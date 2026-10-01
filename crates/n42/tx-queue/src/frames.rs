@@ -49,8 +49,32 @@ pub const MAX_FRAMES: usize = 16_384;
 /// A frame's transactions as the queue holds them, in frame order, shared.
 pub type FrameTxs<T> = Arc<[Arc<ValidPoolTransaction<T>>]>;
 
-/// A frame the ingest admitted whole, for [`crate::TxQueue::note_frame`].
+/// A frame's node-local account ids (`docs/BREAKTHROUGH_DESIGN.md` 4B),
+/// resolved once at admission through `n42_account_ids`: for each
+/// transaction, in frame order, its sender's id and its recipient's
+/// (`n42_account_ids::NO_ID` for a contract creation). Never on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameIds {
+    /// The senders' ids, parallel to the frame's transactions.
+    pub senders: Arc<[u32]>,
+    /// The recipients' ids, parallel to the frame's transactions.
+    pub recipients: Arc<[u32]>,
+}
+
+impl FrameIds {
+    /// How many transactions the ids describe.
+    pub fn len(&self) -> usize {
+        self.senders.len()
+    }
+
+    /// Whether they describe none.
+    pub fn is_empty(&self) -> bool {
+        self.senders.is_empty()
+    }
+}
+
+/// A frame the ingest admitted whole, for [`crate::TxQueue::note_frame`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NewFrame {
     /// The frame's root over `hashes`, which is its id.
     pub id: B256,
@@ -60,6 +84,9 @@ pub struct NewFrame {
     pub members: Vec<(Address, u64)>,
     /// The sum of the transactions' gas limits.
     pub gas: u64,
+    /// The transactions' account ids, when the ingest resolved them
+    /// (`N42_DENSE_IDS=1`); ids of another length than `hashes` are not kept.
+    pub ids: Option<FrameIds>,
 }
 
 /// What [`crate::TxQueue::frames_in_arrival_order`] reports of a frame.
@@ -206,6 +233,8 @@ struct FrameEntry<T: PoolTransaction> {
     /// The sum of `txs`' gas limits, summed once at admission (0 without
     /// them): a build tests a whole frame against the gas left with it.
     txs_gas: u64,
+    /// The transactions' account ids, parallel to `hashes` ([`FrameIds`]).
+    ids: Option<FrameIds>,
 }
 
 impl<T: PoolTransaction> FrameEntry<T> {
@@ -244,7 +273,8 @@ impl<T: PoolTransaction> FrameEntry<T> {
         }
         let txs_gas =
             txs.as_ref().map_or(0, |txs| txs.iter().map(|tx| tx.gas_limit()).fold(0u64, u64::saturating_add));
-        Some((frame.id, Self { hashes: frame.hashes, runs, gas: frame.gas, txs, txs_gas }))
+        let ids = frame.ids.filter(|ids| ids.senders.len() == frame.hashes.len() && ids.recipients.len() == frame.hashes.len());
+        Some((frame.id, Self { hashes: frame.hashes, runs, gas: frame.gas, txs, txs_gas, ids }))
     }
 
     /// Every position's (sender, nonce), in frame order.
@@ -476,6 +506,10 @@ impl<T: PoolTransaction> FrameIndex<T> {
 
     /// The transactions a frame was noted with, shared: `None` for a frame
     /// the index does not hold or one noted without them.
+    pub(crate) fn ids_of(&self, id: &B256) -> Option<FrameIds> {
+        self.frames.get(id).and_then(|entry| entry.ids.clone())
+    }
+
     pub(crate) fn txs_of(&self, id: &B256) -> Option<FrameTxs<T>> {
         self.frames.get(id)?.txs.clone()
     }

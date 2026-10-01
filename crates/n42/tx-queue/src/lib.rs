@@ -42,7 +42,7 @@
 
 mod frames;
 
-pub use frames::{FramePlan, FrameRef, FrameTxs, NewFrame, PlannedFrame, MAX_FRAMES};
+pub use frames::{FrameIds, FramePlan, FrameRef, FrameTxs, NewFrame, PlannedFrame, MAX_FRAMES};
 
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
@@ -1064,6 +1064,16 @@ impl<T: PoolTransaction> TxQueue<T> {
                 Some(FrameTxs::from(out))
             })
             .collect()
+    }
+
+    /// The account ids of each frame in `ids` ([`FrameIds`], resolved at
+    /// admission under `N42_DENSE_IDS=1`), parallel to the frame's
+    /// transactions; `None` for a frame the index does not hold or one
+    /// admitted without ids. Two `Arc` clones a frame.
+    pub fn frame_ids(&self, ids: &[B256]) -> Vec<Option<FrameIds>> {
+        let mut inner = self.lock_inner();
+        self.drain_inbox(&mut inner);
+        ids.iter().map(|id| inner.frames.ids_of(id)).collect()
     }
 
     /// How many indexed frames hold their transactions ([`Self::push_frame`]).
@@ -4102,6 +4112,34 @@ mod tests {
         assert!(queue.is_empty());
     }
 
+    /// A frame's account ids are kept beside it and handed out by id; ids
+    /// of another length than the frame are not kept.
+    #[test]
+    fn a_frames_account_ids_are_kept_and_handed_out() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        let (a, b) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let frame_of = |id: u8, members: &[(Address, u64)], ids: Option<crate::FrameIds>| {
+            let txs: Vec<EthPooledTransaction> = members.iter().map(|(s, n)| tx_hashed(*s, *n)).collect();
+            let hashes: Vec<B256> = txs.iter().map(|t| *t.hash()).collect();
+            queue.push(txs);
+            queue.note_frame(NewFrame {
+                id: B256::repeat_byte(id),
+                hashes,
+                members: members.to_vec(),
+                gas: 21_000 * members.len() as u64,
+                ids,
+            });
+            B256::repeat_byte(id)
+        };
+        let ids = crate::FrameIds { senders: vec![7, 7, 9].into(), recipients: vec![11, 12, u32::MAX].into() };
+        let with = frame_of(0xc1, &[(a, 0), (a, 1), (b, 0)], Some(ids.clone()));
+        let short = crate::FrameIds { senders: vec![7].into(), recipients: vec![11].into() };
+        let wrong = frame_of(0xc2, &[(a, 2), (b, 1)], Some(short));
+        let without = frame_of(0xc3, &[(b, 2)], None);
+        let got = queue.frame_ids(&[with, wrong, without, B256::repeat_byte(0xff)]);
+        assert_eq!(got, vec![Some(ids), None, None, None]);
+    }
+
     /// A frame of `members`, pushed and noted the way the ingest does it.
     fn push_frame(queue: &TxQueue<EthPooledTransaction>, id: u8, members: &[(Address, u64)]) -> Vec<B256> {
         let txs: Vec<EthPooledTransaction> = members.iter().map(|(s, n)| tx_hashed(*s, *n)).collect();
@@ -4112,6 +4150,7 @@ mod tests {
             hashes: hashes.clone(),
             members: members.to_vec(),
             gas: 21_000 * members.len() as u64,
+            ids: None,
         });
         hashes
     }
@@ -4235,6 +4274,7 @@ mod tests {
                 hashes: hashes.clone(),
                 members: members.to_vec(),
                 gas: 21_000 * members.len() as u64,
+                ids: None,
             }),
         );
         hashes
@@ -4365,7 +4405,7 @@ mod tests {
                     frame_id += 1;
                     let mut id = [0u8; 32];
                     id[..4].copy_from_slice(&frame_id.to_be_bytes());
-                    let frame = NewFrame { id: B256::from(id), hashes, members, gas: 21_000 * len as u64 };
+                    let frame = NewFrame { id: B256::from(id), hashes, members, gas: 21_000 * len as u64, ids: None };
                     if kind == 2 {
                         queue.push(txs);
                         queue.note_frame(frame);
@@ -4553,7 +4593,7 @@ mod tests {
             id[..8].copy_from_slice(&(k as u64 + 1).to_be_bytes());
             queue.push_frame(
                 txs,
-                Some(NewFrame { id: B256::from(id), hashes, members: chunk.to_vec(), gas: 21_000 * chunk.len() as u64 }),
+                Some(NewFrame { id: B256::from(id), hashes, members: chunk.to_vec(), gas: 21_000 * chunk.len() as u64, ids: None }),
             );
         }
         assert_eq!(queue.frames_indexed(), all.len() / 500);

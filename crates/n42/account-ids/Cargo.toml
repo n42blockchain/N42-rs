@@ -1,0 +1,20 @@
+[package]
+name = "n42-account-ids"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Node-local dense account ids: an address becomes a u32 once, at admission, so the block's chain indexes arrays"
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+# The table's bench runs on the allocator the node runs on (`MALLOC_CONF` read).
+tikv-jemallocator = { workspace = true, features = ["unprefixed_malloc_on_supported_platforms"] }

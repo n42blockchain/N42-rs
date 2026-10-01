@@ -1993,6 +1993,7 @@ mod tests {
                     hashes,
                     members: members.iter().map(|(s, n)| (Address::repeat_byte(*s), *n)).collect(),
                     gas: 21_000 * members.len() as u64,
+                    ids: None,
                 }),
             );
             frames.push((id, txs));

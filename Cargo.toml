@@ -35,6 +35,7 @@ members = [
     "crates/n42/qmdb-reth",
     "crates/n42/tx-ingest",
     "crates/n42/tx-queue",
+    "crates/n42/account-ids",
     "crates/n42/tx-types",
     "crates/n42/h2-node",
     "crates/n42/mobile-verify",
@@ -242,6 +243,7 @@ n42-qmdb-state = { path = "crates/n42/qmdb-state" }
 n42-qmdb-reth = { path = "crates/n42/qmdb-reth" }
 n42-tx-ingest = { path = "crates/n42/tx-ingest" }
 n42-tx-queue = { path = "crates/n42/tx-queue" }
+n42-account-ids = { path = "crates/n42/account-ids" }
 n42-h2-node = { path = "crates/n42/h2-node" }
 n42-mobile-verify = { path = "crates/n42/mobile-verify" }
 n42-twig-core = { path = "crates/n42/twig-core" }

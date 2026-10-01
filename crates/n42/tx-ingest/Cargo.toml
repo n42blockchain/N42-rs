@@ -17,6 +17,7 @@ reth-transaction-pool.workspace = true
 libc.workspace = true
 n42-tx-queue.workspace = true
 n42-tx-types.workspace = true
+n42-account-ids.workspace = true
 reth-primitives-traits.workspace = true
 reth-evm.workspace = true
 alloy-primitives.workspace = true

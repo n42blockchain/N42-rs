@@ -858,6 +858,15 @@ fn spawn_stats_reporter() {
                     frames_attest_bad = STATS.frames_attest_bad.load(Ordering::Relaxed),
                     frames_attest_short = STATS.frames_attest_short.load(Ordering::Relaxed),
                     attest_verify_us = STATS.attest_verify_ns.load(Ordering::Relaxed) / 1_000,
+                    // Cumulative, `N42_DENSE_IDS=1` (4B): accounts numbered
+                    // at admission, resolutions answered from the table,
+                    // the table's size, the time the resolutions took, and
+                    // frames left without ids (a full table).
+                    ids_new = STATS.ids_new.load(Ordering::Relaxed),
+                    ids_hit = STATS.ids_hit.load(Ordering::Relaxed),
+                    id_table_size = if n42_account_ids::enabled() { n42_account_ids::global().len() } else { 0 },
+                    id_resolve_us = STATS.id_resolve_ns.load(Ordering::Relaxed) / 1_000,
+                    ids_full = STATS.ids_full.load(Ordering::Relaxed),
                     // Non-zero means the gate stopped reopening and frames
                     // were let through on the deadline; the round is not
                     // comparable and a node has stopped draining its queue.
@@ -1232,6 +1241,15 @@ struct IngestStats {
     frames_attest_short: AtomicU64,
     /// Time spent checking attestations, nanoseconds.
     attest_verify_ns: AtomicU64,
+    /// `N42_DENSE_IDS=1`: accounts the id table numbered for the first time
+    /// at admission, and resolutions it answered from what it held
+    /// (a sender run counts once).
+    ids_new: AtomicU64,
+    ids_hit: AtomicU64,
+    /// The resolutions' time, on the recovery threads.
+    id_resolve_ns: AtomicU64,
+    /// Frames indexed without ids because the table was full.
+    ids_full: AtomicU64,
 }
 
 static STATS: IngestStats = IngestStats {
@@ -1254,6 +1272,10 @@ static STATS: IngestStats = IngestStats {
     frames_attest_bad: AtomicU64::new(0),
     frames_attest_short: AtomicU64::new(0),
     attest_verify_ns: AtomicU64::new(0),
+    ids_new: AtomicU64::new(0),
+    ids_hit: AtomicU64::new(0),
+    id_resolve_ns: AtomicU64::new(0),
+    ids_full: AtomicU64::new(0),
     acq_ns: AtomicU64::new(0),
     spawn_ns: AtomicU64::new(0),
     altsig_batches: AtomicU64::new(0),
@@ -1491,7 +1513,10 @@ where
     let hashes: Vec<B256> = pooled.iter().map(|tx| *tx.hash()).collect();
     let (attested, root) = frame_attested(sent, &hashes, attestations, attest);
     let recovered = recover_decoded_in::<P>(pooled, claims, cache, shard, attested);
-    let frame = frame_of(sent, hashes, root, &recovered);
+    // `N42_DENSE_IDS=1`: the frame's account ids, resolved here on the
+    // recovery's thread, once a node (docs/BREAKTHROUGH_DESIGN.md 4B).
+    let ids = n42_account_ids::enabled().then(n42_account_ids::global);
+    let frame = frame_of_with(sent, hashes, root, &recovered, ids);
     if frame.is_none() {
         STATS.frames_unaligned.fetch_add(1, Ordering::Relaxed);
     }
@@ -1545,34 +1570,104 @@ fn frame_attested(
 /// frame's id is its root over `hashes` ([`n42_tx_types::frame_root`]);
 /// `root`, when given, is that root already computed (by the attestation
 /// check).
+#[cfg(test)]
 fn frame_of<T: PoolTransaction>(
     sent: usize,
     hashes: Vec<B256>,
     root: Option<B256>,
     recovered: &[T],
 ) -> Option<NewFrame> {
+    frame_of_with(sent, hashes, root, recovered, None)
+}
+
+/// [`frame_of`], with the frame's account ids resolved through `ids` when
+/// given ([`frame_ids`]).
+fn frame_of_with<T: PoolTransaction>(
+    sent: usize,
+    hashes: Vec<B256>,
+    root: Option<B256>,
+    recovered: &[T],
+    ids: Option<&n42_account_ids::AccountIds>,
+) -> Option<NewFrame> {
     if hashes.is_empty() || hashes.len() != sent || recovered.len() != hashes.len() {
         return None;
     }
     let in_order = recovered.iter().zip(&hashes).all(|(tx, hash)| tx.hash() == hash);
-    let mut members = Vec::with_capacity(hashes.len());
-    let mut gas = 0u64;
-    if in_order {
-        for tx in recovered {
-            members.push((tx.sender(), tx.nonce()));
-            gas = gas.saturating_add(tx.gas_limit());
-        }
+    let ordered: Vec<&T> = if in_order {
+        recovered.iter().collect()
     } else {
         let by_hash: alloy_primitives::map::B256HashMap<&T> =
             recovered.iter().map(|tx| (*tx.hash(), tx)).collect();
-        for hash in &hashes {
-            let tx = by_hash.get(hash)?;
-            members.push((tx.sender(), tx.nonce()));
-            gas = gas.saturating_add(tx.gas_limit());
-        }
+        hashes.iter().map(|hash| by_hash.get(hash).copied()).collect::<Option<Vec<&T>>>()?
+    };
+    let mut members = Vec::with_capacity(hashes.len());
+    let mut gas = 0u64;
+    for tx in &ordered {
+        members.push((tx.sender(), tx.nonce()));
+        gas = gas.saturating_add(tx.gas_limit());
     }
+    let ids = ids.and_then(|table| frame_ids(table, &ordered));
     let id = root.unwrap_or_else(|| n42_tx_types::frame_root(&hashes));
-    Some(NewFrame { id, hashes, members, gas })
+    Some(NewFrame { id, hashes, members, gas, ids })
+}
+
+/// The account ids of a frame's transactions in frame order (`ordered`):
+/// each sender's and each recipient's ([`n42_account_ids::NO_ID`] for a
+/// creation), numbered by `table` on first sight. A sender's run (the
+/// flood's frames hold a sender's transactions back to back) is resolved
+/// once. `None`, counted, when the table is full: the frame is then indexed
+/// without ids and the chain resolves its accounts itself.
+fn frame_ids<T: PoolTransaction>(
+    table: &n42_account_ids::AccountIds,
+    ordered: &[&T],
+) -> Option<n42_tx_queue::FrameIds> {
+    let at = std::time::Instant::now();
+    let mut senders = Vec::with_capacity(ordered.len());
+    let mut recipients = Vec::with_capacity(ordered.len());
+    let (mut new, mut hit) = (0u64, 0u64);
+    let mut last: Option<(Address, u32)> = None;
+    let mut resolve = |address: &Address| -> Option<u32> {
+        match table.resolve(address) {
+            Ok((id, fresh)) => {
+                if fresh {
+                    new += 1;
+                } else {
+                    hit += 1;
+                }
+                Some(id)
+            }
+            Err(_) => None,
+        }
+    };
+    let mut ok = true;
+    for tx in ordered {
+        let sender = tx.sender();
+        let sender_id = match last {
+            Some((address, id)) if address == sender => {
+                Some(id)
+            }
+            _ => resolve(&sender),
+        };
+        let recipient_id = match tx.to() {
+            Some(to) => resolve(&to),
+            None => Some(n42_account_ids::NO_ID),
+        };
+        let (Some(sender_id), Some(recipient_id)) = (sender_id, recipient_id) else {
+            ok = false;
+            break;
+        };
+        last = Some((sender, sender_id));
+        senders.push(sender_id);
+        recipients.push(recipient_id);
+    }
+    STATS.ids_new.fetch_add(new, Ordering::Relaxed);
+    STATS.ids_hit.fetch_add(hit, Ordering::Relaxed);
+    STATS.id_resolve_ns.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if !ok {
+        STATS.ids_full.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    Some(n42_tx_queue::FrameIds { senders: senders.into(), recipients: recipients.into() })
 }
 
 /// Whether, under `N42_INGEST_VERIFY=shard` as shard `(index, count)`, the
@@ -1847,6 +1942,11 @@ mod shard_tests {
         .sign_ed25519(&key)
     }
 
+    /// A transaction's recipient through the pool trait's bound.
+    fn to_of<T: PoolTransaction>(tx: &T) -> Option<Address> {
+        tx.to()
+    }
+
     /// A frame the ingest kept whole is described in frame order, whatever
     /// order the recovery returned it in; one it dropped from is unaligned.
     #[test]
@@ -1870,7 +1970,26 @@ mod shard_tests {
         // The frame carried seven and one was undecodable: unaligned.
         assert_eq!(frame_of(7, hashes.clone(), None, &recovered), None);
         // One did not verify: unaligned.
-        assert_eq!(frame_of(6, hashes, None, &recovered[..5]), None);
+        assert_eq!(frame_of(6, hashes.clone(), None, &recovered[..5]), None);
+        // With an id table: the frame's ids are its transactions' senders
+        // and recipients, in frame order, whatever the recovery's order.
+        let table = n42_account_ids::AccountIds::new();
+        let with = frame_of_with(6, hashes.clone(), None, &reversed, Some(&table)).expect("aligned");
+        let ids = with.ids.clone().expect("ids resolved");
+        assert_eq!(ids.len(), 6);
+        let by_hash: alloy_primitives::map::B256HashMap<&N42PooledTransaction> =
+            recovered.iter().map(|tx| (*tx.hash(), tx)).collect();
+        for (at, hash) in hashes.iter().enumerate() {
+            let tx = by_hash[hash];
+            assert_eq!(table.address(ids.senders[at]), Some(tx.sender()));
+            assert_eq!(table.address(ids.recipients[at]), to_of(tx));
+        }
+        // Two senders and one recipient: three accounts.
+        assert_eq!(table.len(), 3);
+        // The same frame again: the same ids, nothing new.
+        let again = frame_of_with(6, hashes, None, &recovered, Some(&table)).expect("aligned");
+        assert_eq!(again.ids, Some(ids));
+        assert_eq!(table.len(), 3);
     }
 
     /// A claiming frame in shard mode: exactly the transactions whose hash

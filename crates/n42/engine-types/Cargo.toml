@@ -23,6 +23,7 @@ alloy-signer-local.workspace = true
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
 n42-tx-queue.workspace = true
+n42-account-ids.workspace = true
 n42-tx-types.workspace = true
 alloy-evm.workspace = true
 reth-rpc-convert.workspace = true

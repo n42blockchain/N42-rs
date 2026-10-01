@@ -115,6 +115,11 @@ pub struct Phases {
     pub read_set: ReadSetPass,
     /// See `read_set`.
     pub read_set_hits: u64,
+    /// Design B stage 2: the dense batches' claims, conflicts and lookups
+    /// summed over the block (zero on the address path).
+    pub dense: crate::batch_state::DenseCounts,
+    /// Whether the build ran on dense ids.
+    pub dense_on: bool,
     /// See `read_set`.
     pub read_set_misses: u64,
     /// The build's batches on the pool, each from its start to its end:
@@ -3192,7 +3197,33 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set)
+    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, None)
+}
+
+/// [`execute_for_build_in_place`] on dense account ids (design B stage 2,
+/// `docs/BREAKTHROUGH_DESIGN.md` 4B): `ids` holds each candidate's (sender,
+/// recipient) ids from the global id table, parallel to `keys`, and every
+/// batch keeps its accounts by id under the block's claims. The run is the
+/// address path's, account for account.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_for_build_dense<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    ids: &[(u32, u32)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    on_bundle: Option<&(dyn Fn(BundleState) + Sync)>,
+    in_place: bool,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    if ids.len() != keys.len() {
+        return Err(NotParallel::Failed(0, "dense ids do not match the keys".to_string()));
+    }
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, false, Some(ids))
 }
 
 fn execute_for_build_run<T, G>(
@@ -3209,7 +3240,7 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set())
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3222,6 +3253,7 @@ fn execute_for_build_opts<T, G>(
     in_place: bool,
     before_batches: Option<&mut dyn FnMut() -> bool>,
     with_read_set: bool,
+    dense_ids: Option<&[(u32, u32)]>,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
@@ -3259,19 +3291,34 @@ where
         set
     });
     let read_set_ref = block_read_set.as_ref();
+    // Design B stage 2: the block's claims, when the build has ids.
+    let dense_block = dense_ids.and_then(|_| {
+        crate::batch_state::DenseBlock::begin(n42_account_ids::global().id_bound(), beneficiary)
+    });
+    let dense_block_ref = dense_block.as_ref();
+    let dense_ids = dense_ids.filter(|_| dense_block.is_some());
+    phases.dense_on = dense_ids.is_some();
     // Each result goes into its candidate's slot from the batch's own
     // thread: collecting the batches' vectors and sorting them by index was
     // 80-150 ms of a full block's build (loop138-139).
     let slots: Vec<std::sync::OnceLock<BuiltTransfer<T>>> = (0..keys.len()).map(|_| std::sync::OnceLock::new()).collect();
     let slots_ref = &slots;
-    type BatchResult = (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, BatchSpan, LoopTimers);
+    type BatchResult = (
+        Vec<usize>,
+        Option<BundleState>,
+        crate::fast_transfer::TransferTimers,
+        BatchSpan,
+        LoopTimers,
+        crate::batch_state::DenseCounts,
+    );
     // Each batch's span on the pool, against this instant (`BatchSpans`).
     let batches_at = std::time::Instant::now();
     let results: Vec<Result<BatchResult, NotParallel>> = pool.install(|| {
         use rayon::prelude::*;
         batches
             .par_iter()
-            .map(|members| {
+            .enumerate()
+            .map(|(batch_index, members)| {
                 let start_us = batches_at.elapsed().as_micros() as u64;
                 let cpu_start = thread_cpu_ns();
                 let txs = members.iter().map(|group| group.len()).sum::<usize>();
@@ -3281,7 +3328,15 @@ where
                 // A sender, a recipient a transfer and the beneficiary, sized
                 // once: growing from empty rehashed the map a dozen times a
                 // batch.
-                let mut state = crate::batch_state::BatchState::with_capacity(db, txs + txs / 4 + 1);
+                let mut state = match dense_block_ref {
+                    Some(block) => crate::batch_state::BatchState::dense(
+                        db,
+                        txs + txs / 4 + 1,
+                        block.clone(),
+                        u16::try_from(batch_index).map_err(|_| NotParallel::Failed(0, "too many batches".to_string()))?,
+                    ),
+                    None => crate::batch_state::BatchState::with_capacity(db, txs + txs / 4 + 1),
+                };
                 let mut skipped = Vec::new();
                 let mut setup_ns = 0;
                 let close_at;
@@ -3302,6 +3357,11 @@ where
                             // conversion of a full block was 55-100 ms of
                             // the builder's own thread otherwise.
                             let (tx, env) = convert(i);
+                            if let Some(ids) = dense_ids {
+                                let (sender, recipient) = keys[i];
+                                let (sender_id, recipient_id) = ids[i];
+                                evm.db_mut().hint(sender, sender_id, recipient, recipient_id);
+                            }
                             let t1 = mark();
                             match evm.transfer_plain(&env) {
                                 Ok(Some((plain, result))) => {
@@ -3332,6 +3392,7 @@ where
                     }
                     close_at = sampler.on.then(std::time::Instant::now);
                 }
+                let dense_counts = state.dense_counts();
                 let bundle = state.take_bundle();
                 // Drained here, on the batch's own thread, right after its
                 // transfers are done: `N42_PHASE_TIMERS=1` only (see
@@ -3349,12 +3410,12 @@ where
                         sink(bundle);
                         let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
                         let span = BatchSpan::close(start_us, cpu_start, txs, batches_at);
-                        Ok((skipped, None, timers, span, sampler.finish(setup_ns, close_ns)))
+                        Ok((skipped, None, timers, span, sampler.finish(setup_ns, close_ns), dense_counts))
                     }
                     None => {
                         let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
                         let span = BatchSpan::close(start_us, cpu_start, txs, batches_at);
-                        Ok((skipped, Some(bundle), timers, span, sampler.finish(setup_ns, close_ns)))
+                        Ok((skipped, Some(bundle), timers, span, sampler.finish(setup_ns, close_ns), dense_counts))
                     }
                 }
             })
@@ -3372,8 +3433,12 @@ where
     let mut run = BuildRun { phases, ..Default::default() };
     let mut spans: Vec<BatchSpan> = Vec::with_capacity(results.len());
     for r in results {
-        let (skipped, bundle, timers, span, loop_timers) = r?;
+        let (skipped, bundle, timers, span, loop_timers, dense_counts) = r?;
         spans.push(span);
+        run.phases.dense.claimed += dense_counts.claimed;
+        run.phases.dense.conflicts += dense_counts.conflicts;
+        run.phases.dense.by_claim += dense_counts.by_claim;
+        run.phases.dense.by_map += dense_counts.by_map;
         run.phases.loop_timers.add(loop_timers);
         run.skipped.extend(skipped);
         if let Some(bundle) = bundle {
@@ -4536,6 +4601,54 @@ mod tests {
     /// post-state the merged bundle does. The fixture has a sender paid by
     /// another sender's group and a withdrawal to a sender, so the shards'
     /// summed deltas and the executor's take both run.
+    /// Design B stage 2: the build on dense ids gives the address path's
+    /// bundles, batch for batch, and the same index-mode output; the fixture
+    /// pays some recipients from several batches (conflicts).
+    #[test]
+    fn the_dense_build_matches_the_address_path() {
+        use reth_evm::ConfigureEvm as _;
+        let (block, db) = fixture(8, 6);
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_env = evm_config.evm_env(block.header()).expect("env");
+        let txs = &block.body().transactions;
+        let senders = block.senders();
+        let keys = build_path_keys(&block).expect("transfers");
+        let table = n42_account_ids::global();
+        let ids: Vec<(u32, u32)> = keys
+            .iter()
+            .map(|(s, r)| (table.resolve(s).expect("room").0, table.resolve(r).expect("room").0))
+            .collect();
+        let convert = |i: usize| ((), evm_config.tx_env(reth_primitives_traits::Recovered::new_unchecked(&txs[i], senders[i])));
+        let open = || Some(db.clone());
+        let plain = execute_for_build_in_place(&evm_env, &keys, &convert, &open, None, false).expect("address path");
+        // Twice: the second block's claims are a later generation's.
+        for _ in 0..2 {
+            let dense = execute_for_build_dense(&evm_env, &keys, &ids, &convert, &open, None, false).expect("dense path");
+            assert!(dense.phases.dense_on);
+            assert_eq!(dense.bundles.len(), plain.bundles.len());
+            for (ours, theirs) in dense.bundles.iter().zip(&plain.bundles) {
+                assert_same_bundle(ours, theirs, "dense batch");
+                assert_eq!(ours.state_size, theirs.state_size);
+                assert_eq!(ours.reverts_size, theirs.reverts_size);
+            }
+            assert_eq!(dense.executed.len(), plain.executed.len());
+            assert_eq!(dense.skipped, plain.skipped);
+            assert!(dense.phases.dense.claimed > 0 && dense.phases.dense.by_claim > 0, "{:?}", dense.phases.dense);
+            // The index-mode output, through the sink, as the leader builds it.
+            let address_shards = crate::output_shards::OutputShards::with_index_live(evm_env.block_env.beneficiary, keys.len(), 16, true, false);
+            let dense_shards = crate::output_shards::OutputShards::with_index_live(evm_env.block_env.beneficiary, keys.len(), 16, true, false);
+            let a_sink = |bundle: BundleState| address_shards.add(bundle);
+            let d_sink = |bundle: BundleState| dense_shards.add(bundle);
+            execute_for_build_in_place(&evm_env, &keys, &convert, &open, Some(&a_sink), true).expect("address path");
+            execute_for_build_dense(&evm_env, &keys, &ids, &convert, &open, Some(&d_sink), true).expect("dense path");
+            let (a, d) = (address_shards.freeze(), dense_shards.freeze());
+            assert_same_bundle(&d.merged(&BundleState::default()), &a.merged(&BundleState::default()), "index-mode output");
+            assert_eq!(d.accounts(), a.accounts());
+            assert_eq!(d.beneficiary_delta(), a.beneficiary_delta());
+        }
+        assert!(!plain.phases.dense_on);
+    }
+
     #[test]
     fn the_build_path_matches_the_follower_path_and_the_serial_executor() {
         let (block, db) = fixture(8, 6);
@@ -6697,6 +6810,23 @@ mod tests {
             .unwrap_or_default()
         };
         let body_tx = |i: usize| reth_transaction_pool::PoolTransaction::consensus_ref(&cands[i].transaction).into_inner().clone();
+        // `N42_DENSE_IDS=1` (design B stage 2): the ids the ingest would have
+        // resolved at admission, resolved here once, off the timed rounds;
+        // the table first holds the flood's whole account set.
+        let dense_ids: Option<Vec<(u32, u32)>> = n42_account_ids::enabled().then(|| {
+            let table = n42_account_ids::global();
+            for s in 0..senders {
+                let _ = table.resolve(&sender_of(s));
+            }
+            for r in 0..recipients {
+                let _ = table.resolve(&recipient_of(r));
+            }
+            let at = std::time::Instant::now();
+            let ids: Vec<(u32, u32)> =
+                keys.iter().map(|(s, r)| (table.resolve(s).expect("room").0, table.resolve(r).expect("room").0)).collect();
+            println!("dense ids: table {} (bound {}), the block's {} resolved in {} us on one thread", table.len(), table.id_bound(), ids.len(), at.elapsed().as_micros());
+            ids
+        });
         for round in 0..10 {
             let with_root = round % 2 == 1 && round < 8;
             let with_body = round >= 8;
@@ -6725,8 +6855,11 @@ mod tests {
                         })
                     })
                 });
-                let run = execute_for_build_in_place(&evm_env, &keys, &convert, &|| Some(db.clone()), Some(&sink), true)
-                    .expect("a block of transfers");
+                let run = match &dense_ids {
+                    Some(ids) => execute_for_build_dense(&evm_env, &keys, ids, &convert, &|| Some(db.clone()), Some(&sink), true),
+                    None => execute_for_build_in_place(&evm_env, &keys, &convert, &|| Some(db.clone()), Some(&sink), true),
+                }
+                .expect("a block of transfers");
                 if let Some(root) = root {
                     let _ = root.join();
                 }
@@ -6737,6 +6870,16 @@ mod tests {
             let freeze_at = std::time::Instant::now();
             let frozen = shards.freeze();
             let freeze_us = freeze_at.elapsed().as_micros();
+            if dense_ids.is_some() && round == 0 {
+                // The dense build's output equals the address path's.
+                let theirs = crate::output_shards::OutputShards::with_index_live(beneficiary, keys.len(), 16, true, false);
+                let their_sink = |bundle: BundleState| theirs.add(bundle);
+                execute_for_build_in_place(&evm_env, &keys, &convert, &|| Some(db.clone()), Some(&their_sink), true).expect("address path");
+                let theirs = theirs.freeze();
+                assert_same_bundle(&frozen.merged(&BundleState::default()), &theirs.merged(&BundleState::default()), "dense vs address");
+                assert_eq!(frozen.beneficiary_delta(), theirs.beneficiary_delta());
+                println!("dense vs address: the same output ({} accounts)", theirs.accounts());
+            }
             // The seal-first commit as it was (four passes: the references,
             // the gas, the fees, the body) and as it is (two).
             // Which runs first alternates every two rounds: the second reads
@@ -6801,6 +6944,9 @@ mod tests {
                 frozen.fold_split(),
                 run.phases.batch_spans
             );
+            if run.phases.dense_on {
+                println!("  dense: {:?}", run.phases.dense);
+            }
             if crate::fast_transfer::phase_timers() {
                 let (l, t) = (run.phases.loop_timers, run.phases.transfer_timers);
                 let per = |ns: u64| l.per_tx(ns);

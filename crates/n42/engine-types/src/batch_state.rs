@@ -20,6 +20,11 @@
 
 use crate::fast_transfer::PlainTransfer;
 use alloy_primitives::{map::AddressMap, Address, B256};
+use n42_account_ids::{AccountId, NO_ID};
+use std::sync::{
+    atomic::{AtomicU32, AtomicU64, Ordering},
+    Arc,
+};
 use revm::{
     database::states::{AccountStatus, BundleAccount, BundleState, TransitionAccount},
     state::{AccountInfo, Bytecode, EvmState},
@@ -62,6 +67,141 @@ impl std::fmt::Display for Unsupported {
 pub struct BatchState<G> {
     inner: G,
     accounts: AddressMap<BundleAccount>,
+    /// Design B stage 2 (`N42_DENSE_IDS=1`, [`DenseBlock`]): the batch's
+    /// accounts by node-local id instead of `accounts`.
+    dense: Option<Box<Dense>>,
+}
+
+/// A build's dense-id claims (design B stage 2, `docs/BREAKTHROUGH_DESIGN.md`
+/// 4B): one `AtomicU64` an account id, shared by every batch of the block,
+/// `generation << 32 | batch << 16 | position`. A batch's first touch of an
+/// account claims it by CAS -- the block's account -> batch index, built
+/// during the execution -- and the owner then finds the account at
+/// `position` in its own list with one array read, no hash. An account
+/// another batch claimed first (a recipient two batches pay; ~10% on the
+/// flood's shape) is kept in the batch's small conflicts map, as the
+/// address path keeps it in its own map. The generation makes every claim of
+/// an earlier block stale without clearing the table.
+#[derive(Debug, Clone)]
+pub struct DenseBlock {
+    claims: Arc<[AtomicU64]>,
+    generation: u32,
+    beneficiary: Address,
+}
+
+/// The process's claims table, grown (never shrunk) to the id table's bound.
+static CLAIMS: std::sync::Mutex<Option<Arc<[AtomicU64]>>> = std::sync::Mutex::new(None);
+static GENERATION: AtomicU32 = AtomicU32::new(0);
+
+/// Positions a batch can claim; past it an account goes to the conflicts map.
+const POSITION_MAX: usize = u16::MAX as usize;
+
+impl DenseBlock {
+    /// The claims for one block whose ids are all below `id_bound`, or
+    /// `None` when the table cannot be had (a poisoned lock).
+    pub fn begin(id_bound: usize, beneficiary: Address) -> Option<Self> {
+        let mut held = CLAIMS.lock().ok()?;
+        let claims = match held.as_ref() {
+            Some(claims) if claims.len() >= id_bound => Arc::clone(claims),
+            _ => {
+                // Twice the bound, at least 4M ids (32 MB): grown rarely.
+                let len = (id_bound * 2).max(1 << 22);
+                let fresh: Arc<[AtomicU64]> = (0..len).map(|_| AtomicU64::new(0)).collect();
+                *held = Some(Arc::clone(&fresh));
+                fresh
+            }
+        };
+        // Generation 0 is "never claimed".
+        let mut generation = GENERATION.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if generation == 0 {
+            generation = GENERATION.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        }
+        Some(Self { claims, generation, beneficiary })
+    }
+}
+
+/// What a dense batch found, for the build's phases line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DenseCounts {
+    /// Accounts this batch claimed (owns in the block's index).
+    pub claimed: u64,
+    /// Accounts another batch had claimed, kept in this batch's conflicts map.
+    pub conflicts: u64,
+    /// Reads and writes answered by the claim (one array read).
+    pub by_claim: u64,
+    /// Reads and writes that probed the conflicts map.
+    pub by_map: u64,
+}
+
+#[derive(Debug)]
+struct Dense {
+    block: DenseBlock,
+    batch: u16,
+    /// The transfer's sender and recipient with their ids ([`BatchState::hint`]).
+    hint: [(Address, AccountId); 2],
+    /// The batch's accounts in first-touch order.
+    list: Vec<(Address, BundleAccount)>,
+    /// Positions of accounts not found by claim: another batch's, the
+    /// beneficiary, accounts without an id, and positions past
+    /// [`POSITION_MAX`].
+    others: AddressMap<u32>,
+    counts: DenseCounts,
+}
+
+impl Dense {
+    #[inline]
+    fn id_of(&self, address: &Address) -> AccountId {
+        if *address == self.hint[0].0 {
+            self.hint[0].1
+        } else if *address == self.hint[1].0 {
+            self.hint[1].1
+        } else if *address == self.block.beneficiary {
+            NO_ID
+        } else {
+            n42_account_ids::global().get(address).unwrap_or(NO_ID)
+        }
+    }
+
+    /// The account's position in `list`, if the batch holds it.
+    #[inline]
+    fn find(&mut self, address: &Address, id: AccountId) -> Option<usize> {
+        if let Some(claim) = self.block.claims.get(id as usize) {
+            let v = claim.load(Ordering::Relaxed);
+            if (v >> 32) as u32 == self.block.generation && ((v >> 16) & 0xffff) as u16 == self.batch {
+                self.counts.by_claim += 1;
+                return Some((v & 0xffff) as usize);
+            }
+            // Unclaimed this block: an id'd account is in `others` only when
+            // another batch claimed it or the list ran past the positions.
+            if (v >> 32) as u32 != self.block.generation && self.list.len() <= POSITION_MAX {
+                self.counts.by_claim += 1;
+                return None;
+            }
+        }
+        self.counts.by_map += 1;
+        self.others.get(address).map(|at| *at as usize)
+    }
+
+    /// Adds an account the batch did not hold; its position.
+    fn insert(&mut self, address: Address, id: AccountId, entry: BundleAccount) -> usize {
+        let at = self.list.len();
+        self.list.push((address, entry));
+        if at <= POSITION_MAX && address != self.block.beneficiary {
+            if let Some(claim) = self.block.claims.get(id as usize) {
+                let current = claim.load(Ordering::Relaxed);
+                if (current >> 32) as u32 != self.block.generation {
+                    let mine = (u64::from(self.block.generation) << 32) | (u64::from(self.batch) << 16) | at as u64;
+                    if claim.compare_exchange(current, mine, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                        self.counts.claimed += 1;
+                        return at;
+                    }
+                }
+                self.counts.conflicts += 1;
+            }
+        }
+        self.others.insert(address, at as u32);
+        at
+    }
 }
 
 /// An account as `State` loads it into its cache (`load_cache_account`):
@@ -100,7 +240,36 @@ fn change(entry: &mut BundleAccount, info: AccountInfo) {
 impl<G: Database> BatchState<G> {
     /// A batch over `inner` with room for `accounts` without regrowing.
     pub fn with_capacity(inner: G, accounts: usize) -> Self {
-        Self { inner, accounts: AddressMap::with_capacity_and_hasher(accounts, Default::default()) }
+        Self { inner, accounts: AddressMap::with_capacity_and_hasher(accounts, Default::default()), dense: None }
+    }
+
+    /// A batch over `inner` keyed by dense id under `block`'s claims, as
+    /// batch number `batch` of the block. The bundle it closes to is the one
+    /// [`Self::with_capacity`]'s would be.
+    pub fn dense(inner: G, accounts: usize, block: DenseBlock, batch: u16) -> Self {
+        let dense = Dense {
+            block,
+            batch,
+            hint: [(Address::ZERO, NO_ID); 2],
+            list: Vec::with_capacity(accounts),
+            others: AddressMap::with_capacity_and_hasher(accounts / 8 + 4, Default::default()),
+            counts: DenseCounts::default(),
+        };
+        Self { inner, accounts: AddressMap::default(), dense: Some(Box::new(dense)) }
+    }
+
+    /// The next transfer's sender and recipient with their ids: what the
+    /// dense batch finds its accounts by. A no-op on the address path.
+    #[inline]
+    pub fn hint(&mut self, sender: Address, sender_id: AccountId, recipient: Address, recipient_id: AccountId) {
+        if let Some(dense) = self.dense.as_deref_mut() {
+            dense.hint = [(sender, sender_id), (recipient, recipient_id)];
+        }
+    }
+
+    /// The dense batch's counts (zero on the address path).
+    pub fn dense_counts(&self) -> DenseCounts {
+        self.dense.as_ref().map(|dense| dense.counts).unwrap_or_default()
     }
 
     /// Applies a transaction's changes as `State::commit` would
@@ -149,7 +318,17 @@ impl<G: Database> BatchState<G> {
             if info.is_empty() {
                 return Err(Unsupported(address));
             }
-            let Some(entry) = self.accounts.get_mut(&address) else { return Err(Unsupported(address)) };
+            let entry = match self.dense.as_deref_mut() {
+                Some(dense) => {
+                    let id = dense.id_of(&address);
+                    let Some(at) = dense.find(&address, id) else { return Err(Unsupported(address)) };
+                    &mut dense.list[at].1
+                }
+                None => {
+                    let Some(entry) = self.accounts.get_mut(&address) else { return Err(Unsupported(address)) };
+                    entry
+                }
+            };
             change(entry, info);
         }
         Ok(())
@@ -159,7 +338,22 @@ impl<G: Database> BatchState<G> {
     /// `State` returns from `merge_transitions(BundleRetention::Reverts)`
     /// then `take_bundle`. The batch holds nothing afterwards.
     pub fn take_bundle(&mut self) -> BundleState {
-        let mut accounts = std::mem::take(&mut self.accounts);
+        let mut accounts = match self.dense.as_deref_mut() {
+            // The dense list as the map the address path would hold, less
+            // the accounts only read (the retain below drops them anyway).
+            Some(dense) => {
+                let list = std::mem::take(&mut dense.list);
+                dense.others = AddressMap::default();
+                let mut map = AddressMap::with_capacity_and_hasher(list.len(), Default::default());
+                for (address, entry) in list {
+                    if entry.status != loaded_status(entry.original_info.as_ref()) {
+                        map.insert(address, entry);
+                    }
+                }
+                map
+            }
+            None => std::mem::take(&mut self.accounts),
+        };
         let mut bundle = BundleState::default();
         let mut reverts = Vec::with_capacity(accounts.len());
         let (mut state_size, mut reverts_size, mut changed) = (0usize, 0usize, false);
@@ -212,6 +406,14 @@ impl<G: Database> Database for BatchState<G> {
     type Error = G::Error;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        if let Some(dense) = self.dense.as_deref_mut() {
+            let id = dense.id_of(&address);
+            let at = match dense.find(&address, id) {
+                Some(at) => at,
+                None => dense.insert(address, id, loaded(self.inner.basic(address)?)),
+            };
+            return Ok(dense.list[at].1.info.clone());
+        }
         let entry = match self.accounts.entry(address) {
             alloy_primitives::map::Entry::Occupied(entry) => entry.into_mut(),
             alloy_primitives::map::Entry::Vacant(entry) => entry.insert(loaded(self.inner.basic(address)?)),

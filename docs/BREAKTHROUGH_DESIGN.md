@@ -1352,3 +1352,30 @@ p90 fell 1,548 -> 377-610 and the share of roots with >= 500 faults 22.8% -> 5.1
 1.161-1.166M on S legs and 1.174M on OFF, a spread of 1.1%, inside the 4% of one configuration, and the cycle mean is 138-140 ms on all four (the
 medians 122-134 differ more than the means, so the tail of the cycle is not the root's). The record stays 1,226,047 (loop293). Not determined:
 why the remaining 5-8% of roots still fault (the p90 of the split is 7 on twigs and 5 on bits, so those roots' faults lie in a key not in the split).
+
+### 10.55 Step 8 on the fleet (loop307): the build starts earlier, the window does not follow
+
+Tip e55bdb9a6 (step 8: `N42_BUILD_AHEAD_AT_SEAL`, the build-start fields on the `proposal sent` line), the copy-aside configuration of 10.54, 100 ms
+pacing, three nodes. ON and ONb set `N42_BUILD_AHEAD_AT_SEAL=1`, OFF does not, ONP90 is ON at 90 ms pacing. Proposal-to-proposal is over window 1 (30 s
+from the first full build) on node 0's and the other nodes' `proposal sent` lines taken together; `build start` is `build_start_after_prev_send_us`
+(negative: the build began before the previous block's send), over all proposals of the leg (~2,400 per leg). The runner's own `build_start_*` and
+`take_sealed_us_*` counters read `-` because it greps the unstripped `v.log` (the field names carry ANSI codes); the numbers here are from the stripped logs.
+
+| leg | win1 | win2 | cycle mean / median | proposal-to-proposal median / p75 / mean | build start median / p75 (ms) | trigger send / seal | take_sealed median / p75 (us), share > 3000 us | sealed_at median / p90 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ON | 1,166,653 | 863,856 | 135 / 111 | 118 / 159 / 139 | -100.3 / -99.3 | 83% / 16% | 4 / 8, 17.0% | 91 / 205 |
+| ONb | 1,208,663 | 724,321 | 131 / 112 | 118 / 150 / 133 | -100.3 / -99.3 | 83% / 17% | 4 / 8, 15.6% | 93 / 192 |
+| OFF | 1,173,888 | 863,075 | 137 / 127 | 129 / 160 / 137 | -79.5 / +0.3 | 44% / 55% | 4 / 9, 22.3% | 80 / 125 |
+| ONP90 | 1,190,069 | 880,146 | 132 / 122 | 129 / 161 / 136 | -90.7 / -90.0 | 81% / 19% | 1 / 9, 19.6% | 101 / 199 |
+
+The build start moved as designed: on OFF the p75 of the start is +0.3 ms after the previous send (the late half of 10.54) and 55% of the starts
+are triggered by the seal; on ON the p75 is -99 ms and the median -100 ms, the whole distribution lies before the previous send. The own-seal waits did
+not fall on the median (4 us on all legs); the share of takes over 3 ms fell from 22.3% to 15.6-17.0% (30.1% to 14.6-19.0% in window 1), which is
+within what two legs of one configuration differ by. The cycle median fell 127 -> 111-112 ms and the proposal-to-proposal median 129 -> 118 ms, but the
+cycle mean (131-135 against 137) and the proposal mean (133-139 against 137) did not move, so the early half of the distribution shortened and the tail
+did not. `sealed_at` rose (median 80 -> 91-93, p90 125 -> 192-205): with the build started earlier its seal is later after the proposal it is measured
+from, and the window did not gain from it. Window 1 reads 1.167 / 1.209M on ON against 1.174M on OFF (ON mean 1.188M, spread 3.6%, inside the 4% of
+one configuration); ONP90 reads 1.190M, and at pacing 90 the proposal median is the pacing-100 OFF value, not a shorter one. No ON leg reaches the
+record 1,226,047. Window 2 is not a metric (ONb 724k on a 76.8% occupancy; the other three 863-880k). Correctness: `own block at this height was not
+the one committed` 0, `Encountered invalid block` 0, `no gov5 header variant` 0 on all four legs; `TC formed` 1 per leg; `superseded` 1 per leg on the
+three ON legs and 7 on OFF. Not determined: why the early start shortens the cycle's lower half and leaves its mean.

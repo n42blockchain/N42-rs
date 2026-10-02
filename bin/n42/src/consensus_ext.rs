@@ -420,6 +420,181 @@ mod tests {
         assert_eq!(result, HashMap::default());
     }
 
+    use alloy_consensus::Header;
+    use n42_primitives::Validator;
+    use reth_provider::providers::BlockchainProvider;
+    use reth_provider::test_utils::{create_test_provider_factory, MockNodeTypesWithDB};
+    use reth_provider::BeaconProviderWriter;
+
+    type TestProvider = BlockchainProvider<MockNodeTypesWithDB>;
+
+    const TIP: B256 = B256::repeat_byte(0x77);
+
+    fn provider() -> TestProvider {
+        let factory = create_test_provider_factory();
+        let tip = reth_primitives_traits::SealedHeader::new(Header::default(), TIP);
+        BlockchainProvider::with_latest(factory, tip).expect("provider")
+    }
+
+    fn beacon_ext(
+        provider: TestProvider,
+    ) -> (
+        ConsensusBeaconExt<NoopConsensus, TestProvider>,
+        mpsc::Receiver<BlockVerifyResult>,
+    ) {
+        let (verification_tx, verification_rx) = mpsc::channel(2);
+        let (router_tx, _router_rx) = mpsc::channel(2);
+        (
+            ConsensusBeaconExt { consensus: NoopConsensus::default(), provider, verification_tx, router_tx },
+            verification_rx,
+        )
+    }
+
+    fn state_with_validator(pubkey: BLSPubkey, effective_balance: u64) -> BeaconState {
+        let mut state = BeaconState::new();
+        state
+            .validators_store
+            .push(Validator {
+                pubkey,
+                effective_balance,
+                activation_epoch: 0,
+                exit_epoch: u64::MAX,
+                ..Default::default()
+            })
+            .unwrap();
+        state.balances_store.push(effective_balance + 5).unwrap();
+        state.inactivity_scores_store.push(3).unwrap();
+        state.validators = state.validators_store.root();
+        state.validators_len = 1;
+        state.balances = state.balances_store.root();
+        state.balances_len = 1;
+        state.inactivity_scores = state.inactivity_scores_store.root();
+        state.inactivity_scores_len = 1;
+        state
+    }
+
+    /// Files `state` under the beacon block that the latest eth1 block maps to.
+    fn file_latest_state(provider: &TestProvider, state: BeaconState) -> B256 {
+        let beacon_hash = B256::repeat_byte(0xB1);
+        provider.save_beacon_block_hash_by_eth1_hash(&TIP, beacon_hash).unwrap();
+        provider.save_beacon_state_by_hash(&beacon_hash, state).unwrap();
+        beacon_hash
+    }
+
+    #[test]
+    fn submit_verification_forwards_the_result_to_the_miner_channel() {
+        let (ext, mut rx) = beacon_ext(provider());
+        let hash = B256::repeat_byte(5);
+        ext.submit_verification("pk".into(), "sig".into(), AttestationData::default(), hash).unwrap();
+        let got = rx.try_recv().expect("forwarded");
+        assert_eq!(got.pubkey, "pk");
+        assert_eq!(got.signature, "sig");
+        assert_eq!(got.block_hash, hash);
+    }
+
+    #[test]
+    fn submit_verification_with_a_full_channel_still_answers_ok() {
+        let (ext, mut rx) = beacon_ext(provider());
+        for _ in 0..4 {
+            ext.submit_verification("pk".into(), "sig".into(), AttestationData::default(), B256::ZERO)
+                .expect("a full channel drops the result, not the call");
+        }
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, 2, "only the channel's capacity is delivered");
+    }
+
+    #[test]
+    fn beacon_block_and_state_lookups_by_hash_return_what_was_stored() {
+        let provider = provider();
+        let (ext, _rx) = beacon_ext(provider.clone());
+        let hash = B256::repeat_byte(0xA1);
+        assert_eq!(ext.get_beacon_block_by_hash(hash).unwrap(), None);
+        assert_eq!(ext.get_beacon_state_by_beacon_block_hash(hash).unwrap(), None);
+        assert_eq!(ext.get_beacon_block_hash_by_eth1_hash(hash).unwrap(), None);
+
+        let block = BeaconBlock { slot: 9, ..Default::default() };
+        provider.save_beacon_block_by_hash(&hash, block.clone()).unwrap();
+        let mut state = BeaconState::new();
+        state.slot = 12;
+        provider.save_beacon_state_by_hash(&hash, state).unwrap();
+        provider.save_beacon_block_hash_by_eth1_hash(&hash, B256::repeat_byte(0xA2)).unwrap();
+
+        assert_eq!(ext.get_beacon_block_by_hash(hash).unwrap(), Some(block));
+        assert_eq!(ext.get_beacon_state_by_beacon_block_hash(hash).unwrap().unwrap().slot, 12);
+        assert_eq!(ext.get_beacon_block_hash_by_eth1_hash(hash).unwrap(), Some(B256::repeat_byte(0xA2)));
+    }
+
+    #[test]
+    fn lookups_by_number_walk_eth1_hash_to_beacon_hash_to_the_object() {
+        let provider = provider();
+        let (ext, _rx) = beacon_ext(provider.clone());
+        let id = BlockId::latest();
+        // No mapping filed yet: both lookups stop at the first missing link.
+        assert_eq!(ext.get_beacon_block_by_number(id).unwrap(), None);
+        assert_eq!(ext.get_beacon_state_by_number(id).unwrap(), None);
+
+        let block_hash = file_latest_state(&provider, BeaconState::new());
+        // A mapping without a stored block still answers None for the block.
+        assert_eq!(ext.get_beacon_block_by_number(id).unwrap(), None);
+        provider.save_beacon_block_by_hash(&block_hash, BeaconBlock { slot: 4, ..Default::default() }).unwrap();
+        assert_eq!(ext.get_beacon_block_by_number(id).unwrap().unwrap().slot, 4);
+        assert!(ext.get_beacon_state_by_number(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_unknown_block_number_has_no_beacon_object() {
+        let (ext, _rx) = beacon_ext(provider());
+        let id = BlockId::number(123_456);
+        assert_eq!(ext.get_beacon_block_by_number(id).unwrap(), None);
+        assert_eq!(ext.get_beacon_state_by_number(id).unwrap(), None);
+    }
+
+    #[test]
+    fn a_validator_is_reported_with_its_balances_and_zero_timestamps_without_headers() {
+        let provider = provider();
+        let pubkey = BLSPubkey::repeat_byte(0x42);
+        file_latest_state(&provider, state_with_validator(pubkey, 32_000_000_000));
+        let (ext, _rx) = beacon_ext(provider);
+        let info = ext.get_beacon_validator_by_pubkey(pubkey).unwrap().expect("known validator");
+        assert_eq!(info.effective_balance, 32_000_000_000);
+        assert_eq!(info.balance_in_beacon, 32_000_000_005);
+        assert_eq!(info.inactivity_score, 3);
+        assert_eq!(info.activation_timestamp, 0);
+        assert_eq!(info.exit_timestamp, 0);
+        assert_eq!(ext.get_beacon_validator_by_pubkey(BLSPubkey::repeat_byte(1)).unwrap(), None);
+    }
+
+    #[test]
+    fn a_validator_lookup_without_a_state_is_none() {
+        let (ext, _rx) = beacon_ext(provider());
+        assert_eq!(ext.get_beacon_validator_by_pubkey(BLSPubkey::repeat_byte(1)).unwrap(), None);
+    }
+
+    #[test]
+    fn the_total_effective_balance_needs_a_state_and_sums_active_validators() {
+        let provider = provider();
+        let (ext, _rx) = beacon_ext(provider.clone());
+        let err = ext.get_total_effective_balance().unwrap_err();
+        assert_eq!(err.code(), INTERNAL_ERROR_CODE);
+        assert!(err.message().contains("beacon state not found"), "{err}");
+
+        file_latest_state(&provider, state_with_validator(BLSPubkey::repeat_byte(2), 32_000_000_000));
+        assert_eq!(ext.get_total_effective_balance().unwrap(), 32_000_000_000);
+    }
+
+    #[test]
+    fn get_snapshot_of_an_unknown_block_goes_through_the_consensus_engine() {
+        let ext = ConsensusExt { consensus: NoopConsensus::default(), provider: provider() };
+        // The noop engine answers every snapshot request with the default one.
+        assert_eq!(ext.get_snapshot(5).unwrap(), Snapshot::default());
+        assert!(ext.proposals().unwrap().is_empty());
+        ext.propose(Address::repeat_byte(1), true).unwrap();
+        ext.discard(Address::repeat_byte(1)).unwrap();
+    }
+
     async fn start_server() -> std::net::SocketAddr {
         let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr().unwrap();

@@ -4065,3 +4065,7 @@ mod tests {
         assert_eq!(head_stamp(None, None), None, "genesis, which has no parent at all");
     }
 }
+
+#[cfg(test)]
+#[path = "service_tests.rs"]
+mod service_tests;

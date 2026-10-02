@@ -536,3 +536,143 @@ async fn at_most_one_chained_build_is_outstanding() {
     assert_eq!(asked.len(), 2, "the chain runs one block ahead of the last request and no further");
 }
 
+/// The header the chain seals for the block built on `head` with
+/// `attributes`, proposed in `view`, and the attributes of the block after it.
+fn sealed_on(head: &Header, attributes: &PayloadAttributes, view: u64) -> (Header, PayloadAttributes) {
+    sealer()(&FakeEl::build(head, attributes), attributes, view).expect("seals")
+}
+
+/// `N42_BUILD_AHEAD_AT_SEAL`: the chained build of block 42 seals before
+/// block 41 has been proposed (the proposal of 41 is what takes 42 out of the
+/// slot), so 43 may not start at 42's seal -- that would be two blocks ahead
+/// of the proposals. With the flag it starts the moment 42 is taken, without
+/// waiting for 42's own proposal; and it is still never two ahead.
+#[tokio::test]
+async fn with_the_flag_a_held_back_chain_starts_when_its_parent_is_taken() {
+    let (el, client) = fleet(true).await;
+    client.set_chain_sealer(sealer());
+    client.set_build_ahead_at_seal(true);
+
+    let first = client
+        .build_on_own_block_chaining(&parent(), attrs(1_000), Some(ChainAhead { view: 7 }))
+        .await
+        .expect("answered")
+        .expect("built");
+    assert_eq!(first.number, 41);
+    // 42 is chained at 41's seal and seals itself while nobody has taken it.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(el.asked.lock().expect("not poisoned").len(), 2, "no third build while 42 sits untaken");
+
+    // 41 proposed: its request takes 42, and 43 starts there and then -- not
+    // at the request 42's own proposal would make.
+    let (sealed41, next41) = sealed_on(&parent(), &attrs(1_000), 7);
+    let at = std::time::Instant::now();
+    let second = client
+        .build_on_own_block_chaining(&sealed41, next41.clone(), Some(ChainAhead { view: 8 }))
+        .await
+        .expect("answered")
+        .expect("built");
+    assert_eq!(second.number, 42);
+    let started = second.started.expect("a chained build says when it started");
+    assert_eq!(started.trigger, n42_h2_execution::BuildTrigger::Seal);
+    assert!(started.at < at, "42 started at 41's seal, before the request");
+    let (sealed42, next42) = sealed_on(&sealed41, &next41, 8);
+    let asked = asked_at_least(&el, 3).await;
+    assert_eq!(asked.len(), 3);
+    assert_eq!(asked[2].parent, sealed42.hash_slow(), "43 stands on the header 42's proposal will carry");
+    assert_eq!(asked[2].attrs, next42);
+    assert_eq!(asked[2].hint, Some(ChainHint { view: 9, chained: true }));
+
+    // One ahead and no further: 43 seals with 42 not yet proposed, so 44
+    // waits for 42's proposal in turn.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(el.asked.lock().expect("not poisoned").len(), 3, "44 does not start before 43 is taken");
+
+    let third = client
+        .build_on_own_block_chaining(&sealed42, next42.clone(), Some(ChainAhead { view: 9 }))
+        .await
+        .expect("answered")
+        .expect("built");
+    assert_eq!(third.number, 43);
+    assert_eq!(third.started.map(|start| start.trigger), Some(n42_h2_execution::BuildTrigger::Send));
+    let asked = asked_at_least(&el, 4).await;
+    assert_eq!(asked[3].parent, sealed_on(&sealed42, &next42, 9).0.hash_slow());
+    let from_the_proposal = asked.iter().filter(|one| one.hint.is_none_or(|hint| !hint.chained)).count();
+    assert_eq!(from_the_proposal, 1, "every build after the first came from the chain");
+}
+
+/// Flag off: today's behaviour. The start held back at 42's seal is dropped,
+/// and 43 waits for the request 42's own proposal makes.
+#[tokio::test]
+async fn without_the_flag_a_held_back_chain_start_is_dropped() {
+    let (el, client) = fleet(true).await;
+    client.set_chain_sealer(sealer());
+    client.set_build_ahead_at_seal(false);
+
+    client
+        .build_on_own_block_chaining(&parent(), attrs(1_000), Some(ChainAhead { view: 7 }))
+        .await
+        .expect("answered")
+        .expect("built");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let (sealed41, next41) = sealed_on(&parent(), &attrs(1_000), 7);
+    let second = client
+        .build_on_own_block_chaining(&sealed41, next41.clone(), Some(ChainAhead { view: 8 }))
+        .await
+        .expect("answered")
+        .expect("built");
+    assert_eq!(second.number, 42);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(el.asked.lock().expect("not poisoned").len(), 2, "nothing started 43 before its request");
+
+    let (sealed42, next42) = sealed_on(&sealed41, &next41, 8);
+    let third = client
+        .build_on_own_block_chaining(&sealed42, next42, Some(ChainAhead { view: 9 }))
+        .await
+        .expect("answered")
+        .expect("built");
+    assert_eq!(third.number, 43);
+    assert!(third.started.is_none(), "an ordinary request: the driver names its start");
+    let asked = el.asked.lock().expect("not poisoned").clone();
+    assert_eq!(asked[2].hint, Some(ChainHint { view: 9, chained: false }), "43 came from its own request");
+}
+
+/// The block the held-back start would stand on is not the one consensus
+/// went on with (a TC, a view change): the request names another parent, the
+/// chained build is discarded, and the held-back start goes with it -- no
+/// build ever stands on the abandoned block. (Its transactions go back to the
+/// queue on the execution layer's side: the superseded build's take at the
+/// next build, the sealed block's at the height's settlement.)
+#[tokio::test]
+async fn a_held_back_chain_start_is_dropped_when_its_parent_is_not_proposed() {
+    let (el, client) = fleet(true).await;
+    client.set_chain_sealer(sealer());
+    client.set_build_ahead_at_seal(true);
+
+    client
+        .build_on_own_block_chaining(&parent(), attrs(1_000), Some(ChainAhead { view: 7 }))
+        .await
+        .expect("answered")
+        .expect("built");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // 41 went out under another view: another header, another parent.
+    let (sealed41, next41) = sealed_on(&parent(), &attrs(1_000), 7);
+    let (elsewhere, next) = sealed_on(&parent(), &attrs(1_000), 9);
+    let built = client
+        .build_on_own_block_chaining(&elsewhere, next, Some(ChainAhead { view: 10 }))
+        .await
+        .expect("answered")
+        .expect("built");
+    assert_eq!(built.execution_data.payload.parent_hash(), elsewhere.hash_slow());
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let asked = el.asked.lock().expect("not poisoned").clone();
+    let abandoned = sealed_on(&sealed41, &next41, 8).0.hash_slow();
+    assert!(
+        asked.iter().all(|one| one.parent != abandoned),
+        "nothing was built on the block that was never proposed"
+    );
+    assert_eq!(asked[2].parent, elsewhere.hash_slow());
+}
+

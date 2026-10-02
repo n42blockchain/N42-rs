@@ -102,6 +102,9 @@ struct Chained {
     number: u64,
     /// When the request went out, which is what `lead_ms` measures from.
     started: std::time::Instant,
+    /// What started it: the parent's seal, or (a start deferred under
+    /// `N42_BUILD_AHEAD_AT_SEAL`) the take of the parent's own chained build.
+    trigger: n42_h2_execution::BuildTrigger,
     /// The built block, when the chain task has it.
     answer: tokio::sync::oneshot::Receiver<Option<Result<BuiltBlock, ElError>>>,
 }
@@ -125,6 +128,52 @@ struct ChainState {
     /// buffers in the first place. Two is enough: one generation's
     /// connection is still reading when the next one is made.
     spare: Vec<tokio::net::TcpStream>,
+    /// `N42_BUILD_AHEAD_AT_SEAL=1`: a chain start refused because the slot
+    /// still holds the very build that just sealed is kept here and started
+    /// the moment that build is taken, instead of being dropped.
+    defer_refused: bool,
+    /// The start refused that way, waiting for its parent's take.
+    deferred: Option<DeferredChain>,
+}
+
+/// A chain start that the one-ahead bound held back (see
+/// [`ChainState::deferred`]).
+///
+/// The slot held the chained build of block N-1 when N-1 sealed: N-2 had
+/// not been proposed yet (its proposal takes N-1 out of the slot), so
+/// starting N then would have put the leader two blocks ahead of its
+/// proposals. Without this the start was dropped, and N started only at the
+/// request after N-1's own proposal -- the late half of loop306S's builds,
+/// 79-82 ms after the previous proposal. Kept, it starts at N-2's proposal:
+/// the earliest moment the bound allows.
+struct DeferredChain {
+    /// The branch the sealed build belongs to; a discard abandons it.
+    generation: u64,
+    /// The sealer and the endpoint: what [`ChainCtx`] carries, minus the
+    /// shared state (held here, that would be a cycle).
+    sealer: ChainSealer,
+    addr: std::net::SocketAddr,
+    /// The header the execution layer sealed for N-1 and the attributes it
+    /// was built with.
+    built: alloy_consensus::Header,
+    built_with: PayloadAttributes,
+    /// The view N-1 is to be proposed in.
+    view: u64,
+}
+
+impl std::fmt::Debug for DeferredChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeferredChain")
+            .field("generation", &self.generation)
+            .field("number", &self.built.number)
+            .field("view", &self.view)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `N42_BUILD_AHEAD_AT_SEAL=1`: see [`ChainState::defer_refused`]. Default off.
+fn build_ahead_at_seal() -> bool {
+    std::env::var("N42_BUILD_AHEAD_AT_SEAL").is_ok_and(|value| value == "1")
 }
 
 /// Chain connections kept for reuse.
@@ -333,12 +382,24 @@ fn start_chain(
     built_with: &PayloadAttributes,
     view: u64,
 ) {
-    let ChainCtx { chain, sealer, generation, .. } = ctx;
-    let generation = *generation;
     // Synchronous on purpose. It is called from the very task it starts, one
     // generation on, and an `async fn` that spawned its own future type
     // would be a future containing itself.
-    let mut state = chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = ctx.chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    start_chain_locked(&mut state, ctx, built, built_with, view, n42_h2_execution::BuildTrigger::Seal);
+}
+
+/// [`start_chain`] under the chain's lock, which the caller holds.
+fn start_chain_locked(
+    state: &mut ChainState,
+    ctx: &ChainCtx,
+    built: &alloy_consensus::Header,
+    built_with: &PayloadAttributes,
+    view: u64,
+    trigger: n42_h2_execution::BuildTrigger,
+) {
+    let ChainCtx { sealer, generation, .. } = ctx;
+    let generation = *generation;
     if state.generation != generation {
         debug!(
             target: "n42.h2.el",
@@ -351,6 +412,29 @@ fn start_chain(
         // One ahead, never two: the previous chained build has not been
         // taken, so the proposal is behind and a second would be a block of
         // state nobody asked for.
+        //
+        // When the build in the slot is the very one that just sealed, the
+        // start is only early, not wrong: kept, it runs the moment that
+        // build is taken (`N42_BUILD_AHEAD_AT_SEAL`).
+        let own = waiting.generation == generation
+            && waiting.number == built.number
+            && waiting.parent == built.parent_hash;
+        if state.defer_refused && own {
+            debug!(
+                target: "n42.h2.el",
+                number = waiting.number,
+                "chain deferred: the sealed build has not been taken; its successor starts when it is"
+            );
+            state.deferred = Some(DeferredChain {
+                generation,
+                sealer: std::sync::Arc::clone(sealer),
+                addr: ctx.addr,
+                built: built.clone(),
+                built_with: built_with.clone(),
+                view,
+            });
+            return;
+        }
         debug!(
             target: "n42.h2.el",
             number = waiting.number,
@@ -387,8 +471,8 @@ fn start_chain(
         // finished; the block is dropped with it.
         let _ = tx.send(built);
     });
-    info!(target: "n42.h2.el", number, ?parent, view = next_view, "chain started");
-    state.slot = Some(Chained { generation, parent, attrs, number, started, answer });
+    info!(target: "n42.h2.el", number, ?parent, view = next_view, trigger = trigger.as_str(), "chain started");
+    state.slot = Some(Chained { generation, parent, attrs, number, started, trigger, answer });
 }
 
 /// What a chained build's connection came back with: the block, or the
@@ -529,7 +613,21 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             raw_import: tokio::sync::Mutex::new(RawChannel::default()),
             raw_build: tokio::sync::Mutex::new(RawChannel::default()),
             chain_sealer: std::sync::OnceLock::new(),
-            chain: std::sync::Arc::new(std::sync::Mutex::new(ChainState::default())),
+            chain: std::sync::Arc::new(std::sync::Mutex::new(ChainState {
+                defer_refused: build_ahead_at_seal(),
+                ..ChainState::default()
+            })),
+        }
+    }
+
+    /// Turns `N42_BUILD_AHEAD_AT_SEAL` on or off for this client (see
+    /// [`ChainState::defer_refused`]); the environment sets it at
+    /// construction.
+    pub fn set_build_ahead_at_seal(&self, on: bool) {
+        let mut state = self.chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.defer_refused = on;
+        if !on {
+            state.deferred = None;
         }
     }
 
@@ -546,11 +644,12 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         header: &alloy_consensus::Header,
         attrs: &PayloadAttributes,
     ) -> Option<Result<BuiltBlock, ElError>> {
-        let (chained, generation) = {
+        let (chained, generation, deferred) = {
             // Taken under the lock and waited for outside it: the task that
             // is finishing this build puts the next one in the same slot.
             let mut state = self.chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            (state.slot.take()?, state.generation)
+            let chained = state.slot.take()?;
+            (chained, state.generation, state.deferred.take())
         };
         // Hashed only once there is something to compare it with, so a node
         // that never chains pays nothing for the chain being here.
@@ -569,6 +668,11 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         } else {
             None
         };
+        if reason.is_none()
+            && let Some(deferred) = deferred
+        {
+            self.start_deferred(&chained, deferred);
+        }
         if let Some(reason) = reason {
             // Abandon the branch first: the task finishing this build would
             // otherwise start the one after it, and a single wrong guess
@@ -633,9 +737,46 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             ?parent,
             lead_ms,
             wait_ms,
+            trigger = chained.trigger.as_str(),
             "built ahead on the chain"
         );
+        let mut block = block;
+        block.started = Some(n42_h2_execution::BuildStart { at: chained.started, trigger: chained.trigger });
         Some(Ok(block))
+    }
+
+    /// Starts the chain start [`start_chain`] deferred for `taken`, which
+    /// the proposal path has just taken: the block before it has been
+    /// proposed, so the successor of `taken` keeps the leader one block
+    /// ahead of its proposals and no further.
+    ///
+    /// Only for the build it was deferred for, on the branch it was deferred
+    /// on: anything else is dropped (the branch was abandoned, or the slot
+    /// changed hands in between).
+    fn start_deferred(&self, taken: &Chained, deferred: DeferredChain) {
+        let mut state = self.chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let belongs = deferred.generation == taken.generation
+            && deferred.generation == state.generation
+            && deferred.built.number == taken.number
+            && deferred.built.parent_hash == taken.parent;
+        if !belongs || !state.defer_refused {
+            debug!(target: "n42.h2.el", number = deferred.built.number, "deferred chain start dropped: not the build taken");
+            return;
+        }
+        let ctx = ChainCtx {
+            chain: std::sync::Arc::clone(&self.chain),
+            sealer: deferred.sealer,
+            addr: deferred.addr,
+            generation: deferred.generation,
+        };
+        start_chain_locked(
+            &mut state,
+            &ctx,
+            &deferred.built,
+            &deferred.built_with,
+            deferred.view,
+            n42_h2_execution::BuildTrigger::Send,
+        );
     }
 
     /// Records the beacon root a build was started under.

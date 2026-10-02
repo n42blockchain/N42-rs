@@ -220,4 +220,45 @@ mod tests {
         let eof = read_kind_timed(&server).await.unwrap_err();
         assert_eq!(eof.kind(), std::io::ErrorKind::UnexpectedEof);
     }
+
+    fn unset(name: &str) -> bool {
+        std::env::var_os(name).is_none()
+    }
+
+    /// The road runtime is opt-in: with no switch set there is no runtime
+    /// handle, and the dispatch wait is not measured.
+    #[test]
+    fn the_road_runtime_is_off_unless_asked_for() {
+        if unset("N42_ROAD_RUNTIME") {
+            assert!(!enabled());
+            assert!(handle().is_none(), "the channel stays on the main runtime");
+        }
+        if unset("N42_ROAD_RUNTIME") && unset("N42_ROAD_DISPATCH_WAIT") {
+            assert!(!measure_dispatch_wait());
+        }
+    }
+
+    #[test]
+    fn the_worker_count_defaults_to_four() {
+        if unset("N42_ROAD_RUNTIME_WORKERS") {
+            assert_eq!(workers(), 4);
+        }
+    }
+
+    #[test]
+    fn the_nice_value_is_a_valid_priority() {
+        assert!((-20..=19).contains(&current_nice()));
+    }
+
+    /// A socket that never had timestamps enabled still reads, with no wait.
+    #[tokio::test]
+    async fn a_byte_without_a_kernel_timestamp_reads_with_no_wait() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        client.write_all(&[42]).await.unwrap();
+        let (kind, waited) = read_kind_timed(&server).await.unwrap();
+        assert_eq!(kind, 42);
+        assert!(waited.is_none(), "no SO_TIMESTAMPNS, no stamp");
+    }
 }

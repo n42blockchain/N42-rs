@@ -91,3 +91,7 @@ where
         Ok(self.raw_endpoint.map(|addr| addr.to_string()))
     }
 }
+
+#[cfg(test)]
+#[path = "engine_ext_tests.rs"]
+mod tests;

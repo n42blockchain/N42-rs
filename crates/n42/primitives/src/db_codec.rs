@@ -35,3 +35,86 @@ macro_rules! json_codec {
 }
 
 json_codec!(BeaconState, BeaconBlock, Validator, ValidatorBeforeTx, Snapshot);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BLSPubkey;
+    use alloy_primitives::{Address, B256};
+
+    fn roundtrip<T>(make: impl Fn() -> T)
+    where
+        T: Compress<Compressed = Vec<u8>> + Decompress + PartialEq + std::fmt::Debug,
+    {
+        let bytes = make().compress();
+        let back = T::decompress(&bytes).unwrap();
+        assert_eq!(back, make());
+    }
+
+    fn sample_validator() -> Validator {
+        Validator {
+            pubkey: BLSPubkey::repeat_byte(7),
+            withdrawal_credentials: B256::repeat_byte(1),
+            effective_balance: 32_000_000_000,
+            slashed: true,
+            activation_eligibility_epoch: 1,
+            activation_epoch: 2,
+            exit_epoch: 3,
+            withdrawable_epoch: 4,
+        }
+    }
+
+    #[test]
+    fn validator_roundtrips_through_json_codec() {
+        roundtrip(sample_validator);
+    }
+
+    #[test]
+    fn validator_before_tx_roundtrips() {
+        roundtrip(|| ValidatorBeforeTx {
+            address: Address::repeat_byte(9),
+            info: Some(sample_validator()),
+        });
+        roundtrip(|| ValidatorBeforeTx {
+            address: Address::ZERO,
+            info: None,
+        });
+    }
+
+    #[test]
+    fn beacon_block_roundtrips() {
+        roundtrip(|| {
+            let mut block = BeaconBlock::default();
+            block.slot = 42;
+            block.state_root = B256::repeat_byte(3);
+            block
+        });
+    }
+
+    #[test]
+    fn beacon_state_roundtrips_persisted_fields_only() {
+        let mut state = BeaconState::new();
+        state.slot = 99;
+        state.eth1_deposit_index = 5;
+        state.randao_mix = B256::repeat_byte(0xaa);
+        let bytes = state.compress();
+        let back = BeaconState::decompress(&bytes).unwrap();
+        assert_eq!(back.slot, 99);
+        assert_eq!(back.eth1_deposit_index, 5);
+        assert_eq!(back.randao_mix, B256::repeat_byte(0xaa));
+        assert_eq!(back.validators_len, 0);
+    }
+
+    #[test]
+    fn snapshot_type_has_codec() {
+        fn assert_codec<T: Compress + Decompress>() {}
+        assert_codec::<Snapshot>();
+    }
+
+    #[test]
+    fn decompress_rejects_garbage() {
+        assert!(Validator::decompress(b"not json").is_err());
+        assert!(BeaconBlock::decompress(b"").is_err());
+        assert!(BeaconState::decompress(b"{\"slot\":\"x\"}").is_err());
+    }
+}

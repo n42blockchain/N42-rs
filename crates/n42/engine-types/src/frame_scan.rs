@@ -309,4 +309,108 @@ mod tests {
         let short = [(transfer(0, 20_000, 10), a)];
         assert!(summarize(short.iter().map(|(tx, s)| (tx, *s))).is_none());
     }
+
+    fn with_chain(mut tx: TxEip1559, nonce: u64) -> TransactionSigned {
+        tx.nonce = nonce;
+        let signed = Signed::new_unchecked(tx, Signature::test_signature(), B256::random());
+        TransactionSigned::from(reth_ethereum_primitives::TransactionSigned::from(signed))
+    }
+
+    fn base_tx() -> TxEip1559 {
+        TxEip1559 {
+            chain_id: 7,
+            gas_limit: 21_000,
+            max_fee_per_gas: 10,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::repeat_byte(9)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn frames_that_mix_chains_or_invert_fees_are_not_summed() {
+        let a = Address::repeat_byte(1);
+        let other_chain = [(with_chain(base_tx(), 0), a), (with_chain(TxEip1559 { chain_id: 8, ..base_tx() }, 1), a)];
+        assert!(summarize(other_chain.iter().map(|(tx, s)| (tx, *s))).is_none());
+        let tip_over_cap = [(with_chain(TxEip1559 { max_priority_fee_per_gas: 11, ..base_tx() }, 0), a)];
+        assert!(summarize(tip_over_cap.iter().map(|(tx, s)| (tx, *s))).is_none());
+    }
+
+    #[test]
+    fn an_empty_frame_is_clean_and_usable_at_any_base_fee() {
+        let scan = summarize(std::iter::empty()).expect("nothing to refuse");
+        assert_eq!((scan.len, scan.chain_id, scan.gas_total, scan.runs.len()), (0, None, 0, 0));
+        assert_eq!(scan.min_fee_cap, u128::MAX);
+        // No chain id of its own: any chain's block will do.
+        assert!(scan.usable(1, SUMMARY_SPEC, u128::MAX));
+    }
+
+    #[test]
+    fn a_sender_that_returns_after_another_starts_a_new_run() {
+        let (a, b) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let txs = [(with_chain(base_tx(), 0), a), (with_chain(base_tx(), 4), b), (with_chain(base_tx(), 9), a)];
+        let scan = summarize(txs.iter().map(|(tx, s)| (tx, *s))).expect("clean");
+        let shape: Vec<_> = scan.runs.iter().map(|r| (r.sender, r.offset, r.first_nonce, r.len)).collect();
+        assert_eq!(shape, vec![(a, 0, 0, 1), (b, 1, 4, 1), (a, 2, 9, 1)]);
+        assert_eq!(scan.len, 3);
+    }
+
+    #[test]
+    fn the_intrinsic_shortfall_names_what_the_gas_limit_misses() {
+        let enough = with_chain(base_tx(), 0);
+        assert_eq!(intrinsic_gas_shortfall(&enough, SUMMARY_SPEC), None);
+        let short = with_chain(TxEip1559 { gas_limit: 20_999, ..base_tx() }, 0);
+        assert_eq!(intrinsic_gas_shortfall(&short, SUMMARY_SPEC), Some(21_000));
+        // A creation costs more than a call.
+        let create = with_chain(TxEip1559 { to: TxKind::Create, ..base_tx() }, 0);
+        assert!(intrinsic_gas_shortfall(&create, SUMMARY_SPEC).is_some_and(|needed| needed > 21_000));
+        // Calldata is charged.
+        let data = with_chain(TxEip1559 { input: vec![1u8; 100].into(), ..base_tx() }, 0);
+        assert!(intrinsic_gas_shortfall(&data, SUMMARY_SPEC).is_some_and(|needed| needed > 21_000));
+    }
+
+    #[test]
+    fn a_transactions_cost_is_value_plus_gas_at_the_cap_saturating() {
+        let tx = with_chain(TxEip1559 { value: U256::from(5), gas_limit: 30_000, max_fee_per_gas: 7, ..base_tx() }, 0);
+        assert_eq!(tx_cost(&tx), U256::from(5 + 30_000 * 7));
+        let huge = with_chain(TxEip1559 { value: U256::MAX, ..base_tx() }, 0);
+        assert_eq!(tx_cost(&huge), U256::MAX);
+    }
+
+    #[test]
+    fn summaries_are_filed_by_id_replaced_in_place_and_the_oldest_leave_first() {
+        let scan = |len: usize| FrameScan { len, chain_id: None, min_fee_cap: 1, gas_total: 0, runs: Vec::new() };
+        // Ids built from a tag no other test uses.
+        let id = |n: u32| {
+            let mut bytes = [0xC7u8; 32];
+            bytes[..4].copy_from_slice(&n.to_be_bytes());
+            B256::from(bytes)
+        };
+        remember(id(0), scan(1));
+        remember(id(0), scan(2));
+        assert_eq!(lookup([id(0)])[0].as_ref().map(|s| s.len), Some(2), "replaced");
+        assert!(lookup([id(u32::MAX)])[0].is_none());
+        let found = lookup([id(0), id(u32::MAX), id(0)]);
+        assert_eq!(found.iter().map(Option::is_some).collect::<Vec<_>>(), [true, false, true]);
+        // Fill the store past its bound: id(0) was the oldest of ours.
+        for n in 1..=(MAX_SUMMARIES as u32 + 1) {
+            remember(id(n), scan(3));
+        }
+        assert!(lookup([id(0)])[0].is_none(), "the oldest left");
+        assert!(lookup([id(MAX_SUMMARIES as u32 + 1)])[0].is_some());
+        assert!(store().lock().unwrap_or_else(|p| p.into_inner()).by_id.len() <= MAX_SUMMARIES);
+    }
+
+    #[test]
+    fn with_the_flag_off_nothing_is_filed_and_no_layout_is_kept() {
+        // The flag is read from the environment once; these tests never set it.
+        assert!(!enabled());
+        let block = B256::repeat_byte(0xD1);
+        remember_layout(block, vec![(B256::repeat_byte(1), 2, true)]);
+        assert!(layout_of(&block).is_none());
+        let id = B256::repeat_byte(0xD2);
+        note_admitted_any(id, &[], &Vec::<N42PooledTransaction>::new());
+        note_admitted_any(id, &[], &5u8);
+        assert!(lookup([id])[0].is_none());
+    }
 }

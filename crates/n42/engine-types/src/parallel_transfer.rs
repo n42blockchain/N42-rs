@@ -624,15 +624,28 @@ pub fn partition_by_sender(keys: &[(Address, Address)], beneficiary: Address) ->
     let mut group_of: alloy_primitives::map::AddressHashMap<usize> = alloy_primitives::map::AddressHashMap::default();
     group_of.reserve(keys.len() / 8);
     let mut groups: Vec<Vec<usize>> = Vec::new();
+    // A frame build's candidates come in sender runs (a frame's run of one
+    // sender at consecutive nonces, `n42_tx_queue` `SenderRun`): a candidate
+    // whose sender is the one before's joins that group without the map's
+    // probe -- one comparison a transfer instead of one hash, the same
+    // groups (step 7a: the partition was a hash a transaction).
+    let mut last: Option<(Address, usize)> = None;
     for (i, (sender, to)) in keys.iter().enumerate() {
         if *sender == beneficiary || *to == beneficiary {
             return Err(NotParallel::TouchesBeneficiary(i));
         }
-        let next = groups.len();
-        let g = *group_of.entry(*sender).or_insert(next);
-        if g == next {
-            groups.push(Vec::new());
-        }
+        let g = match last {
+            Some((prev, g)) if prev == *sender => g,
+            _ => {
+                let next = groups.len();
+                let g = *group_of.entry(*sender).or_insert(next);
+                if g == next {
+                    groups.push(Vec::new());
+                }
+                last = Some((*sender, g));
+                g
+            }
+        };
         groups[g].push(i);
     }
     Ok(groups)
@@ -1193,7 +1206,11 @@ impl<Tx: Send> BodyAhead<Tx> {
     ) -> Option<(Vec<(Address, Address)>, Self)> {
         use rayon::prelude::*;
         let at = std::time::Instant::now();
-        let (keys, (transactions, (senders, tips))): (Vec<Option<(Address, Address)>>, (Vec<Tx>, (Vec<Address>, Vec<u128>))) =
+        // A candidate that is not a plain transfer is noted, not carried as
+        // an `Option` key: the keys collect straight into their vector, with
+        // no serial pass over 163,000 options afterwards (step 7a).
+        let refused = std::sync::atomic::AtomicBool::new(false);
+        let (keys, (transactions, (senders, tips))): (Vec<(Address, Address)>, (Vec<Tx>, (Vec<Address>, Vec<u128>))) =
             build_pool().install(|| {
                 cands
                     .par_iter()
@@ -1201,11 +1218,17 @@ impl<Tx: Send> BodyAhead<Tx> {
                     .enumerate()
                     .map(|(i, cand)| {
                         let (key, tx, sender, tip) = each(i, cand);
+                        let key = key.unwrap_or_else(|| {
+                            refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                            (Address::ZERO, Address::ZERO)
+                        });
                         (key, (tx, (sender, tip)))
                     })
                     .unzip()
             });
-        let keys: Vec<(Address, Address)> = keys.into_iter().collect::<Option<Vec<_>>>()?;
+        if refused.into_inner() {
+            return None;
+        }
         Some((keys, Self { transactions, senders, tips, took_us: at.elapsed().as_micros() as u64 }))
     }
 }
@@ -6909,6 +6932,28 @@ mod tests {
         let convert =
             |i: usize| ((), evm_config.tx_env(reth_transaction_pool::PoolTransaction::consensus_ref(&cands[i].transaction)));
         println!("block: {} 0x50 transfers, {} pool threads", cands.len(), build_pool().current_num_threads());
+        // Step 7a: the partition by sender, the hash a transaction it was
+        // against the run skip it is, on the same keys; the same groups.
+        for _ in 0..3 {
+            let at = std::time::Instant::now();
+            let mut group_of: alloy_primitives::map::AddressHashMap<usize> = Default::default();
+            group_of.reserve(keys.len() / 8);
+            let mut old_groups: Vec<Vec<usize>> = Vec::new();
+            for (i, (sender, _)) in keys.iter().enumerate() {
+                let next = old_groups.len();
+                let g = *group_of.entry(*sender).or_insert(next);
+                if g == next {
+                    old_groups.push(Vec::new());
+                }
+                old_groups[g].push(i);
+            }
+            let old_us = at.elapsed().as_micros();
+            let at = std::time::Instant::now();
+            let groups = partition_by_sender(&keys, beneficiary).expect("no beneficiary");
+            let new_us = at.elapsed().as_micros();
+            assert_eq!(groups, old_groups, "the run skip's groups");
+            println!("partition by sender: hash a transfer {old_us} us, run skip {new_us} us ({} groups)", groups.len());
+        }
         // Rounds 0-3 and 8-9 the index built at the freeze, 4-7 entered live
         // by the batches (`N42_OUTPUT_INDEX_LIVE=1`); odd rounds of 0-7 with
         // the root job (the MPT build's; a frame build has none), rounds 8-9
@@ -6938,6 +6983,25 @@ mod tests {
                 let keys_only: Option<Vec<(Address, Address)>> =
                     build_pool().install(|| cands.par_iter().with_min_len(1024).map(key_of).collect());
                 let keys_us = at.elapsed().as_micros();
+                // Step 7a: the keys straight into their vector, a refusal
+                // noted beside it (the builder's prep now).
+                let at = std::time::Instant::now();
+                let refused = std::sync::atomic::AtomicBool::new(false);
+                let flat: Vec<(Address, Address)> = build_pool().install(|| {
+                    cands
+                        .par_iter()
+                        .with_min_len(1024)
+                        .map(|c| {
+                            key_of(c).unwrap_or_else(|| {
+                                refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                                (Address::ZERO, Address::ZERO)
+                            })
+                        })
+                        .collect()
+                });
+                let flat_us = at.elapsed().as_micros();
+                assert!(!refused.into_inner() && keys_only.as_ref() == Some(&flat), "the flat keys");
+                println!("prep keys: into Option<Vec> {keys_us} us, flat {flat_us} us");
                 let made = BodyAhead::make_keyed(&cands, |i, c| (key_of(c), body_tx(i), c.sender(), tip(i)));
                 (keys_only.map(|k| k.len()), keys_us, made)
             });

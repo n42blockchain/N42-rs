@@ -1692,11 +1692,23 @@ where
                         _ => (false, Vec::new(), None),
                     };
                 }
-                let keys: Option<Vec<(alloy_primitives::Address, alloy_primitives::Address)>> =
-                    cands.par_iter().with_min_len(1024).map(transfer_key).collect();
-                match keys {
-                    Some(keys) if !keys.is_empty() => (true, keys, None),
-                    _ => (false, Vec::new(), None),
+                // Straight into the vector, a refusal noted beside it: a
+                // collect into `Option<Vec>` is not an indexed collect.
+                let refused = std::sync::atomic::AtomicBool::new(false);
+                let keys: Vec<(alloy_primitives::Address, alloy_primitives::Address)> = cands
+                    .par_iter()
+                    .with_min_len(1024)
+                    .map(|tx| {
+                        transfer_key(tx).unwrap_or_else(|| {
+                            refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                            Default::default()
+                        })
+                    })
+                    .collect();
+                if refused.into_inner() || keys.is_empty() {
+                    (false, Vec::new(), None)
+                } else {
+                    (true, keys, None)
                 }
             });
             par_prep_ms = prep_at.elapsed().as_millis() as u64;

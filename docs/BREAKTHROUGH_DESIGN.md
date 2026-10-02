@@ -1286,3 +1286,48 @@ beside the import, the road and the post-execution waiting for it only where the
 0.1 ms after the frames' take (3.7 before, on the bench). The vote still needs the owned block for the
 pre-execution, seal and includability checks, so the road's end is expected ~11-14 (21-24 now), the fields
 ~82-85. Both wait for the host's swap to be emptied (loop304, then loop305 with the copy aside).
+
+### 10.53 The swap off, steps 7a and 7b on the fleet (loop305): the swap reading is falsified; the proposal waits for the pacing tick
+
+Tip a944a2e8b (steps 7a and 7b, five bug fixes), the host's swap empty (`swap_used_g=0`), 100 ms pacing, three nodes. C and Cb run
+`N42_FOLLOWER_COPY_ASIDE=1`. Stage columns are the median / p90 of the leader's (node0) full blocks of the whole leg (~750 blocks) and of
+the followers' direct imports of the same blocks; `root faults` and the dissection below read the same blocks (the dissection, window 1 only).
+
+| leg | win1 | cycle mean / median | leader: start / prep / exec / sealed_at / p90 | follower: road end / exec start / fields | root faults median / p90 | win2 |
+| --- | --- | --- | --- | --- | --- | --- |
+| A | 1,165,684 | 139 / 127 | 11 / 6 / 29 / 75 / 129 | 22 / 22 / 91 | 15 / 1,570 | 830,154 |
+| C | 1,159,095 | 140 / 133 | 12 / 6 / 29 / 76 / 101 | 28 / 10 / 81 | 8 / 1,113 | 874,685 |
+| Cb | 1,172,189 | 138 / 130 | 12 / 6 / 30 / 77 / 105 | 28 / 11 / 82 | 7 / 1,045 | 911,128 |
+| Ab | 1,171,357 | 139 / 131 | 11 / 6 / 29 / 75 / 120 | 22 / 22 / 91 | 13 / 1,548 | 836,687 |
+
+The record stays 1,226,047 (loop293); the four win1 values are within 1.1% of each other, inside the 4% spread of one configuration. 7a
+moved the seal median 84 -> 75-77 (the start, prep and execution read 11-12 / 6 / 29-30). 7b did what it was built for on the execution
+start (22 -> 10-11) and the fields (91 -> 81-82), and the seal's p90 fell 120-129 -> 101-105; but the road's end went the other way, 22 ->
+28 (not the 11-14 expected in 10.52): the vote waits for the copy aside (`copy_aside_ms` 16, `copy_wait_ms` 18-19 on the road, against 10
+for the inline `copy_ms` on A), so a follower's receipt -> vote reads 36 ms (p75 52) on Cb against 26 (p75 42) on A, and the leg's win1 does not move.
+**The swap reading of 10.50 is falsified**: with the swap empty the root's tail is still there (p90 1,045-1,570) and `root_append_faults`
+carry 98% of the faults of a faulting root. The faults are minor ones (`root_majflt` max 20 on Cb; one block with 7,822 on A), so no page was
+read back from disk.
+
+Which roots fault (Cb, 749 full blocks; faulting = `root_faults` >= 500, 158 blocks = 21%; A: 29%): not the chunk seal (`root_seals` > 0 on 3
+of 158 faulting roots and on 14 of 591 others; within the three blocks before 13/158 against 55/591), not the twig pool (`root_twig_pool_misses`
+0 on every block; refills on 20 of 158, none of the others' median), not a period (gaps between faulting blocks 1, 2, 4, 5, ... with no
+fixed value, median 2), not memory of the previous block (a faulting root follows a faulting one in 20% of cases, the base rate 21%), and none
+of the log lines in the 300 ms before the root is enriched (`compacted the QMDB log` 37% of faulting vs 51% of the others, `freed the QMDB
+records` 11% vs 14%, `forest lock held compute_operations` 88% vs 85%; the two that are over-represented, a lock wait on `on_persisted` and
+`sync_entries_if_file`, precede only 12 and 19 of the 158 faulting roots). The faulting share does grow with the chain
+(blocks 300-399: 14%, 500-599: 21%, 800-899: 27%, 900-999: 35%). **Not determined**: the cause stays unnamed; what is ruled out is the swap, the
+seal, the pool, a period and the neighbouring log events, and the growth with depth is the lead (the next legs need the faults per root
+against the tail of the append's file, not a rule from these counts).
+
+The cycle (Cb window 1, 213 full blocks, medians / p75): proposal to proposal 129 / 166 ms; `R1_collect` (B) 49 / 85; quorum of the parent
+to the proposal 59 / 87; the proposal's quorum comes 60 / 96 ms after it (A: 47 / 83). 73% of the proposals are `tick_bound` (A: 77%): the
+builder declined the view for the 100 ms pacing and the proposal went out at the tick, which lies 99.0 ms after the previous proposal
+(p90 99.3), `tick_late_us` 0.8 / 1.4 ms. After the tick the proposal still waited for its own seal in 34% of the cases (A: 39%): `take_sealed_us`
+0 / 44 ms (p90 65), the tick-to-send 10 / 53. The 27% not tick-bound (A: 23%) are the ones whose quorum came after the tick: 7 sent within 3 ms of
+the quorum, 51 later, the gap quorum -> proposal 6 / 43. The followers' receipt -> vote is 36 / 52 ms on both (`vote road` total 29 / 35, `copy_wait`
+18-19, `parent_fields_wait` and `parent_output_wait` 0); the votes are not what the proposal waits for in the median. **The proposal waits for the
+pacing tick (99 ms after the previous proposal) in three of four views, then for its own seal in a third of them, and for the quorum when the
+quorum lands after the tick (a quarter of the views, the 60 / 96 ms R1 tail)**: the median chain (seal 76, fields 82) is under the tick, the
+cycle median 130 is the tick plus the tails of the seal (p90 101-129) and of the quorum. A pacing below 100 ms moves the first term only; the
+seal's and the quorum's tails are the terms behind it.

@@ -416,11 +416,12 @@ impl FileEntries {
         let mut sealed = Ok(());
         for (key, value) in records.clone() {
             let record_len = KEY_LEN + LEN_LEN + value.len();
-            if !self.tail.is_empty() && self.tail.len() + record_len > CHUNK_BYTES {
-                if let Err(error) = self.seal_tail() {
-                    sealed = Err(error);
-                    break;
-                }
+            if !self.tail.is_empty()
+                && self.tail.len() + record_len > CHUNK_BYTES
+                && let Err(error) = self.seal_tail()
+            {
+                sealed = Err(error);
+                break;
             }
             if self.tail.capacity() < CHUNK_BYTES {
                 self.tail.reserve_exact(CHUNK_BYTES.max(record_len) - self.tail.len());

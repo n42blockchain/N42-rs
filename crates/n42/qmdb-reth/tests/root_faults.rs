@@ -212,7 +212,9 @@ fn root_faults() {
     drop(release);
     let _ = releaser.join();
     churn_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    churners.into_iter().for_each(|churner| drop(churner.join()));
+    for churner in churners {
+        let _ = churner.join();
+    }
     let (root_med, root_p90, root_max) = quantiles(root_ms);
     let (apply_med, apply_p90, apply_max) = quantiles(apply_ms);
     let over_50 = faults.iter().filter(|f| **f > 50.0).count();

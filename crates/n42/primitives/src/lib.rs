@@ -28,6 +28,9 @@ mod attestation_duty;
 mod beacon_committee;
 pub mod shuffle_list;
 
+#[cfg(test)]
+mod test_util;
+
 pub type Hash256 = alloy_primitives::B256;
 pub type Slot = u64;
 pub type CommitteeIndex = u64;

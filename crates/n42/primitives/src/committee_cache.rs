@@ -494,3 +494,286 @@ fn get_committee_count_per_slot_with(
         ),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::beacon_chain_spec;
+    use crate::test_util::{active_validator, state_with_validators};
+
+    fn spec() -> ChainSpec {
+        beacon_chain_spec()
+    }
+
+    fn cache_for(n: usize) -> (BeaconState, CommitteeCache) {
+        let state = state_with_validators(n, 0);
+        let cache = CommitteeCache::initialized(&state, 0, &spec()).unwrap();
+        (state, cache)
+    }
+
+    #[test]
+    fn committee_count_per_slot_is_clamped() {
+        // Fewer than 32 * target validators still yields one committee.
+        assert_eq!(get_committee_count_per_slot_with(0, 4, 4).unwrap(), 1);
+        assert_eq!(get_committee_count_per_slot_with(127, 4, 4).unwrap(), 1);
+        // 32 slots * target 4 = 128 validators per committee-per-slot.
+        assert_eq!(get_committee_count_per_slot_with(128, 4, 4).unwrap(), 1);
+        assert_eq!(get_committee_count_per_slot_with(256, 4, 4).unwrap(), 2);
+        // Capped by the max.
+        assert_eq!(get_committee_count_per_slot_with(100_000, 4, 4).unwrap(), 4);
+        // A zero target committee size is a division by zero, not a panic.
+        assert!(get_committee_count_per_slot_with(256, 4, 0).is_err());
+    }
+
+    #[test]
+    fn committee_index_and_range_arithmetic() {
+        // slot 33 is the second slot of its epoch; 2 committees per slot.
+        assert_eq!(compute_committee_index_in_epoch(33, 32, 2, 1), 3);
+        assert_eq!(compute_committee_index_in_epoch(0, 32, 2, 0), 0);
+        assert_eq!(epoch_committee_count(2, 32), 64);
+
+        assert_eq!(compute_committee_range_in_epoch(0, 0, 10), None);
+        assert_eq!(compute_committee_range_in_epoch(4, 4, 10), None);
+        assert_eq!(compute_committee_range_in_epoch(4, 9, 10), None);
+
+        // The ranges tile the shuffling exactly, with no gaps and no overlap.
+        let mut next = 0;
+        for i in 0..7 {
+            let r = compute_committee_range_in_epoch(7, i, 100).unwrap();
+            assert_eq!(r.start, next);
+            next = r.end;
+        }
+        assert_eq!(next, 100);
+    }
+
+    #[test]
+    fn initialized_builds_the_expected_shuffling() {
+        let (state, cache) = cache_for(256);
+        assert!(cache.is_initialized_at(0));
+        assert!(!cache.is_initialized_at(1));
+        assert_eq!(cache.active_validator_count(), 256);
+        assert_eq!(cache.committees_per_slot(), 2);
+        assert_eq!(cache.epoch_committee_count(), 64);
+
+        let seed = state.get_seed(0, DOMAIN_CONSTANT_BEACON_ATTESTER).unwrap();
+        let expected = shuffle_list((0..256).collect(), spec().shuffle_round_count, &seed[..], false)
+            .unwrap();
+        assert_eq!(cache.shuffling(), expected.as_slice());
+        assert_eq!(cache.active_validator_indices(), expected.as_slice());
+
+        // Positions invert the shuffling.
+        for (pos, &v) in cache.shuffling().iter().enumerate() {
+            assert_eq!(cache.shuffled_position(v), Some(pos));
+        }
+    }
+
+    #[test]
+    fn initialized_is_deterministic_across_shuffle_cache_hits() {
+        let state = state_with_validators(64, 0);
+        let a = CommitteeCache::initialized(&state, 0, &spec()).unwrap();
+        let b = CommitteeCache::initialized(&state, 0, &spec()).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.shuffling(), b.shuffling());
+    }
+
+    #[test]
+    #[ignore = "BUG: SHUFFLE_CACHE key (epoch, seed) ignores the active validator set, so a changed set with the same seed gets a stale shuffling (committee_cache.rs:105)"]
+    fn shuffle_cache_must_not_return_a_shuffling_of_another_validator_set() {
+        let spec = spec();
+        let state_a = state_with_validators(64, 0);
+        let mut state_b = state_with_validators(65, 0);
+        state_b.randao_mix = state_a.randao_mix;
+
+        let a = CommitteeCache::initialized(&state_a, 0, &spec).unwrap();
+        assert_eq!(a.active_validator_count(), 64);
+        let b = CommitteeCache::initialized(&state_b, 0, &spec).unwrap();
+        assert_eq!(b.active_validator_count(), 65);
+        assert!(b.shuffling().contains(&64));
+    }
+
+    #[test]
+    fn initialized_rejects_out_of_range_epoch_and_empty_sets() {
+        let state = state_with_validators(8, 0);
+        // current epoch is 0, so epoch 1 is the furthest allowed.
+        assert!(CommitteeCache::initialized(&state, 1, &spec()).is_ok());
+        let err = CommitteeCache::initialized(&state, 2, &spec()).unwrap_err();
+        assert!(err.to_string().contains("EpochOutOfBounds"));
+
+        let empty = BeaconState::new();
+        let err = CommitteeCache::initialized(&empty, 0, &spec()).unwrap_err();
+        assert!(err.to_string().contains("InsufficientValidators"));
+    }
+
+    #[test]
+    fn committees_partition_the_shuffling() {
+        let (_, cache) = cache_for(256);
+        let all = cache.get_all_beacon_committees().unwrap();
+        assert_eq!(all.len(), 64);
+
+        let flat: Vec<usize> = all.iter().flat_map(|c| c.committee.iter().copied()).collect();
+        assert_eq!(flat, cache.shuffling());
+        assert!(all.iter().all(|c| c.committee.len() == 4));
+
+        // Committees are ordered by slot, then by index.
+        for (n, c) in all.iter().enumerate() {
+            assert_eq!(c.slot, (n / 2) as u64);
+            assert_eq!(c.index, (n % 2) as u64);
+        }
+
+        let at_slot = cache.get_beacon_committees_at_slot(5).unwrap();
+        assert_eq!(at_slot.len(), 2);
+        assert_eq!(at_slot[0], all[10]);
+        assert_eq!(at_slot[1], all[11]);
+    }
+
+    #[test]
+    fn get_beacon_committee_rejects_bad_slot_and_index() {
+        let (_, cache) = cache_for(256);
+        assert!(cache.get_beacon_committee(0, 0).is_some());
+        // Index at or beyond committees_per_slot.
+        assert!(cache.get_beacon_committee(0, 2).is_none());
+        // Slot 32 belongs to epoch 1, which this cache is not initialised for.
+        assert!(cache.get_beacon_committee(32, 0).is_none());
+    }
+
+    #[test]
+    fn uninitialized_cache_gives_no_committees_or_duties() {
+        let cache = CommitteeCache::default();
+        assert!(!cache.is_initialized_at(0));
+        assert!(cache.get_beacon_committee(0, 0).is_none());
+        assert!(cache.get_beacon_committees_at_slot(0).is_err());
+        assert!(cache.get_all_beacon_committees().is_err());
+        assert!(cache.get_attestation_duties(0).is_none());
+        assert!(cache.shuffled_position(0).is_none());
+        assert_eq!(cache.active_validator_count(), 0);
+        assert_eq!(cache.committees_per_slot(), 0);
+        assert!(cache.shuffling().is_empty());
+        assert_eq!(cache.convert_to_slot_and_index(3), None);
+    }
+
+    #[test]
+    fn attestation_duties_match_the_committee_layout() {
+        let (_, cache) = cache_for(256);
+        let all = cache.get_all_beacon_committees().unwrap();
+        for validator in 0..256usize {
+            let duty = cache.get_attestation_duties(validator).unwrap();
+            let committee = cache.get_beacon_committee(duty.slot, duty.index).unwrap();
+            assert_eq!(committee.committee[duty.committee_position], validator);
+            assert_eq!(duty.committee_len, committee.committee.len());
+            assert_eq!(duty.committees_at_slot, 2);
+            assert!(all.contains(&committee));
+        }
+        assert!(cache.get_attestation_duties(256).is_none());
+    }
+
+    #[test]
+    fn inactive_validators_have_no_position_or_duty() {
+        let spec = spec();
+        let mut state = state_with_validators(64, 0);
+        let mut exited = active_validator(3, &spec);
+        exited.exit_epoch = 0;
+        state.validators_store.set(3, exited).unwrap();
+
+        let cache = CommitteeCache::initialized(&state, 0, &spec).unwrap();
+        assert_eq!(cache.active_validator_count(), 63);
+        assert!(!cache.shuffling().contains(&3));
+        assert_eq!(cache.shuffled_position(3), None);
+        assert!(cache.get_attestation_duties(3).is_none());
+        assert!(cache.get_attestation_duties(4).is_some());
+    }
+
+    #[test]
+    fn equality_ignores_trailing_inactive_validators() {
+        let spec = spec();
+        let state_a = state_with_validators(64, 0);
+        let mut state_b = state_with_validators(64, 0);
+        state_b.randao_mix = state_a.randao_mix;
+        // A trailing, never-activated validator only extends shuffling_positions with None.
+        let mut pending = active_validator(64, &spec);
+        pending.activation_epoch = spec.far_future_epoch;
+        state_b.validators_store.push(pending).unwrap();
+        state_b.balances_store.push(0).unwrap();
+        state_b.inactivity_scores_store.push(0).unwrap();
+
+        let a = CommitteeCache::initialized(&state_a, 0, &spec).unwrap();
+        let b = CommitteeCache::initialized(&state_b, 0, &spec).unwrap();
+        assert_eq!(a.shuffling_positions.len() + 1, b.shuffling_positions.len());
+        assert_eq!(a, b);
+        assert_eq!(b, a);
+
+        // A different set of active validators is not equal.
+        let mut state_c = state_with_validators(65, 0);
+        state_c.randao_mix = state_a.randao_mix ^ B256::repeat_byte(1);
+        let c = CommitteeCache::initialized(&state_c, 0, &spec).unwrap();
+        assert_ne!(a, c);
+        // Equal-length position vectors that differ are not equal either.
+        let mut d = a.clone();
+        d.shuffling_positions.swap(0, 1);
+        assert_ne!(a, d);
+    }
+
+    #[test]
+    fn ssz_and_json_roundtrip() {
+        let (_, cache) = cache_for(100);
+        let bytes = cache.as_ssz_bytes();
+        let back = CommitteeCache::from_ssz_bytes(&bytes).unwrap();
+        assert_eq!(back, cache);
+        assert_eq!(back.shuffling(), cache.shuffling());
+        assert!(back.is_initialized_at(0));
+
+        let json = serde_json::to_string(&cache).unwrap();
+        let from_json: CommitteeCache = serde_json::from_str(&json).unwrap();
+        assert_eq!(from_json, cache);
+
+        // An uninitialised cache keeps its `None` epoch through SSZ.
+        let default_back =
+            CommitteeCache::from_ssz_bytes(&CommitteeCache::default().as_ssz_bytes()).unwrap();
+        assert!(!default_back.is_initialized_at(0));
+        assert!(CommitteeCache::from_ssz_bytes(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn non_zero_usize_option_ssz_uses_four_byte_selector() {
+        let none = NonZeroUsizeOption(None);
+        let some = NonZeroUsizeOption::from(NonZeroUsize::new(5));
+        assert_eq!(none.ssz_bytes_len(), none.as_ssz_bytes().len());
+        assert_eq!(some.ssz_bytes_len(), some.as_ssz_bytes().len());
+        // Four-byte selector followed by the value, so Some is longer than None.
+        assert!(some.as_ssz_bytes().len() > none.as_ssz_bytes().len());
+        assert_eq!(
+            NonZeroUsizeOption::from_ssz_bytes(&some.as_ssz_bytes()).unwrap(),
+            some
+        );
+        assert_eq!(
+            NonZeroUsizeOption::from_ssz_bytes(&none.as_ssz_bytes()).unwrap(),
+            none
+        );
+        assert!(!<NonZeroUsizeOption as Encode>::is_ssz_fixed_len());
+        assert!(!<NonZeroUsizeOption as Decode>::is_ssz_fixed_len());
+        let mut buf = Vec::new();
+        some.ssz_append(&mut buf);
+        assert_eq!(buf, some.as_ssz_bytes());
+    }
+
+    #[test]
+    fn free_function_active_indices_filters_by_epoch() {
+        let spec = spec();
+        let mut late = active_validator(1, &spec);
+        late.activation_epoch = 5;
+        let mut exited = active_validator(2, &spec);
+        exited.exit_epoch = 3;
+        let validators = vec![active_validator(0, &spec), late, exited];
+        assert_eq!(get_active_validator_indices(&validators, 0), vec![0, 2]);
+        assert_eq!(get_active_validator_indices(&validators, 4), vec![0]);
+        assert_eq!(get_active_validator_indices(&validators, 5), vec![0, 1]);
+    }
+
+    #[test]
+    fn arbitrary_cache_is_the_default_cache() {
+        use arbitrary::Arbitrary;
+        let mut u = arbitrary::Unstructured::new(&[1, 2, 3]);
+        let c = CommitteeCache::arbitrary(&mut u).unwrap();
+        assert!(!c.is_initialized_at(0));
+        assert_eq!(c.active_validator_count(), 0);
+    }
+}

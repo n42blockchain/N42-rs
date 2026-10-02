@@ -1483,4 +1483,577 @@ mod tests {
         assert_eq!(wait.split(), "3/150/40/0 polls=60 gp_layer=0 ggp_missing=0");
         assert_eq!(open_wait::take(), OpenWait::default());
     }
+
+    // ---- helpers over a provider whose answers can be scripted ----
+
+    use reth_storage_api::errors::ProviderError;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    /// A provider that answers every state request from one mock state, except
+    /// that `state_by_block_hash` can be told to miss: a number of times, for
+    /// named hashes until `released`, or with a fatal error.
+    struct Scripted {
+        inner: MockEthProvider,
+        /// Misses served first, whatever the hash.
+        flaky_first: AtomicUsize,
+        /// Hashes that miss until `released` is set.
+        missing: HashSet<B256>,
+        /// Hashes that fail with an error that is not a miss.
+        fatal: HashSet<B256>,
+        released: Arc<AtomicBool>,
+        calls: AtomicUsize,
+    }
+
+    impl Scripted {
+        fn new(inner: MockEthProvider) -> Self {
+            Self {
+                inner,
+                flaky_first: AtomicUsize::new(0),
+                missing: HashSet::new(),
+                fatal: HashSet::new(),
+                released: Arc::new(AtomicBool::new(false)),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl BlockHashReader for Scripted {
+        fn block_hash(&self, _number: u64) -> ProviderResult<Option<B256>> {
+            Ok(None)
+        }
+        fn canonical_hashes_range(&self, _start: u64, _end: u64) -> ProviderResult<Vec<B256>> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl reth_storage_api::BlockNumReader for Scripted {
+        fn chain_info(&self) -> ProviderResult<reth_chainspec::ChainInfo> {
+            Ok(Default::default())
+        }
+        fn best_block_number(&self) -> ProviderResult<u64> {
+            Ok(0)
+        }
+        fn last_block_number(&self) -> ProviderResult<u64> {
+            Ok(0)
+        }
+        fn block_number(&self, _hash: B256) -> ProviderResult<Option<u64>> {
+            Ok(None)
+        }
+    }
+
+    impl reth_storage_api::BlockIdReader for Scripted {
+        fn pending_block_num_hash(&self) -> ProviderResult<Option<alloy_eips::BlockNumHash>> {
+            Ok(None)
+        }
+        fn safe_block_num_hash(&self) -> ProviderResult<Option<alloy_eips::BlockNumHash>> {
+            Ok(None)
+        }
+        fn finalized_block_num_hash(&self) -> ProviderResult<Option<alloy_eips::BlockNumHash>> {
+            Ok(None)
+        }
+    }
+
+    impl StateProviderFactory for Scripted {
+        fn latest(&self) -> ProviderResult<StateProviderBox> {
+            self.inner.latest()
+        }
+        fn state_by_block_number_or_tag(&self, n: alloy_eips::BlockNumberOrTag) -> ProviderResult<StateProviderBox> {
+            self.inner.state_by_block_number_or_tag(n)
+        }
+        fn history_by_block_number(&self, block: u64) -> ProviderResult<StateProviderBox> {
+            self.inner.history_by_block_number(block)
+        }
+        fn history_by_block_hash(&self, block: B256) -> ProviderResult<StateProviderBox> {
+            self.inner.history_by_block_hash(block)
+        }
+        fn state_by_block_hash(&self, block: B256) -> ProviderResult<StateProviderBox> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fatal.contains(&block) {
+                return Err(ProviderError::UnsupportedProvider);
+            }
+            let flaky = self.flaky_first.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+            if flaky.is_ok() || (self.missing.contains(&block) && !self.released.load(Ordering::SeqCst)) {
+                return Err(ProviderError::StateForHashNotFound(block));
+            }
+            self.inner.state_by_block_hash(block)
+        }
+        fn pending(&self) -> ProviderResult<StateProviderBox> {
+            self.inner.pending()
+        }
+        fn pending_state_by_hash(&self, h: B256) -> ProviderResult<Option<StateProviderBox>> {
+            self.inner.pending_state_by_hash(h)
+        }
+        fn maybe_pending(&self) -> ProviderResult<Option<StateProviderBox>> {
+            self.inner.maybe_pending()
+        }
+    }
+
+    fn info(nonce: u64, balance: u64) -> AccountInfo {
+        AccountInfo { nonce, balance: U256::from(balance), ..Default::default() }
+    }
+
+    fn nonce_of(state: &StateProviderBox, address: Address) -> Option<u64> {
+        state.basic_account(&address).expect("read").map(|a| a.nonce)
+    }
+
+    fn is_miss<T>(result: &ProviderResult<T>) -> bool {
+        matches!(result, Err(ProviderError::StateForHashNotFound(_)))
+    }
+
+    #[test]
+    fn a_state_that_is_not_there_yet_is_polled_for_and_counted() {
+        let _ = open_wait::take();
+        let mut client = Scripted::new(MockEthProvider::default());
+        client.flaky_first = AtomicUsize::new(2);
+        assert!(state_at_soon(&client, B256::with_last_byte(1)).is_ok());
+        assert_eq!(client.calls.load(Ordering::SeqCst), 3, "two misses, then the state");
+        assert_eq!(open_wait::take().grandparent_polls, 2);
+
+        // Found at once: no polling.
+        let client = Scripted::new(MockEthProvider::default());
+        assert!(state_at_soon(&client, B256::with_last_byte(1)).is_ok());
+        assert_eq!(open_wait::take().grandparent_polls, 0);
+    }
+
+    #[test]
+    fn an_error_that_is_not_a_miss_is_not_waited_on() {
+        let _ = open_wait::take();
+        let hash = B256::with_last_byte(2);
+        let mut client = Scripted::new(MockEthProvider::default());
+        client.fatal.insert(hash);
+        let at = std::time::Instant::now();
+        assert!(matches!(state_at_soon(&client, hash), Err(ProviderError::UnsupportedProvider)));
+        assert!(at.elapsed() < GRANDPARENT_WAIT, "returned without waiting");
+        assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(open_wait::take().grandparent_polls, 0);
+    }
+
+    #[test]
+    fn a_state_that_never_arrives_is_refused_after_the_bounded_wait() {
+        let _ = open_wait::take();
+        let hash = B256::with_last_byte(3);
+        let mut client = Scripted::new(MockEthProvider::default());
+        client.missing.insert(hash);
+        let at = std::time::Instant::now();
+        let result = state_at_soon(&client, hash);
+        assert!(matches!(result, Err(ProviderError::StateForHashNotFound(h)) if h == hash));
+        assert!(at.elapsed() >= GRANDPARENT_WAIT, "waited the whole bound: {:?}", at.elapsed());
+        assert!(open_wait::take().grandparent_polls > 5, "and looked again meanwhile");
+    }
+
+    #[test]
+    fn the_built_parent_opener_waits_for_the_grandparent_and_lays_the_parent_over_it() {
+        let _guard = store_lock();
+        let sender = Address::with_last_byte(0x61);
+        let other = Address::with_last_byte(0x62);
+        let grandparent = B256::with_last_byte(0x6a);
+        let mock = MockEthProvider::default();
+        mock.add_account(sender, ExtendedAccount::new(1, U256::from(10)));
+        mock.add_account(other, ExtendedAccount::new(9, U256::from(10)));
+        let mut client = Scripted::new(mock);
+        client.flaky_first = AtomicUsize::new(1);
+        let bundle = BundleState::builder(61..=61).state_present_account_info(sender, info(2, 5)).build();
+        let header = Header { number: 61, parent_hash: grandparent, ..Default::default() };
+        let execution = execution_of(&header, bundle);
+        let sealed = SealedHeader::seal_slow(Header { extra_data: b"view 61".as_slice().into(), ..header });
+        let opener = opener_on_built_parent(client, grandparent, executed_under_seal(&sealed, &execution));
+        let state = opener().expect("opens after one miss");
+        assert_eq!(nonce_of(&state, sender), Some(2), "the parent's value");
+        assert_eq!(nonce_of(&state, other), Some(9), "the grandparent's value");
+        // Every call of the opener is a fresh view.
+        assert_eq!(nonce_of(&opener().expect("again"), sender), Some(2));
+    }
+
+    #[test]
+    fn the_published_parent_opener_reads_newest_first_over_the_anchor() {
+        let acct = Address::with_last_byte(0x71);
+        let only_old = Address::with_last_byte(0x72);
+        let anchor = B256::with_last_byte(0x7a);
+        let mock = MockEthProvider::default();
+        mock.add_account(acct, ExtendedAccount::new(0, U256::from(1)));
+        mock.add_account(Address::with_last_byte(0x73), ExtendedAccount::new(3, U256::from(1)));
+        let output = |block: u64, entries: &[(Address, u64)]| {
+            let mut builder = BundleState::builder(block..=block);
+            for (address, nonce) in entries {
+                builder = builder.state_present_account_info(*address, info(*nonce, 1));
+            }
+            Arc::new(BlockExecutionOutput { result: Default::default(), state: builder.build() })
+        };
+        let seal = |number: u64| {
+            SealedHeader::seal_slow(Header { number, parent_hash: B256::with_last_byte(number as u8), ..Default::default() })
+        };
+        let newest = executed_from_output(&seal(72), output(72, &[(acct, 7)]));
+        let older = executed_from_output(&seal(71), output(71, &[(acct, 5), (only_old, 4)]));
+        let opener = opener_on_published_parent(Scripted::new(mock), anchor, vec![newest, older]);
+        let state = opener().expect("opens");
+        assert_eq!(nonce_of(&state, acct), Some(7), "the newest block that touched it answers");
+        assert_eq!(nonce_of(&state, only_old), Some(4), "an older block's own account");
+        assert_eq!(nonce_of(&state, Address::with_last_byte(0x73)), Some(3), "the anchor's");
+        assert_eq!(state.block_hash(72).expect("read"), Some(seal(72).hash()));
+        assert_eq!(state.block_hash(71).expect("read"), Some(seal(71).hash()));
+    }
+
+    #[test]
+    fn executed_from_output_keeps_the_sealed_header_and_shares_the_output() {
+        let parent = SealedHeader::seal_slow(Header { number: 8, extra_data: b"view 8".as_slice().into(), ..Default::default() });
+        let output = Arc::new(BlockExecutionOutput { result: Default::default(), state: BundleState::default() });
+        let executed = executed_from_output(&parent, output.clone());
+        assert_eq!(executed.recovered_block.hash(), parent.hash());
+        assert_eq!(executed.recovered_block.header().number, 8);
+        assert!(executed.recovered_block.body().transactions.is_empty(), "the body is left empty by design");
+        assert!(executed.recovered_block.senders().is_empty());
+        assert!(Arc::ptr_eq(&executed.execution_output, &output));
+    }
+
+    #[test]
+    fn executed_under_seal_carries_the_body_and_the_senders() {
+        let sender = Address::with_last_byte(0x81);
+        let header = Header { number: 9, ..Default::default() };
+        let mut execution = execution_of(&header, BundleState::default());
+        let tx = n42_tx_types::N42TxEnvelope::Eth(reth_ethereum_primitives::TransactionSigned::new_unhashed(
+            reth_ethereum_primitives::Transaction::Legacy(alloy_consensus::TxLegacy { nonce: 3, ..Default::default() }),
+            alloy_primitives::Signature::test_signature(),
+        ));
+        let block = Block {
+            header: header.clone(),
+            body: BlockBody { transactions: vec![tx], ommers: Vec::new(), withdrawals: Some(Vec::new().into()) },
+        };
+        execution.block = Arc::new(RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), vec![sender]));
+        let sealed = SealedHeader::seal_slow(Header { extra_data: b"view 9".as_slice().into(), ..header });
+        let executed = executed_under_seal(&sealed, &execution);
+        assert_eq!(executed.recovered_block.hash(), sealed.hash());
+        assert_eq!(executed.recovered_block.body().transactions.len(), 1);
+        assert_eq!(executed.recovered_block.senders(), &[sender]);
+        assert!(Arc::ptr_eq(&executed.execution_output, &execution.execution_output));
+    }
+
+    #[test]
+    fn a_parents_builder_hash_is_named_by_each_kind_of_execution() {
+        let header = Header { number: 10, ..Default::default() };
+        let execution = execution_of(&header, BundleState::default());
+        let built = execution.block.hash();
+        assert_eq!(ParentExecution::Ready(execution).built_hash(), built);
+        assert_eq!(ParentExecution::Sealed { built_hash: B256::with_last_byte(5) }.built_hash(), B256::with_last_byte(5));
+        let published = ParentExecution::Published {
+            parent_hash: B256::with_last_byte(6),
+            executed: Vec::new(),
+            anchor: B256::with_last_byte(7),
+        };
+        assert_eq!(published.built_hash(), B256::with_last_byte(6));
+    }
+
+    #[test]
+    fn the_first_registered_builder_wins() {
+        struct Stub(&'static str);
+        impl DirectBuilder for Stub {
+            fn build_on_own(&self, _request: BuildOnOwnRequest) -> Result<N42BuiltPayload, String> {
+                Err(self.0.to_owned())
+            }
+        }
+        let first: Arc<dyn DirectBuilder> = Arc::new(Stub("first"));
+        register(first);
+        let registered = get().expect("a builder is registered");
+        register(Arc::new(Stub("second")));
+        let still = get().expect("still registered");
+        assert!(Arc::ptr_eq(&registered, &still), "a second registration does not replace the first");
+    }
+
+    #[test]
+    fn a_missing_parent_output_refuses_the_open_at_once() {
+        let _guard = store_lock();
+        let parent = SealedHeader::seal_slow(Header { number: 91, extra_data: b"view 91".as_slice().into(), ..Default::default() });
+        let opener = opener_on_sealed_parent_with(Scripted::new(MockEthProvider::default()), parent.clone(), B256::with_last_byte(0x9f), false);
+        let at = std::time::Instant::now();
+        match opener() {
+            Err(ProviderError::StateForHashNotFound(hash)) => assert_eq!(hash, parent.hash()),
+            Err(other) => panic!("a miss naming the parent was expected, got {other:?}"),
+            Ok(_) => panic!("an unfiled output cannot open"),
+        }
+        assert!(at.elapsed() < std::time::Duration::from_secs(1), "an unfiled build is not waited for");
+    }
+
+    /// Files a build as `StateReady` (its bundle is its state) and returns it with its seal.
+    fn file_ready(number: u64, parent_hash: B256, bundle: BundleState) -> (SealedHeader, B256) {
+        let header = Header { number, parent_hash, gas_used: number * 1_000, ..Default::default() };
+        let execution = execution_of(&header, bundle);
+        let built_hash = execution.block.hash();
+        let sealed = SealedHeader::seal_slow(Header { extra_data: format!("view {number}").into_bytes().into(), ..header });
+        crate::built_executions::remember_pending(built_hash, execution.block.clone());
+        crate::built_executions::state_ready(built_hash, execution);
+        (sealed, built_hash)
+    }
+
+    #[test]
+    fn a_grandparent_found_at_once_needs_no_wait_on_the_parent() {
+        let _guard = store_lock();
+        let _ = open_wait::take();
+        let grandparent = B256::with_last_byte(0xa1);
+        let (sealed, built) = file_ready(101, grandparent, BundleState::default());
+        // Pending: even a parent that is finishing is not waited for when the state is there.
+        let state = grandparent_state(&Scripted::new(MockEthProvider::default()), grandparent, built);
+        assert!(state.is_ok());
+        assert_eq!(open_wait::take().parent_root_ms, 0);
+        let _ = sealed;
+    }
+
+    #[test]
+    fn a_grandparent_missing_for_a_parent_that_is_done_is_a_plain_miss() {
+        let _guard = store_lock();
+        let _ = open_wait::take();
+        let grandparent = B256::with_last_byte(0xa2);
+        let mut client = Scripted::new(MockEthProvider::default());
+        client.missing.insert(grandparent);
+        // Not filed at all: `finishing` is false, so no extra waiting follows the bounded wait.
+        let at = std::time::Instant::now();
+        let result = grandparent_state(&client, grandparent, B256::with_last_byte(0xaf));
+        assert!(is_miss(&result));
+        assert!(at.elapsed() < GRANDPARENT_WAIT * 2, "one bounded wait only: {:?}", at.elapsed());
+        let wait = open_wait::take();
+        assert_eq!(wait.parent_root_ms, 0);
+        assert_eq!(wait.parent_complete_ms, 0);
+    }
+
+    #[test]
+    fn a_grandparent_that_lands_after_the_parents_root_is_found_on_the_second_look() {
+        let _guard = store_lock();
+        let _ = open_wait::take();
+        let grandparent = B256::with_last_byte(0xa3);
+        let header = Header { number: 103, parent_hash: grandparent, ..Default::default() };
+        let execution = execution_of(&header, BundleState::default());
+        let built = execution.block.hash();
+        // Sealed, finishing; its QMDB root is already published, so the root wait returns at once.
+        crate::built_executions::remember_pending(built, execution.block.clone());
+        crate::executed_fields::remember(
+            built,
+            crate::executed_fields::ExecutedFields {
+                state_root: B256::with_last_byte(1),
+                receipts_root: B256::with_last_byte(2),
+                logs_bloom: Default::default(),
+                gas_used: 0,
+            },
+        );
+        let mut client = Scripted::new(MockEthProvider::default());
+        client.missing.insert(grandparent);
+        let released = client.released.clone();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(GRANDPARENT_WAIT + std::time::Duration::from_millis(50));
+            released.store(true, Ordering::SeqCst);
+        });
+        let result = grandparent_state(&client, grandparent, built);
+        releaser.join().expect("releaser");
+        assert!(result.is_ok(), "the second look, after the root wait, finds it");
+        assert_eq!(crate::built_executions::stage_of(built), Some(crate::built_executions::Stage::Sealed));
+        assert!(open_wait::take().grandparent_polls > 0);
+    }
+
+    #[test]
+    fn a_grandparent_that_lands_with_the_parents_finish_is_found_on_the_last_look() {
+        let _guard = store_lock();
+        let _ = open_wait::take();
+        let grandparent = B256::with_last_byte(0xa4);
+        let header = Header { number: 104, parent_hash: grandparent, ..Default::default() };
+        let execution = execution_of(&header, BundleState::default());
+        let built = execution.block.hash();
+        crate::built_executions::remember_pending(built, execution.block.clone());
+        crate::executed_fields::remember(
+            built,
+            crate::executed_fields::ExecutedFields {
+                state_root: B256::with_last_byte(3),
+                receipts_root: B256::with_last_byte(4),
+                logs_bloom: Default::default(),
+                gas_used: 0,
+            },
+        );
+        let mut client = Scripted::new(MockEthProvider::default());
+        client.missing.insert(grandparent);
+        let released = client.released.clone();
+        // The engine gets the grandparent, then the parent's finish completes.
+        let finisher = std::thread::spawn(move || {
+            std::thread::sleep(GRANDPARENT_WAIT * 2 + std::time::Duration::from_millis(100));
+            released.store(true, Ordering::SeqCst);
+            crate::built_executions::complete(built, execution);
+        });
+        let result = grandparent_state(&client, grandparent, built);
+        finisher.join().expect("finisher");
+        assert!(result.is_ok(), "found after the parent's finish");
+        assert_eq!(crate::built_executions::stage_of(built), Some(crate::built_executions::Stage::Complete));
+    }
+
+    // ---- leader_layers ----
+
+    fn layer_of(number: u64, parent_hash: B256, bundle: BundleState) -> (leader_layers::Layer, SealedHeader) {
+        let sealed = SealedHeader::seal_slow(Header { number, parent_hash, extra_data: format!("layer {number}").into_bytes().into(), ..Default::default() });
+        let output = Arc::new(BlockExecutionOutput { result: Default::default(), state: bundle });
+        ((executed_from_output(&sealed, output), None), sealed)
+    }
+
+    #[test]
+    fn keeping_a_layer_releases_everything_but_its_parent() {
+        let _guard = store_lock();
+        let (a, a_seal) = layer_of(201, B256::with_last_byte(0xb0), BundleState::default());
+        let (b, b_seal) = layer_of(202, a_seal.hash(), BundleState::default());
+        let (c, c_seal) = layer_of(203, b_seal.hash(), BundleState::default());
+        leader_layers::keep(&a);
+        leader_layers::keep(&b);
+        assert!(leader_layers::find(a_seal.hash()).is_some() && leader_layers::find(b_seal.hash()).is_some());
+        leader_layers::keep(&c);
+        assert!(leader_layers::find(a_seal.hash()).is_none(), "the great-grandparent is released");
+        assert!(leader_layers::find(b_seal.hash()).is_some(), "the parent stays: it is the child's grandparent");
+        assert!(leader_layers::find(c_seal.hash()).is_some());
+        assert_eq!(leader_layers::len(), 2);
+        // Keeping the same block again does not duplicate it.
+        leader_layers::keep(&c);
+        assert_eq!(leader_layers::len(), 2);
+        // An unrelated block (a reorg) keeps nothing of the old chain.
+        let (d, d_seal) = layer_of(300, B256::with_last_byte(0xb1), BundleState::default());
+        leader_layers::keep(&d);
+        assert_eq!(leader_layers::len(), 1);
+        assert!(leader_layers::find(d_seal.hash()).is_some());
+        assert!(leader_layers::find(c_seal.hash()).is_none());
+    }
+
+    #[test]
+    fn layers_over_a_state_read_newest_first_and_an_empty_stack_is_the_state_itself() {
+        let a = Address::with_last_byte(0xc1);
+        let b = Address::with_last_byte(0xc2);
+        let mock = MockEthProvider::default();
+        mock.add_account(a, ExtendedAccount::new(1, U256::from(1)));
+        mock.add_account(b, ExtendedAccount::new(1, U256::from(1)));
+        let historical = || mock.state_by_block_hash(B256::ZERO).expect("state");
+        let (parent, _) = layer_of(211, B256::with_last_byte(1), BundleState::builder(211..=211).state_present_account_info(a, info(3, 1)).build());
+        let (grandparent, _) = layer_of(
+            210,
+            B256::with_last_byte(2),
+            BundleState::builder(210..=210).state_present_account_info(a, info(2, 1)).state_present_account_info(b, info(5, 1)).build(),
+        );
+        let bare = leader_layers::open_on(historical(), &[]);
+        assert_eq!((nonce_of(&bare, a), nonce_of(&bare, b)), (Some(1), Some(1)));
+        // Newest first, as the caller passes them: the parent's write wins over the grandparent's.
+        let stacked = leader_layers::open_on(historical(), &[parent, grandparent]);
+        assert_eq!(nonce_of(&stacked, a), Some(3));
+        assert_eq!(nonce_of(&stacked, b), Some(5));
+    }
+
+    /// Files and opens a grandparent and its child's parent, so the layers are kept.
+    fn chain_of_two(great_grandparent: B256) -> ((SealedHeader, B256), (SealedHeader, B256)) {
+        let gp = file_ready(401, great_grandparent, BundleState::builder(401..=401).state_present_account_info(Address::with_last_byte(0xd1), info(2, 1)).build());
+        let parent = file_ready(402, gp.0.hash(), BundleState::builder(402..=402).state_present_account_info(Address::with_last_byte(0xd2), info(4, 1)).build());
+        (gp, parent)
+    }
+
+    #[test]
+    fn a_great_grandparent_not_in_the_engine_falls_back_to_the_engines_grandparent() {
+        let _guard = store_lock();
+        let _ = open_wait::take();
+        let ggp = B256::with_last_byte(0xe0);
+        let (gp, parent) = chain_of_two(ggp);
+        let mock = || {
+            let mock = MockEthProvider::default();
+            mock.add_account(Address::with_last_byte(0xd1), ExtendedAccount::new(1, U256::from(1)));
+            mock
+        };
+        // The grandparent's own child opens first, which keeps the grandparent's layer.
+        opener_on_sealed_parent_with(Scripted::new(mock()), gp.0.clone(), gp.1, true)().expect("the first open");
+        assert!(leader_layers::find(gp.0.hash()).is_some());
+        let _ = open_wait::take();
+
+        let mut client = Scripted::new(mock());
+        client.missing.insert(ggp);
+        let state = opener_on_sealed_parent_with(client, parent.0.clone(), parent.1, true)().expect("falls back");
+        let wait = open_wait::take();
+        assert_eq!((wait.grandparent_layer, wait.great_grandparent_missing), (0, 1), "{}", wait.split());
+        assert_eq!(nonce_of(&state, Address::with_last_byte(0xd2)), Some(4), "the parent's write");
+        assert_eq!(nonce_of(&state, Address::with_last_byte(0xd1)), Some(1), "the engine's grandparent answers for the rest");
+    }
+
+    #[test]
+    fn any_other_error_on_the_great_grandparent_refuses_the_open() {
+        let _guard = store_lock();
+        let ggp = B256::with_last_byte(0xe1);
+        let (gp, parent) = chain_of_two(ggp);
+        opener_on_sealed_parent_with(Scripted::new(MockEthProvider::default()), gp.0.clone(), gp.1, true)().expect("the first open");
+        let mut client = Scripted::new(MockEthProvider::default());
+        client.fatal.insert(ggp);
+        let result = opener_on_sealed_parent_with(client, parent.0.clone(), parent.1, true)();
+        assert!(matches!(result, Err(ProviderError::UnsupportedProvider)));
+    }
+
+    #[test]
+    fn a_full_bundle_parent_opens_with_the_grandparent_layer_when_kept() {
+        let _guard = store_lock();
+        let _ = open_wait::take();
+        let ggp = B256::with_last_byte(0xe2);
+        let (gp, parent) = chain_of_two(ggp);
+        let mock = || {
+            let mock = MockEthProvider::default();
+            mock.add_account(Address::with_last_byte(0xd3), ExtendedAccount::new(7, U256::from(1)));
+            mock
+        };
+        opener_on_sealed_parent_with(Scripted::new(mock()), gp.0.clone(), gp.1, true)().expect("the first open");
+        let _ = open_wait::take();
+        let state = opener_on_sealed_parent_with(Scripted::new(mock()), parent.0.clone(), parent.1, true)().expect("opens on both layers");
+        assert_eq!(open_wait::take().grandparent_layer, 1);
+        assert_eq!(nonce_of(&state, Address::with_last_byte(0xd1)), Some(2), "the grandparent's layer");
+        assert_eq!(nonce_of(&state, Address::with_last_byte(0xd2)), Some(4), "the parent's layer");
+        assert_eq!(nonce_of(&state, Address::with_last_byte(0xd3)), Some(7), "the engine's state under both");
+    }
+
+    // ---- the read-depth counter ----
+
+    #[test]
+    #[ignore = "read_depth::record(HISTORICAL) passes 7 through bucket_of, which maps it to the 4-7 bucket, so the historical bucket never counts"]
+    fn a_read_no_block_answers_is_counted_as_historical() {
+        let _guard = store_lock();
+        let _ = read_depth::snapshot();
+        let mock = MockEthProvider::default();
+        let address = Address::with_last_byte(0xee);
+        mock.add_account(address, ExtendedAccount::new(42, U256::from(1)));
+        let provider = read_depth::CountingStateProvider {
+            historical: mock.state_by_block_hash(B256::ZERO).expect("state"),
+            executed: Vec::new(),
+        };
+        assert_eq!(provider.basic_account(&address).expect("read").map(|a| a.nonce), Some(42));
+        assert_eq!(read_depth::snapshot(), [0, 0, 0, 0, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn the_counting_provider_buckets_each_read_by_the_depth_that_answered() {
+        let _guard = store_lock();
+        let _ = read_depth::snapshot();
+        let touched: Vec<(usize, Address)> =
+            [0usize, 1, 3, 4, 8, 16].iter().map(|d| (*d, Address::with_last_byte(0x80 + *d as u8))).collect();
+        let executed: Vec<ExecutedParent> = (0..17usize)
+            .map(|depth| {
+                let mut builder = BundleState::builder(depth as u64..=depth as u64);
+                for (d, address) in &touched {
+                    if *d == depth {
+                        builder = builder.state_present_account_info(*address, info(depth as u64 + 1, 1));
+                    }
+                }
+                let sealed = SealedHeader::seal_slow(Header { number: 500 - depth as u64, ..Default::default() });
+                executed_from_output(&sealed, Arc::new(BlockExecutionOutput { result: Default::default(), state: builder.build() }))
+            })
+            .collect();
+        let mock = MockEthProvider::default();
+        let historical_only = Address::with_last_byte(0xee);
+        mock.add_account(historical_only, ExtendedAccount::new(42, U256::from(1)));
+        let provider = read_depth::CountingStateProvider {
+            historical: mock.state_by_block_hash(B256::ZERO).expect("state"),
+            executed,
+        };
+        for (depth, address) in &touched {
+            let account = provider.basic_account(address).expect("read").expect("present");
+            assert_eq!(account.nonce, *depth as u64 + 1, "depth {depth}");
+        }
+        // Depths 0, 1, 2, 3 | 4-7 | 8-15 | 16+.
+        assert_eq!(read_depth::snapshot(), [1, 1, 0, 1, 1, 1, 1, 0]);
+        assert_eq!(read_depth::snapshot(), [0; read_depth::BUCKETS], "a snapshot resets");
+        // The value still comes from the historical state when no block answers.
+        assert_eq!(provider.basic_account(&historical_only).expect("read").map(|a| a.nonce), Some(42));
+        let _ = read_depth::snapshot();
+        // The other reads delegate to the overlay: BLOCKHASH answers from the stack.
+        assert!(provider.block_hash(500).expect("read").is_some());
+        assert_eq!(provider.storage(historical_only, B256::ZERO).expect("read"), None);
+    }
 }

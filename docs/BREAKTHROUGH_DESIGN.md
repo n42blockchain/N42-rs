@@ -1268,3 +1268,21 @@ the frames' ids) could still read differently; but the per-account term is the a
 which an index does not touch. The branch stays unmerged (its last commit, the beneficiary fast path, is
 uncompiled). Where the campaign stands: the plateau of ~1.2M/s is the memory system's per-account cost on
 three nodes of this box, and the tail is the host's swap (10.50).
+
+### 10.52 Steps 7a and 7b, off the fleet: the leader's start and prep, the follower's copy aside
+
+7a (c2a9a9138..69918dfc5): the seal-chain gaps named (`gap_before_exec_ms`, `gap_after_exec_ms`,
+`gap_before_seal_ms`, `index_ms`; the hand-off's `queue_taken_len` / `queue_first_miss` to read why the whole
+hand-over never matched); the prep's keys straight into a Vec (1.3-2.2 -> 0.36-0.47 ms), the sender partition
+skipping the hash within a sender run (1.3-1.7 -> 0.8-1.3), the frame plan's hashes by reference (the walk's 5 MB
+copy gone: 1.4-2.2 -> 0.95-1.3 beside the 2.7-4.3 check), the result slots (~75 MB) made on the pool (the call's
+entry to the batches' start 5.4-5.9 -> 2.4-3.2; the whole call 19-21 -> 16-17). The plan-ahead cursor (the 3
+ms check) and the lock-free hand-off are not done. Expected on the fleet: start -1, prep -1..2, the gap before
+the execution -3..4.
+
+7b (52734209a, 73441a6e3): the follower's build-path execution runs on the described block's transactions by
+reference (a `BuildPathTx` seam over the queue's Arcs) and `N42_FOLLOWER_COPY_ASIDE=1` builds the owned block
+beside the import, the road and the post-execution waiting for it only where they read it: the execution starts
+0.1 ms after the frames' take (3.7 before, on the bench). The vote still needs the owned block for the
+pre-execution, seal and includability checks, so the road's end is expected ~11-14 (21-24 now), the fields
+~82-85. Both wait for the host's swap to be emptied (loop304, then loop305 with the copy aside).

@@ -61,9 +61,13 @@ fn get_cached_pubkey(pubkey_bytes: &FixedBytes<48>) -> eyre::Result<PublicKey> {
 }
 
 // ========== Performance Optimization: Shuffle Cache ==========
-// Cache committee shuffle results to avoid repeated computation
+// Cache committee shuffle results to avoid repeated computation.
+// Key: (epoch, seed, active validator count, keccak256 of the active indices). The last two
+// identify the active set the shuffling was made from, so a different set never hits.
 const SHUFFLE_CACHE_SIZE: u32 = 8;
-pub static SHUFFLE_CACHE: Lazy<RwLock<LruMap<(u64, B256), Vec<usize>>>> =
+/// Shuffle cache key: (epoch, seed, active validator count, keccak256 of the active indices).
+pub type ShuffleCacheKey = (u64, B256, usize, B256);
+pub static SHUFFLE_CACHE: Lazy<RwLock<LruMap<ShuffleCacheKey, Vec<usize>>>> =
     Lazy::new(|| RwLock::new(LruMap::new(schnellru::ByLength::new(SHUFFLE_CACHE_SIZE))));
 
 pub const SLOTS_PER_EPOCH: u64 = 32;

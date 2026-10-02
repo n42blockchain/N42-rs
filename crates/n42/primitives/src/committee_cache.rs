@@ -10,7 +10,7 @@ use crate::safe_arith::SafeArith;
 use crate::shuffle_list::shuffle_list;
 use crate::*;
 use crate::{ChainSpec, SLOTS_PER_EPOCH};
-use alloy_primitives::B256;
+use alloy_primitives::{keccak256, B256};
 use core::num::NonZeroUsize;
 use derivative::Derivative;
 use serde::{Deserialize, Serialize};
@@ -101,8 +101,22 @@ impl CommitteeCache {
 
         let seed = state.get_seed(epoch, DOMAIN_CONSTANT_BEACON_ATTESTER)?;
 
-        // PERF: Try to get cached shuffle result first
-        let cache_key = (epoch, B256::from_slice(&seed[..]));
+        // PERF: Try to get cached shuffle result first. The key identifies the active set
+        // (count and a hash of the indices): epoch and seed alone are equal for two states
+        // whose active sets differ, and a hit must never return another set's shuffling.
+        let active_set_hash = {
+            let mut bytes = Vec::with_capacity(active_validator_indices.len() * 8);
+            for &i in &active_validator_indices {
+                bytes.extend_from_slice(&(i as u64).to_le_bytes());
+            }
+            keccak256(&bytes)
+        };
+        let cache_key = (
+            epoch,
+            B256::from_slice(&seed[..]),
+            active_validator_indices.len(),
+            active_set_hash,
+        );
         let shuffling = {
             // Try cache read
             let mut cached_result = None;
@@ -577,7 +591,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: SHUFFLE_CACHE key (epoch, seed) ignores the active validator set, so a changed set with the same seed gets a stale shuffling (committee_cache.rs:105)"]
     fn shuffle_cache_must_not_return_a_shuffling_of_another_validator_set() {
         let spec = spec();
         let state_a = state_with_validators(64, 0);

@@ -816,6 +816,11 @@ mod tests {
     use reth_trie::{updates::TrieUpdates, HashedPostState};
     use revm::{database::BundleState, state::AccountInfo};
 
+    /// Serialises the tests that file builds in the process-wide stores.
+    fn store_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::built_executions::STORE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     fn execution_of(header: &Header, bundle: BundleState) -> BuiltExecution {
         let block = Block { header: header.clone(), body: BlockBody { transactions: Vec::new(), ommers: Vec::new(), withdrawals: Some(Vec::new().into()) } };
         BuiltExecution {
@@ -828,6 +833,7 @@ mod tests {
 
     #[test]
     fn the_parent_state_is_its_bundle_over_the_grandparent_under_the_sealed_hash() {
+        let _store = store_lock();
         let sender = Address::with_last_byte(1);
         let created = Address::with_last_byte(2);
         let untouched = Address::with_last_byte(3);
@@ -1232,6 +1238,7 @@ mod tests {
     /// account the parent touched, one it did not, and the parent's hash.
     #[test]
     fn a_build_started_at_the_seal_opens_the_state_the_ordinary_path_opens() {
+        let _store = store_lock();
         let sender = Address::with_last_byte(0x31);
         let created = Address::with_last_byte(0x32);
         let untouched = Address::with_last_byte(0x33);
@@ -1298,6 +1305,9 @@ mod tests {
     /// withdrawal to a sender), the shards next, the grandparent last.
     #[test]
     fn a_build_on_the_parents_shards_reads_its_post_state() {
+        // The store of builds keeps three and is process-wide: without this
+        // lock a parallel test's filing can evict this build before it opens.
+        let _store = store_lock();
         let sender = Address::with_last_byte(0x41);
         let created = Address::with_last_byte(0x42);
         let untouched = Address::with_last_byte(0x43);
@@ -1351,6 +1361,7 @@ mod tests {
     /// absent one.
     #[test]
     fn the_grandparents_shards_read_as_the_engines_grandparent() {
+        let _store = store_lock();
         let from_gp = Address::with_last_byte(0x51);
         let from_parent = Address::with_last_byte(0x52);
         let coinbase = Address::with_last_byte(0x53);

@@ -375,11 +375,11 @@ async fn loopback(
     let (engine_tx, mut engine_rx) = mpsc::unbounded_channel::<BeaconEngineMessage<N42EngineTypes>>();
     tokio::spawn(async move {
         while let Some(message) = engine_rx.recv().await {
-            if let BeaconEngineMessage::NewPayload { tx, .. } = message {
-                if let Some(status) = engine_status.clone() {
-                    let _ = tx.send(Ok(PayloadStatus::from_status(status)));
-                }
-                // Without a status the sender is dropped: the engine is gone.
+            // Without a status the sender is dropped: the engine is gone.
+            if let BeaconEngineMessage::NewPayload { tx, .. } = message
+                && let Some(status) = engine_status.clone()
+            {
+                let _ = tx.send(Ok(PayloadStatus::from_status(status)));
             }
         }
     });
@@ -433,24 +433,30 @@ async fn a_failed_build_is_reported_with_the_builders_message() {
     assert_eq!(message, PayloadBuilderError::MissingPayload.to_string());
 }
 
-#[tokio::test]
-async fn get_payload_serves_the_built_block_and_hashed_adds_the_hash_tail() {
+/// A plain test over a hand-built runtime: the serving task writes the
+/// process-wide listed-transaction store, so the lock is held for the whole
+/// exchange and must not sit in an async body.
+#[test]
+fn get_payload_serves_the_built_block_and_hashed_adds_the_hash_tail() {
     let _guard = lock_listed();
-    let payload = built(310, 2, 0x41, None, None);
-    let mut client = loopback(Script::Serves(payload.clone()), None).await;
-    let mut expected = Vec::new();
-    push_built_payload(&mut expected, &payload);
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let payload = built(310, 2, 0x41, None, None);
+        let mut client = loopback(Script::Serves(payload.clone()), None).await;
+        let mut expected = Vec::new();
+        push_built_payload(&mut expected, &payload);
 
-    send_get(&mut client, request::GET_PAYLOAD, 7).await;
-    let mut got = vec![0u8; expected.len()];
-    client.read_exact(&mut got).await.unwrap();
-    assert_eq!(got, expected);
+        send_get(&mut client, request::GET_PAYLOAD, 7).await;
+        let mut got = vec![0u8; expected.len()];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, expected);
 
-    send_get(&mut client, request::GET_PAYLOAD_HASHED, 7).await;
-    let mut got = vec![0u8; expected.len() + 1 + 4 + 2 * 32];
-    client.read_exact(&mut got).await.unwrap();
-    assert_eq!(&got[..expected.len()], expected.as_slice());
-    assert_eq!(got[expected.len()], 1);
+        send_get(&mut client, request::GET_PAYLOAD_HASHED, 7).await;
+        let mut got = vec![0u8; expected.len() + 1 + 4 + 2 * 32];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got[..expected.len()], expected.as_slice());
+        assert_eq!(got[expected.len()], 1);
+    });
 }
 
 #[tokio::test]

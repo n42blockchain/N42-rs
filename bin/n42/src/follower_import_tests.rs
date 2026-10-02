@@ -101,7 +101,7 @@ fn only_the_last_two_blocks_keep_their_shards() {
     // Keeping a block again replaces its entry rather than costing a slot.
     keep_follower_shards(
         c.hash(),
-        c.clone(),
+        c,
         Arc::new(n42_engine_types::output_shards::FrozenShards::default()),
         output_of(&[]),
     );
@@ -152,7 +152,7 @@ fn publishing_an_output_again_replaces_it_and_old_ones_age_out() {
 #[test]
 fn a_wait_returns_what_is_already_there_without_waiting() {
     let started = std::time::Instant::now();
-    let found = wait_for_layer_within(B256::ZERO, || false, std::time::Duration::from_secs(5), |hash| Some(hash));
+    let found = wait_for_layer_within(B256::ZERO, || false, std::time::Duration::from_secs(5), Some);
     assert_eq!(found, Some(B256::ZERO));
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }

@@ -369,7 +369,7 @@ async fn a_fill_that_cannot_be_merged_or_is_miscounted_is_not_trusted() {
 
 /// Pumps both transports, handing every event to its service, until `done`.
 /// A service is drained (the loop's own post-event work) when its flag is set.
-async fn pump(
+pub(super) async fn pump(
     a: &mut Rig,
     b: &mut Rig,
     drain: (bool, bool),
@@ -384,10 +384,14 @@ async fn pump(
             }
             tokio::select! {
                 event = a.svc.transport.next_event() => {
-                    a.svc.handle_transport_event(event.expect("transport a open")).expect("a handles it");
+                    let event = event.expect("transport a open");
+                    a.seen.push(transport_event_kind(&event));
+                    a.svc.handle_transport_event(event).expect("a handles it");
                 }
                 event = b.svc.transport.next_event() => {
-                    b.svc.handle_transport_event(event.expect("transport b open")).expect("b handles it");
+                    let event = event.expect("transport b open");
+                    b.seen.push(transport_event_kind(&event));
+                    b.svc.handle_transport_event(event).expect("b handles it");
                 }
                 () = tokio::time::sleep(Duration::from_millis(15)) => {}
             }

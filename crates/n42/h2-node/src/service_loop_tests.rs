@@ -536,3 +536,138 @@ async fn a_declined_proposal_goes_out_at_the_pacing_tick() {
     assert!(waited < Duration::from_secs(4), "woken by the tick, not the re-ask or the timeout: {waited:?}");
     assert_eq!(svc.declined_view, Some(view), "the decline is on record");
 }
+
+
+// ---------------------------------------------------------------------------
+// Building ahead of leading
+// ---------------------------------------------------------------------------
+
+/// The build ahead's forkchoice is sent from a task: waits for it, bounded.
+async fn wait_for_build_on(el: &MockExecutionLayer, parent: B256) {
+    let seen = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if el.calls().iter().any(|c| matches!(c, ElCall::ForkchoiceUpdatedWithAttrs(s) if s.head_block_hash == parent)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(seen.is_ok(), "no build was started on {parent}: {:?}", el.calls());
+}
+
+type Contexts = Arc<std::sync::Mutex<Vec<ProposalContext>>>;
+
+fn recording_builder(rig: Rig, answer: bool) -> (H2Service<MockExecutionLayer>, MockExecutionLayer, Contexts) {
+    let contexts: Contexts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&contexts);
+    let svc = rig.svc.with_payload_attributes(move |context| {
+        let attrs = attributes_for(&context);
+        log.lock().expect("log").push(context);
+        answer.then_some(attrs)
+    });
+    (svc, rig.el, contexts)
+}
+
+#[tokio::test]
+async fn a_build_ahead_asks_the_builder_to_prepare_and_starts_the_execution_layer_on_the_parent() {
+    let rig = node(1, 0, None).await;
+    let (mut svc, el, contexts) = recording_builder(rig, true);
+    let (parent, header, _) = block(4, B256::repeat_byte(3));
+    svc.remember_block(parent, &header);
+    within(svc.prepare_next_build(parent, false)).await;
+
+    let contexts = contexts.lock().expect("log");
+    assert_eq!(contexts.len(), 1);
+    assert!(contexts[0].preparing, "the builder is told this is a build, not a proposal");
+    assert_eq!(contexts[0].head, parent);
+    assert_eq!(contexts[0].view, svc.engine().current_view() + 1);
+    assert_eq!(contexts[0].head_header.as_ref(), Some(&header));
+    assert_eq!(contexts[0].head_timestamp, Some(header.timestamp));
+    assert!(contexts[0].head_seen.is_some());
+    // The forkchoice that starts the build runs on a task.
+    wait_for_build_on(&el, parent).await;
+}
+
+#[tokio::test]
+async fn a_build_ahead_is_skipped_without_a_builder_a_header_an_answer_or_the_next_view() {
+    // No builder.
+    let mut rig = node(1, 0, None).await;
+    let (parent, header, _) = block(4, B256::repeat_byte(3));
+    rig.svc.remember_block(parent, &header);
+    within(rig.svc.prepare_next_build(parent, false)).await;
+    assert!(rig.el.calls().is_empty());
+
+    // The parent's header is not remembered.
+    let rig = node(1, 0, None).await;
+    let (mut svc, el, contexts) = recording_builder(rig, true);
+    within(svc.prepare_next_build(parent, false)).await;
+    assert!(contexts.lock().expect("log").is_empty(), "the builder is not even asked");
+    assert!(el.calls().is_empty());
+
+    // The builder declines.
+    let rig = node(1, 0, None).await;
+    let (mut svc, el, contexts) = recording_builder(rig, false);
+    svc.remember_block(parent, &header);
+    within(svc.prepare_next_build(parent, false)).await;
+    assert_eq!(contexts.lock().expect("log").len(), 1, "asked once");
+    assert!(el.calls().is_empty(), "a decline starts nothing");
+
+    // The next view is somebody else's.
+    let (keys, set) = keys(4);
+    let mut other = node_in(&keys, &set, 0, None).await;
+    let next = other.svc.engine().current_view() + 1;
+    if other.svc.engine().is_leader_for_view(next) {
+        other = node_in(&keys, &set, 2, None).await;
+    }
+    assert!(!other.svc.engine().is_leader_for_view(next));
+    let (mut svc, el, contexts) = recording_builder(other, true);
+    svc.remember_block(parent, &header);
+    within(svc.prepare_next_build(parent, false)).await;
+    assert!(contexts.lock().expect("log").is_empty(), "a node not leading next builds nothing ahead");
+    assert!(el.calls().is_empty());
+}
+
+#[tokio::test]
+async fn the_import_flush_builds_ahead_only_when_enabled_and_always_consumes_the_parent() {
+    let rig = node(1, 0, None).await;
+    let (mut svc, el, _) = recording_builder(rig, true);
+    let (parent, header, _) = block(4, B256::repeat_byte(3));
+    svc.remember_block(parent, &header);
+
+    svc.prepare_on = Some(parent);
+    within(svc.flush_prepare()).await;
+    assert_eq!(svc.prepare_on, None, "taken whether or not it is used");
+    assert!(el.calls().is_empty(), "build-ahead is off by default");
+
+    svc.prepare_ahead = true;
+    svc.prepare_on = Some(parent);
+    within(svc.flush_prepare()).await;
+    wait_for_build_on(&el, parent).await;
+
+    // Nothing pending: nothing to do.
+    let before = el.calls().len();
+    within(svc.flush_prepare()).await;
+    assert_eq!(el.calls().len(), before);
+}
+
+#[tokio::test]
+async fn the_chain_sealer_is_installed_once_and_only_where_the_sealing_rule_is_known() {
+    // No key and no builder: no chain.
+    let mut rig = node(1, 0, None).await;
+    assert!(!rig.svc.install_chain_sealer());
+    assert!(!rig.svc.chain_sealer_installed);
+
+    // A key and a builder but not gov5's profile: still no chain.
+    let key = BlsSecretKey::random().expect("key");
+    let mut svc = rig.svc.with_payload_attributes(|context| Some(attributes_for(&context)));
+    svc.chain_seal_key = Some(key.clone());
+    assert!(!svc.install_chain_sealer(), "an unknown sealing rule is never guessed");
+
+    // Under gov5's profile it installs, and a second call is a no-op that agrees.
+    rig = node(1, 0, None).await;
+    let mut svc = rig.svc.with_gov5_h2_profile(key).with_payload_attributes(|context| Some(attributes_for(&context)));
+    assert!(svc.install_chain_sealer());
+    assert!(svc.chain_sealer_installed);
+    assert!(svc.install_chain_sealer());
+}

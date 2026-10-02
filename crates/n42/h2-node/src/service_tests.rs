@@ -25,6 +25,8 @@ struct Rig {
     el: MockExecutionLayer,
     out: mpsc::Sender<EngineOutput>,
     addr: libp2p::Multiaddr,
+    /// The kind of every transport event a pump handed to the service.
+    seen: Vec<&'static str>,
 }
 
 fn keys(count: usize) -> (Vec<BlsSecretKey>, ValidatorSet) {
@@ -73,7 +75,7 @@ async fn node_in(keys: &[BlsSecretKey], set: &ValidatorSet, index: usize, dial: 
     let el = MockExecutionLayer::new();
     let driver = ExecutionDriver::new(el.clone(), ID.genesis_hash);
     let svc = H2Service::new(transport, engine, driver, rx, keys.len());
-    Rig { svc, el, out: tx, addr }
+    Rig { svc, el, out: tx, addr, seen: Vec::new() }
 }
 
 /// A block of the mock's shape and the gov5 RLP it travels as.
@@ -821,3 +823,6 @@ mod loop_tests;
 
 #[path = "service_net_tests.rs"]
 mod net_tests;
+
+#[path = "service_mesh_tests.rs"]
+mod mesh_tests;

@@ -479,6 +479,21 @@ pub struct RootSplit {
     /// The computing thread's faults in the apply's structural writes (the
     /// entry appends, the new twigs, the leaves), part of `faults`.
     pub append_faults: u64,
+    /// `append_faults` by structure (`n42_twig_core::qmdb_compat::ApplyPhases`):
+    /// the record bytes copied into the entry file's tail buffer.
+    pub faults_entries: u64,
+    /// See `faults_entries`: the entry offsets' segments.
+    pub faults_offsets: u64,
+    /// The key index's removals and inserts on the computing thread.
+    pub faults_index: u64,
+    /// See `faults_entries`: the entries' active bits.
+    pub faults_bits: u64,
+    /// See `faults_entries`: the twigs (new trees, leaves, bits).
+    pub faults_twigs: u64,
+    /// See `faults_entries`: the undo record's appended keys.
+    pub faults_undo: u64,
+    /// See `faults_entries`: the block's temporaries.
+    pub faults_tmp: u64,
     /// Records the root appended into entry-file buffer pages the populate
     /// thread had not reached yet.
     pub append_behind: u64,
@@ -899,6 +914,13 @@ impl QmdbNodeState {
             split.apply_ms = (phases.sort_us + phases.leaves_us + phases.retire_us + phases.writes_us + phases.index_us) / 1000;
             split.hash_ms = (phases.rehash_us + phases.root_us) / 1000;
             split.append_faults = phases.writes_faults;
+            split.faults_entries = phases.entries_faults;
+            split.faults_offsets = phases.offsets_faults;
+            split.faults_index = phases.index_faults;
+            split.faults_bits = phases.bits_faults;
+            split.faults_twigs = phases.twigs_faults;
+            split.faults_undo = phases.undo_faults;
+            split.faults_tmp = phases.tmp_faults;
             split.publish_ms = publish_us / 1000;
         }
         drop(guard);

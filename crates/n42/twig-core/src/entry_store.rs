@@ -398,6 +398,61 @@ impl FileEntries {
         Ok(())
     }
 
+    /// [`Self::push`] for a block's records, one structure at a time -- the
+    /// tail's bytes, then the offsets, then the active bits -- so the
+    /// applying thread's page faults can be told apart per structure
+    /// (`faults`). The file, the offsets and the bits end as the same
+    /// sequence of `push` calls leaves them; a failed seal keeps the records
+    /// copied before it, whole, as `push` would have.
+    fn push_batch<'a>(
+        &mut self,
+        records: impl Iterator<Item = (&'a Hash, &'a [u8])> + Clone,
+        faults: &mut AppendFaults,
+    ) -> io::Result<()> {
+        let first_slot = self.offsets.len();
+        let first_byte = self.len_bytes;
+        let at = crate::prefault::thread_faults();
+        let mut copied = 0usize;
+        let mut sealed = Ok(());
+        for (key, value) in records.clone() {
+            let record_len = KEY_LEN + LEN_LEN + value.len();
+            if !self.tail.is_empty() && self.tail.len() + record_len > CHUNK_BYTES {
+                if let Err(error) = self.seal_tail() {
+                    sealed = Err(error);
+                    break;
+                }
+            }
+            if self.tail.capacity() < CHUNK_BYTES {
+                self.tail.reserve_exact(CHUNK_BYTES.max(record_len) - self.tail.len());
+            }
+            self.populate_ahead();
+            crate::prefault::note_append(self.populate_epoch, self.tail.len() + record_len);
+            self.tail.extend_from_slice(key);
+            self.tail.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            self.tail.extend_from_slice(value);
+            // A seal maps up to here, so the length moves with the bytes.
+            self.len_bytes += record_len as u64;
+            copied += 1;
+        }
+        let entries_done = crate::prefault::thread_faults();
+        faults.entries += entries_done.saturating_sub(at);
+        let mut offset = first_byte;
+        for (_, value) in records.take(copied) {
+            self.offsets.push(offset);
+            offset += (KEY_LEN + LEN_LEN + value.len()) as u64;
+        }
+        let offsets_done = crate::prefault::thread_faults();
+        faults.offsets += offsets_done.saturating_sub(entries_done);
+        for slot in first_slot..first_slot + copied {
+            if self.active.len() * 64 <= slot {
+                self.active.push(0);
+            }
+            self.set_active(slot, true);
+        }
+        faults.bits += crate::prefault::thread_faults().saturating_sub(offsets_done);
+        sealed
+    }
+
     /// Asks the append populate thread to populate the tail buffer's pages
     /// ahead of the append cursor (`N42_QMDB_APPEND_AHEAD_MB`), so the
     /// appends a block's apply makes never fault.
@@ -584,6 +639,17 @@ impl FileEntries {
     }
 }
 
+/// The applying thread's page faults in a batch append, per structure.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct AppendFaults {
+    /// The record bytes copied into the tail buffer.
+    pub(crate) entries: u64,
+    /// The offsets' segments.
+    pub(crate) offsets: u64,
+    /// The active bits.
+    pub(crate) bits: u64,
+}
+
 /// The tree's entries, wherever they live.
 #[derive(Debug)]
 pub(crate) enum Entries {
@@ -639,15 +705,22 @@ impl Entries {
         }
     }
 
-    /// Appends a live entry as the next slot from borrowed bytes: the file
-    /// copies them into its tail, the heap into a new value.
-    pub(crate) fn push_slice(&mut self, key: &Hash, value: &[u8]) -> io::Result<()> {
+    /// [`Self::push`] on borrowed bytes for every record of `records` in order, counting
+    /// the applying thread's page faults per structure into `faults` (the
+    /// heap's all go to `entries`).
+    pub(crate) fn push_batch<'a>(
+        &mut self,
+        records: impl Iterator<Item = (&'a Hash, &'a [u8])> + Clone,
+        faults: &mut AppendFaults,
+    ) -> io::Result<()> {
         match self {
             Self::Heap(entries) => {
-                entries.push(Entry { key: *key, value: value.to_vec(), active: true });
+                let at = crate::prefault::thread_faults();
+                entries.extend(records.map(|(key, value)| Entry { key: *key, value: value.to_vec(), active: true }));
+                faults.entries += crate::prefault::thread_faults().saturating_sub(at);
                 Ok(())
             }
-            Self::File(file) => file.push(key, value),
+            Self::File(file) => file.push_batch(records, faults),
         }
     }
 

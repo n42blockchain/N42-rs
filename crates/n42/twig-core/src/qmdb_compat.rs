@@ -1069,6 +1069,24 @@ pub struct ApplyPhases {
     /// Page faults the applying thread took in the index inserts, the
     /// rehash and the root read.
     pub hash_faults: u64,
+    /// `writes_faults` by structure: the record bytes copied into the entry
+    /// file's tail buffer.
+    pub entries_faults: u64,
+    /// See `entries_faults`: the entry offsets' segments.
+    pub offsets_faults: u64,
+    /// See `entries_faults`: the entries' active bits.
+    pub bits_faults: u64,
+    /// See `entries_faults`: the twigs (new trees, leaves, bits, the dirty
+    /// marks).
+    pub twigs_faults: u64,
+    /// See `entries_faults`: the undo record's appended keys.
+    pub undo_faults: u64,
+    /// See `entries_faults`: the block's temporaries (the appends' key and
+    /// slot pairs).
+    pub tmp_faults: u64,
+    /// The key index: its removals in the writes, plus the inserts (also
+    /// counted in `hash_faults`).
+    pub index_faults: u64,
 }
 
 /// Rehashes every twig marked in `dirty`, each independently of the others.
@@ -1997,23 +2015,52 @@ impl QmdbCompatTree {
         let faults_writes = crate::prefault::thread_faults();
         phases.prep_faults = faults_writes.saturating_sub(faults_at);
         let at = std::time::Instant::now();
+        // The structural writes one structure at a time, each in the
+        // operations' order, so the faults are counted per structure: the
+        // result is what `append_deferred` per operation leaves.
+        let appends = |i: usize| match (operations.op_value(i), leaves[i]) {
+            (Some(value), Some(leaf)) => Some((value, leaf)),
+            _ => None,
+        };
         // The appends' index entries, inserted per shard afterwards; the
         // block's keys are distinct, so no operation reads one.
+        let first_slot = self.next_slot;
         let mut appended: Vec<(Hash, u64)> = Vec::with_capacity(count);
-        for ((i, leaf), old_slot) in (0..count).zip(leaves).zip(held) {
-            let key = *operations.op_key(i);
-            match (operations.op_value(i), leaf) {
-                (Some(value), Some(leaf)) => {
-                    let slot = self.append_deferred(key, value, leaf, &mut dirty)?;
-                    appended.push((key, slot));
-                }
-                _ => {
-                    if old_slot.is_some() {
-                        self.index.remove(&key, |slot| self.entries.key(slot as usize));
-                    }
-                }
+        for i in 0..count {
+            if appends(i).is_some() {
+                appended.push((*operations.op_key(i), first_slot + appended.len() as u64));
             }
         }
+        let mut faults = crate::prefault::thread_faults();
+        let mut took = |into: &mut u64| {
+            let now = crate::prefault::thread_faults();
+            *into += now.saturating_sub(faults);
+            faults = now;
+        };
+        took(&mut phases.tmp_faults);
+        if let Some(record) = self.recording.as_mut() {
+            record.appended_keys.extend(appended.iter().map(|(key, _)| *key));
+        }
+        took(&mut phases.undo_faults);
+        for (leaf, (_, slot)) in (0..count).filter_map(|i| appends(i).map(|(_, leaf)| leaf)).zip(&appended) {
+            self.set_twig_leaf(*slot, leaf, &mut dirty);
+        }
+        self.next_slot = first_slot + appended.len() as u64;
+        took(&mut phases.twigs_faults);
+        let mut append_faults = crate::entry_store::AppendFaults::default();
+        let records = (0..count).filter_map(|i| appends(i).map(|(value, _)| (operations.op_key(i), value)));
+        let pushed = self.entries.push_batch(records, &mut append_faults);
+        phases.entries_faults = append_faults.entries;
+        phases.offsets_faults = append_faults.offsets;
+        phases.bits_faults = append_faults.bits;
+        pushed.map_err(|e| QmdbOperationError::Store(e.to_string()))?;
+        took(&mut 0);
+        for (i, old_slot) in held.iter().enumerate() {
+            if old_slot.is_some() && appends(i).is_none() {
+                self.index.remove(operations.op_key(i), |slot| self.entries.key(slot as usize));
+            }
+        }
+        took(&mut phases.index_faults);
         phases.writes_us = at.elapsed().as_micros() as u64;
         let faults_hash = crate::prefault::thread_faults();
         phases.writes_faults = faults_hash.saturating_sub(faults_writes);
@@ -2021,6 +2068,7 @@ impl QmdbCompatTree {
         let entries = &self.entries;
         self.index.insert_sorted(&appended, |slot| entries.key(slot as usize));
         phases.index_us = at.elapsed().as_micros() as u64;
+        phases.index_faults += crate::prefault::thread_faults().saturating_sub(faults_hash);
         let at = std::time::Instant::now();
         rehash_dirty(&mut self.twigs, &dirty);
         phases.rehash_us = at.elapsed().as_micros() as u64;
@@ -2031,15 +2079,10 @@ impl QmdbCompatTree {
         Ok((root, phases))
     }
 
-    /// `set` for the block apply: the slot the key held already retired and
-    /// recorded, the twig's hashing left to [`rehash_dirty`], the index
-    /// insert left to the caller. Returns the slot appended.
-    fn append_deferred(&mut self, key: Hash, value: &[u8], leaf: Hash, dirty: &mut Vec<u8>) -> Result<u64, QmdbOperationError> {
-        if let Some(record) = self.recording.as_mut() {
-            record.appended_keys.push(key);
-        }
-        let slot = self.next_slot;
-        self.next_slot += 1;
+    /// The twig half of an append for the block apply: `slot`'s leaf and
+    /// active bit, the twig's hashing left to [`rehash_dirty`]. The entry,
+    /// the undo record, the cursor and the index are the caller's.
+    fn set_twig_leaf(&mut self, slot: u64, leaf: Hash, dirty: &mut Vec<u8>) {
         let twig_id = (slot as usize) / TWIG_SIZE;
         let local = (slot as usize) % TWIG_SIZE;
         self.ensure_twig(twig_id);
@@ -2047,8 +2090,6 @@ impl QmdbCompatTree {
         twig.nodes_mut()[TWIG_SIZE + local] = leaf;
         twig.bits[local / 8] |= 1 << (local % 8);
         mark_dirty(dirty, twig_id, DIRTY_LEAVES);
-        self.entries.push_slice(&key, value).map_err(|e| QmdbOperationError::Store(e.to_string()))?;
-        Ok(slot)
     }
 
     pub fn root(&self) -> Hash {

@@ -182,4 +182,75 @@ mod tests {
         assert!(TOTAL_SIZE > PIVOT_VIEW_SIZE);
         assert!(mem::size_of::<usize>() >= POSITION_WINDOW_SIZE);
     }
+
+    const SEED: [u8; 32] = [7; 32];
+
+    #[test]
+    fn returns_none_for_zero_rounds() {
+        assert_eq!(None, shuffle_list(vec![1, 2, 3], 0, &SEED, true));
+        assert_eq!(None, shuffle_list(vec![1, 2, 3], 0, &SEED, false));
+    }
+
+    #[test]
+    fn single_element_list_is_unchanged() {
+        assert_eq!(Some(vec![5]), shuffle_list(vec![5], 10, &SEED, true));
+        assert_eq!(Some(vec![5]), shuffle_list(vec![5], 10, &SEED, false));
+    }
+
+    #[test]
+    fn shuffle_is_a_permutation_for_all_sizes_around_window_boundaries() {
+        // Sizes straddle the 256-entry hash window so the re-hash branches are taken.
+        for n in [2usize, 3, 10, 255, 256, 257, 300, 513, 1000] {
+            let input: Vec<usize> = (0..n).collect();
+            let out = shuffle_list(input.clone(), 10, &SEED, false).unwrap();
+            let mut sorted = out.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, input, "not a permutation for n={n}");
+        }
+    }
+
+    #[test]
+    fn forwards_and_backwards_are_inverses() {
+        for n in [2usize, 17, 256, 300, 777] {
+            let input: Vec<usize> = (0..n).collect();
+            let fwd = shuffle_list(input.clone(), 10, &SEED, true).unwrap();
+            let back = shuffle_list(fwd, 10, &SEED, false).unwrap();
+            assert_eq!(back, input, "forwards then backwards must round trip, n={n}");
+
+            let bwd = shuffle_list(input.clone(), 10, &SEED, false).unwrap();
+            let back = shuffle_list(bwd, 10, &SEED, true).unwrap();
+            assert_eq!(back, input, "backwards then forwards must round trip, n={n}");
+        }
+    }
+
+    #[test]
+    fn shuffle_actually_moves_elements_and_depends_on_seed_and_rounds() {
+        let input: Vec<usize> = (0..100).collect();
+        let a = shuffle_list(input.clone(), 10, &SEED, false).unwrap();
+        assert_ne!(a, input);
+
+        // Deterministic.
+        assert_eq!(a, shuffle_list(input.clone(), 10, &SEED, false).unwrap());
+
+        // Different seed and different round counts produce different permutations.
+        let other_seed = shuffle_list(input.clone(), 10, &[8; 32], false).unwrap();
+        assert_ne!(a, other_seed);
+        let fewer_rounds = shuffle_list(input.clone(), 3, &SEED, false).unwrap();
+        assert_ne!(a, fewer_rounds);
+
+        // Forwards and backwards shuffles of the same input differ.
+        let fwd = shuffle_list(input, 10, &SEED, true).unwrap();
+        assert_ne!(a, fwd);
+    }
+
+    #[test]
+    fn shuffle_preserves_arbitrary_values() {
+        let input = vec![100usize, 7, 3000, 42, 9];
+        let out = shuffle_list(input.clone(), 10, &SEED, false).unwrap();
+        let mut a = input;
+        let mut b = out;
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+    }
 }

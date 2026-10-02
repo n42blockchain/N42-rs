@@ -932,3 +932,188 @@ fn calc_difficulty_follows_the_next_block_turn() {
     // An address outside the list is never in turn.
     assert_eq!(calc_difficulty(&snap, &Address::repeat_byte(9)), DIFF_NO_TURN);
 }
+
+// ------------------------------------------------------------ poisoned locks
+
+/// Poison `lock` the way a panicking writer would.
+fn poison<T>(lock: &RwLock<T>) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = lock.write().unwrap();
+        panic!("poisoning on purpose");
+    }));
+    assert!(lock.is_poisoned());
+}
+
+#[test]
+fn poisoned_proposals_lock_is_reported_not_propagated_as_panic() {
+    let env = Env::new(3, 100);
+    let e = env.engine(0);
+    poison(&e.proposals);
+    let a = Address::repeat_byte(1);
+    assert!(detail(Consensus::<Blk>::propose(&e, a, true).unwrap_err()).starts_with("lock poisoned"));
+    assert!(detail(Consensus::<Blk>::discard(&e, a).unwrap_err()).starts_with("lock poisoned"));
+    assert!(detail(Consensus::<Blk>::proposals(&e).unwrap_err()).starts_with("lock poisoned"));
+    assert!(detail(Consensus::<Blk>::prepare(&e, &env.genesis).unwrap_err())
+        .starts_with("lock poisoned"));
+}
+
+#[test]
+fn poisoned_signer_lock_is_reported() {
+    let env = Env::new(3, 100);
+    let e = env.engine(0);
+    poison(&e.signer);
+    assert!(
+        detail(Consensus::<Blk>::get_eth_signer_address(&e).unwrap_err()).contains("poisoned")
+    );
+    assert!(matches!(
+        SignerManager::get_signer_address(&e),
+        Err(n42_consensus_traits::AposError::Other(_))
+    ));
+    assert!(detail(Consensus::<Blk>::prepare(&e, &env.genesis).unwrap_err())
+        .starts_with("lock poisoned"));
+    let mut h = base_header(1);
+    h.parent_hash = env.genesis.hash();
+    assert!(detail(Consensus::<Blk>::seal(&e, &mut h).unwrap_err()).starts_with("lock poisoned"));
+    // Replacing the signer logs the failure and leaves the (unreadable) state alone.
+    Consensus::<Blk>::set_eth_signer_by_key(&e, Some(key_hex(1))).unwrap();
+}
+
+#[test]
+fn poisoned_eth_signer_lock_makes_seal_fail_after_the_checks() {
+    let env = Env::new(3, 100);
+    let e = env.engine(0);
+    let mut h = Consensus::<Blk>::prepare(&e, &env.genesis).unwrap();
+    poison(&e.eth_signer);
+    assert!(detail(Consensus::<Blk>::seal(&e, &mut h).unwrap_err()).starts_with("lock poisoned"));
+    Consensus::<Blk>::set_eth_signer_by_key(&e, Some(key_hex(1))).unwrap();
+}
+
+#[test]
+fn poisoned_snapshot_cache_fails_snapshot_and_silences_wiggle() {
+    let env = Env::new(3, 100);
+    let e = env.engine(0);
+    poison(&e.recents);
+    assert!(detail(Consensus::<Blk>::snapshot(&e, 0, env.genesis.hash(), None).unwrap_err())
+        .starts_with("lock poisoned"));
+    assert_eq!(
+        Consensus::<Blk>::wiggle(&e, 0, env.genesis.hash(), DIFF_NO_TURN),
+        Duration::ZERO
+    );
+
+    let e = env.engine(0);
+    poison(&e.recent_headers);
+    assert!(detail(Consensus::<Blk>::snapshot(&e, 0, env.genesis.hash(), None).unwrap_err())
+        .starts_with("lock poisoned"));
+}
+
+#[test]
+fn poisoned_cached_reads_lock_is_reported() {
+    let env = Env::new(3, 100);
+    let e = env.engine(0);
+    poison(&e.recent_cached_reads);
+    let h = keccak256(b"x");
+    assert!(detail(Consensus::<Blk>::set_cached_reads(&e, h, CachedReads::default()).unwrap_err())
+        .starts_with("lock poisoned"));
+    assert!(detail(Consensus::<Blk>::get_cached_reads(&e, h).unwrap_err())
+        .starts_with("lock poisoned"));
+}
+
+#[test]
+fn poisoned_td_lock_yields_zero_and_save_error() {
+    let env = Env::new(3, 100);
+    let chain = env.chain(1);
+    let e = env.engine(0);
+    // Initialise first so the poisoned lock is hit by the lookups, not by seeding.
+    assert_eq!(
+        Consensus::<Blk>::total_difficulty(&e, chain[1].hash()),
+        chain[1].difficulty
+    );
+    poison(&e.recent_tds);
+    assert_eq!(
+        Consensus::<Blk>::total_difficulty(&e, chain[1].hash()),
+        U256::ZERO
+    );
+    assert!(detail(e.save_total_difficulty(chain[1].header()).unwrap_err())
+        .starts_with("lock poisoned"));
+}
+
+// ------------------------------------------------- td initialisation corners
+
+#[test]
+fn save_total_difficulty_needs_the_parent_td() {
+    let env = Env::new(3, 100);
+    let e = env.engine(0);
+    let mut orphan = base_header(7);
+    orphan.parent_hash = B256::repeat_byte(0x55);
+    let msg = detail(e.save_total_difficulty(&orphan).unwrap_err());
+    assert!(msg.starts_with("td not found for parent hash"), "{msg}");
+    assert!(msg.contains("number=7"));
+}
+
+#[test]
+fn td_cache_is_seeded_from_the_last_window_on_a_long_chain() {
+    let provider = MockEthProvider::default();
+    let mut prev = B256::ZERO;
+    let mut hashes = Vec::new();
+    for n in 0..=1100u64 {
+        let h = Header {
+            number: n,
+            parent_hash: prev,
+            difficulty: U256::from(1),
+            ..Default::default()
+        };
+        prev = h.hash_slow();
+        provider.add_header(prev, h);
+        hashes.push(prev);
+    }
+    let e: Engine = APos::new(provider, spec(100), None);
+    // Window = 1024 blocks: seeded at block 77 with TD 0, one unit of difficulty per block.
+    assert_eq!(Consensus::<Blk>::total_difficulty(&e, hashes[1100]), U256::from(1100 - 77));
+    assert_eq!(Consensus::<Blk>::total_difficulty(&e, hashes[77]), U256::ZERO);
+    // Older than the window: not in the cache and the parent is unknown too.
+    assert_eq!(Consensus::<Blk>::total_difficulty(&e, hashes[10]), U256::ZERO);
+}
+
+#[test]
+fn td_seeding_skips_missing_headers_and_orphans_after_the_gap() {
+    let provider = MockEthProvider::default();
+    let mk = |n: u64, parent: B256| Header {
+        number: n,
+        parent_hash: parent,
+        difficulty: U256::from(2),
+        ..Default::default()
+    };
+    let h0 = mk(0, B256::ZERO);
+    let h1 = mk(1, h0.hash_slow());
+    let h3 = mk(3, B256::repeat_byte(0x33)); // block 2 is absent
+    for h in [&h0, &h1, &h3] {
+        provider.add_header(h.hash_slow(), h.clone());
+    }
+    let e: Engine = APos::new(provider, spec(100), None);
+    assert_eq!(Consensus::<Blk>::total_difficulty(&e, h1.hash_slow()), U256::from(2));
+    // Block 3's parent is not cached, so its TD cannot be derived.
+    assert_eq!(Consensus::<Blk>::total_difficulty(&e, h3.hash_slow()), U256::ZERO);
+}
+
+#[test]
+fn snapshot_at_a_checkpoint_without_parent_trusts_the_checkpoint() {
+    let env = Env::new(3, 4);
+    // Block 4 is a checkpoint carrying signers 1 and 2 only; block 3 is not stored.
+    let mut extra = vec![0u8; EXTRA_VANITY];
+    extra.extend_from_slice(key(1).address().as_slice());
+    extra.extend_from_slice(key(2).address().as_slice());
+    extra.extend_from_slice(&[0u8; EXTRA_SEAL]);
+    let cp = Header {
+        number: 4,
+        extra_data: Bytes::from(extra),
+        ..base_header(4)
+    };
+    let sealed = SealedHeader::seal_slow(cp);
+    env.provider.add_header(sealed.hash(), sealed.header().clone());
+
+    let e = env.engine(0);
+    let snap = Consensus::<Blk>::snapshot(&e, 4, sealed.hash(), None).unwrap();
+    assert_eq!(snap.number, 4);
+    assert_eq!(snap.hash, sealed.hash());
+    assert_eq!(snap.signers, vec![key(1).address(), key(2).address()]);
+}

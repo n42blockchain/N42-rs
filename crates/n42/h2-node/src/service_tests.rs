@@ -23,7 +23,6 @@ const ID: H2V4ChainIdentity = H2V4ChainIdentity { chain_id: 96, genesis_hash: B2
 struct Rig {
     svc: H2Service<MockExecutionLayer>,
     el: MockExecutionLayer,
-    out: mpsc::Sender<EngineOutput>,
     addr: libp2p::Multiaddr,
     /// The kind of every transport event a pump handed to the service.
     seen: Vec<&'static str>,
@@ -70,12 +69,12 @@ async fn node_in(keys: &[BlsSecretKey], set: &ValidatorSet, index: usize, dial: 
     let addr = listen.with(libp2p::multiaddr::Protocol::P2p(*transport.local_peer_id()));
     let (tx, rx) = mpsc::channel::<EngineOutput>(256);
     let mut engine =
-        ConsensusEngine::new(index as u32, keys[index].clone(), set.clone(), 1_000, 4_000, tx.clone());
+        ConsensusEngine::new(index as u32, keys[index].clone(), set.clone(), 1_000, 4_000, tx);
     engine.enable_h2_v4_signing(ID);
     let el = MockExecutionLayer::new();
     let driver = ExecutionDriver::new(el.clone(), ID.genesis_hash);
     let svc = H2Service::new(transport, engine, driver, rx, keys.len());
-    Rig { svc, el, out: tx, addr, seen: Vec::new() }
+    Rig { svc, el, addr, seen: Vec::new() }
 }
 
 /// A block of the mock's shape and the gov5 RLP it travels as.
@@ -556,7 +555,7 @@ async fn an_unanswerable_fill_falls_back_to_the_whole_body_when_no_peer_is_left(
     let hash = B256::repeat_byte(0x77);
     let request = n42_h2_net::BlockTxnsRequest { hash, indices: vec![1, 2] };
     rig.svc.fill_rounds.insert(hash, FillRounds::default());
-    rig.svc.ask_next_for_fill(request.clone(), "the peer has none");
+    rig.svc.ask_next_for_fill(request, "the peer has none");
     assert!(rig.svc.awaiting_bodies.contains(&hash), "no peer left: the whole body is asked for");
     assert!(!rig.svc.fill_rounds.contains_key(&hash));
 

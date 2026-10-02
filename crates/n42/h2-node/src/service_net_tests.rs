@@ -272,7 +272,7 @@ fn compact_frame(count: usize) -> (B256, alloy_primitives::Bytes, Vec<alloy_prim
     let (hash, header, _) = block(2, B256::repeat_byte(1));
     let txs: Vec<alloy_primitives::Bytes> = (0..count).map(|i| alloy_primitives::Bytes::from(vec![0x02, i as u8, 0xee])).collect();
     let rlp = n42_h2_net::encode_block_rlp_raw(&header, &txs, &[], None);
-    let hashes: Vec<B256> = txs.iter().map(|tx| keccak256(tx)).collect();
+    let hashes: Vec<B256> = txs.iter().map(keccak256).collect();
     let frame = n42_h2_consensus::encode_compact_body(&rlp, &hashes, HeaderProfile::Ethereum).expect("compact");
     (hash, alloy_primitives::Bytes::from(frame), txs)
 }

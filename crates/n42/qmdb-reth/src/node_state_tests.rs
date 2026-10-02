@@ -474,7 +474,7 @@ fn replaying_a_log_skips_what_the_checkpoint_covers_and_stops_at_a_delta_it_cann
     assert_eq!(good, log_len, "every record was good");
 
     // Onto a state that already holds them they are skipped, and counted as read.
-    let (again, good) = replay_delta_log(&log, reached.clone(), None).expect("replay");
+    let (again, good) = replay_delta_log(&log, reached, None).expect("replay");
     assert_eq!(again.head_hash, head);
     assert_eq!(good, log_len);
 

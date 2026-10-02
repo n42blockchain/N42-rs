@@ -577,14 +577,16 @@ async fn a_build_ahead_asks_the_builder_to_prepare_and_starts_the_execution_laye
     svc.remember_block(parent, &header);
     within(svc.prepare_next_build(parent, false)).await;
 
-    let contexts = contexts.lock().expect("log");
-    assert_eq!(contexts.len(), 1);
-    assert!(contexts[0].preparing, "the builder is told this is a build, not a proposal");
-    assert_eq!(contexts[0].head, parent);
-    assert_eq!(contexts[0].view, svc.engine().current_view() + 1);
-    assert_eq!(contexts[0].head_header.as_ref(), Some(&header));
-    assert_eq!(contexts[0].head_timestamp, Some(header.timestamp));
-    assert!(contexts[0].head_seen.is_some());
+    {
+        let contexts = contexts.lock().expect("log");
+        assert_eq!(contexts.len(), 1);
+        assert!(contexts[0].preparing, "the builder is told this is a build, not a proposal");
+        assert_eq!(contexts[0].head, parent);
+        assert_eq!(contexts[0].view, svc.engine().current_view() + 1);
+        assert_eq!(contexts[0].head_header.as_ref(), Some(&header));
+        assert_eq!(contexts[0].head_timestamp, Some(header.timestamp));
+        assert!(contexts[0].head_seen.is_some());
+    }
     // The forkchoice that starts the build runs on a task.
     wait_for_build_on(&el, parent).await;
 }

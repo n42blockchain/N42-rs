@@ -2823,3 +2823,7 @@ mod tests {
         assert!(!view.is_valid(), "a cut between the floor and the advance invalidates the view");
     }
 }
+
+#[cfg(test)]
+#[path = "node_state_tests.rs"]
+mod more_tests;

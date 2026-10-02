@@ -54,6 +54,15 @@ impl DescribedTx {
     }
 }
 
+/// The follower's build path reads a described block's transactions where
+/// they are held (`N42_FOLLOWER_COPY_ASIDE=1`): the queue's `Arc`s, as the
+/// leader's batches read the pooled ones.
+impl crate::parallel_transfer::BuildPathTx for DescribedTx {
+    fn build_path_tx(&self) -> &TransactionSigned {
+        self.transaction()
+    }
+}
+
 /// One chunk of the block's transactions, encoded end to end: what the
 /// transactions root is computed over, and what the payload's list is copied
 /// from when the block is made.
@@ -680,6 +689,12 @@ impl DescribedBlock {
     /// Whether the block has none.
     pub fn is_empty(&self) -> bool {
         self.transactions.is_empty()
+    }
+
+    /// The withdrawals the body lists, as the owned block will carry them
+    /// (`None` before Shanghai, where the header has no withdrawals root).
+    pub fn withdrawals(&self) -> Option<&[Withdrawal]> {
+        self.header.withdrawals_root.map(|_| self.withdrawals.as_slice())
     }
 
     /// The payload the engine's own pass takes, its transaction list copied

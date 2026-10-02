@@ -4132,10 +4132,15 @@ where
 /// (`N42_FOLLOWER_PARTITION_AHEAD=1` on the build path) and handed to
 /// [`execute_transfers_build_path_keyed`].
 pub fn build_path_keys(block: &RecoveredBlock<Block>) -> Result<Vec<(Address, Address)>, NotParallel> {
+    build_path_keys_of(&block.body().transactions, block.senders())
+}
+
+/// [`build_path_keys`] on a block's transactions and senders wherever they
+/// are held: the owned block's, or a frame description's by reference
+/// ([`BuildPathTx`]), the keys made the moment the frames are taken.
+pub fn build_path_keys_of<T: BuildPathTx>(txs: &[T], senders: &[Address]) -> Result<Vec<(Address, Address)>, NotParallel> {
     use alloy_consensus::Transaction as _;
     use rayon::prelude::*;
-    let txs = &block.body().transactions;
-    let senders = block.senders();
     if txs.len() != senders.len() {
         return Err(NotParallel::Failed(txs.len().min(senders.len()), "a transaction without its sender".to_string()));
     }
@@ -4144,12 +4149,66 @@ pub fn build_path_keys(block: &RecoveredBlock<Block>) -> Result<Vec<(Address, Ad
             .zip(senders.par_iter())
             .enumerate()
             .with_min_len(1024)
-            .map(|(i, (tx, sender))| match tx.kind() {
-                alloy_primitives::TxKind::Call(to) if tx.input().is_empty() => Ok((*sender, to)),
-                _ => Err(NotParallel::NotATransfer(i)),
+            .map(|(i, (tx, sender))| {
+                let tx = tx.build_path_tx();
+                match tx.kind() {
+                    alloy_primitives::TxKind::Call(to) if tx.input().is_empty() => Ok((*sender, to)),
+                    _ => Err(NotParallel::NotATransfer(i)),
+                }
             })
             .collect()
     })
+}
+
+/// A transaction the follower's build path reads: the owned block's own, or
+/// one held by reference where the block was assembled (a frame
+/// description's `Arc`s into this node's queue), as the leader's batches
+/// read the pooled transactions (`consensus_ref`).
+pub trait BuildPathTx: Sync {
+    /// The transaction.
+    fn build_path_tx(&self) -> &n42_tx_types::N42TxEnvelope;
+}
+
+impl BuildPathTx for n42_tx_types::N42TxEnvelope {
+    fn build_path_tx(&self) -> &n42_tx_types::N42TxEnvelope {
+        self
+    }
+}
+
+/// What the follower's build path reads of a block: the header, the
+/// withdrawals and ommers its executor's pre- and post-execution changes
+/// read, and the transactions with their senders -- the owned block's, or
+/// a described block's held by reference, so the execution need not wait
+/// for the owned block's copy (`N42_FOLLOWER_COPY_ASIDE=1`).
+#[derive(Debug, Clone, Copy)]
+pub struct BuildPathBlock<'a, T> {
+    /// The header.
+    pub header: &'a alloy_consensus::Header,
+    /// The owned block, when there is one: its executor context is the
+    /// configuration's own (`context_for_block`).
+    pub sealed: Option<&'a reth_primitives_traits::SealedBlock<Block>>,
+    /// The ommers (a described block has none).
+    pub ommers: &'a [alloy_consensus::Header],
+    /// The withdrawals, as the block's body lists them.
+    pub withdrawals: Option<&'a [alloy_eips::eip4895::Withdrawal]>,
+    /// The transactions, in block order.
+    pub txs: &'a [T],
+    /// Their senders, in the same order.
+    pub senders: &'a [Address],
+}
+
+impl<'a> BuildPathBlock<'a, n42_tx_types::N42TxEnvelope> {
+    /// The owned, recovered block.
+    pub fn of(block: &'a RecoveredBlock<Block>) -> Self {
+        Self {
+            header: block.header(),
+            sealed: Some(block.sealed_block()),
+            ommers: &block.body().ommers,
+            withdrawals: block.body().withdrawals.as_ref().map(|w| w.as_slice()),
+            txs: &block.body().transactions,
+            senders: block.senders(),
+        }
+    }
 }
 
 /// [`execute_transfers_build_path`] with the block's keys made ahead
@@ -4169,11 +4228,36 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
+    execute_transfers_build_path_on(evm_config, BuildPathBlock::of(block), main_db, open, keys_ahead)
+}
+
+/// [`execute_transfers_build_path_keyed`] on a [`BuildPathBlock`]: the same
+/// call on the transactions wherever they are held. A described block's
+/// (`N42_FOLLOWER_COPY_ASIDE=1`) is executed by reference, the moment its
+/// frames are taken, while its owned block is copied beside it.
+pub fn execute_transfers_build_path_on<EvmConfig, DB, G, T>(
+    evm_config: &EvmConfig,
+    block: BuildPathBlock<'_, T>,
+    main_db: DB,
+    open: &(dyn Fn() -> Option<G> + Sync),
+    keys_ahead: Option<Vec<(Address, Address)>>,
+) -> Result<Result<(ShardedExecution, Phases), NotParallel>, BlockExecutionError>
+where
+    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, BlockExecutorFactory = FastExecutorFactory> + Sync,
+    DB: Database + std::fmt::Debug,
+    DB::Error: Send + Sync + 'static,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+    T: BuildPathTx,
+{
     let call_at = std::time::Instant::now();
-    let evm_env = evm_config.evm_env(block.header()).map_err(BlockExecutionError::other)?;
+    let evm_env = evm_config.evm_env(block.header).map_err(BlockExecutionError::other)?;
     let beneficiary = evm_env.block_env.beneficiary;
-    let txs = &block.body().transactions;
-    let senders = block.senders();
+    let txs = block.txs;
+    let senders = block.senders;
+    if txs.len() != senders.len() {
+        return Ok(Err(NotParallel::Failed(txs.len().min(senders.len()), "a transaction without its sender".to_string())));
+    }
 
     // The keys the build's partition reads, made ahead or here.
     let at = std::time::Instant::now();
@@ -4183,7 +4267,7 @@ where
             split.keys_ahead = true;
             keys
         }
-        None => match build_path_keys(block) {
+        None => match build_path_keys_of(txs, senders) {
             Ok(keys) => keys,
             Err(why) => return Ok(Err(why)),
         },
@@ -4199,7 +4283,7 @@ where
     };
     let sink_shards = crate::output_shards::OutputShards::with_index(beneficiary, keys.len(), shard_count, true);
     let sink = |bundle: BundleState| sink_shards.add(bundle);
-    let convert = |i: usize| ((), evm_config.tx_env(reth_primitives_traits::Recovered::new_unchecked(&txs[i], senders[i])));
+    let convert = |i: usize| ((), evm_config.tx_env(reth_primitives_traits::Recovered::new_unchecked(txs[i].build_path_tx(), senders[i])));
     split.setup_us = (call_at.elapsed().as_micros() as u64).saturating_sub(keys_us);
     let thread_err = |what: &str| BlockExecutionError::other(std::io::Error::other(what.to_string()));
 
@@ -4219,7 +4303,20 @@ where
         let at = std::time::Instant::now();
         let mut state = State::builder().with_database(main_db).with_bundle_update().build();
         let (pre_us, post_us, result) = {
-            let ctx = evm_config.context_for_block(block.sealed_block()).map_err(BlockExecutionError::other)?;
+            let ctx = match block.sealed {
+                Some(sealed) => evm_config.context_for_block(sealed).map_err(BlockExecutionError::other)?,
+                // The context `N42EvmConfig::context_for_block` makes, from
+                // the parts a described block holds.
+                None => alloy_evm::eth::EthBlockExecutionCtx {
+                    tx_count_hint: Some(txs.len()),
+                    parent_hash: block.header.parent_hash,
+                    parent_beacon_block_root: block.header.parent_beacon_block_root,
+                    ommers: block.ommers,
+                    withdrawals: block.withdrawals.map(std::borrow::Cow::Borrowed),
+                    extra_data: block.header.extra_data.clone(),
+                    slot_number: block.header.slot_number,
+                },
+            };
             let evm = evm_config.evm_with_env(&mut state, evm_env.clone());
             let mut executor = evm_config.create_executor(evm, ctx);
             executor.apply_pre_execution_changes()?;
@@ -4273,7 +4370,7 @@ where
         for (i, (tx, slot)) in txs.iter().zip(&run.slots).enumerate() {
             let Some(built) = slot.get() else { return (Err(i), at, std::time::Instant::now()) };
             cumulative += built.gas_used;
-            receipts.push(Receipt { tx_type: tx.tx_type(), success: true, cumulative_gas_used: cumulative, logs: Vec::new() });
+            receipts.push(Receipt { tx_type: tx.build_path_tx().tx_type(), success: true, cumulative_gas_used: cumulative, logs: Vec::new() });
         }
         (Ok((receipts, cumulative)), at, std::time::Instant::now())
     };
@@ -4527,6 +4624,75 @@ mod tests {
             all
         };
         assert_eq!(flat(ours), flat(theirs), "{what}: reverts");
+    }
+
+    /// A transaction held by reference, as a frame description holds the
+    /// queue's (`N42_FOLLOWER_COPY_ASIDE=1`).
+    #[derive(Debug)]
+    struct ByRef(std::sync::Arc<n42_tx_types::N42TxEnvelope>);
+
+    impl BuildPathTx for ByRef {
+        fn build_path_tx(&self) -> &n42_tx_types::N42TxEnvelope {
+            &self.0
+        }
+    }
+
+    /// The block's parts by reference, as the follower's import hands a
+    /// described block's to [`execute_transfers_build_path_on`].
+    fn by_ref_parts(block: &RecoveredBlock<Block>) -> Vec<ByRef> {
+        block.body().transactions.iter().map(|tx| ByRef(std::sync::Arc::new(tx.clone()))).collect()
+    }
+
+    fn by_ref_block<'a>(block: &'a RecoveredBlock<Block>, txs: &'a [ByRef]) -> BuildPathBlock<'a, ByRef> {
+        BuildPathBlock {
+            header: block.header(),
+            sealed: None,
+            ommers: &[],
+            withdrawals: block.body().withdrawals.as_ref().map(|w| w.as_slice()),
+            txs,
+            senders: block.senders(),
+        }
+    }
+
+    /// The build path on a described block's transactions by reference
+    /// (`N42_FOLLOWER_COPY_ASIDE=1`: no owned block, the executor's context
+    /// made from the header and the withdrawals) gives what it gives on the
+    /// owned block: the same receipts, gas and post-state, keys made ahead or
+    /// not. The fixture's withdrawal is what the context must carry.
+    #[test]
+    fn the_build_path_by_reference_matches_the_owned_block() {
+        let (block, db) = fixture(8, 6);
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let (owned, _) = execute_transfers_build_path(&evm_config, &block, db.clone(), &|| Some(db.clone()))
+            .expect("no execution error")
+            .expect("the block qualifies on the build path");
+        let txs = by_ref_parts(&block);
+        for ahead in [false, true] {
+            let keys = ahead.then(|| build_path_keys_of(&txs, block.senders()).expect("the keys by reference"));
+            if let Some(keys) = &keys {
+                assert_eq!(keys, &build_path_keys(&block).expect("the owned block's keys"), "the keys");
+            }
+            let (by_ref, _) =
+                execute_transfers_build_path_on(&evm_config, by_ref_block(&block, &txs), db.clone(), &|| Some(db.clone()), keys)
+                    .expect("no execution error")
+                    .expect("the block qualifies by reference");
+            assert_eq!(by_ref.result.gas_used, owned.result.gas_used, "gas used");
+            assert_eq!(by_ref.result.receipts, owned.result.receipts, "receipts");
+            assert_eq!(by_ref.result.requests, owned.result.requests, "requests");
+            assert_same_bundle(&by_ref.merged(), &owned.merged(), "by reference");
+        }
+        // A sender list that does not cover the transactions is declined,
+        // never executed.
+        let short = &block.senders()[..block.senders().len() - 1];
+        let declined = execute_transfers_build_path_on(
+            &evm_config,
+            BuildPathBlock { senders: short, ..by_ref_block(&block, &txs) },
+            db.clone(),
+            &|| Some(db.clone()),
+            None,
+        )
+        .expect("no execution error");
+        assert!(declined.is_err(), "a transaction without its sender is declined");
     }
 
     /// The follower's build path ([`execute_transfers_build_path`]) and its
@@ -5760,6 +5926,55 @@ mod tests {
                 merge_ms,
                 merged.state.len(),
             );
+        }
+        // The road (`N42_FOLLOWER_COPY_ASIDE=1`): the owned block's copy
+        // (what `BlockMaker::make` pays, one clone per transaction out of the
+        // queue's `Arc`s) before the execution, against the execution on the
+        // transactions by reference with the copy made beside it on the
+        // worker pool. `exec start` is when the execution began after the
+        // frames were taken; `owned ready` when the engine's block exists.
+        let txs = by_ref_parts(&block);
+        for round in 0..3 {
+            let copy = |txs: &[ByRef]| -> Vec<n42_tx_types::N42TxEnvelope> {
+                use rayon::prelude::*;
+                txs.par_iter().map(|tx| (*tx.0).clone()).collect()
+            };
+            // On the road: the copy, then the execution on the owned block.
+            let at = std::time::Instant::now();
+            let owned = copy(&txs);
+            let on_road_start = at.elapsed().as_micros();
+            let keys = build_path_keys_of(&owned, block.senders()).expect("the keys");
+            execute_transfers_build_path_on(&evm_config, BuildPathBlock { txs: &owned, ..BuildPathBlock::of(&block) }, db.clone(), &|| Some(db.clone()), Some(keys))
+                .expect("no execution error")
+                .expect("the block qualifies");
+            let on_road_end = at.elapsed().as_micros();
+            drop(owned);
+            // Aside: the execution by reference from the take, the copy beside.
+            let at = std::time::Instant::now();
+            let (made_tx, made_rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let owned = copy(&txs);
+                    let _ = made_tx.send((owned, at.elapsed().as_micros()));
+                });
+                let aside_start = at.elapsed().as_micros();
+                let keys = build_path_keys_of(&txs, block.senders()).expect("the keys");
+                execute_transfers_build_path_on(&evm_config, by_ref_block(&block, &txs), db.clone(), &|| Some(db.clone()), Some(keys))
+                    .expect("no execution error")
+                    .expect("the block qualifies by reference");
+                let aside_end = at.elapsed().as_micros();
+                let (owned, owned_ready) = made_rx.recv().expect("the copy aside");
+                println!(
+                    "road #{round}: copy on the road {:.1} ms | exec start: on road {:.1} aside {:.1} | exec end: on road {:.1} aside {:.1} | owned ready aside {:.1} ({} txs)",
+                    on_road_start as f64 / 1000.0,
+                    on_road_start as f64 / 1000.0,
+                    aside_start as f64 / 1000.0,
+                    on_road_end as f64 / 1000.0,
+                    aside_end as f64 / 1000.0,
+                    owned_ready as f64 / 1000.0,
+                    owned.len(),
+                );
+            });
         }
     }
 

@@ -1851,6 +1851,7 @@ mod shard_tests {
     /// order the recovery returned it in; one it dropped from is unaligned.
     #[test]
     fn a_frame_is_described_in_frame_order_and_a_dropped_one_is_unaligned() {
+        let _lock = crate::coverage_tests::counter_lock();
         n42_tx_types::set_alt_sig_enabled(true);
         let txs: Vec<AltSigTx> = (0..6u64).map(|i| signed(1 + (i % 2) as u8, 50 + i / 2)).collect();
         let pooled: Vec<N42PooledTxEnvelope> = txs.into_iter().map(N42PooledTxEnvelope::AltSig).collect();
@@ -1879,6 +1880,7 @@ mod shard_tests {
     /// claim, unverified, and the claim is what the sender cache records.
     #[test]
     fn a_frame_in_shard_mode_verifies_exactly_its_shard() {
+        let _lock = crate::coverage_tests::counter_lock();
         n42_tx_types::set_alt_sig_enabled(true);
         let shard = (1u64, 3u64);
         let bogus = Address::repeat_byte(0xee);
@@ -1975,6 +1977,7 @@ mod shard_tests {
 
     #[test]
     fn an_attested_frame_is_admitted_without_verification() {
+        let _lock = crate::coverage_tests::counter_lock();
         n42_tx_types::set_alt_sig_enabled(true);
         let key = gateway(7);
         let config = attest_config(&[&key], 1);
@@ -1998,6 +2001,7 @@ mod shard_tests {
 
     #[test]
     fn an_unknown_or_bad_attestation_is_verified_normally() {
+        let _lock = crate::coverage_tests::counter_lock();
         n42_tx_types::set_alt_sig_enabled(true);
         let (trusted, stranger) = (gateway(7), gateway(8));
         let config = attest_config(&[&trusted], 1);
@@ -2026,6 +2030,7 @@ mod shard_tests {
 
     #[test]
     fn a_minimum_of_two_with_one_attestation_is_verified_normally() {
+        let _lock = crate::coverage_tests::counter_lock();
         n42_tx_types::set_alt_sig_enabled(true);
         let (one, two) = (gateway(7), gateway(9));
         let config = attest_config(&[&one, &two], 2);
@@ -2197,3 +2202,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod coverage_tests;

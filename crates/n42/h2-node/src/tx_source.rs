@@ -234,3 +234,7 @@ async fn ingest_lane(addr: String, lane: usize, mut frames: mpsc::Receiver<Vec<B
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tx_source_tests.rs"]
+pub(crate) mod tests;

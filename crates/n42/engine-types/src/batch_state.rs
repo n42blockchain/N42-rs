@@ -348,4 +348,176 @@ mod tests {
         assert!(!ours.state.contains_key(&addr(40)));
         assert!(batch.accounts.is_empty());
     }
+
+    use revm::state::EvmStorageSlot;
+
+    fn funded_db() -> CacheDB<EmptyDB> {
+        let mut db = CacheDB::new(EmptyDB::default());
+        for i in 1..=3u8 {
+            db.insert_account_info(addr(i), AccountInfo { balance: U256::from(1_000u64), ..Default::default() });
+        }
+        db
+    }
+
+    fn touched(info: AccountInfo) -> Account {
+        let mut account = Account::from(info);
+        account.mark_touch();
+        account
+    }
+
+    fn funded() -> AccountInfo {
+        AccountInfo { balance: U256::from(10u64), ..Default::default() }
+    }
+
+    #[test]
+    fn changes_the_transfer_path_never_makes_are_refused_by_account() {
+        let refused = |account: Account| {
+            let mut batch = BatchState::with_capacity(funded_db(), 1);
+            let mut changes = EvmState::default();
+            changes.insert(addr(1), account);
+            batch.commit(changes).expect_err("not a transfer's change").0
+        };
+        let mut destroyed = touched(funded());
+        destroyed.mark_selfdestruct();
+        assert_eq!(refused(destroyed), addr(1));
+        let mut created = touched(funded());
+        created.mark_created();
+        assert_eq!(refused(created), addr(1));
+        // Emptied by the change.
+        assert_eq!(refused(touched(AccountInfo::default())), addr(1));
+        // A storage write.
+        let mut written = touched(funded());
+        written.storage.insert(U256::from(1), EvmStorageSlot::new_changed(U256::ZERO, U256::from(2), TransactionId::ZERO));
+        assert_eq!(refused(written), addr(1));
+    }
+
+    #[test]
+    fn an_untouched_account_in_the_changes_is_skipped() {
+        let mut batch = BatchState::with_capacity(funded_db(), 1);
+        let mut changes = EvmState::default();
+        changes.insert(addr(1), Account::from(funded()));
+        batch.commit(changes).expect("nothing to apply");
+        assert!(batch.accounts.is_empty());
+        let bundle = batch.take_bundle();
+        assert!(bundle.state.is_empty() && bundle.reverts.is_empty());
+    }
+
+    #[test]
+    fn a_batch_that_only_read_closes_with_the_empty_bundle() {
+        let mut batch = BatchState::with_capacity(funded_db(), 2);
+        assert_eq!(batch.basic(addr(1)).expect("read").map(|i| i.balance), Some(U256::from(1_000u64)));
+        assert!(batch.basic(addr(9)).expect("read").is_none());
+        let bundle = batch.take_bundle();
+        assert!(bundle.state.is_empty());
+        assert!(bundle.reverts.is_empty());
+        assert_eq!((bundle.state_size, bundle.reverts_size), (0, 0));
+        assert!(batch.accounts.is_empty(), "the batch holds nothing afterwards");
+    }
+
+    #[test]
+    fn a_changed_account_is_in_the_bundle_with_its_original_and_a_revert() {
+        let mut batch = BatchState::with_capacity(funded_db(), 1);
+        let mut changes = EvmState::default();
+        // Committed without a prior read: loaded as it was before the change.
+        changes.insert(addr(2), {
+            let mut account = Account::from(AccountInfo { balance: U256::from(1_000u64), ..Default::default() });
+            account.info.balance = U256::from(900u64);
+            account.mark_touch();
+            account
+        });
+        batch.commit(changes).expect("a plain change");
+        let bundle = batch.take_bundle();
+        let account = bundle.state.get(&addr(2)).expect("changed");
+        assert_eq!(account.info.as_ref().map(|i| i.balance), Some(U256::from(900u64)));
+        assert_eq!(account.original_info.as_ref().map(|i| i.balance), Some(U256::from(1_000u64)));
+        assert_eq!(bundle.reverts.len(), 1);
+        assert_eq!(bundle.reverts[0].len(), 1);
+        assert!(bundle.state_size > 0 && bundle.reverts_size > 0);
+    }
+
+    #[test]
+    fn a_new_recipient_that_did_not_exist_is_created_by_the_change() {
+        let mut batch = BatchState::with_capacity(funded_db(), 1);
+        let mut changes = EvmState::default();
+        let mut account = Account::new_not_existing(TransactionId::ZERO);
+        account.info.balance = U256::from(3u64);
+        account.mark_touch();
+        changes.insert(addr(50), account);
+        batch.commit(changes).expect("a plain change");
+        let bundle = batch.take_bundle();
+        let account = bundle.state.get(&addr(50)).expect("present");
+        assert!(account.original_info.is_none(), "it did not exist before the batch");
+        assert_eq!(account.info.as_ref().map(|i| i.balance), Some(U256::from(3u64)));
+    }
+
+    fn transfer_of(sender: AccountInfo, recipient: Option<AccountInfo>, recipient_balance: u64, coinbase_balance: u64) -> PlainTransfer {
+        PlainTransfer {
+            caller: addr(1),
+            sender_balance: U256::from(500u64),
+            sender,
+            to: addr(2),
+            recipient_balance: U256::from(recipient_balance),
+            recipient,
+            beneficiary: addr(3),
+            coinbase_balance: U256::from(coinbase_balance),
+            coinbase: AccountInfo { balance: U256::from(1_000u64), ..Default::default() },
+        }
+    }
+
+    fn read_all(batch: &mut BatchState<CacheDB<EmptyDB>>) {
+        for i in 1..=3u8 {
+            batch.basic(addr(i)).expect("read");
+        }
+    }
+
+    #[test]
+    fn a_computed_transfer_needs_its_accounts_read_and_none_left_empty() {
+        let sender = AccountInfo { balance: U256::from(1_000u64), ..Default::default() };
+        let recipient = Some(AccountInfo { balance: U256::from(1_000u64), ..Default::default() });
+        // Not read through the batch: refused, naming the first account.
+        let mut batch = BatchState::with_capacity(funded_db(), 3);
+        let err = batch.commit_transfer(transfer_of(sender.clone(), recipient.clone(), 1_500, 1_100)).expect_err("unread");
+        assert_eq!(err.0, addr(1));
+        // A recipient that ends empty (zero balance, no nonce) is refused.
+        let mut batch = BatchState::with_capacity(funded_db(), 3);
+        read_all(&mut batch);
+        let err = batch.commit_transfer(transfer_of(sender.clone(), None, 0, 1_100)).expect_err("empty recipient");
+        assert_eq!(err.0, addr(2));
+        // A beneficiary that ends empty is refused.
+        let mut batch = BatchState::with_capacity(funded_db(), 3);
+        read_all(&mut batch);
+        let err = batch.commit_transfer(transfer_of(sender.clone(), recipient.clone(), 1_500, 0)).expect_err("empty beneficiary");
+        assert_eq!(err.0, addr(3));
+        // The ordinary transfer commits: nonce bumped, balances replaced.
+        let mut batch = BatchState::with_capacity(funded_db(), 3);
+        read_all(&mut batch);
+        batch.commit_transfer(transfer_of(sender, recipient, 1_500, 1_100)).expect("plain");
+        let bundle = batch.take_bundle();
+        let sender_after = bundle.state.get(&addr(1)).and_then(|a| a.info.clone()).expect("sender");
+        assert_eq!((sender_after.nonce, sender_after.balance), (1, U256::from(500u64)));
+        assert_eq!(bundle.state.get(&addr(2)).and_then(|a| a.info.as_ref().map(|i| i.balance)), Some(U256::from(1_500u64)));
+        assert_eq!(bundle.state.get(&addr(3)).and_then(|a| a.info.as_ref().map(|i| i.balance)), Some(U256::from(1_100u64)));
+    }
+
+    #[test]
+    fn storage_code_and_block_hashes_pass_through_to_the_parent_state() {
+        let mut db = funded_db();
+        let code = Bytecode::new_raw(vec![0x60, 0x00].into());
+        let hash = code.hash_slow();
+        db.insert_account_info(addr(7), AccountInfo { code_hash: hash, code: Some(code.clone()), ..Default::default() });
+        db.insert_account_storage(addr(7), U256::from(4), U256::from(44)).expect("storage");
+        let mut batch = BatchState::with_capacity(db, 1);
+        assert_eq!(batch.storage(addr(7), U256::from(4)).expect("read"), U256::from(44));
+        assert_eq!(batch.storage(addr(7), U256::from(5)).expect("read"), U256::ZERO);
+        assert_eq!(batch.code_by_hash(hash).expect("read").original_bytes(), code.original_bytes());
+        // EmptyDB hashes a block number as the keccak of its decimal text.
+        assert_eq!(batch.block_hash(3).expect("read"), alloy_primitives::keccak256("3"));
+        assert!(batch.accounts.is_empty(), "none of them is an account read");
+    }
+
+    #[test]
+    fn the_refusal_names_the_account() {
+        let text = Unsupported(addr(0x2a)).to_string();
+        assert!(text.contains(&addr(0x2a).to_string()), "{text}");
+    }
 }

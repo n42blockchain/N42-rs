@@ -24,6 +24,9 @@
 //! dropped on a thread of their own, as the node's release thread does; the
 //! moved slots are forgotten and the entry file flushed after every block,
 //! as the node's persistence of a block's own delta does.
+//! `N42_ROOT_FAULTS_CHURN=<threads>` adds threads that allocate, write and
+//! free 1-32 MiB buffers without pause, as the node's builder, executor and
+//! importer do around the root (the fleet's heap is never this quiet).
 //! `N42_TWIG_POOL_FLOOR=0 N42_QMDB_APPEND_AHEAD_MB=0 N42_QMDB_OFFSET_SEGMENTS_AHEAD=0`
 //! turns the prefaulting off for the comparison.
 
@@ -95,6 +98,33 @@ fn root_faults() {
     drop(genesis);
     forest.set_keep_from(Some(0));
     let (release, released_rx) = std::sync::mpsc::channel::<n42_qmdb_state::Released>();
+    let churn_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let churn_threads = std::env::var("N42_ROOT_FAULTS_CHURN").ok().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+    let churners: Vec<_> = (0..churn_threads)
+        .map(|t| {
+            let stop = churn_stop.clone();
+            std::thread::spawn(move || {
+                let mut ring: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+                let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ t;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let len = (1 << 20) + (x % (31 << 20)) as usize;
+                    let mut buf = Vec::<u8>::with_capacity(len);
+                    // SAFETY: bytes, written before the length covers them.
+                    unsafe {
+                        std::ptr::write_bytes(buf.as_mut_ptr(), 1, len);
+                        buf.set_len(len);
+                    }
+                    ring.push_back(buf);
+                    if ring.len() > 8 {
+                        ring.pop_front();
+                    }
+                }
+            })
+        })
+        .collect();
     let releaser = std::thread::Builder::new()
         .name("bench-release".into())
         .spawn(move || released_rx.into_iter().for_each(drop))
@@ -181,6 +211,8 @@ fn root_faults() {
     }
     drop(release);
     let _ = releaser.join();
+    churn_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    churners.into_iter().for_each(|churner| drop(churner.join()));
     let (root_med, root_p90, root_max) = quantiles(root_ms);
     let (apply_med, apply_p90, apply_max) = quantiles(apply_ms);
     let over_50 = faults.iter().filter(|f| **f > 50.0).count();

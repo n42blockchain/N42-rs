@@ -11,11 +11,15 @@
 //!   taskset -c 0-15 cargo test --release -p n42-qmdb-reth --test root_faults -- --ignored --nocapture
 //! ```
 //!
-//! `N42_ROOT_FAULTS_BENCH=<blocks>x<ops>x<population>` (default
-//! 200x163000x2000000) sizes it; `N42_ROOT_FAULTS_BENCH_DIR` is where the
-//! entry file goes (default the temp directory). Every block rewrites `ops`
-//! accounts of the population (a transfer chain's shape: every operation
-//! retires a slot and appends one). The reader's keep moves once per 44
+//! `N42_ROOT_FAULTS_BENCH=<blocks>x<ops>x<population>[x<new>]` (default
+//! 400x163000x2000000x147000) sizes it; `N42_ROOT_FAULTS_BENCH_DIR` is where
+//! the entry file goes (default the temp directory -- a tmpfs counts the file
+//! as memory). Every block writes `ops` accounts: `new` of them never seen
+//! before (the fleet's flood: ~147k new recipients a block, so the state
+//! grows by that every block), the rest rewrites of accounts that exist,
+//! cycling over all of them (every rewrite retires a slot and appends one).
+//! `new` 0 is the earlier shape: rewrites of the fixed population only.
+//! The reader's keep moves once per 44
 //! blocks, as a persistence batch moves it, and the released records are
 //! dropped on a thread of their own, as the node's release thread does; the
 //! moved slots are forgotten and the entry file flushed after every block,
@@ -78,9 +82,10 @@ fn quantiles(mut v: Vec<f64>) -> (f64, f64, f64) {
 fn root_faults() {
     let spec = std::env::var("N42_ROOT_FAULTS_BENCH").unwrap_or_default();
     let parts: Vec<u64> = spec.split('x').filter_map(|p| p.parse().ok()).collect();
-    let (blocks, ops, population) = match parts.as_slice() {
-        [b, o, p] => (*b, *o, *p),
-        _ => (200, 163_000, 2_000_000),
+    let (blocks, ops, population, new) = match parts.as_slice() {
+        [b, o, p] => (*b, *o, *p, 0),
+        [b, o, p, n] => (*b, *o, *p, (*n).min(*o)),
+        _ => (400, 163_000, 2_000_000, 147_000),
     };
     let dir = std::env::var("N42_ROOT_FAULTS_BENCH_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
     let path = dir.join(format!("root-faults-{}.entries", std::process::id()));
@@ -96,12 +101,18 @@ fn root_faults() {
         .expect("release thread");
     let (mut root_ms, mut apply_ms, mut faults, mut misses) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut prep_faults, mut writes_faults, mut hash_faults) = (Vec::new(), Vec::new(), Vec::new());
+    // Per block: the root thread's faults by structure, and the total.
+    let mut split: Vec<[u64; 8]> = Vec::new();
     let mut parent = GENESIS;
     let mut cursor = 0u64;
+    let mut accounts = population;
     let refills_before = n42_twig_core::qmdb_compat::twig_pool_refills();
     for n in 1..=blocks {
-        let ids = (cursor..cursor + ops).map(|i| i % population);
-        cursor += ops;
+        let old = ops - new;
+        let total = accounts;
+        let ids = (cursor..cursor + old).map(move |i| i % total).chain(total..total + new);
+        cursor += old;
+        accounts += new;
         let b = bundle(ids, n);
         let operations = sorted_operations_from_execution(&b, false);
         drop(b);
@@ -131,12 +142,19 @@ fn root_faults() {
         if fault_count > 50 || elapsed > 30.0 {
             println!(
                 "block {n}: root {elapsed:.1} ms, apply {apply:.1}, rehash {:.1}, root read {:.1}; faults {fault_count} \
-                 (prep {}, writes {}, index+hash {}); misses {}",
+                 (prep {}, writes {}, index+hash {}; entries {} offsets {} index {} bits {} twigs {} undo {} tmp {}); misses {}",
                 phases.rehash_us as f64 / 1e3,
                 phases.root_us as f64 / 1e3,
                 phases.prep_faults,
                 phases.writes_faults,
                 phases.hash_faults,
+                phases.entries_faults,
+                phases.offsets_faults,
+                phases.index_faults,
+                phases.bits_faults,
+                phases.twigs_faults,
+                phases.undo_faults,
+                phases.tmp_faults,
                 n42_twig_core::qmdb_compat::twig_pool_misses() - misses_before,
             );
         }
@@ -148,6 +166,16 @@ fn root_faults() {
             prep_faults.push(phases.prep_faults as f64);
             writes_faults.push(phases.writes_faults as f64);
             hash_faults.push(phases.hash_faults as f64);
+            split.push([
+                phases.entries_faults,
+                phases.offsets_faults,
+                phases.index_faults,
+                phases.bits_faults,
+                phases.twigs_faults,
+                phases.undo_faults,
+                phases.tmp_faults,
+                fault_count,
+            ]);
         }
         parent = hash;
     }
@@ -160,7 +188,8 @@ fn root_faults() {
     let (miss_med, _, miss_max) = quantiles(misses);
     let (prep, writes, hash) = (quantiles(prep_faults), quantiles(writes_faults), quantiles(hash_faults));
     println!(
-        "root_faults bench: {blocks} blocks x {ops} ops on {population} accounts (first {WARMUP} left out)\n\
+        "root_faults bench: {blocks} blocks x {ops} ops ({new} new keys) on {population} accounts growing to {accounts} \
+         (first {WARMUP} left out)\n\
          root   ms median {root_med:.1} p90 {root_p90:.1} max {root_max:.1} (p90/median {:.2})\n\
          apply  ms median {apply_med:.1} p90 {apply_p90:.1} max {apply_max:.1} (p90/median {:.2})\n\
          faults    median {fault_med:.0} p90 {fault_p90:.0} max {fault_max:.0}; blocks over 50: {over_50}\n\
@@ -171,8 +200,29 @@ fn root_faults() {
         prep.0, prep.1, prep.2, writes.0, writes.1, writes.2, hash.0, hash.1, hash.2,
         n42_twig_core::qmdb_compat::twig_pool_refills() - refills_before,
     );
+    print_split(&split, blocks as usize - WARMUP);
     let (behind, lag) = n42_twig_core::prefault::append_populate_stats();
     println!("appends past the populate's edge {behind}; populate lag at the end {} MiB", lag >> 20);
     drop(forest);
     let _ = std::fs::remove_file(&path);
+}
+
+/// The faults by structure (median / p90 / max of each), and the share of
+/// blocks over 500 faults by block-number quartile.
+fn print_split(split: &[[u64; 8]], blocks: usize) {
+    const NAMES: [&str; 8] = ["entries", "offsets", "index", "bits", "twigs", "undo", "tmp", "total"];
+    let mut line = String::from("faults by structure (median/p90/max):");
+    for (k, name) in NAMES.iter().enumerate() {
+        let (med, p90, max) = quantiles(split.iter().map(|row| row[k] as f64).collect());
+        line.push_str(&format!(" {name} {med:.0}/{p90:.0}/{max:.0}"));
+    }
+    println!("{line}");
+    let quarter = blocks.div_ceil(4).max(1);
+    let mut line = String::from("blocks over 500 faults by quartile:");
+    for (q, rows) in split.chunks(quarter).enumerate() {
+        let over = rows.iter().filter(|row| row[7] > 500).count();
+        let (_, p90, _) = quantiles(rows.iter().map(|row| row[7] as f64).collect());
+        line.push_str(&format!(" Q{} {over}/{} ({:.0}%, p90 {p90:.0})", q + 1, rows.len(), 100.0 * over as f64 / rows.len() as f64));
+    }
+    println!("{line}");
 }

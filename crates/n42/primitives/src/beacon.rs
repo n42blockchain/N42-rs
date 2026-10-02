@@ -4080,3 +4080,348 @@ mod attestations_and_withdrawals {
         assert!(s.process_operations(&body, &spec).unwrap_err().to_string().contains("FutureEpoch"));
     }
 }
+
+#[cfg(test)]
+mod epoch_processing {
+    use super::*;
+    use crate::test_util::{active_validator, eth1_credentials, pubkey, state_with_validators};
+    use ssz::Decode;
+
+    fn spec() -> ChainSpec {
+        beacon_chain_spec()
+    }
+
+    #[test]
+    fn rounding_helpers() {
+        assert_eq!(round_to_nearest(31_400_000_000, 1_000_000_000), 31_000_000_000);
+        assert_eq!(round_to_nearest(31_500_000_000, 1_000_000_000), 32_000_000_000);
+        assert_eq!(round_to_nearest(0, 1_000_000_000), 0);
+        assert_eq!(round_down(31_999_999_999, 1_000_000_000), 31_000_000_000);
+    }
+
+    #[test]
+    fn epoch_processing_rounds_effective_balances_and_ejects_low_validators() {
+        let spec = spec();
+        let mut s = state_with_validators(5, 0);
+        s.balances_store.set(0, 31_400_000_000).unwrap();
+        s.balances_store.set(1, 31_500_000_000).unwrap();
+        // Balances above the cap are clamped to the maximum effective balance.
+        s.balances_store.set(2, 45_000_000_000).unwrap();
+        s.balances_store.set(3, 20_499_999_999).unwrap();
+        s.balances_store.set(4, 15_600_000_000).unwrap();
+
+        s.process_epoch(&spec).unwrap();
+
+        let eff: Vec<u64> = (0..5).map(|i| s.get_effective_balance(i).unwrap()).collect();
+        assert_eq!(
+            eff,
+            vec![31_000_000_000, 32_000_000_000, 32_000_000_000, 20_000_000_000, 16_000_000_000]
+        );
+        // Only the validator at the ejection balance is queued to exit.
+        for i in 0..4 {
+            assert_eq!(s.get_validator(i).unwrap().exit_epoch, spec.far_future_epoch, "validator {i}");
+        }
+        assert_eq!(s.get_validator(4).unwrap().exit_epoch, 5);
+    }
+
+    #[test]
+    fn epoch_processing_updates_inactivity_scores() {
+        let spec = spec();
+        let mut s = state_with_validators(4, 0);
+        for (i, score) in [(0usize, 100u64), (1, 0), (2, 8100), (3, 10)] {
+            s.inactivity_scores_store.set(i, score).unwrap();
+        }
+        s.epoch_attester_indexes_set.insert(0);
+        s.epoch_attester_indexes_set.insert(3);
+        s.epoch_attester_indexes_store.push(0).unwrap();
+        s.epoch_attester_indexes_store.push(3).unwrap();
+
+        s.process_epoch(&spec).unwrap();
+
+        // Attesters recover by 48 (floored at zero); absentees gain 1 until the 8100 cap.
+        assert_eq!(s.get_inactivity_score(0).unwrap(), 52);
+        assert_eq!(s.get_inactivity_score(1).unwrap(), 1);
+        assert_eq!(s.get_inactivity_score(2).unwrap(), 8100);
+        assert_eq!(s.get_inactivity_score(3).unwrap(), 0);
+        // The attester records are consumed by the epoch.
+        assert!(s.epoch_attester_indexes_set.is_empty());
+        assert!(s.epoch_attester_indexes_store.is_empty());
+    }
+
+    #[test]
+    fn epoch_processing_pays_rewards_after_genesis() {
+        let spec = spec();
+        let mut s = state_with_validators(4, 32);
+        // One more absent epoch pushes validator 1 over the punishment threshold.
+        s.inactivity_scores_store.set(1, 2699).unwrap();
+        s.process_epoch(&spec).unwrap();
+
+        let base = 32_000_000_000u64 / 357_770;
+        assert_eq!(s.get_balance(0).unwrap(), 32_000_000_000 + base);
+        assert_eq!(s.get_inactivity_score(1).unwrap(), 2700);
+        assert_eq!(s.get_balance(1).unwrap(), 32_000_000_000 + base - 3 * base);
+    }
+
+    #[test]
+    fn epoch_processing_reports_a_corrupt_registry() {
+        let spec = spec();
+        let mut s = state_with_validators(2, 0);
+        s.validators_store.clear();
+        assert!(s.process_epoch(&spec).is_err());
+
+        let mut t = state_with_validators(2, 0);
+        t.inactivity_scores_store.clear();
+        assert!(t.process_epoch(&spec).is_err());
+    }
+
+    fn fresh_deposit(i: usize) -> Validator {
+        Validator::from_deposit(pubkey(i), eth1_credentials(1), 32_000_000_000, &spec())
+    }
+
+    #[test]
+    fn registry_updates_queue_then_activate_new_validators() {
+        let spec = spec();
+        let mut s = state_with_validators(2, 64);
+        s.validators_store.push(fresh_deposit(2)).unwrap();
+        s.balances_store.push(32_000_000_000).unwrap();
+        s.inactivity_scores_store.push(0).unwrap();
+
+        // Epoch 2: the validator becomes eligible for the queue, one epoch later.
+        s.process_registry_updates(&spec).unwrap();
+        let v = s.get_validator(2).unwrap().clone();
+        assert_eq!(v.activation_eligibility_epoch, 3);
+        assert_eq!(v.activation_epoch, spec.far_future_epoch);
+
+        // Epoch 3: eligibility epoch has been reached, activation is delayed by the lookahead.
+        s.slot = 96;
+        s.process_registry_updates(&spec).unwrap();
+        assert_eq!(s.get_validator(2).unwrap().activation_epoch, 3 + 1 + 4);
+    }
+
+    #[test]
+    fn registry_updates_respect_the_activation_churn_limit() {
+        let spec = spec();
+        let mut s = state_with_validators(1, 64);
+        for i in 1..=6 {
+            let mut v = fresh_deposit(i);
+            v.activation_eligibility_epoch = 1;
+            s.validators_store.push(v).unwrap();
+            s.balances_store.push(32_000_000_000).unwrap();
+            s.inactivity_scores_store.push(0).unwrap();
+        }
+        s.process_registry_updates(&spec).unwrap();
+
+        let activated: Vec<usize> = (1..=6)
+            .filter(|&i| s.get_validator(i).unwrap().activation_epoch != spec.far_future_epoch)
+            .collect();
+        // min_per_epoch_churn_limit is 4; lowest indices go first.
+        assert_eq!(activated, vec![1, 2, 3, 4]);
+        assert_eq!(s.get_validator(1).unwrap().activation_epoch, 2 + 1 + 4);
+
+        // Validators whose eligibility epoch is still in the future wait.
+        let mut waiting = state_with_validators(1, 64);
+        let mut v = fresh_deposit(1);
+        v.activation_eligibility_epoch = 3;
+        waiting.validators_store.push(v).unwrap();
+        waiting.balances_store.push(32_000_000_000).unwrap();
+        waiting.inactivity_scores_store.push(0).unwrap();
+        waiting.process_registry_updates(&spec).unwrap();
+        assert_eq!(waiting.get_validator(1).unwrap().activation_epoch, spec.far_future_epoch);
+    }
+
+    #[test]
+    fn registry_updates_eject_active_validators_with_low_effective_balance() {
+        let spec = spec();
+        let mut s = state_with_validators(3, 64);
+        let mut weak = active_validator(1, &spec);
+        weak.effective_balance = 16_000_000_000;
+        s.validators_store.set(1, weak).unwrap();
+        s.process_registry_updates(&spec).unwrap();
+        assert_eq!(s.get_validator(1).unwrap().exit_epoch, 2 + 1 + 4);
+        assert_eq!(s.get_validator(0).unwrap().exit_epoch, spec.far_future_epoch);
+    }
+
+    #[test]
+    fn state_transition_advances_the_slot_without_mutating_the_input() {
+        let old = state_with_validators(4, 5);
+        let new = BeaconState::state_transition(&old, &BeaconBlock::default()).unwrap();
+        assert_eq!(new.slot, 6);
+        assert_eq!(old.slot, 5);
+        assert_eq!(new.validators_store.len(), 4);
+    }
+
+    #[test]
+    fn state_transition_runs_epoch_processing_on_epoch_boundaries() {
+        let mut old = state_with_validators(4, 31);
+        old.balances_store.set(0, 31_400_000_000).unwrap();
+        let new = BeaconState::state_transition(&old, &BeaconBlock::default()).unwrap();
+        assert_eq!(new.slot, 32);
+        assert_eq!(new.get_effective_balance(0).unwrap(), 31_000_000_000);
+        assert_eq!(new.get_inactivity_score(0).unwrap(), 1);
+        // The input state still has its original values.
+        assert_eq!(old.get_effective_balance(0).unwrap(), 32_000_000_000);
+        assert_eq!(old.get_inactivity_score(0).unwrap(), 0);
+
+        // Not on a boundary: no epoch processing.
+        let mid = state_with_validators(4, 10);
+        let after = BeaconState::state_transition(&mid, &BeaconBlock::default()).unwrap();
+        assert_eq!(after.get_inactivity_score(0).unwrap(), 0);
+
+        // An empty registry survives an epoch boundary.
+        let empty = BeaconState { slot: 31, ..BeaconState::new() };
+        assert_eq!(BeaconState::state_transition(&empty, &BeaconBlock::default()).unwrap().slot, 32);
+    }
+
+    #[test]
+    fn state_transition_applies_the_block_body() {
+        use alloy_eips::eip6110::DepositRequest as ElDepositRequest;
+        let old = state_with_validators(2, 3);
+        let block = BeaconBlock {
+            slot: 4,
+            body: BeaconBlockBody {
+                execution_requests: ExecutionRequestsV4 {
+                    deposits: vec![ElDepositRequest {
+                        pubkey: pubkey(20),
+                        withdrawal_credentials: eth1_credentials(1),
+                        amount: 32_000_000_000,
+                        signature: FixedBytes::ZERO,
+                        index: 0,
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let new = BeaconState::state_transition(&old, &block).unwrap();
+        assert_eq!(new.validators_store.len(), 3);
+        assert_eq!(old.validators_store.len(), 2);
+    }
+
+    #[test]
+    fn state_transition_rejects_blocks_with_bad_attestations() {
+        let old = state_with_validators(2, 3);
+        let mut bad = Attestation::default();
+        bad.validator_indexes.insert(0);
+        bad.block_aggregate_signature = Some(FixedBytes::<96>::repeat_byte(0xff));
+        let block = BeaconBlock {
+            body: BeaconBlockBody { attestations: vec![bad], ..Default::default() },
+            ..Default::default()
+        };
+        assert!(BeaconState::state_transition(&old, &block).is_err());
+    }
+
+    #[test]
+    fn state_hash_covers_persisted_fields() {
+        let mut a = state_with_validators(2, 1);
+        let h = a.hash_slow();
+        assert_eq!(h, a.hash_slow());
+        assert_eq!(h, keccak256(a.as_ssz_bytes()));
+        a.slot = 2;
+        assert_ne!(a.hash_slow(), h);
+    }
+
+    #[test]
+    fn state_ssz_and_json_keep_roots_but_not_the_in_memory_stores() {
+        let mut s = state_with_validators(3, 7);
+        s.randao_mix = B256::repeat_byte(4);
+        s.next_withdrawal_index = 9;
+        s.pending_partial_withdrawals.push(PendingPartialWithdrawal {
+            validator_index: 1,
+            amount: 2,
+            withdrawable_epoch: 3,
+        });
+        let back = BeaconState::from_ssz_bytes(&s.as_ssz_bytes()).unwrap();
+        assert_eq!(back.slot, 7);
+        assert_eq!(back.randao_mix, B256::repeat_byte(4));
+        assert_eq!(back.next_withdrawal_index, 9);
+        assert_eq!(back.pending_partial_withdrawals, s.pending_partial_withdrawals);
+        assert_eq!(back.validators_len, s.validators_len);
+        assert_eq!(back.validators, s.validators);
+        assert_eq!(back.validators_store.len(), 0);
+
+        let json = serde_json::to_string(&s).unwrap();
+        let from_json: BeaconState = serde_json::from_str(&json).unwrap();
+        assert_eq!(from_json.slot, 7);
+        assert_eq!(from_json.balances, s.balances);
+    }
+
+    fn sample_block() -> BeaconBlock {
+        let spec = spec();
+        let mut att = Attestation::default();
+        att.validator_indexes.extend([1u64, 5]);
+        att.data = AttestationData { slot: 3, committee_index: 1, receipts_root: B256::repeat_byte(2) };
+        att.block_aggregate_signature = Some(FixedBytes::<96>::repeat_byte(7));
+        BeaconBlock {
+            slot: 12,
+            eth1_block_hash: B256::repeat_byte(1),
+            parent_hash: B256::repeat_byte(2),
+            state_root: B256::repeat_byte(3),
+            body: BeaconBlockBody {
+                attestations: vec![att],
+                deposits: vec![Deposit {
+                    proof: vec![B256::repeat_byte(9)],
+                    data: DepositData {
+                        pubkey: pubkey(1),
+                        withdrawal_credentials: eth1_credentials(1),
+                        amount: spec.min_activation_balance,
+                        signature: FixedBytes::repeat_byte(5),
+                    },
+                }],
+                voluntary_exits: vec![VoluntaryExitWithSig {
+                    voluntary_exit: VoluntaryExit { epoch: 4, validator_index: 2 },
+                    signature: Bytes::from(vec![1, 2, 3]),
+                }],
+                execution_requests: ExecutionRequestsV4::default(),
+            },
+        }
+    }
+
+    #[test]
+    fn block_ssz_json_and_hash_roundtrip() {
+        let block = sample_block();
+        let bytes = block.as_ssz_bytes();
+        assert_eq!(BeaconBlock::from_ssz_bytes(&bytes).unwrap(), block);
+        assert!(BeaconBlock::from_ssz_bytes(&bytes[..bytes.len() - 3]).is_err());
+
+        let json = serde_json::to_string(&block).unwrap();
+        assert_eq!(serde_json::from_str::<BeaconBlock>(&json).unwrap(), block);
+
+        assert_eq!(block.hash_slow(), keccak256(&bytes));
+        let mut other = block.clone();
+        other.body.voluntary_exits[0].voluntary_exit.epoch = 5;
+        assert_ne!(other.hash_slow(), block.hash_slow());
+    }
+
+    #[test]
+    fn auxiliary_types_roundtrip_through_ssz() {
+        let agg = BlockVerifyResultAggregate {
+            validator_indexes: [3u64, 1, 2].into_iter().collect(),
+            block_aggregate_signature: Some(FixedBytes::repeat_byte(8)),
+        };
+        assert_eq!(BlockVerifyResultAggregate::from_ssz_bytes(&agg.as_ssz_bytes()).unwrap(), agg);
+
+        let reqs = ExecutionRequests {
+            deposits: vec![DepositRequest {
+                pubkey: Bytes::from(vec![1; 48]),
+                withdrawal_credentials: B256::repeat_byte(2),
+                amount: 3,
+                signature: Bytes::from(vec![4; 96]),
+                index: 5,
+            }],
+            withdrawals: vec![],
+            consolidations: vec![ConsolidationRequest {
+                source_address: Address::repeat_byte(6),
+                source_pubkey: Bytes::from(vec![7; 48]),
+                target_pubkey: Bytes::from(vec![8; 48]),
+            }],
+        };
+        assert_eq!(ExecutionRequests::from_ssz_bytes(&reqs.as_ssz_bytes()).unwrap(), reqs);
+
+        let eth1 = Eth1Data { deposit_root: B256::repeat_byte(1), deposit_count: 2, block_hash: B256::repeat_byte(3) };
+        assert_eq!(Eth1Data::from_ssz_bytes(&eth1.as_ssz_bytes()).unwrap(), eth1);
+
+        let signing = SigningData { object_root: B256::repeat_byte(1), domain: B256::repeat_byte(2) };
+        assert_eq!(SigningData::from_ssz_bytes(&signing.as_ssz_bytes()).unwrap(), signing);
+    }
+}

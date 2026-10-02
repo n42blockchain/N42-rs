@@ -179,3 +179,81 @@ fn verify(mut unverifiedblock: UnverifiedBlock) -> eyre::Result<B256> {
 fn evm_config(chain_spec: Arc<ChainSpec>) -> n42_engine_types::N42EvmConfig {
     n42_engine_types::N42EvmConfig::new_with_evm_factory(chain_spec, n42_engine_types::fast_transfer::N42EvmFactory::from_env())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonrpsee::server::{RpcModule, Server, SubscriptionMessage};
+    use std::sync::Mutex;
+
+    const SK: &str = "6be6c38a5986be6c7094e92017af0d15da0af6857362e2ba0c2103c3eb893eec";
+
+    fn dead_ws_url() -> String {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        format!("ws://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn a_private_key_that_is_not_hex_is_rejected_before_connecting() {
+        let err = run_client(&dead_ws_url(), "not hex").await.expect_err("rejected");
+        let text = err.to_string().to_lowercase();
+        assert!(text.contains("invalid") || text.contains("odd") || text.contains("hex"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_private_key_of_the_wrong_length_is_rejected_with_a_secret_key_error() {
+        let err = run_client(&dead_ws_url(), "0x1234").await.expect_err("rejected");
+        assert!(err.to_string().contains("SecretKey error"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_valid_key_reaches_the_connection_step_with_or_without_a_0x_prefix() {
+        for key in [SK.to_string(), format!("0x{SK}")] {
+            let err = run_client(&dead_ws_url(), &key).await.expect_err("nothing listens");
+            assert!(!err.to_string().contains("SecretKey"), "the key was accepted: {err}");
+        }
+    }
+
+    /// A node that accepts the verification subscription, records the pubkey it
+    /// was subscribed with and pushes one item that is not a block.
+    #[tokio::test]
+    async fn the_client_subscribes_with_its_public_key_and_fails_on_an_undecodable_block() {
+        let subscribed: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = Arc::clone(&subscribed);
+        let mut module = RpcModule::new(());
+        module
+            .register_subscription(
+                "consensusBeaconExt_subscribeToVerificationRequest",
+                "consensusBeaconExt_verificationRequest",
+                "consensusBeaconExt_unsubscribeToVerificationRequest",
+                move |params, pending, _ctx, _ext| {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        let pubkey: String = params.one()?;
+                        seen.lock().unwrap().push(pubkey);
+                        let sink = pending.accept().await?;
+                        let message = SubscriptionMessage::new(sink.method_name(), sink.subscription_id(), &"not a block")?;
+                        sink.send(message).await?;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        Ok(())
+                    }
+                },
+            )
+            .expect("registers");
+        let server = Server::builder().build("127.0.0.1:0").await.expect("binds");
+        let addr = server.local_addr().expect("addr");
+        let handle = server.start(module);
+
+        let result = timeout(Duration::from_secs(20), run_client(&format!("ws://{addr}"), SK))
+            .await
+            .expect("returns promptly instead of reconnecting forever");
+        assert!(result.is_err(), "an undecodable item ends the client with an error");
+
+        let want = hex::encode(SecretKey::from_bytes(&Vec::from_hex(SK).unwrap()).unwrap().sk_to_pk().to_bytes());
+        assert_eq!(*subscribed.lock().unwrap(), vec![want]);
+        handle.stop().ok();
+    }
+}

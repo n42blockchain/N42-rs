@@ -248,4 +248,144 @@ mod tests {
         // Passes if router does not panic
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    async fn expect_none(rx: &mut mpsc::Receiver<Event<String>>) {
+        // Either quiet, or closed because the router dropped the sender.
+        if let Ok(Some(e)) = timeout(Duration::from_millis(100), rx.recv()).await {
+            panic!("received an unexpected event: {:?}", e.payload);
+        }
+    }
+
+    async fn expect_payload(rx: &mut mpsc::Receiver<Event<String>>, want: &str) {
+        let e = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(e.payload, want);
+    }
+
+    #[tokio::test]
+    async fn subscriber_ids_are_unique_and_start_at_one() {
+        let router = setup_router().await;
+        let (a, _ra) = subscribe(router.clone(), "t".into()).await.unwrap();
+        let (b, _rb) = subscribe(router.clone(), "u".into()).await.unwrap();
+        let (c, _rc) = subscribe(router.clone(), "t".into()).await.unwrap();
+        assert_eq!((a, b, c), (1, 2, 3));
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_stops_delivery_to_that_subscriber_only() {
+        let router = setup_router().await;
+        let (id1, mut rx1) = subscribe(router.clone(), "t".into()).await.unwrap();
+        let (_id2, mut rx2) = subscribe(router.clone(), "t".into()).await.unwrap();
+
+        router
+            .send(RouterMsg::Unsubscribe { topic: "t".into(), id: id1 })
+            .await
+            .unwrap();
+        publish(&router, test_event("t", "after")).await;
+
+        expect_payload(&mut rx2, "after").await;
+        expect_none(&mut rx1).await;
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_with_unknown_topic_or_id_is_harmless() {
+        let router = setup_router().await;
+        let (_id, mut rx) = subscribe(router.clone(), "t".into()).await.unwrap();
+
+        router
+            .send(RouterMsg::Unsubscribe { topic: "nope".into(), id: 99 })
+            .await
+            .unwrap();
+        router
+            .send(RouterMsg::Unsubscribe { topic: "t".into(), id: 99 })
+            .await
+            .unwrap();
+        publish(&router, test_event("t", "still")).await;
+        expect_payload(&mut rx, "still").await;
+    }
+
+    #[tokio::test]
+    async fn disconnect_removes_subscriber_from_its_topic() {
+        let router = setup_router().await;
+        let (id1, mut rx1) = subscribe(router.clone(), "t".into()).await.unwrap();
+        let (_id2, mut rx2) = subscribe(router.clone(), "t".into()).await.unwrap();
+
+        router.send(RouterMsg::Disconnect { id: id1 }).await.unwrap();
+        // A second disconnect of the same id and one of an unknown id are no-ops.
+        router.send(RouterMsg::Disconnect { id: id1 }).await.unwrap();
+        router.send(RouterMsg::Disconnect { id: 1000 }).await.unwrap();
+        publish(&router, test_event("t", "x")).await;
+
+        expect_payload(&mut rx2, "x").await;
+        expect_none(&mut rx1).await;
+    }
+
+    #[tokio::test]
+    async fn slow_subscriber_is_dropped_when_its_queue_fills() {
+        let router = setup_router().await;
+        let (_slow_id, mut slow) = subscribe(router.clone(), "t".into()).await.unwrap();
+        let (_fast_id, mut fast) = subscribe(router.clone(), "t".into()).await.unwrap();
+
+        // The subscriber queue holds 64 events; the 65th makes the slow one fail try_send.
+        for i in 0..65 {
+            publish(&router, test_event("t", &format!("e{i}"))).await;
+            // The fast subscriber keeps draining so it is never dropped.
+            expect_payload(&mut fast, &format!("e{i}")).await;
+        }
+        // Later events no longer reach the dropped subscriber, but reach the fast one.
+        publish(&router, test_event("t", "late")).await;
+        expect_payload(&mut fast, "late").await;
+
+        let mut got = Vec::new();
+        while let Ok(Some(e)) = timeout(Duration::from_millis(100), slow.recv()).await {
+            got.push(e.payload);
+        }
+        assert_eq!(got.len(), 64, "slow subscriber keeps what fit before the drop");
+        assert_eq!(got.first().map(String::as_str), Some("e0"));
+        assert_eq!(got.last().map(String::as_str), Some("e63"));
+    }
+
+    #[tokio::test]
+    async fn publish_to_unknown_topic_reaches_nobody() {
+        let router = setup_router().await;
+        let (_id, mut rx) = subscribe(router.clone(), "t".into()).await.unwrap();
+        publish(&router, test_event("other", "x")).await;
+        publish(&router, test_event("t", "y")).await;
+        // Only the event on the subscribed topic arrives.
+        expect_payload(&mut rx, "y").await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_fails_with_send_failed_when_router_is_gone() {
+        let (tx, rx) = mpsc::channel::<RouterMsg<String>>(1);
+        drop(rx);
+        let err = subscribe(tx, "t".into()).await.unwrap_err();
+        assert_eq!(err, SubscribeError::SendFailed);
+    }
+
+    #[tokio::test]
+    async fn subscribe_fails_with_router_dropped_when_reply_never_comes() {
+        let (tx, mut rx) = mpsc::channel::<RouterMsg<String>>(1);
+        // A fake router that receives the request and drops it without replying.
+        tokio::spawn(async move {
+            let _ = rx.recv().await;
+        });
+        let err = subscribe(tx, "t".into()).await.unwrap_err();
+        assert_eq!(err, SubscribeError::RouterDropped);
+    }
+
+    #[tokio::test]
+    async fn publish_to_closed_router_does_not_panic() {
+        let (tx, rx) = mpsc::channel::<RouterMsg<String>>(1);
+        drop(rx);
+        publish(&tx, test_event("t", "x")).await;
+    }
+
+    #[test]
+    fn subscribe_error_display_names_the_variant() {
+        assert_eq!(SubscribeError::SendFailed.to_string(), "SendFailed");
+        assert_eq!(SubscribeError::RouterDropped.to_string(), "RouterDropped");
+    }
 }

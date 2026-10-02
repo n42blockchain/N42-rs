@@ -939,8 +939,9 @@ fn mark_dirty(dirty: &mut Vec<u8>, twig_id: usize, level: u8) {
 }
 
 /// The leaf hash of every operation that writes a value, on the worker pool
-/// when the `rayon` feature is on.
-fn leaf_hashes<O: LeafOps + ?Sized>(operations: &O) -> Vec<Option<Hash>> {
+/// when the `rayon` feature is on, into `out` (emptied first).
+fn leaf_hashes<O: LeafOps + ?Sized>(operations: &O, out: &mut Vec<Option<Hash>>) {
+    out.clear();
     let count = operations.op_count();
     // A chunk at a time, its leaves batched across the SIMD lanes.
     let chunk = |chunk: usize| -> Vec<Option<Hash>> {
@@ -959,16 +960,13 @@ fn leaf_hashes<O: LeafOps + ?Sized>(operations: &O) -> Vec<Option<Hash>> {
     {
         use rayon::prelude::*;
         let pieces: Vec<Vec<Option<Hash>>> = (0..chunks).into_par_iter().map(chunk).collect();
-        let mut out = Vec::with_capacity(count);
+        out.reserve(count);
         for piece in pieces {
             out.extend(piece);
         }
-        out
     }
     #[cfg(not(feature = "rayon"))]
-    {
-        (0..chunks).flat_map(chunk).collect()
-    }
+    out.extend((0..chunks).flat_map(chunk));
 }
 
 /// Operations per unit of parallel work on the block path: small enough to
@@ -977,18 +975,18 @@ fn leaf_hashes<O: LeafOps + ?Sized>(operations: &O) -> Vec<Option<Hash>> {
 /// per operation or per twig; `docs/QMDB_LAYERZERO_COMPARISON.md` section 6.5).
 const LEAF_CHUNK: usize = 1024;
 
-/// The slot each operation's key currently occupies, if any.
-fn held_slots<O: LeafOps + ?Sized>(index: &KeyIndex, entries: &Entries, operations: &O) -> Vec<Option<u64>> {
+/// The slot each operation's key currently occupies, if any, into `out`
+/// (emptied first; written in place by the worker pool).
+fn held_slots<O: LeafOps + ?Sized>(index: &KeyIndex, entries: &Entries, operations: &O, out: &mut Vec<Option<u64>>) {
+    out.clear();
     let held = |i: usize| index.get(operations.op_key(i), |slot| entries.key(slot as usize));
     #[cfg(feature = "rayon")]
     {
         use rayon::prelude::*;
-        (0..operations.op_count()).into_par_iter().with_min_len(LEAF_CHUNK).map(held).collect()
+        out.par_extend((0..operations.op_count()).into_par_iter().with_min_len(LEAF_CHUNK).map(held));
     }
     #[cfg(not(feature = "rayon"))]
-    {
-        (0..operations.op_count()).map(held).collect()
-    }
+    out.extend((0..operations.op_count()).map(held));
 }
 
 /// Clears every slot `held` names in its twig's bit set and marks the twig
@@ -1961,12 +1959,16 @@ impl QmdbCompatTree {
         // and root. The tree these produce is the tree `set`/`delete` produce,
         // and a test says so operation for operation.
         let at = std::time::Instant::now();
-        let leaves = leaf_hashes(operations);
+        // The block's temporaries, the last block's with their pages in.
+        let mut scratch = crate::prefault::take_apply_scratch(count);
+        leaf_hashes(operations, &mut scratch.leaves);
         // The slot each key holds now, looked up on the worker pool: the
         // block's keys are distinct, so no lookup depends on an earlier write
         // of the same block, and the lookups are the random reads of a
         // multi-million-entry index that the serial loop was waiting on.
-        let held = held_slots(&self.index, &self.entries, operations);
+        held_slots(&self.index, &self.entries, operations, &mut scratch.held);
+        let crate::prefault::ApplyScratch { leaves, held, pairs: appended } = &mut scratch;
+        let (leaves, held) = (&*leaves, &*held);
         phases.leaves_us = at.elapsed().as_micros() as u64;
         let at = std::time::Instant::now();
         // The undo record's entries -- what every retired slot held -- built
@@ -1993,7 +1995,7 @@ impl QmdbCompatTree {
                     record.slots.extend(held.iter().flatten().copied());
                 }
             } else {
-                let retired = undo_entries(&self.entries, &held);
+                let retired = undo_entries(&self.entries, held);
                 if let Some(record) = self.recording.as_mut() {
                     record.entries.extend(retired);
                 }
@@ -2009,8 +2011,8 @@ impl QmdbCompatTree {
         // The slots the block retires, cleared on the worker pool: every
         // entry and every twig checks its own against a bitmap, instead of
         // 133,000 random writes in sequence.
-        self.entries.retire(&held);
-        retire_twigs(self.entries.len(), &mut self.twigs, &mut dirty, &held);
+        self.entries.retire(held);
+        retire_twigs(self.entries.len(), &mut self.twigs, &mut dirty, held);
         phases.retire_us = at.elapsed().as_micros() as u64;
         let faults_writes = crate::prefault::thread_faults();
         phases.prep_faults = faults_writes.saturating_sub(faults_at);
@@ -2025,7 +2027,6 @@ impl QmdbCompatTree {
         // The appends' index entries, inserted per shard afterwards; the
         // block's keys are distinct, so no operation reads one.
         let first_slot = self.next_slot;
-        let mut appended: Vec<(Hash, u64)> = Vec::with_capacity(count);
         for i in 0..count {
             if appends(i).is_some() {
                 appended.push((*operations.op_key(i), first_slot + appended.len() as u64));
@@ -2042,7 +2043,7 @@ impl QmdbCompatTree {
             record.appended_keys.extend(appended.iter().map(|(key, _)| *key));
         }
         took(&mut phases.undo_faults);
-        for (leaf, (_, slot)) in (0..count).filter_map(|i| appends(i).map(|(_, leaf)| leaf)).zip(&appended) {
+        for (leaf, (_, slot)) in (0..count).filter_map(|i| appends(i).map(|(_, leaf)| leaf)).zip(appended.iter()) {
             self.set_twig_leaf(*slot, leaf, &mut dirty);
         }
         self.next_slot = first_slot + appended.len() as u64;
@@ -2066,7 +2067,7 @@ impl QmdbCompatTree {
         phases.writes_faults = faults_hash.saturating_sub(faults_writes);
         let at = std::time::Instant::now();
         let entries = &self.entries;
-        self.index.insert_sorted(&appended, |slot| entries.key(slot as usize));
+        self.index.insert_sorted(appended, |slot| entries.key(slot as usize));
         phases.index_us = at.elapsed().as_micros() as u64;
         phases.index_faults += crate::prefault::thread_faults().saturating_sub(faults_hash);
         let at = std::time::Instant::now();
@@ -2076,6 +2077,7 @@ impl QmdbCompatTree {
         let root = self.root();
         phases.root_us = at.elapsed().as_micros() as u64;
         phases.hash_faults = crate::prefault::thread_faults().saturating_sub(faults_hash);
+        crate::prefault::recycle_apply_scratch(scratch);
         Ok((root, phases))
     }
 

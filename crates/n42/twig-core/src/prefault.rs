@@ -130,6 +130,71 @@ fn pools() -> std::sync::MutexGuard<'static, Pools> {
     POOLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// A block apply's per-block temporaries, kept between blocks with their
+/// pages in: the leaf hashes (5.4 MB at 163,000 operations), the slots the
+/// keys held (2.6 MB) and the appends' key and slot pairs (6.5 MB). Freshly
+/// allocated every block, they were the faulting roots' faults: jemalloc
+/// hands a multi-megabyte request an extent its decay has purged as soon as
+/// other threads churn the heap (`root_faults` with
+/// `N42_ROOT_FAULTS_CHURN`: 1,300-1,600 faults in the roots that got one,
+/// a page each). A live allocation is never purged.
+#[derive(Debug, Default)]
+pub(crate) struct ApplyScratch {
+    /// The leaf hash of every operation that writes a value.
+    pub(crate) leaves: Vec<Option<Hash>>,
+    /// The slot each operation's key held.
+    pub(crate) held: Vec<Option<u64>>,
+    /// The appends' key and slot pairs.
+    pub(crate) pairs: Vec<(Hash, u64)>,
+}
+
+static APPLY_SCRATCH: Mutex<Option<ApplyScratch>> = Mutex::new(None);
+
+/// Whether the apply's temporaries are kept between blocks
+/// (`N42_QMDB_APPLY_SCRATCH`, on by default).
+fn apply_scratch_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_usize("N42_QMDB_APPLY_SCRATCH", 1) != 0)
+}
+
+/// The apply temporaries the last block gave back, emptied, with room for
+/// `ops` operations; fresh ones when none are kept (another apply holds them,
+/// or the reuse is off). Grown with a quarter to spare, so a block a little
+/// larger than the last does not reallocate them.
+pub(crate) fn take_apply_scratch(ops: usize) -> ApplyScratch {
+    let mut scratch = if apply_scratch_on() {
+        APPLY_SCRATCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take().unwrap_or_default()
+    } else {
+        ApplyScratch::default()
+    };
+    let room = ops + ops / 4;
+    if scratch.leaves.capacity() < ops {
+        scratch.leaves = Vec::with_capacity(room);
+    }
+    if scratch.held.capacity() < ops {
+        scratch.held = Vec::with_capacity(room);
+    }
+    if scratch.pairs.capacity() < ops {
+        scratch.pairs = Vec::with_capacity(room);
+    }
+    scratch
+}
+
+/// Gives a block's apply temporaries back for the next block's (the larger
+/// set is kept when two applies overlapped).
+pub(crate) fn recycle_apply_scratch(mut scratch: ApplyScratch) {
+    if !apply_scratch_on() {
+        return;
+    }
+    scratch.leaves.clear();
+    scratch.held.clear();
+    scratch.pairs.clear();
+    let mut kept = APPLY_SCRATCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if kept.as_ref().is_none_or(|kept| kept.pairs.capacity() < scratch.pairs.capacity()) {
+        *kept = Some(scratch);
+    }
+}
+
 /// How many fresh twig trees the prefault thread has allocated in this
 /// process (the shared pool's refills).
 pub fn twig_pool_refills() -> u64 {

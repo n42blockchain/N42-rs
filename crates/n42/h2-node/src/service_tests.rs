@@ -818,3 +818,6 @@ async fn blocks_the_execution_layer_already_has_are_answered_without_asking_it_a
 
 #[path = "service_loop_tests.rs"]
 mod loop_tests;
+
+#[path = "service_net_tests.rs"]
+mod net_tests;

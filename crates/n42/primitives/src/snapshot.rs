@@ -806,3 +806,210 @@ mod tests {
         assert!(!tally.authorize); // This is a deauthorization vote
     }
 }
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use alloy_primitives::{address, Bytes, B64};
+    use reth_primitives_traits::Header;
+
+    const S1: Address = address!("0000000000000000000000000000000000000001");
+    const S2: Address = address!("0000000000000000000000000000000000000002");
+    const S3: Address = address!("0000000000000000000000000000000000000003");
+    const NEW: Address = address!("0000000000000000000000000000000000000004");
+
+    fn config(epoch: u64) -> APosConfig {
+        APosConfig { epoch, ..APosConfig::default() }
+    }
+
+    fn snap(epoch: u64) -> Snapshot {
+        Snapshot::new_snapshot(config(epoch), 0, B256::ZERO, vec![S1, S2, S3])
+    }
+
+    /// A header at `number` signed by `signer` (carried in `extra_data`), voting on
+    /// `beneficiary` with `nonce`.
+    fn header(number: u64, signer: Address, beneficiary: Address, nonce: [u8; 8]) -> Header {
+        Header {
+            number,
+            beneficiary,
+            nonce: B64::from(nonce),
+            extra_data: Bytes::copy_from_slice(signer.as_slice()),
+            ..Default::default()
+        }
+    }
+
+    fn abstain(number: u64, signer: Address) -> Header {
+        header(number, signer, Address::ZERO, NONCE_DROP_VOTE)
+    }
+
+    fn recover(h: Header) -> Result<Address, Box<dyn Error>> {
+        if h.extra_data.len() != 20 {
+            return Err("bad extra data".into());
+        }
+        Ok(Address::from_slice(&h.extra_data))
+    }
+
+    #[test]
+    fn no_headers_returns_the_same_snapshot() {
+        let s = snap(100);
+        assert_eq!(s.apply(Vec::<Header>::new(), recover).unwrap(), s);
+    }
+
+    #[test]
+    fn headers_must_form_a_chain_continuing_the_snapshot() {
+        let s = snap(100);
+        // First header must be snapshot.number + 1.
+        let err = s.apply(vec![abstain(2, S1)], recover).unwrap_err();
+        assert!(matches!(err, VotingError::InvalidVotingChain));
+        // Gaps inside the batch are rejected.
+        let err = s.apply(vec![abstain(1, S1), abstain(3, S2)], recover).unwrap_err();
+        assert!(matches!(err, VotingError::InvalidVotingChain));
+    }
+
+    #[test]
+    fn signer_errors_are_reported() {
+        let s = snap(100);
+        let err = s.apply(vec![abstain(1, NEW)], recover).unwrap_err();
+        assert!(matches!(err, VotingError::UnauthorizedSigner));
+
+        let mut broken = abstain(1, S1);
+        broken.extra_data = Bytes::new();
+        match s.apply(vec![broken], recover).unwrap_err() {
+            VotingError::RecoverError(msg) => assert!(msg.contains("bad extra data")),
+            other => panic!("unexpected error {other}"),
+        }
+    }
+
+    #[test]
+    fn a_signer_cannot_sign_twice_within_the_recent_window() {
+        let s = snap(100);
+        // With 3 signers the window is 3/2 + 1 = 2 blocks.
+        let err = s.apply(vec![abstain(1, S1), abstain(2, S1)], recover).unwrap_err();
+        assert!(matches!(err, VotingError::SignerRecentlySigned));
+        // After the window has passed the signer may sign again.
+        let ok = s
+            .apply(vec![abstain(1, S1), abstain(2, S2), abstain(3, S3), abstain(4, S1)], recover)
+            .unwrap();
+        assert_eq!(ok.number, 4);
+        assert_eq!(ok.recents.get(&4), Some(&S1));
+        assert!(!ok.recents.contains_key(&1));
+    }
+
+    #[test]
+    fn nonce_must_be_a_vote_magic_value() {
+        let s = snap(100);
+        let bad = header(1, S1, NEW, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(matches!(s.apply(vec![bad], recover).unwrap_err(), VotingError::InvalidVote));
+    }
+
+    #[test]
+    fn votes_are_recorded_and_the_snapshot_advances() {
+        let s = snap(100);
+        let h1 = header(1, S1, NEW, NONCE_AUTH_VOTE);
+        let out = s.apply(vec![h1.clone()], recover).unwrap();
+        assert_eq!(out.number, 1);
+        assert_eq!(out.hash, h1.hash_slow());
+        assert_eq!(out.signers, vec![S1, S2, S3]);
+        assert_eq!(out.votes, vec![Vote { signer: S1, block: 1, address: NEW, authorize: true }]);
+        assert_eq!(out.tally.get(&NEW), Some(&Tally { authorize: true, votes: 1 }));
+        // The original snapshot is untouched.
+        assert_eq!(s.number, 0);
+        assert!(s.votes.is_empty());
+    }
+
+    #[test]
+    fn blocks_without_a_meaningful_vote_record_nothing() {
+        let s = snap(100);
+        // Beneficiary zero with a "drop" nonce is the usual no-vote block.
+        let out = s.apply(vec![abstain(1, S1)], recover).unwrap();
+        assert!(out.votes.is_empty());
+        assert!(out.tally.is_empty());
+        assert_eq!(out.recents.get(&1), Some(&S1));
+        // Voting to authorize an existing signer is meaningless too.
+        let out = s.apply(vec![header(1, S1, S2, NONCE_AUTH_VOTE)], recover).unwrap();
+        assert!(out.votes.is_empty());
+    }
+
+    #[test]
+    fn a_majority_authorizes_a_new_signer() {
+        let s = snap(100);
+        let out = s
+            .apply(
+                vec![
+                    header(1, S1, NEW, NONCE_AUTH_VOTE),
+                    header(2, S2, NEW, NONCE_AUTH_VOTE),
+                ],
+                recover,
+            )
+            .unwrap();
+        // 2 votes > 3 / 2, so NEW joins and its vote bookkeeping is cleared.
+        assert_eq!(out.signers, vec![S1, S2, S3, NEW]);
+        assert!(out.votes.is_empty());
+        assert!(out.tally.is_empty());
+        assert_eq!(out.number, 2);
+    }
+
+    #[test]
+    fn a_majority_deauthorizes_a_signer_and_drops_its_votes() {
+        let s = snap(100);
+        let out = s
+            .apply(
+                vec![
+                    // S3 votes to add NEW, then is voted out by S1 and S2.
+                    header(1, S3, NEW, NONCE_AUTH_VOTE),
+                    header(2, S1, S3, NONCE_DROP_VOTE),
+                    header(3, S2, S3, NONCE_DROP_VOTE),
+                ],
+                recover,
+            )
+            .unwrap();
+        assert_eq!(out.signers, vec![S1, S2]);
+        // S3's pending vote for NEW is discarded along with the removal votes.
+        assert!(out.votes.is_empty());
+        assert!(out.tally.is_empty());
+    }
+
+    #[test]
+    fn a_signers_new_vote_replaces_its_previous_vote_on_the_same_address() {
+        let s = snap(100);
+        let out = s
+            .apply(
+                vec![
+                    header(1, S1, NEW, NONCE_AUTH_VOTE),
+                    abstain(2, S2),
+                    abstain(3, S3),
+                    header(4, S1, NEW, NONCE_AUTH_VOTE),
+                ],
+                recover,
+            )
+            .unwrap();
+        assert_eq!(out.votes, vec![Vote { signer: S1, block: 4, address: NEW, authorize: true }]);
+        assert_eq!(out.tally.get(&NEW).unwrap().votes, 1);
+    }
+
+    #[test]
+    fn checkpoint_blocks_reset_votes() {
+        let s = snap(4);
+        let out = s
+            .apply(
+                vec![
+                    header(1, S1, NEW, NONCE_AUTH_VOTE),
+                    abstain(2, S2),
+                    abstain(3, S3),
+                    abstain(4, S1),
+                ],
+                recover,
+            )
+            .unwrap();
+        assert!(out.votes.is_empty());
+        assert!(out.tally.is_empty());
+        assert_eq!(out.number, 4);
+    }
+
+    #[test]
+    #[ignore = "BUG: Snapshot::inturn divides by zero (panics) when the signer set is empty (snapshot.rs:404)"]
+    fn inturn_with_no_signers_must_not_panic() {
+        let s = Snapshot::new_snapshot(APosConfig::default(), 0, B256::ZERO, vec![]);
+        assert!(!s.inturn(1, &S1));
+    }
+}

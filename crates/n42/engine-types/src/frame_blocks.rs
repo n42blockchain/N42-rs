@@ -526,3 +526,169 @@ mod claimed_root_tests {
         assert_eq!(root_of_block(&bare), None);
     }
 }
+
+#[cfg(test)]
+mod frame_root_tests {
+    use super::*;
+    use alloy_consensus::EMPTY_ROOT_HASH;
+    use n42_tx_queue::PlannedFrame;
+
+    fn hashes(tag: u8, n: usize) -> Vec<B256> {
+        (0..n).map(|i| B256::repeat_byte(tag.wrapping_add(i as u8))).collect()
+    }
+
+    #[test]
+    fn the_mode_is_off_unless_forced_and_the_override_nests() {
+        assert!(!active());
+        with_active(true, || {
+            assert!(active());
+            with_active(false, || assert!(!active()));
+            assert!(active(), "the outer override is restored");
+        });
+        assert!(!active());
+    }
+
+    #[test]
+    fn a_layout_must_cover_the_body_exactly() {
+        let h = hashes(0x10, 6);
+        let by = |counts: &[usize], known: &[Option<B256>], total: usize| frame_tree_root_known(counts, known, total, |i| h[i]);
+        // An empty body is the empty trie, and only with an empty layout.
+        let empty = by(&[], &[], 0).expect("empty");
+        assert_eq!((empty.root, empty.indexed, empty.hashed), (EMPTY_ROOT_HASH, 0, 0));
+        assert!(by(&[3], &[None], 0).is_none());
+        // Known leaves must be one per frame, frames non-empty, the counts must sum to the total.
+        assert!(by(&[3, 3], &[None], 6).is_none(), "known and counts differ in length");
+        assert!(by(&[3, 0, 3], &[None, None, None], 6).is_none(), "an empty frame");
+        assert!(by(&[3, 2], &[None, None], 6).is_none(), "counts short of the body");
+        assert!(by(&[3, 4], &[None, None], 6).is_none(), "counts past the body");
+        assert!(by(&[6], &[None], 6).is_some());
+    }
+
+    #[test]
+    fn a_known_leaf_is_used_as_is_and_hashing_counts_the_rest() {
+        let h = hashes(0x20, 7);
+        let counts = [3usize, 2, 2];
+        let id0 = n42_tx_types::frame_root(&h[0..3]);
+        let all_hashed = frame_tree_root_known(&counts, &[None, None, None], 7, |i| h[i]).expect("covers");
+        assert_eq!((all_hashed.indexed, all_hashed.hashed), (0, 3));
+        // A leaf that is the frame's true id changes nothing but the counters.
+        let one_known = frame_tree_root_known(&counts, &[Some(id0), None, None], 7, |i| h[i]).expect("covers");
+        assert_eq!((one_known.indexed, one_known.hashed), (1, 2));
+        assert_eq!(one_known.root, all_hashed.root);
+        // A known leaf is trusted without looking at the body: a different id gives a different root.
+        let lie = frame_tree_root_known(&counts, &[Some(B256::repeat_byte(1)), None, None], 7, |i| h[i]).expect("covers");
+        assert_ne!(lie.root, all_hashed.root);
+        // The one-hashed (sequential) and many-hashed (parallel) paths agree on the same root.
+        let sequential = frame_tree_root_known(&counts, &[Some(id0), Some(n42_tx_types::frame_root(&h[3..5])), None], 7, |i| h[i]).expect("covers");
+        assert_eq!((sequential.indexed, sequential.hashed), (2, 1));
+        assert_eq!(sequential.root, all_hashed.root);
+        assert_eq!(root_of_hashes(&h, &counts), Some(all_hashed.root));
+        assert_eq!(root_of_hashes(&h, &[3, 3]), None);
+        assert_eq!(root_of_hashes(&[], &[]), Some(EMPTY_ROOT_HASH));
+    }
+
+    fn plan_of(tag: u8) -> (FramePlan, Vec<B256>) {
+        let h = hashes(tag, 6);
+        let (f0, f1) = (&h[0..3], &h[3..6]);
+        let mut plan = FramePlan::default();
+        plan.frames.push(PlannedFrame { id: n42_tx_types::frame_root(f0), len: 3, taken: 3 });
+        plan.frames.push(PlannedFrame { id: n42_tx_types::frame_root(f1), len: 3, taken: 2 });
+        plan.push_hashes(Arc::from(f0), 3);
+        plan.push_hashes(Arc::from(f1), 2);
+        (plan, h)
+    }
+
+    use std::sync::Arc;
+
+    #[test]
+    fn an_empty_body_keeps_the_mpt_root_without_a_layout() {
+        let mpt = B256::repeat_byte(0xAB);
+        let sealed = seal_root_timed(None, &[], || mpt);
+        assert_eq!((sealed.root, sealed.indexed, sealed.hashed), (mpt, 0, 0));
+        assert_eq!(seal_root(None, &[], || mpt), mpt);
+    }
+
+    #[test]
+    fn a_body_that_is_a_prefix_of_the_plan_is_sealed_with_the_frame_tree() {
+        let (plan, h) = plan_of(0x30);
+        let mpt = B256::repeat_byte(0xAC);
+        let aligned_before = SEALED_ALIGNED.load(Ordering::Relaxed);
+        // The whole plan: frame 0 whole (its id is the leaf), frame 1 cut to 2 and hashed.
+        let body = &h[0..5];
+        let sealed = seal_root_timed(Some(&plan), body, || mpt);
+        let expected = n42_tx_types::frame_tree_root(&[n42_tx_types::frame_root(&h[0..3]), n42_tx_types::frame_root(&h[3..5])]);
+        assert_eq!(sealed.root, expected);
+        assert_eq!((sealed.indexed, sealed.hashed), (1, 1));
+        assert!(SEALED_ALIGNED.load(Ordering::Relaxed) > aligned_before);
+        // The layout is remembered under the root for the block's description.
+        assert_eq!(
+            layout_by_root(&expected),
+            Some(vec![(plan.frames[0].id, 3), (plan.frames[1].id, 2)])
+        );
+        // A body that stopped after frame 0 is that frame alone, all known.
+        let short = seal_root_timed(Some(&plan), &h[0..3], || mpt);
+        assert_eq!((short.indexed, short.hashed), (1, 0));
+        assert_eq!(short.root, n42_tx_types::frame_tree_root(&[plan.frames[0].id]));
+        // A body that ends inside frame 0 cuts it, so its leaf is hashed.
+        let cut = seal_root_timed(Some(&plan), &h[0..2], || mpt);
+        assert_eq!((cut.indexed, cut.hashed), (0, 1));
+        assert_eq!(cut.root, n42_tx_types::frame_tree_root(&[n42_tx_types::frame_root(&h[0..2])]));
+    }
+
+    #[test]
+    fn a_body_that_is_not_a_run_of_the_plans_frames_is_sealed_with_the_mpt_root() {
+        let (plan, h) = plan_of(0x40);
+        let mpt = B256::repeat_byte(0xAD);
+        let before = SEALED_MPT.load(Ordering::Relaxed);
+        // Reordered: not a prefix of the plan.
+        let mut body = h[0..5].to_vec();
+        body.swap(0, 1);
+        let sealed = seal_root_timed(Some(&plan), &body, || mpt);
+        assert_eq!((sealed.root, sealed.indexed, sealed.hashed), (mpt, 0, 0));
+        // Longer than the plan.
+        assert_eq!(seal_root(Some(&plan), &h, || mpt), mpt);
+        // No plan and no index that knows these hashes.
+        assert_eq!(seal_root(None, &hashes(0x44, 4), || mpt), mpt);
+        assert!(SEALED_MPT.load(Ordering::Relaxed) >= before + 3);
+    }
+
+    #[test]
+    fn a_remembered_layout_roots_a_whole_body_and_a_wrong_claim_falls_back_to_mpt() {
+        let h = hashes(0x50, 5);
+        let counts = [3usize, 2];
+        let root = root_of_hashes(&h, &counts).expect("covers");
+        let layout = [(B256::repeat_byte(0xA1), 3u32), (B256::repeat_byte(0xA2), 2u32)];
+        let mpt = B256::repeat_byte(0xAE);
+        remember_verified(B256::repeat_byte(0x51), root, &layout);
+        assert_eq!(root_of_block(&B256::repeat_byte(0x51)), Some(root));
+        assert_eq!(layout_by_root(&root), Some(layout.to_vec()));
+        // The claimed root's layout reproduces it from the body's own hashes.
+        let found = root_for_body_counted(Some(root), &h, || mpt);
+        assert!(found.frame);
+        assert_eq!(found.root, root);
+        assert_eq!(found.indexed + found.hashed, 2);
+        // Another body under the same claim does not reproduce it.
+        let other = hashes(0x60, 5);
+        let refused = root_for_body_counted(Some(root), &other, || mpt);
+        assert_eq!((refused.root, refused.frame), (mpt, false));
+        // An empty body is the empty trie whatever is claimed.
+        assert_eq!(root_for_body(Some(root), &[], || mpt), (EMPTY_ROOT_HASH, false));
+        // A claim nothing remembers, with an index that knows nothing of the body.
+        assert_eq!(root_for_body(Some(B256::repeat_byte(0xFE)), &h, || mpt), (mpt, false));
+        assert_eq!(root_for_body(None, &h, || mpt), (mpt, false));
+    }
+
+    #[test]
+    fn a_layout_is_remembered_once_per_root_and_a_claim_with_no_layout_is_ignored() {
+        let root = B256::repeat_byte(0x71);
+        remember_verified(B256::repeat_byte(0x72), root, &[(B256::repeat_byte(1), 2)]);
+        // A second filing under the same root keeps the first layout.
+        remember_verified(B256::repeat_byte(0x73), root, &[(B256::repeat_byte(2), 9)]);
+        assert_eq!(layout_by_root(&root), Some(vec![(B256::repeat_byte(1), 2)]));
+        assert_eq!(root_of_block(&B256::repeat_byte(0x73)), Some(root), "the block's root is still recorded");
+        // The same block filed twice keeps its first root.
+        remember_verified(B256::repeat_byte(0x72), B256::repeat_byte(0x74), &[(B256::repeat_byte(3), 1)]);
+        assert_eq!(root_of_block(&B256::repeat_byte(0x72)), Some(root));
+        assert_eq!(layout_by_root(&B256::repeat_byte(0x75)), None);
+    }
+}

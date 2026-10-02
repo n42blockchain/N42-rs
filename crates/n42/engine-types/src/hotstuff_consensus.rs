@@ -723,7 +723,7 @@ mod tests {
 
     // ---- validation-rule tests ----
 
-    use alloy_consensus::{BlockBody as _, EMPTY_ROOT_HASH};
+    use alloy_consensus::EMPTY_ROOT_HASH;
     use alloy_eips::eip4895::{Withdrawal, Withdrawals};
     use reth_chainspec::{ChainSpec, ChainSpecBuilder, MAINNET};
 

@@ -1475,7 +1475,9 @@ mod frozen_tests {
     }
 
     /// A batch's bundle: each `(address, before, after)` moved from one value to the other.
-    fn batch(moves: &[(u8, (u64, u64), (u64, u64))]) -> BundleState {
+    type Move = (u8, (u64, u64), (u64, u64));
+
+    fn batch(moves: &[Move]) -> BundleState {
         let mut builder = BundleState::builder(1..=1);
         for (a, (n0, b0), (n1, b1)) in moves {
             builder = builder

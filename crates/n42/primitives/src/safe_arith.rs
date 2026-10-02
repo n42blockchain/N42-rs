@@ -106,3 +106,84 @@ macro_rules! impl_safe_arith {
 
 impl_safe_arith!(u64);
 impl_safe_arith!(usize);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_overflow_is_detected() {
+        assert_eq!(1u64.safe_add(2), Ok(3));
+        assert_eq!(u64::MAX.safe_add(1), Err(ArithError::Overflow));
+        assert_eq!(usize::MAX.safe_add(1), Err(ArithError::Overflow));
+        assert_eq!((u64::MAX - 1).safe_add(1), Ok(u64::MAX));
+    }
+
+    #[test]
+    fn sub_underflow_is_detected() {
+        assert_eq!(5u64.safe_sub(5), Ok(0));
+        assert_eq!(0u64.safe_sub(1), Err(ArithError::Overflow));
+        assert_eq!(0usize.safe_sub(1), Err(ArithError::Overflow));
+    }
+
+    #[test]
+    fn mul_overflow_is_detected() {
+        assert_eq!(6u64.safe_mul(7), Ok(42));
+        assert_eq!(u64::MAX.safe_mul(2), Err(ArithError::Overflow));
+        assert_eq!(u64::MAX.safe_mul(0), Ok(0));
+        assert_eq!(usize::MAX.safe_mul(2), Err(ArithError::Overflow));
+    }
+
+    #[test]
+    fn div_and_rem_by_zero_are_detected() {
+        assert_eq!(10u64.safe_div(3), Ok(3));
+        assert_eq!(10u64.safe_rem(3), Ok(1));
+        assert_eq!(10u64.safe_div(0), Err(ArithError::DivisionByZero));
+        assert_eq!(10u64.safe_rem(0), Err(ArithError::DivisionByZero));
+        assert_eq!(10usize.safe_div(0), Err(ArithError::DivisionByZero));
+        assert_eq!(10usize.safe_rem(0), Err(ArithError::DivisionByZero));
+    }
+
+    #[test]
+    fn assign_variants_update_in_place_only_on_success() {
+        let mut x = 10u64;
+        x.safe_add_assign(5).unwrap();
+        assert_eq!(x, 15);
+        x.safe_sub_assign(3).unwrap();
+        assert_eq!(x, 12);
+        x.safe_mul_assign(2).unwrap();
+        assert_eq!(x, 24);
+        x.safe_div_assign(5).unwrap();
+        assert_eq!(x, 4);
+        x.safe_rem_assign(3).unwrap();
+        assert_eq!(x, 1);
+
+        // A failing assignment leaves the value untouched.
+        assert_eq!(x.safe_sub_assign(2), Err(ArithError::Overflow));
+        assert_eq!(x, 1);
+        assert_eq!(x.safe_div_assign(0), Err(ArithError::DivisionByZero));
+        assert_eq!(x, 1);
+        assert_eq!(x.safe_rem_assign(0), Err(ArithError::DivisionByZero));
+        assert_eq!(x, 1);
+        let mut y = u64::MAX;
+        assert_eq!(y.safe_add_assign(1), Err(ArithError::Overflow));
+        assert_eq!(y.safe_mul_assign(2), Err(ArithError::Overflow));
+        assert_eq!(y, u64::MAX);
+    }
+
+    #[test]
+    fn constants_and_error_display() {
+        assert_eq!(<u64 as SafeArith>::ZERO, 0);
+        assert_eq!(<usize as SafeArith>::ONE, 1);
+        assert_eq!(ArithError::Overflow.to_string(), "overflow");
+        assert_eq!(ArithError::DivisionByZero.to_string(), "divide by zero");
+    }
+
+    #[test]
+    fn safe_sum_adds_and_reports_overflow() {
+        assert_eq!(Vec::<u64>::new().into_iter().safe_sum(), Ok(0));
+        assert_eq!([1u64, 2, 3].into_iter().safe_sum(), Ok(6));
+        assert_eq!([u64::MAX, 1].into_iter().safe_sum(), Err(ArithError::Overflow));
+        assert_eq!([usize::MAX, 0].into_iter().safe_sum(), Ok(usize::MAX));
+    }
+}

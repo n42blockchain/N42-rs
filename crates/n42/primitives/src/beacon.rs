@@ -2895,3 +2895,460 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod state_basics {
+    use super::*;
+    use crate::test_util::{active_validator, state_with_validators};
+
+    fn spec() -> ChainSpec {
+        beacon_chain_spec()
+    }
+
+    #[test]
+    fn epoch_accessors_follow_the_slot() {
+        let mut s = BeaconState::new();
+        assert_eq!((s.current_epoch(), s.previous_epoch()), (0, 0));
+        s.slot = 31;
+        assert_eq!(s.current_epoch(), 0);
+        s.slot = 32;
+        assert_eq!((s.current_epoch(), s.previous_epoch()), (1, 0));
+        s.slot = 64;
+        assert_eq!(s.current_epoch(), 2);
+        assert_eq!(s.previous_epoch(), 1);
+        assert_eq!(s.next_epoch().unwrap(), 3);
+    }
+
+    #[test]
+    fn indexers_report_unknown_validators() {
+        let s = state_with_validators(2, 0);
+        assert!(s.get_validator(1).is_ok());
+        assert_eq!(s.get_balance(1).unwrap(), 32_000_000_000);
+        assert_eq!(s.get_inactivity_score(0).unwrap(), 0);
+        assert_eq!(s.get_effective_balance(0).unwrap(), 32_000_000_000);
+
+        for err in [
+            s.get_validator(2).map(|_| ()).unwrap_err(),
+            s.get_balance(2).map(|_| ()).unwrap_err(),
+            s.get_inactivity_score(2).map(|_| ()).unwrap_err(),
+            s.get_effective_balance(2).map(|_| ()).unwrap_err(),
+        ] {
+            assert!(err.to_string().contains("UnknownValidator"), "{err}");
+        }
+    }
+
+    #[test]
+    fn pubkey_lookup_finds_the_right_index() {
+        let s = state_with_validators(5, 0);
+        assert_eq!(s.get_validator_index_from_pubkey(&crate::test_util::pubkey(3)), Some(3));
+        assert_eq!(s.get_validator_index_from_pubkey(&BLSPubkey::repeat_byte(0xff)), None);
+    }
+
+    #[test]
+    fn pending_balance_sums_only_the_requested_validator() {
+        let mut s = state_with_validators(3, 0);
+        for (v, amount) in [(1u64, 5u64), (2, 7), (1, 11)] {
+            s.pending_partial_withdrawals.push(PendingPartialWithdrawal {
+                validator_index: v,
+                amount,
+                withdrawable_epoch: 0,
+            });
+        }
+        assert_eq!(s.get_pending_balance_to_withdraw(1).unwrap(), 16);
+        assert_eq!(s.get_pending_balance_to_withdraw(2).unwrap(), 7);
+        assert_eq!(s.get_pending_balance_to_withdraw(0).unwrap(), 0);
+
+        s.pending_partial_withdrawals.push(PendingPartialWithdrawal {
+            validator_index: 1,
+            amount: u64::MAX,
+            withdrawable_epoch: 0,
+        });
+        assert!(s.get_pending_balance_to_withdraw(1).is_err());
+    }
+
+    #[test]
+    fn activation_exit_epoch_adds_lookahead_and_checks_overflow() {
+        let s = BeaconState::new();
+        let spec = spec();
+        // epoch + 1 + max_seed_lookahead (4)
+        assert_eq!(s.compute_activation_exit_epoch(3, &spec).unwrap(), 8);
+        assert!(s.compute_activation_exit_epoch(u64::MAX, &spec).is_err());
+        assert!(s.compute_activation_exit_epoch(u64::MAX - 1, &spec).is_err());
+    }
+
+    #[test]
+    fn total_active_balance_counts_only_active_validators() {
+        let spec = spec();
+        let mut s = state_with_validators(3, 0);
+        assert_eq!(s.compute_total_active_balance_slow(&spec).unwrap(), 96_000_000_000);
+        assert_eq!(s.get_total_active_balance(&spec).unwrap(), 96_000_000_000);
+
+        let mut exited = active_validator(0, &spec);
+        exited.exit_epoch = 0;
+        s.validators_store.set(0, exited).unwrap();
+        assert_eq!(s.get_total_active_balance(&spec).unwrap(), 64_000_000_000);
+
+        // An empty registry is floored at one effective balance increment (no div by zero).
+        assert_eq!(
+            BeaconState::new().get_total_active_balance(&spec).unwrap(),
+            spec.effective_balance_increment
+        );
+    }
+
+    #[test]
+    fn churn_limits_scale_with_total_active_balance() {
+        let spec = spec();
+        // 4 validators: total/32 = 4 ETH is below the 128 ETH floor.
+        let small = state_with_validators(4, 0);
+        assert_eq!(small.get_balance_churn_limit(&spec).unwrap(), 128_000_000_000);
+        assert_eq!(small.get_activation_exit_churn_limit(&spec).unwrap(), 128_000_000_000);
+
+        // 100 validators with a lowered floor: total/32 = 100 ETH wins over the floor, and the
+        // activation/exit variant is capped by max_per_epoch_activation_exit_churn_limit.
+        let mut low_floor = beacon_chain_spec();
+        low_floor.min_per_epoch_churn_limit_electra = 1_000_000_000;
+        let big = state_with_validators(100, 0);
+        assert_eq!(big.get_balance_churn_limit(&low_floor).unwrap(), 100_000_000_000);
+        assert_eq!(big.get_activation_exit_churn_limit(&low_floor).unwrap(), 100_000_000_000);
+        low_floor.max_per_epoch_activation_exit_churn_limit = 50_000_000_000;
+        assert_eq!(big.get_activation_exit_churn_limit(&low_floor).unwrap(), 50_000_000_000);
+
+        // The result is rounded down to a multiple of the effective balance increment.
+        let mut odd = beacon_chain_spec();
+        odd.churn_limit_quotient = 7;
+        let s = state_with_validators(100, 0);
+        // 3.2e12 / 7 = 457_142_857_142 -> 457_000_000_000
+        assert_eq!(s.get_balance_churn_limit(&odd).unwrap(), 457_000_000_000);
+
+        // The registry-update churn limit is the configured minimum.
+        assert_eq!(small.get_validator_churn_limit(&spec).unwrap(), 4);
+        assert_eq!(small.get_activation_churn_limit(&spec).unwrap(), 4);
+    }
+
+    #[test]
+    fn exit_queue_consumes_churn_and_spills_into_later_epochs() {
+        let spec = spec();
+        let mut s = state_with_validators(4, 0);
+
+        // Fresh queue: exits start at current + 1 + lookahead = 5 with a full 128 ETH of churn.
+        assert_eq!(s.compute_exit_epoch_and_update_churn(32_000_000_000, &spec).unwrap(), 5);
+        assert_eq!(s.earliest_exit_epoch, 5);
+        assert_eq!(s.exit_balance_to_consume, 96_000_000_000);
+
+        // Same epoch keeps consuming the remaining churn.
+        assert_eq!(s.compute_exit_epoch_and_update_churn(32_000_000_000, &spec).unwrap(), 5);
+        assert_eq!(s.exit_balance_to_consume, 64_000_000_000);
+
+        // 300 ETH on a fresh queue needs two more epochs of churn beyond the first.
+        let mut t = state_with_validators(4, 0);
+        assert_eq!(t.compute_exit_epoch_and_update_churn(300_000_000_000, &spec).unwrap(), 7);
+        assert_eq!(t.earliest_exit_epoch, 7);
+        assert_eq!(t.exit_balance_to_consume, 84_000_000_000);
+    }
+
+    #[test]
+    fn initiate_validator_exit_sets_epochs_once() {
+        let spec = spec();
+        let mut s = state_with_validators(4, 0);
+        s.initiate_validator_exit(0, &spec).unwrap();
+        let v = s.get_validator(0).unwrap().clone();
+        assert_eq!(v.exit_epoch, 5);
+        assert_eq!(v.withdrawable_epoch, 6);
+        let (queue_epoch, to_consume) = (s.earliest_exit_epoch, s.exit_balance_to_consume);
+
+        // A second call is a no-op: it must not consume more churn.
+        s.initiate_validator_exit(0, &spec).unwrap();
+        assert_eq!(s.get_validator(0).unwrap(), &v);
+        assert_eq!((s.earliest_exit_epoch, s.exit_balance_to_consume), (queue_epoch, to_consume));
+
+        assert!(s.initiate_validator_exit(9, &spec).is_err());
+    }
+
+    #[test]
+    fn seed_is_the_hash_of_domain_epoch_and_mix() {
+        let mut s = BeaconState::new();
+        s.randao_mix = B256::repeat_byte(0x5a);
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(&7u32.to_le_bytes());
+        preimage.extend_from_slice(&9u64.to_le_bytes());
+        preimage.extend_from_slice(s.randao_mix.as_slice());
+        let expected = Hash256::from_slice(&hash(&preimage));
+        assert_eq!(s.get_seed(9, 7).unwrap(), expected);
+        assert_ne!(s.get_seed(10, 7).unwrap(), expected);
+        assert_ne!(s.get_seed(9, 8).unwrap(), expected);
+        s.randao_mix = B256::ZERO;
+        assert_ne!(s.get_seed(9, 7).unwrap(), expected);
+    }
+
+    #[test]
+    fn active_indices_and_relative_epochs() {
+        let spec = spec();
+        let mut s = state_with_validators(4, 64);
+        let mut late = active_validator(1, &spec);
+        late.activation_epoch = 3;
+        s.validators_store.set(1, late).unwrap();
+        let mut gone = active_validator(2, &spec);
+        gone.exit_epoch = 2;
+        s.validators_store.set(2, gone).unwrap();
+
+        // current epoch is 2.
+        assert_eq!(s.get_active_validator_indices(1), vec![0, 2, 3]);
+        assert_eq!(s.get_active_validator_indices(2), vec![0, 3]);
+        assert_eq!(s.get_active_validator_indices(3), vec![0, 1, 3]);
+        assert!(s.has_active_validators(RelativeEpoch::Current));
+
+        assert!(!BeaconState::new().has_active_validators(RelativeEpoch::Current));
+    }
+
+    #[test]
+    fn gen_committee_cache_matches_direct_construction() {
+        let s = state_with_validators(128, 32);
+        for rel in [RelativeEpoch::Previous, RelativeEpoch::Current, RelativeEpoch::Next] {
+            let epoch = rel.into_epoch(s.current_epoch());
+            let via_state = s.gen_committee_cache(rel).unwrap();
+            let direct = CommitteeCache::initialized(&s, epoch, &spec()).unwrap();
+            assert_eq!(via_state, direct);
+            assert!(via_state.is_initialized_at(epoch));
+        }
+        assert!(BeaconState::new().gen_committee_cache(RelativeEpoch::Current).is_err());
+    }
+
+    #[test]
+    fn balance_helpers_saturate_and_reject_unknown_index() {
+        let mut s = state_with_validators(2, 0);
+        increase_balance(&mut s, 0, 5).unwrap();
+        assert_eq!(s.get_balance(0).unwrap(), 32_000_000_005);
+        decrease_balance(&mut s, 0, 10).unwrap();
+        assert_eq!(s.get_balance(0).unwrap(), 31_999_999_995);
+
+        // Decreasing below zero floors at zero.
+        decrease_balance(&mut s, 1, u64::MAX).unwrap();
+        assert_eq!(s.get_balance(1).unwrap(), 0);
+        // Increasing past u64::MAX saturates.
+        increase_balance(&mut s, 1, u64::MAX).unwrap();
+        increase_balance(&mut s, 1, 1).unwrap();
+        assert_eq!(s.get_balance(1).unwrap(), u64::MAX);
+
+        assert!(increase_balance(&mut s, 2, 1).unwrap_err().to_string().contains("BalanceNotfound"));
+        assert!(decrease_balance(&mut s, 2, 1).unwrap_err().to_string().contains("BalanceNotfound"));
+    }
+
+    #[test]
+    fn compounding_credential_detection_uses_the_prefix_byte() {
+        let spec = spec();
+        let mut c = [0u8; 32];
+        c[0] = 0x02;
+        assert!(is_compounding_withdrawal_credential(B256::from(c), &spec));
+        c[0] = 0x01;
+        assert!(!is_compounding_withdrawal_credential(B256::from(c), &spec));
+        c[0] = 0x00;
+        assert!(!is_compounding_withdrawal_credential(B256::from(c), &spec));
+    }
+
+    #[test]
+    fn base_reward_formula() {
+        let mut spec = spec();
+        let sqrt = SqrtTotalActiveBalance::new(1_000_000_000_000_000_000);
+        assert_eq!(sqrt.as_u64(), 1_000_000_000);
+        assert_eq!(get_base_reward(32_000_000_000, sqrt, &spec).unwrap(), 32);
+
+        spec.base_reward_factor = 3;
+        spec.base_rewards_per_epoch = 2;
+        assert_eq!(get_base_reward(32_000_000_000, sqrt, &spec).unwrap(), 48);
+
+        // Zero divisors are errors, not panics.
+        assert!(get_base_reward(1, SqrtTotalActiveBalance::new(0), &spec).is_err());
+        spec.base_rewards_per_epoch = 0;
+        assert!(get_base_reward(1, sqrt, &spec).is_err());
+        // Multiplication overflow is an error.
+        spec.base_rewards_per_epoch = 1;
+        spec.base_reward_factor = u64::MAX;
+        assert!(get_base_reward(2, sqrt, &spec).is_err());
+    }
+
+    #[test]
+    fn delta_arithmetic_and_flatten() {
+        let mut d = Delta::default();
+        d.reward(10).unwrap();
+        d.penalize(4).unwrap();
+        d.combine(Delta { rewards: 5, penalties: 1 }).unwrap();
+        assert_eq!((d.rewards, d.penalties), (15, 5));
+
+        assert!(d.reward(u64::MAX).is_err());
+        assert!(d.penalize(u64::MAX).is_err());
+        assert!(d.combine(Delta { rewards: u64::MAX, penalties: 0 }).is_err());
+
+        let flat = AttestationDelta {
+            all_delta: Delta { rewards: 3, penalties: 1 },
+            inactivity_penalty_delta: Delta { rewards: 2, penalties: 8 },
+        }
+        .flatten()
+        .unwrap();
+        assert_eq!((flat.rewards, flat.penalties), (5, 9));
+
+        let overflow = AttestationDelta {
+            all_delta: Delta { rewards: u64::MAX, penalties: 0 },
+            inactivity_penalty_delta: Delta { rewards: 1, penalties: 0 },
+        };
+        assert!(overflow.flatten().is_err());
+    }
+
+    #[test]
+    fn attestation_component_delta_penalises_only_punishable_validators() {
+        let spec = spec();
+        let ok = get_attestation_component_delta_n42(1000, false, &spec).unwrap();
+        assert_eq!((ok.rewards, ok.penalties), (1000, 0));
+        let bad = get_attestation_component_delta_n42(1000, true, &spec).unwrap();
+        assert_eq!((bad.rewards, bad.penalties), (1000, 3000));
+    }
+
+    #[test]
+    fn inactivity_penalty_applies_after_the_grace_period() {
+        let spec = spec();
+        let attester = ValidatorStatus {
+            is_previous_epoch_attester: true,
+            current_epoch_effective_balance: 32_000_000_000,
+            ..ValidatorStatus::default()
+        };
+        // Within min_epochs_to_inactivity_penalty (4): nothing.
+        let d = get_inactivity_penalty_delta(&attester, 1000, 4, &spec).unwrap();
+        assert_eq!((d.rewards, d.penalties), (0, 0));
+
+        // Beyond it: base_rewards_per_epoch * base_reward - proposer reward (base/4) = 750.
+        let d = get_inactivity_penalty_delta(&attester, 1000, 10, &spec).unwrap();
+        assert_eq!(d.penalties, 750);
+
+        // Non-attesters and slashed validators also pay effective_balance * delay / quotient.
+        let extra = 32_000_000_000u64 * 10 / 67_108_864;
+        let absent = ValidatorStatus { is_previous_epoch_attester: false, ..attester.clone() };
+        assert_eq!(get_inactivity_penalty_delta(&absent, 1000, 10, &spec).unwrap().penalties, 750 + extra);
+        let slashed = ValidatorStatus { is_slashed: true, ..attester };
+        assert_eq!(get_inactivity_penalty_delta(&slashed, 1000, 10, &spec).unwrap().penalties, 750 + extra);
+    }
+
+    #[test]
+    fn eligibility_includes_slashed_validators_until_withdrawable() {
+        let spec = spec();
+        let s = BeaconState::new();
+        let active = active_validator(0, &spec);
+        assert!(s.is_eligible_validator(5, &active).unwrap());
+
+        let mut exited = active_validator(1, &spec);
+        exited.exit_epoch = 3;
+        exited.withdrawable_epoch = 10;
+        assert!(!s.is_eligible_validator(5, &exited).unwrap());
+        exited.slashed = true;
+        // previous_epoch + 1 < withdrawable_epoch
+        assert!(s.is_eligible_validator(5, &exited).unwrap());
+        assert!(!s.is_eligible_validator(9, &exited).unwrap());
+        assert!(s.is_eligible_validator(u64::MAX, &exited).is_err());
+    }
+
+    #[test]
+    fn validator_statuses_summarise_the_registry() {
+        let spec = spec();
+        let mut s = state_with_validators(4, 64);
+        s.epoch_attester_indexes_set.insert(1);
+        s.inactivity_scores_store.set(2, 2700).unwrap();
+        let mut exited = active_validator(3, &spec);
+        exited.exit_epoch = 1;
+        s.validators_store.set(3, exited).unwrap();
+
+        let vs = ValidatorStatuses::new(&s, &spec).unwrap();
+        assert_eq!(vs.statuses.len(), 4);
+        assert!(vs.statuses[1].is_previous_epoch_attester);
+        assert!(!vs.statuses[0].is_previous_epoch_attester);
+        assert!(vs.statuses[2].is_punishable);
+        assert!(!vs.statuses[1].is_punishable);
+        assert!(!vs.statuses[3].is_active_in_current_epoch);
+        assert!(!vs.statuses[3].is_active_in_previous_epoch);
+        assert!(vs.statuses[0].is_active_in_current_epoch && vs.statuses[0].is_active_in_previous_epoch);
+        assert_eq!(vs.statuses[0].current_epoch_effective_balance, 32_000_000_000);
+        // Three validators remain active.
+        assert_eq!(vs.total_balances.current_epoch(), 96_000_000_000);
+        assert_eq!(vs.total_balances.previous_epoch(), 96_000_000_000);
+
+        // A registry without its inactivity scores is inconsistent.
+        let mut broken = state_with_validators(2, 0);
+        broken.inactivity_scores_store.clear();
+        assert!(ValidatorStatuses::new(&broken, &spec).is_err());
+    }
+
+    #[test]
+    fn rewards_and_penalties_are_skipped_in_the_genesis_epoch() {
+        let spec = spec();
+        let mut s = state_with_validators(4, 0);
+        let vs = ValidatorStatuses::new(&s, &spec).unwrap();
+        s.process_rewards_and_penalties(&vs, &spec).unwrap();
+        for i in 0..4 {
+            assert_eq!(s.get_balance(i).unwrap(), 32_000_000_000);
+        }
+    }
+
+    #[test]
+    fn rewards_pay_base_reward_and_punish_inactive_validators() {
+        let spec = spec();
+        let mut s = state_with_validators(4, 64);
+        s.inactivity_scores_store.set(2, 2700).unwrap();
+        let vs = ValidatorStatuses::new(&s, &spec).unwrap();
+        s.process_rewards_and_penalties(&vs, &spec).unwrap();
+
+        // sqrt(4 * 32e9) = 357_770; base reward = 32e9 / 357_770.
+        let base = 32_000_000_000u64 / 357_770;
+        assert_eq!(base, 89_442);
+        assert_eq!(s.get_balance(0).unwrap(), 32_000_000_000 + base);
+        assert_eq!(s.get_balance(1).unwrap(), 32_000_000_000 + base);
+        // Punishable: reward base, then lose 3 * base.
+        assert_eq!(s.get_balance(2).unwrap(), 32_000_000_000 + base - 3 * base);
+    }
+
+    #[test]
+    fn rewards_reject_statuses_that_do_not_match_the_registry() {
+        let spec = spec();
+        let mut s = state_with_validators(4, 64);
+        let mut vs = ValidatorStatuses::new(&s, &spec).unwrap();
+        vs.statuses.pop();
+        let err = s.process_rewards_and_penalties(&vs, &spec).unwrap_err();
+        assert!(err.to_string().contains("ValidatorStatusesInconsistent"));
+    }
+
+    #[test]
+    fn ineligible_validators_get_no_delta() {
+        let spec = spec();
+        let s = state_with_validators(2, 64);
+        let mut vs = ValidatorStatuses::new(&s, &spec).unwrap();
+        vs.statuses[0].is_eligible = false;
+        let deltas = s
+            .get_attestation_deltas_all(&vs, ProposerRewardCalculation::Exclude, &spec)
+            .unwrap();
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].clone().flatten().unwrap().rewards, 0);
+        assert!(deltas[1].clone().flatten().unwrap().rewards > 0);
+    }
+
+    #[test]
+    fn total_balances_never_drop_below_one_increment() {
+        let spec = spec();
+        let tb = TotalBalances::new(&spec);
+        assert_eq!(tb.current_epoch(), 1_000_000_000);
+        let vs = ValidatorStatuses::new(&BeaconState::new(), &spec).unwrap();
+        assert!(vs.statuses.is_empty());
+        assert_eq!(vs.total_balances.previous_epoch_attesters(), 1_000_000_000);
+    }
+
+    #[test]
+    fn validator_status_update_never_clears_flags() {
+        let mut a = ValidatorStatus { is_slashed: true, ..ValidatorStatus::default() };
+        let b = ValidatorStatus {
+            is_previous_epoch_attester: true,
+            is_current_epoch_attester: true,
+            is_active_in_previous_epoch: true,
+            ..ValidatorStatus::default()
+        };
+        a.update(&b);
+        assert!(a.is_slashed, "update must not clear an already-set flag");
+        assert!(a.is_previous_epoch_attester && a.is_current_epoch_attester);
+        assert!(a.is_active_in_previous_epoch);
+        assert!(!a.is_eligible);
+    }
+}

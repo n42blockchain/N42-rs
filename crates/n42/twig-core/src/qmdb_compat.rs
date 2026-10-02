@@ -2031,7 +2031,7 @@ impl QmdbCompatTree {
                 appended.push((*operations.op_key(i), first_slot + appended.len() as u64));
             }
         }
-        let mut faults = crate::prefault::thread_faults();
+        let mut faults = faults_writes;
         let mut took = |into: &mut u64| {
             let now = crate::prefault::thread_faults();
             *into += now.saturating_sub(faults);

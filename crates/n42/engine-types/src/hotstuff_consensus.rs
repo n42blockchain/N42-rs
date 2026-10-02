@@ -720,4 +720,587 @@ mod tests {
         assert_ne!(header.ommers_hash, EMPTY_OMMER_ROOT_HASH);
         assert_eq!(validate_gov5_h2_header(&header).unwrap().view, 0);
     }
+
+    // ---- validation-rule tests ----
+
+    use alloy_consensus::{BlockBody as _, EMPTY_ROOT_HASH};
+    use alloy_eips::eip4895::{Withdrawal, Withdrawals};
+    use reth_chainspec::{ChainSpec, ChainSpecBuilder, MAINNET};
+
+    // Mainnet fork times: Shanghai 1681338455, Cancun 1710338135, Prague 1746612311.
+    const TS_LONDON: u64 = 1_600_000_000;
+    const TS_SHANGHAI: u64 = 1_700_000_000;
+    const TS_CANCUN: u64 = 1_720_000_000;
+    const TS_PRAGUE: u64 = 1_800_000_000;
+
+    fn consensus() -> HotStuffConsensus<ChainSpec> {
+        HotStuffConsensus::new(MAINNET.clone())
+    }
+
+    /// A header the profile and Ethereum's standalone rules accept at `ts`.
+    fn good_header(number: u64, ts: u64) -> Header {
+        let mut header = Header {
+            number,
+            timestamp: ts,
+            gas_limit: 30_000_000,
+            gas_used: 0,
+            base_fee_per_gas: Some(1_000),
+            ommers_hash: B256::ZERO,
+            transactions_root: EMPTY_ROOT_HASH,
+            extra_data: HeaderExtra::for_view(number).encode(),
+            ..Default::default()
+        };
+        if ts >= TS_SHANGHAI {
+            header.withdrawals_root = Some(EMPTY_ROOT_HASH);
+        }
+        if ts >= TS_CANCUN {
+            header.blob_gas_used = Some(0);
+            header.excess_blob_gas = Some(0);
+            header.parent_beacon_block_root = Some(B256::ZERO);
+        }
+        if ts >= TS_PRAGUE {
+            header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+        }
+        header
+    }
+
+    fn sealed(header: Header) -> SealedHeader {
+        SealedHeader::seal_slow(header)
+    }
+
+    fn other_err<T: std::error::Error + 'static>(err: &ConsensusError) -> Option<&T> {
+        match err {
+            ConsensusError::Other(inner) => inner.downcast_ref::<T>(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn genesis_header_is_accepted_without_consensus_fields() {
+        let c = consensus();
+        // No extra data, nonzero difficulty: genesis is exempt from every rule.
+        let genesis = Header { number: 0, difficulty: U256::from(9), ..Default::default() };
+        assert!(c.validate_header(&sealed(genesis)).is_ok());
+    }
+
+    #[test]
+    fn a_well_formed_header_is_accepted_at_every_fork() {
+        let c = consensus();
+        for ts in [TS_LONDON, TS_SHANGHAI, TS_CANCUN, TS_PRAGUE] {
+            c.validate_header(&sealed(good_header(5, ts))).unwrap_or_else(|e| panic!("ts {ts}: {e}"));
+        }
+        // gov5 spells the empty ommers list either way.
+        let mut header = good_header(5, TS_SHANGHAI);
+        header.ommers_hash = EMPTY_OMMER_ROOT_HASH;
+        assert!(c.validate_header(&sealed(header)).is_ok());
+        // Difficulty one is allowed as well as zero.
+        let mut header = good_header(5, TS_SHANGHAI);
+        header.difficulty = U256::from(1);
+        assert!(c.validate_header(&sealed(header)).is_ok());
+    }
+
+    #[test]
+    fn profile_violations_are_refused_as_other_errors() {
+        use n42_h2_consensus::HeaderProfileError;
+        let c = consensus();
+        let cases: Vec<(&str, Header)> = vec![
+            ("empty extra", Header { extra_data: Default::default(), ..good_header(5, TS_SHANGHAI) }),
+            ("difficulty", Header { difficulty: U256::from(2), ..good_header(5, TS_SHANGHAI) }),
+            ("nonce", Header { nonce: 7u64.into(), ..good_header(5, TS_SHANGHAI) }),
+            ("ommers", Header { ommers_hash: B256::repeat_byte(3), ..good_header(5, TS_SHANGHAI) }),
+        ];
+        for (name, header) in cases {
+            let err = c.validate_header(&sealed(header)).expect_err(name);
+            assert!(other_err::<HeaderProfileError>(&err).is_some(), "{name}: {err:?}");
+        }
+        let err = c
+            .validate_header(&sealed(Header { difficulty: U256::from(2), ..good_header(5, TS_SHANGHAI) }))
+            .unwrap_err();
+        assert!(matches!(other_err::<HeaderProfileError>(&err), Some(HeaderProfileError::Difficulty(_))));
+    }
+
+    #[test]
+    fn ethereum_standalone_header_rules_still_apply() {
+        let c = consensus();
+        let mut header = good_header(5, TS_SHANGHAI);
+        header.gas_used = header.gas_limit + 1;
+        assert!(matches!(
+            c.validate_header(&sealed(header)),
+            Err(ConsensusError::HeaderGasUsedExceedsGasLimit { .. })
+        ));
+        // London is a block-number fork on mainnet: the base fee is demanded from 12,965,000.
+        let mut header = good_header(13_000_000, TS_SHANGHAI);
+        header.base_fee_per_gas = None;
+        assert!(matches!(c.validate_header(&sealed(header)), Err(ConsensusError::BaseFeeMissing)));
+    }
+
+    #[test]
+    fn withdrawals_root_presence_follows_shanghai() {
+        let c = consensus();
+        let mut header = good_header(5, TS_SHANGHAI);
+        header.withdrawals_root = None;
+        assert!(matches!(c.validate_header(&sealed(header)), Err(ConsensusError::WithdrawalsRootMissing)));
+        let mut header = good_header(5, TS_LONDON);
+        header.withdrawals_root = Some(EMPTY_ROOT_HASH);
+        assert!(matches!(c.validate_header(&sealed(header)), Err(ConsensusError::WithdrawalsRootUnexpected)));
+    }
+
+    #[test]
+    fn blob_fields_follow_cancun() {
+        let c = consensus();
+        let mut header = good_header(5, TS_SHANGHAI);
+        header.blob_gas_used = Some(0);
+        assert!(matches!(c.validate_header(&sealed(header)), Err(ConsensusError::BlobGasUsedUnexpected)));
+        let mut header = good_header(5, TS_SHANGHAI);
+        header.excess_blob_gas = Some(0);
+        assert!(matches!(c.validate_header(&sealed(header)), Err(ConsensusError::ExcessBlobGasUnexpected)));
+        let mut header = good_header(5, TS_SHANGHAI);
+        header.parent_beacon_block_root = Some(B256::ZERO);
+        assert!(matches!(
+            c.validate_header(&sealed(header)),
+            Err(ConsensusError::ParentBeaconBlockRootUnexpected)
+        ));
+        // Past Cancun the standalone 4844 check demands the blob fields.
+        let mut header = good_header(5, TS_CANCUN);
+        header.blob_gas_used = None;
+        assert!(c.validate_header(&sealed(header)).is_err());
+    }
+
+    #[test]
+    fn requests_hash_presence_follows_prague() {
+        let c = consensus();
+        let mut header = good_header(5, TS_PRAGUE);
+        header.requests_hash = None;
+        assert!(matches!(c.validate_header(&sealed(header)), Err(ConsensusError::RequestsHashMissing)));
+        let mut header = good_header(5, TS_CANCUN);
+        header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+        assert!(matches!(c.validate_header(&sealed(header)), Err(ConsensusError::RequestsHashUnexpected)));
+    }
+
+    fn parent_and_child() -> (SealedHeader, Header) {
+        let parent = sealed(good_header(5, TS_SHANGHAI));
+        let mut child = good_header(6, TS_SHANGHAI + 3);
+        child.parent_hash = parent.hash();
+        // The parent used none of its gas, so the base fee falls by 1/8.
+        child.base_fee_per_gas = Some(875);
+        (parent, child)
+    }
+
+    #[test]
+    fn a_child_that_follows_its_parent_is_accepted() {
+        let (parent, child) = parent_and_child();
+        assert!(consensus().validate_header_against_parent(&sealed(child), &parent).is_ok());
+    }
+
+    #[test]
+    fn linkage_errors_are_the_ethereum_ones() {
+        let c = consensus();
+        let (parent, child) = parent_and_child();
+        let mut bad = child.clone();
+        bad.parent_hash = B256::repeat_byte(9);
+        assert!(matches!(
+            c.validate_header_against_parent(&sealed(bad), &parent),
+            Err(ConsensusError::ParentHashMismatch(_))
+        ));
+        let mut bad = child.clone();
+        bad.number = 9;
+        assert!(matches!(
+            c.validate_header_against_parent(&sealed(bad), &parent),
+            Err(ConsensusError::ParentBlockNumberMismatch { .. })
+        ));
+        let mut bad = child.clone();
+        bad.timestamp = parent.timestamp;
+        assert!(matches!(
+            c.validate_header_against_parent(&sealed(bad), &parent),
+            Err(ConsensusError::TimestampIsInPast { .. })
+        ));
+        let mut bad = child;
+        bad.gas_limit = parent.gas_limit * 2;
+        assert!(matches!(
+            c.validate_header_against_parent(&sealed(bad), &parent),
+            Err(ConsensusError::GasLimitInvalidIncrease { .. })
+        ));
+    }
+
+    fn deferred_consensus() -> HotStuffConsensus<ChainSpec> {
+        HotStuffConsensus::new(Arc::new(ChainSpecBuilder::mainnet().genesis(deferred_genesis()).build()))
+    }
+
+    #[test]
+    fn deferred_execution_demands_the_parents_result() {
+        let c = deferred_consensus();
+        let mut parent_header = good_header(500, TS_SHANGHAI);
+        parent_header.state_root = B256::repeat_byte(0xD1);
+        let parent = sealed(parent_header);
+        let mut child = good_header(501, TS_SHANGHAI + 3);
+        child.parent_hash = parent.hash();
+        child.base_fee_per_gas = Some(875);
+
+        // Parent's execution is not known here yet.
+        let err = c.validate_header_against_parent(&sealed(child.clone()), &parent).unwrap_err();
+        assert!(matches!(
+            other_err::<DeferredExecutionError>(&err),
+            Some(DeferredExecutionError::ParentUnknown(h)) if *h == parent.hash()
+        ));
+
+        // Known, header carries something else.
+        crate::executed_fields::remember(parent.hash(), fields(0x40));
+        let err = c.validate_header_against_parent(&sealed(child.clone()), &parent).unwrap_err();
+        assert!(matches!(other_err::<DeferredExecutionError>(&err), Some(DeferredExecutionError::Mismatch { .. })));
+
+        // Header repeats the parent's result.
+        let expected = fields(0x40);
+        child.state_root = expected.state_root;
+        child.receipts_root = expected.receipts_root;
+        child.gas_used = expected.gas_used;
+        assert!(c.validate_header_against_parent(&sealed(child), &parent).is_ok());
+    }
+
+    #[test]
+    fn deferred_execution_after_genesis_parent_repeats_its_header() {
+        let c = deferred_consensus();
+        let parent = sealed(Header {
+            number: 0,
+            timestamp: TS_SHANGHAI,
+            gas_limit: 30_000_000,
+            state_root: B256::repeat_byte(0xE1),
+            base_fee_per_gas: Some(1_000),
+            ..Default::default()
+        });
+        let mut child = good_header(1, TS_SHANGHAI + 3);
+        child.parent_hash = parent.hash();
+        child.base_fee_per_gas = Some(875);
+        // The child's state root is not the genesis state root.
+        assert!(c.validate_header_against_parent(&sealed(child.clone()), &parent).is_err());
+        child.state_root = parent.state_root;
+        assert!(c.validate_header_against_parent(&sealed(child), &parent).is_ok());
+    }
+
+    #[test]
+    fn a_committee_chain_links_the_parent_beacon_root_to_the_parents_evidence() {
+        let genesis: alloy_genesis::Genesis =
+            serde_json::from_str(include_str!("../../../chainspec/res/genesis/n42_devnet.json")).unwrap();
+        let c = HotStuffConsensus::new(Arc::new(ChainSpec::from(genesis)));
+        let pool = c.committee_pool().expect("the devnet genesis names a committee pool");
+
+        let mut parent_header = good_header(7, 1_000);
+        parent_header.receipts_root = B256::repeat_byte(0x55);
+        let parent = sealed(parent_header);
+        let expected = pool.parent_beacon_root(parent.number, &parent.hash(), &parent.receipts_root).unwrap();
+        assert_ne!(expected, B256::ZERO);
+
+        let mut child = good_header(8, 1_003);
+        child.parent_hash = parent.hash();
+        child.base_fee_per_gas = Some(875);
+        child.blob_gas_used = Some(0);
+        child.excess_blob_gas = Some(0);
+        child.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+        child.withdrawals_root = Some(EMPTY_ROOT_HASH);
+        child.parent_beacon_block_root = Some(expected);
+        c.validate_header_against_parent(&sealed(child.clone()), &parent).unwrap();
+
+        child.parent_beacon_block_root = Some(B256::repeat_byte(0x66));
+        let err = c.validate_header_against_parent(&sealed(child.clone()), &parent).unwrap_err();
+        let link = other_err::<CommitteeLinkError>(&err).expect("a committee link error");
+        assert_eq!(link.expected, expected);
+        assert_eq!(link.got, B256::repeat_byte(0x66));
+
+        // A missing root reads as zero, which is not the evidence either.
+        child.parent_beacon_block_root = None;
+        let err = c.validate_header_against_parent(&sealed(child), &parent).unwrap_err();
+        assert_eq!(other_err::<CommitteeLinkError>(&err).unwrap().got, B256::ZERO);
+    }
+
+    fn block_of(header: Header, body: EthBlockBody) -> SealedBlock<EthBlock> {
+        SealedBlock::seal_slow(EthBlock { header, body })
+    }
+
+    fn empty_body() -> EthBlockBody {
+        EthBlockBody { transactions: vec![], ommers: vec![], withdrawals: None }
+    }
+
+    #[test]
+    fn body_ommers_are_checked_against_either_spelling_of_none() {
+        let c = consensus();
+        let body = empty_body();
+        let mut header = good_header(5, TS_LONDON);
+        // Zero and the empty-list hash both mean "none".
+        assert!(c.validate_body_against_header(&body, &sealed(header.clone())).is_ok());
+        header.ommers_hash = EMPTY_OMMER_ROOT_HASH;
+        assert!(c.validate_body_against_header(&body, &sealed(header.clone())).is_ok());
+        // Any other claim is refused.
+        header.ommers_hash = B256::repeat_byte(4);
+        assert!(matches!(
+            c.validate_body_against_header(&body, &sealed(header.clone())),
+            Err(ConsensusError::BodyOmmersHashDiff(_))
+        ));
+        // A body that brings ommers under a zero hash is lying.
+        header.ommers_hash = B256::ZERO;
+        let with_ommers = EthBlockBody { ommers: vec![Header::default()], ..empty_body() };
+        assert!(matches!(
+            c.validate_body_against_header(&with_ommers, &sealed(header)),
+            Err(ConsensusError::BodyOmmersHashDiff(_))
+        ));
+    }
+
+    #[test]
+    fn body_transactions_root_must_match() {
+        let c = consensus();
+        let mut header = good_header(5, TS_LONDON);
+        header.transactions_root = B256::repeat_byte(8);
+        assert!(matches!(
+            c.validate_body_against_header(&empty_body(), &sealed(header)),
+            Err(ConsensusError::BodyTransactionRootDiff(_))
+        ));
+    }
+
+    fn withdrawal(index: u64, amount: u64) -> Withdrawal {
+        Withdrawal { index, validator_index: 0, address: Address::repeat_byte(index as u8 + 1), amount }
+    }
+
+    #[test]
+    fn body_withdrawals_accept_the_trie_root_or_gov5s_rewards_root() {
+        let c = consensus();
+        let list = vec![withdrawal(0, 5), withdrawal(1, 7)];
+        let body = EthBlockBody { withdrawals: Some(Withdrawals::new(list.clone())), ..empty_body() };
+        let trie_root = body.calculate_withdrawals_root().unwrap();
+        let gov5_root = gov5_rewards_root(withdrawals_to_rewards(&list));
+        assert_ne!(trie_root, gov5_root);
+
+        let mut header = good_header(5, TS_SHANGHAI);
+        header.withdrawals_root = Some(trie_root);
+        assert!(c.validate_body_against_header(&body, &sealed(header.clone())).is_ok());
+        header.withdrawals_root = Some(gov5_root);
+        assert!(c.validate_body_against_header(&body, &sealed(header.clone())).is_ok());
+        header.withdrawals_root = Some(B256::repeat_byte(0x99));
+        assert!(matches!(
+            c.validate_body_against_header(&body, &sealed(header)),
+            Err(ConsensusError::BodyWithdrawalsRootDiff(_))
+        ));
+    }
+
+    #[test]
+    fn body_withdrawals_presence_must_agree_with_the_header() {
+        let c = consensus();
+        let header = good_header(5, TS_SHANGHAI);
+        assert!(matches!(
+            c.validate_body_against_header(&empty_body(), &sealed(header)),
+            Err(ConsensusError::BodyWithdrawalsMissing)
+        ));
+        let mut header = good_header(5, TS_LONDON);
+        header.withdrawals_root = None;
+        let body = EthBlockBody { withdrawals: Some(Withdrawals::new(vec![])), ..empty_body() };
+        assert!(matches!(
+            c.validate_body_against_header(&body, &sealed(header)),
+            Err(ConsensusError::WithdrawalsRootUnexpected)
+        ));
+    }
+
+    #[test]
+    fn pre_execution_requires_withdrawals_after_shanghai_and_checks_cancun_gas() {
+        let c = consensus();
+        let good_body = EthBlockBody { withdrawals: Some(Withdrawals::new(vec![])), ..empty_body() };
+        // Withdrawals root None, body None: the body check passes, Shanghai's rule fires.
+        let mut header = good_header(5, TS_SHANGHAI);
+        header.withdrawals_root = None;
+        assert!(matches!(
+            c.validate_block_pre_execution(&block_of(header, empty_body())),
+            Err(ConsensusError::BodyWithdrawalsMissing)
+        ));
+        assert!(c.validate_block_pre_execution(&block_of(good_header(5, TS_SHANGHAI), good_body.clone())).is_ok());
+        assert!(c.validate_block_pre_execution(&block_of(good_header(5, TS_CANCUN), good_body.clone())).is_ok());
+        // Cancun: the header's blob gas must be what the (empty) body consumes.
+        let mut header = good_header(5, TS_CANCUN);
+        header.blob_gas_used = Some(131_072);
+        assert!(c.validate_block_pre_execution(&block_of(header, good_body)).is_err());
+    }
+
+    #[test]
+    fn a_known_transaction_root_replaces_the_computed_one_for_one_call_only() {
+        let c = consensus();
+        let known = B256::repeat_byte(0x2A);
+        let mut header = good_header(5, TS_LONDON);
+        header.transactions_root = known;
+        let block = block_of(header, empty_body());
+        // The empty body's real root is the empty trie; only the passed root matches.
+        assert!(c.validate_block_pre_execution_with_tx_root(&block, Some(known)).is_ok());
+        // The thread-local is cleared afterwards.
+        assert!(matches!(
+            c.validate_block_pre_execution(&block),
+            Err(ConsensusError::BodyTransactionRootDiff(_))
+        ));
+        // A passed root that disagrees with the header is refused.
+        assert!(matches!(
+            c.validate_block_pre_execution_with_tx_root(&block, Some(B256::repeat_byte(1))),
+            Err(ConsensusError::BodyTransactionRootDiff(_))
+        ));
+        // None falls back to computing it.
+        assert!(c.validate_block_pre_execution_with_tx_root(&block, None).is_err());
+    }
+
+    #[test]
+    fn prepare_and_seal_leave_the_view_and_seal_to_the_validator() {
+        let c = consensus();
+        let parent = sealed(good_header(9, TS_SHANGHAI));
+        let mut header = c.prepare(&parent).unwrap();
+        assert_eq!(header.number, 10);
+        let before = header.clone();
+        c.seal(&mut header).unwrap();
+        assert_eq!(header, before);
+    }
+
+    #[test]
+    fn the_signer_key_is_kept_for_information_and_never_the_beneficiary() {
+        let c = consensus();
+        assert_eq!(c.get_eth_signer_address().unwrap(), None);
+        let key = format!("0x{}", "01".repeat(32));
+        c.set_eth_signer_by_key(Some(key.clone())).unwrap();
+        let address = c.get_eth_signer_address().unwrap().expect("configured");
+        let expected = key.parse::<alloy_signer_local::PrivateKeySigner>().unwrap().address();
+        assert_eq!(address, expected);
+        // The block's beneficiary never comes from the local key.
+        assert_eq!(c.get_signer_address().unwrap(), None);
+        c.set_eth_signer_by_key(None).unwrap();
+        assert_eq!(c.get_eth_signer_address().unwrap(), None);
+    }
+
+    #[test]
+    fn a_malformed_signer_key_is_refused_and_leaves_the_old_one() {
+        let c = consensus();
+        c.set_signer_key(Some(format!("0x{}", "02".repeat(32)))).unwrap();
+        let before = c.get_eth_signer_address().unwrap();
+        assert!(before.is_some());
+        assert!(matches!(c.set_signer_key(Some("nonsense".into())), Err(AposError::InvalidSignerKey(_))));
+        let err = c.set_eth_signer_by_key(Some("nonsense".into())).unwrap_err();
+        assert!(other_err::<AposError>(&err).is_some());
+        assert_eq!(c.get_eth_signer_address().unwrap(), before);
+    }
+
+    // ---- post-execution ----
+
+    use alloy_eips::eip7685::Requests;
+
+    fn recovered(header: Header) -> RecoveredBlock<EthBlock> {
+        RecoveredBlock::new_unhashed(EthBlock { header, body: empty_body() }, vec![])
+    }
+
+    fn result_of(receipts: Vec<Receipt>, gas_used: u64) -> BlockExecutionResult<Receipt> {
+        BlockExecutionResult { receipts, requests: Requests::default(), gas_used, blob_gas_used: 0 }
+    }
+
+    fn log_receipt(gas: u64) -> Receipt {
+        Receipt {
+            success: true,
+            cumulative_gas_used: gas,
+            logs: vec![Log::new_unchecked(Address::repeat_byte(7), vec![B256::repeat_byte(1)], Default::default())],
+            ..Default::default()
+        }
+    }
+
+    /// A header whose execution fields match `receipts`.
+    fn header_for(receipts: &[Receipt], number: u64, ts: u64) -> Header {
+        let (root, bloom) = gov5_receipt_root_bloom(receipts);
+        let gas = receipts.last().map_or(0, |r| r.cumulative_gas_used);
+        Header { receipts_root: root, logs_bloom: bloom, gas_used: gas, ..good_header(number, ts) }
+    }
+
+    #[test]
+    fn post_execution_accepts_a_matching_result() {
+        let c = consensus();
+        let receipts = vec![log_receipt(21_000)];
+        let block = recovered(header_for(&receipts, 5, TS_SHANGHAI));
+        assert!(c.validate_block_post_execution(&block, &result_of(receipts, 21_000), None, None).is_ok());
+        // An empty block commits to gov5's nil hash.
+        let block = recovered(header_for(&[], 5, TS_SHANGHAI));
+        assert!(c.validate_block_post_execution(&block, &result_of(vec![], 0), None, None).is_ok());
+    }
+
+    #[test]
+    fn post_execution_refuses_each_mismatch_with_its_own_error() {
+        let c = consensus();
+        let receipts = vec![log_receipt(21_000)];
+        let good = header_for(&receipts, 5, TS_SHANGHAI);
+
+        let block = recovered(good.clone());
+        assert!(matches!(
+            c.validate_block_post_execution(&block, &result_of(receipts.clone(), 22_000), None, None),
+            Err(ConsensusError::BlockGasUsed { .. })
+        ));
+        let block = recovered(Header { receipts_root: B256::repeat_byte(1), ..good.clone() });
+        assert!(matches!(
+            c.validate_block_post_execution(&block, &result_of(receipts.clone(), 21_000), None, None),
+            Err(ConsensusError::BodyReceiptRootDiff(_))
+        ));
+        let block = recovered(Header { logs_bloom: Default::default(), ..good });
+        assert!(matches!(
+            c.validate_block_post_execution(&block, &result_of(receipts, 21_000), None, None),
+            Err(ConsensusError::BodyBloomLogDiff(_))
+        ));
+    }
+
+    #[test]
+    fn post_execution_holds_requests_to_the_eip_after_prague() {
+        let c = consensus();
+        let empty = result_of(vec![], 0);
+        let mut header = header_for(&[], 5, TS_PRAGUE);
+        // Both spellings of "no requests" are accepted.
+        assert!(c.validate_block_post_execution(&recovered(header.clone()), &empty, None, None).is_ok());
+        header.requests_hash = Some(Requests::default().requests_hash());
+        assert!(c.validate_block_post_execution(&recovered(header.clone()), &empty, None, None).is_ok());
+        // Missing.
+        header.requests_hash = None;
+        assert!(matches!(
+            c.validate_block_post_execution(&recovered(header.clone()), &empty, None, None),
+            Err(ConsensusError::RequestsHashMissing)
+        ));
+        // Something else for an empty list.
+        header.requests_hash = Some(B256::repeat_byte(5));
+        assert!(matches!(
+            c.validate_block_post_execution(&recovered(header.clone()), &empty, None, None),
+            Err(ConsensusError::BodyRequestsHashDiff(_))
+        ));
+        // A block that made requests is held to the EIP's hash, not gov5's empty one.
+        let mut requests = Requests::default();
+        requests.push_request_with_type(0x01, [1u8, 2, 3]);
+        let mut with_requests = result_of(vec![], 0);
+        with_requests.requests = requests.clone();
+        header.requests_hash = Some(requests.requests_hash());
+        assert!(c.validate_block_post_execution(&recovered(header.clone()), &with_requests, None, None).is_ok());
+        header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+        assert!(matches!(
+            c.validate_block_post_execution(&recovered(header), &with_requests, None, None),
+            Err(ConsensusError::BodyRequestsHashDiff(_))
+        ));
+    }
+
+    #[test]
+    fn under_deferred_execution_post_execution_records_the_blocks_receipts() {
+        let c = deferred_consensus();
+        // Under deferral the header describes the parent, so its fields are not compared.
+        let header = Header { receipts_root: B256::repeat_byte(0xAB), ..good_header(600, TS_SHANGHAI) };
+        let block = recovered(header);
+        let hash = block.hash();
+        crate::executed_fields::remember_state_root(hash, B256::repeat_byte(0x77));
+        // A result that does not cover the block (1 receipt, 0 transactions) is not recorded.
+        let partial = result_of(vec![log_receipt(21_000)], 21_000);
+        assert!(c.validate_block_post_execution(&block, &partial, None, None).is_ok());
+        assert_eq!(crate::executed_fields::get(&hash), None);
+        // A complete one (no transactions, no receipts) is.
+        assert!(c.validate_block_post_execution(&block, &result_of(vec![], 0), None, None).is_ok());
+        let recorded = crate::executed_fields::get(&hash).expect("recorded");
+        assert_eq!(recorded.state_root, B256::repeat_byte(0x77));
+        assert_eq!(recorded.receipts_root, GOV5_NIL_HASH);
+        assert_eq!(recorded.gas_used, 0);
+    }
+
+    #[test]
+    fn under_deferred_execution_the_requests_hash_is_still_checked() {
+        let c = deferred_consensus();
+        let mut header = good_header(601, TS_PRAGUE);
+        header.requests_hash = Some(B256::repeat_byte(5));
+        assert!(matches!(
+            c.validate_block_post_execution(&recovered(header), &result_of(vec![], 0), None, None),
+            Err(ConsensusError::BodyRequestsHashDiff(_))
+        ));
+    }
 }

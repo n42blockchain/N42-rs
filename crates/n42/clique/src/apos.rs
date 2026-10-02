@@ -1149,3 +1149,7 @@ where
         Ok(*signer_guard)
     }
 }
+
+#[cfg(test)]
+#[path = "apos_tests.rs"]
+mod tests;

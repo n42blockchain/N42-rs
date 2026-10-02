@@ -87,6 +87,7 @@ hex = "0.4.3"
 
 [dev-dependencies]
 serde_json.workspace = true
+reth-provider = { workspace = true, features = ["test-utils"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 

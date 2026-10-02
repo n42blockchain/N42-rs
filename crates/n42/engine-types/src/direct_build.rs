@@ -25,7 +25,8 @@ use std::sync::{Arc, OnceLock};
 use alloy_primitives::{Address, BlockNumber, Bytes, StorageKey, StorageValue, B256};
 use alloy_rpc_types_engine::PayloadAttributes;
 use n42_tx_types::N42Primitives;
-use reth_chain_state::{ExecutedBlock, MemoryOverlayStateProvider, MemoryOverlayStateProviderRef};
+use crate::memory_overlay::{MemoryOverlayStateProvider, MemoryOverlayStateProviderRef};
+use reth_chain_state::ExecutedBlock;
 use reth_primitives_traits::{Account, Bytecode, RecoveredBlock, SealedBlock, SealedHeader};
 use reth_storage_api::{
     errors::ProviderResult, AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider,
@@ -143,6 +144,7 @@ pub fn executed_under_seal(parent: &SealedHeader, execution: &BuiltExecution) ->
         trie_data: LazyTrieData::deferred(move || {
             ComputedTrieData::new(Arc::new((*hashed).clone().into_sorted()), Arc::new((*updates).clone().into_sorted()))
         }),
+        bal: None,
     }
 }
 
@@ -183,6 +185,7 @@ pub fn executed_from_output(
             Arc::new(reth_trie::HashedPostState::default().into_sorted()),
             Arc::new(reth_trie::updates::TrieUpdates::default().into_sorted()),
         )),
+        bal: None,
     }
 }
 
@@ -367,6 +370,7 @@ pub mod read_depth {
         StateProofProvider {
             fn proof(&self, input: TrieInput, address: Address, slots: &[B256]) -> ProviderResult<AccountProof>;
             fn multiproof(&self, input: TrieInput, targets: MultiProofTargets) -> ProviderResult<MultiProof>;
+            fn multiproof_v2(&self, input: TrieInput, targets: reth_trie::MultiProofTargetsV2) -> ProviderResult<reth_trie::DecodedMultiProofV2>;
             fn witness(&self, input: TrieInput, target: HashedPostState, mode: ExecutionWitnessMode) -> ProviderResult<Vec<Bytes>>;
         }
         HashedPostStateProvider {

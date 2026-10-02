@@ -124,6 +124,50 @@ reth-storage-api without `std`, where our `beacon.rs`/`validator.rs` used `std::
 
 No `testdata/` fixture changed.
 
+## The follower slowdown on the fleet (loop308) and the fix
+
+Measured on three nodes with 163k-transaction blocks, the v2.7.0 binaries read win1 0.56-0.57M
+against 1.13-1.16M. The leader's parallel execution and the roots did not move; the followers'
+build-path execution did. In `bench-loop308UPb` node1 the build-path lines read (mean over
+blocks with batches): `batch_median_ms` 92-117 against 13-15 on `bench-loop308BASE`, and
+`exec_pre_ms` -- the block's own executor's pre-execution system calls, a handful of reads beside
+the batches -- 85-109 against 0. A few reads taking as long as a whole batch means every opener
+waited on one shared piece of work, not on its reads.
+
+That work is the execution overlay. The follower's batches each open
+`state_by_block_hash(anchor)` (the anchor is the block under its kept layers, still in the
+tree's memory). v2.5.1 answered that with `MemoryOverlayStateProvider`: the in-memory blocks'
+bundles walked per read over the database at the persisted anchor, nothing done at open.
+v2.7.0's `BlockchainProvider::state_provider_for_state` answers it with
+`reth-storage-overlay`'s `OverlayStateProvider`, whose first read flattens every in-memory block
+from the persisted anchor to the tip into one `ExecutionOverlay` (`AddressMap` of accounts plus
+an empty storage map per account), cached per (anchor, tip): extended from the previous tip's
+overlay when that is cached and not shared (`Arc::make_mut` clones it whole when it is), merged
+from every block when the anchor moved (each persistence). Every batch and the executor wait on
+that one computation (`OverlayWaiter`). `n42_overlay_open_cost_at_fleet_shape` (reth-provider,
+`--ignored`, release, eight in-memory blocks of 147k accounts, idle box): opening a tip and its
+first read takes 24-118 ms flattened against 10-40 us walked; 160k reads then take 9-12 ms
+flattened against 12-27 ms walked on one thread (the follower spreads them over 32).
+
+Fix: `state_provider_for_state` (so `latest`, `pending` and `state_by_block_hash` on an
+in-memory block) opens `MemoryOverlayStateProvider` over the persisted anchor again
+(`n42_layered_state_provider`). The type moved from `engine-types` into the vendored
+`reth-provider` (`providers/state/memory_overlay.rs`, re-exported by
+`n42_engine_types::memory_overlay`). The database side under it is `OverlayStateProvider` at the
+anchor with an empty execution overlay, so the QMDB hooks (`N42_QMDB_READS=on|verify`,
+`N42_HASHED_TABLES=off` refusing) are on the read path exactly as before. When the anchor is not
+readable that way -- not the canonical block at its number, or above the persisted state/trie
+frontier -- the upstream path is taken. `N42_OVERLAY_READS=upstream` restores the upstream path
+for an A/B leg. `n42_layered_reads_match_upstream_overlay` checks both paths answer the same
+accounts and block hashes at every tip of a five-block chain.
+
+Engine settings for the bench: v2.7.0 requires `num-state-masking-blocks +
+memory-block-buffer-target < persistence-threshold`; with the bench's threshold 8 and buffer
+target 6 that leaves masking at 0 or 1, and the runs use `RETH_ENGINE_NUM_STATE_MASKING_BLOCKS=0`.
+Masking 0 is v2.5.1's behaviour (state persisted with its blocks). With masking on, masked blocks'
+state stays only in memory, the anchor of the in-memory chain sits above the state/trie frontier,
+and `n42_layered_state_provider` declines (upstream's path) -- so keep masking at 0.
+
 ## Not verified
 
 Nothing was run on a node or the fleet; no throughput round was taken on v2.7.0. The QMDB hooks on

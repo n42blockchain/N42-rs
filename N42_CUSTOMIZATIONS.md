@@ -46,7 +46,13 @@
   `crates/storage/storage-overlay/src/provider.rs`（上游删除了 `HistoricalStateProvider`，
   该 crate 为此新增 vendored，见 `docs/RETH_2_7_0_UPGRADE.md`）
 - `crates/storage/provider/src/providers/database/provider.rs`：`N42_HASHED_TABLES=off` 时不写 hashed 表
-- reth v2.7.0 删除的 `MemoryOverlayStateProvider` 保留在 `crates/n42/engine-types/src/memory_overlay.rs`（N42 代码，不是 fork）
+- reth v2.7.0 删除的 `MemoryOverlayStateProvider` 保留在 vendored 的
+  `crates/storage/provider/src/providers/state/memory_overlay.rs`（N42 新增文件，
+  `n42_engine_types::memory_overlay` 重新导出）；`BlockchainProvider::state_provider_for_state`
+  （`latest` / `pending` / `state_by_block_hash` 在内存块上的状态）默认用它逐读遍历内存块、
+  其下是持久化锚点的状态（`n42_layered_state_provider`），不再走上游按 tip 摊平整个内存链的
+  `ExecutionOverlay`；`N42_OVERLAY_READS=upstream` 恢复上游路径（loop308 的跟随者减速，见
+  `docs/RETH_2_7_0_UPGRADE.md`）
 
 ## 模块4: network
 ### 定制内容:

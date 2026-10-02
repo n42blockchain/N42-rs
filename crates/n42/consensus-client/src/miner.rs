@@ -1301,3 +1301,67 @@ where
 fn exit_by_sigint() {
     let _ = nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGINT);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::FutureExt;
+
+    /// Polls a mining mode once, with no waker that matters.
+    fn poll_once(mode: &mut MiningMode) -> Poll<()> {
+        mode.poll_unpin(&mut Context::from_waker(futures_util::task::noop_waker_ref()))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_interval_mode_fires_once_per_period_and_not_before() {
+        let mut mode = MiningMode::interval(Duration::from_secs(8));
+        assert!(poll_once(&mut mode).is_pending(), "nothing is due at creation");
+
+        tokio::time::advance(Duration::from_secs(7)).await;
+        assert!(poll_once(&mut mode).is_pending(), "one second early");
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(poll_once(&mut mode).is_ready(), "due at the first period");
+        assert!(poll_once(&mut mode).is_pending(), "the tick was consumed");
+
+        tokio::time::advance(Duration::from_secs(8)).await;
+        assert!(poll_once(&mut mode).is_ready(), "and again one period later");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_interval_mode_resolves_when_awaited() {
+        let mut mode = MiningMode::interval(Duration::from_secs(4));
+        // With the clock paused the runtime auto-advances to the tick.
+        tokio::time::timeout(Duration::from_secs(5), &mut mode).await.expect("fires within the period");
+    }
+
+    #[tokio::test]
+    async fn a_mode_that_never_mines_never_resolves() {
+        let mut mode = MiningMode::NoMining;
+        assert!(poll_once(&mut mode).is_pending());
+        let waited = tokio::time::timeout(Duration::from_millis(50), &mut mode).await;
+        assert!(waited.is_err(), "NoMining stays pending");
+    }
+
+    #[tokio::test]
+    async fn an_instant_mode_fires_for_each_pending_transaction_hash() {
+        let (tx, rx) = mpsc::channel::<TxHash>(8);
+        let mut mode = MiningMode::Instant(ReceiverStream::new(rx).fuse());
+        assert!(poll_once(&mut mode).is_pending(), "no transaction, no block");
+
+        tx.send(B256::repeat_byte(1)).await.unwrap();
+        tx.send(B256::repeat_byte(2)).await.unwrap();
+        assert!(poll_once(&mut mode).is_ready());
+        assert!(poll_once(&mut mode).is_ready(), "the second notification is a second trigger");
+        assert!(poll_once(&mut mode).is_pending(), "drained");
+    }
+
+    #[tokio::test]
+    async fn an_instant_mode_whose_pool_listener_closed_stays_pending() {
+        let (tx, rx) = mpsc::channel::<TxHash>(1);
+        let mut mode = MiningMode::Instant(ReceiverStream::new(rx).fuse());
+        drop(tx);
+        assert!(poll_once(&mut mode).is_pending(), "a fused, finished stream never wakes the miner");
+        assert!(poll_once(&mut mode).is_pending());
+    }
+}

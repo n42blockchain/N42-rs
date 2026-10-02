@@ -84,10 +84,11 @@ mod tests {
     #[test]
     fn beacon_block_roundtrips() {
         roundtrip(|| {
-            let mut block = BeaconBlock::default();
-            block.slot = 42;
-            block.state_root = B256::repeat_byte(3);
-            block
+            BeaconBlock {
+                slot: 42,
+                state_root: B256::repeat_byte(3),
+                ..Default::default()
+            }
         });
     }
 

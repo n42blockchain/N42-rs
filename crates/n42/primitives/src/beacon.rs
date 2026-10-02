@@ -3220,7 +3220,7 @@ mod state_basics {
 
         // Non-attesters and slashed validators also pay effective_balance * delay / quotient.
         let extra = 32_000_000_000u64 * 10 / 67_108_864;
-        let absent = ValidatorStatus { is_previous_epoch_attester: false, ..attester.clone() };
+        let absent = ValidatorStatus { is_previous_epoch_attester: false, ..attester };
         assert_eq!(get_inactivity_penalty_delta(&absent, 1000, 10, &spec).unwrap().penalties, 750 + extra);
         let slashed = ValidatorStatus { is_slashed: true, ..attester };
         assert_eq!(get_inactivity_penalty_delta(&slashed, 1000, 10, &spec).unwrap().penalties, 750 + extra);

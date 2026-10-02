@@ -1566,8 +1566,17 @@ mod tests {
     }
 
     impl StateProviderFactory for Scripted {
+        type Primitives = <MockEthProvider as StateProviderFactory>::Primitives;
+
         fn latest(&self) -> ProviderResult<StateProviderBox> {
             self.inner.latest()
+        }
+        fn state_with_block_appended(
+            &self,
+            parent_hash: B256,
+            block: ExecutedBlock<Self::Primitives>,
+        ) -> ProviderResult<StateProviderBox> {
+            self.inner.state_with_block_appended(parent_hash, block)
         }
         fn state_by_block_number_or_tag(&self, n: alloy_eips::BlockNumberOrTag) -> ProviderResult<StateProviderBox> {
             self.inner.state_by_block_number_or_tag(n)

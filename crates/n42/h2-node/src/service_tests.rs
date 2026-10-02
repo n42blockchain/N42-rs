@@ -815,3 +815,6 @@ async fn blocks_the_execution_layer_already_has_are_answered_without_asking_it_a
     assert!(rig.el.calls().is_empty(), "no round trip for a block it holds");
     assert!(events.is_empty());
 }
+
+#[path = "service_loop_tests.rs"]
+mod loop_tests;

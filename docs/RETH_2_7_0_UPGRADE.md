@@ -102,7 +102,31 @@ methods all have defaults --, consensus, payload builder) compiled without chang
   `genesis.config.bogotaTime`. None of our genesis files set it, so no N42 chain activates it;
   `N42_HARDFORKS` is unchanged. Sepolia now schedules Amsterdam upstream.
 
+Two test-only breaks: the `StateProviderFactory` test double in `direct_build.rs` needs the new
+`Primitives` type and `state_with_block_appended`; and `cargo test -p n42-tx-queue` builds
+reth-storage-api without `std`, where our `beacon.rs`/`validator.rs` used `std::` paths (now
+`alloc`/`core`).
+
+## Verification (2026-10-02)
+
+| Command | Result |
+|---|---|
+| `cargo check --workspace` | clean |
+| `cargo clippy --workspace --lib --bins --examples` | 0 errors (1,238 warnings, none in the new code) |
+| `cargo test -p n42-testing` | 26 passed, 1 ignored |
+| ported crates (bmt-core ... h2-execution) | 572 passed, 1 ignored |
+| `-p n42-engine-types --lib --tests` | 217 passed, 13 ignored |
+| `-p n42-tx-types` / `-p n42-tx-ingest` / `-p n42-tx-queue` | 20 (4 ignored) / 61 / 40 (4 ignored) |
+| `-p n42-qmdb-reth` / `-p n42-primitives` | 49 (5 ignored) / 200 |
+| `-p n42-clique -p n42-bmt-core -p n42-consensus-traits -p n42-consensus-core` | 125 passed, 1 ignored |
+| `-p n42 --lib --bins` | 114 passed, 5 ignored |
+| release `n42`, `h2_validator`, `tx_flood` | build |
+
+No `testdata/` fixture changed.
+
 ## Not verified
 
-See the verification table in the hand-back / commit log of this branch. Nothing was run on a node
-or the fleet; no throughput round was taken on v2.7.0.
+Nothing was run on a node or the fleet; no throughput round was taken on v2.7.0. The QMDB hooks on
+the new overlay path (`N42_QMDB_READS=verify|on`, `N42_HASHED_TABLES=off`) are compiled but not
+exercised by any test. Tests of the vendored non-member crates (network, storage-overlay, revm,
+bin/reth) were not run.

@@ -3294,7 +3294,13 @@ where
     // Each result goes into its candidate's slot from the batch's own
     // thread: collecting the batches' vectors and sorting them by index was
     // 80-150 ms of a full block's build (loop138-139).
-    let slots: Vec<std::sync::OnceLock<BuiltTransfer<T>>> = (0..keys.len()).map(|_| std::sync::OnceLock::new()).collect();
+    // Made on the pool: a full block's slots are ~75 MB of fresh pages, and
+    // one thread faulting them in was ~4 ms of the bench's 5.5 between the
+    // call and the batches (step 7a, `batches_start_us`).
+    let slots: Vec<std::sync::OnceLock<BuiltTransfer<T>>> = pool.install(|| {
+        use rayon::prelude::*;
+        (0..keys.len()).into_par_iter().with_min_len(4096).map(|_| std::sync::OnceLock::new()).collect()
+    });
     let slots_ref = &slots;
     type BatchResult = (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, BatchSpan, LoopTimers);
     // Each batch's span on the pool, against this instant (`BatchSpans`).

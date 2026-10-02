@@ -2554,6 +2554,10 @@ where
 }
 
 #[cfg(test)]
+#[path = "payload_serve_tests.rs"]
+mod serve_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use alloy_consensus::{Block, BlockBody, Header, Signed, TxEip1559, TxLegacy};

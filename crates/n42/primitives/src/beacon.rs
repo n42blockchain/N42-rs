@@ -3352,3 +3352,245 @@ mod state_basics {
         assert!(!a.is_eligible);
     }
 }
+
+#[cfg(test)]
+mod deposits_and_exits {
+    use super::*;
+    use crate::test_util::{active_validator, eth1_credentials, pubkey, secret_key, state_with_validators};
+    use alloy_primitives::LogData;
+
+    fn spec() -> ChainSpec {
+        beacon_chain_spec()
+    }
+
+    fn signed_deposit(i: usize, amount: u64) -> DepositData {
+        let mut d = DepositData {
+            pubkey: pubkey(i),
+            withdrawal_credentials: eth1_credentials(i as u8 + 1),
+            amount,
+            signature: FixedBytes::ZERO,
+        };
+        d.signature = d.create_signature(&secret_key(i));
+        d
+    }
+
+    #[test]
+    fn deposit_signature_verifies_only_for_the_signed_content() {
+        let d = signed_deposit(0, 32_000_000_000);
+        assert!(d.verify_signature());
+
+        let mut tampered = d.clone();
+        tampered.amount += 1;
+        assert!(!tampered.verify_signature());
+
+        let mut other_creds = d.clone();
+        other_creds.withdrawal_credentials = eth1_credentials(0x77);
+        assert!(!other_creds.verify_signature());
+
+        // A signature made by a different key does not verify for this pubkey.
+        let mut wrong_key = d.clone();
+        wrong_key.signature = d.create_signature(&secret_key(1));
+        assert!(!wrong_key.verify_signature());
+    }
+
+    #[test]
+    fn deposit_verification_rejects_unparseable_inputs() {
+        let d = signed_deposit(0, 32_000_000_000);
+        let mut bad_sig = d.clone();
+        bad_sig.signature = FixedBytes::ZERO;
+        assert!(!bad_sig.verify_signature());
+        let mut bad_pk = d;
+        bad_pk.pubkey = FixedBytes::ZERO;
+        assert!(!bad_pk.verify_signature());
+    }
+
+    #[test]
+    fn deposit_message_mirrors_the_deposit_and_signs_over_the_domain() {
+        let d = signed_deposit(2, 5);
+        let m = d.as_deposit_message();
+        assert_eq!((m.pubkey, m.withdrawal_credentials, m.amount), (d.pubkey, d.withdrawal_credentials, 5));
+
+        let domain = Hash256::repeat_byte(3);
+        let expected = SigningData { object_root: m.tree_hash_root(), domain }.tree_hash_root();
+        assert_eq!(m.signing_root(domain), expected);
+        assert_ne!(m.signing_root(Hash256::repeat_byte(4)), expected);
+
+        // The amount is a quoted decimal string in JSON, as the deposit tooling expects.
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["amount"], serde_json::json!("5"));
+    }
+
+    fn deposit_log(topic: B256, data: Bytes) -> Log {
+        Log {
+            address: Address::ZERO,
+            data: LogData::new(vec![topic], data).unwrap(),
+        }
+    }
+
+    #[test]
+    fn deposit_log_parsing() {
+        let ev = DepositEvent {
+            pubkey: Bytes::from(vec![1u8; 48]),
+            withdrawal_credentials: Bytes::from(vec![2u8; 32]),
+            amount: Bytes::from(vec![3u8; 8]),
+            signature: Bytes::from(vec![4u8; 96]),
+            index: Bytes::from(vec![5u8; 8]),
+        };
+        let log = Log { address: Address::repeat_byte(1), data: ev.encode_log_data() };
+        let parsed = parse_deposit_log(&log).unwrap();
+        assert_eq!(parsed.pubkey, ev.pubkey);
+        assert_eq!(parsed.withdrawal_credentials, ev.withdrawal_credentials);
+        assert_eq!(parsed.amount, ev.amount);
+        assert_eq!(parsed.signature, ev.signature);
+        assert_eq!(parsed.index, ev.index);
+
+        // Unknown topic, no topics, and a right topic with undecodable data all yield None.
+        let topic = keccak256(b"DepositEvent(bytes,bytes,bytes,bytes,bytes)");
+        assert!(parse_deposit_log(&deposit_log(B256::repeat_byte(9), Bytes::new())).is_none());
+        assert!(parse_deposit_log(&Log { address: Address::ZERO, data: LogData::new(vec![], Bytes::new()).unwrap() }).is_none());
+        assert!(parse_deposit_log(&deposit_log(topic, Bytes::from(vec![1, 2, 3]))).is_none());
+    }
+
+    #[test]
+    fn add_validator_to_registry_appends_to_all_three_stores() {
+        let spec = spec();
+        let mut s = state_with_validators(2, 0);
+        let idx = s.add_validator_to_registry(pubkey(9), eth1_credentials(9), 32_500_000_000, &spec).unwrap();
+        assert_eq!(idx, 2);
+        assert_eq!(s.validators_store.len(), 3);
+        assert_eq!(s.balances_store.len(), 3);
+        assert_eq!(s.inactivity_scores_store.len(), 3);
+        assert_eq!(s.get_balance(2).unwrap(), 32_500_000_000);
+        assert_eq!(s.get_inactivity_score(2).unwrap(), 0);
+
+        let v = s.get_validator(2).unwrap();
+        // Effective balance is rounded down to the increment and capped at the maximum.
+        assert_eq!(v.effective_balance, 32_000_000_000);
+        assert_eq!(v.activation_epoch, spec.far_future_epoch);
+        assert_eq!(v.activation_eligibility_epoch, spec.far_future_epoch);
+        assert_eq!(v.exit_epoch, spec.far_future_epoch);
+
+        let idx = s.add_validator_to_registry(pubkey(10), eth1_credentials(1), 20_700_000_000, &spec).unwrap();
+        assert_eq!(s.get_validator(idx).unwrap().effective_balance, 20_000_000_000);
+    }
+
+    #[test]
+    fn apply_deposit_creates_or_tops_up() {
+        let spec = spec();
+        let mut s = state_with_validators(2, 0);
+
+        // New pubkey: validator is created and the deposit index advances.
+        s.apply_deposit(signed_deposit(5, 32_000_000_000), None, true, &spec).unwrap();
+        assert_eq!(s.validators_store.len(), 3);
+        assert_eq!(s.eth1_deposit_index, 1);
+        assert_eq!(s.get_balance(2).unwrap(), 32_000_000_000);
+
+        // Existing pubkey: balance is increased, the registry does not grow.
+        s.apply_deposit(signed_deposit(1, 7), None, true, &spec).unwrap();
+        assert_eq!(s.validators_store.len(), 3);
+        assert_eq!(s.get_balance(1).unwrap(), 32_000_000_007);
+        assert_eq!(s.eth1_deposit_index, 2);
+
+        // The deposit index is only advanced when asked to.
+        s.apply_deposit(signed_deposit(1, 1), None, false, &spec).unwrap();
+        assert_eq!(s.eth1_deposit_index, 2);
+    }
+
+    #[test]
+    fn process_deposits_applies_each_deposit_in_order() {
+        let spec = spec();
+        let mut s = BeaconState::new();
+        let deposits: Vec<Deposit> = (0..3)
+            .map(|i| Deposit { proof: vec![], data: signed_deposit(i, 32_000_000_000) })
+            .chain(std::iter::once(Deposit { proof: vec![], data: signed_deposit(0, 1_000_000_000) }))
+            .collect();
+        s.process_deposits(&deposits, &spec).unwrap();
+        assert_eq!(s.validators_store.len(), 3);
+        assert_eq!(s.eth1_deposit_index, 4);
+        assert_eq!(s.get_balance(0).unwrap(), 33_000_000_000);
+        assert_eq!(s.get_validator(1).unwrap().pubkey, pubkey(1));
+    }
+
+    fn exit(validator_index: u64, epoch: Epoch) -> VoluntaryExitWithSig {
+        VoluntaryExitWithSig {
+            voluntary_exit: VoluntaryExit { epoch, validator_index },
+            signature: Bytes::new(),
+        }
+    }
+
+    #[test]
+    fn verify_exit_accepts_a_mature_active_validator() {
+        let spec = spec();
+        // Epoch 2, shard_committee_period 1, activation epoch 0.
+        let mut s = state_with_validators(2, 64);
+        s.verify_exit(None, &exit(0, 2), &spec).unwrap();
+        // Explicit epoch overrides the state's own.
+        s.verify_exit(Some(5), &exit(0, 5), &spec).unwrap();
+    }
+
+    #[test]
+    fn verify_exit_rejects_each_invalid_case() {
+        let spec = spec();
+        let mut s = state_with_validators(4, 64);
+
+        let err = s.verify_exit(None, &exit(9, 0), &spec).unwrap_err().to_string();
+        assert!(err.contains("ValidatorUnknown"), "{err}");
+
+        // Not active: activation is in the future.
+        let mut inactive = active_validator(1, &spec);
+        inactive.activation_epoch = 10;
+        s.validators_store.set(1, inactive).unwrap();
+        let err = s.verify_exit(None, &exit(1, 0), &spec).unwrap_err().to_string();
+        assert!(err.contains("NotActive(1)"), "{err}");
+
+        // Active, but an exit has already been scheduled.
+        let mut exiting = active_validator(2, &spec);
+        exiting.exit_epoch = 100;
+        s.validators_store.set(2, exiting).unwrap();
+        let err = s.verify_exit(None, &exit(2, 0), &spec).unwrap_err().to_string();
+        assert!(err.contains("AlreadyExited(2)"), "{err}");
+
+        // The exit names an epoch that has not arrived.
+        let err = s.verify_exit(None, &exit(0, 3), &spec).unwrap_err().to_string();
+        assert!(err.contains("FutureEpoch"), "{err}");
+
+        // Too young: needs activation_epoch + shard_committee_period.
+        let mut young = state_with_validators(1, 0);
+        let err = young.verify_exit(None, &exit(0, 0), &spec).unwrap_err().to_string();
+        assert!(err.contains("TooYoungToExit"), "{err}");
+
+        // Pending partial withdrawals block a voluntary exit.
+        s.pending_partial_withdrawals.push(PendingPartialWithdrawal {
+            validator_index: 3,
+            amount: 1,
+            withdrawable_epoch: 0,
+        });
+        let err = s.verify_exit(None, &exit(3, 0), &spec).unwrap_err().to_string();
+        assert!(err.contains("PendingWithdrawalInQueue(3)"), "{err}");
+    }
+
+    #[test]
+    fn process_exits_schedules_exits_and_reports_the_failing_index() {
+        let spec = spec();
+        let mut s = state_with_validators(4, 64);
+        s.process_exits(&[exit(0, 2), exit(1, 2)], &spec).unwrap();
+        assert_eq!(s.get_validator(0).unwrap().exit_epoch, 2 + 1 + 4);
+        assert_eq!(s.get_validator(1).unwrap().exit_epoch, 7);
+        assert_eq!(s.get_validator(2).unwrap().exit_epoch, spec.far_future_epoch);
+
+        // The same validator cannot exit twice; the error names the offending position.
+        let err = s.process_exits(&[exit(2, 2), exit(0, 2)], &spec).unwrap_err().to_string();
+        assert!(err.contains("index 1"), "{err}");
+        // Earlier exits in the batch were already applied.
+        assert_ne!(s.get_validator(2).unwrap().exit_epoch, spec.far_future_epoch);
+    }
+
+    #[test]
+    fn exit_invalid_variants_compare_by_value() {
+        assert_eq!(ExitInvalid::NotActive(1), ExitInvalid::NotActive(1));
+        assert_ne!(
+            ExitInvalid::FutureEpoch { state: 1, exit: 2 },
+            ExitInvalid::FutureEpoch { state: 1, exit: 3 }
+        );
+    }
+}

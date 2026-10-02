@@ -447,3 +447,65 @@ fn a_closed_output_channel_is_fatal_for_every_kind_of_output() {
     let text = format!("{engine:?}");
     assert!(text.contains("ConsensusEngine") && text.contains("my_index: 0"), "{text}");
 }
+
+// ---------------------------------------------------------------------------
+// Validator-set changes and read accessors
+// ---------------------------------------------------------------------------
+
+fn candidate(seed: u8, address: u8) -> ValidatorInfo {
+    ValidatorInfo { address: Address::with_last_byte(address), bls_public_key: key(seed).public_key(), p2p_peer_id: None }
+}
+
+#[test]
+fn validator_changes_are_refused_by_name_until_epochs_are_on_and_then_bounded_by_the_minimum_set() {
+    let (mut engine, _sks, vs, _rx) = make(4, 0);
+
+    // Epochs are off by default: the change cannot be staged at all.
+    assert!(matches!(engine.propose_add_validator(candidate(0x90, 0x50)), Err(ConsensusError::EpochsDisabled)));
+    assert!(matches!(engine.propose_remove_validator(Address::with_last_byte(1)), Err(ConsensusError::EpochsDisabled)));
+
+    *engine.epoch_manager_mut() = EpochManager::with_epoch_length(vs, 10);
+    engine.propose_add_validator(candidate(0x90, 0x50)).expect("a new address is queued");
+    assert!(matches!(
+        engine.propose_add_validator(candidate(0x91, 0x50)),
+        Err(ConsensusError::ValidatorAlreadyExists { address }) if address == Address::with_last_byte(0x50)
+    ), "already queued");
+    assert!(matches!(
+        engine.propose_add_validator(candidate(0x92, 1)),
+        Err(ConsensusError::ValidatorAlreadyExists { .. })
+    ), "already a member");
+
+    assert!(matches!(
+        engine.propose_remove_validator(Address::with_last_byte(0x77)),
+        Err(ConsensusError::ValidatorNotFound { address }) if address == Address::with_last_byte(0x77)
+    ));
+    // Four members plus one queued: one may leave and four remain.
+    engine.propose_remove_validator(Address::with_last_byte(1)).expect("the set stays at the minimum");
+    assert!(matches!(
+        engine.propose_remove_validator(Address::with_last_byte(1)),
+        Err(ConsensusError::ValidatorAlreadyPendingRemoval { .. })
+    ));
+    assert!(matches!(
+        engine.propose_remove_validator(Address::with_last_byte(2)),
+        Err(ConsensusError::InsufficientValidators { have: 3, need: 4 })
+    ), "a second departure would leave three");
+}
+
+#[test]
+fn a_new_engine_reports_the_state_it_starts_in() {
+    let (mut engine, _sks, _vs, _rx) = make(4, 2);
+    assert!(matches!(engine.signing_profile(), ConsensusSigningProfile::Native));
+    engine.enable_h2_v4_signing(H2V4ChainIdentity { chain_id: 96, genesis_hash: B256::repeat_byte(1) });
+    assert!(matches!(engine.signing_profile(), ConsensusSigningProfile::H2V4(id) if id.chain_id == 96));
+
+    assert_eq!((engine.validator_count(), engine.quorum_size()), (4, 3));
+    assert_eq!(engine.current_view(), 1);
+    assert_eq!(engine.current_leader_index(), 1, "view 1 belongs to validator 1");
+    assert_eq!((engine.last_voted_view(), engine.last_commit_voted_view()), (0, 0));
+    assert!(engine.last_committed_view_timing().is_none());
+    assert_eq!(engine.consecutive_timeouts(), 0);
+    let before = engine.pacemaker().remaining();
+    engine.pacemaker_mut().extend_deadline(Duration::from_secs(10));
+    assert!(engine.pacemaker().remaining() > before + Duration::from_secs(5), "the view clock moved out");
+    assert!(engine.epoch_manager().current_validator_set().len() == 4);
+}

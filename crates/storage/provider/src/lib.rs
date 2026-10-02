@@ -23,7 +23,8 @@ pub use traits::*;
 pub mod providers;
 pub use providers::{
     DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW, LatestStateProvider,
-    LatestStateProviderRef, ProviderFactory, PruneShardOutcome, PrunedIndices, SaveBlocksInput,
+    LatestStateProviderRef, MemoryOverlayStateProvider, MemoryOverlayStateProviderRef,
+    ProviderFactory, PruneShardOutcome, PrunedIndices, SaveBlocksInput,
     StaticFileAccess, StaticFileProviderBuilder, StaticFileWriteCtx, StaticFileWriter,
 };
 

@@ -8,7 +8,8 @@ use crate::{
     CanonStateSubscriptions, ChainSpecProvider, ChainStateBlockReader, ChangeSetReader,
     DatabaseProviderFactory, HeaderProvider, ProviderError, ProviderFactory, PruneCheckpointReader,
     ReceiptProvider, ReceiptProviderIdExt, RocksDBProviderFactory, StageCheckpointReader,
-    StateProvider, StateProviderBox, StateProviderFactory, StateReader, StaticFileProviderFactory,
+    MemoryOverlayStateProvider, StateProvider, StateProviderBox, StateProviderFactory, StateReader,
+    StaticFileProviderFactory,
     TransactionVariant, TransactionsProvider,
 };
 use alloy_consensus::{transaction::TransactionMeta, BlockHeader};
@@ -52,6 +53,16 @@ use tracing::trace;
 /// Number of most-recent blocks whose state roots remain resolvable via
 /// [`StateRangeProviderFactory::state_range_provider`].
 pub const SNAPSHOT_STATE_RETENTION: u64 = 128;
+
+/// N42: `N42_OVERLAY_READS=upstream` reads state under in-memory blocks through upstream's
+/// flattened `OverlayStateProvider` instead of [`MemoryOverlayStateProvider`] (the default; see
+/// `BlockchainProvider::n42_layered_state_provider`).
+fn n42_upstream_overlay_reads() -> bool {
+    static UPSTREAM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *UPSTREAM.get_or_init(|| {
+        std::env::var("N42_OVERLAY_READS").is_ok_and(|v| v.trim().eq_ignore_ascii_case("upstream"))
+    })
+}
 
 type StateRangeDbProvider<N> = <ProviderFactory<N> as DatabaseProviderFactory>::Provider;
 type HistoricalStateRangeProvider<N> =
@@ -157,11 +168,60 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
         &self,
         state: Arc<BlockState<N::Primitives>>,
     ) -> ProviderResult<StateProviderBox> {
+        self.state_provider_for_state_with(state, n42_upstream_overlay_reads())
+    }
+
+    /// [`Self::state_provider_for_state`] with the read path chosen by the caller (N42: `upstream`
+    /// takes `reth-storage-overlay`'s flattened overlay).
+    fn state_provider_for_state_with(
+        &self,
+        state: Arc<BlockState<N::Primitives>>,
+        upstream: bool,
+    ) -> ProviderResult<StateProviderBox> {
+        if !upstream &&
+            let Some(layered) = self.n42_layered_state_provider(&state)?
+        {
+            return Ok(layered)
+        }
         let state_provider_factory = OverlayStateProviderFactory::new(
             self.database.clone(),
             self.database.overlay_manager().overlay_builder_for_state(state),
         );
         Ok(Box::new(state_provider_factory.database_provider_ro()?))
+    }
+
+    /// N42: the post-state of `state` as v2.5.1 read it -- the in-memory blocks' bundles walked
+    /// per read (newest first, [`MemoryOverlayStateProvider`]) over the database's state at the
+    /// chain's persisted anchor.
+    ///
+    /// Upstream's path flattens every in-memory block above the anchor into one
+    /// `ExecutionOverlay` per tip before the first read (cached, but recomputed for each new
+    /// tip and from scratch whenever persistence moves the anchor). At 147k accounts a block
+    /// that cost the follower import ~100 ms a block with every batch waiting on it (loop308).
+    ///
+    /// `None` when the anchor cannot be read this way -- not on the canonical chain any more, or
+    /// above the persisted state/trie frontier (`--engine.num-state-masking-blocks` > 0 keeps
+    /// masked blocks' state only in memory) -- and the caller takes upstream's path.
+    fn n42_layered_state_provider(
+        &self,
+        state: &BlockState<N::Primitives>,
+    ) -> ProviderResult<Option<StateProviderBox>> {
+        let anchor = state.anchor();
+        let provider = DatabaseProviderFactory::database_provider_ro(&self.database)?;
+        let Some(finish) = provider.get_stage_checkpoint(StageId::Finish)? else { return Ok(None) };
+        let state_trie_tip = finish
+            .finish_stage_checkpoint()
+            .and_then(|finish| finish.partial_state_trie())
+            .unwrap_or(finish.block_number);
+        if anchor.number > state_trie_tip ||
+            provider.block_hash(anchor.number)? != Some(anchor.hash)
+        {
+            return Ok(None)
+        }
+        let in_memory: Vec<ExecutedBlock<N::Primitives>> =
+            state.chain().map(|state| state.block()).collect();
+        let historical = self.state_provider_from_database(provider, anchor.hash);
+        Ok(Some(Box::new(MemoryOverlayStateProvider::new(historical, in_memory))))
     }
 
     /// Returns a historical state provider using an existing database snapshot.
@@ -1102,6 +1162,143 @@ mod tests {
         ops::{Bound, Range, RangeBounds},
         sync::Arc,
     };
+
+    /// N42: an in-memory chain over a database holding only block 0 (Finish at 0), each block
+    /// changing `per_block` accounts, the first `overlap` of them shared with the block before.
+    fn n42_in_memory_chain(
+        blocks: u64,
+        per_block: u64,
+        overlap: u64,
+    ) -> eyre::Result<(BlockchainProvider<MockNodeTypesWithDB>, Vec<B256>)> {
+        use revm::state::AccountInfo;
+        let factory = create_test_provider_factory();
+        let genesis = SealedBlock::seal_slow(Block::default());
+        let provider_rw = factory.provider_rw()?;
+        provider_rw.insert_block(&genesis.clone().try_recover().expect("senders"))?;
+        provider_rw.save_stage_checkpoint(StageId::Finish, StageCheckpoint::new(0))?;
+        provider_rw.commit()?;
+        let provider = BlockchainProvider::new(factory)?;
+        let mut parent = genesis.hash();
+        let mut executed = Vec::new();
+        let mut hashes = Vec::new();
+        for number in 1..=blocks {
+            let first = (number - 1) * (per_block - overlap);
+            let mut state = BundleState::default();
+            for n in first..first + per_block {
+                let info = AccountInfo {
+                    nonce: number,
+                    balance: U256::from(n * 1000 + number),
+                    ..Default::default()
+                };
+                state.state.insert(
+                    n42_address(n),
+                    revm::database::BundleAccount::new(
+                        None,
+                        Some(info),
+                        Default::default(),
+                        revm::database::AccountStatus::Changed,
+                    ),
+                );
+            }
+            let block = Block {
+                header: alloy_consensus::Header {
+                    number,
+                    parent_hash: parent,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let recovered = Arc::new(RecoveredBlock::new_unhashed(block, vec![]));
+            parent = recovered.hash();
+            hashes.push(parent);
+            executed.push(ExecutedBlock {
+                recovered_block: recovered,
+                execution_output: Arc::new(BlockExecutionOutput {
+                    state,
+                    result: BlockExecutionResult {
+                        receipts: Default::default(),
+                        requests: Default::default(),
+                        gas_used: 0,
+                        blob_gas_used: 0,
+                    },
+                }),
+                ..Default::default()
+            });
+        }
+        provider.canonical_in_memory_state.update_chain(NewCanonicalChain::Commit { new: executed });
+        for state in provider.canonical_in_memory_state.canonical_chain() {
+            provider.database.overlay_manager().insert_block(state.block());
+        }
+        Ok((provider, hashes))
+    }
+
+    fn n42_address(n: u64) -> Address {
+        Address::from_word(B256::from(U256::from(n + 1)))
+    }
+
+    /// N42: state under in-memory blocks read through `MemoryOverlayStateProvider` answers
+    /// what upstream's flattened overlay answers, for every block of the chain.
+    #[test]
+    fn n42_layered_reads_match_upstream_overlay() -> eyre::Result<()> {
+        let (provider, hashes) = n42_in_memory_chain(5, 40, 15)?;
+        for hash in &hashes {
+            let state =
+                provider.canonical_in_memory_state.state_by_hash(*hash).expect("in memory");
+            assert!(provider.n42_layered_state_provider(&state)?.is_some(), "anchor is persisted");
+            let layered = provider.state_provider_for_state_with(state.clone(), false)?;
+            let upstream = provider.state_provider_for_state_with(state, true)?;
+            let mut found = 0;
+            for n in 0..200 {
+                let address = n42_address(n);
+                let account = layered.basic_account(&address)?;
+                assert_eq!(account, upstream.basic_account(&address)?, "account {n} at {hash}");
+                found += account.is_some() as usize;
+            }
+            assert!(found > 0);
+            for number in 0..=hashes.len() as u64 + 1 {
+                assert_eq!(layered.block_hash(number)?, upstream.block_hash(number)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// N42 (loop308): the cost of opening state at each tip of an in-memory chain at the
+    /// fleet's block shape and reading 160k accounts from it, flattened (upstream) against
+    /// walked per read. Timing only:
+    /// `cargo test --release -p reth-provider --lib n42_overlay_open_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn n42_overlay_open_cost_at_fleet_shape() -> eyre::Result<()> {
+        use std::time::Instant;
+        const BLOCKS: u64 = 8;
+        const ACCOUNTS: u64 = 147_000;
+        let reads: Vec<Address> = (0..160_000u64)
+            .map(|i| n42_address((i * 7) % (BLOCKS * ACCOUNTS + 50_000)))
+            .collect();
+        for upstream in [true, false] {
+            // Tips from the oldest up, as a follower meets them: upstream's cache extends the
+            // previous tip's overlay, so each mode gets its own provider.
+            let (provider, hashes) = n42_in_memory_chain(BLOCKS, ACCOUNTS, 0)?;
+            for hash in &hashes {
+                let state =
+                    provider.canonical_in_memory_state.state_by_hash(*hash).expect("in memory");
+                let at = Instant::now();
+                let opened = provider.state_provider_for_state_with(state, upstream)?;
+                opened.basic_account(&reads[0])?;
+                let first_read = at.elapsed();
+                let at = Instant::now();
+                let mut found = 0usize;
+                for read in &reads {
+                    found += opened.basic_account(read)?.is_some() as usize;
+                }
+                println!(
+                    "upstream={upstream} tip={hash} open+first read {first_read:?}, 160k reads {:?} ({found} found)",
+                    at.elapsed()
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn historical_proofs_complete_masked_trie_rows() -> eyre::Result<()> {

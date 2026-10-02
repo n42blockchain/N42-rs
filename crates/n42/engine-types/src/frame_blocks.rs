@@ -387,7 +387,7 @@ pub fn seal_root_timed(plan: Option<&FramePlan>, body_hashes: &[B256], mpt: impl
             tracing::info!(
                 target: "payload_builder",
                 txs = body_hashes.len(),
-                planned = plan.hashes.len(),
+                planned = plan.tx_count(),
                 frames = plan.frames.len(),
                 "frame build's body is not a run of frames; sealed with the MPT root"
             );

@@ -1992,7 +1992,7 @@ impl<T: PoolTransaction> Inner<T> {
                 *taken_of.entry(*sender).or_insert(0) += u64::from(*len);
             }
             self.len -= prefix;
-            plan.hashes.extend_from_slice(&hashes[..prefix]);
+            plan.push_hashes(Arc::clone(hashes), prefix);
             plan.frames.push(PlannedFrame { id, len: txs.len(), taken: prefix });
             self.pending.push((id, prefix));
             times.by_ref += 1;
@@ -2093,7 +2093,7 @@ impl<T: PoolTransaction> Inner<T> {
                         }
                     }
                     debug_assert_eq!(taken, txs.len());
-                    plan.hashes.extend_from_slice(hashes);
+                    plan.push_hashes(Arc::clone(hashes), txs.len());
                     plan.frames.push(PlannedFrame { id, len: txs.len(), taken: txs.len() });
                     times.by_ref += 1;
                     segments.push((txs, taken));
@@ -2166,6 +2166,7 @@ impl<T: PoolTransaction> Inner<T> {
                 return SlowFrame::End;
             }
             let mut taken = 0usize;
+            let mut taken_hashes: Vec<B256> = Vec::with_capacity(prefix);
             for (sender, nonce, hash) in &members[..prefix] {
                 let Some(lane) = self.lanes.get_mut(sender) else { break };
                 if lane.by_nonce.first_key_value().map(|(n, _)| *n) != Some(*nonce) {
@@ -2180,12 +2181,13 @@ impl<T: PoolTransaction> Inner<T> {
                     list.push(Arc::clone(&valid));
                 }
                 out.push(valid);
-                plan.hashes.push(*hash);
+                taken_hashes.push(*hash);
                 taken += 1;
             }
             if taken == 0 {
                 return SlowFrame::End;
             }
+            plan.push_hashes(taken_hashes.into(), taken);
             plan.frames.push(PlannedFrame { id, len: members.len(), taken });
             *gas_left = gas_left.saturating_sub(gas);
             SlowFrame::Taken(out, taken == members.len())
@@ -4183,7 +4185,7 @@ mod tests {
             vec![(B256::repeat_byte(0xd1), 3, 3), (B256::repeat_byte(0xd3), 2, 2), (B256::repeat_byte(0xd4), 4, 2)]
         );
         let want: Vec<B256> = first.iter().chain(&third).chain(&fourth[..2]).copied().collect();
-        assert_eq!(plan.hashes, want);
+        assert_eq!(plan.hashes(), want);
         assert_eq!(plan.layout_for(&want[..4]), Some(vec![(B256::repeat_byte(0xd1), 3), (B256::repeat_byte(0xd3), 1)]));
         assert_eq!(plan.layout_for(&[want[1]]), None, "not a prefix: not frame-aligned");
         let mut best = best;
@@ -4414,7 +4416,7 @@ mod tests {
             let own = queue.take_frames(&ids);
             let mut handed = Vec::new();
             let mut by_ref = Vec::new();
-            let keep = if round == 0 { plan.hashes.len() / 2 } else { plan.hashes.len() };
+            let keep = if round == 0 { plan.tx_count() / 2 } else { plan.tx_count() };
             for tx in best.by_ref().take(keep) {
                 handed.push(*tx.hash());
                 by_ref.push(own.iter().flatten().any(|txs| txs.iter().any(|t| Arc::ptr_eq(t, &tx))));
@@ -4426,7 +4428,7 @@ mod tests {
                 .as_ref()
                 .map(|(_, list)| list.iter().map(|t| *t.hash()).collect())
                 .unwrap_or_default();
-            out.push(format!("{round} plan {:?} {:?} {}", plan.frames, plan.hashes, plan.skipped));
+            out.push(format!("{round} plan {:?} {:?} {}", plan.frames, plan.hashes(), plan.skipped));
             out.push(format!("{round} handed {handed:?}"));
             out.push(format!("{round} len {} taken {taken:?}", queue.len()));
             // Pointer identity: a transaction handed out is the frame

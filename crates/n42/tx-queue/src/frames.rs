@@ -96,26 +96,83 @@ pub struct PlannedFrame {
 /// What a frame build took, in the order its transactions are handed to
 /// the builder: whole frames in arrival order, the last one possibly cut
 /// to a prefix.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct FramePlan {
     /// The frames, in body order.
     pub frames: Vec<PlannedFrame>,
-    /// The transactions' hashes, in body order: the frames' taken parts
-    /// end to end.
-    pub hashes: Vec<B256>,
+    /// The transactions' hashes, in body order, as the frames' taken parts
+    /// end to end: each a frame's own shared hashes (the index's, by
+    /// reference) and how many of them from its start. Copying them into
+    /// one vector was ~5 MB under the queue's lock at every full build's
+    /// start (step 7a, `start_walk_ms`); [`Self::hashes`] makes that vector
+    /// for whoever needs it.
+    pub parts: Vec<(Arc<[B256]>, usize)>,
     /// Indexed frames the plan passed over: not whole-usable, or not at
     /// their senders' lane heads once the frames before them were taken.
     pub skipped: usize,
 }
 
+/// Two plans are equal when their frames, their hashes in body order and
+/// their passed-over count are: how the hashes are held (a frame's whole
+/// shared list cut by a count, or a list of its taken part) does not count.
+impl PartialEq for FramePlan {
+    fn eq(&self, other: &Self) -> bool {
+        self.frames == other.frames
+            && self.skipped == other.skipped
+            && self.tx_count() == other.tx_count()
+            && self.parts.iter().flat_map(|(h, n)| &h[..*n]).eq(other.parts.iter().flat_map(|(h, n)| &h[..*n]))
+    }
+}
+
+impl Eq for FramePlan {}
+
 impl FramePlan {
+    /// Appends a frame's taken part: the first `taken` of `hashes`.
+    pub fn push_hashes(&mut self, hashes: Arc<[B256]>, taken: usize) {
+        let taken = taken.min(hashes.len());
+        if taken > 0 {
+            self.parts.push((hashes, taken));
+        }
+    }
+
+    /// How many transactions the plan holds.
+    pub fn tx_count(&self) -> usize {
+        self.parts.iter().map(|(_, taken)| *taken).sum()
+    }
+
+    /// The transactions' hashes, in body order, in one vector.
+    pub fn hashes(&self) -> Vec<B256> {
+        let mut out = Vec::with_capacity(self.tx_count());
+        for (hashes, taken) in &self.parts {
+            out.extend_from_slice(&hashes[..*taken]);
+        }
+        out
+    }
+
+    /// Whether `body` is a prefix of the plan's hashes, compared part by
+    /// part.
+    fn has_prefix(&self, body: &[B256]) -> bool {
+        let mut rest = body;
+        for (hashes, taken) in &self.parts {
+            if rest.is_empty() {
+                return true;
+            }
+            let n = (*taken).min(rest.len());
+            if hashes[..n] != rest[..n] {
+                return false;
+            }
+            rest = &rest[n..];
+        }
+        rest.is_empty()
+    }
+
     /// The layout of a body built from this plan, as (frame id, length) in
     /// body order: `Some` when the body's hashes are a prefix of the plan's
     /// (a build that stopped early, or took everything), with the frame the
     /// body ends in cut to what it holds of it; `None` when the body is not
     /// a prefix of the plan -- it is not frame-aligned.
     pub fn layout_for(&self, body: &[B256]) -> Option<Vec<(B256, usize)>> {
-        if body.len() > self.hashes.len() || self.hashes[..body.len()] != *body {
+        if !self.has_prefix(body) {
             return None;
         }
         let mut layout = Vec::new();
@@ -196,7 +253,7 @@ pub(crate) enum ByRef<T: PoolTransaction> {
 
 #[derive(Debug)]
 struct FrameEntry<T: PoolTransaction> {
-    hashes: Vec<B256>,
+    hashes: Arc<[B256]>,
     runs: Vec<SenderRun>,
     gas: u64,
     /// The transactions themselves, in frame order, when the frame was
@@ -244,7 +301,7 @@ impl<T: PoolTransaction> FrameEntry<T> {
         }
         let txs_gas =
             txs.as_ref().map_or(0, |txs| txs.iter().map(|tx| tx.gas_limit()).fold(0u64, u64::saturating_add));
-        Some((frame.id, Self { hashes: frame.hashes, runs, gas: frame.gas, txs, txs_gas }))
+        Some((frame.id, Self { hashes: frame.hashes.into(), runs, gas: frame.gas, txs, txs_gas }))
     }
 
     /// Every position's (sender, nonce), in frame order.
@@ -470,8 +527,8 @@ impl<T: PoolTransaction> FrameIndex<T> {
 
     /// A frame's sender runs and hashes, for the take after
     /// [`Self::check_by_ref`].
-    pub(crate) fn runs_and_hashes(&self, id: &B256) -> Option<(&[SenderRun], &[B256])> {
-        self.frames.get(id).map(|entry| (entry.runs.as_slice(), entry.hashes.as_slice()))
+    pub(crate) fn runs_and_hashes(&self, id: &B256) -> Option<(&[SenderRun], &Arc<[B256]>)> {
+        self.frames.get(id).map(|entry| (entry.runs.as_slice(), &entry.hashes))
     }
 
     /// The transactions a frame was noted with, shared: `None` for a frame
@@ -506,14 +563,14 @@ impl<T: PoolTransaction> FrameIndex<T> {
                 at = at.saturating_add(*len);
                 let slice = body.get(start..at)?;
                 let frame = self.frames.get(id)?;
-                (frame.hashes.as_slice() == slice).then_some(*id)
+                (&frame.hashes[..] == slice).then_some(*id)
             })
             .collect()
     }
 
     /// A frame's transactions' hashes, in frame order.
     pub(crate) fn hashes_of(&self, id: &B256) -> Option<&[B256]> {
-        self.frames.get(id).map(|entry| entry.hashes.as_slice())
+        self.frames.get(id).map(|entry| &entry.hashes[..])
     }
 
     /// The frame layout of a body given by its transactions' hashes: the

@@ -5423,3 +5423,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "state_machine_gap_tests.rs"]
+mod gap_tests;

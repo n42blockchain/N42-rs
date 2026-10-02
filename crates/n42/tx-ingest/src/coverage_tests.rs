@@ -710,11 +710,11 @@ fn recovery_threads_keep_their_priority_and_affinity_by_default() {
             let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::id_t;
             let before = nice(tid);
             let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-            unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+            unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw mut set) };
             apply_recovery_nice();
             apply_recovery_affinity();
             let mut after: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-            unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut after) };
+            unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw mut after) };
             assert_eq!(nice(tid), before);
             assert!(unsafe { libc::CPU_EQUAL(&set, &after) });
         })
@@ -729,7 +729,7 @@ fn physical_cores_are_a_sorted_subset_of_the_affinity_set() {
     assert!(!cores.is_empty());
     assert!(cores.windows(2).all(|w| w[0] < w[1]), "ascending and unique: {cores:?}");
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    assert_eq!(unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) }, 0);
+    assert_eq!(unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw mut set) }, 0);
     for cpu in cores {
         assert!(unsafe { libc::CPU_ISSET(*cpu, &set) }, "cpu {cpu} is outside the process's set");
     }

@@ -222,7 +222,7 @@ fn new_with_valid_key_exposes_its_address() {
 #[test]
 fn new_with_unparsable_key_leaves_no_signer() {
     let env = Env::new(3, 100);
-    let e: Engine = APos::new(env.provider.clone(), env.spec.clone(), Some("zz".into()));
+    let e: Engine = APos::new(env.provider.clone(), env.spec, Some("zz".into()));
     assert_eq!(Consensus::<Blk>::get_eth_signer_address(&e).unwrap(), None);
 }
 
@@ -307,12 +307,12 @@ fn proposals_can_be_added_overwritten_and_discarded() {
     Consensus::<Blk>::propose(&e, b, false).unwrap();
     let p = Consensus::<Blk>::proposals(&e).unwrap();
     assert_eq!(p.len(), 2);
-    assert_eq!(p[&a], true);
-    assert_eq!(p[&b], false);
+    assert!(p[&a]);
+    assert!(!p[&b]);
 
     // A second proposal for the same address replaces the first.
     Consensus::<Blk>::propose(&e, a, false).unwrap();
-    assert_eq!(Consensus::<Blk>::proposals(&e).unwrap()[&a], false);
+    assert!(!Consensus::<Blk>::proposals(&e).unwrap()[&a]);
 
     Consensus::<Blk>::discard(&e, a).unwrap();
     let p = Consensus::<Blk>::proposals(&e).unwrap();
@@ -742,7 +742,7 @@ fn validate_header_range_is_a_noop_for_any_input() {
     let e = env.engine(0);
     assert!(e.validate_header_range(&[]).is_ok());
     assert!(e
-        .validate_header_range(&[env.genesis.clone(), SealedHeader::seal_slow(base_header(1))])
+        .validate_header_range(&[env.genesis, SealedHeader::seal_slow(base_header(1))])
         .is_ok());
 }
 

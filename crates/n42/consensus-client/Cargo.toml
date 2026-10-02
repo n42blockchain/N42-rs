@@ -87,5 +87,8 @@ blst.workspace = true
 
 op-alloy-rpc-types-engine = { workspace = true, optional = true }
 
+[dev-dependencies]
+reth-provider = { workspace = true, features = ["test-utils"] }
+
 [lints]
 workspace = true

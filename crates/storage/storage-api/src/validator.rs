@@ -6,8 +6,8 @@ use alloy_primitives::BlockNumber;
 use auto_impl::auto_impl;
 use n42_primitives::{Validator, ValidatorBeforeTx, ValidatorChangeset, ValidatorRevert};
 use reth_storage_errors::provider::ProviderResult;
-use std::collections::BTreeMap;
-use std::ops::RangeInclusive;
+use alloc::{collections::BTreeMap, vec::Vec};
+use core::ops::RangeInclusive;
 /// Validator reader
 #[auto_impl(&, Arc, Box)]
 pub trait ValidatorReader: Send + Sync {

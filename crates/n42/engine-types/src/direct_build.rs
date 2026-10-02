@@ -268,6 +268,13 @@ pub mod read_depth {
         COUNTS[bucket_of(depth)].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Counts a read no executed block answered. `HISTORICAL` is a bucket
+    /// index, not a depth: passing it through `bucket_of` would land it in
+    /// the 4-7 bucket.
+    fn record_historical() {
+        COUNTS[HISTORICAL].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records the depth of `executed` an [`overlay_on_executed`] call was
     /// built with -- the number of executed blocks the overlay's own stack
     /// holds, before any read falls through to `historical` -- or `0` for a
@@ -329,7 +336,7 @@ pub mod read_depth {
                     return Ok(account);
                 }
             }
-            record(HISTORICAL);
+            record_historical();
             self.historical.basic_account(address)
         }
     }
@@ -2002,7 +2009,6 @@ mod tests {
     // ---- the read-depth counter ----
 
     #[test]
-    #[ignore = "read_depth::record(HISTORICAL) passes 7 through bucket_of, which maps it to the 4-7 bucket, so the historical bucket never counts"]
     fn a_read_no_block_answers_is_counted_as_historical() {
         let _guard = store_lock();
         let _ = read_depth::snapshot();

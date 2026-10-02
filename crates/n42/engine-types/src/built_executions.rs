@@ -488,3 +488,353 @@ pub fn take_sealed_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_ENGINE_TAKE_SEALED").is_ok_and(|v| v == "1"))
 }
+
+/// Serialises every test that files builds: the stores are process-global and
+/// bounded by [`KEEP`], so concurrent tests would evict each other's builds.
+#[cfg(test)]
+pub(crate) static STORE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::Header;
+    use n42_tx_types::{BlockBody, N42TxEnvelope};
+    use reth_execution_types::BlockExecutionOutput;
+    use std::time::{Duration, Instant};
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        STORE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn header(tag: u8, number: u64) -> Header {
+        Header {
+            number,
+            parent_hash: B256::repeat_byte(tag),
+            state_root: B256::repeat_byte(tag.wrapping_add(1)),
+            receipts_root: B256::repeat_byte(tag.wrapping_add(2)),
+            gas_used: 1_000 + u64::from(tag),
+            transactions_root: B256::repeat_byte(tag.wrapping_add(3)),
+            ..Default::default()
+        }
+    }
+
+    fn built(header: &Header) -> BuiltExecution {
+        let block = Block {
+            header: header.clone(),
+            body: BlockBody { transactions: Vec::new(), ommers: Vec::new(), withdrawals: Some(Vec::new().into()) },
+        };
+        BuiltExecution {
+            block: Arc::new(RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), Vec::new())),
+            execution_output: Arc::new(BlockExecutionOutput { result: Default::default(), state: Default::default() }),
+            hashed_state: Arc::new(HashedPostState::default()),
+            trie_updates: Arc::new(TrieUpdates::default()),
+        }
+    }
+
+    fn find_by(h: &Header) -> Option<(B256, BuiltExecution)> {
+        find(h.parent_hash, h.number, h.state_root, h.receipts_root, h.gas_used, None)
+    }
+
+    #[test]
+    fn a_finished_build_is_found_only_by_all_the_fields_a_seal_cannot_change() {
+        let _guard = lock();
+        let h = header(0x11, 501);
+        let execution = built(&h);
+        let hash = execution.block.hash();
+        remember(hash, execution);
+        assert_eq!(stage_of(hash), Some(Stage::Complete));
+        assert_eq!(find_by(&h).map(|(found, _)| found), Some(hash));
+
+        let off = |f: &dyn Fn(&mut Header)| {
+            let mut other = h.clone();
+            f(&mut other);
+            find_by(&other)
+        };
+        assert!(off(&|o| o.parent_hash = B256::repeat_byte(0xEE)).is_none(), "parent");
+        assert!(off(&|o| o.number += 1).is_none(), "number");
+        assert!(off(&|o| o.state_root = B256::repeat_byte(0xEE)).is_none(), "state root");
+        assert!(off(&|o| o.receipts_root = B256::repeat_byte(0xEE)).is_none(), "receipts root");
+        assert!(off(&|o| o.gas_used += 1).is_none(), "gas");
+    }
+
+    #[test]
+    fn the_transactions_root_tells_siblings_with_the_same_parent_results_apart() {
+        let _guard = lock();
+        let a = header(0x12, 502);
+        let b = Header { transactions_root: B256::repeat_byte(0x99), ..a.clone() };
+        let (ea, eb) = (built(&a), built(&b));
+        let (ha, hb) = (ea.block.hash(), eb.block.hash());
+        assert_ne!(ha, hb);
+        remember(ha, ea);
+        remember(hb, eb);
+        let by_root = |root| find(a.parent_hash, 502, a.state_root, a.receipts_root, a.gas_used, root).map(|(h, _)| h);
+        assert_eq!(by_root(Some(a.transactions_root)), Some(ha));
+        assert_eq!(by_root(Some(b.transactions_root)), Some(hb));
+        assert_eq!(by_root(Some(B256::repeat_byte(0x55))), None);
+        // Without a root the newest of the siblings answers.
+        assert_eq!(by_root(None), Some(hb));
+    }
+
+    #[test]
+    fn the_store_keeps_only_the_last_few_builds() {
+        let _guard = lock();
+        let hashes: Vec<B256> = (0..=KEEP as u8)
+            .map(|i| {
+                let execution = built(&header(0x20 + i, 510 + u64::from(i)));
+                let hash = execution.block.hash();
+                remember(hash, execution);
+                hash
+            })
+            .collect();
+        assert_eq!(stage_of(hashes[0]), None, "the oldest is evicted");
+        for hash in &hashes[1..] {
+            assert_eq!(stage_of(*hash), Some(Stage::Complete));
+        }
+        // Filing the same hash again replaces it instead of taking a second slot.
+        remember(hashes[3], built(&header(0x23, 513)));
+        assert_eq!(stage_of(hashes[1]), Some(Stage::Complete));
+    }
+
+    #[test]
+    fn a_pending_build_advances_through_its_stages() {
+        let _guard = lock();
+        let h = header(0x30, 520);
+        let execution = built(&h);
+        let hash = execution.block.hash();
+        remember_pending(hash, execution.block.clone());
+        assert_eq!(stage_of(hash), Some(Stage::Sealed));
+        // Sealed already: no execution to give, and no waiting for one.
+        assert!(wait_for(hash, Stage::Sealed).is_none());
+        // The kept block is known without waiting, with no execution yet.
+        let (kept_hash, block, exec) = find_kept_sealed(h.parent_hash, 520, h.state_root, h.receipts_root, h.gas_used, None)
+            .expect("filed before the seal is handed out");
+        assert_eq!(kept_hash, hash);
+        assert_eq!(block.hash(), hash);
+        assert!(exec.is_none());
+
+        state_ready(hash, execution.clone());
+        assert_eq!(stage_of(hash), Some(Stage::StateReady));
+        assert!(wait_for(hash, Stage::StateReady).is_some());
+        assert!(matches!(wait_for_state(hash), Some(ParentState::Full(_))));
+        assert!(find_at(h.parent_hash, 520, h.state_root, h.receipts_root, h.gas_used, None, Stage::StateReady).is_some());
+
+        complete(hash, execution);
+        assert_eq!(stage_of(hash), Some(Stage::Complete));
+        assert!(find_by(&h).is_some());
+        assert!(Stage::Complete > Stage::StateReady && Stage::StateReady > Stage::Sealed, "stages are ordered");
+    }
+
+    #[test]
+    fn a_waiter_is_woken_by_the_stage_it_waits_for() {
+        let _guard = lock();
+        let h = header(0x31, 521);
+        let execution = built(&h);
+        let hash = execution.block.hash();
+        remember_pending(hash, execution.block.clone());
+        let waiter = std::thread::spawn(move || {
+            let at = Instant::now();
+            (wait_for(hash, Stage::Complete).is_some(), at.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        complete(hash, execution);
+        let (found, waited) = waiter.join().unwrap();
+        assert!(found);
+        assert!(waited >= Duration::from_millis(90) && waited < WAIT, "woke on the stage, not the deadline: {waited:?}");
+    }
+
+    #[test]
+    fn a_failed_finish_releases_its_waiters_at_once() {
+        let _guard = lock();
+        let h = header(0x32, 522);
+        let execution = built(&h);
+        let hash = execution.block.hash();
+        remember_pending(hash, execution.block.clone());
+        let waiter = std::thread::spawn(move || {
+            let at = Instant::now();
+            (wait_for(hash, Stage::Complete).is_none(), at.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        fail(hash);
+        let (none, waited) = waiter.join().unwrap();
+        assert!(none);
+        assert!(waited < WAIT, "released by the failure, not the deadline: {waited:?}");
+        assert_eq!(stage_of(hash), None);
+        assert!(wait_for_state(hash).is_none());
+    }
+
+    #[test]
+    fn an_advance_for_a_build_not_in_the_store_is_dropped() {
+        let _guard = lock();
+        let h = header(0x33, 523);
+        let execution = built(&h);
+        let hash = execution.block.hash();
+        state_ready(hash, execution.clone());
+        complete(hash, execution);
+        assert_eq!(stage_of(hash), None, "an evicted build is not re-filed over a live one");
+    }
+
+    #[test]
+    fn a_waiter_for_a_build_never_filed_returns_at_once() {
+        let _guard = lock();
+        let at = Instant::now();
+        assert!(wait_for(B256::repeat_byte(0xFA), Stage::Complete).is_none());
+        assert!(wait_for_state(B256::repeat_byte(0xFA)).is_none());
+        assert!(at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn shards_are_served_before_the_bundle_and_dropped_when_it_arrives() {
+        let _guard = lock();
+        let h = header(0x34, 524);
+        let execution = built(&h);
+        let hash = execution.block.hash();
+        let parent = || ShardedParent {
+            residual: execution.execution_output.clone(),
+            shards: Arc::new(crate::output_shards::OutputShards::new(alloy_primitives::Address::ZERO, 4, 2).freeze()),
+        };
+        // Shards for a build that is not filed are ignored.
+        shards_ready(B256::repeat_byte(0xFB), parent());
+
+        remember_pending(hash, execution.block.clone());
+        shards_ready(hash, parent());
+        match wait_for_state(hash) {
+            Some(ParentState::Sharded(sharded)) => assert_eq!(sharded.shards.shard_count(), 2),
+            other => panic!("expected the shard set, got {other:?}"),
+        }
+        state_ready(hash, execution.clone());
+        assert!(matches!(wait_for_state(hash), Some(ParentState::Full(_))), "the bundle supersedes the shards");
+        // Shards filed after the state is ready do not take its place.
+        shards_ready(hash, parent());
+        assert!(matches!(wait_for_state(hash), Some(ParentState::Full(_))));
+    }
+
+    #[test]
+    fn a_taken_build_leaves_the_store_but_stays_findable_as_kept() {
+        let _guard = lock();
+        let h = header(0x40, 530);
+        let execution = built(&h);
+        let hash = execution.block.hash();
+        remember(hash, execution);
+        let (taken, _) = take(h.parent_hash, 530, h.state_root, h.receipts_root, h.gas_used, None).expect("taken");
+        assert_eq!(taken, hash);
+        assert_eq!(stage_of(hash), None);
+        assert!(find_by(&h).is_none(), "gone from the store");
+        assert!(take(h.parent_hash, 530, h.state_root, h.receipts_root, h.gas_used, None).is_none(), "taken once");
+        let (kept, _) = find_kept(h.parent_hash, 530, h.state_root, h.receipts_root, h.gas_used, None).expect("kept");
+        assert_eq!(kept, hash);
+        assert!(find_kept_at(h.parent_hash, 530, h.state_root, h.receipts_root, h.gas_used, None, Stage::StateReady).is_some());
+        let (sealed_hash, block, exec) =
+            find_kept_sealed(h.parent_hash, 530, h.state_root, h.receipts_root, h.gas_used, None).expect("kept sealed");
+        assert_eq!(sealed_hash, hash);
+        assert_eq!(block.hash(), hash);
+        assert!(exec.is_some());
+        // A caller that gave the transactions root still has to match it.
+        assert!(find_kept(h.parent_hash, 530, h.state_root, h.receipts_root, h.gas_used, Some(B256::repeat_byte(0x01))).is_none());
+        assert!(wait_for(hash, Stage::Complete).is_some(), "the handed list answers a waiter");
+        assert!(matches!(wait_for_state(hash), Some(ParentState::Full(_))));
+    }
+
+    #[test]
+    fn the_handed_list_is_bounded_too() {
+        let _guard = lock();
+        let heads: Vec<Header> = (0..=KEEP as u8).map(|i| header(0x50 + i * 4, 540 + u64::from(i))).collect();
+        for h in &heads {
+            let execution = built(h);
+            remember(execution.block.hash(), execution);
+            take(h.parent_hash, h.number, h.state_root, h.receipts_root, h.gas_used, None).expect("taken");
+        }
+        let kept = |h: &Header| find_kept(h.parent_hash, h.number, h.state_root, h.receipts_root, h.gas_used, None);
+        // The oldest handed build fell off, and nothing is filed in the store, so the lookup answers None at once.
+        assert!(kept(&heads[0]).is_none());
+        for h in &heads[1..] {
+            assert!(kept(h).is_some());
+        }
+    }
+
+    #[test]
+    fn find_gives_up_after_the_deadline_on_a_build_that_never_completes() {
+        let _guard = lock();
+        let h = header(0x60, 550);
+        let execution = built(&h);
+        remember_pending(execution.block.hash(), execution.block.clone());
+        let at = Instant::now();
+        assert!(find_by(&h).is_none());
+        assert!(at.elapsed() >= WAIT - Duration::from_millis(50), "waited for the finish: {:?}", at.elapsed());
+    }
+
+    fn sealed_block(tag: u8, transactions: usize) -> SealedBlock<Block> {
+        let txs: Vec<N42TxEnvelope> = (0..transactions)
+            .map(|nonce| {
+                let tx = alloy_consensus::TxLegacy { nonce: nonce as u64, ..Default::default() };
+                N42TxEnvelope::Eth(reth_ethereum_primitives::TransactionSigned::new_unhashed(
+                    reth_ethereum_primitives::Transaction::Legacy(tx),
+                    alloy_primitives::Signature::test_signature(),
+                ))
+            })
+            .collect();
+        let block = Block {
+            header: Header { number: u64::from(tag), extra_data: vec![tag].into(), ..Default::default() },
+            body: BlockBody { transactions: txs, ommers: Vec::new(), withdrawals: None },
+        };
+        SealedBlock::seal_slow(block)
+    }
+
+    #[test]
+    fn a_sealed_block_is_kept_for_the_engines_own_new_payload() {
+        let _guard = lock();
+        let block = sealed_block(0x71, 2);
+        let hash = block.hash();
+        assert!(find_sealed(hash).is_none());
+        assert!(!sealed_here_with_transactions(hash));
+        remember_sealed(hash, block);
+        assert!(sealed_here_with_transactions(hash));
+        // find leaves it, take removes it: a payload converted twice finds it the first time only.
+        assert_eq!(find_sealed(hash).map(|b| b.body().transactions.len()), Some(2));
+        assert_eq!(find_sealed(hash).map(|b| b.hash()), Some(hash));
+        assert_eq!(take_sealed(hash).map(|b| b.hash()), Some(hash));
+        assert!(take_sealed(hash).is_none());
+        assert!(find_sealed(hash).is_none());
+        // The hint outlives the block, so a header-only payload is still recognised.
+        assert!(sealed_here_with_transactions(hash));
+    }
+
+    #[test]
+    fn an_empty_sealed_block_is_not_a_header_only_hint() {
+        let _guard = lock();
+        let block = sealed_block(0x72, 0);
+        let hash = block.hash();
+        remember_sealed(hash, block);
+        assert!(!sealed_here_with_transactions(hash));
+    }
+
+    #[test]
+    fn find_or_take_sealed_copies_when_the_flag_is_off() {
+        let _guard = lock();
+        // The flag is read from the environment once; these tests never set it.
+        assert!(!take_sealed_enabled());
+        let block = sealed_block(0x73, 3);
+        let hash = block.hash();
+        remember_sealed(hash, block);
+        assert!(find_or_take_sealed(hash, 3).is_some());
+        assert!(find_or_take_sealed(hash, 3).is_some(), "copied, not moved");
+        assert!(find_or_take_sealed(hash, 0).is_some());
+        assert!(find_or_take_sealed(B256::repeat_byte(0xFC), 3).is_none());
+    }
+
+    #[test]
+    fn the_sealed_store_is_bounded_and_refiling_replaces() {
+        let _guard = lock();
+        let blocks: Vec<_> = (0..=KEEP as u8).map(|i| sealed_block(0x80 + i, 1)).collect();
+        let hashes: Vec<B256> = blocks.iter().map(|b| b.hash()).collect();
+        for block in blocks.iter().cloned() {
+            remember_sealed(block.hash(), block);
+        }
+        assert!(find_sealed(hashes[0]).is_none(), "the oldest was retired");
+        assert!(sealed_here_with_transactions(hashes[0]), "its hint was not");
+        for hash in &hashes[1..] {
+            assert!(find_sealed(*hash).is_some());
+        }
+        remember_sealed(hashes[1], blocks[1].clone());
+        assert!(find_sealed(hashes[2]).is_some(), "re-filing took no extra slot");
+    }
+}

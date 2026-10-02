@@ -1460,3 +1460,147 @@ reth_storage_api::macros::delegate_impls_to_as_ref!(
         fn hashed_post_state(&self, bundle_state: &BundleState) -> ProviderResult<HashedPostState>;
     }
 );
+
+#[cfg(test)]
+mod frozen_tests {
+    use super::*;
+    use revm::{database::BundleState, state::AccountInfo};
+
+    fn addr(i: u8) -> Address {
+        Address::with_last_byte(i)
+    }
+
+    fn info(nonce: u64, balance: u64) -> AccountInfo {
+        AccountInfo { nonce, balance: U256::from(balance), ..Default::default() }
+    }
+
+    /// A batch's bundle: each `(address, before, after)` moved from one value to the other.
+    fn batch(moves: &[(u8, (u64, u64), (u64, u64))]) -> BundleState {
+        let mut builder = BundleState::builder(1..=1);
+        for (a, (n0, b0), (n1, b1)) in moves {
+            builder = builder
+                .state_original_account_info(addr(*a), info(*n0, *b0))
+                .state_present_account_info(addr(*a), info(*n1, *b1));
+        }
+        builder.build()
+    }
+
+    /// Two batches that both wrote account 5 (a conflict) and the beneficiary 1.
+    fn frozen(index: bool) -> FrozenShards {
+        let shards = OutputShards::with_index_live(addr(1), 8, 4, index, false);
+        shards.add(batch(&[(2, (0, 100), (1, 90)), (5, (0, 50), (0, 60)), (1, (0, 0), (0, 7))]));
+        shards.add(batch(&[(3, (0, 100), (1, 80)), (5, (0, 50), (0, 70)), (1, (0, 0), (0, 7))]));
+        shards.freeze()
+    }
+
+    #[test]
+    fn both_modes_hold_the_same_accounts() {
+        for index in [false, true] {
+            let frozen = frozen(index);
+            assert_eq!(frozen.is_indexed(), index);
+            assert_eq!(frozen.shard_count(), 4, "index {index}");
+            // Account 5 is one account, however many batches wrote it; the beneficiary is not an account here.
+            let held: Vec<u8> = (1..=6).filter(|a| frozen.holds(&addr(*a))).collect();
+            assert_eq!(held, vec![2, 3, 5], "index {index}");
+            assert_eq!(frozen.accounts(), 3, "index {index}");
+            assert!(frozen.get(&addr(9)).is_none());
+            assert_eq!(frozen.get(&addr(2)).and_then(|a| a.info.as_ref()).map(|i| i.balance), Some(U256::from(90u64)));
+            assert_eq!(frozen.get(&addr(3)).and_then(|a| a.info.as_ref()).map(|i| i.nonce), Some(1));
+            // Both batches credited the beneficiary 7: summed, not applied.
+            assert_eq!(frozen.beneficiary_delta(), U256::from(14u64), "index {index}");
+        }
+    }
+
+    #[test]
+    fn conflicting_writes_sum_their_deltas_in_both_modes() {
+        for index in [false, true] {
+            let frozen = frozen(index);
+            let five = frozen.get(&addr(5)).expect("written by both");
+            // Each batch moved 50 -> 60 and 50 -> 70, so the block's net is +10 +20 on the parent's 50.
+            assert_eq!(five.info.as_ref().map(|i| i.balance), Some(U256::from(80u64)), "index {index}");
+            assert_eq!(five.original_info.as_ref().map(|i| i.balance), Some(U256::from(50u64)), "index {index}");
+            if index {
+                assert_eq!(frozen.index_conflicts(), 1);
+            } else {
+                assert_eq!(frozen.index_conflicts(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn the_merge_and_the_view_hold_the_same_accounts_with_and_without_an_executor_change() {
+        for index in [false, true] {
+            let frozen = frozen(index);
+            // The executor changed account 2 again (a withdrawal) and created 8.
+            let residual = BundleState::builder(1..=1)
+                .state_original_account_info(addr(2), info(1, 90))
+                .state_present_account_info(addr(2), info(1, 95))
+                .state_present_account_info(addr(8), info(0, 3))
+                .build();
+            let overlaps = frozen.overlaps(&residual);
+            assert_eq!(overlaps.len(), 1, "only account 2 was written by both");
+            assert_eq!(overlaps[0].0, addr(2));
+            // The newer value over the parent's original.
+            assert_eq!(overlaps[0].1.info.as_ref().map(|i| i.balance), Some(U256::from(95u64)));
+            assert_eq!(overlaps[0].1.original_info.as_ref().map(|i| i.balance), Some(U256::from(100u64)));
+
+            let merged = frozen.merged(&residual);
+            let view = frozen.view(&residual, &overlaps);
+            let mut viewed: Vec<(Address, Option<U256>)> =
+                view.iter().map(|(a, acc)| (**a, acc.info.as_ref().map(|i| i.balance))).collect();
+            viewed.sort_by_key(|(a, _)| *a);
+            let mut merged_accounts: Vec<(Address, Option<U256>)> =
+                merged.state.iter().map(|(a, acc)| (*a, acc.info.as_ref().map(|i| i.balance))).collect();
+            merged_accounts.sort_by_key(|(a, _)| *a);
+            assert_eq!(viewed, merged_accounts, "index {index}: the view is the merge without the copy");
+            assert_eq!(merged.state.len(), 4, "2, 3, 5 and the executor's 8");
+            assert_eq!(merged.state[&addr(2)].info.as_ref().map(|i| i.balance), Some(U256::from(95u64)));
+            assert_eq!(frozen.merged_with(residual.clone()).state.len(), 4);
+            // With nothing for the executor to add, the merge is the shards alone.
+            let bare = frozen.merged(&BundleState::default());
+            assert_eq!(bare.state.len(), 3);
+            assert!(frozen.overlaps(&BundleState::default()).is_empty());
+        }
+    }
+
+    #[test]
+    fn the_timing_accessors_report_in_the_units_they_name() {
+        let at = std::time::Instant::now();
+        let plain = frozen(false);
+        let wall_ms = at.elapsed().as_millis() as u64;
+        // The ranged fold builds no index, and its wall is inside what the caller saw.
+        assert_eq!(plain.index_build_us(), 0);
+        assert!(plain.fold_ms() <= wall_ms, "fold {} ms of {} ms", plain.fold_ms(), wall_ms);
+        assert!(plain.append_ms() <= wall_ms);
+        // One task's own work never exceeds the whole fold's wall.
+        assert!(plain.fold_split().task_max_us <= (plain.fold_ms() + 1) * 1000 + 1000);
+        // The indexed fold reports its index build separately, inside the fold.
+        let indexed = frozen(true);
+        assert!(indexed.index_build_us() / 1000 <= indexed.fold_ms() + 1);
+    }
+
+    #[test]
+    fn a_hashed_post_state_over_a_list_matches_the_bundles() {
+        let bundle = batch(&[(2, (0, 100), (1, 90)), (3, (0, 100), (1, 80)), (4, (2, 5), (3, 6))]);
+        let list: Vec<(&Address, &BundleAccount)> = bundle.state.iter().collect();
+        let from_list = hashed_post_state_of(&list);
+        let from_bundle = HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(bundle.state.iter());
+        assert_eq!(from_list.accounts.len(), 3);
+        assert_eq!(from_list, from_bundle);
+        assert!(!any_destroyed(&list));
+    }
+
+    #[test]
+    fn a_shard_request_is_clamped_to_at_least_one_range() {
+        let shards = OutputShards::with_index_live(addr(1), 0, 0, false, false);
+        shards.add(batch(&[(2, (0, 1), (0, 2))]));
+        let frozen = shards.freeze();
+        assert_eq!(frozen.shard_count(), 1);
+        assert!(frozen.holds(&addr(2)));
+        // An empty block freezes to nothing, and nothing answers.
+        let empty = OutputShards::with_index_live(addr(1), 0, 3, false, false).freeze();
+        assert_eq!((empty.accounts(), empty.beneficiary_delta()), (0, U256::ZERO));
+        assert!(!empty.holds(&addr(2)));
+        assert!(empty.merged(&BundleState::default()).state.is_empty());
+    }
+}

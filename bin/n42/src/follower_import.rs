@@ -1366,6 +1366,126 @@ impl ExecSplit {
     }
 }
 
+/// `N42_FOLLOWER_COPY_ASIDE=1` (default off): a described block's owned
+/// `RecoveredBlock` -- the 163,000 transactions copied out of the queue, the
+/// seal and reth's well-formedness checks, 6-8 ms on the road (loop291-301)
+/// -- is made beside the import instead of before it, and the build path
+/// executes the frames' transactions by reference the moment they are taken
+/// ([`n42_engine_types::parallel_transfer::execute_transfers_build_path_on`]).
+/// What reads the owned block -- the vote road's header and body checks and
+/// its includability check, the post-execution checks, the engine's
+/// hand-off -- waits for it where it reads it ([`LateBlock`]).
+pub fn copy_aside() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_COPY_ASIDE").is_ok_and(|v| v == "1"))
+}
+
+/// The owned block a [`DescribedAside`] is made into beside the import, and
+/// what its copy cost (microseconds), or why it could not be made.
+pub type MadeAside = Result<(RecoveredBlock<Block>, u64), String>;
+
+/// A described block whose owned block is still being made
+/// (`N42_FOLLOWER_COPY_ASIDE=1`): what the build path executes by reference,
+/// and where the owned block arrives.
+#[derive(Debug)]
+pub struct DescribedAside {
+    /// The header, sealed by the hash the description checked it against.
+    pub header: reth_primitives_traits::SealedHeader,
+    /// The withdrawals the body lists (`None` before Shanghai).
+    pub withdrawals: Option<Vec<alloy_eips::eip4895::Withdrawal>>,
+    /// The transactions, held by reference, in block order.
+    pub transactions: Arc<Vec<n42_engine_types::engine_validator::DescribedTx>>,
+    /// Their senders, this node's queue's.
+    pub senders: Arc<Vec<Address>>,
+    /// The owned block, made beside the import.
+    pub made: std::sync::mpsc::Receiver<MadeAside>,
+}
+
+/// The block a foreign import takes: owned, or described with its owned
+/// block made aside ([`copy_aside`]).
+#[derive(Debug)]
+pub enum ForeignBlock {
+    /// The owned, sealed block.
+    Sealed(SealedBlock<Block>),
+    /// A described block, its owned block on the way.
+    Aside(DescribedAside),
+}
+
+impl ForeignBlock {
+    /// How many transactions the block carries.
+    pub fn tx_count(&self) -> usize {
+        match self {
+            Self::Sealed(sealed) => sealed.body().transactions.len(),
+            Self::Aside(aside) => aside.transactions.len(),
+        }
+    }
+}
+
+impl From<SealedBlock<Block>> for ForeignBlock {
+    fn from(sealed: SealedBlock<Block>) -> Self {
+        Self::Sealed(sealed)
+    }
+}
+
+/// The import's owned block: ready, or made aside and waited for by
+/// whichever reader needs it first ([`copy_aside`]). The wait and the copy's
+/// cost are kept for the vote road's line.
+struct LateBlock {
+    ready: std::sync::OnceLock<Result<Arc<RecoveredBlock<Block>>, String>>,
+    made: Mutex<Option<std::sync::mpsc::Receiver<MadeAside>>>,
+    /// The copy's own cost, beside the import.
+    copy_us: std::sync::atomic::AtomicU64,
+    /// How long the first reader waited for it.
+    wait_us: std::sync::atomic::AtomicU64,
+}
+
+impl LateBlock {
+    fn ready(block: Arc<RecoveredBlock<Block>>) -> Self {
+        Self {
+            ready: std::sync::OnceLock::from(Ok(block)),
+            made: Mutex::new(None),
+            copy_us: Default::default(),
+            wait_us: Default::default(),
+        }
+    }
+
+    fn waiting(made: std::sync::mpsc::Receiver<MadeAside>) -> Self {
+        Self {
+            ready: std::sync::OnceLock::new(),
+            made: Mutex::new(Some(made)),
+            copy_us: Default::default(),
+            wait_us: Default::default(),
+        }
+    }
+
+    /// The owned block, waiting for it when it is still being made.
+    fn get(&self) -> Result<&Arc<RecoveredBlock<Block>>, String> {
+        self.ready
+            .get_or_init(|| {
+                let at = std::time::Instant::now();
+                let made = self.made.lock().unwrap_or_else(|p| p.into_inner()).take();
+                let made = match made {
+                    Some(made) => made.recv().map_err(|_| "the owned block's maker went away".to_string()),
+                    None => Err("no owned block and no maker".to_string()),
+                };
+                self.wait_us.store(at.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                let (block, copy_us) = made??;
+                self.copy_us.store(copy_us, std::sync::atomic::Ordering::Relaxed);
+                Ok(Arc::new(block))
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    /// The copy's cost and the first reader's wait, microseconds.
+    fn times(&self) -> (u64, u64) {
+        (
+            self.copy_us.load(std::sync::atomic::Ordering::Relaxed),
+            self.wait_us.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
 /// What the block's road to this node's vote cost before the import began,
 /// and which request carried it.
 ///
@@ -1510,6 +1630,11 @@ struct RoadPhases {
     /// What the check read the parent through: 0 the engine, 1 the merged
     /// output, 2 the shards ([`parent_read_name`]).
     parent_read: u64,
+    /// `N42_FOLLOWER_COPY_ASIDE=1`: the owned block's copy, made beside the
+    /// import (not on the road; not in the line's sum), and how long the
+    /// vote road waited for it.
+    copy_aside_us: u64,
+    copy_wait_us: u64,
 }
 
 impl RoadPhases {
@@ -1605,6 +1730,8 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         road_body_ms = road.road_body_us / 1000,
         road_encode_ms = road.road_encode_us / 1000,
         copy_ms = road.copy_us / 1000,
+        copy_aside_ms = phases.copy_aside_us / 1000,
+        copy_wait_ms = phases.copy_wait_us / 1000,
         header_ms = phases.header_us / 1000,
         senders_ms = phases.senders_us / 1000,
         senders_indexed = phases.senders_indexed,
@@ -1709,11 +1836,11 @@ fn queue_for_senders() -> Option<n42_tx_queue::TxQueue<n42_engine_types::N42Pool
 /// block before the fork sends nothing on it.
 #[allow(clippy::too_many_arguments)]
 pub fn import_foreign_block<Provider, Evm, ChainSpec>(
-    sealed: SealedBlock<Block>,
+    block: ForeignBlock,
     provider: &Provider,
     evm_config: &Evm,
     senders_cache: Option<&reth_evm::SenderRecoveryCache>,
-    given_senders: Option<Vec<Address>>,
+    mut given_senders: Option<Vec<Address>>,
     carry: &Arc<CarriedReads>,
     qmdb: Option<&n42_qmdb_reth::QmdbNodeState>,
     consensus: &(dyn FullConsensus<EthPrimitives> + Send + Sync),
@@ -1738,14 +1865,45 @@ where
     let vote_at: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     // The vote's wait for the parent's fields, out of whichever road waited.
     let parent_fields_wait_us = std::sync::atomic::AtomicU64::new(0);
-    let stage = ImportStage(sealed.number);
+    // `N42_FOLLOWER_COPY_ASIDE=1`: a described block is executed by
+    // reference only where the execution runs beside the vote road on the
+    // build path with this node's own senders; anywhere else its owned block
+    // is waited for here and the import is the one it always was.
+    let by_ref_road = |timestamp: u64| {
+        reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), timestamp)
+            && exec_early()
+            && follower_parallel()
+            && n42_engine_types::parallel_transfer::follower_build_path()
+            && !n42_tx_types::senders_claimed_at_ingest()
+    };
+    // The described block's parts the execution reads by reference, and
+    // where its owned block arrives.
+    let (head, owned, by_ref, made) = match block {
+        ForeignBlock::Sealed(sealed) => (sealed.clone_sealed_header(), Some(sealed), None, None),
+        ForeignBlock::Aside(DescribedAside { header, withdrawals, transactions, senders, made })
+            if by_ref_road(header.timestamp) =>
+        {
+            (header, None, Some((transactions, senders, withdrawals)), Some(made))
+        }
+        ForeignBlock::Aside(aside) => {
+            let (block, _) = aside.made.recv().map_err(|_| "the owned block's maker went away".to_string())??;
+            let (sealed, senders) = block.split_sealed();
+            given_senders = Some(senders);
+            (sealed.clone_sealed_header(), Some(sealed), None, None)
+        }
+    };
+    let stage = ImportStage(head.number);
     stage.at(1);
-    let parent_hash = sealed.parent_hash;
-    let number = sealed.number;
-    let block_hash = sealed.hash();
-    let tx_count = sealed.body().transactions.len();
+    let parent_hash = head.parent_hash;
+    let number = head.number;
+    let block_hash = head.hash();
+    let tx_count = match (&owned, &by_ref) {
+        (Some(sealed), _) => sealed.body().transactions.len(),
+        (None, Some((transactions, _, _))) => transactions.len(),
+        (None, None) => 0,
+    };
 
-    let deferred = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), sealed.timestamp);
+    let deferred = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), head.timestamp);
     // Before the fork the parent must be in already, as it always was: an
     // unknown parent fails here at once and the engine's own path answers
     // SYNCING, with no wait and no sender recovery spent on it. From the
@@ -1771,8 +1929,8 @@ where
     // the execution's ([`two_roads`]); only which error an already invalid
     // block reports first can differ.
     let header_on_vote_road = deferred && exec_early();
-    if !header_on_vote_road {
-        pre_execution_checks(consensus, &sealed)?;
+    if !header_on_vote_road && let Some(sealed) = &owned {
+        pre_execution_checks(consensus, sealed)?;
     }
     let mut phases = RoadPhases { header_us: started.elapsed().as_micros() as u64, ..Default::default() };
     let header_ms = phases.header_us / 1000;
@@ -1804,143 +1962,148 @@ where
         return Err(format!("given {} senders for {tx_count} transactions", claims.len()));
     }
     let cache_hits_out = std::sync::atomic::AtomicU64::new(0);
-    let recovered = match given_senders {
-        Some(senders) if senders.len() != tx_count => {
-            return Err(format!("given {} senders for {tx_count} transactions", senders.len()));
-        }
-        Some(senders) => RecoveredBlock::new_sealed(sealed, senders),
-        None => {
-            let cache_hits = std::sync::atomic::AtomicU64::new(0);
-            // Senders this road computed from a signature rather than read
-            // out of a cache or an index: what the ingest no longer pays for
-            // under `N42_INGEST_VERIFY=leader`.
-            let verified_here = std::sync::atomic::AtomicU64::new(0);
-            let alt_cache = n42_tx_types::AltSigSenderCache::global();
-            let txs: Vec<&TransactionSigned> = sealed.body().transactions().collect();
-            // The transaction queue's by-hash index first, where it is kept:
-            // every transaction of a block this node's ingest has already
-            // seen sits there with the sender that ingest recovered, and
-            // reading one is a shard's read lock rather than a look-up in a
-            // cache sixteen other threads are writing to (34 ms a block on
-            // the fleet at 163,000 transactions, loop202). See
-            // [`senders_in_queue`] for why it may be trusted and what would
-            // catch it if it could not be.
-            let indexed: Vec<Option<Address>> = match given_claims {
-                // The compact body's assembly already read every one of them
-                // out of this node's queue; the index is not asked twice.
-                Some(claims) => claims.into_iter().map(Some).collect(),
-                None => queue_for_senders().map_or_else(Vec::new, |queue| senders_in_queue(&queue, &txs)),
-            };
-            let from_index = indexed.iter().flatten().count();
-            // Under `N42_INGEST_VERIFY=leader` the queue holds the frame's
-            // word for a sender, not this node's recovery of it, so what the
-            // index gives is a claim: something to check the signature
-            // against, never the answer to take. Everything below then falls
-            // through to the caches and, on a miss, to the verification --
-            // which is the whole point of the mode.
-            let (claims, indexed) = if n42_tx_types::senders_claimed_at_ingest() {
-                phases.claims_checked = from_index as u64;
-                (indexed, Vec::new())
-            } else {
-                phases.senders_indexed = from_index as u64;
-                (Vec::new(), indexed)
-            };
-            let mut senders: Vec<Option<Address>> = if !indexed.is_empty() && from_index == tx_count {
-                // Nothing left to look up: the pass below would walk 33 MB
-                // of transactions to read a discriminant per transaction and
-                // decide it already has the answer.
-                indexed
-            } else {
-                use rayon::prelude::*;
-                // Collected into a `Vec<Result>` (written in place) and checked after:
-                // a parallel collect straight into `Result<Vec>` takes rayon's
-                // short-circuiting path, three times the cost at 163,000 items
-                // (round 43, `bench_convert_payload`).
-                let looked_up: Vec<Result<Option<Address>, String>> = txs
-                    .par_iter()
-                    .enumerate()
-                    .map(|(at, tx)| {
-                        if let Some(sender) = indexed.get(at).copied().flatten() {
-                            return Ok(Some(sender));
-                        }
-                        match tx {
-                            TransactionSigned::AltSig(alt) => Ok(alt_cache.get(alt.hash()).inspect(|_| {
-                                cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            })),
-                            TransactionSigned::Eth(_) => {
-                                if let Some(sender) = senders_cache.and_then(|cache| cache.get(tx.tx_hash())) {
-                                    cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let late = match owned {
+        None => LateBlock::waiting(made.ok_or("no block to import")?),
+        Some(sealed) => {
+            let recovered = match given_senders {
+                Some(senders) if senders.len() != tx_count => {
+                    return Err(format!("given {} senders for {tx_count} transactions", senders.len()));
+                }
+                Some(senders) => RecoveredBlock::new_sealed(sealed, senders),
+                None => {
+                    let cache_hits = std::sync::atomic::AtomicU64::new(0);
+                    // Senders this road computed from a signature rather than read
+                    // out of a cache or an index: what the ingest no longer pays for
+                    // under `N42_INGEST_VERIFY=leader`.
+                    let verified_here = std::sync::atomic::AtomicU64::new(0);
+                    let alt_cache = n42_tx_types::AltSigSenderCache::global();
+                    let txs: Vec<&TransactionSigned> = sealed.body().transactions().collect();
+                    // The transaction queue's by-hash index first, where it is kept:
+                    // every transaction of a block this node's ingest has already
+                    // seen sits there with the sender that ingest recovered, and
+                    // reading one is a shard's read lock rather than a look-up in a
+                    // cache sixteen other threads are writing to (34 ms a block on
+                    // the fleet at 163,000 transactions, loop202). See
+                    // [`senders_in_queue`] for why it may be trusted and what would
+                    // catch it if it could not be.
+                    let indexed: Vec<Option<Address>> = match given_claims {
+                        // The compact body's assembly already read every one of them
+                        // out of this node's queue; the index is not asked twice.
+                        Some(claims) => claims.into_iter().map(Some).collect(),
+                        None => queue_for_senders().map_or_else(Vec::new, |queue| senders_in_queue(&queue, &txs)),
+                    };
+                    let from_index = indexed.iter().flatten().count();
+                    // Under `N42_INGEST_VERIFY=leader` the queue holds the frame's
+                    // word for a sender, not this node's recovery of it, so what the
+                    // index gives is a claim: something to check the signature
+                    // against, never the answer to take. Everything below then falls
+                    // through to the caches and, on a miss, to the verification --
+                    // which is the whole point of the mode.
+                    let (claims, indexed) = if n42_tx_types::senders_claimed_at_ingest() {
+                        phases.claims_checked = from_index as u64;
+                        (indexed, Vec::new())
+                    } else {
+                        phases.senders_indexed = from_index as u64;
+                        (Vec::new(), indexed)
+                    };
+                    let mut senders: Vec<Option<Address>> = if !indexed.is_empty() && from_index == tx_count {
+                        // Nothing left to look up: the pass below would walk 33 MB
+                        // of transactions to read a discriminant per transaction and
+                        // decide it already has the answer.
+                        indexed
+                    } else {
+                        use rayon::prelude::*;
+                        // Collected into a `Vec<Result>` (written in place) and checked after:
+                        // a parallel collect straight into `Result<Vec>` takes rayon's
+                        // short-circuiting path, three times the cost at 163,000 items
+                        // (round 43, `bench_convert_payload`).
+                        let looked_up: Vec<Result<Option<Address>, String>> = txs
+                            .par_iter()
+                            .enumerate()
+                            .map(|(at, tx)| {
+                                if let Some(sender) = indexed.get(at).copied().flatten() {
                                     return Ok(Some(sender));
                                 }
-                                // ecrecover is the verification: a sender
-                                // that comes out of it is this node's own,
-                                // whatever the frame claimed.
-                                verified_here.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                tx.recover_signer()
-                                    .map(Some)
-                                    .map_err(|err| format!("sender of {}: {err}", tx.tx_hash()))
-                            }
-                        }
-                    })
-                    .collect();
-                looked_up.into_iter().collect::<Result<Vec<_>, String>>()?
-            };
-            let misses: Vec<usize> = senders.iter().enumerate().filter(|(_, s)| s.is_none()).map(|(i, _)| i).collect();
-            if !misses.is_empty() {
-                use rayon::prelude::*;
-                let batch = n42_tx_types::ed25519_batch_size();
-                let verified: Vec<(usize, Result<Address, n42_tx_types::AltSigError>)> = misses
-                    .par_chunks(batch)
-                    .flat_map_iter(|chunk| {
-                        let refs: Vec<&n42_tx_types::AltSigTx> = chunk
-                            .iter()
-                            .filter_map(|&i| txs[i].as_alt_sig())
+                                match tx {
+                                    TransactionSigned::AltSig(alt) => Ok(alt_cache.get(alt.hash()).inspect(|_| {
+                                        cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    })),
+                                    TransactionSigned::Eth(_) => {
+                                        if let Some(sender) = senders_cache.and_then(|cache| cache.get(tx.tx_hash())) {
+                                            cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            return Ok(Some(sender));
+                                        }
+                                        // ecrecover is the verification: a sender
+                                        // that comes out of it is this node's own,
+                                        // whatever the frame claimed.
+                                        verified_here.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        tx.recover_signer()
+                                            .map(Some)
+                                            .map_err(|err| format!("sender of {}: {err}", tx.tx_hash()))
+                                    }
+                                }
+                            })
                             .collect();
-                        chunk.iter().copied().zip(n42_tx_types::verify_batch(&refs)).collect::<Vec<_>>()
-                    })
-                    .collect();
-                for (i, verdict) in verified {
-                    let sender = verdict.map_err(|err| format!("sender of {}: {err}", txs[i].tx_hash()))?;
-                    alt_cache.insert(*txs[i].tx_hash(), sender);
-                    senders[i] = Some(sender);
+                        looked_up.into_iter().collect::<Result<Vec<_>, String>>()?
+                    };
+                    let misses: Vec<usize> = senders.iter().enumerate().filter(|(_, s)| s.is_none()).map(|(i, _)| i).collect();
+                    if !misses.is_empty() {
+                        use rayon::prelude::*;
+                        let batch = n42_tx_types::ed25519_batch_size();
+                        let verified: Vec<(usize, Result<Address, n42_tx_types::AltSigError>)> = misses
+                            .par_chunks(batch)
+                            .flat_map_iter(|chunk| {
+                                let refs: Vec<&n42_tx_types::AltSigTx> = chunk
+                                    .iter()
+                                    .filter_map(|&i| txs[i].as_alt_sig())
+                                    .collect();
+                                chunk.iter().copied().zip(n42_tx_types::verify_batch(&refs)).collect::<Vec<_>>()
+                            })
+                            .collect();
+                        for (i, verdict) in verified {
+                            let sender = verdict.map_err(|err| format!("sender of {}: {err}", txs[i].tx_hash()))?;
+                            alt_cache.insert(*txs[i].tx_hash(), sender);
+                            senders[i] = Some(sender);
+                        }
+                    }
+                    phases.verified_on_road =
+                        verified_here.load(std::sync::atomic::Ordering::Relaxed) + misses.len() as u64;
+                    let senders: Vec<Address> = senders.into_iter().map(|s| s.expect("every sender resolved")).collect();
+                    // The claim against the signature, where this node holds both.
+                    // A disagreement is the proposer's error -- it built a block on
+                    // a sender nothing verified -- and the vote is not released for
+                    // it. Nothing here depends on the claim being right; this is
+                    // what says so out loud instead of letting the block fail later
+                    // on a nonce nobody can explain.
+                    if !claims.is_empty() {
+                        use rayon::prelude::*;
+                        let mismatch = claims
+                            .par_iter()
+                            .zip(senders.par_iter())
+                            .position_any(|(claim, sender)| matches!(claim, Some(claimed) if claimed != sender));
+                        if let Some(at) = mismatch
+                            && let Some(claimed) = claims[at]
+                        {
+                            CLAIM_MISMATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return Err(format!(
+                                "transaction {at} ({}): its signature says {}, this node's queue was told {claimed}",
+                                txs[at].tx_hash(),
+                                senders[at],
+                            ));
+                        }
+                    }
+                    cache_hits_out.store(cache_hits.into_inner(), std::sync::atomic::Ordering::Relaxed);
+                    RecoveredBlock::new_sealed(sealed, senders)
                 }
-            }
-            phases.verified_on_road =
-                verified_here.load(std::sync::atomic::Ordering::Relaxed) + misses.len() as u64;
-            let senders: Vec<Address> = senders.into_iter().map(|s| s.expect("every sender resolved")).collect();
-            // The claim against the signature, where this node holds both.
-            // A disagreement is the proposer's error -- it built a block on
-            // a sender nothing verified -- and the vote is not released for
-            // it. Nothing here depends on the claim being right; this is
-            // what says so out loud instead of letting the block fail later
-            // on a nonce nobody can explain.
-            if !claims.is_empty() {
-                use rayon::prelude::*;
-                let mismatch = claims
-                    .par_iter()
-                    .zip(senders.par_iter())
-                    .position_any(|(claim, sender)| matches!(claim, Some(claimed) if claimed != sender));
-                if let Some(at) = mismatch
-                    && let Some(claimed) = claims[at]
-                {
-                    CLAIM_MISMATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Err(format!(
-                        "transaction {at} ({}): its signature says {}, this node's queue was told {claimed}",
-                        txs[at].tx_hash(),
-                        senders[at],
-                    ));
-                }
-            }
-            cache_hits_out.store(cache_hits.into_inner(), std::sync::atomic::Ordering::Relaxed);
-            RecoveredBlock::new_sealed(sealed, senders)
+            };
+            // Shared from here on: the executed block hands the engine this same
+            // `Arc`, and a plan made ahead of the execution holds it meanwhile.
+            LateBlock::ready(Arc::new(recovered))
         }
     };
     let cache_hits = cache_hits_out.load(std::sync::atomic::Ordering::Relaxed);
     phases.senders_us = senders_at.elapsed().as_micros() as u64;
     let senders_ms = phases.senders_us / 1000;
-    // Shared from here on: the executed block hands the engine this same
-    // `Arc`, and a plan made ahead of the execution holds it meanwhile.
-    let recovered = Arc::new(recovered);
 
     // `N42_FOLLOWER_PARTITION_AHEAD=1`: the block's senders are known from
     // this point (the compact body's assembly read them out of the queue),
@@ -1955,9 +2118,10 @@ where
     let plan_ahead = (follower_parallel()
         && n42_engine_types::parallel_transfer::follower_partition_ahead()
         && !(deferred && n42_engine_types::parallel_transfer::follower_build_path()))
-    .then(|| {
+    .then(|| late.get().map(Arc::clone))
+    .transpose()?
+    .map(|block| {
         let (planned, plan) = std::sync::mpsc::sync_channel(1);
-        let block = Arc::clone(&recovered);
         let evm_config = evm_config.clone();
         rayon::spawn(move || {
             let made = n42_engine_types::parallel_transfer::plan_transfers(&evm_config, &block);
@@ -1975,16 +2139,31 @@ where
         && follower_parallel()
         && n42_engine_types::parallel_transfer::follower_partition_ahead()
         && n42_engine_types::parallel_transfer::follower_build_path())
-    .then(|| {
+    .then(|| -> Result<_, String> {
         let (made, keys) = std::sync::mpsc::sync_channel(1);
-        let block = Arc::clone(&recovered);
-        n42_engine_types::parallel_transfer::build_pool().spawn(move || {
-            let keys = n42_engine_types::parallel_transfer::build_path_keys(&block);
-            drop(block);
-            let _ = made.send(keys);
-        });
-        keys
-    });
+        // A described block's keys from its transactions by reference
+        // (`N42_FOLLOWER_COPY_ASIDE=1`), the moment its frames are taken.
+        match &by_ref {
+            Some((transactions, senders, _)) => {
+                let (transactions, senders) = (Arc::clone(transactions), Arc::clone(senders));
+                n42_engine_types::parallel_transfer::build_pool().spawn(move || {
+                    let keys = n42_engine_types::parallel_transfer::build_path_keys_of(&transactions, &senders);
+                    drop((transactions, senders));
+                    let _ = made.send(keys);
+                });
+            }
+            None => {
+                let block = Arc::clone(late.get()?);
+                n42_engine_types::parallel_transfer::build_pool().spawn(move || {
+                    let keys = n42_engine_types::parallel_transfer::build_path_keys(&block);
+                    drop(block);
+                    let _ = made.send(keys);
+                });
+            }
+        }
+        Ok(keys)
+    })
+    .transpose()?;
 
     // The parent: in, and under deferred execution executed here, since the
     // header's fields are checked against its result and the transactions
@@ -2018,7 +2197,7 @@ where
     phases.parent_output_wait_us = if parent_output.is_some() { phases.parent_wait_us } else { 0 };
     phases.parent_read = parent_read;
     let parent_output_wait_ms = phases.parent_output_wait_us / 1000;
-    let against_parent = || validate_against_parent(consensus, recovered.sealed_header(), &parent);
+    let against_parent = || validate_against_parent(consensus, &head, &parent);
 
     // How long this import waited for its parent to be *canonical in the
     // engine*, with its execution recorded. This was the one region of the
@@ -2097,6 +2276,8 @@ where
                 "executing before the check; the check and the rest of the vote road run beside the execution"
             );
         } else {
+            let recovered = late.get()?;
+            (phases.copy_aside_us, phases.copy_wait_us) = late.times();
             if header_on_vote_road {
                 let header_at = std::time::Instant::now();
                 pre_execution_checks(consensus, recovered.sealed_block())?;
@@ -2109,7 +2290,7 @@ where
                 provider,
                 parent_hash,
                 parent_state,
-                &recovered,
+                recovered,
                 chain_spec.chain().id(),
                 spec_for_intrinsic_gas(chain_spec, recovered.timestamp),
                 &mut times,
@@ -2270,13 +2451,34 @@ where
                     .ok()
                     .map(|s| n42_engine_types::fast_transfer::doors::CountedDb::new(StateProviderDatabase::new(s)))
             };
-            match n42_engine_types::parallel_transfer::execute_transfers_build_path_keyed(
-                evm_config,
-                &recovered,
-                cached.as_db_mut(StateProviderDatabase::new(&state)),
-                &open,
-                keys,
-            )
+            // A described block (`N42_FOLLOWER_COPY_ASIDE=1`) executes on its
+            // transactions by reference while its owned block is made aside.
+            let executed = match &by_ref {
+                Some((transactions, senders, withdrawals)) => {
+                    n42_engine_types::parallel_transfer::execute_transfers_build_path_on(
+                        evm_config,
+                        n42_engine_types::parallel_transfer::BuildPathBlock {
+                            header: head.header(),
+                            sealed: None,
+                            ommers: &[],
+                            withdrawals: withdrawals.as_deref(),
+                            txs: transactions.as_slice(),
+                            senders: senders.as_slice(),
+                        },
+                        cached.as_db_mut(StateProviderDatabase::new(&state)),
+                        &open,
+                        keys,
+                    )
+                }
+                None => n42_engine_types::parallel_transfer::execute_transfers_build_path_keyed(
+                    evm_config,
+                    late.get()?,
+                    cached.as_db_mut(StateProviderDatabase::new(&state)),
+                    &open,
+                    keys,
+                ),
+            };
+            match executed
             .map_err(|err| format!("parallel execution: {err}"))?
             {
                 Ok((out, phases)) => {
@@ -2296,7 +2498,7 @@ where
                     });
                     let early_root = {
                         let (shards, residual, qmdb) = (Arc::clone(&shards), Arc::clone(&residual), qmdb.clone());
-                        let prague = chain_spec.is_prague_active_at_timestamp(recovered.timestamp);
+                        let prague = chain_spec.is_prague_active_at_timestamp(head.timestamp);
                         root_slot.start(move || {
                             let overlaps = shards.overlaps(&residual.state);
                             let view = shards.view(&residual.state, &overlaps);
@@ -2379,7 +2581,7 @@ where
             };
             match n42_engine_types::parallel_transfer::execute_transfers_planned(
                 evm_config,
-                &recovered,
+                late.get()?,
                 cached.as_db_mut(StateProviderDatabase::new(&state)),
                 &open,
                 plan,
@@ -2481,7 +2683,7 @@ where
             None => Some(
                 evm_config
                     .executor(cached.as_db_mut(StateProviderDatabase::new(&state)))
-                    .execute(&recovered)
+                    .execute(late.get()?)
                     .map_err(|err| format!("execution: {err}"))?,
             ),
         };
@@ -2517,19 +2719,24 @@ where
         Some(roads_at) => {
             // References rather than the values: the vote road's closure is
             // `move`, and the execution road needs the same block and parent.
-            let header = recovered.sealed_header();
+            let header = &head;
             let parent_header = &parent;
             let vote_checked = checked.take();
             let vote_at = &vote_at;
             let parent_fields_wait_us = &parent_fields_wait_us;
-            let block: &RecoveredBlock<Block> = &recovered;
+            let late = &late;
             let chain_id = chain_spec.chain().id();
-            let spec = spec_for_intrinsic_gas(chain_spec, recovered.timestamp);
+            let spec = spec_for_intrinsic_gas(chain_spec, head.timestamp);
             two_roads(
                 number,
                 roads_at,
                 move || {
                     let mut phases = phases;
+                    // The owned block, made aside (`N42_FOLLOWER_COPY_ASIDE=1`)
+                    // while the execution runs on the frames' transactions:
+                    // what the checks below read.
+                    let block: &RecoveredBlock<Block> = late.get()?;
+                    (phases.copy_aside_us, phases.copy_wait_us) = late.times();
                     if early_check && header_on_vote_road {
                         let header_at = std::time::Instant::now();
                         pre_execution_checks(consensus, block.sealed_block())?;
@@ -2574,6 +2781,10 @@ where
             )?
         }
     };
+    // The owned block from here on: the post-execution checks and the
+    // engine's hand-off read it (made aside by now, under the execution).
+    let recovered = Arc::clone(late.get()?);
+    drop(late);
     let prague = chain_spec.is_prague_active_at_timestamp(recovered.timestamp);
     let on_parent_output = executed_parent.is_some();
     // The build path runs the post-execution checks beside its merge, and

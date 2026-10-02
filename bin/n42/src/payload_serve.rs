@@ -189,8 +189,46 @@ pub struct OwnBlockReuse {
 /// parent-state lookup, the carry, the wait for the parent to be canonical in
 /// the engine, the wait for the execution gate, and the wait for the parent's
 /// own QMDB root.
+/// The compact body road's block for the import: owned, or described with
+/// its owned block made aside (`N42_FOLLOWER_COPY_ASIDE=1`), and what the
+/// assembly cost.
+struct RoadBlock {
+    number: u64,
+    txs: usize,
+    block: crate::follower_import::ForeignBlock,
+    payload: alloy_rpc_types_engine::ExecutionData,
+    /// The queue's senders; `None` when the block carries them (aside).
+    senders: Option<Vec<alloy_primitives::Address>>,
+    assemble_us: u64,
+    root_us: u64,
+    miss_wait_us: u64,
+    misses: usize,
+    fill_us: u64,
+    filled: usize,
+    total_us: u64,
+}
+
+impl RoadBlock {
+    fn assembled(assembled: n42_engine_types::engine_validator::AssembledBlock) -> Self {
+        Self {
+            number: assembled.block.number,
+            txs: assembled.block.body().transactions.len(),
+            block: crate::follower_import::ForeignBlock::Sealed(assembled.block),
+            payload: assembled.payload,
+            senders: Some(assembled.senders),
+            assemble_us: assembled.assemble_us,
+            root_us: assembled.root_us,
+            miss_wait_us: assembled.miss_wait_us,
+            misses: assembled.misses,
+            fill_us: assembled.fill_us,
+            filled: assembled.filled,
+            total_us: assembled.total_us,
+        }
+    }
+}
+
 pub type ForeignImport = dyn Fn(
-        SealedBlock<n42_tx_types::Block>,
+        crate::follower_import::ForeignBlock,
         // The senders, when the caller already has them: the compact body
         // road assembles the block out of this node's own queue, which holds
         // each transaction with the sender its ingest recovered.
@@ -1271,7 +1309,7 @@ async fn import_for_validator<T>(
     engine: &ConsensusEngineHandle<T>,
     reuse: Option<&OwnBlockReuse>,
     data: alloy_rpc_types_engine::ExecutionData,
-    pre_converted: Option<SealedBlock<n42_tx_types::Block>>,
+    pre_converted: Option<crate::follower_import::ForeignBlock>,
     // The senders the caller already has: the compact body road's, out of
     // this node's queue. `None` and the import recovers them as it always
     // did.
@@ -1291,7 +1329,7 @@ where
     let mut data = data;
     let number = data.payload.block_number();
     let txs = match (&payload_list, &pre_converted) {
-        (Some(_), Some(block)) => block.body().transactions.len(),
+        (Some(_), Some(block)) => block.tx_count(),
         _ => data.payload.as_v1().transactions.len(),
     };
     // Copied on the blocking pool while the import runs; joined where the
@@ -1358,7 +1396,8 @@ where
             let sealed = match (pre, payload) {
                 (Some(sealed), _) => sealed,
                 (None, Some(payload)) => <n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&validator, payload)
-                    .map_err(|err| format!("conversion: {err}"))?,
+                    .map_err(|err| format!("conversion: {err}"))?
+                    .into(),
                 (None, None) => return Err("no block and no payload to import".to_string()),
             };
             road.convert_us = convert_at.elapsed().as_micros() as u64;
@@ -2058,7 +2097,7 @@ where
                 if !n42_tx_queue::block_by_description() {
                     return validator
                         .convert_compact_body_to_block(announced, profile, body, &queue, miss_wait())
-                        .map(|assembled| (assembled, None))
+                        .map(|assembled| (RoadBlock::assembled(assembled), None))
                         .map_err(CompactRefusal::Refused);
                 }
                 // `N42_BLOCK_BY_DESCRIPTION`: the list checked against the
@@ -2073,8 +2112,39 @@ where
                 // transactions beside it (`import_for_validator`).
                 let payload = described.header_payload();
                 let list = described.take_payload_list();
-                let made = described.maker(&payload).make(&validator).map_err(CompactRefusal::Refused)?;
+                let maker = described.maker(&payload);
                 let senders = std::mem::take(&mut described.senders);
+                // `N42_FOLLOWER_COPY_ASIDE=1`: the owned block is made on the
+                // worker pool beside the import, which executes the frames'
+                // transactions by reference meanwhile; nothing of it is on
+                // the road (`copy_ms` 0, `copy_aside_ms` in the vote road's
+                // line).
+                let (made, senders) = if crate::follower_import::copy_aside() {
+                    let senders = std::sync::Arc::new(senders);
+                    let (made_tx, made_rx) = std::sync::mpsc::sync_channel(1);
+                    let (validator, block_senders) = (std::sync::Arc::clone(&validator), std::sync::Arc::clone(&senders));
+                    rayon::spawn(move || {
+                        let made = maker
+                            .make(&validator)
+                            .map(|made| {
+                                let senders = std::sync::Arc::unwrap_or_clone(block_senders);
+                                (reth_primitives_traits::RecoveredBlock::new_sealed(made.block, senders), made.copy_us)
+                            })
+                            .map_err(|err| format!("the described block: {err}"));
+                        let _ = made_tx.send(made);
+                    });
+                    let aside = crate::follower_import::DescribedAside {
+                        header: reth_primitives_traits::SealedHeader::new(described.header.clone(), described.hash),
+                        withdrawals: described.withdrawals().map(<[_]>::to_vec),
+                        transactions: std::sync::Arc::clone(&described.transactions),
+                        senders,
+                        made: made_rx,
+                    };
+                    ((crate::follower_import::ForeignBlock::Aside(aside), 0), None)
+                } else {
+                    let made = maker.make(&validator).map_err(CompactRefusal::Refused)?;
+                    ((crate::follower_import::ForeignBlock::Sealed(made.block), made.copy_us), Some(senders))
+                };
                 let make_us = make_at.elapsed().as_micros() as u64;
                 let (frames, frames_missing) =
                     (described.frames, (described.frames_missing, described.frame_roots_indexed, described.frame_roots_hashed));
@@ -2088,11 +2158,15 @@ where
                     described.filled,
                     described.total_us,
                 );
+                let (described_number, described_txs) = (described.header.number, described.len());
                 // 163,000 references released, ~4 ms: not on the road.
                 rayon::spawn(move || drop(described));
+                let (block, copy_us) = made;
                 Ok((
-                    n42_engine_types::engine_validator::AssembledBlock {
-                        block: made.block,
+                    RoadBlock {
+                        number: described_number,
+                        txs: described_txs,
+                        block,
                         payload,
                         senders,
                         assemble_us: describe_us.saturating_sub(root_us),
@@ -2103,7 +2177,7 @@ where
                         filled,
                         total_us: described_us + make_us,
                     },
-                    Some((made.copy_us, list, frames, frames_missing, road_parts)),
+                    Some((copy_us, list, frames, frames_missing, road_parts)),
                 ))
             });
             // A miss small enough to be worth asking for: the positions go
@@ -2181,7 +2255,9 @@ where
                 }
                 None => (None, None, 0, (0, 0, 0), (0, 0, 0)),
             };
-            let n42_engine_types::engine_validator::AssembledBlock {
+            let RoadBlock {
+                number: block_number,
+                txs: block_txs,
                 block: sealed,
                 payload: data,
                 senders,
@@ -2197,8 +2273,9 @@ where
                 target: "n42.payload_serve",
                 by_description = copied.is_some(),
                 copy_ms = copied.unwrap_or(0) / 1000,
-                number = sealed.number,
-                txs = sealed.body().transactions.len(),
+                copy_aside = matches!(sealed, crate::follower_import::ForeignBlock::Aside(_)),
+                number = block_number,
+                txs = block_txs,
                 bytes = len,
                 recv_ms = recv.as_millis() as u64,
                 assemble_ms = assemble_us / 1000,
@@ -2248,7 +2325,7 @@ where
                 reuse.as_ref(),
                 data,
                 Some(sealed),
-                Some(senders),
+                senders,
                 payload_list,
                 started,
                 decoded_in,
@@ -2348,7 +2425,7 @@ where
                 dispatch_wait_us,
                 started: started_at,
             };
-            import_for_validator::<T>(&mut stream, &mut out, &engine, reuse.as_ref(), data, Some(sealed), None, None, started, decoded_in, road).await?;
+            import_for_validator::<T>(&mut stream, &mut out, &engine, reuse.as_ref(), data, Some(sealed.into()), None, None, started, decoded_in, road).await?;
             continue;
         }
         if kind == request::NEW_PAYLOAD {

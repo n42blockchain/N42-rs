@@ -27,7 +27,7 @@ use reth_network_types::{
 use std::{
     collections::VecDeque,
     fmt::Display,
-    io::{self},
+    io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
@@ -2911,7 +2911,8 @@ mod tests {
         let peer_id = PeerId::random();
         peer_manager.add_peer(peer_id, PeerAddr::from_tcp(socket_addr), None);
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Age the last tick directly so each reputation update sees a full elapsed second.
+        peer_manager.last_tick -= Duration::from_secs(1);
         peer_manager.tick();
 
         // still unconnected
@@ -2920,7 +2921,7 @@ mod tests {
         // mark as connected
         peer_manager.peers.get_mut(&peer_id).unwrap().state = PeerConnectionState::Out;
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        peer_manager.last_tick -= Duration::from_secs(1);
         peer_manager.tick();
 
         // still at default reputation
@@ -2928,7 +2929,7 @@ mod tests {
 
         peer_manager.peers.get_mut(&peer_id).unwrap().reputation -= 1;
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        peer_manager.last_tick -= Duration::from_secs(1);
         peer_manager.tick();
 
         // tick applied

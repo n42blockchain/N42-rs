@@ -167,7 +167,7 @@ mod codec_tests {
     #[test]
     fn decode_json_rejects_wrong_shape_and_garbage() {
         let err = decode_json::<Vec<u8>>(b"{\"a\":1}").unwrap_err();
-        assert!(matches!(err, StorageError::SerializationError(_)));
+        assert!(matches!(err, StorageError::DeserializationError(_)));
         assert!(decode_json::<u32>(b"").is_err());
         assert!(decode_json::<u32>(b"1 2").is_err(), "trailing data is refused");
     }
@@ -176,11 +176,11 @@ mod codec_tests {
     fn beacon_block_and_state_decode_errors_are_typed() {
         assert!(matches!(
             decode_beacon_block(b"{}"),
-            Err(StorageError::SerializationError(_))
+            Err(StorageError::DeserializationError(_))
         ));
         assert!(matches!(
             decode_beacon_state(b"[1]"),
-            Err(StorageError::SerializationError(_))
+            Err(StorageError::DeserializationError(_))
         ));
     }
 }

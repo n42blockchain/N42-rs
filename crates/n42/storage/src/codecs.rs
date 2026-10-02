@@ -9,7 +9,7 @@
 //! Note: The actual `Compress` and `Decompress` trait implementations
 //! are in `reth-db-api/src/models/beacon.rs` to satisfy Rust's orphan rules.
 
-use crate::StorageResult;
+use crate::{StorageError, StorageResult};
 use n42_primitives::{BeaconBlock, BeaconState};
 
 /// Encode a BeaconState to JSON bytes
@@ -19,7 +19,7 @@ pub fn encode_beacon_state(state: &BeaconState) -> StorageResult<Vec<u8>> {
 
 /// Decode a BeaconState from JSON bytes
 pub fn decode_beacon_state(bytes: &[u8]) -> StorageResult<BeaconState> {
-    serde_json::from_slice(bytes).map_err(Into::into)
+    serde_json::from_slice(bytes).map_err(deserialization_error)
 }
 
 /// Encode a BeaconBlock to JSON bytes
@@ -29,7 +29,7 @@ pub fn encode_beacon_block(block: &BeaconBlock) -> StorageResult<Vec<u8>> {
 
 /// Decode a BeaconBlock from JSON bytes
 pub fn decode_beacon_block(bytes: &[u8]) -> StorageResult<BeaconBlock> {
-    serde_json::from_slice(bytes).map_err(Into::into)
+    serde_json::from_slice(bytes).map_err(deserialization_error)
 }
 
 /// Encode any serializable value to JSON bytes
@@ -39,7 +39,13 @@ pub fn encode_json<T: serde::Serialize>(value: &T) -> StorageResult<Vec<u8>> {
 
 /// Decode any deserializable value from JSON bytes
 pub fn decode_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> StorageResult<T> {
-    serde_json::from_slice(bytes).map_err(Into::into)
+    serde_json::from_slice(bytes).map_err(deserialization_error)
+}
+
+/// A decode failure is a `DeserializationError`; the generic
+/// `From<serde_json::Error>` conversion stays `SerializationError` for encoding.
+fn deserialization_error(err: serde_json::Error) -> StorageError {
+    StorageError::DeserializationError(err.to_string())
 }
 
 #[cfg(test)]

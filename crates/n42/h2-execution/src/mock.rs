@@ -176,6 +176,7 @@ impl MockExecutionLayer {
             execution_data: ExecutionData::from_block_unchecked(hash, &block),
             blob_tx_hashes: Vec::new(),
             header: None,
+            started: None,
         }
     }
 

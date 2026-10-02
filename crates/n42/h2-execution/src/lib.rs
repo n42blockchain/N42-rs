@@ -26,7 +26,7 @@ pub use driver::{
     ImportReport, ImportVerdict,
 };
 pub use el::{
-    BodyOutcome, ChainAhead, ChainBlock, ChainSealer, BuiltBlock, ElError, ExecutionLayer,
+    BodyOutcome, BuildStart, BuildTrigger, ChainAhead, ChainBlock, ChainSealer, BuiltBlock, ElError, ExecutionLayer,
     ForeignBody, ResolveKind,
 };
 pub use execution_path::{ExecutionPath, ExecutionScheduling, ExecutionWorkload};

@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload, PayloadAttributes};
-use n42_h2_execution::{BuiltBlock, ElError, ExecutionDriver, ExecutionLayer, MockExecutionLayer};
+use n42_h2_execution::{
+    BuildStart, BuildTrigger, BuiltBlock, ElError, ExecutionDriver, ExecutionLayer, MockExecutionLayer,
+};
 
 const GENESIS: B256 = B256::ZERO;
 
@@ -37,6 +39,9 @@ enum Direct {
     OnAnotherParent,
     /// Fails.
     Fails,
+    /// Builds the block on the sealed header and says the chain started it
+    /// at the parent's seal, as a chained build does.
+    Chained,
 }
 
 /// A mock that, unlike the plain one, offers the direct build on a sealed
@@ -85,6 +90,11 @@ impl ExecutionLayer for DirectEl {
                 Ok(MockExecutionLayer::built_block_on(header.number + 1, B256::repeat_byte(0xbb)))
             }
             Direct::Fails => Err(ElError::new("the sealed parent is gone")),
+            Direct::Chained => {
+                let mut built = MockExecutionLayer::built_block_on(header.number + 1, header.hash_slow());
+                built.started = Some(BuildStart { at: std::time::Instant::now(), trigger: BuildTrigger::Seal });
+                Ok(built)
+            }
         })
     }
 }
@@ -197,4 +207,30 @@ async fn a_failed_or_misplaced_build_on_the_sealed_block_falls_back_to_the_ordin
     driver.prepare_build_on_sealed(parent, header, attrs(), None).await.expect("requested");
     driver.build_block_on(parent, attrs(), 1).await.expect("rebuilt");
     assert_eq!(driver.last_build_path(), (false, Some("the build prepared ahead extends another parent")));
+}
+
+/// The "proposal sent" line's `build_start_trigger`: a build asked for on the
+/// sealed parent (the request after the previous proposal's send) is `send`,
+/// one the chain started says so itself (`seal`), and one the proposal had to
+/// run on its own path is `commit`.
+#[tokio::test]
+async fn the_build_timing_names_what_started_the_build() {
+    let (header, parent) = sealed_parent();
+
+    let mut asked = driver(Direct::OnTheHeader);
+    let before = std::time::Instant::now();
+    asked.prepare_build_on_sealed_for_view(parent, header.clone(), attrs(), None, None).await.expect("requested");
+    asked.build_block_on(parent, attrs(), 9).await.expect("built");
+    let start = asked.last_build_timing().start.expect("a start is recorded");
+    assert_eq!(start.trigger, BuildTrigger::Send);
+    assert!(start.at >= before);
+
+    let mut chained = driver(Direct::Chained);
+    chained.prepare_build_on_sealed_for_view(parent, header, attrs(), None, None).await.expect("requested");
+    chained.build_block_on(parent, attrs(), 9).await.expect("built");
+    assert_eq!(chained.last_build_timing().start.map(|start| start.trigger), Some(BuildTrigger::Seal));
+
+    let mut on_the_path = ExecutionDriver::new(MockExecutionLayer::new(), GENESIS);
+    on_the_path.build_block_on(GENESIS, attrs(), 1).await.expect("built");
+    assert_eq!(on_the_path.last_build_timing().start.map(|start| start.trigger), Some(BuildTrigger::Commit));
 }

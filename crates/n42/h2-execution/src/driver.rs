@@ -396,6 +396,8 @@ pub struct BuildTiming {
     pub cache_us: u64,
     /// Whether the header was sealed ahead, in the prepared build's task.
     pub presealed: bool,
+    /// When the block's build started and what started it.
+    pub start: Option<crate::el::BuildStart>,
 }
 
 impl std::fmt::Debug for Normalizer {
@@ -441,6 +443,9 @@ struct AheadBuild {
     /// before it ends. `None` for a build on the sealed block, which starts
     /// no job.
     give_up: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// When it was asked for and why; what the "proposal sent" line reports
+    /// when the build itself does not say (a chained build does).
+    requested: crate::el::BuildStart,
 }
 
 impl AheadBuild {
@@ -940,7 +945,16 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             );
             Ok(built)
         });
-        self.prepared = Some(AheadBuild { parent, attrs, task, refused: Default::default(), presealed: Default::default(), give_up: Some(give_up) });
+        let requested = crate::el::BuildStart { at: std::time::Instant::now(), trigger: crate::el::BuildTrigger::Other };
+        self.prepared = Some(AheadBuild {
+            parent,
+            attrs,
+            task,
+            refused: Default::default(),
+            presealed: Default::default(),
+            give_up: Some(give_up),
+            requested,
+        });
         Ok(())
     }
 
@@ -982,6 +996,19 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         attrs: PayloadAttributes,
         chain: Option<crate::el::ChainAhead>,
         view: Option<u64>,
+    ) -> Result<(), ElError> {
+        self.prepare_on_sealed(parent, header, attrs, chain, view, crate::el::BuildTrigger::Send).await
+    }
+
+    /// [`Self::prepare_build_on_sealed_for_view`], naming what asked for it.
+    async fn prepare_on_sealed(
+        &mut self,
+        parent: B256,
+        header: alloy_consensus::Header,
+        attrs: PayloadAttributes,
+        chain: Option<crate::el::ChainAhead>,
+        view: Option<u64>,
+        trigger: crate::el::BuildTrigger,
     ) -> Result<(), ElError> {
         if self.prepared.as_ref().is_some_and(|ahead| ahead.covers(parent, &attrs)) {
             return Ok(());
@@ -1039,7 +1066,8 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 }
             }
         });
-        self.prepared = Some(AheadBuild { parent, attrs, task, refused, presealed, give_up: None });
+        let requested = crate::el::BuildStart { at: std::time::Instant::now(), trigger };
+        self.prepared = Some(AheadBuild { parent, attrs, task, refused, presealed, give_up: None, requested });
         Ok(())
     }
 
@@ -1079,7 +1107,9 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         if let Some(stale) = self.prepared.take() {
             stale.discard();
         }
-        self.prepare_build_on_sealed(parent, header, attrs, chain).await?;
+        // Asked for on the proposal's own path, which follows the quorum.
+        let view = chain.map(|chain| chain.view);
+        self.prepare_on_sealed(parent, header, attrs, chain, view, crate::el::BuildTrigger::Commit).await?;
         Ok("requested")
     }
 
@@ -1176,9 +1206,11 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             }
             Some(prepared) if prepared.parent == parent && prepared.attrs == attrs => {
                 let slot = std::sync::Arc::clone(&prepared.presealed);
+                let requested = prepared.requested;
                 match prepared.task.await {
-                    Ok(Ok(built)) => {
+                    Ok(Ok(mut built)) => {
                         preseal_slot = Some(slot);
+                        built.started = built.started.or(Some(requested));
                         Some(built)
                     }
                     Ok(Err(err)) => {
@@ -1238,7 +1270,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let (mut built, after_fcu, after_resolve, ahead) = match ahead {
             Some(built) => (built, started.elapsed(), started.elapsed(), true),
             None => {
-                let (built, after_fcu) = self.build_now(parent, attrs, started).await?;
+                let (mut built, after_fcu) = self.build_now(parent, attrs, started).await?;
+                // Built on the proposal's path: started by the proposal,
+                // which follows the quorum on the parent.
+                built.started = Some(crate::el::BuildStart { at: started, trigger: crate::el::BuildTrigger::Commit });
                 (built, after_fcu, started.elapsed(), false)
             }
         };
@@ -1290,6 +1325,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             seal_us: after_seal.saturating_sub(after_resolve).as_micros() as u64,
             cache_us: after_cache.saturating_sub(after_seal).as_micros() as u64,
             presealed: was_presealed,
+            start: built.started,
         };
 
         info!(

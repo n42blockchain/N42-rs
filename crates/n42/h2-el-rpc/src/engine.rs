@@ -906,6 +906,7 @@ pub fn built_block_from_envelope(
         header: None,
         tx_hashes: Vec::new(),
         frame_layout: Vec::new(),
+        started: None,
     })
 }
 
@@ -2002,6 +2003,7 @@ pub fn built_block_from_parts(
         header: Some(header),
         tx_hashes: Vec::new(),
         frame_layout: Vec::new(),
+        started: None,
     })
 }
 

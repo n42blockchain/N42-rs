@@ -105,6 +105,50 @@ pub struct BuiltBlock {
     /// transactions the block holds) in block order. What the frame
     /// description names. Empty otherwise.
     pub frame_layout: Vec<(B256, u32)>,
+    /// When the build of this block started and what started it, when the
+    /// layer that started it knows (a chained build: the parent's seal, or
+    /// the previous proposal's send with `N42_BUILD_AHEAD_AT_SEAL`). `None`
+    /// leaves it to the driver, which knows when it asked.
+    pub started: Option<BuildStart>,
+}
+
+/// What started a leader's build, for the "proposal sent" line
+/// (`build_start_trigger`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildTrigger {
+    /// The parent's seal: the chain started it on the header the execution
+    /// layer handed back the moment the parent sealed.
+    Seal,
+    /// A proposal's send: the request the leader makes right after
+    /// publishing the previous block, or (`N42_BUILD_AHEAD_AT_SEAL`) the
+    /// chain's start deferred to the send of the block before the parent.
+    Send,
+    /// The proposal itself: nothing was prepared, so the build ran on the
+    /// proposal's path, which follows the quorum on the parent.
+    Commit,
+    /// Anything else: a build ahead asked for at an import's completion.
+    Other,
+}
+
+impl BuildTrigger {
+    /// The log spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Seal => "seal",
+            Self::Send => "send",
+            Self::Commit => "commit",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// When a build started and what started it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuildStart {
+    /// The instant the build was asked for.
+    pub at: std::time::Instant,
+    /// What asked for it.
+    pub trigger: BuildTrigger,
 }
 
 /// What a caller passes with a build request when it will want the block

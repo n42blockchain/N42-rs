@@ -349,3 +349,7 @@ fn export(args: ExportArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     println!("QMDB snapshot: {} bytes -> {}", portable.len(), args.qmdb_out.display());
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "init_snapshot_tests.rs"]
+mod tests;

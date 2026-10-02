@@ -355,6 +355,10 @@ pub struct H2Service<E> {
     /// a view, so the retries of a leader whose build fell back do not send
     /// the request again every step.
     first_on_output_view: Option<u64>,
+    /// When this leader's previous proposal went out: what the "proposal
+    /// sent" line measures the next build's start from
+    /// (`build_start_after_prev_send_us`).
+    last_proposal_sent_at: Option<std::time::Instant>,
     body_requested_at: std::collections::HashMap<B256, std::time::Instant>,
     body_requested_order: std::collections::VecDeque<B256>,
     /// Height of the last block the execution layer is known to have
@@ -846,6 +850,27 @@ fn build_chain() -> bool {
     *ON.get_or_init(|| std::env::var("N42_BUILD_CHAIN").is_ok_and(|value| value != "0"))
 }
 
+/// The "proposal sent" line's build start: how long after this leader's
+/// previous proposal the build of this block started (negative: before it,
+/// the chain's start at the parent's seal), and what started it. Zero when
+/// either instant is unknown (the first proposal of a run).
+fn build_start_fields(
+    start: Option<n42_h2_execution::BuildStart>,
+    previous_send: Option<std::time::Instant>,
+) -> (i64, &'static str) {
+    let trigger = start.map_or("other", |start| start.trigger.as_str());
+    let after = match (start, previous_send) {
+        (Some(start), Some(sent)) if start.at >= sent => {
+            i64::try_from(start.at.duration_since(sent).as_micros()).unwrap_or(i64::MAX)
+        }
+        (Some(start), Some(sent)) => {
+            -i64::try_from(sent.duration_since(start.at).as_micros()).unwrap_or(i64::MAX)
+        }
+        _ => 0,
+    };
+    (after, trigger)
+}
+
 /// `N42_TENURE_FIRST_ON_OUTPUT=1` (defect 18b, `docs/FLEET7_PLAN_V4.md`
 /// 7.13): the first build of a tenure is asked for on the parent's published
 /// output -- the execution layer's follower execution of the previous
@@ -978,6 +1003,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             direct_push: false,
             build_on_seal: std::env::var("N42_BUILD_ON_SEAL").is_ok_and(|v| v != "0"),
             first_on_output_view: None,
+            last_proposal_sent_at: None,
             body_requested_at: std::collections::HashMap::new(),
             body_requested_order: std::collections::VecDeque::new(),
             imported_height: None,
@@ -2803,6 +2829,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // engine's proposal (its vote persisted first) and the gossip
                 // publish.
                 let timing = self.driver.last_build_timing();
+                let sent_at = std::time::Instant::now();
+                let (build_start_after_prev_send_us, build_start_trigger) =
+                    build_start_fields(timing.start, self.last_proposal_sent_at);
+                self.last_proposal_sent_at = Some(sent_at);
                 info!(
                     target: "n42.h2.node",
                     view,
@@ -2817,6 +2847,8 @@ impl<E: ExecutionLayer> H2Service<E> {
                     describe_us,
                     publish_us = publish_at.elapsed().as_micros() as u64,
                     tick_to_send_us = timeline_from.elapsed().as_micros() as u64,
+                    build_start_after_prev_send_us,
+                    build_start_trigger,
                     "proposal sent"
                 );
                 // Build-on-seal: the next build starts here, on this block's
@@ -4063,6 +4095,23 @@ mod tests {
         assert_eq!(head_stamp(Some(1_700_000_000), Some(&header)), Some(1_700_000_000), "what the node saw wins");
         assert_eq!(head_stamp(None, Some(&header)), Some(1_700_000_042), "a restart reads the header");
         assert_eq!(head_stamp(None, None), None, "genesis, which has no parent at all");
+    }
+
+    /// The "proposal sent" line's build start: signed against the previous
+    /// send (a chained build starts before it), its trigger named, and
+    /// zero / "other" when nothing is known.
+    #[test]
+    fn the_build_start_is_measured_from_the_previous_send() {
+        use n42_h2_execution::{BuildStart, BuildTrigger};
+        let sent = std::time::Instant::now();
+        let later = sent + std::time::Duration::from_millis(80);
+        let at_send = BuildStart { at: later, trigger: BuildTrigger::Send };
+        assert_eq!(build_start_fields(Some(at_send), Some(sent)), (80_000, "send"));
+        let at_seal = BuildStart { at: sent, trigger: BuildTrigger::Seal };
+        assert_eq!(build_start_fields(Some(at_seal), Some(later)), (-80_000, "seal"));
+        let on_the_path = BuildStart { at: later, trigger: BuildTrigger::Commit };
+        assert_eq!(build_start_fields(Some(on_the_path), None), (0, "commit"));
+        assert_eq!(build_start_fields(None, Some(sent)), (0, "other"));
     }
 }
 

@@ -1379,3 +1379,31 @@ one configuration); ONP90 reads 1.190M, and at pacing 90 the proposal median is 
 record 1,226,047. Window 2 is not a metric (ONb 724k on a 76.8% occupancy; the other three 863-880k). Correctness: `own block at this height was not
 the one committed` 0, `Encountered invalid block` 0, `no gov5 header variant` 0 on all four legs; `TC formed` 1 per leg; `superseded` 1 per leg on the
 three ON legs and 7 on OFF. Not determined: why the early start shortens the cycle's lower half and leaves its mean.
+
+### 10.56 The reth v2.7.0 upgrade on the fleet (loop308): correct, and the follower's execution is three times slower
+
+BASE is the tip e96377cc3 (reth v2.5.1), UP is branch `upgrade/reth-v2.7.0` at d50328c0c (reth v2.7.0), both built native; the configuration is that of
+10.54 S (copy-aside, scratch on, 100 ms pacing, three nodes). The first UP and UPb legs did not start: v2.7.0 validates `--engine.num-state-masking-blocks`
+(default 30) + `--engine.memory-block-buffer-target` (6) < `--engine.persistence-threshold` (8, the bench's) and the execution layer exits at launch
+(`loop308.out`). The UP legs in the table were rerun in `loop308b.out` with `RETH_ENGINE_NUM_STATE_MASKING_BLOCKS=0` (masking off), so the order is BASE,
+BASEb, UP, UPb, BASEc (BASEc added as a drift check), not the planned interleave. All five legs read `verify` pass, one commitment hash across the three nodes.
+
+| leg | win1 | win2 | cycle mean / median | sealed_at median / p90 | par_exec / roots (ms) | follower exec / root / fields ready (ms) | imports > 600 ms | root faults p90 | peak el max (G) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| BASE | 1,128,341 | 828,415 | 142 / 126 | 80 / 148 | 30 / 34 | 43 / 30 / 93 | 13 | 371 | 30.5 |
+| BASEb | 1,164,397 | 922,953 | 138 / 119 | 80 / 129 | 30 / 34 | 41 / 30 / 86 | 8 | 482 | 32.0 |
+| BASEc | 1,158,268 | 809,488 | 138 / 132 | 79 / 146 | 30 / 33 | 43 / 30 / 90 | 5 | 496 | 29.5 |
+| UP | 573,396 | 565,048 | 282 / 229 | 171 / 404 | 25 / 29 | 121 / 28 / 229 | 83 | 821 | 21.5 |
+| UPb | 562,228 | 554,181 | 281 / 259 | 167 / 402 | 25 / 29 | 112 / 28 / 219 | 64 | 931 | 21.3 |
+
+Correctness is unchanged: on all five legs `invalid_blocks`, `no_variant`, `own_not_committed`, `unanswered_reads`, `direct_imports_failed`, `incomplete`,
+`gas_mismatch` and `proposals_given_up` are 0 and `tc` is 1 (the genesis timeout); no `ERROR` or `panicked` line appears on any. The only warning message
+that occurs on UP legs and not on BASE legs is `foreign body refused; sending the payload` (3 on UP, 1 on UPb, 0 on the three BASE legs: a compact body
+whose transactions this node did not hold, answered by sending the payload); the `forest lock` warnings are 4-5 times fewer on UP, as the legs carry half the
+load. Performance is not unchanged: win1 reads 562-573k on UP against 1.128-1.164M on BASE (-50%), far outside the ~4% spread of one configuration (BASE legs
+span 3.2%), and the cycle mean doubles 138-142 -> 281-282 ms. The follower's batched execution is the difference that is measured: `imp_exec_batches_ms`
+33-34 -> 107-114 and the batch median 13 -> 75-79 ms (54 batches, 32 threads on both), so a block's fields are ready at 219-229 ms instead of 86-93, and
+`sealed_at` moves 80 -> 167-171 ms with it; the leader's own `par_exec` (25 against 30 ms) and the follower's root (28 against 30 ms) did not slow. Window 2 and 3
+hold at 554-565k on UP, where BASE's window 2 falls to 809-923k and window 3 reads 0 (the supply is spent), because UP spends fewer transactions per window. Not
+determined: why the follower's execution batches are slower on v2.7.0 (revm, the execution-layer crates or the masking-off setting are all untested here); the
+leg ran with masking off, so the default masking was not measured at all.

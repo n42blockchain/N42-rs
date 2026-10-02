@@ -351,7 +351,7 @@ pub struct ForgetTimes {
     /// or the partition. `partition_us` is the comparison's time then.
     pub whole: bool,
     /// The taken list's length at the hand-off, against the body's: why
-    /// the whole hand-over did not match (docs/BREAKTHROUGH_DESIGN.md 10.34:
+    /// the whole hand-over did not match (`docs/BREAKTHROUGH_DESIGN.md` 10.34:
     /// it never did on the fleet), with [`Self::first_miss`].
     pub taken_len: usize,
     /// With equal lengths, the first position whose (sender, nonce) differs

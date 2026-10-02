@@ -49,6 +49,14 @@ pub type FastExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<reth_chai
 pub struct Phases {
     /// Partitioning the transactions into conflict-free groups.
     pub partition_ms: u64,
+    /// [`execute_for_build_in_place`] and its kin: from the call's entry to
+    /// the batches' start (the partition, the hook before the batches, the
+    /// read set, the slots), microseconds -- the leader's gap before the
+    /// execution, with what the caller did before the call.
+    pub batches_start_us: u64,
+    /// From the call's entry to the batches' end, microseconds: the caller
+    /// names the gap after the execution from here.
+    pub batches_end_us: u64,
     /// Of `partition_ms`: the transactions' EVM environments, built on the
     /// worker pool.
     pub env_us: u64,
@@ -3231,6 +3239,7 @@ where
     let beneficiary = evm_env.block_env.beneficiary;
     let mut phases = Phases::default();
     let at = std::time::Instant::now();
+    let call_at = at;
     let groups = partition_by_sender(keys, beneficiary)?;
     phases.groups = groups.len();
     // Batches of whole groups, about equal in transfers: a couple of
@@ -3267,6 +3276,7 @@ where
     type BatchResult = (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, BatchSpan, LoopTimers);
     // Each batch's span on the pool, against this instant (`BatchSpans`).
     let batches_at = std::time::Instant::now();
+    phases.batches_start_us = batches_at.duration_since(call_at).as_micros() as u64;
     let results: Vec<Result<BatchResult, NotParallel>> = pool.install(|| {
         use rayon::prelude::*;
         batches
@@ -3361,6 +3371,7 @@ where
             .collect()
     });
     let batches_us = batches_at.elapsed().as_micros() as u64;
+    phases.batches_end_us = call_at.elapsed().as_micros() as u64;
     phases.groups_ms = at.elapsed().as_millis() as u64;
     if let Some(set) = block_read_set {
         (phases.read_set_hits, phases.read_set_misses) = set.counts();
@@ -7003,7 +7014,10 @@ mod tests {
             });
             drop((old_body, transactions, senders, refs));
             println!(
-                "round {round} (root job {with_root}, body job {with_body}, live {live}): exec {} ms, append {} ms of pool time, freeze {} us (index build {} us, conflicts {}), commit 4 passes {} us / fused {} us (refs+gas {} us){}, split {:?}, batches {:?}",
+                "round {round} (root job {with_root}, body job {with_body}, live {live}): partition {} ms, batches start {} us / end {} us, exec {} ms, append {} ms of pool time, freeze {} us (index build {} us, conflicts {}), commit 4 passes {} us / fused {} us (refs+gas {} us){}, split {:?}, batches {:?}",
+                run.phases.partition_ms,
+                run.phases.batches_start_us,
+                run.phases.batches_end_us,
                 run.phases.groups_ms,
                 frozen.append_ms(),
                 freeze_us,

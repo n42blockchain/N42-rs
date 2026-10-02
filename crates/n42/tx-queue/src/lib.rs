@@ -350,6 +350,13 @@ pub struct ForgetTimes {
     /// in it is mined and the list is handed over whole, without the fold
     /// or the partition. `partition_us` is the comparison's time then.
     pub whole: bool,
+    /// The taken list's length at the hand-off, against the body's: why
+    /// the whole hand-over did not match (docs/BREAKTHROUGH_DESIGN.md 10.34:
+    /// it never did on the fleet), with [`Self::first_miss`].
+    pub taken_len: usize,
+    /// With equal lengths, the first position whose (sender, nonce) differs
+    /// from the body's; `usize::MAX` when not compared or none differs.
+    pub first_miss: usize,
 }
 
 /// How many transactions the queue let go of since the last report, by
@@ -1575,14 +1582,20 @@ impl<T: PoolTransaction> TxQueue<T> {
             // lists position by position decides that, instead of folding
             // 163,000 pairs into a map and then partitioning the list
             // (docs/BREAKTHROUGH_DESIGN.md 10.32, `start_handoff_ms`).
+            times.taken_len = taken.len();
+            times.first_miss = usize::MAX;
             if taken.len() == len {
                 let at = std::time::Instant::now();
                 let list: &[Arc<ValidPoolTransaction<T>>] = taken;
-                let whole = pool.install(|| {
-                    list.par_iter().with_min_len(1024).enumerate().all(|(i, t)| mined_at(i) == (t.sender(), t.nonce()))
+                let miss = pool.install(|| {
+                    list.par_iter()
+                        .with_min_len(1024)
+                        .enumerate()
+                        .position_first(|(i, t)| mined_at(i) != (t.sender(), t.nonce()))
                 });
                 times.partition_us = at.elapsed().as_micros() as u64;
-                if whole {
+                times.first_miss = miss.unwrap_or(usize::MAX);
+                if miss.is_none() {
                     times.whole = true;
                     return (std::mem::take(taken), times);
                 }

@@ -665,6 +665,8 @@ struct BuildOnOwnTimes {
     /// whole (`ForgetTimes::whole`): no fold, `queue_partition_us` is the
     /// comparison.
     queue_whole: bool,
+    queue_taken_len: usize,
+    queue_first_miss: usize,
 }
 
 /// The next block, built on a block this node built and consensus has just
@@ -1047,6 +1049,8 @@ async fn build_on_sealed_output(
         times.queue_lock_us = forget.lock_us;
         times.queue_partition_us = forget.partition_us;
         times.queue_whole = forget.whole;
+        times.queue_taken_len = forget.taken_len;
+        times.queue_first_miss = forget.first_miss;
     }
     Ok((payload??, times, chain, want_hashes))
 }
@@ -2044,6 +2048,8 @@ where
                         queue_lock_us = times.queue_lock_us,
                         queue_partition_us = times.queue_partition_us,
                         queue_whole = times.queue_whole,
+                        queue_taken_len = times.queue_taken_len,
+                        queue_first_miss = times.queue_first_miss,
                         on_output = times.on_output,
                         rename_ms = times.rename_ms,
                         spawn_ms = times.spawn_ms,

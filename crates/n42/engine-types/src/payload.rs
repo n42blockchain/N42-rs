@@ -1425,6 +1425,17 @@ where
     let mut tx_root_wait_ms = 0u64;
     // The lookahead and the puller given back before the ahead seal, ms.
     let mut give_back_ms = 0u64;
+    // The leader's seal chain between its named terms (step 7a): the prep's
+    // end to the batches' start (the prefetch's scope, the shards and the
+    // threads set up, the partition, the deferred state's open, the slots),
+    // the batches' end to the commit's start less the index (`index_ms`, the
+    // shards' freeze: the collect, the release, the joins, the deferred
+    // state's re-check), and the commit's end to the seal's own start (the
+    // body's match, the lookahead and the puller given back).
+    let mut gap_before_exec_ms = 0u64;
+    let mut gap_after_exec_ms = 0u64;
+    let mut gap_before_seal_ms = 0u64;
+    let mut index_ms = 0u64;
     // Where the leader's time from the build's start to the seal goes, beside
     // the fields that already name it (plan v6, the seal gap). With the
     // parallel step taken, `sealed_at_ms` is, within a ms or two of rounding:
@@ -1767,6 +1778,7 @@ where
             // once the step's threads are joined.
             let mut deferred_state_err: Option<PayloadBuilderError> = None;
             let mut exec_returned: Option<std::time::Instant> = None;
+            let mut run_started: Option<std::time::Instant> = None;
             let (executed, mut graft_target, root_ahead) = std::thread::scope(|scope| {
                 let target = prefault.then(|| {
                     let accounts = keys.len() + keys.len() / 4;
@@ -1783,6 +1795,7 @@ where
                 });
                 pre_exec_ms = pre_exec_at.elapsed().as_millis() as u64;
                 let run_at = std::time::Instant::now();
+                run_started = Some(run_at);
                 let executed = if defer_state {
                     // After the partition, before the batches: the builder's
                     // own state opened (the wait for a sealed parent's output
@@ -1827,7 +1840,10 @@ where
                     let beneficiary = group_env.block_env.beneficiary;
                     // The batches are done: the fold, a task a shard on the
                     // build pool.
+                    let freeze_at = std::time::Instant::now();
                     let sharded_out = sharded_out.map(crate::output_shards::OutputShards::freeze);
+                    let index_us = freeze_at.elapsed().as_micros() as u64;
+                    index_ms = index_us / 1_000;
                     if let Some(shards) = sharded_out.as_ref() {
                         out_shards = shards.shard_count();
                         shard_append_ms = shards.append_ms();
@@ -1836,6 +1852,14 @@ where
                     par_collect_ms = run.phases.collect_ms;
                     par_release_ms = run.phases.release_ms;
                     let fold_at = std::time::Instant::now();
+                    if let Some(run_at) = run_started {
+                        gap_before_exec_ms = (run_at.saturating_duration_since(prep_done).as_micros() as u64)
+                            .saturating_add(run.phases.batches_start_us)
+                            / 1_000;
+                        let exec_end = run_at + std::time::Duration::from_micros(run.phases.batches_end_us);
+                        gap_after_exec_ms =
+                            (fold_at.saturating_duration_since(exec_end).as_micros() as u64).saturating_sub(index_us) / 1_000;
+                    }
                     // `N42_SEAL_AT_EXEC=1`: the passes over the slots between the
                     // execution's end and the seal run on the build pool (each
                     // serial pass strides 163k slots of ~470 bytes).
@@ -2031,6 +2055,7 @@ where
                     // are put back into it below, and nothing else is.
                     let keep_cache = !(sealing_early || (build_graft_no_cache() && block_full && withdrawals_clear));
                     par_commit_ms = fold_at.elapsed().as_millis() as u64;
+                    let commit_end = std::time::Instant::now();
                     let _ = executed_count;
                     // `N42_SEAL_AT_EXEC=1`: sealed and proposed here, with the
                     // body just collected; everything below -- the graft, the
@@ -2068,6 +2093,7 @@ where
                         }
                         drop(pulled.take());
                         give_back_ms = seal_at.elapsed().as_millis() as u64;
+                        gap_before_seal_ms = commit_end.elapsed().as_millis() as u64;
                         let sealed = seal_block!(hook, seal_at, if matches { root_ahead } else { None });
                         sealed_ahead_id = Some((sealed.2, sealed.3));
                         sealed_ahead = Some(sealed);
@@ -2950,6 +2976,10 @@ where
                     seal_root_ms,
                     seal_frames_indexed,
                     seal_frames_hashed,
+                    gap_before_exec_ms,
+                    gap_after_exec_ms,
+                    gap_before_seal_ms,
+                    index_ms,
                     // `N42_STATE_AFTER_PULL=1` (plan v6 G3): the parent's state
                     // opened after the pull, prep and partition, and the time
                     // inside that open (0 with the flag off: the open is then

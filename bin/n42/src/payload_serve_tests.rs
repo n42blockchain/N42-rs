@@ -539,3 +539,36 @@ async fn an_engine_that_drops_the_request_is_reported_as_unavailable() {
     let message = read_error(&mut client).await;
     assert!(message.to_lowercase().contains("engine"), "{message}");
 }
+
+fn unset(name: &str) -> bool {
+    std::env::var_os(name).is_none()
+}
+
+/// The experiment switches read once per process default to the shipped
+/// behaviour; each is checked only when the environment leaves it alone.
+#[test]
+fn the_experiment_switches_default_to_the_shipped_behaviour() {
+    for (name, read) in [
+        ("N42_BUILD_START_ASYNC", build_start_async as fn() -> bool),
+        ("N42_BUILD_ON_OUTPUT", build_on_output),
+        ("N42_TENURE_FIRST_ON_OUTPUT", tenure_first_on_output),
+        ("N42_BUILD_ON_SEAL", build_on_seal),
+        ("N42_RAW_SHARED_DECODE", raw_shared_decode),
+        ("N42_PAYLOAD_SERVE_FRESH_BUFFERS", fresh_buffers),
+        ("N42_QUEUE_WORK_OFFLOAD", queue_work_offload),
+        ("N42_DIRECT_FAST_ANSWER", direct_fast_answer),
+    ] {
+        if unset(name) {
+            assert!(!read(), "{name} is off by default");
+        }
+    }
+    if unset("N42_PRUNE_ASYNC") {
+        assert!(prune_async(), "the prune runs beside the answer by default");
+    }
+    if unset("N42_COMPACT_BODY_FILL") {
+        assert_eq!(fill_share(), 2, "up to half a block is fetched by index");
+    }
+    if unset("N42_COMPACT_BODY_WAIT") {
+        assert_eq!(miss_wait(), std::time::Duration::from_millis(20));
+    }
+}

@@ -37,6 +37,7 @@ completion(.failure(.rustError(msg))) }
         return .success(String(cString: jsonPtr))
     }
 
+    /// `depositValueInWei`: decimal, or hex with a `0x` prefix (a bare string is decimal).
     public static func createDepositUnsignedTx(
         depositContractAddress: String,
         validatorPrivateKey: String,
@@ -73,6 +74,7 @@ completion(.failure(.rustError(msg))) }
         return .success(String(cString: jsonPtr))
     }
 
+    /// `feeInWeiOrEmpty`: nil/empty for the default fee, else decimal or `0x`-prefixed hex.
     public static func createExitUnsignedTx(
         validatorPublicKey: String,
         feeInWeiOrEmpty: String?

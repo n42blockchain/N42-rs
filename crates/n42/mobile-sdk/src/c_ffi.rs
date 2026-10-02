@@ -28,6 +28,32 @@ fn cstr_to_string(c: *const c_char) -> Result<String, String> {
     }
 }
 
+/// Parses an amount in wei passed across the C boundary.
+///
+/// A string with a `0x`/`0X` prefix is hex; a string without a prefix is decimal.
+/// Anything else (empty, a bare prefix, other characters, a value above `U256::MAX`)
+/// is an error, never a silently different amount.
+fn parse_wei(s: &str) -> Result<U256, ()> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(());
+        }
+        let digits = hex.trim_start_matches('0');
+        if digits.len() > 64 {
+            return Err(());
+        }
+        if digits.is_empty() {
+            return Ok(U256::zero());
+        }
+        U256::from_str_radix(digits, 16).map_err(|_| ())
+    } else {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(());
+        }
+        U256::from_dec_str(s).map_err(|_| ())
+    }
+}
+
 fn make_c_string(s: String) -> *mut c_char {
     match CString::new(s) {
         Ok(cs) => cs.into_raw(),
@@ -150,6 +176,12 @@ pub unsafe extern "C" fn generate_bls12_381_keypair_c(out_error: *mut *mut c_cha
 }
 
 // ---------------- create_deposit_unsigned_tx ----------------
+/// Builds an unsigned deposit transaction as JSON.
+///
+/// `deposit_value_in_wei` is decimal (`"32000000000000000000"`) or `0x`-prefixed hex
+/// (`"0x1bc16d674ec800000"`); a bare string is always decimal, and anything else is
+/// reported through `out_error`.
+///
 /// # Safety
 ///
 /// Every pointer must be null or valid for the whole call: `*const c_char`
@@ -201,7 +233,7 @@ pub unsafe extern "C" fn create_deposit_unsigned_tx_c(
             return ptr::null_mut();
         }
     };
-    let value = match val_str.parse::<U256>() {
+    let value = match parse_wei(&val_str) {
         Ok(v) => v,
         Err(_) => {
             set_error("invalid deposit value".into());
@@ -266,6 +298,12 @@ pub unsafe extern "C" fn create_get_exit_fee_unsigned_tx_c(out_error: *mut *mut 
 }
 
 // ---------------- create_exit_unsigned_tx ----------------
+/// Builds an unsigned exit transaction as JSON.
+///
+/// `fee_in_wei_or_empty` is null or empty for the default fee (1 wei), otherwise decimal
+/// or `0x`-prefixed hex; a bare string is always decimal, and anything else is reported
+/// through `out_error`.
+///
 /// # Safety
 ///
 /// Every pointer must be null or valid for the whole call: `*const c_char`
@@ -300,7 +338,7 @@ pub unsafe extern "C" fn create_exit_unsigned_tx_c(
     } else {
         match cstr_to_string(fee_in_wei_or_empty) {
             Ok(s) if s.is_empty() => None,
-            Ok(s) => match s.parse::<U256>() {
+            Ok(s) => match parse_wei(&s) {
                 Ok(v) => Some(v),
                 Err(_) => {
                     set_error("invalid fee".into());
@@ -458,16 +496,51 @@ mod tests {
     }
 
     #[test]
+    fn an_exit_fee_without_a_prefix_is_decimal() {
+        let pk = c(PUBKEY);
+        for (fee, expected) in [("100", "0x64"), ("0X10", "0x10"), ("16", "0x10")] {
+            let fee = c(fee);
+            let (out, err) = exit(pk.as_ptr(), fee.as_ptr());
+            assert!(err.is_none(), "{err:?}");
+            let tx: Value = serde_json::from_str(&unsafe { take(out) }).unwrap();
+            assert_eq!(tx["value"], expected);
+        }
+    }
+
+    #[test]
+    fn wei_amounts_are_hex_with_a_prefix_and_decimal_without() {
+        assert_eq!(parse_wei("100"), Ok(U256::from(100u64)));
+        assert_eq!(parse_wei("0x100"), Ok(U256::from(256u64)));
+        assert_eq!(parse_wei("0X0"), Ok(U256::zero()));
+        assert_eq!(parse_wei("0"), Ok(U256::zero()));
+        assert_eq!(parse_wei(&format!("0x{}", "f".repeat(64))), Ok(U256::MAX));
+        assert_eq!(parse_wei(&format!("0x{}1", "0".repeat(70))), Ok(U256::one()));
+        assert_eq!(parse_wei(&U256::MAX.to_string()), Ok(U256::MAX));
+        // Bare hex letters, an empty string, a bare prefix, signs and spaces are errors.
+        for bad in ["ff", "1bc16d674ec800000", "", "0x", "-1", "+1", " 1", "1.0", "0xg"] {
+            assert_eq!(parse_wei(bad), Err(()), "{bad:?}");
+        }
+        // Overflow is an error in either base.
+        assert_eq!(parse_wei(&format!("0x1{}", "0".repeat(64))), Err(()));
+        assert_eq!(
+            parse_wei("115792089237316195423570985008687907853269984665640564039457584007913129639936"),
+            Err(())
+        );
+    }
+
+    #[test]
     fn exit_errors_come_back_as_null_plus_a_message() {
         let pk = c(PUBKEY);
         let (out, err) = exit(ptr::null(), ptr::null());
         assert!(out.is_null());
         assert_eq!(err.as_deref(), Some("null pointer"));
 
-        let fee = c("not a number");
-        let (out, err) = exit(pk.as_ptr(), fee.as_ptr());
-        assert!(out.is_null());
-        assert_eq!(err.as_deref(), Some("invalid fee"));
+        for bad in ["not a number", "10abc", "0x", &format!("0x1{}", "0".repeat(64))] {
+            let fee = c(bad);
+            let (out, err) = exit(pk.as_ptr(), fee.as_ptr());
+            assert!(out.is_null(), "{bad:?}");
+            assert_eq!(err.as_deref(), Some("invalid fee"), "{bad:?}");
+        }
 
         let short = c("0xabcd");
         let (out, err) = exit(short.as_ptr(), ptr::null());
@@ -529,10 +602,20 @@ mod tests {
     #[test]
     fn a_bad_deposit_value_withdrawal_address_and_key_are_reported() {
         let (contract, sk, wd) = (c(CONTRACT), c(SK), c(WITHDRAWAL));
-        let bad_value = c("xyz");
-        let (out, err) = deposit(contract.as_ptr(), sk.as_ptr(), wd.as_ptr(), bad_value.as_ptr());
-        assert!(out.is_null());
-        assert_eq!(err.as_deref(), Some("invalid deposit value"));
+        for bad in ["xyz", "ff", "", "0x", &format!("0x1{}", "0".repeat(64))] {
+            let bad_value = c(bad);
+            let (out, err) =
+                deposit(contract.as_ptr(), sk.as_ptr(), wd.as_ptr(), bad_value.as_ptr());
+            assert!(out.is_null(), "{bad:?}");
+            assert_eq!(err.as_deref(), Some("invalid deposit value"), "{bad:?}");
+        }
+
+        // A decimal value is read as decimal: "100" is 100 wei, not 0x100.
+        let decimal = c("100");
+        let (out, err) = deposit(contract.as_ptr(), sk.as_ptr(), wd.as_ptr(), decimal.as_ptr());
+        assert!(err.is_none(), "{err:?}");
+        let tx: Value = serde_json::from_str(&unsafe { take(out) }).unwrap();
+        assert_eq!(tx["value"], "0x64");
 
         let value = c("0x1");
         let short = c("0x1234");

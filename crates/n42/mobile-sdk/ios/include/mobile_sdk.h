@@ -14,6 +14,10 @@ int32_t run_client_c(const char *ws_url, const char *validator_private_key, char
 
 char *generate_bls12_381_keypair_c(char **out_error);
 
+/* Amounts in wei (deposit_value_in_wei, fee_in_wei_or_empty): a string with a
+ * "0x"/"0X" prefix is hex, a string without a prefix is DECIMAL ("100" is 100 wei).
+ * Empty (deposit), non-digits or a value above 2^256-1 is an error in out_error.
+ * fee_in_wei_or_empty may be NULL or "" for the default fee of 1 wei. */
 char *create_deposit_unsigned_tx_c(const char *deposit_contract_address,
                                    const char *validator_private_key,
                                    const char *withdrawal_address,

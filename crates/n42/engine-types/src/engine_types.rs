@@ -279,3 +279,192 @@ impl EngineTypes for N42EngineTypes {
     type ExecutionPayloadEnvelopeV5 = ExecutionPayloadEnvelopeV5;
     type ExecutionPayloadEnvelopeV6 = ExecutionPayloadEnvelopeV6;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::{Header, EMPTY_ROOT_HASH};
+    use alloy_primitives::{Address, B256};
+    use alloy_rpc_types_engine::ExecutionPayloadV1;
+    use n42_tx_types::{BlockBody, N42TxEnvelope};
+
+    fn envelope(nonce: u64) -> N42TxEnvelope {
+        N42TxEnvelope::Eth(reth_ethereum_primitives::TransactionSigned::new_unhashed(
+            reth_ethereum_primitives::Transaction::Legacy(alloy_consensus::TxLegacy { nonce, ..Default::default() }),
+            alloy_primitives::Signature::test_signature(),
+        ))
+    }
+
+    /// A Cancun-shaped block with `transactions` transfers.
+    fn block(transactions: usize) -> Arc<RecoveredBlock<Block>> {
+        let transactions: Vec<N42TxEnvelope> = (0..transactions as u64).map(envelope).collect();
+        // The payload form carries no roots it can recompute: those must already be consistent.
+        let header = Header {
+            number: 12,
+            gas_limit: 30_000_000,
+            timestamp: 1_720_000_000,
+            base_fee_per_gas: Some(7),
+            ommers_hash: alloy_consensus::EMPTY_OMMER_ROOT_HASH,
+            transactions_root: alloy_consensus::proofs::calculate_transaction_root(&transactions),
+            withdrawals_root: Some(EMPTY_ROOT_HASH),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(B256::repeat_byte(0xBB)),
+            ..Default::default()
+        };
+        let body = BlockBody { transactions, ommers: Vec::new(), withdrawals: Some(Vec::new().into()) };
+        let transactions = body.transactions.len();
+        let senders = vec![Address::repeat_byte(1); transactions];
+        Arc::new(RecoveredBlock::new_sealed(SealedBlock::seal_slow(Block { header, body }), senders))
+    }
+
+    fn payload(transactions: usize) -> N42BuiltPayload {
+        N42BuiltPayload::new(block(transactions), U256::from(99), None, None)
+    }
+
+    fn requests() -> Requests {
+        let mut requests = Requests::default();
+        requests.push_request_with_type(0x01, [7u8, 8, 9]);
+        requests
+    }
+
+    #[test]
+    fn accessors_expose_the_block_and_the_fees() {
+        let built = payload(2);
+        let hash = built.block_arc().hash();
+        assert_eq!(built.block().hash(), hash);
+        assert_eq!(built.recovered_block().senders().len(), 2);
+        assert_eq!(built.fees(), U256::from(99));
+        assert!(matches!(built.sidecars(), BlobSidecars::Empty));
+        // The trait view agrees with the inherent one.
+        assert_eq!(BuiltPayload::block(&built).hash(), hash);
+        assert_eq!(BuiltPayload::fees(&built), U256::from(99));
+        assert!(BuiltPayload::block_access_list(&built).is_none());
+        assert!(BuiltPayload::requests(&built).is_none());
+        assert_eq!(built.into_block_arc().hash(), hash);
+    }
+
+    #[test]
+    fn requests_and_access_list_pass_through_the_trait() {
+        let built = N42BuiltPayload::new(block(0), U256::ZERO, Some(requests()), Some(Bytes::from_static(b"bal")));
+        assert_eq!(BuiltPayload::requests(&built), Some(requests()));
+        assert_eq!(BuiltPayload::block_access_list(&built), Some(&Bytes::from_static(b"bal")));
+    }
+
+    #[test]
+    fn v3_carries_the_sealed_hash_the_transactions_and_the_fees() {
+        let built = payload(3);
+        let hash = built.block().hash();
+        let envelope: ExecutionPayloadEnvelopeV3 = built.try_into().expect("an empty sidecar set converts");
+        assert_eq!(envelope.block_value, U256::from(99));
+        assert!(!envelope.should_override_builder);
+        assert!(envelope.blobs_bundle.blobs.is_empty());
+        let v1 = &envelope.execution_payload.payload_inner.payload_inner;
+        assert_eq!(v1.block_hash, hash);
+        assert_eq!(v1.block_number, 12);
+        assert_eq!(v1.transactions.len(), 3);
+        assert_eq!(envelope.execution_payload.blob_gas_used, 0);
+    }
+
+    #[test]
+    fn v3_refuses_peerdas_sidecars_and_v5_v6_refuse_4844_ones() {
+        let peerdas = payload(0).with_sidecars(BlobSidecars::Eip7594(Vec::new()));
+        assert!(matches!(peerdas.clone().try_into_v3(), Err(BuiltPayloadConversionError::UnexpectedEip7594Sidecars)));
+        assert!(peerdas.clone().try_into_v5().is_ok());
+
+        let legacy = payload(0).with_sidecars(BlobSidecars::Eip4844(Vec::new()));
+        assert!(legacy.clone().try_into_v3().is_ok());
+        assert!(matches!(legacy.clone().try_into_v5(), Err(BuiltPayloadConversionError::UnexpectedEip4844Sidecars)));
+        let with_bal = N42BuiltPayload::new(block(0), U256::ZERO, None, Some(Bytes::from_static(b"bal")))
+            .with_sidecars(BlobSidecars::Eip4844(Vec::new()));
+        assert!(matches!(with_bal.try_into_v6(), Err(BuiltPayloadConversionError::UnexpectedEip4844Sidecars)));
+    }
+
+    #[test]
+    fn v4_and_v5_carry_the_execution_requests() {
+        let with = N42BuiltPayload::new(block(1), U256::from(5), Some(requests()), None);
+        let v4 = with.clone().try_into_v4().unwrap();
+        assert_eq!(v4.execution_requests, requests());
+        assert_eq!(v4.envelope_inner.block_value, U256::from(5));
+        let v5 = with.try_into_v5().unwrap();
+        assert_eq!(v5.execution_requests, requests());
+        assert_eq!(v5.execution_payload.payload_inner.payload_inner.transactions.len(), 1);
+
+        // No requests reads as the empty list, not an error.
+        assert_eq!(payload(0).try_into_v4().unwrap().execution_requests, Requests::default());
+        assert_eq!(payload(0).try_into_v5().unwrap().execution_requests, Requests::default());
+        // The TryFrom spellings are the same conversions.
+        assert!(ExecutionPayloadEnvelopeV4::try_from(payload(0)).is_ok());
+        assert!(ExecutionPayloadEnvelopeV5::try_from(payload(0)).is_ok());
+    }
+
+    #[test]
+    fn v6_needs_a_block_access_list() {
+        assert!(matches!(payload(0).try_into_v6(), Err(BuiltPayloadConversionError::MissingBlockAccessList)));
+        assert!(matches!(
+            ExecutionPayloadEnvelopeV6::try_from(payload(0)),
+            Err(BuiltPayloadConversionError::MissingBlockAccessList)
+        ));
+        let bal = Bytes::from_static(b"\xc0");
+        let built = N42BuiltPayload::new(block(2), U256::from(3), Some(requests()), Some(bal.clone()));
+        let hash = built.block().hash();
+        let v6 = ExecutionPayloadEnvelopeV6::try_from(built).unwrap();
+        assert_eq!(v6.execution_payload.block_access_list, bal);
+        assert_eq!(v6.execution_requests, requests());
+        assert_eq!(v6.block_value, U256::from(3));
+        assert_eq!(v6.execution_payload.payload_inner.payload_inner.payload_inner.block_hash, hash);
+    }
+
+    #[test]
+    fn v1_and_v2_keep_the_hash_and_the_transactions() {
+        let built = payload(2);
+        let hash = built.block().hash();
+        let v1: ExecutionPayloadV1 = built.clone().into();
+        assert_eq!(v1.block_hash, hash);
+        assert_eq!(v1.transactions.len(), 2);
+        let v2: ExecutionPayloadEnvelopeV2 = built.into();
+        assert_eq!(v2.block_value, U256::from(99));
+        match v2.execution_payload {
+            ExecutionPayloadFieldV2::V2(payload) => {
+                assert_eq!(payload.payload_inner.block_hash, hash);
+                assert!(payload.withdrawals.is_empty());
+            }
+            ExecutionPayloadFieldV2::V1(_) => panic!("a block with withdrawals is a V2 payload"),
+        }
+    }
+
+    #[test]
+    fn execution_data_adds_the_prague_sidecar_only_with_requests_and_a_beacon_root() {
+        // Requests and a parent beacon root: the V4 sidecar carries both.
+        let data: ExecutionData = N42BuiltPayload::new(block(1), U256::ZERO, Some(requests()), None).into();
+        assert_eq!(data.sidecar.requests().cloned(), Some(requests()));
+        assert_eq!(data.sidecar.parent_beacon_block_root(), Some(B256::repeat_byte(0xBB)));
+        assert_eq!(data.payload.transactions().len(), 1);
+
+        // Without requests the sidecar is whatever the payload shape implies, with no requests.
+        let data = payload(1).into_execution_data();
+        assert!(data.sidecar.requests().is_none());
+        assert_eq!(data.payload.block_number(), 12);
+    }
+
+    #[test]
+    fn block_to_payload_round_trips_the_block() {
+        let recovered = block(2);
+        let sealed = recovered.sealed_block().clone();
+        let hash = sealed.hash();
+        let data = <N42EngineTypes as PayloadTypes>::block_to_payload(sealed, None);
+        assert_eq!(data.payload.block_hash(), hash);
+        assert_eq!(data.payload.transactions().len(), 2);
+        // The beacon root travels in the sidecar, so the whole of `ExecutionData` decodes back.
+        let rebuilt: Block = data.try_into_block::<N42TxEnvelope>().expect("decodes back");
+        assert_eq!(rebuilt.header.hash_slow(), hash, "the header survives the round trip");
+        assert_eq!(rebuilt.body.transactions.len(), 2);
+        assert_eq!(alloy_consensus::Transaction::nonce(&rebuilt.body.transactions[1]), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "big blocks")]
+    fn big_block_data_is_not_supported() {
+        let _: reth_engine_primitives::BigBlockData<ExecutionData> = payload(0).into();
+    }
+}

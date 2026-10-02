@@ -2449,7 +2449,9 @@ where
             let open = || {
                 open_parent_state()
                     .ok()
-                    .map(|s| n42_engine_types::fast_transfer::doors::CountedDb::new(StateProviderDatabase::new(s)))
+                    .map(|s| n42_engine_types::fast_transfer::doors::CountedDb::new(StateProviderDatabase::new(
+                        reth_provider::StateProvider::into_evm_state_provider(s),
+                    )))
             };
             // A described block (`N42_FOLLOWER_COPY_ASIDE=1`) executes on its
             // transactions by reference while its owned block is made aside.
@@ -2465,7 +2467,7 @@ where
                             txs: transactions.as_slice(),
                             senders: senders.as_slice(),
                         },
-                        cached.as_db_mut(StateProviderDatabase::new(&state)),
+                        cached.as_db_mut(StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state))),
                         &open,
                         keys,
                     )
@@ -2473,7 +2475,7 @@ where
                 None => n42_engine_types::parallel_transfer::execute_transfers_build_path_keyed(
                     evm_config,
                     late.get()?,
-                    cached.as_db_mut(StateProviderDatabase::new(&state)),
+                    cached.as_db_mut(StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state))),
                     &open,
                     keys,
                 ),
@@ -2577,12 +2579,14 @@ where
             let open = || {
                 open_parent_state()
                     .ok()
-                    .map(|s| n42_engine_types::fast_transfer::doors::CountedDb::new(StateProviderDatabase::new(s)))
+                    .map(|s| n42_engine_types::fast_transfer::doors::CountedDb::new(StateProviderDatabase::new(
+                        reth_provider::StateProvider::into_evm_state_provider(s),
+                    )))
             };
             match n42_engine_types::parallel_transfer::execute_transfers_planned(
                 evm_config,
                 late.get()?,
-                cached.as_db_mut(StateProviderDatabase::new(&state)),
+                cached.as_db_mut(StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state))),
                 &open,
                 plan,
             )
@@ -2682,7 +2686,7 @@ where
             None if sharded.is_some() => None,
             None => Some(
                 evm_config
-                    .executor(cached.as_db_mut(StateProviderDatabase::new(&state)))
+                    .executor(cached.as_db_mut(StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state))))
                     .execute(late.get()?)
                     .map_err(|err| format!("execution: {err}"))?,
             ),

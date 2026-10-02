@@ -333,7 +333,7 @@ fn main() {
                                         use reth_evm::ConfigureEvm as _;
                                         use reth_provider::StateProviderFactory as _;
                                         let state = provider.state_by_block_hash(block.parent_hash).map_err(|e| e.to_string())?;
-                                        let db = reth_revm::database::StateProviderDatabase::new(&state);
+                                        let db = reth_revm::database::StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state));
                                         let started = std::time::Instant::now();
                                         let mut executor = evm_config.executor(db);
                                         let out = executor.execute_one(&block).map_err(|e| e.to_string())?;

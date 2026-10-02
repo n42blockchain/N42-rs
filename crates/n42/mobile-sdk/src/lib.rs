@@ -130,7 +130,9 @@ pub async fn run_client(ws_url: &str, validator_private_key: &str) -> eyre::Resu
 fn verify(mut unverifiedblock: UnverifiedBlock) -> eyre::Result<B256> {
     println!("verify, {unverifiedblock:?}");
     let provider_1 = MockEthProvider::default();
-    let state = StateProviderDatabase::new(provider_1);
+    let state = StateProviderDatabase::new(
+        reth_provider::StateProvider::into_evm_state_provider(provider_1),
+    );
     let db = State::builder()
         .with_database(unverifiedblock.db.as_db_mut(state))
         .build();

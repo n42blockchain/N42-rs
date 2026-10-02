@@ -19,6 +19,9 @@ fn payload_v1() -> ExecutionPayloadV1 {
         base_fee_per_gas: U256::from(13),
         block_hash: B256::repeat_byte(14),
         transactions: vec![Bytes::from_static(&[15, 16])],
+        // N42: not carried over SSZ, so left at their defaults.
+        difficulty: U256::ZERO,
+        nonce: Default::default(),
     }
 }
 

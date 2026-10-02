@@ -358,7 +358,7 @@ mod tests {
     /// Calls `f` with an error slot and returns (result, error message if any).
     fn with_error<R>(f: impl FnOnce(*mut *mut c_char) -> R) -> (R, Option<String>) {
         let mut slot: *mut c_char = ptr::null_mut();
-        let result = f(&mut slot);
+        let result = f(&raw mut slot);
         let message = if slot.is_null() { None } else { Some(unsafe { take(slot) }) };
         (result, message)
     }
@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn cstr_to_string_rejects_null_and_bad_utf8_and_reads_valid_strings() {
         assert_eq!(cstr_to_string(ptr::null()), Err("null pointer".to_string()));
-        let bad = CStr::from_bytes_with_nul(b"\xff\xfe\0").unwrap();
+        let bad = c"\xff\xfe";
         let err = cstr_to_string(bad.as_ptr()).expect_err("invalid utf8");
         assert!(err.starts_with("utf8 error"), "{err}");
         let ok = c("héllo");
@@ -474,7 +474,7 @@ mod tests {
         assert!(out.is_null());
         assert!(err.unwrap().contains("48 bytes"));
 
-        let bad_utf8 = CStr::from_bytes_with_nul(b"\xff\0").unwrap();
+        let bad_utf8 = c"\xff";
         let (out, err) = exit(pk.as_ptr(), bad_utf8.as_ptr());
         assert!(out.is_null());
         assert!(err.unwrap().starts_with("utf8 error"));

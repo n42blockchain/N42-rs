@@ -202,7 +202,7 @@ fn built_answer(header: Header) -> Vec<u8> {
     out
 }
 
-fn valid(out: &PayloadStatus) -> bool {
+const fn valid(out: &PayloadStatus) -> bool {
     matches!(out.status, PayloadStatusEnum::Valid)
 }
 

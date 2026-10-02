@@ -3494,10 +3494,10 @@ mod parent_output_tests {
     /// entries, and `cargo test` runs these in threads of one process: two
     /// publishing tests at once would evict each other's parent. Every test
     /// that publishes takes this first.
-    static PUBLISHING: Mutex<()> = Mutex::new(());
+    pub(super) static PUBLISHING: Mutex<()> = Mutex::new(());
 
     /// Holds [`PUBLISHING`] for the length of a test.
-    fn publishing() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn publishing() -> std::sync::MutexGuard<'static, ()> {
         PUBLISHING.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -5045,3 +5045,7 @@ mod tests {
 
 #[cfg(test)]
 mod by_description_bench;
+
+#[cfg(test)]
+#[path = "follower_import_tests.rs"]
+mod branch_tests;

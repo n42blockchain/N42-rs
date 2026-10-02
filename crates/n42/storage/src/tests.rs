@@ -68,3 +68,119 @@ mod table_tests {
         assert!(N42_TABLES.contains(&names::VALIDATOR_CHANGE_SETS));
     }
 }
+
+mod table_id_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn table_ids_map_to_names_in_declaration_order() {
+        let expected = N42_TABLES;
+        let ids = N42TableId::all();
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(id.name(), expected[i]);
+            assert_eq!(*id as u8 as usize, i, "discriminant matches position");
+        }
+    }
+
+    #[test]
+    fn table_names_are_unique_and_display_matches_name() {
+        let names: HashSet<_> = N42_TABLES.iter().collect();
+        assert_eq!(names.len(), N42_TABLES.len());
+        for id in N42TableId::all() {
+            assert_eq!(id.to_string(), id.name());
+        }
+        assert_eq!(N42TableId::BeaconNum2Hash.to_string(), "BeaconNum2Hash");
+    }
+}
+
+mod error_variant_tests {
+    use super::*;
+
+    #[test]
+    fn display_carries_the_payload_for_every_variant() {
+        let h = B256::repeat_byte(0xab);
+        assert_eq!(
+            StorageError::BeaconStateNotFound(h).to_string(),
+            format!("beacon state not found for block {h}")
+        );
+        assert_eq!(
+            StorageError::BlockNum2HashNotFound(7).to_string(),
+            "block number 7 to hash mapping not found"
+        );
+        assert_eq!(
+            StorageError::SerializationError("a".into()).to_string(),
+            "serialization error: a"
+        );
+        assert_eq!(
+            StorageError::DeserializationError("b".into()).to_string(),
+            "deserialization error: b"
+        );
+        assert_eq!(
+            StorageError::DatabaseError("c".into()).to_string(),
+            "database error: c"
+        );
+        assert_eq!(
+            StorageError::ValidatorNotFound("v".into()).to_string(),
+            "validator not found: v"
+        );
+    }
+
+    #[test]
+    fn serialization_and_deserialization_errors_are_not_not_found() {
+        assert!(!StorageError::SerializationError("x".into()).is_not_found());
+        assert!(!StorageError::DeserializationError("x".into()).is_not_found());
+    }
+
+    #[test]
+    fn other_accepts_string_and_str() {
+        assert_eq!(StorageError::other(String::from("s")), StorageError::Other("s".into()));
+        assert_eq!(StorageError::other("s"), StorageError::Other("s".into()));
+    }
+
+    #[test]
+    fn serde_json_error_converts_to_serialization_error() {
+        let e = serde_json::from_str::<u32>("nope").unwrap_err();
+        let msg = e.to_string();
+        match StorageError::from(e) {
+            StorageError::SerializationError(m) => assert_eq!(m, msg),
+            other => panic!("unexpected variant {other:?}"),
+        }
+    }
+}
+
+mod codec_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn json_roundtrip_preserves_value() {
+        let mut m = BTreeMap::new();
+        m.insert("a".to_string(), vec![1u64, 2, 3]);
+        m.insert("b".to_string(), vec![]);
+        let bytes = encode_json(&m).unwrap();
+        assert_eq!(bytes, br#"{"a":[1,2,3],"b":[]}"#);
+        let back: BTreeMap<String, Vec<u64>> = decode_json(&bytes).unwrap();
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn decode_json_rejects_wrong_shape_and_garbage() {
+        let err = decode_json::<Vec<u8>>(b"{\"a\":1}").unwrap_err();
+        assert!(matches!(err, StorageError::SerializationError(_)));
+        assert!(decode_json::<u32>(b"").is_err());
+        assert!(decode_json::<u32>(b"1 2").is_err(), "trailing data is refused");
+    }
+
+    #[test]
+    fn beacon_block_and_state_decode_errors_are_typed() {
+        assert!(matches!(
+            decode_beacon_block(b"{}"),
+            Err(StorageError::SerializationError(_))
+        ));
+        assert!(matches!(
+            decode_beacon_state(b"[1]"),
+            Err(StorageError::SerializationError(_))
+        ));
+    }
+}

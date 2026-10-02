@@ -391,8 +391,14 @@ impl Snapshot {
     }
 
     /// inturn returns if a signer at a given block height is in-turn or not.
+    ///
+    /// The in-turn signer of block `number` is `signers[(number - 1) % len]`. No signer is
+    /// in turn at genesis (`number == 0`) or when the signer set is empty.
     pub fn inturn(&self, number: u64, signer: &Address) -> bool {
         let signers = self.signers();
+        if signers.is_empty() || number == 0 {
+            return false;
+        }
         let mut offset = 0;
 
         //Find the position of the given signer in the sorted list
@@ -1007,9 +1013,22 @@ mod apply_tests {
     }
 
     #[test]
-    #[ignore = "BUG: Snapshot::inturn divides by zero (panics) when the signer set is empty (snapshot.rs:404)"]
     fn inturn_with_no_signers_must_not_panic() {
         let s = Snapshot::new_snapshot(APosConfig::default(), 0, B256::ZERO, vec![]);
         assert!(!s.inturn(1, &S1));
+        assert!(!s.inturn(0, &S1));
+    }
+
+    #[test]
+    fn no_signer_is_inturn_at_genesis() {
+        let signers = vec![S1, S2, S3];
+        let s = Snapshot::new_snapshot(APosConfig::default(), 0, B256::ZERO, signers.clone());
+        for signer in &signers {
+            assert!(!s.inturn(0, signer));
+        }
+        // Block 1 is still signers[0]'s turn under the (number - 1) % len rule.
+        assert!(s.inturn(1, &signers[0]));
+        assert!(s.inturn(3, &signers[2]));
+        assert!(s.inturn(4, &signers[0]));
     }
 }

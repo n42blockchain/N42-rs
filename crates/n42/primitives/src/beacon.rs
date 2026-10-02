@@ -3594,3 +3594,489 @@ mod deposits_and_exits {
         );
     }
 }
+
+#[cfg(test)]
+mod attestations_and_withdrawals {
+    use super::*;
+    use crate::test_util::{active_validator, eth1_credentials, pubkey, secret_key, state_with_validators};
+
+    fn spec() -> ChainSpec {
+        beacon_chain_spec()
+    }
+
+    fn data(slot: u64) -> AttestationData {
+        AttestationData { slot, committee_index: 0, receipts_root: B256::repeat_byte(slot as u8) }
+    }
+
+    /// An attestation signed by `indices` over the JSON encoding of `data`.
+    fn attestation(indices: &[u64], data: AttestationData) -> Attestation {
+        let msg = serde_json::to_vec(&data).unwrap();
+        let mut agg: Option<AggregateSignature> = None;
+        for &i in indices {
+            let sig = secret_key(i as usize).sign(&msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[]);
+            match agg.as_mut() {
+                Some(a) => a.add_signature(&sig, true).unwrap(),
+                None => agg = Some(AggregateSignature::from_signature(&sig)),
+            }
+        }
+        Attestation {
+            validator_indexes: indices.iter().copied().collect(),
+            data,
+            block_aggregate_signature: agg.map(|a| agg_sig_to_fixed(&a)),
+        }
+    }
+
+    #[test]
+    fn aggregate_signature_roundtrips_and_rejects_garbage() {
+        let a = attestation(&[0], data(1));
+        let bytes = a.block_aggregate_signature.unwrap();
+        let sig = fixed_to_agg_sig(&bytes).unwrap();
+        assert_eq!(agg_sig_to_fixed(&sig), bytes);
+        assert!(fixed_to_agg_sig(&FixedBytes::<96>::repeat_byte(0xff)).is_err());
+    }
+
+    #[test]
+    fn pubkey_cache_parses_once_and_rejects_invalid_keys() {
+        let pk = pubkey(40);
+        let first = get_cached_pubkey(&pk).unwrap();
+        let second = get_cached_pubkey(&pk).unwrap();
+        assert_eq!(first.to_bytes(), second.to_bytes());
+        assert_eq!(first.to_bytes().as_slice(), pk.as_slice());
+        assert!(get_cached_pubkey(&FixedBytes::<48>::repeat_byte(0xff)).is_err());
+    }
+
+    #[test]
+    fn verify_aggregate_signature_accepts_valid_and_rejects_bad_attestations() {
+        let s = state_with_validators(4, 0);
+        s.verify_aggregate_signature(&attestation(&[0, 1, 2], data(5))).unwrap();
+
+        // Missing signature.
+        let mut missing = attestation(&[0], data(5));
+        missing.block_aggregate_signature = None;
+        let err = s.verify_aggregate_signature(&missing).unwrap_err().to_string();
+        assert!(err.contains("aggregate signature is empty"), "{err}");
+
+        // Signature over different data.
+        let mut forged = attestation(&[0, 1], data(5));
+        forged.data = data(6);
+        let err = s.verify_aggregate_signature(&forged).unwrap_err().to_string();
+        assert!(err.contains("failed"), "{err}");
+
+        // Claimed signers differ from actual signers.
+        let mut wrong_set = attestation(&[0, 1], data(5));
+        wrong_set.validator_indexes = [0u64, 2].into_iter().collect();
+        assert!(s.verify_aggregate_signature(&wrong_set).is_err());
+
+        // Unknown validator index.
+        let mut unknown = attestation(&[0], data(5));
+        unknown.validator_indexes.insert(77);
+        assert!(s.verify_aggregate_signature(&unknown).unwrap_err().to_string().contains("UnknownValidator"));
+
+        // Undecodable signature bytes.
+        let mut garbage = attestation(&[0], data(5));
+        garbage.block_aggregate_signature = Some(FixedBytes::<96>::repeat_byte(0xff));
+        assert!(s.verify_aggregate_signature(&garbage).is_err());
+    }
+
+    #[test]
+    fn verify_aggregate_signature_rejects_a_validator_with_an_invalid_pubkey() {
+        let mut s = state_with_validators(2, 0);
+        let mut v = active_validator(0, &spec());
+        v.pubkey = FixedBytes::<48>::repeat_byte(0xff);
+        s.validators_store.set(0, v).unwrap();
+        let err = s.verify_aggregate_signature(&attestation(&[0], data(1))).unwrap_err().to_string();
+        assert!(err.contains("PublicKey::from_bytes"), "{err}");
+    }
+
+    #[test]
+    fn batch_verification_paths() {
+        let s = state_with_validators(6, 0);
+        // Empty and small batches.
+        s.verify_attestations_batch(&[]).unwrap();
+        s.verify_attestations_batch(&[attestation(&[0], data(1)), attestation(&[1, 2], data(2))]).unwrap();
+        let mut small_bad = vec![attestation(&[0], data(1)), attestation(&[1], data(2))];
+        small_bad[1].data = data(3);
+        assert!(s.verify_attestations_batch(&small_bad).is_err());
+
+        // Four or more takes the batch path.
+        let good: Vec<Attestation> = (0..5).map(|i| attestation(&[i], data(10 + i))).collect();
+        s.verify_attestations_batch(&good).unwrap();
+
+        let mut bad = good.clone();
+        bad[2].data = data(99);
+        let err = s.verify_attestations_batch(&bad).unwrap_err().to_string();
+        assert!(err.contains("Batch verification failed at attestation 2"), "{err}");
+
+        let mut missing = good.clone();
+        missing[3].block_aggregate_signature = None;
+        assert!(s.verify_attestations_batch(&missing).unwrap_err().to_string().contains("empty"));
+
+        let mut unknown = good.clone();
+        unknown[0].validator_indexes.insert(500);
+        assert!(s.verify_attestations_batch(&unknown).is_err());
+
+        let mut garbage = good;
+        garbage[1].block_aggregate_signature = Some(FixedBytes::<96>::repeat_byte(0xff));
+        assert!(s.verify_attestations_batch(&garbage).is_err());
+    }
+
+    #[test]
+    fn process_randao_xors_signature_hashes_into_the_mix() {
+        let spec = spec();
+        let mut s = state_with_validators(3, 0);
+        s.randao_mix = B256::repeat_byte(0x11);
+        let a = attestation(&[0], data(1));
+        let b = attestation(&[1, 2], data(2));
+        let expected = B256::repeat_byte(0x11)
+            ^ keccak256(a.block_aggregate_signature.unwrap())
+            ^ keccak256(b.block_aggregate_signature.unwrap());
+
+        let body = BeaconBlockBody { attestations: vec![a.clone(), b], ..Default::default() };
+        s.process_randao(&body, &spec).unwrap();
+        assert_eq!(s.randao_mix, expected);
+
+        // No attestations: the mix is unchanged.
+        let before = s.randao_mix;
+        s.process_randao(&BeaconBlockBody::default(), &spec).unwrap();
+        assert_eq!(s.randao_mix, before);
+
+        // An invalid attestation aborts before the mix is touched.
+        let mut bad = a;
+        bad.data = data(9);
+        let body = BeaconBlockBody { attestations: vec![bad], ..Default::default() };
+        assert!(s.process_randao(&body, &spec).is_err());
+        assert_eq!(s.randao_mix, before);
+    }
+
+    #[test]
+    fn process_attestation_records_attesters_only_for_valid_signatures() {
+        let mut s = state_with_validators(4, 0);
+        s.process_attestation(&vec![attestation(&[0, 2], data(1)), attestation(&[3], data(2))]).unwrap();
+        assert_eq!(s.epoch_attester_indexes_store.len(), 3);
+        let recorded: Vec<u64> = s.epoch_attester_indexes_store.iter().copied().collect();
+        assert_eq!(recorded, vec![0, 2, 3]);
+
+        let mut bad = attestation(&[1], data(3));
+        bad.data = data(4);
+        assert!(s.process_one_attestation(&bad).is_err());
+        assert_eq!(s.epoch_attester_indexes_store.len(), 3);
+    }
+
+    fn pending(validator_index: u64, amount: u64, withdrawable_epoch: Epoch) -> PendingPartialWithdrawal {
+        PendingPartialWithdrawal { validator_index, amount, withdrawable_epoch }
+    }
+
+    fn request(i: usize, amount: u64) -> WithdrawalRequest {
+        WithdrawalRequest {
+            source_address: Address::repeat_byte(i as u8 + 1),
+            validator_pubkey: pubkey(i),
+            amount,
+        }
+    }
+
+    fn compounding(i: usize) -> Validator {
+        let mut v = active_validator(i, &spec());
+        let mut c = [0u8; 32];
+        c[0] = 0x02;
+        c[12..].fill(i as u8 + 1);
+        v.withdrawal_credentials = B256::from(c);
+        v
+    }
+
+    #[test]
+    fn full_exit_request_exits_a_mature_validator() {
+        let spec = spec();
+        let mut s = state_with_validators(4, 64);
+        s.process_withdrawal_requests(&[request(1, 0)], &spec).unwrap();
+        assert_eq!(s.get_validator(1).unwrap().exit_epoch, 7);
+        assert_eq!(s.get_validator(0).unwrap().exit_epoch, spec.far_future_epoch);
+    }
+
+    #[test]
+    fn withdrawal_requests_that_fail_validation_are_skipped() {
+        let spec = spec();
+        let far = spec.far_future_epoch;
+        let mut s = state_with_validators(6, 64);
+
+        // 1: wrong source address.
+        let mut wrong_addr = request(1, 0);
+        wrong_addr.source_address = Address::repeat_byte(0xee);
+        // 2: unknown pubkey.
+        let mut unknown = request(2, 0);
+        unknown.validator_pubkey = FixedBytes::repeat_byte(0xab);
+        // 3: no execution credential prefix.
+        let mut no_cred = active_validator(3, &spec);
+        no_cred.withdrawal_credentials = B256::ZERO;
+        s.validators_store.set(3, no_cred).unwrap();
+        // 4: not yet activated.
+        let mut inactive = active_validator(4, &spec);
+        inactive.activation_epoch = 50;
+        s.validators_store.set(4, inactive).unwrap();
+        // 5: exit already scheduled.
+        let mut exiting = active_validator(5, &spec);
+        exiting.exit_epoch = 100;
+        s.validators_store.set(5, exiting).unwrap();
+
+        s.process_withdrawal_requests(
+            &[wrong_addr, unknown, request(3, 0), request(4, 0), request(5, 0)],
+            &spec,
+        )
+        .unwrap();
+        assert_eq!(s.get_validator(1).unwrap().exit_epoch, far);
+        assert_eq!(s.get_validator(3).unwrap().exit_epoch, far);
+        assert_eq!(s.get_validator(4).unwrap().exit_epoch, far);
+        assert_eq!(s.get_validator(5).unwrap().exit_epoch, 100);
+        assert!(s.pending_partial_withdrawals.is_empty());
+    }
+
+    #[test]
+    fn withdrawal_request_for_a_too_young_validator_is_skipped() {
+        let spec = spec();
+        // Epoch 0 < activation 0 + shard_committee_period 1.
+        let mut s = state_with_validators(2, 0);
+        s.process_withdrawal_requests(&[request(0, 0)], &spec).unwrap();
+        assert_eq!(s.get_validator(0).unwrap().exit_epoch, spec.far_future_epoch);
+    }
+
+    #[test]
+    fn full_exit_is_blocked_by_a_pending_partial_withdrawal() {
+        let spec = spec();
+        let mut s = state_with_validators(2, 64);
+        s.pending_partial_withdrawals.push(pending(0, 5, 100));
+        s.process_withdrawal_requests(&[request(0, 0)], &spec).unwrap();
+        assert_eq!(s.get_validator(0).unwrap().exit_epoch, spec.far_future_epoch);
+    }
+
+    #[test]
+    fn partial_withdrawal_requires_compounding_credentials() {
+        let spec = spec();
+        let mut s = state_with_validators(2, 64);
+        s.balances_store.set(0, 40_000_000_000).unwrap();
+        s.process_withdrawal_requests(&[request(0, 5_000_000_000)], &spec).unwrap();
+        assert!(s.pending_partial_withdrawals.is_empty());
+    }
+
+    #[test]
+    fn partial_withdrawals_queue_up_to_the_excess_balance() {
+        let spec = spec();
+        let mut s = state_with_validators(2, 64);
+        s.validators_store.set(0, compounding(0)).unwrap();
+        s.balances_store.set(0, 40_000_000_000).unwrap();
+
+        s.process_withdrawal_requests(&[request(0, 5_000_000_000)], &spec).unwrap();
+        assert_eq!(s.pending_partial_withdrawals, vec![pending(0, 5_000_000_000, 8)]);
+        assert_eq!(s.earliest_exit_epoch, 7);
+        assert_eq!(s.exit_balance_to_consume, 128_000_000_000 - 5_000_000_000);
+
+        // Only the 3 ETH not already pending can still be withdrawn.
+        s.process_withdrawal_requests(&[request(0, 100_000_000_000)], &spec).unwrap();
+        assert_eq!(s.pending_partial_withdrawals.len(), 2);
+        assert_eq!(s.pending_partial_withdrawals[1].amount, 3_000_000_000);
+
+        // Nothing excess is left, so a further request is ignored.
+        s.process_withdrawal_requests(&[request(0, 1)], &spec).unwrap();
+        assert_eq!(s.pending_partial_withdrawals.len(), 2);
+    }
+
+    #[test]
+    fn a_full_partial_queue_only_admits_full_exits() {
+        let spec = spec();
+        let mut s = state_with_validators(3, 64);
+        s.validators_store.set(0, compounding(0)).unwrap();
+        s.balances_store.set(0, 40_000_000_000).unwrap();
+        for _ in 0..pending_partial_withdrawals_limit {
+            s.pending_partial_withdrawals.push(pending(2, 1, 100));
+        }
+
+        s.process_withdrawal_requests(&[request(0, 1_000_000_000), request(1, 0)], &spec).unwrap();
+        assert_eq!(s.pending_partial_withdrawals.len(), pending_partial_withdrawals_limit);
+        assert_eq!(s.get_validator(1).unwrap().exit_epoch, 7);
+        assert_eq!(s.get_validator(0).unwrap().exit_epoch, spec.far_future_epoch);
+    }
+
+    #[test]
+    fn expected_withdrawals_cover_full_and_sweep_partial_cases() {
+        let spec = spec();
+        let mut s = state_with_validators(4, 64);
+        // Validator 1: fully withdrawable (withdrawable epoch passed, balance > 0).
+        let mut done = active_validator(1, &spec);
+        done.exit_epoch = 1;
+        done.withdrawable_epoch = 1;
+        s.validators_store.set(1, done).unwrap();
+        // Validator 2: effective balance at max and 1 ETH of excess.
+        s.balances_store.set(2, 33_000_000_000).unwrap();
+        // Validator 3: fully withdrawable but zero balance, so skipped.
+        let mut empty = active_validator(3, &spec);
+        empty.withdrawable_epoch = 0;
+        s.validators_store.set(3, empty).unwrap();
+        s.balances_store.set(3, 0).unwrap();
+
+        let (w, processed) = s.get_expected_withdrawals(&spec).unwrap();
+        assert_eq!(processed, Some(0));
+        assert_eq!(w.len(), 2);
+        assert_eq!((w[0].index, w[0].validator_index, w[0].amount), (0, 1, 32_000_000_000));
+        assert_eq!(w[0].address, Address::repeat_byte(2));
+        assert_eq!((w[1].index, w[1].validator_index, w[1].amount), (1, 2, 1_000_000_000));
+        assert_eq!(w[1].address, Address::repeat_byte(3));
+    }
+
+    #[test]
+    fn expected_withdrawals_start_at_the_stored_indices() {
+        let spec = spec();
+        let mut s = state_with_validators(3, 64);
+        s.balances_store.set(0, 33_000_000_000).unwrap();
+        s.balances_store.set(2, 34_000_000_000).unwrap();
+        s.next_withdrawal_index = 10;
+        s.next_withdrawal_validator_index = 2;
+        let (w, _) = s.get_expected_withdrawals(&spec).unwrap();
+        // The sweep starts at validator 2 and wraps around to validator 0.
+        assert_eq!(w.iter().map(|x| (x.index, x.validator_index)).collect::<Vec<_>>(), vec![(10, 2), (11, 0)]);
+
+        s.next_withdrawal_validator_index = 3;
+        assert!(s.get_expected_withdrawals(&spec).is_err());
+    }
+
+    #[test]
+    fn expected_withdrawals_include_ripe_pending_partials() {
+        let spec = spec();
+        let mut s = state_with_validators(3, 64);
+        s.balances_store.set(0, 40_000_000_000).unwrap();
+        s.pending_partial_withdrawals = vec![
+            pending(0, 5_000_000_000, 2),
+            // Not yet withdrawable: processing stops here.
+            pending(0, 1, 3),
+        ];
+        let (w, processed) = s.get_expected_withdrawals(&spec).unwrap();
+        assert_eq!(processed, Some(1));
+        // The pending 5 ETH, then the sweep pays the 3 ETH still above the 32 ETH cap.
+        assert_eq!(w.len(), 2);
+        assert_eq!((w[0].index, w[0].validator_index, w[0].amount), (0, 0, 5_000_000_000));
+        assert_eq!((w[1].index, w[1].validator_index, w[1].amount), (1, 0, 3_000_000_000));
+
+        // A partial for a validator with no excess balance is consumed without paying out.
+        s.balances_store.set(0, 32_000_000_000).unwrap();
+        let (w, processed) = s.get_expected_withdrawals(&spec).unwrap();
+        assert!(w.is_empty());
+        assert_eq!(processed, Some(1));
+
+        // A pending entry naming a missing validator is an error.
+        s.pending_partial_withdrawals = vec![pending(99, 1, 0)];
+        assert!(s.get_expected_withdrawals(&spec).is_err());
+    }
+
+    #[test]
+    fn expected_withdrawals_are_capped_per_payload() {
+        let spec = spec();
+        let mut s = state_with_validators(20, 64);
+        for i in 0..20 {
+            let mut v = active_validator(i, &spec);
+            v.withdrawable_epoch = 0;
+            s.validators_store.set(i, v).unwrap();
+        }
+        let (w, _) = s.get_expected_withdrawals(&spec).unwrap();
+        assert_eq!(w.len(), max_withdrawals_per_payload);
+        assert_eq!(w.last().unwrap().validator_index, 15);
+    }
+
+    #[test]
+    fn process_withdrawals_debits_balances_and_advances_the_sweep() {
+        let spec = spec();
+        let mut s = state_with_validators(20, 64);
+        for i in 0..20 {
+            let mut v = active_validator(i, &spec);
+            v.withdrawable_epoch = 0;
+            s.validators_store.set(i, v).unwrap();
+        }
+        s.pending_partial_withdrawals.push(pending(0, 1, 3));
+
+        let (w, processed) = s.process_withdrawals().unwrap();
+        assert_eq!(w.len(), 16);
+        assert_eq!(processed, Some(0));
+        for i in 0..16 {
+            assert_eq!(s.get_balance(i).unwrap(), 0);
+        }
+        assert_eq!(s.get_balance(16).unwrap(), 32_000_000_000);
+        assert_eq!(s.next_withdrawal_index, 16);
+        // A full payload resumes after the last paid validator.
+        assert_eq!(s.next_withdrawal_validator_index, 16);
+        assert_eq!(s.pending_partial_withdrawals.len(), 1);
+
+        // Next block: the remaining four are paid, a short payload advances the sweep by the
+        // sweep size modulo the registry length.
+        let (w, _) = s.process_withdrawals().unwrap();
+        assert_eq!(w.len(), 4);
+        assert_eq!(s.next_withdrawal_index, 20);
+        assert_eq!(s.next_withdrawal_validator_index, (16 + 16384) % 20);
+    }
+
+    #[test]
+    fn process_withdrawals_drains_processed_partials_and_handles_empty_registries() {
+        let mut s = state_with_validators(5, 64);
+        s.balances_store.set(0, 40_000_000_000).unwrap();
+        s.pending_partial_withdrawals = vec![pending(0, 2_000_000_000, 1), pending(0, 1, 9)];
+        let (w, processed) = s.process_withdrawals().unwrap();
+        // 2 ETH pending payout plus the 6 ETH the sweep finds above the cap afterwards.
+        assert_eq!((w.len(), processed), (2, Some(1)));
+        assert_eq!((w[0].amount, w[1].amount), (2_000_000_000, 6_000_000_000));
+        assert_eq!(s.get_balance(0).unwrap(), 32_000_000_000);
+        assert_eq!(s.pending_partial_withdrawals, vec![pending(0, 1, 9)]);
+        assert_eq!(s.next_withdrawal_index, 2);
+        // 16384 % 5 == 4
+        assert_eq!(s.next_withdrawal_validator_index, 4);
+
+        let mut empty = BeaconState::new();
+        let (w, processed) = empty.process_withdrawals().unwrap();
+        assert!(w.is_empty());
+        assert_eq!(processed, Some(0));
+        assert_eq!(empty.next_withdrawal_validator_index, 0);
+    }
+
+    #[test]
+    fn process_operations_applies_deposits_exits_and_withdrawal_requests() {
+        use alloy_eips::eip6110::DepositRequest as ElDepositRequest;
+        let spec = spec();
+        let mut s = state_with_validators(3, 64);
+        let body = BeaconBlockBody {
+            attestations: vec![attestation(&[0], data(1))],
+            deposits: vec![],
+            voluntary_exits: vec![VoluntaryExitWithSig {
+                voluntary_exit: VoluntaryExit { epoch: 2, validator_index: 1 },
+                signature: Bytes::new(),
+            }],
+            execution_requests: ExecutionRequestsV4 {
+                deposits: vec![ElDepositRequest {
+                    pubkey: pubkey(30),
+                    withdrawal_credentials: eth1_credentials(30),
+                    amount: 32_000_000_000,
+                    signature: FixedBytes::ZERO,
+                    index: 0,
+                }],
+                withdrawals: vec![request(2, 0)],
+                consolidations: vec![],
+            },
+        };
+        s.process_operations(&body, &spec).unwrap();
+
+        assert_eq!(s.epoch_attester_indexes_store.len(), 1);
+        assert_eq!(s.validators_store.len(), 4);
+        assert_eq!(s.get_validator(3).unwrap().pubkey, pubkey(30));
+        assert_eq!(s.eth1_deposit_index, 1);
+        assert_ne!(s.get_validator(1).unwrap().exit_epoch, spec.far_future_epoch);
+        assert_ne!(s.get_validator(2).unwrap().exit_epoch, spec.far_future_epoch);
+        assert_eq!(s.get_validator(0).unwrap().exit_epoch, spec.far_future_epoch);
+    }
+
+    #[test]
+    fn process_operations_propagates_an_invalid_exit() {
+        let spec = spec();
+        let mut s = state_with_validators(2, 64);
+        let body = BeaconBlockBody {
+            voluntary_exits: vec![VoluntaryExitWithSig {
+                voluntary_exit: VoluntaryExit { epoch: 50, validator_index: 0 },
+                signature: Bytes::new(),
+            }],
+            ..Default::default()
+        };
+        assert!(s.process_operations(&body, &spec).unwrap_err().to_string().contains("FutureEpoch"));
+    }
+}

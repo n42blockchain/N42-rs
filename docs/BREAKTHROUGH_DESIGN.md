@@ -1331,3 +1331,24 @@ pacing tick (99 ms after the previous proposal) in three of four views, then for
 quorum lands after the tick (a quarter of the views, the 60 / 96 ms R1 tail)**: the median chain (seal 76, fields 82) is under the tick, the
 cycle median 130 is the tick plus the tails of the seal (p90 101-129) and of the quorum. A pacing below 100 ms moves the first term only; the
 seal's and the quorum's tails are the terms behind it.
+
+### 10.54 Defect 27 on the fleet (loop306): the root's faults were its per-block temporaries, and the scratch set removes them
+
+Tip 1b331d714 (the root's per-block temporaries reused from one scratch set; `root_faults_*` split), the copy-aside configuration of 10.53 (C),
+100 ms pacing, three nodes. S, Sb and Sc run the default (scratch on); OFF runs `N42_QMDB_APPLY_SCRATCH=0`. The split columns are the p90 of the
+leader's full blocks (`txs=163000`, ~745 per leg, window 1 and later); every other split key (entries, offsets, index, undo) reads 0 / 0 on S and OFF.
+
+| leg | win1 | cycle mean / median | sealed_at median / p90 | root faults median / p90 | split p90 (bits / twigs / tmp) | share >= 500 |
+| --- | --- | --- | --- | --- | --- | --- |
+| S | 1,161,427 | 140 / 134 | 79 / 126 | 7 / 519 | 5 / 7 / 0 | 5.1% |
+| Sb | 1,165,520 | 139 / 126 | 77 / 120 | 4 / 377 | - | 5.4% |
+| Sc | 1,164,363 | 138 / 122 | 79 / 120 | 7 / 610 | - | 7.6% |
+| OFF | 1,174,405 | 138 / 131 | 80 / 129 | 17 / 1,548 | 5 / 30 / 896 | 22.8% |
+
+The faults of a faulting root were in the per-block temporaries (`root_faults_tmp` p90 896 on OFF, 0 on S; `root_append_faults` median 4 on OFF, 0 on
+all three scratch legs); the twig structure adds a few (p90 30 on OFF, 7 on S) and the bit vectors 5 on both. With the scratch set the root's fault
+p90 fell 1,548 -> 377-610 and the share of roots with >= 500 faults 22.8% -> 5.1-7.6% (the 10.53 reading was 21% on Cb). The seal's p90 moved
+129 -> 120-126 (`sealed_at_over_130` 111 on OFF, 84-101 on the scratch legs), the median not (77-80). The window did not follow: win1 reads
+1.161-1.166M on S legs and 1.174M on OFF, a spread of 1.1%, inside the 4% of one configuration, and the cycle mean is 138-140 ms on all four (the
+medians 122-134 differ more than the means, so the tail of the cycle is not the root's). The record stays 1,226,047 (loop293). Not determined:
+why the remaining 5-8% of roots still fault (the p90 of the split is 7 on twigs and 5 on bits, so those roots' faults lie in a key not in the split).

@@ -654,7 +654,8 @@ pub fn partition_by_sender(keys: &[(Address, Address)], beneficiary: Address) ->
 /// The worker pool the build's batches run on: its own, so that they do not
 /// queue behind the global pool's other jobs (the QMDB root of the block
 /// before, a follower import). `N42_PARALLEL_BUILD_THREADS` threads, 16 by
-/// default.
+/// default. Under `N42_CORE_LAYOUT=isolate` each thread pins itself to the
+/// layout's build set (`n42_core_layout`).
 pub fn build_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
@@ -662,6 +663,7 @@ pub fn build_pool() -> &'static rayon::ThreadPool {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .thread_name(|i| format!("n42-build-{i}"))
+            .start_handler(|_| n42_core_layout::enter(n42_core_layout::Set::Build))
             .build()
             .expect("a thread pool for the parallel build")
     })
@@ -3043,6 +3045,8 @@ impl RevertsSort {
         let (to_sort, sorting) = std::sync::mpsc::channel::<Vec<(Address, AccountRevert)>>();
         let (sorted, answer) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new().name("graft-reverts".into()).spawn(move || {
+            // Spawned from a build thread: off the build's cores.
+            n42_core_layout::enter(n42_core_layout::Set::Background);
             if let Ok(mut reverts) = sorting.recv() {
                 let at = std::time::Instant::now();
                 sort_reverts_indexed(&mut reverts);

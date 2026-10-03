@@ -2562,6 +2562,7 @@ where
                         gap_keys_wait_us = keys_wait_us,
                         gap_gate_us = state_at.saturating_duration_since(gate_at).as_micros() as u64,
                         gap_state_us = executed_at.saturating_duration_since(state_at).as_micros() as u64,
+                        core_layout = n42_core_layout::label(),
                         "build-path import phases"
                     );
                     sharded = Some(StartedShards { shards, residual, result, early_root, returned });
@@ -2835,6 +2836,7 @@ where
                 std::thread::Builder::new()
                     .name("n42-follower-merge".into())
                     .spawn(move || {
+                        n42_core_layout::background_thread();
                         let at = std::time::Instant::now();
                         let merged = shards.merged(&residual.state);
                         (merged, at.elapsed().as_millis() as u64)
@@ -3360,6 +3362,9 @@ fn side_pool(var: &str, name: &'static str, default: usize) -> Option<rayon::Thr
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(move |i| format!("{name}-{i}"))
+        // Both side pools (the vote check, the root) are on a block's
+        // chain: the layout's critical set under `N42_CORE_LAYOUT=isolate`.
+        .start_handler(|_| n42_core_layout::enter(n42_core_layout::Set::Critical))
         .build()
         .inspect_err(|err| tracing::warn!(target: "n42.follower_import", %err, name, "no side pool; on the worker pool"))
         .ok()

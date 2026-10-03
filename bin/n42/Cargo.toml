@@ -19,6 +19,7 @@ reth-primitives-traits.workspace = true
 #n42
 pubsub-mem.workspace = true
 n42-engine-types.workspace = true
+n42-core-layout.workspace = true
 n42-h2-consensus.workspace = true
 n42-qmdb-reth.workspace = true
 n42-tx-ingest.workspace = true

@@ -35,6 +35,12 @@ fn main() {
         eprintln!("error: {err}");
         std::process::exit(2);
     }
+    // `N42_CORE_LAYOUT=isolate`: split the node's affinity mask into the
+    // build, critical and background sets before any thread is spawned, and
+    // move this thread (and any the allocator already has) to the background
+    // set, so tokio, reth's rayon pools, persistence and the engine inherit
+    // it. The critical pools pin their own threads. Logged once tracing is up.
+    let _ = n42_core_layout::init();
     // `N42_THP_DISABLE=1`: no transparent huge pages for this process. With
     // the box's THP at `always`, a fleet allocating ~45 GB of anonymous
     // memory drove 5.8M direct-compaction stalls that tore the page cache
@@ -173,6 +179,15 @@ fn main() {
                 })
                 .launch_with_debug_capabilities()
                 .await?;
+
+            // The layout (or its fallback), and `N42_BACKGROUND_NICE` on
+            // reth's persistence thread (`save_blocks` runs there), which
+            // exists from the launch on.
+            n42_core_layout::log_once();
+            let reniced = n42_core_layout::lower_threads_named(&["persistence"]);
+            if let Some(priority) = n42_core_layout::background_priority() {
+                info!(target: "n42::core_layout", %priority, reniced, "background priority on reth's persistence thread");
+            }
 
             // `N42_FRAME_BLOCKS=1` (docs/BREAKTHROUGH_DESIGN.md step 1): whole
             // frames in the builder, frame-tree roots, frame descriptions on

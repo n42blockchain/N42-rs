@@ -895,6 +895,7 @@ impl Drop for FrozenShards {
         // Cleared off the dropping thread (a pass over every entry, a few ms
         // for the fleet's block): the last holder may be a build.
         let spawned = std::thread::Builder::new().name("n42-shard-recycle".into()).spawn(move || {
+            n42_core_layout::background_thread();
             for shard in &mut shards {
                 shard.state.clear();
                 shard.reverts.clear();

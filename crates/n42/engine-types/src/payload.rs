@@ -2669,6 +2669,8 @@ where
                 let receipts = &execution_result.receipts;
                 let qmdb_job = &qmdb_state;
                 let root = scope.spawn(move || {
+                    // The leader's QMDB root job: on the critical set.
+                    n42_core_layout::enter(n42_core_layout::Set::Critical);
                     let ops = n42_qmdb_reth::sorted_operations_from_execution(bundle_ref, prague);
                     qmdb_job.compute_operations(parent_sealed, ops)
                 });
@@ -2740,6 +2742,8 @@ where
                 let roots_from = std::time::Instant::now();
                 let qmdb_job = &qmdb_state;
                 let root = scope.spawn(move || {
+                    // The leader's QMDB root job: on the critical set.
+                    n42_core_layout::enter(n42_core_layout::Set::Critical);
                     let ops = n42_qmdb_reth::sorted_operations_from_accounts(view_ref, prague);
                     qmdb_job.compute_operations(parent_sealed, ops)
                 });
@@ -2765,6 +2769,7 @@ where
                 let merger = std::thread::Builder::new()
                     .name("n42-shard-merge".into())
                     .spawn(move || {
+                        n42_core_layout::background_thread();
                         let merge_at = std::time::Instant::now();
                         let mut merged = shards.merged(&residual.state);
                         crate::parallel_transfer::append_reverts(&mut merged, shard_reverts);
@@ -3024,6 +3029,7 @@ where
                     populate_lag_mb = root_split.populate_lag_mb,
                     root_seals = root_split.seals,
                     root_seal_ms = root_split.seal_ms,
+                    core_layout = n42_core_layout::label(),
                     "seal-first build phases"
                 );
             }
@@ -3687,6 +3693,7 @@ where
             root_ms = root_took.as_millis() as u64,
             assemble_ms,
             total_ms = total.as_millis() as u64,
+            core_layout = n42_core_layout::label(),
             "payload build phases"
         );
     }

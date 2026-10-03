@@ -1459,3 +1459,22 @@ read 21-24% under BASE this round (loop309: 10%), a larger gap than the 10% that
 `state-ovly` pool: 21.3-21.6k CPU units on every upgrade leg (UPNC 21,615, UPNCb 21,410, UPFIX 21,278) against 0 on BASE, a sealed_at p90 of 148-151 against 115 ms and
 `state_ready` 150-153 against 129 ms, which is upstream's `OverlayManager` computing a trie overlay per in-memory tip on the workers the leader and followers share the cores
 with; N42's QMDB root does not use it, so the next step is a vendored switch that keeps the engine from asking for it (not a flag today) and a leg with it off.
+
+### 10.59 The v2.7.0 upgrade with the overlay manager off (loop311): UPOFF 1.123M / 1.162M against BASE 1.181M, the pool is gone
+
+loop311 ran the v2.7.0 branch at `71d4da172` (`709b861eb`: the engine's state-trie overlay manager is off by default on a QMDB chain) with the loop310 UPFIX environment
+(masking 0, cache and txpool prewarming as in loop309), interleaved UPOFF, BASE, UPOFFb, UPON (UPON = `RETH_ENGINE_STATE_TRIE_OVERLAY=true`, the A/B). The runner counts
+`Overlay manager created state_trie_overlay=` per leg and sums the `state-ovly` thread CPU (units of `threadcpu4.py`; loop310: ~21-22k on upgrade legs, 0 on BASE). Correctness
+is clean on all four legs (verify pass, invalid_blocks 0, no_variant 0, own_not_committed 0, unanswered_reads 0, direct_imports_failed 0, incomplete 0, gas_mismatch 0, ERROR/panicked 0);
+UPON had tc=2 and proposals_given_up=1 against tc=1 on the others.
+
+| leg | win1 TPS | win2 TPS | win1 cycle (mean) | sealed_at median / p90 | par_exec | follower imp_exec / batches | imp_fields_ready | imports >600 ms | el_max_peak | overlay manager | state-ovly CPU |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| UPOFF | 1,123,219 | 890,982 | 0.144 s | 84 / 167 ms | 30 ms | 44 / 36 ms | 91 ms | 7 | 34.1 G | false | 0 |
+| BASE | 1,180,769 | 889,078 | 0.138 s | 80 / 128 ms | 30 ms | 41 / 33 ms | 87 ms | 9 | 30.8 G | - | 0 |
+| UPOFFb | 1,161,988 | 916,914 | 0.139 s | 79 / 141 ms | 30 ms | 43 / 35 ms | 91 ms | 8 | 34.6 G | false | 0 |
+| UPON | 1,036,911 | 825,826 | 0.157 s | 93 / 197 ms | 32 ms | 45 / 36 ms | 95 ms | 7 | 35.9 G | true | 25,569 |
+
+The `state-ovly` pool is at 0 with the manager off, and window 1 is 1.123M / 1.162M against BASE 1.181M (-4.9% and -1.6%; UPON, same binary with the manager on, 1.037M, -12%), so the manager
+accounts for most of the loop309/loop310 gap. The first UPOFF leg is outside the 4% merge bound; the second is inside; win2 is equal to BASE on both. Peak el_max RSS is still 3.3-3.8 G above BASE
+(34.1 / 34.6 against 30.8 G) and sealed_at p90 is higher on UPOFF (167 / 141 against 128 ms); this loop does not say what causes either. Two legs per arm do not separate a 2-5% difference (window 1 repeats within ~4%).

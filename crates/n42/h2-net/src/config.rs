@@ -97,6 +97,10 @@ pub fn gov5_gossipsub_config(
         .history_gossip(GOSSIP_SUB_MCACHE_GOSSIP)
         .duplicate_cache_time(SEEN_MESSAGES_TTL)
         .max_transmit_size(max_gossip_wire_size())
+        // libp2p-gossipsub 0.50 caps the control bytes of one RPC at 16 KiB
+        // (0.49 had no such cap). gov5 sends IHAVE lists of up to 5000 ids, so
+        // keep the old behaviour: bound it only by the RPC size itself.
+        .max_control_message_size(max_gossip_wire_size())
         .validation_mode(gossipsub::ValidationMode::Anonymous)
         .message_id_fn(gov5_message_id_fn(genesis_hash))
         .build()

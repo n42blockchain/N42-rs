@@ -348,7 +348,7 @@ pub const IDENTIFY_PROTOCOL_VERSION: &str = "/n42/h2/1.0.0";
 
 #[derive(NetworkBehaviour)]
 pub(crate) struct H2Behaviour {
-    gossipsub: gossipsub::Behaviour,
+    gossipsub: gossipsub::Behaviour<gossipsub::IdentityTransform, gossipsub::AllowAllSubscriptionFilter>,
     /// gov5 drops peers that cannot answer a status request, so this is not
     /// optional decoration — without it the connection dies within seconds.
     status: StatusBehaviour,
@@ -423,7 +423,12 @@ impl H2V4Transport {
         // StrictNoSign + NoAuthor, so a signed message from this node would be
         // rejected outright by every fleet member.
         let behaviour = H2Behaviour {
-            gossipsub: gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, gossipsub_config)
+            gossipsub: gossipsub::Behaviour::new_with_subscription_filter(
+                MessageAuthenticity::Anonymous,
+                gossipsub_config,
+                // 0.50 defaults to a 100-subscription filter; 0.49 allowed all.
+                gossipsub::AllowAllSubscriptionFilter {},
+            )
                 .map_err(|e| TransportError::Behaviour(e.to_string()))?,
             status: status_behaviour(),
             blocks: block_by_hash_behaviour(),

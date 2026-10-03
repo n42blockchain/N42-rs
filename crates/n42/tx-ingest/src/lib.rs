@@ -220,7 +220,7 @@ fn async_frames_in_flight() -> usize {
 /// 0 by default. At 10 or more, the scheduler gives the builder's and the
 /// engine's threads the core whenever they are runnable and recovery the
 /// cycles nobody else wants -- a budget that follows the load instead of a
-/// fixed one.
+/// fixed one. Unset, the node-wide `N42_BACKGROUND_NICE` applies instead.
 fn recovery_nice() -> i32 {
     static NICE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     *NICE.get_or_init(|| {
@@ -240,7 +240,15 @@ fn apply_recovery_nice() {
         static APPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
     let nice = recovery_nice();
-    if nice == 0 || APPLIED.with(|a| a.replace(true)) {
+    if nice == 0 {
+        // No recovery-specific value: the node-wide background priority
+        // (`N42_BACKGROUND_NICE`, nice 1-19 or SCHED_IDLE), when it is set.
+        if n42_core_layout::background_priority().is_some() && !APPLIED.with(|a| a.replace(true)) {
+            n42_core_layout::lower_current_thread_priority();
+        }
+        return;
+    }
+    if APPLIED.with(|a| a.replace(true)) {
         return;
     }
     // SAFETY: setpriority on the calling thread (PRIO_PROCESS with a thread

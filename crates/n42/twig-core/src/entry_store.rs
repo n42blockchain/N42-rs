@@ -90,6 +90,7 @@ fn populate_off_lock(map: &std::sync::Arc<memmap2::Mmap>) {
     {
         let map = std::sync::Arc::clone(map);
         let _ = std::thread::Builder::new().name("n42-qmdb-populate".into()).spawn(move || {
+            n42_core_layout::background_thread();
             // A failure (an old kernel, a file cut under the mapping) leaves
             // the pages to fault on first read.
             let _ = map.advise(memmap2::Advice::PopulateRead);

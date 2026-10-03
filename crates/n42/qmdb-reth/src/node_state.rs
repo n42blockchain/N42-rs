@@ -251,6 +251,7 @@ fn release_off_lock(head: u64, released: Released) {
         std::thread::Builder::new()
             .name("n42-qmdb-release".into())
             .spawn(move || {
+                n42_core_layout::background_thread();
                 for (head, released) in receiver {
                     let (records, twigs, operations) = (released.records(), released.twigs(), released.operations());
                     let started = std::time::Instant::now();

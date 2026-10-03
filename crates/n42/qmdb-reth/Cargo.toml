@@ -15,6 +15,7 @@ n42-h2-primitives.workspace = true
 n42-qmdb-state.workspace = true
 rayon.workspace = true
 n42-twig-core.workspace = true
+n42-core-layout.workspace = true
 alloy-consensus.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives = { workspace = true, features = ["serde"] }

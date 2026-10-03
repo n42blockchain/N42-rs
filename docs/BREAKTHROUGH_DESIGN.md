@@ -1478,3 +1478,9 @@ UPON had tc=2 and proposals_given_up=1 against tc=1 on the others.
 The `state-ovly` pool is at 0 with the manager off, and window 1 is 1.123M / 1.162M against BASE 1.181M (-4.9% and -1.6%; UPON, same binary with the manager on, 1.037M, -12%), so the manager
 accounts for most of the loop309/loop310 gap. The first UPOFF leg is outside the 4% merge bound; the second is inside; win2 is equal to BASE on both. Peak el_max RSS is still 3.3-3.8 G above BASE
 (34.1 / 34.6 against 30.8 G) and sealed_at p90 is higher on UPOFF (167 / 141 against 128 ms); this loop does not say what causes either. Two legs per arm do not separate a 2-5% difference (window 1 repeats within ~4%).
+
+#### 10.59 addendum (2026-10-03): merged
+
+The reth v2.7.0 upgrade (upgrade/reth-v2.7.0) was merged into feat/native-fleet7 at 8b4704f4c (tag reth-v2.7.0-merged-20261003). Decision: correct on four fleet rounds (12 upgrade legs, every error counter 0) and window-1 throughput is within the one-configuration spread (-4.9% / -1.6% on loop311).
+Open items: the remaining ~3% window-1 gap and the ~3.5 GB higher peak RSS.
+The record 1,226,047 was set on v2.5.1; the next legs re-baseline on v2.7.0.

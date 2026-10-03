@@ -40,6 +40,24 @@
 - `PlainValidatorState` 表
 - `ValidatorsHistory` 表
 - `ValidatorChangeSets` 表
+- QMDB 读取钩子（`reth_storage_api::n42_state`：`on` / `verify` 模式，`N42_HASHED_TABLES=off`
+  时拒绝未应答的读取）与分块并行的 hashed post-state：最新状态在
+  `crates/storage/provider/src/providers/state/latest.rs`；历史/叠加状态自 reth v2.7.0 起在
+  `crates/storage/storage-overlay/src/provider.rs`（上游删除了 `HistoricalStateProvider`，
+  该 crate 为此新增 vendored，见 `docs/RETH_2_7_0_UPGRADE.md`）
+- `crates/storage/provider/src/providers/database/provider.rs`：`N42_HASHED_TABLES=off` 时不写 hashed 表
+- reth v2.7.0 删除的 `MemoryOverlayStateProvider` 保留在 vendored 的
+  `crates/storage/provider/src/providers/state/memory_overlay.rs`（N42 新增文件，
+  `n42_engine_types::memory_overlay` 重新导出）；`BlockchainProvider::state_provider_for_state`
+  （`latest` / `pending` / `state_by_block_hash` 在内存块上的状态）默认用它逐读遍历内存块、
+  其下是持久化锚点的状态（`n42_layered_state_provider`），不再走上游按 tip 摊平整个内存链的
+  `ExecutionOverlay`；`N42_OVERLAY_READS=upstream` 恢复上游路径（loop308 的跟随者减速，见
+  `docs/RETH_2_7_0_UPGRADE.md`）
+- `crates/storage/storage-overlay/src/{manager,builder,provider}.rs`：`OverlayManager::without_state_trie_overlay()`
+  （N42 新增构造函数）——不带 `state-ovly` 工作线程池，插入块时不预计算，执行叠加层改为分层
+  （`ExecutionOverlay::layered`：按块从新到旧逐读查各块的 `BundleState`，不摊平、不缓存）；
+  状态树叠加层（MPT 根/证明用）仍按需在调用线程上计算。由 `--engine.state-trie-overlay`
+  （见模块6）选择
 
 ## 模块4: network
 ### 定制内容:
@@ -61,6 +79,13 @@
   循环转成 `EngineApiRequest::InsertExecutedBlock` 并回执。reth 只对 payload 事件流里带执行结果的
   payload 走这条路，以太坊 payload 类型不带；N42 的共识在构建之后才封装块头、哈希会变，
   所以由节点自己配对（`bin/n42/src/payload_serve.rs`）。纯增量，默认对上游行为无影响。
+- `--engine.state-trie-overlay <bool>`（环境变量 `RETH_ENGINE_STATE_TRIE_OVERLAY`，
+  `crates/node/core/src/args/engine.rs` 新增字段 `state_trie_overlay: Option<bool>` 与
+  `EngineArgs::state_trie_overlay_enabled(genesis)`）：未设置时，genesis 声明 QMDB 状态承诺或
+  `N42_HASHED_TABLES=off` 则为 false，否则 true。`launch/engine.rs` 据此创建
+  `OverlayManager::new(池)` 或 `OverlayManager::without_state_trie_overlay()`；
+  `crates/ethereum/cli/src/app.rs` 在 false 时把运行时的 `state-ovly` 池缩到 1 个（空闲）线程
+  （reth v2.7.0 默认 4 个，loop309/310 每轮约 22k CPU 单位，见 `docs/RETH_2_7_0_UPGRADE.md`）
 
 ## 其他 N42 独有模块:
 - `crates/n42/clique/` - APoS 共识实现

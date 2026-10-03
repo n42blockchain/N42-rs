@@ -598,19 +598,19 @@ impl revm::DatabaseRef for LazyParentDb<'_> {
     type Error = reth_storage_api::errors::ProviderError;
 
     fn basic_ref(&self, address: alloy_primitives::Address) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
-        StateProviderDatabase::new(self.provider()?).basic_ref(address)
+        StateProviderDatabase::new(reth_storage_api::StateProvider::into_evm_state_provider(self.provider()?)).basic_ref(address)
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
-        StateProviderDatabase::new(self.provider()?).code_by_hash_ref(code_hash)
+        StateProviderDatabase::new(reth_storage_api::StateProvider::into_evm_state_provider(self.provider()?)).code_by_hash_ref(code_hash)
     }
 
     fn storage_ref(&self, address: alloy_primitives::Address, index: U256) -> Result<U256, Self::Error> {
-        StateProviderDatabase::new(self.provider()?).storage_ref(address, index)
+        StateProviderDatabase::new(reth_storage_api::StateProvider::into_evm_state_provider(self.provider()?)).storage_ref(address, index)
     }
 
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
-        StateProviderDatabase::new(self.provider()?).block_hash_ref(number)
+        StateProviderDatabase::new(reth_storage_api::StateProvider::into_evm_state_provider(self.provider()?)).block_hash_ref(number)
     }
 }
 
@@ -1614,7 +1614,9 @@ where
         let open_db = || {
             open_parent_state()
                 .ok()
-                .map(|s| crate::fast_transfer::doors::CountedDb::new(StateProviderDatabase::new(s)))
+                .map(|s| crate::fast_transfer::doors::CountedDb::new(StateProviderDatabase::new(
+                    reth_storage_api::StateProvider::into_evm_state_provider(s),
+                )))
         };
         let warm_fill = crate::parallel_transfer::build_prefetch().then(crate::parallel_transfer::WarmAccounts::new);
         let (warm_ref, open_ref) = (warm_fill.as_ref(), &open_db);

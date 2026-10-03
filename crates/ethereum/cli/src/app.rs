@@ -108,11 +108,17 @@ where
             None => {
                 let runtime_config = match &self.cli.command {
                     Commands::Node(command) => {
+                        // N42: without state-trie overlay work the node never hands the
+                        // `state-ovly` pool a task; keep it at the one thread the runtime
+                        // requires instead of four idle ones.
+                        let state_trie_overlay =
+                            command.engine.state_trie_overlay_enabled(command.chain.genesis());
                         reth_tasks::RuntimeConfig::default().with_rayon(RayonConfig {
                             reserved_cpu_cores: command.engine.reserved_cpu_cores,
                             proof_storage_worker_threads: command.engine.storage_worker_count,
                             proof_account_worker_threads: command.engine.account_worker_count,
                             prewarming_threads: command.engine.prewarming_threads,
+                            state_trie_overlay_worker_threads: (!state_trie_overlay).then_some(1),
                             ..Default::default()
                         })
                     }
@@ -201,7 +207,8 @@ where
         Commands::Db(command) => {
             runner.run_blocking_command_until_exit(|ctx| command.execute::<N>(ctx))
         }
-        Commands::Download(command) => runner.run_blocking_until_ctrl_c(command.execute::<N>()),
+        Commands::Download(command) => runner
+            .run_blocking_until_ctrl_c(async move { command.execute::<N>().await.map(|_| ()) }),
         Commands::SnapshotManifest(command) => command.execute(),
         Commands::Stage(command) => {
             runner.run_command_until_exit(|ctx| command.execute::<N, _>(ctx, components))

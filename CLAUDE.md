@@ -188,12 +188,15 @@ Three distinct kinds of crate directory exist, and they behave differently:
 
 1. **`crates/n42/*` — original N42 code.** Workspace members, freely editable.
 2. **Vendored reth forks that ARE workspace members** (`crates/chainspec`, `crates/consensus/consensus`,
-   `crates/primitives-traits`, `crates/storage/{db,db-api,provider,storage-api}`, `crates/node/{core,builder}`,
-   `crates/ethereum/{cli,hardforks,node}`, `crates/net/peers`, `crates/rpc/rpc-types-compat`).
+   `crates/storage/{db,db-api,provider,storage-api}`, `crates/node/{core,builder}`,
+   `crates/ethereum/{cli,hardforks,node}`, `crates/net/peers`; plus `crates/rpc/rpc-types-compat`, a
+   member that is no longer a patch target since upstream renamed it `reth-rpc-convert`).
 3. **Vendored reth forks that are NOT workspace members but ARE patch targets**
-   (`crates/revm`, `crates/ethereum/evm`, `crates/net/network`, `crates/net/network-api`,
-   `crates/storage/libmdbx-rs`, `bin/reth`). They compile only as dependencies. `cargo test --workspace`
-   will not run their tests.
+   (`crates/revm`, `crates/net/network`, `crates/net/network-api`, `crates/storage/storage-overlay`
+   (since v2.7.0: it carries the QMDB reader hooks for historical/overlay reads), `bin/reth`). They
+   compile only as dependencies. `cargo test --workspace` will not run their tests.
+   `reth-primitives-traits` (now crates.io / reth-core; `clique_utils` lives in `crates/n42/clique-utils`),
+   `reth-evm-ethereum` and the libmdbx crates are no longer vendored.
 
 Editing anything in (2) or (3) rewrites reth for *every* crate in the graph, including the upstream git
 crates that depend on it — a signature change there can cascade into hundreds of upstream compile errors.
@@ -206,8 +209,10 @@ crates that were previously forked and have since been reverted to upstream. Don
 
 ### N42 customizations inside forked reth crates
 
-- `crates/primitives-traits/src/header/clique_utils.rs` — `recover_address()` / `seal_hash()` for APoS
-  signature recovery from block headers (N42-only file).
+- `crates/n42/clique-utils` (formerly the vendored `crates/primitives-traits/src/header/clique_utils.rs`) —
+  `recover_address()` / `seal_hash()` for APoS signature recovery from block headers.
+- `crates/storage/{provider,storage-overlay}` — the QMDB reader hooks (`n42_state::reader()`, `on` /
+  `verify`, `N42_HASHED_TABLES=off`) on latest and historical/overlay state reads.
 - `crates/consensus/consensus/src/lib.rs` — the `Consensus` trait is extended with APoS operations
   (`prepare`, `seal`, `snapshot`, `propose`, `discard`, `proposals`, `total_difficulty`, `wiggle`,
   signer get/set) plus N42 error variants.
@@ -218,7 +223,6 @@ crates that were previously forked and have since been reverted to upstream. Don
   genesis JSON in `crates/chainspec/res/genesis/`.
 - `crates/node/core/src/args/dev.rs` — N42 CLI flags: `--dev.consensus-signer-private-key`,
   `--dev.migrate-old-chain-data-from-db`, `--dev.migrate-old-chain-data-from-rpc`.
-- `crates/ethereum/evm` — uses `recover_address()` for the block beneficiary instead of `header.beneficiary`.
 
 `N42_CUSTOMIZATIONS.md` is the maintained (Chinese) inventory of these; update it when the set changes.
 
@@ -276,7 +280,7 @@ Three N42 clients live side by side on this host, and code moves between them:
   1.97) with HotStuff-2 and QMDB. Depends on reth by local path (`../reth`).
 - `../reth` — a checkout of the n42blockchain/reth fork with upstream tags
   fetched; `scripts/reth-sync.py` reads upstream revisions from it. This repo
-  itself pins upstream paradigmxyz/reth by tag (`v2.5.1` as of 2026-08-27).
+  itself pins upstream paradigmxyz/reth by tag (`v2.7.0` as of 2026-10-02).
 
 The `n42-{bmt-core,twig-core,h2-primitives,h2-wire,h2-consensus,mobile-verify,h2-net,h2-execution}`
 crates came from `../N42-26` (`h2-net` is new, modelled on its `n42-network`;
@@ -312,9 +316,15 @@ recorder and replayer must share one revm version.
 
 ## Upgrading reth
 
-The repo is on reth **v2.5.1** (upstream tag; revm 42, alloy 2.3, edition 2024).
+The repo is on reth **v2.7.0** (upstream tag, since 2026-10-02; revm 43, alloy 2.5,
+alloy-evm 0.39, reth-core crates 0.8, edition 2024).
 `docs/RETH_2_4_1_UPGRADE.md` records the 1.11.0 → 2.4.1 move (22 of 121 reth
-crates deleted or relocated; `reth-primitives-traits` now comes from crates.io).
+crates deleted or relocated; `reth-primitives-traits` now comes from crates.io);
+`docs/RETH_2_7_0_UPGRADE.md` the 2.5.1 → 2.7.0 one (13 conflicts; reth-storage-overlay
+newly vendored; `MemoryOverlayStateProvider` kept in `engine-types/src/memory_overlay.rs`;
+the alloy forks re-merged to 2.5.0). `scripts/reth-sync.py` also syncs the commented-out
+patch entries and resolves `../reth` from the repository root -- discard what it brings
+back for reverted forks, and point it at the real checkout when running from a worktree.
 
 Bumping to a newer reth: `scripts/reth-sync.py <old-rev> <new-rev>` three-way
 merges every vendored crate in the patch table from the upstream checkout at

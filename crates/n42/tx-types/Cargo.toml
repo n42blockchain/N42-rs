@@ -36,7 +36,7 @@ alloy-evm.workspace = true
 revm.workspace = true
 alloy-rpc-types-eth = { workspace = true, features = ["std", "serde"] }
 alloy-network.workspace = true
-reth-rpc-traits = "0.6.0"
+reth-rpc-traits = "0.8.1"
 # The same fixed-size cache reth's sender-recovery cache is built on.
 fixed-cache = "0.1.8"
 

@@ -22,8 +22,8 @@ use reth_libmdbx::{
 };
 use reth_storage_errors::db::LogLevel;
 use reth_tracing::tracing::error;
+use rustc_hash::FxHashMap;
 use std::{
-    collections::HashMap,
     ops::{Deref, Range},
     path::{Path, PathBuf},
     sync::Arc,
@@ -251,7 +251,7 @@ pub struct DatabaseEnv {
     /// More generally, do not dynamically create, re-open, or drop tables at
     /// runtime. It's better to perform table creation and migration only once
     /// at startup.
-    dbis: Arc<HashMap<&'static str, ffi::MDBX_dbi>>,
+    dbis: Arc<FxHashMap<&'static str, ffi::MDBX_dbi>>,
     /// Cache for metric handles. If `None`, metrics are not recorded.
     metrics: Option<Arc<DatabaseEnvMetrics>>,
     /// Write lock for when dealing with a read-write environment.
@@ -1414,6 +1414,8 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_update)]
+    #[allow(clippy::clone_on_copy)]
     fn db_closure_put_get() {
         let tempdir = TempDir::new().expect(ERROR_TEMPDIR);
         let path = tempdir.path();
@@ -1422,6 +1424,7 @@ mod tests {
             nonce: 18446744073709551615,
             bytecode_hash: Some(B256::random()),
             balance: U256::MAX,
+            ..Default::default()
         };
         let key = Address::from_str("0xa2c122be93b0074270ebee7f6b7292c7deb45047")
             .expect(ERROR_ETH_ADDRESS);
@@ -1431,7 +1434,7 @@ mod tests {
 
             // PUT
             let result = env.update(|tx| {
-                tx.put::<PlainAccountState>(key, value).expect(ERROR_PUT);
+                tx.put::<PlainAccountState>(key, value.clone()).expect(ERROR_PUT);
                 200
             });
             assert_eq!(result.expect(ERROR_RETURN_VALUE), 200);

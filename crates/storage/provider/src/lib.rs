@@ -22,10 +22,10 @@ pub use traits::*;
 /// Provider trait implementations.
 pub mod providers;
 pub use providers::{
-    DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW, HistoricalStateProvider,
-    HistoricalStateProviderRef, LatestStateProvider, LatestStateProviderRef, ProviderFactory,
-    PruneShardOutcome, PrunedIndices, SaveBlocksInput, StaticFileAccess,
-    StaticFileProviderBuilder, StaticFileWriteCtx, StaticFileWriter,
+    DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW, LatestStateProvider,
+    LatestStateProviderRef, MemoryOverlayStateProvider, MemoryOverlayStateProviderRef,
+    ProviderFactory, PruneShardOutcome, PrunedIndices, SaveBlocksInput,
+    StaticFileAccess, StaticFileProviderBuilder, StaticFileWriteCtx, StaticFileWriter,
 };
 
 pub mod changeset_walker;
@@ -51,10 +51,9 @@ pub use revm::database::states::OriginalValuesKnown;
 // reexport traits to avoid breaking changes
 pub use reth_static_file_types as static_file;
 pub use reth_storage_api::{
-    BalNotification, BalNotificationStream, BalProvider, BalStore, BalStoreHandle,
-    GetBlockAccessListLimit, HistoryWriter, MetadataProvider, MetadataWriter, NoopBalStore,
-    RawBal, StateWriteConfig, StatsReader, StorageSettings, StorageSettingsCache,
-    WriteStateInput,
+    BalProvider, BalStore, BalStoreHandle, GetBlockAccessListLimit, HistoryWriter,
+    MetadataProvider, MetadataWriter, NoopBalStore, RawBal, StateWriteConfig, StatsReader,
+    StorageSettings, StorageSettingsCache, WriteStateInput,
 };
 /// Re-export provider error.
 pub use reth_storage_errors::provider::{ProviderError, ProviderResult};

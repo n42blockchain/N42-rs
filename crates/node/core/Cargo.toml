@@ -45,6 +45,7 @@ alloy-primitives.workspace = true
 alloy-rpc-types-engine = { workspace = true, features = ["std", "jwt-aws-lc-rs"] }
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
+alloy-genesis.workspace = true
 
 # misc
 eyre.workspace = true
@@ -76,6 +77,7 @@ futures.workspace = true
 # test vectors generation
 proptest.workspace = true
 tokio.workspace = true
+serde_json.workspace = true
 
 [features]
 # Features for vergen to generate correct env vars
@@ -91,8 +93,6 @@ min-warn-logs = ["tracing/release_max_level_warn"]
 min-info-logs = ["tracing/release_max_level_info"]
 min-debug-logs = ["tracing/release_max_level_debug"]
 min-trace-logs = ["tracing/release_max_level_trace"]
-
-partial-persistence = ["reth-stages-types/partial-persistence"]
 
 # Debug recording for sparse trie mutations
 trie-debug = ["reth-engine-primitives/trie-debug"]

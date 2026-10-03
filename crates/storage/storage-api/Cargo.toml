@@ -18,6 +18,7 @@ merkle_db_rs.workspace = true
 # reth
 reth-db-models.workspace = true
 reth-chainspec.workspace = true
+reth-chain-state = { workspace = true, optional = true }
 reth-db-api = { workspace = true, optional = true }
 reth-execution-types.workspace = true
 reth-primitives-traits.workspace = true
@@ -39,12 +40,10 @@ auto_impl.workspace = true
 # N42: the state reader registry logs verify-mode mismatches.
 tracing = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-reth-tokio-util = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["sync"], optional = true }
 
 [dev-dependencies]
 alloy-primitives = { workspace = true, features = ["getrandom"] }
-tokio = { workspace = true, features = ["macros", "rt"] }
-tokio-stream.workspace = true
 
 
 [features]
@@ -65,7 +64,6 @@ std = [
     "reth-db-models/std",
     "reth-trie-common/std",
     "serde_json?/std",
-    "dep:reth-tokio-util",
     "alloy-eip7928/std",
     "dep:tracing",
 ]
@@ -75,7 +73,13 @@ db-api = [
     "dep:serde_json",
 ]
 
+chain-state = [
+    "dep:reth-chain-state",
+    "dep:tokio",
+]
+
 serde = [
+    "reth-chain-state?/serde",
     "reth-ethereum-primitives/serde",
     "reth-db-models/serde",
     "reth-execution-types/serde",

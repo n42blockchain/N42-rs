@@ -7,7 +7,8 @@ use n42_primitives::{
     BeaconBlock, BeaconBlockChangeset, BeaconState, BeaconStateChangeset, Validator,
 };
 use reth_storage_errors::ProviderResult;
-use std::ops::RangeInclusive;
+use alloc::vec::Vec;
+use core::ops::RangeInclusive;
 
 #[auto_impl(&, Arc, Box)]
 pub trait BeaconReader {

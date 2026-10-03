@@ -33,6 +33,7 @@ pub mod chain_alias;
 /// What a block's execution produced, by hash (deferred execution).
 pub use n42_qmdb_reth::executed_fields;
 pub mod direct_build;
+pub mod memory_overlay;
 //mod job_generator;
 //mod job;
 //mod metrics;

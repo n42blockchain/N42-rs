@@ -7909,6 +7909,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-core-layout"
+version = "2.1.5"
+dependencies = [
+ "libc",
+ "tracing",
+]
+
+[[package]]
 name = "n42-ef-tests"
 version = "2.1.5"
 dependencies = [

@@ -1430,3 +1430,32 @@ median 6-7 ms later and a 10% longer cycle, and about 3-6 G more peak resident m
 round, BASE is a single leg, and the box load at leg start was 2.6, 37, 22 and 38 (the first leg alone started quiet), so the 10% is a measured difference of two
 upgrade legs against one current-code leg, not a conclusion about a cause. The `exec_pre_ms` counter reads `-` on every leg (the build-path import line it greps does
 not carry it in this configuration).
+
+### 10.58 What still costs the v2.7.0 upgrade 10% (loop310): the sender cache and txpool prewarming are not it; upstream's state-trie overlay pool is the extra CPU
+
+loop309's UPFIX and BASE logs show no new per-block INFO/WARN template on the upgrade (the only UPFIX-only lines are a handful of `build on own block refused`,
+`a parallel step skipped`, `a frame has been held at the ingest gate` events, 1-5 per leg, plus 5% fewer blocks), so the extra work is silent. Field by field (medians
+over `txs=163000` blocks) the upgrade is uniformly 5-10% slower rather than slow in one place: `par_exec` 33 against 31 ms, `sealed_at` 88 / 82, `state_ready` 154 / 142,
+`finish` 162 / 148, build `total` 275 / 257, `shard_append` 277 / 236 ms, follower `exec` 46 / 43, `root` 32 / 30, `fields_ready` 96 / 91, `engine` 35 / 31 ms. The per-thread
+CPU sampler (`threadcpu-loop309*.tsv`) names the difference: a `state-ovly` worker pool (reth's `OverlayManager` for state-trie overlays, 4 threads by default,
+`DEFAULT_STATE_TRIE_OVERLAY_WORKER_THREADS`, no CLI flag) burns 22,800 units on UPFIX and 0 on BASE, which is the whole of the 262.5k against 243.8k total gap, and
+`txpool-prewarm` 1,063 against 27, `payload-builder` 104 against 3.5. Switches (`engine.rs`, v2.5.1 -> v2.7.0): `--engine.sender-recovery-cache` (env
+`RETH_ENGINE_SENDER_RECOVERY_CACHE`) default false -> true, but the bench passes the flag on both sides so BASE had it on; `--engine.txpool-prewarming` default false, bench
+passes it; block prewarming off (`--engine.disable-prewarming`), persistence threshold 8, buffer target 6, backpressure 1024 all set by `fleet7-env.sh`;
+`--engine.persistence-threshold` default 7 -> 50 and `--engine.num-state-masking-blocks` 0 -> 30 (leg env sets masking 0). loop310 turned the cache and txpool prewarming
+off (`RETH_ENGINE_SENDER_RECOVERY_CACHE=false F7_NO_SENDER_CACHE=1 F7_NO_TXPOOL_PREWARM=1`; `F7_NO_SENDER_CACHE` alone would not disable the cache on v2.7.0).
+
+| leg | win1 TPS | win2 TPS | win1 cycle | sealed_at median / p90 | par_exec | follower imp_exec / batches | imp_fields_ready | imports >600 ms | el_max_peak |
+|---|---|---|---|---|---|---|---|---|---|
+| UPNC | 874,595 | 710,933 | 0.186 s | 85 / 150 ms | 32 ms | 45 / 36 ms | 94 ms | 22 | 32.0 G |
+| BASE | 1,151,104 | 955,483 | 0.141 s | 78 / 115 ms | 30 ms | 40 / 33 ms | 85 ms | 15 | 31.8 G |
+| UPNCb | 900,324 | 608,475 | 0.180 s | 88 / 151 ms | 32 ms | 44 / 35 ms | 91 ms | 20 | 30.6 G |
+| UPFIX | 892,752 | 971,350 | 0.182 s | 87 / 148 ms | 32 ms | 44 / 36 ms | 93 ms | 6 | 36.6 G |
+
+Correctness holds on all four legs (verify written, `invalid_blocks`, `no_variant`, `own_not_committed`, `unanswered_reads`, `direct_imports_failed`, `gas_mismatch`
+0; `tc` 4, 1, 3, 2). The two switches took `txpool-prewarm` CPU to 0 and the peak resident memory to BASE's level (32.0 / 30.6 G against 31.8, UPFIX 36.6 in the same
+round and 37.6 / 34.8 in loop309), but not the throughput: UPNC and UPNCb read 875k / 900k against UPFIX's 893k, so they did not close the window-1 gap; the whole upgrade side
+read 21-24% under BASE this round (loop309: 10%), a larger gap than the 10% that motivated the round and a reminder that single legs move by that much. What remains is the
+`state-ovly` pool: 21.3-21.6k CPU units on every upgrade leg (UPNC 21,615, UPNCb 21,410, UPFIX 21,278) against 0 on BASE, a sealed_at p90 of 148-151 against 115 ms and
+`state_ready` 150-153 against 129 ms, which is upstream's `OverlayManager` computing a trie overlay per in-memory tip on the workers the leader and followers share the cores
+with; N42's QMDB root does not use it, so the next step is a vendored switch that keeps the engine from asking for it (not a flag today) and a leg with it off.

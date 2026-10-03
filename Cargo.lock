@@ -11991,6 +11991,7 @@ version = "2.1.5"
 dependencies = [
  "alloy-consensus 2.5.0",
  "alloy-eips 2.5.0",
+ "alloy-genesis",
  "alloy-primitives 1.7.3",
  "alloy-rpc-types-engine 2.5.0",
  "clap",
@@ -12032,6 +12033,7 @@ dependencies = [
  "reth-transaction-pool",
  "secp256k1 0.30.0",
  "serde",
+ "serde_json",
  "strum 0.27.2",
  "thiserror 2.0.21",
  "tokio",

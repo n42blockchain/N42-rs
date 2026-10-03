@@ -417,6 +417,22 @@ pub struct EngineArgs {
     )]
     pub sender_recovery_cache_enabled: bool,
 
+    /// N42: whether the engine's overlay manager builds state-trie and execution overlays for
+    /// in-memory blocks on its `state-ovly` worker pool (upstream v2.7.0's behaviour).
+    ///
+    /// `false` gives the node a manager without a worker pool: nothing is precomputed per
+    /// inserted block, and state reads over in-memory blocks walk the blocks' bundle states per
+    /// read instead of flattening them first. Unset, the node decides: off on a chain whose
+    /// state commitment is QMDB or under `N42_HASHED_TABLES=off` (nothing reads the trie
+    /// overlays there), on otherwise. See [`Self::state_trie_overlay_enabled`].
+    #[arg(
+        long = "engine.state-trie-overlay",
+        env = "RETH_ENGINE_STATE_TRIE_OVERLAY",
+        num_args = 0..=1,
+        default_missing_value = "true",
+    )]
+    pub state_trie_overlay: Option<bool>,
+
     /// CAUTION: This CLI flag has no effect anymore. The parallel sparse trie is always enabled.
     #[deprecated]
     #[arg(long = "engine.parallel-sparse-trie", default_value = "true", hide = true)]
@@ -655,6 +671,7 @@ impl Default for EngineArgs {
             prewarming_disabled,
             txpool_prewarming_enabled,
             sender_recovery_cache_enabled,
+            state_trie_overlay: None,
             parallel_sparse_trie_enabled: true,
             parallel_sparse_trie_disabled: false,
             state_provider_metrics,
@@ -689,6 +706,18 @@ impl Default for EngineArgs {
 }
 
 impl EngineArgs {
+    /// N42: whether the overlay manager does state-trie overlay work, given the chain's genesis.
+    ///
+    /// An explicit `--engine.state-trie-overlay` wins. Unset, it is off when the genesis declares
+    /// the QMDB state commitment (the state root is QMDB's, so the engine never consumes a trie
+    /// overlay) or `N42_HASHED_TABLES=off` (no hashed tables to overlay), and on otherwise.
+    pub fn state_trie_overlay_enabled(&self, genesis: &alloy_genesis::Genesis) -> bool {
+        self.state_trie_overlay.unwrap_or_else(|| {
+            reth_chainspec::qmdb::state_scheme(genesis) != reth_chainspec::qmdb::StateScheme::Qmdb &&
+                !reth_storage_api::n42_state::hashed_tables_off()
+        })
+    }
+
     /// Returns the effective state masking window, disabled when persistence is immediate.
     pub const fn num_state_masking_blocks(&self) -> u64 {
         if self.persistence_threshold == 0 {
@@ -939,6 +968,37 @@ mod tests {
         assert!(!args.sender_recovery_cache_enabled);
     }
 
+    /// N42: `--engine.state-trie-overlay` wins when given; unset, a QMDB genesis turns it off.
+    #[test]
+    fn n42_state_trie_overlay_resolution() {
+        let mpt = alloy_genesis::Genesis::default();
+        let qmdb: alloy_genesis::Genesis =
+            serde_json::from_str(r#"{"config":{"stateScheme":"qmdb"},"alloc":{}}"#).unwrap();
+        assert_eq!(
+            reth_chainspec::qmdb::state_scheme(&qmdb),
+            reth_chainspec::qmdb::StateScheme::Qmdb
+        );
+
+        let args = CommandParser::<EngineArgs>::parse_from(["reth"]).args;
+        assert_eq!(args.state_trie_overlay, None);
+        assert!(!args.state_trie_overlay_enabled(&qmdb));
+        if !reth_storage_api::n42_state::hashed_tables_off() {
+            assert!(args.state_trie_overlay_enabled(&mpt));
+        }
+
+        let args =
+            CommandParser::<EngineArgs>::parse_from(["reth", "--engine.state-trie-overlay"]).args;
+        assert!(args.state_trie_overlay_enabled(&qmdb));
+
+        let args = CommandParser::<EngineArgs>::parse_from([
+            "reth",
+            "--engine.state-trie-overlay",
+            "false",
+        ])
+        .args;
+        assert!(!args.state_trie_overlay_enabled(&mpt));
+    }
+
     #[test]
     #[allow(deprecated)]
     fn engine_args() {
@@ -956,6 +1016,7 @@ mod tests {
             // conflicts with --engine.disable-state-cache, covered by its own test below
             txpool_prewarming_enabled: false,
             sender_recovery_cache_enabled: true,
+            state_trie_overlay: Some(false),
             parallel_sparse_trie_enabled: true,
             parallel_sparse_trie_disabled: false,
             state_provider_metrics: true,
@@ -1002,6 +1063,7 @@ mod tests {
             "--engine.disable-state-cache",
             "--engine.disable-prewarming",
             "--engine.sender-recovery-cache",
+            "--engine.state-trie-overlay=false",
             "--engine.state-provider-metrics",
             "--engine.cross-block-cache-size",
             "256",

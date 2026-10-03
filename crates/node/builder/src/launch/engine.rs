@@ -93,9 +93,15 @@ impl EngineNodeLauncher {
         let NodeHooks { on_component_initialized, on_node_started, .. } = hooks;
 
         // Create the overlay manager that will be shared across the provider and engine.
-        let overlay_manager = OverlayManager::<N::Primitives>::new(
-            ctx.task_executor.state_trie_overlay_worker_pool(),
-        );
+        // N42: `--engine.state-trie-overlay` (default off on a QMDB chain) chooses a manager
+        // without the `state-ovly` worker pool, whose state reads walk the in-memory blocks.
+        let state_trie_overlay = config.engine.state_trie_overlay_enabled(config.chain.genesis());
+        let overlay_manager = if state_trie_overlay {
+            OverlayManager::<N::Primitives>::new(ctx.task_executor.state_trie_overlay_worker_pool())
+        } else {
+            OverlayManager::<N::Primitives>::without_state_trie_overlay()
+        };
+        info!(target: "reth::cli", state_trie_overlay, "Overlay manager created");
         let disabled_stages = N::disabled_stages();
 
         // setup the launch context

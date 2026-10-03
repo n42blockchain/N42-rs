@@ -75,9 +75,94 @@ pub struct ExecutionOverlay {
     storage_wipes: AddressSet,
     /// Bytecode by code hash.
     code_hashes: B256Map<Bytecode>,
+    /// N42: the in-memory blocks' bundle states, newest first, read per lookup instead of being
+    /// flattened into the maps above. Empty unless the manager runs without state-trie overlay
+    /// work (`--engine.state-trie-overlay=false`); the maps above are empty when it is not.
+    layers: ExecutionLayers,
+}
+
+/// N42: one in-memory block's bundle state, read in place by a layered [`ExecutionOverlay`].
+trait BundleLayer: Send + Sync {
+    /// The block's post-execution bundle state.
+    fn bundle(&self) -> &BundleState;
+}
+
+/// N42: an [`ExecutedBlock`] as a [`BundleLayer`].
+struct BlockLayer<N: NodePrimitives>(ExecutedBlock<N>);
+
+impl<N: NodePrimitives> BundleLayer for BlockLayer<N> {
+    fn bundle(&self) -> &BundleState {
+        &self.0.execution_output.state
+    }
+}
+
+/// N42: the layers of a layered [`ExecutionOverlay`], newest block first.
+#[derive(Clone, Default)]
+struct ExecutionLayers(Vec<Arc<dyn BundleLayer>>);
+
+impl std::fmt::Debug for ExecutionLayers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionLayers").field("len", &self.0.len()).finish()
+    }
 }
 
 impl ExecutionOverlay {
+    /// N42: a layered overlay over `blocks` (newest first). Nothing is read or copied: each
+    /// lookup walks the blocks' bundle states, the order v2.5.1's `MemoryOverlayStateProvider`
+    /// read in.
+    pub(crate) fn layered<N: NodePrimitives>(blocks: Vec<ExecutedBlock<N>>) -> Self {
+        let block_hashes =
+            blocks.iter().rev().map(|block| block.recovered_block().num_hash()).collect();
+        let layers = blocks
+            .into_iter()
+            .map(|block| Arc::new(BlockLayer(block)) as Arc<dyn BundleLayer>)
+            .collect();
+        Self { block_hashes, layers: ExecutionLayers(layers), ..Default::default() }
+    }
+
+    /// Whether this overlay reads the blocks' bundle states in place (N42).
+    pub fn is_layered(&self) -> bool {
+        !self.layers.0.is_empty()
+    }
+
+    /// Returns the account state by address: `Some(None)` is a known non-existent account,
+    /// `None` an account no in-memory block touched.
+    pub(crate) fn account(&self, address: &Address) -> Option<Option<AccountInfo>> {
+        if let Some(account) = self.accounts.get(address) {
+            return Some(account.clone())
+        }
+        self.layers.0.iter().find_map(|layer| {
+            layer
+                .bundle()
+                .account(address)
+                .map(|account| Self::normalized_account_info(account.info.clone()))
+        })
+    }
+
+    /// Returns the bytecode for `code_hash` if an in-memory block deployed it.
+    pub(crate) fn bytecode(&self, code_hash: &B256) -> Option<Bytecode> {
+        if let Some(bytecode) = self.code_hashes.get(code_hash) {
+            return Some(bytecode.clone())
+        }
+        self.layers.0.iter().find_map(|layer| layer.bundle().contracts.get(code_hash).cloned())
+    }
+
+    /// N42: the layered storage lookup, newest block first. A block that wrote the slot answers
+    /// it; a block that destroyed the account without writing it answers zero; otherwise the
+    /// next older block is asked.
+    fn layered_storage_value(&self, address: Address, slot: U256) -> Option<U256> {
+        for layer in &self.layers.0 {
+            let Some(account) = layer.bundle().account(&address) else { continue };
+            if let Some(value) = account.storage.get(&slot) {
+                return Some(value.present_value)
+            }
+            if account.was_destroyed() {
+                return Some(U256::ZERO)
+            }
+        }
+        None
+    }
+
     /// Returns the in-memory block hashes in ascending block-number order.
     pub const fn block_hashes(&self) -> &[BlockNumHash] {
         self.block_hashes.as_slice()
@@ -101,6 +186,7 @@ impl ExecutionOverlay {
             .and_then(|storage| storage.get(&slot))
             .copied()
             .or_else(|| self.storage_wipes.contains(&address).then_some(U256::ZERO))
+            .or_else(|| self.layered_storage_value(address, slot))
     }
 
     /// Returns the bytecode by code hash.

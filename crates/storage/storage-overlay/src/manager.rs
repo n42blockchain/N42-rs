@@ -50,6 +50,10 @@ pub struct OverlayManager<N: NodePrimitives = EthPrimitives> {
     worker_pool: Option<Arc<WorkerPool>>,
     metrics: StateTrieOverlayMetrics,
     execution_metrics: ExecutionOverlayMetrics,
+    /// N42: whether execution overlays are read in place from the blocks' bundle states
+    /// ([`ExecutionOverlay::layered`]) instead of flattened, cached and precomputed per tip.
+    /// Set by [`Self::without_state_trie_overlay`].
+    layered: bool,
 }
 
 impl<N: NodePrimitives> Default for OverlayManager<N> {
@@ -64,6 +68,7 @@ impl<N: NodePrimitives> Default for OverlayManager<N> {
             worker_pool: None,
             metrics: Default::default(),
             execution_metrics: Default::default(),
+            layered: false,
         }
     }
 }
@@ -91,7 +96,27 @@ impl<N: NodePrimitives> OverlayManager<N> {
             worker_pool: Some(worker_pool),
             metrics: Default::default(),
             execution_metrics: Default::default(),
+            layered: false,
         }
+    }
+
+    /// N42: a manager that does no overlay work of its own (`--engine.state-trie-overlay=false`).
+    ///
+    /// It holds no worker pool, so nothing is precomputed when a block is inserted and nothing
+    /// runs on the `state-ovly` threads. Execution overlays are layered: a state provider over an
+    /// in-memory tip reads the blocks' bundle states newest first per lookup (v2.5.1's
+    /// `MemoryOverlayStateProvider` order) instead of flattening every block from the anchor
+    /// into one map before its first read. State trie overlays (hashed state + trie updates,
+    /// for Merkle-Patricia roots and proofs) are still built on demand, on the caller's thread;
+    /// a node whose state root is not the trie's (QMDB) does not ask for them.
+    pub fn without_state_trie_overlay() -> Self {
+        Self { layered: true, ..Default::default() }
+    }
+
+    /// Whether this manager builds state-trie and execution overlays (upstream's behaviour), as
+    /// opposed to [`Self::without_state_trie_overlay`].
+    pub const fn state_trie_overlay_enabled(&self) -> bool {
+        !self.layered
     }
 
     /// Creates an overlay builder for `parent_hash`.
@@ -254,6 +279,11 @@ impl<N: NodePrimitives> OverlayManager<N> {
             Entry::Vacant(entry) => {
                 entry.insert(block);
             }
+        }
+
+        // N42: a layered manager caches no execution overlays, so there is nothing to extend.
+        if self.layered {
+            return
         }
 
         // Snapshot matching parent overlays before spawning so DashMap iteration guards are
@@ -456,6 +486,12 @@ impl<N: NodePrimitives> OverlayManager<N> {
         let parent_hash = parent_state.hash();
         if parent_hash == anchor_hash {
             return Ok(Some(Arc::new(ExecutionOverlay::default())))
+        }
+
+        // N42: layered reads need only the block path, resolved without touching block state.
+        if self.layered {
+            let blocks = Self::blocks_from_parent_state(parent_state, anchor_hash)?;
+            return Ok(Some(Arc::new(ExecutionOverlay::layered(blocks))))
         }
 
         self.get_or_compute_overlay(
@@ -1177,6 +1213,69 @@ mod tests {
             .execution_overlay_for_parent(blocks[2].recovered_block().hash(), short_anchor)
             .unwrap();
         assert_eq!(short.accounts().len(), 1);
+    }
+
+    /// N42: a manager without state-trie overlay work answers every lookup the flattened overlay
+    /// answers -- later blocks shadowing earlier ones, a destroyed account's unwritten slots
+    /// reading zero -- and caches nothing.
+    #[test]
+    fn n42_layered_execution_overlay_matches_flattened() {
+        let mut blocks = test_blocks();
+        // Block 3 also rewrites account 1 and destroys account 2.
+        let (one, two) = (Address::with_last_byte(1), Address::with_last_byte(2));
+        let mut output = (*blocks[2].execution_output).clone();
+        let mut extra = BundleState::builder(blocks[2].block_number()..=blocks[2].block_number())
+            .state_present_account_info(one, AccountInfo { nonce: 9, ..Default::default() })
+            .state_storage(one, HashMap::from_iter([(U256::from(7), (U256::ZERO, U256::from(70)))]))
+            .build();
+        extra.state.get_mut(&one).unwrap().info.as_mut().unwrap().account_id =
+            AccountId::new(9);
+        let mut destroyed = revm::database::BundleAccount::new(
+            None,
+            None,
+            Default::default(),
+            revm::database::AccountStatus::Destroyed,
+        );
+        destroyed.storage.clear();
+        extra.state.insert(two, destroyed);
+        output.state.extend(extra);
+        blocks[2].execution_output = Arc::new(output);
+
+        let flat = OverlayManager::default();
+        let layered = OverlayManager::without_state_trie_overlay();
+        assert!(!layered.state_trie_overlay_enabled());
+        for block in &blocks {
+            flat.insert_block(block.clone());
+            layered.insert_block(block.clone());
+        }
+        let tip = blocks[2].recovered_block().hash();
+        for anchor in [blocks[0].recovered_block().parent_hash(), blocks[1].recovered_block().hash()]
+        {
+            let a = flat.execution_overlay_for_parent(tip, anchor).unwrap();
+            let b = layered.execution_overlay_for_parent(tip, anchor).unwrap();
+            assert!(b.is_layered() && !a.is_layered());
+            assert_eq!(a.block_hashes(), b.block_hashes());
+            for id in 1..=4u8 {
+                let address = Address::with_last_byte(id);
+                assert_eq!(a.account(&address), b.account(&address), "account {id}");
+                for slot in [U256::from(id), U256::from(7), U256::from(200)] {
+                    assert_eq!(
+                        a.storage_value(address, slot),
+                        b.storage_value(address, slot),
+                        "account {id} slot {slot}"
+                    );
+                }
+                let code_hash = B256::with_last_byte(id + 64);
+                assert_eq!(a.bytecode(&code_hash), b.bytecode(&code_hash), "code {id}");
+            }
+        }
+        let b = layered
+            .execution_overlay_for_parent(tip, blocks[0].recovered_block().parent_hash())
+            .unwrap();
+        assert_eq!(b.account(&one).unwrap().unwrap().nonce, 9);
+        assert_eq!(b.account(&one).unwrap().unwrap().account_id, None);
+        assert_eq!(b.storage_value(two, U256::from(2)), Some(U256::ZERO));
+        assert_eq!(layered.execution_overlays.len(), 0);
     }
 
     #[test]

@@ -22,8 +22,6 @@ n42-h2-consensus.workspace = true
 libp2p = { workspace = true, features = ["gossipsub", "tokio", "tcp", "noise", "yamux", "macros", "secp256k1", "request-response", "identify"] }
 futures = "0.3"
 snap.workspace = true
-# libp2p's Codec trait is #[async_trait], so the impl must be annotated too.
-async-trait = "0.1"
 tokio = { workspace = true, features = ["rt", "macros"] }
 
 alloy-primitives = { workspace = true, features = ["serde"] }

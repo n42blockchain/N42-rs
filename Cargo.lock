@@ -8250,7 +8250,6 @@ dependencies = [
  "alloy-primitives 1.7.3",
  "alloy-rlp",
  "alloy-rpc-types-engine 2.5.0",
- "async-trait",
  "futures",
  "hex",
  "libp2p",

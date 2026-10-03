@@ -13,7 +13,6 @@
 
 use std::io;
 
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response;
 use libp2p::StreamProtocol;
@@ -104,7 +103,6 @@ fn to_io(e: crate::status::StatusError) -> io::Error {
 #[derive(Debug, Clone, Default)]
 pub struct StatusCodec;
 
-#[async_trait]
 impl request_response::Codec for StatusCodec {
     type Protocol = StreamProtocol;
     type Request = Status;
@@ -354,7 +352,6 @@ pub type BlockReply = Result<BlockChunk, String>;
 #[derive(Debug, Clone, Default)]
 pub struct BlockByHashCodec;
 
-#[async_trait]
 impl request_response::Codec for BlockByHashCodec {
     type Protocol = StreamProtocol;
     type Request = B256;
@@ -537,7 +534,6 @@ fn decode_txns(bytes: &[u8]) -> io::Result<Vec<alloy_primitives::Bytes>> {
     Ok(txns)
 }
 
-#[async_trait]
 impl request_response::Codec for BlockTxnsCodec {
     type Protocol = StreamProtocol;
     type Request = BlockTxnsRequest;
@@ -697,7 +693,6 @@ pub fn block_push_protocol() -> StreamProtocol {
 #[derive(Debug, Clone, Default)]
 pub struct BlockPushCodec;
 
-#[async_trait]
 impl request_response::Codec for BlockPushCodec {
     type Protocol = StreamProtocol;
     type Request = BlockChunk;
@@ -927,7 +922,6 @@ pub type RangeReply = Result<Vec<BlockChunk>, String>;
 #[derive(Debug, Clone, Default)]
 pub struct BodiesByRangeCodec;
 
-#[async_trait]
 impl request_response::Codec for BodiesByRangeCodec {
     type Protocol = StreamProtocol;
     type Request = RangeRequest;

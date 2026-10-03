@@ -20,10 +20,12 @@ alloy-serde.workspace = true
 reth-primitives-traits = { workspace = true, features = ["std", "serde", "reth-codec"] }
 reth-ethereum-primitives = { workspace = true, features = ["std", "serde", "reth-codec"] }
 reth-codecs = { workspace = true, features = ["std", "alloy"] }
-ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "fast", "batch", "zeroize"] }
+ed25519-dalek = { version = "3.0", default-features = false, features = ["fast", "batch", "zeroize"] }
 # ed25519-dalek's batch equation with each key's terms merged (`alt_sig::batch_holds`): the
-# crates, versions and transcript its own batch verification is built on (all in its lock).
-curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "zeroize", "precomputed-tables"] }
+# curve version its own batch verification is built on, and the Merlin v1.0 transcript it draws
+# the coefficients from (ed25519-dalek 3.0 carries its own copy of that protocol on strobe-rs;
+# the `merlin` crate implements the same one, and it keeps rand_core 0.6 for its RNG builder).
+curve25519-dalek = { version = "5.0", default-features = false, features = ["alloc", "zeroize", "precomputed-tables"] }
 merlin = { version = "3", default-features = false }
 rand_core = { version = "0.6", default-features = false }
 sha2.workspace = true

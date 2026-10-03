@@ -101,7 +101,7 @@ tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 alloy-eip7928.workspace = true
 serde_json.workspace = true
 # `claimed_build`'s tests sign the transactions they check the claim of.
-ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "fast"] }
+ed25519-dalek = { version = "3.0", default-features = false, features = ["fast"] }
 secp256k1.workspace = true
 # `bench_build_prefetch` serves its state from a QMDB read view over an entry file it writes.
 n42-twig-core.workspace = true

@@ -168,6 +168,59 @@ Masking 0 is v2.5.1's behaviour (state persisted with its blocks). With masking 
 state stays only in memory, the anchor of the in-memory chain sits above the state/trie frontier,
 and `n42_layered_state_provider` declines (upstream's path) -- so keep masking at 0.
 
+## The `state-ovly` pool and `--engine.state-trie-overlay`
+
+loop309/310's per-thread CPU accounting put the remaining upgrade cost on one place: the
+`state-ovly` worker pool (`reth_tasks::Runtime::state_trie_overlay_worker_pool`,
+`DEFAULT_STATE_TRIE_OVERLAY_WORKER_THREADS = 4`) burnt ~21-22k CPU units per leg on every v2.7.0
+leg and 0 on v2.5.1. The pool belongs to `reth-storage-overlay`'s `OverlayManager`, shared by the
+provider factory and the engine tree. What it runs:
+
+- **Execution overlays.** Any `OverlayStateProvider` over an in-memory tip flattens every block
+  from the persisted anchor to that tip into one `ExecutionOverlay` (accounts, storage, code) on
+  its first read, cached per (anchor, tip); the computation runs on the pool and the opener waits.
+  The engine tree's payload validator opens one per `newPayload` (its own
+  `OverlayStateProviderFactory`, not the `BlockchainProvider` path fixed above), and so does any
+  `BlockchainProvider` read that falls back to upstream's path.
+- **Precompute on insert.** `OverlayManager::insert_block` (every block the tree inserts,
+  `InsertExecutedBlock` included) spawns a pool task extending the parent tip's cached execution
+  overlay by the new block -- once one overlay is cached, every following block keeps one built,
+  147k accounts a block on the fleet, and the whole chain is re-merged from scratch after each
+  persistence moves the anchor.
+- **State trie overlays** (merged trie updates + hashed post-state for the Merkle-Patricia
+  root, proofs and the sparse trie). Consumed by the engine's default state-root task and by
+  `eth_getProof`-style readers; `QmdbStateRootStrategy` never asks for them, and the payload-builder
+  state-root handle stays at the trait default (`None`).
+
+On a QMDB chain nothing consumes the flattened overlays beyond the reads themselves, which
+v2.5.1 answered by walking the in-memory blocks per read.
+
+The switch: `--engine.state-trie-overlay <bool>` (env `RETH_ENGINE_STATE_TRIE_OVERLAY`, a new
+`Option<bool>` field on the vendored `EngineArgs`). Unset, `EngineArgs::state_trie_overlay_enabled`
+resolves it from the genesis: **false** when the chain declares the QMDB state commitment or
+`N42_HASHED_TABLES=off`, **true** otherwise (upstream's behaviour). `launch/engine.rs` then builds
+either `OverlayManager::new(pool)` (true) or `OverlayManager::without_state_trie_overlay()`
+(false); the startup log line `Overlay manager created state_trie_overlay=...` says which. With
+false:
+
+- the manager holds no worker pool, so `insert_block` schedules nothing and no task ever reaches
+  `state-ovly`; `crates/ethereum/cli/src/app.rs` also sizes that pool at one idle thread instead
+  of four (the runtime always builds it);
+- execution overlays are **layered** (`ExecutionOverlay::layered`): opening one only resolves the
+  block path from the anchor to the tip; each account / storage / bytecode read then looks the
+  blocks' `BundleState`s up newest first (a written slot answers; a destroyed account's unwritten
+  slot answers zero; otherwise the next older block, then the database) -- v2.5.1's
+  `MemoryOverlayStateProvider` order. Nothing is cached in the manager. This is the fallback for
+  the engine validator's reads, which would otherwise have waited on the flattening inline;
+- state trie overlays still work, computed on demand on the caller's thread and cached as before,
+  so Merkle-Patricia roots and proofs over in-memory blocks keep answering on a chain that asks.
+
+`n42_layered_execution_overlay_matches_flattened` (storage-overlay, `manager.rs`) checks the
+layered and flattened overlays answer the same accounts (account ids stripped), storage (including
+a later block shadowing an earlier one and a destroyed account) and bytecode at two anchors, and
+that the layered manager caches nothing. storage-overlay is not a workspace member: its 54 lib
+tests were run by adding it to `members` temporarily.
+
 ## Not verified
 
 Nothing was run on a node or the fleet; no throughput round was taken on v2.7.0. The QMDB hooks on

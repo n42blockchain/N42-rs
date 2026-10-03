@@ -2291,6 +2291,93 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("clean up");
     }
 
+    /// A pre-generated set on disk still replays under the Ed25519 crate this
+    /// flood is built with, without a node: its headers match the arguments
+    /// it was generated with, each sampled worker's first frame is the frame
+    /// the live flood signs today byte for byte (Ed25519 signing is
+    /// deterministic, so a crate change that signed differently shows here),
+    /// every 0x50 transaction verifies in one batch to its sender, and every
+    /// frame's attestation passes the gateway check over its root.
+    ///
+    /// The defaults are loop299's `/data/n42-pregen/g900000` (`--alg ed25519
+    /// --chain-id 1143 --senders 6000 --pertx 32000 --offset 900000 --gasprice
+    /// 1e24 --gas 21000 --recipients 2000000 --rpcbatch 500 --conc 64
+    /// --gateway-key seed:n42-bench-gateway`); `N42_PREGEN_SET` names another
+    /// directory generated with the same arguments.
+    /// `cargo test --release -p n42-h2-node --example tx_flood pregen_set_on_disk -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads a pre-generated set from /data"]
+    fn pregen_set_on_disk_replays_and_verifies() {
+        let dir = std::env::var("N42_PREGEN_SET").unwrap_or_else(|_| "/data/n42-pregen/g900000".into());
+        let dir = std::path::Path::new(&dir);
+        let mut args = default_args();
+        args.alg = "ed25519".into();
+        args.chain_id = 1143;
+        args.senders = 6000;
+        args.per_tx = 32_000;
+        args.offset = 900_000;
+        args.gas_price = 1_000_000_000_000_000_000_000_000;
+        args.gas = 21_000;
+        args.recipients = 2_000_000;
+        args.rpc_batch = 500;
+        args.conc = 64;
+        args.claim_sender = false;
+        args.gateway = Some(parse_gateway_key("seed:n42-bench-gateway").expect("key"));
+        let chunk = args.senders.div_ceil(args.conc);
+        let mut set = open_replay_set(dir, &args, chunk).expect("the set opens against its arguments");
+        let gateway = args.gateway.as_ref().expect("key");
+        let gateways = n42_tx_types::FrameGateways::new(vec![gateway.verifying_key()], 1);
+        let workers = set.len();
+        let (mut frames, mut txs) = (0usize, 0usize);
+        for worker in [0, workers / 2, workers - 1] {
+            let file = &mut set[worker];
+            let first_sender = file.header.first_sender as usize;
+            for record in 0..3 {
+                let (local, frame, count) = file.reader.next().expect("readable").expect("a frame");
+                let key = derive(args.offset, first_sender + local, true);
+                if record == 0 {
+                    assert_eq!(local, 0, "{}: the first frame is the first sender's", file.path.display());
+                    let (live, live_count) = live_frame(&key, first_sender, 0, 0, &args);
+                    assert_eq!(live_count, count);
+                    assert!(live == frame, "{}: the first frame differs from the live flood's", file.path.display());
+                }
+                let head = u32::from_le_bytes(frame[..4].try_into().expect("4"));
+                assert_eq!(head & FRAME_CLAIMS, 0, "the set does not claim senders");
+                assert_ne!(head & FRAME_ATTESTED, 0, "the set is attested");
+                let mut at = 4usize;
+                let mut decoded = Vec::with_capacity(count);
+                let mut hashes = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let len = u32::from_le_bytes(frame[at..at + 4].try_into().expect("4")) as usize;
+                    let raw = &frame[at + 4..at + 4 + len];
+                    hashes.push(keccak256(raw));
+                    let tx = <n42_tx_types::AltSigTx as alloy_eips::eip2718::Decodable2718>::decode_2718(&mut &raw[..])
+                        .expect("a 0x50 transaction");
+                    decoded.push(tx);
+                    at += 4 + len;
+                }
+                let attestations = frame[at] as usize;
+                assert_eq!(frame.len(), at + 1 + attestations * 96, "the attestations end the frame");
+                let attestations: Vec<n42_tx_types::FrameAttestation> = (0..attestations)
+                    .map(|i| {
+                        let mut raw = [0u8; 96];
+                        raw.copy_from_slice(&frame[at + 1 + i * 96..at + 1 + (i + 1) * 96]);
+                        n42_tx_types::FrameAttestation::from_bytes(&raw)
+                    })
+                    .collect();
+                let root = n42_tx_types::frame_root(&hashes);
+                assert!(gateways.check(args.chain_id, root, &attestations).attested, "the attestation verifies");
+                let refs: Vec<&n42_tx_types::AltSigTx> = decoded.iter().collect();
+                for verdict in n42_tx_types::verify_batch(&refs) {
+                    assert_eq!(verdict.expect("the signature verifies"), key.address());
+                }
+                frames += 1;
+                txs += count;
+            }
+        }
+        println!("pregen set {}: {workers} workers, {frames} frames and {txs} transactions verified", dir.display());
+    }
+
     /// A disabled bucket (`rate <= 0`) never blocks, whatever it is asked
     /// for.
     #[test]

@@ -1484,3 +1484,16 @@ accounts for most of the loop309/loop310 gap. The first UPOFF leg is outside the
 The reth v2.7.0 upgrade (upgrade/reth-v2.7.0) was merged into feat/native-fleet7 at 8b4704f4c (tag reth-v2.7.0-merged-20261003). Decision: correct on four fleet rounds (12 upgrade legs, every error counter 0) and window-1 throughput is within the one-configuration spread (-4.9% / -1.6% on loop311).
 Open items: the remaining ~3% window-1 gap and the ~3.5 GB higher peak RSS.
 The record 1,226,047 was set on v2.5.1; the next legs re-baseline on v2.7.0.
+
+### 10.60 The new baseline on reth v2.7.0 (loop312): B1-B3 1.186M / 1.146M / 1.197M, mean 1.176M; AHEAD 1.216M but with a 40.7 G peak
+
+Tip d859eb00f (reth v2.7.0, ed25519-dalek 3.0), native build, overlay manager off (the default since 709b861eb). Legs interleaved B1, AHEAD, B2, B3; B1-B3 are identical, AHEAD adds `N42_BUILD_AHEAD_AT_SEAL=1`. All four legs: verify pass, invalid_blocks, no_variant, own_not_committed, unanswered_reads, direct_imports_failed, incomplete, gas_mismatch all 0, tc=1, 0 ERROR/panicked lines, `state_trie_overlay=false` on 3 nodes, `state-ovly` CPU 0. (The runner's `node3` grep/traceback noise is the 3-node fleet having no node3, as in loop311.)
+
+| leg | win1 | win2 | cycle w1 | sealed_at med | par_exec | imp_exec / total | imports >600 ms | el_max peak | min avail |
+|---|---|---|---|---|---|---|---|---|---|
+| B1 | 1,185,656 | 901,431 | 0.137 s | 80 ms | 30 ms | 43 / 144 ms | 6 | 33.0 G | 40.6 G |
+| AHEAD | 1,215,559 | 624,244 (53% occupancy) | 0.130 s | 99 ms | 32 ms | 45 / 155 ms | 9 | 40.7 G | 27.7 G |
+| B2 | 1,145,671 | 926,945 | 0.142 s | 84 ms | 31 ms | 44 / 143 ms | 3 | 32.1 G | 42.2 G |
+| B3 | 1,196,982 | 912,669 | 0.135 s | 82 ms | 31 ms | 43 / 141 ms | 6 | 33.2 G | 38.0 G |
+
+The baseline on v2.7.0 is the mean of B1-B3, 1,176,103 TPS in window 1 (range 1,145,671-1,196,982, spread 4.4% of the mean), against 1,180,769 for loop311's BASE on v2.5.1: -0.4%, inside the round-to-round spread, so the upgrade's earlier ~3% window-1 gap is not visible at this resolution. The B legs' el_max peak is 32-33 G (v2.5.1 BASE 31.4 G in loop309). No leg exceeds the record 1,226,047 (AHEAD is 0.9% below it). AHEAD read +3.4% over the B mean in window 1, within about the spread of the B legs themselves (one leg, so not a conclusion); it moved sealed_at median from 80-84 to 99 ms, raised el_max peak to 40.7 G and cut min available memory to 27.7 G, and its window 2 fell to 624k at 53% occupancy against 901-927k. The per-leg root_faults p90 is not printed by this runner.

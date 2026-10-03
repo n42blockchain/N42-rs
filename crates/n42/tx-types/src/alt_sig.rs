@@ -390,7 +390,8 @@ fn batch_holds(messages: &[&[u8]], signatures: &[EdSignature], keys: &[Verifying
     }
 }
 
-/// ed25519-dalek's batch verification (`ed25519_dalek::verify_batch`, 2.2) with the terms of
+/// ed25519-dalek's batch verification (`ed25519_dalek::verify_batch`, 3.0; the equation and
+/// its Merlin v1.0 transcript are unchanged from 2.2, only vendored there) with the terms of
 /// equal keys merged. It checks
 /// `(-sum z_i s_i) B + sum z_i R_i + sum (z_i H(R_i || A_i || M_i)) A_i = 0`
 /// with the random `z_i` drawn from the same transcript in the same order, and adds the

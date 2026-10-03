@@ -1407,3 +1407,26 @@ span 3.2%), and the cycle mean doubles 138-142 -> 281-282 ms. The follower's bat
 hold at 554-565k on UP, where BASE's window 2 falls to 809-923k and window 3 reads 0 (the supply is spent), because UP spends fewer transactions per window. Not
 determined: why the follower's execution batches are slower on v2.7.0 (revm, the execution-layer crates or the masking-off setting are all untested here); the
 leg ran with masking off, so the default masking was not measured at all.
+
+### 10.57 The v2.7.0 upgrade with the per-read overlay (loop309): within the spread of the current code, and the upstream path reproduces the slowdown
+
+loop309 ran the `upgrade/reth-v2.7.0` branch with the per-read overlay fix (`9ce4e2830`) against the same branch with `N42_OVERLAY_READS=upstream` (the upstream
+flattening) and against the current code, interleaved UPFIX, BASE, UPFIXb, UPUP, all with `RETH_ENGINE_NUM_STATE_MASKING_BLOCKS=0` on the upgrade legs.
+
+| leg | win1 TPS | win2 TPS | win1 cycle | sealed_at median / p90 | par_exec | follower imp_exec / batches | imp_fields_ready | imports >600 ms | el_max_peak |
+|---|---|---|---|---|---|---|---|---|---|
+| UPFIX | 1,039,868 | 858,431 | 0.156 s | 88 / 163 ms | 33 ms | 46 / 36 ms | 96 ms | 8 | 37.6 G |
+| BASE | 1,161,874 | 836,294 | 0.140 s | 82 / 153 ms | 31 ms | 43 / 34 ms | 91 ms | 10 | 31.4 G |
+| UPFIXb | 1,037,543 | 798,033 | 0.156 s | 89 / 160 ms | 33 ms | 46 / 37 ms | 95 ms | 6 | 34.8 G |
+| UPUP | 534,270 | 428,980 | 0.303 s | 201 / 579 ms | 43 ms | 111 / 104 ms | 259 ms | 165 | 14.6 G |
+
+Correctness holds on all four legs: the verify line passes at three nodes with quorum 3 (common heights 2112, 2265, 2026, 1153), `invalid_blocks`, `no_variant`,
+`own_not_committed`, `unanswered_reads`, `direct_imports_failed`, `incomplete`, `gas_mismatch` and the `foreign body refused`, ERROR and panicked counts are all 0;
+`tc` is 1-2 per leg. The fix restores the follower: its batch time is 36-37 ms against BASE's 34 (loop308's UP read 104-107 on the same counter) and `imp_fields_ready`
+is 95-96 ms against 91, and UPUP reproduces loop308's slow path exactly (104 ms batches, window 1 at 534k), so the overlay setting is what separates the two.
+UPFIX is not within the ~4% spread of BASE on window 1: 1.04M against 1.16M is 10.5% lower (UPFIXb agrees at 1.038M, so the gap repeats), while window 2 is within
+the spread (858k / 798k against 836k). What still differs from the current code is a follower execution 3 ms slower, a leader `par_exec` 2 ms longer, a sealed_at
+median 6-7 ms later and a 10% longer cycle, and about 3-6 G more peak resident memory per node; the cause of that remainder was not isolated here. Each leg is one
+round, BASE is a single leg, and the box load at leg start was 2.6, 37, 22 and 38 (the first leg alone started quiet), so the 10% is a measured difference of two
+upgrade legs against one current-code leg, not a conclusion about a cause. The `exec_pre_ms` counter reads `-` on every leg (the build-path import line it greps does
+not carry it in this configuration).

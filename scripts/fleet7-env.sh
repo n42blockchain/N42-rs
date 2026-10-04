@@ -654,6 +654,14 @@ f7_smt_offset() {
 f7_pin() {
   local i=$1 lo hi off
   [[ $F7_PIN == 1 ]] || return 0
+  # F7_PIN_SWAP=a:b (default unset: today's layout) gives node a the CPU list of
+  # node b and the reverse; ports, datadirs and the feed order keep their index.
+  # A measurement variable: it tells whether a node's cost follows the cores or
+  # the node.
+  if [[ -n ${F7_PIN_SWAP:-} ]]; then
+    local sa=${F7_PIN_SWAP%%:*} sb=${F7_PIN_SWAP##*:}
+    if ((i == sa)); then i=$sb; elif ((i == sb)); then i=$sa; fi
+  fi
   if [[ ${F7_PIN_PHYSICAL:-1} == 1 ]]; then
     off=$(f7_smt_offset)
     lo=$((F7_CORE_OFFSET + i * F7_CORES_PER_NODE / 2))

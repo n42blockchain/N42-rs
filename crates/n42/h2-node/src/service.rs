@@ -230,6 +230,9 @@ pub struct H2Service<E> {
     /// Round 1 votes of the validators outside the quorum before proposing
     /// the next block (see [`Self::with_straggler_grace`]). `None`: not at all.
     straggler_grace: Option<Duration>,
+    /// The leader's build throttle (see [`crate::build_throttle`] and
+    /// [`Self::with_build_throttle`]). `None`: off, the default.
+    build_throttle: Option<crate::build_throttle::BuildThrottle>,
     /// The last transport drain's split: poll ms, handle ms, slowest handle
     /// ms and its event kind (see `drain_transport`).
     last_drain: (u64, u64, u64, &'static str),
@@ -1002,6 +1005,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             block_pacing: None,
             declined_view: None,
             straggler_grace: None,
+            build_throttle: None,
             last_drain: (0, 0, 0, ""),
             proposed_view: None,
             meshed: false,
@@ -1203,6 +1207,15 @@ impl<E: ExecutionLayer> H2Service<E> {
         // The followers' side of it: a block imported after its view passed
         // still tells that view's leader (a progress vote, not a vote).
         self.engine.set_progress_votes(self.straggler_grace.is_some());
+        self
+    }
+
+    /// Holds this leader's proposals back while its execution layer carries
+    /// too many unpersisted blocks (see [`crate::build_throttle`]). Local
+    /// policy: the protocol and the wire are untouched, and a held leader
+    /// keeps voting and importing.
+    pub fn with_build_throttle(mut self, throttle: crate::build_throttle::BuildThrottle) -> Self {
+        self.build_throttle = Some(throttle);
         self
     }
 
@@ -2596,6 +2609,12 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// builder declined this view for the pacing and the tick is still ahead.
     fn deferred_pacing_tick(&self) -> Option<tokio::time::Instant> {
         let view = self.engine.current_view();
+        // A proposal the build throttle holds wakes at the throttle's target
+        // (or at the ordinary re-ask, which re-reads the count, if sooner).
+        if self.proposal_deferred && self.defer_reason == Some(crate::build_throttle::THROTTLE_REASON) {
+            let at = self.build_throttle.as_ref()?.wake_for(view)?;
+            return (at > std::time::Instant::now()).then(|| tokio::time::Instant::from_std(at));
+        }
         if !self.proposal_deferred
             || self.declined_view != Some(view)
             || self.defer_reason != Some("the attribute builder declined")
@@ -2700,6 +2719,19 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.declined_view = Some(view);
             return Ok(());
         };
+        // The build throttle: a leader whose execution layer carries too many
+        // unpersisted blocks proposes later, which is a later take of the
+        // build made for this proposal and a later start of the one after it.
+        // Deferred like the pacing, never waited for here: the loop goes on
+        // voting and importing, and asks again at the target.
+        if let Some(throttle) = self.build_throttle.as_mut()
+            && let crate::build_throttle::Verdict::WaitUntil(_) =
+                throttle.ask(view, self.block_pacing, std::time::Instant::now())
+        {
+            self.proposal_deferred = true;
+            self.defer_reason = Some(crate::build_throttle::THROTTLE_REASON);
+            return Ok(());
+        }
         let attrs_at = decided.elapsed();
         // The proposal's timeline from here: when the builder had declined
         // for this view the proposal waited for the pacing tick, and the
@@ -2886,6 +2918,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                 let sent_at = std::time::Instant::now();
                 let (build_start_after_prev_send_us, build_start_trigger) =
                     build_start_fields(timing.start, self.last_proposal_sent_at);
+                // -1: no throttle, or the count was not known.
+                let (throttle_in_mem, throttle_delay_ms, throttle_hard_holds) =
+                    self.build_throttle.as_ref().map_or((-1, 0, 0), |throttle| {
+                        let applied = throttle.last_applied();
+                        (
+                            applied.in_mem.map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX)),
+                            applied.delay_ms,
+                            throttle.hard_holds(),
+                        )
+                    });
                 self.last_proposal_sent_at = Some(sent_at);
                 info!(
                     target: "n42.h2.node",
@@ -2907,6 +2949,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                     answer_bytes = timing.answer.map_or(0, |a| a.bytes),
                     answer_read_end_us = timing.answer.map_or(0, |a| a.read_end_us),
                     answer_decode_end_us = timing.answer.map_or(0, |a| a.decode_end_us),
+                    throttle_in_mem,
+                    throttle_delay_ms,
+                    throttle_hard_holds,
                     "proposal sent"
                 );
                 // Build-on-seal: the next build starts here, on this block's

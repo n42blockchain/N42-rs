@@ -66,7 +66,7 @@ fn ext(script: Script, raw_endpoint: Option<std::net::SocketAddr>) -> N42EngineE
             }
         }
     });
-    N42EngineExt { payloads: PayloadBuilderHandle::new(tx), raw_endpoint }
+    N42EngineExt { payloads: PayloadBuilderHandle::new(tx), raw_endpoint, in_memory_blocks: None }
 }
 
 #[tokio::test]

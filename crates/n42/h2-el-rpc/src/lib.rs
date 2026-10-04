@@ -26,6 +26,7 @@
 //! ```
 
 pub mod engine;
+pub mod in_memory;
 pub mod transport;
 
 pub use engine::{

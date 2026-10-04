@@ -18,6 +18,7 @@
 //! what `../N42-26`'s equivalent (`n42-consensus-service`) carries that this
 //! does not.
 
+pub mod build_throttle;
 pub mod persistence;
 pub mod service;
 pub mod tx_source;

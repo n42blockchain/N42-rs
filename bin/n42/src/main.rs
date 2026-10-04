@@ -163,9 +163,21 @@ fn main() {
                     let raw_endpoint = std::env::var("N42_PAYLOAD_SERVE")
                         .ok()
                         .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok());
+                    // The canonical head minus the last persisted block:
+                    // two reads of the in-memory state's trackers, no lock
+                    // held across anything. Before the first persistence
+                    // the in-memory chain itself is counted.
+                    let in_memory = ctx.provider().canonical_in_memory_state();
+                    let in_memory_blocks: n42::engine_ext::InMemoryBlocks = std::sync::Arc::new(move || {
+                        match in_memory.get_persisted_num_hash() {
+                            Some(persisted) => in_memory.get_canonical_block_number().saturating_sub(persisted.number),
+                            None => in_memory.canonical_chain().count() as u64,
+                        }
+                    });
                     let engine_ext = N42EngineExt {
                         payloads: ctx.node().payload_builder_handle().clone(),
                         raw_endpoint,
+                        in_memory_blocks: Some(in_memory_blocks),
                     };
 
                     // now we merge our extension namespace into all configured transports

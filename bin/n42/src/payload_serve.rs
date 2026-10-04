@@ -29,6 +29,10 @@
 //!   NEW_PAYLOAD: u32 len, encoded ExecutionData (raw_engine::encode_execution_data)
 //!   reply    := u8 status            1 = payload status follows, 2 = error (u32 len + message)
 //!               u32 len, encoded PayloadStatus
+//!   HOLD_EXECUTION: nothing; prefixes a FOREIGN_BODY / COMPACT_BODY request,
+//!               whose CHECKED frame the caller answers with one byte
+//!               (raw_engine::release: 1 = execute, 0 = drop) before its
+//!               execution starts
 //! ```
 //!
 //! `NEW_PAYLOAD` is the follower's half: the same `engine_newPayload`, handed
@@ -1396,6 +1400,9 @@ async fn import_for_validator<T>(
     started: std::time::Instant,
     decoded: std::time::Duration,
     mut road: crate::follower_import::VoteRoad,
+    // `request::HOLD_EXECUTION`: the execution waits for the validator's
+    // release byte after the CHECKED frame.
+    hold: bool,
 ) -> std::io::Result<()>
 where
     T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
@@ -1458,6 +1465,13 @@ where
         // block is checked, and the validator hears it on a
         // CHECKED frame before the import's answer.
         let (checked_tx, checked_rx) = tokio::sync::oneshot::channel::<()>();
+        // A held execution (`request::HOLD_EXECUTION`): registered before the
+        // import starts, released by the validator's byte after the CHECKED
+        // frame. Dropped unsent -- no CHECKED went out, so no byte comes --
+        // and an execution that reached its hold ends instead of waiting.
+        let held_hash = data.payload.block_hash();
+        let mut release = hold.then(|| crate::follower_import::hold_execution(held_hash));
+        let mut dropped = false;
         road.prepare_us = prepare_at.elapsed().as_micros() as u64;
         // The hand-off itself: what the blocking pool costs before the import
         // runs is `dispatch_ms`, and nothing on the road can shorten it from
@@ -1511,18 +1525,55 @@ where
                         // the wire, so the two together name the wake-up and
                         // the write as well.
                         released_ms = road.started.elapsed().as_millis() as u64,
+                        held = release.is_some(),
                         "checked: answered before the execution"
                     );
+                    // Held: the validator answers the CHECKED frame with one
+                    // byte once it has a slot for the block (or has dropped
+                    // it). Read beside the import, which may end first on an
+                    // error of its own; the byte is read either way, so the
+                    // connection stays in step.
+                    if let Some(release) = release.take() {
+                        let byte = tokio::select! {
+                            byte = stream.read_u8() => byte?,
+                            done = &mut handed => {
+                                finished = Some(done);
+                                stream.read_u8().await?
+                            }
+                        };
+                        dropped = byte != raw_engine::release::EXECUTE;
+                        let _ = release.send(!dropped);
+                    }
                 }
+                // No CHECKED frame, no byte: an execution waiting on its
+                // hold ends now.
+                drop(release.take());
             }
             done = &mut handed => finished = Some(done),
         }
+        drop(release.take());
         let handed = match finished {
             Some(done) => done,
             None => handed.await,
         }
         .map_err(|err| err.to_string())
         .and_then(|r| r);
+        if hold {
+            crate::follower_import::forget_hold(held_hash);
+        }
+        if dropped {
+            // Never canonical (a sibling was committed at its height):
+            // nothing was executed, nothing goes to the engine, and the
+            // assembled block and its senders are freed here.
+            let message = crate::follower_import::HELD_DROPPED;
+            debug!(target: "n42.payload_serve", number, "held import dropped by the validator before its execution");
+            out.clear();
+            out.push(raw_engine::reply::ERROR);
+            out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+            out.extend_from_slice(message.as_bytes());
+            stream.write_all(&out[..]).await?;
+            return Ok(());
+        }
         match handed {
             Ok((executed, phases, converted)) => {
                 // The block the engine's own pass takes instead of decoding
@@ -2019,6 +2070,8 @@ where
     // their runtime threads' time going to the kernel. Grown once, reused.
     let mut frame: Vec<u8> = Vec::new();
     let mut out: Vec<u8> = Vec::new();
+    // Set by `request::HOLD_EXECUTION` for the body request that follows it.
+    let mut hold_next = false;
     loop {
         let read = if stamped {
             crate::road_runtime::read_kind_timed(&stream).await
@@ -2035,6 +2088,13 @@ where
         let started_at = std::time::Instant::now();
         // Before it: the byte in the socket, waiting for this task to run.
         let dispatch_wait_us = dispatch_wait.map_or(0, |waited| waited.as_micros() as u64);
+        if kind == request::HOLD_EXECUTION {
+            hold_next = true;
+            continue;
+        }
+        // Applies to the one request after the prefix, and only a body
+        // request reads it.
+        let hold = std::mem::take(&mut hold_next);
         if kind == request::OWN_BLOCK {
             let len = stream.read_u32_le().await? as usize;
             if len > 1 << 20 {
@@ -2466,6 +2526,7 @@ where
                 started,
                 decoded_in,
                 road,
+                hold,
             )
             .await?;
             continue;
@@ -2561,7 +2622,7 @@ where
                 dispatch_wait_us,
                 started: started_at,
             };
-            import_for_validator::<T>(&mut stream, &mut out, &engine, reuse.as_ref(), data, Some(sealed.into()), None, None, started, decoded_in, road).await?;
+            import_for_validator::<T>(&mut stream, &mut out, &engine, reuse.as_ref(), data, Some(sealed.into()), None, None, started, decoded_in, road, hold).await?;
             continue;
         }
         if kind == request::NEW_PAYLOAD {
@@ -2639,6 +2700,7 @@ where
                             dispatch_wait_us,
                             started: started_at,
                         },
+                        false,
                     )
                     .await?;
                     continue;

@@ -1277,7 +1277,25 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         if !path.uses_current_engine_api() || !n42_h2_execution::body_once() {
             return n42_h2_execution::BodyOutcome::NotThisWay;
         }
-        self.foreign_body_over_channel(body, checked).await
+        self.foreign_body_over_channel(body, checked, None).await
+    }
+
+    fn holds_execution(&self) -> bool {
+        // The hold rides the body road; without it there is nothing to hold.
+        n42_h2_execution::body_once()
+    }
+
+    async fn new_payload_body_held(
+        &self,
+        path: ExecutionPath,
+        body: &n42_h2_execution::ForeignBody,
+        checked: tokio::sync::oneshot::Sender<PayloadStatus>,
+        release: tokio::sync::oneshot::Receiver<bool>,
+    ) -> n42_h2_execution::BodyOutcome {
+        if !path.uses_current_engine_api() || !n42_h2_execution::body_once() {
+            return n42_h2_execution::BodyOutcome::NotThisWay;
+        }
+        self.foreign_body_over_channel(body, checked, Some(release)).await
     }
 
     async fn fork_choice_updated(
@@ -1752,10 +1770,20 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
     /// `NEW_PAYLOAD` payload. A failure *after* the check has been released
     /// is `Some(Err(..))`: that block is already being imported over there
     /// and must not be sent a second time.
+    ///
+    /// With `release` the request is held (`request::HOLD_EXECUTION`,
+    /// `N42_VOTE_BEFORE_SLOT`): after the CHECKED frame the release byte is
+    /// written once `release` answers -- [`release::EXECUTE`] for `true`,
+    /// [`release::DROP`] for `false` or a dropped sender -- and the answer is
+    /// read after it.
+    ///
+    /// [`release::EXECUTE`]: n42_h2_execution::raw_engine::release::EXECUTE
+    /// [`release::DROP`]: n42_h2_execution::raw_engine::release::DROP
     async fn foreign_body_over_channel(
         &self,
         body: &n42_h2_execution::ForeignBody,
         checked: tokio::sync::oneshot::Sender<PayloadStatus>,
+        release: Option<tokio::sync::oneshot::Receiver<bool>>,
     ) -> n42_h2_execution::BodyOutcome {
         use n42_h2_execution::raw_engine::reply;
         use n42_h2_execution::BodyOutcome;
@@ -1774,6 +1802,11 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             &body.rlp,
         );
         let mut checked = Some(checked);
+        let held = release.is_some();
+        let mut release = release;
+        // Set when a held block was dropped here: its error answer is the
+        // drop's, not a failure worth a warning.
+        let mut dropped = false;
         // Set once the execution layer has said anything about this block:
         // from there on a failure is this block's failure, not a reason to
         // send it again.
@@ -1798,6 +1831,9 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             } else {
                 n42_h2_execution::raw_engine::request::FOREIGN_BODY
             };
+            if held {
+                conn.write_u8(n42_h2_execution::raw_engine::request::HOLD_EXECUTION).await?;
+            }
             conn.write_u8(kind).await?;
             conn.write_u32_le(frame.len() as u32).await?;
             conn.write_all(&frame).await?;
@@ -1822,6 +1858,17 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                                 "raw foreign body: checked"
                             );
                             let _ = sender.send(status);
+                        }
+                        // The vote is out; the execution waits for its slot.
+                        if let Some(release) = release.take() {
+                            let execute = release.await.unwrap_or(false);
+                            dropped = !execute;
+                            conn.write_u8(if execute {
+                                n42_h2_execution::raw_engine::release::EXECUTE
+                            } else {
+                                n42_h2_execution::raw_engine::release::DROP
+                            })
+                            .await?;
                         }
                     }
                     reply::NEED_TXNS => {
@@ -1875,6 +1922,10 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                     "the execution layer wants named transactions of this block"
                 );
                 BodyOutcome::NeedTxns(indices)
+            }
+            Err(err) if committed && dropped => {
+                debug!(target: "n42.h2.el", block = ?body.block_hash, %err, "held foreign body dropped before its execution");
+                BodyOutcome::Answered(Err(ElError::new(n42_h2_execution::HELD_IMPORT_DROPPED)))
             }
             Err(err) if committed => {
                 warn!(

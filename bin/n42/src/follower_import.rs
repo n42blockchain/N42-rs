@@ -90,6 +90,44 @@ pub fn note_import_landed() {
     landed.notify_all();
 }
 
+/// Executions held for their validator's release
+/// (`request::HOLD_EXECUTION`, `N42_VOTE_BEFORE_SLOT`), by block hash: the
+/// block is assembled and checked, and its vote released, as always; its
+/// execution waits here until the validator has an import slot for it.
+static HELD_EXECUTIONS: Mutex<Option<std::collections::HashMap<B256, std::sync::mpsc::Receiver<bool>>>> =
+    Mutex::new(None);
+
+/// What a held import's error says when its validator dropped it.
+pub const HELD_DROPPED: &str = n42_h2_execution::HELD_IMPORT_DROPPED;
+
+/// Holds `block_hash`'s execution until the returned sender says `true`
+/// (execute) or `false` (drop). Registered before the import starts; a
+/// sender dropped unsent drops the block too, so an import never waits on a
+/// release that cannot come.
+pub fn hold_execution(block_hash: B256) -> std::sync::mpsc::Sender<bool> {
+    let (release, held) = std::sync::mpsc::channel();
+    HELD_EXECUTIONS.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert_with(Default::default).insert(block_hash, held);
+    release
+}
+
+/// Forgets a hold whose import ended without reaching its execution.
+pub fn forget_hold(block_hash: B256) {
+    if let Some(held) = HELD_EXECUTIONS.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        held.remove(&block_hash);
+    }
+}
+
+/// Waits for `block_hash`'s release when its execution is held; at once
+/// otherwise. `Err` when it was dropped.
+fn wait_for_release(block_hash: B256) -> Result<(), String> {
+    let held = HELD_EXECUTIONS.lock().unwrap_or_else(|p| p.into_inner()).as_mut().and_then(|held| held.remove(&block_hash));
+    let Some(held) = held else { return Ok(()) };
+    match held.recv() {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(HELD_DROPPED.to_owned()),
+    }
+}
+
 /// The execution output of a block imported here, as its child's check reads it.
 type ParentOutput = Arc<reth_provider::BlockExecutionOutput<n42_tx_types::Receipt>>;
 
@@ -2382,6 +2420,13 @@ where
         // returns -- before the block's QMDB root, its hashed post-state and
         // its engine insert, which are meant to run beside the next block's
         // execution.
+        // A held execution (`N42_VOTE_BEFORE_SLOT`) waits here for its
+        // validator's import slot: the vote road -- beside this on its own
+        // thread, or before it -- is not held. Deferred blocks only, the only
+        // ones whose vote comes before their execution.
+        if deferred {
+            wait_for_release(block_hash)?;
+        }
         // The plan made ahead, collected before the gate so that a plan
         // still running never holds another block's execution.
         let ahead_at = std::time::Instant::now();

@@ -518,6 +518,31 @@ mod tests {
     }
 
     #[test]
+    fn a_handover_parent_executed_as_a_follower_needs_no_rename_and_no_wait() {
+        // The next leader's first build is on a peer's block it executed as a
+        // follower: filed under the sealed hash by that import, and its
+        // "builder hash" is the sealed hash (`ParentExecution::Published`).
+        let parent_sealed = B256::repeat_byte(0x91);
+        let (state, genesis) = forest("handover");
+        let ops = n42_qmdb_reth::sorted_operations_from_execution(&parent_bundle(), true);
+        state.insert_block_operations(genesis, parent_sealed, 1, ops).expect("follower import");
+        for early in [false, true] {
+            for built in [Some(parent_sealed), None] {
+                let filed = file_parent_under_seal(&state, parent_sealed, built, early, || {
+                    panic!("a follower-filed parent is never waited for")
+                })
+                .expect("nothing to do");
+                assert_eq!(filed, ParentFiled::default());
+            }
+        }
+        // And the block built on it computes its root there in both modes.
+        let (shards, residual) = child_output();
+        let overlaps = shards.overlaps(&residual);
+        let view = shards.view(&residual, &overlaps);
+        assert!(state.compute_operations(parent_sealed, n42_qmdb_reth::sorted_operations_from_accounts(&view, true)).is_ok());
+    }
+
+    #[test]
     fn the_stamps_are_relative_and_never_negative() {
         let a = std::time::Instant::now();
         let b = a + std::time::Duration::from_micros(250);

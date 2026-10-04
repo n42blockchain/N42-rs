@@ -524,3 +524,126 @@ every node), a slow branch of the node launcher's engine service loop (`took_ms=
 going unpolled (its 250 ms tick never came late). Left: the request not reaching the engine's
 channel in time, or the tree busy with something unlogged before it. The case to exercise on
 purpose is a TC during a leader's tenure with a fresh build in its engine.
+
+## 17. Settlement and backpressure (2026-10-04)
+
+Written after reading Near One's SPICE note (2026-09-30,
+https://blog.nearone.org/research/2026/09/30/spice-01-intro.html), which names ordering, data
+availability and execution certification as separate steps. Two questions this document did not
+answer in one place: what is "settled", and when; and what bounds the execution debt when
+execution, import or persistence fall behind ordering. 17.1-17.3 describe the code as of this
+branch (`feat/native-fleet7`, read, not run). 17.4-17.5 are **proposals**: nothing in them exists
+yet. Numbers carry the section of `docs/BREAKTHROUGH_DESIGN.md` (BD) where they were measured, all
+on the three-node fleet at the 163,000-transaction bench block (loop294-loop315).
+
+### 17.1 The states a block passes through today
+
+Block N under deferred execution (sections 2 and 11): its header carries the fields of N-1, its own
+fields appear in the header of N+1.
+
+| State | Who knows it | Evidence | Lag behind ordering (BD, ms) |
+| --- | --- | --- | --- |
+| Ordered | every validator | proposal + QC + committee evidence; a validator's vote on N attests: the body is held and well-formed, the transactions are includable on N-1's post-state (section 11), and the header's four fields for N-1 equal *its own* result for N-1 | the vote needs the parent's fields: `fields_ready` median 89-108 after the road start (BD 10.27, 10.34, 10.61); the leader's seal `sealed_at` median 80-84 (10.60) |
+| Committed | every validator | the state machine's Decide, `EngineOutput::BlockCommitted` (`crates/n42/h2-execution/src/driver.rs` table; rule in `crates/n42/h2-consensus/src/protocol/state_machine.rs`, not re-derived here) | about one cycle after ordering; cycle 0.130-0.142 s (10.60) |
+| Executed on a node | that node (its engine) | its own result for N: fields recorded (`n42_engine_types::executed_fields`), import line `fields_ready_ms`, `total_ms` | import `total_ms` median 124-155 (10.60, 10.63), tail: p99 446-583, max 1,505 (10.42); inside the node, beside the loop |
+| Execution certified | anyone holding N+1's header | N's fields in N+1's header, and a quorum voted on N+1 (each voter checked them against its own result) | one block after ordering of N: the time of N+1's vote, ~one cycle (0.13-0.14 s, 10.60); never earlier |
+| Persisted | that node | the persistence batch (`--engine.persistence-threshold 8`, `--engine.memory-block-buffer-target 6`, `scripts/fleet7-env.sh`) that holds N | derived, not measured: with threshold 8 and target 6 a block waits 6-8 blocks, about 0.8-1.1 s at a 137 ms cycle. The `node_state.rs` comment says persistence "runs 17-18 blocks back" (~2.4 s); its source run is not named there |
+| "finalized" for an RPC client | that node's EL | `ExecutionDriver::commit` sends head = safe = finalized = the committed hash (`driver.rs`, `commit`), after the import lands (`pending_commits` holds it until then) | `latest` = the node's head (imported); `safe` and `finalized` are the same hash, the last **committed** block, not the last certified or persisted one |
+
+What a wallet or bridge should wait for: **the state of N certified by a quorum**, i.e. the header of
+N+1 carrying N's fields, with N+1 voted. Under deferred execution that is one block after ordering
+(~0.14 s on the fleet, BD 10.60), and it is the first point at which a quorum has *attested the
+result*, not just the order. The node's `finalized` tag is weaker: it names the committed block, whose
+own state root a quorum has not yet vouched for. A client that reads balances at `finalized` from one
+node trusts that node's execution of N; waiting one block removes that trust. Persistence is a local
+durability fact, not a settlement fact, and no client needs to wait for it.
+
+Data availability is not a separate layer. A validator votes only after it holds the body (the body
+gossip of `crates/n42/h2-net`, `bin/n42/src/payload_serve.rs` for fetch-on-miss), so "ordered" already
+implies "every voter holds the body"; there is no separate availability certificate or store.
+
+### 17.2 The debts that can accumulate, the counter that reads each, and what bounds it
+
+| Debt | Counter today | Bound today |
+| --- | --- | --- |
+| Transaction queue depth | `queued`, `gate_us_per_frame` on the ingest line (`crates/n42/tx-ingest/src/lib.rs`, `gate_view`; depth is `TxQueue::gate_len`, `crates/n42/tx-queue/src/lib.rs`) | Soft: the gate holds frames at `N42_TX_INGEST_HIGH_WATER` (90,000) + up to 4 blocks of allowance. It lets a frame through after `N42_TX_INGEST_GATE_MAX_WAIT_MS` (15 s) anyway, so it is backpressure and not a rule; one stuck node is a trickle of ~32,000 transactions per 15 s (comment at `gate_max_wait`) |
+| Leader builds ahead of proposals | chain slot log lines in `crates/n42/h2-el-rpc/src/engine.rs` | Hard: one chained build, "one ahead, never two" (`ChainState.slot`; a start while the slot is full is refused or, with `N42_BUILD_AHEAD_AT_SEAL=1`, deferred) |
+| Follower's execution behind ordering | `parent_fields_wait_ms`, `fields_ready_ms`, `total_ms` on the direct-import line (`bin/n42/src/follower_import.rs`); imports over 600 ms; refusals | Hard but binary: a follower does not vote on N+1 without N's result; the wait for it is `PARENT_WAIT` = 3 s (`follower_import.rs`; section 11 still says 10 s, the code says 3 s), then the block is refused and the node withholds its vote. No bound on how far the *chain* may run ahead of a slow follower other than that the quorum can proceed without it |
+| Unpersisted blocks in memory | no per-node counter in the runner lines; the engine's own persistence metrics | Soft: threshold 8 / target 6, but `--engine.persistence-backpressure-threshold` is raised to 1024 (`fleet7-env.sh`, because the default 16 stalled the engine 8-10 s, loop146-147), which makes reth's own bound effectively **no bound** at this block size |
+| QMDB read view lag, journals held | `reader_lag`, `reader_lag_max`, WARN "the QMDB read view is falling behind the chain" at 1/2 and 3/4 of the cap (`crates/n42/qmdb-reth/src/node_state.rs`, `note_reader_lag`) | Hard cap, with a cliff: `N42_QMDB_READER_KEEP_CAP`, 64 default with the hashed tables on, 1024 with them off; at the cap the records are pruned and the view is invalidated for good, which with the tables off refuses blocks (loop183 V2a: a 33 s persistence stall, 29 refused blocks, per the comment). Journals needed by a batch's readers are held until it commits (BD 10.17, dee53c148) |
+| Memory | `el_max_peak_g`, `min_avail_g`, `MEMORY FLOOR` line (`scripts/fleet7-runs/run-loop315.sh` and later runners; the line prints under 10 G free) | None in the node. The runner only reports; it does not stop anything. Peak 31.5-33.2 G on the baseline (BD 10.60, 10.61) |
+| Persistence wall time against the cycle | not logged per batch in the runner lines | None. The comment at `fleet7-env.sh` gives ~365 ms a batch at threshold 2 (earlier code); a figure of ~97 ms a block at threshold 8 was supplied with the task and I did not locate it in BD |
+
+### 17.3 What happens when each falls behind today
+
+- **Stalls safely (votes withheld, then a timeout).** A follower whose execution is late: N+1's vote
+  waits for N's fields; 10.42 shows one second-long root (1,034 ms) making the next block wait 917 ms
+  and its vote 935 ms late. Past `PARENT_WAIT` the block is refused, the follower does not vote, and if
+  a quorum cannot form a TC follows. The handover stall (BD 10.15-10.17, loops 278-280) and the
+  leader's 7-10 s own-block wait (section 16.4, open) end the same way: an 8 s HTTP timeout, a TC.
+  Stalls recover; they cost seconds, not state.
+- **Degrades.** Window 2-3 decay: occupancy halves (BD 10.60 AHEAD 53%; 10.63 D30 windows 364k and
+  170k at 0.45 and 0.36 s cycles) when memory is tight or imports slow. The transaction gate then
+  backs the generator off; empty blocks prune nothing, so a gate that never reopens is a closed loop
+  (loop190Y1a), broken only by the 15 s release.
+- **Could exhaust memory.** Nothing in the node bounds it. 10.63's 30 s decay reached 51.0 G el peak
+  and 2.1 G available on one leg (D30), and 9.0 G on D30NB, with 49 imports over 600 ms. A persistence
+  stall holds executed blocks in memory with reth's backpressure at 1024: at ~30 MB of QMDB record a
+  block (`node_state.rs` comment) the keep alone is ~2 GB at 64 blocks and ~30 GB at 1024.
+  Not established: what an engine does at the OOM boundary; no leg went there.
+
+### 17.4 Proposed thresholds (proposals; none implemented)
+
+Each reads a counter that exists or is named as one to add. Starting values come from the measured
+numbers above; the last column says what must be measured to set them.
+
+| Proposal | Counter | Action | Starting value | To measure |
+| --- | --- | --- | --- | --- |
+| P1 unpersisted-block bound | unpersisted blocks (canonical head minus last persisted; add it to the runner line) | the leader stops building ahead (`N42_BUILD_AHEAD_AT_SEAL` off, slot refused), then slows proposals | K = 24 (3x the threshold of 8; the 17-18 seen in a healthy run is under it); hard stop at 48 | the distribution on a healthy leg, and the depth at which memory crosses the floor on a persistence-delayed leg (17.5 B) |
+| P2 memory | `min_avail_g` as a node-side reading of `/proc/meminfo` | under M = 16 G available: P1's action; under 8 G: stop admitting at the gate | M = 16 G (D10 held 22 G, D30NB hit 9.0 G, D30 2.1 G; BD 10.63) | available memory against unpersisted depth, to tell a leak from a long decay |
+| P3 follower's lag | `fields_ready_ms` and the count of blocks ordered but not executed | past L blocks behind, the follower says so by withholding its vote (it already does) and fetches by range instead of importing each | L = 4 blocks (a 600 ms import is ~4 cycles; 6-15 per leg, BD 10.43) | whether a node over L recovers by itself or must catch up |
+| P4 ingest gate tied to persistence | `gate_view` plus the unpersisted count | high-water shrinks by the share of K used, so the generator slows before memory does | linear from 90,000 at 0 to 0 at K | the gate's effect on window-2 occupancy |
+| P5 persistence wall | batch wall time (add) against the cycle | WARN when a batch exceeds the 8-block budget (8 x cycle) | 8 x 137 ms = ~1.1 s | the batch wall on a healthy leg; the supplied ~97 ms a block (~0.8 s a batch) leaves ~30% room |
+
+Setting P1's K needs the unpersisted-block distribution, which no recorded run has; the 24 and 48 are
+a ratio, not a measurement.
+
+### 17.5 Fault-injection plan (not run)
+
+Both on the three-node fleet (`scripts/fleet7.sh`, one flood leg), one follower faulted, records every
+5 s from the fault's start to 60 s after it is lifted.
+
+- **A. Slow execution on one follower.** An artificial delay in the import, 300 ms then 800 ms a
+  block, for 60 s.
+- **B. Slow persistence.** A delay in the save path (the persistence batch) of 1 s then 5 s per
+  batch, for 60 s, on one node (the leader in a second leg, since the leader's own-block path is the
+  one section 16.4 left open).
+
+Record: execution lag in blocks (head ordered minus head executed) on each node; unpersisted blocks;
+`el_max` and `min_avail`; `reader_lag_max`; `parent_fields_wait_ms` and imports over 600 ms; time from
+ordering of N to N's certified state (N+1's header voted) on the healthy nodes and on the faulted one;
+TC count; transactions sent against transactions in canonical blocks.
+
+Pass: (1) the debt plateaus (execution lag and unpersisted blocks stay under the proposed L and K, or
+under a fixed number named before the run if the proposals are not in); (2) it returns to the
+baseline within 60 s of lifting the fault; (3) every accepted transaction is in a block or
+refused, none lost; (4) time to certified state on the healthy nodes stays at one block while a quorum
+(two of three) is healthy; (5) available memory stays above 10 G.
+
+Hooks needed (none exist; none implemented here): an import delay (env, e.g. `N42_FAULT_IMPORT_DELAY_MS`,
+in `bin/n42/src/follower_import.rs`); a persistence delay in the save path (e.g.
+`N42_FAULT_PERSIST_DELAY_MS`, in the provider's save call); an unpersisted-block gauge; a per-batch
+wall-time log line. Existing flags to reuse: `F7_PERSIST_THRESHOLD`, `F7_BLOCK_BUFFER_TARGET`,
+`F7_PERSIST_BACKPRESSURE` (set 16 to see reth's own bound act, which is the control), and
+`N42_QMDB_READER_KEEP_CAP`. With three nodes a faulted follower leaves two, which is exactly the
+quorum; fault the leader only in leg B.
+
+### 17.6 Relation to SPICE
+
+The same: ordering is separate from execution, and execution is certified one block later by the vote
+that carries the next header (sections 2 and 11). Different: N42 has no data layer apart from the
+validators (every voter holds the body), validators execute and hold state rather than being
+stateless, and the certificate is the header-field check plus the quorum on the next block, a rule of
+the consensus, not a replaceable component. Nor does N42 have SPICE's explicit debt accounting; 17.2
+shows the debts are bounded mostly by timeouts and by one hard cap (the chain slot), not by a stated
+budget. This comparison rests on the SPICE note's summary only; I did not study its protocol in depth.

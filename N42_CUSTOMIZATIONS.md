@@ -151,6 +151,26 @@
   该行无论开关都新增 `merge_ms`、`merge_wait_ms`（交接在 join 处等了多久）、`merge_state_ms`、
   `merge_reverts_ms`、`merge_append_ms`、`merge_mode`，以前合并时长只在 debug 行里。
 
+## 多个验证者密钥共享一个执行层（不改任何 fork 的 reth crate）:
+- `N42_IMPORT_ONCE=1`（默认关；代码在 `bin/n42/src/import_once.rs`，由 `payload_serve.rs` 的
+  `OWN_BLOCK`、`COMPACT_BODY`、`FOREIGN_BODY`、`NEW_PAYLOAD` 四条导入路径使用）：按块哈希登记，
+  每个执行层每块只导入一次。第一个请求照旧做全部工作；同一哈希的后续请求（任何连接、任何密钥）
+  不解码、不组装、不执行，等第一个请求的检查完成即收到 CHECKED，导入落地后收到同一个最终状态；
+  导入完成后才到的请求直接从登记表答复。哈希在任何工作之前取得：`OWN_BLOCK` 解头部，
+  两条 body 路径读帧里声明的哈希，`NEW_PAYLOAD` 从帧里直接读（不解码 19 MB 的 payload）。
+  第一个请求没有给出最终状态就结束（连接断开、路径拒绝、引擎失败）时登记重置，等待者之一接手。
+  只有 VALID/INVALID 会答复之后到的请求；SYNCING/ACCEPTED 只答复当时在等的请求。
+  leader 自己的块：不论 leader 的 `OWN_BLOCK` 还是其他密钥的 body/payload 先到，都只把构建结果
+  交给引擎一次（compact body 先到时按头部找到本节点的构建，按头部导入而不组装执行）；找到构建即
+  发布 CHECKED（构建本身就是本执行层的结果）；共享时若验证者在封块时构建（`N42_BUILD_ON_SEAL`），
+  payload 路径对构建用 `find` 而不是 `take`，与 `OWN_BLOCK` 一致。登记表保留最近 64 个哈希，
+  先淘汰已完成的；仍在工作的条目超过 128 个才淘汰。与 `N42_VOTE_BEFORE_SLOT=1` 同时设置时启动报错
+  （保留执行由一个验证者释放，无法在密钥间共享）；运行中收到带 `HOLD_EXECUTION` 的请求时答复错误。
+  `own block imported by header`、`direct import` 两行和 `raw newPayload` 新增 `once_reqs`
+  （本块到目前的请求数）、`once_served`（其中从登记表答复的）、`once_imports`、`once_blocks`、
+  `once_takeovers`（启动以来累计；`once_imports == once_blocks` 即每块每执行层一次导入），
+  开关关闭时恒为 0。关闭时每条路径与以前逐字节相同（测试覆盖）。
+
 ## HotStuff-2 结算标签（不改任何 fork 的 reth crate）:
 - `N42_SETTLEMENT_TAGS=split|legacy`（默认 `split`；代码在 `crates/n42/h2-execution/src/settlement.rs`，
   由 `ExecutionDriver` 的每个 forkchoice 使用）：`latest` = 共识已提交的块；`safe` = 执行已认证的块

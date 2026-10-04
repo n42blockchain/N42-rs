@@ -25,15 +25,15 @@ Per singleton:
 
 | Singleton | Verdict |
 | --- | --- |
-| `built_executions` store (`take` consumes the build) and `sealed_store` | **Breaks.** The first of k requests takes the own build; the rest, and the leader's own `OWN_BLOCK`, find "unknown build" and fall back to a full import or a payload send. |
-| `chain_alias::rename(built_hash, sealed_hash)` (QMDB tree filed under the sealed hash) | **Breaks** for the second taker (warns, imports the ordinary way, so k-1 full executions). |
+| `built_executions` store (`take` consumes the build) and `sealed_store` | **Breaks.** The first of k requests takes the own build; the rest, and the leader's own `OWN_BLOCK`, find "unknown build" and fall back to a full import or a payload send. *Corrected after reading `built_executions.rs`:* `take` moves the build to a "handed" list that only `find_kept*` reads (the build-on-own lookups), not `find`/`take`, so the import roads miss it as described -- but only without `N42_BUILD_ON_SEAL`. With it, `OWN_BLOCK` uses `find` and leaves the build in place, so every later taker finds it and repeats the whole hand-off (a second executed insert and queue forget per key) instead of failing. |
+| `chain_alias::rename(built_hash, sealed_hash)` (QMDB tree filed under the sealed hash) | *Corrected:* does **not** break. `QmdbForest::rename` (`crates/n42/qmdb-state/src/forest.rs`) answers Ok when `from` is gone and `to` is already filed (the build-on-seal path relies on that), and when both are filed with the same root. The second taker's failure is the lookup above, not the rename. |
 | `HELD_EXECUTIONS` (hash -> one receiver, `N42_VOTE_BEFORE_SLOT`) | **Breaks** with two requesters (the second insert replaces the first's receiver). Off by default; keep off. |
 | `executed_fields` registry (hash -> result), `IMPORT_LANDED`, `HANDED` | Works as is: hash-keyed, EL-wide. A second key's "parent fields equal my EL's result" read hits the same record. |
 | Chain slot / build registry in `engine.rs` (`ChainState.slot`, `generation`) | Client-side, one per validator process, so per key. Works: only the leader builds. At a tenure change two keys may each have a chained build on the EL for a moment (1-2 GB each). Handover is where past defects lived (17.7, defect 8): test it, do not assume. |
 | Import slot accounting in `h2-execution/src/driver.rs` (`N42_DEFERRED_IN_FLIGHT`) | Per validator process. Works, but k keys ask for k imports of one block, so the EL sees k concurrent imports (the code notes execution inflates with two in flight). |
 | Commit `forkchoiceUpdated` per key | Works; k-1 are no-ops on the canonical head (reth fast path). Cost on the engine thread not measured (the real one is 30-36 ms). |
 | In-memory/persisted poller, build throttle | Works: k pollers of two cheap RPCs. |
-| Queue taken list (`forget_mined`, `hold_own_block`) | Probably idempotent; not verified. Called k times per block today. |
+| Queue taken list (`forget_mined`, `hold_own_block`) | *Verified idempotent:* a second forget finds nothing left in the taken list or the lanes, and `hold_own_block` returns at once on an empty list, so no second hold and no give-back. Called k times per block today; once with `N42_IMPORT_ONCE`. |
 | `payload_serve` `LISTED_TRANSACTIONS` (last two blocks) | Works (keyed by hash). |
 
 ## 3. What a vote means with k keys
@@ -46,6 +46,33 @@ by all four request kinds (`OWN_BLOCK`, `COMPACT_BODY`, `FOREIGN_BODY`, `NEW_PAY
 the work; later ones wait on it and get CHECKED as soon as the check cell is set, then the final status. If the
 first connection dies the cell is reset so another key takes over. Estimated 300-500 lines plus tests, in
 `bin/n42` only (no vendored reth change). Fault domain note: k keys on one EL share one EL's mistakes by design.
+
+**Implemented (2026-10-04): `N42_IMPORT_ONCE=1`**, `bin/n42/src/import_once.rs`, used by the four roads in
+`payload_serve.rs` (the list is complete: `BUILD_ON_OWN`, `OWN_BODY` and `GET_PAYLOAD*` import nothing).
+What differs from the sketch above:
+
+- The hash is taken before any work: `OWN_BLOCK` decodes the header, the two body roads read the hash the frame
+  announces, `NEW_PAYLOAD` reads it straight out of the frame (`peek_payload_hash`) without decoding 19 MB. A
+  later key's request is constant-time: the frame is read off the socket and nothing of it is decoded,
+  assembled, hashed or copied.
+- A first request that ends without a final status (connection died, road refused, engine failed) resets the
+  cell on drop; one waiter takes the work over with its own request. Only VALID/INVALID answer later requests;
+  SYNCING/ACCEPTED answer the waiters of the moment only.
+- The leader's own block resolves to one hand-off of the build whichever key's request arrives first: the
+  `OWN_BLOCK`, a payload (`reuse_own_build`, which under the registry uses `find` like `OWN_BLOCK` when the
+  validators build on seal), or a compact body, which is recognised as an own build by its header and imported
+  by header instead of being assembled and executed (with `N42_BLOCK_BY_DESCRIPTION` that road never tried the
+  build before). The own-block road publishes CHECKED as soon as the build is found, so the other keys vote
+  without waiting for a build sealed before its finish.
+- Held executions (`N42_VOTE_BEFORE_SLOT`) are refused: start-up error with both switches, and an ERROR answer
+  to a `HOLD_EXECUTION` request under the registry.
+- Gated behind the switch (default off): with it off every road is byte-for-byte the old code, and the
+  registry also changes who answers a repeated request for a known hash, which is a behaviour change even with
+  one key.
+- Tenure handover between two keys on one EL: the incoming leader's first build (`BUILD_ON_OWN` on the sealed
+  parent, sent at tenure start under `N42_BUILD_ON_SEAL=1 N42_TENURE_FIRST_ON_OUTPUT=1`) finds the outgoing
+  leader's build in the EL-wide registry (`find_kept_sealed` reads the store and the handed list), so the
+  published-output path is skipped and the build chain runs on across the handover with no code change.
 
 ## 4. Networking
 

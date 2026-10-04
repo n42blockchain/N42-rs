@@ -1,0 +1,35 @@
+Warning:
+Processed 309321 events and lost 2517 chunks!
+
+Check IO/CPU overload!
+
+perf-loop314PROF2-node0.data: 298919 samples, kernel-leaf 88244 = 29.5%
+share of samples by thread family (all / kernel-leaf):
+  tokio-rt                34.0%  kernel  27.9% of the family  (9.5% of all samples)
+  n42-build               22.2%  kernel  23.1% of the family  (5.2% of all samples)
+  storage                 15.7%  kernel  23.1% of the family  (3.6% of all samples)
+  n                       13.6%  kernel  22.9% of the family  (3.1% of all samples)
+  jemalloc_bg_thd          5.3%  kernel  97.4% of the family  (5.1% of all samples)
+  build-on-own             2.6%  kernel  35.8% of the family  (0.9% of all samples)
+  n42-shard-merge          1.9%  kernel  19.6% of the family  (0.4% of all samples)
+  engine                   1.1%  kernel  27.3% of the family  (0.3% of all samples)
+  n42-queue-forge          0.8%  kernel  54.2% of the family  (0.4% of all samples)
+  persistence              0.8%  kernel  40.3% of the family  (0.3% of all samples)
+  rocksdb:low              0.8%  kernel  16.2% of the family  (0.1% of all samples)
+  rocksdb:high             0.6%  kernel  13.1% of the family  (0.1% of all samples)
+kernel entry frames (outermost kernel frame), share of ALL samples; first user frames:
+  ffffffffa460012b  20.98%  syscall 43%; [unknown] 29%; __madvise 24%; __sched_yield 3%
+  ffffffffa4600bb7   7.03%  [unknown] 20%; <rayon::iter::unzip::UnzipFolder<rayon::iter::unzip::Unzip,  13%; <alloc::vec::Vec<n42_tx_types::envelope::N42TxEnvelope> as c 8%; <rayon::iter::collect::consumer::CollectResult<alloy_consens 7%
+  ffffffffa4600f0b   0.69%  keccak::backends::soft::keccak_p::<u64, 24> 10%; <revm_database::states::bundle_state::BundleState>::account 9%; <&<n42_engine_types::parallel_transfer::BodyAhead<n42_tx_typ 5%; [unknown] 4%
+  ffffffffa4946aca   0.50%  [unknown] 100%
+  ffffffffa4600b90   0.10%  [unknown] 27%; <hashbrown::raw::RawTable<(alloy_primitives::bits::address:: 16%; <hashbrown::map::HashMap<alloy_primitives::bits::address::Ad 11%; <&mut n42_engine_types::batch_state::BatchState<n42_engine_t 6%
+  ffffffffa4600f4b   0.04%  <reth_provider::providers::rocksdb::provider::RocksDBProvide 12%; <metrics_util::registry::recency::Generational<alloc::sync:: 7%; pthread_mutex_unlock 7%; <metrics_exporter_prometheus::registry::AtomicBucketInstant< 3%
+kernel leaf addresses, share of ALL samples; first user frames:
+  ffffffffa5d34f11   8.31%  __madvise 41%; [unknown] 30%; <rayon::iter::unzip::UnzipFolder<rayon::iter::unzip::Unzip,  7%
+  ffffffffa4951f7e   1.27%  syscall 77%; [unknown] 12%; <n42_twig_core::index::Shard>::get::<<n42_qmdb_reth::read_vi 3%
+  ffffffffa4d5e90f   1.22%  syscall 78%; [unknown] 16%; <n42_twig_core::index::Shard>::get::<<n42_qmdb_reth::read_vi 2%
+  ffffffffa4a0943d   1.07%  syscall 72%; [unknown] 19%; __sched_yield 4%
+  ffffffffa5d34e94   0.92%  __madvise 44%; [unknown] 30%; <rayon::iter::unzip::UnzipFolder<rayon::iter::unzip::Unzip,  6%
+  ffffffffa4e2c90a   0.78%  [unknown] 34%; <alloc::vec::Vec<n42_tx_types::envelope::N42TxEnvelope> as c 15%; <rayon::iter::unzip::UnzipFolder<rayon::iter::unzip::Unzip,  9%
+  ffffffffa4d62eaa   0.75%  syscall 77%; [unknown] 15%; <n42_twig_core::index::Shard>::get::<<n42_qmdb_reth::read_vi 3%
+  ffffffffa4d6231c   0.74%  syscall 77%; [unknown] 15%; __sched_yield 3%

@@ -1,0 +1,76 @@
+loop314PROF2: slow events in the 100 s after T0: 449 (seal 223, imp 226); sealed_at median 87, fields_ready median 95
+
+== B: perf stat per node (60 s, 1 s rows)
+node0: IPC 0.84  cache-miss/1k-instr 5.18  dTLB-miss/1k-instr 0.46  cpus 22.4  ctx-sw/s 51823  migr/s 2219  faults/s 439806
+   IPC by second: 0.79 0.83 0.86 0.81 0.82 0.98 0.72 0.85 0.84 0.91 0.94 0.71 0.89 0.88 0.89 0.82 0.80 0.82 0.92 0.88 0.88 0.94 0.80 0.82 0.88 0.85 0.86 0.84 0.81 0.85   (every 2nd s)
+   seconds with a slow block 56: IPC 0.838 vs 0.822 others; cache-miss/1k 5.22 vs 5.45
+   6 worst-IPC seconds [(42, 0.68, True), (26, 0.7, True), (23, 0.71, True), (13, 0.72, True), (59, 0.72, True), (50, 0.75, True)] (second, IPC, has slow block)
+node1: IPC 0.84  cache-miss/1k-instr 5.12  dTLB-miss/1k-instr 0.50  cpus 22.0  ctx-sw/s 59008  migr/s 2497  faults/s 454518
+   IPC by second: 0.78 0.77 0.89 0.84 0.73 0.74 0.76 0.81 0.80 0.82 0.74 0.91 0.91 0.88 0.92 0.92 0.89 0.88 0.89 1.09 0.89 0.90 0.93 0.70 0.91 1.00 0.62 0.85 0.84 0.71   (every 2nd s)
+   seconds with a slow block 56: IPC 0.839 vs 0.779 others; cache-miss/1k 5.16 vs 5.51
+   6 worst-IPC seconds [(53, 0.62, True), (57, 0.67, True), (47, 0.7, True), (60, 0.71, True), (4, 0.72, True), (36, 0.73, True)] (second, IPC, has slow block)
+node2: no perf stat rows
+
+== C: vmstat deltas per 0.5 s, intervals overlapping [slow: sealed_at>120 or fields_ready>130 ms, span road start to seal/fields] against the rest
+intervals 199, slow-marked 166
+counter                           slow mean     other mean   ratio
+compact_stall                          14.2           15.9    0.89
+compact_fail                           11.1           12.9    0.86
+compact_success                         3.1            3.0    1.03
+thp_fault_alloc                       730.8          973.5    0.75
+thp_fault_fallback                   1027.8         1065.4    0.96
+thp_collapse_alloc                      0.0            0.1    0.30
+thp_split_page                         82.1           27.4    2.99  <-- >2x
+thp_deferred_split_page                82.9          146.0    0.57
+pgscan_kswapd                      175123.1       152870.8    1.15
+pgscan_direct                        2484.0         2959.7    0.84
+pgsteal_kswapd                     170031.4       151060.4    1.13
+pgsteal_direct                       2422.4         2933.8    0.83
+allocstall_normal                       0.0            0.0    1.00
+allocstall_movable                      7.7            8.8    0.88
+pgmajfault                           9263.5         2735.6    3.39  <-- >2x
+pgfault                            791087.8       786097.6    1.01
+nr_dirty                            80624.3        81982.8    0.98
+nr_writeback                         5155.9         8550.9    0.60
+numa_pte_updates                        0.0            0.0    1.00
+pgmigrate_success                    8331.4         4503.4    1.85
+MemAvailable_kb                  67756509.3     68964301.8    0.98
+AnonHugePages_kb                 23330310.2     20630931.4    1.13
+Dirty_kb                           322615.0       327860.1    0.98
+Writeback_kb                        20318.7        34315.9    0.59
+psi_mem_avg10                           0.3            0.5    0.63
+psi_mem_total                        4767.6         4636.3    1.03
+psi_cpu_avg10                           9.5            7.7    1.24
+psi_cpu_total                       52206.1        56990.7    0.92
+
+== C: vmstat deltas per 0.5 s, intervals overlapping [very slow: sealed_at>160 or fields_ready>170 ms] against the rest
+intervals 199, slow-marked 128
+counter                           slow mean     other mean   ratio
+compact_stall                          14.6           14.3    1.02
+compact_fail                           11.5           11.2    1.03
+compact_success                         3.1            3.1    0.99
+thp_fault_alloc                       677.8          939.1    0.72
+thp_fault_fallback                   1056.3          993.9    1.06
+thp_collapse_alloc                      0.0            0.0    0.83
+thp_split_page                         73.8           71.7    1.03
+thp_deferred_split_page                70.8          133.9    0.53
+pgscan_kswapd                      179636.3       156644.0    1.15
+pgscan_direct                        2518.7         2642.5    0.95
+pgsteal_kswapd                     174674.1       152843.9    1.14
+pgsteal_direct                       2468.3         2577.5    0.96
+allocstall_normal                       0.0            0.0    1.00
+allocstall_movable                      7.9            7.9    1.01
+pgmajfault                          11059.4         2991.8    3.70  <-- >2x
+pgfault                            806271.5       761394.9    1.06
+nr_dirty                            80201.2        82018.4    0.98
+nr_writeback                         4919.4         7160.2    0.69
+numa_pte_updates                        0.0            0.0    1.00
+pgmigrate_success                    5154.7        12279.2    0.42
+MemAvailable_kb                  67403387.0     68954492.4    0.98
+AnonHugePages_kb                 22976960.0     22712695.0    1.01
+Dirty_kb                           321199.4       327605.0    0.98
+Writeback_kb                        19133.0        28961.9    0.66
+psi_mem_avg10                           0.4            0.4    0.99
+psi_mem_total                        4734.8         4765.7    0.99
+psi_cpu_avg10                           9.5            8.5    1.12
+psi_cpu_total                       51112.5        56401.6    0.91

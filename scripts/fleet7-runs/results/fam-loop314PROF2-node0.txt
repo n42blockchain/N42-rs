@@ -1,0 +1,55 @@
+Warning:
+Processed 309321 events and lost 2517 chunks!
+
+Check IO/CPU overload!
+
+perf-loop314PROF2-node0.data: 298919 samples
+-- tokio-rt: 34.0% of samples
+    27.9% of family  [kernel]
+    23.9% of family  keccak::backends::soft::keccak_p::<u64, 24>
+     4.5% of family  <n42_tx_queue::TxQueue<n42_engine_types::pool::N42PooledTransaction>>::index_and_stage
+     3.8% of family  <hashbrown::map::HashMap<alloy_primitives::bits::fixed::FixedBytes<32>, alloc::sync::Arc<reth_transa
+     3.2% of family  [unknown]
+     1.9% of family  <sha3::Keccak256 as digest::FixedOutput>::finalize_into
+-- n42-build: 22.2% of samples
+    23.1% of family  [kernel]
+    10.6% of family  <revm_database::states::bundle_state::BundleState>::account
+     8.0% of family  bytes::bytes::shallow_clone_vec
+     7.3% of family  <&n42_engine_types::parallel_transfer::execute_for_build_opts<(), n42_engine_types::parallel_transfe
+     4.5% of family  <revm_context::tx::TxEnvBuilder>::build
+     4.5% of family  <&mut n42_engine_types::batch_state::BatchState<n42_engine_types::parallel_transfer::ReadSetDb<n42_e
+-- storage: 15.7% of samples
+    23.1% of family  [kernel]
+     8.8% of family  [unknown]
+     6.4% of family  <metrics_util::registry::recency::Generational<alloc::sync::Arc<core::sync::atomic::Atomic<u64>>> as
+     5.6% of family  <reth_provider::providers::rocksdb::provider::RocksDBProvider>::write_account_history
+     1.9% of family  rocksdb::BlockBasedTable::Get(rocksdb::ReadOptions const&, rocksdb::Slice const&, rocksdb::GetContex
+     1.9% of family  <metrics_exporter_prometheus::registry::AtomicBucketInstant<f64> as metrics::handles::HistogramFn>::
+-- n: 13.6% of samples
+    22.9% of family  [kernel]
+     8.4% of family  <n42_twig_core::index::Shard>::get::<<n42_qmdb_reth::read_view::QmdbReadView>::step_back::{closure#0
+     7.0% of family  [unknown]
+     6.3% of family  <n42_twig_core::entry_store::FileEntries>::record
+     5.9% of family  _blake3_compress_in_place_avx512
+     5.1% of family  <n42_twig_core::index::Shard>::get::<n42_twig_core::qmdb_compat::held_slots<[n42_twig_core::qmdb_com
+-- jemalloc_bg_thd: 5.3% of samples
+    97.4% of family  [kernel]
+     0.6% of family  pthread_mutex_trylock
+     0.5% of family  pthread_mutex_unlock
+     0.4% of family  _rjem_je_edata_heap_remove
+     0.3% of family  _rjem_je_eset_remove
+     0.1% of family  [unknown]
+-- build-on-own: 2.6% of samples
+    35.8% of family  [kernel]
+    11.0% of family  bytes::bytes::shared_drop
+     5.2% of family  core::ptr::drop_glue::<revm_database::states::bundle_account::BundleAccount>
+     5.0% of family  <alloc::vec::Vec<n42_engine_types::output_shards::IndexedBatch> as core::ops::drop::Drop>::drop
+     4.2% of family  core::ptr::drop_glue::<[(alloy_primitives::bits::address::Address, revm_database::states::reverts::A
+     3.0% of family  [unknown]
+-- n42-shard-merge: 1.9% of samples
+    29.5% of family  <revm_database::states::bundle_account::BundleAccount as core::clone::Clone>::clone
+    25.8% of family  <hashbrown::map::HashMap<alloy_primitives::bits::address::Address, revm_database::states::bundle_acc
+    19.6% of family  [kernel]
+     6.2% of family  <[u8; 20] as core::hash::Hash>::hash::<alloy_primitives::map::fixed::FbHasher<20>>
+     5.4% of family  <core::iter::adapters::cloned::Cloned<core::iter::adapters::filter_map::FilterMap<core::iter::adapte
+     4.3% of family  rayon::slice::sort::partition::<(alloy_primitives::bits::address::Address, revm_database::states::re

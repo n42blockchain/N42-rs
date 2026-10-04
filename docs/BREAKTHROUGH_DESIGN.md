@@ -1510,3 +1510,63 @@ Tip 7d2e5d0cf (step 9: `N42_CORE_LAYOUT=isolate`, three commits on 23f8512ab), n
 | ISO16 | 1,144,627 | 911,254 | 141 / 132 ms | 92 / 149 ms | 29 ms | 39 / 30 | 85 / 111 ms | 49 ms | 5 | 31.9 G |
 
 The tails did not move in the direction the layout was meant to move them. Seal p90 is 149-190 ms on the layout legs against 138 ms on BASE (the reference range was 125-150), the fields p90 is 111-161 ms against 143 on BASE (ISO16 is the one leg below the 140-175 range, ISO is above it), and B p75 is 49-54 ms against 47 on BASE (reference 85 from an earlier loop, so BASE itself is already below it). The cycle mean is 141-149 ms on the layout legs against 135 on BASE (reference 137), and window 1 is 1.085-1.145M against 1.186M, i.e. 3.5-8.5% below BASE; with one round per leg only the ISO deficit (8.5%) approaches the noise limit. Among the layout legs, ISONICE and ISO16 read higher than ISO (1.130M and 1.145M against 1.085M) and ISO16 has the lowest fields p90 and the fewest import batches (30 against 54, from the 16-thread build pool), but the ordering rests on single runs. What this round does show is that confining the other threads and pinning the pools did not reduce the nodes' tail latencies on this host; it does not show why. Tags and the startup tally are in `core_layout=`/`startup_lines=` of `scripts/fleet7-runs/results/loop313.out` (the runner counted `core_layout` with a regex that does not match the quoted value and read the startup line from el.log, so those two columns there are empty/0; the numbers above were taken from the logs directly).
+
+### 10.62 The tail under perf (loop314, diagnostic): a quarter to a third of the on-CPU samples are kernel, mostly syscalls (futex, madvise, sched_yield) and not page faults; no memory-system counter marks the slow blocks
+
+Loop314 is one diagnostic leg of the loop313 BASE configuration with symbols (`cargo build --profile profiling`, frame pointers, `target/native-prof`) and the instruments of `scripts/fleet7-runs/prof314.sh` (a 0.5 s `/proc/vmstat` + meminfo + PSI sampler, `perf stat -I 1000` on each EL for 60 s, `perf record -F 499 -g --call-graph fp` on the leader node0 and on follower node1 from 5 s to 35 s after the funding mined), then a plain BASE leg. The first profiled leg (PROF) produced empty perf data: the default per-thread mmap exhausted the unprivileged mlock budget (`perf_event_mlock_kb` 516); the script now retries with `-m 16..1` and PROF2 repeated the leg (node1 recorded at 16 pages, node0 fell to 1 page and lost 2,517 chunks, 0.8% of events, so node0's shares are slightly less certain). Window 1: BASE 1,188,982 (cycle mean 122 ms, sealed_at median 79 ms), PROF 1,108,976, PROF2 1,096,217 (-7% to -8%: perf's cost, so the profiled legs' tails are perturbed). Not available on this host (`perf_event_paranoid` 1, `kptr_restrict` 1, no sudo): kernel symbol names (`/proc/kallsyms` is zeros, `/boot/System.map*` is root-only), tracefs (`perf sched` refused), `stalled-cycles-backend` (unsupported) and, in PROF2, the HW counters of node2's `perf stat` (`cycles` not supported while two `perf record`s ran; node2 is from PROF). Kernel samples therefore appear as raw addresses; `scripts/fleet7-runs/kernshare314.py` groups them by the outermost kernel frame (the entry into the kernel) and by the first user frame, which says who asked for the kernel work but not which kernel function ran.
+
+**A. Where the cycles go (PROF2, share of all samples; `--no-inline`).**
+
+| | leader node0 | follower node1 |
+|---|---|---|
+| samples | 298,919 | 320,070 |
+| kernel-leaf samples | 29.5% | 25.8% |
+| entered by a syscall (`entry_SYSCALL_64` path) | 21.0% | 17.8% |
+| entered by a page fault (the `asm_exc_page_fault` path) | 7.0% | 6.7% |
+| entered by other paths (interrupts, other exceptions) | ~1.3% | ~1.0% |
+| first user frame of the syscall entries | libc `syscall` 43%, `__madvise` 24%, `__sched_yield` 3% | `syscall` 50%, `__madvise` 22%, `__sched_yield` 6% |
+| the hottest kernel address (one instruction, `0xffffffffa5d34f11`) | 8.3% | 6.1% |
+| the same address's callers | `__madvise` 41%, rayon collect/unzip frames (page faults) 7%+, unknown | `__madvise` 41%, rayon collect 17%, unknown 17% |
+| `jemalloc_bg_thd` | 5.3% of samples, 97% kernel | 4.1% of samples, 96% kernel |
+
+The kernel share by thread family (kernel-leaf / family samples, node0 / node1): tokio runtime 28% / 24% (the family is 34% / 32% of all samples), `n42-build-*` 23% / 19% (22% / 28%), `storage-*` 23% / 19% (16% / 18%), the unnamed `n42` threads (QMDB and merge workers) 23% / 33% (14% / 12%), `jemalloc_bg_thd` 97% / 96%, `build-on-own` 36% on the leader, `vote-check` 85% on the follower (0.3% of samples), `n42-queue-forge` 54% (0.8%). The libc `syscall` wrapper is how Rust's std reaches `futex`; I did not see the syscall number, so "futex" is the reading of the wrapper, not a measurement.
+
+Top user-space leaf symbols per family (share of the family's samples; the `[kernel]` row is the share above):
+
+| family | top 5 user leaf symbols (node0; node1 within a few points unless marked) |
+|---|---|
+| tokio runtime (ingest, queue) | `keccak::backends::soft::keccak_p<u64,24>` 24% (node1 26%), `TxQueue::index_and_stage` 4.5%, `HashMap<FixedBytes<32>, Arc<ValidPoolTransaction>>` 3.8%, `sha3::Keccak256::finalize_into` 1.9% (2.5%), unresolved 3% |
+| `n42-build-*` | `BundleState::account` 10.6% (9.5%), `bytes::shallow_clone_vec` 8.0%, `execute_for_build_opts` 7.3% (6.4%), `TxEnvBuilder::build` 4.5% (4.2%), `BatchState` closure 4.5% |
+| `storage-*` | unresolved 8.8%, `metrics_util ... Generational<Atomic<u64>>` 6.4% (6.1%), `RocksDBProvider::write_account_history` 5.6% (4.5%), `rocksdb::BlockBasedTable::Get` 1.9%, prometheus `AtomicBucketInstant::record` 1.9% (2.5%) |
+| unnamed `n42` (QMDB, merge) | `twig_core::Shard::get<QmdbReadView::step_back>` 8.4% (9.5%), `FileEntries::record` 6.3% (3.4% on node1), `_blake3_compress_in_place_avx512` 5.9%, `Shard::get<held_slots>` 5.1%; node1 also `bytes::shallow_clone_vec` 10% |
+| `jemalloc_bg_thd` | the kernel (97%); user code is `pthread_mutex_trylock/unlock` and `_rjem_je_edata_heap_remove` under 1% each |
+
+Overall (all families) the top user symbols are `keccak_p` soft backend 11.7% / 11.4% (two instantiations, 8.8% + 2.9% and 8.4% + 3.0%), `BundleState::account` 2.7% / 2.9%, `execute_for_build_opts` 1.3% / 1.3%, `TxAltSig::fields_len` 1.3% / 2.1%, blake3 compress 1.2% / 1.35%, `alt_sig_tx_env` 1.2% / 1.4%. The software Keccak sits in the tokio ingest threads and is a CPU cost outside the block cycle's critical pools; I did not trace which call computes the hashes.
+
+**B. perf stat (60 s from the funding, 1 s rows; PROF2 for nodes 0-1, PROF for node 2).**
+
+| node | IPC | cache-miss / 1k instr | dTLB-miss / 1k instr | CPUs busy | ctx-switch /s | migrations /s | page faults /s |
+|---|---|---|---|---|---|---|---|
+| node0 (leader) | 0.84 (PROF 0.84) | 5.18 (5.22) | 0.46 (0.47) | 22.4 | 51.8k | 2.2k | 440k |
+| node1 | 0.84 (0.84) | 5.12 (5.05) | 0.50 (0.51) | 22.0 | 59.0k | 2.5k | 455k |
+| node2 (PROF) | 0.85 | 5.02 | 0.50 | 22.2 | 62.5k | 2.6k | 487k |
+
+IPC by second ranges 0.62-1.03 on every node. A "slow block" (sealed_at > 120 ms on a leader line, fields_ready > 130 ms on a follower line) overlaps 53-56 of the 60 seconds, so a second cannot be classified: IPC in the seconds with a slow block against the others is 0.838 / 0.822 (node0), 0.839 / 0.779 (node1) in PROF2 and 0.835 / 0.854, 0.830 / 0.847, 0.842 / 0.898 in PROF (no consistent direction); the six worst-IPC seconds of each node are all seconds that contain a slow block, which every second does. Stalled-backend share is not available.
+
+**C. vmstat against slow blocks (0.5 s intervals, deltas; slow = an interval overlapping the span from the road's start to the seal, or to the follower's fields_ready, of a block over the threshold; PROF2, 199 intervals).**
+
+| counter (mean delta per 0.5 s) | slow (166 intervals) | other (33) | ratio | very slow, > 160 / 170 ms (128) vs other (71) |
+|---|---|---|---|---|
+| `compact_stall` | 14.2 | 15.9 | 0.89 | 1.02 |
+| `pgscan_direct` / `allocstall_movable` | 2,484 / 7.7 | 2,960 / 8.8 | 0.84 / 0.88 | 0.95 / 1.01 |
+| `pgscan_kswapd` | 175k | 153k | 1.15 | 1.15 |
+| `thp_fault_alloc` / `thp_fault_fallback` | 731 / 1,028 | 974 / 1,065 | 0.75 / 0.96 | 0.72 / 1.06 |
+| `thp_split_page` | 82 | 27 | 2.99 | 1.03 |
+| `nr_dirty` / `nr_writeback` | 80.6k / 5.2k | 82.0k / 8.6k | 0.98 / 0.60 | 0.98 / 0.69 |
+| `pgmajfault` | 9,264 | 2,736 | 3.39 | 3.70 |
+| `pgfault` | 791k | 786k | 1.01 | 1.06 |
+| memory PSI some avg10 | 0.3 | 0.5 | 0.63 | 0.99 |
+
+The only counters over 2x are `pgmajfault` (3.4x and 3.7x here, 6.0x and 5.3x in PROF) and, once, `thp_split_page` (3.0x in the broad PROF2 classification, 1.03x in the strict one, 1.6x in PROF). `pgmajfault` is a ramp: its per-10 s totals are 43k, 70k, 128k, 427k, 181k, 135k, 225k, 172k, 142k, 105k in PROF2 (89, 114k, 502k, 404k, 216k, ... in PROF) while the slow blocks also become more frequent as the leg goes on (the cycle by 15 s bin rises 0.13 to 0.17 s in `loop314PROF`, `loop314BASE` and the earlier legs), so the ratio measures time, not cause; it did not separate within a stretch because the slow-marked intervals cover 64-83% of the leg. Compaction stalls (~30/s), direct reclaim, writeback, dirty pages and memory pressure (some avg10 0.3-0.5) do not differ between slow and other intervals.
+
+**What the evidence supports and what it rules out.** The nodes spend 26-30% of their on-CPU samples in the kernel, and three quarters of that arrives through system calls whose first user frame is libc `syscall` (Rust's futex path), `madvise` (jemalloc's purge, 41% of the hottest kernel address and the whole of `jemalloc_bg_thd`, 4-5% of samples) and `sched_yield`, against 7% through page faults; one kernel instruction takes 6-8% of all samples and is reached from both `madvise` and page faults, which fits lock or atomic contention in the memory-management path, but without symbols that remains a reading and not a measurement. IPC 0.84, 5 cache misses and 0.5 dTLB misses per 1k instructions are the same on all three nodes and in every leg. What the leg rules out as the cause of the tail: THP compaction and direct reclaim (flat between slow and other intervals), page-cache writeback (flat), memory pressure (PSI under 0.5), a per-second IPC or cache-miss change (no consistent direction), and a node-specific effect (leader and followers look alike). What it does not show is why a particular block is slow: the profile is an average over 30 s, perf's own cost moved window 1 by 7-8%, a perf timestamp could not be aligned to a block within the needed ~50 ms (perf's clock is monotonic, the logs are wall time), and the 0.5 s slow classification marks most intervals. The tail's cause is not determined. The next measurements this suggests, each a new leg: kernel symbols under `sudo` (`perf record -a` with kallsyms and `perf trace -s` for the futex/madvise counts), `MALLOC_CONF` with `background_thread:false` or a longer `dirty_decay_ms` to see whether the 4-5% jemalloc purge thread and the madvise share move the seal p90, and the soft Keccak in the ingest threads (11% of samples) against an asm backend.

@@ -1,0 +1,79 @@
+loop314PROF: slow events in the 100 s after T0: 331 (seal 121, imp 210); sealed_at median 83, fields_ready median 94
+
+== B: perf stat per node (60 s, 1 s rows)
+node0: IPC 0.84  cache-miss/1k-instr 5.22  dTLB-miss/1k-instr 0.47  cpus 22.0  ctx-sw/s 47475  migr/s 2256  faults/s 466759
+   IPC by second: 0.82 0.80 0.85 0.97 0.93 0.84 0.94 0.84 0.92 0.83 0.89 0.82 0.77 0.77 0.74 0.92 0.90 0.86 0.88 0.79 0.86 0.68 0.91 0.83 0.85 0.87 0.76 0.85 0.66 0.94   (every 2nd s)
+   seconds with a slow block 53: IPC 0.835 vs 0.854 others; cache-miss/1k 5.29 vs 5.14
+   6 worst-IPC seconds [(58, 0.66, True), (43, 0.68, True), (34, 0.72, True), (36, 0.74, True), (29, 0.74, True), (32, 0.74, True)] (second, IPC, has slow block)
+node1: IPC 0.84  cache-miss/1k-instr 5.05  dTLB-miss/1k-instr 0.51  cpus 22.2  ctx-sw/s 59576  migr/s 2526  faults/s 481796
+   IPC by second: 0.84 0.76 0.82 0.88 0.80 0.73 0.78 0.76 0.71 0.66 0.75 0.91 0.78 0.77 0.85 0.78 0.87 0.71 0.71 0.91 0.88 0.92 0.98 0.71 0.72 0.85 1.01 0.91 0.67 0.67   (every 2nd s)
+   seconds with a slow block 53: IPC 0.830 vs 0.847 others; cache-miss/1k 5.14 vs 4.96
+   6 worst-IPC seconds [(19, 0.66, True), (58, 0.67, True), (60, 0.67, True), (17, 0.71, True), (47, 0.71, True), (35, 0.71, True)] (second, IPC, has slow block)
+node2: IPC 0.85  cache-miss/1k-instr 5.02  dTLB-miss/1k-instr 0.50  cpus 22.2  ctx-sw/s 62526  migr/s 2605  faults/s 486740
+   IPC by second: 0.86 0.79 0.83 0.87 0.78 1.00 0.74 0.85 0.81 0.76 0.89 0.87 1.03 0.81 0.78 0.64 1.00 0.89 0.82 0.82 0.70 0.83 0.69 0.87 0.88 0.98 0.93 0.80 0.78 0.85   (every 2nd s)
+   seconds with a slow block 53: IPC 0.842 vs 0.898 others; cache-miss/1k 5.11 vs 4.81
+   6 worst-IPC seconds [(31, 0.64, True), (45, 0.69, True), (41, 0.7, True), (50, 0.71, True), (13, 0.74, True), (26, 0.75, True)] (second, IPC, has slow block)
+
+== C: vmstat deltas per 0.5 s, intervals overlapping [slow: sealed_at>120 or fields_ready>130 ms, span road start to seal/fields] against the rest
+intervals 199, slow-marked 158
+counter                           slow mean     other mean   ratio
+compact_stall                          15.6           11.8    1.32
+compact_fail                           11.8            9.0    1.31
+compact_success                         3.8            2.8    1.37
+thp_fault_alloc                       674.1         1022.8    0.66
+thp_fault_fallback                   1118.8          925.2    1.21
+thp_collapse_alloc                      0.0            0.0    1.00
+thp_split_page                         72.5           57.9    1.25
+thp_deferred_split_page                77.5          136.3    0.57
+pgscan_kswapd                      190892.8       164599.7    1.16
+pgscan_direct                        2471.7         2002.5    1.23
+pgsteal_kswapd                     186230.7       161645.9    1.15
+pgsteal_direct                       2451.5         1998.6    1.23
+allocstall_normal                       0.0            0.0    1.00
+allocstall_movable                      8.1            6.3    1.29
+pgmajfault                          13795.2         2298.7    6.00  <-- >2x
+pgfault                            836555.5       721918.1    1.16
+nr_dirty                            79573.9        93212.2    0.85
+nr_writeback                         6489.3         9654.6    0.67
+numa_pte_updates                        0.0            0.0    1.00
+pgmigrate_success                    4512.3         4872.5    0.93
+MemAvailable_kb                  66484847.3     70504642.1    0.94
+AnonHugePages_kb                 22497824.4     22642638.0    0.99
+Dirty_kb                           318240.2       373247.5    0.85
+Writeback_kb                        26097.5        38393.9    0.68
+psi_mem_avg10                           0.3            0.3    1.25
+psi_mem_total                        4720.7         3763.9    1.25
+psi_cpu_avg10                          10.2            9.3    1.10
+psi_cpu_total                       56212.4        62424.7    0.90
+
+== C: vmstat deltas per 0.5 s, intervals overlapping [very slow: sealed_at>160 or fields_ready>170 ms] against the rest
+intervals 199, slow-marked 109
+counter                           slow mean     other mean   ratio
+compact_stall                          16.1           13.3    1.22
+compact_fail                           12.4            9.8    1.27
+compact_success                         3.7            3.5    1.08
+thp_fault_alloc                       590.3          934.5    0.63
+thp_fault_fallback                   1138.0         1007.4    1.13
+thp_collapse_alloc                      0.0            0.0    1.00
+thp_split_page                         51.3           91.6    0.56
+thp_deferred_split_page                59.6          125.8    0.47
+pgscan_kswapd                      195496.0       173339.8    1.13
+pgscan_direct                        2542.8         2171.9    1.17
+pgsteal_kswapd                     191050.6       169193.6    1.13
+pgsteal_direct                       2523.8         2157.5    1.17
+allocstall_normal                       0.0            0.0    1.00
+allocstall_movable                      8.4            6.8    1.23
+pgmajfault                          18047.7         3407.6    5.30  <-- >2x
+pgfault                            857506.7       758957.6    1.13
+nr_dirty                            79427.7        85964.0    0.92
+nr_writeback                         6439.8         7991.2    0.81
+numa_pte_updates                        0.0            0.0    1.00
+pgmigrate_success                    4776.7         4356.1    1.10
+MemAvailable_kb                  65715604.6     69247725.6    0.95
+AnonHugePages_kb                 22037400.7     23121419.4    0.95
+Dirty_kb                           317659.4       344002.5    0.92
+Writeback_kb                        25859.0        31988.0    0.81
+psi_mem_avg10                           0.4            0.3    1.40
+psi_mem_total                        4848.1         4130.4    1.17
+psi_cpu_avg10                          10.4            9.5    1.09
+psi_cpu_total                       52639.1        63370.1    0.83

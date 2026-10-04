@@ -362,3 +362,36 @@ fn restart_with_the_index_off_unwinds_nothing() {
         account_history_rows(&on.factory).into_iter().flat_map(|(_, _, blocks)| blocks).collect();
     assert!(indexed.iter().all(|b| *b <= 7), "on: entries above the checkpoint healed away");
 }
+
+/// Unwinds the database to `tip` and commits.
+fn unwind_to(factory: &TestFactory, tip: u64) {
+    let provider_rw = factory.provider_rw().expect("provider_rw");
+    provider_rw.remove_block_and_execution_above(tip).expect("unwind");
+    provider_rw.commit().expect("commit");
+}
+
+#[test]
+fn unwind_with_the_index_off_restores_state() {
+    // Inside the gap: the state and every historical read come back, the gap stays open.
+    let off = run_chain(false, OFF);
+    unwind_to(&off.factory, 8);
+    for k in 0..ACCOUNTS {
+        assert_eq!(latest_account(&off.factory, k), expected_after(k, 8), "account {k}");
+    }
+    assert_eq!(gap_marker(&checkpoints(&off.factory)), Some(1));
+    assert_history_exact(&off.factory, 8);
+    assert_eq!(account_changesets(&off.factory, 8), run_chain(false, ON).changesets[..8].to_vec());
+
+    // Below the gap: the unwind closes it, and the index is complete again.
+    let middle = run_chain(false, MIDDLE_OFF);
+    unwind_to(&middle.factory, 3);
+    let after = checkpoints(&middle.factory);
+    assert_eq!(gap_marker(&after), None);
+    for k in 0..ACCOUNTS {
+        assert_eq!(latest_account(&middle.factory, k), expected_after(k, 3), "account {k}");
+    }
+    assert_history_exact(&middle.factory, 3);
+    let indexed: Vec<u64> =
+        account_history_rows(&middle.factory).into_iter().flat_map(|(_, _, blocks)| blocks).collect();
+    assert!(indexed.iter().all(|b| *b <= 3), "{indexed:?}");
+}

@@ -806,3 +806,85 @@ ms. For the tail: the same three timestamps plus the leader's thread CPU (`threa
 long deliveries coincide with the write or the read side being descheduled, it is scheduling, and if the write
 itself takes the time, it is the copy of the 26 MB. This analysis cannot say which, because the line that ends the EL's
 stage is logged before the write.
+
+### 11.8 Why block N+1's seal waits for N's fields: it is not the own import (loop318, offline)
+
+Method: code reading plus a parse of `node0-el.log` of `/data/blockchain/rust-fleet3-bench/bench-loop318{COMPACT,COMPACTb,BASE}`:
+the 237 full blocks (txs >= 100,000) of window 1 on the leader (blocks 268-509), the `seal-first build phases`,
+`built ahead on the sealed own block`, `own block handed to the engine as executed` and `own block imported by header` lines
+joined by block number. A block's seal time is the build line's timestamp minus `total_ms - sealed_at_ms`. Median / p90 in ms.
+Script: `/tmp/a318.py` (not kept; about 60 lines of regex). Nothing was run on the fleet.
+
+**The premise needs correcting.** Header N+1 carries N's `stateRoot`, `receiptsRoot`, `logsBloom` and `gasUsed` (deferred
+execution). Those are not read from the own import. `parent_executed_fields_or_built` (`engine-types/src/hotstuff_consensus.rs`)
+waits on `executed_fields::wait_for(built_hash)`, and the only writer on the leader is the `publish` closure inside build N's own
+finish (`engine-types/src/payload.rs`, "behind the seal"), which files the QMDB tree and calls `executed_fields::remember` right
+after the QMDB root and the receipts root are computed. The own import happens later and only copies the key
+(`payload_serve.rs::hand_off_own_build`: `remember(sealed_hash, get(built_hash))`).
+
+**Own import of block N, step by step** (`driver::spawn_import_own_block` -> `import_own` -> `OWN_BLOCK` ->
+`payload_serve::own_block_by_header`):
+
+| step | work | recomputed or reused | COMPACT med / p90 | BASE med / p90 |
+| --- | --- | --- | --- | --- |
+| 0 | spawned after the proposal is sent | - | starts about 10 ms after N's seal | |
+| 1 | `built_executions::take/find` waits for the build to reach `Complete` (merge of the bundle, hashed post-state) | reused; pure wait | about 70 (derived: total - handoff - payload - new_payload) | about 45 (derived) |
+| 2 | `hand_off_own_build`: body moved or cloned, `chain_alias::rename` of the QMDB tree, fields copied to the sealed hash, `forget_mined` in the queue, `ExecutedInsert` into the engine, pool prune on a blocking thread (`handoff_ms`) | reused; bookkeeping | 41 / 64 | 42 / 66 |
+| 3 | payload assembled from the kept encodings (`payload_ms`) | reused | 2 / 3 | 2 / 4 |
+| 4 | `engine.new_payload`: finds the block in the tree, answers Valid | reused | a few | a few |
+| total | `own block imported by header` `total_ms` | | 116 / 157 (COMPACTb 113 / 151) | 91 / 136 |
+
+Nothing is executed again and no root is recomputed: the engine takes the build's `BuiltExecution` as an executed insert. The
+100 ms is waiting for the build's own finish (step 1) plus 41 ms of hand-off bookkeeping. In absolute time the import ends about
+255 ms (COMPACT) after N's seal, the build's `Complete` about 185, and the hand-off line about 243.
+
+**What `parent_fields_ms` waits for.** Block N+1 starts at N's seal on 93% of builds and finishes its parallel step about 78 ms
+after N's seal (gap seal(N)->seal(N+1) minus `parent_fields_ms`, binding blocks, median 78 / p90 92). N's fields are published at
+a median 115 / p90 145 ms after N's seal (the gap seal(N)->seal(N+1) on the 182 of 237 blocks where `parent_fields_ms` >= 10;
+COMPACTb 116 / 145, 173 blocks; BASE 114 / 142, only 47 blocks bind because its builds start later). The gap is the wait: 30
+median (31 on binding blocks), p65 at p90. It is the publish of N's QMDB root, not the import, which ends 140 ms later.
+
+Of those 115 ms, `roots_ms` of N is 35 (p90 59) and covers only the root job and the receipts root, so about 80 ms are before
+the roots start: `executor.finish()`, `merge_transitions`, `take_bundle`, the shard residual and view, `rename_parent`. Only the
+last two are conditional waits; `merge_ms` and `shard_ready_ms` print 0-1. The remaining time is not instrumented (this is the
+gap in the logs, and the main uncertainty below). One more fact points to contention: `par_ms` of N+1 is 107 / 137 on binding
+blocks and 74 on the non-binding ones (BASE: 105 against 70), with `par_exec_ms` unchanged at 29-31, so the overlap of N's finish
+with N+1's execution on the same pool and cores costs N+1 about 30 ms too. That is the second "30 ms": the leader now runs N's
+finish and N+1's execution concurrently.
+
+**Which fields the build of N has at seal time.**
+
+| field | known at N's seal? | where it is produced |
+| --- | --- | --- |
+| `gasUsed` | yes | `direct_receipts` (the cumulative gas), complete when the parallel step ends, which is the seal under `seal_at_exec` |
+| `receiptsRoot`, `logsBloom` | yes (inputs complete) | `gov5_receipt_root_bloom(receipts)`, a thread spawned in finish; it needs only the receipts, not the state |
+| `stateRoot` | the inputs yes, the value no | the QMDB root job over the block's accounts (`sorted_operations_from_accounts`, `compute_operations(parent_sealed, ops)`): needs the merged output, i.e. `finish`, and the parent's tree |
+
+So the wait is an artefact of the order of work, not of a different structure: the leader has everything the root needs at the
+seal (the execution is complete; only the fold of the output into one bundle is pending), and the receipt side could be published
+earlier still. The only real dependency is the QMDB root (35 ms) of N after N-1's tree is filed.
+
+**Smallest change (not made, no code edited).** Start the root job at the seal instead of after the pre-roots steps, on the
+shard view that already exists, and publish the fields as soon as it returns, before and independent of the merge, hashed state,
+`state_ready` and `complete`. In the sharded branch `publish` is already called before the merge thread starts; what has to move
+is the work ahead of it: take `rename_parent` (conditional) and the residual/view construction off the critical path, give the
+root job and the receipts root thread the pool first, and defer `executor.finish` details that the root does not read. Publish
+the receipt-side fields (`remember_receipts`) at the seal itself, since they need no state.
+
+**Risks.** (1) A build that is sealed but never committed: fields are keyed by the sealed hash, so a published entry for a block
+that loses is never read by the chain that wins; the build on top of it is discarded on the parent mismatch as today. (2) The
+tree must be filed before the fields say "executed" (the comment on `publish` says so): keep `qmdb_state.insert` before
+`remember`. (3) A handover: the next leader builds on the committed block and finds its fields through its follower import
+(`remember_state_root`, `remember_receipts`), unchanged. (4) A follower that disagrees: the values are the same, only earlier;
+every follower still checks them against its own execution, and the leader's header is rejected as before if they differ.
+(5) Contention: starting the root earlier moves CPU work into the window where N+1's execution also runs, and could lengthen
+`par_ms` of N+1 further; this is the thing to measure.
+
+**Estimate (not measured).** If the fields appeared at the root's own length after the seal (35 ms median, 59 p90) instead of
+115 / 145, N+1's execution (done at 78) would no longer wait: `parent_fields_ms` 30 -> about 0-5 and `sealed_ms` 37 -> about 8,
+`sealed_at_ms` 108 -> about 78-85. The cycle is bound by the 100 ms tick, so the effect on the median cycle is smaller than the
+30 ms: perhaps 10-15 ms (the 125 ms seal-trigger mean toward about 110), mostly on the p65-p90 blocks. The second 30 ms (`par_ms`
+inflation by overlap) would not go away with this change; it would need the finish of N to take less CPU or run on cores the
+build pool does not use, and could even grow. The 80 ms before the roots is the figure that decides: a one-line timestamp on
+the phases line at `roots_from` (and after `rename_parent`) turns the above from an inference into a measurement, and costs
+nothing on the fleet.

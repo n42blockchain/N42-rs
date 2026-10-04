@@ -608,6 +608,29 @@ async fn a_throttled_leader_defers_without_building_and_proposes_once_the_count_
 }
 
 
+#[tokio::test]
+async fn a_hold_that_never_clears_proposes_at_the_max_hold_woken_by_its_end() {
+    let rig = node(1, 0, None).await;
+    let count = Arc::new(std::sync::atomic::AtomicU64::new(500));
+    let max_hold = Duration::from_millis(150);
+    let mut svc = rig
+        .svc
+        .with_payload_attributes(|context| Some(attributes_for(&context)))
+        .with_build_throttle(throttle_reading(&count, max_hold));
+    // A re-ask far longer than the hold: only the hold's end can wake it.
+    svc.propose_retry = Duration::from_secs(5);
+    let started = std::time::Instant::now();
+    let view = svc.engine().current_view();
+    step_until(&mut svc, |svc, _| svc.proposed_view == Some(view)).await;
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(140), "held: {waited:?}");
+    assert!(waited < Duration::from_secs(4), "woken by the hold's end, not the re-ask or the view timeout: {waited:?}");
+    let throttle = svc.build_throttle.as_ref().expect("installed");
+    assert_eq!(throttle.hard_holds(), 1);
+    assert_eq!(throttle.last_applied().in_mem, Some(500));
+}
+
+
 // ---------------------------------------------------------------------------
 // Building ahead of leading
 // ---------------------------------------------------------------------------

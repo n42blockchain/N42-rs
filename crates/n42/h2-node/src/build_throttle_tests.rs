@@ -125,3 +125,35 @@ fn an_unknown_count_never_delays() {
     let mut read = BuildThrottle::new(config(40, 80), Arc::new(|| None));
     assert_eq!(read.ask(1, Some(PACING), now), Verdict::Go);
 }
+
+#[test]
+fn a_hold_that_outlasts_max_hold_proposes_anyway_and_warns_once_per_episode() {
+    let mut t = throttle(40, 80);
+    let tick = Instant::now();
+    let held = |t: &mut BuildThrottle, view, at| t.check(view, Some(120), Some(PACING), at);
+    assert_eq!(held(&mut t, 5, tick), Verdict::WaitUntil(tick + MAX_HOLD_DEFAULT));
+    assert_eq!(held(&mut t, 5, tick + Duration::from_millis(1_999)), Verdict::WaitUntil(tick + MAX_HOLD_DEFAULT));
+    assert!(!t.escape_warned);
+    assert_eq!(held(&mut t, 5, tick + MAX_HOLD_DEFAULT), Verdict::Go, "the hold is bounded");
+    assert!(t.escape_warned, "said once");
+    assert_eq!(t.last_applied(), Applied { in_mem: Some(120), delay_ms: 2_000 });
+    // The next view of the same episode holds again, bounded again, and
+    // does not warn a second time.
+    let next = tick + Duration::from_secs(3);
+    assert_eq!(held(&mut t, 6, next), Verdict::WaitUntil(next + MAX_HOLD_DEFAULT));
+    assert_eq!(held(&mut t, 6, next + MAX_HOLD_DEFAULT), Verdict::Go);
+    assert!(t.escape_warned);
+    assert_eq!(t.hard_holds(), 2, "one per held view");
+    // Under HARD the episode ends; the next one warns afresh.
+    assert_eq!(t.check(7, Some(10), Some(PACING), next + Duration::from_secs(3)), Verdict::Go);
+    assert!(!t.escape_warned);
+}
+
+#[test]
+fn the_max_hold_is_configurable() {
+    let c = ThrottleConfig::from_values(None, Some("80"), Some("150")).expect("on");
+    let mut t = BuildThrottle::new(c, Arc::new(|| Some(80)));
+    let tick = Instant::now();
+    assert_eq!(t.ask(1, Some(PACING), tick), Verdict::WaitUntil(tick + Duration::from_millis(150)));
+    assert_eq!(t.ask(1, Some(PACING), tick + Duration::from_millis(150)), Verdict::Go);
+}

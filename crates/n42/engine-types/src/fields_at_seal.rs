@@ -258,6 +258,184 @@ mod tests {
         assert!(Mode::Verify.early() && Mode::Verify.verify());
     }
 
+    use crate::executed_fields::ExecutedFields;
+    use crate::output_shards::{FrozenShards, OutputShards};
+    use alloy_primitives::{Address, U256};
+    use n42_qmdb_reth::QmdbNodeState;
+    use revm::{database::BundleState, state::AccountInfo};
+    use std::sync::Arc;
+
+    fn addr(i: u8) -> Address {
+        Address::with_last_byte(i)
+    }
+
+    fn info(nonce: u64, balance: u64) -> AccountInfo {
+        AccountInfo { nonce, balance: U256::from(balance), ..Default::default() }
+    }
+
+    /// A QMDB chain whose headers carry their parent's execution from genesis.
+    fn chain() -> Arc<reth_chainspec::ChainSpec> {
+        let mut genesis: alloy_genesis::Genesis = serde_json::from_str(
+            r#"{
+                "config": { "chainId": 1143, "shanghaiTime": 0, "cancunTime": 0, "pragueTime": 0, "stateScheme": "qmdb" },
+                "alloc": { "0x0000000000000000000000000000000000000002": { "balance": "0x64" } },
+                "difficulty": "0x0", "gasLimit": "0x1c9c380", "timestamp": "0x0",
+                "extraData": "0x", "nonce": "0x0",
+                "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "coinbase": "0x0000000000000000000000000000000000000000",
+                "number": "0x0", "gasUsed": "0x0",
+                "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+            }"#,
+        )
+        .expect("genesis json");
+        genesis
+            .config
+            .extra_fields
+            .insert(reth_chainspec::qmdb::DEFERRED_EXECUTION_TIME_KEY.to_owned(), serde_json::json!(0));
+        Arc::new(n42_qmdb_reth::with_declared_state_scheme(genesis.into()).expect("a qmdb chain"))
+    }
+
+    /// A forest at genesis in a scratch directory of its own.
+    fn forest(name: &str) -> (QmdbNodeState, B256) {
+        let chain = chain();
+        let dir = std::env::temp_dir().join(format!("n42-fields-at-seal-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = QmdbNodeState::new(chain.clone(), dir);
+        state.initialize((0, chain.genesis_hash())).expect("genesis seeded");
+        (state, chain.genesis_hash())
+    }
+
+    /// Block N-1's output: two accounts moved.
+    fn parent_bundle() -> BundleState {
+        BundleState::builder(1..=1)
+            .state_original_account_info(addr(2), info(0, 100))
+            .state_present_account_info(addr(2), info(1, 60))
+            .state_present_account_info(addr(3), info(0, 40))
+            .build()
+    }
+
+    /// Block N's output as the leader holds it at the seal: the batches'
+    /// shards, and the executor's residual (a withdrawal to a shard account,
+    /// and a new account).
+    fn child_output() -> (FrozenShards, BundleState) {
+        let shards = OutputShards::with_index_live(addr(1), 8, 4, false, false);
+        let mut batch = BundleState::builder(2..=2);
+        for (a, (n0, b0), (n1, b1)) in [(3u8, (0u64, 40u64), (1u64, 30u64)), (4, (0, 0), (0, 10)), (2, (1, 60), (2, 50))] {
+            batch = batch.state_original_account_info(addr(a), info(n0, b0)).state_present_account_info(addr(a), info(n1, b1));
+        }
+        shards.add(batch.build());
+        let residual = BundleState::builder(2..=2)
+            .state_original_account_info(addr(3), info(1, 30))
+            .state_present_account_info(addr(3), info(1, 35))
+            .state_present_account_info(addr(9), info(0, 5))
+            .build();
+        (shards.freeze(), residual)
+    }
+
+    fn receipts() -> Vec<n42_tx_types::Receipt> {
+        (1..=3u64)
+            .map(|i| {
+                let mut receipt = n42_tx_types::Receipt::default();
+                receipt.success = true;
+                receipt.cumulative_gas_used = 21_000 * i;
+                receipt
+            })
+            .collect()
+    }
+
+    /// Files block N-1 under the hash its builder gave it, as its finish does.
+    fn file_parent(state: &QmdbNodeState, genesis: B256, built: B256) {
+        let ops = n42_qmdb_reth::sorted_operations_from_execution(&parent_bundle(), true);
+        let prepared = state.compute_operations(genesis, ops).expect("parent root");
+        state.insert(built, 1, prepared).expect("parent filed");
+    }
+
+    /// Block N's finish from the parent's rename to its fields: the shard
+    /// view's operations for the root, the receipts root beside it, then the
+    /// tree filed before the fields are remembered.
+    fn finish_child(
+        state: &QmdbNodeState,
+        parent_sealed: B256,
+        parent_built: B256,
+        child_built: B256,
+        early: bool,
+        wait: impl FnOnce(),
+    ) -> (ParentFiled, EarlyInputs<n42_twig_core::qmdb_ops::QmdbOps>) {
+        let filed = file_parent_under_seal(state, parent_sealed, Some(parent_built), early, wait).expect("parent filed");
+        let parent_root = state.root_of(&parent_sealed);
+        let (shards, residual) = child_output();
+        let overlaps = shards.overlaps(&residual);
+        let view = shards.view(&residual, &overlaps);
+        let ops = n42_qmdb_reth::sorted_operations_from_accounts(&view, true);
+        let prepared = state.compute_operations(parent_sealed, ops.clone()).expect("child root");
+        let (receipts_root, logs_bloom) = crate::hotstuff_consensus::gov5_receipt_root_bloom(&receipts());
+        let fields = ExecutedFields { state_root: prepared.root, receipts_root, logs_bloom, gas_used: 63_000 };
+        state.insert(child_built, 2, prepared).expect("child filed");
+        crate::executed_fields::remember(child_built, fields);
+        (filed, EarlyInputs { fields, ops, parent_root })
+    }
+
+    /// The late derivation behind `Complete`: the merged bundle's operations.
+    fn late_inputs(state: &QmdbNodeState, parent_sealed: B256) -> LateInputs<n42_twig_core::qmdb_ops::QmdbOps> {
+        let (shards, residual) = child_output();
+        let merged = shards.merged(&residual);
+        LateInputs {
+            ops: n42_qmdb_reth::sorted_operations_from_execution(&merged, true),
+            parent_root: state.root_of(&parent_sealed),
+            receipts: crate::hotstuff_consensus::gov5_receipt_root_bloom(&receipts()),
+            gas_used: 63_000,
+        }
+    }
+
+    #[test]
+    fn early_and_late_publish_the_same_fields_on_a_built_block() {
+        let parent_built = B256::repeat_byte(0xe1);
+        let parent_sealed = B256::repeat_byte(0xe2);
+        let child_built = B256::repeat_byte(0xe3);
+
+        // Early: the parent's record is filed, so it is renamed without the wait.
+        let (early_forest, genesis) = forest("equal-early");
+        file_parent(&early_forest, genesis, parent_built);
+        let waited = std::cell::Cell::new(false);
+        let (filed, early) = finish_child(&early_forest, parent_sealed, parent_built, child_built, true, || waited.set(true));
+        assert!(filed.early && filed.renamed && !filed.waited && !waited.get());
+
+        // Late, on a forest of its own: the wait, then the rename.
+        let (late_forest, genesis) = forest("equal-late");
+        file_parent(&late_forest, genesis, parent_built);
+        let (filed, late) = finish_child(&late_forest, parent_sealed, parent_built, B256::repeat_byte(0xe4), false, || {});
+        assert!(!filed.early && filed.renamed && filed.waited);
+
+        assert_eq!(early.fields, late.fields, "the same bytes either way");
+        assert_eq!(early_forest.root_of(&child_built), Some(early.fields.state_root));
+        assert_eq!(crate::executed_fields::get(&child_built), Some(early.fields));
+        // And `verify`'s late derivation agrees with what was published.
+        assert_eq!(compare(&early, &late_inputs(&early_forest, parent_sealed)), Verdict::Equal);
+    }
+
+    #[test]
+    fn verify_names_each_input_that_differs() {
+        let parent_built = B256::repeat_byte(0xd1);
+        let parent_sealed = B256::repeat_byte(0xd2);
+        let (state, genesis) = forest("verify-differs");
+        file_parent(&state, genesis, parent_built);
+        let (_, early) = finish_child(&state, parent_sealed, parent_built, B256::repeat_byte(0xd3), true, || {});
+        let mut late = late_inputs(&state, parent_sealed);
+        late.gas_used += 1;
+        late.receipts.0 = B256::repeat_byte(0x99);
+        late.ops = n42_qmdb_reth::sorted_operations_from_execution(&parent_bundle(), true);
+        assert_eq!(
+            compare(&early, &late),
+            Verdict::Differ(vec![Mismatch::StateOps, Mismatch::ReceiptsRoot, Mismatch::GasUsed])
+        );
+        let mut late = late_inputs(&state, parent_sealed);
+        late.parent_root = Some(B256::repeat_byte(0x98));
+        assert_eq!(compare(&early, &late), Verdict::Differ(vec![Mismatch::ParentRoot]));
+        // A parent persisted away on one side is not a mismatch, only unchecked.
+        late.parent_root = None;
+        assert_eq!(compare(&early, &late), Verdict::Unchecked);
+    }
+
     #[test]
     fn the_stamps_are_relative_and_never_negative() {
         let a = std::time::Instant::now();

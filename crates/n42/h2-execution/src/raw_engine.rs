@@ -878,6 +878,95 @@ mod tests {
         assert!(decode_need_txns(&padded).is_err());
     }
 
+    fn compact_answer() -> CompactAnswer {
+        CompactAnswer {
+            header: alloy_consensus::Header {
+                number: 41,
+                gas_used: 3_423_000,
+                // Positional in RLP: a withdrawals root needs a base fee.
+                base_fee_per_gas: Some(7),
+                withdrawals_root: Some(B256::repeat_byte(4)),
+                extra_data: Bytes::from_static(&[9, 9]),
+                ..Default::default()
+            },
+            tx_count: 3,
+            withdrawals: vec![Withdrawal { index: 1, validator_index: 2, address: Address::repeat_byte(3), amount: 4 }],
+            requests: Some(vec![Bytes::from_static(&[0x01, 0x02])]),
+            block_access_list: Some(Bytes::from_static(&[0xc0])),
+            tx_hashes: vec![B256::repeat_byte(0xa1), B256::repeat_byte(0xa2), B256::repeat_byte(0xa3)],
+            frame_layout: vec![(B256::repeat_byte(0xf1), 2), (B256::repeat_byte(0xf2), 1)],
+        }
+    }
+
+    #[test]
+    fn a_compact_answer_round_trips_with_and_without_the_optional_parts() {
+        let full = compact_answer();
+        let bare = CompactAnswer {
+            withdrawals: Vec::new(),
+            requests: None,
+            block_access_list: None,
+            frame_layout: Vec::new(),
+            ..full.clone()
+        };
+        let empty = CompactAnswer { tx_count: 0, tx_hashes: Vec::new(), frame_layout: Vec::new(), ..bare.clone() };
+        for answer in [full, bare, empty] {
+            let encoded = encode_compact_answer(&answer);
+            assert_eq!(decode_compact_answer(&encoded).expect("decodes"), answer);
+            // No transaction bytes in it: the header, 32 bytes a hash and
+            // the small fields, whatever the block weighs.
+            assert!(encoded.len() < 1024 + answer.tx_hashes.len() * 32 + answer.frame_layout.len() * 36);
+        }
+    }
+
+    #[test]
+    fn a_malformed_compact_answer_is_refused() {
+        let encoded = encode_compact_answer(&compact_answer());
+        assert!(decode_compact_answer(&encoded[..encoded.len() - 1]).is_err(), "truncated");
+        let mut padded = encoded.clone();
+        padded.push(0);
+        assert!(decode_compact_answer(&padded).is_err(), "padded");
+        let mut wrong_version = encoded.clone();
+        wrong_version[0] = VERSION + 1;
+        assert!(decode_compact_answer(&wrong_version).is_err(), "unknown version");
+        // Hashes that do not number the block's transactions.
+        let short = CompactAnswer { tx_hashes: vec![B256::ZERO], ..compact_answer() };
+        assert!(decode_compact_answer(&encode_compact_answer(&short)).is_err());
+        // A frame layout that does not sum to them.
+        let layout = CompactAnswer { frame_layout: vec![(B256::ZERO, 2)], ..compact_answer() };
+        assert!(decode_compact_answer(&encode_compact_answer(&layout)).is_err());
+    }
+
+    #[test]
+    fn the_compact_answer_tail_only_appends_and_off_is_the_old_frame() {
+        let header = alloy_consensus::Header { number: 41, ..Default::default() };
+        let attrs = PayloadAttributes {
+            timestamp: 1_700_000_000,
+            prev_randao: B256::repeat_byte(5),
+            suggested_fee_recipient: Address::repeat_byte(6),
+            withdrawals: Some(Vec::new()),
+            parent_beacon_block_root: Some(B256::repeat_byte(7)),
+            slot_number: None,
+            target_gas_limit: None,
+        };
+        let hint = Some(ChainHint { view: 7, chained: false });
+        for (chain, hashes) in [(None, false), (None, true), (hint, true)] {
+            // Off: byte for byte what the frame has always been.
+            let old = encode_build_on_own_chaining(&header, &attrs, chain, hashes);
+            assert_eq!(encode_build_on_own_request(&header, &attrs, chain, hashes, false), old);
+            let request = decode_build_on_own_request(&old).expect("decodes");
+            assert!(!request.compact_answer);
+            // On: the same frame and one tag after it.
+            let compact = encode_build_on_own_request(&header, &attrs, chain, hashes, true);
+            assert_eq!(&compact[..old.len()], &old[..]);
+            assert_eq!(compact.len(), old.len() + 1);
+            let request = decode_build_on_own_request(&compact).expect("decodes");
+            assert_eq!((request.header, request.attrs, request.chain, request.want_hashes, request.compact_answer),
+                (header.clone(), attrs.clone(), chain, hashes, true));
+            // The old decoder reads every other field of it unchanged.
+            assert_eq!(decode_build_on_own(&compact).expect("decodes"), (header.clone(), attrs.clone(), chain, hashes));
+        }
+    }
+
     #[test]
     fn payload_status_round_trips() {
         for status in [

@@ -66,9 +66,13 @@ def main():
     # every caller passed F7_HTTP_BASE, so an invocation that forgot it read
     # ports nothing is listening on and reported "no node answered" -- which
     # looks exactly like a dead fleet.
-    nodes = int(os.environ.get("F7_NODES", "7"))
+    # Validators and execution layers are two numbers on a shared-execution fleet
+    # (fleet7-env.sh F7_VALIDATORS / F7_ELS): one RPC port per layer, the quorum and
+    # the authorship count over validators. Unset, both are F7_NODES, as before.
+    nodes = int(os.environ.get("F7_VALIDATORS", os.environ.get("F7_NODES", "7")))
+    els = int(os.environ.get("F7_ELS", nodes))
     base = int(os.environ.get("F7_HTTP_BASE", "8700"))
-    ports = [base + i for i in range(nodes)]
+    ports = [base + i for i in range(els)]
     # A QC needs `n - f` votes with `f = (n - 1) / 3`; printed beside the
     # authorship count so a four-node leg's output states its own quorum.
     quorum = nodes - (nodes - 1) // 3
@@ -125,19 +129,21 @@ def main():
         "heights_after": second,
         "advanced": advanced,
         "checks": {
-            "every_node_answered": len(answering) == nodes,
+            "every_node_answered": len(answering) == els,
             "commitments_agree": not disagreements,
             "every_node_advanced": len(advanced) == len(answering),
             "authors_at_least": len(authors),
         },
     }
+    if els != nodes:
+        result["execution_layers"] = els
     result["pass"] = (
         result["checks"]["every_node_answered"]
         and result["checks"]["commitments_agree"]
         and result["checks"]["every_node_advanced"]
     )
 
-    say(f"common height {common}, {len(answering)}/{nodes} answering")
+    say(f"common height {common}, {len(answering)}/{els} answering")
     for key in COMMITMENTS:
         values = {row[key] for row in rows.values()}
         mark = "=" if len(values) == 1 else "!"

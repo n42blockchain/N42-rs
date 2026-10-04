@@ -269,13 +269,20 @@ json.dump(g, open(sys.argv[2], 'w'), indent=2)" "$F7_GENESIS" "$DERIVED" "$F7_LE
   export F7_GENESIS=$DERIVED
 fi
 CHAIN=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['config']['chainId'])" "$F7_GENESIS")
-RPCS=$(for ((i = 0; i < F7_NODES; i++)); do printf 'http://127.0.0.1:%s,' $((F7_HTTP_BASE + i)); done | sed 's/,$//')
+# One RPC and one ingest per execution layer, not per validator: with several keys on a
+# layer the flood still feeds the layer once (F7_NODES = F7_ELS when every validator has
+# a layer of its own, which is every round before the shared-execution legs).
+RPCS=$(for ((i = 0; i < F7_ELS; i++)); do printf 'http://127.0.0.1:%s,' $((F7_HTTP_BASE + i)); done | sed 's/,$//')
 
 {
   echo "round        : $TAG"
   echo "tier         : gossip ${N42_MAX_GOSSIP_MB}MB, gas ceiling ${F7_BENCH_GASCEIL}, pool ${F7_BENCH_POOL_SLOTS}, pacing ${F7_BLOCK_INTERVAL_MS}ms, view timeout ${F7_VIEW_TIMEOUT_MS:-genesis}${F7_AMSTERDAM:+, amsterdam}${F7_LEADER_TENURE:+, leader tenure $F7_LEADER_TENURE}"
   echo "supply       : $SENDERS senders x $PERTX tx, offset $OFFSET, conc $CONC, batch $RPCBATCH${SHARD:+, sharded}, $RECIPIENTS recipients, gas $F7_TX_GAS${F7_PRECREATE:+, precreate $F7_PRECREATE}"
   echo "windows      : $WINDOWS x ${WINDOW_SEC}s after ${DECAY_SEC}s of base-fee decay"
+  # Only a fleet whose layers are shared says so; every other round's header is as it was.
+  if ((F7_SHARED || F7_MAPPED)); then
+    echo "layers       : $F7_ELS execution layers for $F7_NODES validators, map $(IFS=,; echo "${F7_EL_OF[*]}"), $(f7_el_cpus) CPUs a layer, import-once ${N42_IMPORT_ONCE:-off}"
+  fi
 }
 
 # The memory state at the start decides the leg (round 43, loop86-97): the
@@ -397,7 +404,7 @@ echo "flood cores  : ${FLOOD_CORES}"
 # list is passed either way.
 INGEST_ARG=()
 if [[ -n ${F7_INGEST:-} ]]; then
-  INGESTS=$(for ((i = 0; i < F7_NODES; i++)); do printf '127.0.0.1:%s,' $((F7_INGEST_BASE + i)); done | sed 's/,$//')
+  INGESTS=$(for ((i = 0; i < F7_ELS; i++)); do printf '127.0.0.1:%s,' $((F7_INGEST_BASE + i)); done | sed 's/,$//')
   INGEST_ARG=(--ingest "$INGESTS")
   # F7_INGEST_ALL=1: every transaction to every node's ingest, so no pool
   # depends on gossip for what another pool holds. gov5's methodology, and

@@ -4,7 +4,8 @@
 """Every 2 s, per execution-layer process of the bench fleet: RSS from /proc/<pid>/status and the in-memory block
 metrics of its Prometheus endpoint (ports F7_METRICS_BASE + i, 19300 by default): num_blocks, latest and earliest
 in-memory block (earliest - 1 is the persisted height), backpressure_active and the backpressure stall histogram.
-usage: memsample.py <out file> [nodes]. One line a node: `<epoch> <HH:MM:SS> node<i> pid= rss_g= num= latest= earliest= bp= stall_n= stall_s=`
+usage: memsample.py <out file> [execution layers]. With F7_EL_MAP set (one layer per validator, comma list; see fleet7-env.sh)
+the layer e lives in the node directory of its first validator; unset, layer e is node e as before. One line a node: `<epoch> <HH:MM:SS> node<i> pid= rss_g= num= latest= earliest= bp= stall_n= stall_s=`
 (`-` where the process or endpoint did not answer). Runs until killed."""
 import os, re, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -14,12 +15,15 @@ NAMES = {'reth_blockchain_tree_in_mem_state_num_blocks': 'num', 'reth_blockchain
          'reth_blockchain_tree_in_mem_state_earliest_block': 'earliest', 'reth_consensus_engine_beacon_backpressure_active': 'bp',
          'reth_consensus_engine_beacon_backpressure_stall_duration_count': 'stall_n',
          'reth_consensus_engine_beacon_backpressure_stall_duration_sum': 'stall_s'}
+MAP = [int(x) for x in os.environ['F7_EL_MAP'].split(',')] if os.environ.get('F7_EL_MAP') else None
+def first_of(i):
+    return MAP.index(i) if MAP else i
 def pid_of(i):
     for p in os.listdir('/proc'):
         if not p.isdigit(): continue
         try: c = open(f'/proc/{p}/cmdline', 'rb').read().replace(b'\0', b' ').decode(errors='replace')
         except OSError: continue
-        if '/n42 node' in c and f'{root}/node{i}' in c: return int(p)
+        if '/n42 node' in c and f'{root}/node{first_of(i)}/' in c: return int(p)
     return None
 def sample(i):
     d = {k: '-' for k in ('num', 'latest', 'earliest', 'bp', 'stall_n', 'stall_s')}; pid = pid_of(i); rss = '-'

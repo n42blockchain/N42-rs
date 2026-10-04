@@ -1167,7 +1167,7 @@ cache's state is set by which validator missed view 1, which the pin swap does n
 **5. The WARM legs.** The insert cost is there on node 2 in WARM too (`Block added` 26.2 ms median against 0.03 on node 1, window 1 of loop325WARM; engine thread
 46.6 / 28.1 / 30.4%), but the cycle is 136 ms and persistence is ~170 ms a block with the history index on (in-memory 81-94 blocks), so node 2's assembly-to-landing,
 162 ms against 128 on node 1, stays under two cycles (272 ms) and the gate binds only on its tail; node 1's landings are pushed past two cycles by the same persistence
-episodes (p90 317 ms), which is why loop323/324WARM gated node 1 as often as node 2. WARM does not move the cache cost; it raises the threshold (2 x cycle) that the cost has
+episodes (up to 317 ms; the persistence attribution is inferred, not measured per block), which is why loop323/324WARM gated node 1 as often as node 2. WARM does not move the cache cost; it raises the threshold (2 x cycle) that the cost has
 to cross. In F the cycle is 112-116 ms, 2 x cycle 224-232 ms, and node 2's extra ~25 ms on the tree thread, plus the newPayload and forkchoice queued behind it, carries its landing
 from ~126 to ~216 ms; the creep of 11.10 section 4 is that sum closing on the threshold in the first full blocks, after which the gate holds it there.
 

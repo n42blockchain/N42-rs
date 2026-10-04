@@ -123,7 +123,7 @@ def derive(num, legs_spec, title):
                'exec env F7_EL_MAP=$EL_MAP python3 scripts/fleet7-runs/memsample.py $STRIP/mem.log $NEL )')
     # per-layer observations: imports per block per layer (the import-once check reads 1), and the registry's own lines
     old = '  echo "$tag no_variant=$(cat $STRIP/el.log | grep -c \'no gov5 header variant\')'
-    run = sub1(run, old, '  echo "$tag imports: layers=$NEL direct_imports=$(cat $STRIP/el.log | grep -c \'direct import: executed here\') canonical_blocks=$(cat $STRIP/el.log | grep -c \'Block added to canonical chain\') import_once_lines=$(cat $STRIP/el.log | grep -ci \'import.once\') (per layer: direct imports should equal canonical blocks for one execution per block)"\n' + old)
+    run = sub1(run, old, '  echo "$tag once: start-up lines import_once=true $(cat $STRIP/el.log | grep -c "import_once=true"); last direct-import counters $(grep "direct import: executed here" $STRIP/el.log | tail -1 | grep -oE "once_[a-z]+=[0-9]+" | paste -sd" ")"\n' + '  echo "$tag imports: layers=$NEL direct_imports=$(cat $STRIP/el.log | grep -c \'direct import: executed here\') canonical_blocks=$(cat $STRIP/el.log | grep -c \'Block added to canonical chain\') import_once_lines=$(cat $STRIP/el.log | grep -ci \'import.once\') (per layer: direct imports should equal canonical blocks for one execution per block)"\n' + old)
     # headers of both processes name the layout and the pool sizes
     run = sub1(run, 'ENGINE_EXEC_CACHE|SETTLEMENT_TAGS|',
                'F7_EL_MAP|F7_EL_CPUS|F7_VAL_CPUS|IMPORT_ONCE|RAYON_NUM_THREADS|PARALLEL_BUILD_THREADS|TOKIO_WORKER_THREADS|ENGINE_EXEC_CACHE|SETTLEMENT_TAGS|', count=2)
@@ -153,6 +153,7 @@ derive(328, [
     ('E1T', [E1, ONCE, ('N42_PARALLEL_BUILD_THREADS', '64'), ('RAYON_NUM_THREADS', '32')]),
     ('E1C74', [E1, ONCE, ('F7_EL_CPUS', '74')]),
     ('E1FS', [E1, ONCE, ('N42_FIELDS_AT_SEAL', '1')]),
+    ('E1G', [E1, ONCE, ('F7_GASCEIL_ARG', '4200000000')]),
 ], 'seven validator keys on one execution layer (docs/SHARED_EXECUTION_SCOPE.md), the peak search: WARM (one-to-one, no switch), E7 (control), E1, E1b, E1P80, E1P70 (pacing), E1T (build pool and rayon doubled), E1C74 (layer capped at 74 CPUs), E1FS (fields at seal). Validators pinned on 16 CPUs of their own. One claim; legs after 75 minutes are skipped, so the order is the priority.')
 derive(329, [
     ('E7', [E7, ONCE]),

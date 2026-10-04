@@ -425,6 +425,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => identity.genesis_hash,
         };
         let mut driver = ExecutionDriver::new(el, start_head);
+        // The execution layer's persistence readings, polled beside the loop
+        // on a connection of their own: the unpersisted-block count for the
+        // leader's build throttle and the persisted block for the finalized
+        // tag. One poller serves both, and nothing is polled when neither is
+        // wanted.
+        let throttle_config =
+            if propose { n42_h2_node::build_throttle::ThrottleConfig::from_env() } else { None };
+        let split_tags = driver.settlement_tags() == n42_h2_execution::SettlementTags::Split;
+        let persistence_gauge = if split_tags || throttle_config.is_some() {
+            let poll = HttpTransport::new(el_url.clone(), jwt, Duration::from_secs(1))?;
+            Some(n42_h2_el_rpc::in_memory::spawn_poller(poll, Duration::from_millis(50)))
+        } else {
+            None
+        };
+        // Settlement tags (docs/PHASE_D_DEFERRED_EXECUTION.md section 17):
+        // safe = certified, finalized = certified and persisted here. A node
+        // starting on a fresh chain floors both at genesis; a restarted one
+        // leaves the tags its execution layer restored until a commit moves
+        // them.
+        if split_tags {
+            if let Some(gauge) = persistence_gauge.clone() {
+                driver.set_persisted_height(std::sync::Arc::new(move || gauge.persisted()));
+            }
+            if start_head == identity.genesis_hash {
+                driver.set_settlement_floor(identity.genesis_hash);
+            }
+            println!("settlement   : split (latest = committed, safe = certified, finalized = certified and persisted)");
+        } else {
+            println!("settlement   : legacy (latest = safe = finalized = committed)");
+        }
         // Bench only (see the engine flag below): with the vote sent before
         // the import, the import must not hold the loop either.
         if std::env::var("N42_VOTE_BEFORE_IMPORT").is_ok_and(|v| v == "1") {
@@ -503,9 +533,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // execution layer's unpersisted-block count is polled on a
             // connection of its own, and proposals are held back while it is
             // deep. Nothing is polled when it is off.
-            if let Some(config) = n42_h2_node::build_throttle::ThrottleConfig::from_env() {
-                let poll = HttpTransport::new(el_url.clone(), jwt, Duration::from_secs(1))?;
-                let gauge = n42_h2_el_rpc::in_memory::spawn_poller(poll, Duration::from_millis(50));
+            if let (Some(config), Some(gauge)) = (throttle_config, persistence_gauge.clone()) {
                 let count: n42_h2_node::build_throttle::InMemoryCount = std::sync::Arc::new(move || gauge.get());
                 service = service.with_build_throttle(n42_h2_node::build_throttle::BuildThrottle::new(config, count));
                 println!(

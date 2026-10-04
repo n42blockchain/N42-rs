@@ -70,6 +70,24 @@
   （`ExecutionOverlay::layered`：按块从新到旧逐读查各块的 `BundleState`，不摊平、不缓存）；
   状态树叠加层（MPT 根/证明用）仍按需在调用线程上计算。由 `--engine.state-trie-overlay`
   （见模块6）选择
+- `crates/storage/provider/src/providers/n42_persist.rs`（N42 新增文件）：持久化批次的计时器与开关
+  （`docs/PERSISTENCE_COST_STUDY.md`）。计时器与上游 `save_blocks_*` 同在 `storage.providers.database`
+  作用域：`save_blocks_pre_scope` / `_plain_reverts` / `_scope` / `_post_scope` / `_qmdb_persisted`、
+  `save_blocks_account_history_{map,reads,batch}`（`rocksdb/provider.rs` 的 `write_account_history`
+  三个阶段）、`save_blocks_sf_{headers,transactions,senders,receipts,account_changesets,storage_changesets}`
+  （`static_file/manager.rs` 的 `write_segment`，含 `sync_all`）。不改变行为
+- `N42_PERSIST_QMDB_IN_SCOPE=1`（默认关）：`save_blocks_inner` 把 QMDB 读视图的 `on_state_persisted`
+  放到独立线程，与静态文件/RocksDB/MDBX 写并行，在 commit 之前 join（`run_with_qmdb_persisted`）。
+  它只需要块列表与 QMDB forest，不读数据库事务
+- `N42_ACCOUNT_HISTORY=on|off`（默认 `on`，与上游逐字节相同）：`off` 时 storage v2 批次只跳过
+  RocksDB `AccountsHistory` 索引写（`RocksDBWriteCtx::write_account_history`）；账户 changeset
+  （回滚来源）照旧写入静态文件。第一个缺索引的块作为缺口标记写入 `StageCheckpoints` 的
+  `N42AccountHistoryGap` 键（与批次同一 MDBX 事务）；`IndexAccountHistory` 检查点照常推进（不触发
+  启动时的 pipeline 一致性检查）。有缺口时：`HistoryReader::account_history_info` 只信任缺口以下的
+  索引，缺口内用 changeset 扫描回答（`database/n42_account_history.rs`），扫描超过
+  `N42_ACCOUNT_HISTORY_SCAN_MAX`（默认 100000 块）则返回点名该模式的错误，绝不返回错值；
+  `rocksdb/invariants.rs` 的 `heal_accounts_history` 不修复（不 unwind）缺口内的范围；unwind 到缺口以下
+  时删除标记（`update_pipeline_stages_after_unwind`）。`StoragesHistory` 不变
 
 ## 模块4: network
 ### 定制内容:

@@ -250,3 +250,107 @@ static files. Four spans, each a few lines, would settle sections 3 and 4 in one
 A bench-only environment switch that makes `write_account_history` return immediately would give the exact
 upper bound of rank 1 in one leg (history reads are wrong in that leg; the QMDB chain does not read history
 during the flood), and a second leg with `--prune.sender-recovery.full` on top gives the static-file floor.
+
+## 9. Implementation (2026-10-04): what the code reading confirmed or corrected
+
+Items 2, 3 and the measuring half of item 1 of section 7(b) are in the tree
+(`crates/storage/provider/src/providers/n42_persist.rs`, `database/n42_account_history.rs`,
+tests in `database/n42_persist_tests.rs`). No fleet leg has run them yet; the numbers above are still
+the estimates they were.
+
+### Timers (section 8 items 1-3)
+
+All are histograms in reth's `storage.providers.database` scope with a `save_blocks_` prefix, so the
+runners' `save stages` regex picks them up (`_sum` seconds over the leg, `_count` batches). The dump
+prints only the ten largest sums; read `metrics-node0.txt` for the rest.
+
+| Metric (`reth_storage_providers_database_...`) | What it times |
+| --- | --- |
+| `save_blocks_pre_scope` | `save_blocks_inner` start to the scope: `tx_nums`, write contexts, the reverts conversion (step 0) |
+| `save_blocks_plain_reverts` | the `to_plain_state_reverts` `par_iter` alone (part of `pre_scope`) |
+| `save_blocks_scope` | the parallel scope from start to join (steps 1-5, includes the QMDB advance when in scope) |
+| `save_blocks_post_scope` | scope join to the end of `save_blocks` (step 6 when not in scope) |
+| `save_blocks_qmdb_persisted` | `on_state_persisted` for the batch, wherever it runs |
+| `save_blocks_account_history_{map,reads,batch}` | the three phases of `write_account_history` (step 1a) |
+| `save_blocks_sf_{headers,transactions,senders,receipts,account_changesets,storage_changesets}` | each static-file segment task including its `sync_all` (step 2a-2f) |
+
+The per-backend commit (step 7) was already timed (`save_blocks_commit_{sf,rocksdb,mdbx}`), so nothing
+was added there. RocksDB's own statistics (section 8 item 4) are not wired.
+
+### `N42_PERSIST_QMDB_IN_SCOPE=1` (item 2): confirmed, with one correction
+
+* Confirmed: `QmdbNodeState::on_persisted` reads only the block list, the forest (under its lock) and the
+  read view; it never touches the database transaction, so its only ordering constraint is "before the
+  commit". It now runs on its own named thread (`persist-qmdb`), started before the scope and joined after
+  it (`run_with_qmdb_persisted`). A plain thread rather than a storage-pool task: `QmdbReadView::advance`
+  uses `par_iter`, which inside a storage-pool worker would run on the storage pool beside the RocksDB
+  task instead of on the global pool as today.
+* Correction: the study described step 6 as running "after the scope joins" as if only a successful batch
+  advanced the view. In the code it runs after the MDBX closure succeeded but **before** the static-file
+  and RocksDB results are collected, so a failed backend task already leaves the view advanced. In scope,
+  an MDBX failure does too. A failed batch is fatal to persistence either way.
+* Default off. Switch-off equivalence is tested at the database level (identical rows, changesets,
+  checkpoints, latest state) and at the call level (one call, same blocks, before return).
+
+### `N42_ACCOUNT_HISTORY=off` (item 1, the measuring half)
+
+Default `on` is today's code path byte for byte (the write flag is true, no marker is ever written). With
+`off` a storage-v2 batch skips only the `AccountsHistory` task; the static-file `AccountChangeSets` task is
+untouched. Corrections to section 5:
+
+* **The marker cannot be the frozen `IndexAccountHistory` checkpoint.** `check_pipeline_consistency`
+  (`crates/node/builder/src/launch/common.rs`) compares every stage checkpoint with the first stage's at
+  launch and runs the pipeline to the tip if any is behind, which would rebuild the index over the gap
+  on every restart. So the checkpoint advances as before and the gap is a separate row:
+  `StageCheckpoints["N42AccountHistoryGap"]` = the first block whose index entries are missing, written in
+  the batch's own MDBX transaction (it is visible in `reth db stage-checkpoints`). It stays until an
+  unwind goes below it (`update_pipeline_stages_after_unwind`); turning the mode back `on` does not close
+  it (the index above the gap is incomplete), only a future indexer or that unwind does.
+* **One choke point for historical account reads.** Every history lookup goes through
+  `DatabaseProvider::account_history_info` (`HistoryReader`); `storage-overlay`'s historical fallback and
+  `get_account_before_block` resolve its answer. The RocksDB lookup already takes a `visible_tip`. With a
+  gap `g` at or below the tip: a read at `b < g` asks the index with the tip lowered to `g - 1`;
+  `InChangeset` and `NotYetWritten` are final (the index is complete below `g`; an account with no entry
+  before `g` did not exist at `b`), `InPlainState`/`MaybeInPlainState` are settled by the first changeset
+  for the address in `g..=tip`. A read at `b >= g` scans `b..=tip`: the first changeset found holds the
+  value, none means the latest value. Each block costs one segment lookup and a binary search of that
+  block's address-sorted changeset (about 17 reads at 157k entries). A scan that finds nothing within
+  `N42_ACCOUNT_HISTORY_SCAN_MAX` blocks (default 100,000) returns an error naming the mode. Reads are
+  therefore exact or an error, never wrong; they get slower as the gap grows.
+* **Healer.** With the checkpoint advancing, a normal restart has `checkpoint == sf_tip` and heals
+  nothing. In the crash shape (static files and RocksDB committed, MDBX not) `heal_accounts_history`
+  would unwind index entries for every address in the changesets above the checkpoint; with a marker at
+  or below `checkpoint + 1` it now returns without touching anything (entries there are not trusted by
+  reads anyway), and never returns an unwind target for it.
+* **Paths that do not depend on the index**, checked in the code: latest-state reads (QMDB reader at the
+  `Finish` version, or the hashed tables) never consult history; the QMDB reader is unaffected;
+  `remove_state_above` rolls state back from the changesets alone; the index unwind in
+  `unwind_trie_state_from` finds nothing to remove inside the gap; the pruner is not enabled for account
+  history.
+* **Storage history left on.** `write_storage_history` has the same shape but is near zero on transfer
+  blocks (5,876 entries a leg); putting it under the mode needs a second marker plus the same fallback in
+  `storage_history_info` and `heal_storages_history`, which is not trivial enough for this step.
+
+### Design note: the deferred indexer (not built)
+
+A background job owns the gap: it reads `AccountChangeSets` for `g..=min(tip, g + N - 1)` from static files,
+sorts `(address, block)`, appends each address's blocks to its last shard (the same shard keys as today,
+so a read path change is not needed), commits the RocksDB batch, then advances the marker to the next
+unindexed block in one MDBX transaction (deleting it when it reaches the tip with the mode `on`). Because
+reads trust only blocks below the marker, the job may run at any pace and crash at any point: a batch
+written but not recorded is overwritten by the next pass. Large passes can use `SstFileWriter` plus
+`ingest_external_file` instead of the memtable. With the mode `off` and the job keeping `N` near 64, every
+historical read stays a short scan.
+
+### Fleet legs (one each, against a BASE with the same binary)
+
+The timers need no switch. Append to the leg's environment line (the EL inherits it, like the `D=`
+variables):
+
+1. BASE: nothing (timers only).
+2. `N42_PERSIST_QMDB_IN_SCOPE=1`: expect `save_blocks_qmdb_persisted` unchanged and `save_blocks_post_scope`
+   to fall by it.
+3. `N42_ACCOUNT_HISTORY=off`: the exact upper bound of rank 1; expect `save_blocks_rocksdb` and
+   `save_blocks_commit_rocksdb` near zero and the static files exposed.
+4. Both together, optionally with `--prune.sender-recovery.full` in `F7_EL_EXTRA` for the static-file
+   floor.

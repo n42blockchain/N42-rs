@@ -213,6 +213,10 @@ crates that were previously forked and have since been reverted to upstream. Don
   `recover_address()` / `seal_hash()` for APoS signature recovery from block headers.
 - `crates/storage/{provider,storage-overlay}` — the QMDB reader hooks (`n42_state::reader()`, `on` /
   `verify`, `N42_HASHED_TABLES=off`) on latest and historical/overlay state reads.
+- `crates/storage/provider/src/providers/n42_persist.rs` — persistence timers (`save_blocks_*`),
+  `N42_PERSIST_QMDB_IN_SCOPE=1` (QMDB view advance beside the backend writes) and
+  `N42_ACCOUNT_HISTORY=off` (skip the `AccountsHistory` index, changesets kept; gap marker
+  `N42AccountHistoryGap`, gap reads scan changesets; `docs/PERSISTENCE_COST_STUDY.md` section 9).
 - `crates/consensus/consensus/src/lib.rs` — the `Consensus` trait is extended with APoS operations
   (`prepare`, `seal`, `snapshot`, `propose`, `discard`, `proposals`, `total_difficulty`, `wiggle`,
   signer get/set) plus N42 error variants.

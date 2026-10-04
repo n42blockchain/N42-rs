@@ -524,6 +524,8 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             prune_tx_lookup: self.prune_modes.transaction_lookup,
             storage_settings: self.cached_storage_settings(),
             pending_batches: self.pending_rocksdb_batches.clone(),
+            // N42: `N42_ACCOUNT_HISTORY=off` skips the `AccountsHistory` write.
+            write_account_history: !crate::providers::n42_persist::account_history_off(),
         }
     }
 
@@ -799,6 +801,14 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             let start = Instant::now();
             if !blocks.is_empty() {
                 self.update_pipeline_stages(last_block_number, false)?;
+            }
+            // N42: a batch that skipped the account-history index opens the gap marker (in this
+            // transaction, so it commits with the batch); see `n42_account_history.rs`.
+            if let (true, Some(first_number), Some(ctx)) =
+                (rocksdb_enabled, first_number, rocksdb_ctx.as_ref()) &&
+                !ctx.write_account_history
+            {
+                self.n42_note_account_history_skipped(first_number)?;
             }
             if save_mode.with_state() {
                 let checkpoint = match partial_state_trie {
@@ -1722,6 +1732,10 @@ impl<TX: DbTx, N: NodeTypes> ChangeSetReader for DatabaseProvider<TX, N> {
     }
 }
 
+// N42: the `N42_ACCOUNT_HISTORY=off` gap marker and the gap-aware historical account read.
+#[path = "n42_account_history.rs"]
+mod n42_account_history;
+
 impl<TX: DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
     /// Returns the `RocksDB` snapshot used for history lookups, creating it on first use.
     ///
@@ -1755,6 +1769,19 @@ impl<TX: DbTx + 'static, N: NodeTypes> HistoryReader for DatabaseProvider<TX, N>
         lowest_available_block_number: Option<BlockNumber>,
     ) -> ProviderResult<HistoryInfo> {
         let visible_tip = self.best_block_number()?;
+        // N42: above the `N42_ACCOUNT_HISTORY=off` gap the changesets answer, not the index.
+        if self.cached_storage_settings().storage_v2 &&
+            let Some(gap) = self.n42_account_history_gap()? &&
+            gap <= visible_tip
+        {
+            return self.n42_account_history_info_in_gap(
+                address,
+                block_number,
+                lowest_available_block_number,
+                visible_tip,
+                gap,
+            )
+        }
         let mut reader = EitherReader::new_accounts_history(self, self.history_rocksdb_snapshot())?;
         reader
             .account_history_info(address, block_number, lowest_available_block_number, visible_tip)
@@ -2425,6 +2452,8 @@ impl<TX: DbTxMut + DbTx, N: NodeTypes> DatabaseProvider<TX, N> {
             .min(block_number);
 
         self.update_pipeline_stages(block_number, true)?;
+        // N42: an unwind below the account-history gap closes it.
+        self.n42_close_account_history_gap(block_number)?;
         if partial_state_trie < block_number {
             self.save_stage_checkpoint(
                 StageId::Finish,

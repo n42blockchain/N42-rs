@@ -8,11 +8,16 @@
 //!   existing `save_blocks_*` histograms (`_sum` / `_count`) in a metrics dump.
 //! * `N42_PERSIST_QMDB_IN_SCOPE=1` runs `on_state_persisted` beside the backend writes instead of
 //!   after them (default off).
+//! * `N42_ACCOUNT_HISTORY=on|off` (default `on`): with `off` a storage-v2 batch skips the
+//!   `AccountsHistory` index write. Account changesets are written as before. The first skipped
+//!   block is recorded durably as the account-history gap (see [`ACCOUNT_HISTORY_GAP_KEY`]);
+//!   historical account reads at or above it answer from the changesets instead of the index.
 
 use metrics::Histogram;
 use reth_metrics::Metrics;
 use reth_static_file_types::StaticFileSegment;
 use alloy_eips::BlockNumHash;
+use alloy_primitives::BlockNumber;
 use reth_storage_api::n42_state::N42StateReader;
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use std::{cell::Cell, sync::OnceLock, time::Duration};
@@ -80,6 +85,8 @@ thread_local! {
     /// Test-only override of `N42_PERSIST_QMDB_IN_SCOPE`, per thread (`save_blocks` reads it on
     /// the calling thread).
     static QMDB_IN_SCOPE_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    /// Test-only override of `N42_ACCOUNT_HISTORY=off`, per thread.
+    static ACCOUNT_HISTORY_OFF_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
 /// Whether `on_state_persisted` runs beside the backend writes (`N42_PERSIST_QMDB_IN_SCOPE=1`).
@@ -96,6 +103,69 @@ pub(crate) fn persist_qmdb_in_scope() -> bool {
 #[cfg(test)]
 pub(crate) fn set_qmdb_in_scope_override(value: Option<bool>) {
     QMDB_IN_SCOPE_OVERRIDE.with(|cell| cell.set(value));
+}
+
+/// Whether the `AccountsHistory` index write is skipped (`N42_ACCOUNT_HISTORY=off`). Read once;
+/// `on`, any other value or no value writes it (reth's behaviour).
+pub(crate) fn account_history_off() -> bool {
+    if let Some(value) = ACCOUNT_HISTORY_OFF_OVERRIDE.with(Cell::get) {
+        return value;
+    }
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        let off = std::env::var("N42_ACCOUNT_HISTORY").is_ok_and(|v| v.trim() == "off");
+        if off {
+            tracing::info!(
+                target: "providers::db",
+                "N42_ACCOUNT_HISTORY=off: the AccountsHistory index is not written; account \
+                 changesets are, and historical account reads above the gap scan them"
+            );
+        }
+        off
+    })
+}
+
+/// Test helper: overrides `N42_ACCOUNT_HISTORY=off` on this thread (`None` restores the env).
+#[cfg(test)]
+pub(crate) fn set_account_history_off_override(value: Option<bool>) {
+    ACCOUNT_HISTORY_OFF_OVERRIDE.with(|cell| cell.set(value));
+}
+
+/// `StageCheckpoints` key of the account-history gap marker: its block number is the first block
+/// whose `AccountsHistory` entries are missing (written in `N42_ACCOUNT_HISTORY=off`). Entries at
+/// or above it are not trusted by historical reads, the restart healer leaves the range alone, and
+/// an unwind below it removes the marker. The `IndexAccountHistory` stage checkpoint advances as
+/// before, so the launch-time pipeline consistency check is not triggered by the gap.
+pub(crate) const ACCOUNT_HISTORY_GAP_KEY: &str = "N42AccountHistoryGap";
+
+/// Default cap on the number of blocks a historical account read scans in the gap
+/// (`N42_ACCOUNT_HISTORY_SCAN_MAX` overrides). A read that would scan more returns an error that
+/// names the mode instead of a slow or wrong answer.
+const DEFAULT_ACCOUNT_HISTORY_SCAN_MAX: u64 = 100_000;
+
+/// The gap-scan cap in force.
+pub(crate) fn account_history_scan_max() -> u64 {
+    static MAX: OnceLock<u64> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("N42_ACCOUNT_HISTORY_SCAN_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(DEFAULT_ACCOUNT_HISTORY_SCAN_MAX)
+    })
+}
+
+/// The error a historical account read returns when the gap it would scan exceeds the cap.
+pub(crate) fn account_history_scan_too_long(
+    gap_from: BlockNumber,
+    from: BlockNumber,
+    to: BlockNumber,
+) -> ProviderError {
+    ProviderError::other(std::io::Error::other(format!(
+        "historical account read needs a changeset scan of blocks {from}..={to}: the \
+         AccountsHistory index is missing from block {gap_from} (N42_ACCOUNT_HISTORY=off), and \
+         the scan exceeds N42_ACCOUNT_HISTORY_SCAN_MAX={}",
+        account_history_scan_max()
+    )))
 }
 
 fn timed_on_state_persisted(reader: &dyn N42StateReader, blocks: &[BlockNumHash]) {

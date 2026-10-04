@@ -408,6 +408,26 @@ impl RocksDBProvider {
             return Ok(None);
         }
 
+        // N42: above the `N42_ACCOUNT_HISTORY=off` gap the index is deliberately missing and its
+        // entries are not trusted by reads, so the range to heal is left alone: nothing in it is
+        // unwound (`providers/database/n42_account_history.rs`).
+        if let Some(gap) = provider
+            .get_all_checkpoints()?
+            .into_iter()
+            .find(|(key, _)| key == crate::providers::n42_persist::ACCOUNT_HISTORY_GAP_KEY)
+            .map(|(_, gap)| gap.block_number) &&
+            checkpoint.saturating_add(1) >= gap
+        {
+            tracing::info!(
+                target: "reth::providers::rocksdb",
+                checkpoint,
+                sf_tip,
+                gap,
+                "AccountsHistory: range above the checkpoint is inside the N42_ACCOUNT_HISTORY gap, not healed"
+            );
+            return Ok(None);
+        }
+
         // Fast path: clear and re-insert genesis history.
         if checkpoint == 0 {
             tracing::info!(

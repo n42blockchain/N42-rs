@@ -114,6 +114,8 @@ pub(crate) struct RocksDBWriteCtx {
     pub storage_settings: StorageSettings,
     /// Pending batches to push to after writing.
     pub pending_batches: PendingRocksDBBatches,
+    /// N42: whether the `AccountsHistory` index is written (`N42_ACCOUNT_HISTORY`, default on).
+    pub write_account_history: bool,
 }
 
 impl fmt::Debug for RocksDBWriteCtx {
@@ -123,6 +125,7 @@ impl fmt::Debug for RocksDBWriteCtx {
             .field("prune_tx_lookup", &self.prune_tx_lookup)
             .field("storage_settings", &self.storage_settings)
             .field("pending_batches", &"<pending batches>")
+            .field("write_account_history", &self.write_account_history)
             .finish()
     }
 }
@@ -1526,7 +1529,9 @@ impl RocksDBProvider {
 
         let write_tx_hash =
             ctx.storage_settings.storage_v2 && ctx.prune_tx_lookup.is_none_or(|m| !m.is_full());
-        let write_account_history = ctx.storage_settings.storage_v2;
+        // N42: `N42_ACCOUNT_HISTORY=off` skips the index only; the account changesets that are its
+        // source (and the rollback source) are written by the static-file task as before.
+        let write_account_history = ctx.storage_settings.storage_v2 && ctx.write_account_history;
         let write_storage_history = ctx.storage_settings.storage_v2;
 
         // Propagate tracing context into rayon-spawned threads so that RocksDB

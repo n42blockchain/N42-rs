@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::{
-    providers::n42_persist, test_utils::create_test_provider_factory,
+    providers::n42_persist, test_utils::create_test_provider_factory, DatabaseProviderFactory,
     ProviderFactory, RocksDBProviderFactory, StaticFileProviderFactory,
 };
 use alloy_consensus::Header;
@@ -314,4 +314,51 @@ fn historical_account_read_errors_rather_than_guess_when_the_scan_is_capped() {
     assert_eq!(short.expect("short scan"), expected_after(1, 1));
     let message = long.expect_err("a capped scan is an error").to_string();
     assert!(message.contains("N42_ACCOUNT_HISTORY=off"), "{message}");
+}
+
+/// Lowers `IndexAccountHistory` to `checkpoint` and puts an index row above it for account 0,
+/// the shape a crash between the static-file/RocksDB commit and the MDBX commit leaves.
+fn crash_shape(factory: &TestFactory, checkpoint: u64, stale: &[u64]) {
+    let provider_rw = factory.provider_rw().expect("provider_rw");
+    provider_rw
+        .save_stage_checkpoint(StageId::IndexAccountHistory, StageCheckpoint::new(checkpoint))
+        .expect("checkpoint");
+    provider_rw.commit().expect("commit");
+    if !stale.is_empty() {
+        factory
+            .rocksdb_provider()
+            .put::<tables::AccountsHistory>(
+                ShardedKey::new(address(0), u64::MAX),
+                &BlockNumberList::new(stale.iter().copied()).expect("list"),
+            )
+            .expect("stale row");
+    }
+}
+
+#[test]
+fn restart_with_the_index_off_unwinds_nothing() {
+    // The ordinary restart: checkpoints agree with the static files, nothing to do.
+    let off = run_chain(false, OFF);
+    let provider = off.factory.database_provider_rw().expect("provider_rw");
+    assert_eq!(off.factory.rocksdb_provider().check_consistency(&provider).expect("check"), None);
+    drop(provider);
+
+    // The crash shape inside the gap: the healer leaves the range alone and asks for no unwind.
+    crash_shape(&off.factory, 7, &[8, 9]);
+    let before = account_history_rows(&off.factory);
+    let provider = off.factory.database_provider_rw().expect("provider_rw");
+    assert_eq!(off.factory.rocksdb_provider().check_consistency(&provider).expect("check"), None);
+    provider.commit().expect("commit");
+    assert_eq!(account_history_rows(&off.factory), before, "nothing unwound inside the gap");
+    assert_history_exact(&off.factory, 10);
+
+    // The same shape without a gap is healed as before: entries above the checkpoint go.
+    let on = run_chain(false, ON);
+    crash_shape(&on.factory, 7, &[]);
+    let provider = on.factory.database_provider_rw().expect("provider_rw");
+    assert_eq!(on.factory.rocksdb_provider().check_consistency(&provider).expect("check"), None);
+    provider.commit().expect("commit");
+    let indexed: Vec<u64> =
+        account_history_rows(&on.factory).into_iter().flat_map(|(_, _, blocks)| blocks).collect();
+    assert!(indexed.iter().all(|b| *b <= 7), "on: entries above the checkpoint healed away");
 }

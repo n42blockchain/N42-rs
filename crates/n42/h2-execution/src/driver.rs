@@ -855,6 +855,23 @@ struct BlockSize {
 }
 
 impl BlockSize {
+    /// The size of a block arriving as a payload or a body. A compact body is
+    /// a few kilobytes whatever the block holds, so its transactions are
+    /// counted from its listing (the header and the hashes or frames, no
+    /// transaction decoded); otherwise a held compact import never reaches
+    /// [`Self::worth_logging`] and its lines never print (loop325).
+    fn of(payload: Option<&ExecutionData>, body: Option<&ForeignBody>) -> Self {
+        let txs = match (payload, body) {
+            (Some(payload), _) => payload.payload.as_v1().transactions.len(),
+            (None, Some(body)) if body.compact => {
+                n42_h2_consensus::compact_body::decode_compact_body(&body.rlp, body.profile)
+                    .map_or(0, |compact| compact.len())
+            }
+            _ => 0,
+        };
+        Self { txs, bytes: body.map_or(0, |b| b.rlp.len()) }
+    }
+
     /// Big enough for the per-block lines, which exist for the bench tier.
     const fn worth_logging(self) -> bool {
         self.txs >= 10_000 || self.bytes >= 1_000_000
@@ -2004,13 +2021,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let el = std::sync::Arc::clone(&self.el);
         let report = self.foreign_imports.clone();
         let guard = ReportGuard { block_hash, report: Some(report.clone()) };
-        let size = BlockSize {
-            txs: payload.as_ref().map_or(0, |p| p.payload.as_v1().transactions.len()),
-            bytes: body.as_ref().map_or(0, |b| b.rlp.len()),
-        };
         let decoder = self.body_decoder.clone();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
+            let size = BlockSize::of(payload.as_ref(), body.as_ref());
             // The body first. `None` is the execution layer saying "not this
             // way" before it answered anything, so nothing has been checked
             // and the payload below is the same block sent again; a failure

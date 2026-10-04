@@ -109,6 +109,18 @@ fn count(el: &MockExecutionLayer, call: &ElCall) -> usize {
     el.calls().iter().filter(|c| *c == call).count()
 }
 
+/// Waits until `call` has been made: a release reaches the execution layer
+/// on the import's own task.
+async fn made(el: &MockExecutionLayer, call: ElCall) {
+    let waited = tokio::time::timeout(Duration::from_secs(10), async {
+        while count(el, &call) == 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "timed out waiting for {call:?}");
+}
+
 /// `got` holds the blocks of `want` and nothing else, in any order: two
 /// imports in flight land in whichever order the mock lets them (a real
 /// execution layer lands them in parent order, which the mock does not
@@ -208,4 +220,61 @@ async fn by_default_a_third_block_waits_for_a_slot_vote_and_all() {
     }
     assert!(!el.calls().iter().any(|c| matches!(c, ElCall::BodyReleased(_) | ElCall::BodyDropped(_))));
     assert_eq!(driver.importing().count(), 0);
+}
+
+/// The switch on: the third block arrives with two imports in flight and is
+/// voted for before either of them lands; its execution waits for the slot
+/// the first one frees.
+#[tokio::test]
+async fn a_block_arriving_with_two_in_flight_votes_before_either_lands() {
+    let blocks = chain(3);
+    let (el, gate) = gated();
+    let (mut driver, mut rx) = driver(&el, true);
+    let mut seen = Seen::default();
+    for block in &blocks {
+        assert!(matches!(arrive(&mut driver, block).await, DriverAction::Ignored));
+    }
+    take_checks(&mut driver, &mut rx, 3, &mut seen).await;
+    assert!(seen.voted.contains(&blocks[2].hash), "the third voted with nothing landed");
+    assert!(seen.imported.is_empty(), "neither import has landed");
+    assert_eq!(driver.voted_ahead(), 1);
+    assert!(driver.is_voted_ahead(&blocks[2].hash));
+    assert_eq!(count(&el, &ElCall::BodyReleased(blocks[2].hash)), 0, "its execution waits");
+
+    land(&mut driver, &mut rx, &gate, 3, &mut seen).await;
+    same(&seen.imported, &blocks.iter().collect::<Vec<_>>());
+    assert_eq!(count(&el, &ElCall::BodyReleased(blocks[2].hash)), 1);
+    assert_eq!(driver.voted_ahead(), 0);
+    assert_eq!(driver.importing().count(), 0);
+}
+
+/// A block whose parent is itself waiting (voted ahead, not executing) has no
+/// parent fields to be checked against: it waits for a slot as without the
+/// switch, and votes once its parent has one.
+#[tokio::test]
+async fn a_block_missing_its_parents_execution_waits() {
+    let blocks = chain(4);
+    let (el, gate) = gated();
+    let (mut driver, mut rx) = driver(&el, true);
+    let mut seen = Seen::default();
+    for block in &blocks {
+        arrive(&mut driver, block).await;
+    }
+    take_checks(&mut driver, &mut rx, 3, &mut seen).await;
+    assert!(quiet(&mut rx).await, "the fourth does not check");
+    assert_eq!(count(&el, &ElCall::NewPayloadBody(blocks[3].hash)), 0, "nor is it handed over");
+    assert!(!driver.is_voted_ahead(&blocks[3].hash));
+    assert!(driver.is_importing(&blocks[3].hash), "queued");
+
+    // The first lands: the third takes its slot, and the fourth, whose parent
+    // is now executing, votes ahead.
+    land(&mut driver, &mut rx, &gate, 1, &mut seen).await;
+    made(&el, ElCall::BodyReleased(blocks[2].hash)).await;
+    assert!(driver.is_voted_ahead(&blocks[3].hash));
+    take_checks(&mut driver, &mut rx, 1, &mut seen).await;
+    assert_eq!(seen.voted.last(), Some(&blocks[3].hash));
+    assert_eq!(seen.imported.len(), 1, "with only one landed");
+
+    land(&mut driver, &mut rx, &gate, 3, &mut seen).await;
+    same(&seen.imported, &blocks.iter().collect::<Vec<_>>());
 }

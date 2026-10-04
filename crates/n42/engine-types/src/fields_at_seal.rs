@@ -334,11 +334,10 @@ mod tests {
 
     fn receipts() -> Vec<n42_tx_types::Receipt> {
         (1..=3u64)
-            .map(|i| {
-                let mut receipt = n42_tx_types::Receipt::default();
-                receipt.success = true;
-                receipt.cumulative_gas_used = 21_000 * i;
-                receipt
+            .map(|i| n42_tx_types::Receipt {
+                success: true,
+                cumulative_gas_used: 21_000 * i,
+                ..Default::default()
             })
             .collect()
     }

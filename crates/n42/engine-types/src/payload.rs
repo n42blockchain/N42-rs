@@ -2635,13 +2635,13 @@ where
             };
             // The root job's own start and end, and the moment the fields
             // were published (the `seal_to_*_us` stamps).
-            let mut root_started_at: Option<std::time::Instant> = None;
-            let mut root_ended_at: Option<std::time::Instant> = None;
+            let root_started_at: Option<std::time::Instant>;
+            let root_ended_at: Option<std::time::Instant>;
             let mut view_ready_at: Option<std::time::Instant> = None;
             let fields_published_at = std::cell::Cell::new(None::<std::time::Instant>);
             // `N42_FIELDS_AT_SEAL=verify`: what the fields were published
             // from, compared behind `Complete` with the late derivation.
-            let mut early_inputs = None;
+            let mut early_inputs;
             let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
             // `N42_OUTPUT_SHARDS`: the executor's bundle holds only what it
             // changed after the batches. The next build is let go on it laid

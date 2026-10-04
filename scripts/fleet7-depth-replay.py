@@ -94,7 +94,7 @@ def collect(root):
             if 'proposal sent view=' in l:
                 d = kv(l)
                 props.setdefault(n, {})[int(d['view'])] = (t, d)
-            elif 'block body prepared' in l and kv(l).get('bytes', 0) > 500_000:
+            elif 'block body prepared' in l and (kv(l).get('bytes', 0) > 500_000 or kv(l).get('compact_bytes', 0) > 5_000):  # elided bodies have bytes=0
                 full.setdefault(n, []).append(t)
     t0 = min(full[n][0] for n in full)  # first full body, any leader
     ldr = min(full, key=lambda n: full[n][0])  # window 1 sits in this leader's tenure

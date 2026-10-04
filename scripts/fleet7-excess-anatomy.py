@@ -80,7 +80,14 @@ def analyse(root):
         cl = lambda t: min(max(t, lo), hi)
         b = ba[v]
         tb, enc, que = b['t'], b['encode_ms'] / 1e3, b['queue_ms'] / 1e3
+        # Since loop318 the line is logged AFTER the write and `total_ms` includes it; the old boundary (the line
+        # before the write) is `answer_write_start_us`. Older logs have no such field and the line time is it.
         r0 = tb - b['total_ms'] / 1e3
+        if 'answer_write_start_us' in b:
+            # the log parser's clock is not the unix clock: shift by the write's own duration from the line time
+            tb = b['t'] - (b['answer_write_end_us'] - b['answer_write_start_us']) / 1e6
+            if b.get('answer_encode_start_us'):
+                enc = (b['answer_write_start_us'] - b['answer_encode_start_us']) / 1e6
         pts = [lo, cl(r0), cl(r0 + que), cl(tb - enc), cl(tb), hi]
         send = P[v] - hi
         seg = {'late (timer)': late_all - qover, 'late (quorum overshoot)': qover,
@@ -93,7 +100,7 @@ def analyse(root):
         rows.append({'v': v, 'cyc': cyc * 1e3, 'seg': {k: x * 1e3 for k, x in seg.items()},
                      'trig': Pd[v]['build_start_trigger'], 'take': take * 1e3,
                      'chain': {'req_after_prev_send': (r0 - P[v - 1]) * 1e3, 'queue': que * 1e3,
-                               'build': b['build_ms'], 'encode': b['encode_ms'],
+                               'build': b['build_ms'], 'encode': enc * 1e3,
                                'delivery': (H - tb) * 1e3, 'prev_send_to_hand': (H - P[v - 1]) * 1e3},
                      'q': {k: x * 1e3 for k, x in q.items()}, 'qcp': (Qc[v - 1] - P[v - 1]) * 1e3})
     return D, W, m, rows

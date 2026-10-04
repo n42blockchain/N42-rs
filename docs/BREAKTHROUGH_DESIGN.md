@@ -1634,3 +1634,45 @@ Syscall table. `perf trace -s` is not possible here: `perf trace` fails with "No
 Persistence. The EL carries no per-batch log line, but the node's Prometheus metrics (summed over the leg, in the runner's `save stages` line) give `batch_size` and `duration_seconds` per batch: BASE 304 batches of 6.4 blocks at 0.69 s (total 211 s), BASEb 322 of 6.1 at 0.67 s, P32 79 of 13.7 at 2.48 s (total 196 s), NOSYNC 318 of 6.2 at 0.66 s (total 209 s). The summed persistence time is nearly the same (196-216 s a leg) in all four: raising the threshold makes fewer, longer batches, not less work, and the work that remains is roughly 0.1 s a block of save time of which RocksDB is 141 s of 164 s on BASE.
 
 No judged leg passed the record of 1,226,047 (NOSYNC is 0.5% below it, within noise).
+
+### 10.66 The elided answer (loop318): N42_TAKE_COMPACT=1 reads +6.9% / +4.6% on window 1 against the two BASE legs, both COMPACT legs above the record, but window 2 collapsed on one of two COMPACT legs and on COMPACTP90
+
+Loop318 is measurement only (tip 8ead2883b, three nodes, one claim 03:27-04:00, the loop317 BASE configuration; derived with `scripts/fleet7-runs/derive318.py`; kernel sampler and TRACE dropped). Finding 11.7 said a third of blocks pay about 168 ms because the leader's execution layer encodes and writes a ~26 MB answer to its own proposer. Commit 206cc817e adds `N42_TAKE_COMPACT=1`: the answer carries no transaction bytes. The loop317 BASE line already set `N42_BODY_ONCE=1` and the bench exports `F7_DIRECT_PUSH=1`; the COMPACT legs add only `N42_TAKE_COMPACT=1 N42_COMPACT_BODY=1`. Legs: WARM (throwaway), BASE, COMPACT, BASEb, COMPACTb, COMPACTP90 (COMPACT at 90 ms pacing).
+
+| leg | win1 | win2 | cycle mean / median / p90 | sealed_at median / p90 | fields median / p90 | imports >600 | el_max peak |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| WARM (not judged) | 1,227,340 | 831,059 | 132.7 / 122.3 / 178.8 | 81 / 142 | 87 / 133 | 6 | 29.3 G |
+| BASE | 1,177,180 | 906,348 | 138.0 / 122.2 / 199.9 | 78 / 146 | 88 / 150 | 4 | 30.1 G |
+| COMPACT | 1,258,012 | 233,046 | 124.2 / 115.2 / 158.0 | 113 / 202 | 91 / 169 | 113 | 42.4 G |
+| BASEb | 1,210,048 | 874,204 | 134.0 / 122.9 / 180.8 | 85 / 181 | 88 / 150 | 11 | 29.5 G |
+| COMPACTb | 1,266,189 | 835,583 | 119.6 / 108.0 / 158.1 | 112 / 187 | 94 / 231 | 27 | 30.1 G |
+| COMPACTP90 | 1,232,527 | 260,511 | 128.4 / 120.8 / 171.6 | 137 / 196 | 90 / 165 | 94 | 44.0 G |
+
+(cycle, sealed_at and the answer split are window 1 of the leader; fields_ready is every follower import of the leg; sealed_at is the whole leg.) Correctness on every leg: verify passes, invalid_blocks, no_variant, own_not_committed, unanswered_reads, direct_imports_failed, incomplete, gas_mismatch and proposals_given_up all 0, tc=1, no ERROR or panic line in any node log. The `node3` cp/grep errors are the three-node fleet as before.
+
+Judging. BASE and BASEb differ by 2.8% on window 1; both COMPACT legs are above both BASE legs by at least 4.0% (COMPACT +6.9% / +4.0%, COMPACTb +7.6% / +4.6%), so by the stated rule window 1 is a change upward. Window 1 on both COMPACT legs beats 1,226,047 (and COMPACTP90, 1,232,527, and also the WARM leg, 1,227,340, which ran the baseline configuration, so the margin over the record of the baseline itself is thin). No tag, `main` untouched. Window 2 is not a metric, but it fails the rule in the other direction: COMPACT 233k and COMPACTP90 261k against 874-906k on BASE, COMPACTb 836k (below both BASE legs). Imports over 600 ms are 113 and 94 on the two legs that collapsed, 27 on COMPACTb, 4-11 on BASE; el_max peaks 42-44 G on the collapsed legs against 30 G. Round totals: BASE 62.5M, BASEb 62.5M, COMPACTb 63.1M, but COMPACT 50.0M and COMPACTP90 49.4M. Two of three compact legs therefore lose most of window 2 and the cause is not identified here (the collapse starts about 135 s in, with the cycle median rising to 0.28-0.32 s); the fields_ready p90 is also higher on every COMPACT leg (165-231 ms against 150). A configuration that raises window 1 and loses window 2 on two of three runs is not adopted.
+
+The answer split (window 1, median / p90 ms, from `answer_*_us` stamps; read = proposer read end minus write start, decode = decode end minus read end):
+
+| leg | encode | write | read | decode | answer MB |
+| --- | --- | --- | --- | --- | --- |
+| BASE | 34.2 / 47.4 | 18.0 / 53.1 | 19.5 / 53.9 | 13.7 / 19.9 | 31.3 |
+| BASEb | 33.9 / 46.1 | 15.4 / 42.6 | 16.4 / 43.6 | 13.7 / 20.6 | 31.3 |
+| COMPACT | 4.3 / 7.1 | 1.9 / 9.1 | 2.0 / 8.7 | 0.7 / 1.8 | 5.2 |
+| COMPACTb | 4.7 / 8.0 | 1.6 / 8.2 | 1.7 / 8.2 | 0.7 / 1.9 | 5.2 |
+| COMPACTP90 | 4.9 / 8.0 | 1.8 / 7.1 | 1.8 / 6.7 | 0.7 / 1.7 | 5.2 |
+
+The old "delivery" of 11.7 is write 15-18 ms plus decode 14 ms (read is the write seen from the other end); the answer was 31.3 MB with hashes, not 26. The elided answer is 5.2 MB (hashes and frame layout, no transactions) and encode falls 34 to 4.5 ms, write 16 to 1.7 ms, decode 14 to 0.7 ms. Every window-1 block on the COMPACT legs was elided.
+
+Two modes (`scripts/fleet7-excess-anatomy.py`, fixed: since 206cc817e the EL line is logged after the write and `answer_write_start_us` marks the old boundary; `fleet7-depth-replay.py` now also accepts an elided body, `compact_bytes` over 5,000, as a full block when it finds the leader):
+
+| leg | seal-trigger share / mean cycle | send-trigger share / mean cycle |
+| --- | --- | --- |
+| BASE | 63% / 115.1 ms | 37% / 177.7 ms |
+| BASEb | 69% / 119.3 | 31% / 166.5 |
+| COMPACT | 93% / 124.7 | 7% / 117.1 |
+| COMPACTb | 92% / 120.4 | 8% / 110.5 |
+
+The send-trigger mode (a build that starts at the previous send) is the slow one on BASE (167-178 ms) and nearly disappears on COMPACT (7-8% of blocks, 111-117 ms): the leader's own answer is back early enough that the next build starts at the seal. The cost moved: the seal-trigger blocks are slower (120-125 ms against 115-119) and `build` is now a segment of 6-7 ms mean (BASE 0.8), and sealed_at rises from 78-85 to 112-113 ms median. The mean excess over the tick falls from 34-38 to 20-24 ms, which is the window-1 gain; what is not explained is why the followers' check and the window 2 behave worse.
+
+On-demand path (COMPACT / COMPACTb / COMPACTP90; grepped in the execution layers' logs for "own block's body served on demand" (OWN_BODY), "compact body: asking for the transactions" (the follower's fill, NEED_TXNS) and "compact body refused", and in the validators' logs for "elided block's body fetched from the execution layer"; the `block_by_hash` serving and miss lines are debug level and are not in the logs): OWN_BODY served 3 / 0 / 4, fill requests 3 / 0 / 4, refused 1 / 0 / 1, bodies fetched by a validator 3 / 0 / 4, against about 1,700-1,850 follower imports a leg. Followers do not ask the leader for full bodies on a meaningful share of blocks (under 0.3%); the one refusal in two legs was a follower that held 500 of 82,000 transactions of a block (the start of the leg, 81,500 missing). The `block_by_hash` misses cannot be counted from these logs.

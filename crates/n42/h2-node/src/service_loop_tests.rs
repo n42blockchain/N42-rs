@@ -631,6 +631,44 @@ async fn a_hold_that_never_clears_proposes_at_the_max_hold_woken_by_its_end() {
 }
 
 
+#[tokio::test]
+async fn the_throttle_wait_is_cancel_safe_and_never_waits_inside_the_ask() {
+    let rig = node(1, 0, None).await;
+    // Mid-band at 200 ms pacing: 100 ms after the first ask.
+    let count = Arc::new(std::sync::atomic::AtomicU64::new(60));
+    let mut svc = rig
+        .svc
+        .with_block_pacing(Duration::from_millis(200))
+        .with_payload_attributes(|context| Some(attributes_for(&context)))
+        .with_build_throttle(throttle_reading(&count, Duration::from_secs(2)));
+    let view = svc.engine().current_view();
+    let mut events = Vec::new();
+    let asked = std::time::Instant::now();
+    // The ask returns at once: the wait is the loop's, not this call's.
+    within(svc.propose_if_leader(&mut events)).await.expect("ok");
+    assert!(asked.elapsed() < Duration::from_millis(50), "the ask did not wait: {:?}", asked.elapsed());
+    assert!(svc.proposal_deferred);
+    let target = svc.deferred_pacing_tick().expect("the loop sleeps to the throttle's target");
+    // The loop's sleep towards it loses to another event and is dropped.
+    tokio::select! {
+        () = tokio::time::sleep_until(target) => panic!("the shorter branch wins"),
+        () = tokio::time::sleep(Duration::from_millis(20)) => {}
+    }
+    // Asked again early, as a step would after that event: still held, the
+    // same target, nothing built.
+    within(svc.propose_if_leader(&mut events)).await.expect("ok");
+    assert!(svc.proposal_deferred);
+    assert_eq!(svc.deferred_pacing_tick(), Some(target), "the target did not move");
+    assert!(rig.el.calls().is_empty());
+    // At the target the proposal goes.
+    tokio::time::sleep_until(target).await;
+    within(svc.propose_if_leader(&mut events)).await.expect("ok");
+    assert_eq!(svc.proposed_view, Some(view));
+    let delay = svc.build_throttle.as_ref().expect("installed").last_applied().delay_ms;
+    assert!((95..1_000).contains(&delay), "about one half of the pacing: {delay} ms");
+}
+
+
 // ---------------------------------------------------------------------------
 // Building ahead of leading
 // ---------------------------------------------------------------------------

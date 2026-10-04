@@ -157,3 +157,29 @@ fn the_max_hold_is_configurable() {
     assert_eq!(t.ask(1, Some(PACING), tick), Verdict::WaitUntil(tick + Duration::from_millis(150)));
     assert_eq!(t.ask(1, Some(PACING), tick + Duration::from_millis(150)), Verdict::Go);
 }
+
+#[test]
+fn an_interrupted_wait_keeps_its_target_and_a_new_view_starts_afresh() {
+    let mut t = throttle(40, 80);
+    let tick = Instant::now();
+    let target = tick + Duration::from_millis(50);
+    assert_eq!(t.check(9, Some(60), Some(PACING), tick), Verdict::WaitUntil(target));
+    assert_eq!(t.wake_for(9), Some(target));
+    // Woken early any number of times (the loop's sleep dropped for another
+    // event and made again): the target does not move and nothing restarts.
+    for ms in [1, 5, 20, 49] {
+        assert_eq!(t.check(9, Some(60), Some(PACING), tick + Duration::from_millis(ms)), Verdict::WaitUntil(target));
+    }
+    assert_eq!(t.wake_for(9), Some(target));
+    assert_eq!(t.wake_for(10), None, "only the held view has a target");
+    // A hold interrupted the same way keeps its start, so its bound holds.
+    let mut h = throttle(40, 80);
+    assert_eq!(h.check(9, Some(90), Some(PACING), tick), Verdict::WaitUntil(tick + MAX_HOLD_DEFAULT));
+    assert_eq!(h.check(9, Some(95), Some(PACING), tick + Duration::from_secs(1)), Verdict::WaitUntil(tick + MAX_HOLD_DEFAULT));
+    assert_eq!(h.hard_holds(), 1, "re-asking is not another hold");
+    // The view moved on (a timeout) before the proposal went: the next view
+    // is measured from its own first ask.
+    let later = tick + Duration::from_millis(500);
+    assert_eq!(t.check(10, Some(60), Some(PACING), later), Verdict::WaitUntil(later + Duration::from_millis(50)));
+    assert_eq!(t.wake_for(9), None);
+}

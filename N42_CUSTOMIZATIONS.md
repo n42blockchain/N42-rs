@@ -129,6 +129,28 @@
   非 QMDB 链始终是上游行为。启动时打印一行 `executed inserts and reth's cross-block execution cache`
   （`mode=skip|update`）。
 
+## 跟随者直接导入的交接路径（不改任何 fork 的 reth crate）:
+- `N42_HANDOFF_ON_LANDED=1`（默认关；代码在 `bin/n42/src/follower_import.rs` 的
+  `handoff_on_landed` / `note_handed` / `wait_until_parent_handed`，`payload_serve.rs` 在引擎对
+  直接导入的块答复 `newPayload` VALID 时记下该块）：在父块已发布输出上执行的块，交给引擎前只等
+  父块的直接导入被引擎答复，不再等父块成为 canonical。reth 的 `InsertExecutedBlock` 只检查块号
+  不低于 canonical 高度、树里没有，然后挂到父块下；`newPayload` 对树里已有的块答 VALID；之后的
+  forkchoice 经树把父块和本块一起变成 canonical；QMDB 森林里本块的树在交接前已由本块的根任务
+  建好，`on_canonical` 照常找到；持久化只写 canonical 块。原来等 canonical 要等父块的提交
+  forkchoice（验证者在父块导入答复后才发，引擎线程上 30-36 ms）再加最多 20 ms 的轮询（变成
+  canonical 不唤醒任何等待者），见 `docs/INDUSTRY_SURVEY_2026_10.md` 11.12。打开后被记下的块
+  立即唤醒子块的等待；集合有界（64）；父块走引擎自己的路径时仍按 canonical 判断（20 ms 轮询兜底），
+  超时（3 s）行为不变。`direct import` 两行新增 `handoff_wait_us` 与 `handoff_before_canonical`
+  （交接时父块是否尚未 canonical；开关关闭时恒为 false）。
+- `N42_SHARDS_MERGE_OFF_PATH=1|verify`（默认关）：构建路径上把分片合并成一个 `BundleState`
+  （引擎的已执行插入、持久化、已发布输出都要这个完整的 bundle，交接无法只拿一部分）时，账户表与
+  回滚集（复制并排序）两半同时做（`FrozenShards::merged_timed`，
+  `crates/n42/engine-types/src/output_shards.rs`），交接等较长的一半而不是两者之和；拼装顺序不变，
+  结果与原合并逐字段相同（测试覆盖）。`verify` 另外按原方式再合并一次并比较，计数打印在
+  `build path: the root's start after the execution` 一行的 `merge_verified` / `merge_mismatches`。
+  该行无论开关都新增 `merge_ms`、`merge_wait_ms`（交接在 join 处等了多久）、`merge_state_ms`、
+  `merge_reverts_ms`、`merge_append_ms`、`merge_mode`，以前合并时长只在 debug 行里。
+
 ## HotStuff-2 结算标签（不改任何 fork 的 reth crate）:
 - `N42_SETTLEMENT_TAGS=split|legacy`（默认 `split`；代码在 `crates/n42/h2-execution/src/settlement.rs`，
   由 `ExecutionDriver` 的每个 forkchoice 使用）：`latest` = 共识已提交的块；`safe` = 执行已认证的块

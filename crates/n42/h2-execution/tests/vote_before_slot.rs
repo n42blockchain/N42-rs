@@ -1,0 +1,211 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! The deferred import slot (`N42_DEFERRED_IN_FLIGHT`) and the vote ahead of
+//! it (`N42_VOTE_BEFORE_SLOT`), against the in-memory Engine API with each
+//! body import held open after its check until the test lets it land
+//! ([`MockBehaviour::body_gate`]) -- an engine that has not landed the block
+//! yet, which is what keeps a slot taken.
+//!
+//! Every wait is bounded. No test pauses the clock.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use alloy_primitives::B256;
+use n42_h2_consensus::{ConsensusEvent, EngineOutput};
+use n42_h2_execution::{
+    BuiltBlock, DriverAction, ElCall, ExecutionDriver, ForeignBody, ImportReport, MockBehaviour, MockExecutionLayer,
+};
+use tokio::sync::{mpsc::UnboundedReceiver, Semaphore};
+
+const GENESIS: B256 = B256::ZERO;
+
+fn execute(hash: B256) -> EngineOutput {
+    EngineOutput::ExecuteBlock(hash)
+}
+
+fn body_for(hash: B256, number: u64) -> ForeignBody {
+    ForeignBody {
+        block_hash: hash,
+        number,
+        timestamp: 1_700_000_000 + number,
+        profile: n42_h2_consensus::N42HeaderProfile::Ethereum,
+        rlp: alloy_primitives::Bytes::from_static(&[0xc0]),
+        compact: false,
+    }
+}
+
+/// A chain `1..=n` on genesis.
+fn chain(n: u64) -> Vec<BuiltBlock> {
+    let mut parent = GENESIS;
+    (1..=n)
+        .map(|number| {
+            let block = MockExecutionLayer::built_block_on(number, parent);
+            parent = block.hash;
+            block
+        })
+        .collect()
+}
+
+/// The execution layer takes bodies and holds each import open after its
+/// check until the gate gives it a permit.
+fn gated() -> (MockExecutionLayer, Arc<Semaphore>) {
+    let gate = Arc::new(Semaphore::new(0));
+    let el = MockExecutionLayer::with_behaviour(MockBehaviour {
+        take_bodies: true,
+        body_gate: Some(Arc::clone(&gate)),
+        ..Default::default()
+    });
+    (el, gate)
+}
+
+/// A deferred driver with the switch as asked; the cap is the default.
+fn driver(el: &MockExecutionLayer, vote_before_slot: bool) -> (ExecutionDriver<MockExecutionLayer>, UnboundedReceiver<ImportReport>) {
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    driver.set_deferred_execution_time(Some(0));
+    driver.set_vote_before_slot(vote_before_slot);
+    let rx = driver.take_foreign_imports().expect("channel");
+    (driver, rx)
+}
+
+/// Hands a block over: its payload (which names its parent) and its body.
+async fn arrive(driver: &mut ExecutionDriver<MockExecutionLayer>, block: &BuiltBlock) -> DriverAction {
+    driver.cache_payload(block.hash, block.execution_data.clone());
+    driver.cache_body(body_for(block.hash, block.number));
+    driver.handle_output(&execute(block.hash)).await
+}
+
+async fn next_report(rx: &mut UnboundedReceiver<ImportReport>) -> ImportReport {
+    tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.expect("a report in time").expect("channel open")
+}
+
+/// Whether a report arrives within a short while.
+async fn quiet(rx: &mut UnboundedReceiver<ImportReport>) -> bool {
+    tokio::time::timeout(Duration::from_millis(150), rx.recv()).await.is_err()
+}
+
+fn checked_hash(report: &ImportReport) -> Option<B256> {
+    match report {
+        ImportReport::Checked(hash) => Some(*hash),
+        ImportReport::Done(..) => None,
+    }
+}
+
+fn votes(actions: &[DriverAction]) -> Vec<B256> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            DriverAction::Consensus(event) => match event.as_ref() {
+                ConsensusEvent::BlockChecked(hash) => Some(*hash),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+fn count(el: &MockExecutionLayer, call: &ElCall) -> usize {
+    el.calls().iter().filter(|c| *c == call).count()
+}
+
+/// `got` holds the blocks of `want` and nothing else, in any order: two
+/// imports in flight land in whichever order the mock lets them (a real
+/// execution layer lands them in parent order, which the mock does not
+/// model).
+fn same(got: &[B256], want: &[&BuiltBlock]) {
+    let mut got = got.to_vec();
+    let mut want: Vec<B256> = want.iter().map(|b| b.hash).collect();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want);
+}
+
+/// What the test saw while it let imports land.
+#[derive(Default)]
+struct Seen {
+    imported: Vec<B256>,
+    voted: Vec<B256>,
+}
+
+/// Feeds reports to the driver until `done` verdicts have been read, letting
+/// one import land per verdict wanted.
+async fn land(
+    driver: &mut ExecutionDriver<MockExecutionLayer>,
+    rx: &mut UnboundedReceiver<ImportReport>,
+    gate: &Semaphore,
+    done: usize,
+    seen: &mut Seen,
+) {
+    let mut verdicts = 0;
+    gate.add_permits(1);
+    while verdicts < done {
+        let report = next_report(rx).await;
+        let is_done = matches!(report, ImportReport::Done(..));
+        let actions = driver.finish_execute(report).await;
+        seen.voted.extend(votes(&actions));
+        seen.imported.extend(actions.iter().filter_map(DriverAction::imported_block));
+        if is_done {
+            verdicts += 1;
+            if verdicts < done {
+                gate.add_permits(1);
+            }
+        }
+    }
+}
+
+/// Reads the reports that are already due (checks), feeding them back.
+async fn take_checks(
+    driver: &mut ExecutionDriver<MockExecutionLayer>,
+    rx: &mut UnboundedReceiver<ImportReport>,
+    want: usize,
+    seen: &mut Seen,
+) {
+    for _ in 0..want {
+        let report = next_report(rx).await;
+        assert!(checked_hash(&report).is_some(), "a check, not a verdict: {report:?}");
+        seen.voted.extend(votes(&driver.finish_execute(report).await));
+    }
+}
+
+#[test]
+fn the_in_flight_knob_accepts_one_to_three() {
+    assert_eq!(n42_h2_execution::DEFERRED_IN_FLIGHT, 2);
+    assert_eq!(n42_h2_execution::parse_in_flight("1"), Ok(1));
+    assert_eq!(n42_h2_execution::parse_in_flight(" 3 "), Ok(3));
+    assert!(n42_h2_execution::parse_in_flight("0").is_err());
+    assert!(n42_h2_execution::parse_in_flight("4").is_err());
+    assert!(n42_h2_execution::parse_in_flight("two").is_err());
+    let (el, _gate) = gated();
+    let (mut driver, _rx) = driver(&el, false);
+    assert!(driver.set_deferred_in_flight(4).is_err());
+    assert!(driver.set_deferred_in_flight(3).is_ok());
+}
+
+/// Both switches unset: the third block waits for a slot with its whole
+/// road, and starts only when the first lands -- as before the knobs.
+#[tokio::test]
+async fn by_default_a_third_block_waits_for_a_slot_vote_and_all() {
+    let blocks = chain(3);
+    let (el, gate) = gated();
+    let (mut driver, mut rx) = driver(&el, false);
+    let mut seen = Seen::default();
+    for block in &blocks {
+        assert!(matches!(arrive(&mut driver, block).await, DriverAction::Ignored));
+    }
+    take_checks(&mut driver, &mut rx, 2, &mut seen).await;
+    assert!(quiet(&mut rx).await, "nothing more until a slot frees");
+    assert_eq!(count(&el, &ElCall::NewPayloadBody(blocks[2].hash)), 0, "the third was not handed over");
+    assert_eq!(driver.voted_ahead(), 0);
+    assert!(driver.is_importing(&blocks[2].hash), "queued");
+
+    land(&mut driver, &mut rx, &gate, 3, &mut seen).await;
+    same(&seen.voted[..2], &[&blocks[0], &blocks[1]]);
+    assert_eq!(seen.voted[2], blocks[2].hash, "the third voted only after a slot freed");
+    same(&seen.imported, &blocks.iter().collect::<Vec<_>>());
+    for block in &blocks {
+        assert_eq!(count(&el, &ElCall::NewPayloadBody(block.hash)), 1, "each handed over once");
+    }
+    assert!(!el.calls().iter().any(|c| matches!(c, ElCall::BodyReleased(_) | ElCall::BodyDropped(_))));
+    assert_eq!(driver.importing().count(), 0);
+}

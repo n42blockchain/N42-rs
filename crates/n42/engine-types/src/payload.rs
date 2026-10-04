@@ -1484,6 +1484,10 @@ where
     let mut seal_frames_indexed = 0usize;
     let mut seal_frames_hashed = 0usize;
     let mut seal_hook_ms = 0u64;
+    // The moment the sealed payload went to the hook: the origin of the
+    // `seal_to_*_us` stamps on the phases line (the finish behind the seal,
+    // up to this block's own fields published).
+    let mut sealed_instant: Option<std::time::Instant> = None;
     // `N42_SEAL_AT_EXEC=1`: the block sealed and proposed at the parallel
     // step's end -- the payload, the block, its hash and number, and the seal's
     // timers -- for the fold and the finish that follow it.
@@ -1585,6 +1589,7 @@ where
             let step_at = std::time::Instant::now();
             let payload = EthBuiltPayload::new(recovered.clone(), total_fees, None, None);
             ($hook)(payload.clone());
+            sealed_instant = Some(std::time::Instant::now());
             note_sealed(block_number);
             seal_hook_ms = step_at.elapsed().as_millis() as u64;
             let sealed_ms = seal_at.elapsed().as_millis() as u64;
@@ -2582,6 +2587,7 @@ where
             // inside the 26 ms before the next build could start (loop138).
             // The hashed state comes with `complete`.
             let mut bundle = db.take_bundle();
+            let bundle_taken_at = std::time::Instant::now();
             if !execution_result.requests.is_empty() {
                 tracing::error!(
                     target: "payload_builder",
@@ -2597,18 +2603,45 @@ where
             // (`ParentExecution::Published`) has no builder hash: its tree is
             // filed under the sealed hash by its own import, and there is
             // nothing to rename.
+            // `N42_FIELDS_AT_SEAL` (INDUSTRY_SURVEY_2026_10 11.8): off, the
+            // rename waits for the parent's `Complete` (its merge and hashed
+            // post-state) as it always did; on, a parent record already filed
+            // under the builder's hash -- it is, whenever this block sealed on
+            // the parent's published fields, because the parent files its tree
+            // before it publishes them -- is renamed at once, and this block's
+            // root job no longer queues behind the parent's finish.
+            let fields_mode = crate::fields_at_seal::mode();
+            let verify_fields = fields_mode.verify();
+            let rename_wait_us = std::cell::Cell::new(0u64);
+            let rename_early = std::cell::Cell::new(false);
+            let renamed_at = std::cell::Cell::new(None::<std::time::Instant>);
             let rename_parent = || -> Result<(), PayloadBuilderError> {
-                if qmdb_state.root_of(&parent_sealed).is_none()
-                    && let Some(built) = parent_built.filter(|built| *built != parent_sealed)
-                {
-                    let _ = crate::built_executions::wait_for(built, crate::built_executions::Stage::Complete);
-                    if qmdb_state.root_of(&parent_sealed).is_none() {
-                        crate::chain_alias::rename(&qmdb_state, built, parent_sealed)
-                            .map_err(PayloadBuilderError::other)?;
-                    }
-                }
+                let filed = crate::fields_at_seal::file_parent_under_seal(
+                    &qmdb_state,
+                    parent_sealed,
+                    parent_built,
+                    fields_mode.early(),
+                    || {
+                        if let Some(built) = parent_built {
+                            let _ = crate::built_executions::wait_for(built, crate::built_executions::Stage::Complete);
+                        }
+                    },
+                )
+                .map_err(PayloadBuilderError::other)?;
+                rename_wait_us.set(filed.waited_us);
+                rename_early.set(filed.early);
+                renamed_at.set(Some(std::time::Instant::now()));
                 Ok(())
             };
+            // The root job's own start and end, and the moment the fields
+            // were published (the `seal_to_*_us` stamps).
+            let mut root_started_at: Option<std::time::Instant> = None;
+            let mut root_ended_at: Option<std::time::Instant> = None;
+            let mut view_ready_at: Option<std::time::Instant> = None;
+            let fields_published_at = std::cell::Cell::new(None::<std::time::Instant>);
+            // `N42_FIELDS_AT_SEAL=verify`: what the fields were published
+            // from, compared behind `Complete` with the late derivation.
+            let mut early_inputs = None;
             let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
             // `N42_OUTPUT_SHARDS`: the executor's bundle holds only what it
             // changed after the batches. The next build is let go on it laid
@@ -2633,15 +2666,14 @@ where
             let publish = |prepared: Result<n42_qmdb_reth::PreparedBlock, n42_qmdb_reth::NodeStateError>,
                            (receipts_root, logs_bloom): reth_consensus::ReceiptRootBloom,
                            gas_used: u64|
-             -> Result<(), PayloadBuilderError> {
+             -> Result<crate::executed_fields::ExecutedFields, PayloadBuilderError> {
                 let prepared = prepared.map_err(PayloadBuilderError::other)?;
                 let state_root = prepared.root;
                 qmdb_state.insert(block_hash, block_number, prepared).map_err(PayloadBuilderError::other)?;
-                crate::executed_fields::remember(
-                    block_hash,
-                    crate::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used },
-                );
-                Ok(())
+                let fields = crate::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used };
+                crate::executed_fields::remember(block_hash, fields);
+                fields_published_at.set(Some(std::time::Instant::now()));
+                Ok(fields)
             };
             let (execution_output, hashed_state) = match output_shards.take() {
                 None => {
@@ -2665,14 +2697,18 @@ where
             // The state provider is `Send` but not `Sync`: the hashed
             // post-state stays on this thread while the root and the
             // receipts run beside it.
-            let (hashed_state, prepared, roots) = std::thread::scope(|scope| {
+            let parent_root_early = verify_fields.then(|| qmdb_state.root_of(&parent_sealed)).flatten();
+            let (hashed_state, (prepared, root_started, root_ended, kept_ops), roots) = std::thread::scope(|scope| {
                 let receipts = &execution_result.receipts;
                 let qmdb_job = &qmdb_state;
                 let root = scope.spawn(move || {
                     // The leader's QMDB root job: on the critical set.
+                    let started = std::time::Instant::now();
                     n42_core_layout::enter(n42_core_layout::Set::Critical);
                     let ops = n42_qmdb_reth::sorted_operations_from_execution(bundle_ref, prague);
-                    qmdb_job.compute_operations(parent_sealed, ops)
+                    let kept = verify_fields.then(|| ops.clone());
+                    let prepared = qmdb_job.compute_operations(parent_sealed, ops);
+                    (prepared, started, std::time::Instant::now(), kept)
                 });
                 let receipts = scope.spawn(move || crate::hotstuff_consensus::gov5_receipt_root_bloom(receipts));
                 // `N42_HASHED_TABLES=off` (stage 6c): the tables this post-state is written to are
@@ -2687,9 +2723,16 @@ where
                 (hashed, prepared, roots)
             });
             let hashed_state = hashed_state.map_err(PayloadBuilderError::other)?;
+            root_started_at = Some(root_started);
+            root_ended_at = Some(root_ended);
             let published_at = std::time::Instant::now();
-            publish(prepared, roots, execution_result.gas_used)?;
+            let fields = publish(prepared, roots, execution_result.gas_used)?;
             root_publish_us.set(published_at.elapsed().as_micros() as u64);
+            early_inputs = kept_ops.map(|ops| crate::fields_at_seal::EarlyInputs {
+                fields,
+                ops,
+                parent_root: parent_root_early,
+            });
             roots_ms = roots_at.elapsed().as_millis() as u64;
             root_split = qmdb_state.take_root_split(&parent_sealed).unwrap_or_default();
             (execution_output, hashed_state)
@@ -2716,6 +2759,7 @@ where
             let residual_state = &residual.state;
             let overlaps = shards.overlaps(residual_state);
             let view = shards.view(residual_state, &overlaps);
+            view_ready_at = Some(std::time::Instant::now());
             let destroyed = crate::output_shards::any_destroyed(&view);
             let hashed_off = n42_qmdb_reth::n42_state::hashed_tables_off();
             let shard_reverts = std::mem::take(&mut par_reverts);
@@ -2739,13 +2783,17 @@ where
                     (execution_result, roots)
                 });
                 rename_parent()?;
+                let parent_root_early = verify_fields.then(|| qmdb_state.root_of(&parent_sealed)).flatten();
                 let roots_from = std::time::Instant::now();
                 let qmdb_job = &qmdb_state;
                 let root = scope.spawn(move || {
                     // The leader's QMDB root job: on the critical set.
+                    let started = std::time::Instant::now();
                     n42_core_layout::enter(n42_core_layout::Set::Critical);
                     let ops = n42_qmdb_reth::sorted_operations_from_accounts(view_ref, prague);
-                    qmdb_job.compute_operations(parent_sealed, ops)
+                    let kept = verify_fields.then(|| ops.clone());
+                    let prepared = qmdb_job.compute_operations(parent_sealed, ops);
+                    (prepared, started, std::time::Instant::now(), kept)
                 });
                 // The hashed post-state beside the root on a thread of its
                 // own, so the publication does not wait for it. A destroyed
@@ -2753,15 +2801,20 @@ where
                 // provider's own path, on the merged bundle, below.
                 let hashed = (!hashed_off && !destroyed)
                     .then(|| scope.spawn(move || crate::output_shards::hashed_post_state_of(view_ref)));
-                let prepared = root.join().map_err(|_| {
+                let (prepared, root_started, root_ended, kept_ops) = root.join().map_err(|_| {
                     PayloadBuilderError::other(std::io::Error::other("the QMDB root job panicked"))
                 })?;
                 let (execution_result, roots) = receipts.join().map_err(|_| {
                     PayloadBuilderError::other(std::io::Error::other("the receipts root panicked"))
                 })?;
                 let published_at = std::time::Instant::now();
-                publish_ref(prepared, roots, execution_result.gas_used)?;
+                let fields = publish_ref(prepared, roots, execution_result.gas_used)?;
                 root_publish_us.set(published_at.elapsed().as_micros() as u64);
+                let early = kept_ops.map(|ops| crate::fields_at_seal::EarlyInputs {
+                    fields,
+                    ops,
+                    parent_root: parent_root_early,
+                });
                 let roots_ms = roots_from.elapsed().as_millis() as u64;
                 let shards = Arc::clone(&shards);
                 let residual = Arc::clone(&residual);
@@ -2795,9 +2848,12 @@ where
                     None if hashed_off => Some(Default::default()),
                     None => None,
                 };
-                Ok((merger, hashed, roots_ms))
+                Ok((merger, hashed, roots_ms, (root_started, root_ended), early))
             });
-            let (merger, hashed, shard_roots_ms) = scoped?;
+            let (merger, hashed, shard_roots_ms, (root_started, root_ended), early) = scoped?;
+            root_started_at = Some(root_started);
+            root_ended_at = Some(root_ended);
+            early_inputs = early;
             let (execution_output, merge_ms, filed_ms) = merger.join().map_err(|_| {
                 PayloadBuilderError::other(std::io::Error::other("the shards' merge panicked"))
             })?;
@@ -2814,6 +2870,7 @@ where
             (execution_output, hashed_state)
                 }
             };
+            let late_output = early_inputs.as_ref().map(|_| Arc::clone(&execution_output));
             crate::built_executions::complete(
                 block_hash,
                 crate::built_executions::BuiltExecution {
@@ -2824,6 +2881,33 @@ where
                 },
             );
             build_stage.at(7);
+            // `N42_FIELDS_AT_SEAL=verify`: behind `Complete`, so neither the
+            // child's seal nor the engine's hand-off waits for it. The late
+            // derivation: the operations from the merged bundle, the parent's
+            // root after the parent's own `Complete` (where the rename used
+            // to wait), and the receipts root and gas from the merged output.
+            if let (Some(early), Some(output)) = (early_inputs.take(), late_output) {
+                if let Some(built) = parent_built.filter(|built| *built != parent_sealed) {
+                    let _ = crate::built_executions::wait_for(built, crate::built_executions::Stage::Complete);
+                }
+                let late = crate::fields_at_seal::LateInputs {
+                    ops: n42_qmdb_reth::sorted_operations_from_execution(&output.state, prague),
+                    parent_root: qmdb_state.root_of(&parent_sealed),
+                    receipts: crate::hotstuff_consensus::gov5_receipt_root_bloom(&output.result.receipts),
+                    gas_used: output.result.gas_used,
+                };
+                let verdict = crate::fields_at_seal::compare(&early, &late);
+                crate::fields_at_seal::note(&verdict);
+                if let crate::fields_at_seal::Verdict::Differ(differ) = &verdict {
+                    tracing::error!(
+                        target: "payload_builder",
+                        number = block_number,
+                        %block_hash,
+                        ?differ,
+                        "the fields published at the seal differ from the late derivation"
+                    );
+                }
+            }
             if tx_count >= 1000 {
                 let (queued, usable, parked) = queue_depth();
                 // `N42_READ_DEPTH_COUNTS=1`: how many of this block's account
@@ -2868,6 +2952,28 @@ where
                     merge_ms,
                     state_ready_ms,
                     roots_ms,
+                    // The finish behind the seal, us from the seal (11.8's
+                    // uninstrumented ~80 ms): the finish's start, the bundle
+                    // taken, the shard view built (0 without shards), the
+                    // parent's tree renamed (and of it, the wait for the
+                    // parent's `Complete`), this block's QMDB root job's
+                    // start and end, and its fields published.
+                    // `N42_FIELDS_AT_SEAL`: the mode, whether the rename took
+                    // the early path, and under `verify` the process's
+                    // blocks found equal / unchecked / different.
+                    seal_to_finish_us = crate::fields_at_seal::us_between(sealed_instant, Some(finish_at)),
+                    seal_to_bundle_us = crate::fields_at_seal::us_between(sealed_instant, Some(bundle_taken_at)),
+                    seal_to_view_us = crate::fields_at_seal::us_between(sealed_instant, view_ready_at),
+                    seal_to_rename_us = crate::fields_at_seal::us_between(sealed_instant, renamed_at.get()),
+                    rename_wait_us = rename_wait_us.get(),
+                    seal_to_root_start_us = crate::fields_at_seal::us_between(sealed_instant, root_started_at),
+                    seal_to_root_end_us = crate::fields_at_seal::us_between(sealed_instant, root_ended_at),
+                    seal_to_fields_us = crate::fields_at_seal::us_between(sealed_instant, fields_published_at.get()),
+                    fields_at_seal = fields_mode.label(),
+                    rename_early = rename_early.get(),
+                    fields_verified = crate::fields_at_seal::counts().0,
+                    fields_unchecked = crate::fields_at_seal::counts().1,
+                    fields_mismatches = crate::fields_at_seal::counts().2,
                     finish_ms = finish_at.elapsed().as_millis() as u64,
                     total_ms = build_started.elapsed().as_millis() as u64,
                     reads_d0 = read_depth[0],

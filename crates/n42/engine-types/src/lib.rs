@@ -30,6 +30,7 @@ pub mod rpc;
 pub mod built_executions;
 pub mod canonical_head;
 pub mod chain_alias;
+pub mod fields_at_seal;
 /// What a block's execution produced, by hash (deferred execution).
 pub use n42_qmdb_reth::executed_fields;
 pub mod direct_build;

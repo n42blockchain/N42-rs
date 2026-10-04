@@ -389,7 +389,7 @@ async fn loopback(
     let engine = ConsensusEngineHandle::new(engine_tx);
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let _ = serve_connection::<N42EngineTypes>(stream, payloads, engine, None).await;
+        let _ = serve_connection::<N42EngineTypes>(stream, payloads, engine, None, None).await;
     });
     tokio::net::TcpStream::connect(addr).await.unwrap()
 }

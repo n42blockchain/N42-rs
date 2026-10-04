@@ -266,6 +266,11 @@ impl std::fmt::Debug for OwnBlockReuse {
 async fn reuse_own_build<T>(
     reuse: &OwnBlockReuse,
     data: &alloy_rpc_types_engine::ExecutionData,
+    // Under `N42_IMPORT_ONCE` a follower key's request may be the one that
+    // imports the leader's own block on a shared execution layer: then the
+    // build is left in the registry exactly as the header-only import leaves
+    // it when the validators build on seal, for the `BUILD_ON_OWN` racing it.
+    shared: bool,
 ) -> Option<B256>
 where
     T: PayloadTypes<ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
@@ -274,9 +279,14 @@ where
     let v1 = data.payload.as_v1();
     let (parent_hash, number, state_root, receipts_root, gas_used) =
         (v1.parent_hash, v1.block_number, v1.state_root, v1.receipts_root, v1.gas_used);
+    let keep = shared && build_on_seal();
     // On a thread: a build sealed before its finish is waited for.
     let (built_hash, built) = tokio::task::spawn_blocking(move || {
-        n42_engine_types::built_executions::take(parent_hash, number, state_root, receipts_root, gas_used, None)
+        if keep {
+            n42_engine_types::built_executions::find(parent_hash, number, state_root, receipts_root, gas_used, None)
+        } else {
+            n42_engine_types::built_executions::take(parent_hash, number, state_root, receipts_root, gas_used, None)
+        }
     })
     .await
     .ok()??;
@@ -528,6 +538,9 @@ async fn own_block_by_header<T>(
     reuse: Option<&OwnBlockReuse>,
     engine: &ConsensusEngineHandle<T>,
     frame: &[u8],
+    // The import-once owner of this block (`N42_IMPORT_ONCE`): told the block
+    // is checked as soon as the build is known to be this block's.
+    once: Option<&crate::import_once::Owner>,
 ) -> Result<(alloy_rpc_types_engine::PayloadStatus, u64, u64, u64), String>
 where
     T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
@@ -555,6 +568,25 @@ where
         (header.parent_hash, header.number, header.state_root, header.receipts_root, header.gas_used, Some(header.transactions_root));
     let stage = crate::follower_import::HandoffStage(number);
     stage.at(1);
+    // Other keys on this execution layer vote on this block once it is
+    // checked. It is this node's own build -- filed before its seal was
+    // handed out, found by the fields a seal cannot change, transactions root
+    // included -- so the header's fields are this execution layer's own
+    // result: the check a follower's import makes holds by construction,
+    // without waiting for a build sealed before its finish.
+    if let Some(once) = once
+        && n42_engine_types::built_executions::find_kept_sealed(
+            parent_hash,
+            number,
+            state_root,
+            receipts_root,
+            gas_used,
+            transactions_root,
+        )
+        .is_some()
+    {
+        once.checked();
+    }
     let (built_hash, built) = tokio::task::spawn_blocking(move || {
         if build_on_seal() {
             n42_engine_types::built_executions::find(parent_hash, number, state_root, receipts_root, gas_used, transactions_root)
@@ -1411,6 +1443,10 @@ async fn import_for_validator<T>(
     // `request::HOLD_EXECUTION`: the execution waits for the validator's
     // release byte after the CHECKED frame.
     hold: bool,
+    // `N42_IMPORT_ONCE`: this request owns the block's import on this
+    // execution layer; every other key's request for it waits on what this
+    // one says (the check, the final status).
+    once: Option<&crate::import_once::Owner>,
 ) -> std::io::Result<()>
 where
     T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
@@ -1435,7 +1471,7 @@ where
     // compact body is never one of this node's own builds (those arrive as
     // `request::OWN_BLOCK`).
     let reused = match reuse.filter(|_| listing.is_none()) {
-        Some(reuse) => reuse_own_build::<T>(reuse, &data).await.is_some(),
+        Some(reuse) => reuse_own_build::<T>(reuse, &data, once.is_some()).await.is_some(),
         None => false,
     };
     road.reuse_us = reuse_at.elapsed().as_micros() as u64;
@@ -1513,15 +1549,11 @@ where
         tokio::select! {
             checked = checked_rx => {
                 if checked.is_ok() {
-                    let status = alloy_rpc_types_engine::PayloadStatus::from_status(
-                        alloy_rpc_types_engine::PayloadStatusEnum::Valid,
-                    )
-                    .with_latest_valid_hash(data.payload.block_hash());
-                    let encoded = raw_engine::encode_payload_status(&status);
-                    let mut frame = Vec::with_capacity(encoded.len() + 5);
-                    frame.push(raw_engine::reply::CHECKED);
-                    frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-                    frame.extend_from_slice(&encoded);
+                    // The other keys' requests for this block vote now too.
+                    if let Some(once) = once {
+                        once.checked();
+                    }
+                    let frame = checked_frame(data.payload.block_hash());
                     stream.write_all(&frame).await?;
                     info!(
                         target: "n42.payload_serve",
@@ -1731,11 +1763,15 @@ where
         )
         .with_latest_valid_hash(hash);
         let encoded = raw_engine::encode_payload_status(&status);
+        if let Some(once) = once {
+            once.done(encoded.clone(), true);
+        }
         out.push(1);
         out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
         out.extend_from_slice(&encoded);
         stream.write_all(&out).await?;
         let answered = started.elapsed().saturating_sub(decoded).as_millis() as u64;
+        let oc = once.map(crate::import_once::Owner::counts).unwrap_or_default();
         if let Some(ms) = direct_ms {
             info!(
                 target: "n42.payload_serve",
@@ -1775,6 +1811,11 @@ where
                 handoff_wait_us = ms[31],
                 handoff_before_canonical = ms[32] != 0,
                 answered_ms = answered,
+                once_reqs = oc.requests,
+                once_served = oc.served,
+                once_imports = oc.imports,
+                once_blocks = oc.blocks,
+                once_takeovers = oc.takeovers,
                 "direct import: answered before the engine's own pass"
             );
         }
@@ -1858,6 +1899,7 @@ where
     }
     match new_payload {
         Ok(status) => {
+            let oc = once.map(crate::import_once::Owner::counts).unwrap_or_default();
             if let (Some(probe), Some(probe_data)) = (probe, probe_data) {
                 let validator = reuse.map(|r| r.validator.clone());
                 if let Some(validator) = validator {
@@ -1972,6 +2014,11 @@ where
                     engine_listing_ms = listing_ms,
                     engine_new_payload_ms = new_payload_ms,
                     status = ?status.status,
+                    once_reqs = oc.requests,
+                    once_served = oc.served,
+                    once_imports = oc.imports,
+                    once_blocks = oc.blocks,
+                    once_takeovers = oc.takeovers,
                     "direct import: executed here, handed to the engine as executed"
                 );
             }
@@ -1984,10 +2031,21 @@ where
                     engine_ms = started.elapsed().saturating_sub(decoded).as_millis() as u64,
                     status = ?status.status,
                     reused,
+                    once_reqs = oc.requests,
+                    once_served = oc.served,
+                    once_imports = oc.imports,
+                    once_blocks = oc.blocks,
+                    once_takeovers = oc.takeovers,
                     "raw newPayload"
                 );
             }
             let encoded = raw_engine::encode_payload_status(&status);
+            // A verdict answers every later request for the block; a status
+            // that may still change (SYNCING, ACCEPTED) only the ones waiting
+            // now.
+            if let Some(once) = once {
+                once.done(encoded.clone(), settled_status(&status.status));
+            }
             out.push(1);
             out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
             out.extend_from_slice(&encoded);
@@ -2001,6 +2059,177 @@ where
     }
     stream.write_all(out).await?;
     Ok(())
+}
+
+/// The CHECKED frame for `hash`: a VALID status naming the block, ahead of
+/// the import's own answer.
+fn checked_frame(hash: B256) -> Vec<u8> {
+    let status = alloy_rpc_types_engine::PayloadStatus::from_status(alloy_rpc_types_engine::PayloadStatusEnum::Valid)
+        .with_latest_valid_hash(hash);
+    let encoded = raw_engine::encode_payload_status(&status);
+    let mut frame = Vec::with_capacity(encoded.len() + 5);
+    frame.push(raw_engine::reply::CHECKED);
+    frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&encoded);
+    frame
+}
+
+/// Whether a status is a verdict that can answer every later request for the
+/// block (VALID, INVALID) rather than one that may change (SYNCING, ACCEPTED).
+const fn settled_status(status: &alloy_rpc_types_engine::PayloadStatusEnum) -> bool {
+    matches!(
+        status,
+        alloy_rpc_types_engine::PayloadStatusEnum::Valid | alloy_rpc_types_engine::PayloadStatusEnum::Invalid { .. }
+    )
+}
+
+/// The block hash in an encoded `NEW_PAYLOAD` frame
+/// (`raw_engine::encode_execution_data`), read without decoding the
+/// payload: what lets a later key's request for a block be answered from the
+/// import-once registry without parsing its 19 MB.
+fn peek_payload_hash(frame: &[u8]) -> Option<B256> {
+    // version, payload version, parent hash, fee recipient, state root,
+    // receipts root, logs bloom, prev randao, number, gas limit, gas used,
+    // timestamp.
+    const BEFORE_EXTRA: usize = 1 + 1 + 32 + 20 + 32 + 32 + 256 + 32 + 8 * 4;
+    let extra_len = u32::from_le_bytes(frame.get(BEFORE_EXTRA..BEFORE_EXTRA + 4)?.try_into().ok()?) as usize;
+    // The extra data, then the base fee, then the block hash.
+    let at = BEFORE_EXTRA.checked_add(4)?.checked_add(extra_len)?.checked_add(32)?;
+    frame.get(at..at.checked_add(32)?).map(B256::from_slice)
+}
+
+/// Where the import-once registry sent a request (`N42_IMPORT_ONCE`).
+enum Gate {
+    /// Answered from the registry; nothing left to do for it.
+    Answered,
+    /// Do the work: as the registry's owner of the block, or (off, or the
+    /// hash unknown) as before.
+    Work(Option<crate::import_once::Owner>),
+}
+
+/// Registers a request for `hash` and, unless it is the one to do the work,
+/// answers it from another request's: the CHECKED frame (when the road speaks
+/// it) as soon as that request's check is done, then its final status. A
+/// waiter whose owner ended without a status takes the work over and is
+/// sent back to its road as the owner. Constant-time for a later request:
+/// nothing of the block is decoded, assembled, hashed or copied for it.
+async fn gate(
+    stream: &mut TcpStream,
+    once: Option<&std::sync::Arc<crate::import_once::Registry>>,
+    hash: Option<B256>,
+    wants_checked: bool,
+) -> std::io::Result<Gate> {
+    let (Some(registry), Some(hash)) = (once, hash) else { return Ok(Gate::Work(None)) };
+    let mut waiter = match registry.claim(hash) {
+        crate::import_once::Claim::Owner(owner) => return Ok(Gate::Work(Some(owner))),
+        crate::import_once::Claim::Waiter(waiter) => waiter,
+    };
+    let waited_at = std::time::Instant::now();
+    let mut checked_us = None;
+    loop {
+        match waiter.next().await {
+            crate::import_once::Event::Checked => {
+                if wants_checked {
+                    stream.write_all(&checked_frame(hash)).await?;
+                    checked_us = Some(waited_at.elapsed().as_micros() as u64);
+                }
+            }
+            crate::import_once::Event::Done(status) => {
+                let mut frame = Vec::with_capacity(status.len() + 5);
+                frame.push(raw_engine::reply::VALUE);
+                frame.extend_from_slice(&(status.len() as u32).to_le_bytes());
+                frame.extend_from_slice(&status);
+                stream.write_all(&frame).await?;
+                debug!(
+                    target: "n42.payload_serve",
+                    block = ?hash,
+                    checked_us,
+                    answered_us = waited_at.elapsed().as_micros() as u64,
+                    "answered from the import-once registry"
+                );
+                return Ok(Gate::Answered);
+            }
+            crate::import_once::Event::TakeOver(owner) => {
+                info!(target: "n42.payload_serve", block = ?hash, "import-once: the first request ended without a status; this one takes the import over");
+                return Ok(Gate::Work(Some(owner)));
+            }
+        }
+    }
+}
+
+/// Answers a held request (`request::HOLD_EXECUTION`) under `N42_IMPORT_ONCE`
+/// with an error: a held execution is released by one validator and cannot be
+/// shared between keys (`import_once::check_startup` refuses the switch
+/// combination at start-up; this is for a validator that holds without it).
+async fn refuse_held(stream: &mut TcpStream, out: &mut Vec<u8>) -> std::io::Result<()> {
+    let message = "held execution refused: N42_IMPORT_ONCE shares each import between keys";
+    warn!(target: "n42.payload_serve", "{message}");
+    out.clear();
+    out.push(raw_engine::reply::ERROR);
+    out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+    out.extend_from_slice(message.as_bytes());
+    stream.write_all(out).await
+}
+
+/// The leader's own block, brought by another key's compact body on a shared
+/// execution layer (`N42_IMPORT_ONCE`): when this node built it, it is imported
+/// by its sealed header from the build -- what the leader's own `OWN_BLOCK`
+/// does -- instead of being assembled and executed again. `None` when the body
+/// is not one of this node's builds (or that import refused it): the road goes
+/// on as before.
+async fn compact_body_own_build<T>(
+    reuse: Option<&OwnBlockReuse>,
+    engine: &ConsensusEngineHandle<T>,
+    frame: &[u8],
+    once: &crate::import_once::Owner,
+) -> Option<alloy_rpc_types_engine::PayloadStatus>
+where
+    T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
+{
+    reuse?;
+    let (announced, profile, body) = raw_engine::decode_foreign_body(frame).ok()?;
+    let (_, header) = n42_h2_consensus::decode_compact_body_header(body, profile).ok()?;
+    if header.hash_slow() != announced {
+        return None;
+    }
+    let (_, built, _) = n42_engine_types::built_executions::find_kept_sealed(
+        header.parent_hash,
+        header.number,
+        header.state_root,
+        header.receipts_root,
+        header.gas_used,
+        Some(header.transactions_root),
+    )?;
+    // A sibling on the same parent with the same transactions -- two empty
+    // blocks after a view change -- is not this build (loop157 W).
+    if built.header().withdrawals_root != header.withdrawals_root || !build_executes_as_sealed(built.header(), None, &header, None) {
+        return None;
+    }
+    let rlp = alloy_rlp::encode(&header);
+    match own_block_by_header::<T>(reuse, engine, &rlp, Some(once)).await {
+        Ok((status, number, handoff_ms, payload_ms)) => {
+            let oc = once.counts();
+            info!(
+                target: "n42.payload_serve",
+                number,
+                handoff_ms,
+                payload_ms,
+                status = ?status.status,
+                road = "compact_body",
+                once_reqs = oc.requests,
+                once_served = oc.served,
+                once_imports = oc.imports,
+                once_blocks = oc.blocks,
+                once_takeovers = oc.takeovers,
+                "own block imported by header"
+            );
+            Some(status)
+        }
+        Err(message) => {
+            debug!(target: "n42.payload_serve", number = header.number, %message, "own block on the compact body road not imported by header; assembling it");
+            None
+        }
+    }
 }
 
 pub async fn serve<T>(
@@ -2036,6 +2265,7 @@ where
     T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
     let listener = TcpListener::bind(addr).await?;
+    let once = crate::import_once::global();
     // Said at start-up so a round can grep that its switch reached this
     // process: a variable that is set but never arrived measures nothing.
     info!(
@@ -2043,6 +2273,7 @@ where
         %addr,
         fresh_buffers = fresh_buffers(),
         own_block_reuse = reuse.is_some(),
+        import_once = once.is_some(),
         road_runtime = crate::road_runtime::enabled(),
         dispatch_wait = crate::road_runtime::measure_dispatch_wait(),
         "raw payload channel listening"
@@ -2058,8 +2289,9 @@ where
         let payloads = payloads.clone();
         let engine = engine.clone();
         let reuse = reuse.clone();
+        let once = once.clone();
         tokio::spawn(async move {
-            if let Err(err) = serve_connection(stream, payloads, engine, reuse).await {
+            if let Err(err) = serve_connection(stream, payloads, engine, reuse, once).await {
                 debug!(target: "n42.payload_serve", %peer, %err, "raw payload connection ended");
             }
         });
@@ -2071,6 +2303,9 @@ async fn serve_connection<T>(
     payloads: PayloadBuilderHandle<T>,
     engine: ConsensusEngineHandle<T>,
     reuse: Option<OwnBlockReuse>,
+    // The execution layer's import-once registry (`N42_IMPORT_ONCE`); `None`
+    // serves every request exactly as before.
+    once: Option<std::sync::Arc<crate::import_once::Registry>>,
 ) -> std::io::Result<()>
 where
     T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
@@ -2126,9 +2361,20 @@ where
             stream.read_exact(&mut buf).await?;
             out.clear();
             let started = std::time::Instant::now();
-            let reply = own_block_by_header::<T>(reuse.as_ref(), &engine, &buf).await;
+            // Under `N42_IMPORT_ONCE` the leader key's import of its own block
+            // and every other key's request for it share one hand-off of the
+            // build. The road speaks no CHECKED frame.
+            let hash = once.as_ref().and_then(|_| {
+                <alloy_consensus::Header as alloy_rlp::Decodable>::decode(&mut &buf[..]).ok().map(|h| h.hash_slow())
+            });
+            let owner = match gate(&mut stream, once.as_ref(), hash, false).await? {
+                Gate::Answered => continue,
+                Gate::Work(owner) => owner,
+            };
+            let reply = own_block_by_header::<T>(reuse.as_ref(), &engine, &buf, owner.as_ref()).await;
             match reply {
                 Ok((status, number, handoff_ms, payload_ms)) => {
+                    let oc = owner.as_ref().map(crate::import_once::Owner::counts).unwrap_or_default();
                     info!(
                         target: "n42.payload_serve",
                         number,
@@ -2136,9 +2382,17 @@ where
                         payload_ms,
                         total_ms = started.elapsed().as_millis() as u64,
                         status = ?status.status,
+                        once_reqs = oc.requests,
+                        once_served = oc.served,
+                        once_imports = oc.imports,
+                        once_blocks = oc.blocks,
+                        once_takeovers = oc.takeovers,
                         "own block imported by header"
                     );
                     let encoded = raw_engine::encode_payload_status(&status);
+                    if let Some(owner) = &owner {
+                        owner.done(encoded.clone(), settled_status(&status.status));
+                    }
                     out.push(1);
                     out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
                     out.extend_from_slice(&encoded);
@@ -2292,6 +2546,30 @@ where
             let recv = started_at.elapsed();
             let started = std::time::Instant::now();
             out.clear();
+            if hold && once.is_some() {
+                refuse_held(&mut stream, &mut out).await?;
+                continue;
+            }
+            // `N42_IMPORT_ONCE`: by the hash the frame announces, before
+            // anything is assembled -- a later key's request costs nothing.
+            let hash = once.as_ref().and_then(|_| raw_engine::decode_foreign_body(&frame).ok().map(|(hash, _, _)| hash));
+            let owner = match gate(&mut stream, once.as_ref(), hash, true).await? {
+                Gate::Answered => continue,
+                Gate::Work(owner) => owner,
+            };
+            // The leader's own block reaching its execution layer on another
+            // key's body first: imported from the build, not executed.
+            if let Some(owner) = &owner
+                && let Some(status) = compact_body_own_build::<T>(reuse.as_ref(), &engine, &frame, owner).await
+            {
+                let encoded = raw_engine::encode_payload_status(&status);
+                owner.done(encoded.clone(), settled_status(&status.status));
+                out.push(raw_engine::reply::VALUE);
+                out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                out.extend_from_slice(&encoded);
+                stream.write_all(&out).await?;
+                continue;
+            }
             // Only with the direct import configured, as the body road: the
             // point of assembling the block here is to put it straight into
             // that import.
@@ -2549,6 +2827,7 @@ where
                 decoded_in,
                 road,
                 hold,
+                owner.as_ref(),
             )
             .await?;
             continue;
@@ -2564,6 +2843,16 @@ where
             let recv = started_at.elapsed();
             let started = std::time::Instant::now();
             out.clear();
+            if hold && once.is_some() {
+                refuse_held(&mut stream, &mut out).await?;
+                continue;
+            }
+            // `N42_IMPORT_ONCE`: by the announced hash, before the decode.
+            let hash = once.as_ref().and_then(|_| raw_engine::decode_foreign_body(&frame).ok().map(|(hash, _, _)| hash));
+            let owner = match gate(&mut stream, once.as_ref(), hash, true).await? {
+                Gate::Answered => continue,
+                Gate::Work(owner) => owner,
+            };
             // Only with the direct import configured: the body path exists to
             // put the block straight into it, and without it the engine's own
             // pass would convert a payload again anyway.
@@ -2644,7 +2933,7 @@ where
                 dispatch_wait_us,
                 started: started_at,
             };
-            import_for_validator::<T>(&mut stream, &mut out, &engine, reuse.as_ref(), data, Some(sealed.into()), None, None, started, decoded_in, road, hold).await?;
+            import_for_validator::<T>(&mut stream, &mut out, &engine, reuse.as_ref(), data, Some(sealed.into()), None, None, started, decoded_in, road, hold, owner.as_ref()).await?;
             continue;
         }
         if kind == request::NEW_PAYLOAD {
@@ -2664,6 +2953,13 @@ where
             let recv = started_at.elapsed();
             let started = std::time::Instant::now();
             out.clear();
+            // `N42_IMPORT_ONCE`: by the hash read out of the frame, before the
+            // payload is decoded.
+            let hash = once.as_ref().and_then(|_| peek_payload_hash(&frame));
+            let owner = match gate(&mut stream, once.as_ref(), hash, true).await? {
+                Gate::Answered => continue,
+                Gate::Work(owner) => owner,
+            };
             // Decoded with a copy per transaction, deliberately: decoding the
             // payload as slices of one shared 19 MB buffer (loop60N1) grew the
             // execution layer by ~19 MB a block -- something downstream keeps
@@ -2723,6 +3019,7 @@ where
                             started: started_at,
                         },
                         false,
+                        owner.as_ref(),
                     )
                     .await?;
                     continue;
@@ -2770,6 +3067,10 @@ where
 #[cfg(test)]
 #[path = "payload_serve_tests.rs"]
 mod serve_tests;
+
+#[cfg(test)]
+#[path = "payload_serve_once_tests.rs"]
+mod once_tests;
 
 #[cfg(test)]
 mod tests {

@@ -326,6 +326,9 @@ fn main() {
             // The raw payload channel for the validator, loopback only. See
             // `payload_serve`.
             if let Ok(addr) = std::env::var("N42_PAYLOAD_SERVE") {
+                // Several keys on this execution layer share each import
+                // (`N42_IMPORT_ONCE`); a held execution cannot be shared.
+                n42::import_once::check_startup().map_err(|err| eyre::eyre!(err))?;
                 match addr.parse::<std::net::SocketAddr>() {
                     Ok(addr) => {
                         let payloads = node.payload_builder_handle.clone();

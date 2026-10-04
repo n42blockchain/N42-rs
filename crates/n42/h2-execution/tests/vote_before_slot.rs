@@ -278,3 +278,79 @@ async fn a_block_missing_its_parents_execution_waits() {
     land(&mut driver, &mut rx, &gate, 3, &mut seen).await;
     same(&seen.imported, &blocks.iter().collect::<Vec<_>>());
 }
+
+/// Past the follower-lag cap -- slots plus blocks voted ahead -- a block
+/// waits with its vote, which is the backpressure.
+#[tokio::test]
+async fn past_the_lag_cap_the_vote_is_withheld() {
+    let blocks = chain(3);
+    let (el, gate) = gated();
+    let (mut driver, mut rx) = driver(&el, true);
+    driver.set_deferred_in_flight(3).expect("three slots");
+    let mut seen = Seen::default();
+    for block in &blocks {
+        arrive(&mut driver, block).await;
+    }
+    // Two siblings at height four, each on a parent that executes.
+    let first = MockExecutionLayer::built_block_on(4, blocks[2].hash);
+    let mut second = first.clone();
+    second.hash = B256::repeat_byte(0x4b);
+    second.execution_data = MockExecutionLayer::payload_for(second.hash, 4);
+    arrive(&mut driver, &first).await;
+    arrive(&mut driver, &second).await;
+    take_checks(&mut driver, &mut rx, 4, &mut seen).await;
+    assert!(quiet(&mut rx).await, "the second sibling does not check");
+    assert!(driver.is_voted_ahead(&first.hash));
+    assert_eq!(driver.voted_ahead(), 1, "3 slots + 1 held = the cap of 4");
+    assert_eq!(count(&el, &ElCall::NewPayloadBody(second.hash)), 0);
+    assert!(driver.is_importing(&second.hash), "it waits for its slot");
+
+    land(&mut driver, &mut rx, &gate, 5, &mut seen).await;
+    let mut all: Vec<&BuiltBlock> = blocks.iter().collect();
+    all.extend([&first, &second]);
+    same(&seen.imported, &all);
+    assert_eq!(count(&el, &ElCall::NewPayloadBody(second.hash)), 1, "imported in its turn, once");
+}
+
+/// A run of blocks arriving faster than they land: every block's execution
+/// starts in arrival order and each is handed over, released and imported
+/// exactly once.
+#[tokio::test]
+async fn imports_run_in_order_and_each_exactly_once() {
+    let blocks = chain(7);
+    let (el, gate) = gated();
+    let (mut driver, mut rx) = driver(&el, true);
+    let mut seen = Seen::default();
+    for block in &blocks {
+        arrive(&mut driver, block).await;
+        // One landing every other arrival: the follower falls behind.
+        if block.number % 2 == 0 {
+            land(&mut driver, &mut rx, &gate, 1, &mut seen).await;
+        }
+    }
+    let left = blocks.len() - seen.imported.len();
+    land(&mut driver, &mut rx, &gate, left, &mut seen).await;
+    same(&seen.imported, &blocks.iter().collect::<Vec<_>>());
+    // Where each execution started: its hand-over when it had a slot, its
+    // release when it voted ahead.
+    let calls = el.calls();
+    let started: Vec<B256> = blocks
+        .iter()
+        .map(|block| {
+            let handed = calls.iter().position(|c| *c == ElCall::NewPayloadBody(block.hash)).expect("handed over");
+            let released = calls.iter().position(|c| *c == ElCall::BodyReleased(block.hash));
+            (released.unwrap_or(handed), block.hash)
+        })
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .into_values()
+        .collect();
+    assert_eq!(started, blocks.iter().map(|b| b.hash).collect::<Vec<_>>(), "executions start in order");
+    for block in &blocks {
+        assert_eq!(count(&el, &ElCall::NewPayloadBody(block.hash)), 1);
+        assert!(count(&el, &ElCall::BodyReleased(block.hash)) <= 1);
+    }
+    assert!(seen.voted.len() >= blocks.len(), "every block voted");
+    assert!(calls.iter().any(|c| matches!(c, ElCall::BodyReleased(_))), "some voted ahead");
+    assert_eq!(driver.importing().count(), 0);
+    assert_eq!(driver.voted_ahead(), 0);
+}

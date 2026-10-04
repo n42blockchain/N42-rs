@@ -1,0 +1,52 @@
+
+== loop317BASE: window 1 blocks 220, cycle mean 136.3 median 129.2 ms; kern samples 322
+slowest 10%: 22 blocks with cycle >= 194 ms (mean 215), rest 197 (mean 128)
+counter                     win1 /s      slow /s      rest /s  ratio  spearman
+CAL                          105949       107853       105353   1.02     0.038
+TLB                               3            4            4   1.17     0.037
+pgfault                     1108519      1106697      1059679   1.04     0.126
+pgmajfault                     2328         7156         1469   4.87     0.003
+thp_fault_alloc                2984         2892         3171   0.91    -0.134
+thp_fault_fallback             1243         1154         1175   0.98     0.120
+compact_stall                    12           12           11   1.09     0.171
+pgscan_kswapd                219424       254473       201492   1.26     0.156
+pgsteal_kswapd               201435       238930       184507   1.29     0.162
+
+== loop317BASEb: window 1 blocks 221, cycle mean 135.8 median 130.0 ms; kern samples 318
+slowest 10%: 22 blocks with cycle >= 183 ms (mean 206), rest 198 (mean 128)
+counter                     win1 /s      slow /s      rest /s  ratio  spearman
+CAL                          108713       102992       109419   0.94     0.100
+TLB                               3            4            3   1.08     0.064
+pgfault                      935375       897067       918990   0.98     0.106
+pgmajfault                       45          166          159   1.04     0.025
+thp_fault_alloc                3409         3543         3541   1.00    -0.161
+thp_fault_fallback              852          750          843   0.89     0.104
+compact_stall                     7            8            7   1.06     0.169
+pgscan_kswapd                206591       193976       202203   0.96     0.118
+pgsteal_kswapd               187433       180335       182768   0.99     0.140
+
+== loop317NOSYNC: window 1 blocks 224, cycle mean 133.8 median 124.2 ms; kern samples 323
+slowest 10%: 23 blocks with cycle >= 191 ms (mean 208), rest 200 (mean 125)
+counter                     win1 /s      slow /s      rest /s  ratio  spearman
+CAL                          106393       108939       105395   1.03     0.069
+TLB                               4            3            4   0.99    -0.012
+pgfault                      681206       745695       664576   1.12     0.032
+pgmajfault                        5            5            5   0.99    -0.007
+thp_fault_alloc                3905         3754         3993   0.94    -0.057
+thp_fault_fallback              325          337          313   1.08     0.027
+compact_stall                     3            3            3   1.00     0.028
+pgscan_kswapd                119908       136022       116450   1.17     0.014
+pgsteal_kswapd               107486       126943       104098   1.22     0.017
+
+== loop317P32: window 1 blocks 215, cycle mean 139.2 median 132.3 ms; kern samples 281
+slowest 10%: 22 blocks with cycle >= 200 ms (mean 231), rest 192 (mean 129)
+counter                     win1 /s      slow /s      rest /s  ratio  spearman
+CAL                           93730        93322        92519   1.01     0.021
+TLB                               3            6            3   2.11     0.136
+pgfault                     1276571      1244359      1243768   1.00     0.105
+pgmajfault                     3552         4847         3743   1.29     0.113
+thp_fault_alloc                2570         2553         2687   0.95    -0.140
+thp_fault_fallback             1683         1513         1653   0.92     0.101
+compact_stall                    18           16           18   0.88     0.117
+pgscan_kswapd                260071       341726       240583   1.42     0.144
+pgsteal_kswapd               248551       326931       230135   1.42     0.133

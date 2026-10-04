@@ -9,7 +9,7 @@
 //! |---|---|---|
 //! | (leader for this view) | FCU-with-attrs, then resolve the build | [`ConsensusEvent::BlockReady`] |
 //! | [`EngineOutput::ExecuteBlock`] | `new_payload` for that hash | [`ConsensusEvent::BlockImported`] |
-//! | [`EngineOutput::BlockCommitted`] | FCU with head = safe = finalized | — |
+//! | [`EngineOutput::BlockCommitted`] | FCU with head = the committed block, safe = certified, finalized = certified and persisted ([`crate::settlement`]; `N42_SETTLEMENT_TAGS=legacy`: head = safe = finalized) | — |
 //!
 //! The middle row is the one that matters for safety: N42 votes are
 //! *import-gated*, so a follower only votes after its own execution layer has
@@ -741,6 +741,9 @@ pub struct ExecutionDriver<E> {
     commit_reports: tokio::sync::mpsc::UnboundedSender<CommitReport>,
     /// The receiving end, until the loop takes it.
     commit_reports_rx: Option<tokio::sync::mpsc::UnboundedReceiver<CommitReport>>,
+    /// What the forkchoice's safe and finalized hashes are (see
+    /// [`crate::settlement`]).
+    settlement: crate::settlement::Settlement,
 }
 
 /// `N42_BODY_ONCE`, read once: opt-in, and read on the validator's side,
@@ -930,6 +933,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             commits_answered: 0,
             commit_reports: commit_tx,
             commit_reports_rx: Some(commit_rx),
+            settlement: crate::settlement::Settlement::new(crate::settlement::settlement_tags()),
         }
     }
 
@@ -981,13 +985,94 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.head
     }
 
-    /// Last committed block.
+    /// Last committed block. Under the split settlement tags this is the
+    /// forkchoice's head, not its finalized hash: see [`Self::safe_tag`] and
+    /// [`Self::finalized_tag`].
     pub fn finalized(&self) -> B256 {
         self.finalized
     }
 
+    /// Picks the settlement tags mode; the default is
+    /// [`crate::settlement::settlement_tags`] (`N42_SETTLEMENT_TAGS`). This is
+    /// how a test picks it without the process environment.
+    pub fn set_settlement_tags(&mut self, mode: crate::settlement::SettlementTags) {
+        self.settlement.set_mode(mode);
+    }
+
+    /// The settlement tags mode in use.
+    pub fn settlement_tags(&self) -> crate::settlement::SettlementTags {
+        self.settlement.mode()
+    }
+
+    /// Installs the reading of this node's last persisted block, which
+    /// caps the finalized tag. Without one the finalized tag follows the
+    /// safe tag.
+    pub fn set_persisted_height(&mut self, source: crate::settlement::PersistedSource) {
+        self.settlement.set_persisted(source);
+    }
+
+    /// A node starting on a fresh chain: genesis is the floor of both tags.
+    /// A restarted node leaves this out, so its first forkchoices do not
+    /// move the tags its execution layer restored back to genesis.
+    pub fn set_settlement_floor(&mut self, genesis: B256) {
+        self.settlement.set_floor(genesis);
+    }
+
+    /// The newest block whose execution is certified, as the forkchoice
+    /// carries it under the split tags; `None` until known.
+    pub fn safe_tag(&self) -> Option<crate::settlement::Tag> {
+        self.settlement.safe()
+    }
+
+    /// The newest certified block at or below this node's persisted block;
+    /// `None` until known.
+    pub fn finalized_tag(&self) -> Option<crate::settlement::Tag> {
+        self.settlement.finalized()
+    }
+
+    /// The forkchoice a commit of `head` sends: legacy, head = safe =
+    /// finalized; split, the tags this commit moves (see
+    /// [`crate::settlement`]).
+    fn commit_forkchoice(&mut self, head: B256) -> ForkchoiceState {
+        if self.settlement.mode() == crate::settlement::SettlementTags::Legacy {
+            return ForkchoiceState { head_block_hash: head, safe_block_hash: head, finalized_block_hash: head };
+        }
+        self.note_lineage_of(head);
+        let deferred_from = self.deferred_execution_time;
+        self.settlement.advance(head, |timestamp| deferred_from.is_some_and(|at| timestamp >= at));
+        let (safe, finalized) = self.settlement.tags_for(head);
+        ForkchoiceState { head_block_hash: head, safe_block_hash: safe, finalized_block_hash: finalized }
+    }
+
+    /// Records `block_hash`'s place in the chain from a payload or body this
+    /// driver still holds, if it has not been recorded already. Bodies are
+    /// read for the header alone.
+    fn note_lineage_of(&mut self, block_hash: B256) {
+        if self.settlement.knows(&block_hash) {
+            return;
+        }
+        if let Some(payload) = self.payloads.get(&block_hash) {
+            let (number, parent, timestamp) =
+                (payload.payload.block_number(), payload.payload.parent_hash(), payload.payload.timestamp());
+            self.settlement.note(block_hash, number, parent, timestamp);
+            return;
+        }
+        if let (Some(body), Some(parent)) = (self.bodies.get(&block_hash), self.parent_of(&block_hash)) {
+            let (number, timestamp) = (body.number, body.timestamp);
+            self.settlement.note(block_hash, number, parent, timestamp);
+        }
+    }
+
     /// Records a block payload so a later `ExecuteBlock` for it can proceed.
     pub fn cache_payload(&mut self, block_hash: B256, payload: ExecutionData) {
+        if self.settlement.mode() == crate::settlement::SettlementTags::Split {
+            self.settlement.note(
+                block_hash,
+                payload.payload.block_number(),
+                payload.payload.parent_hash(),
+                payload.payload.timestamp(),
+            );
+        }
         if self.payloads.insert(block_hash, payload).is_none() {
             self.payload_order.push(block_hash);
             while self.payload_order.len() > self.max_cached_payloads {
@@ -1008,7 +1093,13 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// re-encoded from them. Bounded exactly as the payload cache is.
     pub fn cache_body(&mut self, body: ForeignBody) {
         let block_hash = body.block_hash;
+        let split = self.settlement.mode() == crate::settlement::SettlementTags::Split;
         if self.bodies.insert(block_hash, body).is_none() {
+            if split {
+                // The header alone; the lineage is what a commit of this
+                // block, or of a descendant, walks to set the tags.
+                self.note_lineage_of(block_hash);
+            }
             self.payload_order.push(block_hash);
             while self.payload_order.len() > self.max_cached_payloads {
                 let oldest = self.payload_order.remove(0);
@@ -1053,6 +1144,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
 
     /// The forkchoice this driver would send right now.
     fn forkchoice(&self, head: B256) -> ForkchoiceState {
+        if self.settlement.mode() == crate::settlement::SettlementTags::Split {
+            let (safe, finalized) = self.settlement.tags_for(head);
+            return ForkchoiceState { head_block_hash: head, safe_block_hash: safe, finalized_block_hash: finalized };
+        }
         ForkchoiceState {
             head_block_hash: head,
             safe_block_hash: self.finalized,
@@ -2339,6 +2434,15 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// catch-up that skips a block leaves every later one without a parent.
     pub async fn import_pulled(&mut self, payload: ExecutionData) -> Result<B256, ElError> {
         let block_hash = payload.block_hash();
+        let split = self.settlement.mode() == crate::settlement::SettlementTags::Split;
+        if split {
+            self.settlement.note(
+                block_hash,
+                payload.payload.block_number(),
+                payload.payload.parent_hash(),
+                payload.payload.timestamp(),
+            );
+        }
         let status = self
             .el
             .new_payload_for(ExecutionPath::HISTORICAL_SEQUENTIAL, payload)
@@ -2352,10 +2456,17 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 return Err(ElError::new(format!("execution layer did not accept block {block_hash}: {other:?}")));
             }
         }
-        let state = ForkchoiceState {
-            head_block_hash: block_hash,
-            safe_block_hash: block_hash,
-            finalized_block_hash: self.finalized,
+        // Split tags: a pulled block is neither committed nor certified here,
+        // so it moves neither tag; the forkchoice carries the ones the
+        // driver has, when they are on the pulled block's chain.
+        let state = if split {
+            self.forkchoice(block_hash)
+        } else {
+            ForkchoiceState {
+                head_block_hash: block_hash,
+                safe_block_hash: block_hash,
+                finalized_block_hash: self.finalized,
+            }
         };
         let updated = self
             .el
@@ -2480,11 +2591,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             self.queue_commit(block_hash, Vec::new());
             return DriverAction::Ignored;
         }
-        let state = ForkchoiceState {
-            head_block_hash: block_hash,
-            safe_block_hash: block_hash,
-            finalized_block_hash: block_hash,
-        };
+        let state = self.commit_forkchoice(block_hash);
         let started = std::time::Instant::now();
         let ahead = self.commits_ahead.contains(&block_hash);
         let answer = self
@@ -2580,11 +2687,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         };
         self.commit_in_flight = Some(pending.block_hash);
         let block_hash = pending.block_hash;
-        let state = ForkchoiceState {
-            head_block_hash: block_hash,
-            safe_block_hash: block_hash,
-            finalized_block_hash: block_hash,
-        };
+        let state = self.commit_forkchoice(block_hash);
         let el = std::sync::Arc::clone(&self.el);
         let guard = CommitGuard {
             report: Some(self.commit_reports.clone()),
@@ -2625,6 +2728,8 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 elapsed_ms = (queued + in_flight).as_millis() as u64,
                 in_flight_ms = in_flight.as_millis() as u64,
                 queued_ms = queued.as_millis() as u64,
+                safe = ?self.settlement.safe().map(|tag| tag.number),
+                finalized = ?self.settlement.finalized().map(|tag| tag.number),
                 "commit forkchoice answered"
             );
         }

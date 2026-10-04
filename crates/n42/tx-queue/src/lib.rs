@@ -1287,15 +1287,9 @@ impl<T: PoolTransaction> TxQueue<T> {
         if transactions.is_empty() {
             return;
         }
+        let returned = Returned::new(transactions);
         let mut inner = self.lock_inner();
-        for transaction in &transactions {
-            if let Some((_, taken)) = inner.last_build.as_mut()
-                && let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, transaction))
-            {
-                taken.remove(at);
-            }
-        }
-        inner.give_back(transactions);
+        inner.untake_all(returned);
     }
 
     /// Forgets a transaction a build took and will not use: it leaves the
@@ -2698,6 +2692,52 @@ fn queue_batch() -> usize {
     *N.get_or_init(|| std::env::var("N42_TX_QUEUE_BATCH").ok().and_then(|v| v.parse().ok()).filter(|n| *n >= 1).unwrap_or(1))
 }
 
+/// Transactions a build took and gives back, indexed by allocation so that
+/// [`Inner::untake_all`] forgets them from the build's taken list in one
+/// pass. Built outside the queue's lock.
+struct Returned<T: PoolTransaction> {
+    transactions: Vec<Arc<ValidPoolTransaction<T>>>,
+    /// How many times each allocation is returned.
+    by_ptr: std::collections::HashMap<usize, u32>,
+}
+
+impl<T: PoolTransaction> Returned<T> {
+    fn new(transactions: Vec<Arc<ValidPoolTransaction<T>>>) -> Self {
+        let mut by_ptr = std::collections::HashMap::with_capacity(transactions.len());
+        for transaction in &transactions {
+            *by_ptr.entry(Arc::as_ptr(transaction) as usize).or_insert(0u32) += 1;
+        }
+        Self { transactions, by_ptr }
+    }
+}
+
+impl<T: PoolTransaction> Inner<T> {
+    /// Gives a build's untaken transactions back and forgets that the build
+    /// took them: one pass over the taken list, then [`Self::give_back`]
+    /// (which keeps each sender's nonces in their lane's order).
+    ///
+    /// The per-transaction untake this replaces searched the taken list from
+    /// the back and removed from the middle of it for every transaction:
+    /// quadratic in the selection. A refused chained build gives back a
+    /// whole block (163,000 transactions) and held the lock 4,866 ms doing
+    /// it (loop323 Ab, the tenure handover).
+    fn untake_all(&mut self, returned: Returned<T>) {
+        let Returned { transactions, mut by_ptr } = returned;
+        if let Some((_, taken)) = self.last_build.as_mut()
+            && !taken.is_empty()
+        {
+            taken.retain(|t| match by_ptr.get_mut(&(Arc::as_ptr(t) as usize)) {
+                Some(count) if *count > 0 => {
+                    *count -= 1;
+                    false
+                }
+                _ => true,
+            });
+        }
+        self.give_back(transactions);
+    }
+}
+
 impl<T: PoolTransaction> QueueBest<T> {
     /// Returns a transaction taken but not built to the queue, and forgets
     /// that the build took it. The taken list ends with the buffered ones,
@@ -2721,10 +2761,11 @@ impl<T: PoolTransaction> Drop for QueueBest<T> {
         if self.buffer.is_empty() {
             return;
         }
+        // Indexed before the lock is taken: under it the give-back is one
+        // pass over the build's taken list and one insert a transaction.
+        let returned = Returned::new(self.buffer.drain(..).collect());
         let mut inner = self.queue.lock_inner();
-        for transaction in self.buffer.drain(..) {
-            Self::untake(&mut inner, transaction);
-        }
+        inner.untake_all(returned);
     }
 }
 

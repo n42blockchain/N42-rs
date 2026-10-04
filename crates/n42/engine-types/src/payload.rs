@@ -1102,6 +1102,33 @@ where
 
     debug!(target: "payload_builder", ?block_gas_limit, ?base_fee, "payload builder block config");
 
+    // A height the chain has already committed: nothing will ask for this
+    // payload, and building it costs a block's worth of the queue and a
+    // build's worth of verdicts about a state consensus did not keep. Taken
+    // before anything is selected, so the queue is not touched at all:
+    // until loop322 this ran after `best_txs`, so a payload job on a parent
+    // the chain had passed (the build ahead on the old parent at a tenure
+    // handover) took and gave back a block's worth of frames under the
+    // queue's lock on every attempt before cancelling itself.
+    if skip_decided_builds() && crate::canonical_head::already_decided(parent_header.number + 1) {
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if say_once_a_second(&LAST) {
+            tracing::info!(
+                target: "payload_builder",
+                number = parent_header.number + 1,
+                head = crate::canonical_head::number(),
+                "a build for a height the chain has already decided was cancelled"
+            );
+        }
+        // Not `Cancelled`: reth's payload job treats that outcome as
+        // unreachable unless its own cancel signal fired, and panics the
+        // payload service -- which took the execution layer down on six
+        // legs of loop215-218 and left the dead node leader for the rest of
+        // its tenure (a TC moves the chain on by one view only). `Aborted`
+        // is a build that chose not to produce a block; the job logs it at
+        // debug and moves on.
+        return Ok(BuildOutcome::Aborted { fees: U256::ZERO, cached_reads });
+    }
     // The seal gap's first term named (plan v6 6.13, `par_start_ms`): the
     // selection, of which the wait for the parent's queue hand-off (set by
     // a chained build's selector, [`note_handoff_wait`]), the checks, the
@@ -1170,29 +1197,6 @@ where
     // block, canonical and committed before the build ran. Counted so a leg
     // can say whether the case exists; acted on only under
     // `N42_BUILD_REFUSE_STALE_PARENT`.
-    // A height the chain has already committed: nothing will ask for this
-    // payload, and building it costs a block's worth of the queue and a
-    // build's worth of verdicts about a state consensus did not keep. Taken
-    // before anything is selected, so the queue is not touched at all.
-    if skip_decided_builds() && crate::canonical_head::already_decided(parent_header.number + 1) {
-        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if say_once_a_second(&LAST) {
-            tracing::info!(
-                target: "payload_builder",
-                number = parent_header.number + 1,
-                head = crate::canonical_head::number(),
-                "a build for a height the chain has already decided was cancelled"
-            );
-        }
-        // Not `Cancelled`: reth's payload job treats that outcome as
-        // unreachable unless its own cancel signal fired, and panics the
-        // payload service -- which took the execution layer down on six
-        // legs of loop215-218 and left the dead node leader for the rest of
-        // its tenure (a TC moves the chain on by one view only). `Aborted`
-        // is a build that chose not to produce a block; the job logs it at
-        // debug and moves on.
-        return Ok(BuildOutcome::Aborted { fees: U256::ZERO, cached_reads });
-    }
     let pruned_through = n42_tx_queue::global::<Pool::Transaction>().map_or(0, |queue| queue.pruned_through());
     let parent_behind = pruned_through > parent_header.number;
     if parent_behind {

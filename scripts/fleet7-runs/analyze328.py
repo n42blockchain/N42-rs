@@ -42,6 +42,33 @@ for tag in sys.argv[1:]:
     pts = [ts(ansi.sub('', l)) for l in open(f'{root}/node0-v.log', errors='replace') if 'proposal sent' in l]
     cyc = [(b - a) * 1e3 for a, b in zip(pts, pts[1:]) if t0 - 1 <= a <= t0 + 30 and 0 < (b - a) * 1e3 < 2000]
     if cyc: print(f'  proposal cycle window 1 (n={len(cyc)}): mean {st.mean(cyc):.1f} median {st.median(cyc):.1f} p90 {pct(cyc, .9):.1f} ms; blocks in the 30 s: {len(cyc)}')
+    # votes and the binding wait, from the validators' own logs (the anatomy script pairs a validator index with a layer index: not usable here)
+    P, Pd, Tp, Qc, votes = {}, {}, {}, {}, {}
+    for i in range(7):
+        for l in open(f'{root}/node{i}-v.log', errors='replace'):
+            l = ansi.sub('', l)
+            if i == 0 and 'proposal sent view=' in l:
+                d = dict(KV.findall(l)); P[int(d['view'])] = ts(l); Pd[int(d['view'])] = d
+            elif i == 0 and 'proposal preamble view=' in l: Tp[int(dict(KV.findall(l))['view'])] = ts(l)
+            elif i == 0 and 'block committed!' in l: Qc[int(dict(KV.findall(l))['view'])] = ts(l)
+            elif 'sending vote to leader' in l:
+                d = dict(KV.findall(l)); votes.setdefault(int(d['view']), {})[i] = ts(l)
+    W = [v for v in sorted(P) if t0 <= P[v] <= t0 + 30 and v - 1 in P and v in Tp and v - 1 in Qc]
+    if W:
+        cls = {'tick': [], 'quorum': [], 'seal': []}
+        for v in W:
+            take = float(Pd[v].get('take_sealed_us', 0)) / 1e3
+            c = 'seal' if take > 3 else ('quorum' if (Tp[v] - Qc[v - 1]) * 1e3 < 10 and Tp[v] > P[v - 1] + 0.103 else 'tick')
+            cls[c].append((P[v] - P[v - 1]) * 1e3)
+        print('  binding wait (tick / quorum / seal, share and mean cycle): ' + '; '.join(f'{c} {len(x) / len(W) * 100:.1f}% ({st.mean(x):.1f})' if x else f'{c} 0%' for c, x in cls.items()))
+        from collections import Counter
+        last = Counter(); worst = []; spread = []
+        for v in W:
+            vv = votes.get(v - 0, {})
+            if len(vv) >= 5:
+                dl = {i: (t - P[v]) * 1e3 for i, t in vv.items()}
+                k = max(dl, key=dl.get); last[k] += 1; worst.append(dl[k]); spread.append(dl[k] - st.median(dl.values()))
+        if worst: print(f'  vote delay after the proposal, slowest key per block: median {st.median(worst):.1f} p90 {pct(worst, .9):.1f} ms (slowest minus the median key: median {st.median(spread):.1f}); last key: {dict(sorted(last.items()))} of {len(worst)} blocks')
     gm = time.localtime(t0).tm_gmtoff; a, b = t0 + gm, t0 + 30 + gm
     rows = {}
     try:
@@ -63,7 +90,7 @@ for tag in sys.argv[1:]:
     try:
         mem = [l.split() for l in open(f'{S}/strip-{tag}/mem.log')]
         rss = [float(x[4].split('=')[1]) for x in mem if len(x) > 6 and x[4].startswith('rss_g=') and x[4][6:] != '-']
-        nb = [int(x[6].split('=')[1]) for x in mem if len(x) > 6 and x[6].startswith('num=') and x[6][4:].isdigit()]
+        nb = [int(x[5].split('=')[1]) for x in mem if len(x) > 6 and x[5].startswith('num=') and x[5][4:].isdigit()]
         print(f'  execution layer peak RSS {max(rss):.1f} G; in-memory blocks max {max(nb)} (node0 and others, all layers)')
     except Exception as ex: print(f'  memsample: {ex}')
     print(f'  import-once counters at the last direct import: ' + ' '.join(f'{k}={once[k]}' for k in ('once_reqs', 'once_served', 'once_imports', 'once_blocks', 'once_takeovers') if k in once) + f'; start-up lines with import_once=true: {sum("import_once=true" in l for l in el)}; queue-lock lines {locks}')

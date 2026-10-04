@@ -4,6 +4,8 @@
 cd /home/n42/src/n42/n42-rs
 n=0
 while ls /data/blockchain/.box-claim-* >/dev/null 2>&1 || [ "$(pgrep -fc 'n42-[a-z0-9]+ --chai[n]')" != 0 ]; do sleep 60; n=$((n+1)); [ $n -gt 240 ] && { echo "gave up waiting after 4 h"; exit 1; }; done
+avail=$(df -BG /data | awk 'NR==2{gsub("G","",$4); print $4}'); [ "${avail:-0}" -ge 120 ] || { echo "/data has only ${avail}G free (the smallest leg needs 120G); nothing built"; echo ALLDONE; exit 1; }
+echo "/data free ${avail}G at launch"
 grep -rq N42_IMPORT_ONCE bin/n42/src crates/n42 || { echo "N42_IMPORT_ONCE is not in the tree: the shared-execution legs need the import-once registry; nothing built"; echo ALLDONE; exit 1; }
 echo "box free at $(date +%H:%M); builds:"
 PKGS="-p n42 --bin n42 -p n42-h2-node --example h2_validator --example tx_flood --example h2_keygen --example send_tx"

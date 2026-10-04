@@ -42,12 +42,16 @@ def set_tok(line, key, val):
     return new
 
 
+E1_ = ('F7_EL_MAP', '0,0,0,0,0,0,0')
+ONCE_ = ('N42_IMPORT_ONCE', '1')
+
+
 def sub1(text, old, new, count=1):
     assert text.count(old) == count, (text.count(old), old[:90])
     return text.replace(old, new)
 
 
-def derive(num, legs_spec, title):
+def derive(num, legs_spec, title, warm_e1=False):
     tag = f'loop{num}'
     run = base_run.replace('loop326', tag)
     lines = run.split('\n')
@@ -72,7 +76,7 @@ def derive(num, legs_spec, title):
         return l
 
     ONCE = ('N42_IMPORT_ONCE', '1')
-    new = [warm]
+    new = [mk('WARM', E1_, ONCE_) if warm_e1 else warm]
     for name, edits in legs_spec:
         new.append(mk(name, *edits))
     # `$ONCE` is a shell variable expanded on the leg line; the edits above add it as a token, so write it as the variable.
@@ -127,11 +131,24 @@ def derive(num, legs_spec, title):
     # headers of both processes name the layout and the pool sizes
     run = sub1(run, 'ENGINE_EXEC_CACHE|SETTLEMENT_TAGS|',
                'F7_EL_MAP|F7_EL_CPUS|F7_VAL_CPUS|IMPORT_ONCE|RAYON_NUM_THREADS|PARALLEL_BUILD_THREADS|TOKIO_WORKER_THREADS|ENGINE_EXEC_CACHE|SETTLEMENT_TAGS|', count=2)
+    # free-space gate per leg (E7-shaped legs 450G, the rest 120G), the free figure in every leg's header, and the seven-node datadirs of the
+    # runner's own root wiped at the end of the round (the same two directories `fleet7.sh up --fresh` removes at the start of a leg)
+    run = sub1(run, '  local tag=$1; shift\n  run loop' + str(num) + '$tag',
+               '  local tag=$1; shift\n'
+               '  local need=120; case $tag in E7*) need=450;; esac; local avail; avail=$(df -BG /data | awk \'NR==2{gsub("G","",$4); print $4}\')\n'
+               '  if [ "${avail:-0}" -lt $need ]; then echo "leg loop' + str(num) + '$tag skipped: /data has ${avail}G free, the leg needs $need G with margin"; return; fi\n'
+               '  echo "leg loop' + str(num) + '$tag: /data free ${avail}G (needs $need G)"\n'
+               '  run loop' + str(num) + '$tag')
+    run = sub1(run, '\ncleanup\necho "released at', '\nfor i in 0 1 2 3 4 5 6; do rm -rf $B/node$i/el $B/node$i/consensus; done; echo "datadirs of this round wiped; /data free $(df -BG /data | awk \'NR==2{print $4}\')"\ncleanup\necho "released at')
     run = run.replace('#!/usr/bin/env bash\n', '#!/usr/bin/env bash\n# ' + tag + ' = ' + title + '\n', 1)
     open(D + f'run-{tag}.sh', 'w').write(run)
 
     launch = base_launch.replace('loop326', tag)
     # refuse to build and run when the tree does not know the switch; and once built, when the binary does not
+    launch = sub1(launch, 'echo "box free at',
+                  'avail=$(df -BG /data | awk \'NR==2{gsub("G","",$4); print $4}\'); [ "${avail:-0}" -ge 120 ] || { echo "/data has only ${avail}G free (the smallest leg needs 120G); nothing built"; echo ALLDONE; exit 1; }\n'
+                  'echo "/data free ${avail}G at launch"\n'
+                  'echo "box free at')
     launch = sub1(launch, 'echo "box free at',
                   'grep -rq N42_IMPORT_ONCE bin/n42/src crates/n42 || { echo "N42_IMPORT_ONCE is not in the tree: the shared-execution legs need the import-once registry; nothing built"; echo ALLDONE; exit 1; }\n'
                   'echo "box free at')
@@ -145,16 +162,16 @@ ONCE = ('N42_IMPORT_ONCE', '1')
 E7 = ('F7_EL_MAP', '0,1,2,3,4,5,6')
 E1 = ('F7_EL_MAP', '0,0,0,0,0,0,0')
 derive(328, [
-    ('E7', [E7, ONCE]),
     ('E1', [E1, ONCE]),
     ('E1b', [E1, ONCE]),
     ('E1P80', [E1, ONCE, ('F7_BLOCK_INTERVAL_MS', '80')]),
     ('E1P70', [E1, ONCE, ('F7_BLOCK_INTERVAL_MS', '70')]),
     ('E1T', [E1, ONCE, ('N42_PARALLEL_BUILD_THREADS', '64'), ('RAYON_NUM_THREADS', '32')]),
-    ('E1C74', [E1, ONCE, ('F7_EL_CPUS', '74')]),
-    ('E1FS', [E1, ONCE, ('N42_FIELDS_AT_SEAL', '1')]),
     ('E1G', [E1, ONCE, ('F7_GASCEIL_ARG', '4200000000')]),
-], 'seven validator keys on one execution layer (docs/SHARED_EXECUTION_SCOPE.md), the peak search: WARM (one-to-one, no switch), E7 (control), E1, E1b, E1P80, E1P70 (pacing), E1T (build pool and rayon doubled), E1C74 (layer capped at 74 CPUs), E1FS (fields at seal). Validators pinned on 16 CPUs of their own. One claim; legs after 75 minutes are skipped, so the order is the priority.')
+    ('E1FS', [E1, ONCE, ('N42_FIELDS_AT_SEAL', '1')]),
+    ('E1C74', [E1, ONCE, ('F7_EL_CPUS', '74')]),
+    ('E7', [E7, ONCE]),
+], 'seven validator keys on one execution layer (docs/SHARED_EXECUTION_SCOPE.md), the peak search: WARM (an E=1 warm-up), E1, E1b, E1P80, E1P70 (pacing), E1T (build pool and rayon doubled), E1G (200,000 transfers a block), E1FS (fields at seal), E1C74 (layer capped at 74 CPUs), then the E7 control last and only if /data has 450G free. A per-leg free-space gate (120G, E7 450G); the round wipes its own datadirs at the end. One claim; legs after 75 minutes are skipped, so the order is the priority.', warm_e1=True)
 derive(329, [
     ('E7', [E7, ONCE]),
     ('E4', [('F7_EL_MAP', '0,0,1,1,2,2,3'), ONCE]),

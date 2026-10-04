@@ -1610,6 +1610,18 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         }
 
         let after_seal = started.elapsed();
+        // The settlement tags need every own block's place in the chain, and
+        // an elided one is never cached below: without this a leader's
+        // commits of its own blocks found no lineage and moved no tag for
+        // its whole tenure (loop326 SPLIT, node 0).
+        if self.settlement.mode() == crate::settlement::SettlementTags::Split {
+            self.settlement.note(
+                built.hash,
+                built.execution_data.payload.block_number(),
+                built.execution_data.payload.parent_hash(),
+                built.execution_data.payload.timestamp(),
+            );
+        }
         // An elided block's payload lists no transactions, and a cached
         // payload is what an import of the block would send: it is never
         // cached. Its own import goes by the sealed header, and fetches the

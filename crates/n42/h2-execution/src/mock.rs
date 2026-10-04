@@ -72,6 +72,10 @@ pub struct MockBehaviour {
     /// before its verdict: a test keeps imports in flight, as an engine
     /// that has not landed them yet does.
     pub body_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// Whether a resolved build comes back elided, as the compact take
+    /// answer (`N42_TAKE_COMPACT=1`) does: the driver never caches its
+    /// payload.
+    pub elide_builds: bool,
 }
 
 impl Default for MockBehaviour {
@@ -86,6 +90,7 @@ impl Default for MockBehaviour {
             body_needs_txns: None,
             forkchoice_gate: None,
             body_gate: None,
+            elide_builds: false,
         }
     }
 }
@@ -406,7 +411,8 @@ impl ExecutionLayer for MockExecutionLayer {
             state.next_block = state.next_block.max(known) + 1;
             (state.next_block, state.next_parent)
         };
-        let built = Self::built_block_on(number, parent);
+        let mut built = Self::built_block_on(number, parent);
+        built.elided = self.behaviour.lock().expect("mock behaviour lock").elide_builds;
         if let Ok(block) = built.execution_data.clone().into_block_raw() {
             self.state
                 .lock()

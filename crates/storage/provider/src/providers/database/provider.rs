@@ -4113,6 +4113,11 @@ impl<TX: Send, N: NodeTypes> StoragePath for DatabaseProvider<TX, N> {
     }
 }
 
+// N42: tests of `N42_PERSIST_QMDB_IN_SCOPE` and `N42_ACCOUNT_HISTORY`.
+#[cfg(test)]
+#[path = "n42_persist_tests.rs"]
+mod n42_persist_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

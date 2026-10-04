@@ -21,6 +21,7 @@ pub use state::{
     historical::{compute_history_rank, history_info, needs_prev_shard_check, HistoryInfo},
     latest::{LatestStateProvider, LatestStateProviderRef},
     memory_overlay::{MemoryOverlayStateProvider, MemoryOverlayStateProviderRef},
+    overlay_filter,
 };
 
 mod blockchain_provider;

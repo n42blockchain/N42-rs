@@ -1190,16 +1190,31 @@ mod tests {
                     balance: U256::from(n * 1000 + number),
                     ..Default::default()
                 };
+                // Every 16th account also writes one slot (its own index), so storage reads
+                // walk the overlay too.
+                let mut storage = revm::database::states::StorageWithOriginalValues::default();
+                if n % 16 == 0 {
+                    storage.insert(
+                        U256::from(n),
+                        revm::database::states::StorageSlot::new_changed(
+                            U256::ZERO,
+                            U256::from(n * 10 + number),
+                        ),
+                    );
+                }
                 state.state.insert(
                     n42_address(n),
                     revm::database::BundleAccount::new(
                         None,
                         Some(info),
-                        Default::default(),
+                        storage,
                         revm::database::AccountStatus::Changed,
                     ),
                 );
             }
+            // One contract a block, so bytecode reads walk the overlay too.
+            let code = n42_code(number);
+            state.contracts.insert(code.hash_slow(), code.0);
             let block = Block {
                 header: alloy_consensus::Header {
                     number,
@@ -1234,6 +1249,96 @@ mod tests {
 
     fn n42_address(n: u64) -> Address {
         Address::from_word(B256::from(U256::from(n + 1)))
+    }
+
+    /// N42: the contract block `number` of [`n42_in_memory_chain`] deploys.
+    fn n42_code(number: u64) -> reth_primitives_traits::Bytecode {
+        reth_primitives_traits::Bytecode::new_raw(alloy_primitives::Bytes::from(
+            [&[0x60u8, 0x00, 0x60][..], &number.to_be_bytes()[..]].concat(),
+        ))
+    }
+
+    /// N42: the layered overlay at `state`, its blocks' filters built first (`filtered`) or
+    /// dropped, over the database at the anchor (or over nothing: `walk_only`).
+    fn n42_overlay(
+        provider: &BlockchainProvider<MockNodeTypesWithDB>,
+        state: &reth_chain_state::BlockState<reth_ethereum_primitives::EthPrimitives>,
+        filtered: bool,
+        walk_only: bool,
+    ) -> eyre::Result<crate::MemoryOverlayStateProvider<reth_ethereum_primitives::EthPrimitives>> {
+        use crate::providers::overlay_filter;
+        let in_memory: Vec<ExecutedBlock<reth_ethereum_primitives::EthPrimitives>> =
+            state.chain().map(|state| state.block()).collect();
+        if filtered {
+            for block in &in_memory {
+                assert!(overlay_filter::filter_now(&block.execution_output).is_some());
+            }
+        }
+        let historical: reth_storage_api::StateProviderBox = if walk_only {
+            Box::new(reth_storage_api::noop::NoopProvider::default())
+        } else {
+            let db = DatabaseProviderFactory::database_provider_ro(&provider.database)?;
+            provider.state_provider_from_database(db, state.anchor().hash)
+        };
+        let overlay = crate::MemoryOverlayStateProvider::new(historical, in_memory);
+        Ok(if filtered { overlay } else { overlay.without_filters() })
+    }
+
+    /// N42: reads through the layered overlay with its blocks' address filters answer what the
+    /// unfiltered walk answers -- accounts, storage slots, bytecode, present and missing --
+    /// over a chain of 10 in-memory blocks, at every tip.
+    #[test]
+    fn n42_overlay_filter_reads_match_unfiltered() -> eyre::Result<()> {
+        use crate::providers::overlay_filter;
+        use reth_storage_api::{AccountReader as _, BytecodeReader as _, StateProvider as _};
+        if !overlay_filter::enabled() {
+            return Ok(())
+        }
+        const BLOCKS: u64 = 10;
+        const PER_BLOCK: u64 = 400;
+        let (provider, hashes) = n42_in_memory_chain(BLOCKS, PER_BLOCK, 120)?;
+        let span = BLOCKS * PER_BLOCK + 2_000;
+        // A fixed pseudo-random walk over the key space (splitmix64).
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        for hash in &hashes {
+            let state =
+                provider.canonical_in_memory_state.state_by_hash(*hash).expect("in memory");
+            let filtered = n42_overlay(&provider, &state, true, false)?;
+            let plain = n42_overlay(&provider, &state, false, false)?;
+            let (mut accounts, mut slots, mut codes) = (0usize, 0usize, 0usize);
+            for _ in 0..3_000 {
+                let n = next() % span;
+                let address = n42_address(n);
+                let account = filtered.basic_account(&address)?;
+                assert_eq!(account, plain.basic_account(&address)?, "account {n} at {hash}");
+                accounts += account.is_some() as usize;
+                // The slot an account writes, and one it never writes.
+                for slot in [n, n + 1] {
+                    let key = B256::from(U256::from(slot));
+                    let value = filtered.storage(address, key)?;
+                    assert_eq!(value, plain.storage(address, key)?, "slot {slot} of {n} at {hash}");
+                    slots += value.is_some() as usize;
+                }
+            }
+            for number in 0..=BLOCKS + 2 {
+                let code_hash = n42_code(number).hash_slow();
+                let code = filtered.bytecode_by_hash(&code_hash)?;
+                assert_eq!(code, plain.bytecode_by_hash(&code_hash)?, "code {number} at {hash}");
+                codes += code.is_some() as usize;
+            }
+            assert!(accounts > 0 && slots > 0 && codes > 0, "{accounts} {slots} {codes}");
+        }
+        // The filters did skip blocks (each thread folds its counts in every 4096 reads).
+        let (skips, _) = overlay_filter::take_counters();
+        assert!(skips > 0, "no block skipped on its filter");
+        Ok(())
     }
 
     /// N42: state under in-memory blocks read through `MemoryOverlayStateProvider` answers
@@ -1297,6 +1402,73 @@ mod tests {
                 );
             }
         }
+
+        // N42: the layered overlay's per-block address filters at the fleet's shape: 160k
+        // reads at the tip of 8 in-memory blocks, 90% of them missing every block (fresh
+        // recipients), filter off and on, on 1 and 16 threads (each thread its own overlay and
+        // all 160k reads). `filter=None` is the database read under the overlay alone.
+        use reth_storage_api::AccountReader as _;
+        let (provider, hashes) = n42_in_memory_chain(BLOCKS, ACCOUNTS, 0)?;
+        let tip = provider
+            .canonical_in_memory_state
+            .state_by_hash(*hashes.last().expect("blocks"))
+            .expect("in memory");
+        let in_blocks = BLOCKS * ACCOUNTS;
+        let reads: Vec<Address> = (0..160_000u64)
+            .map(|i| {
+                let mixed = i.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 20;
+                if i % 10 == 0 { n42_address(mixed % in_blocks) } else { n42_address(in_blocks + i) }
+            })
+            .collect();
+        for threads in [1usize, 16] {
+            // `filter=None`: the database under the overlay alone; `walk_only`: the overlay
+            // over a provider that answers nothing at once (the walk's own cost).
+            for (filtered, walk_only) in [
+                (None, false),
+                (Some(false), false),
+                (Some(true), false),
+                (Some(false), true),
+                (Some(true), true),
+            ] {
+                let per_thread = std::thread::scope(|scope| -> eyre::Result<Vec<(f64, usize)>> {
+                    let handles: Vec<_> = (0..threads)
+                        .map(|_| {
+                            let (provider, tip, reads) = (&provider, &tip, &reads);
+                            scope.spawn(move || -> eyre::Result<(f64, usize)> {
+                                let overlay: reth_storage_api::StateProviderBox = match filtered {
+                                    Some(filtered) => {
+                                        Box::new(n42_overlay(provider, tip, filtered, walk_only)?)
+                                    }
+                                    None => provider.state_provider_from_database(
+                                        DatabaseProviderFactory::database_provider_ro(
+                                            &provider.database,
+                                        )?,
+                                        tip.anchor().hash,
+                                    ),
+                                };
+                                let mut found = 0usize;
+                                let at = Instant::now();
+                                for read in reads {
+                                    found += overlay.basic_account(read)?.is_some() as usize;
+                                }
+                                Ok((at.elapsed().as_nanos() as f64 / reads.len() as f64, found))
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|handle| handle.join().map_err(|_| eyre::eyre!("reader panicked"))?)
+                        .collect()
+                })?;
+                let mean = per_thread.iter().map(|(ns, _)| ns).sum::<f64>() / threads as f64;
+                println!(
+                    "filter={filtered:?} walk_only={walk_only} threads={threads}: 160k reads, {mean:.0} ns a read ({} found)",
+                    per_thread[0].1
+                );
+            }
+        }
+        let (skips, probes) = crate::providers::overlay_filter::take_counters();
+        println!("overlay_filter_skips={skips} overlay_probes={probes}");
         Ok(())
     }
 

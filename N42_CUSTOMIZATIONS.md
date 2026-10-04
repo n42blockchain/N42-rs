@@ -53,6 +53,13 @@
   其下是持久化锚点的状态（`n42_layered_state_provider`），不再走上游按 tip 摊平整个内存链的
   `ExecutionOverlay`；`N42_OVERLAY_READS=upstream` 恢复上游路径（loop308 的跟随者减速，见
   `docs/RETH_2_7_0_UPGRADE.md`）
+- `crates/storage/provider/src/providers/state/overlay_filter.rs`（N42 新增文件）：每个内存块一个
+  split-block Bloom 过滤器（512 位块、每键 8 位、11 位/键，约 1% 假阳性，147k 账户约 200 KB），
+  覆盖该块 `BundleState` 的地址（账户与存储读）和合约代码哈希（字节码读）。
+  `MemoryOverlayStateProvider` 逐块读之前先查过滤器，未命中即跳过该块，命中照旧探测，结果按构造不变。
+  过滤器按执行输出（`Arc` 地址 + `Weak` 校验）缓存在有界侧表（64 项，块释放即淘汰），
+  在第一次有覆盖层打开在该块上时由后台线程构建一次，打开者从不等待。`N42_OVERLAY_FILTER=0` 关闭。
+  计数器 `overlay_filter_skips` / `overlay_probes` 在 `N42_PHASE_TIMERS=1` 时打印在领导者的阶段行上
 - `crates/storage/provider/src/providers/op_metrics.rs`（N42 新增文件）：`N42_STORAGE_OP_METRICS=0`
   时跳过每次操作的存储指标——静态文件写入器每追加一行交易/收据/发送者的计数与耗时直方图
   （`StaticFileProviderMetrics::record_segment_operation`）以及 RocksDB 每次点读写的指标

@@ -29,7 +29,8 @@ pub mod engine;
 pub mod transport;
 
 pub use engine::{
-    built_block_from_envelope, forkchoice_method, new_payload_call, EngineApiClient,
+    built_block_from_compact, built_block_from_envelope, forkchoice_method, new_payload_call, request_own_body,
+    EngineApiClient,
 };
 pub use transport::{
     HttpTransport, JsonRpcTransport, RpcError, TransportError, UNKNOWN_PAYLOAD, UNSUPPORTED_FORK,

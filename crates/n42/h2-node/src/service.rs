@@ -416,6 +416,14 @@ pub struct H2Service<E> {
     /// insertion order in `body_store_order`.
     body_store: std::collections::HashMap<B256, crate::body_channel::BodyBuf>,
     body_store_order: Vec<B256>,
+    /// Blocks this node built and took from its execution layer without
+    /// their transactions (`N42_TAKE_COMPACT`): the sealed header and the
+    /// access list, which with the body fetched on demand
+    /// ([`ExecutionLayer::own_block_body`]) make the gov5 body a peer asking
+    /// by hash is served. Such a block is not in `body_store` until a peer
+    /// asks. Bounded like the store; insertion order in `elided_order`.
+    elided_own: std::collections::HashMap<B256, (Header, Option<alloy_primitives::Bytes>)>,
+    elided_order: std::collections::VecDeque<B256>,
     /// Timestamps of blocks this node has seen the body of, for
     /// [`ProposalContext::head_timestamp`]. Bounded; insertion order in
     /// `timestamp_order`.
@@ -569,6 +577,27 @@ fn encode_own_body(
         _ => None,
     };
     n42_h2_net::encode_block_rlp_raw(header, &execution.payload.as_v1().transactions, &rewards, bal.as_ref())
+}
+
+/// The compact body of a block this node built, made without its
+/// transactions: the gov5 body with an empty transaction list carries the
+/// same header, verifiers, rewards and access list as the whole one, and the
+/// compact encoders step over the transaction list without reading it -- so
+/// this is byte for byte what `publish_body` makes of the whole block.
+fn elided_compact_body(
+    execution: &alloy_rpc_types_engine::ExecutionData,
+    header: &alloy_consensus::Header,
+    tx_hashes: &[B256],
+    frame_layout: &[(B256, u32)],
+    profile: HeaderProfile,
+) -> Result<Vec<u8>, n42_h2_consensus::BlockBodyError> {
+    let skeleton = encode_own_body(execution, header);
+    let frames = n42_tx_types::frame_blocks_requested() && !frame_layout.is_empty();
+    if frames {
+        n42_h2_consensus::encode_compact_frame_body(&skeleton, frame_layout, profile)
+    } else {
+        n42_h2_consensus::encode_compact_body(&skeleton, tx_hashes, profile)
+    }
 }
 
 /// Between one broadcast request for a block's body and the next.
@@ -1027,6 +1056,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             pending_ranges: Vec::new(),
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
+            elided_own: std::collections::HashMap::new(),
+            elided_order: std::collections::VecDeque::new(),
             block_timestamps: std::collections::HashMap::new(),
             inbound_transactions: std::collections::VecDeque::new(),
             outbound_transactions: None,
@@ -2098,6 +2129,11 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.consider_catch_up(events).await;
         self.import_ranges(events).await;
         for (peer, hash, channel) in std::mem::take(&mut self.pending_block_requests) {
+            if let Some(body) = self.elided_body(hash).await {
+                debug!(target: "n42.h2.node", peer, ?hash, "peer asked for a block taken elided; body fetched from the execution layer");
+                self.transport.respond_block(channel, Some(body));
+                continue;
+            }
             let body = match self.driver.execution_layer().block_by_hash(hash).await {
                 Ok(Some(block)) => Some(alloy_primitives::Bytes::from(n42_h2_net::encode_block_rlp_raw(
                     &block.header,
@@ -2118,6 +2154,18 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.respond_served_txns(served);
         }
         for (request, channel) in std::mem::take(&mut self.pending_txns_requests) {
+            if let Some(body) = self.elided_body(request.hash).await {
+                let reply = fill_from_body(&body, self.header_profile, &request);
+                debug!(
+                    target: "n42.h2.node",
+                    hash = ?request.hash,
+                    wanted = request.indices.len(),
+                    served = reply.as_ref().map(Vec::len).unwrap_or(0),
+                    "peer asked for named transactions of a block taken elided; body fetched from the execution layer"
+                );
+                self.transport.respond_block_txns(channel, reply);
+                continue;
+            }
             let reply = match self.driver.execution_layer().block_by_hash(request.hash).await {
                 Ok(Some(block)) => request
                     .indices
@@ -2779,14 +2827,20 @@ impl<E: ExecutionLayer> H2Service<E> {
                     }
                 }
                 let describe_at = std::time::Instant::now();
-                let encoded = self.driver.take_encoded_body(built.hash);
-                self.publish_body(
-                    &built.execution_data,
-                    built.header.as_ref(),
-                    &built.tx_hashes,
-                    &built.frame_layout,
-                    encoded,
-                );
+                if built.elided {
+                    // Taken without its transactions (`N42_TAKE_COMPACT`):
+                    // the compact body is all there is to publish.
+                    self.publish_elided_body(&built);
+                } else {
+                    let encoded = self.driver.take_encoded_body(built.hash);
+                    self.publish_body(
+                        &built.execution_data,
+                        built.header.as_ref(),
+                        &built.tx_hashes,
+                        &built.frame_layout,
+                        encoded,
+                    );
+                }
                 let describe_us = describe_at.elapsed().as_micros() as u64;
                 let publish_at = std::time::Instant::now();
                 if let Err(err) = self
@@ -2849,6 +2903,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                     tick_to_send_us = timeline_from.elapsed().as_micros() as u64,
                     build_start_after_prev_send_us,
                     build_start_trigger,
+                    answer_elided = timing.elided,
+                    answer_bytes = timing.answer.map_or(0, |a| a.bytes),
+                    answer_read_end_us = timing.answer.map_or(0, |a| a.read_end_us),
+                    answer_decode_end_us = timing.answer.map_or(0, |a| a.decode_end_us),
                     "proposal sent"
                 );
                 // Build-on-seal: the next build starts here, on this block's
@@ -3669,6 +3727,106 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.block_seen.remove(&oldest);
             }
         }
+    }
+
+    /// Publishes the body of a block taken without its transactions
+    /// (`N42_TAKE_COMPACT`): its compact body, made from the sealed header,
+    /// the rewards, the access list and the hashes (or frame layout) the
+    /// execution layer sent -- byte for byte the compact body
+    /// [`Self::publish_body`] makes of the whole block. It goes to the
+    /// direct-push peers that read compact bodies; a peer that does not, the
+    /// topic and the libp2p push get nothing here and fetch the block by
+    /// hash, which is then served from the execution layer
+    /// ([`Self::elided_body`]).
+    fn publish_elided_body(&mut self, built: &n42_h2_execution::BuiltBlock) {
+        let block_hash = built.hash;
+        let started = std::time::Instant::now();
+        let Some(header) = built.header.as_ref() else {
+            warn!(target: "n42.h2.node", ?block_hash, "a block taken elided has no sealed header; cannot publish it");
+            return;
+        };
+        let compact = match elided_compact_body(
+            &built.execution_data,
+            header,
+            &built.tx_hashes,
+            &built.frame_layout,
+            self.header_profile,
+        ) {
+            Ok(compact) => alloy_primitives::Bytes::from(compact),
+            Err(err) => {
+                warn!(target: "n42.h2.node", %err, ?block_hash, "cannot make a compact body for our own block taken elided");
+                return;
+            }
+        };
+        let bal = match &built.execution_data.payload {
+            alloy_rpc_types_engine::ExecutionPayload::V4(v4) => Some(v4.block_access_list.clone()),
+            _ => None,
+        };
+        self.remember_elided(block_hash, header.clone(), bal);
+        let compact_ms = started.elapsed().as_millis() as u64;
+        let (peers, taken) = match (&self.body_pushers, self.direct_push) {
+            (Some(pushers), true) if !pushers.is_empty() => (
+                pushers.len(),
+                pushers.push(crate::body_channel::OfferedBody {
+                    full: alloy_primitives::Bytes::new(),
+                    compact: Some(compact.clone()),
+                }),
+            ),
+            _ => (0, 0),
+        };
+        info!(
+            target: "n42.h2.node",
+            ?block_hash,
+            bytes = 0,
+            compact_bytes = compact.len(),
+            compact_ms,
+            elided = true,
+            peers,
+            taken,
+            push_ms = (started.elapsed().as_millis() as u64).saturating_sub(compact_ms),
+            "block body prepared"
+        );
+    }
+
+    /// Records a block taken elided, for [`Self::elided_body`].
+    fn remember_elided(&mut self, block_hash: B256, header: Header, bal: Option<alloy_primitives::Bytes>) {
+        if self.elided_own.insert(block_hash, (header, bal)).is_none() {
+            self.elided_order.push_back(block_hash);
+            while self.elided_order.len() > remembered_bodies() {
+                if let Some(oldest) = self.elided_order.pop_front() {
+                    self.elided_own.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    /// The gov5 body of a block this node took elided, fetched from the
+    /// execution layer on demand and kept in the body store, so the next
+    /// peer that asks is served from there. `None` for any other block, or
+    /// when the execution layer no longer has it.
+    async fn elided_body(&mut self, block_hash: B256) -> Option<alloy_primitives::Bytes> {
+        let (header, bal) = self.elided_own.get(&block_hash).cloned()?;
+        let block = match self.driver.execution_layer().own_block_body(&header).await {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                debug!(target: "n42.h2.node", ?block_hash, "the execution layer no longer holds a block taken elided");
+                return None;
+            }
+            Err(err) => {
+                debug!(target: "n42.h2.node", ?block_hash, %err, "could not fetch a block taken elided");
+                return None;
+            }
+        };
+        let body = alloy_primitives::Bytes::from(n42_h2_net::encode_block_rlp_raw(
+            &header,
+            &block.transactions,
+            &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
+            bal.as_ref(),
+        ));
+        self.elided_own.remove(&block_hash);
+        self.elided_order.retain(|hash| *hash != block_hash);
+        self.remember_body(block_hash, body.clone());
+        Some(body)
     }
 
     /// Publishes a block body, queueing it if the mesh is not ready.

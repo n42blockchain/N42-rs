@@ -427,6 +427,14 @@ async fn push_loop(
         // The compact body only to a peer that greeted for it; everyone
         // else gets the bytes they have always been sent.
         let compact = (features & FEATURE_COMPACT != 0).then_some(body.compact.as_ref()).flatten();
+        // A block its leader took without the transactions
+        // (`N42_TAKE_COMPACT`) is offered with no whole body: a peer that
+        // does not read compact bodies is sent nothing and fetches the block
+        // by hash, which that leader serves from its execution layer.
+        if compact.is_none() && body.full.is_empty() {
+            debug!(target: "n42.h2.node", %addr, "no whole body to offer this peer; it fetches the block by hash");
+            continue;
+        }
         let sent = compact.unwrap_or(&body.full);
         let result = async {
             if compact.is_some() {

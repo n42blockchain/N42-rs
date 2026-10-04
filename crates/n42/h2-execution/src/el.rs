@@ -110,6 +110,52 @@ pub struct BuiltBlock {
     /// the previous proposal's send with `N42_BUILD_AHEAD_AT_SEAL`). `None`
     /// leaves it to the driver, which knows when it asked.
     pub started: Option<BuildStart>,
+    /// Whether the execution layer left the transactions out of its answer
+    /// (`N42_TAKE_COMPACT=1`, [`crate::raw_engine::reply::COMPACT_BUILT`]):
+    /// `execution_data` then lists none, `tx_count`, `tx_hashes` and
+    /// `frame_layout` describe the block, and anything that needs the bytes
+    /// fetches them from the execution layer by the sealed header
+    /// ([`ExecutionLayer::own_block_body`]). Such a payload must never be
+    /// imported or cached as the block.
+    pub elided: bool,
+    /// When the answer that carried this block was read and decoded, for
+    /// the "proposal sent" line. `None` for a block that did not come over
+    /// the raw channel.
+    pub answer: Option<AnswerStamps>,
+}
+
+/// The proposer's side of a built block's answer: its size and when it was
+/// read off the socket and decoded, in microseconds since the Unix epoch
+/// (the wall clock the log lines are stamped with, so they line up with the
+/// execution layer's encode and write stamps).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AnswerStamps {
+    /// The answer's size in bytes, every frame of it.
+    pub bytes: u64,
+    /// The last byte read.
+    pub read_end_us: u64,
+    /// The block decoded out of it.
+    pub decode_end_us: u64,
+}
+
+/// `execution` with the transactions of `block` put back: the payload of a
+/// block whose answer was elided ([`BuiltBlock::elided`]), made whole from
+/// the body fetched on demand. Refused unless the body has exactly
+/// `tx_count` transactions -- the count the elided answer carried.
+pub fn fill_elided(
+    execution: &ExecutionData,
+    block: &ChainBlock,
+    tx_count: usize,
+) -> Result<ExecutionData, ElError> {
+    if block.transactions.len() != tx_count {
+        return Err(ElError::new(format!(
+            "the body fetched for an elided block has {} transactions, the block {tx_count}",
+            block.transactions.len()
+        )));
+    }
+    let mut data = execution.clone();
+    data.payload.as_v1_mut().transactions = block.transactions.clone();
+    Ok(data)
 }
 
 /// What started a leader's build, for the "proposal sent" line
@@ -275,6 +321,31 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     async fn block_by_hash(&self, hash: B256) -> Result<Option<ChainBlock>, ElError> {
         let _ = hash;
         Ok(None)
+    }
+
+    /// The whole body of a block this node built, by its *sealed* header:
+    /// what a proposer that took the block without its transactions
+    /// ([`BuiltBlock::elided`]) asks for when something needs them after
+    /// all -- a peer's fetch-on-miss, a fill, the own import's fallback.
+    /// The returned header is `header`. The default looks the block up by
+    /// hash, which finds it once the own import has landed.
+    async fn own_block_body(
+        &self,
+        header: &alloy_consensus::Header,
+    ) -> Result<Option<ChainBlock>, ElError> {
+        self.block_by_hash(header.hash_slow()).await
+    }
+
+    /// The own-block import by sealed header alone, without a payload to
+    /// fall back on: `None` when the execution layer cannot take it that
+    /// way, and the caller fetches the body and sends the payload. The
+    /// default cannot.
+    async fn import_own_block_by_header(
+        &self,
+        header: &alloy_consensus::Header,
+    ) -> Option<PayloadStatus> {
+        let _ = header;
+        None
     }
 
     /// A canonical block by number, as its header and transactions, for

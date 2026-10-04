@@ -1098,6 +1098,76 @@ fn push_built_payload_hashed(
     answer
 }
 
+/// Whether the built block holds a blob transaction, which the compact
+/// answer cannot describe (the proposer would need its sidecar).
+fn has_blob_transactions(payload: &N42BuiltPayload) -> bool {
+    use alloy_consensus::Typed2718 as _;
+    payload.block().body().transactions.iter().any(|tx| tx.is_eip4844())
+}
+
+/// The block without its transactions, as a [`raw_engine::reply::COMPACT_BUILT`]
+/// frame: the header, the withdrawals, the requests and access list, the
+/// transaction hashes (cached on the transactions: a read, not a keccak) and
+/// the frame layout. Nothing of the transactions is encoded. Returns the
+/// encoded answer's size and how long it took.
+fn push_compact_answer(out: &mut Vec<u8>, payload: &N42BuiltPayload) -> (usize, std::time::Duration) {
+    use alloy_consensus::transaction::TxHashRef as _;
+    let encode_at = std::time::Instant::now();
+    let block = payload.block();
+    let transactions = &block.body().transactions;
+    let frame_layout = n42_engine_types::frame_blocks::active()
+        .then(|| n42_engine_types::frame_blocks::layout_by_root(&block.header().transactions_root))
+        .flatten()
+        .filter(|layout| !layout.is_empty())
+        .unwrap_or_default();
+    let answer = raw_engine::CompactAnswer {
+        header: block.header().clone(),
+        tx_count: transactions.len() as u32,
+        withdrawals: block.body().withdrawals.clone().map(|w| w.to_vec()).unwrap_or_default(),
+        requests: payload.requests().map(|requests| requests.take()),
+        block_access_list: payload.block_access_list().cloned(),
+        tx_hashes: transactions.iter().map(|tx| *tx.tx_hash()).collect(),
+        frame_layout,
+    };
+    let encoded = raw_engine::encode_compact_answer(&answer);
+    out.reserve(encoded.len() + 5);
+    out.push(raw_engine::reply::COMPACT_BUILT);
+    out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    out.extend_from_slice(&encoded);
+    (encoded.len(), encode_at.elapsed())
+}
+
+/// The body of a block this node built, by its sealed header
+/// (`request::OWN_BODY`): the build is found by the fields a seal cannot
+/// change, among the kept builds and the ones the own import already took,
+/// else among the sealed blocks the import registered; its block RLP is
+/// returned (the *built* header in it). An `Err` is the message sent back.
+async fn own_block_body(frame: &[u8]) -> Result<Vec<u8>, String> {
+    use alloy_rlp::Decodable;
+    let header = alloy_consensus::Header::decode(&mut &frame[..]).map_err(|e| format!("header: {e}"))?;
+    if header.block_access_list_hash.is_some() {
+        return Err("unknown build: block access list".to_owned());
+    }
+    let sealed_hash = header.hash_slow();
+    tokio::task::spawn_blocking(move || {
+        if let Some((_, block, _)) = n42_engine_types::built_executions::find_kept_sealed(
+            header.parent_hash,
+            header.number,
+            header.state_root,
+            header.receipts_root,
+            header.gas_used,
+            Some(header.transactions_root),
+        ) {
+            return Ok(encode_block_parallel(block.sealed_block()));
+        }
+        n42_engine_types::built_executions::find_sealed(sealed_hash)
+            .map(|block| encode_block_parallel(&block))
+            .ok_or_else(|| "unknown build".to_owned())
+    })
+    .await
+    .map_err(|err| format!("own body task: {err}"))?
+}
+
 fn push_built_payload(out: &mut Vec<u8>, payload: &N42BuiltPayload) -> (usize, std::time::Duration) {
     let encode_at = std::time::Instant::now();
     let (block, listed) = encode_block_parallel_keeping_transactions(payload.block());
@@ -2011,6 +2081,11 @@ where
             out.clear();
             let frame_ms = started_at.elapsed().as_millis() as u64;
             let started = std::time::Instant::now();
+            // `N42_TAKE_COMPACT` on the proposer: the answer may leave the
+            // transactions out. Read from the request's tail; a few hundred
+            // bytes decoded a second time.
+            let compact_answer =
+                raw_engine::decode_build_on_own_request(&buf).is_ok_and(|request| request.compact_answer);
             match build_on_own_block(reuse.as_ref(), &buf).await {
                 Ok((payload, times, chain, want_hashes)) => {
                     // The builder answers on its early seal, so the block's
@@ -2031,12 +2106,31 @@ where
                         frame.extend_from_slice(&rlp);
                         stream.write_all(&frame).await?;
                     }
-                    let (bytes, encoded) = push_built_payload_hashed(&mut out, &payload, want_hashes);
+                    // The answer: the block, or (asked for, with hashes, and
+                    // no blob transaction it could not describe) the block
+                    // without its transactions. Stamped on the wall clock the
+                    // proposer's read and decode stamps use; the line is
+                    // logged after the write so it can say when that ended.
+                    let elided = compact_answer && want_hashes && !has_blob_transactions(&payload);
+                    let answer_encode_start_us = raw_engine::unix_micros();
+                    let (bytes, encoded) = if elided {
+                        push_compact_answer(&mut out, &payload)
+                    } else {
+                        push_built_payload_hashed(&mut out, &payload, want_hashes)
+                    };
+                    let answer_write_start_us = raw_engine::unix_micros();
+                    stream.write_all(&out).await?;
+                    let answer_write_end_us = raw_engine::unix_micros();
                     info!(
                         target: "n42.payload_serve",
                         number = payload.block().number(),
                         txs = payload.block().body().transactions.len(),
                         bytes,
+                        elided,
+                        answer_bytes = out.len(),
+                        answer_encode_start_us,
+                        answer_write_start_us,
+                        answer_write_end_us,
                         hashed = want_hashes,
                         chained = chain.is_some_and(|hint| hint.chained),
                         chain_ahead = chain.is_some(),
@@ -2058,9 +2152,45 @@ where
                         total_ms = started.elapsed().as_millis() as u64,
                         "built ahead on the sealed own block"
                     );
+                    continue;
                 }
                 Err(message) => {
                     info!(target: "n42.payload_serve", %message, "build on own block refused");
+                    out.push(2);
+                    out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+                    out.extend_from_slice(message.as_bytes());
+                }
+            }
+            stream.write_all(&out).await?;
+            continue;
+        }
+        if kind == request::OWN_BODY {
+            let len = stream.read_u32_le().await? as usize;
+            if len > 1 << 20 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "header frame too large"));
+            }
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await?;
+            out.clear();
+            let started = std::time::Instant::now();
+            match own_block_body(&buf).await {
+                Ok(block) => {
+                    out.reserve(block.len() + 8);
+                    out.push(1);
+                    out.extend_from_slice(&(block.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&block);
+                    // No requests, no access list: the proposer has both.
+                    out.push(0);
+                    out.push(0);
+                    info!(
+                        target: "n42.payload_serve",
+                        bytes = block.len(),
+                        total_ms = started.elapsed().as_millis() as u64,
+                        "own block's body served on demand"
+                    );
+                }
+                Err(message) => {
+                    debug!(target: "n42.payload_serve", %message, "own block's body refused");
                     out.push(2);
                     out.extend_from_slice(&(message.len() as u32).to_le_bytes());
                     out.extend_from_slice(message.as_bytes());

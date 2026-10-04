@@ -177,6 +177,8 @@ impl MockExecutionLayer {
             blob_tx_hashes: Vec::new(),
             header: None,
             started: None,
+            elided: false,
+            answer: None,
         }
     }
 

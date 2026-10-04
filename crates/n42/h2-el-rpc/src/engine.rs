@@ -212,27 +212,30 @@ enum BuildFrame {
 /// from an execution layer building frame blocks (`N42_FRAME_BLOCKS=1`),
 /// `u8 2 | u32 n | n * 32 hashes | u32 frames | frames * (32 id | u32 count)`
 /// -- the same hashes and the block's frame layout after them.
+/// The third element is how many bytes the tail took on the wire.
 async fn read_hash_tail(
     stream: &mut tokio::net::TcpStream,
     asked: bool,
-) -> std::io::Result<(Vec<B256>, Vec<(B256, u32)>)> {
+) -> std::io::Result<(Vec<B256>, Vec<(B256, u32)>, usize)> {
     use tokio::io::AsyncReadExt;
     if !asked {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), 0));
     }
     let marker = stream.read_u8().await?;
     if marker != 1 && marker != 2 {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), 1));
     }
     let n = stream.read_u32_le().await? as usize;
     let mut raw = vec![0u8; n * 32];
     stream.read_exact(&mut raw).await?;
+    let mut bytes = 5 + raw.len();
     let hashes = raw.as_chunks::<32>().0.iter().copied().map(B256::from).collect();
     let mut frames = Vec::new();
     if marker == 2 {
         let n = stream.read_u32_le().await? as usize;
         let mut raw = vec![0u8; n * 36];
         stream.read_exact(&mut raw).await?;
+        bytes += 4 + raw.len();
         frames = raw
             .chunks_exact(36)
             .map(|entry| {
@@ -242,7 +245,7 @@ async fn read_hash_tail(
             })
             .collect();
     }
-    Ok((hashes, frames))
+    Ok((hashes, frames, bytes))
 }
 
 /// Reads one frame of a build-on-own answer.
@@ -273,13 +276,17 @@ async fn read_build_frame(
             let len = stream.read_u32_le().await? as usize;
             let mut block = vec![0u8; len];
             stream.read_exact(&mut block).await?;
+            // Every byte of the answer, for the "proposal sent" line.
+            let mut bytes = 1 + 4 + len + 2;
             let requests = if stream.read_u8().await? == 1 {
                 let n = stream.read_u32_le().await? as usize;
+                bytes += 4;
                 let mut requests = Vec::with_capacity(n);
                 for _ in 0..n {
                     let len = stream.read_u32_le().await? as usize;
                     let mut request = vec![0u8; len];
                     stream.read_exact(&mut request).await?;
+                    bytes += 4 + len;
                     requests.push(alloy_primitives::Bytes::from(request));
                 }
                 Some(requests)
@@ -290,15 +297,41 @@ async fn read_build_frame(
                 let len = stream.read_u32_le().await? as usize;
                 let mut bal = vec![0u8; len];
                 stream.read_exact(&mut bal).await?;
+                bytes += 4 + len;
                 Some(alloy_primitives::Bytes::from(bal))
             } else {
                 None
             };
-            let (tx_hashes, frame_layout) = read_hash_tail(stream, hashed).await?;
+            let (tx_hashes, frame_layout, tail) = read_hash_tail(stream, hashed).await?;
+            let read_end_us = n42_h2_execution::raw_engine::unix_micros();
             let mut built = built_block_from_parts(block.into(), requests, bal, beacon_root);
             if let Ok(built) = built.as_mut() {
                 built.tx_hashes = tx_hashes;
                 built.frame_layout = frame_layout;
+                built.answer = Some(n42_h2_execution::AnswerStamps {
+                    bytes: (bytes + tail) as u64,
+                    read_end_us,
+                    decode_end_us: n42_h2_execution::raw_engine::unix_micros(),
+                });
+            }
+            Ok(BuildFrame::Built(Box::new(built)))
+        }
+        // The block without its transactions (`N42_TAKE_COMPACT`): only
+        // ever sent to a request that asked for it.
+        n42_h2_execution::raw_engine::reply::COMPACT_BUILT => {
+            let len = stream.read_u32_le().await? as usize;
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await?;
+            let read_end_us = n42_h2_execution::raw_engine::unix_micros();
+            let mut built = n42_h2_execution::raw_engine::decode_compact_answer(&buf)
+                .map_err(|err| ElError::new(format!("compact answer: {err}")))
+                .and_then(|answer| built_block_from_compact(answer, beacon_root));
+            if let Ok(built) = built.as_mut() {
+                built.answer = Some(n42_h2_execution::AnswerStamps {
+                    bytes: (1 + 4 + len) as u64,
+                    read_end_us,
+                    decode_end_us: n42_h2_execution::raw_engine::unix_micros(),
+                });
             }
             Ok(BuildFrame::Built(Box::new(built)))
         }
@@ -453,11 +486,12 @@ fn start_chain_locked(
     // this way.
     let next_view = view.saturating_add(1);
     let hint = n42_h2_execution::raw_engine::ChainHint { view: next_view, chained: true };
-    let frame = n42_h2_execution::raw_engine::encode_build_on_own_chaining(
+    let frame = n42_h2_execution::raw_engine::encode_build_on_own_request(
         &sealed,
         &attrs,
         Some(hint),
         n42_h2_execution::compact_body(),
+        n42_h2_execution::take_compact(),
     );
     let beacon_root = attrs.parent_beacon_block_root.unwrap_or_default();
     let (tx, answer) = tokio::sync::oneshot::channel();
@@ -579,6 +613,10 @@ pub struct EngineApiClient<T> {
     /// The build on a sealed own block: its own connection, because it runs
     /// while the own-block import holds `raw_import`.
     raw_build: tokio::sync::Mutex<RawChannel>,
+    /// The endpoint for an elided block's body fetched on demand
+    /// (`request::OWN_BODY`); each fetch makes a connection of its own, so
+    /// it never waits behind a build or an import.
+    raw_body: tokio::sync::Mutex<RawChannel>,
     /// What turns a built header into the header this node will propose and
     /// into the next block's attributes. Installed by the consensus side;
     /// without it nothing chains, which is what makes an execution layer
@@ -612,6 +650,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             raw_channel: tokio::sync::Mutex::new(RawChannel::default()),
             raw_import: tokio::sync::Mutex::new(RawChannel::default()),
             raw_build: tokio::sync::Mutex::new(RawChannel::default()),
+            raw_body: tokio::sync::Mutex::new(RawChannel::default()),
             chain_sealer: std::sync::OnceLock::new(),
             chain: std::sync::Arc::new(std::sync::Mutex::new(ChainState {
                 defer_refused: build_ahead_at_seal(),
@@ -1048,6 +1087,8 @@ pub fn built_block_from_envelope(
         tx_hashes: Vec::new(),
         frame_layout: Vec::new(),
         started: None,
+        elided: false,
+        answer: None,
     })
 }
 
@@ -1157,6 +1198,29 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
 
     fn set_chain_sealer(&self, sealer: ChainSealer) {
         let _ = self.chain_sealer.set(Sealer(sealer));
+    }
+
+    async fn own_block_body(
+        &self,
+        header: &alloy_consensus::Header,
+    ) -> Result<Option<ChainBlock>, ElError> {
+        // The build registry first: it holds the block from its seal on,
+        // before the own import has put it where a lookup by hash finds it.
+        if let Some(block) = self.own_body_over_channel(header).await {
+            return Ok(Some(block));
+        }
+        self.block_by_hash(header.hash_slow()).await
+    }
+
+    async fn import_own_block_by_header(
+        &self,
+        header: &alloy_consensus::Header,
+    ) -> Option<PayloadStatus> {
+        let by_header = std::env::var("N42_OWN_BLOCK_BY_HEADER").map_or(true, |v| v != "0");
+        if !by_header {
+            return None;
+        }
+        self.own_block_over_channel(header).await
     }
 
     async fn import_own_block(
@@ -1374,6 +1438,38 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         (*channel.endpoint.as_ref()?)
     }
 
+    /// The body of a block this node built, by its sealed header, over the
+    /// raw channel (`request::OWN_BODY`). `None` when there is no channel,
+    /// the execution layer no longer keeps the build, or the request failed:
+    /// the caller asks for the block by hash.
+    async fn own_body_over_channel(&self, header: &alloy_consensus::Header) -> Option<ChainBlock> {
+        let addr = {
+            let mut channel = self.raw_body.lock().await;
+            self.raw_endpoint(&mut channel).await?
+        };
+        let started = std::time::Instant::now();
+        match request_own_body(addr, header).await {
+            Ok(Ok(block)) => {
+                info!(
+                    target: "n42.h2.el",
+                    number = header.number,
+                    txs = block.transactions.len(),
+                    fetch_ms = started.elapsed().as_millis() as u64,
+                    "elided block's body fetched from the execution layer"
+                );
+                Some(block)
+            }
+            Ok(Err(message)) => {
+                debug!(target: "n42.h2.el", number = header.number, %message, "own body refused; asking by hash");
+                None
+            }
+            Err(err) => {
+                debug!(target: "n42.h2.el", number = header.number, %err, "own body request failed; asking by hash");
+                None
+            }
+        }
+    }
+
     /// Hands a payload to the execution layer over the raw channel.
     ///
     /// `None` means "not this way" and the caller uses JSON.
@@ -1472,8 +1568,15 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         // makes compact bodies: they are what one names its transactions by,
         // and only the builder has them without hashing 26 MB again.
         let hashed = n42_h2_execution::compact_body();
-        let frame =
-            n42_h2_execution::raw_engine::encode_build_on_own_chaining(header, &attrs, hint, hashed);
+        // `N42_TAKE_COMPACT`: the block comes back without its
+        // transactions, which the proposal does not carry either.
+        let frame = n42_h2_execution::raw_engine::encode_build_on_own_request(
+            header,
+            &attrs,
+            hint,
+            hashed,
+            n42_h2_execution::take_compact(),
+        );
         let chain_state = std::sync::Arc::clone(&self.chain);
         // The generation as it stands now: a discard just before this call
         // has already bumped it, so a chain started from here belongs to the
@@ -1938,7 +2041,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                     } else {
                         None
                     };
-                    let (tx_hashes, frame_layout) = read_hash_tail(stream, hashed).await?;
+                    let (tx_hashes, frame_layout, _) = read_hash_tail(stream, hashed).await?;
                     let received = started.elapsed();
                     let mut built = built_block_from_parts(block.into(), requests, bal, beacon_root);
                     if let Ok(built) = built.as_mut() {
@@ -2060,12 +2163,61 @@ pub fn built_block_from_parts(
     block_access_list: Option<alloy_primitives::Bytes>,
     parent_beacon_block_root: B256,
 ) -> Result<BuiltBlock, ElError> {
-    use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2};
-    let (mut header, transactions, withdrawals) = split_block_rlp(&block)?;
+    let (header, transactions, withdrawals) = split_block_rlp(&block)?;
     // Blob transactions need the blobs bundle, which this path does not carry.
     if transactions.iter().any(|tx| tx.first() == Some(&0x03)) {
         return Err(ElError::new("raw payload path cannot carry blob transactions"));
     }
+    let tx_count = transactions.len();
+    built_block_from_header(header, transactions, tx_count, withdrawals, requests, block_access_list, parent_beacon_block_root)
+}
+
+/// A [`reply::COMPACT_BUILT`](n42_h2_execution::raw_engine::reply::COMPACT_BUILT)
+/// answer as a [`BuiltBlock`]: the same payload [`built_block_from_parts`]
+/// makes of the whole block, with an empty transaction list, the count, the
+/// hashes and the frame layout carried beside it, and `elided` set. The
+/// execution layer refuses this shape for a block with blob transactions, so
+/// none can be hidden in it.
+pub fn built_block_from_compact(
+    answer: n42_h2_execution::raw_engine::CompactAnswer,
+    parent_beacon_block_root: B256,
+) -> Result<BuiltBlock, ElError> {
+    let n42_h2_execution::raw_engine::CompactAnswer {
+        header,
+        tx_count,
+        withdrawals,
+        requests,
+        block_access_list,
+        tx_hashes,
+        frame_layout,
+    } = answer;
+    let mut built = built_block_from_header(
+        header,
+        Vec::new(),
+        tx_count as usize,
+        withdrawals,
+        requests,
+        block_access_list,
+        parent_beacon_block_root,
+    )?;
+    built.tx_hashes = tx_hashes;
+    built.frame_layout = frame_layout;
+    built.elided = true;
+    Ok(built)
+}
+
+/// The payload of a built block from its header and parts; `tx_count` is the
+/// block's, which `transactions` lists unless the answer was elided.
+fn built_block_from_header(
+    mut header: alloy_consensus::Header,
+    transactions: Vec<alloy_primitives::Bytes>,
+    tx_count: usize,
+    withdrawals: Vec<alloy_eips::eip4895::Withdrawal>,
+    requests: Option<Vec<alloy_primitives::Bytes>>,
+    block_access_list: Option<alloy_primitives::Bytes>,
+    parent_beacon_block_root: B256,
+) -> Result<BuiltBlock, ElError> {
+    use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2};
     // A V4 payload carries EIP-7843's slot number and every importer writes it
     // into the header it rebuilds, so the header sealed here has to carry the
     // same value or no importer reproduces the hash. This chain has no slots
@@ -2099,7 +2251,6 @@ pub fn built_block_from_parts(
         difficulty: header.difficulty,
         nonce: header.nonce,
     };
-    let tx_count = v1.transactions.len();
     let payload = match (header.withdrawals_root.is_some(), header.blob_gas_used) {
         (false, _) => ExecutionPayload::V1(v1),
         (true, None) => ExecutionPayload::V2(ExecutionPayloadV2 { payload_inner: v1, withdrawals }),
@@ -2145,7 +2296,71 @@ pub fn built_block_from_parts(
         tx_hashes: Vec::new(),
         frame_layout: Vec::new(),
         started: None,
+        elided: false,
+        answer: None,
     })
+}
+
+/// One `request::OWN_BODY` round trip on a connection of its own: the sealed
+/// header goes out, the block comes back in `GET_PAYLOAD`'s shape and is
+/// returned under the sealed header. The inner `Err` is the execution
+/// layer's refusal; the outer one a failed connection or a malformed answer.
+pub async fn request_own_body(
+    addr: std::net::SocketAddr,
+    header: &alloy_consensus::Header,
+) -> std::io::Result<Result<ChainBlock, String>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let invalid = |what: String| std::io::Error::new(std::io::ErrorKind::InvalidData, what);
+    let mut conn = tokio::net::TcpStream::connect(addr).await?;
+    conn.set_nodelay(true)?;
+    let frame = alloy_rlp::encode(header);
+    conn.write_u8(n42_h2_execution::raw_engine::request::OWN_BODY).await?;
+    conn.write_u32_le(frame.len() as u32).await?;
+    conn.write_all(&frame).await?;
+    match conn.read_u8().await? {
+        0 => Ok(Err("unknown build".to_owned())),
+        2 => {
+            let len = conn.read_u32_le().await? as usize;
+            let mut message = vec![0u8; len];
+            conn.read_exact(&mut message).await?;
+            Ok(Err(String::from_utf8_lossy(&message).into_owned()))
+        }
+        1 => {
+            let len = conn.read_u32_le().await? as usize;
+            let mut block = vec![0u8; len];
+            conn.read_exact(&mut block).await?;
+            // The requests and access list sections of `GET_PAYLOAD`'s shape:
+            // read past, since the sealed header and the elided answer
+            // already carry what the block needs of them.
+            if conn.read_u8().await? == 1 {
+                let n = conn.read_u32_le().await?;
+                for _ in 0..n {
+                    let len = conn.read_u32_le().await? as usize;
+                    let mut skip = vec![0u8; len];
+                    conn.read_exact(&mut skip).await?;
+                }
+            }
+            if conn.read_u8().await? == 1 {
+                let len = conn.read_u32_le().await? as usize;
+                let mut skip = vec![0u8; len];
+                conn.read_exact(&mut skip).await?;
+            }
+            let (built, transactions, withdrawals) =
+                split_block_rlp(&block).map_err(|err| invalid(err.to_string()))?;
+            if built.transactions_root != header.transactions_root || built.number != header.number {
+                return Err(invalid(format!(
+                    "the execution layer answered block {} for {}",
+                    built.number, header.number
+                )));
+            }
+            Ok(Ok(ChainBlock {
+                header: header.clone(),
+                transactions,
+                withdrawals: header.withdrawals_root.is_some().then_some(withdrawals),
+            }))
+        }
+        other => Err(invalid(format!("status {other}"))),
+    }
 }
 
 /// A block as the node's RPC returns it: its transactions are the node's

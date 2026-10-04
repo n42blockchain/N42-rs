@@ -89,6 +89,14 @@ pub mod request {
     /// layer that predates it refuses the request, the caller's channel
     /// falls back to JSON for that build, and no compact body is made.
     pub const GET_PAYLOAD_HASHED: u8 = 7;
+    /// `u32` length and the RLP of a *sealed header* follow: a block this
+    /// execution layer built, whose transactions its proposer took without
+    /// (`N42_TAKE_COMPACT`, [`super::reply::COMPACT_BUILT`]) and now needs
+    /// after all -- for a peer's fetch by hash, a fill, or the own import's
+    /// fallback. The answer is the block in `GET_PAYLOAD`'s shape (the
+    /// *built* header in it; the caller has the sealed one), or an error
+    /// (`unknown build`) on which the caller asks for the block by hash.
+    pub const OWN_BODY: u8 = 8;
 }
 
 /// Reply kinds on the channel.
@@ -131,6 +139,138 @@ pub mod reply {
     /// whole-body road, as before. Nothing has been checked and no vote has
     /// been released when this frame goes out.
     pub const NEED_TXNS: u8 = 5;
+    /// [`super::request::BUILD_ON_OWN`] only, and only when the request
+    /// carried the compact-answer tail and asked for hashes: the block
+    /// *without its transactions* -- `u32` length and an encoded
+    /// [`super::CompactAnswer`] -- in place of the [`VALUE`] frame. Nothing
+    /// of the ~26 MB block is encoded or sent; the transaction hashes (and
+    /// the frame layout) that a compact body names them by are.
+    pub const COMPACT_BUILT: u8 = 6;
+}
+
+/// Microseconds since the Unix epoch: the wall clock the log lines are
+/// stamped with, so stamps taken in the execution layer and in the proposer
+/// can be laid on one axis. 0 if the clock is before the epoch.
+pub fn unix_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_micros() as u64)
+}
+
+/// A built block without its transactions: what a proposer that publishes a
+/// compact body needs from the build, and nothing else
+/// ([`reply::COMPACT_BUILT`]).
+///
+/// ```text
+/// answer := u8 version
+///         | u32 len, the built header's RLP
+///         | u32 transactions
+///         | u32 n, n * (u64 index, u64 validator index, 20 address, u64 amount)
+///         | u8 has_requests, [u32 n, n * (u32 len, bytes)]
+///         | u8 has_bal, [u32 len, bytes]
+///         | u32 n, n * 32 transaction hashes (n = transactions)
+///         | u32 frames, frames * (32 frame id, u32 count) (their sum = transactions, or none)
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactAnswer {
+    /// The header as built (before the proposer stamps and seals it).
+    pub header: alloy_consensus::Header,
+    /// How many transactions the block holds.
+    pub tx_count: u32,
+    /// The block's withdrawals (its rewards on a gov5 chain).
+    pub withdrawals: Vec<Withdrawal>,
+    /// The execution requests, when the build has them.
+    pub requests: Option<Vec<Bytes>>,
+    /// The EIP-7928 block access list, when the build has one.
+    pub block_access_list: Option<Bytes>,
+    /// Every transaction's hash, in block order.
+    pub tx_hashes: Vec<B256>,
+    /// The block's frame layout (`N42_FRAME_BLOCKS=1`), or empty.
+    pub frame_layout: Vec<(B256, u32)>,
+}
+
+/// Encodes a [`CompactAnswer`].
+pub fn encode_compact_answer(answer: &CompactAnswer) -> Vec<u8> {
+    let rlp = alloy_rlp::encode(&answer.header);
+    let mut w = Writer(Vec::with_capacity(
+        rlp.len() + 64 + answer.withdrawals.len() * 44 + answer.tx_hashes.len() * 32 + answer.frame_layout.len() * 36,
+    ));
+    w.u8(VERSION);
+    w.bytes(&rlp);
+    w.u32(answer.tx_count);
+    w.u32(answer.withdrawals.len() as u32);
+    for wd in &answer.withdrawals {
+        w.u64(wd.index); w.u64(wd.validator_index); w.fixed(wd.address.as_slice()); w.u64(wd.amount);
+    }
+    match &answer.requests {
+        Some(requests) => {
+            w.u8(1);
+            w.u32(requests.len() as u32);
+            for request in requests { w.bytes(request); }
+        }
+        None => w.u8(0),
+    }
+    match &answer.block_access_list {
+        Some(bal) => { w.u8(1); w.bytes(bal); }
+        None => w.u8(0),
+    }
+    w.u32(answer.tx_hashes.len() as u32);
+    for hash in &answer.tx_hashes { w.fixed(hash.as_slice()); }
+    w.u32(answer.frame_layout.len() as u32);
+    for (id, count) in &answer.frame_layout { w.fixed(id.as_slice()); w.u32(*count); }
+    w.0
+}
+
+/// Decodes what [`encode_compact_answer`] produced. Strict: the hashes must
+/// number the block's transactions, a frame layout must sum to them, and
+/// nothing may follow.
+pub fn decode_compact_answer(buf: &[u8]) -> Result<CompactAnswer, String> {
+    use alloy_rlp::Decodable;
+    let mut r = Reader { rest: buf, shared: None };
+    if r.u8()? != VERSION { return Err("unknown raw engine version".into()); }
+    let rlp = r.bytes()?;
+    let mut cursor = &rlp[..];
+    let header = alloy_consensus::Header::decode(&mut cursor).map_err(|e| format!("header: {e}"))?;
+    if !cursor.is_empty() { return Err("header RLP has trailing bytes".into()); }
+    let tx_count = r.u32()?;
+    let n = r.u32()? as usize;
+    let mut withdrawals = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        let index = r.u64()?; let validator_index = r.u64()?;
+        let address = Address::from_slice(r.take(20)?); let amount = r.u64()?;
+        withdrawals.push(Withdrawal { index, validator_index, address, amount });
+    }
+    let requests = if r.u8()? == 1 {
+        let n = r.u32()? as usize;
+        let mut list = Vec::with_capacity(n.min(1 << 16));
+        for _ in 0..n { list.push(r.bytes()?); }
+        Some(list)
+    } else { None };
+    let block_access_list = if r.u8()? == 1 { Some(r.bytes()?) } else { None };
+    let n = r.u32()? as usize;
+    if n != tx_count as usize {
+        return Err(format!("{n} transaction hashes for a block of {tx_count}"));
+    }
+    let raw = r.take(n.checked_mul(32).ok_or("hash count overflows")?)?;
+    let tx_hashes = raw.as_chunks::<32>().0.iter().copied().map(B256::from).collect();
+    let frames = r.u32()? as usize;
+    let raw = r.take(frames.checked_mul(36).ok_or("frame count overflows")?)?;
+    let mut frame_layout = Vec::with_capacity(frames);
+    let mut sum = 0u64;
+    for entry in raw.as_chunks::<36>().0 {
+        let mut count = [0u8; 4];
+        count.copy_from_slice(&entry[32..]);
+        let count = u32::from_le_bytes(count);
+        sum += u64::from(count);
+        frame_layout.push((B256::from_slice(&entry[..32]), count));
+    }
+    if frames > 0 && sum != u64::from(tx_count) {
+        return Err(format!("a frame layout of {sum} transactions for a block of {tx_count}"));
+    }
+    if !r.rest.is_empty() {
+        return Err(format!("compact answer has {} trailing bytes", r.rest.len()));
+    }
+    Ok(CompactAnswer { header, tx_count, withdrawals, requests, block_access_list, tx_hashes, frame_layout })
 }
 
 /// Encodes the indices of [`reply::NEED_TXNS`].
@@ -440,6 +580,28 @@ const TAIL_CHAIN_HINT: u8 = 1;
 /// payload of its own: the tag is the request.
 const TAIL_WANT_HASHES: u8 = 2;
 
+/// The tag that asks for a [`reply::COMPACT_BUILT`] answer instead of the
+/// block (`N42_TAKE_COMPACT`). No payload of its own. An execution layer
+/// that predates it stops reading at the unknown tag and answers with the
+/// whole block, which the caller reads as ever.
+const TAIL_COMPACT_ANSWER: u8 = 3;
+
+/// A decoded build-on-own request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BuildOnOwn {
+    /// The sealed header of the block just built.
+    pub header: alloy_consensus::Header,
+    /// The attributes of the block to build on it.
+    pub attrs: PayloadAttributes,
+    /// The chain hint, when the request carried one.
+    pub chain: Option<ChainHint>,
+    /// Whether the answer should carry the transaction hashes.
+    pub want_hashes: bool,
+    /// Whether the answer may leave the transactions out
+    /// ([`reply::COMPACT_BUILT`]).
+    pub compact_answer: bool,
+}
+
 /// Encodes a build-on-own request: the sealed header of the block just built
 /// (RLP) and the attributes of the block to build on it.
 pub fn encode_build_on_own(header: &alloy_consensus::Header, attrs: &PayloadAttributes) -> Vec<u8> {
@@ -459,6 +621,20 @@ pub fn encode_build_on_own_chaining(
     attrs: &PayloadAttributes,
     chain: Option<ChainHint>,
     want_hashes: bool,
+) -> Vec<u8> {
+    encode_build_on_own_request(header, attrs, chain, want_hashes, false)
+}
+
+/// [`encode_build_on_own_chaining`], asking for a [`reply::COMPACT_BUILT`]
+/// answer when `compact_answer` is set (a tail after every other one).
+/// With it unset the frame is byte for byte the one
+/// [`encode_build_on_own_chaining`] has always written.
+pub fn encode_build_on_own_request(
+    header: &alloy_consensus::Header,
+    attrs: &PayloadAttributes,
+    chain: Option<ChainHint>,
+    want_hashes: bool,
+    compact_answer: bool,
 ) -> Vec<u8> {
     let rlp = alloy_rlp::encode(header);
     let mut w = Writer(Vec::with_capacity(rlp.len() + 128 + attrs.withdrawals.as_ref().map_or(0, |w| w.len() * 44)));
@@ -497,6 +673,9 @@ pub fn encode_build_on_own_chaining(
     if want_hashes {
         w.u8(TAIL_WANT_HASHES);
     }
+    if compact_answer {
+        w.u8(TAIL_COMPACT_ANSWER);
+    }
     w.0
 }
 
@@ -505,6 +684,13 @@ pub fn encode_build_on_own_chaining(
 pub fn decode_build_on_own(
     buf: &[u8],
 ) -> Result<(alloy_consensus::Header, PayloadAttributes, Option<ChainHint>, bool), String> {
+    let request = decode_build_on_own_request(buf)?;
+    Ok((request.header, request.attrs, request.chain, request.want_hashes))
+}
+
+/// Decodes what [`encode_build_on_own_request`] produced, every tail
+/// included.
+pub fn decode_build_on_own_request(buf: &[u8]) -> Result<BuildOnOwn, String> {
     use alloy_rlp::Decodable;
     let mut r = Reader { rest: buf, shared: None };
     if r.u8()? != VERSION { return Err("unknown raw engine version".into()); }
@@ -530,10 +716,12 @@ pub fn decode_build_on_own(
     // absence is "no hint" rather than a truncated frame.
     let mut chain = None;
     let mut want_hashes = false;
+    let mut compact_answer = false;
     while !r.rest.is_empty() {
         match r.u8()? {
             TAIL_CHAIN_HINT => chain = Some(ChainHint { view: r.u64()?, chained: r.u8()? == 1 }),
             TAIL_WANT_HASHES => want_hashes = true,
+            TAIL_COMPACT_ANSWER => compact_answer = true,
             // A tag from a newer peer. Its length is not known here, so
             // there is nothing to skip to: stop reading and keep what was
             // understood. Fields are only ever appended, so everything
@@ -541,7 +729,8 @@ pub fn decode_build_on_own(
             _ => break,
         }
     }
-    Ok((header, PayloadAttributes { timestamp, prev_randao, suggested_fee_recipient, withdrawals, parent_beacon_block_root, slot_number, target_gas_limit }, chain, want_hashes))
+    let attrs = PayloadAttributes { timestamp, prev_randao, suggested_fee_recipient, withdrawals, parent_beacon_block_root, slot_number, target_gas_limit };
+    Ok(BuildOnOwn { header, attrs, chain, want_hashes, compact_answer })
 }
 
 /// Encodes a [`PayloadStatus`] for the channel.

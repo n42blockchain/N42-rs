@@ -22,12 +22,12 @@ pub mod mock;
 pub mod raw_engine;
 
 pub use driver::{
-    body_once, commit_fcu_async, compact_body, BodyDecoder, BuildTiming, CommitReport, DriverAction, ExecutionDriver,
+    body_once, commit_fcu_async, compact_body, take_compact, BodyDecoder, BuildTiming, CommitReport, DriverAction, ExecutionDriver,
     ImportReport, ImportVerdict,
 };
 pub use el::{
-    BodyOutcome, BuildStart, BuildTrigger, ChainAhead, ChainBlock, ChainSealer, BuiltBlock, ElError, ExecutionLayer,
-    ForeignBody, ResolveKind,
+    AnswerStamps, BodyOutcome, BuildStart, BuildTrigger, ChainAhead, ChainBlock, ChainSealer, BuiltBlock, ElError, ExecutionLayer,
+    ForeignBody, ResolveKind, fill_elided,
 };
 pub use execution_path::{ExecutionPath, ExecutionScheduling, ExecutionWorkload};
 pub use mock::{ElCall, MockBehaviour, MockExecutionLayer};

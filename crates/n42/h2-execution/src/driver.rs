@@ -373,8 +373,11 @@ fn preseal(
         }
     };
     let cached = execution.clone();
+    // An elided block's payload lists no transactions: a body encoded from
+    // it would be a different block. Its compact body is made at the
+    // proposal from the hashes instead.
     let body = match (encoder, header.as_ref()) {
-        (Some(encode), Some(header)) => encode(&execution, header),
+        (Some(encode), Some(header)) if !built.elided => encode(&execution, header),
         _ => None,
     };
     if let Ok(mut slot) = slot.lock() {
@@ -398,6 +401,11 @@ pub struct BuildTiming {
     pub presealed: bool,
     /// When the block's build started and what started it.
     pub start: Option<crate::el::BuildStart>,
+    /// The size of the answer the block came in, and when the proposer
+    /// read and decoded it (see [`crate::el::AnswerStamps`]).
+    pub answer: Option<crate::el::AnswerStamps>,
+    /// Whether that answer left the transactions out (`N42_TAKE_COMPACT`).
+    pub elided: bool,
 }
 
 impl std::fmt::Debug for Normalizer {
@@ -638,6 +646,50 @@ pub fn compact_body() -> bool {
             || std::env::var("N42_BLOCK_BY_DESCRIPTION").is_ok_and(|v| v == "1"))
             && body_once()
     })
+}
+
+/// Imports a block this node built. A whole payload goes the way it always
+/// went ([`ExecutionLayer::import_own_block`]: the sealed header, then the
+/// payload). An elided one (`elided` = the block's transaction count) has
+/// no payload to fall back on: the sealed header first, and when that is
+/// refused the body is fetched from the execution layer
+/// ([`ExecutionLayer::own_block_body`]) and the payload made whole from it.
+pub async fn import_own<E: ExecutionLayer + ?Sized>(
+    el: &E,
+    header: Option<&alloy_consensus::Header>,
+    payload: ExecutionData,
+    elided: Option<usize>,
+) -> Result<alloy_rpc_types_engine::PayloadStatus, ElError> {
+    let Some(tx_count) = elided else {
+        return el.import_own_block(header, payload).await;
+    };
+    let header = header.ok_or_else(|| ElError::new("an elided own block without its sealed header"))?;
+    if let Some(status) = el.import_own_block_by_header(header).await {
+        return Ok(status);
+    }
+    let block = el
+        .own_block_body(header)
+        .await?
+        .ok_or_else(|| ElError::new(format!("the execution layer no longer holds own block {}", header.number)))?;
+    let whole = crate::el::fill_elided(&payload, &block, tx_count)?;
+    el.new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, whole).await
+}
+
+/// `N42_TAKE_COMPACT`, read once: the proposer asks its execution layer for
+/// a build-on-own answer *without the transactions* -- the header, the small
+/// fields and the transaction hashes / frame layout the compact body is made
+/// of -- instead of the ~26 MB block (`docs/INDUSTRY_SURVEY_2026_10.md`
+/// 11.7: encode, write, read and decode of that answer were ~75 ms of a
+/// 160 ms `send`-trigger chain). Off by default.
+///
+/// It implies [`compact_body`]: without a compact body to publish, the
+/// proposer needs the whole body on its proposal path and there is nothing
+/// to save. What needs the bytes afterwards -- a peer's fetch by hash, a
+/// fill, the own import's fallback -- fetches them from the execution layer
+/// by the sealed header ([`crate::ExecutionLayer::own_block_body`]).
+pub fn take_compact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_TAKE_COMPACT").is_ok_and(|v| v == "1") && compact_body())
 }
 
 /// `N42_COMMIT_FCU_ASYNC`, read once: opt-in, and only the *default* for a
@@ -1317,8 +1369,14 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         }
 
         let after_seal = started.elapsed();
-        let cached = cached.unwrap_or_else(|| built.execution_data.clone());
-        self.cache_payload(built.hash, cached);
+        // An elided block's payload lists no transactions, and a cached
+        // payload is what an import of the block would send: it is never
+        // cached. Its own import goes by the sealed header, and fetches the
+        // body when that is refused (`spawn_import_own_block`).
+        if !built.elided {
+            let cached = cached.unwrap_or_else(|| built.execution_data.clone());
+            self.cache_payload(built.hash, cached);
+        }
         let after_cache = started.elapsed();
         self.last_build_timing = BuildTiming {
             take_us: after_resolve.as_micros() as u64,
@@ -1326,6 +1384,8 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             cache_us: after_cache.saturating_sub(after_seal).as_micros() as u64,
             presealed: was_presealed,
             start: built.started,
+            answer: built.answer,
+            elided: built.elided,
         };
 
         info!(
@@ -1382,13 +1442,14 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let payload = built.execution_data.clone();
         let header = built.header.clone();
         let hash = built.hash;
+        let elided = built.elided.then_some(built.tx_count);
         let imported = self.own_imports.clone();
         self.own_importing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(hash);
         let done = OwnImportDone { importing: std::sync::Arc::clone(&self.own_importing), hash };
         tokio::spawn(async move {
             let _done = done;
             let started = std::time::Instant::now();
-            match el.import_own_block(header.as_ref(), payload).await {
+            match import_own(el.as_ref(), header.as_ref(), payload, elided).await {
                 Ok(status) => {
                     info!(
                         target: "n42.h2.el",
@@ -1783,10 +1844,14 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
 
     pub async fn import_own_block(&mut self, built: &BuiltBlock) -> Result<(), ElError> {
         let started = std::time::Instant::now();
-        let status = self
-            .el
-            .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, built.execution_data.clone())
-            .await?;
+        let status = if built.elided {
+            import_own(self.el.as_ref(), built.header.as_ref(), built.execution_data.clone(), Some(built.tx_count))
+                .await?
+        } else {
+            self.el
+                .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, built.execution_data.clone())
+                .await?
+        };
         info!(
             target: "n42.h2.el",
             block = ?built.hash,

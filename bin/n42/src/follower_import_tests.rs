@@ -461,3 +461,43 @@ fn a_timed_check_of_an_empty_block_passes_with_and_without_the_header_comparison
     )
     .expect("the noop consensus accepts the header");
 }
+
+// ---- held executions (`N42_VOTE_BEFORE_SLOT`) --------------------------------
+
+#[test]
+fn an_execution_without_a_hold_starts_at_once() {
+    assert_eq!(wait_for_release(B256::repeat_byte(0xe0)), Ok(()));
+}
+
+#[test]
+fn a_held_execution_waits_for_its_release() {
+    let hash = B256::repeat_byte(0xe1);
+    let release = hold_execution(hash);
+    let waiter = std::thread::spawn(move || wait_for_release(hash));
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    assert!(!waiter.is_finished(), "held until released");
+    release.send(true).expect("the waiter listens");
+    assert_eq!(waiter.join().expect("joins"), Ok(()));
+    // Taken once: a second import of the same hash is not held.
+    assert_eq!(wait_for_release(hash), Ok(()));
+}
+
+#[test]
+fn a_dropped_or_abandoned_hold_ends_the_execution() {
+    let dropped = B256::repeat_byte(0xe2);
+    let release = hold_execution(dropped);
+    release.send(false).expect("listens");
+    assert_eq!(wait_for_release(dropped), Err(HELD_DROPPED.to_owned()));
+
+    // No CHECKED frame went out, so no release byte will come: the sender is
+    // dropped and an execution already waiting ends instead of hanging.
+    let abandoned = B256::repeat_byte(0xe3);
+    drop(hold_execution(abandoned));
+    assert_eq!(wait_for_release(abandoned), Err(HELD_DROPPED.to_owned()));
+
+    // A hold whose import ended before its execution is forgotten.
+    let forgotten = B256::repeat_byte(0xe4);
+    let _release = hold_execution(forgotten);
+    forget_hold(forgotten);
+    assert_eq!(wait_for_release(forgotten), Ok(()));
+}

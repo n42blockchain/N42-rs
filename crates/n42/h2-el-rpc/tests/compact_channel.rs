@@ -211,6 +211,102 @@ async fn a_path_that_is_not_the_canonical_engine_api_is_not_this_way() {
     assert!(matches!(outcome, BodyOutcome::NotThisWay));
 }
 
+// ---- held bodies (`N42_VOTE_BEFORE_SLOT`) -----------------------------------
+
+/// What a held request's server saw: the prefix and kind it read, and the
+/// release byte, with whether the byte came before the test released.
+#[derive(Debug, Default)]
+struct HeldSeen {
+    prefix: u8,
+    kind: u8,
+    byte: Option<u8>,
+}
+
+/// One connection: reads `HOLD_EXECUTION`, the body request, answers
+/// CHECKED, reads the release byte, then answers VALUE (execute) or ERROR
+/// (drop), as the execution layer's server does.
+async fn serve_held() -> (std::net::SocketAddr, Arc<Mutex<HeldSeen>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds");
+    let addr = listener.local_addr().expect("addr");
+    let seen = Arc::new(Mutex::new(HeldSeen::default()));
+    let out = Arc::clone(&seen);
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else { return };
+        let Ok(prefix) = stream.read_u8().await else { return };
+        let Ok(kind) = stream.read_u8().await else { return };
+        let Ok(len) = stream.read_u32_le().await else { return };
+        let mut body = vec![0u8; len as usize];
+        if stream.read_exact(&mut body).await.is_err() {
+            return;
+        }
+        {
+            let mut seen = out.lock().unwrap();
+            seen.prefix = prefix;
+            seen.kind = kind;
+        }
+        if stream.write_all(&frame(reply::CHECKED, &status(PayloadStatusEnum::Valid))).await.is_err() {
+            return;
+        }
+        let Ok(byte) = stream.read_u8().await else { return };
+        out.lock().unwrap().byte = Some(byte);
+        let answer = if byte == raw_engine::release::EXECUTE {
+            frame(reply::VALUE, &status(PayloadStatusEnum::Valid))
+        } else {
+            frame(reply::ERROR, b"dropped")
+        };
+        let _ = stream.write_all(&answer).await;
+    });
+    (addr, seen)
+}
+
+#[tokio::test]
+async fn a_held_body_votes_then_waits_for_its_release_byte() {
+    env();
+    let (addr, seen) = serve_held().await;
+    let client = EngineApiClient::new(Endpoint(addr));
+    assert!(client.holds_execution());
+    let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let body = body(true);
+    let call = client.new_payload_body_held(ExecutionPath::LIVE_SEQUENTIAL, &body, checked_tx, release_rx);
+    tokio::pin!(call);
+    // The check arrives while the call is still open: the vote goes out
+    // before any slot.
+    let checked = tokio::select! {
+        checked = checked_rx => checked.expect("checked"),
+        outcome = &mut call => panic!("answered before the release: {outcome:?}"),
+    };
+    assert!(matches!(checked.status, PayloadStatusEnum::Valid));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(seen.lock().unwrap().byte, None, "no release byte before the slot");
+    release_tx.send(true).expect("the call waits for it");
+    let outcome = call.await;
+    assert!(matches!(outcome, BodyOutcome::Answered(Ok(_))), "{outcome:?}");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.prefix, request::HOLD_EXECUTION);
+    assert_eq!(seen.kind, request::COMPACT_BODY);
+    assert_eq!(seen.byte, Some(raw_engine::release::EXECUTE));
+}
+
+#[tokio::test]
+async fn a_dropped_held_body_sends_the_drop_byte_and_answers_the_drop() {
+    env();
+    let (addr, seen) = serve_held().await;
+    let client = EngineApiClient::new(Endpoint(addr));
+    let (checked_tx, _checked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<bool>();
+    // A dropped sender is a drop.
+    drop(release_tx);
+    let outcome = client.new_payload_body_held(ExecutionPath::LIVE_SEQUENTIAL, &body(false), checked_tx, release_rx).await;
+    match outcome {
+        BodyOutcome::Answered(Err(err)) => assert_eq!(err.to_string(), n42_h2_execution::HELD_IMPORT_DROPPED),
+        other => panic!("expected the drop, got {other:?}"),
+    }
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.kind, request::FOREIGN_BODY);
+    assert_eq!(seen.byte, Some(raw_engine::release::DROP));
+}
+
 // ---- hashed build answers --------------------------------------------------
 
 fn header(number: u64) -> Header {

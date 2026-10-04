@@ -1197,3 +1197,120 @@ from ~126 to ~216 ms; the creep of 11.10 section 4 is that sum closing on the th
   4 x 115 = 460 ms at which the ancestry limit would start to bind), so the release-at-fields would trade the slot wait for tail stalls at the ancestry limit. With the
   cache fix the gate stops binding by itself (node 1's 126 ms is well under 2 x cycle) and the change buys nothing. Recommendation: fix the cache insert first, keep the slot
   released at landing, and revisit release-at-fields (with a guard at `PARENT_OUTPUTS_KEPT - 1` unlanded) only if a later leg shows the gate binding with equal engines.
+
+### 11.12 The follower's import pipeline: no shared stage is saturated; the slot hold is a latency chain whose two excess links are the shards merge and the wait for the parent's canonical commit (loop326 N, Nb; O, Ob for contrast; offline)
+
+Offline: logs and code only (no node, fleet or cargo). Scratch parser in `/tmp/a1112` (`p.py` builds per-block tables from `node{1,2}-el.log` and `-v.log`, `t.py`,
+`c.py`, `g.py` read them); window 1 as `fleet7-depth-replay.py` defines it, 236-242 blocks a leg. Per block and follower the timeline is built from the validator's `import starting`
+(arrival A), `imported a block` (`slot_wait_ms`; the line is printed when the driver frees the slot), `received Decide`, and the execution layer's `vote road` (road start R0 = line
+time minus `total_ms`), `checked: answered`, `direct import` (offsets from R0: `exec_start_ms`, `exec_end_ms`, `root_end_ms`, `fields_ready_ms`; `parent_engine_wait_ms`, `mined_ms`,
+`insert_ms`, `engine_ms`), `build path: the root's start after the execution` (printed after the shards merge is joined), `Block added to canonical chain` and `Canonical chain committed`.
+The import's return to `payload_serve` (ret) is the `direct import` line minus `engine_ms`, `mined_ms` and `insert_ms`. Launch: the bench line of 10.74 (`N42_FOLLOWER_BUILD_PATH`,
+`EXEC_EARLY`, `FIELDS_EARLY`, `ROOT_ON_BUILD_POOL`, `N42_PARALLEL_BUILD_THREADS=32`, `N42_COMMIT_FCU_ASYNC=1`, `N42_HASHED_TABLES=off`, core layout off, `DEFERRED_IN_FLIGHT` 2).
+
+**1. The pipeline of a direct-imported block (code), with what each stage waits for and whether two consecutive blocks can hold it at once.**
+
+| # | Stage | Runs on | Waits for | Two blocks at once? |
+| --- | --- | --- | --- | --- |
+| 0 | Slot (`ExecutionDriver::spawn_execute_deferred`, cap 2) | validator task | a free slot; freed in `finish_execute` on `ImportReport::Done`, i.e. after the engine answered the block's `newPayload` | two slots |
+| 1 | Body assembly from the queue, sender recovery reuse | `spawn_blocking` thread | the frames (never late: `frames_missing` 0) | yes |
+| 2 | Vote road: includability check on the `vote-check` pool (4 threads), then `wait_for_parent_fields(n-1)`, then the vote (CHECKED frame) | its own thread beside 3 (`two_roads`) | n-1's QMDB root and receipts (`parent_fields_wait_ms`, 0 median) | yes |
+| 3 | Execution (build path, 32-thread build pool), receipts and gas | import thread + build pool | `EXEC_GATE`: one execution at a time on the node; n-1's published shards | **no** (gate) |
+| 4 | QMDB root, `insert_block_operations` (forest mutex held throughout, hashing on the build pool, root pool serialised by a static mutex) | `qmdb-root-early` thread | n-1's fields (`root_wait_ms`) | **no** (forest lock, one root at a time) |
+| 5 | Shards merge into the one `BundleState` the engine and the published output need (`shards.merged`) | its own `n42-follower-merge` thread, one per block | the execution | yes |
+| 6 | `wait_for_parent` before the hand-off | import thread | n-1 **visible to the provider**, i.e. canonical: its commit forkchoice has run; woken only by landings, otherwise a 20 ms poll | serial across blocks (see 2) |
+| 7 | Mined-transaction walk, `ExecutedInsert` sent and acknowledged when queued | tokio task | -- | yes |
+| 8 | Executed insert (`Block added`, 0.03 ms since 10.74) | engine thread | messages ahead of it | **no** (one thread) |
+| 9 | `remember_sealed`, listing, `newPayload` (answered Valid from the tree) | blocking pool, then engine thread | the copy; the engine queue | engine part **no** |
+| 10 | Slot freed (`imported a block`), then the commit forkchoice of this block is sent (it waited in `pending_commits`: the Decide came 127-176 ms earlier, median) | validator | stage 9 | -- |
+| 11 | Commit forkchoice: make canonical, QMDB `on_canonical` hook (forest lock), txpool hooks | engine thread | the engine queue (6-8 ms median); the forest lock if a root holds it | **no** |
+| -- | Persistence (`save_blocks` 85-95 ms a full block, every ~3 blocks) and `on_persisted` (forest lock) | persistence thread; engine for the hand-off | the engine | one thread |
+
+Stage 6 is the coupling: the landing of n waits for stage 11 of n-1, which waits for stage 9 of n-1. In 958 of 958 window-1 blocks (N, Nb, both followers) the
+import returned after the parent's `Canonical chain committed` (minimum 4.9-10.2 ms after it), while the parent had landed in the tree at least 56-63 ms before;
+`parent_engine_wait_ms` is quantised at 20 / 40 / 60 ms (N node 1: 0 in 142 blocks, 20 in 15, 40 in 16, 60 in 30): the parent's canonicalisation does not bump
+`IMPORT_LANDED`, so the wait ends on the 20 ms poll. The comment in `import_foreign_block` says the hand-off waits "for the parent to land"; the code waits for it to be canonical.
+
+**2. Per-block stage times, window 1 (median, mean in brackets, ms; N node 1 / N node 2 / Nb node 1 / Nb node 2).** Slot hold H = R0 to the slot's release.
+
+| Segment | N n1 | N n2 | Nb n1 | Nb n2 |
+| --- | --- | --- | --- | --- |
+| blocks gated (slot wait > 5 ms) | 181 of 237 | 131 | 203 of 242 | 94 |
+| `slot_wait_ms` | 36 (36.7) | 12 (22.8) | 46 (46.5) | 0 (16.4) |
+| R0 to execution start | 13 (14.2) | 12 (13.7) | 13 (14.2) | 11 (11.9) |
+| execution (`exec_ms`) | 41 (42.8) | 39 (41.3) | 40 (41.9) | 37.5 (40.1) |
+| execution end to root end (`root_ms`; `root_wait_ms` mean 1.3-2.9) | 27 (31.3) | 26 (28.9) | 27 (30.0) | 25 (28.1) |
+| execution end to the merge joined | **91 (89.2)** | **87 (86.0)** | **89 (87.6)** | **85 (85.8)** |
+| merge joined to return, less the parent wait (unattributed) | 14.5 (27.3) | 15.3 (25.6) | 15.8 (28.7) | 11.5 (19.5) |
+| parent wait (`parent_engine_wait_ms`) | 0 (20.6) | 0 (20.1) | 0 (21.3) | 0 (13.5) |
+| return to slot release (mined 4, insert 0.1, remember + `newPayload` 19-21) | 24 (26.1) | 26 (27.2) | 27 (27.9) | 25 (26.3) |
+| **H** | **221 (220.8)** | **216 (214.6)** | **224 (222.2)** | **196 (197.7)** |
+| arrival to landing (`Block added`) | 244 | 226 | 253 | 198 |
+| arrival to vote | 79 | 58 | 88 | 41 |
+| commit forkchoice on the engine (`elapsed`) / its queue | 36 / 7.6 | 32 / 6.8 | 34 / 8.0 | 30 / 5.8 |
+
+The logged work in H is about 113 ms mean (setup 14, execution 43, root 31, hand-off 26); the other ~107 ms are three items: the merge running ~60 ms past the root
+(the root and the merge start together when the execution returns; the merge's own `merge_ms` is a debug line and was not printed, so its length is inferred from the join),
+the parent's canonical-commit wait (13-21 ms mean), and an unattributed post-root segment, bimodal (a mode at 10-15 ms, another at 50-65 ms in about 30% of blocks).
+
+**3. Utilisation per resource (service time over the mean arrival interval, 116.2 ms in N, 114.8 in Nb; median service in brackets).**
+
+| Resource | Serial across blocks? | Service per block | Utilisation | Queueing seen |
+| --- | --- | --- | --- | --- |
+| Execution gate + build pool | yes | 40-43 ms mean (37.5-41) | 0.35-0.37 | `gate_ms` 0 in every block |
+| QMDB root / forest lock | yes | 28-31 ms (25-27); p90 36-45 is the only sign of the shared build pool | 0.24-0.27 | `root_wait_ms` 1.3-2.9 mean; `on_canonical` waited on the lock 3-9 times in 30 s |
+| Shards merge | no (a thread per block) | 85-89 ms | (0.75 if it were serial) | none: pure latency on the hand-off path |
+| Engine thread (commit forkchoice 30-36 + `newPayload` ~4 CPU + insert 0.03 + persistence hand-off) | yes | ~40-45 ms | 0.33-0.36 (10.74's per-thread CPU: 33-37%) | 6-8 ms before the forkchoice |
+| Persistence thread | yes | 85-95 ms a full block | 0.73-0.83 | off the path except via the engine and `on_persisted` |
+| **Landing chain** (slot release n-1 -> forkchoice n-1 -> canonical -> poll -> hand-off n -> `newPayload` n -> release n) | **yes** | link 98 / 93 / 97 / 88 ms median where it binds (95 / 101 / 110 / 72 blocks) | **0.77-0.85** | the parent wait, 13-21 ms mean |
+| **Two-slot set** (H against 2 x arrival interval) | two servers | H 196-224 | **0.85-0.97** | slot wait 16-47 ms mean |
+
+**4. The bottleneck.** No shared stage is saturated: execution, root, engine and the rayon side are at 0.24-0.37, the pool shows no queue on the follower (gate 0, root wait 1-3 ms;
+the leader's 43k `sched_yield`/s in 10.74 is a leader-side, ptrace-inflated reading). What sits at 0.85-0.97 is the two-slot set, because H is about two cycles; and H is long
+not for want of capacity but because of a latency chain with two excess links: (a) the shards merge on the hand-off path, 85-91 ms against a 25-27 ms root, ~58 ms of H; (b) the
+strict canonical-parent wait, which makes the landing of n a serial successor of n-1's slot release plus a 30-36 ms forkchoice plus a 0-20 ms poll (the "landing chain", 0.77-0.85
+by itself, 13-21 ms of H on average and the longer links when it binds). Together with the unattributed 20-29 ms mean, they are the gap between the ~113 ms of logged work and H.
+Answers to the specific checks: the engine thread's per-block work sums to ~40-45 ms, about 0.35-0.4 of the cycle, not near it; the strict-order landing is real and is
+stricter than the comment says (canonical, not landed); the forest lock is held ~27 ms a block by the root and contended only 3-9 times in 30 s; the rayon pool does not queue
+follower stages; persistence (every ~3 blocks) shows as periodicity: the landing link's autocorrelation is -0.43 to -0.54 at lag 1 (the two slots alternate) and
++0.41 to +0.56 at lag 6, and the unattributed segment's mean by block number modulo 6 has two low phases (11-16 ms against 23-44), a period of 3. A plausible but unproven
+source is the last reference to a persisted block's executed state being dropped on the import thread (its state providers hold the in-memory ancestors); a timer around the
+import's return would settle it.
+
+**5. The alternation.** It is not a lock-in of one follower. Both followers' H (196-224 ms) sits at the threshold 2 x arrival interval (230-232 ms), so both are gated much of the
+time: per block, N has both gated in 106 of 237 blocks, node 1 alone in 75, node 2 alone in 25, neither in 31; Nb 69 / 134 / 25 / 14. Under gating H is by construction two landing
+intervals (R0 of n is the release of n-2), and the leader's cycle adapts to the later follower through the quorum, so a follower that is behind is never given the slack to catch up:
+the state is neutrally stable, not restoring. There is a mild positive feedback through stage 6: a follower that is behind releases n-1 late, so its own commit forkchoice of n-1
+is late (it waits for that release, not for the Decide, which came 127-176 ms earlier), so its landing of n waits for it: the parent wait is 17-28 ms mean on gated blocks
+against 4-17 on free ones (O node 1, free: 4.1-9.2 ms; Ob node 2, gated: 24.0). Which node carries more of the gating is set by small H differences in the opening full blocks
+(Nb: 224 against 196 ms), not by the index; on the O legs node 2's cache insert (return-to-release 40-41 ms against 24-25) decided it every time (node 2 alone 157 / 207 blocks).
+
+**6. The floor.** Remove the merge's excess over the root (~58 ms) and the canonical-parent wait (13-21 ms mean): H falls from ~220 to ~140-150 ms mean, under 2 x arrival interval
+at any cycle above 75 ms, so the gate stops binding; the O legs' ungated node 1 (H 165-176 ms) was gated in only 23-64 of 236 blocks with the merge still in place. The last vote then
+comes at arrival + 25-35 ms (the free followers' vote road), `Qc - P` about 35-40 ms, and the cycle falls to the tick-bound class, 104.5-106.1 ms in these legs, with the seal
+binding in 3-12% of blocks (N: 12.3%, mean 131 ms in that class): about 105-108 ms mean, 1.51-1.55M. The anatomy script's counterfactual (both followers as fast as the
+faster) reads 109.0 and 104.5 ms for N and Nb. These are upper bounds that hold every other duration fixed; 11.6 predicted 103 ms for a change and was falsified, because earlier
+starts overlap more work and lengthen it. Treat 108-110 ms as the realistic aim.
+
+**7. Ranked changes (by expected effect on the mean cycle).**
+1. **Take the shards merge off the hand-off path** (`bin/n42/src/follower_import.rs`, the build-path branch around `shards.merged`; `crates/n42/engine-types/src/output_shards.rs`): merge in
+   parallel (the shards are disjoint by account) or incrementally as each batch finishes, so the bundle is ready when the root is. Effect: H -55 to -60 ms, the gate binds on a
+   few percent of blocks, cycle -6 to -9 ms (to ~106-109). Risk: medium (the bundle feeds the engine, persistence and the published output; it must stay identical). First confirm
+   the merge's length: one leg with `RUST_LOG` raising `n42.follower_import` to debug for the `build path: the shards merged` line (`merge_ms`, `merge_wait_ms`); then the change, two
+   legs against two controls: execution end to the root line equals `root_ms`, H about 160 ms, gated blocks under 30 per follower.
+2. **Hand off on the parent's landing, not its canonical commit** (`wait_for_parent` on the direct-import hand-off in `import_foreign_block`: accept a parent this node has landed --
+   keep a set of landed hashes beside `IMPORT_LANDED` -- and wake on it, no poll). reth's `InsertExecutedBlock` takes a block whose parent is in the tree; the forkchoice of n then
+   canonicalises n-1 and n together. Effect: the parent wait (13-21 ms mean) leaves H and the landing chain is broken, cycle -3 to -6 ms alone. Risk: low to medium (check that the
+   tree inserts an executed child of a non-canonical parent without the pending-block path misbehaving, and that a sibling committed at n-1 still discards the child). Confirm:
+   `parent_engine_wait_ms` without the 20/40/60 quantisation, some returns before the parent's `Canonical chain committed`, H -15 to -20 ms.
+3. **Free the slot when the block's fields are published, with a guard at three unlanded blocks** (`PARENT_OUTPUTS_KEPT - 1`; `finish_execute` and a new `ImportReport::Executed` in
+   `crates/n42/h2-execution/src/driver.rs`), only after 2. 11.11 advised against it because the landing was then a throughput limit (the cache insert) and the depth would fill to the
+   ancestry limit; with the cache gone landing is a latency, not a throughput, limit except for the landing chain (0.77-0.85), which change 2 removes. Then the depth is landing
+   latency over cycle, about 2 (p90 2.5), within the guard, and the vote stops depending on landing at all. Effect beyond 1 and 2: small (they already take the gate off);
+   alone, without 2, it would trade the slot wait for stalls at the guard. Risk: memory (one more block's executed state per follower) and wider overlap (11.6). Confirm:
+   unlanded depth at arrival never above 3, no `decline_on_output` lines, peak RSS, arrival-to-vote 25-35 ms on both followers.
+
+Not ranked: moving the QMDB `on_canonical` hook off the engine thread or batching forkchoices (the engine is at 0.33-0.36; once 2 is in, the forkchoice is off the landing path and
+only its 6-8 ms queue ahead of `newPayload` remains, H -5 ms at most); landing out of strict order (unnecessary: the parent has always landed 56+ ms before, the wait is for
+canonicalisation, which 2 addresses); a dedicated pool for follower imports (no pool queueing on the follower: `gate_ms` 0, root wait 1-3 ms). The unattributed post-root segment
+(20-29 ms mean, period 3) needs its timer before any change.

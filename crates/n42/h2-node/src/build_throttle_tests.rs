@@ -86,3 +86,42 @@ fn a_hard_hold_lasts_until_the_count_is_back_under_hard() {
     assert_eq!(t.last_applied(), Applied { in_mem: Some(60), delay_ms: 300 });
     assert_eq!(t.hard_holds(), 1, "one view held, counted once");
 }
+
+#[test]
+fn off_unless_hard_is_set_above_zero() {
+    assert_eq!(ThrottleConfig::from_values(None, None, None), None, "unset: off");
+    assert_eq!(ThrottleConfig::from_values(Some("40"), None, None), None, "SOFT alone: off");
+    assert_eq!(ThrottleConfig::from_values(Some("40"), Some("0"), None), None, "HARD 0: off");
+    assert_eq!(ThrottleConfig::from_values(Some("40"), Some("lots"), Some("500")), None, "HARD unparsable: off");
+    assert_eq!(
+        ThrottleConfig::from_values(Some("40"), Some("80"), None),
+        Some(ThrottleConfig { soft: 40, hard: 80, max_hold: MAX_HOLD_DEFAULT })
+    );
+    assert_eq!(
+        ThrottleConfig::from_values(Some(" 40 "), Some("80"), Some("750")),
+        Some(ThrottleConfig { soft: 40, hard: 80, max_hold: Duration::from_millis(750) })
+    );
+}
+
+#[test]
+fn a_soft_unset_zero_or_not_under_hard_leaves_no_band() {
+    for soft in [None, Some("0"), Some("80"), Some("120"), Some("x")] {
+        let c = ThrottleConfig::from_values(soft, Some("80"), Some("0")).expect("on");
+        assert_eq!(c.soft, 80, "{soft:?}");
+        assert_eq!(c.max_hold, MAX_HOLD_DEFAULT, "a zero max hold is the default");
+        assert_eq!(c.delay(79, Some(PACING)), Delay::After(Duration::ZERO));
+        assert_eq!(c.delay(80, Some(PACING)), Delay::Hold);
+    }
+}
+
+#[test]
+fn an_unknown_count_never_delays() {
+    let mut t = throttle(40, 80);
+    let now = Instant::now();
+    assert_eq!(t.check(1, None, Some(PACING), now), Verdict::Go);
+    assert_eq!(t.last_applied(), Applied { in_mem: None, delay_ms: 0 });
+    assert_eq!(t.hard_holds(), 0);
+    // Through the reader as well.
+    let mut read = BuildThrottle::new(config(40, 80), Arc::new(|| None));
+    assert_eq!(read.ask(1, Some(PACING), now), Verdict::Go);
+}

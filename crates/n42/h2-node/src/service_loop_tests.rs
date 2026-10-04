@@ -539,6 +539,76 @@ async fn a_declined_proposal_goes_out_at_the_pacing_tick() {
 
 
 // ---------------------------------------------------------------------------
+// The build throttle
+// ---------------------------------------------------------------------------
+
+/// A throttle on SOFT 40 / HARD 80 whose count is whatever `count` holds
+/// (`u64::MAX`: unknown).
+fn throttle_reading(count: &Arc<std::sync::atomic::AtomicU64>, max_hold: Duration) -> crate::build_throttle::BuildThrottle {
+    let count = Arc::clone(count);
+    crate::build_throttle::BuildThrottle::new(
+        crate::build_throttle::ThrottleConfig { soft: 40, hard: 80, max_hold },
+        Arc::new(move || {
+            let n = count.load(Ordering::SeqCst);
+            (n != u64::MAX).then_some(n)
+        }),
+    )
+}
+
+/// The execution layer's calls a proposal made, in order.
+async fn proposal_calls(throttle: Option<crate::build_throttle::BuildThrottle>) -> (Vec<ElCall>, bool) {
+    let rig = node(1, 0, None).await;
+    let mut svc = rig.svc.with_payload_attributes(|context| Some(attributes_for(&context)));
+    if let Some(throttle) = throttle {
+        svc = svc.with_build_throttle(throttle);
+    }
+    let view = svc.engine().current_view();
+    let mut events = Vec::new();
+    within(svc.propose_if_leader(&mut events)).await.expect("ok");
+    (rig.el.calls(), svc.proposed_view == Some(view) && !svc.proposal_deferred)
+}
+
+#[tokio::test]
+async fn a_throttle_below_soft_or_without_a_count_proposes_exactly_as_none() {
+    let (none, proposed) = proposal_calls(None).await;
+    assert!(proposed);
+    assert!(!none.is_empty());
+    for reading in [u64::MAX, 0, 39] {
+        let count = Arc::new(std::sync::atomic::AtomicU64::new(reading));
+        let (calls, proposed) = proposal_calls(Some(throttle_reading(&count, Duration::from_secs(2)))).await;
+        assert!(proposed, "count {reading}: proposed at once");
+        assert_eq!(calls, none, "count {reading}: the same calls as no throttle");
+    }
+}
+
+#[tokio::test]
+async fn a_throttled_leader_defers_without_building_and_proposes_once_the_count_drops() {
+    let rig = node(1, 0, None).await;
+    let count = Arc::new(std::sync::atomic::AtomicU64::new(80));
+    let mut svc = rig
+        .svc
+        .with_payload_attributes(|context| Some(attributes_for(&context)))
+        .with_build_throttle(throttle_reading(&count, Duration::from_secs(2)));
+    let view = svc.engine().current_view();
+    let mut events = Vec::new();
+    within(svc.propose_if_leader(&mut events)).await.expect("ok");
+    assert!(svc.proposal_deferred, "held, not refused: the next step asks again");
+    assert_eq!(svc.defer_reason, Some(crate::build_throttle::THROTTLE_REASON));
+    assert_eq!(svc.proposed_view, None, "a hold is not a proposal");
+    assert!(rig.el.calls().is_empty(), "nothing was built while held");
+    assert!(svc.deferred_pacing_tick().is_some(), "the loop wakes at the hold's end");
+
+    count.store(10, Ordering::SeqCst);
+    within(svc.propose_if_leader(&mut events)).await.expect("ok");
+    assert_eq!(svc.proposed_view, Some(view));
+    assert!(!svc.proposal_deferred);
+    let throttle = svc.build_throttle.as_ref().expect("installed");
+    assert_eq!(throttle.hard_holds(), 1);
+    assert_eq!(throttle.last_applied().in_mem, Some(10));
+}
+
+
+// ---------------------------------------------------------------------------
 // Building ahead of leading
 // ---------------------------------------------------------------------------
 

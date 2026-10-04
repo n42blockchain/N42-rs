@@ -39,7 +39,8 @@ impl<TX: DbTx, N: NodeTypes> DatabaseProvider<TX, N> {
             .map(|checkpoint| checkpoint.block_number))
     }
 
-    /// The first block in `from..=to` with an account changeset entry for `address`.
+    /// The first block in `from..=to` with an account changeset entry for `address`; an error if
+    /// none is found within the first `N42_ACCOUNT_HISTORY_SCAN_MAX` blocks of a longer range.
     fn n42_first_account_change(
         &self,
         address: Address,
@@ -50,10 +51,11 @@ impl<TX: DbTx, N: NodeTypes> DatabaseProvider<TX, N> {
         if from > to {
             return Ok(None)
         }
-        if to - from >= account_history_scan_max() {
-            return Err(account_history_scan_too_long(gap, from, to))
-        }
-        for block in from..=to {
+        let max = account_history_scan_max();
+        for (scanned, block) in (from..=to).enumerate() {
+            if scanned as u64 >= max {
+                return Err(account_history_scan_too_long(gap, from, to))
+            }
             if self.get_account_before_block(block, address)?.is_some() {
                 return Ok(Some(block))
             }
@@ -69,8 +71,8 @@ impl<TX: DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
     /// `gap - 1`; whatever it cannot settle there is settled by the changesets of
     /// `gap..=visible_tip` (or `block_number..=visible_tip` when the read is inside the gap). An
     /// `InChangeset(c)` result means the caller reads block `c`'s changeset, exactly as with a
-    /// complete index; a scan that would be longer than `N42_ACCOUNT_HISTORY_SCAN_MAX` blocks is
-    /// an error naming the mode, never a guess.
+    /// complete index; a scan that finds nothing within `N42_ACCOUNT_HISTORY_SCAN_MAX` blocks of a
+    /// longer range is an error naming the mode, never a guess.
     pub(crate) fn n42_account_history_info_in_gap(
         &self,
         address: Address,

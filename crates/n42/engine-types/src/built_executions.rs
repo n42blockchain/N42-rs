@@ -106,15 +106,39 @@ fn store() -> &'static (Mutex<VecDeque<(B256, Entry)>>, Condvar) {
     STORE.get_or_init(|| (Mutex::new(VecDeque::with_capacity(KEEP)), Condvar::new()))
 }
 
+/// The store's hard bound: only builds still finishing behind their seal may
+/// take it past [`KEEP`].
+const KEEP_FINISHING: usize = 2 * KEEP;
+
 fn put(built_hash: B256, entry: Entry) {
     let (store, advanced) = store();
     let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
     store.retain(|(hash, _)| *hash != built_hash);
-    while store.len() >= KEEP {
-        store.pop_front();
-    }
+    make_room(&mut store);
     store.push_back((built_hash, entry));
     advanced.notify_all();
+}
+
+/// Frees a slot for one more build. A finished build goes first, oldest
+/// first; a build still finishing behind its seal is evicted only past
+/// [`KEEP_FINISHING`]. Its advances are dropped once it has left the store
+/// ([`advance`]), so evicting it loses the block for its own import
+/// ("the execution layer no longer holds own block"). loop320 FASb: with the
+/// fields published at the seal three own builds were finishing at once at
+/// the tenure handover, a given-up build ahead on the old parent had been
+/// filed finished beside them, and the oldest finishing build was evicted
+/// for the newest. Keeping a finishing entry costs nothing its finish does
+/// not hold anyway.
+fn make_room(store: &mut VecDeque<(B256, Entry)>) {
+    while store.len() >= KEEP {
+        if let Some(at) = store.iter().position(|(_, entry)| entry.stage == Stage::Complete) {
+            store.remove(at);
+        } else if store.len() >= KEEP_FINISHING {
+            store.pop_front();
+        } else {
+            break;
+        }
+    }
 }
 
 /// Remembers a finished build under the hash the builder gave it.
@@ -502,8 +526,13 @@ mod tests {
     use reth_execution_types::BlockExecutionOutput;
     use std::time::{Duration, Instant};
 
+    /// Serialises the store's tests and starts each on an empty store: a
+    /// build a test left sealed and never finished would otherwise hold a
+    /// slot for the next test (`make_room` keeps finishing builds).
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        STORE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+        let guard = STORE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        store().0.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        guard
     }
 
     fn header(tag: u8, number: u64) -> Header {
@@ -660,6 +689,57 @@ mod tests {
         assert!(waited < WAIT, "released by the failure, not the deadline: {waited:?}");
         assert_eq!(stage_of(hash), None);
         assert!(wait_for_state(hash).is_none());
+    }
+
+    /// loop320 FASb, node 1 at the tenure handover: own blocks 1024 and 1025
+    /// sealed, a given-up build ahead on the old parent filed finished, 1024
+    /// completed and taken by its own import, then 1026 and 1027 sealed while
+    /// 1025 was still finishing. The FIFO bound evicted 1025, its completion
+    /// was dropped, and its own import found nothing.
+    #[test]
+    fn a_build_still_finishing_is_not_evicted_for_a_newer_one() {
+        let _guard = lock();
+        let own: Vec<Header> = (0..4u8).map(|i| header(0x90 + i * 4, 1024 + u64::from(i))).collect();
+        let hash = |h: &Header| built(h).block.hash();
+        remember_pending(hash(&own[0]), built(&own[0]).block);
+        remember_pending(hash(&own[1]), built(&own[1]).block);
+        let stale = header(0xB0, 1021);
+        remember(hash(&stale), built(&stale));
+        complete(hash(&own[0]), built(&own[0]));
+        take(own[0].parent_hash, own[0].number, own[0].state_root, own[0].receipts_root, own[0].gas_used, None)
+            .expect("1024 taken by its own import");
+        remember_pending(hash(&own[2]), built(&own[2]).block);
+        remember_pending(hash(&own[3]), built(&own[3]).block);
+
+        assert_eq!(stage_of(hash(&own[1])), Some(Stage::Sealed), "1025 is still finishing and stays");
+        assert_eq!(stage_of(hash(&stale)), None, "the finished stale build made the room");
+        complete(hash(&own[1]), built(&own[1]));
+        assert_eq!(find_by(&own[1]).map(|(found, _)| found), Some(hash(&own[1])), "its own import finds it");
+        for h in &own[2..] {
+            assert_eq!(stage_of(hash(h)), Some(Stage::Sealed));
+            fail(hash(h));
+        }
+        fail(hash(&own[1]));
+    }
+
+    #[test]
+    fn finishing_builds_are_bounded_too() {
+        let _guard = lock();
+        let heads: Vec<Header> = (0..=KEEP_FINISHING as u8).map(|i| header(0xC0 + i * 4, 1100 + u64::from(i))).collect();
+        let hashes: Vec<B256> = heads
+            .iter()
+            .map(|h| {
+                let block = built(h).block;
+                let hash = block.hash();
+                remember_pending(hash, block);
+                hash
+            })
+            .collect();
+        assert_eq!(stage_of(hashes[0]), None, "past the hard bound the oldest goes");
+        for hash in &hashes[1..] {
+            assert_eq!(stage_of(*hash), Some(Stage::Sealed));
+            fail(*hash);
+        }
     }
 
     #[test]

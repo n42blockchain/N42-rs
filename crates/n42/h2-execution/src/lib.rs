@@ -20,6 +20,7 @@ pub mod el;
 pub mod execution_path;
 pub mod mock;
 pub mod raw_engine;
+pub mod settlement;
 
 pub use driver::{
     body_once, commit_fcu_async, compact_body, deferred_in_flight, parse_in_flight, take_compact, vote_before_slot, BodyDecoder,
@@ -32,3 +33,6 @@ pub use el::{
 };
 pub use execution_path::{ExecutionPath, ExecutionScheduling, ExecutionWorkload};
 pub use mock::{ElCall, MockBehaviour, MockExecutionLayer};
+pub use settlement::{
+    parse_settlement_tags, settlement_tags, PersistedHeight, PersistedSource, SettlementTags, Tag, SETTLEMENT_TAGS_ENV,
+};

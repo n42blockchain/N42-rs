@@ -672,6 +672,13 @@ tags at genesis; a restarted node sends zero tags until its first commit, so the
 from disk are never moved back. `payload_serve`'s head move for a re-proposed sibling sends zero tags
 too. Range sync (`import_pulled`) moves neither tag.
 
+First fleet leg (loop326 SPLIT): the followers were clean (safe at tip-1, finalized 6-8 behind), but
+the leader's own blocks under the compact take answer (`N42_TAKE_COMPACT=1`) come back elided and
+were never cached, so they had no lineage: node 0's commits moved no tag for its whole tenure (views
+1-1023, ~90 s) and its RPC answered genesis for both `safe` and `finalized` (the floor, sent
+explicitly), then finalized lagged one commit past the handover while the walk crossed its own
+blocks. Every own build now records its lineage whether or not its payload is cached.
+
 What the lag does in reth v2.7.0 (read, `engine/tree/src/tree/mod.rs`): the in-memory trim
 (`remove_until`) clamps finalized to the persisted block anyway, so with finalized ~= persisted
 nothing is held longer; the changeset cache evicts below min(finalized, persisted - 64), unchanged

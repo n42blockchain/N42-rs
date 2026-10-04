@@ -97,6 +97,27 @@ pub mod request {
     /// *built* header in it; the caller has the sealed one), or an error
     /// (`unknown build`) on which the caller asks for the block by hash.
     pub const OWN_BODY: u8 = 8;
+    /// No length, nothing else: a prefix to the [`FOREIGN_BODY`] or
+    /// [`COMPACT_BODY`] request that follows it on the same connection
+    /// (`N42_VOTE_BEFORE_SLOT`). That block is assembled and checked as
+    /// always, but its execution is *held*: after the
+    /// [`super::reply::CHECKED`] frame the execution layer reads one
+    /// [`super::release`] byte from the caller before it executes the block
+    /// ([`super::release::EXECUTE`]) or drops it ([`super::release::DROP`],
+    /// answered with [`super::reply::ERROR`]). The byte is sent exactly when
+    /// the CHECKED frame was received, so a block whose check fails is
+    /// answered as always and nothing more is read. Between the validator and
+    /// its own execution layer only; nothing on the peer wire changes.
+    pub const HOLD_EXECUTION: u8 = 9;
+}
+
+/// The byte a caller sends for a held block ([`request::HOLD_EXECUTION`])
+/// once it has received the block's CHECKED frame.
+pub mod release {
+    /// The block has an import slot: execute it.
+    pub const EXECUTE: u8 = 1;
+    /// The block will never be canonical: drop it unexecuted.
+    pub const DROP: u8 = 0;
 }
 
 /// Reply kinds on the channel.

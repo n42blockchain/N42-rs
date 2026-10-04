@@ -22,8 +22,9 @@ pub mod mock;
 pub mod raw_engine;
 
 pub use driver::{
-    body_once, commit_fcu_async, compact_body, take_compact, BodyDecoder, BuildTiming, CommitReport, DriverAction, ExecutionDriver,
-    ImportReport, ImportVerdict,
+    body_once, commit_fcu_async, compact_body, deferred_in_flight, parse_in_flight, take_compact, vote_before_slot, BodyDecoder,
+    BuildTiming, CommitReport, DriverAction, ExecutionDriver, ImportReport, ImportVerdict, DEFERRED_IN_FLIGHT,
+    DEFERRED_IN_FLIGHT_MAX, FOLLOWER_LAG_CAP, HELD_IMPORT_DROPPED,
 };
 pub use el::{
     AnswerStamps, BodyOutcome, BuildStart, BuildTrigger, ChainAhead, ChainBlock, ChainSealer, BuiltBlock, ElError, ExecutionLayer,

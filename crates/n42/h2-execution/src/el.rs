@@ -508,6 +508,39 @@ pub trait ExecutionLayer: Send + Sync + 'static {
         BodyOutcome::NotThisWay
     }
 
+    /// Whether this execution layer can take a body with its execution held
+    /// ([`Self::new_payload_body_held`]) -- assemble and check it now,
+    /// execute it only when released. The driver votes ahead of an import
+    /// slot (`N42_VOTE_BEFORE_SLOT`) only where it can. The default cannot.
+    fn holds_execution(&self) -> bool {
+        false
+    }
+
+    /// [`Self::new_payload_body_checked`] with the block's *execution* held:
+    /// the execution layer assembles the body and checks it as always, and
+    /// `checked` releases the vote, but nothing is executed until `release`
+    /// says `true`. `false` (or a dropped sender) drops the block: nothing
+    /// is executed, the execution layer frees what it assembled, and the
+    /// answer is an error. A block whose check fails is answered as always,
+    /// and `release` is then never read.
+    ///
+    /// The default executes nothing before the release either: it waits for
+    /// it and only then makes the ordinary call -- which also means the vote
+    /// waits for it. [`Self::holds_execution`] is `false` there, so the driver
+    /// never takes this road with it.
+    async fn new_payload_body_held(
+        &self,
+        path: ExecutionPath,
+        body: &ForeignBody,
+        checked: tokio::sync::oneshot::Sender<PayloadStatus>,
+        release: tokio::sync::oneshot::Receiver<bool>,
+    ) -> BodyOutcome {
+        if !release.await.unwrap_or(false) {
+            return BodyOutcome::Answered(Err(ElError::new(crate::driver::HELD_IMPORT_DROPPED)));
+        }
+        self.new_payload_body_checked(path, body, checked).await
+    }
+
     /// Engine-API `forkchoiceUpdated` without attributes — the finalise and
     /// import path.
     async fn fork_choice_updated(

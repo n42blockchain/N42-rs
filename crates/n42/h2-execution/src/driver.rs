@@ -109,7 +109,111 @@ impl Drop for ReportGuard {
 /// and the one being checked behind it. The rest queue -- the pipeline is
 /// one block deep by design, and every block admitted is a payload, a
 /// sender recovery and an executed state held at once.
-const DEFERRED_IN_FLIGHT: usize = 2;
+///
+/// The default of [`deferred_in_flight`] (`N42_DEFERRED_IN_FLIGHT`).
+pub const DEFERRED_IN_FLIGHT: usize = 2;
+
+/// The largest in-flight cap [`deferred_in_flight`] accepts.
+///
+/// A slot is freed only when the block has landed in the engine, so with
+/// `C` imports in flight the next block's check reads its parent's
+/// post-state through up to `C` unlanded ancestors (`C - 1` when it takes
+/// a slot itself, `C` when it votes before one, `N42_VOTE_BEFORE_SLOT`).
+/// The execution layer stacks at most four published outputs over the
+/// nearest landed ancestor and keeps only the last four
+/// (`PARENT_OUTPUTS_KEPT` in `bin/n42/src/follower_import.rs`); past that
+/// the check declines the stack and waits for the engine -- the stall the
+/// cap exists to avoid. Four is therefore the arithmetic limit with no
+/// slack (one published sibling would push an ancestor's output out);
+/// three keeps one.
+pub const DEFERRED_IN_FLIGHT_MAX: usize = 3;
+
+/// Follower lag under `N42_VOTE_BEFORE_SLOT`: imports in flight plus blocks
+/// voted for but not yet admitted to a slot (docs/PHASE_D_DEFERRED_EXECUTION.md
+/// 17.4, P3). A block arriving past it waits for a slot with its vote, as
+/// every queued block does without the switch -- the backpressure.
+pub const FOLLOWER_LAG_CAP: usize = 4;
+
+/// `N42_DEFERRED_IN_FLIGHT`, read once: how many deferred follower imports
+/// run at once (see [`DEFERRED_IN_FLIGHT`]). Valid `1..=`
+/// [`DEFERRED_IN_FLIGHT_MAX`]; anything else is refused loudly and the
+/// default kept.
+pub fn deferred_in_flight() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| match std::env::var("N42_DEFERRED_IN_FLIGHT") {
+        Err(_) => DEFERRED_IN_FLIGHT,
+        Ok(raw) => match parse_in_flight(&raw) {
+            Ok(cap) => cap,
+            Err(err) => {
+                warn!(target: "n42.h2.el", %err, default = DEFERRED_IN_FLIGHT, "N42_DEFERRED_IN_FLIGHT refused");
+                DEFERRED_IN_FLIGHT
+            }
+        },
+    })
+}
+
+/// An in-flight cap, checked against `1..=`[`DEFERRED_IN_FLIGHT_MAX`].
+pub fn parse_in_flight(raw: &str) -> Result<usize, String> {
+    let cap: usize = raw.trim().parse().map_err(|_| format!("{raw:?} is not a count"))?;
+    if (1..=DEFERRED_IN_FLIGHT_MAX).contains(&cap) {
+        Ok(cap)
+    } else {
+        Err(format!("{cap} is outside 1..={DEFERRED_IN_FLIGHT_MAX}"))
+    }
+}
+
+/// `N42_VOTE_BEFORE_SLOT`, read once (off by default): a deferred block
+/// that arrives while every import slot is taken runs its vote road at once
+/// -- the body's assembly, the check, the vote -- and only its execution and
+/// landing wait for a slot, in the order they always did. See
+/// [`ExecutionDriver::set_vote_before_slot`].
+pub fn vote_before_slot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_VOTE_BEFORE_SLOT").is_ok_and(|v| v == "1"))
+}
+
+/// A block voted for ahead of its import slot (`N42_VOTE_BEFORE_SLOT`): its
+/// import task is running, the execution layer has (or is about to have)
+/// assembled and checked it, and its execution waits for `release`.
+#[derive(Debug)]
+struct HeldImport {
+    /// The block number, for the prerequisite rule and the drop rule.
+    number: u64,
+    /// `true` admits the execution to a slot, `false` drops it.
+    release: Option<tokio::sync::oneshot::Sender<bool>>,
+    /// When the block was held, for the slot wait.
+    since: std::time::Instant,
+    /// Where the slot wait goes once the block is released, for the
+    /// import's line.
+    slot_wait_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// What a deferred import's line says about its slot.
+#[derive(Debug, Clone)]
+struct SlotNote {
+    /// The vote ran before an import slot was free.
+    voted_before_slot: bool,
+    /// Blocks voted for and waiting for a slot when this one arrived.
+    held_at_arrival: usize,
+    /// How long the import waited for its slot, set when it got one.
+    slot_wait_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SlotNote {
+    fn new(voted_before_slot: bool, held_at_arrival: usize, slot_wait: Option<std::time::Duration>) -> Self {
+        Self {
+            voted_before_slot,
+            held_at_arrival,
+            slot_wait_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                slot_wait.map_or(0, |wait| wait.as_millis() as u64),
+            )),
+        }
+    }
+}
+
+/// What the execution layer is told when a held import is dropped, and what
+/// its answer then carries.
+pub const HELD_IMPORT_DROPPED: &str = "the held import was dropped before its execution";
 
 /// A commit whose forkchoice has not been sent yet
 /// (`N42_COMMIT_FCU_ASYNC=1`). One forkchoice is in flight at a time and
@@ -544,7 +648,26 @@ pub struct ExecutionDriver<E> {
     /// The receiving end, until the loop takes it.
     foreign_imports_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ImportReport>>,
     /// Blocks waiting for the import in flight to finish (spawned mode).
+    /// Under `N42_VOTE_BEFORE_SLOT` it also holds, in the same order, the
+    /// blocks voted for ahead of their slot ([`Self::held`]).
     import_queue: std::collections::VecDeque<B256>,
+    /// When each queued block was queued and how many blocks were held
+    /// then, for its import's line.
+    queued_at: HashMap<B256, (std::time::Instant, usize)>,
+    /// Deferred imports in flight at once ([`deferred_in_flight`]).
+    in_flight_cap: usize,
+    /// `N42_VOTE_BEFORE_SLOT` ([`vote_before_slot`]).
+    vote_before_slot: bool,
+    /// Blocks voted for ahead of their import slot, by hash; each is in
+    /// `import_queue` too, where its turn is.
+    held: HashMap<B256, HeldImport>,
+    /// Held blocks dropped while their import task still runs: its reports
+    /// are swallowed when they arrive.
+    dropped_held: std::collections::HashSet<B256>,
+    /// Blocks dropped because a sibling was committed at their height (and
+    /// their queued descendants), newest last, bounded: a late child of one
+    /// is refused at once instead of waiting out its parent.
+    dead: std::collections::VecDeque<B256>,
     /// Payloads seen but not yet executed, keyed by block hash. Populated from
     /// proposals, direct pushes, and our own builds.
     payloads: HashMap<B256, ExecutionData>,
@@ -763,6 +886,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             foreign_imports: foreign_tx,
             foreign_imports_rx: Some(foreign_rx),
             import_queue: std::collections::VecDeque::new(),
+            queued_at: HashMap::new(),
+            in_flight_cap: deferred_in_flight(),
+            vote_before_slot: vote_before_slot(),
+            held: HashMap::new(),
+            dropped_held: std::collections::HashSet::new(),
+            dead: std::collections::VecDeque::new(),
             payloads: HashMap::new(),
             bodies: HashMap::new(),
             body_decoder: None,
@@ -1570,6 +1699,202 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.deferred_execution_time = at;
     }
 
+    /// The deferred in-flight cap (see [`deferred_in_flight`], whose value is
+    /// the default): how a test picks it without the process environment.
+    pub fn set_deferred_in_flight(&mut self, cap: usize) -> Result<(), String> {
+        self.in_flight_cap = parse_in_flight(&cap.to_string())?;
+        Ok(())
+    }
+
+    /// `N42_VOTE_BEFORE_SLOT` (see [`vote_before_slot`], whose value is the
+    /// default). On: a deferred block arriving with every import slot taken
+    /// is handed to the execution layer at once with its execution held
+    /// ([`ExecutionLayer::new_payload_body_held`]), so the body is assembled
+    /// and checked and the vote goes out now; the execution is released into
+    /// a slot in queue order, exactly where the block would have started
+    /// without the switch. Only when the execution layer can hold an
+    /// execution ([`ExecutionLayer::holds_execution`]), the block came as a
+    /// body, no block one below it is still queued or held here (its fields,
+    /// which the check reads, would not exist yet), and fewer than
+    /// [`FOLLOWER_LAG_CAP`] imports are in flight or held. Otherwise the
+    /// block waits for its slot, vote and all, as without the switch.
+    pub fn set_vote_before_slot(&mut self, on: bool) {
+        self.vote_before_slot = on;
+    }
+
+    /// Blocks voted for ahead of their import slot and not yet admitted.
+    pub fn voted_ahead(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Whether `block_hash` was voted for ahead of its slot and still waits
+    /// for one.
+    pub fn is_voted_ahead(&self, block_hash: &B256) -> bool {
+        self.held.contains_key(block_hash)
+    }
+
+    /// How many blocks may be held at once: the lag cap less the slots.
+    fn held_cap(&self) -> usize {
+        FOLLOWER_LAG_CAP.saturating_sub(self.in_flight_cap)
+    }
+
+    /// The block number of a block this driver holds a payload or a body for.
+    fn number_of(&self, block_hash: &B256) -> Option<u64> {
+        if let Some(held) = self.held.get(block_hash) {
+            return Some(held.number);
+        }
+        self.payloads
+            .get(block_hash)
+            .map(|payload| payload.payload.block_number())
+            .or_else(|| self.bodies.get(block_hash).map(|body| body.number))
+    }
+
+    /// The parent of a block this driver holds a payload or a body for: the
+    /// payload says it, a body's header is read for it (the header alone,
+    /// not the transactions).
+    fn parent_of(&self, block_hash: &B256) -> Option<B256> {
+        if let Some(payload) = self.payloads.get(block_hash) {
+            return Some(payload.payload.parent_hash());
+        }
+        let body = self.bodies.get(block_hash)?;
+        let decoded = if body.compact {
+            n42_h2_consensus::decode_compact_body_header(&body.rlp, body.profile)
+        } else {
+            n42_h2_consensus::decode_block_body_header(&body.rlp, body.profile)
+        };
+        decoded.ok().map(|(_, header)| header.parent_hash)
+    }
+
+    /// Whether `block_hash` may vote before its slot now (see
+    /// [`Self::set_vote_before_slot`]); the body to hand over if so.
+    fn may_vote_before_slot(&self, block_hash: &B256) -> Option<ForeignBody> {
+        if !self.vote_before_slot || !self.el.holds_execution() {
+            return None;
+        }
+        if self.held.len() >= self.held_cap() || self.executing.len() + self.held.len() >= FOLLOWER_LAG_CAP {
+            return None;
+        }
+        let body = self.bodies.get(block_hash)?.clone();
+        // The check reads the parent's execution fields. A parent still
+        // queued here -- held or not -- has not executed, so the block waits
+        // for its slot exactly as it would without the switch. Read by
+        // number, not by parent hash: a sibling of the parent queued here
+        // holds the block back too, which errs on the side of today's road.
+        let below = body.number.checked_sub(1)?;
+        for queued in &self.import_queue {
+            if queued == block_hash {
+                continue;
+            }
+            match self.number_of(queued) {
+                Some(number) if number != below => {}
+                _ => return None,
+            }
+        }
+        Some(body)
+    }
+
+    /// Hands `block_hash` to the execution layer with its execution held.
+    fn hold_import(&mut self, block_hash: B256, body: ForeignBody, held_at_arrival: usize) {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let note = SlotNote::new(true, held_at_arrival, None);
+        self.held.insert(
+            block_hash,
+            HeldImport {
+                number: body.number,
+                release: Some(release_tx),
+                since: std::time::Instant::now(),
+                slot_wait_ms: std::sync::Arc::clone(&note.slot_wait_ms),
+            },
+        );
+        if !self.import_queue.contains(&block_hash) {
+            self.import_queue.push_back(block_hash);
+        }
+        self.queued_at.remove(&block_hash);
+        self.spawn_deferred_task(block_hash, Some(body), None, Some(release_rx), note);
+    }
+
+    /// Admits a held block's execution to a free slot.
+    fn release_held(&mut self, block_hash: B256) {
+        let Some(mut held) = self.held.remove(&block_hash) else { return };
+        held.slot_wait_ms
+            .store(held.since.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.executing.insert(block_hash);
+        if let Some(release) = held.release.take() {
+            // A task that already ended has its report on the channel; it
+            // frees this slot when it is read.
+            let _ = release.send(true);
+        }
+    }
+
+    /// Plain queued blocks whose prerequisites have since arrived (their
+    /// parent took a slot) vote now, in queue order.
+    fn promote_queued(&mut self) {
+        if !self.vote_before_slot {
+            return;
+        }
+        let queued: Vec<B256> = self.import_queue.iter().filter(|h| !self.held.contains_key(*h)).copied().collect();
+        for block_hash in queued {
+            if self.executing.len() < self.in_flight_cap {
+                // A free slot takes the queue's front on its own road.
+                break;
+            }
+            if let Some(body) = self.may_vote_before_slot(&block_hash) {
+                let held_at_arrival = self.queued_at.get(&block_hash).map_or(self.held.len(), |(_, held)| *held);
+                self.hold_import(block_hash, body, held_at_arrival);
+            }
+        }
+    }
+
+    /// Drops what a commit has made dead: a held block at the committed
+    /// block's height that is not it can never be canonical (a commit is
+    /// final), and neither can anything queued here that descends from it.
+    /// A held block's execution layer is told to drop it -- it frees the
+    /// assembled block and its senders without executing -- and the
+    /// task's report is swallowed. Under `N42_VOTE_BEFORE_SLOT` only; without
+    /// it a queued sibling is imported as a side block as before.
+    fn drop_losers_of(&mut self, committed: B256) {
+        if !self.vote_before_slot || self.held.is_empty() {
+            return;
+        }
+        let Some(height) = self.number_of(&committed) else { return };
+        let mut dead: Vec<B256> =
+            self.held.iter().filter(|(hash, held)| held.number == height && **hash != committed).map(|(h, _)| *h).collect();
+        if dead.is_empty() {
+            return;
+        }
+        // Their queued descendants, transitively, by the parent each names.
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for queued in self.import_queue.clone() {
+                if dead.contains(&queued) {
+                    continue;
+                }
+                if self.parent_of(&queued).is_some_and(|parent| dead.contains(&parent)) {
+                    dead.push(queued);
+                    grew = true;
+                }
+            }
+        }
+        for block_hash in dead {
+            if let Some(mut held) = self.held.remove(&block_hash) {
+                if let Some(release) = held.release.take() {
+                    let _ = release.send(false);
+                }
+                self.dropped_held.insert(block_hash);
+            }
+            info!(target: "n42.h2.el", block = ?block_hash, committed = ?committed, height, "a block voted ahead of its slot lost its height to a commit; dropped");
+            self.import_queue.retain(|queued| queued != &block_hash);
+            self.queued_at.remove(&block_hash);
+            self.pending_commits.remove(&block_hash);
+            self.forget_payload(block_hash);
+            self.dead.push_back(block_hash);
+            while self.dead.len() > 64 {
+                self.dead.pop_front();
+            }
+        }
+    }
+
     /// Whether `block_hash`'s import is in flight: a commit for it is not
     /// dropped as "not imported" but deferred to the import's success.
     pub fn is_importing(&self, block_hash: &B256) -> bool {
@@ -1584,6 +1909,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// node that fell behind stayed behind: by then most Decides came before
     /// the import started (loop160 C10 node5: 187 of 318; V10 node1: 96).
     pub fn commit_when_imported(&mut self, block_hash: B256) {
+        self.drop_losers_of(block_hash);
         self.remember_commit_ahead(block_hash);
     }
 
@@ -1600,9 +1926,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         }
     }
 
-    /// The blocks whose imports are in flight.
+    /// The blocks whose imports are in flight, and those voted for ahead of
+    /// their slot (`N42_VOTE_BEFORE_SLOT`), whose import tasks run too.
     pub fn importing(&self) -> impl Iterator<Item = &B256> {
-        self.executing.iter()
+        self.executing.iter().chain(self.held.keys())
     }
 
     /// Whether a block stamped `timestamp` is under deferred execution.
@@ -1615,24 +1942,65 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// parent's result as soon as the parent is in, and executes it after --
     /// and reports the check and then the import on the channel.
     fn spawn_execute_deferred(&mut self, block_hash: B256) -> DriverAction {
-        if self.executing.contains(&block_hash) {
+        if self.executing.contains(&block_hash) || self.held.contains_key(&block_hash) {
             return DriverAction::Ignored;
         }
-        if self.executing.len() >= DEFERRED_IN_FLIGHT {
+        if self.vote_before_slot
+            && !self.dead.is_empty()
+            && self.parent_of(&block_hash).is_some_and(|parent| self.dead.contains(&parent))
+        {
+            // Its parent lost its height to a commit: it can never be
+            // canonical, and its import would only wait out a parent that
+            // will not come.
+            self.import_queue.retain(|queued| queued != &block_hash);
+            self.queued_at.remove(&block_hash);
+            self.forget_payload(block_hash);
+            return DriverAction::Rejected {
+                block_hash,
+                reason: "its parent lost its height to a committed block".to_owned(),
+            };
+        }
+        if self.executing.len() >= self.in_flight_cap {
             if !self.import_queue.contains(&block_hash) {
+                let held_at_arrival = self.held.len();
+                if let Some(body) = self.may_vote_before_slot(&block_hash) {
+                    self.hold_import(block_hash, body, held_at_arrival);
+                    return DriverAction::Ignored;
+                }
                 self.import_queue.push_back(block_hash);
+                self.queued_at.insert(block_hash, (std::time::Instant::now(), held_at_arrival));
             }
             return DriverAction::Ignored;
         }
         // The body when this node kept one (`N42_BODY_ONCE=1`), the payload
         // otherwise; a body's payload is only made if the execution layer
         // refuses the body.
+        let note = match self.queued_at.remove(&block_hash) {
+            Some((since, held_at_arrival)) => SlotNote::new(false, held_at_arrival, Some(since.elapsed())),
+            None => SlotNote::new(false, self.held.len(), None),
+        };
         let body = self.bodies.get(&block_hash).cloned();
         let payload = self.payloads.get(&block_hash).cloned();
         if body.is_none() && payload.is_none() {
             return DriverAction::PayloadMissing { block_hash };
         }
         self.executing.insert(block_hash);
+        self.spawn_deferred_task(block_hash, body, payload, None, note);
+        DriverAction::Ignored
+    }
+
+    /// The deferred import's task: the body (or the payload), the check
+    /// reported ahead of the import, then the verdict. With `release` the
+    /// execution layer holds the execution until the driver says (see
+    /// [`Self::set_vote_before_slot`]); such a block always goes as a body.
+    fn spawn_deferred_task(
+        &mut self,
+        block_hash: B256,
+        body: Option<ForeignBody>,
+        payload: Option<ExecutionData>,
+        release: Option<tokio::sync::oneshot::Receiver<bool>>,
+        note: SlotNote,
+    ) {
         let el = std::sync::Arc::clone(&self.el);
         let report = self.foreign_imports.clone();
         let guard = ReportGuard { block_hash, report: Some(report.clone()) };
@@ -1649,9 +2017,17 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             // after the check comes back as `Some(Err(..))` and is not
             // retried.
             let mut answered = None;
+            let held = release.is_some();
             if let Some(body) = &body {
                 let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
-                let call = el.new_payload_body_checked(ExecutionPath::LIVE_SEQUENTIAL, body, checked_tx);
+                let call = async {
+                    match release {
+                        Some(release) => {
+                            el.new_payload_body_held(ExecutionPath::LIVE_SEQUENTIAL, body, checked_tx, release).await
+                        }
+                        None => el.new_payload_body_checked(ExecutionPath::LIVE_SEQUENTIAL, body, checked_tx).await,
+                    }
+                };
                 tokio::pin!(call);
                 let outcome = tokio::select! {
                     checked = checked_rx => {
@@ -1662,6 +2038,15 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 };
                 match outcome {
                     crate::BodyOutcome::Answered(answer) => answered = Some(answer),
+                    // A held block has no payload road: its release went to
+                    // the call that refused, and the payload road would run
+                    // the execution outside the slot. Asked for again, it
+                    // takes the ordinary road when its turn comes.
+                    crate::BodyOutcome::NotThisWay if held => {
+                        debug!(target: "n42.h2.el", block = ?block_hash, "the execution layer would not hold the body; asking again");
+                        guard.done(ImportVerdict::NotYet);
+                        return;
+                    }
                     crate::BodyOutcome::NotThisWay => {}
                     // The block is this block; it is only incomplete here.
                     // The loop fetches what is named and hands the body back.
@@ -1736,11 +2121,25 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 }
             };
             if size.worth_logging() {
-                info!(target: "n42.h2.el", block = ?block_hash, txs = size.txs, bytes = size.bytes, import_ms = started.elapsed().as_millis() as u64, "imported a block");
+                info!(
+                    target: "n42.h2.el",
+                    block = ?block_hash,
+                    txs = size.txs,
+                    bytes = size.bytes,
+                    import_ms = started.elapsed().as_millis() as u64,
+                    // `N42_VOTE_BEFORE_SLOT`: whether the vote went out before
+                    // the block had an import slot, how long the import then
+                    // waited for one (for a block queued without voting, its
+                    // time in the queue), and how many blocks were voted for
+                    // and waiting for a slot when it arrived.
+                    vote_before_slot = note.voted_before_slot,
+                    slot_wait_ms = note.slot_wait_ms.load(std::sync::atomic::Ordering::Relaxed),
+                    held_at_arrival = note.held_at_arrival,
+                    "imported a block"
+                );
             }
             guard.done(ImportVerdict::of(outcome));
         });
-        DriverAction::Ignored
     }
 
     /// Starts `block_hash`'s import on a task, or queues it behind the one in
@@ -1785,11 +2184,27 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// unimported for good).
     pub async fn finish_execute(&mut self, report: ImportReport) -> Vec<DriverAction> {
         let (block_hash, verdict) = match report {
+            // A block dropped while held: its vote is moot, its height was
+            // committed to a sibling.
+            ImportReport::Checked(block_hash) if self.dropped_held.contains(&block_hash) => return Vec::new(),
             ImportReport::Checked(block_hash) => {
                 return vec![DriverAction::Consensus(Box::new(ConsensusEvent::BlockChecked(block_hash)))];
             }
+            ImportReport::Done(block_hash, _) if self.dropped_held.remove(&block_hash) => {
+                // It held no slot, and what it held is freed with the task.
+                self.promote_queued();
+                return Vec::new();
+            }
             ImportReport::Done(block_hash, verdict) => (block_hash, verdict),
         };
+        // A held block whose task ended before its release -- its check
+        // failed, its body did not assemble, or the execution layer would
+        // not hold it: it took no slot, so none is freed, and its turn in
+        // the queue is gone with it.
+        let ended_held = self.held.remove(&block_hash).is_some();
+        if ended_held {
+            self.import_queue.retain(|queued| queued != &block_hash);
+        }
         self.executing.remove(&block_hash);
         let mut actions = Vec::with_capacity(2);
         actions.push(match verdict {
@@ -1822,14 +2237,37 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 DriverAction::Rejected { block_hash, reason }
             }
         });
-        // The next block queued behind the imports in flight, on whichever
-        // path its timestamp puts it.
-        if let Some(next) = self.import_queue.pop_front() {
-            match self.execute(next).await {
-                DriverAction::Ignored => {}
-                other => actions.push(other),
+        if !self.vote_before_slot {
+            // The next block queued behind the imports in flight, on whichever
+            // path its timestamp puts it.
+            if let Some(next) = self.import_queue.pop_front() {
+                match self.execute(next).await {
+                    DriverAction::Ignored => {}
+                    other => actions.push(other),
+                }
+            }
+            return actions;
+        }
+        // `N42_VOTE_BEFORE_SLOT`: the free slots go to the queue's front in
+        // order -- a held block's execution is released, any other block
+        // starts as it would have -- and then the queued blocks whose parent
+        // now has a slot vote.
+        if !ended_held {
+            let mut budget = self.import_queue.len();
+            while self.executing.len() < self.in_flight_cap && budget > 0 {
+                budget -= 1;
+                let Some(next) = self.import_queue.pop_front() else { break };
+                if self.held.contains_key(&next) {
+                    self.release_held(next);
+                    continue;
+                }
+                match self.execute(next).await {
+                    DriverAction::Ignored => {}
+                    other => actions.push(other),
+                }
             }
         }
+        self.promote_queued();
         actions
     }
 
@@ -2007,6 +2445,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     }
 
     async fn commit(&mut self, block_hash: B256) -> DriverAction {
+        self.drop_losers_of(block_hash);
         if self.is_importing(&block_hash) {
             // Still importing, or queued behind the imports in flight: the
             // forkchoice follows the import's success.

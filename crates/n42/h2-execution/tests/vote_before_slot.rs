@@ -25,6 +25,15 @@ fn execute(hash: B256) -> EngineOutput {
     EngineOutput::ExecuteBlock(hash)
 }
 
+fn committed(hash: B256) -> EngineOutput {
+    EngineOutput::BlockCommitted {
+        view: 1,
+        block_hash: hash,
+        commit_qc: n42_h2_primitives::QuorumCertificate::genesis(),
+        validator_changes: None,
+    }
+}
+
 fn body_for(hash: B256, number: u64) -> ForeignBody {
     ForeignBody {
         block_hash: hash,
@@ -353,4 +362,51 @@ async fn imports_run_in_order_and_each_exactly_once() {
     assert!(calls.iter().any(|c| matches!(c, ElCall::BodyReleased(_))), "some voted ahead");
     assert_eq!(driver.importing().count(), 0);
     assert_eq!(driver.voted_ahead(), 0);
+}
+
+/// A block voted ahead whose height is then committed to a sibling is
+/// dropped: its execution is never released, it leaves the queue and the
+/// cache, its import's answer is swallowed, and a late child of it is refused
+/// at once.
+#[tokio::test]
+async fn a_voted_block_that_lost_its_height_is_dropped_cleanly() {
+    let blocks = chain(2);
+    let (el, gate) = gated();
+    let (mut driver, mut rx) = driver(&el, true);
+    let mut seen = Seen::default();
+    for block in &blocks {
+        arrive(&mut driver, block).await;
+    }
+    let loser = MockExecutionLayer::built_block_on(3, blocks[1].hash);
+    let mut winner = loser.clone();
+    winner.hash = B256::repeat_byte(0x3b);
+    winner.execution_data = MockExecutionLayer::payload_for(winner.hash, 3);
+    arrive(&mut driver, &loser).await;
+    arrive(&mut driver, &winner).await;
+    take_checks(&mut driver, &mut rx, 4, &mut seen).await;
+    assert_eq!(driver.voted_ahead(), 2, "both siblings voted ahead");
+
+    // The view change: the sibling is committed at height three.
+    driver.handle_output(&committed(winner.hash)).await;
+    assert!(!driver.is_voted_ahead(&loser.hash));
+    assert!(!driver.is_importing(&loser.hash), "out of the queue");
+    assert!(!driver.has_body(&loser.hash) && !driver.has_payload(&loser.hash), "out of the cache");
+    assert!(driver.is_voted_ahead(&winner.hash), "the winner keeps its turn");
+    // Its task ends with the drop; the answer changes nothing.
+    let report = next_report(&mut rx).await;
+    assert!(matches!(report, ImportReport::Done(hash, _) if hash == loser.hash));
+    assert!(driver.finish_execute(report).await.is_empty(), "swallowed");
+    assert_eq!(count(&el, &ElCall::BodyDropped(loser.hash)), 1);
+    assert_eq!(count(&el, &ElCall::BodyReleased(loser.hash)), 0, "never executed");
+
+    // A child of the loser can never be canonical.
+    let orphan = MockExecutionLayer::built_block_on(4, loser.hash);
+    let action = arrive(&mut driver, &orphan).await;
+    assert_eq!(action.rejection().map(|(hash, _)| hash), Some(orphan.hash));
+    assert!(!driver.is_importing(&orphan.hash));
+
+    land(&mut driver, &mut rx, &gate, 3, &mut seen).await;
+    same(&seen.imported, &[&blocks[0], &blocks[1], &winner]);
+    assert_eq!(driver.finalized(), winner.hash, "the commit that waited ran on the import");
+    assert_eq!(driver.importing().count(), 0);
 }

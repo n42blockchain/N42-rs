@@ -8,6 +8,9 @@ mod database;
 pub use database::*;
 
 mod static_file;
+
+// N42: the `N42_STORAGE_OP_METRICS` switch.
+pub(crate) mod op_metrics;
 pub use static_file::{
     StaticFileAccess, StaticFileJarProvider, StaticFileProvider, StaticFileProviderBuilder,
     StaticFileProviderRW, StaticFileProviderRWRefMut, StaticFileWriteCtx, StaticFileWriter,

@@ -1005,10 +1005,12 @@ impl RocksDBProvider {
         table: &'static str,
         f: impl FnOnce(&Self) -> R,
     ) -> R {
-        let start = self.0.metrics().map(|_| Instant::now());
+        // N42: `N42_STORAGE_OP_METRICS=0` skips the clock and the records.
+        let metrics = self.0.metrics().filter(|_| crate::providers::op_metrics::enabled());
+        let start = metrics.map(|_| Instant::now());
         let res = f(self);
 
-        if let (Some(start), Some(metrics)) = (start, self.0.metrics()) {
+        if let (Some(start), Some(metrics)) = (start, metrics) {
             metrics.record_operation(operation, table, start.elapsed());
         }
 

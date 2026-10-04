@@ -548,15 +548,16 @@ fields appear in the header of N+1.
 | Executed on a node | that node (its engine) | its own result for N: fields recorded (`n42_engine_types::executed_fields`), import line `fields_ready_ms`, `total_ms` | import `total_ms` median 124-155 (10.60, 10.63), tail: p99 446-583, max 1,505 (10.42); inside the node, beside the loop |
 | Execution certified | anyone holding N+1's header | N's fields in N+1's header, and a quorum voted on N+1 (each voter checked them against its own result) | one block after ordering of N: the time of N+1's vote, ~one cycle (0.13-0.14 s, 10.60); never earlier |
 | Persisted | that node | the persistence batch (`--engine.persistence-threshold 8`, `--engine.memory-block-buffer-target 6`, `scripts/fleet7-env.sh`) that holds N | derived, not measured: with threshold 8 and target 6 a block waits 6-8 blocks, about 0.8-1.1 s at a 137 ms cycle. The `node_state.rs` comment says persistence "runs 17-18 blocks back" (~2.4 s); its source run is not named there |
-| "finalized" for an RPC client | that node's EL | `ExecutionDriver::commit` sends head = safe = finalized = the committed hash (`driver.rs`, `commit`), after the import lands (`pending_commits` holds it until then) | `latest` = the node's head (imported); `safe` and `finalized` are the same hash, the last **committed** block, not the last certified or persisted one |
+| Tags for an RPC client | that node's EL | `ExecutionDriver::commit` (`driver.rs`, `commit_forkchoice`; rules in `crates/n42/h2-execution/src/settlement.rs`) | `latest` = the last **committed** block; `safe` = the last **certified** block (the committed block's parent under deferred execution, one block behind); `finalized` = the last certified block at or below this node's **persisted** block. `N42_SETTLEMENT_TAGS=legacy` restores head = safe = finalized = committed |
 
 What a wallet or bridge should wait for: **the state of N certified by a quorum**, i.e. the header of
 N+1 carrying N's fields, with N+1 voted. Under deferred execution that is one block after ordering
 (~0.14 s on the fleet, BD 10.60), and it is the first point at which a quorum has *attested the
-result*, not just the order. The node's `finalized` tag is weaker: it names the committed block, whose
-own state root a quorum has not yet vouched for. A client that reads balances at `finalized` from one
-node trusts that node's execution of N; waiting one block removes that trust. Persistence is a local
-durability fact, not a settlement fact, and no client needs to wait for it.
+result*, not just the order. Since 2026-10-04 the RPC tags say exactly this: `safe` is that block, and
+`finalized` is the newest such block this node has also persisted, so a client reading `finalized`
+the Ethereum way settles on a certified, durable state. (Before, `safe` and `finalized` both named
+the last committed block, whose own state root no quorum had vouched for yet; 17.7 has the switch
+back.)
 
 Data availability is not a separate layer. A validator votes only after it holds the body (the body
 gossip of `crates/n42/h2-net`, `bin/n42/src/payload_serve.rs` for fetch-on-miss), so "ordered" already
@@ -647,3 +648,40 @@ stateless, and the certificate is the header-field check plus the quorum on the 
 the consensus, not a replaceable component. Nor does N42 have SPICE's explicit debt accounting; 17.2
 shows the debts are bounded mostly by timeouts and by one hard cap (the chain slot), not by a stated
 budget. This comparison rests on the SPICE note's summary only; I did not study its protocol in depth.
+
+### 17.7 Settlement tags (implemented, 2026-10-04)
+
+The driver sends every forkchoice with three distinct hashes (`N42_SETTLEMENT_TAGS=split`, the
+default; `legacy` sends head = safe = finalized = the committed block, byte for byte as before):
+
+- **latest** (head): the committed block, as before.
+- **safe**: the newest certified block. A commit of N+1 under deferred execution certifies N (N+1's
+  header carries N's fields and its quorum checked them, 17.1); before the fork a commit certifies
+  its own block, since every vote was import-gated. A commit whose block the driver has never seen
+  (no payload, body or pulled block for it) moves nothing.
+- **finalized**: the newest certified block at or below this node's last persisted block, read by the
+  validator's existing 50 ms persistence poller (`n42Engine_inMemoryBlocks` and, on the same tick,
+  the new `n42Engine_persistedBlock`, `bin/n42/src/engine_ext.rs`). An unknown reading holds it; an
+  execution layer without the method makes it follow `safe`, with one warning.
+
+Both only move forward. A tag that is not provably an ancestor of the forkchoice's head (from the
+number/parent links the driver keeps for the blocks it has seen) goes as the zero hash, which the
+engine reads as "unchanged"; so a build or a pulled block below the tags, or a replayed commit of an
+ancestor, never sends a tag above its head (which reth refuses, -38002). A fresh chain floors both
+tags at genesis; a restarted node sends zero tags until its first commit, so the tags reth restored
+from disk are never moved back. `payload_serve`'s head move for a re-proposed sibling sends zero tags
+too. Range sync (`import_pulled`) moves neither tag.
+
+What the lag does in reth v2.7.0 (read, `engine/tree/src/tree/mod.rs`): the in-memory trim
+(`remove_until`) clamps finalized to the persisted block anyway, so with finalized ~= persisted
+nothing is held longer; the changeset cache evicts below min(finalized, persisted - 64), unchanged
+while finalized is within 64 of persisted; a forkchoice to a canonical ancestor above finalized is a
+no-op rather than "too deep reorg"; backfill targets the finalized hash, which is now always a block
+the node holds, so a far-behind node is caught up by the validator's range sync instead of starting a
+devp2p backfill; the finalized and safe numbers saved to disk are what a restart restores. The QMDB
+hooks (`on_canonical`, `on_persisted`) and the APoS path do not read either tag. Nothing validators
+exchange changes.
+
+Tests: `crates/n42/h2-execution/tests/settlement_tags.rs` (monotonicity, safe one behind the tip,
+finalized capped by persisted and safe, restart, a dropped uncommitted block, async path, pulled
+blocks, legacy forkchoices exactly as before) and the unit tests in `settlement.rs`.

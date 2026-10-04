@@ -129,6 +129,20 @@
   非 QMDB 链始终是上游行为。启动时打印一行 `executed inserts and reth's cross-block execution cache`
   （`mode=skip|update`）。
 
+## HotStuff-2 结算标签（不改任何 fork 的 reth crate）:
+- `N42_SETTLEMENT_TAGS=split|legacy`（默认 `split`；代码在 `crates/n42/h2-execution/src/settlement.rs`，
+  由 `ExecutionDriver` 的每个 forkchoice 使用）：`latest` = 共识已提交的块；`safe` = 执行已认证的块
+  （延迟执行下 N+1 提交即认证 N——N+1 的头携带 N 的执行字段且其法定人数核对过；分叉前提交即认证本块）；
+  `finalized` = 已认证且不高于本节点最后持久化块的块。三者只前进、`finalized` ≤ `safe` ≤ `latest`；
+  不能证明是 head 祖先的标签以零哈希发送（引擎视为"不变"）。全新链以创世块为下限；重启的节点在第一次
+  提交前发零标签，不会把 reth 从磁盘恢复的标签拉回。持久化高度由验证者现有的 50 ms 轮询器读取
+  （`n42Engine_inMemoryBlocks` 之外同一 tick 读新增的 `n42Engine_persistedBlock`，
+  `bin/n42/src/engine_ext.rs`）；执行层没有该方法时 `finalized` 跟随 `safe` 并警告一次。
+  `legacy` 逐字节恢复以前的 head = safe = finalized = 已提交块，用于 A/B；`payload_serve` 在 `split`
+  下给兄弟块重提议的 head 回退发零标签。只影响本节点 Engine API / RPC 语义
+  （`eth_getBlockByNumber("safe"|"finalized")`），验证者之间交换的内容不变，APoS 路径不变。
+  见 `docs/PHASE_D_DEFERRED_EXECUTION.md` 17.7。
+
 ## 其他 N42 独有模块:
 - `crates/n42/clique/` - APoS 共识实现
 - `crates/n42/primitives/` - beacon 链原语

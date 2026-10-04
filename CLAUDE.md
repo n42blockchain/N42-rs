@@ -227,6 +227,12 @@ crates that were previously forked and have since been reverted to upstream. Don
   genesis JSON in `crates/chainspec/res/genesis/`.
 - `crates/node/core/src/args/dev.rs` — N42 CLI flags: `--dev.consensus-signer-private-key`,
   `--dev.migrate-old-chain-data-from-db`, `--dev.migrate-old-chain-data-from-rpc`.
+- `crates/n42/h2-execution/src/settlement.rs` (no forked crate touched) — `N42_SETTLEMENT_TAGS=split|legacy`
+  (default `split`): the HotStuff-2 driver's forkchoice sends latest = committed, safe = execution
+  certified (one block behind under deferred execution), finalized = certified and at or below this
+  node's persisted block (read through `n42Engine_persistedBlock` by the validator's existing
+  persistence poller); `legacy` is head = safe = finalized = committed, byte for byte. Node-local RPC
+  semantics only; `docs/PHASE_D_DEFERRED_EXECUTION.md` 17.7.
 
 `N42_CUSTOMIZATIONS.md` is the maintained (Chinese) inventory of these; update it when the set changes.
 

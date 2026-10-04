@@ -1450,7 +1450,7 @@ where
     // Another node's block: executed here and handed to the
     // engine as executed, when configured. Any failure logs
     // and leaves the block to the engine's own path.
-    let mut direct_ms: Option<[u64; 31]> = None;
+    let mut direct_ms: Option<[u64; 33]> = None;
     // The block's transaction hashes, known once the direct
     // import converted the payload: the prune below then
     // needs no keccak over the raw bytes.
@@ -1706,6 +1706,8 @@ where
                         phases[24],
                         phases[25],
                         phases[26],
+                        phases[27],
+                        phases[28],
                     ]);
                 } else {
                     warn!(target: "n42.payload_serve", number, "direct import: the engine did not take the executed block; importing the ordinary way");
@@ -1770,6 +1772,8 @@ where
                 exec_batch_median_ms = ms[28],
                 parent_output_wait_ms = ms[29],
                 parent_read = crate::follower_import::parent_read_name(ms[30]),
+                handoff_wait_us = ms[31],
+                handoff_before_canonical = ms[32] != 0,
                 answered_ms = answered,
                 "direct import: answered before the engine's own pass"
             );
@@ -1786,13 +1790,14 @@ where
         }
         complete_listing(&mut data, &mut raw_transactions, &mut listing, number, false).await;
         let engine_at = std::time::Instant::now();
+        let handed_hash = data.payload.block_hash();
         match engine.new_payload(data).await {
-            Ok(status) if !status.status.is_valid() => warn!(
+            Ok(status) if status.status.is_valid() => crate::follower_import::note_handed(handed_hash),
+            Ok(status) => warn!(
                 target: "n42.payload_serve", number, status = ?status.status,
                 "the engine disagreed with a block this node executed and answered VALID for"
             ),
             Err(err) => warn!(target: "n42.payload_serve", number, %err, "the engine's own pass failed after the fast answer"),
-            _ => {}
         }
         // Only when the walks stayed on this path; the worker thread
         // above prunes for itself otherwise.
@@ -1842,8 +1847,15 @@ where
     complete_listing(&mut data, &mut raw_transactions, &mut listing, number, direct_ms.is_none()).await;
     let listing_ms = listing_at.elapsed().as_millis() as u64;
     let new_payload_at = std::time::Instant::now();
+    let handed_hash = data.payload.block_hash();
     let new_payload = engine.new_payload(data).await;
     let new_payload_ms = new_payload_at.elapsed().as_millis() as u64;
+    // A block this node executed and the engine now holds: a child's hand-off
+    // waiting for it under `N42_HANDOFF_ON_LANDED=1` goes now, before this
+    // answer is on the wire (`follower_import::handoff_on_landed`).
+    if direct_ms.is_some() && new_payload.as_ref().is_ok_and(|status| status.status.is_valid()) {
+        crate::follower_import::note_handed(handed_hash);
+    }
     match new_payload {
         Ok(status) => {
             if let (Some(probe), Some(probe_data)) = (probe, probe_data) {
@@ -1953,6 +1965,8 @@ where
                     exec_batch_median_ms = ms[28],
                     parent_output_wait_ms = ms[29],
                     parent_read = crate::follower_import::parent_read_name(ms[30]),
+                    handoff_wait_us = ms[31],
+                    handoff_before_canonical = ms[32] != 0,
                     engine_ms = (started.elapsed().saturating_sub(decoded).as_millis() as u64).saturating_sub(ms[7]),
                     engine_remember_ms = remember_ms,
                     engine_listing_ms = listing_ms,

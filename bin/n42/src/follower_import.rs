@@ -90,6 +90,113 @@ pub fn note_import_landed() {
     landed.notify_all();
 }
 
+/// `N42_HANDOFF_ON_LANDED=1`, read once: a block executed on its parent's
+/// published output is handed to the engine once the parent's own direct
+/// import has been answered by the engine ([`note_handed`]), instead of once
+/// the parent is canonical.
+///
+/// The canonical wait is stricter than the engine needs. The executed insert
+/// (`InsertExecutedBlock` in reth's tree) checks only that the block is not at
+/// or below the canonical number and not already held, then files it in the
+/// tree under its parent; `newPayload` for a block the tree holds answers
+/// VALID; the forkchoice that later makes the parent canonical, and the
+/// block's own, extend the chain through the tree. The QMDB forest holds the
+/// block's tree from its own root job (filed under the parent's record, which
+/// the parent's root filed), so its `on_canonical` hook finds it either way;
+/// persistence takes canonical blocks only. What the canonical wait cost was
+/// the parent's commit forkchoice, which the validator sends only after the
+/// parent's import answered (30-36 ms on the engine thread), plus up to 20 ms
+/// of poll, since a block becoming canonical wakes no waiter
+/// (`docs/INDUSTRY_SURVEY_2026_10.md` 11.12). The parent's answer, not its
+/// queued insert, is the mark: the engine then sees `newPayload(n-1)` before
+/// the insert of `n`, as before, and the imports still answer in chain order.
+/// Off by default.
+pub fn handoff_on_landed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_HANDOFF_ON_LANDED").is_ok_and(|v| v == "1"))
+}
+
+/// How many handed blocks [`HANDED`] remembers: a child is handed off within a
+/// few blocks of its parent, so this is far more than the depth in flight.
+const HANDED_KEPT: usize = 64;
+
+/// The last blocks whose direct import the engine answered here (newest last),
+/// and the condition a hand-off waits on for its parent ([`note_handed`]).
+static HANDED: (Mutex<std::collections::VecDeque<B256>>, Condvar) =
+    (Mutex::new(std::collections::VecDeque::new()), Condvar::new());
+
+/// Says the engine has answered `block_hash`'s direct import (it holds the
+/// block as executed); wakes a child's hand-off waiting for it at once.
+pub fn note_handed(block_hash: B256) {
+    let (kept, handed) = &HANDED;
+    let mut kept = kept.lock().unwrap_or_else(|p| p.into_inner());
+    if !kept.contains(&block_hash) {
+        if kept.len() >= HANDED_KEPT {
+            kept.pop_front();
+        }
+        kept.push_back(block_hash);
+    }
+    drop(kept);
+    handed.notify_all();
+}
+
+fn was_handed(block_hash: &B256) -> bool {
+    HANDED.0.lock().unwrap_or_else(|p| p.into_inner()).contains(block_hash)
+}
+
+/// What a hand-off under [`handoff_on_landed`] waited for its parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HandoffWait {
+    /// The wait, in microseconds.
+    waited_us: u64,
+    /// The parent was handed here but not yet canonical when the wait ended.
+    before_canonical: bool,
+}
+
+/// Waits until the parent has been handed to the engine here
+/// ([`note_handed`], woken at once) or is canonical (`canonical`, checked on
+/// every wake and at least every `poll`, for a parent that came in by the
+/// engine's own path), for up to `wait`. `fields` says the parent's execution
+/// fields are recorded; a handed parent always has them, but the hand-off does
+/// not take that on trust.
+fn wait_until_parent_handed(
+    parent_hash: B256,
+    wait: std::time::Duration,
+    poll: std::time::Duration,
+    mut canonical: impl FnMut() -> Result<bool, String>,
+    fields: impl Fn() -> bool,
+) -> Result<HandoffWait, String> {
+    let started = std::time::Instant::now();
+    let deadline = started + wait;
+    loop {
+        let handed = was_handed(&parent_hash) && fields();
+        if handed {
+            let before_canonical = !canonical()?;
+            return Ok(HandoffWait { waited_us: started.elapsed().as_micros() as u64, before_canonical });
+        }
+        if canonical()? {
+            return Ok(HandoffWait { waited_us: started.elapsed().as_micros() as u64, before_canonical: false });
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "parent {parent_hash} neither handed to the engine here nor canonical within {wait:?}"
+            ));
+        }
+        let step = (deadline - now).min(poll);
+        if was_handed(&parent_hash) {
+            // Handed without its fields: not expected; wait out the step.
+            std::thread::sleep(step);
+            continue;
+        }
+        let (kept, handed) = &HANDED;
+        let guard = kept.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = handed
+            .wait_timeout_while(guard, step, |kept| !kept.contains(&parent_hash))
+            .unwrap_or_else(|p| p.into_inner());
+    }
+}
+
 /// Executions held for their validator's release
 /// (`request::HOLD_EXECUTION`, `N42_VOTE_BEFORE_SLOT`), by block hash: the
 /// block is assembled and checked, and its vote released, as always; its
@@ -3138,10 +3245,31 @@ where
     // ordering rather than paying for it -- but it is timed into
     // `parent_engine_wait_ms` all the same, because under a backlog it is
     // where what the execution no longer waits for reappears.
+    //
+    // The wait is for the parent to be *canonical* (visible to the provider),
+    // and a block becoming canonical wakes no one, so it ends on a 20 ms poll;
+    // `N42_HANDOFF_ON_LANDED=1` waits for the parent's own hand-off instead
+    // ([`handoff_on_landed`]). Either way `handoff_wait_us` says how long, and
+    // `handoff_before_canonical` whether the parent was not yet canonical.
+    let mut handoff_wait_us = 0u64;
+    let mut handoff_before_canonical = 0u64;
     if executed_parent.is_some() {
         let wait_at = std::time::Instant::now();
-        wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
-        parent_engine_wait_us += wait_at.elapsed().as_micros() as u64;
+        if handoff_on_landed() {
+            let genesis = chain_spec.genesis();
+            let waited = wait_until_parent_handed(
+                parent_hash,
+                PARENT_WAIT,
+                std::time::Duration::from_millis(20),
+                || parent_in(provider, parent_hash, genesis, deferred).map(|parent| parent.is_some()),
+                || !deferred || n42_engine_types::executed_fields::get(&parent_hash).is_some(),
+            )?;
+            handoff_before_canonical = u64::from(waited.before_canonical);
+        } else {
+            wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
+        }
+        handoff_wait_us = wait_at.elapsed().as_micros() as u64;
+        parent_engine_wait_us += handoff_wait_us;
     }
 
     // Before the deferred-execution fork the vote is this import's answer,
@@ -3192,6 +3320,10 @@ where
             // output, and what they read it through ([`parent_read_name`]).
             parent_output_wait_ms,
             parent_read,
+            // The hand-off's wait for the parent, and whether the parent was
+            // not yet canonical when it ended.
+            handoff_wait_us,
+            handoff_before_canonical,
         ],
     ))
 }
@@ -3286,7 +3418,7 @@ fn prespawn_early_root(parent_hash: B256, block_hash: B256, on_parent_output: bo
 }
 
 /// How many timings [`import_foreign_block`] returns (see its last lines).
-pub const IMPORT_TIMES: usize = 27;
+pub const IMPORT_TIMES: usize = 29;
 
 /// Copies a block's post-state into the read cache the next import starts
 /// from, and files it under the block's hash.
@@ -3541,6 +3673,108 @@ mod side_pool_tests {
                 .all(|_| std::thread::current().name().is_some_and(|name| name.starts_with("vote-check-")))
         });
         assert!(on_pool);
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// [`HANDED`] is one process-wide set: the bounded-set test would evict
+    /// another test's parent between its mark and its wait.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Off unless `N42_HANDOFF_ON_LANDED=1`: with it off the hand-off takes
+    /// [`wait_for_parent`] exactly as before and never reads [`HANDED`].
+    #[test]
+    fn the_switch_is_off_by_default() {
+        if std::env::var("N42_HANDOFF_ON_LANDED").is_err() {
+            assert!(!handoff_on_landed());
+        }
+    }
+
+    /// A parent the engine has answered for here releases its child at once,
+    /// though it is not canonical yet: the child is handed off ahead of the
+    /// parent's commit forkchoice, which is what the switch is for.
+    #[test]
+    fn a_handed_parent_releases_its_child_before_its_canonical_commit() {
+        let _one = one_at_a_time();
+        let parent = B256::with_last_byte(0xa1);
+        note_handed(parent);
+        let waited = wait_until_parent_handed(parent, Duration::from_secs(1), Duration::from_secs(1), || Ok(false), || true)
+            .expect("handed");
+        assert!(waited.before_canonical);
+        assert!(waited.waited_us < 100_000, "no wait for a handed parent: {waited:?}");
+    }
+
+    /// A parent that is canonical (it came in by the engine's own path, or
+    /// its commit ran first) releases the child without a hand-off mark.
+    #[test]
+    fn a_canonical_parent_releases_its_child_without_a_hand_off() {
+        let _one = one_at_a_time();
+        let parent = B256::with_last_byte(0xa2);
+        let waited = wait_until_parent_handed(parent, Duration::from_secs(1), Duration::from_secs(1), || Ok(true), || true)
+            .expect("canonical");
+        assert!(!waited.before_canonical);
+    }
+
+    /// The child's wait ends when the parent is handed, not on the next poll:
+    /// with a ten-second poll the wait would otherwise last ten seconds.
+    #[test]
+    fn the_hand_off_wakes_on_the_parents_answer_without_a_poll() {
+        let _one = one_at_a_time();
+        let parent = B256::with_last_byte(0xa3);
+        let noter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            note_handed(parent);
+        });
+        let at = Instant::now();
+        let waited =
+            wait_until_parent_handed(parent, Duration::from_secs(20), Duration::from_secs(10), || Ok(false), || true)
+                .expect("woken");
+        noter.join().expect("the noting thread");
+        assert!(waited.before_canonical);
+        assert!(at.elapsed() >= Duration::from_millis(50));
+        assert!(at.elapsed() < Duration::from_secs(5), "woken by the mark, not the poll: {:?}", at.elapsed());
+    }
+
+    /// A parent that is never handed and never canonical gives the hand-off
+    /// up after the wait, as [`wait_for_parent`] does after [`PARENT_WAIT`].
+    #[test]
+    fn a_parent_that_never_lands_times_out() {
+        let _one = one_at_a_time();
+        let parent = B256::with_last_byte(0xa4);
+        let at = Instant::now();
+        let err = wait_until_parent_handed(parent, Duration::from_millis(60), Duration::from_millis(10), || Ok(false), || true)
+            .expect_err("never lands");
+        assert!(at.elapsed() >= Duration::from_millis(60));
+        assert!(err.contains("neither handed"), "{err}");
+    }
+
+    /// A handed parent whose fields are not recorded does not release the
+    /// child; it still times out rather than spinning.
+    #[test]
+    fn a_handed_parent_without_fields_does_not_release_the_child() {
+        let _one = one_at_a_time();
+        let parent = B256::with_last_byte(0xa5);
+        note_handed(parent);
+        assert!(wait_until_parent_handed(parent, Duration::from_millis(40), Duration::from_millis(10), || Ok(false), || false)
+            .is_err());
+    }
+
+    /// The set is bounded: the oldest marks fall out past [`HANDED_KEPT`].
+    #[test]
+    fn the_handed_set_is_bounded() {
+        let _one = one_at_a_time();
+        for i in 0..(HANDED_KEPT as u64 + 8) {
+            note_handed(B256::from(alloy_primitives::U256::from(0xbb00_0000u64 + i)));
+        }
+        assert!(HANDED.0.lock().unwrap_or_else(|p| p.into_inner()).len() <= HANDED_KEPT);
     }
 }
 

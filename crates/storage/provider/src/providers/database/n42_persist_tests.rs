@@ -218,6 +218,33 @@ fn gap_marker(checkpoints: &[(String, StageCheckpoint)]) -> Option<u64> {
         .map(|(_, checkpoint)| checkpoint.block_number)
 }
 
+/// The account at the start of block `q` (after block `q - 1`) the way the historical state
+/// provider resolves it: through `HistoryReader::account_history_info` and then the changeset or
+/// the latest state.
+fn historical_account(factory: &TestFactory, k: u64, q: u64) -> ProviderResult<Option<Account>> {
+    let provider = factory.provider()?;
+    Ok(match provider.account_history_info(address(k), q, None)? {
+        HistoryInfo::NotYetWritten => None,
+        HistoryInfo::InChangeset(block) => {
+            provider
+                .get_account_before_block(block, address(k))?
+                .ok_or(ProviderError::AccountChangesetNotFound { block_number: block, address: address(k) })?
+                .info
+        }
+        HistoryInfo::InPlainState | HistoryInfo::MaybeInPlainState => latest_account(factory, k),
+    })
+}
+
+/// Every historical account read at `1..=tip` matches the schedule.
+fn assert_history_exact(factory: &TestFactory, tip: u64) {
+    for k in 0..ACCOUNTS {
+        for q in 1..=tip {
+            let read = historical_account(factory, k, q).expect("historical read");
+            assert_eq!(read, expected_after(k, q - 1), "account {k} at block {q}");
+        }
+    }
+}
+
 #[test]
 fn qmdb_in_scope_switch_writes_the_same_database() {
     for history_mode in [ON, MIDDLE_OFF] {
@@ -265,4 +292,26 @@ fn account_history_off_skips_only_the_index() {
     let indexed: Vec<u64> = middle.history.iter().flat_map(|(_, _, blocks)| blocks.clone()).collect();
     assert!(indexed.iter().all(|b| !(5..=7).contains(b)), "no entry for the off batch: {indexed:?}");
     assert!(indexed.iter().any(|b| (8..=10).contains(b)), "on resumes writing: {indexed:?}");
+}
+
+#[test]
+fn historical_account_reads_are_exact_with_the_index_off() {
+    for history_mode in [ON, OFF, MIDDLE_OFF] {
+        let run = run_chain(false, history_mode);
+        assert_history_exact(&run.factory, 10);
+    }
+}
+
+#[test]
+fn historical_account_read_errors_rather_than_guess_when_the_scan_is_capped() {
+    let run = run_chain(false, OFF);
+    n42_persist::set_account_history_scan_max_override(Some(3));
+    // Account 1 at block 2: the scan from block 2 finds its change at block 3 within the cap.
+    let short = historical_account(&run.factory, 1, 2);
+    // Account 4 at block 1: no change before block 5 would need more than three blocks.
+    let long = historical_account(&run.factory, 4, 1);
+    n42_persist::set_account_history_scan_max_override(None);
+    assert_eq!(short.expect("short scan"), expected_after(1, 1));
+    let message = long.expect_err("a capped scan is an error").to_string();
+    assert!(message.contains("N42_ACCOUNT_HISTORY=off"), "{message}");
 }

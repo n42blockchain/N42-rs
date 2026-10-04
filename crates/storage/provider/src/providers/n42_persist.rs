@@ -87,6 +87,8 @@ thread_local! {
     static QMDB_IN_SCOPE_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
     /// Test-only override of `N42_ACCOUNT_HISTORY=off`, per thread.
     static ACCOUNT_HISTORY_OFF_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    /// Test-only override of `N42_ACCOUNT_HISTORY_SCAN_MAX`, per thread.
+    static ACCOUNT_HISTORY_SCAN_MAX_OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 /// Whether `on_state_persisted` runs beside the backend writes (`N42_PERSIST_QMDB_IN_SCOPE=1`).
@@ -139,12 +141,15 @@ pub(crate) fn set_account_history_off_override(value: Option<bool>) {
 pub(crate) const ACCOUNT_HISTORY_GAP_KEY: &str = "N42AccountHistoryGap";
 
 /// Default cap on the number of blocks a historical account read scans in the gap
-/// (`N42_ACCOUNT_HISTORY_SCAN_MAX` overrides). A read that would scan more returns an error that
-/// names the mode instead of a slow or wrong answer.
+/// (`N42_ACCOUNT_HISTORY_SCAN_MAX` overrides). A read that finds no change within that many blocks
+/// of a longer range returns an error that names the mode instead of a slow or wrong answer.
 const DEFAULT_ACCOUNT_HISTORY_SCAN_MAX: u64 = 100_000;
 
 /// The gap-scan cap in force.
 pub(crate) fn account_history_scan_max() -> u64 {
+    if let Some(value) = ACCOUNT_HISTORY_SCAN_MAX_OVERRIDE.with(Cell::get) {
+        return value;
+    }
     static MAX: OnceLock<u64> = OnceLock::new();
     *MAX.get_or_init(|| {
         std::env::var("N42_ACCOUNT_HISTORY_SCAN_MAX")
@@ -152,6 +157,12 @@ pub(crate) fn account_history_scan_max() -> u64 {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(DEFAULT_ACCOUNT_HISTORY_SCAN_MAX)
     })
+}
+
+/// Test helper: overrides `N42_ACCOUNT_HISTORY_SCAN_MAX` on this thread (`None` restores it).
+#[cfg(test)]
+pub(crate) fn set_account_history_scan_max_override(value: Option<u64>) {
+    ACCOUNT_HISTORY_SCAN_MAX_OVERRIDE.with(|cell| cell.set(value));
 }
 
 /// The error a historical account read returns when the gap it would scan exceeds the cap.

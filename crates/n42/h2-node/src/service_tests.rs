@@ -825,3 +825,101 @@ mod net_tests;
 
 #[path = "service_mesh_tests.rs"]
 mod mesh_tests;
+
+// ---------------------------------------------------------------------------
+// Blocks taken without their transactions (N42_TAKE_COMPACT)
+// ---------------------------------------------------------------------------
+
+/// A built block with withdrawals (rewards) and a header to match, as the
+/// payload a whole answer gives and the one an elided answer gives.
+fn whole_and_elided() -> (alloy_rpc_types_engine::ExecutionData, alloy_rpc_types_engine::ExecutionData, Header, Vec<B256>) {
+    let withdrawals = vec![alloy_eips::eip4895::Withdrawal { index: 0, validator_index: 0, address: Address::repeat_byte(3), amount: 1_000_000_000 }];
+    let header = Header {
+        number: 9,
+        base_fee_per_gas: Some(7),
+        gas_limit: 30_000_000,
+        withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
+        ..Default::default()
+    };
+    let block = alloy_consensus::Block::<alloy_consensus::TxEnvelope> {
+        header: header.clone(),
+        body: alloy_consensus::BlockBody {
+            transactions: Vec::new(),
+            ommers: Vec::new(),
+            withdrawals: Some(alloy_eips::eip4895::Withdrawals::new(withdrawals)),
+        },
+    };
+    let elided = alloy_rpc_types_engine::ExecutionData::from_block_unchecked(header.hash_slow(), &block);
+    let transactions: Vec<alloy_primitives::Bytes> =
+        (0..5u8).map(|i| alloy_primitives::Bytes::from(vec![0x02, 0xc1, i])).collect();
+    let hashes = transactions.iter().map(keccak256).collect();
+    let mut whole = elided.clone();
+    whole.payload.as_v1_mut().transactions = transactions;
+    (whole, elided, header, hashes)
+}
+
+#[test]
+fn an_elided_blocks_compact_body_is_byte_for_byte_the_whole_blocks() {
+    let (whole, elided, header, hashes) = whole_and_elided();
+    // What `publish_body` makes of the whole block.
+    let full = encode_own_body(&whole, &header);
+    let from_whole = n42_h2_consensus::encode_compact_body(&full, &hashes, HeaderProfile::Ethereum).expect("compact");
+    // What the elided road makes without a single transaction byte.
+    let from_elided = elided_compact_body(&elided, &header, &hashes, &[], HeaderProfile::Ethereum).expect("compact");
+    assert_eq!(from_elided, from_whole);
+    // And a follower that rebuilds the gov5 body from it gets the whole one.
+    let decoded = n42_h2_consensus::decode_compact_body(&from_elided, HeaderProfile::Ethereum).expect("decodes");
+    assert_eq!(decoded.hashes, hashes);
+    assert_eq!(
+        n42_h2_consensus::rebuild_gov5_body(&decoded, &whole.payload.as_v1().transactions),
+        full
+    );
+}
+
+#[tokio::test]
+async fn a_block_taken_elided_is_served_from_the_execution_layer_on_demand() {
+    let mut rig = node(1, 0, None).await;
+    // The mock files the block it builds, as an execution layer that built
+    // it holds it.
+    let built = rig
+        .el
+        .resolve_payload(alloy_rpc_types_engine::PayloadId::new([1; 8]), n42_h2_execution::ResolveKind::WaitForPending)
+        .await
+        .expect("a job")
+        .expect("built");
+    let header = built.execution_data.clone().into_block_raw().expect("raw block").header;
+    let hash = header.hash_slow();
+    assert!(rig.svc.elided_body(hash).await.is_none(), "a block not taken elided is not fetched this way");
+
+    rig.svc.remember_elided(hash, header.clone(), None);
+    assert!(!rig.svc.body_store.contains_key(&hash), "nothing is stored until a peer asks");
+    let body = rig.svc.elided_body(hash).await.expect("fetched on demand");
+    assert_eq!(&body[..], &n42_h2_net::encode_block_rlp_raw(&header, &[], &[], None)[..]);
+    assert!(rig.svc.body_store.contains_key(&hash), "kept for the next peer that asks");
+    assert!(!rig.svc.elided_own.contains_key(&hash));
+    // A fill is served from it like any stored body.
+    let request = n42_h2_net::BlockTxnsRequest { hash, indices: Vec::new() };
+    assert_eq!(fill_from_body(&body, HeaderProfile::Ethereum, &request).expect("served"), Vec::<alloy_primitives::Bytes>::new());
+}
+
+#[tokio::test]
+async fn a_block_taken_elided_that_the_execution_layer_lost_stays_unserved() {
+    let mut rig = node(1, 0, None).await;
+    let (hash, header, _) = block(4, B256::repeat_byte(2));
+    rig.svc.remember_elided(hash, header, None);
+    assert!(rig.svc.elided_body(hash).await.is_none());
+    assert!(!rig.svc.body_store.contains_key(&hash));
+    assert!(rig.svc.elided_own.contains_key(&hash), "asked again next time");
+}
+
+#[tokio::test]
+async fn blocks_taken_elided_are_remembered_to_a_bound() {
+    let mut rig = node(1, 0, None).await;
+    let bound = remembered_bodies();
+    for i in 0..bound + 3 {
+        let (hash, header, _) = block(i as u64 + 1, B256::repeat_byte(2));
+        rig.svc.remember_elided(hash, header, None);
+    }
+    assert_eq!(rig.svc.elided_own.len(), bound);
+    assert_eq!(rig.svc.elided_order.len(), bound);
+}

@@ -1,0 +1,73 @@
+# tip when the launcher started: ebe36a242 (second attempt: native binary built 05:30 from the tree at about c861cdfa6, deferred/test build e81c44067+tree 05:46; both contain 889ebfa80; no N42_BUILD_THROTTLE_* set)
+== loop320WARM: window-1 blocks 210, cycle mean/median/p90 142.3/128.2/201.3
+  sealed_at ms median/p90 78.0/154.0 (n=752)
+  follower fields_ready ms median/p90 89.0/154.0 (n=1927, whole leg)
+  answer (window 1, n=210, elided 0): encode 33.6/46.8  write 18.8/48.9  read 19.9/49.3 (n=210)  decode 13.4/19.9  answer_MB 31.3/31.3  [median/p90 ms]
+  modes: seal 138 (66%) mean 124.9  send 72 (34%) mean 175.5
+== loop320WARM: window-1 leader builds 210, fields_at_seal=['"off"'], rename_early 0/210 (0%)
+  parent_fields_ms=0/47  sealed_ms=8/57  sealed_at_ms=75/133  par_ms=73/133  par_exec_ms=29/35  roots_ms=35/65  state_ready_ms=138/220  seal_to_finish_us=16004/22116  seal_to_bundle_us=16252/22448  seal_to_view_us=17085/23562  seal_to_rename_us=51447/94989  rename_wait_us=29082/62823  seal_to_root_start_us=51596/95157  seal_to_root_end_us=83408/134072  seal_to_fields_us=85634/147863
+  process totals: fields_verified=0 fields_unchecked=0 fields_mismatches=0
+== loop320COMPACT: window-1 blocks 223, cycle mean/median/p90 122.6/108.6/153.9
+  sealed_at ms median/p90 106.0/189.0 (n=718)
+  follower fields_ready ms median/p90 92.0/178.0 (n=1709, whole leg)
+  answer (window 1, n=223, elided 223): encode 4.2/7.6  write 1.8/7.4  read 1.8/7.2 (n=223)  decode 0.8/1.7  answer_MB 5.2/5.2  [median/p90 ms]
+  modes: seal 199 (89%) mean 124.2  send 24 (11%) mean 109.3
+== loop320COMPACT: window-1 leader builds 235, fields_at_seal=['"off"'], rename_early 0/235 (0%)
+  parent_fields_ms=19/49  sealed_ms=28/56  sealed_at_ms=98/139  par_ms=96/137  par_exec_ms=31/38  roots_ms=35/57  state_ready_ms=153/196  seal_to_finish_us=12131/15496  seal_to_bundle_us=12511/16073  seal_to_view_us=13251/16683  seal_to_rename_us=59304/83172  rename_wait_us=43407/62325  seal_to_root_start_us=59778/83340  seal_to_root_end_us=95812/120999  seal_to_fields_us=98304/130808
+  process totals: fields_verified=0 fields_unchecked=0 fields_mismatches=0
+== loop320FVERIFY: window-1 blocks 227, cycle mean/median/p90 120.7/104.4/174.5
+  sealed_at ms median/p90 83.0/192.0 (n=716)
+  follower fields_ready ms median/p90 92.0/233.0 (n=1861, whole leg)
+  answer (window 1, n=227, elided 227): encode 4.7/8.6  write 1.8/8.0  read 1.9/7.8 (n=227)  decode 0.9/2.2  answer_MB 5.2/5.2  [median/p90 ms]
+  modes: seal 191 (84%) mean 120.6  send 36 (16%) mean 121.4
+== loop320FVERIFY: window-1 leader builds 234, fields_at_seal=['"verify"'], rename_early 195/234 (83%)
+  parent_fields_ms=0/9  sealed_ms=8/19  sealed_at_ms=76/172  par_ms=72/164  par_exec_ms=30/36  roots_ms=40/65  state_ready_ms=120/153  seal_to_finish_us=12466/17175  seal_to_bundle_us=12673/17461  seal_to_view_us=13363/18560  seal_to_rename_us=15183/22273  rename_wait_us=0/0  seal_to_root_start_us=15289/22866  seal_to_root_end_us=57197/80755  seal_to_fields_us=58620/82717
+  process totals: fields_verified=1192 fields_unchecked=0 fields_mismatches=0
+== loop320FAS: window-1 blocks 210, cycle mean/median/p90 130.7/110.5/201.9
+  sealed_at ms median/p90 85.0/202.0 (n=748)
+  follower fields_ready ms median/p90 94.0/190.0 (n=1550, whole leg)
+  answer (window 1, n=210, elided 210): encode 5.0/8.5  write 3.3/18.6  read 3.4/18.0 (n=210)  decode 0.9/2.7  answer_MB 5.2/5.2  [median/p90 ms]
+  modes: seal 188 (90%) mean 130.3  send 22 (10%) mean 134.7
+== loop320FAS: window-1 leader builds 225, fields_at_seal=['"early"'], rename_early 203/225 (90%)
+  parent_fields_ms=0/22  sealed_ms=8/33  sealed_at_ms=84/185  par_ms=77/175  par_exec_ms=32/40  roots_ms=42/76  state_ready_ms=130/199  seal_to_finish_us=12319/16768  seal_to_bundle_us=12623/17029  seal_to_view_us=13316/18055  seal_to_rename_us=15399/27958  rename_wait_us=0/0  seal_to_root_start_us=15677/28057  seal_to_root_end_us=58398/90573  seal_to_fields_us=60321/117331
+  process totals: fields_verified=0 fields_unchecked=0 fields_mismatches=0
+== loop320COMPACTb: window-1 blocks 210, cycle mean/median/p90 130.2/118.7/181.8
+  sealed_at ms median/p90 111.0/196.0 (n=752)
+  follower fields_ready ms median/p90 93.0/178.0 (n=1860, whole leg)
+  answer (window 1, n=210, elided 210): encode 4.9/8.1  write 2.6/16.1  read 2.6/15.5 (n=210)  decode 0.9/2.2  answer_MB 5.2/5.2  [median/p90 ms]
+  modes: seal 191 (91%) mean 131.7  send 19 (9%) mean 115.0
+== loop320COMPACTb: window-1 leader builds 228, fields_at_seal=['"off"'], rename_early 0/228 (0%)
+  parent_fields_ms=20/55  sealed_ms=29/64  sealed_at_ms=105/150  par_ms=100/150  par_exec_ms=32/39  roots_ms=37/60  state_ready_ms=162/209  seal_to_finish_us=11948/15816  seal_to_bundle_us=12340/16254  seal_to_view_us=13140/17333  seal_to_rename_us=63352/95819  rename_wait_us=45614/68253  seal_to_root_start_us=63858/96498  seal_to_root_end_us=100504/130893  seal_to_fields_us=103846/134704
+  process totals: fields_verified=0 fields_unchecked=0 fields_mismatches=0
+== loop320FASb: window-1 blocks 204, cycle mean/median/p90 133.9/109.5/195.5
+  sealed_at ms median/p90 85.0/198.0 (n=749)
+  follower fields_ready ms median/p90 93.0/179.0 (n=1497, whole leg)
+  answer (window 1, n=204, elided 204): encode 5.2/8.9  write 3.7/20.6  read 3.7/19.9 (n=204)  decode 1.1/2.6  answer_MB 5.2/5.2  [median/p90 ms]
+  modes: seal 175 (86%) mean 135.1  send 29 (14%) mean 126.9
+== loop320FASb: window-1 leader builds 222, fields_at_seal=['"early"'], rename_early 195/222 (88%)
+  parent_fields_ms=0/13  sealed_ms=8/22  sealed_at_ms=83/190  par_ms=79/182  par_exec_ms=32/39  roots_ms=41/72  state_ready_ms=124/173  seal_to_finish_us=12424/17402  seal_to_bundle_us=12718/17707  seal_to_view_us=13460/18665  seal_to_rename_us=15467/24534  rename_wait_us=0/0  seal_to_root_start_us=15660/24639  seal_to_root_end_us=56716/79649  seal_to_fields_us=59144/101250
+  process totals: fields_verified=0 fields_unchecked=0 fields_mismatches=0
+== loop320WARM: T0 +0, handover +124s, last full block +206s, samples 128/128/128
+  node0: in-mem blocks +60s 44  handover 35  +150s 69  end 66  max 91  (first >40 at +30s)  peak RSS 28.4 G  backpressure_active samples 0/128  stalls 0 totalling 0.0s
+  node1: in-mem blocks +60s 30  handover 46  +150s 47  end 63  max 83  (first >40 at +46s)  peak RSS 29.4 G  backpressure_active samples 0/128  stalls 0 totalling 0.0s
+  node2: in-mem blocks +60s 24  handover 41  +150s 58  end 39  max 69  (first >40 at +104s)  peak RSS 26.0 G  backpressure_active samples 0/128  stalls 0 totalling 0.0s
+== loop320COMPACT: T0 +0, handover +108s, last full block +239s, samples 116/116/116
+  node0: in-mem blocks +60s 43  handover 56  +150s 84  end 154  max 154  (first >40 at +50s)  peak RSS 44.3 G  backpressure_active samples 0/116  stalls 0 totalling 0.0s
+  node1: in-mem blocks +60s 38  handover 39  +150s 25  end 8  max 54  (first >40 at +16s)  peak RSS 25.3 G  backpressure_active samples 0/116  stalls 0 totalling 0.0s
+  node2: in-mem blocks +60s 35  handover 69  +150s 34  end 6  max 69  (first >40 at +36s)  peak RSS 26.3 G  backpressure_active samples 0/116  stalls 0 totalling 0.0s
+== loop320FVERIFY: T0 +0, handover +107s, last full block +202s, samples 123/123/123
+  node0: in-mem blocks +60s 46  handover 45  +150s 26  end 41  max 69  (first >40 at +24s)  peak RSS 29.3 G  backpressure_active samples 0/123  stalls 0 totalling 0.0s
+  node1: in-mem blocks +60s 36  handover 69  +150s 36  end 53  max 72  (first >40 at +26s)  peak RSS 29.9 G  backpressure_active samples 0/123  stalls 0 totalling 0.0s
+  node2: in-mem blocks +60s 34  handover 33  +150s 68  end 58  max 84  (first >40 at +52s)  peak RSS 29.8 G  backpressure_active samples 0/123  stalls 0 totalling 0.0s
+== loop320FAS: T0 +0, handover +113s, last full block +207s, samples 104/104/104
+  node0: in-mem blocks +60s 59  handover 46  +150s 8  end 11  max 59  (first >40 at +41s)  peak RSS 29.8 G  backpressure_active samples 0/104  stalls 0 totalling 0.0s
+  node1: in-mem blocks +60s 33  handover 30  +150s 7  end 11  max 71  (first >40 at +37s)  peak RSS 30.4 G  backpressure_active samples 0/99  stalls 0 totalling 0.0s
+  node2: in-mem blocks +60s 35  handover 58  +150s 8  end 9  max 74  (first >40 at +51s)  peak RSS 30.3 G  backpressure_active samples 0/104  stalls 0 totalling 0.0s
+== loop320COMPACTb: T0 +0, handover +112s, last full block +246s, samples 121/121/121
+  node0: in-mem blocks +60s 33  handover 44  +150s 80  end 150  max 150  (first >40 at +33s)  peak RSS 42.7 G  backpressure_active samples 0/121  stalls 0 totalling 0.0s
+  node1: in-mem blocks +60s 26  handover 43  +150s 29  end 8  max 57  (first >40 at +51s)  peak RSS 27.3 G  backpressure_active samples 0/121  stalls 0 totalling 0.0s
+  node2: in-mem blocks +60s 53  handover 58  +150s 24  end 7  max 65  (first >40 at +45s)  peak RSS 28.2 G  backpressure_active samples 0/121  stalls 0 totalling 0.0s
+== loop320FASb: T0 +0, handover +114s, last full block +115s, samples 95/95/95
+  node0: in-mem blocks +60s 46  handover 33  +150s 6  end 33  max 65  (first >40 at +50s)  peak RSS 28.5 G  backpressure_active samples 0/95  stalls 0 totalling 0.0s
+  node1: in-mem blocks +60s 39  handover 56  +150s 8  end 56  max 60  (first >40 at +54s)  peak RSS 25.4 G  backpressure_active samples 0/95  stalls 0 totalling 0.0s
+  node2: in-mem blocks +60s 27  handover 58  +150s 6  end 58  max 76  (first >40 at +56s)  peak RSS 27.6 G  backpressure_active samples 0/95  stalls 0 totalling 0.0s

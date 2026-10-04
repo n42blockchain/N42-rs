@@ -1768,3 +1768,67 @@ Judging window 1 (both-legs rule, FAS and FASb against COMPACT and COMPACTb; the
 Window 2 (reported, not judged): the unbounded COMPACT legs collapsed again (244k and 353k; node 0 ends at 154 and 150 in-memory blocks and 44.3 / 42.7 G, 112 and 99 imports over 600 ms; with the earlier rounds 5 of 7 unbounded COMPACT-type legs have collapsed). The FAS legs did not grow node 0's count (in-memory blocks +60 s / handover / +150 s / end / max: FAS 59 / 46 / 8 / 11 / 59, FASb 46 / 33 / 6 / 33 / 65; FVERIFY 46 / 45 / 26 / 41 / 69; COMPACT 43 / 56 / 84 / 154 / 154; COMPACTb 33 / 44 / 80 / 150 / 150; WARM 44 / 35 / 69 / 66 / 91) and have 5 and 2 imports over 600 ms, but they fail in a different way, at the tenure handover: both FAS legs form timeout certificates on node 1 from its first views as leader (FAS: views 1026, 1052, 1075, 1103, ... 9 TCs and 18 own blocks not committed; FASb: views 1029, 1030, 1031, 1032, 1033, one every 30 s, node 1 never gets a block committed after the handover, window 2 is 0, 6 proposals given up). The first lines on node 1 in FASb, within 0.6 s of the handover: "forkchoice to a committed block failed ... Too deep reorg", "our own execution layer would not take the block we built ... no longer holds own block 1025", "the build prepared ahead failed; building now ... build on the sealed block refused", then "forkchoiceUpdated returned no payload id (status Syncing)" for every view; the execution layer logs "Sidechain block not found in TreeState". COMPACT and FVERIFY, with the same wait removed in verify's early path, handed over without a TC (tc 1). The cause of the FAS handover failure is not established here; FVERIFY (which also renames early) did not show it, so the difference between `1` and `verify` (the late derivation behind Complete) is the first place to look, and the node-1 execution layer's tree state at the handover (the follower's filed parents against the early rename) is the second.
 
 Conclusion. The gap is what 11.8 inferred (the wait for the parent's `Complete`, 43 ms, plus a 36 ms root job); `N42_FIELDS_AT_SEAL=1` removes the wait and publishes the fields about 38 ms earlier, which shortens the leader's seal by 21 ms and removes node 0's count growth, but does not shorten the cycle on this configuration, and it breaks the handover to the next leader on both FAS legs. It is not a candidate for a default; `verify` ran clean on 1,192 blocks with no mismatch, so the early values are right and the defect is in how the handover consumes them.
+
+### 10.69 The leader build throttle (loop321): it keeps the leader's count under HARD and costs nothing at 48/80, but the collapse moves to the follower side, and the first per-phase persistence measurement points at the QMDB persist
+
+Loop321 is measurement only (tip 2e4b29db9 at launch, one launch, claim 06:43-07:16; derived with `derive321.py`). The throttle (commits 35c9d1155..f5fbbf42b, default off) runs in the validator: it polls its execution layer's `n42Engine_inMemoryBlocks` every 50 ms and defers its proposal by `pacing * (n - SOFT) / (HARD - SOFT)` in the soft band and holds it up to 2 s at HARD. The variables reach the validator the way `N42_TAKE_COMPACT` did: the leg line's environment is inherited by every process the fleet script starts (nothing in `fleet7-env.sh` passes them); each leg header now prints the validator process's environment, which shows `N42_BUILD_THROTTLE_SOFT/HARD` on the throttled legs and only `N42_COMPACT_BODY` and `N42_TAKE_COMPACT` on the controls, and the validators log "build throttle: soft 48 hard 80 max hold 2000 ms". No fields-at-seal, no reth backpressure, no persistence switches. Legs: WARM (baseline, throwaway), T4880 (COMPACT + SOFT 48 HARD 80), COMPACT (control), T4880b, T3264 (SOFT 32 HARD 64), COMPACTb. All six fit in the claim.
+
+| leg | win1 | win2 | win3 | round txs | cycle mean / median / p90 | sealed_at | fields | imports >600 | peak RSS n0 / n1 / n2 | tc / own_not_committed / given_up | idles >5 s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| WARM | 1,188,176 | 906,397 | 0 | 62.9M | 137.3 / 125.6 / 192.3 | 79 / 148 | 88 / 149 | 12 | 26.9 / 29.7 / 26.8 G | 1 / 0 / 0 | 1 |
+| T4880 | 1,266,012 | 749,318 | 0 | 60.5M | 125.6 / 115.6 / 159.6 | 111.5 / 183 | 91 / 211 | 16 | 28.0 / 28.4 / 29.8 G | 1 / 0 / 0 | 1 |
+| COMPACT | 1,254,361 | 814,348 | 0 | 62.1M | 127.7 / 119.7 / 172.1 | 114 / 190 | 92 / 174 | 10 | 27.9 / 38.9 / 27.8 G | 1 / 0 / 0 | 1 |
+| T4880b | 1,280,039 | 367,190 | 173,599 | 54.7M | 125.2 / 114.5 / 167.3 | 110 / 186 | 90 / 156 | 93 | 44.1 / 26.6 / 25.4 G | 1 / 0 / 0 | 1 |
+| T3264 | 1,219,064 | 868,467 | 0 | 62.7M | 132.2 / 117.4 / 175.9 | 103 / 187 | 93 / 153 | 7 | 29.0 / 27.9 / 27.0 G | 1 / 0 / 0 | 1 |
+| COMPACTb | 1,254,091 | 265,926 | 189,426 | 51.3M | 120.5 / 105.7 / 167.5 | 113 / 192 | 93 / 182 | 102 | 42.8 / 28.2 / 26.6 G | 1 / 0 / 0 | 1 |
+
+(Window 3 is 0 where the flood had ended, and non-zero only on the two legs whose chain was still behind; cycle and sealed_at are window 1 of the leader.) Correctness on every leg: verify passes, invalid_blocks, no_variant, incomplete, gas_mismatch, direct_imports_failed, unanswered_reads 0, no ERROR or panic line.
+
+Throttle per leg (leader tenures only; node 2 never leads, with 29-115 proposals in the empty tail):
+
+| leg | leader | proposals | delayed | delay when applied median / p90 | total delay | hard holds | max-hold WARN | in_mem at proposals median / p90 / max |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| T4880 | node 0 | 1023 | 143 (14%) | 17 / 41 ms | 2.9 s | 0 | 0 | 34 / 51 / 68 |
+| T4880 | node 1 | 1024 | 118 (12%) | 17 / 48 ms | 2.5 s | 0 | 0 | 8 / 49 / 69 |
+| T4880b | node 0 | 1023 | 195 (19%) | 26 / 61 ms | 5.9 s | 0 | 0 | 34 / 55 / 75 |
+| T4880b | node 1 | 406 | 55 (14%) | 22 / 42 ms | 1.2 s | 0 | 0 | 31 / 51 / 65 |
+| T3264 | node 0 | 1023 | 425 (42%) | 29 / 67 ms | 14.9 s | 1 | 0 | 29 / 47 / 63 |
+| T3264 | node 1 | 1024 | 448 (44%) | 51 / 88 ms | 24.4 s | 6 | 0 | 8 / 55 / 63 |
+
+In-memory blocks per node from `mem.log` (+60 s / handover / +150 s / end / max; handover at +120 / +110 / +111 / +106 / +111 / +108 s):
+
+| leg | node 0 | node 1 | node 2 |
+| --- | --- | --- | --- |
+| WARM | 34 / 47 / 44 / 62 / 66 | 27 / 33 / 40 / 58 / 79 | 27 / 41 / 43 / 35 / 63 |
+| T4880 | 48 / 40 / 38 / 41 / 68 | 28 / 38 / 45 / 42 / 67 | 45 / 40 / 78 / 78 / 86 |
+| COMPACT | 39 / 28 / 35 / 15 / 66 | 44 / 53 / 76 / 85 / 139 | 46 / 57 / 47 / 17 / 68 |
+| T4880b | 55 / 70 / 65 / 159 / 159 | 32 / 48 / 31 / 8 / 56 | 51 / 44 / 27 / 8 / 58 |
+| T3264 | 32 / 57 / 65 / 44 / 69 | 42 / 38 / 44 / 50 / 63 | 34 / 38 / 61 / 31 / 67 |
+| COMPACTb | 33 / 69 / 88 / 148 / 148 | 36 / 43 / 18 / 10 / 64 | 35 / 52 / 25 / 10 / 63 |
+
+Answers.
+- Did every throttled leg hold windows 2 and 3 without TCs or given-up proposals? No TCs and no given-up proposals on any leg (tc 1 everywhere, given_up 0, own_not_committed 0, idles over 5 s 1), but T4880b collapsed anyway (window 2 367k, window 3 174k, 93 imports over 600 ms, node 0 ends at 159 in-memory blocks and 44.1 G); T4880 (749k) and T3264 (868k) held, T3264 with 7 imports over 600 ms. Of the controls COMPACTb collapsed (266k / 189k, node 0 at 148) and COMPACT did not (814k), so the unbounded legs have collapsed 5 of 8 times over the four rounds and the 48/80 throttle 1 of 2.
+- Did the count stay under HARD? At every proposal, yes: the largest in-memory count a leader proposed at is 69 (T4880 against 80), 75 (T4880b against 80) and 63 (T3264 against 64; 7 hard holds, none reaching the 2 s cap). It did not stay under HARD on the node that was not proposing: T4880b node 0 climbs to 159 after the handover, when it is a follower and the throttle has nothing to defer, and T4880's node 2, which never leads, ends at 78 and peaks at 86. The throttle bounds the leader's production, not a follower's backlog, and the collapse is a follower-side effect (node 0's follower import after the handover: T4880b 188 to 1197 ms, exec 49 to 613 ms, root 34 to 121 ms; T3264 flat at 146-162 ms).
+- What did the throttle cost on window 1? T4880 (1,266,012) and T4880b (1,280,039) are above both of this round's controls (1,254,361 / 1,254,091, a gap of 0.3k) by 0.9% to 2.1%: same direction, more than the control gap, so by the stated rule the 48/80 throttle did not cost window 1 and read slightly higher; against the earlier unbounded COMPACT legs (loop318 1,258,012 / 1,266,189; loop319 1,263,755 / 1,256,354; loop320 1,254,176 / 1,234,480) T4880 is not outside their spread (it is below 1,266,189), so no gain is claimed. T4880b is the highest window 1 so far and above 1,226,047 by 4.4%. T3264 (1,219,064, 14.9 s and 24.4 s of delay in a 1,024-block tenure) is 2.8% below both controls: the tighter band costs window 1 in the stated direction and is below the record.
+- Does the round total beat the unbounded and the reth-backpressure legs? No. T4880 60.5M, T4880b 54.7M and T3264 62.7M are about the baseline's 62.9M and the healthy control's 62.1M and above the collapsed controls (51.3M), but below loop319's backpressure legs (84.0M, 76.6M, 72.8M), which paid for their totals with engine stalls and timeout certificates (loop319's windows 2 and 3 were still producing at the end; here, on a leg that does not collapse, window 3 is 0 because the flood has ended).
+
+The first per-phase persistence measurement (`save_blocks_*` from each node's metrics file at the end of the leg; every phase is in `results/analysis-loop321.txt`; ms per batch / ms per persisted block, the batch counting every block it wrote including the idle tail):
+
+| phase | COMPACT node 0 (healthy) | COMPACT node 1 | COMPACTb node 0 (collapsed) | COMPACTb node 1 |
+| --- | --- | --- | --- | --- |
+| engine `save_blocks` total | 729 / 113 | 833 / 115 | 1,394 / 158 | 1,115 / 153 |
+| database total | 573 / 89 | n/a | 1,175 / 133 | 908 / 124 |
+| scope (backend writes) | 503 / 78 | n/a | 867 / 99 | 765 / 105 |
+| RocksDB write | 500 / 78 | n/a | 784 / 89 | 763 / 104 |
+| static files (all) | 301 / 47 | n/a | 426 / 48 | 483 / 66 |
+| static files, transactions | 212 / 33 | n/a | 396 / 45 | 302 / 41 |
+| account-history map (reads + batch) | 195 / 30 | n/a | 377 / 43 | 240 / 33 |
+| commit RocksDB (2 commits a batch) | 109 / 17 | n/a | 170 / 19 | 182 / 25 |
+| account changesets (static file) | 74 / 11 | n/a | 143 / 16 | 104 / 14 |
+| receipts (static file) | 70 / 11 | n/a | 131 / 15 | 104 / 14 |
+| post scope = QMDB persisted | 61 / 9.5 | 167 / n/a | 373 / 42 | 129 / 18 |
+| senders (static file) | 42 / 6.6 | n/a | 77 / 8.8 | 62 / 8.4 |
+
+The dominant phases are the RocksDB write (500-785 ms of a 729-1,394 ms batch, of which the account-history map is 195-377 ms and the transactions' static file 212-396 ms) and, on the nodes that drift, the QMDB persist after the scope. `post_scope` (= `qmdb_persisted`) in ms a batch per node: WARM 65 / 63 / 61, T4880 61 / 58 / 90, COMPACT 61 / 167 / 72, T4880b 226 / 130 / 132, T3264 53 / 55 / 56, COMPACTb 373 / 129 / 122, and 407 on the collapsed node 0 of loop320's COMPACT and 373-407 in loop319's. The nodes that ended with 148-159 blocks in memory (node 0 of T4880b, COMPACTb, loop320 COMPACT) are exactly the ones whose QMDB persist runs at 226-407 ms a batch against 53-72 on a healthy node; COMPACT's node 1 (167 ms, 139 blocks at its peak, no collapse) sits in between. So the follower import's growth after a handover tracks a QMDB persist that has become 4-7 times slower on that node, which the bound on the leader's count (T3264: 53-56 ms on every node, no collapse) keeps from happening but a 48/80 band does only some of the time.
+
+Conclusion. The throttle does what it was written to: no timeout certificate, no given-up proposal, the leader never proposes above HARD, no max hold reached, and at 48/80 it costs no window 1. It does not remove the collapse by itself at 48/80 (T4880b), because the node that collapses is the follower after the handover, whose in-memory count the leader's throttle does not govern; at 32/64 it held every window but cost 2.8% of window 1 and about 40 s of delay. The next measurement this points at is the QMDB persist (`post_scope`, 61 ms a batch healthy against 226-407 ms on the drifting node): what slows it on a node that carries 100+ unpersisted blocks (its state-trie overlay depth against the backend commit) is not shown by these counters. No default is changed; no tag, `main` untouched.

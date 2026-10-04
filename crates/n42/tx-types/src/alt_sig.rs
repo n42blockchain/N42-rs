@@ -770,6 +770,32 @@ mod merged_batch_tests {
         println!("body clone of {n}: vec-backed {} us, shared {} us", best[0], best[1]);
     }
 
+    /// `cargo test -p n42-tx-types --release --lib [--features
+    /// alloy-primitives/asm-keccak] -- --ignored --nocapture keccak_bench`:
+    /// the admission's hashes -- a 0x50 transaction's hash over its encoding
+    /// and a frame root's 64-byte node -- with whichever Keccak backend the
+    /// build selected. The digests are printed so two builds can be compared.
+    #[test]
+    #[ignore = "timing; run by hand in release"]
+    fn keccak_bench() {
+        let mut encoded = Vec::new();
+        signed(7, 3).encode_2718(&mut encoded);
+        let node = [0x5au8; 64];
+        let n = 1_000_000u32;
+        for (what, input) in [("tx encoding", encoded.as_slice()), ("64-byte node", &node[..])] {
+            let mut digest = keccak256(input);
+            let at = std::time::Instant::now();
+            for _ in 0..n {
+                digest = keccak256(core::hint::black_box(input));
+            }
+            let took = at.elapsed();
+            let mut hasher = Keccak256::new();
+            hasher.update(input);
+            assert_eq!(hasher.finalize(), digest);
+            println!("{what} ({} B): {:.1} ns a hash, digest {digest}", input.len(), took.as_nanos() as f64 / f64::from(n));
+        }
+    }
+
     #[test]
     fn merged_batch_verdicts_match_ed25519_dalek() {
         let one_sender: Vec<AltSigTx> = (0..128).map(|nonce| signed(7, nonce)).collect();

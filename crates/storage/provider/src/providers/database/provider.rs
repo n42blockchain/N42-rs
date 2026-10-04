@@ -644,7 +644,20 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         // Propagate tracing context into rayon-spawned threads so that static file
         // and RocksDB write spans appear as children of save_blocks in traces.
         let span = tracing::Span::current();
-        runtime.storage_pool().in_place_scope(|s| {
+        // N42: with `N42_PERSIST_QMDB_IN_SCOPE=1` the QMDB read view's `on_state_persisted` runs
+        // beside the backend writes instead of after them (`n42_persist::run_with_qmdb_persisted`).
+        let n42_qmdb_in_scope = crate::providers::n42_persist::persist_qmdb_in_scope();
+        let n42_scope_reader = (n42_qmdb_in_scope &&
+            save_mode.with_state() &&
+            !state_trie_blocks.is_empty())
+        .then(reth_storage_api::n42_state::registered)
+        .flatten();
+        let n42_scope_blocks: Vec<_> = if n42_scope_reader.is_some() {
+            state_trie_blocks.iter().map(|block| block.recovered_block().num_hash()).collect()
+        } else {
+            Vec::new()
+        };
+        let n42_backend_writes = || runtime.storage_pool().in_place_scope(|s| {
             // SF writes
             if sf_ctx.is_some() {
                 s.spawn(|_| {
@@ -802,13 +815,19 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             timings.mdbx = mdbx_start.elapsed();
 
             Ok::<_, ProviderError>(())
-        })?;
+        });
+        crate::providers::n42_persist::run_with_qmdb_persisted(
+            n42_scope_reader,
+            &n42_scope_blocks,
+            true,
+            n42_backend_writes,
+        )?;
         n42_timers.save_blocks_scope.record(scope_start.elapsed());
         let post_scope_start = Instant::now();
 
         // N42: the state/trie blocks' hashed state is written (committed with this transaction); a
         // registered QMDB reader moves with it.
-        if save_mode.with_state() && !state_trie_blocks.is_empty() {
+        if !n42_qmdb_in_scope && save_mode.with_state() && !state_trie_blocks.is_empty() {
             if let Some(reader) = reth_storage_api::n42_state::registered() {
                 let qmdb_start = Instant::now();
                 let persisted: Vec<_> =

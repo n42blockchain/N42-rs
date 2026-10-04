@@ -303,8 +303,8 @@ here; it is not a lever.
 
 Page-fault volume. 450k faults/s at 4 KiB is 1.84 GB/s of first-touch memory per node
 (450,000 x 4,096; arithmetic). Whether BASE legs use huge pages is unclear: the BASE `MALLOC_CONF` in BD 10.63
-is `dirty_decay_ms:2000,background_thread:true` with no `thp` token, the project notes say records were
-measured with `thp:always`, and the host's THP mode is `madvise` with `defrag=defer`. Open question 4. BD 10.48
+is `thp:always,oversize_threshold:0,dirty_decay_ms:2000,background_thread:true` (it does carry a `thp` token: the
+BASE legs run with `thp:always`), and the host's THP mode is `madvise` with `defrag=defer`. Open question 4. BD 10.48
 and 10.54 already removed the QMDB root's own faults with pooled twig trees, a populated append buffer, a
 scratch set and an undo pool (`crates/n42/twig-core/src/prefault.rs`); BD 10.62 lists `rayon collect` frames
 as 7-17% of fault entries, which is what is left.
@@ -529,3 +529,132 @@ Local facts (grep or read in this tree): `bin/n42/Cargo.toml` (asm-keccak defaul
 `crates/n42/twig-core/src/prefault.rs`, `crates/n42/engine-types/src/parallel_transfer.rs`, commits
 `e3d7e9495` and `da9f16608`, and the host's `/proc/cpuinfo`, `/proc/interrupts`, `/proc/vmstat`,
 `/sys/kernel/mm/transparent_hugepage/*`.
+
+---
+
+## 11. Deferral depth replay (loop316 logs)
+
+Question: what would the cycle have been if header N carried the result of block N-D, for D = 2 and 3, on logs
+already taken? Answer from three judged legs (NEW, FOFF, NEWb of loop316, window 1, 218-222 full blocks each,
+3-node fleet, 100 ms pacing, 163,000 transactions a block): **the same cycle.** D = 2 and 3 change the mean
+by 0.0 to -0.3%, because at D = 1 the parent's result is almost never the wait that sets the cycle. The script is
+`scripts/fleet7-depth-replay.py`; it reads `node<i>-v.log` and `node<i>-el.log` and nothing else.
+
+### 11.1 Method
+
+Window 1 is the 30 s after the first full body, in the first leader's tenure (node 0 in all three legs). Per block
+the logs give, on the leader: the proposal's preamble time, `tick_late_us`, `take_sealed_us`, the leader's own commit
+of the previous block, and the EL's `seal-first build phases` (build start, `par_ms`, `sealed_at_ms`,
+`state_ready_ms`); on each follower: the body arrival (`import starting`), the vote time, and the direct-import
+line's `exec_start_ms`, `exec_end_ms`, `fields_ready_ms` and `road_end_ms`. Block view V is EL number V-1.
+
+What the logs show about the waits at D = 1 (measured, not assumed):
+
+- A follower's vote on V is `max(body + check, F(V-1))`. In window 1 the vote came 4 to 8 ms or more after the parent's
+  fields were ready in every block of every leg (NEW: minimum margin 3.8 ms, p10 42-46 ms, median 83-89 ms; one
+  `parent_wait_ms` above zero in 436 votes). The check itself, 12-70 ms, is the vote delay.
+- The leader's seal of V is `start + max(par_ms, R(V-1) - start) + about 1 ms`, where `R` is `state_ready`. This fits to
+  within 5 ms for the median block. The parent term is the larger one in 2, 3 and 6 of about 220 blocks.
+- The proposal is `max(previous proposal + 100 ms tick, previous commit + 3 ms, the sealed header in hand) + about 2 ms`.
+  The sealed header reaches the proposer 55-290 ms after `sealed_at` (the build-ahead's encode and hand-off).
+- The leader's chained build starts either at the previous seal (`build_start_trigger="seal"`) or, in 29-40% of blocks
+  (63-88 of 220), at the previous *send* (`"send"`). The second is the one-ahead slot of `crates/n42/h2-el-rpc/src/engine.rs`: "the
+  sealed build has not been taken; its successor starts when it is". It is a rule about the build slot, not about a
+  result.
+
+The replay (`simulate` in the script) recomputes, for D = 1, 2, 3, the leader's start, seal and proposal, each follower's
+body arrival, vote, execution and fields-ready times, and the quorum, with `result(N-D)` in the leader's seal and in the
+follower's vote. Every per-block duration is the measured one (`par_ms`, `state_ready_ms`, build-start delay,
+hand-off, body offset, check time, execution time, root time). Execution is serial per node (execution starts after
+the previous block's execution ends; the root after the previous block's root). The gating constants are medians
+(tick 100-101 ms from the previous send, commit-to-preamble floor 6-8.5 ms, send overhead 2.5 ms, vote-to-commit
+transit 17-20 ms, execution start 15-16 ms ahead of the check's end because the execution begins beside it). The first four blocks of the window keep their measured times.
+
+### 11.2 Validation at D = 1
+
+| Leg | Measured mean cycle | Model D = 1 | Error |
+| --- | --- | --- | --- |
+| NEW | 136.7 ms | 136.5 ms | -0.1% |
+| FOFF | 135.5 ms | 135.3 ms | -0.2% |
+| NEWb | 137.1 ms | 136.7 ms | -0.3% |
+
+Passed (the bar was a few percent). The medians and p90s agree to 3-8% (model median 124.1 / 124.7 / 120.2 ms
+against 128.5 / 125.5 / 122.3; p90 188.9 / 177.1 / 188.8 against 190.4 / 184.0 / 192.3). Honest limit: the model is fed
+every duration the nodes measured, so a pass shows the gating structure (tick, previous commit, seal, vote) accounts for
+the cycle, not that the durations are independent of D. Measured here means the mean of consecutive proposal-to-proposal
+intervals, 0.5 ms above `cycles.txt`'s 136 ms because the window edges differ.
+
+### 11.3 Result
+
+Cycle in ms (mean / median / p90) and implied transactions per second at 163,000 a block:
+
+| Leg | D = 1 (model) | D = 2 | D = 3 |
+| --- | --- | --- | --- |
+| NEW | 136.5 / 124.1 / 188.9, 1.194M | 136.5 / 124.1 / 188.9, 1.194M | 136.5 / 124.1 / 188.9, 1.194M |
+| FOFF | 135.3 / 124.7 / 177.1, 1.205M | 135.2 / 124.7 / 177.1, 1.206M | 135.2 / 124.7 / 177.1, 1.206M |
+| NEWb | 136.7 / 120.2 / 188.8, 1.193M | 136.3 / 117.6 / 188.5, 1.196M | 136.3 / 117.6 / 188.5, 1.196M |
+
+What gates each block's proposal at D = 1 (share of blocks, mean cycle of that class):
+
+| Gate | NEW | FOFF | NEWb |
+| --- | --- | --- | --- |
+| Pacing tick | 53.9%, 107 ms | 55.7%, 113 ms | 55.0%, 109 ms |
+| Leader seal, build waits for the previous send (one-ahead slot) | 38.8%, 173 ms | 28.1%, 171 ms | 35.3%, 175 ms |
+| Leader seal, own build (`par_ms`) | 4.6%, 152 ms | 12.7%, 154 ms | 7.8%, 163 ms |
+| Quorum of the previous block (vote path) | 2.7%, 166 ms | 3.6%, 134 ms | 1.8%, 135 ms |
+| of which the leader's seal waited for its own parent result | 2 blocks | 3 blocks | 6 blocks |
+| of which a follower's vote was set by its parent result | 0 | 0 | 0 |
+
+The excess of the cycle over the 100 ms tick (about 36 ms a block) is the one-ahead slot and the leader's own build,
+neither of which depends on D.
+
+Execution lag, follower fields-ready minus proposal time, in window 1: mean 79-83 ms, p90 100-103 ms, growth +0.02 to
++0.07 ms per block measured and +0.00 to +0.06 in the replay at every D. Execution (40-42 ms) plus root (30-31 ms) per
+block is 70-73 ms against a 136 ms cycle, so execution does not fall behind ordering in this window; D = 2 and 3 do
+not change that because they do not change the cycle. The backpressure cost of deferral is therefore not visible in
+these logs, because the logs contain no regime in which execution is the slower stage.
+
+Two extrapolations, both beyond what was measured and shown only to find where D would start to matter:
+
+| Scenario (model, one-ahead slot lifted: a build starts at the previous seal) | D = 1 | D = 2 | D = 3 |
+| --- | --- | --- | --- |
+| 100 ms tick | 102.8 / 104.8 / 103.3 ms | same | same |
+| tick 50 ms or none (cycle then set by the leader's own seal chain) | 85.6 / 96.5 / 90.5 ms | 82.2 / 94.3 / 88.3 ms | 82.2 / 94.3 / 88.3 ms |
+
+(NEW / FOFF / NEWb.) With the slot lifted and the tick removed, D = 2 buys 2-4% and D = 3 nothing more; the lag slope stays
++0.01 to +0.07 ms per block because execution (70 ms) stays below the 82-97 ms cycle. Lifting the slot alone is worth
+more than any D here: about 103 ms against 136 ms, 1.55-1.59M transactions per second against 1.19-1.20M in the model,
+if the build's `par_ms` and hand-off survive the extra overlap (not shown by these logs; the follower and leader
+share cores).
+
+### 11.4 What the model cannot see
+
+- Quorum. The bench is 2 of 3 with the leader's own vote, so the quorum is the faster follower. A rough 5-of-7 check
+  (leader plus the fourth fastest of six followers, each vote delay drawn independently from the measured pool) gives
+  the same cycle as the 3-node replay at every D (136.5 / 135.3 / 136.7 ms for NEW / FOFF / NEWb at D = 1): the quorum gates 2-4% of blocks here and a slower fifth voter
+  would only matter if its tail exceeded the 100 ms tick. That check assumes independent delays, no fan-out cost for
+  seven peers and no tail beyond window 1; it is not a measurement. `fleet7.sh` is the place to check it (open question 6).
+- Window 1 only. Windows 2 and 3 of the same legs show the cycle at 163-196 ms and occupancy falling (BD 10.60-10.64),
+  and the tails of execution (whole-round follower payload-to-canonical p99 436 ms, max 738 ms in `phases.txt`) are where `F(V-1)` would set the vote
+  and D would help. Window 1 has no follower vote set by its parent result, so it cannot show that gain. A replay of
+  windows 2 and 3 on the same legs is the obvious next check; it needs the same script with the window changed.
+- Durations are held as measured. Under D > 1 the leader's build and the follower's execution would overlap more with
+  the next block's check and build; contention among them (the leader's par phase against its own parent's roots,
+  followers' check against execution) would lengthen the measured durations and is not modelled.
+- Admission. At D > 1 the includability pass of PD section 11 cannot read the parent's post-state, since it is not
+  settled; the replay keeps the measured check time, which is the optimistic case. Monad's reserve-balance rule
+  (section 2.3) is what makes that possible, and this replay does not price it.
+- Execution lag against backpressure. Execution never exceeded the cycle here, so no lag growth was observed at any
+  D. If a later configuration shortens the cycle below the 70-73 ms of execution plus root, lag grows by about the
+  difference every block (replay on this data: not reached), and D bounds it only by the validity rule, not by running
+  out of anything; PD 17.4's thresholds would have to be there first.
+- Clock and parse. Times come from the nodes' own log stamps on one host; `seal-first` start is the line's time
+  minus `total_ms`, and the view-to-number map (view = number + 1) was checked against block hashes for one block.
+
+### 11.5 What the logs support
+
+They do not support going further with D > 1 *for the bench's window-1 cycle*: the parent's result is the binding wait
+in 2-6 of about 220 seals and in none of the votes, and D = 2 or 3 reproduces the D = 1 cycle to within 0.3%. The
+gate that sets the 36 ms of excess is the leader's one-ahead build slot, and that is a change to test first (replay
+suggests 136 ms to about 103 ms on the same logs, with the caveats above). D > 1 might matter in the stalls and tails of
+windows 2 and 3 and in production's seven-node tail; that is a replay of those windows, not a protocol change yet.

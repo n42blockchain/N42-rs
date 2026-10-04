@@ -298,3 +298,63 @@ async fn a_pulled_block_moves_no_tag_under_split() {
     driver.handle_output(&committed(pulled[1].0)).await;
     assert_eq!(driver.safe_tag(), Some(Tag { number: 4, hash: pulled[0].0 }));
 }
+
+/// A leader under the compact take answer (`N42_TAKE_COMPACT=1`): its builds
+/// come back elided and are never cached as payloads.
+fn elided_leader(el: &MockExecutionLayer, persisted: &Arc<AtomicU64>) -> ExecutionDriver<MockExecutionLayer> {
+    el.set_behaviour(n42_h2_execution::MockBehaviour { elide_builds: true, ..Default::default() });
+    split_driver(el, persisted)
+}
+
+#[tokio::test]
+async fn a_leader_committing_its_own_elided_builds_moves_both_tags() {
+    let el = MockExecutionLayer::new();
+    let persisted = Arc::new(AtomicU64::new(2));
+    let mut driver = elided_leader(&el, &persisted);
+    let mut own = Vec::new();
+    for view in 1..=4u64 {
+        let built = driver.build_block_on(driver.head(), attrs(1_700_000_000 + view), view).await.expect("a build");
+        assert!(built.elided, "the take answer was compact");
+        driver.handle_output(&committed(built.hash)).await;
+        assert_eq!(driver.head(), built.hash);
+        own.push(built.hash);
+    }
+    // loop326 SPLIT node 0: safe and finalized stayed at genesis here.
+    assert_eq!(driver.safe_tag(), Some(Tag { number: 3, hash: own[2] }));
+    assert_eq!(driver.finalized_tag(), Some(Tag { number: 2, hash: own[1] }));
+    let sent = *forkchoices(&el).last().expect("a forkchoice");
+    assert_eq!((sent.head_block_hash, sent.safe_block_hash, sent.finalized_block_hash), (own[3], own[2], own[1]));
+}
+
+#[tokio::test]
+async fn the_tags_follow_across_a_handover_from_leader_to_follower() {
+    let el = MockExecutionLayer::new();
+    let persisted = Arc::new(AtomicU64::new(1));
+    let mut driver = elided_leader(&el, &persisted);
+    let mut own = Vec::new();
+    for view in 1..=3u64 {
+        let built = driver.build_block_on(driver.head(), attrs(1_700_000_000 + view), view).await.expect("a build");
+        driver.handle_output(&committed(built.hash)).await;
+        own.push(built.hash);
+    }
+    assert_eq!(driver.safe_tag().map(|tag| tag.number), Some(2));
+    // The tenure passes: the next blocks arrive from the new leader.
+    let theirs = chain_on(own[2], 4, 3);
+    let mut last = (2, 1);
+    for (i, (hash, payload)) in theirs.iter().enumerate() {
+        if i == 1 {
+            // Persistence reaches into this node's own blocks.
+            persisted.store(3, Ordering::Relaxed);
+        }
+        driver.cache_payload(*hash, payload.clone());
+        driver.handle_output(&committed(*hash)).await;
+        let safe = driver.safe_tag().expect("safe").number;
+        let finalized = driver.finalized_tag().expect("finalized").number;
+        assert_eq!(safe, 4 + i as u64 - 1, "safe is one behind the tip");
+        assert!(finalized <= safe && finalized <= persisted.load(Ordering::Relaxed));
+        assert!(safe >= last.0 && finalized >= last.1, "a tag moved backwards");
+        last = (safe, finalized);
+    }
+    // Finalized walked from the follower's blocks into the leader's own.
+    assert_eq!(driver.finalized_tag(), Some(Tag { number: 3, hash: own[2] }));
+}

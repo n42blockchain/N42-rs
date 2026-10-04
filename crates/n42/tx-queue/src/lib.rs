@@ -4637,6 +4637,115 @@ mod tests {
     /// The leader's frame selection at the bench's shape: 480k queued in
     /// frames of 500 (one transaction per sender per frame, as the flood's
     /// ingest makes them), a 163k-transaction block of 326 frames, caches
+    /// A queue of `rounds` nonces for each of `senders` senders, pushed as
+    /// frames of 500 the way the ingest does.
+    fn framed_queue(senders: u64, rounds: u64) -> (TxQueue<EthPooledTransaction>, Vec<(Address, u64)>) {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        let mut all: Vec<(Address, u64)> = Vec::with_capacity((senders * rounds) as usize);
+        for n in 0..rounds {
+            for s in 0..senders {
+                let mut a = [0u8; 20];
+                a[..8].copy_from_slice(&(s.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1).to_be_bytes());
+                all.push((Address::from(a), n));
+            }
+        }
+        for (k, chunk) in all.chunks(500).enumerate() {
+            let txs: Vec<EthPooledTransaction> = chunk.iter().map(|(s, n)| tx_hashed(*s, *n)).collect();
+            let hashes: Vec<B256> = txs.iter().map(|t| *t.hash()).collect();
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&(k as u64 + 1).to_be_bytes());
+            queue.push_frame(
+                txs,
+                Some(NewFrame { id: B256::from(id), hashes, members: chunk.to_vec(), gas: 21_000 * chunk.len() as u64 }),
+            );
+        }
+        (queue, all)
+    }
+
+    /// Everything the queue would offer a build on a fresh parent, in order.
+    fn offered(queue: &TxQueue<EthPooledTransaction>, parent: u8) -> Vec<(Address, u64)> {
+        queue.best_for_build(B256::repeat_byte(parent)).map(|t| (t.sender(), t.nonce())).collect()
+    }
+
+    /// Every sender's nonces offered from 0 upwards with no gap and no
+    /// repeat, and exactly the queue's contents.
+    fn assert_lanes_whole(got: &[(Address, u64)], expected: &[(Address, u64)]) {
+        let mut next: std::collections::HashMap<Address, u64> = std::collections::HashMap::new();
+        for (sender, nonce) in got {
+            let at = next.entry(*sender).or_insert(0);
+            assert_eq!(*nonce, *at, "sender {sender} offered out of order");
+            *at += 1;
+        }
+        let mut a = got.to_vec();
+        let mut b = expected.to_vec();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a.len(), b.len(), "lost or duplicated");
+        assert!(a == b, "different contents");
+    }
+
+    /// loop323 Ab: the chained build refused at the tenure handover gives a
+    /// whole block's selection back, and the per-transaction untake held the
+    /// queue's lock 4,866 ms doing it.
+    #[test]
+    fn a_refused_block_selection_goes_back_whole_and_fast() {
+        let (queue, all) = framed_queue(136_000, 3);
+        let before = queue.len();
+        assert_eq!(before, all.len());
+        let (best, plan) = queue.frames_for_build(B256::repeat_byte(0x51), 163_000 * 21_000);
+        assert_eq!(plan.frames.len(), 326);
+        // The take applied to the lanes, as the next lock does.
+        drop(queue.lock_inner());
+        assert_eq!(queue.len(), before - 163_000);
+        let at = std::time::Instant::now();
+        drop(best);
+        let untake = at.elapsed();
+        eprintln!("untake of 163,000 from a queue of {before}: {untake:?}");
+        assert!(untake < std::time::Duration::from_millis(1_500), "untake took {untake:?}");
+        assert_eq!(queue.len(), before);
+        assert_lanes_whole(&offered(&queue, 0x52), &all);
+    }
+
+    /// The give-back's index is built before the lock is taken: a prune of
+    /// other senders and a push of new frames, racing it, leave the queue
+    /// exactly as running them one after the other would.
+    #[test]
+    fn an_untake_racing_a_prune_and_a_push_loses_nothing() {
+        let (queue, all) = framed_queue(20_000, 3);
+        let (best, _) = queue.frames_for_build(B256::repeat_byte(0x61), 30_000 * 21_000);
+        drop(queue.lock_inner());
+        // Mined elsewhere: the first 1,000 senders' nonce 0.
+        let mined: Vec<(Address, u64)> = all.iter().take(1_000).copied().collect();
+        // New arrivals: nonce 3 of the last 1,000 senders.
+        let fresh: Vec<(Address, u64)> = all.iter().take(20_000).skip(19_000).map(|(s, _)| (*s, 3)).collect();
+        let racer = {
+            let queue = queue.clone();
+            let mined = mined.clone();
+            let fresh = fresh.clone();
+            std::thread::spawn(move || {
+                queue.remove_mined_batch(mined);
+                queue.push(fresh.iter().map(|(s, n)| tx_hashed(*s, *n)).collect::<Vec<_>>());
+            })
+        };
+        drop(best);
+        racer.join().expect("racer");
+        let mut expected: Vec<(Address, u64)> = all.iter().skip(1_000).copied().collect();
+        expected.extend(fresh);
+        let got = offered(&queue, 0x62);
+        // The mined senders start at nonce 1 now.
+        let mut next: std::collections::HashMap<Address, u64> = mined.iter().map(|(s, _)| (*s, 1)).collect();
+        for (sender, nonce) in &got {
+            let at = next.entry(*sender).or_insert(0);
+            assert_eq!(*nonce, *at, "sender {sender} offered out of order");
+            *at += 1;
+        }
+        let (mut a, mut b) = (got, expected);
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a.len(), b.len(), "lost or duplicated");
+        assert!(a == b, "different contents");
+    }
+
     /// cold. `cargo test -p n42-tx-queue --release --lib -- --ignored bench_frame_selection --nocapture`.
     #[test]
     #[ignore]

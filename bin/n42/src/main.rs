@@ -168,16 +168,29 @@ fn main() {
                     // held across anything. Before the first persistence
                     // the in-memory chain itself is counted.
                     let in_memory = ctx.provider().canonical_in_memory_state();
+                    let persisted_state = in_memory.clone();
                     let in_memory_blocks: n42::engine_ext::InMemoryBlocks = std::sync::Arc::new(move || {
                         match in_memory.get_persisted_num_hash() {
                             Some(persisted) => in_memory.get_canonical_block_number().saturating_sub(persisted.number),
                             None => in_memory.canonical_chain().count() as u64,
                         }
                     });
+                    // The last persisted block: the tracker's, or before the
+                    // first persistence of this run the database tip (the
+                    // head less the blocks held in memory).
+                    let persisted_block: n42::engine_ext::PersistedBlock = std::sync::Arc::new(move || {
+                        match persisted_state.get_persisted_num_hash() {
+                            Some(persisted) => persisted.number,
+                            None => persisted_state
+                                .get_canonical_block_number()
+                                .saturating_sub(persisted_state.canonical_chain().count() as u64),
+                        }
+                    });
                     let engine_ext = N42EngineExt {
                         payloads: ctx.node().payload_builder_handle().clone(),
                         raw_endpoint,
                         in_memory_blocks: Some(in_memory_blocks),
+                        persisted_block: Some(persisted_block),
                     };
 
                     // now we merge our extension namespace into all configured transports

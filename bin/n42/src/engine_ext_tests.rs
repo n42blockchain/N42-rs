@@ -66,7 +66,7 @@ fn ext(script: Script, raw_endpoint: Option<std::net::SocketAddr>) -> N42EngineE
             }
         }
     });
-    N42EngineExt { payloads: PayloadBuilderHandle::new(tx), raw_endpoint, in_memory_blocks: None }
+    N42EngineExt { payloads: PayloadBuilderHandle::new(tx), raw_endpoint, in_memory_blocks: None, persisted_block: None }
 }
 
 #[tokio::test]
@@ -111,4 +111,12 @@ async fn the_unpersisted_block_count_is_served_when_the_node_reads_it() {
     assert_eq!(ext.in_memory_blocks().await.unwrap(), None, "a node that does not read it says null");
     ext.in_memory_blocks = Some(Arc::new(|| 42));
     assert_eq!(ext.in_memory_blocks().await.unwrap(), Some(42));
+}
+
+#[tokio::test]
+async fn the_persisted_block_is_served_when_the_node_reads_it() {
+    let mut ext = ext(Script::Unknown, None);
+    assert_eq!(ext.persisted_block().await.unwrap(), None, "a node that does not read it says null");
+    ext.persisted_block = Some(Arc::new(|| 1234));
+    assert_eq!(ext.persisted_block().await.unwrap(), Some(1234));
 }

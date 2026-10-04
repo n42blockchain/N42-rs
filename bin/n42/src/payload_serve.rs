@@ -596,10 +596,18 @@ where
     if let Some(head) = reuse.canonical_head.as_ref().and_then(|current| current()) {
         if head != header.parent_hash {
             let moved_at = std::time::Instant::now();
+            // Under the split settlement tags (`n42_h2_execution::settlement`)
+            // the parent is committed, not certified or persisted: this head
+            // move leaves safe and finalized where the validator's driver put
+            // them (zero is "unchanged" to the engine).
+            let tag = match n42_h2_execution::settlement_tags() {
+                n42_h2_execution::SettlementTags::Legacy => header.parent_hash,
+                n42_h2_execution::SettlementTags::Split => alloy_primitives::B256::ZERO,
+            };
             let state = alloy_rpc_types_engine::ForkchoiceState {
                 head_block_hash: header.parent_hash,
-                safe_block_hash: header.parent_hash,
-                finalized_block_hash: header.parent_hash,
+                safe_block_hash: tag,
+                finalized_block_hash: tag,
             };
             match engine.fork_choice_updated(state, None).await {
                 Ok(updated) => info!(

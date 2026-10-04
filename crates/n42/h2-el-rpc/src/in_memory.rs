@@ -110,3 +110,83 @@ pub fn spawn_poller<T: JsonRpcTransport>(transport: T, every: Duration) -> InMem
     });
     gauge
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::RpcError;
+    use serde_json::{json, Value};
+    use std::sync::Mutex;
+
+    /// Answers each call with the next scripted result and counts the calls.
+    struct Scripted(Mutex<(Vec<Result<Value, TransportError>>, usize)>);
+
+    impl Scripted {
+        fn new(mut answers: Vec<Result<Value, TransportError>>) -> Self {
+            answers.reverse();
+            Self(Mutex::new((answers, 0)))
+        }
+        fn calls(&self) -> usize {
+            self.0.lock().map(|state| state.1).unwrap_or_default()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl JsonRpcTransport for Scripted {
+        async fn call(&self, method: &str, params: Vec<Value>) -> Result<Value, TransportError> {
+            assert_eq!(method, IN_MEMORY_BLOCKS_METHOD);
+            assert!(params.is_empty());
+            let mut state = self.0.lock().map_err(|_| TransportError::Transport("poisoned".into()))?;
+            state.1 += 1;
+            state.0.pop().unwrap_or_else(|| Err(TransportError::Transport("no more answers".into())))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_poll_records_the_count_and_a_failure_reads_as_unknown() {
+        let gauge = InMemoryGauge::default();
+        assert_eq!(gauge.get(), None, "unknown until read");
+        let transport = Scripted::new(vec![
+            Ok(json!(57)),
+            Err(TransportError::Transport("timed out".into())),
+            Ok(json!(12)),
+            Ok(Value::Null),
+        ]);
+        assert_eq!(poll_once(&transport, &gauge).await, Poll::Again);
+        assert_eq!(gauge.get(), Some(57));
+        assert_eq!(poll_once(&transport, &gauge).await, Poll::Again);
+        assert_eq!(gauge.get(), None, "a failed poll never leaves a stale count");
+        assert_eq!(poll_once(&transport, &gauge).await, Poll::Again);
+        assert_eq!(gauge.get(), Some(12));
+        assert_eq!(poll_once(&transport, &gauge).await, Poll::Again);
+        assert_eq!(gauge.get(), None, "a node that does not say");
+    }
+
+    #[tokio::test]
+    async fn a_stock_execution_layer_is_asked_once() {
+        let transport = Arc::new(Scripted::new(vec![Err(TransportError::Rpc(RpcError {
+            code: METHOD_NOT_FOUND,
+            message: "the method does not exist".into(),
+        }))]));
+        struct Shared(Arc<Scripted>);
+        #[async_trait::async_trait]
+        impl JsonRpcTransport for Shared {
+            async fn call(&self, method: &str, params: Vec<Value>) -> Result<Value, TransportError> {
+                self.0.call(method, params).await
+            }
+        }
+        let gauge = spawn_poller(Shared(Arc::clone(&transport)), Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(transport.calls(), 1, "the poller stopped at the first \"method not found\"");
+        assert_eq!(gauge.get(), None);
+    }
+
+    #[test]
+    fn a_count_never_reads_as_unknown() {
+        let gauge = InMemoryGauge::default();
+        gauge.set(Some(u64::MAX));
+        assert_eq!(gauge.get(), Some(u64::MAX - 1));
+        gauge.set(Some(0));
+        assert_eq!(gauge.get(), Some(0));
+    }
+}

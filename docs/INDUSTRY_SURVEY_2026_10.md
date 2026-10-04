@@ -722,3 +722,87 @@ follower check p90 and `h` printed per leg. If the lift is purely a scheduling g
 cycle drops to about 105-115 ms; if those counters rise again to 60-76 ms and the cycle stays at 130-135 ms, the
 contention reading holds and neither the slot nor D is the lever. The existing ON/AHEAD logs already lean to the
 second outcome.
+
+### 11.7 Anatomy of the excess over the tick (loop317 BASE and BASEb, window 1)
+
+`scripts/fleet7-excess-anatomy.py <round-dir>` (reuses the parser of `fleet7-depth-replay.py`). 220 blocks per leg, leader
+node 0, cycle mean 135.6 / 135.4 ms, median 124.8 / 128.4, p90 187.7 / 180.4; the excess over 100 ms is 35.6 / 35.4 ms.
+
+**Segments** (each block's cycle = 100 ms + the six segments, exactly; mean over blocks, ms; share of the excess, BASE / BASEb):
+
+| Segment | Meaning | median | mean | p90 | share |
+| --- | --- | --- | --- | --- | --- |
+| late (timer) | preamble after P(V-1) + 100 ms, not explained by the commit | 0.5 | 1.7 / 3.1 | 12.8 / 18.5 | 4.9% / 8.8% |
+| late (quorum overshoot) | preamble held for the previous commit | 0.0 | 2.1 / 2.5 | 0.0 / 3.8 | 5.9% / 7.0% |
+| start lag, queue, build | inside the sealed-header wait, clipped to it | 0.0 | 0.7 / 0.6 | 0 | 1.8% |
+| encode | the EL encoding its ~26 MB answer (`encode_ms`) | 0.0 | 4.9 / 4.1 | 22 / 18 | 14% / 12% |
+| delivery | the EL's `built ahead on the sealed own block` line to `take_sealed` returning | 0.0 | 21.1 / 20.0 | 61 / 58 | 59% / 56% |
+| send | sealed header in hand to the proposal on the wire (sign, publish) | 2.6 | 5.0 / 5.2 | 13 | 14% / 15% |
+
+The median block has 0 in every segment except `send` (2.5 ms) and a 0.5 ms timer lateness: half the blocks are on the tick.
+Delivery is large only in the 42% of blocks whose wait for the sealed header was binding (median 51 ms there, p90 83). In
+the code (`bin/n42/src/payload_serve.rs`, `driver.rs`) the EL logs "built ahead on the sealed own block" *before* its
+`stream.write_all` of the whole ~26 MB answer, and `take_us` ends after the proposer has read and resolved it, so
+delivery is the write, read and decode of that answer; the logs do not split those three. The previous block's quorum path
+(first follower's check 28 ms median, vote-to-commit transit 19.6 ms, `Qc - P` 48 ms median, 85-98 ms p90) sits inside the
+100 ms and overshoots it in only 6-9% of blocks (the 2.1-2.5 ms above). The negative "receipt" median (-0.7 ms) is the
+followers' `import starting` stamp preceding the leader's `proposal sent` stamp by under a millisecond; nothing in the logs
+is more precise than that.
+
+**Groups** (mean ms; BASE; BASEb in brackets):
+
+| | <= 110 ms (79 blocks) | middle (119) | slowest 10% (22) |
+| --- | --- | --- | --- |
+| cycle | 101.5 (99.8) | 145.3 (144.5) | 205.9 (200.2) |
+| late (timer + quorum) | -1.4 (-2.7) | 6.8 (9.5) | 6.8 (10.6) |
+| build | 0 | 0.3 (0.2) | 5.1 (5.2) |
+| encode | 0 | 5.1 (4.3) | 21.6 (16.2) |
+| delivery | 0.1 (0) | 27.1 (24.3) | 64.4 (60.1) |
+| send | 2.7 (2.5) | 6.1 (6.1) | 7.9 (8.1) |
+| `Qc - P` | 50.3 (49.3) | 55.6 (57.5) | 63.1 (59.5) |
+| share with trigger `send` | 0% | 49% (41%) | 77% (64%) |
+
+Between the fast group and the middle one the only segments that grow are delivery (+27 ms) and encode (+5 ms), and they grow
+together with the build trigger: every block with the `send` trigger is slow and none is fast. Between the middle and the
+slowest 10%, delivery grows by another 37 ms, encode by 16 ms, build by 5 ms: the same segments, longer.
+
+**Fixed part or noise.** Fixed, and tied to the build trigger. A build that starts at the previous *seal* (trigger `seal`, 66-70%
+of blocks) finishes before the next tick and gives a 98-109 ms cycle (cycle p10 / median / p90 98 / 109 / 147 BASE). A build that
+starts at the previous *send* (trigger `send`, one-ahead slot, 30-34%) starts a fixed lag after the previous proposal and
+needs queue 4 + build 76-80 + encode 25-26 + delivery 49-51 = 158-161 ms to reach the proposer (median
+160.6 / 157.9 ms from the previous send to the hand-off, p90 194 / 192): cycle 170 / 166 ms mean (p10 144 / 140, p90 204 /
+198). Mean excess 35 ms is 0.32 x 68 ms plus 0.68 x 19 ms. Only 74 of the 220 BASE blocks are in the first class, so the typical
+(median) 25 ms is a mix of the two modes, not a uniform lag: it is the 125 ms median of a 109 ms mode and a 168 ms mode.
+Within the `send` blocks the spread is noise around the fixed chain (cycle against delivery r = 0.73 / 0.74, against build
+0.67 / 0.43, build against delivery 0.16 / -0.10, so the two vary independently).
+
+**Leadership.** In both legs `F7_LEADER_TENURE` ends at 1024 views: node 0 proposes views 1-1023, node 1 views 1024-2047,
+node 2 from 2048 (61 and 72 proposals before the leg ends, all in the empty tail; `seal-first` builds 755 / 423 / 0 on
+nodes 0 / 1 / 2 because node 2 never reaches a full block). Rotation is node 0, 1, 2 by tenure; window 1 (views about 270-490) lies
+inside node 0's tenure, so no handover is in it, and the question whether slow blocks cluster at handovers cannot be
+answered from window 1; windows 2-3 hold the 0-to-1 handover. Autocorrelation of the cycle is -0.55 / -0.49 at lag 1, +0.53 /
++0.34 at lag 2, -0.33 / -0.16 at lag 3: a period-2 alternation. The mechanism is visible in the trigger: a `send`
+block is never followed by another `send` block (0 of 75 and 0 of 66), and after a `seal` block the next is `send` in 51% /
+42%. P(slowest 10% | previous slowest) = 0.00 / 0.05 against a base rate of 0.10. Slow blocks do not follow slow
+predecessors; they follow fast ones, because a slow block frees the slot so that the next build starts early.
+
+**Cross-node coincidence.** Not host-wide. For the slowest 10% of blocks the followers' stages are at their medians or
+below (check 0.83-1.01x, exec 0.88-0.97x, root 0.86-1.00x, fields lag 0.98-1.01x; the block before: 0.91-1.23x, check on node 1
+in BASE the only one above 1.1x). Blocks above a follower's own p90 on both followers: 2 / 5 / 3 (check / exec / root, BASE)
+against 2.2 expected by independence; on exactly one follower 32-40. Cross-follower correlation of the check is +0.04 / +0.07,
+of exec +0.42 / +0.37, of root +0.15 / +0.31 (exec and root share the block's content, so some correlation is expected).
+The leader's `par_ms` is 1.06x and its seal-to-hand-off 1.03-1.07x at the slowest blocks. The slowness is local to one node's
+one path: the leader's build-to-delivery chain.
+
+**Cause and cheapest confirmation.** The fixed part: with the one-ahead slot, a third of the blocks (all `send` blocks) pay a chain of
+about 160 ms (build 80, encode 26, delivery 50, queue 4) from the previous send against a 100 ms tick, and the second half of
+that chain (encode and the write, read and decode of the 26 MB answer, 75 ms) is the only part that is not computation
+overlapped with something else. The tail part: the variance of that same chain, dominated by delivery (p90 83 against median 51)
+and by build (p90 145-147 against 76-80). Cheapest measurement for the fixed part: put three timestamps on the take (EL
+`write_all` start, `write_all` end, proposer read end) and one on the decode, one extra line per proposal, on one ordinary
+BASE leg; if the sum of write, read and decode is the 50 ms of `delivery`, the lever is not sending 26 MB to the proposer
+(the proposal itself carries a 12.5 KB compact body) and the prediction is that `send`-trigger cycles fall from 168 toward 135
+ms. For the tail: the same three timestamps plus the leader's thread CPU (`threadcpu-*.tsv`) around the slowest blocks; if the
+long deliveries coincide with the write or the read side being descheduled, it is scheduling, and if the write
+itself takes the time, it is the copy of the 26 MB. This analysis cannot say which, because the line that ends the EL's
+stage is logged before the write.

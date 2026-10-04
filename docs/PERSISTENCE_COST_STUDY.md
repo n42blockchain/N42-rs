@@ -354,3 +354,199 @@ variables):
    `save_blocks_commit_rocksdb` near zero and the static files exposed.
 4. Both together, optionally with `--prune.sender-recovery.full` in `F7_EL_EXTRA` for the static-file
    floor.
+
+## 10. Follower drift after a tenure
+
+Offline diagnosis (2026-10-04): code reading plus python over the loop319-loop321 node logs
+(`/data/blockchain/rust-fleet3-bench/bench-loop3{19,20,21}*/node*-el.log`), the per-node metrics dumps
+and the 2 s `mem.log` samples (`/data/n42-build/target-n42-rs/fleet-runs/strip-<tag>/mem.log`). No node
+was run and no code was changed. The scripts are throwaway (`/tmp/drift/*.py`): handover = the time of
+node 0's 1023rd `own block imported by header`; "num" = `reth_blockchain_tree_in_mem_state_num_blocks`
+of the same node at the nearest sample.
+
+### 10.1 Result in one paragraph
+
+The drift is a **cliff at 64 in-memory blocks in the overlay's address-filter cache**
+(`crates/storage/provider/src/providers/state/overlay_filter.rs`, `CACHE_CAP = 64`), not a QMDB
+persist that slows by itself. Below 64 unpersisted blocks every follower import executes in 43-45 ms
+(median) whatever the depth; from 64 up it jumps (54 ms at 64-67, 141 at 68-71, 173 at 72-75) and then
+grows about 5 ms per extra block (591 ms at 152-155). The leader's build shows the same step (`par_ms`
+95-105 below 64, 128 at 64-67, 168-201 at 68-79). Node 0 is the only node that changes role while the
+flood runs; on the drifting legs it leaves its tenure with 51-57 blocks in memory (peaks 66-71), crosses
+64 at the top of each persistence sawtooth from the first seconds as a follower, its imports slow, the
+chain follows its vote (straggler grace), its persistence falls further behind (batch interval 4-6 s
+before the handover, 6-10 s after, then 12 s and 42 s), every further block makes reads more expensive,
+and once its heap passes about 33 GB the page cache it reads through (QMDB entry file, RocksDB, static
+files) starts to fault (major faults per root 0 to 1,300-4,200). The 226-407 ms `post_scope` of 10.69
+is the end of that road: on COMPACTb node 0's last batch was 48 blocks in 39.3 s, of which RocksDB was
+7.3 s and static files 2.7 s, so about 29 s of the leg's 51 s of QMDB callback is one batch in the
+memory-starved phase.
+
+### 10.2 What the QMDB persist callback does (question 1)
+
+`save_blocks_inner` calls `on_state_persisted(blocks)` once per batch (after the scope by default,
+beside it with `N42_PERSIST_QMDB_IN_SCOPE=1`); `QmdbNodeState::on_persisted`
+(`crates/n42/qmdb-reth/src/node_state.rs`) does:
+
+| Step | Per | Work | Scales with |
+| --- | --- | --- | --- |
+| `hold_journals_from(view head)` | batch | one write lock on the view's versions | constant |
+| `view.position(number, hash)` | block | versions read lock; a scan of the journals only for a number below the head | journals (at most the batch) |
+| forest lock `"on_persisted"` | block | `lock_as`: a wait behind whoever holds it (the build's `compute_operations` on a leader, the import's `insert_block_operations` on a follower) | contention, measured small (10.4) |
+| `flush_entries_for_sync` | block | writes the entry file's pending tail under the lock (no fsync) | bytes appended since the last flush; normally small because `on_canonical` already flushed through `sync_entries_if_file` |
+| `block_changes(hash)` | block | walks the block's ~157k sorted operations, `entry_offset` per operation; the cursor check scans `records.values()` only when the block is not directly under the cursor | keys in the block; records held (one per unpersisted block plus siblings, at most ~200) |
+| `raise_floor`, `set_keep_from(number + 1)` | block | max over the offsets, one record read; moves the forest's reader keep | constant |
+| lock released; `view.advance` | block | `advancing` mutex; the journal = 157k `index.get` on the global rayon pool (16 threads), each comparing keys by reading the entry file through its mapping; publish to 128 reader slots (waits out in-flight reads); `index.apply_sorted` (256 shards, rayon) with the same key reads; publish again; journal trim (held for the batch) | keys in the block; **page cache of the 6.7 GB entry file** (each get and insert reads records at random old offsets) |
+| `note_reader_lag` | batch | two atomics | constant |
+
+What it does not do: free records (the next `on_canonical` head move does that, `extract_if` over the
+records, freed off the lock on `n42-qmdb-release`), touch twigs, or walk anything keyed by builder hash.
+Twig trimming is bounded by the oldest retained undo, i.e. by the persisted head, so the untrimmed twigs
+grow with the unpersisted depth (about 77 twigs a full block), as does the record memory (~30 MB a block).
+None of the per-block work grows with the depth except through memory: the callback is O(keys) per block
+and O(blocks) per batch, and it becomes slow only when its random key reads of the entry file miss the
+page cache.
+
+### 10.3 What a leader keeps that a follower does not (question 2)
+
+| Leader-side state | Bound | Released |
+| --- | --- | --- |
+| forest records filed under builder hashes, moved by `QmdbForest::rename` | one per build; `rename` moves, and repoints children with one pass over the records | like any record: when the persisted head passes its number |
+| superseded builds ("previous build on the same parent was not committed", 271 on COMPACTb) | `pending` is reverted at the next move; a filed sibling is a record at an unpersisted height | when persistence passes that height (`cutoff` uses the number, not the branch) |
+| `built_executions` store and handed list | `KEEP = 3` each (finishing builds up to 6) | on the next own build: never after the handover |
+| `direct_build::leader_layers` | two blocks' layers (bundle and shards) | on the next own build: never after the handover |
+| `chain_alias` notes, sealed-block hints | 8 pairs, 256 hashes | bounded |
+
+So the tenure leaves two blocks' layers and up to six executions pinned until the node leads again (a
+few hundred MB, and a few output `Arc`s that also hold slots in the filter cache of 10.5), but nothing
+that makes a later persist or a later import scan longer. The one thing the tenure leaves that matters
+is the unpersisted depth itself: the leader's persistence loses to its own build (the `on_persisted` lock
+waits before the handover are all `held_by="compute_operations"`), so on the drifting legs node 0 ends
+the tenure 7-15 blocks deeper than the two followers.
+
+### 10.4 Node 0 across the handover (question 3)
+
+Per 10 s since the handover, node 0: follower imports, median `exec_ms` / root `root_ms`, num median /
+max, RSS max (GB), median major faults per root (process-wide, over the root), and the persistence
+commits seen in `mem.log` (time of the commit: blocks; healthy nodes commit every 4-6 s under load).
+
+| Leg | +0 | +10 | +20 | +30 | +40 | +50 | +60 | +100 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| loop321 COMPACTb (drift) | 51: 44/36, 50/70, 30, 0 | 53: 52/39, 64/72, 30, 0 | 42: 115/56, 68/81, 30, 0 | 40: 120/74, 72/83, 30, 1 | 34: 181/83, 73/88, 31, 29 | 24: 204/85, 94/103, 33, 1,267 | 18: 339/89, 114/121, 36, 1,351 | 12: 454/101, 126/130, 39, 4,202 |
+| loop321 T4880b (drift) | 48: 47/33, 64/78, 29, 0 | 51: 49/33, 63/74, 29, 0 | 41: 115/38, 72/77, 30, 0 | 47: 53/46, 72/79, 29, 0 | 38: 130/50, 73/84, 30, 1 | 22: 243/83, 99/107, 34, 553 | 25: 226/102, 84/94, 34, 0 | 10: 577/113, 144/148, 42, 1,572 |
+| loop321 COMPACT (healthy) | 56: 45/31, 44/57, 26, 0 | 52: 46/33, 50/62, 27, 0 | 56: 46/33, 49/60, 27, 0 | 49: 42/31, 44/63, 27, 0 | 58: 43/29, 46/58, 26, 0 | 47: 45/29, 33/41, 22, 0 | 45: 46/35, 32/39, 21, 0 | flood over |
+| loop321 T3264 (healthy) | 58: 47/33, 49/62, 28, 0 | 54: 52/34, 62/69, 29, 0 | 52: 44/27, 48/59, 27, 0 | 54: 48/28, 54/65, 29, 0 | 54: 45/36, 52/68, 28, 0 | 54: 47/31, 52/65, 28, 0 | 53: 50/32, 54/64, 28, 0 | flood over |
+
+Commits on node 0 (s after the handover: blocks): COMPACTb -11:25 -5:35 +1:38 +9:31 +15:34 +21:33
++31:38 +43:39 +85:48; T4880b -6:31 +2:37 +8:35 +16:35 +24:34 +32:38 +40:35 +60:39. Healthy COMPACT keeps
+4-6 s intervals (+6, +10, +16, +22, +28, +34, ...), T3264 6 s.
+
+At 2 s resolution the import cost follows the in-memory sawtooth, not the batch phase: on T4880b node 0's
+imports read 33-57 ms whenever num is 42-63 and 96-250 ms whenever it is 64-79, flipping within one
+sample of each commit (num 72 to 42: exec 250 to 37; 52 to 72: 43 to 245; 78 to 52: 84 to 43).
+Over every import of 13 legs (28k imports, all nodes):
+
+| num | 32-59 | 60-63 | 64-67 | 68-71 | 72-75 | 80-83 | 100-103 | 120-123 | 152-155 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| import `exec_ms` median / p90 | 43-44 / 55-58 | 45 / 72 | 54 / 152 | 141 / 215 | 173 / 242 | 190 / 260 | 259-262 / 324-336 | 399 / 515 | 591 / 667 |
+| leader `par_ms` median | 90-108 | 105 | 128 | 168 | 194 | 223 | - | - | - |
+
+Lock waits: the `on_persisted` waits are 0-5 per 10 s at 20-530 ms (before the handover behind
+`compute_operations`, after it behind `insert_block_operations`); imports waiting on `on_persisted` are
+0-2 per 10 s at 27-123 ms. `sync_entries_if_file` holds of 20-250 ms are as frequent on node 2 (103 a
+minute) as on node 0 (86), so no lock is node-0 specific. `reader_lag` on node 0: 28-47 before the
+handover, 36-67 at +0..+20, 82 at +60, 124 at +110.
+
+Which moves first: neither persistence nor the lock. The first change at the handover is node 0's
+follower import crossing the 64-block cliff at the top of each sawtooth (p90 `exec_ms` in the first
+10 s: 159-276 ms on all five drifting legs, 53-60 on the healthy ones; node 2 in the same windows 55-169,
+mostly 55-88), together with node 0's persistence slowing (batch intervals widen at once: 6-8 s).
+Major faults come 30-50 s later (RSS above ~33 GB). The loop: depth over 64 -> imports and builds slow,
+and each overlay open rebuilds filters (10.5) on the node's cores -> the persistence batch takes longer
+-> the next batch starts deeper -> the depth stays over 64 for more of each cycle -> ~150 MB of heap per
+extra block (RSS 30 -> 44 GB at 70 -> 159 blocks) -> page-cache loss -> majflt in the root, the
+execution and the view advance -> slower still. What breaks it on the legs that recover is not reaching
+it: node 0 leaves the tenure at a median of 34-51 blocks and its sawtooth peaks stay under 64, so a
+commit keeps resetting it (COMPACT: 44 -> 33 -> 10 by +80). loop319 COMPACTb (median 61 at the
+handover) drifted slowly (`exec` 48 -> 150 ms) without collapsing.
+
+### 10.5 The mechanism
+
+`MemoryOverlayStateProviderRef::new` calls `filters_of(in_memory)`, which calls
+`overlay_filter::filter_for` for every in-memory block, newest first, on every state open. The side map
+holds at most `CACHE_CAP = 64` entries and evicts the oldest *inserted* entry (`cache.remove(0)`) when a
+block is missing. That is FIFO over a cyclic access pattern: with 64 or fewer live blocks one block (the
+new one) misses per open; with 65 or more **every block misses on every open** (simulated: misses per
+open 1, 4, 6 at depth 40, 60, 63; 64, 65, 70, 150 at depth 64, 65, 70, 150). Each miss spawns an
+`overlay-filter` thread that builds a fresh ~200 KB filter over the block's ~150k-account bundle, and a
+read never waits for it: an unbuilt filter means "probe the bundle", so above the cliff every read walks
+the bundles' hash maps block by block (the 5 ms per extra block slope) while the node burns D thread
+spawns and D filter builds per open (the CPU that slows persistence and the build beside it). Entries
+whose block left the tree but is still referenced elsewhere (the persistence batch in flight, the
+leader-side `KEEP` stores) keep their slots, so the effective threshold sits a little under 64, a
+little lower on a leader.
+
+Evidence for: the step at exactly 64 in 28k imports across all nodes and legs, on the follower import
+and on the leader's build; the per-sample flips with each commit; node 2 (which never leads and stays
+under ~63) never drifts; the one leader-throttle leg at 32/64 held (it keeps the count under the cliff)
+while 48/80 (proposals at up to 75) failed once in two; 10.66's "slower build 10 s before the handover"
+is node 0 at 66-71 blocks. Excluded: the read view's journals (`JOURNAL_DEPTH = 64`) would decline reads
+only for a reader more than 64 blocks behind the view, i.e. a batch over 64 blocks; batches were 31-39
+when the cliff showed, and `unanswered_reads` is 0 on every leg. The QMDB callback itself is O(keys) per
+block (10.2) and its 4-7x is the late, memory-starved phase.
+
+Against, or not shown: how many overlay opens a block costs (import, engine, pool, RPC), so the size of
+the rebuild storm is inferred, not measured; that the persistence slowdown right after the handover is
+CPU from that storm rather than something else on node 0 (no per-batch timeline exists); the new
+leader node 1 on COMPACT reached 139 blocks without collapsing because its own blocks import by header
+(no execution on the overlay) and the chain waits on the followers' votes, which fits, but its build at
+that depth was not checked.
+
+### 10.6 Why node 0 (question 4)
+
+It is the only node whose role changes while the flood runs: node 2 never leads, and node 1's tenure of
+1024 views does not end before the flood does (on COMPACT the flood ends about 80-90 s after the
+handover; on the drifting legs node 1 makes only 406-1024 proposals at a slowing chain). The first leader
+is not special in configuration or in its queue (node 0's and node 2's queues hold the same 0.8M
+transactions after the handover); it is special in arriving at the follower role with the deepest
+backlog, because a leader's persistence competes with its own build for the forest lock and the cores.
+
+### 10.7 What each existing switch should do under this mechanism
+
+* `N42_PERSIST_QMDB_IN_SCOPE=1`: `post_scope` falls to about zero and `qmdb_persisted` is unchanged; a
+  healthy batch is shorter by the callback (about 61 of 730 ms), so the sawtooth peaks sit a few blocks
+  lower and fewer legs reach 64. It does not touch the cliff: a leg whose node 0 leaves the tenure near 60
+  still drifts, and in the drift the callback now lengthens the scope instead of the tail. Expect the
+  drift rate to fall at most a little; any drift should still show the exec step at 64.
+* `N42_ACCOUNT_HISTORY=off`: removes the critical-path RocksDB task (about 119 of 178 ms per full block,
+  section 3), so persistence outruns the 120 ms cycle on every node and the depth should stay around
+  10-30, never near 64. Prediction: no drift on any leg, follower `exec_ms` flat at ~43, leader `par_ms`
+  flat. A drift with the depth under 60 would refute the mechanism.
+
+### 10.8 The measurement that settles it, and the fix
+
+Settle it with one counter: the number of filters `filter_for` builds (one `fetch_add` where it spawns
+the thread), exported next to the depth the overlay was opened at. The mechanism predicts about one
+build per block below 64 and depth x opens per block above it, switching on exactly when num crosses 64.
+Without code, `memsample.py` can add the box's thread-creation rate (the `processes` line of
+`/proc/stat`) to `mem.log`: it should jump by thousands per second whenever a node passes 64. Either
+reading, with `exec_ms` binned as in 10.4, decides it.
+
+Candidates weighed:
+
+| Change | Breaks the loop? | Cost and risk |
+| --- | --- | --- |
+| **Filter cache that never evicts a live block** (`CACHE_CAP` 64 -> 1024, or evict only entries whose owner is gone) | yes: the import pays one filter probe per block per read at any depth (gentle, linear), so depth no longer multiplies the cost; persistence keeps its CPU | one constant; 206 KB a filter, so 150 live blocks are 31 MB and the cap's worst case ~210 MB; the linear search over the map per open is D x cap compares (150 x 150). Answers cannot change: a filter only lets a read skip a bundle. Lowest risk |
+| releasing leader-side records at the handover | no: they are bounded (10.3) | small memory win only |
+| bounding the persist batch on a follower | no: persistence is still slower than the chain, the depth still grows | adds the per-batch fixed cost (section 6) |
+| moving the callback off the import's lock | no: the waits are small (10.4) | `N42_PERSIST_QMDB_IN_SCOPE=1` already measures the nearest version |
+| follower-side throttle on import admission (hold the vote while num > SOFT) | yes, by keeping every node under the cliff, at the price of slowing the chain to the slowest persister | needs the hold capped well under the view timeout; costs throughput whenever any node lags |
+
+Proposed: the filter cache change first (one line, no behaviour change, removes the cliff), measured on
+a COMPACT pair against COMPACT controls, reading the exec-versus-num bins above; it leaves the slower
+underlying fact (persistence at ~178 ms a full block against a 120 ms cycle) to `N42_ACCOUNT_HISTORY=off`
+and the deferred indexer (section 9), which are what keep the depth low in the first place. Risk: none to
+correctness; the residual risk is that above 64 something else is also depth-bound (the in-memory read
+path is still O(depth) probes per missing account, and the heap still grows ~150 MB a block), so a node
+far behind would degrade gently instead of falling off the cliff, and the follower throttle remains the
+backstop if a leg shows that.

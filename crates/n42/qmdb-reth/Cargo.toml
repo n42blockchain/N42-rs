@@ -52,6 +52,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+reth-ethereum-engine-primitives.workspace = true
 # The read_bench example: point reads of the same accounts from MDBX and from QMDB.
 reth-db = { workspace = true, features = ["mdbx"] }
 reth-db-api.workspace = true

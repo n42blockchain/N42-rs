@@ -201,3 +201,213 @@ impl<V: WaitForCaches> WaitForCaches for N42TreeValidator<V> {
         self.inner.wait_for_caches()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{address, U256};
+    use reth_engine_tree::tree::{ExecutionCache, PayloadExecutionCache, SavedCache};
+    use reth_ethereum_engine_primitives::EthEngineTypes;
+    use reth_ethereum_primitives::{Block, EthPrimitives};
+    use reth_execution_types::BlockExecutionResult;
+    use reth_primitives_traits::{Account, RecoveredBlock};
+    use reth_provider::BlockExecutionOutput;
+    use reth_trie::{updates::TrieUpdates, HashedPostState};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    /// Stands in for reth's validator: counts the executed inserts it is
+    /// handed and answers with the block's trie data already sorted.
+    #[derive(Default)]
+    struct Recorder {
+        inserted: Arc<AtomicUsize>,
+    }
+
+    impl EngineValidator<EthEngineTypes> for Recorder {
+        fn validate_payload_attributes_against_header(
+            &self,
+            _attr: &<EthEngineTypes as PayloadTypes>::PayloadAttributes,
+            _header: &alloy_consensus::Header,
+        ) -> Result<(), InvalidPayloadAttributesError> {
+            Ok(())
+        }
+
+        fn convert_payload_to_block(
+            &self,
+            _payload: <EthEngineTypes as PayloadTypes>::ExecutionData,
+        ) -> Result<SealedBlock<Block>, NewPayloadError> {
+            unreachable!("not reached by these tests")
+        }
+
+        fn validate_payload(
+            &mut self,
+            _payload: <EthEngineTypes as PayloadTypes>::ExecutionData,
+            _ctx: TreeCtx<'_, EthPrimitives>,
+        ) -> ValidationOutcome<EthPrimitives> {
+            unreachable!("not reached by these tests")
+        }
+
+        fn validate_block(
+            &mut self,
+            _block: SealedBlockWithAccessList<Block>,
+            _ctx: TreeCtx<'_, EthPrimitives>,
+        ) -> ValidationOutcome<EthPrimitives> {
+            unreachable!("not reached by these tests")
+        }
+
+        fn on_inserted_executed_block(
+            &self,
+            block: BuiltPayloadExecutedBlock<EthPrimitives>,
+        ) -> ProviderResult<ExecutedBlock<EthPrimitives>> {
+            self.inserted.fetch_add(1, Ordering::SeqCst);
+            let BuiltPayloadExecutedBlock { recovered_block, execution_output, hashed_state, trie_updates } =
+                block;
+            let (data, producer) = LazyTrieData::pending(hashed_state, trie_updates);
+            let _ = producer.compute_and_publish();
+            Ok(ExecutedBlock::with_deferred_trie_data(recovered_block, execution_output, data))
+        }
+
+        fn payload_builder_resources(
+            &self,
+            _parent_hash: B256,
+            _parent_header: &alloy_consensus::Header,
+            _timestamp: u64,
+            _state: &mut EngineApiTreeState<EthPrimitives>,
+        ) -> PayloadBuilderResources {
+            unreachable!("not reached by these tests")
+        }
+    }
+
+    fn hashed_state() -> HashedPostState {
+        let mut state = HashedPostState::default();
+        state.accounts.insert(
+            B256::with_last_byte(1),
+            Some(Account { nonce: 3, balance: U256::from(7), bytecode_hash: None }),
+        );
+        state.accounts.insert(B256::with_last_byte(2), None);
+        state
+    }
+
+    fn executed(number: u64) -> BuiltPayloadExecutedBlock<EthPrimitives> {
+        let mut block = Block::default();
+        block.header.number = number;
+        let mut output = BlockExecutionOutput {
+            result: BlockExecutionResult::default(),
+            state: Default::default(),
+        };
+        output.result.gas_used = 21_000 * number;
+        BuiltPayloadExecutedBlock {
+            recovered_block: Arc::new(RecoveredBlock::new_unhashed(block, vec![])),
+            execution_output: Arc::new(output),
+            hashed_state: Arc::new(hashed_state()),
+            trie_updates: Arc::new(TrieUpdates::default()),
+        }
+    }
+
+    fn wrapped(mode: ExecCacheOnInsert) -> (N42TreeValidator<Recorder>, Arc<AtomicUsize>) {
+        let recorder = Recorder::default();
+        let inserted = Arc::clone(&recorder.inserted);
+        (N42TreeValidator::new(recorder, mode, Runtime::test()), inserted)
+    }
+
+    #[test]
+    fn the_switch_reads_on_and_nothing_else() {
+        assert_eq!(ExecCacheOnInsert::from_env_value(Some("on")), ExecCacheOnInsert::Update);
+        for value in [None, Some(""), Some("off"), Some("1"), Some("ON")] {
+            assert_eq!(ExecCacheOnInsert::from_env_value(value), ExecCacheOnInsert::Skip, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn skipping_never_reaches_the_inner_hook() {
+        let (validator, inserted) = wrapped(ExecCacheOnInsert::Skip);
+        for number in 1..=3 {
+            let _ = EngineValidator::<EthEngineTypes>::on_inserted_executed_block(&validator, executed(number))
+                .expect("an executed insert");
+        }
+        assert_eq!(inserted.load(Ordering::SeqCst), 0, "the inner hook is the one that writes the cache");
+    }
+
+    #[test]
+    fn updating_hands_every_insert_to_the_inner_hook() {
+        let (validator, inserted) = wrapped(ExecCacheOnInsert::Update);
+        for number in 1..=3 {
+            let _ = EngineValidator::<EthEngineTypes>::on_inserted_executed_block(&validator, executed(number))
+                .expect("an executed insert");
+        }
+        assert_eq!(inserted.load(Ordering::SeqCst), 3);
+    }
+
+    /// The block, its execution output and its sorted trie data are the same
+    /// whichever way the insert went.
+    #[test]
+    fn both_modes_give_the_tree_the_same_executed_block() {
+        let expected_hashed = hashed_state().clone_into_sorted();
+        for mode in [ExecCacheOnInsert::Skip, ExecCacheOnInsert::Update] {
+            let (validator, _) = wrapped(mode);
+            let input = executed(5);
+            let output_in = Arc::clone(&input.execution_output);
+            let hash = input.recovered_block.hash();
+            let block = EngineValidator::<EthEngineTypes>::on_inserted_executed_block(&validator, input)
+                .expect("an executed insert");
+            assert_eq!(block.recovered_block().hash(), hash, "{mode:?}");
+            assert_eq!(block.recovered_block().number, 5, "{mode:?}");
+            assert_eq!(block.execution_outcome(), &*output_in, "{mode:?}");
+            assert_eq!(block.execution_outcome().result.gas_used, 105_000, "{mode:?}");
+            // Waits for the worker's sort when it has not published yet.
+            assert_eq!(*block.hashed_state(), expected_hashed, "{mode:?}");
+            assert_eq!(*block.trie_updates(), TrieUpdates::default().into_sorted(), "{mode:?}");
+            assert!(block.bal().is_none(), "{mode:?}");
+        }
+    }
+
+    /// What a reth-side execution (a fork's payload, a range sync) finds in a
+    /// cache that skipped inserts left at an old block: it asks for the
+    /// cache by its parent's hash. A different parent gets the cache back
+    /// empty -- every read goes to the state provider -- and the old block's
+    /// own children get exactly that block's state, which a skipped insert
+    /// never changed.
+    #[test]
+    fn a_stale_cache_misses_or_holds_its_own_block_state() {
+        let stale = B256::repeat_byte(0xaa);
+        let tip = B256::repeat_byte(0xbb);
+        let who = address!("0000000000000000000000000000000000000042");
+        let at_stale = Account { nonce: 1, balance: U256::from(10), bytecode_hash: None };
+        let fill = |cache: &PayloadExecutionCache| {
+            let saved = SavedCache::new(stale, ExecutionCache::new(1_000_000));
+            saved.cache().insert_account(who, Some(at_stale));
+            cache.update_with_guard(|slot| *slot = Some(saved));
+        };
+        let read = |saved: &SavedCache| {
+            let mut miss = false;
+            let account = saved
+                .cache()
+                .get_or_try_insert_account_with(who, || {
+                    miss = true;
+                    Ok::<_, ()>(None)
+                })
+                .expect("a cache read");
+            (miss, account)
+        };
+
+        // A block on another parent: the cache comes back empty.
+        let cache = PayloadExecutionCache::default();
+        fill(&cache);
+        let checked_out = cache.get_cache_for(tip).expect("an available cache");
+        assert_eq!(checked_out.executed_block_hash(), tip);
+        let (miss, _) = read(&checked_out);
+        assert!(miss, "a cache left at another block must not answer for this one");
+
+        // A block on the stale block itself: that block's state.
+        let cache = PayloadExecutionCache::default();
+        fill(&cache);
+        let checked_out = cache.get_cache_for(stale).expect("an available cache");
+        assert_eq!(checked_out.executed_block_hash(), stale);
+        let (miss, account) = read(&checked_out);
+        assert!(!miss, "the stale block's own state is what it holds");
+        let text = format!("{account:?}");
+        assert!(text.starts_with("Cached(Some(") && text.contains("nonce: 1"), "{text}");
+    }
+}

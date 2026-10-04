@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+# Copyright (c) 2017-2025 N42 Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+"""Every 2 s, per execution-layer process of the bench fleet: RSS from /proc/<pid>/status and the in-memory block
+metrics of its Prometheus endpoint (ports F7_METRICS_BASE + i, 19300 by default): num_blocks, latest and earliest
+in-memory block (earliest - 1 is the persisted height), backpressure_active and the backpressure stall histogram.
+usage: memsample.py <out file> [nodes]. One line a node: `<epoch> <HH:MM:SS> node<i> pid= rss_g= num= latest= earliest= bp= stall_n= stall_s=`
+(`-` where the process or endpoint did not answer). Runs until killed."""
+import os, re, sys, time, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+out = sys.argv[1]; nodes = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+base = int(os.environ.get('F7_METRICS_BASE', '19300')); root = os.environ.get('F7_ROOT', '/data/blockchain/rust-fleet3-bench')
+NAMES = {'reth_blockchain_tree_in_mem_state_num_blocks': 'num', 'reth_blockchain_tree_in_mem_state_latest_block': 'latest',
+         'reth_blockchain_tree_in_mem_state_earliest_block': 'earliest', 'reth_consensus_engine_beacon_backpressure_active': 'bp',
+         'reth_consensus_engine_beacon_backpressure_stall_duration_count': 'stall_n',
+         'reth_consensus_engine_beacon_backpressure_stall_duration_sum': 'stall_s'}
+def pid_of(i):
+    for p in os.listdir('/proc'):
+        if not p.isdigit(): continue
+        try: c = open(f'/proc/{p}/cmdline', 'rb').read().replace(b'\0', b' ').decode(errors='replace')
+        except OSError: continue
+        if '/n42 node' in c and f'{root}/node{i}' in c: return int(p)
+    return None
+def sample(i):
+    d = {k: '-' for k in ('num', 'latest', 'earliest', 'bp', 'stall_n', 'stall_s')}; pid = pid_of(i); rss = '-'
+    if pid:
+        try: rss = '%.2f' % (int(re.search(r'VmRSS:\s+(\d+)', open(f'/proc/{pid}/status').read())[1]) / 1e6)
+        except (OSError, TypeError): pass
+    try:
+        for l in urllib.request.urlopen(f'http://127.0.0.1:{base + i}/metrics', timeout=1.5).read().decode().splitlines():
+            n, _, v = l.partition(' ')
+            if n in NAMES: d[NAMES[n]] = v
+    except Exception: pass
+    return f'node{i} pid={pid or "-"} rss_g={rss} num={d["num"]} latest={d["latest"]} earliest={d["earliest"]} bp={d["bp"]} stall_n={d["stall_n"]} stall_s={d["stall_s"]}'
+ex = ThreadPoolExecutor(nodes)
+with open(out, 'a', buffering=1) as f:
+    while True:
+        t = time.time()
+        for l in ex.map(sample, range(nodes)): f.write(f'{t:.2f} {time.strftime("%H:%M:%S", time.localtime(t))} {l}\n')
+        time.sleep(max(0.0, 2 - (time.time() - t)))

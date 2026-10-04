@@ -973,3 +973,107 @@ Cheapest fleet measurement for the cause: node 2's engine landing latency per bl
 log) and its `parent_engine_wait_ms` against node 1's on one ordinary F leg with the two nodes' cores swapped (node 1's execution layer and
 validator pinned where node 2's were, and the reverse). If the late landing follows the node, it is the node's configuration or core
 placement; if it follows the position, it is the order in which the engine accepts the executed blocks, and the wait is the design.
+
+### 11.10 Why node 2 is the last voter: the two-slot import cap, and a slower engine on node 2 (loop324 F, Fb, FS, FSb, FV, FSG, WARM, offline)
+
+Offline: logs, scripts and code only; no node, fleet or cargo. Analysis scripts were scratch (`/tmp`), built on the parser of `scripts/fleet7-depth-replay.py`;
+the per-block tables below can be rebuilt from `<leg>/node{1,2}-el.log` and `-v.log` (`import starting`, `compact body assembled`, `raw newPayload`, `Block added to canonical chain`,
+`direct import: executed here`). Window 1, 233-238 blocks a leg. Times are medians unless stated.
+
+**1. What the 73 ms wait is.** `wait_for_engine` is the anatomy script's label (`fleet7-excess-anatomy.py`, body arrival to the `compact body assembled` line minus
+`assemble_ms`); no function has that name. The wait is a queue in `ExecutionDriver::spawn_execute_deferred` (`crates/n42/h2-execution/src/driver.rs`):
+`const DEFERRED_IN_FLIGHT: usize = 2` ("the one executing and the one being checked behind it ... one block deep by design", memory-motivated). A block that arrives while
+`executing.len() >= 2` goes to `import_queue` and its task, which calls `el.new_payload_body_checked` (the compact-body assembly and the check, hence the vote), is not spawned. A slot is freed
+only in `finish_execute`, on `ImportReport::Done`, i.e. when the whole `new_payload_body_checked` call has returned, which is after the engine landed the block and answered
+(`raw newPayload ... engine_ms`, a few ms after `Block added to canonical chain`). Then `import_queue.pop_front()` starts the next one. Evidence, node 2, F: assembly start minus the `raw newPayload`
+line of block n-2: min 0.4, median 3.4, p90 10.8 ms; gated (assembly more than 5 ms after body arrival) in 231 of 234 blocks, with two unlanded predecessors at body arrival in 230 of 234.
+Node 1: gated in 13 of 234, 0.53 unlanded predecessors on average (0 in 110, 1 in 124). Block n is therefore held until block n-2 is in the engine.
+
+**2. Is it a correctness requirement?** No; it is ordering and memory policy. Section 17.1 of `docs/PHASE_D_DEFERRED_EXECUTION.md`: a vote attests that the body is held and well formed, that
+the transactions are includable on N-1's post-state, and that the header's four fields for N-1 equal this node's own result for N-1. What the code needs for that, in
+`follower_import.rs`: the frames (assembly from the queue: `frames_missing=0`, `miss_wait_ms=0` throughout, so frames are not late), N-1's published shards/output
+(`wait_for_parent_layer`, `parent_wait_ms=0`), N-1's fields (`wait_for_parent_fields`, `parent_fields_wait_ms=0`). Unlanded ancestors are read through, not waited for:
+`ancestry_of` stacks the published outputs of the unlanded ancestors (up to `PARENT_OUTPUTS_KEPT = 4`) over the nearest ancestor the engine holds. The landing of n-2 (or n-1) is
+needed only afterwards, by the hand-over to the engine (`parent_engine_wait_ms`, after the fields are ready and the vote has gone). No lock is involved: the forest-lock warnings
+(`insert_block_operations`, `on_canonical`, `on_persisted`) are all after the vote road and are no more frequent on node 2 than on nodes 0 and 1 (nodes 2 / 1 / 0: held 270 / 231 / 183 times over 20 ms,
+waited 38 / 69 / 74 times for `on_canonical`).
+
+**3. Where node 2 loses the time (F, medians, node 1 / node 2, ms; the 235-block window, which is the 50-block picture repeated).**
+
+| Step | node 1 | node 2 |
+| --- | --- | --- |
+| body arrival to assembly start | 1.0 | **73.1** |
+| assembly start to execution start | 7 | 10 |
+| execution (`exec_ms`) | 37 | 36 |
+| execution end to fields ready (QMDB root) | 28 | 25 |
+| fields ready to `Block added to canonical chain` | 40.9 | **149.2** |
+| of which `parent_engine_wait_ms` | 0 | 40 |
+| of which `engine_ms` / `engine_new_payload_ms` | 18 / 7 | 36 / 24 |
+| assembly start to landing | 114.6 | **227.1** |
+| body arrival to landing | 116.8 | 300.3 |
+| `Canonical chain committed` (the commit's forkchoice, `elapsed`) | 16.7 | 16.7 |
+
+Fifty consecutive blocks (N = 375..424, ms after the leader's proposal; the first eight shown; assembly start, vote sent, landing for node 1; assembly start, vote sent, answer of `raw newPayload`, landing for node 2):
+
+| N | node 1 | node 2 |
+| --- | --- | --- |
+| 375 | -0.1, 19.6, 164.7 | 76.6, 95.2, 331.2, 321.9 |
+| 376 | -1.4, 16.2, 144.4 | 56.6, 81.2, 309.1, 298.1 |
+| 377 | -1.6, 31.8, 119.0 | 106.9, 127.7, 334.9, 321.9 |
+| 378 | -2.0, 20.9, 124.1 | 75.4, 94.3, 292.6, 288.7 |
+| 379 | 4.0, 23.3, 135.1 | 95.2, 117.5, 349.3, 346.2 |
+| 380 | 2.1, 28.7, 114.2 | 81.3, 104.3, 332.2, 310.7 |
+| 381 | 0.4, 22.2, 96.7 | 115.6, 141.1, 346.0, 336.9 |
+| 382 | 1.3, 21.7, 108.3 | 57.7, 81.4, 294.0, 277.1 |
+
+Over the fifty, node 1 votes at +14 to +57 ms and lands at +97 to +187; node 2 starts the assembly at +45 to +129, votes at +73 to +161 and lands at +249 to +353, about three cycles
+behind the proposal, with blocks n-1 and n-2 unlanded when n arrives (230 of 234). The step where it loses the time is the one after the roots: execution and roots are the same on both
+nodes, and the whole difference sits between "fields ready" and "landed" (149 against 41 ms): the wait for the parent's landing (40) and a `new_payload` into the engine that takes 24 ms against 7
+(the engine's own insert, timed at the caller, so it includes queueing behind the engine thread's other work). A lock is not the step (see 2) and neither is the persistence
+(`forest lock ... on_persisted` held 29 / 43 / 32 times on nodes 2 / 1 / 0, no outlier; the persistence batches are not logged per batch in `el.log`, so a per-batch overlap table cannot be built from these legs).
+
+**4. Standing backlog: yes, a self-sustaining one, and not specific to the node index.** Node 2 is two blocks unlanded at 230 of 234 arrivals; the chain runs at its speed and the backlog never clears, because the
+gate turns it into a closed loop: with the cap at two, the vote of block n waits for the landing of n-2, the landing takes about two cycles from assembly start (227 against 2 x 112 = 224 ms), so n-2
+lands just as the next arrival needs the slot. A single slot-hold time A (assembly start to landing) decides the regime: gate not binding if A < 2 x cycle (node 1: 115 against 224), binding if
+A >= 2 x cycle. Which node falls in is set by A, not by the index. How it set in in F (blocks 274-286, b -> land and wait on node 2): landing latency 157, 152, 175, 193, 203, 204, 213, 220, 225, 253, 263, 313,
+312 ms with the wait 3, 1, 1, 0, 2, 8, 21, 21, 32, 26, 23, 57, 73: a creeping landing latency from the first full blocks (node 1 at the same blocks: 134-152) crossed the 2 x cycle line at about
+block 280, after which it stayed (250-340). So it is the first seconds of the flood plus a standing engine disadvantage, not the start order. Across the loop321-loop324 legs the gate binds
+on node 2 in 224-235 of ~236 blocks in F, Fb, FS, FSb, FV, FSG, loop323A16 and A20 (cycle median 110-113 ms, 134 in FSG); in loop323A, Ab, 322AHOFF, BOTH, CTRL, 321COMPACT and both WARM legs (cycle 101-131 ms) it binds in 36-86 of ~215-270 blocks, and
+in loop324WARM and loop323WARM node 1 is gated as often as node 2 (57 / 44 and 42 / 65 of 212-215). When the gate binds the cycle is the 112 ms of this section; when it does not
+(loop323A: cycle 102, 263 blocks) node 2 still lands 32 ms after node 1 (127 against 95).
+
+**5. What is different about node 2 (all per-node items of the launch).**
+- Pins (`f7_pin`, `F7_CORES_PER_NODE=74`, `F7_PIN_PHYSICAL=1`): node i takes logical CPUs 37i..37i+36 and their siblings +128. Node 0: 0-36,128-164; node 1: 37-73,165-201; node 2: 74-110,202-238; the flood and the other tools'
+  range 111-127,239-255 (17 physical cores, not 16; the 4 x 56 text in `fleet3-env.sh` is for four nodes). One NUMA node (`numactl -H`), so there is no NUMA asymmetry. The L3 domains (`lscpu -e`, 16 L3s of 16 CPUs) do not
+  line up with the logical ranges: node 0 spans L3 0, 2 (10 of 16), 4, 8, 12; node 1 spans 2 (6), 3, 6, 7 (4), 10, 14; node 2 spans 1, 5 (14), 7 (12), 11, 15. Node 2 shares L3 5 with the flood's first physical core and L3 7 with node 1;
+  node 1 also straddles two L3s (2 and 7). All are `performance` governor, same max frequency. This is the only per-node difference with a hardware reading, and it is not shown to matter.
+- Threads: the same `RAYON_NUM_THREADS=16`, `TOKIO_WORKER_THREADS=8`, `--builder` and worker arguments, the same `MALLOC_CONF`, on all three (`fleet7-env.sh` has one argument list; the per-node values are `--authrpc.port`, `--http.port`,
+  `--port`, `--listen`, `--index`, `--bls-key`, the datadir, `N42_TX_INGEST`, `N42_PAYLOAD_SERVE`, `N42_INGEST_SHARD=i/n`, which only `N42_INGEST_VERIFY=shard` reads and these legs do not set).
+- Feed: `F7_INGEST_ALL=1` and `F7_NO_TX_GOSSIP=1`: every worker writes each replay frame to ingest 8900, 8901, 8902 in that order (`Ingest::send_frame`) and reads the three replies in that order, so node 2 gets each frame last and
+  its reply is read last (`reply ms/node` 115 / 116 / 139 at +10 s; by construction non-decreasing in read order). Nothing is second-hand: there is no gossip. The ingest line is the same on all three (1.37 / 1.37 / 1.37 M tx/s at the
+  same instant, `recover_us_per_tx` 0-1, `slots_busy_pct` 8-13), and `frames_missing` and `miss_wait_ms` are 0 on both followers, so the feed does not make node 2's body assembly wait.
+- Peers and ports: static full mesh, each node dialled in index order; body receipt is the same on both followers (-0.5 ms median against the proposal). The measurement (`fleet7-measure.py`, `read_pending`) polls node 0's RPC only,
+  and the samplers (`threadcpu4.py`, `memsample.py`, `perf stat -p` per node, the `ps` sampler) are not pinned. Datadirs are under one root on one device; NVMe IRQs are spread symmetrically over the three ranges (`/proc/interrupts`).
+- Start order: ELs 0, 1, 2 in turn, then validators 0, 1, 2 (node 2 last by about a second). Page faults: node 2 is not an outlier (median 141k/s against 151k/s on node 1 and 117k on the leader in F).
+- The asymmetry that shows: the engine thread. `threadcpu` (the run's per-thread sampler, `engine` thread, percent of one core), node 0 / 1 / 2: F 26.6 / 26.4 / **43.7**, FS 26.7 / 26.6 / 44.0, loop323A 22.8 / 22.8 / 38.2, loop322AHOFF 22.6 / 22.4 / 37.2,
+  loop324WARM 21.5 / 23.0 / 35.6 -- in all 27 legs from loop321 to loop324 (the ones that carry the sampler), node 2 is 1.6-1.7 times node 0 and node 1, which are equal to each other. The same shows in `engine_new_payload_ms` (node 1 / node 2: 7/24 F, 4/15 loop323A,
+  4/14 loop322AHOFF, 10/19 loop324WARM), while the commit's forkchoice (16.7 ms on all three), execution, roots and `engine_remember_ms` (9 / 11) are equal. The extra is about 17 points of a core, or roughly 20 ms of engine-thread CPU a block, spent in
+  `engine.new_payload`. Nothing in the launch gives node 2 more engine work (same blocks, same arguments); what differs is where it runs and what it runs beside. The logs do not say which; this note does not establish it.
+
+**6. Conclusion.**
+- Cause: two things in series. (1) A standing engine disadvantage on node 2, 1.6x the engine-thread CPU and 2-3.5x the `new_payload` time of node 1, in every leg from loop321 on, cause not identified (core/L3 placement is the only
+  per-node hardware difference; feed order and ingest are ruled out as far as the logs go: equal ingest rates, no missing frames, same body receipt). (2) The two-slot cap `DEFERRED_IN_FLIGHT = 2`, which turns a node whose assembly-to-landing time reaches
+  two cycles (A >= 2 x 112 ms) into a node whose vote waits for the landing of n-2: A is 227 ms in that state (115-127 ms where the gate does not bind, node 1 and loop323A), the gate keeps binding, and node 2 votes 73 ms late in 231 of 234 blocks, which holds the quorum
+  (3 of 3 votes) and with it 52-68% of the cycles.
+- Evidence: 11.9 plus section 1-4 above: assembly start follows the `raw newPayload` answer of n-2 by 0.4-10.8 ms in 231 of 234 blocks; no frame or fields wait; the regime flips by A against 2 x cycle across 16 legs; WARM legs show node 1 gated too.
+- Kind: ordering for the gate (code, not configuration), plus an unexplained per-node cost for the engine (possibly configuration: placement). Not a capacity limit: node 2's CPU is the same as node 1's in total (1,761 against 1,721 percent of a core, execution and roots equal),
+  and the cap holds a vote back for 73 ms while the node's execution is idle.
+- Smallest safe change, in code: make the cap a knob and run it at 3 (`DEFERRED_IN_FLIGHT` in `crates/n42/h2-execution/src/driver.rs`, an environment override with default 2, so nothing changes by default). 3 is the largest value `ancestry_of` supports with
+  `PARENT_OUTPUTS_KEPT = 4` (three unlanded ancestors stacked is within it; four would make it decline and wait for the engine, which is the stall the cap avoids). It costs one more block's payload, sender recovery and executed state held per node (memory, not measured here),
+  and it widens the overlap of two imports on the node's cores, which 11.6 warned lengthens other durations. A cleaner version frees the slot when the block's execution fields are published rather than when the engine answers (a new `ImportReport::Executed`),
+  but then the in-flight count is not bounded by anything but the ancestry limit; not recommended before the knob has been measured.
+- Prediction for the knob at 3 on the F configuration: node 2's assembly starts at body arrival (+1 ms), its vote at +26 ms like node 1's, quorum overshoot (13.5-15 ms of the 15-17 ms excess) mostly gone, cycle 102-110 ms (11.9's counterfactual of 102 is an upper bound); `parent_engine_wait_ms` on node 2 unchanged
+  or longer, since the engine's landing path is not touched.
+- The one confirming leg: F (loop324 F configuration, one leg plus its repeat) with node 1 and node 2 swapped in the launch: node 1's execution layer and validator on node 2's CPU list and the reverse (everything else, ports and feed order, unchanged; an edited `f7_pin` for the two indices). If the engine-thread CPU (`threadcpu`, `engine`), `engine_new_payload_ms` and the gating move to the node on the CPUs
+  37-73,165-201, it is placement and a launch-script fix (a layout whose nodes are L3-aligned: 37 physical cores a node does not divide the 8-core L3s, so give each node whole L3 domains, e.g. 32 physical cores each); if they stay with the node index, it is the feed
+  order (swap the `--ingest` list order in the same leg to separate the two) or per-node state, and the gate change above is the remedy. A second leg, `DEFERRED_IN_FLIGHT = 3` on the unswapped layout, tests the code change.

@@ -197,6 +197,58 @@ fn wait_until_parent_handed(
     }
 }
 
+/// How the build path's shards merge runs (`N42_SHARDS_MERGE_OFF_PATH`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeMode {
+    /// Unset or `0`: the account map, then the revert set, one after the
+    /// other, as before.
+    OnPath,
+    /// `1`: the two halves at once ([`FrozenShards::merged_timed`]): the
+    /// hand-off waits for the longer half instead of the sum.
+    ///
+    /// [`FrozenShards::merged_timed`]: n42_engine_types::output_shards::FrozenShards::merged_timed
+    Concurrent,
+    /// `verify`: as `1`, and the merge is then made the old way too and the
+    /// two compared (`merge_verified`, `merge_mismatches` on the root line).
+    Verify,
+}
+
+impl MergeMode {
+    fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("1") => Self::Concurrent,
+            Some("verify") => Self::Verify,
+            _ => Self::OnPath,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::OnPath => "on_path",
+            Self::Concurrent => "concurrent",
+            Self::Verify => "verify",
+        }
+    }
+}
+
+/// `N42_SHARDS_MERGE_OFF_PATH`, read once (see [`MergeMode`]). Off by default.
+fn shards_merge_mode() -> MergeMode {
+    static MODE: std::sync::OnceLock<MergeMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| MergeMode::parse(std::env::var("N42_SHARDS_MERGE_OFF_PATH").ok().as_deref()))
+}
+
+/// Merges compared under `N42_SHARDS_MERGE_OFF_PATH=verify`, and how many differed.
+static MERGE_VERIFIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MERGE_MISMATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_merge_verified(same: bool) {
+    MERGE_VERIFIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !same {
+        MERGE_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(target: "n42.follower_import", "the concurrent shards merge differs from the on-path merge");
+    }
+}
+
 /// Executions held for their validator's release
 /// (`request::HOLD_EXECUTION`, `N42_VOTE_BEFORE_SLOT`), by block hash: the
 /// block is assembled and checked, and its vote released, as always; its
@@ -2951,6 +3003,9 @@ where
     // is timed against (`root_gap_ms`).
     let mut root_returned: Option<std::time::Instant> = None;
     let mut view_hashed: Option<reth_trie::HashedPostState> = None;
+    // The build path's shards merge: its length, what the import waited for
+    // it at the join, and its halves (`n42_engine_types::output_shards::MergeSplit`).
+    let mut merge_times: Option<(u64, u64, n42_engine_types::output_shards::MergeSplit)> = None;
     let (execution_output, early_root) = match (output, sharded) {
         (Some(output), _) => {
             let execution_output = Arc::new(output);
@@ -2990,8 +3045,16 @@ where
                     .spawn(move || {
                         n42_core_layout::background_thread();
                         let at = std::time::Instant::now();
-                        let merged = shards.merged(&residual.state);
-                        (merged, at.elapsed().as_millis() as u64)
+                        let mode = shards_merge_mode();
+                        let (merged, split) = shards.merged_timed(&residual.state, mode != MergeMode::OnPath);
+                        let merge_ms = at.elapsed().as_millis() as u64;
+                        if mode == MergeMode::Verify {
+                            // The on-path merge beside it, compared and dropped:
+                            // one more bundle for the length of the compare.
+                            let on_path = shards.merged(&residual.state);
+                            note_merge_verified(on_path == merged);
+                        }
+                        (merged, merge_ms, split)
                     })
                     .map_err(|err| format!("a thread for the shards' merge: {err}"))?
             };
@@ -3016,7 +3079,8 @@ where
                 }
             }
             let wait_at = std::time::Instant::now();
-            let (merged, merge_ms) = merger.join().map_err(|_| "the shards' merge thread panicked".to_string())?;
+            let (merged, merge_ms, split) = merger.join().map_err(|_| "the shards' merge thread panicked".to_string())?;
+            merge_times = Some((merge_ms, wait_at.elapsed().as_millis() as u64, split));
             tracing::debug!(
                 target: "n42.follower_import",
                 number,
@@ -3190,6 +3254,14 @@ where
                 populate_lag_mb = split.populate_lag_mb,
                 root_seals = split.seals,
                 root_seal_ms = split.seal_ms,
+                merge_ms = merge_times.map_or(0, |(ms, _, _)| ms),
+                merge_wait_ms = merge_times.map_or(0, |(_, ms, _)| ms),
+                merge_state_ms = merge_times.map_or(0, |(_, _, split)| split.state_us / 1000),
+                merge_reverts_ms = merge_times.map_or(0, |(_, _, split)| split.reverts_us / 1000),
+                merge_append_ms = merge_times.map_or(0, |(_, _, split)| split.append_us / 1000),
+                merge_mode = shards_merge_mode().name(),
+                merge_verified = MERGE_VERIFIED.load(std::sync::atomic::Ordering::Relaxed),
+                merge_mismatches = MERGE_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed),
                 "build path: the root's start after the execution"
             );
         }
@@ -3775,6 +3847,37 @@ mod handoff_tests {
             note_handed(B256::from(alloy_primitives::U256::from(0xbb00_0000u64 + i)));
         }
         assert!(HANDED.0.lock().unwrap_or_else(|p| p.into_inner()).len() <= HANDED_KEPT);
+    }
+}
+
+#[cfg(test)]
+mod merge_mode_tests {
+    use super::*;
+
+    /// Unset, `0` or anything unknown keeps the merge on the path as before.
+    #[test]
+    fn the_merge_stays_on_the_path_unless_asked() {
+        assert_eq!(MergeMode::parse(None), MergeMode::OnPath);
+        assert_eq!(MergeMode::parse(Some("0")), MergeMode::OnPath);
+        assert_eq!(MergeMode::parse(Some("yes")), MergeMode::OnPath);
+        assert_eq!(MergeMode::parse(Some("1")), MergeMode::Concurrent);
+        assert_eq!(MergeMode::parse(Some(" verify ")), MergeMode::Verify);
+        if std::env::var("N42_SHARDS_MERGE_OFF_PATH").is_err() {
+            assert_eq!(shards_merge_mode(), MergeMode::OnPath);
+        }
+    }
+
+    /// The verify counters count every compare and only the differing ones.
+    #[test]
+    fn a_verified_merge_counts_its_mismatches() {
+        let (verified, mismatched) = (
+            MERGE_VERIFIED.load(std::sync::atomic::Ordering::Relaxed),
+            MERGE_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        note_merge_verified(true);
+        note_merge_verified(false);
+        assert!(MERGE_VERIFIED.load(std::sync::atomic::Ordering::Relaxed) >= verified + 2);
+        assert!(MERGE_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed) > mismatched);
     }
 }
 

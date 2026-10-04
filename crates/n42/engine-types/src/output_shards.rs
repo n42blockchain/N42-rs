@@ -927,6 +927,21 @@ pub struct FrozenShards {
     split: FoldSplit,
 }
 
+/// What [`FrozenShards::merged_timed`] spent, microseconds: the account map,
+/// the revert set (copied and sorted), their assembly, and the whole (the
+/// first two overlap when the merge runs them at once).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MergeSplit {
+    /// The account map.
+    pub state_us: u64,
+    /// The revert set, copied and sorted.
+    pub reverts_us: u64,
+    /// The sorted reverts appended to the block's own.
+    pub append_us: u64,
+    /// The whole merge.
+    pub total_us: u64,
+}
+
 /// The fold's wall time taken apart ([`OutputShards::freeze`]), microseconds:
 /// what the node's fold number is made of, which a bench off the node cannot
 /// say (the fold itself is 3.5-5 ms of 16 threads on the block's shape,
@@ -1232,6 +1247,65 @@ impl FrozenShards {
     /// caller's thread (the build pool stays free for the next build). Built
     /// behind the seal, beside the roots, which read [`Self::view`] instead.
     pub fn merged(&self, residual: &BundleState) -> BundleState {
+        self.merged_timed(residual, false).0
+    }
+
+    /// [`Self::merged`], timed in its two halves, and with `concurrent` the
+    /// halves run at once: the account map on this thread, the revert set
+    /// (the shards' reverts copied and sorted, the larger part of a block of
+    /// transfers' merge after the map) on a scoped thread of its own. Neither
+    /// half reads the other's result; the bundle is assembled from both in
+    /// the same order either way, so it is the same bundle
+    /// (`N42_SHARDS_MERGE_OFF_PATH`, `docs/INDUSTRY_SURVEY_2026_10.md` 11.12).
+    pub fn merged_timed(&self, residual: &BundleState, concurrent: bool) -> (BundleState, MergeSplit) {
+        let started = std::time::Instant::now();
+        let reverts_job = || {
+            let at = std::time::Instant::now();
+            let reverts = self.merged_reverts();
+            (reverts, at.elapsed().as_micros() as u64)
+        };
+        let state_job = || {
+            let at = std::time::Instant::now();
+            let state = self.merged_state(residual);
+            (state, at.elapsed().as_micros() as u64)
+        };
+        let (((state, size), state_us), (reverts, reverts_us)) = if concurrent {
+            std::thread::scope(|scope| {
+                let reverts = std::thread::Builder::new()
+                    .name("n42-merge-reverts".into())
+                    .spawn_scoped(scope, reverts_job);
+                let state = state_job();
+                let reverts = match reverts {
+                    Ok(handle) => handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                    // No thread to be had: the half here, after the other.
+                    Err(_) => reverts_job(),
+                };
+                (state, reverts)
+            })
+        } else {
+            let state = state_job();
+            (state, reverts_job())
+        };
+        let mut contracts = self.contracts.clone();
+        contracts.extend(residual.contracts.iter().map(|(hash, code)| (*hash, code.clone())));
+        let block_reverts = residual.reverts.clone();
+        let reverts_size = block_reverts.iter().map(Vec::len).sum();
+        let state_size = usize::try_from(size.max(0)).unwrap_or(usize::MAX);
+        let mut bundle = BundleState { state, contracts, reverts: block_reverts, state_size, reverts_size };
+        let append_at = std::time::Instant::now();
+        crate::parallel_transfer::append_sorted_reverts(&mut bundle, reverts);
+        let split = MergeSplit {
+            state_us,
+            reverts_us,
+            append_us: append_at.elapsed().as_micros() as u64,
+            total_us: started.elapsed().as_micros() as u64,
+        };
+        (bundle, split)
+    }
+
+    /// The merged account map and its size: the shards' accounts with the
+    /// residual's laid over them, each account cloned once into the one map.
+    fn merged_state(&self, residual: &BundleState) -> (AddressHashMap<BundleAccount>, i128) {
         let newer = &residual.state;
         let total: usize = self.accounts() + newer.len();
         let mut state: AddressHashMap<BundleAccount> = Default::default();
@@ -1275,10 +1349,12 @@ impl FrozenShards {
                 state.insert(*address, account.clone());
             }
         }
-        let mut contracts = self.contracts.clone();
-        contracts.extend(residual.contracts.iter().map(|(hash, code)| (*hash, code.clone())));
-        let block_reverts = residual.reverts.clone();
-        let reverts_size = block_reverts.iter().map(Vec::len).sum();
+        (state, size)
+    }
+
+    /// The shards' reverts, copied and sorted by address as `append_reverts`
+    /// sorts them, ready for [`crate::parallel_transfer::append_sorted_reverts`].
+    fn merged_reverts(&self) -> Vec<(Address, AccountRevert)> {
         let mut reverts = Vec::with_capacity(self.shards.iter().map(|shard| shard.reverts.len()).sum());
         for shard in &self.shards {
             reverts.extend(shard.reverts.iter().cloned());
@@ -1287,10 +1363,8 @@ impl FrozenShards {
             reverts.reserve(indexed.kept.iter().map(Vec::len).sum());
             reverts.extend(indexed.kept.iter().flatten().filter_map(|&slot| indexed.revert(slot)).cloned());
         }
-        let state_size = usize::try_from(size.max(0)).unwrap_or(usize::MAX);
-        let mut bundle = BundleState { state, contracts, reverts: block_reverts, state_size, reverts_size };
-        crate::parallel_transfer::append_reverts(&mut bundle, reverts);
-        bundle
+        crate::parallel_transfer::sort_reverts(&mut reverts);
+        reverts
     }
 
     /// The accounts both the batches and the block's executor changed, as
@@ -1564,6 +1638,50 @@ mod frozen_tests {
             let bare = frozen.merged(&BundleState::default());
             assert_eq!(bare.state.len(), 3);
             assert!(frozen.overlaps(&BundleState::default()).is_empty());
+        }
+    }
+
+    /// `N42_SHARDS_MERGE_OFF_PATH`: the merge with its two halves at once is
+    /// the same bundle as the merge one half after the other -- accounts,
+    /// sizes, contracts and the sorted revert set -- in both modes, at a size
+    /// that takes the parallel revert sort (4,096 and more), with conflicting
+    /// writes and an executor change over the shards.
+    #[test]
+    fn the_concurrent_merge_is_the_on_path_merge() {
+        let wide = |i: u32| Address::from_word(B256::from(U256::from(0x1000_0000u64 + u64::from(i))));
+        for (index, live) in [(false, false), (true, false), (true, true)] {
+            let shards = OutputShards::with_index_live(addr(1), 12_000, 16, index, live);
+            for batch_no in 0..8u32 {
+                let mut builder = BundleState::builder(1..=1);
+                for i in 0..1_200u32 {
+                    let account = wide(batch_no * 1_200 + i);
+                    builder = builder
+                        .state_original_account_info(account, info(0, 1_000))
+                        .state_present_account_info(account, info(1, 900 + u64::from(i % 7)))
+                        .revert_account_info(1, account, Some(Some(info(0, 1_000))));
+                }
+                // One account every batch writes: a conflict in index mode.
+                builder = builder
+                    .state_original_account_info(addr(5), info(0, 50))
+                    .state_present_account_info(addr(5), info(0, 50 + u64::from(batch_no)))
+                    .revert_account_info(1, addr(5), Some(Some(info(0, 50))));
+                shards.add(builder.build());
+            }
+            let frozen = shards.freeze();
+            let residual = BundleState::builder(1..=1)
+                .state_original_account_info(wide(3), info(1, 900))
+                .state_present_account_info(wide(3), info(1, 950))
+                .state_present_account_info(addr(8), info(0, 3))
+                .revert_account_info(1, addr(8), Some(None))
+                .build();
+            let on_path = frozen.merged(&residual);
+            let (concurrent, split) = frozen.merged_timed(&residual, true);
+            let (sequential, _) = frozen.merged_timed(&residual, false);
+            assert_eq!(on_path.state.len(), 9_600 + 2, "index {index} live {live}");
+            assert!(on_path.reverts.iter().map(Vec::len).sum::<usize>() >= 4_096);
+            assert_eq!(concurrent, on_path, "index {index} live {live}: concurrent against on-path");
+            assert_eq!(sequential, on_path, "index {index} live {live}: sequential against on-path");
+            assert!(split.total_us >= split.append_us);
         }
     }
 

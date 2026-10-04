@@ -2986,7 +2986,7 @@ pub fn append_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRe
 }
 
 /// [`append_reverts`] for a set already sorted by address.
-fn append_sorted_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRevert)>) {
+pub(crate) fn append_sorted_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRevert)>) {
     if reverts.is_empty() {
         return;
     }
@@ -3105,7 +3105,7 @@ fn sort_reverts_indexed(reverts: &mut [(Address, AccountRevert)]) {
 }
 
 /// By address, on the worker pool where there are enough of them to pay for it.
-fn sort_reverts(reverts: &mut [(Address, AccountRevert)]) {
+pub(crate) fn sort_reverts(reverts: &mut [(Address, AccountRevert)]) {
     if reverts.len() >= 4096 {
         use rayon::prelude::*;
         reverts.par_sort_unstable_by_key(|(address, _)| *address);

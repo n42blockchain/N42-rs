@@ -1,0 +1,88 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use super::*;
+
+const PACING: Duration = Duration::from_millis(100);
+
+fn config(soft: u64, hard: u64) -> ThrottleConfig {
+    ThrottleConfig { soft, hard, max_hold: MAX_HOLD_DEFAULT }
+}
+
+fn throttle(soft: u64, hard: u64) -> BuildThrottle {
+    BuildThrottle::new(config(soft, hard), Arc::new(|| None))
+}
+
+#[test]
+fn below_soft_there_is_no_delay() {
+    let c = config(40, 80);
+    for count in [0, 1, 20, 39] {
+        assert_eq!(c.delay(count, Some(PACING)), Delay::After(Duration::ZERO), "count {count}");
+    }
+}
+
+#[test]
+fn the_soft_band_grows_linearly_to_one_pacing_interval() {
+    let c = config(40, 80);
+    assert_eq!(c.delay(40, Some(PACING)), Delay::After(Duration::ZERO), "at SOFT the delay starts from zero");
+    assert_eq!(c.delay(50, Some(PACING)), Delay::After(Duration::from_millis(25)));
+    assert_eq!(c.delay(60, Some(PACING)), Delay::After(Duration::from_millis(50)), "mid-band: half an interval");
+    assert_eq!(c.delay(79, Some(PACING)), Delay::After(Duration::from_micros(97_500)));
+    // Monotone over the band.
+    let mut last = Duration::ZERO;
+    for count in 40..80 {
+        let Delay::After(delay) = c.delay(count, Some(PACING)) else { panic!("held inside the band at {count}") };
+        assert!(delay >= last && delay < PACING, "count {count}: {delay:?}");
+        last = delay;
+    }
+}
+
+#[test]
+fn at_and_above_hard_the_proposal_is_held() {
+    let c = config(40, 80);
+    for count in [80, 81, 500] {
+        assert_eq!(c.delay(count, Some(PACING)), Delay::Hold, "count {count}");
+    }
+}
+
+#[test]
+fn without_a_pacing_the_band_delays_nothing_but_hard_still_holds() {
+    let c = config(40, 80);
+    assert_eq!(c.delay(60, None), Delay::After(Duration::ZERO));
+    assert_eq!(c.delay(80, None), Delay::Hold);
+}
+
+#[test]
+fn the_delay_is_counted_from_the_first_ask_of_the_view() {
+    let mut t = throttle(40, 80);
+    let tick = Instant::now();
+    // Mid-band: 50 ms after the first ask, whenever it is asked again.
+    assert_eq!(t.check(7, Some(60), Some(PACING), tick), Verdict::WaitUntil(tick + Duration::from_millis(50)));
+    assert_eq!(
+        t.check(7, Some(60), Some(PACING), tick + Duration::from_millis(30)),
+        Verdict::WaitUntil(tick + Duration::from_millis(50))
+    );
+    assert_eq!(t.check(7, Some(60), Some(PACING), tick + Duration::from_millis(50)), Verdict::Go);
+    assert_eq!(t.last_applied(), Applied { in_mem: Some(60), delay_ms: 50 });
+    // A backlog that drained meanwhile lets the proposal go sooner.
+    let next = tick + Duration::from_secs(1);
+    assert!(matches!(t.check(8, Some(70), Some(PACING), next), Verdict::WaitUntil(_)));
+    assert_eq!(t.check(8, Some(39), Some(PACING), next + Duration::from_millis(10)), Verdict::Go);
+    assert_eq!(t.last_applied().delay_ms, 10);
+}
+
+#[test]
+fn a_hard_hold_lasts_until_the_count_is_back_under_hard() {
+    let mut t = throttle(40, 80);
+    let tick = Instant::now();
+    assert_eq!(t.check(3, Some(90), Some(PACING), tick), Verdict::WaitUntil(tick + MAX_HOLD_DEFAULT));
+    assert_eq!(t.hard_holds(), 1);
+    // Back in the band 300 ms later: the band's delay from the tick has
+    // long passed, so the proposal goes.
+    assert_eq!(t.check(3, Some(60), Some(PACING), tick + Duration::from_millis(300)), Verdict::Go);
+    assert_eq!(t.last_applied(), Applied { in_mem: Some(60), delay_ms: 300 });
+    assert_eq!(t.hard_holds(), 1, "one view held, counted once");
+}

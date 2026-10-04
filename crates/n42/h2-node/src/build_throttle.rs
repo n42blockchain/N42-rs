@@ -281,3 +281,7 @@ impl BuildThrottle {
         self.hard_holds
     }
 }
+
+#[cfg(test)]
+#[path = "build_throttle_tests.rs"]
+mod tests;

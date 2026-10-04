@@ -2832,6 +2832,14 @@ where
                 // historical provider (plan v6 6.4, `crate::direct_build::read_depth`).
                 let read_depth = crate::direct_build::read_depth::snapshot();
                 let overlay_depth = crate::direct_build::read_depth::overlay_depth();
+                // `N42_PHASE_TIMERS=1`: the layered overlay's blocks skipped on
+                // their address filters and bundles probed since the last line
+                // (the process's, so a follower import in between counts too).
+                let (overlay_filter_skips, overlay_probes) = if crate::fast_transfer::phase_timers() {
+                    reth_provider::providers::overlay_filter::take_counters()
+                } else {
+                    (0, 0)
+                };
                 tracing::info!(
                     target: "payload_builder",
                     number = block_number,
@@ -2871,6 +2879,8 @@ where
                     reads_d16p = read_depth[6],
                     reads_hist = read_depth[7],
                     overlay_depth,
+                    overlay_filter_skips,
+                    overlay_probes,
                     // `N42_PHASE_TIMERS=1` (plan v6 6.5/6.6): where the
                     // parallel step's wall time (`par_exec_ms` above) goes
                     // inside `N42Evm::transfer`, which door each account read

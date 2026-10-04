@@ -21,6 +21,7 @@
 //! The payload builder side lives with the builder itself, in
 //! `n42-engine-types`, since that builder is this repo's code.
 
+pub mod exec_cache;
 pub mod executed_fields;
 pub mod chainspec;
 pub mod changes;
@@ -46,4 +47,5 @@ pub use read_view::QmdbReadView;
 pub use state_reader::{check_hashed_tables_setting, register_state_reader, QmdbStateReader};
 /// The latest-state reader registry the providers consult (`N42_QMDB_READS`).
 pub use reth_storage_api::n42_state;
+pub use exec_cache::{ExecCacheOnInsert, N42TreeValidator, EXEC_CACHE_ENV};
 pub use strategy::{QmdbEngineValidatorBuilder, QmdbStateRootStrategy};

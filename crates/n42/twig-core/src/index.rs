@@ -31,6 +31,8 @@ pub(crate) const MAX_SLOT: u64 = SLOT_MASK - 1;
 /// [`MAX_SLOT`], public: the largest value a [`SharedOffsetIndex`] holds.
 pub const MAX_INDEX_VALUE: u64 = MAX_SLOT;
 const MIN_BITS: u32 = 4;
+/// How many keys ahead a batch lookup prefetches its bucket.
+const PREFETCH_AHEAD: usize = 8;
 const MAX_BITS: u32 = FP_BITS;
 
 /// A random seed per process, taken from std's randomly keyed hasher.
@@ -100,6 +102,28 @@ impl Shard {
             }
             at = (at + 1) & mask;
         }
+    }
+
+    /// Prefetches the bucket line `key` probes first (a no-op off x86_64 or on
+    /// an empty table). A batch lookup issues it a few keys ahead
+    /// ([`PREFETCH_AHEAD`]): the probes of a multi-million-key table are cache
+    /// misses, and the prefetch overlaps them instead of taking them one by one.
+    #[inline]
+    fn prefetch(&self, key: &Hash) {
+        if self.buckets.is_empty() {
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let at = self.home_of_fp(fingerprint(key));
+            // SAFETY: `at` is below `buckets.len()` (a home is `bits` bits wide
+            // and the table holds `1 << bits` buckets); a prefetch reads nothing
+            // and never faults.
+            unsafe { _mm_prefetch(self.buckets.as_ptr().add(at) as *const i8, _MM_HINT_T0) };
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = key;
     }
 
     /// Room for `len` keys at a load of at most 3/4.
@@ -188,6 +212,29 @@ impl TagIndex {
         self.shards[key[0] as usize].get(key, &key_at).map(|(_, slot)| slot)
     }
 
+    /// `out[i]` = [`Self::get`] of `key(i)` for every `i < out.len()`, each
+    /// bucket prefetched [`PREFETCH_AHEAD`] keys ahead. The answers are
+    /// [`Self::get`]'s; only the order of the memory traffic changes.
+    pub(crate) fn get_into<'k>(
+        &self,
+        out: &mut [Option<u64>],
+        key: impl Fn(usize) -> &'k Hash,
+        key_at: impl Fn(u64) -> Hash,
+    ) {
+        let n = out.len();
+        for ahead in 0..PREFETCH_AHEAD.min(n) {
+            let k = key(ahead);
+            self.shards[k[0] as usize].prefetch(k);
+        }
+        for (i, slot) in out.iter_mut().enumerate() {
+            if i + PREFETCH_AHEAD < n {
+                let k = key(i + PREFETCH_AHEAD);
+                self.shards[k[0] as usize].prefetch(k);
+            }
+            *slot = self.get(key(i), &key_at);
+        }
+    }
+
     /// Maps `key` to `slot`, returning the slot it replaced. `key_at` must
     /// already answer for every slot the index holds.
     #[inline]
@@ -253,7 +300,15 @@ impl TagIndex {
                 return;
             }
             shard.ensure_capacity(shard.len + run.len());
-            for (key, slot) in run {
+            // The table does not grow inside the run (capacity reserved
+            // above), so a bucket prefetched ahead is the one probed.
+            for (key, _) in run.iter().take(PREFETCH_AHEAD) {
+                shard.prefetch(key);
+            }
+            for (at, (key, slot)) in run.iter().enumerate() {
+                if let Some((ahead, _)) = run.get(at + PREFETCH_AHEAD) {
+                    shard.prefetch(ahead);
+                }
                 shard.insert(key, *slot, &key_at);
             }
         };
@@ -356,10 +411,21 @@ impl SharedOffsetIndex {
             let inserts = run.iter().filter(|(_, value)| value.is_some()).count();
             let len = guard.len;
             guard.ensure_capacity(len + inserts);
+            // No growth inside the run (capacity reserved above): a bucket
+            // prefetched ahead is the one probed.
+            for (key, _) in run.iter().take(PREFETCH_AHEAD) {
+                guard.prefetch(key);
+            }
             run.iter()
-                .map(|(key, value)| match value {
-                    Some(value) => guard.insert(key, *value, &key_at),
-                    None => guard.remove(key, &key_at),
+                .enumerate()
+                .map(|(at, (key, value))| {
+                    if let Some((ahead, _)) = run.get(at + PREFETCH_AHEAD) {
+                        guard.prefetch(ahead);
+                    }
+                    match value {
+                        Some(value) => guard.insert(key, *value, &key_at),
+                        None => guard.remove(key, &key_at),
+                    }
                 })
                 .collect()
         };
@@ -549,5 +615,117 @@ mod tests {
             }
             writer.join().unwrap();
         });
+    }
+
+    /// A shared index over `live` keys (offsets are store positions) and a
+    /// sorted batch of `batch` keys, half of them held, half misses.
+    fn shared_fixture(live: u64, batch: u64) -> (Vec<Hash>, SharedOffsetIndex, Vec<(Hash, Option<u64>)>) {
+        let store: Vec<Hash> = (0..live).map(|n| key_of(n, None)).collect();
+        let index = SharedOffsetIndex::default();
+        let mut pairs: Vec<(Hash, Option<u64>)> = store.iter().enumerate().map(|(i, k)| (*k, Some(i as u64))).collect();
+        pairs.sort_unstable_by_key(|(k, _)| *k);
+        index.apply_sorted(&pairs, |offset| store[offset as usize]);
+        let mut keys: Vec<(Hash, Option<u64>)> = (0..batch)
+            .map(|n| if n % 2 == 0 { (key_of(n * 7 % live, None), None) } else { (key_of(live + n, None), None) })
+            .collect();
+        keys.sort_unstable_by_key(|(k, _)| *k);
+        keys.dedup_by_key(|(k, _)| *k);
+        (store, index, keys)
+    }
+
+    /// `apply_sorted` (prefetched runs) against one `insert`/`remove` a key:
+    /// the same previous values and the same index afterwards.
+    #[test]
+    fn shared_apply_sorted_matches_single_ops() {
+        let (mut store, batched, keys) = shared_fixture(60_000, 20_000);
+        let (_, single, _) = shared_fixture(60_000, 20_000);
+        // Held keys alternately removed and moved to a fresh offset; missing
+        // keys inserted at a fresh offset.
+        let changes: Vec<(Hash, Option<u64>)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, (key, _))| {
+                if i % 3 == 0 {
+                    (*key, None)
+                } else {
+                    store.push(*key);
+                    (*key, Some(store.len() as u64 - 1))
+                }
+            })
+            .collect();
+        let key_at = |offset: u64| store[offset as usize];
+        let got = batched.apply_sorted(&changes, key_at);
+        let want: Vec<Option<u64>> = changes
+            .iter()
+            .map(|(key, value)| match value {
+                Some(value) => single.insert(*key, *value, key_at),
+                None => single.remove(key, key_at),
+            })
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(batched.len(), single.len());
+        for (key, _) in &changes {
+            assert_eq!(batched.get(key, key_at), single.get(key, key_at));
+        }
+    }
+
+    #[test]
+    fn tag_get_into_matches_get() {
+        let store: Vec<Hash> = (0..50_000u64).map(|n| key_of(n, None)).collect();
+        let mut index = TagIndex::default();
+        let key_at = |slot: u64| store[slot as usize];
+        for (slot, key) in store.iter().enumerate() {
+            index.insert(*key, slot as u64, key_at);
+        }
+        let probes: Vec<Hash> = (0..30_000u64).map(|n| key_of(n * 3, None)).collect();
+        for len in [0usize, 1, 5, 8, 9, 1024, probes.len()] {
+            let mut out = vec![Some(u64::MAX); len];
+            index.get_into(&mut out, |i| &probes[i], key_at);
+            for (i, got) in out.iter().enumerate() {
+                assert_eq!(*got, index.get(&probes[i], key_at));
+            }
+        }
+    }
+
+    /// `cargo test -p n42-twig-core --release --features rayon --lib -- --ignored
+    /// --nocapture batch_lookup_bench`: the read view's `apply_sorted` (its
+    /// overwrite path, every key held) and the tree's held-slot pass, one
+    /// lookup a key against `get_into`, over a 4M-key index and a 326k-key
+    /// block (half misses for the held-slot pass).
+    #[test]
+    #[ignore = "timing; run by hand in release"]
+    fn batch_lookup_bench() {
+        let (store, index, keys) = shared_fixture(4_000_000, 326_000);
+        let key_at = |offset: u64| store[offset as usize];
+        let rounds = 20;
+        let time = |f: &dyn Fn() -> usize| {
+            let mut best = u128::MAX;
+            let mut sink = 0;
+            for _ in 0..rounds {
+                let at = std::time::Instant::now();
+                sink += f();
+                best = best.min(at.elapsed().as_micros());
+            }
+            (best, sink)
+        };
+        // Every held key mapped again to the offset it holds: the overwrite
+        // path (a probe, then a bucket write), the same index every round.
+        let overwrites: Vec<(Hash, Option<u64>)> =
+            keys.iter().filter_map(|(key, _)| index.get(key, key_at).map(|offset| (*key, Some(offset)))).collect();
+        let (apply, a) = time(&|| index.apply_sorted(&overwrites, key_at).len());
+        println!("shared apply_sorted: {apply} us ({} overwrites, sink {a})", overwrites.len());
+
+        let mut tag = TagIndex::default();
+        let mut pairs: Vec<(Hash, u64)> = store.iter().enumerate().map(|(i, k)| (*k, i as u64)).collect();
+        pairs.sort_unstable_by_key(|(k, _)| *k);
+        tag.insert_sorted(&pairs, key_at);
+        let probes: Vec<Hash> = keys.iter().map(|(k, _)| *k).collect();
+        let (before, a) = time(&|| probes.iter().map(|k| tag.get(k, key_at)).filter(Option::is_some).count());
+        let (after, b) = time(&|| {
+            let mut out = vec![None; probes.len()];
+            tag.get_into(&mut out, |i| &probes[i], key_at);
+            out.iter().filter(|o| o.is_some()).count()
+        });
+        println!("tag held slots (one thread): get {before} us, get_into {after} us (sinks {a} {b})");
     }
 }

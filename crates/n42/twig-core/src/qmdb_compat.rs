@@ -979,14 +979,22 @@ const LEAF_CHUNK: usize = 1024;
 /// (emptied first; written in place by the worker pool).
 fn held_slots<O: LeafOps + ?Sized>(index: &KeyIndex, entries: &Entries, operations: &O, out: &mut Vec<Option<u64>>) {
     out.clear();
-    let held = |i: usize| index.get(operations.op_key(i), |slot| entries.key(slot as usize));
+    let count = operations.op_count();
+    out.resize(count, None);
+    // A chunk of keys at a time, each chunk's buckets prefetched a few keys
+    // ahead (`TagIndex::get_into`): the same answers as one `get` a key, with
+    // the probes' cache misses overlapped instead of taken one by one.
+    let work = |(chunk, held): (usize, &mut [Option<u64>])| {
+        let base = chunk * LEAF_CHUNK;
+        index.get_into(held, |i| operations.op_key(base + i), |slot| entries.key(slot as usize));
+    };
     #[cfg(feature = "rayon")]
     {
         use rayon::prelude::*;
-        out.par_extend((0..operations.op_count()).into_par_iter().with_min_len(LEAF_CHUNK).map(held));
+        out.par_chunks_mut(LEAF_CHUNK).enumerate().for_each(work);
     }
     #[cfg(not(feature = "rayon"))]
-    out.extend((0..operations.op_count()).map(held));
+    out.chunks_mut(LEAF_CHUNK).enumerate().for_each(work);
 }
 
 /// Clears every slot `held` names in its twig's bit set and marks the twig

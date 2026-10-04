@@ -888,3 +888,88 @@ inflation by overlap) would not go away with this change; it would need the fini
 build pool does not use, and could even grow. The 80 ms before the roots is the figure that decides: a one-line timestamp on
 the phases line at `roots_from` (and after `rename_parent`) turns the above from an inference into a measurement, and costs
 nothing on the fleet.
+
+### 11.9 What holds the cycle above the tick after the compact answer (loop324 F, Fb, FS, FSb, window 1)
+
+`scripts/fleet7-excess-anatomy.py <dir>` (segments) and `... --binding <dir>` (binding wait, last voter, counterfactual).
+234 / 233 / 237 / 236 blocks, leader node 0, cycle mean 117.1 / 117.6 / 115.7 / 116.2 ms, median 111.7 / 112.4 / 110.7 / 111.7,
+p90 140.8 / 140.9 / 137.9 / 138.0. Excess over 100 ms: 17.1 / 17.6 / 15.7 / 16.2 ms.
+
+**1. Segments** (mean ms and share of the excess, F / FS; median, p90 in brackets):
+
+| Segment | F | FS |
+| --- | --- | --- |
+| late, timer (preamble after P(V-1) + 100 ms, not the commit) | 0.7 ms, 4.0% (0.0, 0.8) | 0.8 ms, 4.9% (0.0, 1.3) |
+| late, quorum overshoot (preamble held for the previous commit) | 15.0 ms, **87.8%** (9.8, 38.4) | 13.5 ms, **85.6%** (7.3, 36.6) |
+| build, encode, delivery (inside the sealed-header wait) | 0.1 ms, 1.0% | 0.2 ms, 1.2% |
+| send (sign, publish) | 1.2 ms, 7.2% (0.8, 1.7) | 1.3 ms, 8.2% (0.8, 2.2) |
+
+The two modes of 11.7 are gone. Trigger `seal` 79% / 72% of blocks, cycle mean 117.2 / 115.6 ms; trigger `send` 21% / 28%, 116.8 /
+116.2 ms: the build trigger no longer predicts the cycle. The sealed-header wait binds in 2 (F), 7 (Fb), 5 (FS) and 11 (FSb) blocks of
+about 235. The excess is almost entirely the leader's preamble waiting for the previous block's commit.
+
+**2. Binding wait per block** (tick: the preamble came on the tick and nothing was later; quorum: the preamble came within 10 ms of the
+previous commit and more than 3 ms after the tick; seal: the proposer waited more than 3 ms for the sealed header; the build throttle,
+soft 48 / hard 80 unpersisted blocks, never engaged: in-memory maximum 11-16 in the round table):
+
+| Leg | Quorum | Tick | Seal |
+| --- | --- | --- | --- |
+| F | 60.7%, mean cycle 124.8 | 38.5%, 105.1 | 0.9%, 114.6 |
+| Fb | 67.8%, 123.9 | 29.2%, 102.8 | 3.0%, 119.0 |
+| FS | 52.3%, 124.4 | 45.6%, 106.0 | 2.1%, 110.3 |
+| FSb | 59.3%, 123.1 | 36.0%, 105.5 | 4.7%, 110.8 |
+
+The quorum waits for every vote (votes = 3 + 3 in the commit line, the straggler grace of the bench; with f = 0 and three validators there is
+no slack), so the last voter binds: **node 2 in 232 of 234 blocks (F) and 235 of 237 (FS)**. A correction to 11.1-11.4: those sections
+modelled the quorum as the faster follower, which was close enough while the quorum was not binding (loop316 and loop317, `Qc - P` 48 ms);
+it is not close here, `Qc` lies 81 ms after the first vote and 5.1 ms after the last (F).
+
+The last voter's path from the proposal to the commit (F; FS in brackets), median / mean / p90 ms:
+
+| Step | median | mean | p90 |
+| --- | --- | --- | --- |
+| proposal to body arrival (receipt) | -0.5 (-0.5) | 0.0 | 2.4 |
+| body arrival to the start of the compact-body assembly (`wait_for_engine`) | **73.0 (71.1)** | 74.0 (68.6) | 105.7 (103.2) |
+| assembly start to the vote sent (assemble plus check) | 27.6 (27.4) | 28.5 | 37.7 |
+| last vote to the leader's commit (transit) | 5.1 (5.3) | 6.2 | 8.4 |
+| proposal to commit (`Qc - P`) | 108.0 (105.2) | 108.7 | 136.7 |
+
+Node 1 starts the assembly 1 ms after the body arrives and votes 25.6 ms after it. Node 2's vote road itself is as short (26 ms total in
+its own `vote road` line); what is long is the 73 ms before it starts. The assembly start minus node 2's engine landing of block n-2
+(`Block added to canonical chain`): minimum 0.7 ms, p10 2.9, median 11.3, p90 20.9, and below zero in 0 of 234 blocks (FS: 0.5 / 3.2 / 12.2 /
+23.0, 0 of 237). So the vote of block n waits for the node's own engine landing of block n-2. On node 2 that landing comes 300 ms
+(p90 330) after the body arrival, on node 1 117 ms (p90 146); node 2's direct import carries `parent_engine_wait_ms` 40 median (p90 89) against
+0, `engine_ms` 36 against 18 and `engine_new_payload_ms` 24 against 7, while its execution and roots are the same (exec 35 / 37 ms, roots
+25 / 27 ms, `fields_ready` 73 on both). Node 2 is not computing slower; its engine takes the executed block about 80 ms longer to land
+and waits for its parent's landing. The logs do not say why node 2 and not node 1 (loop317's node 2 landed at 168 ms and was not the late voter).
+Quorum-bound blocks have a longer wait (88 ms mean) than tick-bound ones (53 ms), the binding class follows that wait.
+
+**3. Why FS did not pay.** FS moved `sealed_at` from 104 / 93 to 75 / 77 ms, but the seal was binding in 0.9% (F) and 2.1% (FS) of blocks,
+so there was nothing to take: the wait that sets 52-68% of the cycles is node 2's vote, which the seal does not touch. When the seal moved
+earlier, the tick (38.5% to 45.6%) took the blocks the quorum did not claim; the quorum's own share fell from 60.7% to 52.3% between
+F and FS, but Fb to FSb shows 67.8% to 59.3% and F to Fb alone moves it 7 points, so the difference is inside the leg-to-leg spread. The
+cycle gain, 1.4 to 1.4 ms (F to FS 117.1 to 115.7; Fb to FSb 117.6 to 116.2), is that spread.
+
+**4. What 109 ms needs.** Floor: tick 100 ms + `send` 1.2-1.3 ms + timer lateness 0.25-0.30 ms mean (`tick_late_us` median 0.00, p90 1.0-1.2 ms)
+= about 101.5-101.6 ms. Timer granularity is not a share of the excess; it is 2% of the 16-17 ms. A 109 ms mean leaves 7.5 ms of excess against
+today's 15-16, so the quorum overshoot (13.5-15.0 ms mean) has to halve:
+- Follower side, node 2's `wait_for_engine`: 74 ms mean (p90 106) to about 50 ms, the level of the tick-bound blocks. That is -24 ms on the
+  last voter's path and is the only large term. It is the node's own previous-block engine landing (parent landing wait 40 ms plus the engine's 36 ms).
+- Last-vote-to-commit transit: 5.1-5.3 ms median on every quorum-bound block, so 3 ms off it is worth about 1.7 ms of mean cycle (transport on one host plus the leader's
+  event loop; not separable here).
+- Leader side: nothing. The seal binds in 1-5% of blocks and the preamble is already 1.3 ms behind the commit.
+Counterfactual, every follower's vote path as fast as node 1's (per-block receipt and check as measured, commit transit 5.1 ms, the
+seal wait kept where it was binding): mean cycle 102.0 / 101.8 / 102.3 / 102.2 ms, about 1.6M. It is an upper bound that holds the other durations fixed,
+and 11.6 showed that earlier starts lengthen them; do not read it as a forecast. Half of it, 109-110 ms, is the target.
+
+**5. The tail.** The slowest 10% (24 blocks, at least 141 / 138 ms in F / FS): 22 of 24 (F) and 20 of 24 (FS) are quorum-bound, and the previous
+block's `Qc - P` is 144 / 140 ms against 109 / 105 overall. Within it the last voter's `wait_for_engine` is 106.6 / 98.0 ms against 74.0 / 68.6 on
+average, the assemble-plus-check 30.2 / 33.0 against 28.5 / 29.9 and the transit 7.6 / 9.1 against 6.2 / 6.7: the tail is node 2's engine-landing wait getting 25-30 ms longer,
+nothing else moves. No slow block follows a slow one (autocorrelation of the cycle -0.37 at lag 1, -0.09 at lag 2, +0.21 at lag 3 in F; 0.00 probability of two slowest in a row),
+and the cycles alternate (60% of consecutive blocks fall on opposite sides of 110 ms): a late landing of n-2 delays block n and the following block's vote finds the
+engine caught up.
+
+Cheapest fleet measurement for the cause: node 2's engine landing latency per block (`Block added to canonical chain` minus body arrival, already in the
+log) and its `parent_engine_wait_ms` against node 1's on one ordinary F leg with the two nodes' cores swapped (node 1's execution layer and
+validator pinned where node 2's were, and the reverse). If the late landing follows the node, it is the node's configuration or core
+placement; if it follows the position, it is the order in which the engine accepts the executed blocks, and the wait is the design.

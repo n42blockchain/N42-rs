@@ -210,8 +210,129 @@ def leadership(root):
     print('  proposals per node (count, first view, last view):', ranges, ' seal-first builds:', dict(sf))
 
 
+def binding(root):
+    """Which wait binds each proposal, and the last voter's path from receipt to vote.
+
+    Tick: the preamble came at P(V-1) + 100 ms and nothing else was later. Seal: the
+    proposer waited for the sealed header (take_sealed > 3 ms). Quorum: the preamble
+    came within 10 ms of the previous commit and more than 3 ms after the tick. The
+    throttle (unpersisted blocks soft 48 / hard 80) is reported from the in-memory
+    maximum in the round table, not from a log line: it never engages below 48.
+    The quorum waits for every vote (the straggler grace), so the last voter binds.
+    """
+    D, W, m, rows = analyse(root)
+    P, Tp, Qc = D['P'], D['Tp'], D['Qc']
+    asm, land = {}, {}
+    for n in D['fol']:
+        a, ld = {}, {}
+        for t, l in dr.lines(f'{root}/node{n}-el.log'):
+            if 'compact body assembled from the queue' in l:
+                d = dr.kv(l)
+                a[int(d['number'])] = t - d['assemble_ms'] / 1e3
+            elif 'Block added to canonical chain' in l:
+                ld[int(dr.kv(l)['number'])] = t
+        asm[n], land[n] = a, ld
+    cls = {}
+    for r in rows:
+        v = r['v']
+        if r['take'] > 3:
+            c = 'seal'
+        elif Tp[v] - Qc[v - 1] < 0.010 and Tp[v] > P[v - 1] + 0.103:
+            c = 'quorum'
+        else:
+            c = 'tick'
+        r['bind'] = c
+        cls.setdefault(c, []).append(r)
+    mean = st.mean(r['cyc'] for r in rows)
+    print(f'-- binding wait per block ({os.path.basename(root)}); cycle mean {mean:.1f}')
+    for c, g in sorted(cls.items(), key=lambda kv: -len(kv[1])):
+        print(f'   {c:7} {len(g) / len(rows) * 100:5.1f}% of blocks, mean cycle {st.mean(r["cyc"] for r in g):6.1f}, '
+              f'median {st.median(r["cyc"] for r in g):6.1f}')
+    # last voter's path, for every block (the quorum waits for it) and per binding class
+    parts = {k: [] for k in ('receipt', 'wait_for_engine', 'assemble_check', 'to_vote_sent', 'transit', 'qc_minus_p')}
+    last = Counter()
+    gate = []
+    byc = {}
+    for r in rows:
+        v = r['v'] - 1  # the previous block, whose quorum gates this proposal
+        vs = {n: D['fo'][n]['vote'][v] for n in D['fol']}
+        n = max(vs, key=vs.get)
+        last[n] += 1
+        b = D['fo'][n]['b'][v]
+        a = asm[n].get(v - 1)
+        if a is None:
+            continue
+        k = v - 1
+        d = {'receipt': b - P[v], 'wait_for_engine': a - b, 'assemble_check': vs[n] - a,
+             'transit': Qc[v] - vs[n], 'qc_minus_p': Qc[v] - P[v]}
+        d['to_vote_sent'] = 0.0
+        for kk, x in d.items():
+            parts[kk].append(x * 1e3)
+        if k - 2 in land[n]:
+            gate.append((a - land[n][k - 2]) * 1e3)
+        r['d'] = d
+        r['lastvoter'] = n
+        byc.setdefault(r['bind'], []).append((n, d))
+    print('   last voter of the previous block:', dict(last))
+    print('   last voter, receipt to Qc (ms, median / mean / p90):')
+    for kk in ('receipt', 'wait_for_engine', 'assemble_check', 'transit', 'qc_minus_p'):
+        print(f'     {kk:16} {stats(parts[kk])}')
+    if gate:
+        print(f'   assembly start minus the voter\'s engine landing of block n-2: min {min(gate):.1f} '
+              f'p10 {dr.pct(gate, .1):.1f} median {st.median(gate):.1f} p90 {dr.pct(gate, .9):.1f} ms (never negative: '
+              f'{sum(1 for x in gate if x < 0)} of {len(gate)} below 0)')
+    print('   quorum path by binding class (mean ms): ' + '; '.join(
+        f'{c}: wait_for_engine {st.mean(d["wait_for_engine"] for n, d in g) * 1e3:.0f}, Qc-P {st.mean(d["qc_minus_p"] for n, d in g) * 1e3:.0f}'
+        for c, g in byc.items()))
+    # engine landing latency per follower
+    for n in D['fol']:
+        x = [(land[n][v - 1] - D['fo'][n]['b'][v]) * 1e3 for v in W if v - 1 in land[n]]
+        di = D['fo'][n]['di']
+        print(f'   node{n}: engine landing minus body arrival median {st.median(x):.0f} p90 {dr.pct(x, .9):.0f}; '
+              f'parent_engine_wait_ms median {st.median(di[v]["parent_engine_wait_ms"] for v in W):.0f}; '
+              f'fields_ready median {st.median(di[v]["fields_ready_ms"] for v in W):.0f}')
+    # counterfactual: the slower follower's check path as fast as the faster follower's
+    fast = min(D['fol'], key=lambda n: st.median(D['fo'][n]['vote'][v] - D['fo'][n]['b'][v] for v in W))
+    gq = st.median(Tp[r['v']] - Qc[r['v'] - 1] for r in rows if r['bind'] == 'quorum') if cls.get('quorum') else 0.007
+    tr = st.median(Qc[v] - max(D['fo'][n]['vote'][v] for n in D['fol']) for v in W)
+    late = st.mean(r['seg']['late (timer)'] for r in rows) / 1e3
+    send = st.mean(r['seg']['send'] for r in rows) / 1e3
+    cf = []
+    for r in rows:
+        v = r['v'] - 1
+        q = max(D['fo'][n]['b'][v] - P[v] + (D['fo'][fast]['vote'][v] - D['fo'][fast]['b'][v]) for n in D['fol']) + tr
+        base = 0.100 + late
+        seal = r['take'] / 1e3 + 0.0 if r['take'] > 3 else 0.0
+        cf.append((max(base, q + gq, seal + (P[r['v']] - r['seg']['send'] / 1e3 - Tp[r['v']] + Tp[r['v']] - P[r['v'] - 1]) if False else base, q + gq) + send) * 1e3)
+    print(f'   counterfactual, every follower\'s vote path as fast as node{fast}\'s (quorum gap {gq * 1e3:.1f} ms, '
+          f'commit transit {tr * 1e3:.1f} ms, seal wait left as measured where binding): mean cycle '
+          f'{st.mean(max(c, r["cyc"] if r["bind"] == "seal" else 0) for c, r in zip(cf, rows)):.1f} ms')
+    tl = [D['Pd'][r['v']]['tick_late_us'] / 1e3 for r in rows]
+    print(f'   timer: tick_late_us median {st.median(tl):.2f} mean {st.mean(tl):.2f} p90 {dr.pct(tl, .9):.2f} ms; '
+          f'preamble minus nominal tick (late, all causes) mean {st.mean(r["seg"]["late (timer)"] + r["seg"]["late (quorum overshoot)"] for r in rows):.1f}; '
+          f'send overhead mean {st.mean(r["seg"]["send"] for r in rows):.2f} ms')
+    top = sorted(r['cyc'] for r in rows)[int(len(rows) * .9)]
+    hi = [r for r in rows if r['cyc'] >= top]
+    print(f'   slowest 10% (>= {top:.0f} ms, n={len(hi)}): binding ' +
+          ', '.join(f'{c} {sum(1 for r in hi if r["bind"] == c)}' for c in ('tick', 'quorum', 'seal')) +
+          f'; previous-block Qc-P mean {st.mean(r["qcp"] for r in hi):.0f} against {st.mean(r["qcp"] for r in rows):.0f} overall')
+    hd = [r['d'] for r in hi if 'd' in r]
+    ad = [r['d'] for r in rows if 'd' in r]
+    for kk in ('wait_for_engine', 'assemble_check', 'transit'):
+        print(f'     last voter {kk:16} slowest 10% mean {st.mean(d[kk] for d in hd) * 1e3:6.1f}  all blocks {st.mean(d[kk] for d in ad) * 1e3:6.1f}')
+    print(f'     last voter is node{max(D["fol"], key=lambda n: sum(1 for r in hi if r.get("lastvoter") == n))} in '
+          f'{max(sum(1 for r in hi if r.get("lastvoter") == n) for n in D["fol"])} of {len(hi)}; slow blocks with the previous block also slow: '
+          f'{sum(1 for i, r in enumerate(rows) if r in hi and i and rows[i - 1] in hi)}')
+    return D, W, rows
+
+
 if __name__ == '__main__':
-    for r in sys.argv[1:]:
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    for r in args:
+        if '--binding' in sys.argv:
+            binding(r)
+            print()
+            continue
         report(r)
         leadership(r)
         print()

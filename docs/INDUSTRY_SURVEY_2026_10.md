@@ -658,3 +658,67 @@ in 2-6 of about 220 seals and in none of the votes, and D = 2 or 3 reproduces th
 gate that sets the 36 ms of excess is the leader's one-ahead build slot, and that is a change to test first (replay
 suggests 136 ms to about 103 ms on the same logs, with the caveats above). D > 1 might matter in the stalls and tails of
 windows 2 and 3 and in production's seven-node tail; that is a replay of those windows, not a protocol change yet.
+
+### 11.6 Reconciliation with the earlier build-at-seal legs (loop307, loop312): the 103 ms prediction is falsified
+
+Earlier rounds (BD 10.55, loop307 ON/ONb/OFF/ONP90; BD 10.60, loop312 AHEAD against B1-B3) set `N42_BUILD_AHEAD_AT_SEAL=1`
+and window 1 did not move. Their logs are still under `/data/blockchain/rust-fleet3-bench/bench-loop307*` and `bench-loop312*`;
+`scripts/fleet7-depth-replay.py <dir>` runs on them unchanged (model D = 1 within 0.4% on every one).
+
+**What the slot is** (`crates/n42/h2-el-rpc/src/engine.rs`, `start_chain_locked`; `crates/n42/h2-node/src/service.rs`,
+`build_start_fields`). `ChainState.slot` holds the one chained build of a block that has been requested or built and
+not yet *taken*; a build is taken when the proposer fetches it for the proposal (`take_sealed_us`), that is, at the
+proposal's send. When build N seals, the chain asks to start N+1 on the sealed header. If the slot is still occupied,
+the start is refused ("one ahead, never two"). Without the switch, N+1 then starts from the request the leader makes
+after publishing the previous block (trigger `send`, start about 2 ms after the previous proposal). With the switch, the
+refused start is kept in `deferred` and runs the moment the occupying build is taken. What the logs show that this moves:
+build V starts at `P(V-2) + 3 ms`, one tick earlier, instead of at `P(V-1) + 2 ms` (trigger-send blocks: start minus P(V-1)
+of -101 ms with the switch against +2 ms without). What it does not change: still one build in the slot and one
+more in flight, the start still waits for a proposal's send, and the build still needs the sealed parent's state.
+The model's "slot lifted" scenario started a build at the previous *seal* (about 50 ms earlier again than the switch)
+and kept every other duration as measured, so the switch is a milder version of the same lift.
+
+**Gating attribution on the earlier legs** (same classes as 11.3; share of blocks; window 1; leader node 0):
+
+| Leg | Cycle ms | Pacing tick | Seal waits for previous send (slot) | Leader own build | Quorum of N-1 |
+| --- | --- | --- | --- | --- | --- |
+| loop307 OFF | 137.0 | 58.7% | 26.6% | 3.2% | 11.5% |
+| loop307 ON | 135.1 | 61.5% | 5.0% | 11.3% | 22.2% |
+| loop307 ONb | 131.1 | 68.9% | 4.8% | 9.2% | 16.7% |
+| loop307 ONP90 (90 ms) | 132.5 | 53.5% | 11.9% | 13.3% | 20.8% |
+| loop312 B1 / B2 | 136.2 / 142.3 | 47.9% / 53.8% | 31.5% / 29.5% | 13.2% / 11.4% | 6.4% / 4.3% |
+| loop312 AHEAD | 129.5 | 70.1% | 4.3% | 9.5% | 14.3% |
+
+With the switch on the slot's share falls from 27-32% to 4-5% (ONP90 12%), as intended, and the cycle falls by 2-9 ms,
+not the 33 ms the model predicted. The time moved to the quorum of the previous block and to longer durations that the
+model held fixed (medians, OFF/B legs against ON/AHEAD legs):
+
+| Duration | OFF / B1-B3 | ON / ONb / AHEAD |
+| --- | --- | --- |
+| Quorum after proposal, `Qc - P` median / p90 (ms) | 58 / 150 (307), 45-50 / 90-98 (312) | 76 / 172, 72 / 154, 60 / 142 |
+| Follower check, vote minus body, p90 (ms) | 93 (307), 52-58 (312) | 113, 97, 91 |
+| Seal to proposer's hand-off, `h` median (ms) | 100 (307), 98-102 (312) | 138, 129, 129 |
+| Leader `par_ms` median (ms) | 76-81 | 83-86 |
+| Peak EL memory, 312 (BD 10.60) | 32-33 G | 40.7 G |
+
+The same slot-lifted replay, run on the ON/AHEAD legs' own durations, still says 105-106 ms, while those legs measured
+129-135 ms. The replay therefore fails an out-of-sample check: it assumes the per-block durations do not change when
+builds start earlier, and they do. ONP90 is a second witness: at 90 ms pacing the cycle stayed 132 ms, so the tick is not
+what limits it once the slot is open. The 103 ms in 11.3 is an upper bound under zero contention, not a forecast.
+Section 11.5's statement that lifting the slot is worth more than any D should be read with this correction: the switch
+that does it was measured twice and delivered 2-9 ms.
+
+**What a real lift would need.** A second build in flight on state the first has not finished: the leader would execute
+N+1's transactions against N's output shards while N's roots and import are still running, and also hold N's
+unfinished block in memory. Candidates for what it then contends with, none separated by these logs: the leader's own
+import of N-1 (170-230 ms, `own block imported by header`) and root on the same pinned cores; the 32-thread build pool;
+memory bandwidth and page faults (peak memory +7-8 G with the switch); and the vote path of the *followers*, whose check
+and the leader's quorum time both grew although followers run no builds, which points at host-wide contention (memory,
+page cache, hugepage pool) and not only at the leader's cores. That cause is open.
+
+**One measurement that would confirm or falsify** the slot as the cycle's limit: a leg with the switch on and the leader's
+build, import and root threads on cores and memory disjoint from the other work, with the three counters `Qc - P`,
+follower check p90 and `h` printed per leg. If the lift is purely a scheduling gain, `Qc - P` median stays at 45-58 ms and the
+cycle drops to about 105-115 ms; if those counters rise again to 60-76 ms and the cycle stays at 130-135 ms, the
+contention reading holds and neither the slot nor D is the lever. The existing ON/AHEAD logs already lean to the
+second outcome.

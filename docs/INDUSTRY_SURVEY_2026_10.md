@@ -1077,3 +1077,123 @@ in loop324WARM and loop323WARM node 1 is gated as often as node 2 (57 / 44 and 4
 - The one confirming leg: F (loop324 F configuration, one leg plus its repeat) with node 1 and node 2 swapped in the launch: node 1's execution layer and validator on node 2's CPU list and the reverse (everything else, ports and feed order, unchanged; an edited `f7_pin` for the two indices). If the engine-thread CPU (`threadcpu`, `engine`), `engine_new_payload_ms` and the gating move to the node on the CPUs
   37-73,165-201, it is placement and a launch-script fix (a layout whose nodes are L3-aligned: 37 physical cores a node does not divide the 8-core L3s, so give each node whole L3 domains, e.g. 32 physical cores each); if they stay with the node index, it is the feed
   order (swap the `--ingest` list order in the same leg to separate the two) or per-node state, and the gate change above is the remedy. A second leg, `DEFERRED_IN_FLIGHT = 3` on the unswapped layout, tests the code change.
+
+### 11.11 Node 2's engine cost found: reth's cross-block execution cache, kept live on node 2 only by the start-up order (loop325 F, Fb, SWAP, WARM; loop320-loop325 metrics, offline)
+
+Offline: logs, metrics files, `threadcpu-*.tsv`, scripts and code (reth v2.7.0 at `3d592ec` in the cargo git checkout); no node, fleet or cargo. Scratch parser
+in `/tmp/a1111` (per-block join of the execution layer's `direct import`, `raw newPayload`, `Block added to canonical chain`, `Received new payload`,
+`Canonical chain committed`, `compact body assembled`, `vote road` and `checked` lines). Window 1 of loop325F is blocks 275-533 (the flood starts at 274).
+
+**1. What the engine thread does per block on a follower (direct import), in arrival order, and what each step scales with.**
+The engine tree runs on one OS thread and takes messages in FIFO order from the engine service task (`crates/node/builder/src/launch/engine.rs`).
+- *Executed insert.* `payload_serve.rs` sends the block it executed (`BuiltPayloadExecutedBlock`: block, `BundleState`, hashed state, empty trie updates) on
+  `executed_inserts`; the service task forwards it as `EngineApiRequest::InsertExecutedBlock` and acknowledges as soon as it is queued (so `insert_ms` is 0).
+  On the tree thread (`tree/mod.rs` 1603-1644): outdated / already-known checks, O(1); then `BasicEngineValidator::on_inserted_executed_block` ->
+  `PayloadProcessor::on_inserted_executed_block` (`payload_processor/mod.rs` 484-529): **if the saved execution cache's block hash equals the block's parent,
+  `ExecutionCache::insert_state(bundle)` writes every changed account and slot of the block into the cross-block cache** -- O(accounts + slots changed), about 160,000
+  accounts in a full block; if the hash differs it returns at once. Then `spawn_deferred_trie_task` (the sort runs on a blocking worker, about 1 ms, off this thread),
+  `tree_state.insert_executed`, `set_pending_block` when the parent is the head, a metric and the `CanonicalBlockAdded` event, whose `elapsed` is timed around exactly
+  these steps (the `Block added to canonical chain ... elapsed=` field).
+- *newPayload.* After `engine_remember_ms` (the sealed block filed for the engine's conversion, a worker thread) N42 sends the payload; the tree finds the block
+  already in the tree and answers Valid without executing. Its thread CPU is metered by reth (`new_payload_thread_user_cpu_seconds`): 7.32 / 7.81 / 7.76 s for
+  2,095 calls on nodes 0 / 1 / 2, 3.5-3.7 ms a call, the same on every node. `engine_new_payload_ms` is timed at the caller, so it also holds the queueing behind
+  whatever the tree thread is still doing.
+- *forkchoiceUpdated at the commit* (one per block from the validator; a leader sends more): the head move, `Canonical chain committed elapsed` 27-31 ms median on both
+  followers, including N42's QMDB `on_canonical` hook and reth's txpool prewarm hook; scales with the in-memory chain update and the hooks, not with the block's state size.
+- *Persistence hand-off*, every ~3 blocks (682 / 695 / 688 actions): `on_persistence_complete` drops persisted blocks from the tree and the in-memory state and runs the
+  `on_persisted` hook; the save itself is on the persistence thread (`save_blocks` 88-94 ms a full block on the followers).
+- N42 adds nothing else on this thread: the conversion of the payload is avoided by `remember_sealed`, execution and roots run on rayon, and the parent-landing wait
+  (`parent_engine_wait_ms`) is in the import task, not the engine.
+
+**2. What differs on node 2: one step, the cache insert.** Window 1 of F, 259 blocks, node 1 / node 2 medians [min, max]:
+
+| field | node 1 | node 2 |
+| --- | --- | --- |
+| path: messages per block (direct import, raw newPayload, Block added, Received new payload, commit, compact assembly, vote road, checked) | 1 each | 1 each |
+| body transport (`compact body assembled`) | by description, copy aside, 12.6 KB | identical |
+| `vote road` request / `frames_missing` | `block_by_description` / 0 | identical |
+| `convert_ms`, `senders_cached`, `parent_read`, `reused` | 0, 0, shards, false | identical |
+| `exec_ms` / `root_ms` / `fields_ready_ms` | 37 / 27 / 75 | 37 / 25 / 76 |
+| **`Block added ... elapsed`** (the executed insert on the tree thread) | **0.03 ms [0.02, 0.07]** | **24.7 ms [14.2, 46.2]** |
+| `Received new payload` minus `Block added` | 10.4 ms | 0.10 ms (queued behind the insert) |
+| `engine_new_payload_ms` / `engine_ms` / `engine_remember_ms` | 8 / 19 / 10 | 21 / 34 / 11 |
+| `parent_engine_wait_ms` | 0 | 40 |
+| assembly start to `Block added` | 126 | 216 |
+| `Canonical chain committed elapsed` | 27.4 | 30.7 |
+
+No re-execution, no fetch, no payload conversion, no duplicate delivery, no second forkchoice source on node 2: the road is the same block for block. The only step
+whose own duration differs is the executed insert, 0.03 ms against 25 ms, and newPayload then lands 0.1 ms after the insert because it was waiting behind it.
+The engine-thread CPU difference in F, (52.2 - 31.7)% of a core x 115.7 ms = 23.7 ms a block, is that insert.
+
+Engine metrics at the end of F (nodes 0 / 1 / 2): `inserted_already_executed_blocks` 2,095 / 2,096 / 2,095; `new_payload_messages` 2,095 / 2,096 / 2,095;
+`forkchoice_updated_messages` 2,824 / 2,532 / **2,097** (node 2 handles *fewer* engine messages: it never leads in the flood); `forkchoice_updated_syncing` and
+`executed_new_block_cache_miss` 556 / 387 / 0 (leader-side forkchoices to a block not yet inserted); persistence actions 682 / 695 / 688, `save_blocks` sum 139 / 112 / 110 s;
+reorg and "fork chain" lines 0 on all; and the one metric that singles node 2 out:
+
+| metric | node 0 | node 1 | node 2 |
+| --- | --- | --- | --- |
+| `reth_sync_caching_account_cache_size` | 4 | 4 | **32,768** (full) |
+| `reth_sync_caching_storage_cache_size` | 2 | 2 | **6,247** |
+
+Across all 41 legs from loop320 to loop325 node 2's account cache is 32,768 at the end; nodes 0 and 1 read 4 / 2 in 39 legs, and node 1 reads 32,764 in two
+(loop320FAS, loop322CTRL; see 4). The per-block `elapsed` agrees: in F, WARM and loop322CTRL nodes 0 and 1 insert 1,180 blocks of 1,000+ transactions at 0.03 ms median
+and never above 1 ms, node 2 every one of them at 22-25 ms median from the first full block (274) on.
+
+**3. Why node 2: it missed the orphan block 1.** The execution cache follows a chain of executed inserts: each insert whose parent is the cache's block moves the cache
+to the new block; an insert with any other parent is skipped and the cache keeps its old hash, and from then on no canonical block's parent matches it, so every later
+insert is skipped too. Nothing in N42's path re-anchors it (only reth's own payload execution saves a fresh cache). In every leg (F, Fb, SWAP, WARM, CTRL, FAS: same hashes,
+deterministic genesis) validator 0 starts at +0, proposes view 1 at once and builds block 1 `0x5d78e7ab...`; validator 1 starts ~0.2 s later, receives the proposal and
+imports that block into its execution layer; validator 2 starts ~0.4 s later still (`node2-v.log` first line 37.07 s against the proposal at 36.73 s) and never sees it.
+View 1 cannot commit with 3 of 3 votes, times out after 6 s, and view 2 commits a different block 1, `0xb677cfe8...`, also with the genesis as parent. Nodes 0 and 1 had
+inserted `0x5d78` (cache -> `0x5d78`); `0xb677`'s parent is genesis, so the insert skips the cache on them, permanently: their cache stays at 4 accounts, the empty block's.
+Node 2 inserted only `0xb677`, so its cache follows the canonical chain to the end of the leg and absorbs every block's ~160,000 accounts on the engine thread,
+evicting a 128 MB cache (`--engine.cross-block-cache-size 128`) that nothing reads: the follower executes on its published shards (`parent_read="shards"`), the leader's
+build has its own state path, and `share-execution-cache-with-payload-builder` is not set. The cache is read only by reth's own payload execution (the fallback for a
+block that reaches the engine as a payload, a few times a leg at a handover) and its prewarmer (disabled on the bench).
+
+The natural experiment that confirms it, loop322CTRL: at the tenure handover node 1 produced a block 1026 (`0x660d5453`) that was not committed and the canonical 1026
+(`0x168765fb`) followed. Node 2 inserted `0x660d` first, so the canonical insert skipped its cache: from block 1026 on its inserts fall to 0.02-0.06 ms, its
+`engine_ms` from 38 to 18 ms and `engine_new_payload_ms` from 11 to 6.5 ms on full blocks. Node 1 executed `0x168765fb` through reth's validator (`Block added to fork chain`,
+364 ms), which saved a fresh cache for it, and node 1's inserts became 12-17 ms from block 1028 until the next fork at 1056. The cost moves with the cache, block for block.
+
+**4. Per-index launch items, each against the engine.** Start order (validators 0, 1, 2, about 0.2 s apart; ELs likewise): **this is the cause**, through the orphan
+block 1 above. Last in the ingest list (`F7_INGEST_ALL=1`, frames written 8900, 8901, 8902): no engine cost (the engine never sees the pool feed; frames are complete,
+`frames_missing` 0, same assembly). Last in the static peer list / dials out to both: the body arrives at the same time (-0.5 ms median), same transport. Never leads during the
+flood (node 0 leads 1-1022, node 1 1023-2046, node 2 2047-2246 after the flood): fewer forkchoices on node 2, and as a follower its cache never meets a sibling build, which
+is also why nothing re-breaks its chain. The flood's last worker, the RPC the measurement polls (node 0), the samplers: none reaches the engine thread. Index-keyed environment
+(`N42_TX_INGEST`, `N42_PAYLOAD_SERVE`, `N42_INGEST_SHARD`, ports, datadir, `--index`, `--bls-key`): no engine effect. SWAP (loop325) kept the cost on node 2 because the
+cache's state is set by which validator missed view 1, which the pin swap does not change.
+
+**5. The WARM legs.** The insert cost is there on node 2 in WARM too (`Block added` 26.2 ms median against 0.03 on node 1, window 1 of loop325WARM; engine thread
+46.6 / 28.1 / 30.4%), but the cycle is 136 ms and persistence is ~170 ms a block with the history index on (in-memory 81-94 blocks), so node 2's assembly-to-landing,
+162 ms against 128 on node 1, stays under two cycles (272 ms) and the gate binds only on its tail; node 1's landings are pushed past two cycles by the same persistence
+episodes (p90 317 ms), which is why loop323/324WARM gated node 1 as often as node 2. WARM does not move the cache cost; it raises the threshold (2 x cycle) that the cost has
+to cross. In F the cycle is 112-116 ms, 2 x cycle 224-232 ms, and node 2's extra ~25 ms on the tree thread, plus the newPayload and forkchoice queued behind it, carries its landing
+from ~126 to ~216 ms; the creep of 11.10 section 4 is that sum closing on the threshold in the first full blocks, after which the gate holds it there.
+
+**6. Conclusion.**
+- Cause (settled by the logs and metrics, no new leg needed): reth's cross-block execution cache update in `on_inserted_executed_block`, ~22-25 ms of the engine thread per
+  163k-transaction block, runs on node 2 only, because node 2 alone missed the uncommitted view-1 block 1 at start-up and so alone kept its cache anchored to the canonical
+  chain. It follows the node that missed view 1 (the start order), not the index's cores, feed or peers; on any node it can switch on (node 1, CTRL, after a fork executed by
+  reth) or off (node 2, CTRL, after a sibling insert). The 1.6-1.7x engine CPU, `engine_new_payload_ms` 21 against 8, the `parent_engine_wait_ms` 40, the late landing and,
+  through the two-slot cap, node 2 as last voter all follow from it.
+- Settling field, already in every leg: `reth_sync_caching_account_cache_size` per node in `metrics-node<i>.txt` (32,768 on the slow node, 4 on the others), and per block the
+  `elapsed` of `Block added to canonical chain` on a follower (25 ms against 0.03 ms).
+- Smallest fix, code: do not update the execution cache on an executed insert. `QmdbEngineValidatorBuilder` (`crates/n42/qmdb-reth/src/strategy.rs`) already builds the tree's
+  validator; make it return a thin wrapper around `BasicEngineValidator` that delegates every method and overrides `on_inserted_executed_block` to build the `ExecutedBlock`
+  without `PayloadProcessor::on_inserted_executed_block` (the deferred trie sort via the public `LazyTrieData` / `ExecutedBlock::with_deferred_trie_data`, as reth's private
+  `spawn_deferred_trie_task` does; check those constructors are public in the pinned reth before writing it). No vendored crate changes. Alternative: a one-line guard in a vendored
+  `reth-engine-tree` (skip the cache update when `--engine.disable-state-cache` is set), heavier because that crate is not vendored today. No launch flag disables it
+  (`--engine.disable-state-cache` only stops reads; a smaller `--engine.cross-block-cache-size` still walks the whole bundle). Making all three nodes see view 1 would also
+  equalise them, but it relies on the same accident; do not use it as the fix.
+- Prediction with the fix: node 2's insert 0.03 ms, engine thread ~30% like nodes 0 and 1, landing ~126 ms after assembly, gate binding in ~13 of 234 blocks as on node 1,
+  last voter split between the followers; the quorum overshoot of 11.9 shrinks towards node 1's vote road (11.9's counterfactual, ~102 ms, is the upper bound).
+  Confirming leg: F with the wrapper, one leg plus repeat; read the cache metric (4 or unchanged on all three), `Block added elapsed` on node 2, and the gating counts.
+- Freeing the import slot at fields-published instead of at engine landing, judged on its own: the landing wait protects nothing the next check needs (the check of n reads
+  n-1's published output and fields; unlanded ancestors are read through by `ancestry_of`); the hand-off order is kept separately by `wait_for_parent` in the import task. What
+  the slot does bound is the depth of unlanded blocks: `ancestry_of` stacks at most `PARENT_OUTPUTS_KEPT = 4` published outputs, and beyond that the check itself waits for
+  the engine, which is worse than today (the wait moves in front of the vote rather than in front of the assembly), and every unlanded block holds its executed output in memory.
+  With the cache cost present node 2's landing is the binding resource: D3 showed the backlog growing to fill a larger cap (landing 289 to 381 ms, p90 426, close to the
+  4 x 115 = 460 ms at which the ancestry limit would start to bind), so the release-at-fields would trade the slot wait for tail stalls at the ancestry limit. With the
+  cache fix the gate stops binding by itself (node 1's 126 ms is well under 2 x cycle) and the change buys nothing. Recommendation: fix the cache insert first, keep the slot
+  released at landing, and revisit release-at-fields (with a guard at `PARENT_OUTPUTS_KEPT - 1` unlanded) only if a later leg shows the gate binding with equal engines.

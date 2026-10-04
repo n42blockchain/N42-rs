@@ -42,6 +42,7 @@ pub mod cli;
 pub mod consensus_ext;
 pub mod engine_ext;
 pub mod follower_import;
+pub mod import_once;
 pub mod payload_serve;
 pub mod queue_reorg;
 pub mod road_runtime;

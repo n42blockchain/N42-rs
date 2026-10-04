@@ -117,6 +117,17 @@
   `OverlayManager::new(池)` 或 `OverlayManager::without_state_trie_overlay()`；
   `crates/ethereum/cli/src/app.rs` 在 false 时把运行时的 `state-ovly` 池缩到 1 个（空闲）线程
   （reth v2.7.0 默认 4 个，loop309/310 每轮约 22k CPU 单位，见 `docs/RETH_2_7_0_UPGRADE.md`）
+- `N42_ENGINE_EXEC_CACHE=on`（未设置或其他值即跳过；不改任何 fork 的 reth crate，代码在
+  `crates/n42/qmdb-reth/src/exec_cache.rs`，由 `QmdbEngineValidatorBuilder` 包装引擎树的验证器）：
+  QMDB 链上默认跳过——以"已执行"方式插入引擎的块不再写入 reth 的跨块执行缓存
+  （`on_inserted_executed_block` 里的 `insert_state`，一个 16.3 万笔交易的块在引擎线程上
+  14-46 ms）；其余效果照旧（延迟排序的 trie 数据在 `deferred-trie` 工作线程上计算，
+  `ExecutedBlock` 不变；只少记 reth 私有的三个排序直方图）。N42 路径上没有任何读者：跟随者
+  在已发布的分片上执行，出块器有自己的状态路径；reth 自己执行的块按父哈希取缓存，哈希不符时
+  拿到清空的缓存，不会读到错误状态。以前哪个节点付这笔开销取决于启动顺序（错过 view 1 那个
+  未提交的块 1 的节点，见 `docs/INDUSTRY_SURVEY_2026_10.md` 11.11）。`on` 恢复上游行为做 A/B；
+  非 QMDB 链始终是上游行为。启动时打印一行 `executed inserts and reth's cross-block execution cache`
+  （`mode=skip|update`）。
 
 ## 其他 N42 独有模块:
 - `crates/n42/clique/` - APoS 共识实现

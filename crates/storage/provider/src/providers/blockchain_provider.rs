@@ -1468,7 +1468,10 @@ mod tests {
             }
         }
         let (skips, probes) = crate::providers::overlay_filter::take_counters();
-        println!("overlay_filter_skips={skips} overlay_probes={probes}");
+        let (builds, cached) = crate::providers::overlay_filter::filter_stats();
+        println!(
+            "overlay_filter_skips={skips} overlay_probes={probes} overlay_filter_builds={builds} overlay_filter_cached={cached}"
+        );
         Ok(())
     }
 

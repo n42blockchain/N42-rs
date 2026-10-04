@@ -59,6 +59,7 @@
   `MemoryOverlayStateProvider` 逐块读之前先查过滤器，未命中即跳过该块，命中照旧探测，结果按构造不变。
   过滤器按执行输出（`Arc` 地址 + `Weak` 校验）缓存在有界侧表（64 项，块释放即淘汰），
   在第一次有覆盖层打开在该块上时由后台线程构建一次，打开者从不等待。`N42_OVERLAY_FILTER=0` 关闭。
+  `N42_OVERLAY_FILTER_CAP`（默认 1024，下限 64）：过滤器缓存容量，须不小于内存中的块数，否则每次打开都会全部未命中并重建；满时淘汰最近最少使用的条目。
   计数器 `overlay_filter_skips` / `overlay_probes` 在 `N42_PHASE_TIMERS=1` 时打印在领导者的阶段行上
 - `crates/storage/provider/src/providers/op_metrics.rs`（N42 新增文件）：`N42_STORAGE_OP_METRICS=0`
   时跳过每次操作的存储指标——静态文件写入器每追加一行交易/收据/发送者的计数与耗时直方图

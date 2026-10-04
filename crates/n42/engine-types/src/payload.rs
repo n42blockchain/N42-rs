@@ -2924,6 +2924,8 @@ where
                 } else {
                     (0, 0)
                 };
+                let (overlay_filter_builds, overlay_filter_cached) =
+                    reth_provider::providers::overlay_filter::filter_stats();
                 tracing::info!(
                     target: "payload_builder",
                     number = block_number,
@@ -2987,6 +2989,8 @@ where
                     overlay_depth,
                     overlay_filter_skips,
                     overlay_probes,
+                    overlay_filter_builds,
+                    overlay_filter_cached,
                     // `N42_PHASE_TIMERS=1` (plan v6 6.5/6.6): where the
                     // parallel step's wall time (`par_exec_ms` above) goes
                     // inside `N42Evm::transfer`, which door each account read

@@ -15,6 +15,8 @@
 //! another), and are built once per output on a background thread the first time an overlay
 //! is opened over it: the opener never waits for a build, and a block whose filter is not
 //! ready yet is probed as before. `N42_OVERLAY_FILTER=0` turns the filters off.
+//! The map holds `N42_OVERLAY_FILTER_CAP` entries (default 1024, at least 64): it must hold every
+//! in-memory block, or every open misses every block and rebuilds all of them.
 //!
 //! [`MemoryOverlayStateProvider`]: super::memory_overlay::MemoryOverlayStateProvider
 
@@ -32,8 +34,26 @@ use std::{
 /// Bits per key: a split-block Bloom filter at 11 bits a key reads ~1% false positives.
 const BITS_PER_KEY: usize = 11;
 
-/// Entries the side map keeps at most (64 blocks of ~150k accounts: ~13 MB of filters).
-const CACHE_CAP: usize = 64;
+/// Entries the side map keeps at most by default. A state open asks for the filter of every
+/// in-memory block, so a cap below the in-memory block count makes every lookup a miss.
+const DEFAULT_CACHE_CAP: usize = 1024;
+
+/// The smallest cap `N42_OVERLAY_FILTER_CAP` can set.
+const MIN_CACHE_CAP: usize = 64;
+
+/// The cap for an `N42_OVERLAY_FILTER_CAP` value: the default when unset or unparsable, never
+/// under [`MIN_CACHE_CAP`].
+fn parse_cap(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(DEFAULT_CACHE_CAP, |v| v.max(MIN_CACHE_CAP))
+}
+
+/// Entries the side map keeps at most (`N42_OVERLAY_FILTER_CAP`, parsed once).
+fn cache_cap() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| parse_cap(std::env::var("N42_OVERLAY_FILTER_CAP").ok().as_deref()))
+}
 
 /// Whether the filters are on (`N42_OVERLAY_FILTER=0` turns them off; on by default).
 pub fn enabled() -> bool {
@@ -149,6 +169,7 @@ pub struct BlockFilter {
 impl BlockFilter {
     /// Builds the filters of `output`'s bundle: one pass over its accounts and contracts.
     pub fn build<R>(output: &BlockExecutionOutput<R>) -> Self {
+        BUILDS.fetch_add(1, Ordering::Relaxed);
         let bundle = &output.state;
         let mut accounts = SplitBloom::with_capacity(bundle.state.len());
         for address in bundle.state.keys() {
@@ -186,9 +207,55 @@ struct Entry {
     key: usize,
     owner: Weak<dyn Any + Send + Sync>,
     cell: FilterCell,
+    /// Tick of the entry's last lookup. The cache key carries no block number (the output does
+    /// not hold one and the callers sit outside this module), so eviction is least recently used:
+    /// a persisted block is no longer asked for, so it ages out first.
+    used: u64,
 }
 
 static CACHE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+static TICK: AtomicU64 = AtomicU64::new(0);
+
+/// Filters built since the process started.
+static BUILDS: AtomicU64 = AtomicU64::new(0);
+
+/// `(overlay_filter_builds, overlay_filter_cached)`: filters built since the process started
+/// and entries the side map holds now.
+pub fn filter_stats() -> (u64, usize) {
+    let cached = CACHE.lock().unwrap_or_else(PoisonError::into_inner).len();
+    (BUILDS.load(Ordering::Relaxed), cached)
+}
+
+/// The slot for the output at `key` in `cache`, and whether it is new (its build is the
+/// caller's to start). A block already in the map, built or still building, is never entered a
+/// second time, so a repeated miss cannot start a second build; at `cap` the least recently
+/// used entry makes room.
+fn lookup(
+    cache: &mut Vec<Entry>,
+    cap: usize,
+    key: usize,
+    owner: Weak<dyn Any + Send + Sync>,
+) -> (FilterCell, bool) {
+    cache.retain(|entry| entry.owner.strong_count() > 0);
+    let used = TICK.fetch_add(1, Ordering::Relaxed);
+    if let Some(entry) = cache
+        .iter_mut()
+        .find(|entry| entry.key == key && entry.owner.as_ptr() as *const () as usize == key)
+    {
+        entry.used = used;
+        return (entry.cell.clone(), false)
+    }
+    while cache.len() >= cap {
+        let Some(victim) = cache.iter().enumerate().min_by_key(|(_, e)| e.used).map(|(i, _)| i)
+        else {
+            break
+        };
+        cache.swap_remove(victim);
+    }
+    let cell: FilterCell = Arc::new(OnceLock::new());
+    cache.push(Entry { key, owner, cell: cell.clone(), used });
+    (cell, true)
+}
 
 /// The filter slot of `output`, starting its build on a background thread when it has none.
 /// `None` when the filters are off (or the build could not be started).
@@ -200,21 +267,15 @@ where
         return None
     }
     let key = Arc::as_ptr(output) as *const () as usize;
-    let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
-    cache.retain(|entry| entry.owner.strong_count() > 0);
-    if let Some(entry) = cache.iter().find(|entry| {
-        entry.key == key && entry.owner.as_ptr() as *const () as usize == key
-    }) {
-        return Some(entry.cell.clone())
-    }
-    if cache.len() >= CACHE_CAP {
-        cache.remove(0);
-    }
-    let cell: FilterCell = Arc::new(OnceLock::new());
     let owner: Arc<dyn Any + Send + Sync> = output.clone();
-    cache.push(Entry { key, owner: Arc::downgrade(&owner), cell: cell.clone() });
+    let (cell, is_new) = {
+        let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+        lookup(&mut cache, cache_cap(), key, Arc::downgrade(&owner))
+    };
     drop(owner);
-    drop(cache);
+    if !is_new {
+        return Some(cell)
+    }
 
     let (build_output, build_cell) = (output.clone(), cell.clone());
     let spawned = std::thread::Builder::new().name("overlay-filter".into()).spawn(move || {
@@ -306,5 +367,85 @@ mod tests {
         let rate = fp as f64 / n as f64;
         assert!(rate < 0.02, "false positive rate {rate}");
         assert!(bloom.size_bytes() < 220_000, "{}", bloom.size_bytes());
+    }
+
+    fn output() -> Arc<BlockExecutionOutput<()>> {
+        Arc::new(BlockExecutionOutput {
+            result: reth_execution_types::BlockExecutionResult {
+                receipts: Vec::new(),
+                requests: Default::default(),
+                gas_used: 0,
+                blob_gas_used: 0,
+            },
+            state: Default::default(),
+        })
+    }
+
+    fn owner(o: &Arc<BlockExecutionOutput<()>>) -> (usize, Weak<dyn Any + Send + Sync>) {
+        let w: Arc<dyn Any + Send + Sync> = o.clone();
+        (Arc::as_ptr(o) as *const () as usize, Arc::downgrade(&w))
+    }
+
+    #[test]
+    fn repeated_opens_over_200_blocks_build_each_block_once() {
+        let outputs: Vec<_> = (0..200).map(|_| output()).collect();
+        let mut cache = Vec::new();
+        let mut builds = 0;
+        for _ in 0..5 {
+            for o in outputs.iter().rev() {
+                let (key, weak) = owner(o);
+                builds += usize::from(lookup(&mut cache, DEFAULT_CACHE_CAP, key, weak).1);
+            }
+        }
+        assert_eq!(builds, 200);
+        assert_eq!(cache.len(), 200);
+    }
+
+    #[test]
+    fn a_block_being_built_is_not_entered_twice() {
+        let o = output();
+        let mut cache = Vec::new();
+        let (key, weak) = owner(&o);
+        let (a, first) = lookup(&mut cache, 64, key, weak.clone());
+        let (b, second) = lookup(&mut cache, 64, key, weak);
+        assert!(first && !second);
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn eviction_at_the_cap_removes_the_least_recently_used() {
+        let outputs: Vec<_> = (0..65).map(|_| output()).collect();
+        let mut cache = Vec::new();
+        for o in &outputs[..64] {
+            let (key, weak) = owner(o);
+            lookup(&mut cache, 64, key, weak);
+        }
+        // Touch the first block, leaving the second the least recently used.
+        let (key, weak) = owner(&outputs[0]);
+        assert!(!lookup(&mut cache, 64, key, weak).1);
+        let (key, weak) = owner(&outputs[64]);
+        assert!(lookup(&mut cache, 64, key, weak).1);
+        assert_eq!(cache.len(), 64);
+        let keys: Vec<_> = cache.iter().map(|e| e.key).collect();
+        let second = Arc::as_ptr(&outputs[1]) as *const () as usize;
+        assert!(!keys.contains(&second));
+        assert!(keys.contains(&(Arc::as_ptr(&outputs[0]) as *const () as usize)));
+    }
+
+    #[test]
+    fn cap_env_is_clamped_and_defaults() {
+        assert_eq!(parse_cap(None), 1024);
+        assert_eq!(parse_cap(Some("junk")), 1024);
+        assert_eq!(parse_cap(Some("10")), 64);
+        assert_eq!(parse_cap(Some("0")), 64);
+        assert_eq!(parse_cap(Some(" 300 ")), 300);
+    }
+
+    #[test]
+    fn build_counter_and_filter_size() {
+        let before = filter_stats().0;
+        let _ = BlockFilter::build(&*output());
+        assert!(filter_stats().0 > before);
     }
 }

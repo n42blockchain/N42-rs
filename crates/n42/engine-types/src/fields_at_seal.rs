@@ -470,6 +470,54 @@ mod tests {
     }
 
     #[test]
+    fn a_block_sealed_but_never_committed_is_never_read_by_the_winning_chain() {
+        let parent_built = B256::repeat_byte(0xa1);
+        let parent_sealed = B256::repeat_byte(0xa2);
+        let (state, genesis) = forest("lost-sibling");
+        file_parent(&state, genesis, parent_built);
+        // The leader seals block N (builder hash 0xa3) and publishes its fields
+        // early; consensus never commits it.
+        let (_, lost) = finish_child(&state, parent_sealed, parent_built, B256::repeat_byte(0xa3), true, || {});
+        // The block that wins at height N on the same parent (another view, a
+        // different body): its own operations, its own tree and fields.
+        let won_built = B256::repeat_byte(0xa4);
+        let won_ops = n42_qmdb_reth::sorted_operations_from_execution(
+            &BundleState::builder(2..=2)
+                .state_original_account_info(addr(2), info(1, 60))
+                .state_present_account_info(addr(2), info(2, 55))
+                .build(),
+            true,
+        );
+        let prepared = state.compute_operations(parent_sealed, won_ops.clone()).expect("winner root");
+        let won_root = prepared.root;
+        state.insert(won_built, 2, prepared).expect("winner filed");
+        let won = ExecutedFields { state_root: won_root, ..lost.fields };
+        crate::executed_fields::remember(won_built, won);
+        assert_ne!(won.state_root, lost.fields.state_root);
+
+        // The same root a forest that never saw the lost block computes.
+        let (clean, genesis) = forest("lost-sibling-clean");
+        file_parent(&clean, genesis, parent_built);
+        clean.rename(parent_built, parent_sealed).expect("renamed");
+        assert_eq!(clean.compute_operations(parent_sealed, won_ops).expect("clean root").root, won_root);
+
+        // The child of the winner reads the winner's fields: under its sealed
+        // hash, falling back to its builder hash. Nothing keyed by the lost
+        // block's hash is on that path.
+        let mut header = alloy_consensus::Header { number: 2, timestamp: 2, ..Default::default() };
+        header.parent_hash = parent_sealed;
+        let won_sealed = reth_primitives_traits::SealedHeader::seal_slow(header);
+        let found = crate::hotstuff_consensus::parent_executed_fields_or_built(
+            chain().genesis(),
+            &won_sealed,
+            Some(won_built),
+            std::time::Duration::from_millis(50),
+        );
+        assert_eq!(found, Some(won));
+        assert_eq!(crate::executed_fields::get(&won_sealed.hash()), Some(won));
+    }
+
+    #[test]
     fn the_stamps_are_relative_and_never_negative() {
         let a = std::time::Instant::now();
         let b = a + std::time::Duration::from_micros(250);

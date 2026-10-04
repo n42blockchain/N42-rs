@@ -2453,4 +2453,61 @@ mod raw_payload_tests {
         let want: Vec<Vec<u8>> = block.body.transactions.iter().map(|tx| tx.encoded_2718()).collect();
         assert_eq!(txs.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), want);
     }
+
+    /// `N42_TAKE_COMPACT`: the block taken without its transactions is the
+    /// block taken whole, minus the bytes. Same hash, same header, same
+    /// sealed hash, and the payload made whole from the body fetched later
+    /// is the whole answer's payload, field for field.
+    #[test]
+    fn an_elided_answer_is_the_whole_answer_without_the_transactions() {
+        let txs = vec![typed(), legacy(), typed()];
+        let withdrawals = vec![alloy_eips::eip4895::Withdrawal { index: 1, validator_index: 2, address: Address::repeat_byte(7), amount: 3 }];
+        let header = Header {
+            number: 8,
+            base_fee_per_gas: Some(7),
+            transactions_root: alloy_consensus::proofs::calculate_transaction_root(&txs),
+            withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(B256::repeat_byte(7)),
+            requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
+            ..Default::default()
+        };
+        let block = Block { header: header.clone(), body: BlockBody { transactions: txs.clone(), ommers: Vec::new(), withdrawals: Some(alloy_eips::eip4895::Withdrawals(withdrawals.clone())) } };
+        let whole = built_block_from_parts(alloy_rlp::encode(&block).into(), Some(Vec::new()), None, B256::repeat_byte(7)).expect("builds");
+        let hashes: Vec<B256> = txs.iter().map(|tx| *tx.tx_hash()).collect();
+        let answer = n42_h2_execution::raw_engine::CompactAnswer {
+            header: header.clone(),
+            tx_count: 3,
+            withdrawals: withdrawals.clone(),
+            requests: Some(Vec::new()),
+            block_access_list: None,
+            tx_hashes: hashes.clone(),
+            frame_layout: Vec::new(),
+        };
+        let encoded = n42_h2_execution::raw_engine::encode_compact_answer(&answer);
+        let decoded = n42_h2_execution::raw_engine::decode_compact_answer(&encoded).expect("decodes");
+        let elided = built_block_from_compact(decoded, B256::repeat_byte(7)).expect("builds");
+        assert!(elided.elided && !whole.elided);
+        assert_eq!((elided.hash, elided.number, elided.timestamp, elided.tx_count), (whole.hash, whole.number, whole.timestamp, whole.tx_count));
+        assert_eq!(elided.header, whole.header);
+        assert_eq!(elided.tx_hashes, hashes);
+        assert!(elided.execution_data.payload.as_v1().transactions.is_empty(), "no transaction bytes");
+        // The seal touches the header alone, so it seals both to one hash.
+        let (sealed_whole, header_whole) = n42_h2_consensus::normalize_to_gov5_h2_from_header(header.clone(), &whole.execution_data, 9, None).expect("seals");
+        let (sealed_elided, header_elided) = n42_h2_consensus::normalize_to_gov5_h2_from_header(header, &elided.execution_data, 9, None).expect("seals");
+        assert_eq!(header_whole, header_elided);
+        assert_eq!(sealed_whole.block_hash(), sealed_elided.block_hash());
+        // Made whole from the body fetched on demand, it is the whole payload.
+        let body = ChainBlock {
+            header: header_elided,
+            transactions: whole.execution_data.payload.as_v1().transactions.clone(),
+            withdrawals: Some(withdrawals),
+        };
+        let filled = n42_h2_execution::fill_elided(&sealed_elided, &body, elided.tx_count).expect("fills");
+        assert_eq!(format!("{filled:?}"), format!("{sealed_whole:?}"));
+        // A body of another length is not this block.
+        let short = ChainBlock { transactions: body.transactions[..2].to_vec(), ..body };
+        assert!(n42_h2_execution::fill_elided(&sealed_elided, &short, elided.tx_count).is_err());
+    }
 }

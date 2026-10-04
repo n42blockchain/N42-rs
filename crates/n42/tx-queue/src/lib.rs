@@ -405,6 +405,46 @@ struct GaveBack {
     filtered: usize,
 }
 
+/// The lanes' lock as [`TxQueue::lock_inner`] hands it out: the guard, when
+/// it was taken, how long the caller waited for it, and who the caller is.
+struct TimedInner<'a, T: PoolTransaction> {
+    guard: parking_lot::MutexGuard<'a, Inner<T>>,
+    at: std::time::Instant,
+    waited: std::time::Duration,
+    caller: &'static std::panic::Location<'static>,
+}
+
+/// A hold or a wait of the queue's lock this long is said.
+const SLOW_LOCK: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl<T: PoolTransaction> std::ops::Deref for TimedInner<'_, T> {
+    type Target = Inner<T>;
+    fn deref(&self) -> &Inner<T> {
+        &self.guard
+    }
+}
+
+impl<T: PoolTransaction> std::ops::DerefMut for TimedInner<'_, T> {
+    fn deref_mut(&mut self) -> &mut Inner<T> {
+        &mut self.guard
+    }
+}
+
+impl<T: PoolTransaction> Drop for TimedInner<'_, T> {
+    fn drop(&mut self) {
+        let held = self.at.elapsed();
+        if held >= SLOW_LOCK || self.waited >= SLOW_LOCK {
+            tracing::warn!(
+                target: "n42.tx_queue",
+                held_ms = held.as_millis() as u64,
+                waited_ms = self.waited.as_millis() as u64,
+                caller = %self.caller,
+                "the queue's lock was held or waited for a second or more"
+            );
+        }
+    }
+}
+
 struct Inner<T: PoolTransaction> {
     // Keyed by address with alloy's fixed-bytes hasher: the builder looks a
     // lane up per transaction, and std's SipHash was 3% of its thread.
@@ -934,10 +974,20 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// The lanes' lock, with a frame build's noted takes applied first
     /// ([`Inner::settle`]): every lock of the queue goes through here, so
     /// no caller ever sees the lanes before them.
-    fn lock_inner(&self) -> parking_lot::MutexGuard<'_, Inner<T>> {
+    ///
+    /// Timed ([`TimedInner`]): a hold or a wait of a second or more is said
+    /// once, naming the caller, so a multi-second stall of everything that
+    /// touches the queue (loop320 FAS, loop322 CTRL: the new leader's queue
+    /// prune 5 s, the own block's hand-off and every finish behind it) names
+    /// its holder.
+    #[track_caller]
+    fn lock_inner(&self) -> TimedInner<'_, T> {
+        let caller = std::panic::Location::caller();
+        let asked = std::time::Instant::now();
         let mut inner = self.inner.lock();
+        let at = std::time::Instant::now();
         inner.settle();
-        inner
+        TimedInner { guard: inner, at, waited: at.saturating_duration_since(asked), caller }
     }
 
     /// Moves what was pushed since the last drain into the lanes. Called

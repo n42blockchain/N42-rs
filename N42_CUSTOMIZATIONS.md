@@ -53,6 +53,11 @@
   其下是持久化锚点的状态（`n42_layered_state_provider`），不再走上游按 tip 摊平整个内存链的
   `ExecutionOverlay`；`N42_OVERLAY_READS=upstream` 恢复上游路径（loop308 的跟随者减速，见
   `docs/RETH_2_7_0_UPGRADE.md`）
+- `crates/storage/provider/src/providers/op_metrics.rs`（N42 新增文件）：`N42_STORAGE_OP_METRICS=0`
+  时跳过每次操作的存储指标——静态文件写入器每追加一行交易/收据/发送者的计数与耗时直方图
+  （`StaticFileProviderMetrics::record_segment_operation`）以及 RocksDB 每次点读写的指标
+  （`RocksDBProvider::execute_with_operation_metric`）；未设置或其他值保持上游行为（loop314 剖析：
+  `storage-*` 线程 8% 花在这些指标上）
 - `crates/storage/storage-overlay/src/{manager,builder,provider}.rs`：`OverlayManager::without_state_trie_overlay()`
   （N42 新增构造函数）——不带 `state-ovly` 工作线程池，插入块时不预计算，执行叠加层改为分层
   （`ExecutionOverlay::layered`：按块从新到旧逐读查各块的 `BundleState`，不摊平、不缓存）；

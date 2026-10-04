@@ -20,6 +20,9 @@ use revm::{database::BundleState, state::AccountInfo};
 
 type TestFactory = ProviderFactory<crate::test_utils::MockNodeTypesWithDB>;
 
+/// Account changesets per block: `(block, [(address, account before the block)])`.
+type ChangesetRows = Vec<(u64, Vec<(Address, Option<Account>)>)>;
+
 /// Addresses the test chain touches.
 const ACCOUNTS: u64 = 6;
 
@@ -31,9 +34,9 @@ fn address(k: u64) -> Address {
 /// blocks, and account 5 only from block 7 on (created inside a later batch).
 fn changes(k: u64, b: u64) -> bool {
     if k == ACCOUNTS - 1 {
-        return b >= 7 && b % 2 == 1
+        return b >= 7 && !b.is_multiple_of(2)
     }
-    b % (k + 1) == 0
+    b.is_multiple_of(k + 1)
 }
 
 fn info(k: u64, b: u64) -> AccountInfo {
@@ -150,7 +153,7 @@ fn account_history_rows(factory: &TestFactory) -> Vec<(Address, u64, Vec<u64>)> 
 }
 
 /// The account changesets of blocks `1..=n` from static files.
-fn account_changesets(factory: &TestFactory, n: u64) -> Vec<(u64, Vec<(Address, Option<Account>)>)> {
+fn account_changesets(factory: &TestFactory, n: u64) -> ChangesetRows {
     let sf = factory.static_file_provider();
     (1..=n)
         .map(|b| {
@@ -184,7 +187,7 @@ fn latest_account(factory: &TestFactory, k: u64) -> Option<Account> {
 struct Run {
     factory: TestFactory,
     history: Vec<(Address, u64, Vec<u64>)>,
-    changesets: Vec<(u64, Vec<(Address, Option<Account>)>)>,
+    changesets: ChangesetRows,
     checkpoints: Vec<(String, StageCheckpoint)>,
 }
 

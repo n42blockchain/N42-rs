@@ -948,7 +948,7 @@ Quorum-bound blocks have a longer wait (88 ms mean) than tick-bound ones (53 ms)
 so there was nothing to take: the wait that sets 52-68% of the cycles is node 2's vote, which the seal does not touch. When the seal moved
 earlier, the tick (38.5% to 45.6%) took the blocks the quorum did not claim; the quorum's own share fell from 60.7% to 52.3% between
 F and FS, but Fb to FSb shows 67.8% to 59.3% and F to Fb alone moves it 7 points, so the difference is inside the leg-to-leg spread. The
-cycle gain, 1.4 to 1.4 ms (F to FS 117.1 to 115.7; Fb to FSb 117.6 to 116.2), is that spread.
+cycle gain, 1.4 ms both times (F to FS 117.1 to 115.7; Fb to FSb 117.6 to 116.2), is of the size of that spread.
 
 **4. What 109 ms needs.** Floor: tick 100 ms + `send` 1.2-1.3 ms + timer lateness 0.25-0.30 ms mean (`tick_late_us` median 0.00, p90 1.0-1.2 ms)
 = about 101.5-101.6 ms. Timer granularity is not a share of the excess; it is 2% of the 16-17 ms. A 109 ms mean leaves 7.5 ms of excess against

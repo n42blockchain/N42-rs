@@ -404,7 +404,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("UNSAFE        : voting before import (N42_VOTE_BEFORE_IMPORT=1) -- a measurement, not a node");
         }
 
-        let el = EngineApiClient::new(HttpTransport::new(el_url.clone(), jwt.clone(), Duration::from_secs(8))?);
+        let el = EngineApiClient::new(HttpTransport::new(el_url.clone(), jwt, Duration::from_secs(8))?);
         // The driver starts where the execution layer actually is. The
         // checkpoint's last committed block may be one this node committed on
         // the fleet's certificates while behind, without ever importing it; a
@@ -504,7 +504,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // connection of its own, and proposals are held back while it is
             // deep. Nothing is polled when it is off.
             if let Some(config) = n42_h2_node::build_throttle::ThrottleConfig::from_env() {
-                let poll = HttpTransport::new(el_url.clone(), jwt.clone(), Duration::from_secs(1))?;
+                let poll = HttpTransport::new(el_url.clone(), jwt, Duration::from_secs(1))?;
                 let gauge = n42_h2_el_rpc::in_memory::spawn_poller(poll, Duration::from_millis(50));
                 let count: n42_h2_node::build_throttle::InMemoryCount = std::sync::Arc::new(move || gauge.get());
                 service = service.with_build_throttle(n42_h2_node::build_throttle::BuildThrottle::new(config, count));

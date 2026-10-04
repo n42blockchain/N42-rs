@@ -437,6 +437,39 @@ mod tests {
     }
 
     #[test]
+    fn switched_off_the_rename_still_waits_for_the_parents_complete() {
+        let parent_built = B256::repeat_byte(0xc1);
+        let parent_sealed = B256::repeat_byte(0xc2);
+        let (state, genesis) = forest("off-waits");
+        file_parent(&state, genesis, parent_built);
+        // The record is there, but off means the old order: wait, then rename.
+        let waited = std::cell::Cell::new(false);
+        let filed = file_parent_under_seal(&state, parent_sealed, Some(parent_built), Mode::Off.early(), || {
+            assert!(state.root_of(&parent_built).is_some(), "nothing renamed before the wait");
+            waited.set(true);
+        })
+        .expect("filed");
+        assert!(waited.get() && filed.waited && filed.renamed && !filed.early);
+        assert!(state.root_of(&parent_built).is_none() && state.root_of(&parent_sealed).is_some());
+    }
+
+    #[test]
+    fn switched_on_a_parent_not_yet_filed_falls_back_to_the_wait() {
+        let parent_built = B256::repeat_byte(0xb1);
+        let parent_sealed = B256::repeat_byte(0xb2);
+        let (state, genesis) = forest("on-unfiled");
+        // The parent's finish files its tree during the wait.
+        let filed = file_parent_under_seal(&state, parent_sealed, Some(parent_built), true, || {
+            file_parent(&state, genesis, parent_built);
+        })
+        .expect("filed");
+        assert!(filed.waited && filed.renamed && !filed.early);
+        assert!(state.root_of(&parent_sealed).is_some());
+        // The own import's later rename of the same record is a no-op, not an error.
+        crate::chain_alias::rename(&state, parent_built, parent_sealed).expect("idempotent");
+    }
+
+    #[test]
     fn the_stamps_are_relative_and_never_negative() {
         let a = std::time::Instant::now();
         let b = a + std::time::Duration::from_micros(250);

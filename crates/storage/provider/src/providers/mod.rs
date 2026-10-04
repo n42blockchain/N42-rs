@@ -11,6 +11,8 @@ mod static_file;
 
 // N42: the `N42_STORAGE_OP_METRICS` switch.
 pub(crate) mod op_metrics;
+// N42: persistence-cycle timers and switches (`docs/PERSISTENCE_COST_STUDY.md`).
+pub(crate) mod n42_persist;
 pub use static_file::{
     StaticFileAccess, StaticFileJarProvider, StaticFileProvider, StaticFileProviderBuilder,
     StaticFileProviderRW, StaticFileProviderRWRefMut, StaticFileWriteCtx, StaticFileWriter,

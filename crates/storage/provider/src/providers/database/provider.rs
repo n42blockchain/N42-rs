@@ -621,6 +621,8 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         // N42: each block's plain-state reverts, converted once for the static-file changesets and
         // the RocksDB history indices, which converted the same reverts four times a block
         // (~147,000 accounts each at the fleet's tier).
+        let n42_timers = crate::providers::n42_persist::metrics();
+        let reverts_start = Instant::now();
         let plain_reverts: Vec<revm::database::states::PlainStateReverts> = if first_number.is_some() {
             use rayon::prelude::*;
             blocks
@@ -630,6 +632,9 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         } else {
             Vec::new()
         };
+        n42_timers.save_blocks_plain_reverts.record(reverts_start.elapsed());
+        n42_timers.save_blocks_pre_scope.record(total_start.elapsed());
+        let scope_start = Instant::now();
 
         let mut sf_result = None;
         let mut rocksdb_result = None;
@@ -798,14 +803,18 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
 
             Ok::<_, ProviderError>(())
         })?;
+        n42_timers.save_blocks_scope.record(scope_start.elapsed());
+        let post_scope_start = Instant::now();
 
         // N42: the state/trie blocks' hashed state is written (committed with this transaction); a
         // registered QMDB reader moves with it.
         if save_mode.with_state() && !state_trie_blocks.is_empty() {
             if let Some(reader) = reth_storage_api::n42_state::registered() {
+                let qmdb_start = Instant::now();
                 let persisted: Vec<_> =
                     state_trie_blocks.iter().map(|block| block.recovered_block().num_hash()).collect();
                 reader.on_state_persisted(&persisted);
+                n42_timers.save_blocks_qmdb_persisted.record(qmdb_start.elapsed());
             }
         }
 
@@ -823,6 +832,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         }
 
         timings.total = total_start.elapsed();
+        n42_timers.save_blocks_post_scope.record(post_scope_start.elapsed());
 
         self.metrics.record_save_blocks(&timings);
         if let Some(first_number) = first_number {

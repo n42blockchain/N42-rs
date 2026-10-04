@@ -1608,6 +1608,9 @@ impl RocksDBProvider {
         plain_reverts: &[revm::database::states::PlainStateReverts],
         ctx: &RocksDBWriteCtx,
     ) -> ProviderResult<()> {
+        // N42: the three phases timed (map build, shard reads, batch build).
+        let timers = crate::providers::n42_persist::metrics();
+        let phase = Instant::now();
         let mut account_history: BTreeMap<Address, Vec<u64>> = BTreeMap::new();
 
         for (block_idx, reverts) in plain_reverts.iter().enumerate() {
@@ -1622,14 +1625,19 @@ impl RocksDBProvider {
             }
         }
 
+        timers.save_blocks_account_history_map.record(phase.elapsed());
+
         // N42: each address's last shard read and extended on the worker pool,
         // as storage history does; one address at a time this was ~147,000
         // serial point reads per persisted block at the fleet's tier.
+        let phase = Instant::now();
         let shard_puts = account_history
             .into_par_iter()
             .map(|(address, indices)| self.account_history_shards_to_put(address, indices))
             .collect::<ProviderResult<Vec<_>>>()?;
+        timers.save_blocks_account_history_reads.record(phase.elapsed());
 
+        let phase = Instant::now();
         let mut batch = self.batch();
         for shards in shard_puts {
             for (key, shard) in shards {
@@ -1637,6 +1645,7 @@ impl RocksDBProvider {
             }
         }
         ctx.pending_batches.lock().push(batch.into_inner());
+        timers.save_blocks_account_history_batch.record(phase.elapsed());
         Ok(())
     }
 

@@ -1226,6 +1226,70 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         Ok(())
     }
 
+    /// N42: appends `lens.len()` transactions whose rows are already encoded, numbered from
+    /// `first_tx_num`.
+    ///
+    /// `rows` holds each transaction's `Compact` encoding back to back and `lens` their lengths,
+    /// so the file gets the same bytes, offsets and header as that many
+    /// [`Self::append_transaction`] calls; only the encoding has been done elsewhere (in
+    /// parallel, by `write_transactions` under `N42_SF_PARALLEL_ENCODE=1`). Like
+    /// `append_transaction` it does not call `increment_block()`.
+    pub fn append_transactions_encoded(
+        &mut self,
+        first_tx_num: TxNumber,
+        rows: &[u8],
+        lens: &[u32],
+    ) -> ProviderResult<()> {
+        let start = Instant::now();
+        self.ensure_no_queued_prune()?;
+
+        let segment = self.writer.user_header().segment();
+        debug_assert!(segment == StaticFileSegment::Transactions);
+        if lens.is_empty() {
+            return Ok(());
+        }
+        let total: usize = lens.iter().map(|len| *len as usize).sum();
+        if total != rows.len() {
+            return Err(ProviderError::other(StaticFileWriterError::new(
+                "encoded transaction rows do not match their lengths",
+            )));
+        }
+        let tx_start = match self.writer.user_header().tx_range() {
+            Some(range) => {
+                let next_tx = range.end() + 1;
+                if next_tx != first_tx_num {
+                    return Err(ProviderError::UnexpectedStaticFileTxNumber(
+                        segment,
+                        first_tx_num,
+                        next_tx,
+                    ));
+                }
+                range.start()
+            }
+            None => first_tx_num,
+        };
+
+        let mut offset = 0;
+        for len in lens {
+            let end = offset + *len as usize;
+            self.writer.append_column(Some(Ok(&rows[offset..end]))).map_err(ProviderError::other)?;
+            offset = end;
+        }
+        let tx_end = first_tx_num + lens.len() as u64 - 1;
+        self.writer.user_header_mut().set_tx_range(tx_start, tx_end);
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_segment_operations(
+                segment,
+                StaticFileProviderOperation::Append,
+                lens.len() as u64,
+                Some(start.elapsed()),
+            );
+        }
+
+        Ok(())
+    }
+
     /// Appends receipt to static file.
     ///
     /// It **DOES NOT** call `increment_block()`, it should be handled elsewhere. There might be

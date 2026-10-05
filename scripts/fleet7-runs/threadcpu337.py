@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2017-2025 N42 Contributors
 # SPDX-License-Identifier: MIT OR Apache-2.0
-"""loop337 (docs 10.84): CPU of every `tokio-rt*` thread of the execution layer, per thread id, every 5 s. The group view of threadcpu4.py adds the 8 main
+"""loop337 (docs 10.84): CPU of every `tokio-rt*` (and, from loop338, `n42-ingest*` / `n42-queue*`) thread of the execution layer, per thread id, every 5 s. The group view of threadcpu4.py adds the 8 main
 runtime workers and the blocking pool into one number; this one tells whether any single worker is saturated.
 usage: threadcpu337.py sample <seconds> [node index, default 0] > out.tsv     (rows: t, tid, comm, cumulative cpu seconds)
        threadcpu337.py report out.tsv                                         (threads alive for the whole flood: cores busy, median per 5 s)"""
@@ -22,7 +22,7 @@ if sys.argv[1] == 'sample':
             try: s = open(t).read()
             except OSError: continue
             comm = s[s.index('(') + 1:s.rindex(')')]
-            if comm.startswith('tokio-rt'):
+            if comm.startswith(('tokio-rt', 'n42-ingest', 'n42-queue')):
                 f = s[s.rindex(')') + 2:].split()
                 print(f'{now:.1f}\t{os.path.basename(os.path.dirname(t))}\t{comm}\t{(int(f[11]) + int(f[12])) / HZ:.2f}', flush=True)
         time.sleep(5)

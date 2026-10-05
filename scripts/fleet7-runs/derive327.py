@@ -66,7 +66,19 @@ def derive(suffix, tag_prefix, legs_spec, warm_name):
     assert run.count(pat) == 1
     run = run.replace(pat, pat + "HANDOFF_ON_LANDED|SHARDS_MERGE_OFF_PATH|")
     run = run.replace('#!/usr/bin/env bash\n', f'#!/usr/bin/env bash\n# loop327{suffix} = the follower hand-off and shards merge (docs 10.75; 11.12): base N = loop326 N (settlement tags legacy). Legs {warm_name}, ' + ', '.join(legs_spec) + '. memsample.py, threadcpu and the env headers on every leg; tests include n42 --lib.\n', 1)
+    # free-space gate (a leg needs 250G free on /data; its figure is printed in the leg header)
+    old = '  local tag=$1; shift\n  run loop327' + suffix + '$tag'
+    assert run.count(old) == 1
+    run = run.replace(old, '  local tag=$1; shift\n'
+        '  local avail; avail=$(df -BG /data | awk \'NR==2{gsub("G","",$4); print $4}\')\n'
+        '  if [ "${avail:-0}" -lt 250 ]; then echo "leg loop327' + suffix + '$tag skipped: /data has ${avail}G free, a leg needs 250G"; return; fi\n'
+        '  echo "leg loop327' + suffix + '$tag: /data free ${avail}G (needs 250G)"\n'
+        '  run loop327' + suffix + '$tag')
     open(D + f'run-loop327{suffix}.sh', 'w').write(run)
-    open(D + f'launch-loop327{suffix}.sh', 'w').write(open(D + 'launch-loop326.sh').read().replace('loop326', 'loop327' + suffix))
+    launch = open(D + 'launch-loop326.sh').read().replace('loop326', 'loop327' + suffix)
+    old = 'echo "box free at'
+    assert launch.count(old) == 1
+    launch = launch.replace(old, 'avail=$(df -BG /data | awk \'NR==2{gsub("G","",$4); print $4}\'); [ "${avail:-0}" -ge 250 ] || { echo "/data has only ${avail}G free (a leg needs 250G); nothing built"; echo ALLDONE; exit 1; }\necho "/data free ${avail}G at launch"\n' + old)
+    open(D + f'launch-loop327{suffix}.sh', 'w').write(launch)
 derive('', 'loop327', ['N', 'H', 'HMV', 'HM', 'Nb', 'HMb'], 'WARM')
 derive('b', 'loop327b', ['Hb', 'HMS', 'HMP90', 'HMFS'], 'WARM2')

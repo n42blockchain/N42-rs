@@ -151,6 +151,31 @@ pub struct Counts {
     pub takeovers: u64,
     /// Since start: requests answered from the registry.
     pub served_total: u64,
+    /// Since start: blocks this execution layer built, imported from the build.
+    pub own_from_build: u64,
+    /// Since start: blocks this execution layer built that were executed again
+    /// by a follower-style import. Must stay 0.
+    pub own_executed_again: u64,
+}
+
+/// Blocks this layer built and imported from the build (cumulative).
+static OWN_FROM_BUILD: AtomicU64 = AtomicU64::new(0);
+/// Blocks this layer built and executed again (cumulative).
+static OWN_EXECUTED_AGAIN: AtomicU64 = AtomicU64::new(0);
+
+/// A block this layer built was imported from its build.
+pub fn note_own_from_build() {
+    OWN_FROM_BUILD.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A block this layer built was executed again.
+pub fn note_own_executed_again() {
+    OWN_EXECUTED_AGAIN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The two own-build counters, (from the build, executed again).
+pub fn own_counts() -> (u64, u64) {
+    (OWN_FROM_BUILD.load(Ordering::Relaxed), OWN_EXECUTED_AGAIN.load(Ordering::Relaxed))
 }
 
 /// The registry of one execution layer.
@@ -252,6 +277,8 @@ impl Registry {
             blocks: self.blocks.load(Ordering::Relaxed),
             takeovers: self.takeovers.load(Ordering::Relaxed),
             served_total: self.served.load(Ordering::Relaxed),
+            own_from_build: OWN_FROM_BUILD.load(Ordering::Relaxed),
+            own_executed_again: OWN_EXECUTED_AGAIN.load(Ordering::Relaxed),
         }
     }
 }

@@ -1474,6 +1474,9 @@ where
         Some(reuse) => reuse_own_build::<T>(reuse, &data, once.is_some()).await.is_some(),
         None => false,
     };
+    if reused && once.is_some() {
+        crate::import_once::note_own_from_build();
+    }
     road.reuse_us = reuse_at.elapsed().as_micros() as u64;
     // Everything copied between that check and the hand-off below is
     // `prepare_ms` in the vote road's line.
@@ -1697,6 +1700,13 @@ where
                 // apart, because together they were most of the ~78 ms
                 // of a 438 ms import that no phase accounted for.
                 let mined_ms = handed_at.elapsed().as_millis() as u64;
+                // Under `N42_IMPORT_ONCE`: a block this layer built that was
+                // executed again here -- the defect the own-build road exists to
+                // prevent, counted so a leg proves it never happens.
+                if once.is_some() && is_own_build(executed.recovered_block.header()) {
+                    crate::import_once::note_own_executed_again();
+                    warn!(target: "n42.payload_serve", number, "a block this execution layer built was executed again");
+                }
                 let insert_at = std::time::Instant::now();
                 let (done, handed) = tokio::sync::oneshot::channel();
                 let sent = inserts
@@ -1817,6 +1827,8 @@ where
                 once_imports = oc.imports,
                 once_blocks = oc.blocks,
                 once_takeovers = oc.takeovers,
+                own_from_build = oc.own_from_build,
+                own_executed_again = oc.own_executed_again,
                 "direct import: answered before the engine's own pass"
             );
         }
@@ -2021,6 +2033,8 @@ where
                     once_imports = oc.imports,
                     once_blocks = oc.blocks,
                     once_takeovers = oc.takeovers,
+                    own_from_build = oc.own_from_build,
+                    own_executed_again = oc.own_executed_again,
                     "direct import: executed here, handed to the engine as executed"
                 );
             }
@@ -2039,6 +2053,8 @@ where
                     once_imports = oc.imports,
                     once_blocks = oc.blocks,
                     once_takeovers = oc.takeovers,
+                    own_from_build = oc.own_from_build,
+                    own_executed_again = oc.own_executed_again,
                     "raw newPayload"
                 );
             }
@@ -2174,43 +2190,84 @@ async fn refuse_held(stream: &mut TcpStream, out: &mut Vec<u8>) -> std::io::Resu
     stream.write_all(out).await
 }
 
-/// The leader's own block, brought by another key's compact body on a shared
-/// execution layer (`N42_IMPORT_ONCE`): when this node built it, it is imported
-/// by its sealed header from the build -- what the leader's own `OWN_BLOCK`
-/// does -- instead of being assembled and executed again. `None` when the body
-/// is not one of this node's builds (or that import refused it): the road goes
-/// on as before.
-async fn compact_body_own_build<T>(
-    reuse: Option<&OwnBlockReuse>,
-    engine: &ConsensusEngineHandle<T>,
-    frame: &[u8],
-    once: &crate::import_once::Owner,
-) -> Option<alloy_rpc_types_engine::PayloadStatus>
-where
-    T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
-{
-    reuse?;
-    let (announced, profile, body) = raw_engine::decode_foreign_body(frame).ok()?;
-    let (_, header) = n42_h2_consensus::decode_compact_body_header(body, profile).ok()?;
-    if header.hash_slow() != announced {
-        return None;
-    }
-    let (_, built, _) = n42_engine_types::built_executions::find_kept_sealed(
+/// Whether `header` -- a sealed header a follower key's request carries -- is
+/// a block this execution layer built: a kept build on the same parent with the
+/// same number, roots, gas and transactions root, whose seal-invariant fields
+/// match (a sibling with the same transactions, two empty blocks after a view
+/// change, is not this build: loop157 W).
+///
+/// The seal is not a hash-preserving step: gov5's profile rewrites the
+/// withdrawals root as the rewards commitment (and the ommers hash, the
+/// difficulty, the requests placeholder and the extra data), so the
+/// withdrawals root is compared in both shapes. Comparing it raw is what made
+/// every own block on a shared layer miss and be executed a second time
+/// (loop328/330: 1,175 of 1,179 built blocks).
+fn is_own_build(header: &alloy_consensus::Header) -> bool {
+    let Some((_, built, _)) = n42_engine_types::built_executions::find_kept_sealed(
         header.parent_hash,
         header.number,
         header.state_root,
         header.receipts_root,
         header.gas_used,
         Some(header.transactions_root),
+    ) else {
+        return false;
+    };
+    let withdrawals_match = built.header().withdrawals_root == header.withdrawals_root
+        || built.header().withdrawals_root.is_some() && {
+            let withdrawals = built.body().withdrawals.as_ref().map_or(&[][..], |w| w.as_slice());
+            header.withdrawals_root
+                == Some(n42_h2_consensus::gov5_rewards_root(n42_h2_consensus::withdrawals_to_rewards(withdrawals)))
+        };
+    withdrawals_match && build_executes_as_sealed(built.header(), None, header, None)
+}
+
+/// The sealed header a follower's payload describes when it is one of this
+/// layer's builds: found by the fields the payload carries, rebuilt in every
+/// shape the seal may have given it, and proved by the payload's hash.
+fn own_sealed_header_of_payload(data: &alloy_rpc_types_engine::ExecutionData) -> Option<alloy_consensus::Header> {
+    let v1 = data.payload.as_v1();
+    let (_, built, _) = n42_engine_types::built_executions::find_kept_sealed(
+        v1.parent_hash,
+        v1.block_number,
+        v1.state_root,
+        v1.receipts_root,
+        v1.gas_used,
+        None,
     )?;
-    // A sibling on the same parent with the same transactions -- two empty
-    // blocks after a view change -- is not this build (loop157 W).
-    if built.header().withdrawals_root != header.withdrawals_root || !build_executes_as_sealed(built.header(), None, &header, None) {
-        return None;
+    let sealed = sealed_header_from_fields(data, built.header())?;
+    (sealed.hash() == data.payload.block_hash() && is_own_build(sealed.header())).then(|| sealed.header().clone())
+}
+
+/// A block this execution layer built, brought by a follower key's request
+/// (`N42_IMPORT_ONCE`, a shared layer): imported from the build by its sealed
+/// header -- the leader's own `OWN_BLOCK` work, CHECKED as soon as the build
+/// is found, the status once the build is handed to the engine (waiting for a
+/// build still finishing behind its seal) -- and never executed again. `None`
+/// when the block is not one of this layer's builds, or the build was
+/// abandoned: the road imports it the ordinary way.
+async fn serve_from_own_build<T>(
+    stream: &mut TcpStream,
+    out: &mut Vec<u8>,
+    reuse: Option<&OwnBlockReuse>,
+    engine: &ConsensusEngineHandle<T>,
+    header: &alloy_consensus::Header,
+    once: &crate::import_once::Owner,
+    road: &'static str,
+) -> std::io::Result<bool>
+where
+    T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
+{
+    if reuse.is_none() || !is_own_build(header) {
+        return Ok(false);
     }
-    let rlp = alloy_rlp::encode(&header);
+    // The build's fields are this layer's own result: this key votes now, as
+    // the other keys waiting on the block do once `own_block_by_header` says so.
+    stream.write_all(&checked_frame(header.hash_slow())).await?;
+    let rlp = alloy_rlp::encode(header);
     match own_block_by_header::<T>(reuse, engine, &rlp, Some(once)).await {
         Ok((status, number, handoff_ms, payload_ms)) => {
+            crate::import_once::note_own_from_build();
             let oc = once.counts();
             info!(
                 target: "n42.payload_serve",
@@ -2218,22 +2275,42 @@ where
                 handoff_ms,
                 payload_ms,
                 status = ?status.status,
-                road = "compact_body",
+                road,
                 once_reqs = oc.requests,
                 once_served = oc.served,
                 once_served_total = oc.served_total,
                 once_imports = oc.imports,
                 once_blocks = oc.blocks,
                 once_takeovers = oc.takeovers,
+                own_from_build = oc.own_from_build,
+                own_executed_again = oc.own_executed_again,
                 "own block imported by header"
             );
-            Some(status)
+            answer_own_build(stream, out, once, &status).await?;
+            Ok(true)
         }
         Err(message) => {
-            debug!(target: "n42.payload_serve", number = header.number, %message, "own block on the compact body road not imported by header; assembling it");
-            None
+            info!(target: "n42.payload_serve", number = header.number, road, %message, "own build not imported from the build (abandoned?); importing the block the ordinary way");
+            Ok(false)
         }
     }
+}
+
+/// Writes a final VALUE frame for `status` and publishes it to the block's
+/// waiting keys.
+async fn answer_own_build(
+    stream: &mut TcpStream,
+    out: &mut Vec<u8>,
+    owner: &crate::import_once::Owner,
+    status: &alloy_rpc_types_engine::PayloadStatus,
+) -> std::io::Result<()> {
+    let encoded = raw_engine::encode_payload_status(status);
+    owner.done(encoded.clone(), settled_status(&status.status));
+    out.clear();
+    out.push(raw_engine::reply::VALUE);
+    out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    out.extend_from_slice(&encoded);
+    stream.write_all(out).await
 }
 
 pub async fn serve<T>(
@@ -2378,6 +2455,9 @@ where
             let reply = own_block_by_header::<T>(reuse.as_ref(), &engine, &buf, owner.as_ref()).await;
             match reply {
                 Ok((status, number, handoff_ms, payload_ms)) => {
+                    if owner.is_some() {
+                        crate::import_once::note_own_from_build();
+                    }
                     let oc = owner.as_ref().map(crate::import_once::Owner::counts).unwrap_or_default();
                     info!(
                         target: "n42.payload_serve",
@@ -2392,6 +2472,8 @@ where
                         once_imports = oc.imports,
                         once_blocks = oc.blocks,
                         once_takeovers = oc.takeovers,
+                        own_from_build = oc.own_from_build,
+                        own_executed_again = oc.own_executed_again,
                         "own block imported by header"
                     );
                     let encoded = raw_engine::encode_payload_status(&status);
@@ -2565,14 +2647,14 @@ where
             // The leader's own block reaching its execution layer on another
             // key's body first: imported from the build, not executed.
             if let Some(owner) = &owner
-                && let Some(status) = compact_body_own_build::<T>(reuse.as_ref(), &engine, &frame, owner).await
+                && let Some(header) = raw_engine::decode_foreign_body(&frame).ok().and_then(|(announced, profile, body)| {
+                    n42_h2_consensus::decode_compact_body_header(body, profile)
+                        .ok()
+                        .filter(|(hash, _)| *hash == announced)
+                        .map(|(_, header)| header)
+                })
+                && serve_from_own_build::<T>(&mut stream, &mut out, reuse.as_ref(), &engine, &header, owner, "compact_body").await?
             {
-                let encoded = raw_engine::encode_payload_status(&status);
-                owner.done(encoded.clone(), settled_status(&status.status));
-                out.push(raw_engine::reply::VALUE);
-                out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-                out.extend_from_slice(&encoded);
-                stream.write_all(&out).await?;
                 continue;
             }
             // Only with the direct import configured, as the body road: the
@@ -2858,6 +2940,18 @@ where
                 Gate::Answered => continue,
                 Gate::Work(owner) => owner,
             };
+            // A block this layer built: from the build, by its header alone.
+            if let Some(owner) = &owner
+                && let Some(header) = raw_engine::decode_foreign_body(&frame).ok().and_then(|(announced, profile, body)| {
+                    n42_h2_consensus::decode_block_body_header(body, profile)
+                        .ok()
+                        .filter(|(hash, _)| *hash == announced)
+                        .map(|(_, header)| header)
+                })
+                && serve_from_own_build::<T>(&mut stream, &mut out, reuse.as_ref(), &engine, &header, owner, "foreign_body").await?
+            {
+                continue;
+            }
             // Only with the direct import configured: the body path exists to
             // put the block straight into it, and without it the engine's own
             // pass would convert a payload again anyway.
@@ -2986,6 +3080,13 @@ where
                     out.extend_from_slice(err.as_bytes());
                 }
                 Ok(data) => {
+                    // A block this layer built: from the build, by its header.
+                    if let Some(owner) = &owner
+                        && let Some(header) = own_sealed_header_of_payload(&data)
+                        && serve_from_own_build::<T>(&mut stream, &mut out, reuse.as_ref(), &engine, &header, owner, "new_payload").await?
+                    {
+                        continue;
+                    }
                     import_for_validator::<T>(
                         &mut stream,
                         &mut out,

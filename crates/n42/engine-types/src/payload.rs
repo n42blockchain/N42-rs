@@ -3135,6 +3135,16 @@ where
                     start_best_other_ms,
                     start_frames_by_ref = select_times.by_ref,
                     start_frames_slow = select_times.slow,
+                    // `N42_PLAN_AHEAD`: 0 the plan was made at this start,
+                    // 1 it was prepared while the parent executed, 2 and
+                    // topped up here; its age at use, its preparation's
+                    // time, the top-up's transactions, and why a prepared
+                    // plan was discarded ("" when none was).
+                    plan_ahead = select_times.ahead,
+                    plan_age_us = select_times.ahead_age_us,
+                    plan_prep_us = select_times.ahead_prep_us,
+                    plan_topup_txs = select_times.ahead_topup_txs,
+                    plan_discard = select_times.ahead_discard,
                     start_check_ms,
                     start_puller_ms,
                     start_prepare_ms,

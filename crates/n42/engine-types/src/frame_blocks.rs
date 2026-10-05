@@ -101,6 +101,11 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
         times.settle_us = took.settle_us;
         times.by_ref = took.by_ref;
         times.slow = took.slow;
+        times.ahead = took.ahead;
+        times.ahead_age_us = took.ahead_age_us;
+        times.ahead_prep_us = took.ahead_prep_us;
+        times.ahead_topup_txs = took.ahead_topup_txs;
+        times.ahead_discard = took.ahead_discard.map_or("", n42_tx_queue::AheadDiscard::name);
         if plan.frames.is_empty() {
             // No frame a build could take whole (the funding block, a thin
             // pool, transactions that came by RPC): the ordinary walk, and
@@ -149,6 +154,17 @@ pub struct SelectTimes {
     pub by_ref: usize,
     /// Frames that needed the per-transaction check.
     pub slow: usize,
+    /// `N42_PLAN_AHEAD`: 0 planned here, 1 prepared ahead, 2 prepared ahead
+    /// and topped up ([`n42_tx_queue::FrameSelectTimes::ahead`]).
+    pub ahead: u8,
+    /// A used prepared plan's age at use, and its preparation's time.
+    pub ahead_age_us: u64,
+    /// Of a used prepared plan, its preparation's time.
+    pub ahead_prep_us: u64,
+    /// Transactions the top-up added.
+    pub ahead_topup_txs: usize,
+    /// Why a prepared plan was discarded, or "".
+    pub ahead_discard: &'static str,
 }
 
 std::thread_local! {
@@ -162,6 +178,11 @@ std::thread_local! {
             pull_us: 0,
             by_ref: 0,
             slow: 0,
+            ahead: 0,
+            ahead_age_us: 0,
+            ahead_prep_us: 0,
+            ahead_topup_txs: 0,
+            ahead_discard: "",
         })
     };
 }

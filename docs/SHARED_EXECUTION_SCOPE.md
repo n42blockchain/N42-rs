@@ -718,3 +718,181 @@ paired with the same configuration without the two switches (the gate mirror and
 Pass: no convoy (`acq_us_per_frame` under 1,000 on every `ingest` line with 12 slots), delivery above 2.88M/s when the
 chain wants it, `prune_ms` under 15 at 200k, `lock_hold_max_us` and `drain_us_max` read. Then the same with
 `N42_TX_INGEST_RECOVER_PARALLEL=64` to separate the runtime from the slot count.
+
+## 12. The seal's start, the answer and the drain, built (2026-10-05, code only, no fleet leg)
+
+Section 9's two left-out pieces (the child's plan and pull, the answer's hashes), the drain section 11.4 left as
+"batch it if the fleet shows several milliseconds" (loop338 showed 25-35 ms), and a read of loop338's window-3 sag.
+Four switches, all default off; with them off every path is today's (tests pin it). Gate: `cargo check
+--workspace`, clippy on the touched crates (no new warnings), tests of `n42-tx-queue`, `n42-tx-ingest`,
+`n42-engine-types`, `n42-h2-el-rpc`, `n42-h2-execution`, `n42-h2-node`, `n42 --lib`.
+
+### 12.1 The child's plan prepared while the parent executes (`N42_PLAN_AHEAD=1`)
+
+What is serial today: N's build start takes the lanes lock, drains, opens the build (the hand-off already forgot
+N-1's take) and plans: the ids in arrival order, a parallel check of the ~420 frames the gas reaches, then the
+decisions in arrival order and ~400 segments, under the lock (`start_walk` ~6 of `start` ~10 ms). N-1's plan is
+known ~60 ms earlier, and the lanes N's plan is made on are exactly the lanes after N-1's take: the hand-off and
+`hold_own_block` do not touch the lanes, and nothing else does on a quiet chain.
+
+What was built (`crates/n42/tx-queue/src/lib.rs`): the thread that applies a frame plan's takes
+(`n42-frame-settle`) then prepares the next plan (`prepare_next_plan`): the same `plan_frames` on the lanes as
+the current take left them, its takes into a list of their own (`Inner::prepared`), never into the current
+build's taken list (that list is what the hand-off forgets). The next frame build accepts it only if
+(`prepared_verdict`, after draining the inbox):
+
+| check | what it rules out | discard reason |
+| --- | --- | --- |
+| no build began since it was made (`builds` counter) | a second build on any parent, a build that planned in between | `other_build` |
+| the hand-off forgot the whole previous take as mined by an own block, and `hold_own_block` named that block, which is the new parent | the previous build refused or abandoned, a handover, another block at the height, the tenure's first build on a peer's block | `not_on_its_parent` |
+| nothing of the previous take is still out | a block shorter than its take (refusals, a cut) | `take_left` |
+| its gas fits the new limit | a lower gas limit | `gas` |
+| per sender it draws on: the lane's mined watermark is below its lowest nonce | a canonical prune that mined one of its frames (also discarded at once inside the prune) | `mined` |
+| per sender: the lane holds nothing below its lowest nonce | a give-back (`untake`, a refusal, a superseded build), a re-sent or late arrival into a hole | `below` |
+| the build takes frames | a walking build (`best_for_build`) gives it back first | `not_frames` |
+
+A discarded plan goes back through the ordinary give-back, minus what the chain mined (freed after the lock),
+and the build plans afresh. Why an accepted plan is a block the fresh path could have built: it was made by the
+fresh algorithm on a queue state Q (the lanes after N-1's take); since then the lanes changed only by arrivals
+(each sender's arrivals above its lanes' content: the `below` check catches any that is not) and nothing was
+taken or given back (checks 1-3, 6); the parent carries every nonce N-1 took (check 2), so each prepared run
+starts at its sender's next nonce; nothing in it is mined (check 5); its transactions were out of the lanes from
+the moment it was made, so no other plan can hold them, and a discarded plan is given back before any fresh plan
+is made, so no transaction is in two plans. Frames that arrived after it are behind it in arrival order: a full
+prepared plan is the plan a fresh one makes now, and only the ordering of frames that were unusable at Q and
+became usable later can differ (the fresh path has the same race between its plan and a late arrival).
+
+Top-up: a prepared plan that ran out of frames (no cut last frame, at least 21,000 gas of room) is extended at
+use by `plan_frames` over the room, on the lanes as it left them (`plan_ahead=2`, `plan_topup_txs`); a plan that
+ends in a cut frame is not extended, because a cut frame in the middle of a body is not a run of frames. At
+saturation (2.5M queued) every plan is full and the top-up never runs.
+
+Cost and side effects: the preparation holds the lanes lock for a plan's length (~6 ms) while the parent executes,
+so drains wait behind it (run it with 12.3); the prepared frames are out of the lanes, so the gate's depth reads a
+block lower and the ingest admits ~200k more (RSS +~1 GB). Fields: `plan_ahead`, `plan_age_us`, `plan_prep_us`,
+`plan_topup_txs`, `plan_discard` on `seal-first build phases`; `plan_discards` (reason:count) on `ingest`.
+Tests (`ahead_tests.rs`): a chain of six own blocks on prepared plans equals the chain on fresh plans block for
+block at four gas limits; late frames top a short plan up into the fresh one; a refused build, a handover, an
+untake, a re-sent arrival below the plan and a lower gas limit each discard it by name and the chain keeps nonce
+order, takes nothing twice and loses nothing; a prune of one of its frames discards it inside the prune; a
+walking build gets it back; a preparation racing an untake and a prune (20 rounds) loses nothing and offers
+nothing mined.
+
+### 12.2 The pull by frame (`N42_PULL_BY_FRAMES=1`)
+
+The pull was the `n42-builder-puller` thread calling `next()` 200,000 times (one cold `Arc` clone each, ~25 ns)
+in batches of 1,024 over a channel. `QueueBest::take_frame_segments` now hands the plan's frames over whole, and
+`frame_blocks::select` clones each frame's slice on the build pool into the build's candidate vector; the build
+starts its parallel step with it, starts no puller, and keeps the iterator on its own thread for refusals and
+give-backs (same candidates, same order). Only when the parallel step with the puller is on and senders are not
+claims to check (those go through `claimed_build`'s batches). Fields `pull_bulk_txs`, `pull_bulk_us` (inside
+`start_best_ms`; `par_pull_ms` then reads ~0).
+
+What stops a block from taking frames truly by reference: the build's candidates are a `Vec<Arc<ValidPoolTransaction>>`
+that the prep pass, the partition and `batch_groups`, the slots, `BodyAhead`, `body_matches_pull`,
+`receipts_from_slots` and the lookahead give-back all index by position and own; a two-level (frame, offset) view
+would mean rewriting those consumers in `parallel_transfer.rs`, and the give-back of an unbuilt candidate needs an
+owned `Arc`. The queue's own taken list already holds the lanes' `Arc`s by move, not by clone. One clone per
+transaction remains, now parallel (~0.3-1 ms for 200k on 32 threads, estimate); not worth the refactor before a
+leg says otherwise.
+
+Expected effect of 12.1 + 12.2 (estimate, no leg): `start` 10 -> ~3-4 ms (lock, drain, verdict ~0.3 ms, the
+hand-off wait 2 ms unchanged), `pull` 5 -> ~1 ms: `sealed_at` 62-65 -> ~53-56 ms median. Confirm: `plan_ahead=1`
+on >= 95% of full builds, `plan_discard` empty, `start_walk_us` < 1,000, `pull_bulk_us` < 1,500, `sealed_at` and the
+cycle at 55 ms pacing. But see 12.4: persistence is already at the cycle.
+
+### 12.3 The answer without the hash list (`N42_ANSWER_LAYOUT_ONLY=1`)
+
+Every consumer of `CompactAnswer.tx_hashes` / `BuiltBlock.tx_hashes` on the proposer side with frame blocks on:
+`elided_compact_body` (h2-node `service.rs`, from `publish_elided_body`) is the only reader, and its frame branch
+reads only the layout; `publish_body` runs on whole (non-elided) answers, which keep their hashes; the elided own
+body, `OWN_BODY` serving, the fill (`NEED_TXNS`), `import_own` / `fill_elided` and the own import by header go by
+the sealed header, the transaction count and the body fetched by it; no tx-gossip, pool removal, log or metric
+reads the hashes. So nothing needs them when the layout covers the block. With the switch (implies
+`N42_TAKE_COMPACT`, effective only with `N42_FRAME_BLOCKS=1`) the proposer adds a last tail tag to its build-on-own
+request; an execution layer that knows it answers a block whose layout is non-empty and sums to the transaction
+count with an empty hash list and never builds the hash vector (6.4 MB at 200,000). An older layer stops at the tag
+and sends the hashes; a block that is not frame-aligned gets them too; the decoder accepts an empty list only beside
+a covering layout; without frame blocks a short hash list is refused rather than published. The published compact
+body is byte for byte the same (`elided_compact_body_with`, tested with an empty list against the full one).
+Fields: `answer_layout_only` on the layer's `built ahead on the sealed own block` and the validator's `proposal
+sent`; the gain reads from `answer_bytes` and the encode/read/decode stamps. Expected (estimate): seal -> proposal
+-5 ms (the 5.5 ms median encode+write of 9.3), off the seal itself; on the cycle only where the proposal road binds.
+
+### 12.4 The drain in bounded holds (`N42_TX_QUEUE_DRAIN_CHUNK=<n>`)
+
+loop338: ~70,000 transactions a drain, 4-5 ms mean, 17-26 ms max, the longest hold of every window `drain_now`
+at 25-35 ms (B, Q); with the ingest runtime 17-19k a drain and 5-7 ms max. With the switch the drainer takes the
+inbox and the frame inbox without the lanes lock (the batch counted in a new `in_hand` the gate reads between
+`staged` and the mirror, so it is never in none of them), hands it to `Inner::pending_drain` under the lock (a
+`Vec` becomes the deque in O(1)), and inserts `n` at a time, releasing the lock between chunks. The insert is the
+one-hold drain's (`insert_valid`, transaction by transaction in inbox order: duplicates, the mined watermark,
+parks and the arrival order decided exactly as before); the batch's frames are indexed in the hold that inserts
+its last transaction, so no plan sees a frame before its transactions. Any other drain (a build's start, a prune,
+the vote road's `take_frames`) finishes the remainder first, so the lanes see the inbox's order whoever moves it;
+those holds are unbounded and counted (`drain_finished`). A lock holder that does not drain (an untake, a
+give-back) sees a prefix of the batch queued, which is what two consecutive drains would show; lanes are keyed by
+nonce, so per-sender order does not depend on it. The depth mirror counts the remainder.
+
+Bench (`drain_tests::bench_drain_chunked`, release, 17,500 a 5 ms tick into a 2,000,000-deep queue, warm caches):
+one hold 0.96-1.1 ms; chunks of 16,384 / 8,192 / 4,096 ~0.56 / 0.37 / 0.21 ms a hold (mean per hold), the whole
+drain unchanged (0.97 ms). At the fleet's ~70 ns a transaction (cold), 8,192 is ~0.6 ms a hold and 16,384 ~1.2 ms:
+both under the 2 ms bound. Lock duty is unchanged (the same transactions are inserted); what changes is the longest
+hold, which is what a selection waits behind. Fields on `ingest`: `drain_chunks`, `drain_chunk_max_txs`,
+`drain_finished`. Tests (`drain_tests.rs`): for chunks 1 to 100,000 the chunked drain leaves the one-hold drain's
+queue (depth, frames in order, offer order); every hold moves at most its chunk; a build during a pending
+remainder plans exactly as after a one-hold drain; the gate never reads fewer than were pushed under racing
+chunked drains (75,000 transactions). Not built: grouping the batch by sender outside the lock (one lane look-up a
+run): the chunk alone gives the bound, and grouping changes only the hash look-ups.
+
+### 12.5 Window 3 and persistence (loop338 B, Bb, IQ, IQb, offline)
+
+Windows of 30 s from the first full block; `seal-first build phases` and `own block handed` from the layer's log,
+in-memory blocks and RSS from the 2 s `mem.log` samples, persistence from the end-of-run metrics (cumulative only,
+so not per window). Ad-hoc parsers, not kept.
+
+The sag is a tail, not a slower cycle. Mean cycle w1 / w2 / w3: B 66.8 / 66.2 / 68.7, Bb 67.7 / 67.0 / 69.2, IQ
+67.8 / 68.0 / 68.9, IQb 66.2 / 66.3 / 69.6 ms; the median is flat (B 65.9 / 64.8 / 65.5) and the p90 rises (B
+82 / 81 / 87, IQb 83 / 83 / 91). Cycles over 100 ms: B 10 / 9 / 23, IQb 4 / 7 / 15; their excess over 66 ms grows
+by 0.7-1.2 s per 30 s in window 3, which is the whole 2-4%. What grows across the leg:
+
+| quantity | w1 | w2 | w3 |
+| --- | --- | --- | --- |
+| in-memory blocks, median / p90 (B) | 14 / 17 | 15 / 18 | 15 / 29 (max 31; IQ max 34, IQb 36) |
+| persisted lag (latest - persisted) at +0 / +30 / +60 / +90 s (B) | 6 | 15 / 13 | 30 |
+| RSS median, G (B; others alike) | 23.9 | 31.2 | 36.8 (end 44.1) |
+| `sealed_at` median / p90 (B) | 63 / 69 | 63 / 69 | 64 / 73 |
+| `roots_ms` median / p90 (B) | 39 / 47 | 41 / 50 | 42 / 54 |
+| own-import hand-off median / p90 (B) | 30 / 57 | 33 / 62 | 43 / 66 (IQb 29 -> 31 / 39 -> 55) |
+
+Not tracking it: `par_exec` (29 / 28 / 28), `state_wait` (0), the root's undo/append faults (B higher in w2 than
+w3, IQ rising: inconsistent). New in window 3 only, on every leg: forest-lock waits behind
+`sync_entries_if_file`; `jemalloc_bg_thd` CPU 2.1 / 2.7 / 5.2 s a window (B). The best single correlate of the
+5 s block rate is `sealed_at` (r -0.6 to -0.9); in-memory blocks and RSS correlate too but are collinear with time,
+so the cause is not separated by these logs.
+
+Persistence (B, 1,883 blocks in 399 batches of 3-15, median 5, ~1,384 of them full): `save_blocks_total` 89.8 s =
+49.6 ms a block over all blocks and up to ~65 ms a full block; the batch median is 0.328 s = ~66 ms a block, the
+batches run back to back, and the persistence thread's own CPU is 2-2.7 s a window: it is busy at ~100% of the
+cycle and falls behind by ~1.5% (lag 6 -> 30 blocks over 90 s). Per full block: the static-file scope ~50 ms, of
+which `sf_transactions` ~50 ms is the critical path (its siblings in the scope `sf_receipts` ~20, `sf_account_changesets`
+~17, `sf_senders` ~10 run beside it), then `qmdb_persisted` ~12 ms serial after the scope, `plain_reverts` ~2.5 ms
+before it; the commits, `write_state`, the trie and hashed state are each under 1 ms. The history index is already
+off in these legs (`N42_ACCOUNT_HISTORY=off`; `update_history_indices` 0.3 ms in all), so the floor with it off is
+today's ~65 ms a 200k block. **Persistence is already the bound at a 66 ms cycle**: a seal 8-10 ms faster (12.1-12.2)
+makes the in-memory chain grow ~15% of the blocks produced until the engine's backpressure (1,024 blocks) or the
+memory stops it. To keep up at a 50 ms cycle `sf_transactions` must drop under ~35 ms (sharded or pre-encoded
+transaction segments, or written off the persistence thread as the body is already encoded for the wire); at 40 ms
+`qmdb_persisted` must also overlap the scope instead of following it (~20 + 2.5 + overlap < 40).
+
+Next round: run 12.1-12.4 with a per-window persistence reading (the `save_blocks_*` sums scraped every 10 s, or a
+log line per batch), and take `sf_transactions` apart before any pacing below 60 ms.
+
+### 12.6 Legs to run
+
+Base: loop338's B (three leader layers, fields at seal, `N42_ROAD_RUNTIME=1`, 24 permits, 200k, 60 ms; it already
+has `N42_FRAME_BLOCKS=1`, `N42_PARALLEL_BUILD=1` and a non-zero `N42_BUILDER_PULLER`, which 12.2 needs). Pairs:
+B against B + `N42_TX_QUEUE_DRAIN_CHUNK=8192 N42_PLAN_AHEAD=1 N42_PULL_BY_FRAMES=1 N42_ANSWER_LAYOUT_ONLY=1`; then
+the same at 55 ms pacing; one leg with `N42_TX_QUEUE_DRAIN_CHUNK=8192` alone to read `lock_hold_max_us`. Read
+`plan_ahead` / `plan_discard`, `start_walk_us`, `pull_bulk_us`, `sealed_at`, `answer_bytes`, `drain_chunk_max_txs`,
+`lock_hold_max_us`, the in-memory blocks and the persistence lag per window.

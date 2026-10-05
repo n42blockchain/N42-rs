@@ -590,14 +590,41 @@ fn encode_own_body(
 fn elided_compact_body(
     execution: &alloy_rpc_types_engine::ExecutionData,
     header: &alloy_consensus::Header,
+    tx_count: usize,
+    tx_hashes: &[B256],
+    frame_layout: &[(B256, u32)],
+    profile: HeaderProfile,
+) -> Result<Vec<u8>, n42_h2_consensus::BlockBodyError> {
+    elided_compact_body_with(
+        n42_tx_types::frame_blocks_requested(),
+        execution,
+        header,
+        tx_count,
+        tx_hashes,
+        frame_layout,
+        profile,
+    )
+}
+
+/// [`elided_compact_body`] with the frame-blocks switch given. Under frame
+/// blocks only the layout is read: the hash list may be empty
+/// (`N42_ANSWER_LAYOUT_ONLY`) and the bytes are the same as with it full.
+/// Without them the hashes are the body, and a list that does not number the
+/// block's transactions is refused rather than published as a block of none.
+fn elided_compact_body_with(
+    frame_blocks: bool,
+    execution: &alloy_rpc_types_engine::ExecutionData,
+    header: &alloy_consensus::Header,
+    tx_count: usize,
     tx_hashes: &[B256],
     frame_layout: &[(B256, u32)],
     profile: HeaderProfile,
 ) -> Result<Vec<u8>, n42_h2_consensus::BlockBodyError> {
     let skeleton = encode_own_body(execution, header);
-    let frames = n42_tx_types::frame_blocks_requested() && !frame_layout.is_empty();
-    if frames {
+    if frame_blocks && !frame_layout.is_empty() {
         n42_h2_consensus::encode_compact_frame_body(&skeleton, frame_layout, profile)
+    } else if tx_hashes.len() != tx_count {
+        Err(n42_h2_consensus::BlockBodyError::InvalidRlp)
     } else {
         n42_h2_consensus::encode_compact_body(&skeleton, tx_hashes, profile)
     }
@@ -2947,6 +2974,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     build_start_trigger,
                     answer_elided = timing.elided,
                     answer_bytes = timing.answer.map_or(0, |a| a.bytes),
+                    answer_layout_only = timing.answer.is_some_and(|a| a.layout_only),
                     answer_read_end_us = timing.answer.map_or(0, |a| a.read_end_us),
                     answer_decode_end_us = timing.answer.map_or(0, |a| a.decode_end_us),
                     throttle_in_mem,
@@ -3793,6 +3821,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         let compact = match elided_compact_body(
             &built.execution_data,
             header,
+            built.tx_count,
             &built.tx_hashes,
             &built.frame_layout,
             self.header_profile,

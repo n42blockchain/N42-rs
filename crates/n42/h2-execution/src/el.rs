@@ -136,6 +136,9 @@ pub struct AnswerStamps {
     pub read_end_us: u64,
     /// The block decoded out of it.
     pub decode_end_us: u64,
+    /// Whether it was a compact answer without the transaction hash list
+    /// (`N42_ANSWER_LAYOUT_ONLY`).
+    pub layout_only: bool,
 }
 
 /// `execution` with the transactions of `block` put back: the payload of a

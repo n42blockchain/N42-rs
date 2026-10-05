@@ -655,6 +655,55 @@ async fn a_compact_answer_is_read_as_an_elided_block_and_stamped() {
     assert!(!raw_engine::decode_build_on_own_request(sent).expect("decodes").compact_answer);
 }
 
+/// `N42_ANSWER_LAYOUT_ONLY`: an answer with the frame layout and no hash
+/// list is an elided block whose stamps say so, and a block with neither
+/// layout nor hashes is an error rather than a block.
+#[tokio::test]
+async fn a_layout_only_answer_is_read_as_an_elided_block_without_hashes() {
+    let (addr, _) = serve(Arc::new(|_, frame_bytes| {
+        let (parent, attrs, _, _) = raw_engine::decode_build_on_own(frame_bytes).expect("decodes");
+        let answer = raw_engine::CompactAnswer {
+            header: cancun_header(parent.number + 1, attrs.parent_beacon_block_root.unwrap()),
+            tx_count: 3,
+            withdrawals: Vec::new(),
+            requests: None,
+            block_access_list: None,
+            tx_hashes: Vec::new(),
+            frame_layout: vec![(B256::repeat_byte(0xf1), 2), (B256::repeat_byte(0xf2), 1)],
+        };
+        Some(frame(reply::COMPACT_BUILT, &raw_engine::encode_compact_answer(&answer)))
+    }))
+    .await;
+    let client = EngineApiClient::new(Json::at(addr));
+    let built = client
+        .build_on_own_block(&cancun_header(5, B256::ZERO), build_attrs())
+        .await
+        .expect("answered")
+        .expect("built");
+    assert!(built.elided && built.tx_hashes.is_empty());
+    assert_eq!(built.tx_count, 3);
+    assert_eq!(built.frame_layout, vec![(B256::repeat_byte(0xf1), 2), (B256::repeat_byte(0xf2), 1)]);
+    assert!(built.answer.expect("stamped").layout_only);
+
+    let (addr, _) = serve(Arc::new(|_, frame_bytes| {
+        let (parent, attrs, _, _) = raw_engine::decode_build_on_own(frame_bytes).expect("decodes");
+        let answer = raw_engine::CompactAnswer {
+            header: cancun_header(parent.number + 1, attrs.parent_beacon_block_root.unwrap()),
+            tx_count: 3,
+            withdrawals: Vec::new(),
+            requests: None,
+            block_access_list: None,
+            tx_hashes: Vec::new(),
+            frame_layout: Vec::new(),
+        };
+        Some(frame(reply::COMPACT_BUILT, &raw_engine::encode_compact_answer(&answer)))
+    }))
+    .await;
+    let client = EngineApiClient::new(Json::at(addr));
+    let built = client.build_on_own_block(&cancun_header(5, B256::ZERO), build_attrs()).await;
+    assert!(!matches!(built, Some(Ok(_))), "hashes missing and no layout: not a block");
+}
+
 #[tokio::test]
 async fn a_whole_answer_is_stamped_and_not_elided() {
     let (addr, _) = serve(Arc::new(|_, frame_bytes| {

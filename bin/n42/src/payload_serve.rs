@@ -1153,8 +1153,18 @@ fn has_blob_transactions(payload: &N42BuiltPayload) -> bool {
 /// frame: the header, the withdrawals, the requests and access list, the
 /// transaction hashes (cached on the transactions: a read, not a keccak) and
 /// the frame layout. Nothing of the transactions is encoded. Returns the
-/// encoded answer's size and how long it took.
-fn push_compact_answer(out: &mut Vec<u8>, payload: &N42BuiltPayload) -> (usize, std::time::Duration) {
+/// encoded answer's size, how long it took, and whether the hash list was
+/// left out.
+///
+/// With `layout_only` (the request's mark, `N42_ANSWER_LAYOUT_ONLY`) and a
+/// non-empty frame layout that sums to the block's transaction count, the
+/// hash list is empty and the hash vector is not computed at all; a block
+/// without such a layout gets its hashes as ever.
+fn push_compact_answer(
+    out: &mut Vec<u8>,
+    payload: &N42BuiltPayload,
+    layout_only: bool,
+) -> (usize, std::time::Duration, bool) {
     use alloy_consensus::transaction::TxHashRef as _;
     let encode_at = std::time::Instant::now();
     let block = payload.block();
@@ -1164,13 +1174,16 @@ fn push_compact_answer(out: &mut Vec<u8>, payload: &N42BuiltPayload) -> (usize, 
         .flatten()
         .filter(|layout| !layout.is_empty())
         .unwrap_or_default();
+    let covered = layout_only
+        && !frame_layout.is_empty()
+        && frame_layout.iter().map(|(_, count)| *count as usize).sum::<usize>() == transactions.len();
     let answer = raw_engine::CompactAnswer {
         header: block.header().clone(),
         tx_count: transactions.len() as u32,
         withdrawals: block.body().withdrawals.clone().map(|w| w.to_vec()).unwrap_or_default(),
         requests: payload.requests().map(|requests| requests.take()),
         block_access_list: payload.block_access_list().cloned(),
-        tx_hashes: transactions.iter().map(|tx| *tx.tx_hash()).collect(),
+        tx_hashes: if covered { Vec::new() } else { transactions.iter().map(|tx| *tx.tx_hash()).collect() },
         frame_layout,
     };
     let encoded = raw_engine::encode_compact_answer(&answer);
@@ -1178,7 +1191,7 @@ fn push_compact_answer(out: &mut Vec<u8>, payload: &N42BuiltPayload) -> (usize, 
     out.push(raw_engine::reply::COMPACT_BUILT);
     out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
     out.extend_from_slice(&encoded);
-    (encoded.len(), encode_at.elapsed())
+    (encoded.len(), encode_at.elapsed(), covered)
 }
 
 /// The body of a block this node built, by its sealed header
@@ -2512,6 +2525,7 @@ where
             // bytes decoded a second time.
             let decoded = raw_engine::decode_build_on_own_request(&buf).ok();
             let compact_answer = decoded.as_ref().is_some_and(|request| request.compact_answer);
+            let layout_only_asked = decoded.as_ref().is_some_and(|request| request.layout_only);
             // The parent's road (`post_seal`): this request's first byte.
             let parent_number = decoded.as_ref().map(|request| request.header.number);
             if let Some(number) = parent_number {
@@ -2548,10 +2562,11 @@ where
                     // logged after the write so it can say when that ended.
                     let elided = compact_answer && want_hashes && !has_blob_transactions(&payload);
                     let answer_encode_start_us = raw_engine::unix_micros();
-                    let (bytes, encoded) = if elided {
-                        push_compact_answer(&mut out, &payload)
+                    let (bytes, encoded, answer_layout_only) = if elided {
+                        push_compact_answer(&mut out, &payload, layout_only_asked)
                     } else {
-                        push_built_payload_hashed(&mut out, &payload, want_hashes)
+                        let (bytes, encoded) = push_built_payload_hashed(&mut out, &payload, want_hashes);
+                        (bytes, encoded, false)
                     };
                     let answer_write_start_us = raw_engine::unix_micros();
                     stream.write_all(&out).await?;
@@ -2564,6 +2579,7 @@ where
                         bytes,
                         elided,
                         answer_bytes = out.len(),
+                        answer_layout_only,
                         answer_encode_start_us,
                         answer_write_start_us,
                         answer_write_end_us,

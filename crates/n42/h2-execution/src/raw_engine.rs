@@ -189,7 +189,7 @@ pub fn unix_micros() -> u64 {
 ///         | u32 n, n * (u64 index, u64 validator index, 20 address, u64 amount)
 ///         | u8 has_requests, [u32 n, n * (u32 len, bytes)]
 ///         | u8 has_bal, [u32 len, bytes]
-///         | u32 n, n * 32 transaction hashes (n = transactions)
+///         | u32 n, n * 32 transaction hashes (n = transactions, or 0 for a layout-only answer)
 ///         | u32 frames, frames * (32 frame id, u32 count) (their sum = transactions, or none)
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,7 +204,9 @@ pub struct CompactAnswer {
     pub requests: Option<Vec<Bytes>>,
     /// The EIP-7928 block access list, when the build has one.
     pub block_access_list: Option<Bytes>,
-    /// Every transaction's hash, in block order.
+    /// Every transaction's hash, in block order. Empty only in a
+    /// layout-only answer (`N42_ANSWER_LAYOUT_ONLY`): `frame_layout` then
+    /// covers the block, and the hashes are fetched with the body if wanted.
     pub tx_hashes: Vec<B256>,
     /// The block's frame layout (`N42_FRAME_BLOCKS=1`), or empty.
     pub frame_layout: Vec<(B256, u32)>,
@@ -243,7 +245,8 @@ pub fn encode_compact_answer(answer: &CompactAnswer) -> Vec<u8> {
 }
 
 /// Decodes what [`encode_compact_answer`] produced. Strict: the hashes must
-/// number the block's transactions, a frame layout must sum to them, and
+/// number the block's transactions (or be absent, with a frame layout that
+/// covers the block), a frame layout must sum to them, and
 /// nothing may follow.
 pub fn decode_compact_answer(buf: &[u8]) -> Result<CompactAnswer, String> {
     use alloy_rlp::Decodable;
@@ -269,7 +272,10 @@ pub fn decode_compact_answer(buf: &[u8]) -> Result<CompactAnswer, String> {
     } else { None };
     let block_access_list = if r.u8()? == 1 { Some(r.bytes()?) } else { None };
     let n = r.u32()? as usize;
-    if n != tx_count as usize {
+    // A layout-only answer has no hashes; whether its layout covers the
+    // block is checked below, once the layout has been read.
+    let layout_only = n == 0 && tx_count > 0;
+    if n != tx_count as usize && !layout_only {
         return Err(format!("{n} transaction hashes for a block of {tx_count}"));
     }
     let raw = r.take(n.checked_mul(32).ok_or("hash count overflows")?)?;
@@ -287,6 +293,9 @@ pub fn decode_compact_answer(buf: &[u8]) -> Result<CompactAnswer, String> {
     }
     if frames > 0 && sum != u64::from(tx_count) {
         return Err(format!("a frame layout of {sum} transactions for a block of {tx_count}"));
+    }
+    if layout_only && frames == 0 {
+        return Err(format!("no transaction hashes and no frame layout for a block of {tx_count}"));
     }
     if !r.rest.is_empty() {
         return Err(format!("compact answer has {} trailing bytes", r.rest.len()));
@@ -607,6 +616,15 @@ const TAIL_WANT_HASHES: u8 = 2;
 /// whole block, which the caller reads as ever.
 const TAIL_COMPACT_ANSWER: u8 = 3;
 
+/// The tag that tells the execution layer the proposer can do without the
+/// transaction hashes of a [`reply::COMPACT_BUILT`] answer when the block's
+/// frame layout covers it (`N42_ANSWER_LAYOUT_ONLY`). No payload of its own,
+/// and written last: an execution layer that predates it stops reading at the
+/// tag and answers with the hashes, which the decoder still accepts. The
+/// answer says for itself which shape it is (no hashes, a layout that sums
+/// to the block), so nothing else follows the request's mark.
+const TAIL_LAYOUT_ONLY: u8 = 4;
+
 /// A decoded build-on-own request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BuildOnOwn {
@@ -621,6 +639,9 @@ pub struct BuildOnOwn {
     /// Whether the answer may leave the transactions out
     /// ([`reply::COMPACT_BUILT`]).
     pub compact_answer: bool,
+    /// Whether a [`reply::COMPACT_BUILT`] answer may leave the hash list out
+    /// when the block's frame layout covers it.
+    pub layout_only: bool,
 }
 
 /// Encodes a build-on-own request: the sealed header of the block just built
@@ -656,6 +677,22 @@ pub fn encode_build_on_own_request(
     chain: Option<ChainHint>,
     want_hashes: bool,
     compact_answer: bool,
+) -> Vec<u8> {
+    encode_build_on_own_request_layout(header, attrs, chain, want_hashes, compact_answer, false)
+}
+
+/// [`encode_build_on_own_request`], also telling the execution layer that a
+/// compact answer may carry the frame layout alone, without the hash list,
+/// when `layout_only` is set (a tag after every other one; meaningful only
+/// together with `compact_answer`). With it unset the frame is byte for byte
+/// the one [`encode_build_on_own_request`] writes.
+pub fn encode_build_on_own_request_layout(
+    header: &alloy_consensus::Header,
+    attrs: &PayloadAttributes,
+    chain: Option<ChainHint>,
+    want_hashes: bool,
+    compact_answer: bool,
+    layout_only: bool,
 ) -> Vec<u8> {
     let rlp = alloy_rlp::encode(header);
     let mut w = Writer(Vec::with_capacity(rlp.len() + 128 + attrs.withdrawals.as_ref().map_or(0, |w| w.len() * 44)));
@@ -696,6 +733,9 @@ pub fn encode_build_on_own_request(
     }
     if compact_answer {
         w.u8(TAIL_COMPACT_ANSWER);
+    }
+    if layout_only {
+        w.u8(TAIL_LAYOUT_ONLY);
     }
     w.0
 }
@@ -738,11 +778,13 @@ pub fn decode_build_on_own_request(buf: &[u8]) -> Result<BuildOnOwn, String> {
     let mut chain = None;
     let mut want_hashes = false;
     let mut compact_answer = false;
+    let mut layout_only = false;
     while !r.rest.is_empty() {
         match r.u8()? {
             TAIL_CHAIN_HINT => chain = Some(ChainHint { view: r.u64()?, chained: r.u8()? == 1 }),
             TAIL_WANT_HASHES => want_hashes = true,
             TAIL_COMPACT_ANSWER => compact_answer = true,
+            TAIL_LAYOUT_ONLY => layout_only = true,
             // A tag from a newer peer. Its length is not known here, so
             // there is nothing to skip to: stop reading and keep what was
             // understood. Fields are only ever appended, so everything
@@ -751,7 +793,7 @@ pub fn decode_build_on_own_request(buf: &[u8]) -> Result<BuildOnOwn, String> {
         }
     }
     let attrs = PayloadAttributes { timestamp, prev_randao, suggested_fee_recipient, withdrawals, parent_beacon_block_root, slot_number, target_gas_limit };
-    Ok(BuildOnOwn { header, attrs, chain, want_hashes, compact_answer })
+    Ok(BuildOnOwn { header, attrs, chain, want_hashes, compact_answer, layout_only })
 }
 
 /// Encodes a [`PayloadStatus`] for the channel.
@@ -955,6 +997,49 @@ mod tests {
         // A frame layout that does not sum to them.
         let layout = CompactAnswer { frame_layout: vec![(B256::ZERO, 2)], ..compact_answer() };
         assert!(decode_compact_answer(&encode_compact_answer(&layout)).is_err());
+    }
+
+    /// `N42_ANSWER_LAYOUT_ONLY`: no hashes when the layout covers the block,
+    /// and nothing else accepted without them.
+    #[test]
+    fn a_layout_only_answer_round_trips_and_is_otherwise_strict() {
+        let answer = CompactAnswer { tx_hashes: Vec::new(), ..compact_answer() };
+        let encoded = encode_compact_answer(&answer);
+        assert_eq!(decode_compact_answer(&encoded).expect("decodes"), answer);
+        assert!(encoded.len() < encode_compact_answer(&compact_answer()).len());
+        // No hashes and no layout: not a block that can be described.
+        let bare = CompactAnswer { tx_hashes: Vec::new(), frame_layout: Vec::new(), ..compact_answer() };
+        assert!(decode_compact_answer(&encode_compact_answer(&bare)).is_err());
+        // A layout that does not cover the block.
+        let short = CompactAnswer { frame_layout: vec![(B256::ZERO, 2)], ..answer.clone() };
+        assert!(decode_compact_answer(&encode_compact_answer(&short)).is_err());
+        let long = CompactAnswer { frame_layout: vec![(B256::ZERO, 2), (B256::ZERO, 2)], ..answer };
+        assert!(decode_compact_answer(&encode_compact_answer(&long)).is_err());
+    }
+
+    #[test]
+    fn the_layout_only_mark_is_a_last_tag_and_off_is_the_old_frame() {
+        let header = alloy_consensus::Header { number: 41, ..Default::default() };
+        let attrs = PayloadAttributes {
+            timestamp: 1_700_000_000,
+            prev_randao: B256::repeat_byte(5),
+            suggested_fee_recipient: Address::repeat_byte(6),
+            withdrawals: Some(Vec::new()),
+            parent_beacon_block_root: Some(B256::repeat_byte(7)),
+            slot_number: None,
+            target_gas_limit: None,
+        };
+        let hint = Some(ChainHint { view: 7, chained: true });
+        let old = encode_build_on_own_request(&header, &attrs, hint, true, true);
+        assert_eq!(encode_build_on_own_request_layout(&header, &attrs, hint, true, true, false), old);
+        let marked = encode_build_on_own_request_layout(&header, &attrs, hint, true, true, true);
+        assert_eq!(&marked[..old.len()], &old[..]);
+        assert_eq!(marked.len(), old.len() + 1);
+        let request = decode_build_on_own_request(&marked).expect("decodes");
+        assert!(request.layout_only && request.compact_answer && request.want_hashes);
+        assert!(!decode_build_on_own_request(&old).expect("decodes").layout_only);
+        // A reader that predates the tag stops at it and keeps the rest.
+        assert_eq!(decode_build_on_own(&marked).expect("decodes"), (header, attrs, hint, true));
     }
 
     #[test]

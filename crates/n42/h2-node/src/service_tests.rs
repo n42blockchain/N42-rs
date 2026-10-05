@@ -865,7 +865,7 @@ fn an_elided_blocks_compact_body_is_byte_for_byte_the_whole_blocks() {
     let full = encode_own_body(&whole, &header);
     let from_whole = n42_h2_consensus::encode_compact_body(&full, &hashes, HeaderProfile::Ethereum).expect("compact");
     // What the elided road makes without a single transaction byte.
-    let from_elided = elided_compact_body(&elided, &header, &hashes, &[], HeaderProfile::Ethereum).expect("compact");
+    let from_elided = elided_compact_body(&elided, &header, hashes.len(), &hashes, &[], HeaderProfile::Ethereum).expect("compact");
     assert_eq!(from_elided, from_whole);
     // And a follower that rebuilds the gov5 body from it gets the whole one.
     let decoded = n42_h2_consensus::decode_compact_body(&from_elided, HeaderProfile::Ethereum).expect("decodes");
@@ -874,6 +874,27 @@ fn an_elided_blocks_compact_body_is_byte_for_byte_the_whole_blocks() {
         n42_h2_consensus::rebuild_gov5_body(&decoded, &whole.payload.as_v1().transactions),
         full
     );
+}
+
+/// `N42_ANSWER_LAYOUT_ONLY`: under frame blocks the compact body is made of
+/// the layout alone, so an answer without the hash list gives exactly the
+/// bytes the full one does.
+#[test]
+fn a_layout_only_answers_compact_body_is_byte_for_byte_the_full_ones() {
+    let (_, elided, header, hashes) = whole_and_elided();
+    let layout = vec![(B256::repeat_byte(0xf1), 3), (B256::repeat_byte(0xf2), 2)];
+    let with_hashes =
+        elided_compact_body_with(true, &elided, &header, hashes.len(), &hashes, &layout, HeaderProfile::Ethereum)
+            .expect("compact");
+    let layout_only =
+        elided_compact_body_with(true, &elided, &header, hashes.len(), &[], &layout, HeaderProfile::Ethereum)
+            .expect("compact");
+    assert_eq!(layout_only, with_hashes);
+    let decoded = n42_h2_consensus::decode_compact_body(&layout_only, HeaderProfile::Ethereum).expect("decodes");
+    assert!(decoded.hashes.is_empty(), "a frame description names no hashes");
+    // Without frame blocks the hashes are the body: a short list is refused.
+    assert!(elided_compact_body_with(false, &elided, &header, hashes.len(), &[], &layout, HeaderProfile::Ethereum).is_err());
+    assert!(elided_compact_body_with(false, &elided, &header, hashes.len(), &hashes, &layout, HeaderProfile::Ethereum).is_ok());
 }
 
 #[tokio::test]

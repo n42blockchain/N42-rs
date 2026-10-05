@@ -202,6 +202,15 @@ enum BuildFrame {
     Built(Box<Result<BuiltBlock, ElError>>),
 }
 
+/// `N42_ANSWER_LAYOUT_ONLY` on a node that builds frame blocks: the request
+/// tells the execution layer a compact answer may leave the hash list out
+/// when its frame layout covers the block. The compact body then needs only
+/// the layout (`N42_FRAME_BLOCKS=1`), which is the one thing the proposer
+/// reads the hashes for otherwise.
+fn answer_layout_only() -> bool {
+    n42_h2_execution::answer_layout_only() && n42_tx_types::frame_blocks_requested()
+}
+
 /// The transaction-hash tail the execution layer appends when the request
 /// asked for it (`request::GET_PAYLOAD_HASHED`, `BUILD_ON_OWN`'s hash tail).
 ///
@@ -312,6 +321,7 @@ async fn read_build_frame(
                     bytes: (bytes + tail) as u64,
                     read_end_us,
                     decode_end_us: n42_h2_execution::raw_engine::unix_micros(),
+                    layout_only: false,
                 });
             }
             Ok(BuildFrame::Built(Box::new(built)))
@@ -331,6 +341,9 @@ async fn read_build_frame(
                     bytes: (1 + 4 + len) as u64,
                     read_end_us,
                     decode_end_us: n42_h2_execution::raw_engine::unix_micros(),
+                    // The decoder lets the hash list be absent only for a
+                    // layout that covers the block.
+                    layout_only: built.tx_hashes.is_empty() && built.tx_count > 0,
                 });
             }
             Ok(BuildFrame::Built(Box::new(built)))
@@ -486,12 +499,13 @@ fn start_chain_locked(
     // this way.
     let next_view = view.saturating_add(1);
     let hint = n42_h2_execution::raw_engine::ChainHint { view: next_view, chained: true };
-    let frame = n42_h2_execution::raw_engine::encode_build_on_own_request(
+    let frame = n42_h2_execution::raw_engine::encode_build_on_own_request_layout(
         &sealed,
         &attrs,
         Some(hint),
         n42_h2_execution::compact_body(),
         n42_h2_execution::take_compact(),
+        answer_layout_only(),
     );
     let beacon_root = attrs.parent_beacon_block_root.unwrap_or_default();
     let (tx, answer) = tokio::sync::oneshot::channel();
@@ -1588,12 +1602,13 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         let hashed = n42_h2_execution::compact_body();
         // `N42_TAKE_COMPACT`: the block comes back without its
         // transactions, which the proposal does not carry either.
-        let frame = n42_h2_execution::raw_engine::encode_build_on_own_request(
+        let frame = n42_h2_execution::raw_engine::encode_build_on_own_request_layout(
             header,
             &attrs,
             hint,
             hashed,
             n42_h2_execution::take_compact(),
+            answer_layout_only(),
         );
         let chain_state = std::sync::Arc::clone(&self.chain);
         // The generation as it stands now: a discard just before this call

@@ -818,6 +818,23 @@ pub fn take_compact() -> bool {
     *ON.get_or_init(|| std::env::var("N42_TAKE_COMPACT").is_ok_and(|v| v == "1") && compact_body())
 }
 
+/// `N42_ANSWER_LAYOUT_ONLY`, read once: the proposer tells its execution
+/// layer that a compact build-on-own answer may leave the transaction hash
+/// list out when the block's frame layout covers it (~6.4 MB at 200,000
+/// transactions: encoded, written, read and decoded on the seal -> proposal
+/// road, and nothing on the proposer's side reads it under frame blocks: the
+/// frame description names the layout). Off by default.
+///
+/// It implies [`take_compact`]; the caller also has to be building frame
+/// blocks (`N42_FRAME_BLOCKS=1`), which this crate cannot see, so it
+/// combines the two. An execution layer that predates the request's mark
+/// answers with the hashes as ever, and a block whose layout is empty gets
+/// them too.
+pub fn answer_layout_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_ANSWER_LAYOUT_ONLY").is_ok_and(|v| v == "1") && take_compact())
+}
+
 /// `N42_COMMIT_FCU_ASYNC`, read once: opt-in, and only the *default* for a
 /// driver -- [`ExecutionDriver::set_commit_fcu_async`] is what a test uses,
 /// so the two paths are exercised without the process environment deciding

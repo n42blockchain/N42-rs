@@ -628,3 +628,93 @@ CPU at 7,000 frames/s is ~3.2 runtime cores of decode and ~3.5 blocking cores of
 the first hard limit then is the per-block prune (7), which at the measured 0.25 us a transaction runs out around
 3.1-4.1M/s and at its p90 below 3M. So: reachable with (1) and (7), probably (5) as insurance; not with the runner as
 it stands.
+
+## 11. The feed path, built (2026-10-05, code only, no fleet leg)
+
+Section 10's code items 5-7 plus the drain's clock. Every switch is default off; the internal changes keep behaviour.
+Gate: `cargo check --workspace`, clippy on the touched crates (no new warnings), tests of `n42-tx-queue`,
+`n42-tx-ingest`, `n42-engine-types`, `n42-h2-el-rpc`, `n42-h2-node`, `n42 --lib`.
+
+### 11.1 What runs where
+
+| work | before | after |
+| --- | --- | --- |
+| ingest listener, connection read loops, gate, decode, reply, admitters, gate watcher, 5 s line | main runtime | `N42_INGEST_RUNTIME=1`: own runtime `n42-ingest` (`N42_INGEST_RUNTIME_WORKERS`, default 8, 1..=64) |
+| recovery slot | node-wide `tokio::sync::Semaphore` awaited by the connection task, then `spawn_blocking` | same switch: the slot is taken on the blocking thread from a counting semaphore (`parking_lot` Mutex + Condvar); the ingest runtime's blocking pool is bounded at slots + 2 (512 unbounded), so the excess waits in tokio's own blocking queue and a finishing thread takes the next frame directly. No async task holds or awaits a permit. `acq_us_per_frame` is then the blocking-side wait |
+| gate depth and the reply's `pending` | `gate_len` took the lanes Mutex (and ran the deferred settle) twice a frame | lock-free, always (11.2) |
+| canonical prune | tokio task on the main runtime, three calls, frees under the lanes lock and the index shard locks | one pass, always (11.3); `N42_QUEUE_PRUNE_THREAD=1`: thread `n42-queue-prune`, the task only forwards (and marks `canonical_head::saw`); a wake takes every waiting notification (`coalesced`, `prune_wait_ms`) |
+| freeing a pruned block | inside the prune, partly under locks | thread `n42-queue-free` (channel four blocks deep; a full channel frees inline) |
+
+Still on the main runtime: engine API and RPC, the network, the payload builder's tasks, the 5 ms inbox drainer
+(`N42_TX_QUEUE_DRAINER`, a `spawn_blocking` per tick), the pool's new-transaction feed into the queue, the
+canonical-head watcher the gate's lag allowance reads, the pruner without its switch, and the vote road without
+`N42_ROAD_RUNTIME`.
+
+### 11.2 The gate's staleness
+
+`len` and `parked_len` are packed into one `AtomicU64` stored as every guard of the lanes lock is released (still
+under the lock, so the stores are ordered by it); `gate_len` = mirror + live `staged`, the old formula. With nobody
+holding the lock the reading is exactly the locked one, so every gate decision is the same. While somebody holds it
+the reading is the depth at the last release: **staleness is one hold** of the lanes lock (a build's take, a prune's
+removal, a give-back become visible when their hold ends; the longest hold per 5 s is now on the `ingest` line). The
+drain is the exception that is never undercounted: it adds its batch to the mirror before it subtracts it from
+`staged` (counted twice for nanoseconds, the shut side). Tests: after each of 20 kinds of operation the two readings
+and the decisions at limits around them agree; a reader racing a pusher and a drainer never reads fewer than were
+pushed before it read (100,000 transactions).
+
+### 11.3 The prune's cost
+
+Unit test (`prune_tests`, release, a loaded host, system allocator): 400,000 queued in frames of 500 (one sender's
+run each), a 200,000-transaction block = the oldest 400 frames, with the by-hash index.
+
+| | follower (block in the lanes) | leader (a frame build took it) |
+| --- | --- | --- |
+| old three calls (settle, `remove_mined_batch`, `forget_hashes`), at 7ae94f038 | 69.0-70.6 ms | 69.9-76.3 ms |
+| `prune_block` | 5.2-10.0 ms | 9.0-9.3 ms |
+| of which fold / lanes hold / index | 0.24-0.44 / 0.9-2.1 / 3.0-7.3 ms | 0.37-0.47 / 2.9-4.9 / 2.7-3.6 ms |
+
+What made the 70 ms: freeing 200,000 transactions (600,000 references) was 27-31 ms on its own, most of it under the
+lanes lock and the 64 shard locks; one shard write lock per hash (200,000 takes); `remove_mined_batch`'s fold of
+200,000 pairs under the lock; the taken list retained with a map lookup per transaction; a split of every block
+sender's lane even when the build had already taken everything below the head; and `by_first.retain` over every
+indexed frame. Now: the fold runs outside the lock and follows the block's runs (one map touch per sender run); a lane
+whose head is above the mined nonce is not split; the taken list is split in one pass read once per run; each dead
+frame removes its own `by_first` entry; the index is grouped by shard and visited one write lock a shard, on the
+queue's 8-thread pool; and nothing is freed until every lock is released, and then on `n42-queue-free`. Freeing in
+parallel on four threads was tried and measured 110-153 ms (cross-thread frees contend in the allocator), so the free
+stays serial on its own thread: ~30 ms of one thread per 200k block, ~53% of a core at 17.5 blocks a second, off
+every path. The lanes lock is held 1-5 ms per block instead of ~20.
+
+`mark_invalid` and `forget_taken` still search the taken list from the back (`rposition`); they are per refusal, the
+refused transaction is at or near the end, and neither is on the prune path, so they were left.
+
+Invariants, tested: the one pass and the three calls leave identical queues (offer order, depth, gate, frames, index
+over a probe of both halves); the other 200,000 are offered in nonce order; a re-arrival or an untake of the block is
+never offered; two prunes racing each other, a pusher and a builder that walks, untakes and is superseded lose
+nothing and break no sender's order; an own block held at a height comes back minus what another committed block at
+that height carries, and is settled by its own block.
+
+### 11.4 The drain's clock
+
+New on every `ingest` line (one 5 s interval each, from `n42_tx_queue::take_lock_stats`): `lock_holds`,
+`lock_duty_pct` (sum of holds over the interval), `lock_hold_max_us` and `lock_hold_max_at` (the caller's
+`file:line`), `lock_wait_max_us`, `lock_wait_us`, `drains`, `drain_txs`, `drain_us_mean`, `drain_us_max`. The prune
+line adds `fold_us`, `lock_us`, `free_us`, `frames_swept`, `coalesced`, `prune_wait_ms`; its `remove_us` is now the
+hold alone.
+
+Unit bench (`bench_drain`, release, quiet host): the feed's target, 3.5M/s, is 17,500 transactions per 5 ms
+drainer tick (35 frames of 500 appended to lanes already queued); into a 2,000,000-deep queue each drain holds the
+lanes lock **0.82-0.87 ms** (47-50 ns a transaction), the whole `drain_now` 0.95-1.07 ms. That is ~17% duty of the
+lock at 3.5M/s from the drain, plus the prune's 1-5 ms a block (~5-9% at 17.5 blocks a second) and the builder's
+frame plan: well under the ~50% at which section 10.4 (7) said the lanes should be sharded by sender, so the queue is
+not sharded here. If the fleet's `drain_us_max` reads several milliseconds, the cheaper step first is batching: drain
+on every tick into a per-sender pre-sorted batch outside the lock (group the inbox by sender, then one lane lookup and
+one `BTreeMap::append` per run under it) before splitting the lanes into sender shards with a lock each.
+
+### 11.5 Legs to run
+
+Claim-1 configuration (12 slots, `N42_ROAD_RUNTIME=1`, 60 ms) with `N42_INGEST_RUNTIME=1 N42_QUEUE_PRUNE_THREAD=1`,
+paired with the same configuration without the two switches (the gate mirror and the one-pass prune are in both).
+Pass: no convoy (`acq_us_per_frame` under 1,000 on every `ingest` line with 12 slots), delivery above 2.88M/s when the
+chain wants it, `prune_ms` under 15 at 200k, `lock_hold_max_us` and `drain_us_max` read. Then the same with
+`N42_TX_INGEST_RECOVER_PARALLEL=64` to separate the runtime from the slot count.

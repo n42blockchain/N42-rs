@@ -221,6 +221,35 @@
   `own_from_build`（从构建导入的自建块，累计）与 `own_executed_again`（被再执行的自建块，累计，应恒为 0；
   发生时另有 warn 行）。
 
+## 交易供给路径：ingest、队列闸门与剪枝（不改任何 fork 的 reth crate）:
+- `N42_INGEST_RUNTIME=1`（默认关；代码在 `crates/n42/tx-ingest/src/runtime.rs`，由 `n42_tx_ingest::spawn_serve`
+  使用）：ingest 的监听、每个连接的读循环、闸门、解码、答复、admitter、闸门 watcher 与 5 s 统计行都跑在
+  自己的 tokio runtime 上（线程名 `n42-ingest`，异步 worker 数 `N42_INGEST_RUNTIME_WORKERS`，默认 8，
+  限 1..=64），不再与执行层主 runtime 共用。恢复（attested frame 检查或逐笔验签）在这个 runtime 的
+  blocking 池上运行，并且在 blocking 线程上取恢复槽（`N42_TX_INGEST_RECOVER_PARALLEL` 个，一个普通的
+  计数信号量，线程阻塞等待），连接任务既不持有也不 await 许可，所以不会出现"许可已发给一个还没被
+  调度的任务"的车队（`docs/SHARED_EXECUTION_SCOPE.md` 10.2）。blocking 池的线程上限 = 槽数 + 2（无界时
+  512）。`acq_us_per_frame` 此时是 blocking 线程上等槽的时间，`spawn_us_per_frame` 是此前的交接。
+  runtime 建不起来时退回主 runtime 与原来的异步信号量，并打 warn。线上协议与 flood 的帧格式不变。
+- `N42_QUEUE_PRUNE_THREAD=1`（默认关；代码在 `bin/n42/src/queue_prune.rs`）：每个已提交块的队列剪枝
+  （own block settle、lanes/帧索引/taken 列表移除、by-hash 索引移除）从主 runtime 的 tokio 任务移到专用
+  线程 `n42-queue-prune`；tokio 任务只转发通知（并照旧调用 `canonical_head::saw`）。线程醒来时取走所有
+  已到的通知（合并唤醒，逐块按序处理）。`canonical blocks pruned from the queue` 一行新增 `fold_us`、
+  `lock_us`、`free_us`、`frames_swept`、`coalesced`、`prune_wait_ms`；`remove_us` 现在只是持锁移除的时间。
+- 无开关的内部改动（行为相同）：
+  - 闸门与答复读的队列深度（`TxQueue::gate_len`）不再取 lanes 锁：`len` 与 `parked_len` 在每次释放锁时
+    写入一个原子镜像，inbox 部分仍读实时的 `staged`；drain 先把批次加进镜像再从 `staged` 减去，所以
+    读数在无人持锁时与持锁读数完全相同，有人持锁时是上一次释放时的值（陈旧至多一次持锁），drain
+    永远不会被少算。`gate_len_locked` 保留原读法供测试对照。
+  - 剪枝一遍完成（`TxQueue::prune_block`）：块的 (sender, nonce) 按连续段折叠（锁外）、lane 头已高于
+    已挖 nonce 时不 split、taken 列表一遍按段拆分、帧清扫只删死帧自己的 `by_first` 项、by-hash 索引
+    按分片一次写锁（大批量在队列自己的小池上并行）、移出的 `Arc` 全部在锁外交给队列的释放线程
+    `n42-queue-free`（通道满四块时就地释放）。单元测试（40 万深、20 万一块）：三次调用 69-76 ms，
+    一遍 5-10 ms。`remove_mined_batch` 与 `forget_hashes` 共用同一实现。
+  - 5 s 的 `ingest` 一行新增 lanes 锁与 drain 的计时：`lock_holds`、`lock_duty_pct`、`lock_hold_max_us`、
+    `lock_hold_max_at`（最长持锁的调用位置）、`lock_wait_max_us`、`lock_wait_us`、`drains`、`drain_txs`、
+    `drain_us_mean`、`drain_us_max`（`n42_tx_queue::take_lock_stats`，每行一个区间）。
+
 ## HotStuff-2 结算标签（不改任何 fork 的 reth crate）:
 - `N42_SETTLEMENT_TAGS=split|legacy`（默认 `split`；代码在 `crates/n42/h2-execution/src/settlement.rs`，
   由 `ExecutionDriver` 的每个 forkchoice 使用）：`latest` = 共识已提交的块；`safe` = 执行已认证的块

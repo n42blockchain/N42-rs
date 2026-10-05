@@ -378,19 +378,44 @@ impl<T: PoolTransaction> FrameIndex<T> {
     /// whose canonical watermark is at or past a run's first nonce. Called
     /// after a canonical prune has raised the watermarks.
     pub(crate) fn sweep(&mut self, lanes: &AddressHashMap<Lane<T>>) -> usize {
-        let before = self.frames.len();
-        self.frames.retain(|_, entry| {
-            !entry.runs.iter().any(|run| {
-                lanes.get(&run.sender).is_some_and(|lane| lane.chain_mined(run.first_nonce))
+        let mut gone = Vec::new();
+        self.sweep_into(lanes, &mut gone);
+        gone.len()
+    }
+
+    /// [`Self::sweep`], handing the dropped frames' transactions to `gone`
+    /// instead of freeing them here: the caller holds the lanes' lock, and a
+    /// frame's last reference to its transactions is often this one, so the
+    /// free of a block's worth (200,000 allocations) would otherwise happen
+    /// under it. Each dropped frame's own `by_first` entry is removed by its
+    /// first hash rather than by a pass over every indexed frame.
+    pub(crate) fn sweep_into(&mut self, lanes: &AddressHashMap<Lane<T>>, gone: &mut Vec<FrameTxs<T>>) -> usize {
+        let dead: Vec<B256> = self
+            .frames
+            .iter()
+            .filter(|(_, entry)| {
+                entry.runs.iter().any(|run| {
+                    lanes.get(&run.sender).is_some_and(|lane| lane.chain_mined(run.first_nonce))
+                })
             })
-        });
-        let gone = before - self.frames.len();
-        if gone > 0 {
-            let frames = &self.frames;
-            self.by_first.retain(|_, id| frames.contains_key(id));
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &dead {
+            if let Some(entry) = self.frames.remove(id) {
+                if let Some(first) = entry.hashes.first()
+                    && self.by_first.get(first) == Some(id)
+                {
+                    self.by_first.remove(first);
+                }
+                if let Some(txs) = entry.txs {
+                    gone.push(txs);
+                }
+            }
+        }
+        if !dead.is_empty() {
             self.compact();
         }
-        gone
+        dead.len()
     }
 
     /// The frames in arrival order, each with whether a build could take it

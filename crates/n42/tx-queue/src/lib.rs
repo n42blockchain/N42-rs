@@ -359,6 +359,134 @@ pub struct ForgetTimes {
     pub first_miss: usize,
 }
 
+/// Where [`TxQueue::prune_block`] spent its time, in microseconds, and how
+/// much it did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PruneTimes {
+    /// The own block held at the height settled (its own lock).
+    pub settle_us: u64,
+    /// The block's pairs folded to one nonce a sender, outside the lock.
+    pub fold_us: u64,
+    /// Waiting for the lanes' lock.
+    pub lock_us: u64,
+    /// Under it: the inbox drained, the lanes split, the frames swept, the
+    /// taken list split.
+    pub remove_us: u64,
+    /// The by-hash index, one write lock a shard.
+    pub forget_us: u64,
+    /// Handing what left the queue to the freeing thread (or freeing it
+    /// here when that thread is four blocks behind), with no lock held.
+    pub free_us: u64,
+    /// Senders in the block.
+    pub senders: usize,
+    /// Frames the sweep dropped.
+    pub frames_swept: usize,
+    /// References released by the free (a transaction is freed when its
+    /// last one goes).
+    pub freed: usize,
+}
+
+/// What a prune took out of the queue, held until every lock is released.
+struct PruneGarbage<T: PoolTransaction> {
+    lanes: Vec<BTreeMap<u64, Arc<ValidPoolTransaction<T>>>>,
+    taken: Vec<Arc<ValidPoolTransaction<T>>>,
+    frames: Vec<FrameTxs<T>>,
+    index: Vec<Arc<ValidPoolTransaction<T>>>,
+}
+
+impl<T: PoolTransaction> Default for PruneGarbage<T> {
+    fn default() -> Self {
+        Self { lanes: Vec::new(), taken: Vec::new(), frames: Vec::new(), index: Vec::new() }
+    }
+}
+
+/// Garbage on its way to the freeing thread, type-erased: one thread serves
+/// whatever transaction type the queue holds.
+type Freeable = Box<dyn Send>;
+
+/// The queue's freeing thread (`n42-queue-free`): what a prune took out of
+/// the queue is released there, off the prune and off every lock. A
+/// 200,000-transaction block is 600,000 references and 200,000
+/// transactions freed, 27-31 ms on one thread with the system allocator
+/// (`prune_tests::bench_prune_block`) -- most of the prune once nothing was
+/// freed under a lock. Freeing in parallel was worse (110-150 ms: frees of
+/// one allocator's objects from several threads contend). The channel holds
+/// four blocks; a prune that finds it full frees its own garbage, so a
+/// freeing thread that falls behind slows the prune down rather than letting
+/// memory grow. `None` if the thread could not be started.
+fn freeing_thread() -> Option<&'static std::sync::mpsc::SyncSender<Freeable>> {
+    static SENDER: OnceLock<Option<std::sync::mpsc::SyncSender<Freeable>>> = OnceLock::new();
+    SENDER
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Freeable>(4);
+            std::thread::Builder::new()
+                .name("n42-queue-free".to_owned())
+                .spawn(move || {
+                    while let Ok(garbage) = rx.recv() {
+                        drop(garbage);
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+impl<T: PoolTransaction + 'static> PruneGarbage<T> {
+    /// Releases everything on the freeing thread ([`freeing_thread`]), or
+    /// here when it is full or absent. The by-hash index's references go
+    /// last: they are usually the last ones, so that is where the
+    /// transactions themselves are freed.
+    fn free(self) {
+        if self.lanes.is_empty() && self.taken.is_empty() && self.frames.is_empty() && self.index.is_empty() {
+            return;
+        }
+        let Some(sender) = freeing_thread() else {
+            drop(self);
+            return;
+        };
+        match sender.try_send(Box::new(self)) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(garbage) | std::sync::mpsc::TrySendError::Disconnected(garbage)) => {
+                drop(garbage);
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.lanes.iter().map(BTreeMap::len).sum::<usize>()
+            + self.taken.len()
+            + self.frames.iter().map(|frame| frame.len()).sum::<usize>()
+            + self.index.len()
+    }
+}
+
+/// Each sender's highest nonce in `mined`. A block is runs of one sender's
+/// consecutive nonces (a frame is one sender's run on the bench), so the
+/// map is touched once a run, not once a transaction.
+fn fold_highest(mined: impl IntoIterator<Item = (Address, u64)>) -> AddressHashMap<u64> {
+    let mut highest: AddressHashMap<u64> = AddressHashMap::default();
+    let mut run: Option<(Address, u64)> = None;
+    let flush = |highest: &mut AddressHashMap<u64>, (sender, nonce): (Address, u64)| {
+        let entry = highest.entry(sender).or_insert(nonce);
+        *entry = (*entry).max(nonce);
+    };
+    for (sender, nonce) in mined {
+        match run.as_mut() {
+            Some((current, top)) if *current == sender => *top = (*top).max(nonce),
+            _ => {
+                if let Some(done) = run.replace((sender, nonce)) {
+                    flush(&mut highest, done);
+                }
+            }
+        }
+    }
+    if let Some(done) = run {
+        flush(&mut highest, done);
+    }
+    highest
+}
+
 /// How many transactions the queue let go of since the last report, by
 /// reason, with the first few named.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -865,14 +993,60 @@ impl<T: PoolTransaction> HashIndex<T> {
         }
     }
 
-    fn remove(&self, hash: &B256) {
-        let mut shard = self.shard_of(hash).write();
-        if shard.by_hash.remove(hash).is_some() {
-            // The order list is walked only when the bound bites, and a hash
-            // that is no longer in the map is skipped there, so a removal
-            // costs one map operation rather than a scan.
-            shard.removed = shard.removed.saturating_add(1);
+    /// Removes every one of `hashes` the index holds and hands their `Arc`s
+    /// back, to be freed by the caller with no shard locked.
+    ///
+    /// Grouped by shard first, then one write lock a shard -- not one a
+    /// hash, 200,000 lock takes a block -- with the shards visited on the
+    /// queue's small pool when the batch is large. Removing a hash the
+    /// index does not hold is a no-op. The order list is walked only when
+    /// the bound bites, and a hash no longer in the map is skipped there,
+    /// so a removal costs one map operation rather than a scan.
+    fn remove_all(&self, hashes: &[B256]) -> Vec<Arc<ValidPoolTransaction<T>>> {
+        /// Below this a batch is removed in place, hash by hash.
+        const BY_SHARD_FROM: usize = 1_024;
+        if hashes.len() < BY_SHARD_FROM {
+            let mut out = Vec::with_capacity(hashes.len());
+            for hash in hashes {
+                let mut shard = self.shard_of(hash).write();
+                if let Some(held) = shard.by_hash.remove(hash) {
+                    shard.removed = shard.removed.saturating_add(1);
+                    out.push(held);
+                }
+            }
+            return out;
         }
+        let mut buckets: Vec<Vec<B256>> =
+            (0..HASH_INDEX_SHARDS).map(|_| Vec::with_capacity(hashes.len() / HASH_INDEX_SHARDS + 16)).collect();
+        for hash in hashes {
+            buckets[usize::from(hash.0[0]) % HASH_INDEX_SHARDS].push(*hash);
+        }
+        let one_shard = |(at, bucket): (usize, &Vec<B256>)| {
+            let mut out = Vec::with_capacity(bucket.len());
+            if bucket.is_empty() {
+                return out;
+            }
+            let mut shard = self.shards[at].write();
+            for hash in bucket {
+                if let Some(held) = shard.by_hash.remove(hash) {
+                    out.push(held);
+                }
+            }
+            shard.removed = shard.removed.saturating_add(out.len());
+            out
+        };
+        let parts: Vec<Vec<Arc<ValidPoolTransaction<T>>>> = match forget_pool() {
+            Some(pool) => {
+                use rayon::prelude::*;
+                pool.install(|| buckets.par_iter().enumerate().map(one_shard).collect())
+            }
+            None => buckets.iter().enumerate().map(one_shard).collect(),
+        };
+        let mut out = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+        for part in parts {
+            out.extend(part);
+        }
+        out
     }
 
     fn get(&self, hash: &B256) -> Option<Arc<ValidPoolTransaction<T>>> {
@@ -1437,9 +1611,9 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// them.
     pub fn forget_hashes(&self, hashes: impl IntoIterator<Item = B256>) {
         let Some(index) = self.by_hash.as_ref() else { return };
-        for hash in hashes {
-            index.remove(&hash);
-        }
+        let hashes: Vec<B256> = hashes.into_iter().collect();
+        // One write lock a shard; what leaves is freed after the locks.
+        drop(index.remove_all(&hashes));
     }
 
     /// Puts transactions a build took but will not offer to the builder back
@@ -1517,37 +1691,94 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// mined watermarks, so nothing at or below them can be queued again.
     /// For canonical blocks only -- see [`Self::remove_mined_batch_collecting`]
     /// for a block of this node's that consensus has not committed yet.
-    pub fn remove_mined_batch(&self, mined: impl IntoIterator<Item = (Address, u64)>) {
+    pub fn remove_mined_batch(&self, mined: impl IntoIterator<Item = (Address, u64)>)
+    where
+        T: 'static,
+    {
+        // Folded to the highest nonce per sender first, outside the lock: a
+        // lane is split once per sender, not once per transaction.
+        // Splitting per transaction was 163,000 tree splits and as many
+        // allocations a block, 54-128 ms under the lock the next build's
+        // puller is waiting on.
+        let highest = fold_highest(mined);
+        let mut garbage = PruneGarbage::default();
         let mut inner = self.lock_inner();
         self.drain_inbox(&mut inner);
-        // Folded to the highest nonce per sender first: a lane is split once
-        // per sender, not once per transaction. Splitting per transaction
-        // was 163,000 tree splits and as many allocations a block, 54-128 ms
-        // under the lock the next build's puller is waiting on.
-        let mut highest: AddressHashMap<u64> = AddressHashMap::default();
-        for (sender, nonce) in mined {
-            let entry = highest.entry(sender).or_insert(nonce);
-            *entry = (*entry).max(nonce);
-        }
-        for (sender, nonce) in &highest {
-            inner.remove_mined(*sender, *nonce);
-        }
-        // A frame any of whose transactions the chain has mined can never
-        // be referenced whole again.
+        inner.remove_mined_highest(&highest, &mut garbage);
+        drop(inner);
+        garbage.free();
+    }
+
+    /// A canonical block's whole prune, in the order the node's pruner ran
+    /// its three steps: the own block held at `number` settled
+    /// ([`Self::settle_own_block`]), the block's `(sender, nonce)` pairs out
+    /// of the lanes, the frame index and the build's taken list
+    /// ([`Self::remove_mined_batch`]), and its `hashes` out of the by-hash
+    /// index ([`Self::forget_hashes`]). Returns how many transactions the
+    /// settle gave back, and where the time went.
+    ///
+    /// The result is that of the three calls in sequence; what differs is
+    /// the cost (`docs/SHARED_EXECUTION_SCOPE.md` 10.1 and 11: 49-65 ms per
+    /// 200,000-transaction block, serial, on a runtime worker):
+    /// - the fold of the block's pairs runs outside the lock and follows the
+    ///   block's runs (a frame is one sender's consecutive nonces), so a
+    ///   200,000-transaction block is a few hundred map operations;
+    /// - a lane whose head is already above the mined nonce (the leader's
+    ///   case: its build took them) is not split;
+    /// - the build's taken list is split in one pass, again by runs;
+    /// - the frame sweep drops each dead frame's own `by_first` entry
+    ///   instead of re-walking every frame's;
+    /// - the by-hash index is visited one shard at a time (one write lock a
+    ///   shard, not one a hash), on the queue's small pool;
+    /// - nothing is freed under a lock: every `Arc` that leaves the lanes,
+    ///   the taken list, the frame index or the by-hash index is collected
+    ///   and handed at the end (`free_us`) to the queue's freeing thread,
+    ///   with no lock held ([`freeing_thread`]).
+    pub fn prune_block(
+        &self,
+        number: u64,
+        hash: B256,
+        mined: &[(Address, u64)],
+        hashes: &[B256],
+    ) -> (usize, PruneTimes)
+    where
+        T: 'static,
+    {
+        let mut times = PruneTimes::default();
+        let at = std::time::Instant::now();
+        // Built only if an own block is held at this height (rarely): a
+        // 200,000-entry set every block on every node was 10-20 ms.
+        let carried = std::cell::OnceCell::new();
+        let back = self.settle_own_block(number, hash, |sender, nonce| {
+            carried
+                .get_or_init(|| mined.iter().copied().collect::<std::collections::HashSet<(Address, u64)>>())
+                .contains(&(*sender, nonce))
+        });
+        times.settle_us = at.elapsed().as_micros() as u64;
+        let at = std::time::Instant::now();
+        let highest = fold_highest(mined.iter().copied());
+        times.senders = highest.len();
+        times.fold_us = at.elapsed().as_micros() as u64;
+        let mut garbage = PruneGarbage::default();
+        let at = std::time::Instant::now();
         {
-            let Inner { frames, lanes, .. } = &mut *inner;
-            frames.sweep(lanes);
+            let mut inner = self.lock_inner();
+            times.lock_us = at.elapsed().as_micros() as u64;
+            let held = std::time::Instant::now();
+            self.drain_inbox(&mut inner);
+            times.frames_swept = inner.remove_mined_highest(&highest, &mut garbage);
+            times.remove_us = held.elapsed().as_micros() as u64;
         }
-        // What a build has taken is not in the lanes, so the removal above
-        // misses it; when the build is superseded its transactions are
-        // offered again, and a mined one offered again is a stale
-        // transaction the builder pays to refuse (42,000 a build in round
-        // 38). Forget the mined ones here.
-        if let Some((_, taken)) = inner.last_build.as_mut() {
-            if !taken.is_empty() {
-                taken.retain(|t| highest.get(&t.sender()).is_none_or(|mined| t.nonce() > *mined));
-            }
+        let at = std::time::Instant::now();
+        if let Some(index) = self.by_hash.as_ref() {
+            garbage.index = index.remove_all(hashes);
         }
+        times.forget_us = at.elapsed().as_micros() as u64;
+        let at = std::time::Instant::now();
+        times.freed = garbage.len();
+        garbage.free();
+        times.free_us = at.elapsed().as_micros() as u64;
+        (back, times)
     }
 
     /// [`Self::remove_mined_batch`], returning what it removed from the
@@ -2628,6 +2859,55 @@ impl<T: PoolTransaction> Inner<T> {
             .fold((0, 0), |(lanes, txs), lane| (lanes + 1, txs + lane.by_nonce.len()))
     }
 
+    /// A canonical block's removal, given each sender's highest mined nonce:
+    /// the lanes, then the frame index, then the build's taken list; what
+    /// leaves goes to `garbage` for the caller to free after the lock.
+    /// Returns how many frames the sweep dropped.
+    fn remove_mined_highest(&mut self, highest: &AddressHashMap<u64>, garbage: &mut PruneGarbage<T>) -> usize {
+        for (sender, nonce) in highest {
+            if let Some(gone) = self.remove_mined_taking(*sender, *nonce, true) {
+                garbage.lanes.push(gone);
+            }
+        }
+        // A frame any of whose transactions the chain has mined can never
+        // be referenced whole again.
+        let swept = {
+            let Self { frames, lanes, .. } = self;
+            frames.sweep_into(lanes, &mut garbage.frames)
+        };
+        // What a build has taken is not in the lanes, so the removal above
+        // misses it; when the build is superseded its transactions are
+        // offered again, and a mined one offered again is a stale
+        // transaction the builder pays to refuse (42,000 a build in round
+        // 38). Forget the mined ones here: one pass, the map read once a
+        // run of one sender, the kept ones in their order.
+        if let Some((_, taken)) = self.last_build.as_mut()
+            && !taken.is_empty()
+        {
+            let all = std::mem::take(taken);
+            let mut kept = Vec::with_capacity(all.len());
+            let mut run: Option<(Address, Option<u64>)> = None;
+            for t in all {
+                let sender = t.sender();
+                let mined = match run {
+                    Some((current, mined)) if current == sender => mined,
+                    _ => {
+                        let mined = highest.get(&sender).copied();
+                        run = Some((sender, mined));
+                        mined
+                    }
+                };
+                if mined.is_some_and(|mined| t.nonce() <= mined) {
+                    garbage.taken.push(t);
+                } else {
+                    kept.push(t);
+                }
+            }
+            *taken = kept;
+        }
+        swept
+    }
+
     /// [`Self::remove_mined_from`] for a canonical block.
     fn remove_mined(&mut self, sender: Address, nonce: u64) {
         self.remove_mined_from(sender, nonce, true);
@@ -2637,16 +2917,34 @@ impl<T: PoolTransaction> Inner<T> {
     /// `from_chain` says whether a canonical block put it there or a build
     /// did ([`Lane::chain_mined`]).
     fn remove_mined_from(&mut self, sender: Address, nonce: u64, from_chain: bool) {
-        let Some(lane) = self.lanes.get_mut(&sender) else { return };
+        drop(self.remove_mined_taking(sender, nonce, from_chain));
+    }
+
+    /// [`Self::remove_mined_from`], handing back what left the lane rather
+    /// than freeing it here, so a caller under the lock can free it after
+    /// the lock is released.
+    fn remove_mined_taking(
+        &mut self,
+        sender: Address,
+        nonce: u64,
+        from_chain: bool,
+    ) -> Option<BTreeMap<u64, Arc<ValidPoolTransaction<T>>>> {
+        let lane = self.lanes.get_mut(&sender)?;
         lane.mine(nonce, from_chain);
         // The chain has reached or passed the hole: whatever is left in the
         // lane above it is the next thing this sender wants mined.
         let ends_park = lane.chain_passed(nonce);
         let parked = lane.parked.is_some();
-        let keep = lane.by_nonce.split_off(&(nonce + 1));
-        let dropped = lane.by_nonce.len();
+        // Nothing at or below the nonce: no split (a split of a lane whose
+        // head is above the mined nonce moves the whole tree for nothing,
+        // which on a leader is every lane the block's frames came from:
+        // the build took them out already).
+        let gone = lane.by_nonce.first_key_value().is_some_and(|(first, _)| *first <= nonce).then(|| {
+            let keep = lane.by_nonce.split_off(&nonce.saturating_add(1));
+            std::mem::replace(&mut lane.by_nonce, keep)
+        });
+        let dropped = gone.as_ref().map_or(0, BTreeMap::len);
         self.len -= dropped;
-        lane.by_nonce = keep;
         // What left the lane leaves the parked total first, whatever
         // happens to the park itself: `unpark` subtracts what the lane
         // *still* holds, so a park ended in the same breath as a prune
@@ -2660,6 +2958,7 @@ impl<T: PoolTransaction> Inner<T> {
             self.unpark(sender);
             self.requeue(sender);
         }
+        gone
     }
 
     /// Ends the run in progress: the sender it was taking from goes back to

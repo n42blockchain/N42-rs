@@ -29,13 +29,19 @@ def derive(suffix):
         for k, v in edits: l = set_tok(l, k, v)
         return l
     S64 = ('N42_TX_INGEST_RECOVER_PARALLEL', '64'); iv = lambda n: ('F7_BLOCK_INTERVAL_MS', str(n))
-    warm = 'WARM' if suffix == '' else 'WARM2'
+    warm = {'': 'WARM', 'b': 'WARM2', 'c': 'WARM3', 'd': 'WARM4'}[suffix]
     gi = [k for k, l in enumerate(lines) if l.startswith('W=$B/bench-loop337WARM')]; assert len(gi) == 1
     guard = re.sub(r'bench-loop337WARM2?', f'bench-loop337{warm}', lines[gi[0]])
     cyc = lambda tag: f"$(python3 scripts/fleet7-runs/cycmed336.py loop337{tag} cycle)"
     if suffix == '':
         body = [mk(warm, S64, fn='leg'), guard, mk('RF64', S64), mk('RF64b', S64), mk('RF24', ('N42_TX_INGEST_RECOVER_PARALLEL', '24'))]
         title = 'Claim 1: WARM (RF64), RF64, RF64b, RF24.'
+    elif suffix in ('c', 'd'):
+        # claim 3: claim 2's runner was killed with the session's background shell during RF64T64's post-processing (salvaged by hand), so BEST / BESTb never ran
+        body = [mk(warm, S64, fn='leg'), guard,
+                'BT=$(python3 scripts/fleet7-runs/best337.py loop337 RF64P55 RF64P50 RF64S250 RF64S300 RF64T64); echo "BEST single leg: ${BT:-none}"',
+                'if [ -n "$BT" ]; then argsof $BT BARGS; legf BEST "${BARGS[@]}"; legf BESTb "${BARGS[@]}"; fi']
+        title = 'Claim 3 / 4 (4: claim 3 ran a stale best337.py from the worktree and found no BEST leg): WARM3 / WARM4, BEST, BESTb (the highest fully-full single leg of claim 2).'
     else:
         body = [mk(warm, S64, fn='leg'), guard,
                 'C1=' + cyc('RF64') + '; C2=' + cyc('RF64b') + '; CM=$(python3 -c "print(min(float(\'$C1\'), float(\'$C2\')))"); echo "RF64 / RF64b cycle medians $C1 / $C2 ms"',
@@ -68,4 +74,4 @@ def derive(suffix):
     open(D + f'run-loop337{suffix}.sh', 'w').write(run)
     la = open(D + 'launch-loop336b.sh').read().replace('run-loop336b.sh', 'run-loop337' + suffix + '.sh').replace('loop336b', 'loop337' + suffix)
     open(D + f'launch-loop337{suffix}.sh', 'w').write(la)
-for sfx in (sys.argv[1:] or ['', 'b']): derive(sfx)
+for sfx in (sys.argv[1:] or ['', 'b', 'c', 'd']): derive(sfx)

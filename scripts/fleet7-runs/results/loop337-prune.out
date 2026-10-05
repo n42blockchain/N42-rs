@@ -1,0 +1,48 @@
+== loop337WARM: pruner (per block; busy = sum prune_ms / 30 s, lock = sum (remove_us + settle_us) / 30 s)
+  window 1: 370 prunes; prune_ms 49/84; remove_us 22.0/41.0 ms; forget_us 15.4/23.4 ms; settle_us 2.7 ms; pruner busy 66% of a worker; lanes lock held for removal 35%
+  window 2: 377 prunes; prune_ms 49/64; remove_us 22.9/31.0 ms; forget_us 13.3/21.5 ms; settle_us 2.9 ms; pruner busy 66% of a worker; lanes lock held for removal 36%
+  window 3: 350 prunes; prune_ms 49/89; remove_us 22.9/43.6 ms; forget_us 13.4/24.7 ms; settle_us 3.0 ms; pruner busy 64% of a worker; lanes lock held for removal 34%
+== loop337RF64: pruner (per block; busy = sum prune_ms / 30 s, lock = sum (remove_us + settle_us) / 30 s)
+  window 1: 361 prunes; prune_ms 49/84; remove_us 21.9/39.8 ms; forget_us 15.2/25.4 ms; settle_us 2.8 ms; pruner busy 65% of a worker; lanes lock held for removal 34%
+  window 2: 371 prunes; prune_ms 50/70; remove_us 23.5/33.9 ms; forget_us 14.0/21.6 ms; settle_us 2.6 ms; pruner busy 67% of a worker; lanes lock held for removal 36%
+  window 3: 358 prunes; prune_ms 51/81; remove_us 23.3/42.5 ms; forget_us 15.2/24.6 ms; settle_us 2.8 ms; pruner busy 66% of a worker; lanes lock held for removal 35%
+== loop337RF64b: pruner (per block; busy = sum prune_ms / 30 s, lock = sum (remove_us + settle_us) / 30 s)
+  window 1: 371 prunes; prune_ms 48/71; remove_us 22.1/37.1 ms; forget_us 14.4/23.4 ms; settle_us 2.6 ms; pruner busy 65% of a worker; lanes lock held for removal 35%
+  window 2: 371 prunes; prune_ms 50/80; remove_us 22.8/39.2 ms; forget_us 14.9/27.9 ms; settle_us 2.9 ms; pruner busy 68% of a worker; lanes lock held for removal 36%
+  window 3: 360 prunes; prune_ms 51/94; remove_us 23.0/43.7 ms; forget_us 16.1/27.4 ms; settle_us 2.8 ms; pruner busy 67% of a worker; lanes lock held for removal 36%
+== loop337RF24: pruner (per block; busy = sum prune_ms / 30 s, lock = sum (remove_us + settle_us) / 30 s)
+  window 1: 383 prunes; prune_ms 47/60; remove_us 21.6/28.5 ms; forget_us 12.8/20.9 ms; settle_us 2.6 ms; pruner busy 64% of a worker; lanes lock held for removal 34%
+  window 2: 363 prunes; prune_ms 50/92; remove_us 24.2/43.8 ms; forget_us 14.2/24.3 ms; settle_us 2.8 ms; pruner busy 67% of a worker; lanes lock held for removal 37%
+  window 3: 349 prunes; prune_ms 50/97; remove_us 23.9/46.0 ms; forget_us 14.2/27.2 ms; settle_us 3.0 ms; pruner busy 66% of a worker; lanes lock held for removal 36%
+== loop337WARM2: pruner (per block; busy = sum prune_ms / 30 s, lock = sum (remove_us + settle_us) / 30 s)
+  window 1: 356 prunes; prune_ms 50/97; remove_us 22.5/42.5 ms; forget_us 15.9/26.7 ms; settle_us 2.8 ms; pruner busy 67% of a worker; lanes lock held for removal 35%
+  window 2: 362 prunes; prune_ms 52/92; remove_us 23.7/43.3 ms; forget_us 16.2/30.3 ms; settle_us 2.8 ms; pruner busy 69% of a worker; lanes lock held for removal 36%
+  window 3: 351 prunes; prune_ms 50/91; remove_us 22.8/44.7 ms; forget_us 15.0/24.4 ms; settle_us 2.8 ms; pruner busy 65% of a worker; lanes lock held for removal 34%
+== loop337RF64S250: pruner (per block; busy = sum prune_ms / 30 s, lock = sum (remove_us + settle_us) / 30 s)
+  window 1: 291 prunes; prune_ms 61/106; remove_us 26.8/50.4 ms; forget_us 18.7/31.7 ms; settle_us 3.5 ms; pruner busy 64% of a worker; lanes lock held for removal 34%
+  window 2: 299 prunes; prune_ms 60/93; remove_us 28.0/40.2 ms; forget_us 18.1/27.0 ms; settle_us 3.5 ms; pruner busy 64% of a worker; lanes lock held for removal 35%
+  window 3: 298 prunes; prune_ms 62/80; remove_us 28.3/36.8 ms; forget_us 18.1/25.9 ms; settle_us 3.5 ms; pruner busy 64% of a worker; lanes lock held for removal 34%
+== loop337RF64S300: pruner (per block; busy = sum prune_ms / 30 s, lock = sum (remove_us + settle_us) / 30 s)
+  window 1: 256 prunes; prune_ms 69/95; remove_us 30.6/40.5 ms; forget_us 22.3/33.6 ms; settle_us 3.7 ms; pruner busy 63% of a worker; lanes lock held for removal 32%
+  window 2: 245 prunes; prune_ms 69/105; remove_us 32.4/57.0 ms; forget_us 19.2/34.2 ms; settle_us 3.9 ms; pruner busy 62% of a worker; lanes lock held for removal 34%
+  window 3: 260 prunes; prune_ms 68/87; remove_us 32.4/40.0 ms; forget_us 19.3/28.0 ms; settle_us 3.8 ms; pruner busy 61% of a worker; lanes lock held for removal 34%
+== loop337RF64T64: pruner (per block; busy = sum prune_ms / 30 s, lock = sum (remove_us + settle_us) / 30 s)
+  window 1: 360 prunes; prune_ms 50/89; remove_us 22.0/41.6 ms; forget_us 15.0/25.3 ms; settle_us 2.7 ms; pruner busy 66% of a worker; lanes lock held for removal 34%
+  window 2: 343 prunes; prune_ms 50/99; remove_us 23.4/46.2 ms; forget_us 14.8/28.5 ms; settle_us 3.0 ms; pruner busy 65% of a worker; lanes lock held for removal 35%
+  window 3: 353 prunes; prune_ms 51/83; remove_us 24.0/43.3 ms; forget_us 14.4/24.9 ms; settle_us 2.8 ms; pruner busy 66% of a worker; lanes lock held for removal 36%
+== loop337WARM3: pruner (per block; busy = sum prune_ms / 30 s, lock = sum (remove_us + settle_us) / 30 s)
+  window 1: 355 prunes; prune_ms 49/84; remove_us 22.8/40.1 ms; forget_us 14.3/24.5 ms; settle_us 2.7 ms; pruner busy 64% of a worker; lanes lock held for removal 34%
+  window 2: 363 prunes; prune_ms 50/93; remove_us 23.1/43.0 ms; forget_us 15.4/25.2 ms; settle_us 2.8 ms; pruner busy 67% of a worker; lanes lock held for removal 35%
+  window 3: 343 prunes; prune_ms 52/98; remove_us 24.0/47.4 ms; forget_us 16.7/27.3 ms; settle_us 2.6 ms; pruner busy 67% of a worker; lanes lock held for removal 36%
+== loop337WARM4: pruner (per block; busy = sum prune_ms / 30 s, lock = sum (remove_us + settle_us) / 30 s)
+  window 1: 336 prunes; prune_ms 50/96; remove_us 21.5/43.9 ms; forget_us 14.7/30.6 ms; settle_us 3.4 ms; pruner busy 65% of a worker; lanes lock held for removal 33%
+  window 2: 342 prunes; prune_ms 61/92; remove_us 21.2/33.8 ms; forget_us 25.3/45.3 ms; settle_us 2.8 ms; pruner busy 73% of a worker; lanes lock held for removal 31%
+  window 3: 327 prunes; prune_ms 65/101; remove_us 21.1/46.1 ms; forget_us 25.6/44.3 ms; settle_us 3.7 ms; pruner busy 75% of a worker; lanes lock held for removal 32%
+== loop337BEST: pruner (per block; busy = sum prune_ms / 30 s, lock = sum (remove_us + settle_us) / 30 s)
+  window 1: 387 prunes; prune_ms 49/64; remove_us 21.6/28.4 ms; forget_us 15.0/25.3 ms; settle_us 2.8 ms; pruner busy 67% of a worker; lanes lock held for removal 34%
+  window 2: 334 prunes; prune_ms 53/99; remove_us 23.4/46.4 ms; forget_us 16.4/29.8 ms; settle_us 3.3 ms; pruner busy 66% of a worker; lanes lock held for removal 35%
+  window 3: 362 prunes; prune_ms 50/72; remove_us 23.5/36.5 ms; forget_us 13.9/24.1 ms; settle_us 2.9 ms; pruner busy 66% of a worker; lanes lock held for removal 35%
+== loop337BESTb: pruner (per block; busy = sum prune_ms / 30 s, lock = sum (remove_us + settle_us) / 30 s)
+  window 1: 368 prunes; prune_ms 48/72; remove_us 21.6/36.0 ms; forget_us 14.1/24.0 ms; settle_us 2.9 ms; pruner busy 65% of a worker; lanes lock held for removal 34%
+  window 2: 361 prunes; prune_ms 51/80; remove_us 23.4/41.6 ms; forget_us 14.5/23.5 ms; settle_us 3.1 ms; pruner busy 67% of a worker; lanes lock held for removal 36%
+  window 3: 346 prunes; prune_ms 51/99; remove_us 23.0/45.8 ms; forget_us 15.0/27.3 ms; settle_us 3.0 ms; pruner busy 66% of a worker; lanes lock held for removal 35%

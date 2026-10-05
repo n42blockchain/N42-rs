@@ -60,6 +60,11 @@ def derive(suffix):
     # the per-leg report: the feed check next to feedcheck335.py's verdict
     run = run.replace('  python3 scripts/fleet7-runs/feedcheck335.py loop337$tag\n', '  python3 scripts/fleet7-runs/feedcheck335.py loop337$tag; python3 scripts/fleet7-runs/feed337.py loop337$tag 2>&1 | cut -c1-420; python3 scripts/fleet7-runs/fields336.py loop337$tag 2>&1 | cut -c1-900\n')
     assert 'feed337.py' in run
+    # per-thread CPU of the layer's tokio-rt threads (threadcpu337.py): is one main-runtime worker saturated?
+    key = "F7_ROOT=/data/blockchain/rust-fleet7-bench python3 $S/threadcpu4.py 200 ) > $S/threadcpu-$tag.tsv 2>/dev/null &\n"
+    assert key in run
+    run = run.replace(key, key + "  ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; python3 scripts/fleet7-runs/threadcpu337.py sample 150 0 ) > $S/tidcpu-$tag.tsv 2>/dev/null &\n")
+    run = run.replace('python3 scripts/fleet7-runs/feed337.py loop337$tag 2>&1 | cut -c1-420;', 'python3 scripts/fleet7-runs/feed337.py loop337$tag 2>&1 | cut -c1-420; python3 scripts/fleet7-runs/threadcpu337.py report $S/tidcpu-loop337$tag.tsv 2>&1 | cut -c1-300;')
     open(D + f'run-loop337{suffix}.sh', 'w').write(run)
     la = open(D + 'launch-loop336b.sh').read().replace('run-loop336b.sh', 'run-loop337' + suffix + '.sh').replace('loop336b', 'loop337' + suffix)
     open(D + f'launch-loop337{suffix}.sh', 'w').write(la)

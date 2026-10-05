@@ -819,12 +819,13 @@ static LAST_SEAL: std::sync::Mutex<Option<(u64, std::time::Instant)>> = std::syn
 
 /// What a build's `state_wait_ms` was on: the largest of the named waits
 /// ([`crate::direct_build::open_wait`]), or `open` when the rest of the wait
-/// -- the open itself: the overlay, the provider -- is larger than each;
-/// `none` for no wait.
-fn state_wait_label(total_ms: u64, on: &crate::direct_build::open_wait::OpenWait) -> &'static str {
-    let named = [on.output_ms, on.grandparent_ms, on.parent_root_ms, on.parent_complete_ms];
-    let rest = total_ms.saturating_sub(named.iter().sum());
-    if rest > 0 && named.iter().all(|ms| rest > *ms) {
+/// -- what no named wait covers, a millisecond or more -- is larger than
+/// each; `none` for no wait. Since loop333 the open's own two costs are named
+/// (`layer_release`, `provider_open`), so `open` is what is left after them.
+fn state_wait_label(total_us: u64, on: &crate::direct_build::open_wait::OpenWait) -> &'static str {
+    let named = on.named_us();
+    let rest = total_us.saturating_sub(named.iter().map(|(us, _)| us).sum());
+    if rest >= 1000 && named.iter().all(|(us, _)| rest > *us) {
         return "open";
     }
     on.label()
@@ -1285,6 +1286,7 @@ where
     // parent's `StateReady`.
     let state_pending = std::cell::Cell::new(defer_state);
     let mut state_wait_ms = 0u64;
+    let mut state_wait_us = 0u64;
     // What that wait was on (`direct_build::open_wait`): the parent's output,
     // the grandparent's import, the parent's QMDB root or `Complete`, or the
     // open itself ("open": the rest of `state_wait_ms`).
@@ -1295,7 +1297,9 @@ where
                 let _ = crate::direct_build::open_wait::take();
                 let at = std::time::Instant::now();
                 let opened = open_parent_state();
-                state_wait_ms += at.elapsed().as_millis() as u64;
+                let waited = at.elapsed();
+                state_wait_ms += waited.as_millis() as u64;
+                state_wait_us += waited.as_micros() as u64;
                 state_wait_on = crate::direct_build::open_wait::take();
                 match opened {
                     Err(err) => Err(PayloadBuilderError::from(err)),
@@ -3129,7 +3133,8 @@ where
                     // inside `setup_ms`).
                     state_after_pull = defer_state,
                     state_wait_ms,
-                    state_wait_on = state_wait_label(state_wait_ms, &state_wait_on),
+                    state_wait_us,
+                    state_wait_on = state_wait_label(state_wait_us, &state_wait_on),
                     state_wait_split = %state_wait_on.split(),
                     root_lock_wait_ms = root_split.lock_wait_ms,
                     root_lock_held_by = root_split.held_by,
@@ -3803,7 +3808,8 @@ where
             par_ms,
             state_after_pull = defer_state,
             state_wait_ms,
-            state_wait_on = state_wait_label(state_wait_ms, &state_wait_on),
+            state_wait_us,
+            state_wait_on = state_wait_label(state_wait_us, &state_wait_on),
             state_wait_split = %state_wait_on.split(),
             refused = ?crate::fast_transfer::rejected(),
             queued,

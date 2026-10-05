@@ -315,6 +315,30 @@ fn main() {
                 });
             }
 
+            // A chained build that waits for an ancestor to reach the engine is
+            // woken by the canonical chain's changes instead of polling, and the
+            // own-block layers the engine's tip has passed are released
+            // (`direct_build::engine_landed`, `leader_layers::on_canonical`).
+            {
+                let mut canonical = node.provider.subscribe_to_canonical_state();
+                n42_engine_types::direct_build::engine_landed::wire();
+                tokio::spawn(async move {
+                    let depth = n42_engine_types::direct_build::leader_layers::depth();
+                    loop {
+                        match canonical.recv().await {
+                            Ok(notification) => {
+                                n42_engine_types::direct_build::engine_landed::notify();
+                                n42_engine_types::direct_build::leader_layers::on_canonical(notification.tip().number, depth);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                n42_engine_types::direct_build::engine_landed::notify();
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+
             let consensus_signer_private_key = node_config_dev.dev.consensus_signer_private_key;
             let signer_address = if let Some(signer_private_key) = &consensus_signer_private_key {
                 let eth_signer: PrivateKeySigner = signer_private_key.to_string().parse().unwrap();

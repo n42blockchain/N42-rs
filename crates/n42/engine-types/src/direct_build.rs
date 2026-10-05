@@ -379,88 +379,127 @@ pub mod read_depth {
     );
 }
 
-/// How long [`opener_on_built_parent`] waits for the grandparent to reach the
-/// engine before giving up on the build.
+/// How long a build's open waits for an ancestor to reach the engine before
+/// giving up on it.
 ///
 /// The build chain (`N42_BUILD_CHAIN`) starts a build at its parent's early
 /// seal, which on a leader with a tenure is *before* the engine has finished
-/// importing the grandparent -- the block this node proposed one view ago.
-/// Measured on loop193 W1b: 56 of 347 refused chained builds were exactly
-/// this, and the block they named was added to the canonical chain a median
-/// of 18 ms later (p90 68, max 209). Refusing costs the whole build and the
-/// ~275 ms of lead it was for; waiting costs the wait. Bounded, because a
-/// grandparent that is not coming must end as a refusal and not as a builder
-/// thread that never returns.
+/// importing the blocks this node proposed just before. Measured on loop193
+/// W1b: 56 of 347 refused chained builds were exactly this, and the block they
+/// named was added to the canonical chain a median of 18 ms later (p90 68, max
+/// 209). Refusing costs the whole build and the ~275 ms of lead it was for;
+/// waiting costs the wait. Bounded, because an ancestor that is not coming
+/// must end as a refusal and not as a builder thread that never returns.
 const GRANDPARENT_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// How often the wait looks again.
+/// How often the wait looks again when nothing wakes it
+/// ([`engine_landed::wire`] not called: tests, a binary that does not follow
+/// the canonical chain).
 const GRANDPARENT_POLL: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// The longest a woken wait sleeps without a wake-up before it looks again
+/// anyway: a safety net for a block that became readable without a canonical
+/// notification, not the mechanism.
+const LANDED_SAFETY_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Where a build's open of its parent's state waited (`state_wait_on` on the
 /// seal-first phases line): the parent's output (`StateReady` / the shards,
-/// [`opener_on_sealed_parent`]), the state under it (the grandparent in the
-/// engine, [`state_at_soon`]), and, when the grandparent was missing while the
-/// parent finished, the parent's QMDB root and its `Complete`
-/// ([`grandparent_state`]). Kept per thread: the build's open runs on the
-/// builder's thread, which takes it before and after the open.
+/// [`opener_on_sealed_parent`]), the state under the kept layers (the anchor
+/// in the engine, [`state_at_soon`]), and, when the anchor was missing while
+/// the parent finished, the parent's QMDB root and its `Complete`
+/// ([`grandparent_state`]); and, named since loop333 (the "open" waits of
+/// `docs/SHARED_EXECUTION_SCOPE.md` 8.1), the open's own two costs: the
+/// release of the layers no longer kept (`leader_layers::keep` drops them on
+/// the build's thread) and the first look up of the anchor's state (the
+/// provider's open: in-memory lookup, database read transaction, the
+/// anchor's header). Kept per thread: the build's open runs on the builder's
+/// thread, which takes it before and after the open.
 pub mod open_wait {
     use std::cell::Cell;
 
-    /// One open's waits, in milliseconds.
+    /// One open's waits.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct OpenWait {
-        /// The parent's output filed (`built_executions::wait_for_state`).
+        /// The parent's output filed (`built_executions::wait_for_state`), ms.
         pub output_ms: u64,
-        /// The state under the parent's output (the grandparent), first look
-        /// and the bounded wait for its import.
+        /// The anchor under the kept layers (the grandparent when only the
+        /// parent is laid over the engine) not in the engine at the first
+        /// look: the bounded wait for its import, ms.
         pub grandparent_ms: u64,
-        /// How many times that wait looked again (2 ms apart).
+        /// How many times that wait looked again (woken by a canonical
+        /// notification, or every 2 ms when nothing wakes it).
         pub grandparent_polls: u32,
-        /// The grandparent still missing: the wait for the parent's QMDB root
-        /// and the look after it.
+        /// The anchor still missing: the wait for the parent's QMDB root and
+        /// the look after it, ms.
         pub parent_root_ms: u64,
-        /// Still missing: the wait for the parent's `Complete` and the look after it.
+        /// Still missing: the wait for the parent's `Complete` and the look
+        /// after it, ms.
         pub parent_complete_ms: u64,
-        /// Opens that read the grandparent from its kept layer (its shards
-        /// under its residual, or its filed bundle) over the engine's state
-        /// at the great-grandparent instead of the grandparent in the engine
-        /// (`N42_GRANDPARENT_SHARDS`, [`super::leader_layers`]).
+        /// Opens that read the grandparent (and older blocks) from kept layers
+        /// over the engine's state at a deeper anchor
+        /// (`N42_GRANDPARENT_SHARDS`, `N42_LEADER_LAYERS`,
+        /// [`super::leader_layers`]).
         pub grandparent_layer: u32,
-        /// Opens whose grandparent layer was kept but whose great-grandparent
-        /// was not yet in the engine (a stall): they fell back to the wait
-        /// for the grandparent in the engine.
+        /// Opens whose deepest anchor was not in the engine at the first look
+        /// (they waited for it, [`OpenWait::grandparent_ms`]).
         pub great_grandparent_missing: u32,
+        /// How many own blocks the open laid over the engine's state (the
+        /// parent counts: 1 is the parent alone).
+        pub layers: u32,
+        /// Whether the open had to wait for its anchor to reach the engine.
+        pub fallback: bool,
+        /// That wait, microseconds (all of it: the woken wait, the root and
+        /// `Complete` waits).
+        pub engine_wait_us: u64,
+        /// `leader_layers::keep`: keeping the parent's layer and dropping the
+        /// layers released by it, microseconds.
+        pub keep_us: u64,
+        /// The first look up of the anchor's state, microseconds.
+        pub provider_us: u64,
     }
 
     impl OpenWait {
         /// The largest of the waits, by name; `none` when every one is under
         /// a millisecond.
         pub fn label(&self) -> &'static str {
+            self.named_us()
+                .into_iter()
+                .filter(|(us, _)| *us >= 1000)
+                .max_by_key(|(us, _)| *us)
+                .map_or("none", |(_, name)| name)
+        }
+
+        /// The named waits in microseconds, by name.
+        pub fn named_us(&self) -> [(u64, &'static str); 6] {
             [
-                (self.output_ms, "output"),
-                (self.grandparent_ms, "grandparent"),
-                (self.parent_root_ms, "parent_root"),
-                (self.parent_complete_ms, "parent_complete"),
+                (self.output_ms * 1000, "output"),
+                (self.grandparent_ms * 1000, "grandparent"),
+                (self.parent_root_ms * 1000, "parent_root"),
+                (self.parent_complete_ms * 1000, "parent_complete"),
+                (self.keep_us, "layer_release"),
+                (self.provider_us, "provider_open"),
             ]
-            .into_iter()
-            .filter(|(ms, _)| *ms > 0)
-            .max_by_key(|(ms, _)| *ms)
-            .map_or("none", |(_, name)| name)
         }
 
         /// `output/grandparent/parent_root/parent_complete` in ms, then the
-        /// grandparent's polls, the opens on the grandparent's kept layer and
-        /// the great-grandparent's misses.
+        /// grandparent's polls, the opens on kept layers, the anchor misses,
+        /// the layers laid, whether the open waited for the engine, that
+        /// wait, the layer release and the anchor's first look (us).
         pub fn split(&self) -> String {
             format!(
-                "{}/{}/{}/{} polls={} gp_layer={} ggp_missing={}",
+                "{}/{}/{}/{} polls={} gp_layer={} ggp_missing={} open_layers={} open_fallback={} open_engine_us={} open_keep_us={} open_provider_us={}",
                 self.output_ms,
                 self.grandparent_ms,
                 self.parent_root_ms,
                 self.parent_complete_ms,
                 self.grandparent_polls,
                 self.grandparent_layer,
-                self.great_grandparent_missing
+                self.great_grandparent_missing,
+                self.layers,
+                self.fallback,
+                self.engine_wait_us,
+                self.keep_us,
+                self.provider_us,
             )
         }
     }
@@ -475,6 +514,11 @@ pub mod open_wait {
                 parent_complete_ms: 0,
                 grandparent_layer: 0,
                 great_grandparent_missing: 0,
+                layers: 0,
+                fallback: false,
+                engine_wait_us: 0,
+                keep_us: 0,
+                provider_us: 0,
             })
         };
     }
@@ -493,18 +537,101 @@ pub mod open_wait {
     }
 }
 
+/// A wake-up for every change of the engine's canonical chain, so a build
+/// waiting for an ancestor to become readable sleeps until it may have, not
+/// on a 2 ms poll.
+///
+/// The node calls [`notify`] from a canonical-state subscriber
+/// (`bin/n42/src/main.rs`): reth publishes the notification after the
+/// in-memory canonical state holds the new blocks, which is where
+/// `state_by_block_hash` finds them. A waiter reads the generation *before*
+/// it looks, so a landing between its look and its sleep is never missed.
+pub mod engine_landed {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Condvar, Mutex,
+    };
+    use std::time::{Duration, Instant};
+
+    static GENERATION: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
+    static WIRED: AtomicBool = AtomicBool::new(false);
+
+    /// Marks the wake-ups as delivered: waits then sleep up to
+    /// [`super::LANDED_SAFETY_SLICE`] between looks instead of polling.
+    pub fn wire() {
+        WIRED.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether [`wire`] was called.
+    pub fn wired() -> bool {
+        WIRED.load(Ordering::Relaxed)
+    }
+
+    /// The engine's canonical chain changed: wakes every waiter.
+    pub fn notify() {
+        let (count, landed) = &GENERATION;
+        let mut count = count.lock().unwrap_or_else(|p| p.into_inner());
+        *count = count.wrapping_add(1);
+        landed.notify_all();
+    }
+
+    /// The current generation, read before a look.
+    pub fn generation() -> u64 {
+        *GENERATION.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The longest sleep between two looks.
+    pub(crate) fn slice() -> Duration {
+        if wired() {
+            super::LANDED_SAFETY_SLICE
+        } else {
+            super::GRANDPARENT_POLL
+        }
+    }
+
+    /// Sleeps until the generation moves past `seen`, `slice` has passed or
+    /// `until`, whichever comes first; `true` when woken by a change.
+    pub(crate) fn wait_past(seen: u64, until: Instant, slice: Duration) -> bool {
+        let limit = until.min(Instant::now() + slice);
+        let (count, landed) = &GENERATION;
+        let mut guard = count.lock().unwrap_or_else(|p| p.into_inner());
+        while *guard == seen {
+            let now = Instant::now();
+            if now >= limit {
+                return false;
+            }
+            guard = landed.wait_timeout(guard, limit - now).unwrap_or_else(|p| p.into_inner()).0;
+        }
+        true
+    }
+}
+
 /// The state at `block`, waiting up to [`GRANDPARENT_WAIT`] for an import
 /// that is already in flight to land.
 ///
 /// Only "this node does not hold that state" is waited on; every other error
 /// is the provider saying something is wrong, and waiting would only make the
-/// build slower before it failed anyway.
+/// build slower before it failed anyway. The wait is woken by the engine's
+/// canonical notifications ([`engine_landed`]).
 fn state_at_soon<C>(client: &C, block: B256) -> ProviderResult<StateProviderBox>
 where
     C: StateProviderFactory,
 {
-    let deadline = std::time::Instant::now() + GRANDPARENT_WAIT;
+    state_when_landed(client, block, std::time::Instant::now() + GRANDPARENT_WAIT, engine_landed::slice())
+}
+
+/// [`state_at_soon`] with the deadline and the sleep between looks given.
+fn state_when_landed<C>(
+    client: &C,
+    block: B256,
+    deadline: std::time::Instant,
+    slice: std::time::Duration,
+) -> ProviderResult<StateProviderBox>
+where
+    C: StateProviderFactory,
+{
     loop {
+        let seen = engine_landed::generation();
         let err = match client.state_by_block_hash(block) {
             Ok(state) => return Ok(state),
             Err(err) => err,
@@ -515,37 +642,43 @@ where
             return Err(err);
         }
         open_wait::add(|wait| wait.grandparent_polls += 1);
-        std::thread::sleep(GRANDPARENT_POLL);
+        engine_landed::wait_past(seen, deadline, slice);
     }
 }
 
-/// The state at `grandparent` for a build on the sealed own parent filed
-/// under `built_hash`: [`state_at_soon`], and when the grandparent is still
-/// not in the engine while the parent's finish behind its seal is running,
-/// once more after the parent's QMDB root is published, and once more after
-/// that finish.
+/// The state at `anchor` -- the block under the layers a build on the sealed
+/// own parent filed under `built_hash` lays over the engine -- looked up once
+/// (timed: `provider_us`), then waited for ([`state_at_soon`]), and when the
+/// anchor is still not in the engine while the parent's finish behind its
+/// seal is running, once more after the parent's QMDB root is published, and
+/// once more after that finish.
 ///
-/// The grandparent is this node's own block, handed to the engine after its
-/// own finish, and that hand-off can be held behind the parent's finish: on
-/// loop278 IDX/IDXb and every `N42_OUTPUT_SHARDS` leg of loop276-277 the
-/// grandparent's hand-off (`own block handed to the engine as executed`,
-/// 590-640 ms) ended with the parent's slow QMDB roots (575-650 ms, every
-/// ~44 blocks), where the ordinary hand-off takes ~40 ms -- with the shards
-/// the parent's roots start at its seal, before the grandparent's hand-off
-/// is through. The 150 ms wait then refused the chained build ("no state
-/// found for block" the grandparent: 1-3 a leg on the leader, 0 on every
-/// flag-off leg) and the leader lost the view (5-6 s, then a TC).
+/// The anchor is an ancestor of this node's own blocks, handed to the engine
+/// after its own finish, and that hand-off can be held behind the parent's
+/// finish: on loop278 IDX/IDXb and every `N42_OUTPUT_SHARDS` leg of
+/// loop276-277 the grandparent's hand-off (`own block handed to the engine as
+/// executed`, 590-640 ms) ended with the parent's slow QMDB roots (575-650
+/// ms, every ~44 blocks), where the ordinary hand-off takes ~40 ms -- with
+/// the shards the parent's roots start at its seal, before the grandparent's
+/// hand-off is through. The 150 ms wait then refused the chained build ("no
+/// state found for block" the grandparent: 1-3 a leg on the leader, 0 on
+/// every flag-off leg) and the leader lost the view (5-6 s, then a TC).
 ///
 /// What held the hand-off is the QMDB forest's lock: the grandparent's rename
 /// to its sealed hash (`chain_alias::rename`) waits for the parent's root job
 /// (`compute_operations`) to let it go. So the first wait is for the parent's
 /// root, published the moment that job ends (`executed_fields`) -- which this
 /// build waits for anyway, its header carries the parent's execution
-/// (`PARENT_FIELDS_WAIT`). Only if the grandparent is still missing then does
-/// it wait for the parent's `Complete`, which since the shards' merge runs
+/// (`PARENT_FIELDS_WAIT`). Only if the anchor is still missing then does it
+/// wait for the parent's `Complete`, which since the shards' merge runs
 /// behind the root's publication (BREAKTHROUGH_DESIGN 10.16) comes ~55 ms
 /// later.
-fn grandparent_state<C>(client: &C, grandparent: B256, built_hash: B256) -> ProviderResult<StateProviderBox>
+///
+/// The anchor is the *deepest* block the open can stand on: before loop333
+/// the open that missed its great-grandparent waited for the grandparent,
+/// which the engine lands one import (60-90 ms at E=1) after it
+/// (`docs/SHARED_EXECUTION_SCOPE.md` 8.2).
+fn grandparent_state<C>(client: &C, anchor: B256, built_hash: B256) -> ProviderResult<StateProviderBox>
 where
     C: StateProviderFactory,
 {
@@ -554,39 +687,54 @@ where
     let missing = |result: &ProviderResult<StateProviderBox>| {
         matches!(result, Err(reth_storage_api::errors::ProviderError::StateForHashNotFound(_)))
     };
-    let first_at = std::time::Instant::now();
-    let first = state_at_soon(client, grandparent);
-    open_wait::add(|wait| wait.grandparent_ms += first_at.elapsed().as_millis() as u64);
-    if !missing(&first) || !finishing() {
+    let looked_at = std::time::Instant::now();
+    let first = client.state_by_block_hash(anchor);
+    open_wait::add(|wait| wait.provider_us += looked_at.elapsed().as_micros() as u64);
+    if !missing(&first) {
         return first;
+    }
+    let waited_at = std::time::Instant::now();
+    let note_wait = |wait: &mut open_wait::OpenWait| {
+        wait.fallback = true;
+        wait.great_grandparent_missing += 1;
+    };
+    open_wait::add(note_wait);
+    let soon = state_at_soon(client, anchor);
+    open_wait::add(|wait| wait.grandparent_ms += waited_at.elapsed().as_millis() as u64);
+    let done = |result: ProviderResult<StateProviderBox>| {
+        open_wait::add(|wait| wait.engine_wait_us += waited_at.elapsed().as_micros() as u64);
+        result
+    };
+    if !missing(&soon) || !finishing() {
+        return done(soon);
     }
     let at = std::time::Instant::now();
     let _ = crate::executed_fields::wait_for(&built_hash, crate::hotstuff_consensus::PARENT_FIELDS_WAIT);
-    let after_root = state_at_soon(client, grandparent);
+    let after_root = state_at_soon(client, anchor);
     let root_ms = at.elapsed().as_millis() as u64;
     open_wait::add(|wait| wait.parent_root_ms += root_ms);
     if !missing(&after_root) || !finishing() {
         tracing::info!(
             target: "payload_builder",
-            %grandparent,
+            %anchor,
             waited_ms = root_ms,
             found = after_root.is_ok(),
-            "the grandparent was not in the engine; waited for the parent's QMDB root"
+            "the anchor was not in the engine; waited for the parent's QMDB root"
         );
-        return after_root;
+        return done(after_root);
     }
     let complete_at = std::time::Instant::now();
     let _ = crate::built_executions::wait_for(built_hash, Stage::Complete);
     tracing::info!(
         target: "payload_builder",
-        %grandparent,
+        %anchor,
         root_ms,
         waited_ms = at.elapsed().as_millis() as u64,
-        "the grandparent was not in the engine; waited for the parent's QMDB root and finish"
+        "the anchor was not in the engine; waited for the parent's QMDB root and finish"
     );
-    let after_complete = state_at_soon(client, grandparent);
+    let after_complete = state_at_soon(client, anchor);
     open_wait::add(|wait| wait.parent_complete_ms += complete_at.elapsed().as_millis() as u64);
-    after_complete
+    done(after_complete)
 }
 
 /// An opener for the parent's post-state: the chain's state at the
@@ -635,24 +783,50 @@ pub fn opener_on_sealed_parent<C>(client: C, parent: SealedHeader, built_hash: B
 where
     C: StateProviderFactory + Send + Sync + 'static,
 {
-    opener_on_sealed_parent_with(client, parent, built_hash, leader_layers::enabled())
+    opener_on_sealed_parent_with(client, parent, built_hash, leader_layers::depth())
 }
 
+/// The own blocks a chained build lays over the engine's state.
+///
 /// `N42_GRANDPARENT_SHARDS` (on by default; `0` turns it off): the chained
 /// build reads its grandparent -- this node's own block two seals back --
 /// from the layer the previous chained build opened its parent on (its frozen
 /// shards under its residual, or its filed bundle), over the engine's state at
 /// the great-grandparent, instead of waiting for the grandparent to reach the
-/// engine (BREAKTHROUGH_DESIGN 10.40: that hand-off comes after the
-/// grandparent's `Complete` and through the engine's loop, and in 22% of the
-/// builds of loop293 P100 it was not there yet at the parent's seal:
-/// `state_wait` 16-35 ms on the grandparent). The follower keeps the same two
+/// engine (BREAKTHROUGH_DESIGN 10.40). The follower keeps the same two
 /// generations (`FOLLOWER_SHARDS` in `bin/n42/src/follower_import.rs`).
 ///
-/// The store holds two blocks' layers: the one a build just opened its parent
-/// on, and that parent's parent -- the layer its own child will read as the
-/// grandparent. Keeping a new parent drops every other entry, so the
-/// great-grandparent's shards are released at the child's first open.
+/// `N42_LEADER_LAYERS` (2..=4, default 2): how many own blocks a build lays
+/// over the engine -- its parent and that many minus one ancestors -- so the
+/// engine has to hold only the block below the deepest (N-3 at 2, N-4 at 3,
+/// N-5 at 4). At E=1 the engine is two to three blocks behind a build's start
+/// and three on 5-15% of starts (`docs/SHARED_EXECUTION_SCOPE.md` 8.2); one
+/// more layer covers that.
+///
+/// What a layer holds: the block under its sealed header with an empty body,
+/// its residual (the executor's own changes: fees, withdrawals, system calls)
+/// and its frozen shard set (every account the block's batches wrote, with
+/// the reverts; ~40 MB at 163,000 transfers, about 50 MB at 200,000 and 65 MB
+/// at 250,000 by the accounts a block touches), or, filed after `StateReady`,
+/// its whole bundle. All behind `Arc`s the build store and in-flight builds
+/// share; a kept layer costs memory only while nothing else holds it, which
+/// for the deepest one is about one block's shard set.
+///
+/// What bounds the count: memory (one shard set a layer), every read that no
+/// layer answers walks every layer before the engine (one more index and map
+/// lookup a layer), and depth past the engine's lag buys nothing. Nothing else
+/// in the crate is keyed on two: the follower keeps its own generations.
+///
+/// What releases a layer: [`keep`] of a newer parent (every layer that is not
+/// one of that parent's `depth - 1` nearest kept ancestors -- the oldest when
+/// the chain moves on, every layer of a branch the chain abandoned, all of
+/// them on a block that does not descend from them), and [`on_canonical`]
+/// (every layer `depth` or more blocks under the engine's canonical tip --
+/// the release after a handover, when this layer builds no more, and of an
+/// abandoned build's branch). Persistence releases nothing by itself: a
+/// persisted block was canonical first. A release is never a correctness
+/// event: a build that does not find a layer lays fewer and waits for a
+/// shallower anchor.
 pub mod leader_layers {
     use super::*;
     use std::{collections::VecDeque, sync::Mutex};
@@ -664,42 +838,128 @@ pub mod leader_layers {
 
     static KEPT: Mutex<VecDeque<Layer>> = Mutex::new(VecDeque::new());
 
+    /// The smallest and largest `N42_LEADER_LAYERS`.
+    pub const DEPTHS: std::ops::RangeInclusive<usize> = 2..=4;
+
+    /// `N42_LEADER_LAYERS` as given: the default 2 when unset, `None` when
+    /// it is not a number in [`DEPTHS`].
+    pub fn parse_depth(value: Option<&str>) -> Option<usize> {
+        match value.map(str::trim) {
+            None | Some("") => Some(2),
+            Some(v) => v.parse::<usize>().ok().filter(|d| DEPTHS.contains(d)),
+        }
+    }
+
+    /// How many own blocks a chained build lays over the engine: 1 (the
+    /// parent alone) with `N42_GRANDPARENT_SHARDS=0`, else
+    /// `N42_LEADER_LAYERS` (2 when unset; an invalid value is refused with a
+    /// warning and 2 is used).
+    pub fn depth() -> usize {
+        static DEPTH: OnceLock<usize> = OnceLock::new();
+        *DEPTH.get_or_init(|| {
+            if !enabled() {
+                return 1;
+            }
+            let value = std::env::var("N42_LEADER_LAYERS").ok();
+            parse_depth(value.as_deref()).unwrap_or_else(|| {
+                tracing::warn!(target: "payload_builder", ?value, "N42_LEADER_LAYERS must be 2, 3 or 4; using 2");
+                2
+            })
+        })
+    }
+
     /// Whether chained builds read their grandparent from its kept layer.
     pub fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var("N42_GRANDPARENT_SHARDS").map_or(true, |v| v.trim() != "0"))
     }
 
-    /// Keeps `layer` (the parent a build just opened on) and its own parent's
-    /// layer, and releases every other block's.
-    pub fn keep(layer: &Layer) {
-        let hash = layer.0.recovered_block.hash();
-        let parent_hash = layer.0.recovered_block.header().parent_hash;
+    fn hash_of(layer: &Layer) -> B256 {
+        layer.0.recovered_block.hash()
+    }
+
+    fn parent_of(layer: &Layer) -> B256 {
+        layer.0.recovered_block.header().parent_hash
+    }
+
+    fn number_of(layer: &Layer) -> u64 {
+        layer.0.recovered_block.header().number
+    }
+
+    /// Keeps `layer` (the parent a build just opened on) and its `depth - 1`
+    /// nearest kept ancestors, and releases every other block's layer. The
+    /// released layers are dropped here, after the lock; returns how many.
+    pub fn keep(layer: &Layer, depth: usize) -> usize {
+        let hash = hash_of(layer);
         let released: Vec<Layer> = {
             let mut kept = KEPT.lock().unwrap_or_else(|p| p.into_inner());
-            let (stay, released): (VecDeque<Layer>, VecDeque<Layer>) =
-                std::mem::take(&mut *kept).into_iter().partition(|(executed, _)| executed.recovered_block.hash() == parent_hash);
+            let mut all: Vec<Layer> = std::mem::take(&mut *kept).into_iter().collect();
+            let mut stay: VecDeque<Layer> = VecDeque::new();
+            let mut want = parent_of(layer);
+            while stay.len() + 1 < depth {
+                let Some(at) = all.iter().position(|l| hash_of(l) == want) else { break };
+                let ancestor = all.swap_remove(at);
+                want = parent_of(&ancestor);
+                stay.push_front(ancestor);
+            }
+            stay.push_back(layer.clone());
             *kept = stay;
-            kept.push_back(layer.clone());
-            released.into_iter().filter(|(executed, _)| executed.recovered_block.hash() != hash).collect()
+            // The same block kept again replaces its old clone: not a release.
+            all.into_iter().filter(|l| hash_of(l) != hash).collect()
         };
+        let count = released.len();
         // The released shard sets (the last reference, usually) are dropped
         // here, after the lock.
         drop(released);
+        count
+    }
+
+    /// The engine's canonical tip moved to `tip_number`: releases every layer
+    /// `depth` or more blocks under it, which no build on the canonical chain
+    /// or ahead of it lays any more (a build on a parent at or above the tip
+    /// lays blocks down to `tip - depth + 1`). Returns how many.
+    pub fn on_canonical(tip_number: u64, depth: usize) -> usize {
+        let released: Vec<Layer> = {
+            let mut kept = KEPT.lock().unwrap_or_else(|p| p.into_inner());
+            let (stay, released): (VecDeque<Layer>, VecDeque<Layer>) =
+                std::mem::take(&mut *kept).into_iter().partition(|l| number_of(l) + depth as u64 > tip_number);
+            *kept = stay;
+            released.into_iter().collect()
+        };
+        let count = released.len();
+        drop(released);
+        count
     }
 
     /// The kept layer of the block sealed as `hash`.
     pub fn find(hash: B256) -> Option<Layer> {
-        KEPT.lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .find(|(executed, _)| executed.recovered_block.hash() == hash)
-            .cloned()
+        KEPT.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|l| hash_of(l) == hash).cloned()
     }
 
-    /// How many blocks' layers are kept (at most two once the chain runs).
+    /// The kept layers of `hash` and its ancestors, newest first, at most
+    /// `count`, stopping at the first block not kept.
+    pub fn ancestors(hash: B256, count: usize) -> Vec<Layer> {
+        let kept = KEPT.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out = Vec::new();
+        let mut want = hash;
+        while out.len() < count {
+            let Some(layer) = kept.iter().find(|l| hash_of(l) == want) else { break };
+            want = parent_of(layer);
+            out.push(layer.clone());
+        }
+        out
+    }
+
+    /// How many blocks' layers are kept (at most `depth` once the chain runs).
     pub fn len() -> usize {
         KEPT.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// Releases every kept layer (tests).
+    #[cfg(test)]
+    pub(crate) fn clear() {
+        let released = std::mem::take(&mut *KEPT.lock().unwrap_or_else(|p| p.into_inner()));
+        drop(released);
     }
 
     /// `layers` (newest first) over `historical`: a block held as shards is a
@@ -726,12 +986,14 @@ pub mod leader_layers {
     }
 }
 
-/// [`opener_on_sealed_parent`] with [`leader_layers::enabled`] given.
+/// [`opener_on_sealed_parent`] with the number of own blocks to lay given
+/// (`depth`: 1 is the parent alone over the engine's grandparent, the path
+/// before `N42_GRANDPARENT_SHARDS`; see [`leader_layers::depth`]).
 fn opener_on_sealed_parent_with<C>(
     client: C,
     parent: SealedHeader,
     built_hash: B256,
-    grandparent_layers: bool,
+    depth: usize,
 ) -> ParentStateOpener
 where
     C: StateProviderFactory + Send + Sync + 'static,
@@ -740,8 +1002,9 @@ where
     // residual is laid over, when the shards came before `StateReady`.
     type Filed = leader_layers::Layer;
     let filed: Arc<OnceLock<Filed>> = Arc::new(OnceLock::new());
-    // The grandparent's kept layer, looked up once at the first open.
-    let grandparent: Arc<OnceLock<Option<Filed>>> = Arc::new(OnceLock::new());
+    // The kept ancestors' layers (newest first), looked up once at the first
+    // open, so every batch of the build reads the same stack.
+    let ancestors: Arc<OnceLock<Vec<Filed>>> = Arc::new(OnceLock::new());
     Arc::new(move || {
         let (executed, shards) = match filed.get() {
             Some(filed) => filed.clone(),
@@ -772,40 +1035,31 @@ where
             }
         };
         let parent_layer: Filed = (executed, shards);
-        let grandparent_layer = grandparent
+        let ancestors = ancestors
             .get_or_init(|| {
-                if !grandparent_layers {
-                    return None;
+                if depth < 2 {
+                    return Vec::new();
                 }
-                leader_layers::keep(&parent_layer);
-                leader_layers::find(parent.parent_hash)
+                let kept_at = std::time::Instant::now();
+                leader_layers::keep(&parent_layer, depth);
+                open_wait::add(|wait| wait.keep_us += kept_at.elapsed().as_micros() as u64);
+                leader_layers::ancestors(parent.parent_hash, depth - 1)
             })
             .clone();
-        // The grandparent from its kept layer over the engine's state at the
-        // great-grandparent (three seals back, long committed); the engine's
-        // grandparent when no layer was kept or the great-grandparent is not
-        // in the engine yet (a stall: today's wait, counted).
-        if let Some(grandparent_layer) = grandparent_layer {
-            let great_grandparent = grandparent_layer.0.recovered_block.header().parent_hash;
-            match client.state_by_block_hash(great_grandparent) {
-                Ok(historical) => {
-                    open_wait::add(|wait| wait.grandparent_layer += 1);
-                    return Ok(leader_layers::open_on(historical, &[parent_layer, grandparent_layer]));
-                }
-                Err(reth_storage_api::errors::ProviderError::StateForHashNotFound(_)) => {
-                    open_wait::add(|wait| wait.great_grandparent_missing += 1);
-                    tracing::debug!(
-                        target: "payload_builder",
-                        number = parent.number,
-                        %great_grandparent,
-                        "the great-grandparent is not in the engine; the build opens on the engine's grandparent"
-                    );
-                }
-                Err(err) => return Err(err),
-            }
+        // The kept ancestors over the engine's state under the deepest of
+        // them; the engine's grandparent when none is kept. A missing anchor
+        // is waited for (woken by the engine's canonical notifications) --
+        // the deepest one, which lands first.
+        let anchor = ancestors.last().map_or(parent.parent_hash, |deepest| deepest.0.recovered_block.header().parent_hash);
+        let historical = grandparent_state(&client, anchor, built_hash)?;
+        if !ancestors.is_empty() {
+            open_wait::add(|wait| wait.grandparent_layer += 1);
         }
-        let historical = grandparent_state(&client, parent.parent_hash, built_hash)?;
-        Ok(leader_layers::open_on(historical, &[parent_layer]))
+        let mut layers = Vec::with_capacity(ancestors.len() + 1);
+        layers.push(parent_layer);
+        layers.extend(ancestors);
+        open_wait::add(|wait| wait.layers = layers.len() as u32);
+        Ok(leader_layers::open_on(historical, &layers))
     })
 }
 
@@ -1291,7 +1545,7 @@ mod tests {
                 crate::built_executions::state_ready(built_hash, execution);
             })
         };
-        let on_seal = opener_on_sealed_parent_with(grandparent_state(), sealed.clone(), built_hash, false)()
+        let on_seal = opener_on_sealed_parent_with(grandparent_state(), sealed.clone(), built_hash, 1)()
             .expect("the parent's state opens once its output is filed");
         finish.join().expect("the finish thread");
         let ordinary = opener_on_built_parent(grandparent_state(), grandparent, executed_under_seal(&sealed, &execution))()
@@ -1306,7 +1560,7 @@ mod tests {
         assert_eq!(on_seal.block_hash(41).expect("read"), Some(sealed.hash()), "BLOCKHASH is the sealed hash");
         assert_eq!(on_seal.block_hash(41).expect("read"), ordinary.block_hash(41).expect("read"));
         // A second open (one per execution batch) reuses the filed parent.
-        let again = opener_on_sealed_parent_with(grandparent_state(), sealed, built_hash, false)().expect("opens again");
+        let again = opener_on_sealed_parent_with(grandparent_state(), sealed, built_hash, 1)().expect("opens again");
         assert_eq!(again.basic_account(&sender).expect("read").map(|a| a.nonce), Some(5));
     }
 
@@ -1350,7 +1604,7 @@ mod tests {
             built_hash,
             crate::built_executions::ShardedParent { residual: execution.execution_output.clone(), shards },
         );
-        let on_shards = opener_on_sealed_parent_with(grandparent_state(), sealed.clone(), built_hash, false)()
+        let on_shards = opener_on_sealed_parent_with(grandparent_state(), sealed.clone(), built_hash, 1)()
             .expect("the parent's state opens on its shards");
         let read = |address: Address| {
             on_shards.basic_account(&address).expect("read").map(|a| (a.nonce, a.balance))
@@ -1434,7 +1688,7 @@ mod tests {
         // The parent's build opened on the grandparent: that keeps its layer.
         // (Each open follows its filing at once: the store of builds keeps
         // three, and the crate's other tests file theirs in parallel.)
-        opener_on_sealed_parent_with(engine_at_ggp(), gp_sealed.clone(), gp_built, true)()
+        opener_on_sealed_parent_with(engine_at_ggp(), gp_sealed.clone(), gp_built, 2)()
             .expect("the grandparent's child opens");
         assert!(leader_layers::find(gp_sealed.hash()).is_some(), "the grandparent's layer is kept");
         let (p_sealed, p_built) = file(
@@ -1451,14 +1705,14 @@ mod tests {
         );
         let _ = open_wait::take();
         // The child: both layers over the engine's great-grandparent.
-        let layered = opener_on_sealed_parent_with(engine_at_ggp(), p_sealed.clone(), p_built, true)()
+        let layered = opener_on_sealed_parent_with(engine_at_ggp(), p_sealed.clone(), p_built, 2)()
             .expect("the child opens on the two layers");
         let wait = open_wait::take();
         assert_eq!((wait.grandparent_layer, wait.great_grandparent_missing), (1, 0), "{}", wait.split());
         assert_eq!(wait.grandparent_ms, 0, "the engine's grandparent was not waited for");
         assert!(leader_layers::len() <= 2, "two blocks' layers at most");
         // Today's path: the parent's shards over the engine's grandparent.
-        let direct = opener_on_sealed_parent_with(engine_at_gp(), p_sealed.clone(), p_built, false)()
+        let direct = opener_on_sealed_parent_with(engine_at_gp(), p_sealed.clone(), p_built, 1)()
             .expect("the child opens on the engine's grandparent");
 
         let read = |state: &StateProviderBox, address: Address| {
@@ -1491,8 +1745,19 @@ mod tests {
         open_wait::add(|wait| wait.parent_root_ms += 40);
         let wait = open_wait::take();
         assert_eq!(wait.label(), "grandparent");
-        assert_eq!(wait.split(), "3/150/40/0 polls=60 gp_layer=0 ggp_missing=0");
+        assert_eq!(
+            wait.split(),
+            "3/150/40/0 polls=60 gp_layer=0 ggp_missing=0 open_layers=0 open_fallback=false open_engine_us=0 open_keep_us=0 open_provider_us=0"
+        );
         assert_eq!(open_wait::take(), OpenWait::default());
+        // The open's own costs are named, in microseconds.
+        open_wait::add(|wait| wait.keep_us += 61_000);
+        open_wait::add(|wait| wait.provider_us += 900);
+        assert_eq!(open_wait::take().label(), "layer_release");
+        open_wait::add(|wait| wait.provider_us += 70_000);
+        assert_eq!(open_wait::take().label(), "provider_open");
+        open_wait::add(|wait| wait.provider_us += 999);
+        assert_eq!(open_wait::take().label(), "none", "under a millisecond is no wait");
     }
 
     // ---- helpers over a provider whose answers can be scripted ----
@@ -1783,7 +2048,7 @@ mod tests {
     fn a_missing_parent_output_refuses_the_open_at_once() {
         let _guard = store_lock();
         let parent = SealedHeader::seal_slow(Header { number: 91, extra_data: b"view 91".as_slice().into(), ..Default::default() });
-        let opener = opener_on_sealed_parent_with(Scripted::new(MockEthProvider::default()), parent.clone(), B256::with_last_byte(0x9f), false);
+        let opener = opener_on_sealed_parent_with(Scripted::new(MockEthProvider::default()), parent.clone(), B256::with_last_byte(0x9f), 1);
         let at = std::time::Instant::now();
         match opener() {
             Err(ProviderError::StateForHashNotFound(hash)) => assert_eq!(hash, parent.hash()),
@@ -1914,20 +2179,20 @@ mod tests {
         let (a, a_seal) = layer_of(201, B256::with_last_byte(0xb0), BundleState::default());
         let (b, b_seal) = layer_of(202, a_seal.hash(), BundleState::default());
         let (c, c_seal) = layer_of(203, b_seal.hash(), BundleState::default());
-        leader_layers::keep(&a);
-        leader_layers::keep(&b);
+        leader_layers::keep(&a, 2);
+        leader_layers::keep(&b, 2);
         assert!(leader_layers::find(a_seal.hash()).is_some() && leader_layers::find(b_seal.hash()).is_some());
-        leader_layers::keep(&c);
+        leader_layers::keep(&c, 2);
         assert!(leader_layers::find(a_seal.hash()).is_none(), "the great-grandparent is released");
         assert!(leader_layers::find(b_seal.hash()).is_some(), "the parent stays: it is the child's grandparent");
         assert!(leader_layers::find(c_seal.hash()).is_some());
         assert_eq!(leader_layers::len(), 2);
         // Keeping the same block again does not duplicate it.
-        leader_layers::keep(&c);
+        leader_layers::keep(&c, 2);
         assert_eq!(leader_layers::len(), 2);
         // An unrelated block (a reorg) keeps nothing of the old chain.
         let (d, d_seal) = layer_of(300, B256::with_last_byte(0xb1), BundleState::default());
-        leader_layers::keep(&d);
+        leader_layers::keep(&d, 2);
         assert_eq!(leader_layers::len(), 1);
         assert!(leader_layers::find(d_seal.hash()).is_some());
         assert!(leader_layers::find(c_seal.hash()).is_none());
@@ -1962,8 +2227,12 @@ mod tests {
         (gp, parent)
     }
 
+    /// The fallback (loop333, `docs/SHARED_EXECUTION_SCOPE.md` 8.2): a
+    /// great-grandparent not yet in the engine is waited for, and the open
+    /// then stands on it with both layers -- it no longer waits for the
+    /// grandparent, which the engine lands one import later.
     #[test]
-    fn a_great_grandparent_not_in_the_engine_falls_back_to_the_engines_grandparent() {
+    fn a_great_grandparent_not_in_the_engine_is_waited_for_with_both_layers_kept() {
         let _guard = store_lock();
         let _ = open_wait::take();
         let ggp = B256::with_last_byte(0xe0);
@@ -1974,17 +2243,29 @@ mod tests {
             mock
         };
         // The grandparent's own child opens first, which keeps the grandparent's layer.
-        opener_on_sealed_parent_with(Scripted::new(mock()), gp.0.clone(), gp.1, true)().expect("the first open");
+        opener_on_sealed_parent_with(Scripted::new(mock()), gp.0.clone(), gp.1, 2)().expect("the first open");
         assert!(leader_layers::find(gp.0.hash()).is_some());
         let _ = open_wait::take();
 
         let mut client = Scripted::new(mock());
         client.missing.insert(ggp);
-        let state = opener_on_sealed_parent_with(client, parent.0.clone(), parent.1, true)().expect("falls back");
+        // The grandparent itself is never asked for: were it, it would miss for good.
+        client.missing.insert(gp.0.hash());
+        let released = client.released.clone();
+        let lander = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            released.store(true, Ordering::SeqCst);
+            engine_landed::notify();
+        });
+        let at = std::time::Instant::now();
+        let state = opener_on_sealed_parent_with(client, parent.0.clone(), parent.1, 2)().expect("waits, then opens");
+        lander.join().expect("lander");
         let wait = open_wait::take();
-        assert_eq!((wait.grandparent_layer, wait.great_grandparent_missing), (0, 1), "{}", wait.split());
+        assert!(at.elapsed() < GRANDPARENT_WAIT, "found once it landed: {:?}", at.elapsed());
+        assert_eq!((wait.grandparent_layer, wait.great_grandparent_missing, wait.layers), (1, 1, 2), "{}", wait.split());
+        assert!(wait.fallback && wait.engine_wait_us >= 25_000, "{}", wait.split());
         assert_eq!(nonce_of(&state, Address::with_last_byte(0xd2)), Some(4), "the parent's write");
-        assert_eq!(nonce_of(&state, Address::with_last_byte(0xd1)), Some(1), "the engine's grandparent answers for the rest");
+        assert_eq!(nonce_of(&state, Address::with_last_byte(0xd1)), Some(2), "the grandparent's layer, not the engine");
     }
 
     #[test]
@@ -1992,10 +2273,10 @@ mod tests {
         let _guard = store_lock();
         let ggp = B256::with_last_byte(0xe1);
         let (gp, parent) = chain_of_two(ggp);
-        opener_on_sealed_parent_with(Scripted::new(MockEthProvider::default()), gp.0.clone(), gp.1, true)().expect("the first open");
+        opener_on_sealed_parent_with(Scripted::new(MockEthProvider::default()), gp.0.clone(), gp.1, 2)().expect("the first open");
         let mut client = Scripted::new(MockEthProvider::default());
         client.fatal.insert(ggp);
-        let result = opener_on_sealed_parent_with(client, parent.0.clone(), parent.1, true)();
+        let result = opener_on_sealed_parent_with(client, parent.0.clone(), parent.1, 2)();
         assert!(matches!(result, Err(ProviderError::UnsupportedProvider)));
     }
 
@@ -2010,9 +2291,9 @@ mod tests {
             mock.add_account(Address::with_last_byte(0xd3), ExtendedAccount::new(7, U256::from(1)));
             mock
         };
-        opener_on_sealed_parent_with(Scripted::new(mock()), gp.0.clone(), gp.1, true)().expect("the first open");
+        opener_on_sealed_parent_with(Scripted::new(mock()), gp.0.clone(), gp.1, 2)().expect("the first open");
         let _ = open_wait::take();
-        let state = opener_on_sealed_parent_with(Scripted::new(mock()), parent.0.clone(), parent.1, true)().expect("opens on both layers");
+        let state = opener_on_sealed_parent_with(Scripted::new(mock()), parent.0.clone(), parent.1, 2)().expect("opens on both layers");
         assert_eq!(open_wait::take().grandparent_layer, 1);
         assert_eq!(nonce_of(&state, Address::with_last_byte(0xd1)), Some(2), "the grandparent's layer");
         assert_eq!(nonce_of(&state, Address::with_last_byte(0xd2)), Some(4), "the parent's layer");

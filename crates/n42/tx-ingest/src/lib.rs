@@ -800,6 +800,10 @@ fn spawn_stats_reporter() {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let now = std::time::Instant::now();
+            // The queue's lanes lock and inbox drain over the same interval
+            // (`docs/SHARED_EXECUTION_SCOPE.md` 11): taken every interval so
+            // each line reports its own.
+            let lock = n42_tx_queue::take_lock_stats();
             let (frames, txs, recover, pool, busy) = (
                 STATS.frames.load(Ordering::Relaxed),
                 STATS.txs.load(Ordering::Relaxed),
@@ -889,6 +893,20 @@ fn spawn_stats_reporter() {
                     // vote road missed a proposed block's transactions
                     // (defect 17); cumulative.
                     gate_opened_for_block = GATE_OPENED_FOR_BLOCK.load(Ordering::Relaxed),
+                    // The queue's lanes lock over the interval: holds, their
+                    // share of the interval, the longest hold and where it
+                    // was taken, the longest wait; and the inbox drains under
+                    // it: how many, what they moved, mean and longest.
+                    lock_holds = lock.holds,
+                    lock_duty_pct = (lock.hold_ns as f64 / 1e9 / secs * 100.0) as u64,
+                    lock_hold_max_us = lock.hold_max_ns / 1_000,
+                    lock_hold_max_at = %lock.hold_max_at.map_or_else(String::new, |at| format!("{}:{}", at.file(), at.line())),
+                    lock_wait_max_us = lock.wait_max_ns / 1_000,
+                    lock_wait_us = lock.wait_ns / 1_000,
+                    drains = lock.drains,
+                    drain_txs = lock.drain_txs,
+                    drain_us_mean = lock.drain_ns / lock.drains.max(1) / 1_000,
+                    drain_us_max = lock.drain_max_ns / 1_000,
                     "ingest"
                 );
             }

@@ -74,7 +74,7 @@ def derive(suffix):
     run = run.replace(k2, '  local WARG=3; for kv in "$@"; do case "$kv" in F7_WINDOWS_ARG=*) WARG=${kv#*=};; esac; done\n' + k2.replace('--tag "$tag"', '--tag "$tag" --windows $WARG'))
     run = run.replace("grep -E '^win[123] '", "grep -E '^win[1-5] '")
     assert '"-p n42 --lib"; do' in run
-    run = run.replace('"-p n42 --lib"; do', '"-p n42-engine-types --lib" "-p n42 --lib"; do', 1)
+    run = run.replace('"-p n42 --lib"; do', '"-p n42-engine-types --lib -- --test-threads=1" "-p n42 --lib"; do', 1)
     open(D + f'run-loop339{suffix}.sh', 'w').write(run)
     la = open(D + 'launch-loop338.sh').read().replace('run-loop338.sh', 'run-loop339' + suffix + '.sh').replace('loop338', 'loop339' + suffix)
     open(D + f'launch-loop339{suffix}.sh', 'w').write(la)

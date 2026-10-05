@@ -12,6 +12,9 @@ pub use writer::{StaticFileProviderRW, StaticFileProviderRWRefMut};
 
 mod metrics;
 
+// N42: the transactions segment's write switches (`N42_SF_*`).
+mod n42_sf;
+
 #[cfg(test)]
 mod writer_tests;
 

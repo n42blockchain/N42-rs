@@ -501,12 +501,17 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         blocks: &[ExecutedBlock<N>],
         tx_nums: &[TxNumber],
     ) -> ProviderResult<()> {
+        // N42: `N42_SF_PARALLEL_ENCODE=1` encodes each block's rows in parallel (same bytes).
+        let parallel = super::n42_sf::parallel_encode();
         for (block, &first_tx) in blocks.iter().zip(tx_nums) {
             let b = block.recovered_block();
             w.increment_block(b.number())?;
-            for (i, tx) in b.body().transactions().iter().enumerate() {
-                w.append_transaction(first_tx + i as u64, tx)?;
-            }
+            super::n42_sf::append_block_transactions(
+                w,
+                b.body().transactions(),
+                first_tx,
+                parallel,
+            )?;
         }
         Ok(())
     }

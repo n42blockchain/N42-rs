@@ -151,6 +151,28 @@
   该行无论开关都新增 `merge_ms`、`merge_wait_ms`（交接在 join 处等了多久）、`merge_state_ms`、
   `merge_reverts_ms`、`merge_append_ms`、`merge_mode`，以前合并时长只在 debug 行里。
 
+## 出块器链式构建叠放的自建块层数（不改任何 fork 的 reth crate）:
+- `N42_LEADER_LAYERS=2|3|4`（默认 2，即原行为；其他值打印警告并按 2；`N42_GRANDPARENT_SHARDS=0`
+  时为 1，只叠父块；代码在 `crates/n42/engine-types/src/direct_build.rs` 的 `leader_layers` 与
+  `opener_on_sealed_parent_with`）：在父块封印时开始的链式构建，把父块及其最近的 `层数-1` 个自建
+  祖先（各自的冻结分片 + 残余，或 `StateReady` 后的整 bundle，均在封印哈希下）叠在引擎状态之上，
+  引擎只需持有最深一层之下的块（2 层为 N-3，3 层为 N-4，4 层为 N-5）。E=1 时引擎在构建开始时落后
+  两到三块，5-15% 的构建开始时落后四块（`docs/SHARED_EXECUTION_SCOPE.md` 8.2），多一层即可覆盖。
+  一层的内存约为一个块的分片集合（163,000 笔约 40 MB，200,000 笔约 50 MB，250,000 笔约 65 MB，
+  与构建存储和在途构建共享 `Arc`）。释放：新父块的 `keep` 释放不在其祖先链上的层（链前进时最老的、
+  被放弃构建的分支、不相关的块）；canonical 通知（`bin/n42/src/main.rs` 的订阅者调用
+  `leader_layers::on_canonical`）释放比引擎 tip 低 `层数` 块及以上的层（交接给其他执行层之后、
+  被放弃的分支）；持久化本身不释放（持久化的块先已 canonical）。释放从不影响正确性：找不到层的构建
+  少叠几层、等较浅的锚点。
+  与层数无关的修正：最深的锚点不在引擎里时，等的是这个锚点本身（先落地的那个），而不是像以前那样
+  轮询祖父块（引擎晚一次导入、60-90 ms 后才有）；等待由同一个 canonical 订阅唤醒
+  （`direct_build::engine_landed`，未接线时仍为 2 ms 轮询，接线后 20 ms 兜底），超时（150 ms，
+  再等父块 QMDB 根与 `Complete`）行为不变。`seal-first build phases` 一行新增 `state_wait_us`，
+  `state_wait_split` 新增 `open_layers`（叠放层数，含父块）、`open_fallback`（是否等了引擎）、
+  `open_engine_us`（该等待）、`open_keep_us`（`keep` 及其释放的层的析构）、`open_provider_us`
+  （锚点状态的首次查找）；`state_wait_on` 新增具名原因 `layer_release` 与 `provider_open`，
+  `open` 只剩无法归类的部分。
+
 ## 多个验证者密钥共享一个执行层（不改任何 fork 的 reth crate）:
 - `N42_IMPORT_ONCE=1`（默认关；代码在 `bin/n42/src/import_once.rs`，由 `payload_serve.rs` 的
   `OWN_BLOCK`、`COMPACT_BODY`、`FOREIGN_BODY`、`NEW_PAYLOAD` 四条导入路径使用）：按块哈希登记，

@@ -808,14 +808,6 @@ thread_local! {
     static HANDOFF_WAIT_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// The leader's last seal-first seal: the block's number and when its hook
-/// answered. A chained build on it reads the gap from there to its own
-/// entry and start (`next_start_gap_ms`, `next_entry_gap_ms`): what lies
-/// between one block's seal and the next build's first step -- the proposal,
-/// the chained request's trip and the payload service's set-up -- is on the
-/// leader's cycle but in no build's own timers (docs/BREAKTHROUGH_DESIGN.md
-/// 10.32: the cycle 132 against `sealed_at_ms` 114).
-static LAST_SEAL: std::sync::Mutex<Option<(u64, std::time::Instant)>> = std::sync::Mutex::new(None);
 
 /// What a build's `state_wait_ms` was on: the largest of the named waits
 /// ([`crate::direct_build::open_wait`]), or `open` when the rest of the wait
@@ -831,22 +823,14 @@ fn state_wait_label(total_us: u64, on: &crate::direct_build::open_wait::OpenWait
     on.label()
 }
 
+/// The leader's seal-first seal of `number`: when its hook answered. A
+/// chained build on it reads the road from there to its own entry and start
+/// (`post_seal`, `next_start_gap_ms`, `prev_seal_to_*_us`): what lies between
+/// one block's seal and the next build's first step -- the chain header's and
+/// the request's trips and the payload service's set-up -- is on the leader's
+/// cycle but in no build's own timers (docs/BREAKTHROUGH_DESIGN.md 10.32).
 fn note_sealed(number: u64) {
-    let now = std::time::Instant::now();
-    if let Ok(mut last) = LAST_SEAL.lock() {
-        *last = Some((number, now));
-    }
-}
-
-/// The gap from the seal of block `number - 1` (this process's own) to `at`,
-/// ms; 0 when the parent was not sealed here or not just before.
-fn gap_from_parent_seal(number: u64, at: std::time::Instant) -> u64 {
-    match LAST_SEAL.lock().ok().and_then(|last| *last) {
-        Some((sealed, when)) if sealed.checked_add(1) == Some(number) => {
-            at.saturating_duration_since(when).as_millis() as u64
-        }
-        _ => 0,
-    }
+    crate::post_seal::note(number, crate::post_seal::Mark::Sealed);
 }
 
 thread_local! {
@@ -949,6 +933,15 @@ where
     } = config;
 
     let parent_hash_for_state = parent_header.hash();
+    // The parent's road from its seal to this build (`post_seal`): read by
+    // this build's phases line as `prev_seal_to_*_us`. Recorded here, at
+    // the start, because the line is written long after the parent's seal
+    // has been overwritten by this block's own (`next_start_gap_ms` read 0
+    // on every build until this moved here).
+    crate::post_seal::note_at(parent_header.number, crate::post_seal::Mark::ChildStarted, build_started);
+    if let Some(entered) = own_entered {
+        crate::post_seal::note_at(parent_header.number, crate::post_seal::Mark::ChildEntered, entered);
+    }
     let open_parent_state = || -> Result<reth_storage_api::StateProviderBox, reth_storage_api::errors::ProviderError> {
         match &parent_state {
             Some(open) => open(),
@@ -1496,6 +1489,8 @@ where
     // `seal_to_*_us` stamps on the phases line (the finish behind the seal,
     // up to this block's own fields published).
     let mut sealed_instant: Option<std::time::Instant> = None;
+    // The same moment on the wall clock (`sealed_unix_us` on the line).
+    let mut sealed_unix_us = 0u64;
     // `N42_SEAL_AT_EXEC=1`: the block sealed and proposed at the parallel
     // step's end -- the payload, the block, its hash and number, and the seal's
     // timers -- for the fold and the finish that follow it.
@@ -1598,6 +1593,9 @@ where
             let payload = EthBuiltPayload::new(recovered.clone(), total_fees, None, None);
             ($hook)(payload.clone());
             sealed_instant = Some(std::time::Instant::now());
+            sealed_unix_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_micros() as u64);
             note_sealed(block_number);
             seal_hook_ms = step_at.elapsed().as_millis() as u64;
             let sealed_ms = seal_at.elapsed().as_millis() as u64;
@@ -2934,6 +2932,7 @@ where
                 };
                 let (overlay_filter_builds, overlay_filter_cached) =
                     reth_provider::providers::overlay_filter::filter_stats();
+                let prev_road = crate::post_seal::road_us(parent_header.number);
                 tracing::info!(
                     target: "payload_builder",
                     number = block_number,
@@ -3032,6 +3031,19 @@ where
                     batch_txs_min = par_batch_spans.txs_min,
                     batch_start_skew_ms = par_batch_spans.start_skew_ms,
                     batch_wait_ms = par_batch_spans.wait_ms,
+                    // The dispatch, us from the batches' hand-over to the pool:
+                    // the first and the last batch's start, the moment every
+                    // thread that ran one had started its first (two waves:
+                    // `batch_last_start_us` less this is the first wave), the
+                    // last batch's end; the batches and the threads that ran
+                    // them; `N42_BUILD_ONE_WAVE`.
+                    batch_first_start_us = par_batch_spans.first_start_us,
+                    batch_last_start_us = par_batch_spans.last_start_us,
+                    batch_dispatch_us = par_batch_spans.dispatch_us,
+                    batch_last_end_us = par_batch_spans.last_end_us,
+                    batches = par_batch_spans.batches,
+                    batch_threads = par_batch_spans.threads,
+                    one_wave = crate::parallel_transfer::build_one_wave(),
                     // `N42_PHASE_TIMERS=1`: the batch loop by section, ns of
                     // pool time a transaction (`LoopTimers`); zero when off.
                     loop_fetch_ns = par_loop_timers.per_tx(par_loop_timers.fetch_ns),
@@ -3084,8 +3096,23 @@ where
                     // before) to this build's start and to its entry into
                     // `build_on_own` (0 when not chained on an own seal):
                     // the leader's cycle outside every build's timers.
-                    next_start_gap_ms = gap_from_parent_seal(block_number, build_started),
-                    next_entry_gap_ms = own_entered.map_or(0, |at| gap_from_parent_seal(block_number, at)),
+                    next_start_gap_ms = prev_road[4] / 1_000,
+                    next_entry_gap_ms = prev_road[3] / 1_000,
+                    // The same road in microseconds, with what lies between
+                    // (`post_seal`): the parent's chain header and answer
+                    // written to the validator, this build's request read,
+                    // `build_on_own` entered, this build started, and the
+                    // parent's first import request by header (at E=1 the
+                    // leader key's, just after its proposal). 0 = not seen.
+                    prev_seal_to_header_us = prev_road[0],
+                    prev_seal_to_answer_us = prev_road[1],
+                    prev_seal_to_request_us = prev_road[2],
+                    prev_seal_to_entry_us = prev_road[3],
+                    prev_seal_to_start_us = prev_road[4],
+                    prev_seal_to_import_us = prev_road[5],
+                    // This block's seal on the wall clock, to join the
+                    // validator's `proposal sent` and `block committed` lines.
+                    sealed_unix_us,
                     // Of `par_start_ms`: the selection (`best_txs`, which on a
                     // chained build waits for the parent's queue hand-off --
                     // `start_handoff_ms` of it -- and then takes the queue's
@@ -3097,6 +3124,13 @@ where
                     start_select_ms,
                     start_walk_ms,
                     start_walk_check_ms,
+                    // Of `start_walk_ms`, us: the ids listed, the parallel
+                    // check, the takes settled; the rest of the walk is the
+                    // decisions in arrival order and the segments.
+                    start_walk_ids_us = select_times.ids_us,
+                    start_walk_check_us = select_times.check_us,
+                    start_walk_settle_us = select_times.settle_us,
+                    start_walk_us = select_times.walk_us,
                     start_pull_ms,
                     start_best_other_ms,
                     start_frames_by_ref = select_times.by_ref,

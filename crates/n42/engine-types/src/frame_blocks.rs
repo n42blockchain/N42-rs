@@ -97,6 +97,8 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
         times.select_us = took.lock_us + took.begin_us;
         times.walk_us = took.plan_us;
         times.check_us = took.check_us;
+        times.ids_us = took.ids_us;
+        times.settle_us = took.settle_us;
         times.by_ref = took.by_ref;
         times.slow = took.slow;
         if plan.frames.is_empty() {
@@ -136,6 +138,10 @@ pub struct SelectTimes {
     pub walk_us: u64,
     /// Of `walk_us`, the parallel check of the frames the gas reaches.
     pub check_us: u64,
+    /// Of `walk_us`, the live frame ids listed in arrival order.
+    pub ids_us: u64,
+    /// Of `walk_us`, the parallel part's takes applied before a serial part.
+    pub settle_us: u64,
     /// The ordinary walk's opening when no frame was usable, or the mode
     /// is off (`best_for_build`).
     pub pull_us: u64,
@@ -147,7 +153,16 @@ pub struct SelectTimes {
 
 std::thread_local! {
     static SELECT_TIMES: std::cell::Cell<SelectTimes> = const {
-        std::cell::Cell::new(SelectTimes { select_us: 0, walk_us: 0, check_us: 0, pull_us: 0, by_ref: 0, slow: 0 })
+        std::cell::Cell::new(SelectTimes {
+            select_us: 0,
+            walk_us: 0,
+            check_us: 0,
+            ids_us: 0,
+            settle_us: 0,
+            pull_us: 0,
+            by_ref: 0,
+            slow: 0,
+        })
     };
 }
 

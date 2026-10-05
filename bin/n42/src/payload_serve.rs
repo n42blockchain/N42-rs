@@ -2442,12 +2442,15 @@ where
             stream.read_exact(&mut buf).await?;
             out.clear();
             let started = std::time::Instant::now();
+            // The block's road (`post_seal`): the first key's import request.
+            let header = <alloy_consensus::Header as alloy_rlp::Decodable>::decode(&mut &buf[..]).ok();
+            if let Some(header) = &header {
+                n42_engine_types::post_seal::note_at(header.number, n42_engine_types::post_seal::Mark::FirstImport, started_at);
+            }
             // Under `N42_IMPORT_ONCE` the leader key's import of its own block
             // and every other key's request for it share one hand-off of the
             // build. The road speaks no CHECKED frame.
-            let hash = once.as_ref().and_then(|_| {
-                <alloy_consensus::Header as alloy_rlp::Decodable>::decode(&mut &buf[..]).ok().map(|h| h.hash_slow())
-            });
+            let hash = once.as_ref().and_then(|_| header.as_ref().map(alloy_consensus::Header::hash_slow));
             let owner = match gate(&mut stream, once.as_ref(), hash, false).await? {
                 Gate::Answered => continue,
                 Gate::Work(owner) => owner,
@@ -2507,8 +2510,13 @@ where
             // `N42_TAKE_COMPACT` on the proposer: the answer may leave the
             // transactions out. Read from the request's tail; a few hundred
             // bytes decoded a second time.
-            let compact_answer =
-                raw_engine::decode_build_on_own_request(&buf).is_ok_and(|request| request.compact_answer);
+            let decoded = raw_engine::decode_build_on_own_request(&buf).ok();
+            let compact_answer = decoded.as_ref().is_some_and(|request| request.compact_answer);
+            // The parent's road (`post_seal`): this request's first byte.
+            let parent_number = decoded.as_ref().map(|request| request.header.number);
+            if let Some(number) = parent_number {
+                n42_engine_types::post_seal::note_at(number, n42_engine_types::post_seal::Mark::ChildRequest, started_at);
+            }
             match build_on_own_block(reuse.as_ref(), &buf).await {
                 Ok((payload, times, chain, want_hashes)) => {
                     // The builder answers on its early seal, so the block's
@@ -2528,6 +2536,10 @@ where
                         frame.extend_from_slice(&(rlp.len() as u32).to_le_bytes());
                         frame.extend_from_slice(&rlp);
                         stream.write_all(&frame).await?;
+                        n42_engine_types::post_seal::note(
+                            payload.block().number(),
+                            n42_engine_types::post_seal::Mark::HeaderSent,
+                        );
                     }
                     // The answer: the block, or (asked for, with hashes, and
                     // no blob transaction it could not describe) the block
@@ -2544,6 +2556,7 @@ where
                     let answer_write_start_us = raw_engine::unix_micros();
                     stream.write_all(&out).await?;
                     let answer_write_end_us = raw_engine::unix_micros();
+                    n42_engine_types::post_seal::note(payload.block().number(), n42_engine_types::post_seal::Mark::AnswerSent);
                     info!(
                         target: "n42.payload_serve",
                         number = payload.block().number(),

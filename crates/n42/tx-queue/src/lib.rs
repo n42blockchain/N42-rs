@@ -3815,6 +3815,24 @@ impl<T: PoolTransaction> Inner<T> {
 }
 
 impl<T: PoolTransaction> QueueBest<T> {
+    /// A frame build's planned frames not yet handed out, all at once, in
+    /// plan order: each frame's shared transactions and the range of them
+    /// still to hand out. The iterator then offers nothing of them, and they
+    /// are not given back when it is dropped: the caller owns them, as it
+    /// owns what `next` hands it. Empty for a build that is not a frame
+    /// build.
+    ///
+    /// What lets a build take its block by frame rather than by 200,000
+    /// `next` calls on a puller thread (`N42_PULL_BY_FRAMES`); the caller
+    /// still makes its own `Arc` of each transaction, on as many threads as
+    /// it likes.
+    pub fn take_frame_segments(&mut self) -> Vec<(FrameTxs<T>, usize, usize)> {
+        if !self.frame_mode || self.frames_ended {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.segments).into_iter().collect()
+    }
+
     /// Returns a transaction taken but not built to the queue, and forgets
     /// that the build took it. The taken list ends with the buffered ones,
     /// so the search from the back is short.

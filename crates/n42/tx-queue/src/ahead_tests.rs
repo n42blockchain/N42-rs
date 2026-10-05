@@ -342,3 +342,27 @@ fn an_untake_and_a_prune_racing_a_preparation_lose_nothing() {
         assert_eq!(txs.len() + next.len() + queue.len() + foreign_unseen, total, "round {round}");
     }
 }
+
+/// A build takes its frames whole: the segments are exactly what `next`
+/// would have handed out, in order, and dropping the iterator afterwards
+/// gives nothing back.
+#[test]
+fn a_build_takes_its_frames_whole() {
+    let gas = 90 * 21_000;
+    let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+    fill(&queue, 30, 6, 5, 0);
+    let reference: TxQueue<EthPooledTransaction> = TxQueue::new();
+    fill(&reference, 30, 6, 5, 0);
+    let (mut best, plan, _) = queue.frames_for_build_ahead(block_hash(0), gas, SelectMode::Parallel, false);
+    let segments = best.take_frame_segments();
+    assert!(best.next().is_none());
+    drop(best);
+    let whole: Vec<Tx> =
+        segments.iter().flat_map(|(txs, from, to)| txs[*from..*to].iter().cloned().collect::<Vec<_>>()).collect();
+    let (mut best, _, _) = reference.frames_for_build_ahead(block_hash(0), gas, SelectMode::Parallel, false);
+    let walked: Vec<Tx> = best.by_ref().collect();
+    drop(best);
+    assert_eq!(pairs(&whole), pairs(&walked));
+    assert_eq!(whole.len(), plan.tx_count());
+    assert_eq!(queue.len(), reference.len());
+}

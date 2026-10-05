@@ -711,3 +711,93 @@ Against a BASE with the same binary (loop339's B line), append to the environmen
 
 Read `save_blocks_sf_*`, `save_blocks_scope`, `save_blocks_post_scope`, `save_blocks_total`, the batch count,
 and the in-memory block count per window.
+
+### 11.7 Receipts and account changesets under the same switches
+
+The mechanism is the same (a per-row encode and append on the segment's task, and a batch `sync_all`), so the
+two switches cover both segments; neither needs its own switch. New additive writer methods:
+`append_receipts_encoded` (shares the transactions' body: tx-number check, header range, one offset a row) and
+`append_account_changeset_entries_encoded` (appends sorted, encoded entries to a block started with
+`begin_account_changeset`, counting each row in the changeset offset, so the `.csoff` sidecar is the one
+`append_account_changeset` writes). `N42_SF_EARLY_WRITEBACK=1` kicks both data files after each block.
+
+The account changeset needed more than a parallel encode. Today's code builds a `Vec<AccountBeforeTx>` (an
+`AccountInfo` clone and conversion an entry), sorts it by address (stable) and appends. Measured on a 200k-entry
+block: building the vector 9-10 ms (page faults on ~100-byte entries), and encoding in sorted order 27 ms
+serial / 8 ms parallel (a random walk over the reverts); with `AccountInfo` cloned per row even the
+in-order parallel encode was 7-8 ms. The parallel path therefore encodes every entry in the reverts' own
+order converting by reference (`Account::from(&AccountInfo)`, the same value), 1.4 ms; sorts `(address,
+position)` keys by value, which is the stable sort by address, 2-3 ms; and gathers the encoded rows in that
+order, under 1 ms; then appends, 3 ms. The serial path is today's code unchanged.
+
+Bench (`n42_sf_seg_tests::bench_sf_receipts_changesets_batch`, five 200k blocks, release, quiet box), ms a
+block including the batch's `sync_all`:
+
+| Segment | serial (today) | parallel | parallel + writeback |
+| --- | --- | --- | --- |
+| Transactions (11.2) | 40.0 | 22.4-23.5 | **17.8-18.0** |
+| Receipts | 29.8-31.4 | 5.0-8.9 | **4.4-5.2** |
+| Account changesets | 30.5-32.2 | 12.1-13.3 | **11.4-11.6** |
+
+Tests (`static_file/n42_sf_seg_tests.rs`), both paths, every file of the segment (data, offsets, configuration,
+`.csoff`) compared byte for byte: receipts of both transaction types with and without logs and a failed status;
+changesets with unsorted addresses, created accounts (`None`) and every 1,000th address repeated in a second
+transition with another value (the sort's stability is part of the bytes); rows read back through the unmodified
+`receipt` and `account_block_changeset`; both paths mixed in either order across a provider reopen; an unwind
+(`prune_receipts`, `prune_account_changesets` of two blocks) and rewrite; a crash after `sync_all` without the
+configuration, healed at the next open (the changeset sidecar included).
+
+**The other segments.** Senders, headers and storage changesets append through the same
+`NippyJarWriter::append_column` into the same 8 KiB `BufWriter`. Senders: 200k 20-byte rows a block, ~10 ms
+on the fleet (loop338 B); the encode is a 20-byte copy, so a parallel encode buys nothing and the cost is the
+per-row path (timer, tx-number check, buffered copy, ~500 `write(2)` a block): only the nippy-jar bulk append
+below, or `--prune.sender-recovery.full`, takes it. Headers: one row of three LZ4-compressed columns a block,
+under 0.1 ms. Storage changesets: the account changeset's shape, but empty on transfer blocks; on a contract
+chain the same gather path would apply (not built).
+
+**Per full 200k block with every switch on (estimate, fleet).** Scaling each bench figure by its own
+fleet/bench ratio for the serial path (transactions 50/40, receipts 20/30, changesets 17/31): transactions
+~22 ms, senders ~10 (unchanged), account changesets ~6, receipts ~3.5, `qmdb_persisted` ~9 when in scope
+(`N42_PERSIST_QMDB_IN_SCOPE=1`). **The transactions task stays the longest**, with senders next at about
+half of it. Serial outside the scope: before it `tx_nums` and the write contexts (well under 1 ms) and the
+`to_plain_state_reverts` conversion (`plain_reverts`, 2.5 ms a full block, `par_iter` on the global pool);
+after it `qmdb_persisted` unless it is in scope (9 ms); then the commit (static-file `finalize`, one atomic
+configuration write a segment, ~1.3 ms a batch; MDBX 0.2 ms; RocksDB 0.1 ms with the history index off).
+Nothing else. **Floor: ~22 + 2.5 + 0.4 = ~25 ms a full block** (the earlier ~26 ms estimate, now with the
+changeset and receipt tasks well below the transactions task); ~34 ms if the QMDB callback stays after the
+scope. With the nippy-jar change below the transactions task would fall to ~10-12 ms and the floor would be
+`max(senders ~10, QMDB ~9, transactions ~11) + 3`, about 14 ms.
+
+### 11.8 The upstream change `reth-nippy-jar` needs (not vendored; to propose or vendor later)
+
+What remains of every per-row segment is `NippyJarWriter::append_column` per row: a `BufWriter<File>` built with
+`BufWriter::new` (8 KiB) flushes every ~44 transaction rows (~4,500 `write(2)` a 200k block), and every row pushes
+one offset. Measured: 200k pre-encoded transaction rows take 12.5-13 ms to append against 3.8 ms for one
+`write_all` of the same 37 MB. Patch description for `crates/storage/nippy-jar/src/writer.rs` (v2.7.0), bytes
+on disk unchanged:
+
+1. **A larger data buffer.** `NippyJarWriter::new` and the consistency checker that reopens files
+   (`consistency.rs`, which builds the writer's `BufWriter`s) use `BufWriter::with_capacity(DATA_BUFFER, file)`
+   with `DATA_BUFFER = 1 << 20` for the data file (the offsets file can stay at 8 KiB or take the same). Alone
+   this cuts the syscalls 128-fold; the per-row `write_all` into the buffer stays (a ~200-byte memcpy).
+2. **A bulk append for single-column jars**:
+   ```rust
+   /// Appends `lens.len()` rows of a single-column, uncompressed jar whose values are
+   /// concatenated in `values`. Equivalent to one `append_column(Some(Ok(value)))` a row.
+   pub fn append_column_values(&mut self, values: &[u8], lens: &[u32]) -> Result<(), NippyJarError>
+   ```
+   Preconditions checked with an error: `self.jar.columns == 1`, `self.jar.compressor.is_none()` (otherwise
+   fall back to the per-row loop), `self.column == 0`, and `sum(lens) == values.len()`. Body: `dirty = true`;
+   if `offsets` is empty push `data_file.stream_position()?`; push `last + len` for each length; one
+   `data_file.write_all(values)` (larger than the buffer, so `BufWriter` passes it straight to the file);
+   `jar.rows += lens.len()`; `jar.max_row_size = max(jar.max_row_size, max(lens))`. On error nothing is
+   committed (the offsets live in memory until `commit_offsets`, the data past the configured row count is
+   healed away at the next open, as today).
+3. Use: `StaticFileProviderRW::{append_transactions_encoded, append_receipts_encoded,
+   append_account_changeset_entries_encoded}` call it with a chunk's rows instead of their per-row loop (the
+   tx-range and changeset-offset bookkeeping stay where they are), and the senders task can lay out its 20-byte
+   rows in one buffer and do the same. Transactions, receipts, senders and both changeset segments are
+   single-column and uncompressed; headers (three columns, LZ4) keep the per-row path.
+
+Expected (estimate from the measurements above): the transactions append 13 to ~4-5 ms a block, senders 10 to
+~2-3, receipts and changesets 3 ms less each.

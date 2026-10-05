@@ -55,11 +55,12 @@ def log_blocks(path):
 
 
 def first_full(path, min_txs, wait):
-    """Epoch of the first full canonical block after now (the flood's first block); now when none appears in `wait` s."""
+    """Epoch of the flood's first full canonical block (looked for from 60 s before the call: the first block can land before this
+    process has started; nothing full precedes a flood); now when none appears within `wait` s."""
     since = time.time()
     while time.time() - since < wait:
         for when, _, txs, _, _ in log_blocks(path):
-            if when >= since - 1 and txs >= min_txs:
+            if when >= since - 60 and txs >= min_txs:
                 return when
         time.sleep(1)
     return time.time()

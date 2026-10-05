@@ -162,6 +162,8 @@ pub struct BatchSpan {
     pub cpu_us: u64,
     /// Transactions in the batch.
     pub txs: usize,
+    /// The pool thread that ran it (`usize::MAX` off the pool).
+    pub thread: usize,
 }
 
 impl BatchSpan {
@@ -171,6 +173,7 @@ impl BatchSpan {
             end_us: batches_at.elapsed().as_micros() as u64,
             cpu_us: thread_cpu_ns().saturating_sub(cpu_start) / 1000,
             txs,
+            thread: rayon::current_thread_index().unwrap_or(usize::MAX),
         }
     }
 }
@@ -196,6 +199,22 @@ pub struct BatchSpans {
     /// The batches' start to the first batch's start, plus the last batch's
     /// end to the batches' end.
     pub wait_ms: u64,
+    /// How many batches ran.
+    pub batches: usize,
+    /// How many distinct pool threads ran them.
+    pub threads: usize,
+    /// The first batch's start, microseconds after the batches' start (the
+    /// hand-over to the pool).
+    pub first_start_us: u64,
+    /// The last batch's start, microseconds after the batches' start.
+    pub last_start_us: u64,
+    /// The last batch's end, microseconds after the batches' start.
+    pub last_end_us: u64,
+    /// The dispatch: microseconds after the batches' start by which every
+    /// thread that ran a batch had started its first one. With at most one
+    /// batch a thread (`N42_BUILD_ONE_WAVE=1`) this equals `last_start_us`;
+    /// with two waves, `last_start_us` less this is the first wave's length.
+    pub dispatch_us: u64,
 }
 
 impl BatchSpans {
@@ -209,8 +228,25 @@ impl BatchSpans {
         let first_start = spans.iter().map(|s| s.start_us).min().unwrap_or(0);
         let last_start = spans.iter().map(|s| s.start_us).max().unwrap_or(0);
         let last_end = spans.iter().map(|s| s.end_us).max().unwrap_or(0);
+        // Each thread's first start; the latest of those is when the last
+        // thread got going.
+        let mut first_by_thread: Vec<(usize, u64)> = Vec::with_capacity(spans.len());
+        for span in spans.iter() {
+            match first_by_thread.iter_mut().find(|(thread, _)| *thread == span.thread) {
+                Some((_, first)) => *first = (*first).min(span.start_us),
+                None => first_by_thread.push((span.thread, span.start_us)),
+            }
+        }
+        let dispatch_us = first_by_thread.iter().map(|(_, first)| *first).max().unwrap_or(0);
+        let (batches, threads) = (spans.len(), first_by_thread.len());
         spans.sort_unstable_by_key(wall);
         Self {
+            batches,
+            threads,
+            first_start_us: first_start,
+            last_start_us: last_start,
+            last_end_us: last_end,
+            dispatch_us,
             max_ms: wall(&slowest) / 1000,
             min_ms: wall(&spans[0]) / 1000,
             median_ms: wall(&spans[spans.len() / 2]) / 1000,
@@ -1085,6 +1121,50 @@ pub fn batch_groups(groups: &[Vec<usize>], total: usize, workers: usize) -> Vec<
         if filled >= per_batch {
             batches.push(std::mem::take(&mut current));
             filled = 0;
+        }
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// `N42_BUILD_ONE_WAVE=1`: the build's batches are one per pool thread at
+/// most ([`batch_groups_one_wave`]) and handed to the pool all at once
+/// ([`execute_for_build`]'s spawn per batch), instead of up to two a thread
+/// split recursively. With two a thread the second wave starts only when a
+/// first-wave batch ends: on loop334 (200,000 transfers, 400 sender runs of
+/// 500, 32 threads, 58 batches) `batch_start_skew_ms` tracked
+/// `batch_median_ms` + 2-3 ms (correlation 0.96), and the execution was two
+/// batches long. Batches are still whole sender groups in candidate order,
+/// as with a pool of a different size; the block's state, receipts and gas
+/// are the same either way. Off by default.
+pub fn build_one_wave() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILD_ONE_WAVE").is_ok_and(|v| v == "1"))
+}
+
+/// Whole groups packed into at most `workers` batches, in group order, each
+/// ending at the first group that takes the running count past its share
+/// (`k x total / batches`): every batch holds about `total / workers`
+/// transfers, at most one group more. Fewer batches than `workers` when
+/// there are fewer groups.
+pub fn batch_groups_one_wave(groups: &[Vec<usize>], total: usize, workers: usize) -> Vec<Vec<&Vec<usize>>> {
+    let wanted = workers.max(1).min(groups.len().max(1));
+    let mut batches: Vec<Vec<&Vec<usize>>> = Vec::with_capacity(wanted);
+    let mut current: Vec<&Vec<usize>> = Vec::new();
+    let mut filled = 0usize;
+    let mut boundary = 1usize;
+    for group in groups {
+        current.push(group);
+        filled += group.len();
+        // The k-th batch closes once the running count reaches k / wanted of
+        // the total (integer arithmetic, rounded up, so no empty batch).
+        if boundary < wanted && filled.saturating_mul(wanted) >= boundary.saturating_mul(total) {
+            batches.push(std::mem::take(&mut current));
+            while boundary < wanted && filled.saturating_mul(wanted) >= boundary.saturating_mul(total) {
+                boundary += 1;
+            }
         }
     }
     if !current.is_empty() {
@@ -3227,7 +3307,28 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set)
+    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, build_one_wave())
+}
+
+/// [`execute_for_build_in_place`] with the dispatch chosen by the caller
+/// rather than `N42_BUILD_ONE_WAVE`: for tests that compare both in one
+/// process.
+#[doc(hidden)]
+pub fn execute_for_build_dispatch<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    on_bundle: Option<&(dyn Fn(BundleState) + Sync)>,
+    in_place: bool,
+    one_wave: bool,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, read_set(), one_wave)
 }
 
 fn execute_for_build_run<T, G>(
@@ -3244,7 +3345,7 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set())
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), build_one_wave())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3257,6 +3358,7 @@ fn execute_for_build_opts<T, G>(
     in_place: bool,
     before_batches: Option<&mut dyn FnMut() -> bool>,
     with_read_set: bool,
+    one_wave: bool,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
@@ -3274,7 +3376,8 @@ where
     // own view of the parent, which is not free.
     let pool = build_pool();
     let workers = pool.current_num_threads().max(1);
-    let batches = batch_groups(&groups, keys.len(), workers);
+    let batches =
+        if one_wave { batch_groups_one_wave(&groups, keys.len(), workers) } else { batch_groups(&groups, keys.len(), workers) };
     phases.batches = batches.len();
     phases.partition_ms = at.elapsed().as_millis() as u64;
     if let Some(hook) = before_batches
@@ -3310,99 +3413,116 @@ where
     // Each batch's span on the pool, against this instant (`BatchSpans`).
     let batches_at = std::time::Instant::now();
     phases.batches_start_us = batches_at.duration_since(call_at).as_micros() as u64;
-    let results: Vec<Result<BatchResult, NotParallel>> = pool.install(|| {
-        use rayon::prelude::*;
-        batches
-            .par_iter()
-            .map(|members| {
-                let start_us = batches_at.elapsed().as_micros() as u64;
-                let cpu_start = thread_cpu_ns();
-                let txs = members.iter().map(|group| group.len()).sum::<usize>();
-                let mut sampler = LoopSampler::new();
-                let setup_at = sampler.on.then(std::time::Instant::now);
-                let db = ReadSetDb::new(read_set_ref, open().ok_or(NotParallel::NoState)?);
-                // A sender, a recipient a transfer and the beneficiary, sized
-                // once: growing from empty rehashed the map a dozen times a
-                // batch.
-                let mut state = crate::batch_state::BatchState::with_capacity(db, txs + txs / 4 + 1);
-                let mut skipped = Vec::new();
-                let mut setup_ns = 0;
-                let close_at;
-                {
-                    let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
-                    if let Some(at) = setup_at {
-                        setup_ns = at.elapsed().as_nanos() as u64;
-                    }
-                    for group in members {
-                        let mut rest = group.iter();
-                        for &i in rest.by_ref() {
-                            // `N42_PHASE_TIMERS=1`: one transaction in
-                            // `LOOP_SAMPLE_STRIDE` timed by section.
-                            let timed = sampler.begin();
-                            let mark = || timed.then(std::time::Instant::now);
-                            let t0 = mark();
-                            // Converted here, on the batch's thread: the
-                            // conversion of a full block was 55-100 ms of
-                            // the builder's own thread otherwise.
-                            let (tx, env) = convert(i);
-                            let t1 = mark();
-                            match evm.transfer_plain(&env) {
-                                Ok(Some((plain, result))) => {
-                                    let t2 = mark();
-                                    let gas_used = result.gas_used();
-                                    let t3 = mark();
-                                    // Straight into the batch's state, no
-                                    // `EvmState` built (`BatchState`).
-                                    evm.db_mut().commit_transfer(plain).map_err(|err| NotParallel::Failed(i, err.to_string()))?;
-                                    let t4 = mark();
-                                    if slots_ref[i].set(BuiltTransfer { index: i, tx, result, gas_used }).is_err() {
-                                        return Err(NotParallel::Failed(i, "executed twice".to_string()));
-                                    }
-                                    if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4)) = (t0, t1, t2, t3, t4) {
-                                        sampler.record(&[t0, t1, t1, t2, t2, t3, t4, std::time::Instant::now()]);
-                                    }
-                                }
-                                Ok(None) => {
-                                    // The sender's later transfers would only
-                                    // fail their nonce check: skipped unrun.
-                                    skipped.push(i);
-                                    break;
-                                }
-                                Err(err) => return Err(NotParallel::Failed(i, err.to_string())),
+    let run_batch = |members: &Vec<&Vec<usize>>| -> Result<BatchResult, NotParallel> {
+        let start_us = batches_at.elapsed().as_micros() as u64;
+        let cpu_start = thread_cpu_ns();
+        let txs = members.iter().map(|group| group.len()).sum::<usize>();
+        let mut sampler = LoopSampler::new();
+        let setup_at = sampler.on.then(std::time::Instant::now);
+        let db = ReadSetDb::new(read_set_ref, open().ok_or(NotParallel::NoState)?);
+        // A sender, a recipient a transfer and the beneficiary, sized
+        // once: growing from empty rehashed the map a dozen times a
+        // batch.
+        let mut state = crate::batch_state::BatchState::with_capacity(db, txs + txs / 4 + 1);
+        let mut skipped = Vec::new();
+        let mut setup_ns = 0;
+        let close_at;
+        {
+            let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
+            if let Some(at) = setup_at {
+                setup_ns = at.elapsed().as_nanos() as u64;
+            }
+            for group in members {
+                let mut rest = group.iter();
+                for &i in rest.by_ref() {
+                    // `N42_PHASE_TIMERS=1`: one transaction in
+                    // `LOOP_SAMPLE_STRIDE` timed by section.
+                    let timed = sampler.begin();
+                    let mark = || timed.then(std::time::Instant::now);
+                    let t0 = mark();
+                    // Converted here, on the batch's thread: the
+                    // conversion of a full block was 55-100 ms of
+                    // the builder's own thread otherwise.
+                    let (tx, env) = convert(i);
+                    let t1 = mark();
+                    match evm.transfer_plain(&env) {
+                        Ok(Some((plain, result))) => {
+                            let t2 = mark();
+                            let gas_used = result.gas_used();
+                            let t3 = mark();
+                            // Straight into the batch's state, no
+                            // `EvmState` built (`BatchState`).
+                            evm.db_mut().commit_transfer(plain).map_err(|err| NotParallel::Failed(i, err.to_string()))?;
+                            let t4 = mark();
+                            if slots_ref[i].set(BuiltTransfer { index: i, tx, result, gas_used }).is_err() {
+                                return Err(NotParallel::Failed(i, "executed twice".to_string()));
+                            }
+                            if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4)) = (t0, t1, t2, t3, t4) {
+                                sampler.record(&[t0, t1, t1, t2, t2, t3, t4, std::time::Instant::now()]);
                             }
                         }
-                        skipped.extend(rest.copied());
-                    }
-                    close_at = sampler.on.then(std::time::Instant::now);
-                }
-                let bundle = state.take_bundle();
-                // Drained here, on the batch's own thread, right after its
-                // transfers are done: `N42_PHASE_TIMERS=1` only (see
-                // `fast_transfer::drain_timers`; zero and free otherwise). An
-                // error path above returns before this and leaves whatever it
-                // accumulated for a later call on this thread to drain --
-                // rare (`NotParallel`, which sends the whole block to the
-                // serial executor) and diagnostic-only.
-                let timers = crate::fast_transfer::drain_timers();
-                match on_bundle {
-                    // Folded into the staged graft here, on this batch's
-                    // thread: the work is off the builder's chain, and the
-                    // sink's lock only ever holds one batch at a time.
-                    Some(sink) => {
-                        sink(bundle);
-                        let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
-                        let span = BatchSpan::close(start_us, cpu_start, txs, batches_at);
-                        Ok((skipped, None, timers, span, sampler.finish(setup_ns, close_ns)))
-                    }
-                    None => {
-                        let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
-                        let span = BatchSpan::close(start_us, cpu_start, txs, batches_at);
-                        Ok((skipped, Some(bundle), timers, span, sampler.finish(setup_ns, close_ns)))
+                        Ok(None) => {
+                            // The sender's later transfers would only
+                            // fail their nonce check: skipped unrun.
+                            skipped.push(i);
+                            break;
+                        }
+                        Err(err) => return Err(NotParallel::Failed(i, err.to_string())),
                     }
                 }
-            })
+                skipped.extend(rest.copied());
+            }
+            close_at = sampler.on.then(std::time::Instant::now);
+        }
+        let bundle = state.take_bundle();
+        // Drained here, on the batch's own thread, right after its
+        // transfers are done: `N42_PHASE_TIMERS=1` only (see
+        // `fast_transfer::drain_timers`; zero and free otherwise). An
+        // error path above returns before this and leaves whatever it
+        // accumulated for a later call on this thread to drain --
+        // rare (`NotParallel`, which sends the whole block to the
+        // serial executor) and diagnostic-only.
+        let timers = crate::fast_transfer::drain_timers();
+        match on_bundle {
+            // Folded into the staged graft here, on this batch's
+            // thread: the work is off the builder's chain, and the
+            // sink's lock only ever holds one batch at a time.
+            Some(sink) => {
+                sink(bundle);
+                let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
+                let span = BatchSpan::close(start_us, cpu_start, txs, batches_at);
+                Ok((skipped, None, timers, span, sampler.finish(setup_ns, close_ns)))
+            }
+            None => {
+                let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
+                let span = BatchSpan::close(start_us, cpu_start, txs, batches_at);
+                Ok((skipped, Some(bundle), timers, span, sampler.finish(setup_ns, close_ns)))
+            }
+        }
+    };
+    let results: Vec<Result<BatchResult, NotParallel>> = if one_wave {
+        // Every batch spawned at once onto the pool (one job each, taken by
+        // whichever thread is free), not split in halves from one thread:
+        // the batches start as fast as the threads pick them up, and the
+        // results are read back in batch order as before.
+        let mut slots: Vec<Option<Result<BatchResult, NotParallel>>> = (0..batches.len()).map(|_| None).collect();
+        let run_batch = &run_batch;
+        pool.scope(|scope| {
+            for (slot, members) in slots.iter_mut().zip(batches.iter()) {
+                scope.spawn(move |_| *slot = Some(run_batch(members)));
+            }
+        });
+        slots
+            .into_iter()
+            .enumerate()
+            .map(|(i, slot)| slot.unwrap_or_else(|| Err(NotParallel::Failed(i, "a batch did not run".to_string()))))
             .collect()
-    });
+    } else {
+        pool.install(|| {
+            use rayon::prelude::*;
+            batches.par_iter().map(run_batch).collect()
+        })
+    };
     let batches_us = batches_at.elapsed().as_micros() as u64;
     phases.batches_end_us = call_at.elapsed().as_micros() as u64;
     phases.groups_ms = at.elapsed().as_millis() as u64;
@@ -5488,6 +5608,135 @@ mod tests {
         assert_eq!(phases.read_set.unresolved, 0);
         assert!(phases.read_set_hits > 0);
         assert_eq!(phases.read_set_misses, 0, "every account a transfer reads is in the set");
+    }
+
+    /// `N42_BUILD_ONE_WAVE=1`: one batch a thread at most, spawned at once,
+    /// runs the block the default dispatch does -- the same transfers, gas,
+    /// skips, grafted state and reverts, and through the output shards the
+    /// same merged bundle -- on blocks of sender runs (the bench's shape), of
+    /// interleaved senders, and of recipients many senders share.
+    #[test]
+    fn the_one_wave_dispatch_equals_the_default_one() {
+        let threads = build_pool().current_num_threads();
+        // Sender runs of 50 (frames), runs of 1, and a shared recipient
+        // space of 2,000 addresses.
+        for (senders, per, space, run) in [(400u64, 50u64, 0u64, 50usize), (300, 30, 0, 1), (200, 40, 2_000, 7)] {
+            let (block, db) = random_fixture(senders, per, space, run, 5);
+            let evm_config =
+                crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+            let evm_env = evm_config.evm_env(block.header()).expect("env");
+            let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
+            let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
+            let beneficiary = evm_env.block_env.beneficiary;
+            let convert = |i: usize| ((), envs[i].clone());
+            let accounts_of = |bundle: &BundleState| -> std::collections::BTreeMap<Address, _> {
+                bundle.state.iter().map(|(a, acc)| (*a, (acc.info.clone(), acc.original_info.clone(), acc.status))).collect()
+            };
+            let reverts_of = |bundle: &BundleState| -> std::collections::BTreeMap<Address, _> {
+                bundle.reverts.iter().flatten().cloned().collect()
+            };
+            // What the header commits to: the QMDB operations the state root
+            // is computed from, and the gov5 receipts root and bloom over the
+            // receipts in block order.
+            let state_ops_of = |bundle: &BundleState| n42_qmdb_reth::sorted_operations_from_execution(bundle, true).to_operations();
+            let receipts_root_of = |executed: &[(usize, u64, bool)]| {
+                let mut cumulative = 0u64;
+                let receipts: Vec<Receipt> = executed
+                    .iter()
+                    .map(|(_, gas, success)| {
+                        cumulative += gas;
+                        Receipt {
+                            tx_type: n42_tx_types::N42TxType::Eth(alloy_consensus::TxType::Eip1559),
+                            success: *success,
+                            cumulative_gas_used: cumulative,
+                            logs: Vec::new(),
+                        }
+                    })
+                    .collect();
+                (crate::hotstuff_consensus::gov5_receipt_root_bloom(&receipts), cumulative)
+            };
+            // The grafted path: bundles back, slots in place.
+            let grafted = |one_wave: bool| {
+                let run = execute_for_build_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), None, true, one_wave)
+                    .expect("a block of transfers");
+                let executed: Vec<(usize, u64, bool)> = run
+                    .slots
+                    .iter()
+                    .filter_map(std::sync::OnceLock::get)
+                    .map(|b| (b.index, b.gas_used, b.result.is_success()))
+                    .collect();
+                let spans = run.phases.batch_spans;
+                let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();
+                let graft = graft_bundles(&mut state, run.bundles, beneficiary).unwrap();
+                state.merge_transitions(BundleRetention::Reverts);
+                let mut bundle = state.take_bundle();
+                append_reverts(&mut bundle, graft.reverts);
+                let roots = (state_ops_of(&bundle), receipts_root_of(&executed));
+                (executed, run.skipped, graft.beneficiary_delta, accounts_of(&bundle), reverts_of(&bundle), spans, roots)
+            };
+            let two = grafted(false);
+            let one = grafted(true);
+            assert_eq!(two.0.len(), keys.len(), "every transfer ran");
+            assert_eq!(two.0, one.0, "executed transfers, in block order, with their gas");
+            assert_eq!(two.1, one.1, "skipped");
+            assert_eq!(two.2, one.2, "beneficiary delta");
+            assert_eq!(two.3, one.3, "grafted accounts");
+            assert_eq!(two.4, one.4, "reverts");
+            assert!(!two.6.0.is_empty());
+            assert_eq!(two.6.0, one.6.0, "the state root's operations");
+            assert_eq!(two.6.1, one.6.1, "the receipts root, bloom and gas");
+            assert!(one.5.batches <= threads, "one batch a thread at most: {} on {threads}", one.5.batches);
+            assert!(one.5.threads >= 1 && one.5.threads <= one.5.batches);
+            assert!(one.5.dispatch_us <= one.5.last_start_us && one.5.first_start_us <= one.5.dispatch_us);
+            assert!(one.5.last_end_us >= one.5.last_start_us);
+
+            // The output shards' path (the leader's on the bench), merged.
+            let sharded = |one_wave: bool| {
+                let shards = crate::output_shards::OutputShards::with_index_live(beneficiary, keys.len(), 16, true, true);
+                let sink = |bundle: BundleState| shards.add(bundle);
+                let run = execute_for_build_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), Some(&sink), true, one_wave)
+                    .expect("a block of transfers");
+                let executed: Vec<(usize, u64, bool)> = run
+                    .slots
+                    .iter()
+                    .filter_map(std::sync::OnceLock::get)
+                    .map(|b| (b.index, b.gas_used, b.result.is_success()))
+                    .collect();
+                let frozen = shards.freeze();
+                let merged = frozen.merged(&BundleState::default());
+                let receipts = receipts_root_of(&executed);
+                (receipts, run.skipped, frozen.beneficiary_delta(), accounts_of(&merged), reverts_of(&merged), state_ops_of(&merged))
+            };
+            let two = sharded(false);
+            let one = sharded(true);
+            assert!(two.0.1 > 0);
+            assert_eq!(two, one, "the shards merge to the same bundle, state operations and receipts either way");
+        }
+    }
+
+    /// The one-wave packing: whole groups in order, at most `workers`
+    /// batches, each within one group of an even share.
+    #[test]
+    fn the_one_wave_packing_is_even_and_in_order() {
+        for (groups, size, workers) in [(400usize, 500usize, 32usize), (400, 500, 16), (7, 3, 32), (1, 10, 8), (33, 1, 32), (1000, 1, 3)] {
+            let all: Vec<Vec<usize>> = (0..groups).map(|g| (g * size..(g + 1) * size).collect()).collect();
+            let total = groups * size;
+            let batches = batch_groups_one_wave(&all, total, workers);
+            assert!(batches.len() <= workers.min(groups), "{groups} groups on {workers}: {} batches", batches.len());
+            assert!(batches.iter().all(|b| !b.is_empty()));
+            let flat: Vec<usize> = batches.iter().flatten().flat_map(|g| g.iter().copied()).collect();
+            assert_eq!(flat, (0..total).collect::<Vec<_>>(), "every group once, in order");
+            let share = total.div_ceil(batches.len().max(1));
+            let largest = batches.iter().map(|b| b.iter().map(|g| g.len()).sum::<usize>()).max().unwrap_or(0);
+            assert!(largest <= total.div_ceil(workers.min(groups)) + size, "largest {largest}, share {share}");
+        }
+        // The bench's block: 400 runs of 500 on 32 threads, 32 batches of
+        // 6,000-6,500 where the default packs 58 of 3,500 and 500.
+        let all: Vec<Vec<usize>> = (0..400).map(|g| (g * 500..(g + 1) * 500).collect()).collect();
+        let one = batch_groups_one_wave(&all, 200_000, 32);
+        assert_eq!(one.len(), 32);
+        assert!(one.iter().all(|b| (6_000..=6_500).contains(&b.iter().map(|g| g.len()).sum::<usize>())));
+        assert_eq!(batch_groups(&all, 200_000, 32).len(), 58);
     }
 
     /// A read set answers exactly its members, absent accounts as absent,

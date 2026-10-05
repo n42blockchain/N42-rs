@@ -550,3 +550,164 @@ correctness; the residual risk is that above 64 something else is also depth-bou
 path is still O(depth) probes per missing account, and the heap still grows ~150 MB a block), so a node
 far behind would degrade gently instead of falling off the cliff, and the follower throttle remains the
 backstop if a leg shows that.
+
+## 11. Static files on the critical path (2026-10-05)
+
+With the account-history index off, the E=1 layer's batch is the static-file scope, and inside it the
+`Transactions` segment task (`docs/SHARED_EXECUTION_SCOPE.md` 12.5: loop338 B, `sf_transactions` 69.7 s
+over 1,384 full blocks = **50 ms a full block**, 175 ms a batch of 4.7 blocks; `sf_receipts` 20, `sf_account_changesets`
+17, `sf_senders` 10, then `qmdb_persisted` 9-12 serial after the scope and `plain_reverts` 2.5 before it). This
+section takes the segment apart from the code and a microbenchmark, and adds two switches.
+
+### 11.1 What the segment does
+
+`StaticFileProvider::write_blocks_data` spawns one task a segment on the storage pool (`write_segment`), so
+the segments run beside each other and each ends in its own `sync_all`; the slowest sets the scope. The
+transactions task (`manager.rs` `write_transactions`) does, per block, `increment_block` and then for every
+transaction `append_transaction` (`static_file/writer.rs`):
+
+| Step | Per | Code | Cost |
+| --- | --- | --- | --- |
+| metrics timer | row | `Instant::now()` and one `record_segment_operation` (returns at once under `N42_STORAGE_OP_METRICS=0`) | ~40 ns |
+| tx-number check | row | `append_with_tx_number`: `tx_range().end + 1 == tx_num`, `increment_tx` | small |
+| encode | row | `Compact::to_compact` into the writer's reusable 100-byte `buf`: for 0x50 (`n42-tx-types` `compact.rs`) tag 1 + the cached hash (32) + u32 length + `encode_2718` (an RLP re-encode through `&mut dyn BufMut`, the fields' lengths computed twice); for Ethereum rows tag 0 + reth's `TransactionSigned` compact | **~97 ns** |
+| append | row | `NippyJarWriter::append_column` (upstream `reth-nippy-jar`, not vendored): `write_all` into the data file's `BufWriter` (**8 KiB default capacity**, so one `write(2)` every ~44 rows, ~4,500 a block) and one `u64` push to the in-memory offset list | **~65 ns** |
+| sync | segment, once a **batch** | `sync_all`: flush the buffer, `fsync` the data file, write the offsets (8 B a row, 1.6 MB a block) and `fsync` them; the configuration is written at `commit` by `finalize` (atomic temp file + fsync + rename), no second sync (the `synced` flag) | device-bound, ~10 ms a 37 MB block |
+
+No compression: `create_jar` gives only `Headers` an LZ4 compressor, the 0x50 row is not compressed by its
+codec (Ethereum rows compress their input with zstd only from 32 bytes), and the row is 185.6 B on the
+flood's transfers (37.1 MB a 200k block; the study's 203 B was 0x02 rows). `sync_all` is already once per
+batch per segment, not per block.
+
+### 11.2 Measured (`n42_sf_tests::bench_sf_transactions_{200k,batch}`)
+
+Release build, one synthetic 200k-transfer block (random key, signature and recipient; real hashes) written
+to a temporary static-file directory on `/data` (the fleet's device), three repetitions, the box shared (load
+~16); medians:
+
+| Part | ms a 200k block |
+| --- | --- |
+| encode serial into one buffer | 19.3 |
+| encode in 4,096-row chunks on the rayon pool | 1.3-2.0 |
+| `append_transaction` loop (encode + append + timers), as today | 30.5-31.4 |
+| the same rows pre-encoded, appended (`append_transactions_encoded`) | 12.5-13.0 |
+| `sync_all` of one block | 9.6-9.7 |
+| raw: memcpy into fresh memory / one `write` of 37 MB / `fsync` | 10.5 (page faults) / 3.8 / 8.7 |
+
+A batch of five blocks (the fleet's 3-15, median 5), task from the first `increment_block` to the end of
+`sync_all`:
+
+| Mode | per block (appends) | `sync_all` | ms a block |
+| --- | --- | --- | --- |
+| serial (today) | 29.7-30.4 | 48.4 | **40.1** |
+| `N42_SF_PARALLEL_ENCODE=1` | 13.3-13.8 | 48.3-48.6 | 23.3-23.8 |
+| `N42_SF_EARLY_WRITEBACK=1` | 32.0-33.2 | 11.1-11.3 | 34.8-35.4 |
+| both | 14.6-16.8 | 11.3-11.4 | **17.7-18.9** |
+
+Where today's 40 ms goes (the fleet's 50 ms is the same work slowed by the box): encoding 19 (48%), the
+per-row append 11 (28%), the batch's fsync 10 (24%, device wait, paid at the end because the kernel's
+background writeback does not start below its dirty threshold). CPU is about 30 of 40 ms. The same bytes
+written raw cost about 4 ms (one write) plus the device time of the fsync, 9 ms a block: **about 27 of 40 ms
+is avoidable** (the encoding, the per-row syscalls, and the fsync's serial wait), the rest is the write and
+the device. The two switches remove about 22 of it; the remaining ~9 ms of avoidable work is the per-row
+append into an 8 KiB `BufWriter`, which only a change to upstream's `reth-nippy-jar` (not vendored) can
+take: a bulk `append_rows(&[u8], &[u32])` that writes the block's rows with one `write_all` and extends the
+offset list, or a `BufWriter` of 1 MiB. Estimate with it: ~5 ms a block appended, ~8-10 ms a block in all.
+
+### 11.3 The changes (each default off; files byte-identical)
+
+* `StaticFileProviderRW::append_transactions_encoded(first_tx, rows, lens)` (additive): appends rows already
+  encoded with `Compact`, with the same tx-number check, header range and offsets as one `append_transaction`
+  each, and one bulk metric instead of a timer a row.
+* `N42_SF_PARALLEL_ENCODE=1` (`static_file/n42_sf.rs`): `write_transactions` encodes each block's rows in
+  4,096-row chunks with `par_chunks` on the pool the task runs on (the storage pool: its 16 threads hold at
+  most five segment tasks, the rest are idle during the scope; the build's global pool is not touched) and
+  appends them in order. Blocks under 8,192 transactions stay serial. Memory: one block's rows at a time,
+  ~37 MB. **Measured: 40.1 to 23.3-23.8 ms a block in the five-block batch.**
+* `N42_SF_EARLY_WRITEBACK=1`: after each block, `n42_start_writeback` opens the data file read-only and calls
+  `sync_file_range(SYNC_FILE_RANGE_WRITE)` over the whole file, which queues the dirty pages for the device
+  and does not wait for them; the batch's `sync_all` then waits only for the last block. It costs 1-3 ms a
+  block of submission (`sync_file_range` can block on a congested queue). **Measured: `sync_all` 48 to 11 ms a
+  batch; with parallel encode 17.7-18.9 ms a block.**
+
+**Durability, before and after (identical).** Before: within the batch each segment task appends, then
+`sync_all` makes its data and offsets (and a changeset segment's `.csoff`) durable; at the batch's commit,
+`finalize` writes each segment's configuration (rows, ranges) atomically, then RocksDB and MDBX commit, and
+MDBX's `Finish` checkpoint is the persistence frontier. A crash between the sync and the configuration leaves
+rows past the configured count, which the next open heals away (`NippyJarChecker`, then
+`ensure_end_range_consistency`); a crash before the MDBX commit leaves static files ahead of the database,
+which the start-up consistency check unwinds. After: the same calls in the same order; the writeback hint only
+starts earlier the I/O that `sync_all` would have started, and nothing is reported durable that was not
+fsynced. The parallel encode changes no byte and no order.
+
+**Readable by either path.** Tests in `static_file/n42_sf_tests.rs` (the dev-dependency on `n42-tx-types` gives
+real 0x50 rows, mixed with Ethereum rows; block sizes 0, 3, 10,000, 1, 0, 20,000, 8,191, 8,192, 12,345, four
+blocks a file, so several files): the serial and parallel paths' files are equal byte for byte (data, offsets,
+configuration), with and without the writeback hint; every row reads back through the unmodified reader
+(`transaction_by_id`) and the row past the end is absent; both paths mixed in one file in either order across a
+provider reopen equal the serial files; an unwind (`prune_transactions` of the last two blocks) and rewrite
+leaves identical files; a crash after `sync_all` without the configuration heals to identical files at the next
+open. Since the bytes are the serial path's, no format, reader or recovery change exists to test beyond that.
+
+### 11.4 What was looked at and not built
+
+* **Reusing the frames' bytes.** Not available: the persisted `ExecutedBlock` holds decoded `N42TxEnvelope`s,
+  and the frames hold `Arc<ValidPoolTransaction<N42PooledTransaction>>`, decoded too (only `encoded_length` is
+  kept). The 0x50 row is `1 + hash + u32 len + EIP-2718 bytes`, i.e. the wire bytes behind a 37-byte prefix, so a
+  fast path needs `AltSigTx` to keep a `Bytes` slice of the buffer it was decoded from (refcounted, so the
+  ingest buffers stay alive while a transaction lives: up to ~165 B a queued transaction, ~330 MB at a 2M-deep
+  queue if the slices pin whole buffers) and `to_compact` would copy it. With the encode already parallel
+  (1.3-2 ms a block) that saves at most ~1.5 ms a block of wall time. Not worth the memory.
+* **Compression.** The segment is already uncompressed. On the synthetic transfers zstd -1 / -3 / -19 keep
+  77 / 76 / 74% of the bytes, zlib -6 78% (hash, key, signature and recipient are 148 of 186 B and random;
+  the flood's repeated sender keys could add some dedup within a block). zstd at a few hundred MB/s a core
+  would add 75-100 ms of CPU a block to save ~9 MB of a write that costs ~13 ms in all. No mode added.
+* **Fewer fsyncs.** Already one per segment per batch; merging the segments' syncs would serialise six
+  parallel fsyncs into one thread. The only remaining fsync saving is its overlap, which the writeback hint
+  gives.
+* **Dropping the stored hash** (32 B a row, 17%): a format change, saves a keccak a read; not worth a new row
+  format for ~6 MB a block.
+
+### 11.5 The next segments in line, and the rest of the batch
+
+Per full block on loop338 B (fleet, with the box's contention): receipts 20 ms, account changesets 17, senders
+10, headers and storage changesets under 1. With transactions at an estimated ~23 ms on the fleet (the bench's
+18 x the fleet/bench ratio of 50/40), **`Receipts` is next** at ~20 ms: 200k rows of ~15 B, so its cost is the
+per-row path (encode, timer, append), not bytes; the same parallel encode applies unchanged in shape (a
+`Receipt<N42TxType>` is `Compact`; the bulk append would need its tx-number twin for receipts) and should take
+it to ~8-10 ms. Account changesets: `write_account_changesets` clones each revert into an `AccountBeforeTx`
+vector, `append_account_changeset` sorts it by address and appends one row each, plus the `.csoff` sidecar; the
+sort and the encode can be parallel too (a `par_sort_unstable` and chunked encode), ~17 to ~8 ms (estimate).
+Senders: 20-byte rows, ~10 ms; `--prune.sender-recovery.full` (`static_file_write_ctx.write_senders = false`)
+skips the task entirely. **The bench does not pass it** (loop338/339 runners pass only
+`--prune.transaction-lookup.full`); it would free one storage-pool thread and 4 MB of write and fsync a block
+but not shorten the scope, since senders is not the slowest task; the cost is a recovery a read
+(`keccak(alg || key)` for 0x50, an ecrecover for secp256k1) wherever a sender of a persisted transaction is asked
+for.
+
+Serial outside the scope: `plain_reverts` (2.5 ms a full block, before it) and `qmdb_persisted` (9 ms a block
+on loop338 B, 42 ms a batch, after it). `N42_PERSIST_QMDB_IN_SCOPE=1` (section 9) **does what is needed now**: it
+runs the callback on its own thread beside the scope and joins before the commit, and the scope (175 ms a
+batch today, ~90-110 after this change) is still longer than the callback (42 ms), so it hides it whole. It
+showed no gain when the RocksDB write dominated because then the post-scope tail was not the bound either; it
+was not on in loop338 (`post_scope` = `qmdb_persisted` in every leg). Commits are ~1.5 ms a batch.
+
+Estimate for a 200k block on the fleet with all of it: max(transactions ~23, receipts 20, account changesets 17,
+QMDB ~9 in scope) + `plain_reverts` 2.5 + commits ~0.4 = **~26 ms a full block** against today's ~65 and the
+35-40 ms target; with the receipts and changeset encode in parallel as well, transactions (~23) stays the bound
+until the nippy-jar bulk append lands (~10).
+
+### 11.6 Fleet legs
+
+Against a BASE with the same binary (loop339's B line), append to the environment line:
+
+1. `N42_SF_PARALLEL_ENCODE=1`: expect `save_blocks_sf_transactions` ~50 to ~30 ms a full block.
+2. `N42_SF_PARALLEL_ENCODE=1 N42_SF_EARLY_WRITEBACK=1`: expect ~23 ms; `sf_receipts` becomes the largest
+   segment.
+3. Leg 2 plus `N42_PERSIST_QMDB_IN_SCOPE=1`: expect `save_blocks_post_scope` near zero and `save_blocks_total`
+   ~26-30 ms a full block; the persisted lag should stay flat (6 blocks) through window 3.
+4. Optionally leg 3 plus `F7_EL_EXTRA="... --prune.sender-recovery.full"` (keep `--builder.*` and
+   `--prune.transaction-lookup.full` in the same string): `sf_senders` disappears, the scope should not move.
+
+Read `save_blocks_sf_*`, `save_blocks_scope`, `save_blocks_post_scope`, `save_blocks_total`, the batch count,
+and the in-memory block count per window.

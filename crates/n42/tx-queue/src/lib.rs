@@ -433,6 +433,93 @@ const fn unpack_depth(packed: u64) -> (u64, u64) {
     (packed & 0xffff_ffff, packed >> 32)
 }
 
+/// The lanes' lock and the inbox drain, measured for the 5 s report
+/// ([`take_lock_stats`]): how often the lock was held and for how long in
+/// all, its longest hold (and who held it) and its longest wait, and the
+/// drains' count, transactions and hold time. Process-wide: a node has one
+/// queue.
+struct LockCounters {
+    holds: std::sync::atomic::AtomicU64,
+    hold_ns: std::sync::atomic::AtomicU64,
+    hold_max_ns: std::sync::atomic::AtomicU64,
+    wait_max_ns: std::sync::atomic::AtomicU64,
+    wait_ns: std::sync::atomic::AtomicU64,
+    drains: std::sync::atomic::AtomicU64,
+    drain_txs: std::sync::atomic::AtomicU64,
+    drain_ns: std::sync::atomic::AtomicU64,
+    drain_max_ns: std::sync::atomic::AtomicU64,
+}
+
+static LOCK_COUNTERS: LockCounters = LockCounters {
+    holds: std::sync::atomic::AtomicU64::new(0),
+    hold_ns: std::sync::atomic::AtomicU64::new(0),
+    hold_max_ns: std::sync::atomic::AtomicU64::new(0),
+    wait_max_ns: std::sync::atomic::AtomicU64::new(0),
+    wait_ns: std::sync::atomic::AtomicU64::new(0),
+    drains: std::sync::atomic::AtomicU64::new(0),
+    drain_txs: std::sync::atomic::AtomicU64::new(0),
+    drain_ns: std::sync::atomic::AtomicU64::new(0),
+    drain_max_ns: std::sync::atomic::AtomicU64::new(0),
+};
+
+/// The caller that set the current longest hold, beside it.
+static HOLD_MAX_AT: Mutex<Option<&'static std::panic::Location<'static>>> = Mutex::new(None);
+
+/// What [`take_lock_stats`] reports: the lanes' lock and the inbox drain
+/// since the previous call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LockStats {
+    /// Times the lanes' lock was taken and released.
+    pub holds: u64,
+    /// Their holds' sum, nanoseconds: over the interval, the lock's duty.
+    pub hold_ns: u64,
+    /// The longest single hold, nanoseconds, and where it was taken.
+    pub hold_max_ns: u64,
+    /// `file:line` of the longest hold's caller, when one was recorded.
+    pub hold_max_at: Option<&'static std::panic::Location<'static>>,
+    /// The longest wait for the lock, nanoseconds, and the waits' sum.
+    pub wait_max_ns: u64,
+    /// Sum of every wait for the lock, nanoseconds.
+    pub wait_ns: u64,
+    /// Inbox drains that moved anything into the lanes, the transactions
+    /// they moved, their time under the lock in all and the longest one.
+    pub drains: u64,
+    /// Transactions those drains moved.
+    pub drain_txs: u64,
+    /// The drains' time under the lock, nanoseconds.
+    pub drain_ns: u64,
+    /// The longest drain, nanoseconds.
+    pub drain_max_ns: u64,
+}
+
+/// The lanes' lock and drain counters since the last call, which resets
+/// them: the 5 s `ingest` line reports one interval each.
+pub fn take_lock_stats() -> LockStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = &LOCK_COUNTERS;
+    let hold_max_at = HOLD_MAX_AT.lock().take();
+    LockStats {
+        holds: c.holds.swap(0, Relaxed),
+        hold_ns: c.hold_ns.swap(0, Relaxed),
+        hold_max_ns: c.hold_max_ns.swap(0, Relaxed),
+        hold_max_at,
+        wait_max_ns: c.wait_max_ns.swap(0, Relaxed),
+        wait_ns: c.wait_ns.swap(0, Relaxed),
+        drains: c.drains.swap(0, Relaxed),
+        drain_txs: c.drain_txs.swap(0, Relaxed),
+        drain_ns: c.drain_ns.swap(0, Relaxed),
+        drain_max_ns: c.drain_max_ns.swap(0, Relaxed),
+    }
+}
+
+/// Raises `max` to `value` if it is larger; returns whether it did. A load
+/// first, so the common case (not a new maximum) writes nothing to a line
+/// every lock of the queue would otherwise share.
+fn raise_max(max: &std::sync::atomic::AtomicU64, value: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    value > max.load(Relaxed) && max.fetch_max(value, Relaxed) < value
+}
+
 /// A hold or a wait of the queue's lock this long is said.
 const SLOW_LOCK: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -451,11 +538,23 @@ impl<T: PoolTransaction> std::ops::DerefMut for TimedInner<'_, T> {
 
 impl<T: PoolTransaction> Drop for TimedInner<'_, T> {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering::Release;
+        use std::sync::atomic::Ordering::{Relaxed, Release};
         // Still under the lock: mirror stores are ordered by it, so the
         // mirror only ever holds a depth the lanes really had at a release.
         self.mirror.store(pack_depth(self.guard.len, self.guard.parked_len), Release);
         let held = self.at.elapsed();
+        let held_ns = held.as_nanos() as u64;
+        let waited_ns = self.waited.as_nanos() as u64;
+        let c = &LOCK_COUNTERS;
+        c.holds.fetch_add(1, Relaxed);
+        c.hold_ns.fetch_add(held_ns, Relaxed);
+        if waited_ns > 0 {
+            c.wait_ns.fetch_add(waited_ns, Relaxed);
+            raise_max(&c.wait_max_ns, waited_ns);
+        }
+        if raise_max(&c.hold_max_ns, held_ns) {
+            *HOLD_MAX_AT.lock() = Some(self.caller);
+        }
         if held >= SLOW_LOCK || self.waited >= SLOW_LOCK {
             tracing::warn!(
                 target: "n42.tx_queue",
@@ -1057,9 +1156,17 @@ impl<T: PoolTransaction> TxQueue<T> {
         drop(inbox);
         // Lanes only. Nothing here touches the by-hash index: this runs
         // under the lanes' lock, with the builder's puller waiting on it.
+        let at = std::time::Instant::now();
+        let count = staged.len() as u64;
         for valid in staged {
             inner.insert_valid(valid);
         }
+        let took = at.elapsed().as_nanos() as u64;
+        let c = &LOCK_COUNTERS;
+        c.drains.fetch_add(1, Ordering::Relaxed);
+        c.drain_txs.fetch_add(count, Ordering::Relaxed);
+        c.drain_ns.fetch_add(took, Ordering::Relaxed);
+        raise_max(&c.drain_max_ns, took);
     }
 
     /// Notes a frame the ingest admitted whole: its id (root), its

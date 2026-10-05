@@ -412,6 +412,25 @@ struct TimedInner<'a, T: PoolTransaction> {
     at: std::time::Instant,
     waited: std::time::Duration,
     caller: &'static std::panic::Location<'static>,
+    /// The queue's depth mirror ([`TxQueue::gate_len`]), stored from the
+    /// lanes as the guard is released.
+    mirror: &'a std::sync::atomic::AtomicU64,
+}
+
+/// `len` and `parked_len` packed into one word for the depth mirror: the
+/// parked total in the high half, the queued total in the low half, each
+/// saturated at `u32::MAX` (a queue of four billion is not a state this
+/// node reaches; saturating keeps a wrong value from wrapping into the
+/// other half).
+const fn pack_depth(len: usize, parked: usize) -> u64 {
+    let len = if len > u32::MAX as usize { u32::MAX as u64 } else { len as u64 };
+    let parked = if parked > u32::MAX as usize { u32::MAX as u64 } else { parked as u64 };
+    (parked << 32) | len
+}
+
+/// The (len, parked) a packed mirror holds.
+const fn unpack_depth(packed: u64) -> (u64, u64) {
+    (packed & 0xffff_ffff, packed >> 32)
 }
 
 /// A hold or a wait of the queue's lock this long is said.
@@ -432,6 +451,10 @@ impl<T: PoolTransaction> std::ops::DerefMut for TimedInner<'_, T> {
 
 impl<T: PoolTransaction> Drop for TimedInner<'_, T> {
     fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Release;
+        // Still under the lock: mirror stores are ordered by it, so the
+        // mirror only ever holds a depth the lanes really had at a release.
+        self.mirror.store(pack_depth(self.guard.len, self.guard.parked_len), Release);
         let held = self.at.elapsed();
         if held >= SLOW_LOCK || self.waited >= SLOW_LOCK {
             tracing::warn!(
@@ -800,6 +823,11 @@ pub struct TxQueue<T: PoolTransaction> {
     /// reads it right after its selection, while the selection's takes may
     /// still be leaving the lanes ([`Inner::settle`]).
     pruned_mirror: Arc<std::sync::atomic::AtomicU64>,
+    /// The lanes' `len` and `parked_len` as of the last release of their
+    /// lock ([`pack_depth`]), and raised by a drain before it subtracts what
+    /// it takes from `staged`: what [`Self::gate_len`] reads instead of
+    /// taking the lock.
+    depth: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Frames noted since the last drain, each with its transactions when the
@@ -816,6 +844,7 @@ impl<T: PoolTransaction> Clone for TxQueue<T> {
             frame_inbox: Arc::clone(&self.frame_inbox),
             pruned_mirror: Arc::clone(&self.pruned_mirror),
             frames_staged: Arc::clone(&self.frames_staged),
+            depth: Arc::clone(&self.depth),
         }
     }
 }
@@ -968,6 +997,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             frame_inbox: Arc::new(Mutex::new(Vec::new())),
             frames_staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pruned_mirror: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            depth: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -987,7 +1017,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         let mut inner = self.inner.lock();
         let at = std::time::Instant::now();
         inner.settle();
-        TimedInner { guard: inner, at, waited: at.saturating_duration_since(asked), caller }
+        TimedInner { guard: inner, at, waited: at.saturating_duration_since(asked), caller, mirror: &self.depth }
     }
 
     /// Moves what was pushed since the last drain into the lanes. Called
@@ -1016,6 +1046,13 @@ impl<T: PoolTransaction> TxQueue<T> {
         // overflows.
         let mut inbox = self.inbox.lock();
         let staged = std::mem::take(&mut *inbox);
+        // The depth mirror counts the batch before `staged` lets go of it,
+        // so a gate reading the two without the lanes' lock never sees the
+        // batch in neither (an undercount that would open the gate for the
+        // drain's length). Between the two it is counted twice -- the safe
+        // side, a gate shut a few nanoseconds early -- and the release of
+        // this lock stores the exact value again.
+        self.depth.fetch_add(staged.len() as u64, Ordering::AcqRel);
         self.staged.fetch_sub(staged.len(), Ordering::AcqRel);
         drop(inbox);
         // Lanes only. Nothing here touches the by-hash index: this runs
@@ -1190,7 +1227,30 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// parked lanes held its depth at 569,520 against a gate of 543,333,
     /// the flood was held off, nothing was mined so nothing was pruned, and
     /// the node built empty blocks until its tenure ended.
+    ///
+    /// Read without the lanes' lock: the lanes' part is the depth mirror,
+    /// stored at every release of the lock, and the inbox's part is the
+    /// live `staged` counter. So the reading is exact whenever nobody holds
+    /// the lock, and while somebody does it is the depth as of the last
+    /// release (the staleness is one hold: a build's take, a prune's
+    /// removal, a give-back are seen when their hold ends). A drain is the
+    /// exception that is never undercounted: it raises the mirror before it
+    /// takes its batch out of `staged` ([`Self::drain_inbox`]). Taking the
+    /// lock here put every ingest connection behind any 17-24 ms removal
+    /// (`docs/SHARED_EXECUTION_SCOPE.md` 10.2).
     pub fn gate_len(&self) -> usize {
+        use std::sync::atomic::Ordering;
+        // `staged` first: a drain moves a batch from it into the mirror,
+        // and with the mirror read second the batch is in at least one of
+        // the two readings (the mirror is raised before `staged` drops).
+        let staged = self.staged.load(Ordering::Acquire) as u64;
+        let (len, parked) = unpack_depth(self.depth.load(Ordering::Acquire));
+        usize::try_from((len + staged).saturating_sub(parked)).unwrap_or(usize::MAX)
+    }
+
+    /// [`Self::gate_len`] read under the lanes' lock, as it was before the
+    /// mirror: the reference the tests hold the mirror against.
+    pub fn gate_len_locked(&self) -> usize {
         let inner = self.lock_inner();
         (inner.len + self.staged.load(std::sync::atomic::Ordering::Acquire)).saturating_sub(inner.parked_len)
     }

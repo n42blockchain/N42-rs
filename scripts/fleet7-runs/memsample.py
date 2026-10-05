@@ -18,7 +18,13 @@ NAMES = {'reth_blockchain_tree_in_mem_state_num_blocks': 'num', 'reth_blockchain
          # loop339: the persistence reading (cumulative; persist339.py differences them per window)
          'reth_storage_providers_database_save_blocks_total_sum': 'sb_sum', 'reth_storage_providers_database_save_blocks_total_count': 'sb_n',
          'reth_storage_providers_database_save_blocks_batch_size_sum': 'bs_sum', 'reth_storage_providers_database_save_blocks_sf_transactions_sum': 'sft_sum',
-         'reth_storage_providers_database_save_blocks_qmdb_persisted_sum': 'qp_sum', 'reth_blockchain_tree_canonical_chain_height': 'canon'}
+         'reth_storage_providers_database_save_blocks_qmdb_persisted_sum': 'qp_sum', 'reth_blockchain_tree_canonical_chain_height': 'canon',
+         # loop340: every part of the batch
+         'reth_storage_providers_database_save_blocks_sf_receipts_sum': 'sfr_sum', 'reth_storage_providers_database_save_blocks_sf_account_changesets_sum': 'sfa_sum',
+         'reth_storage_providers_database_save_blocks_sf_senders_sum': 'sfs_sum', 'reth_storage_providers_database_save_blocks_scope_sum': 'scope_sum',
+         'reth_storage_providers_database_save_blocks_post_scope_sum': 'post_sum', 'reth_storage_providers_database_save_blocks_pre_scope_sum': 'pre_sum',
+         'reth_storage_providers_database_save_blocks_plain_reverts_sum': 'pr_sum', 'reth_storage_providers_database_save_blocks_commit_sf_sum': 'csf_sum',
+         'reth_storage_providers_database_save_blocks_commit_mdbx_sum': 'cmd_sum', 'reth_storage_providers_database_save_blocks_commit_rocksdb_sum': 'crk_sum'}
 MAP = [int(x) for x in os.environ['F7_EL_MAP'].split(',')] if os.environ.get('F7_EL_MAP') else None
 def first_of(i):
     return MAP.index(i) if MAP else i
@@ -39,7 +45,7 @@ def sample(i):
             n, _, v = l.partition(' ')
             if n in NAMES: d[NAMES[n]] = v
     except Exception: pass
-    return f'node{i} pid={pid or "-"} rss_g={rss} num={d["num"]} latest={d["latest"]} earliest={d["earliest"]} bp={d["bp"]} stall_n={d["stall_n"]} stall_s={d["stall_s"]} sb_sum={d["sb_sum"]} sb_n={d["sb_n"]} bs_sum={d["bs_sum"]} sft_sum={d["sft_sum"]} qp_sum={d["qp_sum"]} canon={d["canon"]}'
+    return f'node{i} pid={pid or "-"} rss_g={rss} num={d["num"]} latest={d["latest"]} earliest={d["earliest"]} bp={d["bp"]} stall_n={d["stall_n"]} stall_s={d["stall_s"]} sb_sum={d["sb_sum"]} sb_n={d["sb_n"]} bs_sum={d["bs_sum"]} sft_sum={d["sft_sum"]} qp_sum={d["qp_sum"]} canon={d["canon"]} sfr_sum={d["sfr_sum"]} sfa_sum={d["sfa_sum"]} sfs_sum={d["sfs_sum"]} scope_sum={d["scope_sum"]} post_sum={d["post_sum"]} pre_sum={d["pre_sum"]} pr_sum={d["pr_sum"]} csf_sum={d["csf_sum"]} cmd_sum={d["cmd_sum"]} crk_sum={d["crk_sum"]}'
 ex = ThreadPoolExecutor(nodes)
 with open(out, 'a', buffering=1) as f:
     while True:

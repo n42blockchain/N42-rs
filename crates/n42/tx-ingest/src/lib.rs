@@ -907,6 +907,12 @@ fn spawn_stats_reporter() {
                     drain_txs = lock.drain_txs,
                     drain_us_mean = lock.drain_ns / lock.drains.max(1) / 1_000,
                     drain_us_max = lock.drain_max_ns / 1_000,
+                    // `N42_TX_QUEUE_DRAIN_CHUNK`: the drainer's bounded holds,
+                    // the most one of them moved, and remainders another
+                    // holder (a build's start, a prune) finished unbounded.
+                    drain_chunks = lock.drain_chunks,
+                    drain_chunk_max_txs = lock.drain_chunk_max_txs,
+                    drain_finished = lock.drain_finished,
                     "ingest"
                 );
             }

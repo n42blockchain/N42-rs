@@ -1007,6 +1007,94 @@ mod wire {
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
     }
 
+    /// Four connections of eight frames of 25 transactions each, delivered
+    /// to a queue straight from the ingest (direct, asynchronous), with two
+    /// recovery slots. Returns each sender's nonces in the order a build is
+    /// offered them, and the frames the queue indexed.
+    fn deliver(own_runtime: bool) -> (std::collections::BTreeMap<Address, Vec<u64>>, usize) {
+        const CONNECTIONS: u8 = 4;
+        const FRAMES: u64 = 8;
+        const PER: u64 = 25;
+        let queue: n42_tx_queue::TxQueue<N42PooledTransaction> = n42_tx_queue::TxQueue::new();
+        let (runtime, slots) = if own_runtime {
+            (runtime::build(2, Some(2)).expect("the ingest runtime"), Slots::Blocking(runtime::BlockingSlots::new(Some(2))))
+        } else {
+            (
+                tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("a runtime"),
+                Slots::Async(Arc::new(tokio::sync::Semaphore::new(2))),
+            )
+        };
+        let setup = Setup {
+            queue: Some(queue.clone()),
+            direct: true,
+            asynchronous: true,
+            gate: 1 << 40,
+            allowance: 0,
+            slots,
+        };
+        let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).expect("a listener");
+        let addr = listener.local_addr().expect("an address");
+        runtime.spawn(serve_on(listener, Pool::new(), None, Arc::new(AtomicU64::new(0)), setup));
+        let clients: Vec<_> = (0..CONNECTIONS)
+            .map(|c| {
+                std::thread::spawn(move || {
+                    use std::io::{Read as _, Write as _};
+                    let key = 80 + c;
+                    let mut wire = Vec::new();
+                    for f in 0..FRAMES {
+                        let txs: Vec<Bytes> = (0..PER).map(|n| raw(&eth_tx(key, f * PER + n))).collect();
+                        wire.extend(frame(None, &txs, None));
+                    }
+                    let mut stream = std::net::TcpStream::connect(addr).expect("connected");
+                    stream.write_all(&wire).expect("frames written");
+                    for _ in 0..FRAMES {
+                        let mut answer = [0u8; 8];
+                        stream.read_exact(&mut answer).expect("an answer");
+                        let accepted = u32::from_le_bytes([answer[0], answer[1], answer[2], answer[3]]);
+                        assert_eq!(u64::from(accepted), PER, "every transaction of the frame acknowledged");
+                    }
+                })
+            })
+            .collect();
+        for client in clients {
+            client.join().expect("a client failed");
+        }
+        // The answers go out before the admission: wait for the queue.
+        let total = usize::from(CONNECTIONS) * (FRAMES * PER) as usize;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while (queue.len() < total || queue.frames_indexed() < usize::from(CONNECTIONS) * FRAMES as usize)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut by_sender: std::collections::BTreeMap<Address, Vec<u64>> = Default::default();
+        for tx in queue.best_for_build(B256::repeat_byte(1)) {
+            by_sender.entry(tx.sender()).or_default().push(tx.nonce());
+        }
+        let frames = queue.frames_indexed();
+        runtime.shutdown_background();
+        (by_sender, frames)
+    }
+
+    /// `N42_INGEST_RUNTIME=1`: the ingest on its own runtime with the slots
+    /// taken on the blocking side delivers exactly what it delivers on the
+    /// caller's runtime with the async semaphore -- every frame, indexed
+    /// whole, each sender's nonces in order with none missing.
+    #[test]
+    fn the_ingest_runtime_delivers_the_same_frames_in_the_same_order() {
+        let _g = counter_lock();
+        let (on, frames_on) = deliver(true);
+        let (off, frames_off) = deliver(false);
+        assert_eq!(frames_on, 32);
+        assert_eq!(frames_off, 32);
+        assert_eq!(on.len(), 4);
+        for c in 0..4u8 {
+            let nonces = on.get(&secp_address(80 + c)).expect("every sender delivered");
+            assert_eq!(*nonces, (0..200).collect::<Vec<u64>>(), "sender {c} in nonce order, none missing");
+        }
+        assert_eq!(on, off);
+    }
+
     #[test]
     fn the_frame_hook_is_set_once() {
         fn first(_: B256, _: &[B256], _: &dyn std::any::Any) {}

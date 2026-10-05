@@ -30,7 +30,7 @@ for tag in sys.argv[1:]:
             l = ansi.sub('', l); d = {k: v for k, v in KV.findall(l)}
             if 'queued' in d and int(d.get('txs', 0)) >= 0.9 * blk: q.append((ts(l), int(d['queued'])))
     print(f'== {tag}: feed check (acq_us / gate_us / reply_us are per frame of 500; rate per 5 s `ingest` line)')
-    for w in range(3):
+    for w in range(int(os.environ.get('W339', '3'))):
         a, b = t0 + 30 * w, t0 + 30 * (w + 1)
         iw = [d for d in ing if a <= d['_t'] < b]; qw = [x for t, x in q if a <= t < b]
         cw = [c for c in canon if a <= c[0] < b]

@@ -30,7 +30,7 @@ for tag in sys.argv[1:]:
             l = ansi.sub('', l); d = dict(KV.findall(l)); d['_t'] = ts(l)
             if int(d.get('mined', 0)) >= 100000: pr.append(d)
     print(f'== {tag}: lanes lock, drain and pruner (new fields)')
-    for w in range(3):
+    for w in range(int(os.environ.get('W339', '3'))):
         a, b = t0 + 30 * w, t0 + 30 * (w + 1)
         iw = [d for d in ing if a <= d['_t'] < b]; pw = [d for d in pr if a <= d['_t'] < b]
         g = lambda rows, k: [float(d[k]) for d in rows if k in d and re.fullmatch(r'-?[\d.]+', d[k])]

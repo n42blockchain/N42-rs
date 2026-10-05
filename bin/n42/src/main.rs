@@ -723,11 +723,11 @@ fn main() {
                         // The chain id a frame attestation is signed over
                         // (`N42_FRAME_GATEWAYS`, step 2).
                         let chain_id = reth_chainspec::EthChainSpec::chain_id(&*node.chain_spec());
-                        tokio::spawn(async move {
-                            n42_tx_ingest::set_frame_hook(n42_engine_types::frame_scan::note_admitted_any);
-                            if let Err(err) = n42_tx_ingest::serve(addr, pool, cache, head, chain_id).await {
-                                error!(target: "reth::cli", %err, "transaction ingest stopped");
-                            }
+                        n42_tx_ingest::set_frame_hook(n42_engine_types::frame_scan::note_admitted_any);
+                        // On its own runtime under `N42_INGEST_RUNTIME=1`
+                        // (`n42_tx_ingest::runtime`), on this one otherwise.
+                        n42_tx_ingest::spawn_serve(addr, pool, cache, head, chain_id, |err| {
+                            error!(target: "reth::cli", %err, "transaction ingest stopped");
                         });
                     }
                     Err(err) => {

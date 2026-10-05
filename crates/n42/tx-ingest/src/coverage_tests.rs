@@ -572,20 +572,20 @@ fn the_gate_view_is_the_pending_count_against_the_mark_plus_lag_allowance() {
     let head = Arc::new(AtomicU64::new(0));
 
     // Nothing pending: open against any positive mark, shut against zero.
-    assert_eq!(gate_view(&pool, &head, 10, 0), GateView { open: true, depth: 0, limit: 10 });
-    assert_eq!(gate_view(&pool, &head, 0, 0), GateView { open: false, depth: 0, limit: 0 });
-    assert!(gate_open(&pool, &head, 10, 0));
-    assert!(!gate_open(&pool, &head, 0, 0));
+    assert_eq!(gate_view(&pool, None, &head, 10, 0), GateView { open: true, depth: 0, limit: 10 });
+    assert_eq!(gate_view(&pool, None, &head, 0, 0), GateView { open: false, depth: 0, limit: 0 });
+    assert!(gate_open(&pool, None, &head, 10, 0));
+    assert!(!gate_open(&pool, None, &head, 0, 0));
 
     // The chain is ahead of the pool by two blocks: two allowances are added.
     head.store(2, Ordering::Relaxed);
-    assert_eq!(gate_view(&pool, &head, 0, 100), GateView { open: true, depth: 0, limit: 200 });
+    assert_eq!(gate_view(&pool, None, &head, 0, 100), GateView { open: true, depth: 0, limit: 200 });
     // The lag is capped at four blocks.
     head.store(1_000, Ordering::Relaxed);
-    assert_eq!(gate_view(&pool, &head, 5, 100).limit, 405);
+    assert_eq!(gate_view(&pool, None, &head, 5, 100).limit, 405);
     // A pool ahead of the chain never subtracts.
     let ahead = Arc::new(AtomicU64::new(0));
-    assert_eq!(gate_view(&pool, &ahead, 5, 100).limit, 5);
+    assert_eq!(gate_view(&pool, None, &ahead, 5, 100).limit, 5);
 }
 
 #[test]
@@ -632,7 +632,7 @@ async fn the_watcher_wakes_a_waiter_when_the_pools_depth_is_under_the_mark() {
     // The watcher reads the (empty) pool and finds the gate open; the waiter's
     // own reading stays shut for 300 ms of runtime time. The waiter would
     // otherwise sleep to its 2 s warning cap, so waking early is the watcher.
-    spawn_gate_watcher(Pool::new(), Arc::new(AtomicU64::new(0)), 10, 0);
+    spawn_gate_watcher(Pool::new(), None, Arc::new(AtomicU64::new(0)), 10, 0);
     let shut_until = tokio::time::Instant::now() + Duration::from_millis(300);
     let view = move || GateView { open: tokio::time::Instant::now() >= shut_until, depth: 1, limit: 0 };
     match wait_at_gate(view, || None, Some(Duration::from_secs(15))).await {
@@ -759,7 +759,7 @@ mod wire {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
-        let handle = tokio::spawn(serve_connection(server, Pool::new(), None, Arc::new(AtomicU64::new(0))));
+        let handle = tokio::spawn(serve_connection(server, Pool::new(), None, Arc::new(AtomicU64::new(0)), Setup::from_env(false)));
         (client, handle)
     }
 
@@ -965,7 +965,7 @@ mod wire {
     async fn admit_returns_zero_for_an_empty_decode_and_counts_nothing() {
         let _g = counter_lock();
         let before = (load(&STATS.frames), load(&STATS.txs));
-        let accepted = admit::<Pool>(&Pool::new(), vec![Bytes::from_static(b"\x05")], Vec::new(), Vec::new(), None).await;
+        let accepted = admit::<Pool>(&Pool::new(), &Setup::from_env(false), vec![Bytes::from_static(b"\x05")], Vec::new(), Vec::new(), None).await;
         assert_eq!(accepted, 0);
         assert_eq!((load(&STATS.frames), load(&STATS.txs)), before);
     }

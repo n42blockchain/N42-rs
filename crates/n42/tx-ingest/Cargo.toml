@@ -22,7 +22,8 @@ reth-primitives-traits.workspace = true
 reth-evm.workspace = true
 alloy-primitives.workspace = true
 alloy-eips.workspace = true
-tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "time"] }
+parking_lot.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

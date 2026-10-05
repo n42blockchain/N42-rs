@@ -8486,6 +8486,7 @@ dependencies = [
  "n42-engine-types",
  "n42-tx-queue",
  "n42-tx-types",
+ "parking_lot 0.12.5",
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-primitives-traits",

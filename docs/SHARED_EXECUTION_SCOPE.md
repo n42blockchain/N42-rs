@@ -180,3 +180,192 @@ key shares key 0's layer.
 E1P80, E1P70, E1T build pool 32->64 and rayon 16->32, E1C74, E1FS) and `run-loop329.sh`/`launch-loop329.sh` (WARM, E7, E4, E4I, E4b,
 E4Ib) from the loop326 pair. The switch is the variable `ONCE` at the top of the runner; the runner and the launcher (after
 its build) refuse to start when the tree or the binary lacks `N42_IMPORT_ONCE`. Not launched.
+
+## 8. E=1: the seal's tail and the decay after the first minute
+
+Offline read of loop333 (`/data/blockchain/rust-fleet7-bench/bench-loop333*`, the strip/mem/threadcpu/pf files under
+`target/fleet-runs`; BREAKTHROUGH_DESIGN 10.80), no new run. Legs G80, G80b, X, Xb (200,000 transfers, 80 ms), H100
+(250,000, 100 ms), G70 and B70b (163,000, 70 ms). Times are seconds from the first full build (t0). All counts come from
+the layer's `seal-first build phases`, `own block handed to the engine`, `Canonical chain committed`, `Block added`
+lines; `state_wait_on` and `state_wait_split` are the build line's own attribution
+(`direct_build::open_wait`: output / grandparent / parent_root / parent_complete, and "open" for the rest of the open).
+
+### 8.1 The decay is mostly the harness, and what is left is the engine falling behind
+
+**The state wait has two kinds, and one of them is switched on by the measurement.** Per 10 s, builds whose
+`state_wait_ms` > 20 by `state_wait_on`:
+
+| leg | 0-30 s | 30-140 s | 140-172 s |
+| --- | --- | --- | --- |
+| G80b | open 0, grandparent 7-14 | open 8-16, grandparent 5-13 | open 0, grandparent 8-18 |
+| H100 | open 0, gp 5-7 | open 10-14, gp 1-9 | open 0, gp 9-13 |
+| B70b | open 0, gp 4-9 | open 8-22, gp 4-11 | open 0-6, gp 6-11 |
+
+On every one of the eleven legs (and on loop332's G80 and B80) the "open" waits begin at t0+31-32 s, exactly when
+window 1 ends, and stop when `fleet7-measure.py` stops reading: after window 1 it fetches every block of the window with
+`eth_getBlockByNumber(n, false)` (367 blocks of 200,000 hashes, ~13 MB of JSON each, one at a time), which takes about
+110 s (t0+30 to t0+140); the bench's own window 2 then sleeps over t0+140-170 (G80b: 347 blocks there by my count and
+by the bench's), and window 3 starts after the flood has ended (its "0 transactions" is the end of the set, not an RPC
+refusal). `analyze333.py`'s canonical slices 2 and 3 (t0+30-90) therefore lie entirely inside the read. Rates by period
+(seal `sealed_at` mean / p90 / p99, share of builds sealed later than the tick minus 3 ms):
+
+| leg | 0-30 s | 40-130 s (harness reading) | 140-172 s (quiet) | bench win2 / win1 |
+| --- | --- | --- | --- | --- |
+| G80 | 2.45M, 70/85/132, 20% | 2.20M, 87/147/227, 42% | 2.24M, 84/124/225, 47% | 91.7% |
+| G80b | 2.45M, 74/93/144, 23% | 2.21M, 86/138/215, 44% | 2.32M, 78/114/153, 33% | 94.5% |
+| X | 2.45M, 74/91/135, 28% | 2.20M, 86/141/230, 43% | 2.29M, 83/115/165, 50% | 93.8% |
+| Xb | 2.45M, 74/89/127, 29% | 2.20M, 86/138/217, 42% | 2.33M, 80/120/162, 38% | 95.1% |
+| H100 | 2.45M, 92/107/177, 28% | 2.18M, 108/180/267, 40% | 2.27M, 104/164/219, 37% | 93.5% |
+| G70 | 2.51M, 73/91/142, 57% | 2.21M, 86/142/225, 63% | 2.30M, 83/124/198, 73% | 88.7% |
+| B70b | 2.28M, 58/70/114, 14% | 2.10M, 72/120/189, 34% | 2.25M, 63/88/124, 26% | 100.0% |
+
+So of the 9-12% loss in 10.80's windows 2-3, about two thirds is the harness's RPC read of window 1 contending with
+the leader's state open, and one third is real: in the quiet period the full-block legs at 200-250k read 91-95% of
+window 1 and B70b (163k at 70 ms) reads 100%. What the RPC read does to the leader: 9-13% of builds wait 60-120 ms in the
+open with no named wait (`split` 0/0/0/0, `gp_layer=1`, the great-grandparent already in the engine), so the time is
+inside `client.state_by_block_hash(great_grandparent)` (in-memory lookup, `database_provider_ro`, the stage checkpoint
+and the anchor's `block_hash` read from the static files, `OverlayStateProvider::new`) or in `leader_layers::keep`
+(it drops the released great-grandparent layer on the build thread). Which of these the RPC read blocks is not
+named by any field; the static-file path (the anchor's header read while persistence commits static files, 47 ms a
+commit on average: `save_blocks_commit_sf` 84 s over 1,777 commits) is the first suspect. It is a product issue too: a
+node that serves block reads while it leads would lose the same 10%.
+
+**What tracks the real residual (t0+140-172 against window 1, G80b/X/Xb pooled, slow = `sealed_at` >= 85):** slow
+builds 23% of 1,110 against 12% of 1,468; of them 46% wait on the grandparent (the engine), 36% on the parent's
+fields, 16% other. Medians hardly move (`sealed_at` 71 -> 73, `par_ms` 61 -> 61, `par_exec_ms` 26 -> 26); means move
+by the tail (`sealed_at` 73.5 -> 77.8, `roots_ms` 28.9 -> 33.8, `root_faults_undo` 2 -> 21, `root_append_faults`
+5 -> 23, `state_wait_ms` 5.7 -> 8.1, `sealed_ms` 10.7 -> 12.3). The engine is two to three blocks behind the seal at
+every build start (median lag 3: the newest block in the engine is N-3 when N starts; lag 4 on 5-15% of starts),
+its own-block hand-off grows from 29-32 ms to 32-40 ms (p90 40 -> 45-59) and its per-block busy time (hand-off +
+canonical commit 15-22 ms + head moves on 25-45% of blocks, `own block forks from the engine's head`) from 50-53 ms to
+55-71 ms on an 82 ms cycle. That is the "grandparent" class growing from 6-8% to 10-12% of builds.
+
+**What does not track it:**
+
+- In-memory blocks: 10-17 for the whole leg (memsample `num`), throttle silent; persistence 58 ms a full block
+  (215 s over 3,691 blocks in 1,180 batches), below the cycle throughout. Overlay filter cache 15-17 entries, ~2 builds
+  a block, flat.
+- Accounts: the 400M set pays 2,000,000 recipients (`--recipients 2000000`), 190,503 distinct a block (shape line). The
+  range is fixed, so creations decay geometrically: 95% of the range exists after ~30 blocks (~2.5 s) and the rest of
+  the leg is updates only (`root_twig_pool_refills` mean 5.2 in window 1, 0.6 late). The later part of the set does
+  not create more or touch a wider range; window 1 carries the creations.
+- RSS: the layer's RSS climbs 16 -> 40 G, but host-wide `AnonPages` only 19.5 -> 22.7 G (validators and flood
+  included, Shmem flat 14.6 G): about 20 G of the growth is file-backed mapped pages (the entry file and static files
+  mapped by readers), not heap. No leak is visible. `AnonHugePages` 12.9-15.1 G flat; `compact_stall` +124 over a leg.
+- Memory pressure: `Cached` grows 1.1 GB/s (35 -> 105 G) until `MemFree` reaches ~1.7 G at about t0+65 s, then kswapd
+  reclaims (Cached 105 -> 64 G over t0+70-95 s) and the cycle repeats (MemFree 3.6-16 G at t0+125-145). The fillers are
+  the replay set (64.9 GB read over 175 s) and the layer's static-file writes. This overlaps the harness read, so its
+  share cannot be separated in loop333; page-fault samples (`pf-*.csv`, perf stat for 60 s) cover only t0-4 to +55 s
+  (67k/s rising to 140-148k/s).
+- QMDB growth: the delta-log checkpoint grows linearly with updates (5.7 MB at t0 -> 47.7 MB at t0+165; compaction wall
+  29 -> 95-224 ms, on its own nice-10 thread, 131 -> 8 compactions per 20 s). The entry file is append-only, so every
+  update grows the tree whether or not it creates an account; the root's undo/append faults (above) are where that shows
+  up on the seal.
+
+**Verdict.** "The chain is slower on a bigger state" is a real but small property at E=1: 5-9% at 200-250k a block after
+two to three minutes, 0% at 163k, carried by (a) the engine's per-block import growing until the great-grandparent
+is sometimes not in the engine at the child's start and (b) the root's faults growing with the append-only tree. Neither
+is a leak, and both are fixable (8.4). The rest of 10.80's decay is the harness (fixable in the script) and a real RPC
+contention in the leader's state open (fixable in code once named).
+
+### 8.2 The tail: what `state_wait_ms` waits for
+
+The chained build of N starts at N-1's seal and opens N-1's state lazily after its pull
+(`N42_STATE_AFTER_PULL=1`) through `opener_on_sealed_parent_with`: N-1's output (filed as shards + residual, never
+waited on here: `output_ms` 0 on every build), N-2 from the kept layer (`N42_GRANDPARENT_SHARDS`, default on), and the
+engine's state at N-3 underneath. When N-3 is not in the engine yet (`ggp_missing=1`) it falls back to
+`grandparent_state`, i.e. polls (2 ms) until **N-2** is in the engine. Slow builds' `split` is `0/60-90/0/0` with
+30-36 polls, `gp_layer 0`, `ggp_missing 1`: the 90 ms is the wait for the engine to land N-2 after it was still missing
+N-3. Timeline of a typical case (G80 block 718): N-1 sealed at 0; the engine adds 714 at -86 ms, 715 at +28 ms
+(hand-off 30 ms), moves its head at +56 for 716 and adds 716 at +84; the open ends at about +68-70, once 716 is
+reachable. Had the fallback waited for N-3 (715) it would have ended at about +30; had a third layer been kept it would
+not have waited at all. What delays N-3: nothing exotic. The engine imports one own block per ~55 ms of serial work
+(the hand-off's `chain_alias::rename` behind the forest lock held by the root job, `forest lock held
+label="compute_operations"` 20-25 ms on 30-76 builds per 10 s; the insert behind the previous canonical commit;
+the head move when the new block's parent is not the head), and the hand-off itself starts only after the block's
+`Complete` (~100-110 ms after its seal: `state_ready_ms` 98-109). So a block reaches the engine about two cycles after
+its seal, which is exactly where N's start lands N-2, and one slow import (a 40-60 ms hand-off, a head move, a QMDB
+compaction or persistence batch near it; none of them is present in more than 25% of the cases) puts N-3 behind too.
+No periodicity (10.80: no pattern mod 8, isolated).
+
+**Not the waits the three-node switches shortened.** `N42_SHARDS_MERGE_OFF_PATH` is read only by
+`bin/n42/src/follower_import.rs`; with `N42_IMPORT_ONCE` the layer never imports its own block by execution, so the
+switch does nothing at E=1. `N42_FIELDS_AT_SEAL=1` shortens the parent-fields chain (8.3: `rename_wait_us` 19-25 ms
+median), which is the 36% "parent_fields" share of the late slow builds, and it renames the parent's tree early, so the
+grandparent's later hand-off finds the rename done; it may thin the grandparent class indirectly but does not address
+it. Starting the build on the parent's shard view without the merge is what the opener already does (`output_ms` 0).
+The fix for this wait is a third kept layer (8.4 C1).
+
+### 8.3 What is serial per block and the seal's floor
+
+Window 1 medians / p90, ms (G80; G80b, G70 within 1-3 ms; H100 scales with 250k, B70b with 163k):
+
+| chain | piece | median / p90 |
+| --- | --- | --- |
+| child's build (start at N-1's seal) | start (`start_best`: walk 5, handoff 2) | 8 / 21 |
+| | pull 4 + prep 3 + partition 0 | 7 / 9 |
+| | state open (`state_wait`) | 0 / 0 (tail 8.2) |
+| | execution `par_run` (batch start skew 13 + longest batch 16-17; `par_exec` 26) | 28 / 38 |
+| | commit 2 + fold 6 (+ index 4-5 inside) + tx root 2 | 10 / 12 |
+| | parent's fields (`parent_fields_ms`) | 0 / 16 |
+| | seal (`sealed_ms`, remember 3) | 5 / 22 |
+| | **`sealed_at`** | **67 / 85** |
+| parent's fields (N-1 after its seal) | finish to shard view (`seal_to_view`) | 13 / 15 |
+| | rename wait for N-2's `Complete` (`rename_wait_us`, fields at seal off) | 19 / 32 |
+| | QMDB root (`roots_ms`: apply 14, hash 1, the rest undo/append/lock) | 29 / 35 |
+| | **`seal_to_fields`** | **64 / 77** |
+| engine (per own block) | hand-off (rename under the forest lock, insert) | 29-32 / 40 |
+| | canonical commit | 17-18 / 22 |
+| persistence (own thread) | ~3-block batches | 58 per block |
+
+The execution is 42% of the median seal, start 12%, pull/prep 10%, commit/fold/tx root 15%, seal 8%; the roots
+(22-28 in 10.80's phrasing, 29 here at 200k) are not on the child's chain but on the parent-fields chain, which runs
+beside it and is nearly as long (64 against 67). The floor today is the longer of the two: ~64-67 ms median, p90
+~85. With `N42_FIELDS_AT_SEAL=1` the fields chain drops to ~45 (13 + 29 + publish) and the floor is the build chain
+itself, ~58-60 ms of waits-free work (the sum of the medians above). For a 60 ms tick to stop binding (35-43% of
+blocks at 60-70 ms in loop332/333), the p90 has to come under 60: fields at the seal (removes ~20 ms from the fields
+chain), the grandparent wait gone (8.4 C1: the 60-90 ms tail of 6-12% of builds), and one more piece of the build
+chain cut by 10-15 ms. The single piece that can give that is the execution's batch start skew (13 ms of the 28:
+batches start 13 ms apart from first to last on a 32-thread pool, then the longest batch runs 16-17 ms); more build
+threads did not help at 163k (loop331 R with 96 against B32: 49 against 43 ms), so it is the dispatch, not the
+thread count.
+
+### 8.4 Ranked changes
+
+Switches to try on a leg first (no code; G80 and G70 on the 400M set, harness fix S0 in place):
+
+| # | switch | targets | expected | confirm by |
+| --- | --- | --- | --- | --- |
+| S0 | measure windows from the layer's canonical log (or read the windows' blocks after the leg), not by RPC between windows | the 30-140 s "open" waits | windows 2-3 from 2.20M to the quiet 2.24-2.33M; nothing on window 1 | no `state_wait_on="open"` > 20 ms anywhere in the leg |
+| S1 | `N42_FIELDS_AT_SEAL=1` (run `=verify` once first) at 200k / 80 and 70 ms | `rename_wait`, parent-fields tail | seal p90 -10 to -15 ms; G70 seal-bound share 43% -> under 30%; peak +2-4% | `seal_to_fields` median < 50, `parent_fields_ms` p90 < 5, `fields_mismatches` 0, no handover TC (tenure 1024 has no handover in a leg) |
+| S2 | `N42_QMDB_APPEND_AHEAD_MB=256 N42_QMDB_APPEND_REWALK=1 N42_QMDB_UNDO_POOL=128 N42_TWIG_POOL_FLOOR=1024` | root's append/undo faults growing late | late `roots_ms` back to ~29; sustained +1% | `root_append_faults`, `root_faults_undo` means flat across the leg |
+| S3 | replay reader with `POSIX_FADV_DONTNEED` (or `F7_DROP_CACHE` mid-leg), harness only | page cache full at +65 s, reclaim | removes the reclaim from the measurement; unknown share | `MemFree` never under ~10 G; compare quiet-period rates |
+
+Code changes, by expected effect:
+
+1. **C1, a third kept layer for the leader's opener** (`crates/n42/engine-types/src/direct_build.rs`:
+   `leader_layers` keeps three generations; the opener walks the kept layers newest first down to the first
+   ancestor the engine holds; the fallback waits for the oldest missing ancestor, never for N-2). Removes the
+   "grandparent" class (6-8% of builds in window 1, 10-12% late, 60-90 ms each). (a) sustained +3-5%, (b) peak at
+   G70/H80 +4-8% (fewer seal-bound blocks). Risk low: one more block's shard set in memory (hundreds of MB), one more
+   overlay level on reads; the overlay-order tests in `direct_build.rs` cover it. Confirm: `gp_layer` 1 on >= 99%
+   of builds, `ggp_missing` ~0, `state_wait_on="grandparent"` < 0.5%. A one-line interim: in the fallback wait
+   for the great-grandparent instead of the grandparent (about 30-50 ms of each such wait).
+2. **C2, name and remove the RPC contention in the open** (split `state_by_block_hash` and `leader_layers::keep`
+   into timed fields first; then likely candidates: hand the released layer to a release thread; avoid the
+   static-file `block_hash` read in `n42_layered_state_provider` by checking the anchor against the in-memory
+   chain). (a) for any node serving reads while leading, the 10% of 8.1; on the bench equal to S0. Risk low.
+   Confirm: an RPC-reading leg (today's harness) with no "open" waits.
+3. **C3, a cheaper own-block import** (`bin/n42/src/payload_serve.rs` hand-off: rename before `Complete` when the
+   fields are early, the insert not queued behind the canonical commit, and no head move for a block whose parent is
+   the engine's pending head). Shrinks the engine's 55-70 ms per block that makes N-3 late and that grows over the
+   leg. (a) +2-3% (the late drift), (b) small. Risk moderate (engine ordering). Confirm: hand-off p90 flat at <= 35
+   across the leg, lag-4 starts < 2%.
+4. **C4, the execution's batch dispatch** (pre-armed workers or batches handed out by work-stealing instead of a
+   serial start, `crates/n42/engine-types/src/batch_state.rs` / the parallel step in `payload.rs`). Only for (b):
+   with S1 and C1 the build chain is the floor and `batch_start_skew` 13 ms is its largest removable piece; -8 to -12
+   ms on the seal would let 60 ms ticks hold (163k at 60 ms: 2.7M; 200k at 70 ms: 2.86M). Risk moderate. Confirm:
+   `batch_start_skew_ms` < 4, `par_run_ms` median <= 20, B60 seal-bound share < 10%.
+
+Analysis scripts used: ad-hoc parsers of the same lines as `scripts/fleet7-runs/analyze333.py` (per-10 s phase
+medians, `state_wait_on` counts, wait end against engine events, period comparisons); none was kept.

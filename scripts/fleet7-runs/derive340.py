@@ -52,6 +52,11 @@ def derive(suffix):
             mk('P3X', *P3, iv('$HELD'), ('F7_WINDOWS_ARG', '5')),
             'W339=5 python3 scripts/fleet7-runs/persist340.py loop340P3X 2>&1 | cut -c1-900; W339=5 python3 scripts/fleet7-runs/feed337.py loop340P3X 2>&1 | cut -c1-420; W339=5 python3 scripts/fleet7-runs/plan339.py loop340P3X 2>&1 | cut -c1-420; grep -E "^win[1-5] " $B/bench-loop340P3X/round.txt | cut -c1-170']
         title = 'Claim 2: WARM, WARMb, PE, PEW, P3S, P3S163, P3P55..P3P40 (gated: cycle within 3 ms and flat backlog), P3X (five windows).'
+    elif suffix == 'r':
+        # claim 1 stopped after P3: the read-back check flagged reth's normal start-up line and a deferred header's gasUsed, and a 200k block does not fit the default 160 MB RPC response: the check's own faults.
+        # The rest of claim 1 runs again here with the fixed check on P3b (its layer started with --rpc.max-response-size 1000, an RPC-only limit).
+        body = warm + [mk('Nb'), mk('P3b', *P3).replace('--prune.transaction-lookup.full"', '--prune.transaction-lookup.full --rpc.max-response-size 1000"')]
+        title = 'Claim 1 repeat: WARM, WARMb, Nb, P3b (read-back check after P3b).'
     else:
         body = warm + ['BT=$(python3 scripts/fleet7-runs/best337.py loop340 PE PEW P3S P3S163 P3P55 P3P50 P3P45 P3P40); echo "BEST single leg: ${BT:-none}"',
                        'if [ -n "$BT" ]; then argsof $BT BARGS; legf BEST "${BARGS[@]}"; legf BESTb "${BARGS[@]}"; fi']
@@ -75,7 +80,7 @@ def derive(suffix):
     # the static-file read-back check on P3, with the layer still up
     k = "  for p in $(pgrep -f '/n4[2] node --chain'; pgrep -f 'h2_validato[r]'; pgrep -f 'tx_floo[d]'); do kill -9 $p 2>/dev/null; done; sleep 2\n}"
     assert run.count(k) == 1
-    hook = ('  STOPNOW=0\n  if [ "$tag" = loop340P3 ]; then echo "== read-back check of $tag (layer still up) from $(date +%H:%M:%S)"; timeout 1500 python3 scripts/fleet7-runs/check340.py $tag 2>&1 | cut -c1-420 | tee $S/check340-$tag.out; '
+    hook = ('  STOPNOW=0\n  if [ "$tag" = loop340P3' + ('b' if suffix == 'r' else '') + ' ]; then echo "== read-back check of $tag (layer still up) from $(date +%H:%M:%S)"; timeout 1500 python3 scripts/fleet7-runs/check340.py $tag 2>&1 | cut -c1-420 | tee $S/check340-$tag.out; '
             '[ "${PIPESTATUS[0]}" = 1 ] && STOPNOW=1; echo "== read-back check done $(date +%H:%M:%S)"; fi\n')
     tail = ('  for p in $(pgrep -f \'/n4[2] node --chain\'; pgrep -f \'h2_validato[r]\'; pgrep -f \'tx_floo[d]\'); do kill -9 $p 2>/dev/null; done; sleep 2\n'
             '  if [ "$STOPNOW" = 1 ]; then echo "READ-BACK CHECK FAILED on $tag: stopping the round (datadirs kept as evidence)"; cleanup; echo "released at $(date +%H:%M)"; echo ALLDONE; exit 1; fi\n}')
@@ -86,4 +91,4 @@ def derive(suffix):
     open(D + f'run-loop340{suffix}.sh', 'w').write(run)
     la = open(D + 'launch-loop339.sh').read().replace('run-loop339.sh', 'run-loop340' + suffix + '.sh').replace('loop339', 'loop340' + suffix)
     open(D + f'launch-loop340{suffix}.sh', 'w').write(la)
-for sfx in (sys.argv[1:] or ['', 'b', 'c']): derive(sfx)
+for sfx in (sys.argv[1:] or ['', 'b', 'c', 'r']): derive(sfx)

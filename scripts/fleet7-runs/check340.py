@@ -3,9 +3,9 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 """loop340 (docs 10.87): read-back of a leg's static-file data through the layer's RPC, run while the layer is still up, before the datadirs are wiped.
 usage: check340.py <tag> [rpc port, default 8700]. Exit 0 = everything read right, 1 = something read wrong, 2 = the check could not complete (timeout / no answer).
-1. The layer's log: any line about static-file consistency or healing beyond the start-up (lines matching heal|inconsisten|unwind|corrupt|NippyJar|mismatch, printed).
-2. For the first full block of the leg, a middle one and the last one: eth_getBlockByNumber with full transactions and eth_getBlockReceipts: the transaction count equals the
-   canonical-log count, the receipts' count equals it, every receipt's status is 1, cumulativeGasUsed rises and ends at the block's gasUsed, the receipts' transaction
+1. The layer's log: any line about static-file consistency or healing beyond the single start-up line `check_consistency: Healing static file inconsistencies.` (lines matching heal|inconsisten|unwind|corrupt|NippyJar|mismatch, printed).
+2. For the first full block of the leg, a middle one and the last one (the layer needs --rpc.max-response-size 1000 for a 200k block's receipts, ~280 MB): the block's hash list, eth_getBlockReceipts and eth_getTransactionByBlockNumberAndIndex for five transactions: the transaction count equals the
+   canonical-log count, the receipts' count equals it, every receipt's status is 1, cumulativeGasUsed rises and ends at the NEXT block's header gasUsed (deferred execution: a header carries its parent's execution), the receipts' transaction
    hashes equal the block's in order, and for the first / middle / last transaction (and two more) of each block the hash is recomputed from the fields
    (keccak256(0x50 || rlp([...fields, signature])), docs/spec/N42_TX_0x50.md), the Ed25519 signature is verified over the signing hash and `from` equals
    keccak256(alg || pubkey)[12:]. The raw JSON of the sampled transactions is saved to /data/n42-build/target-n42-rs/fleet-runs/check340-<tag>.json."""
@@ -24,14 +24,16 @@ def call(method, params, timeout=300):
     r = json.load(urllib.request.urlopen(req, timeout=timeout))
     if 'error' in r: raise RuntimeError(str(r['error'])[:300])
     return r['result']
-# 1. the log
+# 1. the log: reth prints "check_consistency: Healing static file inconsistencies." once at every start-up (log line ~10, in every leg); that line is the normal one.
 log = f'{B}/node0/el.log'
 pat = re.compile(r'heal|inconsisten|unwind|corrupt|nippyjar|mismatch', re.I)
-hits = [l.rstrip()[:300] for l in open(log, errors='replace') if pat.search(l) and 'fields_mismatches=0' not in l and 'gas used mismatch' not in l]
-hits = [l for l in hits if 'seal-first build phases' not in l]
-print(f'log: {len(hits)} lines match heal|inconsisten|unwind|corrupt|NippyJar|mismatch (excluding the build lines\' counters)')
-for l in hits[:8]: print('   ', re.sub(r'\x1b\[[0-9;]*m', '', l))
-if any(re.search(r'heal|inconsisten|corrupt', l, re.I) for l in hits): bad.append('log: healing / inconsistency message')
+ansi = re.compile(r'\x1b\[[0-9;]*m')
+allhits = [(i, ansi.sub('', l.rstrip())[:300]) for i, l in enumerate(open(log, errors='replace'), 1) if pat.search(l) and 'seal-first build phases' not in l and 'gas used mismatch' not in l]
+startup = [h for h in allhits if 'check_consistency: Healing static file inconsistencies.' in h[1]]
+other = [h for h in allhits if h not in startup]
+print(f'log: {len(allhits)} lines match heal|inconsisten|unwind|corrupt|NippyJar|mismatch; the normal start-up line "Healing static file inconsistencies." x{len(startup)} (at log line {[h[0] for h in startup]}); others: {len(other)}')
+for i, l in other[:8]: print('   ', i, l)
+if len(startup) != 1 or other: bad.append('log: a healing / consistency line beyond the single start-up one')
 canon = measure.log_blocks(log); full = [c for c in canon if c[2] >= 100000]
 if not full: print('no full block'); sys.exit(2)
 nums = [full[0][1], full[len(full) // 2][1], full[-1][1]]; counts = {c[1]: c[2] for c in canon}
@@ -39,17 +41,20 @@ print('blocks checked:', nums, 'transaction counts from the log:', [counts[n] fo
 samples = {}
 try:
     for n in nums:
-        blk = call('eth_getBlockByNumber', [hex(n), True]); txs = blk['transactions']
+        blk = call('eth_getBlockByNumber', [hex(n), False]); hashes = blk['transactions']
+        nxt = call('eth_getBlockByNumber', [hex(n + 1), False])
         rc = call('eth_getBlockReceipts', [hex(n)])
-        ok = len(txs) == counts[n] and len(rc) == len(txs)
+        ok = len(hashes) == counts[n] and len(rc) == len(hashes)
         st = sum(1 for r in rc if r.get('status') in ('0x1', 1, True)); cum = [int(r['cumulativeGasUsed'], 16) for r in rc]
-        mono = all(a < b for a, b in zip(cum, cum[1:])) and (not cum or cum[-1] == int(blk['gasUsed'], 16))
-        same = all(t['hash'] == r['transactionHash'] for t, r in zip(txs, rc))
-        print(f'block {n}: {len(txs)} txs (log {counts[n]}), {len(rc)} receipts, status ok {st}, cumulative gas rising and ending at gasUsed: {mono}, receipt hashes equal the block\'s in order: {same}')
-        if not (ok and st == len(rc) and mono and same): bad.append(f'block {n}: count/status/gas/hash order')
-        idx = sorted({0, len(txs) // 2, len(txs) - 1, len(txs) // 4, 3 * len(txs) // 4}); done = 0
+        rising = all(a < b for a, b in zip(cum, cum[1:]))
+        # deferred execution: a header carries its PARENT's execution, so block n's receipts must end at block n+1's header gasUsed
+        gas_ok = bool(cum) and cum[-1] == int(nxt['gasUsed'], 16)
+        same = all(h == r['transactionHash'] for h, r in zip(hashes, rc))
+        print(f'block {n}: {len(hashes)} txs (log {counts[n]}), {len(rc)} receipts, status ok {st}, cumulative gas rising: {rising}, ends at {cum[-1] if cum else 0:,} = block {n + 1} header gasUsed {int(nxt["gasUsed"], 16):,}: {gas_ok}, receipt hashes equal the block hash list in order: {same}')
+        if not (ok and st == len(rc) and rising and gas_ok and same): bad.append(f'block {n}: count/status/gas/hash order')
+        idx = sorted({0, len(hashes) // 4, len(hashes) // 2, 3 * len(hashes) // 4, len(hashes) - 1})
         for i in idx:
-            tx = txs[i]; samples[f'{n}:{i}'] = tx
+            tx = call('eth_getTransactionByBlockNumberAndIndex', [hex(n), hex(i)]); samples[f'{n}:{i}'] = tx
             try:
                 fl = lambda k, *alts: next(tx[a] for a in (k,) + alts if a in tx)
                 body = dict(chainId=fl('chainId'), nonce=fl('nonce'), maxPriorityFeePerGas=fl('maxPriorityFeePerGas'), maxFeePerGas=fl('maxFeePerGas'), gasLimit=fl('gasLimit', 'gas'),
@@ -57,13 +62,12 @@ try:
                 sig = vec.unhex(fl('signature'))
                 signing = vec.keccak256(b'\x50' + vec.rlp_list(vec.fields(body)))
                 enc = b'\x50' + vec.rlp_list(vec.fields(body) + [vec.rlp_bytes(sig)])
-                h = vec.keccak256(enc).hex(); okh = ('0x' + h) == tx['hash']
+                okh = ('0x' + vec.keccak256(enc).hex()) == tx['hash'] == hashes[i]
                 Ed25519PublicKey.from_public_bytes(vec.unhex(body['pubkey'])).verify(sig, signing)
                 sender = '0x' + vec.keccak256(bytes([vec.qty(body['algType'])]) + vec.unhex(body['pubkey']))[12:].hex()
                 oks = sender.lower() == tx['from'].lower()
-                done += 1
                 if not (okh and oks): bad.append(f'block {n} tx {i}: hash recompute {okh}, sender {oks}')
-                else: print(f'   tx {i}: hash recomputed ok, Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]')
+                else: print(f'   tx {i}: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]')
             except Exception as e:
                 warn.append(f'block {n} tx {i}: could not recompute ({type(e).__name__}: {str(e)[:120]}); keys {sorted(tx)[:20]}')
 except Exception as e:

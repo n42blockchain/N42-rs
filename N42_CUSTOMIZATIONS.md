@@ -89,6 +89,17 @@
   `N42_ACCOUNT_HISTORY_SCAN_MAX`（默认 100000 块）则返回点名该模式的错误，绝不返回错值；
   `rocksdb/invariants.rs` 的 `heal_accounts_history` 不修复（不 unwind）缺口内的范围；unwind 到缺口以下
   时删除标记（`update_pipeline_stages_after_unwind`）。`StoragesHistory` 不变
+- `crates/storage/provider/src/providers/static_file/n42_sf.rs`（N42 新增文件）：交易静态文件段的写入开关
+  （`docs/PERSISTENCE_COST_STUDY.md` 第 11 节）。`static_file/writer.rs` 新增两个方法（只加不改）：
+  `append_transactions_encoded`（追加已按 `Compact` 编码好的行，tx 编号检查、段头范围与 offset
+  与逐条 `append_transaction` 完全相同）与 `n42_start_writeback`（对数据文件调用
+  `sync_file_range(SYNC_FILE_RANGE_WRITE)`，只是提示，失败忽略）；`static_file/manager.rs` 的
+  `write_transactions` 改为经 `n42_sf::append_block_transactions` 写每个块。
+  `N42_SF_PARALLEL_ENCODE=1`（默认关）：每块的行在 storage 线程池上按 4096 行一组并行编码，再按序追加，
+  磁盘字节与串行路径逐字节相同；`N42_SF_EARLY_WRITEBACK=1`（默认关）：每块追加后启动数据文件回写，
+  批次末尾的 `sync_all` 不变（持久性语义不变），只需等最后一块。测试在 `static_file/n42_sf_tests.rs`
+  （两条路径逐文件逐字节比较、原读取器读回、同一文件混写与重启、unwind 后重写、崩溃自愈）；
+  provider 的 dev-dependency 新增 `n42-tx-types`
 
 ## 模块4: network
 ### 定制内容:

@@ -2323,3 +2323,55 @@ Binaries. Claim 1 (WARM, G80, G80b, FV, FS, FSb) ran binaries frozen from loop33
 What this changes. The E=1 chain at 200,000-transfer blocks sustains what it peaks at; nothing left on the opener or the harness limits it at 80 ms; the next limit is the ~72 ms cycle floor (seal 59-62 ms + 12 ms of commit and vote), so the next gain is in the build chain itself (8.3: the batch start skew, the execution's 26-27 ms) and a pair at 70 ms and below before anything is claimed.
 
 Files: `scripts/fleet7-runs/{derive334.py,analyze334.py,results/loop334.out}`; the runners are derived by `derive334.py` from loop333's.
+
+### 10.82 The E=1 cycle floor (loop335): pairs at 70 and 75 ms read 2.58-2.65M, the cycle is the seal chain plus 10 ms and consensus is 100 ms off it; block size moves the rate by under 4%; layers 4 and a build pool of 64 add nothing
+
+Every figure is E=1 (seven keys on one execution layer, windows from the layer's canonical log, 400M replay set, no RPC block reads during a flood); not comparable with the three-node record. Base P = loop334 L3FS (`N42_LEADER_LAYERS=3`, `N42_FIELDS_AT_SEAL=1`, 200,000 transfers a block). Tip fa12c4c0b, built and tested under the full gate (1,001 tests) in a git worktree (`/data/n42-build/wt335`, the main tree carried another agent's uncommitted edit that broke `payload.rs` at the first attempt; the same worktree and target dir serve loop336). Claim 2's legs (WARM2, S250, S300, L4, T64) ran first by a launcher mix-up and are labelled "plain feed" (rate 4.0M, pool 2.0M); claim 1 (WARM, P70, P70b, P75, P75b, S163, S163b) ran with the feed raised from the start (rate 6.0M, pool 3.0M). A leg is rerun once when its feed bound (`feedcheck335.py`: under 97% full blocks, or a median queue under 2.5 blocks, in a window); reruns carry `r`.
+
+**Feed.** Loop334's plain feed (rate 4.0M, pool 2.0M, gate 1.67M) held at 70 ms (WARM2 and S250 passed the check) but not above ~2.7M/s: S300 (300k at 105 ms) had 92% full blocks in windows 1 and 2 (queue median 426k in window 2), L4 fell to 95% in window 3 (queue median 285k), and S163 at 60 ms bound in window 3 even with 6.0M / 3.0M (queue median 302k); each rerun with 6.0M / 3.0M (8.0M / 4.0M for S163) passed with the queue at 2.0-3.2M. The raised legs' numbers are the ones reported; S163b (6.0M / 3.0M) passed without a rerun. Delivery median 2.61M/s on P70 (the gate throttles it to consumption).
+
+| leg | win1 | win2 | win3 | round | blocks w1 | cycle w1 mean / med / p90 | sealed_at w1 med / p90 / p99 | tick / seal % | layer cores | peak RSS |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| WARM (70 ms) | 2,606,667 | 2,566,667 | 2,593,333 | 233.0M | 391 | 76.5/72.6/91.0 | 62/76/91 | 67/32 | 25.9 | 36.8 G |
+| P70 | 2,613,333 | 2,566,667 | 2,580,000 | 232.8M | 392 | 76.6/72.2/88.7 | 61/77/102 | 68/31 | 25.7 | 37.0 G |
+| P70b | 2,646,667 | 2,546,667 | 2,580,000 | 233.2M | 397 | 75.5/72.0/87.5 | 62/75/90 | 74/25 | 26.2 | 36.3 G |
+| P75 (75 ms) | 2,573,333 | 2,540,000 | 2,566,667 | 230.4M | 386 | 77.7/76.4/85.3 | 61/75/89 | 93/7 | 25.9 | 36.4 G |
+| P75b | 2,580,000 | 2,573,333 | 2,573,333 | 231.8M | 387 | 77.7/76.4/83.6 | 60/77/93 | 92/8 | 25.1 | 35.9 G |
+| S163 (163k, 60 ms; feed-bound) | 2,445,000 | 2,417,833 | 2,386,183 | 217.5M | 450 | 66.5/62.0/78.4 | 51/59/71 | 72/27 | 24.4 | 33.6 G |
+| S163r (rerun, feed 8M/4M) | 2,553,667 | 2,483,033 | 2,499,333 | 226.1M | 470 | 63.9/61.5/71.7 | 52/62/82 | 85/15 | 26.0 | 36.2 G |
+| S163b | 2,559,100 | 2,493,900 | 2,542,800 | 227.9M | 471 | 63.7/61.5/71.0 | 50/61/75 | 87/12 | 25.7 | 35.4 G |
+| WARM2 (70 ms) | 2,630,883 | 2,586,667 | 2,573,333 | 233.7M | 395 | 75.8/71.9/89.2 | 61/76/95 | 73/26 | 25.7 | 34.7 G |
+| S250 (250k, 90 ms) | 2,625,000 | 2,600,000 | 2,583,333 | 234.2M | 315 | 95.3/91.9/108.8 | 80/99/117 | 71/28 | 25.6 | 37.0 G |
+| S300 (300k, 105 ms; feed-bound) | 2,644,583 | 2,608,233 | 2,500,000 | 232.6M | 269 | 111.7/107.0/131.2 | 93/112/130 | 70/29 | 25.5 | 38.2 G |
+| S300r (rerun, feed 6M/3M) | 2,690,000 | 2,620,000 | 2,610,000 | 237.6M | 269 | 111.6/106.7/130.4 | 93/104/142 | 76/21 | 25.3 | 40.0 G |
+| L4 (4 layers; feed-bound w3) | 2,632,533 | 2,566,667 | 2,500,567 | 231.0M | 395 | 75.9/71.8/90.2 | 61/68/87 | 78/22 | 26.2 | 35.2 G |
+| L4r (rerun, 6M/3M) | 2,646,667 | 2,580,000 | 2,586,667 | 234.4M | 397 | 75.7/71.7/89.5 | 62/72/91 | 73/26 | 25.6 | 36.9 G |
+| T64 (build pool 64) | 2,606,667 | 2,466,667 | 2,553,333 | 228.8M | 391 | 76.6/73.0/90.2 | 63/70/89 | 64/35 | 32.1 | 34.6 G |
+(Binding shares are window 1, tick / seal %. Every window of every leg is >= 99% full blocks except S300 and L4 plain. Layer cores 24-26 (32 on T64), validators 1.0. RSS 3.7 -> 21 -> 27 -> 33-37 G across the windows on every leg; in-memory blocks max 10-12. Persistence ~49 ms a full block at 200k. `own_executed_again` 0, tc 1, own_not_committed 0, given_up 0, invalid_blocks 0 on every leg. Engine own-import 30-36 ms median per 200k block.)
+
+**The floor, taken apart (`cycle335.py`, P70 and P75, windows 1-3, leader = validator 0; median / p90 ms).** The cycle is the leader's build chain; consensus is not on it.
+
+| piece | P70 | P75 |
+| --- | --- | --- |
+| chain start -> frame build sealed | 62.5 / 76.4 | 63.0 / 76.2 |
+| frame sealed -> early-seal answered | 3.4 / 4.5 | 3.4 / 4.7 |
+| early-seal answered -> next chain start (the release) | 2.3 / 18.3 | 2.1 / 19.0 |
+| seal-to-seal cadence (chain start -> next chain start) | 72.5 / 92.4 | 73.6 / 93.0 |
+| cycle (proposal -> proposal) | 72.1 / 91.2 | 76.4 / 85.7 |
+| early-seal answered -> proposal sent | 25.5 / 56.3 | 45.5 / 71.7 (the tick waits) |
+| proposal -> each key's vote | 9.7-11.1 per key, slowest key 12.7 / 47.2 | 9.1-11.3, slowest 13.0 / 41.0 |
+| proposal -> commit (R1 13, R2 5 at the leader) | 19.5 / 53.9 | 19.9 / 48.5 |
+| commit minus the release of the build two on | -109 / -63 (off the chain) | -92 / -56 |
+| commit -> Decide at a key | 1.1 | 1.1 |
+
+So the ~12 ms after the seal in the seal-to-seal cadence are not commit and vote (the commit of block H lands 90-110 ms before the build two on is released): they are the frame seal and its answer (3.4), the release (2.3 median, a tail to 18-19 ms at p90 that carries the mean: the one-ahead rule defers the child's start until the proposal path has taken the parent's chained build, scope 9.3) and the remaining 4 ms of the chain start before the first frame is sealed; the mean cycle (75.5-77.7) is the median 72 plus that release tail. At 75 ms the tick binds 92-93% of blocks (proposals tick-bound 635 of 651) and the cycle reads 76.4 (tick + 1.4); at 70 ms the seal binds 25-31% of blocks and the cycle median stays 72.0-72.2.
+
+Repeated per key (what seven keys on one layer cost, over 3 windows of ~620 views): each key syncs its vote log on 148-211 of 623-651 views (6-8 ms median, 24-33% of views; a vote's own path, off the chain unless the proposal waits for it: `body prepared -> proposal sent` 0.6 / 7.6); `commit forkchoice answered` lines are logged only when slow (73-109 per key over the windows, 21-24 ms median, p90 37-62) while the layer's own log shows 1,252-1,294 `Forkchoice updated` lines for 1,152-1,164 canonical blocks (about one reaches the engine per block, the other six are coalesced or answered syncing); `forest lock held` 864-897 lines, 24 ms median (p90 30), i.e. on about 75% of blocks. Of the 3,738 votes in P70, 3,175 waited for execution validation and 563 found the block already validated.
+
+**Judging by pairs** (a configuration counts when both its legs differ from both control legs in the same direction by more than the controls differ from each other; for P70 against P75 each pair serves as the other's control). Window 1: P70 / P70b 2,613,333 / 2,646,667 (spread 33,333); P75 / P75b 2,573,333 / 2,580,000 (spread 6,667): P70's smaller leg beats P75's larger by 33,333 > 6,667: confirmed, P70 +1.3-2.8% over P75. Windows 2-3 mean: P70 2,573,333, P70b 2,563,333, P75 2,553,333, P75b 2,573,333: overlap, nothing confirmed; sustained is 2.55-2.57M at both pacings. Steadier at 75? Windows 2 / 3 as a share of window 1: P75 98.7 / 99.7%, P75b 99.7 / 99.7%; P70 98.2 / 98.7%, P70b 96.2 / 97.5%: yes, a pair at 75 holds its window-1 rate to within 1.3%, at 70 to within 3.8%, but at a lower rate; the sustained means are equal. **Best confirmed pair for the peak: P70 / P70b, 2.61-2.65M in window 1 (confirmed over P75 and over loop334's 80 ms controls, +7%). Best confirmed pair for the sustained rate: none separates; P70, P70b, P75, P75b all read 2.55-2.57M in windows 2-3.** Every window of every full-block pair above (P70, P70b, P75, P75b, S163r, S163b) exceeds 2,452,761 (lowest: S163r window 2, 2,483,033; P70b window 2, 2,546,667).
+
+**Block size** (seal and cycle against size; leader medians in window 1, rate with the feed not binding): 163k: `sealed_at` 50-52, cycle 61.5 median (63.7-63.9 mean), 2.554 / 2.559M in window 1 and 2.49 / 2.52M in windows 2-3 (S163r, S163b; two legs, no control pair at this size); 200k: 61-62, 72.0 (75.5-76.6), 2.61-2.65M and 2.56-2.58M; 250k at 90 ms (S250, plain feed ok, single leg): 80, 91.9 (95.3), 2.625 / 2.600 / 2.583M; 300k at 105 ms (S300r, feed raised, single leg): 93, 106.7 (111.6), 2.690 / 2.620 / 2.610M. The floor is cycle median = `sealed_at` + 10 to 14 ms at every size (163k +11, 200k +10, 250k +12, 300k +14), so the seal chain is linear in the block (~0.31 ms per 1,000 transfers) and the rate is nearly flat: 2.55M at 163k, 2.6-2.65M at 200k, 2.6M at 250k, 2.6-2.7M at 300k; block size moves it by under 4% and the best is the biggest block, by a margin the single legs cannot confirm. Nothing but the seal caps 300k: its blocks are 300,000 transfers (820 of them in the leg, gas 6.3G), gossip 105 MB, frames 600 of 16,384, the gas limit is the genesis value (no climb); the feed is the only limit that appeared (S300 plain).
+
+**L4 and T64.** L4 (four layers) with the feed raised: 2,646,667 / 2,580,000 / 2,586,667, `sealed_at` 62 / 72 / 91, no difference from P70 (three layers already never fall back, 10.81). T64 (build pool 64, rayon 32): 2,606,667 / 2,466,667 / 2,553,333, layer 32.1 cores against 25.7, `sealed_at` 63 / 70 / 89, seal binds 35% against 25-31%: more threads do not shorten the seal (the batches are fewer and larger per thread; 10.81 section 8.3's stagger is dispatch, not thread count) and window 2 is 5% lower; single legs, nothing confirmed.
+
+Files: `scripts/fleet7-runs/{derive335.py,feedcheck335.py,cycle335.py,results/loop335.out,results/loop335-set-b.out}` (the runners were patched in place after the launcher mix-up; `derive335.py` carries the intended text).

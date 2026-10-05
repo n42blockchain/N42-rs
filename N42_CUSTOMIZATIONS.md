@@ -170,6 +170,12 @@
   （本块到目前的请求数）、`once_served`（其中从登记表答复的）、`once_imports`、`once_blocks`、
   `once_takeovers`（启动以来累计；`once_imports == once_blocks` 即每块每执行层一次导入），
   开关关闭时恒为 0。关闭时每条路径与以前逐字节相同（测试覆盖）。
+  本执行层自己构建的块：三条跟随者路径（compact body、foreign body、payload）在任何组装或解码之前
+  按头部识别（同父块、块号、根、gas、交易根的保留构建；封块会把 withdrawals root 改成 gov5 的奖励
+  承诺，两种形状都比较——原来按原值比较，loop328/330 中 1,179 个自建块有 1,175 个被再执行一次），
+  立即回 CHECKED，等构建完成后按头部交给引擎、回最终状态；构建被放弃时才走普通导入。各行新增
+  `own_from_build`（从构建导入的自建块，累计）与 `own_executed_again`（被再执行的自建块，累计，应恒为 0；
+  发生时另有 warn 行）。
 
 ## HotStuff-2 结算标签（不改任何 fork 的 reth crate）:
 - `N42_SETTLEMENT_TAGS=split|legacy`（默认 `split`；代码在 `crates/n42/h2-execution/src/settlement.rs`，

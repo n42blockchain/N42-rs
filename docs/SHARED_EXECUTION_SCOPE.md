@@ -64,6 +64,15 @@ What differs from the sketch above:
   by header instead of being assembled and executed (with `N42_BLOCK_BY_DESCRIPTION` that road never tried the
   build before). The own-block road publishes CHECKED as soon as the build is found, so the other keys vote
   without waiting for a build sealed before its finish.
+  *Correction after loop328/330:* the first version compared the sealed header's withdrawals root with the
+  build's raw, and gov5's seal rewrites it as the rewards commitment, so the compact-body recognition never
+  matched: at E=1 the follower keys' compact bodies won the race for almost every own block and 1,175 of 1,179
+  built blocks were executed a second time (only blocks whose `OWN_BLOCK` arrived first were handed off).
+  Now all three follower roads recognise an own build by its header before any assembly or decode, comparing
+  the withdrawals root in both shapes (the payload road rebuilds the sealed header from the build), answer
+  CHECKED at once and the status when the build is handed off (waiting for a build still finishing), and fall
+  through to an ordinary import only when the build was abandoned. `own_from_build` / `own_executed_again`
+  on the per-block lines prove the second stays 0.
 - Held executions (`N42_VOTE_BEFORE_SLOT`) are refused: start-up error with both switches, and an ERROR answer
   to a `HOLD_EXECUTION` request under the registry.
 - Gated behind the switch (default off): with it off every road is byte-for-byte the old code, and the

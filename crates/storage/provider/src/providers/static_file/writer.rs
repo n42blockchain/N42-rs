@@ -1495,30 +1495,32 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         Ok(())
     }
 
-    /// N42: appends a block's account changeset whose rows are already sorted by address and
-    /// encoded (`AccountBeforeTx::to_compact` back to back in `rows`, lengths in `lens`).
+    /// N42: appends account changeset entries, already sorted by address and encoded
+    /// (`AccountBeforeTx::to_compact` back to back in `rows`, lengths in `lens`), to the block
+    /// started by [`Self::begin_account_changeset`].
     ///
-    /// The same bytes, offsets, header and changeset sidecar as
-    /// [`Self::append_account_changeset`] of the same entries; only the sort and the encoding
-    /// have been done elsewhere (in parallel, under `N42_SF_PARALLEL_ENCODE=1`). It **CALLS**
-    /// `increment_block()`.
-    pub fn append_account_changeset_encoded(
+    /// Called with a block's sorted entries in order (in one call or in consecutive chunks), the
+    /// file gets the same bytes, offsets, header and changeset sidecar as
+    /// [`Self::append_account_changeset`] of the same entries; only the sort and the encoding have
+    /// been done elsewhere (in parallel, under `N42_SF_PARALLEL_ENCODE=1`).
+    pub fn append_account_changeset_entries_encoded(
         &mut self,
-        block_number: u64,
         rows: &[u8],
         lens: &[u32],
     ) -> ProviderResult<()> {
         debug_assert!(self.writer.user_header().segment() == StaticFileSegment::AccountChangeSets);
         let start = Instant::now();
+        if self.current_changeset_offset.is_none() {
+            return Err(ProviderError::other(StaticFileWriterError::new(
+                "account changeset stream must be started before appending entries",
+            )))
+        }
         let total: usize = lens.iter().map(|len| *len as usize).sum();
         if total != rows.len() {
             return Err(ProviderError::other(StaticFileWriterError::new(
                 "encoded rows do not match their lengths",
             )));
         }
-
-        self.increment_block(block_number)?;
-        self.ensure_no_queued_prune()?;
 
         let mut offset = 0;
         for len in lens {

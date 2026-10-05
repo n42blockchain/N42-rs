@@ -1226,6 +1226,25 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         Ok(())
     }
 
+    /// N42: asks the kernel to start writing the data file's dirty pages to the device
+    /// (`sync_file_range(SYNC_FILE_RANGE_WRITE)`) without waiting for them, so the batch's
+    /// [`Self::sync_all`] finds most of them written (`N42_SF_EARLY_WRITEBACK=1`).
+    ///
+    /// A hint only: durability still comes from `sync_all`, which is unchanged, and a failure
+    /// here is ignored. Rows still in the writer's buffer are not in the file yet and are left
+    /// to `sync_all`.
+    pub fn n42_start_writeback(&self) {
+        #[cfg(target_os = "linux")]
+        if let Ok(file) = std::fs::File::open(&self.data_path) {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the descriptor is open for the duration of the call, and the flag only
+            // starts writeback of pages already in the page cache.
+            let _ = unsafe {
+                libc::sync_file_range(file.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE)
+            };
+        }
+    }
+
     /// N42: appends `lens.len()` transactions whose rows are already encoded, numbered from
     /// `first_tx_num`.
     ///

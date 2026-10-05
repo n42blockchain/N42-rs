@@ -512,6 +512,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 first_tx,
                 parallel,
             )?;
+            if super::n42_sf::early_writeback() {
+                w.n42_start_writeback();
+            }
         }
         Ok(())
     }

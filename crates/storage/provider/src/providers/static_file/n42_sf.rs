@@ -4,15 +4,21 @@
 //! N42: the `Transactions` static-file segment's write, off its single thread.
 //!
 //! Today's write (`write_transactions`) encodes every transaction into the
-//! `Compact` row on the segment's task, one at a time, and appends it: about
-//! 20 ms of a 200k-transfer block's ~45 ms is the encoding (measured by
-//! `n42_sf_tests::bench_sf_transactions_200k`), the rest the per-row append
-//! and the batch's `sync_all`. The switch, default off, leaves the files and
-//! their durability exactly as they were:
+//! `Compact` row on the segment's task, one at a time, and appends it. Of the
+//! 40 ms a 200k-transfer block costs in a five-block batch, 19 ms is the
+//! encoding, 11 ms the per-row append and 10 ms the batch's `sync_all`
+//! (`n42_sf_tests::bench_sf_transactions_{200k,batch}`). Two switches, both
+//! default off, both leaving the files and their durability as they were:
 //!
 //! * `N42_SF_PARALLEL_ENCODE=1`: a block's rows are encoded in chunks on the
 //!   pool the segment task runs on (the storage pool) and then appended in
 //!   order. The bytes, offsets and header are those of the serial path.
+//! * `N42_SF_EARLY_WRITEBACK=1`: after each block's rows are appended, the
+//!   data file's dirty pages are handed to the device
+//!   (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, which does not wait), so the
+//!   batch's `sync_all` waits only for the last block's tail instead of the
+//!   whole batch. The `sync_all` itself is unchanged: what is durable when is
+//!   what it was.
 
 use super::StaticFileProviderRWRefMut;
 use alloy_primitives::TxNumber;
@@ -35,6 +41,12 @@ fn flag(name: &str) -> bool {
 pub(crate) fn parallel_encode() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| flag("N42_SF_PARALLEL_ENCODE"))
+}
+
+/// `N42_SF_EARLY_WRITEBACK=1`, read once.
+pub(crate) fn early_writeback() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| flag("N42_SF_EARLY_WRITEBACK"))
 }
 
 /// One chunk of encoded rows: the `Compact` encodings back to back, and each length.

@@ -27,7 +27,7 @@ use reth_db::{
 };
 use reth_db_api::{
     cursor::DbCursorRO,
-    models::{AccountBeforeTx, BlockNumberAddress, StorageBeforeTx, StoredBlockBodyIndices},
+    models::{BlockNumberAddress, StorageBeforeTx, StoredBlockBodyIndices},
     table::{Decompress, Table, Value},
     tables,
     transaction::DbTx,
@@ -574,15 +574,12 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         blocks: &[ExecutedBlock<N>],
         plain_reverts: &[revm::database::states::PlainStateReverts],
     ) -> ProviderResult<()> {
+        // N42: `N42_SF_PARALLEL_ENCODE=1` builds, sorts and encodes the rows in parallel (same
+        // bytes); without it the entries are collected and appended as before.
+        let parallel = super::n42_sf::parallel_encode();
         for (block, reverts) in blocks.iter().zip(plain_reverts) {
             let block_number = block.recovered_block().number();
-            let changeset: Vec<_> = reverts
-                .accounts
-                .iter()
-                .flatten()
-                .map(|(address, info)| AccountBeforeTx { address: *address, info: info.clone().map(Into::into) })
-                .collect();
-            w.append_account_changeset(changeset, block_number)?;
+            super::n42_sf::append_block_account_changeset(w, reverts, block_number, parallel)?;
         }
         Ok(())
     }

@@ -130,3 +130,38 @@ where
     }
     Ok(())
 }
+
+/// Appends one block's account changeset from its plain reverts: the entries sorted by address
+/// (a stable sort, as `append_account_changeset` does) and appended one row each. With
+/// `parallel` the entries are built, sorted (rayon's stable sort) and encoded on the current
+/// pool and appended through `append_account_changeset_entries_encoded`: the same rows in the
+/// same order. It calls `increment_block`.
+pub(crate) fn append_block_account_changeset<N: NodePrimitives>(
+    w: &mut StaticFileProviderRWRefMut<'_, N>,
+    reverts: &revm::database::states::PlainStateReverts,
+    block_number: u64,
+    parallel: bool,
+) -> ProviderResult<()> {
+    use rayon::prelude::*;
+    use reth_db_api::models::AccountBeforeTx;
+    let entry = |(address, info): &(
+        alloy_primitives::Address,
+        Option<revm::state::AccountInfo>,
+    )| AccountBeforeTx { address: *address, info: info.clone().map(Into::into) };
+
+    let count: usize = reverts.accounts.iter().map(Vec::len).sum();
+    if !parallel || count < PARALLEL_MIN {
+        let changeset: Vec<_> = reverts.accounts.iter().flatten().map(entry).collect();
+        return w.append_account_changeset(changeset, block_number);
+    }
+    let mut changeset: Vec<AccountBeforeTx> = Vec::with_capacity(count);
+    for part in &reverts.accounts {
+        changeset.par_extend(part.par_iter().map(entry));
+    }
+    changeset.par_sort_by_key(|change| change.address);
+    w.begin_account_changeset(block_number)?;
+    for chunk in encode_parallel(&changeset) {
+        w.append_account_changeset_entries_encoded(&chunk.rows, &chunk.lens)?;
+    }
+    Ok(())
+}

@@ -565,6 +565,11 @@ fn main() {
                     }
                 });
                 let mut canonical = node.provider.subscribe_to_canonical_state();
+                // `N42_QUEUE_PRUNE_THREAD=1`: the prune runs on a thread of its
+                // own and this task only forwards (see `n42::queue_prune`).
+                let pruner = n42::queue_prune::on_own_thread()
+                    .then(|| n42::queue_prune::spawn_thread(queue.clone()))
+                    .flatten();
                 tokio::spawn(async move {
                     loop {
                         match canonical.recv().await {
@@ -573,116 +578,20 @@ fn main() {
                                 if behind > 8 {
                                     warn!(target: "reth::cli", behind, "canonical subscriber lag: queue pruner");
                                 }
-                                let started = std::time::Instant::now();
-                                // A reorg: the reverted blocks' transactions are
-                                // nowhere else -- with the direct ingest the queue
-                                // is their only holder -- so those the new chain
-                                // does not carry are offered again, before the new
-                                // chain's prune (which then removes any the new
-                                // chain mined at a higher nonce). Without this the
-                                // affected senders' lanes started at a nonce ahead
-                                // of the chain and every leader refused them:
-                                // half-empty blocks for the rest of the leg
-                                // (round 43).
-                                if let reth_provider::CanonStateNotification::Reorg { old, new } = &notification {
-                                    let reverted_blocks = old.blocks_iter().count();
-                                    let back = n42::queue_reorg::reverted_transactions(old, new);
-                                    let offered = back.len();
-                                    // Through the reverted door: it lowers the
-                                    // senders' mined watermarks, which the
-                                    // reverted blocks no longer justify.
-                                    queue.push_reverted(back);
-                                    warn!(target: "n42.tx_queue", reverted_blocks, offered, new_blocks = new.blocks_iter().count(), "reorg: the reverted blocks' transactions are offered again");
-                                }
-                                let mut mined = 0usize;
-                                // Where the prune's time goes (loop322 CTRL: 5 s on the
-                                // new leader at the handover): the own-block settle,
-                                // the lanes' removal, the by-hash index, microseconds.
-                                let (mut settle_us, mut remove_us, mut forget_us) = (0u64, 0u64, 0u64);
-                                for (_, block) in notification.committed().blocks_iter().map(|b| (b.number(), b)) {
-                                    // What the builder reads to tell a build
-                                    // for a height the chain has already
-                                    // decided from a build that is starving.
-                                    n42_engine_types::canonical_head::saw(block.number());
-                                    // What the builder compares its parent
-                                    // against: a build below this is behind
-                                    // its own queue.
-                                    queue.note_pruned(block.number());
-                                    // One walk for both: the (sender, nonce)
-                                    // pairs the lanes are pruned by, and the
-                                    // hashes the by-hash index is pruned by
-                                    // (`N42_COMPACT_BODY` or
-                                    // `N42_SENDERS_FROM_QUEUE`; nothing will ever
-                                    // name a committed block's transactions
-                                    // again, and an index that carries them
-                                    // until its bound reaches them evicts
-                                    // what the next block needs).
-                                    let mut hashes: Vec<alloy_primitives::B256> = Vec::new();
-                                    let pairs: Vec<(alloy_primitives::Address, u64)> = block
-                                        .transactions_with_sender()
-                                        .map(|(sender, tx)| {
-                                            hashes.push(*alloy_consensus::transaction::TxHashRef::tx_hash(tx));
-                                            (*sender, alloy_consensus::Transaction::nonce(tx))
-                                        })
-                                        .collect();
-                                    mined += pairs.len();
-                                    // An own block held at this height: the same
-                                    // hash is settled, another hash gives back what
-                                    // this block does not carry (then pruned below
-                                    // where this block mined a higher nonce).
-                                    // Built only if an own block is held at this
-                                    // height (rarely): a 163,000-entry SipHash set
-                                    // every block on every node was 10-20 ms.
-                                    let carried = std::cell::OnceCell::new();
-                                    let step_at = std::time::Instant::now();
-                                    let back = queue.settle_own_block(block.number(), block.hash(), |sender, nonce| {
-                                        carried
-                                            .get_or_init(|| pairs.iter().copied().collect::<alloy_primitives::map::HashSet<(alloy_primitives::Address, u64)>>())
-                                            .contains(&(*sender, nonce))
-                                    });
-                                    if back > 0 {
-                                        warn!(target: "n42.tx_queue", number = block.number(), back, "an own block at this height was not the one committed; its transactions are offered again");
+                                match pruner.as_ref() {
+                                    Some(pruner) => {
+                                        // Read by the builder: said here as
+                                        // well, so the thread's queue does
+                                        // not delay it.
+                                        for block in notification.committed().blocks_iter() {
+                                            n42_engine_types::canonical_head::saw(block.number());
+                                        }
+                                        if pruner.send((notification, std::time::Instant::now())).is_err() {
+                                            error!(target: "n42.tx_queue", "the queue's pruning thread is gone; the queue is no longer pruned");
+                                            break;
+                                        }
                                     }
-                                    settle_us += step_at.elapsed().as_micros() as u64;
-                                    let step_at = std::time::Instant::now();
-                                    queue.remove_mined_batch(pairs);
-                                    remove_us += step_at.elapsed().as_micros() as u64;
-                                    let step_at = std::time::Instant::now();
-                                    // Out of the by-hash index too: nothing
-                                    // will ever name a committed block's
-                                    // transactions again, and an index that
-                                    // carries them until its bound reaches
-                                    // them evicts what the next block needs.
-                                    // A no-op without an index.
-                                    queue.forget_hashes(hashes);
-                                    forget_us += step_at.elapsed().as_micros() as u64;
-                                }
-                                if mined > 10_000 {
-                                    // `usable` beside `queued`: what a build
-                                    // could take of the depth. The two part
-                                    // company when lanes are parked behind a
-                                    // hole, which is what loop207-208's defect
-                                    // 13 was -- 334-360k queued, empty blocks,
-                                    // and no line saying which of the two it
-                                    // was.
-                                    let (parked_lanes, parked, park_capped) = queue.parked();
-                                    info!(target: "n42.tx_queue", mined, queued = queue.len(), usable = queue.usable(), parked, parked_lanes, park_capped, frames_indexed = queue.frames_indexed(), prune_ms = started.elapsed().as_millis() as u64, settle_us, remove_us, forget_us, "canonical blocks pruned from the queue");
-                                    // What the queue let go of since the last
-                                    // block, by reason, with the first few
-                                    // named. A lane's hole -- a nonce the
-                                    // generator was told this node had taken
-                                    // and that is in neither the queue nor a
-                                    // block -- can only be made at one of
-                                    // these; before this nothing counted them.
-                                    let drops = queue.take_drops();
-                                    if drops.interesting() {
-                                        warn!(
-                                            target: "n42.tx_queue",
-                                            by_reason = ?drops.named(),
-                                            first = ?drops.samples,
-                                            "the queue let go of transactions"
-                                        );
-                                    }
+                                    None => n42::queue_prune::prune_notification(&queue, &notification, 1, std::time::Duration::ZERO),
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {

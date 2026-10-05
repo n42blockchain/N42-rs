@@ -62,7 +62,11 @@ impl Default for Script {
 fn executed(header: &Header) -> Box<reth_payload_primitives::BuiltPayloadExecutedBlock<n42_tx_types::N42Primitives>> {
     let block = n42_tx_types::Block {
         header: header.clone(),
-        body: n42_tx_types::BlockBody { transactions: Vec::new(), ommers: Vec::new(), withdrawals: None },
+        body: n42_tx_types::BlockBody {
+            transactions: Vec::new(),
+            ommers: Vec::new(),
+            withdrawals: header.withdrawals_root.map(|_| Vec::new().into()),
+        },
     };
     Box::new(reth_payload_primitives::BuiltPayloadExecutedBlock {
         recovered_block: Arc::new(reth_primitives_traits::RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), Vec::new())),
@@ -349,6 +353,7 @@ async fn the_leaders_own_build_is_shared_by_every_key() {
 async fn a_handover_on_one_execution_layer_keeps_the_build_chain() {
     let _builds = BUILDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let el = execution_layer(Script { direct_import: true, ..Default::default() }).await;
+    let (from_build, again) = crate::import_once::own_counts();
     // The outgoing leader built N-1 and N, chained.
     let before = header(305, 0x35);
     file_build(&before);
@@ -364,11 +369,15 @@ async fn a_handover_on_one_execution_layer_keeps_the_build_chain() {
         let mut outgoing = connect(&el).await;
         send(&mut outgoing, request::OWN_BLOCK, &alloy_rlp::encode(block)).await;
         assert_eq!(hear(&mut outgoing).await, valid(false));
-        assert_eq!(incoming.await.expect("incoming"), valid(false));
+        // The incoming key votes on CHECKED as soon as the build is found.
+        assert_eq!(incoming.await.expect("incoming"), valid(true));
     }
     assert_eq!(el.seen.executions.load(Ordering::SeqCst), 0, "neither block executed");
     assert_eq!(el.seen.inserts.load(Ordering::SeqCst), 2, "one hand-off each");
     assert_eq!(el.seen.new_payloads.load(Ordering::SeqCst), 2);
+    let (from_build_now, again_now) = crate::import_once::own_counts();
+    assert_eq!(from_build_now - from_build, 2, "both own blocks served from their builds");
+    assert_eq!(again_now, again, "no own block executed again");
     // The incoming leader's first build on the last block finds it (what
     // `BUILD_ON_OWN` on a sealed parent looks up), as the outgoing leader's
     // next build would have.
@@ -447,4 +456,159 @@ fn the_payload_hash_is_read_without_decoding_the_payload() {
         assert_eq!(peek_payload_hash(&frame), Some(data.payload.block_hash()));
     }
     assert_eq!(peek_payload_hash(&[1, 2, 3]), None, "a short frame names no hash");
+}
+
+// ---- the layer's own blocks reaching it on a follower key's road first ----
+
+/// How far the layer's build of the block has come when the requests arrive.
+#[derive(Clone, Copy, Debug)]
+enum Stage {
+    /// Sealed and published, still finishing behind its seal.
+    InFlight,
+    /// Its post-state is filed, its receipts not yet.
+    StateFiled,
+    /// Finished.
+    Done,
+    /// Sealed, then its finish failed.
+    Abandoned,
+}
+
+/// Which road the follower key brings the block on.
+#[derive(Clone, Copy, Debug)]
+enum Road {
+    CompactBody,
+    ForeignBody,
+    Payload,
+}
+
+/// A block as the layer built it (Ethereum-shaped withdrawals root) and as
+/// consensus sealed it (gov5's: the rewards commitment, zero ommers hash, the
+/// view in the extra data) -- the seal the recognition used to miss.
+fn own_block(number: u64, tag: u8) -> (Header, Header) {
+    let built = Header {
+        withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
+        ..header(number, tag)
+    };
+    let sealed = n42_h2_consensus::gov5_h2_header_for_view(built.clone(), &[], number + 7, None).expect("sealed");
+    assert_ne!(built.withdrawals_root, sealed.withdrawals_root, "the seal moves the withdrawals root");
+    (built, sealed)
+}
+
+/// The build's execution, as the store files it.
+fn build_of(built: &Header) -> n42_engine_types::built_executions::BuiltExecution {
+    let execution = executed(built);
+    n42_engine_types::built_executions::BuiltExecution {
+        block: Arc::clone(&execution.recovered_block),
+        execution_output: Arc::clone(&execution.execution_output),
+        hashed_state: Arc::clone(&execution.hashed_state),
+        trie_updates: Arc::clone(&execution.trie_updates),
+    }
+}
+
+/// The follower key's request for the sealed block on `road`.
+fn follower_request(road: Road, sealed: &Header) -> (u8, Vec<u8>) {
+    let hash = sealed.hash_slow();
+    let profile = n42_h2_consensus::N42HeaderProfile::Gov5H2;
+    let body = n42_h2_consensus::encode_block_rlp_raw(sealed, &[], &[], None);
+    match road {
+        Road::CompactBody => {
+            let compact = n42_h2_consensus::encode_compact_body(&body, &[], profile).expect("compact body");
+            (request::COMPACT_BODY, raw_engine::encode_foreign_body(hash, profile, &compact))
+        }
+        Road::ForeignBody => (request::FOREIGN_BODY, raw_engine::encode_foreign_body(hash, profile, &body)),
+        Road::Payload => {
+            let data = n42_h2_consensus::execution_data_from_raw_parts(hash, sealed, Vec::new(), Vec::new(), None);
+            (request::NEW_PAYLOAD, raw_engine::encode_execution_data(&data))
+        }
+    }
+}
+
+/// One race: the layer's build at `stage`, the follower key's request on
+/// `road` and the leader key's `OWN_BLOCK`, in the order given. Returns what
+/// the leader and the follower heard.
+async fn own_block_race(el: &El, road: Road, follower_first: bool, stage: Stage, number: u64, tag: u8) -> (Heard, Heard) {
+    let (built, sealed) = own_block(number, tag);
+    let execution = build_of(&built);
+    let built_hash = execution.block.hash();
+    match stage {
+        Stage::Done => n42_engine_types::built_executions::remember(built_hash, execution.clone()),
+        Stage::InFlight | Stage::StateFiled | Stage::Abandoned => {
+            n42_engine_types::built_executions::remember_pending(built_hash, Arc::clone(&execution.block));
+            if matches!(stage, Stage::StateFiled) {
+                n42_engine_types::built_executions::state_ready(built_hash, execution.clone());
+            }
+        }
+    }
+    let (kind, frame) = follower_request(road, &sealed);
+    let mut follower = connect(el).await;
+    let mut leader = connect(el).await;
+    let leader_frame = alloy_rlp::encode(&sealed);
+    if follower_first {
+        send(&mut follower, kind, &frame).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        send(&mut leader, request::OWN_BLOCK, &leader_frame).await;
+    } else {
+        send(&mut leader, request::OWN_BLOCK, &leader_frame).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        send(&mut follower, kind, &frame).await;
+    }
+    let follower = tokio::spawn(async move { hear(&mut follower).await });
+    let leader = tokio::spawn(async move { hear(&mut leader).await });
+    // The build's finish (or its failure) lands while both are waiting.
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    match stage {
+        Stage::InFlight | Stage::StateFiled => n42_engine_types::built_executions::complete(built_hash, execution),
+        Stage::Abandoned => n42_engine_types::built_executions::fail(built_hash),
+        Stage::Done => {}
+    }
+    (leader.await.expect("leader"), follower.await.expect("follower"))
+}
+
+/// Every road, both orders, a build in flight, filed but unfinished, and done:
+/// the block is imported from the build once, never executed again, and both
+/// keys hear VALID; the follower key, whose road speaks it, hears CHECKED
+/// first. Fails without the fix: the seal's withdrawals root kept the body
+/// roads from recognising the build at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_own_block_on_a_follower_road_is_served_from_the_build_never_executed() {
+    let _builds = BUILDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut tag = 0x60u8;
+    for road in [Road::CompactBody, Road::ForeignBody, Road::Payload] {
+        for follower_first in [true, false] {
+            for stage in [Stage::InFlight, Stage::StateFiled, Stage::Done] {
+                let el = execution_layer(Script { direct_import: true, work: std::time::Duration::from_millis(30), ..Default::default() }).await;
+                let (from_build, again) = crate::import_once::own_counts();
+                tag = tag.wrapping_add(3);
+                let case = format!("{road:?}, follower first {follower_first}, {stage:?}");
+                let (leader, follower) = own_block_race(&el, road, follower_first, stage, 400 + u64::from(tag), tag).await;
+                assert_eq!(leader.status, Ok(PayloadStatusEnum::Valid), "{case}: leader {leader:?}");
+                assert_eq!(follower, valid(true), "{case}: follower");
+                assert_eq!(el.seen.executions.load(Ordering::SeqCst), 0, "{case}: never executed again");
+                assert_eq!(el.seen.inserts.load(Ordering::SeqCst), 1, "{case}: one hand-off of the build");
+                assert_eq!(el.seen.new_payloads.load(Ordering::SeqCst), 1, "{case}: one engine pass");
+                let (from_build_now, again_now) = crate::import_once::own_counts();
+                assert_eq!(from_build_now - from_build, 1, "{case}: counted as served from the build");
+                assert_eq!(again_now, again, "{case}: nothing executed again");
+            }
+        }
+    }
+}
+
+/// A build abandoned behind its seal: the follower key's payload falls
+/// through to the ordinary import and both keys hear its
+/// status; nothing is counted as an own block executed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abandoned_build_falls_through_to_an_ordinary_import() {
+    let _builds = BUILDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let el = execution_layer(Script { direct_import: true, work: std::time::Duration::from_millis(30), ..Default::default() }).await;
+    let (_, again) = crate::import_once::own_counts();
+    let (leader, follower) = own_block_race(&el, Road::Payload, true, Stage::Abandoned, 480, 0xA0).await;
+    assert_eq!(follower.status, Ok(PayloadStatusEnum::Valid), "{follower:?}");
+    assert_eq!(leader.status, Ok(PayloadStatusEnum::Valid), "{leader:?}");
+    // The ordinary road: no hand-off of the abandoned build, the engine's own
+    // pass once (the scripted chain's profile cannot convert a gov5 payload
+    // for the direct import, so the engine's pass is the import here).
+    assert_eq!(el.seen.inserts.load(Ordering::SeqCst), 0, "the abandoned build is not handed off");
+    assert_eq!(el.seen.new_payloads.load(Ordering::SeqCst), 1, "imported once, the ordinary way");
+    assert_eq!(crate::import_once::own_counts().1, again, "an abandoned build is no own block executed again");
 }

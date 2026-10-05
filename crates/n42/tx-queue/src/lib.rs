@@ -4868,6 +4868,11 @@ mod tests {
         assert!(queue.take_frames(&[B256::repeat_byte(0xf1)])[0].is_none());
         assert_eq!(queue.frames_indexed(), 1);
         assert_eq!(queue.frames_with_txs(), 1);
+        // Freed on the queue's freeing thread, after the prune returns.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while weak.iter().any(|w| w.upgrade().is_some()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert!(weak.iter().all(|w| w.upgrade().is_none()), "the index still held a pruned frame's transactions");
         assert!(queue.take_frames(&[B256::repeat_byte(0xf2)])[0].is_some());
     }

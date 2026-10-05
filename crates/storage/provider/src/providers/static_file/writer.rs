@@ -1259,18 +1259,41 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         rows: &[u8],
         lens: &[u32],
     ) -> ProviderResult<()> {
+        self.n42_append_encoded_tx_rows(StaticFileSegment::Transactions, first_tx_num, rows, lens)
+    }
+
+    /// N42: appends `lens.len()` receipts whose rows are already encoded, numbered from
+    /// `first_tx_num`: the same bytes, offsets and header as that many [`Self::append_receipt`]
+    /// calls (see [`Self::append_transactions_encoded`]).
+    pub fn append_receipts_encoded(
+        &mut self,
+        first_tx_num: TxNumber,
+        rows: &[u8],
+        lens: &[u32],
+    ) -> ProviderResult<()> {
+        self.n42_append_encoded_tx_rows(StaticFileSegment::Receipts, first_tx_num, rows, lens)
+    }
+
+    /// N42: the shared body of the tx-numbered encoded appends.
+    fn n42_append_encoded_tx_rows(
+        &mut self,
+        expected: StaticFileSegment,
+        first_tx_num: TxNumber,
+        rows: &[u8],
+        lens: &[u32],
+    ) -> ProviderResult<()> {
         let start = Instant::now();
         self.ensure_no_queued_prune()?;
 
         let segment = self.writer.user_header().segment();
-        debug_assert!(segment == StaticFileSegment::Transactions);
+        debug_assert!(segment == expected);
         if lens.is_empty() {
             return Ok(());
         }
         let total: usize = lens.iter().map(|len| *len as usize).sum();
         if total != rows.len() {
             return Err(ProviderError::other(StaticFileWriterError::new(
-                "encoded transaction rows do not match their lengths",
+                "encoded rows do not match their lengths",
             )));
         }
         let tx_start = match self.writer.user_header().tx_range() {

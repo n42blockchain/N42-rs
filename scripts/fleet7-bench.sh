@@ -479,19 +479,39 @@ for ((fp = 0; fp < FLOOD_PROCS; fp++)); do
 done
 FLOOD=${FLOODS[0]}
 
-for ((w = 1; w <= WINDOWS; w++)); do
-  "$HERE/fleet7-measure.py" "$F7_HTTP_BASE" "$WINDOW_SEC" "win$w"
-  # The block's shape after the first window: senders, distinct recipients,
-  # run lengths. The flood paid 13,000 recipients a block for 42 rounds before
-  # this line existed (round 43).
-  if (( w == 1 )); then
-    python3 "$HERE/fleet7-shape.py" "$F7_HTTP_BASE" "shape" 2>&1 | tail -1
-  fi
-  # A profile is pulled between windows, never inside one.
-  if (( PROFILE_NODE >= 0 && w < WINDOWS )); then
-    "$HERE/fleet7-profile.sh" "$PROFILE_NODE" "$OUT/profile-win$w" 2>&1 | tail -3
-  fi
-done
+# F7_MEASURE_FROM_LOG=1: the windows come from the execution layer's `Block added to canonical chain` lines
+# (contiguous, the first starting at the flood's first full block) and nothing reads a block over RPC while the
+# flood runs: with it the builds' state opens waited 60-120 ms behind the harness's 200k-hash reads (docs 10.81).
+# What still touches RPC in a leg: the funding transactions and nonce reads before the first window, the decay's
+# eth_getBlockByNumber(latest) before the flood, and, after the flood is killed and the chain idles, the shape line
+# and fleet7-verify.py.
+if [[ ${F7_MEASURE_FROM_LOG:-0} == 1 ]]; then
+  MLOG=$F7_ROOT/node0/el.log
+  MT0=$("$HERE/fleet7-measure.py" --first-full "$MLOG" "${F7_MEASURE_FULL_TXS:-100000}" 180)
+  echo "measure      : windows from $MLOG, first full block at epoch $MT0"
+  for ((w = 1; w <= WINDOWS; w++)); do
+    "$HERE/fleet7-measure.py" --log "$MLOG" "$(python3 -c "print($MT0 + ($w - 1) * $WINDOW_SEC)")" "$WINDOW_SEC" "win$w"
+  done
+  for fp_pid in "${FLOODS[@]}"; do kill "$fp_pid" 2>/dev/null || true; done
+  "$HERE/fleet7-measure.py" --wait-idle "$MLOG" 120
+  SHAPE_N=$("$HERE/fleet7-measure.py" --shape-block "$MLOG" "$MT0" "${F7_MEASURE_FULL_TXS:-100000}")
+  python3 "$HERE/fleet7-shape.py" "$F7_HTTP_BASE" "shape" "$SHAPE_N" 2>&1 | tail -1
+else
+  for ((w = 1; w <= WINDOWS; w++)); do
+    "$HERE/fleet7-measure.py" "$F7_HTTP_BASE" "$WINDOW_SEC" "win$w"
+    # The block's shape after the first window: senders, distinct recipients,
+    # run lengths. The flood paid 13,000 recipients a block for 42 rounds before
+    # this line existed (round 43).
+    if (( w == 1 )); then
+      python3 "$HERE/fleet7-shape.py" "$F7_HTTP_BASE" "shape" 2>&1 | tail -1
+    fi
+    # A profile is pulled between windows, never inside one.
+    if (( PROFILE_NODE >= 0 && w < WINDOWS )); then
+      "$HERE/fleet7-profile.sh" "$PROFILE_NODE" "$OUT/profile-win$w" 2>&1 | tail -3
+    fi
+  done
+
+fi
 
 echo "--- resources at the end of the round ---"
 "$HERE/fleet7.sh" stats | tail -3

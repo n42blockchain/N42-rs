@@ -563,6 +563,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 first_tx,
                 super::n42_sf::parallel_encode(),
             )?;
+            if super::n42_sf::early_writeback() {
+                w.n42_start_writeback();
+            }
         }
         Ok(())
     }
@@ -580,6 +583,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         for (block, reverts) in blocks.iter().zip(plain_reverts) {
             let block_number = block.recovered_block().number();
             super::n42_sf::append_block_account_changeset(w, reverts, block_number, parallel)?;
+            if super::n42_sf::early_writeback() {
+                w.n42_start_writeback();
+            }
         }
         Ok(())
     }

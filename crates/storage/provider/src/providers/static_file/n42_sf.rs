@@ -1,7 +1,10 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! N42: the `Transactions` static-file segment's write, off its single thread.
+//! N42: the static-file segments' per-row write, off their single threads.
+//!
+//! Both switches cover the `Transactions`, `Receipts` and `AccountChangeSets`
+//! segments (the three that are slow on a 200k-transfer block).
 //!
 //! Today's write (`write_transactions`) encodes every transaction into the
 //! `Compact` row on the segment's task, one at a time, and appends it. Of the

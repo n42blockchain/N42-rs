@@ -476,3 +476,155 @@ Not changed, and why:
 
 Leg to run: the L3FS60 configuration with `N42_BUILD_ONE_WAVE=1`, paired, against L3FS60 as it was; then the same
 with `N42_ROAD_RUNTIME=1` added. Read `par_exec_ms`, `batch_*_us`, `prev_seal_to_*_us`, the cycle.
+
+## 10. E=1: the feed ceiling (loop335-336 logs, offline)
+
+Question: loop336 (`BREAKTHROUGH_DESIGN.md` 10.83) read delivery into the one layer at 2.5-2.6M/s on every leg and
+called it the feed's cap. What between the replay files and the builder's queue saturates there? Sources: every leg's
+`flood.log`, the layer's `ingest` lines (5 s), `seal-first build phases`, `frame build sealed` and `canonical blocks
+pruned from the queue` lines, `threadcpu-loop336*.tsv`; code in `tx_flood.rs`, `n42-tx-ingest`, `n42-tx-queue`,
+`bin/n42/src/main.rs`. Nothing was run.
+
+**Short answer.** It is not one ceiling. (a) With 12 recovery slots (claim 1: P60, P60r, W, Wb, Wr, WR, WRr, and every
+loop335 leg) the ingest sits in a *convoy* at its recovery semaphore: ~5,100 frames/s, 2.53-2.62M/s, on every 5 s
+sample, whether the queue is full or empty. (b) With 24 slots (claim 2, the F legs) the convoy formed on one leg of nine
+(RF, from its third sample on, then stayed); on the other eight the ingest followed the gate, the queue held at the
+2.5M gate, delivery equalled consumption and read up to 2.88M/s in a 5 s sample (RFb). The F legs' ~2.6M is the chain,
+not the feed. The short blocks are a rate problem, not an ordering problem.
+
+### 10.1 The path, stage by stage (WR = feed-bound with 12 slots, RFb = feed-clean with 24)
+
+| stage | where it runs, what it shares | measured | ceiling |
+| --- | --- | --- | --- |
+| replay read | 64 flood worker threads, one file each (64 files, 64.9 GB, 800,000 frames of 500, ~81 KB a frame), 8 MB `BufReader`; flood pinned to CPUs 112-127, 240-255 | reads are outside the send and wait clocks, and those two cover 98.8% of worker time (`wait` 5,690 worker-s in 90 s of 64 workers), so the reads take ~1%; 2.6M/s is ~420 MB/s across the 64 files | not binding |
+| send | one blocking TCP connection per worker to the one ingest address (64 in all; `F7_FLOOD_PROCS` splits the 64, it does not add any), `TCP_NODELAY`, one `write_all` a frame; at most `--window` frames unanswered per worker (**`F7_FLOOD_WINDOW=6`** in the runner since loop333), one frame in flight per sender; process-wide token bucket `--rate` | `send` 6 s of 5,760 worker-s; the flood process uses 0.28 cores of 32; in flight 64 x 6 x 500 = 192,000 transactions, and by Little's law delivery = 192,000 / reply latency: 71-77 ms on every leg (2.49-2.72M) | window-bound only if the server answered faster than it does; see 10.2 |
+| accept, read | layer's main tokio runtime (`TOKIO_WORKER_THREADS=16`): one task per connection, a 1 MB `BufReader`, the frame read field by field | not clocked (the clocks start after the read) | - |
+| gate | same connection task: `gate_view` takes the queue's lanes `Mutex` (`gate_len` -> `lock_inner`, which also runs the lazy `settle`) on the tokio worker; shut frames wait on one `Notify` that a watcher polls every 2 ms | `gate_us_per_frame` 1.3-1.4 ms (WR, gate open: queue median 203k against a 1.67M gate); 1.3-7.4 ms on the F legs (gate shut, queue at 2.1-2.3M) | the gate ties delivery to consumption when it binds (F legs) |
+| decode | same connection task, before the slot: 500 x `decode_2718_exact` | inside `acq_us_per_frame`; 0.46 ms a frame when there is no wait (F legs) | ~0.9 us a transaction on a runtime worker |
+| recovery slot | node-wide `tokio::sync::Semaphore` of `N42_TX_INGEST_RECOVER_PARALLEL` permits, then `spawn_blocking` (nice 10) | **`acq_us_per_frame` 10.6-11.3 ms on every 12-slot leg** and on RF; 0.45-0.47 ms on the other 24-slot legs; `spawn_us` 10-15 us | see 10.2 |
+| attested-frame check | blocking pool, holding the slot: attestation (one Ed25519 verify + frame root, ~150 us a frame), 0x50 sender from the public key, no per-transaction verification | `busy_us_per_tx` 0-1; slots 20-22% busy with 12 slots, 10-11% with 24: 2.5-2.6 slots busy, **0.49-0.51 ms a frame** | 12 slots x 2,000 frames/s = 24,000 frames/s (12M/s) of CPU; not binding |
+| reply | connection task: `admit_tx.send` into the per-connection channel (8 frames), then the reply, whose `pending` takes the lanes `Mutex` again | `chan_us` 0 (12 slots) / 43-74 us (24); `reply_us_per_frame` 12.1-12.7 ms (12 slots), 2.8-8.1 ms (24) | - |
+| admit / push | one admitter task per connection on the main runtime: awaits the recovery, frame-scan hook, `push_frame`: the lanes' `Arc`s, the by-hash index (sharded `RwLock`s), the inbox `Mutex` | `pool_us_per_tx` 0-1 | not binding |
+| inbox -> lanes | drainer: every 5 ms a `spawn_blocking` `drain_now` that inserts the inbox into the per-sender `BTreeMap` lanes **under the lanes `Mutex`** | not logged | unknown; the next thing to instrument |
+| selection | builder: frame plan by reference under the lanes `Mutex` (`start_frames_by_ref=400`), settle of the taken frames deferred to the next lock | `start_walk_us` ~0.9-4 ms | - |
+| prune | one tokio task per canonical block (sync work on a runtime worker): `settle_own_block`, `remove_mined_batch` (lanes `Mutex`), `forget_hashes` (index shards) | `prune_ms` 49-65 median, p90 69-88 per 200k block (`remove_us` 17-24 ms, `forget_us` 13-37 ms, larger on the feed-bound legs); 41 ms at 163k, 71 ms at 300k (~0.25 us a transaction) | serial: ~3.1-4.1M/s at the median, ~2.7M at the p90 |
+
+Per-thread CPU: `threadcpu4.py` sums threads by name, so the 16 runtime workers and the blocking pool are one
+`tokio-rt` group (~5 cores averaged over the sample span) and no single thread can be named as the one at 100% of a
+core; the data cannot show it. The flood is idle (0.28 cores), and the slots are 11-22% busy.
+
+### 10.2 The binding stage: a convoy at the recovery semaphore
+
+On a 12-slot leg every connection spends ~11 of its ~12.4 ms per frame waiting at `acquire` (decode excluded: 0.46 ms):
+5,100 frames/s x 11 ms = **~56 of the 64 connections waiting at the semaphore at any moment, while only 2.5 of its 12
+permits are doing work**. A permit cycles every 12 / 5,100 = 2.35 ms but works 0.49 ms of it; with 24 slots on RF it
+cycles every 4.65 ms and works 0.51. Doubling the permits doubled the idle part of the hold and left the frame rate
+where it was (5,060-5,170 frames/s on WR, WRr, P60r and RF alike). That is the signature of a permit that is granted to
+a waiting task which is then not polled for 1.9-4.1 ms: the release happens on a blocking-pool thread, the wake goes
+through the main runtime's injection queue, and the woken connection task then does its frame's reply, the next read,
+the gate's lock and the 500-transaction decode before it waits again. The runtime it waits on also runs the prune (49-65
+ms of synchronous work per block), 128 connection and admitter tasks, and gate reads that block a worker on the lanes
+`Mutex` whenever the prune's removal (17-24 ms a block) or the drainer holds it (`BREAKTHROUGH_DESIGN.md` 10.71 already
+caught a dozen callers at `gate_len` waiting 4.9 s behind one holder). Which of those makes the poll late is not
+separable offline; what is measured is that the wait is scheduling, not CPU.
+
+It is bistable. With 12 slots the semaphore's capacity at a ~2 ms poll delay (12 / 2.35 ms = 5,100/s) sits right on
+the demand (2.6M/s = 5,200 frames/s), so a queue of waiters forms, the poll delay grows with it, and it never clears:
+every 12-slot leg is in it on every sample, full queue (P60r's first 40 s, queue 1.7-2.5M) or empty. With 24 slots the
+capacity is ~10,000/s and the waiters normally do not accumulate (acq 0.45 ms on 8 of 9 legs); RF fell in after 10 s
+(acq 0.4 -> 8.1 -> 10.6 ms) and stayed, at the same 5,160 frames/s.
+
+Weighed and set aside:
+
+- **The workers' request-reply pacing.** Delivery is exactly 192,000 in flight / reply latency on every leg, but the
+  reply latency is the server's: 6 frames x 12.4 ms of per-connection service on the convoy legs. A larger window puts
+  more frames into the same convoy. Not the binding stage while the server is; see 10.4 for when it would be.
+- **The gate throttling to consumption.** True of the eight clean 24-slot legs, and there "delivery equals
+  consumption" is no ceiling at all. On the feed-bound legs the gate was open (`gate_us` 1.2-1.4 ms; WR's queue median
+  203k against a 1.67M gate).
+- **Too few connections / one reader.** 64 connections and 64 readers; each connection waits 89% of its time at the
+  shared semaphore, so the per-connection serial loop is not the limit while the convoy is.
+- **The flood's CPU, the files, the rate limiter, the pool size.** 0.28 cores, ~1% of worker time, 4-8M against
+  2.6M delivered, gate never reached on the feed-bound legs.
+- **Queue push contention.** `pool_us_per_tx` 0-1 and `chan_us` 0: the admitters keep up. The lanes `Mutex` matters
+  through the gate reads and the runtime (above), not through the push.
+
+### 10.3 Rate, not ordering
+
+At the leader's short builds (`seal-first build phases` with txs < 95% of a block, after the first 50 builds; the
+line is written at the build's end, so `queued` is what was left plus what arrived during the build):
+
+| leg | short builds | txs (median) | queued after | usable | parked |
+| --- | --- | --- | --- | --- | --- |
+| WR | 267 of 1,204 | 146k | 74k | 71k | 0 |
+| WRr | 483 of 1,272 | 142k | 82k | 83k | 0 |
+| RF | 343 of 1,265 | 146k | 119k | 117k | 0 |
+| P60r | 102 of 1,155 | 166k | 136k | 136k | 0 |
+| W | 36 of 1,157 | 166k | 156k | 156k | 0 |
+
+Every short build took every whole-usable frame there was (289 frames on WR and RF), `usable` equals `queued`, no lane
+was parked, and the frame plan's `skipped` (1,610-1,673 a short build) is the same as on full builds (1,190-1,650 on
+WR, RF, RFb, P60F): those are the index entries of the one to three chained builds ahead whose frames are taken but not
+yet pruned, not senders waiting for an earlier frame. The flood keeps one frame per sender in flight and a sender's
+frames in file order, so a lane has no hole to stall on (no `parked`, no gap warnings). The leftover 74-156k is what
+arrived during the ~60 ms build at ~2.5M/s. **So at a short build's start the queue held less than a block: the
+builder ran out of transactions, i.e. rate.**
+
+### 10.4 What raises it, ranked
+
+Variables first (no code):
+
+1. **`N42_TX_INGEST_RECOVER_PARALLEL` at 48 or unset (unbounded).** With attested frames a frame holds a slot 0.5 ms
+   of real work (2.6 slots busy at 2.6M/s), so the permits were never protecting CPU; they only create the queue the
+   convoy lives in. Expected: no convoy on any leg, acq <= 0.5 ms on every sample, delivery following the gate
+   (> 2.88M/s, the highest 5 s sample read; the ingest's own ceiling past that is unmeasured, estimated well above 3.5M
+   from 0.5 ms of recovery + 0.46 ms of decode a frame). Confirming leg: RF's configuration (`N42_ROAD_RUNTIME=1`, 60 ms)
+   with slots 64, run twice: both legs >= 97% full blocks in every window and `acq_us_per_frame` < 1,000 on every
+   `ingest` line. 24 is the minimum from now on; 12 is the 2.55M ceiling of claim 1.
+2. **Frames of 1,000-2,000 transactions** (a regenerated set): every cost on the convoy path is per frame (the wake,
+   the two lock takes, the reply), so the frame-rate ceiling stays and the transaction ceiling scales (estimate ~5M at
+   1,000 with 12 slots). It changes the block's shape (one sender per frame today, so 100-200 senders a 200k block
+   instead of 400) unless the pregen writes multi-sender frames, which the queue's runs already support. Confirming
+   leg: a 1,000-transaction set with 12 slots and nothing else changed should read ~5,100 frames/s = ~5.1M/s offered.
+   Second priority, because (1) is cheaper and does not move the block.
+3. `F7_FLOOD_WINDOW` 6 -> 12: no gain in either regime measured (convoy: the server is the bound; clean: the gate is).
+   It only becomes the bound when the chain wants more than 192,000 / (6 x per-frame service): at 1 ms service that is
+   32M/s. Harmless to raise; nothing to confirm.
+4. Not levers: more flood CPUs (0.28 of 32 used), `F7_FLOOD_PROCS` (the 64 connections are split, not multiplied),
+   `--conc` (the set has exactly 64 files; more connections need a new set and, in the convoy, only add waiters),
+   `N42_INGEST_SHARD` (sender verification sharding; attested frames verify nothing per transaction), a second ingest
+   listener at E=1 (same runtime, same semaphore), the pool size and the gate's 5/6 fraction (the gate decides how
+   deep the queue is, not how fast it fills).
+
+Code changes:
+
+5. **The ingest on its own runtime** (as `N42_ROAD_RUNTIME` did for the vote road; the road runtime already cut the
+   ingest's reply from 7.8 to 2.8-3.9 ms on the F legs by moving work off the main runtime) and the slot acquired on
+   the blocking side, so no permit is ever parked on a task waiting for a main-runtime poll. Estimate: per-frame
+   service ~1 ms, frame ceiling > 20,000/s (> 10M/s at 500). Leg: claim-1 configuration (12 slots) with the switch on;
+   the convoy must not form.
+6. **Gate and reply read atomics, not the lanes `Mutex`.** `gate_len` and the reply's `pending` take the lanes lock
+   twice a frame on a runtime worker (~10,000 takes a second at 2.6M) and run the deferred `settle`; any 17-24 ms
+   removal blocks every connection that reaches the gate and the worker it is on. `len`, `staged` and `parked_len`
+   kept as atomics beside the lanes would make the gate lock-free. Leg: the convoy configuration, gate_us under 0.1 ms.
+7. **The prune off the runtime and in parallel.** 49-65 ms median, 69-88 p90 per 200,000-transaction block, serial, on
+   a runtime worker: ~0.25 us a transaction is a consumption-side cap of ~3.1-4.1M/s at the median and ~2.7M at the
+   p90 (S300r: 71 ms for 300k). At 3.5M with 200k blocks the cycle is 57 ms and the p90 prune does not fit; a lagging
+   prune keeps the gate shut and the feed then tracks the pruner. `forget_hashes` is per shard and `remove_mined` per
+   sender: both split. Instrument `drain_now`'s hold first (inbox -> lanes is the third lanes-lock holder and is not
+   logged), then shard the lanes by sender if the lock's duty (removal ~30% of the cycle today, plus the drain) is
+   over ~50% at the target rate.
+8. **An in-process replay source** (frames read from the set and pushed through `push_frame` and the same gate inside
+   the layer, no TCP, no connection tasks): it would measure the chain, the queue, the gate and the prune at a feed
+   that cannot be the limit, i.e. the consensus-plus-execution capacity at E=1. It would not measure the ingest (its
+   socket reads, decode, attestation check, slots and runtime), which is exactly the stage that bound loop336, so a rate
+   read that way is not a fed-chain result and must be labelled as such. Useful as the upper reference for (1)-(7),
+   not as a record.
+
+**3.5M TPS** needs ~3.5M/s delivered with the queue kept >= 2 blocks deep: 7,000 frames/s of 500, 17.5 blocks of
+200,000 a second (57 ms cycle). Today's design cannot with 12 slots (5,100 frames/s). With slots unbounded the ingest's
+CPU at 7,000 frames/s is ~3.2 runtime cores of decode and ~3.5 blocking cores of attestation checks, which the layer's
+208 CPUs have, so the feed itself is reachable provided the convoy does not re-form (that is what (5) removes for good);
+the first hard limit then is the per-block prune (7), which at the measured 0.25 us a transaction runs out around
+3.1-4.1M/s and at its p90 below 3M. So: reachable with (1) and (7), probably (5) as insurance; not with the runner as
+it stands.

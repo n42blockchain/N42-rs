@@ -24,7 +24,7 @@ legf() {
   [ -f $B/bench-loop335$tag/round.txt ] || return
   if ! python3 scripts/fleet7-runs/feedcheck335.py loop335$tag; then
     echo "FEED BOUND on $tag: rerun as ${tag}r with F7_FLOOD_RATE=6000000 and pool 3000000"
-    leg ${tag}r "$@" F7_FLOOD_RATE=6000000 F7_BENCH_POOL_SLOTS=3000000
+    leg ${tag}r "$@" F7_FLOOD_RATE=${RR:-6000000} F7_BENCH_POOL_SLOTS=${RP:-3000000}
     [ -f $B/bench-loop335${tag}r/round.txt ] && python3 scripts/fleet7-runs/feedcheck335.py loop335${tag}r
   fi
 }
@@ -54,6 +54,8 @@ def derive(suffix):
     first = [k for k, l in enumerate(lines) if l.startswith('leg WARM2 ')][0]
     wipe = [k for k, l in enumerate(lines) if l.startswith('for i in 0 1 2 3 4 5 6; do rm -rf $B/node$i/el')][0]
     lines[first:wipe] = body + ['']
+    if suffix == '':  # claim 1 runs the raised feed on every leg (rate 6.0M, pool 3.0M), a rerun at 8.0M / 4.0M: loop335 claim 2 showed 2.7M+/s consumption binds the plain feed
+        lines = [l + ' F7_FLOOD_RATE=6000000 F7_BENCH_POOL_SLOTS=3000000' if (l.startswith('legf ') or l.startswith('leg WARM ')) else l for l in lines]
     run = '\n'.join(lines)
     i0 = run.index('# loop335 = '); i1 = run.index('cd /home/n42/src/n42/n42-rs')
     hdr = ('# loop335 = the E=1 cycle floor (docs 10.82): base P = loop334 L3FS (N42_LEADER_LAYERS=3, N42_FIELDS_AT_SEAL=1, 200,000 a block, 400M set, windows from the layer\'s canonical log). '
@@ -66,6 +68,6 @@ def derive(suffix):
     run = run[:k] + LEGF + run[k:]
     assert 'loop334' not in run.split(chr(10),3)[2].replace('loop334 L3FS','') and run.count('loop334') == 1
     open(D + f'run-loop335{suffix}.sh', 'w').write(run)
-    la = open(D + 'launch-loop334b.sh').read().replace('loop334', 'loop335' + suffix)
+    la = open(D + 'launch-loop334b.sh').read().replace('run-loop334b.sh', 'run-loop335' + suffix + '.sh').replace('loop334', 'loop335' + suffix)
     open(D + f'launch-loop335{suffix}.sh', 'w').write(la)
 derive(''); derive('b')

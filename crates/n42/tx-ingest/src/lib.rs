@@ -804,6 +804,11 @@ fn spawn_stats_reporter() {
             // (`docs/SHARED_EXECUTION_SCOPE.md` 11): taken every interval so
             // each line reports its own.
             let lock = n42_tx_queue::take_lock_stats();
+            let ahead_discards = n42_tx_queue::take_ahead_discards()
+                .iter()
+                .map(|(reason, count)| format!("{reason}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",");
             let (frames, txs, recover, pool, busy) = (
                 STATS.frames.load(Ordering::Relaxed),
                 STATS.txs.load(Ordering::Relaxed),
@@ -913,6 +918,8 @@ fn spawn_stats_reporter() {
                     drain_chunks = lock.drain_chunks,
                     drain_chunk_max_txs = lock.drain_chunk_max_txs,
                     drain_finished = lock.drain_finished,
+                    // `N42_PLAN_AHEAD`: prepared plans discarded, by reason.
+                    plan_discards = %ahead_discards,
                     "ingest"
                 );
             }

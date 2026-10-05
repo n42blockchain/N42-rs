@@ -250,6 +250,37 @@
     `lock_hold_max_at`（最长持锁的调用位置）、`lock_wait_max_us`、`lock_wait_us`、`drains`、`drain_txs`、
     `drain_us_mean`、`drain_us_max`（`n42_tx_queue::take_lock_stats`，每行一个区间）。
 
+## 封块链：预先选帧、整帧取出、限时 drain 与只带布局的紧凑应答（不改任何 fork 的 reth crate）:
+`docs/SHARED_EXECUTION_SCOPE.md` 第 12 节。四个开关默认全关；关闭时行为与以前相同（测试覆盖）。
+- `N42_TX_QUEUE_DRAIN_CHUNK=<n>`（默认 0 = 一次持锁；代码在 `crates/n42/tx-queue/src/lib.rs`
+  `TxQueue::drain_now`/`drain_chunked`）：drainer 不持 lanes 锁取走 inbox（批次计入新的 `in_hand`，闸门照读），
+  在锁下放进 `Inner::pending_drain`，然后每次持锁最多插入 n 笔、两次之间释放锁；插入顺序与一次持锁的
+  drain 完全相同，批次的帧在插入最后一笔的那次持锁里建索引。其他任何 drain（构建开始、剪枝）先把剩余
+  部分插完再处理 inbox，所以 lanes 看到的永远是 inbox 的顺序；深度镜像计入剩余部分，闸门不会少算。
+  建议 8192（单元测试：每次持锁约 0.4 ms，一次持锁的 drain 约 1 ms/17,500 笔）。`ingest` 行新增
+  `drain_chunks`、`drain_chunk_max_txs`、`drain_finished`。
+- `N42_PLAN_AHEAD=1`（默认关；代码在 `crates/n42/tx-queue/src/lib.rs` `Prepared`、`prepare_next_plan`、
+  `frames_for_build_ahead`）：帧构建在自己的选帧之后，由应用 take 的那个线程立即为下一个构建预先选帧
+  （在当前构建 take 之后的 lanes 上，算法与现场选帧相同），其帧移出 lanes 存放在 `Inner::prepared`。下一个
+  帧构建只有在以下条件全部成立时才用它：其间没有别的构建开始；上一构建的 take 被 hand-off 整个作为一个
+  自建块已挖而遗忘，且该块（`hold_own_block` 给出的哈希）就是新父块；上一 take 没有剩余；gas 够；它涉及的
+  每个 sender 链上都没挖到它的 nonce、lane 里也没有比它更低的 nonce。否则还回 lanes（链已挖的除外）后现场
+  选帧；规范剪枝挖到其中 nonce 时立即作废。没有截断帧且 gas 有余时用其后到达的帧补足。构建阶段行新增
+  `plan_ahead`（0 现场/1 预选/2 预选+补足）、`plan_age_us`、`plan_prep_us`、`plan_topup_txs`、
+  `plan_discard`；`ingest` 行新增 `plan_discards`（按原因计数）。
+- `N42_PULL_BY_FRAMES=1`（默认关；代码在 `crates/n42/engine-types/src/frame_blocks.rs` `select`/`take_bulk`
+  与 `payload.rs`）：帧构建在并行步骤与 puller 都开启、且 sender 不是待验证的声明时，用
+  `QueueBest::take_frame_segments` 整帧取出全部计划帧，在 build 池上并行复制每帧切片的 `Arc`，构建拿着这个
+  向量直接开始并行步骤，不启动 puller 线程（迭代器留在构建线程上处理拒绝与归还）。候选交易与顺序不变。
+  阶段行新增 `pull_bulk_txs`、`pull_bulk_us`（计入 `start_best_ms`，`par_pull_ms` 随之约为 0）。
+- `N42_ANSWER_LAYOUT_ONLY=1`（默认关；代码在 `crates/n42/h2-execution/src/{driver,raw_engine}.rs`、
+  `h2-el-rpc/src/engine.rs` 与 `bin/n42/src/payload_serve.rs`；隐含 `N42_TAKE_COMPACT=1`，且仅在
+  `N42_FRAME_BLOCKS=1` 时生效）：提议者在 build-on-own 请求末尾加标记，执行层在块的 frame layout 非空且
+  总和等于交易数时，COMPACT_BUILT 应答省略交易哈希列表（200,000 笔约 6.4 MB），也不计算哈希向量；旧执行层
+  忽略标记照常带哈希，未按帧对齐的块也照常带哈希，解码只在布局覆盖整块时接受空列表。验证者之间交换的
+  紧凑块体逐字节不变（测试覆盖）。执行层的 "built ahead" 行与验证者的 "proposal sent" 行新增
+  `answer_layout_only`。
+
 ## HotStuff-2 结算标签（不改任何 fork 的 reth crate）:
 - `N42_SETTLEMENT_TAGS=split|legacy`（默认 `split`；代码在 `crates/n42/h2-execution/src/settlement.rs`，
   由 `ExecutionDriver` 的每个 forkchoice 使用）：`latest` = 共识已提交的块；`safe` = 执行已认证的块

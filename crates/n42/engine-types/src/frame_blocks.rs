@@ -93,7 +93,7 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
 ) -> n42_tx_queue::QueueBest<T> {
     let mut times = SelectTimes::default();
     let best = if active() {
-        let (best, plan, took) = queue.frames_for_build_timed(parent, gas_limit);
+        let (mut best, plan, took) = queue.frames_for_build_timed(parent, gas_limit);
         times.select_us = took.lock_us + took.begin_us;
         times.walk_us = took.plan_us;
         times.check_us = took.check_us;
@@ -106,6 +106,33 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
         times.ahead_prep_us = took.ahead_prep_us;
         times.ahead_topup_txs = took.ahead_topup_txs;
         times.ahead_discard = took.ahead_discard.map_or("", n42_tx_queue::AheadDiscard::name);
+        if !plan.frames.is_empty()
+            && WANT_BULK.with(std::cell::Cell::get)
+            && pull_by_frames()
+            && !n42_tx_types::senders_claimed_at_ingest()
+        {
+            // The block's transactions out of its frames at once, each
+            // frame's slice cloned on the build pool, instead of 200,000
+            // `next` calls on the puller thread. Not with claimed senders:
+            // those go through the check's wrapper one batch at a time.
+            let at = std::time::Instant::now();
+            let segments = best.take_frame_segments();
+            let parts: Vec<Vec<std::sync::Arc<reth_transaction_pool::ValidPoolTransaction<T>>>> =
+                crate::parallel_transfer::build_pool().install(|| {
+                    use rayon::prelude::*;
+                    segments
+                        .par_iter()
+                        .map(|(txs, from, to)| txs.get(*from..*to).map_or_else(Vec::new, <[_]>::to_vec))
+                        .collect()
+                });
+            let mut all = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+            for part in parts {
+                all.extend(part);
+            }
+            times.bulk_txs = all.len();
+            times.bulk_us = at.elapsed().as_micros() as u64;
+            BULK.with(|slot| *slot.borrow_mut() = Some(Box::new(all)));
+        }
         if plan.frames.is_empty() {
             // No frame a build could take whole (the funding block, a thin
             // pool, transactions that came by RPC): the ordinary walk, and
@@ -129,6 +156,42 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
     };
     SELECT_TIMES.with(|slot| slot.set(times));
     best
+}
+
+std::thread_local! {
+    /// Whether the build on this thread consumes a block's transactions in
+    /// one vector ([`want_bulk`]).
+    static WANT_BULK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The vector [`select`] made, for [`take_bulk`].
+    static BULK: std::cell::RefCell<Option<Box<dyn std::any::Any>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `N42_PULL_BY_FRAMES`, read once: a frame build takes its block's
+/// transactions out of the plan's frames at once ([`select`]) instead of
+/// through the puller thread. Off by default.
+pub fn pull_by_frames() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_PULL_BY_FRAMES").is_ok_and(|v| v == "1"))
+}
+
+/// Says whether the build about to select on this thread can take its
+/// transactions as one vector (the parallel step with the puller on): only
+/// then does [`select`] make one.
+pub fn want_bulk(on: bool) {
+    WANT_BULK.with(|slot| slot.set(on));
+    if !on {
+        BULK.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+/// The block's transactions [`select`] took out of its frames at once on
+/// this thread, in plan order, if it did. Whoever takes them owns them as it
+/// owns what the iterator hands out: anything not built goes back through
+/// the iterator's refusals.
+pub fn take_bulk<T: reth_transaction_pool::PoolTransaction>(
+) -> Option<Vec<std::sync::Arc<reth_transaction_pool::ValidPoolTransaction<T>>>> {
+    let taken = BULK.with(|slot| slot.borrow_mut().take())?;
+    taken.downcast::<Vec<std::sync::Arc<reth_transaction_pool::ValidPoolTransaction<T>>>>().ok().map(|boxed| *boxed)
 }
 
 /// Where the last [`select`] on this thread spent its time, in
@@ -165,6 +228,11 @@ pub struct SelectTimes {
     pub ahead_topup_txs: usize,
     /// Why a prepared plan was discarded, or "".
     pub ahead_discard: &'static str,
+    /// `N42_PULL_BY_FRAMES`: the transactions taken out of the frames at
+    /// once, and how long that took.
+    pub bulk_txs: usize,
+    /// How long taking them took, the parallel clone included.
+    pub bulk_us: u64,
 }
 
 std::thread_local! {
@@ -183,6 +251,8 @@ std::thread_local! {
             ahead_prep_us: 0,
             ahead_topup_txs: 0,
             ahead_discard: "",
+            bulk_txs: 0,
+            bulk_us: 0,
         })
     };
 }
@@ -560,6 +630,31 @@ mod claimed_root_tests {
         let bare = B256::repeat_byte(0x79);
         remember_claimed(bare, root, &[]);
         assert_eq!(root_of_block(&bare), None);
+    }
+}
+
+#[cfg(test)]
+mod bulk_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    type Valid = reth_transaction_pool::ValidPoolTransaction<crate::N42PooledTransaction>;
+
+    /// The vector `select` leaves is taken once, only as the type it was
+    /// made with, and a build that does not want it clears it.
+    #[test]
+    fn the_bulk_is_taken_once_and_cleared_when_not_wanted() {
+        let made: Vec<Arc<Valid>> = Vec::new();
+        BULK.with(|slot| *slot.borrow_mut() = Some(Box::new(made)));
+        assert!(take_bulk::<crate::N42PooledTransaction>().is_some());
+        assert!(take_bulk::<crate::N42PooledTransaction>().is_none(), "taken once");
+        BULK.with(|slot| *slot.borrow_mut() = Some(Box::new(7u32)));
+        assert!(take_bulk::<crate::N42PooledTransaction>().is_none(), "another type is not a block");
+        BULK.with(|slot| *slot.borrow_mut() = Some(Box::new(Vec::<Arc<Valid>>::new())));
+        want_bulk(false);
+        assert!(take_bulk::<crate::N42PooledTransaction>().is_none(), "cleared when not wanted");
+        assert!(!WANT_BULK.with(std::cell::Cell::get));
+        assert!(!pull_by_frames(), "off unless N42_PULL_BY_FRAMES=1");
     }
 }
 

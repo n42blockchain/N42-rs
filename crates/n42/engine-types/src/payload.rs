@@ -1130,6 +1130,10 @@ where
     HANDOFF_WAIT_US.with(|cell| cell.set(0));
     let _ = crate::frame_blocks::take_select_times();
     let start_best_at = std::time::Instant::now();
+    // `N42_PULL_BY_FRAMES`: the selector may hand the block over as one
+    // vector out of the plan's frames, which only the parallel step with the
+    // puller consumes (`frame_blocks::take_bulk`).
+    crate::frame_blocks::want_bulk(parallel_build() && builder_puller() != 0);
     let mut best_txs = best_txs(BestTransactionsAttributes::new(
         base_fee,
         builder
@@ -1140,6 +1144,8 @@ where
     ));
     let start_best_us = start_best_at.elapsed().as_micros() as u64;
     let start_best_ms = start_best_us / 1_000;
+    let mut bulk = crate::frame_blocks::take_bulk::<Pool::Transaction>();
+    crate::frame_blocks::want_bulk(false);
     // `N42_FRAME_BLOCKS=1`: the frames the selector just took, whose layout
     // the transactions root is sealed over (`frame_blocks::sealed_root`).
     // The roots computed ahead over the pulled set are the MPT root and are
@@ -1226,7 +1232,9 @@ where
     let start_puller_at = std::time::Instant::now();
     let puller = builder_puller();
     let mut pulled: Option<Puller<Pool::Transaction>> = None;
-    let mut best_txs = if puller == 0 {
+    // With the block in hand (`bulk`) there is nothing to pull: the
+    // iterator stays here for the refusals, on this thread.
+    let mut best_txs = if puller == 0 || bulk.is_some() {
         Some(best_txs)
     } else {
         pulled = Some(Puller::start(best_txs, puller));
@@ -1604,7 +1612,7 @@ where
             (payload, recovered, block_hash, block_number, root_ms, fields_ms, sealed_ms, sealed_at_ms, parent_sealed)
         }};
     }
-    if parallel_build() && pulled.is_some() {
+    if parallel_build() && (pulled.is_some() || bulk.is_some()) {
         let par_at = std::time::Instant::now();
         par_start_ms = build_started.elapsed().as_millis() as u64;
         start_other_ms =
@@ -1612,7 +1620,7 @@ where
         let budget = (block_gas_limit.saturating_sub(cumulative_gas_used) / MIN_TRANSACTION_GAS) as usize;
         par_budget = budget;
         let mut cands: Vec<Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>> =
-            Vec::with_capacity(budget.min(262_144));
+            bulk.take().unwrap_or_else(|| Vec::with_capacity(budget.min(262_144)));
         // `N42_BUILD_PREFETCH=1`: each batch the puller hands over has its
         // senders' and recipients' accounts read on the worker pool while the
         // rest of the block is pulled and prepared, into a layer the
@@ -3145,6 +3153,10 @@ where
                     plan_prep_us = select_times.ahead_prep_us,
                     plan_topup_txs = select_times.ahead_topup_txs,
                     plan_discard = select_times.ahead_discard,
+                    // `N42_PULL_BY_FRAMES`: the block taken out of its
+                    // frames at once (0 = through the puller) and how long.
+                    pull_bulk_txs = select_times.bulk_txs,
+                    pull_bulk_us = select_times.bulk_us,
                     start_check_ms,
                     start_puller_ms,
                     start_prepare_ms,

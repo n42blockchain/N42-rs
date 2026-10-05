@@ -1495,6 +1495,53 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         Ok(())
     }
 
+    /// N42: appends a block's account changeset whose rows are already sorted by address and
+    /// encoded (`AccountBeforeTx::to_compact` back to back in `rows`, lengths in `lens`).
+    ///
+    /// The same bytes, offsets, header and changeset sidecar as
+    /// [`Self::append_account_changeset`] of the same entries; only the sort and the encoding
+    /// have been done elsewhere (in parallel, under `N42_SF_PARALLEL_ENCODE=1`). It **CALLS**
+    /// `increment_block()`.
+    pub fn append_account_changeset_encoded(
+        &mut self,
+        block_number: u64,
+        rows: &[u8],
+        lens: &[u32],
+    ) -> ProviderResult<()> {
+        debug_assert!(self.writer.user_header().segment() == StaticFileSegment::AccountChangeSets);
+        let start = Instant::now();
+        let total: usize = lens.iter().map(|len| *len as usize).sum();
+        if total != rows.len() {
+            return Err(ProviderError::other(StaticFileWriterError::new(
+                "encoded rows do not match their lengths",
+            )));
+        }
+
+        self.increment_block(block_number)?;
+        self.ensure_no_queued_prune()?;
+
+        let mut offset = 0;
+        for len in lens {
+            let end = offset + *len as usize;
+            if let Some(ref mut changeset_offset) = self.current_changeset_offset {
+                changeset_offset.increment_num_changes();
+            }
+            self.writer.append_column(Some(Ok(&rows[offset..end]))).map_err(ProviderError::other)?;
+            offset = end;
+        }
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_segment_operations(
+                StaticFileSegment::AccountChangeSets,
+                StaticFileProviderOperation::Append,
+                lens.len() as u64,
+                Some(start.elapsed()),
+            );
+        }
+
+        Ok(())
+    }
+
     /// Starts a block account changeset that will be appended one entry at a time.
     ///
     /// Callers must append entries sorted by address and keep the writer open until the block is

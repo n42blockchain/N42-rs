@@ -2300,6 +2300,313 @@ mod tests {
         assert_eq!(nonce_of(&state, Address::with_last_byte(0xd3)), Some(7), "the engine's state under both");
     }
 
+    // ---- N42_LEADER_LAYERS ----
+
+    /// Files a build as its shard set and residual (before `StateReady`, as
+    /// `N42_OUTPUT_SHARDS` does) and returns it with its seal.
+    fn file_sharded(number: u64, parent_hash: B256, batch: BundleState, residual: BundleState) -> (SealedHeader, B256) {
+        let header = Header { number, parent_hash, gas_used: number * 1_000, ..Default::default() };
+        let execution = execution_of(&header, residual);
+        let built_hash = execution.block.hash();
+        let sealed = SealedHeader::seal_slow(Header { extra_data: format!("view {number}").into_bytes().into(), ..header });
+        let shards = crate::output_shards::OutputShards::with_index_live(Address::with_last_byte(0x01), 4, 16, true, true);
+        shards.add(batch);
+        crate::built_executions::remember_pending(built_hash, execution.block.clone());
+        crate::built_executions::shards_ready(
+            built_hash,
+            crate::built_executions::ShardedParent { residual: execution.execution_output.clone(), shards: Arc::new(shards.freeze()) },
+        );
+        (sealed, built_hash)
+    }
+
+    #[test]
+    fn the_layer_count_parses_two_to_four_and_defaults_to_two() {
+        assert_eq!(leader_layers::parse_depth(None), Some(2));
+        assert_eq!(leader_layers::parse_depth(Some("")), Some(2));
+        assert_eq!(leader_layers::parse_depth(Some("2")), Some(2));
+        assert_eq!(leader_layers::parse_depth(Some(" 3 ")), Some(3));
+        assert_eq!(leader_layers::parse_depth(Some("4")), Some(4));
+        for bad in ["1", "5", "0", "three", "-3"] {
+            assert_eq!(leader_layers::parse_depth(Some(bad)), None, "{bad}");
+        }
+    }
+
+    /// Three kept layers -- a full bundle, a shard set, a full bundle -- over
+    /// the engine at the block under them read exactly as the engine's state
+    /// once it has landed all three: every account each block wrote, one two
+    /// of them wrote, one created, a slot, an untouched and an absent account,
+    /// and `BLOCKHASH` of each.
+    #[test]
+    fn three_kept_layers_read_as_the_engine_after_it_landed_them() {
+        let _guard = store_lock();
+        leader_layers::clear();
+        let x = Address::with_last_byte(0x71);
+        let y = Address::with_last_byte(0x72);
+        let z = Address::with_last_byte(0x73);
+        let coinbase = Address::with_last_byte(0x74);
+        let untouched = Address::with_last_byte(0x75);
+        let created = Address::with_last_byte(0x76);
+        let absent = Address::with_last_byte(0x77);
+        let slot = B256::with_last_byte(7);
+        let anchor = B256::with_last_byte(0x70);
+        // The engine at the anchor (N-4), and after it landed N-3..N-1.
+        let at_anchor = || {
+            let m = MockEthProvider::default();
+            m.add_account(x, ExtendedAccount::new(1, U256::from(10)));
+            m.add_account(y, ExtendedAccount::new(5, U256::from(50)).extend_storage([(slot, U256::from(3))]));
+            m.add_account(z, ExtendedAccount::new(7, U256::from(70)));
+            m.add_account(coinbase, ExtendedAccount::new(0, U256::from(1)));
+            m.add_account(untouched, ExtendedAccount::new(4, U256::from(40)));
+            m
+        };
+        let landed = MockEthProvider::default();
+        landed.add_account(x, ExtendedAccount::new(3, U256::from(12)));
+        landed.add_account(y, ExtendedAccount::new(6, U256::from(51)).extend_storage([(slot, U256::from(9))]));
+        landed.add_account(z, ExtendedAccount::new(8, U256::from(71)));
+        landed.add_account(coinbase, ExtendedAccount::new(0, U256::from(4)));
+        landed.add_account(untouched, ExtendedAccount::new(4, U256::from(40)));
+        landed.add_account(created, ExtendedAccount::new(0, U256::from(7)));
+
+        // N-3: x and z, the coinbase (a full bundle).
+        let n3 = file_ready(
+            171,
+            anchor,
+            BundleState::builder(171..=171)
+                .state_present_account_info(x, info(2, 11))
+                .state_present_account_info(z, info(8, 71))
+                .state_present_account_info(coinbase, info(0, 2))
+                .build(),
+        );
+        opener_on_sealed_parent_with(Scripted::new(at_anchor()), n3.0.clone(), n3.1, 3)().expect("N-2's build opens");
+        // N-2: y and its slot, a created account; the coinbase in its residual (a shard set).
+        let n2 = file_sharded(
+            172,
+            n3.0.hash(),
+            BundleState::builder(172..=172)
+                .state_original_account_info(y, info(5, 50))
+                .state_present_account_info(y, info(6, 51))
+                .state_storage(y, [(U256::from(7), (U256::from(3), U256::from(9)))].into_iter().collect())
+                .state_original_account_info(created, info(0, 0))
+                .state_present_account_info(created, info(0, 7))
+                .build(),
+            BundleState::builder(172..=172).state_present_account_info(coinbase, info(0, 3)).build(),
+        );
+        opener_on_sealed_parent_with(Scripted::new(at_anchor()), n2.0.clone(), n2.1, 3)().expect("N-1's build opens");
+        // N-1: x again, the coinbase (a full bundle).
+        let n1 = file_ready(
+            173,
+            n2.0.hash(),
+            BundleState::builder(173..=173)
+                .state_present_account_info(x, info(3, 12))
+                .state_present_account_info(coinbase, info(0, 4))
+                .build(),
+        );
+        let _ = open_wait::take();
+        // N's build: N-4 is in the engine; nothing newer has to be.
+        let mut client = Scripted::new(at_anchor());
+        client.missing.extend([n3.0.hash(), n2.0.hash(), n1.0.hash()]);
+        let layered = opener_on_sealed_parent_with(client, n1.0.clone(), n1.1, 3)().expect("N's build opens on three layers");
+        let wait = open_wait::take();
+        assert_eq!((wait.layers, wait.grandparent_layer, wait.fallback), (3, 1, false), "{}", wait.split());
+        assert_eq!(leader_layers::len(), 3);
+        let installed = landed.state_by_block_hash(B256::ZERO).expect("the landed state");
+
+        let read = |state: &StateProviderBox, a: Address| state.basic_account(&a).expect("read").map(|a| (a.nonce, a.balance));
+        for a in [x, y, z, coinbase, untouched, created, absent] {
+            assert_eq!(read(&layered, a), read(&installed, a), "{a}: the layers read as the landed engine");
+        }
+        assert_eq!(layered.storage(y, slot).expect("read"), installed.storage(y, slot).expect("read"));
+        assert_eq!(layered.storage(y, slot).expect("read"), Some(U256::from(9)));
+        for (number, sealed) in [(171, &n3.0), (172, &n2.0), (173, &n1.0)] {
+            assert_eq!(layered.block_hash(number).expect("read"), Some(sealed.hash()), "BLOCKHASH({number}) is the sealed hash");
+        }
+        // And as two layers over the engine at N-3 (today's default) does.
+        let at_n3 = || {
+            let m = at_anchor();
+            m.add_account(x, ExtendedAccount::new(2, U256::from(11)));
+            m.add_account(z, ExtendedAccount::new(8, U256::from(71)));
+            m.add_account(coinbase, ExtendedAccount::new(0, U256::from(2)));
+            m
+        };
+        let two = opener_on_sealed_parent_with(Scripted::new(at_n3()), n1.0.clone(), n1.1, 2)().expect("two layers");
+        for a in [x, y, z, coinbase, untouched, created, absent] {
+            assert_eq!(read(&two, a), read(&installed, a), "{a}: two layers over N-3 read the same");
+        }
+        leader_layers::clear();
+    }
+
+    /// The default (2) keeps two layers and stands on N-3, as before: N-4
+    /// missing in the engine costs it nothing.
+    #[test]
+    fn at_two_layers_the_open_stands_on_the_great_grandparent_as_before() {
+        let _guard = store_lock();
+        leader_layers::clear();
+        let anchor = B256::with_last_byte(0x80);
+        let a = file_ready(181, anchor, BundleState::default());
+        opener_on_sealed_parent_with(Scripted::new(MockEthProvider::default()), a.0.clone(), a.1, 2)().expect("open");
+        let b = file_ready(182, a.0.hash(), BundleState::default());
+        opener_on_sealed_parent_with(Scripted::new(MockEthProvider::default()), b.0.clone(), b.1, 2)().expect("open");
+        let c = file_ready(183, b.0.hash(), BundleState::default());
+        let _ = open_wait::take();
+        let mut client = Scripted::new(MockEthProvider::default());
+        client.missing.insert(anchor);
+        let at = std::time::Instant::now();
+        opener_on_sealed_parent_with(client, c.0.clone(), c.1, 2)().expect("opens on N-3");
+        let wait = open_wait::take();
+        assert!(at.elapsed() < GRANDPARENT_WAIT);
+        assert_eq!((wait.layers, wait.fallback), (2, false), "{}", wait.split());
+        assert_eq!(leader_layers::len(), 2, "two blocks' layers");
+        assert!(leader_layers::find(a.0.hash()).is_none(), "N-3 released");
+        leader_layers::clear();
+    }
+
+    /// Every release event: the chain moving on (the count), an abandoned
+    /// build's branch (a sibling kept), the engine's tip moving past (after a
+    /// handover, when nothing more is kept here), and a block that does not
+    /// descend from the kept ones.
+    #[test]
+    fn layers_are_released_at_each_release_event() {
+        let _guard = store_lock();
+        leader_layers::clear();
+        let root = B256::with_last_byte(0x90);
+        let (a, a_seal) = layer_of(191, root, BundleState::default());
+        let (b, b_seal) = layer_of(192, a_seal.hash(), BundleState::default());
+        let (c, c_seal) = layer_of(193, b_seal.hash(), BundleState::default());
+        let (d, d_seal) = layer_of(194, c_seal.hash(), BundleState::default());
+        // The count: at three, the fourth keep releases the oldest.
+        assert_eq!(leader_layers::keep(&a, 3), 0);
+        assert_eq!(leader_layers::keep(&b, 3), 0);
+        assert_eq!(leader_layers::keep(&c, 3), 0);
+        assert_eq!(leader_layers::keep(&d, 3), 1);
+        assert!(leader_layers::find(a_seal.hash()).is_none());
+        assert_eq!(leader_layers::ancestors(d_seal.hash(), 3).len(), 3);
+        // An abandoned build: d never committed, the next build is on its sibling d'.
+        let d2_seal = SealedHeader::seal_slow(Header {
+            number: 194,
+            parent_hash: c_seal.hash(),
+            extra_data: b"layer 194b".as_slice().into(),
+            ..Default::default()
+        });
+        let d2: leader_layers::Layer = (
+            executed_from_output(&d2_seal, Arc::new(BlockExecutionOutput { result: Default::default(), state: BundleState::default() })),
+            None,
+        );
+        assert_ne!(d2_seal.hash(), d_seal.hash());
+        assert_eq!(leader_layers::keep(&d2, 3), 1, "the abandoned d is released");
+        assert!(leader_layers::find(d_seal.hash()).is_none());
+        assert!(leader_layers::find(b_seal.hash()).is_some() && leader_layers::find(c_seal.hash()).is_some());
+        // The engine's tip: layers depth or more under it go; the rest stay.
+        assert_eq!(leader_layers::on_canonical(194, 3), 0, "the tip at the newest keeps all");
+        assert_eq!(leader_layers::on_canonical(195, 3), 1, "192 is three under 195");
+        assert!(leader_layers::find(b_seal.hash()).is_none());
+        // A handover to a layer elsewhere: no more keeps here, the tip moves on.
+        assert_eq!(leader_layers::on_canonical(197, 3), 2);
+        assert_eq!(leader_layers::len(), 0, "nothing is held after the handover");
+        // A block that does not descend from the kept ones keeps only itself.
+        leader_layers::keep(&b, 3);
+        leader_layers::keep(&c, 3);
+        let (e, e_seal) = layer_of(400, B256::with_last_byte(0x92), BundleState::default());
+        assert_eq!(leader_layers::keep(&e, 3), 2);
+        assert_eq!(leader_layers::len(), 1);
+        assert!(leader_layers::find(e_seal.hash()).is_some());
+        leader_layers::clear();
+    }
+
+    /// An abandoned build's layer is never read by the build on its sibling.
+    #[test]
+    fn a_build_on_a_sibling_reads_none_of_the_abandoned_build() {
+        let _guard = store_lock();
+        leader_layers::clear();
+        let anchor = B256::with_last_byte(0xa0);
+        let only_abandoned = Address::with_last_byte(0xa9);
+        let gp = file_ready(201, anchor, BundleState::default());
+        opener_on_sealed_parent_with(Scripted::new(MockEthProvider::default()), gp.0.clone(), gp.1, 3)().expect("open");
+        let abandoned = file_ready(202, gp.0.hash(), BundleState::builder(202..=202).state_present_account_info(only_abandoned, info(9, 9)).build());
+        opener_on_sealed_parent_with(Scripted::new(MockEthProvider::default()), abandoned.0.clone(), abandoned.1, 3)().expect("open");
+        assert!(leader_layers::find(abandoned.0.hash()).is_some());
+        let mut sibling_header = Header { number: 202, parent_hash: gp.0.hash(), gas_used: 1, ..Default::default() };
+        sibling_header.extra_data = b"view 202b".as_slice().into();
+        let execution = execution_of(&sibling_header, BundleState::default());
+        let sibling_built = execution.block.hash();
+        let sibling = SealedHeader::seal_slow(Header { extra_data: b"sealed 202b".as_slice().into(), ..sibling_header });
+        crate::built_executions::remember_pending(sibling_built, execution.block.clone());
+        crate::built_executions::state_ready(sibling_built, execution);
+        let _ = open_wait::take();
+        let state = opener_on_sealed_parent_with(Scripted::new(MockEthProvider::default()), sibling.clone(), sibling_built, 3)().expect("opens");
+        assert_eq!(open_wait::take().layers, 2, "the sibling and the shared grandparent");
+        assert!(leader_layers::find(abandoned.0.hash()).is_none(), "the abandoned build is released");
+        assert_eq!(nonce_of(&state, only_abandoned), None, "and nothing of it is read");
+        leader_layers::clear();
+    }
+
+    /// A tenure handover at three layers. To a key on this execution layer:
+    /// its builds' parents are this layer's sealed builds, so the chain of
+    /// layers continues unchanged (the leader's key is invisible here). To a
+    /// key elsewhere: nothing more is kept, and the engine's tip moving on
+    /// releases what was.
+    #[test]
+    fn a_handover_with_three_layers_kept() {
+        let _guard = store_lock();
+        leader_layers::clear();
+        let anchor = B256::with_last_byte(0xb0);
+        let mut chain = Vec::new();
+        let mut parent_hash = anchor;
+        for number in 211..=215u64 {
+            let filed = file_ready(number, parent_hash, BundleState::builder(number..=number).state_present_account_info(Address::with_last_byte(number as u8), info(number, 1)).build());
+            parent_hash = filed.0.hash();
+            let _ = open_wait::take();
+            opener_on_sealed_parent_with(Scripted::new(MockEthProvider::default()), filed.0.clone(), filed.1, 3)().expect("open");
+            chain.push((number, filed, open_wait::take().layers));
+        }
+        // Blocks 211-213 led by key 0, 214-215 by key 1 on the same layer: the layers grow to three and stay.
+        assert_eq!(chain.iter().map(|(_, _, layers)| *layers).collect::<Vec<_>>(), vec![1, 2, 3, 3, 3]);
+        assert_eq!(leader_layers::len(), 3);
+        // Then a key on another layer leads: its blocks come by import, the tip moves past ours.
+        assert_eq!(leader_layers::on_canonical(216, 3), 1, "213 goes");
+        assert_eq!(leader_layers::on_canonical(218, 3), 2, "214 and 215 go");
+        assert_eq!(leader_layers::len(), 0);
+        // Leading again later, on a block of the other layer: a build opens with its parent alone.
+        let foreign = file_ready(219, B256::with_last_byte(0xb9), BundleState::default());
+        let _ = open_wait::take();
+        opener_on_sealed_parent_with(Scripted::new(MockEthProvider::default()), foreign.0.clone(), foreign.1, 3)().expect("open");
+        assert_eq!(open_wait::take().layers, 1);
+        leader_layers::clear();
+    }
+
+    /// The wait for an ancestor is woken by the engine's notification, not
+    /// found by a poll: with a one-second slice it returns right after the
+    /// landing, having slept once.
+    #[test]
+    fn the_wait_for_an_ancestor_is_woken_when_it_lands() {
+        // Serialised with the other tests that notify.
+        let _guard = store_lock();
+        let _ = open_wait::take();
+        let hash = B256::with_last_byte(0xc7);
+        let mut client = Scripted::new(MockEthProvider::default());
+        client.missing.insert(hash);
+        let released = client.released.clone();
+        let lander = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            released.store(true, Ordering::SeqCst);
+            engine_landed::notify();
+        });
+        let at = std::time::Instant::now();
+        let state = state_when_landed(&client, hash, at + std::time::Duration::from_secs(5), std::time::Duration::from_secs(1));
+        let elapsed = at.elapsed();
+        lander.join().expect("lander");
+        assert!(state.is_ok());
+        assert!(elapsed >= std::time::Duration::from_millis(35) && elapsed < std::time::Duration::from_millis(500), "{elapsed:?}");
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2, "one look before, one after the wake-up");
+        assert_eq!(open_wait::take().grandparent_polls, 1);
+        // And the bound still holds when nothing lands.
+        let mut client = Scripted::new(MockEthProvider::default());
+        client.missing.insert(hash);
+        let at = std::time::Instant::now();
+        let result = state_when_landed(&client, hash, at + std::time::Duration::from_millis(60), std::time::Duration::from_secs(1));
+        assert!(is_miss(&result));
+        assert!(at.elapsed() >= std::time::Duration::from_millis(60) && at.elapsed() < std::time::Duration::from_millis(500));
+    }
+
     // ---- the read-depth counter ----
 
     #[test]

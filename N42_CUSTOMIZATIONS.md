@@ -99,7 +99,13 @@
   磁盘字节与串行路径逐字节相同；`N42_SF_EARLY_WRITEBACK=1`（默认关）：每块追加后启动数据文件回写，
   批次末尾的 `sync_all` 不变（持久性语义不变），只需等最后一块。测试在 `static_file/n42_sf_tests.rs`
   （两条路径逐文件逐字节比较、原读取器读回、同一文件混写与重启、unwind 后重写、崩溃自愈）；
-  provider 的 dev-dependency 新增 `n42-tx-types`
+  provider 的 dev-dependency 新增 `n42-tx-types`。两个开关同样覆盖 `Receipts` 与 `AccountChangeSets` 段：
+  `writer.rs` 另加 `append_receipts_encoded` 与 `append_account_changeset_entries_encoded`（只加不改；后者向
+  `begin_account_changeset` 开始的块追加已排序、已编码的条目，`.csoff` 不变），`manager.rs` 的
+  `write_receipts` / `write_account_changesets` 改经 `n42_sf::append_block_receipts` /
+  `append_block_account_changeset`。账户 changeset 的并行路径按 reverts 原顺序编码（`AccountInfo` 按引用转换），
+  再对 `(address, 位置)` 排序（即按地址的稳定排序）后按序拼接，行与顺序与串行路径相同；串行路径即原代码。
+  测试在 `static_file/n42_sf_seg_tests.rs`
 
 ## 模块4: network
 ### 定制内容:

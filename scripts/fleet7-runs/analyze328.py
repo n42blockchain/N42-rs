@@ -93,7 +93,17 @@ for tag in sys.argv[1:]:
         nb = [int(x[5].split('=')[1]) for x in mem if len(x) > 6 and x[5].startswith('num=') and x[5][4:].isdigit()]
         print(f'  execution layer peak RSS {max(rss):.1f} G; in-memory blocks max {max(nb)} (node0 and others, all layers)')
     except Exception as ex: print(f'  memsample: {ex}')
-    print(f'  import-once counters at the last direct import: ' + ' '.join(f'{k}={once[k]}' for k in ('once_reqs', 'once_served', 'once_imports', 'once_blocks', 'once_takeovers') if k in once) + f'; start-up lines with import_once=true: {sum("import_once=true" in l for l in el)}; queue-lock lines {locks}')
+    # does the layer execute its own built blocks a second time as an import? (built = `seal-first build phases` number; imported = `direct import: executed here`)
+    bn, dn = {}, {}
+    for l in el:
+        m = re.search(r'number=(\d+)', l)
+        if not m: continue
+        if 'seal-first build phases' in l: bn[int(m[1]) + 1] = dict(KV.findall(l))  # the line's `number` is the parent's
+        elif 'direct import: executed here' in l: dn[int(m[1])] = dict(KV.findall(l))
+    both = sorted(set(bn) & set(dn))
+    if bn:
+        print(f'  blocks built here {len(bn)}; also directly imported (executed a second time) {len(both)}; for those, the import\'s exec_ms / root_ms / total_ms median ' + ' / '.join(f'{st.median(num(dn[n][k]) or 0 for n in both):.0f}' for k in ('exec_ms', 'root_ms', 'total_ms')) if both else f'  blocks built here {len(bn)}; none also directly imported')
+    print(f'  import-once counters at the last direct import: ' + ' '.join(f'{k}={once[k]}' for k in ('once_reqs', 'once_served', 'once_served_total', 'once_imports', 'once_blocks', 'once_takeovers') if k in once) + f'; start-up lines with import_once=true: {sum("import_once=true" in l for l in el)}; queue-lock lines {locks}')
     if once and num(once.get('once_blocks', 0)):
         nb_ = num(once['once_blocks']); print(f'    per block: imports {num(once["once_imports"]) / nb_:.2f}, reqs {num(once["once_reqs"]) / nb_:.2f}, served {num(once["once_served"]) / nb_:.2f}')
     if q: print('  layer-0 queue (queued after canonical prune), median per 10 s: ' + ' '.join(f't+{x}:{st.median(y for t, y in q if x <= t < x + 10):.0f}' for x in range(0, 120, 20) if any(x <= t < x + 10 for t, _ in q)))

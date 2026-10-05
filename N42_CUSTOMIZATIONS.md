@@ -173,6 +173,28 @@
   （锚点状态的首次查找）；`state_wait_on` 新增具名原因 `layer_release` 与 `provider_open`，
   `open` 只剩无法归类的部分。
 
+## 出块器并行执行的批次分派（不改任何 fork 的 reth crate）:
+- `N42_BUILD_ONE_WAVE=1`（默认关；代码在 `crates/n42/engine-types/src/parallel_transfer.rs` 的
+  `build_one_wave`、`batch_groups_one_wave` 与 `execute_for_build_opts`）：出块器的执行批次每个线程最多
+  一个（批次数 = min(构建池线程数, 发送者组数)），按前缀和把整组按候选顺序切成大小相近的批次（每批与
+  `总数/线程数` 至多差一组），并且一次性逐批 `spawn` 到构建池（每批一个任务，空闲线程直接取走），
+  而不是原来最多两倍线程数的批次、由一个线程二分递归分发。原方式下第二波批次要等第一波某批结束
+  才开始：loop334 L3FS70（200,000 笔、400 个 500 笔的发送者段、32 线程、58 批）的
+  `batch_start_skew_ms` 等于 `batch_median_ms` + 2-3 ms（相关系数 0.96），执行是两个批次长。
+  批次仍是整组发送者、候选顺序，和换一个池大小时一样；状态、收据、gas 与回滚逐项相同（测试比较
+  QMDB 操作、gov5 收据根与 bloom、累计 gas、graft 后账户与回滚、输出分片合并后的 bundle）。
+- `seal-first build phases` 一行无论开关都新增：`batch_first_start_us`、`batch_last_start_us`、
+  `batch_dispatch_us`（每个跑过批次的线程都已开始其第一批的时刻；两波时 `batch_last_start_us` 减它
+  即第一波长度）、`batch_last_end_us`（均为相对交给池的时刻）、`batches`、`batch_threads`、`one_wave`；
+  帧选择的拆分 `start_walk_ids_us`、`start_walk_check_us`、`start_walk_settle_us`、`start_walk_us`；
+  父块封印之后到本构建开始的路（`crates/n42/engine-types/src/post_seal.rs`，仅观测）：
+  `prev_seal_to_header_us`（chain header 写给验证者）、`prev_seal_to_answer_us`（答复写完）、
+  `prev_seal_to_request_us`（本构建请求的第一个字节）、`prev_seal_to_entry_us`（进入 `build_on_own`）、
+  `prev_seal_to_start_us`（本构建开始）、`prev_seal_to_import_us`（任一密钥按头部导入父块的第一个请求，
+  E=1 时即 leader 提案之后）；`sealed_unix_us`（本块封印的墙钟，用于与验证者的 `proposal sent`、
+  `block committed` 行对齐）。`next_start_gap_ms` / `next_entry_gap_ms` 改为在构建开始时记录：以前在
+  完成时才读上一次封印，那时已被本块自己的封印覆盖，所以一直是 0。
+
 ## 多个验证者密钥共享一个执行层（不改任何 fork 的 reth crate）:
 - `N42_IMPORT_ONCE=1`（默认关；代码在 `bin/n42/src/import_once.rs`，由 `payload_serve.rs` 的
   `OWN_BLOCK`、`COMPACT_BODY`、`FOREIGN_BODY`、`NEW_PAYLOAD` 四条导入路径使用）：按块哈希登记，

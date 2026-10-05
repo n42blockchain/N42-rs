@@ -369,3 +369,110 @@ Code changes, by expected effect:
 
 Analysis scripts used: ad-hoc parsers of the same lines as `scripts/fleet7-runs/analyze333.py` (per-10 s phase
 medians, `state_wait_on` counts, wait end against engine events, period comparisons); none was kept.
+
+## 9. E=1: the seal's floor taken apart (loop334 L3FS70 / L3FS60, offline)
+
+Offline read of loop334's L3FS70 and L3FS60 (`/data/blockchain/rust-fleet7-bench/bench-loop334L3FS{70,60}`, the layer is
+node 0; validator 0's tenure for the validator-side figures), window-1 blocks 20-420 of the layer's `seal-first build
+phases` lines, joined with `build on the sealed block answered on the early seal`, `built ahead on the sealed own
+block`, and validator 0's `chain started`, `proposal sent` and `block committed!` lines. No run. Medians (p10 / p90).
+
+### 9.1 The seal (L3FS70, `sealed_at_ms` 62 / 57 / 70; L3FS60 59)
+
+| piece | median | what is serial in it |
+| --- | --- | --- |
+| start (`par_start_ms`) | 10 (8 / 15) | `start_handoff_ms` 2 (the wait for the parent's queue hand-off, `forget_mined_parallel`, started when the request arrives), `start_walk_ms` 6 (the frame plan under the queue's lock: ids, a parallel check that reads < 1 ms, then the decisions in arrival order and 400 segments of 500 hashes copied, serial), the rest 1-2 |
+| pull (`par_pull_ms`) | 5 | the puller thread walks the plan's 400 segments and clones 200,000 `Arc`s into 196 batches of 1,024 over a channel; the build thread only receives. Serial on one thread, ~25 ns a transaction of cold atomics |
+| prep (`par_prep_ms`) | 3 | already a parallel pass over the candidates (keys, body ahead) |
+| partition + slots (`gap_before_exec_ms`) | 2 | `partition_by_sender` (one comparison a transfer on sender runs), `batch_groups`, the 200,000 slots made on the pool, the deferred state open (`state_wait_us` 166) |
+| execution (`par_exec_ms`) | 27 (25 / 29) | see 9.2 |
+| commit / fold / index / tx root | 1 + 6 (index 5 inside) + 2 | on the pool already |
+| seal (`sealed_ms`) | 5 | header, block, remember, hook |
+
+### 9.2 The batch stagger is two waves, not a slow dispatch
+
+The block is 400 sender runs of 500 (shape line: `senders=400 run_median=500`). `batch_groups` packs at most
+`2 x workers` batches of about `total / wanted` transfers: 200,000 / 64 = 3,125, so 7 runs a batch, 57 batches of
+3,500 and one of 500 (`batch_txs_max` 3500, `batch_txs_min` 500 on every block), on 32 threads. Rayon splits the 58
+batches into about 32 leaves of one or two, and a thread runs its leaf in order: the second wave starts only when a
+first-wave batch ends. The line says so: `batch_start_skew_ms` is `batch_median_ms` + 2-3 ms on 80% of blocks
+(skew 14, median batch 11; correlation 0.96 over 400 blocks), `par_exec_ms` is skew + median + 2, and
+`batch_wait_ms` (the first batch's start after the hand-over plus the last end to the return) is 0. The 2-3 ms the
+skew exceeds a batch is the first wave's own spread (thread hand-off, page faults at the start of a batch). None of
+the other suspects is visible in it: the partition and the slots are before the batches' clock starts
+(`gap_before_exec_ms` 2), the dispatch is one `par_iter` from one thread with nothing else to do, a sleeping pool
+would show in `batch_wait_ms`, and first-touch shows inside each batch (`batch_max_ms` 17 against
+`batch_cpu_max_ms` 9: the slowest batch spends half its wall off the CPU or faulting). The per-batch times were not
+logged one by one; the fields below now give the first wave's length directly.
+
+### 9.3 After the seal: the cycle is the seal plus the road to the child's start
+
+At 60 and 70 ms pacing the cycle (seal to seal) is 71-73 ms median against `sealed_at_ms` 59-62. The difference is
+the road from the parent's seal to the child's build start, 9.4 / 10.1 ms median (mean 11.6 / 12.7, p90 25 / 27):
+
+| leg | seal -> validator's `chain started` | `chain started` -> the child's request at the layer | request -> build start |
+| --- | --- | --- | --- |
+| L3FS70 | 1.9 (p90 16.3) | 4.9 (p90 11.3) | 0.1 |
+| L3FS60 | 2.5 (p90 17.0) | 4.8 (p90 12.4) | 0.1 |
+
+The layer's own part is nothing (`frame_ms`, `decode_ms`, `find_ms`, `rename_ms`, `spawn_ms` all 0; `pre_ms` 0;
+`build_ms` - `sealed_at_ms` = 3 ms of hops). The median road is two runtime hops and a loopback write each way.
+The layer's main tokio runtime runs at 11.1 cores in window 1 (`threadcpu`, family `tokio-rt`, which includes its
+blocking pool: the ingest's Ed25519 recovery at 2.6M tx/s) and the road shares it (`N42_ROAD_RUNTIME` off in
+loop334): the chain header is written after the build's `spawn_blocking` handle wakes its task
+(seal -> answer encode start 2.5 ms median, p90 16.8). The tail (a third of blocks over 5 ms) is the chain's
+one-ahead rule: the validator defers the child's start until the proposal path has taken the parent's chained build,
+which happens when the parent's view starts, i.e. at the grandparent's commit. In the examples the deferred start
+follows the commit or the preamble by < 1 ms. Consensus is therefore on the cycle in its tail: seal -> proposal sent
+24.3 / 19.7 ms median (p90 41 / 48; the tick, the answer's 6.4 MB of hashes encoded and written in 5.5 ms median,
+p90 16, and the view's start), proposal -> commit 20.2 / 24.3 ms (p90 48 / 65; `R1_collect` 5-6 ms, p90 33-45,
+`R2_collect` 5).
+
+What is per key at E=1, and what it costs:
+
+- Commit forkchoices: seven a block, one per key, over the authenticated JSON-RPC (`engine_forkchoiceUpdatedV3`
+  12,761 calls by chain height 1,658: 7.7 a block; the engine counted 13,610 messages). Each costs ~28 us on the engine
+  thread (`forkchoice_updated_last`), ~0.2 ms a block in all; the calls wait 12.9 ms mean in the engine's queue but are
+  sent from a task (`N42_COMMIT_FCU_ASYNC=1`) and are on no build's road. Not coalesced: the gain is ~0.2 ms of an
+  engine thread that is 31% busy, and it would mean intercepting reth's Engine API.
+- Own-block imports: seven `OWN_BLOCK`/body requests, already one import (`N42_IMPORT_ONCE`, `once_reqs=7`,
+  `once_served` the other six).
+- Compact bodies: six, header only (15 KB), each decoded once in its own process.
+- Votes: each key signs its own (separate processes, in parallel); the leader collects 5 of 7 per round. The R1 tail
+  (p90 33-45 ms) is the slowest of the five, not a serial verification.
+
+### 9.4 What was changed (all observable, one switch)
+
+- `N42_BUILD_ONE_WAVE=1` (default off): at most one batch a pool thread, the groups cut at even shares of the block
+  in candidate order (`batch_groups_one_wave`: 32 batches of 6,000-6,500 for this shape where the default makes 58),
+  every batch spawned onto the pool at once rather than split from one thread. Same groups, same order inside each
+  batch: the block's QMDB operations, gov5 receipts root and bloom, gas, grafted accounts and reverts, and the output
+  shards' merged bundle are equal with it on and off (`the_one_wave_dispatch_equals_the_default_one`, three block
+  shapes). Estimate: `par_exec_ms` 27 -> 20-22 (one batch of 6,500 at the measured ~3.1 us a transfer of wall plus the
+  dispatch), `sealed_at_ms` -5 to -7; at 60 ms pacing a cycle of ~65-67 instead of 72 if the road of 9.3 does not take
+  the gain (+7-10% on the 2.65M). Confirm: `batch_last_start_us` - `batch_first_start_us` under 2,000,
+  `batch_dispatch_us` = `batch_last_start_us`, `par_exec_ms` median <= 22, and the cycle.
+- Fields on `seal-first build phases` (always on): `batch_first_start_us`, `batch_last_start_us`,
+  `batch_dispatch_us`, `batch_last_end_us`, `batches`, `batch_threads`, `one_wave`; `start_walk_ids_us`,
+  `start_walk_check_us`, `start_walk_settle_us`, `start_walk_us`; the parent's road (`post_seal.rs`)
+  `prev_seal_to_header_us`, `prev_seal_to_answer_us`, `prev_seal_to_request_us`, `prev_seal_to_entry_us`,
+  `prev_seal_to_start_us`, `prev_seal_to_import_us` (the first import request by header for the parent: at E=1 the
+  leader key's, right after its proposal); `sealed_unix_us` to join the validator's `proposal sent` and
+  `block committed!` lines (quorum and commit are on the latter). `next_start_gap_ms` read 0 on every build since it
+  was added (it read the last seal at the line's time, by then the block's own); it is now taken at the build's start.
+
+Not changed, and why:
+
+- The pull's per-transaction clones and the frame plan's serial decisions (start 6 + pull 5): the largest piece left
+  before the execution. They cannot overlap the parent's tail as they are (the plan needs the parent's taken set), but
+  the parent's plan is known at the parent's start, so the child's plan could be made speculatively right after it and
+  only checked at the seal: ~10-15 ms off the chain. A tx-queue change with its own tests; not "clearly safe" here.
+- The road of 9.3: `N42_ROAD_RUNTIME=1` already exists (the road on its own runtime and blocking pool, away from the
+  ingest) and was off in loop334; it is the switch to try for the 4.9 ms hop and the 2.5 ms (p90 17) wake before the
+  chain header. Answering the chained build without the 200,000 hashes at E=1 (every key reads the block from the same
+  layer) would take ~5 ms off seal -> proposal; it changes what the validator receives and is left to whoever owns the
+  compact path.
+- Forkchoice coalescing (above): not worth intercepting reth's Engine API for ~0.2 ms of engine thread.
+
+Leg to run: the L3FS60 configuration with `N42_BUILD_ONE_WAVE=1`, paired, against L3FS60 as it was; then the same
+with `N42_ROAD_RUNTIME=1` added. Read `par_exec_ms`, `batch_*_us`, `prev_seal_to_*_us`, the cycle.

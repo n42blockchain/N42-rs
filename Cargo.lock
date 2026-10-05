@@ -12428,6 +12428,7 @@ dependencies = [
  "merkle_db_rs",
  "metrics",
  "n42-primitives",
+ "n42-tx-types",
  "notify",
  "parking_lot 0.12.5",
  "rand 0.9.5",

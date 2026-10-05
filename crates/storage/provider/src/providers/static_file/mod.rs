@@ -18,6 +18,9 @@ mod n42_sf;
 #[cfg(test)]
 mod writer_tests;
 
+// N42: the transactions segment's write path, measured and tested on 0x50 transfers.
+mod n42_sf_tests;
+
 use reth_nippy_jar::NippyJar;
 use reth_static_file_types::{ChangesetOffsetReader, SegmentHeader, StaticFileSegment};
 use reth_storage_errors::provider::{ProviderError, ProviderResult};

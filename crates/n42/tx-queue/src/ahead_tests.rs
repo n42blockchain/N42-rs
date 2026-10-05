@@ -46,7 +46,7 @@ fn assert_chain_valid(blocks: &[Vec<Tx>]) {
     for (k, block) in blocks.iter().enumerate() {
         for t in block {
             assert!(seen.insert(*t.hash()), "block {k}: a transaction selected twice");
-            let at = next.entry(t.sender()).or_insert(t.nonce());
+            let at = next.entry(t.sender()).or_insert_with(|| t.nonce());
             assert_eq!(t.nonce(), *at, "block {k}: sender {} out of nonce order", t.sender());
             *at += 1;
         }
@@ -358,7 +358,7 @@ fn a_build_takes_its_frames_whole() {
     assert!(best.next().is_none());
     drop(best);
     let whole: Vec<Tx> =
-        segments.iter().flat_map(|(txs, from, to)| txs[*from..*to].iter().cloned().collect::<Vec<_>>()).collect();
+        segments.iter().flat_map(|(txs, from, to)| txs[*from..*to].to_vec()).collect();
     let (mut best, _, _) = reference.frames_for_build_ahead(block_hash(0), gas, SelectMode::Parallel, false);
     let walked: Vec<Tx> = best.by_ref().collect();
     drop(best);

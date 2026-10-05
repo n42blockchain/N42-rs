@@ -660,15 +660,30 @@ mod tests {
         let execution = built(&h);
         let hash = execution.block.hash();
         remember_pending(hash, execution.block.clone());
+        // Ordered by the test, not by the clock: the old form measured the
+        // waiter's own elapsed time against the main thread's 100 ms sleep,
+        // and a waiter thread scheduled 10+ ms late on a loaded machine read
+        // under 90 ms. What it asserts is the same: the waiter returned with
+        // the block (a deadline returns `None`), and only after the stage was
+        // reached (`completed` is set before `complete` runs, and nothing
+        // else can move the build to `Complete`).
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let seen = std::sync::Arc::clone(&completed);
         let waiter = std::thread::spawn(move || {
-            let at = Instant::now();
-            (wait_for(hash, Stage::Complete).is_some(), at.elapsed())
+            let _ = ready_tx.send(());
+            let found = wait_for(hash, Stage::Complete).is_some();
+            (found, seen.load(std::sync::atomic::Ordering::SeqCst))
         });
-        std::thread::sleep(Duration::from_millis(100));
+        ready_rx.recv().expect("the waiter started");
+        // Not needed for the assertion; it gives the waiter time to block,
+        // so the test exercises the wake-up rather than the first look.
+        std::thread::sleep(Duration::from_millis(50));
+        completed.store(true, std::sync::atomic::Ordering::SeqCst);
         complete(hash, execution);
-        let (found, waited) = waiter.join().unwrap();
-        assert!(found);
-        assert!(waited >= Duration::from_millis(90) && waited < WAIT, "woke on the stage, not the deadline: {waited:?}");
+        let (found, after_complete) = waiter.join().unwrap();
+        assert!(found, "woke on the stage, not the deadline");
+        assert!(after_complete, "returned only once the stage was reached");
     }
 
     #[test]

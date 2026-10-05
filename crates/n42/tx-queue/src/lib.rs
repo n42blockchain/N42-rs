@@ -813,6 +813,143 @@ struct Inner<T: PoolTransaction> {
     /// transaction is in its lane (a frame is never indexed before its
     /// transactions are queued, as in the one-hold drain).
     pending_frames: Vec<(NewFrame, Option<FrameTxs<T>>)>,
+    /// The child's frame plan, prepared while the build it follows is still
+    /// executing (`N42_PLAN_AHEAD`, [`Prepared`]).
+    prepared: Option<Prepared<T>>,
+    /// The last hand-off that forgot a build's whole take as mined by an own
+    /// block, and that block's hash ([`TxQueue::hold_own_block`]): what a
+    /// prepared plan is accepted against.
+    handed: Option<Handed>,
+}
+
+/// A whole take handed off to an own block: the build counter of the build
+/// that took it, and the block's sealed hash once
+/// [`TxQueue::hold_own_block`] names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Handed {
+    build: u64,
+    block: Option<B256>,
+}
+
+/// The next build's frame plan, made right after the plan of the build it
+/// follows (`N42_PLAN_AHEAD=1`, `docs/SHARED_EXECUTION_SCOPE.md` 12).
+///
+/// Made exactly as [`TxQueue::frames_for_build`] makes a plan, on the lanes
+/// as they stand once the current build's take has left them: its frames
+/// leave the lanes into `taken` (not the current build's taken list), so no
+/// other build can take them, and the depth counts them as taken. Used by
+/// the next frame build only when nothing that could make it differ from a
+/// plan the fresh path could have made on that state has happened since
+/// ([`Inner::prepared_verdict`]); otherwise given back, minus what the chain
+/// has mined, before that build plans afresh.
+struct Prepared<T: PoolTransaction> {
+    /// `Inner::builds` when it was made: the build it follows.
+    after: u64,
+    /// The gas its frames take.
+    gas_used: u64,
+    /// Whether its last frame was cut to the gas (no top-up may follow a cut
+    /// frame: the body would not be a run of frames).
+    cut: bool,
+    segments: Vec<(FrameTxs<T>, usize)>,
+    plan: FramePlan,
+    /// The lanes' `Arc`s it took, in plan order.
+    taken: Vec<Arc<ValidPoolTransaction<T>>>,
+    /// Per sender, the lowest nonce it took: nothing at or below the lane's
+    /// mined watermark, and nothing below it in the lane, may exist when it
+    /// is used.
+    lowest: AddressHashMap<u64>,
+    made_at: std::time::Instant,
+    /// Its preparation, lock wait included.
+    prep_us: u64,
+}
+
+/// Why a prepared plan was not used ([`FrameSelectTimes::ahead_discard`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AheadDiscard {
+    /// Another build began after it was made.
+    OtherBuild,
+    /// The build it follows was not handed off whole to the block the new
+    /// build stands on (refused, abandoned, another block at the height).
+    NotOnItsParent,
+    /// The previous build's take is still (partly) out: its block did not
+    /// carry all of it.
+    TakeLeft,
+    /// The new build's gas limit is below what the plan takes.
+    Gas,
+    /// The chain mined a nonce the plan holds (a prune).
+    Mined,
+    /// A lane holds a nonce below the plan's (a give-back, an untake, a late
+    /// arrival filling a hole).
+    Below,
+    /// A build that does not take frames (`best_for_build`).
+    NotFrames,
+}
+
+impl AheadDiscard {
+    /// The name it is logged under.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::OtherBuild => "other_build",
+            Self::NotOnItsParent => "not_on_its_parent",
+            Self::TakeLeft => "take_left",
+            Self::Gas => "gas",
+            Self::Mined => "mined",
+            Self::Below => "below",
+            Self::NotFrames => "not_frames",
+        }
+    }
+}
+
+/// The gas of the cheapest transaction: a prepared plan with less room
+/// than this left is full, and no top-up is tried.
+const MIN_FRAME_TX_GAS: u64 = 21_000;
+
+/// Prepared plans discarded, by [`AheadDiscard`] reason, since the last
+/// [`take_ahead_discards`].
+static AHEAD_DISCARDS: [std::sync::atomic::AtomicU64; 7] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+const AHEAD_REASONS: [AheadDiscard; 7] = [
+    AheadDiscard::OtherBuild,
+    AheadDiscard::NotOnItsParent,
+    AheadDiscard::TakeLeft,
+    AheadDiscard::Gas,
+    AheadDiscard::Mined,
+    AheadDiscard::Below,
+    AheadDiscard::NotFrames,
+];
+
+fn note_ahead_discard(reason: AheadDiscard) {
+    if let Some(at) = AHEAD_REASONS.iter().position(|r| *r == reason) {
+        AHEAD_DISCARDS[at].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Prepared plans discarded since the last call, by reason (name, count),
+/// the zero ones left out; the call resets them.
+pub fn take_ahead_discards() -> Vec<(&'static str, u64)> {
+    AHEAD_REASONS
+        .iter()
+        .zip(&AHEAD_DISCARDS)
+        .filter_map(|(reason, count)| {
+            let n = count.swap(0, std::sync::atomic::Ordering::Relaxed);
+            (n > 0).then_some((reason.name(), n))
+        })
+        .collect()
+}
+
+/// `N42_PLAN_AHEAD`, read once: a frame build prepares its child's plan
+/// right after its own ([`Prepared`]). Off by default.
+pub fn plan_ahead() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_PLAN_AHEAD").is_ok_and(|v| v == "1"))
 }
 
 /// `N42_TX_QUEUE_DRAIN_CHUNK=<n>`, read once: the drainer
@@ -1312,6 +1449,8 @@ impl<T: PoolTransaction> TxQueue<T> {
                 frames: frames::FrameIndex::default(),
                 pending_drain: VecDeque::new(),
                 pending_frames: Vec::new(),
+                prepared: None,
+                handed: None,
             })),
             inbox: Arc::new(Mutex::new(Vec::new())),
             staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1922,6 +2061,15 @@ impl<T: PoolTransaction> TxQueue<T> {
             return;
         }
         let mut inner = self.lock_inner();
+        // The block a whole hand-off just forgot the take of: what a plan
+        // prepared ahead of the next build is accepted against.
+        let build = inner.builds;
+        if let Some(handed) = inner.handed.as_mut()
+            && handed.build == build
+            && handed.block.is_none()
+        {
+            handed.block = Some(hash);
+        }
         while inner.held.len() >= HELD_BLOCKS {
             let Some((evicted, _, gone)) = inner.held.pop_front() else { break };
             // Nothing else holds these: the block they were taken for was
@@ -2059,7 +2207,12 @@ impl<T: PoolTransaction> TxQueue<T> {
         let (mined, kept): (Vec<_>, Vec<_>) = std::mem::take(taken)
             .into_iter()
             .partition(|t| highest.get(&t.sender()).is_some_and(|nonce| t.nonce() <= *nonce));
+        let whole = kept.is_empty() && !mined.is_empty();
         *taken = kept;
+        if whole {
+            let build = inner.builds;
+            inner.handed = Some(Handed { build, block: None });
+        }
         times.partition_us = at.elapsed().as_micros() as u64;
         (mined, times)
     }
@@ -2125,7 +2278,10 @@ impl<T: PoolTransaction> TxQueue<T> {
                 times.first_miss = miss.unwrap_or(usize::MAX);
                 if miss.is_none() {
                     times.whole = true;
-                    return (std::mem::take(taken), times);
+                    let whole = std::mem::take(taken);
+                    let build = inner.builds;
+                    inner.handed = Some(Handed { build, block: None });
+                    return (whole, times);
                 }
             }
         }
@@ -2158,7 +2314,12 @@ impl<T: PoolTransaction> TxQueue<T> {
         let (mined, kept): (Vec<_>, Vec<_>) = pool.install(|| {
             all.into_par_iter().partition(|t| highest.get(&t.sender()).is_some_and(|nonce| t.nonce() <= *nonce))
         });
+        let whole = kept.is_empty() && !mined.is_empty();
         *taken = kept;
+        if whole {
+            let build = inner.builds;
+            inner.handed = Some(Handed { build, block: None });
+        }
         times.partition_us = at.elapsed().as_micros() as u64;
         (mined, times)
     }
@@ -2276,10 +2437,19 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// hand them. Taking returns what the previous build on the same parent
     /// took, first.
     pub fn best_for_build(&self, parent: B256) -> QueueBest<T> {
+        let mut garbage = PruneGarbage::default();
         {
             let mut inner = self.lock_inner();
+            // A build that walks the lanes cannot use a frame plan: it goes
+            // back before the walk, so the walk sees its transactions.
+            if inner.prepared.is_some() {
+                self.drain_inbox(&mut inner);
+                garbage.taken = inner.discard_prepared();
+                note_ahead_discard(AheadDiscard::NotFrames);
+            }
             self.begin_build(&mut inner, parent);
         }
+        garbage.free();
         QueueBest {
             queue: self.clone(),
             skipped: AddressHashSet::default(),
@@ -2325,27 +2495,104 @@ impl<T: PoolTransaction> TxQueue<T> {
         gas_limit: u64,
         mode: SelectMode,
     ) -> (QueueBest<T>, FramePlan, FrameSelectTimes) {
+        self.frames_for_build_ahead(parent, gas_limit, mode, plan_ahead())
+    }
+
+    /// [`Self::frames_for_build_in`], using the plan prepared for this build
+    /// when [`Inner::prepared_verdict`] allows it (topped up when it holds
+    /// less gas than this build has room for and its last frame is whole),
+    /// and with `ahead` preparing the next build's plan right after this
+    /// one, on the thread that applies this plan's takes
+    /// (`N42_PLAN_AHEAD=1`, [`Prepared`]).
+    fn frames_for_build_ahead(
+        &self,
+        parent: B256,
+        gas_limit: u64,
+        mode: SelectMode,
+        ahead: bool,
+    ) -> (QueueBest<T>, FramePlan, FrameSelectTimes) {
         let mut times = FrameSelectTimes::default();
+        let mut garbage = PruneGarbage::default();
         let at = std::time::Instant::now();
         let (segments, plan) = {
             let mut inner = self.lock_inner();
             times.lock_us = at.elapsed().as_micros() as u64;
             let begin_at = std::time::Instant::now();
-            self.begin_build(&mut inner, parent);
-            times.begin_us = begin_at.elapsed().as_micros() as u64;
-            let plan_at = std::time::Instant::now();
-            let planned = inner.plan_frames(gas_limit, &mut times, mode);
-            times.plan_us = plan_at.elapsed().as_micros() as u64;
-            planned
+            // The inbox first: an arrival below a prepared plan's nonces must
+            // be in its lane when the plan is judged.
+            self.drain_inbox(&mut inner);
+            let verdict = inner.prepared.as_ref().map(|prepared| inner.prepared_verdict(prepared, parent, gas_limit));
+            match (verdict, inner.prepared.take()) {
+                (Some(Ok(())), Some(prepared)) => {
+                    let Prepared { gas_used, cut, segments, plan, taken, made_at, prep_us, .. } = prepared;
+                    times.ahead = 1;
+                    times.ahead_age_us = made_at.elapsed().as_micros() as u64;
+                    times.ahead_prep_us = prep_us;
+                    inner.open_build(parent, taken);
+                    times.begin_us = begin_at.elapsed().as_micros() as u64;
+                    let (mut segments, mut plan) = (segments, plan);
+                    let room = gas_limit.saturating_sub(gas_used);
+                    if !cut && room >= MIN_FRAME_TX_GAS {
+                        // The plan ran out of frames, not of gas: what has
+                        // arrived since tops it up, planned on the lanes as
+                        // the plan left them.
+                        let plan_at = std::time::Instant::now();
+                        let mut more_times = FrameSelectTimes::default();
+                        let (more, more_plan, _) = inner.plan_frames(room, &mut more_times, mode);
+                        times.plan_us = plan_at.elapsed().as_micros() as u64;
+                        times.ids_us = more_times.ids_us;
+                        times.check_us = more_times.check_us;
+                        times.settle_us = more_times.settle_us;
+                        times.by_ref = more_times.by_ref;
+                        times.slow = more_times.slow;
+                        times.counted = more_times.counted;
+                        if !more_plan.frames.is_empty() {
+                            times.ahead = 2;
+                            times.ahead_topup_txs = more_plan.tx_count();
+                            segments.extend(more);
+                            plan.frames.extend(more_plan.frames);
+                            plan.parts.extend(more_plan.parts);
+                        }
+                        plan.skipped += more_plan.skipped;
+                    }
+                    (segments, plan)
+                }
+                (verdict, prepared) => {
+                    if let Some(prepared) = prepared {
+                        // Not usable: back to the lanes (minus what the
+                        // chain mined) before this build plans afresh.
+                        inner.prepared = Some(prepared);
+                        garbage.taken = inner.discard_prepared();
+                        let reason = match verdict {
+                            Some(Err(reason)) => reason,
+                            _ => AheadDiscard::OtherBuild,
+                        };
+                        times.ahead_discard = Some(reason);
+                        note_ahead_discard(reason);
+                    }
+                    self.begin_build(&mut inner, parent);
+                    times.begin_us = begin_at.elapsed().as_micros() as u64;
+                    let plan_at = std::time::Instant::now();
+                    let (segments, plan, _) = inner.plan_frames(gas_limit, &mut times, mode);
+                    times.plan_us = plan_at.elapsed().as_micros() as u64;
+                    (segments, plan)
+                }
+            }
         };
+        garbage.free();
         // The takes the plan left noted leave the lanes on a thread of their
         // own, off the build's start; any lock before that applies them first.
-        if mode == SelectMode::Parallel {
+        // With `ahead`, the same thread then prepares the next build's plan.
+        if mode == SelectMode::Parallel || ahead {
             let queue = self.clone();
-            let spawned = std::thread::Builder::new()
-                .name("n42-frame-settle".to_owned())
-                .spawn(move || drop(queue.lock_inner()));
-            if spawned.is_err() {
+            let spawned = std::thread::Builder::new().name("n42-frame-settle".to_owned()).spawn(move || {
+                if ahead {
+                    queue.prepare_next_in(gas_limit, mode);
+                } else {
+                    drop(queue.lock_inner());
+                }
+            });
+            if spawned.is_err() && mode == SelectMode::Parallel {
                 drop(self.lock_inner());
             }
         }
@@ -2359,6 +2606,72 @@ impl<T: PoolTransaction> TxQueue<T> {
             segments: segments.into_iter().map(|(txs, taken)| (txs, 0, taken)).collect(),
         };
         (best, plan, times)
+    }
+
+    /// Prepares the next frame build's plan now ([`Prepared`],
+    /// `N42_PLAN_AHEAD=1`): on the lanes as they stand once the current
+    /// build's take has left them, against `gas_limit`, exactly as
+    /// [`Self::frames_for_build`] would plan it, its frames taken out of the
+    /// lanes and held for that build. Returns whether a plan was prepared (a
+    /// queue with no usable frame prepares none).
+    pub fn prepare_next_plan(&self, gas_limit: u64) -> bool {
+        let mode = if frame_select_parallel() { SelectMode::Parallel } else { SelectMode::Serial };
+        self.prepare_next_in(gas_limit, mode)
+    }
+
+    fn prepare_next_in(&self, gas_limit: u64, mode: SelectMode) -> bool {
+        let at = std::time::Instant::now();
+        let mut garbage = PruneGarbage::default();
+        let prepared = {
+            let mut inner = self.lock_inner();
+            self.drain_inbox(&mut inner);
+            if inner.prepared.is_some() {
+                // A plan nobody used (two builds' plans in a row without a
+                // build between them): it goes back first.
+                garbage.taken = inner.discard_prepared();
+                note_ahead_discard(AheadDiscard::OtherBuild);
+            }
+            // The plan's takes go to a list of their own, not the current
+            // build's: that build's taken list is what its hand-off forgets.
+            let current = inner.last_build.take();
+            inner.last_build = Some((B256::ZERO, Vec::new()));
+            let mut times = FrameSelectTimes::default();
+            let (segments, plan, gas_left) = inner.plan_frames(gas_limit, &mut times, mode);
+            inner.settle();
+            let taken = inner.last_build.take().map(|(_, taken)| taken).unwrap_or_default();
+            inner.last_build = current;
+            if plan.frames.is_empty() {
+                if !taken.is_empty() {
+                    inner.give_back(taken);
+                }
+                false
+            } else {
+                let mut lowest: AddressHashMap<u64> = AddressHashMap::default();
+                for frame in &plan.frames {
+                    let Some((runs, _)) = inner.frames.runs_and_hashes(&frame.id) else { continue };
+                    for run in runs.iter().filter(|run| (run.start as usize) < frame.taken) {
+                        let entry = lowest.entry(run.sender).or_insert(run.first_nonce);
+                        *entry = (*entry).min(run.first_nonce);
+                    }
+                }
+                let cut = plan.frames.last().is_some_and(|frame| frame.taken < frame.len);
+                let after = inner.builds;
+                inner.prepared = Some(Prepared {
+                    after,
+                    gas_used: gas_limit.saturating_sub(gas_left),
+                    cut,
+                    segments,
+                    plan,
+                    taken,
+                    lowest,
+                    made_at: std::time::Instant::now(),
+                    prep_us: at.elapsed().as_micros() as u64,
+                });
+                true
+            }
+        };
+        garbage.free();
+        prepared
     }
 
     /// The frame layout of a body, from this node's frame index: each
@@ -2386,8 +2699,19 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// build's take given back, this build's taken list opened, the parked
     /// lanes whose park ended offered again.
     fn begin_build(&self, inner: &mut Inner<T>, parent: B256) {
+        self.drain_inbox(inner);
+        inner.open_build(parent, Vec::new());
+    }
+}
+
+impl<T: PoolTransaction> Inner<T> {
+    /// A build's opening once the inbox is drained: the previous build's
+    /// take given back, this build's taken list opened with `taken` (empty,
+    /// or a prepared plan's), the parked lanes whose park ended offered
+    /// again.
+    fn open_build(&mut self, parent: B256, taken: Vec<Arc<ValidPoolTransaction<T>>>) {
+        let inner = self;
         {
-            self.drain_inbox(inner);
             inner.builds += 1;
             let build = inner.builds;
             match inner.last_build.take() {
@@ -2422,7 +2746,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 }
                 _ => {}
             }
-            inner.last_build = Some((parent, Vec::new()));
+            inner.last_build = Some((parent, taken));
             inner.end_run();
             // Every lane whose park has ended is offered again before this
             // build walks: a park that outlived its reason must never cost
@@ -2454,7 +2778,7 @@ impl<T: PoolTransaction> Inner<T> {
         gas_limit: u64,
         times: &mut FrameSelectTimes,
         mode: SelectMode,
-    ) -> (Vec<(FrameTxs<T>, usize)>, FramePlan) {
+    ) -> (Vec<(FrameTxs<T>, usize)>, FramePlan, u64) {
         let mut segments: Vec<(FrameTxs<T>, usize)> = Vec::new();
         let mut plan = FramePlan::default();
         let mut gas_left = gas_limit;
@@ -2470,7 +2794,7 @@ impl<T: PoolTransaction> Inner<T> {
         let from = if mode == SelectMode::Parallel {
             let (next, ended) = self.plan_parallel(&ids, &mut gas_left, &mut segments, &mut plan, times);
             if ended {
-                return (segments, plan);
+                return (segments, plan, gas_left);
             }
             next
         } else {
@@ -2484,7 +2808,7 @@ impl<T: PoolTransaction> Inner<T> {
             times.settle_us += settle_at.elapsed().as_micros() as u64;
             self.plan_serial(&ids[from..], &mut gas_left, &mut segments, &mut plan, times, mode == SelectMode::PerTx);
         }
-        (segments, plan)
+        (segments, plan, gas_left)
     }
 
     /// The first part of [`Self::plan_frames`]: the frames the block's gas
@@ -2817,6 +3141,70 @@ impl<T: PoolTransaction> Inner<T> {
         }
     }
 
+    /// Whether the plan prepared ahead may be the plan of a frame build on
+    /// `parent` with `gas_limit`, the lanes drained (`docs/SHARED_EXECUTION_SCOPE.md`
+    /// 12). It may when the queue is exactly where the plan left it, less
+    /// the build it followed and plus later arrivals:
+    /// - no build began since it was made (`after`);
+    /// - that build's whole take was forgotten as mined by an own block (the
+    ///   hand-off), and that block is `parent` -- so the parent carries every
+    ///   nonce the plan's runs start after;
+    /// - nothing of that take is still out (`last_build` empty, on another
+    ///   parent);
+    /// - its gas fits;
+    /// - for every sender it draws on, the chain has mined none of its
+    ///   nonces (a prune) and the lane holds nothing below them (a
+    ///   give-back, an untake, a refusal, a late arrival into a hole): its
+    ///   runs are still at their lanes' heads once the parent is applied.
+    ///
+    /// Frames that arrived since are behind it in arrival order, so the plan
+    /// is the one a fresh plan would have made on the queue as it stood
+    /// when it was prepared.
+    fn prepared_verdict(&self, prepared: &Prepared<T>, parent: B256, gas_limit: u64) -> Result<(), AheadDiscard> {
+        if prepared.after != self.builds {
+            return Err(AheadDiscard::OtherBuild);
+        }
+        if self.handed != Some(Handed { build: self.builds, block: Some(parent) }) {
+            return Err(AheadDiscard::NotOnItsParent);
+        }
+        match &self.last_build {
+            Some((built_on, taken)) if *built_on != parent && taken.is_empty() => {}
+            _ => return Err(AheadDiscard::TakeLeft),
+        }
+        if prepared.gas_used > gas_limit {
+            return Err(AheadDiscard::Gas);
+        }
+        for (sender, lowest) in &prepared.lowest {
+            let Some(lane) = self.lanes.get(sender) else { continue };
+            if lane.is_stale(*lowest) {
+                return Err(AheadDiscard::Mined);
+            }
+            if lane.by_nonce.first_key_value().is_some_and(|(nonce, _)| nonce < lowest) {
+                return Err(AheadDiscard::Below);
+            }
+        }
+        Ok(())
+    }
+
+    /// Gives a prepared plan's transactions back to the lanes, as a build's
+    /// give-back does, and returns the ones the chain has mined (at or below
+    /// their lane's watermark) for the caller to free after the lock.
+    fn discard_prepared(&mut self) -> Vec<Arc<ValidPoolTransaction<T>>> {
+        let Some(prepared) = self.prepared.take() else { return Vec::new() };
+        let lanes = &self.lanes;
+        let (mined, back): (Vec<_>, Vec<_>) = prepared
+            .taken
+            .into_iter()
+            .partition(|t| lanes.get(&t.sender()).is_some_and(|lane| lane.is_stale(t.nonce())));
+        for t in &mined {
+            self.dropped(Dropped::Mined, t.sender(), t.nonce());
+        }
+        if !back.is_empty() {
+            self.give_back(back);
+        }
+        mined
+    }
+
     /// Moves up to `budget` transactions of a chunked drain's remainder into
     /// their lanes, in inbox order, and indexes the remainder's frames once
     /// the last of them is in. Returns how many it moved.
@@ -3068,6 +3456,16 @@ impl<T: PoolTransaction> Inner<T> {
                 garbage.lanes.push(gone);
             }
         }
+        // A plan prepared ahead that holds a nonce the chain has now mined
+        // can never be used: back to the lanes now (the mined ones freed with
+        // the rest of the prune's garbage), not when the next build finds it.
+        if let Some(prepared) = self.prepared.as_ref()
+            && prepared.lowest.iter().any(|(sender, lowest)| highest.get(sender).is_some_and(|mined| mined >= lowest))
+        {
+            let mined = self.discard_prepared();
+            garbage.taken.extend(mined);
+            note_ahead_discard(AheadDiscard::Mined);
+        }
         // A frame any of whose transactions the chain has mined can never
         // be referenced whole again.
         let swept = {
@@ -3315,6 +3713,19 @@ pub struct FrameSelectTimes {
     /// Of `by_ref`, frames whose decision read the per-sender counters (a
     /// sender with entries below the frame's run in its lane).
     pub counted: usize,
+    /// `N42_PLAN_AHEAD`: 0 the plan was made here, 1 it was prepared ahead
+    /// and used as it was, 2 prepared ahead and topped up here (`plan_us`
+    /// and the counters above are then the top-up's).
+    pub ahead: u8,
+    /// A used prepared plan's age at use, and its preparation's time.
+    pub ahead_age_us: u64,
+    /// Of a used prepared plan, how long its preparation took (lock wait
+    /// included).
+    pub ahead_prep_us: u64,
+    /// Transactions the top-up added.
+    pub ahead_topup_txs: usize,
+    /// Why a prepared plan was not used, when there was one.
+    pub ahead_discard: Option<AheadDiscard>,
 }
 
 /// How a frame build selects ([`Inner::plan_frames`]); the plan is the
@@ -5483,3 +5894,5 @@ mod test_support;
 #[cfg(test)]
 mod drain_tests;
 
+#[cfg(test)]
+mod ahead_tests;

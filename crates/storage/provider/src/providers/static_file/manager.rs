@@ -556,9 +556,13 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 continue
             }
 
-            for (i, receipt) in block.execution_outcome().receipts.iter().enumerate() {
-                w.append_receipt(first_tx + i as u64, receipt)?;
-            }
+            // N42: `N42_SF_PARALLEL_ENCODE=1` encodes the rows in parallel (same bytes).
+            super::n42_sf::append_block_receipts(
+                w,
+                &block.execution_outcome().receipts,
+                first_tx,
+                super::n42_sf::parallel_encode(),
+            )?;
         }
         Ok(())
     }

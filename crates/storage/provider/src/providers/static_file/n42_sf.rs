@@ -104,3 +104,29 @@ where
     }
     Ok(())
 }
+
+/// Appends one block's receipts, numbered from `first_tx`: one `append_receipt` each, or with
+/// `parallel` the rows encoded by [`encode_parallel`] and appended in order. The caller has
+/// already called `increment_block`.
+pub(crate) fn append_block_receipts<N>(
+    w: &mut StaticFileProviderRWRefMut<'_, N>,
+    receipts: &[N::Receipt],
+    first_tx: TxNumber,
+    parallel: bool,
+) -> ProviderResult<()>
+where
+    N: NodePrimitives<Receipt: Compact>,
+{
+    if !parallel {
+        for (i, receipt) in receipts.iter().enumerate() {
+            w.append_receipt(first_tx + i as u64, receipt)?;
+        }
+        return Ok(());
+    }
+    let mut next = first_tx;
+    for chunk in encode_parallel(receipts) {
+        w.append_receipts_encoded(next, &chunk.rows, &chunk.lens)?;
+        next += chunk.lens.len() as u64;
+    }
+    Ok(())
+}

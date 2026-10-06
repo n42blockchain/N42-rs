@@ -671,9 +671,11 @@ fn defaults_hold_when_the_environment_does_not_override_them() {
     if unset("N42_TX_INGEST_ASYNC_FRAMES") {
         assert_eq!(async_frames_in_flight(), ASYNC_FRAMES_IN_FLIGHT);
     }
+    #[cfg(target_os = "linux")]
     if unset("N42_TX_INGEST_RECOVER_NICE") {
         assert_eq!(recovery_nice(), 0);
     }
+    #[cfg(target_os = "linux")]
     if unset("N42_TX_INGEST_RECOVER_PIN") {
         assert_eq!(recovery_pin(), 0);
     }
@@ -702,6 +704,7 @@ fn defaults_hold_when_the_environment_does_not_override_them() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn recovery_threads_keep_their_priority_and_affinity_by_default() {
     if unset("N42_TX_INGEST_RECOVER_NICE") && unset("N42_TX_INGEST_RECOVER_PIN") {
         // Both are no-ops by default: run on a fresh thread and compare its nice value.
@@ -724,6 +727,7 @@ fn recovery_threads_keep_their_priority_and_affinity_by_default() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn physical_cores_are_a_sorted_subset_of_the_affinity_set() {
     let cores = physical_cores();
     assert!(!cores.is_empty());
@@ -848,6 +852,22 @@ mod wire {
         client.write_all(&1u32.to_le_bytes()).await.unwrap();
         client.write_all(&(MAX_TX_BYTES + 1).to_le_bytes()).await.unwrap();
         refused(handle, client, &format!("transaction of {} bytes", MAX_TX_BYTES + 1)).await;
+    }
+
+    #[tokio::test]
+    async fn individually_valid_lengths_cannot_build_an_unbounded_frame() {
+        let (mut client, handle) = connect().await;
+        let per = MAX_TX_BYTES as usize;
+        let count = MAX_FRAME_BYTES / per;
+        client.write_all(&((count + 1) as u32).to_le_bytes()).await.unwrap();
+        let bytes = vec![0u8; per];
+        for _ in 0..count {
+            client.write_all(&MAX_TX_BYTES.to_le_bytes()).await.unwrap();
+            client.write_all(&bytes).await.unwrap();
+        }
+        // Refuse from the next length alone, before waiting for its body.
+        client.write_all(&1u32.to_le_bytes()).await.unwrap();
+        refused(handle, client, "frame exceeds").await;
     }
 
     #[tokio::test]

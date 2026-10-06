@@ -142,6 +142,20 @@ impl AggregatedAttestation {
         &self,
         registry: &VerifierRegistry,
     ) -> Result<Vec<[u8; 48]>, AttestationError> {
+        let maximum = (registry.len() as usize).div_ceil(8);
+        if self.participant_bitfield.len() > maximum {
+            return Err(AttestationError::ParticipantBitfieldTooLong {
+                maximum,
+                actual: self.participant_bitfield.len(),
+            });
+        }
+        let actual: usize = self.participant_bitfield.iter().map(|byte| byte.count_ones() as usize).sum();
+        if self.participant_count as usize != actual || self.participant_count > registry.len() {
+            return Err(AttestationError::ParticipantCountMismatch {
+                claimed: self.participant_count,
+                actual,
+            });
+        }
         let mut pubkeys = Vec::with_capacity(self.participant_count as usize);
         for (byte_idx, &byte) in self.participant_bitfield.iter().enumerate() {
             for bit in 0..8u32 {
@@ -264,6 +278,10 @@ impl AttestationBuilder {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AttestationError {
+    #[error("participant bitfield has {actual} bytes, registry permits {maximum}")]
+    ParticipantBitfieldTooLong { maximum: usize, actual: usize },
+    #[error("participant count {claimed} does not match the registry and bitfield ({actual} set bits)")]
+    ParticipantCountMismatch { claimed: u32, actual: usize },
     #[error("no participants in attestation")]
     NoParticipants,
     #[error("BLS signature aggregation failed")]
@@ -310,6 +328,26 @@ mod tests {
         assert_eq!(reg.index_of(&pk2), Some(1));
         assert_eq!(reg.pubkey_at(0), Some(&pk1));
         assert_eq!(reg.pubkey_at(2), None);
+    }
+
+    #[test]
+    fn a_valid_signature_cannot_vouch_for_a_forged_participant_count() {
+        let key = make_keys(1).pop().unwrap();
+        let mut registry = VerifierRegistry::new();
+        registry.register(key.public_key().to_bytes());
+        let receipt = sign_receipt(B256::ZERO, 1, B256::ZERO, 0, &key);
+        let mut builder = AttestationBuilder::new(B256::ZERO, 1, B256::ZERO);
+        assert!(builder.add_receipt(&receipt, &registry));
+        let original = builder.build().unwrap();
+        assert!(original.verify(&registry).is_ok());
+        for claimed in [0, 2, u32::MAX] {
+            let mut forged = original.clone();
+            forged.participant_count = claimed;
+            assert!(matches!(forged.verify(&registry), Err(AttestationError::ParticipantCountMismatch { .. })));
+        }
+        let mut padded = original;
+        padded.participant_bitfield.push(0);
+        assert!(matches!(padded.verify(&registry), Err(AttestationError::ParticipantBitfieldTooLong { .. })));
     }
 
     #[test]

@@ -470,15 +470,17 @@ fn batch_equation_holds(messages: &[&[u8]], signatures: &[EdSignature], keys: &[
         })
         .collect();
     let base_coefficient: Scalar = s_values.iter().zip(&zs).map(|(s, z)| z * s).sum();
-    let mut key_bytes: Vec<&[u8; 32]> = Vec::new();
+    // Preserve first-seen point order, while avoiding a quadratic scan for
+    // batches in which every transaction belongs to a different sender.
+    let mut key_indices = std::collections::HashMap::with_capacity(keys.len());
     let mut key_points: Vec<EdwardsPoint> = Vec::new();
     let mut key_coefficients: Vec<Scalar> = Vec::new();
     for ((key, hram), z) in keys.iter().zip(&hrams).zip(&zs) {
         let term = Scalar::from_bytes_mod_order_wide(hram) * z;
-        match key_bytes.iter().position(|seen| *seen == key.as_bytes()) {
-            Some(at) => key_coefficients[at] += term,
-            None => {
-                key_bytes.push(key.as_bytes());
+        match key_indices.entry(*key.as_bytes()) {
+            std::collections::hash_map::Entry::Occupied(entry) => key_coefficients[*entry.get()] += term,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(key_points.len());
                 key_points.push(key.to_edwards());
                 key_coefficients.push(term);
             }
@@ -805,6 +807,12 @@ mod merged_batch_tests {
         let five_senders: Vec<AltSigTx> = (0..64u64).map(|nonce| signed((nonce % 5) as u8 + 1, nonce)).collect();
         let (hashes, signatures, keys) = parts(&five_senders);
         assert!(verdict(&hashes, &signatures, &keys), "five senders interleaved");
+
+        let distinct: Vec<AltSigTx> = (1..=255u8).map(|seed| signed(seed, u64::from(seed))).collect();
+        let (hashes, signatures, keys) = parts(&distinct);
+        assert!(verdict(&hashes, &signatures, &keys), "all distinct senders");
+        let refs: Vec<&AltSigTx> = distinct.iter().collect();
+        assert_eq!(verify_batch(&refs), distinct.iter().map(AltSigTx::verify).collect::<Vec<_>>());
 
         let (mut swapped, signatures, keys) = parts(&five_senders);
         swapped.swap(3, 4);

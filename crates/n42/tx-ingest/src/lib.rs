@@ -223,6 +223,7 @@ fn async_frames_in_flight() -> usize {
 /// engine's threads the core whenever they are runnable and recovery the
 /// cycles nobody else wants -- a budget that follows the load instead of a
 /// fixed one. Unset, the node-wide `N42_BACKGROUND_NICE` applies instead.
+#[cfg(target_os = "linux")]
 fn recovery_nice() -> i32 {
     static NICE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     *NICE.get_or_init(|| {
@@ -238,6 +239,12 @@ fn recovery_nice() -> i32 {
 /// thread; blocking-pool threads are reused, so this is a few syscalls a
 /// frame at most.
 fn apply_recovery_nice() {
+    #[cfg(target_os = "linux")]
+    apply_recovery_nice_linux();
+}
+
+#[cfg(target_os = "linux")]
+fn apply_recovery_nice_linux() {
     thread_local! {
         static APPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
@@ -273,11 +280,13 @@ fn apply_recovery_nice() {
 /// `=2` pins over every logical CPU of the set instead (one thread per SMT
 /// thread, no migration); `=1` measured a loss -- 16 physical cores could not
 /// carry 20 slots, 12.7 cores of recovery against 20 unpinned.
+#[cfg(target_os = "linux")]
 fn recovery_pin() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| std::env::var("N42_TX_INGEST_RECOVER_PIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
+#[cfg(target_os = "linux")]
 fn physical_cores() -> &'static [usize] {
     static CORES: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
     CORES.get_or_init(|| {
@@ -309,6 +318,12 @@ fn physical_cores() -> &'static [usize] {
 /// Pins the calling thread to its core (see [`recovery_pin`]), once per
 /// thread.
 fn apply_recovery_affinity() {
+    #[cfg(target_os = "linux")]
+    apply_recovery_affinity_linux();
+}
+
+#[cfg(target_os = "linux")]
+fn apply_recovery_affinity_linux() {
     thread_local! {
         static PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
@@ -349,6 +364,10 @@ fn recovery_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
 
 /// Largest single transaction, in bytes.
 const MAX_TX_BYTES: u32 = 1 << 20;
+
+/// Bound the retained transaction bytes of one frame independently of its
+/// transaction count. The per-transaction cap alone allowed a 10 GiB frame.
+const MAX_FRAME_BYTES: usize = 64 << 20;
 
 /// How long to wait between checks when the pool is at its high water mark.
 const GATE_POLL: std::time::Duration = std::time::Duration::from_millis(2);
@@ -1201,12 +1220,20 @@ where
         let keep_claims = claiming && claimed_senders;
         let mut claims: Vec<Address> = if keep_claims { Vec::with_capacity(count as usize) } else { Vec::new() };
         let mut frame_buf = bytes::BytesMut::with_capacity(count as usize * 160);
+        let mut frame_bytes = 0usize;
         for _ in 0..count {
             let len = stream.read_u32_le().await? as usize;
             if len == 0 || len > MAX_TX_BYTES as usize {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("transaction of {len} bytes"),
+                ));
+            }
+            frame_bytes += len;
+            if frame_bytes > MAX_FRAME_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("frame exceeds {MAX_FRAME_BYTES} transaction bytes"),
                 ));
             }
             if claiming {

@@ -566,6 +566,34 @@ pub fn freeze_after_seal() -> bool {
     *ON.get_or_init(|| std::env::var("N42_FREEZE_AFTER_SEAL").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `N42_ROOT_OPS_AHEAD=1` (`docs/SHARED_EXECUTION_SCOPE.md` 15): with the
+/// output shards on a block that seals early, the shards' QMDB leaf
+/// operations are encoded and sorted on a thread of their own as soon as the
+/// shards are final (the graft's end), beside the receipts and the
+/// executor's finish; the root job behind the seal then encodes only the
+/// residual's few accounts and merges them in (`OpsAhead::finish`), instead
+/// of encoding the block's ~190,000 accounts after the finish. The same
+/// operations either way (`operations_ahead_finished_equal_the_whole_views`).
+/// Off by default.
+pub fn root_ops_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_ROOT_OPS_AHEAD").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The shards' operations encoded ahead ([`root_ops_ahead`]), and when they
+/// were done.
+type OpsAheadJob = std::thread::JoinHandle<(n42_qmdb_reth::OpsAhead, std::time::Instant)>;
+
+/// How the root job used the operations encoded ahead: its wait for them,
+/// the finish (the residual's encoded and merged in), and when they were
+/// done. All zero when it encoded the whole view itself.
+#[derive(Debug, Default, Clone, Copy)]
+struct OpsAheadUse {
+    waited: std::time::Duration,
+    finish: std::time::Duration,
+    done_at: Option<std::time::Instant>,
+}
+
 /// The output shards frozen on a thread of their own ([`freeze_after_seal`]).
 type LateFreeze = crate::output_shards::FreezeHandle;
 
@@ -1432,7 +1460,11 @@ where
     // parallel step's output left in address-range shards and never grafted;
     // carried to the finish behind the seal, where the next build is let go
     // on it before the block's one bundle is built.
-    let mut output_shards: Option<crate::output_shards::FrozenShards> = None;
+    let mut output_shards: Option<Arc<crate::output_shards::FrozenShards>> = None;
+    // `N42_ROOT_OPS_AHEAD=1`: the shards' QMDB leaves encoded on a thread of
+    // their own from the graft's end (with the Prague flag they were encoded
+    // under), for the root job behind the seal to finish.
+    let mut ops_ahead: Option<(OpsAheadJob, bool)> = None;
     let mut out_shards = 0usize;
     let mut shard_append_ms = 0u64;
     let mut shard_fold_ms = 0u64;
@@ -2406,7 +2438,27 @@ where
                         changes.insert(beneficiary, account);
                     }
                     revm::DatabaseCommit::commit(db, changes);
-                    output_shards = sharded_out;
+                    output_shards = sharded_out.map(Arc::new);
+                    // `N42_ROOT_OPS_AHEAD=1`: the shards are final here (the
+                    // cached accounts taken out of them); their QMDB leaves
+                    // are encoded and sorted now, beside the finish, and the
+                    // root job adds the residual's to them.
+                    if root_ops_ahead() && sealing_early && let Some(shards) = output_shards.as_ref() {
+                        let shards = Arc::clone(shards);
+                        let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
+                        let spawned = std::thread::Builder::new().name("n42-ops-ahead".into()).spawn(move || {
+                            n42_core_layout::enter(n42_core_layout::Set::Critical);
+                            let empty = revm::database::BundleState::default();
+                            let accounts = shards.view(&empty, &[]);
+                            (n42_qmdb_reth::operations_ahead(&accounts, prague), std::time::Instant::now())
+                        });
+                        match spawned {
+                            Ok(handle) => ops_ahead = Some((handle, prague)),
+                            Err(error) => {
+                                tracing::debug!(target: "payload_builder", %error, "no thread for the operations ahead; the root job encodes them");
+                            }
+                        }
+                    }
                     par_fold_ms = fold_at.elapsed().saturating_sub(seal_took).as_millis() as u64;
                     par_txs = tx_count;
                     par_groups = run.phases.groups;
@@ -2795,7 +2847,7 @@ where
             // and the shard path's root job split into its operations (encode,
             // join, sort) and the forest's compute.
             let mut leader_merge = LeaderMerge::default();
-            let mut root_ops: (n42_qmdb_reth::OpsSplit, std::time::Duration, std::time::Duration) = Default::default();
+            let mut root_ops: (n42_qmdb_reth::OpsSplit, std::time::Duration, std::time::Duration, OpsAheadUse) = Default::default();
             let roots_ms;
             // Where the QMDB root spent its time (`root_*` on the phases line),
             // and how long its publication took.
@@ -2883,7 +2935,6 @@ where
                 }
                 Some(shards) => {
             shards_used = out_shards;
-            let shards = Arc::new(shards);
             // The residual is filed as it is, not copied: the root, the
             // hashed post-state and the merge below read it through the Arc.
             let residual = Arc::new(reth_execution_types::BlockExecutionOutput {
@@ -2930,16 +2981,53 @@ where
                 let parent_root_early = verify_fields.then(|| qmdb_state.root_of(&parent_sealed)).flatten();
                 let roots_from = std::time::Instant::now();
                 let qmdb_job = &qmdb_state;
+                let ahead = ops_ahead.take();
+                let shards_ref = &shards;
+                let overlaps_ref = &overlaps;
                 let root = scope.spawn(move || {
                     // The leader's QMDB root job: on the critical set.
                     let started = std::time::Instant::now();
                     n42_core_layout::enter(n42_core_layout::Set::Critical);
-                    let (ops, split) = n42_qmdb_reth::sorted_operations_from_accounts_timed(view_ref, prague);
+                    // `N42_ROOT_OPS_AHEAD=1`: the shards' operations encoded
+                    // beside the finish; the residual's added here. A job
+                    // that failed, or ran under another Prague flag, leaves
+                    // the whole encode to this one.
+                    let finished = ahead.and_then(|(job, ahead_prague)| {
+                        let joined_at = std::time::Instant::now();
+                        let (ahead, done_at) = job.join().ok().filter(|_| ahead_prague == prague)?;
+                        let waited = joined_at.elapsed();
+                        let finish_at = std::time::Instant::now();
+                        let replaced: Vec<(&alloy_primitives::Address, &revm::database::BundleAccount)> = residual_state
+                            .state
+                            .keys()
+                            .filter_map(|address| shards_ref.get(address).map(|account| (address, account)))
+                            .collect();
+                        let newer: Vec<(&alloy_primitives::Address, &revm::database::BundleAccount)> = residual_state
+                            .state
+                            .iter()
+                            .filter(|(address, _)| !shards_ref.holds(address))
+                            .chain(overlaps_ref.iter().map(|(address, account)| (address, account)))
+                            .collect();
+                        let split = n42_qmdb_reth::OpsSplit {
+                            encode_us: ahead.encode_us,
+                            concat_us: 0,
+                            sort_us: ahead.sort_us,
+                        };
+                        let ops = ahead.finish(&replaced, &newer, prague);
+                        Some((ops, split, OpsAheadUse { waited, finish: finish_at.elapsed(), done_at: Some(done_at) }))
+                    });
+                    let (ops, split, ahead_use) = match finished {
+                        Some(finished) => finished,
+                        None => {
+                            let (ops, split) = n42_qmdb_reth::sorted_operations_from_accounts_timed(view_ref, prague);
+                            (ops, split, OpsAheadUse::default())
+                        }
+                    };
                     let kept = verify_fields.then(|| ops.clone());
                     let ops_done = std::time::Instant::now();
                     let prepared = qmdb_job.compute_operations(parent_sealed, ops);
                     let ended = std::time::Instant::now();
-                    let timed = (split, ops_done.duration_since(started), ended.duration_since(ops_done));
+                    let timed = (split, ops_done.duration_since(started), ended.duration_since(ops_done), ahead_use);
                     (prepared, started, ended, kept, timed)
                 });
                 // The hashed post-state beside the root on a thread of its
@@ -3311,6 +3399,14 @@ where
                     root_ops_concat_us = root_ops.0.concat_us,
                     root_ops_sort_us = root_ops.0.sort_us,
                     root_compute_us = root_ops.2.as_micros() as u64,
+                    // `N42_ROOT_OPS_AHEAD=1`: whether the root job finished
+                    // operations encoded ahead (the encode and sort above are
+                    // then the ahead job's), when that job was done (us from
+                    // the seal), the root job's wait for it, and its finish.
+                    root_ops_ahead = root_ops.3.done_at.is_some(),
+                    seal_to_ops_ahead_us = crate::fields_at_seal::us_between(sealed_instant, root_ops.3.done_at),
+                    root_ops_ahead_wait_us = root_ops.3.waited.as_micros() as u64,
+                    root_ops_finish_us = root_ops.3.finish.as_micros() as u64,
                     // `N42_SEAL_AT_EXEC=1` (plan v6 G2): sealed at the parallel
                     // step's end with the fold behind the proposal; the
                     // transactions root computed over the pulled set beside

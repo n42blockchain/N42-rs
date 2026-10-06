@@ -3,7 +3,7 @@
 
 // The builder's phases line has more fields than `tracing`'s macros expand
 // under the default limit.
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 //mod addons;
 //pub use addons::N42NodeAddOns;

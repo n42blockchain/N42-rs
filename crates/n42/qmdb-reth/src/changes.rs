@@ -148,6 +148,68 @@ pub fn sorted_operations_from_accounts_timed(
     (ops, split)
 }
 
+/// A block's output-shard accounts encoded and sorted before the block's
+/// executor has finished (`N42_ROOT_OPS_AHEAD`): what
+/// [`sorted_operations_from_accounts`] makes of them, less the system caller's
+/// leaf, ready for [`Self::finish`] to replace the accounts the executor
+/// changed again and add the ones it alone wrote.
+#[derive(Debug, Default)]
+pub struct OpsAhead {
+    ops: QmdbOps,
+    /// The encode and the sort, microseconds (the join is in `encode_us`).
+    pub encode_us: u64,
+    /// See `encode_us`.
+    pub sort_us: u64,
+}
+
+/// [`OpsAhead`] over `accounts` (each address once, as in a bundle's map).
+pub fn operations_ahead(accounts: &[(&Address, &revm_database::BundleAccount)], prague_active: bool) -> OpsAhead {
+    let at = std::time::Instant::now();
+    let mut ops = QmdbOps::concat(encode_account_pieces(accounts, prague_active));
+    let encoded = std::time::Instant::now();
+    ops.sort();
+    OpsAhead {
+        ops,
+        encode_us: encoded.duration_since(at).as_micros() as u64,
+        sort_us: encoded.elapsed().as_micros() as u64,
+    }
+}
+
+impl OpsAhead {
+    /// The block's operations: the accounts encoded ahead less `replaced`
+    /// (accounts of theirs the executor changed afterwards, as they were
+    /// encoded), plus `newer` (every account the executor's residual left:
+    /// the ones it alone wrote and the replaced ones as the merge leaves them)
+    /// and, on a Prague block, the system caller's leaf. Equal to
+    /// [`sorted_operations_from_accounts`] over the block's whole view, when
+    /// `replaced` and `newer` name the same addresses and the accounts
+    /// encoded ahead are the rest of the view.
+    pub fn finish(
+        self,
+        replaced: &[(&Address, &revm_database::BundleAccount)],
+        newer: &[(&Address, &revm_database::BundleAccount)],
+        prague_active: bool,
+    ) -> QmdbOps {
+        use n42_twig_core::qmdb_compat::{gov5_account_key, gov5_storage_key};
+        let mut dropped: Vec<n42_twig_core::Hash> = Vec::with_capacity(replaced.len());
+        for (address, account) in replaced {
+            // The system caller's account leaf was never encoded on a Prague
+            // block; a key that is not there is passed over.
+            dropped.push(gov5_account_key(&address.0 .0));
+            for slot in account.storage.keys() {
+                dropped.push(gov5_storage_key(&address.0 .0, &B256::from(slot.to_be_bytes::<32>()).0));
+            }
+        }
+        dropped.sort_unstable();
+        let mut extra = QmdbOps::concat(encode_account_pieces(newer, prague_active));
+        if prague_active {
+            push_prague_system_caller(&mut extra);
+        }
+        extra.sort();
+        self.ops.merge_sorted(extra, &dropped)
+    }
+}
+
 /// The system caller's leaf as gov5 writes it on a Prague block (see
 /// [`PRAGUE_SYSTEM_CALLER`]).
 fn push_prague_system_caller(ops: &mut QmdbOps) {
@@ -433,6 +495,77 @@ mod state_commit_bench {
                     assert_eq!(*key, e.key, "key (prague {prague})");
                     assert_eq!(value, e.value.as_deref(), "value (prague {prague})");
                 }
+            }
+        }
+    }
+
+    /// `N42_ROOT_OPS_AHEAD`: the shards' accounts encoded ahead, finished with
+    /// the residual's (accounts it alone wrote, accounts it changed again with
+    /// storage on both sides, a deleted one, the system caller on either
+    /// side), equal the operations of the whole view, with and without Prague.
+    #[test]
+    fn operations_ahead_finished_equal_the_whole_views() {
+        let slot = |n: u64, from: u64, to: u64| {
+            (U256::from(n), revm_database::states::StorageSlot::new_changed(U256::from(from), U256::from(to)))
+        };
+        let mut shards = bundle(0..3000, true);
+        let with_storage = |slots: Vec<(U256, revm_database::states::StorageSlot)>| {
+            BundleAccount::new(Some(AccountInfo::default()), Some(AccountInfo { nonce: 1, ..Default::default() }), slots.into_iter().collect(), revm_database::AccountStatus::Changed)
+        };
+        shards.state.insert(addr(5), with_storage(vec![slot(1, 0, 9), slot(2, 5, 0)]));
+        shards.state.insert(addr(6), with_storage(vec![slot(3, 1, 2)]));
+        // The residual: accounts only it wrote, accounts of the shards it
+        // changed again (one with storage of its own over the shard's), a
+        // deletion.
+        let mut residual = bundle(20_000..20_010, false);
+        for i in [7u64, 900, 2999] {
+            let over = AccountInfo { balance: U256::from(7_000_000 + i), nonce: 99, ..Default::default() };
+            residual.state.insert(addr(i), BundleAccount::new(None, Some(over), Default::default(), revm_database::AccountStatus::Changed));
+        }
+        residual.state.insert(addr(5), with_storage(vec![slot(2, 5, 4), slot(8, 0, 1)]));
+        residual.state.insert(addr(20_011), BundleAccount::new(Some(AccountInfo::default()), None, Default::default(), revm_database::AccountStatus::Destroyed));
+        for caller_in in [None, Some(true), Some(false)] {
+            let (mut shards, mut residual) = (shards.clone(), residual.clone());
+            let caller = BundleAccount::new(None, Some(AccountInfo { nonce: 3, ..Default::default() }), Default::default(), revm_database::AccountStatus::Changed);
+            match caller_in {
+                Some(true) => drop(shards.state.insert(PRAGUE_SYSTEM_CALLER, caller)),
+                Some(false) => drop(residual.state.insert(PRAGUE_SYSTEM_CALLER, caller)),
+                None => {}
+            }
+            // The merge's view: a shard account the residual changed again is
+            // the residual's value over the shard's original, with the storage
+            // of both (`output_shards::overlaid`).
+            let overlaid = |account: &BundleAccount, over: &BundleAccount| {
+                let mut merged = over.clone();
+                merged.original_info = account.original_info.clone();
+                let mut storage = account.storage.clone();
+                storage.extend(over.storage.iter().map(|(slot, value)| (*slot, *value)));
+                merged.storage = storage;
+                merged
+            };
+            let overlaps: Vec<(Address, BundleAccount)> = residual
+                .state
+                .iter()
+                .filter_map(|(address, over)| shards.state.get(address).map(|account| (*address, overlaid(account, over))))
+                .collect();
+            let mut view: Vec<(&Address, &BundleAccount)> =
+                shards.state.iter().filter(|(address, _)| !residual.state.contains_key(*address)).collect();
+            let newer: Vec<(&Address, &BundleAccount)> = residual
+                .state
+                .iter()
+                .filter(|(address, _)| !shards.state.contains_key(*address))
+                .chain(overlaps.iter().map(|(address, account)| (address, account)))
+                .collect();
+            view.extend(newer.iter().copied());
+            let replaced: Vec<(&Address, &BundleAccount)> =
+                residual.state.keys().filter_map(|address| shards.state.get_key_value(address)).collect();
+            assert!(!replaced.is_empty() && !newer.is_empty());
+            let ahead_accounts: Vec<(&Address, &BundleAccount)> = shards.state.iter().collect();
+            for prague in [false, true] {
+                let expected = sorted_operations_from_accounts(&view, prague);
+                let got = operations_ahead(&ahead_accounts, prague).finish(&replaced, &newer, prague);
+                assert!(got.is_sorted(), "caller {caller_in:?}, prague {prague}");
+                assert_eq!(got, expected, "caller {caller_in:?}, prague {prague}");
             }
         }
     }

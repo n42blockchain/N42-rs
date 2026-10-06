@@ -432,6 +432,38 @@ fn a_freeze_on_its_own_thread_equals_the_inline_freeze() {
     }
 }
 
+/// `N42_ROOT_OPS_AHEAD`: the shards' operations encoded before the residual
+/// exists, finished as the root job finishes them (the residual's accounts the
+/// shards hold replaced by the overlaps, the rest added), equal the operations
+/// of the view and of the merged bundle, in every mode and shard count.
+#[test]
+fn the_operations_encoded_ahead_equal_the_views() {
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    for (count, mode) in [1, 16, 64].into_iter().flat_map(|count| MODES.map(|mode| (count, mode))) {
+        let (shards, residual) = sharded_parts(&db, shards_of(bundles.clone(), count, mode));
+        let empty = BundleState::default();
+        let ahead_accounts = shards.view(&empty, &[]);
+        let overlaps = shards.overlaps(&residual);
+        assert!(!overlaps.is_empty(), "{count} shards: an overlap to replace");
+        let view = shards.view(&residual, &overlaps);
+        let merged = shards.merged(&residual);
+        let replaced: Vec<_> =
+            residual.state.keys().filter_map(|address| shards.get(address).map(|account| (address, account))).collect();
+        let newer: Vec<_> = residual
+            .state
+            .iter()
+            .filter(|(address, _)| !shards.holds(address))
+            .chain(overlaps.iter().map(|(address, account)| (address, account)))
+            .collect();
+        for prague in [false, true] {
+            let got = n42_qmdb_reth::operations_ahead(&ahead_accounts, prague).finish(&replaced, &newer, prague);
+            assert_eq!(got, n42_qmdb_reth::sorted_operations_from_accounts(&view, prague), "{count} shards, {mode}: view");
+            assert_eq!(got, n42_qmdb_reth::sorted_operations_from_execution(&merged, prague), "{count} shards, {mode}: merged");
+        }
+    }
+}
+
 #[test]
 fn the_fallback_with_the_cache_kept_equals_the_direct_graft() {
     let db = parent();

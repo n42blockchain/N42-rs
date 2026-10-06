@@ -27,7 +27,7 @@
 
 QMDB 补充反例直接提取原版和修复版的方法体，以相同最小类型驱动三项断言：原版 0/3 通过，修复版 3/3 通过。该反例用于证明问题，不能替代下面的仓库测试。
 
-## 验证
+## 验证（初次代码审计）
 
 以下进程均已结束，退出码为 0。共 **1086 项通过、0 失败、22 项按原配置忽略**；不重复计入先前运行和单独运行的 forest 测试。
 
@@ -49,19 +49,42 @@ QMDB 最终分别为 reth 57 项、state 24 项通过；交易入口 63 项、�
 - `cargo clippy --locked -p n42-h2-consensus -p n42-h2-execution -p n42-h2-net -p n42-mobile-verify -p n42-qmdb-reth -p n42-tx-ingest -p n42-tx-types -p n42-h2-el-rpc --lib --tests`：退出 0，日志 `/tmp/n42-audit-clippy-final.log`。
 - 最终 forest 修复后，`cargo clippy --locked -p n42-qmdb-reth -p n42-qmdb-state --lib --tests`：退出 0，日志 `/tmp/n42-audit-clippy-state-final.log`。
 - Clippy 保留已有警告，没有使用 `-D warnings`，因此不称为零警告。
-- `git diff --check`：通过。`Cargo.lock` 未改变。
+- `git diff --check`：通过。初次代码审计未改变 `Cargo.lock`；后续依赖升级更新了锁文件。
 
 文件增量沿用现有序列化字段，读取旧日志的恢复测试通过；旧二进制会拒绝含追加槽位退役标志的新文件模式增量，因此回退旧程序前需要使用相应旧 checkpoint/日志备份。本次未实施线上升级或回退。
 
-## 尚未关闭的项目
+## 依赖升级与 4 条漏洞告警关闭
 
-`cargo audit --json` 返回 4 条安全告警。核对锁文件和实际依赖图后：
+用户授权升级后，`cargo audit --json` 的漏洞数量由 4 降为 **0**，退出码为 0。未添加忽略规则，也未删除依赖扫描范围。
 
-- `h2 0.3.27`：[RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258.html)。链路为 mobile-sdk → ethers → reqwest 0.11 → hyper 0.14；修复版本需要 h2 0.4.16 以上，不能仅在当前锁文件中做补丁版本更新。
-- `ring 0.16.20`：[RUSTSEC-2025-0009](https://rustsec.org/advisories/RUSTSEC-2025-0009.html)。链路为 mobile-sdk → ethers-providers → jsonwebtoken 8；修复版本为 ring 0.17.12 以上，需迁移旧 SDK 依赖。
-- `hickory-proto 0.25.2`：[RUSTSEC-2026-0118](https://rustsec.org/advisories/RUSTSEC-2026-0118.html)、[RUSTSEC-2026-0119](https://rustsec.org/advisories/RUSTSEC-2026-0119.html)。锁文件中的旧 libp2p-mdns/解析器链路未出现在当前 workspace 的实际反向依赖图（含 `--target all`）中；锁文件告警仍然存在，不能记为已修复。
+| 原告警 | 修复路径 | 当前版本 |
+| --- | --- | --- |
+| h2 0.3.27 / [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258.html) | 移除 ethers 的旧 reqwest/hyper RPC 栈 | h2 0.4.20 |
+| ring 0.16.20 / [RUSTSEC-2025-0009](https://rustsec.org/advisories/RUSTSEC-2025-0009.html) | 移除 ethers-providers → jsonwebtoken 8 链路 | ring 0.17.14 |
+| hickory-proto 0.25.2 / [RUSTSEC-2026-0118](https://rustsec.org/advisories/RUSTSEC-2026-0118.html)、[RUSTSEC-2026-0119](https://rustsec.org/advisories/RUSTSEC-2026-0119.html) | libp2p 0.56 → 0.57，带入 DNS 0.45 / mDNS 0.49；提高 workspace resolver 版本下限 | Hickory 0.26.3 |
 
-当前节点实际使用 h2 0.4.19、ring 0.17.14、hickory-proto 0.26.3。上述依赖图检查仅说明当前构建路径，不证明所有可选 feature 或部署配置均安全。旧 ethers SDK 的迁移需要独立兼容验证，本次未作未经验证的大版本替换。
+这些旧版本均已从锁文件消失。版本信息通过 crates.io 的 `cargo info` 核对。由于 [ethers 上游已停更并推荐 Alloy](https://github.com/gakonst/ethers-rs)，SDK 示例的 RPC 与签名改用仓库现用的 Alloy 2.5.0；库只保留最新版 ethers-core 2.0.14 的 ABI 和交易类型，保持公共 Rust 类型、C/JNI JSON（包括 `data` 字段）和金额解析行为。交易发送仍显式使用原有 legacy gas 定价；批量发送从 pending nonce 开始递增。
+
+libp2p 0.57 的 Codec 改用原生异步方法，相关实现和依赖已适配。其 Yamux 0.14 后端只提供自适应接收窗口，旧固定窗口/缓冲区接口已移除：`N42_YAMUX_WINDOW_MB` 不再控制窗口，显式配置时记录一次警告。新增 2 MiB 难压缩正文的真实 TCP loopback 回归。此升级改变流控与内存预算，尚未做原 163,000 笔交易集群负载对照，不能宣称吞吐或内存占用与旧版相同。
+
+libp2p-swarm 0.48 精确约束 wasm-bindgen-futures 0.4.58，连带约束 wasm-bindgen 0.2.108；因此保留上游支持的兼容组合，而不是强行替换该浏览器依赖链。
+
+扫描还保留 **7 条停维护提示、1 条既有 lru 健全性警告**。初次审计为 8 条停维护提示、1 条健全性警告。lru 0.16.4 由锁文件中的旧 Alloy provider 1.8.3 引入，当前 workspace 默认依赖图中未选中；可选 feature 仍需单独验证。这些提示不记为本次 4 条漏洞的修复，也不代表整个依赖树没有风险。
+
+升级后的最终验证均已结束，退出码为 0；共 **368 项通过、0 失败、5 项按原配置忽略**。这是升级后的验证组，不与初次审计的重复测试相加。
+
+| 最终命令 | 通过 / 忽略 | 日志 |
+| --- | --- | --- |
+| `cargo test --locked -p n42-h2-net -p n42-h2-node --lib --tests` | 199 / 0 | `/tmp/n42-libp2p-dependency-tests-final3.log` |
+| `cargo test --locked -p n42 --bin n42 --lib -- --test-threads=1` | 134 / 5 | `/tmp/n42-dependency-node-tests.log` |
+| `cargo test --locked -p mobile-sdk --lib --examples` | 35 / 0 | `/tmp/n42-mobile-dependency-tests-final2.log` |
+| `cargo check --locked -p n42-h2-node --examples` | 编译检查通过 | `/tmp/n42-dependency-node-examples-final.log` |
+
+SDK 回归覆盖存款、退出和费用查询交易，比较转换后的字段、calldata 与 legacy 签名哈希；测试发现 ethers RPC JSON 不序列化 chain_id，转换现已显式保留该字段。示例检查另发现验证器无条件调用 Linux prctl，已补充 Linux 平台条件，macOS 编译通过。没有运行真实 RPC 提交或链上交易。
+
+扫描日志：`/tmp/n42-dependency-audit-final.json`。升级后的编译保留既有警告；未重跑升级后的 Clippy，不将初次审计的 Clippy 结果作为新依赖组合的证据。
+
+## 其他验证边界
 
 全仓 `cargo fmt --all -- --check` 失败，输出约 7498 处格式差异，首处位于未修改的 pubsub-mem。没有为通过格式检查重写全仓；本次检查单独确认补丁空白无误。
 
@@ -69,4 +92,4 @@ QMDB 最终分别为 reth 57 项、state 24 项通过；交易入口 63 项、�
 
 ## 分批提交
 
-QMDB 状态、网络协议、交易与证明、平台兼容四组已逐组推送至 `origin/feat/native-fleet7`，每次均通过 `ls-remote` 核对提交号。用户随后授权继续升级依赖并关闭 4 条安全告警，依赖修复将另行记录验证结果。
+QMDB 状态、网络协议、交易与证明、平台兼容、初次审计记录、依赖升级、验证器示例平台修复、最终验证记录分为八次英文提交，逐次推送至 `origin/feat/native-fleet7`，每次通过 `ls-remote` 核对提交号。未合并至默认分支，GitHub 默认分支告警是否关闭需以合并后的扫描为准。

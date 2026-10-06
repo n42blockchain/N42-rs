@@ -75,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `N42_V_THP_DISABLE=1` does it for the validator alone, leaving the
     // execution layer's builder its huge pages (measured +15-20% on its
     // execution phase without them).
+    #[cfg(target_os = "linux")]
     if std::env::var("N42_THP_DISABLE").is_ok_and(|v| v == "1")
         || std::env::var("N42_V_THP_DISABLE").is_ok_and(|v| v == "1")
     {

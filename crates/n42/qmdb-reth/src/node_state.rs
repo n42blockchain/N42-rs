@@ -114,6 +114,7 @@ fn checkpoint_ratio() -> u64 {
 /// `N42_QMDB_COMPACT_NICE`: the compaction thread's nice value (default 10),
 /// so its read, replay and write of the whole state yield to the builder and
 /// the import on the same cores. 0 leaves it at the process's priority.
+#[cfg(target_os = "linux")]
 fn compact_nice() -> i32 {
     static NICE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     *NICE.get_or_init(|| {
@@ -127,6 +128,12 @@ fn compact_nice() -> i32 {
 
 /// Lowers the calling thread's priority to [`compact_nice`].
 fn apply_compact_nice() {
+    #[cfg(target_os = "linux")]
+    apply_compact_nice_linux();
+}
+
+#[cfg(target_os = "linux")]
+fn apply_compact_nice_linux() {
     let nice = compact_nice();
     if nice == 0 {
         return;
@@ -549,7 +556,11 @@ struct RootCounters {
 impl RootCounters {
     fn now() -> Self {
         let (seals, seal_us) = n42_twig_core::entry_store::seal_stats();
+        #[cfg(target_os = "linux")]
         let (thread_faults, _) = rusage(libc::RUSAGE_THREAD);
+        // Other platforms do not expose Linux's per-thread fault counters.
+        #[cfg(not(target_os = "linux"))]
+        let thread_faults = 0;
         let (_, process_majflt) = rusage(libc::RUSAGE_SELF);
         Self {
             thread_faults,

@@ -46,6 +46,7 @@ fn main() {
     // memory drove 5.8M direct-compaction stalls that tore the page cache
     // out from under the importers' reads (round 39: the "first leg"
     // collapses, 0.7-0.8 s cycles, millions of major faults at 70 GB free).
+    #[cfg(target_os = "linux")]
     if std::env::var("N42_THP_DISABLE").is_ok_and(|v| v == "1") {
         // SAFETY: prctl with PR_SET_THP_DISABLE takes no pointers.
         let rc = unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };

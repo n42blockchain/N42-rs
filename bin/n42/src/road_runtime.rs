@@ -87,6 +87,7 @@ pub fn handle() -> Option<tokio::runtime::Handle> {
 }
 
 /// The calling thread's nice value, 0 when it cannot be read.
+#[cfg(target_os = "linux")]
 fn current_nice() -> i32 {
     // SAFETY: gettid and getpriority on the calling thread are plain syscalls
     // with no memory effects. getpriority can legitimately return -1, so errno
@@ -95,6 +96,12 @@ fn current_nice() -> i32 {
         let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
         libc::getpriority(libc::PRIO_PROCESS, tid)
     }
+}
+
+/// Per-thread nice values are only queried on Linux.
+#[cfg(not(target_os = "linux"))]
+fn current_nice() -> i32 {
+    0
 }
 
 /// Whether the channel measures `dispatch_wait_ms`: under `N42_ROAD_RUNTIME=1`,
@@ -107,6 +114,7 @@ pub fn measure_dispatch_wait() -> bool {
 
 /// Asks the kernel to stamp every segment this socket receives
 /// (`SO_TIMESTAMPNS`, wall clock), read back by [`read_kind_timed`].
+#[cfg(target_os = "linux")]
 pub fn enable_receive_timestamps(stream: &TcpStream) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
     let on: libc::c_int = 1;
@@ -126,6 +134,12 @@ pub fn enable_receive_timestamps(stream: &TcpStream) -> std::io::Result<()> {
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+/// Kernel receive timestamps are only implemented on Linux.
+#[cfg(not(target_os = "linux"))]
+pub fn enable_receive_timestamps(_stream: &TcpStream) -> std::io::Result<()> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "receive timestamps require Linux"))
 }
 
 /// Reads a request's first byte, and how long it had been in the socket's
@@ -150,6 +164,7 @@ pub async fn read_kind_timed(stream: &TcpStream) -> std::io::Result<(u8, Option<
 }
 
 /// One byte by `recvmsg`, with the `SCM_TIMESTAMPNS` control message if any.
+#[cfg(target_os = "linux")]
 fn recv_one_stamped(stream: &TcpStream) -> std::io::Result<(u8, Option<std::time::SystemTime>)> {
     use std::os::fd::AsRawFd as _;
     let mut byte = 0u8;
@@ -192,14 +207,40 @@ fn recv_one_stamped(stream: &TcpStream) -> std::io::Result<(u8, Option<std::time
     Ok((byte, stamp))
 }
 
+#[cfg(not(target_os = "linux"))]
+fn recv_one_stamped(stream: &TcpStream) -> std::io::Result<(u8, Option<std::time::SystemTime>)> {
+    let mut byte = [0];
+    match stream.try_read(&mut byte)? {
+        0 => Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof")),
+        _ => Ok((byte[0], None)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn unsupported_timestamps_preserve_bytes_and_eof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        assert_eq!(enable_receive_timestamps(&server).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+        client.write_all(&[7, 1, 2]).await.unwrap();
+        assert_eq!(read_kind_timed(&server).await.unwrap(), (7, None));
+        let mut rest = [0; 2];
+        server.read_exact(&mut rest).await.unwrap();
+        assert_eq!(rest, [1, 2]);
+        drop(client);
+        assert_eq!(read_kind_timed(&server).await.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
     /// A byte that sat in the socket for 60 ms reads as having waited about
     /// that long, and the bytes after it read as usual.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(target_os = "linux")]
     async fn the_first_byte_says_how_long_it_waited() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

@@ -136,6 +136,34 @@ impl QmdbOps {
         out
     }
 
+    /// `self` and `other`, both sorted by key, merged into one sorted set,
+    /// leaving out every operation of `self` whose key is in `dropped`
+    /// (sorted). One pass over the spans; `self`'s values stay where they
+    /// are and `other`'s are appended after them. With keys unique across
+    /// the two (a block's operations name each key once), the result is the
+    /// operations of both, less the dropped ones, in the order [`Self::sort`]
+    /// gives them.
+    pub fn merge_sorted(mut self, other: Self, dropped: &[Hash]) -> Self {
+        let base = self.values.len();
+        self.values.extend_from_slice(&other.values);
+        let mut ops = Vec::with_capacity(self.ops.len() + other.ops.len());
+        let mut theirs = other.ops.iter().map(|op| OpSpan { start: op.start + base, ..*op }).peekable();
+        let mut dropped = dropped.iter().peekable();
+        for op in &self.ops {
+            while dropped.next_if(|key| **key < op.key).is_some() {}
+            if dropped.peek().is_some_and(|key| **key == op.key) {
+                continue;
+            }
+            while let Some(next) = theirs.next_if(|next| next.key < op.key) {
+                ops.push(next);
+            }
+            ops.push(*op);
+        }
+        ops.extend(theirs);
+        self.ops = ops;
+        self
+    }
+
     /// The operations as owned [`QmdbOperation`]s, a value allocation apiece.
     pub fn to_operations(&self) -> Vec<QmdbOperation> {
         self.iter().map(|(key, value)| QmdbOperation { key: *key, value: value.map(<[u8]>::to_vec) }).collect()
@@ -250,6 +278,37 @@ mod tests {
         assert_eq!(arena.iter().filter(|(_, v)| v.is_some_and(<[u8]>::is_empty)).count(), 4, "empty values stay values");
         assert_eq!(arena.get(5), Some((&key(5), None)));
         assert_eq!(arena.get(40), None);
+    }
+
+    /// A sorted set merged with another, some of its keys dropped, equals the
+    /// two joined, filtered and sorted.
+    #[test]
+    fn merge_sorted_equals_join_filter_sort() {
+        let all = sample();
+        for split in [0usize, 1, 17, 39, 40] {
+            for drop_every in [0usize, 1, 3, 7] {
+                let (mine, theirs) = all.split_at(split);
+                let mut left = QmdbOps::from(mine);
+                left.sort();
+                let mut right = QmdbOps::from(theirs);
+                right.sort();
+                let mut dropped: Vec<Hash> = mine
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| drop_every != 0 && i % drop_every == 0)
+                    .map(|(_, op)| op.key)
+                    .collect();
+                // A key that is not there is no harm.
+                dropped.push([0xEE; 32]);
+                dropped.sort_unstable();
+                let mut expected: Vec<QmdbOperation> =
+                    all.iter().filter(|op| !dropped.contains(&op.key) || theirs.contains(op)).cloned().collect();
+                expected.sort_unstable_by_key(|op| op.key);
+                let merged = left.merge_sorted(right, &dropped);
+                assert!(merged.is_sorted(), "split {split}, drop {drop_every}");
+                assert_eq!(merged.to_operations(), expected, "split {split}, drop {drop_every}");
+            }
+        }
     }
 
     #[test]

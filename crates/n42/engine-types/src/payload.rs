@@ -682,6 +682,28 @@ fn receipts_from_slots<P: PoolTransaction<Consensus = TransactionSigned>>(
 /// failure is loud, as for the finish behind the seal. `sealed` is the
 /// proposed block's hash and number, `None` when nothing was proposed yet
 /// (the error then goes back as it always did).
+/// The leader's merge of its output shards into the block's one bundle, as
+/// its thread ran it behind the fields' publication.
+#[derive(Debug, Default, Clone, Copy)]
+struct LeaderMerge {
+    /// The merge's start on its thread.
+    started: Option<std::time::Instant>,
+    /// Its end, before `StateReady` is filed.
+    ended: Option<std::time::Instant>,
+    /// `StateReady` filed with the merged bundle.
+    state_ready: Option<std::time::Instant>,
+    /// The halves ([`crate::output_shards::FrozenShards::merged_timed`]).
+    split: crate::output_shards::MergeSplit,
+    /// The graft's own reverts appended after the merge, us.
+    tail_us: u64,
+    /// The threads the merge ran on.
+    threads: u32,
+    /// The merged bundle's accounts.
+    accounts: usize,
+    /// The merged bundle's reverts.
+    reverts: usize,
+}
+
 fn failed_after_seal(sealed: Option<(B256, u64)>, err: PayloadBuilderError) -> PayloadBuilderError {
     if let Some((block_hash, number)) = sealed {
         crate::built_executions::fail(block_hash);
@@ -2666,6 +2688,11 @@ where
             let mut shard_ready_ms = 0u64;
             let mut shard_merge_ms = 0u64;
             let mut shards_used = 0usize;
+            // The leader's merge on its own thread (`merge_*` on the line),
+            // and the shard path's root job split into its operations (encode,
+            // join, sort) and the forest's compute.
+            let mut leader_merge = LeaderMerge::default();
+            let mut root_ops: (n42_qmdb_reth::OpsSplit, std::time::Duration, std::time::Duration) = Default::default();
             let roots_ms;
             // Where the QMDB root spent its time (`root_*` on the phases line),
             // and how long its publication took.
@@ -2804,10 +2831,13 @@ where
                     // The leader's QMDB root job: on the critical set.
                     let started = std::time::Instant::now();
                     n42_core_layout::enter(n42_core_layout::Set::Critical);
-                    let ops = n42_qmdb_reth::sorted_operations_from_accounts(view_ref, prague);
+                    let (ops, split) = n42_qmdb_reth::sorted_operations_from_accounts_timed(view_ref, prague);
                     let kept = verify_fields.then(|| ops.clone());
+                    let ops_done = std::time::Instant::now();
                     let prepared = qmdb_job.compute_operations(parent_sealed, ops);
-                    (prepared, started, std::time::Instant::now(), kept)
+                    let ended = std::time::Instant::now();
+                    let timed = (split, ops_done.duration_since(started), ended.duration_since(ops_done));
+                    (prepared, started, ended, kept, timed)
                 });
                 // The hashed post-state beside the root on a thread of its
                 // own, so the publication does not wait for it. A destroyed
@@ -2815,7 +2845,7 @@ where
                 // provider's own path, on the merged bundle, below.
                 let hashed = (!hashed_off && !destroyed)
                     .then(|| scope.spawn(move || crate::output_shards::hashed_post_state_of(view_ref)));
-                let (prepared, root_started, root_ended, kept_ops) = root.join().map_err(|_| {
+                let (prepared, root_started, root_ended, kept_ops, ops_timed) = root.join().map_err(|_| {
                     PayloadBuilderError::other(std::io::Error::other("the QMDB root job panicked"))
                 })?;
                 let (execution_result, roots) = receipts.join().map_err(|_| {
@@ -2837,10 +2867,26 @@ where
                     .name("n42-shard-merge".into())
                     .spawn(move || {
                         n42_core_layout::background_thread();
+                        // Every input is in hand when this thread starts (the
+                        // shards frozen, the residual taken, the publication
+                        // done): the merge waits for nothing, and its phases
+                        // say where its wall goes (`merge_*` on the line).
                         let merge_at = std::time::Instant::now();
-                        let mut merged = shards.merged(&residual.state);
+                        let (mut merged, split) = shards.merged_timed(&residual.state, false);
+                        let tail_at = std::time::Instant::now();
                         crate::parallel_transfer::append_reverts(&mut merged, shard_reverts);
-                        let merge_ms = merge_at.elapsed().as_millis() as u64;
+                        let merge_end = std::time::Instant::now();
+                        let merge_ms = merge_end.duration_since(merge_at).as_millis() as u64;
+                        let timing = LeaderMerge {
+                            started: Some(merge_at),
+                            ended: Some(merge_end),
+                            split,
+                            tail_us: merge_end.duration_since(tail_at).as_micros() as u64,
+                            threads: 1,
+                            accounts: merged.state.len(),
+                            reverts: merged.reverts.iter().map(Vec::len).sum(),
+                            state_ready: None,
+                        };
                         let execution_output =
                             Arc::new(reth_execution_types::BlockExecutionOutput { state: merged, result: execution_result });
                         crate::built_executions::state_ready(
@@ -2852,7 +2898,8 @@ where
                                 trie_updates: Arc::new(TrieUpdates::default()),
                             },
                         );
-                        (execution_output, merge_ms, finish_at.elapsed().as_millis() as u64)
+                        let timing = LeaderMerge { state_ready: Some(std::time::Instant::now()), ..timing };
+                        (execution_output, merge_ms, finish_at.elapsed().as_millis() as u64, timing)
                     })
                     .map_err(PayloadBuilderError::other)?;
                 let hashed = match hashed {
@@ -2862,15 +2909,17 @@ where
                     None if hashed_off => Some(Default::default()),
                     None => None,
                 };
-                Ok((merger, hashed, roots_ms, (root_started, root_ended), early))
+                Ok((merger, hashed, roots_ms, (root_started, root_ended), early, ops_timed))
             });
-            let (merger, hashed, shard_roots_ms, (root_started, root_ended), early) = scoped?;
+            let (merger, hashed, shard_roots_ms, (root_started, root_ended), early, ops_timed) = scoped?;
             root_started_at = Some(root_started);
             root_ended_at = Some(root_ended);
             early_inputs = early;
-            let (execution_output, merge_ms, filed_ms) = merger.join().map_err(|_| {
+            root_ops = ops_timed;
+            let (execution_output, merge_ms, filed_ms, merge_timing) = merger.join().map_err(|_| {
                 PayloadBuilderError::other(std::io::Error::other("the shards' merge panicked"))
             })?;
+            leader_merge = merge_timing;
             let hashed_state = match hashed {
                 Some(hashed) => hashed,
                 None => parent_state_ref()
@@ -2885,6 +2934,7 @@ where
                 }
             };
             let late_output = early_inputs.as_ref().map(|_| Arc::clone(&execution_output));
+            let complete_at = std::time::Instant::now();
             crate::built_executions::complete(
                 block_hash,
                 crate::built_executions::BuiltExecution {
@@ -3127,6 +3177,37 @@ where
                     shard_fold_ms,
                     shard_ready_ms,
                     shard_merge_ms,
+                    // The leader's merge into the block's one bundle
+                    // (SHARED_EXECUTION_SCOPE 15), us from the seal: its
+                    // thread's start (every input is ready by then: it is
+                    // spawned after the fields' publication), its end,
+                    // `StateReady` filed, `Complete` filed (the engine's
+                    // hand-off; it also waits for the hashed post-state);
+                    // its halves (the account map, the revert set copied and
+                    // sorted, the sorted reverts appended, the graft's
+                    // reverts appended after), the threads it ran on, and
+                    // the accounts and reverts it copied.
+                    seal_to_merge_start_us = crate::fields_at_seal::us_between(sealed_instant, leader_merge.started),
+                    seal_to_merge_end_us = crate::fields_at_seal::us_between(sealed_instant, leader_merge.ended),
+                    seal_to_state_ready_us = crate::fields_at_seal::us_between(sealed_instant, leader_merge.state_ready),
+                    seal_to_complete_us = crate::fields_at_seal::us_between(sealed_instant, Some(complete_at)),
+                    merge_state_us = leader_merge.split.state_us,
+                    merge_reverts_us = leader_merge.split.reverts_us,
+                    merge_append_us = leader_merge.split.append_us,
+                    merge_tail_us = leader_merge.tail_us,
+                    merge_threads = leader_merge.threads,
+                    merge_accounts = leader_merge.accounts,
+                    merge_reverts = leader_merge.reverts,
+                    // The shard path's QMDB root job, us: its operations
+                    // (the leaves encoded on the global pool, the chunks
+                    // joined, the sort) and the forest's compute (the lock,
+                    // the move, the apply -- `root_apply_total_us` -- the
+                    // note and the delta).
+                    root_ops_us = root_ops.1.as_micros() as u64,
+                    root_ops_encode_us = root_ops.0.encode_us,
+                    root_ops_concat_us = root_ops.0.concat_us,
+                    root_ops_sort_us = root_ops.0.sort_us,
+                    root_compute_us = root_ops.2.as_micros() as u64,
                     // `N42_SEAL_AT_EXEC=1` (plan v6 G2): sealed at the parallel
                     // step's end with the fold behind the proposal; the
                     // transactions root computed over the pulled set beside

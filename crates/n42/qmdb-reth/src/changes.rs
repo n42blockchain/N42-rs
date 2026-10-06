@@ -110,13 +110,64 @@ pub fn sorted_operations_from_accounts(
     accounts: &[(&Address, &revm_database::BundleAccount)],
     prague_active: bool,
 ) -> QmdbOps {
+    sorted_operations_from_accounts_timed(accounts, prague_active).0
+}
+
+/// Where [`sorted_operations_from_accounts_timed`] spent its time, microseconds:
+/// the leaves keyed and encoded on the worker pool, the chunks joined into one
+/// arena (serial), and the sort (on the pool).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OpsSplit {
+    /// The parallel encode of every account's leaves.
+    pub encode_us: u64,
+    /// The chunks' arenas joined into one.
+    pub concat_us: u64,
+    /// The sort by key.
+    pub sort_us: u64,
+}
+
+/// [`sorted_operations_from_accounts`], timed in its three pieces.
+pub fn sorted_operations_from_accounts_timed(
+    accounts: &[(&Address, &revm_database::BundleAccount)],
+    prague_active: bool,
+) -> (QmdbOps, OpsSplit) {
+    let at = std::time::Instant::now();
+    let pieces = encode_account_pieces(accounts, prague_active);
+    let encoded = std::time::Instant::now();
+    let mut ops = QmdbOps::concat(pieces);
+    if prague_active {
+        push_prague_system_caller(&mut ops);
+    }
+    let joined = std::time::Instant::now();
+    ops.sort();
+    let split = OpsSplit {
+        encode_us: encoded.duration_since(at).as_micros() as u64,
+        concat_us: joined.duration_since(encoded).as_micros() as u64,
+        sort_us: joined.elapsed().as_micros() as u64,
+    };
+    (ops, split)
+}
+
+/// The system caller's leaf as gov5 writes it on a Prague block (see
+/// [`PRAGUE_SYSTEM_CALLER`]).
+fn push_prague_system_caller(ops: &mut QmdbOps) {
+    use n42_twig_core::qmdb_compat::{encode_gov5_account_value_into, gov5_account_key};
+    ops.push_with(gov5_account_key(&PRAGUE_SYSTEM_CALLER.0 .0), |out| {
+        encode_gov5_account_value_into(out, 0, &U256::ZERO.to_be_bytes::<32>(), &alloy_primitives::KECCAK256_EMPTY.0)
+    });
+}
+
+/// Every account's leaves keyed and encoded, a chunk of accounts an arena on
+/// the worker pool, unsorted; on a Prague block the system caller's account
+/// leaf is left out (its storage is not), for the caller to write once.
+fn encode_account_pieces(accounts: &[(&Address, &revm_database::BundleAccount)], prague_active: bool) -> Vec<QmdbOps> {
     use n42_twig_core::qmdb_compat::{encode_gov5_account_value_into, gov5_account_key, gov5_storage_key};
     use rayon::prelude::*;
     // Each chunk of accounts writes its leaves into an arena of its own on
     // the worker pool, and the chunks are joined into one: a block's
     // operations are a few hundred allocations, not one a value, and so is
     // the forest record that keeps them (BREAKTHROUGH_DESIGN 10.39).
-    let pieces: Vec<QmdbOps> = accounts
+    accounts
         .par_chunks(ACCOUNTS_PER_CHUNK)
         .map(|chunk| {
             let slots: usize = chunk.iter().map(|(_, account)| account.storage.len()).sum();
@@ -149,15 +200,7 @@ pub fn sorted_operations_from_accounts(
             }
             ops
         })
-        .collect();
-    let mut ops = QmdbOps::concat(pieces);
-    if prague_active {
-        ops.push_with(gov5_account_key(&PRAGUE_SYSTEM_CALLER.0 .0), |out| {
-            encode_gov5_account_value_into(out, 0, &U256::ZERO.to_be_bytes::<32>(), &alloy_primitives::KECCAK256_EMPTY.0)
-        });
-    }
-    ops.sort();
-    ops
+        .collect()
 }
 
 /// Accounts a worker writes into one arena in [`sorted_operations_from_accounts`].

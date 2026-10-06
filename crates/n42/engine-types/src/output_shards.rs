@@ -763,6 +763,9 @@ fn fold_split<'a>(
         task_minflt_sum: costs().map(|cost| cost.minflt).sum(),
         task_migrated: costs().filter(|cost| cost.migrated).count() as u64,
         task_nivcsw_max: costs().map(|cost| cost.nivcsw).max().unwrap_or(0),
+        pending_max: 0,
+        pending_us_max: 0,
+        drops_max: 0,
     }
 }
 
@@ -791,6 +794,9 @@ fn log_folded(fold_ns: u64, split: &FoldSplit, index: Option<(u64, usize)>, live
         task_minflt_sum = split.task_minflt_sum,
         task_migrated = split.task_migrated,
         task_nivcsw_max = split.task_nivcsw_max,
+        pending_max = split.pending_max,
+        pending_us_max = split.pending_us_max,
+        drops_max = split.drops_max,
         "output shards folded"
     );
 }
@@ -863,7 +869,7 @@ fn freeze_indexed(
         crate::parallel_transfer::build_pool().install(|| (0..count).into_par_iter().map(build).collect())
     };
     let done = std::time::Instant::now();
-    finish_indexed(at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, false)
+    finish_indexed(at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, None)
 }
 
 /// The live index's freeze ([`output_index_live`]): the indexes and kept
@@ -895,6 +901,7 @@ fn freeze_live(
     let any_pending = pending.iter().any(|list| !list.is_empty());
     let sum = move |(mut part, pending): (IndexPart, Vec<u16>), shard: usize| {
         let probe = TaskProbe::start();
+        let entries = pending.len() as u64;
         for id in pending {
             let Some(batch) = batches_ref.get(id as usize) else { continue };
             enter_part(
@@ -906,6 +913,8 @@ fn freeze_live(
                 batch.revert_at.get(shard).map_or(&[][..], Vec::as_slice),
             );
         }
+        let pending_us = probe.start.elapsed().as_micros() as u64;
+        let drops = part.drops.len() as u64;
         for (id, address) in &part.drops {
             let Some(account) = batches_ref.get(*id as usize).and_then(|b| b.accounts.get(address)) else { continue };
             match part.conflicts.get_mut(address) {
@@ -919,20 +928,31 @@ fn freeze_live(
                 }
             }
         }
-        (part, probe.finish())
+        (part, probe.finish(), (entries, pending_us, drops))
     };
-    let built: Vec<(IndexPart, TaskCost)> = {
+    let summed: Vec<(IndexPart, TaskCost, (u64, u64, u64))> = {
         use rayon::prelude::*;
         if any_pending || parts.iter().any(|part| !part.drops.is_empty()) {
             let work: Vec<(IndexPart, Vec<u16>)> = parts.into_iter().zip(pending).collect();
             crate::parallel_transfer::build_pool()
                 .install(|| work.into_par_iter().enumerate().map(|(shard, item)| sum(item, shard)).collect())
         } else {
-            parts.into_iter().map(|part| (part, TaskProbe::start().finish())).collect()
+            parts.into_iter().map(|part| (part, TaskProbe::start().finish(), (0, 0, 0))).collect()
         }
     };
     let done = std::time::Instant::now();
-    finish_indexed(at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, true)
+    let (mut pending_max, mut pending_us_max, mut drops_max) = (0u64, 0u64, 0u64);
+    let built: Vec<(IndexPart, TaskCost)> = summed
+        .into_iter()
+        .map(|(part, cost, (entries, pending_us, drops))| {
+            pending_max = pending_max.max(entries);
+            pending_us_max = pending_us_max.max(pending_us);
+            drops_max = drops_max.max(drops);
+            (part, cost)
+        })
+        .collect();
+    let pending = (pending_max, pending_us_max, drops_max);
+    finish_indexed(at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, Some(pending))
 }
 
 /// What both index freezes end with: the batches' maps kept as the output,
@@ -949,10 +969,16 @@ fn finish_indexed(
     contracts: B256HashMap<RevmBytecode>,
     append_ns: u64,
     built: Vec<(IndexPart, TaskCost)>,
-    live: bool,
+    // The live freeze's (`Some`): the most entries, the longest entry pass
+    // and the most drops of one task (`FoldSplit::pending_max`).
+    live: Option<(u64, u64, u64)>,
 ) -> FrozenShards {
     let index_build_ns = done.duration_since(transposed).as_nanos() as u64;
-    let split = fold_split(built.iter().map(|(_, cost)| cost), at, transposed, done);
+    let mut split = fold_split(built.iter().map(|(_, cost)| cost), at, transposed, done);
+    if let Some((pending_max, pending_us_max, drops_max)) = live {
+        (split.pending_max, split.pending_us_max, split.drops_max) = (pending_max, pending_us_max, drops_max);
+    }
+    let live = live.is_some();
     let mut state_size = 0usize;
     let mut beneficiary_delta = U256::ZERO;
     let mut kept_batches = Vec::with_capacity(batches.len());
@@ -1144,6 +1170,15 @@ pub struct FoldSplit {
     /// The most involuntary context switches one task took (its thread
     /// preempted by another runnable thread on its CPU).
     pub task_nivcsw_max: u64,
+    /// Live index with `N42_LIVE_INDEX_DEFER=1`: the most batches one task
+    /// entered at the freeze (the shards they left), the longest such entry
+    /// pass in one task (us), and the most conflicting occurrences one task
+    /// summed (`drops`). What the freeze's slowest task is made of.
+    pub pending_max: u64,
+    /// See `pending_max`.
+    pub pending_us_max: u64,
+    /// See `pending_max`.
+    pub drops_max: u64,
 }
 
 /// One fold task's own cost, read from its thread: wall, CPU time, minor

@@ -345,9 +345,39 @@ impl Default for SharedOffsetIndex {
     }
 }
 
+thread_local! {
+    /// This thread's reads that found their shard write-locked (or a writer
+    /// queued on it) and the nanoseconds they waited, cumulative.
+    static READ_WAITS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// The calling thread's [`SharedOffsetIndex`] reads that had to wait for a
+/// shard's lock -- a writer (`apply_sorted`, a QMDB read view's advance) held
+/// or was queued on it -- and the nanoseconds they waited, cumulative since
+/// the thread started. A read that takes its lock at once costs nothing more
+/// than before: only a `try_read` that fails is timed. Callers difference two
+/// readings to attribute waits to a span of work on one thread.
+pub fn thread_read_waits() -> (u64, u64) {
+    READ_WAITS.try_with(std::cell::Cell::get).unwrap_or((0, 0))
+}
+
 impl SharedOffsetIndex {
     fn read(&self, key: &Hash) -> std::sync::RwLockReadGuard<'_, Shard> {
-        self.shards[key[0] as usize].read().unwrap_or_else(std::sync::PoisonError::into_inner)
+        let lock = &self.shards[key[0] as usize];
+        match lock.try_read() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let at = std::time::Instant::now();
+                let guard = lock.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let waited = at.elapsed().as_nanos() as u64;
+                let _ = READ_WAITS.try_with(|waits| {
+                    let (count, ns) = waits.get();
+                    waits.set((count + 1, ns + waited));
+                });
+                guard
+            }
+        }
     }
 
     fn write(&self, shard: usize) -> std::sync::RwLockWriteGuard<'_, Shard> {
@@ -580,6 +610,34 @@ mod tests {
         for (key, value) in &oracle {
             assert_eq!(shared.get(key, key_at), Some(*value));
         }
+    }
+
+    #[test]
+    fn a_read_behind_a_held_shard_is_counted_as_a_wait_and_answers_the_same() {
+        let key = key_of(1, Some(9));
+        let store = [key];
+        let key_at = |value: u64| store[value as usize];
+        let shared = SharedOffsetIndex::default();
+        shared.insert(key, 0, key_at);
+        let (count_before, _) = thread_read_waits();
+        assert_eq!(shared.get(&key, key_at), Some(0));
+        assert_eq!(thread_read_waits().0, count_before, "an uncontended read is not a wait");
+        let ready = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let held = shared.write(9);
+            let reader = scope.spawn(|| {
+                ready.wait();
+                let found = shared.get(&key, key_at);
+                (found, thread_read_waits())
+            });
+            ready.wait();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(held);
+            let (found, (count, ns)) = reader.join().unwrap();
+            assert_eq!(found, Some(0));
+            assert_eq!(count, 1);
+            assert!(ns > 0, "waited {ns} ns");
+        });
     }
 
     #[test]

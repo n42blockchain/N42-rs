@@ -21,7 +21,7 @@ mod simd;
 
 use flat::FlatIndex;
 pub use simd::{hash_singleblock_batch, kernel_name as simd_kernel_name};
-pub use index::{SharedOffsetIndex, MAX_INDEX_VALUE};
+pub use index::{thread_read_waits, SharedOffsetIndex, MAX_INDEX_VALUE};
 
 /// 32-byte hash / key.
 pub type Hash = [u8; 32];

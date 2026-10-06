@@ -1,7 +1,7 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use ethers::types::U256;
+use ethers_core::types::U256;
 use jni::objects::{GlobalRef, JObject, JString};
 use jni::sys::{jobject, jstring};
 use jni::JNIEnv;

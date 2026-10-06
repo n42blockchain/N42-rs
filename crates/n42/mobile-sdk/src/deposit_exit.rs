@@ -3,9 +3,9 @@
 
 use alloy_primitives::{Address, B256};
 use blst::min_pk::SecretKey;
+use ethers_core as ethers;
 use ethers::abi::Token;
-use ethers::prelude::*;
-use ethers::types::{NameOrAddress, TransactionRequest, U256};
+use ethers::types::{Bytes, NameOrAddress, TransactionRequest, U256};
 use ethers::utils::keccak256;
 use hex::FromHex;
 use n42_primitives::DepositData;

@@ -40,13 +40,19 @@ serde_json.workspace = true
 tracing.workspace = true
 blst = { version = "0.3.3" }
 hex = "0.4"
-ethers = { version = "2.0", default-features = false, features = ["abigen"] }
+# Keep the existing public ABI/transaction types without the deprecated
+# ethers RPC stack (reqwest 0.11, hyper 0.14 and jsonwebtoken 8).
+ethers-core = { version = "2.0.14", default-features = false }
 
 [dev-dependencies]
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 clap = { version = "4.5.23", features = ["derive"] }
-ethers-signers = "2.0"
+alloy-provider.workspace = true
+alloy-network.workspace = true
+alloy-consensus.workspace = true
+alloy-signer-local.workspace = true
+alloy-rpc-types-eth = { workspace = true, features = ["serde"] }
 
 [lints]
 workspace = true

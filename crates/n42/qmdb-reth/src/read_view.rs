@@ -161,7 +161,7 @@ impl ViewLockWaits {
     }
 
     /// The waits between `earlier` and `self`.
-    pub fn since(self, earlier: Self) -> Self {
+    pub const fn since(self, earlier: Self) -> Self {
         Self {
             slot_waits: self.slot_waits.saturating_sub(earlier.slot_waits),
             slot_wait_ns: self.slot_wait_ns.saturating_sub(earlier.slot_wait_ns),

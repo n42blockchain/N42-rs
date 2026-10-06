@@ -1110,3 +1110,124 @@ Base P (10.88). Pair P / Pb against P + `N42_LIVE_INDEX_DEFER=1` twice (D / Db);
   is left; then the off-CPU profile of 14.3 on one D leg;
 - `sealed_at` median / p90, the cycle, the rate; correctness `fields_mismatches` 0, `invalid_blocks` 0,
   `fleet7-verify` clean.
+
+## 15. E=1: the shard merge, the freeze and the parent's root chain (2026-10-06, code and loop342 logs, no fleet leg)
+
+The question from 10.89: with `N42_LIVE_INDEX_DEFER=1` the execution fell 30 -> 23 ms (17 at 48 threads) and the
+seal did not move; `shard_merge_ms` read 52-54 ms "inside `par_ms`". Offline read of loop342 P, D and D48 (layer
+node 0, full blocks, the first 20 dropped; medians, p10 / p90 where given) against the code.
+
+### 15.1 `shard_merge_ms` is not on the seal's path; the freeze is
+
+`shard_merge_ms` is the wall of `FrozenShards::merged` plus `append_reverts` on the `n42-shard-merge` thread
+(`payload.rs`, the shard branch behind the seal). That thread is spawned **after the block's fields are published**
+(seal + 53 ms), runs on the background cores, and every input is in hand when it starts (the shards frozen, the
+residual taken): it waits for nothing. It is work: ~190,000 `BundleAccount`s cloned into one pre-reserved map, the
+kept reverts copied and sorted, then appended, on one thread (~280 ns an account). It ends at seal + ~106 ms and
+`StateReady` is filed at seal + ~108 (`state_ready_ms` 96 from the finish's start at seal + 12).
+
+Who reads the merged bundle on the leader at E=1, and when:
+
+| consumer | what it reads | when it needs it |
+| --- | --- | --- |
+| the child's build (`opener_on_sealed_parent`, `wait_for_state`) | the parent as `Sharded` (residual over the frozen shards), filed at seal + ~12 | its first open, seal + ~20; it never sees the bundle (`StateReady` comes 90 ms later) |
+| the kept layers (`leader_layers`, depth 3) | the layer the child filed: the frozen shards, not the bundle | every later build's open |
+| the own-block import (`built_executions::take` -> engine `InsertExecutedBlock`) | the `Complete` execution: merged bundle, receipts, hashed state | at the commit's import; the engine is 2-3 blocks behind and the deepest layer's anchor is N-4 |
+| persistence | the engine's executed block | after the import |
+| `N42_FIELDS_AT_SEAL=verify` | the merged bundle's operations | behind `Complete`; off on the fleet |
+
+**None of them is before the seal**, and none is on the child's seal: the merge already runs after the seal and after
+the root, the way the fields-at-seal change moved the root. Shortening it would make `Complete` (and the engine's
+import) earlier, nothing else; the follower's two-halves split (`N42_SHARDS_MERGE_OFF_PATH`, ~10 ms there) is not
+ported to the leader for that reason. 10.89 read the number as a piece of `par_ms`; it is not.
+
+What **is** on the seal's path is the freeze (`OutputShards::freeze`, `index_ms`), between the batches' end and the
+seal in the `N42_SEAL_AT_EXEC` path, although the seal reads only the body, the transactions root and the parent's
+fields:
+
+| leg | start | prep | gap | `par_run` (exec) | **`index_ms` (freeze)** | commit | seal (`sealed_ms`) | `sealed_at` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| P | 4 | 4 | 3 | 33 (31) | **4** | 2 | 6 | 61 |
+| D | 4 | 4 | 3 | 26 (23) | **13** (p10 10, p90 18) | 2 | 6 | 61 |
+| D48 | 5 | 3 | 3 | 19 (17) | **14** | 2 | 8 | 60 |
+
+**D moved 9 ms of the shards' index from the batches into the freeze, on the seal's path; the execution's 7 ms gain
+was spent there**, which is why the seal did not move (14.1 assumed the freeze was behind the seal; it was not). The
+freeze's wall is its slowest task's CPU (`task_max_us` = `task_cpu_max_us`, no faults, no preemption): 12.8 ms on D
+against 4.2 on P for the same ~7,700 conflicts; regressing the slowest task on the conflicts gives P 0.47 us a
+conflict + 0.4 ms, D 0.67 us + **8.0 ms**, D48 0.82 us + 7.7 ms: the deferred entries cost a fixed ~8 ms in the
+slowest task that their count (35-56 shard entries a block, ~220 addresses each) does not explain. The new fields
+`pending_max` / `pending_us_max` / `drops_max` on the "output shards folded" line say which.
+
+### 15.2 The parent's root chain into the child's fields (D, us from the parent's seal)
+
+| stamp | median | piece |
+| --- | --- | --- |
+| `seal_to_finish_us` | 11,791 | the graft scope behind the seal (receipts from the slots), the fee credit, the diagnosis, the executor's finish |
+| `seal_to_bundle_us` | 11,967 | merge transitions, bundle taken |
+| `seal_to_view_us` | 12,726 | shards filed (`shards_ready`), overlaps and the view |
+| `seal_to_rename_us` | 14,227 | the grandparent renamed under its seal (early path, 0 wait) |
+| `seal_to_root_start_us` | 14,334 | the root job starts |
+| `seal_to_root_end_us` | 52,170 | **the root job, 37.9 ms**: the operations' encode, join and sort over the view (~12 ms: the job less the compute; now `root_ops_*_us`), two sortedness passes (~0.5-1), the lock (0), the apply (`root_apply_total_us` 23.9: leaves 6.8, writes 6.9, index 3.0, rehash + root 2.0, retire with the undo lists 1.6, sort 0.1, gaps ~3.5), the delta 1.05, the note 0.1 |
+| `seal_to_fields_us` | 53,290 | receipts joined, the tree filed, the fields published |
+
+The child reads the parent's fields inside `seal_block` (after its transactions root) and the header, block and hook
+follow (~4-5 ms). So **the cycle cannot be shorter than `seal_to_fields` + ~5 = 58-59 ms** whatever the seal does:
+that is D48P55's 59.0 ms cycle at 55 ms pacing, and D48's `parent_fields_ms` median of 1 (the child already waits
+for the parent's root on half its builds once its own seal is 60). The seal (61) and the root chain (53 + 5) are now
+within 2-3 ms of each other; shortening only one moves the cycle by at most that.
+
+For a 50 ms cycle: the child's seal at <= 50 ms (15.3 brings it to ~48) **and** `seal_to_fields` <= ~45 ms, i.e. the
+root job <= ~29 ms if the 12 ms before it and the 1 ms after it stay, or the 12 ms before it shortened as well. The
+operations encoded beside the finish (15.3) take ~8-10 of the 37.9; the rest has to come from the apply (24 ms, of
+which leaves and writes are 13.7) or from the 12 ms finish before the root starts.
+
+### 15.3 What was changed
+
+| commit | change | switch | expected (estimate) | confirm by |
+| --- | --- | --- | --- | --- |
+| 71943f85e | the leader's merge timed (`seal_to_merge_start_us`, `seal_to_merge_end_us`, `seal_to_state_ready_us`, `seal_to_complete_us`, `merge_state_us`, `merge_reverts_us`, `merge_append_us`, `merge_tail_us`, `merge_threads`, `merge_accounts`, `merge_reverts`); the root job split (`root_ops_us`, `root_ops_encode_us`, `root_ops_concat_us`, `root_ops_sort_us`, `root_compute_us`); the live freeze's slowest task (`pending_max`, `pending_us_max`, `drops_max`) | always | - | merge start ~= `seal_to_fields_us`, end ~= start + 53 ms, 1 thread; `root_ops_us` + `root_compute_us` ~= the root job |
+| fd48c1abe | the freeze on its own thread from the batches' end, beside the commit and the seal, joined where the graft first reads the shards (beside the receipts job); a block that will not seal early joins it before the withdrawals' check; `freeze_late`, `seal_to_frozen_us`, `freeze_join_wait_us` | `N42_FREEZE_AFTER_SEAL=1` (needs `N42_SEAL_AT_EXEC=1`) | `sealed_at` 61 -> ~48-50 on D, ~46 on D48 (the 13-14 ms freeze off the path; the commit and seal share the pool with it); `seal_to_fields` +0-3 ms (the freeze ends ~5 ms after the seal, beside the receipts) | `index_ms` ~13 with `freeze_late=true`, `seal_to_frozen_us` <= ~6,000, `freeze_join_wait_us` small, `sealed_at`, `seal_to_view_us` |
+| 9dd1da23d, 3bcf476bd | the shards' QMDB leaf operations encoded and sorted on a thread of their own from the graft's end (`qmdb-reth` `operations_ahead`), the root job encoding only the residual's accounts and merging them in (`OpsAhead::finish`, `QmdbOps::merge_sorted`: one pass, the replaced accounts' keys dropped); `root_ops_ahead`, `seal_to_ops_ahead_us`, `root_ops_ahead_wait_us`, `root_ops_finish_us` | `N42_ROOT_OPS_AHEAD=1` | the root job 38 -> ~29-31 ms, `seal_to_fields` 53 -> ~45-47 | `root_ops_us` (with: the wait + the finish, ~1-4 ms), `seal_to_ops_ahead_us` < `seal_to_root_start_us`, `seal_to_fields_us`, `fields_mismatches` 0 |
+| 2ff77c20b | `QmdbOps` keeps a sorted flag (set by `sort` and a merge of sorted sets, cleared by any push): the forest's and the apply's sortedness checks stop scanning the block's keys | always (same operations, same order) | root -0.5 to -1 ms | `root_apply_gap_us`, the root job |
+| b20ae3740 | `root_undo_us`, `root_apply_gap_us` on the line | always | - | what the apply's ~3.5 ms between phases is |
+
+Estimates, not measurements. With both switches on D (or D48): the seal ~48 (46), the root chain ~45-47 + 5, so the
+cycle at a 60 ms tick stays the tick (no rate change expected there), at 55 ms ~55-56 (from 59), and **at 50 ms
+~51-53**: then the root chain binds again (F + 5), with the seal 2-4 ms under it.
+
+Equality (all switches change scheduling only; block contents, roots, bundles and what validators exchange are the
+same by construction, and the tests say so on built blocks of the shapes the shard tests use):
+`a_freeze_on_its_own_thread_equals_the_inline_freeze` (engine-types `tests/output_shards.rs`: every fold mode, live
+deferral none / forced / busy-concurrent, 1, 16 and 64 shards, the pool busy and a job beside the join: shards,
+merged bundle, view, QMDB operations with and without Prague, hashed post-state, and the staged fallback against the
+direct graft), `the_operations_encoded_ahead_equal_the_views` (the same shards and residual: ahead + finish equals
+`sorted_operations_from_accounts` of the view and of the merged bundle), `operations_ahead_finished_equal_the_whole_views`
+(qmdb-reth: storage on both sides of an overlap, a deletion, the system caller in the shards, the residual or
+neither, Prague on and off), `merge_sorted_equals_join_filter_sort` (twig-core). Gate: `cargo check --workspace`;
+clippy on engine-types, qmdb-reth and twig-core adds no warning; tests of `n42-engine-types` (229 + 13 + benches
+ignored), `n42-twig-core` (66, and `--features rayon`), `n42-qmdb-reth` (56), `n42-h2-el-rpc`, `n42 --lib` (134) pass.
+
+Not done, and why: the leader merge's two-halves split (off the seal and the root chain; it would only bring
+`Complete` forward); the freeze's ~8 ms fixed cost under the defer (not explained by the code's entry counts; the new
+fields name it first, and with `N42_FREEZE_AFTER_SEAL` it overlaps the seal anyway); the apply's leaves and writes
+(13.7 ms, section 13: the next pieces of the root chain once the operations are ahead); the 12 ms between the seal
+and the root's start (the receipts job and the executor's finish), which the 50 ms cycle needs next.
+
+### 15.4 What the next leg must read
+
+Base D (or D48). Pairs: D / Db against D + `N42_FREEZE_AFTER_SEAL=1 N42_ROOT_OPS_AHEAD=1` twice, at 60 ms and then at
+55 ms; if the 55 ms cycle median reads <= 56, one 50 ms leg. Per window:
+- the seal: `sealed_at` median / p90 (61 -> ~48), `index_ms` with `freeze_late`, `seal_to_frozen_us`,
+  `freeze_join_wait_us`, `par_commit_ms`, `sealed_ms`; `parent_fields_ms` (it becomes the child's wait if the root
+  chain does not shrink with the seal);
+- the root chain: `seal_to_view_us` (should not grow by more than ~3 ms), `seal_to_ops_ahead_us` against
+  `seal_to_root_start_us`, `root_ops_us`, `root_ops_ahead_wait_us`, `root_ops_finish_us`, `root_compute_us`,
+  `root_apply_total_us`, `root_apply_gap_us`, `seal_to_fields_us` (53 -> ~45-47);
+- on the base legs too (always on): `root_ops_encode_us` / `root_ops_concat_us` / `root_ops_sort_us` (what the
+  ~12 ms of operations is), the merge's `seal_to_merge_start_us` / `seal_to_merge_end_us` / `merge_*` (confirming it
+  waits for nothing and is one thread's work), and on the folded line `pending_max` / `pending_us_max` / `drops_max`
+  (what the freeze's slowest task is);
+- the cycle median / p90, the rate; correctness `fields_mismatches` 0 (with `N42_FIELDS_AT_SEAL=verify` on one leg:
+  it compares the published fields with the operations of the merged bundle, which is exactly what
+  `N42_ROOT_OPS_AHEAD` changes), `invalid_blocks` 0, `fleet7-verify` clean.

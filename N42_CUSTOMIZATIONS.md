@@ -298,6 +298,28 @@
   紧凑块体逐字节不变（测试覆盖）。执行层的 "built ahead" 行与验证者的 "proposal sent" 行新增
   `answer_layout_only`。
 
+## E=1 执行与 QMDB 根的界：两个开关与新的观测字段（不改任何 fork 的 reth crate）:
+`docs/SHARED_EXECUTION_SCOPE.md` 第 13 节（基准 `crates/n42/engine-types/tests/e1_bound_bench.rs`）。两个开关默认关；
+关闭时行为与以前相同（测试覆盖）。
+- `N42_QMDB_PARALLEL_WRITES=1`（默认关；代码在 `crates/n42/twig-core/src/qmdb_compat.rs`
+  `QmdbCompatTree::parallel_writes`）：块 apply 的三项结构写入——undo 记录的追加 key、追加槽位的 twig 叶子与
+  active 位、entry store 的追加——互不相交，在 worker 池上并行执行，各自仍按操作顺序写；先按顺序建好追加
+  涉及的 twig，范围内有被驱逐的 twig 时退回串行写入。树、undo 记录、游标、快照与 entry 文件与串行写入相同
+  （`parallel_writes_equal_the_serial_ones`）。基准（19 万操作、201 万条目、entry 文件模式、16 线程）：writes
+  7.1-7.4 → 5.0-5.2 ms，`compute_operations` 20.4 → 18.4 ms。
+- `N42_VIEW_JOURNAL_FILTER=1`（默认关；代码在 `crates/n42/qmdb-reth/src/read_view.rs` `JournalData`）：QMDB 读视图
+  为每个块的 journal 建一个 split-block 过滤器（复用 `overlay_filter::SplitBloom`）；读者落后于视图头（持久化
+  批次期间）或遇到正在建索引的块时，跳过未改动其 key 的 journal 的二分查找。过滤器没有假阴性，答案不变
+  （`journal_filters_change_no_answer`）。基准：每多走一个 journal，视图读多 200-300 ns；4 个 journal 时执行
+  11.4 → 16.1 ms，开过滤器后 12.4 ms。过滤器在 `advance`（持久化路径）上串行构建，每块约 1-2 ms。
+- 恒开（纯观测或结果相同）：块 delta 的退役槽位排序改在 worker 池上（`qmdb-state` `delta_of_applied`，
+  2.4 → 1.0-1.6 ms，顺序相同）。seal-first 阶段行新增 `batch_wall_sum_us`、`batch_cpu_sum_us`、`batch_minflt`、
+  `batch_vcsw`、`batch_ivcsw`（每个 batch 线程的 `getrusage(RUSAGE_THREAD)` 差值求和：离开 CPU 的时间是缺页、
+  阻塞还是被抢占）；`root_sort_us`、`root_leaves_us`、`root_retire_us`、`root_writes_us`、`root_index_us`、
+  `root_rehash_us`、`root_note_us`、`root_delta_us`、`root_apply_total_us`（QMDB 根按阶段）；
+  `view_journal_reads`、`view_journal_searches`、`view_journal_skips`（视图读走过的 journal，进程范围，每线程
+  每 4096 次读汇总一次）。
+
 ## HotStuff-2 结算标签（不改任何 fork 的 reth crate）:
 - `N42_SETTLEMENT_TAGS=split|legacy`（默认 `split`；代码在 `crates/n42/h2-execution/src/settlement.rs`，
   由 `ExecutionDriver` 的每个 forkchoice 使用）：`latest` = 共识已提交的块；`safe` = 执行已认证的块

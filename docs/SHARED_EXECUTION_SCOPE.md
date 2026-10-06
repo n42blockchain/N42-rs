@@ -896,3 +896,128 @@ B against B + `N42_TX_QUEUE_DRAIN_CHUNK=8192 N42_PLAN_AHEAD=1 N42_PULL_BY_FRAMES
 the same at 55 ms pacing; one leg with `N42_TX_QUEUE_DRAIN_CHUNK=8192` alone to read `lock_hold_max_us`. Read
 `plan_ahead` / `plan_discard`, `start_walk_us`, `pull_bulk_us`, `sealed_at`, `answer_bytes`, `drain_chunk_max_txs`,
 `lock_hold_max_us`, the in-memory blocks and the persistence lag per window.
+
+## 13. E=1: what bounds the execution and the QMDB root (2026-10-05, microbenchmark, no fleet leg)
+
+The question from 10.87: at 200,000 transfers a block the seal's execution (`par_exec` 29-30 ms on 32 threads) and the
+parent's QMDB root (`roots_ms` 38-40, `root_apply_ms` 21) did not get faster with more threads before, so what bounds
+them. Measured on a quiet box (load < 3, no fleet, no claim) with `crates/n42/engine-types/tests/e1_bound_bench.rs`,
+fleet `MALLOC_CONF`, release build; perf counters from `perf stat --control` enabled around the measured rounds only.
+
+### 13.1 The bench
+
+`e1_exec_bound`: one block of the replay set's shape -- 200,000 pooled 0x50 transfers, 400 sender runs of 500,
+recipients drawn from 2,000,000 (190,700 distinct) -- through `execute_for_build` with the leader's partition and
+two-wave dispatch (58 batches of 3,500 on 32 threads; `E1_WAVE=one` for `N42_BUILD_ONE_WAVE`), the builder's own
+`convert` (`tx_env` of the pooled transaction), and each batch's bundle handed to the output shards in live index
+mode (16 shards). The parent's state is the leader's read stack: three kept layers of frozen shards from three
+executed blocks (`N42_LEADER_LAYERS=3`; 26% of the reads end there), ten in-memory engine blocks of ~190,000
+accounts behind their `overlay_filter` filters (63% of the rest end there), then a QMDB read view over an entry file of
+2,012,501 accounts (`E1_JOURNALS` journals ahead of the readers). Not modelled: the provider's `dyn` chain and
+`StateProviderDatabase`, the latest provider's version lookup, and the process around it (persistence, ingest, the
+RPC, 40 G of RSS). `e1_root_bound`: `sorted_operations_from_accounts` and `QmdbNodeState::compute_operations` in
+entry-file mode over the same 2,012,501 accounts after 30 blocks of churn, 190,700-account blocks. `e1_overlap`:
+the execution with the parent's root running beside it on the global pool, and with 10 more threads verifying
+Ed25519 signatures (the ingest).
+
+### 13.2 The execution: per-thread CPU work, latency-bound; it scales with threads
+
+| build threads | exec ms (two waves) | batch CPU sum ms | on CPU | cycles / transfer | IPC | cache misses / transfer | DRAM fills / transfer | dTLB misses / transfer | faults a block | vcsw / ivcsw a block |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 243.4 | 240 | 100% | 5,030 | 0.97 | 35.6 | 14.4 | 0.62 | 85 | 0 / 2 |
+| 8 | 34.0 | 245 | 99% | 5,470 | 0.93 | 40.0 | 11.1 | 0.67 | 103 | 29 / 0 |
+| 16 | 18.7 | 245 | 95% | 5,630 | 0.92 | 40.8 | 10.4 | 0.61 | 97 | 105 / 0 |
+| 32 | 11.5 | 266 | 95% | 6,370 | 0.83 | 43.7 | 10.6 | 0.74 | 95 | 345 / 0 |
+| 48 | 8.9 | 269 | 92% | 6,790 | 0.80 | 46.3 | 10.8 | 0.97 | 73 | 652 / 0 |
+| 64 | 8.8 | 291 | 88% | 7,840 | 0.72 | 53.7 | 11.5 | 1.83 | 82 | 760 / 0 |
+
+(One wave reads the same at every count: 11.7 ms at 32. The counters are the process's over the measured rounds,
+divided by the transfers.) The execution is CPU work on each thread and scales: 21x on 32 threads, 27x on 48; the
+CPU a transfer rises 11% from 1 to 32 threads and IPC falls from 0.97 to 0.83. It is not memory bandwidth (10.6 DRAM
+fills a transfer is ~11 GB/s at 32 threads, on a 12-channel host), not a lock (no involuntary switches; the voluntary
+ones are pool threads parking after the last batch, the batches' wall is 95% CPU), not allocation (95 minor faults a
+block), and not serial (one thread runs it in 243 ms, 32 in 11.5). At 64 it stops scaling because two waves of
+4 ms batches are the floor. Where the CPU goes at 32 threads (perf record, symbols): the batch state's map
+(`batch_state::loaded` 19.6%, `BatchState::basic` 6.8%, the map's own probes 5.5%) -- the first write of each
+account's 264-byte slot into a 2.2 MB map, cold memory recycled from blocks freed three blocks earlier; the batch
+loop with the transfer and the conversion 12.9%; kernel 7.1%; the output shards' live index 4.2%; the read stack
+itself (shards `get`, the filters and bundles, the view's index and blake3 key) ~9%. A read alone costs 345-412 ns
+on one thread and 1.2-1.8x that with 8-64 threads reading (shared-cache effects, not a lock).
+
+Beside the parent's root and the ingest: alone 12.1 ms, beside the root 12.2, beside the root and 10 Ed25519
+threads 12.5 (the root 24.8 alone, 27.3-27.7 beside the execution): co-running work on this host costs the
+execution 1-3%.
+
+**The fleet's execution is 2.5x the bench's, and the bench says where not to look for the difference.** loop340
+(P3b, PEW, BEST, window 2 medians): `par_exec` 30 ms on 32 threads, the slowest batch 20-21 ms wall and 11-12 ms of
+CPU for 3,500 transfers (3.3 us a transfer against 1.3-1.5 here), so the fleet both does ~2.3x the CPU a transfer and
+spends ~45% of the slowest batch off the CPU. Neither the root beside it nor the ingest's load reproduces either
+(above). Two things the bench does reproduce when switched on:
+
+- **Journal walks in the QMDB view.** A view read whose reader stands behind the view's head (a persistence batch's
+  readers, `hold_journals_from`) or meets a block being indexed (`pending`) binary-searches every journal in
+  between: ~17 dependent probes of a ~9 MB vector each. Per journal walked, 200-300 ns more a view read; with 2 and
+  4 journals the execution goes 11.4 -> 13.6 -> 16.1 ms and its CPU 263 -> 329 -> 400 ms. Whether the fleet's reads
+  walk journals, and how many, was not logged; it is now (13.4).
+- **The shared `Bytecode::default()` `Arc`.** revm 43's `AccountInfo::default()` carries `Some(Bytecode::default())`,
+  a clone of one process-wide `Arc`: every clone from any thread is an atomic on the same line. Filling the batch
+  maps with such infos takes 1,583 ns an entry on 32 threads against 101 without (119 against 89 on one thread). The
+  provider's accounts carry no code (`From<Account>` sets `None`), so steady-state reads never touch it; a new
+  recipient does (`commit_transfer`'s `unwrap_or_default()`), so blocks that create accounts pay it -- on the replay
+  set, the first ~30 blocks of window 1. Not changed: an account created with `code: None` puts no empty-code entry
+  into the bundle's `contracts`, which changes what is persisted.
+
+What is left for the fleet's 2.3x CPU and 45% off-CPU is outside the bench: the provider's per-read path (the `dyn`
+chain, `StateProviderDatabase`, the latest provider's version lookup), the pooled transactions' cold memory (the
+fetch read 407-457 ns a transfer on the fleet against 110 on a bench, 10.26), and whatever takes the batch threads
+off the CPU. The batch counters added here (13.4) name the last on the next leg.
+
+### 13.3 The root: serial sections; more threads stop helping past 16
+
+| global pool threads | ops ms (cores) | `compute_operations` ms (cores) | CPU ms | IPC | DRAM fills a block | sort | leaves | retire | writes | index | rehash + root | delta | the apply's call |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 8 | 6.6 (6.0) | 24.9 (4.0) | 100 | 1.24 | 3.0M | 0.1 | 7.4 | 1.6 | 7.5 | 2.7 | 1.3 | 1.3 | 22.1 |
+| 16 | 4.9 (9.7) | 20.4 (5.7) | 117 | 1.13 | 3.4M | 0.1 | 4.6 | 1.6 | 7.4 | 1.6 | 1.0 | 1.3 | 17.6 |
+| 32 | 4.0 (16) | 18.2 (8.6) | 156 | 0.96 | 3.3M | 0.2 | 3.0 | 1.8 | 7.3 | 1.1 | 1.0 | 1.0 | 15.7 |
+| 64 | 4.2 (30) | 17.7 (15) | 270 | 0.64 | 3.6M | 0.1 | 2.5 | 1.8 | 7.4 | 0.9 | 0.8 | 1.4 | 14.9 |
+
+(ms; the phase columns from the new `RootSplit` fields; delta after the change below, 2.4 ms before it.) From 16 to
+64 threads the compute falls 2.7 ms while its CPU more than doubles (rayon's idle spinning: IPC 1.13 -> 0.64, DRAM
+traffic flat). The pieces that scale (leaves and lookups, index inserts, rehash) are 7.2 ms at 16 threads; the
+rest is serial on the root's thread and does not move: the structural writes 7.3-7.5 (entry appends, twig leaves,
+undo keys, one after another), the retirement 1.6-1.8, the delta's sort 2.4, ~2 ms inside the apply between its
+phases (`root_apply_total_us` minus the phases), ~2.5 ms around it (the lock, the counters, the records), and the
+operations' concat and sort ~2 of their 4-5 ms. **The root is bound by its serial sections (~15 of 20 ms at 16
+threads); the fleet's 39 ms is the same shape slower (apply 21 against 15 here).**
+
+### 13.4 What was changed
+
+| commit | change | switch | measured on the bench | expected on the fleet | confirm by |
+| --- | --- | --- | --- | --- | --- |
+| 0188370e9 | batch counters on the seal-first line: `batch_wall_sum_us`, `batch_cpu_sum_us`, `batch_minflt`, `batch_vcsw`, `batch_ivcsw` (`ThreadMark`, `getrusage(RUSAGE_THREAD)` per batch); root phases `root_{sort,leaves,retire,writes,index,rehash,note,delta}_us` | always (observability) | - | names the fleet's off-CPU half: faults (`minflt` in the thousands), blocking (`vcsw` >> 58), preemption (`ivcsw` > 0) | the fields on every line |
+| 03efb811c | `e1_bound_bench` | test only | - | - | - |
+| a640452d8 | the delta's retired-slot sort on the pool; `root_apply_total_us` | always (same order, same delta) | delta 2.4 -> 1.0-1.6 ms | `roots_ms` -1 ms | `root_delta_us` ~1,000 |
+| 74e685e00 | the apply's three structural writes side by side on the pool | `N42_QMDB_PARALLEL_WRITES=1` | writes 7.3 -> 5.1 ms, compute 20.4 -> 18.4 ms | `roots_ms` -2 ms, `seal_to_fields` -2 ms; only the tail and pacing under 60 ms feel it | `root_writes_us` ~5,000, roots identical (`fields_mismatches` 0, `fleet7-verify`) |
+| 8e7b6705d | an address filter on each read-view journal; `view_journal_reads`, `view_journal_searches`, `view_journal_skips` on the line | `N42_VIEW_JOURNAL_FILTER=1` (the counters always) | 4 journals: exec 16.1 -> 12.4 ms; 2: 13.6 -> 11.9 | 0 if the fleet's reads walk no journals; up to the 2.3x CPU gap's share that is journals (~0.25 us a journal a view read; at 1-3 journals on a quarter of the reads, 2-8 ms of `par_exec`) | `view_journal_searches` / `view_journal_reads` before (the depth) and after (~0.1 + hits), `par_exec_ms` and `batch_cpu_sum_us` |
+
+Equality: `parallel_writes_equal_the_serial_ones` (twig-core, with and without `rayon`: root, undo record, cursor,
+snapshot and entry file, eight blocks in memory and in the file), `journal_filters_change_no_answer` (qmdb-reth: every
+key at every depth through views with and without filters), the existing forest and node-state suites for the delta.
+Block contents, receipts, roots and everything validators exchange are untouched by construction: the switches change
+only how the root's writes are scheduled and how a view read finds a journal entry.
+
+Not done, and why: a smaller batch map (the 264-byte `BundleAccount` slot is what the output shards and the graft
+consume; a compact map means rebuilding the bundle, which was 490 ns a transfer before `BatchState` kept the map,
+loop283) and a tighter pre-size (the lines written are per entry, not per bucket); one wave (equal on the bench);
+`code: None` for new recipients (changes the bundle's `contracts`); a cheaper `push_batch` (the longest arm of the
+parallel writes at ~5 ms: a per-record populate check and an atomic, small each); NUMA placement (one node; the
+L3 domains are 16 CCDs of 8 cores, and the bench's far-cache fill counter read 0).
+
+### 13.5 Legs to run
+
+Base PEW (10.87). Pairs: PEW / PEWb against PEW + `N42_VIEW_JOURNAL_FILTER=1 N42_QMDB_PARALLEL_WRITES=1` twice; one
+leg with `N42_PARALLEL_BUILD_THREADS=48` added (27x scaling at 48 on the bench against 21x at 32; 64 was slower on an
+earlier fleet). Read, per window: `batch_cpu_sum_us` / `batch_wall_sum_us` and `batch_minflt`, `batch_vcsw`,
+`batch_ivcsw` (what the off-CPU half is), `view_journal_reads` / `view_journal_searches` / `view_journal_skips` (whether
+the reads walk journals), `par_exec_ms`, `root_writes_us`, `root_delta_us`, `roots_ms`, `seal_to_fields_us`,
+`sealed_at` p90, and the cycle. Correctness: `fields_mismatches` 0, `invalid_blocks` 0, `fleet7-verify` clean.

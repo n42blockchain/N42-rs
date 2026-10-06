@@ -531,6 +531,8 @@ pub struct RootSplit {
     /// between them (the undo record's start, the sortedness check, the
     /// scratch's recycling).
     pub apply_total_us: u64,
+    /// Of `retire_us`: the undo record's lists, microseconds.
+    pub undo_us: u64,
 }
 
 /// The counters a [`RootSplit`] is the difference of.
@@ -953,6 +955,7 @@ impl QmdbNodeState {
                 (phases.sort_us, phases.leaves_us, phases.retire_us, phases.writes_us);
             (split.index_us, split.rehash_us, split.root_us) = (phases.index_us, phases.rehash_us, phases.root_us);
             (split.note_us, split.delta_us, split.apply_total_us) = forest.last_compute_tail();
+            split.undo_us = phases.undo_us;
         }
         drop(guard);
         before.finish(&mut split);

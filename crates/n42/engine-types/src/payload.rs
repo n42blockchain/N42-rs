@@ -3535,6 +3535,20 @@ where
                     root_note_us = root_split.note_us,
                     root_delta_us = root_split.delta_us,
                     root_apply_total_us = root_split.apply_total_us,
+                    // Of the apply (SHARED_EXECUTION_SCOPE 15): the undo
+                    // record's lists inside `root_retire_us`, and what lies
+                    // between the phases (`root_apply_total_us` less them: the
+                    // sortedness check, the undo record's start, the scratch).
+                    root_undo_us = root_split.undo_us,
+                    root_apply_gap_us = root_split.apply_total_us.saturating_sub(
+                        root_split.sort_us
+                            + root_split.leaves_us
+                            + root_split.retire_us
+                            + root_split.writes_us
+                            + root_split.index_us
+                            + root_split.rehash_us
+                            + root_split.root_us
+                    ),
                     root_publish_ms = root_publish_us.get() / 1000,
                     root_faults = root_split.faults,
                     root_majflt = root_split.majflt,

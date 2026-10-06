@@ -3039,6 +3039,15 @@ where
                     batch_txs_min = par_batch_spans.txs_min,
                     batch_start_skew_ms = par_batch_spans.start_skew_ms,
                     batch_wait_ms = par_batch_spans.wait_ms,
+                    // Every batch's wall and thread CPU summed (us), and the
+                    // batches' own minor faults and voluntary / involuntary
+                    // context switches (`ThreadMark`): what the off-CPU part
+                    // of a batch is -- first touches, blocking, preemption.
+                    batch_wall_sum_us = par_batch_spans.wall_sum_us,
+                    batch_cpu_sum_us = par_batch_spans.cpu_sum_us,
+                    batch_minflt = par_batch_spans.minflt,
+                    batch_vcsw = par_batch_spans.vcsw,
+                    batch_ivcsw = par_batch_spans.ivcsw,
                     // The dispatch, us from the batches' hand-over to the pool:
                     // the first and the last batch's start, the moment every
                     // thread that ran one had started its first (two waves:
@@ -3197,6 +3206,16 @@ where
                     root_move_ms = root_split.move_ms,
                     root_apply_ms = root_split.apply_ms,
                     root_hash_ms = root_split.hash_ms,
+                    // The apply by phase and the tail after it, us
+                    // (`RootSplit`): which of the root's pieces is serial.
+                    root_sort_us = root_split.sort_us,
+                    root_leaves_us = root_split.leaves_us,
+                    root_retire_us = root_split.retire_us,
+                    root_writes_us = root_split.writes_us,
+                    root_index_us = root_split.index_us,
+                    root_rehash_us = root_split.rehash_us + root_split.root_us,
+                    root_note_us = root_split.note_us,
+                    root_delta_us = root_split.delta_us,
                     root_publish_ms = root_publish_us.get() / 1000,
                     root_faults = root_split.faults,
                     root_majflt = root_split.majflt,

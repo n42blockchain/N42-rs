@@ -149,6 +149,42 @@ fn thread_cpu_ns() -> u64 {
     0
 }
 
+/// The calling thread's CPU time and its resource counters at one instant
+/// (`getrusage(RUSAGE_THREAD)`): a batch's span is the difference of two.
+/// The minor faults say whether a batch's off-CPU time is first touches, the
+/// voluntary switches whether it blocked (a futex, a major fault), the
+/// involuntary ones whether it was preempted.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ThreadMark {
+    cpu_ns: u64,
+    minflt: u64,
+    nvcsw: u64,
+    nivcsw: u64,
+}
+
+impl ThreadMark {
+    /// The calling thread's counters now (zeros where they cannot be read).
+    pub fn now() -> Self {
+        let cpu_ns = thread_cpu_ns();
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: the call only writes into the zeroed struct passed to it.
+            unsafe {
+                let mut usage: libc::rusage = std::mem::zeroed();
+                if libc::getrusage(libc::RUSAGE_THREAD, &mut usage) == 0 {
+                    return Self {
+                        cpu_ns,
+                        minflt: usage.ru_minflt.max(0) as u64,
+                        nvcsw: usage.ru_nvcsw.max(0) as u64,
+                        nivcsw: usage.ru_nivcsw.max(0) as u64,
+                    };
+                }
+            }
+        }
+        Self { cpu_ns, ..Self::default() }
+    }
+}
+
 /// One batch of the build on the pool: its start and end against the
 /// batches' start (microseconds), the CPU time its thread spent in it, and
 /// its transactions.
@@ -164,16 +200,26 @@ pub struct BatchSpan {
     pub txs: usize,
     /// The pool thread that ran it (`usize::MAX` off the pool).
     pub thread: usize,
+    /// Minor page faults the thread took inside the batch.
+    pub minflt: u64,
+    /// Voluntary context switches inside the batch (the thread blocked).
+    pub vcsw: u64,
+    /// Involuntary context switches inside the batch (it was preempted).
+    pub ivcsw: u64,
 }
 
 impl BatchSpan {
-    fn close(start_us: u64, cpu_start: u64, txs: usize, batches_at: std::time::Instant) -> Self {
+    fn close(start_us: u64, mark: ThreadMark, txs: usize, batches_at: std::time::Instant) -> Self {
+        let now = ThreadMark::now();
         Self {
             start_us,
             end_us: batches_at.elapsed().as_micros() as u64,
-            cpu_us: thread_cpu_ns().saturating_sub(cpu_start) / 1000,
+            cpu_us: now.cpu_ns.saturating_sub(mark.cpu_ns) / 1000,
             txs,
             thread: rayon::current_thread_index().unwrap_or(usize::MAX),
+            minflt: now.minflt.saturating_sub(mark.minflt),
+            vcsw: now.nvcsw.saturating_sub(mark.nvcsw),
+            ivcsw: now.nivcsw.saturating_sub(mark.nivcsw),
         }
     }
 }
@@ -215,6 +261,17 @@ pub struct BatchSpans {
     /// batch a thread (`N42_BUILD_ONE_WAVE=1`) this equals `last_start_us`;
     /// with two waves, `last_start_us` less this is the first wave's length.
     pub dispatch_us: u64,
+    /// Every batch's wall time summed, microseconds.
+    pub wall_sum_us: u64,
+    /// Every batch's thread CPU time summed, microseconds: `wall_sum_us` less
+    /// this is the batches' time off the CPU.
+    pub cpu_sum_us: u64,
+    /// Minor page faults inside the batches, summed.
+    pub minflt: u64,
+    /// Voluntary context switches inside the batches, summed.
+    pub vcsw: u64,
+    /// Involuntary context switches inside the batches, summed.
+    pub ivcsw: u64,
 }
 
 impl BatchSpans {
@@ -239,8 +296,18 @@ impl BatchSpans {
         }
         let dispatch_us = first_by_thread.iter().map(|(_, first)| *first).max().unwrap_or(0);
         let (batches, threads) = (spans.len(), first_by_thread.len());
+        let wall_sum_us = spans.iter().map(wall).sum();
+        let cpu_sum_us = spans.iter().map(|s| s.cpu_us).sum();
+        let minflt = spans.iter().map(|s| s.minflt).sum();
+        let vcsw = spans.iter().map(|s| s.vcsw).sum();
+        let ivcsw = spans.iter().map(|s| s.ivcsw).sum();
         spans.sort_unstable_by_key(wall);
         Self {
+            wall_sum_us,
+            cpu_sum_us,
+            minflt,
+            vcsw,
+            ivcsw,
             batches,
             threads,
             first_start_us: first_start,
@@ -3415,7 +3482,7 @@ where
     phases.batches_start_us = batches_at.duration_since(call_at).as_micros() as u64;
     let run_batch = |members: &Vec<&Vec<usize>>| -> Result<BatchResult, NotParallel> {
         let start_us = batches_at.elapsed().as_micros() as u64;
-        let cpu_start = thread_cpu_ns();
+        let cpu_start = ThreadMark::now();
         let txs = members.iter().map(|group| group.len()).sum::<usize>();
         let mut sampler = LoopSampler::new();
         let setup_at = sampler.on.then(std::time::Instant::now);
@@ -3971,7 +4038,7 @@ where
             .par_iter()
             .map(|members| {
                 let start_us = batches_at.elapsed().as_micros() as u64;
-                let cpu_start = thread_cpu_ns();
+                let cpu_start = ThreadMark::now();
                 let batch_txs = members.iter().map(|group| group.len()).sum::<usize>();
                 let db = open().ok_or(NotParallel::NoState)?;
                 let (bundle, gas) = if follower_batch_state() {

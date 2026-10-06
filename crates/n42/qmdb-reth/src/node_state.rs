@@ -505,6 +505,28 @@ pub struct RootSplit {
     pub seals: u64,
     /// See `seals`.
     pub seal_ms: u64,
+    /// The apply by phase, microseconds (`n42_twig_core::qmdb_compat::ApplyPhases`):
+    /// the duplicate check and sort, the leaf hashes and slot lookups (pool),
+    /// the undo and the retirement (pool), the serial structural writes, the
+    /// index inserts (per shard on the pool), the twigs' rehash and the root.
+    pub sort_us: u64,
+    /// See `sort_us`.
+    pub leaves_us: u64,
+    /// See `sort_us` (the undo is inside it).
+    pub retire_us: u64,
+    /// See `sort_us`.
+    pub writes_us: u64,
+    /// See `sort_us`.
+    pub index_us: u64,
+    /// See `sort_us`.
+    pub rehash_us: u64,
+    /// See `sort_us`.
+    pub root_us: u64,
+    /// After the apply, under the lock: the move's bookkeeping and the
+    /// block's delta, microseconds.
+    pub note_us: u64,
+    /// See `note_us`.
+    pub delta_us: u64,
 }
 
 /// The counters a [`RootSplit`] is the difference of.
@@ -923,6 +945,10 @@ impl QmdbNodeState {
             split.faults_undo = phases.undo_faults;
             split.faults_tmp = phases.tmp_faults;
             split.publish_ms = publish_us / 1000;
+            (split.sort_us, split.leaves_us, split.retire_us, split.writes_us) =
+                (phases.sort_us, phases.leaves_us, phases.retire_us, phases.writes_us);
+            (split.index_us, split.rehash_us, split.root_us) = (phases.index_us, phases.rehash_us, phases.root_us);
+            (split.note_us, split.delta_us) = forest.last_compute_tail();
         }
         drop(guard);
         before.finish(&mut split);

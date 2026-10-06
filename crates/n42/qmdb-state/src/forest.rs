@@ -376,6 +376,10 @@ pub struct QmdbForest {
     /// Where the last [`Self::compute_operations`] spent its time: the move
     /// to the parent (microseconds) and the apply's phases.
     last_compute: (u64, n42_twig_core::qmdb_compat::ApplyPhases),
+    /// What the last [`Self::compute_operations`] spent after the apply, in
+    /// microseconds: the move's bookkeeping ([`Self::note_move`]) and the
+    /// block's delta ([`Self::delta_of_applied`]).
+    last_tail: (u64, u64),
 }
 
 impl QmdbForest {
@@ -502,6 +506,7 @@ impl QmdbForest {
             dirty_slots_deduped: 0,
             min_cursor: next_slot,
             last_compute: Default::default(),
+            last_tail: (0, 0),
         }
     }
 
@@ -510,6 +515,13 @@ impl QmdbForest {
     /// phases (the hashing is `rehash_us` and `root_us`).
     pub const fn last_compute(&self) -> (u64, n42_twig_core::qmdb_compat::ApplyPhases) {
         self.last_compute
+    }
+
+    /// What the last [`Self::compute_operations`] spent after the apply, in
+    /// microseconds: the move's bookkeeping and the block's delta, both
+    /// under the caller's lock and before the root is handed back.
+    pub const fn last_compute_tail(&self) -> (u64, u64) {
+        self.last_tail
     }
 
     /// Records what a move touched: the slots the undo names, and how far back
@@ -727,8 +739,12 @@ impl QmdbForest {
         // Applied from the arena the record keeps: no clone of the block.
         let (root, undo, phases) = self.tree.apply_ops_recorded_phased(&ops)?;
         self.last_compute = (move_us, phases);
+        let noted_at = std::time::Instant::now();
         self.note_move(&undo);
+        let note_us = noted_at.elapsed().as_micros() as u64;
+        let delta_at = std::time::Instant::now();
         let delta = self.delta_of_applied(&undo);
+        self.last_tail = (note_us, delta_at.elapsed().as_micros() as u64);
         self.pending = Some((parent, undo));
         Ok(PreparedBlock {
             root: B256::from(root),

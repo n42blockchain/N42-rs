@@ -552,6 +552,31 @@ pub fn seal_at_exec() -> bool {
     *ON.get_or_init(|| std::env::var("N42_SEAL_AT_EXEC").is_ok_and(|v| v == "1"))
 }
 
+/// `N42_FREEZE_AFTER_SEAL=1` (`docs/SHARED_EXECUTION_SCOPE.md` 15): with
+/// `N42_SEAL_AT_EXEC=1` and the output shards, the shards' freeze (the index's
+/// conflict sums, and under `N42_LIVE_INDEX_DEFER=1` the shards the batches
+/// left to it: `index_ms` 4-5 ms, 13 with the defer) runs on a thread of its
+/// own from the batches' end, beside the commit and the seal, and is joined
+/// behind the seal where the graft first reads the shards -- beside the
+/// receipts job. The seal reads the body, the transactions root and the
+/// parent's fields, none of which the freeze touches; the frozen shards are
+/// the same call on the same input either way. Off by default.
+pub fn freeze_after_seal() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FREEZE_AFTER_SEAL").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The output shards frozen on a thread of their own ([`freeze_after_seal`]).
+type LateFreeze = crate::output_shards::FreezeHandle;
+
+/// Starts the freeze of `shards` on a thread of its own
+/// ([`crate::output_shards::OutputShards::freeze_on_thread`]).
+fn spawn_freeze(shards: crate::output_shards::OutputShards) -> Result<LateFreeze, Option<Box<crate::output_shards::OutputShards>>> {
+    shards.freeze_on_thread().inspect_err(|_| {
+        tracing::debug!(target: "payload_builder", "no thread for the freeze; frozen before the seal");
+    })
+}
+
 /// `N42_STATE_AFTER_PULL=1` (plan v6 attempt G3, `FLEET7_PLAN_V4.md` 6.7):
 /// with the parallel build and the puller on, the builder opens the parent's
 /// state -- and applies the pre-execution changes, the one thing before the
@@ -1467,6 +1492,11 @@ where
     let mut gap_after_exec_ms = 0u64;
     let mut gap_before_seal_ms = 0u64;
     let mut index_ms = 0u64;
+    // `N42_FREEZE_AFTER_SEAL=1`: whether the freeze ran beside the seal, when
+    // it ended, and how long its join waited for it (us).
+    let mut freeze_late_used = false;
+    let mut freeze_ended_at: Option<std::time::Instant> = None;
+    let mut freeze_join_wait_us = 0u64;
     // Where the leader's time from the build's start to the seal goes, beside
     // the fields that already name it (plan v6, the seal gap). With the
     // parallel step taken, `sealed_at_ms` is, within a ms or two of rounding:
@@ -1896,13 +1926,48 @@ where
                     // The batches are done: the fold, a task a shard on the
                     // build pool.
                     let freeze_at = std::time::Instant::now();
-                    let sharded_out = sharded_out.map(crate::output_shards::OutputShards::freeze);
+                    // `N42_FREEZE_AFTER_SEAL=1`: on a block that can seal at
+                    // the execution's end, the freeze starts on its own
+                    // thread and is joined where the shards are first read.
+                    let freeze_late = freeze_after_seal()
+                        && seal_at_exec()
+                        && direct_receipts_enabled()
+                        && seal_early_possible
+                        && block_blob_count == 0
+                        && early_seal.is_some();
+                    let mut freezing: Option<LateFreeze> = None;
+                    let mut sharded_out = match sharded_out {
+                        Some(shards) if freeze_late => match spawn_freeze(shards) {
+                            Ok(handle) => {
+                                freezing = Some(handle);
+                                None
+                            }
+                            Err(shards) => shards.map(|shards| shards.freeze()),
+                        },
+                        other => other.map(crate::output_shards::OutputShards::freeze),
+                    };
                     let index_us = freeze_at.elapsed().as_micros() as u64;
                     index_ms = index_us / 1_000;
+                    freeze_late_used = freezing.is_some();
                     if let Some(shards) = sharded_out.as_ref() {
                         out_shards = shards.shard_count();
                         shard_append_ms = shards.append_ms();
                         shard_fold_ms = shards.fold_ms();
+                    }
+                    // The late freeze joined: its counters as the inline
+                    // freeze sets them, `index_ms` its own wall (off the
+                    // seal's path), and when it ended and how long the join
+                    // waited for it.
+                    macro_rules! freeze_joined {
+                        ($joined:expr) => {{
+                            let (frozen, took, ended): (crate::output_shards::FrozenShards, std::time::Duration, std::time::Instant) = $joined;
+                            index_ms = took.as_millis() as u64;
+                            out_shards = frozen.shard_count();
+                            shard_append_ms = frozen.append_ms();
+                            shard_fold_ms = frozen.fold_ms();
+                            freeze_ended_at = Some(ended);
+                            frozen
+                        }};
                     }
                     par_collect_ms = run.phases.collect_ms;
                     par_release_ms = run.phases.release_ms;
@@ -2091,6 +2156,19 @@ where
                     // turns the skip on; the cache insert per account was
                     // ~a third of a 70 ms graft.
                     let block_full = block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS;
+                    // Sealed early, nothing after the graft reads the cache
+                    // either: the serial loop never runs.
+                    let sealing_early = seal_early_possible && block_blob_count == 0 && (block_full || par_drained);
+                    // A block that will not seal early reads the shards below
+                    // (the withdrawals' check, the staged graft): the late
+                    // freeze is joined first. One that will is joined behind
+                    // the seal, beside the receipts.
+                    if !sealing_early && let Some(handle) = freezing.take() {
+                        let joined = handle.join().map_err(|_| {
+                            PayloadBuilderError::other(std::io::Error::other("the shards' freeze panicked"))
+                        })?;
+                        sharded_out = Some(freeze_joined!(joined));
+                    }
                     let withdrawals_clear = attributes.withdrawals.as_ref().is_none_or(|ws| match (staged.as_ref(), sharded_out.as_ref()) {
                         (Some(staged), _) => {
                             let staged = staged.lock().expect("the staged graft's lock");
@@ -2099,9 +2177,6 @@ where
                         (None, Some(shards)) => ws.iter().all(|w| !shards.holds(&w.address)),
                         (None, None) => ws.iter().all(|w| !run.bundles.iter().any(|b| b.state.contains_key(&w.address))),
                     });
-                    // Sealed early, nothing after the graft reads the cache
-                    // either: the serial loop never runs.
-                    let sealing_early = seal_early_possible && block_blob_count == 0 && (block_full || par_drained);
                     // The executor's finish credits the block's withdrawals
                     // through the cache, and a miss there would load the
                     // parent's account over the graft's (the faucet, on a
@@ -2163,24 +2238,27 @@ where
                     // state with no bundle of its own; otherwise the shards are
                     // folded into one staged map here and installed as the
                     // streamed graft is.
+                    // Decided once, for the shards frozen here and for the
+                    // late freeze joined in the scope below alike.
+                    let shards_stay = !keep_cache
+                        && sealing_early
+                        && tx_count > 0
+                        && builder.executor.evm_mut().db_mut().bundle_state.state.is_empty();
                     let (staged, mut sharded_out) = match sharded_out {
-                        Some(shards)
-                            if !keep_cache
-                                && sealing_early
-                                && tx_count > 0
-                                && builder.executor.evm_mut().db_mut().bundle_state.state.is_empty() =>
-                        {
-                            (None, Some(shards))
-                        }
+                        Some(shards) if shards_stay => (None, Some(shards)),
                         Some(shards) => (Some(std::sync::Mutex::new(shards.into_staged())), None),
                         None => (staged, None),
                     };
-                    let staged = staged.map(|staged| staged.into_inner().expect("the staged graft's lock"));
+                    let mut staged = staged.map(|staged| staged.into_inner().expect("the staged graft's lock"));
                     // Of the fold: the graft alone, without the transactions
                     // root that runs beside it -- `par_fold_ms` is the longer
                     // of the two, so a graft that falls under the root would
                     // not show in it (plan v5 attempt D).
                     let mut graft_ms = 0u64;
+                    // `N42_FREEZE_AFTER_SEAL=1`: set when the late freeze's
+                    // thread panicked; the graft is not run and the build
+                    // fails behind its seal.
+                    let mut freeze_failed = false;
                     let (graft, early_root, receipts) = std::thread::scope(|scope| {
                         // Sealed at the execution's end: the receipts from the
                         // slots, beside the graft, instead of the root.
@@ -2203,9 +2281,27 @@ where
                                 scope.spawn(move || crate::assembler::parallel_transaction_root_recovered(txs))
                             }
                         });
+                        // `N42_FREEZE_AFTER_SEAL=1`: the shards are first read
+                        // here; the freeze has run beside the commit and the
+                        // seal, and the receipts job runs beside its end.
+                        if let Some(handle) = freezing.take() {
+                            let join_at = std::time::Instant::now();
+                            match handle.join() {
+                                Ok(joined) => {
+                                    let frozen = freeze_joined!(joined);
+                                    if shards_stay {
+                                        sharded_out = Some(frozen);
+                                    } else {
+                                        staged = Some(frozen.into_staged());
+                                    }
+                                }
+                                Err(_) => freeze_failed = true,
+                            }
+                            freeze_join_wait_us = join_at.elapsed().as_micros() as u64;
+                        }
                         let db = builder.executor.evm_mut().db_mut();
                         let at = std::time::Instant::now();
-                        let graft = match (staged, sharded_out.as_mut()) {
+                        let graft = if freeze_failed { None } else { Some(match (staged, sharded_out.as_mut()) {
                             // The block's output stays in its shards: only the
                             // accounts a pre-execution call left in the cache
                             // are committed, as deltas.
@@ -2226,7 +2322,7 @@ where
                                 crate::parallel_transfer::build_graft_fold(),
                                 graft_target.take(),
                             ),
-                        };
+                        }) };
                         // Kept at 0 when nothing was grafted.
                         graft_ms = if sharded_out.is_some() { 0 } else { at.elapsed().as_millis() as u64 };
                         (
@@ -2249,7 +2345,14 @@ where
                         let slots = std::mem::take(&mut run.slots);
                         crate::parallel_transfer::build_pool().spawn(move || drop(slots));
                     }
-                    let graft = graft.map_err(|err| failed_after_seal(sealed_ahead_id, PayloadBuilderError::other(err)))?;
+                    let graft = graft
+                        .ok_or_else(|| {
+                            failed_after_seal(
+                                sealed_ahead_id,
+                                PayloadBuilderError::other(std::io::Error::other("the shards' freeze behind the seal panicked")),
+                            )
+                        })?
+                        .map_err(|err| failed_after_seal(sealed_ahead_id, PayloadBuilderError::other(err)))?;
                     // Zero on `install_staged`'s streamed graft
                     // (`N42_GRAFT_STREAM=1`) and on `GraftFold::Indexed`/
                     // `IndexedRanges`: only the default in-place fold
@@ -3303,6 +3406,14 @@ where
                     gap_after_exec_ms,
                     gap_before_seal_ms,
                     index_ms,
+                    // `N42_FREEZE_AFTER_SEAL=1`: the freeze ran on its own
+                    // thread beside the commit and the seal (`index_ms` is then
+                    // its own wall, off the seal's path), when it ended (us
+                    // from the seal; 0 = before it), and how long its join
+                    // behind the seal waited.
+                    freeze_late = freeze_late_used,
+                    seal_to_frozen_us = crate::fields_at_seal::us_between(sealed_instant, freeze_ended_at),
+                    freeze_join_wait_us,
                     // `N42_STATE_AFTER_PULL=1` (plan v6 G3): the parent's state
                     // opened after the pull, prep and partition, and the time
                     // inside that open (0 with the flag off: the open is then

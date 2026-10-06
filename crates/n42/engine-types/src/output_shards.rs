@@ -737,6 +737,35 @@ impl OutputShards {
     }
 }
 
+/// A freeze running on a thread of its own ([`OutputShards::freeze_on_thread`]):
+/// the frozen shards, the freeze's own wall, and the moment it ended.
+pub type FreezeHandle = std::thread::JoinHandle<(FrozenShards, std::time::Duration, std::time::Instant)>;
+
+impl OutputShards {
+    /// [`Self::freeze`] on a thread of its own, joined by the caller when it
+    /// first reads the shards (`N42_FREEZE_AFTER_SEAL`): the same call on the
+    /// same input, only started where the batches end and finished beside
+    /// whatever the caller does meanwhile. `Err` gives the shards back when
+    /// no thread could be had (`None` only if they were lost, which the
+    /// failed spawn cannot do: its closure is dropped unrun).
+    pub fn freeze_on_thread(self) -> Result<FreezeHandle, Option<Box<Self>>> {
+        let slot = std::sync::Arc::new(Mutex::new(Some(self)));
+        let taken = std::sync::Arc::clone(&slot);
+        let spawned = std::thread::Builder::new().name("n42-freeze".into()).spawn(move || {
+            let at = std::time::Instant::now();
+            let shards = taken.lock().unwrap_or_else(PoisonError::into_inner).take();
+            // Always present: the slot is filled before the spawn and emptied
+            // only here or, when the spawn failed, by the caller.
+            let frozen = shards.map(Self::freeze).unwrap_or_default();
+            (frozen, at.elapsed(), std::time::Instant::now())
+        });
+        match spawned {
+            Ok(handle) => Ok(handle),
+            Err(_) => Err(slot.lock().unwrap_or_else(PoisonError::into_inner).take().map(Box::new)),
+        }
+    }
+}
+
 /// Where the fold's wall goes: the set-up, the wait for the pool's first
 /// thread, the spread of the tasks' starts, the slowest task's own work, and
 /// the collect after the last one; and what the tasks' own work is made of

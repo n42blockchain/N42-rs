@@ -344,6 +344,94 @@ fn a_live_index_with_shards_left_to_the_freeze_equals_the_direct_graft() {
     assert!(!live_index_defer() || std::env::var("N42_LIVE_INDEX_DEFER").is_ok(), "off by default");
 }
 
+/// `N42_FREEZE_AFTER_SEAL`: the freeze on a thread of its own, joined after
+/// other work on the build pool and beside a job of its own (the receipts'
+/// place), leaves the same shards as the freeze inline: the merged bundle,
+/// the view the QMDB root and the hashed post-state read, the operations, and
+/// the staged fallback -- in every mode, with the live index's deferral forced
+/// and with busy shards left by concurrent hand-overs.
+#[test]
+fn a_freeze_on_its_own_thread_equals_the_inline_freeze() {
+    use rayon::prelude::*;
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let (expected, _) = direct(&db, bundles.clone(), false);
+    let fill = |count: usize, mode: Mode, deferral: Option<bool>, concurrent: bool| {
+        let mut shards = shards_with(count, mode);
+        if let Some(forced) = deferral {
+            shards.set_live_defer(true, forced);
+        }
+        if concurrent {
+            std::thread::scope(|scope| {
+                for bundle in bundles.clone() {
+                    let shards = &shards;
+                    scope.spawn(move || shards.add(bundle));
+                }
+            });
+        } else {
+            for bundle in bundles.clone() {
+                shards.add(bundle);
+            }
+        }
+        shards
+    };
+    for count in [1, 16, 64] {
+        for mode in MODES {
+            let deferrals: &[Option<bool>] = if mode.live { &[None, Some(true), Some(false)] } else { &[None] };
+            for &deferral in deferrals {
+                let label = format!("{count} shards, index {mode}, deferral {deferral:?}");
+                let inline = fill(count, mode, deferral, deferral == Some(false)).freeze();
+                let handle = match fill(count, mode, deferral, deferral == Some(false)).freeze_on_thread() {
+                    Ok(handle) => handle,
+                    Err(_) => panic!("{label}: no thread for the freeze"),
+                };
+                // The pool busy and a job beside the join, as behind the seal.
+                let busy: u64 = n42_engine_types::parallel_transfer::build_pool()
+                    .install(|| (0..200_000u64).into_par_iter().map(|i| i.wrapping_mul(i)).sum());
+                let (late, took, ended) = std::thread::scope(|scope| {
+                    let beside = scope.spawn(move || busy.count_ones());
+                    let joined = handle.join().map_err(|_| "the freeze panicked");
+                    let _ = beside.join();
+                    joined
+                })
+                .unwrap_or_else(|why| panic!("{label}: {why}"));
+                assert!(ended.elapsed() < std::time::Duration::from_secs(60) && took > std::time::Duration::ZERO, "{label}");
+                assert_eq!(late.shard_count(), inline.shard_count(), "{label}: shards");
+                assert_eq!(late.accounts(), inline.accounts(), "{label}: accounts");
+                assert_eq!(late.beneficiary_delta(), inline.beneficiary_delta(), "{label}: beneficiary");
+                let (late, late_residual) = sharded_parts(&db, late);
+                let (inline, inline_residual) = sharded_parts(&db, inline);
+                assert_same(&format!("{label}: residual"), &inline_residual, &late_residual);
+                let late_merged = late.merged(&late_residual);
+                assert_same(&format!("{label}: against the graft"), &expected, &late_merged);
+                assert_same(&format!("{label}: against the inline freeze"), &inline.merged(&inline_residual), &late_merged);
+                let late_overlaps = late.overlaps(&late_residual);
+                let inline_overlaps = inline.overlaps(&inline_residual);
+                let late_view = late.view(&late_residual, &late_overlaps);
+                let inline_view = inline.view(&inline_residual, &inline_overlaps);
+                for prague in [false, true] {
+                    assert_eq!(
+                        n42_qmdb_reth::sorted_operations_from_accounts(&late_view, prague),
+                        n42_qmdb_reth::sorted_operations_from_accounts(&inline_view, prague),
+                        "{label}: QMDB operations, prague {prague}"
+                    );
+                }
+                assert_eq!(hashed_post_state_of(&late_view), hashed_post_state_of(&inline_view), "{label}: hashed");
+            }
+            // The fallback: the late freeze placed into the staged graft.
+            let mut state = block_state(&db);
+            let late = match fill(count, mode, None, false).freeze_on_thread() {
+                Ok(handle) => handle.join().map(|(frozen, _, _)| frozen).unwrap_or_else(|_| panic!("the freeze panicked")),
+                Err(_) => panic!("no thread for the freeze"),
+            };
+            let graft = install_staged(&mut state, late.into_staged(), false).expect("an in-memory database");
+            let mut got = finish(&mut state, graft.beneficiary_delta, false, from_bundle);
+            append_reverts(&mut got, graft.reverts);
+            assert_same(&format!("{count} shards, index {mode}: staged after a late freeze"), &expected, &got);
+        }
+    }
+}
+
 #[test]
 fn the_fallback_with_the_cache_kept_equals_the_direct_graft() {
     let db = parent();

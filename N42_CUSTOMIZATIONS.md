@@ -339,6 +339,34 @@
 - `scripts/fleet7-offcpu.sh`：build 池线程的 off-CPU 剖析（`context-switches` 软件事件 + `--switch-events`，
   无需 root；旁边采样 `/proc/<tid>/wchan`），`--report` 按调用栈汇总离开 CPU 的时间。
 
+
+## E=1 seal 链上的 freeze 与 QMDB 根的操作编码：两个开关与新的观测字段（不改任何 fork 的 reth crate）:
+`docs/SHARED_EXECUTION_SCOPE.md` 第 15 节。纠正：`shard_merge_ms`（52-54 ms）是 leader 在字段发布之后、在自己的
+线程上把分片合并成一个 bundle 的耗时，不在 seal 路径上；seal 路径上的是 freeze（`index_ms`：P 4-5 ms，
+`N42_LIVE_INDEX_DEFER=1` 时 13 ms——上一节说补录"移到 seal 之后"是错的，它在 seal 之前，所以 D 省下的执行
+时间被 freeze 吃掉了）。
+- `N42_FREEZE_AFTER_SEAL=1`（默认关；需 `N42_SEAL_AT_EXEC=1`、输出分片、可提前 seal 的块；代码在
+  `crates/n42/engine-types/src/payload.rs` `freeze_after_seal`、`output_shards.rs` `OutputShards::freeze_on_thread`）：
+  batch 结束时 freeze 在自己的线程上启动，与提交、seal 并行，在 seal 之后 graft 第一次读分片处 join（与 receipts
+  任务并行）；不会提前 seal 的块在 withdrawals 检查前 join。冻结结果是同一输入上的同一调用
+  （`tests/output_shards.rs` `a_freeze_on_its_own_thread_equals_the_inline_freeze`：各模式、各 deferral，合并的
+  bundle、视图、QMDB 操作、hashed post-state、staged 回退都相等）。阶段行新增 `freeze_late`、`seal_to_frozen_us`、
+  `freeze_join_wait_us`；开启时 `index_ms` 是 freeze 自己的耗时（不在 seal 路径上）。
+- `N42_ROOT_OPS_AHEAD=1`（默认关；输出分片、提前 seal 的块；代码在 `payload.rs` `root_ops_ahead`、
+  `qmdb-reth` `changes.rs` `operations_ahead` / `OpsAhead::finish`、`twig-core` `QmdbOps::merge_sorted`）：分片定稿
+  （graft 结束）后立即在自己的线程上编码并排序分片账户的 QMDB 叶子操作，与 receipts 和 executor 的 finish 并行；
+  seal 之后的根任务只编码 residual 的少量账户并合并进去（替换被 executor 再次修改的分片账户）。操作完全相同
+  （`changes.rs` `operations_ahead_finished_equal_the_whole_views`、`tests/output_shards.rs`
+  `the_operations_encoded_ahead_equal_the_views`）。阶段行新增 `root_ops_ahead`、`seal_to_ops_ahead_us`、
+  `root_ops_ahead_wait_us`、`root_ops_finish_us`。
+- 恒开（纯优化）：`twig-core` `QmdbOps` 记住自己已排序（`sort()` 与两个有序集合的合并置位，任何 push 清除），
+  forest 的 `compute_operations` 与树的 apply 两次有序性检查不再扫 ~190,000 个键。
+- 恒开（纯观测）：seal-first 阶段行新增 leader 合并的时间点与分解 `seal_to_merge_start_us`、`seal_to_merge_end_us`、
+  `seal_to_state_ready_us`、`seal_to_complete_us`、`merge_state_us`、`merge_reverts_us`、`merge_append_us`、
+  `merge_tail_us`、`merge_threads`、`merge_accounts`、`merge_reverts`；分片路径根任务的 `root_ops_us`、
+  `root_ops_encode_us`、`root_ops_concat_us`、`root_ops_sort_us`、`root_compute_us`；apply 的 `root_undo_us`、
+  `root_apply_gap_us`。"output shards folded" 行新增 `pending_max`、`pending_us_max`、`drops_max`（freeze 最慢任务
+  的补录批数、补录耗时、冲突出现次数）。`crates/n42/engine-types/src/lib.rs` 的 `recursion_limit` 升到 512。
 ## HotStuff-2 结算标签（不改任何 fork 的 reth crate）:
 - `N42_SETTLEMENT_TAGS=split|legacy`（默认 `split`；代码在 `crates/n42/h2-execution/src/settlement.rs`，
   由 `ExecutionDriver` 的每个 forkchoice 使用）：`latest` = 共识已提交的块；`safe` = 执行已认证的块

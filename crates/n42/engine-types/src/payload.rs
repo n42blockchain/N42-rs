@@ -2940,6 +2940,13 @@ where
                 };
                 let (overlay_filter_builds, overlay_filter_cached) =
                     reth_provider::providers::overlay_filter::filter_stats();
+                // The QMDB view's reads that stood behind its head (or met a
+                // block being indexed) since the last line, the journals they
+                // binary-searched and those their filters skipped
+                // (`N42_VIEW_JOURNAL_FILTER`): whether the reads walk journals
+                // at all, and how deep (the process's, folded per 4,096 reads).
+                let (view_journal_reads, view_journal_searches, view_journal_skips) =
+                    n42_qmdb_reth::read_view::take_journal_counters();
                 let prev_road = crate::post_seal::road_us(parent_header.number);
                 tracing::info!(
                     target: "payload_builder",
@@ -3006,6 +3013,9 @@ where
                     overlay_probes,
                     overlay_filter_builds,
                     overlay_filter_cached,
+                    view_journal_reads,
+                    view_journal_searches,
+                    view_journal_skips,
                     // `N42_PHASE_TIMERS=1` (plan v6 6.5/6.6): where the
                     // parallel step's wall time (`par_exec_ms` above) goes
                     // inside `N42Evm::transfer`, which door each account read

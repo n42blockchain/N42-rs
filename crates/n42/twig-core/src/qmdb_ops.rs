@@ -34,17 +34,22 @@ struct OpSpan {
 pub struct QmdbOps {
     ops: Vec<OpSpan>,
     values: Vec<u8>,
+    /// Known to be in key order: set by [`Self::sort`] and by a merge of two
+    /// sorted sets, cleared by anything that adds operations. Lets
+    /// [`Self::is_sorted`] answer without a pass over the keys (the root's
+    /// path asked twice a block, ~190,000 32-byte compares each).
+    sorted: bool,
 }
 
 impl QmdbOps {
     /// No operations.
     pub const fn new() -> Self {
-        Self { ops: Vec::new(), values: Vec::new() }
+        Self { ops: Vec::new(), values: Vec::new(), sorted: false }
     }
 
     /// Room for `ops` operations whose values total `value_bytes`.
     pub fn with_capacity(ops: usize, value_bytes: usize) -> Self {
-        Self { ops: Vec::with_capacity(ops), values: Vec::with_capacity(value_bytes) }
+        Self { ops: Vec::with_capacity(ops), values: Vec::with_capacity(value_bytes), sorted: false }
     }
 
     /// How many operations.
@@ -66,7 +71,10 @@ impl QmdbOps {
     pub fn push(&mut self, key: Hash, value: Option<&[u8]>) {
         match value {
             Some(value) => self.push_with(key, |out| out.extend_from_slice(value)),
-            None => self.ops.push(OpSpan { key, start: self.values.len(), len: DELETE }),
+            None => {
+                self.sorted = false;
+                self.ops.push(OpSpan { key, start: self.values.len(), len: DELETE });
+            }
         }
     }
 
@@ -78,6 +86,7 @@ impl QmdbOps {
         // A closure can only grow the buffer; saturating keeps a misbehaving
         // one from producing a span that is not in it.
         let len = self.values.len().saturating_sub(start);
+        self.sorted = false;
         self.ops.push(OpSpan { key, start, len });
     }
 
@@ -106,7 +115,7 @@ impl QmdbOps {
 
     /// Whether the keys are in ascending order.
     pub fn is_sorted(&self) -> bool {
-        self.ops.is_sorted_by_key(|op| op.key)
+        self.sorted || self.ops.is_sorted_by_key(|op| op.key)
     }
 
     /// Sorts the operations by key. Only the spans move; the values stay
@@ -121,6 +130,7 @@ impl QmdbOps {
         {
             self.ops.sort_unstable_by_key(|op| op.key);
         }
+        self.sorted = true;
     }
 
     /// Joins pieces built apart (a worker pool's chunks) into one, in order.
@@ -144,6 +154,7 @@ impl QmdbOps {
     /// operations of both, less the dropped ones, in the order [`Self::sort`]
     /// gives them.
     pub fn merge_sorted(mut self, other: Self, dropped: &[Hash]) -> Self {
+        let both_sorted = self.is_sorted() && other.is_sorted();
         let base = self.values.len();
         self.values.extend_from_slice(&other.values);
         let mut ops = Vec::with_capacity(self.ops.len() + other.ops.len());
@@ -161,6 +172,7 @@ impl QmdbOps {
         }
         ops.extend(theirs);
         self.ops = ops;
+        self.sorted = both_sorted;
         self
     }
 

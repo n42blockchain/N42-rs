@@ -154,18 +154,30 @@ fn thread_cpu_ns() -> u64 {
 /// The minor faults say whether a batch's off-CPU time is first touches, the
 /// voluntary switches whether it blocked (a futex, a major fault), the
 /// involuntary ones whether it was preempted.
+/// The major faults say whether it waited on a file read (an entry-file page
+/// of the QMDB view, a database page, not in the page cache). Beside the
+/// kernel's counters, the thread's own lock-wait counters: the QMDB read
+/// view's slot and index locks ([`n42_qmdb_reth::ViewLockWaits`]) and the
+/// output shards' live-index locks
+/// ([`crate::output_shards::LiveLockCounts`]) -- per-thread cells, read
+/// without a syscall.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ThreadMark {
     cpu_ns: u64,
     minflt: u64,
+    majflt: u64,
     nvcsw: u64,
     nivcsw: u64,
+    view: n42_qmdb_reth::ViewLockWaits,
+    live: crate::output_shards::LiveLockCounts,
 }
 
 impl ThreadMark {
     /// The calling thread's counters now (zeros where they cannot be read).
     pub fn now() -> Self {
         let cpu_ns = thread_cpu_ns();
+        let view = n42_qmdb_reth::ViewLockWaits::now();
+        let live = crate::output_shards::LiveLockCounts::now();
         #[cfg(target_os = "linux")]
         {
             // SAFETY: the call only writes into the zeroed struct passed to it.
@@ -175,13 +187,16 @@ impl ThreadMark {
                     return Self {
                         cpu_ns,
                         minflt: usage.ru_minflt.max(0) as u64,
+                        majflt: usage.ru_majflt.max(0) as u64,
                         nvcsw: usage.ru_nvcsw.max(0) as u64,
                         nivcsw: usage.ru_nivcsw.max(0) as u64,
+                        view,
+                        live,
                     };
                 }
             }
         }
-        Self { cpu_ns, ..Self::default() }
+        Self { cpu_ns, view, live, ..Self::default() }
     }
 }
 
@@ -206,6 +221,14 @@ pub struct BatchSpan {
     pub vcsw: u64,
     /// Involuntary context switches inside the batch (it was preempted).
     pub ivcsw: u64,
+    /// Major page faults inside the batch (a file page read from disk).
+    pub majflt: u64,
+    /// The QMDB read view's lock waits inside the batch.
+    pub view: n42_qmdb_reth::ViewLockWaits,
+    /// The live-index hand-over's lock counts inside the batch.
+    pub live: crate::output_shards::LiveLockCounts,
+    /// The batch's open of its view of the parent, microseconds.
+    pub open_us: u64,
 }
 
 impl BatchSpan {
@@ -220,7 +243,17 @@ impl BatchSpan {
             minflt: now.minflt.saturating_sub(mark.minflt),
             vcsw: now.nvcsw.saturating_sub(mark.nvcsw),
             ivcsw: now.nivcsw.saturating_sub(mark.nivcsw),
+            majflt: now.majflt.saturating_sub(mark.majflt),
+            view: now.view.since(mark.view),
+            live: now.live.since(mark.live),
+            open_us: 0,
         }
+    }
+
+    /// The span with its open's time set.
+    fn with_open_us(mut self, open_us: u64) -> Self {
+        self.open_us = open_us;
+        self
     }
 }
 
@@ -272,6 +305,28 @@ pub struct BatchSpans {
     pub vcsw: u64,
     /// Involuntary context switches inside the batches, summed.
     pub ivcsw: u64,
+    /// Major page faults inside the batches, summed.
+    pub majflt: u64,
+    /// Reads that waited for a QMDB read-view reader slot (a publish), summed.
+    pub view_slot_waits: u64,
+    /// Microseconds those reads waited.
+    pub view_slot_wait_us: u64,
+    /// Reads that waited for a QMDB offset-index shard (an advance's writes).
+    pub view_index_waits: u64,
+    /// Microseconds those reads waited.
+    pub view_index_wait_us: u64,
+    /// Live-index shard locks the hand-overs blocked on.
+    pub live_lock_waits: u64,
+    /// Microseconds blocked on them.
+    pub live_lock_wait_us: u64,
+    /// Microseconds the hand-overs held shard locks.
+    pub live_lock_hold_us: u64,
+    /// Shards the hand-overs left to the freeze (`N42_LIVE_INDEX_DEFER=1`).
+    pub live_deferred: u64,
+    /// The batches' opens of the parent's view, microseconds summed.
+    pub open_sum_us: u64,
+    /// The longest of them.
+    pub open_max_us: u64,
 }
 
 impl BatchSpans {
@@ -301,6 +356,18 @@ impl BatchSpans {
         let minflt = spans.iter().map(|s| s.minflt).sum();
         let vcsw = spans.iter().map(|s| s.vcsw).sum();
         let ivcsw = spans.iter().map(|s| s.ivcsw).sum();
+        let sum = |f: &dyn Fn(&BatchSpan) -> u64| spans.iter().map(f).sum::<u64>();
+        let majflt = sum(&|s| s.majflt);
+        let view_slot_waits = sum(&|s| s.view.slot_waits);
+        let view_slot_wait_us = sum(&|s| s.view.slot_wait_ns) / 1000;
+        let view_index_waits = sum(&|s| s.view.index_waits);
+        let view_index_wait_us = sum(&|s| s.view.index_wait_ns) / 1000;
+        let live_lock_waits = sum(&|s| s.live.waits);
+        let live_lock_wait_us = sum(&|s| s.live.wait_ns) / 1000;
+        let live_lock_hold_us = sum(&|s| s.live.hold_ns) / 1000;
+        let live_deferred = sum(&|s| s.live.deferred);
+        let open_sum_us = sum(&|s| s.open_us);
+        let open_max_us = spans.iter().map(|s| s.open_us).max().unwrap_or(0);
         spans.sort_unstable_by_key(wall);
         Self {
             wall_sum_us,
@@ -308,6 +375,17 @@ impl BatchSpans {
             minflt,
             vcsw,
             ivcsw,
+            majflt,
+            view_slot_waits,
+            view_slot_wait_us,
+            view_index_waits,
+            view_index_wait_us,
+            live_lock_waits,
+            live_lock_wait_us,
+            live_lock_hold_us,
+            live_deferred,
+            open_sum_us,
+            open_max_us,
             batches,
             threads,
             first_start_us: first_start,
@@ -3486,7 +3564,12 @@ where
         let txs = members.iter().map(|group| group.len()).sum::<usize>();
         let mut sampler = LoopSampler::new();
         let setup_at = sampler.on.then(std::time::Instant::now);
-        let db = ReadSetDb::new(read_set_ref, open().ok_or(NotParallel::NoState)?);
+        // The open of the parent's view, timed on every batch: one of the
+        // places a batch can wait (the opener's waits for an ancestor).
+        let open_at = std::time::Instant::now();
+        let opened = open().ok_or(NotParallel::NoState)?;
+        let open_us = open_at.elapsed().as_micros() as u64;
+        let db = ReadSetDb::new(read_set_ref, opened);
         // A sender, a recipient a transfer and the beneficiary, sized
         // once: growing from empty rehashed the map a dozen times a
         // batch.
@@ -3557,12 +3640,12 @@ where
             Some(sink) => {
                 sink(bundle);
                 let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
-                let span = BatchSpan::close(start_us, cpu_start, txs, batches_at);
+                let span = BatchSpan::close(start_us, cpu_start, txs, batches_at).with_open_us(open_us);
                 Ok((skipped, None, timers, span, sampler.finish(setup_ns, close_ns)))
             }
             None => {
                 let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
-                let span = BatchSpan::close(start_us, cpu_start, txs, batches_at);
+                let span = BatchSpan::close(start_us, cpu_start, txs, batches_at).with_open_us(open_us);
                 Ok((skipped, Some(bundle), timers, span, sampler.finish(setup_ns, close_ns)))
             }
         }

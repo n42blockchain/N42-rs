@@ -3058,6 +3058,26 @@ where
                     batch_minflt = par_batch_spans.minflt,
                     batch_vcsw = par_batch_spans.vcsw,
                     batch_ivcsw = par_batch_spans.ivcsw,
+                    live_index_defer = crate::output_shards::live_index_defer(),
+                    // Where a batch can block (SHARED_EXECUTION_SCOPE 14):
+                    // major faults (a file page read from disk); reads that
+                    // waited for the QMDB read view's reader slot (a publish)
+                    // or offset-index shard (an advance's writes), count and
+                    // us; the live-index hand-over's blocked shard locks,
+                    // the time blocked, the time held, the shards left to
+                    // the freeze (`N42_LIVE_INDEX_DEFER=1`); the opens of the
+                    // parent's view, us summed and the longest.
+                    batch_majflt = par_batch_spans.majflt,
+                    batch_view_slot_waits = par_batch_spans.view_slot_waits,
+                    batch_view_slot_wait_us = par_batch_spans.view_slot_wait_us,
+                    batch_view_index_waits = par_batch_spans.view_index_waits,
+                    batch_view_index_wait_us = par_batch_spans.view_index_wait_us,
+                    batch_live_lock_waits = par_batch_spans.live_lock_waits,
+                    batch_live_lock_wait_us = par_batch_spans.live_lock_wait_us,
+                    batch_live_lock_hold_us = par_batch_spans.live_lock_hold_us,
+                    batch_live_deferred = par_batch_spans.live_deferred,
+                    batch_open_sum_us = par_batch_spans.open_sum_us,
+                    batch_open_max_us = par_batch_spans.open_max_us,
                     // The dispatch, us from the batches' hand-over to the pool:
                     // the first and the last batch's start, the moment every
                     // thread that ran one had started its first (two waves:

@@ -115,6 +115,114 @@ pub fn output_index_live() -> bool {
     *ON.get_or_init(|| std::env::var("N42_OUTPUT_INDEX_LIVE").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `N42_LIVE_INDEX_DEFER=1` (live index only): a batch whose hand-over finds
+/// a shard's index lock busy twice (the rotated pass and one more) does not
+/// wait for it: the shard is left to the freeze, which enters the batch's
+/// addresses there under the same rules. loop341 measured the waits this
+/// removes: the hand-over (`shard_append_ms`) was 251 ms of pool time a block
+/// against 227 ms of the batches' time off the CPU (r = 0.99 over 1,453
+/// blocks; 541 / 520 ms with 48 threads), ~4 blocking lock calls a batch.
+/// The same index, conflicts and kept reverts come out (the batches' order
+/// at a shard is as arbitrary as before). Off by default. Read once.
+pub fn live_index_defer() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_LIVE_INDEX_DEFER").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// How a live hand-over treats a busy shard: wait for it (the default),
+/// leave it to the freeze (`N42_LIVE_INDEX_DEFER=1`), or, for tests, leave
+/// every other shard to the freeze whatever its lock says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveDefer {
+    Wait,
+    Busy,
+    Forced,
+}
+
+/// One thread's live-index hand-over counters, cumulative (see
+/// [`LiveLockCounts`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LiveLockCounts {
+    /// Shard locks the hand-over blocked on (the try passes found them busy).
+    pub waits: u64,
+    /// Nanoseconds blocked on them.
+    pub wait_ns: u64,
+    /// Nanoseconds the thread held shard locks entering addresses.
+    pub hold_ns: u64,
+    /// Shards left to the freeze (`N42_LIVE_INDEX_DEFER=1`).
+    pub deferred: u64,
+}
+
+impl LiveLockCounts {
+    /// The calling thread's counts now.
+    pub fn now() -> Self {
+        LIVE_LOCKS.try_with(std::cell::Cell::get).unwrap_or_default()
+    }
+
+    /// The counts between `earlier` and `self`.
+    pub const fn since(self, earlier: Self) -> Self {
+        Self {
+            waits: self.waits.saturating_sub(earlier.waits),
+            wait_ns: self.wait_ns.saturating_sub(earlier.wait_ns),
+            hold_ns: self.hold_ns.saturating_sub(earlier.hold_ns),
+            deferred: self.deferred.saturating_sub(earlier.deferred),
+        }
+    }
+
+    fn add(f: impl FnOnce(&mut Self)) {
+        let _ = LIVE_LOCKS.try_with(|cell| {
+            let mut counts = cell.get();
+            f(&mut counts);
+            cell.set(counts);
+        });
+    }
+}
+
+std::thread_local! {
+    static LIVE_LOCKS: std::cell::Cell<LiveLockCounts> = const {
+        std::cell::Cell::new(LiveLockCounts { waits: 0, wait_ns: 0, hold_ns: 0, deferred: 0 })
+    };
+}
+
+/// One batch's addresses and kept reverts of one shard entered into that
+/// shard's index part: `StagedGraft::add`'s rules as the frozen index build
+/// applies them, the conflicting accounts' sums left to the freeze (their
+/// order is the order of `drops`).
+fn enter_part(
+    part: &mut IndexPart,
+    id: u16,
+    accounts: &AddressHashMap<BundleAccount>,
+    reverts: &[(Address, AccountRevert)],
+    addresses: &[Address],
+    revert_at: &[u32],
+) {
+    let mut repeated: AddressHashSet = Default::default();
+    for address in addresses {
+        match part.index.entry(*address) {
+            alloy_primitives::map::hash_map::Entry::Vacant(slot) => {
+                slot.insert(id);
+            }
+            alloy_primitives::map::hash_map::Entry::Occupied(mut held) => {
+                let Some(account) = accounts.get(address) else { continue };
+                repeated.insert(*address);
+                part.size_less += account.size_hint();
+                let first = *held.get();
+                if first != CONFLICT {
+                    part.drops.push((first, *address));
+                    held.insert(CONFLICT);
+                }
+                part.drops.push((id, *address));
+            }
+        }
+    }
+    for &pos in revert_at {
+        let Some((address, _)) = reverts.get(pos as usize) else { continue };
+        if repeated.is_empty() || !repeated.contains(address) {
+            part.kept.push((id, pos));
+        }
+    }
+}
+
 /// The index's mark for an account several batches wrote: it is read from
 /// the shard's conflicts map, not from a batch's.
 const CONFLICT: u16 = u16::MAX;
@@ -233,6 +341,9 @@ struct BatchOut {
     /// Live index mode: the number the batch's index entries carry (its
     /// position in the frozen output), `usize::MAX` when not entered.
     live_id: usize,
+    /// Live index mode: the shards this batch left to the freeze
+    /// (`N42_LIVE_INDEX_DEFER=1`), empty when it entered every one.
+    deferred: Vec<u16>,
 }
 
 /// One batch's map and reverts kept as the block's output (index mode).
@@ -343,6 +454,8 @@ pub struct OutputShards {
     live: Option<Vec<Mutex<IndexPart>>>,
     /// The next live batch number.
     live_next: std::sync::atomic::AtomicUsize,
+    /// What a busy shard lock does to a live hand-over.
+    live_defer: LiveDefer,
 }
 
 impl OutputShards {
@@ -386,7 +499,20 @@ impl OutputShards {
             index,
             live,
             live_next: std::sync::atomic::AtomicUsize::new(0),
+            live_defer: if live_index_defer() { LiveDefer::Busy } else { LiveDefer::Wait },
         }
+    }
+
+    /// Tests: whether a live hand-over leaves busy shards to the freeze
+    /// (`N42_LIVE_INDEX_DEFER=1`'s rule), whatever the environment says; with
+    /// `forced`, every other shard of every batch is left to it, busy or not.
+    #[doc(hidden)]
+    pub fn set_live_defer(&mut self, on: bool, forced: bool) {
+        self.live_defer = match (on, forced) {
+            (_, true) => LiveDefer::Forced,
+            (true, false) => LiveDefer::Busy,
+            (false, false) => LiveDefer::Wait,
+        };
     }
 
     /// The live index's inserts for one batch (see [`output_index_live`]):
@@ -395,6 +521,11 @@ impl OutputShards {
     /// passed over while another is free. `StagedGraft::add`'s rules as the
     /// frozen index build applies them, the conflicting accounts' sums left
     /// to the freeze (their order is the order of `drops`).
+    ///
+    /// Returns the shards left to the freeze (`defer` other than
+    /// [`LiveDefer::Wait`]); the thread's [`LiveLockCounts`] take the waits,
+    /// the time held and the shards left.
+    #[allow(clippy::too_many_arguments)]
     fn enter_live(
         live: &[Mutex<IndexPart>],
         id: u16,
@@ -402,47 +533,62 @@ impl OutputShards {
         reverts: &[(Address, AccountRevert)],
         addresses: &[Vec<Address>],
         revert_at: &[Vec<u32>],
-    ) {
+        defer: LiveDefer,
+    ) -> Vec<u16> {
         let count = live.len();
-        let enter = |part: &mut IndexPart, shard: usize| {
-            let mut repeated: AddressHashSet = Default::default();
-            for address in addresses.get(shard).map_or(&[][..], Vec::as_slice) {
-                match part.index.entry(*address) {
-                    alloy_primitives::map::hash_map::Entry::Vacant(slot) => {
-                        slot.insert(id);
-                    }
-                    alloy_primitives::map::hash_map::Entry::Occupied(mut held) => {
-                        let Some(account) = accounts.get(address) else { continue };
-                        repeated.insert(*address);
-                        part.size_less += account.size_hint();
-                        let first = *held.get();
-                        if first != CONFLICT {
-                            part.drops.push((first, *address));
-                            held.insert(CONFLICT);
-                        }
-                        part.drops.push((id, *address));
-                    }
-                }
-            }
-            for &pos in revert_at.get(shard).map_or(&[][..], Vec::as_slice) {
-                let Some((address, _)) = reverts.get(pos as usize) else { continue };
-                if repeated.is_empty() || !repeated.contains(address) {
-                    part.kept.push((id, pos));
-                }
-            }
+        let mut hold_ns = 0u64;
+        let mut enter = |part: &mut IndexPart, shard: usize| {
+            let at = std::time::Instant::now();
+            enter_part(
+                part,
+                id,
+                accounts,
+                reverts,
+                addresses.get(shard).map_or(&[][..], Vec::as_slice),
+                revert_at.get(shard).map_or(&[][..], Vec::as_slice),
+            );
+            hold_ns += at.elapsed().as_nanos() as u64;
         };
         let mut left: Vec<usize> = Vec::new();
+        let mut deferred: Vec<u16> = Vec::new();
         for k in 0..count {
             let shard = (id as usize + k) % count;
+            if defer == LiveDefer::Forced && (id as usize + shard) % 2 == 1 {
+                deferred.push(shard as u16);
+                continue;
+            }
             match live[shard].try_lock() {
                 Ok(mut part) => enter(&mut part, shard),
                 Err(std::sync::TryLockError::Poisoned(poisoned)) => enter(&mut poisoned.into_inner(), shard),
                 Err(std::sync::TryLockError::WouldBlock) => left.push(shard),
             }
         }
+        let (mut waits, mut wait_ns) = (0u64, 0u64);
         for shard in left {
-            enter(&mut live[shard].lock().unwrap_or_else(PoisonError::into_inner), shard);
+            if defer != LiveDefer::Wait {
+                // One more try: the pass above took a while; a shard still
+                // busy now is the freeze's.
+                match live[shard].try_lock() {
+                    Ok(mut part) => enter(&mut part, shard),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => enter(&mut poisoned.into_inner(), shard),
+                    Err(std::sync::TryLockError::WouldBlock) => deferred.push(shard as u16),
+                }
+                continue;
+            }
+            let at = std::time::Instant::now();
+            let mut part = live[shard].lock().unwrap_or_else(PoisonError::into_inner);
+            waits += 1;
+            wait_ns += at.elapsed().as_nanos() as u64;
+            enter(&mut part, shard);
         }
+        let shards_left = deferred.len() as u64;
+        LiveLockCounts::add(|counts| {
+            counts.waits += waits;
+            counts.wait_ns += wait_ns;
+            counts.hold_ns += hold_ns;
+            counts.deferred += shards_left;
+        });
+        deferred
     }
 
     /// One batch's bundle handed over whole, on the batch's thread, with its
@@ -507,14 +653,16 @@ impl OutputShards {
         // more batches than an index entry can name is frozen the ordinary
         // way (every batch's lists are kept either way).
         let mut live_id = usize::MAX;
+        let mut deferred = Vec::new();
         if let Some(live) = self.live.as_deref() {
             let id = self.live_next.fetch_add(1, Ordering::Relaxed);
             if id < CONFLICT as usize {
                 live_id = id;
-                Self::enter_live(live, id as u16, &accounts, &reverts, &addresses, &revert_at);
+                deferred =
+                    Self::enter_live(live, id as u16, &accounts, &reverts, &addresses, &revert_at, self.live_defer);
             }
         }
-        let out = BatchOut { accounts, reverts, addresses, revert_at, size, beneficiary_delta, live_id };
+        let out = BatchOut { accounts, reverts, addresses, revert_at, size, beneficiary_delta, live_id, deferred };
         self.batches.lock().unwrap_or_else(PoisonError::into_inner).push(out);
         self.append_ns.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
@@ -733,8 +881,31 @@ fn freeze_live(
 ) -> FrozenShards {
     let transposed = std::time::Instant::now();
     let batches_ref = &batches;
-    let sum = move |mut part: IndexPart| {
+    // `N42_LIVE_INDEX_DEFER=1`: the batches a shard was left by, in batch
+    // number order, entered here before the sums (the batches are sorted by
+    // number, so a batch's position is its number).
+    let mut pending: Vec<Vec<u16>> = vec![Vec::new(); parts.len()];
+    for (id, batch) in batches.iter().enumerate() {
+        for &shard in &batch.deferred {
+            if let Some(list) = pending.get_mut(shard as usize) {
+                list.push(id as u16);
+            }
+        }
+    }
+    let any_pending = pending.iter().any(|list| !list.is_empty());
+    let sum = move |(mut part, pending): (IndexPart, Vec<u16>), shard: usize| {
         let probe = TaskProbe::start();
+        for id in pending {
+            let Some(batch) = batches_ref.get(id as usize) else { continue };
+            enter_part(
+                &mut part,
+                id,
+                &batch.accounts,
+                &batch.reverts,
+                batch.addresses.get(shard).map_or(&[][..], Vec::as_slice),
+                batch.revert_at.get(shard).map_or(&[][..], Vec::as_slice),
+            );
+        }
         for (id, address) in &part.drops {
             let Some(account) = batches_ref.get(*id as usize).and_then(|b| b.accounts.get(address)) else { continue };
             match part.conflicts.get_mut(address) {
@@ -752,8 +923,10 @@ fn freeze_live(
     };
     let built: Vec<(IndexPart, TaskCost)> = {
         use rayon::prelude::*;
-        if parts.iter().any(|part| !part.drops.is_empty()) {
-            crate::parallel_transfer::build_pool().install(|| parts.into_par_iter().map(sum).collect())
+        if any_pending || parts.iter().any(|part| !part.drops.is_empty()) {
+            let work: Vec<(IndexPart, Vec<u16>)> = parts.into_iter().zip(pending).collect();
+            crate::parallel_transfer::build_pool()
+                .install(|| work.into_par_iter().enumerate().map(|(shard, item)| sum(item, shard)).collect())
         } else {
             parts.into_iter().map(|part| (part, TaskProbe::start().finish())).collect()
         }

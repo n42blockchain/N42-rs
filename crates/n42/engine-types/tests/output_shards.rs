@@ -7,7 +7,9 @@
 #![allow(missing_docs, unreachable_pub, unused_crate_dependencies)]
 
 use alloy_primitives::{Address, U256};
-use n42_engine_types::output_shards::{any_destroyed, hashed_post_state_of, output_shards, FrozenShards, OutputShards};
+use n42_engine_types::output_shards::{
+    any_destroyed, hashed_post_state_of, live_index_defer, output_shards, FrozenShards, LiveLockCounts, OutputShards,
+};
 use n42_engine_types::parallel_transfer::{append_reverts, graft_bundles_folded, install_staged, GraftFold, StagedGraft};
 use reth_revm::db::State;
 use revm::database::BundleState;
@@ -287,6 +289,59 @@ fn batches_writing_at_once_give_the_same_output() {
         let got = sharded(&db, shards.freeze());
         assert_same(&format!("concurrent, index {index}"), &expected, &got);
     }
+}
+
+/// `N42_LIVE_INDEX_DEFER`: a live index whose hand-overs leave shards to the
+/// freeze -- every other shard of every batch (`forced`), or the busy ones
+/// of batches handed over at once -- gives the direct graft's output, in
+/// order and reversed, at 1, 16 and 64 shards.
+#[test]
+fn a_live_index_with_shards_left_to_the_freeze_equals_the_direct_graft() {
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let (expected, _) = direct(&db, bundles.clone(), false);
+    let live = Mode { index: true, live: true };
+    for count in [1, 16, 64] {
+        for reversed in [false, true] {
+            let mut ordered = bundles.clone();
+            if reversed {
+                ordered.reverse();
+            }
+            let mut shards = shards_with(count, live);
+            shards.set_live_defer(true, true);
+            for bundle in ordered {
+                shards.add(bundle);
+            }
+            let got = sharded(&db, shards.freeze());
+            assert_same(&format!("{count} shards, forced deferral, reversed {reversed}"), &expected, &got);
+        }
+        for _ in 0..4 {
+            let mut shards = shards_with(count, live);
+            shards.set_live_defer(true, false);
+            std::thread::scope(|scope| {
+                for bundle in bundles.clone() {
+                    let shards = &shards;
+                    scope.spawn(move || shards.add(bundle));
+                }
+            });
+            let got = sharded(&db, shards.freeze());
+            assert_same(&format!("{count} shards, busy deferral, concurrent"), &expected, &got);
+        }
+    }
+    // The counters see the hand-overs: a forced deferral leaves shards and
+    // holds locks on this thread, and never waits.
+    let before = LiveLockCounts::now();
+    let mut shards = shards_with(16, live);
+    shards.set_live_defer(true, true);
+    for bundle in bundles.clone() {
+        shards.add(bundle);
+    }
+    let counts = LiveLockCounts::now().since(before);
+    assert!(counts.deferred > 0, "{counts:?}");
+    assert!(counts.hold_ns > 0, "{counts:?}");
+    assert_eq!(counts.waits, 0, "{counts:?}");
+    drop(shards.freeze());
+    assert!(!live_index_defer() || std::env::var("N42_LIVE_INDEX_DEFER").is_ok(), "off by default");
 }
 
 #[test]

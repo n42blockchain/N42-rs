@@ -3216,6 +3216,7 @@ where
                     root_rehash_us = root_split.rehash_us + root_split.root_us,
                     root_note_us = root_split.note_us,
                     root_delta_us = root_split.delta_us,
+                    root_apply_total_us = root_split.apply_total_us,
                     root_publish_ms = root_publish_us.get() / 1000,
                     root_faults = root_split.faults,
                     root_majflt = root_split.majflt,

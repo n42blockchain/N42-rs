@@ -527,6 +527,10 @@ pub struct RootSplit {
     pub note_us: u64,
     /// See `note_us`.
     pub delta_us: u64,
+    /// The apply's whole call, microseconds: its phases and what lies
+    /// between them (the undo record's start, the sortedness check, the
+    /// scratch's recycling).
+    pub apply_total_us: u64,
 }
 
 /// The counters a [`RootSplit`] is the difference of.
@@ -948,7 +952,7 @@ impl QmdbNodeState {
             (split.sort_us, split.leaves_us, split.retire_us, split.writes_us) =
                 (phases.sort_us, phases.leaves_us, phases.retire_us, phases.writes_us);
             (split.index_us, split.rehash_us, split.root_us) = (phases.index_us, phases.rehash_us, phases.root_us);
-            (split.note_us, split.delta_us) = forest.last_compute_tail();
+            (split.note_us, split.delta_us, split.apply_total_us) = forest.last_compute_tail();
         }
         drop(guard);
         before.finish(&mut split);

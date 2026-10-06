@@ -378,8 +378,9 @@ pub struct QmdbForest {
     last_compute: (u64, n42_twig_core::qmdb_compat::ApplyPhases),
     /// What the last [`Self::compute_operations`] spent after the apply, in
     /// microseconds: the move's bookkeeping ([`Self::note_move`]) and the
-    /// block's delta ([`Self::delta_of_applied`]).
-    last_tail: (u64, u64),
+    /// block's delta ([`Self::delta_of_applied`]); and the apply's whole
+    /// call (its phases and what lies between them).
+    last_tail: (u64, u64, u64),
 }
 
 impl QmdbForest {
@@ -506,7 +507,7 @@ impl QmdbForest {
             dirty_slots_deduped: 0,
             min_cursor: next_slot,
             last_compute: Default::default(),
-            last_tail: (0, 0),
+            last_tail: (0, 0, 0),
         }
     }
 
@@ -519,8 +520,9 @@ impl QmdbForest {
 
     /// What the last [`Self::compute_operations`] spent after the apply, in
     /// microseconds: the move's bookkeeping and the block's delta, both
-    /// under the caller's lock and before the root is handed back.
-    pub const fn last_compute_tail(&self) -> (u64, u64) {
+    /// under the caller's lock and before the root is handed back; and the
+    /// apply's whole call.
+    pub const fn last_compute_tail(&self) -> (u64, u64, u64) {
         self.last_tail
     }
 
@@ -737,14 +739,16 @@ impl QmdbForest {
             ops.sort();
         }
         // Applied from the arena the record keeps: no clone of the block.
+        let applied_at = std::time::Instant::now();
         let (root, undo, phases) = self.tree.apply_ops_recorded_phased(&ops)?;
+        let apply_us = applied_at.elapsed().as_micros() as u64;
         self.last_compute = (move_us, phases);
         let noted_at = std::time::Instant::now();
         self.note_move(&undo);
         let note_us = noted_at.elapsed().as_micros() as u64;
         let delta_at = std::time::Instant::now();
         let delta = self.delta_of_applied(&undo);
-        self.last_tail = (note_us, delta_at.elapsed().as_micros() as u64);
+        self.last_tail = (note_us, delta_at.elapsed().as_micros() as u64, apply_us);
         self.pending = Some((parent, undo));
         Ok(PreparedBlock {
             root: B256::from(root),
@@ -786,9 +790,13 @@ impl QmdbForest {
         // every block, under the forest's lock.
         let mut slots: Vec<u64> = Vec::with_capacity(undo.retired_len());
         slots.extend(undo.retired_slots().filter(|slot| *slot < base_next_slot));
-        slots.sort_unstable();
+        // Sorted on the worker pool: one thread sorting a full block's
+        // ~190,000 retired slots was 2.4 ms of the leader's root, under the
+        // forest's lock (`docs/SHARED_EXECUTION_SCOPE.md` 13). The same
+        // order either way.
+        slots.par_sort_unstable();
         slots.dedup();
-        let changed: Vec<(u64, bool)> = slots.into_iter().map(|slot| (slot, false)).collect();
+        let changed: Vec<(u64, bool)> = slots.into_par_iter().map(|slot| (slot, false)).collect();
         ForestDelta {
             version: ForestDelta::VERSION,
             head_number: 0,

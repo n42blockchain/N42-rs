@@ -679,7 +679,7 @@ fn e1_root_bound() {
         parent = hash_of(n);
         if measured {
             println!(
-                "block {n}: {} accounts; ops {ops_us} us ({cpu_ops} us cpu, {:.1} cores); compute {compute_us} us ({cpu_compute} us cpu, {:.1} cores): move {} apply {} hash {} ms (sort {} leaves {} retire {} writes {} index {} rehash {} root {} note {} delta {} us), faults {} (append {}, undo {}), pool misses {}",
+                "block {n}: {} accounts; ops {ops_us} us ({cpu_ops} us cpu, {:.1} cores); compute {compute_us} us ({cpu_compute} us cpu, {:.1} cores): move {} apply {} hash {} ms (sort {} leaves {} retire {} writes {} index {} rehash {} root {} note {} delta {} us; the apply's call {} us), faults {} (append {}, undo {}), pool misses {}",
                 accounts.len(),
                 cpu_ops as f64 / ops_us.max(1) as f64,
                 cpu_compute as f64 / compute_us.max(1) as f64,
@@ -695,6 +695,7 @@ fn e1_root_bound() {
                 split.root_us,
                 split.note_us,
                 split.delta_us,
+                split.apply_total_us,
                 split.faults,
                 split.append_faults,
                 split.faults_undo,

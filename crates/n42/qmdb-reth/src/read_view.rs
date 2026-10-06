@@ -129,6 +129,66 @@ std::thread_local! {
     static JOURNAL_LOCAL: std::cell::Cell<(u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0)) };
 }
 
+std::thread_local! {
+    /// This thread's reads whose reader slot was write-locked (a publish in
+    /// flight: an advance, a step back) and the nanoseconds they waited.
+    static SLOT_WAITS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// The calling thread's waits on the read view's locks, cumulative since the
+/// thread started (difference two readings to attribute them to a span of
+/// work). Only a lock that could not be taken at once is timed, so a read that
+/// waits for nothing costs what it did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ViewLockWaits {
+    /// Reads whose reader slot was held by a writer publishing a new version.
+    pub slot_waits: u64,
+    /// Nanoseconds those reads waited for the slot.
+    pub slot_wait_ns: u64,
+    /// Reads whose offset-index shard was held by a writer (the index's
+    /// `apply_sorted` at an advance, a step back's inserts).
+    pub index_waits: u64,
+    /// Nanoseconds those reads waited for the shard.
+    pub index_wait_ns: u64,
+}
+
+impl ViewLockWaits {
+    /// The calling thread's counts now.
+    pub fn now() -> Self {
+        let (slot_waits, slot_wait_ns) = SLOT_WAITS.try_with(std::cell::Cell::get).unwrap_or((0, 0));
+        let (index_waits, index_wait_ns) = n42_twig_core::thread_read_waits();
+        Self { slot_waits, slot_wait_ns, index_waits, index_wait_ns }
+    }
+
+    /// The waits between `earlier` and `self`.
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            slot_waits: self.slot_waits.saturating_sub(earlier.slot_waits),
+            slot_wait_ns: self.slot_wait_ns.saturating_sub(earlier.slot_wait_ns),
+            index_waits: self.index_waits.saturating_sub(earlier.index_waits),
+            index_wait_ns: self.index_wait_ns.saturating_sub(earlier.index_wait_ns),
+        }
+    }
+}
+
+/// The reader slot's read lock, a failed `try_read` timed into [`SLOT_WAITS`].
+fn read_slot(slot: &Slot) -> std::sync::RwLockReadGuard<'_, Arc<Frozen>> {
+    match slot.0.try_read() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let at = std::time::Instant::now();
+            let guard = slot.0.read().unwrap_or_else(PoisonError::into_inner);
+            let waited = at.elapsed().as_nanos() as u64;
+            let _ = SLOT_WAITS.try_with(|waits| {
+                let (count, ns) = waits.get();
+                waits.set((count + 1, ns + waited));
+            });
+            guard
+        }
+    }
+}
+
 #[inline]
 fn record_journal_walk(searches: u64, skips: u64) {
     let _ = JOURNAL_LOCAL.try_with(|local| {
@@ -393,7 +453,7 @@ impl QmdbReadView {
     /// thread's reader slot is held through the record read, so a truncation
     /// (and an index change) waits.
     fn read_at<T>(&self, key: &Hash, at: u64, decode: impl FnOnce(&[u8]) -> T) -> Option<Option<T>> {
-        let frozen = self.readers.get(reader_slot())?.0.read().unwrap_or_else(PoisonError::into_inner);
+        let frozen = read_slot(self.readers.get(reader_slot())?);
         if !frozen.valid || at > frozen.head {
             return None;
         }
@@ -664,6 +724,49 @@ mod tests {
     /// again on the same mapping (`warm`), beside the same reads with no
     /// versions lock (`raw`: index and record only). Pinned:
     /// `taskset -c 0-31 cargo test -p n42-qmdb-reth --release --lib bench_concurrent_reads -- --ignored --nocapture`.
+    /// A read whose reader slot a publish holds waits, is counted as a slot
+    /// wait (`ViewLockWaits`), and answers what an unheld read answers.
+    #[test]
+    fn a_read_behind_a_publish_is_counted_and_answers_the_same() {
+        use n42_twig_core::qmdb_compat::GOV5_EMPTY_CODE_HASH;
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("n42-view-waits-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("entries.log");
+        let address = Address::with_last_byte(0x24);
+        let key = gov5_account_key(&address.0 .0);
+        let value = encode_gov5_account_value(5, &U256::from(9u64).to_be_bytes::<32>(), &GOV5_EMPTY_CODE_HASH);
+        {
+            let mut file = std::io::BufWriter::new(std::fs::File::create(&path).expect("the entry file"));
+            file.write_all(&key).expect("write");
+            file.write_all(&(value.len() as u32).to_le_bytes()).expect("write");
+            file.write_all(&value).expect("write");
+            file.flush().expect("flush");
+        }
+        let view = QmdbReadView::build(&path, (1, B256::ZERO), vec![(key, 0)]).expect("the view");
+        let unheld = view.account(&address, 1);
+        assert_eq!(unheld.map(|a| a.map(|a| a.nonce)), Some(Some(5)));
+        let ready = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let held = view.lock_readers();
+            let reader = scope.spawn(|| {
+                ready.wait();
+                let before = ViewLockWaits::now();
+                let found = view.account(&address, 1);
+                (found, ViewLockWaits::now().since(before))
+            });
+            ready.wait();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(held);
+            let (found, waits) = reader.join().expect("the reader");
+            assert_eq!(found, unheld);
+            assert_eq!(waits.slot_waits, 1);
+            assert!(waits.slot_wait_ns > 0, "waited {} ns", waits.slot_wait_ns);
+            assert_eq!(waits.index_waits, 0);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A persistence batch longer than the journals: the database's readers
     /// stay at the batch's start until it commits, and are answered.
     #[test]

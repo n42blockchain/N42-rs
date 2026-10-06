@@ -234,14 +234,14 @@ async fn read_hash_tail(
     if marker != 1 && marker != 2 {
         return Ok((Vec::new(), Vec::new(), 1));
     }
-    let n = stream.read_u32_le().await? as usize;
+    let n = read_bounded_u32(stream, (256 << 20) / 32).await?;
     let mut raw = vec![0u8; n * 32];
     stream.read_exact(&mut raw).await?;
     let mut bytes = 5 + raw.len();
     let hashes = raw.as_chunks::<32>().0.iter().copied().map(B256::from).collect();
     let mut frames = Vec::new();
     if marker == 2 {
-        let n = stream.read_u32_le().await? as usize;
+        let n = read_bounded_u32(stream, (256 << 20) / 36).await?;
         let mut raw = vec![0u8; n * 36];
         stream.read_exact(&mut raw).await?;
         bytes += 4 + raw.len();
@@ -257,6 +257,20 @@ async fn read_hash_tail(
     Ok((hashes, frames, bytes))
 }
 
+/// Bound a raw-channel length or count before allocating. The server uses
+/// a 256 MiB payload cap; replies must obey the same bound.
+async fn read_bounded_u32(
+    stream: &mut tokio::net::TcpStream,
+    maximum: usize,
+) -> std::io::Result<usize> {
+    use tokio::io::AsyncReadExt;
+    let value = stream.read_u32_le().await? as usize;
+    if value > maximum {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "raw-channel length exceeds limit"));
+    }
+    Ok(value)
+}
+
 /// Reads one frame of a build-on-own answer.
 async fn read_build_frame(
     stream: &mut tokio::net::TcpStream,
@@ -267,14 +281,14 @@ async fn read_build_frame(
     match stream.read_u8().await? {
         0 => Ok(BuildFrame::Nothing),
         2 => {
-            let len = stream.read_u32_le().await? as usize;
+            let len = read_bounded_u32(stream, 256 << 20).await?;
             let mut message = vec![0u8; len];
             stream.read_exact(&mut message).await?;
             Ok(BuildFrame::Refused(String::from_utf8_lossy(&message).into_owned()))
         }
         n42_h2_execution::raw_engine::reply::CHAIN_HEADER => {
             use alloy_rlp::Decodable as _;
-            let len = stream.read_u32_le().await? as usize;
+            let len = read_bounded_u32(stream, 256 << 20).await?;
             let mut rlp = vec![0u8; len];
             stream.read_exact(&mut rlp).await?;
             let header = alloy_consensus::Header::decode(&mut &rlp[..])
@@ -282,17 +296,17 @@ async fn read_build_frame(
             Ok(BuildFrame::ChainHeader(Box::new(header)))
         }
         1 => {
-            let len = stream.read_u32_le().await? as usize;
+            let len = read_bounded_u32(stream, 256 << 20).await?;
             let mut block = vec![0u8; len];
             stream.read_exact(&mut block).await?;
             // Every byte of the answer, for the "proposal sent" line.
             let mut bytes = 1 + 4 + len + 2;
             let requests = if stream.read_u8().await? == 1 {
-                let n = stream.read_u32_le().await? as usize;
+                let n = read_bounded_u32(stream, 256).await?;
                 bytes += 4;
                 let mut requests = Vec::with_capacity(n);
                 for _ in 0..n {
-                    let len = stream.read_u32_le().await? as usize;
+                    let len = read_bounded_u32(stream, 256 << 20).await?;
                     let mut request = vec![0u8; len];
                     stream.read_exact(&mut request).await?;
                     bytes += 4 + len;
@@ -303,7 +317,7 @@ async fn read_build_frame(
                 None
             };
             let bal = if stream.read_u8().await? == 1 {
-                let len = stream.read_u32_le().await? as usize;
+                let len = read_bounded_u32(stream, 256 << 20).await?;
                 let mut bal = vec![0u8; len];
                 stream.read_exact(&mut bal).await?;
                 bytes += 4 + len;
@@ -329,7 +343,7 @@ async fn read_build_frame(
         // The block without its transactions (`N42_TAKE_COMPACT`): only
         // ever sent to a request that asked for it.
         n42_h2_execution::raw_engine::reply::COMPACT_BUILT => {
-            let len = stream.read_u32_le().await? as usize;
+            let len = read_bounded_u32(stream, 256 << 20).await?;
             let mut buf = vec![0u8; len];
             stream.read_exact(&mut buf).await?;
             let read_end_us = n42_h2_execution::raw_engine::unix_micros();
@@ -1530,7 +1544,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             stream.write_all(&frame).await?;
             let status = match stream.read_u8().await? {
                 1 => {
-                    let len = stream.read_u32_le().await? as usize;
+                    let len = read_bounded_u32(stream, 256 << 20).await?;
                     let mut buf = vec![0u8; len];
                     stream.read_exact(&mut buf).await?;
                     Some(
@@ -1539,7 +1553,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                     )
                 }
                 2 => {
-                    let len = stream.read_u32_le().await? as usize;
+                    let len = read_bounded_u32(stream, 256 << 20).await?;
                     let mut message = vec![0u8; len];
                     stream.read_exact(&mut message).await?;
                     debug!(target: "n42.h2.el", message = %String::from_utf8_lossy(&message), "own block by header refused; sending the payload");
@@ -1715,7 +1729,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             conn.write_all(&frame).await?;
             loop {
                 let kind = conn.read_u8().await?;
-                let len = conn.read_u32_le().await? as usize;
+                let len = read_bounded_u32(&mut conn, 256 << 20).await?;
                 let mut buf = vec![0u8; len];
                 conn.read_exact(&mut buf).await?;
                 match kind {
@@ -1854,7 +1868,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             conn.write_all(&frame).await?;
             loop {
                 let kind = conn.read_u8().await?;
-                let len = conn.read_u32_le().await? as usize;
+                let len = read_bounded_u32(&mut conn, 256 << 20).await?;
                 let mut buf = vec![0u8; len];
                 conn.read_exact(&mut buf).await?;
                 match kind {
@@ -1996,14 +2010,14 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             stream.write_all(&frame).await?;
             let status = match stream.read_u8().await? {
                 1 => {
-                    let len = stream.read_u32_le().await? as usize;
+                    let len = read_bounded_u32(stream, 256 << 20).await?;
                     let mut buf = vec![0u8; len];
                     stream.read_exact(&mut buf).await?;
                     n42_h2_execution::raw_engine::decode_payload_status(&buf)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
                 }
                 2 => {
-                    let len = stream.read_u32_le().await? as usize;
+                    let len = read_bounded_u32(stream, 256 << 20).await?;
                     let mut message = vec![0u8; len];
                     stream.read_exact(&mut message).await?;
                     return Err(std::io::Error::other(String::from_utf8_lossy(&message).into_owned()));
@@ -2077,20 +2091,20 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             let answer = match stream.read_u8().await? {
                 0 => None,
                 2 => {
-                    let len = stream.read_u32_le().await? as usize;
+                    let len = read_bounded_u32(stream, 256 << 20).await?;
                     let mut message = vec![0u8; len];
                     stream.read_exact(&mut message).await?;
                     Some(Err(ElError::new(String::from_utf8_lossy(&message).into_owned())))
                 }
                 1 => {
-                    let len = stream.read_u32_le().await? as usize;
+                    let len = read_bounded_u32(stream, 256 << 20).await?;
                     let mut block = vec![0u8; len];
                     stream.read_exact(&mut block).await?;
                     let requests = if stream.read_u8().await? == 1 {
-                        let n = stream.read_u32_le().await? as usize;
+                        let n = read_bounded_u32(stream, 256).await?;
                         let mut requests = Vec::with_capacity(n);
                         for _ in 0..n {
-                            let len = stream.read_u32_le().await? as usize;
+                            let len = read_bounded_u32(stream, 256 << 20).await?;
                             let mut request = vec![0u8; len];
                             stream.read_exact(&mut request).await?;
                             requests.push(alloy_primitives::Bytes::from(request));
@@ -2100,7 +2114,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                         None
                     };
                     let bal = if stream.read_u8().await? == 1 {
-                        let len = stream.read_u32_le().await? as usize;
+                        let len = read_bounded_u32(stream, 256 << 20).await?;
                         let mut bal = vec![0u8; len];
                         stream.read_exact(&mut bal).await?;
                         Some(alloy_primitives::Bytes::from(bal))
@@ -2386,28 +2400,28 @@ pub async fn request_own_body(
     match conn.read_u8().await? {
         0 => Ok(Err("unknown build".to_owned())),
         2 => {
-            let len = conn.read_u32_le().await? as usize;
+            let len = read_bounded_u32(&mut conn, 256 << 20).await?;
             let mut message = vec![0u8; len];
             conn.read_exact(&mut message).await?;
             Ok(Err(String::from_utf8_lossy(&message).into_owned()))
         }
         1 => {
-            let len = conn.read_u32_le().await? as usize;
+            let len = read_bounded_u32(&mut conn, 256 << 20).await?;
             let mut block = vec![0u8; len];
             conn.read_exact(&mut block).await?;
             // The requests and access list sections of `GET_PAYLOAD`'s shape:
             // read past, since the sealed header and the elided answer
             // already carry what the block needs of them.
             if conn.read_u8().await? == 1 {
-                let n = conn.read_u32_le().await?;
+                let n = read_bounded_u32(&mut conn, 256).await?;
                 for _ in 0..n {
-                    let len = conn.read_u32_le().await? as usize;
+                    let len = read_bounded_u32(&mut conn, 256 << 20).await?;
                     let mut skip = vec![0u8; len];
                     conn.read_exact(&mut skip).await?;
                 }
             }
             if conn.read_u8().await? == 1 {
-                let len = conn.read_u32_le().await? as usize;
+                let len = read_bounded_u32(&mut conn, 256 << 20).await?;
                 let mut skip = vec![0u8; len];
                 conn.read_exact(&mut skip).await?;
             }
@@ -2454,6 +2468,23 @@ mod raw_payload_tests {
     use alloy_consensus::{Block, BlockBody, Header, TxEip1559, TxEnvelope, TxLegacy};
     use alloy_eips::Encodable2718;
     use alloy_primitives::{Address, Signature, TxKind, U256};
+
+    #[tokio::test]
+    async fn oversized_raw_replies_are_refused_before_the_body_is_read() {
+        use tokio::io::AsyncWriteExt;
+        for marker in [1, 2, n42_h2_execution::raw_engine::reply::COMPACT_BUILT] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (mut server, _) = listener.accept().await.unwrap();
+            server.write_u8(marker).await.unwrap();
+            server.write_u32_le(u32::MAX).await.unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                read_build_frame(&mut client, B256::ZERO, false),
+            ).await.expect("reject from the length without waiting for a body");
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
 
     fn typed() -> TxEnvelope {
         let tx = TxEip1559 { chain_id: 1, nonce: 3, gas_limit: 21_000, max_fee_per_gas: 10, max_priority_fee_per_gas: 1, to: TxKind::Call(Address::repeat_byte(2)), value: U256::from(9), ..Default::default() };

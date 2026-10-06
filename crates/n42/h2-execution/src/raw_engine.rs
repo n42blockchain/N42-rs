@@ -257,20 +257,20 @@ pub fn decode_compact_answer(buf: &[u8]) -> Result<CompactAnswer, String> {
     let header = alloy_consensus::Header::decode(&mut cursor).map_err(|e| format!("header: {e}"))?;
     if !cursor.is_empty() { return Err("header RLP has trailing bytes".into()); }
     let tx_count = r.u32()?;
-    let n = r.u32()? as usize;
-    let mut withdrawals = Vec::with_capacity(n.min(1 << 16));
+    let n = r.count(44)?;
+    let mut withdrawals = Vec::with_capacity(n);
     for _ in 0..n {
         let index = r.u64()?; let validator_index = r.u64()?;
         let address = Address::from_slice(r.take(20)?); let amount = r.u64()?;
         withdrawals.push(Withdrawal { index, validator_index, address, amount });
     }
-    let requests = if r.u8()? == 1 {
-        let n = r.u32()? as usize;
-        let mut list = Vec::with_capacity(n.min(1 << 16));
+    let requests = if r.flag()? {
+        let n = r.count(4)?;
+        let mut list = Vec::with_capacity(n);
         for _ in 0..n { list.push(r.bytes()?); }
         Some(list)
     } else { None };
-    let block_access_list = if r.u8()? == 1 { Some(r.bytes()?) } else { None };
+    let block_access_list = if r.flag()? { Some(r.bytes()?) } else { None };
     let n = r.u32()? as usize;
     // A layout-only answer has no hashes; whether its layout covers the
     // block is checked below, once the layout has been read.
@@ -316,8 +316,8 @@ pub fn encode_need_txns(indices: &[u32]) -> Vec<u8> {
 /// Decodes what [`encode_need_txns`] produced.
 pub fn decode_need_txns(buf: &[u8]) -> Result<Vec<u32>, String> {
     let mut r = Reader { rest: buf, shared: None };
-    let n = r.u32()? as usize;
-    let mut indices = Vec::with_capacity(n.min(1 << 20));
+    let n = r.count(4)?;
+    let mut indices = Vec::with_capacity(n);
     for _ in 0..n {
         indices.push(r.u32()?);
     }
@@ -348,9 +348,24 @@ impl<'a> Reader<'a> {
         let (a, b) = self.rest.split_at(n); self.rest = b; Ok(a)
     }
     fn u8(&mut self) -> Result<u8, String> { Ok(self.take(1)?[0]) }
+    fn flag(&mut self) -> Result<bool, String> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(format!("invalid boolean marker {other}")),
+        }
+    }
     fn u32(&mut self) -> Result<u32, String> { Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4"))) }
     fn u64(&mut self) -> Result<u64, String> { Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8"))) }
     fn b256(&mut self) -> Result<B256, String> { Ok(B256::from_slice(self.take(32)?)) }
+    /// Bounds a list by the bytes each element must occupy before allocating.
+    fn count(&mut self, minimum_bytes: usize) -> Result<usize, String> {
+        let n = self.u32()? as usize;
+        if n > self.rest.len() / minimum_bytes {
+            return Err("list count exceeds available bytes".into());
+        }
+        Ok(n)
+    }
     fn bytes(&mut self) -> Result<Bytes, String> {
         let n = self.u32()? as usize;
         let part = self.take(n)?;
@@ -449,6 +464,7 @@ pub fn decode_execution_data_shared(buf: &Bytes) -> Result<ExecutionData, String
 fn decode_with(mut r: Reader<'_>) -> Result<ExecutionData, String> {
     if r.u8()? != VERSION { return Err("unknown raw engine version".into()); }
     let kind = r.u8()?;
+    if !(1..=4).contains(&kind) { return Err(format!("unknown payload kind {kind}")); }
     let parent_hash = r.b256()?;
     let fee_recipient = Address::from_slice(r.take(20)?);
     let state_root = r.b256()?;
@@ -464,7 +480,7 @@ fn decode_with(mut r: Reader<'_>) -> Result<ExecutionData, String> {
     let block_hash = r.b256()?;
     let difficulty = U256::from_be_slice(r.take(32)?);
     let nonce = B64::from_slice(r.take(8)?);
-    let n = r.u32()? as usize;
+    let n = r.count(4)?;
     let mut transactions = Vec::with_capacity(n);
     for _ in 0..n { transactions.push(r.bytes()?); }
     let v1 = ExecutionPayloadV1 {
@@ -475,7 +491,7 @@ fn decode_with(mut r: Reader<'_>) -> Result<ExecutionData, String> {
     let payload = if kind == 1 {
         ExecutionPayload::V1(v1)
     } else {
-        let n = r.u32()? as usize;
+        let n = r.count(44)?;
         let mut withdrawals = Vec::with_capacity(n);
         for _ in 0..n {
             let index = r.u64()?; let validator_index = r.u64()?;
@@ -498,18 +514,18 @@ fn decode_with(mut r: Reader<'_>) -> Result<ExecutionData, String> {
             }
         }
     };
-    let cancun = if r.u8()? == 1 {
+    let cancun = if r.flag()? {
         let parent_beacon_block_root = r.b256()?;
-        let n = r.u32()? as usize;
+        let n = r.count(32)?;
         let mut versioned_hashes = Vec::with_capacity(n);
         for _ in 0..n { versioned_hashes.push(r.b256()?); }
         Some(CancunPayloadFields { parent_beacon_block_root, versioned_hashes })
     } else { None };
-    let prague = if r.u8()? == 1 {
-        let requests = if r.u8()? == 0 {
+    let prague = if r.flag()? {
+        let requests = if !r.flag()? {
             RequestsOrHash::Hash(r.b256()?)
         } else {
-            let n = r.u32()? as usize;
+            let n = r.count(4)?;
             let mut list = Vec::with_capacity(n);
             for _ in 0..n { list.push(r.bytes()?); }
             RequestsOrHash::Requests(Requests::new(list))
@@ -517,10 +533,12 @@ fn decode_with(mut r: Reader<'_>) -> Result<ExecutionData, String> {
         Some(PraguePayloadFields { requests })
     } else { None };
     let sidecar = match (cancun, prague) {
-        (None, _) => ExecutionPayloadSidecar::none(),
+        (None, None) => ExecutionPayloadSidecar::none(),
+        (None, Some(_)) => return Err("Prague sidecar without Cancun fields".into()),
         (Some(c), None) => ExecutionPayloadSidecar::v3(c),
         (Some(c), Some(p)) => ExecutionPayloadSidecar::v4(c, p),
     };
+    if !r.rest.is_empty() { return Err("execution data has trailing bytes".into()); }
     Ok(ExecutionData::new(payload, sidecar))
 }
 
@@ -756,12 +774,14 @@ pub fn decode_build_on_own_request(buf: &[u8]) -> Result<BuildOnOwn, String> {
     let mut r = Reader { rest: buf, shared: None };
     if r.u8()? != VERSION { return Err("unknown raw engine version".into()); }
     let rlp = r.bytes()?;
-    let header = alloy_consensus::Header::decode(&mut &rlp[..]).map_err(|e| format!("header: {e}"))?;
+    let mut cursor = &rlp[..];
+    let header = alloy_consensus::Header::decode(&mut cursor).map_err(|e| format!("header: {e}"))?;
+    if !cursor.is_empty() { return Err("header RLP has trailing bytes".into()); }
     let timestamp = r.u64()?;
     let prev_randao = r.b256()?;
     let suggested_fee_recipient = Address::from_slice(r.take(20)?);
-    let withdrawals = if r.u8()? == 1 {
-        let n = r.u32()? as usize;
+    let withdrawals = if r.flag()? {
+        let n = r.count(44)?;
         let mut list = Vec::with_capacity(n);
         for _ in 0..n {
             let index = r.u64()?; let validator_index = r.u64()?;
@@ -770,9 +790,9 @@ pub fn decode_build_on_own_request(buf: &[u8]) -> Result<BuildOnOwn, String> {
         }
         Some(list)
     } else { None };
-    let parent_beacon_block_root = if r.u8()? == 1 { Some(r.b256()?) } else { None };
-    let slot_number = if r.u8()? == 1 { Some(r.u64()?) } else { None };
-    let target_gas_limit = if r.u8()? == 1 { Some(r.u64()?) } else { None };
+    let parent_beacon_block_root = if r.flag()? { Some(r.b256()?) } else { None };
+    let slot_number = if r.flag()? { Some(r.u64()?) } else { None };
+    let target_gas_limit = if r.flag()? { Some(r.u64()?) } else { None };
     // The tail. Empty in every frame written before it existed, so its
     // absence is "no hint" rather than a truncated frame.
     let mut chain = None;
@@ -781,7 +801,7 @@ pub fn decode_build_on_own_request(buf: &[u8]) -> Result<BuildOnOwn, String> {
     let mut layout_only = false;
     while !r.rest.is_empty() {
         match r.u8()? {
-            TAIL_CHAIN_HINT => chain = Some(ChainHint { view: r.u64()?, chained: r.u8()? == 1 }),
+            TAIL_CHAIN_HINT => chain = Some(ChainHint { view: r.u64()?, chained: r.flag()? }),
             TAIL_WANT_HASHES => want_hashes = true,
             TAIL_COMPACT_ANSWER => compact_answer = true,
             TAIL_LAYOUT_ONLY => layout_only = true,
@@ -815,7 +835,7 @@ pub fn encode_payload_status(status: &PayloadStatus) -> Vec<u8> {
 pub fn decode_payload_status(buf: &[u8]) -> Result<PayloadStatus, String> {
     let mut r = Reader { rest: buf, shared: None };
     let kind = r.u8()?;
-    let latest_valid_hash = if r.u8()? == 1 { Some(r.b256()?) } else { None };
+    let latest_valid_hash = if r.flag()? { Some(r.b256()?) } else { None };
     let error = String::from_utf8_lossy(&r.bytes()?).into_owned();
     let status = match kind {
         0 => PayloadStatusEnum::Valid,
@@ -824,6 +844,7 @@ pub fn decode_payload_status(buf: &[u8]) -> Result<PayloadStatus, String> {
         3 => PayloadStatusEnum::Accepted,
         other => return Err(format!("unknown payload status {other}")),
     };
+    if !r.rest.is_empty() { return Err("payload status has trailing bytes".into()); }
     Ok(PayloadStatus { status, latest_valid_hash })
 }
 
@@ -840,6 +861,64 @@ mod tests {
             transactions: vec![Bytes::from_static(&[0x02, 0x01]), Bytes::from_static(&[0xf8, 0x00, 0x11])],
             difficulty: U256::from(13), nonce: B64::repeat_byte(14),
         }
+    }
+
+    #[test]
+    fn truncated_lists_are_rejected_before_allocating_from_their_counts() {
+        let mut base = v1();
+        base.transactions.clear();
+        let v2 = ExecutionPayloadV2 { payload_inner: base.clone(), withdrawals: Vec::new() };
+        let v3 = ExecutionPayloadV3 { payload_inner: v2.clone(), blob_gas_used: 0, excess_blob_gas: 0 };
+        let cancun = CancunPayloadFields { parent_beacon_block_root: B256::ZERO, versioned_hashes: Vec::new() };
+        let cases = [
+            (ExecutionData::new(ExecutionPayload::V1(base), ExecutionPayloadSidecar::none()), 6),
+            (ExecutionData::new(ExecutionPayload::V2(v2), ExecutionPayloadSidecar::none()), 6),
+            (ExecutionData::new(ExecutionPayload::V3(v3.clone()), ExecutionPayloadSidecar::v3(cancun.clone())), 5),
+            (ExecutionData::new(ExecutionPayload::V3(v3), ExecutionPayloadSidecar::v4(cancun,
+                PraguePayloadFields { requests: RequestsOrHash::Requests(Requests::new(Vec::new())) })), 4),
+        ];
+        for (data, from_end) in cases {
+            let mut wire = encode_execution_data(&data);
+            assert!(decode_execution_data(&wire).is_ok());
+            let at = wire.len() - from_end;
+            wire[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(decode_execution_data(&wire).is_err());
+            assert!(decode_execution_data_shared(&Bytes::from(wire)).is_err());
+        }
+    }
+
+    #[test]
+    fn execution_data_rejects_unknown_kinds_and_trailing_bytes() {
+        let data = ExecutionData::new(ExecutionPayload::V1(v1()), ExecutionPayloadSidecar::none());
+        let wire = encode_execution_data(&data);
+        for kind in [0, 5, 255] {
+            let mut wrong = wire.clone();
+            wrong[1] = kind;
+            assert!(decode_execution_data(&wrong).is_err());
+        }
+        let mut padded = wire;
+        padded.push(0);
+        assert!(decode_execution_data(&padded).is_err());
+    }
+
+    #[test]
+    fn unknown_optional_markers_are_refused() {
+        let data = ExecutionData::new(ExecutionPayload::V1(v1()), ExecutionPayloadSidecar::none());
+        for from_end in [1, 2] {
+            for marker in [2, 255] {
+                let mut wire = encode_execution_data(&data);
+                let at = wire.len() - from_end;
+                wire[at] = marker;
+                assert!(decode_execution_data(&wire).is_err());
+            }
+        }
+        let status = PayloadStatus { status: PayloadStatusEnum::Valid, latest_valid_hash: None };
+        let mut wire = encode_payload_status(&status);
+        wire.push(0);
+        assert!(decode_payload_status(&wire).is_err());
+        wire.pop();
+        wire[1] = 2;
+        assert!(decode_payload_status(&wire).is_err());
     }
 
     #[test]

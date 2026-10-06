@@ -478,7 +478,7 @@ pub const MAX_BLOCK_TXNS_BYTES: u64 = 32 << 20;
 
 /// Bound on the indices a peer may ask for, so a request cannot make this
 /// node allocate without bound.
-pub const MAX_BLOCK_TXNS_INDICES: usize = 1 << 20;
+pub const MAX_BLOCK_TXNS_INDICES: usize = n42_h2_consensus::compact_body::MAX_COMPACT_TXS;
 
 /// The codec for [`BLOCK_TXNS_PROTOCOL`].
 #[derive(Debug, Clone, Default)]
@@ -522,6 +522,9 @@ fn decode_txns(bytes: &[u8]) -> io::Result<Vec<alloy_primitives::Bytes>> {
     let count = u32::from_le_bytes(count.try_into().map_err(|_| bad("count"))?) as usize;
     if count > MAX_BLOCK_TXNS_INDICES {
         return Err(bad("more transactions than any block has"));
+    }
+    if count > rest.len() / 4 {
+        return Err(bad("transaction count exceeds available lengths"));
     }
     let mut txns = Vec::with_capacity(count);
     for _ in 0..count {
@@ -659,6 +662,7 @@ mod block_txns_tests {
 
     #[test]
     fn a_malformed_index_list_or_answer_is_refused() {
+        assert!(decode_txns(&(MAX_BLOCK_TXNS_INDICES as u32).to_le_bytes()).is_err());
         assert!(decode_indices(&[]).is_err());
         assert!(decode_indices(&[2, 0, 0, 0, 1, 0, 0, 0]).is_err(), "count says two, one follows");
         assert!(decode_txns(&[1, 0, 0, 0, 9, 0, 0, 0, 1]).is_err(), "length runs past the end");

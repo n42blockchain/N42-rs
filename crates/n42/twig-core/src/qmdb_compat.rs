@@ -931,6 +931,38 @@ const DIRTY_BITS: u8 = 1;
 /// A twig that took new leaves (and possibly bit changes).
 const DIRTY_LEAVES: u8 = 2;
 
+/// Whether the block apply's structural writes run beside each other
+/// (`N42_QMDB_PARALLEL_WRITES=1`, off by default; see
+/// [`QmdbCompatTree::parallel_writes`]), or what
+/// [`set_parallel_writes_on_this_thread`] chose for the applying thread.
+pub fn parallel_writes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    PARALLEL_WRITES_HERE
+        .try_with(std::cell::Cell::get)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| *ON.get_or_init(|| std::env::var("N42_QMDB_PARALLEL_WRITES").is_ok_and(|v| v.trim() == "1")))
+}
+
+std::thread_local! {
+    static PARALLEL_WRITES_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Applies whose structural writes ran in parallel, since the process started.
+static PARALLEL_WRITES_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many applies wrote in parallel ([`parallel_writes`]) so far.
+pub fn parallel_writes_runs() -> u64 {
+    PARALLEL_WRITES_RUNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Tests and benches: the parallel writes on or off for applies made on this
+/// thread, whatever the environment says (`None` follows it again).
+#[doc(hidden)]
+pub fn set_parallel_writes_on_this_thread(on: Option<bool>) {
+    let _ = PARALLEL_WRITES_HERE.try_with(|here| here.set(on));
+}
+
 fn mark_dirty(dirty: &mut Vec<u8>, twig_id: usize, level: u8) {
     if dirty.len() <= twig_id {
         dirty.resize(twig_id + 1, 0);
@@ -2047,18 +2079,31 @@ impl QmdbCompatTree {
             faults = now;
         };
         took(&mut phases.tmp_faults);
-        if let Some(record) = self.recording.as_mut() {
-            record.appended_keys.extend(appended.iter().map(|(key, _)| *key));
-        }
-        took(&mut phases.undo_faults);
-        for (leaf, (_, slot)) in (0..count).filter_map(|i| appends(i).map(|(_, leaf)| leaf)).zip(appended.iter()) {
-            self.set_twig_leaf(*slot, leaf, &mut dirty);
-        }
-        self.next_slot = first_slot + appended.len() as u64;
-        took(&mut phases.twigs_faults);
         let mut append_faults = crate::entry_store::AppendFaults::default();
         let records = (0..count).filter_map(|i| appends(i).map(|(value, _)| (operations.op_key(i), value)));
-        let pushed = self.entries.push_batch(records, &mut append_faults);
+        let pushed = match self.parallel_writes(operations, leaves, appended, &mut dirty, records.clone(), &mut append_faults) {
+            Some((pushed, undo_faults, twigs_faults)) => {
+                // The undo keys, the twigs' leaves and the entries were
+                // written beside each other, each counting its own thread's
+                // faults.
+                phases.undo_faults += undo_faults;
+                phases.twigs_faults += twigs_faults;
+                took(&mut 0);
+                pushed
+            }
+            None => {
+                if let Some(record) = self.recording.as_mut() {
+                    record.appended_keys.extend(appended.iter().map(|(key, _)| *key));
+                }
+                took(&mut phases.undo_faults);
+                for (leaf, (_, slot)) in (0..count).filter_map(|i| appends(i).map(|(_, leaf)| leaf)).zip(appended.iter()) {
+                    self.set_twig_leaf(*slot, leaf, &mut dirty);
+                }
+                took(&mut phases.twigs_faults);
+                self.entries.push_batch(records, &mut append_faults)
+            }
+        };
+        self.next_slot = first_slot + appended.len() as u64;
         phases.entries_faults = append_faults.entries;
         phases.offsets_faults = append_faults.offsets;
         phases.bits_faults = append_faults.bits;
@@ -2087,6 +2132,81 @@ impl QmdbCompatTree {
         phases.hash_faults = crate::prefault::thread_faults().saturating_sub(faults_hash);
         crate::prefault::recycle_apply_scratch(scratch);
         Ok((root, phases))
+    }
+
+    /// `N42_QMDB_PARALLEL_WRITES=1`: the block apply's three structural
+    /// writes -- the undo record's appended keys, the appended slots' twig
+    /// leaves and active bits, the entries -- run beside each other on the
+    /// worker pool instead of one after another on the applying thread. They
+    /// touch disjoint structures, and each is written in the operations'
+    /// order as before, so the tree, the undo record and the entry store are
+    /// the ones the serial writes leave (`parallel_writes_equal_the_serial_ones`).
+    /// The twigs the appends reach are made first, in order, as the serial
+    /// loop's `ensure_twig` makes them. `None` (the caller writes serially)
+    /// when the switch is off, there is nothing appended, or a twig the
+    /// appends reach is evicted (the serial path's case). Returns the entries'
+    /// result and the undo's and the twigs' faults.
+    #[allow(clippy::type_complexity)]
+    fn parallel_writes<'a, O: LeafOps + ?Sized>(
+        &mut self,
+        operations: &'a O,
+        leaves: &[Option<Hash>],
+        appended: &[(Hash, u64)],
+        dirty: &mut Vec<u8>,
+        records: impl Iterator<Item = (&'a Hash, &'a [u8])> + Clone + Send,
+        append_faults: &mut crate::entry_store::AppendFaults,
+    ) -> Option<(std::io::Result<()>, u64, u64)> {
+        #[cfg(feature = "rayon")]
+        {
+            let (first, last) = (appended.first()?.1, appended.last()?.1);
+            if !parallel_writes() {
+                return None;
+            }
+            let (first_twig, last_twig) = (first as usize / TWIG_SIZE, last as usize / TWIG_SIZE);
+            self.ensure_twig(last_twig);
+            if self.twigs.get(first_twig..=last_twig).is_none_or(|twigs| twigs.iter().any(|twig| twig.nodes.is_none())) {
+                return None;
+            }
+            let count = operations.op_count();
+            let (recording, twigs, entries) = (&mut self.recording, &mut self.twigs[first_twig..=last_twig], &mut self.entries);
+            let ((undo_faults, twigs_faults), pushed) = rayon::join(
+                || {
+                    rayon::join(
+                        || {
+                            let at = crate::prefault::thread_faults();
+                            if let Some(record) = recording.as_mut() {
+                                record.appended_keys.extend(appended.iter().map(|(key, _)| *key));
+                            }
+                            crate::prefault::thread_faults().saturating_sub(at)
+                        },
+                        || {
+                            let at = crate::prefault::thread_faults();
+                            let leaves = (0..count).filter_map(|i| operations.op_value(i).and(leaves[i]));
+                            for (leaf, (_, slot)) in leaves.zip(appended.iter()) {
+                                let (twig, local) = (*slot as usize / TWIG_SIZE - first_twig, *slot as usize % TWIG_SIZE);
+                                let twig = &mut twigs[twig];
+                                if let Some(nodes) = twig.nodes.as_deref_mut() {
+                                    nodes[TWIG_SIZE + local] = leaf;
+                                }
+                                twig.bits[local / 8] |= 1 << (local % 8);
+                            }
+                            crate::prefault::thread_faults().saturating_sub(at)
+                        },
+                    )
+                },
+                || entries.push_batch(records, append_faults),
+            );
+            for twig_id in first_twig..=last_twig {
+                mark_dirty(dirty, twig_id, DIRTY_LEAVES);
+            }
+            PARALLEL_WRITES_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some((pushed, undo_faults, twigs_faults))
+        }
+        #[cfg(not(feature = "rayon"))]
+        {
+            let _ = (operations, leaves, appended, dirty, records, append_faults);
+            None
+        }
     }
 
     /// The twig half of an append for the block apply: `slot`'s leaf and
@@ -2502,6 +2622,75 @@ mod tests {
             assert_eq!(root, expected_root, "root differs at block {block}");
             assert_eq!(undo, expected_undo, "undo record differs at block {block}");
             assert_eq!(batched.snapshot(), one_by_one.snapshot(), "snapshot differs at block {block}");
+        }
+    }
+
+    /// `N42_QMDB_PARALLEL_WRITES`: the parallel structural writes leave the
+    /// tree, the undo record, the snapshot and the entries the serial writes
+    /// leave, in memory and in the entry file, over blocks that create,
+    /// update, delete and re-create keys across many twigs (a 5,000-key
+    /// block spans three). Without the `rayon` feature both trees write
+    /// serially.
+    #[test]
+    fn parallel_writes_equal_the_serial_ones() {
+        for in_file in [false, true] {
+            let dir = std::env::temp_dir().join(format!("n42-twig-parallel-writes-{}-{in_file}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let key_of = |n: u64| {
+                let mut key = [0u8; 32];
+                key[..8].copy_from_slice(&n.wrapping_mul(0x2545_f491_4f6c_dd1d).to_be_bytes());
+                key[24..].copy_from_slice(&n.to_be_bytes());
+                key
+            };
+            let mut serial = QmdbCompatTree::new();
+            let mut parallel = QmdbCompatTree::new();
+            if in_file {
+                serial.set_entry_file(&dir.join("serial.log")).unwrap();
+                parallel.set_entry_file(&dir.join("parallel.log")).unwrap();
+            }
+            for block in 0..8u64 {
+                let count = if block == 0 { 9_000 } else { 5_000 };
+                let mut seen = std::collections::HashSet::new();
+                let mut operations = Vec::new();
+                while operations.len() < count {
+                    let r = next();
+                    let key = key_of(r % 12_000);
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    let value = if r % 9 == 0 && block > 0 {
+                        None
+                    } else {
+                        Some((0..(4 + (r % 40) as usize)).map(|i| (r as u8).wrapping_add(i as u8)).collect())
+                    };
+                    operations.push(QmdbOperation { key, value });
+                }
+                set_parallel_writes_on_this_thread(Some(false));
+                let (serial_root, serial_undo) = serial.apply_sorted_ops_recorded(operations.clone()).unwrap();
+                set_parallel_writes_on_this_thread(Some(true));
+                let (parallel_root, parallel_undo) = parallel.apply_sorted_ops_recorded(operations).unwrap();
+                set_parallel_writes_on_this_thread(None);
+                assert_eq!(parallel_root, serial_root, "root differs at block {block} (file {in_file})");
+                assert_eq!(parallel_undo, serial_undo, "undo record differs at block {block} (file {in_file})");
+                assert_eq!(parallel.next_slot(), serial.next_slot(), "cursor differs at block {block}");
+                assert_eq!(parallel.snapshot(), serial.snapshot(), "snapshot differs at block {block} (file {in_file})");
+            }
+            #[cfg(feature = "rayon")]
+            assert!(parallel_writes_runs() >= 8, "the parallel writes ran");
+            if in_file {
+                let serial_bytes = std::fs::read(dir.join("serial.log")).unwrap();
+                let parallel_bytes = std::fs::read(dir.join("parallel.log")).unwrap();
+                assert_eq!(serial_bytes, parallel_bytes, "the entry files differ");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 

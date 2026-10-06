@@ -1057,9 +1057,9 @@ ahead plus each one's wake-up latency. 48 threads make the queues longer, which 
 | --- | --- | --- |
 | 09fdadb38 | `twig-core` `thread_read_waits()`: offset-index reads that found their shard held, count and ns (a failed `try_read` alone is timed) | always (observability) |
 | 3e353d195 | `qmdb-reth` `ViewLockWaits`: reader-slot and index-shard waits per thread | always (observability) |
-| (this round) | `OutputShards`: `LiveLockCounts` per thread (blocked shard locks, the time blocked, the time held, shards left to the freeze); `N42_LIVE_INDEX_DEFER=1`: a shard still busy after the rotated pass and one more try is left to the freeze, which enters that batch's addresses there (same rules) before the conflicts' sums | `N42_LIVE_INDEX_DEFER=1`, default off |
-| (this round) | `ThreadMark` / `BatchSpan` carry major faults, the view's waits, the hand-over's counts and the batch's open time; the seal-first line prints `live_index_defer`, `batch_majflt`, `batch_view_slot_waits`, `batch_view_slot_wait_us`, `batch_view_index_waits`, `batch_view_index_wait_us`, `batch_live_lock_waits`, `batch_live_lock_wait_us`, `batch_live_lock_hold_us`, `batch_live_deferred`, `batch_open_sum_us`, `batch_open_max_us` | always (observability) |
-| (this round) | `scripts/fleet7-offcpu.sh` (+ `fleet7-offcpu-fold.py`): the build pool's off-CPU profile, without root | - |
+| 103a07da8 | `OutputShards`: `LiveLockCounts` per thread (blocked shard locks, the time blocked, the time held, shards left to the freeze); `N42_LIVE_INDEX_DEFER=1`: a shard still busy after the rotated pass and one more try is left to the freeze, which enters that batch's addresses there (same rules) before the conflicts' sums | `N42_LIVE_INDEX_DEFER=1`, default off |
+| 4724f2926 | `ThreadMark` / `BatchSpan` carry major faults, the view's waits, the hand-over's counts and the batch's open time; the seal-first line prints `live_index_defer`, `batch_majflt`, `batch_view_slot_waits`, `batch_view_slot_wait_us`, `batch_view_index_waits`, `batch_view_index_wait_us`, `batch_live_lock_waits`, `batch_live_lock_wait_us`, `batch_live_lock_hold_us`, `batch_live_deferred`, `batch_open_sum_us`, `batch_open_max_us` | always (observability) |
+| 337a6c65a | `scripts/fleet7-offcpu.sh` (+ `fleet7-offcpu-fold.py`): the build pool's off-CPU profile, without root | - |
 
 Equality: `a_live_index_with_shards_left_to_the_freeze_equals_the_direct_graft` (engine-types `tests/output_shards.rs`:
 every other shard of every batch left to the freeze, in order and reversed, and busy shards left by 16 concurrent

@@ -1021,3 +1021,92 @@ earlier fleet). Read, per window: `batch_cpu_sum_us` / `batch_wall_sum_us` and `
 `batch_ivcsw` (what the off-CPU half is), `view_journal_reads` / `view_journal_searches` / `view_journal_skips` (whether
 the reads walk journals), `par_exec_ms`, `root_writes_us`, `root_delta_us`, `roots_ms`, `seal_to_fields_us`,
 `sealed_at` p90, and the cycle. Correctness: `fields_mismatches` 0, `invalid_blocks` 0, `fleet7-verify` clean.
+
+## 14. E=1: what the batches wait on (2026-10-05, code and loop341 logs, no fleet leg)
+
+The question from 10.88: the build's batches are on the CPU 64-70% of their wall, with `batch_vcsw` 248-261 a block
+(~4.3 a batch, ~0.9 ms each), no preemption and few faults; 48 threads wait more (372-380, on-CPU 0.48). The bench
+(13.2) is 95% on the CPU. What do the batches block on?
+
+### 14.1 Where a batch can block, from the code
+
+A batch (`execute_for_build_opts`, `run_batch`, on the `n42-build-*` rayon pool) does, in order: open its view of
+the parent (`open()` -> `ParentStateOpener`), execute its transfers reading through the read stack (kept layers,
+the in-memory blocks behind their filters, the QMDB read view over the entry file), take its bundle, and hand it to
+the output shards (`OutputShards::add`, inside the batch's span). No rayon `join`/`scope` runs inside a batch, and
+no channel or condvar is waited on outside the open. The points that can sleep:
+
+| rank | point | what it waits on | who holds it during a build | what loop341 says |
+| --- | --- | --- | --- | --- |
+| 1 | the live index's shard locks in the hand-over (`OutputShards::enter_live`, `N42_OUTPUT_INDEX_LIVE=1`, 16 shards): a rotated `try_lock` pass, then a blocking `Mutex::lock` on every shard that was busy | another batch entering its addresses into that shard | the other batches' hand-overs, nobody else; a batch ending holds each of the 16 locks in turn | **this is it.** `shard_append_ms` (pool time inside `add`) is 251 / 253 ms a block on P / Pb against 227 / 227 ms off the CPU, r = +0.99 over 1,453 blocks; T48 541 against 520, r = +1.00. On every leg `append - off` is 24-29 ms (the hand-over's own CPU), i.e. **the batches' off-CPU time is the hand-over's waiting, all of it.** The J legs wait more (255-262 ms) because their batches are faster (`batch_cpu_max_ms` 10 against 12) and reach the hand-over together: the journal filter's gain went into the queue, which is why it moved nothing (10.88). With 48 threads, 10.8 ms a thread a block against 7.1 |
+| 2 | the QMDB read view's reader slot (`read_at`'s slot `RwLock`) and the offset index's shard `RwLock` (`SharedOffsetIndex::read`) | a publish (all 128 slot write locks, twice an `advance`), an `apply_sorted` run (one shard's write lock for its run of ~750 keys) | the persistence thread's `advance` (`N42_PERSIST_QMDB_IN_SCOPE=1`), once a persisted block | nothing correlates with the off-CPU time (`roots_ms`, `root_*`, journal reads: r -0.31..+0.16), and after the hand-over nothing is left to explain. Bounded small; counted now |
+| 3 | a major fault on the entry file (`EntryFileView`: a shared read-only mapping, `MADV_RANDOM`; a page not in the page cache is read from disk) or on a database page | the disk | - | `batch_minflt` ~1,100 a block, r ~0 with the off-CPU time; major faults were not logged (`root_majflt` 0 on the root's side). Counted now |
+| 4 | the batch's open of the parent (`open()`: the opener's waits for an ancestor -- `engine_landed`'s `Condvar`, `wait_for_state` -- the overlay filter cache's `Mutex`, the provider's version lookup) | the parent's output or import; the filter cache's lock | the engine, the other 57 opens | the builder's own open waits 0.3 ms (`state_wait_us` median 295); the batches' opens were not logged. Counted now |
+| - | jemalloc (`thp:always`, background thread): arena locks, a huge page zeroed or compacted | other threads of the arena; the kernel | - | faults are minor and uncorrelated; per-thread arenas |
+| - | `mmap_lock` under a fault | an `mmap`/`munmap` elsewhere in the process | - | per-VMA locks on this kernel; faults uncorrelated |
+| - | `batches` / `contracts` mutexes in `add`, the `CountedDb` passthrough, `convert` | one push a batch; transfers carry no code | - | - |
+
+Why ~0.9 ms a wait when a shard's insert for one batch is ~20-40 us: the batches of a wave end within a few ms of
+each other (`batch_txs_max` 3,500, the same shape), so ~29 hand-overs arrive at once and queue on the same 16
+locks; each blocked `lock` is a futex sleep and a wake-up, and the queue behind a shard is the sum of the holders
+ahead plus each one's wake-up latency. 48 threads make the queues longer, which is T48's 380 switches and 0.48.
+
+### 14.2 What was changed
+
+| commit | change | switch |
+| --- | --- | --- |
+| 09fdadb38 | `twig-core` `thread_read_waits()`: offset-index reads that found their shard held, count and ns (a failed `try_read` alone is timed) | always (observability) |
+| 3e353d195 | `qmdb-reth` `ViewLockWaits`: reader-slot and index-shard waits per thread | always (observability) |
+| (this round) | `OutputShards`: `LiveLockCounts` per thread (blocked shard locks, the time blocked, the time held, shards left to the freeze); `N42_LIVE_INDEX_DEFER=1`: a shard still busy after the rotated pass and one more try is left to the freeze, which enters that batch's addresses there (same rules) before the conflicts' sums | `N42_LIVE_INDEX_DEFER=1`, default off |
+| (this round) | `ThreadMark` / `BatchSpan` carry major faults, the view's waits, the hand-over's counts and the batch's open time; the seal-first line prints `live_index_defer`, `batch_majflt`, `batch_view_slot_waits`, `batch_view_slot_wait_us`, `batch_view_index_waits`, `batch_view_index_wait_us`, `batch_live_lock_waits`, `batch_live_lock_wait_us`, `batch_live_lock_hold_us`, `batch_live_deferred`, `batch_open_sum_us`, `batch_open_max_us` | always (observability) |
+| (this round) | `scripts/fleet7-offcpu.sh` (+ `fleet7-offcpu-fold.py`): the build pool's off-CPU profile, without root | - |
+
+Equality: `a_live_index_with_shards_left_to_the_freeze_equals_the_direct_graft` (engine-types `tests/output_shards.rs`:
+every other shard of every batch left to the freeze, in order and reversed, and busy shards left by 16 concurrent
+hand-overs, at 1, 16 and 64 shards: accounts, contracts, reverts and sizes equal the direct graft's). The order the
+batches enter a shard was already arbitrary under the live index (the order they ended), and every rule there is
+indifferent to it; the freeze enters left shards after the live ones, in batch-number order. The counters change no
+answer: `a_read_behind_a_held_shard_is_counted_as_a_wait_and_answers_the_same` (twig-core),
+`a_read_behind_a_publish_is_counted_and_answers_the_same` (qmdb-reth).
+
+### 14.3 The off-CPU profile (`scripts/fleet7-offcpu.sh`)
+
+`perf_event_paranoid` is 1 on this host and `/sys/kernel/tracing` is root's, so the sched tracepoints, `perf sched`
+and `perf record --off-cpu` need root. Without it: the `context-switches` software event sampled at every
+switch-out with the call stack, and `--switch-events` (a timestamped OUT, `preempt` when involuntary, and IN, per
+thread); a sample's off-CPU time is its OUT to the thread's next IN. Kernel frames stay unnamed (`kptr_restrict` 1);
+`/proc/<tid>/wchan`, readable by the owner, is sampled beside it at ~1 kHz for the kernel side (`futex_do_wait` for
+a lock, `folio_wait_bit*`/`filemap_fault` for a file read). Recipe for the runner:
+
+```bash
+CARGO_TARGET_DIR=/data/n42-build/<dir> cargo build --profile profiling -p n42 -p n42-h2-node --bins --examples
+# the leg with F7_BIN=<that dir>/profiling; in window 1 (after the flood's funding and the first window's start):
+scripts/fleet7-offcpu.sh --dry-run --node 0 --secs 10 <dir>/offcpu-<tag>     # pid, build-pool tids, commands
+scripts/fleet7-offcpu.sh --node 0 --secs 10 [--delay <s>] <dir>/offcpu-<tag>
+#   = perf record -e context-switches -c 1 --switch-events --call-graph dwarf,16384 -t <n42-build-* tids> \
+#       -o <prefix>.data -- sleep 10      (+ the wchan sampler)
+# after the leg, with the box returned:
+scripts/fleet7-offcpu.sh --report <dir>/offcpu-<tag>
+#   = perf script -i <prefix>.data --no-inline --show-switch-events -F comm,tid,time,event,ip,sym
+#       | fleet7-offcpu-fold.py <prefix>   -> time off the CPU by blocking site, <prefix>.offcpu.folded
+```
+
+With root the same answer with kernel names: `perf record -e sched:sched_switch -e sched:sched_wakeup -g -t <tids>
+-- sleep 10`, then `perf sched timehist -V --state`. The recording copies 16 KB of stack at each of ~4,000
+switches a second: a profiled window is not a measured one.
+
+### 14.4 What the next leg must read
+
+Base P (10.88). Pair P / Pb against P + `N42_LIVE_INDEX_DEFER=1` twice (D / Db); one T48 + defer leg. Per window:
+- `batch_live_lock_waits` / `batch_live_lock_wait_us` on P (expected ~250 and ~220,000: the waits named) and on D
+  (expected ~0, with `batch_live_deferred` the shards moved and `batch_live_lock_hold_us` ~25,000 either way);
+- `batch_wall_sum_us - batch_cpu_sum_us` and `batch_vcsw` (expected to fall from ~227 ms / ~255 to tens), the
+  on-CPU share, `batch_max_ms` (20 -> ~12), `par_exec_ms` (30 -> low 20s if the second wave starts sooner),
+  `shard_append_ms` (251 -> ~27);
+- the cost moved: `shard_fold_ms` / the "output shards folded" line's `index_build_us` and `task_max_us`
+  (the left shards entered at the freeze), `seal_to_fields_us`, `roots_ms`;
+- the residual candidates: `batch_view_slot_waits`, `batch_view_index_waits` (and their us), `batch_majflt`,
+  `batch_open_sum_us` / `batch_open_max_us` -- if the off-CPU time does not fall with the defer, these name what
+  is left; then the off-CPU profile of 14.3 on one D leg;
+- `sealed_at` median / p90, the cycle, the rate; correctness `fields_mismatches` 0, `invalid_blocks` 0,
+  `fleet7-verify` clean.

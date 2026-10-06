@@ -320,6 +320,25 @@
   `view_journal_reads`、`view_journal_searches`、`view_journal_skips`（视图读走过的 journal，进程范围，每线程
   每 4096 次读汇总一次）。
 
+## E=1 batch 离开 CPU 的去处：一个开关与新的观测字段（不改任何 fork 的 reth crate）:
+`docs/SHARED_EXECUTION_SCOPE.md` 第 14 节。loop341 的日志显示 batch 离开 CPU 的时间几乎全部在输出分片的交接
+（`OutputShards::add`）里：每块 `shard_append_ms` 251 ms 对离开 CPU 227 ms（P，1,453 块 r = 0.99；T48 541 对 520）。
+- `N42_LIVE_INDEX_DEFER=1`（默认关；只在 `N42_OUTPUT_INDEX_LIVE=1` 下起作用；代码在
+  `crates/n42/engine-types/src/output_shards.rs` `enter_live` / `freeze_live`）：batch 交接时，轮转一遍和再试一次
+  都拿不到锁的分片不再阻塞等待，而是记在该 batch 上，由 freeze 在汇总冲突之前按 batch 编号补录（规则与交接
+  时相同）。产出的索引、冲突账户与保留的 revert 与直接 graft 相同（`tests/output_shards.rs`
+  `a_live_index_with_shards_left_to_the_freeze_equals_the_direct_graft`，1/16/64 分片、正序/倒序、并发）。
+  代价：补录的插入移到 freeze（seal 之后、根之前）。
+- 恒开（纯观测）：seal-first 阶段行新增 `live_index_defer`、`batch_majflt`（主缺页：文件页读盘）、
+  `batch_view_slot_waits` / `batch_view_slot_wait_us`（QMDB 读视图的 reader slot 被 publish 占住）、
+  `batch_view_index_waits` / `batch_view_index_wait_us`（offset 索引分片被 advance 的写锁占住）、
+  `batch_live_lock_waits` / `batch_live_lock_wait_us` / `batch_live_lock_hold_us` / `batch_live_deferred`（交接的
+  分片锁：阻塞次数与时间、持有时间、留给 freeze 的分片数）、`batch_open_sum_us` / `batch_open_max_us`（每个 batch
+  打开父状态视图的时间）。锁等待只在 `try_lock` / `try_read` 失败时计时（线程局部计数，无系统调用）；
+  `twig-core` `thread_read_waits()`、`qmdb-reth` `ViewLockWaits`、`output_shards::LiveLockCounts`。
+- `scripts/fleet7-offcpu.sh`：build 池线程的 off-CPU 剖析（`context-switches` 软件事件 + `--switch-events`，
+  无需 root；旁边采样 `/proc/<tid>/wchan`），`--report` 按调用栈汇总离开 CPU 的时间。
+
 ## HotStuff-2 结算标签（不改任何 fork 的 reth crate）:
 - `N42_SETTLEMENT_TAGS=split|legacy`（默认 `split`；代码在 `crates/n42/h2-execution/src/settlement.rs`，
   由 `ExecutionDriver` 的每个 forkchoice 使用）：`latest` = 共识已提交的块；`safe` = 执行已认证的块

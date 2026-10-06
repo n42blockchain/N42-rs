@@ -100,7 +100,7 @@ impl ForestCheckpoint {
     pub const VERSION: u32 = 1;
 
     /// Moves this checkpoint forward by one delta: the cursor to the delta's
-    /// (truncating first on a rewind), the appended range live, the changed
+    /// (truncating first on a rewind), the appended entries' active flags, the changed
     /// slots to their flags. The entries themselves are in the file.
     pub fn apply_delta(&mut self, delta: &ForestDelta) -> Result<(), StateError> {
         if delta.version != ForestDelta::VERSION {
@@ -109,21 +109,45 @@ impl ForestCheckpoint {
         if delta.base_next_slot > self.next_slot {
             return Err(StateError::DeltaBase { expected: self.next_slot, found: delta.base_next_slot });
         }
+        // File-backed deltas omit appended payloads: their entries are
+        // already durable in the entry file. Heap deltas carry the span.
+        if !delta.appended.is_empty() {
+            delta.validate_span()?;
+        }
+        if delta.next_slot < delta.base_next_slot
+            || usize::try_from(delta.next_slot).ok().and_then(|n| n.checked_add(63)).is_none()
+        {
+            return Err(StateError::DeltaBase { expected: delta.base_next_slot, found: delta.next_slot });
+        }
         let words = |slots: u64| (slots as usize).div_ceil(64);
+        for (slot, active) in &delta.changed {
+            if *slot >= delta.next_slot
+                || (*slot < delta.base_next_slot && (*slot / 64) as usize >= self.active.len())
+                || (*slot >= delta.base_next_slot && (!delta.appended.is_empty() || *active))
+            {
+                return Err(StateError::DeltaSlot(*slot));
+            }
+        }
         // Truncate to the base.
         self.active.truncate(words(delta.base_next_slot));
         for slot in delta.base_next_slot..(self.active.len() as u64 * 64) {
             self.active[(slot / 64) as usize] &= !(1 << (slot % 64));
         }
-        // The appended range is live.
+        // A delta may span several blocks: an entry appended early in it
+        // can already have been retired by a later block.
         self.active.resize(words(delta.next_slot), 0);
-        for slot in delta.base_next_slot..delta.next_slot {
-            self.active[(slot / 64) as usize] |= 1 << (slot % 64);
+        if delta.appended.is_empty() {
+            for slot in delta.base_next_slot..delta.next_slot {
+                self.active[(slot / 64) as usize] |= 1 << (slot % 64);
+            }
+        }
+        for (offset, entry) in delta.appended.iter().enumerate() {
+            let slot = delta.base_next_slot + offset as u64;
+            if entry.active {
+                self.active[(slot / 64) as usize] |= 1 << (slot % 64);
+            }
         }
         for (slot, active) in &delta.changed {
-            if *slot >= delta.base_next_slot {
-                return Err(StateError::DeltaSlot(*slot));
-            }
             let word = (*slot / 64) as usize;
             if *active {
                 self.active[word] |= 1 << (*slot % 64);
@@ -180,24 +204,18 @@ impl ForestSnapshot {
                 found: delta.base_next_slot,
             });
         }
-        if delta.base_next_slot < self.tree.next_slot {
-            self.tree.entries.truncate(delta.base_next_slot as usize);
-            self.tree.next_slot = delta.base_next_slot;
-        }
         // Everything is checked before anything is written. A delta that fails
         // halfway leaves a snapshot that is neither state, and a caller holding
         // one has no way to tell.
-        if delta.base_next_slot + delta.appended.len() as u64 != delta.next_slot {
-            return Err(StateError::DeltaBase {
-                expected: delta.next_slot,
-                found: delta.base_next_slot + delta.appended.len() as u64,
-            });
-        }
+        delta.validate_span()?;
         for (slot, _) in &delta.changed {
             let index = usize::try_from(*slot).map_err(|_| StateError::DeltaSlot(*slot))?;
-            if index >= self.tree.entries.len() {
+            if *slot >= delta.base_next_slot || index >= self.tree.entries.len() {
                 return Err(StateError::DeltaSlot(*slot));
             }
+        }
+        if delta.base_next_slot < self.tree.next_slot {
+            self.tree.entries.truncate(delta.base_next_slot as usize);
         }
         for (slot, active) in &delta.changed {
             self.tree.entries[*slot as usize].active = *active;
@@ -236,12 +254,25 @@ pub struct ForestDelta {
     /// slot's content never changes after its append, so this is all a
     /// delta has to say about it (version 2; version 1 carried the entry,
     /// which cost 133,000 random reads of the retired slots a block).
+    /// File-backed deltas also carry false flags for appended slots retired
+    /// within this delta, since their entry payloads are omitted.
     pub changed: Vec<(u64, bool)>,
 }
 
 impl ForestDelta {
     /// The layout this crate writes.
     pub const VERSION: u32 = 2;
+
+    fn validate_span(&self) -> Result<(), StateError> {
+        let end = self.base_next_slot.checked_add(self.appended.len() as u64);
+        if end != Some(self.next_slot) {
+            return Err(StateError::DeltaBase {
+                expected: self.next_slot,
+                found: end.unwrap_or(u64::MAX),
+            });
+        }
+        Ok(())
+    }
 
     /// Roughly what this costs to store, for a caller deciding when a run of
     /// deltas has grown longer than the checkpoint it is replacing.
@@ -1028,21 +1059,25 @@ impl QmdbForest {
         // those slots travel as appends (the replay truncates to the base
         // first). Below that, the slots a move flipped travel as flags.
         let base = self.min_cursor.min(base_next_slot);
-        let appended = if self.tree.entry_file().is_some() {
+        let file_backed = self.tree.entry_file().is_some();
+        let appended = if file_backed {
             Vec::new()
         } else {
             (base..next_slot)
                 .map(|slot| self.tree.entry_at(slot).ok_or(StateError::DeltaSlot(slot)))
                 .collect::<Result<Vec<_>, _>>()?
         };
-        self.dirty_slots.retain(|slot| *slot < base);
+        self.dirty_slots.retain(|slot| *slot < if file_backed { next_slot } else { base });
         self.dirty_slots.sort_unstable();
         self.dirty_slots.dedup();
-        let changed = self
+        let mut changed = self
             .dirty_slots
             .iter()
             .map(|slot| self.tree.slot_active(*slot).map(|active| (*slot, active)).ok_or(StateError::DeltaSlot(*slot)))
             .collect::<Result<Vec<_>, _>>()?;
+        if file_backed {
+            changed.retain(|(slot, active)| *slot < base || !*active);
+        }
         self.dirty_slots.clear();
         self.dirty_slots_deduped = 0;
         self.min_cursor = next_slot;
@@ -1256,6 +1291,81 @@ mod tests {
 
     fn h(byte: u8) -> B256 {
         B256::repeat_byte(byte)
+    }
+
+    fn checkpoint_from(snapshot: &ForestSnapshot) -> ForestCheckpoint {
+        let mut active = vec![0u64; (snapshot.tree.next_slot as usize).div_ceil(64)];
+        for (slot, entry) in snapshot.tree.entries.iter().enumerate() {
+            if entry.active {
+                active[slot / 64] |= 1 << (slot % 64);
+            }
+        }
+        ForestCheckpoint {
+            version: ForestCheckpoint::VERSION,
+            head_number: snapshot.head_number,
+            head_hash: snapshot.head_hash,
+            next_slot: snapshot.tree.next_slot,
+            active,
+        }
+    }
+
+    #[test]
+    fn a_multi_block_checkpoint_delta_keeps_retired_appends_inactive() {
+        for file_backed in [false, true] {
+            let mut forest = QmdbForest::genesis(GENESIS, &changes(1)).unwrap();
+            let path = std::env::temp_dir().join(format!("n42-audit-delta-{}.entries", std::process::id()));
+            if file_backed {
+                let _ = std::fs::remove_file(&path);
+                forest = forest.with_entry_file(&path).unwrap();
+            }
+            let base = forest.snapshot().unwrap();
+            let mut checkpoint = checkpoint_from(&base);
+            forest.apply(GENESIS, h(1), 1, &changes(1)).unwrap();
+            forest.apply(h(1), h(2), 2, &changes(1)).unwrap();
+            forest.set_canonical(h(2)).unwrap();
+            let delta = forest.delta_since(base.tree.next_slot).unwrap();
+            if file_backed {
+                assert!(delta.appended.is_empty());
+                assert!(delta.changed.iter().any(|(slot, active)| *slot >= delta.base_next_slot && !*active));
+            } else {
+                assert!(delta.appended.iter().any(|entry| !entry.active));
+            }
+            checkpoint.apply_delta(&delta).unwrap();
+            assert_eq!(checkpoint, checkpoint_from(&forest.snapshot().unwrap()));
+            drop(forest);
+            if file_backed {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_rewind_deltas_leave_snapshot_and_checkpoint_unchanged() {
+        let mut forest = QmdbForest::genesis(GENESIS, &changes(1)).unwrap();
+        let base = forest.snapshot().unwrap();
+        let checkpoint = checkpoint_from(&base);
+        for (next_slot, changed) in [(1, vec![]), (0, vec![(0, false)]), (u64::MAX, vec![])] {
+            let delta = ForestDelta {
+                version: ForestDelta::VERSION,
+                head_number: 1,
+                head_hash: h(1),
+                base_next_slot: 0,
+                next_slot,
+                appended: if next_slot == 1 {
+                    vec![base.tree.entries[0].clone(); 2]
+                } else {
+                    Vec::new()
+                },
+                changed,
+            };
+            let mut snapshot = base.clone();
+            assert!(snapshot.apply_delta(&delta).is_err());
+            assert_eq!(snapshot.tree, base.tree);
+            assert_eq!((snapshot.head_number, snapshot.head_hash), (base.head_number, base.head_hash));
+            let mut replayed = checkpoint.clone();
+            assert!(replayed.apply_delta(&delta).is_err());
+            assert_eq!(replayed, checkpoint);
+        }
     }
 
     #[test]

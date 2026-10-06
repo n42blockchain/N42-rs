@@ -359,6 +359,9 @@ fn decode_account(value: &[u8]) -> Option<Account> {
         loop {
             let byte = *value.get(at)?;
             at += 1;
+            if shift == 63 && byte > 1 {
+                return None;
+            }
             nonce |= u64::from(byte & 0x7f).checked_shl(shift)?;
             if byte & 0x80 == 0 {
                 break;
@@ -715,6 +718,16 @@ mod tests {
         }
         assert_eq!(decode_account(&[]), None);
         assert_eq!(decode_account(&[2, 5, 1]), None, "a truncated balance");
+    }
+
+    #[test]
+    fn an_overflowing_account_nonce_is_declined() {
+        for last in [2, 0x7f, 0x80, 0xff] {
+            let mut value = vec![1];
+            value.extend_from_slice(&[0x80; 9]);
+            value.push(last);
+            assert_eq!(decode_account(&value), None, "overflow must not become a different nonce");
+        }
     }
 
     /// Concurrent reads of the view (plan v6, the read view's contention):

@@ -83,7 +83,9 @@ cmd_up() {
   done
   echo "execution layers up"
 
-  for ((i = 0; i < F7_NODES; i++)); do
+  # View 1 belongs to validator 0. Bring its followers' listeners up first,
+  # so the first direct-push proposal can reach a quorum during startup.
+  for ((i = F7_NODES - 1; i >= 0; i--)); do
     d=$(f7_node_dir "$i")
     pin=$(f7_pin_validator "$i")
     f7_validator_args "$i"

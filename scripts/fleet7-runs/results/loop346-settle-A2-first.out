@@ -1,0 +1,12 @@
+  19:45:02 latest (3103, '0x47c8a10e13'), safe (3103, '0x47c8a10e13'), finalized (3103, '0x47c8a10e13'); latest-safe 0, latest-finalized 0
+  19:45:04 latest (3136, '0xd85fc66aa3'), safe (3136, '0xd85fc66aa3'), finalized (3136, '0xd85fc66aa3'); latest-safe 0, latest-finalized 0
+  19:45:06 latest (3168, '0xf67672b8f0'), safe (3168, '0xf67672b8f0'), finalized (3168, '0xf67672b8f0'); latest-safe 0, latest-finalized 0
+  19:45:08 latest (3201, '0x6d311ba5ac'), safe (3201, '0x6d311ba5ac'), finalized (3201, '0x6d311ba5ac'); latest-safe 0, latest-finalized 0
+  settlement / forkchoice error lines (-3800x, refused, unknown ancestor, ParentUnknown): 2076
+     ('node0', '2026-10-07T23:42:15.358413Z  INFO n42.h2.el: commit forkchoice block=0x828ac28cdf1d47b6474ad63a1684bd48caf0e9866b94914344c74d624e3714ab elapsed_ms=71 ahead_of_import=false outcome=error: execution lay')
+     ('node0', '2026-10-07T23:42:15.358416Z  WARN n42.h2.el: forkchoice to a committed block failed block=0x828ac28cdf1d47b6474ad63a1684bd48caf0e9866b94914344c74d624e3714ab error=execution layer: Too deep reorg (code')
+     ('node0', '2026-10-07T23:42:15.777139Z  INFO n42.h2.el: commit forkchoice block=0xb83cd88521f1c671ab1017b61a48a6cd8ba301b9fb7e163985266b0db6b0ff3f elapsed_ms=43 ahead_of_import=false outcome=error: execution lay')
+     ('node0', '2026-10-07T23:42:15.777157Z  WARN n42.h2.el: forkchoice to a committed block failed block=0xb83cd88521f1c671ab1017b61a48a6cd8ba301b9fb7e163985266b0db6b0ff3f error=execution layer: Too deep reorg (code')
+     ('node0', '2026-10-07T23:42:17.730363Z  INFO n42.h2.el: commit forkchoice block=0x4601add31a28e80029680ce47ba8c43440f84b35c1dc0fe4dd7d842beb6e6cb1 elapsed_ms=76 ahead_of_import=false outcome=error: execution lay')
+     ('node0', '2026-10-07T23:42:17.730370Z  WARN n42.h2.el: forkchoice to a committed block failed block=0x4601add31a28e80029680ce47ba8c43440f84b35c1dc0fe4dd7d842beb6e6cb1 error=execution layer: Too deep reorg (code')
+RESULT BAD: error lines

@@ -14,6 +14,7 @@
 //! pass (cold), then read again (warm). QMDB in file mode reads its whole entry file when it opens, so
 //! only its warm pass means anything. Values are decoded on both sides.
 
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -60,10 +61,14 @@ fn decode_gov5_account(value: &[u8]) -> (u64, U256, Option<B256>) {
     (nonce, balance, code)
 }
 
-fn advise_out(path: &Path) {
+fn advise_out(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
     if let Ok(file) = std::fs::File::open(path) {
-        unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        return unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) } == 0;
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = path;
+    false
 }
 
 fn samples(recipients: u32, n: usize) -> Vec<Address> {
@@ -126,7 +131,7 @@ fn main() -> eyre::Result<()> {
     let addresses = samples(recipients, n);
 
     // MDBX, cold then warm.
-    advise_out(&mdbx_dir.join("mdbx.dat"));
+    let advised_cold = advise_out(&mdbx_dir.join("mdbx.dat"));
     let db = reth_db::open_db_read_only(&mdbx_dir, DatabaseArguments::default())?;
     let mdbx_pass = |label: &str, threads: usize| -> eyre::Result<Vec<Option<(u64, U256)>>> {
         let started = Instant::now();
@@ -164,7 +169,7 @@ fn main() -> eyre::Result<()> {
         summary(label, threads, lat, wall, found);
         Ok(out)
     };
-    let mdbx_values = mdbx_pass("mdbx-cold", 1)?;
+    let mdbx_values = mdbx_pass(if advised_cold { "mdbx-cold" } else { "mdbx-first-pass" }, 1)?;
     for &threads in &thread_list {
         mdbx_pass("mdbx-warm", threads)?;
     }

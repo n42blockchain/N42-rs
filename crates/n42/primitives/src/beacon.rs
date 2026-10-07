@@ -25,7 +25,7 @@ use crate::committee_cache::CommitteeCache;
 use crate::safe_arith::SafeArith;
 use crate::safe_arith::SafeArithIter;
 use crate::{activation_queue::ActivationQueue, CommitteeIndex, Hash256, Slot, Validator};
-use derivative::Derivative;
+use educe::Educe;
 use ethereum_hashing::hash;
 use merkle_db_rs::tree::VecTree;
 use std::collections::{BTreeMap, HashMap};
@@ -218,8 +218,8 @@ pub struct BeaconBlockChangeset {
     pub beaconblocks: Vec<(BlockHash, BeaconBlock)>,
 }
 
-#[derive(Derivative, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
-#[derivative(Debug)]
+#[derive(Educe, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[educe(Debug)]
 pub struct BeaconState {
     pub slot: u64,
     pub eth1_deposit_index: u64,
@@ -229,7 +229,7 @@ pub struct BeaconState {
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
-    #[derivative(Debug = "ignore")]
+    #[educe(Debug(ignore))]
     pub validators_store: VecTree<Validator, U100000>,
 
     //pub balances: Vec<Gwei>,
@@ -238,7 +238,7 @@ pub struct BeaconState {
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
-    #[derivative(Debug = "ignore")]
+    #[educe(Debug(ignore))]
     pub balances_store: VecTree<Gwei, U100000>,
 
     //pub inactivity_scores: Vec<u64>,
@@ -247,7 +247,7 @@ pub struct BeaconState {
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
-    #[derivative(Debug = "ignore")]
+    #[educe(Debug(ignore))]
     pub inactivity_scores_store: VecTree<u64, U100000>,
 
     pub randao_mix: B256,
@@ -266,12 +266,12 @@ pub struct BeaconState {
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
-    #[derivative(Debug = "ignore")]
+    #[educe(Debug(ignore))]
     pub epoch_attester_indexes_store: VecTree<u64, U100000>,
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
-    #[derivative(Debug = "ignore")]
+    #[educe(Debug(ignore))]
     pub epoch_attester_indexes_set: BTreeSet<u64>,
 }
 

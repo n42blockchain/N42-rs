@@ -1,0 +1,10 @@
+[package]
+name = "n42-dependency-compat-tests"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+[dev-dependencies]
+ruint = { version = "1.20.1", features = ["ark-ff", "ark-ff-04", "ark-ff-05"] }
+ark-ff = "0.4.2"
+sled = "0.34.7"

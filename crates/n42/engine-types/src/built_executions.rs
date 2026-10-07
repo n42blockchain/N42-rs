@@ -684,7 +684,7 @@ mod tests {
             seed ^= seed >> 7;
             seed ^= seed << 17;
             // Some hashes come back (a re-put), most are new.
-            let hash = B256::from(U256::from(if seed % 5 == 0 { seed % 7 } else { 1_000 + n }));
+            let hash = B256::from(U256::from(if seed.is_multiple_of(5) { seed % 7 } else { 1_000 + n }));
             let stage = match seed % 4 {
                 0 => Stage::Sealed,
                 1 => Stage::StateReady,

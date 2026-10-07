@@ -4904,7 +4904,6 @@ mod plan_body_tests {
     use crate::parallel_transfer::{execute_for_build_counted_dispatch, partition_by_sender, BodyAhead, PreparedExec};
     use alloy_primitives::{Address, Bytes};
     use n42_tx_types::{AltSigTx, N42TxEnvelope, TxAltSig, ALG_ED25519};
-    use reth_evm::ConfigureEvm as _;
     use reth_primitives_traits::Recovered;
     use reth_transaction_pool::{
         identifier::{SenderId, TransactionId},

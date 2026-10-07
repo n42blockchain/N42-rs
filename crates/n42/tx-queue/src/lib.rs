@@ -880,6 +880,10 @@ pub type PreparedBody = Box<dyn Any + Send + Sync>;
 /// lanes' lock is released; `None` makes no body.
 pub type PlanAheadHook<T> = Arc<dyn Fn(&[(FrameTxs<T>, usize)]) -> Option<PreparedBody> + Send + Sync>;
 
+/// A prepared plan's segments and its body's slot, for the hook to fill
+/// after the lanes' lock is released.
+type BodyJob<T> = (Vec<(FrameTxs<T>, usize)>, Arc<Mutex<BodySlot>>);
+
 /// A prepared plan's body, filled by the hook once it ran.
 #[derive(Default)]
 struct BodySlot {
@@ -2683,7 +2687,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         let mut garbage = PruneGarbage::default();
         let hook = self.ahead_hook.lock().clone();
         // The plan's segments and its body's slot, for the hook after the lock.
-        let mut body_job: Option<(Vec<(FrameTxs<T>, usize)>, Arc<Mutex<BodySlot>>)> = None;
+        let mut body_job: Option<BodyJob<T>> = None;
         let prepared = {
             let mut inner = self.lock_inner();
             self.drain_inbox(&mut inner);
@@ -2787,7 +2791,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         let mut inner = self.lock_inner();
         times.lock_us = at.elapsed().as_micros() as u64;
         let build = inner.builds;
-        let Some((built_on, taken)) = inner.last_build.as_mut() else { return None };
+        let (built_on, taken) = inner.last_build.as_mut()?;
         if *built_on != parent || taken.len() != len || len == 0 {
             return None;
         }

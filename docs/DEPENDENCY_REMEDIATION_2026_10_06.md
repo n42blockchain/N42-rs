@@ -61,6 +61,7 @@ cargo test --locked -p n42-primitives -p n42-h2-consensus -p n42-h2-primitives -
 
 - `cargo test -p reth-nippy-jar --lib`：`/tmp/n42-nippy-maintained-tests-final.log`。将该本地补丁列为 workspace member 后执行；锁文件随后已固定。
 - `cargo test --locked -p reth-db-api --lib`：`/tmp/n42-fuzz-maintained-tests.log`。
+- `cargo test --locked -p n42-dependency-compat-tests --features sled/docs --lib`：可选文档功能编译、2 项兼容性测试通过，不重复计入总数。日志 `/tmp/n42-sled-doc-feature-tests.log`。
 - `cargo check --locked -p n42 --bin n42 --lib`：`/tmp/n42-maintained-main-check.log`。
 - `cargo check --locked -p reth-rpc-types-compat --features op`：`/tmp/n42-maintained-op-check-final.log`。
 
@@ -72,4 +73,4 @@ cargo test --locked -p n42-primitives -p n42-h2-consensus -p n42-h2-primitives -
 
 本次在 macOS 上验证。没有运行真实链上交易、线上集群、Linux/Windows/wasm 主机验证、profiling/JIT 的全部可选功能或生产数据库升级；本地补丁覆盖这些包的依赖声明，不代表其所有功能都已执行验证。
 
-按密码学/ABI 宏、运行时/诊断宏、存储/fuzz 补丁、项目依赖适配、基准平台修复、报告拆为六组英文修复提交。首次两次推送被远端新增提交拒绝；获取后确认仅新增六个 fleet runner 脚本，以英文合并提交保留远端三次提交和本地改动，再继续推送。每次成功推送均核对远端提交号。新增脚本没有改变被验证的依赖或 Rust 代码，未执行这些脚本。没有合并至默认分支；GitHub 默认分支告警需等待合并后的扫描。
+按密码学/ABI 宏、运行时/诊断宏、存储/fuzz 补丁、项目依赖适配、基准平台修复、报告拆为六组英文修复提交；提交后补充核对发现 sled 的上游 .gitignore 排除了三个原始文件，另以第七次修复提交补齐。首次两次推送被远端新增提交拒绝；获取后确认仅新增六个 fleet runner 脚本，以英文合并提交保留远端三次提交和本地改动，再继续推送。每次成功推送均核对远端提交号。新增脚本没有改变被验证的依赖或 Rust 代码，未执行这些脚本。没有合并至默认分支；GitHub 默认分支告警需等待合并后的扫描。

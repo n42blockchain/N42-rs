@@ -135,7 +135,7 @@ Method: grep for every reader of `deferred_execution_*`, `executed_fields::`, `p
 caller to see whether it needs the parent's *result* (a header input or a check) or the parent's *output* (state to
 execute or check on). Result: **17 places assume depth 1 (15 rule or semantics, 2 capacity), 6 read the parent's
 fields without needing them at depth 1 either (benign), and nothing in the build or the includability check reads the
-parent's fields as an input** (they read its output). The three hardest are items 5, 8 and 15.
+parent's fields as an input** (they read its output). The three hardest are items 5, 8 and 14 (section 2.3).
 
 ### 2.1 The claim to verify: N reads N-1's output, never its fields
 

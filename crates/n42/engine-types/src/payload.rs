@@ -715,6 +715,79 @@ fn pooled_consensus<P: PoolTransaction<Consensus = TransactionSigned>>(
     tx.transaction.consensus_ref().into_inner()
 }
 
+/// A candidate's (sender, recipient) when it is a plain transfer the parallel
+/// step takes -- the prep's check -- and `None` otherwise.
+fn transfer_key<P: PoolTransaction<Consensus = TransactionSigned>>(
+    tx: &reth_transaction_pool::ValidPoolTransaction<P>,
+) -> Option<(alloy_primitives::Address, alloy_primitives::Address)> {
+    let inner = &tx.transaction;
+    (inner.gas_limit() == MIN_TRANSACTION_GAS
+        && inner.input().is_empty()
+        && !inner.is_create()
+        && inner.access_list().is_none_or(|list| list.is_empty())
+        && !inner.is_eip4844()
+        && !inner.is_eip7702())
+    .then(|| (tx.sender(), inner.to().unwrap_or_default()))
+}
+
+/// The plan-ahead hook's work (`N42_PLAN_AHEAD_BODY=1`): from a prepared
+/// plan's segments, on the plan body's own pool, the candidates in plan
+/// order, their transfer keys, the body's transactions and senders and the
+/// hashes, the partition at the beneficiary this node builds for, and the
+/// empty slots -- what the next build's start, prep and gap made. `None`
+/// when not every candidate is a plain transfer (the build preps as before).
+fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
+    segments: &[(n42_tx_queue::FrameTxs<P>, usize)],
+) -> Option<crate::frame_blocks::PreparedBuild<P>> {
+    use rayon::prelude::*;
+    let at = std::time::Instant::now();
+    let pool = crate::parallel_transfer::plan_body_pool();
+    let parts: Vec<Vec<Arc<reth_transaction_pool::ValidPoolTransaction<P>>>> = pool.install(|| {
+        segments.par_iter().map(|(txs, taken)| txs.get(..*taken).map_or_else(Vec::new, <[_]>::to_vec)).collect()
+    });
+    let mut cands = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for part in parts {
+        cands.extend(part);
+    }
+    if cands.is_empty() {
+        return None;
+    }
+    // The prep's own pass, with no tip: the batches read the tips at the
+    // block's base fee (`N42_SEAL_ON_COUNTERS`), which this cannot know.
+    let (keys, made) = crate::parallel_transfer::BodyAhead::make_keyed_on(pool, &cands, |_, tx| {
+        (transfer_key(tx), pooled_consensus(tx).clone(), tx.sender(), 0)
+    })?;
+    if keys.is_empty() {
+        return None;
+    }
+    let hashes: Vec<B256> = pool.install(|| cands.par_iter().with_min_len(4096).map(|tx| *tx.hash()).collect());
+    let groups = crate::frame_blocks::noted_beneficiary().and_then(|beneficiary| {
+        crate::parallel_transfer::partition_by_sender(&keys, beneficiary).ok().map(|groups| (beneficiary, groups))
+    });
+    let slots = crate::parallel_transfer::empty_slots(pool, cands.len());
+    Some(crate::frame_blocks::PreparedBuild {
+        segments: segments.to_vec(),
+        cands,
+        keys,
+        transactions: made.transactions,
+        senders: made.senders,
+        hashes,
+        groups,
+        slots,
+        made_us: at.elapsed().as_micros() as u64,
+    })
+}
+
+/// Installs the plan-ahead hook on the queue once (`N42_PLAN_AHEAD_BODY=1`).
+fn install_plan_ahead_body<P: PoolTransaction<Consensus = TransactionSigned>>(queue: &n42_tx_queue::TxQueue<P>) {
+    if queue.has_plan_ahead_hook() {
+        return;
+    }
+    queue.set_plan_ahead_hook(Arc::new(|segments: &[(n42_tx_queue::FrameTxs<P>, usize)]| {
+        make_prepared_build(segments).map(|made| Box::new(made) as n42_tx_queue::PreparedBody)
+    }));
+}
+
 /// The cumulative gas through each transaction of a block the parallel step
 /// left in its slots, in block order, and the block's gas.
 fn cumulative_gas(
@@ -1227,6 +1300,14 @@ where
     // vector out of the plan's frames, which only the parallel step with the
     // puller consumes (`frame_blocks::take_bulk`).
     crate::frame_blocks::want_bulk(parallel_build() && builder_puller() != 0);
+    // `N42_PLAN_AHEAD_BODY=1`: the queue makes the next block's body with its
+    // plan; the partition is made at this build's beneficiary.
+    if crate::frame_blocks::plan_ahead_body_wanted()
+        && let Some(queue) = n42_tx_queue::global::<Pool::Transaction>()
+    {
+        crate::frame_blocks::note_beneficiary(group_env.block_env.beneficiary);
+        install_plan_ahead_body(&queue);
+    }
     let mut best_txs = best_txs(BestTransactionsAttributes::new(
         base_fee,
         builder
@@ -1238,6 +1319,10 @@ where
     let start_best_us = start_best_at.elapsed().as_micros() as u64;
     let start_best_ms = start_best_us / 1_000;
     let mut bulk = crate::frame_blocks::take_bulk::<Pool::Transaction>();
+    // `N42_PLAN_AHEAD_BODY=1`: what was made with the plan, its candidates
+    // already the bulk vector (always taken, so nothing is left behind).
+    let mut prepared_build = crate::frame_blocks::take_prepared::<Pool::Transaction>();
+    let from_bulk = bulk.is_some();
     crate::frame_blocks::want_bulk(false);
     // `N42_FRAME_BLOCKS=1`: the frames the selector just took, whose layout
     // the transactions root is sealed over (`frame_blocks::sealed_root`).
@@ -1585,6 +1670,15 @@ where
     // seal's start, us (the commit, the give-back and the match between).
     let mut seal_on_counters_used = false;
     let mut exec_end_to_seal_us = 0u64;
+    // `N42_PLAN_AHEAD_BODY=1`: the prep took the keys and body made with the
+    // plan; the call took its partition and slots; the hand-off of this
+    // block was noted as its whole take.
+    let mut prep_from_plan = false;
+    let mut exec_partition_us = 0u64;
+    let mut exec_slots_us = 0u64;
+    let mut exec_prepared_groups = false;
+    let mut exec_prepared_slots = false;
+    let mut whole_take_noted = false;
     // Of `give_back_ms`: the body checked against the pulled set.
     let mut match_ms = 0u64;
     // Of `sealed_ms`: the header filled and `cons.seal`; the sealed and
@@ -1790,7 +1884,18 @@ where
             // other (`par_prep_ms` 10, loop274). The sender is the one the
             // ingest recorded (the attested frame's, for 0x50); nothing is
             // hashed or recovered here.
-            let (all_transfers, keys, body_made) = crate::parallel_transfer::build_pool().install(|| {
+            // `N42_PLAN_AHEAD_BODY=1`: the keys and the body were made with the
+            // plan, from exactly these candidates (the bulk vector is the
+            // prepared one, uncut); nothing to read here.
+            let from_plan = body_at_prep
+                && prepared_build
+                    .as_ref()
+                    .is_some_and(|made| made.keys.len() == cands.len() && made.transactions.len() == cands.len());
+            prep_from_plan = from_plan;
+            let (all_transfers, keys, body_made) = if from_plan {
+                let keys = prepared_build.as_mut().map(|made| std::mem::take(&mut made.keys)).unwrap_or_default();
+                (!keys.is_empty(), keys, None)
+            } else { crate::parallel_transfer::build_pool().install(|| {
                 use rayon::prelude::*;
                 let transfer_key = |tx: &Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>| {
                     let inner = &tx.transaction;
@@ -1838,7 +1943,7 @@ where
                 } else {
                     (true, keys, None)
                 }
-            });
+            }) };
             par_prep_ms = prep_at.elapsed().as_millis() as u64;
             (all_transfers, keys, body_made, std::time::Instant::now())
         });
@@ -1941,6 +2046,18 @@ where
                 // read beside its conversion, as the prep's body reads it), so
                 // the seal needs no pass over the slots.
                 let tip_of = |i: usize| pooled_consensus(&cands[i]).effective_tip_per_gas(base_fee).unwrap_or_default();
+                // `N42_PLAN_AHEAD_BODY=1`: the partition (at this block's
+                // beneficiary only) and the slots made with the plan.
+                let prepared_exec = prepared_build.as_mut().filter(|_| prep_from_plan).map(|made| {
+                    crate::parallel_transfer::PreparedExec {
+                        groups: made
+                            .groups
+                            .take()
+                            .filter(|(beneficiary, _)| *beneficiary == group_env.block_env.beneficiary)
+                            .map(|(_, groups)| groups),
+                        slots: Some(std::mem::take(&mut made.slots)),
+                    }
+                });
                 let counted_tips: Option<&(dyn Fn(usize) -> u128 + Sync)> =
                     if seal_on_counters() && body_at_prep { Some(&tip_of) } else { None };
                 let executed = if defer_state {
@@ -1963,6 +2080,7 @@ where
                         in_place,
                         Some(&mut before_batches),
                         counted_tips,
+                        prepared_exec,
                     )
                 } else {
                     crate::parallel_transfer::execute_for_build_counted(
@@ -1974,6 +2092,7 @@ where
                         in_place,
                         None,
                         counted_tips,
+                        prepared_exec,
                     )
                 };
                 let exec_done = std::time::Instant::now();
@@ -2115,9 +2234,18 @@ where
                         && run.skipped.is_empty()
                         && executed_count == cands.len()
                         && let Some(fees) = run.counters.fees
-                        && body_ahead.as_ref().is_some_and(|made| made.transactions.len() == cands.len())
                     {
-                        body_ahead.take().map(|made| (made, fees))
+                        // The body made with the plan (`N42_PLAN_AHEAD_BODY`)
+                        // or in the prep, every candidate in pull order.
+                        if prep_from_plan
+                            && let Some(made) = prepared_build.as_mut().filter(|made| made.transactions.len() == cands.len())
+                        {
+                            Some(((std::mem::take(&mut made.transactions), std::mem::take(&mut made.senders)), fees))
+                        } else if body_ahead.as_ref().is_some_and(|made| made.transactions.len() == cands.len()) {
+                            body_ahead.take().map(|made| ((made.transactions, made.senders), fees))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     };
@@ -2131,12 +2259,12 @@ where
                         commit_refs_ms += at.elapsed().as_millis() as u64;
                     }
                     seal_on_counters_used = counted_body.is_some();
-                    if let Some((made, fees)) = counted_body {
+                    if let Some(((transactions, senders), fees)) = counted_body {
                         total_fees += fees;
                         commit_body_ahead_used = true;
                         cumulative_gas_used += executed_gas;
                         tx_count += executed_count as u64;
-                        direct_body = Some((made.transactions, made.senders));
+                        direct_body = Some((transactions, senders));
                         // The references, the cumulative gas and the receipts
                         // are made behind the seal by the receipts job, which
                         // reads the slots itself.
@@ -2344,6 +2472,24 @@ where
                         gap_before_seal_ms = commit_end.elapsed().as_millis() as u64;
                         let sealed = seal_block!(hook, seal_at, if matches { root_ahead } else { None });
                         sealed_ahead_id = Some((sealed.2, sealed.3));
+                        // `N42_PLAN_AHEAD_BODY=1`: a block sealed on its
+                        // counters from the frames' bulk vector, uncut, is
+                        // its build's whole take in take order: the queue's
+                        // hand-off forgets it in O(1) (`forget_whole_take`).
+                        if seal_on_counters_used && from_bulk && crate::frame_blocks::plan_ahead_body_wanted() && !cands.is_empty() {
+                            let last = cands.len() - 1;
+                            let checks = [0, last / 2, last]
+                                .into_iter()
+                                .map(|i| (i, cands[i].sender(), cands[i].nonce()))
+                                .collect();
+                            crate::frame_blocks::note_whole_take(crate::frame_blocks::WholeTake {
+                                block: sealed.2,
+                                parent: parent_header.hash(),
+                                len: cands.len(),
+                                checks,
+                            });
+                            whole_take_noted = true;
+                        }
                         sealed_ahead = Some(sealed);
                         seal_took = seal_at.elapsed();
                     }
@@ -2558,6 +2704,10 @@ where
                     par_batches = run.phases.batches;
                     par_part_ms = run.phases.partition_ms;
                     par_exec_ms = run.phases.groups_ms;
+                    exec_prepared_groups = run.phases.prepared_groups;
+                    exec_prepared_slots = run.phases.prepared_slots;
+                    exec_partition_us = run.phases.partition_us;
+                    exec_slots_us = run.phases.slots_us;
                     par_transfer_timers = run.phases.transfer_timers;
                     par_read_set = run.phases.read_set;
                     par_read_set_hits = run.phases.read_set_hits;
@@ -3587,6 +3737,19 @@ where
                     // the batches' end to the seal's start, us.
                     seal_on_counters = seal_on_counters_used,
                     exec_end_to_seal_us,
+                    // `N42_PLAN_AHEAD_BODY=1`: the plan's body (0 none, 1
+                    // used, 2 not ready, 3 not this build's) and its making
+                    // time, us; whether the prep, the partition and the slots
+                    // came with it; the partition's and the slots' time in
+                    // the call, us; the hand-off noted as a whole take.
+                    plan_body = select_times.body_ahead,
+                    plan_body_us = select_times.body_ahead_us,
+                    prep_from_plan,
+                    exec_prepared_groups,
+                    exec_prepared_slots,
+                    exec_partition_us,
+                    exec_slots_us,
+                    whole_take_noted,
                     match_ms,
                     seal_header_ms,
                     seal_block_ms,
@@ -4702,5 +4865,171 @@ mod seal_at_exec_tests {
         let mut body = pulled.clone();
         body.swap(7, 8);
         assert!(!body_matches_pull(&body, &pulled, |h| *h, |h| *h));
+    }
+}
+
+#[cfg(test)]
+mod plan_body_tests {
+    //! `N42_PLAN_AHEAD_BODY=1` (`docs/SHARED_EXECUTION_SCOPE.md` 16.4 item 2):
+    //! what the plan-ahead hook makes equals what the build's start, prep and
+    //! gap make from the same candidates.
+    use super::*;
+    use crate::parallel_transfer::{execute_for_build_counted_dispatch, partition_by_sender, BodyAhead, PreparedExec};
+    use alloy_primitives::{Address, Bytes};
+    use n42_tx_types::{AltSigTx, N42TxEnvelope, TxAltSig, ALG_ED25519};
+    use reth_evm::ConfigureEvm as _;
+    use reth_primitives_traits::Recovered;
+    use reth_transaction_pool::{
+        identifier::{SenderId, TransactionId},
+        TransactionOrigin, ValidPoolTransaction,
+    };
+    use revm::database::{CacheDB, EmptyDB};
+    use revm::state::AccountInfo;
+
+    type Cand = Arc<ValidPoolTransaction<crate::N42PooledTransaction>>;
+
+    fn address(i: u64) -> Address {
+        let mut a = [0u8; 20];
+        a[..8].copy_from_slice(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_be_bytes());
+        a[12..].copy_from_slice(&i.to_be_bytes());
+        Address::from(a)
+    }
+
+    /// `senders` frames of `run` 0x50 transfers each (one sender a frame,
+    /// nonces from `first`), recipients drawn from `space`, the senders funded
+    /// in `db`.
+    fn frames(senders: u64, run: u64, first: u64, space: u64, db: &mut CacheDB<EmptyDB>) -> Vec<(n42_tx_queue::FrameTxs<crate::N42PooledTransaction>, usize)> {
+        let mut seed = 0x2545_f491_4f6c_dd1du64 ^ first;
+        let mut out = Vec::new();
+        for s in 0..senders {
+            let sender = address(100 + s);
+            db.insert_account_info(sender, AccountInfo { balance: U256::from(10u128.pow(21)), nonce: first, ..Default::default() });
+            let mut pubkey = [0u8; 32];
+            pubkey[..8].copy_from_slice(&s.to_be_bytes());
+            let mut frame: Vec<Cand> = Vec::new();
+            for k in first..first + run {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let tx = TxAltSig {
+                    chain_id: 1,
+                    nonce: k,
+                    max_priority_fee_per_gas: 1_000_000_000 + u128::from(seed % 1_000),
+                    max_fee_per_gas: 10_000_000_000,
+                    gas_limit: 21_000,
+                    to: address(1_000_000 + seed % space),
+                    value: U256::from(1_000 + k),
+                    input: Bytes::new(),
+                    access_list: Default::default(),
+                    alg_type: ALG_ED25519,
+                    pubkey: Bytes::copy_from_slice(&pubkey),
+                };
+                let mut signature = [0u8; 64];
+                signature[..8].copy_from_slice(&seed.to_be_bytes());
+                let envelope = N42TxEnvelope::AltSig(AltSigTx::new(tx, Bytes::copy_from_slice(&signature)));
+                let encoded = alloy_eips::eip2718::Encodable2718::encode_2718_len(&envelope);
+                let pooled = crate::N42PooledTransaction::new(Recovered::new_unchecked(envelope, sender), encoded);
+                frame.push(Arc::new(ValidPoolTransaction {
+                    transaction: pooled,
+                    transaction_id: TransactionId::new(SenderId::from(s), k),
+                    propagate: false,
+                    timestamp: std::time::Instant::now(),
+                    origin: TransactionOrigin::External,
+                    authority_ids: None,
+                }));
+            }
+            let len = frame.len();
+            // A cut last frame, as a plan's last frame may be.
+            let taken = if s + 1 == senders { len.div_ceil(2) } else { len };
+            out.push((Arc::from(frame), taken));
+        }
+        out
+    }
+
+    /// The body made with the plan equals the body the build's prep makes
+    /// from the same candidates (keys, transactions, senders, hashes), its
+    /// partition is the call's, its slots are empty; and three blocks of
+    /// different shapes executed on the prepared partition and slots equal
+    /// the fresh call: transfers, gas, success, skips, counters and the
+    /// batches' bundles.
+    #[test]
+    fn body_made_with_the_plan_equals_body_made_at_start() {
+        let beneficiary = address(1);
+        crate::frame_blocks::note_beneficiary(beneficiary);
+        let base_fee = 1_000_000_000u64;
+        for (senders, run, first, space) in [(60u64, 20u64, 0u64, 500u64), (200, 3, 4, 50_000), (17, 90, 1, 40)] {
+            let mut db = CacheDB::new(EmptyDB::default());
+            db.insert_account_info(beneficiary, AccountInfo { balance: U256::from(7), ..Default::default() });
+            let segments = frames(senders, run, first, space, &mut db);
+            let made = make_prepared_build(&segments).expect("every candidate a transfer");
+            let cands: Vec<Cand> = segments.iter().flat_map(|(txs, taken)| txs[..*taken].to_vec()).collect();
+            assert_eq!(made.cands.len(), cands.len());
+            assert!(made.cands.iter().zip(&cands).all(|(a, b)| Arc::ptr_eq(a, b)), "the candidates, in plan order");
+            let in_place: Vec<(n42_tx_queue::FrameTxs<_>, usize, usize)> =
+                segments.iter().map(|(txs, taken)| (Arc::clone(txs), 0, *taken)).collect();
+            assert!(made.made_from(&in_place));
+            let mut cut = in_place.clone();
+            cut[0].2 -= 1;
+            assert!(!made.made_from(&cut), "another take is not the plan's");
+            // The prep, as the build runs it.
+            let (keys, fresh) = BodyAhead::make_keyed(&cands, |_, tx| {
+                let consensus = pooled_consensus(tx);
+                (transfer_key(tx), consensus.clone(), tx.sender(), consensus.effective_tip_per_gas(base_fee).unwrap_or_default())
+            })
+            .expect("transfers");
+            assert_eq!(made.keys, keys, "keys");
+            assert_eq!(made.transactions, fresh.transactions, "transactions");
+            assert_eq!(made.senders, fresh.senders, "senders");
+            let hashes: Vec<B256> = fresh.transactions.iter().map(|tx| *alloy_consensus::transaction::TxHashRef::tx_hash(tx)).collect();
+            assert_eq!(made.hashes, hashes, "hashes");
+            let (noted, groups) = made.groups.clone().expect("a beneficiary was noted");
+            assert_eq!(noted, beneficiary);
+            assert_eq!(groups, partition_by_sender(&keys, beneficiary).expect("a partition"), "partition");
+            assert_eq!(made.slots.len(), cands.len());
+            assert!(made.slots.iter().all(|slot| slot.get().is_none()), "empty slots");
+
+            // Executed on the prepared partition and slots, and fresh.
+            let header = alloy_consensus::Header {
+                number: 20_000_000,
+                beneficiary,
+                gas_limit: 5_000_000_000,
+                base_fee_per_gas: Some(base_fee),
+                timestamp: 1_800_000_000,
+                ..Default::default()
+            };
+            let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(
+                reth_chainspec::MAINNET.clone(),
+                crate::fast_transfer::N42EvmFactory::with_fast_transfers(true),
+            );
+            let evm_env = evm_config.evm_env(&header).expect("env");
+            let convert = |i: usize| ((), evm_config.tx_env(reth_transaction_pool::PoolTransaction::consensus_ref(&cands[i].transaction)));
+            let tip_of = |i: usize| pooled_consensus(&cands[i]).effective_tip_per_gas(base_fee).unwrap_or_default();
+            let run_with = |prepared: Option<PreparedExec<()>>| {
+                let run = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, false, Some(&tip_of), prepared)
+                    .expect("a block of transfers");
+                let executed: Vec<(usize, u64, bool)> =
+                    run.slots.iter().filter_map(std::sync::OnceLock::get).map(|b| (b.index, b.gas_used, b.result.is_success())).collect();
+                let mut accounts: Vec<(Address, Option<AccountInfo>)> =
+                    run.bundles.iter().flat_map(|b| b.state.iter().map(|(a, acc)| (*a, acc.info.clone()))).collect();
+                accounts.sort_by_key(|(a, _)| *a);
+                (executed, run.skipped, run.counters, accounts, run.phases.prepared_groups, run.phases.prepared_slots)
+            };
+            let fresh_run = run_with(None);
+            let mut made = made;
+            let prepared = PreparedExec { groups: made.groups.take().map(|(_, groups)| groups), slots: Some(std::mem::take(&mut made.slots)) };
+            let planned_run = run_with(Some(prepared));
+            assert!(planned_run.4 && planned_run.5, "the prepared partition and slots were taken");
+            assert!(!fresh_run.4 && !fresh_run.5);
+            assert_eq!(fresh_run.0.len(), cands.len(), "every transfer ran");
+            assert_eq!(fresh_run.0, planned_run.0, "executed transfers");
+            assert_eq!(fresh_run.1, planned_run.1, "skipped");
+            assert_eq!(fresh_run.2, planned_run.2, "counters");
+            assert_eq!(fresh_run.3, planned_run.3, "the batches' accounts");
+            // A partition or slots of another size are not taken.
+            let wrong = PreparedExec { groups: Some(vec![vec![0]]), slots: Some(crate::parallel_transfer::empty_slots(crate::parallel_transfer::build_pool(), 3)) };
+            let fallback = run_with(Some(wrong));
+            assert!(!fallback.4 && !fallback.5);
+            assert_eq!(fallback.0, fresh_run.0);
+        }
     }
 }

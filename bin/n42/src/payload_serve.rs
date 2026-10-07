@@ -1035,7 +1035,15 @@ async fn build_on_sealed_output(
             let task = tokio::task::spawn_blocking(move || {
                 let at = std::time::Instant::now();
                 let txs = block.body().transactions().count();
-                let (dropped, forget) = if build_start_async() {
+                // `N42_PLAN_AHEAD_BODY=1`: a block its builder sealed as its
+                // whole take is forgotten in O(1); anything else, or a take
+                // that does not match, by the full hand-off.
+                let whole = n42_engine_types::frame_blocks::take_whole_take(built_hash)
+                    .filter(|take| take.parent == block.header().parent_hash && take.len == txs)
+                    .and_then(|take| queue.forget_whole_take(take.parent, take.len, &take.checks));
+                let (dropped, forget) = if let Some(whole) = whole {
+                    whole
+                } else if build_start_async() {
                     let (body, senders): (&[_], &[_]) = (&block.body().transactions, block.senders());
                     queue.forget_mined_parallel(block.header().parent_hash, body.len().min(senders.len()), |i| {
                         (senders[i], alloy_consensus::Transaction::nonce(&body[i]))

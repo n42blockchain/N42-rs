@@ -54,6 +54,16 @@ pub struct Phases {
     /// read set, the slots), microseconds -- the leader's gap before the
     /// execution, with what the caller did before the call.
     pub batches_start_us: u64,
+    /// `N42_PLAN_AHEAD_BODY=1`: the partition and the slots came prepared
+    /// with the plan ([`PreparedExec`]) rather than made in the call.
+    pub prepared_groups: bool,
+    /// See `prepared_groups`.
+    pub prepared_slots: bool,
+    /// The partition and `batch_groups` (or the prepared groups' check),
+    /// microseconds; and the slots made (or taken), microseconds.
+    pub partition_us: u64,
+    /// See `partition_us`.
+    pub slots_us: u64,
     /// From the call's entry to the batches' end, microseconds: the caller
     /// names the gap after the execution from here.
     pub batches_end_us: u64,
@@ -885,6 +895,47 @@ pub fn behind_pool() -> &'static rayon::ThreadPool {
     own.as_ref().unwrap_or_else(|| build_pool())
 }
 
+/// What a build's call can be handed, prepared with the plan while the parent
+/// executed (`N42_PLAN_AHEAD_BODY=1`, `docs/SHARED_EXECUTION_SCOPE.md` 16.4
+/// item 2): the sender partition of the same keys at the same beneficiary
+/// ([`partition_by_sender`]) and the empty slot array. Either is used only
+/// when its size is the call's; otherwise the call makes its own.
+#[derive(Debug)]
+pub struct PreparedExec<T> {
+    /// The partition, made by [`partition_by_sender`] on these keys and this
+    /// block's beneficiary.
+    pub groups: Option<Vec<Vec<usize>>>,
+    /// One empty slot a candidate.
+    pub slots: Option<Vec<std::sync::OnceLock<BuiltTransfer<T>>>>,
+}
+
+/// `n` empty slots, made and touched on `pool` (a full block's are ~94 MB).
+pub fn empty_slots<T: Send>(pool: &rayon::ThreadPool, n: usize) -> Vec<std::sync::OnceLock<BuiltTransfer<T>>> {
+    pool.install(|| {
+        use rayon::prelude::*;
+        (0..n).into_par_iter().with_min_len(4096).map(|_| std::sync::OnceLock::new()).collect()
+    })
+}
+
+/// The pool the plan-ahead body is made on (`N42_PLAN_AHEAD_BODY=1`): its own
+/// `N42_PLAN_AHEAD_BODY_THREADS` threads (8 by default, `n42-plan-body-*`),
+/// so the next block's preparation does not take the build pool's workers
+/// from the block executing on them. Falls back to the build pool.
+pub fn plan_body_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    let own = POOL.get_or_init(|| {
+        let threads =
+            std::env::var("N42_PLAN_AHEAD_BODY_THREADS").ok().and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0).unwrap_or(8);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("n42-plan-body-{i}"))
+            .build()
+            .inspect_err(|err| tracing::warn!(target: "payload_builder", %err, "no pool for the plan-ahead body; the build pool makes it"))
+            .ok()
+    });
+    own.as_ref().unwrap_or_else(|| build_pool())
+}
+
 /// Whether the leader's parallel build reads the block's accounts ahead of
 /// its execution (`N42_BUILD_PREFETCH=1`, [`WarmAccounts`]): each batch the
 /// puller hands over is read on the worker pool while the pull and the prep
@@ -1466,6 +1517,16 @@ impl<Tx: Send> BodyAhead<Tx> {
         cands: &[C],
         each: impl Fn(usize, &C) -> (Option<(Address, Address)>, Tx, Address, u128) + Sync,
     ) -> Option<(Vec<(Address, Address)>, Self)> {
+        Self::make_keyed_on(build_pool(), cands, each)
+    }
+
+    /// [`Self::make_keyed`] on `pool` (the plan-ahead body's own pool).
+    #[allow(clippy::type_complexity)]
+    pub fn make_keyed_on<C: Sync>(
+        pool: &rayon::ThreadPool,
+        cands: &[C],
+        each: impl Fn(usize, &C) -> (Option<(Address, Address)>, Tx, Address, u128) + Sync,
+    ) -> Option<(Vec<(Address, Address)>, Self)> {
         use rayon::prelude::*;
         let at = std::time::Instant::now();
         // A candidate that is not a plain transfer is noted, not carried as
@@ -1473,7 +1534,7 @@ impl<Tx: Send> BodyAhead<Tx> {
         // no serial pass over 163,000 options afterwards (step 7a).
         let refused = std::sync::atomic::AtomicBool::new(false);
         let (keys, (transactions, (senders, tips))): (Vec<(Address, Address)>, (Vec<Tx>, (Vec<Address>, Vec<u128>))) =
-            build_pool().install(|| {
+            pool.install(|| {
                 cands
                     .par_iter()
                     .with_min_len(1024)
@@ -3519,7 +3580,7 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, build_one_wave(), None)
+    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, build_one_wave(), None, None)
 }
 
 /// [`execute_for_build_in_place`] with the dispatch chosen by the caller
@@ -3540,7 +3601,7 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, read_set(), one_wave, None)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, read_set(), one_wave, None, None)
 }
 
 fn execute_for_build_run<T, G>(
@@ -3557,7 +3618,7 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), build_one_wave(), None)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), build_one_wave(), None, None)
 }
 
 /// [`execute_for_build_in_place_after`] (with `before_batches` optional) with
@@ -3576,13 +3637,14 @@ pub fn execute_for_build_counted<T, G>(
     in_place: bool,
     before_batches: Option<&mut dyn FnMut() -> bool>,
     tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
+    prepared: Option<PreparedExec<T>>,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), build_one_wave(), tip_of)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), build_one_wave(), tip_of, prepared)
 }
 
 /// [`execute_for_build_counted`] with the dispatch chosen by the caller: for
@@ -3597,13 +3659,14 @@ pub fn execute_for_build_counted_dispatch<T, G>(
     in_place: bool,
     one_wave: bool,
     tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
+    prepared: Option<PreparedExec<T>>,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, None, in_place, None, read_set(), one_wave, tip_of)
+    execute_for_build_opts(evm_env, keys, convert, open, None, in_place, None, read_set(), one_wave, tip_of, prepared)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3618,6 +3681,7 @@ fn execute_for_build_opts<T, G>(
     with_read_set: bool,
     one_wave: bool,
     tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
+    prepared: Option<PreparedExec<T>>,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
@@ -3628,7 +3692,21 @@ where
     let mut phases = Phases::default();
     let at = std::time::Instant::now();
     let call_at = at;
-    let groups = partition_by_sender(keys, beneficiary)?;
+    // `N42_PLAN_AHEAD_BODY=1`: the partition and the slots made with the
+    // plan, each used only when it is this call's size.
+    let (prepared_groups, prepared_slots) = match prepared {
+        Some(PreparedExec { groups, slots }) => (
+            groups.filter(|groups| groups.iter().map(Vec::len).sum::<usize>() == keys.len()),
+            slots.filter(|slots| slots.len() == keys.len()),
+        ),
+        None => (None, None),
+    };
+    phases.prepared_groups = prepared_groups.is_some();
+    phases.prepared_slots = prepared_slots.is_some();
+    let groups = match prepared_groups {
+        Some(groups) => groups,
+        None => partition_by_sender(keys, beneficiary)?,
+    };
     phases.groups = groups.len();
     // Batches of whole groups, about equal in transfers: a couple of
     // thousand transfers each, at most two per worker. Each batch opens its
@@ -3639,6 +3717,7 @@ where
         if one_wave { batch_groups_one_wave(&groups, keys.len(), workers) } else { batch_groups(&groups, keys.len(), workers) };
     phases.batches = batches.len();
     phases.partition_ms = at.elapsed().as_millis() as u64;
+    phases.partition_us = at.elapsed().as_micros() as u64;
     if let Some(hook) = before_batches
         && !hook()
     {
@@ -3663,10 +3742,12 @@ where
     // Made on the pool: a full block's slots are ~75 MB of fresh pages, and
     // one thread faulting them in was ~4 ms of the bench's 5.5 between the
     // call and the batches (step 7a, `batches_start_us`).
-    let slots: Vec<std::sync::OnceLock<BuiltTransfer<T>>> = pool.install(|| {
-        use rayon::prelude::*;
-        (0..keys.len()).into_par_iter().with_min_len(4096).map(|_| std::sync::OnceLock::new()).collect()
-    });
+    let slots_at = std::time::Instant::now();
+    let slots: Vec<std::sync::OnceLock<BuiltTransfer<T>>> = match prepared_slots {
+        Some(slots) => slots,
+        None => empty_slots(pool, keys.len()),
+    };
+    phases.slots_us = slots_at.elapsed().as_micros() as u64;
     let slots_ref = &slots;
     type BatchResult =
         (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, BatchSpan, LoopTimers, RunCounters);
@@ -6032,7 +6113,7 @@ mod tests {
                 .collect();
             for one_wave in [false, true] {
                 let tip_of = |i: usize| tips[i];
-                let run = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, one_wave, Some(&tip_of))
+                let run = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, one_wave, Some(&tip_of), None)
                     .expect("a block of transfers");
                 assert_eq!(broken, !run.skipped.is_empty(), "skips only on the broken blocks");
                 let (refs, gas) = slot_refs_and_gas(&run.slots);
@@ -6054,7 +6135,7 @@ mod tests {
                 assert_eq!(made.senders, senders_of, "the body's senders");
                 assert_eq!(run.counters.fees, Some(fees), "the body's fees");
                 // Without tips the counters still count, and say no fees.
-                let plain = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, one_wave, None)
+                let plain = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, one_wave, None, None)
                     .expect("a block of transfers");
                 assert_eq!((plain.counters.executed, plain.counters.gas, plain.counters.fees), (refs.len(), gas, None));
             }

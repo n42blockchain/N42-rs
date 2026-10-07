@@ -262,6 +262,10 @@ if [[ ${F7_REQUIRE_TX_VERIFY:-0} == 1 ]]; then
     echo "REFUSING: F7_REQUIRE_TX_VERIFY=1 needs N42_INGEST_VERIFY=all and no N42_FRAME_GATEWAYS" >&2
     exit 1
   fi
+  if [[ ${N42_FRAME_BLOCKS:-0} == 1 && ${N42_BLOCK_BY_DESCRIPTION:-0} != 1 ]]; then
+    echo "REFUSING: an audited frame-block round needs N42_BLOCK_BY_DESCRIPTION=1 to carry its frame layout" >&2
+    exit 1
+  fi
   echo "signature verification: every transaction at ingest; gateway bypass disabled"
 fi
 

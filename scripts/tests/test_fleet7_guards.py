@@ -59,6 +59,17 @@ class FleetGuards(unittest.TestCase):
             else:
                 self.assertEqual(result.stdout.strip(), '0')
 
+    def test_frame_round_requires_native_description_transport(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ, F7_ROOT=tmp, F7_REQUIRE_TX_VERIFY='1',
+                       F7_SKIP_STALE_CHECK='1', N42_INGEST_VERIFY='all',
+                       N42_FRAME_GATEWAYS='', N42_FRAME_BLOCKS='1', N42_BLOCK_BY_DESCRIPTION='0')
+            result = subprocess.run(['bash', str(REPO / 'scripts/fleet7-bench.sh')],
+                                    env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('needs N42_BLOCK_BY_DESCRIPTION=1', result.stdout + result.stderr)
+            self.assertFalse((Path(tmp) / 'node0').exists())
+
     def test_each_binary_and_shared_source_is_checked(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'src' / 'checkout'

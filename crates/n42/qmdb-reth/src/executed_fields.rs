@@ -5,7 +5,9 @@
 //! Under deferred execution (`docs/PHASE_D_DEFERRED_EXECUTION.md`, the
 //! genesis `deferredExecutionTime`) a header carries the execution of its
 //! *parent*: `stateRoot`, `receiptsRoot`, `logsBloom` and `gasUsed` are the
-//! parent's after execution. So a builder needs the parent's result to
+//! parent's after execution (at `deferredExecutionDepth` 2, the parent's
+//! parent's: `docs/DEFERRED_DEPTH_2_DESIGN.md`; "parent" below reads as "the
+//! ancestor at the chain's depth"). So a builder needs the parent's result to
 //! assemble a header, and a validator needs it to check one. Both come from
 //! here: every path that executes a block -- the builder, the follower's
 //! direct import, the engine's validator -- records the block's fields under
@@ -145,9 +147,10 @@ pub fn seed_from_header(block_hash: B256, header: &alloy_consensus::Header) {
     );
 }
 
-/// The execution fields a header at or past the fork carries for its parent,
-/// read from that header: what `executed_root_of(parent)` returns once the
-/// child exists.
+/// The execution fields a header at or past the fork carries, read from that
+/// header. The name is historical: the fields are those of the header's
+/// depth-D ancestor (`deferredExecutionDepth`, `docs/DEFERRED_DEPTH_2_DESIGN.md`),
+/// the parent at depth 1 and the parent's parent at depth 2.
 pub fn fields_from_child_header(child: &alloy_consensus::Header) -> ExecutedFields {
     ExecutedFields {
         state_root: child.state_root,

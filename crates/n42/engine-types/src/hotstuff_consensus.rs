@@ -138,6 +138,37 @@ pub enum DeferredExecutionError {
 /// the parent's own header if the parent is before the fork (its header
 /// carries its own execution), the registry otherwise.
 pub fn parent_executed_fields(genesis: &alloy_genesis::Genesis, parent: &SealedHeader) -> Option<crate::executed_fields::ExecutedFields> {
+    ancestor_executed_fields(genesis, parent, 1)
+}
+
+/// The hash of the block whose execution result a child of `parent` carries
+/// at `depth` (`docs/DEFERRED_DEPTH_2_DESIGN.md` section 1.1): the parent at
+/// depth 1, the parent's parent at depth 2. By hash on the child's own chain,
+/// never by number.
+pub fn ancestor_hash(parent: &SealedHeader, depth: u64) -> B256 {
+    if depth <= 1 {
+        parent.hash()
+    } else {
+        parent.parent_hash
+    }
+}
+
+/// The execution result a header past the fork must carry when its parent
+/// is `parent` and the chain's deferred-execution depth is `depth`: the
+/// result of the ancestor at that distance on the child's own chain.
+///
+/// Depth 1 is [`parent_executed_fields`]: the parent's own header before the
+/// fork or at genesis, the registry under the parent's hash otherwise.
+pub fn ancestor_executed_fields(
+    genesis: &alloy_genesis::Genesis,
+    parent: &SealedHeader,
+    depth: u64,
+) -> Option<crate::executed_fields::ExecutedFields> {
+    if depth != 1 {
+        // Depth 2 is filled in with the consensus rule; until then no other
+        // depth has a result.
+        return None;
+    }
     // The genesis header carries the genesis state by definition, whatever
     // the fork time says; so does every header before the fork.
     if parent.number == 0 || !reth_chainspec::qmdb::deferred_execution_active_at(genesis, parent.timestamp) {
@@ -176,12 +207,26 @@ pub fn parent_executed_fields_or_built(
     parent_built: Option<B256>,
     timeout: std::time::Duration,
 ) -> Option<crate::executed_fields::ExecutedFields> {
-    if let Some(fields) = parent_executed_fields(genesis, parent) {
+    ancestor_executed_fields_or_built(genesis, parent, parent_built, 1, timeout)
+}
+
+/// [`ancestor_executed_fields`], falling back to the hash the builder gave
+/// the ancestor (`ancestor_built`) and waiting for it there; the found fields
+/// are filed under the ancestor's sealed hash as well. At depth 1 this is
+/// [`parent_executed_fields_or_built`].
+pub fn ancestor_executed_fields_or_built(
+    genesis: &alloy_genesis::Genesis,
+    parent: &SealedHeader,
+    ancestor_built: Option<B256>,
+    depth: u64,
+    timeout: std::time::Duration,
+) -> Option<crate::executed_fields::ExecutedFields> {
+    if let Some(fields) = ancestor_executed_fields(genesis, parent, depth) {
         return Some(fields);
     }
-    let built = parent_built?;
+    let built = ancestor_built?;
     let fields = crate::executed_fields::wait_for(&built, timeout)?;
-    crate::executed_fields::remember(parent.hash(), fields);
+    crate::executed_fields::remember(ancestor_hash(parent, depth), fields);
     Some(fields)
 }
 
@@ -275,12 +320,14 @@ where
         // parent's own header carries). The first header past the fork
         // therefore repeats its parent's fields, the invariant at the switch.
         if reth_chainspec::qmdb::deferred_execution_active_at(self.chain_spec.genesis(), header.timestamp) {
-            let expected = parent_executed_fields(self.chain_spec.genesis(), parent)
-                .ok_or_else(|| ConsensusError::Other(Arc::new(DeferredExecutionError::ParentUnknown(parent.hash()))))?;
+            let depth = 1;
+            let ancestor = ancestor_hash(parent, depth);
+            let expected = ancestor_executed_fields(self.chain_spec.genesis(), parent, depth)
+                .ok_or_else(|| ConsensusError::Other(Arc::new(DeferredExecutionError::ParentUnknown(ancestor))))?;
             let got = crate::executed_fields::fields_from_child_header(header);
             if got != expected {
                 return Err(ConsensusError::Other(Arc::new(DeferredExecutionError::Mismatch {
-                    parent: parent.hash(),
+                    parent: ancestor,
                     got: Box::new(got),
                     expected: Box::new(expected),
                 })));
@@ -657,6 +704,40 @@ mod tests {
             B256::repeat_byte(0x73),
         );
         assert_eq!(parent_executed_fields_or_built(&genesis, &other, None, wait), None);
+    }
+
+    /// Depth as a parameter: at depth 1 the general form is the parent's
+    /// result exactly, on a genesis parent, a pre-fork parent, a recorded
+    /// parent and an unknown one (docs/DEFERRED_DEPTH_2_DESIGN.md step 0).
+    #[test]
+    fn at_depth_one_the_ancestor_is_the_parent() {
+        let mut late_fork = alloy_genesis::Genesis::default();
+        late_fork.config.extra_fields.insert(
+            reth_chainspec::qmdb::DEFERRED_EXECUTION_TIME_KEY.to_owned(),
+            serde_json::json!(1_000u64),
+        );
+        let recorded = SealedHeader::new(
+            Header { number: 7, timestamp: 2_000, parent_hash: B256::repeat_byte(0x5e), ..Default::default() },
+            B256::repeat_byte(0x5f),
+        );
+        crate::executed_fields::remember(recorded.hash(), fields(0x50));
+        let carried = Header { state_root: B256::repeat_byte(0x52), gas_used: 9, ..Default::default() };
+        let parents = [
+            SealedHeader::new(Header { number: 0, ..carried.clone() }, B256::repeat_byte(0x53)),
+            SealedHeader::new(Header { number: 3, timestamp: 10, ..carried.clone() }, B256::repeat_byte(0x54)),
+            recorded,
+            SealedHeader::new(Header { number: 8, timestamp: 2_001, ..carried }, B256::repeat_byte(0x55)),
+        ];
+        for genesis in [deferred_genesis(), late_fork] {
+            for parent in &parents {
+                assert_eq!(ancestor_executed_fields(&genesis, parent, 1), parent_executed_fields(&genesis, parent));
+                assert_eq!(ancestor_hash(parent, 1), parent.hash());
+                assert_eq!(
+                    ancestor_executed_fields_or_built(&genesis, parent, None, 1, std::time::Duration::ZERO),
+                    parent_executed_fields_or_built(&genesis, parent, None, std::time::Duration::ZERO),
+                );
+            }
+        }
     }
 
     /// A block before the fork carries its own execution, so neither the

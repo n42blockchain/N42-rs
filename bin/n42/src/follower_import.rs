@@ -299,6 +299,32 @@ static PARENT_OUTPUTS: Mutex<std::collections::VecDeque<(B256, reth_primitives_t
 /// How many published outputs are kept: the check reads only the parent's.
 const PARENT_OUTPUTS_KEPT: usize = 4;
 
+/// How many published outputs are kept, by `N42_PARENT_OUTPUTS_KEPT`
+/// (2..=16, default [`PARENT_OUTPUTS_KEPT`]). The check and the execution
+/// stack the unlanded ancestors' outputs, and a shorter cycle (deferred
+/// execution at depth 2, `docs/DEFERRED_DEPTH_2_DESIGN.md` items 12 and 4.4)
+/// leaves more of them unlanded at once; a leg sets it, the default is the
+/// depth-1 value. Read once.
+fn parent_outputs_kept() -> usize {
+    static KEPT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *KEPT.get_or_init(|| kept_from_env("N42_PARENT_OUTPUTS_KEPT", PARENT_OUTPUTS_KEPT, 2..=16))
+}
+
+/// A capacity knob: `name` parsed as a count within `range`, else `default`
+/// (with a warning for a value that does not parse or lies outside).
+fn kept_from_env(name: &str, default: usize, range: std::ops::RangeInclusive<usize>) -> usize {
+    match std::env::var(name) {
+        Err(_) => default,
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(value) if range.contains(&value) => value,
+            _ => {
+                tracing::warn!(target: "n42.follower_import", %name, %raw, ?range, default, "capacity knob ignored");
+                default
+            }
+        },
+    }
+}
+
 /// Under deferred execution a block's check reads its senders from the
 /// parent's execution output, published by the parent's import as soon as its
 /// execution ends, instead of waiting for the parent to land in the engine. On
@@ -366,7 +392,7 @@ fn publish_parent_output(block_hash: B256, header: reth_primitives_traits::Seale
     {
         let mut outputs = PARENT_OUTPUTS.lock().unwrap_or_else(|p| p.into_inner());
         outputs.retain(|(hash, _, _)| *hash != block_hash);
-        while outputs.len() >= PARENT_OUTPUTS_KEPT {
+        while outputs.len() >= parent_outputs_kept() {
             outputs.pop_front();
         }
         outputs.push_back((block_hash, header, output));
@@ -393,6 +419,13 @@ static FOLLOWER_SHARDS: Mutex<std::collections::VecDeque<KeptShards>> = Mutex::n
 /// a backlog its grandparent's when that one's merge is not yet published.
 const FOLLOWER_SHARDS_KEPT: usize = 2;
 
+/// [`FOLLOWER_SHARDS_KEPT`], overridden by `N42_FOLLOWER_SHARDS_KEPT`
+/// (1..=8), as [`parent_outputs_kept`]. Read once.
+fn follower_shards_kept() -> usize {
+    static KEPT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *KEPT.get_or_init(|| kept_from_env("N42_FOLLOWER_SHARDS_KEPT", FOLLOWER_SHARDS_KEPT, 1..=8))
+}
+
 /// Whether the child's check and execution read a parent executed here on the
 /// build path through its shards the moment they are kept, instead of waiting
 /// for the published (merged) output. On by default;
@@ -413,7 +446,7 @@ fn keep_follower_shards(
     {
         let mut kept = FOLLOWER_SHARDS.lock().unwrap_or_else(|p| p.into_inner());
         kept.retain(|(hash, _, _, _)| *hash != block_hash);
-        while kept.len() >= FOLLOWER_SHARDS_KEPT {
+        while kept.len() >= follower_shards_kept() {
             kept.pop_front();
         }
         kept.push_back((block_hash, header, shards, residual));
@@ -602,6 +635,33 @@ fn wait_for_parent_fields(parent_hash: B256) -> Result<(), String> {
     n42_engine_types::executed_fields::wait_for(&parent_hash, PARENT_WAIT)
         .map(|_| ())
         .ok_or_else(|| format!("parent {parent_hash}'s execution fields not recorded within {PARENT_WAIT:?}"))
+}
+
+/// The vote road's wait for the result the header carries
+/// (`docs/DEFERRED_DEPTH_2_DESIGN.md` item 10): the parent's at depth 1
+/// ([`wait_for_parent_fields`], exactly as before), the parent's parent's at
+/// depth 2 -- which completed about a cycle earlier, so the vote no longer
+/// waits for the parent's QMDB root. Nothing to wait for at the chain start,
+/// where the parent's own header carries the expected (genesis) fields.
+///
+/// The waits that stand for the parent's *tree* being filed before this
+/// block's own root (the root job's, [`spawn_early_root`]) stay on the parent
+/// at every depth.
+fn wait_for_ancestor_fields(
+    genesis: &alloy_genesis::Genesis,
+    parent: &reth_primitives_traits::SealedHeader,
+    depth: u64,
+) -> Result<(), String> {
+    if depth <= 1 {
+        return wait_for_parent_fields(parent.hash());
+    }
+    if !n42_engine_types::hotstuff_consensus::ancestor_result_is_recorded(genesis, parent, depth) {
+        return Ok(());
+    }
+    let ancestor = n42_engine_types::hotstuff_consensus::ancestor_hash(parent, depth);
+    n42_engine_types::executed_fields::wait_for(&ancestor, PARENT_WAIT)
+        .map(|_| ())
+        .ok_or_else(|| format!("ancestor {ancestor}'s execution fields not recorded within {PARENT_WAIT:?}"))
 }
 
 /// The header against the parent, by the consensus rules: under deferred
@@ -1340,7 +1400,7 @@ pub fn published_ancestry(parent_hash: B256, wait: std::time::Duration) -> Resul
     let waited = started.elapsed();
     let mut executed = vec![n42_engine_types::direct_build::executed_from_output(&header, Arc::clone(&output))];
     let mut anchor = header.parent_hash;
-    while executed.len() < PARENT_OUTPUTS_KEPT {
+    while executed.len() < parent_outputs_kept() {
         let Some((older, published)) = published_output(anchor) else { break };
         executed.push(n42_engine_types::direct_build::executed_from_output(&older, published));
         anchor = older.parent_hash;
@@ -1410,7 +1470,7 @@ where
                 return None;
             }
         }
-        if outputs.len() >= PARENT_OUTPUTS_KEPT {
+        if outputs.len() >= parent_outputs_kept() {
             decline_on_output(number, "more unimported ancestors than there are published outputs");
             return None;
         }
@@ -2101,6 +2161,11 @@ where
     };
 
     let deferred = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), head.timestamp);
+    // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md): which
+    // ancestor's result the header carries, so which one the vote road waits
+    // for. The includability check and the execution read the *parent's*
+    // output at every depth.
+    let carried_depth = reth_chainspec::qmdb::deferred_execution_depth_at(chain_spec.genesis(), head.timestamp);
     // Before the fork the parent must be in already, as it always was: an
     // unknown parent fails here at once and the engine's own path answers
     // SYNCING, with no wait and no sender recovery spent on it. From the
@@ -2518,7 +2583,7 @@ where
                 // to run beside.
                 let fields_at = std::time::Instant::now();
                 if parent_state.is_some() {
-                    wait_for_parent_fields(parent_hash)?;
+                    wait_for_ancestor_fields(chain_spec.genesis(), &parent, carried_depth)?;
                     phases.parent_fields_wait_us = fields_at.elapsed().as_micros() as u64;
                     parent_fields_wait_us.store(phases.parent_fields_wait_us, std::sync::atomic::Ordering::Relaxed);
                     against_parent()?;
@@ -2930,6 +2995,7 @@ where
             // `move`, and the execution road needs the same block and parent.
             let header = &head;
             let parent_header = &parent;
+            let genesis = chain_spec.genesis();
             let vote_checked = checked.take();
             let vote_at = &vote_at;
             let parent_fields_wait_us = &parent_fields_wait_us;
@@ -2973,7 +3039,7 @@ where
                         phases.note_check(header_us, include_us, times);
                     }
                     let fields_at = std::time::Instant::now();
-                    wait_for_parent_fields(parent_hash)?;
+                    wait_for_ancestor_fields(genesis, parent_header, carried_depth)?;
                     phases.parent_fields_wait_us = fields_at.elapsed().as_micros() as u64;
                     parent_fields_wait_us.store(phases.parent_fields_wait_us, std::sync::atomic::Ordering::Relaxed);
                     validate_against_parent(consensus, header, parent_header)?;

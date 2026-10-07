@@ -2,7 +2,7 @@
 # Copyright (c) 2017-2025 N42 Contributors
 # SPDX-License-Identifier: MIT OR Apache-2.0
 """loop340 (docs 10.87): read-back of a leg's static-file data through the layer's RPC, run while the layer is still up, before the datadirs are wiped.
-usage: check340.py <tag> [rpc port, default 8700]. Exit 0 = everything read right, 1 = something read wrong, 2 = the check could not complete (timeout / no answer).
+usage: check340.py <tag> [rpc port, default 8700] [deferred depth, default 1]. Exit 0 = everything read right, 1 = something read wrong, 2 = the check could not complete (timeout / no answer).
 1. The layer's log: any line about static-file consistency or healing beyond the single start-up line `check_consistency: Healing static file inconsistencies.` (lines matching heal|inconsisten|unwind|corrupt|NippyJar|mismatch, printed).
 2. For the first full block of the leg, a middle one and the last one (the layer needs --rpc.max-response-size 1000 for a 200k block's receipts, ~280 MB): the block's hash list, eth_getBlockReceipts and eth_getTransactionByBlockNumberAndIndex for five transactions: the transaction count equals the
    canonical-log count, the receipts' count equals it, every receipt's status is 1, cumulativeGasUsed rises and ends at the NEXT block's header gasUsed (deferred execution: a header carries its parent's execution), the receipts' transaction
@@ -11,7 +11,7 @@ usage: check340.py <tag> [rpc port, default 8700]. Exit 0 = everything read righ
    keccak256(alg || pubkey)[12:]. The raw JSON of the sampled transactions is saved to /data/n42-build/target-n42-rs/fleet-runs/check340-<tag>.json."""
 import importlib.util, json, os, re, subprocess, sys, urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
-tag = sys.argv[1]; port = int(sys.argv[2]) if len(sys.argv) > 2 else 8700
+tag = sys.argv[1]; port = int(sys.argv[2]) if len(sys.argv) > 2 else 8700; depth = int(sys.argv[3]) if len(sys.argv) > 3 else 1   # the chain's deferred-execution depth: header n+depth carries block n's result
 B = '/data/blockchain/rust-fleet7-bench'; S = '/data/n42-build/target-n42-rs/fleet-runs'
 def load(name, path):
     spec = importlib.util.spec_from_file_location(name, path); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
@@ -42,15 +42,15 @@ samples = {}
 try:
     for n in nums:
         blk = call('eth_getBlockByNumber', [hex(n), False]); hashes = blk['transactions']
-        nxt = call('eth_getBlockByNumber', [hex(n + 1), False])
+        nxt = call('eth_getBlockByNumber', [hex(n + depth), False])
         rc = call('eth_getBlockReceipts', [hex(n)])
         ok = len(hashes) == counts[n] and len(rc) == len(hashes)
         st = sum(1 for r in rc if r.get('status') in ('0x1', 1, True)); cum = [int(r['cumulativeGasUsed'], 16) for r in rc]
         rising = all(a < b for a, b in zip(cum, cum[1:]))
-        # deferred execution: a header carries its PARENT's execution, so block n's receipts must end at block n+1's header gasUsed
+        # deferred execution: a header carries the execution of its ancestor `depth` back (1: the parent), so block n's receipts must end at block n+depth's header gasUsed
         gas_ok = bool(cum) and cum[-1] == int(nxt['gasUsed'], 16)
         same = all(h == r['transactionHash'] for h, r in zip(hashes, rc))
-        print(f'block {n}: {len(hashes)} txs (log {counts[n]}), {len(rc)} receipts, status ok {st}, cumulative gas rising: {rising}, ends at {cum[-1] if cum else 0:,} = block {n + 1} header gasUsed {int(nxt["gasUsed"], 16):,}: {gas_ok}, receipt hashes equal the block hash list in order: {same}')
+        print(f'block {n}: {len(hashes)} txs (log {counts[n]}), {len(rc)} receipts, status ok {st}, cumulative gas rising: {rising}, ends at {cum[-1] if cum else 0:,} = block {n + depth} header gasUsed {int(nxt["gasUsed"], 16):,}: {gas_ok}, receipt hashes equal the block hash list in order: {same}')
         if not (ok and st == len(rc) and rising and gas_ok and same): bad.append(f'block {n}: count/status/gas/hash order')
         idx = sorted({0, len(hashes) // 4, len(hashes) // 2, 3 * len(hashes) // 4, len(hashes) - 1})
         for i in idx:

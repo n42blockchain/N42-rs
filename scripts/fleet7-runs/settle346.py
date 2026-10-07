@@ -19,14 +19,15 @@ for i in range(4):
     print(f'  {time.strftime("%H:%M:%S")} latest {row["latest"]}, safe {row["safe"]}, finalized {row["finalized"]}' + (f'; latest-safe {row["latest"][0] - row["safe"][0]}, latest-finalized {row["latest"][0] - row["finalized"][0]}' if row['safe'] and row['finalized'] else ''))
     if not (row['safe'] and row['finalized']) or not (row['finalized'][0] <= row['safe'][0] <= row['latest'][0]): bad.append('tag order / missing')
     time.sleep(2)
-pat = re.compile(r'-3800[0-9]|invalid forkchoice|forkchoice.*(refus|invalid)|unknown ancestor|ParentUnknown', re.I)
+# the layer's INFO `Received invalid forkchoice updated message head=safe=finalized` appears at depth 1 as well (220-285 lines a leg) and is not an error line here
+pat = re.compile(r'-3800[0-9]|forkchoice.*(refus|rejected)|unknown ancestor|ParentUnknown', re.I)
 hits = []
 for f in [f'{B}/node0/el.log'] + sorted(glob.glob(f'{B}/node*/v.log')):
     try:
         for l in open(f, errors='replace'):
             if pat.search(l): hits.append((f.split('/')[-2], re.sub(r'\x1b\[[0-9;]*m', '', l.strip())[:200]))
     except OSError: pass
-print(f'  settlement / forkchoice error lines (-3800x, invalid forkchoice, refused, ParentUnknown): {len(hits)}')
+print(f'  settlement / forkchoice error lines (-3800x, refused, unknown ancestor, ParentUnknown): {len(hits)}')
 for h in hits[:6]: print('    ', h)
 if hits: bad.append('error lines')
 print('RESULT', 'BAD: ' + '; '.join(bad) if bad else 'ok')

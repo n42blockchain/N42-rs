@@ -97,6 +97,7 @@ def derive(suffix):
     k = "if [ \"$tag\" = loop346CB ]"
     assert k in run
     run = run.replace(k, "if [ \"$tag\" = loop346A2 ]")
+    run = run.replace('check340.py $tag 2>&1 | cut -c1-420 | tee $S/check340-$tag.out', 'check340.py $tag 8700 2 2>&1 | cut -c1-420 | tee $S/check340-$tag.out')
     k = '[ "${PIPESTATUS[0]}" = 1 ] && STOPNOW=1; echo "== read-back check done $(date +%H:%M:%S)"; fi'
     assert k in run
     run = run.replace(k, '[ "${PIPESTATUS[0]}" = 1 ] && STOPNOW=1; echo "== settlement tags of $tag"; python3 scripts/fleet7-runs/settle346.py $tag 2>&1 | cut -c1-300 | tee $S/settle346-$tag.out; [ "${PIPESTATUS[0]}" = 1 ] && STOPNOW=1; echo "== read-back check done $(date +%H:%M:%S)"; fi')

@@ -24,7 +24,7 @@ class FleetGuards(unittest.TestCase):
 
     def test_each_binary_and_shared_source_is_checked(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp) / 'src' / 'checkout'
             (root / 'crates/tx/src').mkdir(parents=True)
             (root / 'bin').mkdir()
             (root / 'crates/n42/h2-node/examples').mkdir(parents=True)
@@ -38,6 +38,9 @@ class FleetGuards(unittest.TestCase):
             for binary in binaries:
                 binary.write_text('#!/bin/sh\nexit 0\n')
                 binary.chmod(0o755)
+            # The checkout itself lives below /src/, which must not make
+            # an unrelated example count as shared production source.
+            (root / 'crates/n42/h2-node/examples/unrelated.rs').write_text('// example\n')
             env = dict(os.environ, AUDIT_FIXTURE=str(root), F7_SKIP_STALE_CHECK='0')
             command = ['bash', '-c', 'source "$1/scripts/fleet7-env.sh"; '
                        'REPO=$AUDIT_FIXTURE; F7_BIN=$REPO/built; f7_check_binary_fresh',

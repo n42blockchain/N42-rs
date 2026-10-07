@@ -36,7 +36,8 @@ f7_check_binary_fresh() {
     # Include shared transaction, execution and state dependencies, not just
     # validator sources. Tests and unrelated examples do not enter these bins.
     newest=$(find "$REPO/crates" "$REPO/bin" \
-      \( -path '*/src/*.rs' -o -name Cargo.toml \) -newer "$bin" -print -quit)
+      \( -type d \( -name examples -o -name tests -o -name benches \) -prune \) -o \
+      \( -type f \( -name '*.rs' -o -name Cargo.toml \) -newer "$bin" -print -quit \))
     if [[ -z $newest && "$REPO/Cargo.lock" -nt $bin ]]; then newest=$REPO/Cargo.lock; fi
     if [[ -z $newest && "$REPO/Cargo.toml" -nt $bin ]]; then newest=$REPO/Cargo.toml; fi
     case $bin in

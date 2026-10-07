@@ -861,6 +861,54 @@ struct Prepared<T: PoolTransaction> {
     made_at: std::time::Instant,
     /// Its preparation, lock wait included.
     prep_us: u64,
+    /// The body the plan-ahead hook makes from it (`N42_PLAN_AHEAD_BODY`),
+    /// `None` without a hook.
+    body: Option<Arc<Mutex<BodySlot>>>,
+}
+
+/// What the builder made of a prepared plan's transactions while the parent
+/// executed (`N42_PLAN_AHEAD_BODY=1`, `docs/SHARED_EXECUTION_SCOPE.md` 16.4
+/// item 2): opaque to the queue, made by the hook the builder installed
+/// ([`TxQueue::set_plan_ahead_hook`]) and handed back with the plan it was
+/// made from ([`QueueBest::take_prepared_body`]). It lives in the
+/// [`Prepared`] plan, so every discard of the plan drops it too.
+pub type PreparedBody = Box<dyn Any + Send + Sync>;
+
+/// The hook that makes a [`PreparedBody`] from a prepared plan's segments
+/// (each frame's transactions and how many the plan takes from its start,
+/// in plan order). Run on the thread that prepared the plan, after the
+/// lanes' lock is released; `None` makes no body.
+pub type PlanAheadHook<T> = Arc<dyn Fn(&[(FrameTxs<T>, usize)]) -> Option<PreparedBody> + Send + Sync>;
+
+/// A prepared plan's body, filled by the hook once it ran.
+#[derive(Default)]
+struct BodySlot {
+    body: Option<PreparedBody>,
+    /// The hook's own time.
+    made_us: u64,
+}
+
+/// What a build found of its plan's prepared body
+/// ([`QueueBest::take_prepared_body`]).
+pub enum PreparedBodyTake {
+    /// The build did not stand on a prepared plan, the plan was topped up,
+    /// or no hook was installed.
+    None,
+    /// The hook had not finished when the build asked: the build makes its
+    /// body itself.
+    Late,
+    /// The body made with the plan, and the hook's time.
+    Ready(PreparedBody, u64),
+}
+
+impl std::fmt::Debug for PreparedBodyTake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Late => f.write_str("Late"),
+            Self::Ready(_, made_us) => f.debug_tuple("Ready").field(made_us).finish(),
+        }
+    }
 }
 
 /// Why a prepared plan was not used ([`FrameSelectTimes::ahead_discard`]).
@@ -1283,6 +1331,8 @@ pub struct TxQueue<T: PoolTransaction> {
     in_hand: Arc<std::sync::atomic::AtomicUsize>,
     /// `N42_TX_QUEUE_DRAIN_CHUNK` unless a test said otherwise.
     drain_chunk: Arc<std::sync::atomic::AtomicUsize>,
+    /// The builder's plan-ahead hook ([`Self::set_plan_ahead_hook`]).
+    ahead_hook: Arc<Mutex<Option<PlanAheadHook<T>>>>,
 }
 
 /// Frames noted since the last drain, each with its transactions when the
@@ -1302,6 +1352,7 @@ impl<T: PoolTransaction> Clone for TxQueue<T> {
             depth: Arc::clone(&self.depth),
             in_hand: Arc::clone(&self.in_hand),
             drain_chunk: Arc::clone(&self.drain_chunk),
+            ahead_hook: Arc::clone(&self.ahead_hook),
         }
     }
 }
@@ -1461,6 +1512,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             depth: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             in_hand: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             drain_chunk: Arc::new(std::sync::atomic::AtomicUsize::new(drain_chunk())),
+            ahead_hook: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2458,6 +2510,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             frame_mode: false,
             frames_ended: false,
             segments: VecDeque::new(),
+            prepared_body: None,
         }
     }
 
@@ -2514,6 +2567,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         let mut times = FrameSelectTimes::default();
         let mut garbage = PruneGarbage::default();
         let at = std::time::Instant::now();
+        let mut prepared_body: Option<Arc<Mutex<BodySlot>>> = None;
         let (segments, plan) = {
             let mut inner = self.lock_inner();
             times.lock_us = at.elapsed().as_micros() as u64;
@@ -2524,7 +2578,8 @@ impl<T: PoolTransaction> TxQueue<T> {
             let verdict = inner.prepared.as_ref().map(|prepared| inner.prepared_verdict(prepared, parent, gas_limit));
             match (verdict, inner.prepared.take()) {
                 (Some(Ok(())), Some(prepared)) => {
-                    let Prepared { gas_used, cut, segments, plan, taken, made_at, prep_us, .. } = prepared;
+                    let Prepared { gas_used, cut, segments, plan, taken, made_at, prep_us, body, .. } = prepared;
+                    prepared_body = body;
                     times.ahead = 1;
                     times.ahead_age_us = made_at.elapsed().as_micros() as u64;
                     times.ahead_prep_us = prep_us;
@@ -2547,6 +2602,9 @@ impl<T: PoolTransaction> TxQueue<T> {
                         times.slow = more_times.slow;
                         times.counted = more_times.counted;
                         if !more_plan.frames.is_empty() {
+                            // A topped-up plan is not the one the body was
+                            // made from.
+                            prepared_body = None;
                             times.ahead = 2;
                             times.ahead_topup_txs = more_plan.tx_count();
                             segments.extend(more);
@@ -2604,6 +2662,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             frame_mode: true,
             frames_ended: false,
             segments: segments.into_iter().map(|(txs, taken)| (txs, 0, taken)).collect(),
+            prepared_body,
         };
         (best, plan, times)
     }
@@ -2622,6 +2681,9 @@ impl<T: PoolTransaction> TxQueue<T> {
     fn prepare_next_in(&self, gas_limit: u64, mode: SelectMode) -> bool {
         let at = std::time::Instant::now();
         let mut garbage = PruneGarbage::default();
+        let hook = self.ahead_hook.lock().clone();
+        // The plan's segments and its body's slot, for the hook after the lock.
+        let mut body_job: Option<(Vec<(FrameTxs<T>, usize)>, Arc<Mutex<BodySlot>>)> = None;
         let prepared = {
             let mut inner = self.lock_inner();
             self.drain_inbox(&mut inner);
@@ -2656,6 +2718,13 @@ impl<T: PoolTransaction> TxQueue<T> {
                 }
                 let cut = plan.frames.last().is_some_and(|frame| frame.taken < frame.len);
                 let after = inner.builds;
+                // A clone of each frame's `Arc` (a few hundred), not of its
+                // transactions: the hook reads them outside the lock.
+                let body = hook.is_some().then(|| {
+                    let slot = Arc::new(Mutex::new(BodySlot::default()));
+                    body_job = Some((segments.clone(), Arc::clone(&slot)));
+                    slot
+                });
                 inner.prepared = Some(Prepared {
                     after,
                     gas_used: gas_limit.saturating_sub(gas_left),
@@ -2666,12 +2735,74 @@ impl<T: PoolTransaction> TxQueue<T> {
                     lowest,
                     made_at: std::time::Instant::now(),
                     prep_us: at.elapsed().as_micros() as u64,
+                    body,
                 });
                 true
             }
         };
         garbage.free();
+        // The body, made off the lanes' lock. A build that takes the plan
+        // before this ends finds the slot empty and makes its own.
+        if let (Some(hook), Some((segments, slot))) = (hook, body_job) {
+            let at = std::time::Instant::now();
+            let body = hook(&segments);
+            let made_us = at.elapsed().as_micros() as u64;
+            let mut slot = slot.lock();
+            slot.body = body;
+            slot.made_us = made_us;
+        }
         prepared
+    }
+
+    /// Installs the builder's plan-ahead hook (`N42_PLAN_AHEAD_BODY=1`): every
+    /// plan prepared from now on ([`Self::prepare_next_plan`]) has a body made
+    /// from its segments by `hook`, kept with the plan and handed to the build
+    /// that uses it whole ([`QueueBest::take_prepared_body`]). Replaces any
+    /// earlier hook.
+    pub fn set_plan_ahead_hook(&self, hook: PlanAheadHook<T>) {
+        *self.ahead_hook.lock() = Some(hook);
+    }
+
+    /// Whether a plan-ahead hook is installed.
+    pub fn has_plan_ahead_hook(&self) -> bool {
+        self.ahead_hook.lock().is_some()
+    }
+
+    /// The hand-off of a build whose sealed block is, by the builder's
+    /// construction, its whole take in take order (`N42_PLAN_AHEAD_BODY=1`:
+    /// a frame build sealed on its batches' counters with every candidate
+    /// executed): the taken list is forgotten as mined in O(1), with the
+    /// length and the `(position, sender, nonce)` points in `checks` compared
+    /// instead of every position ([`Self::forget_mined_parallel`]'s whole
+    /// case). `None` -- nothing changed -- when the build on `parent` is not
+    /// the one described; the caller then runs the full hand-off.
+    pub fn forget_whole_take(
+        &self,
+        parent: B256,
+        len: usize,
+        checks: &[(usize, Address, u64)],
+    ) -> Option<(Vec<Arc<ValidPoolTransaction<T>>>, ForgetTimes)> {
+        let mut times = ForgetTimes::default();
+        let at = std::time::Instant::now();
+        let mut inner = self.lock_inner();
+        times.lock_us = at.elapsed().as_micros() as u64;
+        let build = inner.builds;
+        let Some((built_on, taken)) = inner.last_build.as_mut() else { return None };
+        if *built_on != parent || taken.len() != len || len == 0 {
+            return None;
+        }
+        let matches = checks
+            .iter()
+            .all(|(i, sender, nonce)| taken.get(*i).is_some_and(|t| t.sender() == *sender && t.nonce() == *nonce));
+        if !matches {
+            return None;
+        }
+        times.taken_len = len;
+        times.first_miss = usize::MAX;
+        times.whole = true;
+        let whole = std::mem::take(taken);
+        inner.handed = Some(Handed { build, block: None });
+        Some((whole, times))
     }
 
     /// The frame layout of a body, from this node's frame index: each
@@ -3685,6 +3816,9 @@ pub struct QueueBest<T: PoolTransaction> {
     /// A frame build's first refusal: nothing more is offered, since a body
     /// with a hole in a frame is not frame-aligned.
     frames_ended: bool,
+    /// The body made with the prepared plan this build stands on, when the
+    /// plan was used whole (not topped up) and a hook made one.
+    prepared_body: Option<Arc<Mutex<BodySlot>>>,
 }
 
 /// Where a frame build's selection ([`TxQueue::frames_for_build_timed`])
@@ -3815,6 +3949,19 @@ impl<T: PoolTransaction> Inner<T> {
 }
 
 impl<T: PoolTransaction> QueueBest<T> {
+    /// The body made with the prepared plan this build stands on
+    /// (`N42_PLAN_AHEAD_BODY=1`, [`TxQueue::set_plan_ahead_hook`]): only when
+    /// the plan was used whole, once. [`PreparedBodyTake::Late`] when the
+    /// hook had not finished.
+    pub fn take_prepared_body(&mut self) -> PreparedBodyTake {
+        let Some(slot) = self.prepared_body.take() else { return PreparedBodyTake::None };
+        let mut slot = slot.lock();
+        match slot.body.take() {
+            Some(body) => PreparedBodyTake::Ready(body, slot.made_us),
+            None => PreparedBodyTake::Late,
+        }
+    }
+
     /// A frame build's planned frames not yet handed out, all at once, in
     /// plan order: each frame's shared transactions and the range of them
     /// still to hand out. The iterator then offers nothing of them, and they

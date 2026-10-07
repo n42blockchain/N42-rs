@@ -149,6 +149,8 @@ fn every_invalidation_discards_the_prepared_plan_and_loses_nothing() {
     ];
     for (case, want) in cases {
         let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        // With a body made with every plan: a discarded plan's body goes with it.
+        queue.set_plan_ahead_hook(pairs_hook());
         fill(&queue, 40, 12, 5, 0);
         let total = queue.len();
         let p0 = block_hash(0);
@@ -211,6 +213,7 @@ fn every_invalidation_discards_the_prepared_plan_and_loses_nothing() {
         let (mut best, plan, times) = queue.frames_for_build_ahead(parent_of_2, gas_2, SelectMode::Parallel, false);
         assert_eq!(times.ahead, 0, "{case}");
         assert_eq!(times.ahead_discard, Some(want), "{case}");
+        assert!(matches!(best.take_prepared_body(), PreparedBodyTake::None), "{case}: the body went with its plan");
         let txs: Vec<Tx> = best.by_ref().collect();
         drop(best);
         assert_eq!(txs.len(), plan.tx_count(), "{case}");
@@ -234,6 +237,7 @@ fn every_invalidation_discards_the_prepared_plan_and_loses_nothing() {
 fn a_prune_of_a_frame_in_the_prepared_plan_discards_it() {
     let gas = 120 * 21_000;
     let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+    queue.set_plan_ahead_hook(pairs_hook());
     fill(&queue, 40, 12, 5, 0);
     let p0 = block_hash(0);
     let (mut best, _, _) = queue.frames_for_build_ahead(p0, gas, SelectMode::Parallel, false);
@@ -255,6 +259,7 @@ fn a_prune_of_a_frame_in_the_prepared_plan_discards_it() {
     assert!(queue.lock_inner().prepared.is_none(), "the prune discarded it");
     let (mut best, _, times) = queue.frames_for_build_ahead(B256::repeat_byte(0xcc), gas, SelectMode::Parallel, false);
     assert_eq!(times.ahead, 0);
+    assert!(matches!(best.take_prepared_body(), PreparedBodyTake::None), "the body went with its plan");
     let next: Vec<Tx> = best.by_ref().collect();
     drop(best);
     assert!(next.iter().all(|t| t.sender() != who || t.nonce() > nonce), "a mined nonce was offered");
@@ -365,4 +370,105 @@ fn a_build_takes_its_frames_whole() {
     assert_eq!(pairs(&whole), pairs(&walked));
     assert_eq!(whole.len(), plan.tx_count());
     assert_eq!(queue.len(), reference.len());
+}
+
+/// A plan-ahead hook for the tests: the plan's (sender, nonce) pairs in plan
+/// order, as the builder's body would list them.
+fn pairs_hook() -> PlanAheadHook<EthPooledTransaction> {
+    Arc::new(|segments: &[(FrameTxs<EthPooledTransaction>, usize)]| {
+        let all: Vec<Tx> = segments.iter().flat_map(|(txs, taken)| txs[..*taken].to_vec()).collect();
+        Some(Box::new(pairs(&all)) as PreparedBody)
+    })
+}
+
+/// `N42_PLAN_AHEAD_BODY=1`: the body made with each prepared plan is handed
+/// to the build that stands on that plan, and it is that build's take, in
+/// order, block for block, at four gas limits; a topped-up plan hands none
+/// (its take is not the plan the body was made from), and the chain is the
+/// one built without hook or preparation.
+#[test]
+fn a_prepared_body_is_the_take_of_the_build_on_its_plan() {
+    for gas_txs in [7u64, 60, 333, 700] {
+        let gas = gas_txs * 21_000;
+        let (fresh, _) = chain(false, 6, gas, |_, _| {});
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        queue.set_plan_ahead_hook(pairs_hook());
+        assert!(queue.has_plan_ahead_hook());
+        fill(&queue, 40, 12, 5, 0);
+        let mut parent = block_hash(0);
+        let mut blocks = Vec::new();
+        for n in 1..=6u64 {
+            let (mut best, plan, times) = queue.frames_for_build_ahead(parent, gas, SelectMode::Parallel, false);
+            let body = best.take_prepared_body();
+            queue.prepare_next_in(gas, SelectMode::Parallel);
+            let txs: Vec<Tx> = best.by_ref().collect();
+            drop(best);
+            assert_eq!(plan.tx_count(), txs.len());
+            match body {
+                PreparedBodyTake::Ready(body, _) => {
+                    assert_eq!(times.ahead, 1, "gas {gas_txs}, block {n}");
+                    let made = body.downcast::<Vec<(Address, u64)>>().expect("the hook's type");
+                    assert_eq!(*made, pairs(&txs), "gas {gas_txs}, block {n}: the body is the take");
+                }
+                PreparedBodyTake::None => assert!(n == 1 || times.ahead != 1 || txs.is_empty(), "gas {gas_txs}, block {n}: {times:?}"),
+                PreparedBodyTake::Late => panic!("the hook runs inside the preparation here"),
+            }
+            let hash = block_hash(n);
+            seal(&queue, parent, n, hash, &txs);
+            parent = hash;
+            blocks.push(txs);
+        }
+        assert_eq!(
+            fresh.iter().map(|b| pairs(b)).collect::<Vec<_>>(),
+            blocks.iter().map(|b| pairs(b)).collect::<Vec<_>>(),
+            "gas {gas_txs} txs"
+        );
+    }
+}
+
+/// The O(1) hand-off of a whole take (`N42_PLAN_AHEAD_BODY=1`): on a build
+/// whose block is its take it forgets exactly what the position-by-position
+/// hand-off forgets, and marks the take handed so the next prepared plan is
+/// accepted; on a parent, a length or a point that does not match it changes
+/// nothing and says so.
+#[test]
+fn the_whole_take_hand_off_is_the_compared_one() {
+    let gas = 120 * 21_000;
+    let run = |whole: bool| {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        fill(&queue, 40, 12, 5, 0);
+        let mut parent = block_hash(0);
+        let mut out = Vec::new();
+        for n in 1..=5u64 {
+            let (mut best, _, times) = queue.frames_for_build_ahead(parent, gas, SelectMode::Parallel, false);
+            queue.prepare_next_in(gas, SelectMode::Parallel);
+            let txs: Vec<Tx> = best.by_ref().collect();
+            drop(best);
+            if n > 1 {
+                assert_eq!(times.ahead, 1, "block {n}");
+            }
+            let hash = block_hash(n);
+            let body = pairs(&txs);
+            let (dropped, forget) = if whole {
+                let last = body.len() - 1;
+                let checks: Vec<(usize, Address, u64)> =
+                    [0, last / 2, last].into_iter().map(|i| (i, body[i].0, body[i].1)).collect();
+                // What does not match changes nothing.
+                assert!(queue.forget_whole_take(block_hash(99), body.len(), &checks).is_none());
+                assert!(queue.forget_whole_take(parent, body.len() + 1, &checks).is_none());
+                let wrong = [(last, body[last].0, body[last].1 + 1)];
+                assert!(queue.forget_whole_take(parent, body.len(), &wrong).is_none());
+                queue.forget_whole_take(parent, body.len(), &checks).expect("the whole take")
+            } else {
+                queue.forget_mined_parallel(parent, body.len(), |i| body[i])
+            };
+            assert!(forget.whole, "block {n}");
+            assert_eq!(pairs(&dropped), body, "block {n}");
+            queue.hold_own_block(n, hash, dropped);
+            parent = hash;
+            out.push(body);
+        }
+        (out, queue.len())
+    };
+    assert_eq!(run(true), run(false));
 }

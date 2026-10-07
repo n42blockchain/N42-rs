@@ -34,6 +34,31 @@ class FleetGuards(unittest.TestCase):
             slot = args.index('--engine.num-state-masking-blocks')
             self.assertEqual(args[slot + 1], override or '0')
 
+    def test_rpc_start_log_does_not_make_a_dead_node_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'node0/el.log'
+            log.parent.mkdir()
+            log.write_text('RPC auth server started\n')
+            env = dict(os.environ, F7_ROOT=tmp)
+            result = subprocess.run(['bash', '-c', 'source "$1/scripts/fleet7-env.sh"; '
+                                     'f7_pid() { return 1; }; f7_wait_el_ready 0 1',
+                                     'guard', str(REPO)], env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('exited during startup', result.stderr)
+
+    def test_unavailable_chain_is_not_a_zero_base_fee(self):
+        for response, expected in [('{"result":{"baseFeePerGas":"0x0"}}', 0),
+                                   ('{"result":null}', 1), ('{"error":{"code":-32000}}', 1)]:
+            env = dict(os.environ, MOCK_RPC=response)
+            result = subprocess.run(['bash', '-c', 'source "$1/scripts/fleet7-env.sh"; '
+                                     'curl() { printf "%s" "$MOCK_RPC"; }; f7_read_basefee',
+                                     'guard', str(REPO)], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, expected, result.stderr)
+            if expected:
+                self.assertIn('cannot read the live chain', result.stderr)
+            else:
+                self.assertEqual(result.stdout.strip(), '0')
+
     def test_each_binary_and_shared_source_is_checked(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'src' / 'checkout'

@@ -79,12 +79,7 @@ cmd_up() {
   # build, which on a fleet that all starts at once is every view.
   for ((i = 0; i < F7_ELS; i++)); do
     d=$(f7_el_dir "$i")
-    for _ in $(seq 1 120); do
-      grep -aq "RPC auth server started" "$d/el.log" 2>/dev/null && break
-      sleep 1
-    done
-    grep -aq "RPC auth server started" "$d/el.log" || {
-      echo "node $i: execution layer never opened its auth port; see $d/el.log" >&2; exit 1; }
+    f7_wait_el_ready "$i" || exit 1
   done
   echo "execution layers up"
 

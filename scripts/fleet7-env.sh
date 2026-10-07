@@ -945,6 +945,40 @@ f7_pid() {
   echo "$pid"
 }
 
+# A missing node is not a zero base fee. Refuse a measurement when the
+# chain's latest header cannot be read.
+f7_read_basefee() {
+  curl -fsS --max-time 5 -X POST -H 'content-type: application/json' \
+    --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["latest",false]}' \
+    "http://127.0.0.1:$F7_HTTP_BASE" | \
+    python3 -c 'import sys,json; print(int(json.load(sys.stdin)["result"]["baseFeePerGas"],16))' 2>/dev/null || {
+      echo "REFUSING: cannot read the live chain base fee" >&2
+      return 1
+    }
+}
+
+# Startup logs can precede a fatal configuration check. Require a live
+# recorded process and an answering RPC, rather than an old log line.
+f7_wait_el_ready() {
+  local i=$1 attempts=${2:-120} d attempt
+  d=$(f7_el_dir "$i")
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    if ! f7_pid "$i" el > /dev/null; then
+      echo "node $i: execution layer exited during startup; see $d/el.log" >&2
+      return 1
+    fi
+    if curl -fsS --max-time 2 -H 'content-type: application/json' \
+      --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+      "http://127.0.0.1:$((F7_HTTP_BASE + i))" 2>/dev/null | \
+      python3 -c 'import json,sys; r=json.load(sys.stdin); sys.exit(0 if isinstance(r.get("result"), str) and r["result"].startswith("0x") else 1)' 2>/dev/null; then
+      f7_pid "$i" el > /dev/null && return 0
+    fi
+    sleep 1
+  done
+  echo "node $i: execution layer RPC never became ready; see $d/el.log" >&2
+  return 1
+}
+
 # f7_stop <index> <el|v> [timeout] -- SIGTERM and wait. NEVER SIGKILL: a hard
 # kill truncates the MDBX spill and leaves the QMDB forest snapshot behind the
 # database head, which is a node that will not start again.

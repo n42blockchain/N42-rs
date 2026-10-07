@@ -370,12 +370,7 @@ echo "memory       : $(awk '/^MemFree|^Cached:|^Shmem:/{printf "%s %.1fG  ", $1,
 # because a round that starts above it is not measuring the tier it claims to.
 : "${DECAY_TARGET:=100000}"
 : "${DECAY_MAX_SEC:=180}"
-read_basefee() {
-  curl -s --max-time 5 -X POST -H 'content-type: application/json' \
-    --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["latest",false]}' \
-    "http://127.0.0.1:$F7_HTTP_BASE" \
-    | python3 -c "import sys,json;print(int(json.load(sys.stdin)['result']['baseFeePerGas'],16))" 2>/dev/null || echo 0
-}
+read_basefee() { f7_read_basefee; }
 DECAY_START=$SECONDS
 sleep "$DECAY_SEC"
 BASEFEE=$(read_basefee)

@@ -568,6 +568,30 @@ Order and dependencies: 0 -> 1 -> 2 -> {3, 4, 5, 6 independent; all before 5's f
 flip is the first moment a depth-2 genesis loads. Total estimate: ~1,350 lines of change, 60% tests, about 4-6 agent
 sessions; steps 0-2 and 4 are mechanical, 3 is the one that needs care (items 5 and 8).
 
+### 5.1 What steps 0-5 (and 7) actually took (2026-10-07, code only, no fleet leg)
+
+| step | commit | what landed | differs from the plan |
+| --- | --- | --- | --- |
+| 0 | `2f4d0ff07` | `ancestor_executed_fields(genesis, parent, depth)`, `ancestor_executed_fields_or_built`, `ancestor_hash` in `hotstuff_consensus.rs`; the old names call them with 1; `fields_from_child_header`'s doc says "depth-D ancestor" | none; a test pins the general form to the old one at depth 1 |
+| 1 | `8e19edeea` | `reth_chainspec::qmdb::{DEFERRED_EXECUTION_DEPTH_KEY, deferred_execution_depth, check_deferred_execution_depth, deferred_execution_depth_at, DeferredDepthError, SUPPORTED_DEFERRED_EXECUTION_DEPTH}` (additive); refused at start in `bin/n42/src/main.rs` and `h2_validator` (which also prints the depth); re-exported from `n42-qmdb-reth` | the strict parse also refuses a malformed `deferredExecutionTime` when the depth key is present (the gate's own lenient parser is unchanged); depth 1 with a gate after genesis is accepted; T1 lives in `n42-qmdb-reth/tests/deferred_depth.rs` because the vendored chainspec crate's lib tests do not build (`sepolia`, before this work) |
+| 2 | `8144674a2` | the rule as reth-free code in `n42-h2-consensus::deferred_depth` (`ParentLink`, `result_source`, `expected_fields`, `check_carried`, `certified_number`); `HotStuffConsensus::validate_header_against_parent` reads the depth per header; `ancestor_result_is_recorded` for waiters | the chain start is read off the **parent's own header** (blocks 1..D carry the genesis fields, which block 1's header carries too), not `chain_spec.genesis_header()`, so no QMDB genesis root is recomputed |
+| 3 | `3533fdd9b` (+ `f091ee285`) | `executed_fields::note_built(sealed, built)` + `built_of` (16 aliases; `get`/`wait_for` follow them), written in `build_on_own` (the one funnel for the three request constructions) only at depth >= 2; `carried_fields_for_seal` in both seal paths; `fields_at_seal::file_parent_under_seal_with_barrier` (the root job waits up to `PARENT_FIELDS_WAIT` for the parent's fields under its builder hash before the early rename) with `barrier_counts()`; phases line `rename_record_waits`, `rename_fallbacks`, `carried_depth`; `gas_limit_over_carried` at depth >= 2 | the alias is noted at the build request, not in `payload_serve.rs` (the pair is in hand in `build_on_own`); depth 1 notes no alias and passes no barrier, so its paths are the old ones |
+| 4 | `d34e3dbe6` | `wait_for_ancestor_fields` on the two vote-road sites (the three root-job waits stay on the parent: they stand for the parent's *tree*); `N42_PARENT_OUTPUTS_KEPT` (2..=16, default 4), `N42_FOLLOWER_SHARDS_KEPT` (1..=8, default 2) | `validate_against_parent` needed no change (it inherits step 2) |
+| 5 | `d786c7df1` | `ExecutionDriver::set_deferred_depth`; `Settlement::advance_at_depth` (depth 0 = before the gate, certified = the ancestor at distance D through the lineage); `h2_validator` sets it; the CHECKED-frame docs; `SUPPORTED_DEFERRED_EXECUTION_DEPTH` = 2; dev-chain tests: depth 1 explicit equals the stored depth-1 vectors, depth 2 builds 7 blocks + the fork and writes `testdata/deferred_execution_vectors_d2.json` | the dev chain is APoS-sealed (the harness has no HotStuff validator), so the vote rule is exercised through `ancestor_executed_fields` on every real block rather than through a validator process; the main chain carries transfers in 1-5 and the fork blocks 4f/5f are empty (a fork with its own transfer depended on when reth's pool re-injected the reorged transactions) |
+| 7 | `075786ea3` | `n42_fleet3_bench_d2.json`, `n42_fleet7_bench_d2.json` (`deferredExecutionDepth: 2`, extraData's first byte `0xd2`, so a different genesis hash and fork digest); the depth on the bench header line and in `fleet7-verify` | |
+
+Gate at the end (2026-10-07): `cargo check --workspace`; clippy clean on the changed lines of the touched crates;
+`n42-h2-consensus` 268, `n42-h2-execution` (lib 30 incl. 8 settlement, `settlement_tags` 11), `n42-h2-node` 134,
+`n42-h2-el-rpc` 92, `n42-qmdb-reth` (lib 58, `deferred_depth` 4), `n42-engine-types --lib` single-threaded 240,
+`n42 --lib` 136, `n42-testing` 28 (the stored depth-1 vectors unchanged and reproduced with the key set to 1;
+the depth-2 vectors twice byte-equal) -- all pass.
+
+A fleet leg at depth 2: `F7_GENESIS=crates/chainspec/res/genesis/n42_fleet7_bench_d2.json` (or the fleet3 one
+through `scripts/fleet3-env.sh`), nothing else; the gates are `rename_fallbacks` 0 on the leader's phases line,
+`fields_mismatches` 0, no `ParentUnknown`, `invalid_blocks` 0. Not done: step 6 (the restart journal: a node
+restarted on a depth-2 chain loses one leader view or abstains once), step 8 (the capacity maxima beyond the two
+env knobs), T13 (a mixed-depth mock loop; the refusal is pinned at unit level instead).
+
 **The legs after step 7** (not part of any step): (a) the three-node independent-execution smoke and the three fault
 legs of 4.7; (b) before any of it, a D=1 leg at pacing 45 ms with SES 17's switches on, to read the proposal-to-Decide
 time (risk 3) and `V`; (c) the E=1 pacing sweep at 200k in pairs; (d) 400k. Success is not a rate: it is

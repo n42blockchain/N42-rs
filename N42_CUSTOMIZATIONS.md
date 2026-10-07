@@ -415,6 +415,34 @@
   下给兄弟块重提议的 head 回退发零标签。只影响本节点 Engine API / RPC 语义
   （`eth_getBlockByNumber("safe"|"finalized")`），验证者之间交换的内容不变，APoS 路径不变。
   见 `docs/PHASE_D_DEFERRED_EXECUTION.md` 17.7。
+## 延迟执行深度 `deferredExecutionDepth`（chainspec 仅新增函数，其余不改 fork 的 reth crate）:
+- 创世 `config.deferredExecutionDepth`（缺省 1）：门控（`deferredExecutionTime`）之后，块 N 的头携带其本链上
+  第 D 代祖先的执行结果（`stateRoot`/`receiptsRoot`/`logsBloom`/`gasUsed`）；D=1 即父块（原语义），D=2 即祖父块，
+  块 1..=D 携带创世头自身的四个字段。按哈希（`parent.parent_hash`）取祖先，不查规范链。设计与规则见
+  `docs/DEFERRED_DEPTH_2_DESIGN.md`。
+- `crates/chainspec/src/qmdb.rs`（fork 的 reth crate，**仅新增**）：`DEFERRED_EXECUTION_DEPTH_KEY`、
+  `deferred_execution_depth`（严格解析：只接受整数 1 或 2；字符串、浮点、`null`、0、3 均拒绝；有深度无门控
+  拒绝；深度 >1 而门控晚于创世时间戳拒绝）、`check_deferred_execution_depth`（启动时调用，另拒绝本构建尚未
+  实现的深度：`SUPPORTED_DEFERRED_EXECUTION_DEPTH`）、`deferred_execution_depth_at`。`bin/n42/src/main.rs` 与
+  `h2_validator` 启动即校验，非法值拒绝启动而不是悄悄按 1 运行，并打印深度。
+- 规则本体：`crates/n42/h2-consensus/src/deferred_depth.rs`（无 reth 依赖：祖先哈希、结果来源、投票比较、
+  `certified_number`）；`engine-types/src/hotstuff_consensus.rs` 的 `ancestor_executed_fields(_or_built)`、
+  `ancestor_hash`、`ancestor_result_is_recorded`，`validate_header_against_parent` 按深度比较。
+- 出块器：`executed_fields::note_built(sealed, built)`（sealed→built 别名表，16 条；`get`/`wait_for` 经别名回落到
+  出块器哈希；只在 D≥2 时于 `build_on_own` 记入），seal 取祖父结果（`carried_fields_for_seal`）；根任务在早期改名
+  前等父块字段（`fields_at_seal::file_parent_under_seal_with_barrier`），阶段行新增 `rename_record_waits`、
+  `rename_fallbacks`（D=2 健康时应为 0）、`carried_depth`；D≥2 时 gas limit 不低于所携带的 `gasUsed`
+  （`gas_limit_over_carried`）。
+- 跟随者：投票路等待祖先结果（`wait_for_ancestor_fields`）；可纳入性检查与执行仍读父块输出；根任务对父块树的
+  等待不变。容量开关 `N42_PARENT_OUTPUTS_KEPT`（2..=16，缺省 4）、`N42_FOLLOWER_SHARDS_KEPT`（1..=8，缺省 2）。
+- 结算：`ExecutionDriver::set_deferred_depth`，D=2 时提交 B 认证 B-2（`safe` = 已提交块的祖父，`finalized`
+  仍受持久化高度限制）。
+- 测试向量：`crates/n42/n42-testing/testdata/deferred_execution_vectors_d2.json`（7 块 + 兄弟分叉）。
+  D=1 链（缺省或显式 1）逐字节不变。
+- 基准链 `crates/chainspec/res/genesis/n42_fleet3_bench_d2.json`、`n42_fleet7_bench_d2.json`：D=1 文件的副本，
+  `deferredExecutionDepth: 2`，`extraData` 首字节 0xd2（创世哈希、fork digest 与 gossip 主题因此不同）。
+  fleet 用 `F7_GENESIS=<该文件>` 选择；`fleet7-bench.sh` 头部打印 `chain : <文件>, deferred execution depth N`，
+  `fleet7-verify.py` 输出与 JSON 带 `deferred_depth`。未实现：重启日志（第 6 步，D=2 重启后丢一个出块视图或弃权一次）。
 
 ## 其他 N42 独有模块:
 - `crates/n42/clique/` - APoS 共识实现

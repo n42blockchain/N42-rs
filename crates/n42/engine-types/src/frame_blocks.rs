@@ -332,6 +332,8 @@ pub fn want_bulk(on: bool) {
     WANT_BULK.with(|slot| slot.set(on));
     if !on {
         BULK.with(|slot| slot.borrow_mut().take());
+        // A prepared build nobody took goes with its bulk vector.
+        PREPARED.with(|slot| slot.borrow_mut().take());
     }
 }
 

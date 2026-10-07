@@ -109,6 +109,34 @@ pub fn file_parent_under_seal(
     early: bool,
     wait_complete: impl FnOnce(),
 ) -> Result<ParentFiled, n42_qmdb_reth::NodeStateError> {
+    file_parent_under_seal_with_barrier(qmdb, parent_sealed, parent_built, early, None, wait_complete)
+}
+
+/// [`file_parent_under_seal`], with the barrier a depth-2 chain needs
+/// (`docs/DEFERRED_DEPTH_2_DESIGN.md` item 8).
+///
+/// At depth 1 the child's seal waited for the parent's *fields*, and the
+/// parent files its QMDB tree before it publishes them, so by the time the
+/// child's root job ran the parent's record was there and the early rename
+/// took it. At depth 2 the seal waits for the grandparent's fields instead,
+/// and in about half the blocks the parent's record is not yet filed when the
+/// child's root job starts: without a wait of its own the rename would fall
+/// back to the parent's `Complete` (~105 ms after its seal) and the root
+/// chain would silently stop being a pipeline. `record_wait`, when given,
+/// is that wait: up to that long for the parent's fields under its builder
+/// hash -- published right after its tree is filed -- before the early
+/// rename looks for the record. It runs in the root job, behind the seal.
+///
+/// Every early rename that still ends on the `Complete` wait is counted
+/// ([`barrier_counts`]): a fleet leg reads 0 there to prove the barrier holds.
+pub fn file_parent_under_seal_with_barrier(
+    qmdb: &n42_qmdb_reth::QmdbNodeState,
+    parent_sealed: B256,
+    parent_built: Option<B256>,
+    early: bool,
+    record_wait: Option<std::time::Duration>,
+    wait_complete: impl FnOnce(),
+) -> Result<ParentFiled, n42_qmdb_reth::NodeStateError> {
     let mut filed = ParentFiled::default();
     if qmdb.root_of(&parent_sealed).is_some() {
         return Ok(filed);
@@ -116,11 +144,25 @@ pub fn file_parent_under_seal(
     let Some(built) = parent_built.filter(|built| *built != parent_sealed) else {
         return Ok(filed);
     };
+    if early
+        && qmdb.root_of(&built).is_none()
+        && let Some(wait) = record_wait
+    {
+        RECORD_WAITS.fetch_add(1, Ordering::Relaxed);
+        let _ = crate::executed_fields::wait_for(&built, wait);
+        if qmdb.root_of(&parent_sealed).is_some() {
+            // The parent's own hand-off renamed it meanwhile.
+            return Ok(filed);
+        }
+    }
     if early && qmdb.root_of(&built).is_some() {
         crate::chain_alias::rename(qmdb, built, parent_sealed)?;
         filed.renamed = true;
         filed.early = true;
         return Ok(filed);
+    }
+    if early {
+        EARLY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
     }
     let at = std::time::Instant::now();
     wait_complete();
@@ -131,6 +173,17 @@ pub fn file_parent_under_seal(
         filed.renamed = true;
     }
     Ok(filed)
+}
+
+static RECORD_WAITS: AtomicU64 = AtomicU64::new(0);
+static EARLY_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// The process's barrier counts so far: root jobs that waited for the
+/// parent's record before the early rename (depth 2), and early renames that
+/// fell back to the parent's `Complete` anyway (`rename_fallbacks` on the
+/// phases line; 0 on a healthy depth-2 leg).
+pub fn barrier_counts() -> (u64, u64) {
+    (RECORD_WAITS.load(Ordering::Relaxed), EARLY_FALLBACKS.load(Ordering::Relaxed))
 }
 
 /// What the early path published a block's fields from.
@@ -539,6 +592,55 @@ mod tests {
         let overlaps = shards.overlaps(&residual);
         let view = shards.view(&residual, &overlaps);
         assert!(state.compute_operations(parent_sealed, n42_qmdb_reth::sorted_operations_from_accounts(&view, true)).is_ok());
+    }
+
+    /// T5 of docs/DEFERRED_DEPTH_2_DESIGN.md: at depth 2 the child's seal no
+    /// longer waits for the parent's fields, so its root job can start before
+    /// the parent's record is filed. With the barrier it waits for the
+    /// parent's fields (published right after the record) and still takes the
+    /// early path, never the parent's `Complete`; without it, it falls back
+    /// and the fallback is counted.
+    #[test]
+    fn at_depth_two_the_root_job_waits_for_the_parents_record_not_its_complete() {
+        let parent_built = B256::repeat_byte(0x81);
+        let parent_sealed = B256::repeat_byte(0x82);
+        let (state, genesis) = forest("depth-two-barrier");
+        let filer = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                file_parent(&state, genesis, parent_built);
+                crate::executed_fields::remember(
+                    parent_built,
+                    ExecutedFields { state_root: B256::repeat_byte(0x83), receipts_root: B256::ZERO, logs_bloom: Bloom::default(), gas_used: 0 },
+                );
+            })
+        };
+        let (waits, _) = barrier_counts();
+        let filed = file_parent_under_seal_with_barrier(
+            &state,
+            parent_sealed,
+            Some(parent_built),
+            true,
+            Some(std::time::Duration::from_secs(5)),
+            || panic!("the barrier makes the parent's Complete unnecessary"),
+        )
+        .expect("filed");
+        filer.join().expect("the parent's finish");
+        assert!(filed.early && filed.renamed && !filed.waited);
+        assert!(state.root_of(&parent_sealed).is_some());
+        assert!(barrier_counts().0 > waits);
+
+        // Without the barrier (depth 1's call) the same race ends on the
+        // parent's `Complete`, and that is what the counter reads.
+        let (late_state, genesis) = forest("depth-two-no-barrier");
+        let (_, fallbacks) = barrier_counts();
+        let filed = file_parent_under_seal(&late_state, parent_sealed, Some(parent_built), true, || {
+            file_parent(&late_state, genesis, parent_built);
+        })
+        .expect("filed");
+        assert!(filed.waited && !filed.early);
+        assert!(barrier_counts().1 > fallbacks);
     }
 
     #[test]

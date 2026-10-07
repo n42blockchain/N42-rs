@@ -54,9 +54,28 @@ impl Partial {
 /// restart the persisted head -- a few views' worth, generously.
 const KEEP: usize = 256;
 
+/// Sealed-to-built aliases kept ([`note_built`]): a depth-2 build needs its
+/// grandparent's, noted one block earlier; a few views of re-seals besides.
+const ALIASES_KEPT: usize = 16;
+
 struct Registry {
     by_hash: HashMap<B256, Partial>,
     order: VecDeque<B256>,
+    /// `(sealed, built)`, oldest first: a leader's own block is filed under
+    /// the hash its builder gave it and is known to its descendants by the
+    /// hash consensus sealed.
+    aliases: VecDeque<(B256, B256)>,
+}
+
+impl Registry {
+    /// The complete entry under `hash`, or under the builder hash `hash` is
+    /// an alias of.
+    fn complete(&self, hash: &B256) -> Option<ExecutedFields> {
+        self.by_hash.get(hash).and_then(Partial::complete).or_else(|| {
+            let built = self.aliases.iter().rev().find(|(sealed, _)| sealed == hash)?.1;
+            self.by_hash.get(&built).and_then(Partial::complete)
+        })
+    }
 }
 
 static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
@@ -65,7 +84,7 @@ static WRITTEN: std::sync::Condvar = std::sync::Condvar::new();
 
 fn with_registry<T>(f: impl FnOnce(&mut Registry) -> T) -> T {
     let mut guard = REGISTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let registry = guard.get_or_insert_with(|| Registry { by_hash: HashMap::new(), order: VecDeque::new() });
+    let registry = guard.get_or_insert_with(|| Registry { by_hash: HashMap::new(), order: VecDeque::new(), aliases: VecDeque::new() });
     let out = f(registry);
     drop(guard);
     WRITTEN.notify_all();
@@ -103,9 +122,41 @@ pub fn remember(block_hash: B256, fields: ExecutedFields) {
     });
 }
 
-/// A block's execution result, once both halves are in.
+/// A block's execution result, once both halves are in: under `block_hash`,
+/// or under the builder hash `block_hash` was noted as an alias of
+/// ([`note_built`]).
 pub fn get(block_hash: &B256) -> Option<ExecutedFields> {
-    with_registry(|registry| registry.by_hash.get(block_hash).and_then(Partial::complete))
+    with_registry(|registry| registry.complete(block_hash))
+}
+
+/// Notes that the block consensus sealed as `sealed` is the one this node's
+/// builder filed as `built` (`docs/DEFERRED_DEPTH_2_DESIGN.md` item 5).
+///
+/// A leader's own block has two hashes: its result is filed under the
+/// builder's the moment its build ends, and copied to the sealed one only at
+/// the own-block hand-off, about two cycles after the seal. At depth 1 the
+/// child's seal finds the parent through the builder hash it is handed; at
+/// depth 2 the child needs its *grandparent's* result, named only by the
+/// parent header's `parent_hash` (a sealed hash), before that hand-off has
+/// run. Noted where a build on the block is requested -- one block before it
+/// becomes a grandparent; a block re-sealed after a view change gets its new
+/// sealed hash noted the same way. [`get`] and [`wait_for`] follow it.
+pub fn note_built(sealed: B256, built: B256) {
+    if sealed == built {
+        return;
+    }
+    with_registry(|registry| {
+        registry.aliases.retain(|(known, _)| *known != sealed);
+        registry.aliases.push_back((sealed, built));
+        while registry.aliases.len() > ALIASES_KEPT {
+            registry.aliases.pop_front();
+        }
+    });
+}
+
+/// The builder hash `sealed` was noted as, if any.
+pub fn built_of(sealed: &B256) -> Option<B256> {
+    with_registry(|registry| registry.aliases.iter().rev().find(|(known, _)| known == sealed).map(|(_, built)| *built))
 }
 
 /// [`get`], waiting up to `timeout` for the fields to be recorded: a parent
@@ -115,11 +166,7 @@ pub fn wait_for(block_hash: &B256, timeout: std::time::Duration) -> Option<Execu
     let deadline = std::time::Instant::now() + timeout;
     let mut guard = REGISTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     loop {
-        if let Some(found) = guard
-            .as_ref()
-            .and_then(|registry| registry.by_hash.get(block_hash))
-            .and_then(Partial::complete)
-        {
+        if let Some(found) = guard.as_ref().and_then(|registry| registry.complete(block_hash)) {
             return Some(found);
         }
         let now = std::time::Instant::now();
@@ -180,5 +227,36 @@ mod tests {
             remember(B256::from(bytes), ExecutedFields { state_root: h(2), receipts_root: h(3), logs_bloom: Bloom::default(), gas_used: 1 });
         }
         assert_eq!(get(&h(1)), None, "the oldest entries are evicted");
+    }
+
+    #[test]
+    fn a_sealed_hash_noted_as_an_alias_finds_the_builders_entry() {
+        let h = |b: u8| B256::repeat_byte(b);
+        let fields = ExecutedFields { state_root: h(0xC1), receipts_root: h(0xC2), logs_bloom: Bloom::default(), gas_used: 7 };
+        // Filed under the builder's hash only, as a leader's own block is.
+        remember(h(0x31), fields);
+        assert_eq!(get(&h(0x32)), None, "nothing under the sealed hash yet");
+        note_built(h(0x32), h(0x31));
+        assert_eq!(built_of(&h(0x32)), Some(h(0x31)));
+        assert_eq!(get(&h(0x32)), Some(fields));
+        // A waiter on the sealed hash is woken by the builder's entry.
+        let waiter = std::thread::spawn(move || wait_for(&h(0x34), std::time::Duration::from_secs(2)));
+        note_built(h(0x34), h(0x33));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        remember(h(0x33), fields);
+        assert_eq!(waiter.join().expect("the waiter"), Some(fields));
+        // Re-sealed after a view change: the new sealed hash follows too, and
+        // re-noting a sealed hash replaces its builder hash.
+        note_built(h(0x35), h(0x31));
+        assert_eq!(get(&h(0x35)), Some(fields));
+        note_built(h(0x35), h(0x36));
+        assert_eq!(get(&h(0x35)), None, "the newer note wins");
+        // A self-alias is never noted; old aliases fall out.
+        note_built(h(0x37), h(0x37));
+        assert_eq!(built_of(&h(0x37)), None);
+        for i in 0..(ALIASES_KEPT as u8 + 2) {
+            note_built(h(0x40 + i), h(0x31));
+        }
+        assert_eq!(built_of(&h(0x32)), None, "the oldest aliases are evicted");
     }
 }

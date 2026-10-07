@@ -154,6 +154,50 @@ pub fn calculate_block_gas_limit(parent_gas_limit: u64, desired_gas_limit: u64) 
 }
 // reth/crates/ethereum/payload/src/config.rs
 
+/// The gas limit a block may take when its header carries another block's
+/// `gasUsed` (`deferredExecutionDepth` 2, docs/DEFERRED_DEPTH_2_DESIGN.md
+/// item 19): never below the carried gas, or the header fails
+/// `gas_used <= gas_limit`. `computed` is the ordinary step towards the
+/// desired limit; when it falls below the carried gas the limit is raised
+/// towards it, no further than the parent's limit allows. An unknown carried
+/// gas keeps the limit from shrinking at all.
+pub fn gas_limit_over_carried(computed: u64, parent_gas_limit: u64, carried_gas_used: Option<u64>) -> u64 {
+    let floor = carried_gas_used.unwrap_or(parent_gas_limit);
+    if computed >= floor {
+        return computed;
+    }
+    let max = parent_gas_limit.saturating_add((parent_gas_limit / GAS_LIMIT_BOUND_DIVISOR).saturating_sub(1));
+    floor.min(max).max(computed)
+}
+
+/// The fields a header carries, waited for when a build needs them:
+/// depth 1 is the parent's (under its sealed hash, or under `parent_built` as
+/// the builder filed it); depth 2 the grandparent's under the parent header's
+/// `parent_hash`, which [`crate::executed_fields`] follows to the builder's
+/// entry when this node built it (`note_built`).
+fn carried_fields_for_seal(
+    genesis: &alloy_genesis::Genesis,
+    parent: &reth_primitives_traits::SealedHeader,
+    parent_built: Option<B256>,
+    depth: u64,
+) -> Option<crate::executed_fields::ExecutedFields> {
+    if depth <= 1 {
+        return crate::hotstuff_consensus::parent_executed_fields_or_built(
+            genesis,
+            parent,
+            parent_built,
+            crate::hotstuff_consensus::PARENT_FIELDS_WAIT,
+        );
+    }
+    crate::hotstuff_consensus::ancestor_executed_fields_or_built(
+        genesis,
+        parent,
+        Some(parent.parent_hash),
+        depth,
+        crate::hotstuff_consensus::PARENT_FIELDS_WAIT,
+    )
+}
+
 type BestTransactionsIter<Pool> = Box<
     dyn BestTransactions<Item = Arc<ValidPoolTransaction<<Pool as TransactionPool>::Transaction>>>,
 >;
@@ -354,6 +398,14 @@ where
         let parent_hash = parent.hash();
         let parent_gas_limit = parent.gas_limit;
         let parent_built = parent_execution.built_hash();
+        // `deferredExecutionDepth` 2 (docs/DEFERRED_DEPTH_2_DESIGN.md item 5):
+        // the parent becomes the grandparent of the next build, whose header
+        // needs its result by the sealed hash, before the own-block hand-off
+        // has filed it there. The pair is in hand only here. Depth 1 notes
+        // nothing, so its lookups are what they were.
+        if reth_chainspec::qmdb::deferred_execution_depth_at(self.client.chain_spec().genesis(), attributes.timestamp) >= 2 {
+            crate::executed_fields::note_built(parent_hash, parent_built);
+        }
         let opener = match &parent_execution {
             crate::direct_build::ParentExecution::Ready(execution) => {
                 let executed = crate::direct_build::executed_under_seal(&parent, execution);
@@ -1186,7 +1238,20 @@ where
         timestamp: attributes.timestamp,
         suggested_fee_recipient: coinbase,
         prev_randao: attributes.prev_randao,
-        gas_limit: builder_config.gas_limit(parent_header.gas_limit),
+        gas_limit: {
+            let computed = builder_config.gas_limit(parent_header.gas_limit);
+            // `deferredExecutionDepth` 2 (docs/DEFERRED_DEPTH_2_DESIGN.md item
+            // 19): the header's `gasUsed` is the grandparent's, which a limit
+            // that shrank twice could fall under. Depth 1 is left as it was.
+            let depth = reth_chainspec::qmdb::deferred_execution_depth_at(chain_spec.genesis(), attributes.timestamp);
+            if depth >= 2 {
+                let carried = crate::hotstuff_consensus::ancestor_executed_fields(chain_spec.genesis(), &parent_header, depth)
+                    .map(|fields| fields.gas_used);
+                gas_limit_over_carried(computed, parent_header.gas_limit, carried)
+            } else {
+                computed
+            }
+        },
         parent_beacon_block_root: attributes.parent_beacon_block_root,
         withdrawals: attributes.withdrawals.clone().map(Into::into),
         extra_data: Default::default(),
@@ -1616,6 +1681,8 @@ where
     // which hash the builder gave this block's parent. The ordinary finish
     // needs it for exactly the same reason the early seal does.
     let parent_built = early_seal.as_ref().and_then(|early| early.parent_built);
+    // `deferredExecutionDepth`: which ancestor's result the header carries.
+    let carried_depth = reth_chainspec::qmdb::deferred_execution_depth_at(chain_spec.genesis(), attributes.timestamp);
     // `N42_SEAL_AT_EXEC=1`: the transactions root computed over the pulled
     // candidates beside the parallel step, whether the seal used it, and how
     // long the step's end waited for it.
@@ -1762,15 +1829,13 @@ where
             // The parent's execution, as this header carries it: recorded
             // under its sealed hash, or -- a parent finishing behind its own
             // seal -- arriving under the builder's hash a moment from now.
-            let parent_fields = crate::hotstuff_consensus::parent_executed_fields_or_built(
-                chain_spec.genesis(),
-                &parent_header,
-                parent_built,
-                crate::hotstuff_consensus::PARENT_FIELDS_WAIT,
-            )
-            .ok_or_else(|| {
-                PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(parent_sealed))
-            })?;
+            // At depth 2 the grandparent's (`parent_fields_ms` keeps its name).
+            let parent_fields = carried_fields_for_seal(chain_spec.genesis(), &parent_header, parent_built, carried_depth)
+                .ok_or_else(|| {
+                    PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(
+                        crate::hotstuff_consensus::ancestor_hash(&parent_header, carried_depth),
+                    ))
+                })?;
             let fields_ms = (seal_at.elapsed().as_millis() as u64).saturating_sub(root_ms);
             header.transactions_root = transactions_root;
             header.state_root = parent_fields.state_root;
@@ -3073,11 +3138,17 @@ where
             let rename_early = std::cell::Cell::new(false);
             let renamed_at = std::cell::Cell::new(None::<std::time::Instant>);
             let rename_parent = || -> Result<(), PayloadBuilderError> {
-                let filed = crate::fields_at_seal::file_parent_under_seal(
+                // At depth 2 this block's seal no longer waited for the
+                // parent's fields, which was what made sure the parent's tree
+                // was filed before this root job looked for it: the root job
+                // waits for them itself (docs/DEFERRED_DEPTH_2_DESIGN.md item 8).
+                let record_wait = (carried_depth >= 2).then_some(crate::hotstuff_consensus::PARENT_FIELDS_WAIT);
+                let filed = crate::fields_at_seal::file_parent_under_seal_with_barrier(
                     &qmdb_state,
                     parent_sealed,
                     parent_built,
                     fields_mode.early(),
+                    record_wait,
                     || {
                         if let Some(built) = parent_built {
                             let _ = crate::built_executions::wait_for(built, crate::built_executions::Stage::Complete);
@@ -3505,6 +3576,9 @@ where
                     fields_verified = crate::fields_at_seal::counts().0,
                     fields_unchecked = crate::fields_at_seal::counts().1,
                     fields_mismatches = crate::fields_at_seal::counts().2,
+                    rename_record_waits = crate::fields_at_seal::barrier_counts().0,
+                    rename_fallbacks = crate::fields_at_seal::barrier_counts().1,
+                    carried_depth,
                     finish_ms = finish_at.elapsed().as_millis() as u64,
                     total_ms = build_started.elapsed().as_millis() as u64,
                     reads_d0 = read_depth[0],
@@ -4341,13 +4415,14 @@ where
         // itself moments earlier, because its execution was still filed only
         // under the builder's hash (loop193 W1b: 289 of 347 refusals, each
         // 0.4-1.3 ms after the request).
-        let parent_fields = crate::hotstuff_consensus::parent_executed_fields_or_built(
-            chain_spec.genesis(),
-            &parent_header,
-            parent_built,
-            crate::hotstuff_consensus::PARENT_FIELDS_WAIT,
-        )
-        .ok_or_else(|| PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(parent_header.hash())))?;
+        // At depth 2 the grandparent's (docs/DEFERRED_DEPTH_2_DESIGN.md).
+        let carried_depth = reth_chainspec::qmdb::deferred_execution_depth_at(chain_spec.genesis(), attributes.timestamp);
+        let parent_fields = carried_fields_for_seal(chain_spec.genesis(), &parent_header, parent_built, carried_depth)
+            .ok_or_else(|| {
+                PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(
+                    crate::hotstuff_consensus::ancestor_hash(&parent_header, carried_depth),
+                ))
+            })?;
         header.state_root = parent_fields.state_root;
         header.receipts_root = parent_fields.receipts_root;
         header.logs_bloom = parent_fields.logs_bloom;
@@ -5058,5 +5133,101 @@ mod plan_body_tests {
             assert!(!fallback.4 && !fallback.5);
             assert_eq!(fallback.0, fresh_run.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod depth_two_tests {
+    use super::*;
+    use reth_primitives_traits::SealedHeader;
+    use alloy_consensus::Header;
+
+    /// T9 of docs/DEFERRED_DEPTH_2_DESIGN.md: the limit step never goes below
+    /// the carried `gasUsed`, and never further than the parent allows.
+    #[test]
+    fn the_gas_limit_never_falls_under_the_carried_gas() {
+        let parent = 30_000_000u64;
+        let step = parent / GAS_LIMIT_BOUND_DIVISOR - 1;
+        // A shrinking step under the carried gas is raised to it.
+        let shrink = calculate_block_gas_limit(parent, 10_000_000);
+        assert_eq!(shrink, parent - step);
+        assert_eq!(gas_limit_over_carried(shrink, parent, Some(parent - 10)), parent - 10);
+        // Never above the parent's ramp.
+        assert_eq!(gas_limit_over_carried(shrink, parent, Some(parent + 2 * step)), parent + step);
+        // Over the carried gas already: unchanged; growth is unchanged too.
+        assert_eq!(gas_limit_over_carried(shrink, parent, Some(1_000)), shrink);
+        let grow = calculate_block_gas_limit(parent, 60_000_000);
+        assert_eq!(gas_limit_over_carried(grow, parent, Some(parent)), grow);
+        // An unknown carried gas holds the limit where it was.
+        assert_eq!(gas_limit_over_carried(shrink, parent, None), parent);
+        // A fixed limit (the bench) is never touched.
+        assert_eq!(gas_limit_over_carried(parent, parent, Some(parent)), parent);
+    }
+
+    fn depth_two_genesis() -> alloy_genesis::Genesis {
+        let mut genesis = alloy_genesis::Genesis::default();
+        genesis.config.extra_fields.insert(reth_chainspec::qmdb::DEFERRED_EXECUTION_TIME_KEY.to_owned(), serde_json::json!(0));
+        genesis.config.extra_fields.insert(reth_chainspec::qmdb::DEFERRED_EXECUTION_DEPTH_KEY.to_owned(), serde_json::json!(2));
+        genesis
+    }
+
+    fn fields(byte: u8) -> crate::executed_fields::ExecutedFields {
+        crate::executed_fields::ExecutedFields {
+            state_root: B256::repeat_byte(byte),
+            receipts_root: B256::repeat_byte(byte ^ 1),
+            logs_bloom: Default::default(),
+            gas_used: u64::from(byte),
+        }
+    }
+
+    /// T4: a chained build whose grandparent's result is filed under the
+    /// builder hash only (the own-block hand-off has not run) seals, through
+    /// the alias noted when the parent's build was requested; after a view
+    /// timeout re-seals the grandparent the new sealed hash is noted and
+    /// followed; with nothing filed the build fails (the loud `ParentUnknown`).
+    #[test]
+    fn a_chained_build_finds_its_grandparent_through_the_alias() {
+        let genesis = depth_two_genesis();
+        let (gp_built, gp_sealed, gp_resealed) = (B256::repeat_byte(0xd1), B256::repeat_byte(0xd2), B256::repeat_byte(0xd3));
+        crate::executed_fields::remember(gp_built, fields(0xd4));
+        // The parent was built on the grandparent's sealed hash.
+        let parent = SealedHeader::new(
+            Header { number: 12, timestamp: 12, parent_hash: gp_sealed, ..Default::default() },
+            B256::repeat_byte(0xd5),
+        );
+        let no_alias = SealedHeader::new(
+            Header { number: 12, timestamp: 12, parent_hash: B256::repeat_byte(0xd6), ..Default::default() },
+            B256::repeat_byte(0xd7),
+        );
+        // With nothing under the sealed hash the build waits, then fails.
+        let short = std::time::Duration::from_millis(20);
+        assert_eq!(
+            crate::hotstuff_consensus::ancestor_executed_fields_or_built(&genesis, &no_alias, Some(no_alias.parent_hash), 2, short),
+            None
+        );
+        // The parent's build request noted (sealed, built) for the grandparent.
+        crate::executed_fields::note_built(gp_sealed, gp_built);
+        crate::executed_fields::remember(gp_built, fields(0xd4));
+        assert_eq!(carried_fields_for_seal(&genesis, &parent, Some(parent.hash()), 2), Some(fields(0xd4)));
+        // A re-seal of the grandparent (a view timeout): the request on the
+        // re-sealed block notes its new hash, and a parent on it finds it.
+        crate::executed_fields::note_built(gp_resealed, gp_built);
+        // Filed again: the registry is process-wide and bounded, and work
+        // other tests left running may have pushed the entry out meanwhile.
+        crate::executed_fields::remember(gp_built, fields(0xd4));
+        let on_resealed = SealedHeader::new(
+            Header { number: 12, timestamp: 13, parent_hash: gp_resealed, ..Default::default() },
+            B256::repeat_byte(0xd8),
+        );
+        assert_eq!(carried_fields_for_seal(&genesis, &on_resealed, Some(on_resealed.hash()), 2), Some(fields(0xd4)));
+        // At the chain start (parent 1) the genesis result is the parent's own header.
+        let block1 = SealedHeader::new(
+            Header { number: 1, timestamp: 1, state_root: B256::repeat_byte(0xd9), ..Default::default() },
+            B256::repeat_byte(0xda),
+        );
+        assert_eq!(
+            carried_fields_for_seal(&genesis, &block1, None, 2).map(|f| f.state_root),
+            Some(B256::repeat_byte(0xd9))
+        );
     }
 }

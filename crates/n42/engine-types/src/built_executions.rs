@@ -666,6 +666,28 @@ mod tests {
         assert_eq!(by_root(None), Some(hb));
     }
 
+    /// T11 of docs/DEFERRED_DEPTH_2_DESIGN.md: at depth 2 two blocks on
+    /// *different* parents of one grandparent carry the same four fields (the
+    /// grandparent's result); the store's identity includes the parent, so
+    /// each is found under its own and never under the other's.
+    #[test]
+    fn at_depth_two_cousins_with_the_same_fields_are_kept_apart() {
+        let _guard = lock();
+        let a = header(0x13, 503);
+        let b = Header { parent_hash: B256::repeat_byte(0x9a), ..a.clone() };
+        assert_eq!((a.state_root, a.receipts_root, a.gas_used), (b.state_root, b.receipts_root, b.gas_used));
+        let (ea, eb) = (built(&a), built(&b));
+        let (ha, hb) = (ea.block.hash(), eb.block.hash());
+        assert_ne!(ha, hb);
+        remember(ha, ea);
+        remember(hb, eb);
+        assert_eq!(find_by(&a).map(|(h, _)| h), Some(ha));
+        assert_eq!(find_by(&b).map(|(h, _)| h), Some(hb));
+        let by_parent = |parent| find(parent, 503, a.state_root, a.receipts_root, a.gas_used, Some(a.transactions_root)).map(|(h, _)| h);
+        assert_eq!(by_parent(a.parent_hash), Some(ha));
+        assert_eq!(by_parent(b.parent_hash), Some(hb));
+    }
+
     /// The eviction moved off the store's lock leaves the store the inline
     /// eviction left -- the same hashes and stages in the same order -- over
     /// a long run of puts mixing finished and finishing builds and repeats,

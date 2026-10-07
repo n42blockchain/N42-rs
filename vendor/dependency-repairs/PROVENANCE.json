@@ -1,0 +1,212 @@
+[
+  {
+    "package": "alloy-primitives",
+    "version": "0.8.26",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "upstream_manifest_sha256": "208bc9df7342b0fd928502fca41a53ce93eec43ee2275b6a499fb1d6fe8ccdb9",
+    "path": "vendor/dependency-repairs/alloy-primitives-0.8.26",
+    "modified_files": [
+      "Cargo.toml"
+    ]
+  },
+  {
+    "package": "alloy-primitives",
+    "version": "1.7.3",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "upstream_manifest_sha256": "452c09018d3cd93b999cc98e7fc95a020f77b64e3e74409c4e80b52ac5da468a",
+    "path": "vendor/dependency-repairs/alloy-primitives-1.7.3",
+    "modified_files": [
+      "Cargo.toml"
+    ]
+  },
+  {
+    "package": "aquamarine",
+    "version": "0.6.0",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "upstream_manifest_sha256": "4958733357465675c7decd3c511347133085472cee390ae3cd19ba2386bc29b2",
+    "path": "vendor/dependency-repairs/aquamarine-0.6.0",
+    "modified_files": [
+      "Cargo.toml",
+      "src/attrs.rs",
+      "src/lib.rs"
+    ]
+  },
+  {
+    "package": "ark-ff",
+    "version": "0.3.0",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "upstream_manifest_sha256": "15bdc5004e80ae7e00d896f2370a89c96ab1b1a95ffa72e38aa779d6128d7413",
+    "path": "vendor/dependency-repairs/ark-ff-0.3.0",
+    "modified_files": [
+      "Cargo.toml",
+      "src/fields/macros.rs",
+      "src/fields/models/cubic_extension.rs",
+      "src/fields/models/quadratic_extension.rs"
+    ]
+  },
+  {
+    "package": "ark-ff",
+    "version": "0.4.2",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "upstream_manifest_sha256": "541e04535d018a95405109e6e24b7c755d629761f3ecf2d3e1161b5931676a28",
+    "path": "vendor/dependency-repairs/ark-ff-0.4.2",
+    "modified_files": [
+      "Cargo.toml",
+      "src/fields/models/cubic_extension.rs",
+      "src/fields/models/fp/mod.rs",
+      "src/fields/models/quadratic_extension.rs"
+    ]
+  },
+  {
+    "package": "ark-ff",
+    "version": "0.5.0",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "upstream_manifest_sha256": "9bdcbbbc524008af18e9a6c603fd05b32ed824b0166c8b055bf8d6431d719aa4",
+    "path": "vendor/dependency-repairs/ark-ff-0.5.0",
+    "modified_files": [
+      "Cargo.toml"
+    ]
+  },
+  {
+    "package": "boa_engine",
+    "version": "0.21.1",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "upstream_manifest_sha256": "d225c873e524ec715c467c585c5a4b87e7909a475f06523060709b59fc816e9d",
+    "path": "vendor/dependency-repairs/boa_engine-0.21.1",
+    "modified_files": [
+      "Cargo.toml"
+    ]
+  },
+  {
+    "package": "boa_string",
+    "version": "0.21.1",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "upstream_manifest_sha256": "038c4c3be33816848eaa2428eadabd77d84707321b0cbc00032b7b047ac2914b",
+    "path": "vendor/dependency-repairs/boa_string-0.21.1",
+    "modified_files": [
+      "Cargo.toml"
+    ]
+  },
+  {
+    "package": "netlink-packet-core",
+    "version": "0.8.2",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "upstream_manifest_sha256": "ec995249e01585a420d74a6c0dee84c4c1d4b28d041573ec1a790b38831004f2",
+    "path": "vendor/dependency-repairs/netlink-packet-core-0.8.2",
+    "modified_files": [
+      "Cargo.toml"
+    ]
+  },
+  {
+    "package": "parking_lot",
+    "version": "0.11.2",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "upstream_manifest_sha256": "6217caca78eb5e8c0bb41beed960b735bde774ae60e752e584d7265a2e19f079",
+    "path": "vendor/dependency-repairs/parking_lot-0.11.2",
+    "modified_files": [
+      "Cargo.toml"
+    ]
+  },
+  {
+    "package": "parking_lot_core",
+    "version": "0.8.6",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "upstream_manifest_sha256": "eb7f5eba6c03746da0585ae4abdc3ce74103ac9b9fc6f0d1db02fe5bf786e810",
+    "path": "vendor/dependency-repairs/parking_lot_core-0.8.6",
+    "modified_files": [
+      "Cargo.toml"
+    ]
+  },
+  {
+    "package": "reth-nippy-jar",
+    "version": "2.7.0",
+    "source": "git+https://github.com/paradigmxyz/reth.git?tag=v2.7.0#3d592ece6de8c4559987416a544fc215fd6d6921",
+    "upstream_manifest_sha256": "f83d6dd5db47c4e6b88d26e331e7e049abda5010ddbbcd37768b32adeb451623",
+    "path": "vendor/dependency-repairs/reth-nippy-jar-2.7.0",
+    "modified_files": [
+      "Cargo.toml"
+    ]
+  },
+  {
+    "package": "reth-transaction-pool",
+    "version": "2.7.0",
+    "source": "git+https://github.com/paradigmxyz/reth.git?tag=v2.7.0#3d592ece6de8c4559987416a544fc215fd6d6921",
+    "upstream_manifest_sha256": "f94c267bd73d1e9047b51c08438dbcfdbdd679549fc0d2616413bbc821007d2a",
+    "path": "vendor/dependency-repairs/reth-transaction-pool-2.7.0",
+    "modified_files": [
+      "Cargo.toml"
+    ]
+  },
+  {
+    "package": "revm-bytecode",
+    "version": "43.0.0",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "upstream_manifest_sha256": "f132cfa6503b6229d8804bdc2e55bfb32f17b016838df81c4ced3fb145f46e2b",
+    "path": "vendor/dependency-repairs/revm-bytecode-43.0.0",
+    "modified_files": [
+      "Cargo.toml"
+    ]
+  },
+  {
+    "package": "sled",
+    "version": "0.34.7",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "upstream_manifest_sha256": "f8e7f39eeba5709bdeef3f3c2146d55e8ba71cdf78c7a5091b8a10385cc02e98",
+    "path": "vendor/dependency-repairs/sled-0.34.7",
+    "modified_files": [
+      "Cargo.toml",
+      "src/fail.rs",
+      "src/lib.rs"
+    ]
+  },
+  {
+    "package": "syn-solidity",
+    "version": "1.7.3",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "upstream_manifest_sha256": "565c9131b994bac4cd5ad8f03200e994ad632489574d2495ef33d47e9b04c0f1",
+    "path": "vendor/dependency-repairs/syn-solidity-1.7.3",
+    "modified_files": [
+      "Cargo.toml"
+    ]
+  },
+  {
+    "package": "test-fuzz-internal",
+    "version": "8.1.1",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "upstream_manifest_sha256": "ff22ebd56dde1a610685b82318198e7cefdef016ca518d744246c152d35f0124",
+    "path": "vendor/dependency-repairs/test-fuzz-internal-8.1.1",
+    "modified_files": [
+      "Cargo.toml"
+    ]
+  },
+  {
+    "package": "tikv-jemalloc-ctl",
+    "version": "0.6.1",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "upstream_manifest_sha256": "3efe020b1c1eb1742dcc99ccbf74f11196381a999bd643a8ccae712065fd9efa",
+    "path": "vendor/dependency-repairs/tikv-jemalloc-ctl-0.6.1",
+    "modified_files": [
+      "Cargo.toml"
+    ]
+  },
+  {
+    "package": "pprof_util",
+    "version": "0.8.2",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "path": "vendor/dependency-repairs/pprof_util-0.8.2",
+    "upstream_manifest_sha256": "13a1016d07f70027c313177c030e81a5eae5609fce502a2b215eb7e035609fae",
+    "modified_files": [
+      "Cargo.toml"
+    ]
+  },
+  {
+    "package": "revmc-builtins",
+    "version": "0.1.0",
+    "source": "git+https://github.com/paradigmxyz/revmc?branch=main#5fba0216ed6bb3c73c4ce214b58c8e434a948e98",
+    "path": "vendor/dependency-repairs/revmc-builtins-0.1.0",
+    "upstream_manifest_sha256": "6ea1c9ce68766e24dfffbbc33d29ae6cbf5d7f166b551258232fa80471d67239",
+    "modified_files": [
+      "Cargo.toml"
+    ]
+  }
+]

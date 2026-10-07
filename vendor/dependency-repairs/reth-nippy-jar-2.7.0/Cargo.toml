@@ -1,0 +1,39 @@
+[package]
+name = "reth-nippy-jar"
+version = "2.7.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+homepage = "https://paradigmxyz.github.io/reth"
+repository = "https://github.com/paradigmxyz/reth"
+description = "Immutable data store format"
+
+
+
+[lib]
+name = "reth_nippy_jar"
+
+[dependencies]
+# reth
+reth-fs-util = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
+
+# compression
+zstd = { "version" = "0.13", "features" = ["experimental", "zdict_builder"] }
+lz4_flex = { "version" = "0.12", "default-features" = false }
+
+memmap2 = { "version" = "0.9.11" }
+bincode = { package = "n42-legacy-codec", path = "../../../crates/n42/legacy-codec" }
+smallvec = { "version" = "1" }
+serde = { "version" = "1.0", "default-features" = false, "features" = ["derive"] }
+tracing = { "version" = "0.1.0", "default-features" = false, "features" = ["attributes"] }
+anyhow = { "version" = "1.0" }
+thiserror = { "version" = "2.0.0", "default-features" = false }
+derive_more = { "version" = "2", "default-features" = false, "features" = ["full"] }
+
+[dev-dependencies]
+rand = { "version" = "0.9", "features" = ["small_rng"] }
+tempfile = { "version" = "3.20" }
+
+[features]
+default = []
+test-utils = []

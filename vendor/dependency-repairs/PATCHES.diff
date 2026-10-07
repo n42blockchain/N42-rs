@@ -1,0 +1,784 @@
+--- alloy-primitives-0.8.26/upstream/Cargo.toml
++++ alloy-primitives-0.8.26/patched/Cargo.toml
+@@ -236,7 +236,8 @@
+ default-features = false
+ 
+ [dependencies.paste]
+-version = "1.0"
++package = "pastey"
++version = "0.2.3"
+ 
+ [dependencies.postgres-types]
+ version = "0.2.6"
+@@ -324,3 +325,5 @@
+ 
+ [lints.rustdoc]
+ all = "warn"
++
++[workspace]
+--- alloy-primitives-1.7.3/upstream/Cargo.toml
++++ alloy-primitives-1.7.3/patched/Cargo.toml
+@@ -302,7 +302,8 @@
+ default-features = false
+ 
+ [dependencies.paste]
+-version = "1.0"
++package = "pastey"
++version = "0.2.3"
+ 
+ [dependencies.postgres-types]
+ version = "0.2.6"
+@@ -422,3 +423,5 @@
+ 
+ [lints.rustdoc]
+ all = "warn"
++
++[workspace]
+--- aquamarine-0.6.0/upstream/Cargo.toml
++++ aquamarine-0.6.0/patched/Cargo.toml
+@@ -47,8 +47,8 @@
+ [dependencies.itertools]
+ version = "0.10"
+ 
+-[dependencies.proc-macro-error2]
+-version = "2"
++[dependencies.proc-macro-error3]
++version = "3.0.1"
+ default-features = false
+ 
+ [dependencies.proc-macro2]
+@@ -62,3 +62,5 @@
+ 
+ [dev-dependencies.pretty_assertions]
+ version = "1"
++
++[workspace]
+--- aquamarine-0.6.0/upstream/src/attrs.rs
++++ aquamarine-0.6.0/patched/src/attrs.rs
+@@ -2,7 +2,7 @@
+ use itertools::Itertools;
+ use proc_macro::Span;
+ use proc_macro2::TokenStream;
+-use proc_macro_error2::{abort, emit_call_site_warning, emit_error};
++use proc_macro_error3::{abort, emit_call_site_warning, emit_error};
+ use quote::quote;
+ use std::fs;
+ use std::path::Path;
+--- aquamarine-0.6.0/upstream/src/lib.rs
++++ aquamarine-0.6.0/patched/src/lib.rs
+@@ -74,7 +74,7 @@
+ extern crate proc_macro;
+ 
+ use proc_macro::TokenStream;
+-use proc_macro_error2::{abort, proc_macro_error};
++use proc_macro_error3::{abort, proc_macro_error};
+ 
+ use quote::quote;
+ use syn::{parse_macro_input, Attribute};
+--- ark-ff-0.3.0/upstream/Cargo.toml
++++ ark-ff-0.3.0/patched/Cargo.toml
+@@ -39,8 +39,8 @@
+ default-features = false
+ 
+ [dependencies.derivative]
+-version = "2"
+-features = ["use_core"]
++package = "educe"
++version = "0.8.1"
+ 
+ [dependencies.num-bigint]
+ version = "0.4.0"
+@@ -51,7 +51,8 @@
+ default-features = false
+ 
+ [dependencies.paste]
+-version = "1.0"
++package = "pastey"
++version = "0.2.3"
+ 
+ [dependencies.rayon]
+ version = "1"
+@@ -69,3 +70,5 @@
+ default = []
+ parallel = ["std", "rayon", "ark-std/parallel"]
+ std = ["ark-std/std", "ark-serialize/std"]
++
++[workspace]
+--- ark-ff-0.3.0/upstream/src/fields/macros.rs
++++ ark-ff-0.3.0/patched/src/fields/macros.rs
+@@ -94,19 +94,19 @@
+         /// This type can represent elements in any field of size at most
+         #[doc = $field_size]
+         /// bits.
+-        #[derive(Derivative)]
+-        #[derivative(
+-            Default(bound = ""),
+-            Hash(bound = ""),
+-            Clone(bound = ""),
+-            Copy(bound = ""),
+-            Debug(bound = ""),
+-            PartialEq(bound = ""),
+-            Eq(bound = "")
++        #[derive(Educe)]
++        #[educe(
++            Default(bound(false)),
++            Hash(bound(false)),
++            Clone(bound(false)),
++            Copy(bound(false)),
++            Debug(bound(false)),
++            PartialEq(bound(false)),
++            Eq(bound(false))
+         )]
+         pub struct $Fp<P>(
+             pub $BigIntegerType,
+-            #[derivative(Debug = "ignore")]
++            #[educe(Debug(ignore))]
+             #[doc(hidden)]
+             pub PhantomData<P>,
+         );
+--- ark-ff-0.3.0/upstream/src/fields/models/cubic_extension.rs
++++ ark-ff-0.3.0/patched/src/fields/models/cubic_extension.rs
+@@ -60,8 +60,8 @@
+     );
+ }
+ 
+-#[derive(Derivative)]
+-#[derivative(
++#[derive(Educe)]
++#[educe(
+     Default(bound = "P: CubicExtParameters"),
+     Hash(bound = "P: CubicExtParameters"),
+     Clone(bound = "P: CubicExtParameters"),
+@@ -74,7 +74,7 @@
+     pub c0: P::BaseField,
+     pub c1: P::BaseField,
+     pub c2: P::BaseField,
+-    #[derivative(Debug = "ignore")]
++    #[educe(Debug(ignore))]
+     #[doc(hidden)]
+     pub _parameters: PhantomData<P>,
+ }
+--- ark-ff-0.3.0/upstream/src/fields/models/quadratic_extension.rs
++++ ark-ff-0.3.0/patched/src/fields/models/quadratic_extension.rs
+@@ -121,8 +121,8 @@
+ 
+ /// An element of a quadratic extension field F_p\[X\]/(X^2 - P::NONRESIDUE) is
+ /// represented as c0 + c1 * X, for c0, c1 in `P::BaseField`.
+-#[derive(Derivative)]
+-#[derivative(
++#[derive(Educe)]
++#[educe(
+     Default(bound = "P: QuadExtParameters"),
+     Hash(bound = "P: QuadExtParameters"),
+     Clone(bound = "P: QuadExtParameters"),
+@@ -134,7 +134,7 @@
+ pub struct QuadExtField<P: QuadExtParameters> {
+     pub c0: P::BaseField,
+     pub c1: P::BaseField,
+-    #[derivative(Debug = "ignore")]
++    #[educe(Debug(ignore))]
+     #[doc(hidden)]
+     pub _parameters: PhantomData<P>,
+ }
+--- ark-ff-0.4.2/upstream/Cargo.toml
++++ ark-ff-0.4.2/patched/Cargo.toml
+@@ -58,8 +58,8 @@
+ default-features = false
+ 
+ [dependencies.derivative]
+-version = "2"
+-features = ["use_core"]
++package = "educe"
++version = "0.8.1"
+ 
+ [dependencies.digest]
+ version = "0.10"
+@@ -79,7 +79,8 @@
+ default-features = false
+ 
+ [dependencies.paste]
+-version = "1.0"
++package = "pastey"
++version = "0.2.3"
+ 
+ [dependencies.rayon]
+ version = "1"
+@@ -142,3 +143,5 @@
+     "ark-serialize/std",
+     "itertools/use_std",
+ ]
++
++[workspace]
+--- ark-ff-0.4.2/upstream/src/fields/models/cubic_extension.rs
++++ ark-ff-0.4.2/patched/src/fields/models/cubic_extension.rs
+@@ -78,8 +78,8 @@
+ 
+ /// An element of a cubic extension field F_p\[X\]/(X^3 - P::NONRESIDUE) is
+ /// represented as c0 + c1 * X + c2 * X^2, for c0, c1, c2 in `P::BaseField`.
+-#[derive(Derivative)]
+-#[derivative(
++#[derive(Educe)]
++#[educe(
+     Default(bound = "P: CubicExtConfig"),
+     Hash(bound = "P: CubicExtConfig"),
+     Clone(bound = "P: CubicExtConfig"),
+--- ark-ff-0.4.2/upstream/src/fields/models/fp/mod.rs
++++ ark-ff-0.4.2/patched/src/fields/models/fp/mod.rs
+@@ -100,18 +100,17 @@
+ 
+ /// Represents an element of the prime field F_p, where `p == P::MODULUS`.
+ /// This type can represent elements in any field of size at most N * 64 bits.
+-#[derive(Derivative)]
+-#[derivative(
+-    Default(bound = ""),
+-    Hash(bound = ""),
+-    Clone(bound = ""),
+-    Copy(bound = ""),
+-    PartialEq(bound = ""),
+-    Eq(bound = "")
++#[derive(Educe)]
++#[educe(
++    Default(bound(false)),
++    Hash(bound(false)),
++    Clone(bound(false)),
++    Copy(bound(false)),
++    PartialEq(bound(false)),
++    Eq(bound(false))
+ )]
+ pub struct Fp<P: FpConfig<N>, const N: usize>(
+     pub BigInt<N>,
+-    #[derivative(Debug = "ignore")]
+     #[doc(hidden)]
+     pub PhantomData<P>,
+ );
+--- ark-ff-0.4.2/upstream/src/fields/models/quadratic_extension.rs
++++ ark-ff-0.4.2/patched/src/fields/models/quadratic_extension.rs
+@@ -93,8 +93,8 @@
+ 
+ /// An element of a quadratic extension field F_p\[X\]/(X^2 - P::NONRESIDUE) is
+ /// represented as c0 + c1 * X, for c0, c1 in `P::BaseField`.
+-#[derive(Derivative)]
+-#[derivative(
++#[derive(Educe)]
++#[educe(
+     Default(bound = "P: QuadExtConfig"),
+     Hash(bound = "P: QuadExtConfig"),
+     Clone(bound = "P: QuadExtConfig"),
+--- ark-ff-0.5.0/upstream/Cargo.toml
++++ ark-ff-0.5.0/patched/Cargo.toml
+@@ -86,7 +86,8 @@
+ default-features = false
+ 
+ [dependencies.paste]
+-version = "1.0"
++package = "pastey"
++version = "0.2.3"
+ 
+ [dependencies.rayon]
+ version = "1"
+@@ -111,3 +112,5 @@
+     "ark-serialize/std",
+     "itertools/use_std",
+ ]
++
++[workspace]
+--- boa_engine-0.21.1/upstream/Cargo.toml
++++ boa_engine-0.21.1/patched/Cargo.toml
+@@ -337,7 +337,8 @@
+ version = "0.7.4"
+ 
+ [dependencies.paste]
+-version = "1.0"
++package = "pastey"
++version = "0.2.3"
+ 
+ [dependencies.portable-atomic]
+ version = "1.11.0"
+@@ -548,3 +549,5 @@
+ missing_crate_level_docs = "warn"
+ private_doc_tests = "warn"
+ private_intra_doc_links = "warn"
++
++[workspace]
+--- boa_string-0.21.1/upstream/Cargo.toml
++++ boa_string-0.21.1/patched/Cargo.toml
+@@ -50,7 +50,8 @@
+ version = "1.0.15"
+ 
+ [dependencies.paste]
+-version = "1.0"
++package = "pastey"
++version = "0.2.3"
+ 
+ [dependencies.rustc-hash]
+ version = "2.1.1"
+@@ -153,3 +154,5 @@
+ missing_crate_level_docs = "warn"
+ private_doc_tests = "warn"
+ private_intra_doc_links = "warn"
++
++[workspace]
+--- netlink-packet-core-0.8.2/upstream/Cargo.toml
++++ netlink-packet-core-0.8.2/patched/Cargo.toml
+@@ -43,7 +43,10 @@
+ path = "examples/rtnetlink.rs"
+ 
+ [dependencies.paste]
+-version = "1"
++package = "pastey"
++version = "0.2.3"
+ 
+ [dev-dependencies.netlink-packet-route]
+ version = "0.13.0"
++
++[workspace]
+--- parking_lot-0.11.2/upstream/Cargo.toml
++++ parking_lot-0.11.2/patched/Cargo.toml
+@@ -21,7 +21,8 @@
+ license = "Apache-2.0/MIT"
+ repository = "https://github.com/Amanieu/parking_lot"
+ [dependencies.instant]
+-version = "0.1.9"
++package = "web-time"
++version = "1.1"
+ 
+ [dependencies.lock_api]
+ version = "0.4.5"
+@@ -44,3 +45,5 @@
+ serde = ["lock_api/serde"]
+ stdweb = ["instant/stdweb"]
+ wasm-bindgen = ["instant/wasm-bindgen"]
++
++[workspace]
+--- parking_lot_core-0.8.6/upstream/Cargo.toml
++++ parking_lot_core-0.8.6/patched/Cargo.toml
+@@ -34,7 +34,8 @@
+ version = "1.0.0"
+ 
+ [dependencies.instant]
+-version = "0.1.9"
++package = "web-time"
++version = "1.1"
+ 
+ [dependencies.petgraph]
+ version = "0.5.1"
+@@ -72,3 +73,5 @@
+     "errhandlingapi",
+     "handleapi",
+ ]
++
++[workspace]
+--- reth-nippy-jar-2.7.0/upstream/Cargo.toml
++++ reth-nippy-jar-2.7.0/patched/Cargo.toml
+@@ -1,39 +1,38 @@
+ [package]
+ name = "reth-nippy-jar"
+-version.workspace = true
+-edition.workspace = true
+-rust-version.workspace = true
+-license.workspace = true
+-homepage.workspace = true
+-repository.workspace = true
++version = "2.7.0"
++edition = "2024"
++rust-version = "1.95"
++license = "MIT OR Apache-2.0"
++homepage = "https://paradigmxyz.github.io/reth"
++repository = "https://github.com/paradigmxyz/reth"
+ description = "Immutable data store format"
+ 
+-[lints]
+-workspace = true
++
+ 
+ [lib]
+ name = "reth_nippy_jar"
+ 
+ [dependencies]
+ # reth
+-reth-fs-util.workspace = true
++reth-fs-util = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
+ 
+ # compression
+-zstd = { workspace = true, features = ["experimental", "zdict_builder"] }
+-lz4_flex.workspace = true
++zstd = { "version" = "0.13", "features" = ["experimental", "zdict_builder"] }
++lz4_flex = { "version" = "0.12", "default-features" = false }
+ 
+-memmap2.workspace = true
+-bincode.workspace = true
+-smallvec.workspace = true
+-serde = { workspace = true, features = ["derive"] }
+-tracing.workspace = true
+-anyhow.workspace = true
+-thiserror.workspace = true
+-derive_more.workspace = true
++memmap2 = { "version" = "0.9.11" }
++bincode = { package = "n42-legacy-codec", path = "../../../crates/n42/legacy-codec" }
++smallvec = { "version" = "1" }
++serde = { "version" = "1.0", "default-features" = false, "features" = ["derive"] }
++tracing = { "version" = "0.1.0", "default-features" = false, "features" = ["attributes"] }
++anyhow = { "version" = "1.0" }
++thiserror = { "version" = "2.0.0", "default-features" = false }
++derive_more = { "version" = "2", "default-features" = false, "features" = ["full"] }
+ 
+ [dev-dependencies]
+-rand = { workspace = true, features = ["small_rng"] }
+-tempfile.workspace = true
++rand = { "version" = "0.9", "features" = ["small_rng"] }
++tempfile = { "version" = "3.20" }
+ 
+ [features]
+ default = []
+--- reth-transaction-pool-2.7.0/upstream/Cargo.toml
++++ reth-transaction-pool-2.7.0/patched/Cargo.toml
+@@ -1,82 +1,78 @@
+ [package]
+ name = "reth-transaction-pool"
+-version.workspace = true
+-edition.workspace = true
+-rust-version.workspace = true
+-license.workspace = true
+-homepage.workspace = true
+-repository.workspace = true
++version = "2.7.0"
++edition = "2024"
++rust-version = "1.95"
++license = "MIT OR Apache-2.0"
++homepage = "https://paradigmxyz.github.io/reth"
++repository = "https://github.com/paradigmxyz/reth"
+ description = "Transaction pool implementation"
+ 
+-[lints]
+-workspace = true
++
+ 
+ [dependencies]
+ # reth
+-reth-chain-state.workspace = true
+-reth-ethereum-primitives.workspace = true
+-reth-chainspec.workspace = true
+-reth-eth-wire-types.workspace = true
+-reth-evm.workspace = true
+-reth-evm-ethereum.workspace = true
+-reth-primitives-traits.workspace = true
+-reth-execution-types.workspace = true
+-reth-fs-util.workspace = true
+-reth-storage-api.workspace = true
+-reth-tasks.workspace = true
+-revm.workspace = true
++reth-chain-state = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
++reth-ethereum-primitives = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
++reth-chainspec = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
++reth-eth-wire-types = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
++reth-evm = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
++reth-evm-ethereum = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
++reth-primitives-traits = { "version" = "0.8.1", "default-features" = false }
++reth-execution-types = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
++reth-fs-util = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
++reth-storage-api = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
++reth-tasks = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
++revm = { "version" = "43.0.3", "default-features" = false }
+ 
+ # ethereum
+-alloy-eips = { workspace = true, features = ["kzg"] }
+-alloy-primitives.workspace = true
+-alloy-rlp.workspace = true
+-alloy-consensus = { workspace = true, features = ["kzg"] }
+-
++alloy-eips = { "version" = "2.5.0", "default-features" = false, "features" = ["kzg"] }
++alloy-primitives = { "version" = "1.6.1", "default-features" = false, "features" = ["map-foldhash"] }
++alloy-rlp = { "version" = "0.3.16", "default-features" = false, "features" = ["core-net"] }
++alloy-consensus = { "version" = "2.5.0", "default-features" = false, "features" = ["kzg"] }
+ # async/futures
+-futures-util.workspace = true
+-parking_lot.workspace = true
+-pin-project.workspace = true
+-tokio = { workspace = true, features = ["sync"] }
+-tokio-stream.workspace = true
++futures-util = { "version" = "0.3", "default-features" = false }
++parking_lot = { "version" = "0.12" }
++pin-project = { "version" = "1.1.12" }
++tokio = { "version" = "1.52.3", "default-features" = false, "features" = ["sync"] }
++tokio-stream = { "version" = "0.1.11" }
+ 
+ # metrics
+-reth-metrics.workspace = true
+-metrics.workspace = true
++reth-metrics = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
++metrics = { "version" = "0.24.0" }
+ 
+ # misc
+-aquamarine.workspace = true
+-thiserror.workspace = true
+-tracing.workspace = true
+-rustc-hash.workspace = true
+-schnellru.workspace = true
+-serde = { workspace = true, features = ["derive", "rc"] }
+-serde_json.workspace = true
+-bitflags.workspace = true
+-auto_impl.workspace = true
+-imbl.workspace = true
+-smallvec.workspace = true
++aquamarine = { "version" = "0.6" }
++thiserror = { "version" = "2.0.0", "default-features" = false }
++tracing = { "version" = "0.1.0", "default-features" = false, "features" = ["attributes"] }
++rustc-hash = { "version" = "2.0", "default-features" = false }
++schnellru = { "version" = "0.2" }
++serde = { "version" = "1.0", "default-features" = false, "features" = ["derive", "rc"] }
++serde_json = { "version" = "1.0", "default-features" = false, "features" = ["alloc"] }
++bitflags = { "version" = "2.4" }
++auto_impl = { "version" = "1" }
++imbl = { "version" = "7" }
++smallvec = { "version" = "1" }
+ 
+ # testing
+-rand = { workspace = true, optional = true }
+-paste = { workspace = true, optional = true }
+-proptest = { workspace = true, optional = true }
+-proptest-arbitrary-interop = { workspace = true, optional = true }
+-
++rand = { "version" = "0.9", "optional" = true }
++paste = { package = "pastey", version = "0.2.3", optional = true }
++proptest = { "version" = "1.7", "optional" = true }
++proptest-arbitrary-interop = { "version" = "0.1.0", "optional" = true }
+ [dev-dependencies]
+-reth-provider = { workspace = true, features = ["test-utils"] }
+-reth-tracing.workspace = true
+-alloy-primitives = { workspace = true, features = ["rand"] }
+-paste.workspace = true
+-rand.workspace = true
+-proptest.workspace = true
+-proptest-arbitrary-interop.workspace = true
+-assert_matches.workspace = true
+-tempfile.workspace = true
+-tokio = { workspace = true, features = ["rt-multi-thread"] }
+-futures.workspace = true
+-criterion.workspace = true
+-reth-transaction-pool = { workspace = true, features = ["test-utils"] }
+-
++reth-provider = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0", "features" = ["test-utils"] }
++reth-tracing = { "version" = "0.1.0", "default-features" = false, "features" = ["attributes"] }
++alloy-primitives = { "version" = "1.6.1", "default-features" = false, "features" = ["map-foldhash", "rand"] }
++paste = { package = "pastey", version = "0.2.3" }
++rand = { "version" = "0.9" }
++proptest = { "version" = "1.7" }
++proptest-arbitrary-interop = { "version" = "0.1.0" }
++assert_matches = { "version" = "1.5.0" }
++tempfile = { "version" = "3.20" }
++tokio = { "version" = "1.52.3", "default-features" = false, "features" = ["rt-multi-thread"] }
++futures = { "version" = "0.3" }
++criterion = { "package" = "codspeed-criterion-compat", "version" = "4.3" }
++reth-transaction-pool = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0", "features" = ["test-utils"] }
+ [features]
+ serde = [
+     "reth-execution-types/serde",
+@@ -133,3 +129,5 @@
+ name = "saturated_pool"
+ harness = false
+ required-features = ["test-utils"]
++
++[workspace]
+--- revm-bytecode-43.0.0/upstream/Cargo.toml
++++ revm-bytecode-43.0.0/patched/Cargo.toml
+@@ -75,7 +75,8 @@
+ default-features = false
+ 
+ [dependencies.paste]
+-version = "1.0"
++package = "pastey"
++version = "0.2.3"
+ optional = true
+ 
+ [dependencies.phf]
+@@ -125,3 +126,5 @@
+ 
+ [lints.rustdoc]
+ all = "warn"
++
++[workspace]
+--- sled-0.34.7/upstream/Cargo.toml
++++ sled-0.34.7/patched/Cargo.toml
+@@ -51,7 +51,8 @@
+ version = "0.8.5"
+ 
+ [dependencies.fxhash]
+-version = "0.2.1"
++package = "rustc-hash"
++version = "1.1.0"
+ 
+ [dependencies.libc]
+ version = "0.2.101"
+@@ -113,3 +114,5 @@
+ version = "0.4.3"
+ [badges.maintenance]
+ status = "actively-developed"
++
++[workspace]
+--- sled-0.34.7/upstream/src/fail.rs
++++ sled-0.34.7/patched/src/fail.rs
+@@ -7,7 +7,7 @@
+ type HM = HashMap<
+     &'static str,
+     u64,
+-    std::hash::BuildHasherDefault<fxhash::FxHasher64>,
++    std::hash::BuildHasherDefault<fxhash::FxHasher>,
+ >;
+ 
+ static ACTIVE: Lazy<Mutex<HM>, fn() -> Mutex<HM>> = Lazy::new(init);
+--- sled-0.34.7/upstream/src/lib.rs
++++ sled-0.34.7/patched/src/lib.rs
+@@ -91,9 +91,11 @@
+     missing_copy_implementations,
+     trivial_casts,
+     trivial_numeric_casts,
+-    unsafe_code,
+-    unused_qualifications
++    unsafe_code
+ )]
++// Registry dependencies had capped lints; retain this style diagnostic as a
++// warning for the local dependency patch on current Rust compilers.
++#![warn(unused_qualifications)]
+ #![deny(
+     // over time, consider enabling the commented-out lints below
+     clippy::cast_lossless,
+@@ -423,14 +425,14 @@
+ pub(crate) type FastMap8<K, V> = std::collections::HashMap<
+     K,
+     V,
+-    std::hash::BuildHasherDefault<fxhash::FxHasher64>,
++    std::hash::BuildHasherDefault<fxhash::FxHasher>,
+ >;
+ 
+ /// A fast set that is not resistant to collision attacks. Works
+ /// on 8 bytes at a time.
+ pub(crate) type FastSet8<V> = std::collections::HashSet<
+     V,
+-    std::hash::BuildHasherDefault<fxhash::FxHasher64>,
++    std::hash::BuildHasherDefault<fxhash::FxHasher>,
+ >;
+ 
+ /// A function that may be configured on a particular shared `Tree`
+--- syn-solidity-1.7.3/upstream/Cargo.toml
++++ syn-solidity-1.7.3/patched/Cargo.toml
+@@ -57,7 +57,8 @@
+ path = "src/lib.rs"
+ 
+ [dependencies.paste]
+-version = "1.0"
++package = "pastey"
++version = "0.2.3"
+ 
+ [dependencies.proc-macro2]
+ version = "1.0"
+@@ -92,3 +93,5 @@
+ 
+ [lints.rustdoc]
+ all = "warn"
++
++[workspace]
+--- test-fuzz-internal-8.1.1/upstream/Cargo.toml
++++ test-fuzz-internal-8.1.1/patched/Cargo.toml
+@@ -46,6 +46,7 @@
+ version = "0.23"
+ 
+ [dependencies.postcard]
++default-features = false
+ version = "1.1"
+ features = ["use-std"]
+ 
+@@ -82,3 +83,5 @@
+     "cfg(fuzzing)",
+     "cfg(serde_default)",
+ ]
++
++[workspace]
+--- tikv-jemalloc-ctl-0.6.1/upstream/Cargo.toml
++++ tikv-jemalloc-ctl-0.6.1/patched/Cargo.toml
+@@ -84,10 +84,13 @@
+ default-features = false
+ 
+ [dependencies.paste]
+-version = "1"
++package = "pastey"
++version = "0.2.3"
+ 
+ [dependencies.tikv-jemalloc-sys]
+ version = "0.6.1"
+ 
+ [dev-dependencies.tikv-jemallocator]
+ version = "0.6.0"
++
++[workspace]
+--- pprof_util-0.8.2/upstream/Cargo.toml
++++ pprof_util-0.8.2/patched/Cargo.toml
+@@ -55,8 +55,11 @@
+ version = "0.4"
+ 
+ [dependencies.paste]
+-version = "1.0"
++package = "pastey"
++version = "0.2.3"
+ 
+ [dependencies.prost]
+ version = "0.14"
+ features = ["no-recursion-limit"]
++
++[workspace]
+--- revmc-builtins-0.1.0/upstream/Cargo.toml
++++ revmc-builtins-0.1.0/patched/Cargo.toml
+@@ -3,30 +3,29 @@
+ description = "EVM bytecode compiler builtins"
+ homepage = "https://github.com/danipopes/revmc/tree/main/crates/revmc-builtins"
+ 
+-version.workspace = true
+-authors.workspace = true
+-edition.workspace = true
+-rust-version.workspace = true
+-license.workspace = true
+-categories.workspace = true
+-keywords.workspace = true
+-repository.workspace = true
+-exclude.workspace = true
++version = "0.1.0"
++authors = ["DaniPopes <57450786+DaniPopes@users.noreply.github.com>"]
++edition = "2024"
++rust-version = "1.95"
++license = "MIT OR Apache-2.0"
++categories = ["compilers", "cryptography::cryptocurrencies"]
++keywords = ["compile", "compiler", "jit", "evm", "ethereum"]
++repository = "https://github.com/paradigmxyz/revmc"
++exclude = [".github/", "benches/", "fuzz/", "tests/"]
+ 
+-[lints]
+-workspace = true
++
+ 
+ [dependencies]
+-revmc-context.workspace = true
++revmc-context = { "version" = "0.1.0", "default-features" = false, "git" = "https://github.com/paradigmxyz/revmc", "branch" = "main" }
+ 
+-revm-primitives.workspace = true
+-revm-interpreter.workspace = true
+-revm-bytecode.workspace = true
+-revm-context-interface.workspace = true
+-paste.workspace = true
++revm-primitives = { "version" = "43.0.0", "default-features" = false }
++revm-interpreter = { "version" = "43.0.0", "default-features" = false }
++revm-bytecode = { "version" = "43.0.0", "default-features" = false, "features" = ["parse"] }
++revm-context-interface = { "version" = "43.0.2", "default-features" = false }
++paste = { "package" = "pastey", "version" = "0.2.3" }
+ 
+-revmc-backend = { workspace = true, optional = true }
+-tracing = { workspace = true, optional = true }
++revmc-backend = { "version" = "0.1.0", "default-features" = false, "git" = "https://github.com/paradigmxyz/revmc", "branch" = "main", "optional" = true }
++tracing = { "version" = "0.1", "optional" = true }
+ 
+ [features]
+ default = ["std", "ir"]
+@@ -38,3 +37,5 @@
+     "revmc-context/account-ext",
+     "revm-context-interface/account-ext",
+ ]
++
++[workspace]

@@ -802,11 +802,11 @@ mod tests {
         let genesis = depth_two_genesis();
         assert_eq!(reth_chainspec::qmdb::deferred_execution_depth_at(&genesis, 1), 2);
         let genesis_fields = fields(0x80);
-        let block0 = SealedHeader::new(carrying(Header::default(), genesis_fields), B256::repeat_byte(0x81));
+        let block0 = SealedHeader::new(carrying(Header::default(), genesis_fields), alloy_primitives::keccak256(b"depth-two-consensus-0x81"));
         // Block 1 carries the genesis result; so would block 2 (its parent is 1).
         let block1 = SealedHeader::new(
             carrying(Header { number: 1, timestamp: 1, parent_hash: block0.hash(), ..Default::default() }, genesis_fields),
-            B256::repeat_byte(0x82),
+            alloy_primitives::keccak256(b"depth-two-consensus-0x82"),
         );
         assert_eq!(ancestor_executed_fields(&genesis, &block0, 2), Some(genesis_fields), "block 1");
         assert_eq!(ancestor_executed_fields(&genesis, &block1, 2), Some(genesis_fields), "block 2");
@@ -814,7 +814,7 @@ mod tests {
         // Block 3 (parent 2, grandparent 1): result(1), from the registry.
         let block2 = SealedHeader::new(
             carrying(Header { number: 2, timestamp: 2, parent_hash: block1.hash(), ..Default::default() }, genesis_fields),
-            B256::repeat_byte(0x83),
+            alloy_primitives::keccak256(b"depth-two-consensus-0x83"),
         );
         assert!(ancestor_result_is_recorded(&genesis, &block2, 2));
         assert_eq!(ancestor_hash(&block2, 2), block1.hash());
@@ -825,13 +825,13 @@ mod tests {
         // Two siblings at height 2 on block 1: their children expect the same.
         let sibling = SealedHeader::new(
             Header { number: 2, timestamp: 3, parent_hash: block1.hash(), ..Default::default() },
-            B256::repeat_byte(0x87),
+            alloy_primitives::keccak256(b"depth-two-consensus-0x87"),
         );
         assert_eq!(ancestor_executed_fields(&genesis, &sibling, 2), ancestor_executed_fields(&genesis, &block2, 2));
         // A parent on another grandparent expects that one's result.
         let other = SealedHeader::new(
             Header { number: 3, timestamp: 4, parent_hash: block2.hash(), ..Default::default() },
-            B256::repeat_byte(0x88),
+            alloy_primitives::keccak256(b"depth-two-consensus-0x88"),
         );
         assert_eq!(ancestor_executed_fields(&genesis, &other, 2), Some(fields(0x86)));
         // At depth 1 the same parents expect their own results.
@@ -839,17 +839,17 @@ mod tests {
         // The builder's fallback at depth 2: the grandparent filed under its
         // builder hash only is found and filed under the sealed hash.
         let unknown = SealedHeader::new(
-            Header { number: 9, timestamp: 9, parent_hash: B256::repeat_byte(0x89), ..Default::default() },
-            B256::repeat_byte(0x8a),
+            Header { number: 9, timestamp: 9, parent_hash: alloy_primitives::keccak256(b"depth-two-consensus-0x89"), ..Default::default() },
+            alloy_primitives::keccak256(b"depth-two-consensus-0x8a"),
         );
         let wait = std::time::Duration::from_millis(20);
         assert_eq!(ancestor_executed_fields_or_built(&genesis, &unknown, None, 2, wait), None);
-        crate::executed_fields::remember(B256::repeat_byte(0x8b), fields(0x8c));
+        crate::executed_fields::remember(alloy_primitives::keccak256(b"depth-two-consensus-0x8b"), fields(0x8c));
         assert_eq!(
-            ancestor_executed_fields_or_built(&genesis, &unknown, Some(B256::repeat_byte(0x8b)), 2, wait),
+            ancestor_executed_fields_or_built(&genesis, &unknown, Some(alloy_primitives::keccak256(b"depth-two-consensus-0x8b")), 2, wait),
             Some(fields(0x8c))
         );
-        assert_eq!(crate::executed_fields::get(&B256::repeat_byte(0x89)), Some(fields(0x8c)));
+        assert_eq!(crate::executed_fields::get(&alloy_primitives::keccak256(b"depth-two-consensus-0x89")), Some(fields(0x8c)));
         // A depth outside the rule has no expected fields.
         assert_eq!(ancestor_executed_fields(&genesis, &block2, 3), None);
     }
@@ -861,7 +861,7 @@ mod tests {
     fn each_depth_refuses_the_other_depths_header() {
         let d2 = HotStuffConsensus::new(Arc::new(ChainSpecBuilder::mainnet().genesis(depth_two_genesis()).build()));
         let d1 = deferred_consensus();
-        let grandparent = B256::repeat_byte(0x90);
+        let grandparent = alloy_primitives::keccak256(b"depth-two-consensus-0x90");
         crate::executed_fields::remember(grandparent, fields(0x92)); // result(N-2)
         let mut parent_header = carrying(good_header(600, TS_SHANGHAI), fields(0x94)); // carries result(N-3)
         parent_header.gas_used = 0;
@@ -886,7 +886,7 @@ mod tests {
         assert!(d1.validate_header_against_parent(&child_with(fields(0x92)), &parent).is_err());
         // An unknown grandparent is named.
         let mut orphan_header = good_header(600, TS_SHANGHAI);
-        orphan_header.parent_hash = B256::repeat_byte(0x98);
+        orphan_header.parent_hash = alloy_primitives::keccak256(b"depth-two-consensus-0x98");
         let orphan = sealed(orphan_header);
         let mut child = good_header(601, TS_SHANGHAI + 3);
         child.parent_hash = orphan.hash();
@@ -894,7 +894,7 @@ mod tests {
         let err = d2.validate_header_against_parent(&sealed(child), &orphan).unwrap_err();
         assert!(matches!(
             other_err::<DeferredExecutionError>(&err),
-            Some(DeferredExecutionError::ParentUnknown(h)) if *h == B256::repeat_byte(0x98)
+            Some(DeferredExecutionError::ParentUnknown(h)) if *h == alloy_primitives::keccak256(b"depth-two-consensus-0x98")
         ));
     }
 

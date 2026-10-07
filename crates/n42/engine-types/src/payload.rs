@@ -5188,16 +5188,16 @@ mod depth_two_tests {
     #[test]
     fn a_chained_build_finds_its_grandparent_through_the_alias() {
         let genesis = depth_two_genesis();
-        let (gp_built, gp_sealed, gp_resealed) = (B256::repeat_byte(0xd1), B256::repeat_byte(0xd2), B256::repeat_byte(0xd3));
+        let (gp_built, gp_sealed, gp_resealed) = (alloy_primitives::keccak256(b"depth-two-tests-0xd1"), alloy_primitives::keccak256(b"depth-two-tests-0xd2"), alloy_primitives::keccak256(b"depth-two-tests-0xd3"));
         crate::executed_fields::remember(gp_built, fields(0xd4));
         // The parent was built on the grandparent's sealed hash.
         let parent = SealedHeader::new(
             Header { number: 12, timestamp: 12, parent_hash: gp_sealed, ..Default::default() },
-            B256::repeat_byte(0xd5),
+            alloy_primitives::keccak256(b"depth-two-tests-0xd5"),
         );
         let no_alias = SealedHeader::new(
-            Header { number: 12, timestamp: 12, parent_hash: B256::repeat_byte(0xd6), ..Default::default() },
-            B256::repeat_byte(0xd7),
+            Header { number: 12, timestamp: 12, parent_hash: alloy_primitives::keccak256(b"depth-two-tests-0xd6"), ..Default::default() },
+            alloy_primitives::keccak256(b"depth-two-tests-0xd7"),
         );
         // With nothing under the sealed hash the build waits, then fails.
         let short = std::time::Duration::from_millis(20);
@@ -5217,17 +5217,17 @@ mod depth_two_tests {
         crate::executed_fields::remember(gp_built, fields(0xd4));
         let on_resealed = SealedHeader::new(
             Header { number: 12, timestamp: 13, parent_hash: gp_resealed, ..Default::default() },
-            B256::repeat_byte(0xd8),
+            alloy_primitives::keccak256(b"depth-two-tests-0xd8"),
         );
         assert_eq!(carried_fields_for_seal(&genesis, &on_resealed, Some(on_resealed.hash()), 2), Some(fields(0xd4)));
         // At the chain start (parent 1) the genesis result is the parent's own header.
         let block1 = SealedHeader::new(
-            Header { number: 1, timestamp: 1, state_root: B256::repeat_byte(0xd9), ..Default::default() },
-            B256::repeat_byte(0xda),
+            Header { number: 1, timestamp: 1, state_root: alloy_primitives::keccak256(b"depth-two-tests-0xd9"), ..Default::default() },
+            alloy_primitives::keccak256(b"depth-two-tests-0xda"),
         );
         assert_eq!(
             carried_fields_for_seal(&genesis, &block1, None, 2).map(|f| f.state_root),
-            Some(B256::repeat_byte(0xd9))
+            Some(alloy_primitives::keccak256(b"depth-two-tests-0xd9"))
         );
     }
 }

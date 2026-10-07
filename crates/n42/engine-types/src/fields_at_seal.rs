@@ -602,8 +602,8 @@ mod tests {
     /// and the fallback is counted.
     #[test]
     fn at_depth_two_the_root_job_waits_for_the_parents_record_not_its_complete() {
-        let parent_built = B256::repeat_byte(0x81);
-        let parent_sealed = B256::repeat_byte(0x82);
+        let parent_built = alloy_primitives::keccak256(b"depth-two-barrier-0x81");
+        let parent_sealed = alloy_primitives::keccak256(b"depth-two-barrier-0x82");
         let (state, genesis) = forest("depth-two-barrier");
         let filer = {
             let state = state.clone();
@@ -612,7 +612,7 @@ mod tests {
                 file_parent(&state, genesis, parent_built);
                 crate::executed_fields::remember(
                     parent_built,
-                    ExecutedFields { state_root: B256::repeat_byte(0x83), receipts_root: B256::ZERO, logs_bloom: Bloom::default(), gas_used: 0 },
+                    ExecutedFields { state_root: alloy_primitives::keccak256(b"depth-two-barrier-0x83"), receipts_root: B256::ZERO, logs_bloom: Bloom::default(), gas_used: 0 },
                 );
             })
         };

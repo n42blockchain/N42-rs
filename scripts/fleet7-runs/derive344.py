@@ -63,7 +63,7 @@ def derive(suffix, binary):
     run = run.replace('if [ "$tag" = loop344F2 ]', 'if [ "$tag" = loop344F2new ]')
     k = "  for p in $(pgrep -f '/n4[2] node --chain'; pgrep -f 'h2_validato[r]'; pgrep -f 'tx_floo[d]'); do kill -9 $p 2>/dev/null; done; sleep 2\n  if [ \"$STOPNOW\" = 1 ]"
     assert run.count(k) == 1
-    extra = ('  case $tag in G*) python3 scripts/fleet7-runs/gossip344.py $tag 2>&1 | cut -c1-420 ;; esac\n'
+    extra = ('  case $tag in loop344G*) python3 scripts/fleet7-runs/gossip344.py $tag 2>&1 | cut -c1-420 ;; esac\n'
              '  if [ "$tag" = loop344Gnew ]; then echo "== kill-and-restart check of $tag from $(date +%H:%M:%S)"; timeout 900 python3 scripts/fleet7-runs/restart344.py $tag 2>&1 | cut -c1-420 | tee $S/restart344-$tag.out; echo "== restart check done $(date +%H:%M:%S)"; fi\n')
     run = run.replace(k, extra + k)
     open(D + f'run-loop344{suffix}.sh', 'w').write(run)

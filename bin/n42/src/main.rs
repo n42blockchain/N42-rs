@@ -89,6 +89,19 @@ fn main() {
         Cli::<N42ChainSpecParser>::parse().run(async move |builder, _extra_args| {
             info!(target: "reth::cli", "Launching node");
 
+            // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md): a
+            // malformed value or a depth this node does not run is refused here,
+            // never read as depth 1 -- a depth-1 member of a depth-2 fleet
+            // refuses every header.
+            {
+                let genesis = builder.config().chain.genesis();
+                let depth = reth_chainspec::qmdb::check_deferred_execution_depth(genesis)
+                    .map_err(|err| eyre::eyre!("genesis: {err}"))?;
+                if let Some(at) = reth_chainspec::qmdb::deferred_execution_time(genesis) {
+                    info!(target: "reth::cli", deferred_from = at, depth, "deferred execution: a header carries the result of its ancestor {depth} blocks back");
+                }
+            }
+
             // Start the pubsub router loop (must be inside async context)
             tokio::spawn(async move {
                 debug!(target: "reth::cli", "Starting pubsub router loop");

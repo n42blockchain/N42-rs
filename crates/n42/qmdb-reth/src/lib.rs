@@ -39,7 +39,10 @@ pub use changes::{
     changes_from_alloc, changes_from_bundle, changes_from_execution, with_prague_system_caller, sorted_operations_from_accounts, sorted_operations_from_accounts_timed, sorted_operations_from_execution, operations_ahead, OpsAhead, OpsSplit,
 };
 pub use hotstuff::{GenesisValidator, HotStuffConfigError, HotStuffGenesisConfig};
-pub use reth_chainspec::qmdb::{deferred_execution_active_at, deferred_execution_time};
+pub use reth_chainspec::qmdb::{
+    check_deferred_execution_depth, deferred_execution_active_at, deferred_execution_depth, deferred_execution_depth_at,
+    deferred_execution_time, DeferredDepthError, DEFERRED_EXECUTION_DEPTH_KEY, SUPPORTED_DEFERRED_EXECUTION_DEPTH,
+};
 /// The tree a producer computed for a block it has not yet sealed.
 pub use n42_qmdb_state::forest::PreparedBlock;
 pub use node_state::{NodeStateError, QmdbNodeState, RootSplit};

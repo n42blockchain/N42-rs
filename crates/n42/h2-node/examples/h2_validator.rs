@@ -175,11 +175,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut hotstuff_config: Option<n42_qmdb_reth::HotStuffGenesisConfig> = None;
     // The chain's `deferredExecutionTime`, when it has one.
     let mut deferred_execution_time: Option<u64> = None;
+    // The chain's `deferredExecutionDepth` (1 when absent).
+    let mut deferred_execution_depth: u64 = 1;
     let (identity, validators): (H2V4ChainIdentity, Vec<ValidatorInfo>) = match &chain_path {
         Some(path) => {
             use reth_cli::chainspec::ChainSpecParser as _;
             let spec = n42_qmdb_reth::N42ChainSpecParser::parse(path)?;
             deferred_execution_time = n42_qmdb_reth::deferred_execution_time(&spec.genesis);
+            // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md):
+            // refused when malformed or not run by this build, never read as 1.
+            deferred_execution_depth = n42_qmdb_reth::check_deferred_execution_depth(&spec.genesis)
+                .map_err(|err| format!("{path}: {err}"))?;
             let hotstuff = n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(&spec.genesis)?;
             base_timeout_ms.get_or_insert(hotstuff.base_timeout);
             max_timeout_ms.get_or_insert(hotstuff.max_timeout);
@@ -467,6 +473,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(at) = deferred_execution_time {
             driver.set_deferred_execution_time(Some(at));
             println!("deferred     : execution deferred from timestamp {at}; a block is checked, voted for, then imported beside the loop");
+            println!("deferred     : depth {deferred_execution_depth} (a header carries the result of its ancestor {deferred_execution_depth} blocks back)");
         }
 
         let mut service = H2Service::new(transport, engine, driver, output_rx, validator_count);

@@ -66,6 +66,9 @@ def derive(suffix, binary):
     extra = ('  case $tag in loop344G*) python3 scripts/fleet7-runs/gossip344.py $tag 2>&1 | cut -c1-420 ;; esac\n'
              '  if [ "$tag" = loop344Gnew ]; then echo "== kill-and-restart check of $tag from $(date +%H:%M:%S)"; timeout 900 python3 scripts/fleet7-runs/restart344.py $tag 2>&1 | cut -c1-420 | tee $S/restart344-$tag.out; echo "== restart check done $(date +%H:%M:%S)"; fi\n')
     run = run.replace(k, extra + k)
+    # a global bounded map in payload_serve (`listed_for`) is crowded out by parallel tests: the n42 lib runs single-threaded, like the engine-types lib
+    assert '"-p n42 --lib"; do' in run
+    run = run.replace('"-p n42 --lib"; do', '"-p n42 --lib -- --test-threads=1"; do')
     open(D + f'run-loop344{suffix}.sh', 'w').write(run)
     la = open(D + 'launch-loop343.sh').read().replace('run-loop343.sh', 'run-loop344' + suffix + '.sh').replace('loop343', 'loop344' + suffix)
     open(D + f'launch-loop344{suffix}.sh', 'w').write(la)

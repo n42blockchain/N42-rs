@@ -552,6 +552,24 @@ pub fn seal_at_exec() -> bool {
     *ON.get_or_init(|| std::env::var("N42_SEAL_AT_EXEC").is_ok_and(|v| v == "1"))
 }
 
+/// `N42_SEAL_ON_COUNTERS=1` (`docs/SHARED_EXECUTION_SCOPE.md` 16.4 item 1;
+/// `N42_SEAL_ON_COUNTS=1` is the same switch): with `N42_SEAL_AT_EXEC=1` and
+/// the body made in the prep, every batch counts its transfers, their gas and
+/// their fees as it executes, and a block that seals at the execution's end
+/// with every candidate executed in pull order seals on those sums, with the
+/// prep's body, and no pass over the slots on the seal's path (the pass on the
+/// build pool that finished behind the freeze's slowest task, 16.2). The
+/// references are then made behind the seal by the receipts job only. Any
+/// other block makes them as before. Off by default.
+pub fn seal_on_counters() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        ["N42_SEAL_ON_COUNTERS", "N42_SEAL_ON_COUNTS"]
+            .iter()
+            .any(|name| std::env::var(name).is_ok_and(|v| v.trim() == "1"))
+    })
+}
+
 /// `N42_FREEZE_AFTER_SEAL=1` (`docs/SHARED_EXECUTION_SCOPE.md` 15): with
 /// `N42_SEAL_AT_EXEC=1` and the output shards, the shards' freeze (the index's
 /// conflict sums, and under `N42_LIVE_INDEX_DEFER=1` the shards the batches
@@ -1562,6 +1580,11 @@ where
     let mut commit_body_ms = 0u64;
     // Whether the commit took the body made in the prep's pass.
     let mut commit_body_ahead_used = false;
+    // `N42_SEAL_ON_COUNTERS=1`: whether this block sealed on the batches'
+    // counters with no pass over the slots, and the batches' end to the
+    // seal's start, us (the commit, the give-back and the match between).
+    let mut seal_on_counters_used = false;
+    let mut exec_end_to_seal_us = 0u64;
     // Of `give_back_ms`: the body checked against the pulled set.
     let mut match_ms = 0u64;
     // Of `sealed_ms`: the header filled and `cons.seal`; the sealed and
@@ -1913,6 +1936,11 @@ where
                 pre_exec_ms = pre_exec_at.elapsed().as_millis() as u64;
                 let run_at = std::time::Instant::now();
                 run_started = Some(run_at);
+                // `N42_SEAL_ON_COUNTERS=1`: the batches count the block's
+                // transfers, gas and fees (at the tips made in the prep) as
+                // they execute, so the seal needs no pass over the slots.
+                let counted_tips: Option<&[u128]> =
+                    if seal_on_counters() { body_ahead.as_ref().map(|made| made.tips.as_slice()) } else { None };
                 let executed = if defer_state {
                     // After the partition, before the batches: the builder's
                     // own state opened (the wait for a sealed parent's output
@@ -1924,17 +1952,27 @@ where
                             false
                         }
                     };
-                    crate::parallel_transfer::execute_for_build_in_place_after(
+                    crate::parallel_transfer::execute_for_build_counted(
                         &group_env,
                         &keys,
                         &convert,
                         &open,
                         sink,
                         in_place,
-                        &mut before_batches,
+                        Some(&mut before_batches),
+                        counted_tips,
                     )
                 } else {
-                    crate::parallel_transfer::execute_for_build_in_place(&group_env, &keys, &convert, &open, sink, in_place)
+                    crate::parallel_transfer::execute_for_build_counted(
+                        &group_env,
+                        &keys,
+                        &convert,
+                        &open,
+                        sink,
+                        in_place,
+                        None,
+                        counted_tips,
+                    )
                 };
                 let exec_done = std::time::Instant::now();
                 par_run_ms = exec_done.duration_since(run_at).as_millis() as u64;
@@ -2016,11 +2054,16 @@ where
                     // execution's end and the seal run on the build pool (each
                     // serial pass strides 163k slots of ~470 bytes).
                     let on_pool = seal_at_exec();
+                    // `N42_SEAL_ON_COUNTERS=1`: the count and the gas are the
+                    // batches' own (`RunCounters`, the same sums), and the
+                    // references are made below only for a block that does
+                    // not seal on the counters.
+                    let counters_first = seal_on_counters() && !run.slots.is_empty();
                     // Block order, by reference: a pointer a transfer, where the
                     // collect moved ~470 bytes of each.
                     // On the pool, the references and the block's gas are one
                     // pass (`slot_refs_and_gas`).
-                    let (refs, pool_gas) = if run.slots.is_empty() {
+                    let (mut refs, pool_gas) = if run.slots.is_empty() || counters_first {
                         (None, None)
                     } else if on_pool {
                         let (refs, gas) = crate::parallel_transfer::slot_refs_and_gas(&run.slots);
@@ -2029,6 +2072,7 @@ where
                         (Some(run.slots.iter().filter_map(std::sync::OnceLock::get).collect::<Vec<_>>()), None)
                     };
                     let (executed_count, executed_gas) = match (refs.as_ref(), pool_gas) {
+                        _ if counters_first => (run.counters.executed, run.counters.gas),
                         (Some(refs), Some(gas)) => (refs.len(), gas),
                         (Some(refs), None) => (refs.len(), refs.iter().map(|built| built.gas_used).sum::<u64>()),
                         (None, _) => (run.executed.len(), run.executed.iter().map(|built| built.gas_used).sum::<u64>()),
@@ -2059,7 +2103,43 @@ where
                     // cumulative gas per transaction and the block's gas: the
                     // seal needs neither.
                     let mut receipts_behind = false;
-                    if let (true, true, Some(refs)) = (seals_early_here, direct_receipts_enabled(), refs.as_ref()) {
+                    // `N42_SEAL_ON_COUNTERS=1`: a block that seals here with
+                    // every candidate executed in pull order is the body made
+                    // in the prep (`BodyAhead`) and the batches' fees; nothing
+                    // on the seal's path reads the slots. Any other block
+                    // makes the references now, as without the switch.
+                    let counted_body = if counters_first
+                        && ahead
+                        && run.skipped.is_empty()
+                        && executed_count == cands.len()
+                        && let Some(fees) = run.counters.fees
+                        && body_ahead.as_ref().is_some_and(|made| made.transactions.len() == cands.len())
+                    {
+                        body_ahead.take().map(|made| (made, fees))
+                    } else {
+                        None
+                    };
+                    if counters_first && counted_body.is_none() {
+                        let at = std::time::Instant::now();
+                        refs = Some(if on_pool {
+                            crate::parallel_transfer::slot_refs_and_gas(&run.slots).0
+                        } else {
+                            run.slots.iter().filter_map(std::sync::OnceLock::get).collect::<Vec<_>>()
+                        });
+                        commit_refs_ms += at.elapsed().as_millis() as u64;
+                    }
+                    seal_on_counters_used = counted_body.is_some();
+                    if let Some((made, fees)) = counted_body {
+                        total_fees += fees;
+                        commit_body_ahead_used = true;
+                        cumulative_gas_used += executed_gas;
+                        tx_count += executed_count as u64;
+                        direct_body = Some((made.transactions, made.senders));
+                        // The references, the cumulative gas and the receipts
+                        // are made behind the seal by the receipts job, which
+                        // reads the slots itself.
+                        receipts_behind = true;
+                    } else if let (true, true, Some(refs)) = (seals_early_here, direct_receipts_enabled(), refs.as_ref()) {
                         // The same body and receipts as the branch below, made
                         // from the slots: the transaction is copied out of its
                         // slot once, on the pool, straight into the body.
@@ -2228,6 +2308,10 @@ where
                     let mut seal_took = std::time::Duration::ZERO;
                     if ahead && let Some(EarlySeal { hook, parent_built: _ }) = early_seal.take() {
                         let seal_at = std::time::Instant::now();
+                        if let Some(run_at) = run_started {
+                            let exec_end = run_at + std::time::Duration::from_micros(run.phases.batches_end_us);
+                            exec_end_to_seal_us = seal_at.saturating_duration_since(exec_end).as_micros() as u64;
+                        }
                         let matches = root_ahead.is_some()
                             && run.skipped.is_empty()
                             && direct_body.as_ref().is_some_and(|(transactions, _)| {
@@ -3489,6 +3573,11 @@ where
                     commit_fees_ms,
                     commit_body_ms,
                     commit_body_ahead_used,
+                    // `N42_SEAL_ON_COUNTERS=1`: sealed on the batches'
+                    // counters (no pass over the slots before the seal), and
+                    // the batches' end to the seal's start, us.
+                    seal_on_counters = seal_on_counters_used,
+                    exec_end_to_seal_us,
                     match_ms,
                     seal_header_ms,
                     seal_block_ms,

@@ -1497,6 +1497,37 @@ pub struct BuildRun<T> {
     /// `executed` is then empty; [`BuildRun::executed_refs`] reads them in
     /// block order and [`BuildRun::take_executed`] collects them.
     pub slots: Vec<std::sync::OnceLock<BuiltTransfer<T>>>,
+    /// The batches' own counts, summed in batch order: what the seal needs of
+    /// the execution without a pass over the slots (`N42_SEAL_ON_COUNTERS=1`).
+    pub counters: RunCounters,
+}
+
+/// What every batch counts as it executes ([`BuildRun::counters`]): the
+/// transfers it executed, their gas, and -- when the caller handed the
+/// candidates' tips per gas ([`execute_for_build_counted`]) -- their fees,
+/// `tip x gas_used` summed exactly as [`fees_from_tips`] sums it over the
+/// slots. The same numbers a pass over the filled slots gives
+/// ([`slot_refs_and_gas`]), read off the batches instead.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RunCounters {
+    /// Transfers executed (filled slots).
+    pub executed: usize,
+    /// Their gas used, summed.
+    pub gas: u64,
+    /// Their fees at the tips handed in; `None` without tips, or when the
+    /// tips did not cover every candidate.
+    pub fees: Option<U256>,
+}
+
+impl RunCounters {
+    fn add(&mut self, batch: Self) {
+        self.executed += batch.executed;
+        self.gas += batch.gas;
+        self.fees = match (self.fees, batch.fees) {
+            (Some(a), Some(b)) => Some(a + b),
+            _ => None,
+        };
+    }
 }
 
 impl<T> Default for BuildRun<T> {
@@ -1507,6 +1538,7 @@ impl<T> Default for BuildRun<T> {
             bundles: Vec::new(),
             phases: Phases::default(),
             slots: Vec::new(),
+            counters: RunCounters::default(),
         }
     }
 }
@@ -3452,7 +3484,7 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, build_one_wave())
+    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, build_one_wave(), None)
 }
 
 /// [`execute_for_build_in_place`] with the dispatch chosen by the caller
@@ -3473,7 +3505,7 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, read_set(), one_wave)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, read_set(), one_wave, None)
 }
 
 fn execute_for_build_run<T, G>(
@@ -3490,7 +3522,53 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), build_one_wave())
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), build_one_wave(), None)
+}
+
+/// [`execute_for_build_in_place_after`] (with `before_batches` optional) with
+/// the candidates' tips per gas at the block's base fee, one a candidate in
+/// candidate order: every batch then sums its transfers' fees beside their
+/// count and gas ([`RunCounters`]), and the seal reads the block's count, gas
+/// and fees off [`BuildRun::counters`] with no pass over the slots
+/// (`N42_SEAL_ON_COUNTERS=1`). Tips of another length give `fees: None`.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_for_build_counted<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    on_bundle: Option<&(dyn Fn(BundleState) + Sync)>,
+    in_place: bool,
+    before_batches: Option<&mut dyn FnMut() -> bool>,
+    tips: Option<&[u128]>,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), build_one_wave(), tips)
+}
+
+/// [`execute_for_build_counted`] with the dispatch chosen by the caller: for
+/// tests that compare the counters with the slots' pass in one process.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn execute_for_build_counted_dispatch<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    in_place: bool,
+    one_wave: bool,
+    tips: Option<&[u128]>,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    execute_for_build_opts(evm_env, keys, convert, open, None, in_place, None, read_set(), one_wave, tips)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3504,6 +3582,7 @@ fn execute_for_build_opts<T, G>(
     before_batches: Option<&mut dyn FnMut() -> bool>,
     with_read_set: bool,
     one_wave: bool,
+    tips: Option<&[u128]>,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
@@ -3511,6 +3590,8 @@ where
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let beneficiary = evm_env.block_env.beneficiary;
+    // Tips that do not name every candidate count no fees.
+    let tips = tips.filter(|tips| tips.len() == keys.len());
     let mut phases = Phases::default();
     let at = std::time::Instant::now();
     let call_at = at;
@@ -3554,7 +3635,8 @@ where
         (0..keys.len()).into_par_iter().with_min_len(4096).map(|_| std::sync::OnceLock::new()).collect()
     });
     let slots_ref = &slots;
-    type BatchResult = (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, BatchSpan, LoopTimers);
+    type BatchResult =
+        (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, BatchSpan, LoopTimers, RunCounters);
     // Each batch's span on the pool, against this instant (`BatchSpans`).
     let batches_at = std::time::Instant::now();
     phases.batches_start_us = batches_at.duration_since(call_at).as_micros() as u64;
@@ -3575,6 +3657,8 @@ where
         // batch.
         let mut state = crate::batch_state::BatchState::with_capacity(db, txs + txs / 4 + 1);
         let mut skipped = Vec::new();
+        // The batch's count, gas and fees, kept as it executes.
+        let mut counted = RunCounters { fees: tips.map(|_| U256::ZERO), ..Default::default() };
         let mut setup_ns = 0;
         let close_at;
         {
@@ -3606,6 +3690,11 @@ where
                             let t4 = mark();
                             if slots_ref[i].set(BuiltTransfer { index: i, tx, result, gas_used }).is_err() {
                                 return Err(NotParallel::Failed(i, "executed twice".to_string()));
+                            }
+                            counted.executed += 1;
+                            counted.gas += gas_used;
+                            if let (Some(fees), Some(tip)) = (counted.fees.as_mut(), tips.and_then(|tips| tips.get(i))) {
+                                *fees += U256::from(*tip) * U256::from(gas_used);
                             }
                             if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4)) = (t0, t1, t2, t3, t4) {
                                 sampler.record(&[t0, t1, t1, t2, t2, t3, t4, std::time::Instant::now()]);
@@ -3641,12 +3730,12 @@ where
                 sink(bundle);
                 let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
                 let span = BatchSpan::close(start_us, cpu_start, txs, batches_at).with_open_us(open_us);
-                Ok((skipped, None, timers, span, sampler.finish(setup_ns, close_ns)))
+                Ok((skipped, None, timers, span, sampler.finish(setup_ns, close_ns), counted))
             }
             None => {
                 let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
                 let span = BatchSpan::close(start_us, cpu_start, txs, batches_at).with_open_us(open_us);
-                Ok((skipped, Some(bundle), timers, span, sampler.finish(setup_ns, close_ns)))
+                Ok((skipped, Some(bundle), timers, span, sampler.finish(setup_ns, close_ns), counted))
             }
         }
     };
@@ -3684,9 +3773,11 @@ where
 
     let at = std::time::Instant::now();
     let mut run = BuildRun { phases, ..Default::default() };
+    run.counters.fees = tips.map(|_| U256::ZERO);
     let mut spans: Vec<BatchSpan> = Vec::with_capacity(results.len());
     for r in results {
-        let (skipped, bundle, timers, span, loop_timers) = r?;
+        let (skipped, bundle, timers, span, loop_timers, counted) = r?;
+        run.counters.add(counted);
         spans.push(span);
         run.phases.loop_timers.add(loop_timers);
         run.skipped.extend(skipped);
@@ -5864,6 +5955,82 @@ mod tests {
         }
     }
 
+    /// `N42_SEAL_ON_COUNTERS=1`: the batches' counters are the slots' pass.
+    /// On blocks of sender runs, interleaved senders and shared recipients,
+    /// whole and with senders that fail part-way (a nonce ahead, a balance
+    /// that runs out), in both dispatches: the count, the gas and the fees the
+    /// batches sum equal `slot_refs_and_gas` and the fees over the slots
+    /// (`fees_from_tips` when nothing was skipped); and on a whole block the
+    /// body made in the prep (`BodyAhead`) equals the body made from the slots
+    /// (`body_and_fees`), so the seal's transactions, senders, count, gas and
+    /// fees are the same either way. The receipts (root and bloom) are made
+    /// from the slots behind the seal on both paths.
+    #[test]
+    fn seal_on_counters_equals_the_refs_pass() {
+        for (senders, per, space, run, broken) in
+            [(400u64, 20u64, 0u64, 20usize, false), (300, 10, 0, 1, false), (200, 15, 2_000, 7, false), (200, 15, 0, 5, true), (150, 12, 1_500, 3, true)]
+        {
+            let (block, mut db) = random_fixture(senders, per, space, run, 5);
+            if broken {
+                // Every seventh sender is a nonce ahead (its run skipped from
+                // the first transfer), every eleventh can pay for two transfers.
+                for s in (0..senders).step_by(7) {
+                    db.insert_account_info(addr(100 + s), AccountInfo { balance: U256::from(10u128.pow(21)), nonce: 3, ..Default::default() });
+                }
+                for s in (3..senders).step_by(11) {
+                    db.insert_account_info(addr(100 + s), AccountInfo { balance: U256::from(2 * 21_000u64 * 10_000_000_000u64 + 2_500), nonce: 0, ..Default::default() });
+                }
+            }
+            let evm_config =
+                crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+            let evm_env = evm_config.evm_env(block.header()).expect("env");
+            let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
+            let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
+            let hashes: Vec<B256> = block.body().transactions.iter().map(|tx| *alloy_consensus::transaction::TxHashRef::tx_hash(tx)).collect();
+            let convert = |i: usize| ((), envs[i].clone());
+            let mut seed = 0x2545f4914f6cdd1du64;
+            let tips: Vec<u128> = (0..keys.len())
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    u128::from(seed % 3_000_000_000)
+                })
+                .collect();
+            for one_wave in [false, true] {
+                let run = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, one_wave, Some(&tips))
+                    .expect("a block of transfers");
+                assert_eq!(broken, !run.skipped.is_empty(), "skips only on the broken blocks");
+                let (refs, gas) = slot_refs_and_gas(&run.slots);
+                assert!(!refs.is_empty());
+                assert_eq!(run.counters.executed, refs.len(), "count");
+                assert_eq!(run.counters.gas, gas, "gas");
+                let slot_fees =
+                    refs.iter().fold(U256::ZERO, |sum, built| sum + U256::from(tips[built.index]) * U256::from(built.gas_used));
+                assert_eq!(run.counters.fees, Some(slot_fees), "fees");
+                if broken {
+                    assert_eq!(fees_from_tips(&refs, &tips), None, "a block with skips is not the prep's body");
+                    continue;
+                }
+                assert_eq!(run.counters.fees, fees_from_tips(&refs, &tips), "fees as the commit reads them");
+                // The body: made in the prep against made from the slots.
+                let (_, made) = BodyAhead::make_keyed(&hashes, |i, hash| (Some(keys[i]), *hash, keys[i].0, tips[i])).expect("every candidate a transfer");
+                let (transactions, senders_of, fees) = body_and_fees(&refs, |built| (hashes[built.index], keys[built.index].0, tips[built.index]));
+                assert_eq!(made.transactions, transactions, "the body's transactions");
+                assert_eq!(made.senders, senders_of, "the body's senders");
+                assert_eq!(run.counters.fees, Some(fees), "the body's fees");
+                // Without tips the counters still count, and say no fees.
+                let plain = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, one_wave, None)
+                    .expect("a block of transfers");
+                assert_eq!((plain.counters.executed, plain.counters.gas, plain.counters.fees), (refs.len(), gas, None));
+                // Tips of another length count no fees.
+                let short = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, one_wave, Some(&tips[1..]))
+                    .expect("a block of transfers");
+                assert_eq!(short.counters.fees, None);
+            }
+        }
+    }
+
     /// The one-wave packing: whole groups in order, at most `workers`
     /// batches, each within one group of an even share.
     #[test]
@@ -6560,7 +6727,7 @@ mod tests {
                 });
                 let par = at.elapsed();
                 let prefault_us = target.as_ref().map_or(0, |t| t.prefault_us);
-                let BuildRun { executed, bundles, skipped, phases, slots } = run;
+                let BuildRun { executed, bundles, skipped, phases, slots, counters: _ } = run;
                 // The receipts and the body, as the builder builds them for a
                 // block that seals early (`par_commit_ms`): out of the
                 // collected vector, or out of the slots by reference

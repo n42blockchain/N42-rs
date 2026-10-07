@@ -1375,6 +1375,56 @@ pub fn build_one_wave() -> bool {
     *ON.get_or_init(|| std::env::var("N42_BUILD_ONE_WAVE").is_ok_and(|v| v == "1"))
 }
 
+/// `N42_BUILD_BATCHES=<n>` (`docs/SHARED_EXECUTION_SCOPE.md` 16.4 item 4):
+/// the build's transfers in `n` batches of about equal size (whole sender
+/// groups in candidate order, [`batch_groups_one_wave`] with `n`), handed to
+/// the pool largest first (FIFO, so the workers take them in that order):
+/// with 96-128 batches on 32 workers no worker starts a second batch behind a
+/// long one, and the execution ends within one small batch of its CPU floor.
+/// 0 (the default) keeps the dispatch `N42_BUILD_ONE_WAVE` chooses. Each batch
+/// opens its own view of the parent, so more batches cost more opens.
+pub fn build_batches() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("N42_BUILD_BATCHES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// How a build's batches are made and handed to the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatch {
+    /// Up to two batches a worker ([`batch_groups`]), split in halves by
+    /// rayon (the default).
+    Halves,
+    /// One batch a worker at most ([`batch_groups_one_wave`]), all spawned
+    /// at once (`N42_BUILD_ONE_WAVE=1`).
+    OneWave,
+    /// `n` batches, spawned largest first (`N42_BUILD_BATCHES=<n>`).
+    LargestFirst(usize),
+}
+
+impl Dispatch {
+    /// The dispatch the environment asks for.
+    pub fn from_env() -> Self {
+        match build_batches() {
+            0 if build_one_wave() => Self::OneWave,
+            0 => Self::Halves,
+            n => Self::LargestFirst(n),
+        }
+    }
+
+    fn from_one_wave(one_wave: bool) -> Self {
+        if one_wave { Self::OneWave } else { Self::Halves }
+    }
+}
+
+/// The order [`Dispatch::LargestFirst`] hands batches to the pool in: by
+/// transfers, largest first, ties in batch order (longest processing time
+/// first).
+pub fn largest_first(sizes: &[usize]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    order.sort_by(|a, b| sizes[*b].cmp(&sizes[*a]).then(a.cmp(b)));
+    order
+}
+
 /// Whole groups packed into at most `workers` batches, in group order, each
 /// ending at the first group that takes the running count past its share
 /// (`k x total / batches`): every batch holds about `total / workers`
@@ -3586,7 +3636,7 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, build_one_wave(), None, None)
+    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, Dispatch::from_env(), None, None)
 }
 
 /// [`execute_for_build_in_place`] with the dispatch chosen by the caller
@@ -3607,7 +3657,7 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, read_set(), one_wave, None, None)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), None, None)
 }
 
 fn execute_for_build_run<T, G>(
@@ -3624,7 +3674,7 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), build_one_wave(), None, None)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), None, None)
 }
 
 /// [`execute_for_build_in_place_after`] (with `before_batches` optional) with
@@ -3650,7 +3700,7 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), build_one_wave(), tip_of, prepared)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), tip_of, prepared)
 }
 
 /// [`execute_for_build_counted`] with the dispatch chosen by the caller: for
@@ -3672,7 +3722,26 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, None, in_place, None, read_set(), one_wave, tip_of, prepared)
+    execute_for_build_opts(evm_env, keys, convert, open, None, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), tip_of, prepared)
+}
+
+/// [`execute_for_build_in_place`] with the [`Dispatch`] chosen by the caller:
+/// for tests that compare the dispatches in one process.
+#[doc(hidden)]
+pub fn execute_for_build_dispatched<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    on_bundle: Option<&(dyn Fn(BundleState) + Sync)>,
+    dispatch: Dispatch,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, true, None, read_set(), dispatch, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3685,7 +3754,7 @@ fn execute_for_build_opts<T, G>(
     in_place: bool,
     before_batches: Option<&mut dyn FnMut() -> bool>,
     with_read_set: bool,
-    one_wave: bool,
+    dispatch: Dispatch,
     tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
     prepared: Option<PreparedExec<T>>,
 ) -> Result<BuildRun<T>, NotParallel>
@@ -3720,7 +3789,11 @@ where
     let pool = build_pool();
     let workers = pool.current_num_threads().max(1);
     let batches =
-        if one_wave { batch_groups_one_wave(&groups, keys.len(), workers) } else { batch_groups(&groups, keys.len(), workers) };
+        match dispatch {
+            Dispatch::OneWave => batch_groups_one_wave(&groups, keys.len(), workers),
+            Dispatch::LargestFirst(n) => batch_groups_one_wave(&groups, keys.len(), n.max(1)),
+            Dispatch::Halves => batch_groups(&groups, keys.len(), workers),
+        };
     phases.batches = batches.len();
     phases.partition_ms = at.elapsed().as_millis() as u64;
     phases.partition_us = at.elapsed().as_micros() as u64;
@@ -3859,7 +3932,30 @@ where
             }
         }
     };
-    let results: Vec<Result<BatchResult, NotParallel>> = if one_wave {
+    let results: Vec<Result<BatchResult, NotParallel>> = if let Dispatch::LargestFirst(_) = dispatch {
+        // Spawned FIFO in the largest-first order: the workers take the
+        // longest batches first and the short ones fill the tail. Results
+        // are read back in batch order, as in the other dispatches.
+        let sizes: Vec<usize> = batches.iter().map(|members| members.iter().map(|group| group.len()).sum()).collect();
+        let order = largest_first(&sizes);
+        let mut slots: Vec<Option<Result<BatchResult, NotParallel>>> = (0..batches.len()).map(|_| None).collect();
+        {
+            let mut by_index: Vec<Option<&mut Option<Result<BatchResult, NotParallel>>>> = slots.iter_mut().map(Some).collect();
+            let run_batch = &run_batch;
+            pool.scope_fifo(|scope| {
+                for &i in &order {
+                    if let (Some(slot), Some(members)) = (by_index.get_mut(i).and_then(Option::take), batches.get(i)) {
+                        scope.spawn_fifo(move |_| *slot = Some(run_batch(members)));
+                    }
+                }
+            });
+        }
+        slots
+            .into_iter()
+            .enumerate()
+            .map(|(i, slot)| slot.unwrap_or_else(|| Err(NotParallel::Failed(i, "a batch did not run".to_string()))))
+            .collect()
+    } else if dispatch == Dispatch::OneWave {
         // Every batch spawned at once onto the pool (one job each, taken by
         // whichever thread is free), not split in halves from one thread:
         // the batches start as fast as the threads pick them up, and the
@@ -6072,6 +6168,59 @@ mod tests {
             let one = sharded(true);
             assert!(two.0.1 > 0);
             assert_eq!(two, one, "the shards merge to the same bundle, state operations and receipts either way");
+
+            // `N42_BUILD_BATCHES`: 96 and 128 batches, largest first, through
+            // the shards, equal the default dispatch.
+            for n in [96usize, 128] {
+                let shards = crate::output_shards::OutputShards::with_index_live(beneficiary, keys.len(), 16, true, true);
+                let sink = |bundle: BundleState| shards.add(bundle);
+                let run = execute_for_build_dispatched(&evm_env, &keys, &convert, &|| Some(db.clone()), Some(&sink), Dispatch::LargestFirst(n))
+                    .expect("a block of transfers");
+                assert!(run.phases.batches <= n && run.phases.batches > 0);
+                let executed: Vec<(usize, u64, bool)> = run
+                    .slots
+                    .iter()
+                    .filter_map(std::sync::OnceLock::get)
+                    .map(|b| (b.index, b.gas_used, b.result.is_success()))
+                    .collect();
+                let frozen = shards.freeze();
+                let merged = frozen.merged(&BundleState::default());
+                let largest = (receipts_root_of(&executed), run.skipped, frozen.beneficiary_delta(), accounts_of(&merged), reverts_of(&merged), state_ops_of(&merged));
+                assert_eq!(two, largest, "{n} batches largest first equal the default dispatch");
+            }
+        }
+    }
+
+    /// `N42_BUILD_BATCHES=<n>`: the packing puts every sender group in exactly
+    /// one batch, in candidate order (so every sender's transfers stay in one
+    /// batch, in nonce order), at most `n` batches; and the largest-first
+    /// order is a permutation of the batches by size, largest first.
+    #[test]
+    fn the_largest_first_packing_keeps_every_sender_run_whole_and_in_order() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for (count, n) in [(400usize, 96usize), (400, 128), (160_000, 128), (37, 96), (1, 128), (2_000, 64)] {
+            let mut all: Vec<Vec<usize>> = Vec::with_capacity(count);
+            let mut next = 0usize;
+            for _ in 0..count {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let len = 1 + (seed % 700) as usize;
+                all.push((next..next + len).collect());
+                next += len;
+            }
+            let batches = batch_groups_one_wave(&all, next, n);
+            assert!(!batches.is_empty() && batches.len() <= n, "{count} groups, {n}: {} batches", batches.len());
+            let flat: Vec<&Vec<usize>> = batches.iter().flatten().copied().collect();
+            assert_eq!(flat.len(), all.len(), "every group once");
+            assert!(flat.iter().zip(&all).all(|(a, b)| std::ptr::eq(*a, b)), "groups in candidate order");
+            let sizes: Vec<usize> = batches.iter().map(|b| b.iter().map(|g| g.len()).sum()).collect();
+            assert_eq!(sizes.iter().sum::<usize>(), next);
+            let order = largest_first(&sizes);
+            let mut seen = order.clone();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..sizes.len()).collect::<Vec<_>>(), "a permutation");
+            assert!(order.windows(2).all(|w| sizes[w[0]] >= sizes[w[1]]), "largest first");
         }
     }
 

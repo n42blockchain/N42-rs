@@ -3598,6 +3598,8 @@ where
                     batches = par_batch_spans.batches,
                     batch_threads = par_batch_spans.threads,
                     one_wave = crate::parallel_transfer::build_one_wave(),
+                    // `N42_BUILD_BATCHES`: batches asked for, largest first (0 off).
+                    build_batches = crate::parallel_transfer::build_batches(),
                     // `N42_PHASE_TIMERS=1`: the batch loop by section, ns of
                     // pool time a transaction (`LoopTimers`); zero when off.
                     loop_fetch_ns = par_loop_timers.per_tx(par_loop_timers.fetch_ns),

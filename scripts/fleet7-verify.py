@@ -78,6 +78,20 @@ def main():
     quorum = nodes - (nodes - 1) // 3
 
     say = (lambda *a, **k: None) if args.quiet else print
+    # The chain's deferred-execution depth (docs/DEFERRED_DEPTH_2_DESIGN.md), when
+    # F7_GENESIS names the file: a header's stateRoot is then the result of the
+    # block that many back, so it is a commitment to compare, not a block's own root.
+    depth = None
+    if os.environ.get("F7_GENESIS"):
+        try:
+            with open(os.environ["F7_GENESIS"]) as genesis:
+                config = json.load(genesis).get("config", {})
+            if "deferredExecutionTime" in config:
+                depth = int(config.get("deferredExecutionDepth", 1))
+        except (OSError, ValueError, TypeError):
+            depth = None
+    if depth is not None:
+        say(f"deferred execution depth {depth}: header N carries the result of block N-{depth}")
 
     first = [height(port) for port in ports]
     answering = [i for i, h in enumerate(first) if h is not None]
@@ -119,6 +133,7 @@ def main():
     result = {
         "nodes": nodes,
         "quorum": quorum,
+        "deferred_depth": depth,
         "answering": answering,
         "common_height": common,
         "commitments": {str(i): rows[i] for i in sorted(rows)},

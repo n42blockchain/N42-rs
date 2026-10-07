@@ -359,6 +359,15 @@ f7_el_dir() { f7_node_dir "${F7_EL_FIRST[$1]}"; }
 # and refusing to roll against a different one turns it into a sentence.
 f7_genesis_fingerprint() { sha256sum "$F7_GENESIS" | cut -d' ' -f1; }
 
+# f7_genesis_depth -- the chain's deferredExecutionDepth (docs/DEFERRED_DEPTH_2_DESIGN.md):
+# 1 when absent, "-" when the chain does not defer execution at all.
+f7_genesis_depth() {
+  python3 -c "
+import json, sys
+config = json.load(open(sys.argv[1])).get('config', {})
+print(config.get('deferredExecutionDepth', 1) if 'deferredExecutionTime' in config else '-')" "$F7_GENESIS"
+}
+
 # f7_genesis_validator_count -- validators the chain names, or 0.
 f7_genesis_validator_count() {
   python3 -c "

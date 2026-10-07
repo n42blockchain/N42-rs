@@ -99,3 +99,36 @@ fn the_bundled_genesis_files_are_depth_one() {
         assert_eq!(check_deferred_execution_depth(&genesis), Ok(1));
     }
 }
+
+/// Step 7: the depth-2 bench files are copies of the depth-1 ones with
+/// `deferredExecutionDepth: 2` and a different `extraData`, so their genesis
+/// hash -- and with it the fork digest and the block-gossip topic -- differs
+/// from the depth-1 chain's: a depth-1 and a depth-2 binary given different
+/// files never meet on the wire.
+#[test]
+fn the_depth_two_bench_files_are_chains_of_their_own() {
+    for (one, two) in [
+        (
+            include_str!("../../../chainspec/res/genesis/n42_fleet3_bench.json"),
+            include_str!("../../../chainspec/res/genesis/n42_fleet3_bench_d2.json"),
+        ),
+        (
+            include_str!("../../../chainspec/res/genesis/n42_fleet7_bench.json"),
+            include_str!("../../../chainspec/res/genesis/n42_fleet7_bench_d2.json"),
+        ),
+    ] {
+        let one: Genesis = serde_json::from_str(one).expect("a genesis");
+        let two: Genesis = serde_json::from_str(two).expect("a genesis");
+        assert_eq!(check_deferred_execution_depth(&one), Ok(1));
+        assert_eq!(check_deferred_execution_depth(&two), Ok(2));
+        assert_eq!(one.alloc, two.alloc);
+        assert_eq!(one.timestamp, two.timestamp);
+        assert_ne!(one.extra_data, two.extra_data);
+        let hash = |genesis: Genesis| {
+            n42_qmdb_reth::with_declared_state_scheme(reth_chainspec::ChainSpec::from(genesis))
+                .expect("a qmdb chain")
+                .genesis_hash()
+        };
+        assert_ne!(hash(one), hash(two), "a depth-2 chain has its own genesis hash");
+    }
+}

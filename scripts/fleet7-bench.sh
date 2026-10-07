@@ -279,6 +279,7 @@ RPCS=$(for ((i = 0; i < F7_ELS; i++)); do printf 'http://127.0.0.1:%s,' $((F7_HT
   echo "tier         : gossip ${N42_MAX_GOSSIP_MB}MB, gas ceiling ${F7_BENCH_GASCEIL}, pool ${F7_BENCH_POOL_SLOTS}, pacing ${F7_BLOCK_INTERVAL_MS}ms, view timeout ${F7_VIEW_TIMEOUT_MS:-genesis}${F7_AMSTERDAM:+, amsterdam}${F7_LEADER_TENURE:+, leader tenure $F7_LEADER_TENURE}"
   echo "supply       : $SENDERS senders x $PERTX tx, offset $OFFSET, conc $CONC, batch $RPCBATCH${SHARD:+, sharded}, $RECIPIENTS recipients, gas $F7_TX_GAS${F7_PRECREATE:+, precreate $F7_PRECREATE}"
   echo "windows      : $WINDOWS x ${WINDOW_SEC}s after ${DECAY_SEC}s of base-fee decay"
+  echo "chain        : $(basename "$F7_GENESIS"), deferred execution depth $(f7_genesis_depth)"
   # Only a fleet whose layers are shared says so; every other round's header is as it was.
   if ((F7_SHARED || F7_MAPPED)); then
     echo "layers       : $F7_ELS execution layers for $F7_NODES validators, map $(IFS=,; echo "${F7_EL_OF[*]}"), $(f7_el_cpus) CPUs a layer, import-once ${N42_IMPORT_ONCE:-off}"

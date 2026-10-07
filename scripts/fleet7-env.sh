@@ -604,6 +604,10 @@ f7_el_args() {
       # exceed the threshold. Memory: eight executed blocks held in memory.
       --engine.persistence-threshold "${F7_PERSIST_THRESHOLD:-8}"
       --engine.memory-block-buffer-target "${F7_BLOCK_BUFFER_TARGET:-6}"
+      # Reth 2.7 masks 30 states by default, incompatible with this small
+      # persistence window. Keep masking explicitly off unless a round
+      # selects a valid wider window; preserve the existing Reth env override.
+      --engine.num-state-masking-blocks "${F7_STATE_MASKING_BLOCKS:-${RETH_ENGINE_NUM_STATE_MASKING_BLOCKS:-0}}"
       # reth stops draining engine messages while a persistence cycle runs and more than this
       # many blocks beyond the buffer target await it (default 16). A cycle here writes ~150k
       # hashed accounts a block to MDBX and takes seconds; the leader's own-block newPayload and

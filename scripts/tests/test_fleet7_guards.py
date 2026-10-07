@@ -22,6 +22,18 @@ class FleetGuards(unittest.TestCase):
                 self.assertIn('F7_REQUIRE_TX_VERIFY=1 needs', result.stdout + result.stderr)
                 self.assertFalse((Path(tmp) / 'node0').exists())
 
+    def test_small_persistence_window_does_not_inherit_thirty_masked_states(self):
+        for override in ['', '3']:
+            env = dict(os.environ, F7_PROFILE='bench', F7_STATE_MASKING_BLOCKS='',
+                       RETH_ENGINE_NUM_STATE_MASKING_BLOCKS=override)
+            result = subprocess.run(['bash', '-c', 'source "$1/scripts/fleet7-env.sh"; '
+                                     'f7_el_args 0; printf "%s\\n" "${F7_EL_ARGS[@]}"',
+                                     'guard', str(REPO)], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = result.stdout.splitlines()
+            slot = args.index('--engine.num-state-masking-blocks')
+            self.assertEqual(args[slot + 1], override or '0')
+
     def test_each_binary_and_shared_source_is_checked(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'src' / 'checkout'

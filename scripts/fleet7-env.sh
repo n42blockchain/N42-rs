@@ -25,33 +25,32 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${F7_GENESIS:=$REPO/crates/chainspec/res/genesis/n42_fleet7.json}"
 : "${F7_BIN:=$REPO/target/release}"
 
-# Refuse to launch a validator binary older than the code it was built from.
-#
-# A round takes minutes and reports a number whatever it measured, so a stale
-# binary is not an error that announces itself -- it is a result, filed against
-# the wrong change. This session came within one command of measuring a reverted
-# edit because the binary was built at 07:45 and the source reverted at 07:54.
-# F7_SKIP_STALE_CHECK=1 for the rare case where that is deliberate.
+# Refuse to measure stale node, validator or workload binaries. Shared Rust
+# source and manifests matter as much as the validator example itself.
+# F7_SKIP_STALE_CHECK=1 is only for a deliberately recorded historical build.
 f7_check_binary_fresh() {
-  local bin=$F7_BIN/examples/h2_validator newest
+  local bin newest example
   [[ ${F7_SKIP_STALE_CHECK:-0} == 1 ]] && return 0
-  [[ -x $bin ]] || return 0
-  # `src` and `examples` only. Test and bench sources do not go into this
-  # binary, and counting them made the guard refuse a round because a *test*
-  # had been edited after the build -- which cost eighty minutes of a
-  # measurement that then reported "no completed runs".
-  # Exactly the sources that go into *this* binary: the crate's `src` trees
-  # and its own example file. Earlier versions counted the whole `tests` and
-  # `examples` directories, so editing a test -- or a different example --
-  # refused a round that would have been perfectly valid. Both cost a
-  # measurement.
-  newest=$(find "$REPO/crates/n42/h2-node/src" "$REPO/crates/n42/h2-net/src" "$REPO/crates/n42/h2-consensus/src" "$REPO/crates/n42/h2-execution/src" "$REPO/crates/n42/h2-el-rpc/src" "$REPO/crates/n42/h2-node/examples/h2_validator.rs" -name '*.rs' -newer "$bin" -print -quit 2>/dev/null)
-  [[ -z $newest ]] && return 0
-  echo "REFUSING: $bin is older than $newest" >&2
-  echo "  A round would measure the previous build and report it as this one." >&2
-  echo "  cargo build --release -p n42-h2-node --example h2_validator" >&2
-  echo "  (F7_SKIP_STALE_CHECK=1 to run anyway)" >&2
-  return 1
+  for bin in "$F7_BIN/n42" "$F7_BIN/examples/h2_validator" "$F7_BIN/examples/tx_flood"; do
+    [[ -x $bin ]] || { echo "REFUSING: missing executable $bin" >&2; return 1; }
+    # Include shared transaction, execution and state dependencies, not just
+    # validator sources. Tests and unrelated examples do not enter these bins.
+    newest=$(find "$REPO/crates" "$REPO/bin" \
+      \( -path '*/src/*.rs' -o -name Cargo.toml \) -newer "$bin" -print -quit)
+    if [[ -z $newest && "$REPO/Cargo.lock" -nt $bin ]]; then newest=$REPO/Cargo.lock; fi
+    if [[ -z $newest && "$REPO/Cargo.toml" -nt $bin ]]; then newest=$REPO/Cargo.toml; fi
+    case $bin in
+      */examples/h2_validator) example=$REPO/crates/n42/h2-node/examples/h2_validator.rs ;;
+      */examples/tx_flood) example=$REPO/crates/n42/h2-node/examples/tx_flood.rs ;;
+      *) example= ;;
+    esac
+    if [[ -z $newest && -n $example && $example -nt $bin ]]; then newest=$example; fi
+    [[ -z $newest ]] && continue
+    echo "REFUSING: $bin is older than $newest" >&2
+    echo "  cargo build --release -p n42 --bin n42 -p n42-h2-node --example h2_validator --example tx_flood" >&2
+    echo "  (F7_SKIP_STALE_CHECK=1 only for a deliberately recorded old build)" >&2
+    return 1
+  done
 }
 # How many members the fleet has. Seven is this file's own default and the
 # shape the whole campaign was measured on; `scripts/fleet4-env.sh` sets four

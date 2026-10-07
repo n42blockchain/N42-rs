@@ -255,6 +255,16 @@ exec > >(tee -a "$OUT/round.txt") 2>&1
 
 f7_check_binary_fresh || exit 1
 
+# An audited signature-verification round must never silently become a
+# generator-trust or gateway-trust probe. Check before starting any node.
+if [[ ${F7_REQUIRE_TX_VERIFY:-0} == 1 ]]; then
+  if [[ ${N42_INGEST_VERIFY:-all} != all || -n ${N42_FRAME_GATEWAYS:-} ]]; then
+    echo "REFUSING: F7_REQUIRE_TX_VERIFY=1 needs N42_INGEST_VERIFY=all and no N42_FRAME_GATEWAYS" >&2
+    exit 1
+  fi
+  echo "signature verification: every transaction at ingest; gateway bypass disabled"
+fi
+
 # F7_LEADER_TENURE=<views>: every validator leads that many consecutive views
 # (`hotstuff.leaderTenure`), so a leader builds block h+1 while the fleet is
 # still importing h and one of a block's two executions leaves the critical

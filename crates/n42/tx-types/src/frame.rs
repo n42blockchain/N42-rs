@@ -67,7 +67,7 @@ pub fn frame_tree_root(frame_roots: &[B256]) -> B256 {
 /// body exactly or names an empty frame, i.e. the body is not frame-aligned
 /// by that layout.
 pub fn frame_tree_root_of(tx_hashes: &[B256], layout: &[usize]) -> Option<B256> {
-    if layout.iter().any(|len| *len == 0) || layout.iter().sum::<usize>() != tx_hashes.len() {
+    if layout.iter().any(|len| *len == 0) || layout.iter().try_fold(0usize, |total, len| total.checked_add(*len)) != Some(tx_hashes.len()) {
         return None;
     }
     let mut at = 0usize;
@@ -332,6 +332,9 @@ mod tests {
         assert_eq!(frame_tree_root_of(&hashes, &[3, 3, 1]), Some(expected));
         assert_eq!(frame_tree_root_of(&hashes, &[3, 3]), None);
         assert_eq!(frame_tree_root_of(&hashes, &[3, 0, 3, 1]), None);
+        // Both overflow and a wrapped sum matching the body must fail closed.
+        assert_eq!(frame_tree_root_of(&hashes, &[usize::MAX, 1]), None);
+        assert_eq!(frame_tree_root_of(&hashes, &[usize::MAX, 8]), None);
     }
 
     fn gateway(seed: u8) -> ed25519_dalek::SigningKey {

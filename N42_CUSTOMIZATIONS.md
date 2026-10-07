@@ -367,6 +367,41 @@
   `root_ops_encode_us`、`root_ops_concat_us`、`root_ops_sort_us`、`root_compute_us`；apply 的 `root_undo_us`、
   `root_apply_gap_us`。"output shards folded" 行新增 `pending_max`、`pending_us_max`、`drops_max`（freeze 最慢任务
   的补录批数、补录耗时、冲突出现次数）。`crates/n42/engine-types/src/lib.rs` 的 `recursion_limit` 升到 512。
+
+## E=1 seal 路径缩短：计数器 seal、随计划预备的块体、并行度均衡（不改任何 fork 的 reth crate）:
+`docs/SHARED_EXECUTION_SCOPE.md` 第 16 节的计划第 1-4 项与 16.2 的判定测试，实现记录见第 17 节。全部开关默认关；
+关闭时每条路径与之前相同。
+- `N42_SEAL_ON_COUNTERS=1`（`N42_SEAL_ON_COUNTS=1` 同义；需 `N42_SEAL_AT_EXEC=1` 与 prep 中的块体；代码在
+  `payload.rs` `seal_on_counters`、`parallel_transfer.rs` `RunCounters` / `execute_for_build_counted`）：每个 batch
+  执行时累计自己的交易数、gas 与费用（候选的 tip 在 batch 线程上、转换旁读取，与 prep 同一公式）；全部候选按
+  拉取顺序执行完的块直接用这些和与 prep（或计划）中做好的块体 seal，seal 路径上不再有遍历 20 万个 slot 的
+  build-pool 任务（16.2 中它总是在 freeze 最慢任务之后才结束）。slot 引用只由 seal 之后的 receipts 任务构建；
+  其他块照旧。测试 `seal_on_counters_equals_the_refs_pass`。阶段行新增 `seal_on_counters`、`exec_end_to_seal_us`。
+- `N42_FREEZE_POOL=own`（`N42_FREEZE_POOL_THREADS`，默认 16；代码在 `parallel_transfer.rs` `behind_pool`、
+  `output_shards.rs` `OutputShards::freeze_on`）：输出分片的 freeze（其任务与释放）、slot 的 receipts 与 slot 释放
+  改在自己的线程池（`n42-behind-*`）上跑，不与 build pool 共享：16.2 嵌套窃取推断的判定测试。冻结结果与 build
+  pool 上相同（`tests/output_shards.rs` `a_freeze_on_its_own_pool_equals_the_inline_freeze`）。阶段行新增
+  `freeze_pool_own`。
+- `N42_PLAN_AHEAD_BODY=1`（需 `N42_PLAN_AHEAD=1`、`N42_PULL_BY_FRAMES=1`、`N42_SEAL_ON_COUNTERS=1`；
+  `N42_PLAN_AHEAD_BODY_THREADS`，默认 8；代码在 `tx-queue` `set_plan_ahead_hook` / `PreparedBody` /
+  `QueueBest::take_prepared_body` / `forget_whole_take`，`frame_blocks.rs` `PreparedBuild` / `note_whole_take`，
+  `payload.rs` `make_prepared_build`，`bin/n42/src/payload_serve.rs` 的 hand-off）：队列预备下一块计划时，在自己的
+  线程池上同时做好候选（从帧中克隆）、转账键、块体交易/发送者/哈希、按本节点 beneficiary 的发送者分组与空 slot
+  数组，随 `Prepared` 计划保存（计划被任何原因丢弃时一起丢弃）；整块使用该计划的构建直接取用，不再克隆、prep、
+  分组、分配。以计数器 seal 且来自该批量向量的块被记为"整个 take"，父块的 hand-off 以 O(1)（长度 + 三个点）
+  遗忘它，取代 20 万位置的比较。测试：`ahead_tests.rs` `a_prepared_body_is_the_take_of_the_build_on_its_plan`、
+  `the_whole_take_hand_off_is_the_compared_one`（各丢弃原因的测试同时断言块体随计划丢弃），
+  `payload.rs` `body_made_with_the_plan_equals_body_made_at_start`。阶段行新增 `plan_body`、`plan_body_us`、
+  `prep_from_plan`、`exec_prepared_groups`、`exec_prepared_slots`、`exec_partition_us`、`exec_slots_us`、
+  `whole_take_noted`。
+- `N42_BUILD_BATCHES=<n>`（默认 0 = 原调度；代码在 `parallel_transfer.rs` `build_batches` / `Dispatch` /
+  `largest_first`）：交易按整个发送者组、候选顺序装成 n 个大小相近的 batch，以 FIFO 从大到小投入 build pool
+  （建议 96-128，32 个 worker）。测试 `the_largest_first_packing_keeps_every_sender_run_whole_and_in_order`，
+  以及 96/128 个 batch 经输出分片与默认调度相等。阶段行新增 `build_batches`。
+- 恒开（纯调度，结果相同）：`built_executions` 的 `put` 把被逐出/替换的条目移出 store 的锁，在
+  `n42-built-free` 线程上释放（`seal_remember_ms` 3 ms；测试
+  `an_evicted_entry_is_dropped_off_the_lock_and_the_store_is_the_same`）；prep 的 `BodyAhead` 与计划块体带上
+  交易哈希，seal 的帧布局直接使用而不再收集 20 万个哈希（`tx_root_ms` 2 ms；阶段行 `seal_hashes_ahead`）。
 ## HotStuff-2 结算标签（不改任何 fork 的 reth crate）:
 - `N42_SETTLEMENT_TAGS=split|legacy`（默认 `split`；代码在 `crates/n42/h2-execution/src/settlement.rs`，
   由 `ExecutionDriver` 的每个 forkchoice 使用）：`latest` = 共识已提交的块；`safe` = 执行已认证的块

@@ -1395,3 +1395,88 @@ has room.
 
 Ad-hoc parsers over `node0-el.log` (not kept); sources: `/data/blockchain/rust-fleet7-bench/bench-loop343{D,F2,F2T48,F2P55}/node0-el.log`,
 `/data/n42-build/target-n42-rs/fleet-runs/threadcpu-loop343{D,F2,F2P55,FZ}.tsv`.
+
+## 17. The seal's path shortened: section 16's items 1-4 and the freeze-pool test, built (2026-10-07, code only, no fleet leg)
+
+Section 16.4's items 1-4 and 16.2's decisive test, each behind its own switch (default off) except the two pure
+changes of item 3. With every switch off each path is the one before (the equality tests pin it). Block contents,
+roots, bundles and everything validators exchange are unchanged with every switch on: the switches change only when
+and where the same values are made. Savings below are estimates from section 16's timeline, not measurements.
+
+### 17.1 What was built
+
+| item | switch | what it does | phase it removes (16.1 F2) | expected |
+| --- | --- | --- | --- | --- |
+| 1 | `N42_SEAL_ON_COUNTERS=1` (`N42_SEAL_ON_COUNTS=1` too) | every batch counts its executed transfers, their gas and their fees (`RunCounters`; the tip read on the batch's thread beside the conversion, the prep's formula); a block that seals at the execution's end with every candidate executed in pull order seals on those sums and the body made in the prep or with the plan | commit 16 (refs 15) -> ~0-1 | `sealed_at` 61 -> ~46-47 |
+| test | `N42_FREEZE_POOL=own`, `N42_FREEZE_POOL_THREADS` (16) | the shards' freeze (its tasks and frees), the receipts from the slots and the slots' free run on `behind_pool` (`n42-behind-*`) instead of the build pool | - | if 16.2 holds, `commit_refs_ms` 15 -> 1-2 on F2 *without* item 1, `index_ms` stays ~14 |
+| 2 | `N42_PLAN_AHEAD_BODY=1` (needs `N42_PLAN_AHEAD`, `N42_PULL_BY_FRAMES`, `N42_SEAL_ON_COUNTERS`); `N42_PLAN_AHEAD_BODY_THREADS` (8) | the queue's plan-ahead hook makes, with the next plan and on its own pool, the candidates cloned out of the frames, the transfer keys, the body's transactions, senders and hashes, the partition at this node's beneficiary and the empty slot array (`PreparedBuild`); a build on that plan, used whole, takes them; a block sealed on its counters from that vector is noted as its whole take and the parent's hand-off forgets it in O(1) | start 4 -> ~1, prep 4 -> ~0, gap 3 -> ~1 | -7 to -8 ms |
+| 3 | always (pure) | the store's evicted entry leaves `put` and is freed on `n42-built-free` after the lock; the body's hashes come with the body (`BodyAhead.hashes`, `PreparedBuild.hashes`) into the seal's frame layout | remember 3 -> ~0, `tx_root` 2 -> ~0.5 | -4 to -5 ms |
+| 4 | `N42_BUILD_BATCHES=<n>` | `n` batches of about equal size (whole sender groups, candidate order), spawned FIFO largest first | exec 23 -> ~18-19 | -4 to -5 ms |
+
+All four (estimate): start 1 + prep 0 + gap 1 + exec 18.5 + commit 1 + seal ~2 = **~24-28 ms median** against 61, with
+the root chain (`seal_to_fields` 45-46 + ~5) then binding the cycle as 16.5 says.
+
+### 17.2 Where the refs pass went, and who needs it
+
+The pass (`slot_refs_and_gas`: the filled slots by reference and the block's gas) fed, on the seal path: the count and
+gas (the seal decision and `tx_count` / `cumulative_gas_used`), the fees (`fees_from_tips(refs, tips)`), and, without
+a prep body, the body (`body_and_fees`). With item 1 the count and gas are the batches' sums, the fees their
+`tip x gas_used` sums (exactly `fees_from_tips`' sum on a block with nothing skipped: U256 addition is exact and
+order-free), the body the prep's or the plan's. The only remaining reader of the references is the receipts job
+behind the seal (cumulative gas and receipts), which already built its own (`receipts_job`); so on a counted block the
+pass does not run before the seal at all. A block that does not qualify (something skipped, a cut candidate vector,
+no prep body, a non-early seal) makes the references right after the decision, as before (`commit_refs_ms` then
+names it). Fields: `seal_on_counters`, `exec_end_to_seal_us` (the batches' end to the seal's start).
+
+### 17.3 Item 2: what moved into the plan-ahead, and what could not
+
+| piece | where it is now | why |
+| --- | --- | --- |
+| the hand-off's 200,000-position compare (`start_handoff_ms` 3) | O(1) `forget_whole_take`: length and three (position, sender, nonce) points, on the builder's note that the block is its whole take | a counted seal from the uncut bulk vector is, by construction, the take in take order (the compare proved what the builder knew); any mismatch falls back to `forget_mined_parallel` |
+| candidates (200k `Arc` clones out of the frames) | the hook (plan's segments, cloned as frame `Arc`s under the lock, read after it) | a function of the plan |
+| transfer keys, transactions, senders, hashes | the hook (`make_keyed_on` on the plan-body pool) | a function of the plan |
+| tips | the batches (item 1's `tip_of`) | they need the child's base fee, which the plan-ahead cannot know; read beside the conversion they cost nothing extra |
+| partition by sender | the hook, at the beneficiary the last build used; used only when the build's beneficiary is that one and the sizes match | needs the beneficiary, which is the leader's and stable |
+| `batch_groups` | the call (~0.1 ms on 400 groups) | depends on the pool's worker count and the dispatch |
+| the slot array (~94 MB) | the hook, allocated and touched on the plan-body pool | a function of the plan's length |
+| the lanes lock, the drain, the verdict (~0.3-1 ms) | the build's start | must follow the parent's seal: the verdict (`prepared_verdict`) is what proves the plan is still valid on the new parent |
+| the state open (`state_wait_us` 0.2-0.6 ms, p90 4) | the gap | waits for the parent's `StateReady` shards: real |
+
+A topped-up plan (`plan_ahead=2`) hands no body (its take is not the plan the body was made from); a plan whose
+hook had not finished hands none (`plan_body=2`); every discard of the plan drops its body with it. RSS: one
+prepared body is ~120 MB (slots 94 MB, transactions ~22 MB). The hook's CPU (~130 CPU-ms at 200k) runs on 8 idle
+threads while the parent executes: ~16 ms of a 55 ms plan age; watch `plan_body_us` and `plan_body=2` at shorter
+cycles.
+
+### 17.4 Tests and gate
+
+`seal_on_counters_equals_the_refs_pass` (five shapes, whole and with senders a nonce ahead or running out of balance,
+both dispatches: count, gas, fees equal the slots' pass; body, senders, hashes and fees from `BodyAhead` equal
+`body_and_fees`); `a_freeze_on_its_own_pool_equals_the_inline_freeze` (1/16/64 shards, every index mode and deferral,
+the build pool busy: accounts, beneficiary, merged bundle, QMDB operations, hashed post-state); tx-queue
+`a_prepared_body_is_the_take_of_the_build_on_its_plan` (four gas limits, six blocks, chain equal to the fresh one),
+`the_whole_take_hand_off_is_the_compared_one`, and the discard tests (refused, handover, untake, arrival below, gas,
+prune) now assert the body goes with its plan; `body_made_with_the_plan_equals_body_made_at_start` (three shapes: keys,
+transactions, senders, hashes, partition, empty slots; executed on the prepared partition and slots equal to fresh:
+transfers, gas, success, skips, counters, the batches' accounts; wrong sizes fall back);
+`an_evicted_entry_is_dropped_off_the_lock_and_the_store_is_the_same` (400 puts); 96 and 128 largest-first batches
+through the output shards equal the default dispatch (receipts root, skips, beneficiary, merged accounts, reverts, QMDB
+operations), and `the_largest_first_packing_keeps_every_sender_run_whole_and_in_order`. Not covered by a unit test:
+the block hash of a whole built block (the payload builder has no harness); the fleet's `fields_mismatches`,
+`invalid_blocks` and `fleet7-verify` are that check.
+
+### 17.5 Legs to run
+
+Base F2 (`N42_FREEZE_AFTER_SEAL=1 N42_ROOT_OPS_AHEAD=1` on loop343's D). In order:
+1. F2 + `N42_FREEZE_POOL=own` (16 threads): read `commit_refs_ms` (15 -> 1-2 says 16.2 holds), `index_ms`,
+   `freeze_pool_own=true`.
+2. F2 + `N42_SEAL_ON_COUNTERS=1`: `seal_on_counters=true` on full blocks, `commit_refs_ms` ~0, `exec_end_to_seal_us`,
+   `sealed_at`; watch `seal_to_view_us` / `seal_to_fields_us` (the behind-seal jobs now meet the freeze).
+3. 2 + `N42_PLAN_AHEAD=1 N42_PULL_BY_FRAMES=1 N42_PLAN_AHEAD_BODY=1`: `plan_body=1`, `prep_from_plan`,
+   `exec_prepared_groups`, `exec_prepared_slots`, `whole_take_noted`, `par_start_ms`, `start_handoff_ms` ~0,
+   `par_prep_ms` ~0, `gap_before_exec_ms`, the hand-off's `queue_partition_us`; `plan_discard` empty.
+4. 3 + `N42_BUILD_BATCHES=96` (and 128): `par_batches`, `batch_last_end_us`, `par_exec_ms`, `batch_open_sum_us`,
+   `shard_append_ms`, `batch_minflt`.
+Item 3 is on in every leg (`seal_remember_ms` ~0, `seal_hashes_ahead=true`, `tx_root_ms`). Correctness on every leg:
+`fields_mismatches` 0 (one leg with `N42_FIELDS_AT_SEAL=verify`), `invalid_blocks` 0, `fleet7-verify` clean, block
+hashes against F2 on the same replay (`F7_FLOOD_REPLAY`).

@@ -103,7 +103,7 @@ def derive(suffix):
     # gate: the h2 / qmdb crates and the testing suite
     k = '"-p n42-engine-types --lib -- --test-threads=1" "-p n42 --lib -- --test-threads=1"'
     assert k in run
-    run = run.replace(k, '"-p n42-h2-consensus" "-p n42-h2-execution" "-p n42-h2-node" "-p n42-h2-el-rpc" "-p n42-qmdb-reth" "-p n42-testing" ' + k)
+    run = run.replace(k, '"-p n42-h2-consensus" "-p n42-h2-execution" "-p n42-h2-node" "-p n42-h2-el-rpc" "-p n42-qmdb-reth -- --test-threads=1" "-p n42-testing" ' + k)
     open(D + f'run-loop346{suffix}.sh', 'w').write(run)
     la = open(D + 'launch-loop345b.sh').read().replace('run-loop345b.sh', 'run-loop346' + suffix + '.sh').replace('loop345b', 'loop346' + suffix)
     open(D + f'launch-loop346{suffix}.sh', 'w').write(la)

@@ -1,0 +1,41 @@
+[package]
+name = "revmc-builtins"
+description = "EVM bytecode compiler builtins"
+homepage = "https://github.com/danipopes/revmc/tree/main/crates/revmc-builtins"
+
+version = "0.1.0"
+authors = ["DaniPopes <57450786+DaniPopes@users.noreply.github.com>"]
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+categories = ["compilers", "cryptography::cryptocurrencies"]
+keywords = ["compile", "compiler", "jit", "evm", "ethereum"]
+repository = "https://github.com/paradigmxyz/revmc"
+exclude = [".github/", "benches/", "fuzz/", "tests/"]
+
+
+
+[dependencies]
+revmc-context = { "version" = "0.1.0", "default-features" = false, "git" = "https://github.com/paradigmxyz/revmc", "branch" = "main" }
+
+revm-primitives = { "version" = "43.0.0", "default-features" = false }
+revm-interpreter = { "version" = "43.0.0", "default-features" = false }
+revm-bytecode = { "version" = "43.0.0", "default-features" = false, "features" = ["parse"] }
+revm-context-interface = { "version" = "43.0.2", "default-features" = false }
+paste = { "package" = "pastey", "version" = "0.2.3" }
+
+revmc-backend = { "version" = "0.1.0", "default-features" = false, "git" = "https://github.com/paradigmxyz/revmc", "branch" = "main", "optional" = true }
+tracing = { "version" = "0.1", "optional" = true }
+
+[features]
+default = ["std", "ir"]
+std = ["revmc-context/std", "revm-primitives/std", "revm-interpreter/std"]
+ir = ["std", "dep:tracing", "dep:revmc-backend"]
+
+# Enables opaque account payloads in revm; disabled by default.
+account-ext = [
+    "revmc-context/account-ext",
+    "revm-context-interface/account-ext",
+]
+
+[workspace]

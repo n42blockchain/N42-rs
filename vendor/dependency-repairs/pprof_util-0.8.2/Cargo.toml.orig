@@ -1,0 +1,24 @@
+[package]
+name = "pprof_util"
+version = "0.8.2"
+edition = "2021"
+description = "various utilities for representing and manipulating profiling data"
+publish = true
+license = "Apache-2.0"
+repository = "https://github.com/polarsignals/rust-jemalloc-pprof"
+homepage = "https://crates.io/crates/pprof_util"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+flate2.workspace = true
+prost.workspace = true
+anyhow.workspace = true
+num.workspace = true
+paste.workspace = true
+backtrace = { workspace = true, optional = true }
+inferno = { workspace = true, optional = true }
+
+[features]
+flamegraph = ["symbolize", "dep:inferno"]
+symbolize = ["dep:backtrace"]

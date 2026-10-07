@@ -1503,6 +1503,9 @@ pub struct BodyAhead<Tx> {
     pub senders: Vec<Address>,
     /// Their tips per gas at the block's base fee.
     pub tips: Vec<u128>,
+    /// Their hashes (the pooled transactions' own), for the seal's frame
+    /// layout: the seal's 200,000-hash collect was `tx_root_ms` 2.
+    pub hashes: Vec<alloy_primitives::B256>,
     /// The job's own time, microseconds.
     pub took_us: u64,
 }
@@ -1510,12 +1513,12 @@ pub struct BodyAhead<Tx> {
 impl<Tx: Send> BodyAhead<Tx> {
     /// The prep's pass on the build pool, over `cands`: `each` gives a
     /// candidate's transfer key (`None`: not a plain transfer) and its body
-    /// parts. The keys and the body when every candidate is a transfer,
-    /// `None` otherwise.
+    /// parts (transaction, sender, tip, hash). The keys and the body when
+    /// every candidate is a transfer, `None` otherwise.
     #[allow(clippy::type_complexity)]
     pub fn make_keyed<C: Sync>(
         cands: &[C],
-        each: impl Fn(usize, &C) -> (Option<(Address, Address)>, Tx, Address, u128) + Sync,
+        each: impl Fn(usize, &C) -> (Option<(Address, Address)>, Tx, Address, u128, alloy_primitives::B256) + Sync,
     ) -> Option<(Vec<(Address, Address)>, Self)> {
         Self::make_keyed_on(build_pool(), cands, each)
     }
@@ -1525,7 +1528,7 @@ impl<Tx: Send> BodyAhead<Tx> {
     pub fn make_keyed_on<C: Sync>(
         pool: &rayon::ThreadPool,
         cands: &[C],
-        each: impl Fn(usize, &C) -> (Option<(Address, Address)>, Tx, Address, u128) + Sync,
+        each: impl Fn(usize, &C) -> (Option<(Address, Address)>, Tx, Address, u128, alloy_primitives::B256) + Sync,
     ) -> Option<(Vec<(Address, Address)>, Self)> {
         use rayon::prelude::*;
         let at = std::time::Instant::now();
@@ -1533,26 +1536,29 @@ impl<Tx: Send> BodyAhead<Tx> {
         // an `Option` key: the keys collect straight into their vector, with
         // no serial pass over 163,000 options afterwards (step 7a).
         let refused = std::sync::atomic::AtomicBool::new(false);
-        let (keys, (transactions, (senders, tips))): (Vec<(Address, Address)>, (Vec<Tx>, (Vec<Address>, Vec<u128>))) =
-            pool.install(|| {
-                cands
-                    .par_iter()
-                    .with_min_len(1024)
-                    .enumerate()
-                    .map(|(i, cand)| {
-                        let (key, tx, sender, tip) = each(i, cand);
-                        let key = key.unwrap_or_else(|| {
-                            refused.store(true, std::sync::atomic::Ordering::Relaxed);
-                            (Address::ZERO, Address::ZERO)
-                        });
-                        (key, (tx, (sender, tip)))
-                    })
-                    .unzip()
-            });
+        #[allow(clippy::type_complexity)]
+        let (keys, (transactions, (senders, (tips, hashes)))): (
+            Vec<(Address, Address)>,
+            (Vec<Tx>, (Vec<Address>, (Vec<u128>, Vec<alloy_primitives::B256>))),
+        ) = pool.install(|| {
+            cands
+                .par_iter()
+                .with_min_len(1024)
+                .enumerate()
+                .map(|(i, cand)| {
+                    let (key, tx, sender, tip, hash) = each(i, cand);
+                    let key = key.unwrap_or_else(|| {
+                        refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                        (Address::ZERO, Address::ZERO)
+                    });
+                    (key, (tx, (sender, (tip, hash))))
+                })
+                .unzip()
+        });
         if refused.into_inner() {
             return None;
         }
-        Some((keys, Self { transactions, senders, tips, took_us: at.elapsed().as_micros() as u64 }))
+        Some((keys, Self { transactions, senders, tips, hashes, took_us: at.elapsed().as_micros() as u64 }))
     }
 }
 
@@ -6129,10 +6135,11 @@ mod tests {
                 }
                 assert_eq!(run.counters.fees, fees_from_tips(&refs, &tips), "fees as the commit reads them");
                 // The body: made in the prep against made from the slots.
-                let (_, made) = BodyAhead::make_keyed(&hashes, |i, hash| (Some(keys[i]), *hash, keys[i].0, tips[i])).expect("every candidate a transfer");
+                let (_, made) = BodyAhead::make_keyed(&hashes, |i, hash| (Some(keys[i]), *hash, keys[i].0, tips[i], *hash)).expect("every candidate a transfer");
                 let (transactions, senders_of, fees) = body_and_fees(&refs, |built| (hashes[built.index], keys[built.index].0, tips[built.index]));
                 assert_eq!(made.transactions, transactions, "the body's transactions");
                 assert_eq!(made.senders, senders_of, "the body's senders");
+                assert_eq!(made.hashes, hashes, "the body's hashes, as the seal collects them");
                 assert_eq!(run.counters.fees, Some(fees), "the body's fees");
                 // Without tips the counters still count, and say no fees.
                 let plain = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, one_wave, None, None)
@@ -7689,7 +7696,7 @@ mod tests {
                 let flat_us = at.elapsed().as_micros();
                 assert!(!refused.into_inner() && keys_only.as_ref() == Some(&flat), "the flat keys");
                 println!("prep keys: into Option<Vec> {keys_us} us, flat {flat_us} us");
-                let made = BodyAhead::make_keyed(&cands, |i, c| (key_of(c), body_tx(i), c.sender(), tip(i)));
+                let made = BodyAhead::make_keyed(&cands, |i, c| (key_of(c), body_tx(i), c.sender(), tip(i), *c.hash()));
                 (keys_only.map(|k| k.len()), keys_us, made)
             });
             let run = std::thread::scope(|scope| {

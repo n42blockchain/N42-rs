@@ -755,12 +755,12 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
     // The prep's own pass, with no tip: the batches read the tips at the
     // block's base fee (`N42_SEAL_ON_COUNTERS`), which this cannot know.
     let (keys, made) = crate::parallel_transfer::BodyAhead::make_keyed_on(pool, &cands, |_, tx| {
-        (transfer_key(tx), pooled_consensus(tx).clone(), tx.sender(), 0)
+        (transfer_key(tx), pooled_consensus(tx).clone(), tx.sender(), 0, *tx.hash())
     })?;
     if keys.is_empty() {
         return None;
     }
-    let hashes: Vec<B256> = pool.install(|| cands.par_iter().with_min_len(4096).map(|tx| *tx.hash()).collect());
+    let hashes = made.hashes;
     let groups = crate::frame_blocks::noted_beneficiary().and_then(|beneficiary| {
         crate::parallel_transfer::partition_by_sender(&keys, beneficiary).ok().map(|groups| (beneficiary, groups))
     });
@@ -1600,6 +1600,13 @@ where
     // used to make them by moving 163,000 recovered transactions through one
     // serial `unzip` (most of a 24 ms `tx_root_ms`).
     let mut direct_body: Option<(Vec<TransactionSigned>, Vec<alloy_primitives::Address>)> = None;
+    // The body's transaction hashes, made with it in the prep (or with the
+    // plan): the seal's frame layout reads them instead of collecting
+    // 200,000 hashes on its path. Set only beside `direct_body` from the same
+    // source, so they are its hashes in its order.
+    let mut direct_hashes: Option<Vec<B256>> = None;
+    // Whether the seal took them.
+    let mut seal_hashes_ahead = false;
     let deferred_now = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), attributes.timestamp);
     // What the seal-first path needs of the chain and the block, short of
     // the block being full (known after the parallel step).
@@ -1729,7 +1736,13 @@ where
                 // run of frames (by the build's plan or this node's frame
                 // index), the MPT root for any other body.
                 use alloy_consensus::transaction::TxHashRef as _;
-                let hashes: Vec<B256> = transactions.iter().map(|tx| *tx.tx_hash()).collect();
+                let hashes: Vec<B256> = match direct_hashes.take().filter(|hashes| hashes.len() == transactions.len()) {
+                    Some(hashes) => {
+                        seal_hashes_ahead = true;
+                        hashes
+                    }
+                    None => transactions.iter().map(|tx| *tx.tx_hash()).collect(),
+                };
                 let sealed = crate::frame_blocks::seal_root_timed(frame_plan.as_ref(), &hashes, || {
                     early_root.unwrap_or_else(|| crate::assembler::parallel_transaction_root(&transactions))
                 });
@@ -1918,6 +1931,7 @@ where
                             consensus.clone(),
                             tx.sender(),
                             consensus.effective_tip_per_gas(base_fee).unwrap_or_default(),
+                            *tx.hash(),
                         )
                     });
                     return match made {
@@ -2240,9 +2254,16 @@ where
                         if prep_from_plan
                             && let Some(made) = prepared_build.as_mut().filter(|made| made.transactions.len() == cands.len())
                         {
-                            Some(((std::mem::take(&mut made.transactions), std::mem::take(&mut made.senders)), fees))
+                            Some((
+                                (
+                                    std::mem::take(&mut made.transactions),
+                                    std::mem::take(&mut made.senders),
+                                    std::mem::take(&mut made.hashes),
+                                ),
+                                fees,
+                            ))
                         } else if body_ahead.as_ref().is_some_and(|made| made.transactions.len() == cands.len()) {
-                            body_ahead.take().map(|made| ((made.transactions, made.senders), fees))
+                            body_ahead.take().map(|made| ((made.transactions, made.senders, made.hashes), fees))
                         } else {
                             None
                         }
@@ -2259,12 +2280,13 @@ where
                         commit_refs_ms += at.elapsed().as_millis() as u64;
                     }
                     seal_on_counters_used = counted_body.is_some();
-                    if let Some(((transactions, senders), fees)) = counted_body {
+                    if let Some(((transactions, senders, hashes), fees)) = counted_body {
                         total_fees += fees;
                         commit_body_ahead_used = true;
                         cumulative_gas_used += executed_gas;
                         tx_count += executed_count as u64;
                         direct_body = Some((transactions, senders));
+                        direct_hashes = Some(hashes);
                         // The references, the cumulative gas and the receipts
                         // are made behind the seal by the receipts job, which
                         // reads the slots itself.
@@ -2300,6 +2322,7 @@ where
                         let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) = if let Some((made, fees)) = made {
                             total_fees += fees;
                             commit_body_ahead_used = true;
+                            direct_hashes = Some(made.hashes);
                             (made.transactions, made.senders)
                         } else if ahead {
                             let (transactions, senders, fees) = crate::parallel_transfer::body_and_fees(refs, |built| {
@@ -3757,6 +3780,8 @@ where
                     seal_hook_ms,
                     seal_layout_ms,
                     seal_root_ms,
+                    // The seal's hash vector came with the body (no collect).
+                    seal_hashes_ahead,
                     seal_frames_indexed,
                     seal_frames_hashed,
                     gap_before_exec_ms,
@@ -4974,7 +4999,7 @@ mod plan_body_tests {
             // The prep, as the build runs it.
             let (keys, fresh) = BodyAhead::make_keyed(&cands, |_, tx| {
                 let consensus = pooled_consensus(tx);
-                (transfer_key(tx), consensus.clone(), tx.sender(), consensus.effective_tip_per_gas(base_fee).unwrap_or_default())
+                (transfer_key(tx), consensus.clone(), tx.sender(), consensus.effective_tip_per_gas(base_fee).unwrap_or_default(), *tx.hash())
             })
             .expect("transfers");
             assert_eq!(made.keys, keys, "keys");
@@ -4982,6 +5007,7 @@ mod plan_body_tests {
             assert_eq!(made.senders, fresh.senders, "senders");
             let hashes: Vec<B256> = fresh.transactions.iter().map(|tx| *alloy_consensus::transaction::TxHashRef::tx_hash(tx)).collect();
             assert_eq!(made.hashes, hashes, "hashes");
+            assert_eq!(fresh.hashes, hashes, "the prep's hashes are the seal's collect");
             let (noted, groups) = made.groups.clone().expect("a beneficiary was noted");
             assert_eq!(noted, beneficiary);
             assert_eq!(groups, partition_by_sender(&keys, beneficiary).expect("a partition"), "partition");

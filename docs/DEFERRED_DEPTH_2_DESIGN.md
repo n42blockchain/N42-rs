@@ -542,6 +542,38 @@ header `receiptsRoot`, which is the genesis value at D=2).
 9. **Restart and sync** (4.5): one abstention or one lost view, bounded.
 10. **E=3 is not modelled** (3.5).
 
+## 5. Implementation plan
+
+For an implementing agent. Rules for every step: one commit, behind the genesis flag (a chain without
+`deferredExecutionDepth` runs byte-for-byte as before; the D=1 vectors file and every existing test stay green and
+unedited); Conventional Commits, English, no attribution; no fleet is needed to land a step, the gate is `cargo test`
+in the crates named; the fleet legs are run by whoever holds the box, after step 7. `crates/n42/engine-types/src/payload.rs`
+and `built_executions.rs` are also edited by the seal work (SES 17): do step 3 after that work is committed and rebase
+on it; the other steps do not touch those files.
+
+| step | what | files | size (estimate) | gate |
+| --- | --- | --- | --- | --- |
+| 0 | **Depth as a parameter, value always 1.** `ancestor_executed_fields(genesis, parent, depth)` and `ancestor_executed_fields_or_built` as the general forms; the old names call them with 1; `fields_from_child_header` renamed in docs. No behaviour change | `engine-types/src/hotstuff_consensus.rs`, `qmdb-reth/src/executed_fields.rs` | ~120 lines | `cargo test -p n42-engine-types --lib` (single-threaded, as BD 10.86 notes), `-p n42-testing` (the vectors test byte-equal), `-p n42-h2-execution` |
+| 1 | **The flag.** `deferred_execution_depth`, `deferred_execution_depth_at`, strict parse, validation (T1) called at node start (`bin/n42/src/main.rs`, `h2_validator.rs`); depth 2 is refused with "not implemented yet" until step 5; the depth printed at startup | `crates/chainspec/src/qmdb.rs` (additive, no signature changes), `bin/n42/src/main.rs`, `h2-node/examples/h2_validator.rs` | ~150 lines | T1; `cargo check --workspace` (a chainspec edit rebuilds the graph: additive only) |
+| 2 | **The consensus rule.** Depth in `validate_header_against_parent` and `parent_executed_fields` (genesis cases for N <= D, `registry[parent.parent_hash]` otherwise); error variants name the ancestor | `hotstuff_consensus.rs` | ~150 lines + tests | T2, T3 (including the both-depths refusal) |
+| 3 | **The builder.** The alias table (`executed_fields::note_built`, `get`/`wait_for` through it; written where the three `BuildOnOwnRequest`s are made); the grandparent in `seal_block!` and the ordinary finish; the root job's wait for the parent's fields before the early rename (item 8); the gas-limit clamp (item 19); log fields renamed or documented | `engine-types/src/payload.rs`, `direct_build.rs`, `fields_at_seal.rs`, `executed_fields.rs`, `bin/n42/src/payload_serve.rs` | ~250 lines (payload.rs edits are ~30; the rest is the alias and its tests) | T4, T5, T9, T11; the existing `fields_at_seal` and builder tests; `N42_FIELDS_AT_SEAL=verify` path still compiles |
+| 4 | **The follower.** `wait_for_parent_fields` takes the ancestor's hash (a function `ancestor_hash(parent_header, depth)`), five call sites, `validate_against_parent`; `parent_in` untouched; knobs for capacity read from env but defaults unchanged (step 8 changes the maxima) | `bin/n42/src/follower_import.rs`, `follower_import_tests.rs` | ~150 lines | T6; the existing `follower_import_tests` |
+| 5 | **The driver, settlement and the flip.** `Driver::set_deferred_depth`, `commit_forkchoice` passes the depth to `Settlement::advance` (item 17), docs of the `CHECKED` frame; the three callers of `set_deferred_execution_time`; **step 1's refusal of depth 2 is removed here**; first end-to-end test on the dev chain | `h2-execution/src/{driver,settlement,el}.rs`, `h2-node/examples/h2_validator.rs`, `n42-testing/src/dev.rs` | ~200 lines + the dev test | T7, T8, T12, T13; the new vectors file written by T12 (`N42_WRITE_VECTORS=1`) and checked in |
+| 6 | **The journal** (restart, 4.5): `ExecutedFields` by hash, appended on completion, read at start for the last 8, cross-checked; `bin/n42/src/main.rs` seeding generalised | new `qmdb-reth/src/executed_journal.rs`, `executed_fields.rs`, `bin/n42/src/main.rs` | ~250 lines | T10; a restart in T12 |
+| 7 | **Genesis files and scripts.** `n42_fleet3_bench_d2.json`, `n42_fleet7_bench_d2.json` (copies, `deferredExecutionDepth: 2`, a distinct `extraData`); the depth in the fleet scripts' printed header and `fleet7-verify`'s output; nothing else in the scripts | `crates/chainspec/res/genesis/`, `scripts/fleet7-env.sh`, `fleet3-env.sh`, `fleet7-verify.py` | files only | the genesis loads; `n42 init` of each prints a hash different from the D=1 file |
+| 8 | **Capacity**, by env with documented relations: `DEFERRED_IN_FLIGHT_MAX` 3 -> 4, `PARENT_OUTPUTS_KEPT` 4 -> 6, `LEADER_LAYERS` cap 4 -> 6, `FOLLOWER_SHARDS_KEPT`; defaults unchanged | `follower_import.rs`, `h2-execution/driver.rs`, `direct_build.rs` | ~80 lines | the stacking tests at depth 6 (`ancestry_of` tests exist at 4); a leg decides the defaults |
+| 9 | **Documents.** `N42_CUSTOMIZATIONS.md` (the additive chainspec function), `docs/N42_26_PORT.md` (a gov5 subsection from 2.4), a pointer in `PHASE_D_DEFERRED_EXECUTION.md`, `CLAUDE.md`'s mention if any, the round results as they come | docs | | |
+
+Order and dependencies: 0 -> 1 -> 2 -> {3, 4, 5, 6 independent; all before 5's flip is used} -> 7 -> 8; step 5's
+flip is the first moment a depth-2 genesis loads. Total estimate: ~1,350 lines of change, 60% tests, about 4-6 agent
+sessions; steps 0-2 and 4 are mechanical, 3 is the one that needs care (items 5 and 8).
+
+**The legs after step 7** (not part of any step): (a) the three-node independent-execution smoke and the three fault
+legs of 4.7; (b) before any of it, a D=1 leg at pacing 45 ms with SES 17's switches on, to read the proposal-to-Decide
+time (risk 3) and `V`; (c) the E=1 pacing sweep at 200k in pairs; (d) 400k. Success is not a rate: it is
+`fields_mismatches` 0, `invalid_blocks` 0, `rename_wait_us` 0 on the early path, no `ParentUnknown`, and a floor read
+from the counters of 3.1 that says which chain binds.
+
 ## Appendix A. Switching a live depth-1 chain to depth 2 (not planned)
 
 If a chain that already runs depth 1 had to move at time `T`: the first depth-2 block `X` (parent `X-1` at depth 1)

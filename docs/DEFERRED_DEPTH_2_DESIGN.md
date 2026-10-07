@@ -188,9 +188,10 @@ it needs its own wait at D=2.
 | 24 | gov5: `parentBeaconRoot` derivation, `ExecutedResultOfHeader`, `CheckDeferredBlock` | (read from PD section 15, not from gov5's code) | section 2.4 |
 | 25 | `mobile-verify` receipts and `n42-init-snapshot` pairing | PD section 3: "proof for state after N is against header N+1's stateRoot; receipt of N under N+1" | N+D; neither is implemented for depth 1 either (PD section 15: "not yet") |
 
-Items 1-5, 8, 10, 14, 16, 17, 19, 20, 21, 25 plus the follower's `wait_for_parent_fields` doc are the 15 rule or semantic
-places; 12 and 13 are the 2 capacity ones; 6, 7, 9, 11 and the two registry writers (`strategy.rs:147`
-`remember_state_root`, `hotstuff_consensus.rs:475` `remember_receipts`) are the benign reads, which need no change.
+Items 1-5, 8, 10, 14, 16, 17, 18, 19, 21, 24 and 25 are the 15 rule or semantic places; 12 and 13 are the 2 capacity
+ones; 6, 7, 9, 11 and the two registry writers (`strategy.rs:147` `remember_state_root`, `hotstuff_consensus.rs:475`
+`remember_receipts`) are the 6 benign reads, which need no change. Items 20, 22 and 23 are the tests, documents and
+scripts that follow the rule rather than assumptions of their own.
 
 ### 2.3 The three hardest
 

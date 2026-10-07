@@ -30,6 +30,7 @@ pub mod vote_log;
 pub mod wire_bridge;
 
 pub mod block_body;
+pub mod deferred_depth;
 pub mod committee_pool;
 pub mod compact_body;
 pub use block_body::{

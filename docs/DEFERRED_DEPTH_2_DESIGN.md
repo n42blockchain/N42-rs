@@ -363,3 +363,192 @@ the layer burned ~34 cores at 61 ms and ~52 at 40 ms (SES 16.5) of 208; at 42 ms
 layers, one per validator) is not modelled: a follower's chain is the same exec -> view -> exec on its own hardware
 plus the check; at D=1 the 3-node follower's import was 38-40 ms median (E=1 layer, own-import) and 275 ms in the
 older seven-node rounds; a D=2 E=3 round has to be run before anything is claimed for it.
+
+## 4. Risks and tests
+
+### 4.1 Safety: a block certified two later, and the commit rule
+
+What the rule needs from consensus: nothing beyond what any header needs. The result a header carries is a
+deterministic function of the chain the block extends, bound by hash (`parent.parent_hash`, section 1.1), so a header
+can never carry "the wrong N-2": a sibling chain's blocks carry that chain's result and are checked against it.
+Whether N-2 is *committed* when N is proposed does not enter the check. For completeness, what the protocol gives
+(read in `h2-consensus/src/protocol/{proposal,round,state_machine}.rs`):
+
+- **Optimistic path.** The protocol is two rounds a view (Propose, R1 vote, PrepareQC, R2 CommitVote, Decide) and the
+  next proposal is made after Decide (`state_machine.rs` flow comment; the proposal's `justify_qc` is `locked_qc`,
+  `proposal.rs:145`; the piggybacked `previous_prepare_qc` only carries the QC to voters). So when N is proposed N-1 has
+  a CommitQC, and with it every ancestor: N-2 is committed.
+- **Timeout path.** A new leader proposes on the highest QC it holds. N-1 may be prepared but not committed; its
+  proposal carried `justify = QC(N-2)`, and every voter ran `update_locked_qc` on it (`proposal.rs:369`), so n-f
+  validators are locked on N-2's QC and `is_safe_to_vote` (`justify.view >= locked.view`) keeps a conflicting N-2'
+  from ever gathering a quorum. N-2 is not "committed" in the protocol's sense yet, but it cannot be replaced, which is
+  all the rule needs.
+- **A reorg of N-1 after N was built.** N is on N-1; if N-1 is replaced by a sibling N-1' (a TC re-proposal), N is
+  dropped as today (its parent is wrong; `payload_serve` and the build store discard it) and a new N' is built on N-1'.
+  N and N' carry the same four fields (both `result(N-2)`: same grandparent) and differ in parent hash and body;
+  nothing about a result is ever re-decided. The build store's identity (parent, number, transactions root;
+  `built_executions`, PD 16) already separates them: at D=2 two blocks with *different* parents and the same grandparent
+  also share their fields, and the identity includes the parent, so no change; the test in 4.7 pins it.
+- **What a vote no longer proves** (the real change): a quorum on N proves the grandparent's result, not the parent's.
+  A block whose execution diverges between nodes (a non-determinism bug) is caught at its `D`-th child instead of its
+  first. The cost of a bug is therefore one more block of chain built on a state some nodes disagree about; recovery is
+  today's (a mismatch refuses the votes, a TC, the diverging node resyncs). The unit and fleet gates `fields_mismatches`
+  0 and `fleet7-verify` read exactly this and stay.
+
+### 4.2 Liveness: handover, view changes, a block dropped under a header
+
+- **The tenure handover** (BD 10.15-10.17's stall). The incoming leader's first build of a tenure reads its parent as
+  `ParentExecution::Published` (a peer's block it executed; `N42_TENURE_FIRST_ON_OUTPUT`): the parent's *output*, which
+  its follower import publishes as soon as the parent's execution ends. The header needs `result(parent.parent)`, filed
+  under that block's sealed hash by the follower import ~one cycle earlier. At D=1 the incoming leader waits for the
+  parent's *root* (30-45 ms after the parent's execution); at D=2 it does not. The handover gets shorter, not
+  longer.
+- **A view change.** The new leader's parent is the highest-QC block P; its header carries `result(P.parent)`. A voter on
+  P executed P.parent (a voter of P checked its header against `P.parent.parent`, and executed `P.parent` to check P's
+  includability), so a node that voted for P has the result. A node that never saw P (lagging) abstains and catches up
+  by range sync: the same cure as at D=1.
+- **N-1 dropped, "what is N's parent then".** N's parent is whatever block it was built on; its header says
+  `result(parent.parent)` of *that* chain. There is no canonical-chain lookup anywhere in the rule, so a drop needs no
+  handling in the rule; the implementation hazard is only the alias table of item 5 (a re-sealed block, view moved by a
+  timeout, has a new sealed hash and the alias must follow it: `chain_alias::remember` is the existing pattern).
+- **A leader whose grandparent's result is missing** fails the build (`ParentUnknown`, as at D=1 for the parent), the
+  view times out, TC. With the alias table this should not occur on the first leg; if it does it is the loud failure.
+
+### 4.3 Settlement tags and what a wallet waits for
+
+`Settlement::advance` (item 17): at depth D a commit of B certifies the ancestor of B at distance D; `safe` is that
+block, `finalized` the newest certified block at or below the persisted height; `latest` is the committed block as
+today. Wall-clock time from a block's proposal to its certified state (estimate): D=1 about one cycle plus the vote
+road, ~60 + ~45 = ~105 ms at today's cycle; D=2 two cycles plus the vote road, ~2 x 44 + ~45 = ~133 ms at the D=2
+cycle, i.e. **about 30 ms later, not 60** (the cycle shrinks while the depth doubles). Consequences:
+
+- a client that reads `latest` sees the same freshness as today (the QMDB read view stands at the committed head);
+- `eth_getBlockByNumber(latest).stateRoot` is the root two blocks back; a proof of state after B is anchored by
+  header B+2 (and for a receipt, `receiptsRoot` of B+2);
+- the mobile receipt and proof formats (`mobile-verify`) are not implemented for depth 1 either; define them with the
+  depth in the document (`anchor = B + D`) so a verifier reads it from the chain constant rather than hard-coding 1.
+
+### 4.4 Follower memory and the slot cap
+
+A follower must hold N-1's and N-2's execution outputs unlanded and, at a shorter cycle, up to 4-6 of them (item 12).
+Size: a block's published output plus its shards residual is dominated by the bundle (~190k accounts and as many
+reverts; BD: ~30 MB of QMDB record a block, ~60 MB for a provisional bundle clone, ~120 MB for a prepared body at
+200k). Four extra unlanded outputs are 0.3-0.5 GB a node against peaks of 32-51 GB (BD 10.60-10.63): not the risk.
+The risk is the **in-flight cap**: `DEFERRED_IN_FLIGHT` 2 (max 3) frees a slot only when a block has *landed* (~120-150
+ms at today's seals). At a 42 ms cycle that is 3-4 blocks in flight, so blocks queue for a slot and their votes wait
+(`FOLLOWER_LAG_CAP` 4, `N42_VOTE_BEFORE_SLOT` exists for exactly this). Plan: step 8 raises the maxima with a
+documented relation (`PARENT_OUTPUTS_KEPT >= cap + 2`, the arithmetic of `driver.rs:116-129`) and keeps the defaults;
+legs set them by env; the deciding counters are `decline_on_output` (stack too deep), imports over 600 ms and
+`parent_engine_wait_ms`.
+
+### 4.5 Restart, late joiners and sync
+
+- **Restart** (item 14). At D=2 a leader restarted at head H cannot build H+1: `result(H-1)` is in no store. A follower
+  abstains on H+1 and recovers at H+2 (which carries `result(H)`, seeded as today). Cure: a journal of `ExecutedFields`
+  by block hash, number and parent hash, appended when an entry becomes complete (`executed_fields::remember*`), read back
+  at startup for the last 8 canonical blocks and cross-checked against the head's forest root and database receipts.
+  About 330 bytes a block; an append-only file beside the QMDB state, flushed with the persistence batch. Missing or
+  torn tail: the node starts without it and costs one abstention or one lost leader view, never a wrong vote.
+- **A late joiner pulling by range** (`import_pulled`) executes each block and records its result; the header of B is
+  verified when its D-th descendant arrives (PD section 3 had one block of look-ahead; it is D now). The last D blocks of a
+  pulled range are unverified until the next block, as on Ethereum with EIP-7862.
+- **`n42-init-snapshot`** pairs header and state: the state after B is certified by header B+D, so the tool takes that
+  header (not B+1) and the snapshot's head result is the third-last header's.
+
+### 4.6 Mixed fleets: a depth-1 member in a depth-2 chain
+
+It cannot vote, and that is by the rule, not by a handshake. A depth-1 validator checks every header against
+`result(parent)` (`validate_header_against_parent`, item 3); the header carries `result(parent.parent)`; the two differ
+whenever any state changes between the two blocks (the block reward and withdrawals alone change the QMDB root every
+block on the fleet genesis files), so the proposal fails the header check, the payload is answered INVALID by its own
+engine, and the member neither votes nor imports; as a leader its blocks fail everywhere else and its view times out.
+Safety is unaffected (a refusing member signs nothing); liveness degrades by that member's votes and its leader views.
+Symmetrically a depth-2 member refuses depth-1 headers. Two honest limits:
+
+1. On a quiescent chain (no state change, no receipts, gas 0) both rules give identical headers and a mixed fleet
+   appears to work until the first transaction or reward. The fleet files never idle that way; a mixed-fleet test must
+   include a state-changing block.
+2. The transport cannot separate the depths: the fork digest is the first four bytes of the genesis hash
+   (`h2-net/src/status.rs:84`, gov5's contract) and `deferredExecutionDepth` is a `config` extra field, not part of
+   the genesis header. Mitigation: print the depth at startup and in the fleet scripts' header, make the new genesis files
+   separate files with a different `extraData` (so their hash, hence digest and block-gossip topic, differ from the
+   D=1 files: `n42_fleet7_bench_d2.json` carries `"extraData": "...d2"`; cheap, native-only), and keep depth out of any
+   gov5-facing wire.
+
+### 4.7 Tests
+
+**Unit, per rule** (each next to its code; D=1 behaviour pinned by the existing tests staying green):
+
+| # | test | where |
+| --- | --- | --- |
+| T1 | depth parse: absent = 1; 1; 2; `"2"` (string), 0, 3, `null` refused; depth without gate refused; depth 2 with a gate after the genesis timestamp refused; depth 2 refused until step 5 flips it | `crates/chainspec/src/qmdb.rs` |
+| T2 | `ancestor_executed_fields`: D=1 equals the old function over random chains; D=2: blocks 1 and 2 carry the genesis fields, block 3 `result(1)`, unknown grandparent -> `ParentUnknown`; two sibling parents of one grandparent give equal expected fields; different grandparents give different | `hotstuff_consensus.rs` tests |
+| T3 | `validate_header_against_parent` at D=2: accepts `result(N-2)`, rejects `result(N-1)` (the D=1 value) and `result(N-3)` with `Mismatch`; and the same header at D=1 rejected the other way; both depths in one test = the mixed-fleet refusal at unit level | same |
+| T4 | builder: a chained build whose grandparent's result is filed under the builder hash only (hand-off not run) seals; after a view timeout re-seals the grandparent the alias follows; `ParentUnknown` only when nothing was filed | `payload.rs`, `direct_build` tests |
+| T5 | `file_parent_under_seal` waits for the parent's fields, not its `Complete`, when the tree is not yet filed; early path taken when the fields arrive after the child's seal | `fields_at_seal.rs` |
+| T6 | follower: the vote road passes while N-1's root is not computed (N-1 fields absent, N-2 present) and waits when N-2's are absent; includability still reads N-1's output; `parent_in` unchanged | `follower_import_tests.rs` |
+| T7 | settlement at D=2: safe = committed - 2, finalized capped by persisted; a dropped uncommitted block moves nothing; restart sends zero tags; D=1 unchanged | `tests/settlement_tags.rs` |
+| T8 | base fee: header N's `baseFeePerGas` from the parent's carried `gasUsed` (= `result(N-3)` at D=2), golden numbers | `n42-testing` |
+| T9 | the gas-limit step never goes below the carried `gasUsed` (item 19) | `payload.rs` |
+| T10 | journal: round trip, torn tail, missing H-1 -> `ParentUnknown`, never a panic or a wrong value | new module |
+| T11 | build store identity: two blocks, different parents, same grandparent, same fields: kept apart | `built_executions.rs` |
+| T12 | end to end on the dev chain, `deferredExecutionDepth: 2`: block N's header fields equal the registry's result for N-2 for N = 1..12, a restart in the middle, the head's own result restored | `n42-testing/src/dev.rs`, a sibling of the existing `test_deferred_execution__...` |
+| T13 | `h2-execution` mock loop: four members, three at D=2 and one at D=1: the chain advances, the D=1 member never votes; settlement tags at D=2 | `tests/consensus_execution_loop.rs` |
+
+**Fixture-style tests against gov5.** None exist for depth 2. The shape to follow is
+`crates/n42/n42-testing/testdata/deferred_execution_vectors.json` (keys `genesis {alloc, hash, header}`, `blocks[]
+{number, hash, header, transactions (raw 2718), executed, deferred}`, fixed keys and timestamps,
+`N42_WRITE_VECTORS=1` rewrites it). A depth-2 document, `deferred_execution_vectors_d2.json`, with the gate at
+genesis and `deferredExecutionDepth: 2`, needs, from gov5: the same genesis alloc and header; seven blocks with
+transfers in blocks 1, 2, 3 and 5 (so `result(k)` differs for each k); for each block its full header as carried, its
+own `executed` result (gov5's `ExecutedResult`) and the transactions; plus a **fork vector**: two sibling blocks 4 and
+4' on block 3 (different transactions), each with a child (5 on 4, 5' on 4'), where headers 4 and 4' carry
+`result(2)` and headers 5 and 5' carry `result(3)` (identical fields, different parent hashes), and a block 6 on 5'
+that carries `result(4')`. Both clients' suites compare every header byte for byte and every `executed` result.
+The Rust side can produce its half first (T12 with `N42_WRITE_VECTORS`); gov5 produces its half from the same keys.
+Also needed from gov5: its `parentBeaconRoot` vectors across the chain start (block 2's evidence link uses block 1's
+header `receiptsRoot`, which is the genesis value at D=2).
+
+**Rounds** (to run by the fleet agent; this study ran none):
+
+1. *Three-node independent-execution round* (`scripts/fleet3.sh`, three validators each with its own execution layer,
+   `n42_fleet3_bench_d2.json`): 200 tx/s offered for 90 s, then a flood; gates: heads equal on all three, `invalid_blocks`
+   0, `fields_mismatches` 0, `fleet7-verify` clean, no `ParentUnknown`, `decline_on_output` rate, imports over 600 ms.
+   Then faults: kill a follower for 60 s and restart it (journal and range sync); stop the leader in its tenure (TC;
+   the first header after it carries the right ancestor); one node started late with a fresh layer.
+2. *E=1 round at 200k*: pairs (D=1 control and D=2 on one binary, same day, `fleet7-repeat.sh`; no conclusion from one
+   leg), pacing 50 / 45 / 42 / 40 and 0, reading `sealed_at`, `parent_fields_ms` (should be 0 at every block),
+   `seal_to_fields_us`, the **proposal-to-Decide time per block** (never read below 52 ms), `rename_wait_us` (must be 0 on
+   the early path: item 8), persistence backlog, `great_grandparent_missing` / `grandparent_ms`, `exec_end -> view` (V).
+3. *400k round* after 2, same pairs.
+
+### 4.8 Risks, ranked
+
+1. **The grandparent's identity** (item 5): the first chained build on a leader fails `ParentUnknown` without the alias.
+   Loud. Covered by T4 and the round-1 smoke.
+2. **The silent regression of the root chain** (item 8): correct chain, a root job that waits ~105 ms. Quiet; the
+   counter is `rename_wait_us` / `rename_early` on the build line and the gate is round 2.
+3. **The vote road is unmeasured** below 52 ms (3.2): it may be the floor, and then D=2 yields less than the +10-20%.
+   Cheap to learn first: one E=1 leg at D=1 with pacing 45 reads the proposal-to-Decide time before any code (the
+   leg is only worth running once SES 17's switches are on).
+4. **Persistence and the root job run at 70-90% of the D=2 cycle** (3.2, 3.3): a small backlog growth fills the
+   throttle in minutes (BD 10.86's +40 blocks a minute at 55 ms).
+5. **The landing bound and the slot cap** (3.4, 4.4): capacity knobs, no rule change, but the first D=2 leg at 42 ms
+   will meet them.
+6. **gov5 delays or differs.** Mixed fleets fail closed (4.6), but a gov5 member in a depth-2 fleet is a refusing
+   member; the cross-client claim in PD (a mixed fleet at 0.43 s) is not available at depth 2 until gov5 implements it.
+7. **A wallet-visible delay of ~30 ms** and headers two blocks stale as proof anchors (4.3). Document.
+8. **Gas limit and base fee edges** (items 19, T8, T9): minor on the bench, relevant on a chain with a limit target.
+9. **Restart and sync** (4.5): one abstention or one lost view, bounded.
+10. **E=3 is not modelled** (3.5).
+
+## Appendix A. Switching a live depth-1 chain to depth 2 (not planned)
+
+If a chain that already runs depth 1 had to move at time `T`: the first depth-2 block `X` (parent `X-1` at depth 1)
+carries `result(X-2)`, which is *also* in the parent's header (a depth-1 header carries its parent's result). So the
+transition rule is: for the first block at or past `T`, expected = the parent's own header fields; for every later
+block expected = `registry[parent.parent_hash]`. No result is skipped (`result(X-1)` appears in header `X+1`) and one
+is repeated (`result(X-2)` appears in headers `X-1` and `X`), exactly as the genesis fields repeat at the chain
+start. It needs the parent header in the check (already given) and the registry to hold every block executed before
+`T` (feed `seed_from_header` on the pre-`T` import path). The cost is a `deferredExecutionDepthTime` key and the
+two-case check; the benefit is zero until a chain needs it. Not built.

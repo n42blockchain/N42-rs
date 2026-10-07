@@ -115,7 +115,7 @@ pub const MAX_DEFERRED_EXECUTION_DEPTH: u64 = 2;
 
 /// The deepest depth this build of the node runs. A depth the rule defines
 /// but the node does not yet implement is refused at start-up.
-pub const SUPPORTED_DEFERRED_EXECUTION_DEPTH: u64 = 1;
+pub const SUPPORTED_DEFERRED_EXECUTION_DEPTH: u64 = 2;
 
 /// Why a genesis's `deferredExecutionDepth` is refused.
 #[derive(Debug, Clone, PartialEq, Eq)]

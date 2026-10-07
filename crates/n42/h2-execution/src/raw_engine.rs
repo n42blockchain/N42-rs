@@ -129,7 +129,9 @@ pub mod reply {
     /// `NEW_PAYLOAD` only, under deferred execution
     /// (docs/PHASE_D_DEFERRED_EXECUTION.md): the block was *checked* -- its
     /// header's execution fields match this execution layer's result for the
-    /// parent and its transactions are includable on the parent's state --
+    /// depth-D ancestor (the parent at depth 1, the grandparent at depth 2:
+    /// docs/DEFERRED_DEPTH_2_DESIGN.md) and its transactions are includable
+    /// on the parent's state --
     /// and is now executing. `u32` length and an encoded
     /// [`super::PayloadStatus`] (VALID) follow, then the final answer as a
     /// [`VALUE`] or [`ERROR`] frame once the block is imported. A block

@@ -643,6 +643,11 @@ pub struct ExecutionDriver<E> {
     /// layer orders them by parent. Blocks before the fork take the path
     /// above.
     deferred_execution_time: Option<u64>,
+    /// The chain's `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md):
+    /// a gated header carries the result of its ancestor this many blocks
+    /// back, so a commit certifies that ancestor ([`crate::settlement`]). 1
+    /// unless set.
+    deferred_depth: u64,
     /// Where a spawned import reports.
     foreign_imports: tokio::sync::mpsc::UnboundedSender<ImportReport>,
     /// The receiving end, until the loop takes it.
@@ -920,6 +925,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             own_importing: Default::default(),
             spawn_imports: false,
             deferred_execution_time: None,
+            deferred_depth: 1,
             foreign_imports: foreign_tx,
             foreign_imports_rx: Some(foreign_rx),
             import_queue: std::collections::VecDeque::new(),
@@ -1056,7 +1062,9 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         }
         self.note_lineage_of(head);
         let deferred_from = self.deferred_execution_time;
-        self.settlement.advance(head, |timestamp| deferred_from.is_some_and(|at| timestamp >= at));
+        let depth = self.deferred_depth;
+        self.settlement
+            .advance_at_depth(head, |timestamp| if deferred_from.is_some_and(|at| timestamp >= at) { depth } else { 0 });
         let (safe, finalized) = self.settlement.tags_for(head);
         ForkchoiceState { head_block_hash: head, safe_block_hash: safe, finalized_block_hash: finalized }
     }
@@ -1838,6 +1846,21 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// every block on the import-gated path.
     pub fn set_deferred_execution_time(&mut self, at: Option<u64>) {
         self.deferred_execution_time = at;
+    }
+
+    /// The chain's `deferredExecutionDepth` (see the field): 1 or 2. Anything
+    /// else is refused and leaves the depth as it was.
+    pub fn set_deferred_depth(&mut self, depth: u64) -> Result<(), String> {
+        if !(1..=n42_h2_consensus::deferred_depth::MAX_DEPTH).contains(&depth) {
+            return Err(format!("deferred execution depth {depth}: expected 1..={}", n42_h2_consensus::deferred_depth::MAX_DEPTH));
+        }
+        self.deferred_depth = depth;
+        Ok(())
+    }
+
+    /// The depth [`Self::set_deferred_depth`] set (1 by default).
+    pub const fn deferred_depth(&self) -> u64 {
+        self.deferred_depth
     }
 
     /// The deferred in-flight cap (see [`deferred_in_flight`], whose value is

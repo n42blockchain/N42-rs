@@ -358,3 +358,36 @@ async fn the_tags_follow_across_a_handover_from_leader_to_follower() {
     // Finalized walked from the follower's blocks into the leader's own.
     assert_eq!(driver.finalized_tag(), Some(Tag { number: 3, hash: own[2] }));
 }
+
+/// T7 of docs/DEFERRED_DEPTH_2_DESIGN.md through the driver: at
+/// `deferredExecutionDepth` 2 a commit certifies the block two behind it, so
+/// safe trails the tip by two (blocks 1 and 2 carry the genesis result and
+/// move nothing past the floor) and finalized stays capped by persistence.
+#[tokio::test]
+async fn at_depth_two_safe_is_two_behind_the_tip() {
+    let el = MockExecutionLayer::new();
+    let persisted = Arc::new(AtomicU64::new(0));
+    let mut driver = split_driver(&el, &persisted);
+    assert!(driver.set_deferred_depth(3).is_err(), "only depths 1 and 2 are defined");
+    driver.set_deferred_depth(2).expect("depth 2");
+    assert_eq!(driver.deferred_depth(), 2);
+    let blocks = chain_on(GENESIS, 1, 16);
+    let mut last = (0u64, 0u64);
+    for (i, (hash, payload)) in blocks.iter().enumerate() {
+        let number = i as u64 + 1;
+        if number.is_multiple_of(8) {
+            persisted.store(number - 6, Ordering::Relaxed);
+        }
+        driver.cache_payload(*hash, payload.clone());
+        driver.handle_output(&committed(*hash)).await;
+        let sent = *forkchoices(&el).last().expect("a commit sends a forkchoice");
+        assert_eq!(sent.head_block_hash, *hash);
+        let safe = number_of(&blocks, sent.safe_block_hash);
+        assert_eq!(safe, number.saturating_sub(2), "block {number}: safe is the grandparent");
+        let finalized = number_of(&blocks, sent.finalized_block_hash);
+        assert_eq!(finalized, safe.min(persisted.load(Ordering::Relaxed)));
+        assert!(safe >= last.0 && finalized >= last.1, "block {number}: a tag moved backwards");
+        last = (safe, finalized);
+    }
+    assert_eq!(driver.safe_tag(), Some(Tag { number: 14, hash: blocks[13].0 }));
+}

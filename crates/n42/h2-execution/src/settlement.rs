@@ -231,7 +231,22 @@ impl Settlement {
     /// commit (a quorum on it, each voter having checked those fields against
     /// its own result) certifies the parent. Before the fork every vote is
     /// import-gated, so a commit certifies the block itself.
+    /// Kept for the depth-1 tests; the driver calls [`Self::advance_at_depth`].
+    #[cfg(test)]
     pub(crate) fn advance(&mut self, committed: B256, deferred: impl Fn(u64) -> bool) {
+        self.advance_at_depth(committed, |timestamp| u64::from(deferred(timestamp)));
+    }
+
+    /// `advance` with the chain's deferred-execution depth
+    /// (`docs/DEFERRED_DEPTH_2_DESIGN.md` section 4.3): `depth(timestamp)` is
+    /// 0 for a block before deferred execution (its commit certifies itself),
+    /// else the depth `D`, and a commit of `B` certifies the ancestor of `B`
+    /// at distance `D` on `B`'s chain -- the block whose result `B`'s header
+    /// carries. At depth 1 that is the parent, exactly as `advance`
+    /// always did; at depth 2 the grandparent, found through the lineage (a
+    /// commit whose parent link is unknown moves nothing). Blocks `1..=D`
+    /// carry the genesis result and certify nothing beyond the floor.
+    pub(crate) fn advance_at_depth(&mut self, committed: B256, depth: impl Fn(u64) -> u64) {
         if self.mode == SettlementTags::Legacy {
             return;
         }
@@ -239,10 +254,11 @@ impl Settlement {
             debug!(target: "n42.h2.el", block = ?committed, "a commit with no known lineage; settlement tags stay");
             return;
         };
-        let certified = if deferred(link.timestamp) {
-            link.number.checked_sub(1).map(|number| Tag { number, hash: link.parent })
-        } else {
-            Some(Tag { number: link.number, hash: committed })
+        let certified = match depth(link.timestamp) {
+            0 => Some(Tag { number: link.number, hash: committed }),
+            1 => link.number.checked_sub(1).map(|number| Tag { number, hash: link.parent }),
+            depth => n42_h2_consensus::deferred_depth::certified_number(link.number, depth)
+                .and_then(|number| self.lineage.ancestor_at(committed, number).map(|hash| Tag { number, hash })),
         };
         if let Some(certified) = certified
             && self.safe.is_none_or(|safe| certified.number > safe.number)
@@ -375,6 +391,40 @@ mod tests {
         chain(&mut legacy, 3);
         legacy.advance(h(3), |_| true);
         assert_eq!((legacy.safe(), legacy.finalized()), (None, None));
+    }
+
+    /// T7 of docs/DEFERRED_DEPTH_2_DESIGN.md: at depth 2 a commit certifies
+    /// the grandparent: safe = committed - 2, finalized capped by persisted;
+    /// blocks 1 and 2 certify nothing beyond the floor; a commit whose parent
+    /// link is unknown moves nothing; depth 1 is unchanged.
+    #[test]
+    fn at_depth_two_safe_is_the_grandparent() {
+        let mut s = Settlement::new(SettlementTags::Split);
+        s.set_floor(h(0));
+        s.set_persisted(persisted(3));
+        chain(&mut s, 8);
+        s.advance_at_depth(h(2), |_| 2);
+        assert_eq!(s.safe(), Some(Tag { number: 0, hash: h(0) }), "block 2 carries the genesis result");
+        s.advance_at_depth(h(8), |_| 2);
+        assert_eq!(s.safe(), Some(Tag { number: 6, hash: h(6) }));
+        assert_eq!(s.finalized(), Some(Tag { number: 3, hash: h(3) }));
+        assert_eq!(s.tags_for(h(8)), (h(6), h(3)));
+        // A sibling of 8 committed on a 7 the driver never saw: no lineage
+        // to the grandparent, nothing moves.
+        s.note(h(0x99), 9, h(0x98), 9);
+        s.advance_at_depth(h(0x99), |_| 2);
+        assert_eq!(s.safe().map(|t| t.number), Some(6));
+        // Depth 1 through the same entry point is the old rule.
+        let mut one = Settlement::new(SettlementTags::Split);
+        one.set_persisted(persisted(100));
+        chain(&mut one, 8);
+        one.advance_at_depth(h(8), |_| 1);
+        assert_eq!(one.safe(), Some(Tag { number: 7, hash: h(7) }));
+        let mut before = Settlement::new(SettlementTags::Split);
+        before.set_persisted(persisted(100));
+        chain(&mut before, 4);
+        before.advance_at_depth(h(4), |_| 0);
+        assert_eq!(before.safe(), Some(Tag { number: 4, hash: h(4) }));
     }
 
     #[test]

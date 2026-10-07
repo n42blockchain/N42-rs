@@ -478,8 +478,10 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     /// its execution, under deferred execution
     /// (docs/PHASE_D_DEFERRED_EXECUTION.md): `checked` receives VALID once
     /// the execution layer has found the header's execution fields equal to
-    /// its own result for the parent and the transactions includable on the
-    /// parent's post-state -- what a follower's vote attests -- and the
+    /// its own result for the depth-D ancestor (the parent at
+    /// `deferredExecutionDepth` 1, the parent's parent at 2:
+    /// docs/DEFERRED_DEPTH_2_DESIGN.md) and the transactions includable on the
+    /// parent's post-state at every depth -- what a follower's vote attests -- and the
     /// returned status is the import, as before. An execution layer without
     /// the early answer drops `checked` unused, and the caller votes on the
     /// import instead; this default is that.

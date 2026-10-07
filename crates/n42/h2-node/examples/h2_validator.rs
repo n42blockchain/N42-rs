@@ -472,6 +472,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // for, and imported beside the loop.
         if let Some(at) = deferred_execution_time {
             driver.set_deferred_execution_time(Some(at));
+            // At depth 2 a commit certifies the grandparent (safe = committed - 2).
+            driver.set_deferred_depth(deferred_execution_depth)?;
             println!("deferred     : execution deferred from timestamp {at}; a block is checked, voted for, then imported beside the loop");
             println!("deferred     : depth {deferred_execution_depth} (a header carries the result of its ancestor {deferred_execution_depth} blocks back)");
         }

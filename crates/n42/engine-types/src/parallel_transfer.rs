@@ -1538,10 +1538,11 @@ pub struct BuildRun<T> {
 }
 
 /// What every batch counts as it executes ([`BuildRun::counters`]): the
-/// transfers it executed, their gas, and -- when the caller handed the
-/// candidates' tips per gas ([`execute_for_build_counted`]) -- their fees,
+/// transfers it executed, their gas, and -- when the caller handed a
+/// candidate's tip per gas ([`execute_for_build_counted`]) -- their fees,
 /// `tip x gas_used` summed exactly as [`fees_from_tips`] sums it over the
-/// slots. The same numbers a pass over the filled slots gives
+/// slots. The tip is read on the batch's thread, beside the conversion that
+/// just read the same candidate. The same numbers a pass over the filled slots gives
 /// ([`slot_refs_and_gas`]), read off the batches instead.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RunCounters {
@@ -1549,8 +1550,7 @@ pub struct RunCounters {
     pub executed: usize,
     /// Their gas used, summed.
     pub gas: u64,
-    /// Their fees at the tips handed in; `None` without tips, or when the
-    /// tips did not cover every candidate.
+    /// Their fees at the tips handed in; `None` without tips.
     pub fees: Option<U256>,
 }
 
@@ -3561,11 +3561,11 @@ where
 }
 
 /// [`execute_for_build_in_place_after`] (with `before_batches` optional) with
-/// the candidates' tips per gas at the block's base fee, one a candidate in
-/// candidate order: every batch then sums its transfers' fees beside their
-/// count and gas ([`RunCounters`]), and the seal reads the block's count, gas
-/// and fees off [`BuildRun::counters`] with no pass over the slots
-/// (`N42_SEAL_ON_COUNTERS=1`). Tips of another length give `fees: None`.
+/// `tip_of(i)`, candidate `i`'s tip per gas at the block's base fee: every
+/// batch then sums its transfers' fees beside their count and gas
+/// ([`RunCounters`]), and the seal reads the block's count, gas and fees off
+/// [`BuildRun::counters`] with no pass over the slots
+/// (`N42_SEAL_ON_COUNTERS=1`).
 #[allow(clippy::too_many_arguments)]
 pub fn execute_for_build_counted<T, G>(
     evm_env: &reth_evm::EvmEnv,
@@ -3575,14 +3575,14 @@ pub fn execute_for_build_counted<T, G>(
     on_bundle: Option<&(dyn Fn(BundleState) + Sync)>,
     in_place: bool,
     before_batches: Option<&mut dyn FnMut() -> bool>,
-    tips: Option<&[u128]>,
+    tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), build_one_wave(), tips)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), build_one_wave(), tip_of)
 }
 
 /// [`execute_for_build_counted`] with the dispatch chosen by the caller: for
@@ -3596,14 +3596,14 @@ pub fn execute_for_build_counted_dispatch<T, G>(
     open: &(dyn Fn() -> Option<G> + Sync),
     in_place: bool,
     one_wave: bool,
-    tips: Option<&[u128]>,
+    tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, None, in_place, None, read_set(), one_wave, tips)
+    execute_for_build_opts(evm_env, keys, convert, open, None, in_place, None, read_set(), one_wave, tip_of)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3617,7 +3617,7 @@ fn execute_for_build_opts<T, G>(
     before_batches: Option<&mut dyn FnMut() -> bool>,
     with_read_set: bool,
     one_wave: bool,
-    tips: Option<&[u128]>,
+    tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
@@ -3625,8 +3625,6 @@ where
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let beneficiary = evm_env.block_env.beneficiary;
-    // Tips that do not name every candidate count no fees.
-    let tips = tips.filter(|tips| tips.len() == keys.len());
     let mut phases = Phases::default();
     let at = std::time::Instant::now();
     let call_at = at;
@@ -3693,7 +3691,7 @@ where
         let mut state = crate::batch_state::BatchState::with_capacity(db, txs + txs / 4 + 1);
         let mut skipped = Vec::new();
         // The batch's count, gas and fees, kept as it executes.
-        let mut counted = RunCounters { fees: tips.map(|_| U256::ZERO), ..Default::default() };
+        let mut counted = RunCounters { fees: tip_of.map(|_| U256::ZERO), ..Default::default() };
         let mut setup_ns = 0;
         let close_at;
         {
@@ -3728,8 +3726,8 @@ where
                             }
                             counted.executed += 1;
                             counted.gas += gas_used;
-                            if let (Some(fees), Some(tip)) = (counted.fees.as_mut(), tips.and_then(|tips| tips.get(i))) {
-                                *fees += U256::from(*tip) * U256::from(gas_used);
+                            if let (Some(fees), Some(tip_of)) = (counted.fees.as_mut(), tip_of) {
+                                *fees += U256::from(tip_of(i)) * U256::from(gas_used);
                             }
                             if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4)) = (t0, t1, t2, t3, t4) {
                                 sampler.record(&[t0, t1, t1, t2, t2, t3, t4, std::time::Instant::now()]);
@@ -3808,7 +3806,7 @@ where
 
     let at = std::time::Instant::now();
     let mut run = BuildRun { phases, ..Default::default() };
-    run.counters.fees = tips.map(|_| U256::ZERO);
+    run.counters.fees = tip_of.map(|_| U256::ZERO);
     let mut spans: Vec<BatchSpan> = Vec::with_capacity(results.len());
     for r in results {
         let (skipped, bundle, timers, span, loop_timers, counted) = r?;
@@ -6033,7 +6031,8 @@ mod tests {
                 })
                 .collect();
             for one_wave in [false, true] {
-                let run = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, one_wave, Some(&tips))
+                let tip_of = |i: usize| tips[i];
+                let run = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, one_wave, Some(&tip_of))
                     .expect("a block of transfers");
                 assert_eq!(broken, !run.skipped.is_empty(), "skips only on the broken blocks");
                 let (refs, gas) = slot_refs_and_gas(&run.slots);
@@ -6058,10 +6057,6 @@ mod tests {
                 let plain = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, one_wave, None)
                     .expect("a block of transfers");
                 assert_eq!((plain.counters.executed, plain.counters.gas, plain.counters.fees), (refs.len(), gas, None));
-                // Tips of another length count no fees.
-                let short = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, one_wave, Some(&tips[1..]))
-                    .expect("a block of transfers");
-                assert_eq!(short.counters.fees, None);
             }
         }
     }

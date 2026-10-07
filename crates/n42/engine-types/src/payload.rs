@@ -1937,10 +1937,12 @@ where
                 let run_at = std::time::Instant::now();
                 run_started = Some(run_at);
                 // `N42_SEAL_ON_COUNTERS=1`: the batches count the block's
-                // transfers, gas and fees (at the tips made in the prep) as
-                // they execute, so the seal needs no pass over the slots.
-                let counted_tips: Option<&[u128]> =
-                    if seal_on_counters() { body_ahead.as_ref().map(|made| made.tips.as_slice()) } else { None };
+                // transfers, gas and fees as they execute (a candidate's tip
+                // read beside its conversion, as the prep's body reads it), so
+                // the seal needs no pass over the slots.
+                let tip_of = |i: usize| pooled_consensus(&cands[i]).effective_tip_per_gas(base_fee).unwrap_or_default();
+                let counted_tips: Option<&(dyn Fn(usize) -> u128 + Sync)> =
+                    if seal_on_counters() && body_at_prep { Some(&tip_of) } else { None };
                 let executed = if defer_state {
                     // After the partition, before the batches: the builder's
                     // own state opened (the wait for a sealed parent's output

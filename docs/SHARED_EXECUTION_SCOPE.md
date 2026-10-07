@@ -1231,3 +1231,167 @@ Base D (or D48). Pairs: D / Db against D + `N42_FREEZE_AFTER_SEAL=1 N42_ROOT_OPS
 - the cycle median / p90, the rate; correctness `fields_mismatches` 0 (with `N42_FIELDS_AT_SEAL=verify` on one leg:
   it compares the published fields with the operations of the merged bundle, which is exactly what
   `N42_ROOT_OPS_AHEAD` changes), `invalid_blocks` 0, `fleet7-verify` clean.
+
+## 16. E=1: the seal's timeline, why the freeze's work came back, and the way to a 40 ms seal (2026-10-07, code and loop343 logs, no fleet leg)
+
+The question from 10.90: with `N42_FREEZE_AFTER_SEAL=1 N42_ROOT_OPS_AHEAD=1` (F2) the child's fields came 6 ms sooner and
+`sealed_at` stayed at 60-61 ms, the freeze's 14 ms reappearing as `par_commit` 2 -> 16 and `par_fold` 6 -> 21. Read offline:
+the layer's `el.log` of loop343 D and F2 (node 0, full blocks (`txs=200000`), first 20 dropped: 1,405 and 1,415 blocks),
+paired block by block with the "output shards folded" line (`fold_us` against `index_ms`: r 0.997 at offset 0), the
+thread-CPU samples of D, F2, F2P55 and FZ (every 5 s by thread-name group), and the code. Medians, p90 where given. The
+seal's own `sealed_at` is read from the build's start; every `*_ms` field is floored to a whole millisecond, so the phases
+below sum to 59-60 where `sealed_at` reads 61 (seven floors, mean 0.5 each, and the median of a sum is not the sum of
+medians).
+
+### 16.1 The timeline
+
+`par_commit` and `par_fold` are **not additive**: `fold_at` is taken at the commit's start, `par_commit_ms` ends at the
+commit's end, and `par_fold_ms` runs to the end of the graft behind the seal minus the seal's own time. So `par_fold` =
+`par_commit` + the behind-seal graft (D 6 = 2 + 4; F2 21 = 16 + 5), and only the commit part is on the seal's path. The
+behind-seal part did not move. The path, with each phase's start offset from the build's start (cumulative per block,
+median / p90) and duration (median / p90):
+
+| phase (field) | D start | D duration | F2 start | F2 duration | runs on | waits for | must follow the previous phase? |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| start (`par_start_ms`; of it `start_handoff_ms` 3 / 9, select 0) | 0 | 4 / 9 | 0 | 4 / 11 | the `build-on-own` blocking thread; the hand-off on the queue's own 8-thread pool; the lanes lock | `before_pull`: the parent's queue hand-off (`forget_mined_parallel`: a parallel compare of the 200,000 taken (sender, nonce) with the sealed block) | a real dependency only on "the parent's take is forgotten"; the compare proves what the builder knew by construction (`body_matches_pull`) |
+| prep (`par_prep_ms`; pull 0) | 4 | 4 / 6 | 4 | 4 / 6 | the build thread blocked in `build_pool().install`: `BodyAhead::make_keyed` on 32 workers (clones 200k transactions, their senders, tips, the (sender, recipient) keys) | the plan's candidates only | code order. Nothing in it reads the parent's state; the tips need the child's base fee, which only the (behind-seal) fee credit uses |
+| gap (`gap_before_exec_ms` = run_at - prep_done + `batches_start_us`; `par_part_ms` 1) | 8 | 3 / 6 | 8-9 | 3 / 6 | the build thread: `partition_by_sender` + `batch_groups` (1 ms), `before_batches` = `open_deferred_state` (`state_wait_us` 236-568, p90 3.5-4.3 ms; waits on the parent's output in 28-38% of blocks), then `slots` (200,000 `OnceLock<BuiltTransfer>` ~470 B = ~94 MB) allocated and touched on the pool | the parent's `StateReady` shards (state open, real); the rest nothing | partition and slots: code order; the state open: real |
+| exec (`par_exec_ms`; `batch_last_end_us` 21.9 ms; 58 batches of 500-3,500, `batch_median_ms` 9, `batch_max_ms` 14) | 12 | 23 / 28 (F2 29) | 12 | 23 / 29 | the 32 `n42-build-*` workers (`install` + `par_iter` over batches: two waves, `batch_last_start_us` 11.3 ms) | the parent's view; the live index's shard locks (none waited on D/F2: the defer) | real |
+| freeze (`index_ms`; one slow shard task: `task_max_us` 13.5-13.8 ms = `task_cpu_max_us`, 16 shards, `pending_us_max` 9.3-9.6 ms, ~8,200 conflicts, `drops_max` ~16,500) | 35 | 14 / 20, **inline, before the commit** | 35 | 14 / 19, on `n42-freeze`, its 16 tasks on the build pool; **beside the commit** | D: the build thread + the pool; F2: `n42-freeze` + the pool | the batches' end | **no.** The seal reads the body, the transactions root and the parent's fields, none of which the freeze produces; first read of the shards is the graft behind the seal |
+| commit (`par_commit_ms`; of it `commit_refs_ms`) | 50 | 2 / 2 (refs 1) | 37 | **16 / 21 (refs 15)** | the build thread in `install`: `slot_refs_and_gas` over 200,000 slots on the pool; the body parts come from `BodyAhead` (`commit_body_ms` 0) | all batches done; **in F2 it ends 0.1-1.5 ms after the freeze's fold ends (16.2)** | **no for the seal:** the seal needs only the count, the gas and "nothing skipped", which every batch knows |
+| `tx_root_ms` | 52 | 2 / 3 | 53 | 2 / 3 | the build thread, serial: a 200,000-hash vector (6.4 MB) from the body, then the frame tree over 400 frames (`seal_frames_indexed` 400, `hashed` 0) | the body | no: the hashes exist at ingest; a prep-time pass would hold them |
+| `parent_fields_ms` | 54 | 0 / 8 | 55 | 0 / 6 | the build thread blocked in `parent_executed_fields_or_built` | the parent's published fields (`seal_to_fields_us` 46.9 ms in F2 + the parent's seal) | real: the header carries the parent's execution |
+| remember (`seal_remember_ms`) | 56 | 3 / 5 | 56 | 3 / 5 | the build thread: `built_executions::remember_pending` -> `put` -> `make_room`: **`store.remove(at)` drops the evicted `Complete` entry (its bundle, receipts and hashed state) inline, under the store's mutex** | nothing | no: it is a free |
+| header, `SealedBlock`, `RecoveredBlock`, hook (rest of `sealed_ms` 6) | 59 | 0 / 1 | 59 | 0 / 1 | the build thread (`cons.seal`, header hash, the hook that answers the validator) | the fields | real |
+| **`sealed_at_ms`** | | **61 (p90 75)** | | **61 (p90 76)** | | | |
+
+Means (D / F2): start 4.8 / 5.6, prep 4.2 / 4.4, run (gap + exec) 26.9 / 28.2, freeze inline 14.4 / 0, commit 1.9 / 15.2,
+`sealed_ms` 8.3 / 7.5; they sum to 60.5 / 60.9 against a mean `sealed_at` of 63.0 / 63.0 (the floors), so **there is no
+hidden phase**: `par_run` = gap + exec to within a millisecond in every block of both legs.
+
+What the tail is made of (blocks with `sealed_at` >= 72: 209 of 1,405 on D, 219 of 1,415 on F2). Share of the variance
+of `sealed_at` by phase, D / F2: run (gap + exec) 0.54 / 0.65, `sealed_ms` 0.36 / 0.14, commit 0 / 0.11, start 0.03 /
+0.10, freeze inline 0.06 / 0. Inside `sealed_ms`, 83-86% of its variance is `parent_fields_ms` (p90 6-8 ms: the root
+chain is already the seal's tail). In F2 the slow blocks are half long gap (`state_wait` p90 40 ms, and `grandparent` as
+the wait's cause in 61 of 219 against 11 of 209 on D) and half long exec (p90 52 ms, `batch_last_end_us` p90 51 ms).
+
+### 16.2 Why the freeze's work came back in the commit
+
+Fact 1 (the arithmetic). From the batches' end to the seal's start: D = freeze 14 + commit 2 = 16 ms; F2 = commit 16 ms
+with the freeze beside it. The freeze moved to another thread and the seal did not wait for it, yet the commit ends
+when the freeze ends: **`commit_refs_ms` - fold wall = +0.8 ms median (p10 +0.1, p90 +1.5), refs >= the fold's whole
+milliseconds in 1,284 of 1,395 blocks (92%)**; by freeze duration (`index_ms` bucket -> refs median): 0-10 -> 10, 10-13 ->
+13, 13-16 -> 15, 16-20 -> 18, >20 -> 22 ms; D's refs is 1 ms in every bucket. F2P55 reads the same (refs - fold +0.75,
+p90 +1.3). The pass is 1 ms of work when the pool is quiet (D) and finishes ~0.8 ms after the freeze when it is not.
+
+Fact 2 (the freeze is unharmed). Its wall is 14.3 ms on D (alone) and on F2 (beside the commit); `task_max_us` 13.8 / 13.5
+and `task_cpu_max_us` equal it, `task_migrated` 0, `task_nivcsw_max` 0 on both. So nothing slows the freeze and something
+holds the commit: an asymmetry that a bandwidth or SMT explanation cannot make (those slow both sides). Its work is one
+shard task that is 13.5 ms on a 16-task fold (the others end earlier: the build pool burns 12.3 -> 12.5 cores on average,
++0.25 = ~15 core-ms a block, about the freeze's own CPU).
+
+Excluded, with the evidence:
+
+| candidate | verdict |
+| --- | --- |
+| the freeze thread takes a core of the 32 | no. `n42-freeze` blocks in `install`; its tasks run on pool workers. The layer is `taskset` on 208 logical CPUs (`f7_pin`: 7 x 32 - `F7_VAL_CPUS` 16, one layer, physical cores 0-103 with their siblings 128-231) and the whole layer burns 33.5 (D) / 34.5 (F2) / 34.9 (F2P55) cores of them; the pool is 32 threads, `core_layout="off"` |
+| SMT siblings of busy workers | cannot be read from these logs (the thread samples are 5 s sums by name; `n42-freeze` is alive in 2 of 40 samples; no CPU-of-thread trace). At ~34 of 208 CPUs busy it cannot explain a gate that ends with the freeze |
+| a lock both take | none found. The output shards' live locks are taken by the batches only (0 waits, 0 us on D and F2); `freeze` owns the batches' vector (`into_inner`), the freeze thread's `Mutex<Option<OutputShards>>` is taken once at its start; `SHARD_POOL` is off (`N42_SHARD_RECYCLE`); the `built_executions` store is first touched at the seal (offset 56), after the commit; the queue's lanes are not read in the commit |
+| memory bandwidth | no: both sides would slow, and the freeze does not (Fact 2); the refs pass is ~25 MB of lines for 200k slots |
+| the pool is saturated | no: 12.5 of 32 cores on average over the leg, and the freeze holds ~16 tasks of which one runs 13 ms |
+
+The mechanism that fits all of it, **untested**: both jobs run on the one 32-worker `build_pool`, and `slot_refs_and_gas`
+is `par_iter().filter_map().unzip()` under `install`, a tree of rayon joins. A worker that waits in a join for a stolen
+child does not sleep: it takes any job it can find (`find_work`: its deque, then the others', then the injector) and
+cannot return to the join until that job returns. With the freeze's 13.5 ms shard task in the pool, some worker of the
+refs tree takes it while waiting, and the refs `install` cannot finish before that task does: **a latency-critical
+1 ms pass shares a pool with a 13 ms task, and finishes behind it.** It predicts exactly the data: the commit ends just
+after the freeze's slowest task, the freeze is untouched, CPUs are idle, no lock. The same mechanism would let the parent's
+behind-seal pool jobs (graft, receipts, frees, ops-ahead's pool use) hold the child's exec tail (`batch_last_end_us` p90
+51 ms in the slow blocks) and prep. **The cheap test:** put the freeze's `install` on a pool of its own (16 threads out
+of the 174 idle logical CPUs): if the story holds, `commit_refs_ms` falls to 1-2 in F2 and `index_ms` stays 14. The fix
+that does not depend on the story is 16.5 item 1: the seal never runs a pool pass.
+
+### 16.3 What each phase does per block, and what can start earlier
+
+Counts (F2, medians): 200,000 transfers in 400 frames; 58 batches (500-3,500 transfers, 32 workers: 26 workers take two
+batches, six take one); ~192,000 accounts (`merge_accounts`), as many reverts; ~8,200 index conflicts, ~16,500 `drops`,
+36 deferred shard entries (`batch_live_deferred`), 16 shards; `batch_cpu_sum_us` 537 ms (on-CPU share 1.0, so 16.8 ms is
+the 32-worker floor of the execution against 23 measured: 73% efficiency); `batch_minflt` 701 (p90 5,130).
+
+| phase | work | avoidable, or can start before the previous phase ends |
+| --- | --- | --- |
+| start 4 | lanes lock, drain, plan verdict (~0.3 ms), **hand-off wait 3 ms: a 200,000-element compare of the take with the sealed block on the queue pool, after the seal** | the compare is a proof of what `body_matches_pull` + `skipped.is_empty()` already say; do it as an O(1) take at the seal, or run the compare on the pool while the parent executes (the take is fixed once the plan is applied). 3 of the 4 ms |
+| prep 4 | 200,000 transaction clones (~22 MB), senders (4 MB), tips (3.2 MB), keys (8 MB): one pass on 32 workers | none of it depends on the parent: it is a function of the plan. `prepare_next_plan` (12.1) already holds the plan 55 ms ahead (`plan_age_us` 55,253) and builds it in 6.6 ms: build the `BodyAhead` there, keep it with the plan under the same discard rules (`other_build`, `not_on_its_parent`, `take_left`, `gas`, `mined`, `below`, `not_frames`). Tips: at the fee credit, behind the seal |
+| gap 3 | partition by sender (~160k small vectors, 1 ms), the state open (0.2-0.6, p90 4), the 94 MB slot array allocated and touched (estimate 1-1.5, not timed alone) | partition and `batch_groups` are functions of the keys: with the plan. The slot array: two arenas used alternately (the previous block's slots are freed on the pool behind its seal) or allocated in the plan-ahead; first touch costs the same, off the path |
+| exec 23 | 537 CPU-ms over 32 workers | balance: 58 equal batches on 32 workers is 1.8 waves (`batch_last_start_us` 11.3 ms, last end 21.9). 64, 96 or 128 batches, largest first, give a makespan within one small batch of 16.8 ms (estimate 18-19). 48 threads read 16 (F2T48) but also moved `par_start` 4 -> 12 and the p99 (10.90): unexplained, so not the lever |
+| freeze 14 | one 13.5 ms shard task: ~36 deferred entries entered (9.3 ms) then ~16,500 conflict sums | off the seal (done); its slowest task is split by shard imbalance: split the heavy shard's entries into two tasks (estimate 14 -> ~8 ms; it matters for `Complete` and the graft's start, not the seal) |
+| commit 2 (16) | 200,000 `OnceLock::get` + gas sum into a `Vec<&BuiltTransfer>` | the seal needs `executed_count` (= candidates when nothing was skipped) and `executed_gas`; both are known per batch (`txs` and each transfer's `gas_used` are in the batch's hand). Sum them from the batches' results (58 integers); build the refs vector behind the seal beside the receipts job, which already builds it again serially (`receipts_job`: `slots.iter().filter_map(OnceLock::get).collect()`) |
+| `tx_root` 2 | 200,000 hashes copied into a vector, serial | take the hashes in the prep/plan pass (the pooled transaction holds its hash from ingest) |
+| remember 3 | a free of ~190k-account bundle, 200k receipts and hashed state, inline under the store mutex | move the evicted entry out of the lock and drop it on a background thread (the same as the shard recycle does): 3 ms, and the lock hold with it |
+| fields wait 0 (p90 6-8) | parent's `seal_to_fields_us` 46.9 ms median, 60.8 p90 | needs the root chain: 16.5 "the floor" |
+
+The behind-seal graft (`par_fold` - commit, 4-5 ms; `seal_to_finish_us` 11.7 ms) is the parent's own chain: it matters
+only through `seal_to_fields`.
+
+### 16.4 The plan, ranked
+
+Baseline for the savings: F2 `sealed_at` 61 = start 4 + prep 4 + gap 3 + exec 23 + (commit 16) + seal 6, minus floors. All
+savings are estimates unless stated.
+
+| # | change | phase | mechanism | saving | risk | equality test |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | **seal on the batches' counters; no pool pass on the seal's path** (`N42_SEAL_ON_COUNTS=1`) | commit 16 -> ~1 | `executed_count` and `executed_gas` summed from the batches' results; the seal runs when the batches end (with `skipped` empty and the count = candidates, else today's refs pass); refs vector, receipts, fees and graft behind the seal. With the freeze on its own thread (already built) the seal then does not meet the freeze at all. Also removes the D-style inline 14 ms for anyone without the freeze switch | **-14 to -15 ms** (measured arithmetic: the commit is 16 in F2, 2 in D with a quiet pool) | low-medium: the behind-seal jobs now start with the freeze and the graft on the same pool, so `seal_to_fields` can grow by the same nested-steal delay (watch `seal_to_view_us`, `seal_to_fields_us`, 45-46 ms); fall back is the old path | `seal_on_counts_equals_the_refs_pass` (engine-types: random blocks with failures and skipped senders: count, gas, body, receipts, header and block hash equal); the n42-h2-el-rpc `build_chain` and the replay legs: block hashes equal the F2 legs' on the same replay (`F7_FLOOD_REPLAY`), `fields_mismatches` 0 with `N42_FIELDS_AT_SEAL=verify`, `fleet7-verify` clean |
+| 2 | **the child's start, prep and gap into the plan-ahead; hand-off by construction** | start 4, prep 4, gap 3 -> ~1 + ~0.5 + ~1.5 | (a) the take's hand-off an O(1) move at the seal; (b) `BodyAhead` (+ the 400-frame layout and the transaction-hash vector) built with the plan; (c) partition + `batch_groups` + slot arena with the plan; tips behind the seal | **-7 to -8 ms** (start -3, prep -4, gap -1.5; the state open, 0.2-0.6 median, stays) | medium: the plan has to carry the prepared body under the existing discard rules; RSS +~35 MB; the plan's age is 55 ms and shrinks with the cycle (at 40 ms still ahead of its use by ~30 ms: the prep takes 7 ms) | extend `ahead_tests.rs`: a chain of blocks on prepared bodies equals the fresh path block by block (hashes) at four gas limits; each discard reason discards the body too; `body_made_with_the_plan_equals_body_made_at_start` |
+| 3 | **the seal's own 6 ms**: eviction drop off the thread, hashes ahead | remember 3, `tx_root` 2 -> ~0 + ~0 | `make_room` hands the evicted entry to a background thread after the lock is released; the hash vector comes from the prep pass | **-5 ms** (remember is exactly the `remember_pending` call: `seal_remember_ms` 3, p90 5; `tx_root_ms` 2) | low | `an_evicted_entry_is_dropped_off_the_lock_and_the_store_is_the_same` (the store's contents and order after N puts equal the inline eviction's); `hash_vector_from_prep_equals_the_seal_collect`; block hash equal |
+| 4 | **balance the execution**: 96-128 batches, largest first | exec 23 -> ~18-19 | `batch_groups` closes batches at `total / (workers x k)`, dispatched longest first (LPT) so no worker starts a second wave behind a 14 ms batch; each batch still opens its own view (+~0.2 ms CPU a batch: 12 ms summed at 58, ~26 at 128) | **-4 to -5 ms** (16.8 ms is the floor at 32 workers; 23 now) | medium: more opens and more live-index hand-overs per block (D's defer removes the lock wait; re-read `shard_append_ms`, `batch_minflt`) | the block's state and receipts do not depend on batch boundaries: a property test of `batch_groups` (every group once, in order within a sender) plus `execute_for_build_dispatch` equal to the serial executor over random blocks, as the existing one-wave tests do |
+| 5 | **a pool of its own for the behind-seal and freeze work** (`N42_BEHIND_POOL_THREADS=16-24`; `n42-core-layout` isolate is the existing way to give the build pool cores) | tails | freeze, graft, receipts, frees and ops-ahead's parallel work never share the 32 workers of exec, prep and the seal's passes | median ~0 after 1; **p90 -3 to -5 ms** (exec p90 29 -> ~24, F2's slow blocks: half are exec tails, half the parent's wait) and a lower mean (63.0 vs 61) | low: CPU is free (34 of 208), only thread count and RSS | `a_freeze_on_its_own_pool_equals_the_inline_freeze` (the existing 1/16/64-shard cases, with the pool a parameter); the 16.2 test leg |
+
+Order of work: 1 (and the 16.2 leg first, it costs one run and tells whether the nested-steal story holds), then 3 (an
+afternoon), 2, 4, 5. Items 1, 3 and 5 touch scheduling only; 2 and 4 touch what is prepared when, never what is built.
+
+### 16.5 The floor, and whether 40 ms is in reach
+
+After 1-4 (estimates): start 1 + prep 0.5 + gap 1.5 + exec 18.5 + join 0.5 + commit 1 + seal ~2 (header, block, hook; the
+fields wait is 0 at the median) = **~26-27 ms at the median, p90 ~36-38** (today 61 / 75). **A 40 ms seal at 200,000 is
+within reach with no structural change**, with ~10 ms in hand for the tail. Items 1 alone give ~46-47.
+
+**A 40 ms cycle is not.** The child's header carries the parent's execution, so the child's seal waits for the parent's
+`seal_to_fields_us`: 45-46 ms in F2 (46.9 median over the 1,415 full blocks, p90 60.8) + ~5 ms for the header, block and
+hook = a cycle floor of ~51 ms however fast the seal is. With 1-4 and nothing else the cycle at 200k is ~51 ms (~3.9M TPS,
+estimate); at 250k-transaction blocks and 50 ms the chain grows with the accounts (~56 ms) and still binds. The chain is
+`seal_to_finish_us` 11.7 (graft scope, receipts, fee credit, finish) + 2.8 to the root job + 30-32 root (apply 24: leaves
+6.8, writes 6.9) + ~1. Taking 10-11 ms off it means halving the finish and the apply: possible in pieces (the receipts job
+is one serial thread, the apply's leaves and writes are 13.7 ms) but not within a plan of five changes.
+
+**The structural change that makes 40 ms (and 5M TPS at 200k) reachable: deferred execution two blocks deep.** Header N
+carries the execution of N-2, not N-1 (`deferredExecutionTime` family, `parent_executed_fields_or_built`, the follower's
+check, the chain-spec rule, `fleet7-verify`, the gov5 header profile if the Go clients are to follow): the root chain then
+has two cycles (75 ms at 40) minus ~5, against 45-46 today, and the seal never waits for it (`parent_fields_ms` p90 6-8
+goes to 0). Equivalent forms: pipelining two blocks' seals on the shard view before the fold (what items 1-2 already do:
+the seal precedes the fold) does not remove the dependency; only the deeper deferral does. What it costs: a longer
+finality-to-state lag by one block, state roots two blocks old in headers (light clients, the mobile verifier read one
+block more), and a consensus-rule change every client must adopt together.
+
+Other bounds at a 40 ms cycle (read from 10.90, not re-measured): persistence 31-37 ms a full block (85-92% busy: the
+next bound after the seal, as 12.5 said at 50); CPU: the layer burns ~34 cores at 61 ms, ~52 at 40 ms of 208; the feed
+has room.
+
+### 16.6 What was not established, and the legs to run
+
+- The nested-steal mechanism of 16.2 is inferred (data fit, rayon's documented behaviour), not observed: no
+  per-worker trace of the refs `install` exists. The leg that decides it is F2 + the freeze on its own pool.
+- `n42-freeze` and SMT placement are not observable in the existing thread samples; `fleet7-offcpu.sh` on an F2 leg
+  (the profiling build) would show who the refs tree's workers ran while it waited.
+- The slot array's allocation (gap) is estimated from its size and `batches_start_us`, not timed alone: one timer
+  around the `install` in `execute_for_build_opts` settles it.
+- F2T48's `par_start` 12 ms (hand-off 6, p90 25) with 48 threads is unexplained; it blocks the cheap route to a faster
+  execution.
+- Legs, in order: F2 + `N42_FREEZE_POOL_THREADS=16` (item 5's switch, build it first: one `commit_refs_ms` read);
+  item 1 on F2; items 1+3; the 40 ms leg only after the two-deep deferral exists. Read per window: `sealed_at` median /
+  p90, `commit_refs_ms`, `index_ms`, `seal_to_view_us`, `seal_to_fields_us`, `parent_fields_ms`, `seal_remember_ms`,
+  `tx_root_ms`, `par_exec_ms`, `batch_last_end_us`, persistence per block and its backlog, `fields_mismatches` 0,
+  `invalid_blocks` 0, `fleet7-verify`.
+
+Ad-hoc parsers over `node0-el.log` (not kept); sources: `/data/blockchain/rust-fleet7-bench/bench-loop343{D,F2,F2T48,F2P55}/node0-el.log`,
+`/data/n42-build/target-n42-rs/fleet-runs/threadcpu-loop343{D,F2,F2P55,FZ}.tsv`.

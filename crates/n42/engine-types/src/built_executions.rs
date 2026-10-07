@@ -113,10 +113,55 @@ const KEEP_FINISHING: usize = 2 * KEEP;
 fn put(built_hash: B256, entry: Entry) {
     let (store, advanced) = store();
     let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
-    store.retain(|(hash, _)| *hash != built_hash);
-    make_room(&mut store);
-    store.push_back((built_hash, entry));
+    let evicted = put_into(&mut store, built_hash, entry);
+    drop(store);
     advanced.notify_all();
+    free_off_path(evicted);
+}
+
+/// [`put`]'s change to the store, returning what left it instead of dropping
+/// it under the store's lock: an evicted `Complete` entry holds a full
+/// block's bundle, receipts and hashed state, whose free was `seal_remember_ms`
+/// 3 ms (p90 5) on the seal's path (`docs/SHARED_EXECUTION_SCOPE.md` 16.3).
+/// The store after it is the store `retain` + [`make_room`] + `push_back`
+/// left: the same entries in the same order.
+fn put_into(store: &mut VecDeque<(B256, Entry)>, built_hash: B256, entry: Entry) -> Vec<Entry> {
+    let mut evicted = Vec::new();
+    while let Some(at) = store.iter().position(|(hash, _)| *hash == built_hash) {
+        if let Some((_, old)) = store.remove(at) {
+            evicted.push(old);
+        }
+    }
+    make_room_into(store, &mut evicted);
+    store.push_back((built_hash, entry));
+    evicted
+}
+
+/// Drops evicted entries on a thread of their own (`n42-built-free`), off
+/// the caller's path and the store's lock; inline if that thread cannot be
+/// had. Nothing reads an entry once it left the store.
+fn free_off_path(evicted: Vec<Entry>) {
+    if evicted.is_empty() {
+        return;
+    }
+    static FREE: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Vec<Entry>>>>> = OnceLock::new();
+    let sender = FREE.get_or_init(|| {
+        let (send, receive) = std::sync::mpsc::channel::<Vec<Entry>>();
+        std::thread::Builder::new()
+            .name("n42-built-free".into())
+            .spawn(move || {
+                while let Ok(entries) = receive.recv() {
+                    drop(entries);
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(send))
+    });
+    let unsent = match sender {
+        Some(sender) => sender.lock().unwrap_or_else(|p| p.into_inner()).send(evicted).err().map(|err| err.0),
+        None => Some(evicted),
+    };
+    drop(unsent);
 }
 
 /// Frees a slot for one more build. A finished build goes first, oldest
@@ -129,6 +174,7 @@ fn put(built_hash: B256, entry: Entry) {
 /// filed finished beside them, and the oldest finishing build was evicted
 /// for the newest. Keeping a finishing entry costs nothing its finish does
 /// not hold anyway.
+#[cfg(test)]
 fn make_room(store: &mut VecDeque<(B256, Entry)>) {
     while store.len() >= KEEP {
         if let Some(at) = store.iter().position(|(_, entry)| entry.stage == Stage::Complete) {
@@ -137,6 +183,22 @@ fn make_room(store: &mut VecDeque<(B256, Entry)>) {
             store.pop_front();
         } else {
             break;
+        }
+    }
+}
+
+/// [`make_room`], the evicted entries handed to `evicted` rather than dropped.
+fn make_room_into(store: &mut VecDeque<(B256, Entry)>, evicted: &mut Vec<Entry>) {
+    while store.len() >= KEEP {
+        let removed = if let Some(at) = store.iter().position(|(_, entry)| entry.stage == Stage::Complete) {
+            store.remove(at)
+        } else if store.len() >= KEEP_FINISHING {
+            store.pop_front()
+        } else {
+            break;
+        };
+        if let Some((_, entry)) = removed {
+            evicted.push(entry);
         }
     }
 }
@@ -602,6 +664,46 @@ mod tests {
         assert_eq!(by_root(Some(B256::repeat_byte(0x55))), None);
         // Without a root the newest of the siblings answers.
         assert_eq!(by_root(None), Some(hb));
+    }
+
+    /// The eviction moved off the store's lock leaves the store the inline
+    /// eviction left -- the same hashes and stages in the same order -- over
+    /// a long run of puts mixing finished and finishing builds and repeats,
+    /// and hands out exactly the entries the inline one dropped.
+    #[test]
+    fn an_evicted_entry_is_dropped_off_the_lock_and_the_store_is_the_same() {
+        use alloy_primitives::U256;
+        let block = built(&header(0x31, 1)).block;
+        let entry = |stage: Stage| Entry { stage, block: Arc::clone(&block), execution: None, shards: None };
+        let mut inline: VecDeque<(B256, Entry)> = VecDeque::new();
+        let mut moved: VecDeque<(B256, Entry)> = VecDeque::new();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut evicted_total = 0usize;
+        for n in 0..400u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            // Some hashes come back (a re-put), most are new.
+            let hash = B256::from(U256::from(if seed % 5 == 0 { seed % 7 } else { 1_000 + n }));
+            let stage = match seed % 4 {
+                0 => Stage::Sealed,
+                1 => Stage::StateReady,
+                _ => Stage::Complete,
+            };
+            let before: usize = inline.len();
+            let replaced = inline.iter().filter(|(h, _)| *h == hash).count();
+            inline.retain(|(h, _)| *h != hash);
+            make_room(&mut inline);
+            let dropped = before - inline.len();
+            inline.push_back((hash, entry(stage)));
+            let evicted = put_into(&mut moved, hash, entry(stage));
+            assert_eq!(evicted.len(), dropped, "put {n}: as many entries leave ({replaced} replaced)");
+            evicted_total += evicted.len();
+            free_off_path(evicted);
+            let keys = |store: &VecDeque<(B256, Entry)>| store.iter().map(|(h, e)| (*h, e.stage)).collect::<Vec<_>>();
+            assert_eq!(keys(&inline), keys(&moved), "put {n}");
+        }
+        assert!(evicted_total > 0);
     }
 
     #[test]

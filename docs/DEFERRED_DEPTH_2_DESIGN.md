@@ -266,3 +266,100 @@ mirror of" the Rust item):
   unchanged.
 - fork digest: `genesis_hash[..4]` (`h2-net/src/status.rs:84`) is gov5's contract; depth cannot be added to it
   without gov5 changing it, so mixed depths are not separated by the transport (section 4.6).
+
+## 3. Timing model
+
+All figures E=1 (one execution layer, 200,000 one-transfer transactions, 3 validators, 400M set) unless stated. **Measured**
+= from BD 10.86-10.90 (loop339-loop343) or SES 15-16; **plan** = SES section 16.4/17 (built, not measured: `sealed_at`
+~24-28 ms with items 1-4); **estimate** = this document. The model is a set of serial chains, each with a period (the
+least time between two consecutive seals that the chain allows); the cycle is the largest period.
+
+### 3.1 What each chain's period is
+
+| chain | what it is | D=1 | D=2 | source |
+| --- | --- | --- | --- | --- |
+| **root chain** | N's seal waits for N-1's fields: `seal_to_fields` + the header, block and hook (~5) | **50-51** (45-46 + 5; p90 59-61 + 5) | **off the seal path**; remains as a pipeline stage whose *latency* (45-46) must stay under `2P - 5` (~80) and whose *period* is the root job, below | measured (BD 10.90), SES 16.5 |
+| **build chain** | exec(N) needs N-1's state view: view(N-1) = exec_end(N-1) + V; then gap, then exec | 41 (estimate) | 41 (estimate) | below |
+| **root job** | N's QMDB root runs on N-1's tree: serial per block | 30-32 | 30-32 | measured (`roots_ms` 30-32 on F2) |
+| **persistence** | one thread, back to back | 31-37 | 31-37 | measured (BD 10.87, 10.90: 31.6-33.4) |
+| **vote road** | proposal -> check -> R1 -> PrepareQC -> R2 -> Decide -> next proposal (the next proposal waits for the previous Decide) | not binding at 52-62 ms cycles | **unmeasured below 52 ms** | components: slowest key's vote delay 26 median / 52 p90 (BD 10.90), vote-to-commit transit 17-20, commit-to-proposal 6-8, send 2.5 (IS 11.1, 163k) |
+| **tick** | `F7_BLOCK_INTERVAL_MS` pacing | 60 (set by the leg) | set to 0 or under the floor for the leg | |
+| **landing** | the engine lands a block ~2 cycles after its seal (`Complete` +105, hand-off ~30, commit ~17) and a build can stack only `N42_LEADER_LAYERS` (<= 4) unlanded layers | | binds when `landing / layers` exceeds the cycle | SES 8.2; estimate below |
+
+**The build chain, derived.** After SES 17's items 1-4 the seal comes at the batches' end plus ~3 ms (commit on counters,
+tx root, fields wait 0, header). What the next block's execution waits for is not the seal but N-1's *state view*: the
+shards frozen (`index_ms` 13-15 measured, one slow shard task of 13.5 ms) and laid with the residual (the graft scope,
+receipts-from-slots, the fee credit and the executor's finish: `seal_to_finish_us` 11.8 measured in the D ordering,
+`seal_to_view_us` 12.7). With the freeze on its own thread the two overlap only in part (the graft joins the freeze
+where it first reads the shards). So **V = exec_end -> view is 18-28 ms (central 23, estimate)**; the task's "~25 ms
+after the seal" is the upper end (seal + 25 = exec_end + 28). Then
+
+    P_build = V + gap (~1: state open, `gap_before_exec` after item 2) + exec (18.5 after item 4; 23 today)
+            = 38-48, central ~42 ms (estimate)
+
+Today the seal (60-61) hides all of this; after section 17 the seal is no longer the long pole and this chain, the one
+the claim in section 2.1 says stays sequential, is. **The root chain's removal does not make the cycle 27 ms; it makes
+the build chain the floor.** Levers on V and exec, in order of size (all estimates): split the heavy shard task (SES 16.3:
+14 -> ~8 ms), keep only the part of the graft the next exec reads on the critical path (the receipts and the fee
+credit are behind it), 96-128 batches largest first (exec 23 -> 18.5, built).
+
+### 3.2 The expected floor and rate, 200k
+
+| | D=1 after SES 17 | D=2 |
+| --- | --- | --- |
+| seal (`sealed_at`) | 24-28 median | 24-28 median |
+| root chain on the seal path | 50-51 | 0 |
+| build chain | 38-48 | 38-48 |
+| persistence / root job | 33 / 31 | 33 / 31 |
+| vote road | unmeasured, not binding | unmeasured; 35-50 (components) |
+| **cycle (largest period)** | **~51 ms** (SES 16.5 states it) | **~42-45 ms; range 38-50** |
+| rate at 200,000 | ~3.9M (SES) | **~4.4-4.8M; range 4.0-5.3M** |
+
+Reading: D=2 moves the floor from the root chain (51) to the build chain (~42) with the vote road (35-50, unmeasured)
+possibly just above it. That is a **+10 to +20% rate, not +30%**; the 5M goal at 200k needs a 40 ms cycle: it is at the
+optimistic end (V = 18 and a vote road under 38) and not the expectation. Reaching it needs one or two of the levers
+above in addition. After D=2 the next things that bind, in this order (estimates): the build chain's V, then the vote
+road (`proposal -> Decide` has never been read at pacing 0 and 40-45 ms), then persistence (33 of 42 ms is 79% busy;
+a 5% backlog growth fills the 48-block throttle in ~2 minutes), then landing (3.4).
+
+### 3.3 400k-transaction blocks
+
+Scaling rules (estimates): execution and the per-account passes double; the root job's apply (24 of 31 at 200k) grows
+with the accounts touched (~192k -> ~384k); persistence ~66 (BD 10.86: 60-68 ms at 200k *before* the static-file
+switches, 31-37 after, so 62-74 at 400k); the check doubles; the tick and the fixed 5-6 ms of the seal path do not.
+
+| | D=1 after SES 17 | D=2 |
+| --- | --- | --- |
+| seal | ~45 | ~45 |
+| root chain on the seal path | ~91 (finish 24 + 3 + root ~58 + 1, + 5) | 0 |
+| build chain: V + gap + exec | | 28-52 (central 40) + 2 + 37 = 65-90, central ~79 |
+| persistence / root job | 66 / 58 | 66 / 58 |
+| vote road | | 60-100 |
+| **cycle** | **~91 ms** | **~80 ms; range 66-100** |
+| rate at 400,000 | **~4.4M** | **~5.0M; range 4.0-6.0M** |
+
+At 400k the gain is the same ~14% but the rate is higher at equal cycle ratio because the fixed costs amortise, so
+**5M is the central estimate at 400k and the optimistic one at 200k**. Persistence (66-74) and the root job (~58) sit
+at 70-90% of the D=2 cycle and are the next bound at once; a chain that wants more than ~5M at 400k needs the
+persistence and root job work (BD 10.87 "the next bound") as much as D=2.
+
+### 3.4 The landing bound D=2 exposes (estimate)
+
+A build of N lays N-1 (and with `N42_LEADER_LAYERS` = 3 or 4, N-2, N-3) over the engine's state at the nearest landed
+ancestor. A block lands ~2 cycles after its seal at today's cycle (SES 8.2): about 120-150 ms. At 42 ms that is 3-4
+unlanded blocks, so the stack the build needs is 4-5 deep against a cap of 4 (`LEADER_LAYERS_MAX`) and the follower's
+`PARENT_OUTPUTS_KEPT` 4. The rule of thumb: `landing / layers <= cycle`, i.e. 150 / 4 = 37 ms. Counters that read it
+already exist: `great_grandparent_missing`, `grandparent_ms`, `grandparent_layer` on the build line,
+`decline_on_output` on the follower's. If they rise the fix is a deeper stack (raise the cap to 6) or a faster
+hand-off, not a rule change. It is a consequence of the faster cycle, not of the depth.
+
+### 3.5 What the model cannot see
+
+The execution of N runs while N-1's behind-seal jobs (freeze, graft, receipts, root ops) still use the 32-worker
+build pool; section 16.2's nested-steal story says a latency-critical pass can finish behind a long task of another
+job. Items 5 and 1 of SES 16.4 (a pool of its own for behind-seal work) are therefore *more* valuable at D=2 than
+before: the child's exec now overlaps its parent's whole behind-seal tail every block instead of half of them. CPU:
+the layer burned ~34 cores at 61 ms and ~52 at 40 ms (SES 16.5) of 208; at 42 ms ~50. E=3 (independent execution
+layers, one per validator) is not modelled: a follower's chain is the same exec -> view -> exec on its own hardware
+plus the check; at D=1 the 3-node follower's import was 38-40 ms median (E=1 layer, own-import) and 275 ms in the
+older seven-node rounds; a D=2 E=3 round has to be run before anything is claimed for it.

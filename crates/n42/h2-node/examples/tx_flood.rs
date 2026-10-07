@@ -267,7 +267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fund(&client, &args, &keys)?;
     }
     if args.replay.is_some() {
-        check_fresh_senders(&client, &args, &keys, chunk)?;
+        check_fresh_senders(&client, &args, &keys)?;
     }
 
     let started = Instant::now();
@@ -1664,18 +1664,17 @@ fn open_replay_set(
     Ok(set)
 }
 
-/// A replay set is valid only where its senders start at nonce 0: reads the
-/// first sender of every worker back and refuses anything else. An RPC that
-/// cannot answer is a warning, not a refusal.
+/// A replay set is valid only where its senders start at nonce 0: reads
+/// every sender back and refuses anything else. An unavailable RPC cannot
+/// establish that a pre-generated nonce sequence is valid, so it refuses too.
 fn check_fresh_senders(
     client: &reqwest::blocking::Client,
     args: &Args,
     keys: &[Signer],
-    chunk: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rpc = &args.rpcs[0];
-    for first in (0..keys.len()).step_by(chunk.max(1)) {
-        let address = keys[first].address();
+    for (first, key) in keys.iter().enumerate() {
+        let address = key.address();
         let body =
             json!({"jsonrpc": "2.0", "id": 1, "method": "eth_getTransactionCount", "params": [address, "latest"]});
         let answer = client
@@ -1700,12 +1699,11 @@ fn check_fresh_senders(
                 .into())
             }
             Err(err) => {
-                eprintln!("WARN replay   : could not read sender {first}'s nonce ({err}); assuming a fresh chain");
-                return Ok(());
+                return Err(format!("REFUSING --replay: could not verify sender {first}'s nonce ({err})").into());
             }
         }
     }
-    println!("replay       : every worker's first sender is at nonce 0");
+    println!("replay       : every sender is at nonce 0");
     Ok(())
 }
 
@@ -2165,6 +2163,38 @@ mod tests {
         args.claim_sender = claim;
         args.chain_id = 1143;
         args
+    }
+
+    #[test]
+    fn replay_nonce_checks_fail_closed_and_check_every_sender() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        for replies in [vec!["0x0", "0x0"], vec!["0x0", "0x1"], vec!["error"]] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+            let mut args = tiny_args("ed25519", 2, false);
+            args.senders = 2;
+            args.conc = 1; // the second sender would escape a per-worker check
+            args.rpcs = vec![format!("http://{}", listener.local_addr().unwrap())];
+            let expected_ok = replies.iter().all(|reply| *reply == "0x0");
+            let server = std::thread::spawn(move || {
+                for reply in replies {
+                    let (mut stream, _) = listener.accept().expect("accept");
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut request = [0; 4096];
+                    stream.read(&mut request).expect("request");
+                    let body = if reply == "error" {
+                        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"unavailable"}}"#.to_string()
+                    } else {
+                        format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{reply}"}}"#)
+                    };
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                }
+            });
+            let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+            let keys: Vec<_> = (0..args.senders).map(|i| derive(args.offset, i, true)).collect();
+            assert_eq!(check_fresh_senders(&client, &args, &keys).is_ok(), expected_ok);
+            server.join().unwrap();
+        }
     }
 
     fn replay_all(args: &Args, dir: &std::path::Path, short: Option<(usize, usize)>) -> Vec<Vec<(usize, Vec<u8>)>> {

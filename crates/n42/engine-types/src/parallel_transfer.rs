@@ -850,6 +850,41 @@ pub fn build_pool() -> &'static rayon::ThreadPool {
     })
 }
 
+/// `N42_FREEZE_POOL=own` (`docs/SHARED_EXECUTION_SCOPE.md` 16.2): the work
+/// behind the seal -- the output shards' freeze (its tasks and the frees it
+/// spawns), the receipts from the slots and the slots' free -- runs on a
+/// small pool of its own ([`behind_pool`]) instead of the build pool, so a
+/// latency-critical pass of the build never finishes behind one of its long
+/// tasks (a rayon worker waiting in a join takes any job it finds). Off by
+/// default: everything stays on [`build_pool`].
+pub fn freeze_pool_own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FREEZE_POOL").is_ok_and(|v| v.trim() == "own"))
+}
+
+/// The pool the work behind the seal runs on: with `N42_FREEZE_POOL=own` a
+/// pool of `N42_FREEZE_POOL_THREADS` threads (16 by default, `n42-behind-*`,
+/// in the layout's build set as the build pool's are), else [`build_pool`].
+/// A pool that cannot be built falls back to [`build_pool`].
+pub fn behind_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    if !freeze_pool_own() {
+        return build_pool();
+    }
+    let own = POOL.get_or_init(|| {
+        let threads =
+            std::env::var("N42_FREEZE_POOL_THREADS").ok().and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0).unwrap_or(16);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("n42-behind-{i}"))
+            .start_handler(|_| n42_core_layout::enter(n42_core_layout::Set::Build))
+            .build()
+            .inspect_err(|err| tracing::warn!(target: "payload_builder", %err, "no pool of its own for the freeze; the build pool takes it"))
+            .ok()
+    });
+    own.as_ref().unwrap_or_else(|| build_pool())
+}
+
 /// Whether the leader's parallel build reads the block's accounts ahead of
 /// its execution (`N42_BUILD_PREFETCH=1`, [`WarmAccounts`]): each batch the
 /// puller hands over is read on the worker pool while the pull and the prep

@@ -2193,7 +2193,7 @@ where
                             direct_receipts = Some((receipts_from_slots(refs, &cumulative, &cands), tx_gas));
                             // The slots' 77 MB are freed on the pool, off this thread.
                             let slots = std::mem::take(&mut run.slots);
-                            crate::parallel_transfer::build_pool().spawn(move || drop(slots));
+                            crate::parallel_transfer::behind_pool().spawn(move || drop(slots));
                         } else {
                             receipts_behind = true;
                         }
@@ -2384,7 +2384,14 @@ where
                             scope.spawn(move || {
                                 let refs: Vec<_> = slots.iter().filter_map(std::sync::OnceLock::get).collect();
                                 let (cumulative, tx_gas) = cumulative_gas(&refs);
-                                (receipts_from_slots(&refs, &cumulative, pulled), tx_gas)
+                                // `N42_FREEZE_POOL=own`: the receipts on the
+                                // pool behind the seal; the global pool else.
+                                let receipts = if crate::parallel_transfer::freeze_pool_own() {
+                                    crate::parallel_transfer::behind_pool().install(|| receipts_from_slots(&refs, &cumulative, pulled))
+                                } else {
+                                    receipts_from_slots(&refs, &cumulative, pulled)
+                                };
+                                (receipts, tx_gas)
                             })
                         });
                         let root = (sealing_early && sealed_ahead.is_none() && frame_plan.is_none()).then(|| match direct_body.as_ref() {
@@ -2459,7 +2466,7 @@ where
                         direct_receipts = Some((receipts, tx_gas));
                         // The slots' 77 MB are freed on the pool, off this thread.
                         let slots = std::mem::take(&mut run.slots);
-                        crate::parallel_transfer::build_pool().spawn(move || drop(slots));
+                        crate::parallel_transfer::behind_pool().spawn(move || drop(slots));
                     }
                     let graft = graft
                         .ok_or_else(|| {
@@ -3597,6 +3604,9 @@ where
                     // from the seal; 0 = before it), and how long its join
                     // behind the seal waited.
                     freeze_late = freeze_late_used,
+                    // `N42_FREEZE_POOL=own`: the freeze, the receipts and the
+                    // frees behind the seal ran on a pool of their own.
+                    freeze_pool_own = crate::parallel_transfer::freeze_pool_own(),
                     seal_to_frozen_us = crate::fields_at_seal::us_between(sealed_instant, freeze_ended_at),
                     freeze_join_wait_us,
                     // `N42_STATE_AFTER_PULL=1` (plan v6 G3): the parent's state

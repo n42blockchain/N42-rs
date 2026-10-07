@@ -675,6 +675,14 @@ impl OutputShards {
     /// of their reverts is the same parent value. The batches' maps are
     /// freed on the pool afterwards, off the caller's path.
     pub fn freeze(self) -> FrozenShards {
+        self.freeze_on(crate::parallel_transfer::behind_pool())
+    }
+
+    /// [`Self::freeze`] with its tasks and its frees on `pool`: the build
+    /// pool by default, a pool of its own with `N42_FREEZE_POOL=own`
+    /// ([`crate::parallel_transfer::behind_pool`]). The pool decides only
+    /// where the tasks run; the frozen shards are the same.
+    pub fn freeze_on(self, pool: &rayon::ThreadPool) -> FrozenShards {
         let at = std::time::Instant::now();
         let beneficiary = self.beneficiary;
         let count = self.count;
@@ -687,9 +695,9 @@ impl OutputShards {
             let entered = batches.iter().enumerate().all(|(i, batch)| batch.live_id == i);
             if let (Some(live), true) = (self.live, entered) {
                 let parts = live.into_iter().map(|part| part.into_inner().unwrap_or_else(PoisonError::into_inner)).collect();
-                return freeze_live(at, beneficiary, count, batches, contracts, self.append_ns.into_inner(), parts);
+                return freeze_live(pool, at, beneficiary, count, batches, contracts, self.append_ns.into_inner(), parts);
             }
-            return freeze_indexed(at, beneficiary, count, batches, contracts, self.append_ns.into_inner());
+            return freeze_indexed(pool, at, beneficiary, count, batches, contracts, self.append_ns.into_inner());
         }
         let transposed = std::time::Instant::now();
         let batches_ref = &batches;
@@ -713,12 +721,12 @@ impl OutputShards {
         };
         let folded: Vec<(Shard, TaskCost)> = {
             use rayon::prelude::*;
-            crate::parallel_transfer::build_pool().install(|| (0..count).into_par_iter().map(fold).collect())
+            pool.install(|| (0..count).into_par_iter().map(fold).collect())
         };
         let done = std::time::Instant::now();
         // Freed on the pool, a job a batch, off the caller's path.
         for batch in batches {
-            crate::parallel_transfer::build_pool().spawn(move || drop(batch));
+            pool.spawn(move || drop(batch));
         }
         let split = fold_split(folded.iter().map(|(_, cost)| cost), at, transposed, done);
         let shards: Vec<Shard> = folded.into_iter().map(|(shard, _)| shard).collect();
@@ -840,6 +848,7 @@ fn log_folded(fold_ns: u64, split: &FoldSplit, index: Option<(u64, usize)>, live
 /// After the tasks the conflicting accounts are taken out of the batches'
 /// maps, so every account lives in exactly one place.
 fn freeze_indexed(
+    pool: &rayon::ThreadPool,
     at: std::time::Instant,
     beneficiary: Address,
     count: usize,
@@ -895,17 +904,19 @@ fn freeze_indexed(
     };
     let built: Vec<(IndexPart, TaskCost)> = {
         use rayon::prelude::*;
-        crate::parallel_transfer::build_pool().install(|| (0..count).into_par_iter().map(build).collect())
+        pool.install(|| (0..count).into_par_iter().map(build).collect())
     };
     let done = std::time::Instant::now();
-    finish_indexed(at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, None)
+    finish_indexed(pool, at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, None)
 }
 
 /// The live index's freeze ([`output_index_live`]): the indexes and kept
 /// reverts are built; what is left is the conflicting accounts' sums, one
 /// task a shard with any, in `drops` order -- the first batch's account
 /// cloned, every later one's change added, as [`freeze_indexed`] does.
+#[allow(clippy::too_many_arguments)]
 fn freeze_live(
+    pool: &rayon::ThreadPool,
     at: std::time::Instant,
     beneficiary: Address,
     count: usize,
@@ -963,8 +974,7 @@ fn freeze_live(
         use rayon::prelude::*;
         if any_pending || parts.iter().any(|part| !part.drops.is_empty()) {
             let work: Vec<(IndexPart, Vec<u16>)> = parts.into_iter().zip(pending).collect();
-            crate::parallel_transfer::build_pool()
-                .install(|| work.into_par_iter().enumerate().map(|(shard, item)| sum(item, shard)).collect())
+            pool.install(|| work.into_par_iter().enumerate().map(|(shard, item)| sum(item, shard)).collect())
         } else {
             parts.into_iter().map(|part| (part, TaskProbe::start().finish(), (0, 0, 0))).collect()
         }
@@ -981,7 +991,7 @@ fn freeze_live(
         })
         .collect();
     let pending = (pending_max, pending_us_max, drops_max);
-    finish_indexed(at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, Some(pending))
+    finish_indexed(pool, at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, Some(pending))
 }
 
 /// What both index freezes end with: the batches' maps kept as the output,
@@ -989,6 +999,7 @@ fn freeze_live(
 /// beneficiary's credit summed.
 #[allow(clippy::too_many_arguments)]
 fn finish_indexed(
+    pool: &rayon::ThreadPool,
     at: std::time::Instant,
     transposed: std::time::Instant,
     done: std::time::Instant,
@@ -1019,7 +1030,7 @@ fn finish_indexed(
         lists.push((batch.addresses, batch.revert_at));
     }
     // The address lists are done with: freed on the pool.
-    crate::parallel_transfer::build_pool().spawn(move || drop(lists));
+    pool.spawn(move || drop(lists));
     let (mut index, mut conflicts, mut kept) =
         (Vec::with_capacity(count), Vec::with_capacity(count), Vec::with_capacity(count));
     let mut conflict_count = 0usize;
@@ -1038,7 +1049,7 @@ fn finish_indexed(
         use rayon::prelude::*;
         let removals: usize = drops_of.iter().map(Vec::len).sum();
         if removals >= 1024 {
-            crate::parallel_transfer::build_pool().install(|| {
+            pool.install(|| {
                 kept_batches.par_iter_mut().zip(drops_of.par_iter()).for_each(|(batch, list)| {
                     for address in list {
                         batch.accounts.remove(address);

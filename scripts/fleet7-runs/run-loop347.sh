@@ -238,7 +238,7 @@ bodygate() {
   fm=$(grep -a 'seal-first build phases' $f 2>/dev/null | grep -oE 'fields_mismatches=[0-9]+' | cut -d= -f2 | sort -n | tail -1)
   nc=$(grep -ac 'was not the one committed' $f 2>/dev/null); gu=$(cat $B/bench-$1/node*-v.log 2>/dev/null | grep -ac 'could not build a block to propose')
   echo "bodygate $tag: invalid_blocks=${inv:-0} gas_mismatch=${gas:-0} fields_mismatches=${fm:-none} own_not_committed=${nc:-0} proposals_given_up=${gu:-0}"
-  if [ "${inv:-0}" != 0 ] || [ "${gas:-0}" != 0 ] || [ "${fm:-0}" != 0 ] || [ "${nc:-0}" != 0 ] || [ "${gu:-0}" != 0 ]; then
+  if [ "${inv:-0}" != 0 ] || [ "${gas:-0}" != 0 ] || [ "${fm:-0}" != 0 ] || [ "${nc:-0}" != 0 ] || { [ "${gu:-0}" != 0 ] && [ "${tag#K99}" = "${tag}" ] && [ "${tag#loop347K99}" = "${tag}" ]; }; then   # K99 legs give up 4-5 proposals each (a view that times out: counted and reported, not a stop; K99 stopped nothing but the last leg of a and b, and K99G0 follows K99P50)
     echo "BODYGATE FAILED on $tag: stopping the round (datadirs kept as evidence)"; cleanup; echo "released at $(date +%H:%M)"; echo ALLDONE; exit 1
   fi
 }

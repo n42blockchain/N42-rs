@@ -2864,3 +2864,51 @@ Every figure E=1 (one layer, windows from the layer's canonical log, 400M set). 
 **Against 5M.** **No pair holds three windows above 3.5M** (the highest window is BESTb's 3,480,000; the highest 5 s feed sample 3.62M); **a pair above 3.2M in every window: BEST / BESTb at 400k (3.226-3.480M, 3.31-3.39M typical).** The seal is no longer the limit: 49 ms at 200k, 95-100 at 400k (0.245 ms per thousand, i.e. a 4.0M transfers a second ceiling for the seal alone). The cycle floor is the root chain: `seal_to_fields` ~50 ms at 200k and 103-106 ms at 400k (0.25-0.26 ms per thousand, ~3.9M a second) plus the child's wait for it; and the feed (3.3-3.5M delivered) is within 5% of the chain's rate. 5M at 400k needs an 80 ms cycle: the root chain must fall from 104 to under 80 ms (-25%), the seal from 95-100 to ~75, persistence (63-77 ms) to ~60, and the feed above 5M a second: none of the four is there. Deferred execution depth 2 (loop346) is the change that takes the root chain off the cycle.
 
 Files: `scripts/fleet7-runs/{derive345.py,fields345.py,fieldsum345.py,table345.py,ptable345.py,run-loop345{a,b,c,d}.sh,results/loop345*.out}`.
+
+### 10.93 Deferred execution depth 2 (loop346): the seal no longer waits for the parent's root chain (sealed_at 49 -> 41-43 ms, parent_fields_ms 0), but the cycle does not move: 200k holds 3.05-3.17M, 400k 3.2-3.5M; what binds is the vote road tail and the wait for the parent's state shards
+
+Base A is loop345 ALL (200k transfers per block, 60 ms pacing, all seal switches on). Depth 2 is a chain rule (header N carries the execution result of N-2), so depth-2 legs run on `n42_fleet7_bench_d2.json` and depth-1 legs on the usual genesis. E=1, 30 s windows from the first full block.
+
+**Correctness (every depth-2 leg: A2, A2b, A2P50, S400A2, S400A2b, A2X, BEST, BESTb).** `rename_fallbacks` 0 in every build (the totals are 0), `fields_mismatches` 0, `invalid_blocks` 0, no `ParentUnknown`, tc 1, `fleet7-verify` pass. `carried_depth` is 2 on every depth-2 header and 1 on depth 1. The read-back on A2 (receipts of block n end at header n+2's `gasUsed`, the depth rule) is ok. `rename_record_waits` is a cumulative counter (106-139k per 200k leg, 11-33k per 400k leg); it is a count of record look-ups that found the entry still pending, not a time.
+
+**Three bench-tooling notes.** (1) The first read-back and settle checks applied depth-1 rules (receipts end at header n+1; the layer's INFO line `Received invalid forkchoice updated message head=safe=finalized`); fixed in `check340.py` (depth argument) and `settle346.py`. (2) Every validator logs `commit forkchoice ... Too deep reorg (code -38006)` on 1,700-2,100 lines per leg at E=1 at depth 1 as well (A1: 1,684-1,928); it is baseline noise of seven keys on one layer, counted and not a stop. (3) `bench-<tag>/round.txt` accumulates across re-launches; the numbers below are the last window set of each leg. One gate run failed on `n42-h2-consensus` `test_emit_retries_non_block_committed_output_when_channel_is_full` (its retry budget is 1.5 ms and the build was loading the box); it passed 3/3 on rerun and the claim was relaunched.
+
+**Claim 1, 200k at 60 ms (window 1 / 2 / 3, every block full):**
+
+| leg | w1 | w2 | w3 | cycle median |
+| --- | --- | --- | --- | --- |
+| A1 (depth 1) | 3.180M | 3.080M | 3.053M | 61.4 ms |
+| A2 (depth 2) | 3.067M | 3.047M | 2.940M | 61-62 ms |
+| A1b | 3.100M | 3.100M | 3.033M | |
+| A2b | 3.087M | 2.947M | 3.027M | |
+| A2P50 | 3.173M | 3.120M | 2.900M | 53.1 ms |
+| A1P50 | 3.185M | 3.133M | 3.173M | 52.5 ms |
+
+Pairs: window 1 A2/A2b 3.08M against A1/A1b 3.14M, windows 2-3 mean 3.00M against 3.07M. Depth 2 is not ahead at 200k; it is inside the noise, on the low side. At 60 ms the cycle is tick-bound, so there was nothing for a shorter seal to buy. A2P50 stopped the step-down (cycle median 53.1 against a limit of 53); the 45 and 40 ms steps did not run. The first failing test is the cycle itself, at 50 ms: median is tick + 2-3 ms, but the mean cycle is about 62 ms because of a heavy tail (p90 88 ms). A1P50 behaves the same (52.5 median), so the 50 ms floor is the same at depth 1 and depth 2.
+
+**What depth 2 changed, measured.** `sealed_at_ms` 49 -> 41-43 ms; `parent_fields_ms` -> 0 (A1: 4/17); `seal_to_fields_us` unchanged at 52-56 ms. At 50 ms pacing `gap_before_exec_ms` and `state_wait_us` grow from 8-9 ms median (60 ms pacing) to 16-17 ms (p90 57) at A2P50: the seal now outruns the parent's state shards, and the wait moves from the parent's fields to the parent's state.
+
+**Claim 2, 400k (gas 8.4e9, window 1 / 2 / 3):**
+
+| leg | pacing | w1 | w2 | w3 | cycle median |
+| --- | --- | --- | --- | --- | --- |
+| S400A1 | 104 | 3.427M | 3.227M | 3.227M | 106.0 ms |
+| S400A2 | 104 | 3.280M | 3.147M | 3.053M | 107.2 ms |
+| S400A2b | 104 | 3.333M | 3.200M | 3.160M | |
+| A2X (4 windows) | 104 | 3.373M | 3.333M | 3.227M (w4 3.187M) | 119 ms |
+| BEST | 104 | 3.480M | 3.253M | 3.133M | 115-128 ms |
+| BESTb | 104 | 3.253M | 3.280M | 3.187M | 122-126 ms |
+
+The S400A2 gate at 104 ms failed (median 108.7 against a limit of 107), so the floor stayed at 104 and no S400A2P* step ran; A2X, BEST and BESTb are S400A2's configuration. At 400k depth 2 has `sealed_at` 101-105 ms (depth 1: 114-118) and `parent_fields_ms` 0, but `gap_before_exec_ms` rises to 56-59 (p90 118-128), `seal_to_fields_us` to 122-130 ms and `par_fold`/`index_ms` to 46-53: the same work now waits for the parent's state, so depth 2 buys on the seal what it loses in the wait. Peak RSS 41.8-41.9 G, in-memory blocks max 10-11. Persistence per block 67-78 ms at 400k (BESTb), backlog flat (it grows with the window, 67 -> 78 ms, qmdb 26 -> 46 ms).
+
+**Vote road and tenure handover.** Proposal to quorum: median 11 ms, p90 63 ms at 200k/50 ms (A1P50 60), 112-124 ms at 400k (BEST 116, BESTb 121). Slowest key's vote delay: about 27-33 median, 76 p90 at 200k. Handover at view 1024 is clean in every depth-2 leg (no `ParentUnknown`, `rename_fallbacks` 0, tc 1; the incoming leader got the grandparent's fields from the alias table: block 1024 `parent_fields_ms` 0): proposal intervals at 1024-1025 were 97-154 ms in most 200k legs, 105 ms (A2), 295 ms (A2b), 228/300 ms and a 1,205 ms interval at view 1027 (BEST), 138 ms (BESTb). The long intervals are present at depth 1 too (A1 246/228 ms), so they belong to the tenure change, not to depth 2.
+
+**Settlement tags (A2).** `latest = safe = finalized` at every sample, i.e. the tags equal the tip at E=1 because the FCUs carry head=safe=finalized. The expected "safe two behind, finalized behind" cannot be observed in this configuration; it needs a settlement-tags leg with E=7 (not run). No `-38002` and no refusal.
+
+**Answers.**
+- Did the cycle break below 51 ms? No. 200k at 50 ms reads 53.1 ms (A2P50), the same as depth 1 (52.5, A1P50). The 45/40 steps did not qualify.
+- What binds now? Not the parent's fields (0 ms) and not the seal (41-43 ms at 200k). Two things: the tail of the vote road (proposal to quorum p90 63 ms at 200k, 112-124 ms at 400k, against a median of 11), which is why the mean cycle is 10 ms above the median at 50 ms pacing; and the wait for the parent's state shards (`gap_before_exec` / `state_wait`, 16-17 ms median at 200k/50 ms, 56-59 ms at 400k), which depth 2 exposed because the seal no longer waits for the fields.
+- Pairs: no pair holds all three windows above 4M or above 3.5M. At 200k no pair is above 3.2M in all three windows (A1/A1b 3.18/3.08/3.05 and 3.10/3.10/3.03; A2/A2b lower). At 400k the best pair, S400A1 plus the depth-1 line, holds 3.43/3.23/3.23M; BEST/BESTb (depth 2) hold 3.25-3.48 / 3.25-3.28 / 3.13-3.19M, so only window 1 exceeds 3.4M and no depth-2 pair holds three windows above 3.2M (BESTb does: 3.25/3.28/3.19 is just under in w3).
+- Rate against 5M: 200k reads 3.0-3.2M (60-64% of 5M) and 400k 3.2-3.5M (64-70%). Best single window 3.48M (BEST w1), 70% of 5M. Depth 2 is not the lever that closes the gap on this box; the next target is the vote road tail and the parent-state wait.
+
+Hand-off files: `scripts/fleet7-runs/results/loop346{a,b,c}.out`, the stopped-run outputs and the read-back/settle outputs beside them.

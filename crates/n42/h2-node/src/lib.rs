@@ -21,6 +21,7 @@
 pub mod build_throttle;
 pub mod persistence;
 pub mod service;
+pub mod straggler;
 pub mod tx_source;
 
 pub mod body_channel;

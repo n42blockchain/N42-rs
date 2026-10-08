@@ -1689,3 +1689,129 @@ which matters only when the proposals are commit-bound, i.e. after item 1 only i
 Instrumentation to add first (cheap): log `landing` events per block (arrival of the import request, hand-off start, fork-move
 start/end, engine insert start/end) so 18.3's c2h split needs no join; per-shard entry counts of the freeze (is the heavy shard a
 property of the address derivation?); the canonical notification's wake latency in `grandparent_state`.
+
+## 19. Section 18's items 1-4, built (2026-10-07, code only, no fleet leg)
+
+Each item behind its own switch, default off; with every switch off each path is the one before (the existing tests and
+the new equality tests pin it). With every switch on, block contents, roots, bundles, votes and everything validators
+exchange are unchanged: the switches change when and where the same values are made, and which request carries a check
+the execution layer already makes. Savings are estimates from section 18's timeline, not measurements.
+
+### 19.1 What was built
+
+| item | commit | switch (process) | what it does | expected (estimate) |
+| --- | --- | --- | --- | --- |
+| 1 | dc40c0a3c | `N42_CHECK_BEFORE_SLOT=1` (validator; the execution layer serves the request always) | a deferred block queued behind busy import slots sends its sealed header as a `CHECK_ONLY` raw request (kind 10). The layer answers one CHECKED frame (VALID, naming the header's hash) when the header is one of its kept builds (`is_own_build`, the same check the body roads answer CHECKED with) or the import-once registry holds another request's check of that hash (`Registry::is_checked`); else one ERROR frame. Nothing is imported, held, claimed or registered. The driver releases the vote only on a VALID answer naming exactly the block (`vouches_for`); the import stays in the queue, in order, under the slot bound, and its own later check releases no second vote (`first_check`, 64 hashes kept) | vote delay 31.7 -> ~3 ms (200k), 80 -> ~3 (400k); proposal-to-commit ~12 ms; send-started builds (14%) vanish: mean cycle 65 -> ~61 (200k), 126 -> ~121 (400k) |
+| 1 | 6008a5e6d | always (observability) | the "proposal sent" line carries running `build_starts_seal` / `_send` / `_commit` / `_other`, so a leg reads the one-ahead rule's send share from its last line | - |
+| 2 | 099f5ec1b | `N42_LEADER_LAYERS` 2..=8 (layer) | the cap was 4 (`DEPTHS`); nothing else bounded it: layers live in `leader_layers::KEPT` from their child's first open, not in the build store (`built_executions` `KEEP` 3 holds builds until their hand-off; the six-layer test files six builds through it), and `PARENT_OUTPUTS_KEPT` is the follower's own stack (already `N42_PARENT_OUTPUTS_KEPT` 2..=16). Memory: `leader_layers::held()` and `open_kept_accounts` on the open's split (accounts in the kept shard sets and bundles; ~260 B an account, so ~50 MB a layer at 200k). The anchor N-7 must still be in the engine's in-memory tree: `--engine.memory-block-buffer-target` 6 (the fleet default) covers six layers at a canonical lag of ~4 | anchor wait mean 16.3 -> ~1 (200k), 23.2 -> ~2 (400k); read-through +3 / +6-8 ms exec; net ~-12 / -15 ms |
+| 3 | 01235ca8e | `N42_MERGE_AT_SHARDS_READY=1`, `N42_MERGE_POOL_THREADS` (16) (layer) | the leader's shard merge starts at `shards_ready` on `n42-merge-*` (`FrozenShards::merged_on`: each source map, a v4 shard or a batch's map or a shard's conflicts, cloned with the residual laid over on a task; the copies inserted in the serial merge's source order; reverts copied per source and sorted as before; map and reverts at once), instead of after the fields' publication on one thread | merge 58 -> ~12-15 ms, ending at seal + ~33 (200k), before the fields (54): `Complete` 114 -> ~56 (fields + hashed), L -55 ms; 400k: merge 131 -> ~30, `Complete` 267 -> ~132, L ~-130 |
+| 4a | 213a6e362 | `N42_SHARDS_BEFORE_RECEIPTS=1` (layer) | on a block sealed at the execution's end with its output in its shards, the receipts from the slots are built on `n42-receipts-late`, which owns its inputs (the slots moved, the candidates shared in an `Arc`), instead of in the graft's scope; the scope ends with the freeze join and `take_cached`, the executor's finish follows, and `shards_ready` is filed. The receipts join the block's result where they are first read (the receipts-root thread beside the QMDB root) | output wait -4.2 ms (200k), -5.9 (400k) |
+| 4b | f24ada784 | `N42_FREEZE_SPLIT=<k>` (1; at most 8) (layer) | the live freeze's heavy shard (work = deferred batches' addresses entered + occurrences summed; split when >= 2,048 and >= 1.5x the mean) is worked on by k tasks, one sub-range of its addresses each (bytes 2-3; the shard is bytes 0-1) | freeze 14 -> ~6-8 ms at k=4 (200k), 50 -> ~20-25 (400k); output wait follows |
+
+All five on (estimate, 200k at 42-45 ms pacing): the vote leaves the slot (item 1), the anchor is canonical when the build
+opens (item 2), L drops by ~55 ms so the slot's service time falls under `C c` (item 3), and the output wait shrinks from
+~9 to ~3 ms (item 4): section 18.8's floor of 42 ms (38-50) is what the first leg should test.
+
+### 19.2 `N42_VOTE_BEFORE_SLOT`: a new switch, not a compatible old one
+
+`N42_VOTE_BEFORE_SLOT` holds an execution on the layer: the request is prefixed `HOLD_EXECUTION`, the layer assembles and
+checks the body, and then waits for one release byte from the connection that sent it before it executes. Under
+`N42_IMPORT_ONCE` seven keys share the layer and the registry gives each block one owner whose work every other key's
+request waits on. Making the hold compatible would mean deciding whose byte releases a shared execution (the owner's,
+whose key may drop a block another key still needs, or a vote of seven keys' slots that disagree), keeping a second
+registry of releases per hash, and changing when the shared import runs relative to each key's slot order. A check needs
+none of it: at E=1 the block is the layer's own build, the layer's answer depends only on the header, and the import can
+stay on today's road. So the new `N42_CHECK_BEFORE_SLOT` holds nothing, claims nothing in the registry, and composes with
+`N42_IMPORT_ONCE`; the start-up refusal of `N42_VOTE_BEFORE_SLOT` + `N42_IMPORT_ONCE` stays, and `N42_VOTE_BEFORE_SLOT`
+keeps its use where it was built (one key per layer, foreign blocks the layer did not build). A block the layer did not
+build and nobody checked is declined and votes on its import's check, as without the switch (at E>1 every follower's
+blocks are such blocks: one extra loopback round trip each, nothing else). The send-started builds of 18.4 exist only
+because proposals lag their seal behind the gate; `build_starts_send` on the "proposal sent" line shows whether they go.
+
+### 19.3 Item 3: what moved earlier with the merge, and what could not
+
+| step | before | with `N42_MERGE_AT_SHARDS_READY` | why |
+| --- | --- | --- | --- |
+| merge start | after the fields' publication (seal + 54 / 130) | `shards_ready` (seal + ~18 / ~55) | every input is in hand there: the frozen shards, the residual, the graft's reverts. The receipts are not an input of the merge (they are put beside the merged bundle in the output) |
+| merge end | seal + ~114 / ~267 | seal + ~33 / ~85 (estimate) | 16 threads by source map; the inserts into the one map and the reverts' sort remain serial (~8-10 ms at 200k) |
+| `StateReady` | after the merge, after the publication | right after the publication (the merger thread only joins the early merge) | not moved before the publication: a child that opens after `StateReady` reads the full bundle instead of the shards (`wait_for_state` prefers it), and keeping the filing after the fields keeps every reader's order as before |
+| `Complete` (the engine's hand-off, then the executed insert and persistence) | after the merge | after the publication and the hashed post-state | must not move before the publication: the publication files this block's QMDB tree (`qmdb_state.insert`), which the engine's executed insert, persistence and the child's root job read. It sees the same inputs: the same merged bundle, receipts and hashed post-state |
+| the QMDB root, the receipts root, the fields | unchanged | unchanged | the root reads the view, never the merged bundle; the merge pool is not the root's or the build pool |
+| `N42_FIELDS_AT_SEAL=verify` | behind `Complete` | behind `Complete` (earlier with it) | compares the published fields with the merged bundle's operations: the same comparison on the same bundle |
+
+### 19.4 Item 4: what the child needs, and how the heavy shard was split
+
+(a) The child's open reads `ShardedParent { residual, shards }`. The residual is the executor's own changes taken after
+its finish; its `result` is built empty (no receipts, no gas), and the executor's finish does not read the direct
+receipts (they are substituted after it). So filing the shards before the receipts exist is a pure reordering, which
+`a_sharded_parent_opens_the_same_with_or_without_its_receipts` checks on a filed parent: every account the batch or the
+residual wrote, an untouched and an absent one and `BLOCKHASH` read the same with the block's receipts and gas in the
+residual's result and without. The transactions-root job of 18.2 does not run in this path (the counted seal computes
+the root at the seal from the hashes the body carries, `seal_hashes_ahead`): only the receipts join was in the scope.
+
+(b) The heavy shard's two phases, entering the deferred batches (`pending`) and summing the repeated occurrences
+(`drops`), are both per address: an address's index entry, its kept revert and its conflicting sum depend only on the
+batches that wrote it, in batch order. A sub-range of the shard (the address's bytes 2-3, independent of the shard's
+bytes 0-1) is therefore a self-contained job: each task enters the deferred batches' addresses of its sub-range in batch
+order, reading the live index and keeping what it adds in its own map (a newly repeated live address in a list), then
+sums its sub-range's occurrences in the single task's order (the live ones, then the deferred ones); the parts are put
+back into the one shard part (index entries, CONFLICT marks, kept reverts, drops, the size taken off, the conflicting
+sums). The kept reverts' order inside the shard changes (sub-range major), which no reader depends on: the merge sorts the
+reverts by address and `take` scans them. The folded line names the heaviest shard (`heavy_shard`, always on) and its
+work (`heavy_work`), which answers 18.9's question whether the heavy shard is a property of the address derivation: the
+same shard index leg after leg says yes.
+
+### 19.5 Timestamps added on existing lines
+
+| boundary | field | line |
+| --- | --- | --- |
+| vote released relative to the body's arrival | `check_us` (queue entry, body in hand, to the answer) and `vouched` | validator "check ahead of the import slot" (info for large blocks), with `check_ahead_sent` / `_vouched` / `_declined` on "imported a block" |
+| `shards_ready` filed | `seal_to_shards_ready_us` (always) | layer seal-first phases line, beside `seal_to_view_us` |
+| merge start / end | `seal_to_merge_start_us`, `seal_to_merge_end_us` (existing), `merge_early`, `merge_join_wait_us`, `merge_threads` | same line |
+| the receipts past the shards | `receipts_late`, `receipts_late_wait_us` | same line |
+| the heavy shard's task | `task_max_us` (existing), `heavy_shard`, `heavy_work`, `split_tasks`, `pending_us_max` | "output shards folded" |
+| the layers' memory | `open_kept_accounts` | the open's split (`state_wait_on` details) |
+| send-started builds | `build_starts_seal` / `_send` / `_commit` / `_other` | validator "proposal sent" |
+
+### 19.6 Tests and gate
+
+New: `h2-execution` `tests/check_before_slot.rs` (a block behind busy slots voted for on its check-only answer before any
+slot frees, imported in order, voted for once; a CHECKED answer naming another build releases no vote; no request
+without the switch, against a layer that does not serve it, or for a body whose header does not hash to the block);
+`h2-el-rpc` `a_check_only_answer_vouches_only_for_the_block_asked_about` (only a VALID CHECKED naming the asked block
+vouches; another build's hash, ERROR, SYNCING, no channel do not; one connection reused) and
+`a_check_only_request_without_a_channel_vouches_for_nothing`; `n42` `a_check_only_request_vouches_for_a_kept_build_and_nothing_else`
+(a kept build by its gov5-sealed header vouched for with nothing imported, executed, handed off or registered; a
+sibling with another state root, an unknown block and no header refused; a block another key's import checked vouched
+for from the registry); `six_kept_layers_read_as_the_engine_after_it_landed_them` (six layers, bundles and shard sets
+alternating, over the engine at N-7: every account, a slot written twice, a created account, the coinbase from a
+residual, untouched, absent, `BLOCKHASH` of each, equal to the engine after it landed all six; four and three layers
+over the matching deeper engine equal too); `the_merge_on_its_own_pool_equals_the_serial_merge` (1/16/64 shards, every
+index mode and live deferral, 1 and 4 threads, the build pool busy: accounts, contracts, reverts in order, sizes, against
+the serial merge and the direct graft, QMDB operations with and without Prague, hashed post-state; the account map's
+iteration order is no property of either merge: its hasher is seeded per map, two serial merges of the same shards
+iterate differently, and every consumer sorts); `a_sharded_parent_opens_the_same_with_or_without_its_receipts`;
+`a_split_heavy_shard_freezes_as_one_task` (2/4/8 tasks against one at 1/16/64 shards, forced, busy-concurrent and no
+deferral: every address read through the shards, conflicts, accounts, beneficiary, merged bundle against one task and
+the direct graft, QMDB operations, hashed post-state). Gate: `cargo check --workspace`; clippy on the touched crates adds
+no warning on changed lines; `n42-engine-types` lib single-threaded 242 passed (10 ignored) and its integration tests
+(16 in `output_shards`), `n42-h2-execution`, `n42-h2-el-rpc`, `n42-h2-node`, `n42 --lib` single-threaded (137),
+`n42-qmdb-reth` single-threaded (63) pass. Not covered by a unit test: a whole built block's hash with the switches on
+(the payload builder has no harness): the fleet's `fields_mismatches`, `invalid_blocks`, `fleet7-verify` and block hashes
+against A2P50 on the same replay are that check.
+
+### 19.7 Legs to run (18.9's order, one variable each from A2P50 / S400A2)
+
+Validator env: `N42_CHECK_BEFORE_SLOT=1` (with the existing `N42_IMPORT_ONCE=1`, `N42_BODY_ONCE=1`). Layer env:
+`N42_LEADER_LAYERS=6`, `N42_MERGE_AT_SHARDS_READY=1 N42_MERGE_POOL_THREADS=16`, `N42_SHARDS_BEFORE_RECEIPTS=1`,
+`N42_FREEZE_SPLIT=4`.
+1. `N42_LEADER_LAYERS=6` alone: `ggp_missing`, `state_wait_on`, `gp_ms` -> 0, `open_kept_accounts`, exec time; cycle at 50 and 45.
+2. `N42_CHECK_BEFORE_SLOT=1` alone: `check_ahead_vouched` ~ `check_ahead_sent`, `check_us` (expect ~1-3 ms), proposal-to-quorum
+   over full-block views, `build_starts_send` share (14% -> ~0), commit-bound share.
+3. 1 + 2 at pacing 45, 40, 35.
+4. + `N42_MERGE_AT_SHARDS_READY=1`: `merge_early=true`, `seal_to_merge_start_us` ~ `seal_to_shards_ready_us`,
+   `seal_to_merge_end_us` < `seal_to_fields_us`, `merge_join_wait_us` ~0, `seal_to_complete_us` (114 -> ~56), `moved_ms`, L.
+5. + `N42_SHARDS_BEFORE_RECEIPTS=1 N42_FREEZE_SPLIT=4`: `receipts_late=true`, `seal_to_shards_ready_us` (17.5 -> ~13),
+   `receipts_late_wait_us`, `split_tasks`, `task_max_us` (13.6 -> ~6-8), `heavy_shard` stable across legs or not, output wait.
+Correctness on every leg: `fields_mismatches` 0 (one leg with `N42_FIELDS_AT_SEAL=verify`), `invalid_blocks` 0,
+`fleet7-verify` clean, block hashes against A2P50 on the same replay.

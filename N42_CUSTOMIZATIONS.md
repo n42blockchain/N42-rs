@@ -169,7 +169,7 @@
   `merge_reverts_ms`、`merge_append_ms`、`merge_mode`，以前合并时长只在 debug 行里。
 
 ## 出块器链式构建叠放的自建块层数（不改任何 fork 的 reth crate）:
-- `N42_LEADER_LAYERS=2|3|4`（默认 2，即原行为；其他值打印警告并按 2；`N42_GRANDPARENT_SHARDS=0`
+- `N42_LEADER_LAYERS=2..8`（默认 2，即原行为；上限自 2026-10-07 由 4 提到 8，见下文第 18 节条目；其他值打印警告并按 2；`N42_GRANDPARENT_SHARDS=0`
   时为 1，只叠父块；代码在 `crates/n42/engine-types/src/direct_build.rs` 的 `leader_layers` 与
   `opener_on_sealed_parent_with`）：在父块封印时开始的链式构建，把父块及其最近的 `层数-1` 个自建
   祖先（各自的冻结分片 + 残余，或 `StateReady` 后的整 bundle，均在封印哈希下）叠在引擎状态之上，
@@ -402,6 +402,47 @@
   `n42-built-free` 线程上释放（`seal_remember_ms` 3 ms；测试
   `an_evicted_entry_is_dropped_off_the_lock_and_the_store_is_the_same`）；prep 的 `BodyAhead` 与计划块体带上
   交易哈希，seal 的帧布局直接使用而不再收集 20 万个哈希（`tx_root_ms` 2 ms；阶段行 `seal_hashes_ahead`）。
+## E=1 深度 2：投票不等导入槽、更多叠放层、提前合并、分片先于 receipts（不改任何 fork 的 reth crate）:
+`docs/SHARED_EXECUTION_SCOPE.md` 第 18 节计划第 1-4 项，实现记录见第 19 节。全部开关默认关；关闭时每条路径与之前相同；
+打开时块内容、各种根、bundle、投票以及验证者之间交换的一切都不变。
+- `N42_CHECK_BEFORE_SLOT=1`（验证者进程；代码在 `h2-execution` `driver.rs` `spawn_check_ahead` / `first_check`、
+  `el.rs` `ExecutionLayer::check_only` / `checks_only` / `vouches_for`、`raw_engine.rs` `request::CHECK_ONLY`（10），
+  `h2-el-rpc` `engine.rs` `check_only_over_channel`，执行层 `bin/n42/src/payload_serve.rs` `check_only_answer`、
+  `import_once.rs` `Registry::is_checked`）：延迟执行下导入槽全占时排队的块，除照旧排队外，立即把封印头部作为
+  只检查请求发给执行层；执行层仅当该头部是自己保存的构建（`is_own_build`，与 body 路径答复 CHECKED 的同一检查）
+  或 import-once 登记表里已有别的请求对该哈希的检查时，答复一个点名该哈希的 CHECKED 帧，否则答复 ERROR；不导入、
+  不保留、不登记。驱动只在 VALID 且点名正是该块时放出投票；导入仍在原队列顺序与槽位内进行，之后导入自己的检查不再
+  放出第二次投票。与 `N42_VOTE_BEFORE_SLOT` 不同，执行层一侧不持有任何东西，因此可与 `N42_IMPORT_ONCE=1` 同时使用
+  （`N42_VOTE_BEFORE_SLOT` 仍与之互斥，见第 19 节）。验证者 `imported a block` 行新增 `check_ahead_sent`、
+  `check_ahead_vouched`、`check_ahead_declined`（累计），大块另有 `check ahead of the import slot` 行（`check_us`：
+  块进入队列到答复，即投票放出）；执行层 debug 行 `check-only request`。验证者 `proposal sent` 行（恒开）新增累计的
+  `build_starts_seal`、`build_starts_send`、`build_starts_commit`、`build_starts_other`（一前一后规则造成的 send
+  起始占比）。测试：`h2-execution` `tests/check_before_slot.rs`，`h2-el-rpc` `tests/compact_channel.rs`
+  `a_check_only_answer_vouches_only_for_the_block_asked_about`，`n42` `payload_serve_once_tests`
+  `a_check_only_request_vouches_for_a_kept_build_and_nothing_else`。
+- `N42_LEADER_LAYERS` 上限 4 -> 8（`direct_build.rs` `leader_layers::DEPTHS`）：层保存在 `leader_layers` 自己的
+  队列里（从子块第一次打开起），不受构建存储 `KEEP`（3）约束；`PARENT_OUTPUTS_KEPT` 是 follower 自己的栈，无关。
+  E=1 时锚点须已 canonical，落地约晚 4 个周期，42 ms 周期需 6 层。引擎内存树须仍持有锚点
+  （`--engine.memory-block-buffer-target`，fleet 默认 6 足够 6 层）。内存计量：`leader_layers::held()`，打开行
+  （`state_wait_on` 的拆分）新增 `open_kept_accounts`（保存的各层的账户数，约 260 B/账户）。测试
+  `six_kept_layers_read_as_the_engine_after_it_landed_them`。
+- `N42_MERGE_AT_SHARDS_READY=1`（`N42_MERGE_POOL_THREADS`，默认 16；代码在 `output_shards.rs`
+  `merge_at_shards_ready` / `merge_pool` / `FrozenShards::merged_on`，`payload.rs` 的分片分支）：leader 的分片合并在
+  `shards_ready` 时（而不是字段发布之后）在自己的线程池（`n42-merge-*`）上按源 map 并行开始；合并出的 bundle 与单线程
+  合并相同（账户、合约、按序 reverts、大小）。`StateReady` 与 `Complete` 仍在字段发布之后（发布写入本块的 QMDB 树，
+  引擎插入与持久化要读），只是不再等合并。阶段行新增 `seal_to_shards_ready_us`（恒开）、`merge_early`、
+  `merge_join_wait_us`。测试 `tests/output_shards.rs` `the_merge_on_its_own_pool_equals_the_serial_merge`。
+- `N42_SHARDS_BEFORE_RECEIPTS=1`（代码在 `output_shards.rs` `shards_before_receipts`，`payload.rs` 的 graft scope 与
+  分片分支）：执行结束即 seal、输出留在分片中的块，slot 的 receipts 改在拥有其输入的线程（`n42-receipts-late`）上构建，
+  graft scope 只等 freeze 与 `take_cached`，执行器 finish 之后立即登记 `shards_ready`；receipts 在第一次被读处（QMDB
+  根旁的 receipts root）并入。子块打开只读分片与残余。阶段行新增 `receipts_late`、`receipts_late_wait_us`。测试
+  `a_sharded_parent_opens_the_same_with_or_without_its_receipts`。
+- `N42_FREEZE_SPLIT=<k>`（默认 1，最大 8；代码在 `output_shards.rs` `freeze_split` / `heavy_shards` / `sum_split`）：
+  live freeze 中工作量（补录批次的地址 + 冲突出现次数）至少 2,048 且不低于均值 1.5 倍的分片（实际即那个重分片），
+  按地址第 3-4 字节分成 k 个子区间并行处理（读 live 索引、只写自己的部分，再按单任务顺序求和），最后并回一个分片。
+  "output shards folded" 行新增（恒开）`heavy_shard`、`heavy_work`、`split_tasks`。测试
+  `tests/output_shards.rs` `a_split_heavy_shard_freezes_as_one_task`。
+
 ## HotStuff-2 结算标签（不改任何 fork 的 reth crate）:
 - `N42_SETTLEMENT_TAGS=split|legacy`（默认 `split`；代码在 `crates/n42/h2-execution/src/settlement.rs`，
   由 `ExecutionDriver` 的每个 forkchoice 使用）：`latest` = 共识已提交的块；`safe` = 执行已认证的块

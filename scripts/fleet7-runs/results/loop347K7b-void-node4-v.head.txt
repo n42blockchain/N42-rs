@@ -1,0 +1,60 @@
+note: --block-interval-ms 60 paces faster than the chain's 1s period. Timestamps advance by the period per block regardless, as gov5's do, so this chain's clock runs ahead of real time in proportion.
+[2m2026-10-08T04:46:41.658190Z[0m [32m INFO[0m [2mlibp2p_swarm[0m[2m:[0m [3mlocal_peer_id[0m[2m=[0m16Uiu2HAm5qnMKTecNm8SGzYzRhtQAYsLzYp9GN61KpWDNPE6n1Sz
+node peer id : 16Uiu2HAm5qnMKTecNm8SGzYzRhtQAYsLzYp9GN61KpWDNPE6n1Sz
+chain        : id 1143 genesis 0x86ff9348a72cc9f96aedf36235d66313056bcee5a1630874c646e4ea8f432bff
+validator    : index 4 of 7 (f = 2)
+execution    : http://127.0.0.1:8600/
+proposing    : yes
+pacing       : 60 ms
+leader tenure: 1024 views, so a leader builds its next block while the fleet imports this one
+state        : /data/blockchain/rust-fleet7-bench/node4/consensus, fresh
+settlement   : legacy (latest = safe = finalized = committed)
+deferred     : execution deferred from timestamp 0; a block is checked, voted for, then imported beside the loop
+deferred     : depth 1 (a header carries the result of its ancestor 1 blocks back)
+[2m2026-10-08T04:46:41.669447Z[0m [32m INFO[0m [2mn42.h2.el[0m[2m:[0m unpersisted-block count: first reading [3mcount[0m[2m=[0m0 [3mevery_ms[0m[2m=[0m50
+[2m2026-10-08T04:46:41.670381Z[0m [32m INFO[0m [2mn42.h2.el[0m[2m:[0m persisted block: first reading [3mnumber[0m[2m=[0m0
+committee pool: 200000 keys, 512 per block
+block rewards: 2 withdrawal(s) per block
+build throttle: soft 48 hard 80 max hold 2000 ms (unpersisted blocks, polled every 50 ms)
+[2m2026-10-08T04:46:41.726354Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m body channel listening [3maddr[0m[2m=[0m127.0.0.1:20004
+running…
+
+[2m2026-10-08T04:46:41.726466Z[0m [33m WARN[0m [2mn42.h2.node[0m[2m:[0m dial failed [3mreason[0m[2m=[0m"Failed to negotiate transport protocol(s): [(/ip4/127.0.0.1/tcp/19006/p2p/16Uiu2HAmLpq62D7sSoUBUE8GxykmR6kuyZxMWymZSLfsCUxSKPN1: : Connection refused (os error 111): Connection refused (os error 111))]"
+view   2
+[2m2026-10-08T04:46:42.335870Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m compact block body received (header only) [3mblock_hash[0m[2m=[0m0xf6356726cf9c227c2f727705d4874d0599e6dc2a2842f1aa621ee26c63f65adc [3mdecode_ms[0m[2m=[0m0
+[2m2026-10-08T04:46:42.335893Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m block runs ahead of the execution layer; held until the pull reaches it [3mblock_hash[0m[2m=[0m0xf6356726cf9c227c2f727705d4874d0599e6dc2a2842f1aa621ee26c63f65adc [3mnumber[0m[2m=[0mSome(2) [3mtip[0m[2m=[0mSome(0) [3mheld_ms[0m[2m=[0m0 [3mheld[0m[2m=[0m1
+body         : 0xf6356726cf9c227c2f727705d4874d0599e6dc2a2842f1aa621ee26c63f65adc
+view   3
+[2m2026-10-08T04:46:42.957696Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m compact block body received (header only) [3mblock_hash[0m[2m=[0m0x941a3a99da7deb335f35ad9f8e9051c4dfd85d59fbd6071e42d7a738f93608e2 [3mdecode_ms[0m[2m=[0m0
+[2m2026-10-08T04:46:42.957716Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m block runs ahead of the execution layer; held until the pull reaches it [3mblock_hash[0m[2m=[0m0xf6356726cf9c227c2f727705d4874d0599e6dc2a2842f1aa621ee26c63f65adc [3mnumber[0m[2m=[0mSome(2) [3mtip[0m[2m=[0mSome(0) [3mheld_ms[0m[2m=[0m621 [3mheld[0m[2m=[0m1
+body         : 0x941a3a99da7deb335f35ad9f8e9051c4dfd85d59fbd6071e42d7a738f93608e2
+view   4
+[2m2026-10-08T04:46:43.573156Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m compact block body received (header only) [3mblock_hash[0m[2m=[0m0xe5dd3a17d9783481525f73dc5ea066e5508c4d73542bdde86fe94d30b181a59f [3mdecode_ms[0m[2m=[0m0
+[2m2026-10-08T04:46:43.573177Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m block runs ahead of the execution layer; held until the pull reaches it [3mblock_hash[0m[2m=[0m0xf6356726cf9c227c2f727705d4874d0599e6dc2a2842f1aa621ee26c63f65adc [3mnumber[0m[2m=[0mSome(2) [3mtip[0m[2m=[0mSome(0) [3mheld_ms[0m[2m=[0m1237 [3mheld[0m[2m=[0m1
+body         : 0xe5dd3a17d9783481525f73dc5ea066e5508c4d73542bdde86fe94d30b181a59f
+view   5
+[2m2026-10-08T04:46:44.185670Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m compact block body received (header only) [3mblock_hash[0m[2m=[0m0x5f3dfcd9944a3a60fb9c44743bc237aa7b6b0cd5c78f4d386c23d3cbcf3fe6e4 [3mdecode_ms[0m[2m=[0m0
+[2m2026-10-08T04:46:44.185687Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m block runs ahead of the execution layer; held until the pull reaches it [3mblock_hash[0m[2m=[0m0xf6356726cf9c227c2f727705d4874d0599e6dc2a2842f1aa621ee26c63f65adc [3mnumber[0m[2m=[0mSome(2) [3mtip[0m[2m=[0mSome(0) [3mheld_ms[0m[2m=[0m1849 [3mheld[0m[2m=[0m1
+body         : 0x5f3dfcd9944a3a60fb9c44743bc237aa7b6b0cd5c78f4d386c23d3cbcf3fe6e4
+view   6
+[2m2026-10-08T04:46:44.809085Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m compact block body received (header only) [3mblock_hash[0m[2m=[0m0x5b14e7040fa6f021cf8ef86ef51d346b3c7f5ea8f86949c65f3a8cb0ef808662 [3mdecode_ms[0m[2m=[0m0
+[2m2026-10-08T04:46:44.809110Z[0m [33m WARN[0m [2mn42.h2.node[0m[2m:[0m a block body has been held far too long [3mblock_hash[0m[2m=[0m0xf6356726cf9c227c2f727705d4874d0599e6dc2a2842f1aa621ee26c63f65adc [3mnumber[0m[2m=[0mSome(2) [3mtip[0m[2m=[0mSome(0) [3mhead[0m[2m=[0m0x86ff9348a72cc9f96aedf36235d66313056bcee5a1630874c646e4ea8f432bff [3mheld_ms[0m[2m=[0m2473 [3mheld[
+[2m2026-10-08T04:46:44.809115Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m block runs ahead of the execution layer; held until the pull reaches it [3mblock_hash[0m[2m=[0m0x941a3a99da7deb335f35ad9f8e9051c4dfd85d59fbd6071e42d7a738f93608e2 [3mnumber[0m[2m=[0mSome(3) [3mtip[0m[2m=[0mSome(0) [3mheld_ms[0m[2m=[0m1851 [3mheld[0m[2m=[0m2
+body         : 0x5b14e7040fa6f021cf8ef86ef51d346b3c7f5ea8f86949c65f3a8cb0ef808662
+view   7
+[2m2026-10-08T04:46:45.421526Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m compact block body received (header only) [3mblock_hash[0m[2m=[0m0xb034180d5da45524e91af66476284d26cb9b87a6e31a8fbbb3a4bf575f065aa4 [3mdecode_ms[0m[2m=[0m0
+[2m2026-10-08T04:46:45.421539Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m block runs ahead of the execution layer; held until the pull reaches it [3mblock_hash[0m[2m=[0m0xf6356726cf9c227c2f727705d4874d0599e6dc2a2842f1aa621ee26c63f65adc [3mnumber[0m[2m=[0mSome(2) [3mtip[0m[2m=[0mSome(0) [3mheld_ms[0m[2m=[0m3085 [3mheld[0m[2m=[0m1
+body         : 0xb034180d5da45524e91af66476284d26cb9b87a6e31a8fbbb3a4bf575f065aa4
+view   8
+[2m2026-10-08T04:46:46.043392Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m compact block body received (header only) [3mblock_hash[0m[2m=[0m0x36fb1fff8db90a74b7e011ab279b201bfe9352a2f28c83245b4f5b1e87f0a061 [3mdecode_ms[0m[2m=[0m0
+[2m2026-10-08T04:46:46.043413Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m block runs ahead of the execution layer; held until the pull reaches it [3mblock_hash[0m[2m=[0m0xf6356726cf9c227c2f727705d4874d0599e6dc2a2842f1aa621ee26c63f65adc [3mnumber[0m[2m=[0mSome(2) [3mtip[0m[2m=[0mSome(0) [3mheld_ms[0m[2m=[0m3707 [3mheld[0m[2m=[0m1
+body         : 0x36fb1fff8db90a74b7e011ab279b201bfe9352a2f28c83245b4f5b1e87f0a061
+view   9
+[2m2026-10-08T04:46:46.657226Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m compact block body received (header only) [3mblock_hash[0m[2m=[0m0x22a88d1ef2ecb2ff56510435f8c3cb24c03cf5c225e53a53ed098f3a514ccebf [3mdecode_ms[0m[2m=[0m0
+[2m2026-10-08T04:46:46.657247Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m block runs ahead of the execution layer; held until the pull reaches it [3mblock_hash[0m[2m=[0m0xf6356726cf9c227c2f727705d4874d0599e6dc2a2842f1aa621ee26c63f65adc [3mnumber[0m[2m=[0mSome(2) [3mtip[0m[2m=[0mSome(0) [3mheld_ms[0m[2m=[0m4321 [3mheld[0m[2m=[0m1
+body         : 0x22a88d1ef2ecb2ff56510435f8c3cb24c03cf5c225e53a53ed098f3a514ccebf
+view   10
+[2m2026-10-08T04:46:47.269917Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m compact block body received (header only) [3mblock_hash[0m[2m=[0m0xb2fbcf5b98b6e4c9aa14caa03f3647ee8c15c93bd4acbc0638084d10bd58c5f5 [3mdecode_ms[0m[2m=[0m0
+[2m2026-10-08T04:46:47.269935Z[0m [32m INFO[0m [2mn42.h2.node[0m[2m:[0m block runs ahead of the execution layer; held until the pull reaches it [3mblock_hash[0m[2m=[0m0xf6356726cf9c227c2f727705d4874d0599e6dc2a2842f1aa621ee26c63f65adc [3mnumber[0m[2m=[0mSome(2) [3mtip[0m[2m=[0mSome(0) [3mheld_ms[0m[2m=[0m4934 [3mheld[0m[2m=[0m1
+[2m2026-10-08T04:46:47.269941Z[0m [33m WARN[0m [2mn42.h2.node[0m[2m:[0m a block body has been held far too long [3mblock_hash[0m[2m=[0m0x941a3a99da7deb335f35ad9f8e9051c4dfd85d59fbd6071e42d7a738f93608e2 [3mnumber[0m[2m=[0mSome(3) [3mtip[0m[2m=[0mSome(0) [3mhead[0m[2m=[0m0x86ff9348a72cc9f96aedf36235d66313056bcee5a1630874c646e4ea8f432bff [3mheld_ms[0m[2m=[0m4312 [3mheld[
+body         : 0xb2fbcf5b98b6e4c9aa14caa03f3647ee8c15c93bd4acbc0638084d10bd58c5f5

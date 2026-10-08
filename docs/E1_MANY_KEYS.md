@@ -1,0 +1,99 @@
+# E=1 with many validator keys: 21 and 99 keys on one execution layer
+
+Audit and loop347 preparation, 2026-10-07. Read from code, the loop345 ALL logs and a dry run of the launch plans; nothing was
+built or run. **Measured** means read from loop345 ALL (7 keys, 60 ms, 200k transfers); **estimate** is arithmetic from it and from
+blst's published cost (a single BLS verify ~1.1 ms on this class of core: 2 Miller loops, the final exponentiation, hash to G2 and, with
+`verify(true, ...)` at `h2-primitives/src/bls/keys.rs:149`, a signature subgroup check). Quorum and f follow the node's rule
+`f = (n-1)/3`, quorum `n-f` (`h2-consensus/src/validator/set.rs:28,93`, `qmdb-reth/src/hotstuff.rs:232`, `h2_validator.rs:249`): 7 -> f 2, quorum 5;
+**21 -> f 6, quorum 15; 99 -> f 32, quorum 67**. The genesis files carry only the validator list.
+
+## 1. The two suspected O(N) points
+
+**(a) The leader verifies every vote on its loop, one signature at a time.** The service feeds each gossip message to the engine as its own
+event (`service.rs:2142`, `ConsensusEvent::Message`). `process_vote_inner` (`voting.rs:62-95`) calls `verify_single` -> blst
+`verify_prevalidated` for every R1 vote *before* it looks at the collector, so votes after the quorum are verified too, until the view moves; a
+late R1 vote of a past view is verified again in `note_late_vote` (`voting.rs:32-50`), up to twice (the progress-vote message, then the vote message;
+progress votes exist only with the grace on). R2 votes are verified one by one the same way (`voting.rs:262-269`), but a vote that arrives after
+the commit QC is dropped on the view mismatch (`voting.rs:252`) unverified. The QC itself costs almost nothing: votes enter the collector as
+`add_verified_vote`, so `build_qc_with_profile_message` (`quorum.rs:236-247`) only aggregates. The batch machinery exists and is not wired:
+`ConsensusEngine::authenticate_vote_batch` (`state_machine.rs:722`, a randomised multi-pairing, ~0.5 ms a signature because every signature
+re-hashes the same message) and `process_authenticated_message` (`:996`) are called from tests only; `AggregateSignature::verify_aggregate`
+(`aggregate.rs:24`, `fast_aggregate_verify`) is used for QCs. Followers do not verify other keys' votes: a non-leader returns before the check
+(`voting.rs:75`); they still *decode* every vote (`h2_wire.rs:604` `BlsSignature::from_bytes`, a G2 decompression, ~60 us).
+
+Cost on the leader's loop per block, estimate (R1 N-1 verifies + R2 q-1): **7 keys 10 verifies = 11 ms; 21 keys 34 = 37 ms; 99 keys 164 = 180 ms**
+(+35 ms when the grace's late and progress votes pay their second attempt). On the *critical path* (quorum assembly: q-1 verifies for PrepareQC,
+then q-1 for CommitQC, each batch of votes arriving together after the proposal / the PrepareQC): 2(q-1) x 1.1 = **9 / 31 / 145 ms**. Check against
+loop345 ALL: `R2_collect` p50 5 ms with q-1 = 4 verifies (measured; 4 x 1.1 = 4.4), `R1_collect` p50 5, p90 29 (the tail is the followers' import).
+So at 21 keys the vote road alone is half of a 60 ms cycle and at 99 it is 2.4 cycles: **the cycle at 99 keys is bound near 150-300 ms by
+verification, whatever the layer does.** The batched form: one check per round over *the same message*: aggregate the arrived signatures and
+public keys (G2/G1 additions, ~2 us each) and run one `fast_aggregate_verify` (~1.3 ms for 66 votes, flat), bisecting only on failure so the
+equivocation and bad-signature handling is unchanged; the keys are the registered validator set the QC check already trusts, so no new assumption.
+It needs (i) `h2-primitives`: `verify_same_message_batch(msg, sigs, pks)` over blst's aggregate API; (ii) `service.rs`: collect the Vote/CommitVote
+events of one `drain_transport` step (up to `MAX_TRANSPORT_DRAIN` = 256, `service.rs:657`) when this node is the leader, authenticate them as one batch
+and hand them to `process_authenticated_message`; (iii) votes after the quorum verified in one aggregate when the loop is idle, or not at all when
+the grace is off (they only feed `voters_seen`). Result: ~3 ms a round at any N. A cheap, separate saving: decode the vote signature lazily so a
+non-leader drops a vote without the G2 decompression (196 x 60 us = 12 ms a block per follower at 99 keys, estimate).
+
+**(b) The leader waits for every voter (`F7_STRAGGLER_GRACE_MS`, default 600 in the bench).** `propose_if_leader` (`service.rs:2669-2689`): for
+view v the leader reads `voters_seen(v-1)` (verified R1 voters of its own previous view, kept for 8 views, `state_machine.rs:23,878`); if `0 < seen < N`
+and fewer than `grace` ms have passed since the commit QC of v-1 (`commit_qc_formed`), the proposal is deferred ("waiting for the stragglers'
+votes"). It proceeds when all N votes (real or progress) have arrived, or the grace runs out. It was added for the round-43 tenure-handover stall
+(`service.rs:1222-1236`): with one layer per key, the keys outside the quorum imported slower than the leader proposed, fell a block behind each view,
+and the next leader, if it was one of them, could not propose until it had caught up (10-40 s stalls). Followers whose vote was withheld because
+the view had passed send a progress vote after their import (`state_machine.rs:1364`), which is what the leader counts. At 99 keys the rule is "the
+slowest of 99": every block waits for the last of 98 follower loops, and one key that is merely 20 ms late on every block puts 20 ms on every cycle;
+one dead or wedged key makes every block 600 ms (the grace) after it. Loop345 ALL already shows the signature at 7 keys: `total` max 600 ms, two
+proposal intervals >= 500 ms in 4,323. **At E=1 the handover reason is gone**: all keys read one layer, which imports each block once, so a key
+cannot be "a block behind" on import; what lags is its validator loop, and that is not what the next leader needs. Rule change (local policy, no
+protocol change): *wait for the next leader and for lag, not for the last voter.* The leader keeps, per validator, the last view it was seen at (the
+ledger it has, `note_voter`); it defers the proposal only while (1) the next tenure's leader has not been seen at view v-1 and the tenure ends within the
+next D = 2 views, or (2) some voter's last seen view is more than D = 2 behind (a voter one block late never holds anything), and in either case at
+most `min(grace, 2 x median cycle)` since the commit QC. Steady state at 99 keys: no wait; a key that falls 3 blocks behind costs one short grace and
+is then ignored until it returns, with its lag capped at D blocks at every handover, which is what the stall needed. Keep `F7_STRAGGLER_GRACE_MS=600`
+on the seven-layer chains where the stall was measured; `K99G0` (grace 0) tests the E=1 claim.
+
+## 2. Every other per-key cost at E=1 (per block unless stated)
+
+| Item | Per key | 21 keys | 99 keys | Basis |
+| --- | --- | --- | --- | --- |
+| Gossip messages (distinct) | - | ~46 | ~200 (2N votes + proposal, QCs, body) | each vote is *published*; v4 has no direct-to-leader channel (`service.rs:2367-2373`) |
+| Deliveries to a node | 8-12 copies of each | ~370 in, ~370 out | ~1.6k in, ~1.6k out | `flood_publish` is on (libp2p-gossipsub default, not overridden in `h2-net/src/config.rs:88-100`): the publisher sends to all peers, then every receiver forwards on its mesh (D 8, Dlo 6, Dhi 12, gov5 values). IDONTWANT only above 1000 B, votes are smaller. |
+| Gossip loop time | ~20 us a delivery (estimate) | 15 ms | 64 ms | the swarm is polled *inline* in the service loop (`service.rs:1581-1621`, `transport.rs:735`): same thread as the engine |
+| Hops | 1 for the originator's flood, mesh adds duplicates not hops; mesh-only diameter of a random 8-regular graph on 99 nodes is 3-4 | 1-2 | 1-3 | not logged by gossipsub; the traced arrival delay of the proposal is the proxy |
+| libp2p connections | 98 dialled each way (`--peer` x N-1, `fleet7-env.sh`), up to 2 per pair | <= 420 | <= 9,702 (4,851 pairs x 2) | libp2p keeps both of a simultaneous dial; valsample347 counts them. Noise handshakes ~1.5 ms x 2 each: ~30 CPU-s at start. fd limit 524,288, somaxconn 4,096: fine |
+| Requests to the layer | 1 compact body (header only, 15 KB, `payload_serve`) + the CHECKED/final status, ImportOnce answers all but the first at once | 21 | 99 (1.5 MB over loopback) | `once_reqs` counts them; registry cap 64 hashes (`import_once.rs:40`) is ample |
+| Commit forkchoice | ~1.1 (7.7 a block at 7 keys, measured, ~28 us on the engine thread) | 23 (0.6 ms) | 109 (3 ms, +5% of the engine thread; a burst of 99 queued messages delays the next one up to ~3 ms) | `SHARED_EXECUTION_SCOPE.md` 9.3 |
+| Pollers (`n42Engine_inMemoryBlocks` + `persistedBlock`, every 50 ms, `h2_validator.rs:445`) | 40 JSON-RPC calls/s | 840/s | 3,960/s (~0.2-0.3 core on the layer's runtime) | only the leader reads the gauge: start it for the leader only |
+| Vote signature decode | ~60 us x 2N | 2.5 ms | 12 ms | `h2_wire.rs:604` |
+| Leader: verification | see 1(a) | 37 ms | 180 ms | |
+| CPU of a follower key | 0.15-0.20 core measured at 7 keys (threadcpu, loop345 ALL) | ~0.35 (estimate) | ~1.1: the loop alone needs ~80 ms per 60 ms block | gossip + decode + base 6 ms |
+| **Validators' CPU, all keys** | | **~7 cores** | **~100 cores (60-130)** | the 16-CPU set of today holds 7 keys at 1.2 cores |
+| RSS | 0.28 GB measured at 7 (2.0 GB / 7) | ~6 GB | ~30-40 GB (+~0.15 MB a connection) | host has 136 GB; the layer 29 GB, the huge-page pool 40 GB: tight, see section 3 |
+| Log volume | 12 MB a leg | 250 MB | 1.2 GB; the traced validators log ~400 lines a block more | `F7_TRACE_VALIDATOR=0,1,2` only |
+
+## 3. Anything else that assumes a small N
+
+Not scaled by N (checked): `baseTimeout` 6,000 / `maxTimeout` 30,000 (genesis), `epochLength` 200 and the 200,000-key `committeePool` (seeded independently of
+the validator list, static validator set), `MAX_BITMAP` 1,024 B / `MAX_VALIDATORS` 4,096 (`h2_wire.rs:14,17`), `VOTERS_SEEN_WINDOW` 8, the
+`HELD_EXECUTIONS` map (refused under import-once), the import-once cap 64, leader tenure 1,024 (a leg of ~10k views has <= 10 distinct leaders: keys 0-2 in the
+window). **Startup:** the view clock starts when the first mesh peer appears (`service.rs:2433-2446`), not when a quorum exists; `f7_spawn` polled for the pid file every
+200 ms, a 20 s launch span for 99 validators with views timing out meanwhile (fixed, 20 ms). **Memory:** validators start after the layer and take ~35 GB of the free pool before
+the flood's `thp:always` heaps ask for it; the runner skips a K99 leg under 75 GB available. **Layer size:** the budget is 224 CPUs and 99 validators need ~100, so K99 gets a 128-CPU layer; `K7L`
+(7 keys, the same 128-CPU layer) separates that effect from the key count.
+
+## 4. Dry-run findings (`scripts/fleet7.sh plan` for 7, 21, 99; 7 is byte-identical to before)
+
+1. `fleet7-env.sh` refused N > 7: only seven network keys. Keys >= 7 are now `sha256("n42-fleet7-netkey-<i>")` (first seven unchanged).
+2. The node CPU budget was `F7_NODES x F7_CORES_PER_NODE` (99 x 32 = 3,168 CPUs: a 3,072-CPU layer and validators placed past the host). `f7_fleet_cpus` (`F7_FLEET_CPUS=224`) replaces it in all seven places; K7 plans exactly as loop345.
+3. `f7_spawn` polling 200 ms -> 20 ms; `F7_TRACE_VALIDATOR=0,1,2` turns `N42_H2_TRACE_MSGS` on for those validators only (fleet-wide it would be 400 lines a block each).
+4. The loop346 runner hard-coded seven (EL map default, verify, log copies, wipes); `run-loop347.sh` takes the count from the map, removes stale `node<i>` dirs of a larger previous fleet, and `LOOP347_DRY=1` prints every stage's plans (all 0 refusals).
+5. Genesis: `scripts/fleet-genesis-many.py --nodes 21 99` writes `n42_fleet7_bench_v21.json` / `_v99.json`: validators 0-6 and the BLS keys from `h2_keygen --seed n42-fleet7-validator` (index-only derivation, so the first seven equal the bench file's), derived addresses for the rest, `extraData` vanity `n42-fleet7-bench-v<N>` (distinct hashes); alloc, forks, gas limit, period, timeouts, committeePool equal (checked).
+
+## 5. loop347 (not launched): `launch-loop347.sh <a|b|c>` -> `run-loop347.sh`
+
+Base = loop345 ALL verbatim (E=1, `N42_IMPORT_ONCE=1`, 200k, 60 ms, depth 1); each leg appends its key count, chain, `F7_VAL_CPUS` and `F7_TRACE_VALIDATOR=0,1,2`. Stage **a**: WARM, WARMb, `K7` (16 val CPUs, layer 208 = loop345), `K21` (32 / 192), `K99` (96 / 128). **b**: WARM, `K7b`, `K21b`, `K99b`. **c**: WARM, `K7L`, `K21P50`, `K99P50` (`F7_BLOCK_INTERVAL_MS=50`), `K99G0` (`F7_STRAGGLER_GRACE_MS=0`) only if >= 1% of K99's proposal intervals are >= 500 ms.
+Gates as loop346 (build and tests, 120 G a leg, 75-minute cap a stage, 600 s a leg, replay and body gates). Report per leg (`manykeys347.py`, `valsample347.py`): `R1/R2_collect` and `votes=` of the leader; proposal -> first vote -> quorum -> last vote
+for R1 and R2 (the slowest key = the last arrival; its delay distribution) from the traced leaders' `recv` lines; proposal intervals and the count >= 500 ms (the grace); `slow step` lines by event kind; proposal arrival delay at the traced followers (hop proxy); validators' CPU (cores, per key), RSS, threads and the libp2p connection count (`/proc/net/tcp`).
+**Missing fields, for a code change:** the leader's vote-verification time (add `verify_us` and `verify_n` to `ViewTiming`, `state_machine.rs:26`, summed around `verify_single` at `voting.rs:88,269` and printed in `summary()`); the voter index on the trace line (`service.rs:2144`) to name the slowest key; hop count (not exposed by gossipsub).
+Predictions to test (estimates): K21 cycle 70-85 ms at 60 ms pacing (leader loop ~75 ms), K21P50 no faster; K99 150-300 ms, validator CPUs saturated, `R2_collect` ~70 ms; K99G0 recovers only what the grace cost. If K99 looks like that, the vote batch (1a) and the lazy decode are the first code to write.

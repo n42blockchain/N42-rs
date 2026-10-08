@@ -299,7 +299,9 @@ case $STAGE in
   c) mk WARM 7 16; warm_gate WARM
      mk K7L 7 96
      mk K21P50 21 32 F7_BLOCK_INTERVAL_MS=50; mk K99P50 99 96 F7_BLOCK_INTERVAL_MS=50
-     if straggler_shows; then echo "K99G0: the straggler rule shows (or no K99 report here): running with the grace off"; mk K99G0 99 96 F7_STRAGGLER_GRACE_MS=0; else echo "K99G0 not run: under 1% of the K99 proposal intervals reach 500 ms"; fi ;;
+     if straggler_shows; then echo "K99G0: the straggler rule shows (or no K99 report here): running with the grace off"; mk K99G0 99 96 F7_STRAGGLER_GRACE_MS=0; else echo "K99G0 not run: under 1% of the K99 proposal intervals reach 500 ms"; fi
+     # K99 never fit in claims a and b (MemAvailable floor 1.7-2.9 GB with 99 validators at 99.5 G RSS): the same leg with the huge-page prep off, as the brief says for a K99 that cannot fit
+     mk K99H0 99 96 F7_HUGEPREP=0 ;;
   *) echo "unknown stage $STAGE (a, b or c)"; exit 2 ;;
 esac
 

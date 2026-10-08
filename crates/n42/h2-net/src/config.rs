@@ -88,7 +88,69 @@ pub fn max_gossip_wire_size() -> usize {
 pub fn gov5_gossipsub_config(
     genesis_hash: B256,
 ) -> Result<gossipsub::Config, &'static str> {
+    let bounds = QueueBounds::from_env();
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        tracing::info!(target: "n42.h2.net",
+            handler_queue = bounds.handler_queue, max_ihave = bounds.max_ihave,
+            "gossipsub local queue bounds (N42_GOSSIP_HANDLER_QUEUE, N42_GOSSIP_MAX_IHAVE)");
+    });
+    gov5_gossipsub_config_with(genesis_hash, bounds)
+}
+
+/// Default of libp2p-gossipsub's `connection_handler_queue_len`.
+pub const DEFAULT_GOSSIP_HANDLER_QUEUE: usize = 5000;
+/// Default of libp2p-gossipsub's `max_control_messages_sent`, the cap on the ids
+/// of one IHAVE / IWANT (this libp2p version has no separate `max_ihave_length`).
+pub const DEFAULT_GOSSIP_MAX_IHAVE: usize = 5000;
+
+/// Local, wire-neutral bounds on gossipsub's memory: the per-peer send queue
+/// (in messages) and the ids per IHAVE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueBounds {
+    /// Messages a peer's send queue may hold.
+    pub handler_queue: usize,
+    /// Message ids one IHAVE may carry.
+    pub max_ihave: usize,
+}
+
+impl Default for QueueBounds {
+    fn default() -> Self {
+        Self {
+            handler_queue: DEFAULT_GOSSIP_HANDLER_QUEUE,
+            max_ihave: DEFAULT_GOSSIP_MAX_IHAVE,
+        }
+    }
+}
+
+impl QueueBounds {
+    /// Reads `N42_GOSSIP_HANDLER_QUEUE` and `N42_GOSSIP_MAX_IHAVE`.
+    pub fn from_env() -> Self {
+        Self::parse(
+            std::env::var("N42_GOSSIP_HANDLER_QUEUE").ok().as_deref(),
+            std::env::var("N42_GOSSIP_MAX_IHAVE").ok().as_deref(),
+        )
+    }
+
+    /// Unset, unparseable or zero values keep the default.
+    fn parse(queue: Option<&str>, ihave: Option<&str>) -> Self {
+        let get = |raw: Option<&str>, default: usize| {
+            raw.and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(default)
+        };
+        Self {
+            handler_queue: get(queue, DEFAULT_GOSSIP_HANDLER_QUEUE),
+            max_ihave: get(ihave, DEFAULT_GOSSIP_MAX_IHAVE),
+        }
+    }
+}
+
+fn gov5_gossipsub_config_with(
+    genesis_hash: B256,
+    bounds: QueueBounds,
+) -> Result<gossipsub::Config, &'static str> {
     gossipsub::ConfigBuilder::default()
+        .connection_handler_queue_len(bounds.handler_queue)
+        .max_control_messages_sent(bounds.max_ihave)
         .heartbeat_interval(GOSSIP_SUB_HEARTBEAT)
         .mesh_n(GOSSIP_SUB_D)
         .mesh_n_low(GOSSIP_SUB_D_LO)
@@ -123,6 +185,38 @@ mod tests {
         for bad in [Some("0"), Some("eight"), Some(""), None] {
             assert_eq!(gossip_size_from(bad), DEFAULT_MAX_GOSSIP_SIZE, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn unset_env_leaves_the_default_config_field_for_field() {
+        let ours = gov5_gossipsub_config_with(B256::ZERO, QueueBounds::parse(None, None)).unwrap();
+        let lib = gossipsub::ConfigBuilder::default()
+            .heartbeat_interval(GOSSIP_SUB_HEARTBEAT)
+            .mesh_n(GOSSIP_SUB_D)
+            .mesh_n_low(GOSSIP_SUB_D_LO)
+            .mesh_n_high(GOSSIP_SUB_D_HI)
+            .history_length(GOSSIP_SUB_MCACHE_LEN)
+            .history_gossip(GOSSIP_SUB_MCACHE_GOSSIP)
+            .duplicate_cache_time(SEEN_MESSAGES_TTL)
+            .max_transmit_size(max_gossip_wire_size())
+            .validation_mode(gossipsub::ValidationMode::Anonymous)
+            .message_id_fn(gov5_message_id_fn(B256::ZERO))
+            .build()
+            .unwrap();
+        // Debug prints every field (the id function is a closure and is skipped).
+        assert_eq!(format!("{ours:?}"), format!("{lib:?}"));
+        assert_eq!(ours.connection_handler_queue_len(), 5000);
+        assert_eq!(ours.max_control_messages_sent(), 5000);
+    }
+
+    #[test]
+    fn env_values_are_applied_and_bad_ones_ignored() {
+        let b = QueueBounds::parse(Some(" 64 "), Some("500"));
+        assert_eq!(b, QueueBounds { handler_queue: 64, max_ihave: 500 });
+        let cfg = gov5_gossipsub_config_with(B256::ZERO, b).unwrap();
+        assert_eq!(cfg.connection_handler_queue_len(), 64);
+        assert_eq!(cfg.max_control_messages_sent(), 500);
+        assert_eq!(QueueBounds::parse(Some("0"), Some("x")), QueueBounds::default());
     }
 
     #[test]

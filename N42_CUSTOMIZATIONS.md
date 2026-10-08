@@ -525,3 +525,12 @@
 - `crates/n42/alloy-rpc-types-engine/` - RPC 类型
 - `crates/n42/alloy-rpc-types-beacon/` - Beacon RPC 类型
 - `crates/ethereum/hardforks/` - N42 特定硬分叉
+
+## h2-net GossipSub 本地队列上限（环境变量）
+
+- `crates/n42/h2-net/src/config.rs`：`N42_GOSSIP_HANDLER_QUEUE`（`connection_handler_queue_len`，每个 peer 发送队列的消息条数，默认 5000）
+  与 `N42_GOSSIP_MAX_IHAVE`（本版 libp2p-gossipsub 0.50 没有 `max_ihave_length`，对应的是 `max_control_messages_sent`，
+  即单个 IHAVE/IWANT 的 id 上限，默认 5000）。两者都只是本地内存上限，不改变线上协议；未设置、无法解析或为 0 时保持默认值。
+  启动时打印一行 `gossipsub local queue bounds`。`flood_publish`、mesh 参数不变。
+- 队列深度在不修改库的前提下无法取得（只有开启 `metrics` feature 的 prometheus 直方图，没有最大值或事件），
+  因此验证者的 timing 行没有 `gossip_queue_max`。

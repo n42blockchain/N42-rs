@@ -378,8 +378,9 @@ pub(crate) struct H2Behaviour {
     identify: libp2p::identify::Behaviour,
 }
 
-/// A bidirectional member of a gov5 HotStuff-2 v4 gossip mesh.
-pub struct H2V4Transport {
+/// The swarm and its bookkeeping: what [`H2V4Transport`] polls on the
+/// caller's loop, or hands to its own task (`with_keypair_off_loop`).
+pub(crate) struct TransportCore {
     swarm: Swarm<H2Behaviour>,
     topic: IdentTopic,
     /// Where block bodies travel; bound to the chain by its fork digest.
@@ -403,12 +404,7 @@ pub struct H2V4Transport {
     advertised_height: u64,
 }
 
-impl H2V4Transport {
-    /// Builds a transport with a freshly generated identity.
-    pub fn new(config: TransportConfig) -> Result<Self, TransportError> {
-        Self::with_keypair(config, Keypair::generate_ed25519())
-    }
-
+impl TransportCore {
     /// Builds a transport with a caller-supplied libp2p identity. Use this when
     /// the fleet gates inbound connections on a known peer id, which a
     /// validator's fleet generally does.
@@ -728,6 +724,21 @@ impl H2V4Transport {
             .publish(self.block_topic.clone(), data)?)
     }
 
+    /// Publishes already-encoded bytes on one of the four topics.
+    pub(crate) fn publish_raw(
+        &mut self,
+        topic: crate::pump::PubTopic,
+        data: Vec<u8>,
+    ) -> Result<gossipsub::MessageId, PublishError> {
+        let topic = match topic {
+            crate::pump::PubTopic::V4 => self.topic.clone(),
+            crate::pump::PubTopic::Native => self.native_topic.clone(),
+            crate::pump::PubTopic::Block => self.block_topic.clone(),
+            crate::pump::PubTopic::Tx => self.tx_topic.clone(),
+        };
+        Ok(self.swarm.behaviour_mut().gossipsub.publish(topic, data)?)
+    }
+
     /// Drives the swarm until something worth reporting happens.
     ///
     /// Returns `None` only if the swarm stream ends, which it does not do in
@@ -1030,15 +1041,323 @@ impl H2V4Transport {
     /// Split out from the event loop so it can be tested without a network:
     /// this is where the chain-binding half of the cross-client contract lands.
     pub fn decode_payload(&self, from: Option<PeerId>, data: &[u8]) -> TransportEvent {
-        match decode_gossip(data, self.identity) {
-            Ok(envelope) => TransportEvent::Envelope {
-                from,
-                envelope: Box::new(envelope),
-            },
-            Err(err) => TransportEvent::Rejected {
-                from,
-                reason: format!("envelope: {err}"),
-            },
+        decode_payload_for(self.identity, from, data)
+    }
+}
+
+/// Decodes one v4 gossip payload for the chain `identity`.
+pub(crate) fn decode_payload_for(
+    identity: H2V4ChainIdentity,
+    from: Option<PeerId>,
+    data: &[u8],
+) -> TransportEvent {
+    match decode_gossip(data, identity) {
+        Ok(envelope) => TransportEvent::Envelope {
+            from,
+            envelope: Box::new(envelope),
+        },
+        Err(err) => TransportEvent::Rejected {
+            from,
+            reason: format!("envelope: {err}"),
+        },
+    }
+}
+
+impl std::fmt::Debug for TransportCore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportCore")
+            .field("local_peer_id", self.swarm.local_peer_id())
+            .field("topic", &self.topic.to_string())
+            .field("chain_id", &self.identity.chain_id)
+            .field("connected_peers", &self.mesh_peers.len())
+            .finish()
+    }
+}
+
+/// A bidirectional member of a gov5 HotStuff-2 v4 gossip mesh.
+///
+/// Two ways to run the swarm, with one API: *inline*
+/// ([`Self::with_keypair`]), polled by whoever awaits [`Self::next_event`],
+/// which is the validator's consensus loop; or *off the loop*
+/// ([`Self::with_keypair_off_loop`], `N42_GOSSIP_OFF_LOOP=1`), polled by its
+/// own tokio task that decodes and forwards events through a bounded channel
+/// and takes publishes and requests through two others. The bytes on the
+/// wire and every GossipSub parameter are the same either way.
+pub struct H2V4Transport {
+    inner: Inner,
+    identity: H2V4ChainIdentity,
+    local_peer_id: PeerId,
+}
+
+enum Inner {
+    Inline(Box<TransportCore>),
+    OffLoop(crate::pump::OffLoop),
+}
+
+impl H2V4Transport {
+    /// Builds a transport with a freshly generated identity.
+    pub fn new(config: TransportConfig) -> Result<Self, TransportError> {
+        Self::with_keypair(config, Keypair::generate_ed25519())
+    }
+
+    /// Builds a transport with a caller-supplied libp2p identity. Use this when
+    /// the fleet gates inbound connections on a known peer id, which a
+    /// validator's fleet generally does.
+    pub fn with_keypair(config: TransportConfig, keypair: Keypair) -> Result<Self, TransportError> {
+        let core = TransportCore::with_keypair(config, keypair)?;
+        Ok(Self {
+            identity: core.identity(),
+            local_peer_id: *core.local_peer_id(),
+            inner: Inner::Inline(Box::new(core)),
+        })
+    }
+
+    /// [`Self::with_keypair`], with the swarm polled on its own tokio task
+    /// rather than by the caller (`N42_GOSSIP_OFF_LOOP=1`).
+    ///
+    /// Must be called inside a tokio runtime; on a multi-thread runtime the
+    /// task runs on a worker, so gossip decoding (envelopes, native messages,
+    /// the G2 decompression of every vote signature) and GossipSub's own state
+    /// machine leave the thread that awaits [`Self::next_event`]. Events keep
+    /// the order the swarm produced them in.
+    pub fn with_keypair_off_loop(config: TransportConfig, keypair: Keypair) -> Result<Self, TransportError> {
+        let core = TransportCore::with_keypair(config, keypair)?;
+        Ok(Self {
+            identity: core.identity(),
+            local_peer_id: *core.local_peer_id(),
+            inner: Inner::OffLoop(crate::pump::OffLoop::spawn(core)),
+        })
+    }
+
+    /// Whether the swarm runs on its own task.
+    pub const fn is_off_loop(&self) -> bool {
+        matches!(self.inner, Inner::OffLoop(_))
+    }
+
+    /// This node's peer id — hand it to the fleet if it gates inbound peers.
+    pub const fn local_peer_id(&self) -> &PeerId {
+        &self.local_peer_id
+    }
+
+    /// Peers currently connected.
+    pub fn connected_peers(&self) -> usize {
+        match &self.inner {
+            Inner::Inline(core) => core.connected_peers(),
+            Inner::OffLoop(off) => off.shared().connected_count(),
+        }
+    }
+
+    /// Peers that have this node in their gossip mesh for the v4 topic.
+    ///
+    /// This, not [`Self::connected_peers`], is what determines whether a publish
+    /// can succeed: a connected peer that has not meshed will not relay.
+    pub fn mesh_size(&self) -> usize {
+        match &self.inner {
+            Inner::Inline(core) => core.mesh_size(),
+            Inner::OffLoop(off) => off.shared().mesh_size(),
+        }
+    }
+
+    /// The chain this transport is bound to.
+    pub const fn identity(&self) -> H2V4ChainIdentity {
+        self.identity
+    }
+
+    /// Dials an additional fleet member. Off the loop the dial is queued and
+    /// a failure arrives as [`TransportEvent::DialFailed`].
+    pub fn dial(&mut self, addr: Multiaddr) -> Result<(), libp2p::swarm::DialError> {
+        match &mut self.inner {
+            Inner::Inline(core) => core.dial(addr),
+            Inner::OffLoop(off) => {
+                off.command(crate::pump::Command::Dial(addr));
+                Ok(())
+            }
+        }
+    }
+
+    /// Sets the head height advertised to peers.
+    pub fn set_advertised_height(&mut self, height: u64) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.set_advertised_height(height),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::SetHeight(height)),
+        }
+    }
+
+    /// Publishes a consensus envelope to the fleet.
+    ///
+    /// The envelope must name the chain this transport is bound to; a mismatch
+    /// is refused rather than sent, because such a message would be dropped by
+    /// every recipient and by this node's own decoder, making the resulting
+    /// silence very hard to diagnose. Off the loop the publish is queued: the
+    /// id returned is empty, and a full queue is reported as the transient
+    /// [`gossipsub::PublishError::AllQueuesFull`].
+    pub fn publish(&mut self, envelope: &H2V4Envelope) -> Result<gossipsub::MessageId, PublishError> {
+        match &mut self.inner {
+            Inner::Inline(core) => core.publish(envelope),
+            Inner::OffLoop(off) => {
+                if envelope.identity != self.identity {
+                    return Err(PublishError::IdentityMismatch);
+                }
+                let payload = encode_gossip(envelope)?;
+                off.publish(crate::pump::PubTopic::V4, payload)
+            }
+        }
+    }
+
+    /// Publishes a consensus message on the chain's native topic, in gov5's
+    /// own encoding — what a Go fleet member listens for.
+    pub fn publish_native(&mut self, message: &H2Message) -> Result<gossipsub::MessageId, PublishError> {
+        match &mut self.inner {
+            Inner::Inline(core) => core.publish_native(message),
+            Inner::OffLoop(off) => {
+                let payload = encode_gov5_gossip_message(message)
+                    .map_err(|e| PublishError::Encode(n42_h2_wire::H2V4Error::Wire(e)))?;
+                off.publish(crate::pump::PubTopic::Native, payload)
+            }
+        }
+    }
+
+    /// Peers in this node's mesh for the native consensus topic.
+    pub fn native_mesh_size(&self) -> usize {
+        match &self.inner {
+            Inner::Inline(core) => core.native_mesh_size(),
+            Inner::OffLoop(off) => off.shared().native_mesh_size(),
+        }
+    }
+
+    /// Peers currently connected, for asking them things.
+    pub fn connected_peer_ids(&self) -> Vec<PeerId> {
+        match &self.inner {
+            Inner::Inline(core) => core.connected_peer_ids(),
+            Inner::OffLoop(off) => off.shared().connected_peer_ids(),
+        }
+    }
+
+    /// Asks `peer` for a block by hash. The answer arrives as
+    /// [`TransportEvent::BlockFetched`] or [`TransportEvent::BlockFetchFailed`].
+    pub fn request_block(&mut self, peer: PeerId, hash: B256) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.request_block(peer, hash),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::RequestBlock(peer, hash)),
+        }
+    }
+
+    /// Asks `peer` for a range of blocks. The answer arrives as
+    /// [`TransportEvent::RangeFetched`].
+    pub fn request_range(&mut self, peer: PeerId, request: RangeRequest) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.request_range(peer, request),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::RequestRange(peer, request)),
+        }
+    }
+
+    /// Asks `peer` for named transactions of a block. The answer arrives as
+    /// [`TransportEvent::BlockTxnsFetched`], including when the peer does not
+    /// speak the protocol -- then it is the error, and the caller asks for
+    /// the whole body as it always did.
+    pub fn request_block_txns(&mut self, peer: PeerId, request: BlockTxnsRequest) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.request_block_txns(peer, request),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::RequestTxns(peer, request)),
+        }
+    }
+
+    /// Answers a [`TransportEvent::BlockTxnsRequested`].
+    pub fn respond_block_txns(&mut self, channel: BlockTxnsChannel, reply: BlockTxnsReply) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.respond_block_txns(channel, reply),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::RespondTxns(channel, reply)),
+        }
+    }
+
+    /// Answers a [`TransportEvent::RangeRequest`] with the blocks this node
+    /// has, in order — as many as it could find from the start, which is
+    /// how gov5 serves a range it only partly holds.
+    pub fn respond_range(&mut self, channel: RangeRequestChannel, rlps: Vec<Vec<u8>>) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.respond_range(channel, rlps),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::RespondRange(channel, rlps)),
+        }
+    }
+
+    /// Hands `rlp` straight to `peer`, unasked; see
+    /// [`crate::rpc::BLOCK_PUSH_PROTOCOL`].
+    pub fn push_block(&mut self, peer: PeerId, rlp: alloy_primitives::Bytes) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.push_block(peer, rlp),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::PushBlock(peer, rlp)),
+        }
+    }
+
+    /// Hands the same block to every connected member, copying it once, and
+    /// returns how many were sent to.
+    pub fn push_block_to_all(&mut self, rlp: &[u8]) -> usize {
+        match &mut self.inner {
+            Inner::Inline(core) => core.push_block_to_all(rlp),
+            Inner::OffLoop(off) => {
+                let peers = off.shared().connected_peer_ids();
+                let shared = alloy_primitives::Bytes::copy_from_slice(rlp);
+                for peer in &peers {
+                    off.command(crate::pump::Command::PushBlock(*peer, shared.clone()));
+                }
+                peers.len()
+            }
+        }
+    }
+
+    /// Answers a [`TransportEvent::BlockRequest`]: the block's gov5 RLP, or
+    /// gov5's "not found" when this node does not have it.
+    pub fn respond_block(&mut self, channel: BlockRequestChannel, rlp: Option<alloy_primitives::Bytes>) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.respond_block(channel, rlp),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::RespondBlock(channel, rlp)),
+        }
+    }
+
+    /// Publishes a compressed transaction batch on the chain's transaction
+    /// topic; see [`crate::tx_gossip`].
+    pub fn publish_transactions(&mut self, data: Vec<u8>) -> Result<gossipsub::MessageId, PublishError> {
+        match &mut self.inner {
+            Inner::Inline(core) => core.publish_transactions(data),
+            Inner::OffLoop(off) => off.publish(crate::pump::PubTopic::Tx, data),
+        }
+    }
+
+    /// Publishes an already-encoded block body on the chain's block topic.
+    pub fn publish_block(&mut self, data: Vec<u8>) -> Result<gossipsub::MessageId, PublishError> {
+        match &mut self.inner {
+            Inner::Inline(core) => core.publish_block(data),
+            Inner::OffLoop(off) => off.publish(crate::pump::PubTopic::Block, data),
+        }
+    }
+
+    /// The next event: polls the swarm inline, or takes what the transport's
+    /// own task forwarded.
+    ///
+    /// Returns `None` only if the swarm stream (or its task) ends, which it
+    /// does not do in normal operation.
+    pub async fn next_event(&mut self) -> Option<TransportEvent> {
+        match &mut self.inner {
+            Inner::Inline(core) => core.next_event().await,
+            Inner::OffLoop(off) => off.next_event().await,
+        }
+    }
+
+    /// Decodes one gossip payload.
+    ///
+    /// Split out from the event loop so it can be tested without a network:
+    /// this is where the chain-binding half of the cross-client contract lands.
+    pub fn decode_payload(&self, from: Option<PeerId>, data: &[u8]) -> TransportEvent {
+        decode_payload_for(self.identity, from, data)
+    }
+
+    /// Off the loop: the deepest the inbound queue got and the microseconds
+    /// the task spent polling the swarm since the last call (both reset).
+    /// Inline: `(0, 0)` -- the caller times its own polls.
+    pub fn take_loop_stats(&self) -> (usize, u64) {
+        match &self.inner {
+            Inner::Inline(_) => (0, 0),
+            Inner::OffLoop(off) => off.shared().take_stats(),
         }
     }
 }
@@ -1046,10 +1365,10 @@ impl H2V4Transport {
 impl std::fmt::Debug for H2V4Transport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("H2V4Transport")
-            .field("local_peer_id", self.swarm.local_peer_id())
-            .field("topic", &self.topic.to_string())
+            .field("local_peer_id", &self.local_peer_id)
             .field("chain_id", &self.identity.chain_id)
-            .field("connected_peers", &self.mesh_peers.len())
+            .field("off_loop", &self.is_off_loop())
+            .field("connected_peers", &self.connected_peers())
             .finish()
     }
 }

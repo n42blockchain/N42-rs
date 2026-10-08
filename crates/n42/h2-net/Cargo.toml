@@ -22,7 +22,7 @@ n42-h2-consensus.workspace = true
 libp2p = { workspace = true, features = ["gossipsub", "tokio", "tcp", "noise", "yamux", "macros", "secp256k1", "request-response", "identify"] }
 futures = "0.3"
 snap.workspace = true
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync"] }
 
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-consensus.workspace = true

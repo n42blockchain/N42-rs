@@ -22,6 +22,7 @@ pub mod tx_gossip;
 pub mod config;
 pub mod message_id;
 pub mod observer;
+mod pump;
 pub mod rpc;
 pub mod status;
 pub mod topic;
@@ -49,4 +50,5 @@ pub use transport::{
     BlockRequestChannel, BlockTxnsChannel, H2V4Transport, RangeRequestChannel, PublishError, TransportConfig, TransportError,
     TransportEvent,
 };
+pub use pump::{INBOUND_CAPACITY, PUBLISH_CAPACITY, RETRY_CAPACITY};
 pub use tx_gossip::{decode_tx_batch, encode_tx_batch, TxGossipError, TX_BATCH_MAX_BYTES, TX_BATCH_MAX_TXS};

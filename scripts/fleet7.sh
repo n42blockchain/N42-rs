@@ -95,7 +95,7 @@ cmd_up() {
     # F7_TRACE_VALIDATOR=0,1: only those validators log every consensus message
     # (N42_H2_TRACE_MSGS=1; a line per message, so at 99 keys it is never set fleet-wide).
     N42_H2_TRACE_MSGS="$(f7_trace_of "$i")" \
-    RUST_LOG="$F7_LOG_V" f7_spawn "$d/v.pid" "$d/v.log" $pin "$F7_BIN/examples/h2_validator" "${F7_V_ARGS[@]}"
+    RUST_LOG="$F7_LOG_V" f7_spawn "$d/v.pid" "$d/v.log" $pin ${F7_VAL_NO_MALLOC_CONF:+env -u MALLOC_CONF -u _RJEM_MALLOC_CONF} "$F7_BIN/examples/h2_validator" "${F7_V_ARGS[@]}"
   done
   echo "validators up"
 }
@@ -348,7 +348,7 @@ cmd_roll() {
     RUST_LOG="$F7_LOG_EL" f7_spawn "$d/el.pid" "$d/el.log" $pin "$F7_BIN/n42" "${F7_EL_ARGS[@]}"
   for _ in $(seq 1 120); do grep -aq "RPC auth server started" "$d/el.log" 2>/dev/null && break; sleep 1; done
   f7_validator_args "$i"
-  RUST_LOG="$F7_LOG_V" f7_spawn "$d/v.pid" "$d/v.log" $pin "$F7_BIN/examples/h2_validator" "${F7_V_ARGS[@]}"
+  RUST_LOG="$F7_LOG_V" f7_spawn "$d/v.pid" "$d/v.log" $pin ${F7_VAL_NO_MALLOC_CONF:+env -u MALLOC_CONF -u _RJEM_MALLOC_CONF} "$F7_BIN/examples/h2_validator" "${F7_V_ARGS[@]}"
   echo "node $i: restarted; how the QMDB forest came back:"
   grep -a "QMDB" "$d/el.log" | sed 's/\x1b\[[0-9;]*m//g' | head -4
   # A node that restarts but never commits again is worse than one that stayed

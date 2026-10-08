@@ -3185,6 +3185,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                     throttle_hard_holds,
                     straggler_waits,
                     straggler_wait_us,
+                    direct_received = self.direct_votes.received,
+                    direct_duplicates = self.direct_votes.duplicates,
+                    direct_sent = self.direct_votes.sent,
+                    direct_fallbacks = self.direct_votes.fallbacks,
                     "proposal sent"
                 );
                 // Build-on-seal: the next build starts here, on this block's

@@ -858,3 +858,75 @@ fn the_merge_on_its_own_pool_equals_the_serial_merge() {
         }
     }
 }
+
+/// `N42_FREEZE_SPLIT` (`docs/SHARED_EXECUTION_SCOPE.md` 18.7 item 4b): the
+/// live freeze's shard work split over two, four and eight tasks by address
+/// sub-range is the single task's: every address reads the same account
+/// through the frozen shards, the conflicts and account counts, the
+/// beneficiary's credit, the merged bundle (against the single task's and
+/// the direct graft), the view's QMDB operations and hashed post-state are
+/// equal -- with every other shard of every batch left to the freeze (the
+/// deferred entries the split works on), busy shards left by concurrent
+/// hand-overs, and none left, at 1, 16 and 64 shards.
+#[test]
+fn a_split_heavy_shard_freezes_as_one_task() {
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let (expected, _) = direct(&db, bundles.clone(), false);
+    let live = Mode { index: true, live: true };
+    let touched: Vec<Address> = expected.state.keys().copied().collect();
+    let fill = |count: usize, deferral: Option<bool>, split: usize| {
+        let mut shards = shards_with(count, live);
+        if let Some(forced) = deferral {
+            shards.set_live_defer(true, forced);
+        }
+        shards.set_freeze_split(split, true);
+        // Concurrent hand-overs, so busy shards are left too.
+        std::thread::scope(|scope| {
+            for chunk in bundles.chunks(4) {
+                let shards = &shards;
+                scope.spawn(move || {
+                    for bundle in chunk {
+                        shards.add(bundle.clone());
+                    }
+                });
+            }
+        });
+        shards.freeze()
+    };
+    for count in [1, 16, 64] {
+        for deferral in [Some(true), Some(false), None] {
+            let one = fill(count, deferral, 1);
+            for split in [2, 4, 8] {
+                let label = format!("{count} shards, deferral {deferral:?}, split {split}");
+                let many = fill(count, deferral, split);
+                if deferral == Some(true) {
+                    assert!(many.fold_split().split_tasks > 0, "{label}: the split ran");
+                }
+                assert_eq!(many.accounts(), one.accounts(), "{label}: accounts");
+                assert_eq!(many.index_conflicts(), one.index_conflicts(), "{label}: conflicts");
+                assert_eq!(many.beneficiary_delta(), one.beneficiary_delta(), "{label}: beneficiary");
+                for address in &touched {
+                    assert_eq!(many.get(address), one.get(address), "{label}: {address} read through the shards");
+                }
+                let (many, many_residual) = sharded_parts(&db, many);
+                let (one_again, one_residual) = sharded_parts(&db, fill(count, deferral, 1));
+                let many_merged = many.merged(&many_residual);
+                assert_same(&format!("{label}: against one task"), &one_again.merged(&one_residual), &many_merged);
+                assert_same(&format!("{label}: against the graft"), &expected, &many_merged);
+                let many_overlaps = many.overlaps(&many_residual);
+                let one_overlaps = one_again.overlaps(&one_residual);
+                let many_view = many.view(&many_residual, &many_overlaps);
+                let one_view = one_again.view(&one_residual, &one_overlaps);
+                for prague in [false, true] {
+                    assert_eq!(
+                        n42_qmdb_reth::sorted_operations_from_accounts(&many_view, prague),
+                        n42_qmdb_reth::sorted_operations_from_accounts(&one_view, prague),
+                        "{label}: QMDB operations, prague {prague}"
+                    );
+                }
+                assert_eq!(hashed_post_state_of(&many_view), hashed_post_state_of(&one_view), "{label}: hashed");
+            }
+        }
+    }
+}

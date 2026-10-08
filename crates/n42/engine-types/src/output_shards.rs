@@ -508,6 +508,11 @@ pub struct OutputShards {
     live_next: std::sync::atomic::AtomicUsize,
     /// What a busy shard lock does to a live hand-over.
     live_defer: LiveDefer,
+    /// How many tasks a heavy shard's freeze work is split over
+    /// ([`freeze_split`]); 1 keeps one task a shard.
+    freeze_split: usize,
+    /// Tests: split every shard with any work, heavy or not.
+    freeze_split_all: bool,
 }
 
 impl OutputShards {
@@ -552,7 +557,18 @@ impl OutputShards {
             live,
             live_next: std::sync::atomic::AtomicUsize::new(0),
             live_defer: if live_index_defer() { LiveDefer::Busy } else { LiveDefer::Wait },
+            freeze_split: freeze_split(),
+            freeze_split_all: false,
         }
+    }
+
+    /// Tests: the heavy shard's split ([`freeze_split`]), whatever the
+    /// environment says; 1 keeps one task a shard. With `all`, every shard
+    /// with any work is split, heavy or not.
+    #[doc(hidden)]
+    pub fn set_freeze_split(&mut self, tasks: usize, all: bool) {
+        self.freeze_split = tasks.clamp(1, MAX_FREEZE_SPLIT);
+        self.freeze_split_all = all;
     }
 
     /// Tests: whether a live hand-over leaves busy shards to the freeze
@@ -747,7 +763,8 @@ impl OutputShards {
             let entered = batches.iter().enumerate().all(|(i, batch)| batch.live_id == i);
             if let (Some(live), true) = (self.live, entered) {
                 let parts = live.into_iter().map(|part| part.into_inner().unwrap_or_else(PoisonError::into_inner)).collect();
-                return freeze_live(pool, at, beneficiary, count, batches, contracts, self.append_ns.into_inner(), parts);
+                let split = (self.freeze_split, self.freeze_split_all);
+                return freeze_live(pool, at, beneficiary, count, batches, contracts, self.append_ns.into_inner(), parts, split);
             }
             return freeze_indexed(pool, at, beneficiary, count, batches, contracts, self.append_ns.into_inner());
         }
@@ -855,6 +872,9 @@ fn fold_split<'a>(
         pending_max: 0,
         pending_us_max: 0,
         drops_max: 0,
+        heavy_shard: 0,
+        heavy_work: 0,
+        split_tasks: 0,
     }
 }
 
@@ -886,6 +906,12 @@ fn log_folded(fold_ns: u64, split: &FoldSplit, index: Option<(u64, usize)>, live
         pending_max = split.pending_max,
         pending_us_max = split.pending_us_max,
         drops_max = split.drops_max,
+        // The live freeze's heaviest shard, its work (deferred batches'
+        // addresses entered plus occurrences summed), and the tasks heavy
+        // shards were split over (`N42_FREEZE_SPLIT`; 0 when none was).
+        heavy_shard = split.heavy_shard,
+        heavy_work = split.heavy_work,
+        split_tasks = split.split_tasks,
         "output shards folded"
     );
 }
@@ -976,6 +1002,7 @@ fn freeze_live(
     contracts: B256HashMap<RevmBytecode>,
     append_ns: u64,
     parts: Vec<IndexPart>,
+    (split, split_all): (usize, bool),
 ) -> FrozenShards {
     let transposed = std::time::Instant::now();
     let batches_ref = &batches;
@@ -991,7 +1018,29 @@ fn freeze_live(
         }
     }
     let any_pending = pending.iter().any(|list| !list.is_empty());
+    // `N42_FREEZE_SPLIT`: each shard's work (the deferred batches' addresses
+    // it enters and the occurrences it sums); a heavy one is split.
+    let work: Vec<usize> = parts
+        .iter()
+        .zip(&pending)
+        .enumerate()
+        .map(|(shard, (part, list))| {
+            part.drops.len()
+                + list
+                    .iter()
+                    .filter_map(|id| batches.get(*id as usize))
+                    .map(|batch| batch.addresses.get(shard).map_or(0, Vec::len))
+                    .sum::<usize>()
+        })
+        .collect();
+    let heavy = if split_all && split > 1 { work.iter().map(|w| *w > 0).collect() } else { heavy_shards(&work, split) };
+    let heavy_count = heavy.iter().filter(|h| **h).count();
+    let (heavy_shard, heavy_work) =
+        work.iter().enumerate().max_by_key(|(_, work)| **work).map_or((0, 0), |(shard, work)| (shard, *work));
     let sum = move |(mut part, pending): (IndexPart, Vec<u16>), shard: usize| {
+        if heavy.get(shard).copied().unwrap_or(false) {
+            return sum_split(part, &pending, shard, split, batches_ref);
+        }
         let probe = TaskProbe::start();
         let entries = pending.len() as u64;
         for id in pending {
@@ -1042,8 +1091,163 @@ fn freeze_live(
             (part, cost)
         })
         .collect();
-    let pending = (pending_max, pending_us_max, drops_max);
+    let split_tasks = (heavy_count * split) as u64;
+    let pending = (pending_max, pending_us_max, drops_max, heavy_shard as u64, heavy_work as u64, split_tasks);
     finish_indexed(pool, at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, Some(pending))
+}
+
+/// The largest `N42_FREEZE_SPLIT`.
+pub const MAX_FREEZE_SPLIT: usize = 8;
+
+/// `N42_FREEZE_SPLIT=<k>` (1 by default, at most [`MAX_FREEZE_SPLIT`];
+/// `docs/SHARED_EXECUTION_SCOPE.md` 18.7 item 4b): the live freeze's heavy
+/// shard -- the one whose deferred batches and repeated occurrences are the
+/// slowest task, ~73 of 128 batches and 16,000 occurrences at 200k -- is
+/// worked on by `k` tasks, each over the addresses of one sub-range of the
+/// shard (the address's third and fourth bytes), and put back together into
+/// the one shard part. The index, the conflicting accounts' sums, the kept
+/// reverts and the occurrences to drop are the ones the single task makes.
+/// Read once.
+pub fn freeze_split() -> usize {
+    static K: OnceLock<usize> = OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("N42_FREEZE_SPLIT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(1, |k| k.clamp(1, MAX_FREEZE_SPLIT))
+    })
+}
+
+/// Which shards are split over `split` tasks: those with at least 2,048
+/// units of work and at least one and a half times the mean (in practice the
+/// one heavy shard). None when `split` is 1.
+fn heavy_shards(work: &[usize], split: usize) -> Vec<bool> {
+    if split < 2 || work.is_empty() {
+        return vec![false; work.len()];
+    }
+    let mean = work.iter().sum::<usize>() / work.len();
+    work.iter().map(|w| *w >= 2048 && *w * 2 >= mean * 3).collect()
+}
+
+/// The sub-range of a shard `address` falls in when its work is split over
+/// `split` tasks: the address's third and fourth bytes (the first two pick
+/// the shard), scaled.
+fn sub_range(address: &Address, split: usize) -> usize {
+    let bits = u16::from_be_bytes([address.0[2], address.0[3]]) as usize;
+    (bits * split) >> 16
+}
+
+/// One sub-range's share of a split shard's freeze work.
+#[derive(Default)]
+struct SubPart {
+    /// Addresses the deferred batches entered that the live index did not
+    /// hold (`CONFLICT` once a later batch repeated them).
+    entered: AddressHashMap<u16>,
+    /// Addresses the live index held that a deferred batch repeated.
+    newly_conflicting: Vec<Address>,
+    /// The occurrences to drop the deferred batches added.
+    drops: Vec<(u16, Address)>,
+    kept: Vec<(u16, u32)>,
+    size_less: usize,
+    /// The conflicting accounts' sums of this sub-range.
+    conflicts: AddressHashMap<BundleAccount>,
+    /// The entry pass's wall, us.
+    pending_us: u64,
+}
+
+/// [`freeze_live`]'s per-shard work for a heavy shard, over `split` tasks:
+/// each enters the deferred batches' addresses of its sub-range in batch
+/// order (reading the live index, never writing it: what it adds is its
+/// own) under [`enter_part`]'s rules, then sums its sub-range's occurrences
+/// in the single task's order (the live ones, then the deferred ones). The
+/// sub-ranges are disjoint, so every address's entries, occurrences and sum
+/// are exactly the single task's, and they are put back into the shard part.
+fn sum_split(
+    mut part: IndexPart,
+    pending: &[u16],
+    shard: usize,
+    split: usize,
+    batches: &[BatchOut],
+) -> (IndexPart, TaskCost, (u64, u64, u64)) {
+    use rayon::prelude::*;
+    let probe = TaskProbe::start();
+    let base = &part.index;
+    let live_drops = &part.drops;
+    let subs: Vec<SubPart> = (0..split)
+        .into_par_iter()
+        .map(|sub| {
+            let at = std::time::Instant::now();
+            let mut out = SubPart::default();
+            let mut conflicting: AddressHashSet = Default::default();
+            for &id in pending {
+                let Some(batch) = batches.get(id as usize) else { continue };
+                let addresses = batch.addresses.get(shard).map_or(&[][..], Vec::as_slice);
+                let revert_at = batch.revert_at.get(shard).map_or(&[][..], Vec::as_slice);
+                let mut repeated: AddressHashSet = Default::default();
+                for address in addresses.iter().filter(|address| sub_range(address, split) == sub) {
+                    let held = if conflicting.contains(address) {
+                        Some(CONFLICT)
+                    } else {
+                        out.entered.get(address).copied().or_else(|| base.get(address).copied())
+                    };
+                    let Some(first) = held else {
+                        out.entered.insert(*address, id);
+                        continue;
+                    };
+                    let Some(account) = batch.accounts.get(address) else { continue };
+                    repeated.insert(*address);
+                    out.size_less += account.size_hint();
+                    if first != CONFLICT {
+                        out.drops.push((first, *address));
+                        if let Some(entry) = out.entered.get_mut(address) {
+                            *entry = CONFLICT;
+                        } else {
+                            conflicting.insert(*address);
+                            out.newly_conflicting.push(*address);
+                        }
+                    }
+                    out.drops.push((id, *address));
+                }
+                for &pos in revert_at {
+                    let Some((address, _)) = batch.reverts.get(pos as usize) else { continue };
+                    if sub_range(address, split) == sub && (repeated.is_empty() || !repeated.contains(address)) {
+                        out.kept.push((id, pos));
+                    }
+                }
+            }
+            out.pending_us = at.elapsed().as_micros() as u64;
+            let ours = live_drops.iter().filter(|(_, address)| sub_range(address, split) == sub).chain(out.drops.iter());
+            let mut conflicts: AddressHashMap<BundleAccount> = Default::default();
+            for (id, address) in ours {
+                let Some(account) = batches.get(*id as usize).and_then(|b| b.accounts.get(address)) else { continue };
+                match conflicts.get_mut(address) {
+                    Some(staged) => {
+                        if let Some(info) = staged.info.as_mut() {
+                            add_delta(info, account);
+                        }
+                    }
+                    None => {
+                        conflicts.insert(*address, account.clone());
+                    }
+                }
+            }
+            out.conflicts = conflicts;
+            out
+        })
+        .collect();
+    let pending_us = subs.iter().map(|sub| sub.pending_us).max().unwrap_or(0);
+    for sub in subs {
+        part.index.extend(sub.entered);
+        for address in sub.newly_conflicting {
+            part.index.insert(address, CONFLICT);
+        }
+        part.drops.extend(sub.drops);
+        part.kept.extend(sub.kept);
+        part.size_less += sub.size_less;
+        part.conflicts.extend(sub.conflicts);
+    }
+    let drops = part.drops.len() as u64;
+    (part, probe.finish(), (pending.len() as u64, pending_us, drops))
 }
 
 /// What both index freezes end with: the batches' maps kept as the output,
@@ -1062,13 +1266,16 @@ fn finish_indexed(
     append_ns: u64,
     built: Vec<(IndexPart, TaskCost)>,
     // The live freeze's (`Some`): the most entries, the longest entry pass
-    // and the most drops of one task (`FoldSplit::pending_max`).
-    live: Option<(u64, u64, u64)>,
+    // and the most drops of one task (`FoldSplit::pending_max`), the
+    // heaviest shard and its work, and the tasks heavy shards were split
+    // over (`FoldSplit::heavy_shard`).
+    live: Option<(u64, u64, u64, u64, u64, u64)>,
 ) -> FrozenShards {
     let index_build_ns = done.duration_since(transposed).as_nanos() as u64;
     let mut split = fold_split(built.iter().map(|(_, cost)| cost), at, transposed, done);
-    if let Some((pending_max, pending_us_max, drops_max)) = live {
+    if let Some((pending_max, pending_us_max, drops_max, heavy_shard, heavy_work, split_tasks)) = live {
         (split.pending_max, split.pending_us_max, split.drops_max) = (pending_max, pending_us_max, drops_max);
+        (split.heavy_shard, split.heavy_work, split.split_tasks) = (heavy_shard, heavy_work, split_tasks);
     }
     let live = live.is_some();
     let mut state_size = 0usize;
@@ -1271,6 +1478,15 @@ pub struct FoldSplit {
     pub pending_us_max: u64,
     /// See `pending_max`.
     pub drops_max: u64,
+    /// Live freeze: the shard with the most work (deferred batches'
+    /// addresses entered plus occurrences summed), and that work: whether
+    /// the heavy shard is a property of the address derivation.
+    pub heavy_shard: u64,
+    /// See `heavy_shard`.
+    pub heavy_work: u64,
+    /// `N42_FREEZE_SPLIT`: the tasks the heavy shards were split over (0
+    /// when none was).
+    pub split_tasks: u64,
 }
 
 /// One fold task's own cost, read from its thread: wall, CPU time, minor

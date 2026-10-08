@@ -33,6 +33,11 @@
 //!               whose CHECKED frame the caller answers with one byte
 //!               (raw_engine::release: 1 = execute, 0 = drop) before its
 //!               execution starts
+//!   CHECK_ONLY: u32 len, a sealed header's RLP (N42_CHECK_BEFORE_SLOT)
+//!   reply    := one frame: CHECKED (u32 len, VALID status naming the
+//!               header's hash) when the block is a kept build of this
+//!               layer or its check is in the import-once registry, else
+//!               ERROR (u32 len + message); nothing is imported
 //! ```
 //!
 //! `NEW_PAYLOAD` is the follower's half: the same `engine_newPayload`, handed
@@ -2197,6 +2202,35 @@ async fn gate(
     }
 }
 
+/// The answer to a check-only request (`request::CHECK_ONLY`,
+/// `N42_CHECK_BEFORE_SLOT`): the header's hash and what vouched for it, or
+/// why nothing does. A block is vouched for exactly when the import's own road
+/// would send CHECKED for it at once: it is one of this layer's kept builds,
+/// matched field by field (`is_own_build`, the check `serve_from_own_build`
+/// answers with), or the import-once registry holds a check of its hash that
+/// another request's import already made. Nothing is imported, claimed or
+/// held.
+fn check_only_answer(
+    header_rlp: &[u8],
+    reuse: bool,
+    once: Option<&crate::import_once::Registry>,
+) -> Result<(B256, &'static str), String> {
+    let mut cursor = header_rlp;
+    let header = <alloy_consensus::Header as alloy_rlp::Decodable>::decode(&mut cursor)
+        .map_err(|err| format!("check-only header: {err}"))?;
+    if !cursor.is_empty() {
+        return Err("check-only header: trailing bytes".to_owned());
+    }
+    let hash = header.hash_slow();
+    if reuse && is_own_build(&header) {
+        return Ok((hash, "own_build"));
+    }
+    if once.is_some_and(|registry| registry.is_checked(hash)) {
+        return Ok((hash, "registry"));
+    }
+    Err("not checked here".to_owned())
+}
+
 /// Answers a held request (`request::HOLD_EXECUTION`) under `N42_IMPORT_ONCE`
 /// with an error: a held execution is released by one validator and cannot be
 /// shared between keys (`import_once::check_startup` refuses the switch
@@ -2454,6 +2488,37 @@ where
         // Applies to the one request after the prefix, and only a body
         // request reads it.
         let hold = std::mem::take(&mut hold_next);
+        if kind == request::CHECK_ONLY {
+            let len = stream.read_u32_le().await? as usize;
+            if len > 1 << 20 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "header frame too large"));
+            }
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await?;
+            let answer = check_only_answer(&buf, reuse.is_some(), once.as_deref());
+            crate::import_once::note_check_only(answer.is_ok());
+            out.clear();
+            match &answer {
+                Ok((hash, _)) => out.extend_from_slice(&checked_frame(*hash)),
+                Err(message) => {
+                    out.push(raw_engine::reply::ERROR);
+                    out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+                    out.extend_from_slice(message.as_bytes());
+                }
+            }
+            stream.write_all(&out).await?;
+            let (vouched, declined) = crate::import_once::check_only_counts();
+            debug!(
+                target: "n42.payload_serve",
+                vouched = answer.is_ok(),
+                by = answer.as_ref().map_or("none", |(_, by)| *by),
+                answered_us = started_at.elapsed().as_micros() as u64,
+                vouched_total = vouched,
+                declined_total = declined,
+                "check-only request"
+            );
+            continue;
+        }
         if kind == request::OWN_BLOCK {
             let len = stream.read_u32_le().await? as usize;
             if len > 1 << 20 {

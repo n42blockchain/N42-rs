@@ -612,3 +612,61 @@ async fn an_abandoned_build_falls_through_to_an_ordinary_import() {
     assert_eq!(el.seen.new_payloads.load(Ordering::SeqCst), 1, "imported once, the ordinary way");
     assert_eq!(crate::import_once::own_counts().1, again, "an abandoned build is no own block executed again");
 }
+
+/// Reads the single frame a check-only request is answered with.
+async fn hear_one(client: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+    let kind = client.read_u8().await.expect("kind");
+    let len = client.read_u32_le().await.expect("len") as usize;
+    let mut buf = vec![0u8; len];
+    client.read_exact(&mut buf).await.expect("frame");
+    (kind, buf)
+}
+
+/// `N42_CHECK_BEFORE_SLOT`: a check-only request for one of this layer's kept
+/// builds (by the sealed header a follower key holds) is answered with one
+/// CHECKED frame naming exactly that header's hash, and nothing is imported,
+/// executed or claimed; a sibling's header (same parent and number, another
+/// state root), an unknown block and bytes that are no header get one ERROR
+/// frame. A block whose check another request's import already made is
+/// vouched for from the registry. The connection serves every answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_check_only_request_vouches_for_a_kept_build_and_nothing_else() {
+    let _builds = BUILDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let el = execution_layer(Script { direct_import: true, work: std::time::Duration::from_millis(30), ..Default::default() }).await;
+    let (built, sealed) = own_block(611, 0xB1);
+    let execution = build_of(&built);
+    n42_engine_types::built_executions::remember(execution.block.hash(), execution);
+    let mut client = connect(&el).await;
+    let (vouched_before, declined_before) = crate::import_once::check_only_counts();
+
+    send(&mut client, request::CHECK_ONLY, &alloy_rlp::encode(&sealed)).await;
+    let (kind, buf) = hear_one(&mut client).await;
+    assert_eq!(kind, raw_engine::reply::CHECKED, "{}", String::from_utf8_lossy(&buf));
+    let status = raw_engine::decode_payload_status(&buf).expect("status");
+    assert!(n42_h2_execution::vouches_for(sealed.hash_slow(), &status), "{status:?}");
+
+    let sibling = Header { state_root: B256::repeat_byte(0xEE), ..sealed.clone() };
+    send(&mut client, request::CHECK_ONLY, &alloy_rlp::encode(&sibling)).await;
+    assert_eq!(hear_one(&mut client).await.0, raw_engine::reply::ERROR, "a sibling of the build");
+    send(&mut client, request::CHECK_ONLY, &alloy_rlp::encode(header(612, 0xB5))).await;
+    assert_eq!(hear_one(&mut client).await.0, raw_engine::reply::ERROR, "an unknown block");
+    send(&mut client, request::CHECK_ONLY, &[0xc0, 0x01]).await;
+    assert_eq!(hear_one(&mut client).await.0, raw_engine::reply::ERROR, "no header");
+
+    assert_eq!(el.seen.executions.load(Ordering::SeqCst), 0, "nothing executed");
+    assert_eq!(el.seen.inserts.load(Ordering::SeqCst), 0, "nothing handed to the engine");
+    assert_eq!(el.seen.new_payloads.load(Ordering::SeqCst), 0, "no engine pass");
+    assert!(el.registry.is_empty(), "nothing registered");
+
+    // A block another key's import checked: vouched for from the registry.
+    let data = payload(&header(613, 0xB9));
+    let heard = keys_send_payload(&el, &data, 1).await;
+    assert_eq!(heard, vec![valid(true)]);
+    let checked = header(613, 0xB9);
+    send(&mut client, request::CHECK_ONLY, &alloy_rlp::encode(&checked)).await;
+    let (kind, buf) = hear_one(&mut client).await;
+    assert_eq!(kind, raw_engine::reply::CHECKED);
+    assert!(n42_h2_execution::vouches_for(checked.hash_slow(), &raw_engine::decode_payload_status(&buf).expect("status")));
+    let (vouched, declined) = crate::import_once::check_only_counts();
+    assert!(vouched - vouched_before >= 2 && declined - declined_before >= 3);
+}

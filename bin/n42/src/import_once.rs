@@ -173,6 +173,21 @@ pub fn note_own_executed_again() {
     OWN_EXECUTED_AGAIN.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Check-only requests vouched for (cumulative, `N42_CHECK_BEFORE_SLOT`).
+static CHECK_ONLY_VOUCHED: AtomicU64 = AtomicU64::new(0);
+/// Check-only requests declined (cumulative).
+static CHECK_ONLY_DECLINED: AtomicU64 = AtomicU64::new(0);
+
+/// A check-only request was answered: vouched for or declined.
+pub fn note_check_only(vouched: bool) {
+    if vouched { &CHECK_ONLY_VOUCHED } else { &CHECK_ONLY_DECLINED }.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The check-only counters, (vouched for, declined).
+pub fn check_only_counts() -> (u64, u64) {
+    (CHECK_ONLY_VOUCHED.load(Ordering::Relaxed), CHECK_ONLY_DECLINED.load(Ordering::Relaxed))
+}
+
 /// The two own-build counters, (from the build, executed again).
 pub fn own_counts() -> (u64, u64) {
     (OWN_FROM_BUILD.load(Ordering::Relaxed), OWN_EXECUTED_AGAIN.load(Ordering::Relaxed))
@@ -256,6 +271,15 @@ impl Registry {
                 None => break,
             }
         }
+    }
+
+    /// Whether a request for `hash` has had its check done here (an owner
+    /// said [`Owner::checked`]): what a check-only request
+    /// (`request::CHECK_ONLY`) may vouch for without claiming anything. Read
+    /// only; a hash not registered (or evicted) is `false`.
+    pub fn is_checked(&self, hash: B256) -> bool {
+        let entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.iter().rev().find(|cell| cell.hash == hash).is_some_and(|cell| cell.state.borrow().checked)
     }
 
     /// How many hashes are registered.

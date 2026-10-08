@@ -281,6 +281,15 @@ pub struct ForeignBody {
     pub compact: bool,
 }
 
+/// Whether a check-only answer ([`ExecutionLayer::check_only`]) vouches for
+/// `block_hash`: VALID, naming exactly that block. A CHECKED status for any
+/// other block -- another build at the same height, a stale answer -- is no
+/// vote.
+pub fn vouches_for(block_hash: B256, status: &PayloadStatus) -> bool {
+    matches!(status.status, alloy_rpc_types_engine::PayloadStatusEnum::Valid)
+        && status.latest_valid_hash == Some(block_hash)
+}
+
 /// What the execution layer did with a body handed to it.
 ///
 /// A compact body has a third answer the full one does not: it named
@@ -544,6 +553,28 @@ pub trait ExecutionLayer: Send + Sync + 'static {
             return BodyOutcome::Answered(Err(ElError::new(crate::driver::HELD_IMPORT_DROPPED)));
         }
         self.new_payload_body_checked(path, body, checked).await
+    }
+
+    /// Whether this execution layer answers a check-only request
+    /// ([`Self::check_only`]). The driver checks ahead of an import slot
+    /// (`N42_CHECK_BEFORE_SLOT`) only where it does. The default does not.
+    fn checks_only(&self) -> bool {
+        false
+    }
+
+    /// A check and nothing else (`N42_CHECK_BEFORE_SLOT`,
+    /// [`crate::raw_engine::request::CHECK_ONLY`]): `header_rlp` is the
+    /// block's sealed header as its body carries it, `block_hash` the hash
+    /// consensus named and the header hashes to. `true` only when the
+    /// execution layer vouches for exactly that block now, without importing
+    /// it (a VALID CHECKED answer naming `block_hash`); `false` for anything
+    /// else -- a refusal, an error, a status naming another block -- and the
+    /// caller's vote then waits for the import's own check, as without the
+    /// switch. Nothing is imported, held or registered either way. The
+    /// default vouches for nothing.
+    async fn check_only(&self, block_hash: B256, header_rlp: alloy_primitives::Bytes) -> bool {
+        let _ = (block_hash, header_rlp);
+        false
     }
 
     /// Engine-API `forkchoiceUpdated` without attributes — the finalise and

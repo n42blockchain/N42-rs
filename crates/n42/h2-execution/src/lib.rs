@@ -29,7 +29,7 @@ pub use driver::{
 };
 pub use el::{
     AnswerStamps, BodyOutcome, BuildStart, BuildTrigger, ChainAhead, ChainBlock, ChainSealer, BuiltBlock, ElError, ExecutionLayer,
-    ForeignBody, ResolveKind, fill_elided,
+    ForeignBody, ResolveKind, fill_elided, vouches_for,
 };
 pub use execution_path::{ExecutionPath, ExecutionScheduling, ExecutionWorkload};
 pub use mock::{ElCall, MockBehaviour, MockExecutionLayer};

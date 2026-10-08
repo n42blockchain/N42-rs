@@ -172,6 +172,37 @@ pub fn vote_before_slot() -> bool {
     *ON.get_or_init(|| std::env::var("N42_VOTE_BEFORE_SLOT").is_ok_and(|v| v == "1"))
 }
 
+/// `N42_CHECK_BEFORE_SLOT`, read once (off by default): a deferred block
+/// that arrives while every import slot is taken is *checked* at once by a
+/// check-only request ([`ExecutionLayer::check_only`],
+/// `raw_engine::request::CHECK_ONLY`) and its vote goes out on that answer;
+/// the block itself waits in the queue for its slot and is imported exactly
+/// as without the switch -- same order, same slot bound, same request. See
+/// [`ExecutionDriver::set_check_before_slot`].
+///
+/// Unlike [`vote_before_slot`] nothing is held on the execution layer's side
+/// (no release byte, no registry entry), so it composes with
+/// `N42_IMPORT_ONCE`, where several validator keys share one execution layer.
+pub fn check_before_slot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_CHECK_BEFORE_SLOT").is_ok_and(|v| v == "1"))
+}
+
+/// How many released checks the driver remembers, so a block checked ahead
+/// of its slot does not release its vote a second time when its import's own
+/// check arrives.
+const RELEASED_CHECKS_KEPT: usize = 64;
+
+/// What the check-ahead requests did since start (`N42_CHECK_BEFORE_SLOT`),
+/// for the import line: sent, vouched for, and declined (the vote then waits
+/// for the import's own check, as without the switch).
+#[derive(Debug, Default)]
+struct CheckAheadCounts {
+    sent: std::sync::atomic::AtomicU64,
+    vouched: std::sync::atomic::AtomicU64,
+    declined: std::sync::atomic::AtomicU64,
+}
+
 /// A block voted for ahead of its import slot (`N42_VOTE_BEFORE_SLOT`): its
 /// import task is running, the execution layer has (or is about to have)
 /// assembled and checked it, and its execution waits for `release`.
@@ -663,6 +694,15 @@ pub struct ExecutionDriver<E> {
     in_flight_cap: usize,
     /// `N42_VOTE_BEFORE_SLOT` ([`vote_before_slot`]).
     vote_before_slot: bool,
+    /// `N42_CHECK_BEFORE_SLOT` ([`check_before_slot`]).
+    check_before_slot: bool,
+    /// Blocks whose check has released a vote, newest last, bounded
+    /// ([`RELEASED_CHECKS_KEPT`]): under [`Self::check_before_slot`] a block
+    /// checked ahead of its slot is checked again by its import, and that
+    /// second check releases nothing.
+    released_checks: std::collections::VecDeque<B256>,
+    /// The check-ahead requests' counts, shared with their tasks.
+    check_ahead: std::sync::Arc<CheckAheadCounts>,
     /// Blocks voted for ahead of their import slot, by hash; each is in
     /// `import_queue` too, where its turn is.
     held: HashMap<B256, HeldImport>,
@@ -932,6 +972,9 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             queued_at: HashMap::new(),
             in_flight_cap: deferred_in_flight(),
             vote_before_slot: vote_before_slot(),
+            check_before_slot: check_before_slot(),
+            released_checks: std::collections::VecDeque::new(),
+            check_ahead: std::sync::Arc::default(),
             held: HashMap::new(),
             dropped_held: std::collections::HashSet::new(),
             dead: std::collections::VecDeque::new(),
@@ -1886,6 +1929,94 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.vote_before_slot = on;
     }
 
+    /// `N42_CHECK_BEFORE_SLOT` (see [`check_before_slot`], whose value is the
+    /// default). On: a deferred block arriving with every import slot taken
+    /// is queued for its slot exactly as without the switch, and beside that
+    /// its sealed header goes to the execution layer as a check-only request
+    /// ([`ExecutionLayer::check_only`]). When the execution layer vouches for
+    /// that very block (one of its own kept builds, or a check another key's
+    /// request already made there), the check is reported at once
+    /// ([`ImportReport::Checked`]) and the vote goes out; the import's own
+    /// check later releases nothing more. When it does not, nothing happens
+    /// and the vote waits for the import's check, as today. Only when the
+    /// execution layer answers check-only requests
+    /// ([`ExecutionLayer::checks_only`]) and the block came as a body.
+    pub fn set_check_before_slot(&mut self, on: bool) {
+        self.check_before_slot = on;
+    }
+
+    /// The check-ahead counts since start: (sent, vouched for, declined).
+    pub fn check_ahead_counts(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.check_ahead.sent.load(Relaxed), self.check_ahead.vouched.load(Relaxed), self.check_ahead.declined.load(Relaxed))
+    }
+
+    /// Sends the check-only request for a block queued behind busy slots
+    /// (see [`Self::set_check_before_slot`]); the import is not touched.
+    fn spawn_check_ahead(&self, block_hash: B256) {
+        if !self.check_before_slot || !self.el.checks_only() {
+            return;
+        }
+        let Some(body) = self.bodies.get(&block_hash) else { return };
+        // The sealed header the body carries, proved to be the block
+        // consensus named before anything is asked: a header that does not
+        // hash to it is no reason to vote.
+        let decoded = if body.compact {
+            n42_h2_consensus::decode_compact_body_header(&body.rlp, body.profile)
+        } else {
+            n42_h2_consensus::decode_block_body_header(&body.rlp, body.profile)
+        };
+        let Some(header) = decoded.ok().filter(|(hash, _)| *hash == block_hash).map(|(_, header)| header) else {
+            return;
+        };
+        let number = header.number;
+        let size = BlockSize::of(None, Some(body));
+        let header_rlp = alloy_primitives::Bytes::from(alloy_rlp::encode(&header));
+        let el = std::sync::Arc::clone(&self.el);
+        let report = self.foreign_imports.clone();
+        let counts = std::sync::Arc::clone(&self.check_ahead);
+        let busy = self.executing.len();
+        let queued = self.import_queue.len();
+        let queued_at = std::time::Instant::now();
+        counts.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tokio::spawn(async move {
+            let vouched = el.check_only(block_hash, header_rlp).await;
+            let check_us = queued_at.elapsed().as_micros() as u64;
+            if vouched {
+                counts.vouched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The vote goes out on this report; the stamp is from the
+                // block's arrival in the queue (its body was in hand).
+                let _ = report.send(ImportReport::Checked(block_hash));
+            } else {
+                counts.declined.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // `check_us`: the block's arrival in the queue (its body in
+            // hand) to the answer, i.e. to the vote's release when vouched.
+            if size.worth_logging() {
+                info!(target: "n42.h2.el", block = ?block_hash, number, vouched, check_us, slots_busy = busy, queued, bytes = size.bytes, "check ahead of the import slot");
+            } else {
+                debug!(target: "n42.h2.el", block = ?block_hash, number, vouched, check_us, slots_busy = busy, queued, "check ahead of the import slot");
+            }
+        });
+    }
+
+    /// Whether a check report releases a vote now: always without
+    /// `N42_CHECK_BEFORE_SLOT`; with it, only the first check of a block
+    /// (its check ahead of the slot or its import's, whichever came first).
+    fn first_check(&mut self, block_hash: B256) -> bool {
+        if !self.check_before_slot {
+            return true;
+        }
+        if self.released_checks.contains(&block_hash) {
+            return false;
+        }
+        self.released_checks.push_back(block_hash);
+        while self.released_checks.len() > RELEASED_CHECKS_KEPT {
+            self.released_checks.pop_front();
+        }
+        true
+    }
+
     /// Blocks voted for ahead of their import slot and not yet admitted.
     pub fn voted_ahead(&self) -> usize {
         self.held.len()
@@ -2133,6 +2264,9 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 }
                 self.import_queue.push_back(block_hash);
                 self.queued_at.insert(block_hash, (std::time::Instant::now(), held_at_arrival));
+                // `N42_CHECK_BEFORE_SLOT`: the vote need not wait for the
+                // slot; the import does.
+                self.spawn_check_ahead(block_hash);
             }
             return DriverAction::Ignored;
         }
@@ -2169,6 +2303,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let report = self.foreign_imports.clone();
         let guard = ReportGuard { block_hash, report: Some(report.clone()) };
         let decoder = self.body_decoder.clone();
+        let check_ahead = std::sync::Arc::clone(&self.check_ahead);
         tokio::spawn(async move {
             let started = std::time::Instant::now();
             let size = BlockSize::of(payload.as_ref(), body.as_ref());
@@ -2296,6 +2431,13 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     vote_before_slot = note.voted_before_slot,
                     slot_wait_ms = note.slot_wait_ms.load(std::sync::atomic::Ordering::Relaxed),
                     held_at_arrival = note.held_at_arrival,
+                    // `N42_CHECK_BEFORE_SLOT`, since start: check-only
+                    // requests sent for blocks queued behind busy slots, and
+                    // of them vouched for (the vote went out at once) and
+                    // declined (the vote waited for the import's check).
+                    check_ahead_sent = check_ahead.sent.load(std::sync::atomic::Ordering::Relaxed),
+                    check_ahead_vouched = check_ahead.vouched.load(std::sync::atomic::Ordering::Relaxed),
+                    check_ahead_declined = check_ahead.declined.load(std::sync::atomic::Ordering::Relaxed),
                     "imported a block"
                 );
             }
@@ -2348,6 +2490,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             // A block dropped while held: its vote is moot, its height was
             // committed to a sibling.
             ImportReport::Checked(block_hash) if self.dropped_held.contains(&block_hash) => return Vec::new(),
+            ImportReport::Checked(block_hash) if !self.first_check(block_hash) => return Vec::new(),
             ImportReport::Checked(block_hash) => {
                 return vec![DriverAction::Consensus(Box::new(ConsensusEvent::BlockChecked(block_hash)))];
             }

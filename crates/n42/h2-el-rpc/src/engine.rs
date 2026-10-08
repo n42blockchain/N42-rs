@@ -1326,6 +1326,16 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         self.foreign_body_over_channel(body, checked, Some(release)).await
     }
 
+    fn checks_only(&self) -> bool {
+        // A block is checked ahead of its slot only when it came as a body,
+        // and the request rides the same raw channel.
+        n42_h2_execution::body_once()
+    }
+
+    async fn check_only(&self, block_hash: B256, header_rlp: alloy_primitives::Bytes) -> bool {
+        self.check_only_over_channel(block_hash, &header_rlp).await
+    }
+
     async fn fork_choice_updated(
         &self,
         state: ForkchoiceState,
@@ -1979,6 +1989,74 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                 BodyOutcome::NotThisWay
             }
         }
+    }
+
+    /// A check-only request over the raw channel
+    /// (`request::CHECK_ONLY`, `N42_CHECK_BEFORE_SLOT`): one request, one
+    /// frame back. `true` only for a CHECKED frame vouching for exactly
+    /// `block_hash` ([`n42_h2_execution::vouches_for`]); an ERROR frame, a
+    /// CHECKED frame naming another block, a malformed answer, no channel or
+    /// a failed connection are all `false`, and the caller's vote waits for
+    /// the import's own check.
+    async fn check_only_over_channel(&self, block_hash: B256, header_rlp: &[u8]) -> bool {
+        use n42_h2_execution::raw_engine::{reply, request};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (addr, taken) = {
+            let mut channel = self.raw_import.lock().await;
+            let Some(addr) = self.raw_endpoint(&mut channel).await else { return false };
+            (addr, channel.stream.take())
+        };
+        let started = std::time::Instant::now();
+        // Taken out of the channel and put back only after the whole answer
+        // was read, as every request on it does.
+        let attempt: std::io::Result<(u8, Vec<u8>, tokio::net::TcpStream)> = async {
+            let mut conn = match taken {
+                Some(stream) => stream,
+                None => {
+                    let stream = tokio::net::TcpStream::connect(addr).await?;
+                    stream.set_nodelay(true)?;
+                    stream
+                }
+            };
+            let len = u32::try_from(header_rlp.len())
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "header too large"))?;
+            let mut frame = Vec::with_capacity(header_rlp.len() + 5);
+            frame.push(request::CHECK_ONLY);
+            frame.extend_from_slice(&len.to_le_bytes());
+            frame.extend_from_slice(header_rlp);
+            conn.write_all(&frame).await?;
+            let kind = conn.read_u8().await?;
+            let len = read_bounded_u32(&mut conn, 1 << 20).await?;
+            let mut buf = vec![0u8; len];
+            conn.read_exact(&mut buf).await?;
+            Ok((kind, buf, conn))
+        }
+        .await;
+        let (kind, buf, conn) = match attempt {
+            Ok(answer) => answer,
+            Err(err) => {
+                debug!(target: "n42.h2.el", block = ?block_hash, %err, "check-only request failed; the vote waits for the import");
+                return false;
+            }
+        };
+        {
+            let mut channel = self.raw_import.lock().await;
+            if channel.stream.is_none() {
+                channel.stream = Some(conn);
+            }
+        }
+        let vouched = kind == reply::CHECKED
+            && n42_h2_execution::raw_engine::decode_payload_status(&buf)
+                .is_ok_and(|status| n42_h2_execution::vouches_for(block_hash, &status));
+        debug!(
+            target: "n42.h2.el",
+            block = ?block_hash,
+            vouched,
+            kind,
+            round_trip_us = started.elapsed().as_micros() as u64,
+            "check-only answer"
+        );
+        vouched
     }
 
     async fn new_payload_over_channel(&self, payload: &ExecutionData) -> Option<PayloadStatus> {

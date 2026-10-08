@@ -109,6 +109,18 @@ pub mod request {
     /// answered as always and nothing more is read. Between the validator and
     /// its own execution layer only; nothing on the peer wire changes.
     pub const HOLD_EXECUTION: u8 = 9;
+    /// `u32` length and the RLP of a block's *sealed header* follow
+    /// (`N42_CHECK_BEFORE_SLOT`): a check and nothing else. The execution
+    /// layer answers with exactly one frame: [`super::reply::CHECKED`] (a
+    /// VALID status whose latest valid hash is the header's hash) when it can
+    /// vouch for the block now without importing it -- the header is one of
+    /// its own kept builds, matched field by field, or the import-once
+    /// registry already holds another request's check of that hash -- and
+    /// [`super::reply::ERROR`] otherwise. Nothing is imported, held,
+    /// registered or kept: the block's import comes later on the ordinary
+    /// road, in its slot. Between a validator and its own execution layer
+    /// only; nothing on the peer wire changes.
+    pub const CHECK_ONLY: u8 = 10;
 }
 
 /// The byte a caller sends for a held block ([`request::HOLD_EXECUTION`])

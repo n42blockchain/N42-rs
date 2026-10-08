@@ -37,6 +37,8 @@ pub enum ElCall {
     BodyReleased(B256),
     /// A held body dropped unexecuted.
     BodyDropped(B256),
+    /// A check-only request ([`ExecutionLayer::check_only`]).
+    CheckOnly(B256),
 }
 
 /// Behaviour a test wants from the execution layer.
@@ -76,6 +78,11 @@ pub struct MockBehaviour {
     /// answer (`N42_TAKE_COMPACT=1`) does: the driver never caches its
     /// payload.
     pub elide_builds: bool,
+    /// The check-only answer (`N42_CHECK_BEFORE_SLOT`): `None` is an
+    /// execution layer that does not serve the request; `Some(None)` vouches
+    /// for the block asked about; `Some(Some(other))` answers CHECKED naming
+    /// `other` -- another build -- which must release no vote.
+    pub check_only: Option<Option<B256>>,
 }
 
 impl Default for MockBehaviour {
@@ -91,6 +98,7 @@ impl Default for MockBehaviour {
             forkchoice_gate: None,
             body_gate: None,
             elide_builds: false,
+            check_only: None,
         }
     }
 }
@@ -300,6 +308,18 @@ impl ExecutionLayer for MockExecutionLayer {
         }
         self.record(ElCall::BodyReleased(body.block_hash));
         self.answer_body(body, behaviour).await
+    }
+
+    fn checks_only(&self) -> bool {
+        self.behaviour.lock().expect("mock behaviour lock").check_only.is_some()
+    }
+
+    async fn check_only(&self, block_hash: B256, _header_rlp: alloy_primitives::Bytes) -> bool {
+        self.record(ElCall::CheckOnly(block_hash));
+        let answer = self.behaviour.lock().expect("mock behaviour lock").check_only;
+        let Some(named) = answer else { return false };
+        let status = PayloadStatus::from_status(PayloadStatusEnum::Valid).with_latest_valid_hash(named.unwrap_or(block_hash));
+        crate::el::vouches_for(block_hash, &status)
     }
 
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError> {

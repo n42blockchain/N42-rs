@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # loop348 = the four vote-road switches of docs/E1_MANY_KEYS.md section 6 (A = N42_VOTE_AGGREGATE_VERIFY, Q = N42_STRAGGLER_RULE=quorum, G = N42_GOSSIP_OFF_LOOP, D = N42_VOTE_TRANSPORT=direct) on 7, 21 and 99 validator keys, ONE execution layer, base V = loop345 ALL + F7_STRAGGLER_GRACE_MS=600 (the loop347 line); validators start without the layer's MALLOC_CONF. usage: run-loop348.sh <a|b|c>   (LOOP348_DRY=1: print the plans of the stage's legs and stop).
-# Stage a: WARM, K7, K7A, K21, K21A, K7b, K7Ab.  Stage b: WARM, K21AQ, K21AQG, K21AQGD, K21AQGDb, K7AQGD.  Stage c: WARM, K99A (then the validator RSS gate: summed peaks under 30 G, else the stage stops), K99AQ, K99AQGD, K99AQGDb.
+# Stage a: WARM, K7, K7A, K21, K21A, K7b, K7Ab.  Stage b: WARM, K21c (K21 control on the claim-2 binary, which carries the silent-key fix dd601ff39), K21AQ, K21AQG, K21AQGD, K21AQGDb, K7AQGD.  Stage c: WARM, K99A (then the validator RSS gate: summed peaks under 30 G, else the stage stops), K99AQ, K99AQGD, K99AQGDb.
 # Same gates as loop346: build and test gate, free-space gate 120G a leg, 75-minute claim cap per stage, per-leg timeout 600 s, claim released on exit, datadirs wiped at the end. Launch: setsid nohup bash target/fleet-runs/launch-loop348.sh <stage> > target/fleet-runs/loop348<stage>.out 2>&1 &
 WT=${LOOP348_WT:-/data/n42-build/wt338}; STAGE=${1:-a}
 cd $WT
@@ -306,7 +306,7 @@ case $STAGE in
   a) mk WARM 7 16; warm_gate WARM
      mk K7 7 16; mk K7A 7 16 $V1; mk K21 21 32; mk K21A 21 32 $V1; mk K7b 7 16; mk K7Ab 7 16 $V1 ;;
   b) mk WARM 7 16; warm_gate WARM
-     mk K21AQ 21 32 $V1 $V2; mk K21AQG 21 32 $V1 $V2 $V3; mk K21AQGD 21 32 $V1 $V2 $V3 $V4; mk K21AQGDb 21 32 $V1 $V2 $V3 $V4
+     mk K21c 21 32; mk K21AQ 21 32 $V1 $V2; mk K21AQG 21 32 $V1 $V2 $V3; mk K21AQGD 21 32 $V1 $V2 $V3 $V4; mk K21AQGDb 21 32 $V1 $V2 $V3 $V4
      mk K7AQGD 7 16 $V1 $V2 $V3 $V4 ;;
   c) mk WARM 7 16; warm_gate WARM
      mk K99A 99 96 $V1; k99_rss_gate K99A

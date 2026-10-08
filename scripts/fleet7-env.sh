@@ -943,9 +943,11 @@ f7_spawn() {
   shift 2
   setsid bash -c 'echo $$ > "$1"; exec "${@:3}" >> "$2" 2>&1 < /dev/null' _     "$pidfile" "$logfile" "$@" &
   # Give the exec a moment, then check the file names something plausible.
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+  # Polled every 20 ms (it was 200 ms): a launch of 99 validators spent 20 s in this loop alone,
+  # long enough for the first members to start timing out views before a quorum existed.
+  for _ in $(seq 1 100); do
     [[ -s $pidfile ]] && return 0
-    sleep 0.2
+    sleep 0.02
   done
   echo "warning: $pidfile was never written" >&2
   return 1

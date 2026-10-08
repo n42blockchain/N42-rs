@@ -32,6 +32,8 @@ BUILD_FROM=$(date -u +%s)
 # the 40G scope needs the user systemd manager; when its bus is gone (it was, after claim a on 2026-10-08) run the test plain: the tests fit the box
 tst() { echo "== $*" >> $T; if systemd-run --user --scope -q true >/dev/null 2>&1; then nice -n 19 systemd-run --user --scope -q -p MemoryMax=40G -p MemorySwapMax=0 "$@" >> $T 2>&1; else nice -n 19 "$@" >> $T 2>&1; fi; }
 echo "tests from $(date +%H:%M) (no claim)"
+SKIPGATE=""; if [ -n "${LOOP350_GATE_TREES:-}" ] && [ "$LOOP350_GATE_TREES" = "$(git rev-parse HEAD:crates)-$(git rev-parse HEAD:bin)" ]; then SKIPGATE=1; echo "test and build gate skipped: git diff --stat f2794a821 HEAD -- crates bin is empty (crates/ and bin/ unchanged since claim a build; LOOP350_GATE_TREES)"; fi
+if [ -z "$SKIPGATE" ]; then
 for spec in "-p n42-engine-types --lib direct_build" "-p n42-engine-types --lib payload" "-p n42-engine-types --lib output_shards" "-p n42-engine-types --test output_shards" "-p n42-tx-queue --lib" "-p n42-engine-types --lib frame" "-p n42-tx-types --lib" "-p n42-qmdb-reth --lib -- --test-threads=1" "-p n42-h2-execution --lib driver" "-p n42-h2-execution --test consensus_execution_loop" "-p n42 --lib payload_serve::tests" "-p n42 --lib follower_import" "-p n42-h2-el-rpc --lib" "-p n42-engine-types --lib engine_validator" "-p n42-h2-el-rpc --test build_chain" "-p n42-h2-consensus --lib header_profile" "-p n42-engine-types --lib chain_alias" "-p n42-engine-types --lib engine_validator" "-p n42-h2-consensus --lib compact_body" "-p n42-h2-node --lib body_channel" "-p n42-h2-net --lib rpc" "-p n42-engine-types --lib hotstuff_consensus" "-p n42-h2-execution --lib raw_engine" "-p n42-qmdb-reth --lib hotstuff" "-p n42-engine-types --lib payload" "-p n42-qmdb-reth --lib -- --test-threads=1" "-p n42-qmdb-reth --lib -- --test-threads=1" "-p n42-tx-ingest" "-p n42-tx-queue" "-p n42-h2-node --lib" "-p n42-h2-node --test four_node_fleet" "-p n42-h2-consensus --lib block_body" "-p n42-h2-execution --lib" "-p n42-h2-execution --test vote_before_slot" "-p n42-h2-el-rpc --test compact_channel" "-p n42-h2-execution --test settlement_tags" "-p n42-qmdb-reth --lib exec_cache" "-p n42-twig-core --lib" "-p n42-h2-consensus" "-p n42-h2-execution" "-p n42-h2-node" "-p n42-h2-el-rpc" "-p n42-qmdb-reth -- --test-threads=1" "-p n42-testing" "-p n42-engine-types --lib -- --test-threads=1" "-p n42 --lib -- --test-threads=1"; do
   # a_block_behind_busy_slots_is_voted_for_on_its_check_only_answer (h2-execution, check_before_slot) orders two concurrent imports' votes and fails about 1 run in 6 under load (2026-10-08, 4 of 12 gate runs): a failed spec is run up to 3 times
   ok=0; for try in 1 2 3; do if tst cargo test -j8 --target-dir target/deferred $spec; then ok=1; break; fi; echo "test spec failed (try $try of 3): $spec"; done
@@ -41,6 +43,7 @@ if ! tst cargo clippy -j8 --target-dir target/deferred -p n42-h2-el-rpc -p n42-h
 echo "tests passed at $(date +%H:%M): $(grep -E '^test result:' $T | sed -E 's/test result: ok. ([0-9]+) passed.*/\1/' | paste -sd+ | bc) tests"
 if ! nice -n 19 cargo build -j8 --release --target-dir target/deferred -p n42 --bin n42 -p n42-h2-node --example h2_validator --example tx_flood --example h2_keygen --example send_tx > $S/build-loop350.log 2>&1; then echo "BUILD FAILED"; echo ALLDONE; exit 1; fi
 echo "built $(git rev-parse --short HEAD)+tree at $(date +%H:%M)"
+fi
 WAITED_FROM=$(date -u +%s)
 good() { local cpus; cpus=$(nproc)
   [ "$(pgrep -fc 'bin/n42-[a-z]+ --chai[n]')" = "0" ] && [ "$(pgrep -fc 'n42-[a-z0-9]+ --chai[n]')" = "0" ] \
@@ -48,7 +51,7 @@ good() { local cpus; cpus=$(nproc)
     && { [ "$(pgrep -fc 'txfloo[d]')" = "0" ] || [ $(( $(date -u +%s) - ${WAITED_FROM:-0} )) -gt 600 ]; } \
     && [ "$(free -g | awk '/Mem:/{print $7}')" -ge 80 ] \
     && [ "$(awk '{printf "%d", $1}' /proc/loadavg)" -lt $(( cpus / 4 )) ]; }
-theirs_claim() { local f n=""; for f in /data/blockchain/.box-claim-* /data/blockchain/wr-logs/.box-claim-*; do [ -e "$f" ] || continue; case "$f" in *box-claim-rust) continue;; esac; v=$(tr -c '0-9\n' ' ' < "$f" | tr -s ' ' '\n' | grep -E '^[0-9]+$' | sort -n | tail -1); [ -z "$v" ] && v=9999999999; n="$n $v"; done; echo $n | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n | tail -1; }
+theirs_claim() { local f n=""; for f in /data/blockchain/.box-claim-* /data/blockchain/wr-logs/.box-claim-*; do [ -e "$f" ] || continue; case "$f" in *box-claim-rust) continue;; esac; v=$(tr -c '0-9\n' ' ' < "$f" | tr -s ' ' '\n' | grep -E '^[0-9]+$' | sort -n | tail -1); [ -z "$v" ] && v=9999999999; [ "$v" != 9999999999 ] && [ $(( $(date -u +%s) - v )) -gt 5400 ] && { echo "ignoring a claim older than 90 minutes: $f ($v)" >&2; continue; }; n="$n $v"; done; echo $n | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n | tail -1; }
 quiet() { local n=0; while [ $n -lt 3 ]; do [ -z "$(theirs_claim)" ] || return 1; good || return 1; n=$((n+1)); [ $n -lt 3 ] && sleep 30; done; return 0; }
 mkdir -p /data/blockchain/wr-logs
 echo "waiting for a quiet box from $(date +%H:%M)"

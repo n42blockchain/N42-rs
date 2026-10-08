@@ -4,7 +4,7 @@
 cd /data/n42-build/wt338
 STAGE=${1:-a}; case $STAGE in a|b|c|d) ;; *) echo "usage: launch-loop350.sh <a|b|c|d>"; exit 2;; esac
 n=0
-while ls /data/blockchain/.box-claim-* >/dev/null 2>&1 || [ "$(pgrep -fc 'n42-[a-z0-9]+ --chai[n]')" != 0 ]; do sleep 60; n=$((n+1)); [ $n -gt 240 ] && { echo "gave up waiting after 4 h"; exit 1; }; done
+while [ -n "$(find /data/blockchain/.box-claim-* -mmin -90 2>/dev/null)" ] || [ "$(pgrep -fc 'n42-[a-z0-9]+ --chai[n]')" != 0 ]; do sleep 60; n=$((n+1)); [ $n -gt 240 ] && { echo "gave up waiting after 4 h"; exit 1; }; done
 # claim 2 runs the binary with N42_LEADER_LAYERS: the commit must be in and nothing in crates/ bin/ uncommitted
 grep -rq N42_LEADER_LAYERS crates/n42/engine-types/src || { echo "N42_LEADER_LAYERS is not in the tree; nothing built"; echo ALLDONE; exit 1; }
 if [ -n "$(git status --porcelain crates bin | grep -v pycache)" ]; then echo "uncommitted changes in crates/ or bin/; nothing built"; echo ALLDONE; exit 1; fi

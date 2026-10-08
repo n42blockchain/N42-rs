@@ -2950,3 +2950,44 @@ Pairs (window 1 / mean of windows 2-3): 7 keys 3.157M / 3.080M; 21 keys 3.020M /
 **What this says.** The cycle grows with the key count as the vote road does: flat to 21 keys (tick-bound, tails +3-6%), 2.6x at 99 keys. The fix is on the leader's vote loop (batch verification of same-message votes, vote processing off the loop), which is what `docs/E1_MANY_KEYS.md` section 6 describes and what the tip after `099f5ec1b` carries; this round is its baseline. The next measurement should be on a box with the validators' 99 GB in memory (free the 29 GB tmpfs, or fewer validator threads), or K99 stays a memory test.
 
 Hand-off files: `scripts/fleet7-runs/results/loop347{a,b,c}.out`, `loop347b-void.out`, `manykeys-loop347*.txt`.
+
+### 10.95 The four vote-road switches, E=1 (loop348): batch verification cuts the leader's vote time 4-8x and takes 99 keys from 0.90M to 2.29M in the first window; up to 21 keys nothing moves the rate (tick-bound); 99 keys still do not fit the box (validators 85.6 GB)
+
+Binary: tip with `7df5e960a` plus `dd601ff39` (silent-key fix; in claims 2-3 only) plus a counter-only change (`b42a1a918`: direct-vote counters on the `proposal sent` line). Base V = loop345 ALL + `F7_STRAGGLER_GRACE_MS=600` (loop347's line), 200k transfers, 60 ms, depth 1, one execution layer; layer 208 CPUs at 7 keys, 192 at 21, 128 at 99. A = `N42_VOTE_AGGREGATE_VERIFY=1`, Q = `N42_STRAGGLER_RULE=quorum`, G = `N42_GOSSIP_OFF_LOOP=1`, D = `N42_VOTE_TRANSPORT=direct`. Every leg starts its validators without the layer's `MALLOC_CONF` (`F7_VAL_NO_MALLOC_CONF=1`). Every figure is E=1 and says its key count.
+
+**Validator memory (the fix that was asked for).** Dropping `MALLOC_CONF` (h2_validator links jemalloc through engine-types, so the layer's `thp:always,...` did reach it) cut the validators' peak RSS per key from 0.27 / 0.45 / 1.0 GB to 0.12-0.13 / 0.28 / 0.86-0.99 GB at 7 / 21 / 99 keys; with D the 21-key figure falls further to 0.13 GB (2.7 GB in all). At 99 keys the sum is still **85.6 GB** (limit 30), so the gate stopped claim 3 after its first K99 leg: K99AQ, K99AQGD, K99AQGDb were not run. What a 99-key validator holds (valmem at flood +70 s, `results/valmem-loop348K99A.txt`): 856 MB anonymous, 8.5 MB file-backed, no huge pages, 119 threads (113 unnamed worker threads, 4 tokio workers); one mapping of 570 MB (37 MB at 7 keys, 44 MB at 21); RSS starts at 463 MB at flood start and rises to 986 MB over 60 s, then is flat (7 keys: 121 MB flat; 21: 158 to 245 MB). So the growth is superlinear in the key count in both its parts (start 122 / 158 / 463 MB; fill 0 / 87 / 523 MB). Probes at 99 keys (K99Ps jemalloc stats, K99Pd decay off + `thp:never`, K99Pb body store at one block): RSS unchanged at 0.86 GB, so it is not allocator retention and not the 16-body store. Jemalloc profiling is not built into h2_validator (`Invalid conf pair: prof:true`), the stats print did not appear (validators are killed, not exited), so the holder is not named; suspects, untested, are per-connection libp2p/gossipsub state (98 connections each, 9,696 in all) and the vote/proposal dedupe caches. The box's `MemAvailable` fell to 1.2-1.4 GB in every 99-key leg.
+
+**Rate, E=1 (w1 / w2 / w3 in M TPS; round total in M transactions; every block full, 99-100%):**
+
+| leg | keys | switches | w1 | w2 | w3 | round |
+| --- | --- | --- | --- | --- | --- | --- |
+| K7 / K7b | 7 | base | 3.147 / 3.193 | 3.067 / 3.107 | 3.127 / 3.093 | 280.2 / 281.8 |
+| K7A / K7Ab | 7 | A | 3.184 / 3.107 | 3.207 / 3.113 | 3.107 / 3.000 | 284.9 / 276.6 |
+| K7AQGD | 7 | AQGD | 3.127 | 3.073 | 3.147 | 280.4 |
+| K21 / K21c | 21 | base | 3.047 / 3.073 | 3.073 / 2.947 | 3.013 / 3.013 | 274.0 / 271.0 |
+| K21A | 21 | A | 3.167 | 3.127 | 2.973 | 278.0 |
+| K21AQ | 21 | AQ | 3.087 | 3.027 | 3.033 | 274.4 |
+| K21AQG | 21 | AQG | 3.067 | 3.073 | 2.987 | 273.8 |
+| K21AQGD / K21AQGDb | 21 | AQGD | 3.167 / 3.147 | 3.107 / 3.107 | 3.087 / 3.053 | 280.8 / 279.2 |
+| K99A | 99 | A | 2.287 | 1.067 | 0 | 100.6 |
+| K99Ps / K99Pd / K99Pb (probes) | 99 | A | 2.320 / 2.247 / 2.273 | 1.007 / 1.160 / 1.047 | 0 | 99.8 / 102.2 / 99.6 |
+
+Pairs (window 1 / mean of windows 2-3): 7 keys base 3.170 / 3.099, with A 3.146 / 3.107 (equal); 21 keys base (K21, K21c, single control on two binaries) 3.060 / 3.012, AQGD pair 3.157 / 3.088 (+3% / +3%, inside the 5% noise); 99 keys: loop347's K99 pair read 0.902 / 0.770, K99A 2.287 / 1.067 then nothing in window 3 (the chain stopped with 1.2 GB free). K99A's first window is 2.5x loop347's and 73% of the 7-key rate; windows 2-3 are the memory collapse, not a rate. Cycle (w1 mean / median / p90 ms): 7 keys 63.4 / 61.5 / 68.1, 21 keys 65.5 / 61.6 / 77.2 (base) and 63.2 / 61.4 / 67.6 (AQGD: the p90 tail is gone), 99 keys 86.9 / 82.8 / 107.7 (loop347: 217 / 171 / 341). Binding: tick up to 21 keys (95-99%, quorum 0.4-2%); K99A tick 88% (the tick itself runs 82 ms late on the starved host) and quorum 11%.
+
+**Measured vote-verification time (`verify_us` per block on the leader, both rounds; the loop347 estimate was 4 / 15 / 83 ms).**
+
+| keys | votes verified (`verify_n`) | base `verify_us` | A `verify_us`, batches | first-to-quorum R1 / R2 base -> A (ms) |
+| --- | --- | --- | --- | --- |
+| 7 | 10 | 6.6 ms (0.66 ms a vote) | 3.0 ms, 3 | 2.2 / 2.2 -> 0.3 / 0.3 |
+| 21 | 34 | 23.6 ms (0.69 ms) | 5.5 ms, 3 (AQGD 4.4) | 10.1 / 10.1 -> 1.6 / 1.7 (AQGD 0.5 / 0.6) |
+| 99 | 170 | not run (loop347 estimate 145 ms) | 19.0 ms, 3 (p90 25) | loop347 58 / 57 -> 13.9 / 12.7 |
+
+`verify_fallbacks` is 0 in every leg except K7Ab (3 in 4,401 blocks) and K99A (106 in 920): a failed batch falls back to one-by-one checks and the votes still verify, so no block was refused (`invalid_blocks` 0); the cause (a vote that really fails, or a batch group split by the load) is not in the logs and is open. At 99 keys the vote road is no longer the cycle: proposal to commit p50 76 ms against 160, R1 / R2 collect 36 / 29 ms against 66 / 85. What is left of it is the arrival spread (quorum to last vote 21.5 / 25.8 ms, slowest key's vote 52.7 / 84.4 ms after the proposal against 87.6 / 154), which is gossip delivery on a starved host, not verification.
+
+**Which switch bought what.** A: the whole of the 99-key gain (leader vote time 4.3-8x, 99 keys 0.90 -> 2.29M in window 1), nothing visible in the rate at 7 and 21 keys (tick-bound; validator CPU 6.4 -> 6.0 cores at 21). Q: nothing measurable here: K21AQ equals K21A, `straggler_waits` 0 in 4,334 proposals (K21A 1 wait of 44 ms; K7Ab 5 waits, 49-57 ms); the 99-key effect (>= 500 ms intervals 3.4% under the grace) was not run. G: `inbound_queue_max` 13 (p90 19, max 41) at 21 keys, 6 with D; validator CPU 6.0 -> 5.6 cores; no rate change. D: the validators' CPU halves at 21 keys (5.6 -> 3.1 cores) and their memory with it (5.8 -> 2.7 GB), `gossip_poll_us` 2.2 -> 1.1 ms; 99.9% of the leaders' votes arrive direct in K21AQGD, 97.5% in K21AQGDb (2,046 fallbacks to gossip, the hello not yet verified) and 92% at 7 keys (K7AQGD); no duplicates, `fleet7-verify` pass. K7AQGD costs nothing at the base size (3.127 / 3.110 against 3.170 / 3.099).
+
+**Correctness.** `invalid_blocks` 0, `fields_mismatches` 0, `own_executed_again` 0, `proposals_given_up` 0 at 7 and 21 keys (K99A 8, with tc 7 against loop347's 4, on the collapsing host); tc 0-1 at 7 and 21 keys; `fleet7-verify` pass on all 12 legs of claims 1-2 (none at 99 keys: "no node answered"). Test gate: `n42-h2-consensus` `test_emit_retries...` and `n42-h2-execution` `check_before_slot` fail intermittently under build load (retried by the runner, up to 3 times; passed every time).
+
+**Answer.** Do 99 keys now run at the 7-key rate? Not yet, and not for the vote road: in the first window 2.29M against 3.15M (73%), and then the box runs out of memory because 99 validators hold 85.6 GB. What binds is the host, not the protocol: validators per key must come under about 0.3 GB (the 30 GB gate) or the box needs the 29 GB of other sessions' `/tmp` tmpfs back. Next: find the 570 MB mapping (a build with jemalloc profiling, or a counted-allocation validator), then rerun K99AQ / K99AQGD.
+
+Hand-off files: `scripts/fleet7-runs/results/loop348{a,b,c,p,q}.out`, `manykeys-loop348*.txt`, `valmem-loop348*.txt`.

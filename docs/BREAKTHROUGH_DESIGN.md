@@ -2991,3 +2991,57 @@ Pairs (window 1 / mean of windows 2-3): 7 keys base 3.170 / 3.099, with A 3.146 
 **Answer.** Do 99 keys now run at the 7-key rate? Not yet, and not for the vote road: in the first window 2.29M against 3.15M (73%), and then the box runs out of memory because 99 validators hold 85.6 GB. What binds is the host, not the protocol: validators per key must come under about 0.3 GB (the 30 GB gate) or the box needs the 29 GB of other sessions' `/tmp` tmpfs back. Next: find the 570 MB mapping (a build with jemalloc profiling, or a counted-allocation validator), then rerun K99AQ / K99AQGD.
 
 Hand-off files: `scripts/fleet7-runs/results/loop348{a,b,c,p,q}.out`, `manykeys-loop348*.txt`, `valmem-loop348*.txt`.
+
+### 10.96 Gossipsub queue bound and direct votes against the validators' memory (loop349): 99 keys now hold 13-17 GB instead of 85.6 GB, hold three windows at 2.6-2.7M (83-86% of the 7-key rate), and the starvation signature of loop347/348 is gone; direct transport alone does it, the queue bound alone does most of it
+
+Binary: tip with `b03e71c8f` (`N42_GOSSIP_HANDLER_QUEUE`, `N42_GOSSIP_MAX_IHAVE`) and `dd601ff39` (silent-key fix). Base V = loop348's K-line with `N42_VOTE_AGGREGATE_VERIFY=1`, `F7_STRAGGLER_GRACE_MS=600`, 200k transfers, 60 ms, depth 1, one execution layer (208 / 192 / 128 CPUs at 7 / 21 / 99 keys), validators started without the layer's `MALLOC_CONF` on every leg. Q64 = `N42_GOSSIP_HANDLER_QUEUE=64 N42_GOSSIP_MAX_IHAVE=500` (start-up line `gossipsub local queue bounds ... handler_queue=64 max_ihave=500` seen on every Q64 leg, `5000 / 5000` otherwise); D = `N42_VOTE_TRANSPORT=direct`; AQG = + `N42_STRAGGLER_RULE=quorum N42_GOSSIP_OFF_LOOP=1`. Every figure is E=1 and says its key count.
+
+**The gate.** K99DQ64's validators held **14.8 GB** summed at their peaks (13.1 GB anonymous), under the 30 GB limit, so claims 2 and 3 ran.
+
+**Validator memory (anonymous RSS at flood +70 s, median / max per key MB; sum; sum of per-key peak RSS):**
+
+| keys | leg | anon median / max | anon sum | peak RSS sum |
+| --- | --- | --- | --- | --- |
+| 7 | K7DQ64 | 107 / 109 | 0.8 GB | 0.9 GB |
+| 21 | K21 (control) | 207 / 216 | 4.3 GB | 5.7 GB |
+| 21 | K21Q64 | 120 / 153 | 2.6 GB | 2.9 GB |
+| 21 | K21D | 112 / 115 | 2.3 GB | 2.7 GB |
+| 21 | K21DQ64 | 110 / 115 | 2.3 GB | 2.7 GB |
+| 99 | K99DQ64, K99DQ64b | 132 / 137 | 13.1 GB | 14.8 GB |
+| 99 | K99D | 135 / 138 | 13.4 GB | 15.1 GB |
+| 99 | K99Q64 | 171 / 172 | 16.9 GB | 18.8 GB |
+| 99 | K99DQ64AQG, K99DQ64P50 | 136 / 142, 136 / 141 | 13.5 GB | 15.2-15.4 GB |
+
+loop348 had 856 MB anonymous per key at 99 keys (85.6 GB). Per peer, (anon - 65 MB) / peers: 0.68 MB (DQ64), 0.71 (D), 1.08 (Q64), against 8.1 MB; at 21 keys 7.2 -> 2.3 (Q64) and 2.4 (D). The memory is flat from the start of the flood (no 60 s ramp to 986 MB).
+
+**Which candidate K99D selects.** Section 7.5: A and B predict at most 250 MB a key, C at least 450. K99D reads **135 MB: A / B (gossipsub per-peer state fed by vote gossip), not C (per-connection fixed state)**. K99Q64 (bound, no direct) reads 171 MB, so the queue bound alone removes 80% of the memory; A (the 5,000-message send queues) is the main holder, and since `N42_GOSSIP_HANDLER_QUEUE` and `N42_GOSSIP_MAX_IHAVE` were always set together the legs cannot split A from B. The 65 MB base and the ~0.7 MB per peer left are connection state (C). Direct and the bound do not add: DQ64 equals D.
+
+**Rate, E=1 (w1 / w2 / w3 in M TPS; round in M transactions; every block full, 99-100%):**
+
+| leg | keys | w1 | w2 | w3 | round | cycle mean / median / p90 ms (w1) |
+| --- | --- | --- | --- | --- | --- | --- |
+| K7DQ64 | 7 | 3.207 | 3.100 | 3.167 | 284.2 | 61.9 / 61.4 / 66.4 |
+| K21 | 21 | 3.173 | 3.033 | 2.973 | 275.4 | 62.9 / 61.3 / 68.2 |
+| K21Q64 | 21 | 3.087 | 2.980 | 3.013 | 272.4 | 64.6 / 61.5 / 77.0 |
+| K21D | 21 | 3.173 | 3.033 | 3.000 | 276.2 | 63.2 / 61.4 / 68.5 |
+| K21DQ64 | 21 | 3.140 | 3.100 | 3.060 | 279.0 | 63.7 / 61.4 / 69.4 |
+| K99DQ64 | 99 | 2.567 | 2.640 | 2.667 | 236.2 | 77.6 / 62.3 / 115.0 |
+| K99DQ64b | 99 | 2.687 | 2.660 | 2.653 | 240.0 | 73.9 / 62.2 / 107.7 |
+| K99D | 99 | 2.627 | 2.620 | 2.600 | 235.4 | 75.7 / 63.2 / 111.6 |
+| K99Q64 | 99 | 2.107 | 2.120 | 2.140 | 191.0 | 94.3 / 90.6 / 109.1 |
+| K99DQ64AQG | 99 | 2.720 | 2.687 | 2.587 | 239.8 | 73.0 / 62.2 / 103.7 |
+| K99DQ64P50 (50 ms) | 99 | 2.627 | 2.667 | 2.567 | 235.8 | 75.3 / 62.5 / 121.3 |
+
+**99 keys now hold three windows**, in every D leg (no window below 2.57M). K99DQ64 pair (window 1 / mean of windows 2-3): 2.627M / 2.655M; K7 (loop348's K7 / K7b base) 3.170M / 3.099M and K7DQ64 3.207M / 3.133M: 99 keys run at **83% (w1) and 86% (w2-3) of the 7-key rate**, against 73% and collapse in loop348 (K99A 2.29M, 1.07M, 0). At 21 keys nothing moves (control 3.173 / 3.003, Q64 3.087 / 2.997, D 3.173 / 3.017, DQ64 3.140 / 3.080: all inside 5%), and the 7-key cost of Q64 + D is none (3.207 / 3.133 against 3.170 / 3.099). What still binds at 99 keys: the tick in the median (cycle median 62.3 ms against 61.4 at 7 keys, binding word tick 85-90%) and the tail (p90 104-115 ms against 66-69; quorum binds 10-14% of cycles at a mean of 121-128 ms; `slow step` lines 48-62 a leg, kind `other`, max 60 ms). The 50 ms leg (K99DQ64P50) proposes 4,739 views (4,162-4,196 at 60 ms) but commits the same 2.6M: the cycle median stays 62.5 ms.
+
+**The vote road at 99 keys with D (leaders' view).** `verify_us` 12.2 ms for `verify_n` 196 votes in 2 batches (62 us a vote; loop348's K99A: 19.0 ms for 170 in 3; the sequential estimate was 145 ms); first vote to quorum 2.3 / 2.4 ms (R1 / R2; 13.9 / 12.7 with gossip), quorum to last vote 0.9 / 0.9 ms (21.5 / 25.8), proposal to the slowest key's vote 7.3 / 22.2 ms (52.7 / 84.4), R1 / R2 collect 16 / 14 ms. Direct share of the leaders' votes (their cumulative counters, approximate) 99.9% in K99DQ64b, 98.9-99.0% in K99D, AQG and P50, 77% at 7 keys (K7DQ64: the hello is slower than the vote traffic of a small mesh); fallbacks to gossip 4,092 in the b and c legs (0 in K99DQ64), duplicates 0. `verify_fallbacks` 0 in every D leg. `gossip_poll_us` 5.1-5.5 ms a block (inline), `inbound_queue_max` 0; with G (K99DQ64AQG) `inbound_queue_max` 32 (max 113), `straggler_waits` 0. Validator CPU: 17.7-22.1 cores (K99A of loop348: 21.6; K99 with gossip votes in loop347: 25), 15.4-16.5 in window 1 by the layer's measure.
+
+**K99Q64 (the bound without direct) costs.** 2.11M, cycle median 90.6 ms, validators 72-74 cores (against 18), 15,108 `slow step` lines, `verify_fallbacks` 1,864 in 3,306 blocks, `straggler_waits` 2,474 of 3,310 proposals (median 17.6 ms, max 611 ms). A queue of 64 drops forwarded votes under the full vote fan-out; the vote is then recovered by IHAVE / IWANT and batches fail and fall back to one-by-one checks (inferred; not traced). So the bound is only safe with D, or after the vote fan-out is cut.
+
+**Starvation signature (loop347/348 against loop349 K99DQ64 / K99DQ64b):** layer cores busy in window 1 10-12 -> 31-32; layer peak RSS 14.6 -> 37 GB; major faults per build 7,497 (loop347) -> 0; persistence per block 152-254 ms -> 34 / 37 / 40 ms (7 keys 32-37); in-memory blocks max 28 -> 11; `MemAvailable` floor 1.2-3 GB -> no `MEMORY FLOOR` line.
+
+**Correctness.** `invalid_blocks` 0, `fields_mismatches` 0, `own_executed_again` 0, `proposals_given_up` 0, tc 0, `fleet7-verify` pass on all 11 legs, including every 99-key leg (loop348's K99A: tc 7, 8 give-ups, no answer). Silent key: no `held far too long` WARN in any leg and no view with fewer votes than keys (`views with fewer than 98 votes received` 0); one `NO BODY ... cannot vote on it` line per validator that missed the first block before its mesh formed (15-18 of 21 keys, 94-96 of 99, 0 of 7), at start-up, as before the fix; no key stayed silent. `verify_fallbacks` 1 in K7DQ64, 1,864 in K99Q64 (above), 0 elsewhere (loop348 had 3 and 106).
+
+**Answers.** Both brought 99 keys under 30 GB: the bound alone to 16.9 GB, direct alone to 13.4 GB, both 13.1 GB. K99D selects A / B. 99 keys hold three windows at 2.6-2.7M, 83-86% of 7 keys. No correctness counter moved. Next: find the tail (p90 105-115 ms, quorum binding 10-14%) and the remaining 14-17%, with K99DQ64AQG (2.72 / 2.69 / 2.59M) and a longer run of the K99DQ64P50 shape as the base.
+
+Hand-off files: `scripts/fleet7-runs/results/loop349{a,b,c}.out`, `manykeys-loop349*.txt`, `valmem-loop349*.txt`.

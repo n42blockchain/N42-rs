@@ -789,3 +789,72 @@ fn the_batch_states_bundles_equal_the_states_through_the_index() {
     assert_same("index", &indexed_ours, &indexed_theirs);
     assert_same("index against the graft", &indexed_ours, &direct_theirs);
 }
+
+/// `N42_MERGE_AT_SHARDS_READY` (`docs/SHARED_EXECUTION_SCOPE.md` 18.7 item
+/// 3): the merge on a pool of its own, parallel by source map
+/// (`FrozenShards::merged_on`), is the serial merge's bundle -- every account,
+/// the contracts, the reverts in their order and the sizes (the account map's
+/// iteration order is no property of either: its hasher is seeded per map,
+/// so two serial merges of the same shards iterate differently, and every
+/// consumer sorts) -- at 1, 16 and 64 shards, in every index mode and live
+/// deferral, on a one-thread and a four-thread pool, with the build pool busy
+/// beside it; and it equals the direct graft. The QMDB operations and the
+/// hashed post-state derived from it are the serial merge's.
+#[test]
+fn the_merge_on_its_own_pool_equals_the_serial_merge() {
+    use rayon::prelude::*;
+    let pools: Vec<rayon::ThreadPool> =
+        [1, 4].into_iter().map(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().expect("a pool for the test")).collect();
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let (expected, _) = direct(&db, bundles.clone(), false);
+    for count in [1, 16, 64] {
+        for mode in MODES {
+            let deferrals: &[Option<bool>] = if mode.live { &[None, Some(true), Some(false)] } else { &[None] };
+            for &deferral in deferrals {
+                let mut shards = shards_with(count, mode);
+                if let Some(forced) = deferral {
+                    shards.set_live_defer(true, forced);
+                }
+                for bundle in bundles.clone() {
+                    shards.add(bundle);
+                }
+                let (shards, residual) = sharded_parts(&db, shards.freeze());
+                let serial = shards.merged(&residual);
+                for pool in &pools {
+                    let label = format!("{count} shards, index {mode}, deferral {deferral:?}, {} threads", pool.current_num_threads());
+                    let ((parallel, split), _) = rayon::join(
+                        || shards.merged_on(&residual, pool),
+                        || {
+                            n42_engine_types::parallel_transfer::build_pool()
+                                .install(|| (0..200_000u64).into_par_iter().map(|i| i.wrapping_mul(i)).sum::<u64>())
+                        },
+                    );
+                    assert!(split.total_us >= split.append_us, "{label}: split");
+                    assert_same(&format!("{label}: against the serial merge"), &serial, &parallel);
+                    assert_same(&format!("{label}: against the graft"), &expected, &parallel);
+                    for prague in [false, true] {
+                        assert_eq!(
+                            n42_qmdb_reth::sorted_operations_from_execution(&parallel, prague),
+                            n42_qmdb_reth::sorted_operations_from_execution(&serial, prague),
+                            "{label}: QMDB operations, prague {prague}"
+                        );
+                    }
+                    let (parallel_accounts, serial_accounts): (Vec<_>, Vec<_>) =
+                        (parallel.state.iter().collect(), serial.state.iter().collect());
+                    assert_eq!(
+                        hashed_post_state_of(&parallel_accounts),
+                        hashed_post_state_of(&serial_accounts),
+                        "{label}: hashed post-state"
+                    );
+                    // The graft's own reverts appended after either merge.
+                    let mut tail = (serial.clone(), parallel.clone());
+                    let extra = vec![(addr(77_000_001), Default::default()), (addr(77_000_002), Default::default())];
+                    append_reverts(&mut tail.0, extra.clone());
+                    append_reverts(&mut tail.1, extra);
+                    assert_same(&format!("{label}: with the graft's reverts"), &tail.0, &tail.1);
+                }
+            }
+        }
+    }
+}

@@ -898,6 +898,12 @@ struct LeaderMerge {
     accounts: usize,
     /// The merged bundle's reverts.
     reverts: usize,
+    /// `N42_MERGE_AT_SHARDS_READY`: the merge ran from `shards_ready` on
+    /// the merge pool.
+    early: bool,
+    /// How long the merger thread (spawned after the fields' publication)
+    /// waited for the early merge to end, us: 0 when it had ended.
+    join_wait_us: u64,
 }
 
 fn failed_after_seal(sealed: Option<(B256, u64)>, err: PayloadBuilderError) -> PayloadBuilderError {
@@ -3166,6 +3172,9 @@ where
             let root_started_at: Option<std::time::Instant>;
             let root_ended_at: Option<std::time::Instant>;
             let mut view_ready_at: Option<std::time::Instant> = None;
+            // When the shards were filed (`shards_ready`): the child's open
+            // proceeds from here.
+            let mut shards_ready_at: Option<std::time::Instant> = None;
             let fields_published_at = std::cell::Cell::new(None::<std::time::Instant>);
             // `N42_FIELDS_AT_SEAL=verify`: what the fields were published
             // from, compared behind `Complete` with the late derivation.
@@ -3288,13 +3297,54 @@ where
                 crate::built_executions::ShardedParent { residual: Arc::clone(&residual), shards: Arc::clone(&shards) },
             );
             shard_ready_ms = finish_at.elapsed().as_millis() as u64;
+            shards_ready_at = Some(std::time::Instant::now());
+            let shard_reverts = std::mem::take(&mut par_reverts);
+            // `N42_MERGE_AT_SHARDS_READY=1`: every input of the merge is in
+            // hand now (the shards frozen, the residual taken, the graft's
+            // reverts): it starts here on its own pool instead of after the
+            // fields' publication on one thread. The receipts are not an
+            // input (they join the merged bundle in the output below), and
+            // `StateReady` and `Complete` stay where they are: after the
+            // publication, which files this block's QMDB tree.
+            type EarlyMerge = (revm::database::BundleState, crate::output_shards::MergeSplit, u64, u32, std::time::Instant, std::time::Instant);
+            let (early_merge, shard_reverts): (Option<std::thread::JoinHandle<EarlyMerge>>, _) =
+                match crate::output_shards::merge_at_shards_ready().then(crate::output_shards::merge_pool).flatten() {
+                    Some(pool) => {
+                        let (shards, residual) = (Arc::clone(&shards), Arc::clone(&residual));
+                        let threads = u32::try_from(pool.current_num_threads()).unwrap_or(u32::MAX);
+                        // The graft's reverts reach the thread through a
+                        // cell, so a thread that cannot be had leaves them
+                        // here for the merge after the publication.
+                        let reverts_cell = Arc::new(std::sync::Mutex::new(Some(shard_reverts)));
+                        let cell = Arc::clone(&reverts_cell);
+                        let spawned = std::thread::Builder::new().name("n42-merge-early".into()).spawn(move || {
+                            n42_core_layout::background_thread();
+                            let reverts = cell.lock().ok().and_then(|mut cell| cell.take()).unwrap_or_default();
+                            let merge_at = std::time::Instant::now();
+                            let (mut merged, split) = shards.merged_on(&residual.state, pool);
+                            let tail_at = std::time::Instant::now();
+                            crate::parallel_transfer::append_reverts(&mut merged, reverts);
+                            let merge_end = std::time::Instant::now();
+                            let tail_us = merge_end.duration_since(tail_at).as_micros() as u64;
+                            (merged, split, tail_us, threads, merge_at, merge_end)
+                        });
+                        match spawned {
+                            Ok(handle) => (Some(handle), Vec::new()),
+                            Err(err) => {
+                                tracing::warn!(target: "payload_builder", %err, "no thread for the early merge; it runs after the fields' publication");
+                                let back = reverts_cell.lock().ok().and_then(|mut cell| cell.take()).unwrap_or_default();
+                                (None, back)
+                            }
+                        }
+                    }
+                    None => (None, shard_reverts),
+                };
             let residual_state = &residual.state;
             let overlaps = shards.overlaps(residual_state);
             let view = shards.view(residual_state, &overlaps);
             view_ready_at = Some(std::time::Instant::now());
             let destroyed = crate::output_shards::any_destroyed(&view);
             let hashed_off = n42_qmdb_reth::n42_state::hashed_tables_off();
-            let shard_reverts = std::mem::take(&mut par_reverts);
             let view_ref = &view;
             let publish_ref = &publish;
             // The order behind the seal (BREAKTHROUGH_DESIGN 10.16): the QMDB
@@ -3399,21 +3449,39 @@ where
                         // shards frozen, the residual taken, the publication
                         // done): the merge waits for nothing, and its phases
                         // say where its wall goes (`merge_*` on the line).
-                        let merge_at = std::time::Instant::now();
-                        let (mut merged, split) = shards.merged_timed(&residual.state, false);
-                        let tail_at = std::time::Instant::now();
-                        crate::parallel_transfer::append_reverts(&mut merged, shard_reverts);
-                        let merge_end = std::time::Instant::now();
+                        // With the early merge it only takes that merge's
+                        // result, waiting for it if it is still running.
+                        let joined_at = std::time::Instant::now();
+                        let early = early_merge.map(|handle| {
+                            handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                        });
+                        let join_wait_us = early.as_ref().map_or(0, |_| joined_at.elapsed().as_micros() as u64);
+                        let (merged, split, tail_us, threads, merge_at, merge_end, was_early) = match early {
+                            Some((merged, split, tail_us, threads, merge_at, merge_end)) => {
+                                (merged, split, tail_us, threads, merge_at, merge_end, true)
+                            }
+                            None => {
+                                let merge_at = std::time::Instant::now();
+                                let (mut merged, split) = shards.merged_timed(&residual.state, false);
+                                let tail_at = std::time::Instant::now();
+                                crate::parallel_transfer::append_reverts(&mut merged, shard_reverts);
+                                let merge_end = std::time::Instant::now();
+                                let tail_us = merge_end.duration_since(tail_at).as_micros() as u64;
+                                (merged, split, tail_us, 1, merge_at, merge_end, false)
+                            }
+                        };
                         let merge_ms = merge_end.duration_since(merge_at).as_millis() as u64;
                         let timing = LeaderMerge {
                             started: Some(merge_at),
                             ended: Some(merge_end),
                             split,
-                            tail_us: merge_end.duration_since(tail_at).as_micros() as u64,
-                            threads: 1,
+                            tail_us,
+                            threads,
                             accounts: merged.state.len(),
                             reverts: merged.reverts.iter().map(Vec::len).sum(),
                             state_ready: None,
+                            early: was_early,
+                            join_wait_us,
                         };
                         let execution_output =
                             Arc::new(reth_execution_types::BlockExecutionOutput { state: merged, result: execution_result });
@@ -3566,6 +3634,9 @@ where
                     seal_to_finish_us = crate::fields_at_seal::us_between(sealed_instant, Some(finish_at)),
                     seal_to_bundle_us = crate::fields_at_seal::us_between(sealed_instant, Some(bundle_taken_at)),
                     seal_to_view_us = crate::fields_at_seal::us_between(sealed_instant, view_ready_at),
+                    // The shards filed (`shards_ready`): what the child's
+                    // open waits for (`docs/SHARED_EXECUTION_SCOPE.md` 18.2).
+                    seal_to_shards_ready_us = crate::fields_at_seal::us_between(sealed_instant, shards_ready_at),
                     seal_to_rename_us = crate::fields_at_seal::us_between(sealed_instant, renamed_at.get()),
                     rename_wait_us = rename_wait_us.get(),
                     seal_to_root_start_us = crate::fields_at_seal::us_between(sealed_instant, root_started_at),
@@ -3731,6 +3802,11 @@ where
                     merge_threads = leader_merge.threads,
                     merge_accounts = leader_merge.accounts,
                     merge_reverts = leader_merge.reverts,
+                    // `N42_MERGE_AT_SHARDS_READY`: the merge ran from the
+                    // shards' filing on its own pool, and how long the
+                    // merger (after the fields' publication) waited for it.
+                    merge_early = leader_merge.early,
+                    merge_join_wait_us = leader_merge.join_wait_us,
                     // The shard path's QMDB root job, us: its operations
                     // (the leaves encoded on the global pool, the chunks
                     // joined, the sort) and the forest's compute (the lock,

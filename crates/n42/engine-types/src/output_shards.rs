@@ -129,6 +129,43 @@ pub fn live_index_defer() -> bool {
     *ON.get_or_init(|| std::env::var("N42_LIVE_INDEX_DEFER").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `N42_MERGE_AT_SHARDS_READY=1` (off by default,
+/// `docs/SHARED_EXECUTION_SCOPE.md` 18.7 item 3): the leader's shard merge
+/// starts the moment the shards are filed (`shards_ready`, seal + ~18 ms at
+/// 200k) on a pool of its own ([`merge_pool`]), parallel by source map
+/// ([`FrozenShards::merged_on`]), instead of after the block's fields are
+/// published (seal + ~54 ms) on one thread. The merged bundle is the same
+/// bundle, built in the same insertion order; `StateReady` and `Complete`
+/// stay where they are in the finish's order (after the fields'
+/// publication), so they no longer wait for a merge. Read once.
+pub fn merge_at_shards_ready() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_MERGE_AT_SHARDS_READY").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The early merge's pool (`n42-merge-*`, `N42_MERGE_POOL_THREADS`, 16 by
+/// default): not the build pool (the child's execution runs there while the
+/// parent merges) and not the freeze's. `None` when no pool could be made;
+/// the merge then runs on one thread as before.
+pub fn merge_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("N42_MERGE_POOL_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|n: &usize| *n > 0)
+            .unwrap_or(16);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("n42-merge-{i}"))
+            .start_handler(|_| n42_core_layout::background_thread())
+            .build()
+            .inspect_err(|err| tracing::warn!(target: "payload_builder", %err, "no pool for the early merge; it runs on one thread"))
+            .ok()
+    })
+    .as_ref()
+}
+
 /// How a live hand-over treats a busy shard: wait for it (the default),
 /// leave it to the freeze (`N42_LIVE_INDEX_DEFER=1`), or, for tests, leave
 /// every other shard to the freeze whatever its lock says.
@@ -1549,6 +1586,128 @@ impl FrozenShards {
             total_us: started.elapsed().as_micros() as u64,
         };
         (bundle, split)
+    }
+
+    /// [`Self::merged_timed`] on `pool`, parallel by source map: every source
+    /// map (a v4 shard's, or in index mode a batch's and a shard's conflicts)
+    /// is cloned -- with the residual laid over the accounts it also holds --
+    /// on a task of its own, and the copies are then inserted into the one
+    /// map in the serial merge's source order (a later source's account
+    /// replaces an earlier one's, as there): the same map. Its iteration
+    /// order is no property of either merge (the map's hasher is seeded per
+    /// map); every consumer sorts. The revert set is copied per source on the pool and sorted
+    /// as the serial merge sorts it; the account map and the reverts run at
+    /// once. `split.state_us` is the map's wall (the clones and the inserts).
+    pub fn merged_on(&self, residual: &BundleState, pool: &rayon::ThreadPool) -> (BundleState, MergeSplit) {
+        pool.install(|| {
+            let started = std::time::Instant::now();
+            let (((state, size), state_us), (reverts, reverts_us)) = rayon::join(
+                || {
+                    let at = std::time::Instant::now();
+                    let state = self.merged_state_parallel(residual);
+                    (state, at.elapsed().as_micros() as u64)
+                },
+                || {
+                    let at = std::time::Instant::now();
+                    let reverts = self.merged_reverts_parallel();
+                    (reverts, at.elapsed().as_micros() as u64)
+                },
+            );
+            let mut contracts = self.contracts.clone();
+            contracts.extend(residual.contracts.iter().map(|(hash, code)| (*hash, code.clone())));
+            let block_reverts = residual.reverts.clone();
+            let reverts_size = block_reverts.iter().map(Vec::len).sum();
+            let state_size = usize::try_from(size.max(0)).unwrap_or(usize::MAX);
+            let mut bundle = BundleState { state, contracts, reverts: block_reverts, state_size, reverts_size };
+            let append_at = std::time::Instant::now();
+            crate::parallel_transfer::append_sorted_reverts(&mut bundle, reverts);
+            let split = MergeSplit {
+                state_us,
+                reverts_us,
+                append_us: append_at.elapsed().as_micros() as u64,
+                total_us: started.elapsed().as_micros() as u64,
+            };
+            (bundle, split)
+        })
+    }
+
+    /// The source maps in the serial merge's order: the v4 shards', then
+    /// (index mode) the batches' and the conflicts'.
+    fn source_maps(&self) -> Vec<&AddressHashMap<BundleAccount>> {
+        let mut sources: Vec<&AddressHashMap<BundleAccount>> = self.shards.iter().map(|shard| &shard.state).collect();
+        if let Some(indexed) = &self.indexed {
+            sources.extend(indexed.batches.iter().map(|batch| &batch.accounts).chain(indexed.conflicts.iter()));
+        }
+        sources
+    }
+
+    /// [`Self::merged_state`], the clones on the current pool (see
+    /// [`Self::merged_on`]).
+    fn merged_state_parallel(&self, residual: &BundleState) -> (AddressHashMap<BundleAccount>, i128) {
+        use rayon::prelude::*;
+        let newer = &residual.state;
+        let sources = self.source_maps();
+        // Each source's accounts in its own iteration order, the residual
+        // laid over the ones it also holds, with the size that changes.
+        let copies: Vec<(Vec<(Address, BundleAccount)>, i128)> = sources
+            .par_iter()
+            .map(|map| {
+                let mut out = Vec::with_capacity(map.len());
+                let mut delta = 0i128;
+                for (address, account) in map.iter() {
+                    match newer.get(address) {
+                        Some(over) => {
+                            let merged = overlaid(account, over);
+                            delta += merged.size_hint() as i128 - account.size_hint() as i128 - over.size_hint() as i128;
+                            out.push((*address, merged));
+                        }
+                        None => out.push((*address, account.clone())),
+                    }
+                }
+                (out, delta)
+            })
+            .collect();
+        let total: usize = self.accounts() + newer.len();
+        let mut state: AddressHashMap<BundleAccount> = Default::default();
+        state.reserve(total);
+        let mut size = residual.state_size as i128;
+        size += self.indexed.as_ref().map_or(0, |indexed| indexed.state_size as i128);
+        size += self.shards.iter().map(|shard| shard.state_size as i128).sum::<i128>();
+        // The inserts in the serial merge's order, into the same capacity.
+        for (copy, delta) in copies {
+            size += delta;
+            for (address, account) in copy {
+                state.insert(address, account);
+            }
+        }
+        for (address, account) in newer {
+            if !self.holds(address) {
+                state.insert(*address, account.clone());
+            }
+        }
+        (state, size)
+    }
+
+    /// [`Self::merged_reverts`], the copies on the current pool.
+    fn merged_reverts_parallel(&self) -> Vec<(Address, AccountRevert)> {
+        use rayon::prelude::*;
+        let mut parts: Vec<Vec<(Address, AccountRevert)>> =
+            self.shards.par_iter().map(|shard| shard.reverts.clone()).collect();
+        if let Some(indexed) = &self.indexed {
+            parts.extend(
+                indexed
+                    .kept
+                    .par_iter()
+                    .map(|kept| kept.iter().filter_map(|&slot| indexed.revert(slot)).cloned().collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let mut reverts = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+        for part in parts {
+            reverts.extend(part);
+        }
+        crate::parallel_transfer::sort_reverts(&mut reverts);
+        reverts
     }
 
     /// The merged account map and its size: the shards' accounts with the

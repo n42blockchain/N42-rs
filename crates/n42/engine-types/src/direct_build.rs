@@ -2356,6 +2356,77 @@ mod tests {
         (sealed, built_hash)
     }
 
+    /// `N42_SHARDS_BEFORE_RECEIPTS` (`docs/SHARED_EXECUTION_SCOPE.md` 18.7
+    /// item 4a) files the shards before the block's receipts exist: a pure
+    /// reordering only if the child's open reads nothing of them. The same
+    /// shard set and residual filed with the block's receipts and gas in the
+    /// residual's result and without them open to the same state: every
+    /// account the batch or the residual wrote, an untouched and an absent
+    /// one, and `BLOCKHASH` of the parent.
+    #[test]
+    fn a_sharded_parent_opens_the_same_with_or_without_its_receipts() {
+        let _guard = store_lock();
+        leader_layers::clear();
+        let (a, b, coinbase, untouched, absent) = (
+            Address::with_last_byte(0x61),
+            Address::with_last_byte(0x62),
+            Address::with_last_byte(0x63),
+            Address::with_last_byte(0x64),
+            Address::with_last_byte(0x65),
+        );
+        let engine = || {
+            let m = MockEthProvider::default();
+            m.add_account(a, ExtendedAccount::new(1, U256::from(10)));
+            m.add_account(coinbase, ExtendedAccount::new(0, U256::from(1)));
+            m.add_account(untouched, ExtendedAccount::new(4, U256::from(40)));
+            m
+        };
+        let open = |number: u64, receipts: Vec<n42_tx_types::Receipt>, gas_used: u64| {
+            let header = Header { number, parent_hash: B256::with_last_byte(0x60), gas_used: 42_000, ..Default::default() };
+            let residual = BundleState::builder(number..=number).state_present_account_info(coinbase, info(0, 9)).build();
+            let mut execution = execution_of(&header, residual);
+            let mut output = (*execution.execution_output).clone();
+            output.result.receipts = receipts;
+            output.result.gas_used = gas_used;
+            execution.execution_output = Arc::new(output);
+            let built_hash = execution.block.hash();
+            let sealed = SealedHeader::seal_slow(Header { extra_data: format!("view {number}").into_bytes().into(), ..header });
+            let shards = crate::output_shards::OutputShards::with_index_live(Address::with_last_byte(0x01), 4, 16, true, true);
+            shards.add(
+                BundleState::builder(number..=number)
+                    .state_original_account_info(a, info(1, 10))
+                    .state_present_account_info(a, info(2, 5))
+                    .state_original_account_info(b, info(0, 0))
+                    .state_present_account_info(b, info(0, 5))
+                    .build(),
+            );
+            crate::built_executions::remember_pending(built_hash, execution.block.clone());
+            crate::built_executions::shards_ready(
+                built_hash,
+                crate::built_executions::ShardedParent { residual: execution.execution_output.clone(), shards: Arc::new(shards.freeze()) },
+            );
+            let state = opener_on_sealed_parent_with(Scripted::new(engine()), sealed.clone(), built_hash, 1)().expect("the child opens");
+            (state, sealed)
+        };
+        let receipt = |cumulative_gas_used: u64| n42_tx_types::Receipt {
+            tx_type: Default::default(),
+            success: true,
+            cumulative_gas_used,
+            logs: Vec::new(),
+        };
+        let (without, without_sealed) = open(331, Vec::new(), 0);
+        let (with, with_sealed) = open(332, vec![receipt(21_000), receipt(42_000)], 42_000);
+        let read = |state: &StateProviderBox, x: Address| state.basic_account(&x).expect("read").map(|x| (x.nonce, x.balance));
+        for x in [a, b, coinbase, untouched, absent] {
+            assert_eq!(read(&with, x), read(&without, x), "{x}: the receipts change no read");
+        }
+        assert_eq!(read(&with, a), Some((2, U256::from(5))));
+        assert_eq!(read(&with, coinbase), Some((0, U256::from(9))));
+        assert_eq!(with.block_hash(332).expect("read"), Some(with_sealed.hash()));
+        assert_eq!(without.block_hash(331).expect("read"), Some(without_sealed.hash()));
+        leader_layers::clear();
+    }
+
     #[test]
     fn the_layer_count_parses_two_to_eight_and_defaults_to_two() {
         assert_eq!(leader_layers::parse_depth(None), Some(2));

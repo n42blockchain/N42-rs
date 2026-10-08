@@ -1666,6 +1666,10 @@ where
     // executor's finish reports, built beside the parallel step instead of one executor commit
     // per transaction (see `direct_receipts_enabled`); taken by the finish behind the seal.
     let mut direct_receipts: Option<(Vec<n42_tx_types::Receipt>, u64)> = None;
+    // `N42_SHARDS_BEFORE_RECEIPTS=1`: the same receipts, still being built on
+    // a thread of their own when the shards are filed; joined where the
+    // receipts are first read (the receipts root behind the seal).
+    let mut receipts_pending: Option<std::thread::JoinHandle<(Vec<n42_tx_types::Receipt>, u64)>> = None;
     // The block's body as the same parallel pass leaves it, already split into
     // the transactions and their senders: the seal wants those two vectors and
     // used to make them by moving 163,000 recovered transactions through one
@@ -2617,10 +2621,58 @@ where
                     // thread panicked; the graft is not run and the build
                     // fails behind its seal.
                     let mut freeze_failed = false;
+                    // `N42_SHARDS_BEFORE_RECEIPTS=1` on a block whose output
+                    // stays in its shards: the receipts are built on a thread
+                    // that owns their inputs (the slots and the candidates,
+                    // shared), so the shards are filed without waiting for
+                    // them (`docs/SHARED_EXECUTION_SCOPE.md` 18.7 item 4a):
+                    // the child reads the shards, never the receipts.
+                    let mut cands_shared: Option<Arc<Vec<_>>> = None;
+                    if receipts_behind && shards_stay && crate::output_shards::shards_before_receipts() {
+                        let shared = Arc::new(std::mem::take(&mut cands));
+                        let inputs = Arc::new(std::sync::Mutex::new(Some((std::mem::take(&mut run.slots), Arc::clone(&shared)))));
+                        let taken = Arc::clone(&inputs);
+                        let spawned = std::thread::Builder::new().name("n42-receipts-late".into()).spawn(move || {
+                            let Some((slots, pulled)) = taken.lock().ok().and_then(|mut cell| cell.take()) else {
+                                return (Vec::new(), 0);
+                            };
+                            let refs: Vec<_> = slots.iter().filter_map(std::sync::OnceLock::get).collect();
+                            let (cumulative, tx_gas) = cumulative_gas(&refs);
+                            let receipts = if crate::parallel_transfer::freeze_pool_own() {
+                                crate::parallel_transfer::behind_pool().install(|| receipts_from_slots(&refs, &cumulative, &pulled))
+                            } else {
+                                receipts_from_slots(&refs, &cumulative, &pulled)
+                            };
+                            drop(refs);
+                            // The slots' 77 MB are freed on the pool, off this thread.
+                            crate::parallel_transfer::behind_pool().spawn(move || drop((slots, pulled)));
+                            (receipts, tx_gas)
+                        });
+                        match spawned {
+                            Ok(handle) => {
+                                receipts_pending = Some(handle);
+                                cands_shared = Some(shared);
+                            }
+                            Err(err) => {
+                                // No thread: the inputs come back and the
+                                // receipts are built in the scope, as before.
+                                tracing::warn!(target: "payload_builder", %err, "no thread for the late receipts; built beside the graft");
+                                if let Some((slots, pulled)) = inputs.lock().ok().and_then(|mut cell| cell.take()) {
+                                    run.slots = slots;
+                                    drop(pulled);
+                                }
+                                match Arc::try_unwrap(shared) {
+                                    Ok(back) => cands = back,
+                                    Err(still) => cands_shared = Some(still),
+                                }
+                            }
+                        }
+                    }
+                    let receipts_in_scope = receipts_behind && receipts_pending.is_none();
                     let (graft, early_root, receipts) = std::thread::scope(|scope| {
                         // Sealed at the execution's end: the receipts from the
                         // slots, beside the graft, instead of the root.
-                        let receipts_job = receipts_behind.then(|| {
+                        let receipts_job = receipts_in_scope.then(|| {
                             let slots: &[_] = &run.slots;
                             let pulled: &[_] = &cands;
                             scope.spawn(move || {
@@ -2817,8 +2869,11 @@ where
                     // transaction -- 5.2 s for a block's worth when the
                     // base fee had run past every candidate's fee (round 43).
                     // Given back with the leftovers at the end instead.
+                    // The candidates are shared with the late receipts'
+                    // thread when it runs (`N42_SHARDS_BEFORE_RECEIPTS`).
+                    let pulled_now: &[_] = cands_shared.as_deref().map_or(&cands[..], |shared| &shared[..]);
                     for i in run.skipped {
-                        deferred.push(Arc::clone(&cands[i]));
+                        deferred.push(Arc::clone(&pulled_now[i]));
                     }
                     // Why each skipped sender's head was refused, so the
                     // give-back below can say it. Handing every skipped
@@ -3099,8 +3154,24 @@ where
                 .map_err(|err| PayloadBuilderError::Internal(err.into()))?;
             // Receipts built beside the parallel step: the executor committed
             // none, so its finish reports none and no gas.
-            let direct_receipts_used = direct_receipts.is_some();
+            let receipts_late_used = receipts_pending.is_some();
+            let direct_receipts_used = direct_receipts.is_some() || receipts_late_used;
             if let Some((receipts, gas_used)) = direct_receipts {
+                execution_result.receipts = receipts;
+                execution_result.gas_used = gas_used;
+            }
+            // `N42_SHARDS_BEFORE_RECEIPTS`: the receipts still being built
+            // are joined where they are first read -- beside the QMDB root,
+            // after the shards are filed -- on the shard path, and here on any
+            // other (which never takes this road: it is chosen only for a
+            // block whose output stays in its shards).
+            let mut receipts_late = receipts_pending.take();
+            if output_shards.is_none()
+                && let Some(handle) = receipts_late.take()
+            {
+                let (receipts, gas_used) = handle.join().map_err(|_| {
+                    PayloadBuilderError::other(std::io::Error::other("the late receipts job panicked"))
+                })?;
                 execution_result.receipts = receipts;
                 execution_result.gas_used = gas_used;
             }
@@ -3199,6 +3270,9 @@ where
             // and how long its publication took.
             let root_split: n42_qmdb_reth::RootSplit;
             let root_publish_us = std::cell::Cell::new(0u64);
+            // `N42_SHARDS_BEFORE_RECEIPTS`: how long the receipts root waited
+            // for the late receipts, us (0 when they were in).
+            let receipts_late_wait_us = std::cell::Cell::new(0u64);
             let state_ready_ms;
             // The block's own execution fields, published the moment its QMDB
             // root is in: the child's header carries them (deferred
@@ -3361,8 +3435,18 @@ where
             // for it.
             let scoped = std::thread::scope(|scope| -> Result<_, PayloadBuilderError> {
                 let receipts = scope.spawn(move || {
+                    let mut execution_result = execution_result;
+                    // `N42_SHARDS_BEFORE_RECEIPTS`: the receipts join the
+                    // block's result here, after the shards were filed.
+                    let joined_at = std::time::Instant::now();
+                    if let Some(handle) = receipts_late {
+                        let (receipts, gas_used) = handle.join().map_err(|_| ())?;
+                        execution_result.receipts = receipts;
+                        execution_result.gas_used = gas_used;
+                    }
+                    let late_wait = joined_at.elapsed();
                     let roots = crate::hotstuff_consensus::gov5_receipt_root_bloom(&execution_result.receipts);
-                    (execution_result, roots)
+                    Ok::<_, ()>((execution_result, roots, late_wait))
                 });
                 rename_parent()?;
                 let parent_root_early = verify_fields.then(|| qmdb_state.root_of(&parent_sealed)).flatten();
@@ -3426,9 +3510,10 @@ where
                 let (prepared, root_started, root_ended, kept_ops, ops_timed) = root.join().map_err(|_| {
                     PayloadBuilderError::other(std::io::Error::other("the QMDB root job panicked"))
                 })?;
-                let (execution_result, roots) = receipts.join().map_err(|_| {
-                    PayloadBuilderError::other(std::io::Error::other("the receipts root panicked"))
+                let (execution_result, roots, late_wait) = receipts.join().ok().and_then(Result::ok).ok_or_else(|| {
+                    PayloadBuilderError::other(std::io::Error::other("the receipts root (or the late receipts) panicked"))
                 })?;
+                receipts_late_wait_us.set(late_wait.as_micros() as u64);
                 let published_at = std::time::Instant::now();
                 let fields = publish_ref(prepared, roots, execution_result.gas_used)?;
                 root_publish_us.set(published_at.elapsed().as_micros() as u64);
@@ -3637,6 +3722,11 @@ where
                     // The shards filed (`shards_ready`): what the child's
                     // open waits for (`docs/SHARED_EXECUTION_SCOPE.md` 18.2).
                     seal_to_shards_ready_us = crate::fields_at_seal::us_between(sealed_instant, shards_ready_at),
+                    // `N42_SHARDS_BEFORE_RECEIPTS`: the receipts were built
+                    // past the shards' filing, and how long their root then
+                    // waited for them.
+                    receipts_late = receipts_late_used,
+                    receipts_late_wait_us = receipts_late_wait_us.get(),
                     seal_to_rename_us = crate::fields_at_seal::us_between(sealed_instant, renamed_at.get()),
                     rename_wait_us = rename_wait_us.get(),
                     seal_to_root_start_us = crate::fields_at_seal::us_between(sealed_instant, root_started_at),
@@ -4039,7 +4129,7 @@ where
     }
     // Receipts built for an early seal belong to its finish; this block's
     // executor committed none of those transactions, so it must not go on.
-    if direct_receipts.is_some() {
+    if direct_receipts.is_some() || receipts_pending.is_some() {
         return Err(PayloadBuilderError::other(std::io::Error::other(
             "receipts were built for an early seal that did not happen",
         )));

@@ -143,6 +143,21 @@ pub fn merge_at_shards_ready() -> bool {
     *ON.get_or_init(|| std::env::var("N42_MERGE_AT_SHARDS_READY").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `N42_SHARDS_BEFORE_RECEIPTS=1` (off by default,
+/// `docs/SHARED_EXECUTION_SCOPE.md` 18.7 item 4a): on a block that seals at
+/// the execution's end with its output left in its shards, the receipts from
+/// the slots are built on a thread that owns their inputs instead of in the
+/// graft's scope, so the scope ends with the freeze and the cached accounts'
+/// take, the executor's finish follows, and the shards are filed
+/// (`shards_ready`) without waiting for the receipts. The receipts join the
+/// block's result where they are first read (the receipts root, beside the
+/// QMDB root). The child's open reads the shards and the residual only.
+/// Read once.
+pub fn shards_before_receipts() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_SHARDS_BEFORE_RECEIPTS").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// The early merge's pool (`n42-merge-*`, `N42_MERGE_POOL_THREADS`, 16 by
 /// default): not the build pool (the child's execution runs there while the
 /// parent merges) and not the freeze's. `None` when no pool could be made;

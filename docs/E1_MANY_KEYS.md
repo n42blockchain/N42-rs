@@ -19,7 +19,7 @@ the commit QC is dropped on the view mismatch (`voting.rs:252`) unverified. The 
 `ConsensusEngine::authenticate_vote_batch` (`state_machine.rs:722`, a randomised multi-pairing, ~0.5 ms a signature because every signature
 re-hashes the same message) and `process_authenticated_message` (`:996`) are called from tests only; `AggregateSignature::verify_aggregate`
 (`aggregate.rs:24`, `fast_aggregate_verify`) is used for QCs. Followers do not verify other keys' votes: a non-leader returns before the check
-(`voting.rs:75`); they still *decode* every vote (`h2_wire.rs:604` `BlsSignature::from_bytes`, a G2 decompression, ~60 us).
+(`voting.rs:78`); they still *decode* every vote (`h2_wire.rs:604` `BlsSignature::from_bytes`, a G2 decompression, ~60 us).
 
 Cost on the leader's loop per block, estimate (R1 N-1 verifies + R2 q-1): **7 keys 10 verifies = 11 ms; 21 keys 34 = 37 ms; 99 keys 164 = 180 ms**
 (+35 ms when the grace's late and progress votes pay their second attempt). On the *critical path* (quorum assembly: q-1 verifies for PrepareQC,

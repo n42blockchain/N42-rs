@@ -80,6 +80,8 @@ pub(crate) enum Command {
     RespondRange(RangeRequestChannel, Vec<Vec<u8>>),
     RespondBlock(BlockRequestChannel, Option<alloy_primitives::Bytes>),
     PushBlock(PeerId, alloy_primitives::Bytes),
+    /// A direct vote (or hello) for one peer; see [`crate::rpc::VOTE_PROTOCOL`].
+    SendVote(PeerId, crate::rpc::VoteRequest),
 }
 
 /// What the loop reads of the task's state without asking it.
@@ -287,5 +289,6 @@ fn apply(core: &mut TransportCore, command: Command) {
         Command::RespondRange(channel, rlps) => core.respond_range(channel, rlps),
         Command::RespondBlock(channel, rlp) => core.respond_block(channel, rlp),
         Command::PushBlock(peer, rlp) => core.push_block(peer, rlp),
+        Command::SendVote(peer, request) => core.send_vote(peer, request),
     }
 }

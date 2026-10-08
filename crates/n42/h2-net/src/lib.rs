@@ -39,7 +39,7 @@ pub use libp2p::PeerId;
 pub use rpc::{
     BlockChunk, BlockReply, BlockTxnsReply, BlockTxnsRequest, RangeReply, RangeRequest,
     BLOCK_BY_HASH_PROTOCOL, BLOCK_PUSH_PROTOCOL, BLOCK_TXNS_PROTOCOL, BODIES_BY_RANGE_PROTOCOL,
-    MAX_RANGE_BLOCKS,
+    MAX_RANGE_BLOCKS, VOTE_PROTOCOL, VoteRequest, vote_hello_message,
 };
 pub use config::{gov5_gossipsub_config, max_gossip_size, max_gossip_wire_size};
 pub use message_id::{gov5_message_id_fn, gov5_message_id_parts};

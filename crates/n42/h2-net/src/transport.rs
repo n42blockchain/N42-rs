@@ -331,6 +331,28 @@ pub enum TransportEvent {
         /// the one configured here.
         fork_matches: bool,
     },
+    /// A peer announced which validator it is over
+    /// [`crate::rpc::VOTE_PROTOCOL`]. Not verified here: the signature is
+    /// checked against the validator set by the consensus side, and only a
+    /// hello that verifies may route votes to `peer`.
+    VoteHello {
+        /// The peer (authenticated by the Noise handshake).
+        peer: PeerId,
+        /// The validator index it claims.
+        index: u32,
+        /// Its BLS signature over [`crate::rpc::vote_hello_message`].
+        signature: [u8; 96],
+    },
+    /// A vote that came straight from `peer` over
+    /// [`crate::rpc::VOTE_PROTOCOL`]: `inner` is the [`Self::Native`] or
+    /// [`Self::Envelope`] event its bytes decode to (or [`Self::Rejected`]),
+    /// exactly as if it had arrived by gossip.
+    DirectVote {
+        /// The peer that sent it.
+        peer: PeerId,
+        /// The decoded vote.
+        inner: Box<TransportEvent>,
+    },
     /// An outbound dial failed. Surfaced rather than swallowed: when a node
     /// sits there reporting nothing, the operator needs to know whether it is
     /// connected and idle or never connected at all.
@@ -376,6 +398,10 @@ pub(crate) struct H2Behaviour {
     /// members connected to a gov5 node for a minute without a single
     /// gossipsub RPC in either direction.
     identify: libp2p::identify::Behaviour,
+    /// N42's own: votes straight to the leader, see
+    /// [`crate::rpc::VOTE_PROTOCOL`]. Used only when a node sends on it
+    /// (`N42_VOTE_TRANSPORT`); a peer without it fails the request.
+    votes: crate::rpc::VoteBehaviour,
 }
 
 /// The swarm and its bookkeeping: what [`H2V4Transport`] polls on the
@@ -430,6 +456,7 @@ impl TransportCore {
                 libp2p::identify::Config::new(IDENTIFY_PROTOCOL_VERSION.into(), keypair.public())
                     .with_agent_version(format!("n42-rs/h2-net/{}", env!("CARGO_PKG_VERSION"))),
             ),
+            votes: crate::rpc::vote_behaviour(),
         };
 
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -724,6 +751,35 @@ impl TransportCore {
             .publish(self.block_topic.clone(), data)?)
     }
 
+    /// Sends a direct vote (or hello) to `peer`; fire and forget.
+    pub fn send_vote(&mut self, peer: PeerId, request: crate::rpc::VoteRequest) {
+        let _ = self.swarm.behaviour_mut().votes.send_request(&peer, request);
+    }
+
+    /// What a request on the vote protocol is, as a transport event.
+    fn direct_vote_event(&self, peer: PeerId, request: crate::rpc::VoteRequest) -> TransportEvent {
+        let inner = match request {
+            crate::rpc::VoteRequest::Hello { index, signature } => {
+                return TransportEvent::VoteHello { peer, index, signature };
+            }
+            crate::rpc::VoteRequest::Native(bytes) => match decode_gov5_gossip_message(&bytes) {
+                Ok(decoded) => TransportEvent::Native {
+                    from: Some(peer),
+                    message: Box::new(decoded),
+                },
+                Err(err) => TransportEvent::Rejected {
+                    from: Some(peer),
+                    reason: format!("direct vote: {err}"),
+                },
+            },
+            crate::rpc::VoteRequest::Envelope(bytes) => decode_payload_for(self.identity, Some(peer), &bytes),
+        };
+        TransportEvent::DirectVote {
+            peer,
+            inner: Box::new(inner),
+        }
+    }
+
     /// Publishes already-encoded bytes on one of the four topics.
     pub(crate) fn publish_raw(
         &mut self,
@@ -948,6 +1004,28 @@ impl TransportCore {
                     }
                 }
                 SwarmEvent::Behaviour(H2BehaviourEvent::BlockTxns(_)) => {}
+                SwarmEvent::Behaviour(H2BehaviourEvent::Votes(
+                    request_response::Event::Message { peer, message, .. },
+                )) => match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        let _ = self
+                            .swarm
+                            .behaviour_mut()
+                            .votes
+                            .send_response(channel, crate::status::RESPONSE_CODE_SUCCESS);
+                        return Some(self.direct_vote_event(peer, request));
+                    }
+                    request_response::Message::Response { .. } => {}
+                },
+                SwarmEvent::Behaviour(H2BehaviourEvent::Votes(
+                    request_response::Event::OutboundFailure { peer, error, .. },
+                )) => {
+                    // A peer without the protocol (every gov5 member) or one
+                    // that went away: the vote also went by gossip, or the
+                    // sender falls back to it.
+                    tracing::debug!(target: "n42.h2.net", %peer, %error, "direct vote not delivered");
+                }
+                SwarmEvent::Behaviour(H2BehaviourEvent::Votes(_)) => {}
                 SwarmEvent::Behaviour(H2BehaviourEvent::Status(
                     request_response::Event::Message { peer, message, .. },
                 )) => {
@@ -1302,6 +1380,15 @@ impl H2V4Transport {
                 }
                 peers.len()
             }
+        }
+    }
+
+    /// Sends a vote (or a hello) straight to `peer` over
+    /// [`crate::rpc::VOTE_PROTOCOL`]; fire and forget.
+    pub fn send_vote(&mut self, peer: PeerId, request: crate::rpc::VoteRequest) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.send_vote(peer, request),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::SendVote(peer, request)),
         }
     }
 

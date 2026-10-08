@@ -217,7 +217,10 @@ impl H2V4Observer {
             | TransportEvent::RangeRequest { peer, .. }
             | TransportEvent::RangeFetched { peer, .. }
             | TransportEvent::BlockTxnsRequested { peer, .. }
-            | TransportEvent::BlockTxnsFetched { peer, .. } => {
+            | TransportEvent::BlockTxnsFetched { peer, .. }
+            // Direct votes and their hellos are for leaders, not observers.
+            | TransportEvent::VoteHello { peer, .. }
+            | TransportEvent::DirectVote { peer, .. } => {
                 ObserverEvent::NonDecide { from: Some(peer) }
             }
             TransportEvent::Subscribed => ObserverEvent::Subscribed,

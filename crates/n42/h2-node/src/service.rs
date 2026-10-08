@@ -241,6 +241,11 @@ pub struct H2Service<E> {
     straggler_wait: Option<(u64, std::time::Instant)>,
     /// Proposals the straggler rule deferred at least once (cumulative).
     straggler_waits: u64,
+    /// Votes straight to the leader (`N42_VOTE_TRANSPORT`; see
+    /// [`crate::direct_votes`]).
+    direct_votes: crate::direct_votes::DirectVotes,
+    /// This validator's hello, signed once.
+    vote_hello: Option<[u8; 96]>,
     /// The leader's build throttle (see [`crate::build_throttle`] and
     /// [`Self::with_build_throttle`]). `None`: off, the default.
     build_throttle: Option<crate::build_throttle::BuildThrottle>,
@@ -1055,6 +1060,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             quorum_rule: crate::straggler::QuorumRule::default(),
             straggler_wait: None,
             straggler_waits: 0,
+            direct_votes: crate::direct_votes::DirectVotes::new(crate::direct_votes::VoteTransport::from_env()),
+            vote_hello: None,
             build_throttle: None,
             last_drain: (0, 0, 0, ""),
             proposed_view: None,
@@ -1267,6 +1274,13 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// wire and what a vote attests are unchanged.
     pub fn with_vote_aggregate(mut self, on: bool) -> Self {
         self.engine.set_vote_aggregate(on);
+        self
+    }
+
+    /// Chooses how votes travel (`N42_VOTE_TRANSPORT`, read by
+    /// [`Self::new`]); see [`crate::direct_votes`].
+    pub fn with_vote_transport(mut self, mode: crate::direct_votes::VoteTransport) -> Self {
+        self.direct_votes = crate::direct_votes::DirectVotes::new(mode);
         self
     }
 
@@ -2163,6 +2177,26 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             TransportEvent::PeerConnected(peer) => {
                 debug!(target: "n42.h2.node", %peer, "peer connected");
+                self.send_vote_hello(peer);
+            }
+            TransportEvent::PeerDisconnected(peer) => {
+                self.direct_votes.forget_peer(&peer);
+            }
+            TransportEvent::VoteHello { peer, index, signature } => {
+                let verified = n42_h2_primitives::BlsSignature::from_bytes(&signature).is_ok_and(|signature| {
+                    self.engine
+                        .verify_vote_hello(index, self.identity.genesis_hash, &peer.to_bytes(), &signature)
+                });
+                if verified {
+                    debug!(target: "n42.h2.node", %peer, index, "validator announced for direct votes");
+                    self.direct_votes.learn(index, peer);
+                } else {
+                    debug!(target: "n42.h2.node", %peer, index, "vote hello did not verify; ignored");
+                }
+            }
+            TransportEvent::DirectVote { inner, .. } => {
+                self.direct_votes.note_direct();
+                return self.handle_transport_event_inner(*inner);
             }
             TransportEvent::Rejected { reason, .. } => {
                 debug!(target: "n42.h2.node", reason, "dropped a gossip payload");
@@ -2181,6 +2215,11 @@ impl<E: ExecutionLayer> H2Service<E> {
             Ok(message) => {
                 if trace_messages() {
                     info!(target: "n42.h2.trace", kind = message_kind(&message), view = message.view(), "recv");
+                }
+                // A vote that came by both paths reaches the engine once
+                // (only while direct votes are in use; see `direct_votes`).
+                if !self.direct_votes.admit(&message) {
+                    return;
                 }
                 // `N42_VOTE_AGGREGATE_VERIFY`: a vote waits for its batch,
                 // verified at the end of this drain (`flush_votes`). With the
@@ -2421,9 +2460,11 @@ impl<E: ExecutionLayer> H2Service<E> {
             // over the same topic as everything else, and the leader picks it
             // out. Treating these differently would mean inventing a channel
             // gov5 does not have.
-            EngineOutput::BroadcastMessage(message)
-            | EngineOutput::SendToValidator(_, message) => {
+            EngineOutput::BroadcastMessage(message) => {
                 self.publish(message, events);
+            }
+            EngineOutput::SendToValidator(target, message) => {
+                self.send_to_validator(target, message, events);
             }
             EngineOutput::BlockCommitted {
                 view,
@@ -3357,6 +3398,86 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             }
         }
+        true
+    }
+
+    /// Announces this validator to `peer` for direct votes, when this node
+    /// uses them (see [`crate::direct_votes`]).
+    fn send_vote_hello(&mut self, peer: PeerId) {
+        if !self.direct_votes.announces() {
+            return;
+        }
+        let index = self.engine.my_index();
+        if index >= self.engine.validator_count() {
+            return;
+        }
+        let signature = match self.vote_hello {
+            Some(signature) => signature,
+            None => {
+                let signature = self
+                    .engine
+                    .sign_vote_hello(self.identity.genesis_hash, &self.transport.local_peer_id().to_bytes())
+                    .to_bytes();
+                self.vote_hello = Some(signature);
+                signature
+            }
+        };
+        self.transport.send_vote(peer, n42_h2_net::VoteRequest::Hello { index, signature });
+    }
+
+    /// A message addressed to one validator (a vote to the leader): straight
+    /// to it when direct votes are on and its peer is known, by gossip
+    /// otherwise or as well (`both`).
+    fn send_to_validator(
+        &mut self,
+        target: u32,
+        message: n42_h2_primitives::consensus::ConsensusMessage,
+        events: &mut Vec<ServiceEvent>,
+    ) {
+        use crate::direct_votes::VoteTransport;
+        use n42_h2_primitives::consensus::ConsensusMessage as M;
+        let mode = self.direct_votes.mode();
+        if mode != VoteTransport::Gossip && matches!(message, M::Vote(_) | M::CommitVote(_)) {
+            match self.direct_votes.peer_of(target) {
+                Some(peer) => {
+                    if self.send_direct_vote(peer, &message) {
+                        self.direct_votes.sent += 1;
+                        if mode == VoteTransport::Direct {
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    if mode == VoteTransport::Direct {
+                        self.direct_votes.fallbacks += 1;
+                    }
+                }
+            }
+        }
+        self.publish(message, events);
+    }
+
+    /// Encodes `message` as its gossip bytes and sends it to `peer` over the
+    /// vote protocol; false if it cannot be encoded.
+    fn send_direct_vote(&mut self, peer: PeerId, message: &n42_h2_primitives::consensus::ConsensusMessage) -> bool {
+        let Ok(envelope) = wire_bridge::to_wire(message, self.identity, B256::ZERO) else {
+            return false;
+        };
+        let request = if self.native_wire {
+            match n42_h2_wire::h2_wire::encode_gov5_gossip_message(&envelope.message) {
+                Ok(bytes) => n42_h2_net::VoteRequest::Native(bytes),
+                Err(_) => return false,
+            }
+        } else {
+            match n42_h2_wire::h2_v4::encode_gossip(&envelope) {
+                Ok(bytes) => n42_h2_net::VoteRequest::Envelope(bytes),
+                Err(_) => return false,
+            }
+        };
+        if trace_messages() {
+            info!(target: "n42.h2.trace", kind = message_kind(message), view = message.view(), %peer, "send direct");
+        }
+        self.transport.send_vote(peer, request);
         true
     }
 

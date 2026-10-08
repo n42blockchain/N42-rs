@@ -19,6 +19,7 @@
 //! does not.
 
 pub mod build_throttle;
+pub mod direct_votes;
 pub mod persistence;
 pub mod service;
 pub mod straggler;

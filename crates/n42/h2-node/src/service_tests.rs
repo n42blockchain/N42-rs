@@ -944,3 +944,98 @@ async fn blocks_taken_elided_are_remembered_to_a_bound() {
     assert_eq!(rig.svc.elided_own.len(), bound);
     assert_eq!(rig.svc.elided_order.len(), bound);
 }
+
+// ---------------------------------------------------------------------------
+// Direct votes (`N42_VOTE_TRANSPORT`)
+// ---------------------------------------------------------------------------
+
+fn test_vote(keys: &[BlsSecretKey], voter: u32) -> n42_h2_primitives::consensus::ConsensusMessage {
+    n42_h2_primitives::consensus::ConsensusMessage::Vote(n42_h2_primitives::consensus::Vote {
+        view: 1,
+        block_hash: B256::repeat_byte(0x5a),
+        voter,
+        signature: keys[voter as usize].sign(b"a vote"),
+    })
+}
+
+fn some_peer() -> PeerId {
+    libp2p::identity::Keypair::generate_ed25519().public().to_peer_id()
+}
+
+/// A leader that never announced itself (it does not speak the protocol)
+/// still gets the vote, by gossip; once its hello verifies, `direct` sends
+/// straight to it and not to the mesh. A hello signed by the wrong key names
+/// no one.
+#[tokio::test]
+async fn a_direct_vote_falls_back_to_gossip_until_the_leader_announces_itself() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    rig.svc = rig.svc.with_vote_transport(crate::direct_votes::VoteTransport::Direct);
+    let mut events = Vec::new();
+
+    rig.svc.send_to_validator(1, test_vote(&keys, 0), &mut events);
+    assert_eq!(rig.svc.direct_votes.fallbacks, 1);
+    assert_eq!(rig.svc.direct_votes.sent, 0);
+    assert_eq!(rig.svc.outbox.len(), 1, "by gossip: queued until the mesh forms");
+
+    let peer = some_peer();
+    // The node-side hello bytes are the transport's: one definition each side.
+    let hello = n42_h2_net::vote_hello_message(ID.genesis_hash, &peer);
+    let forged = keys[3].sign(&hello);
+    rig.svc
+        .handle_transport_event(TransportEvent::VoteHello { peer, index: 2, signature: forged.to_bytes() })
+        .expect("handled");
+    assert_eq!(rig.svc.direct_votes.peer_of(2), None, "validator 3's key cannot announce validator 2");
+    let genuine = keys[1].sign(&hello);
+    rig.svc
+        .handle_transport_event(TransportEvent::VoteHello { peer, index: 1, signature: genuine.to_bytes() })
+        .expect("handled");
+    assert_eq!(rig.svc.direct_votes.peer_of(1), Some(peer));
+
+    rig.svc.send_to_validator(1, test_vote(&keys, 0), &mut events);
+    assert_eq!(rig.svc.direct_votes.sent, 1);
+    assert_eq!(rig.svc.outbox.len(), 1, "direct only: nothing more for the mesh");
+
+    rig.svc.handle_transport_event(TransportEvent::PeerDisconnected(peer)).expect("handled");
+    assert_eq!(rig.svc.direct_votes.peer_of(1), None, "a peer that left routes nothing");
+}
+
+/// `both` sends directly and to the mesh; the default sends nothing new.
+#[tokio::test]
+async fn both_sends_by_both_paths_and_gossip_by_one() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    let peer = some_peer();
+    let mut events = Vec::new();
+
+    assert_eq!(rig.svc.direct_votes.mode(), crate::direct_votes::VoteTransport::Gossip);
+    rig.svc.direct_votes.learn(1, peer);
+    rig.svc.send_to_validator(1, test_vote(&keys, 0), &mut events);
+    assert_eq!(rig.svc.direct_votes.sent, 0, "gossip mode never sends directly");
+    assert_eq!(rig.svc.outbox.len(), 1);
+
+    rig.svc = rig.svc.with_vote_transport(crate::direct_votes::VoteTransport::Both);
+    rig.svc.direct_votes.learn(1, peer);
+    rig.svc.send_to_validator(1, test_vote(&keys, 2), &mut events);
+    assert_eq!(rig.svc.direct_votes.sent, 1);
+    assert_eq!(rig.svc.outbox.len(), 2, "and by gossip");
+}
+
+/// One vote arriving directly and then by gossip reaches the engine once.
+#[tokio::test]
+async fn a_vote_by_gossip_and_directly_reaches_the_engine_once() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 1, None).await;
+    let envelope = wire_bridge::to_wire(&test_vote(&keys, 2), ID, B256::ZERO).expect("to wire");
+    let peer = some_peer();
+    let direct = TransportEvent::DirectVote {
+        peer,
+        inner: Box::new(TransportEvent::Envelope { from: Some(peer), envelope: Box::new(envelope.clone()) }),
+    };
+    rig.svc.handle_transport_event(direct).expect("handled");
+    rig.svc
+        .handle_transport_event(TransportEvent::Envelope { from: None, envelope: Box::new(envelope) })
+        .expect("handled");
+    assert_eq!(rig.svc.direct_votes.received, 1);
+    assert_eq!(rig.svc.direct_votes.duplicates, 1, "the gossip copy is dropped before the engine");
+}

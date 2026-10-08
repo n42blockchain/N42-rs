@@ -230,6 +230,17 @@ pub struct H2Service<E> {
     /// Round 1 votes of the validators outside the quorum before proposing
     /// the next block (see [`Self::with_straggler_grace`]). `None`: not at all.
     straggler_grace: Option<Duration>,
+    /// Which voters the grace waits for (`N42_STRAGGLER_RULE`; see
+    /// [`crate::straggler`]). `All` is the grace as it always was.
+    straggler_rule: crate::straggler::StragglerRule,
+    /// The quorum rule's state (given-up voters, the measured cycle).
+    quorum_rule: crate::straggler::QuorumRule,
+    /// The view the straggler rule last deferred, and when that view's
+    /// predecessor was decided: what the "proposal sent" line's
+    /// `straggler_wait_us` is measured from.
+    straggler_wait: Option<(u64, std::time::Instant)>,
+    /// Proposals the straggler rule deferred at least once (cumulative).
+    straggler_waits: u64,
     /// The leader's build throttle (see [`crate::build_throttle`] and
     /// [`Self::with_build_throttle`]). `None`: off, the default.
     build_throttle: Option<crate::build_throttle::BuildThrottle>,
@@ -1040,6 +1051,10 @@ impl<E: ExecutionLayer> H2Service<E> {
             block_pacing: None,
             declined_view: None,
             straggler_grace: None,
+            straggler_rule: crate::straggler::StragglerRule::from_env(),
+            quorum_rule: crate::straggler::QuorumRule::default(),
+            straggler_wait: None,
+            straggler_waits: 0,
             build_throttle: None,
             last_drain: (0, 0, 0, ""),
             proposed_view: None,
@@ -2686,12 +2701,93 @@ impl<E: ExecutionLayer> H2Service<E> {
         (tick > std::time::Instant::now()).then(|| tokio::time::Instant::from_std(tick))
     }
 
+    /// The quorum straggler rule ([`crate::straggler::StragglerRule::Quorum`]):
+    /// true when the proposal of `view` is deferred.
+    fn quorum_straggler_defers(&mut self, view: u64, grace: Duration) -> bool {
+        let previous = view - 1;
+        // Only a leader that led the previous view has a ledger for it, the
+        // same gate as the `All` rule's `seen > 0`.
+        if self.engine.voters_seen(previous) == 0 {
+            return false;
+        }
+        let Some(decided_at) = self.engine.last_committed_view_timing().and_then(|t| t.commit_qc_formed) else {
+            return false;
+        };
+        let me = self.engine.my_index();
+        let tenure = self.engine.leader_tenure();
+        let next_leader = crate::straggler::next_tenure_leader(view, tenure, me, |v| self.engine.leader_of_view(v));
+        let validator_count = self.engine.validator_count();
+        if self.engine.vote_aggregate() {
+            // Settle, for the voters the rule might wait for, the votes
+            // batching parked unverified: the next leader, every voter not
+            // verified within the bound, and the given-up ones (whose return
+            // ends their exclusion).
+            let behind: Vec<u32> = (0..validator_count)
+                .filter(|v| *v != me)
+                .filter(|v| {
+                    Some(*v) == next_leader
+                        || self
+                            .engine
+                            .voter_last_seen(*v)
+                            .is_none_or(|seen| seen + crate::straggler::LAG_VIEWS < view)
+                })
+                .collect();
+            if !behind.is_empty() {
+                let oldest = view.saturating_sub(n42_h2_consensus::VOTERS_SEEN_WINDOW as u64 + 1);
+                for v in oldest..view {
+                    self.engine.settle_voters_seen(v, Some(&behind));
+                }
+            }
+        }
+        let engine = &self.engine;
+        let last_seen = |voter: u32| engine.voter_last_seen(voter);
+        let ledger = crate::straggler::Ledger {
+            view,
+            validator_count,
+            me,
+            next_leader,
+            last_seen: &last_seen,
+        };
+        match self.quorum_rule.decide(&ledger, decided_at, grace, std::time::Instant::now()) {
+            crate::straggler::Verdict::Proceed => false,
+            crate::straggler::Verdict::Wait(waited) => {
+                if self.straggler_wait.is_none_or(|(v, _)| v != view) {
+                    debug!(target: "n42.h2.node", view, ?waited, next_leader, "quorum straggler rule: waiting");
+                }
+                self.proposal_deferred = true;
+                self.defer_reason = Some("waiting for the next leader or a lagging voter");
+                self.note_straggler_wait(view, decided_at);
+                true
+            }
+        }
+    }
+
+    /// Remembers that the straggler rule deferred `view`, decided at `at`.
+    fn note_straggler_wait(&mut self, view: u64, at: std::time::Instant) {
+        if self.straggler_wait.is_none_or(|(v, _)| v != view) {
+            self.straggler_wait = Some((view, at));
+            self.straggler_waits += 1;
+        }
+    }
+
+    /// The straggler wait behind the proposal of `view`, in microseconds
+    /// (0 when the rule did not defer it).
+    fn take_straggler_wait_us(&mut self, view: u64) -> u64 {
+        match self.straggler_wait {
+            Some((v, at)) if v == view => {
+                self.straggler_wait = None;
+                at.elapsed().as_micros() as u64
+            }
+            _ => 0,
+        }
+    }
+
     /// Builds and announces a block when this node is the leader of a view it
     /// has not yet proposed for.
     async fn propose_if_leader(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
-        let Some(build_attributes) = self.payload_attributes.as_ref() else {
+        if self.payload_attributes.is_none() {
             return Ok(());
-        };
+        }
         let view = self.engine.current_view();
         if self.proposed_view == Some(view) || !self.engine.is_current_leader() {
             self.proposal_deferred = false;
@@ -2700,8 +2796,17 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
         // The stragglers' grace: see `with_straggler_grace`.
         if let Some(grace) = self.straggler_grace {
-            if view > 1 {
+            if view > 1 && self.straggler_rule == crate::straggler::StragglerRule::Quorum {
+                if self.quorum_straggler_defers(view, grace) {
+                    return Ok(());
+                }
+            } else if view > 1 {
                 let previous = view - 1;
+                // Batched verification parks the late votes unverified;
+                // this rule reads every voter, so all of them are settled.
+                if self.engine.vote_aggregate() {
+                    self.engine.settle_voters_seen(previous, None);
+                }
                 let seen = self.engine.voters_seen(previous);
                 let all = self.engine.validator_count() as usize;
                 let decided_at = self.engine.last_committed_view_timing().and_then(|t| t.commit_qc_formed);
@@ -2710,6 +2815,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         if at.elapsed() < grace {
                             self.proposal_deferred = true;
                             self.defer_reason = Some("waiting for the stragglers' votes");
+                            self.note_straggler_wait(view, at);
                             return Ok(());
                         }
                         debug!(target: "n42.h2.node", view, seen, all, "stragglers' grace ran out; proposing without them");
@@ -2717,6 +2823,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             }
         }
+        let Some(build_attributes) = self.payload_attributes.as_ref() else {
+            return Ok(());
+        };
         // The parent is the block the highest QC certifies, not whatever the
         // execution layer imported last: a proposal has to extend its justify
         // QC's block (the fleet refuses one that does not), and a leader that
@@ -2997,6 +3106,8 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.build_start_counts[trigger_slot] += 1;
                 let [build_starts_seal, build_starts_send, build_starts_commit, build_starts_other] =
                     self.build_start_counts;
+                let straggler_wait_us = self.take_straggler_wait_us(view);
+                let straggler_waits = self.straggler_waits;
                 info!(
                     target: "n42.h2.node",
                     view,
@@ -3025,6 +3136,8 @@ impl<E: ExecutionLayer> H2Service<E> {
                     throttle_in_mem,
                     throttle_delay_ms,
                     throttle_hard_holds,
+                    straggler_waits,
+                    straggler_wait_us,
                     "proposal sent"
                 );
                 // Build-on-seal: the next build starts here, on this block's

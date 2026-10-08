@@ -60,7 +60,7 @@ pub use header_profile::{
 pub use protocol::quorum::{
     validator_changes_hash, verify_commit_qc, verify_commit_qc_with_profile, verify_qc, verify_tc,
 };
-pub use protocol::state_machine::{AuthenticatedConsensusMessage, FUTURE_VIEW_WINDOW};
+pub use protocol::state_machine::{AuthenticatedConsensusMessage, FUTURE_VIEW_WINDOW, VOTERS_SEEN_WINDOW};
 pub use protocol::{ConsensusEngine, ConsensusEvent, EngineOutput, Pacemaker, Phase, RoundState,
     TimeoutCollector, ViewTiming, VoteCollector};
 pub use validator::{

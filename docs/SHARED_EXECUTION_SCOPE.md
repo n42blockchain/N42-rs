@@ -1480,3 +1480,212 @@ Base F2 (`N42_FREEZE_AFTER_SEAL=1 N42_ROOT_OPS_AHEAD=1` on loop343's D). In orde
 Item 3 is on in every leg (`seal_remember_ms` ~0, `seal_hashes_ahead=true`, `tx_root_ms`). Correctness on every leg:
 `fields_mismatches` 0 (one leg with `N42_FIELDS_AT_SEAL=verify`), `invalid_blocks` 0, `fleet7-verify` clean, block
 hashes against F2 on the same replay (`F7_FLOOD_REPLAY`).
+
+## 18. E=1 at depth 2: what binds the 53 ms floor is the landing latency, not the shard hand-off or the vote itself (2026-10-07, code and loop346 logs, no fleet leg)
+
+Question from 10.93: depth 2 took the parent's root chain off the seal (`parent_fields_ms` 0, `sealed_at` 49 -> 41-43) and the
+cycle stayed at 53.1 ms (A2P50, 200k, pacing 50) and 107-115 ms (S400A2, 400k). 10.93 names two causes, the child's wait for the
+parent's state shards (`gap_before_exec` 16-17 ms median at 200k, 56-59 at 400k) and the vote road's tail. Read offline: A2P50 and
+S400A2 `node0-el.log` (the layer, ANSI stripped; full-block builds only: 1,430 blocks 546-1975 at 200k, 739 at 400k) joined block by
+block with all seven `node*-v.log` (view V is block V-1; view 1..1023 led by key 0, 1024.. by key 1; one host clock, millisecond stamps),
+and the code in `direct_build.rs`, `payload.rs`, `output_shards.rs`, `h2-execution/src/driver.rs`, `h2-el-rpc/src/engine.rs`,
+`bin/n42/src/payload_serve.rs`. Medians (p90) unless stated; "estimate" is arithmetic from these, never a measurement.
+
+### 18.1 Summary
+
+1. **Both causes are one cause: the landing latency L**, the time from a block's seal to the layer having it imported by header
+   (A2P50 201 ms, p90 266; S400A2 418, p90 502) and to its canonical commit (238, p90 286; 476, p90 551). Three couplings carry L
+   back into the cycle: the leader's anchor wait (18.3), the follower driver's two import slots (18.4) and the one-ahead rule (18.5).
+   At 50 ms pacing L is four cycles, so every one of them is in its tail.
+2. **The child's wait for the parent's shards is only half of `state_wait`, and the smaller half.** Measured split at A2P50:
+   output (shards) wait mean 8.8 ms (median 9, p90 17); anchor wait mean 16.3 (median 0, p90 47, present in 48% of blocks). At
+   S400A2: output mean 40.5 (median 46), anchor mean 23.2 (p90 80, 43% of blocks). The anchor wait ends within 3 ms of the anchor's
+   *canonical commit* (exec start minus `Canonical chain committed` of block N-4: median -2.5 ms; against the insert: +18.6).
+3. **The vote road's own latency is ~12 ms; what 10.93 measured as the tail is a gate.** 10.93's proposal-to-quorum median of 11 ms is
+   over every view of the leg including the ~3,400 empty ramp blocks. Over the full-block views only (A2P50 views 560-1975, n=1,416)
+   it is median 41.4, p90 91.6, p99 116.5 ms; S400A2 median 91.9, p90 166.7. The six followers vote within 0.4 ms of each other
+   (p99 4.3 ms), so the tail is common-mode, there is no slow key, and the last key changes (A2P50: keys 4, 6, 2, 3, 5, 0, 1 last in
+   24, 19, 15, 15, 12, 10, 5% of views). The common event is the **import slot freeing**: quorum(n) minus "own block imported by
+   header"(n-2) is +0.8 ms median, IQR 5.9 (vs -56.8 for n-1 and +64.8 for n-3).
+4. **Estimated floor of the plan in 18.7: 42 ms (38-50) at 200k, ~80 (75-95) at 400k, i.e. 4.8M (4.0-5.3M) and 5.0M (4.2-5.3M).**
+   5M is the optimistic end at both sizes, not the expectation; it needs items 1-4 and headroom in two loops this section cannot
+   see (the engine thread, persistence). No consensus-rule change is needed for it; 18.8 names the next lever if the floor is 45+.
+
+### 18.2 The state hand-off timeline (ms after the parent's seal; seal = execution end + 0.1 at 200k, 0.13 at 400k)
+
+| step | field / event | 200k | 400k | on the child's path? |
+| --- | --- | --- | --- | --- |
+| child build asked for | `prev_seal_to_start_us` (chain, trigger seal; 86% of builds) | 1.2 (1.5) | 1.3 (1.7) | start; the other 14% / 9% wait for the previous proposal's send (+55 / +116, 18.5) |
+| shards frozen | `seal_to_frozen_us` (`index_ms` 14.1 / 50) | 13.0 (17.5) | 48.5 (60.4) | **yes, by code order; the child needs only the index** |
+| scope joined | `seal_to_finish_us`: freeze + graft `take_cached` + **receipts job + transactions-root job** | 17.2 (21.6) | 54.4 (66.1) | **yes, by code order: +4.2 / +5.9 ms the child does not need** |
+| executor finish + merge_transitions | `seal_to_bundle_us` | 17.4 (21.8) | 54.7 (66.4) | yes (the residual) |
+| **`shards_ready` filed: the child's open proceeds** | between bundle and view | ~17.5 | ~55 | the event `wait_for_state` is woken by |
+| parent's own view | `seal_to_view_us` | 18.2 (22.7) | 56.7 (68.8) | no |
+| QMDB tree renamed early | `seal_to_rename_us` | 20.7 (30.9) | 63.0 (82.6) | no (root job) |
+| root and fields published | `seal_to_fields_us` | 54.3 (73.5) | 130.5 (183.1) | no at depth 2 (consumer is block N+2's header) |
+| `StateReady` = `Complete` | `seal_to_complete_us`; shard merge 58 / 131 ms, one thread, starts at the fields | 114.1 (140.5) | 267.3 (321.9) | no; the hand-off waits for it |
+| hand-off starts | handed minus `total_ms`; **fork-move forkchoice** + body lookup | 143.5 (200.1) | ~313 | no |
+| handed to the engine | "own block handed to the engine as executed" (`total_ms` 41 / ~85) | 187.7 (249.4) | 397.9 (483.8) | no |
+| imported by header | "own block imported by header"; new_payload +4.3 / +8 | 201.3 (265.5) | 418.0 (501.9) | no |
+| canonical commit | "Canonical chain committed" (+31.6 after import, p90 +89; 400k +52) | 237.9 (285.7) | 475.7 (550.8) | **yes: the anchor of a 3-layer open** |
+
+What the child needs before its first batch. Its senders are the parent's senders (the flood draws 12,500 senders into every
+block), so every first read of a sender is a read of the parent's output; each sender lives in exactly one parent batch, so that
+read needs only the live index entry of the batch, never the conflict sum. It does not need: the receipts (a different job, joined
+in the same scope), the transactions root, the view, the rename, or anything from `StateReady` on. What the code makes it wait for:
+the freeze's *completion* (conflict sums of ~8,000 recipients at 200k, ~32,000 at 400k, and the deferred shard entries), and the
+scope's join of the receipts and transactions-root jobs. The freeze task is one shard: `task_max_us` 13.6 of `fold_us` 14.2, with
+`pending_max` 73 of 128 batches deferred into the heaviest shard (9.5 ms of `pending_us_max`) and `drops_max` 16k (the rest).
+
+The scaling at 400k. Blocks are 2x; the freeze is 3.7x (13.0 -> 48.5) and `index_conflicts` 4.0x (8,054 -> 32,003).
+Recipients are drawn from 2,000,000 addresses, so the expected number of repeated recipients is N^2/(2 x 2M): 10,000 and 40,000
+(observed 8,054 and 32,003). The conflict work is quadratic in block size, the pending entries superlinear (`pending_us_max` 9.5
+-> 30.0, a 3.2x for cache-cold per-batch maps), and both sit in the single heaviest shard task, so more workers do not help.
+The wait itself is the same ratio: output wait median 9 -> 46 (5x), because the child's start (1.3 ms) and open do not scale
+while the freeze does. The anchor wait scales with L (2.1x) over the same cycle (2.0x): it grows slowly (16.3 -> 23.2 mean).
+`gap_before_exec` median 19 -> 58 is therefore mostly the freeze at 400k and mostly the anchor at 200k.
+
+Locks and notifications on this path: none measurable at the child's open (`open_keep_us` 4, `open_provider_us` 72, `polls` mean
+0.9). The anchor wait's wake is the engine's canonical notification (`engine_landed::notify`), 20 ms safety slice otherwise.
+The forest lock does show on the landing side: `compute_operations` holds it 26 ms (p90 35) in 74% of blocks and `rename`,
+`on_canonical`, `on_persisted` wait behind it (97 + 190 + 122 waits of ~25-28 ms in 1,430 blocks).
+
+### 18.3 The two landing couplings of the build
+
+**Anchor.** `N42_LEADER_LAYERS=3` lays N-1, N-2, N-3 over the engine and needs block N-4 *canonical* in the engine
+(`opener_on_sealed_parent_with` -> `grandparent_state` -> `state_at_soon`). Build N starts at seal(N-1)+1, so the wait is
+`canonical(N-4) - seal(N-1) - 1 = L_canon - 3c - 1` with `L_canon` 238: at c = 60, 57 ms in the late half of blocks, 0 in the
+early half (observed: 48% of blocks, mean 16.3). It cannot be made smaller by pacing: at c = 42 the same arithmetic gives
+`238 - 126 = 112`. The layer count that clears it is `L_canon / c` rounded up: 6 at 42 ms (7-8 for p90). The code caps the count at 4
+(`leader_layers::DEPTHS` 2..=4).
+
+**Hand-off tail.** The hand-off of block n begins with a forkchoice moving the engine head to the parent when it is not already
+there (`own block forks from the engine's head`, 1,328 of 1,430 blocks, `moved_ms` median 16, p90 75, 685 of them answered
+SYNCING because the parent has not landed). Hand-off start minus `Complete` by `moved_ms` bucket: <3 ms: 6.5; 3-15: 14.6; 15-40: 32.1;
+>=40: 87.1 (200k); the remainder (c2h minus moved) is 5.6-6.2 ms flat, so the tail of the whole landing is this one forkchoice,
+which waits for the engine thread (commit forkchoices of 9.2 ms mean, p90 27, p99 90, three per block; lock waits above).
+
+### 18.4 The vote tail: anatomy of the slowest 10%
+
+The mechanism, from `h2-execution/src/driver.rs` (`spawn_execute_deferred`: `executing.len() >= in_flight_cap`, cap 2 by default,
+3 at most; the slot is freed when the import returns its verdict, i.e. when the block has landed) and `payload_serve.rs`
+(`own_block_by_header`: `once.checked()` fires the moment the build is found, `serve_from_own_build` writes CHECKED first of
+all): **at E=1 the layer answers CHECKED at once, but only when the request arrives, and the driver sends the request for
+block n only when block n-2 has landed.** `N42_VOTE_BEFORE_SLOT` is the existing way round the slot and the start-up refuses it
+together with `N42_IMPORT_ONCE` (18.2's table in section 2: one receiver per hash). None of the loop346 legs set it.
+
+Timeline of a view (A2P50, medians; p90 in brackets), time from the proposal's send: key receives the body 1.6-2.1; all six votes
+sent at 31.7 (82.2); leader commit 41.4 (91.6), of which 9.0 (13.8) are the R1 and R2 collects after the fourth vote
+(`R1_collect=5ms R2_collect=5ms`). The vote therefore costs ~2 + ~1 + 9 = ~12 ms when the gate is open and 30-80 ms when it is not.
+S400A2: receive 1.7-2.2, votes at 80.4 (156.2), commit 91.9 (166.7).
+
+The slowest 10% (vote delay >= 82.2 ms at 200k, >= 156.2 at 400k), by the landing of the block that frees the slot, n-2:
+
+| component of the freeing block's L | slowest 10% | the rest | excess share |
+| --- | --- | --- | --- |
+| seal -> imported (L) | 265.9 (200k) / 515.0 (400k) | 198.2 / 412.7 | +67.7 / +102.3 |
+| `Complete` (seal -> `StateReady`) | 107.4 / 268.9 | 114.6 / 267.3 | -4.6 / +3.4 (not the cause) |
+| `Complete` -> hand-off start | 82.8 / 70.4 | 19.4 / 21.4 | **+50.1 / +60.7** |
+| hand-off duration | 49.0 / 129.0 | 40.0 / 83.0 | +10.1 / +42.0 |
+| head-move forkchoice `moved_ms` | 73 / 58 | 11 / 5 | the c2h excess |
+| hand-off -> new_payload, new_payload | +3.6, +0.3 | | |
+
+Fork-move >= 20 ms in 77% of the slowest decile against 39% of the rest (73% / 39% at 400k). The tail correlates with the
+layer's own work through the engine thread and the forest lock (the head move waits for the engine; `rename` waits for
+`compute_operations`), not through the freeze (`seal_to_frozen` is not different in the tail) and not through the key. The vote
+tail is the landing tail of block n-2 delivered through the slot.
+
+Is the vote road on the critical path at 50 ms pacing? **Yes, through the gate, and for about half the views.** 52% of proposals are
+tick-bound (interval median 51.4); 41% are sent within 5 ms of the previous view's commit (interval median 77.1) and only 3 of 671
+non-tick-bound proposals are within 5 ms of their own seal: the proposals are commit-bound, not build-bound. The proposal lags its
+seal by 45 ms (median), 93 ms at 400k: the build runs ahead of the road. The chain-start rule (`ChainState.slot`, one chained
+build, held until its proposal takes it): 1,220 builds start at the parent's seal ("S"), 195 at the previous proposal's send ("D",
+14%), and D happens only when the parent's proposal lagged its seal by more than ~45 ms (fraction of D by lag bucket: 0% below 45 ms,
+26% at 45-60, 33% at 60-75). A D start costs ~55 ms at 200k (cycle 89.8 median against 56.6 for S). Cycle: S-class mean 60.9, D-class
+92.1, mean 65.2. So the one-ahead rule is not what binds; the gate that makes proposals lag is.
+
+The closed form that fits both legs: with cap C, vote(n) = land(n-C) + 1, so a proposal is held until `L + 10 - C c` after the
+seal of its block; the build loop (D start) then closes at about `(L + 10 + B_send)/(C + 1)` with `B_send` the shorter build of a
+send-started block (sealed_at 26): (201 + 10 + 26)/4 = 59 ms against 65 measured. At 400k: (418 + 10 + 41)/4 = 117 against 126.
+
+### 18.5 Candidates weighed against the data
+
+| candidate | verdict |
+| --- | --- |
+| Child executes on the parent's unfrozen batch state (read-through to per-batch maps) | Worth it, but not first. It removes the output wait (mean 8.8 / 40.5 ms; only while the anchor is not the later wait), i.e. ~6 ms mean at 200k and ~25 at 400k after item 2. Reads of a sender are non-conflicting (one batch); a recipient read needs the sum of its batches (lazy, 4% of accounts); the deferred shards' entries need a probe of the deferred batches. High risk (consistency of three sources), so it comes after the cheap freeze items. |
+| Freeze and publish per shard as batches end | Little: every batch reads recipients across all 16 shards, and one shard (13.5 of 14.1 ms) is the whole freeze. Splitting the heaviest shard's pending list over two to four tasks is the useful form (item 3). |
+| Overlap the child's first batches with the parent's freeze on disjoint senders | Not applicable to this flood (every sender in every block); no disjoint set. |
+| CHECKED from the build's counters as soon as the seal exists | Already how the layer answers (`once.checked()` on `find_kept_sealed`). What is missing is the request: the driver does not send it until a slot frees. Item 1. |
+| Proposals two deep (one-ahead relaxed) | Not before item 1: D starts are 14% of builds and exist only because proposals lag. After item 1 the lag is the tick, and relaxing the rule would let two unproposed builds be discarded on a view change for nothing. |
+| Not on the list | (a) the layer count cap and the receipts-join order (items 2, 4); (b) the shard merge starting only after the fields (items 3's sibling, 18.7 item 3); (c) the fork-move forkchoice in the hand-off; (d) the `listed_for` cache of two blocks against a landing 4 cycles late (the re-encoding of 200k transactions on the pool, part of the 5.6-6.2 ms c2h floor; unmeasured). |
+
+### 18.6 Costs the plan has to keep an eye on
+
+CPU: the layer burns ~35 of 208 CPUs; a dedicated pool for the merge costs nothing the box lacks (the freeze pool precedent: `index_ms`
+unchanged, `commit_refs` -15). Memory: a kept layer is one shard set (~50 MB at 200k, ~100 at 400k); six layers are ~0.3-0.6 GB of
+41.8 GB RSS. Read cost: every read no layer answers walks every layer (one index probe each), estimate +3 ms exec at 200k, +6-8 at 400k
+for six layers (~800k reads x 3 more layers x 30 ns / 32 threads, 200k). Engine thread: 3.2 canonical commits per block at 9.2 ms mean
+is ~29 ms of 65; at 42 ms that is 70%, and `compute_operations` holds the forest lock 26 ms in 74% of blocks: the engine thread and the
+forest lock are the loops this log cannot bound below 50 ms.
+
+### 18.7 The plan (ranked by expected effect on the floor; estimates labelled)
+
+1. **Vote before slot, by a check-only request (`N42_CHECK_BEFORE_SLOT`).** Mechanism: when the driver holds a proposal's body and
+   every slot is busy, it sends a header-only CHECK to the layer (new raw frame, or `OWN_BLOCK` with a "no hand-off" flag) answered
+   by `find_kept_sealed` + `once.checked()` with the CHECKED frame and nothing else; the vote goes at once. The import stays queued
+   in the slot exactly as today (landing order, parent-before-child and the slot semantics unchanged). Saving: vote delay 31.7 ->
+   ~3 ms (200k), 80 -> ~3 (400k); proposal-to-commit ~12 ms; D starts vanish: mean cycle 65.2 -> ~61 (estimate, 200k), 126 -> ~121 (400k).
+   Alone it does not move the median block (the build loop is 56.6): it is the precondition for everything below, because without it
+   `c >= (L + 10 - x)/3` is 69 ms at E=1. Risk: moderate (a second reply path; a vote must still be withheld for a block the layer
+   does not hold, which falls back to today's road). Test: for every key and view, CHECKED-before-slot is sent only when
+   `find_kept_sealed` matches parent, number, state root, receipts root, gas and transactions root; a mock layer returning CHECKED
+   for a different build must produce no vote; `fields_mismatches` 0, `invalid_blocks` 0, `fleet7-verify`; same replay, same block
+   hashes as A2P50.
+2. **Layers 3 -> 6 (`DEPTHS` 2..=8, `N42_LEADER_LAYERS=6`, `PARENT_OUTPUTS_KEPT` and `built_executions KEEP` to match).** Mechanism:
+   the anchor becomes N-7 and the wait `L_canon - 6c - 1` is <= 0 for c >= 40 at the median (6 x 40 = 240 vs 238; p90 needs item 3).
+   Saving: anchor wait mean 16.3 -> ~1 (200k), 23.2 -> ~2 (400k), less the read cost: net ~ -12 ms (200k), -15 (400k), estimate.
+   Risk: low in correctness (the stack is the same code with more entries), moderate in speed. Test: `open_on` over 6 layers equals the
+   engine's own state at the same height for every account of two replayed blocks (existing 2-4 layer tests extended);
+   state roots equal under `N42_FIELDS_AT_SEAL=verify`; exec time and `view_journal_searches` before/after.
+3. **Cut L: start the shard merge at `shards_ready` on a dedicated pool, parallel by shard.** Today the merge (58 / 131 ms, one thread:
+   `merge_threads=1`, state 38 + reverts 15 at 200k) starts at the fields (54 / 130) and sets `Complete`, hence the hand-off, hence
+   L. Started at 18 / 55 on 16 threads it ends near the root job's end: `Complete` 114 -> ~65-75, 267 -> ~150-170 (estimate), L -45 /
+   -100, `L_canon` 238 -> ~190 (200k). Together with item 2 this lets 5 layers do the work of 6 and brings the slot's service time
+   (arrival -> landing, now ~2c) under `C c` for C = 2 at c = 42. Risk: CPU contention with the child's execution if the pool is
+   shared (use `behind_pool`); 10.16 moved the merge after the root for exactly that. Test: the merged `BundleState`, hashed post-state
+   and trie updates equal the single-thread merge for 1/16/64 shards (the `freeze_pool` test shape); `fleet7-verify`.
+4. **Output wait: reorder the scope and split the heavy shard.** (a) `shards_ready` is filed after the scope joined the receipts and
+   transactions-root jobs (`seal_to_frozen` 13.0 -> `seal_to_finish` 17.2, 48.5 -> 54.4): file the shards after `take_cached` and
+   the executor's finish, join the receipts job afterwards (the executor's finish already ignores receipts; `direct_receipts` is
+   substituted after it): -4.2 / -5.9 ms of output wait. (b) Split the heaviest shard's `pending` list (73 of 128 entries) over 2-4
+   tasks, summing conflicts per task and merging: the freeze 14 -> ~8 ms, 50 -> ~25 (estimate; SES 16.4 had 14 -> 8). Saving on the
+   mean cycle after item 2 (the output wait becomes the gap): -6 ms (200k), -26 (400k). Risk: low. Test: receipts root, QMDB operations,
+   accounts and reverts equal to the current freeze (`tests/output_shards.rs` shapes); a changed order of joins must not move a root.
+5. **Read-through on the unfrozen state (18.5, first row)**, after 1-4, when the output wait left is above 5 ms (400k: ~20 ms).
+   Saving ~ -4 ms (200k), -18 (400k), estimate. Test: the child's reads against the frozen view for every address the block touches,
+   equal; a randomised batch/shard schedule; block hashes equal.
+
+### 18.8 The floor, and 5M
+
+Loops after items 1-4 (200k; estimates except where marked): build `1.2 + 6 + 3 (output wait) + 20.5 (exec, measured) + 3.5
+(layers) + 1.5 = 36`; proposal tick 35-40 (a setting); vote road ~12 (measured pieces); root job 27 (measured, `roots_ms`); persistence
+33 (10.87-10.90: 79% busy at 42); engine thread ~29 per block (this section); landing service `(L - x)/C` = (190 - 5)/2 = 92 per
+two blocks, 46 each. **Floor 42 ms (38-50)**: 200k / 0.042 = 4.76M (4.0-5.3M). At 400k: build `1.3 + 7 + 20 + 35.2 + 7 + 2 = 72`, root
+job 58, persistence 67-78 (10.93), tick 80: **floor ~80 (75-95)**, 5.0M (4.2-5.3M); persistence is within a few ms of the floor
+there. **Verdict: 5M is reachable at E=1 only at the optimistic end of both sizes, and without a rule change.** What decides it is
+unmeasured below 50 ms: the engine thread (3.2 commits a block, forest lock 26 ms in 74% of blocks) and persistence. If the first
+leg after items 1-4 reads 45+ ms at 200k, the next change is not a consensus rule but the block: 300k transactions per block
+(gas limit 6.3e9) amortises the ~6 ms start, ~1.5 seal and ~12 vote road over 50% more work, and the 400k floor above says it
+fits. A consensus rule would be next only for the commit: proposing on the R1 QC (not Decide) takes ~5 ms off the proposal loop,
+which matters only when the proposals are commit-bound, i.e. after item 1 only if the intrinsic road (12 ms) exceeds the tick.
+
+### 18.9 Legs to run, in order (one variable each from A2P50 / S400A2)
+
+1. Item 2 alone (`N42_LEADER_LAYERS=6`): `ggp_missing`, `state_wait_on`, `gp_ms` -> 0; exec time; cycle at 50 and 45.
+2. Item 1 alone: proposal-to-quorum over full-block views (use `voteroad346.py` restricted to views whose block has txs=200000, or
+   the filter in 18.1), `build_start_trigger` D share, commit-bound share.
+3. Items 1 + 2, pacing 45, 40, 35.
+4. Item 3, then item 4, each added to leg 3; read `seal_to_complete_us`, `seal_to_frozen_us`, `seal_to_finish_us`, `moved_ms`.
+Instrumentation to add first (cheap): log `landing` events per block (arrival of the import request, hand-off start, fork-move
+start/end, engine insert start/end) so 18.3's c2h split needs no join; per-shard entry counts of the freeze (is the heavy shard a
+property of the address derivation?); the canonical notification's wake latency in `grandparent_state`.

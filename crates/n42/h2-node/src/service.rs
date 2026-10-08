@@ -390,6 +390,13 @@ pub struct H2Service<E> {
     /// Height of the last block the execution layer is known to have
     /// imported, once read; what "far ahead" is measured from.
     imported_height: Option<u64>,
+    /// When the layer's height was last read for a held block; one forced
+    /// read every [`HELD_TOO_LONG`] at most.
+    last_forced_layer_read: Option<std::time::Instant>,
+    /// Keys that stopped voting, as this node sees them when it leads.
+    silent_keys: SilentKeys,
+    /// The view whose votes `silent_keys` last looked at.
+    silent_checked_view: Option<u64>,
     /// Bodies held back because they run far ahead of the execution layer:
     /// on a block more than 32 past its tip reth starts a backfill it has
     /// no peers for and answers every forkchoice with SYNCING from then on.
@@ -986,13 +993,66 @@ const fn runs_far_ahead(number: u64, tip: u64) -> bool {
     number > tip + FAR_AHEAD_BLOCKS
 }
 
-/// The execution layer's height from the two things that know it: the head
-/// the driver has moved to, and the highest block whose import is in flight.
-const fn tip_of(head: Option<u64>, in_flight: Option<u64>) -> Option<u64> {
-    match (head, in_flight) {
-        (Some(a), Some(b)) => Some(if a > b { a } else { b }),
-        (Some(a), None) => Some(a),
-        (None, b) => b,
+/// The execution layer's height from the three things that know it: the head
+/// the driver has moved to, the highest block whose import is in flight, and
+/// the height last read from the layer itself.
+///
+/// The layer read counts because with many keys sharing one layer (E=1) the
+/// layer is ahead of this key's own driver, and a key that missed the first
+/// blocks would otherwise hold every later block as "far ahead" forever.
+const fn tip_of(head: Option<u64>, in_flight: Option<u64>, layer: Option<u64>) -> Option<u64> {
+    const fn higher(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(if a > b { a } else { b }),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        }
+    }
+    higher(higher(head, in_flight), layer)
+}
+
+/// How many consecutive views a key may go without a verified vote before the
+/// leader names it.
+const SILENT_KEY_VIEWS: u64 = 16;
+
+/// The leader's record of when each validator key last voted, to name a key
+/// that has been silent for [`SILENT_KEY_VIEWS`] views: once per episode.
+#[derive(Debug, Default)]
+struct SilentKeys {
+    /// The first view observed; a key never seen is silent from here.
+    since: Option<u64>,
+    last_voted: std::collections::HashMap<u32, u64>,
+    warned: HashSet<u32>,
+}
+
+impl SilentKeys {
+    /// Looks at `view` (whose votes have had time to arrive) and returns the
+    /// keys that have just become silent, with their silent view count.
+    fn observe(
+        &mut self,
+        view: u64,
+        validators: u32,
+        me: u32,
+        last_seen: impl Fn(u32) -> Option<u64>,
+    ) -> Vec<(u32, u64)> {
+        let since = *self.since.get_or_insert(view);
+        let mut silent = Vec::new();
+        for voter in (0..validators).filter(|v| *v != me) {
+            if let Some(seen) = last_seen(voter) {
+                let known = self.last_voted.entry(voter).or_insert(seen);
+                *known = (*known).max(seen);
+            }
+            let last = self.last_voted.get(&voter).copied().unwrap_or(since);
+            let gap = view.saturating_sub(last);
+            if gap >= SILENT_KEY_VIEWS {
+                if self.warned.insert(voter) {
+                    silent.push((voter, gap));
+                }
+            } else {
+                self.warned.remove(&voter);
+            }
+        }
+        silent
     }
 }
 
@@ -1098,6 +1158,9 @@ impl<E: ExecutionLayer> H2Service<E> {
             body_requested_at: std::collections::HashMap::new(),
             body_requested_order: std::collections::VecDeque::new(),
             imported_height: None,
+            last_forced_layer_read: None,
+            silent_keys: SilentKeys::default(),
+            silent_checked_view: None,
             held_bodies: Vec::new(),
             held_since: std::collections::HashMap::new(),
             held_warned: HashSet::new(),
@@ -2337,6 +2400,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         // could not do at the time. Through the same path as the original
         // request, so the resulting BlockImported reaches the engine the same
         // way.
+        self.refresh_layer_for_held().await;
         for block_hash in std::mem::take(&mut self.held_bodies) {
             if self.far_ahead(block_hash) {
                 self.held_bodies.push(block_hash);
@@ -2840,6 +2904,9 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.proposal_deferred = false;
             self.defer_reason = None;
             return Ok(());
+        }
+        if view > 2 {
+            self.check_silent_keys(view);
         }
         // The stragglers' grace: see `with_straggler_grace`.
         if let Some(grace) = self.straggler_grace {
@@ -3755,6 +3822,63 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
     }
 
+    /// Once a block has been held past [`HELD_TOO_LONG`], reads the layer's
+    /// height instead of waiting for a peer's height to prompt it: with one
+    /// layer shared by many keys the layer is already at the tip, no peer is
+    /// ever ahead of it, and the pull never starts.
+    async fn refresh_layer_for_held(&mut self) {
+        let now = std::time::Instant::now();
+        let overdue = self.held_since.values().any(|since| now.duration_since(*since) >= HELD_TOO_LONG);
+        if !overdue
+            || self.last_forced_layer_read.is_some_and(|at| now.duration_since(at) < HELD_TOO_LONG)
+        {
+            return;
+        }
+        self.last_forced_layer_read = Some(now);
+        match self.driver.execution_layer().latest_block_number().await {
+            Ok(Some(latest)) => self.note_imported(latest),
+            Ok(None) => {}
+            Err(err) => {
+                debug!(target: "n42.h2.node", %err, "could not read the execution layer's height for a held block");
+            }
+        }
+    }
+
+    /// Names a key that has not voted for [`SILENT_KEY_VIEWS`] views, once per
+    /// episode. Looks at the view before the previous one, whose votes have
+    /// had a full view to arrive.
+    fn check_silent_keys(&mut self, view: u64) {
+        let Some(observed) = view.checked_sub(2).filter(|v| *v > 0) else { return };
+        if self.silent_checked_view == Some(observed) {
+            return;
+        }
+        self.silent_checked_view = Some(observed);
+        let validators = self.engine.validator_count();
+        let me = self.engine.my_index();
+        if self.engine.vote_aggregate() {
+            // Batched verification parks late votes unverified; settle them
+            // for the keys that look silent so a slow vote is not read as none.
+            let stale: Vec<u32> = (0..validators)
+                .filter(|v| *v != me)
+                .filter(|v| self.engine.voter_last_seen(*v).is_none_or(|seen| seen < observed))
+                .collect();
+            if !stale.is_empty() {
+                self.engine.settle_voters_seen(observed, Some(&stale));
+            }
+        }
+        let engine = &self.engine;
+        let silent = self.silent_keys.observe(observed, validators, me, |voter| engine.voter_last_seen(voter));
+        for (key, silent_views) in silent {
+            warn!(
+                target: "n42.h2.node",
+                key,
+                silent_views,
+                view,
+                "a validator key has not voted for many views; the leader is waiting on it every view"
+            );
+        }
+    }
+
     /// Says that a block is being held, without saying it for every block on
     /// every drain: once when the block is first held, at most one line every
     /// [`HELD_LOG_EVERY`], and one WARN per block once it has been held for
@@ -3776,6 +3900,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 ?block_hash,
                 ?number,
                 tip = ?self.imported_tip(),
+                layer_height = ?self.imported_height,
                 head = ?self.driver.head(),
                 held_ms,
                 held = self.held_bodies.len(),
@@ -3817,15 +3942,14 @@ impl<E: ExecutionLayer> H2Service<E> {
         let head = self
             .block_headers
             .get(&self.driver.head())
-            .map(|header| header.number)
-            .or(self.imported_height);
+            .map(|header| header.number);
         let in_flight = self
             .driver
             .importing()
             .filter_map(|hash| self.block_headers.get(hash))
             .map(|header| header.number)
             .max();
-        tip_of(head, in_flight)
+        tip_of(head, in_flight, self.imported_height)
     }
 
 
@@ -4604,15 +4728,45 @@ mod tests {
         assert!(runs_far_ahead(384, 382), "two is not");
     }
 
+    /// The layer's own height counts: head 0, layer 5 is a tip of 5, and a
+    /// block 2 is no longer far ahead (E=1, the silent key).
+    #[test]
+    fn the_layer_height_lifts_the_tip_of_a_driver_at_genesis() {
+        assert_eq!(tip_of(Some(0), None, Some(5)), Some(5));
+        assert!(!runs_far_ahead(2, 5));
+        assert_eq!(tip_of(Some(0), None, None), Some(0), "without the read it is far ahead");
+        assert!(runs_far_ahead(2, 0));
+        assert_eq!(tip_of(Some(7), Some(8), Some(5)), Some(8), "a lagging layer lowers nothing");
+        assert_eq!(tip_of(None, None, Some(5)), Some(5));
+    }
+
+    /// A key silent for 16 views is named once; a vote ends the episode.
+    #[test]
+    fn a_silent_key_is_named_once_per_episode() {
+        let mut keys = SilentKeys::default();
+        let seen = |voter: u32| if voter == 4 { None } else { Some(100) };
+        // The first look starts the clock; nothing is silent yet.
+        assert!(keys.observe(3, 7, 0, seen).is_empty());
+        assert!(keys.observe(3 + SILENT_KEY_VIEWS - 1, 7, 0, seen).is_empty());
+        assert_eq!(keys.observe(3 + SILENT_KEY_VIEWS, 7, 0, seen), vec![(4, SILENT_KEY_VIEWS)]);
+        assert!(keys.observe(3 + SILENT_KEY_VIEWS + 1, 7, 0, seen).is_empty(), "once");
+        // It votes at view 40: the episode ends, and a new silence is named again.
+        let back = |voter: u32| if voter == 4 { Some(40) } else { Some(100) };
+        assert!(keys.observe(41, 7, 0, back).is_empty());
+        assert!(keys.warned.is_empty());
+        let gone = |voter: u32| if voter == 4 { Some(40) } else { Some(100) };
+        assert_eq!(keys.observe(40 + SILENT_KEY_VIEWS, 7, 0, gone), vec![(4, SILENT_KEY_VIEWS)]);
+    }
+
     /// The tip is the higher of the head and the imports in flight, and
     /// exists as soon as either does.
     #[test]
     fn the_tip_is_the_furthest_of_what_the_node_knows() {
-        assert_eq!(tip_of(Some(381), None), Some(381));
-        assert_eq!(tip_of(Some(381), Some(382)), Some(382), "an import in flight counts");
-        assert_eq!(tip_of(Some(383), Some(382)), Some(383));
-        assert_eq!(tip_of(None, Some(382)), Some(382));
-        assert_eq!(tip_of(None, None), None, "nothing known: nothing is far ahead");
+        assert_eq!(tip_of(Some(381), None, None), Some(381));
+        assert_eq!(tip_of(Some(381), Some(382), None), Some(382), "an import in flight counts");
+        assert_eq!(tip_of(Some(383), Some(382), None), Some(383));
+        assert_eq!(tip_of(None, Some(382), None), Some(382));
+        assert_eq!(tip_of(None, None, None), None, "nothing known: nothing is far ahead");
     }
 
     #[test]

@@ -430,6 +430,86 @@ async fn a_held_block_is_logged_once_then_released_when_the_tip_catches_up() {
     assert!(!rig.svc.held_warned.contains(&hash));
 }
 
+/// E=1: one execution layer shared by many keys, and this key's driver is
+/// still at genesis because it missed the view-1 block. The layer is at 5.
+async fn rig_at_genesis_with_a_layer_at_five() -> Rig {
+    use n42_h2_execution::ExecutionLayer;
+    let mut rig = node(1, 0, None).await;
+    let mut parent = B256::ZERO;
+    for number in 1..=5 {
+        let built = MockExecutionLayer::built_block_on(number, parent);
+        parent = built.hash;
+        within(rig.el.new_payload(built.execution_data)).await.expect("accepted");
+    }
+    // The genesis header is always known to a real node.
+    let genesis = Header { number: 0, ..Default::default() };
+    rig.svc.block_headers.insert(ID.genesis_hash, genesis);
+    rig
+}
+
+#[tokio::test]
+async fn a_layer_ahead_of_the_driver_releases_a_block_whose_parent_was_never_seen() {
+    let mut rig = rig_at_genesis_with_a_layer_at_five().await;
+    let (hash, _, rlp) = block(2, B256::repeat_byte(9));
+    rig.svc.handle_direct_body(rlp.into());
+    let mut events = Vec::new();
+    // What `consider_catch_up` records when it reads the layer.
+    rig.svc.imported_height = Some(5);
+    within(rig.svc.drain_outputs(&mut events)).await.expect("drain");
+    within(rig.svc.handle_output(EngineOutput::ExecuteBlock(hash), &mut events)).await.expect("ok");
+    within(rig.svc.drain_outputs(&mut events)).await.expect("drain");
+    assert!(rig.svc.held_bodies.is_empty(), "the layer is at 5; block 2 is not far ahead");
+    assert!(
+        rig.el.calls().iter().any(|c| matches!(c, ElCall::NewPayload(h) | ElCall::NewPayloadBody(h) if *h == hash)),
+        "ExecuteBlock ran: {:?}",
+        rig.el.calls()
+    );
+}
+
+/// Nothing prompts a read of the layer (no peer is ahead of it): a block held
+/// past `HELD_TOO_LONG` asks the layer itself, and is released.
+#[tokio::test]
+async fn a_block_held_too_long_reads_the_layer_and_is_released() {
+    let mut rig = rig_at_genesis_with_a_layer_at_five().await;
+    let (hash, _, rlp) = block(2, B256::repeat_byte(9));
+    rig.svc.handle_direct_body(rlp.into());
+    let mut events = Vec::new();
+    within(rig.svc.drain_outputs(&mut events)).await.expect("drain");
+    within(rig.svc.handle_output(EngineOutput::ExecuteBlock(hash), &mut events)).await.expect("ok");
+    assert_eq!(rig.svc.held_bodies, vec![hash], "held while the layer's height is unread");
+    within(rig.svc.drain_outputs(&mut events)).await.expect("drain");
+    assert_eq!(rig.svc.held_bodies, vec![hash], "not yet overdue: no read forced");
+    rig.svc.held_since.insert(hash, std::time::Instant::now().checked_sub(HELD_TOO_LONG * 2).expect("clock"));
+    within(rig.svc.drain_outputs(&mut events)).await.expect("drain");
+    assert!(rig.svc.held_bodies.is_empty(), "the forced read lifted the tip to 5");
+    assert_eq!(rig.svc.imported_height, Some(5));
+    assert!(
+        rig.el.calls().iter().any(|c| matches!(c, ElCall::NewPayload(h) | ElCall::NewPayloadBody(h) if *h == hash)),
+        "ExecuteBlock ran: {:?}",
+        rig.el.calls()
+    );
+}
+
+/// E>1 is unchanged: a validator whose own layer lags still holds, even after
+/// the forced read, and leaves the catch-up pull to bring the chain.
+#[tokio::test]
+async fn a_lagging_layer_still_holds_a_far_ahead_block_after_the_forced_read() {
+    let mut rig = node(1, 0, None).await;
+    let genesis = Header { number: 0, ..Default::default() };
+    rig.svc.block_headers.insert(ID.genesis_hash, genesis);
+    let (hash, _, rlp) = block(4, B256::repeat_byte(9));
+    rig.svc.handle_direct_body(rlp.into());
+    let mut events = Vec::new();
+    within(rig.svc.drain_outputs(&mut events)).await.expect("drain");
+    within(rig.svc.handle_output(EngineOutput::ExecuteBlock(hash), &mut events)).await.expect("ok");
+    rig.svc.held_since.insert(hash, std::time::Instant::now().checked_sub(HELD_TOO_LONG * 2).expect("clock"));
+    within(rig.svc.drain_outputs(&mut events)).await.expect("drain");
+    assert!(rig.svc.last_forced_layer_read.is_some(), "the layer was read");
+    assert_eq!(rig.svc.imported_height, Some(0), "and it is empty");
+    assert_eq!(rig.svc.held_bodies, vec![hash], "still held: the pull has to bring the gap");
+    assert!(rig.el.calls().is_empty(), "nothing reached the execution layer");
+}
+
 #[tokio::test]
 async fn the_held_list_is_bounded_and_drops_the_oldest() {
     let mut rig = node(1, 0, None).await;

@@ -311,7 +311,12 @@ case $STAGE in
   c) mk WARM 7 16; warm_gate WARM
      mk K99A 99 96 $V1; k99_rss_gate K99A
      mk K99AQ 99 96 $V1 $V2; mk K99AQGD 99 96 $V1 $V2 $V3 $V4; mk K99AQGDb 99 96 $V1 $V2 $V3 $V4 ;;
-  *) echo "unknown stage $STAGE (a, b or c)"; exit 2 ;;
+  p) mk WARM 7 16; warm_gate WARM
+     # what do 99 validators hold? the same K99A leg with the validators' allocator told to show its books, to return pages at once, and with the body store at one block
+     mk K99Ps 99 96 $V1 F7_VAL_MALLOC_CONF=stats_print:true,thp:never
+     mk K99Pd 99 96 $V1 F7_VAL_MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0,thp:never
+     mk K99Pb 99 96 $V1 N42_H2_REMEMBERED_BODIES=1 ;;
+  *) echo "unknown stage $STAGE (a, b, c or p)"; exit 2 ;;
 esac
 
 if [ "${LOOP348_DRY:-0}" = 1 ]; then echo "dry run done"; exit 0; fi

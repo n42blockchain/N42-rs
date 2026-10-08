@@ -1,15 +1,15 @@
 == validator memory at flood +70 s (loop348WARM)
-validators 7: RSS sum 0.9 G, max 0.12 G, mean 0.12 G; threads 273 (mean 39)
-one validator (pid 31453):
-VmHWM:	  122720 kB
-VmRSS:	  122720 kB
-RssAnon:	  106856 kB
-RssFile:	   15864 kB
+validators 7: RSS sum 0.8 G, max 0.12 G, mean 0.12 G; threads 273 (mean 39)
+one validator (pid 464155):
+VmHWM:	  119840 kB
+VmRSS:	  119840 kB
+RssAnon:	  104088 kB
+RssFile:	   15752 kB
 RssShmem:	       0 kB
 Threads:	39
-Rss:              122720 kB
-Private_Dirty:    106856 kB
-Anonymous:        106856 kB
+Rss:              119840 kB
+Private_Dirty:    104088 kB
+Anonymous:        104088 kB
 AnonHugePages:         0 kB
 threads by name:
      33 h2_validator
@@ -17,13 +17,13 @@ threads by name:
       1 n42-qmdb-prefau
       1 futures-timer
 largest mappings by Rss:
-47108  73ac2aa00000-73ac32800000
-14880  73ac36000000-73ac37000000
-13200  73ac37100000-73ac37e00000
-11364  73ac37e80000-73ac38a00000
-10964 /data/n42-build/target-n42-rs/native/release/examples/h2_validator 55a5e7082000-55a5e7f1a000
-8344  73ac3b280000-73ac3d600000
-4284  73ac38a80000-73ac39400000
-2388  73ac43400000-73ac43800000
+51368  7a7468c00000-7a746da00000
+15868  7a746db00000-7a7472200000
+11008  7a7475c00000-7a7476c00000
+10876 /data/n42-build/target-n42-rs/native/release/examples/h2_validator 5b33b52a9000-5b33b6143000
+5400  7a7472300000-7a7473200000
+4272  7a7479180000-7a7479c00000
+4076  7a7476c80000-7a7477800000
+3312  7a7478580000-7a7479000000
 RSS of all validators, sorted:
-min 122.528 MB median 122.7 MB max 123.72 MB
+min 119.292 MB median 119.848 MB max 120.324 MB

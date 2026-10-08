@@ -3,8 +3,9 @@ use bitvec::prelude::*;
 use n42_h2_primitives::{
     BlsSecretKey,
     bls::{
-        AggregateSignature, BlsPublicKey, BlsSignature, batch_verify_h2_v4_with_fallback,
-        batch_verify_with_fallback,
+        AggregateSignature, BlsPublicKey, BlsSignature, SameMessageOutcome,
+        batch_verify_h2_v4_with_fallback, batch_verify_with_fallback,
+        verify_same_message_h2_v4_with_fallback, verify_same_message_with_fallback,
     },
     consensus::{
         H2V4ChainIdentity, QuorumCertificate, TimeoutCertificate, ViewNumber,
@@ -130,6 +131,23 @@ impl ConsensusSigningProfile {
         }
     }
 
+    /// Verifies many signatures over one message in one randomised batch,
+    /// falling back to one-by-one checks to name the bad positions (at most
+    /// 1 + n checks); see `n42_h2_primitives::bls::verify_same_message_batch`.
+    pub fn verify_same_message(
+        self,
+        message: &[u8],
+        signatures: &[&BlsSignature],
+        public_keys: &[&BlsPublicKey],
+    ) -> SameMessageOutcome {
+        match self {
+            Self::Native => verify_same_message_with_fallback(message, signatures, public_keys),
+            Self::H2V4(_) => {
+                verify_same_message_h2_v4_with_fallback(message, signatures, public_keys)
+            }
+        }
+    }
+
     fn verify_aggregate(
         self,
         message: &[u8],
@@ -206,6 +224,11 @@ impl VoteCollector {
 
     pub fn vote_count(&self) -> usize {
         self.votes.len()
+    }
+
+    /// Whether `validator_index` already has a vote here.
+    pub fn has_vote_from(&self, validator_index: u32) -> bool {
+        self.votes.contains_key(&validator_index)
     }
 
     pub fn has_quorum(&self, quorum_size: usize) -> bool {

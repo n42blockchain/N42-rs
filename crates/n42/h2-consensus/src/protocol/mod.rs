@@ -6,6 +6,7 @@ pub mod quorum;
 mod round;
 pub mod state_machine;
 mod timeout;
+mod vote_batch;
 mod voting;
 
 pub use pacemaker::Pacemaker;

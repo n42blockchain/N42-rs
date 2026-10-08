@@ -316,7 +316,10 @@ case $STAGE in
      mk K99Ps 99 96 $V1 F7_VAL_MALLOC_CONF=stats_print:true,thp:never
      mk K99Pd 99 96 $V1 F7_VAL_MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0,thp:never
      mk K99Pb 99 96 $V1 N42_H2_REMEMBERED_BODIES=1 ;;
-  *) echo "unknown stage $STAGE (a, b, c or p)"; exit 2 ;;
+  q) mk WARM 7 16; warm_gate WARM
+     # a jemalloc heap profile of the validators at 99 keys (a dump at each new high-water mark of memory in use): jeprof on one validator's last dump says who holds the 0.86 G
+     mk K99Pp 99 96 $V1 F7_VAL_MALLOC_CONF=prof:true,prof_active:true,lg_prof_sample:17,prof_gdump:true,prof_prefix:/data/n42-build/jeprof348/v ;;
+  *) echo "unknown stage $STAGE (a, b, c, p or q)"; exit 2 ;;
 esac
 
 if [ "${LOOP348_DRY:-0}" = 1 ]; then echo "dry run done"; exit 0; fi

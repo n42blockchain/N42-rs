@@ -2,7 +2,7 @@
 # loop348 (E=1 with 7, 21 and 99 keys, docs/E1_MANY_KEYS.md). usage: launch-loop348.sh <a|b|c>. Launch: setsid nohup bash scripts/fleet7-runs/launch-loop348.sh a > target/fleet-runs/loop348a.out 2>&1 &
 # Waits for the box, checks the tree, builds the native binaries, runs the flood's own tests, then runs the stage.
 cd /data/n42-build/wt338
-STAGE=${1:-a}; case $STAGE in a|b|c|p) ;; *) echo "usage: launch-loop348.sh <a|b|c|p>"; exit 2;; esac
+STAGE=${1:-a}; case $STAGE in a|b|c|p|q) ;; *) echo "usage: launch-loop348.sh <a|b|c|p|q>"; exit 2;; esac
 n=0
 while ls /data/blockchain/.box-claim-* >/dev/null 2>&1 || [ "$(pgrep -fc 'n42-[a-z0-9]+ --chai[n]')" != 0 ]; do sleep 60; n=$((n+1)); [ $n -gt 240 ] && { echo "gave up waiting after 4 h"; exit 1; }; done
 # claim 2 runs the binary with N42_LEADER_LAYERS: the commit must be in and nothing in crates/ bin/ uncommitted

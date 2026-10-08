@@ -124,14 +124,14 @@ pub struct QuorumRule {
 impl QuorumRule {
     /// Records a decision instant; consecutive ones give the cycle.
     pub fn note_decided(&mut self, decided_at: Instant) {
-        if let Some(last) = self.last_decided {
-            if decided_at > last {
-                let interval = decided_at - last;
-                if interval <= CYCLE_SAMPLE_MAX {
-                    self.cycles.push_back(interval);
-                    if self.cycles.len() > CYCLE_SAMPLES {
-                        self.cycles.pop_front();
-                    }
+        if let Some(last) = self.last_decided
+            && decided_at > last
+        {
+            let interval = decided_at - last;
+            if interval <= CYCLE_SAMPLE_MAX {
+                self.cycles.push_back(interval);
+                if self.cycles.len() > CYCLE_SAMPLES {
+                    self.cycles.pop_front();
                 }
             }
         }
@@ -155,10 +155,11 @@ impl QuorumRule {
     /// The voters the rule would wait for now (the next leader first).
     pub fn waited_for(&self, ledger: &Ledger<'_>) -> Vec<u32> {
         let mut waited = Vec::new();
-        if let Some(next) = ledger.next_leader {
-            if next != ledger.me && !ledger.next_leader_ready(next) {
-                waited.push(next);
-            }
+        if let Some(next) = ledger.next_leader
+            && next != ledger.me
+            && !ledger.next_leader_ready(next)
+        {
+            waited.push(next);
         }
         for voter in 0..ledger.validator_count {
             if voter == ledger.me

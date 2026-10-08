@@ -146,10 +146,10 @@ impl ConsensusEngine {
         let cap = QUEUE_PER_VALIDATOR
             .saturating_mul(self.validator_count() as usize)
             .max(64);
-        if self.vote_queue.len() > cap {
-            if let Err(err) = self.flush_votes_inner(true) {
-                tracing::debug!(target: "n42::cl::voting", %err, "vote batch over its cap");
-            }
+        if self.vote_queue.len() > cap
+            && let Err(err) = self.flush_votes_inner(true)
+        {
+            tracing::debug!(target: "n42::cl::voting", %err, "vote batch over its cap");
         }
     }
 

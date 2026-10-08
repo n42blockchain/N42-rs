@@ -107,7 +107,7 @@ impl DirectVotes {
     }
 
     /// Notes a vote that arrived directly.
-    pub fn note_direct(&mut self) {
+    pub const fn note_direct(&mut self) {
         self.direct_seen = true;
         self.received += 1;
     }

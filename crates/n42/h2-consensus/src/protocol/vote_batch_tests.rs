@@ -79,11 +79,11 @@ fn broadcast_bytes(rx: &mut mpsc::Receiver<EngineOutput>) -> Vec<Vec<u8>> {
     };
     let mut out = Vec::new();
     while let Ok(output) = rx.try_recv() {
-        if let EngineOutput::BroadcastMessage(message) = output {
-            if matches!(message, ConsensusMessage::PrepareQC(_) | ConsensusMessage::Decide(_)) {
-                let envelope = crate::wire_bridge::to_wire(&message, identity, B256::ZERO).expect("to wire");
-                out.push(n42_h2_wire::h2_v4::encode_envelope(&envelope).expect("encode"));
-            }
+        if let EngineOutput::BroadcastMessage(message) = output
+            && matches!(message, ConsensusMessage::PrepareQC(_) | ConsensusMessage::Decide(_))
+        {
+            let envelope = crate::wire_bridge::to_wire(&message, identity, B256::ZERO).expect("to wire");
+            out.push(n42_h2_wire::h2_v4::encode_envelope(&envelope).expect("encode"));
         }
     }
     out

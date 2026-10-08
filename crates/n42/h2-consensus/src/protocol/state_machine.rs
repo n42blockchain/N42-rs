@@ -51,6 +51,13 @@ pub struct ViewTiming {
     pub verify_batches: u32,
     /// Leader: batches that failed and fell back to one-by-one checks.
     pub verify_fallbacks: u32,
+    /// The deepest the transport's inbound queue got in this view (only
+    /// with the swarm off the loop, `N42_GOSSIP_OFF_LOOP`; else 0).
+    pub inbound_queue_max: u32,
+    /// Microseconds spent polling the libp2p swarm in this view: on the
+    /// loop's transport drains when inline, on the transport's own task when
+    /// off the loop.
+    pub gossip_poll_us: u64,
 }
 
 impl ViewTiming {
@@ -69,6 +76,8 @@ impl ViewTiming {
             verify_n: 0,
             verify_batches: 0,
             verify_fallbacks: 0,
+            inbound_queue_max: 0,
+            gossip_poll_us: 0,
         }
     }
 
@@ -114,7 +123,7 @@ impl ViewTiming {
         if self.proposal_sent.is_some() {
             // Leader view
             format!(
-                "leader proposal=@{} R1_collect={} R2_collect={} total={} votes={}+{} verify_us={} verify_n={} verify_batches={} verify_fallbacks={}",
+                "leader proposal=@{} R1_collect={} R2_collect={} total={} votes={}+{} verify_us={} verify_n={} verify_batches={} verify_fallbacks={} inbound_queue_max={} gossip_poll_us={}",
                 ms(self.proposal_sent),
                 d(prepare_delta),
                 d(commit_delta),
@@ -125,15 +134,19 @@ impl ViewTiming {
                 self.verify_n,
                 self.verify_batches,
                 self.verify_fallbacks,
+                self.inbound_queue_max,
+                self.gossip_poll_us,
             )
         } else {
             // Follower view
             format!(
-                "follower proposal=@{} vote_delay={} commit_vote=@{} total=@{}",
+                "follower proposal=@{} vote_delay={} commit_vote=@{} total=@{} inbound_queue_max={} gossip_poll_us={}",
                 ms(self.proposal_received),
                 d(vote_delta),
                 ms(self.commit_vote_sent),
                 ms(self.commit_qc_formed),
+                self.inbound_queue_max,
+                self.gossip_poll_us,
             )
         }
     }
@@ -911,6 +924,16 @@ impl ConsensusEngine {
         addr: alloy_primitives::Address,
     ) -> crate::error::ConsensusResult<()> {
         self.epoch_manager.propose_remove_validator(addr)
+    }
+
+    /// Adds one transport drain's numbers to this view's timing: the deepest
+    /// inbound queue seen and the swarm poll time (see `ViewTiming`).
+    pub fn note_transport(&mut self, inbound_queue_max: usize, gossip_poll_us: u64) {
+        let timing = &mut self.view_timing;
+        timing.inbound_queue_max = timing
+            .inbound_queue_max
+            .max(u32::try_from(inbound_queue_max).unwrap_or(u32::MAX));
+        timing.gossip_poll_us = timing.gossip_poll_us.saturating_add(gossip_poll_us);
     }
 
     /// Returns the timing from the last committed view.

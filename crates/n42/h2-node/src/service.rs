@@ -1643,6 +1643,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 None => break,
             }
         }
+        // The swarm's cost on this view's timing line: off the loop, what its
+        // own task spent polling and how deep the inbound queue got; inline,
+        // this drain's polls.
+        let (queue_max, task_poll_us) = self.transport.take_loop_stats();
+        let poll_us = if self.transport.is_off_loop() { task_poll_us } else { poll.as_micros() as u64 };
+        self.engine.note_transport(queue_max, poll_us);
         // The drain boundary: the votes it queued are verified as batches.
         if self.engine.vote_aggregate() {
             let at = std::time::Instant::now();

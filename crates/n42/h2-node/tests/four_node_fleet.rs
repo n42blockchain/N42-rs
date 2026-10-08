@@ -124,7 +124,14 @@ async fn build_node(
     if let Some(addr) = peer {
         config = config.with_peer(addr);
     }
-    let mut transport = H2V4Transport::new(config).expect("transport");
+    // `N42_GOSSIP_OFF_LOOP=1` runs the same fleet with every swarm on its
+    // own task (the service reads `N42_VOTE_AGGREGATE_VERIFY` itself).
+    let mut transport = if std::env::var("N42_GOSSIP_OFF_LOOP").is_ok_and(|v| v == "1") {
+        H2V4Transport::with_keypair_off_loop(config, libp2p::identity::Keypair::generate_ed25519())
+            .expect("transport")
+    } else {
+        H2V4Transport::new(config).expect("transport")
+    };
 
     let listen_addr = loop {
         match transport.next_event().await {

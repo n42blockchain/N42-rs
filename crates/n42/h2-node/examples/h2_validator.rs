@@ -299,7 +299,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let transport = H2V4Transport::with_keypair(config, keypair)?;
+        // `N42_GOSSIP_OFF_LOOP=1`: the swarm runs on its own task of this
+        // runtime and hands the loop decoded events (see `n42_h2_net`'s
+        // `pump`). Same wire, same GossipSub parameters.
+        let transport = if std::env::var("N42_GOSSIP_OFF_LOOP").is_ok_and(|v| v == "1") {
+            println!("gossip       : swarm polled off the consensus loop");
+            H2V4Transport::with_keypair_off_loop(config, keypair)?
+        } else {
+            H2V4Transport::with_keypair(config, keypair)?
+        };
         println!("node peer id : {}", transport.local_peer_id());
         println!("chain        : id {} genesis {}", identity.chain_id, identity.genesis_hash);
         println!("validator    : index {index} of {validator_count} (f = {f})");

@@ -362,6 +362,13 @@ pub struct H2Service<E> {
     /// sent" line measures the next build's start from
     /// (`build_start_after_prev_send_us`).
     last_proposal_sent_at: Option<std::time::Instant>,
+    /// Proposals sent since start by what started their build: seal, send,
+    /// commit, other (`build_start_trigger`). A "send" start is a build the
+    /// one-ahead rule held until the previous proposal went out
+    /// (`docs/SHARED_EXECUTION_SCOPE.md` 18.4); the "proposal sent" line
+    /// carries the running counts so a leg reads its share from the last
+    /// line instead of a join.
+    build_start_counts: [u64; 4],
     body_requested_at: std::collections::HashMap<B256, std::time::Instant>,
     body_requested_order: std::collections::VecDeque<B256>,
     /// Height of the last block the execution layer is known to have
@@ -1064,6 +1071,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             build_on_seal: std::env::var("N42_BUILD_ON_SEAL").is_ok_and(|v| v != "0"),
             first_on_output_view: None,
             last_proposal_sent_at: None,
+            build_start_counts: [0; 4],
             body_requested_at: std::collections::HashMap::new(),
             body_requested_order: std::collections::VecDeque::new(),
             imported_height: None,
@@ -2956,6 +2964,15 @@ impl<E: ExecutionLayer> H2Service<E> {
                         )
                     });
                 self.last_proposal_sent_at = Some(sent_at);
+                let trigger_slot = match build_start_trigger {
+                    "seal" => 0,
+                    "send" => 1,
+                    "commit" => 2,
+                    _ => 3,
+                };
+                self.build_start_counts[trigger_slot] += 1;
+                let [build_starts_seal, build_starts_send, build_starts_commit, build_starts_other] =
+                    self.build_start_counts;
                 info!(
                     target: "n42.h2.node",
                     view,
@@ -2972,6 +2989,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                     tick_to_send_us = timeline_from.elapsed().as_micros() as u64,
                     build_start_after_prev_send_us,
                     build_start_trigger,
+                    build_starts_seal,
+                    build_starts_send,
+                    build_starts_commit,
+                    build_starts_other,
                     answer_elided = timing.elided,
                     answer_bytes = timing.answer.map_or(0, |a| a.bytes),
                     answer_layout_only = timing.answer.is_some_and(|a| a.layout_only),

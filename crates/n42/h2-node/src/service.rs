@@ -999,12 +999,13 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// without it the loop sees nothing the engine produces.
     pub fn new(
         transport: H2V4Transport,
-        engine: ConsensusEngine,
+        mut engine: ConsensusEngine,
         mut driver: ExecutionDriver<E>,
         outputs: mpsc::Receiver<EngineOutput>,
         validator_count: usize,
     ) -> Self {
         let identity = transport.identity();
+        engine.set_vote_aggregate(vote_aggregate_from_env());
         // How a body this node kept as bytes becomes a payload, for the
         // fallback when the execution layer will not take the bytes. The
         // transactions are slices of the body rather than copies: the body
@@ -1242,6 +1243,15 @@ impl<E: ExecutionLayer> H2Service<E> {
         // The followers' side of it: a block imported after its view passed
         // still tells that view's leader (a progress vote, not a vote).
         self.engine.set_progress_votes(self.straggler_grace.is_some());
+        self
+    }
+
+    /// Verifies votes in same-message batches at each transport drain's end
+    /// instead of one pairing per vote (`N42_VOTE_AGGREGATE_VERIFY=1`, read
+    /// by [`Self::new`]; see `n42_h2_consensus`'s `vote_batch`). Local: the
+    /// wire and what a vote attests are unchanged.
+    pub fn with_vote_aggregate(mut self, on: bool) -> Self {
+        self.engine.set_vote_aggregate(on);
         self
     }
 
@@ -1617,6 +1627,14 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
                 None => break,
             }
+        }
+        // The drain boundary: the votes it queued are verified as batches.
+        if self.engine.vote_aggregate() {
+            let at = std::time::Instant::now();
+            if let Err(err) = self.engine.flush_votes() {
+                debug!(target: "n42.h2.node", %err, "engine rejected a vote batch");
+            }
+            handle += at.elapsed();
         }
         self.last_drain = (poll.as_millis() as u64, handle.as_millis() as u64, slowest.0.as_millis() as u64, slowest.1);
         let _ = events;
@@ -2143,6 +2161,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 if trace_messages() {
                     info!(target: "n42.h2.trace", kind = message_kind(&message), view = message.view(), "recv");
                 }
+                // `N42_VOTE_AGGREGATE_VERIFY`: a vote waits for its batch,
+                // verified at the end of this drain (`flush_votes`). With the
+                // switch off every message comes straight back.
+                let Some(message) = self.engine.queue_vote(message) else {
+                    return;
+                };
                 // A message that fails the engine's own checks is a
                 // peer problem, not a local one: log it and keep the
                 // node running rather than taking the fleet's word for
@@ -4246,6 +4270,11 @@ async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeReques
 /// `N42_H2_TRACE_MSGS=1`: one info line per consensus message sent or
 /// received, with its kind and view, so a round's hops can be timed across
 /// the fleet's logs (all on one clock when the fleet is on one box).
+/// `N42_VOTE_AGGREGATE_VERIFY=1`: batched vote verification on a leader.
+fn vote_aggregate_from_env() -> bool {
+    std::env::var("N42_VOTE_AGGREGATE_VERIFY").is_ok_and(|v| v == "1")
+}
+
 fn trace_messages() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_H2_TRACE_MSGS").is_ok_and(|v| v == "1"))

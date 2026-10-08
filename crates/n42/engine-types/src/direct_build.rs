@@ -456,6 +456,10 @@ pub mod open_wait {
         pub keep_us: u64,
         /// The first look up of the anchor's state, microseconds.
         pub provider_us: u64,
+        /// Accounts the kept layers hold after the open's keep (shard sets
+        /// and filed bundles, [`super::leader_layers::held`]): the memory the
+        /// layer count costs.
+        pub kept_accounts: u64,
     }
 
     impl OpenWait {
@@ -487,7 +491,7 @@ pub mod open_wait {
         /// wait, the layer release and the anchor's first look (us).
         pub fn split(&self) -> String {
             format!(
-                "{}/{}/{}/{} polls={} gp_layer={} ggp_missing={} open_layers={} open_fallback={} open_engine_us={} open_keep_us={} open_provider_us={}",
+                "{}/{}/{}/{} polls={} gp_layer={} ggp_missing={} open_layers={} open_fallback={} open_engine_us={} open_keep_us={} open_provider_us={} open_kept_accounts={}",
                 self.output_ms,
                 self.grandparent_ms,
                 self.parent_root_ms,
@@ -500,6 +504,7 @@ pub mod open_wait {
                 self.engine_wait_us,
                 self.keep_us,
                 self.provider_us,
+                self.kept_accounts,
             )
         }
     }
@@ -519,6 +524,7 @@ pub mod open_wait {
                 engine_wait_us: 0,
                 keep_us: 0,
                 provider_us: 0,
+                kept_accounts: 0,
             })
         };
     }
@@ -838,8 +844,21 @@ pub mod leader_layers {
 
     static KEPT: Mutex<VecDeque<Layer>> = Mutex::new(VecDeque::new());
 
-    /// The smallest and largest `N42_LEADER_LAYERS`.
-    pub const DEPTHS: std::ops::RangeInclusive<usize> = 2..=4;
+    /// The smallest and largest `N42_LEADER_LAYERS`. Up to 8 since
+    /// `docs/SHARED_EXECUTION_SCOPE.md` 18.7 item 2: at E=1 the anchor (the
+    /// block under the deepest layer) has to be canonical in the engine, and
+    /// the canonical commit lands ~4 cycles after a seal (238 ms at 200k), so
+    /// a ~42 ms cycle needs six layers to stand on a block the engine already
+    /// holds. Nothing else bounds the count: the layers are kept here, not in
+    /// the build store (`built_executions`' `KEEP` holds builds until their
+    /// hand-off, and a layer is kept from its child's first open on), and the
+    /// follower's `PARENT_OUTPUTS_KEPT` is the follower's own stack. What a
+    /// layer costs is one shard set (~50 MB at 200k, ~100 MB at 400k) and one
+    /// index probe on every read no newer layer answers; the open's line
+    /// carries what the kept layers hold (`open_kept_accounts`). The engine's
+    /// in-memory tree must still hold the anchor (`--engine.memory-block-buffer-target`
+    /// at least the layers less the engine's lag; the fleet's 6 does at 6).
+    pub const DEPTHS: std::ops::RangeInclusive<usize> = 2..=8;
 
     /// `N42_LEADER_LAYERS` as given: the default 2 when unset, `None` when
     /// it is not a number in [`DEPTHS`].
@@ -862,7 +881,7 @@ pub mod leader_layers {
             }
             let value = std::env::var("N42_LEADER_LAYERS").ok();
             parse_depth(value.as_deref()).unwrap_or_else(|| {
-                tracing::warn!(target: "payload_builder", ?value, "N42_LEADER_LAYERS must be 2, 3 or 4; using 2");
+                tracing::warn!(target: "payload_builder", ?value, "N42_LEADER_LAYERS must be 2 to 8; using 2");
                 2
             })
         })
@@ -948,6 +967,20 @@ pub mod leader_layers {
             out.push(layer.clone());
         }
         out
+    }
+
+    /// What the kept layers hold: (layers, accounts in their shard sets and
+    /// filed bundles). The memory the layer count costs, in the unit the
+    /// shard sets are sized by (~260 B an account with its revert at 200k).
+    pub fn held() -> (usize, usize) {
+        let kept = KEPT.lock().unwrap_or_else(|p| p.into_inner());
+        let accounts = kept
+            .iter()
+            .map(|(executed, shards)| {
+                shards.as_ref().map_or(0, |shards| shards.accounts()) + executed.execution_output.state.state.len()
+            })
+            .sum();
+        (kept.len(), accounts)
     }
 
     /// How many blocks' layers are kept (at most `depth` once the chain runs).
@@ -1042,7 +1075,11 @@ where
                 }
                 let kept_at = std::time::Instant::now();
                 leader_layers::keep(&parent_layer, depth);
-                open_wait::add(|wait| wait.keep_us += kept_at.elapsed().as_micros() as u64);
+                let (_, held) = leader_layers::held();
+                open_wait::add(|wait| {
+                    wait.keep_us += kept_at.elapsed().as_micros() as u64;
+                    wait.kept_accounts = held as u64;
+                });
                 leader_layers::ancestors(parent.parent_hash, depth - 1)
             })
             .clone();
@@ -1747,7 +1784,7 @@ mod tests {
         assert_eq!(wait.label(), "grandparent");
         assert_eq!(
             wait.split(),
-            "3/150/40/0 polls=60 gp_layer=0 ggp_missing=0 open_layers=0 open_fallback=false open_engine_us=0 open_keep_us=0 open_provider_us=0"
+            "3/150/40/0 polls=60 gp_layer=0 ggp_missing=0 open_layers=0 open_fallback=false open_engine_us=0 open_keep_us=0 open_provider_us=0 open_kept_accounts=0"
         );
         assert_eq!(open_wait::take(), OpenWait::default());
         // The open's own costs are named, in microseconds.
@@ -2320,13 +2357,15 @@ mod tests {
     }
 
     #[test]
-    fn the_layer_count_parses_two_to_four_and_defaults_to_two() {
+    fn the_layer_count_parses_two_to_eight_and_defaults_to_two() {
         assert_eq!(leader_layers::parse_depth(None), Some(2));
         assert_eq!(leader_layers::parse_depth(Some("")), Some(2));
         assert_eq!(leader_layers::parse_depth(Some("2")), Some(2));
         assert_eq!(leader_layers::parse_depth(Some(" 3 ")), Some(3));
         assert_eq!(leader_layers::parse_depth(Some("4")), Some(4));
-        for bad in ["1", "5", "0", "three", "-3"] {
+        assert_eq!(leader_layers::parse_depth(Some("6")), Some(6));
+        assert_eq!(leader_layers::parse_depth(Some("8")), Some(8));
+        for bad in ["1", "9", "0", "three", "-3"] {
             assert_eq!(leader_layers::parse_depth(Some(bad)), None, "{bad}");
         }
     }
@@ -2431,6 +2470,129 @@ mod tests {
         let two = opener_on_sealed_parent_with(Scripted::new(at_n3()), n1.0.clone(), n1.1, 2)().expect("two layers");
         for a in [x, y, z, coinbase, untouched, created, absent] {
             assert_eq!(read(&two, a), read(&installed, a), "{a}: two layers over N-3 read the same");
+        }
+        leader_layers::clear();
+    }
+
+    /// Six kept layers (`docs/SHARED_EXECUTION_SCOPE.md` 18.7 item 2) --
+    /// full bundles and shard sets alternating -- over the engine at N-7 read
+    /// exactly as the engine's state once it has landed all six: every
+    /// account each block wrote, one every block wrote, a slot written twice,
+    /// one created, an untouched and an absent account, the coinbase from a
+    /// residual or a bundle, and `BLOCKHASH` of each. The same reads at three
+    /// and four layers over the engine at the matching deeper height are
+    /// equal too, and the build store's `KEEP` (3) does not bound the count:
+    /// the six blocks outlive their builds there as layers.
+    #[test]
+    fn six_kept_layers_read_as_the_engine_after_it_landed_them() {
+        let _guard = store_lock();
+        leader_layers::clear();
+        const DEPTH: usize = 6;
+        let own = |k: usize| Address::with_last_byte(0x90 + k as u8);
+        let shared = Address::with_last_byte(0xa0);
+        let slotted = Address::with_last_byte(0xa1);
+        let created = Address::with_last_byte(0xa2);
+        let coinbase = Address::with_last_byte(0xa3);
+        let untouched = Address::with_last_byte(0xa4);
+        let absent = Address::with_last_byte(0xa5);
+        let slot = B256::with_last_byte(9);
+        let anchor = B256::with_last_byte(0x8f);
+        // The engine's state after `landed` of the six blocks.
+        let engine_after = |landed: usize| {
+            let m = MockEthProvider::default();
+            for k in 0..DEPTH {
+                let (nonce, balance) = if k < landed { (k as u64 + 2, 100 + k as u64) } else { (1, 10) };
+                m.add_account(own(k), ExtendedAccount::new(nonce, U256::from(balance)));
+            }
+            let s = landed.checked_sub(1).map_or((0, 1), |k| (k as u64 + 1, 1000 + k as u64));
+            m.add_account(shared, ExtendedAccount::new(s.0, U256::from(s.1)));
+            let slot_value = [4usize, 1].into_iter().find(|k| *k < landed).map_or(0, |k| 10 * k as u64);
+            m.add_account(slotted, ExtendedAccount::new(3, U256::from(30)).extend_storage([(slot, U256::from(slot_value))]));
+            if landed > 2 {
+                m.add_account(created, ExtendedAccount::new(0, U256::from(7)));
+            }
+            m.add_account(coinbase, ExtendedAccount::new(0, U256::from(landed as u64 + 1)));
+            m.add_account(untouched, ExtendedAccount::new(4, U256::from(40)));
+            m
+        };
+        // Block k's writes; the coinbase is in the residual of a shard set
+        // (odd k) and in the bundle of a full block (even k).
+        let block = |k: usize, parent: B256| {
+            let number = 191 + k as u64;
+            let mut batch = BundleState::builder(number..=number)
+                .state_original_account_info(own(k), info(1, 10))
+                .state_present_account_info(own(k), info(k as u64 + 2, 100 + k as u64))
+                .state_present_account_info(shared, info(k as u64 + 1, 1000 + k as u64));
+            if k == 1 || k == 4 {
+                let before = if k == 4 { 10 } else { 0 };
+                batch = batch
+                    .state_present_account_info(slotted, info(3, 30))
+                    .state_storage(slotted, [(U256::from(9), (U256::from(before), U256::from(10 * k as u64)))].into_iter().collect());
+            }
+            if k == 2 {
+                batch = batch
+                    .state_original_account_info(created, info(0, 0))
+                    .state_present_account_info(created, info(0, 7));
+            }
+            let coinbase_now = info(0, k as u64 + 2);
+            if k % 2 == 1 {
+                let residual = BundleState::builder(number..=number).state_present_account_info(coinbase, coinbase_now).build();
+                file_sharded(number, parent, batch.build(), residual)
+            } else {
+                file_ready(number, parent, batch.state_present_account_info(coinbase, coinbase_now).build())
+            }
+        };
+        let mut sealed = Vec::new();
+        let mut parent = anchor;
+        for k in 0..DEPTH {
+            let filed = block(k, parent);
+            parent = filed.0.hash();
+            if k + 1 < DEPTH {
+                // Block k's child opens on it: keeps its layer and its kept
+                // ancestors, standing on the anchor.
+                opener_on_sealed_parent_with(Scripted::new(engine_after(0)), filed.0.clone(), filed.1, DEPTH)()
+                    .expect("the child's build opens");
+            }
+            sealed.push(filed);
+        }
+        let _ = open_wait::take();
+        let last = &sealed[DEPTH - 1];
+        // N's build: N-7 is in the engine; none of the six has to be.
+        let mut client = Scripted::new(engine_after(0));
+        client.missing.extend(sealed.iter().map(|(header, _)| header.hash()));
+        let layered = opener_on_sealed_parent_with(client, last.0.clone(), last.1, DEPTH)().expect("N's build opens on six layers");
+        let wait = open_wait::take();
+        assert_eq!((wait.layers, wait.grandparent_layer, wait.fallback), (DEPTH as u32, 1, false), "{}", wait.split());
+        assert_eq!(leader_layers::len(), DEPTH);
+        assert!(wait.kept_accounts >= 6 * 3, "the kept layers' accounts are counted: {}", wait.split());
+        assert_eq!(leader_layers::held(), (DEPTH, wait.kept_accounts as usize));
+
+        let installed = engine_after(DEPTH).state_by_block_hash(B256::ZERO).expect("the landed state");
+        let read = |state: &StateProviderBox, a: Address| state.basic_account(&a).expect("read").map(|a| (a.nonce, a.balance));
+        let everyone: Vec<Address> =
+            (0..DEPTH).map(own).chain([shared, slotted, created, coinbase, untouched, absent]).collect();
+        for a in &everyone {
+            assert_eq!(read(&layered, *a), read(&installed, *a), "{a}: six layers read as the landed engine");
+        }
+        assert_eq!(layered.storage(slotted, slot).expect("read"), Some(U256::from(40)), "the newer of two slot writes");
+        assert_eq!(layered.storage(slotted, slot).expect("read"), installed.storage(slotted, slot).expect("read"));
+        assert_eq!(read(&layered, coinbase), Some((0, U256::from(DEPTH as u64 + 1))), "the newest block's coinbase, from a residual");
+        for (k, (header, _)) in sealed.iter().enumerate() {
+            let number = 191 + k as u64;
+            assert_eq!(layered.block_hash(number).expect("read"), Some(header.hash()), "BLOCKHASH({number}) is the sealed hash");
+        }
+        // Fewer layers over a deeper engine read the same (deepest first:
+        // each open releases the layers past its own count).
+        for depth in [4, 3] {
+            let landed = DEPTH - depth;
+            let _ = open_wait::take();
+            let fewer = opener_on_sealed_parent_with(Scripted::new(engine_after(landed)), last.0.clone(), last.1, depth)()
+                .expect("fewer layers");
+            assert_eq!(open_wait::take().layers, depth as u32);
+            for a in &everyone {
+                assert_eq!(read(&fewer, *a), read(&installed, *a), "{a}: {depth} layers over N-{} read the same", depth + 1);
+            }
+            assert_eq!(fewer.storage(slotted, slot).expect("read"), Some(U256::from(40)));
         }
         leader_layers::clear();
     }

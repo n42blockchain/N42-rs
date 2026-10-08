@@ -3045,3 +3045,39 @@ loop348 had 856 MB anonymous per key at 99 keys (85.6 GB). Per peer, (anon - 65 
 **Answers.** Both brought 99 keys under 30 GB: the bound alone to 16.9 GB, direct alone to 13.4 GB, both 13.1 GB. K99D selects A / B. 99 keys hold three windows at 2.6-2.7M, 83-86% of 7 keys. No correctness counter moved. Next: find the tail (p90 105-115 ms, quorum binding 10-14%) and the remaining 14-17%, with K99DQ64AQG (2.72 / 2.69 / 2.59M) and a longer run of the K99DQ64P50 shape as the base.
 
 Hand-off files: `scripts/fleet7-runs/results/loop349{a,b,c}.out`, `manykeys-loop349*.txt`, `valmem-loop349*.txt`.
+
+### 10.97 The section 19 switches at 60 ms pacing (loop350 stage a): all six legs are pacing-bound and correct; S1 (`N42_CHECK_BEFORE_SLOT=1`) cuts the leader's first-vote tail from 29-36 ms to 3-3.5 ms, S1+S2 gives back half of it
+
+Stage a is the correctness gate for the four switches of `docs/SHARED_EXECUTION_SCOPE.md` section 19 (S1 `N42_CHECK_BEFORE_SLOT=1`, S2 `N42_LEADER_LAYERS=6`, S3 `N42_MERGE_AT_SHARDS_READY=1 N42_MERGE_POOL_THREADS=16`, S4 `N42_SHARDS_BEFORE_RECEIPTS=1 N42_FREEZE_SPLIT=4`; leg order in 19.7), not the measurement: 60 ms pacing, 200k transfers a block, all 7 keys on one execution layer, loop349's vote-side base (`N42_VOTE_AGGREGATE_VERIFY=1`, direct votes, `F7_STRAGGLER_GRACE_MS=600`). Legs: WARM, B (base), S1, Bb (base again), S1b (S1 again), S12 (S1 + S2). Runner `scripts/fleet7-runs/run-loop350.sh`; raw output `scripts/fleet7-runs/results/loop350a.out`, vote-road reports `manykeys-loop350{WARM,B,S1,Bb,S1b,S12}.txt`.
+
+**Rate (w1 / w2 / w3 in M TPS, blocks in window 1, round in M transactions, cycle mean in window 1):**
+
+| leg | switches | w1 | w2 | w3 | w1 blocks | round | cycle mean ms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| WARM | none | 3.253 | 3.027 | 2.953 | 488 | 277.0 | 61.7 |
+| B | none | 3.200 | 3.173 | 3.113 | 480 | 284.8 | 61.8 |
+| S1 | S1 | 3.179 | 3.147 | 3.133 | 477 | 284.0 | 62.7 |
+| Bb | none | 3.160 | 3.193 | 3.140 | 474 | 285.0 | 63.3 |
+| S1b | S1 | 3.189 | 3.173 | 3.173 | 479 | 286.2 | (62-63) |
+| S12 | S1 + S2 | 3.127 | 3.167 | 3.007 | 469 | 279.0 | (62-64) |
+
+The cycle holds the 60 ms pacing (median 61.3-61.5 ms on every leg), blocks are 99.8-100% full, and the base legs spread as much as the switch legs (w1 3.160-3.200M on the two bases, 3.179-3.189M on the two S1 legs). **At this pacing nothing is distinguishable: the rate is the pacing**, so stage a says nothing about whether the switches lift the floor; that is stage b (shorter pacing).
+
+**Correctness (every leg):** `no_variant` 0, `invalid_blocks` 0, `gas_mismatch` 0, `direct_imports_failed` 0, `proposals_given_up` 0. `tc` is 1 on Bb and S1b (one timeout and one engine idle over 5 s each; one on a base leg and one on a switch leg, so not caused by the switches) and 0 elsewhere.
+
+**The vote road (leaders' view; p90 ms; B / Bb are the bases):**
+
+| leg | R1_collect | proposal -> first vote R1 / R2 | verify_us p50 | verify_fallbacks |
+| --- | --- | --- | --- | --- |
+| B | 23 | 29.3 / 32.8 | 2.88 ms | 0 |
+| Bb | 28 | 35.6 / 39.1 | 2.88 ms | 2 |
+| S1 | 4 | 3.5 / 9.2 | 2.88 ms | 0 |
+| S1b | 4 | 2.9 / 7.6 | 2.89 ms | 2 |
+| S12 | 6 | 17.7 / 21.3 | 2.90 ms | 1 |
+
+- **S1 removes the first-vote tail, and it reproduces** (S1 and S1b agree: R1_collect p90 4 ms against 23-28, p99 28-39 against 69-79, proposal-to-first-vote p90 2.9-3.5 ms against 29-36). The followers now check the block before the slot rather than inside it, so their vote no longer waits behind the import. p50 does not move (R1_collect 3 ms on every leg), which is why the cycle does not either.
+- **S12 gives back about half of it** (R1_collect p90 6 ms, first vote p90 17.7 ms, p99 101 ms, max 246 ms against 161-172 on the S1 / Bb legs): S2 (six leader layers, 6 x the build threads on one box) is the only difference to S1, so the extra layers cost the followers CPU in the slot. Seen once; S12 is also the leg with the lowest w3 (3.007M, 451 blocks) and the largest cycle tail, so repeat it before drawing a conclusion.
+- `verify_fallbacks` 2 on Bb and 2 on S1b, 1 on S12, 0 on B and S1: the loop348 open item recurs at a rate of about 1 in 2,000 blocks, on base and switch legs alike.
+- Persistence per block at 200k: 32-36 ms (WARM w1 32.3, w3 35.7); builder `sealed_at_ms` median 46-57 ms, p90 62-87 ms, rising from window 1 to window 3 on every leg; CPU per transfer 2.9-3.2 us.
+
+Stage b (50/45/40 ms pacing) pending.

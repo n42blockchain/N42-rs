@@ -329,14 +329,15 @@ F7_NETKEYS=(
   "$(printf '55%.0s' {1..32})" "$(printf '66%.0s' {1..32})"
   "$(printf '77%.0s' {1..32})"
 )
-# A fleet larger than the list would index past its end. Under `set -u` that is
-# an "unbound variable" from inside `f7_peer_id`, three call levels from the
-# cause; said here it names the fix.
-if ((F7_NODES > ${#F7_NETKEYS[@]})); then
-  echo "fleet7-env: F7_NODES=$F7_NODES but only ${#F7_NETKEYS[@]} network keys are defined." >&2
-  echo "            Add keys to F7_NETKEYS (0x11..0x77 repeated 32 times, gov5's fleet keys)." >&2
-  return 1 2>/dev/null || exit 1
-fi
+# A fleet larger than the seven gov5 keys (the many-key shared-execution legs,
+# docs/E1_MANY_KEYS.md: 21 and 99 validators) takes derived keys for the rest:
+# key i >= 7 is sha256("n42-fleet7-netkey-<i>") as hex, a valid secp256k1 secret
+# with overwhelming probability (a 256-bit value below the group order). The
+# first seven are untouched, so a fleet of seven plans exactly as before.
+for ((f7_k = ${#F7_NETKEYS[@]}; f7_k < F7_NODES; f7_k++)); do
+  F7_NETKEYS+=("$(printf 'n42-fleet7-netkey-%d' "$f7_k" | sha256sum | cut -d' ' -f1)")
+done
+unset f7_k
 
 # f7_peer_id <index> -- the peer id that node's fixed network key yields.
 f7_peer_id() { "$F7_BIN/examples/h2_keygen" --libp2p-peer-id "${F7_NETKEYS[$1]}"; }
@@ -644,6 +645,14 @@ f7_el_args() {
   fi
 }
 
+# f7_trace_of <validator> -- the value N42_H2_TRACE_MSGS gets for that validator: "1" when
+# F7_TRACE_VALIDATOR (comma list of indices) names it, "0" when the list is set and does not, and
+# whatever the caller's environment says when the list is unset.
+f7_trace_of() {
+  if [[ -z ${F7_TRACE_VALIDATOR:-} ]]; then echo "${N42_H2_TRACE_MSGS:-}"; return 0; fi
+  [[ ",$F7_TRACE_VALIDATOR," == *",$1,"* ]] && echo 1 || echo 0
+}
+
 # f7_validator_args <index> -> fills F7_V_ARGS[]
 f7_validator_args() {
   local i=$1 j d e
@@ -719,6 +728,14 @@ f7_smt_offset() {
   esac
 }
 
+# f7_fleet_cpus -- the CPUs the nodes (layers and validators) share, flood excluded.
+#
+# F7_NODES x F7_CORES_PER_NODE (7 x 32 = 224) unless F7_FLEET_CPUS says otherwise. The many-key
+# legs (21 and 99 validators on one layer, docs/E1_MANY_KEYS.md) must not grow the budget with
+# the key count: 99 x 32 would run past the host. They set F7_FLEET_CPUS=224 and the layer and
+# the validators split it as for seven keys.
+f7_fleet_cpus() { echo "${F7_FLEET_CPUS:-$((F7_NODES * F7_CORES_PER_NODE))}"; }
+
 # f7_val_cpus -- CPUs set aside for the validator processes of a shared fleet.
 #
 # One-to-one, a node's validator runs on its execution layer's CPUs (0 here: nothing
@@ -747,7 +764,7 @@ f7_el_cpus() {
   local total
   if [[ -n ${F7_EL_CPUS:-} ]]; then echo "$F7_EL_CPUS"; return 0; fi
   if ((F7_ELS == F7_NODES)); then echo "$F7_CORES_PER_NODE"; return 0; fi
-  total=$((F7_NODES * F7_CORES_PER_NODE - $(f7_val_cpus)))
+  total=$(($(f7_fleet_cpus) - $(f7_val_cpus)))
   if [[ ${F7_PIN_PHYSICAL:-1} == 1 ]]; then
     echo $(( (total / 2 / F7_ELS) * 2 ))
   else
@@ -765,12 +782,12 @@ f7_pin_validator() {
   [[ $F7_PIN == 1 ]] || return 0
   if [[ ${F7_PIN_PHYSICAL:-1} == 1 ]]; then
     off=$(f7_smt_offset)
-    lo=$((F7_CORE_OFFSET + (F7_NODES * F7_CORES_PER_NODE - v) / 2))
+    lo=$((F7_CORE_OFFSET + ($(f7_fleet_cpus) - v) / 2))
     hi=$((lo + v / 2 - 1))
     echo "taskset -c $lo-$hi,$((lo + off))-$((hi + off))"
     return 0
   fi
-  lo=$((F7_CORE_OFFSET + F7_NODES * F7_CORES_PER_NODE - v))
+  lo=$((F7_CORE_OFFSET + $(f7_fleet_cpus) - v))
   hi=$((lo + v - 1))
   echo "taskset -c $lo-$hi"
 }
@@ -828,12 +845,12 @@ f7_flood_cores() {
   local off lo hi
   if [[ ${F7_PIN_PHYSICAL:-1} == 1 ]]; then
     off=$(f7_smt_offset)
-    lo=$((F7_CORE_OFFSET + F7_NODES * F7_CORES_PER_NODE / 2))
+    lo=$((F7_CORE_OFFSET + $(f7_fleet_cpus) / 2))
     hi=$((off - 1))
     echo "${F7_FLOOD_CORES:-$lo-$hi,$((lo + off))-$((hi + off))}"
     return 0
   fi
-  echo "${F7_FLOOD_CORES:-$((F7_CORE_OFFSET + F7_NODES * F7_CORES_PER_NODE))-$(($(nproc) - 1))}"
+  echo "${F7_FLOOD_CORES:-$((F7_CORE_OFFSET + $(f7_fleet_cpus)))-$(($(nproc) - 1))}"
 }
 
 # f7_check_shared_ready -- a layer shared by several keys must dedupe their imports.
@@ -874,8 +891,8 @@ f7_check_layout() {
     echo "fleet7-env: F7_VAL_CPUS is for a fleet with fewer layers than validators (F7_EL_MAP); here every validator runs on its node's CPUs" >&2
     return 1
   fi
-  ((F7_ELS * per + $(f7_val_cpus) <= F7_NODES * F7_CORES_PER_NODE)) || {
-    echo "fleet7-env: $F7_ELS layers x $per CPUs + $(f7_val_cpus) for validators exceed the fleet's $((F7_NODES * F7_CORES_PER_NODE)) ($F7_NODES x $F7_CORES_PER_NODE); the flood's cores would be taken" >&2
+  ((F7_ELS * per + $(f7_val_cpus) <= $(f7_fleet_cpus))) || {
+    echo "fleet7-env: $F7_ELS layers x $per CPUs + $(f7_val_cpus) for validators exceed the fleet's $(f7_fleet_cpus) CPUs ($F7_NODES x $F7_CORES_PER_NODE unless F7_FLEET_CPUS is set); the flood's cores would be taken" >&2
     return 1
   }
   ((($(f7_val_cpus)) % 2 == 0)) || { echo "fleet7-env: F7_VAL_CPUS=$(f7_val_cpus) is odd; a physical core is two CPUs" >&2; return 1; }

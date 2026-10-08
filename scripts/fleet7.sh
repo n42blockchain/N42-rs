@@ -92,6 +92,9 @@ cmd_up() {
     d=$(f7_node_dir "$i")
     pin=$(f7_pin_validator "$i")
     f7_validator_args "$i"
+    # F7_TRACE_VALIDATOR=0,1: only those validators log every consensus message
+    # (N42_H2_TRACE_MSGS=1; a line per message, so at 99 keys it is never set fleet-wide).
+    N42_H2_TRACE_MSGS="$(f7_trace_of "$i")" \
     RUST_LOG="$F7_LOG_V" f7_spawn "$d/v.pid" "$d/v.log" $pin "$F7_BIN/examples/h2_validator" "${F7_V_ARGS[@]}"
   done
   echo "validators up"

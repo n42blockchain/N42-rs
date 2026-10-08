@@ -97,3 +97,75 @@ Gates as loop346 (build and tests, 120 G a leg, 75-minute cap a stage, 600 s a l
 for R1 and R2 (the slowest key = the last arrival; its delay distribution) from the traced leaders' `recv` lines; proposal intervals and the count >= 500 ms (the grace); `slow step` lines by event kind; proposal arrival delay at the traced followers (hop proxy); validators' CPU (cores, per key), RSS, threads and the libp2p connection count (`/proc/net/tcp`).
 **Missing fields, for a code change:** the leader's vote-verification time (add `verify_us` and `verify_n` to `ViewTiming`, `state_machine.rs:26`, summed around `verify_single` at `voting.rs:88,269` and printed in `summary()`); the voter index on the trace line (`service.rs:2144`) to name the slowest key; hop count (not exposed by gossipsub).
 Predictions to test (estimates): K21 cycle 70-85 ms at 60 ms pacing (leader loop ~75 ms), K21P50 no faster; K99 150-300 ms, validator CPUs saturated, `R2_collect` ~70 ms; K99G0 recovers only what the grace cost. If K99 looks like that, the vote batch (1a) and the lazy decode are the first code to write.
+
+## 6. What was built (2026-10-08): four switches, all off by default
+
+Code, not measured on the fleet yet. Off, every path is the one before (tests), and nothing on the wire changes under any switch.
+
+**`N42_VOTE_AGGREGATE_VERIFY=1` (1a).** `h2-primitives/src/bls/verify.rs` `verify_same_message_batch`: n signatures over one message,
+random non-zero 64-bit weights, `e(sum r_i s_i, g1) = e(H(m), sum r_i pk_i)`: H(m) once, one verification, two single-threaded Pippenger
+sums and one G2 subgroup check per signature. The weights matter: a plain aggregate (`fast_aggregate_verify` of the sum) accepts two invalid
+signatures that cancel (test `cancelling_signatures_do_not_pass_the_weighted_batch`); with them a passing batch means every member verifies on its own
+(to 2^-64), so a vote's meaning is unchanged. Timing (`same_message_batch_timing`, release, ignored test): 66 signatures 4.4 ms against 41 ms one
+by one; 14: 1.7 ms against 8.6. Engine (`h2-consensus/src/protocol/vote_batch.rs`): the service hands every vote to `queue_vote` and calls
+`flush_votes` at the end of each `drain_transport` (the drain boundary is the event loop's natural batch). A group (same view, block hash, and for
+R2 the changes hash) is verified when the collector could reach its quorum with it (or it is not for the collector's block: equivocation evidence,
+verified at once as before); smaller groups wait for the next drain, which costs nothing since no QC can form without them. A failed batch falls back
+to one-by-one checks of its members: **bound 1 + n checks for n votes, and a vote is verified on its own at most once**, so a peer that poisons every
+batch (anyone can gossip a vote naming any voter) brings the leader back to today's cost plus one batch per group and drain, never above. Exact
+repeats are dropped before the batch, and a vote naming a voter the collector already has is dropped without a check. After the PrepareQC (and for
+late or progress votes after the view), R1 votes are **parked unverified** (at most 2N a view, 8 views): the protocol does not need them, and the
+voters ledger (`voters_seen`, the straggler rule's input) verifies them only when the rule asks, `settle_voters_seen(view, voters)`: one batch per
+message (vote, then progress), so post-quorum votes now cost nothing at arrival and a couple of batches at proposal time. R2 votes after the
+CommitQC are dropped on the view mismatch, as before. Accepted votes enter the collector through `process_verified_vote` / `process_verified_commit_vote`,
+the path the existing randomised batch verifier already used. The leader line of `block committed!` gains `verify_us verify_n verify_batches
+verify_fallbacks` (also counted on the one-by-one path). Tests (`vote_batch_tests.rs`): batched equals sequential and the PrepareQC and Decide
+encode to the same gov5 wire bytes; one bad vote of 20 rejected, 19 accepted, `verify_fallbacks=1`; votes wait until the quorum is reachable;
+post-quorum votes parked and settled only on demand; a late progress vote settles under its own message.
+
+**`N42_STRAGGLER_RULE=quorum` (1b, needs the grace).** `h2-node/src/straggler.rs`, `service.rs` `quorum_straggler_defers`. Why the grace exists:
+round 43 (`with_straggler_grace`, `service.rs` doc; `docs/NATIVE_FLEET7.md` round 43): with one layer per key the keys outside the quorum imported more
+slowly than the leader proposed, fell one more block behind every view, and when the tenure passed to one of them it could not propose until it had
+caught up: 10-40 s stalls at each handover. `All` prevents it by bounding *everyone's* lag to zero, at the price of the slowest of N every block.
+`Quorum` bounds what the stall needed: (i) while the handover is at most D = 2 views away (`next_tenure_leader`; every view under tenure 1) the
+outgoing leader waits until the incoming leader has voted (or sent its progress vote, which a follower sends only after its import,
+`state_machine.rs` `withheld_votes`) at the previous view, so it has imported the parent of its first block when the tenure passes; it is never given
+up on; (ii) any voter whose last verified vote is older than `view - 2` is waited for, so no live voter's lag grows past 2 blocks, which is what made
+the round-43 lag unbounded; a voter one block late holds nothing. Each wait is capped at `min(grace, 2 x median of the last 16 commit intervals)`; a
+lagger still missing at the cap is given up on until it is seen within the bound again (a dead key costs one wait, not one per block), and its lag
+is then the protocol's ordinary f. Worst case at a handover: the incoming leader is at most D = 2 blocks behind (it was bounded by (ii)) and the
+outgoing leader has spent up to 2 capped waits on it. Unset, the grace path is the old code with one addition: under batching it settles the parked
+votes of the previous view before counting them. Tests: `the_outgoing_leader_waits_for_an_incoming_leader_that_is_behind`,
+`one_slow_voter_among_seven_is_not_waited_for`, `a_lagging_voter_costs_one_wait_then_is_given_up_until_it_returns`, the cap. The `proposal sent`
+line gains `straggler_waits` (cumulative) and `straggler_wait_us` (this proposal, from the decision of the previous view).
+
+**`N42_GOSSIP_OFF_LOOP=1` (3a).** `h2-net/src/pump.rs`, `transport.rs`: `H2V4Transport` keeps its API and wraps the inline core or a tokio task that
+owns the swarm (on the validator's multi-thread runtime, so off the thread that runs `block_on(service)`). Inbound: decoded events through a bounded
+channel (4096; when the loop is behind the task waits, nothing is dropped; one FIFO, so per-peer order is kept); publishes through a second bounded
+one (1024; full is the transient `AllQueuesFull` the service already retries, and transiently refused publishes are retried by the task);
+requests, responses, pushes and dials through an unbounded command channel (a dropped response would leave a peer waiting out its timeout).
+GossipSub's configuration is untouched. What the loop still does per message: one channel receive, `wire_bridge::to_engine` (field copies; the G2
+decompression and the envelope or native decode happened on the task), the direct-vote dedupe when on, and `queue_vote` or `process_event`.
+Both timing lines gain `inbound_queue_max` and `gossip_poll_us` (the task's poll time off the loop, the drain's own polls inline). Tests:
+`h2-net/tests/off_loop.rs` (both directions over a socket, order kept, stats), and `four_node_fleet.rs` passes with `N42_GOSSIP_OFF_LOOP=1`
+`N42_VOTE_AGGREGATE_VERIFY=1` and either `N42_VOTE_TRANSPORT`.
+
+**`N42_VOTE_TRANSPORT=direct|both|gossip` (3b, default `gossip`).** `h2-net/src/rpc.rs` `VOTE_PROTOCOL` = `/n42/vote/1`: `tag (1) || len (4, BE) ||
+body`, tag 1 `Hello` (index BE, 96-byte signature), 2 the vote's native-topic bytes, 3 its v4 envelope bytes; one ack byte back (fixtures pinned in
+`vote_protocol_tests`). A received vote becomes `TransportEvent::DirectVote` wrapping the same `Native` / `Envelope` event gossip produces, so the
+receiving path is the gossip one. The leader's peer id comes from the hello each member sends on connect when it runs `direct` or `both`: its
+index and a BLS signature by its consensus key over `"n42/vote-hello/1" || genesis hash || peer id` (`h2-consensus/src/protocol/vote_hello.rs`;
+the Noise handshake authenticates the peer id, so a hello cannot be replayed for another peer). `direct` sends to the leader when its hello has
+verified and by gossip otherwise (`fallbacks`); `both` sends by both. A leader deduplicates before the engine by (round, view, voter, signature):
+the two copies of a real vote are the same bytes, and keying by (view, voter) alone would let a forged vote that arrives first shadow the real one.
+The gossip path is byte-identical in every mode, and `gossip` sends nothing new (no hello). **gov5 does not speak the protocol: a mixed fleet runs
+`gossip` or `both`.** For gov5 to adopt it: register a libp2p stream handler for `/n42/vote/1` with this framing, verify the hello against its
+validator set and keep index -> peer id, send its own hello on connect, send a vote to the leader's stream (keeping the topic as fallback), and
+dedupe by (round, view, voter, signature) before its vote handler. Tests: `a_vote_by_gossip_and_directly_reaches_the_engine_once`,
+`a_direct_vote_falls_back_to_gossip_until_the_leader_announces_itself` (a wrong-key hello names no one), `both_sends_by_both_paths_and_gossip_by_one`.
+
+Fleet legs (on loop345 ALL's env, `F7_STRAGGLER_GRACE_MS=600`): per key count 7, 21, 99, add in order and measure each: (1)
+`N42_VOTE_AGGREGATE_VERIFY=1` (expect `verify_us` per view ~2 batches: K99 ~10 ms against ~180, R2_collect down to the arrival spread); (2) + `N42_STRAGGLER_RULE=quorum` (expect
+the >= 500 ms proposal intervals to vanish, `straggler_waits` near the handovers only); (3) + `N42_GOSSIP_OFF_LOOP=1` (expect `slow step` lines and the
+leader's `gossip_poll_us` on the loop to go, `inbound_queue_max` small); (4) + `N42_VOTE_TRANSPORT=direct` (all-Rust only; expect the deliveries per
+node to fall from ~1.6k to ~2N + gossip of the rest at K99).

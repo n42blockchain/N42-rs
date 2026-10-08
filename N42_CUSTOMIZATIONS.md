@@ -485,6 +485,34 @@
   fleet 用 `F7_GENESIS=<该文件>` 选择；`fleet7-bench.sh` 头部打印 `chain : <文件>, deferred execution depth N`，
   `fleet7-verify.py` 输出与 JSON 带 `deferred_depth`。未实现：重启日志（第 6 步，D=2 重启后丢一个出块视图或弃权一次）。
 
+## E=1 多密钥：投票批量验证、quorum 等待规则、gossip 离开共识循环、投票直达 leader（不改任何 fork 的 reth crate）:
+`docs/E1_MANY_KEYS.md` 第 6 节（审计见第 1 节）。四个开关默认全关；关闭时行为与以前相同，线上字节不变。
+- `N42_VOTE_AGGREGATE_VERIFY=1`（验证者进程；`h2-primitives` `bls/verify.rs` `verify_same_message_batch` /
+  `verify_same_message_with_fallback`，`h2-consensus` `protocol/vote_batch.rs` `queue_vote` / `flush_votes` /
+  `settle_voters_seen`，`h2-node` `service.rs` `accept_envelope` 与 `drain_transport` 末尾）：leader 把当前视图的
+  R1/R2 投票按签名消息分组，在一次 transport drain 结束时、且该组能让收集器达到 quorum 时，用一次随机系数的同消息
+  批量验证（消息只哈希到 G2 一次，一次配对检查；每个签名单独做 G2 子群检查）；批失败时逐个验证找出坏票、保留好票
+  （每票至多单独验证一次，代价上界 = 今天的逐票验证 + 每组每次 drain 一个批）。PrepareQC 之后与视图过后的 R1 票不
+  验证，暂存（每视图至多 2N 条），只在等待规则需要时（`settle_voters_seen`）按需批量验证；CommitQC 之后的 R2 票仍按
+  视图不符丢弃。leader 的 `block committed!` 计时行（恒开）新增 `verify_us`、`verify_n`、`verify_batches`、
+  `verify_fallbacks`（逐票路径同样计数）。测试：批量与逐票结果及 PrepareQC/Decide 线上字节相同；20 票中 1 张坏票
+  被拒、19 张接受；回退上界 1+n；66 签名 4.4 ms 对逐票 41 ms（`same_message_batch_timing`，ignored）。
+- `N42_STRAGGLER_RULE=quorum`（需 `F7_STRAGGLER_GRACE_MS` > 0；`h2-node` `straggler.rs`、`service.rs`
+  `quorum_straggler_defers`）：leader 只等（1）交接前不超过 2 个视图时、尚未在上一视图出现的下一任 leader，
+  （2）最后一票早于 view-2 的投票者；每次等待上限 min(grace, 2×最近 16 个提交间隔的中位数)；等待超时的落后者被放弃，
+  直到它重新回到 2 个块以内。未设置时等待规则逐字节不变（只在批量验证开启时先结算暂存票）。`proposal sent` 行
+  （恒开）新增 `straggler_waits`（累计被推迟的提案数）与 `straggler_wait_us`（本提案被推迟的时长）。
+- `N42_GOSSIP_OFF_LOOP=1`（验证者进程；`h2-net` `pump.rs`、`transport.rs` `H2V4Transport::with_keypair_off_loop`，
+  `h2_validator.rs`）：swarm 在自己的 tokio 任务上轮询；入站事件解码后经有界通道（4096，背压不丢弃，FIFO 保序）交给
+  共识循环，发布经第二个有界通道（1024，满时报暂时性的 `AllQueuesFull`，服务已有重试），请求/应答/推送经无界命令
+  通道；GossipSub 参数与线上字节不变。计时行（leader 与 follower）新增 `inbound_queue_max`、`gossip_poll_us`。
+- `N42_VOTE_TRANSPORT=direct|both|gossip`（缺省 gossip；`h2-net` `rpc.rs` `VOTE_PROTOCOL` = `/n42/vote/1`、
+  `h2-consensus` `protocol/vote_hello.rs`、`h2-node` `direct_votes.rs`）：投票经新的 request-response 协议直接发给
+  该视图 leader（载荷就是投票原本的 gossip 字节；tag 1 hello、2 native、3 v4 envelope）；leader 的 peer id 来自连接时
+  的 hello（验证者索引 + 共识 BLS 密钥对 前缀‖创世哈希‖peer id 的签名），未知时退回 gossip。`both` 两路都发；
+  `gossip` 不发 hello、不发任何新东西。leader 按 (轮次, 视图, 投票者, 签名) 去重，伪造票不能顶替真票。gov5 不支持
+  该协议，混合舰队必须用 `gossip` 或 `both`。
+
 ## 其他 N42 独有模块:
 - `crates/n42/clique/` - APoS 共识实现
 - `crates/n42/primitives/` - beacon 链原语

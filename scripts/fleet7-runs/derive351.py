@@ -7,6 +7,8 @@ stage-a configuration with the best window 1 (it must beat max(BP50, BP50b) by 1
 import re
 D = '/data/n42-build/wt338/scripts/fleet7-runs/'
 r = open(D + 'run-loop350.sh').read().replace('loop350', 'loop351').replace('LOOP350', 'LOOP351')
+# a dry run owns no fleet: the EXIT trap must not kill the processes of a leg another stage is running (2026-10-08, S13P50)
+r = r.replace('cleanup() {\n', 'cleanup() {\n  # a dry run (LOOP351_DRY=1) owns no fleet: on 2026-10-08 a dry run of stage c, exited while stage a held the box, killed the running leg (S13P50) through this trap\n  [ "${LOOP351_DRY:-0}" = 1 ] && return 0\n', 1)
 r = r.replace('manykeys351', 'manykeys350').replace('valsample351', 'valsample350')
 r = re.sub(r'^# loop351 = .*\n# Stage a:.*\n', '''# loop351 = 200k blocks, 7 keys on one layer, 50 ms pacing: the base, check-before-slot alone (S1), 64 build threads (T64) and the merge at shards_ready (S3), then a step-down of the best. usage: run-loop351.sh <a|b|c>
 # Stage a: WARM (60 ms), BP50, S1P50, S1P50T64, S13P50, S13P50T64, BP50b.  b: WARM, then 45 and 40 ms for the best stage-a configuration (window 1 at least 1.5% over max(BP50, BP50b), each step only while gate340 holds), else S1P50b and S1P50T64b.

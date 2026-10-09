@@ -16,6 +16,8 @@ UPG=/data/n42-build/upgrade-native/release
 SIMD=$WT/target/native-simd/release
 CLAIM=/data/blockchain/.box-claim-rust; CLAIM2=/data/blockchain/wr-logs/.box-claim-rust
 cleanup() {
+  # a dry run (LOOP351_DRY=1) owns no fleet: on 2026-10-08 a dry run of stage c, exited while stage a held the box, killed the running leg (S13P50) through this trap
+  [ "${LOOP351_DRY:-0}" = 1 ] && return 0
   rm -f $CLAIM $CLAIM2
   # The fleet this runner started goes with it. Killing the runner alone left
   # seven nodes and seven validators running for four and a half hours on

@@ -3106,3 +3106,45 @@ The cycle holds the 60 ms pacing (median 61.3-61.5 ms on every leg), blocks are 
 **Pairs and the 5M line.** S1 / S1b against B / Bb (stage a) are equal. No pair or single leg holds all three windows above 4.0M, none above 3.5M: the best 200k leg is B (3.200 / 3.173 / 3.113M, 64% of 5M), the best 400k window S400B w1 3.333M (67%), and S400B's w3 is 3.000M. The switches deliver their own timing targets (merge -50 / -109 ms, shards ready -7 ms, first-vote tail -30 ms) and none of it reaches the rate: at 60 ms the tick holds the rate, at 50 ms and at 400k the S1234 legs lose it to the tail. The S400 pair and the S1234P50 pair against a single base leg are the weak points; repeat BP50 and S400B before treating the -5% and -20% as final.
 
 Hand-off files: `scripts/fleet7-runs/results/loop350{a,b,c,d}.out`, `manykeys-loop350*.txt`.
+
+### 10.98 loop351 — at 50 ms the cycle is the import slot, not the seal: six leader layers and depth 2 take sealed_at 59 -> 35 ms and buy nothing; the vote waits for an import slot (34 ms), and at depth 2 N42_CHECK_BEFORE_SLOT is defeated by the far-ahead hold (cycle 78)
+
+Loop351 asks whether the leader's seal chain (`docs/SHARED_EXECUTION_SCOPE.md` section 20) is what holds the cycle at 61-65 ms once the pacing is below it. 200k transfers a block, all 7 keys on one execution layer, window 1 in the table. Switches: S1 = `N42_CHECK_BEFORE_SLOT=1`, S2 = `N42_LEADER_LAYERS=6`, S3 = merge at `shards_ready` (16-thread pool), T64 = `N42_PARALLEL_BUILD_THREADS=64`, D2 = the depth-2 genesis `n42_fleet7_bench_d2.json`, Pxx = pacing in ms. `d2gate` passed on every D2 leg (invalid 0, fields mismatches 0). `sealed_at` is the layer-0 leader window-1 median (from the .out lines), cycle is the window-1 cycle.
+
+| leg | pacing | w1 | w2 | w3 | round (M tx) | sealed_at median ms | cycle ms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| WARM | 60 | 3.193 | 3.167 | 3.153 | 285.6 | 48 | 63 |
+| BP50 | 50 | 3.093 | 3.087 | 3.107 | 278.8 | 58 | 65 |
+| BP50b | 50 | 3.153 | 3.080 | 2.880 | 273.6 | 57 | 63 |
+| S1P50 | 50 | 3.171 | 3.267 | 3.120 | 286.7 | 58 | 63 |
+| S1P50T64 | 50 | 3.033 | 3.093 | 3.073 | 276.2 | 61 | 66 |
+| S13P50 (void) | 50 | 2.627 | - | - | 79.0 | 61 | 76 |
+| S13P50T64 | 50 | 2.933 | 2.933 | 2.827 | 260.8 | 64 | 68 |
+| S2P50T64 | 50 | 3.213 | 3.173 | 3.027 | 282.6 | 48 | 62 |
+| S2P50T64b | 50 | 3.270 | 3.167 | 3.147 | 287.5 | 49 | 61 |
+| S12P50T64 | 50 | 3.233 | 3.173 | 2.980 | 281.6 | 52 | 62 |
+| S12P50T64b | 50 | 3.060 | 2.887 | 3.040 | 269.8 | 50 | 65 |
+| S123P50T64 | 50 | 2.773 | 3.000 | 2.793 | 257.1 | 51 | 72 |
+| S123P50T64b | 50 | 3.087 | 3.027 | 2.720 | 265.0 | 54 | 65 |
+| S2P45T64 | 45 | 3.198 | 3.107 | 3.007 | 279.3 | 48 | 62 |
+| D2S2P50T64 | 50 | 3.147 | 3.153 | 3.073 | 281.3 | 34 | 64 |
+| D2S2P45T64 | 45 | 3.233 | 3.187 | 3.000 | 282.6 | 35 | 62 |
+| D2S2P45T64b | 45 | 3.140 | 3.147 | 3.073 | 280.8 | 35 | 64 |
+| D2S2P40T64 | 40 | 3.160 | 3.160 | 3.087 | 282.4 | 36 | 63 |
+| D2S2P40T64b | 40 | 3.153 | 3.113 | 3.080 | 280.6 | 35 | 63 |
+| D2S12P45T64 | 45 | 2.553 | 2.600 | 2.527 | 230.4 | 38 | 78 |
+| D2S12P45T64b | 45 | 2.339 | 2.427 | 2.460 | 216.8 | 34 | 85 |
+| D2S12P40T64 | 40 | 2.613 | 2.693 | 2.420 | 231.8 | 35 | 77 |
+| D2S12P40T64b | 40 | 2.407 | 2.440 | 2.360 | 216.4 | 35 | 83 |
+
+S13P50 is void: its fleet was SIGTERMed 26 s into window 1 by the EXIT trap of a stage-c dry run (fixed in 6acd1bfb2). The D2S12P35T64 legs were not in `loop351e.out` when this was written (their directories exist, no result lines). WARM reads 3.07-3.19M in window 1 across stages (a WARM is repeated inside each .out; the first is quoted).
+
+**Per item (loop351 analysis, this round; section 20's anatomy):**
+- **The seal chain.** At BP50 `sealed_at` mean 60.6 ms (median 57-58) = par_start 5 + state_wait 25 + par_exec 21 (32-thread pool, about 30 effective cores of 208) + sealed 8. The state wait is the anchor under the 3 leader layers (block n-4 not yet canonical in 40% of builds): landing = seal + one interval + 116 ms build finish + about 40 ms commit (block n commits when n+1's hand-off moves the head) = 229 ms. Six layers (S2) remove it (grandparent waits 0) and `sealed_at` falls to 48-51. What remains in `sealed_ms` is `parent_fields_ms` 18 median / 43 p90: the child's seal waits for the parent's execution fields, the parent's roots about 35 ms after its seal. Depth 2 removes that too: `sealed_at` 35-36 ms. T64 takes `par_exec` 21 -> 13-15. S3 does not help here (S13P50T64 2.93 against S1P50T64 3.03; cycle 72 on the S3 legs). None of this moves the rate: every non-S3, non-stage-e leg is 3.03-3.27M with a 61-65 ms cycle.
+- **The post-seal cycle at D2S2P45T64 (per view, median / p90 ms).** Build 36/50; seal -> proposal sent 55/98; proposal -> first vote received 35/89; first vote -> R1 QC 1.9/3.4; R1 QC -> commit 2.8/3.5; commit -> next proposal 10/39. The next build starts at the parent's seal (commit -> next build start is -81 ms). The tick (`pacing_tick` = block_seen[head] + pacing, `h2-node/src/service.rs` about 2770) binds in about half the views (proposal-to-proposal 46 at 45 ms pacing, 51 at 50), the vote round in the other half (73-76). So the cycle = max(tick, vote round), and the vote round is about 62.
+- **The vote round waits for an import slot.** On a follower (D2S2P45T64, node1, 428 views) the body is already there before the proposal (compact body 0.8 ms earlier). The vote is import-gated: it waits for the block's execution validation to start, which waits for one of the two import slots: `slot_wait_ms` 34 / 89 (`import_ms` 122 / 165); check -> vote 0.5 ms. Two slots at about 122 ms an import is one block per 61 ms, which is the cycle. BP50 at depth 1 shows the same without any switch (45 / 89).
+- **Check-before-slot at depth 2 is defeated by the far-ahead hold.** With S1 at depth 2 (D2S12P45T64) the check-ahead answers in 0.15 ms (`check_us` 155 us, vouched 100%), but it is reached only if h2-node's service lets `ExecuteBlock` through. `FAR_AHEAD_BLOCKS = 1` (`service.rs` about 563, `runs_far_ahead`; the hold at about 3812) holds a block whose number exceeds the layer's tip + 1 until the previous import lands (`block runs ahead of the execution layer; held until the pull reaches it`). At depth 2 the voted block is two ahead, so the vote waits 57 / 106 ms (`since_body_ms`) instead of 0.15, and the cycle is 77-85 ms (2.34-2.61M, -20 to -25%). At depth 1 the lag is one and the hold is only partial (S1P50: `since_body` 8 / 45), which is why stage a's S1 cut the first-vote tail without moving the rate. Fix: `N42_FAR_AHEAD_BLOCKS` (commit 5c3389083, default 1); stage f runs D2 + S1 + S2 + T64 + `N42_FAR_AHEAD_BLOCKS=2` at 45 / 40 / 35 ms.
+
+**What binds, and what is next.** Six leader layers and depth 2 cut the seal from 59 to 35 ms and the rate stays at 3.1-3.3M, because at 50 ms and below the cycle is the follower's import slot (two slots, about 122 ms each) and the tick, not the leader's seal. Check-before-slot is the lever on the vote road, but it needs the far-ahead hold lifted at depth 2 (stage f). With the vote road at about 3 ms the cycle should follow the tick down to where the layer's own-block hand-off binds (`own block handed to the engine as executed`, 48 ms median / 73 p90 at BP50, plus the head-move FCU 11 ms, so about one hand-off per 48-60 ms); the next lever is that hand-off, then the tick itself.
+
+Hand-off files: `target/fleet-runs/loop351{a,c,d,e}.out` (`loop351f.out` is empty); kept legs under `/data/blockchain/rust-fleet7-bench/bench-loop351{WARM,BP50,BP50b,S1P50,S1P50T64,S13P50,S13P50T64,S2P50T64,S2P50T64b,S12P50T64,S12P50T64b,S123P50T64,S123P50T64b,S2P45T64,D2S2P50T64,D2S2P45T64,D2S2P45T64b,D2S2P40T64,D2S2P40T64b,D2S12P45T64,D2S12P45T64b,D2S12P40T64,D2S12P40T64b,D2S12P35T64}/`.

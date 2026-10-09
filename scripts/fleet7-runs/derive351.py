@@ -72,7 +72,15 @@ stages = '''case $STAGE in
      b7 D2S2P40T64 $D2 F7_BLOCK_INTERVAL_MS=40 $S2 $T64
      b7 D2S2P45T64b $D2 F7_BLOCK_INTERVAL_MS=45 $S2 $T64
      b7 D2S2P40T64b $D2 F7_BLOCK_INTERVAL_MS=40 $S2 $T64 ;;
-  *) echo "unknown stage $STAGE (a, b, c or d)"; exit 2 ;;
+  e) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"
+     b7 D2S12P45T64 $D2 F7_BLOCK_INTERVAL_MS=45 $S1 $S2 $T64
+     b7 D2S12P40T64 $D2 F7_BLOCK_INTERVAL_MS=40 $S1 $S2 $T64
+     b7 D2S12P45T64b $D2 F7_BLOCK_INTERVAL_MS=45 $S1 $S2 $T64
+     b7 D2S12P40T64b $D2 F7_BLOCK_INTERVAL_MS=40 $S1 $S2 $T64
+     b7 D2S12P35T64 $D2 F7_BLOCK_INTERVAL_MS=35 $S1 $S2 $T64
+     b7 D2S12P35T64b $D2 F7_BLOCK_INTERVAL_MS=35 $S1 $S2 $T64 ;;
+  *) echo "unknown stage $STAGE (a, b, c, d or e)"; exit 2 ;;
 esac
 '''
 r = r[:i] + stages + r[j:]

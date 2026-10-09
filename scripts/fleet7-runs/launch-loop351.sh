@@ -1,8 +1,8 @@
 #!/bin/bash
-# loop351 (200k, 7 keys on one layer, 50 ms pacing; derive351.py). usage: launch-loop351.sh <a|b|c|d>. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh a > target/fleet-runs/loop351a.out 2>&1 &
+# loop351 (200k, 7 keys on one layer, 50 ms pacing; derive351.py). usage: launch-loop351.sh <a|b|c|d|e>. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh a > target/fleet-runs/loop351a.out 2>&1 &
 # Waits for the box, checks the tree, and runs the stage. No build and no test gate: crates/ and bin/ are unchanged since the built commit (f2794a821), so the binaries in target/native and target/deferred are current.
 cd /data/n42-build/wt338
-STAGE=${1:-a}; case $STAGE in a|b|c|d) ;; *) echo "usage: launch-loop351.sh <a|b|c|d>"; exit 2;; esac
+STAGE=${1:-a}; case $STAGE in a|b|c|d|e) ;; *) echo "usage: launch-loop351.sh <a|b|c|d|e>"; exit 2;; esac
 BUILT=f2794a821
 git diff --quiet $BUILT HEAD -- crates bin || { echo "crates/ or bin/ changed since $BUILT: the binaries are not current; nothing run"; echo ALLDONE; exit 1; }
 if [ -n "$(git status --porcelain crates bin | grep -v pycache)" ]; then echo "uncommitted changes in crates/ or bin/; nothing run"; echo ALLDONE; exit 1; fi

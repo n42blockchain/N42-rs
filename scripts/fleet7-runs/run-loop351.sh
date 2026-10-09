@@ -399,7 +399,15 @@ case $STAGE in
      b7 D2S12F6I3K8P40T64b $D2 $S1 $S2 $F6 $I3 $K8 $T64 F7_BLOCK_INTERVAL_MS=40
      b7 D2S12F6I3K8P35T64b $D2 $S1 $S2 $F6 $I3 $K8 $T64 F7_BLOCK_INTERVAL_MS=35
      b7 D2S2I3K8P40T64 $D2 $S2 $I3 $K8 $T64 F7_BLOCK_INTERVAL_MS=40 ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h or i)"; exit 2 ;;
+  j) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; F6="N42_FAR_AHEAD_BLOCKS=6"; I3="N42_DEFERRED_IN_FLIGHT=3"; K8="N42_BUILT_KEEP=8"
+     b7 D2S2P45T64 $D2 $S2 $T64 F7_BLOCK_INTERVAL_MS=45
+     b7 D2S12F6I3K8P45T64 $D2 $S1 $S2 $F6 $I3 $K8 $T64 F7_BLOCK_INTERVAL_MS=45
+     b7 D2S2I3K8P45T64 $D2 $S2 $I3 $K8 $T64 F7_BLOCK_INTERVAL_MS=45
+     b7 D2S2I3K8P40T64 $D2 $S2 $I3 $K8 $T64 F7_BLOCK_INTERVAL_MS=40
+     b7 D2S12F6I3K8P40T64 $D2 $S1 $S2 $F6 $I3 $K8 $T64 F7_BLOCK_INTERVAL_MS=40
+     b7 D2S2P45T64b $D2 $S2 $T64 F7_BLOCK_INTERVAL_MS=45 ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i or j)"; exit 2 ;;
 esac
 
 if [ "${LOOP351_DRY:-0}" = 1 ]; then echo "dry run done"; exit 0; fi

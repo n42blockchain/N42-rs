@@ -113,7 +113,15 @@ stages = '''case $STAGE in
      b7 D2S12F6I3K8P40T64b $D2 $S1 $S2 $F6 $I3 $K8 $T64 F7_BLOCK_INTERVAL_MS=40
      b7 D2S12F6I3K8P35T64b $D2 $S1 $S2 $F6 $I3 $K8 $T64 F7_BLOCK_INTERVAL_MS=35
      b7 D2S2I3K8P40T64 $D2 $S2 $I3 $K8 $T64 F7_BLOCK_INTERVAL_MS=40 ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h or i)"; exit 2 ;;
+  j) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; F6="N42_FAR_AHEAD_BLOCKS=6"; I3="N42_DEFERRED_IN_FLIGHT=3"; K8="N42_BUILT_KEEP=8"
+     b7 D2S2P45T64 $D2 $S2 $T64 F7_BLOCK_INTERVAL_MS=45
+     b7 D2S12F6I3K8P45T64 $D2 $S1 $S2 $F6 $I3 $K8 $T64 F7_BLOCK_INTERVAL_MS=45
+     b7 D2S2I3K8P45T64 $D2 $S2 $I3 $K8 $T64 F7_BLOCK_INTERVAL_MS=45
+     b7 D2S2I3K8P40T64 $D2 $S2 $I3 $K8 $T64 F7_BLOCK_INTERVAL_MS=40
+     b7 D2S12F6I3K8P40T64 $D2 $S1 $S2 $F6 $I3 $K8 $T64 F7_BLOCK_INTERVAL_MS=40
+     b7 D2S2P45T64b $D2 $S2 $T64 F7_BLOCK_INTERVAL_MS=45 ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i or j)"; exit 2 ;;
 esac
 '''
 r = r[:i] + stages + r[j:]
@@ -124,11 +132,11 @@ def atomic(path, text):
 atomic(D + 'run-loop351.sh', r)
 
 l = r'''#!/bin/bash
-# loop351 (200k, 7 keys on one layer, 50 ms pacing; derive351.py). usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i>. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh f > target/fleet-runs/loop351f.out 2>&1 &
+# loop351 (200k, 7 keys on one layer, 50 ms pacing; derive351.py). usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j>. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh f > target/fleet-runs/loop351f.out 2>&1 &
 # Waits for the box, checks the tree, and runs the stage. When crates/ or bin/ changed since the last build, the launcher builds target/native (the legs' F7_BIN) after the box is free and the runner
 # runs its own test gate, clippy and the target/deferred build (once: this launcher does not export LOOP351_GATE_TREES for a changed tree). Unchanged tree: no build, no tests.
 cd /data/n42-build/wt338
-STAGE=${1:-a}; case $STAGE in a|b|c|d|e|f|g|h|i) ;; *) echo "usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i>"; exit 2;; esac
+STAGE=${1:-a}; case $STAGE in a|b|c|d|e|f|g|h|i|j) ;; *) echo "usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j>"; exit 2;; esac
 # the tree (crates/ and bin/) the binaries in target/native and target/deferred were built from: f2794a821 until a build here records another (the marker is written after a stage that built)
 MARK=target/fleet-runs/loop351-built-trees
 BUILT=f2794a821

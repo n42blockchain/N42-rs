@@ -488,6 +488,7 @@ where
         at.elapsed().as_millis() as u64
     });
     let (done, handed) = tokio::sync::oneshot::channel();
+    let insert_sent_at = std::time::Instant::now();
     if reuse
         .inserts
         .send(reth_node_builder::executed_inserts::ExecutedInsert { block: Box::new(executed), done })
@@ -495,7 +496,9 @@ where
     {
         return None;
     }
+    // The insert channel is unbounded: the send does not wait.
     let handed = tokio::time::timeout(std::time::Duration::from_secs(2), handed).await;
+    let insert_wait_ms = insert_sent_at.elapsed().as_millis() as u64;
     match handed {
         Ok(Ok(true)) => {
             crate::follower_import::note_import_landed();
@@ -519,6 +522,7 @@ where
                 number = block_number,
                 convert_ms = converted.as_millis() as u64,
                 queue_prune_ms,
+                insert_wait_ms,
                 total_ms = started.elapsed().as_millis() as u64,
                 "own block handed to the engine as executed"
             );
@@ -650,6 +654,7 @@ where
                 Ok(updated) => info!(
                     target: "n42.payload_serve",
                     number, parent = ?header.parent_hash, engine_head = ?head, status = ?updated.payload_status.status,
+                    head_number = number.saturating_sub(1),
                     moved_ms = moved_at.elapsed().as_millis() as u64,
                     "own block forks from the engine's head; the head was moved to its parent first"
                 ),

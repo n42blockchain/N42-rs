@@ -127,6 +127,7 @@
   循环转成 `EngineApiRequest::InsertExecutedBlock` 并回执。reth 只对 payload 事件流里带执行结果的
   payload 走这条路，以太坊 payload 类型不带；N42 的共识在构建之后才封装块头、哈希会变，
   所以由节点自己配对（`bin/n42/src/payload_serve.rs`）。纯增量，默认对上游行为无影响。
+- 引擎循环逐消息计时（`launch/engine.rs`，target `n42.engine.loop`）：每条消息（`orchestrator` / `built_payloads` / `executed_insert`）耗时不低于 `N42_ENGINE_LOOP_TRACE_MS`（默认 5，0 = 全部）时记一行 `engine loop message`（`took_ms`、`idle_before_ms`、块号哈希）；每 5 秒一行 `engine loop summary`（各类的 count / total_ms / max_ms 与 busy_pct / idle_pct）。只加日志与计数，不改行为；原有 300 ms 警告不变。
 - `--engine.state-trie-overlay <bool>`（环境变量 `RETH_ENGINE_STATE_TRIE_OVERLAY`，
   `crates/node/core/src/args/engine.rs` 新增字段 `state_trie_overlay: Option<bool>` 与
   `EngineArgs::state_trie_overlay_enabled(genesis)`）：未设置时，genesis 声明 QMDB 状态承诺或

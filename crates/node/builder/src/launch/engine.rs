@@ -359,6 +359,7 @@ impl EngineNodeLauncher {
             service_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut last_branch_done = std::time::Instant::now();
             let mut last_tick = std::time::Instant::now();
+            let mut loop_stats = EngineLoopStats::new();
             let slow_branch = |name: &str, started: std::time::Instant, since_previous: std::time::Duration| {
                 let took = started.elapsed();
                 if took > std::time::Duration::from_millis(300) || since_previous > std::time::Duration::from_secs(3) {
@@ -376,6 +377,7 @@ impl EngineNodeLauncher {
                             warn!(target: "reth::cli", gap_ms = gap.as_millis() as u64, "engine service loop: the tick came late; the task was not polled");
                         }
                         last_tick = std::time::Instant::now();
+                        loop_stats.maybe_summarize();
                     }
                     event = orchestrator.next() => {
                         let branch_started = std::time::Instant::now();
@@ -425,16 +427,20 @@ impl EngineNodeLauncher {
                                 event_sender.notify(ev);
                             }
                         }
+                        loop_stats.record(0, branch_started.elapsed(), idle_before, None);
                         slow_branch("orchestrator", branch_started, idle_before);
                         last_branch_done = std::time::Instant::now();
                     }
                     Some(payload) = built_payloads.next(), if !built_payloads.is_terminated() => {
                         let branch_started = std::time::Instant::now();
                         let idle_before = branch_started.duration_since(last_branch_done);
+                        let mut detail = None;
                         if let Some(executed_block) = payload.executed_block() {
+                            detail = Some(executed_block.recovered_block.num_hash());
                             debug!(target: "reth::cli", block=?executed_block.recovered_block.num_hash(),  "inserting built payload");
                             orchestrator.handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block).into());
                         }
+                        loop_stats.record(1, branch_started.elapsed(), idle_before, detail.as_ref().map(|d| d as &dyn std::fmt::Debug));
                         slow_branch("built_payloads", branch_started, idle_before);
                         last_branch_done = std::time::Instant::now();
                     }
@@ -460,6 +466,7 @@ impl EngineNodeLauncher {
                             // Every sender gone: nothing more will come this way.
                             None => executed_inserts = None,
                         }
+                        loop_stats.record(2, branch_started.elapsed(), idle_before, None);
                         slow_branch("executed_insert", branch_started, idle_before);
                         last_branch_done = std::time::Instant::now();
                     }
@@ -543,5 +550,98 @@ where
 
     fn launch_node(self, target: NodeBuilderWithComponents<T, CB, AO>) -> Self::Future {
         Box::pin(self.launch_node(target))
+    }
+}
+
+/// N42: the kinds of message the consensus engine loop handles, as logged.
+const LOOP_KINDS: [&str; 3] = ["orchestrator", "built_payloads", "executed_insert"];
+
+/// N42: per-message timing of the consensus engine loop (`n42.engine.loop`).
+///
+/// Fixed arrays only, no allocation in the hot path. A message at or above
+/// `trace_ms` is logged on its own; every five seconds a summary line per kind
+/// is logged. Observability only: nothing here changes what the loop does.
+#[derive(Debug)]
+struct EngineLoopStats {
+    /// Messages at or above this many milliseconds are logged (0 = all).
+    trace_ms: u64,
+    /// Start of the current summary window.
+    window_start: std::time::Instant,
+    /// Messages handled in the window, per kind.
+    count: [u64; 3],
+    /// Total handling time in the window, per kind, in microseconds.
+    total_us: [u64; 3],
+    /// Longest handling time in the window, per kind, in microseconds.
+    max_us: [u64; 3],
+}
+
+impl EngineLoopStats {
+    /// Reads `N42_ENGINE_LOOP_TRACE_MS` (default 5).
+    fn new() -> Self {
+        let trace_ms = std::env::var("N42_ENGINE_LOOP_TRACE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+        Self {
+            trace_ms,
+            window_start: std::time::Instant::now(),
+            count: [0; 3],
+            total_us: [0; 3],
+            max_us: [0; 3],
+        }
+    }
+
+    /// Records one handled message of `kind` (an index into `LOOP_KINDS`).
+    fn record(
+        &mut self,
+        kind: usize,
+        took: std::time::Duration,
+        idle_before: std::time::Duration,
+        detail: Option<&dyn std::fmt::Debug>,
+    ) {
+        let took_us = took.as_micros() as u64;
+        self.count[kind] += 1;
+        self.total_us[kind] += took_us;
+        self.max_us[kind] = self.max_us[kind].max(took_us);
+        let took_ms = took_us / 1000;
+        if took_ms >= self.trace_ms {
+            info!(
+                target: "n42.engine.loop",
+                kind = LOOP_KINDS[kind],
+                took_ms,
+                idle_before_ms = idle_before.as_millis() as u64,
+                block = ?detail,
+                "engine loop message"
+            );
+        }
+        self.maybe_summarize();
+    }
+
+    /// Logs and resets the window once five seconds have passed.
+    fn maybe_summarize(&mut self) {
+        let window = self.window_start.elapsed();
+        if window < std::time::Duration::from_secs(5) {
+            return;
+        }
+        let window_us = (window.as_micros() as u64).max(1);
+        let busy_us: u64 = self.total_us.iter().sum();
+        let pct = |us: u64| us as f64 * 100.0 / window_us as f64;
+        info!(
+            target: "n42.engine.loop",
+            window_s = 5,
+            orchestrator_count = self.count[0],
+            orchestrator_total_ms = self.total_us[0] / 1000,
+            orchestrator_max_ms = self.max_us[0] / 1000,
+            built_payloads_count = self.count[1],
+            built_payloads_total_ms = self.total_us[1] / 1000,
+            built_payloads_max_ms = self.max_us[1] / 1000,
+            executed_insert_count = self.count[2],
+            executed_insert_total_ms = self.total_us[2] / 1000,
+            executed_insert_max_ms = self.max_us[2] / 1000,
+            busy_pct = format!("{:.1}", pct(busy_us)),
+            idle_pct = format!("{:.1}", 100.0 - pct(busy_us)),
+            "engine loop summary"
+        );
+        self.window_start = std::time::Instant::now();
+        self.count = [0; 3];
+        self.total_us = [0; 3];
+        self.max_us = [0; 3];
     }
 }

@@ -486,3 +486,121 @@ fn the_offlock_settle_is_the_ordinary_settle() {
         assert_eq!(states[1].3.len(), 900);
     }
 }
+
+/// A settle in batches of 64 senders leaves the queue as the one-hold
+/// settle does, with arrivals drained between its holds into a lane it has
+/// settled and one it has not touched yet; whether its own batches finish
+/// the rest or another hold of the lanes does.
+#[test]
+fn a_batched_settle_is_the_one_hold_settle() {
+    let gas = 900 * 21_000;
+    for finish_by_lock in [false, true] {
+        let mut states = Vec::new();
+        let mut arrivals: Vec<Address> = Vec::new();
+        for batched in [true, false] {
+            let queue = queue(true);
+            flood(&queue, 400, 0, 4, 50);
+            let (segments, mark) = {
+                let mut inner = queue.lock_inner();
+                queue.begin_build(&mut inner, block_hash(0));
+                let mut times = FrameSelectTimes::default();
+                let (segments, plan, _) = inner.plan_frames(gas, &mut times, SelectMode::Parallel);
+                assert_eq!(plan.tx_count(), 900);
+                let mark = SettleMark {
+                    build: inner.builds,
+                    count: inner.pending.len(),
+                    first: inner.pending[0].0,
+                    last: inner.pending[inner.pending.len() - 1].0,
+                };
+                (segments, mark)
+            };
+            let gen_before = queue.lock_inner_unsettled().lanes_gen;
+            if batched {
+                queue.settle_offlock_in(mark, segments, 64, 2);
+                let inner = queue.lock_inner_unsettled();
+                assert!(inner.pending.is_empty());
+                assert_eq!(inner.lanes_gen, gen_before + 2, "one raise a hold");
+                assert_eq!(inner.last_build.as_ref().map(|(_, taken)| taken.len()), Some(900), "the taken list at the first hold");
+                // 400 senders, 128 settled: one lane of each kind.
+                let unsettled: HashSet<Address> = inner.settling.iter().map(|(who, ..)| *who).collect();
+                assert_eq!(unsettled.len(), 400 - 128);
+                let open = *unsettled.iter().next().unwrap();
+                let done = (0..400).map(sender).find(|who| !unsettled.contains(who)).unwrap();
+                assert!(inner.lanes[&open].by_nonce.contains_key(&0));
+                assert!(!inner.lanes[&done].by_nonce.contains_key(&0));
+                drop(inner);
+                arrivals = vec![done, open];
+            } else {
+                queue.settle_offlock(mark, segments);
+            }
+            // Arrivals into both lanes, drained between the holds (the
+            // drainer does not settle under the switch).
+            for who in &arrivals {
+                let txs = vec![tx_hashed(*who, 4), tx_hashed(*who, 5)];
+                let hashes: Vec<B256> = txs.iter().map(|t| *t.hash()).collect();
+                queue.push_frame(
+                    txs,
+                    Some(NewFrame { id: frame_id(*who, 0xa11), hashes, members: vec![(*who, 4), (*who, 5)], gas: 42_000 }),
+                );
+            }
+            queue.drain_now();
+            if batched {
+                assert!(!queue.lock_inner_unsettled().settling.is_empty());
+                if finish_by_lock {
+                    drop(queue.lock_inner());
+                } else {
+                    queue.settle_rest(64, usize::MAX);
+                }
+                assert!(queue.lock_inner_unsettled().settling.is_empty());
+            }
+            assert_counts(&queue);
+            states.push(state(&queue));
+        }
+        assert_eq!(states[0], states[1], "finish by lock {finish_by_lock}");
+        assert_eq!(states[0].3.len(), 900);
+        for who in &arrivals {
+            let lane = states[0].0.iter().find(|(w, ..)| w == who).unwrap();
+            assert!(lane.1.ends_with(&[4, 5]), "the arrivals queued");
+        }
+    }
+}
+
+/// The off-lock settle's holds for a bench-tier build (`N42_BENCH_SENDERS`
+/// senders, default 100,000, two nonces each taken: 200,000 transfers), in
+/// one hold against batches of [`OFFLOCK_SETTLE_SENDERS`].
+/// `cargo test -p n42-tx-queue --lib -- --ignored bench_settle_holds --nocapture`.
+#[test]
+#[ignore]
+fn bench_settle_holds() {
+    let senders: u64 = std::env::var("N42_BENCH_SENDERS").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
+    let gas = 2 * senders * 21_000;
+    for batch in [usize::MAX, OFFLOCK_SETTLE_SENDERS] {
+        let queue = queue(true);
+        flood(&queue, senders, 0, 4, 500);
+        queue.drain_now();
+        let (segments, mark) = {
+            let mut inner = queue.lock_inner();
+            queue.begin_build(&mut inner, block_hash(0));
+            let mut times = FrameSelectTimes::default();
+            let (segments, _, _) = inner.plan_frames(gas, &mut times, SelectMode::Parallel);
+            let mark = SettleMark {
+                build: inner.builds,
+                count: inner.pending.len(),
+                first: inner.pending[0].0,
+                last: inner.pending[inner.pending.len() - 1].0,
+            };
+            (segments, mark)
+        };
+        take_lock_stats();
+        queue.settle_offlock_in(mark, segments, batch, usize::MAX);
+        let stats = take_lock_stats();
+        eprintln!(
+            "batch {batch:>20}: holds {:>3} longest {:>7.2} ms total {:>7.2} ms",
+            stats.holds,
+            stats.hold_max_ns as f64 / 1e6,
+            stats.hold_ns as f64 / 1e6
+        );
+        assert!(queue.lock_inner_unsettled().settling.is_empty());
+        assert_eq!(state(&queue).3.len() as u64, 2 * senders);
+    }
+}

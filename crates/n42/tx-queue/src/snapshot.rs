@@ -404,7 +404,7 @@ impl<T: PoolTransaction> Inner<T> {
     /// `plan` takes from still holds, at its lane's unparked head, exactly
     /// the allocations the plan takes, and every frame it took is indexed.
     pub(crate) fn snapshot_verdict(&self, plan: &SnapPlan<T>, builds: u64) -> Result<(), SnapMiss> {
-        if self.builds != builds || self.prepared.is_some() || !self.pending.is_empty() {
+        if self.builds != builds || self.prepared.is_some() || self.takes_unsettled() {
             return Err(SnapMiss::Stale);
         }
         if plan.noted.iter().any(|(id, _)| self.frames.runs_and_hashes(id).is_none()) {
@@ -520,7 +520,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         snapshot.lanes.reserve(wanted.len());
         for chunk in wanted.chunks(SNAPSHOT_SENDERS) {
             let inner = self.lock_inner_unsettled();
-            if inner.builds != snapshot.builds || !inner.pending.is_empty() {
+            if inner.builds != snapshot.builds || inner.takes_unsettled() {
                 return false;
             }
             let lanes = &inner.lanes;

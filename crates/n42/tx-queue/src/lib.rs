@@ -738,6 +738,14 @@ struct Inner<T: PoolTransaction> {
     /// many of its transactions from its start). Applied by
     /// [`Inner::settle`] at the next lock ([`TxQueue::lock_inner`]).
     pending: Vec<(B256, usize)>,
+    /// A batched off-lock settle's runs not yet out of their lanes
+    /// ([`TxQueue::settle_offlock`]): (sender, first nonce, end), each one
+    /// sender's whole noted run, so a lane is either settled or untouched.
+    /// Their transactions are already in the build's taken list (in plan
+    /// order) and out of `len`. Applied by [`Inner::settle`] like `pending`,
+    /// so every hold but the drainer's and the settle's own batches finishes
+    /// them first.
+    settling: Vec<(Address, u64, u64)>,
     /// Holes a build ran into: (sender, the account's next nonce, the lowest
     /// queued nonce above it). The feed fills them from the pool.
     gaps: Vec<(Address, u64, u64)>,
@@ -1075,6 +1083,12 @@ fn queue_offlock() -> bool {
 /// Senders whose lanes one hold of an off-lock prune splits
 /// (`N42_QUEUE_OFFLOCK`).
 const OFFLOCK_PRUNE_SENDERS: usize = 256;
+
+/// Senders whose noted runs one hold of an off-lock settle splits out of
+/// their lanes (`N42_QUEUE_OFFLOCK`, [`TxQueue::settle_offlock`]): a
+/// 200,000-transfer build applied in one hold took 13 ms in the debug
+/// bench, the longest hold left on the block path.
+const OFFLOCK_SETTLE_SENDERS: usize = 8192;
 
 /// Frames one hold of an off-lock prune's sweep checks against the lanes
 /// (`N42_QUEUE_OFFLOCK`): a frame of the flood's shape is ~500 runs, so
@@ -1587,6 +1601,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 len: 0,
                 last_build: None,
                 pending: Vec::new(),
+                settling: Vec::new(),
                 gaps: Vec::new(),
                 held: VecDeque::new(),
                 parked_order: VecDeque::new(),
@@ -3081,18 +3096,36 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// off the lanes' lock (`N42_QUEUE_OFFLOCK`): the taken list in plan
     /// order (the frames' own `Arc`s, which the planner checked are the
     /// lanes' entries) and each sender's run of nonces are made with no
-    /// lock held, then applied in one hold as one split per sender -- if
-    /// the noted takes are still the ones `mark` names. Every hold of the
-    /// lanes' lock but the drainer's settles them first, so if they are
-    /// still noted, nothing but arrivals has touched the lanes since they
-    /// were planned; if another hold settled them, there is nothing to do.
+    /// lock held, then applied as one split per sender in holds of at most
+    /// [`OFFLOCK_SETTLE_SENDERS`] senders -- if the noted takes are still
+    /// the ones `mark` names. Every hold of the lanes' lock but the
+    /// drainer's settles them first, so if they are still noted, nothing but
+    /// arrivals has touched the lanes since they were planned; if another
+    /// hold settled them, there is nothing to do.
+    ///
+    /// The first hold checks the mark, moves the taken list to the build
+    /// and leaves the runs in [`Inner::settling`]; each hold then splits a
+    /// batch of them out. A run is one sender's whole take, so between
+    /// holds a lane is either settled or untouched: the drainer inserts
+    /// into either as it would before or after a one-hold settle (an
+    /// arrival at a noted nonce of an untouched lane is the duplicate it is
+    /// in the one-hold path, which has not settled it either), and any
+    /// other hold finishes the rest first ([`Inner::settle`]). Every batch
+    /// raises [`Inner::lanes_gen`], as the one hold did.
     fn settle_offlock(&self, mark: SettleMark, noted: Vec<(FrameTxs<T>, usize)>) {
-        let mut garbage = PruneGarbage::default();
+        self.settle_offlock_in(mark, noted, OFFLOCK_SETTLE_SENDERS, usize::MAX);
+    }
+
+    /// [`Self::settle_offlock`] in holds of `batch` senders, stopping after
+    /// `max_holds` holds (a test's way to leave runs in
+    /// [`Inner::settling`]).
+    fn settle_offlock_in(&self, mark: SettleMark, noted: Vec<(FrameTxs<T>, usize)>, batch: usize, max_holds: usize) {
         let count: usize = noted.iter().map(|(_, prefix)| *prefix).sum();
         let mut taken: Vec<Arc<ValidPoolTransaction<T>>> = Vec::with_capacity(count);
         for (txs, prefix) in &noted {
             taken.extend(txs.iter().take(*prefix).cloned());
         }
+        drop(noted);
         let mut runs: AddressHashMap<(u64, u64)> = AddressHashMap::default();
         for t in &taken {
             let nonce = t.nonce();
@@ -3103,33 +3136,54 @@ impl<T: PoolTransaction> TxQueue<T> {
             }
             run.1 = nonce.saturating_add(1);
         }
-        let mut inner = self.lock_inner_unsettled();
-        let current = inner.builds == mark.build
-            && inner.pending.len() == mark.count
-            && inner.pending.first().is_some_and(|(id, _)| *id == mark.first)
-            && inner.pending.last().is_some_and(|(id, _)| *id == mark.last)
-            && inner.pending.iter().map(|(_, prefix)| *prefix).sum::<usize>() == count;
-        if !current {
-            return;
-        }
-        inner.pending.clear();
-        inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
-        for (sender, (lo, hi)) in &runs {
-            let Some(lane) = inner.lanes.get_mut(sender) else { continue };
-            let mut run = lane.by_nonce.split_off(lo);
-            let mut tail = run.split_off(hi);
-            lane.by_nonce.append(&mut tail);
-            debug_assert_eq!(run.len() as u64, hi - lo);
-            if lane.by_nonce.is_empty() {
-                lane.queued = false;
+        let mut runs: Vec<(Address, u64, u64)> = runs.into_iter().map(|(sender, (lo, hi))| (sender, lo, hi)).collect();
+        let batch = batch.max(1);
+        // The first batch is applied in the first hold, the rest go to
+        // `settling` and are applied from its end.
+        let first: Vec<(Address, u64, u64)> = runs.split_off(runs.len().saturating_sub(batch));
+        let mut garbage = PruneGarbage::default();
+        {
+            let mut inner = self.lock_inner_unsettled();
+            let current = inner.builds == mark.build
+                && inner.settling.is_empty()
+                && inner.pending.len() == mark.count
+                && inner.pending.first().is_some_and(|(id, _)| *id == mark.first)
+                && inner.pending.last().is_some_and(|(id, _)| *id == mark.last)
+                && inner.pending.iter().map(|(_, prefix)| *prefix).sum::<usize>() == count;
+            if !current {
+                return;
             }
-            garbage.lanes.push(run);
+            inner.pending.clear();
+            inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+            inner.split_runs(&first, &mut garbage.lanes);
+            inner.settling = runs;
+            if let Some((_, list)) = inner.last_build.as_mut() {
+                list.extend(taken);
+            }
         }
-        if let Some((_, list)) = inner.last_build.as_mut() {
-            list.extend(taken);
-        }
-        drop(inner);
         garbage.free();
+        drop(first);
+        self.settle_rest(batch, max_holds.saturating_sub(1));
+    }
+
+    /// The batches of a settle left in [`Inner::settling`], `batch` senders
+    /// a hold, at most `max_holds` holds; stops when another hold has
+    /// finished them.
+    fn settle_rest(&self, batch: usize, max_holds: usize) {
+        for _ in 0..max_holds {
+            let mut garbage = PruneGarbage::default();
+            {
+                let mut inner = self.lock_inner_unsettled();
+                if inner.settling.is_empty() {
+                    return;
+                }
+                let from = inner.settling.len().saturating_sub(batch.max(1));
+                let part = inner.settling.split_off(from);
+                inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+                inner.split_runs(&part, &mut garbage.lanes);
+            }
+            garbage.free();
+        }
     }
 
     /// Prepares the next frame build's plan now ([`Prepared`],
@@ -3583,6 +3637,12 @@ impl<T: PoolTransaction> Inner<T> {
     /// first ([`TxQueue::lock_inner`]), so nothing ever sees the lanes
     /// before it.
     fn settle(&mut self) {
+        if !self.settling.is_empty() {
+            self.lanes_gen = self.lanes_gen.wrapping_add(1);
+            let runs = std::mem::take(&mut self.settling);
+            let mut split = Vec::new();
+            self.split_runs(&runs, &mut split);
+        }
         if self.pending.is_empty() {
             return;
         }
@@ -3615,6 +3675,35 @@ impl<T: PoolTransaction> Inner<T> {
                 }
             }
         }
+    }
+
+    /// Takes each (sender, first nonce, end) run out of its lane, one split
+    /// a sender, the runs pushed to `out` (to be freed off the lock).
+    /// Returns how many transactions left the lanes.
+    fn split_runs(
+        &mut self,
+        runs: &[(Address, u64, u64)],
+        out: &mut Vec<BTreeMap<u64, Arc<ValidPoolTransaction<T>>>>,
+    ) -> usize {
+        let mut removed = 0;
+        for (sender, lo, hi) in runs {
+            let Some(lane) = self.lanes.get_mut(sender) else { continue };
+            let mut run = lane.by_nonce.split_off(lo);
+            let mut tail = run.split_off(hi);
+            lane.by_nonce.append(&mut tail);
+            removed += run.len();
+            if lane.by_nonce.is_empty() {
+                lane.queued = false;
+            }
+            out.push(run);
+        }
+        removed
+    }
+
+    /// Whether a frame build's takes are noted and not all out of their
+    /// lanes ([`Self::pending`] or a batched settle's [`Self::settling`]).
+    pub(crate) fn takes_unsettled(&self) -> bool {
+        !self.pending.is_empty() || !self.settling.is_empty()
     }
 
     /// The serial part of [`Self::plan_frames`] over `ids`, with the lanes

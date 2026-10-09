@@ -46,7 +46,7 @@ pub mod forest;
 
 use alloy_primitives::{Address, B256, U256};
 pub use alloc::changes_from_alloc;
-pub use forest::{ForestCheckpoint, ForestDelta, ForestSnapshot, PreparedBlock, QmdbForest, Released, StateProofProvider,
+pub use forest::{BlockChangesParts, ForestCheckpoint, LeasedRoot, TreeLease, ForestDelta, ForestSnapshot, PreparedBlock, QmdbForest, Released, StateProofProvider,
     DEFAULT_RETAIN_DEPTH, READER_KEEP_CAP,
 };
 use n42_twig_core::qmdb_compat::{
@@ -237,6 +237,10 @@ pub enum StateError {
     /// belong to the same history.
     #[error("QMDB undo: {0}")]
     Undo(String),
+    /// The tree is leased out for a root computed off the forest's lock
+    /// (`QmdbForest::lease_tree`), and this call needs it.
+    #[error("the QMDB tree is leased out for a root computation")]
+    TreeLeased,
     /// Two held blocks share no ancestor within the retained window, so the
     /// tree cannot be walked from one to the other.
     #[error("no held ancestor connects block {from} to block {to}")]

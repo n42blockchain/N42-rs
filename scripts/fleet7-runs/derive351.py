@@ -213,7 +213,17 @@ stages = '''case $STAGE in
      b7 D2S12P35T64X8DR $D2 $S1 $S2 $X8 $DR $T64 F7_BLOCK_INTERVAL_MS=35
      b7 D2S12P40T64X7DRb $D2 $S1 $S2 $X7 $DR $T64 F7_BLOCK_INTERVAL_MS=40
      b7 D2S12P40T64X8DRb $D2 $S1 $S2 $X8 $DR $T64 F7_BLOCK_INTERVAL_MS=40 ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s or t)"; exit 2 ;;
+  u) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     DR="N42_TX_QUEUE_DRAINER=1"
+     b7 D2S12P40T64X7DRc $D2 $S1 $S2 $X7 $DR $T64 F7_BLOCK_INTERVAL_MS=40
+     b7 D2S12P35T64X7DRb $D2 $S1 $S2 $X7 $DR $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P30T64X7DR $D2 $S1 $S2 $X7 $DR $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P40T64X7DRd $D2 $S1 $S2 $X7 $DR $T64 F7_BLOCK_INTERVAL_MS=40
+     b7 D2S12P35T64X7DRc $D2 $S1 $S2 $X7 $DR $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P30T64X7DRb $D2 $S1 $S2 $X7 $DR $T64 F7_BLOCK_INTERVAL_MS=30 ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t or u)"; exit 2 ;;
 esac
 '''
 r = r[:i] + stages + r[j:]
@@ -224,11 +234,11 @@ def atomic(path, text):
 atomic(D + 'run-loop351.sh', r)
 
 l = r'''#!/bin/bash
-# loop351 (200k, 7 keys on one layer, 50 ms pacing; derive351.py). usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t>. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh f > target/fleet-runs/loop351f.out 2>&1 &
+# loop351 (200k, 7 keys on one layer, 50 ms pacing; derive351.py). usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u>. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh f > target/fleet-runs/loop351f.out 2>&1 &
 # Waits for the box, checks the tree, and runs the stage. When crates/ or bin/ changed since the last build, the launcher builds target/native (the legs' F7_BIN) after the box is free and the runner
 # runs its own test gate, clippy and the target/deferred build (once: this launcher does not export LOOP351_GATE_TREES for a changed tree). Unchanged tree: no build, no tests.
 cd /data/n42-build/wt338
-STAGE=${1:-a}; case $STAGE in a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t) ;; *) echo "usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t>"; exit 2;; esac
+STAGE=${1:-a}; case $STAGE in a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u) ;; *) echo "usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u>"; exit 2;; esac
 # the tree (crates/ and bin/) the binaries in target/native and target/deferred were built from: f2794a821 until a build here records another (the marker is written after a stage that built)
 MARK=target/fleet-runs/loop351-built-trees
 BUILT=f2794a821

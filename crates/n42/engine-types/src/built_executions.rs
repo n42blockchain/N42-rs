@@ -44,7 +44,35 @@ pub struct BuiltExecution {
 /// each is ~100 MB at 163,000 transactions (block, bundle state, receipts),
 /// and on a box whose page cache is the contended resource every retained
 /// hundred megabytes is a hundred megabytes of state pages evicted.
-const KEEP: usize = 3;
+const DEFAULT_KEEP: usize = 3;
+
+/// Parses `N42_BUILT_KEEP`: an unsigned number in `3..=16`, else the default
+/// (with one warning for a value that is set but invalid).
+fn built_keep_from(value: Option<&str>) -> usize {
+    let Some(raw) = value else { return DEFAULT_KEEP };
+    match raw.trim().parse::<usize>() {
+        Ok(n) if (3..=16).contains(&n) => n,
+        _ => {
+            tracing::warn!(target: "n42.built_executions", value = raw, default = DEFAULT_KEEP, "N42_BUILT_KEEP must be an integer in 3..=16; using the default");
+            DEFAULT_KEEP
+        }
+    }
+}
+
+/// How many own built executions the stores keep (`N42_BUILT_KEEP`, `3..=16`,
+/// default 3), read once.
+///
+/// Why it is tunable: under pipeline depth 2 with `N42_CHECK_BEFORE_SLOT=1`
+/// and `N42_FAR_AHEAD_BLOCKS=2` the validators' import of an own block arrives
+/// 280-400 ms after its seal, 3-4 builds later (loop351 D2S12F2P45T64), so the
+/// entry was already evicted and 1115 of 1156 own blocks were re-executed
+/// through the direct import (136 ms) instead of the hand-off (48 ms).
+/// What an entry costs: one full 200k-transaction bundle with its hashed state
+/// and trie updates, freed on the `n42-built-free` thread.
+fn keep() -> usize {
+    static KEEP: OnceLock<usize> = OnceLock::new();
+    *KEEP.get_or_init(|| built_keep_from(std::env::var("N42_BUILT_KEEP").ok().as_deref()))
+}
 
 /// How far a build that was sealed before it finished has come
 /// (docs/PHASE_D_DEFERRED_EXECUTION.md section 13).
@@ -103,12 +131,14 @@ const WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn store() -> &'static (Mutex<VecDeque<(B256, Entry)>>, Condvar) {
     static STORE: OnceLock<(Mutex<VecDeque<(B256, Entry)>>, Condvar)> = OnceLock::new();
-    STORE.get_or_init(|| (Mutex::new(VecDeque::with_capacity(KEEP)), Condvar::new()))
+    STORE.get_or_init(|| (Mutex::new(VecDeque::with_capacity(keep())), Condvar::new()))
 }
 
 /// The store's hard bound: only builds still finishing behind their seal may
-/// take it past [`KEEP`].
-const KEEP_FINISHING: usize = 2 * KEEP;
+/// take it past [`keep`].
+fn keep_finishing() -> usize {
+    2 * keep()
+}
 
 fn put(built_hash: B256, entry: Entry) {
     let (store, advanced) = store();
@@ -166,7 +196,7 @@ fn free_off_path(evicted: Vec<Entry>) {
 
 /// Frees a slot for one more build. A finished build goes first, oldest
 /// first; a build still finishing behind its seal is evicted only past
-/// [`KEEP_FINISHING`]. Its advances are dropped once it has left the store
+/// [`keep_finishing`]. Its advances are dropped once it has left the store
 /// ([`advance`]), so evicting it loses the block for its own import
 /// ("the execution layer no longer holds own block"). loop320 FASb: with the
 /// fields published at the seal three own builds were finishing at once at
@@ -176,10 +206,10 @@ fn free_off_path(evicted: Vec<Entry>) {
 /// not hold anyway.
 #[cfg(test)]
 fn make_room(store: &mut VecDeque<(B256, Entry)>) {
-    while store.len() >= KEEP {
+    while store.len() >= keep() {
         if let Some(at) = store.iter().position(|(_, entry)| entry.stage == Stage::Complete) {
             store.remove(at);
-        } else if store.len() >= KEEP_FINISHING {
+        } else if store.len() >= keep_finishing() {
             store.pop_front();
         } else {
             break;
@@ -189,10 +219,10 @@ fn make_room(store: &mut VecDeque<(B256, Entry)>) {
 
 /// [`make_room`], the evicted entries handed to `evicted` rather than dropped.
 fn make_room_into(store: &mut VecDeque<(B256, Entry)>, evicted: &mut Vec<Entry>) {
-    while store.len() >= KEEP {
+    while store.len() >= keep() {
         let removed = if let Some(at) = store.iter().position(|(_, entry)| entry.stage == Stage::Complete) {
             store.remove(at)
-        } else if store.len() >= KEEP_FINISHING {
+        } else if store.len() >= keep_finishing() {
             store.pop_front()
         } else {
             break;
@@ -249,7 +279,7 @@ fn advance(built_hash: B256, stage: Stage, execution: BuiltExecution) {
             entry.execution = Some(execution);
             entry.shards = None;
         }
-        // Evicted (a finish that ran longer than KEEP builds), or never
+        // Evicted (a finish that ran longer than `keep()` builds), or never
         // pending: not re-filed -- that would evict a live build the engine
         // or the next build still needs.
         None => {
@@ -403,7 +433,7 @@ pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, ga
     // the store's.
     let mut handed = handed().lock().unwrap_or_else(|p| p.into_inner());
     handed.retain(|(hash, _)| *hash != taken.0);
-    while handed.len() >= KEEP {
+    while handed.len() >= keep() {
         handed.pop_front();
     }
     handed.push_back(taken.clone());
@@ -413,7 +443,7 @@ pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, ga
 /// Builds [`take`] handed to the engine, still findable by [`find_kept`].
 fn handed() -> &'static Mutex<VecDeque<(B256, BuiltExecution)>> {
     static HANDED: OnceLock<Mutex<VecDeque<(B256, BuiltExecution)>>> = OnceLock::new();
-    HANDED.get_or_init(|| Mutex::new(VecDeque::with_capacity(KEEP)))
+    HANDED.get_or_init(|| Mutex::new(VecDeque::with_capacity(keep())))
 }
 
 /// The kept build matching these fields, at whatever stage it has reached,
@@ -491,7 +521,7 @@ fn matches_block(block: &RecoveredBlock<Block>, parent: B256, number: u64, state
 /// proposal and the next build -- to produce the block that is already here.
 fn sealed_store() -> &'static Mutex<VecDeque<(B256, SealedBlock<Block>)>> {
     static STORE: OnceLock<Mutex<VecDeque<(B256, SealedBlock<Block>)>>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(VecDeque::with_capacity(KEEP)))
+    STORE.get_or_init(|| Mutex::new(VecDeque::with_capacity(keep())))
 }
 
 /// Keeps the sealed block under its sealed hash.
@@ -506,14 +536,14 @@ pub fn remember_sealed(sealed_hash: B256, block: SealedBlock<Block>) {
     }
     let mut store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
     store.retain(|(hash, _)| *hash != sealed_hash);
-    while store.len() >= KEEP {
+    while store.len() >= keep() {
         store.pop_front();
     }
     store.push_back((sealed_hash, block));
 }
 
 /// How many sealed hashes [`sealed_here_with_transactions`] remembers: the
-/// sealed blocks themselves are retired after [`KEEP`], their hashes and
+/// sealed blocks themselves are retired after [`keep`], their hashes and
 /// transaction counts stay much longer, so a header-only payload for a
 /// block whose body is gone is recognised as such.
 const SEALED_HINTS: usize = 256;
@@ -544,7 +574,7 @@ pub fn take_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
 /// a header-only own-block payload more than once on some paths (a sibling
 /// re-proposed after a TC was converted, then executed with the *empty*
 /// transaction list the payload carries: loop147-150), and every conversion
-/// must find the body. The store's bound (`KEEP`) retires it.
+/// must find the body. The store's bound (`keep()`) retires it.
 pub fn find_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
     let store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
     store.iter().find(|(hash, _)| *hash == sealed_hash).map(|(_, block)| block.clone())
@@ -576,12 +606,22 @@ pub fn take_sealed_enabled() -> bool {
 }
 
 /// Serialises every test that files builds: the stores are process-global and
-/// bounded by [`KEEP`], so concurrent tests would evict each other's builds.
+/// bounded by [`keep`], so concurrent tests would evict each other's builds.
 #[cfg(test)]
 pub(crate) static STORE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn built_keep_parses_and_bounds() {
+        assert_eq!(built_keep_from(None), 3);
+        assert_eq!(built_keep_from(Some("8")), 8);
+        assert_eq!(built_keep_from(Some("16")), 16);
+        assert_eq!(built_keep_from(Some("2")), 3);
+        assert_eq!(built_keep_from(Some("17")), 3);
+        assert_eq!(built_keep_from(Some("x")), 3);
+    }
+
     use super::*;
     use alloy_consensus::Header;
     use n42_tx_types::{BlockBody, N42TxEnvelope};
@@ -731,7 +771,7 @@ mod tests {
     #[test]
     fn the_store_keeps_only_the_last_few_builds() {
         let _guard = lock();
-        let hashes: Vec<B256> = (0..=KEEP as u8)
+        let hashes: Vec<B256> = (0..=keep() as u8)
             .map(|i| {
                 let execution = built(&header(0x20 + i, 510 + u64::from(i)));
                 let hash = execution.block.hash();
@@ -864,7 +904,7 @@ mod tests {
     #[test]
     fn finishing_builds_are_bounded_too() {
         let _guard = lock();
-        let heads: Vec<Header> = (0..=KEEP_FINISHING as u8).map(|i| header(0xC0 + i * 4, 1100 + u64::from(i))).collect();
+        let heads: Vec<Header> = (0..=keep_finishing() as u8).map(|i| header(0xC0 + i * 4, 1100 + u64::from(i))).collect();
         let hashes: Vec<B256> = heads
             .iter()
             .map(|h| {
@@ -956,7 +996,7 @@ mod tests {
     #[test]
     fn the_handed_list_is_bounded_too() {
         let _guard = lock();
-        let heads: Vec<Header> = (0..=KEEP as u8).map(|i| header(0x50 + i * 4, 540 + u64::from(i))).collect();
+        let heads: Vec<Header> = (0..=keep() as u8).map(|i| header(0x50 + i * 4, 540 + u64::from(i))).collect();
         for h in &heads {
             let execution = built(h);
             remember(execution.block.hash(), execution);
@@ -1043,7 +1083,7 @@ mod tests {
     #[test]
     fn the_sealed_store_is_bounded_and_refiling_replaces() {
         let _guard = lock();
-        let blocks: Vec<_> = (0..=KEEP as u8).map(|i| sealed_block(0x80 + i, 1)).collect();
+        let blocks: Vec<_> = (0..=keep() as u8).map(|i| sealed_block(0x80 + i, 1)).collect();
         let hashes: Vec<B256> = blocks.iter().map(|b| b.hash()).collect();
         for block in blocks.iter().cloned() {
             remember_sealed(block.hash(), block);

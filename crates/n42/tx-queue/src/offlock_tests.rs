@@ -211,3 +211,163 @@ fn a_hold_that_moves_the_lanes_between_the_holds_refuses_the_commit() {
         assert_eq!(txs.len() + next.len() + queue.len() + mined_unseen, total, "prune {prune}: something lost");
     }
 }
+
+/// What a queue holds, for comparing two: each lane's nonces and mined
+/// watermarks (sorted by sender), the depth, the frames indexed, the build's
+/// taken list and whether a plan is prepared.
+type Lanes = Vec<(Address, Vec<u64>, Option<u64>, Option<u64>)>;
+
+fn state(queue: &TxQueue<EthPooledTransaction>) -> (Lanes, usize, usize, Vec<(Address, u64)>, Option<usize>) {
+    let inner = queue.lock_inner_quiet();
+    let mut lanes: Lanes = inner
+        .lanes
+        .iter()
+        .map(|(who, lane)| (*who, lane.by_nonce.keys().copied().collect(), lane.mined, lane.chain_mined))
+        .collect();
+    lanes.sort_by_key(|(who, ..)| *who);
+    let taken = inner.last_build.as_ref().map(|(_, taken)| pairs(taken)).unwrap_or_default();
+    (lanes, inner.len, inner.frames.len(), taken, inner.prepared.as_ref().map(|prepared| prepared.taken.len()))
+}
+
+/// A canonical block of another node's mining the first `rounds` nonces of
+/// every sender, on a queue deep enough that the off-lock prune splits the
+/// lanes in several holds (600 senders) and sweeps the index in several
+/// (60 frames), with a build's take out and the child's plan prepared:
+/// every mined transaction leaves the lanes, the index and the taken list,
+/// nothing else does, the watermarks are the block's, and the queue is the
+/// one-hold prune's in every respect.
+#[test]
+fn a_batched_prune_is_the_one_hold_prune() {
+    let gas = 1_500 * 21_000;
+    for rounds in [1u64, 3] {
+        let mut states = Vec::new();
+        for offlock in [false, true] {
+            let queue = queue(offlock);
+            flood(&queue, 600, 0, 5, 50);
+            let (mut best, _, _) = queue.frames_for_build_ahead(block_hash(0), gas, SelectMode::Parallel, false);
+            assert!(queue.prepare_next_in(gas, SelectMode::Parallel));
+            let took: Vec<Tx> = best.by_ref().collect();
+            drop(best);
+            assert_eq!(took.len(), 1_500);
+            let mined: Vec<(Address, u64)> = (0..rounds).flat_map(|n| (0..600).map(move |s| (sender(s), n))).collect();
+            let hashes: Vec<B256> = mined.iter().map(|(s, n)| *tx_hashed(*s, *n).hash()).collect();
+            let (_, times) = queue.prune_block(1, B256::repeat_byte(0xee), &mined, &hashes);
+            queue.note_pruned(1);
+            assert_eq!(times.senders, 600);
+            assert_counts(&queue);
+            let st = state(&queue);
+            // Every mined transaction is gone, from the lanes and the
+            // taken list, and every watermark is the block's.
+            for (who, nonces, _, chain) in &st.0 {
+                assert_eq!(*chain, Some(rounds - 1), "{who}: the watermark");
+                assert!(nonces.iter().all(|n| *n >= rounds), "{who}: a mined nonce still queued");
+            }
+            assert!(st.3.iter().all(|(_, n)| *n >= rounds), "a mined nonce still taken");
+            // The plan holds rounds 2 and up: a block mining round 2 takes
+            // it with it (back to the lanes, minus what was mined).
+            assert_eq!(st.4.is_none(), rounds >= 3, "rounds {rounds}: the prepared plan");
+            assert_eq!(queue.pruned_through(), 1);
+            // Nothing else: the lanes, the taken list and the prepared plan
+            // account for every unmined transaction.
+            let queued: usize = st.0.iter().map(|(_, nonces, ..)| nonces.len()).sum();
+            assert_eq!(
+                queued + st.3.len() + st.4.unwrap_or(0),
+                600 * (5 - rounds) as usize,
+                "rounds {rounds} offlock {offlock}"
+            );
+            states.push(st);
+        }
+        assert_eq!(states[0], states[1], "rounds {rounds}: the batched prune against the one-hold prune");
+    }
+}
+
+/// The off-lock prune racing a build's selection, a preparation, the
+/// drainer and an untake, over many rounds: whatever the interleaving,
+/// nothing mined is offered afterwards, nothing is offered twice or out of
+/// nonce order, and nothing is lost.
+#[test]
+fn a_batched_prune_racing_builds_and_drains_loses_nothing() {
+    let gas = 600 * 21_000;
+    for round in 0..12u64 {
+        let queue = queue(true);
+        flood(&queue, 600, 0, 4, 50);
+        let p0 = block_hash(0);
+        let (mut best, _, _) = queue.frames_for_build_ahead(p0, gas, SelectMode::Parallel, false);
+        let mut txs: Vec<Tx> = best.by_ref().collect();
+        drop(best);
+        let back: Vec<Tx> = txs.drain(txs.len() - 50..).collect();
+        // Another node's committed block mines round 0 of senders 300..600
+        // (the build took round 0 of senders 0..600 bar the untaken tail).
+        let mined: Vec<(Address, u64)> = (300..600).map(|s| (sender(s), 0)).chain((0..100).map(|s| (sender(s), 1))).collect();
+        let hashes: Vec<B256> = mined.iter().map(|(s, n)| *tx_hashed(*s, *n).hash()).collect();
+        let workers = vec![
+            {
+                let queue = queue.clone();
+                std::thread::spawn(move || {
+                    queue.prepare_next_in(gas, SelectMode::Parallel);
+                })
+            },
+            {
+                let queue = queue.clone();
+                std::thread::spawn(move || queue.untake(back))
+            },
+            {
+                let queue = queue.clone();
+                std::thread::spawn(move || {
+                    flood(&queue, 600, 4, 1, 50);
+                    queue.drain_now();
+                })
+            },
+            {
+                let queue = queue.clone();
+                let (mined, hashes) = (mined.clone(), hashes.clone());
+                std::thread::spawn(move || {
+                    if round % 2 == 0 {
+                        std::thread::yield_now();
+                    }
+                    queue.prune_block(1, B256::repeat_byte(0xdd), &mined, &hashes);
+                })
+            },
+        ];
+        for worker in workers {
+            worker.join().expect("worker");
+        }
+        assert_counts(&queue);
+        assert!(queue.lock_inner_quiet().pruning.is_none());
+        // The first build's block is sealed (not committed: another block
+        // took height 1), so its take is not offered again.
+        seal(&queue, p0, 1, block_hash(1), &txs);
+        let mut offered: Vec<Tx> = Vec::new();
+        let mut parent = B256::repeat_byte(0xdd);
+        for n in 2..40u64 {
+            let (mut best, _, _) = queue.frames_for_build_ahead(parent, gas, SelectMode::Parallel, false);
+            let next: Vec<Tx> = best.by_ref().collect();
+            drop(best);
+            if next.is_empty() {
+                break;
+            }
+            let body = pairs(&next);
+            let (dropped, _) = queue.forget_mined_parallel(parent, body.len(), |i| body[i]);
+            queue.hold_own_block(n, block_hash(n), dropped);
+            parent = block_hash(n);
+            offered.extend(next);
+        }
+        let mined_set: HashSet<(Address, u64)> = mined.iter().copied().collect();
+        assert!(offered.iter().all(|t| !mined_set.contains(&(t.sender(), t.nonce()))), "round {round}: a mined one offered");
+        let unique: HashSet<B256> = offered.iter().chain(&txs).map(|t| *t.hash()).collect();
+        assert_eq!(unique.len(), offered.len() + txs.len(), "round {round}: a transaction twice");
+        let mut by_sender: HashMap<Address, Vec<u64>> = HashMap::new();
+        for t in &offered {
+            by_sender.entry(t.sender()).or_default().push(t.nonce());
+        }
+        for (who, nonces) in by_sender {
+            assert!(nonces.windows(2).all(|w| w[1] == w[0] + 1), "round {round}: {who} out of order");
+        }
+        // Everything is in the first build's block, offered since, or is
+        // one of the foreign block's that the build did not take; the
+        // queue ends empty.
+        let first: HashSet<(Address, u64)> = pairs(&txs).into_iter().collect();
+        let foreign_unseen = mined.iter().filter(|p| !first.contains(p)).count();
+        assert_eq!(txs.len() + offered.len() + queue.len() + foreign_unseen, 600 * 5, "round {round}");
+    }
+}

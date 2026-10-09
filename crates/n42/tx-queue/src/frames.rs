@@ -418,6 +418,43 @@ impl<T: PoolTransaction> FrameIndex<T> {
         dead.len()
     }
 
+    /// [`Self::sweep_into`] over `ids` only, without compacting the arrival
+    /// order: one bounded hold of an off-lock prune's sweep
+    /// (`N42_QUEUE_OFFLOCK`), which compacts once at its end
+    /// ([`Self::compact_order`]). An id no longer indexed is passed over.
+    pub(crate) fn sweep_ids_into(
+        &mut self,
+        ids: &[B256],
+        lanes: &AddressHashMap<Lane<T>>,
+        gone: &mut Vec<FrameTxs<T>>,
+    ) -> usize {
+        let mut dead = 0usize;
+        for id in ids {
+            let Some(entry) = self.frames.get(id) else { continue };
+            if !entry.runs.iter().any(|run| lanes.get(&run.sender).is_some_and(|lane| lane.chain_mined(run.first_nonce))) {
+                continue;
+            }
+            if let Some(entry) = self.frames.remove(id) {
+                if let Some(first) = entry.hashes.first()
+                    && self.by_first.get(first) == Some(id)
+                {
+                    self.by_first.remove(first);
+                }
+                if let Some(txs) = entry.txs {
+                    gone.push(txs);
+                }
+                dead += 1;
+            }
+        }
+        dead
+    }
+
+    /// Compacts the arrival order when the ids no longer indexed outnumber
+    /// the live ones (what every sweep does at its end).
+    pub(crate) fn compact_order(&mut self) {
+        self.compact();
+    }
+
     /// The frames in arrival order, each with whether a build could take it
     /// whole from `lanes` right now.
     pub(crate) fn in_arrival_order(

@@ -2152,7 +2152,12 @@ impl<T: PoolTransaction> TxQueue<T> {
         times.fold_us = at.elapsed().as_micros() as u64;
         let mut garbage = PruneGarbage::default();
         let at = std::time::Instant::now();
-        {
+        if self.offlock() {
+            let (swept, lock_us, remove_us) = self.remove_mined_offlock(highest, &mut garbage);
+            times.frames_swept = swept;
+            times.lock_us = lock_us;
+            times.remove_us = remove_us;
+        } else {
             let mut inner = self.lock_inner();
             times.lock_us = at.elapsed().as_micros() as u64;
             let held = std::time::Instant::now();
@@ -2170,6 +2175,90 @@ impl<T: PoolTransaction> TxQueue<T> {
         garbage.free();
         times.free_us = at.elapsed().as_micros() as u64;
         (back, times)
+    }
+
+    /// [`Inner::remove_mined_highest`] in bounded holds of the lanes' lock
+    /// with the lock released between them (`N42_QUEUE_OFFLOCK`): a first
+    /// hold drains the inbox, names the block's nonces as being pruned
+    /// ([`Inner::pruning`], so no build accepts a prepared plan holding one
+    /// meanwhile) and discards a prepared plan that holds one; then the
+    /// lanes are split [`OFFLOCK_PRUNE_SENDERS`] senders a hold; a last
+    /// hold discards a plan prepared in between that holds a mined nonce
+    /// and splits the build's taken list; then the frame index is swept
+    /// [`OFFLOCK_SWEEP_FRAMES`] frames a hold and its order compacted once.
+    ///
+    /// The result is the one-hold removal's. What a hold in between can see
+    /// is a prune part-applied: a sender not yet split still holds its mined
+    /// nonces, and a build may take them (its block refuses them as stale,
+    /// as when the prune runs a little later) -- a give-back or untake in
+    /// between puts nothing mined back for good, because every sender's
+    /// split comes after the first hold and the taken list's after the
+    /// last. Returns the frames swept, the waits for the lock and the holds'
+    /// sum, in microseconds.
+    fn remove_mined_offlock(&self, highest: AddressHashMap<u64>, garbage: &mut PruneGarbage<T>) -> (usize, u64, u64) {
+        let (mut lock_us, mut held_us) = (0u64, 0u64);
+        let highest = Arc::new(highest);
+        let senders: Vec<(Address, u64)> = highest.iter().map(|(sender, nonce)| (*sender, *nonce)).collect();
+        let timed = |lock_us: &mut u64| {
+            let at = std::time::Instant::now();
+            let inner = self.lock_inner_quiet();
+            *lock_us += at.elapsed().as_micros() as u64;
+            (inner, std::time::Instant::now())
+        };
+        {
+            let (mut inner, held) = timed(&mut lock_us);
+            self.drain_inbox(&mut inner);
+            inner.pruning = Some(Arc::clone(&highest));
+            if inner.prepared_holds_mined(&highest) {
+                garbage.taken.extend(inner.discard_prepared());
+                note_ahead_discard(AheadDiscard::Mined);
+                inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+            }
+            held_us += held.elapsed().as_micros() as u64;
+        }
+        for chunk in senders.chunks(OFFLOCK_PRUNE_SENDERS) {
+            std::thread::yield_now();
+            let (mut inner, held) = timed(&mut lock_us);
+            let mut moved = false;
+            for (sender, nonce) in chunk {
+                if let Some(gone) = inner.remove_mined_taking(*sender, *nonce, true) {
+                    moved = true;
+                    garbage.lanes.push(gone);
+                }
+            }
+            if moved {
+                inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+            }
+            held_us += held.elapsed().as_micros() as u64;
+        }
+        let ids = {
+            std::thread::yield_now();
+            let (mut inner, held) = timed(&mut lock_us);
+            if inner.prepared_holds_mined(&highest) {
+                garbage.taken.extend(inner.discard_prepared());
+                note_ahead_discard(AheadDiscard::Mined);
+                inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+            }
+            inner.forget_taken_mined(&highest, garbage);
+            inner.pruning = None;
+            let ids = inner.frames.ids_in_arrival_order();
+            held_us += held.elapsed().as_micros() as u64;
+            ids
+        };
+        let mut swept = 0usize;
+        for chunk in ids.chunks(OFFLOCK_SWEEP_FRAMES) {
+            std::thread::yield_now();
+            let (mut inner, held) = timed(&mut lock_us);
+            let Inner { frames, lanes, .. } = &mut *inner;
+            swept += frames.sweep_ids_into(chunk, lanes, &mut garbage.frames);
+            held_us += held.elapsed().as_micros() as u64;
+        }
+        if swept > 0 {
+            let (mut inner, held) = timed(&mut lock_us);
+            inner.frames.compact_order();
+            held_us += held.elapsed().as_micros() as u64;
+        }
+        (swept, lock_us, held_us)
     }
 
     /// [`Self::remove_mined_batch`], returning what it removed from the
@@ -2261,7 +2350,9 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// says which (sender, nonce) it does) go back to the lanes. Returns how
     /// many went back. Heights the chain has passed are dropped too.
     pub fn settle_own_block(&self, number: u64, hash: B256, carried: impl Fn(&Address, u64) -> bool) -> usize {
-        let mut inner = self.lock_inner();
+        // Quiet: only a give-back below moves the lanes, and raises the
+        // generation itself.
+        let mut inner = self.lock_inner_quiet();
         if inner.held.is_empty() {
             return 0;
         }
@@ -2297,6 +2388,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         if back.is_empty() {
             return 0;
         }
+        inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
         // Through the reverted door, which lowers the senders' watermarks
         // first.
         //
@@ -3916,6 +4008,13 @@ impl<T: PoolTransaction> Inner<T> {
         // transaction the builder pays to refuse (42,000 a build in round
         // 38). Forget the mined ones here: one pass, the map read once a
         // run of one sender, the kept ones in their order.
+        self.forget_taken_mined(highest, garbage);
+        swept
+    }
+
+    /// The build's taken list split by a canonical block's highest nonces
+    /// per sender: the mined ones to `garbage`, the rest kept in order.
+    fn forget_taken_mined(&mut self, highest: &AddressHashMap<u64>, garbage: &mut PruneGarbage<T>) {
         if let Some((_, taken)) = self.last_build.as_mut()
             && !taken.is_empty()
         {
@@ -3940,7 +4039,14 @@ impl<T: PoolTransaction> Inner<T> {
             }
             *taken = kept;
         }
-        swept
+    }
+
+    /// Whether the prepared plan holds a nonce at or below `highest`'s for
+    /// its sender (a canonical block mined it).
+    fn prepared_holds_mined(&self, highest: &AddressHashMap<u64>) -> bool {
+        self.prepared.as_ref().is_some_and(|prepared| {
+            prepared.lowest.iter().any(|(sender, lowest)| highest.get(sender).is_some_and(|mined| mined >= lowest))
+        })
     }
 
     /// [`Self::remove_mined_from`] for a canonical block.

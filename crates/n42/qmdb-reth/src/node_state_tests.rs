@@ -537,3 +537,225 @@ fn a_delta_is_appended_after_the_length_it_names_and_the_log_directory_is_made()
     let err = append_delta(&blocker.join("sub").join("forest.log"), 0, &delta).expect_err("no directory");
     assert!(matches!(err, NodeStateError::Io { .. }), "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// Roots on a leased tree (N42_QMDB_COMPUTE_OFFLOCK) and batched persistence
+// (N42_QMDB_PERSIST_BATCH)
+// ---------------------------------------------------------------------------
+
+/// A viewed state at genesis with the two switches set as given.
+fn switched(name: &str, offlock: bool, batch: bool) -> (QmdbNodeState, Arc<crate::read_view::QmdbReadView>, B256) {
+    let chain = qmdb_chain();
+    let state = QmdbNodeState::new_with_entry_file(chain.clone(), scratch(name), true);
+    state.set_compute_offlock(offlock);
+    state.set_persist_batch(batch);
+    state.set_read_view_wanted(true);
+    state.initialize((0, chain.genesis_hash())).expect("initialize");
+    state.set_reader_keep_cap(128);
+    let view = state.read_view().expect("the view is built at initialisation");
+    (state, view, chain.genesis_hash())
+}
+
+/// Block `number` on `parent` from leaf operations: odd blocks the way an
+/// import files them (`insert_block_operations`), even ones the way a
+/// producer does (`compute_operations`, then `insert`). Returns the root.
+fn file_from_operations(state: &QmdbNodeState, number: u64, parent: B256) -> B256 {
+    let ops = changes_for(number).ops();
+    if number % 2 == 1 {
+        state.insert_block_operations(parent, hash_of(number), number, ops).expect("insert operations")
+    } else {
+        let prepared = state.compute_operations(parent, ops).expect("compute operations");
+        let root = prepared.root;
+        state.insert(hash_of(number), number, prepared).expect("insert");
+        root
+    }
+}
+
+#[test]
+fn a_root_on_a_leased_tree_equals_the_locked_one_and_the_views_agree() {
+    let (locked, locked_view, genesis) = switched("offlock-equal-locked", false, false);
+    let (leased, leased_view, _) = switched("offlock-equal-leased", true, true);
+    let mut parent = genesis;
+    for number in 1..=12u64 {
+        let want = file_from_operations(&locked, number, parent);
+        let got = file_from_operations(&leased, number, parent);
+        assert_eq!(got, want, "block {number}'s root");
+        assert_eq!(leased.root_of(&hash_of(number)), Some(want));
+        locked.on_canonical(hash_of(number)).expect("canonical");
+        leased.on_canonical(hash_of(number)).expect("canonical");
+        parent = hash_of(number);
+    }
+    assert_eq!(leased.state_root(), locked.state_root());
+    // A validated block's root, and a block already held, through the lease.
+    let ops = changes_for(13).ops();
+    let want = locked.validate_block_operations(parent, hash_of(13), 13, ops.clone(), B256::ZERO).expect("validate");
+    let got = leased.validate_block_operations(parent, hash_of(13), 13, ops.clone(), B256::ZERO).expect("validate");
+    assert_eq!(got, want, "a mismatching header still gets its computed root");
+    assert_eq!(leased.root_of(&hash_of(13)), None, "and no tree");
+    let filed = leased.validate_block_operations(parent, hash_of(13), 13, ops.clone(), want).expect("validate");
+    assert_eq!(filed, want);
+    assert_eq!(leased.root_of(&hash_of(13)), Some(want));
+    assert_eq!(leased.insert_block_operations(parent, hash_of(13), 13, ops).expect("held"), want);
+
+    let persisted: Vec<(u64, B256)> = (1..=10).map(|n| (n, hash_of(n))).collect();
+    locked.on_persisted(&persisted[..4]);
+    locked.on_persisted(&persisted[4..]);
+    leased.on_persisted(&persisted[..4]);
+    leased.on_persisted(&persisted[4..]);
+    assert_eq!(leased_view.head(), locked_view.head());
+    assert_eq!(leased_view.head(), (10, hash_of(10)));
+    assert!(leased_view.is_valid() && locked_view.is_valid());
+    for number in [3u64, 7, 10] {
+        let address = Address::from_word(B256::from(U256::from(number)));
+        assert_eq!(leased_view.account(&address, 10), locked_view.account(&address, 10));
+        assert!(leased_view.account(&address, 10).is_some_and(|account| account.is_some()));
+    }
+    let counters = leased.offlock_counters();
+    assert_eq!(counters.leased_roots, 14, "12 blocks and two validations computed on the lease");
+    assert_eq!(counters.persist_fallbacks, 0, "every persisted block listed from its shared parts");
+    assert_eq!(counters.persists, 2);
+    assert_eq!(counters.persist_split.holds, 2, "one hold a batch");
+    assert_eq!(locked.offlock_counters().persist_split.holds, 10, "one hold a block");
+    assert_eq!(locked.offlock_counters().leased_roots, 0);
+}
+
+#[test]
+fn a_rename_while_the_tree_is_leased_is_followed_and_tree_readers_wait_for_it() {
+    let (state, view, genesis) = switched("offlock-lease-race", true, true);
+    let mut parent = genesis;
+    for number in 1..=4u64 {
+        file_from_operations(&state, number, parent);
+        state.on_canonical(hash_of(number)).expect("canonical");
+        parent = hash_of(number);
+    }
+    // The same chain on the locked path, for the root block 5 must have.
+    let (reference, _, _) = switched("offlock-lease-race-ref", false, false);
+    let mut at = genesis;
+    for number in 1..=4u64 {
+        file_from_operations(&reference, number, at);
+        at = hash_of(number);
+    }
+    let want = file_from_operations(&reference, 5, at);
+
+    // Block 5's root, taken apart: the tree is leased on block 4 ...
+    let mut lease = {
+        let mut guard = state.lock_as("compute_operations");
+        guard.as_mut().expect("initialised").lease_tree(hash_of(4)).expect("lease")
+    };
+    // ... and meanwhile a writer renames the parent, the persistence lists
+    // and advances from shared parts, and a root is answered -- none of them
+    // waits for the tree.
+    let sealed = B256::repeat_byte(0x44);
+    state.rename(hash_of(4), sealed).expect("a rename needs no tree");
+    assert_eq!(state.root_of(&sealed), reference.root_of(&hash_of(4)));
+    state.on_persisted(&[(1, hash_of(1)), (2, hash_of(2))]);
+    assert_eq!(view.head(), (2, hash_of(2)));
+    assert_eq!(state.offlock_counters().persist_fallbacks, 0);
+
+    // A caller that needs the tree waits until it is back.
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waiter = {
+        let (state, done) = (state.clone(), done.clone());
+        std::thread::spawn(move || {
+            let held = state.lock_as("checkpoint").as_ref().map(QmdbForest::tip);
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            held
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!done.load(std::sync::atomic::Ordering::SeqCst), "a tree reader waited for the lease");
+
+    let computed = lease.compute(changes_for(5).ops());
+    let (prepared, renamed) = {
+        let mut guard = state.lock_as("lease_return");
+        let returned = guard.as_mut().expect("initialised").return_tree(lease, computed).expect("return");
+        state.inner.tree_back.notify_all();
+        returned
+    };
+    assert!(renamed, "the parent moved while the tree was out");
+    assert_eq!(prepared.parent(), sealed, "and the block is filed on its new hash");
+    assert_eq!(prepared.root, want, "the same root as the locked path");
+    waiter.join().expect("the waiter");
+    assert!(state.offlock_counters().tree_waits >= 1);
+    state.insert(hash_of(5), 5, prepared).expect("insert on the renamed parent");
+    state.on_canonical(hash_of(5)).expect("canonical");
+
+    // The lease refuses what needs the tree from a forest it was taken from.
+    let mut forest = QmdbForest::from_tree(0, B256::ZERO, n42_twig_core::qmdb_compat::QmdbCompatTree::new());
+    let lease = forest.lease_tree(B256::ZERO).expect("lease");
+    assert!(forest.is_leased());
+    assert!(matches!(forest.lease_tree(B256::ZERO), Err(StateError::TreeLeased)));
+    assert!(matches!(forest.flush_entries_for_sync(), Err(StateError::TreeLeased)));
+    assert!(matches!(forest.set_canonical_releasing(B256::ZERO), Err(StateError::TreeLeased)));
+    assert!(forest.return_tree(lease, Err(StateError::TreeLeased)).is_err(), "a failed root returns its error");
+    assert!(!forest.is_leased(), "and the tree");
+}
+
+#[test]
+fn a_block_without_shared_parts_falls_back_to_the_tree() {
+    // Blocks 1-3 on the locked path (no captured offsets), 4-6 on the lease.
+    let (state, view, genesis) = switched("offlock-fallback", false, false);
+    let mut parent = genesis;
+    for number in 1..=6u64 {
+        state.set_compute_offlock(number > 3);
+        file_from_operations(&state, number, parent);
+        state.on_canonical(hash_of(number)).expect("canonical");
+        parent = hash_of(number);
+    }
+    state.set_persist_batch(true);
+    state.on_persisted(&[(1, hash_of(1)), (2, hash_of(2))]);
+    assert_eq!(view.head(), (2, hash_of(2)));
+    assert_eq!(state.offlock_counters().persist_fallbacks, 1, "listed from the tree");
+    state.on_persisted(&[(3, hash_of(3)), (4, hash_of(4))]);
+    assert_eq!(state.offlock_counters().persist_fallbacks, 2, "one block without parts sends the batch to the tree");
+    state.on_persisted(&[(5, hash_of(5)), (6, hash_of(6))]);
+    assert_eq!(state.offlock_counters().persist_fallbacks, 2, "both from their parts");
+    assert_eq!(view.head(), (6, hash_of(6)));
+    assert!(view.is_valid());
+}
+
+#[test]
+fn a_batched_persist_leaves_the_view_where_one_hold_a_block_does() {
+    let run = |name: &str, batch: bool| {
+        let (state, view, genesis) = switched(name, false, batch);
+        let mut parent = genesis;
+        for number in 1..=9u64 {
+            let (hash, _) = advance(&state, number, parent);
+            parent = hash;
+        }
+        let mut heads = Vec::new();
+        // Two batches, a repeat of held blocks inside the next one, then a
+        // batch that names a block the view does not hold after advancing.
+        state.on_persisted(&[(1, hash_of(1)), (2, hash_of(2)), (3, hash_of(3))]);
+        heads.push((view.head(), view.is_valid()));
+        state.on_persisted(&[(2, hash_of(2)), (3, hash_of(3)), (4, hash_of(4)), (5, hash_of(5)), (4, hash_of(4))]);
+        heads.push((view.head(), view.is_valid()));
+        state.on_persisted(&[(6, hash_of(6)), (7, hash_of(7)), (7, B256::repeat_byte(7))]);
+        heads.push((view.head(), view.is_valid()));
+        let address = Address::from_word(B256::from(U256::from(7u64)));
+        let read = view.account(&address, 7);
+        (heads, read, state.offlock_counters().persist_split.holds)
+    };
+    let (each, each_read, each_holds) = run("batch-each", false);
+    let (batched, batched_read, batched_holds) = run("batch-one", true);
+    assert_eq!(batched, each);
+    assert_eq!(each[1], ((5, hash_of(5)), true));
+    assert_eq!(each[2], ((7, hash_of(7)), false), "advanced through 7, then invalidated by the mismatch");
+    assert_eq!(batched_read, each_read);
+    assert_eq!(each_holds, 7, "a hold a block (plus the release)");
+    assert!(batched_holds < each_holds, "{batched_holds} holds batched");
+
+    // A gap after advancing: both advance, then invalidate.
+    let gap = |name: &str, batch: bool| {
+        let (state, view, genesis) = switched(name, false, batch);
+        let mut parent = genesis;
+        for number in 1..=4u64 {
+            let (hash, _) = advance(&state, number, parent);
+            parent = hash;
+        }
+        state.on_persisted(&[(1, hash_of(1)), (2, hash_of(2)), (4, hash_of(4))]);
+        (view.head(), view.is_valid())
+    };
+    assert_eq!(gap("batch-gap-one", true), gap("batch-gap-each", false));
+    assert_eq!(gap("batch-gap-one2", true), ((2, hash_of(2)), false));
+}

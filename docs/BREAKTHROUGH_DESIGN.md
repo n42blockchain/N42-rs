@@ -3282,3 +3282,37 @@ Stage p's `b` legs and any leg after the P30 simple-set one were still running a
 **What binds, and what is next.** With the queue off its lock the seal follows the tick (39-40 ms at 40 ms pacing) and the cycle (51 ms) is the layer's serial per-block lock work, so pacing below 35 ms buys nothing and 30 ms hurts the S1 set. Next: the snapshot planner (stage r) for the 32-35 ms planning hold, the tree lease for window 3 (persistence must stay at about 40 ms a block), then the F6/I3/K8 stop at stage s.
 
 Hand-off files: `target/fleet-runs/loop351{n,o,p,q}.out` (p incomplete at writing, q one leg), kept legs under `/data/blockchain/rust-fleet7-bench/bench-loop351D2S*T64X{5,6,7}/` (q's P40 X7 datadirs kept as BODYGATE evidence).
+
+### 10.102 loop351 stages r-t — the snapshot planner regresses and stops rounds (excluded); the far-ahead window is what stops rounds, not the tree lease; X7 on the plain S1 set holds 3.9M across all three windows at 40 and 35 ms (3.93 / 3.93 / 3.52M)
+
+Section 10.101 left stage q's X7 leg with F6/I3/K8 stopping at BODYGATE and the snapshot planner (X8 = X7 + `N42_QUEUE_PLAN_SNAPSHOT`) untried. This section records stage r (X8 with F6I3K8 and the simple set), stage s (the plain S1 set `D2S12` = D2 S1 S2 T64, without F6/I3/K8, at 40 ms: X6 / X7 / X8) and stage t (the same with `N42_TX_QUEUE_DRAINER=1`, tag `DR`). Notation as in 10.99-10.101; `b` = repeat leg.
+
+Columns: w1 / w2 / w3 in M tx/s, round total in M tx, `sealed_at` median of window 1 (ms), cycle of window 1 (ms), queue lock duty in window 1. An empty w2 / w3 = the round was stopped.
+
+| leg | stage | pacing | w1 | w2 | w3 | round total | sealed_at median | cycle | lock duty w1 | note |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| D2S12F6I3K8P40T64X8 | r | 40 | 3.147 | 2.547 | 2.247 | 238.4 | 58 | 64 | 92.5% | sealed_at 58 / 71 / 84 over the windows |
+| D2S12F6I3K8P35T64X8 | r | 35 | 1.489 | 1.382 | 1.345 | 126.5 | 66 | 125 | 87.0% | 207 of 240 blocks full in w1 |
+| D2S12F6I3K8P35T64X8b | r | 35 | 1.147 | 1.449 | 1.399 | 119.8 | 61 | 173 | 92.0% | |
+| D2S12F6I3K8P30T64X8 | r | 30 | 2.740 | 2.300 | 2.013 | 211.8 | 67 | 73 | 94.5% | |
+| D2S2P35T64X8 | r | 35 | 3.080 | 3.093 | 2.947 | 273.6 | 58 | 65 | 91.0% | simple set; X6 read 3.70M at 35 (10.101) |
+| D2S2P30T64X8 | r | 30 | 3.180 | 3.060 | 1.063 | 219.1 | 55 | 63 | 90.5% | w3 collapses (cycle 167) |
+| D2S12P40T64X6 | s | 40 | 3.947 | 3.793 | 3.680 | 342.6 | 38 | 51 | 75.5% | longest hold 31 ms |
+| D2S12P40T64X7 | s | 40 | 3.912 | 3.913 | 3.587 | 342.4 | 41 | 51 | 71.0% | longest hold 24 ms |
+| D2S12P40T64X8 | s | 40 | 1.467 | | | 44.0 | 54 | 136 | 92.0% | BODYGATE, round stopped |
+| D2S12P40T64X7DR | t | 40 | 3.927 | 3.933 | 3.520 | 341.4 | 39 | 51 | 74.0% | |
+| D2S12P40T64X7DRb | t | 40 | 3.940 | 3.847 | 3.460 | 337.4 | 40 | 51 | 74.0% | |
+| D2S12P35T64X7DR | t | 35 | 3.907 | 3.920 | 3.633 | 344.0 | 41 | 51 | 69.0% | same 51 ms cycle as at 40 |
+| D2S12P40T64X8DR | t | 40 | 2.000 | 1.177 | 1.182 | 130.7 | 104 | 100 | 95.0% | |
+| D2S12P35T64X8DR | t | 35 | 1.545 | 1.248 | 1.151 | 118.3 | 64 | 122 | 89.0% | |
+| D2S12P40T64X8DRb | t | 40 | 1.540 | | | 46.3 | 57 | 130 | 96.0% | BODYGATE, round stopped |
+
+- **The far-ahead window is what stops rounds (loop351 analysis).** Stage q's stop is diagnosed: with `N42_FAR_AHEAD_BLOCKS=6` and the layer's head 270 blocks behind the commit, an own-block build executes nothing (`a parallel step skipped a block's worth`, `payload.rs:1021`); the leader stalls about 6 s (engine idle 5.4 s), six validators time out, a TC forms, the re-proposed block wins and two own blocks are "not the one committed" (`queue_prune.rs:88` -> `own_not_committed`, BODYGATE). Stage h's F6 leg (no QMDB switches) shows the same signature, and every F6-less leg shows none, so the tree lease is cleared. Decision: F6/I3/K8 leave the main set; stage p's 3.95M ran without them by mistake, which is why it held.
+- **The snapshot planner regresses and is excluded.** X8 at 40 ms reads 3.15 / 2.55 / 2.25M against X7's 3.9M, and at 35 ms collapses to 1.49M with 65-93% full blocks; the simple set at 35 ms reads 3.08M against X6's 3.70M. Cause (loop351 analysis): the snapshot path moved the inbox drain into every block-path hold (`usable()` `lib.rs:1928`, `offlock_plan` `lib.rs:3279`, `snapshot.rs:839` starts with `drain_inbox`), and the drainer task fell behind (668 drains of about 23k transactions per 5 s); lock duty 92.5%, longest hold 46.5 ms median, by `usable()`. Fixes: 1382a5afc (bounded `drain_inbox_block`, 2048 per hold; `usable()` counts the inbox instead of draining; cached lane walk), fe205a64d (tests), df593149b (`N42_TX_QUEUE_DRAINER=1`, a dedicated drainer thread: 5 ms tick, wake at 8192, slices of 8192 with yields). Even so X8DR reads 2.0M (40) and 1.54M (35) at 95% lock duty, and X8 stopped rounds twice more (stage s and the stage t repeat, BODYGATE): the snapshot planner is excluded.
+- **The tree lease holds window 3.** X7's QMDB switches keep window-3 persistence at 36-37 ms a block (qmdb 13-21) against 48-68 before (10.101, the forest-lock doubling).
+- **X7 on the plain S1 set (the result).** X6 reads 3.95 / 3.79 / 3.68M (about 342M a round, lock duty 75.5%, longest hold 31 ms); X7 3.91 / 3.91 / 3.59M (71%, 24 ms). With the drainer thread X7DR reads 3.93 / 3.93 / 3.52M at 40 ms, 3.91 / 3.92 / 3.63M at 35 ms and 3.94 / 3.85 / 3.46M on the repeat: all three windows hold 3.5M or more, rounds are 337-344M. The drainer changes nothing for X7 (its holds already drained little). Spread over the three X7 legs at 40 ms: w1 3.91-3.94, w3 3.46-3.59M, so window 3 is the noisy one and X6 against X7 is not separated by these legs.
+- **Where the 51 ms cycle sits now (X7DR, 40 ms).** `sealed_at` 40 = `par_start` 2 + `state_wait` 9-10 (the parent's output) + `par_exec` 15 + `parent_fields` (p90 23) + about 12 unattributed; the post-seal path is about 11 ms. Pacing below 40 does not help (35 ms = the same 51 ms cycle).
+
+**What binds, and what is next.** The chain is bound by the serial block cycle (51 ms), not by the queue (lock duty 70-75%) or by persistence. Stage u repeats X7DR at 40 / 35 / 30; stage v tries S4 (`N42_SHARDS_BEFORE_RECEIPTS=1 N42_FREEZE_SPLIT=4`) for the parent-output wait and T128 for `par_exec`; then the post-seal path.
+
+Hand-off files: `target/fleet-runs/loop351{r,s,t}.out`; the BODYGATE legs' datadirs (`P40T64X8` in s, `P40T64X8DRb` in t) are kept as evidence under `/data/blockchain/rust-fleet7-bench/`.

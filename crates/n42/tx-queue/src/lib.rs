@@ -820,6 +820,20 @@ struct Inner<T: PoolTransaction> {
     /// block, and that block's hash ([`TxQueue::hold_own_block`]): what a
     /// prepared plan is accepted against.
     handed: Option<Handed>,
+    /// Raised by every hold of the lanes' lock that may take, remove,
+    /// re-insert or park a lane's entries: every [`TxQueue::lock_inner`]
+    /// and a [`Inner::settle`] that applied anything. Not raised by the
+    /// holds that only drain the inbox (arrivals are inserted, never
+    /// replace an entry) or read and touch nothing of the lanes
+    /// ([`TxQueue::lock_inner_quiet`]). An off-lock preparation
+    /// (`N42_QUEUE_OFFLOCK`) applies its plan only if this has not moved
+    /// since the hold it planned under.
+    lanes_gen: u64,
+    /// The highest nonce per sender of a canonical block an off-lock prune
+    /// is splitting the lanes for, while it runs: a prepared plan holding
+    /// any of them is refused at once ([`Inner::prepared_verdict`]), not
+    /// after the prune's last batch.
+    pruning: Option<Arc<AddressHashMap<u64>>>,
 }
 
 /// A whole take handed off to an own block: the build counter of the build
@@ -864,6 +878,30 @@ struct Prepared<T: PoolTransaction> {
     /// The body the plan-ahead hook makes from it (`N42_PLAN_AHEAD_BODY`),
     /// `None` without a hook.
     body: Option<Arc<Mutex<BodySlot>>>,
+}
+
+/// The first hold of an off-lock preparation (`N42_QUEUE_OFFLOCK`,
+/// [`TxQueue::offlock_plan`]): a plan stored there already, or one whose
+/// takes are noted and still in the lanes, for [`TxQueue::offlock_commit`].
+enum OffPlanned<T: PoolTransaction> {
+    Done(bool),
+    Planned(OffPlan<T>),
+}
+
+/// A plan made under the first hold of an off-lock preparation, its takes
+/// not yet out of the lanes, and what its commit checks against.
+struct OffPlan<T: PoolTransaction> {
+    segments: Vec<(FrameTxs<T>, usize)>,
+    plan: FramePlan,
+    gas_left: u64,
+    gas_limit: u64,
+    /// Transactions the plan takes.
+    count: usize,
+    /// [`Inner::lanes_gen`] and [`Inner::builds`] when it was made.
+    lanes_gen: u64,
+    after: u64,
+    at: std::time::Instant,
+    hook: Option<PlanAheadHook<T>>,
 }
 
 /// What the builder made of a prepared plan's transactions while the parent
@@ -1002,6 +1040,45 @@ pub fn take_ahead_discards() -> Vec<(&'static str, u64)> {
 pub fn plan_ahead() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_PLAN_AHEAD").is_ok_and(|v| v == "1"))
+}
+
+/// `N42_QUEUE_OFFLOCK`, read once (default off): the queue's heavy steps
+/// run off the lanes' lock or in short bounded holds instead of one long
+/// one -- the plan-ahead preparation plans under one hold, groups its takes
+/// per sender outside it and applies them under a second hold that checks
+/// nothing moved the lanes in between ([`Inner::lanes_gen`], retried once, then
+/// the one-hold path); the canonical prune splits the lanes, sweeps the
+/// frame index and splits the taken list in batches with the lock released
+/// between them; the hand-off's `forget_mined_*` compares and partitions
+/// the taken list with the lock released. At 45 ms pacing the one-hold
+/// steps kept the lock 94% busy and the builder's start waiting behind
+/// holds of 50-110 ms (`docs/BREAKTHROUGH_DESIGN.md` 10.99). Results are
+/// the one-hold path's. A test sets it per queue ([`TxQueue::with_offlock`]).
+fn queue_offlock() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_QUEUE_OFFLOCK").is_ok_and(|v| v == "1"))
+}
+
+/// Senders whose lanes one hold of an off-lock prune splits
+/// (`N42_QUEUE_OFFLOCK`).
+const OFFLOCK_PRUNE_SENDERS: usize = 256;
+
+/// Frames one hold of an off-lock prune's sweep checks against the lanes
+/// (`N42_QUEUE_OFFLOCK`): a frame of the flood's shape is ~500 runs, so
+/// this is ~16,000 lane look-ups a hold.
+const OFFLOCK_SWEEP_FRAMES: usize = 32;
+
+/// Off-lock plan-ahead preparations whose commit found the lanes moved
+/// (and retried), and those that then fell back to the one-hold path,
+/// since the last [`take_offlock_stats`].
+static OFFLOCK_RACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OFFLOCK_FALLBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(raced, fell_back)` of the off-lock preparation since the last call,
+/// which resets them.
+pub fn take_offlock_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (OFFLOCK_RACED.swap(0, Relaxed), OFFLOCK_FALLBACK.swap(0, Relaxed))
 }
 
 /// `N42_TX_QUEUE_DRAIN_CHUNK=<n>`, read once: the drainer
@@ -1337,6 +1414,8 @@ pub struct TxQueue<T: PoolTransaction> {
     drain_chunk: Arc<std::sync::atomic::AtomicUsize>,
     /// The builder's plan-ahead hook ([`Self::set_plan_ahead_hook`]).
     ahead_hook: Arc<Mutex<Option<PlanAheadHook<T>>>>,
+    /// `N42_QUEUE_OFFLOCK` unless a test said otherwise ([`queue_offlock`]).
+    offlock: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Frames noted since the last drain, each with its transactions when the
@@ -1357,6 +1436,7 @@ impl<T: PoolTransaction> Clone for TxQueue<T> {
             in_hand: Arc::clone(&self.in_hand),
             drain_chunk: Arc::clone(&self.drain_chunk),
             ahead_hook: Arc::clone(&self.ahead_hook),
+            offlock: Arc::clone(&self.offlock),
         }
     }
 }
@@ -1506,6 +1586,8 @@ impl<T: PoolTransaction> TxQueue<T> {
                 pending_frames: Vec::new(),
                 prepared: None,
                 handed: None,
+                lanes_gen: 0,
+                pruning: None,
             })),
             inbox: Arc::new(Mutex::new(Vec::new())),
             staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1517,6 +1599,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             in_hand: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             drain_chunk: Arc::new(std::sync::atomic::AtomicUsize::new(drain_chunk())),
             ahead_hook: Arc::new(Mutex::new(None)),
+            offlock: Arc::new(std::sync::atomic::AtomicBool::new(queue_offlock())),
         }
     }
 
@@ -1540,12 +1623,39 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// its holder.
     #[track_caller]
     fn lock_inner(&self) -> TimedInner<'_, T> {
+        let mut inner = self.lock_inner_quiet();
+        inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+        inner
+    }
+
+    /// [`Self::lock_inner`] without raising [`Inner::lanes_gen`]: for the holds
+    /// that only drain the inbox, or read, or touch nothing of the lanes
+    /// (the drainer, the hand-off's whole take, the own-block hold, the
+    /// depth readings), so an off-lock preparation is not refused for them.
+    /// A hold that takes, removes, re-inserts or parks lane entries raises
+    /// it itself. Measured by the lock sampler like any other hold.
+    #[track_caller]
+    fn lock_inner_quiet(&self) -> TimedInner<'_, T> {
         let caller = std::panic::Location::caller();
         let asked = std::time::Instant::now();
         let mut inner = self.inner.lock();
         let at = std::time::Instant::now();
         inner.settle();
         TimedInner { guard: inner, at, waited: at.saturating_duration_since(asked), caller, mirror: &self.depth }
+    }
+
+    /// Whether this queue runs its heavy steps off the lanes' lock
+    /// ([`queue_offlock`]).
+    fn offlock(&self) -> bool {
+        self.offlock.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The same queue with `N42_QUEUE_OFFLOCK` set to `on` whatever the
+    /// environment says. What a test uses to choose the path.
+    #[must_use]
+    pub fn with_offlock(self, on: bool) -> Self {
+        self.offlock.store(on, std::sync::atomic::Ordering::Relaxed);
+        self
     }
 
     /// Moves what was pushed since the last drain into the lanes. Called
@@ -1651,7 +1761,7 @@ impl<T: PoolTransaction> TxQueue<T> {
 
     /// How many frames the index holds, counting those still in its inbox.
     pub fn frames_indexed(&self) -> usize {
-        self.lock_inner().frames.len() + self.frames_staged.load(std::sync::atomic::Ordering::Acquire)
+        self.lock_inner_quiet().frames.len() + self.frames_staged.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The indexed frames in the order they arrived, each with its count,
@@ -1719,7 +1829,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// Records that a canonical block at `number` has been pruned out of the
     /// lanes. Only the highest is kept.
     pub fn note_pruned(&self, number: u64) {
-        let mut inner = self.lock_inner();
+        let mut inner = self.lock_inner_quiet();
         inner.pruned_through = inner.pruned_through.max(number);
         self.pruned_mirror.fetch_max(number, std::sync::atomic::Ordering::AcqRel);
     }
@@ -1739,13 +1849,13 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// queue never saw -- the pool's listener drops on a full channel -- or
     /// one still on its way in; the feed looks the pool up for it.
     pub fn take_gaps(&self) -> Vec<(Address, u64, u64)> {
-        std::mem::take(&mut self.lock_inner().gaps)
+        std::mem::take(&mut self.lock_inner_quiet().gaps)
     }
 
     /// How many transactions are queued.
     pub fn len(&self) -> usize {
         use std::sync::atomic::Ordering;
-        let inner = self.lock_inner();
+        let inner = self.lock_inner_quiet();
         inner.len
             + inner.pending_drain.len()
             + self.staged.load(Ordering::Acquire)
@@ -1763,7 +1873,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// One walk of the lanes (~6,000 at the bench tier), so it belongs on a
     /// per-block line and not in a loop.
     pub fn usable(&self) -> usize {
-        let mut inner = self.lock_inner();
+        let mut inner = self.lock_inner_quiet();
         // What is in the inbox is a build away from the lanes -- the next
         // pull drains it -- so it counts, and counting it means draining
         // it. The drainer task normally leaves nothing to do here.
@@ -1809,7 +1919,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// mirror: the reference the tests hold the mirror against.
     pub fn gate_len_locked(&self) -> usize {
         use std::sync::atomic::Ordering;
-        let inner = self.lock_inner();
+        let inner = self.lock_inner_quiet();
         (inner.len
             + inner.pending_drain.len()
             + self.staged.load(Ordering::Acquire)
@@ -1821,13 +1931,13 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// the first few named ([`Dropped`]). Taking it clears it, so a caller
     /// logging this reports a window and not a running total.
     pub fn take_drops(&self) -> DropReport {
-        std::mem::take(&mut self.lock_inner().drops)
+        std::mem::take(&mut self.lock_inner_quiet().drops)
     }
 
     /// The lanes parked behind a hole, how many transactions they hold, and
     /// how many parks the cap has refused since the process started.
     pub fn parked(&self) -> (usize, usize, u64) {
-        let inner = self.lock_inner();
+        let inner = self.lock_inner_quiet();
         (inner.parked_order.len(), inner.parked_len, inner.park_capped)
     }
 
@@ -2116,7 +2226,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         if transactions.is_empty() {
             return;
         }
-        let mut inner = self.lock_inner();
+        let mut inner = self.lock_inner_quiet();
         // The block a whole hand-off just forgot the take of: what a plan
         // prepared ahead of the next build is accepted against.
         let build = inner.builds;
@@ -2399,7 +2509,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             self.drain_chunked(chunk, usize::MAX);
             return;
         }
-        let mut inner = self.lock_inner();
+        let mut inner = self.lock_inner_quiet();
         self.drain_inbox(&mut inner);
     }
 
@@ -2451,7 +2561,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             let moved;
             let done;
             {
-                let mut inner = self.lock_inner();
+                let mut inner = self.lock_inner_quiet();
                 at = std::time::Instant::now();
                 // Moved, not copied: a `Vec` becomes the deque in O(1).
                 if let Some(batch) = batch.take() {
@@ -2651,11 +2761,11 @@ impl<T: PoolTransaction> TxQueue<T> {
                 if ahead {
                     queue.prepare_next_in(gas_limit, mode);
                 } else {
-                    drop(queue.lock_inner());
+                    drop(queue.lock_inner_quiet());
                 }
             });
             if spawned.is_err() && mode == SelectMode::Parallel {
-                drop(self.lock_inner());
+                drop(self.lock_inner_quiet());
             }
         }
         let best = QueueBest {
@@ -2683,6 +2793,23 @@ impl<T: PoolTransaction> TxQueue<T> {
     }
 
     fn prepare_next_in(&self, gas_limit: u64, mode: SelectMode) -> bool {
+        if self.offlock() && mode == SelectMode::Parallel {
+            for attempt in 0..2 {
+                if let Some(made) = self.prepare_next_offlock(gas_limit) {
+                    return made;
+                }
+                OFFLOCK_RACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if attempt == 1 {
+                    OFFLOCK_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        self.prepare_next_locked(gas_limit, mode)
+    }
+
+    /// [`Self::prepare_next_in`] in one hold of the lanes' lock: planned,
+    /// its takes applied and the plan stored under it.
+    fn prepare_next_locked(&self, gas_limit: u64, mode: SelectMode) -> bool {
         let at = std::time::Instant::now();
         let mut garbage = PruneGarbage::default();
         let hook = self.ahead_hook.lock().clone();
@@ -2703,50 +2830,162 @@ impl<T: PoolTransaction> TxQueue<T> {
             inner.last_build = Some((B256::ZERO, Vec::new()));
             let mut times = FrameSelectTimes::default();
             let (segments, plan, gas_left) = inner.plan_frames(gas_limit, &mut times, mode);
-            inner.settle();
-            let taken = inner.last_build.take().map(|(_, taken)| taken).unwrap_or_default();
-            inner.last_build = current;
-            if plan.frames.is_empty() {
-                if !taken.is_empty() {
-                    inner.give_back(taken);
-                }
-                false
-            } else {
-                let mut lowest: AddressHashMap<u64> = AddressHashMap::default();
-                for frame in &plan.frames {
-                    let Some((runs, _)) = inner.frames.runs_and_hashes(&frame.id) else { continue };
-                    for run in runs.iter().filter(|run| (run.start as usize) < frame.taken) {
-                        let entry = lowest.entry(run.sender).or_insert(run.first_nonce);
-                        *entry = (*entry).min(run.first_nonce);
-                    }
-                }
-                let cut = plan.frames.last().is_some_and(|frame| frame.taken < frame.len);
-                let after = inner.builds;
-                // A clone of each frame's `Arc` (a few hundred), not of its
-                // transactions: the hook reads them outside the lock.
-                let body = hook.is_some().then(|| {
-                    let slot = Arc::new(Mutex::new(BodySlot::default()));
-                    body_job = Some((segments.clone(), Arc::clone(&slot)));
-                    slot
-                });
-                inner.prepared = Some(Prepared {
-                    after,
-                    gas_used: gas_limit.saturating_sub(gas_left),
-                    cut,
-                    segments,
-                    plan,
-                    taken,
-                    lowest,
-                    made_at: std::time::Instant::now(),
-                    prep_us: at.elapsed().as_micros() as u64,
-                    body,
-                });
-                true
-            }
+            inner.store_prepared(current, segments, plan, gas_left, gas_limit, at, hook.is_some(), &mut body_job)
         };
         garbage.free();
-        // The body, made off the lanes' lock. A build that takes the plan
-        // before this ends finds the slot empty and makes its own.
+        Self::run_body_hook(hook, body_job);
+        prepared
+    }
+
+    /// The off-lock preparation (`N42_QUEUE_OFFLOCK`): planned under one
+    /// hold exactly as [`Self::prepare_next_locked`] plans, but the plan's
+    /// takes -- noted by the parallel planner, not yet out of the lanes --
+    /// are grouped per sender with the lock released (each sender's takes
+    /// are one run of consecutive nonces from its lane's head: the planner
+    /// takes a frame's run only at its lane's head after the plan's earlier
+    /// takes) and applied under a second hold, one split per sender, only
+    /// if [`Inner::lanes_gen`] has not moved since the first: then no hold in
+    /// between took, removed, re-inserted or parked a lane entry, so the
+    /// planned entries are still where the plan found them, and nothing
+    /// was handed out from the plan before it is stored. `None` when the
+    /// lanes moved (nothing applied; the caller retries or plans in one
+    /// hold). A plan the parallel planner did not make whole (its serial
+    /// part ran, which takes as it goes) is stored in the first hold, as
+    /// the one-hold path does.
+    fn prepare_next_offlock(&self, gas_limit: u64) -> Option<bool> {
+        match self.offlock_plan(gas_limit) {
+            OffPlanned::Done(made) => Some(made),
+            OffPlanned::Planned(planned) => self.offlock_commit(planned),
+        }
+    }
+
+    /// The first hold of [`Self::prepare_next_offlock`]: the plan made,
+    /// its noted takes left in the lanes.
+    fn offlock_plan(&self, gas_limit: u64) -> OffPlanned<T> {
+        let at = std::time::Instant::now();
+        let mut garbage = PruneGarbage::default();
+        let hook = self.ahead_hook.lock().clone();
+        let mut body_job: Option<BodyJob<T>> = None;
+        let mut inner = self.lock_inner();
+        self.drain_inbox(&mut inner);
+        if inner.prepared.is_some() {
+            garbage.taken = inner.discard_prepared();
+            note_ahead_discard(AheadDiscard::OtherBuild);
+        }
+        let current = inner.last_build.take();
+        inner.last_build = Some((B256::ZERO, Vec::new()));
+        let mut times = FrameSelectTimes::default();
+        let (segments, plan, gas_left) = inner.plan_frames(gas_limit, &mut times, SelectMode::Parallel);
+        let serial_took = inner.last_build.as_ref().is_some_and(|(_, taken)| !taken.is_empty());
+        if serial_took || plan.frames.is_empty() || inner.pending.len() != segments.len() {
+            let made = inner.store_prepared(current, segments, plan, gas_left, gas_limit, at, hook.is_some(), &mut body_job);
+            drop(inner);
+            garbage.free();
+            Self::run_body_hook(hook, body_job);
+            return OffPlanned::Done(made);
+        }
+        // The takes stay in the lanes until the second hold, counted as
+        // queued meanwhile: a prune between the holds subtracts what it
+        // removes from `len`, and must find it there.
+        let noted = std::mem::take(&mut inner.pending);
+        let count: usize = noted.iter().map(|(_, prefix)| *prefix).sum();
+        inner.len += count;
+        inner.last_build = current;
+        let planned = OffPlan {
+            segments,
+            plan,
+            gas_left,
+            gas_limit,
+            count,
+            lanes_gen: inner.lanes_gen,
+            after: inner.builds,
+            at,
+            hook,
+        };
+        drop(inner);
+        garbage.free();
+        OffPlanned::Planned(planned)
+    }
+
+    /// The rest of [`Self::prepare_next_offlock`]: the takes grouped per
+    /// sender off the lock, then applied and the plan stored under a second
+    /// hold if the lanes have not moved; `None` (nothing applied) if they
+    /// have.
+    fn offlock_commit(&self, planned: OffPlan<T>) -> Option<bool> {
+        let OffPlan { segments, plan, gas_left, gas_limit, count, lanes_gen, after, at, hook } = planned;
+        let mut garbage = PruneGarbage::default();
+        let mut body_job: Option<BodyJob<T>> = None;
+        // Off the lock: the taken list in plan order (the frames' own
+        // `Arc`s, the lanes' entries by the planner's pointer check), and
+        // each sender's run of nonces.
+        let mut taken: Vec<Arc<ValidPoolTransaction<T>>> = Vec::with_capacity(count);
+        for (txs, prefix) in &segments {
+            taken.extend(txs.iter().take(*prefix).cloned());
+        }
+        let mut runs: AddressHashMap<(u64, u64)> = AddressHashMap::default();
+        let mut contiguous = true;
+        for t in &taken {
+            let nonce = t.nonce();
+            let run = runs.entry(t.sender()).or_insert((nonce, nonce));
+            if run.1 != nonce {
+                contiguous = false;
+            }
+            run.1 = nonce.saturating_add(1);
+        }
+        let mut inner = self.lock_inner_quiet();
+        if !contiguous || inner.lanes_gen != lanes_gen || inner.builds != after || inner.prepared.is_some() {
+            // The noted takes were never applied: the lanes still hold them
+            // and `len` already counts them (a prune that removed some of
+            // them meanwhile subtracted those itself).
+            drop(inner);
+            drop(taken);
+            return None;
+        }
+        let mut removed = 0usize;
+        for (sender, (lo, hi)) in &runs {
+            let Some(lane) = inner.lanes.get_mut(sender) else { continue };
+            // An arrival below the run (a hole filled since) stays: the
+            // verdict refuses the plan for it later, as the one-hold path's.
+            let mut run = lane.by_nonce.split_off(lo);
+            let mut tail = run.split_off(hi);
+            lane.by_nonce.append(&mut tail);
+            debug_assert_eq!(run.len() as u64, hi - lo);
+            removed += run.len();
+            if lane.by_nonce.is_empty() {
+                lane.queued = false;
+            }
+            garbage.lanes.push(run);
+        }
+        inner.len -= removed;
+        inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+        let lowest: AddressHashMap<u64> = runs.iter().map(|(sender, (lo, _))| (*sender, *lo)).collect();
+        let cut = plan.frames.last().is_some_and(|frame| frame.taken < frame.len);
+        let body = hook.is_some().then(|| {
+            let slot = Arc::new(Mutex::new(BodySlot::default()));
+            body_job = Some((segments.clone(), Arc::clone(&slot)));
+            slot
+        });
+        inner.prepared = Some(Prepared {
+            after,
+            gas_used: gas_limit.saturating_sub(gas_left),
+            cut,
+            segments,
+            plan,
+            taken,
+            lowest,
+            made_at: std::time::Instant::now(),
+            prep_us: at.elapsed().as_micros() as u64,
+            body,
+        });
+        drop(inner);
+        garbage.free();
+        Self::run_body_hook(hook, body_job);
+        Some(true)
+    }
+
+    /// The body, made off the lanes' lock. A build that takes the plan
+    /// before this ends finds the slot empty and makes its own.
+    fn run_body_hook(hook: Option<PlanAheadHook<T>>, body_job: Option<BodyJob<T>>) {
         if let (Some(hook), Some((segments, slot))) = (hook, body_job) {
             let at = std::time::Instant::now();
             let body = hook(&segments);
@@ -2755,7 +2994,6 @@ impl<T: PoolTransaction> TxQueue<T> {
             slot.body = body;
             slot.made_us = made_us;
         }
-        prepared
     }
 
     /// Installs the builder's plan-ahead hook (`N42_PLAN_AHEAD_BODY=1`): every
@@ -2788,7 +3026,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     ) -> Option<(Vec<Arc<ValidPoolTransaction<T>>>, ForgetTimes)> {
         let mut times = ForgetTimes::default();
         let at = std::time::Instant::now();
-        let mut inner = self.lock_inner();
+        let mut inner = self.lock_inner_quiet();
         times.lock_us = at.elapsed().as_micros() as u64;
         let build = inner.builds;
         let (built_on, taken) = inner.last_build.as_mut()?;
@@ -3097,6 +3335,7 @@ impl<T: PoolTransaction> Inner<T> {
         if self.pending.is_empty() {
             return;
         }
+        self.lanes_gen = self.lanes_gen.wrapping_add(1);
         let pending = std::mem::take(&mut self.pending);
         let mut list = self.last_build.as_mut().map(|(_, list)| list);
         for (id, prefix) in pending {
@@ -3309,6 +3548,11 @@ impl<T: PoolTransaction> Inner<T> {
         if prepared.gas_used > gas_limit {
             return Err(AheadDiscard::Gas);
         }
+        if let Some(pruning) = self.pruning.as_ref()
+            && prepared.lowest.iter().any(|(sender, lowest)| pruning.get(sender).is_some_and(|mined| mined >= lowest))
+        {
+            return Err(AheadDiscard::Mined);
+        }
         for (sender, lowest) in &prepared.lowest {
             let Some(lane) = self.lanes.get(sender) else { continue };
             if lane.is_stale(*lowest) {
@@ -3319,6 +3563,65 @@ impl<T: PoolTransaction> Inner<T> {
             }
         }
         Ok(())
+    }
+
+    /// The end of a preparation under the lanes' lock, with the plan made
+    /// on a taken list of its own (the current build's, `current`, put
+    /// back): its takes applied, and the plan stored as [`Prepared`] -- or,
+    /// when it holds no frame, what it took given back. Returns whether a
+    /// plan was stored; `body_job` gets the hook's work when `with_hook`.
+    #[allow(clippy::too_many_arguments)]
+    fn store_prepared(
+        &mut self,
+        current: Option<(B256, Vec<Arc<ValidPoolTransaction<T>>>)>,
+        segments: Vec<(FrameTxs<T>, usize)>,
+        plan: FramePlan,
+        gas_left: u64,
+        gas_limit: u64,
+        at: std::time::Instant,
+        with_hook: bool,
+        body_job: &mut Option<BodyJob<T>>,
+    ) -> bool {
+        let inner = self;
+        inner.settle();
+        let taken = inner.last_build.take().map(|(_, taken)| taken).unwrap_or_default();
+        inner.last_build = current;
+        if plan.frames.is_empty() {
+            if !taken.is_empty() {
+                inner.give_back(taken);
+            }
+            return false;
+        }
+        let mut lowest: AddressHashMap<u64> = AddressHashMap::default();
+        for frame in &plan.frames {
+            let Some((runs, _)) = inner.frames.runs_and_hashes(&frame.id) else { continue };
+            for run in runs.iter().filter(|run| (run.start as usize) < frame.taken) {
+                let entry = lowest.entry(run.sender).or_insert(run.first_nonce);
+                *entry = (*entry).min(run.first_nonce);
+            }
+        }
+        let cut = plan.frames.last().is_some_and(|frame| frame.taken < frame.len);
+        let after = inner.builds;
+        // A clone of each frame's `Arc` (a few hundred), not of its
+        // transactions: the hook reads them outside the lock.
+        let body = with_hook.then(|| {
+            let slot = Arc::new(Mutex::new(BodySlot::default()));
+            *body_job = Some((segments.clone(), Arc::clone(&slot)));
+            slot
+        });
+        inner.prepared = Some(Prepared {
+            after,
+            gas_used: gas_limit.saturating_sub(gas_left),
+            cut,
+            segments,
+            plan,
+            taken,
+            lowest,
+            made_at: std::time::Instant::now(),
+            prep_us: at.elapsed().as_micros() as u64,
+            body,
+        });
+        true
     }
 
     /// Gives a prepared plan's transactions back to the lanes, as a build's
@@ -6065,3 +6368,6 @@ mod drain_tests;
 
 #[cfg(test)]
 mod ahead_tests;
+
+#[cfg(test)]
+mod offlock_tests;

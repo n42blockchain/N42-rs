@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>N42 公开提案分流</title>
+<style>
+  body{font:16px/1.5 system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;color:#1b2430}
+  label{display:block;margin:1rem 0}.hint{color:#526273}input,textarea,button{font:inherit}input,textarea{display:block;width:100%;box-sizing:border-box;padding:.6rem;margin:.3rem 0}textarea{min-height:7rem}button{padding:.55rem 1rem;margin:.3rem .5rem .3rem 0}pre{white-space:pre-wrap;word-break:break-word;background:#f2f5f8;padding:1rem}#message{color:#154c6b}
+</style>
+<h1>N42 公开提案分流</h1>
+<p>提交的提案正文会公开上链。Jev 结果用于选择技术、社区或资金审核队列；资金决议仍由治理流程执行。</p>
+<label>Router 合约地址<input id="router" placeholder="0x..."></label>
+<label>Hub 合约地址<input id="hub" placeholder="0x..."></label>
+<label>模板 ID<input id="templateId" type="number" min="1" value="1"></label>
+<label>提案标题<input id="title"></label>
+<label>公开提案正文<textarea id="body"></textarea></label>
+<label>提案唯一键<input id="proposalKey" placeholder="0x...，留空则自动生成"></label>
+<button id="prepare">生成输入 hash</button>
+<pre id="prepared"></pre>
+<p class="hint">将输入 hash 交给报价服务；它返回签名报价。报价中的 requester 和 consumer 都必须是 Router，refundTo 必须是你的钱包地址。</p>
+<label>签名报价 JSON<textarea id="quote" placeholder='{"quote":{...},"signature":"0x..."}'></textarea></label>
+<button id="submit">连接钱包并提交</button>
+<label>请求 ID<input id="requestId" placeholder="从 ProposalSubmitted 事件读取"></label>
+<button id="status">查询状态</button><button id="route">结果就绪后分流</button>
+<p class="hint">confidence 表示分布集中程度，不代表判断正确率。Review 状态需要人工审核；链上结果只能证明网关签名和记录一致。</p>
+<p id="message" role="status"></p>
+<script type="module" src="./app.mjs"></script>
+</html>

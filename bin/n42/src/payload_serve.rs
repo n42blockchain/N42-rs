@@ -456,6 +456,73 @@ fn head_move_needed(mode: HandoffHeadMove, head: B256, head_number: u64, parent:
     }
 }
 
+/// The build's block under the sealed header for the hand-off, and whether
+/// its body was moved rather than copied: with `move_body`
+/// (`N42_HANDOFF_MOVE_BODY`) the stores give the build up and the body moves
+/// (`built_executions::reseal_moving`), else -- or when a holder outside the
+/// stores keeps the build -- it is moved only if `block` is its last holder
+/// and copied otherwise. The sealed block is remembered for the engine's own
+/// `newPayload` either way: shared under `no_clone` or `move_body`, as a
+/// second copy otherwise.
+fn resealed_for_handoff(
+    built_hash: B256,
+    block: std::sync::Arc<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>>,
+    sealed_header: reth_primitives_traits::SealedHeader,
+    move_body: bool,
+    no_clone: bool,
+) -> (std::sync::Arc<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>>, bool) {
+    let sealed_hash = sealed_header.hash();
+    let mut moved_body = false;
+    let kept = if move_body {
+        match n42_engine_types::built_executions::reseal_moving(built_hash, block, sealed_header.clone()) {
+            Ok(moved) => {
+                moved_body = true;
+                Ok(moved)
+            }
+            Err(shared) => Err(shared),
+        }
+    } else {
+        Err(block)
+    };
+    let recovered = match kept {
+        Ok(moved) => {
+            // For the engine's newPayload of this block, which follows the
+            // hand-off: the very block the insert carries.
+            n42_engine_types::built_executions::remember_sealed_shared(sealed_hash, std::sync::Arc::clone(&moved));
+            moved
+        }
+        Err(block) => {
+            let (body, senders) = match std::sync::Arc::try_unwrap(block) {
+                Ok(block) => {
+                    let (sealed, senders) = block.split_sealed();
+                    (sealed.split_sealed_header_body().1, senders)
+                }
+                Err(shared) => (shared.body().clone(), shared.senders().to_vec()),
+            };
+            // For the engine's newPayload of this block, which follows the
+            // hand-off: its conversion finds the block here instead of
+            // decoding the payload. `N42_HANDOFF_NO_CLONE=1` keeps the
+            // executed block's own `Arc` there instead of a second copy of
+            // the body (`built_executions::handoff_no_clone_enabled`).
+            if !no_clone && !move_body {
+                n42_engine_types::built_executions::remember_sealed(
+                    sealed_hash,
+                    SealedBlock::from_sealed_parts(sealed_header.clone(), body.clone()),
+                );
+            }
+            let recovered = std::sync::Arc::new(reth_primitives_traits::RecoveredBlock::<n42_tx_types::Block>::new_sealed(
+                SealedBlock::from_sealed_parts(sealed_header, body),
+                senders,
+            ));
+            if no_clone || move_body {
+                n42_engine_types::built_executions::remember_sealed_shared(sealed_hash, std::sync::Arc::clone(&recovered));
+            }
+            recovered
+        }
+    };
+    (recovered, moved_body)
+}
+
 /// The hand-off of a build this node kept, under the sealed header consensus
 /// gave it: the sealed block registered for the engine's own conversion, the
 /// build's execution inserted as executed, the QMDB root filed under the
@@ -479,33 +546,19 @@ where
     // body for the engine's copy instead of two. The handed store
     // (`built_executions::take`) still holds the build, so in practice the
     // body is cloned here; `clone_ms` on the hand-off line is both copies.
+    // `N42_HANDOFF_MOVE_BODY=1` takes the build out of every store first and
+    // moves the body under the sealed header, the new block shared with the
+    // stores, the sealed store and the engine's insert: no copy at all unless
+    // a holder outside the stores keeps the build (`moved_body=false`;
+    // `built_executions::handoff_move_body_enabled`).
     let clone_at = std::time::Instant::now();
-    let (body, senders) = match std::sync::Arc::try_unwrap(built.block) {
-        Ok(block) => {
-            let (sealed, senders) = block.split_sealed();
-            (sealed.split_sealed_header_body().1, senders)
-        }
-        Err(shared) => (shared.body().clone(), shared.senders().to_vec()),
-    };
-    // For the engine's newPayload of this block, which follows the hand-off:
-    // its conversion finds the block here instead of decoding the payload.
-    // `N42_HANDOFF_NO_CLONE=1` keeps the executed block's own `Arc` there
-    // instead of a second copy of the body
-    // (`built_executions::handoff_no_clone_enabled`).
-    let no_clone = n42_engine_types::built_executions::handoff_no_clone_enabled();
-    if !no_clone {
-        n42_engine_types::built_executions::remember_sealed(
-            sealed_hash,
-            SealedBlock::from_sealed_parts(sealed_header.clone(), body.clone()),
-        );
-    }
-    let recovered = std::sync::Arc::new(reth_primitives_traits::RecoveredBlock::<n42_tx_types::Block>::new_sealed(
-        SealedBlock::from_sealed_parts(sealed_header, body),
-        senders,
-    ));
-    if no_clone {
-        n42_engine_types::built_executions::remember_sealed_shared(sealed_hash, std::sync::Arc::clone(&recovered));
-    }
+    let (recovered, moved_body) = resealed_for_handoff(
+        built_hash,
+        built.block,
+        sealed_header,
+        n42_engine_types::built_executions::handoff_move_body_enabled(),
+        n42_engine_types::built_executions::handoff_no_clone_enabled(),
+    );
     let clone_ms = clone_at.elapsed().as_millis() as u64;
     // For the pool prune below, taken now: the block moves into the engine's
     // insert.
@@ -609,6 +662,7 @@ where
                 rename_wait_ms,
                 rename_deferred,
                 clone_ms,
+                moved_body,
                 total_ms = started.elapsed().as_millis() as u64,
                 "own block handed to the engine as executed"
             );
@@ -3378,6 +3432,87 @@ mod tests {
     use alloy_consensus::{Block, BlockBody, Header, Signed, TxEip1559, TxLegacy};
     use alloy_primitives::{Address, Signature, TxKind, U256};
     use reth_ethereum_primitives::TransactionSigned;
+
+    /// A taken build with one transaction, filed and handed out of the store
+    /// as `take` hands it to the own-block import, and its sealed header.
+    fn handed_build(number: u64) -> (B256, n42_engine_types::built_executions::BuiltExecution, reth_primitives_traits::SealedHeader) {
+        let header = Header {
+            number,
+            parent_hash: B256::repeat_byte(0xD0),
+            state_root: B256::with_last_byte(number as u8),
+            receipts_root: B256::repeat_byte(0xD2),
+            gas_used: 21_000 + number,
+            ..Default::default()
+        };
+        let tx: n42_tx_types::N42TxEnvelope = TransactionSigned::new_unhashed(
+            reth_ethereum_primitives::Transaction::Legacy(TxLegacy { nonce: number, ..Default::default() }),
+            Signature::test_signature(),
+        )
+        .into();
+        let block = Block { header: header.clone(), body: BlockBody { transactions: vec![tx], ommers: Vec::new(), withdrawals: None } };
+        let sender = Address::with_last_byte(0x5E);
+        let execution = n42_engine_types::built_executions::BuiltExecution {
+            block: std::sync::Arc::new(reth_primitives_traits::RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), vec![sender])),
+            execution_output: std::sync::Arc::new(reth_execution_types::BlockExecutionOutput {
+                result: Default::default(),
+                state: Default::default(),
+            }),
+            hashed_state: Default::default(),
+            trie_updates: Default::default(),
+        };
+        let built_hash = execution.block.hash();
+        n42_engine_types::built_executions::remember(built_hash, execution);
+        let (taken_hash, taken) = n42_engine_types::built_executions::take(
+            header.parent_hash,
+            number,
+            header.state_root,
+            header.receipts_root,
+            header.gas_used,
+            None,
+        )
+        .expect("taken");
+        assert_eq!(taken_hash, built_hash);
+        let sealed = reth_primitives_traits::SealedHeader::seal_slow(Header { extra_data: b"view".as_slice().into(), ..header });
+        (built_hash, taken, sealed)
+    }
+
+    /// `N42_HANDOFF_MOVE_BODY`: the hand-off's block is the build's body
+    /// moved under the sealed header, found under the sealed hash (the
+    /// engine's own conversion) and, through the alias, under the build hash;
+    /// a second hand-off of the same block takes the alias as it is.
+    #[test]
+    fn the_handoff_moves_the_body_when_the_stores_give_it_up() {
+        let (built_hash, taken, sealed) = handed_build(0x7101);
+        let sealed_hash = sealed.hash();
+        let body_at = taken.block.body().transactions.as_ptr();
+        let (block, moved) = resealed_for_handoff(built_hash, taken.block, sealed.clone(), true, false);
+        assert!(moved);
+        assert_eq!(block.hash(), sealed_hash);
+        assert_eq!(block.body().transactions.as_ptr(), body_at, "the body moved, not copied");
+        assert_eq!(block.senders(), &[Address::with_last_byte(0x5E)]);
+        assert_eq!(n42_engine_types::built_executions::find_sealed(sealed_hash).map(|found| found.hash()), Some(sealed_hash));
+        let alias = n42_engine_types::built_executions::kept_block(built_hash).expect("the build hash aliases the sealed block");
+        assert!(std::sync::Arc::ptr_eq(&alias, &block));
+        drop(alias);
+        let (again, moved_again) = resealed_for_handoff(built_hash, std::sync::Arc::clone(&block), sealed, true, false);
+        assert!(moved_again, "already under the sealed header");
+        assert!(std::sync::Arc::ptr_eq(&again, &block));
+    }
+
+    /// A holder outside the stores keeps the build: the body is copied as
+    /// before, `moved_body` says so, and the stores keep the build.
+    #[test]
+    fn the_handoff_copies_the_body_a_holder_still_reads() {
+        let (built_hash, taken, sealed) = handed_build(0x7102);
+        let sealed_hash = sealed.hash();
+        let reader = std::sync::Arc::clone(&taken.block);
+        let (block, moved) = resealed_for_handoff(built_hash, taken.block, sealed, true, false);
+        assert!(!moved);
+        assert_eq!(block.hash(), sealed_hash);
+        assert_ne!(block.body().transactions.as_ptr(), reader.body().transactions.as_ptr());
+        assert!(n42_engine_types::built_executions::kept_block(built_hash).is_some_and(|kept| std::sync::Arc::ptr_eq(&kept, &reader)));
+        assert_eq!(n42_engine_types::built_executions::find_sealed(sealed_hash).map(|found| found.hash()), Some(sealed_hash));
+    }
 
     /// `N42_HANDOFF_HEAD_MOVE=number` moves the head only for an insert the
     /// tree would drop as outdated; the default moves it whenever the head is

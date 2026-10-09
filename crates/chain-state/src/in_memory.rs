@@ -940,6 +940,30 @@ pub enum NewCanonicalChain<N: NodePrimitives = EthPrimitives> {
     },
 }
 
+/// N42: whether canonical-state notifications are built without execution outcomes.
+///
+/// Read once from `N42_CANON_NOTIFY_LEAN` (`1` turns it on; default off). Measured in loop351
+/// stage k (E=1, seven validator keys on one execution layer, 200k-transfer blocks): the engine
+/// tree thread spent 59% of its time in `on_canonical_chain_update`, nearly all of it in
+/// [`NewCanonicalChain::to_chain_notification`] deep-cloning each block's execution outcome (the
+/// receipts of 200k transactions and the bundle state of ~190k accounts) and extending it block by
+/// block: 23 ms per block canonicalised, and the leader's build waited on its anchor.
+///
+/// Only correct when no subscriber of the canonical-state stream reads
+/// `Chain::execution_outcome()` (receipts, bundle, changed accounts): with the switch on the
+/// notification's outcome is empty with the right `first_block`, while blocks, trie data and BALs
+/// are carried as before. Readers that lose something with the switch on: the transaction-pool
+/// maintenance task gets no changed accounts (mined transactions are still removed; a sender's
+/// tracked nonce/balance refreshes only when a new transaction of it is validated, or on drift),
+/// the payload job generator's pre-cached reads stay empty, the RPC block/receipt and fee-history
+/// caches get no entries (reads fall back to the provider), and the `logs` / receipt pubsub
+/// streams emit nothing. Blocks, headers and transactions (`newHeads`, the N42 queue pruner, the
+/// head followers) are unaffected. Bench-only.
+pub fn n42_canon_notify_lean() -> bool {
+    static LEAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEAN.get_or_init(|| std::env::var("N42_CANON_NOTIFY_LEAN").is_ok_and(|v| v == "1"))
+}
+
 impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
     /// Returns the length of the new chain.
     pub const fn new_block_count(&self) -> usize {
@@ -970,9 +994,23 @@ impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
     }
 
     /// Converts a slice of executed blocks into a [`Chain`].
+    ///
+    /// With `N42_CANON_NOTIFY_LEAN=1` (see [`n42_canon_notify_lean`]) the chain carries the
+    /// blocks, their trie data handles and BALs but an empty [`ExecutionOutcome`] (no bundle, no
+    /// receipts) whose `first_block` is the first block's number.
     fn blocks_to_chain(blocks: &[ExecutedBlock<N>]) -> Chain<N> {
+        Self::blocks_to_chain_with(blocks, n42_canon_notify_lean())
+    }
+
+    /// [`Self::blocks_to_chain`] with the lean switch passed explicitly.
+    fn blocks_to_chain_with(blocks: &[ExecutedBlock<N>], lean: bool) -> Chain<N> {
         let mut chain = match blocks {
             [] => Chain::default(),
+            [first, ..] if lean => Chain::new(
+                blocks.iter().map(|exec| Arc::clone(&exec.recovered_block)),
+                ExecutionOutcome { first_block: first.block_number(), ..Default::default() },
+                blocks.iter().map(|exec| (exec.block_number(), exec.trie_data_handle())).collect(),
+            ),
             [first, rest @ ..] => {
                 let mut chain = Chain::from_block(
                     Arc::clone(&first.recovered_block),
@@ -1463,6 +1501,47 @@ mod tests {
                 ))
             }
         );
+    }
+
+    #[test]
+    fn n42_lean_chain_notification_skips_execution_outcomes() {
+        let mut test_block_builder: TestBlockBuilder = TestBlockBuilder::default();
+        let block5 = test_block_builder.get_executed_block_with_number(5, B256::random());
+        let block6 =
+            test_block_builder.get_executed_block_with_number(6, block5.recovered_block.hash());
+        let blocks = vec![block5.clone(), block6.clone()];
+
+        // Lean: same blocks and trie data, an empty outcome starting at the first block.
+        let lean = NewCanonicalChain::blocks_to_chain_with(&blocks, true);
+        assert_eq!(lean.range(), 5..=6);
+        assert_eq!(lean.tip().hash(), block6.recovered_block.hash());
+        assert_eq!(lean.first().hash(), block5.recovered_block.hash());
+        assert_eq!(lean.trie_data().keys().copied().collect::<Vec<_>>(), vec![5, 6]);
+        assert_eq!(
+            lean.execution_outcome(),
+            &ExecutionOutcome { first_block: 5, ..Default::default() }
+        );
+        assert!(lean.execution_outcome().receipts.is_empty());
+        assert!(lean.execution_outcome().bundle.is_empty());
+
+        // Not lean: the upstream outcome, one receipt and request list per block.
+        let full = NewCanonicalChain::blocks_to_chain_with(&blocks, false);
+        assert_eq!(full.range(), 5..=6);
+        assert_eq!(
+            full.execution_outcome(),
+            &ExecutionOutcome {
+                receipts: vec![vec![], vec![]],
+                requests: vec![Requests::default(), Requests::default()],
+                first_block: 5,
+                ..Default::default()
+            }
+        );
+        assert_eq!(lean.blocks(), full.blocks());
+
+        // A single block also works in lean mode.
+        let single = NewCanonicalChain::blocks_to_chain_with(&blocks[..1], true);
+        assert_eq!(single.range(), 5..=5);
+        assert_eq!(single.execution_outcome().first_block, 5);
     }
 
     #[test]

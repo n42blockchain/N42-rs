@@ -169,7 +169,14 @@ async fn a_block_behind_busy_slots_is_voted_for_on_its_check_only_answer() {
     arrive(&mut driver, &blocks[2], body_of(&blocks[2])).await;
     // The check ahead: a Checked report with both imports still held open.
     voted.extend(take_votes(&mut driver, &mut rx, 1).await);
-    assert_eq!(voted, vec![blocks[0].hash, blocks[1].hash, blocks[2].hash]);
+    // The first two votes come from two concurrent imports and may arrive in either order.
+    assert_eq!(voted.len(), 3, "exactly three votes: {voted:?}");
+    let mut first_two = voted[..2].to_vec();
+    first_two.sort();
+    let mut expected = vec![blocks[0].hash, blocks[1].hash];
+    expected.sort();
+    assert_eq!(first_two, expected);
+    assert_eq!(voted[2], blocks[2].hash);
     assert_eq!(check_calls(&el), vec![blocks[2].hash], "one check-only request, for the queued block only");
     assert_eq!(body_calls(&el), vec![blocks[0].hash, blocks[1].hash], "the queued block is not imported yet");
     assert_eq!(driver.check_ahead_counts(), (1, 1, 0));

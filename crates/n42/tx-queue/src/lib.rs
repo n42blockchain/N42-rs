@@ -3525,127 +3525,21 @@ impl<T: PoolTransaction> Inner<T> {
         plan: &mut FramePlan,
         times: &mut FrameSelectTimes,
     ) -> (usize, bool) {
-        use rayon::prelude::*;
-        // Past the gas, a margin for the frames the plan passes over; the
-        // serial part continues if they run out.
-        const MARGIN: usize = 16;
-        let check_at = std::time::Instant::now();
-        let mut end = 0usize;
-        let mut reach = 0u64;
-        let mut past = 0usize;
-        while end < ids.len() && past <= MARGIN {
-            if reach > *gas_left {
-                past += 1;
-            }
-            reach = reach.saturating_add(self.frames.txs_gas_of(&ids[end]).unwrap_or(u64::MAX));
-            end += 1;
-        }
-        let (frames, lanes) = (&self.frames, &self.lanes);
-        let checks: Vec<frames::RunCheck<T>> =
-            ids[..end].par_iter().with_min_len(4).map(|id| frames.check_runs(id, lanes)).collect();
-        // Senders some run needs entries below it taken of, and each frame's
-        // runs of those senders: what the decisions below count.
-        let shared: AddressHashSet = checks
-            .iter()
-            .filter_map(|check| match check {
-                frames::RunCheck::Ok { below, .. } => Some(below.iter().map(|(_, sender, _)| *sender)),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        let draws: Vec<Vec<(u32, Address, u32)>> = if shared.is_empty() {
-            Vec::new()
-        } else {
-            ids[..end]
-                .par_iter()
-                .zip(checks.par_iter())
-                .map(|(id, check)| match check {
-                    frames::RunCheck::Ok { .. } => frames.runs_and_hashes(id).map_or_else(Vec::new, |(runs, _)| {
-                        runs.iter()
-                            .enumerate()
-                            .filter(|(_, run)| shared.contains(&run.sender))
-                            .map(|(idx, run)| (idx as u32, run.sender, run.len))
-                            .collect()
-                    }),
-                    _ => Vec::new(),
-                })
-                .collect()
-        };
-        times.check_us = check_at.elapsed().as_micros() as u64;
-        let mut taken_of: AddressHashMap<u64> = AddressHashMap::default();
-        for (k, check) in checks.into_iter().enumerate() {
-            if *gas_left == 0 {
-                return (k, true);
-            }
-            let (txs, gas) = match check {
-                frames::RunCheck::Slow => return (k, false),
-                frames::RunCheck::Unusable { gas } => {
-                    // A frame the gas cuts is checked only as far as the
-                    // cut: the serial check decides it.
-                    if gas > *gas_left {
-                        return (k, false);
-                    }
-                    plan.skipped += 1;
-                    continue;
-                }
-                frames::RunCheck::Ok { txs, gas, below } => {
-                    let draws = draws.get(k).map_or(&[][..], Vec::as_slice);
-                    if !below.is_empty() {
-                        times.counted += 1;
-                    }
-                    let at_heads = draws.iter().all(|(idx, sender, _)| {
-                        let needs = below.iter().find(|(at, _, _)| at == idx).map_or(0, |(_, _, n)| *n);
-                        taken_of.get(sender).copied().unwrap_or(0) == needs
-                    });
-                    if !at_heads {
-                        if gas > *gas_left {
-                            return (k, false);
-                        }
-                        plan.skipped += 1;
-                        continue;
-                    }
-                    (txs, gas)
-                }
-            };
-            let id = ids[k];
-            let Some((_, hashes)) = self.frames.runs_and_hashes(&id) else { return (k, false) };
-            let (prefix, used) = if gas <= *gas_left {
-                (txs.len(), gas)
-            } else {
-                // The frame the block's gas runs out in, cut: its own
-                // transactions' gas, the one frame read here.
-                let mut used = 0u64;
-                let mut prefix = 0usize;
-                for tx in txs.iter() {
-                    let tx_gas = tx.gas_limit();
-                    if used.saturating_add(tx_gas) > *gas_left {
-                        break;
-                    }
-                    used += tx_gas;
-                    prefix += 1;
-                }
-                (prefix, used)
-            };
-            if prefix == 0 {
-                return (k, true);
-            }
-            for (_, sender, len) in draws.get(k).map_or(&[][..], Vec::as_slice) {
-                // Runs are in position order; a cut frame's runs past the cut
-                // take nothing, and the plan ends with it anyway.
-                *taken_of.entry(*sender).or_insert(0) += u64::from(*len);
-            }
+        let mut noted = Vec::new();
+        let out = plan_parallel_over(
+            &LivePlanSource { frames: &self.frames, lanes: &self.lanes },
+            ids,
+            gas_left,
+            segments,
+            plan,
+            times,
+            &mut noted,
+        );
+        for (id, prefix) in noted {
             self.len -= prefix;
-            plan.push_hashes(Arc::clone(hashes), prefix);
-            plan.frames.push(PlannedFrame { id, len: txs.len(), taken: prefix });
             self.pending.push((id, prefix));
-            times.by_ref += 1;
-            segments.push((txs, prefix));
-            *gas_left = gas_left.saturating_sub(used);
-            if prefix < hashes.len() {
-                return (k + 1, true);
-            }
         }
-        (end, false)
+        out
     }
 
     /// Applies the takes [`Self::plan_parallel`] noted: each planned
@@ -4433,6 +4327,172 @@ impl<T: PoolTransaction> Inner<T> {
         }
         None
     }
+}
+
+/// Past the block's gas, how many frames the parallel planner checks for
+/// the ones it passes over; the serial part continues if they run out.
+const PLAN_MARGIN: usize = 16;
+
+/// What the parallel planner ([`plan_parallel_over`]) reads: the frame index
+/// and the lanes under the lanes' lock ([`LivePlanSource`]), or a plan
+/// snapshot's copy of the parts it needs (`snapshot::PlanSnapshot`).
+trait PlanSource<T: PoolTransaction>: Sync {
+    fn txs_gas_of(&self, id: &B256) -> Option<u64>;
+    fn check_runs(&self, id: &B256) -> frames::RunCheck<T>;
+    fn runs_and_hashes(&self, id: &B256) -> Option<(&[frames::SenderRun], &Arc<[B256]>)>;
+}
+
+/// The frame index and the lanes as they stand, under the lanes' lock.
+struct LivePlanSource<'a, T: PoolTransaction> {
+    frames: &'a frames::FrameIndex<T>,
+    lanes: &'a AddressHashMap<Lane<T>>,
+}
+
+impl<T: PoolTransaction> PlanSource<T> for LivePlanSource<'_, T> {
+    fn txs_gas_of(&self, id: &B256) -> Option<u64> {
+        self.frames.txs_gas_of(id)
+    }
+    fn check_runs(&self, id: &B256) -> frames::RunCheck<T> {
+        self.frames.check_runs(id, self.lanes)
+    }
+    fn runs_and_hashes(&self, id: &B256) -> Option<(&[frames::SenderRun], &Arc<[B256]>)> {
+        self.frames.runs_and_hashes(id)
+    }
+}
+
+/// The first part of [`Inner::plan_frames`] over `src`: the frames the
+/// block's gas reaches (and a few past it, for the ones passed over) checked
+/// at once on the worker pool, then decided in arrival order with one
+/// counter per sender that more than one of them draws on. Each taken frame
+/// is pushed to `noted` as (id, taken prefix), in plan order; nothing of the
+/// lanes is touched. Returns where the serial part continues and whether
+/// the plan has ended.
+fn plan_parallel_over<T: PoolTransaction, S: PlanSource<T>>(
+src: &S,
+ids: &[B256],
+gas_left: &mut u64,
+segments: &mut Vec<(FrameTxs<T>, usize)>,
+plan: &mut FramePlan,
+times: &mut FrameSelectTimes,
+noted: &mut Vec<(B256, usize)>,
+) -> (usize, bool) {
+    use rayon::prelude::*;
+    const MARGIN: usize = PLAN_MARGIN;
+    let check_at = std::time::Instant::now();
+    let mut end = 0usize;
+    let mut reach = 0u64;
+    let mut past = 0usize;
+    while end < ids.len() && past <= MARGIN {
+        if reach > *gas_left {
+            past += 1;
+        }
+        reach = reach.saturating_add(src.txs_gas_of(&ids[end]).unwrap_or(u64::MAX));
+        end += 1;
+    }
+    let checks: Vec<frames::RunCheck<T>> =
+        ids[..end].par_iter().with_min_len(4).map(|id| src.check_runs(id)).collect();
+    // Senders some run needs entries below it taken of, and each frame's
+    // runs of those senders: what the decisions below count.
+    let shared: AddressHashSet = checks
+        .iter()
+        .filter_map(|check| match check {
+            frames::RunCheck::Ok { below, .. } => Some(below.iter().map(|(_, sender, _)| *sender)),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let draws: Vec<Vec<(u32, Address, u32)>> = if shared.is_empty() {
+        Vec::new()
+    } else {
+        ids[..end]
+            .par_iter()
+            .zip(checks.par_iter())
+            .map(|(id, check)| match check {
+                frames::RunCheck::Ok { .. } => src.runs_and_hashes(id).map_or_else(Vec::new, |(runs, _)| {
+                    runs.iter()
+                        .enumerate()
+                        .filter(|(_, run)| shared.contains(&run.sender))
+                        .map(|(idx, run)| (idx as u32, run.sender, run.len))
+                        .collect()
+                }),
+                _ => Vec::new(),
+            })
+            .collect()
+    };
+    times.check_us = check_at.elapsed().as_micros() as u64;
+    let mut taken_of: AddressHashMap<u64> = AddressHashMap::default();
+    for (k, check) in checks.into_iter().enumerate() {
+        if *gas_left == 0 {
+            return (k, true);
+        }
+        let (txs, gas) = match check {
+            frames::RunCheck::Slow => return (k, false),
+            frames::RunCheck::Unusable { gas } => {
+                // A frame the gas cuts is checked only as far as the
+                // cut: the serial check decides it.
+                if gas > *gas_left {
+                    return (k, false);
+                }
+                plan.skipped += 1;
+                continue;
+            }
+            frames::RunCheck::Ok { txs, gas, below } => {
+                let draws = draws.get(k).map_or(&[][..], Vec::as_slice);
+                if !below.is_empty() {
+                    times.counted += 1;
+                }
+                let at_heads = draws.iter().all(|(idx, sender, _)| {
+                    let needs = below.iter().find(|(at, _, _)| at == idx).map_or(0, |(_, _, n)| *n);
+                    taken_of.get(sender).copied().unwrap_or(0) == needs
+                });
+                if !at_heads {
+                    if gas > *gas_left {
+                        return (k, false);
+                    }
+                    plan.skipped += 1;
+                    continue;
+                }
+                (txs, gas)
+            }
+        };
+        let id = ids[k];
+        let Some((_, hashes)) = src.runs_and_hashes(&id) else { return (k, false) };
+        let (prefix, used) = if gas <= *gas_left {
+            (txs.len(), gas)
+        } else {
+            // The frame the block's gas runs out in, cut: its own
+            // transactions' gas, the one frame read here.
+            let mut used = 0u64;
+            let mut prefix = 0usize;
+            for tx in txs.iter() {
+                let tx_gas = tx.gas_limit();
+                if used.saturating_add(tx_gas) > *gas_left {
+                    break;
+                }
+                used += tx_gas;
+                prefix += 1;
+            }
+            (prefix, used)
+        };
+        if prefix == 0 {
+            return (k, true);
+        }
+        for (_, sender, len) in draws.get(k).map_or(&[][..], Vec::as_slice) {
+            // Runs are in position order; a cut frame's runs past the cut
+            // take nothing, and the plan ends with it anyway.
+            *taken_of.entry(*sender).or_insert(0) += u64::from(*len);
+        }
+        plan.push_hashes(Arc::clone(hashes), prefix);
+        plan.frames.push(PlannedFrame { id, len: txs.len(), taken: prefix });
+        noted.push((id, prefix));
+        times.by_ref += 1;
+        segments.push((txs, prefix));
+        *gas_left = gas_left.saturating_sub(used);
+        if prefix < hashes.len() {
+            return (k + 1, true);
+        }
+    }
+    (end, false)
 }
 
 /// The builder's iterator over the queue. Implements reth's

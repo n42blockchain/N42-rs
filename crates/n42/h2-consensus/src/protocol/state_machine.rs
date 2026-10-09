@@ -42,6 +42,22 @@ pub struct ViewTiming {
     pub prepare_vote_count: u32,
     /// Number of Round 2 votes collected when CommitQC formed.
     pub commit_vote_count: u32,
+    /// Leader: microseconds spent verifying vote signatures in this view
+    /// (Round 1, Round 2, late and progress votes).
+    pub verify_us: u64,
+    /// Leader: signatures verified in this view (each batch member counts).
+    pub verify_n: u32,
+    /// Leader: same-message batch checks run (`N42_VOTE_AGGREGATE_VERIFY`).
+    pub verify_batches: u32,
+    /// Leader: batches that failed and fell back to one-by-one checks.
+    pub verify_fallbacks: u32,
+    /// The deepest the transport's inbound queue got in this view (only
+    /// with the swarm off the loop, `N42_GOSSIP_OFF_LOOP`; else 0).
+    pub inbound_queue_max: u32,
+    /// Microseconds spent polling the libp2p swarm in this view: on the
+    /// loop's transport drains when inline, on the transport's own task when
+    /// off the loop.
+    pub gossip_poll_us: u64,
 }
 
 impl ViewTiming {
@@ -56,7 +72,23 @@ impl ViewTiming {
             commit_qc_formed: None,
             prepare_vote_count: 0,
             commit_vote_count: 0,
+            verify_us: 0,
+            verify_n: 0,
+            verify_batches: 0,
+            verify_fallbacks: 0,
+            inbound_queue_max: 0,
+            gossip_poll_us: 0,
         }
+    }
+
+    /// Adds one verification episode to this view's counters.
+    pub(super) fn note_verify(&mut self, started: Instant, signatures: usize, batch: bool, fell_back: bool) {
+        self.verify_us = self
+            .verify_us
+            .saturating_add(started.elapsed().as_micros() as u64);
+        self.verify_n = self.verify_n.saturating_add(signatures as u32);
+        self.verify_batches += u32::from(batch);
+        self.verify_fallbacks += u32::from(fell_back);
     }
 
     /// Returns a human-readable summary of the timing breakdown.
@@ -91,22 +123,30 @@ impl ViewTiming {
         if self.proposal_sent.is_some() {
             // Leader view
             format!(
-                "leader proposal=@{} R1_collect={} R2_collect={} total={} votes={}+{}",
+                "leader proposal=@{} R1_collect={} R2_collect={} total={} votes={}+{} verify_us={} verify_n={} verify_batches={} verify_fallbacks={} inbound_queue_max={} gossip_poll_us={}",
                 ms(self.proposal_sent),
                 d(prepare_delta),
                 d(commit_delta),
                 d(total),
                 self.prepare_vote_count,
                 self.commit_vote_count,
+                self.verify_us,
+                self.verify_n,
+                self.verify_batches,
+                self.verify_fallbacks,
+                self.inbound_queue_max,
+                self.gossip_poll_us,
             )
         } else {
             // Follower view
             format!(
-                "follower proposal=@{} vote_delay={} commit_vote=@{} total=@{}",
+                "follower proposal=@{} vote_delay={} commit_vote=@{} total=@{} inbound_queue_max={} gossip_poll_us={}",
                 ms(self.proposal_received),
                 d(vote_delta),
                 ms(self.commit_vote_sent),
                 ms(self.commit_qc_formed),
+                self.inbound_queue_max,
+                self.gossip_poll_us,
             )
         }
     }
@@ -343,6 +383,17 @@ pub struct ConsensusEngine {
     /// Whether to send progress votes; set by a node running the stragglers'
     /// grace, off otherwise (a gov5 peer would only log the failed signature).
     pub(super) progress_votes: bool,
+    /// `N42_VOTE_AGGREGATE_VERIFY`: a leader verifies Round 1 and Round 2
+    /// votes in same-message batches at the orchestrator's drain boundary
+    /// (`queue_vote` / `flush_votes`) instead of one pairing per vote.
+    pub(super) vote_aggregate: bool,
+    /// Votes for the current view waiting for their batch (`vote_aggregate`).
+    pub(super) vote_queue: Vec<ConsensusMessage>,
+    /// Round 1 votes that arrived after their view's PrepareQC or after the
+    /// view passed, kept *unverified* for the voters ledger
+    /// (`vote_aggregate`); verified only when the straggler rule asks
+    /// (`settle_voters_seen`). Bounded per view and to the ledger's window.
+    pub(super) parked_votes: HashMap<ViewNumber, Vec<super::vote_batch::ParkedVote>>,
     /// Per-view timing for commit latency diagnosis.
     pub(super) view_timing: ViewTiming,
     /// Timing from the last committed view (preserved across advance_to_view).
@@ -444,6 +495,9 @@ impl ConsensusEngine {
             voters_seen: HashMap::new(),
             withheld_votes: VecDeque::new(),
             progress_votes: false,
+            vote_aggregate: false,
+            vote_queue: Vec::new(),
+            parked_votes: HashMap::new(),
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
             pending_tx_roots: BoundedFifoMap::new(64),
@@ -557,6 +611,9 @@ impl ConsensusEngine {
             voters_seen: HashMap::new(),
             withheld_votes: VecDeque::new(),
             progress_votes: false,
+            vote_aggregate: false,
+            vote_queue: Vec::new(),
+            parked_votes: HashMap::new(),
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
             pending_tx_roots: BoundedFifoMap::new(64),
@@ -867,6 +924,16 @@ impl ConsensusEngine {
         addr: alloy_primitives::Address,
     ) -> crate::error::ConsensusResult<()> {
         self.epoch_manager.propose_remove_validator(addr)
+    }
+
+    /// Adds one transport drain's numbers to this view's timing: the deepest
+    /// inbound queue seen and the swarm poll time (see `ViewTiming`).
+    pub fn note_transport(&mut self, inbound_queue_max: usize, gossip_poll_us: u64) {
+        let timing = &mut self.view_timing;
+        timing.inbound_queue_max = timing
+            .inbound_queue_max
+            .max(u32::try_from(inbound_queue_max).unwrap_or(u32::MAX));
+        timing.gossip_poll_us = timing.gossip_poll_us.saturating_add(gossip_poll_us);
     }
 
     /// Returns the timing from the last committed view.

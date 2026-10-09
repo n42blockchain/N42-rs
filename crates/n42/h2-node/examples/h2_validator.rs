@@ -75,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `N42_V_THP_DISABLE=1` does it for the validator alone, leaving the
     // execution layer's builder its huge pages (measured +15-20% on its
     // execution phase without them).
+    #[cfg(target_os = "linux")]
     if std::env::var("N42_THP_DISABLE").is_ok_and(|v| v == "1")
         || std::env::var("N42_V_THP_DISABLE").is_ok_and(|v| v == "1")
     {
@@ -174,11 +175,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut hotstuff_config: Option<n42_qmdb_reth::HotStuffGenesisConfig> = None;
     // The chain's `deferredExecutionTime`, when it has one.
     let mut deferred_execution_time: Option<u64> = None;
+    // The chain's `deferredExecutionDepth` (1 when absent).
+    let mut deferred_execution_depth: u64 = 1;
     let (identity, validators): (H2V4ChainIdentity, Vec<ValidatorInfo>) = match &chain_path {
         Some(path) => {
             use reth_cli::chainspec::ChainSpecParser as _;
             let spec = n42_qmdb_reth::N42ChainSpecParser::parse(path)?;
             deferred_execution_time = n42_qmdb_reth::deferred_execution_time(&spec.genesis);
+            // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md):
+            // refused when malformed or not run by this build, never read as 1.
+            deferred_execution_depth = n42_qmdb_reth::check_deferred_execution_depth(&spec.genesis)
+                .map_err(|err| format!("{path}: {err}"))?;
             let hotstuff = n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(&spec.genesis)?;
             base_timeout_ms.get_or_insert(hotstuff.base_timeout);
             max_timeout_ms.get_or_insert(hotstuff.max_timeout);
@@ -292,7 +299,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let transport = H2V4Transport::with_keypair(config, keypair)?;
+        // `N42_GOSSIP_OFF_LOOP=1`: the swarm runs on its own task of this
+        // runtime and hands the loop decoded events (see `n42_h2_net`'s
+        // `pump`). Same wire, same GossipSub parameters.
+        let transport = if std::env::var("N42_GOSSIP_OFF_LOOP").is_ok_and(|v| v == "1") {
+            println!("gossip       : swarm polled off the consensus loop");
+            H2V4Transport::with_keypair_off_loop(config, keypair)?
+        } else {
+            H2V4Transport::with_keypair(config, keypair)?
+        };
         println!("node peer id : {}", transport.local_peer_id());
         println!("chain        : id {} genesis {}", identity.chain_id, identity.genesis_hash);
         println!("validator    : index {index} of {validator_count} (f = {f})");
@@ -404,7 +419,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("UNSAFE        : voting before import (N42_VOTE_BEFORE_IMPORT=1) -- a measurement, not a node");
         }
 
-        let el = EngineApiClient::new(HttpTransport::new(el_url, jwt, Duration::from_secs(8))?);
+        let el = EngineApiClient::new(HttpTransport::new(el_url.clone(), jwt, Duration::from_secs(8))?);
         // The driver starts where the execution layer actually is. The
         // checkpoint's last committed block may be one this node committed on
         // the fleet's certificates while behind, without ever importing it; a
@@ -425,6 +440,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => identity.genesis_hash,
         };
         let mut driver = ExecutionDriver::new(el, start_head);
+        // The execution layer's persistence readings, polled beside the loop
+        // on a connection of their own: the unpersisted-block count for the
+        // leader's build throttle and the persisted block for the finalized
+        // tag. One poller serves both, and nothing is polled when neither is
+        // wanted.
+        let throttle_config =
+            if propose { n42_h2_node::build_throttle::ThrottleConfig::from_env() } else { None };
+        let split_tags = driver.settlement_tags() == n42_h2_execution::SettlementTags::Split;
+        let persistence_gauge = if split_tags || throttle_config.is_some() {
+            let poll = HttpTransport::new(el_url.clone(), jwt, Duration::from_secs(1))?;
+            Some(n42_h2_el_rpc::in_memory::spawn_poller(poll, Duration::from_millis(50)))
+        } else {
+            None
+        };
+        // Settlement tags (docs/PHASE_D_DEFERRED_EXECUTION.md section 17):
+        // safe = certified, finalized = certified and persisted here. A node
+        // starting on a fresh chain floors both at genesis; a restarted one
+        // leaves the tags its execution layer restored until a commit moves
+        // them.
+        if split_tags {
+            if let Some(gauge) = persistence_gauge.clone() {
+                driver.set_persisted_height(std::sync::Arc::new(move || gauge.persisted()));
+            }
+            if start_head == identity.genesis_hash {
+                driver.set_settlement_floor(identity.genesis_hash);
+            }
+            println!("settlement   : split (latest = committed, safe = certified, finalized = certified and persisted)");
+        } else {
+            println!("settlement   : legacy (latest = safe = finalized = committed)");
+        }
         // Bench only (see the engine flag below): with the vote sent before
         // the import, the import must not hold the loop either.
         if std::env::var("N42_VOTE_BEFORE_IMPORT").is_ok_and(|v| v == "1") {
@@ -435,7 +480,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // for, and imported beside the loop.
         if let Some(at) = deferred_execution_time {
             driver.set_deferred_execution_time(Some(at));
+            // At depth 2 a commit certifies the grandparent (safe = committed - 2).
+            driver.set_deferred_depth(deferred_execution_depth)?;
             println!("deferred     : execution deferred from timestamp {at}; a block is checked, voted for, then imported beside the loop");
+            println!("deferred     : depth {deferred_execution_depth} (a header carries the result of its ancestor {deferred_execution_depth} blocks back)");
         }
 
         let mut service = H2Service::new(transport, engine, driver, output_rx, validator_count);
@@ -498,6 +546,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // from the pacing rather than left at its production default.
             service = service.with_block_pacing(Duration::from_millis(period_ms));
             service = service.with_straggler_grace(Duration::from_millis(straggler_grace_ms));
+            // The leader's build throttle (`N42_BUILD_THROTTLE_SOFT` /
+            // `_HARD` / `_MAX_HOLD_MS`; off unless HARD is above 0): the
+            // execution layer's unpersisted-block count is polled on a
+            // connection of its own, and proposals are held back while it is
+            // deep. Nothing is polled when it is off.
+            if let (Some(config), Some(gauge)) = (throttle_config, persistence_gauge.clone()) {
+                let count: n42_h2_node::build_throttle::InMemoryCount = std::sync::Arc::new(move || gauge.get());
+                service = service.with_build_throttle(n42_h2_node::build_throttle::BuildThrottle::new(config, count));
+                println!(
+                    "build throttle: soft {} hard {} max hold {} ms (unpersisted blocks, polled every 50 ms)",
+                    config.soft,
+                    config.hard,
+                    config.max_hold.as_millis()
+                );
+            }
             service = service.with_direct_block_push(direct_push);
             // The plain TCP body channel, on every member's libp2p port plus
             // the offset; 0 leaves bodies to libp2p alone.

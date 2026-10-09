@@ -118,6 +118,8 @@ def main():
                 (body_full if size > BIG_BODY else body_small).append(ms)
 
     build, imported = [], []
+    # With a shared-execution fleet (F7_EL_MAP) only the first validator's node directory holds an el.log, so this
+    # loop is per execution layer and the v.log loop above is per validator; the phases are not paired by node.
     for path in sorted(glob.glob(f'{ROOT}/node*/el.log')):
         job = recv = job_gap = None
         for raw in open(path, errors='ignore'):

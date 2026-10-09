@@ -1,0 +1,28 @@
+== loop344Gold: 6 validators logged bodies; body arrival -> vote: n 175, median 2.8 ms, p90 284.8, max 358.0; bodies without a vote line 84
+   transport / timeout lines: 639 in 4 distinct shapes
+     x298 node0-v.log: 2026-10-07T15:18:46.928763Z  WARN n42::cl::timeout: view timed out view=1
+     x255 node1-v.log: 2026-10-07T15:18:46.927268Z  WARN n42.h2.node: view timed out view=1 leader=false proposed=false reason="not this node's view to lead"
+     x43 node0-v.log: 2026-10-07T15:18:46.928738Z  WARN n42.h2.node: view timed out view=1 leader=true proposed=true reason="proposed; the votes did not arrive"
+     x43 node0-v.log: 2026-10-07T15:18:47.567694Z  INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed, I am the new leader for view 2 view=1
+   layer log yamux/closed lines: 0
+== loop344Gnew: 6 validators logged bodies; body arrival -> vote: n 175, median 2.3 ms, p90 249.1, max 346.8; bodies without a vote line 84
+   transport / timeout lines: 635 in 4 distinct shapes
+     x296 node0-v.log: 2026-10-07T15:25:36.415679Z  WARN n42::cl::timeout: view timed out view=1
+     x253 node1-v.log: 2026-10-07T15:25:36.415458Z  WARN n42.h2.node: view timed out view=1 leader=false proposed=false reason="not this node's view to lead"
+     x43 node0-v.log: 2026-10-07T15:25:36.415651Z  WARN n42.h2.node: view timed out view=1 leader=true proposed=true reason="proposed; the votes did not arrive"
+     x43 node0-v.log: 2026-10-07T15:25:37.051062Z  INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed, I am the new leader for view 2 view=1
+   layer log yamux/closed lines: 0
+== loop344F2old: 7 validators logged bodies; body arrival -> vote: n 25698, median 3.0 ms, p90 44.5, max 118.1; bodies without a vote line 0
+   transport / timeout lines: 11 in 4 distinct shapes
+     x5 node0-v.log: 2026-10-07T14:56:46.149106Z  WARN n42::cl::timeout: view timed out view=1
+     x4 node1-v.log: 2026-10-07T14:56:46.148575Z  WARN n42.h2.node: view timed out view=1 leader=false proposed=false reason="not this node's view to lead"
+     x1 node0-v.log: 2026-10-07T14:56:46.149082Z  WARN n42.h2.node: view timed out view=1 leader=true proposed=true reason="proposed; the votes did not arrive"
+     x1 node0-v.log: 2026-10-07T14:56:46.790400Z  INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed, I am the new leader for view 2 view=1
+   layer log yamux/closed lines: 0
+== loop344F2new: 7 validators logged bodies; body arrival -> vote: n 25500, median 3.0 ms, p90 44.5, max 240.1; bodies without a vote line 0
+   transport / timeout lines: 11 in 4 distinct shapes
+     x5 node0-v.log: 2026-10-07T15:02:15.636405Z  WARN n42::cl::timeout: view timed out view=1
+     x4 node1-v.log: 2026-10-07T15:02:15.636273Z  WARN n42.h2.node: view timed out view=1 leader=false proposed=false reason="not this node's view to lead"
+     x1 node0-v.log: 2026-10-07T15:02:15.636374Z  WARN n42.h2.node: view timed out view=1 leader=true proposed=true reason="proposed; the votes did not arrive"
+     x1 node0-v.log: 2026-10-07T15:02:16.268863Z  INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed, I am the new leader for view 2 view=1
+   layer log yamux/closed lines: 0

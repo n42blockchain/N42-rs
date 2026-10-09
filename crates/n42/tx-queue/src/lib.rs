@@ -41,8 +41,10 @@
 //! [`global`].
 
 mod frames;
+mod snapshot;
 
 pub use frames::{FramePlan, FrameRef, FrameTxs, NewFrame, PlannedFrame, MAX_FRAMES};
+pub use snapshot::take_plan_snapshot_stats;
 
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
@@ -359,6 +361,134 @@ pub struct ForgetTimes {
     pub first_miss: usize,
 }
 
+/// Where [`TxQueue::prune_block`] spent its time, in microseconds, and how
+/// much it did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PruneTimes {
+    /// The own block held at the height settled (its own lock).
+    pub settle_us: u64,
+    /// The block's pairs folded to one nonce a sender, outside the lock.
+    pub fold_us: u64,
+    /// Waiting for the lanes' lock.
+    pub lock_us: u64,
+    /// Under it: the inbox drained, the lanes split, the frames swept, the
+    /// taken list split.
+    pub remove_us: u64,
+    /// The by-hash index, one write lock a shard.
+    pub forget_us: u64,
+    /// Handing what left the queue to the freeing thread (or freeing it
+    /// here when that thread is four blocks behind), with no lock held.
+    pub free_us: u64,
+    /// Senders in the block.
+    pub senders: usize,
+    /// Frames the sweep dropped.
+    pub frames_swept: usize,
+    /// References released by the free (a transaction is freed when its
+    /// last one goes).
+    pub freed: usize,
+}
+
+/// What a prune took out of the queue, held until every lock is released.
+struct PruneGarbage<T: PoolTransaction> {
+    lanes: Vec<BTreeMap<u64, Arc<ValidPoolTransaction<T>>>>,
+    taken: Vec<Arc<ValidPoolTransaction<T>>>,
+    frames: Vec<FrameTxs<T>>,
+    index: Vec<Arc<ValidPoolTransaction<T>>>,
+}
+
+impl<T: PoolTransaction> Default for PruneGarbage<T> {
+    fn default() -> Self {
+        Self { lanes: Vec::new(), taken: Vec::new(), frames: Vec::new(), index: Vec::new() }
+    }
+}
+
+/// Garbage on its way to the freeing thread, type-erased: one thread serves
+/// whatever transaction type the queue holds.
+type Freeable = Box<dyn Send>;
+
+/// The queue's freeing thread (`n42-queue-free`): what a prune took out of
+/// the queue is released there, off the prune and off every lock. A
+/// 200,000-transaction block is 600,000 references and 200,000
+/// transactions freed, 27-31 ms on one thread with the system allocator
+/// (`prune_tests::bench_prune_block`) -- most of the prune once nothing was
+/// freed under a lock. Freeing in parallel was worse (110-150 ms: frees of
+/// one allocator's objects from several threads contend). The channel holds
+/// four blocks; a prune that finds it full frees its own garbage, so a
+/// freeing thread that falls behind slows the prune down rather than letting
+/// memory grow. `None` if the thread could not be started.
+fn freeing_thread() -> Option<&'static std::sync::mpsc::SyncSender<Freeable>> {
+    static SENDER: OnceLock<Option<std::sync::mpsc::SyncSender<Freeable>>> = OnceLock::new();
+    SENDER
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Freeable>(4);
+            std::thread::Builder::new()
+                .name("n42-queue-free".to_owned())
+                .spawn(move || {
+                    while let Ok(garbage) = rx.recv() {
+                        drop(garbage);
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+impl<T: PoolTransaction + 'static> PruneGarbage<T> {
+    /// Releases everything on the freeing thread ([`freeing_thread`]), or
+    /// here when it is full or absent. The by-hash index's references go
+    /// last: they are usually the last ones, so that is where the
+    /// transactions themselves are freed.
+    fn free(self) {
+        if self.lanes.is_empty() && self.taken.is_empty() && self.frames.is_empty() && self.index.is_empty() {
+            return;
+        }
+        let Some(sender) = freeing_thread() else {
+            drop(self);
+            return;
+        };
+        match sender.try_send(Box::new(self)) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(garbage) | std::sync::mpsc::TrySendError::Disconnected(garbage)) => {
+                drop(garbage);
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.lanes.iter().map(BTreeMap::len).sum::<usize>()
+            + self.taken.len()
+            + self.frames.iter().map(|frame| frame.len()).sum::<usize>()
+            + self.index.len()
+    }
+}
+
+/// Each sender's highest nonce in `mined`. A block is runs of one sender's
+/// consecutive nonces (a frame is one sender's run on the bench), so the
+/// map is touched once a run, not once a transaction.
+fn fold_highest(mined: impl IntoIterator<Item = (Address, u64)>) -> AddressHashMap<u64> {
+    let mut highest: AddressHashMap<u64> = AddressHashMap::default();
+    let mut run: Option<(Address, u64)> = None;
+    let flush = |highest: &mut AddressHashMap<u64>, (sender, nonce): (Address, u64)| {
+        let entry = highest.entry(sender).or_insert(nonce);
+        *entry = (*entry).max(nonce);
+    };
+    for (sender, nonce) in mined {
+        match run.as_mut() {
+            Some((current, top)) if *current == sender => *top = (*top).max(nonce),
+            _ => {
+                if let Some(done) = run.replace((sender, nonce)) {
+                    flush(&mut highest, done);
+                }
+            }
+        }
+    }
+    if let Some(done) = run {
+        flush(&mut highest, done);
+    }
+    highest
+}
+
 /// How many transactions the queue let go of since the last report, by
 /// reason, with the first few named.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -405,6 +535,188 @@ struct GaveBack {
     filtered: usize,
 }
 
+/// The lanes' lock as [`TxQueue::lock_inner`] hands it out: the guard, when
+/// it was taken, how long the caller waited for it, and who the caller is.
+struct TimedInner<'a, T: PoolTransaction> {
+    guard: parking_lot::MutexGuard<'a, Inner<T>>,
+    at: std::time::Instant,
+    waited: std::time::Duration,
+    caller: &'static std::panic::Location<'static>,
+    /// The queue's depth mirror ([`TxQueue::gate_len`]), stored from the
+    /// lanes as the guard is released.
+    mirror: &'a std::sync::atomic::AtomicU64,
+}
+
+/// `len` and `parked_len` packed into one word for the depth mirror: the
+/// parked total in the high half, the queued total in the low half, each
+/// saturated at `u32::MAX` (a queue of four billion is not a state this
+/// node reaches; saturating keeps a wrong value from wrapping into the
+/// other half).
+const fn pack_depth(len: usize, parked: usize) -> u64 {
+    let len = if len > u32::MAX as usize { u32::MAX as u64 } else { len as u64 };
+    let parked = if parked > u32::MAX as usize { u32::MAX as u64 } else { parked as u64 };
+    (parked << 32) | len
+}
+
+/// The (len, parked) a packed mirror holds.
+const fn unpack_depth(packed: u64) -> (u64, u64) {
+    (packed & 0xffff_ffff, packed >> 32)
+}
+
+/// The lanes' lock and the inbox drain, measured for the 5 s report
+/// ([`take_lock_stats`]): how often the lock was held and for how long in
+/// all, its longest hold (and who held it) and its longest wait, and the
+/// drains' count, transactions and hold time. Process-wide: a node has one
+/// queue.
+struct LockCounters {
+    holds: std::sync::atomic::AtomicU64,
+    hold_ns: std::sync::atomic::AtomicU64,
+    hold_max_ns: std::sync::atomic::AtomicU64,
+    wait_max_ns: std::sync::atomic::AtomicU64,
+    wait_ns: std::sync::atomic::AtomicU64,
+    drains: std::sync::atomic::AtomicU64,
+    drain_txs: std::sync::atomic::AtomicU64,
+    drain_ns: std::sync::atomic::AtomicU64,
+    drain_max_ns: std::sync::atomic::AtomicU64,
+    drain_chunks: std::sync::atomic::AtomicU64,
+    drain_chunk_max_txs: std::sync::atomic::AtomicU64,
+    drain_finished: std::sync::atomic::AtomicU64,
+}
+
+static LOCK_COUNTERS: LockCounters = LockCounters {
+    holds: std::sync::atomic::AtomicU64::new(0),
+    hold_ns: std::sync::atomic::AtomicU64::new(0),
+    hold_max_ns: std::sync::atomic::AtomicU64::new(0),
+    wait_max_ns: std::sync::atomic::AtomicU64::new(0),
+    wait_ns: std::sync::atomic::AtomicU64::new(0),
+    drains: std::sync::atomic::AtomicU64::new(0),
+    drain_txs: std::sync::atomic::AtomicU64::new(0),
+    drain_ns: std::sync::atomic::AtomicU64::new(0),
+    drain_max_ns: std::sync::atomic::AtomicU64::new(0),
+    drain_chunks: std::sync::atomic::AtomicU64::new(0),
+    drain_chunk_max_txs: std::sync::atomic::AtomicU64::new(0),
+    drain_finished: std::sync::atomic::AtomicU64::new(0),
+};
+
+/// The caller that set the current longest hold, beside it.
+static HOLD_MAX_AT: Mutex<Option<&'static std::panic::Location<'static>>> = Mutex::new(None);
+
+/// What [`take_lock_stats`] reports: the lanes' lock and the inbox drain
+/// since the previous call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LockStats {
+    /// Times the lanes' lock was taken and released.
+    pub holds: u64,
+    /// Their holds' sum, nanoseconds: over the interval, the lock's duty.
+    pub hold_ns: u64,
+    /// The longest single hold, nanoseconds, and where it was taken.
+    pub hold_max_ns: u64,
+    /// `file:line` of the longest hold's caller, when one was recorded.
+    pub hold_max_at: Option<&'static std::panic::Location<'static>>,
+    /// The longest wait for the lock, nanoseconds, and the waits' sum.
+    pub wait_max_ns: u64,
+    /// Sum of every wait for the lock, nanoseconds.
+    pub wait_ns: u64,
+    /// Inbox drains that moved anything into the lanes, the transactions
+    /// they moved, their time under the lock in all and the longest one.
+    pub drains: u64,
+    /// Transactions those drains moved.
+    pub drain_txs: u64,
+    /// The drains' time under the lock, nanoseconds.
+    pub drain_ns: u64,
+    /// The longest drain, nanoseconds.
+    pub drain_max_ns: u64,
+    /// Holds of the lanes' lock a chunked drainer made
+    /// (`N42_TX_QUEUE_DRAIN_CHUNK`); each is also one of `drains`.
+    pub drain_chunks: u64,
+    /// The most transactions one of those holds moved.
+    pub drain_chunk_max_txs: u64,
+    /// Chunked remainders another lock holder finished before draining the
+    /// inbox (a build's start, a prune): those holds are not bounded.
+    pub drain_finished: u64,
+}
+
+/// The lanes' lock and drain counters since the last call, which resets
+/// them: the 5 s `ingest` line reports one interval each.
+pub fn take_lock_stats() -> LockStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = &LOCK_COUNTERS;
+    let hold_max_at = HOLD_MAX_AT.lock().take();
+    LockStats {
+        holds: c.holds.swap(0, Relaxed),
+        hold_ns: c.hold_ns.swap(0, Relaxed),
+        hold_max_ns: c.hold_max_ns.swap(0, Relaxed),
+        hold_max_at,
+        wait_max_ns: c.wait_max_ns.swap(0, Relaxed),
+        wait_ns: c.wait_ns.swap(0, Relaxed),
+        drains: c.drains.swap(0, Relaxed),
+        drain_txs: c.drain_txs.swap(0, Relaxed),
+        drain_ns: c.drain_ns.swap(0, Relaxed),
+        drain_max_ns: c.drain_max_ns.swap(0, Relaxed),
+        drain_chunks: c.drain_chunks.swap(0, Relaxed),
+        drain_chunk_max_txs: c.drain_chunk_max_txs.swap(0, Relaxed),
+        drain_finished: c.drain_finished.swap(0, Relaxed),
+    }
+}
+
+/// Raises `max` to `value` if it is larger; returns whether it did. A load
+/// first, so the common case (not a new maximum) writes nothing to a line
+/// every lock of the queue would otherwise share.
+fn raise_max(max: &std::sync::atomic::AtomicU64, value: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    value > max.load(Relaxed) && max.fetch_max(value, Relaxed) < value
+}
+
+/// A hold or a wait of the queue's lock this long is said.
+const SLOW_LOCK: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl<T: PoolTransaction> std::ops::Deref for TimedInner<'_, T> {
+    type Target = Inner<T>;
+    fn deref(&self) -> &Inner<T> {
+        &self.guard
+    }
+}
+
+impl<T: PoolTransaction> std::ops::DerefMut for TimedInner<'_, T> {
+    fn deref_mut(&mut self) -> &mut Inner<T> {
+        &mut self.guard
+    }
+}
+
+impl<T: PoolTransaction> Drop for TimedInner<'_, T> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        // Still under the lock: mirror stores are ordered by it, so the
+        // mirror only ever holds a depth the lanes really had at a release.
+        // A chunked drain's remainder is queued as far as the gate is
+        // concerned: it left `staged` and is on its way into the lanes.
+        let queued = self.guard.len + self.guard.pending_drain.len();
+        self.mirror.store(pack_depth(queued, self.guard.parked_len), Release);
+        let held = self.at.elapsed();
+        let held_ns = held.as_nanos() as u64;
+        let waited_ns = self.waited.as_nanos() as u64;
+        let c = &LOCK_COUNTERS;
+        c.holds.fetch_add(1, Relaxed);
+        c.hold_ns.fetch_add(held_ns, Relaxed);
+        if waited_ns > 0 {
+            c.wait_ns.fetch_add(waited_ns, Relaxed);
+            raise_max(&c.wait_max_ns, waited_ns);
+        }
+        if raise_max(&c.hold_max_ns, held_ns) {
+            *HOLD_MAX_AT.lock() = Some(self.caller);
+        }
+        if held >= SLOW_LOCK || self.waited >= SLOW_LOCK {
+            tracing::warn!(
+                target: "n42.tx_queue",
+                held_ms = held.as_millis() as u64,
+                waited_ms = self.waited.as_millis() as u64,
+                caller = %self.caller,
+                "the queue's lock was held or waited for a second or more"
+            );
+        }
+    }
+}
+
 struct Inner<T: PoolTransaction> {
     // Keyed by address with alloy's fixed-bytes hasher: the builder looks a
     // lane up per transaction, and std's SipHash was 3% of its thread.
@@ -426,6 +738,14 @@ struct Inner<T: PoolTransaction> {
     /// many of its transactions from its start). Applied by
     /// [`Inner::settle`] at the next lock ([`TxQueue::lock_inner`]).
     pending: Vec<(B256, usize)>,
+    /// A batched off-lock settle's runs not yet out of their lanes
+    /// ([`TxQueue::settle_offlock`]): (sender, first nonce, end), each one
+    /// sender's whole noted run, so a lane is either settled or untouched.
+    /// Their transactions are already in the build's taken list (in plan
+    /// order) and out of `len`. Applied by [`Inner::settle`] like `pending`,
+    /// so every hold but the drainer's and the settle's own batches finishes
+    /// them first.
+    settling: Vec<(Address, u64, u64)>,
     /// Holes a build ran into: (sender, the account's next nonce, the lowest
     /// queued nonce above it). The feed fills them from the pool.
     gaps: Vec<(Address, u64, u64)>,
@@ -493,6 +813,319 @@ struct Inner<T: PoolTransaction> {
     /// The frames the ingest admitted whole ([`frames`]). Kept whether or
     /// not the chain builds frame blocks; nothing reads it unless asked.
     frames: frames::FrameIndex<T>,
+    /// A chunked drain's remainder (`N42_TX_QUEUE_DRAIN_CHUNK`, see
+    /// [`TxQueue::drain_now`]): transactions taken out of the inbox and not
+    /// yet in their lanes, in inbox order. Counted in the depth mirror. Any
+    /// other drain finishes it first, so the inbox's order is the lanes'
+    /// order whoever drains.
+    pending_drain: VecDeque<Arc<ValidPoolTransaction<T>>>,
+    /// The frames noted with that remainder, each with the count of
+    /// remainder transactions ever queued ([`Inner::pending_in`]) once its
+    /// own were in the remainder: indexed when [`Inner::pending_out`]
+    /// reaches that mark, i.e. once its last transaction is in its lane (a
+    /// frame is never indexed before its transactions are queued, as in
+    /// the one-hold drain). Marks never decrease, front to back.
+    pending_frames: VecDeque<(u64, NewFrame, Option<FrameTxs<T>>)>,
+    /// Transactions ever put in `pending_drain`, and ever moved out of it
+    /// into the lanes: the frame marks above count on these.
+    pending_in: u64,
+    pending_out: u64,
+    /// The last walk of the lanes [`TxQueue::usable`] made
+    /// (`N42_QUEUE_OFFLOCK`): reused while [`Inner::lanes_gen`] has not
+    /// moved, with what the quiet holds inserted since added.
+    usable_cache: Option<UsableWalk>,
+    /// The child's frame plan, prepared while the build it follows is still
+    /// executing (`N42_PLAN_AHEAD`, [`Prepared`]).
+    prepared: Option<Prepared<T>>,
+    /// The last hand-off that forgot a build's whole take as mined by an own
+    /// block, and that block's hash ([`TxQueue::hold_own_block`]): what a
+    /// prepared plan is accepted against.
+    handed: Option<Handed>,
+    /// Raised by every hold of the lanes' lock that may take, remove,
+    /// re-insert or park a lane's entries: every [`TxQueue::lock_inner`]
+    /// and a [`Inner::settle`] that applied anything. Not raised by the
+    /// holds that only drain the inbox (arrivals are inserted, never
+    /// replace an entry) or read and touch nothing of the lanes
+    /// ([`TxQueue::lock_inner_quiet`]). An off-lock preparation
+    /// (`N42_QUEUE_OFFLOCK`) applies its plan only if this has not moved
+    /// since the hold it planned under.
+    lanes_gen: u64,
+    /// The highest nonce per sender of a canonical block an off-lock prune
+    /// is splitting the lanes for, while it runs: a prepared plan holding
+    /// any of them is refused at once ([`Inner::prepared_verdict`]), not
+    /// after the prune's last batch.
+    pruning: Option<Arc<AddressHashMap<u64>>>,
+}
+
+/// A whole take handed off to an own block: the build counter of the build
+/// that took it, and the block's sealed hash once
+/// [`TxQueue::hold_own_block`] names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Handed {
+    build: u64,
+    block: Option<B256>,
+}
+
+/// The next build's frame plan, made right after the plan of the build it
+/// follows (`N42_PLAN_AHEAD=1`, `docs/SHARED_EXECUTION_SCOPE.md` 12).
+///
+/// Made exactly as [`TxQueue::frames_for_build`] makes a plan, on the lanes
+/// as they stand once the current build's take has left them: its frames
+/// leave the lanes into `taken` (not the current build's taken list), so no
+/// other build can take them, and the depth counts them as taken. Used by
+/// the next frame build only when nothing that could make it differ from a
+/// plan the fresh path could have made on that state has happened since
+/// ([`Inner::prepared_verdict`]); otherwise given back, minus what the chain
+/// has mined, before that build plans afresh.
+struct Prepared<T: PoolTransaction> {
+    /// `Inner::builds` when it was made: the build it follows.
+    after: u64,
+    /// The gas its frames take.
+    gas_used: u64,
+    /// Whether its last frame was cut to the gas (no top-up may follow a cut
+    /// frame: the body would not be a run of frames).
+    cut: bool,
+    segments: Vec<(FrameTxs<T>, usize)>,
+    plan: FramePlan,
+    /// The lanes' `Arc`s it took, in plan order.
+    taken: Vec<Arc<ValidPoolTransaction<T>>>,
+    /// Per sender, the lowest nonce it took: nothing at or below the lane's
+    /// mined watermark, and nothing below it in the lane, may exist when it
+    /// is used.
+    lowest: AddressHashMap<u64>,
+    made_at: std::time::Instant,
+    /// Its preparation, lock wait included.
+    prep_us: u64,
+    /// The body the plan-ahead hook makes from it (`N42_PLAN_AHEAD_BODY`),
+    /// `None` without a hook.
+    body: Option<Arc<Mutex<BodySlot>>>,
+}
+
+/// A frame build's noted takes as its selection left them
+/// ([`TxQueue::settle_offlock`]): the build, how many frames, the first and
+/// last frame ids.
+#[derive(Clone, Copy, Debug)]
+struct SettleMark {
+    build: u64,
+    count: usize,
+    first: B256,
+    last: B256,
+}
+
+/// The first hold of an off-lock preparation (`N42_QUEUE_OFFLOCK`,
+/// [`TxQueue::offlock_plan`]): a plan stored there already, or one whose
+/// takes are noted and still in the lanes, for [`TxQueue::offlock_commit`].
+enum OffPlanned<T: PoolTransaction> {
+    Done(bool),
+    Planned(OffPlan<T>),
+}
+
+/// A plan made under the first hold of an off-lock preparation, its takes
+/// not yet out of the lanes, and what its commit checks against.
+struct OffPlan<T: PoolTransaction> {
+    segments: Vec<(FrameTxs<T>, usize)>,
+    plan: FramePlan,
+    gas_left: u64,
+    gas_limit: u64,
+    /// Transactions the plan takes.
+    count: usize,
+    /// [`Inner::lanes_gen`] and [`Inner::builds`] when it was made.
+    lanes_gen: u64,
+    after: u64,
+    at: std::time::Instant,
+    hook: Option<PlanAheadHook<T>>,
+}
+
+/// What the builder made of a prepared plan's transactions while the parent
+/// executed (`N42_PLAN_AHEAD_BODY=1`, `docs/SHARED_EXECUTION_SCOPE.md` 16.4
+/// item 2): opaque to the queue, made by the hook the builder installed
+/// ([`TxQueue::set_plan_ahead_hook`]) and handed back with the plan it was
+/// made from ([`QueueBest::take_prepared_body`]). It lives in the
+/// [`Prepared`] plan, so every discard of the plan drops it too.
+pub type PreparedBody = Box<dyn Any + Send + Sync>;
+
+/// The hook that makes a [`PreparedBody`] from a prepared plan's segments
+/// (each frame's transactions and how many the plan takes from its start,
+/// in plan order). Run on the thread that prepared the plan, after the
+/// lanes' lock is released; `None` makes no body.
+pub type PlanAheadHook<T> = Arc<dyn Fn(&[(FrameTxs<T>, usize)]) -> Option<PreparedBody> + Send + Sync>;
+
+/// A prepared plan's segments and its body's slot, for the hook to fill
+/// after the lanes' lock is released.
+type BodyJob<T> = (Vec<(FrameTxs<T>, usize)>, Arc<Mutex<BodySlot>>);
+
+/// A prepared plan's body, filled by the hook once it ran.
+#[derive(Default)]
+struct BodySlot {
+    body: Option<PreparedBody>,
+    /// The hook's own time.
+    made_us: u64,
+}
+
+/// What a build found of its plan's prepared body
+/// ([`QueueBest::take_prepared_body`]).
+pub enum PreparedBodyTake {
+    /// The build did not stand on a prepared plan, the plan was topped up,
+    /// or no hook was installed.
+    None,
+    /// The hook had not finished when the build asked: the build makes its
+    /// body itself.
+    Late,
+    /// The body made with the plan, and the hook's time.
+    Ready(PreparedBody, u64),
+}
+
+impl std::fmt::Debug for PreparedBodyTake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Late => f.write_str("Late"),
+            Self::Ready(_, made_us) => f.debug_tuple("Ready").field(made_us).finish(),
+        }
+    }
+}
+
+/// Why a prepared plan was not used ([`FrameSelectTimes::ahead_discard`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AheadDiscard {
+    /// Another build began after it was made.
+    OtherBuild,
+    /// The build it follows was not handed off whole to the block the new
+    /// build stands on (refused, abandoned, another block at the height).
+    NotOnItsParent,
+    /// The previous build's take is still (partly) out: its block did not
+    /// carry all of it.
+    TakeLeft,
+    /// The new build's gas limit is below what the plan takes.
+    Gas,
+    /// The chain mined a nonce the plan holds (a prune).
+    Mined,
+    /// A lane holds a nonce below the plan's (a give-back, an untake, a late
+    /// arrival filling a hole).
+    Below,
+    /// A build that does not take frames (`best_for_build`).
+    NotFrames,
+}
+
+impl AheadDiscard {
+    /// The name it is logged under.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::OtherBuild => "other_build",
+            Self::NotOnItsParent => "not_on_its_parent",
+            Self::TakeLeft => "take_left",
+            Self::Gas => "gas",
+            Self::Mined => "mined",
+            Self::Below => "below",
+            Self::NotFrames => "not_frames",
+        }
+    }
+}
+
+/// The gas of the cheapest transaction: a prepared plan with less room
+/// than this left is full, and no top-up is tried.
+const MIN_FRAME_TX_GAS: u64 = 21_000;
+
+/// Prepared plans discarded, by [`AheadDiscard`] reason, since the last
+/// [`take_ahead_discards`].
+static AHEAD_DISCARDS: [std::sync::atomic::AtomicU64; 7] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+const AHEAD_REASONS: [AheadDiscard; 7] = [
+    AheadDiscard::OtherBuild,
+    AheadDiscard::NotOnItsParent,
+    AheadDiscard::TakeLeft,
+    AheadDiscard::Gas,
+    AheadDiscard::Mined,
+    AheadDiscard::Below,
+    AheadDiscard::NotFrames,
+];
+
+fn note_ahead_discard(reason: AheadDiscard) {
+    if let Some(at) = AHEAD_REASONS.iter().position(|r| *r == reason) {
+        AHEAD_DISCARDS[at].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Prepared plans discarded since the last call, by reason (name, count),
+/// the zero ones left out; the call resets them.
+pub fn take_ahead_discards() -> Vec<(&'static str, u64)> {
+    AHEAD_REASONS
+        .iter()
+        .zip(&AHEAD_DISCARDS)
+        .filter_map(|(reason, count)| {
+            let n = count.swap(0, std::sync::atomic::Ordering::Relaxed);
+            (n > 0).then_some((reason.name(), n))
+        })
+        .collect()
+}
+
+/// `N42_PLAN_AHEAD`, read once: a frame build prepares its child's plan
+/// right after its own ([`Prepared`]). Off by default.
+pub fn plan_ahead() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_PLAN_AHEAD").is_ok_and(|v| v == "1"))
+}
+
+/// `N42_QUEUE_OFFLOCK`, read once (default off): the queue's heavy steps
+/// run off the lanes' lock or in short bounded holds instead of one long
+/// one -- the plan-ahead preparation plans under one hold, groups its takes
+/// per sender outside it and applies them under a second hold that checks
+/// nothing moved the lanes in between ([`Inner::lanes_gen`], retried once, then
+/// the one-hold path); the canonical prune splits the lanes, sweeps the
+/// frame index and splits the taken list in batches with the lock released
+/// between them; the hand-off's `forget_mined_*` compares and partitions
+/// the taken list with the lock released. At 45 ms pacing the one-hold
+/// steps kept the lock 94% busy and the builder's start waiting behind
+/// holds of 50-110 ms (`docs/BREAKTHROUGH_DESIGN.md` 10.99). Results are
+/// the one-hold path's. A test sets it per queue ([`TxQueue::with_offlock`]).
+fn queue_offlock() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_QUEUE_OFFLOCK").is_ok_and(|v| v == "1"))
+}
+
+/// Senders whose lanes one hold of an off-lock prune splits
+/// (`N42_QUEUE_OFFLOCK`).
+const OFFLOCK_PRUNE_SENDERS: usize = 256;
+
+/// Senders whose noted runs one hold of an off-lock settle splits out of
+/// their lanes (`N42_QUEUE_OFFLOCK`, [`TxQueue::settle_offlock`]): a
+/// 200,000-transfer build applied in one hold took 13 ms in the debug
+/// bench, the longest hold left on the block path.
+const OFFLOCK_SETTLE_SENDERS: usize = 8192;
+
+/// Frames one hold of an off-lock prune's sweep checks against the lanes
+/// (`N42_QUEUE_OFFLOCK`): a frame of the flood's shape is ~500 runs, so
+/// this is ~16,000 lane look-ups a hold.
+const OFFLOCK_SWEEP_FRAMES: usize = 32;
+
+/// Off-lock plan-ahead preparations whose commit found the lanes moved
+/// (and retried), and those that then fell back to the one-hold path,
+/// since the last [`take_offlock_stats`].
+static OFFLOCK_RACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OFFLOCK_FALLBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(raced, fell_back)` of the off-lock preparation since the last call,
+/// which resets them.
+pub fn take_offlock_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (OFFLOCK_RACED.swap(0, Relaxed), OFFLOCK_FALLBACK.swap(0, Relaxed))
+}
+
+/// `N42_TX_QUEUE_DRAIN_CHUNK=<n>`, read once: the drainer
+/// ([`TxQueue::drain_now`]) holds the lanes' lock for at most `n`
+/// transactions at a time. 0 (the default) drains the whole inbox in one
+/// hold, as before.
+fn drain_chunk() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("N42_TX_QUEUE_DRAIN_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
 /// How many consecutive nonces a build takes from one sender before moving
@@ -703,14 +1336,60 @@ impl<T: PoolTransaction> HashIndex<T> {
         }
     }
 
-    fn remove(&self, hash: &B256) {
-        let mut shard = self.shard_of(hash).write();
-        if shard.by_hash.remove(hash).is_some() {
-            // The order list is walked only when the bound bites, and a hash
-            // that is no longer in the map is skipped there, so a removal
-            // costs one map operation rather than a scan.
-            shard.removed = shard.removed.saturating_add(1);
+    /// Removes every one of `hashes` the index holds and hands their `Arc`s
+    /// back, to be freed by the caller with no shard locked.
+    ///
+    /// Grouped by shard first, then one write lock a shard -- not one a
+    /// hash, 200,000 lock takes a block -- with the shards visited on the
+    /// queue's small pool when the batch is large. Removing a hash the
+    /// index does not hold is a no-op. The order list is walked only when
+    /// the bound bites, and a hash no longer in the map is skipped there,
+    /// so a removal costs one map operation rather than a scan.
+    fn remove_all(&self, hashes: &[B256]) -> Vec<Arc<ValidPoolTransaction<T>>> {
+        /// Below this a batch is removed in place, hash by hash.
+        const BY_SHARD_FROM: usize = 1_024;
+        if hashes.len() < BY_SHARD_FROM {
+            let mut out = Vec::with_capacity(hashes.len());
+            for hash in hashes {
+                let mut shard = self.shard_of(hash).write();
+                if let Some(held) = shard.by_hash.remove(hash) {
+                    shard.removed = shard.removed.saturating_add(1);
+                    out.push(held);
+                }
+            }
+            return out;
         }
+        let mut buckets: Vec<Vec<B256>> =
+            (0..HASH_INDEX_SHARDS).map(|_| Vec::with_capacity(hashes.len() / HASH_INDEX_SHARDS + 16)).collect();
+        for hash in hashes {
+            buckets[usize::from(hash.0[0]) % HASH_INDEX_SHARDS].push(*hash);
+        }
+        let one_shard = |(at, bucket): (usize, &Vec<B256>)| {
+            let mut out = Vec::with_capacity(bucket.len());
+            if bucket.is_empty() {
+                return out;
+            }
+            let mut shard = self.shards[at].write();
+            for hash in bucket {
+                if let Some(held) = shard.by_hash.remove(hash) {
+                    out.push(held);
+                }
+            }
+            shard.removed = shard.removed.saturating_add(out.len());
+            out
+        };
+        let parts: Vec<Vec<Arc<ValidPoolTransaction<T>>>> = match forget_pool() {
+            Some(pool) => {
+                use rayon::prelude::*;
+                pool.install(|| buckets.par_iter().enumerate().map(one_shard).collect())
+            }
+            None => buckets.iter().enumerate().map(one_shard).collect(),
+        };
+        let mut out = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+        for part in parts {
+            out.extend(part);
+        }
+        out
     }
 
     fn get(&self, hash: &B256) -> Option<Arc<ValidPoolTransaction<T>>> {
@@ -760,7 +1439,70 @@ pub struct TxQueue<T: PoolTransaction> {
     /// reads it right after its selection, while the selection's takes may
     /// still be leaving the lanes ([`Inner::settle`]).
     pruned_mirror: Arc<std::sync::atomic::AtomicU64>,
+    /// The lanes' `len` and `parked_len` as of the last release of their
+    /// lock ([`pack_depth`]), and raised by a drain before it subtracts what
+    /// it takes from `staged`: what [`Self::gate_len`] reads instead of
+    /// taking the lock.
+    depth: Arc<std::sync::atomic::AtomicU64>,
+    /// A chunked drain's batch between the inbox and `Inner::pending_drain`
+    /// (taken out of `staged`, not yet under the lanes' lock): counted by
+    /// [`Self::gate_len`], so the batch is never in none of the readings.
+    in_hand: Arc<std::sync::atomic::AtomicUsize>,
+    /// `N42_TX_QUEUE_DRAIN_CHUNK` unless a test said otherwise.
+    drain_chunk: Arc<std::sync::atomic::AtomicUsize>,
+    /// The builder's plan-ahead hook ([`Self::set_plan_ahead_hook`]).
+    ahead_hook: Arc<Mutex<Option<PlanAheadHook<T>>>>,
+    /// `N42_QUEUE_OFFLOCK` unless a test said otherwise ([`queue_offlock`]).
+    offlock: Arc<std::sync::atomic::AtomicBool>,
+    /// `N42_QUEUE_PLAN_SNAPSHOT` unless a test said otherwise
+    /// ([`snapshot::queue_plan_snapshot`]).
+    plan_snapshot: Arc<std::sync::atomic::AtomicBool>,
+    /// The dedicated drainer's state and wake-up ([`TxQueue::run_drainer`]).
+    drainer: Arc<DrainerSignal>,
 }
+
+/// The dedicated drainer's state ([`TxQueue::run_drainer`]): whether one
+/// runs (then the block path's holds drain only a bounded slice of the
+/// inbox, [`TxQueue::drain_inbox_block`]), and the flag and condition it
+/// sleeps on between ticks, raised by a push that takes the inbox past
+/// [`DRAINER_WAKE`].
+#[derive(Debug, Default)]
+struct DrainerSignal {
+    running: std::sync::atomic::AtomicBool,
+    woken: Mutex<bool>,
+    wake: parking_lot::Condvar,
+}
+
+/// The last walk of the lanes [`TxQueue::usable`] made: at which
+/// [`Inner::lanes_gen`], what it counted, and `len` and `parked_len` then.
+#[derive(Debug, Clone, Copy)]
+struct UsableWalk {
+    lanes_gen: u64,
+    usable: usize,
+    len: usize,
+    parked_len: usize,
+}
+
+/// Transactions one hold on the block path moves from the inbox into the
+/// lanes when a dedicated drainer runs (`N42_QUEUE_OFFLOCK`,
+/// [`TxQueue::drain_inbox_block`]). At ~80 ns an insert in release this is
+/// ~0.2 ms; loop351 X8 measured whole-inbox drains of 23,000 transactions
+/// mean and 28.5 ms at worst inside the plan's, the snapshot's and
+/// `usable()`'s holds.
+const BLOCK_DRAIN_SLICE: usize = 2048;
+
+/// Transactions the dedicated drainer moves per hold, the lock released
+/// (and the thread yielding) between holds, when `N42_TX_QUEUE_DRAIN_CHUNK`
+/// does not say otherwise.
+const DRAINER_SLICE: usize = 8192;
+
+/// Inbox depth at which a push wakes the dedicated drainer before its tick.
+const DRAINER_WAKE: usize = 8192;
+
+/// Holds one call of the dedicated drainer makes at most, so a flood it
+/// cannot outrun still returns to its tick (and to the gate's readings)
+/// rather than looping in one call for ever.
+const DRAINER_MAX_HOLDS: usize = 256;
 
 /// Frames noted since the last drain, each with its transactions when the
 /// ingest handed them over ([`TxQueue::push_frame`]).
@@ -776,6 +1518,13 @@ impl<T: PoolTransaction> Clone for TxQueue<T> {
             frame_inbox: Arc::clone(&self.frame_inbox),
             pruned_mirror: Arc::clone(&self.pruned_mirror),
             frames_staged: Arc::clone(&self.frames_staged),
+            depth: Arc::clone(&self.depth),
+            in_hand: Arc::clone(&self.in_hand),
+            drain_chunk: Arc::clone(&self.drain_chunk),
+            ahead_hook: Arc::clone(&self.ahead_hook),
+            offlock: Arc::clone(&self.offlock),
+            plan_snapshot: Arc::clone(&self.plan_snapshot),
+            drainer: Arc::clone(&self.drainer),
         }
     }
 }
@@ -909,6 +1658,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 len: 0,
                 last_build: None,
                 pending: Vec::new(),
+                settling: Vec::new(),
                 gaps: Vec::new(),
                 held: VecDeque::new(),
                 parked_order: VecDeque::new(),
@@ -921,6 +1671,15 @@ impl<T: PoolTransaction> TxQueue<T> {
                 run: run.max(1),
                 builds: 0,
                 frames: frames::FrameIndex::default(),
+                pending_drain: VecDeque::new(),
+                pending_frames: VecDeque::new(),
+                pending_in: 0,
+                pending_out: 0,
+                usable_cache: None,
+                prepared: None,
+                handed: None,
+                lanes_gen: 0,
+                pruning: None,
             })),
             inbox: Arc::new(Mutex::new(Vec::new())),
             staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -928,51 +1687,177 @@ impl<T: PoolTransaction> TxQueue<T> {
             frame_inbox: Arc::new(Mutex::new(Vec::new())),
             frames_staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pruned_mirror: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            depth: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            in_hand: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            drain_chunk: Arc::new(std::sync::atomic::AtomicUsize::new(drain_chunk())),
+            ahead_hook: Arc::new(Mutex::new(None)),
+            offlock: Arc::new(std::sync::atomic::AtomicBool::new(queue_offlock())),
+            plan_snapshot: Arc::new(std::sync::atomic::AtomicBool::new(snapshot::queue_plan_snapshot())),
+            drainer: Arc::new(DrainerSignal::default()),
         }
+    }
+
+    /// The same queue draining at most `chunk` transactions per hold of the
+    /// lanes' lock in [`Self::drain_now`]; 0 is one hold. What a test uses to
+    /// choose the path without the process environment deciding for it.
+    #[must_use]
+    pub fn with_drain_chunk(self, chunk: usize) -> Self {
+        self.drain_chunk.store(chunk, std::sync::atomic::Ordering::Relaxed);
+        self
     }
 
     /// The lanes' lock, with a frame build's noted takes applied first
     /// ([`Inner::settle`]): every lock of the queue goes through here, so
     /// no caller ever sees the lanes before them.
-    fn lock_inner(&self) -> parking_lot::MutexGuard<'_, Inner<T>> {
-        let mut inner = self.inner.lock();
-        inner.settle();
+    ///
+    /// Timed ([`TimedInner`]): a hold or a wait of a second or more is said
+    /// once, naming the caller, so a multi-second stall of everything that
+    /// touches the queue (loop320 FAS, loop322 CTRL: the new leader's queue
+    /// prune 5 s, the own block's hand-off and every finish behind it) names
+    /// its holder.
+    #[track_caller]
+    fn lock_inner(&self) -> TimedInner<'_, T> {
+        let mut inner = self.lock_inner_quiet();
+        inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
         inner
+    }
+
+    /// [`Self::lock_inner`] without raising [`Inner::lanes_gen`]: for the holds
+    /// that only drain the inbox, or read, or touch nothing of the lanes
+    /// (the drainer, the hand-off's whole take, the own-block hold, the
+    /// depth readings), so an off-lock preparation is not refused for them.
+    /// A hold that takes, removes, re-inserts or parks lane entries raises
+    /// it itself. Measured by the lock sampler like any other hold.
+    #[track_caller]
+    fn lock_inner_quiet(&self) -> TimedInner<'_, T> {
+        let caller = std::panic::Location::caller();
+        let asked = std::time::Instant::now();
+        let mut inner = self.inner.lock();
+        let at = std::time::Instant::now();
+        inner.settle();
+        TimedInner { guard: inner, at, waited: at.saturating_duration_since(asked), caller, mirror: &self.depth }
+    }
+
+    /// The lanes' lock for the drainer: with `N42_QUEUE_OFFLOCK`, without
+    /// applying a frame build's noted takes first, so the drainer never
+    /// pays for a selection's settle and [`Self::settle_offlock`] can apply
+    /// them in its own short hold. Arrivals do not need them applied: an
+    /// arrival at a noted (sender, nonce) is a duplicate either way, one
+    /// below is inserted below, and `len` already left them out. Without
+    /// the switch this is [`Self::lock_inner_quiet`].
+    #[track_caller]
+    fn lock_inner_unsettled(&self) -> TimedInner<'_, T> {
+        if !self.offlock() {
+            return self.lock_inner_quiet();
+        }
+        let caller = std::panic::Location::caller();
+        let asked = std::time::Instant::now();
+        let inner = self.inner.lock();
+        let at = std::time::Instant::now();
+        TimedInner { guard: inner, at, waited: at.saturating_duration_since(asked), caller, mirror: &self.depth }
+    }
+
+    /// Whether this queue runs its heavy steps off the lanes' lock
+    /// ([`queue_offlock`]).
+    fn offlock(&self) -> bool {
+        self.offlock.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The same queue with `N42_QUEUE_OFFLOCK` set to `on` whatever the
+    /// environment says. What a test uses to choose the path.
+    #[must_use]
+    pub fn with_offlock(self, on: bool) -> Self {
+        self.offlock.store(on, std::sync::atomic::Ordering::Relaxed);
+        self
     }
 
     /// Moves what was pushed since the last drain into the lanes. Called
     /// with the lanes' lock held; a no-op when nothing was pushed.
     fn drain_inbox(&self, inner: &mut Inner<T>) {
+        self.drain_inbox_upto(inner, usize::MAX);
+    }
+
+    /// The block path's drain: the whole inbox, unless a dedicated drainer
+    /// runs under `N42_QUEUE_OFFLOCK` ([`Self::run_drainer`]) -- then at most
+    /// [`BLOCK_DRAIN_SLICE`] transactions, the rest left in order for the
+    /// drainer. An arrival left in the inbox is one that arrived a moment
+    /// later, which any arrival may: the lanes are always a prefix of the
+    /// arrivals in inbox order, whoever drained.
+    fn drain_inbox_block(&self, inner: &mut Inner<T>) {
+        let bound = if self.bounded_drains() { BLOCK_DRAIN_SLICE } else { usize::MAX };
+        self.drain_inbox_upto(inner, bound);
+    }
+
+    /// Whether the block path's holds drain a bounded slice
+    /// ([`Self::drain_inbox_block`]): `N42_QUEUE_OFFLOCK` and a dedicated
+    /// drainer running. Without the drainer nothing else would move the
+    /// rest, so every hold drains it all as before.
+    fn bounded_drains(&self) -> bool {
+        self.offlock() && self.drainer.running.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Moves at most `budget` transactions of what was pushed into the
+    /// lanes, oldest first: a chunked drain's remainder before the inbox,
+    /// the inbox (and the frames noted with it) appended to that remainder
+    /// first, so what this hold leaves is the next drain's start whoever
+    /// makes it. A frame is indexed in the hold that moves its last
+    /// transaction. Called with the lanes' lock held; returns how many it
+    /// moved.
+    fn drain_inbox_upto(&self, inner: &mut Inner<T>, budget: usize) -> usize {
         use std::sync::atomic::Ordering;
-        if self.frames_staged.load(Ordering::Acquire) != 0 {
+        let had_pending = !inner.pending_drain.is_empty() || !inner.pending_frames.is_empty();
+        // Frames before the inbox: a frame is noted after its transactions
+        // were pushed, so every transaction of a frame taken here is in the
+        // inbox taken after it, or drained before.
+        let frames = if self.frames_staged.load(Ordering::Acquire) != 0 {
             let mut noted = self.frame_inbox.lock();
             let frames = std::mem::take(&mut *noted);
             self.frames_staged.fetch_sub(frames.len(), Ordering::AcqRel);
-            drop(noted);
-            for (frame, txs) in frames {
-                inner.frames.insert(frame, txs);
-            }
+            frames
+        } else {
+            Vec::new()
+        };
+        let staged = if self.staged.load(Ordering::Acquire) != 0 {
+            // Taken and counted down under the inbox's lock, as a push adds
+            // under it: a drain that took a batch a push had already put in
+            // the inbox but not yet counted subtracted more than the counter
+            // held, and `staged` -- which the ingest gate reads through
+            // `len` -- wrapped to about 2^64 until the push's own increment
+            // landed.
+            let mut inbox = self.inbox.lock();
+            let staged = std::mem::take(&mut *inbox);
+            // The depth mirror counts the batch before `staged` lets go of
+            // it, so a gate reading the two without the lanes' lock never
+            // sees the batch in neither (an undercount that would open the
+            // gate for the drain's length). Between the two it is counted
+            // twice -- the safe side -- and the release of this lock stores
+            // the exact value again (the remainder counted with the lanes).
+            self.depth.fetch_add(staged.len() as u64, Ordering::AcqRel);
+            self.staged.fetch_sub(staged.len(), Ordering::AcqRel);
+            staged
+        } else {
+            Vec::new()
+        };
+        if !had_pending && frames.is_empty() && staged.is_empty() {
+            return 0;
         }
-        if self.staged.load(Ordering::Acquire) == 0 {
-            return;
-        }
-        // Taken and counted down under the inbox's lock, as a push adds
-        // under it: a drain that took a batch a push had already put in the
-        // inbox but not yet counted subtracted more than the counter held,
-        // and `staged` -- which the ingest gate reads through `len` --
-        // wrapped to about 2^64 until the push's own increment landed. It
-        // healed itself in a few nanoseconds, but a gate that reads it in
-        // that window shuts, and a debug build's `inner.len + staged`
-        // overflows.
-        let mut inbox = self.inbox.lock();
-        let staged = std::mem::take(&mut *inbox);
-        self.staged.fetch_sub(staged.len(), Ordering::AcqRel);
-        drop(inbox);
+        inner.push_pending(staged, frames);
         // Lanes only. Nothing here touches the by-hash index: this runs
         // under the lanes' lock, with the builder's puller waiting on it.
-        for valid in staged {
-            inner.insert_valid(valid);
+        let at = std::time::Instant::now();
+        let moved = inner.drain_pending(budget) as u64;
+        let took = at.elapsed().as_nanos() as u64;
+        let c = &LOCK_COUNTERS;
+        if had_pending {
+            c.drain_finished.fetch_add(1, Ordering::Relaxed);
         }
+        if moved > 0 {
+            c.drains.fetch_add(1, Ordering::Relaxed);
+            c.drain_txs.fetch_add(moved, Ordering::Relaxed);
+            c.drain_ns.fetch_add(took, Ordering::Relaxed);
+            raise_max(&c.drain_max_ns, took);
+        }
+        moved as usize
     }
 
     /// Notes a frame the ingest admitted whole: its id (root), its
@@ -1016,7 +1901,7 @@ impl<T: PoolTransaction> TxQueue<T> {
 
     /// How many frames the index holds, counting those still in its inbox.
     pub fn frames_indexed(&self) -> usize {
-        self.lock_inner().frames.len() + self.frames_staged.load(std::sync::atomic::Ordering::Acquire)
+        self.lock_inner_quiet().frames.len() + self.frames_staged.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The indexed frames in the order they arrived, each with its count,
@@ -1084,7 +1969,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// Records that a canonical block at `number` has been pruned out of the
     /// lanes. Only the highest is kept.
     pub fn note_pruned(&self, number: u64) {
-        let mut inner = self.lock_inner();
+        let mut inner = self.lock_inner_quiet();
         inner.pruned_through = inner.pruned_through.max(number);
         self.pruned_mirror.fetch_max(number, std::sync::atomic::Ordering::AcqRel);
     }
@@ -1104,12 +1989,17 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// queue never saw -- the pool's listener drops on a full channel -- or
     /// one still on its way in; the feed looks the pool up for it.
     pub fn take_gaps(&self) -> Vec<(Address, u64, u64)> {
-        std::mem::take(&mut self.lock_inner().gaps)
+        std::mem::take(&mut self.lock_inner_quiet().gaps)
     }
 
     /// How many transactions are queued.
     pub fn len(&self) -> usize {
-        self.lock_inner().len + self.staged.load(std::sync::atomic::Ordering::Acquire)
+        use std::sync::atomic::Ordering;
+        let inner = self.lock_inner_quiet();
+        inner.len
+            + inner.pending_drain.len()
+            + self.staged.load(Ordering::Acquire)
+            + self.in_hand.load(Ordering::Acquire)
     }
 
     /// How many of them a build could take now: what [`Self::len`] counts,
@@ -1122,8 +2012,25 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// the second (`queued=334-360k` with every build finding nothing).
     /// One walk of the lanes (~6,000 at the bench tier), so it belongs on a
     /// per-block line and not in a loop.
+    ///
+    /// Under `N42_QUEUE_OFFLOCK` nothing is drained: the inbox, the
+    /// remainder and a chunked drain's batch in hand are counted as they
+    /// stand (an arrival a drain would drop as a duplicate or park is
+    /// counted too, and a parked lane whose hole an arrival still in the
+    /// inbox fills is counted parked until that arrival is in its lane),
+    /// and the walk is reused while [`Inner::lanes_gen`] has
+    /// not moved ([`Inner::usable_walked`]). loop351 X8: this hold, drain
+    /// and walk, was the lock's longest at 46.5 ms median.
     pub fn usable(&self) -> usize {
-        let mut inner = self.lock_inner();
+        use std::sync::atomic::Ordering;
+        if self.offlock() {
+            let mut inner = self.lock_inner_quiet();
+            let inbox = inner.pending_drain.len()
+                + self.staged.load(Ordering::Acquire)
+                + self.in_hand.load(Ordering::Acquire);
+            return inner.usable_walked() + inbox;
+        }
+        let mut inner = self.lock_inner_quiet();
         // What is in the inbox is a build away from the lanes -- the next
         // pull drains it -- so it counts, and counting it means draining
         // it. The drainer task normally leaves nothing to do here.
@@ -1140,22 +2047,54 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// parked lanes held its depth at 569,520 against a gate of 543,333,
     /// the flood was held off, nothing was mined so nothing was pruned, and
     /// the node built empty blocks until its tenure ended.
+    ///
+    /// Read without the lanes' lock: the lanes' part is the depth mirror,
+    /// stored at every release of the lock, and the inbox's part is the
+    /// live `staged` counter. So the reading is exact whenever nobody holds
+    /// the lock, and while somebody does it is the depth as of the last
+    /// release (the staleness is one hold: a build's take, a prune's
+    /// removal, a give-back are seen when their hold ends). A drain is the
+    /// exception that is never undercounted: it raises the mirror before it
+    /// takes its batch out of `staged` ([`Self::drain_inbox`]). Taking the
+    /// lock here put every ingest connection behind any 17-24 ms removal
+    /// (`docs/SHARED_EXECUTION_SCOPE.md` 10.2).
     pub fn gate_len(&self) -> usize {
-        let inner = self.lock_inner();
-        (inner.len + self.staged.load(std::sync::atomic::Ordering::Acquire)).saturating_sub(inner.parked_len)
+        use std::sync::atomic::Ordering;
+        // `staged` first: a drain moves a batch from it into the mirror,
+        // and with the mirror read second the batch is in at least one of
+        // the two readings (the mirror is raised before `staged` drops).
+        let staged = self.staged.load(Ordering::Acquire) as u64;
+        // A chunked drain's batch moves `staged` -> `in_hand` -> the mirror,
+        // each step adding to the next before taking from the last: read in
+        // that order, the batch is in at least one of the readings.
+        let in_hand = self.in_hand.load(Ordering::Acquire) as u64;
+        let (len, parked) = unpack_depth(self.depth.load(Ordering::Acquire));
+        usize::try_from((len + staged + in_hand).saturating_sub(parked)).unwrap_or(usize::MAX)
+    }
+
+    /// [`Self::gate_len`] read under the lanes' lock, as it was before the
+    /// mirror: the reference the tests hold the mirror against.
+    pub fn gate_len_locked(&self) -> usize {
+        use std::sync::atomic::Ordering;
+        let inner = self.lock_inner_quiet();
+        (inner.len
+            + inner.pending_drain.len()
+            + self.staged.load(Ordering::Acquire)
+            + self.in_hand.load(Ordering::Acquire))
+        .saturating_sub(inner.parked_len)
     }
 
     /// What the queue has let go of since the last call, by reason, with
     /// the first few named ([`Dropped`]). Taking it clears it, so a caller
     /// logging this reports a window and not a running total.
     pub fn take_drops(&self) -> DropReport {
-        std::mem::take(&mut self.lock_inner().drops)
+        std::mem::take(&mut self.lock_inner_quiet().drops)
     }
 
     /// The lanes parked behind a hole, how many transactions they hold, and
     /// how many parks the cap has refused since the process started.
     pub fn parked(&self) -> (usize, usize, u64) {
-        let inner = self.lock_inner();
+        let inner = self.lock_inner_quiet();
         (inner.parked_order.len(), inner.parked_len, inner.park_capped)
     }
 
@@ -1207,7 +2146,17 @@ impl<T: PoolTransaction> TxQueue<T> {
         // always agree for a drain that holds it (see `drain_inbox`).
         let mut inbox = self.inbox.lock();
         inbox.extend(staged);
-        self.staged.fetch_add(count, std::sync::atomic::Ordering::AcqRel);
+        let before = self.staged.fetch_add(count, std::sync::atomic::Ordering::AcqRel);
+        drop(inbox);
+        // The dedicated drainer is woken once as the inbox crosses its mark,
+        // not on every push past it.
+        if before < DRAINER_WAKE
+            && before + count >= DRAINER_WAKE
+            && self.drainer.running.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            *self.drainer.woken.lock() = true;
+            self.drainer.wake.notify_one();
+        }
     }
 
     /// Forgets `hashes`, for a block the chain has committed: nothing will
@@ -1220,9 +2169,9 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// them.
     pub fn forget_hashes(&self, hashes: impl IntoIterator<Item = B256>) {
         let Some(index) = self.by_hash.as_ref() else { return };
-        for hash in hashes {
-            index.remove(&hash);
-        }
+        let hashes: Vec<B256> = hashes.into_iter().collect();
+        // One write lock a shard; what leaves is freed after the locks.
+        drop(index.remove_all(&hashes));
     }
 
     /// Puts transactions a build took but will not offer to the builder back
@@ -1237,15 +2186,9 @@ impl<T: PoolTransaction> TxQueue<T> {
         if transactions.is_empty() {
             return;
         }
+        let returned = Returned::new(transactions);
         let mut inner = self.lock_inner();
-        for transaction in &transactions {
-            if let Some((_, taken)) = inner.last_build.as_mut()
-                && let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, transaction))
-            {
-                taken.remove(at);
-            }
-        }
-        inner.give_back(transactions);
+        inner.untake_all(returned);
     }
 
     /// Forgets a transaction a build took and will not use: it leaves the
@@ -1306,37 +2249,183 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// mined watermarks, so nothing at or below them can be queued again.
     /// For canonical blocks only -- see [`Self::remove_mined_batch_collecting`]
     /// for a block of this node's that consensus has not committed yet.
-    pub fn remove_mined_batch(&self, mined: impl IntoIterator<Item = (Address, u64)>) {
+    pub fn remove_mined_batch(&self, mined: impl IntoIterator<Item = (Address, u64)>)
+    where
+        T: 'static,
+    {
+        // Folded to the highest nonce per sender first, outside the lock: a
+        // lane is split once per sender, not once per transaction.
+        // Splitting per transaction was 163,000 tree splits and as many
+        // allocations a block, 54-128 ms under the lock the next build's
+        // puller is waiting on.
+        let highest = fold_highest(mined);
+        let mut garbage = PruneGarbage::default();
         let mut inner = self.lock_inner();
         self.drain_inbox(&mut inner);
-        // Folded to the highest nonce per sender first: a lane is split once
-        // per sender, not once per transaction. Splitting per transaction
-        // was 163,000 tree splits and as many allocations a block, 54-128 ms
-        // under the lock the next build's puller is waiting on.
-        let mut highest: AddressHashMap<u64> = AddressHashMap::default();
-        for (sender, nonce) in mined {
-            let entry = highest.entry(sender).or_insert(nonce);
-            *entry = (*entry).max(nonce);
+        inner.remove_mined_highest(&highest, &mut garbage);
+        drop(inner);
+        garbage.free();
+    }
+
+    /// A canonical block's whole prune, in the order the node's pruner ran
+    /// its three steps: the own block held at `number` settled
+    /// ([`Self::settle_own_block`]), the block's `(sender, nonce)` pairs out
+    /// of the lanes, the frame index and the build's taken list
+    /// ([`Self::remove_mined_batch`]), and its `hashes` out of the by-hash
+    /// index ([`Self::forget_hashes`]). Returns how many transactions the
+    /// settle gave back, and where the time went.
+    ///
+    /// The result is that of the three calls in sequence; what differs is
+    /// the cost (`docs/SHARED_EXECUTION_SCOPE.md` 10.1 and 11: 49-65 ms per
+    /// 200,000-transaction block, serial, on a runtime worker):
+    /// - the fold of the block's pairs runs outside the lock and follows the
+    ///   block's runs (a frame is one sender's consecutive nonces), so a
+    ///   200,000-transaction block is a few hundred map operations;
+    /// - a lane whose head is already above the mined nonce (the leader's
+    ///   case: its build took them) is not split;
+    /// - the build's taken list is split in one pass, again by runs;
+    /// - the frame sweep drops each dead frame's own `by_first` entry
+    ///   instead of re-walking every frame's;
+    /// - the by-hash index is visited one shard at a time (one write lock a
+    ///   shard, not one a hash), on the queue's small pool;
+    /// - nothing is freed under a lock: every `Arc` that leaves the lanes,
+    ///   the taken list, the frame index or the by-hash index is collected
+    ///   and handed at the end (`free_us`) to the queue's freeing thread,
+    ///   with no lock held ([`freeing_thread`]).
+    pub fn prune_block(
+        &self,
+        number: u64,
+        hash: B256,
+        mined: &[(Address, u64)],
+        hashes: &[B256],
+    ) -> (usize, PruneTimes)
+    where
+        T: 'static,
+    {
+        let mut times = PruneTimes::default();
+        let at = std::time::Instant::now();
+        // Built only if an own block is held at this height (rarely): a
+        // 200,000-entry set every block on every node was 10-20 ms.
+        let carried = std::cell::OnceCell::new();
+        let back = self.settle_own_block(number, hash, |sender, nonce| {
+            carried
+                .get_or_init(|| mined.iter().copied().collect::<std::collections::HashSet<(Address, u64)>>())
+                .contains(&(*sender, nonce))
+        });
+        times.settle_us = at.elapsed().as_micros() as u64;
+        let at = std::time::Instant::now();
+        let highest = fold_highest(mined.iter().copied());
+        times.senders = highest.len();
+        times.fold_us = at.elapsed().as_micros() as u64;
+        let mut garbage = PruneGarbage::default();
+        let at = std::time::Instant::now();
+        if self.offlock() {
+            let (swept, lock_us, remove_us) = self.remove_mined_offlock(highest, &mut garbage);
+            times.frames_swept = swept;
+            times.lock_us = lock_us;
+            times.remove_us = remove_us;
+        } else {
+            let mut inner = self.lock_inner();
+            times.lock_us = at.elapsed().as_micros() as u64;
+            let held = std::time::Instant::now();
+            self.drain_inbox(&mut inner);
+            times.frames_swept = inner.remove_mined_highest(&highest, &mut garbage);
+            times.remove_us = held.elapsed().as_micros() as u64;
         }
-        for (sender, nonce) in &highest {
-            inner.remove_mined(*sender, *nonce);
+        let at = std::time::Instant::now();
+        if let Some(index) = self.by_hash.as_ref() {
+            garbage.index = index.remove_all(hashes);
         }
-        // A frame any of whose transactions the chain has mined can never
-        // be referenced whole again.
+        times.forget_us = at.elapsed().as_micros() as u64;
+        let at = std::time::Instant::now();
+        times.freed = garbage.len();
+        garbage.free();
+        times.free_us = at.elapsed().as_micros() as u64;
+        (back, times)
+    }
+
+    /// [`Inner::remove_mined_highest`] in bounded holds of the lanes' lock
+    /// with the lock released between them (`N42_QUEUE_OFFLOCK`): a first
+    /// hold drains the inbox, names the block's nonces as being pruned
+    /// ([`Inner::pruning`], so no build accepts a prepared plan holding one
+    /// meanwhile) and discards a prepared plan that holds one; then the
+    /// lanes are split [`OFFLOCK_PRUNE_SENDERS`] senders a hold; a last
+    /// hold discards a plan prepared in between that holds a mined nonce
+    /// and splits the build's taken list; then the frame index is swept
+    /// [`OFFLOCK_SWEEP_FRAMES`] frames a hold and its order compacted once.
+    ///
+    /// The result is the one-hold removal's. What a hold in between can see
+    /// is a prune part-applied: a sender not yet split still holds its mined
+    /// nonces, and a build may take them (its block refuses them as stale,
+    /// as when the prune runs a little later) -- a give-back or untake in
+    /// between puts nothing mined back for good, because every sender's
+    /// split comes after the first hold and the taken list's after the
+    /// last. Returns the frames swept, the waits for the lock and the holds'
+    /// sum, in microseconds.
+    fn remove_mined_offlock(&self, highest: AddressHashMap<u64>, garbage: &mut PruneGarbage<T>) -> (usize, u64, u64) {
+        let (mut lock_us, mut held_us) = (0u64, 0u64);
+        let highest = Arc::new(highest);
+        let senders: Vec<(Address, u64)> = highest.iter().map(|(sender, nonce)| (*sender, *nonce)).collect();
+        let timed = |lock_us: &mut u64| {
+            let at = std::time::Instant::now();
+            let inner = self.lock_inner_quiet();
+            *lock_us += at.elapsed().as_micros() as u64;
+            (inner, std::time::Instant::now())
+        };
         {
-            let Inner { frames, lanes, .. } = &mut *inner;
-            frames.sweep(lanes);
-        }
-        // What a build has taken is not in the lanes, so the removal above
-        // misses it; when the build is superseded its transactions are
-        // offered again, and a mined one offered again is a stale
-        // transaction the builder pays to refuse (42,000 a build in round
-        // 38). Forget the mined ones here.
-        if let Some((_, taken)) = inner.last_build.as_mut() {
-            if !taken.is_empty() {
-                taken.retain(|t| highest.get(&t.sender()).is_none_or(|mined| t.nonce() > *mined));
+            let (mut inner, held) = timed(&mut lock_us);
+            self.drain_inbox(&mut inner);
+            inner.pruning = Some(Arc::clone(&highest));
+            if inner.prepared_holds_mined(&highest) {
+                garbage.taken.extend(inner.discard_prepared());
+                note_ahead_discard(AheadDiscard::Mined);
+                inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
             }
+            held_us += held.elapsed().as_micros() as u64;
         }
+        for chunk in senders.chunks(OFFLOCK_PRUNE_SENDERS) {
+            std::thread::yield_now();
+            let (mut inner, held) = timed(&mut lock_us);
+            let mut moved = false;
+            for (sender, nonce) in chunk {
+                if let Some(gone) = inner.remove_mined_taking(*sender, *nonce, true) {
+                    moved = true;
+                    garbage.lanes.push(gone);
+                }
+            }
+            if moved {
+                inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+            }
+            held_us += held.elapsed().as_micros() as u64;
+        }
+        let ids = {
+            std::thread::yield_now();
+            let (mut inner, held) = timed(&mut lock_us);
+            if inner.prepared_holds_mined(&highest) {
+                garbage.taken.extend(inner.discard_prepared());
+                note_ahead_discard(AheadDiscard::Mined);
+                inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+            }
+            inner.forget_taken_mined(&highest, garbage);
+            inner.pruning = None;
+            let ids = inner.frames.ids_in_arrival_order();
+            held_us += held.elapsed().as_micros() as u64;
+            ids
+        };
+        let mut swept = 0usize;
+        for chunk in ids.chunks(OFFLOCK_SWEEP_FRAMES) {
+            std::thread::yield_now();
+            let (mut inner, held) = timed(&mut lock_us);
+            let Inner { frames, lanes, .. } = &mut *inner;
+            swept += frames.sweep_ids_into(chunk, lanes, &mut garbage.frames);
+            held_us += held.elapsed().as_micros() as u64;
+        }
+        if swept > 0 {
+            let (mut inner, held) = timed(&mut lock_us);
+            inner.frames.compact_order();
+            held_us += held.elapsed().as_micros() as u64;
+        }
+        (swept, lock_us, held_us)
     }
 
     /// [`Self::remove_mined_batch`], returning what it removed from the
@@ -1393,7 +2482,16 @@ impl<T: PoolTransaction> TxQueue<T> {
         if transactions.is_empty() {
             return;
         }
-        let mut inner = self.lock_inner();
+        let mut inner = self.lock_inner_quiet();
+        // The block a whole hand-off just forgot the take of: what a plan
+        // prepared ahead of the next build is accepted against.
+        let build = inner.builds;
+        if let Some(handed) = inner.handed.as_mut()
+            && handed.build == build
+            && handed.block.is_none()
+        {
+            handed.block = Some(hash);
+        }
         while inner.held.len() >= HELD_BLOCKS {
             let Some((evicted, _, gone)) = inner.held.pop_front() else { break };
             // Nothing else holds these: the block they were taken for was
@@ -1419,7 +2517,9 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// says which (sender, nonce) it does) go back to the lanes. Returns how
     /// many went back. Heights the chain has passed are dropped too.
     pub fn settle_own_block(&self, number: u64, hash: B256, carried: impl Fn(&Address, u64) -> bool) -> usize {
-        let mut inner = self.lock_inner();
+        // Quiet: only a give-back below moves the lanes, and raises the
+        // generation itself.
+        let mut inner = self.lock_inner_quiet();
         if inner.held.is_empty() {
             return 0;
         }
@@ -1455,6 +2555,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         if back.is_empty() {
             return 0;
         }
+        inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
         // Through the reverted door, which lowers the senders' watermarks
         // first.
         //
@@ -1520,6 +2621,15 @@ impl<T: PoolTransaction> TxQueue<T> {
             *entry = (*entry).max(nonce);
         }
         times.fold_us = at.elapsed().as_micros() as u64;
+        if self.offlock() {
+            let Some((all, build)) = self.take_out_taken(parent, &mut times) else { return (Vec::new(), times) };
+            let at = std::time::Instant::now();
+            let (mined, kept): (Vec<_>, Vec<_>) =
+                all.into_iter().partition(|t| highest.get(&t.sender()).is_some_and(|nonce| t.nonce() <= *nonce));
+            times.partition_us = at.elapsed().as_micros() as u64;
+            self.put_back_kept(parent, build, kept, !mined.is_empty(), &mut times);
+            return (mined, times);
+        }
         let at = std::time::Instant::now();
         let mut inner = self.lock_inner();
         times.lock_us += at.elapsed().as_micros() as u64;
@@ -1531,7 +2641,12 @@ impl<T: PoolTransaction> TxQueue<T> {
         let (mined, kept): (Vec<_>, Vec<_>) = std::mem::take(taken)
             .into_iter()
             .partition(|t| highest.get(&t.sender()).is_some_and(|nonce| t.nonce() <= *nonce));
+        let whole = kept.is_empty() && !mined.is_empty();
         *taken = kept;
+        if whole {
+            let build = inner.builds;
+            inner.handed = Some(Handed { build, block: None });
+        }
         times.partition_us = at.elapsed().as_micros() as u64;
         (mined, times)
     }
@@ -1566,6 +2681,9 @@ impl<T: PoolTransaction> TxQueue<T> {
             return self.forget_mined_timed(parent, (0..len).map(&mined_at));
         };
         let mut times = ForgetTimes::default();
+        if self.offlock() {
+            return self.forget_mined_parallel_offlock(pool, parent, len, mined_at, times);
+        }
         {
             let at = std::time::Instant::now();
             let mut inner = self.lock_inner();
@@ -1597,7 +2715,10 @@ impl<T: PoolTransaction> TxQueue<T> {
                 times.first_miss = miss.unwrap_or(usize::MAX);
                 if miss.is_none() {
                     times.whole = true;
-                    return (std::mem::take(taken), times);
+                    let whole = std::mem::take(taken);
+                    let build = inner.builds;
+                    inner.handed = Some(Handed { build, block: None });
+                    return (whole, times);
                 }
             }
         }
@@ -1630,9 +2751,130 @@ impl<T: PoolTransaction> TxQueue<T> {
         let (mined, kept): (Vec<_>, Vec<_>) = pool.install(|| {
             all.into_par_iter().partition(|t| highest.get(&t.sender()).is_some_and(|nonce| t.nonce() <= *nonce))
         });
+        let whole = kept.is_empty() && !mined.is_empty();
         *taken = kept;
+        if whole {
+            let build = inner.builds;
+            inner.handed = Some(Handed { build, block: None });
+        }
         times.partition_us = at.elapsed().as_micros() as u64;
         (mined, times)
+    }
+
+    /// [`Self::forget_mined_parallel`] with the taken list out of the lanes'
+    /// lock while it is compared and partitioned (`N42_QUEUE_OFFLOCK`): one
+    /// short hold takes it out ([`Self::take_out_taken`]), the comparison
+    /// with the body, the fold and the partition run on the queue's pool
+    /// with no lock held, and a second short hold puts the kept part back
+    /// ([`Self::put_back_kept`]). The result is the one-hold path's.
+    fn forget_mined_parallel_offlock<F>(
+        &self,
+        pool: &rayon::ThreadPool,
+        parent: B256,
+        len: usize,
+        mined_at: F,
+        mut times: ForgetTimes,
+    ) -> (Vec<Arc<ValidPoolTransaction<T>>>, ForgetTimes)
+    where
+        T: Send + Sync,
+        F: Fn(usize) -> (Address, u64) + Sync + Send,
+    {
+        use rayon::prelude::*;
+        let Some((all, build)) = self.take_out_taken(parent, &mut times) else { return (Vec::new(), times) };
+        times.taken_len = all.len();
+        times.first_miss = usize::MAX;
+        if all.len() == len {
+            let at = std::time::Instant::now();
+            let list: &[Arc<ValidPoolTransaction<T>>] = &all;
+            let miss = pool.install(|| {
+                list.par_iter().with_min_len(1024).enumerate().position_first(|(i, t)| mined_at(i) != (t.sender(), t.nonce()))
+            });
+            times.partition_us = at.elapsed().as_micros() as u64;
+            times.first_miss = miss.unwrap_or(usize::MAX);
+            if miss.is_none() {
+                times.whole = true;
+                self.put_back_kept(parent, build, Vec::new(), true, &mut times);
+                return (all, times);
+            }
+        }
+        let at = std::time::Instant::now();
+        let fold_one = |mut highest: AddressHashMap<u64>, (sender, nonce): (Address, u64)| {
+            let entry = highest.entry(sender).or_insert(nonce);
+            *entry = (*entry).max(nonce);
+            highest
+        };
+        let highest: AddressHashMap<u64> = pool.install(|| {
+            (0..len).into_par_iter().map(&mined_at).fold(AddressHashMap::default, fold_one).reduce(
+                AddressHashMap::default,
+                |a, b| {
+                    let (big, small) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+                    small.into_iter().fold(big, fold_one)
+                },
+            )
+        });
+        times.fold_us = at.elapsed().as_micros() as u64;
+        let at = std::time::Instant::now();
+        let (mined, kept): (Vec<_>, Vec<_>) = pool.install(|| {
+            all.into_par_iter().partition(|t| highest.get(&t.sender()).is_some_and(|nonce| t.nonce() <= *nonce))
+        });
+        times.partition_us = at.elapsed().as_micros() as u64;
+        self.put_back_kept(parent, build, kept, !mined.is_empty(), &mut times);
+        (mined, times)
+    }
+
+    /// The first hold of an off-lock hand-off: the build on `parent`'s
+    /// taken list, taken out whole, with the build counter it belongs to;
+    /// `None` when the last build is not on `parent` or took nothing.
+    fn take_out_taken(&self, parent: B256, times: &mut ForgetTimes) -> Option<(Vec<Arc<ValidPoolTransaction<T>>>, u64)> {
+        let at = std::time::Instant::now();
+        let mut inner = self.lock_inner_quiet();
+        times.lock_us += at.elapsed().as_micros() as u64;
+        let build = inner.builds;
+        let (built_on, taken) = inner.last_build.as_mut()?;
+        if *built_on != parent || taken.is_empty() {
+            return None;
+        }
+        Some((std::mem::take(taken), build))
+    }
+
+    /// The second hold of an off-lock hand-off: what the block did not
+    /// mine goes back to the front of the build's taken list (ahead of
+    /// anything a settle added meanwhile), and a whole take (`mined_any`
+    /// with nothing kept) marks the hand-off for a prepared plan -- if that
+    /// build is still the last one. If another build began in between, its
+    /// opening found the list empty, so the kept part is given back to the
+    /// lanes here, as that opening would have (minus what the chain has
+    /// mined meanwhile).
+    fn put_back_kept(
+        &self,
+        parent: B256,
+        build: u64,
+        kept: Vec<Arc<ValidPoolTransaction<T>>>,
+        mined_any: bool,
+        times: &mut ForgetTimes,
+    ) {
+        let at = std::time::Instant::now();
+        let mut inner = self.lock_inner_quiet();
+        times.lock_us += at.elapsed().as_micros() as u64;
+        let whole = kept.is_empty() && mined_any;
+        let current = inner.builds == build;
+        match inner.last_build.as_mut() {
+            Some((built_on, taken)) if current && *built_on == parent => {
+                if !kept.is_empty() {
+                    let added = std::mem::replace(taken, kept);
+                    taken.extend(added);
+                }
+                if whole {
+                    inner.handed = Some(Handed { build, block: None });
+                }
+            }
+            _ => {
+                if !kept.is_empty() {
+                    inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+                    inner.give_back(kept);
+                }
+            }
+        }
     }
 
     /// Moves what the inbox holds into the lanes now. The builder does this
@@ -1640,23 +2882,207 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// transaction of a full block's build (118 ms of 440, round 38) spent
     /// inserting arrivals rather than building; a task calling this every
     /// few milliseconds (`N42_TX_QUEUE_DRAINER=1`) takes it off the builder.
+    ///
+    /// With `N42_TX_QUEUE_DRAIN_CHUNK=<n>` the lanes' lock is held for at
+    /// most `n` transactions at a time ([`Self::drain_chunked`]); the result
+    /// is the one-hold drain's.
+    ///
+    /// Under `N42_QUEUE_OFFLOCK` the drain is always sliced
+    /// ([`Self::drain_sliced`]: [`DRAINER_SLICE`] unless the chunk says
+    /// otherwise), and with a dedicated drainer running it also finishes
+    /// the remainder the block path's bounded holds left
+    /// ([`Self::drain_inbox_block`]).
     pub fn drain_now(&self) {
         use std::sync::atomic::Ordering;
+        if self.offlock() {
+            if self.staged.load(Ordering::Acquire) == 0
+                && self.frames_staged.load(Ordering::Acquire) == 0
+                && !self.bounded_drains()
+            {
+                return;
+            }
+            let chunk = self.drain_chunk.load(Ordering::Relaxed);
+            self.drain_sliced(if chunk > 0 { chunk } else { DRAINER_SLICE }, DRAINER_MAX_HOLDS);
+            return;
+        }
         if self.staged.load(Ordering::Acquire) == 0 {
             return;
         }
-        let mut inner = self.lock_inner();
+        let chunk = self.drain_chunk.load(Ordering::Relaxed);
+        if chunk > 0 {
+            self.drain_chunked(chunk, usize::MAX);
+            return;
+        }
+        let mut inner = self.lock_inner_unsettled();
         self.drain_inbox(&mut inner);
+    }
+
+    /// [`Self::drain_now`] in bounded holds (`docs/SHARED_EXECUTION_SCOPE.md`
+    /// 12): at 3M transactions a second the one-hold drain moved ~70,000 a
+    /// call, 4-5 ms mean and 25-35 ms at worst, and was the lanes' longest
+    /// holder on every leg of loop338.
+    ///
+    /// The inbox and the frame inbox are taken without the lanes' lock (the
+    /// batch is counted in `in_hand` meanwhile, so the gate never misses
+    /// it), handed to `Inner::pending_drain` under the lock, and inserted
+    /// `chunk` at a time, the lock released between chunks. The insert is
+    /// the one-hold drain's, transaction by transaction in inbox order
+    /// (`Inner::insert_valid`), and the frames are indexed in the hold that
+    /// inserts the last transaction. Whoever else drains while a remainder
+    /// is pending finishes it first ([`Self::drain_inbox`]), so the lanes
+    /// see the inbox's order whoever moves it; a lock holder that does not
+    /// drain (an untake, a give-back) sees a prefix of the batch queued,
+    /// which is what it would have seen had the batch arrived in two drains.
+    ///
+    /// Stops after `max_holds` holds (a test's way to leave a remainder
+    /// pending); returns how many transactions each hold moved.
+    fn drain_chunked(&self, chunk: usize, max_holds: usize) -> Vec<u64> {
+        use std::sync::atomic::Ordering;
+        let frames = if self.frames_staged.load(Ordering::Acquire) != 0 {
+            let mut noted = self.frame_inbox.lock();
+            let frames = std::mem::take(&mut *noted);
+            self.frames_staged.fetch_sub(frames.len(), Ordering::AcqRel);
+            frames
+        } else {
+            Vec::new()
+        };
+        let batch = {
+            let mut inbox = self.inbox.lock();
+            let batch = std::mem::take(&mut *inbox);
+            // In hand before out of `staged`: a gate reading both in that
+            // order never misses the batch (counted twice for a moment).
+            self.in_hand.fetch_add(batch.len(), Ordering::AcqRel);
+            self.staged.fetch_sub(batch.len(), Ordering::AcqRel);
+            batch
+        };
+        let total = batch.len();
+        let (mut batch, mut frames) = (Some(batch), Some(frames));
+        let c = &LOCK_COUNTERS;
+        let mut first = true;
+        let mut holds = Vec::new();
+        loop {
+            let at;
+            let moved;
+            let done;
+            {
+                let mut inner = self.lock_inner_unsettled();
+                at = std::time::Instant::now();
+                if let (Some(batch), Some(frames)) = (batch.take(), frames.take()) {
+                    inner.push_pending(batch, frames);
+                }
+                moved = inner.drain_pending(chunk) as u64;
+                done = inner.pending_drain.is_empty() && inner.pending_frames.is_empty();
+            }
+            let took = at.elapsed().as_nanos() as u64;
+            if first {
+                // After the release that put the batch in the mirror.
+                self.in_hand.fetch_sub(total, Ordering::AcqRel);
+                first = false;
+            }
+            if moved > 0 {
+                c.drains.fetch_add(1, Ordering::Relaxed);
+                c.drain_chunks.fetch_add(1, Ordering::Relaxed);
+                c.drain_txs.fetch_add(moved, Ordering::Relaxed);
+                c.drain_ns.fetch_add(took, Ordering::Relaxed);
+                raise_max(&c.drain_max_ns, took);
+                raise_max(&c.drain_chunk_max_txs, moved);
+            }
+            holds.push(moved);
+            if done || moved == 0 || holds.len() >= max_holds {
+                break;
+            }
+        }
+        holds
+    }
+
+    /// The drainer's drain under `N42_QUEUE_OFFLOCK`: holds of at most
+    /// `slice` transactions each ([`Self::drain_inbox_upto`], the inbox
+    /// taken into the remainder in every hold), the lock released and the
+    /// thread yielding between them, until a hold leaves no remainder or
+    /// `max_holds` were made. Without the frame build's noted takes applied
+    /// ([`Self::lock_inner_unsettled`]). Returns how many holds it made.
+    ///
+    /// loop351 X8: the chunked drain took the inbox into the remainder and
+    /// the block path's next hold -- the plan's, the snapshot's,
+    /// `usable()`'s -- finished it in one go (668 drains per 5 s of 23,000
+    /// transactions mean, 28.5 ms at worst): with those holds bounded the
+    /// remainder is this drainer's alone.
+    fn drain_sliced(&self, slice: usize, max_holds: usize) -> usize {
+        use std::sync::atomic::Ordering;
+        let slice = slice.max(1);
+        let mut holds = 0;
+        loop {
+            let (moved, left) = {
+                let mut inner = self.lock_inner_unsettled();
+                let moved = self.drain_inbox_upto(&mut inner, slice);
+                (moved, !inner.pending_drain.is_empty() || !inner.pending_frames.is_empty())
+            };
+            holds += 1;
+            if moved > 0 {
+                let c = &LOCK_COUNTERS;
+                c.drain_chunks.fetch_add(1, Ordering::Relaxed);
+                raise_max(&c.drain_chunk_max_txs, moved as u64);
+            }
+            if !left || holds >= max_holds {
+                return holds;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// The dedicated drainer (`N42_TX_QUEUE_DRAINER` under
+    /// `N42_QUEUE_OFFLOCK`): [`Self::drain_now`] every `tick`, or at once
+    /// when a push takes the inbox past [`DRAINER_WAKE`]; never returns.
+    /// Run it on a thread of its own. While it runs, the block path's holds
+    /// drain only [`BLOCK_DRAIN_SLICE`] transactions each and leave the
+    /// rest to it.
+    pub fn run_drainer(&self, tick: std::time::Duration) {
+        let never = std::sync::atomic::AtomicBool::new(false);
+        self.run_drainer_until(tick, &never);
+    }
+
+    /// [`Self::run_drainer`] until `stop` is raised (checked every tick);
+    /// the queue's holds drain everything again once it returns.
+    pub fn run_drainer_until(&self, tick: std::time::Duration, stop: &std::sync::atomic::AtomicBool) {
+        use std::sync::atomic::Ordering;
+        self.drainer.running.store(true, Ordering::Relaxed);
+        while !stop.load(Ordering::Relaxed) {
+            {
+                let mut woken = self.drainer.woken.lock();
+                if !*woken {
+                    let _ = self.drainer.wake.wait_for(&mut woken, tick);
+                }
+                *woken = false;
+            }
+            self.drain_now();
+        }
+        self.drainer.running.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether this queue runs a dedicated drainer: what `bin/n42` asks
+    /// before choosing [`Self::run_drainer`] over a ticking task. True
+    /// under `N42_QUEUE_OFFLOCK`.
+    pub fn wants_drainer_thread(&self) -> bool {
+        self.offlock()
     }
 
     /// The transactions for a build on `parent`, as the pool's iterator would
     /// hand them. Taking returns what the previous build on the same parent
     /// took, first.
     pub fn best_for_build(&self, parent: B256) -> QueueBest<T> {
+        let mut garbage = PruneGarbage::default();
         {
             let mut inner = self.lock_inner();
+            // A build that walks the lanes cannot use a frame plan: it goes
+            // back before the walk, so the walk sees its transactions.
+            if inner.prepared.is_some() {
+                self.drain_inbox_block(&mut inner);
+                garbage.taken = inner.discard_prepared();
+                note_ahead_discard(AheadDiscard::NotFrames);
+            }
             self.begin_build(&mut inner, parent);
         }
+        garbage.free();
         QueueBest {
             queue: self.clone(),
             skipped: AddressHashSet::default(),
@@ -1665,6 +3091,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             frame_mode: false,
             frames_ended: false,
             segments: VecDeque::new(),
+            prepared_body: None,
         }
     }
 
@@ -1702,28 +3129,149 @@ impl<T: PoolTransaction> TxQueue<T> {
         gas_limit: u64,
         mode: SelectMode,
     ) -> (QueueBest<T>, FramePlan, FrameSelectTimes) {
+        self.frames_for_build_ahead(parent, gas_limit, mode, plan_ahead())
+    }
+
+    /// [`Self::frames_for_build_in`], using the plan prepared for this build
+    /// when [`Inner::prepared_verdict`] allows it (topped up when it holds
+    /// less gas than this build has room for and its last frame is whole),
+    /// and with `ahead` preparing the next build's plan right after this
+    /// one, on the thread that applies this plan's takes
+    /// (`N42_PLAN_AHEAD=1`, [`Prepared`]).
+    fn frames_for_build_ahead(
+        &self,
+        parent: B256,
+        gas_limit: u64,
+        mode: SelectMode,
+        ahead: bool,
+    ) -> (QueueBest<T>, FramePlan, FrameSelectTimes) {
+        if mode == SelectMode::Parallel && self.plan_snapshot_on() {
+            return self.frames_for_build_snapshot(parent, gas_limit, ahead);
+        }
         let mut times = FrameSelectTimes::default();
+        let mut garbage = PruneGarbage::default();
         let at = std::time::Instant::now();
-        let (segments, plan) = {
+        let mut prepared_body: Option<Arc<Mutex<BodySlot>>> = None;
+        let ((segments, plan), mark) = {
             let mut inner = self.lock_inner();
             times.lock_us = at.elapsed().as_micros() as u64;
             let begin_at = std::time::Instant::now();
-            self.begin_build(&mut inner, parent);
-            times.begin_us = begin_at.elapsed().as_micros() as u64;
-            let plan_at = std::time::Instant::now();
-            let planned = inner.plan_frames(gas_limit, &mut times, mode);
-            times.plan_us = plan_at.elapsed().as_micros() as u64;
-            planned
+            // The inbox first: an arrival below a prepared plan's nonces must
+            // be in its lane when the plan is judged.
+            self.drain_inbox_block(&mut inner);
+            let verdict = inner.prepared.as_ref().map(|prepared| inner.prepared_verdict(prepared, parent, gas_limit));
+            let out = match (verdict, inner.prepared.take()) {
+                (Some(Ok(())), Some(prepared)) => {
+                    let Prepared { gas_used, cut, segments, plan, taken, made_at, prep_us, body, .. } = prepared;
+                    prepared_body = body;
+                    times.ahead = 1;
+                    times.ahead_age_us = made_at.elapsed().as_micros() as u64;
+                    times.ahead_prep_us = prep_us;
+                    inner.open_build(parent, taken);
+                    times.begin_us = begin_at.elapsed().as_micros() as u64;
+                    let (mut segments, mut plan) = (segments, plan);
+                    let room = gas_limit.saturating_sub(gas_used);
+                    if !cut && room >= MIN_FRAME_TX_GAS {
+                        // The plan ran out of frames, not of gas: what has
+                        // arrived since tops it up, planned on the lanes as
+                        // the plan left them.
+                        let plan_at = std::time::Instant::now();
+                        let mut more_times = FrameSelectTimes::default();
+                        let (more, more_plan, _) = inner.plan_frames(room, &mut more_times, mode);
+                        times.plan_us = plan_at.elapsed().as_micros() as u64;
+                        times.ids_us = more_times.ids_us;
+                        times.check_us = more_times.check_us;
+                        times.settle_us = more_times.settle_us;
+                        times.by_ref = more_times.by_ref;
+                        times.slow = more_times.slow;
+                        times.counted = more_times.counted;
+                        if !more_plan.frames.is_empty() {
+                            // A topped-up plan is not the one the body was
+                            // made from.
+                            prepared_body = None;
+                            times.ahead = 2;
+                            times.ahead_topup_txs = more_plan.tx_count();
+                            segments.extend(more);
+                            plan.frames.extend(more_plan.frames);
+                            plan.parts.extend(more_plan.parts);
+                        }
+                        plan.skipped += more_plan.skipped;
+                    }
+                    (segments, plan)
+                }
+                (verdict, prepared) => {
+                    if let Some(prepared) = prepared {
+                        // Not usable: back to the lanes (minus what the
+                        // chain mined) before this build plans afresh.
+                        inner.prepared = Some(prepared);
+                        garbage.taken = inner.discard_prepared();
+                        let reason = match verdict {
+                            Some(Err(reason)) => reason,
+                            _ => AheadDiscard::OtherBuild,
+                        };
+                        times.ahead_discard = Some(reason);
+                        note_ahead_discard(reason);
+                    }
+                    self.begin_build(&mut inner, parent);
+                    times.begin_us = begin_at.elapsed().as_micros() as u64;
+                    let plan_at = std::time::Instant::now();
+                    let (segments, plan, _) = inner.plan_frames(gas_limit, &mut times, mode);
+                    times.plan_us = plan_at.elapsed().as_micros() as u64;
+                    (segments, plan)
+                }
+            };
+            // With `N42_QUEUE_OFFLOCK` the noted takes are grouped off the
+            // lock by the thread below and applied in one short hold
+            // ([`Self::settle_offlock`]), unless a lock settles them first.
+            let mark = (self.offlock() && !inner.pending.is_empty()).then(|| SettleMark {
+                build: inner.builds,
+                count: inner.pending.len(),
+                first: inner.pending[0].0,
+                last: inner.pending[inner.pending.len() - 1].0,
+            });
+            (out, mark)
         };
+        garbage.free();
+        self.finish_frame_build(segments, plan, times, mark, prepared_body, gas_limit, mode, ahead)
+    }
+
+    /// The end of a frame build's selection, after its last hold: the noted
+    /// takes handed to the settling thread (which, with `ahead`, then
+    /// prepares the next build's plan), and the build's [`QueueBest`].
+    #[allow(clippy::too_many_arguments)]
+    fn finish_frame_build(
+        &self,
+        segments: Vec<(FrameTxs<T>, usize)>,
+        plan: FramePlan,
+        times: FrameSelectTimes,
+        mark: Option<SettleMark>,
+        prepared_body: Option<Arc<Mutex<BodySlot>>>,
+        gas_limit: u64,
+        mode: SelectMode,
+        ahead: bool,
+    ) -> (QueueBest<T>, FramePlan, FrameSelectTimes) {
         // The takes the plan left noted leave the lanes on a thread of their
         // own, off the build's start; any lock before that applies them first.
-        if mode == SelectMode::Parallel {
+        // With `ahead`, the same thread then prepares the next build's plan.
+        if mode == SelectMode::Parallel || ahead {
             let queue = self.clone();
-            let spawned = std::thread::Builder::new()
-                .name("n42-frame-settle".to_owned())
-                .spawn(move || drop(queue.lock_inner()));
-            if spawned.is_err() {
-                drop(self.lock_inner());
+            // The noted takes are the plan's last segments, one each.
+            let noted: Option<(SettleMark, Vec<(FrameTxs<T>, usize)>)> = mark.and_then(|mark| {
+                let from = segments.len().checked_sub(mark.count)?;
+                Some((mark, segments[from..].to_vec()))
+            });
+            let spawned = std::thread::Builder::new().name("n42-frame-settle".to_owned()).spawn(move || {
+                if let Some((mark, noted)) = noted {
+                    queue.settle_offlock(mark, noted);
+                }
+                if ahead {
+                    queue.prepare_next_in(gas_limit, mode);
+                } else {
+                    drop(queue.lock_inner_quiet());
+                }
+            });
+            if spawned.is_err() && mode == SelectMode::Parallel {
+                drop(self.lock_inner_quiet());
             }
         }
         let best = QueueBest {
@@ -1734,8 +3282,374 @@ impl<T: PoolTransaction> TxQueue<T> {
             frame_mode: true,
             frames_ended: false,
             segments: segments.into_iter().map(|(txs, taken)| (txs, 0, taken)).collect(),
+            prepared_body,
         };
         (best, plan, times)
+    }
+
+    /// [`Inner::settle`] of a frame build's noted takes with the grouping
+    /// off the lanes' lock (`N42_QUEUE_OFFLOCK`): the taken list in plan
+    /// order (the frames' own `Arc`s, which the planner checked are the
+    /// lanes' entries) and each sender's run of nonces are made with no
+    /// lock held, then applied as one split per sender in holds of at most
+    /// [`OFFLOCK_SETTLE_SENDERS`] senders -- if the noted takes are still
+    /// the ones `mark` names. Every hold of the lanes' lock but the
+    /// drainer's settles them first, so if they are still noted, nothing but
+    /// arrivals has touched the lanes since they were planned; if another
+    /// hold settled them, there is nothing to do.
+    ///
+    /// The first hold checks the mark, moves the taken list to the build
+    /// and leaves the runs in [`Inner::settling`]; each hold then splits a
+    /// batch of them out. A run is one sender's whole take, so between
+    /// holds a lane is either settled or untouched: the drainer inserts
+    /// into either as it would before or after a one-hold settle (an
+    /// arrival at a noted nonce of an untouched lane is the duplicate it is
+    /// in the one-hold path, which has not settled it either), and any
+    /// other hold finishes the rest first ([`Inner::settle`]). Every batch
+    /// raises [`Inner::lanes_gen`], as the one hold did.
+    fn settle_offlock(&self, mark: SettleMark, noted: Vec<(FrameTxs<T>, usize)>) {
+        self.settle_offlock_in(mark, noted, OFFLOCK_SETTLE_SENDERS, usize::MAX);
+    }
+
+    /// [`Self::settle_offlock`] in holds of `batch` senders, stopping after
+    /// `max_holds` holds (a test's way to leave runs in
+    /// [`Inner::settling`]).
+    fn settle_offlock_in(&self, mark: SettleMark, noted: Vec<(FrameTxs<T>, usize)>, batch: usize, max_holds: usize) {
+        let count: usize = noted.iter().map(|(_, prefix)| *prefix).sum();
+        let mut taken: Vec<Arc<ValidPoolTransaction<T>>> = Vec::with_capacity(count);
+        for (txs, prefix) in &noted {
+            taken.extend(txs.iter().take(*prefix).cloned());
+        }
+        drop(noted);
+        let mut runs: AddressHashMap<(u64, u64)> = AddressHashMap::default();
+        for t in &taken {
+            let nonce = t.nonce();
+            let run = runs.entry(t.sender()).or_insert((nonce, nonce));
+            if run.1 != nonce {
+                // Not one run a sender: the ordinary settle decides.
+                return;
+            }
+            run.1 = nonce.saturating_add(1);
+        }
+        let mut runs: Vec<(Address, u64, u64)> = runs.into_iter().map(|(sender, (lo, hi))| (sender, lo, hi)).collect();
+        let batch = batch.max(1);
+        // The first batch is applied in the first hold, the rest go to
+        // `settling` and are applied from its end.
+        let first: Vec<(Address, u64, u64)> = runs.split_off(runs.len().saturating_sub(batch));
+        let mut garbage = PruneGarbage::default();
+        {
+            let mut inner = self.lock_inner_unsettled();
+            let current = inner.builds == mark.build
+                && inner.settling.is_empty()
+                && inner.pending.len() == mark.count
+                && inner.pending.first().is_some_and(|(id, _)| *id == mark.first)
+                && inner.pending.last().is_some_and(|(id, _)| *id == mark.last)
+                && inner.pending.iter().map(|(_, prefix)| *prefix).sum::<usize>() == count;
+            if !current {
+                return;
+            }
+            inner.pending.clear();
+            inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+            inner.split_runs(&first, &mut garbage.lanes);
+            inner.settling = runs;
+            if let Some((_, list)) = inner.last_build.as_mut() {
+                list.extend(taken);
+            }
+        }
+        garbage.free();
+        drop(first);
+        self.settle_rest(batch, max_holds.saturating_sub(1));
+    }
+
+    /// The batches of a settle left in [`Inner::settling`], `batch` senders
+    /// a hold, at most `max_holds` holds; stops when another hold has
+    /// finished them.
+    fn settle_rest(&self, batch: usize, max_holds: usize) {
+        for _ in 0..max_holds {
+            let mut garbage = PruneGarbage::default();
+            {
+                let mut inner = self.lock_inner_unsettled();
+                if inner.settling.is_empty() {
+                    return;
+                }
+                let from = inner.settling.len().saturating_sub(batch.max(1));
+                let part = inner.settling.split_off(from);
+                inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+                inner.split_runs(&part, &mut garbage.lanes);
+            }
+            garbage.free();
+        }
+    }
+
+    /// Prepares the next frame build's plan now ([`Prepared`],
+    /// `N42_PLAN_AHEAD=1`): on the lanes as they stand once the current
+    /// build's take has left them, against `gas_limit`, exactly as
+    /// [`Self::frames_for_build`] would plan it, its frames taken out of the
+    /// lanes and held for that build. Returns whether a plan was prepared (a
+    /// queue with no usable frame prepares none).
+    pub fn prepare_next_plan(&self, gas_limit: u64) -> bool {
+        let mode = if frame_select_parallel() { SelectMode::Parallel } else { SelectMode::Serial };
+        self.prepare_next_in(gas_limit, mode)
+    }
+
+    fn prepare_next_in(&self, gas_limit: u64, mode: SelectMode) -> bool {
+        if mode == SelectMode::Parallel && self.plan_snapshot_on() {
+            if let Some(made) = self.prepare_next_snapshot(gas_limit) {
+                return made;
+            }
+        }
+        if self.offlock() && mode == SelectMode::Parallel {
+            for attempt in 0..2 {
+                if let Some(made) = self.prepare_next_offlock(gas_limit) {
+                    return made;
+                }
+                OFFLOCK_RACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if attempt == 1 {
+                    OFFLOCK_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        self.prepare_next_locked(gas_limit, mode)
+    }
+
+    /// [`Self::prepare_next_in`] in one hold of the lanes' lock: planned,
+    /// its takes applied and the plan stored under it.
+    fn prepare_next_locked(&self, gas_limit: u64, mode: SelectMode) -> bool {
+        let at = std::time::Instant::now();
+        let mut garbage = PruneGarbage::default();
+        let hook = self.ahead_hook.lock().clone();
+        // The plan's segments and its body's slot, for the hook after the lock.
+        let mut body_job: Option<BodyJob<T>> = None;
+        let prepared = {
+            let mut inner = self.lock_inner();
+            self.drain_inbox_block(&mut inner);
+            if inner.prepared.is_some() {
+                // A plan nobody used (two builds' plans in a row without a
+                // build between them): it goes back first.
+                garbage.taken = inner.discard_prepared();
+                note_ahead_discard(AheadDiscard::OtherBuild);
+            }
+            // The plan's takes go to a list of their own, not the current
+            // build's: that build's taken list is what its hand-off forgets.
+            let current = inner.last_build.take();
+            inner.last_build = Some((B256::ZERO, Vec::new()));
+            let mut times = FrameSelectTimes::default();
+            let (segments, plan, gas_left) = inner.plan_frames(gas_limit, &mut times, mode);
+            inner.store_prepared(current, segments, plan, gas_left, gas_limit, at, hook.is_some(), &mut body_job)
+        };
+        garbage.free();
+        Self::run_body_hook(hook, body_job);
+        prepared
+    }
+
+    /// The off-lock preparation (`N42_QUEUE_OFFLOCK`): planned under one
+    /// hold exactly as [`Self::prepare_next_locked`] plans, but the plan's
+    /// takes -- noted by the parallel planner, not yet out of the lanes --
+    /// are grouped per sender with the lock released (each sender's takes
+    /// are one run of consecutive nonces from its lane's head: the planner
+    /// takes a frame's run only at its lane's head after the plan's earlier
+    /// takes) and applied under a second hold, one split per sender, only
+    /// if [`Inner::lanes_gen`] has not moved since the first: then no hold in
+    /// between took, removed, re-inserted or parked a lane entry, so the
+    /// planned entries are still where the plan found them, and nothing
+    /// was handed out from the plan before it is stored. `None` when the
+    /// lanes moved (nothing applied; the caller retries or plans in one
+    /// hold). A plan the parallel planner did not make whole (its serial
+    /// part ran, which takes as it goes) is stored in the first hold, as
+    /// the one-hold path does.
+    fn prepare_next_offlock(&self, gas_limit: u64) -> Option<bool> {
+        match self.offlock_plan(gas_limit) {
+            OffPlanned::Done(made) => Some(made),
+            OffPlanned::Planned(planned) => self.offlock_commit(planned),
+        }
+    }
+
+    /// The first hold of [`Self::prepare_next_offlock`]: the plan made,
+    /// its noted takes left in the lanes.
+    fn offlock_plan(&self, gas_limit: u64) -> OffPlanned<T> {
+        let at = std::time::Instant::now();
+        let mut garbage = PruneGarbage::default();
+        let hook = self.ahead_hook.lock().clone();
+        let mut body_job: Option<BodyJob<T>> = None;
+        let mut inner = self.lock_inner();
+        self.drain_inbox_block(&mut inner);
+        if inner.prepared.is_some() {
+            garbage.taken = inner.discard_prepared();
+            note_ahead_discard(AheadDiscard::OtherBuild);
+        }
+        let current = inner.last_build.take();
+        inner.last_build = Some((B256::ZERO, Vec::new()));
+        let mut times = FrameSelectTimes::default();
+        let (segments, plan, gas_left) = inner.plan_frames(gas_limit, &mut times, SelectMode::Parallel);
+        let serial_took = inner.last_build.as_ref().is_some_and(|(_, taken)| !taken.is_empty());
+        if serial_took || plan.frames.is_empty() || inner.pending.len() != segments.len() {
+            let made = inner.store_prepared(current, segments, plan, gas_left, gas_limit, at, hook.is_some(), &mut body_job);
+            drop(inner);
+            garbage.free();
+            Self::run_body_hook(hook, body_job);
+            return OffPlanned::Done(made);
+        }
+        // The takes stay in the lanes until the second hold, counted as
+        // queued meanwhile: a prune between the holds subtracts what it
+        // removes from `len`, and must find it there.
+        let noted = std::mem::take(&mut inner.pending);
+        let count: usize = noted.iter().map(|(_, prefix)| *prefix).sum();
+        inner.len += count;
+        inner.last_build = current;
+        let planned = OffPlan {
+            segments,
+            plan,
+            gas_left,
+            gas_limit,
+            count,
+            lanes_gen: inner.lanes_gen,
+            after: inner.builds,
+            at,
+            hook,
+        };
+        drop(inner);
+        garbage.free();
+        OffPlanned::Planned(planned)
+    }
+
+    /// The rest of [`Self::prepare_next_offlock`]: the takes grouped per
+    /// sender off the lock, then applied and the plan stored under a second
+    /// hold if the lanes have not moved; `None` (nothing applied) if they
+    /// have.
+    fn offlock_commit(&self, planned: OffPlan<T>) -> Option<bool> {
+        let OffPlan { segments, plan, gas_left, gas_limit, count, lanes_gen, after, at, hook } = planned;
+        let mut garbage = PruneGarbage::default();
+        let mut body_job: Option<BodyJob<T>> = None;
+        // Off the lock: the taken list in plan order (the frames' own
+        // `Arc`s, the lanes' entries by the planner's pointer check), and
+        // each sender's run of nonces.
+        let mut taken: Vec<Arc<ValidPoolTransaction<T>>> = Vec::with_capacity(count);
+        for (txs, prefix) in &segments {
+            taken.extend(txs.iter().take(*prefix).cloned());
+        }
+        let mut runs: AddressHashMap<(u64, u64)> = AddressHashMap::default();
+        let mut contiguous = true;
+        for t in &taken {
+            let nonce = t.nonce();
+            let run = runs.entry(t.sender()).or_insert((nonce, nonce));
+            if run.1 != nonce {
+                contiguous = false;
+            }
+            run.1 = nonce.saturating_add(1);
+        }
+        let mut inner = self.lock_inner_quiet();
+        if !contiguous || inner.lanes_gen != lanes_gen || inner.builds != after || inner.prepared.is_some() {
+            // The noted takes were never applied: the lanes still hold them
+            // and `len` already counts them (a prune that removed some of
+            // them meanwhile subtracted those itself).
+            drop(inner);
+            drop(taken);
+            return None;
+        }
+        let mut removed = 0usize;
+        for (sender, (lo, hi)) in &runs {
+            let Some(lane) = inner.lanes.get_mut(sender) else { continue };
+            // An arrival below the run (a hole filled since) stays: the
+            // verdict refuses the plan for it later, as the one-hold path's.
+            let mut run = lane.by_nonce.split_off(lo);
+            let mut tail = run.split_off(hi);
+            lane.by_nonce.append(&mut tail);
+            debug_assert_eq!(run.len() as u64, hi - lo);
+            removed += run.len();
+            if lane.by_nonce.is_empty() {
+                lane.queued = false;
+            }
+            garbage.lanes.push(run);
+        }
+        inner.len -= removed;
+        inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+        let lowest: AddressHashMap<u64> = runs.iter().map(|(sender, (lo, _))| (*sender, *lo)).collect();
+        let cut = plan.frames.last().is_some_and(|frame| frame.taken < frame.len);
+        let body = hook.is_some().then(|| {
+            let slot = Arc::new(Mutex::new(BodySlot::default()));
+            body_job = Some((segments.clone(), Arc::clone(&slot)));
+            slot
+        });
+        inner.prepared = Some(Prepared {
+            after,
+            gas_used: gas_limit.saturating_sub(gas_left),
+            cut,
+            segments,
+            plan,
+            taken,
+            lowest,
+            made_at: std::time::Instant::now(),
+            prep_us: at.elapsed().as_micros() as u64,
+            body,
+        });
+        drop(inner);
+        garbage.free();
+        Self::run_body_hook(hook, body_job);
+        Some(true)
+    }
+
+    /// The body, made off the lanes' lock. A build that takes the plan
+    /// before this ends finds the slot empty and makes its own.
+    fn run_body_hook(hook: Option<PlanAheadHook<T>>, body_job: Option<BodyJob<T>>) {
+        if let (Some(hook), Some((segments, slot))) = (hook, body_job) {
+            let at = std::time::Instant::now();
+            let body = hook(&segments);
+            let made_us = at.elapsed().as_micros() as u64;
+            let mut slot = slot.lock();
+            slot.body = body;
+            slot.made_us = made_us;
+        }
+    }
+
+    /// Installs the builder's plan-ahead hook (`N42_PLAN_AHEAD_BODY=1`): every
+    /// plan prepared from now on ([`Self::prepare_next_plan`]) has a body made
+    /// from its segments by `hook`, kept with the plan and handed to the build
+    /// that uses it whole ([`QueueBest::take_prepared_body`]). Replaces any
+    /// earlier hook.
+    pub fn set_plan_ahead_hook(&self, hook: PlanAheadHook<T>) {
+        *self.ahead_hook.lock() = Some(hook);
+    }
+
+    /// Whether a plan-ahead hook is installed.
+    pub fn has_plan_ahead_hook(&self) -> bool {
+        self.ahead_hook.lock().is_some()
+    }
+
+    /// The hand-off of a build whose sealed block is, by the builder's
+    /// construction, its whole take in take order (`N42_PLAN_AHEAD_BODY=1`:
+    /// a frame build sealed on its batches' counters with every candidate
+    /// executed): the taken list is forgotten as mined in O(1), with the
+    /// length and the `(position, sender, nonce)` points in `checks` compared
+    /// instead of every position ([`Self::forget_mined_parallel`]'s whole
+    /// case). `None` -- nothing changed -- when the build on `parent` is not
+    /// the one described; the caller then runs the full hand-off.
+    pub fn forget_whole_take(
+        &self,
+        parent: B256,
+        len: usize,
+        checks: &[(usize, Address, u64)],
+    ) -> Option<(Vec<Arc<ValidPoolTransaction<T>>>, ForgetTimes)> {
+        let mut times = ForgetTimes::default();
+        let at = std::time::Instant::now();
+        let mut inner = self.lock_inner_quiet();
+        times.lock_us = at.elapsed().as_micros() as u64;
+        let build = inner.builds;
+        let (built_on, taken) = inner.last_build.as_mut()?;
+        if *built_on != parent || taken.len() != len || len == 0 {
+            return None;
+        }
+        let matches = checks
+            .iter()
+            .all(|(i, sender, nonce)| taken.get(*i).is_some_and(|t| t.sender() == *sender && t.nonce() == *nonce));
+        if !matches {
+            return None;
+        }
+        times.taken_len = len;
+        times.first_miss = usize::MAX;
+        times.whole = true;
+        let whole = std::mem::take(taken);
+        inner.handed = Some(Handed { build, block: None });
+        Some((whole, times))
     }
 
     /// The frame layout of a body, from this node's frame index: each
@@ -1763,8 +3677,19 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// build's take given back, this build's taken list opened, the parked
     /// lanes whose park ended offered again.
     fn begin_build(&self, inner: &mut Inner<T>, parent: B256) {
+        self.drain_inbox_block(inner);
+        inner.open_build(parent, Vec::new());
+    }
+}
+
+impl<T: PoolTransaction> Inner<T> {
+    /// A build's opening once the inbox is drained: the previous build's
+    /// take given back, this build's taken list opened with `taken` (empty,
+    /// or a prepared plan's), the parked lanes whose park ended offered
+    /// again.
+    fn open_build(&mut self, parent: B256, taken: Vec<Arc<ValidPoolTransaction<T>>>) {
+        let inner = self;
         {
-            self.drain_inbox(inner);
             inner.builds += 1;
             let build = inner.builds;
             match inner.last_build.take() {
@@ -1799,7 +3724,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 }
                 _ => {}
             }
-            inner.last_build = Some((parent, Vec::new()));
+            inner.last_build = Some((parent, taken));
             inner.end_run();
             // Every lane whose park has ended is offered again before this
             // build walks: a park that outlived its reason must never cost
@@ -1831,7 +3756,7 @@ impl<T: PoolTransaction> Inner<T> {
         gas_limit: u64,
         times: &mut FrameSelectTimes,
         mode: SelectMode,
-    ) -> (Vec<(FrameTxs<T>, usize)>, FramePlan) {
+    ) -> (Vec<(FrameTxs<T>, usize)>, FramePlan, u64) {
         let mut segments: Vec<(FrameTxs<T>, usize)> = Vec::new();
         let mut plan = FramePlan::default();
         let mut gas_left = gas_limit;
@@ -1847,7 +3772,7 @@ impl<T: PoolTransaction> Inner<T> {
         let from = if mode == SelectMode::Parallel {
             let (next, ended) = self.plan_parallel(&ids, &mut gas_left, &mut segments, &mut plan, times);
             if ended {
-                return (segments, plan);
+                return (segments, plan, gas_left);
             }
             next
         } else {
@@ -1861,7 +3786,7 @@ impl<T: PoolTransaction> Inner<T> {
             times.settle_us += settle_at.elapsed().as_micros() as u64;
             self.plan_serial(&ids[from..], &mut gas_left, &mut segments, &mut plan, times, mode == SelectMode::PerTx);
         }
-        (segments, plan)
+        (segments, plan, gas_left)
     }
 
     /// The first part of [`Self::plan_frames`]: the frames the block's gas
@@ -1882,127 +3807,22 @@ impl<T: PoolTransaction> Inner<T> {
         plan: &mut FramePlan,
         times: &mut FrameSelectTimes,
     ) -> (usize, bool) {
-        use rayon::prelude::*;
-        // Past the gas, a margin for the frames the plan passes over; the
-        // serial part continues if they run out.
-        const MARGIN: usize = 16;
-        let check_at = std::time::Instant::now();
-        let mut end = 0usize;
-        let mut reach = 0u64;
-        let mut past = 0usize;
-        while end < ids.len() && past <= MARGIN {
-            if reach > *gas_left {
-                past += 1;
-            }
-            reach = reach.saturating_add(self.frames.txs_gas_of(&ids[end]).unwrap_or(u64::MAX));
-            end += 1;
-        }
-        let (frames, lanes) = (&self.frames, &self.lanes);
-        let checks: Vec<frames::RunCheck<T>> =
-            ids[..end].par_iter().with_min_len(4).map(|id| frames.check_runs(id, lanes)).collect();
-        // Senders some run needs entries below it taken of, and each frame's
-        // runs of those senders: what the decisions below count.
-        let shared: AddressHashSet = checks
-            .iter()
-            .filter_map(|check| match check {
-                frames::RunCheck::Ok { below, .. } => Some(below.iter().map(|(_, sender, _)| *sender)),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        let draws: Vec<Vec<(u32, Address, u32)>> = if shared.is_empty() {
-            Vec::new()
-        } else {
-            ids[..end]
-                .par_iter()
-                .zip(checks.par_iter())
-                .map(|(id, check)| match check {
-                    frames::RunCheck::Ok { .. } => frames.runs_and_hashes(id).map_or_else(Vec::new, |(runs, _)| {
-                        runs.iter()
-                            .enumerate()
-                            .filter(|(_, run)| shared.contains(&run.sender))
-                            .map(|(idx, run)| (idx as u32, run.sender, run.len))
-                            .collect()
-                    }),
-                    _ => Vec::new(),
-                })
-                .collect()
-        };
-        times.check_us = check_at.elapsed().as_micros() as u64;
-        let mut taken_of: AddressHashMap<u64> = AddressHashMap::default();
-        for (k, check) in checks.into_iter().enumerate() {
-            if *gas_left == 0 {
-                return (k, true);
-            }
-            let (txs, gas) = match check {
-                frames::RunCheck::Slow => return (k, false),
-                frames::RunCheck::Unusable { gas } => {
-                    // A frame the gas cuts is checked only as far as the
-                    // cut: the serial check decides it.
-                    if gas > *gas_left {
-                        return (k, false);
-                    }
-                    plan.skipped += 1;
-                    continue;
-                }
-                frames::RunCheck::Ok { txs, gas, below } => {
-                    let draws = draws.get(k).map_or(&[][..], Vec::as_slice);
-                    if !below.is_empty() {
-                        times.counted += 1;
-                    }
-                    let at_heads = draws.iter().all(|(idx, sender, _)| {
-                        let needs = below.iter().find(|(at, _, _)| at == idx).map_or(0, |(_, _, n)| *n);
-                        taken_of.get(sender).copied().unwrap_or(0) == needs
-                    });
-                    if !at_heads {
-                        if gas > *gas_left {
-                            return (k, false);
-                        }
-                        plan.skipped += 1;
-                        continue;
-                    }
-                    (txs, gas)
-                }
-            };
-            let id = ids[k];
-            let Some((_, hashes)) = self.frames.runs_and_hashes(&id) else { return (k, false) };
-            let (prefix, used) = if gas <= *gas_left {
-                (txs.len(), gas)
-            } else {
-                // The frame the block's gas runs out in, cut: its own
-                // transactions' gas, the one frame read here.
-                let mut used = 0u64;
-                let mut prefix = 0usize;
-                for tx in txs.iter() {
-                    let tx_gas = tx.gas_limit();
-                    if used.saturating_add(tx_gas) > *gas_left {
-                        break;
-                    }
-                    used += tx_gas;
-                    prefix += 1;
-                }
-                (prefix, used)
-            };
-            if prefix == 0 {
-                return (k, true);
-            }
-            for (_, sender, len) in draws.get(k).map_or(&[][..], Vec::as_slice) {
-                // Runs are in position order; a cut frame's runs past the cut
-                // take nothing, and the plan ends with it anyway.
-                *taken_of.entry(*sender).or_insert(0) += u64::from(*len);
-            }
+        let mut noted = Vec::new();
+        let out = plan_parallel_over(
+            &LivePlanSource { frames: &self.frames, lanes: &self.lanes },
+            ids,
+            gas_left,
+            segments,
+            plan,
+            times,
+            &mut noted,
+            PLAN_MARGIN,
+        );
+        for (id, prefix) in noted {
             self.len -= prefix;
-            plan.push_hashes(Arc::clone(hashes), prefix);
-            plan.frames.push(PlannedFrame { id, len: txs.len(), taken: prefix });
             self.pending.push((id, prefix));
-            times.by_ref += 1;
-            segments.push((txs, prefix));
-            *gas_left = gas_left.saturating_sub(used);
-            if prefix < hashes.len() {
-                return (k + 1, true);
-            }
         }
-        (end, false)
+        out
     }
 
     /// Applies the takes [`Self::plan_parallel`] noted: each planned
@@ -2012,9 +3832,16 @@ impl<T: PoolTransaction> Inner<T> {
     /// first ([`TxQueue::lock_inner`]), so nothing ever sees the lanes
     /// before it.
     fn settle(&mut self) {
+        if !self.settling.is_empty() {
+            self.lanes_gen = self.lanes_gen.wrapping_add(1);
+            let runs = std::mem::take(&mut self.settling);
+            let mut split = Vec::new();
+            self.split_runs(&runs, &mut split);
+        }
         if self.pending.is_empty() {
             return;
         }
+        self.lanes_gen = self.lanes_gen.wrapping_add(1);
         let pending = std::mem::take(&mut self.pending);
         let mut list = self.last_build.as_mut().map(|(_, list)| list);
         for (id, prefix) in pending {
@@ -2043,6 +3870,35 @@ impl<T: PoolTransaction> Inner<T> {
                 }
             }
         }
+    }
+
+    /// Takes each (sender, first nonce, end) run out of its lane, one split
+    /// a sender, the runs pushed to `out` (to be freed off the lock).
+    /// Returns how many transactions left the lanes.
+    fn split_runs(
+        &mut self,
+        runs: &[(Address, u64, u64)],
+        out: &mut Vec<BTreeMap<u64, Arc<ValidPoolTransaction<T>>>>,
+    ) -> usize {
+        let mut removed = 0;
+        for (sender, lo, hi) in runs {
+            let Some(lane) = self.lanes.get_mut(sender) else { continue };
+            let mut run = lane.by_nonce.split_off(lo);
+            let mut tail = run.split_off(hi);
+            lane.by_nonce.append(&mut tail);
+            removed += run.len();
+            if lane.by_nonce.is_empty() {
+                lane.queued = false;
+            }
+            out.push(run);
+        }
+        removed
+    }
+
+    /// Whether a frame build's takes are noted and not all out of their
+    /// lanes ([`Self::pending`] or a batched settle's [`Self::settling`]).
+    pub(crate) fn takes_unsettled(&self) -> bool {
+        !self.pending.is_empty() || !self.settling.is_empty()
     }
 
     /// The serial part of [`Self::plan_frames`] over `ids`, with the lanes
@@ -2192,6 +4048,197 @@ impl<T: PoolTransaction> Inner<T> {
             *gas_left = gas_left.saturating_sub(gas);
             SlowFrame::Taken(out, taken == members.len())
         }
+    }
+
+    /// Whether the plan prepared ahead may be the plan of a frame build on
+    /// `parent` with `gas_limit`, the lanes drained (`docs/SHARED_EXECUTION_SCOPE.md`
+    /// 12). It may when the queue is exactly where the plan left it, less
+    /// the build it followed and plus later arrivals:
+    /// - no build began since it was made (`after`);
+    /// - that build's whole take was forgotten as mined by an own block (the
+    ///   hand-off), and that block is `parent` -- so the parent carries every
+    ///   nonce the plan's runs start after;
+    /// - nothing of that take is still out (`last_build` empty, on another
+    ///   parent);
+    /// - its gas fits;
+    /// - for every sender it draws on, the chain has mined none of its
+    ///   nonces (a prune) and the lane holds nothing below them (a
+    ///   give-back, an untake, a refusal, a late arrival into a hole): its
+    ///   runs are still at their lanes' heads once the parent is applied.
+    ///
+    /// Frames that arrived since are behind it in arrival order, so the plan
+    /// is the one a fresh plan would have made on the queue as it stood
+    /// when it was prepared.
+    fn prepared_verdict(&self, prepared: &Prepared<T>, parent: B256, gas_limit: u64) -> Result<(), AheadDiscard> {
+        self.prepared_verdict_in(prepared, parent, gas_limit, false)
+    }
+
+    /// [`Self::prepared_verdict`], with the per-sender part on the worker
+    /// pool when `parallel` (`N42_QUEUE_PLAN_SNAPSHOT`: ~150,000 lane
+    /// look-ups at the bench tier, under the build's first hold). The same
+    /// verdict either way: the first failing sender in the map's order
+    /// decides the reason.
+    fn prepared_verdict_in(
+        &self,
+        prepared: &Prepared<T>,
+        parent: B256,
+        gas_limit: u64,
+        parallel: bool,
+    ) -> Result<(), AheadDiscard> {
+        if prepared.after != self.builds {
+            return Err(AheadDiscard::OtherBuild);
+        }
+        if self.handed != Some(Handed { build: self.builds, block: Some(parent) }) {
+            return Err(AheadDiscard::NotOnItsParent);
+        }
+        match &self.last_build {
+            Some((built_on, taken)) if *built_on != parent && taken.is_empty() => {}
+            _ => return Err(AheadDiscard::TakeLeft),
+        }
+        if prepared.gas_used > gas_limit {
+            return Err(AheadDiscard::Gas);
+        }
+        if let Some(pruning) = self.pruning.as_ref()
+            && prepared.lowest.iter().any(|(sender, lowest)| pruning.get(sender).is_some_and(|mined| mined >= lowest))
+        {
+            return Err(AheadDiscard::Mined);
+        }
+        if parallel {
+            use rayon::prelude::*;
+            let lowest: Vec<(&Address, &u64)> = prepared.lowest.iter().collect();
+            let lanes = &self.lanes;
+            let failed = lowest.par_iter().with_min_len(1024).find_map_first(|(sender, lowest)| {
+                let lane = lanes.get(*sender)?;
+                if lane.is_stale(**lowest) {
+                    return Some(AheadDiscard::Mined);
+                }
+                lane.by_nonce.first_key_value().is_some_and(|(nonce, _)| nonce < *lowest).then_some(AheadDiscard::Below)
+            });
+            return failed.map_or(Ok(()), Err);
+        }
+        for (sender, lowest) in &prepared.lowest {
+            let Some(lane) = self.lanes.get(sender) else { continue };
+            if lane.is_stale(*lowest) {
+                return Err(AheadDiscard::Mined);
+            }
+            if lane.by_nonce.first_key_value().is_some_and(|(nonce, _)| nonce < lowest) {
+                return Err(AheadDiscard::Below);
+            }
+        }
+        Ok(())
+    }
+
+    /// The end of a preparation under the lanes' lock, with the plan made
+    /// on a taken list of its own (the current build's, `current`, put
+    /// back): its takes applied, and the plan stored as [`Prepared`] -- or,
+    /// when it holds no frame, what it took given back. Returns whether a
+    /// plan was stored; `body_job` gets the hook's work when `with_hook`.
+    #[allow(clippy::too_many_arguments)]
+    fn store_prepared(
+        &mut self,
+        current: Option<(B256, Vec<Arc<ValidPoolTransaction<T>>>)>,
+        segments: Vec<(FrameTxs<T>, usize)>,
+        plan: FramePlan,
+        gas_left: u64,
+        gas_limit: u64,
+        at: std::time::Instant,
+        with_hook: bool,
+        body_job: &mut Option<BodyJob<T>>,
+    ) -> bool {
+        let inner = self;
+        inner.settle();
+        let taken = inner.last_build.take().map(|(_, taken)| taken).unwrap_or_default();
+        inner.last_build = current;
+        if plan.frames.is_empty() {
+            if !taken.is_empty() {
+                inner.give_back(taken);
+            }
+            return false;
+        }
+        let mut lowest: AddressHashMap<u64> = AddressHashMap::default();
+        for frame in &plan.frames {
+            let Some((runs, _)) = inner.frames.runs_and_hashes(&frame.id) else { continue };
+            for run in runs.iter().filter(|run| (run.start as usize) < frame.taken) {
+                let entry = lowest.entry(run.sender).or_insert(run.first_nonce);
+                *entry = (*entry).min(run.first_nonce);
+            }
+        }
+        let cut = plan.frames.last().is_some_and(|frame| frame.taken < frame.len);
+        let after = inner.builds;
+        // A clone of each frame's `Arc` (a few hundred), not of its
+        // transactions: the hook reads them outside the lock.
+        let body = with_hook.then(|| {
+            let slot = Arc::new(Mutex::new(BodySlot::default()));
+            *body_job = Some((segments.clone(), Arc::clone(&slot)));
+            slot
+        });
+        inner.prepared = Some(Prepared {
+            after,
+            gas_used: gas_limit.saturating_sub(gas_left),
+            cut,
+            segments,
+            plan,
+            taken,
+            lowest,
+            made_at: std::time::Instant::now(),
+            prep_us: at.elapsed().as_micros() as u64,
+            body,
+        });
+        true
+    }
+
+    /// Gives a prepared plan's transactions back to the lanes, as a build's
+    /// give-back does, and returns the ones the chain has mined (at or below
+    /// their lane's watermark) for the caller to free after the lock.
+    fn discard_prepared(&mut self) -> Vec<Arc<ValidPoolTransaction<T>>> {
+        let Some(prepared) = self.prepared.take() else { return Vec::new() };
+        let lanes = &self.lanes;
+        let (mined, back): (Vec<_>, Vec<_>) = prepared
+            .taken
+            .into_iter()
+            .partition(|t| lanes.get(&t.sender()).is_some_and(|lane| lane.is_stale(t.nonce())));
+        for t in &mined {
+            self.dropped(Dropped::Mined, t.sender(), t.nonce());
+        }
+        if !back.is_empty() {
+            self.give_back(back);
+        }
+        mined
+    }
+
+    /// Appends a batch taken from the inbox, and the frames noted with it,
+    /// to the remainder. Each frame's mark is the remainder count with the
+    /// batch in: every transaction of the frame is at or before it.
+    fn push_pending(&mut self, batch: Vec<Arc<ValidPoolTransaction<T>>>, frames: Vec<(NewFrame, Option<FrameTxs<T>>)>) {
+        self.pending_in += batch.len() as u64;
+        if !batch.is_empty() {
+            // Moved, not copied: a `Vec` becomes the deque in O(1).
+            if self.pending_drain.is_empty() {
+                self.pending_drain = VecDeque::from(batch);
+            } else {
+                self.pending_drain.extend(batch);
+            }
+        }
+        let mark = self.pending_in;
+        self.pending_frames.extend(frames.into_iter().map(|(frame, txs)| (mark, frame, txs)));
+    }
+
+    /// Moves up to `budget` transactions of the remainder into their lanes,
+    /// in inbox order, and indexes each remainder frame whose last
+    /// transaction is now in. Returns how many it moved.
+    fn drain_pending(&mut self, budget: usize) -> usize {
+        let mut moved = 0usize;
+        while moved < budget {
+            let Some(valid) = self.pending_drain.pop_front() else { break };
+            self.insert_valid(valid);
+            moved += 1;
+        }
+        self.pending_out += moved as u64;
+        while self.pending_frames.front().is_some_and(|(mark, _, _)| *mark <= self.pending_out) {
+            let Some((_, frame, txs)) = self.pending_frames.pop_front() else { break };
+            self.frames.insert(frame, txs);
+        }
+        moved
     }
 
     /// Queues one transaction the pusher has already wrapped.
@@ -2407,6 +4454,25 @@ impl<T: PoolTransaction> Inner<T> {
         self.lanes.values().filter(|lane| lane.queued).map(|lane| lane.by_nonce.len()).sum()
     }
 
+    /// [`Inner::usable`], walked at most once per [`Inner::lanes_gen`]: the
+    /// holds that do not raise it only insert arrivals ([`TxQueue::lock_inner_quiet`]),
+    /// so what they changed is what `len` moved less what `parked_len`
+    /// moved. (An arrival that puts back a lane holding entries outside
+    /// the order -- a build's cursor lane -- adds those entries to the walk
+    /// but not here, until the next walk.)
+    fn usable_walked(&mut self) -> usize {
+        if let Some(walk) = self.usable_cache
+            && walk.lanes_gen == self.lanes_gen
+        {
+            let moved = (self.len as i64 - walk.len as i64) - (self.parked_len as i64 - walk.parked_len as i64);
+            return (walk.usable as i64 + moved).max(0) as usize;
+        }
+        let usable = self.usable();
+        self.usable_cache =
+            Some(UsableWalk { lanes_gen: self.lanes_gen, usable, len: self.len, parked_len: self.parked_len });
+        usable
+    }
+
     /// The parked lanes and what they hold, walked. What
     /// [`Inner::parked_len`] tracks incrementally; the two must agree.
     #[cfg(test)]
@@ -2415,6 +4481,79 @@ impl<T: PoolTransaction> Inner<T> {
             .values()
             .filter(|lane| lane.parked.is_some())
             .fold((0, 0), |(lanes, txs), lane| (lanes + 1, txs + lane.by_nonce.len()))
+    }
+
+    /// A canonical block's removal, given each sender's highest mined nonce:
+    /// the lanes, then the frame index, then the build's taken list; what
+    /// leaves goes to `garbage` for the caller to free after the lock.
+    /// Returns how many frames the sweep dropped.
+    fn remove_mined_highest(&mut self, highest: &AddressHashMap<u64>, garbage: &mut PruneGarbage<T>) -> usize {
+        for (sender, nonce) in highest {
+            if let Some(gone) = self.remove_mined_taking(*sender, *nonce, true) {
+                garbage.lanes.push(gone);
+            }
+        }
+        // A plan prepared ahead that holds a nonce the chain has now mined
+        // can never be used: back to the lanes now (the mined ones freed with
+        // the rest of the prune's garbage), not when the next build finds it.
+        if let Some(prepared) = self.prepared.as_ref()
+            && prepared.lowest.iter().any(|(sender, lowest)| highest.get(sender).is_some_and(|mined| mined >= lowest))
+        {
+            let mined = self.discard_prepared();
+            garbage.taken.extend(mined);
+            note_ahead_discard(AheadDiscard::Mined);
+        }
+        // A frame any of whose transactions the chain has mined can never
+        // be referenced whole again.
+        let swept = {
+            let Self { frames, lanes, .. } = self;
+            frames.sweep_into(lanes, &mut garbage.frames)
+        };
+        // What a build has taken is not in the lanes, so the removal above
+        // misses it; when the build is superseded its transactions are
+        // offered again, and a mined one offered again is a stale
+        // transaction the builder pays to refuse (42,000 a build in round
+        // 38). Forget the mined ones here: one pass, the map read once a
+        // run of one sender, the kept ones in their order.
+        self.forget_taken_mined(highest, garbage);
+        swept
+    }
+
+    /// The build's taken list split by a canonical block's highest nonces
+    /// per sender: the mined ones to `garbage`, the rest kept in order.
+    fn forget_taken_mined(&mut self, highest: &AddressHashMap<u64>, garbage: &mut PruneGarbage<T>) {
+        if let Some((_, taken)) = self.last_build.as_mut()
+            && !taken.is_empty()
+        {
+            let all = std::mem::take(taken);
+            let mut kept = Vec::with_capacity(all.len());
+            let mut run: Option<(Address, Option<u64>)> = None;
+            for t in all {
+                let sender = t.sender();
+                let mined = match run {
+                    Some((current, mined)) if current == sender => mined,
+                    _ => {
+                        let mined = highest.get(&sender).copied();
+                        run = Some((sender, mined));
+                        mined
+                    }
+                };
+                if mined.is_some_and(|mined| t.nonce() <= mined) {
+                    garbage.taken.push(t);
+                } else {
+                    kept.push(t);
+                }
+            }
+            *taken = kept;
+        }
+    }
+
+    /// Whether the prepared plan holds a nonce at or below `highest`'s for
+    /// its sender (a canonical block mined it).
+    fn prepared_holds_mined(&self, highest: &AddressHashMap<u64>) -> bool {
+        self.prepared.as_ref().is_some_and(|prepared| {
+            prepared.lowest.iter().any(|(sender, lowest)| highest.get(sender).is_some_and(|mined| mined >= lowest))
+        })
     }
 
     /// [`Self::remove_mined_from`] for a canonical block.
@@ -2426,16 +4565,34 @@ impl<T: PoolTransaction> Inner<T> {
     /// `from_chain` says whether a canonical block put it there or a build
     /// did ([`Lane::chain_mined`]).
     fn remove_mined_from(&mut self, sender: Address, nonce: u64, from_chain: bool) {
-        let Some(lane) = self.lanes.get_mut(&sender) else { return };
+        drop(self.remove_mined_taking(sender, nonce, from_chain));
+    }
+
+    /// [`Self::remove_mined_from`], handing back what left the lane rather
+    /// than freeing it here, so a caller under the lock can free it after
+    /// the lock is released.
+    fn remove_mined_taking(
+        &mut self,
+        sender: Address,
+        nonce: u64,
+        from_chain: bool,
+    ) -> Option<BTreeMap<u64, Arc<ValidPoolTransaction<T>>>> {
+        let lane = self.lanes.get_mut(&sender)?;
         lane.mine(nonce, from_chain);
         // The chain has reached or passed the hole: whatever is left in the
         // lane above it is the next thing this sender wants mined.
         let ends_park = lane.chain_passed(nonce);
         let parked = lane.parked.is_some();
-        let keep = lane.by_nonce.split_off(&(nonce + 1));
-        let dropped = lane.by_nonce.len();
+        // Nothing at or below the nonce: no split (a split of a lane whose
+        // head is above the mined nonce moves the whole tree for nothing,
+        // which on a leader is every lane the block's frames came from:
+        // the build took them out already).
+        let gone = lane.by_nonce.first_key_value().is_some_and(|(first, _)| *first <= nonce).then(|| {
+            let keep = lane.by_nonce.split_off(&nonce.saturating_add(1));
+            std::mem::replace(&mut lane.by_nonce, keep)
+        });
+        let dropped = gone.as_ref().map_or(0, BTreeMap::len);
         self.len -= dropped;
-        lane.by_nonce = keep;
         // What left the lane leaves the parked total first, whatever
         // happens to the park itself: `unpark` subtracts what the lane
         // *still* holds, so a park ended in the same breath as a prune
@@ -2449,6 +4606,7 @@ impl<T: PoolTransaction> Inner<T> {
             self.unpark(sender);
             self.requeue(sender);
         }
+        gone
     }
 
     /// Ends the run in progress: the sender it was taking from goes back to
@@ -2553,6 +4711,176 @@ impl<T: PoolTransaction> Inner<T> {
     }
 }
 
+/// Past the block's gas, how many frames the parallel planner checks for
+/// the ones it passes over; the serial part continues if they run out.
+const PLAN_MARGIN: usize = 16;
+
+/// What the parallel planner ([`plan_parallel_over`]) reads: the frame index
+/// and the lanes under the lanes' lock ([`LivePlanSource`]), or a plan
+/// snapshot's copy of the parts it needs (`snapshot::PlanSnapshot`).
+trait PlanSource<T: PoolTransaction>: Sync {
+    fn txs_gas_of(&self, id: &B256) -> Option<u64>;
+    fn check_runs(&self, id: &B256) -> frames::RunCheck<T>;
+    fn runs_and_hashes(&self, id: &B256) -> Option<(&[frames::SenderRun], &Arc<[B256]>)>;
+}
+
+/// The frame index and the lanes as they stand, under the lanes' lock.
+struct LivePlanSource<'a, T: PoolTransaction> {
+    frames: &'a frames::FrameIndex<T>,
+    lanes: &'a AddressHashMap<Lane<T>>,
+}
+
+impl<T: PoolTransaction> PlanSource<T> for LivePlanSource<'_, T> {
+    fn txs_gas_of(&self, id: &B256) -> Option<u64> {
+        self.frames.txs_gas_of(id)
+    }
+    fn check_runs(&self, id: &B256) -> frames::RunCheck<T> {
+        self.frames.check_runs(id, self.lanes)
+    }
+    fn runs_and_hashes(&self, id: &B256) -> Option<(&[frames::SenderRun], &Arc<[B256]>)> {
+        self.frames.runs_and_hashes(id)
+    }
+}
+
+/// The first part of [`Inner::plan_frames`] over `src`: the frames the
+/// block's gas reaches (and a few past it, for the ones passed over) checked
+/// at once on the worker pool, then decided in arrival order with one
+/// counter per sender that more than one of them draws on. Each taken frame
+/// is pushed to `noted` as (id, taken prefix), in plan order; nothing of the
+/// lanes is touched. Returns where the serial part continues and whether
+/// the plan has ended.
+#[allow(clippy::too_many_arguments)]
+fn plan_parallel_over<T: PoolTransaction, S: PlanSource<T>>(
+    src: &S,
+    ids: &[B256],
+    gas_left: &mut u64,
+    segments: &mut Vec<(FrameTxs<T>, usize)>,
+    plan: &mut FramePlan,
+    times: &mut FrameSelectTimes,
+    noted: &mut Vec<(B256, usize)>,
+    margin: usize,
+) -> (usize, bool) {
+    use rayon::prelude::*;
+    let check_at = std::time::Instant::now();
+    let mut end = 0usize;
+    let mut reach = 0u64;
+    let mut past = 0usize;
+    while end < ids.len() && past <= margin {
+        let gas = src.txs_gas_of(&ids[end]).unwrap_or(u64::MAX);
+        // A frame of no gas (a snapshot's frame that can take nothing) is
+        // decided without a check and costs no margin.
+        if reach > *gas_left && gas > 0 {
+            past += 1;
+        }
+        reach = reach.saturating_add(gas);
+        end += 1;
+    }
+    let checks: Vec<frames::RunCheck<T>> =
+        ids[..end].par_iter().with_min_len(4).map(|id| src.check_runs(id)).collect();
+    // Senders some run needs entries below it taken of, and each frame's
+    // runs of those senders: what the decisions below count.
+    let shared: AddressHashSet = checks
+        .iter()
+        .filter_map(|check| match check {
+            frames::RunCheck::Ok { below, .. } => Some(below.iter().map(|(_, sender, _)| *sender)),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let draws: Vec<Vec<(u32, Address, u32)>> = if shared.is_empty() {
+        Vec::new()
+    } else {
+        ids[..end]
+            .par_iter()
+            .zip(checks.par_iter())
+            .map(|(id, check)| match check {
+                frames::RunCheck::Ok { .. } => src.runs_and_hashes(id).map_or_else(Vec::new, |(runs, _)| {
+                    runs.iter()
+                        .enumerate()
+                        .filter(|(_, run)| shared.contains(&run.sender))
+                        .map(|(idx, run)| (idx as u32, run.sender, run.len))
+                        .collect()
+                }),
+                _ => Vec::new(),
+            })
+            .collect()
+    };
+    times.check_us = check_at.elapsed().as_micros() as u64;
+    let mut taken_of: AddressHashMap<u64> = AddressHashMap::default();
+    for (k, check) in checks.into_iter().enumerate() {
+        if *gas_left == 0 {
+            return (k, true);
+        }
+        let (txs, gas) = match check {
+            frames::RunCheck::Slow => return (k, false),
+            frames::RunCheck::Unusable { gas } => {
+                // A frame the gas cuts is checked only as far as the
+                // cut: the serial check decides it.
+                if gas > *gas_left {
+                    return (k, false);
+                }
+                plan.skipped += 1;
+                continue;
+            }
+            frames::RunCheck::Ok { txs, gas, below } => {
+                let draws = draws.get(k).map_or(&[][..], Vec::as_slice);
+                if !below.is_empty() {
+                    times.counted += 1;
+                }
+                let at_heads = draws.iter().all(|(idx, sender, _)| {
+                    let needs = below.iter().find(|(at, _, _)| at == idx).map_or(0, |(_, _, n)| *n);
+                    taken_of.get(sender).copied().unwrap_or(0) == needs
+                });
+                if !at_heads {
+                    if gas > *gas_left {
+                        return (k, false);
+                    }
+                    plan.skipped += 1;
+                    continue;
+                }
+                (txs, gas)
+            }
+        };
+        let id = ids[k];
+        let Some((_, hashes)) = src.runs_and_hashes(&id) else { return (k, false) };
+        let (prefix, used) = if gas <= *gas_left {
+            (txs.len(), gas)
+        } else {
+            // The frame the block's gas runs out in, cut: its own
+            // transactions' gas, the one frame read here.
+            let mut used = 0u64;
+            let mut prefix = 0usize;
+            for tx in txs.iter() {
+                let tx_gas = tx.gas_limit();
+                if used.saturating_add(tx_gas) > *gas_left {
+                    break;
+                }
+                used += tx_gas;
+                prefix += 1;
+            }
+            (prefix, used)
+        };
+        if prefix == 0 {
+            return (k, true);
+        }
+        for (_, sender, len) in draws.get(k).map_or(&[][..], Vec::as_slice) {
+            // Runs are in position order; a cut frame's runs past the cut
+            // take nothing, and the plan ends with it anyway.
+            *taken_of.entry(*sender).or_insert(0) += u64::from(*len);
+        }
+        plan.push_hashes(Arc::clone(hashes), prefix);
+        plan.frames.push(PlannedFrame { id, len: txs.len(), taken: prefix });
+        noted.push((id, prefix));
+        times.by_ref += 1;
+        segments.push((txs, prefix));
+        *gas_left = gas_left.saturating_sub(used);
+        if prefix < hashes.len() {
+            return (k + 1, true);
+        }
+    }
+    (end, false)
+}
+
 /// The builder's iterator over the queue. Implements reth's
 /// [`BestTransactions`], so the payload builder takes it in place of the
 /// pool's.
@@ -2578,6 +4906,9 @@ pub struct QueueBest<T: PoolTransaction> {
     /// A frame build's first refusal: nothing more is offered, since a body
     /// with a hole in a frame is not frame-aligned.
     frames_ended: bool,
+    /// The body made with the prepared plan this build stands on, when the
+    /// plan was used whole (not topped up) and a hook made one.
+    prepared_body: Option<Arc<Mutex<BodySlot>>>,
 }
 
 /// Where a frame build's selection ([`TxQueue::frames_for_build_timed`])
@@ -2606,6 +4937,19 @@ pub struct FrameSelectTimes {
     /// Of `by_ref`, frames whose decision read the per-sender counters (a
     /// sender with entries below the frame's run in its lane).
     pub counted: usize,
+    /// `N42_PLAN_AHEAD`: 0 the plan was made here, 1 it was prepared ahead
+    /// and used as it was, 2 prepared ahead and topped up here (`plan_us`
+    /// and the counters above are then the top-up's).
+    pub ahead: u8,
+    /// A used prepared plan's age at use, and its preparation's time.
+    pub ahead_age_us: u64,
+    /// Of a used prepared plan, how long its preparation took (lock wait
+    /// included).
+    pub ahead_prep_us: u64,
+    /// Transactions the top-up added.
+    pub ahead_topup_txs: usize,
+    /// Why a prepared plan was not used, when there was one.
+    pub ahead_discard: Option<AheadDiscard>,
 }
 
 /// How a frame build selects ([`Inner::plan_frames`]); the plan is the
@@ -2648,7 +4992,84 @@ fn queue_batch() -> usize {
     *N.get_or_init(|| std::env::var("N42_TX_QUEUE_BATCH").ok().and_then(|v| v.parse().ok()).filter(|n| *n >= 1).unwrap_or(1))
 }
 
+/// Transactions a build took and gives back, indexed by allocation so that
+/// [`Inner::untake_all`] forgets them from the build's taken list in one
+/// pass. Built outside the queue's lock.
+struct Returned<T: PoolTransaction> {
+    transactions: Vec<Arc<ValidPoolTransaction<T>>>,
+    /// How many times each allocation is returned.
+    by_ptr: std::collections::HashMap<usize, u32>,
+}
+
+impl<T: PoolTransaction> Returned<T> {
+    fn new(transactions: Vec<Arc<ValidPoolTransaction<T>>>) -> Self {
+        let mut by_ptr = std::collections::HashMap::with_capacity(transactions.len());
+        for transaction in &transactions {
+            *by_ptr.entry(Arc::as_ptr(transaction) as usize).or_insert(0u32) += 1;
+        }
+        Self { transactions, by_ptr }
+    }
+}
+
+impl<T: PoolTransaction> Inner<T> {
+    /// Gives a build's untaken transactions back and forgets that the build
+    /// took them: one pass over the taken list, then [`Self::give_back`]
+    /// (which keeps each sender's nonces in their lane's order).
+    ///
+    /// The per-transaction untake this replaces searched the taken list from
+    /// the back and removed from the middle of it for every transaction:
+    /// quadratic in the selection. A refused chained build gives back a
+    /// whole block (163,000 transactions) and held the lock 4,866 ms doing
+    /// it (loop323 Ab, the tenure handover).
+    fn untake_all(&mut self, returned: Returned<T>) {
+        let Returned { transactions, mut by_ptr } = returned;
+        if let Some((_, taken)) = self.last_build.as_mut()
+            && !taken.is_empty()
+        {
+            taken.retain(|t| match by_ptr.get_mut(&(Arc::as_ptr(t) as usize)) {
+                Some(count) if *count > 0 => {
+                    *count -= 1;
+                    false
+                }
+                _ => true,
+            });
+        }
+        self.give_back(transactions);
+    }
+}
+
 impl<T: PoolTransaction> QueueBest<T> {
+    /// The body made with the prepared plan this build stands on
+    /// (`N42_PLAN_AHEAD_BODY=1`, [`TxQueue::set_plan_ahead_hook`]): only when
+    /// the plan was used whole, once. [`PreparedBodyTake::Late`] when the
+    /// hook had not finished.
+    pub fn take_prepared_body(&mut self) -> PreparedBodyTake {
+        let Some(slot) = self.prepared_body.take() else { return PreparedBodyTake::None };
+        let mut slot = slot.lock();
+        match slot.body.take() {
+            Some(body) => PreparedBodyTake::Ready(body, slot.made_us),
+            None => PreparedBodyTake::Late,
+        }
+    }
+
+    /// A frame build's planned frames not yet handed out, all at once, in
+    /// plan order: each frame's shared transactions and the range of them
+    /// still to hand out. The iterator then offers nothing of them, and they
+    /// are not given back when it is dropped: the caller owns them, as it
+    /// owns what `next` hands it. Empty for a build that is not a frame
+    /// build.
+    ///
+    /// What lets a build take its block by frame rather than by 200,000
+    /// `next` calls on a puller thread (`N42_PULL_BY_FRAMES`); the caller
+    /// still makes its own `Arc` of each transaction, on as many threads as
+    /// it likes.
+    pub fn take_frame_segments(&mut self) -> Vec<(FrameTxs<T>, usize, usize)> {
+        if !self.frame_mode || self.frames_ended {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.segments).into_iter().collect()
+    }
+
     /// Returns a transaction taken but not built to the queue, and forgets
     /// that the build took it. The taken list ends with the buffered ones,
     /// so the search from the back is short.
@@ -2671,10 +5092,11 @@ impl<T: PoolTransaction> Drop for QueueBest<T> {
         if self.buffer.is_empty() {
             return;
         }
+        // Indexed before the lock is taken: under it the give-back is one
+        // pass over the build's taken list and one insert a transaction.
+        let returned = Returned::new(self.buffer.drain(..).collect());
         let mut inner = self.queue.lock_inner();
-        for transaction in self.buffer.drain(..) {
-            Self::untake(&mut inner, transaction);
-        }
+        inner.untake_all(returned);
     }
 }
 
@@ -2716,7 +5138,7 @@ impl<T: PoolTransaction> Iterator for QueueBest<T> {
                 return Some(transaction);
             }
             let mut inner = self.queue.lock_inner();
-            self.queue.drain_inbox(&mut inner);
+            self.queue.drain_inbox_block(&mut inner);
             if self.batch <= 1 {
                 return inner.next_ready(&self.skipped);
             }
@@ -3666,6 +6088,13 @@ mod tests {
         build_refusing_gaps(&queue, B256::repeat_byte(1), &|_| 0);
         assert_eq!(queue.usable(), 0);
         queue.push((0..5).map(|n| tx(1, n)).collect::<Vec<_>>());
+        if queue.offlock() {
+            // `usable()` drains nothing under the switch: the filler counts
+            // as it stands in the inbox, the parked head only once the
+            // filler is in its lane and has ended the park.
+            assert_eq!(queue.usable(), 5);
+            queue.drain_now();
+        }
         // The lane is walked again at once: nonces 0-4 and the head the
         // first build handed back. The rest (6-9) is still that build's
         // take and comes back at the next build's start.
@@ -4311,6 +6740,11 @@ mod tests {
         assert!(queue.take_frames(&[B256::repeat_byte(0xf1)])[0].is_none());
         assert_eq!(queue.frames_indexed(), 1);
         assert_eq!(queue.frames_with_txs(), 1);
+        // Freed on the queue's freeing thread, after the prune returns.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while weak.iter().any(|w| w.upgrade().is_some()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert!(weak.iter().all(|w| w.upgrade().is_none()), "the index still held a pruned frame's transactions");
         assert!(queue.take_frames(&[B256::repeat_byte(0xf2)])[0].is_some());
     }
@@ -4546,6 +6980,115 @@ mod tests {
     /// The leader's frame selection at the bench's shape: 480k queued in
     /// frames of 500 (one transaction per sender per frame, as the flood's
     /// ingest makes them), a 163k-transaction block of 326 frames, caches
+    /// A queue of `rounds` nonces for each of `senders` senders, pushed as
+    /// frames of 500 the way the ingest does.
+    fn framed_queue(senders: u64, rounds: u64) -> (TxQueue<EthPooledTransaction>, Vec<(Address, u64)>) {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        let mut all: Vec<(Address, u64)> = Vec::with_capacity((senders * rounds) as usize);
+        for n in 0..rounds {
+            for s in 0..senders {
+                let mut a = [0u8; 20];
+                a[..8].copy_from_slice(&(s.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1).to_be_bytes());
+                all.push((Address::from(a), n));
+            }
+        }
+        for (k, chunk) in all.chunks(500).enumerate() {
+            let txs: Vec<EthPooledTransaction> = chunk.iter().map(|(s, n)| tx_hashed(*s, *n)).collect();
+            let hashes: Vec<B256> = txs.iter().map(|t| *t.hash()).collect();
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&(k as u64 + 1).to_be_bytes());
+            queue.push_frame(
+                txs,
+                Some(NewFrame { id: B256::from(id), hashes, members: chunk.to_vec(), gas: 21_000 * chunk.len() as u64 }),
+            );
+        }
+        (queue, all)
+    }
+
+    /// Everything the queue would offer a build on a fresh parent, in order.
+    fn offered(queue: &TxQueue<EthPooledTransaction>, parent: u8) -> Vec<(Address, u64)> {
+        queue.best_for_build(B256::repeat_byte(parent)).map(|t| (t.sender(), t.nonce())).collect()
+    }
+
+    /// Every sender's nonces offered from 0 upwards with no gap and no
+    /// repeat, and exactly the queue's contents.
+    fn assert_lanes_whole(got: &[(Address, u64)], expected: &[(Address, u64)]) {
+        let mut next: std::collections::HashMap<Address, u64> = std::collections::HashMap::new();
+        for (sender, nonce) in got {
+            let at = next.entry(*sender).or_insert(0);
+            assert_eq!(*nonce, *at, "sender {sender} offered out of order");
+            *at += 1;
+        }
+        let mut a = got.to_vec();
+        let mut b = expected.to_vec();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a.len(), b.len(), "lost or duplicated");
+        assert!(a == b, "different contents");
+    }
+
+    /// loop323 Ab: the chained build refused at the tenure handover gives a
+    /// whole block's selection back, and the per-transaction untake held the
+    /// queue's lock 4,866 ms doing it.
+    #[test]
+    fn a_refused_block_selection_goes_back_whole_and_fast() {
+        let (queue, all) = framed_queue(136_000, 3);
+        let before = queue.len();
+        assert_eq!(before, all.len());
+        let (best, plan) = queue.frames_for_build(B256::repeat_byte(0x51), 163_000 * 21_000);
+        assert_eq!(plan.frames.len(), 326);
+        // The take applied to the lanes, as the next lock does.
+        drop(queue.lock_inner());
+        assert_eq!(queue.len(), before - 163_000);
+        let at = std::time::Instant::now();
+        drop(best);
+        let untake = at.elapsed();
+        eprintln!("untake of 163,000 from a queue of {before}: {untake:?}");
+        assert!(untake < std::time::Duration::from_millis(1_500), "untake took {untake:?}");
+        assert_eq!(queue.len(), before);
+        assert_lanes_whole(&offered(&queue, 0x52), &all);
+    }
+
+    /// The give-back's index is built before the lock is taken: a prune of
+    /// other senders and a push of new frames, racing it, leave the queue
+    /// exactly as running them one after the other would.
+    #[test]
+    fn an_untake_racing_a_prune_and_a_push_loses_nothing() {
+        let (queue, all) = framed_queue(20_000, 3);
+        let (best, _) = queue.frames_for_build(B256::repeat_byte(0x61), 30_000 * 21_000);
+        drop(queue.lock_inner());
+        // Mined elsewhere: the first 1,000 senders' nonce 0.
+        let mined: Vec<(Address, u64)> = all.iter().take(1_000).copied().collect();
+        // New arrivals: nonce 3 of the last 1,000 senders.
+        let fresh: Vec<(Address, u64)> = all.iter().take(20_000).skip(19_000).map(|(s, _)| (*s, 3)).collect();
+        let racer = {
+            let queue = queue.clone();
+            let mined = mined.clone();
+            let fresh = fresh.clone();
+            std::thread::spawn(move || {
+                queue.remove_mined_batch(mined);
+                queue.push(fresh.iter().map(|(s, n)| tx_hashed(*s, *n)).collect::<Vec<_>>());
+            })
+        };
+        drop(best);
+        racer.join().expect("racer");
+        let mut expected: Vec<(Address, u64)> = all.iter().skip(1_000).copied().collect();
+        expected.extend(fresh);
+        let got = offered(&queue, 0x62);
+        // The mined senders start at nonce 1 now.
+        let mut next: std::collections::HashMap<Address, u64> = mined.iter().map(|(s, _)| (*s, 1)).collect();
+        for (sender, nonce) in &got {
+            let at = next.entry(*sender).or_insert(0);
+            assert_eq!(*nonce, *at, "sender {sender} offered out of order");
+            *at += 1;
+        }
+        let (mut a, mut b) = (got, expected);
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a.len(), b.len(), "lost or duplicated");
+        assert!(a == b, "different contents");
+    }
+
     /// cold. `cargo test -p n42-tx-queue --release --lib -- --ignored bench_frame_selection --nocapture`.
     #[test]
     #[ignore]
@@ -4603,3 +7146,21 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod snapshot_tests;
+
+#[cfg(test)]
+mod prune_tests;
+
+#[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
+mod drain_tests;
+
+#[cfg(test)]
+mod ahead_tests;
+
+#[cfg(test)]
+mod offlock_tests;

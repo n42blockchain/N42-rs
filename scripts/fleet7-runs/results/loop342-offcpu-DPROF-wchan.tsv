@@ -1,0 +1,16 @@
+S	futex_do_wait	144875
+S	0	743
+S	prepare_task_switch	7
+S	futex_wait	7
+S	perf_event_switch_output	6
+S	__futex_wait	4
+S	do_syscall_64	3
+S	perf_iterate_ctx	3
+S	do_sched_yield	2
+S	sched_clock	2
+S	perf_event_output_forward	2
+S	schedule	1
+S	copy_from_user_nmi	1
+S	perf_ctx_enable	1
+D	0	1
+S	x64_sys_call	1

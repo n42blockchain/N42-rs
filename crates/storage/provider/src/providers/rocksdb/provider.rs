@@ -114,6 +114,8 @@ pub(crate) struct RocksDBWriteCtx {
     pub storage_settings: StorageSettings,
     /// Pending batches to push to after writing.
     pub pending_batches: PendingRocksDBBatches,
+    /// N42: whether the `AccountsHistory` index is written (`N42_ACCOUNT_HISTORY`, default on).
+    pub write_account_history: bool,
 }
 
 impl fmt::Debug for RocksDBWriteCtx {
@@ -123,6 +125,7 @@ impl fmt::Debug for RocksDBWriteCtx {
             .field("prune_tx_lookup", &self.prune_tx_lookup)
             .field("storage_settings", &self.storage_settings)
             .field("pending_batches", &"<pending batches>")
+            .field("write_account_history", &self.write_account_history)
             .finish()
     }
 }
@@ -1005,10 +1008,12 @@ impl RocksDBProvider {
         table: &'static str,
         f: impl FnOnce(&Self) -> R,
     ) -> R {
-        let start = self.0.metrics().map(|_| Instant::now());
+        // N42: `N42_STORAGE_OP_METRICS=0` skips the clock and the records.
+        let metrics = self.0.metrics().filter(|_| crate::providers::op_metrics::enabled());
+        let start = metrics.map(|_| Instant::now());
         let res = f(self);
 
-        if let (Some(start), Some(metrics)) = (start, self.0.metrics()) {
+        if let (Some(start), Some(metrics)) = (start, metrics) {
             metrics.record_operation(operation, table, start.elapsed());
         }
 
@@ -1524,7 +1529,9 @@ impl RocksDBProvider {
 
         let write_tx_hash =
             ctx.storage_settings.storage_v2 && ctx.prune_tx_lookup.is_none_or(|m| !m.is_full());
-        let write_account_history = ctx.storage_settings.storage_v2;
+        // N42: `N42_ACCOUNT_HISTORY=off` skips the index only; the account changesets that are its
+        // source (and the rollback source) are written by the static-file task as before.
+        let write_account_history = ctx.storage_settings.storage_v2 && ctx.write_account_history;
         let write_storage_history = ctx.storage_settings.storage_v2;
 
         // Propagate tracing context into rayon-spawned threads so that RocksDB
@@ -1606,6 +1613,9 @@ impl RocksDBProvider {
         plain_reverts: &[revm::database::states::PlainStateReverts],
         ctx: &RocksDBWriteCtx,
     ) -> ProviderResult<()> {
+        // N42: the three phases timed (map build, shard reads, batch build).
+        let timers = crate::providers::n42_persist::metrics();
+        let phase = Instant::now();
         let mut account_history: BTreeMap<Address, Vec<u64>> = BTreeMap::new();
 
         for (block_idx, reverts) in plain_reverts.iter().enumerate() {
@@ -1620,14 +1630,19 @@ impl RocksDBProvider {
             }
         }
 
+        timers.save_blocks_account_history_map.record(phase.elapsed());
+
         // N42: each address's last shard read and extended on the worker pool,
         // as storage history does; one address at a time this was ~147,000
         // serial point reads per persisted block at the fleet's tier.
+        let phase = Instant::now();
         let shard_puts = account_history
             .into_par_iter()
             .map(|(address, indices)| self.account_history_shards_to_put(address, indices))
             .collect::<ProviderResult<Vec<_>>>()?;
+        timers.save_blocks_account_history_reads.record(phase.elapsed());
 
+        let phase = Instant::now();
         let mut batch = self.batch();
         for shards in shard_puts {
             for (key, shard) in shards {
@@ -1635,6 +1650,7 @@ impl RocksDBProvider {
             }
         }
         ctx.pending_batches.lock().push(batch.into_inner());
+        timers.save_blocks_account_history_batch.record(phase.elapsed());
         Ok(())
     }
 

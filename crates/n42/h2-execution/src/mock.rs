@@ -32,6 +32,13 @@ pub enum ElCall {
     /// A foreign block handed over as its gossip body
     /// (`request::FOREIGN_BODY`).
     NewPayloadBody(B256),
+    /// A held body's execution released into a slot
+    /// ([`ExecutionLayer::new_payload_body_held`]).
+    BodyReleased(B256),
+    /// A held body dropped unexecuted.
+    BodyDropped(B256),
+    /// A check-only request ([`ExecutionLayer::check_only`]).
+    CheckOnly(B256),
 }
 
 /// Behaviour a test wants from the execution layer.
@@ -63,6 +70,19 @@ pub struct MockBehaviour {
     /// reaches the mock (and is recorded): a test holds a commit's forkchoice
     /// open, which is the whole point of running it off the consensus loop.
     pub forkchoice_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// When set, a body's import waits for a permit after its check and
+    /// before its verdict: a test keeps imports in flight, as an engine
+    /// that has not landed them yet does.
+    pub body_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// Whether a resolved build comes back elided, as the compact take
+    /// answer (`N42_TAKE_COMPACT=1`) does: the driver never caches its
+    /// payload.
+    pub elide_builds: bool,
+    /// The check-only answer (`N42_CHECK_BEFORE_SLOT`): `None` is an
+    /// execution layer that does not serve the request; `Some(None)` vouches
+    /// for the block asked about; `Some(Some(other))` answers CHECKED naming
+    /// `other` -- another build -- which must release no vote.
+    pub check_only: Option<Option<B256>>,
 }
 
 impl Default for MockBehaviour {
@@ -76,6 +96,9 @@ impl Default for MockBehaviour {
             take_bodies: false,
             body_needs_txns: None,
             forkchoice_gate: None,
+            body_gate: None,
+            elide_builds: false,
+            check_only: None,
         }
     }
 }
@@ -177,7 +200,27 @@ impl MockExecutionLayer {
             blob_tx_hashes: Vec::new(),
             header: None,
             started: None,
+            elided: false,
+            answer: None,
         }
+    }
+
+    /// A body's verdict, after the check: behind [`MockBehaviour::body_gate`]
+    /// when one is set.
+    async fn answer_body(&self, body: &crate::el::ForeignBody, behaviour: MockBehaviour) -> crate::BodyOutcome {
+        if let Some(gate) = behaviour.body_gate
+            && let Ok(permit) = gate.acquire().await
+        {
+            permit.forget();
+        }
+        // The real channel answers the check while the block is still
+        // executing; without a gap here the two would race in the caller's
+        // select and a test could not say which it saw.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        crate::BodyOutcome::Answered(Ok(PayloadStatus {
+            status: behaviour.new_payload_status,
+            latest_valid_hash: Some(body.block_hash),
+        }))
     }
 
     pub fn payload_for(hash: B256, number: u64) -> ExecutionData {
@@ -226,20 +269,57 @@ impl ExecutionLayer for MockExecutionLayer {
         if let Some(indices) = behaviour.body_needs_txns.clone() {
             return crate::BodyOutcome::NeedTxns(indices);
         }
-        if let Some(error) = behaviour.new_payload_error {
+        if let Some(error) = behaviour.new_payload_error.clone() {
             return crate::BodyOutcome::Answered(Err(ElError(error)));
         }
         // The check first, as the real channel does: it is the vote, and it
         // arrives before the import's verdict.
         let _ = checked.send(PayloadStatus::from_status(PayloadStatusEnum::Valid));
-        // The real channel answers the check while the block is still
-        // executing; without a gap here the two would race in the caller's
-        // select and a test could not say which it saw.
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        crate::BodyOutcome::Answered(Ok(PayloadStatus {
-            status: behaviour.new_payload_status,
-            latest_valid_hash: Some(body.block_hash),
-        }))
+        self.answer_body(body, behaviour).await
+    }
+
+    fn holds_execution(&self) -> bool {
+        self.behaviour.lock().expect("mock behaviour lock").take_bodies
+    }
+
+    async fn new_payload_body_held(
+        &self,
+        _path: crate::ExecutionPath,
+        body: &crate::el::ForeignBody,
+        checked: tokio::sync::oneshot::Sender<PayloadStatus>,
+        release: tokio::sync::oneshot::Receiver<bool>,
+    ) -> crate::BodyOutcome {
+        if !self.behaviour.lock().expect("mock behaviour lock").take_bodies {
+            return crate::BodyOutcome::NotThisWay;
+        }
+        self.record(ElCall::NewPayloadBody(body.block_hash));
+        let behaviour = self.behaviour.lock().expect("mock behaviour lock").clone();
+        if let Some(indices) = behaviour.body_needs_txns.clone() {
+            return crate::BodyOutcome::NeedTxns(indices);
+        }
+        if let Some(error) = behaviour.new_payload_error.clone() {
+            return crate::BodyOutcome::Answered(Err(ElError(error)));
+        }
+        let _ = checked.send(PayloadStatus::from_status(PayloadStatusEnum::Valid));
+        // The execution waits for its slot.
+        if !release.await.unwrap_or(false) {
+            self.record(ElCall::BodyDropped(body.block_hash));
+            return crate::BodyOutcome::Answered(Err(ElError::new(crate::driver::HELD_IMPORT_DROPPED)));
+        }
+        self.record(ElCall::BodyReleased(body.block_hash));
+        self.answer_body(body, behaviour).await
+    }
+
+    fn checks_only(&self) -> bool {
+        self.behaviour.lock().expect("mock behaviour lock").check_only.is_some()
+    }
+
+    async fn check_only(&self, block_hash: B256, _header_rlp: alloy_primitives::Bytes) -> bool {
+        self.record(ElCall::CheckOnly(block_hash));
+        let answer = self.behaviour.lock().expect("mock behaviour lock").check_only;
+        let Some(named) = answer else { return false };
+        let status = PayloadStatus::from_status(PayloadStatusEnum::Valid).with_latest_valid_hash(named.unwrap_or(block_hash));
+        crate::el::vouches_for(block_hash, &status)
     }
 
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError> {
@@ -351,7 +431,8 @@ impl ExecutionLayer for MockExecutionLayer {
             state.next_block = state.next_block.max(known) + 1;
             (state.next_block, state.next_parent)
         };
-        let built = Self::built_block_on(number, parent);
+        let mut built = Self::built_block_on(number, parent);
+        built.elided = self.behaviour.lock().expect("mock behaviour lock").elide_builds;
         if let Ok(block) = built.execution_data.clone().into_block_raw() {
             self.state
                 .lock()

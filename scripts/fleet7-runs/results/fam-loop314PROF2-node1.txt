@@ -1,0 +1,50 @@
+perf-loop314PROF2-node1.data: 320070 samples
+-- tokio-rt: 31.6% of samples
+    26.3% of family  keccak::backends::soft::keccak_p::<u64, 24>
+    23.9% of family  [kernel]
+     4.3% of family  <n42_tx_queue::TxQueue<n42_engine_types::pool::N42PooledTransaction>>::index_and_stage
+     3.7% of family  <hashbrown::map::HashMap<alloy_primitives::bits::fixed::FixedBytes<32>, alloc::sync::Arc<reth_transa
+     2.8% of family  [unknown]
+     2.5% of family  <sha3::Keccak256 as digest::FixedOutput>::finalize_into
+-- n42-build: 28.3% of samples
+    19.3% of family  [kernel]
+     9.5% of family  <revm_database::states::bundle_state::BundleState>::account
+     6.6% of family  [unknown]
+     6.4% of family  <&n42_engine_types::parallel_transfer::execute_for_build_opts<(), n42_engine_types::fast_transfer::d
+     4.2% of family  <revm_context::tx::TxEnvBuilder>::build
+     3.4% of family  <n42_twig_core::entry_store::FileEntries>::record
+-- storage: 18.1% of samples
+    18.8% of family  [kernel]
+     8.8% of family  [unknown]
+     6.1% of family  <metrics_util::registry::recency::Generational<alloc::sync::Arc<core::sync::atomic::Atomic<u64>>> as
+     4.5% of family  <reth_provider::providers::rocksdb::provider::RocksDBProvider>::write_account_history
+     2.5% of family  <metrics_exporter_prometheus::registry::AtomicBucketInstant<f64> as metrics::handles::HistogramFn>::
+     2.2% of family  crossbeam_epoch::default::with_handle::<crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch:
+-- n: 11.6% of samples
+    32.9% of family  [kernel]
+    10.3% of family  bytes::bytes::shallow_clone_vec
+     9.5% of family  <n42_twig_core::index::Shard>::get::<<n42_qmdb_reth::read_view::QmdbReadView>::step_back::{closure#0
+     5.8% of family  [unknown]
+     5.3% of family  rayon::slice::sort::partition::<(alloy_primitives::bits::address::Address, revm_database::states::re
+     4.9% of family  <alloc::vec::Vec<u8> as bytes::buf::buf_mut::BufMut>::put_slice
+-- jemalloc_bg_thd: 4.1% of samples
+    96.2% of family  [kernel]
+     0.9% of family  pthread_mutex_trylock
+     0.7% of family  pthread_mutex_unlock
+     0.6% of family  _rjem_je_edata_heap_remove
+     0.5% of family  _rjem_je_eset_remove
+     0.1% of family  emap_try_acquire_edata_neighbor_impl
+-- n42-follower-me: 1.7% of samples
+    32.5% of family  <hashbrown::map::HashMap<alloy_primitives::bits::address::Address, revm_database::states::bundle_acc
+    26.9% of family  <revm_database::states::bundle_account::BundleAccount as core::clone::Clone>::clone
+    14.2% of family  [kernel]
+     6.1% of family  <core::iter::adapters::cloned::Cloned<core::iter::adapters::filter_map::FilterMap<core::iter::adapte
+     4.9% of family  <[u8; 20] as core::hash::Hash>::hash::<alloy_primitives::map::fixed::FbHasher<20>>
+     4.8% of family  rayon::slice::sort::partition::<(alloy_primitives::bits::address::Address, revm_database::states::re
+-- engine: 1.1% of samples
+    39.1% of family  <hashbrown::map::HashMap<alloy_primitives::bits::address::Address, revm_database::states::bundle_acc
+    26.6% of family  [kernel]
+    15.5% of family  bytes::bytes::shared_drop
+    13.0% of family  <alloc::vec::Vec<alloc::vec::Vec<(alloy_primitives::bits::address::Address, revm_database::states::r
+     4.1% of family  <alloc::vec::Vec<alloy_consensus::receipt::receipt2::EthereumReceipt<n42_tx_types::envelope::N42TxTy
+     0.3% of family  core::ptr::drop_glue::<n42_tx_types::alt_sig::TxAltSig>

@@ -46,7 +46,9 @@ use reth_primitives_traits::{NodePrimitives, RecoveredBlock};
 use reth_provider::{BlockExecutionOutput, ProviderError, ProviderResult};
 use reth_storage_overlay::OverlayManager;
 use reth_trie::updates::TrieUpdates;
-use tracing::debug;
+use tracing::{debug, info};
+
+use crate::exec_cache::{ExecCacheOnInsert, N42TreeValidator, EXEC_CACHE_ENV};
 
 use crate::changes::changes_from_execution;
 use reth_chainspec::EthereumHardforks;
@@ -215,7 +217,8 @@ where
         > + Clone,
     <Node::Types as NodeTypes>::ChainSpec: EthereumHardforks,
 {
-    type EngineValidator = BasicEngineValidator<Node::Provider, Node::Evm, PVB::Validator>;
+    type EngineValidator =
+        N42TreeValidator<BasicEngineValidator<Node::Provider, Node::Evm, PVB::Validator>>;
 
     async fn build_tree_validator(
         self,
@@ -227,7 +230,22 @@ where
             .inner
             .build_tree_validator(ctx, tree_config, overlay_manager)
             .await?;
-        Ok(match self.state {
+        // A QMDB chain keeps executed inserts out of reth's cross-block
+        // execution cache (see `exec_cache`); any other chain is upstream's.
+        let mode = if self.state.is_some() {
+            ExecCacheOnInsert::from_env()
+        } else {
+            ExecCacheOnInsert::Update
+        };
+        info!(
+            target: "n42::qmdb",
+            mode = mode.as_str(),
+            qmdb = self.state.is_some(),
+            env = EXEC_CACHE_ENV,
+            "executed inserts and reth's cross-block execution cache"
+        );
+        let runtime = ctx.node.task_executor().clone();
+        let validator = match self.state {
             Some(state) => {
                 let strategy: Arc<
                     dyn StateRootStrategy<PrimitivesTy<Node::Types>, Node::Provider, Node::Evm>,
@@ -239,6 +257,7 @@ where
                 validator.with_state_root_strategy(strategy)
             }
             None => validator,
-        })
+        };
+        Ok(N42TreeValidator::new(validator, mode, runtime))
     }
 }

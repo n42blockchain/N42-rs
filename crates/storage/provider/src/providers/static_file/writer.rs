@@ -1226,6 +1226,112 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         Ok(())
     }
 
+    /// N42: asks the kernel to start writing the data file's dirty pages to the device
+    /// (`sync_file_range(SYNC_FILE_RANGE_WRITE)`) without waiting for them, so the batch's
+    /// [`Self::sync_all`] finds most of them written (`N42_SF_EARLY_WRITEBACK=1`).
+    ///
+    /// A hint only: durability still comes from `sync_all`, which is unchanged, and a failure
+    /// here is ignored. Rows still in the writer's buffer are not in the file yet and are left
+    /// to `sync_all`.
+    pub fn n42_start_writeback(&self) {
+        #[cfg(target_os = "linux")]
+        if let Ok(file) = std::fs::File::open(&self.data_path) {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the descriptor is open for the duration of the call, and the flag only
+            // starts writeback of pages already in the page cache.
+            let _ = unsafe {
+                libc::sync_file_range(file.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE)
+            };
+        }
+    }
+
+    /// N42: appends `lens.len()` transactions whose rows are already encoded, numbered from
+    /// `first_tx_num`.
+    ///
+    /// `rows` holds each transaction's `Compact` encoding back to back and `lens` their lengths,
+    /// so the file gets the same bytes, offsets and header as that many
+    /// [`Self::append_transaction`] calls; only the encoding has been done elsewhere (in
+    /// parallel, by `write_transactions` under `N42_SF_PARALLEL_ENCODE=1`). Like
+    /// `append_transaction` it does not call `increment_block()`.
+    pub fn append_transactions_encoded(
+        &mut self,
+        first_tx_num: TxNumber,
+        rows: &[u8],
+        lens: &[u32],
+    ) -> ProviderResult<()> {
+        self.n42_append_encoded_tx_rows(StaticFileSegment::Transactions, first_tx_num, rows, lens)
+    }
+
+    /// N42: appends `lens.len()` receipts whose rows are already encoded, numbered from
+    /// `first_tx_num`: the same bytes, offsets and header as that many [`Self::append_receipt`]
+    /// calls (see [`Self::append_transactions_encoded`]).
+    pub fn append_receipts_encoded(
+        &mut self,
+        first_tx_num: TxNumber,
+        rows: &[u8],
+        lens: &[u32],
+    ) -> ProviderResult<()> {
+        self.n42_append_encoded_tx_rows(StaticFileSegment::Receipts, first_tx_num, rows, lens)
+    }
+
+    /// N42: the shared body of the tx-numbered encoded appends.
+    fn n42_append_encoded_tx_rows(
+        &mut self,
+        expected: StaticFileSegment,
+        first_tx_num: TxNumber,
+        rows: &[u8],
+        lens: &[u32],
+    ) -> ProviderResult<()> {
+        let start = Instant::now();
+        self.ensure_no_queued_prune()?;
+
+        let segment = self.writer.user_header().segment();
+        debug_assert!(segment == expected);
+        if lens.is_empty() {
+            return Ok(());
+        }
+        let total: usize = lens.iter().map(|len| *len as usize).sum();
+        if total != rows.len() {
+            return Err(ProviderError::other(StaticFileWriterError::new(
+                "encoded rows do not match their lengths",
+            )));
+        }
+        let tx_start = match self.writer.user_header().tx_range() {
+            Some(range) => {
+                let next_tx = range.end() + 1;
+                if next_tx != first_tx_num {
+                    return Err(ProviderError::UnexpectedStaticFileTxNumber(
+                        segment,
+                        first_tx_num,
+                        next_tx,
+                    ));
+                }
+                range.start()
+            }
+            None => first_tx_num,
+        };
+
+        let mut offset = 0;
+        for len in lens {
+            let end = offset + *len as usize;
+            self.writer.append_column(Some(Ok(&rows[offset..end]))).map_err(ProviderError::other)?;
+            offset = end;
+        }
+        let tx_end = first_tx_num + lens.len() as u64 - 1;
+        self.writer.user_header_mut().set_tx_range(tx_start, tx_end);
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_segment_operations(
+                segment,
+                StaticFileProviderOperation::Append,
+                lens.len() as u64,
+                Some(start.elapsed()),
+            );
+        }
+
+        Ok(())
+    }
+
     /// Appends receipt to static file.
     ///
     /// It **DOES NOT** call `increment_block()`, it should be handled elsewhere. There might be
@@ -1382,6 +1488,55 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 StaticFileSegment::AccountChangeSets,
                 StaticFileProviderOperation::Append,
                 count,
+                Some(start.elapsed()),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// N42: appends account changeset entries, already sorted by address and encoded
+    /// (`AccountBeforeTx::to_compact` back to back in `rows`, lengths in `lens`), to the block
+    /// started by [`Self::begin_account_changeset`].
+    ///
+    /// Called with a block's sorted entries in order (in one call or in consecutive chunks), the
+    /// file gets the same bytes, offsets, header and changeset sidecar as
+    /// [`Self::append_account_changeset`] of the same entries; only the sort and the encoding have
+    /// been done elsewhere (in parallel, under `N42_SF_PARALLEL_ENCODE=1`).
+    pub fn append_account_changeset_entries_encoded(
+        &mut self,
+        rows: &[u8],
+        lens: &[u32],
+    ) -> ProviderResult<()> {
+        debug_assert!(self.writer.user_header().segment() == StaticFileSegment::AccountChangeSets);
+        let start = Instant::now();
+        if self.current_changeset_offset.is_none() {
+            return Err(ProviderError::other(StaticFileWriterError::new(
+                "account changeset stream must be started before appending entries",
+            )))
+        }
+        let total: usize = lens.iter().map(|len| *len as usize).sum();
+        if total != rows.len() {
+            return Err(ProviderError::other(StaticFileWriterError::new(
+                "encoded rows do not match their lengths",
+            )));
+        }
+
+        let mut offset = 0;
+        for len in lens {
+            let end = offset + *len as usize;
+            if let Some(ref mut changeset_offset) = self.current_changeset_offset {
+                changeset_offset.increment_num_changes();
+            }
+            self.writer.append_column(Some(Ok(&rows[offset..end]))).map_err(ProviderError::other)?;
+            offset = end;
+        }
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_segment_operations(
+                StaticFileSegment::AccountChangeSets,
+                StaticFileProviderOperation::Append,
+                lens.len() as u64,
                 Some(start.elapsed()),
             );
         }

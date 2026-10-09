@@ -1966,6 +1966,412 @@ async fn test_deferred_execution__headers_carry_the_parents_execution_across_the
 }
 
 
+/// Builds one payload on `parent_hash` at `timestamp` with the node's payload
+/// builder and hands it to the engine (`newPayload`), without moving the head:
+/// what [`new_block_at`] does short of its forkchoice. Returns the block.
+#[cfg(test)]
+async fn build_and_submit_on<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(
+    node: &FullNode<Node, AddOns>,
+    eth_signer_key: &str,
+    consensus: &CapturingConsensusBuilder,
+    parent_hash: B256,
+    timestamp: u64,
+) -> eyre::Result<reth_primitives_traits::SealedBlock<n42_tx_types::Block>>
+where
+    <<<Node as FullNodeTypes>::Types as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes:
+        From<reth::rpc::types::engine::PayloadAttributes>,
+    <<Node as FullNodeTypes>::Types as NodeTypes>::Primitives: NodePrimitives<Block = n42_tx_types::Block>,
+    <<Node as FullNodeTypes>::Types as NodeTypes>::Payload: EngineTypes,
+{
+    let signer = PrivateKeySigner::from_bytes(&FixedBytes::from_str(eth_signer_key)?)?;
+    let attributes = n42_payload_attributes(timestamp, parent_hash, signer.address());
+    consensus.arm(eth_signer_key, None)?;
+    let payload_id = node
+        .payload_builder_handle
+        .send_new_payload(reth_payload_builder::BuildNewPayload {
+            attributes: attributes.into(),
+            parent_hash,
+            resources: Default::default(),
+        })
+        .await
+        .map_err(|err| eyre::eyre!("payload job: {err}"))??;
+    let payload = node
+        .payload_builder_handle
+        .resolve_kind(payload_id, PayloadKind::default())
+        .await
+        .ok_or_else(|| eyre::eyre!("missing payload"))??;
+    let block = payload.block().clone();
+    let client = node.engine_http_client();
+    let execution_payload = ExecutionPayloadV3::from_block_slow(&block.clone().into_block());
+    let status = EngineApiClient::new_payload_v3(&client, execution_payload, vec![], B256::ZERO).await?;
+    eyre::ensure!(status.is_valid(), "block {} on {parent_hash}: {status:?}", block.number());
+    Ok(block)
+}
+
+/// What one run of [`deferred_chain`] builds.
+#[cfg(test)]
+struct DeferredChainRun {
+    /// `deferredExecutionDepth`, or `None` to leave the key out.
+    depth: Option<u64>,
+    /// The gate: block `fork_block`'s timestamp (0 = at genesis).
+    fork_block: u64,
+    /// Canonical blocks 1..=last.
+    last: u64,
+    /// The canonical blocks with a transfer.
+    carries: &'static [u64],
+    /// Also build the sibling fork (depth 2): 4f and 5f on block 3, both
+    /// empty (so 4f differs from a block 4 that carries a transfer), after
+    /// the canonical chain.
+    fork: bool,
+    /// Scratch directory tag.
+    tag: &'static str,
+}
+
+/// The deferred-execution dev chain at a given depth: APoS-sealed, QMDB,
+/// fixed keys and timestamps (block n at T0 + n), so it reproduces byte for
+/// byte. Every block is built by the node's payload builder and imported by
+/// its engine; every header is checked against the rule
+/// (`n42_engine_types::hotstuff_consensus::ancestor_executed_fields`, the
+/// check `HotStuffConsensus::validate_header_against_parent` and the
+/// follower's vote road make) at the run's depth and, for the refusal, at the
+/// other depth. Returns the vectors document.
+#[cfg(test)]
+async fn deferred_chain(run: DeferredChainRun) -> eyre::Result<serde_json::Value> {
+    use alloy_eips::eip2718::Encodable2718;
+    use n42_qmdb_reth::{executed_fields::ExecutedFields, with_declared_state_scheme, QmdbNodeState};
+    use reth_provider::BlockReader;
+
+    reth_tracing::init_test_tracing();
+    let runtime = Runtime::test();
+    let mut accounts = TesterAccountPool::new();
+    accounts
+        .accounts
+        .insert("A".to_string(), secp256k1::SecretKey::from_slice(&[0x11u8; 32])?);
+    let base = CliqueTest { signers: vec!["A".to_string()], ..Default::default() };
+    let mut chainspec = base.gen_chainspec(&mut accounts);
+    let sender = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x42))?;
+    chainspec.genesis.alloc.insert(
+        sender.address(),
+        alloy_genesis::GenesisAccount { balance: U256::from(10u128.pow(18)), ..Default::default() },
+    );
+    const T0: u64 = 1_750_000_000;
+    let fork_time = if run.fork_block == 0 { 0 } else { T0 + run.fork_block };
+    chainspec.genesis.config.extra_fields.insert_value("stateScheme".to_string(), "qmdb")?;
+    chainspec.genesis.config.extra_fields.insert_value("deferredExecutionTime".to_string(), fork_time)?;
+    if let Some(depth) = run.depth {
+        chainspec.genesis.config.extra_fields.insert_value("deferredExecutionDepth".to_string(), depth)?;
+    }
+    let depth = reth_chainspec::qmdb::check_deferred_execution_depth(&chainspec.genesis)?;
+    let chainspec = Arc::new(with_declared_state_scheme(chainspec)?);
+
+    let dir = std::env::temp_dir().join(format!("n42-deferred-{}-{}", run.tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let qmdb = QmdbNodeState::new(chainspec.clone(), &dir);
+    let mut node_config = NodeConfig::new(chainspec.clone())
+        .with_network(NetworkArgs {
+            discovery: DiscoveryArgs { disable_discovery: true, ..DiscoveryArgs::default() },
+            ..NetworkArgs::default()
+        })
+        .with_unused_ports()
+        .with_rpc(RpcServerArgs::default().with_unused_ports().with_http())
+        .with_dev(DevArgs {
+            dev: false,
+            consensus_signer_private_key: Some(B256::random().to_string()),
+            ..Default::default()
+        });
+    node_config.engine.cross_block_cache_size = TEST_CROSS_BLOCK_CACHE_MB;
+    // Nothing persisted while the test runs: the fork reorgs below block 4.
+    node_config.engine.persistence_threshold = 64;
+    let capturing_consensus = CapturingConsensusBuilder::default();
+    let types = N42Node::with_qmdb(Some(qmdb.clone()));
+    let NodeHandle { node, .. } = {
+        let _alt_sig_guard = ALT_SIG_FLAG_LOCK.lock().await;
+        NodeBuilder::new(node_config)
+            .testing_node(runtime.clone())
+            .with_types::<N42Node>()
+            .with_components(
+                types
+                    .components_builder()
+                    .consensus(capturing_consensus.clone())
+                    .payload(
+                        n42_engine_types::N42PayloadServiceBuilder::new(capturing_consensus.clone())
+                            .with_qmdb(Some(qmdb.clone())),
+                    ),
+            )
+            .with_add_ons(types.add_ons())
+            .launch()
+            .await?
+    };
+    let genesis_hash = node.provider.block_hash(0)?.expect("genesis is stored");
+    qmdb.initialize((0, genesis_hash))?;
+
+    let fields_of = |h: &alloy_consensus::Header| ExecutedFields {
+        state_root: h.state_root,
+        receipts_root: h.receipts_root,
+        logs_bloom: h.logs_bloom,
+        gas_used: h.gas_used,
+    };
+    let send = |signer: &PrivateKeySigner, nonce: u64| -> eyre::Result<n42_engine_types::N42PooledTransaction> {
+        let tx = alloy_consensus::TxEip1559 {
+            chain_id: chainspec.chain().id(),
+            nonce,
+            gas_limit: 21_000,
+            max_fee_per_gas: 10_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: alloy_primitives::TxKind::Call(Address::with_last_byte(0x77)),
+            value: U256::from(1_000u64),
+            ..Default::default()
+        };
+        let signature =
+            alloy_signer::SignerSync::sign_hash_sync(signer, &alloy_consensus::SignableTransaction::signature_hash(&tx))?;
+        let signed = n42_tx_types::N42TxEnvelope::from(reth_ethereum_primitives::TransactionSigned::new_unhashed(
+            tx.into(),
+            signature,
+        ));
+        let encoded_len = signed.encode_2718_len();
+        let recovered = reth_primitives_traits::Recovered::new_unchecked(signed, signer.address());
+        Ok(n42_engine_types::N42PooledTransaction::new(recovered, encoded_len))
+    };
+    let key = hex::encode(accounts.secret_key("A").secret_bytes());
+    let genesis_sealed = chainspec.genesis_header.clone();
+    // Every block's own result and sealed header, by hash, genesis included.
+    let mut own: std::collections::HashMap<B256, ExecutedFields> = std::collections::HashMap::new();
+    let mut sealed_by_hash: std::collections::HashMap<B256, reth_primitives_traits::SealedHeader> =
+        std::collections::HashMap::new();
+    own.insert(genesis_hash, fields_of(&genesis_sealed));
+    sealed_by_hash.insert(genesis_hash, SealedHeader::new(genesis_sealed.header().clone(), genesis_hash));
+    let block_json = |header: &reth_primitives_traits::SealedHeader,
+                      deferred: bool,
+                      own: &ExecutedFields,
+                      transactions: Vec<alloy_primitives::Bytes>| {
+        serde_json::json!({
+            "number": header.number,
+            "hash": header.hash(),
+            "deferred": deferred,
+            "transactions": transactions,
+            "header": header.header(),
+            "executed": {
+                "stateRoot": own.state_root,
+                "receiptsRoot": own.receipts_root,
+                "logsBloom": own.logs_bloom,
+                "gasUsed": alloy_primitives::U64::from(own.gas_used),
+            },
+        })
+    };
+    // The rule, as consensus and the vote road apply it, at `at_depth`.
+    let expected_at = |known: &std::collections::HashMap<B256, reth_primitives_traits::SealedHeader>,
+                       header: &reth_primitives_traits::SealedHeader,
+                       at_depth: u64| {
+        let parent = &known[&header.parent_hash];
+        n42_engine_types::hotstuff_consensus::ancestor_executed_fields(&chainspec.genesis, parent, at_depth)
+    };
+
+    let mut nonce = 0u64;
+    let mut blocks = Vec::new();
+    let mut canonical: Vec<reth_primitives_traits::SealedHeader> = vec![sealed_by_hash[&genesis_hash].clone()];
+    for number in 1..=run.last {
+        if run.carries.contains(&number) {
+            let pooled = send(&sender, nonce)?;
+            nonce += 1;
+            reth_transaction_pool::TransactionPool::add_transaction(
+                &node.pool,
+                reth_transaction_pool::TransactionOrigin::Local,
+                pooled,
+            )
+            .await?;
+        }
+        new_block_at(&node, key.clone(), None, &capturing_consensus, Some(T0 + number)).await?;
+        let header = node.provider.latest_header()?.expect("a head");
+        eyre::ensure!(header.number == number, "block {number} was not accepted by the engine");
+        let mine = n42_engine_types::executed_fields::get(&header.hash()).expect("the block's own result is recorded");
+        eyre::ensure!(qmdb.root_of(&header.hash()) == Some(mine.state_root), "the recorded root is the forest's");
+        let deferred = number >= run.fork_block;
+        let carried = fields_of(header.header());
+        if deferred {
+            let source = &canonical[number.saturating_sub(depth) as usize];
+            assert_eq!(carried, own[&source.hash()], "block {number} carries result({}) at depth {depth}", source.number);
+            assert_eq!(expected_at(&sealed_by_hash, &header, depth), Some(carried), "block {number}: the vote rule accepts it");
+        } else {
+            assert_eq!(carried, mine, "block {number} carries its own execution before the gate");
+        }
+        own.insert(header.hash(), mine);
+        sealed_by_hash.insert(header.hash(), header.clone());
+        canonical.push(header.clone());
+        let block = node.provider.block_by_number(number)?.expect("the block");
+        blocks.push(block_json(
+            &header,
+            deferred,
+            &mine,
+            block.body.transactions.iter().map(|tx| alloy_primitives::Bytes::from(tx.encoded_2718())).collect(),
+        ));
+        qmdb.on_canonical(header.hash())?;
+    }
+
+    // The mixed-fleet refusal on real blocks: at the other depth a header
+    // whose two candidate ancestors' results differ is refused.
+    if depth == 2 && run.fork_block == 0 {
+        for number in [3u64, 4] {
+            let header = &canonical[number as usize];
+            assert_ne!(
+                expected_at(&sealed_by_hash, header, 1),
+                Some(fields_of(header.header())),
+                "a depth-1 node refuses block {number} of a depth-2 chain"
+            );
+        }
+    }
+
+    // The sibling fork (design 4.7): 4f and 5f on block 3, empty, so
+    // result(4f) differs from result(4) (which carries a transfer).
+    let mut fork = Vec::new();
+    if run.fork {
+        eyre::ensure!(depth == 2 && run.last >= 6 && run.carries.contains(&4), "the fork vector is the depth-2 one");
+        let three = canonical[3].hash();
+        let four_f = build_and_submit_on(&node, &key, &capturing_consensus, three, T0 + 104).await?;
+        // The head moves to 4f (genesis stays the finalized block), so 5f can
+        // be built on it.
+        let client = node.engine_http_client();
+        EngineApiClient::fork_choice_updated_v1(
+            &client,
+            reth::rpc::types::engine::ForkchoiceState {
+                head_block_hash: four_f.hash(),
+                safe_block_hash: genesis_hash,
+                finalized_block_hash: genesis_hash,
+            },
+            None,
+        )
+        .await?;
+        // The reorg gives the canonical chain's dropped transactions back to
+        // the pool, asynchronously; 5f must not depend on when. Wait for the
+        // pool to settle, then empty it, so 5f is empty on every run.
+        let settle_until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last_seen = (usize::MAX, std::time::Instant::now());
+        while std::time::Instant::now() < settle_until {
+            let size = reth_transaction_pool::TransactionPool::pool_size(&node.pool).total;
+            if size != last_seen.0 {
+                last_seen = (size, std::time::Instant::now());
+            } else if last_seen.1.elapsed() >= std::time::Duration::from_millis(500) && size > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let pending: Vec<B256> = reth_transaction_pool::TransactionPool::all_transactions(&node.pool)
+            .all()
+            .map(|tx| *tx.hash())
+            .collect();
+        let _ = reth_transaction_pool::TransactionPool::remove_transactions(&node.pool, pending);
+        let five_f = build_and_submit_on(&node, &key, &capturing_consensus, four_f.hash(), T0 + 105).await?;
+        eyre::ensure!(five_f.body().transactions.is_empty() && four_f.body().transactions.is_empty(), "the fork is empty");
+        let sides = [four_f, five_f];
+        for side in &sides {
+            let header = side.sealed_header().clone();
+            let mine = n42_engine_types::executed_fields::get(&header.hash()).expect("the sibling's own result");
+            own.insert(header.hash(), mine);
+            sealed_by_hash.insert(header.hash(), header.clone());
+            assert_eq!(expected_at(&sealed_by_hash, &header, 2), Some(fields_of(header.header())), "the vote rule accepts {}", header.number);
+            fork.push(block_json(
+                &header,
+                true,
+                &mine,
+                side.body().transactions.iter().map(|tx| alloy_primitives::Bytes::from(tx.encoded_2718())).collect(),
+            ));
+        }
+        let (four, five, six) = (&canonical[4], &canonical[5], &canonical[6]);
+        let (four_f, five_f) = (sides[0].sealed_header(), sides[1].sealed_header());
+        assert_ne!(own[&four.hash()], own[&four_f.hash()], "the siblings executed different bodies");
+        assert_eq!(fields_of(four_f.header()), own[&canonical[2].hash()], "4 and 4f carry result(2)");
+        assert_eq!(fields_of(four.header()), fields_of(four_f.header()));
+        assert_eq!(fields_of(five_f.header()), own[&canonical[3].hash()], "5 and 5f carry result(3)");
+        assert_eq!(fields_of(five.header()), fields_of(five_f.header()));
+        assert_ne!(five.parent_hash, five_f.parent_hash, "with different parents");
+        assert_eq!(fields_of(six.header()), own[&four.hash()], "6 on 5 carries result(4), never result(4f)");
+        assert_ne!(fields_of(six.header()), own[&four_f.hash()]);
+    }
+
+    let vectors = serde_json::json!({
+        "description": "Deferred execution at depth 2 (docs/DEFERRED_DEPTH_2_DESIGN.md): with \
+            deferredExecutionTime 0 and deferredExecutionDepth 2 the header of block N carries the result of \
+            its parent's parent (stateRoot / receiptsRoot / logsBloom / gasUsed after executing that block); \
+            blocks 1 and 2 carry the genesis header's own four fields. `executed` is what the block's own \
+            execution produced, carried by the header two blocks later on the same chain. `fork` holds two \
+            empty blocks on block 3 of `blocks` (4f, and 5f on 4f; block 4 carries a transfer): 4f carries \
+            result(2) like block 4, 5f carries result(3) like block 5 with a different parent, and block 6 \
+            (on 5) carries result(4), not result(4f). Plain EIP-1559 transfers, the priority fee to `feeRecipient` (the APoS \
+            signer; the header's miner field is zero), no withdrawals, no block reward. \
+            Generated by n42-testing test_deferred_execution_depth_2__headers_carry_the_grandparents_execution.",
+        "chainId": chainspec.chain().id(),
+        "stateScheme": "qmdb",
+        "deferredExecutionTime": fork_time,
+        "deferredExecutionDepth": depth,
+        "signerPrivateKey": B256::from([0x11u8; 32]),
+        "signerAddress": accounts.address("A"),
+        "feeRecipient": accounts.address("A"),
+        "senderPrivateKey": B256::repeat_byte(0x42),
+        "genesis": {
+            "hash": genesis_hash,
+            "header": &chainspec.genesis_header.header(),
+            "alloc": &chainspec.genesis.alloc,
+        },
+        "blocks": blocks,
+        "fork": fork,
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(vectors)
+}
+
+/// Depth 1 set explicitly (`"deferredExecutionDepth": 1`) builds and checks
+/// exactly the blocks the depth-1 vectors hold
+/// (`testdata/deferred_execution_vectors.json`, written before the depth
+/// existed): the depth parameter changed nothing at depth 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_deferred_execution__an_explicit_depth_one_builds_the_same_blocks() -> eyre::Result<()> {
+    let vectors = deferred_chain(DeferredChainRun {
+        depth: Some(1),
+        fork_block: 3,
+        last: 6,
+        carries: &[2, 3, 5],
+        fork: false,
+        tag: "explicit-d1",
+    })
+    .await?;
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/deferred_execution_vectors.json");
+    let stored: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    assert_eq!(vectors["genesis"]["hash"], stored["genesis"]["hash"], "the same genesis");
+    assert_eq!(vectors["blocks"], stored["blocks"], "the same blocks, byte for byte");
+    Ok(())
+}
+
+/// T12 of docs/DEFERRED_DEPTH_2_DESIGN.md: a QMDB dev chain with
+/// `deferredExecutionDepth` 2 from genesis. Seven blocks with transfers in
+/// 1 to 5, each built by the payload builder and imported by the
+/// engine; every header carries the result two behind it (blocks 1 and 2 the
+/// genesis fields) and passes the vote rule at depth 2, while a depth-1 node
+/// would refuse it; plus the sibling-fork vector. The run is
+/// `testdata/deferred_execution_vectors_d2.json`, the fixture gov5 checks
+/// against: `N42_WRITE_VECTORS=1` rewrites it (run this test alone then: the
+/// depth-1 vectors test reads the same variable), otherwise it is compared.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_deferred_execution_depth_2__headers_carry_the_grandparents_execution() -> eyre::Result<()> {
+    let vectors = deferred_chain(DeferredChainRun {
+        depth: Some(2),
+        fork_block: 0,
+        last: 7,
+        carries: &[1, 2, 3, 4, 5],
+        fork: true,
+        tag: "d2",
+    })
+    .await?;
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/deferred_execution_vectors_d2.json");
+    let rendered = serde_json::to_string_pretty(&vectors)? + "\n";
+    if std::env::var_os("N42_WRITE_VECTORS").is_some() {
+        std::fs::write(&path, &rendered)?;
+        println!("wrote {}", path.display());
+    } else {
+        let stored: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        assert_eq!(vectors, stored, "the chain no longer matches {} (N42_WRITE_VECTORS=1 rewrites it)", path.display());
+    }
+    Ok(())
+}
+
 /// A 0x50 (Ed25519) transfer on a chain whose genesis enables the type: the
 /// pool admits it, the builder mines it, the stored block and receipt carry
 /// the type. This is the path the fleet smoke test exercises, in one process.

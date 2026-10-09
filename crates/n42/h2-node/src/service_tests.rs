@@ -430,6 +430,86 @@ async fn a_held_block_is_logged_once_then_released_when_the_tip_catches_up() {
     assert!(!rig.svc.held_warned.contains(&hash));
 }
 
+/// E=1: one execution layer shared by many keys, and this key's driver is
+/// still at genesis because it missed the view-1 block. The layer is at 5.
+async fn rig_at_genesis_with_a_layer_at_five() -> Rig {
+    use n42_h2_execution::ExecutionLayer;
+    let mut rig = node(1, 0, None).await;
+    let mut parent = B256::ZERO;
+    for number in 1..=5 {
+        let built = MockExecutionLayer::built_block_on(number, parent);
+        parent = built.hash;
+        within(rig.el.new_payload(built.execution_data)).await.expect("accepted");
+    }
+    // The genesis header is always known to a real node.
+    let genesis = Header { number: 0, ..Default::default() };
+    rig.svc.block_headers.insert(ID.genesis_hash, genesis);
+    rig
+}
+
+#[tokio::test]
+async fn a_layer_ahead_of_the_driver_releases_a_block_whose_parent_was_never_seen() {
+    let mut rig = rig_at_genesis_with_a_layer_at_five().await;
+    let (hash, _, rlp) = block(2, B256::repeat_byte(9));
+    rig.svc.handle_direct_body(rlp.into());
+    let mut events = Vec::new();
+    // What `consider_catch_up` records when it reads the layer.
+    rig.svc.imported_height = Some(5);
+    within(rig.svc.drain_outputs(&mut events)).await.expect("drain");
+    within(rig.svc.handle_output(EngineOutput::ExecuteBlock(hash), &mut events)).await.expect("ok");
+    within(rig.svc.drain_outputs(&mut events)).await.expect("drain");
+    assert!(rig.svc.held_bodies.is_empty(), "the layer is at 5; block 2 is not far ahead");
+    assert!(
+        rig.el.calls().iter().any(|c| matches!(c, ElCall::NewPayload(h) | ElCall::NewPayloadBody(h) if *h == hash)),
+        "ExecuteBlock ran: {:?}",
+        rig.el.calls()
+    );
+}
+
+/// Nothing prompts a read of the layer (no peer is ahead of it): a block held
+/// past `HELD_TOO_LONG` asks the layer itself, and is released.
+#[tokio::test]
+async fn a_block_held_too_long_reads_the_layer_and_is_released() {
+    let mut rig = rig_at_genesis_with_a_layer_at_five().await;
+    let (hash, _, rlp) = block(2, B256::repeat_byte(9));
+    rig.svc.handle_direct_body(rlp.into());
+    let mut events = Vec::new();
+    within(rig.svc.drain_outputs(&mut events)).await.expect("drain");
+    within(rig.svc.handle_output(EngineOutput::ExecuteBlock(hash), &mut events)).await.expect("ok");
+    assert_eq!(rig.svc.held_bodies, vec![hash], "held while the layer's height is unread");
+    within(rig.svc.drain_outputs(&mut events)).await.expect("drain");
+    assert_eq!(rig.svc.held_bodies, vec![hash], "not yet overdue: no read forced");
+    rig.svc.held_since.insert(hash, std::time::Instant::now().checked_sub(HELD_TOO_LONG * 2).expect("clock"));
+    within(rig.svc.drain_outputs(&mut events)).await.expect("drain");
+    assert!(rig.svc.held_bodies.is_empty(), "the forced read lifted the tip to 5");
+    assert_eq!(rig.svc.imported_height, Some(5));
+    assert!(
+        rig.el.calls().iter().any(|c| matches!(c, ElCall::NewPayload(h) | ElCall::NewPayloadBody(h) if *h == hash)),
+        "ExecuteBlock ran: {:?}",
+        rig.el.calls()
+    );
+}
+
+/// E>1 is unchanged: a validator whose own layer lags still holds, even after
+/// the forced read, and leaves the catch-up pull to bring the chain.
+#[tokio::test]
+async fn a_lagging_layer_still_holds_a_far_ahead_block_after_the_forced_read() {
+    let mut rig = node(1, 0, None).await;
+    let genesis = Header { number: 0, ..Default::default() };
+    rig.svc.block_headers.insert(ID.genesis_hash, genesis);
+    let (hash, _, rlp) = block(4, B256::repeat_byte(9));
+    rig.svc.handle_direct_body(rlp.into());
+    let mut events = Vec::new();
+    within(rig.svc.drain_outputs(&mut events)).await.expect("drain");
+    within(rig.svc.handle_output(EngineOutput::ExecuteBlock(hash), &mut events)).await.expect("ok");
+    rig.svc.held_since.insert(hash, std::time::Instant::now().checked_sub(HELD_TOO_LONG * 2).expect("clock"));
+    within(rig.svc.drain_outputs(&mut events)).await.expect("drain");
+    assert!(rig.svc.last_forced_layer_read.is_some(), "the layer was read");
+    assert_eq!(rig.svc.imported_height, Some(0), "and it is empty");
+    assert_eq!(rig.svc.held_bodies, vec![hash], "still held: the pull has to bring the gap");
+    assert!(rig.el.calls().is_empty(), "nothing reached the execution layer");
+}
+
 #[tokio::test]
 async fn the_held_list_is_bounded_and_drops_the_oldest() {
     let mut rig = node(1, 0, None).await;
@@ -825,3 +905,217 @@ mod net_tests;
 
 #[path = "service_mesh_tests.rs"]
 mod mesh_tests;
+
+// ---------------------------------------------------------------------------
+// Blocks taken without their transactions (N42_TAKE_COMPACT)
+// ---------------------------------------------------------------------------
+
+/// A built block with withdrawals (rewards) and a header to match, as the
+/// payload a whole answer gives and the one an elided answer gives.
+fn whole_and_elided() -> (alloy_rpc_types_engine::ExecutionData, alloy_rpc_types_engine::ExecutionData, Header, Vec<B256>) {
+    let withdrawals = vec![alloy_eips::eip4895::Withdrawal { index: 0, validator_index: 0, address: Address::repeat_byte(3), amount: 1_000_000_000 }];
+    let header = Header {
+        number: 9,
+        base_fee_per_gas: Some(7),
+        gas_limit: 30_000_000,
+        withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
+        ..Default::default()
+    };
+    let block = alloy_consensus::Block::<alloy_consensus::TxEnvelope> {
+        header: header.clone(),
+        body: alloy_consensus::BlockBody {
+            transactions: Vec::new(),
+            ommers: Vec::new(),
+            withdrawals: Some(alloy_eips::eip4895::Withdrawals::new(withdrawals)),
+        },
+    };
+    let elided = alloy_rpc_types_engine::ExecutionData::from_block_unchecked(header.hash_slow(), &block);
+    let transactions: Vec<alloy_primitives::Bytes> =
+        (0..5u8).map(|i| alloy_primitives::Bytes::from(vec![0x02, 0xc1, i])).collect();
+    let hashes = transactions.iter().map(keccak256).collect();
+    let mut whole = elided.clone();
+    whole.payload.as_v1_mut().transactions = transactions;
+    (whole, elided, header, hashes)
+}
+
+#[test]
+fn an_elided_blocks_compact_body_is_byte_for_byte_the_whole_blocks() {
+    let (whole, elided, header, hashes) = whole_and_elided();
+    // What `publish_body` makes of the whole block.
+    let full = encode_own_body(&whole, &header);
+    let from_whole = n42_h2_consensus::encode_compact_body(&full, &hashes, HeaderProfile::Ethereum).expect("compact");
+    // What the elided road makes without a single transaction byte.
+    let from_elided = elided_compact_body(&elided, &header, hashes.len(), &hashes, &[], HeaderProfile::Ethereum).expect("compact");
+    assert_eq!(from_elided, from_whole);
+    // And a follower that rebuilds the gov5 body from it gets the whole one.
+    let decoded = n42_h2_consensus::decode_compact_body(&from_elided, HeaderProfile::Ethereum).expect("decodes");
+    assert_eq!(decoded.hashes, hashes);
+    assert_eq!(
+        n42_h2_consensus::rebuild_gov5_body(&decoded, &whole.payload.as_v1().transactions),
+        full
+    );
+}
+
+/// `N42_ANSWER_LAYOUT_ONLY`: under frame blocks the compact body is made of
+/// the layout alone, so an answer without the hash list gives exactly the
+/// bytes the full one does.
+#[test]
+fn a_layout_only_answers_compact_body_is_byte_for_byte_the_full_ones() {
+    let (_, elided, header, hashes) = whole_and_elided();
+    let layout = vec![(B256::repeat_byte(0xf1), 3), (B256::repeat_byte(0xf2), 2)];
+    let with_hashes =
+        elided_compact_body_with(true, &elided, &header, hashes.len(), &hashes, &layout, HeaderProfile::Ethereum)
+            .expect("compact");
+    let layout_only =
+        elided_compact_body_with(true, &elided, &header, hashes.len(), &[], &layout, HeaderProfile::Ethereum)
+            .expect("compact");
+    assert_eq!(layout_only, with_hashes);
+    let decoded = n42_h2_consensus::decode_compact_body(&layout_only, HeaderProfile::Ethereum).expect("decodes");
+    assert!(decoded.hashes.is_empty(), "a frame description names no hashes");
+    // Without frame blocks the hashes are the body: a short list is refused.
+    assert!(elided_compact_body_with(false, &elided, &header, hashes.len(), &[], &layout, HeaderProfile::Ethereum).is_err());
+    assert!(elided_compact_body_with(false, &elided, &header, hashes.len(), &hashes, &layout, HeaderProfile::Ethereum).is_ok());
+}
+
+#[tokio::test]
+async fn a_block_taken_elided_is_served_from_the_execution_layer_on_demand() {
+    let mut rig = node(1, 0, None).await;
+    // The mock files the block it builds, as an execution layer that built
+    // it holds it.
+    let built = rig
+        .el
+        .resolve_payload(alloy_rpc_types_engine::PayloadId::new([1; 8]), n42_h2_execution::ResolveKind::WaitForPending)
+        .await
+        .expect("a job")
+        .expect("built");
+    let header = built.execution_data.clone().into_block_raw().expect("raw block").header;
+    let hash = header.hash_slow();
+    assert!(rig.svc.elided_body(hash).await.is_none(), "a block not taken elided is not fetched this way");
+
+    rig.svc.remember_elided(hash, header.clone(), None);
+    assert!(!rig.svc.body_store.contains_key(&hash), "nothing is stored until a peer asks");
+    let body = rig.svc.elided_body(hash).await.expect("fetched on demand");
+    assert_eq!(&body[..], &n42_h2_net::encode_block_rlp_raw(&header, &[], &[], None)[..]);
+    assert!(rig.svc.body_store.contains_key(&hash), "kept for the next peer that asks");
+    assert!(!rig.svc.elided_own.contains_key(&hash));
+    // A fill is served from it like any stored body.
+    let request = n42_h2_net::BlockTxnsRequest { hash, indices: Vec::new() };
+    assert_eq!(fill_from_body(&body, HeaderProfile::Ethereum, &request).expect("served"), Vec::<alloy_primitives::Bytes>::new());
+}
+
+#[tokio::test]
+async fn a_block_taken_elided_that_the_execution_layer_lost_stays_unserved() {
+    let mut rig = node(1, 0, None).await;
+    let (hash, header, _) = block(4, B256::repeat_byte(2));
+    rig.svc.remember_elided(hash, header, None);
+    assert!(rig.svc.elided_body(hash).await.is_none());
+    assert!(!rig.svc.body_store.contains_key(&hash));
+    assert!(rig.svc.elided_own.contains_key(&hash), "asked again next time");
+}
+
+#[tokio::test]
+async fn blocks_taken_elided_are_remembered_to_a_bound() {
+    let mut rig = node(1, 0, None).await;
+    let bound = remembered_bodies();
+    for i in 0..bound + 3 {
+        let (hash, header, _) = block(i as u64 + 1, B256::repeat_byte(2));
+        rig.svc.remember_elided(hash, header, None);
+    }
+    assert_eq!(rig.svc.elided_own.len(), bound);
+    assert_eq!(rig.svc.elided_order.len(), bound);
+}
+
+// ---------------------------------------------------------------------------
+// Direct votes (`N42_VOTE_TRANSPORT`)
+// ---------------------------------------------------------------------------
+
+fn test_vote(keys: &[BlsSecretKey], voter: u32) -> n42_h2_primitives::consensus::ConsensusMessage {
+    n42_h2_primitives::consensus::ConsensusMessage::Vote(n42_h2_primitives::consensus::Vote {
+        view: 1,
+        block_hash: B256::repeat_byte(0x5a),
+        voter,
+        signature: keys[voter as usize].sign(b"a vote"),
+    })
+}
+
+fn some_peer() -> PeerId {
+    libp2p::identity::Keypair::generate_ed25519().public().to_peer_id()
+}
+
+/// A leader that never announced itself (it does not speak the protocol)
+/// still gets the vote, by gossip; once its hello verifies, `direct` sends
+/// straight to it and not to the mesh. A hello signed by the wrong key names
+/// no one.
+#[tokio::test]
+async fn a_direct_vote_falls_back_to_gossip_until_the_leader_announces_itself() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    rig.svc = rig.svc.with_vote_transport(crate::direct_votes::VoteTransport::Direct);
+    let mut events = Vec::new();
+
+    rig.svc.send_to_validator(1, test_vote(&keys, 0), &mut events);
+    assert_eq!(rig.svc.direct_votes.fallbacks, 1);
+    assert_eq!(rig.svc.direct_votes.sent, 0);
+    assert_eq!(rig.svc.outbox.len(), 1, "by gossip: queued until the mesh forms");
+
+    let peer = some_peer();
+    // The node-side hello bytes are the transport's: one definition each side.
+    let hello = n42_h2_net::vote_hello_message(ID.genesis_hash, &peer);
+    let forged = keys[3].sign(&hello);
+    rig.svc
+        .handle_transport_event(TransportEvent::VoteHello { peer, index: 2, signature: forged.to_bytes() })
+        .expect("handled");
+    assert_eq!(rig.svc.direct_votes.peer_of(2), None, "validator 3's key cannot announce validator 2");
+    let genuine = keys[1].sign(&hello);
+    rig.svc
+        .handle_transport_event(TransportEvent::VoteHello { peer, index: 1, signature: genuine.to_bytes() })
+        .expect("handled");
+    assert_eq!(rig.svc.direct_votes.peer_of(1), Some(peer));
+
+    rig.svc.send_to_validator(1, test_vote(&keys, 0), &mut events);
+    assert_eq!(rig.svc.direct_votes.sent, 1);
+    assert_eq!(rig.svc.outbox.len(), 1, "direct only: nothing more for the mesh");
+
+    rig.svc.handle_transport_event(TransportEvent::PeerDisconnected(peer)).expect("handled");
+    assert_eq!(rig.svc.direct_votes.peer_of(1), None, "a peer that left routes nothing");
+}
+
+/// `both` sends directly and to the mesh; the default sends nothing new.
+#[tokio::test]
+async fn both_sends_by_both_paths_and_gossip_by_one() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    let peer = some_peer();
+    let mut events = Vec::new();
+
+    assert_eq!(rig.svc.direct_votes.mode(), crate::direct_votes::VoteTransport::Gossip);
+    rig.svc.direct_votes.learn(1, peer);
+    rig.svc.send_to_validator(1, test_vote(&keys, 0), &mut events);
+    assert_eq!(rig.svc.direct_votes.sent, 0, "gossip mode never sends directly");
+    assert_eq!(rig.svc.outbox.len(), 1);
+
+    rig.svc = rig.svc.with_vote_transport(crate::direct_votes::VoteTransport::Both);
+    rig.svc.direct_votes.learn(1, peer);
+    rig.svc.send_to_validator(1, test_vote(&keys, 2), &mut events);
+    assert_eq!(rig.svc.direct_votes.sent, 1);
+    assert_eq!(rig.svc.outbox.len(), 2, "and by gossip");
+}
+
+/// One vote arriving directly and then by gossip reaches the engine once.
+#[tokio::test]
+async fn a_vote_by_gossip_and_directly_reaches_the_engine_once() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 1, None).await;
+    let envelope = wire_bridge::to_wire(&test_vote(&keys, 2), ID, B256::ZERO).expect("to wire");
+    let peer = some_peer();
+    let direct = TransportEvent::DirectVote {
+        peer,
+        inner: Box::new(TransportEvent::Envelope { from: Some(peer), envelope: Box::new(envelope.clone()) }),
+    };
+    rig.svc.handle_transport_event(direct).expect("handled");
+    rig.svc
+        .handle_transport_event(TransportEvent::Envelope { from: None, envelope: Box::new(envelope) })
+        .expect("handled");
+    assert_eq!(rig.svc.direct_votes.received, 1);
+    assert_eq!(rig.svc.direct_votes.duplicates, 1, "the gossip copy is dropped before the engine");
+}

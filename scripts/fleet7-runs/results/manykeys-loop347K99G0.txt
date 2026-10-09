@@ -1,0 +1,28 @@
+== loop347K99G0: 99 validator logs, f=32, quorum 67
+1. the leaders' commit lines
+  R1_collect (proposal -> prepare QC): n=832 p50 66.0 p90 73.0 p99 237.0 max 5851.0 ms
+  R2_collect (prepare QC -> commit QC): n=832 p50 85.0 p90 89.0 p99 94.0 max 105.0 ms
+  total (proposal -> commit): n=832 p50 160.0 p90 361.0 p99 676.0 max 6007.0 ms
+  votes at formation: R1 median 67 max 67 (quorum 67); R2 median 67 max 67
+2. vote collection at the traced leaders (first vote -> quorum -> last vote)
+ R1 (vote), 832 views:
+    proposal -> first vote: n=832 p50 4.6 p90 8.7 p99 165.9 max 5139.6 ms
+    first vote -> quorum: n=832 p50 57.9 p90 61.8 p99 65.6 max 5836.9 ms
+    quorum -> last vote: n=832 p50 24.8 p90 25.8 p99 31.8 max 91.6 ms
+    proposal -> last vote (the slowest key): n=832 p50 87.7 p90 94.9 p99 259.5 max 5939.4 ms
+   views with fewer than 98 votes received: 1
+ R2 (commit_vote), 832 views:
+    proposal -> first vote: n=832 p50 91.4 p90 101.2 p99 262.7 max 5874.7 ms
+    first vote -> quorum: n=832 p50 57.1 p90 59.9 p99 62.1 max 65.1 ms
+    quorum -> last vote: n=832 p50 4.9 p90 5.5 p99 7.4 max 429.3 ms
+    proposal -> last vote (the slowest key): n=832 p50 153.9 p90 165.0 p99 335.0 max 5952.3 ms
+   views with fewer than 98 votes received: 0
+3. the straggler rule and the loop
+  proposal interval (same leader, consecutive views): n=831 p50 160.9 p90 354.7 p99 661.2 max 5948.2 ms; >= 500 ms: 28
+  `slow step` lines: 2363 (transport+flush > 30 ms); by slowest event kind: native: 2328 (max 5190 ms), -: 35 (max 3578 ms)
+  leaders' lines: 1667
+4. gossip propagation (proposal sent -> received at a traced follower)
+    proposal arrival delay: n=1664 p50 0.5 p90 2.2 p99 4.8 max 19.6 ms
+5. validators
+validators n=99: cpu total 27.24 cores, per key mean 0.275 median 0.266 max 0.908 (key 0) min 0.221; rss per key peak mean 0.973 max 1.218 G, sum of peaks 96.3 G; threads per key mean 123, total 12177
+libp2p connections (last census of 5): 9696 in all (a full mesh of 99 is 4851); sockets per process min 96 median 98 max 98

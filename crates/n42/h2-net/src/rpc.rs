@@ -13,7 +13,6 @@
 
 use std::io;
 
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response;
 use libp2p::StreamProtocol;
@@ -104,7 +103,6 @@ fn to_io(e: crate::status::StatusError) -> io::Error {
 #[derive(Debug, Clone, Default)]
 pub struct StatusCodec;
 
-#[async_trait]
 impl request_response::Codec for StatusCodec {
     type Protocol = StreamProtocol;
     type Request = Status;
@@ -354,7 +352,6 @@ pub type BlockReply = Result<BlockChunk, String>;
 #[derive(Debug, Clone, Default)]
 pub struct BlockByHashCodec;
 
-#[async_trait]
 impl request_response::Codec for BlockByHashCodec {
     type Protocol = StreamProtocol;
     type Request = B256;
@@ -478,7 +475,7 @@ pub const MAX_BLOCK_TXNS_BYTES: u64 = 32 << 20;
 
 /// Bound on the indices a peer may ask for, so a request cannot make this
 /// node allocate without bound.
-pub const MAX_BLOCK_TXNS_INDICES: usize = 1 << 20;
+pub const MAX_BLOCK_TXNS_INDICES: usize = n42_h2_consensus::compact_body::MAX_COMPACT_TXS;
 
 /// The codec for [`BLOCK_TXNS_PROTOCOL`].
 #[derive(Debug, Clone, Default)]
@@ -523,6 +520,9 @@ fn decode_txns(bytes: &[u8]) -> io::Result<Vec<alloy_primitives::Bytes>> {
     if count > MAX_BLOCK_TXNS_INDICES {
         return Err(bad("more transactions than any block has"));
     }
+    if count > rest.len() / 4 {
+        return Err(bad("transaction count exceeds available lengths"));
+    }
     let mut txns = Vec::with_capacity(count);
     for _ in 0..count {
         let (len, after) = rest.split_at_checked(4).ok_or_else(|| bad("truncated length"))?;
@@ -537,7 +537,6 @@ fn decode_txns(bytes: &[u8]) -> io::Result<Vec<alloy_primitives::Bytes>> {
     Ok(txns)
 }
 
-#[async_trait]
 impl request_response::Codec for BlockTxnsCodec {
     type Protocol = StreamProtocol;
     type Request = BlockTxnsRequest;
@@ -659,6 +658,7 @@ mod block_txns_tests {
 
     #[test]
     fn a_malformed_index_list_or_answer_is_refused() {
+        assert!(decode_txns(&(MAX_BLOCK_TXNS_INDICES as u32).to_le_bytes()).is_err());
         assert!(decode_indices(&[]).is_err());
         assert!(decode_indices(&[2, 0, 0, 0, 1, 0, 0, 0]).is_err(), "count says two, one follows");
         assert!(decode_txns(&[1, 0, 0, 0, 9, 0, 0, 0, 1]).is_err(), "length runs past the end");
@@ -697,7 +697,6 @@ pub fn block_push_protocol() -> StreamProtocol {
 #[derive(Debug, Clone, Default)]
 pub struct BlockPushCodec;
 
-#[async_trait]
 impl request_response::Codec for BlockPushCodec {
     type Protocol = StreamProtocol;
     type Request = BlockChunk;
@@ -927,7 +926,6 @@ pub type RangeReply = Result<Vec<BlockChunk>, String>;
 #[derive(Debug, Clone, Default)]
 pub struct BodiesByRangeCodec;
 
-#[async_trait]
 impl request_response::Codec for BodiesByRangeCodec {
     type Protocol = StreamProtocol;
     type Request = RangeRequest;
@@ -1070,5 +1068,225 @@ mod bodies_by_range_tests {
         block_on(codec.write_request(&proto, &mut wire, request)).unwrap();
         let back = block_on(codec.read_request(&proto, &mut futures::io::Cursor::new(wire))).unwrap();
         assert_eq!(back, request);
+    }
+}
+
+/// Votes sent straight to the view's leader (`N42_VOTE_TRANSPORT=direct` or
+/// `both`), beside -- or instead of -- the gossip topic.
+///
+/// A vote is addressed to one validator, but v4 has no direct channel, so
+/// it is published to the whole mesh and every member receives (and the
+/// mesh forwards) N-1 votes it ignores. This protocol carries a vote over
+/// one stream to the one member that counts it. The payload is the vote's
+/// gossip bytes, unchanged (the native-topic encoding or the v4 envelope), so
+/// the receiver decodes it with the decoder it already uses; what a vote
+/// attests is untouched. A peer that does not speak the protocol -- every
+/// gov5 member -- fails the request and is reached by gossip as before; a
+/// mixed fleet runs `gossip` or `both`.
+///
+/// The leader is found by a `Hello` each side sends on connect: the
+/// validator index and a BLS signature, by that validator's consensus key,
+/// over [`vote_hello_message`] (the chain's genesis hash and the sender's
+/// libp2p peer id, which the Noise handshake authenticates). A hello that
+/// does not verify names no one.
+///
+/// Wire: `tag (1) || length (4, big endian) || body`; tag 1 `Hello` (body:
+/// index, 4 bytes big endian, then the 96-byte signature), tag 2 a native
+/// gossip message, tag 3 a v4 gossip envelope. The response is one code byte.
+pub const VOTE_PROTOCOL: &str = "/n42/vote/1";
+
+/// The protocol as libp2p names it.
+pub fn vote_protocol() -> StreamProtocol {
+    StreamProtocol::new(VOTE_PROTOCOL)
+}
+
+/// Largest body accepted: a vote is ~200 bytes, a hello 100.
+pub const MAX_VOTE_BODY: usize = 64 * 1024;
+
+const VOTE_TAG_HELLO: u8 = 1;
+const VOTE_TAG_NATIVE: u8 = 2;
+const VOTE_TAG_ENVELOPE: u8 = 3;
+
+/// What travels on [`VOTE_PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoteRequest {
+    /// "I am validator `index`": signed by its consensus key over
+    /// [`vote_hello_message`].
+    Hello {
+        /// The sender's validator index.
+        index: u32,
+        /// The BLS signature, compressed.
+        signature: [u8; 96],
+    },
+    /// A vote as the native consensus topic carries it.
+    Native(Vec<u8>),
+    /// A vote as the v4 topic carries it (a chain-bound envelope).
+    Envelope(Vec<u8>),
+}
+
+/// The bytes a [`VoteRequest::Hello`] signs.
+pub fn vote_hello_message(genesis_hash: B256, peer_id: &libp2p::PeerId) -> Vec<u8> {
+    let peer = peer_id.to_bytes();
+    let mut message = Vec::with_capacity(16 + 32 + peer.len());
+    message.extend_from_slice(b"n42/vote-hello/1");
+    message.extend_from_slice(genesis_hash.as_slice());
+    message.extend_from_slice(&peer);
+    message
+}
+
+/// Encodes a request body as it goes on the wire.
+pub fn encode_vote_request(request: &VoteRequest) -> Vec<u8> {
+    let (tag, body): (u8, std::borrow::Cow<'_, [u8]>) = match request {
+        VoteRequest::Hello { index, signature } => {
+            let mut body = Vec::with_capacity(100);
+            body.extend_from_slice(&index.to_be_bytes());
+            body.extend_from_slice(signature);
+            (VOTE_TAG_HELLO, body.into())
+        }
+        VoteRequest::Native(bytes) => (VOTE_TAG_NATIVE, bytes.as_slice().into()),
+        VoteRequest::Envelope(bytes) => (VOTE_TAG_ENVELOPE, bytes.as_slice().into()),
+    };
+    let mut out = Vec::with_capacity(5 + body.len());
+    out.push(tag);
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Decodes a request from its tag and body.
+pub fn decode_vote_request(tag: u8, body: Vec<u8>) -> io::Result<VoteRequest> {
+    match tag {
+        VOTE_TAG_HELLO => {
+            if body.len() != 100 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "vote hello is 100 bytes"));
+            }
+            let mut index = [0u8; 4];
+            index.copy_from_slice(&body[..4]);
+            let mut signature = [0u8; 96];
+            signature.copy_from_slice(&body[4..]);
+            Ok(VoteRequest::Hello {
+                index: u32::from_be_bytes(index),
+                signature,
+            })
+        }
+        VOTE_TAG_NATIVE => Ok(VoteRequest::Native(body)),
+        VOTE_TAG_ENVELOPE => Ok(VoteRequest::Envelope(body)),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unknown vote request tag")),
+    }
+}
+
+/// Codec for [`VOTE_PROTOCOL`].
+#[derive(Debug, Clone, Default)]
+pub struct VoteCodec;
+
+impl request_response::Codec for VoteCodec {
+    type Protocol = StreamProtocol;
+    type Request = VoteRequest;
+    type Response = u8;
+
+    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut head = [0u8; 5];
+        io.read_exact(&mut head).await?;
+        let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+        if len > MAX_VOTE_BODY {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "vote request too large"));
+        }
+        let mut body = vec![0u8; len];
+        io.read_exact(&mut body).await?;
+        decode_vote_request(head[0], body)
+    }
+
+    async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut code = [0u8; 1];
+        io.read_exact(&mut code).await?;
+        Ok(code[0])
+    }
+
+    async fn write_request<T>(&mut self, _: &Self::Protocol, io: &mut T, request: Self::Request) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        io.write_all(&encode_vote_request(&request)).await?;
+        io.close().await
+    }
+
+    async fn write_response<T>(&mut self, _: &Self::Protocol, io: &mut T, code: Self::Response) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        io.write_all(&[code]).await?;
+        io.close().await
+    }
+}
+
+/// The behaviour for [`VOTE_PROTOCOL`].
+pub type VoteBehaviour = request_response::Behaviour<VoteCodec>;
+
+/// Sending and accepting direct votes.
+pub fn vote_behaviour() -> VoteBehaviour {
+    request_response::Behaviour::with_codec(
+        VoteCodec,
+        [(vote_protocol(), request_response::ProtocolSupport::Full)],
+        request_response::Config::default(),
+    )
+}
+
+#[cfg(test)]
+mod vote_protocol_tests {
+    use super::*;
+    use futures::executor::block_on;
+    use libp2p::request_response::Codec as _;
+
+    #[test]
+    fn the_protocol_id_is_pinned() {
+        assert_eq!(VOTE_PROTOCOL, "/n42/vote/1");
+        assert_eq!(vote_protocol().as_ref(), "/n42/vote/1");
+    }
+
+    /// Fixtures: the exact bytes of each request kind.
+    #[test]
+    fn requests_encode_to_the_fixture_bytes_and_back() {
+        let native = VoteRequest::Native(vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(hex::encode(encode_vote_request(&native)), "0200000004deadbeef");
+        let envelope = VoteRequest::Envelope(vec![0x01]);
+        assert_eq!(hex::encode(encode_vote_request(&envelope)), "030000000101");
+        let hello = VoteRequest::Hello { index: 98, signature: [0xab; 96] };
+        let expected = format!("0100000064{}{}", "00000062", "ab".repeat(96));
+        assert_eq!(hex::encode(encode_vote_request(&hello)), expected);
+
+        for request in [native, envelope, hello] {
+            let mut wire = Vec::new();
+            block_on(VoteCodec.write_request(&vote_protocol(), &mut wire, request.clone())).expect("write");
+            assert_eq!(wire, encode_vote_request(&request));
+            let back = block_on(VoteCodec.read_request(&vote_protocol(), &mut wire.as_slice())).expect("read");
+            assert_eq!(back, request);
+        }
+    }
+
+    #[test]
+    fn malformed_requests_are_refused() {
+        assert!(decode_vote_request(9, vec![]).is_err(), "unknown tag");
+        assert!(decode_vote_request(1, vec![0; 99]).is_err(), "short hello");
+        let mut wire = vec![2u8];
+        wire.extend_from_slice(&((MAX_VOTE_BODY as u32) + 1).to_be_bytes());
+        assert!(block_on(VoteCodec.read_request(&vote_protocol(), &mut wire.as_slice())).is_err(), "too large");
+    }
+
+    #[test]
+    fn the_hello_message_binds_the_chain_and_the_peer() {
+        let random_peer = || libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();
+        let peer = random_peer();
+        let a = vote_hello_message(B256::repeat_byte(1), &peer);
+        let b = vote_hello_message(B256::repeat_byte(2), &peer);
+        let c = vote_hello_message(B256::repeat_byte(1), &random_peer());
+        assert!(a.starts_with(b"n42/vote-hello/1"));
+        assert_ne!(a, b);
+        assert_ne!(a, c);
     }
 }

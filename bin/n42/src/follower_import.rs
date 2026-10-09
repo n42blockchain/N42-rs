@@ -90,6 +90,203 @@ pub fn note_import_landed() {
     landed.notify_all();
 }
 
+/// `N42_HANDOFF_ON_LANDED=1`, read once: a block executed on its parent's
+/// published output is handed to the engine once the parent's own direct
+/// import has been answered by the engine ([`note_handed`]), instead of once
+/// the parent is canonical.
+///
+/// The canonical wait is stricter than the engine needs. The executed insert
+/// (`InsertExecutedBlock` in reth's tree) checks only that the block is not at
+/// or below the canonical number and not already held, then files it in the
+/// tree under its parent; `newPayload` for a block the tree holds answers
+/// VALID; the forkchoice that later makes the parent canonical, and the
+/// block's own, extend the chain through the tree. The QMDB forest holds the
+/// block's tree from its own root job (filed under the parent's record, which
+/// the parent's root filed), so its `on_canonical` hook finds it either way;
+/// persistence takes canonical blocks only. What the canonical wait cost was
+/// the parent's commit forkchoice, which the validator sends only after the
+/// parent's import answered (30-36 ms on the engine thread), plus up to 20 ms
+/// of poll, since a block becoming canonical wakes no waiter
+/// (`docs/INDUSTRY_SURVEY_2026_10.md` 11.12). The parent's answer, not its
+/// queued insert, is the mark: the engine then sees `newPayload(n-1)` before
+/// the insert of `n`, as before, and the imports still answer in chain order.
+/// Off by default.
+pub fn handoff_on_landed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_HANDOFF_ON_LANDED").is_ok_and(|v| v == "1"))
+}
+
+/// How many handed blocks [`HANDED`] remembers: a child is handed off within a
+/// few blocks of its parent, so this is far more than the depth in flight.
+const HANDED_KEPT: usize = 64;
+
+/// The last blocks whose direct import the engine answered here (newest last),
+/// and the condition a hand-off waits on for its parent ([`note_handed`]).
+static HANDED: (Mutex<std::collections::VecDeque<B256>>, Condvar) =
+    (Mutex::new(std::collections::VecDeque::new()), Condvar::new());
+
+/// Says the engine has answered `block_hash`'s direct import (it holds the
+/// block as executed); wakes a child's hand-off waiting for it at once.
+pub fn note_handed(block_hash: B256) {
+    let (kept, handed) = &HANDED;
+    let mut kept = kept.lock().unwrap_or_else(|p| p.into_inner());
+    if !kept.contains(&block_hash) {
+        if kept.len() >= HANDED_KEPT {
+            kept.pop_front();
+        }
+        kept.push_back(block_hash);
+    }
+    drop(kept);
+    handed.notify_all();
+}
+
+fn was_handed(block_hash: &B256) -> bool {
+    HANDED.0.lock().unwrap_or_else(|p| p.into_inner()).contains(block_hash)
+}
+
+/// What a hand-off under [`handoff_on_landed`] waited for its parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HandoffWait {
+    /// The wait, in microseconds.
+    waited_us: u64,
+    /// The parent was handed here but not yet canonical when the wait ended.
+    before_canonical: bool,
+}
+
+/// Waits until the parent has been handed to the engine here
+/// ([`note_handed`], woken at once) or is canonical (`canonical`, checked on
+/// every wake and at least every `poll`, for a parent that came in by the
+/// engine's own path), for up to `wait`. `fields` says the parent's execution
+/// fields are recorded; a handed parent always has them, but the hand-off does
+/// not take that on trust.
+fn wait_until_parent_handed(
+    parent_hash: B256,
+    wait: std::time::Duration,
+    poll: std::time::Duration,
+    mut canonical: impl FnMut() -> Result<bool, String>,
+    fields: impl Fn() -> bool,
+) -> Result<HandoffWait, String> {
+    let started = std::time::Instant::now();
+    let deadline = started + wait;
+    loop {
+        let handed = was_handed(&parent_hash) && fields();
+        if handed {
+            let before_canonical = !canonical()?;
+            return Ok(HandoffWait { waited_us: started.elapsed().as_micros() as u64, before_canonical });
+        }
+        if canonical()? {
+            return Ok(HandoffWait { waited_us: started.elapsed().as_micros() as u64, before_canonical: false });
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "parent {parent_hash} neither handed to the engine here nor canonical within {wait:?}"
+            ));
+        }
+        let step = (deadline - now).min(poll);
+        if was_handed(&parent_hash) {
+            // Handed without its fields: not expected; wait out the step.
+            std::thread::sleep(step);
+            continue;
+        }
+        let (kept, handed) = &HANDED;
+        let guard = kept.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = handed
+            .wait_timeout_while(guard, step, |kept| !kept.contains(&parent_hash))
+            .unwrap_or_else(|p| p.into_inner());
+    }
+}
+
+/// How the build path's shards merge runs (`N42_SHARDS_MERGE_OFF_PATH`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeMode {
+    /// Unset or `0`: the account map, then the revert set, one after the
+    /// other, as before.
+    OnPath,
+    /// `1`: the two halves at once ([`FrozenShards::merged_timed`]): the
+    /// hand-off waits for the longer half instead of the sum.
+    ///
+    /// [`FrozenShards::merged_timed`]: n42_engine_types::output_shards::FrozenShards::merged_timed
+    Concurrent,
+    /// `verify`: as `1`, and the merge is then made the old way too and the
+    /// two compared (`merge_verified`, `merge_mismatches` on the root line).
+    Verify,
+}
+
+impl MergeMode {
+    fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("1") => Self::Concurrent,
+            Some("verify") => Self::Verify,
+            _ => Self::OnPath,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::OnPath => "on_path",
+            Self::Concurrent => "concurrent",
+            Self::Verify => "verify",
+        }
+    }
+}
+
+/// `N42_SHARDS_MERGE_OFF_PATH`, read once (see [`MergeMode`]). Off by default.
+fn shards_merge_mode() -> MergeMode {
+    static MODE: std::sync::OnceLock<MergeMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| MergeMode::parse(std::env::var("N42_SHARDS_MERGE_OFF_PATH").ok().as_deref()))
+}
+
+/// Merges compared under `N42_SHARDS_MERGE_OFF_PATH=verify`, and how many differed.
+static MERGE_VERIFIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MERGE_MISMATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_merge_verified(same: bool) {
+    MERGE_VERIFIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !same {
+        MERGE_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(target: "n42.follower_import", "the concurrent shards merge differs from the on-path merge");
+    }
+}
+
+/// Executions held for their validator's release
+/// (`request::HOLD_EXECUTION`, `N42_VOTE_BEFORE_SLOT`), by block hash: the
+/// block is assembled and checked, and its vote released, as always; its
+/// execution waits here until the validator has an import slot for it.
+static HELD_EXECUTIONS: Mutex<Option<std::collections::HashMap<B256, std::sync::mpsc::Receiver<bool>>>> =
+    Mutex::new(None);
+
+/// What a held import's error says when its validator dropped it.
+pub const HELD_DROPPED: &str = n42_h2_execution::HELD_IMPORT_DROPPED;
+
+/// Holds `block_hash`'s execution until the returned sender says `true`
+/// (execute) or `false` (drop). Registered before the import starts; a
+/// sender dropped unsent drops the block too, so an import never waits on a
+/// release that cannot come.
+pub fn hold_execution(block_hash: B256) -> std::sync::mpsc::Sender<bool> {
+    let (release, held) = std::sync::mpsc::channel();
+    HELD_EXECUTIONS.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert_with(Default::default).insert(block_hash, held);
+    release
+}
+
+/// Forgets a hold whose import ended without reaching its execution.
+pub fn forget_hold(block_hash: B256) {
+    if let Some(held) = HELD_EXECUTIONS.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        held.remove(&block_hash);
+    }
+}
+
+/// Waits for `block_hash`'s release when its execution is held; at once
+/// otherwise. `Err` when it was dropped.
+fn wait_for_release(block_hash: B256) -> Result<(), String> {
+    let held = HELD_EXECUTIONS.lock().unwrap_or_else(|p| p.into_inner()).as_mut().and_then(|held| held.remove(&block_hash));
+    let Some(held) = held else { return Ok(()) };
+    match held.recv() {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(HELD_DROPPED.to_owned()),
+    }
+}
+
 /// The execution output of a block imported here, as its child's check reads it.
 type ParentOutput = Arc<reth_provider::BlockExecutionOutput<n42_tx_types::Receipt>>;
 
@@ -101,6 +298,32 @@ static PARENT_OUTPUTS: Mutex<std::collections::VecDeque<(B256, reth_primitives_t
 
 /// How many published outputs are kept: the check reads only the parent's.
 const PARENT_OUTPUTS_KEPT: usize = 4;
+
+/// How many published outputs are kept, by `N42_PARENT_OUTPUTS_KEPT`
+/// (2..=16, default [`PARENT_OUTPUTS_KEPT`]). The check and the execution
+/// stack the unlanded ancestors' outputs, and a shorter cycle (deferred
+/// execution at depth 2, `docs/DEFERRED_DEPTH_2_DESIGN.md` items 12 and 4.4)
+/// leaves more of them unlanded at once; a leg sets it, the default is the
+/// depth-1 value. Read once.
+fn parent_outputs_kept() -> usize {
+    static KEPT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *KEPT.get_or_init(|| kept_from_env("N42_PARENT_OUTPUTS_KEPT", PARENT_OUTPUTS_KEPT, 2..=16))
+}
+
+/// A capacity knob: `name` parsed as a count within `range`, else `default`
+/// (with a warning for a value that does not parse or lies outside).
+fn kept_from_env(name: &str, default: usize, range: std::ops::RangeInclusive<usize>) -> usize {
+    match std::env::var(name) {
+        Err(_) => default,
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(value) if range.contains(&value) => value,
+            _ => {
+                tracing::warn!(target: "n42.follower_import", %name, %raw, ?range, default, "capacity knob ignored");
+                default
+            }
+        },
+    }
+}
 
 /// Under deferred execution a block's check reads its senders from the
 /// parent's execution output, published by the parent's import as soon as its
@@ -169,7 +392,7 @@ fn publish_parent_output(block_hash: B256, header: reth_primitives_traits::Seale
     {
         let mut outputs = PARENT_OUTPUTS.lock().unwrap_or_else(|p| p.into_inner());
         outputs.retain(|(hash, _, _)| *hash != block_hash);
-        while outputs.len() >= PARENT_OUTPUTS_KEPT {
+        while outputs.len() >= parent_outputs_kept() {
             outputs.pop_front();
         }
         outputs.push_back((block_hash, header, output));
@@ -196,6 +419,13 @@ static FOLLOWER_SHARDS: Mutex<std::collections::VecDeque<KeptShards>> = Mutex::n
 /// a backlog its grandparent's when that one's merge is not yet published.
 const FOLLOWER_SHARDS_KEPT: usize = 2;
 
+/// [`FOLLOWER_SHARDS_KEPT`], overridden by `N42_FOLLOWER_SHARDS_KEPT`
+/// (1..=8), as [`parent_outputs_kept`]. Read once.
+fn follower_shards_kept() -> usize {
+    static KEPT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *KEPT.get_or_init(|| kept_from_env("N42_FOLLOWER_SHARDS_KEPT", FOLLOWER_SHARDS_KEPT, 1..=8))
+}
+
 /// Whether the child's check and execution read a parent executed here on the
 /// build path through its shards the moment they are kept, instead of waiting
 /// for the published (merged) output. On by default;
@@ -216,7 +446,7 @@ fn keep_follower_shards(
     {
         let mut kept = FOLLOWER_SHARDS.lock().unwrap_or_else(|p| p.into_inner());
         kept.retain(|(hash, _, _, _)| *hash != block_hash);
-        while kept.len() >= FOLLOWER_SHARDS_KEPT {
+        while kept.len() >= follower_shards_kept() {
             kept.pop_front();
         }
         kept.push_back((block_hash, header, shards, residual));
@@ -405,6 +635,33 @@ fn wait_for_parent_fields(parent_hash: B256) -> Result<(), String> {
     n42_engine_types::executed_fields::wait_for(&parent_hash, PARENT_WAIT)
         .map(|_| ())
         .ok_or_else(|| format!("parent {parent_hash}'s execution fields not recorded within {PARENT_WAIT:?}"))
+}
+
+/// The vote road's wait for the result the header carries
+/// (`docs/DEFERRED_DEPTH_2_DESIGN.md` item 10): the parent's at depth 1
+/// ([`wait_for_parent_fields`], exactly as before), the parent's parent's at
+/// depth 2 -- which completed about a cycle earlier, so the vote no longer
+/// waits for the parent's QMDB root. Nothing to wait for at the chain start,
+/// where the parent's own header carries the expected (genesis) fields.
+///
+/// The waits that stand for the parent's *tree* being filed before this
+/// block's own root (the root job's, [`spawn_early_root`]) stay on the parent
+/// at every depth.
+fn wait_for_ancestor_fields(
+    genesis: &alloy_genesis::Genesis,
+    parent: &reth_primitives_traits::SealedHeader,
+    depth: u64,
+) -> Result<(), String> {
+    if depth <= 1 {
+        return wait_for_parent_fields(parent.hash());
+    }
+    if !n42_engine_types::hotstuff_consensus::ancestor_result_is_recorded(genesis, parent, depth) {
+        return Ok(());
+    }
+    let ancestor = n42_engine_types::hotstuff_consensus::ancestor_hash(parent, depth);
+    n42_engine_types::executed_fields::wait_for(&ancestor, PARENT_WAIT)
+        .map(|_| ())
+        .ok_or_else(|| format!("ancestor {ancestor}'s execution fields not recorded within {PARENT_WAIT:?}"))
 }
 
 /// The header against the parent, by the consensus rules: under deferred
@@ -1143,7 +1400,7 @@ pub fn published_ancestry(parent_hash: B256, wait: std::time::Duration) -> Resul
     let waited = started.elapsed();
     let mut executed = vec![n42_engine_types::direct_build::executed_from_output(&header, Arc::clone(&output))];
     let mut anchor = header.parent_hash;
-    while executed.len() < PARENT_OUTPUTS_KEPT {
+    while executed.len() < parent_outputs_kept() {
         let Some((older, published)) = published_output(anchor) else { break };
         executed.push(n42_engine_types::direct_build::executed_from_output(&older, published));
         anchor = older.parent_hash;
@@ -1213,7 +1470,7 @@ where
                 return None;
             }
         }
-        if outputs.len() >= PARENT_OUTPUTS_KEPT {
+        if outputs.len() >= parent_outputs_kept() {
             decline_on_output(number, "more unimported ancestors than there are published outputs");
             return None;
         }
@@ -1904,6 +2161,11 @@ where
     };
 
     let deferred = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), head.timestamp);
+    // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md): which
+    // ancestor's result the header carries, so which one the vote road waits
+    // for. The includability check and the execution read the *parent's*
+    // output at every depth.
+    let carried_depth = reth_chainspec::qmdb::deferred_execution_depth_at(chain_spec.genesis(), head.timestamp);
     // Before the fork the parent must be in already, as it always was: an
     // unknown parent fails here at once and the engine's own path answers
     // SYNCING, with no wait and no sender recovery spent on it. From the
@@ -2321,7 +2583,7 @@ where
                 // to run beside.
                 let fields_at = std::time::Instant::now();
                 if parent_state.is_some() {
-                    wait_for_parent_fields(parent_hash)?;
+                    wait_for_ancestor_fields(chain_spec.genesis(), &parent, carried_depth)?;
                     phases.parent_fields_wait_us = fields_at.elapsed().as_micros() as u64;
                     parent_fields_wait_us.store(phases.parent_fields_wait_us, std::sync::atomic::Ordering::Relaxed);
                     against_parent()?;
@@ -2382,6 +2644,13 @@ where
         // returns -- before the block's QMDB root, its hashed post-state and
         // its engine insert, which are meant to run beside the next block's
         // execution.
+        // A held execution (`N42_VOTE_BEFORE_SLOT`) waits here for its
+        // validator's import slot: the vote road -- beside this on its own
+        // thread, or before it -- is not held. Deferred blocks only, the only
+        // ones whose vote comes before their execution.
+        if deferred {
+            wait_for_release(block_hash)?;
+        }
         // The plan made ahead, collected before the gate so that a plan
         // still running never holds another block's execution.
         let ahead_at = std::time::Instant::now();
@@ -2562,6 +2831,7 @@ where
                         gap_keys_wait_us = keys_wait_us,
                         gap_gate_us = state_at.saturating_duration_since(gate_at).as_micros() as u64,
                         gap_state_us = executed_at.saturating_duration_since(state_at).as_micros() as u64,
+                        core_layout = n42_core_layout::label(),
                         "build-path import phases"
                     );
                     sharded = Some(StartedShards { shards, residual, result, early_root, returned });
@@ -2725,6 +2995,7 @@ where
             // `move`, and the execution road needs the same block and parent.
             let header = &head;
             let parent_header = &parent;
+            let genesis = chain_spec.genesis();
             let vote_checked = checked.take();
             let vote_at = &vote_at;
             let parent_fields_wait_us = &parent_fields_wait_us;
@@ -2768,7 +3039,7 @@ where
                         phases.note_check(header_us, include_us, times);
                     }
                     let fields_at = std::time::Instant::now();
-                    wait_for_parent_fields(parent_hash)?;
+                    wait_for_ancestor_fields(genesis, parent_header, carried_depth)?;
                     phases.parent_fields_wait_us = fields_at.elapsed().as_micros() as u64;
                     parent_fields_wait_us.store(phases.parent_fields_wait_us, std::sync::atomic::Ordering::Relaxed);
                     validate_against_parent(consensus, header, parent_header)?;
@@ -2798,6 +3069,9 @@ where
     // is timed against (`root_gap_ms`).
     let mut root_returned: Option<std::time::Instant> = None;
     let mut view_hashed: Option<reth_trie::HashedPostState> = None;
+    // The build path's shards merge: its length, what the import waited for
+    // it at the join, and its halves (`n42_engine_types::output_shards::MergeSplit`).
+    let mut merge_times: Option<(u64, u64, n42_engine_types::output_shards::MergeSplit)> = None;
     let (execution_output, early_root) = match (output, sharded) {
         (Some(output), _) => {
             let execution_output = Arc::new(output);
@@ -2835,9 +3109,18 @@ where
                 std::thread::Builder::new()
                     .name("n42-follower-merge".into())
                     .spawn(move || {
+                        n42_core_layout::background_thread();
                         let at = std::time::Instant::now();
-                        let merged = shards.merged(&residual.state);
-                        (merged, at.elapsed().as_millis() as u64)
+                        let mode = shards_merge_mode();
+                        let (merged, split) = shards.merged_timed(&residual.state, mode != MergeMode::OnPath);
+                        let merge_ms = at.elapsed().as_millis() as u64;
+                        if mode == MergeMode::Verify {
+                            // The on-path merge beside it, compared and dropped:
+                            // one more bundle for the length of the compare.
+                            let on_path = shards.merged(&residual.state);
+                            note_merge_verified(on_path == merged);
+                        }
+                        (merged, merge_ms, split)
                     })
                     .map_err(|err| format!("a thread for the shards' merge: {err}"))?
             };
@@ -2862,7 +3145,8 @@ where
                 }
             }
             let wait_at = std::time::Instant::now();
-            let (merged, merge_ms) = merger.join().map_err(|_| "the shards' merge thread panicked".to_string())?;
+            let (merged, merge_ms, split) = merger.join().map_err(|_| "the shards' merge thread panicked".to_string())?;
+            merge_times = Some((merge_ms, wait_at.elapsed().as_millis() as u64, split));
             tracing::debug!(
                 target: "n42.follower_import",
                 number,
@@ -3036,6 +3320,14 @@ where
                 populate_lag_mb = split.populate_lag_mb,
                 root_seals = split.seals,
                 root_seal_ms = split.seal_ms,
+                merge_ms = merge_times.map_or(0, |(ms, _, _)| ms),
+                merge_wait_ms = merge_times.map_or(0, |(_, ms, _)| ms),
+                merge_state_ms = merge_times.map_or(0, |(_, _, split)| split.state_us / 1000),
+                merge_reverts_ms = merge_times.map_or(0, |(_, _, split)| split.reverts_us / 1000),
+                merge_append_ms = merge_times.map_or(0, |(_, _, split)| split.append_us / 1000),
+                merge_mode = shards_merge_mode().name(),
+                merge_verified = MERGE_VERIFIED.load(std::sync::atomic::Ordering::Relaxed),
+                merge_mismatches = MERGE_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed),
                 "build path: the root's start after the execution"
             );
         }
@@ -3091,10 +3383,31 @@ where
     // ordering rather than paying for it -- but it is timed into
     // `parent_engine_wait_ms` all the same, because under a backlog it is
     // where what the execution no longer waits for reappears.
+    //
+    // The wait is for the parent to be *canonical* (visible to the provider),
+    // and a block becoming canonical wakes no one, so it ends on a 20 ms poll;
+    // `N42_HANDOFF_ON_LANDED=1` waits for the parent's own hand-off instead
+    // ([`handoff_on_landed`]). Either way `handoff_wait_us` says how long, and
+    // `handoff_before_canonical` whether the parent was not yet canonical.
+    let mut handoff_wait_us = 0u64;
+    let mut handoff_before_canonical = 0u64;
     if executed_parent.is_some() {
         let wait_at = std::time::Instant::now();
-        wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
-        parent_engine_wait_us += wait_at.elapsed().as_micros() as u64;
+        if handoff_on_landed() {
+            let genesis = chain_spec.genesis();
+            let waited = wait_until_parent_handed(
+                parent_hash,
+                PARENT_WAIT,
+                std::time::Duration::from_millis(20),
+                || parent_in(provider, parent_hash, genesis, deferred).map(|parent| parent.is_some()),
+                || !deferred || n42_engine_types::executed_fields::get(&parent_hash).is_some(),
+            )?;
+            handoff_before_canonical = u64::from(waited.before_canonical);
+        } else {
+            wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
+        }
+        handoff_wait_us = wait_at.elapsed().as_micros() as u64;
+        parent_engine_wait_us += handoff_wait_us;
     }
 
     // Before the deferred-execution fork the vote is this import's answer,
@@ -3145,6 +3458,10 @@ where
             // output, and what they read it through ([`parent_read_name`]).
             parent_output_wait_ms,
             parent_read,
+            // The hand-off's wait for the parent, and whether the parent was
+            // not yet canonical when it ended.
+            handoff_wait_us,
+            handoff_before_canonical,
         ],
     ))
 }
@@ -3239,7 +3556,7 @@ fn prespawn_early_root(parent_hash: B256, block_hash: B256, on_parent_output: bo
 }
 
 /// How many timings [`import_foreign_block`] returns (see its last lines).
-pub const IMPORT_TIMES: usize = 27;
+pub const IMPORT_TIMES: usize = 29;
 
 /// Copies a block's post-state into the read cache the next import starts
 /// from, and files it under the block's hash.
@@ -3360,6 +3677,9 @@ fn side_pool(var: &str, name: &'static str, default: usize) -> Option<rayon::Thr
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(move |i| format!("{name}-{i}"))
+        // Both side pools (the vote check, the root) are on a block's
+        // chain: the layout's critical set under `N42_CORE_LAYOUT=isolate`.
+        .start_handler(|_| n42_core_layout::enter(n42_core_layout::Set::Critical))
         .build()
         .inspect_err(|err| tracing::warn!(target: "n42.follower_import", %err, name, "no side pool; on the worker pool"))
         .ok()
@@ -3491,6 +3811,139 @@ mod side_pool_tests {
                 .all(|_| std::thread::current().name().is_some_and(|name| name.starts_with("vote-check-")))
         });
         assert!(on_pool);
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// [`HANDED`] is one process-wide set: the bounded-set test would evict
+    /// another test's parent between its mark and its wait.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Off unless `N42_HANDOFF_ON_LANDED=1`: with it off the hand-off takes
+    /// [`wait_for_parent`] exactly as before and never reads [`HANDED`].
+    #[test]
+    fn the_switch_is_off_by_default() {
+        if std::env::var("N42_HANDOFF_ON_LANDED").is_err() {
+            assert!(!handoff_on_landed());
+        }
+    }
+
+    /// A parent the engine has answered for here releases its child at once,
+    /// though it is not canonical yet: the child is handed off ahead of the
+    /// parent's commit forkchoice, which is what the switch is for.
+    #[test]
+    fn a_handed_parent_releases_its_child_before_its_canonical_commit() {
+        let _one = one_at_a_time();
+        let parent = B256::with_last_byte(0xa1);
+        note_handed(parent);
+        let waited = wait_until_parent_handed(parent, Duration::from_secs(1), Duration::from_secs(1), || Ok(false), || true)
+            .expect("handed");
+        assert!(waited.before_canonical);
+        assert!(waited.waited_us < 100_000, "no wait for a handed parent: {waited:?}");
+    }
+
+    /// A parent that is canonical (it came in by the engine's own path, or
+    /// its commit ran first) releases the child without a hand-off mark.
+    #[test]
+    fn a_canonical_parent_releases_its_child_without_a_hand_off() {
+        let _one = one_at_a_time();
+        let parent = B256::with_last_byte(0xa2);
+        let waited = wait_until_parent_handed(parent, Duration::from_secs(1), Duration::from_secs(1), || Ok(true), || true)
+            .expect("canonical");
+        assert!(!waited.before_canonical);
+    }
+
+    /// The child's wait ends when the parent is handed, not on the next poll:
+    /// with a ten-second poll the wait would otherwise last ten seconds.
+    #[test]
+    fn the_hand_off_wakes_on_the_parents_answer_without_a_poll() {
+        let _one = one_at_a_time();
+        let parent = B256::with_last_byte(0xa3);
+        let noter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            note_handed(parent);
+        });
+        let at = Instant::now();
+        let waited =
+            wait_until_parent_handed(parent, Duration::from_secs(20), Duration::from_secs(10), || Ok(false), || true)
+                .expect("woken");
+        noter.join().expect("the noting thread");
+        assert!(waited.before_canonical);
+        assert!(at.elapsed() >= Duration::from_millis(50));
+        assert!(at.elapsed() < Duration::from_secs(5), "woken by the mark, not the poll: {:?}", at.elapsed());
+    }
+
+    /// A parent that is never handed and never canonical gives the hand-off
+    /// up after the wait, as [`wait_for_parent`] does after [`PARENT_WAIT`].
+    #[test]
+    fn a_parent_that_never_lands_times_out() {
+        let _one = one_at_a_time();
+        let parent = B256::with_last_byte(0xa4);
+        let at = Instant::now();
+        let err = wait_until_parent_handed(parent, Duration::from_millis(60), Duration::from_millis(10), || Ok(false), || true)
+            .expect_err("never lands");
+        assert!(at.elapsed() >= Duration::from_millis(60));
+        assert!(err.contains("neither handed"), "{err}");
+    }
+
+    /// A handed parent whose fields are not recorded does not release the
+    /// child; it still times out rather than spinning.
+    #[test]
+    fn a_handed_parent_without_fields_does_not_release_the_child() {
+        let _one = one_at_a_time();
+        let parent = B256::with_last_byte(0xa5);
+        note_handed(parent);
+        assert!(wait_until_parent_handed(parent, Duration::from_millis(40), Duration::from_millis(10), || Ok(false), || false)
+            .is_err());
+    }
+
+    /// The set is bounded: the oldest marks fall out past [`HANDED_KEPT`].
+    #[test]
+    fn the_handed_set_is_bounded() {
+        let _one = one_at_a_time();
+        for i in 0..(HANDED_KEPT as u64 + 8) {
+            note_handed(B256::from(alloy_primitives::U256::from(0xbb00_0000u64 + i)));
+        }
+        assert!(HANDED.0.lock().unwrap_or_else(|p| p.into_inner()).len() <= HANDED_KEPT);
+    }
+}
+
+#[cfg(test)]
+mod merge_mode_tests {
+    use super::*;
+
+    /// Unset, `0` or anything unknown keeps the merge on the path as before.
+    #[test]
+    fn the_merge_stays_on_the_path_unless_asked() {
+        assert_eq!(MergeMode::parse(None), MergeMode::OnPath);
+        assert_eq!(MergeMode::parse(Some("0")), MergeMode::OnPath);
+        assert_eq!(MergeMode::parse(Some("yes")), MergeMode::OnPath);
+        assert_eq!(MergeMode::parse(Some("1")), MergeMode::Concurrent);
+        assert_eq!(MergeMode::parse(Some(" verify ")), MergeMode::Verify);
+        if std::env::var("N42_SHARDS_MERGE_OFF_PATH").is_err() {
+            assert_eq!(shards_merge_mode(), MergeMode::OnPath);
+        }
+    }
+
+    /// The verify counters count every compare and only the differing ones.
+    #[test]
+    fn a_verified_merge_counts_its_mismatches() {
+        let (verified, mismatched) = (
+            MERGE_VERIFIED.load(std::sync::atomic::Ordering::Relaxed),
+            MERGE_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        note_merge_verified(true);
+        note_merge_verified(false);
+        assert!(MERGE_VERIFIED.load(std::sync::atomic::Ordering::Relaxed) >= verified + 2);
+        assert!(MERGE_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed) > mismatched);
     }
 }
 

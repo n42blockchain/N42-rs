@@ -29,7 +29,14 @@ fn alt_sig_tx_env(tx: &AltSigTx, caller: Address) -> TxEnv {
         chain_id: Some(inner.chain_id),
         access_list: inner.access_list.clone(),
         gas_priority_fee: Some(inner.max_priority_fee_per_gas),
-        ..Default::default()
+        // Every field spelled out: `TxEnv::default()` is
+        // `TxEnvBuilder::new().build()`, a whole second `TxEnv` built and
+        // type-derived per transaction only for these three empty fields
+        // (4.5% of the build pool in the loop314 profile). The values are
+        // the default's.
+        blob_hashes: Vec::new(),
+        max_fee_per_blob_gas: 0,
+        authorization_list: Vec::new(),
     }
 }
 

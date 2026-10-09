@@ -65,7 +65,156 @@ use tracing::{info, warn};
 pub const JOURNAL_DEPTH: usize = 64;
 
 /// For one block, sorted by key: the offset of each key's live record before the block.
-type Journal = Arc<Vec<(Hash, Option<u64>)>>;
+type Journal = Arc<JournalData>;
+
+/// A block's journal: its entries, and with `N42_VIEW_JOURNAL_FILTER=1` an
+/// address filter over their keys, so a read whose key the block did not
+/// change skips the journal's binary search (~17 dependent probes of a
+/// ~9 MB vector at a full block: 200-300 ns a journal on the E=1 bench,
+/// `docs/SHARED_EXECUTION_SCOPE.md` 13). A filter has no false negatives:
+/// every answer is the one the search gives.
+#[derive(Debug)]
+struct JournalData {
+    entries: Vec<(Hash, Option<u64>)>,
+    filter: Option<reth_provider::providers::overlay_filter::SplitBloom>,
+}
+
+impl JournalData {
+    fn new(entries: Vec<(Hash, Option<u64>)>, with_filter: bool) -> Self {
+        let filter = with_filter.then(|| {
+            let mut filter = reth_provider::providers::overlay_filter::SplitBloom::with_capacity(entries.len());
+            for (key, _) in &entries {
+                filter.insert(journal_key(key));
+            }
+            filter
+        });
+        Self { entries, filter }
+    }
+
+    /// The offset `key` held before the block, if the block changed it.
+    #[inline]
+    fn before(&self, key: &Hash) -> Option<Option<u64>> {
+        self.entries.binary_search_by(|(k, _)| k.cmp(key)).ok().map(|i| self.entries[i].1)
+    }
+}
+
+impl std::ops::Deref for JournalData {
+    type Target = [(Hash, Option<u64>)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+/// A journal key's filter key.
+#[inline(always)]
+fn journal_key(key: &Hash) -> reth_provider::providers::overlay_filter::FilterKey {
+    reth_provider::providers::overlay_filter::FilterKey::code_hash(&B256::from(*key))
+}
+
+/// Whether the view files a filter with each block's journal
+/// (`N42_VIEW_JOURNAL_FILTER=1`, off by default).
+pub fn journal_filter() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_VIEW_JOURNAL_FILTER").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Reads that walked journals: per-thread accumulators folded into the
+/// totals every 4,096 such reads (see [`take_journal_counters`]).
+static JOURNAL_READS: AtomicU64 = AtomicU64::new(0);
+static JOURNAL_SEARCHES: AtomicU64 = AtomicU64::new(0);
+static JOURNAL_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+std::thread_local! {
+    static JOURNAL_LOCAL: std::cell::Cell<(u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+std::thread_local! {
+    /// This thread's reads whose reader slot was write-locked (a publish in
+    /// flight: an advance, a step back) and the nanoseconds they waited.
+    static SLOT_WAITS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// The calling thread's waits on the read view's locks, cumulative since the
+/// thread started (difference two readings to attribute them to a span of
+/// work). Only a lock that could not be taken at once is timed, so a read that
+/// waits for nothing costs what it did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ViewLockWaits {
+    /// Reads whose reader slot was held by a writer publishing a new version.
+    pub slot_waits: u64,
+    /// Nanoseconds those reads waited for the slot.
+    pub slot_wait_ns: u64,
+    /// Reads whose offset-index shard was held by a writer (the index's
+    /// `apply_sorted` at an advance, a step back's inserts).
+    pub index_waits: u64,
+    /// Nanoseconds those reads waited for the shard.
+    pub index_wait_ns: u64,
+}
+
+impl ViewLockWaits {
+    /// The calling thread's counts now.
+    pub fn now() -> Self {
+        let (slot_waits, slot_wait_ns) = SLOT_WAITS.try_with(std::cell::Cell::get).unwrap_or((0, 0));
+        let (index_waits, index_wait_ns) = n42_twig_core::thread_read_waits();
+        Self { slot_waits, slot_wait_ns, index_waits, index_wait_ns }
+    }
+
+    /// The waits between `earlier` and `self`.
+    pub const fn since(self, earlier: Self) -> Self {
+        Self {
+            slot_waits: self.slot_waits.saturating_sub(earlier.slot_waits),
+            slot_wait_ns: self.slot_wait_ns.saturating_sub(earlier.slot_wait_ns),
+            index_waits: self.index_waits.saturating_sub(earlier.index_waits),
+            index_wait_ns: self.index_wait_ns.saturating_sub(earlier.index_wait_ns),
+        }
+    }
+}
+
+/// The reader slot's read lock, a failed `try_read` timed into [`SLOT_WAITS`].
+fn read_slot(slot: &Slot) -> std::sync::RwLockReadGuard<'_, Arc<Frozen>> {
+    match slot.0.try_read() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let at = std::time::Instant::now();
+            let guard = slot.0.read().unwrap_or_else(PoisonError::into_inner);
+            let waited = at.elapsed().as_nanos() as u64;
+            let _ = SLOT_WAITS.try_with(|waits| {
+                let (count, ns) = waits.get();
+                waits.set((count + 1, ns + waited));
+            });
+            guard
+        }
+    }
+}
+
+#[inline]
+fn record_journal_walk(searches: u64, skips: u64) {
+    let _ = JOURNAL_LOCAL.try_with(|local| {
+        let (reads, s, k) = local.get();
+        let (reads, s, k) = (reads + 1, s + searches, k + skips);
+        if reads >= 4096 {
+            JOURNAL_READS.fetch_add(reads, Ordering::Relaxed);
+            JOURNAL_SEARCHES.fetch_add(s, Ordering::Relaxed);
+            JOURNAL_SKIPS.fetch_add(k, Ordering::Relaxed);
+            local.set((0, 0, 0));
+        } else {
+            local.set((reads, s, k));
+        }
+    });
+}
+
+/// `(reads that had journals to walk, journals they searched, journals their
+/// filters skipped)` since the last call, reset to zero. Each thread folds its
+/// counts in every 4,096 such reads.
+pub fn take_journal_counters() -> (u64, u64, u64) {
+    (
+        JOURNAL_READS.swap(0, Ordering::Relaxed),
+        JOURNAL_SEARCHES.swap(0, Ordering::Relaxed),
+        JOURNAL_SKIPS.swap(0, Ordering::Relaxed),
+    )
+}
 
 /// One block the view advanced by.
 #[derive(Debug)]
@@ -179,6 +328,8 @@ pub struct QmdbReadView {
     cuts: AtomicU64,
     /// Advances and steps back one at a time.
     advancing: Mutex<()>,
+    /// Whether each new journal gets a filter ([`journal_filter`]).
+    filter_journals: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for QmdbReadView {
@@ -208,6 +359,9 @@ fn decode_account(value: &[u8]) -> Option<Account> {
         loop {
             let byte = *value.get(at)?;
             at += 1;
+            if shift == 63 && byte > 1 {
+                return None;
+            }
             nonce |= u64::from(byte & 0x7f).checked_shl(shift)?;
             if byte & 0x80 == 0 {
                 break;
@@ -247,7 +401,15 @@ impl QmdbReadView {
             floor: AtomicU64::new(floor),
             cuts: AtomicU64::new(0),
             advancing: Mutex::new(()),
+            filter_journals: std::sync::atomic::AtomicBool::new(journal_filter()),
         }))
+    }
+
+    /// Tests and benches: whether the journals filed from now on carry a
+    /// filter, whatever `N42_VIEW_JOURNAL_FILTER` says.
+    #[doc(hidden)]
+    pub fn set_journal_filter(&self, on: bool) {
+        self.filter_journals.store(on, Ordering::Relaxed);
     }
 
     /// The block the view stands at.
@@ -294,7 +456,7 @@ impl QmdbReadView {
     /// thread's reader slot is held through the record read, so a truncation
     /// (and an index change) waits.
     fn read_at<T>(&self, key: &Hash, at: u64, decode: impl FnOnce(&[u8]) -> T) -> Option<Option<T>> {
-        let frozen = self.readers.get(reader_slot())?.0.read().unwrap_or_else(PoisonError::into_inner);
+        let frozen = read_slot(self.readers.get(reader_slot())?);
         if !frozen.valid || at > frozen.head {
             return None;
         }
@@ -302,12 +464,23 @@ impl QmdbReadView {
         if behind > frozen.journals.len() {
             return None;
         }
-        let undone = frozen
-            .journals
-            .iter()
-            .skip(frozen.journals.len() - behind)
-            .chain(frozen.pending.iter())
-            .find_map(|journal| journal.binary_search_by(|(k, _)| k.cmp(key)).ok().map(|i| journal[i].1));
+        let walk = behind + usize::from(frozen.pending.is_some());
+        let undone = if walk == 0 {
+            None
+        } else {
+            let filter_key = journal_key(key);
+            let (mut searches, mut skips) = (0u64, 0u64);
+            let found = frozen.journals.iter().skip(frozen.journals.len() - behind).chain(frozen.pending.iter()).find_map(|journal| {
+                if journal.filter.as_ref().is_some_and(|filter| !filter.may_contain(filter_key)) {
+                    skips += 1;
+                    return None;
+                }
+                searches += 1;
+                journal.before(key)
+            });
+            record_journal_walk(searches, skips);
+            found
+        };
         let offset = match undone {
             Some(offset) => offset,
             None => self.index.get(key, |offset| self.file.key(offset)),
@@ -359,7 +532,16 @@ impl QmdbReadView {
     /// forest's lock, before the lock that could let the tree cut them is
     /// released; the result goes to [`Self::advance`].
     pub fn raise_floor(&self, changes: &[(Hash, Option<u64>)]) -> Raised {
-        let floor = changes.iter().filter_map(|(_, offset)| *offset).max().map_or(0, |offset| record_end(&self.file, offset));
+        self.raise_floor_to(changes.iter().filter_map(|(_, offset)| *offset).max())
+    }
+
+    /// [`Self::raise_floor`] from the highest record offset the block's
+    /// changes name (`None` for a block that appended nothing), for a caller
+    /// that lists the changes only after the forest's lock is let go
+    /// (`QmdbForest::block_changes_parts`). The same rule: under the lock,
+    /// before anything that could cut the records.
+    pub fn raise_floor_to(&self, max_offset: Option<u64>) -> Raised {
+        let floor = max_offset.map_or(0, |offset| record_end(&self.file, offset));
         self.floor.fetch_max(floor, Ordering::SeqCst);
         Raised { floor, cuts: self.cuts.load(Ordering::SeqCst) }
     }
@@ -390,7 +572,7 @@ impl QmdbReadView {
         let key_at = |offset: u64| self.file.key(offset);
         let journal: Vec<(Hash, Option<u64>)> =
             changes.par_iter().with_min_len(1024).map(|(key, _)| (*key, self.index.get(key, key_at))).collect();
-        let journal = Arc::new(journal);
+        let journal = Arc::new(JournalData::new(journal, self.filter_journals.load(Ordering::Relaxed)));
         {
             let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
             versions.pending = Some(journal.clone());
@@ -547,6 +729,16 @@ mod tests {
         assert_eq!(decode_account(&[2, 5, 1]), None, "a truncated balance");
     }
 
+    #[test]
+    fn an_overflowing_account_nonce_is_declined() {
+        for last in [2, 0x7f, 0x80, 0xff] {
+            let mut value = vec![1];
+            value.extend_from_slice(&[0x80; 9]);
+            value.push(last);
+            assert_eq!(decode_account(&value), None, "overflow must not become a different nonce");
+        }
+    }
+
     /// Concurrent reads of the view (plan v6, the read view's contention):
     /// 160k distinct keys of a 2M-key view read at 1, 4 and 16 threads, at the
     /// head (no journal walked) and 16 blocks behind it (16 journals walked),
@@ -554,6 +746,49 @@ mod tests {
     /// again on the same mapping (`warm`), beside the same reads with no
     /// versions lock (`raw`: index and record only). Pinned:
     /// `taskset -c 0-31 cargo test -p n42-qmdb-reth --release --lib bench_concurrent_reads -- --ignored --nocapture`.
+    /// A read whose reader slot a publish holds waits, is counted as a slot
+    /// wait (`ViewLockWaits`), and answers what an unheld read answers.
+    #[test]
+    fn a_read_behind_a_publish_is_counted_and_answers_the_same() {
+        use n42_twig_core::qmdb_compat::GOV5_EMPTY_CODE_HASH;
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("n42-view-waits-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("entries.log");
+        let address = Address::with_last_byte(0x24);
+        let key = gov5_account_key(&address.0 .0);
+        let value = encode_gov5_account_value(5, &U256::from(9u64).to_be_bytes::<32>(), &GOV5_EMPTY_CODE_HASH);
+        {
+            let mut file = std::io::BufWriter::new(std::fs::File::create(&path).expect("the entry file"));
+            file.write_all(&key).expect("write");
+            file.write_all(&(value.len() as u32).to_le_bytes()).expect("write");
+            file.write_all(&value).expect("write");
+            file.flush().expect("flush");
+        }
+        let view = QmdbReadView::build(&path, (1, B256::ZERO), vec![(key, 0)]).expect("the view");
+        let unheld = view.account(&address, 1);
+        assert_eq!(unheld.map(|a| a.map(|a| a.nonce)), Some(Some(5)));
+        let ready = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let held = view.lock_readers();
+            let reader = scope.spawn(|| {
+                ready.wait();
+                let before = ViewLockWaits::now();
+                let found = view.account(&address, 1);
+                (found, ViewLockWaits::now().since(before))
+            });
+            ready.wait();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(held);
+            let (found, waits) = reader.join().expect("the reader");
+            assert_eq!(found, unheld);
+            assert_eq!(waits.slot_waits, 1);
+            assert!(waits.slot_wait_ns > 0, "waited {} ns", waits.slot_wait_ns);
+            assert_eq!(waits.index_waits, 0);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A persistence batch longer than the journals: the database's readers
     /// stay at the batch's start until it commits, and are answered.
     #[test]
@@ -614,6 +849,87 @@ mod tests {
                 assert_eq!(nonce_at(&view, 1), None, "without the hold the start is past the journals");
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `N42_VIEW_JOURNAL_FILTER`: a view whose journals carry filters gives
+    /// every read the answer a view without them gives, at the head and at
+    /// every depth its journals reach, for keys the blocks changed (some
+    /// several times), keys they never changed and keys that do not exist;
+    /// and the filters skip journals.
+    #[test]
+    fn journal_filters_change_no_answer() {
+        use n42_twig_core::qmdb_compat::GOV5_EMPTY_CODE_HASH;
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("n42-view-filters-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("entries.log");
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&path).expect("the entry file"));
+        let mut offset = 0u64;
+        let address = |i: u64| Address::from_slice(&alloy_primitives::keccak256(i.to_be_bytes())[12..]);
+        let mut put = |file: &mut std::io::BufWriter<std::fs::File>, i: u64, nonce: u64| {
+            let key = gov5_account_key(&address(i).0 .0);
+            let value = encode_gov5_account_value(nonce, &U256::from(nonce).to_be_bytes::<32>(), &GOV5_EMPTY_CODE_HASH);
+            file.write_all(&key).expect("write");
+            file.write_all(&(value.len() as u32).to_le_bytes()).expect("write");
+            file.write_all(&value).expect("write");
+            let at = offset;
+            offset += 36 + value.len() as u64;
+            (key, at)
+        };
+        let keys = 4_000u64;
+        let live: Vec<(Hash, u64)> = (0..keys).map(|i| put(&mut file, i, 1)).collect();
+        // Six blocks, each re-writing a tenth of the keys (overlapping) and
+        // creating a few new ones.
+        let blocks: Vec<Vec<(Hash, Option<u64>)>> = (0..6u64)
+            .map(|b| {
+                let mut changes: Vec<(Hash, Option<u64>)> = (0..keys)
+                    .filter(|i| (i * 7 + b * 3) % 10 == 0)
+                    .chain((0..20).map(|n| keys + b * 20 + n))
+                    .map(|i| {
+                        let (key, at) = put(&mut file, i, b + 2);
+                        (key, Some(at))
+                    })
+                    .collect();
+                changes.sort_unstable_by_key(|(key, _)| *key);
+                changes
+            })
+            .collect();
+        file.flush().expect("flush");
+        drop(file);
+        let views: Vec<Arc<QmdbReadView>> = [false, true]
+            .into_iter()
+            .map(|filtered| {
+                let view = QmdbReadView::build(&path, (1, B256::ZERO), live.clone()).expect("the view");
+                view.set_journal_filter(filtered);
+                for (b, changes) in blocks.iter().enumerate() {
+                    let raised = view.raise_floor(changes);
+                    view.advance(b as u64 + 2, B256::with_last_byte(b as u8 + 2), changes, raised);
+                }
+                view
+            })
+            .collect();
+        for at in 1..=7u64 {
+            for i in 0..keys + 200 {
+                let (plain, filtered) = (views[0].account(&address(i), at), views[1].account(&address(i), at));
+                assert_eq!(plain, filtered, "key {i} at {at}");
+                assert!(plain.is_some(), "the view answers at {at}");
+            }
+        }
+        // The filtered view alone, on a thread of its own: its counts fold in
+        // whole every 4,096 reads.
+        let _ = take_journal_counters();
+        let filtered = Arc::clone(&views[1]);
+        std::thread::spawn(move || {
+            for i in 0..8192u64 {
+                let _ = filtered.account(&address(i % keys), 1);
+            }
+        })
+        .join()
+        .expect("the reads");
+        let (reads, searches, skips) = take_journal_counters();
+        assert!(reads >= 8192, "every read had journals to walk ({reads})");
+        assert!(skips > searches, "the filters skipped most journals ({skips} skipped, {searches} searched)");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

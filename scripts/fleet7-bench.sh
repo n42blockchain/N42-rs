@@ -269,13 +269,21 @@ json.dump(g, open(sys.argv[2], 'w'), indent=2)" "$F7_GENESIS" "$DERIVED" "$F7_LE
   export F7_GENESIS=$DERIVED
 fi
 CHAIN=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['config']['chainId'])" "$F7_GENESIS")
-RPCS=$(for ((i = 0; i < F7_NODES; i++)); do printf 'http://127.0.0.1:%s,' $((F7_HTTP_BASE + i)); done | sed 's/,$//')
+# One RPC and one ingest per execution layer, not per validator: with several keys on a
+# layer the flood still feeds the layer once (F7_NODES = F7_ELS when every validator has
+# a layer of its own, which is every round before the shared-execution legs).
+RPCS=$(for ((i = 0; i < F7_ELS; i++)); do printf 'http://127.0.0.1:%s,' $((F7_HTTP_BASE + i)); done | sed 's/,$//')
 
 {
   echo "round        : $TAG"
   echo "tier         : gossip ${N42_MAX_GOSSIP_MB}MB, gas ceiling ${F7_BENCH_GASCEIL}, pool ${F7_BENCH_POOL_SLOTS}, pacing ${F7_BLOCK_INTERVAL_MS}ms, view timeout ${F7_VIEW_TIMEOUT_MS:-genesis}${F7_AMSTERDAM:+, amsterdam}${F7_LEADER_TENURE:+, leader tenure $F7_LEADER_TENURE}"
   echo "supply       : $SENDERS senders x $PERTX tx, offset $OFFSET, conc $CONC, batch $RPCBATCH${SHARD:+, sharded}, $RECIPIENTS recipients, gas $F7_TX_GAS${F7_PRECREATE:+, precreate $F7_PRECREATE}"
   echo "windows      : $WINDOWS x ${WINDOW_SEC}s after ${DECAY_SEC}s of base-fee decay"
+  echo "chain        : $(basename "$F7_GENESIS"), deferred execution depth $(f7_genesis_depth)"
+  # Only a fleet whose layers are shared says so; every other round's header is as it was.
+  if ((F7_SHARED || F7_MAPPED)); then
+    echo "layers       : $F7_ELS execution layers for $F7_NODES validators, map $(IFS=,; echo "${F7_EL_OF[*]}"), $(f7_el_cpus) CPUs a layer, import-once ${N42_IMPORT_ONCE:-off}"
+  fi
 }
 
 # The memory state at the start decides the leg (round 43, loop86-97): the
@@ -397,7 +405,7 @@ echo "flood cores  : ${FLOOD_CORES}"
 # list is passed either way.
 INGEST_ARG=()
 if [[ -n ${F7_INGEST:-} ]]; then
-  INGESTS=$(for ((i = 0; i < F7_NODES; i++)); do printf '127.0.0.1:%s,' $((F7_INGEST_BASE + i)); done | sed 's/,$//')
+  INGESTS=$(for ((i = 0; i < F7_ELS; i++)); do printf '127.0.0.1:%s,' $((F7_INGEST_BASE + i)); done | sed 's/,$//')
   INGEST_ARG=(--ingest "$INGESTS")
   # F7_INGEST_ALL=1: every transaction to every node's ingest, so no pool
   # depends on gossip for what another pool holds. gov5's methodology, and
@@ -472,19 +480,39 @@ for ((fp = 0; fp < FLOOD_PROCS; fp++)); do
 done
 FLOOD=${FLOODS[0]}
 
-for ((w = 1; w <= WINDOWS; w++)); do
-  "$HERE/fleet7-measure.py" "$F7_HTTP_BASE" "$WINDOW_SEC" "win$w"
-  # The block's shape after the first window: senders, distinct recipients,
-  # run lengths. The flood paid 13,000 recipients a block for 42 rounds before
-  # this line existed (round 43).
-  if (( w == 1 )); then
-    python3 "$HERE/fleet7-shape.py" "$F7_HTTP_BASE" "shape" 2>&1 | tail -1
-  fi
-  # A profile is pulled between windows, never inside one.
-  if (( PROFILE_NODE >= 0 && w < WINDOWS )); then
-    "$HERE/fleet7-profile.sh" "$PROFILE_NODE" "$OUT/profile-win$w" 2>&1 | tail -3
-  fi
-done
+# F7_MEASURE_FROM_LOG=1: the windows come from the execution layer's `Block added to canonical chain` lines
+# (contiguous, the first starting at the flood's first full block) and nothing reads a block over RPC while the
+# flood runs: with it the builds' state opens waited 60-120 ms behind the harness's 200k-hash reads (docs 10.81).
+# What still touches RPC in a leg: the funding transactions and nonce reads before the first window, the decay's
+# eth_getBlockByNumber(latest) before the flood, and, after the flood is killed and the chain idles, the shape line
+# and fleet7-verify.py.
+if [[ ${F7_MEASURE_FROM_LOG:-0} == 1 ]]; then
+  MLOG=$F7_ROOT/node0/el.log
+  MT0=$("$HERE/fleet7-measure.py" --first-full "$MLOG" "${F7_MEASURE_FULL_TXS:-100000}" 180)
+  echo "measure      : windows from $MLOG, first full block at epoch $MT0"
+  for ((w = 1; w <= WINDOWS; w++)); do
+    "$HERE/fleet7-measure.py" --log "$MLOG" "$(python3 -c "print($MT0 + ($w - 1) * $WINDOW_SEC)")" "$WINDOW_SEC" "win$w"
+  done
+  for fp_pid in "${FLOODS[@]}"; do kill "$fp_pid" 2>/dev/null || true; done
+  "$HERE/fleet7-measure.py" --wait-idle "$MLOG" 120
+  SHAPE_N=$("$HERE/fleet7-measure.py" --shape-block "$MLOG" "$MT0" "${F7_MEASURE_FULL_TXS:-100000}")
+  python3 "$HERE/fleet7-shape.py" "$F7_HTTP_BASE" "shape" "$SHAPE_N" 2>&1 | tail -1
+else
+  for ((w = 1; w <= WINDOWS; w++)); do
+    "$HERE/fleet7-measure.py" "$F7_HTTP_BASE" "$WINDOW_SEC" "win$w"
+    # The block's shape after the first window: senders, distinct recipients,
+    # run lengths. The flood paid 13,000 recipients a block for 42 rounds before
+    # this line existed (round 43).
+    if (( w == 1 )); then
+      python3 "$HERE/fleet7-shape.py" "$F7_HTTP_BASE" "shape" 2>&1 | tail -1
+    fi
+    # A profile is pulled between windows, never inside one.
+    if (( PROFILE_NODE >= 0 && w < WINDOWS )); then
+      "$HERE/fleet7-profile.sh" "$PROFILE_NODE" "$OUT/profile-win$w" 2>&1 | tail -3
+    fi
+  done
+
+fi
 
 echo "--- resources at the end of the round ---"
 "$HERE/fleet7.sh" stats | tail -3

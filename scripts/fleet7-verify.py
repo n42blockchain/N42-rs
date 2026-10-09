@@ -66,14 +66,32 @@ def main():
     # every caller passed F7_HTTP_BASE, so an invocation that forgot it read
     # ports nothing is listening on and reported "no node answered" -- which
     # looks exactly like a dead fleet.
-    nodes = int(os.environ.get("F7_NODES", "7"))
+    # Validators and execution layers are two numbers on a shared-execution fleet
+    # (fleet7-env.sh F7_VALIDATORS / F7_ELS): one RPC port per layer, the quorum and
+    # the authorship count over validators. Unset, both are F7_NODES, as before.
+    nodes = int(os.environ.get("F7_VALIDATORS", os.environ.get("F7_NODES", "7")))
+    els = int(os.environ.get("F7_ELS", nodes))
     base = int(os.environ.get("F7_HTTP_BASE", "8700"))
-    ports = [base + i for i in range(nodes)]
+    ports = [base + i for i in range(els)]
     # A QC needs `n - f` votes with `f = (n - 1) / 3`; printed beside the
     # authorship count so a four-node leg's output states its own quorum.
     quorum = nodes - (nodes - 1) // 3
 
     say = (lambda *a, **k: None) if args.quiet else print
+    # The chain's deferred-execution depth (docs/DEFERRED_DEPTH_2_DESIGN.md), when
+    # F7_GENESIS names the file: a header's stateRoot is then the result of the
+    # block that many back, so it is a commitment to compare, not a block's own root.
+    depth = None
+    if os.environ.get("F7_GENESIS"):
+        try:
+            with open(os.environ["F7_GENESIS"]) as genesis:
+                config = json.load(genesis).get("config", {})
+            if "deferredExecutionTime" in config:
+                depth = int(config.get("deferredExecutionDepth", 1))
+        except (OSError, ValueError, TypeError):
+            depth = None
+    if depth is not None:
+        say(f"deferred execution depth {depth}: header N carries the result of block N-{depth}")
 
     first = [height(port) for port in ports]
     answering = [i for i, h in enumerate(first) if h is not None]
@@ -115,6 +133,7 @@ def main():
     result = {
         "nodes": nodes,
         "quorum": quorum,
+        "deferred_depth": depth,
         "answering": answering,
         "common_height": common,
         "commitments": {str(i): rows[i] for i in sorted(rows)},
@@ -125,19 +144,21 @@ def main():
         "heights_after": second,
         "advanced": advanced,
         "checks": {
-            "every_node_answered": len(answering) == nodes,
+            "every_node_answered": len(answering) == els,
             "commitments_agree": not disagreements,
             "every_node_advanced": len(advanced) == len(answering),
             "authors_at_least": len(authors),
         },
     }
+    if els != nodes:
+        result["execution_layers"] = els
     result["pass"] = (
         result["checks"]["every_node_answered"]
         and result["checks"]["commitments_agree"]
         and result["checks"]["every_node_advanced"]
     )
 
-    say(f"common height {common}, {len(answering)}/{nodes} answering")
+    say(f"common height {common}, {len(answering)}/{els} answering")
     for key in COMMITMENTS:
         values = {row[key] for row in rows.values()}
         mark = "=" if len(values) == 1 else "!"

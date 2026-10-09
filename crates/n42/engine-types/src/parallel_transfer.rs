@@ -54,6 +54,16 @@ pub struct Phases {
     /// read set, the slots), microseconds -- the leader's gap before the
     /// execution, with what the caller did before the call.
     pub batches_start_us: u64,
+    /// `N42_PLAN_AHEAD_BODY=1`: the partition and the slots came prepared
+    /// with the plan ([`PreparedExec`]) rather than made in the call.
+    pub prepared_groups: bool,
+    /// See `prepared_groups`.
+    pub prepared_slots: bool,
+    /// The partition and `batch_groups` (or the prepared groups' check),
+    /// microseconds; and the slots made (or taken), microseconds.
+    pub partition_us: u64,
+    /// See `partition_us`.
+    pub slots_us: u64,
     /// From the call's entry to the batches' end, microseconds: the caller
     /// names the gap after the execution from here.
     pub batches_end_us: u64,
@@ -149,6 +159,57 @@ fn thread_cpu_ns() -> u64 {
     0
 }
 
+/// The calling thread's CPU time and its resource counters at one instant
+/// (`getrusage(RUSAGE_THREAD)`): a batch's span is the difference of two.
+/// The minor faults say whether a batch's off-CPU time is first touches, the
+/// voluntary switches whether it blocked (a futex, a major fault), the
+/// involuntary ones whether it was preempted.
+/// The major faults say whether it waited on a file read (an entry-file page
+/// of the QMDB view, a database page, not in the page cache). Beside the
+/// kernel's counters, the thread's own lock-wait counters: the QMDB read
+/// view's slot and index locks ([`n42_qmdb_reth::ViewLockWaits`]) and the
+/// output shards' live-index locks
+/// ([`crate::output_shards::LiveLockCounts`]) -- per-thread cells, read
+/// without a syscall.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ThreadMark {
+    cpu_ns: u64,
+    minflt: u64,
+    majflt: u64,
+    nvcsw: u64,
+    nivcsw: u64,
+    view: n42_qmdb_reth::ViewLockWaits,
+    live: crate::output_shards::LiveLockCounts,
+}
+
+impl ThreadMark {
+    /// The calling thread's counters now (zeros where they cannot be read).
+    pub fn now() -> Self {
+        let cpu_ns = thread_cpu_ns();
+        let view = n42_qmdb_reth::ViewLockWaits::now();
+        let live = crate::output_shards::LiveLockCounts::now();
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: the call only writes into the zeroed struct passed to it.
+            unsafe {
+                let mut usage: libc::rusage = std::mem::zeroed();
+                if libc::getrusage(libc::RUSAGE_THREAD, &mut usage) == 0 {
+                    return Self {
+                        cpu_ns,
+                        minflt: usage.ru_minflt.max(0) as u64,
+                        majflt: usage.ru_majflt.max(0) as u64,
+                        nvcsw: usage.ru_nvcsw.max(0) as u64,
+                        nivcsw: usage.ru_nivcsw.max(0) as u64,
+                        view,
+                        live,
+                    };
+                }
+            }
+        }
+        Self { cpu_ns, view, live, ..Self::default() }
+    }
+}
+
 /// One batch of the build on the pool: its start and end against the
 /// batches' start (microseconds), the CPU time its thread spent in it, and
 /// its transactions.
@@ -162,16 +223,47 @@ pub struct BatchSpan {
     pub cpu_us: u64,
     /// Transactions in the batch.
     pub txs: usize,
+    /// The pool thread that ran it (`usize::MAX` off the pool).
+    pub thread: usize,
+    /// Minor page faults the thread took inside the batch.
+    pub minflt: u64,
+    /// Voluntary context switches inside the batch (the thread blocked).
+    pub vcsw: u64,
+    /// Involuntary context switches inside the batch (it was preempted).
+    pub ivcsw: u64,
+    /// Major page faults inside the batch (a file page read from disk).
+    pub majflt: u64,
+    /// The QMDB read view's lock waits inside the batch.
+    pub view: n42_qmdb_reth::ViewLockWaits,
+    /// The live-index hand-over's lock counts inside the batch.
+    pub live: crate::output_shards::LiveLockCounts,
+    /// The batch's open of its view of the parent, microseconds.
+    pub open_us: u64,
 }
 
 impl BatchSpan {
-    fn close(start_us: u64, cpu_start: u64, txs: usize, batches_at: std::time::Instant) -> Self {
+    fn close(start_us: u64, mark: ThreadMark, txs: usize, batches_at: std::time::Instant) -> Self {
+        let now = ThreadMark::now();
         Self {
             start_us,
             end_us: batches_at.elapsed().as_micros() as u64,
-            cpu_us: thread_cpu_ns().saturating_sub(cpu_start) / 1000,
+            cpu_us: now.cpu_ns.saturating_sub(mark.cpu_ns) / 1000,
             txs,
+            thread: rayon::current_thread_index().unwrap_or(usize::MAX),
+            minflt: now.minflt.saturating_sub(mark.minflt),
+            vcsw: now.nvcsw.saturating_sub(mark.nvcsw),
+            ivcsw: now.nivcsw.saturating_sub(mark.nivcsw),
+            majflt: now.majflt.saturating_sub(mark.majflt),
+            view: now.view.since(mark.view),
+            live: now.live.since(mark.live),
+            open_us: 0,
         }
+    }
+
+    /// The span with its open's time set.
+    fn with_open_us(mut self, open_us: u64) -> Self {
+        self.open_us = open_us;
+        self
     }
 }
 
@@ -196,6 +288,55 @@ pub struct BatchSpans {
     /// The batches' start to the first batch's start, plus the last batch's
     /// end to the batches' end.
     pub wait_ms: u64,
+    /// How many batches ran.
+    pub batches: usize,
+    /// How many distinct pool threads ran them.
+    pub threads: usize,
+    /// The first batch's start, microseconds after the batches' start (the
+    /// hand-over to the pool).
+    pub first_start_us: u64,
+    /// The last batch's start, microseconds after the batches' start.
+    pub last_start_us: u64,
+    /// The last batch's end, microseconds after the batches' start.
+    pub last_end_us: u64,
+    /// The dispatch: microseconds after the batches' start by which every
+    /// thread that ran a batch had started its first one. With at most one
+    /// batch a thread (`N42_BUILD_ONE_WAVE=1`) this equals `last_start_us`;
+    /// with two waves, `last_start_us` less this is the first wave's length.
+    pub dispatch_us: u64,
+    /// Every batch's wall time summed, microseconds.
+    pub wall_sum_us: u64,
+    /// Every batch's thread CPU time summed, microseconds: `wall_sum_us` less
+    /// this is the batches' time off the CPU.
+    pub cpu_sum_us: u64,
+    /// Minor page faults inside the batches, summed.
+    pub minflt: u64,
+    /// Voluntary context switches inside the batches, summed.
+    pub vcsw: u64,
+    /// Involuntary context switches inside the batches, summed.
+    pub ivcsw: u64,
+    /// Major page faults inside the batches, summed.
+    pub majflt: u64,
+    /// Reads that waited for a QMDB read-view reader slot (a publish), summed.
+    pub view_slot_waits: u64,
+    /// Microseconds those reads waited.
+    pub view_slot_wait_us: u64,
+    /// Reads that waited for a QMDB offset-index shard (an advance's writes).
+    pub view_index_waits: u64,
+    /// Microseconds those reads waited.
+    pub view_index_wait_us: u64,
+    /// Live-index shard locks the hand-overs blocked on.
+    pub live_lock_waits: u64,
+    /// Microseconds blocked on them.
+    pub live_lock_wait_us: u64,
+    /// Microseconds the hand-overs held shard locks.
+    pub live_lock_hold_us: u64,
+    /// Shards the hand-overs left to the freeze (`N42_LIVE_INDEX_DEFER=1`).
+    pub live_deferred: u64,
+    /// The batches' opens of the parent's view, microseconds summed.
+    pub open_sum_us: u64,
+    /// The longest of them.
+    pub open_max_us: u64,
 }
 
 impl BatchSpans {
@@ -209,8 +350,58 @@ impl BatchSpans {
         let first_start = spans.iter().map(|s| s.start_us).min().unwrap_or(0);
         let last_start = spans.iter().map(|s| s.start_us).max().unwrap_or(0);
         let last_end = spans.iter().map(|s| s.end_us).max().unwrap_or(0);
+        // Each thread's first start; the latest of those is when the last
+        // thread got going.
+        let mut first_by_thread: Vec<(usize, u64)> = Vec::with_capacity(spans.len());
+        for span in spans.iter() {
+            match first_by_thread.iter_mut().find(|(thread, _)| *thread == span.thread) {
+                Some((_, first)) => *first = (*first).min(span.start_us),
+                None => first_by_thread.push((span.thread, span.start_us)),
+            }
+        }
+        let dispatch_us = first_by_thread.iter().map(|(_, first)| *first).max().unwrap_or(0);
+        let (batches, threads) = (spans.len(), first_by_thread.len());
+        let wall_sum_us = spans.iter().map(wall).sum();
+        let cpu_sum_us = spans.iter().map(|s| s.cpu_us).sum();
+        let minflt = spans.iter().map(|s| s.minflt).sum();
+        let vcsw = spans.iter().map(|s| s.vcsw).sum();
+        let ivcsw = spans.iter().map(|s| s.ivcsw).sum();
+        let sum = |f: &dyn Fn(&BatchSpan) -> u64| spans.iter().map(f).sum::<u64>();
+        let majflt = sum(&|s| s.majflt);
+        let view_slot_waits = sum(&|s| s.view.slot_waits);
+        let view_slot_wait_us = sum(&|s| s.view.slot_wait_ns) / 1000;
+        let view_index_waits = sum(&|s| s.view.index_waits);
+        let view_index_wait_us = sum(&|s| s.view.index_wait_ns) / 1000;
+        let live_lock_waits = sum(&|s| s.live.waits);
+        let live_lock_wait_us = sum(&|s| s.live.wait_ns) / 1000;
+        let live_lock_hold_us = sum(&|s| s.live.hold_ns) / 1000;
+        let live_deferred = sum(&|s| s.live.deferred);
+        let open_sum_us = sum(&|s| s.open_us);
+        let open_max_us = spans.iter().map(|s| s.open_us).max().unwrap_or(0);
         spans.sort_unstable_by_key(wall);
         Self {
+            wall_sum_us,
+            cpu_sum_us,
+            minflt,
+            vcsw,
+            ivcsw,
+            majflt,
+            view_slot_waits,
+            view_slot_wait_us,
+            view_index_waits,
+            view_index_wait_us,
+            live_lock_waits,
+            live_lock_wait_us,
+            live_lock_hold_us,
+            live_deferred,
+            open_sum_us,
+            open_max_us,
+            batches,
+            threads,
+            first_start_us: first_start,
+            last_start_us: last_start,
+            last_end_us: last_end,
+            dispatch_us,
             max_ms: wall(&slowest) / 1000,
             min_ms: wall(&spans[0]) / 1000,
             median_ms: wall(&spans[spans.len() / 2]) / 1000,
@@ -654,7 +845,8 @@ pub fn partition_by_sender(keys: &[(Address, Address)], beneficiary: Address) ->
 /// The worker pool the build's batches run on: its own, so that they do not
 /// queue behind the global pool's other jobs (the QMDB root of the block
 /// before, a follower import). `N42_PARALLEL_BUILD_THREADS` threads, 16 by
-/// default.
+/// default. Under `N42_CORE_LAYOUT=isolate` each thread pins itself to the
+/// layout's build set (`n42_core_layout`).
 pub fn build_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
@@ -662,9 +854,86 @@ pub fn build_pool() -> &'static rayon::ThreadPool {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .thread_name(|i| format!("n42-build-{i}"))
+            .start_handler(|_| n42_core_layout::enter(n42_core_layout::Set::Build))
             .build()
             .expect("a thread pool for the parallel build")
     })
+}
+
+/// `N42_FREEZE_POOL=own` (`docs/SHARED_EXECUTION_SCOPE.md` 16.2): the work
+/// behind the seal -- the output shards' freeze (its tasks and the frees it
+/// spawns), the receipts from the slots and the slots' free -- runs on a
+/// small pool of its own ([`behind_pool`]) instead of the build pool, so a
+/// latency-critical pass of the build never finishes behind one of its long
+/// tasks (a rayon worker waiting in a join takes any job it finds). Off by
+/// default: everything stays on [`build_pool`].
+pub fn freeze_pool_own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FREEZE_POOL").is_ok_and(|v| v.trim() == "own"))
+}
+
+/// The pool the work behind the seal runs on: with `N42_FREEZE_POOL=own` a
+/// pool of `N42_FREEZE_POOL_THREADS` threads (16 by default, `n42-behind-*`,
+/// in the layout's build set as the build pool's are), else [`build_pool`].
+/// A pool that cannot be built falls back to [`build_pool`].
+pub fn behind_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    if !freeze_pool_own() {
+        return build_pool();
+    }
+    let own = POOL.get_or_init(|| {
+        let threads =
+            std::env::var("N42_FREEZE_POOL_THREADS").ok().and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0).unwrap_or(16);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("n42-behind-{i}"))
+            .start_handler(|_| n42_core_layout::enter(n42_core_layout::Set::Build))
+            .build()
+            .inspect_err(|err| tracing::warn!(target: "payload_builder", %err, "no pool of its own for the freeze; the build pool takes it"))
+            .ok()
+    });
+    own.as_ref().unwrap_or_else(|| build_pool())
+}
+
+/// What a build's call can be handed, prepared with the plan while the parent
+/// executed (`N42_PLAN_AHEAD_BODY=1`, `docs/SHARED_EXECUTION_SCOPE.md` 16.4
+/// item 2): the sender partition of the same keys at the same beneficiary
+/// ([`partition_by_sender`]) and the empty slot array. Either is used only
+/// when its size is the call's; otherwise the call makes its own.
+#[derive(Debug)]
+pub struct PreparedExec<T> {
+    /// The partition, made by [`partition_by_sender`] on these keys and this
+    /// block's beneficiary.
+    pub groups: Option<Vec<Vec<usize>>>,
+    /// One empty slot a candidate.
+    pub slots: Option<Vec<std::sync::OnceLock<BuiltTransfer<T>>>>,
+}
+
+/// `n` empty slots, made and touched on `pool` (a full block's are ~94 MB).
+pub fn empty_slots<T: Send>(pool: &rayon::ThreadPool, n: usize) -> Vec<std::sync::OnceLock<BuiltTransfer<T>>> {
+    pool.install(|| {
+        use rayon::prelude::*;
+        (0..n).into_par_iter().with_min_len(4096).map(|_| std::sync::OnceLock::new()).collect()
+    })
+}
+
+/// The pool the plan-ahead body is made on (`N42_PLAN_AHEAD_BODY=1`): its own
+/// `N42_PLAN_AHEAD_BODY_THREADS` threads (8 by default, `n42-plan-body-*`),
+/// so the next block's preparation does not take the build pool's workers
+/// from the block executing on them. Falls back to the build pool.
+pub fn plan_body_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    let own = POOL.get_or_init(|| {
+        let threads =
+            std::env::var("N42_PLAN_AHEAD_BODY_THREADS").ok().and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0).unwrap_or(8);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("n42-plan-body-{i}"))
+            .build()
+            .inspect_err(|err| tracing::warn!(target: "payload_builder", %err, "no pool for the plan-ahead body; the build pool makes it"))
+            .ok()
+    });
+    own.as_ref().unwrap_or_else(|| build_pool())
 }
 
 /// Whether the leader's parallel build reads the block's accounts ahead of
@@ -1091,6 +1360,100 @@ pub fn batch_groups(groups: &[Vec<usize>], total: usize, workers: usize) -> Vec<
     batches
 }
 
+/// `N42_BUILD_ONE_WAVE=1`: the build's batches are one per pool thread at
+/// most ([`batch_groups_one_wave`]) and handed to the pool all at once
+/// ([`execute_for_build`]'s spawn per batch), instead of up to two a thread
+/// split recursively. With two a thread the second wave starts only when a
+/// first-wave batch ends: on loop334 (200,000 transfers, 400 sender runs of
+/// 500, 32 threads, 58 batches) `batch_start_skew_ms` tracked
+/// `batch_median_ms` + 2-3 ms (correlation 0.96), and the execution was two
+/// batches long. Batches are still whole sender groups in candidate order,
+/// as with a pool of a different size; the block's state, receipts and gas
+/// are the same either way. Off by default.
+pub fn build_one_wave() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILD_ONE_WAVE").is_ok_and(|v| v == "1"))
+}
+
+/// `N42_BUILD_BATCHES=<n>` (`docs/SHARED_EXECUTION_SCOPE.md` 16.4 item 4):
+/// the build's transfers in `n` batches of about equal size (whole sender
+/// groups in candidate order, [`batch_groups_one_wave`] with `n`), handed to
+/// the pool largest first (FIFO, so the workers take them in that order):
+/// with 96-128 batches on 32 workers no worker starts a second batch behind a
+/// long one, and the execution ends within one small batch of its CPU floor.
+/// 0 (the default) keeps the dispatch `N42_BUILD_ONE_WAVE` chooses. Each batch
+/// opens its own view of the parent, so more batches cost more opens.
+pub fn build_batches() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("N42_BUILD_BATCHES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// How a build's batches are made and handed to the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatch {
+    /// Up to two batches a worker ([`batch_groups`]), split in halves by
+    /// rayon (the default).
+    Halves,
+    /// One batch a worker at most ([`batch_groups_one_wave`]), all spawned
+    /// at once (`N42_BUILD_ONE_WAVE=1`).
+    OneWave,
+    /// `n` batches, spawned largest first (`N42_BUILD_BATCHES=<n>`).
+    LargestFirst(usize),
+}
+
+impl Dispatch {
+    /// The dispatch the environment asks for.
+    pub fn from_env() -> Self {
+        match build_batches() {
+            0 if build_one_wave() => Self::OneWave,
+            0 => Self::Halves,
+            n => Self::LargestFirst(n),
+        }
+    }
+
+    fn from_one_wave(one_wave: bool) -> Self {
+        if one_wave { Self::OneWave } else { Self::Halves }
+    }
+}
+
+/// The order [`Dispatch::LargestFirst`] hands batches to the pool in: by
+/// transfers, largest first, ties in batch order (longest processing time
+/// first).
+pub fn largest_first(sizes: &[usize]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    order.sort_by(|a, b| sizes[*b].cmp(&sizes[*a]).then(a.cmp(b)));
+    order
+}
+
+/// Whole groups packed into at most `workers` batches, in group order, each
+/// ending at the first group that takes the running count past its share
+/// (`k x total / batches`): every batch holds about `total / workers`
+/// transfers, at most one group more. Fewer batches than `workers` when
+/// there are fewer groups.
+pub fn batch_groups_one_wave(groups: &[Vec<usize>], total: usize, workers: usize) -> Vec<Vec<&Vec<usize>>> {
+    let wanted = workers.max(1).min(groups.len().max(1));
+    let mut batches: Vec<Vec<&Vec<usize>>> = Vec::with_capacity(wanted);
+    let mut current: Vec<&Vec<usize>> = Vec::new();
+    let mut filled = 0usize;
+    let mut boundary = 1usize;
+    for group in groups {
+        current.push(group);
+        filled += group.len();
+        // The k-th batch closes once the running count reaches k / wanted of
+        // the total (integer arithmetic, rounded up, so no empty batch).
+        if boundary < wanted && filled.saturating_mul(wanted) >= boundary.saturating_mul(total) {
+            batches.push(std::mem::take(&mut current));
+            while boundary < wanted && filled.saturating_mul(wanted) >= boundary.saturating_mul(total) {
+                boundary += 1;
+            }
+        }
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
 /// One transfer executed for a block being built: its index in the candidate
 /// list, the transaction as `convert` produced it, the EVM's result, and the
 /// gas it used. Its state changes are in its batch's bundle
@@ -1190,6 +1553,9 @@ pub struct BodyAhead<Tx> {
     pub senders: Vec<Address>,
     /// Their tips per gas at the block's base fee.
     pub tips: Vec<u128>,
+    /// Their hashes (the pooled transactions' own), for the seal's frame
+    /// layout: the seal's 200,000-hash collect was `tx_root_ms` 2.
+    pub hashes: Vec<alloy_primitives::B256>,
     /// The job's own time, microseconds.
     pub took_us: u64,
 }
@@ -1197,12 +1563,22 @@ pub struct BodyAhead<Tx> {
 impl<Tx: Send> BodyAhead<Tx> {
     /// The prep's pass on the build pool, over `cands`: `each` gives a
     /// candidate's transfer key (`None`: not a plain transfer) and its body
-    /// parts. The keys and the body when every candidate is a transfer,
-    /// `None` otherwise.
+    /// parts (transaction, sender, tip, hash). The keys and the body when
+    /// every candidate is a transfer, `None` otherwise.
     #[allow(clippy::type_complexity)]
     pub fn make_keyed<C: Sync>(
         cands: &[C],
-        each: impl Fn(usize, &C) -> (Option<(Address, Address)>, Tx, Address, u128) + Sync,
+        each: impl Fn(usize, &C) -> (Option<(Address, Address)>, Tx, Address, u128, alloy_primitives::B256) + Sync,
+    ) -> Option<(Vec<(Address, Address)>, Self)> {
+        Self::make_keyed_on(build_pool(), cands, each)
+    }
+
+    /// [`Self::make_keyed`] on `pool` (the plan-ahead body's own pool).
+    #[allow(clippy::type_complexity)]
+    pub fn make_keyed_on<C: Sync>(
+        pool: &rayon::ThreadPool,
+        cands: &[C],
+        each: impl Fn(usize, &C) -> (Option<(Address, Address)>, Tx, Address, u128, alloy_primitives::B256) + Sync,
     ) -> Option<(Vec<(Address, Address)>, Self)> {
         use rayon::prelude::*;
         let at = std::time::Instant::now();
@@ -1210,26 +1586,29 @@ impl<Tx: Send> BodyAhead<Tx> {
         // an `Option` key: the keys collect straight into their vector, with
         // no serial pass over 163,000 options afterwards (step 7a).
         let refused = std::sync::atomic::AtomicBool::new(false);
-        let (keys, (transactions, (senders, tips))): (Vec<(Address, Address)>, (Vec<Tx>, (Vec<Address>, Vec<u128>))) =
-            build_pool().install(|| {
-                cands
-                    .par_iter()
-                    .with_min_len(1024)
-                    .enumerate()
-                    .map(|(i, cand)| {
-                        let (key, tx, sender, tip) = each(i, cand);
-                        let key = key.unwrap_or_else(|| {
-                            refused.store(true, std::sync::atomic::Ordering::Relaxed);
-                            (Address::ZERO, Address::ZERO)
-                        });
-                        (key, (tx, (sender, tip)))
-                    })
-                    .unzip()
-            });
+        #[allow(clippy::type_complexity)]
+        let (keys, (transactions, (senders, (tips, hashes)))): (
+            Vec<(Address, Address)>,
+            (Vec<Tx>, (Vec<Address>, (Vec<u128>, Vec<alloy_primitives::B256>))),
+        ) = pool.install(|| {
+            cands
+                .par_iter()
+                .with_min_len(1024)
+                .enumerate()
+                .map(|(i, cand)| {
+                    let (key, tx, sender, tip, hash) = each(i, cand);
+                    let key = key.unwrap_or_else(|| {
+                        refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                        (Address::ZERO, Address::ZERO)
+                    });
+                    (key, (tx, (sender, (tip, hash))))
+                })
+                .unzip()
+        });
         if refused.into_inner() {
             return None;
         }
-        Some((keys, Self { transactions, senders, tips, took_us: at.elapsed().as_micros() as u64 }))
+        Some((keys, Self { transactions, senders, tips, hashes, took_us: at.elapsed().as_micros() as u64 }))
     }
 }
 
@@ -1270,6 +1649,37 @@ pub struct BuildRun<T> {
     /// `executed` is then empty; [`BuildRun::executed_refs`] reads them in
     /// block order and [`BuildRun::take_executed`] collects them.
     pub slots: Vec<std::sync::OnceLock<BuiltTransfer<T>>>,
+    /// The batches' own counts, summed in batch order: what the seal needs of
+    /// the execution without a pass over the slots (`N42_SEAL_ON_COUNTERS=1`).
+    pub counters: RunCounters,
+}
+
+/// What every batch counts as it executes ([`BuildRun::counters`]): the
+/// transfers it executed, their gas, and -- when the caller handed a
+/// candidate's tip per gas ([`execute_for_build_counted`]) -- their fees,
+/// `tip x gas_used` summed exactly as [`fees_from_tips`] sums it over the
+/// slots. The tip is read on the batch's thread, beside the conversion that
+/// just read the same candidate. The same numbers a pass over the filled slots gives
+/// ([`slot_refs_and_gas`]), read off the batches instead.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RunCounters {
+    /// Transfers executed (filled slots).
+    pub executed: usize,
+    /// Their gas used, summed.
+    pub gas: u64,
+    /// Their fees at the tips handed in; `None` without tips.
+    pub fees: Option<U256>,
+}
+
+impl RunCounters {
+    fn add(&mut self, batch: Self) {
+        self.executed += batch.executed;
+        self.gas += batch.gas;
+        self.fees = match (self.fees, batch.fees) {
+            (Some(a), Some(b)) => Some(a + b),
+            _ => None,
+        };
+    }
 }
 
 impl<T> Default for BuildRun<T> {
@@ -1280,6 +1690,7 @@ impl<T> Default for BuildRun<T> {
             bundles: Vec::new(),
             phases: Phases::default(),
             slots: Vec::new(),
+            counters: RunCounters::default(),
         }
     }
 }
@@ -2984,7 +3395,7 @@ pub fn append_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRe
 }
 
 /// [`append_reverts`] for a set already sorted by address.
-fn append_sorted_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRevert)>) {
+pub(crate) fn append_sorted_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRevert)>) {
     if reverts.is_empty() {
         return;
     }
@@ -3043,6 +3454,8 @@ impl RevertsSort {
         let (to_sort, sorting) = std::sync::mpsc::channel::<Vec<(Address, AccountRevert)>>();
         let (sorted, answer) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new().name("graft-reverts".into()).spawn(move || {
+            // Spawned from a build thread: off the build's cores.
+            n42_core_layout::enter(n42_core_layout::Set::Background);
             if let Ok(mut reverts) = sorting.recv() {
                 let at = std::time::Instant::now();
                 sort_reverts_indexed(&mut reverts);
@@ -3101,7 +3514,7 @@ fn sort_reverts_indexed(reverts: &mut [(Address, AccountRevert)]) {
 }
 
 /// By address, on the worker pool where there are enough of them to pay for it.
-fn sort_reverts(reverts: &mut [(Address, AccountRevert)]) {
+pub(crate) fn sort_reverts(reverts: &mut [(Address, AccountRevert)]) {
     if reverts.len() >= 4096 {
         use rayon::prelude::*;
         reverts.par_sort_unstable_by_key(|(address, _)| *address);
@@ -3223,7 +3636,28 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set)
+    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, Dispatch::from_env(), None, None)
+}
+
+/// [`execute_for_build_in_place`] with the dispatch chosen by the caller
+/// rather than `N42_BUILD_ONE_WAVE`: for tests that compare both in one
+/// process.
+#[doc(hidden)]
+pub fn execute_for_build_dispatch<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    on_bundle: Option<&(dyn Fn(BundleState) + Sync)>,
+    in_place: bool,
+    one_wave: bool,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), None, None)
 }
 
 fn execute_for_build_run<T, G>(
@@ -3240,7 +3674,74 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set())
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), None, None)
+}
+
+/// [`execute_for_build_in_place_after`] (with `before_batches` optional) with
+/// `tip_of(i)`, candidate `i`'s tip per gas at the block's base fee: every
+/// batch then sums its transfers' fees beside their count and gas
+/// ([`RunCounters`]), and the seal reads the block's count, gas and fees off
+/// [`BuildRun::counters`] with no pass over the slots
+/// (`N42_SEAL_ON_COUNTERS=1`).
+#[allow(clippy::too_many_arguments)]
+pub fn execute_for_build_counted<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    on_bundle: Option<&(dyn Fn(BundleState) + Sync)>,
+    in_place: bool,
+    before_batches: Option<&mut dyn FnMut() -> bool>,
+    tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
+    prepared: Option<PreparedExec<T>>,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), tip_of, prepared)
+}
+
+/// [`execute_for_build_counted`] with the dispatch chosen by the caller: for
+/// tests that compare the counters with the slots' pass in one process.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn execute_for_build_counted_dispatch<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    in_place: bool,
+    one_wave: bool,
+    tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
+    prepared: Option<PreparedExec<T>>,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    execute_for_build_opts(evm_env, keys, convert, open, None, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), tip_of, prepared)
+}
+
+/// [`execute_for_build_in_place`] with the [`Dispatch`] chosen by the caller:
+/// for tests that compare the dispatches in one process.
+#[doc(hidden)]
+pub fn execute_for_build_dispatched<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    on_bundle: Option<&(dyn Fn(BundleState) + Sync)>,
+    dispatch: Dispatch,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, true, None, read_set(), dispatch, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3253,6 +3754,9 @@ fn execute_for_build_opts<T, G>(
     in_place: bool,
     before_batches: Option<&mut dyn FnMut() -> bool>,
     with_read_set: bool,
+    dispatch: Dispatch,
+    tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
+    prepared: Option<PreparedExec<T>>,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
@@ -3263,16 +3767,36 @@ where
     let mut phases = Phases::default();
     let at = std::time::Instant::now();
     let call_at = at;
-    let groups = partition_by_sender(keys, beneficiary)?;
+    // `N42_PLAN_AHEAD_BODY=1`: the partition and the slots made with the
+    // plan, each used only when it is this call's size.
+    let (prepared_groups, prepared_slots) = match prepared {
+        Some(PreparedExec { groups, slots }) => (
+            groups.filter(|groups| groups.iter().map(Vec::len).sum::<usize>() == keys.len()),
+            slots.filter(|slots| slots.len() == keys.len()),
+        ),
+        None => (None, None),
+    };
+    phases.prepared_groups = prepared_groups.is_some();
+    phases.prepared_slots = prepared_slots.is_some();
+    let groups = match prepared_groups {
+        Some(groups) => groups,
+        None => partition_by_sender(keys, beneficiary)?,
+    };
     phases.groups = groups.len();
     // Batches of whole groups, about equal in transfers: a couple of
     // thousand transfers each, at most two per worker. Each batch opens its
     // own view of the parent, which is not free.
     let pool = build_pool();
     let workers = pool.current_num_threads().max(1);
-    let batches = batch_groups(&groups, keys.len(), workers);
+    let batches =
+        match dispatch {
+            Dispatch::OneWave => batch_groups_one_wave(&groups, keys.len(), workers),
+            Dispatch::LargestFirst(n) => batch_groups_one_wave(&groups, keys.len(), n.max(1)),
+            Dispatch::Halves => batch_groups(&groups, keys.len(), workers),
+        };
     phases.batches = batches.len();
     phases.partition_ms = at.elapsed().as_millis() as u64;
+    phases.partition_us = at.elapsed().as_micros() as u64;
     if let Some(hook) = before_batches
         && !hook()
     {
@@ -3297,108 +3821,163 @@ where
     // Made on the pool: a full block's slots are ~75 MB of fresh pages, and
     // one thread faulting them in was ~4 ms of the bench's 5.5 between the
     // call and the batches (step 7a, `batches_start_us`).
-    let slots: Vec<std::sync::OnceLock<BuiltTransfer<T>>> = pool.install(|| {
-        use rayon::prelude::*;
-        (0..keys.len()).into_par_iter().with_min_len(4096).map(|_| std::sync::OnceLock::new()).collect()
-    });
+    let slots_at = std::time::Instant::now();
+    let slots: Vec<std::sync::OnceLock<BuiltTransfer<T>>> = match prepared_slots {
+        Some(slots) => slots,
+        None => empty_slots(pool, keys.len()),
+    };
+    phases.slots_us = slots_at.elapsed().as_micros() as u64;
     let slots_ref = &slots;
-    type BatchResult = (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, BatchSpan, LoopTimers);
+    type BatchResult =
+        (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, BatchSpan, LoopTimers, RunCounters);
     // Each batch's span on the pool, against this instant (`BatchSpans`).
     let batches_at = std::time::Instant::now();
     phases.batches_start_us = batches_at.duration_since(call_at).as_micros() as u64;
-    let results: Vec<Result<BatchResult, NotParallel>> = pool.install(|| {
-        use rayon::prelude::*;
-        batches
-            .par_iter()
-            .map(|members| {
-                let start_us = batches_at.elapsed().as_micros() as u64;
-                let cpu_start = thread_cpu_ns();
-                let txs = members.iter().map(|group| group.len()).sum::<usize>();
-                let mut sampler = LoopSampler::new();
-                let setup_at = sampler.on.then(std::time::Instant::now);
-                let db = ReadSetDb::new(read_set_ref, open().ok_or(NotParallel::NoState)?);
-                // A sender, a recipient a transfer and the beneficiary, sized
-                // once: growing from empty rehashed the map a dozen times a
-                // batch.
-                let mut state = crate::batch_state::BatchState::with_capacity(db, txs + txs / 4 + 1);
-                let mut skipped = Vec::new();
-                let mut setup_ns = 0;
-                let close_at;
-                {
-                    let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
-                    if let Some(at) = setup_at {
-                        setup_ns = at.elapsed().as_nanos() as u64;
-                    }
-                    for group in members {
-                        let mut rest = group.iter();
-                        for &i in rest.by_ref() {
-                            // `N42_PHASE_TIMERS=1`: one transaction in
-                            // `LOOP_SAMPLE_STRIDE` timed by section.
-                            let timed = sampler.begin();
-                            let mark = || timed.then(std::time::Instant::now);
-                            let t0 = mark();
-                            // Converted here, on the batch's thread: the
-                            // conversion of a full block was 55-100 ms of
-                            // the builder's own thread otherwise.
-                            let (tx, env) = convert(i);
-                            let t1 = mark();
-                            match evm.transfer_plain(&env) {
-                                Ok(Some((plain, result))) => {
-                                    let t2 = mark();
-                                    let gas_used = result.gas_used();
-                                    let t3 = mark();
-                                    // Straight into the batch's state, no
-                                    // `EvmState` built (`BatchState`).
-                                    evm.db_mut().commit_transfer(plain).map_err(|err| NotParallel::Failed(i, err.to_string()))?;
-                                    let t4 = mark();
-                                    if slots_ref[i].set(BuiltTransfer { index: i, tx, result, gas_used }).is_err() {
-                                        return Err(NotParallel::Failed(i, "executed twice".to_string()));
-                                    }
-                                    if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4)) = (t0, t1, t2, t3, t4) {
-                                        sampler.record(&[t0, t1, t1, t2, t2, t3, t4, std::time::Instant::now()]);
-                                    }
-                                }
-                                Ok(None) => {
-                                    // The sender's later transfers would only
-                                    // fail their nonce check: skipped unrun.
-                                    skipped.push(i);
-                                    break;
-                                }
-                                Err(err) => return Err(NotParallel::Failed(i, err.to_string())),
+    let run_batch = |members: &Vec<&Vec<usize>>| -> Result<BatchResult, NotParallel> {
+        let start_us = batches_at.elapsed().as_micros() as u64;
+        let cpu_start = ThreadMark::now();
+        let txs = members.iter().map(|group| group.len()).sum::<usize>();
+        let mut sampler = LoopSampler::new();
+        let setup_at = sampler.on.then(std::time::Instant::now);
+        // The open of the parent's view, timed on every batch: one of the
+        // places a batch can wait (the opener's waits for an ancestor).
+        let open_at = std::time::Instant::now();
+        let opened = open().ok_or(NotParallel::NoState)?;
+        let open_us = open_at.elapsed().as_micros() as u64;
+        let db = ReadSetDb::new(read_set_ref, opened);
+        // A sender, a recipient a transfer and the beneficiary, sized
+        // once: growing from empty rehashed the map a dozen times a
+        // batch.
+        let mut state = crate::batch_state::BatchState::with_capacity(db, txs + txs / 4 + 1);
+        let mut skipped = Vec::new();
+        // The batch's count, gas and fees, kept as it executes.
+        let mut counted = RunCounters { fees: tip_of.map(|_| U256::ZERO), ..Default::default() };
+        let mut setup_ns = 0;
+        let close_at;
+        {
+            let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
+            if let Some(at) = setup_at {
+                setup_ns = at.elapsed().as_nanos() as u64;
+            }
+            for group in members {
+                let mut rest = group.iter();
+                for &i in rest.by_ref() {
+                    // `N42_PHASE_TIMERS=1`: one transaction in
+                    // `LOOP_SAMPLE_STRIDE` timed by section.
+                    let timed = sampler.begin();
+                    let mark = || timed.then(std::time::Instant::now);
+                    let t0 = mark();
+                    // Converted here, on the batch's thread: the
+                    // conversion of a full block was 55-100 ms of
+                    // the builder's own thread otherwise.
+                    let (tx, env) = convert(i);
+                    let t1 = mark();
+                    match evm.transfer_plain(&env) {
+                        Ok(Some((plain, result))) => {
+                            let t2 = mark();
+                            let gas_used = result.gas_used();
+                            let t3 = mark();
+                            // Straight into the batch's state, no
+                            // `EvmState` built (`BatchState`).
+                            evm.db_mut().commit_transfer(plain).map_err(|err| NotParallel::Failed(i, err.to_string()))?;
+                            let t4 = mark();
+                            if slots_ref[i].set(BuiltTransfer { index: i, tx, result, gas_used }).is_err() {
+                                return Err(NotParallel::Failed(i, "executed twice".to_string()));
+                            }
+                            counted.executed += 1;
+                            counted.gas += gas_used;
+                            if let (Some(fees), Some(tip_of)) = (counted.fees.as_mut(), tip_of) {
+                                *fees += U256::from(tip_of(i)) * U256::from(gas_used);
+                            }
+                            if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4)) = (t0, t1, t2, t3, t4) {
+                                sampler.record(&[t0, t1, t1, t2, t2, t3, t4, std::time::Instant::now()]);
                             }
                         }
-                        skipped.extend(rest.copied());
-                    }
-                    close_at = sampler.on.then(std::time::Instant::now);
-                }
-                let bundle = state.take_bundle();
-                // Drained here, on the batch's own thread, right after its
-                // transfers are done: `N42_PHASE_TIMERS=1` only (see
-                // `fast_transfer::drain_timers`; zero and free otherwise). An
-                // error path above returns before this and leaves whatever it
-                // accumulated for a later call on this thread to drain --
-                // rare (`NotParallel`, which sends the whole block to the
-                // serial executor) and diagnostic-only.
-                let timers = crate::fast_transfer::drain_timers();
-                match on_bundle {
-                    // Folded into the staged graft here, on this batch's
-                    // thread: the work is off the builder's chain, and the
-                    // sink's lock only ever holds one batch at a time.
-                    Some(sink) => {
-                        sink(bundle);
-                        let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
-                        let span = BatchSpan::close(start_us, cpu_start, txs, batches_at);
-                        Ok((skipped, None, timers, span, sampler.finish(setup_ns, close_ns)))
-                    }
-                    None => {
-                        let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
-                        let span = BatchSpan::close(start_us, cpu_start, txs, batches_at);
-                        Ok((skipped, Some(bundle), timers, span, sampler.finish(setup_ns, close_ns)))
+                        Ok(None) => {
+                            // The sender's later transfers would only
+                            // fail their nonce check: skipped unrun.
+                            skipped.push(i);
+                            break;
+                        }
+                        Err(err) => return Err(NotParallel::Failed(i, err.to_string())),
                     }
                 }
-            })
+                skipped.extend(rest.copied());
+            }
+            close_at = sampler.on.then(std::time::Instant::now);
+        }
+        let bundle = state.take_bundle();
+        // Drained here, on the batch's own thread, right after its
+        // transfers are done: `N42_PHASE_TIMERS=1` only (see
+        // `fast_transfer::drain_timers`; zero and free otherwise). An
+        // error path above returns before this and leaves whatever it
+        // accumulated for a later call on this thread to drain --
+        // rare (`NotParallel`, which sends the whole block to the
+        // serial executor) and diagnostic-only.
+        let timers = crate::fast_transfer::drain_timers();
+        match on_bundle {
+            // Folded into the staged graft here, on this batch's
+            // thread: the work is off the builder's chain, and the
+            // sink's lock only ever holds one batch at a time.
+            Some(sink) => {
+                sink(bundle);
+                let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
+                let span = BatchSpan::close(start_us, cpu_start, txs, batches_at).with_open_us(open_us);
+                Ok((skipped, None, timers, span, sampler.finish(setup_ns, close_ns), counted))
+            }
+            None => {
+                let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
+                let span = BatchSpan::close(start_us, cpu_start, txs, batches_at).with_open_us(open_us);
+                Ok((skipped, Some(bundle), timers, span, sampler.finish(setup_ns, close_ns), counted))
+            }
+        }
+    };
+    let results: Vec<Result<BatchResult, NotParallel>> = if let Dispatch::LargestFirst(_) = dispatch {
+        // Spawned FIFO in the largest-first order: the workers take the
+        // longest batches first and the short ones fill the tail. Results
+        // are read back in batch order, as in the other dispatches.
+        let sizes: Vec<usize> = batches.iter().map(|members| members.iter().map(|group| group.len()).sum()).collect();
+        let order = largest_first(&sizes);
+        let mut slots: Vec<Option<Result<BatchResult, NotParallel>>> = (0..batches.len()).map(|_| None).collect();
+        {
+            let mut by_index: Vec<Option<&mut Option<Result<BatchResult, NotParallel>>>> = slots.iter_mut().map(Some).collect();
+            let run_batch = &run_batch;
+            pool.scope_fifo(|scope| {
+                for &i in &order {
+                    if let (Some(slot), Some(members)) = (by_index.get_mut(i).and_then(Option::take), batches.get(i)) {
+                        scope.spawn_fifo(move |_| *slot = Some(run_batch(members)));
+                    }
+                }
+            });
+        }
+        slots
+            .into_iter()
+            .enumerate()
+            .map(|(i, slot)| slot.unwrap_or_else(|| Err(NotParallel::Failed(i, "a batch did not run".to_string()))))
             .collect()
-    });
+    } else if dispatch == Dispatch::OneWave {
+        // Every batch spawned at once onto the pool (one job each, taken by
+        // whichever thread is free), not split in halves from one thread:
+        // the batches start as fast as the threads pick them up, and the
+        // results are read back in batch order as before.
+        let mut slots: Vec<Option<Result<BatchResult, NotParallel>>> = (0..batches.len()).map(|_| None).collect();
+        let run_batch = &run_batch;
+        pool.scope(|scope| {
+            for (slot, members) in slots.iter_mut().zip(batches.iter()) {
+                scope.spawn(move |_| *slot = Some(run_batch(members)));
+            }
+        });
+        slots
+            .into_iter()
+            .enumerate()
+            .map(|(i, slot)| slot.unwrap_or_else(|| Err(NotParallel::Failed(i, "a batch did not run".to_string()))))
+            .collect()
+    } else {
+        pool.install(|| {
+            use rayon::prelude::*;
+            batches.par_iter().map(run_batch).collect()
+        })
+    };
     let batches_us = batches_at.elapsed().as_micros() as u64;
     phases.batches_end_us = call_at.elapsed().as_micros() as u64;
     phases.groups_ms = at.elapsed().as_millis() as u64;
@@ -3410,9 +3989,11 @@ where
 
     let at = std::time::Instant::now();
     let mut run = BuildRun { phases, ..Default::default() };
+    run.counters.fees = tip_of.map(|_| U256::ZERO);
     let mut spans: Vec<BatchSpan> = Vec::with_capacity(results.len());
     for r in results {
-        let (skipped, bundle, timers, span, loop_timers) = r?;
+        let (skipped, bundle, timers, span, loop_timers, counted) = r?;
+        run.counters.add(counted);
         spans.push(span);
         run.phases.loop_timers.add(loop_timers);
         run.skipped.extend(skipped);
@@ -3847,7 +4428,7 @@ where
             .par_iter()
             .map(|members| {
                 let start_us = batches_at.elapsed().as_micros() as u64;
-                let cpu_start = thread_cpu_ns();
+                let cpu_start = ThreadMark::now();
                 let batch_txs = members.iter().map(|group| group.len()).sum::<usize>();
                 let db = open().ok_or(NotParallel::NoState)?;
                 let (bundle, gas) = if follower_batch_state() {
@@ -5486,6 +6067,262 @@ mod tests {
         assert_eq!(phases.read_set_misses, 0, "every account a transfer reads is in the set");
     }
 
+    /// `N42_BUILD_ONE_WAVE=1`: one batch a thread at most, spawned at once,
+    /// runs the block the default dispatch does -- the same transfers, gas,
+    /// skips, grafted state and reverts, and through the output shards the
+    /// same merged bundle -- on blocks of sender runs (the bench's shape), of
+    /// interleaved senders, and of recipients many senders share.
+    #[test]
+    fn the_one_wave_dispatch_equals_the_default_one() {
+        let threads = build_pool().current_num_threads();
+        // Sender runs of 50 (frames), runs of 1, and a shared recipient
+        // space of 2,000 addresses.
+        for (senders, per, space, run) in [(400u64, 50u64, 0u64, 50usize), (300, 30, 0, 1), (200, 40, 2_000, 7)] {
+            let (block, db) = random_fixture(senders, per, space, run, 5);
+            let evm_config =
+                crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+            let evm_env = evm_config.evm_env(block.header()).expect("env");
+            let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
+            let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
+            let beneficiary = evm_env.block_env.beneficiary;
+            let convert = |i: usize| ((), envs[i].clone());
+            let accounts_of = |bundle: &BundleState| -> std::collections::BTreeMap<Address, _> {
+                bundle.state.iter().map(|(a, acc)| (*a, (acc.info.clone(), acc.original_info.clone(), acc.status))).collect()
+            };
+            let reverts_of = |bundle: &BundleState| -> std::collections::BTreeMap<Address, _> {
+                bundle.reverts.iter().flatten().cloned().collect()
+            };
+            // What the header commits to: the QMDB operations the state root
+            // is computed from, and the gov5 receipts root and bloom over the
+            // receipts in block order.
+            let state_ops_of = |bundle: &BundleState| n42_qmdb_reth::sorted_operations_from_execution(bundle, true).to_operations();
+            let receipts_root_of = |executed: &[(usize, u64, bool)]| {
+                let mut cumulative = 0u64;
+                let receipts: Vec<Receipt> = executed
+                    .iter()
+                    .map(|(_, gas, success)| {
+                        cumulative += gas;
+                        Receipt {
+                            tx_type: n42_tx_types::N42TxType::Eth(alloy_consensus::TxType::Eip1559),
+                            success: *success,
+                            cumulative_gas_used: cumulative,
+                            logs: Vec::new(),
+                        }
+                    })
+                    .collect();
+                (crate::hotstuff_consensus::gov5_receipt_root_bloom(&receipts), cumulative)
+            };
+            // The grafted path: bundles back, slots in place.
+            let grafted = |one_wave: bool| {
+                let run = execute_for_build_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), None, true, one_wave)
+                    .expect("a block of transfers");
+                let executed: Vec<(usize, u64, bool)> = run
+                    .slots
+                    .iter()
+                    .filter_map(std::sync::OnceLock::get)
+                    .map(|b| (b.index, b.gas_used, b.result.is_success()))
+                    .collect();
+                let spans = run.phases.batch_spans;
+                let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();
+                let graft = graft_bundles(&mut state, run.bundles, beneficiary).unwrap();
+                state.merge_transitions(BundleRetention::Reverts);
+                let mut bundle = state.take_bundle();
+                append_reverts(&mut bundle, graft.reverts);
+                let roots = (state_ops_of(&bundle), receipts_root_of(&executed));
+                (executed, run.skipped, graft.beneficiary_delta, accounts_of(&bundle), reverts_of(&bundle), spans, roots)
+            };
+            let two = grafted(false);
+            let one = grafted(true);
+            assert_eq!(two.0.len(), keys.len(), "every transfer ran");
+            assert_eq!(two.0, one.0, "executed transfers, in block order, with their gas");
+            assert_eq!(two.1, one.1, "skipped");
+            assert_eq!(two.2, one.2, "beneficiary delta");
+            assert_eq!(two.3, one.3, "grafted accounts");
+            assert_eq!(two.4, one.4, "reverts");
+            assert!(!two.6.0.is_empty());
+            assert_eq!(two.6.0, one.6.0, "the state root's operations");
+            assert_eq!(two.6.1, one.6.1, "the receipts root, bloom and gas");
+            assert!(one.5.batches <= threads, "one batch a thread at most: {} on {threads}", one.5.batches);
+            assert!(one.5.threads >= 1 && one.5.threads <= one.5.batches);
+            assert!(one.5.dispatch_us <= one.5.last_start_us && one.5.first_start_us <= one.5.dispatch_us);
+            assert!(one.5.last_end_us >= one.5.last_start_us);
+
+            // The output shards' path (the leader's on the bench), merged.
+            let sharded = |one_wave: bool| {
+                let shards = crate::output_shards::OutputShards::with_index_live(beneficiary, keys.len(), 16, true, true);
+                let sink = |bundle: BundleState| shards.add(bundle);
+                let run = execute_for_build_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), Some(&sink), true, one_wave)
+                    .expect("a block of transfers");
+                let executed: Vec<(usize, u64, bool)> = run
+                    .slots
+                    .iter()
+                    .filter_map(std::sync::OnceLock::get)
+                    .map(|b| (b.index, b.gas_used, b.result.is_success()))
+                    .collect();
+                let frozen = shards.freeze();
+                let merged = frozen.merged(&BundleState::default());
+                let receipts = receipts_root_of(&executed);
+                (receipts, run.skipped, frozen.beneficiary_delta(), accounts_of(&merged), reverts_of(&merged), state_ops_of(&merged))
+            };
+            let two = sharded(false);
+            let one = sharded(true);
+            assert!(two.0.1 > 0);
+            assert_eq!(two, one, "the shards merge to the same bundle, state operations and receipts either way");
+
+            // `N42_BUILD_BATCHES`: 96 and 128 batches, largest first, through
+            // the shards, equal the default dispatch.
+            for n in [96usize, 128] {
+                let shards = crate::output_shards::OutputShards::with_index_live(beneficiary, keys.len(), 16, true, true);
+                let sink = |bundle: BundleState| shards.add(bundle);
+                let run = execute_for_build_dispatched(&evm_env, &keys, &convert, &|| Some(db.clone()), Some(&sink), Dispatch::LargestFirst(n))
+                    .expect("a block of transfers");
+                assert!(run.phases.batches <= n && run.phases.batches > 0);
+                let executed: Vec<(usize, u64, bool)> = run
+                    .slots
+                    .iter()
+                    .filter_map(std::sync::OnceLock::get)
+                    .map(|b| (b.index, b.gas_used, b.result.is_success()))
+                    .collect();
+                let frozen = shards.freeze();
+                let merged = frozen.merged(&BundleState::default());
+                let largest = (receipts_root_of(&executed), run.skipped, frozen.beneficiary_delta(), accounts_of(&merged), reverts_of(&merged), state_ops_of(&merged));
+                assert_eq!(two, largest, "{n} batches largest first equal the default dispatch");
+            }
+        }
+    }
+
+    /// `N42_BUILD_BATCHES=<n>`: the packing puts every sender group in exactly
+    /// one batch, in candidate order (so every sender's transfers stay in one
+    /// batch, in nonce order), at most `n` batches; and the largest-first
+    /// order is a permutation of the batches by size, largest first.
+    #[test]
+    fn the_largest_first_packing_keeps_every_sender_run_whole_and_in_order() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for (count, n) in [(400usize, 96usize), (400, 128), (160_000, 128), (37, 96), (1, 128), (2_000, 64)] {
+            let mut all: Vec<Vec<usize>> = Vec::with_capacity(count);
+            let mut next = 0usize;
+            for _ in 0..count {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let len = 1 + (seed % 700) as usize;
+                all.push((next..next + len).collect());
+                next += len;
+            }
+            let batches = batch_groups_one_wave(&all, next, n);
+            assert!(!batches.is_empty() && batches.len() <= n, "{count} groups, {n}: {} batches", batches.len());
+            let flat: Vec<&Vec<usize>> = batches.iter().flatten().copied().collect();
+            assert_eq!(flat.len(), all.len(), "every group once");
+            assert!(flat.iter().zip(&all).all(|(a, b)| std::ptr::eq(*a, b)), "groups in candidate order");
+            let sizes: Vec<usize> = batches.iter().map(|b| b.iter().map(|g| g.len()).sum()).collect();
+            assert_eq!(sizes.iter().sum::<usize>(), next);
+            let order = largest_first(&sizes);
+            let mut seen = order.clone();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..sizes.len()).collect::<Vec<_>>(), "a permutation");
+            assert!(order.windows(2).all(|w| sizes[w[0]] >= sizes[w[1]]), "largest first");
+        }
+    }
+
+    /// `N42_SEAL_ON_COUNTERS=1`: the batches' counters are the slots' pass.
+    /// On blocks of sender runs, interleaved senders and shared recipients,
+    /// whole and with senders that fail part-way (a nonce ahead, a balance
+    /// that runs out), in both dispatches: the count, the gas and the fees the
+    /// batches sum equal `slot_refs_and_gas` and the fees over the slots
+    /// (`fees_from_tips` when nothing was skipped); and on a whole block the
+    /// body made in the prep (`BodyAhead`) equals the body made from the slots
+    /// (`body_and_fees`), so the seal's transactions, senders, count, gas and
+    /// fees are the same either way. The receipts (root and bloom) are made
+    /// from the slots behind the seal on both paths.
+    #[test]
+    fn seal_on_counters_equals_the_refs_pass() {
+        for (senders, per, space, run, broken) in
+            [(400u64, 20u64, 0u64, 20usize, false), (300, 10, 0, 1, false), (200, 15, 2_000, 7, false), (200, 15, 0, 5, true), (150, 12, 1_500, 3, true)]
+        {
+            let (block, mut db) = random_fixture(senders, per, space, run, 5);
+            if broken {
+                // Every seventh sender is a nonce ahead (its run skipped from
+                // the first transfer), every eleventh can pay for two transfers.
+                for s in (0..senders).step_by(7) {
+                    db.insert_account_info(addr(100 + s), AccountInfo { balance: U256::from(10u128.pow(21)), nonce: 3, ..Default::default() });
+                }
+                for s in (3..senders).step_by(11) {
+                    db.insert_account_info(addr(100 + s), AccountInfo { balance: U256::from(2 * 21_000u64 * 10_000_000_000u64 + 2_500), nonce: 0, ..Default::default() });
+                }
+            }
+            let evm_config =
+                crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+            let evm_env = evm_config.evm_env(block.header()).expect("env");
+            let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
+            let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
+            let hashes: Vec<B256> = block.body().transactions.iter().map(|tx| *alloy_consensus::transaction::TxHashRef::tx_hash(tx)).collect();
+            let convert = |i: usize| ((), envs[i].clone());
+            let mut seed = 0x2545f4914f6cdd1du64;
+            let tips: Vec<u128> = (0..keys.len())
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    u128::from(seed % 3_000_000_000)
+                })
+                .collect();
+            for one_wave in [false, true] {
+                let tip_of = |i: usize| tips[i];
+                let run = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, one_wave, Some(&tip_of), None)
+                    .expect("a block of transfers");
+                assert_eq!(broken, !run.skipped.is_empty(), "skips only on the broken blocks");
+                let (refs, gas) = slot_refs_and_gas(&run.slots);
+                assert!(!refs.is_empty());
+                assert_eq!(run.counters.executed, refs.len(), "count");
+                assert_eq!(run.counters.gas, gas, "gas");
+                let slot_fees =
+                    refs.iter().fold(U256::ZERO, |sum, built| sum + U256::from(tips[built.index]) * U256::from(built.gas_used));
+                assert_eq!(run.counters.fees, Some(slot_fees), "fees");
+                if broken {
+                    assert_eq!(fees_from_tips(&refs, &tips), None, "a block with skips is not the prep's body");
+                    continue;
+                }
+                assert_eq!(run.counters.fees, fees_from_tips(&refs, &tips), "fees as the commit reads them");
+                // The body: made in the prep against made from the slots.
+                let (_, made) = BodyAhead::make_keyed(&hashes, |i, hash| (Some(keys[i]), *hash, keys[i].0, tips[i], *hash)).expect("every candidate a transfer");
+                let (transactions, senders_of, fees) = body_and_fees(&refs, |built| (hashes[built.index], keys[built.index].0, tips[built.index]));
+                assert_eq!(made.transactions, transactions, "the body's transactions");
+                assert_eq!(made.senders, senders_of, "the body's senders");
+                assert_eq!(made.hashes, hashes, "the body's hashes, as the seal collects them");
+                assert_eq!(run.counters.fees, Some(fees), "the body's fees");
+                // Without tips the counters still count, and say no fees.
+                let plain = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, one_wave, None, None)
+                    .expect("a block of transfers");
+                assert_eq!((plain.counters.executed, plain.counters.gas, plain.counters.fees), (refs.len(), gas, None));
+            }
+        }
+    }
+
+    /// The one-wave packing: whole groups in order, at most `workers`
+    /// batches, each within one group of an even share.
+    #[test]
+    fn the_one_wave_packing_is_even_and_in_order() {
+        for (groups, size, workers) in [(400usize, 500usize, 32usize), (400, 500, 16), (7, 3, 32), (1, 10, 8), (33, 1, 32), (1000, 1, 3)] {
+            let all: Vec<Vec<usize>> = (0..groups).map(|g| (g * size..(g + 1) * size).collect()).collect();
+            let total = groups * size;
+            let batches = batch_groups_one_wave(&all, total, workers);
+            assert!(batches.len() <= workers.min(groups), "{groups} groups on {workers}: {} batches", batches.len());
+            assert!(batches.iter().all(|b| !b.is_empty()));
+            let flat: Vec<usize> = batches.iter().flatten().flat_map(|g| g.iter().copied()).collect();
+            assert_eq!(flat, (0..total).collect::<Vec<_>>(), "every group once, in order");
+            let share = total.div_ceil(batches.len().max(1));
+            let largest = batches.iter().map(|b| b.iter().map(|g| g.len()).sum::<usize>()).max().unwrap_or(0);
+            assert!(largest <= total.div_ceil(workers.min(groups)) + size, "largest {largest}, share {share}");
+        }
+        // The bench's block: 400 runs of 500 on 32 threads, 32 batches of
+        // 6,000-6,500 where the default packs 58 of 3,500 and 500.
+        let all: Vec<Vec<usize>> = (0..400).map(|g| (g * 500..(g + 1) * 500).collect()).collect();
+        let one = batch_groups_one_wave(&all, 200_000, 32);
+        assert_eq!(one.len(), 32);
+        assert!(one.iter().all(|b| (6_000..=6_500).contains(&b.iter().map(|g| g.len()).sum::<usize>())));
+        assert_eq!(batch_groups(&all, 200_000, 32).len(), 58);
+    }
+
     /// A read set answers exactly its members, absent accounts as absent,
     /// and nothing for an address outside it -- including addresses that
     /// share a member's directory bucket.
@@ -6157,7 +6994,7 @@ mod tests {
                 });
                 let par = at.elapsed();
                 let prefault_us = target.as_ref().map_or(0, |t| t.prefault_us);
-                let BuildRun { executed, bundles, skipped, phases, slots } = run;
+                let BuildRun { executed, bundles, skipped, phases, slots, counters: _ } = run;
                 // The receipts and the body, as the builder builds them for a
                 // block that seals early (`par_commit_ms`): out of the
                 // collected vector, or out of the slots by reference
@@ -7008,7 +7845,7 @@ mod tests {
                 let flat_us = at.elapsed().as_micros();
                 assert!(!refused.into_inner() && keys_only.as_ref() == Some(&flat), "the flat keys");
                 println!("prep keys: into Option<Vec> {keys_us} us, flat {flat_us} us");
-                let made = BodyAhead::make_keyed(&cands, |i, c| (key_of(c), body_tx(i), c.sender(), tip(i)));
+                let made = BodyAhead::make_keyed(&cands, |i, c| (key_of(c), body_tx(i), c.sender(), tip(i), *c.hash()));
                 (keys_only.map(|k| k.len()), keys_us, made)
             });
             let run = std::thread::scope(|scope| {

@@ -41,9 +41,12 @@ impl ConsensusEngine {
         let Ok(pk) = view_set.get_public_key(vote.voter) else { return };
         let late = self.signing_profile.vote_message(vote.view, vote.block_hash);
         let progress = self.signing_profile.progress_vote_message(vote.view, vote.block_hash);
-        if self.signing_profile.verify_single(pk, &progress, &vote.signature)
-            || self.signing_profile.verify_single(pk, &late, &vote.signature)
-        {
+        let started = std::time::Instant::now();
+        let progress_ok = self.signing_profile.verify_single(pk, &progress, &vote.signature);
+        let ok = progress_ok || self.signing_profile.verify_single(pk, &late, &vote.signature);
+        self.view_timing
+            .note_verify(started, if progress_ok { 1 } else { 2 }, false, false);
+        if ok {
             self.note_voter(vote.view, vote.voter);
         }
     }
@@ -83,10 +86,12 @@ impl ConsensusEngine {
             let view_set = self.validator_set_for_view(view);
             let pk = view_set.get_public_key(vote.voter)?;
             let msg = self.signing_profile.vote_message(view, vote.block_hash);
-            if !self
+            let started = std::time::Instant::now();
+            let ok = self
                 .signing_profile
-                .verify_single(pk, &msg, &vote.signature)
-            {
+                .verify_single(pk, &msg, &vote.signature);
+            self.view_timing.note_verify(started, 1, false, false);
+            if !ok {
                 return Err(ConsensusError::InvalidSignature {
                     view,
                     validator_index: vote.voter,
@@ -266,7 +271,10 @@ impl ConsensusEngine {
             let msg = self
                 .signing_profile
                 .commit_message(view, cv.block_hash, changes_hash);
-            if !self.signing_profile.verify_single(pk, &msg, &cv.signature) {
+            let started = std::time::Instant::now();
+            let ok = self.signing_profile.verify_single(pk, &msg, &cv.signature);
+            self.view_timing.note_verify(started, 1, false, false);
+            if !ok {
                 return Err(ConsensusError::InvalidSignature {
                     view,
                     validator_index: cv.voter,

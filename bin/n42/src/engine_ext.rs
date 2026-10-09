@@ -56,7 +56,28 @@ pub trait N42EngineApi {
     /// when this node runs one; `null` otherwise.
     #[method(name = "payloadEndpoint")]
     async fn payload_endpoint(&self) -> RpcResult<Option<String>>;
+
+    /// How many canonical blocks this node holds in memory and has not yet
+    /// persisted (the canonical head minus the last persisted block); `null`
+    /// when the node does not say. Read by the validator's build throttle
+    /// (`n42_h2_node::build_throttle`), polled beside its loop.
+    #[method(name = "inMemoryBlocks")]
+    async fn in_memory_blocks(&self) -> RpcResult<Option<u64>>;
+
+    /// The number of this node's last persisted canonical block (the DB tip
+    /// before the first persistence of this run); `null` when the node does
+    /// not say. Read by the validator's driver, which caps the forkchoice's
+    /// finalized hash at it (`N42_SETTLEMENT_TAGS=split`,
+    /// `n42_h2_execution::settlement`), polled with `inMemoryBlocks`.
+    #[method(name = "persistedBlock")]
+    async fn persisted_block(&self) -> RpcResult<Option<u64>>;
 }
+
+/// Reads the unpersisted-block count; see [`N42EngineApi::in_memory_blocks`].
+pub type InMemoryBlocks = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// Reads the last persisted block number; see [`N42EngineApi::persisted_block`].
+pub type PersistedBlock = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// Serves [`N42EngineApi`] from the node's payload service.
 pub struct N42EngineExt<T: PayloadTypes> {
@@ -64,6 +85,10 @@ pub struct N42EngineExt<T: PayloadTypes> {
     pub payloads: PayloadBuilderHandle<T>,
     /// Where `payload_serve` listens, if it does.
     pub raw_endpoint: Option<std::net::SocketAddr>,
+    /// The unpersisted-block count, when the node can read it.
+    pub in_memory_blocks: Option<InMemoryBlocks>,
+    /// The last persisted block number, when the node can read it.
+    pub persisted_block: Option<PersistedBlock>,
 }
 
 #[jsonrpsee::core::async_trait]
@@ -89,6 +114,14 @@ where
 
     async fn payload_endpoint(&self) -> RpcResult<Option<String>> {
         Ok(self.raw_endpoint.map(|addr| addr.to_string()))
+    }
+
+    async fn in_memory_blocks(&self) -> RpcResult<Option<u64>> {
+        Ok(self.in_memory_blocks.as_ref().map(|count| count()))
+    }
+
+    async fn persisted_block(&self) -> RpcResult<Option<u64>> {
+        Ok(self.persisted_block.as_ref().map(|number| number()))
     }
 }
 

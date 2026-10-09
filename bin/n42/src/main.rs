@@ -35,11 +35,18 @@ fn main() {
         eprintln!("error: {err}");
         std::process::exit(2);
     }
+    // `N42_CORE_LAYOUT=isolate`: split the node's affinity mask into the
+    // build, critical and background sets before any thread is spawned, and
+    // move this thread (and any the allocator already has) to the background
+    // set, so tokio, reth's rayon pools, persistence and the engine inherit
+    // it. The critical pools pin their own threads. Logged once tracing is up.
+    let _ = n42_core_layout::init();
     // `N42_THP_DISABLE=1`: no transparent huge pages for this process. With
     // the box's THP at `always`, a fleet allocating ~45 GB of anonymous
     // memory drove 5.8M direct-compaction stalls that tore the page cache
     // out from under the importers' reads (round 39: the "first leg"
     // collapses, 0.7-0.8 s cycles, millions of major faults at 70 GB free).
+    #[cfg(target_os = "linux")]
     if std::env::var("N42_THP_DISABLE").is_ok_and(|v| v == "1") {
         // SAFETY: prctl with PR_SET_THP_DISABLE takes no pointers.
         let rc = unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
@@ -81,6 +88,19 @@ fn main() {
     if let Err(err) =
         Cli::<N42ChainSpecParser>::parse().run(async move |builder, _extra_args| {
             info!(target: "reth::cli", "Launching node");
+
+            // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md): a
+            // malformed value or a depth this node does not run is refused here,
+            // never read as depth 1 -- a depth-1 member of a depth-2 fleet
+            // refuses every header.
+            {
+                let genesis = builder.config().chain.genesis();
+                let depth = reth_chainspec::qmdb::check_deferred_execution_depth(genesis)
+                    .map_err(|err| eyre::eyre!("genesis: {err}"))?;
+                if let Some(at) = reth_chainspec::qmdb::deferred_execution_time(genesis) {
+                    info!(target: "reth::cli", deferred_from = at, depth, "deferred execution: a header carries the result of its ancestor {depth} blocks back");
+                }
+            }
 
             // Start the pubsub router loop (must be inside async context)
             tokio::spawn(async move {
@@ -157,9 +177,34 @@ fn main() {
                     let raw_endpoint = std::env::var("N42_PAYLOAD_SERVE")
                         .ok()
                         .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok());
+                    // The canonical head minus the last persisted block:
+                    // two reads of the in-memory state's trackers, no lock
+                    // held across anything. Before the first persistence
+                    // the in-memory chain itself is counted.
+                    let in_memory = ctx.provider().canonical_in_memory_state();
+                    let persisted_state = in_memory.clone();
+                    let in_memory_blocks: n42::engine_ext::InMemoryBlocks = std::sync::Arc::new(move || {
+                        match in_memory.get_persisted_num_hash() {
+                            Some(persisted) => in_memory.get_canonical_block_number().saturating_sub(persisted.number),
+                            None => in_memory.canonical_chain().count() as u64,
+                        }
+                    });
+                    // The last persisted block: the tracker's, or before the
+                    // first persistence of this run the database tip (the
+                    // head less the blocks held in memory).
+                    let persisted_block: n42::engine_ext::PersistedBlock = std::sync::Arc::new(move || {
+                        match persisted_state.get_persisted_num_hash() {
+                            Some(persisted) => persisted.number,
+                            None => persisted_state
+                                .get_canonical_block_number()
+                                .saturating_sub(persisted_state.canonical_chain().count() as u64),
+                        }
+                    });
                     let engine_ext = N42EngineExt {
                         payloads: ctx.node().payload_builder_handle().clone(),
                         raw_endpoint,
+                        in_memory_blocks: Some(in_memory_blocks),
+                        persisted_block: Some(persisted_block),
                     };
 
                     // now we merge our extension namespace into all configured transports
@@ -173,6 +218,15 @@ fn main() {
                 })
                 .launch_with_debug_capabilities()
                 .await?;
+
+            // The layout (or its fallback), and `N42_BACKGROUND_NICE` on
+            // reth's persistence thread (`save_blocks` runs there), which
+            // exists from the launch on.
+            n42_core_layout::log_once();
+            let reniced = n42_core_layout::lower_threads_named(&["persistence"]);
+            if let Some(priority) = n42_core_layout::background_priority() {
+                info!(target: "n42::core_layout", %priority, reniced, "background priority on reth's persistence thread");
+            }
 
             // `N42_FRAME_BLOCKS=1` (docs/BREAKTHROUGH_DESIGN.md step 1): whole
             // frames in the builder, frame-tree roots, frame descriptions on
@@ -275,6 +329,30 @@ fn main() {
                 });
             }
 
+            // A chained build that waits for an ancestor to reach the engine is
+            // woken by the canonical chain's changes instead of polling, and the
+            // own-block layers the engine's tip has passed are released
+            // (`direct_build::engine_landed`, `leader_layers::on_canonical`).
+            {
+                let mut canonical = node.provider.subscribe_to_canonical_state();
+                n42_engine_types::direct_build::engine_landed::wire();
+                tokio::spawn(async move {
+                    let depth = n42_engine_types::direct_build::leader_layers::depth();
+                    loop {
+                        match canonical.recv().await {
+                            Ok(notification) => {
+                                n42_engine_types::direct_build::engine_landed::notify();
+                                n42_engine_types::direct_build::leader_layers::on_canonical(notification.tip().number, depth);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                n42_engine_types::direct_build::engine_landed::notify();
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+
             let consensus_signer_private_key = node_config_dev.dev.consensus_signer_private_key;
             let signer_address = if let Some(signer_private_key) = &consensus_signer_private_key {
                 let eth_signer: PrivateKeySigner = signer_private_key.to_string().parse().unwrap();
@@ -286,6 +364,9 @@ fn main() {
             // The raw payload channel for the validator, loopback only. See
             // `payload_serve`.
             if let Ok(addr) = std::env::var("N42_PAYLOAD_SERVE") {
+                // Several keys on this execution layer share each import
+                // (`N42_IMPORT_ONCE`); a held execution cannot be shared.
+                n42::import_once::check_startup().map_err(|err| eyre::eyre!(err))?;
                 match addr.parse::<std::net::SocketAddr>() {
                     Ok(addr) => {
                         let payloads = node.payload_builder_handle.clone();
@@ -303,7 +384,7 @@ fn main() {
                                 inserts: reth_node_builder::executed_inserts::sender(),
                                 canonical_head: Some(std::sync::Arc::new({
                                     let provider = node.provider.clone();
-                                    move || reth_provider::BlockNumReader::chain_info(&provider).ok().map(|info| info.best_hash)
+                                    move || reth_provider::BlockNumReader::chain_info(&provider).ok().map(|info| (info.best_hash, info.best_number))
                                 })),
                                 // Opt-in (N42_PRUNE_POOL_ON_IMPORT=1), measured and not
                                 // adopted: removing a block's 163,000 transactions from
@@ -408,7 +489,18 @@ fn main() {
             // here by every canonical block on every node.
             if std::env::var("N42_TX_QUEUE").is_ok() {
                 let queue: n42_tx_queue::TxQueue<n42_engine_types::N42PooledTransaction> = n42_tx_queue::TxQueue::new();
-                if std::env::var("N42_TX_QUEUE_DRAINER").is_ok() {
+                if std::env::var("N42_TX_QUEUE_DRAINER").is_ok() && queue.wants_drainer_thread() {
+                    // N42_QUEUE_OFFLOCK: a thread of its own, woken early by a
+                    // deep inbox; while it runs the block path's holds drain
+                    // only a bounded slice. See TxQueue::run_drainer.
+                    let drained = queue.clone();
+                    if let Err(err) = std::thread::Builder::new()
+                        .name("tx-queue-drainer".into())
+                        .spawn(move || drained.run_drainer(std::time::Duration::from_millis(5)))
+                    {
+                        tracing::warn!(target: "reth::cli", %err, "could not start the queue's drainer thread");
+                    }
+                } else if std::env::var("N42_TX_QUEUE_DRAINER").is_ok() {
                     // The inbox drained off the builder's thread; see TxQueue::drain_now.
                     let drained = queue.clone();
                     tokio::spawn(async move {
@@ -498,6 +590,11 @@ fn main() {
                     }
                 });
                 let mut canonical = node.provider.subscribe_to_canonical_state();
+                // `N42_QUEUE_PRUNE_THREAD=1`: the prune runs on a thread of its
+                // own and this task only forwards (see `n42::queue_prune`).
+                let pruner = n42::queue_prune::on_own_thread()
+                    .then(|| n42::queue_prune::spawn_thread(queue.clone()))
+                    .flatten();
                 tokio::spawn(async move {
                     loop {
                         match canonical.recv().await {
@@ -506,106 +603,20 @@ fn main() {
                                 if behind > 8 {
                                     warn!(target: "reth::cli", behind, "canonical subscriber lag: queue pruner");
                                 }
-                                let started = std::time::Instant::now();
-                                // A reorg: the reverted blocks' transactions are
-                                // nowhere else -- with the direct ingest the queue
-                                // is their only holder -- so those the new chain
-                                // does not carry are offered again, before the new
-                                // chain's prune (which then removes any the new
-                                // chain mined at a higher nonce). Without this the
-                                // affected senders' lanes started at a nonce ahead
-                                // of the chain and every leader refused them:
-                                // half-empty blocks for the rest of the leg
-                                // (round 43).
-                                if let reth_provider::CanonStateNotification::Reorg { old, new } = &notification {
-                                    let reverted_blocks = old.blocks_iter().count();
-                                    let back = n42::queue_reorg::reverted_transactions(old, new);
-                                    let offered = back.len();
-                                    // Through the reverted door: it lowers the
-                                    // senders' mined watermarks, which the
-                                    // reverted blocks no longer justify.
-                                    queue.push_reverted(back);
-                                    warn!(target: "n42.tx_queue", reverted_blocks, offered, new_blocks = new.blocks_iter().count(), "reorg: the reverted blocks' transactions are offered again");
-                                }
-                                let mut mined = 0usize;
-                                for (_, block) in notification.committed().blocks_iter().map(|b| (b.number(), b)) {
-                                    // What the builder reads to tell a build
-                                    // for a height the chain has already
-                                    // decided from a build that is starving.
-                                    n42_engine_types::canonical_head::saw(block.number());
-                                    // What the builder compares its parent
-                                    // against: a build below this is behind
-                                    // its own queue.
-                                    queue.note_pruned(block.number());
-                                    // One walk for both: the (sender, nonce)
-                                    // pairs the lanes are pruned by, and the
-                                    // hashes the by-hash index is pruned by
-                                    // (`N42_COMPACT_BODY` or
-                                    // `N42_SENDERS_FROM_QUEUE`; nothing will ever
-                                    // name a committed block's transactions
-                                    // again, and an index that carries them
-                                    // until its bound reaches them evicts
-                                    // what the next block needs).
-                                    let mut hashes: Vec<alloy_primitives::B256> = Vec::new();
-                                    let pairs: Vec<(alloy_primitives::Address, u64)> = block
-                                        .transactions_with_sender()
-                                        .map(|(sender, tx)| {
-                                            hashes.push(*alloy_consensus::transaction::TxHashRef::tx_hash(tx));
-                                            (*sender, alloy_consensus::Transaction::nonce(tx))
-                                        })
-                                        .collect();
-                                    mined += pairs.len();
-                                    // An own block held at this height: the same
-                                    // hash is settled, another hash gives back what
-                                    // this block does not carry (then pruned below
-                                    // where this block mined a higher nonce).
-                                    // Built only if an own block is held at this
-                                    // height (rarely): a 163,000-entry SipHash set
-                                    // every block on every node was 10-20 ms.
-                                    let carried = std::cell::OnceCell::new();
-                                    let back = queue.settle_own_block(block.number(), block.hash(), |sender, nonce| {
-                                        carried
-                                            .get_or_init(|| pairs.iter().copied().collect::<alloy_primitives::map::HashSet<(alloy_primitives::Address, u64)>>())
-                                            .contains(&(*sender, nonce))
-                                    });
-                                    if back > 0 {
-                                        warn!(target: "n42.tx_queue", number = block.number(), back, "an own block at this height was not the one committed; its transactions are offered again");
+                                match pruner.as_ref() {
+                                    Some(pruner) => {
+                                        // Read by the builder: said here as
+                                        // well, so the thread's queue does
+                                        // not delay it.
+                                        for block in notification.committed().blocks_iter() {
+                                            n42_engine_types::canonical_head::saw(block.number());
+                                        }
+                                        if pruner.send((notification, std::time::Instant::now())).is_err() {
+                                            error!(target: "n42.tx_queue", "the queue's pruning thread is gone; the queue is no longer pruned");
+                                            break;
+                                        }
                                     }
-                                    queue.remove_mined_batch(pairs);
-                                    // Out of the by-hash index too: nothing
-                                    // will ever name a committed block's
-                                    // transactions again, and an index that
-                                    // carries them until its bound reaches
-                                    // them evicts what the next block needs.
-                                    // A no-op without an index.
-                                    queue.forget_hashes(hashes);
-                                }
-                                if mined > 10_000 {
-                                    // `usable` beside `queued`: what a build
-                                    // could take of the depth. The two part
-                                    // company when lanes are parked behind a
-                                    // hole, which is what loop207-208's defect
-                                    // 13 was -- 334-360k queued, empty blocks,
-                                    // and no line saying which of the two it
-                                    // was.
-                                    let (parked_lanes, parked, park_capped) = queue.parked();
-                                    info!(target: "n42.tx_queue", mined, queued = queue.len(), usable = queue.usable(), parked, parked_lanes, park_capped, frames_indexed = queue.frames_indexed(), prune_ms = started.elapsed().as_millis() as u64, "canonical blocks pruned from the queue");
-                                    // What the queue let go of since the last
-                                    // block, by reason, with the first few
-                                    // named. A lane's hole -- a nonce the
-                                    // generator was told this node had taken
-                                    // and that is in neither the queue nor a
-                                    // block -- can only be made at one of
-                                    // these; before this nothing counted them.
-                                    let drops = queue.take_drops();
-                                    if drops.interesting() {
-                                        warn!(
-                                            target: "n42.tx_queue",
-                                            by_reason = ?drops.named(),
-                                            first = ?drops.samples,
-                                            "the queue let go of transactions"
-                                        );
-                                    }
+                                    None => n42::queue_prune::prune_notification(&queue, &notification, 1, std::time::Duration::ZERO),
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -646,11 +657,11 @@ fn main() {
                         // The chain id a frame attestation is signed over
                         // (`N42_FRAME_GATEWAYS`, step 2).
                         let chain_id = reth_chainspec::EthChainSpec::chain_id(&*node.chain_spec());
-                        tokio::spawn(async move {
-                            n42_tx_ingest::set_frame_hook(n42_engine_types::frame_scan::note_admitted_any);
-                            if let Err(err) = n42_tx_ingest::serve(addr, pool, cache, head, chain_id).await {
-                                error!(target: "reth::cli", %err, "transaction ingest stopped");
-                            }
+                        n42_tx_ingest::set_frame_hook(n42_engine_types::frame_scan::note_admitted_any);
+                        // On its own runtime under `N42_INGEST_RUNTIME=1`
+                        // (`n42_tx_ingest::runtime`), on this one otherwise.
+                        n42_tx_ingest::spawn_serve(addr, pool, cache, head, chain_id, |err| {
+                            error!(target: "reth::cli", %err, "transaction ingest stopped");
                         });
                     }
                     Err(err) => {

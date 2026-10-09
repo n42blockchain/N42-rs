@@ -19,6 +19,7 @@ reth-primitives-traits.workspace = true
 #n42
 pubsub-mem.workspace = true
 n42-engine-types.workspace = true
+n42-core-layout.workspace = true
 n42-h2-consensus.workspace = true
 n42-qmdb-reth.workspace = true
 n42-tx-ingest.workspace = true
@@ -105,7 +106,12 @@ similar-asserts.workspace = true
 tempfile.workspace = true
 
 [features]
-default = ["jemalloc", "reth-revm/portable"]
+# asm-keccak: the assembly Keccak backend (keccak-asm) for every keccak256 in
+# the graph -- the same function as the software backend, bit for bit; the
+# loop314 profile put the software Keccak at ~11.5% of all on-CPU samples
+# (transaction hashes and frame roots at admission). Upstream's reth binary
+# enables it by default too.
+default = ["jemalloc", "asm-keccak", "reth-revm/portable"]
 
 dev = ["reth-ethereum-cli/dev"]
 
@@ -114,6 +120,8 @@ asm-keccak = [
     # (was reth-primitives/asm-keccak; reth-ethereum-primitives has no such
     # feature — node-core and ethereum-cli still forward the flag)
     "reth-ethereum-cli/asm-keccak",
+    "reth-node-ethereum/asm-keccak",
+    "alloy-primitives/asm-keccak",
 ]
 
 jemalloc = [

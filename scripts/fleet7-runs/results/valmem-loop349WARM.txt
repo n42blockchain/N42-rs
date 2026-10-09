@@ -1,0 +1,31 @@
+== validator memory at flood +70 s (loop349WARM)
+validators 7: RSS sum 0.8 G, max 0.12 G, mean 0.12 G; threads 273 (mean 39)
+one validator (pid 2421400):
+VmHWM:	  120004 kB
+VmRSS:	  120004 kB
+RssAnon:	  104256 kB
+RssFile:	   15748 kB
+RssShmem:	       0 kB
+Threads:	39
+Rss:              120004 kB
+Private_Dirty:    104256 kB
+Anonymous:        104256 kB
+AnonHugePages:         0 kB
+threads by name:
+     33 h2_validator
+      4 tokio-rt-worker
+      1 n42-qmdb-prefau
+      1 futures-timer
+largest mappings by Rss:
+53604  756267e00000-75626fa00000
+13696  756274400000-756276a00000
+10764 /data/n42-build/target-n42-rs/native/release/examples/h2_validator 5b438b283000-5b438c11d000
+9108  75627a2ff000-75627abff000
+7512  75626fb00000-756270c00000
+6036  756276b00000-756278800000
+4092  756279e00000-75627a200000
+2736  756278980000-756279400000
+RssAnon of all validators (MB):
+anon n=7 min 104 median 104 max 105 MB, sum 0.7 G
+RSS of all validators, sorted:
+min 119.62 MB median 120.028 MB max 120.86 MB

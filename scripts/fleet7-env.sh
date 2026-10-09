@@ -62,6 +62,69 @@ f7_check_binary_fresh() {
 # `7` anywhere is a script that breaks silently at another size -- and "breaks
 # silently" here means a leg that runs and reports a number.
 : "${F7_NODES:=7}"
+
+# Validators and execution layers are two numbers, and a fleet where they differ is
+# a shared-execution fleet (docs/SHARED_EXECUTION_SCOPE.md): several validator keys on
+# one execution layer, the way many Ethereum validator keys attach to one node.
+#
+#   F7_VALIDATORS  how many validator keys the chain names (default F7_NODES; F7_NODES
+#                  keeps meaning "validators" for every script that reads it, and is set
+#                  equal to F7_VALIDATORS here). The quorum, the mesh, the key and
+#                  network-key files and the genesis check all follow it.
+#   F7_EL_MAP      one execution-layer index per validator, comma separated:
+#                  0,1,2,3,4,5,6 (today's layout, the default), 0,0,0,0,0,0,0 (one layer),
+#                  0,0,1,1,2,2,3 (contiguous), 0,1,2,3,0,1,2 (interleaved). Indices must
+#                  cover 0..E-1.
+#   F7_ELS         E, derived: the number of execution layers. Ports, datadirs, CPU sets,
+#                  the flood's RPC and ingest lists and the ingest shard are per layer.
+#
+# Unset, F7_VALIDATORS = F7_NODES and the map is the identity, and every value derived
+# below is the one the one-to-one script computed. `F7_MAPPED` is 1 only when a map was
+# given that is not the identity.
+: "${F7_VALIDATORS:=$F7_NODES}"
+F7_NODES=$F7_VALIDATORS
+f7_parse_el_map() {
+  local raw=${F7_EL_MAP:-} i e max=-1 seen=() ident=1
+  F7_EL_OF=()
+  if [[ -z $raw ]]; then
+    for ((i = 0; i < F7_VALIDATORS; i++)); do F7_EL_OF+=("$i"); done
+  else
+    IFS=, read -r -a F7_EL_OF <<< "$raw"
+  fi
+  if ((${#F7_EL_OF[@]} != F7_VALIDATORS)); then
+    echo "fleet7-env: F7_EL_MAP='$raw' names ${#F7_EL_OF[@]} validators, F7_VALIDATORS=$F7_VALIDATORS." >&2
+    return 1
+  fi
+  for ((i = 0; i < F7_VALIDATORS; i++)); do
+    e=${F7_EL_OF[$i]}
+    [[ $e =~ ^[0-9]+$ ]] || { echo "fleet7-env: F7_EL_MAP entry '$e' is not an index." >&2; return 1; }
+    ((e > max)) && max=$e
+    seen[$e]=1
+    ((e == i)) || ident=0
+  done
+  F7_ELS=$((max + 1))
+  for ((e = 0; e < F7_ELS; e++)); do
+    [[ -n ${seen[$e]:-} ]] || { echo "fleet7-env: F7_EL_MAP leaves execution layer $e without a validator." >&2; return 1; }
+  done
+  # The first validator of each layer: its node directory holds the layer's datadir and
+  # log, and it is the key that carries the layer's transaction gossip (--el-rpc).
+  F7_EL_FIRST=()
+  for ((i = F7_VALIDATORS - 1; i >= 0; i--)); do F7_EL_FIRST[${F7_EL_OF[$i]}]=$i; done
+  F7_MAPPED=$((1 - ident))
+  # The imports of one block per layer are only one if the layer dedupes them; a
+  # layer shared by several keys without the switch executes the block once per key.
+  F7_SHARED=0
+  ((F7_ELS < F7_VALIDATORS)) && F7_SHARED=1
+  return 0
+}
+f7_parse_el_map || { return 1 2>/dev/null || exit 1; }
+export F7_VALIDATORS F7_NODES F7_ELS F7_MAPPED F7_SHARED
+# F7_EL_MAP is exported only when given, so scripts that read it see what the caller said.
+[[ -n ${F7_EL_MAP:-} ]] && export F7_EL_MAP
+# f7_el_of <validator> -- its execution layer.
+f7_el_of() { echo "${F7_EL_OF[$1]}"; }
+# f7_is_first <validator> -- succeeds for the first key of its layer.
+f7_is_first() { ((F7_EL_FIRST[${F7_EL_OF[$1]}] == $1)); }
 # The seed is deliberately NOT per fleet. `h2_keygen` derives validator `i`
 # from `keccak256("<seed>-<i>")`, the index alone, so node `i` holds the same
 # BLS key in every fleet derived from this seed and a four-node genesis is the
@@ -124,7 +187,7 @@ f7_start_load() {
   for ((i = 0; i < F7_TXGEN_SENDERS && i < ${#F7_DEV_KEYS[@]}; i++)); do
     key=${F7_DEV_KEYS[$i]}
     setsid "$F7_BIN/examples/send_tx" \
-      --rpc "http://127.0.0.1:$((F7_HTTP_BASE + i % F7_NODES))" \
+      --rpc "http://127.0.0.1:$((F7_HTTP_BASE + i % F7_ELS))" \
       --key "$key" --to 0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f \
       --chain-id "$chain" --rate "$rate" --seconds "$secs" --quiet \
       > "$F7_ROOT/txgen-$i.log" 2>&1 < /dev/null &
@@ -266,19 +329,22 @@ F7_NETKEYS=(
   "$(printf '55%.0s' {1..32})" "$(printf '66%.0s' {1..32})"
   "$(printf '77%.0s' {1..32})"
 )
-# A fleet larger than the list would index past its end. Under `set -u` that is
-# an "unbound variable" from inside `f7_peer_id`, three call levels from the
-# cause; said here it names the fix.
-if ((F7_NODES > ${#F7_NETKEYS[@]})); then
-  echo "fleet7-env: F7_NODES=$F7_NODES but only ${#F7_NETKEYS[@]} network keys are defined." >&2
-  echo "            Add keys to F7_NETKEYS (0x11..0x77 repeated 32 times, gov5's fleet keys)." >&2
-  return 1 2>/dev/null || exit 1
-fi
+# A fleet larger than the seven gov5 keys (the many-key shared-execution legs,
+# docs/E1_MANY_KEYS.md: 21 and 99 validators) takes derived keys for the rest:
+# key i >= 7 is sha256("n42-fleet7-netkey-<i>") as hex, a valid secp256k1 secret
+# with overwhelming probability (a 256-bit value below the group order). The
+# first seven are untouched, so a fleet of seven plans exactly as before.
+for ((f7_k = ${#F7_NETKEYS[@]}; f7_k < F7_NODES; f7_k++)); do
+  F7_NETKEYS+=("$(printf 'n42-fleet7-netkey-%d' "$f7_k" | sha256sum | cut -d' ' -f1)")
+done
+unset f7_k
 
 # f7_peer_id <index> -- the peer id that node's fixed network key yields.
 f7_peer_id() { "$F7_BIN/examples/h2_keygen" --libp2p-peer-id "${F7_NETKEYS[$1]}"; }
 
 f7_node_dir() { echo "$F7_ROOT/node$1"; }
+# The execution layer's directory: the node directory of its first validator.
+f7_el_dir() { f7_node_dir "${F7_EL_FIRST[$1]}"; }
 
 # The chain the running fleet was started on.
 #
@@ -293,6 +359,15 @@ f7_node_dir() { echo "$F7_ROOT/node$1"; }
 # rolled after the genesis had been edited mid-run. Recording the file at `up`
 # and refusing to roll against a different one turns it into a sentence.
 f7_genesis_fingerprint() { sha256sum "$F7_GENESIS" | cut -d' ' -f1; }
+
+# f7_genesis_depth -- the chain's deferredExecutionDepth (docs/DEFERRED_DEPTH_2_DESIGN.md):
+# 1 when absent, "-" when the chain does not defer execution at all.
+f7_genesis_depth() {
+  python3 -c "
+import json, sys
+config = json.load(open(sys.argv[1])).get('config', {})
+print(config.get('deferredExecutionDepth', 1) if 'deferredExecutionTime' in config else '-')" "$F7_GENESIS"
+}
 
 # f7_genesis_validator_count -- validators the chain names, or 0.
 f7_genesis_validator_count() {
@@ -347,7 +422,8 @@ f7_check_genesis() {
 f7_place_keys() {
   local i=$1 d
   d=$(f7_node_dir "$i")
-  mkdir -p "$d/consensus" "$d/el"
+  mkdir -p "$d/consensus"
+  f7_is_first "$i" && mkdir -p "$d/el"
   [[ -f $F7_ROOT/keys/validator-$i.key ]] || {
     mkdir -p "$F7_ROOT/keys"
     "$F7_BIN/examples/h2_keygen" --count "$F7_NODES" --seed "$F7_SEED" \
@@ -370,10 +446,11 @@ f7_bls_key() {
 }
 
 # ------------------------------------------------------------ launch args ---
-# f7_el_args <index> -> fills F7_EL_ARGS[]
+# f7_el_args <el index> -> fills F7_EL_ARGS[]   (the layer's index; the validator's
+# index when every validator has a layer of its own)
 f7_el_args() {
   local i=$1 d
-  d=$(f7_node_dir "$i")
+  d=$(f7_el_dir "$i")
   F7_EL_ARGS=(
     node
     --chain "$F7_GENESIS"
@@ -568,15 +645,24 @@ f7_el_args() {
   fi
 }
 
+# f7_trace_of <validator> -- the value N42_H2_TRACE_MSGS gets for that validator: "1" when
+# F7_TRACE_VALIDATOR (comma list of indices) names it, "0" when the list is set and does not, and
+# whatever the caller's environment says when the list is unset.
+f7_trace_of() {
+  if [[ -z ${F7_TRACE_VALIDATOR:-} ]]; then echo "${N42_H2_TRACE_MSGS:-}"; return 0; fi
+  [[ ",$F7_TRACE_VALIDATOR," == *",$1,"* ]] && echo 1 || echo 0
+}
+
 # f7_validator_args <index> -> fills F7_V_ARGS[]
 f7_validator_args() {
-  local i=$1 j d
+  local i=$1 j d e
   d=$(f7_node_dir "$i")
+  e=${F7_EL_OF[$i]}
   F7_V_ARGS=(
     --chain "$F7_GENESIS"
     --index "$i"
     --bls-key "$(f7_bls_key "$i")"
-    --el "http://127.0.0.1:$((F7_AUTH_BASE + i))"
+    --el "http://127.0.0.1:$((F7_AUTH_BASE + e))"
     --jwt "$F7_ROOT/jwt.hex"
     --listen "/ip4/127.0.0.1/tcp/$((F7_P2P_BASE + i))"
     --datadir "$d/consensus"
@@ -589,14 +675,16 @@ f7_validator_args() {
   # RPCs, so in a bench round the gossip carries nothing the pools do not
   # already have, and dropping it isolates what the forwarding costs. On a real
   # fleet it is how a transaction reaches the nodes it was not sent to.
-  [[ ${F7_NO_TX_GOSSIP:-0} == 1 ]] || F7_V_ARGS+=(--el-rpc "http://127.0.0.1:$((F7_HTTP_BASE + i))")
+  # On a layer shared by several keys only the first carries the gossip: the others
+  # would gossip the same pool and hand the same gossiped transactions to it again.
+  [[ ${F7_NO_TX_GOSSIP:-0} == 1 ]] || ! f7_is_first "$i" || F7_V_ARGS+=(--el-rpc "http://127.0.0.1:$((F7_HTTP_BASE + e))")
   # F7_INGEST_FORWARD=1: what the fleet gossips reaches the pool through the
   # binary ingest rather than through eth_sendRawTransaction, which is worth
   # an order of magnitude to a leader whose pool has to refill every block
   # (a leader with a tenure). Opt-in, not implied by F7_INGEST: it is a
   # variable of its own, and a validator binary built before the flag existed
   # refuses to start with it.
-  [[ ${F7_INGEST_FORWARD:-0} == 1 && -n ${F7_INGEST:-} ]] && F7_V_ARGS+=(--el-ingest "127.0.0.1:$((F7_INGEST_BASE + i))")
+  [[ ${F7_INGEST_FORWARD:-0} == 1 && -n ${F7_INGEST:-} ]] && f7_is_first "$i" && F7_V_ARGS+=(--el-ingest "127.0.0.1:$((F7_INGEST_BASE + e))")
   [[ $F7_PROFILE == lean ]] && F7_V_ARGS+=(--worker-threads 2)
   # A throughput round is not trying to honour a block interval, it is trying to
   # find the ceiling, so the bench tier paces in milliseconds and overrides the
@@ -640,7 +728,72 @@ f7_smt_offset() {
   esac
 }
 
-# f7_pin <index> -- echoes the taskset prefix for that node, or nothing.
+# f7_fleet_cpus -- the CPUs the nodes (layers and validators) share, flood excluded.
+#
+# F7_NODES x F7_CORES_PER_NODE (7 x 32 = 224) unless F7_FLEET_CPUS says otherwise. The many-key
+# legs (21 and 99 validators on one layer, docs/E1_MANY_KEYS.md) must not grow the budget with
+# the key count: 99 x 32 would run past the host. They set F7_FLEET_CPUS=224 and the layer and
+# the validators split it as for seven keys.
+f7_fleet_cpus() { echo "${F7_FLEET_CPUS:-$((F7_NODES * F7_CORES_PER_NODE))}"; }
+
+# f7_val_cpus -- CPUs set aside for the validator processes of a shared fleet.
+#
+# One-to-one, a node's validator runs on its execution layer's CPUs (0 here: nothing
+# is set aside). With several keys on a layer, seven validator processes would sit on
+# the layer's own cores, taking from the execution that is the point of the leg, so a
+# shared fleet pins them on a small set of their own, F7_VAL_CPUS CPUs (default 16, 8
+# physical cores, shared by all the validators), carved out of the fleet's total and
+# placed at its end (after the largest layer layout, before the flood's cores).
+# F7_VAL_CPUS=0 puts the validators back on their layer's CPUs.
+f7_val_cpus() {
+  ((F7_SHARED)) || { echo 0; return 0; }
+  echo "${F7_VAL_CPUS:-16}"
+}
+
+# f7_el_cpus -- CPUs one execution layer gets (and the validators on it when none are
+# set aside).
+#
+# One-to-one, this is F7_CORES_PER_NODE exactly. With fewer layers than validators the
+# fleet keeps its total, F7_NODES x F7_CORES_PER_NODE less the validators' set, split
+# over the layers in whole physical cores (224 CPUs, 16 for validators: one layer 208,
+# four layers 52 each; the remainder of an uneven split stays idle rather than giving
+# one layer more than another). F7_EL_CPUS=<n> caps a layer at n CPUs (even, with
+# F7_PIN_PHYSICAL=1): the E=1 leg at 74 CPUs. The flood's cores are not touched by
+# either (`f7_flood_cores`).
+f7_el_cpus() {
+  local total
+  if [[ -n ${F7_EL_CPUS:-} ]]; then echo "$F7_EL_CPUS"; return 0; fi
+  if ((F7_ELS == F7_NODES)); then echo "$F7_CORES_PER_NODE"; return 0; fi
+  total=$(($(f7_fleet_cpus) - $(f7_val_cpus)))
+  if [[ ${F7_PIN_PHYSICAL:-1} == 1 ]]; then
+    echo $(( (total / 2 / F7_ELS) * 2 ))
+  else
+    echo $((total / F7_ELS))
+  fi
+}
+
+# f7_pin_validator <validator> -- the taskset prefix for a validator process: its
+# layer's (`f7_pin`) unless the fleet sets validator CPUs aside, in which case one
+# shared set for all of them.
+f7_pin_validator() {
+  local i=$1 v off lo hi
+  v=$(f7_val_cpus)
+  if ((v == 0)); then f7_pin "${F7_EL_OF[$i]}"; return; fi
+  [[ $F7_PIN == 1 ]] || return 0
+  if [[ ${F7_PIN_PHYSICAL:-1} == 1 ]]; then
+    off=$(f7_smt_offset)
+    lo=$((F7_CORE_OFFSET + ($(f7_fleet_cpus) - v) / 2))
+    hi=$((lo + v / 2 - 1))
+    echo "taskset -c $lo-$hi,$((lo + off))-$((hi + off))"
+    return 0
+  fi
+  lo=$((F7_CORE_OFFSET + $(f7_fleet_cpus) - v))
+  hi=$((lo + v - 1))
+  echo "taskset -c $lo-$hi"
+}
+
+# f7_pin <el index> -- echoes the taskset prefix for that execution layer, or nothing.
+# Validators take the prefix of their layer (`f7_pin "$(f7_el_of i)"`).
 #
 # F7_PIN_PHYSICAL=1 (the default; 0 restores the old layout) gives each node
 # whole physical cores: half as many core numbers, each with its SMT sibling.
@@ -652,17 +805,30 @@ f7_smt_offset() {
 # was noticed: node 2's builder executing the same blocks 2-3x slower than
 # node 0's.
 f7_pin() {
-  local i=$1 lo hi off
+  local i=$1 lo hi off cpus
   [[ $F7_PIN == 1 ]] || return 0
+  cpus=$(f7_el_cpus)
+  # F7_PIN_SWAP=a:b (default unset: today's layout) gives node a the CPU list of
+  # node b and the reverse; ports, datadirs and the feed order keep their index.
+  # A measurement variable: it tells whether a node's cost follows the cores or
+  # the node. Refused with a mapped fleet, where "node" is two things.
+  if [[ -n ${F7_PIN_SWAP:-} ]]; then
+    if ((F7_MAPPED)) || ((F7_SHARED)); then
+      echo "fleet7-env: F7_PIN_SWAP is not defined for a fleet with F7_EL_MAP (layers are not nodes)" >&2
+      return 1
+    fi
+    local sa=${F7_PIN_SWAP%%:*} sb=${F7_PIN_SWAP##*:}
+    if ((i == sa)); then i=$sb; elif ((i == sb)); then i=$sa; fi
+  fi
   if [[ ${F7_PIN_PHYSICAL:-1} == 1 ]]; then
     off=$(f7_smt_offset)
-    lo=$((F7_CORE_OFFSET + i * F7_CORES_PER_NODE / 2))
-    hi=$((lo + F7_CORES_PER_NODE / 2 - 1))
+    lo=$((F7_CORE_OFFSET + i * cpus / 2))
+    hi=$((lo + cpus / 2 - 1))
     echo "taskset -c $lo-$hi,$((lo + off))-$((hi + off))"
     return 0
   fi
-  lo=$((F7_CORE_OFFSET + i * F7_CORES_PER_NODE))
-  hi=$((lo + F7_CORES_PER_NODE - 1))
+  lo=$((F7_CORE_OFFSET + i * cpus))
+  hi=$((lo + cpus - 1))
   echo "taskset -c $lo-$hi"
 }
 
@@ -679,12 +845,32 @@ f7_flood_cores() {
   local off lo hi
   if [[ ${F7_PIN_PHYSICAL:-1} == 1 ]]; then
     off=$(f7_smt_offset)
-    lo=$((F7_CORE_OFFSET + F7_NODES * F7_CORES_PER_NODE / 2))
+    lo=$((F7_CORE_OFFSET + $(f7_fleet_cpus) / 2))
     hi=$((off - 1))
     echo "${F7_FLOOD_CORES:-$lo-$hi,$((lo + off))-$((hi + off))}"
     return 0
   fi
-  echo "${F7_FLOOD_CORES:-$((F7_CORE_OFFSET + F7_NODES * F7_CORES_PER_NODE))-$(($(nproc) - 1))}"
+  echo "${F7_FLOOD_CORES:-$((F7_CORE_OFFSET + $(f7_fleet_cpus)))-$(($(nproc) - 1))}"
+}
+
+# f7_check_shared_ready -- a layer shared by several keys must dedupe their imports.
+#
+# Without `N42_IMPORT_ONCE=1` in the layer's environment, each key's request for the
+# same block executes it again (docs/SHARED_EXECUTION_SCOPE.md section 2): the leg would
+# measure k-fold execution and report it as shared execution. The binary is checked
+# for the switch too. F7_ALLOW_UNGATED=1 for a deliberate measurement of exactly that.
+f7_check_shared_ready() {
+  ((F7_SHARED)) || return 0
+  [[ ${F7_ALLOW_UNGATED:-0} == 1 ]] && return 0
+  [[ ${N42_IMPORT_ONCE:-} == 1 ]] || {
+    echo "fleet7-env: $F7_ELS layers for $F7_NODES validators needs N42_IMPORT_ONCE=1 (F7_ALLOW_UNGATED=1 to run without)" >&2
+    return 1
+  }
+  if [[ -x $F7_BIN/n42 ]] && ! grep -aq N42_IMPORT_ONCE "$F7_BIN/n42"; then
+    echo "fleet7-env: $F7_BIN/n42 does not know N42_IMPORT_ONCE; build it from a commit that has the import-once registry" >&2
+    return 1
+  fi
+  return 0
 }
 
 # f7_check_layout -- refuse a core layout that does not fit, and say why.
@@ -694,30 +880,43 @@ f7_flood_cores() {
 # blocks 2-3x slower than node 0's and nothing said so. So the arithmetic is
 # checked where it is written rather than discovered in a leg's numbers.
 f7_check_layout() {
-  local off cpus phys used
+  local off cpus phys used per
   [[ $F7_PIN == 1 ]] || return 0
   cpus=$(nproc)
+  per=$(f7_el_cpus)
+  # The layers together may not take more than the fleet's total: the rest belongs to
+  # the flood (`f7_flood_cores`), and a layer that spilled into it would share physical
+  # cores with the generator.
+  if [[ -n ${F7_VAL_CPUS:-} ]] && ! ((F7_SHARED)); then
+    echo "fleet7-env: F7_VAL_CPUS is for a fleet with fewer layers than validators (F7_EL_MAP); here every validator runs on its node's CPUs" >&2
+    return 1
+  fi
+  ((F7_ELS * per + $(f7_val_cpus) <= $(f7_fleet_cpus))) || {
+    echo "fleet7-env: $F7_ELS layers x $per CPUs + $(f7_val_cpus) for validators exceed the fleet's $(f7_fleet_cpus) CPUs ($F7_NODES x $F7_CORES_PER_NODE unless F7_FLEET_CPUS is set); the flood's cores would be taken" >&2
+    return 1
+  }
+  ((($(f7_val_cpus)) % 2 == 0)) || { echo "fleet7-env: F7_VAL_CPUS=$(f7_val_cpus) is odd; a physical core is two CPUs" >&2; return 1; }
   if [[ ${F7_PIN_PHYSICAL:-1} == 1 ]]; then
     off=$(f7_smt_offset)
     ((off > 0)) || { echo "fleet7-env: F7_PIN_PHYSICAL=1 on a host without SMT siblings" >&2; return 1; }
-    ((F7_CORES_PER_NODE % 2 == 0)) || {
-      echo "fleet7-env: F7_CORES_PER_NODE=$F7_CORES_PER_NODE is odd; a physical core is two CPUs" >&2
+    ((per % 2 == 0)) || {
+      echo "fleet7-env: $per CPUs a layer is odd; a physical core is two CPUs" >&2
       return 1
     }
     # `f7_pin`'s layout is: physical cores are 0..off-1 and their siblings are
     # off..2*off-1, so the sibling offset IS the physical core count.
-    phys=$((F7_NODES * F7_CORES_PER_NODE / 2))
+    phys=$((F7_ELS * per / 2))
     used=$((F7_CORE_OFFSET + phys))
     ((used <= off)) || {
-      echo "fleet7-env: $F7_NODES nodes x $F7_CORES_PER_NODE CPUs need $used physical cores" >&2
+      echo "fleet7-env: $F7_ELS nodes x $per CPUs need $used physical cores" >&2
       echo "            but this host has $off of $cpus CPUs (siblings at +$off)." >&2
       echo "            Nodes would share physical cores; lower F7_CORES_PER_NODE or F7_NODES." >&2
       return 1
     }
   else
-    used=$((F7_CORE_OFFSET + F7_NODES * F7_CORES_PER_NODE))
+    used=$((F7_CORE_OFFSET + F7_ELS * per))
     ((used <= cpus)) || {
-      echo "fleet7-env: $F7_NODES x $F7_CORES_PER_NODE CPUs from $F7_CORE_OFFSET exceed $cpus" >&2
+      echo "fleet7-env: $F7_ELS x $per CPUs from $F7_CORE_OFFSET exceed $cpus" >&2
       return 1
     }
   fi
@@ -744,21 +943,23 @@ f7_spawn() {
   shift 2
   setsid bash -c 'echo $$ > "$1"; exec "${@:3}" >> "$2" 2>&1 < /dev/null' _     "$pidfile" "$logfile" "$@" &
   # Give the exec a moment, then check the file names something plausible.
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+  # Polled every 20 ms (it was 200 ms): a launch of 99 validators spent 20 s in this loop alone,
+  # long enough for the first members to start timing out views before a quorum existed.
+  for _ in $(seq 1 100); do
     [[ -s $pidfile ]] && return 0
-    sleep 0.2
+    sleep 0.02
   done
   echo "warning: $pidfile was never written" >&2
   return 1
 }
 
-# f7_pid <index> <el|v> -- the recorded pid, only if it is alive and is still
+# f7_pid <index> <el|v> -- <index> is a validator for `v` and an execution layer for `el`
+# (the same number when the fleet is one-to-one). The recorded pid, only if it is alive and is still
 # the process we started. A stale pidfile can name something else entirely
 # after a reboot, and a fleet script that "stopped" such a pid would kill it.
 f7_pid() {
   local d pid comm want
-  d=$(f7_node_dir "$1")
-  case $2 in el) want=n42;; v) want=h2_validator;; *) return 1;; esac
+  case $2 in el) want=n42; d=$(f7_el_dir "$1");; v) want=h2_validator; d=$(f7_node_dir "$1");; *) return 1;; esac
   [[ -r $d/$2.pid ]] || return 1
   pid=$(awk '{print $1; exit}' "$d/$2.pid" 2>/dev/null) || return 1
   [[ -n ${pid:-} ]] || return 1
@@ -794,7 +995,7 @@ f7_rotate_logs() {
   return 0
 }
 
-# f7_height <index> -- the execution layer's head, or nothing if it is not up.
+# f7_height <el index> -- the execution layer's head, or nothing if it is not up.
 f7_height() {
   curl -s --max-time 5 -X POST -H 'content-type: application/json' \
     --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
@@ -802,7 +1003,7 @@ f7_height() {
     python3 -c "import sys,json;print(int(json.load(sys.stdin)['result'],16))" 2>/dev/null
 }
 
-# f7_hash_at <index> <number>
+# f7_hash_at <el index> <number>
 f7_hash_at() {
   curl -s --max-time 5 -X POST -H 'content-type: application/json' \
     --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBlockByNumber\",\"params\":[\"0x$(printf %x "$2")\",false]}" \

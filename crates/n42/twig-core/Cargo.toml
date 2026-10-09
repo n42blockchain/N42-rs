@@ -26,6 +26,8 @@ thiserror.workspace = true
 # Optional: cross-shard parallelism for the builder. OFF by default so mobile/FFI
 # stays zero-dep (it only verifies proofs).
 rayon = { workspace = true, optional = true }
+# The background set and priority for the prefault / populate threads.
+n42-core-layout.workspace = true
 
 # `madvise(MADV_POPULATE_WRITE)` and the thread's fault count (`prefault`).
 [target.'cfg(target_os = "linux")'.dependencies]

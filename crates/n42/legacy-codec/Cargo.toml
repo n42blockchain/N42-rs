@@ -1,0 +1,13 @@
+[package]
+name = "n42-legacy-codec"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Legacy fixed-width Serde encoding backed by maintained bincode_reloaded"
+[dependencies]
+bincode_reloaded = { version = "3.1.24", default-features = false, features = ["std", "serde"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+[dev-dependencies]
+n42-qmdb-state = { path = "../qmdb-state" }
+n42-h2-primitives = { path = "../h2-primitives" }

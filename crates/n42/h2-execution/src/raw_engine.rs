@@ -89,6 +89,47 @@ pub mod request {
     /// layer that predates it refuses the request, the caller's channel
     /// falls back to JSON for that build, and no compact body is made.
     pub const GET_PAYLOAD_HASHED: u8 = 7;
+    /// `u32` length and the RLP of a *sealed header* follow: a block this
+    /// execution layer built, whose transactions its proposer took without
+    /// (`N42_TAKE_COMPACT`, [`super::reply::COMPACT_BUILT`]) and now needs
+    /// after all -- for a peer's fetch by hash, a fill, or the own import's
+    /// fallback. The answer is the block in `GET_PAYLOAD`'s shape (the
+    /// *built* header in it; the caller has the sealed one), or an error
+    /// (`unknown build`) on which the caller asks for the block by hash.
+    pub const OWN_BODY: u8 = 8;
+    /// No length, nothing else: a prefix to the [`FOREIGN_BODY`] or
+    /// [`COMPACT_BODY`] request that follows it on the same connection
+    /// (`N42_VOTE_BEFORE_SLOT`). That block is assembled and checked as
+    /// always, but its execution is *held*: after the
+    /// [`super::reply::CHECKED`] frame the execution layer reads one
+    /// [`super::release`] byte from the caller before it executes the block
+    /// ([`super::release::EXECUTE`]) or drops it ([`super::release::DROP`],
+    /// answered with [`super::reply::ERROR`]). The byte is sent exactly when
+    /// the CHECKED frame was received, so a block whose check fails is
+    /// answered as always and nothing more is read. Between the validator and
+    /// its own execution layer only; nothing on the peer wire changes.
+    pub const HOLD_EXECUTION: u8 = 9;
+    /// `u32` length and the RLP of a block's *sealed header* follow
+    /// (`N42_CHECK_BEFORE_SLOT`): a check and nothing else. The execution
+    /// layer answers with exactly one frame: [`super::reply::CHECKED`] (a
+    /// VALID status whose latest valid hash is the header's hash) when it can
+    /// vouch for the block now without importing it -- the header is one of
+    /// its own kept builds, matched field by field, or the import-once
+    /// registry already holds another request's check of that hash -- and
+    /// [`super::reply::ERROR`] otherwise. Nothing is imported, held,
+    /// registered or kept: the block's import comes later on the ordinary
+    /// road, in its slot. Between a validator and its own execution layer
+    /// only; nothing on the peer wire changes.
+    pub const CHECK_ONLY: u8 = 10;
+}
+
+/// The byte a caller sends for a held block ([`request::HOLD_EXECUTION`])
+/// once it has received the block's CHECKED frame.
+pub mod release {
+    /// The block has an import slot: execute it.
+    pub const EXECUTE: u8 = 1;
+    /// The block will never be canonical: drop it unexecuted.
+    pub const DROP: u8 = 0;
 }
 
 /// Reply kinds on the channel.
@@ -100,7 +141,9 @@ pub mod reply {
     /// `NEW_PAYLOAD` only, under deferred execution
     /// (docs/PHASE_D_DEFERRED_EXECUTION.md): the block was *checked* -- its
     /// header's execution fields match this execution layer's result for the
-    /// parent and its transactions are includable on the parent's state --
+    /// depth-D ancestor (the parent at depth 1, the grandparent at depth 2:
+    /// docs/DEFERRED_DEPTH_2_DESIGN.md) and its transactions are includable
+    /// on the parent's state --
     /// and is now executing. `u32` length and an encoded
     /// [`super::PayloadStatus`] (VALID) follow, then the final answer as a
     /// [`VALUE`] or [`ERROR`] frame once the block is imported. A block
@@ -131,6 +174,147 @@ pub mod reply {
     /// whole-body road, as before. Nothing has been checked and no vote has
     /// been released when this frame goes out.
     pub const NEED_TXNS: u8 = 5;
+    /// [`super::request::BUILD_ON_OWN`] only, and only when the request
+    /// carried the compact-answer tail and asked for hashes: the block
+    /// *without its transactions* -- `u32` length and an encoded
+    /// [`super::CompactAnswer`] -- in place of the [`VALUE`] frame. Nothing
+    /// of the ~26 MB block is encoded or sent; the transaction hashes (and
+    /// the frame layout) that a compact body names them by are.
+    pub const COMPACT_BUILT: u8 = 6;
+}
+
+/// Microseconds since the Unix epoch: the wall clock the log lines are
+/// stamped with, so stamps taken in the execution layer and in the proposer
+/// can be laid on one axis. 0 if the clock is before the epoch.
+pub fn unix_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_micros() as u64)
+}
+
+/// A built block without its transactions: what a proposer that publishes a
+/// compact body needs from the build, and nothing else
+/// ([`reply::COMPACT_BUILT`]).
+///
+/// ```text
+/// answer := u8 version
+///         | u32 len, the built header's RLP
+///         | u32 transactions
+///         | u32 n, n * (u64 index, u64 validator index, 20 address, u64 amount)
+///         | u8 has_requests, [u32 n, n * (u32 len, bytes)]
+///         | u8 has_bal, [u32 len, bytes]
+///         | u32 n, n * 32 transaction hashes (n = transactions, or 0 for a layout-only answer)
+///         | u32 frames, frames * (32 frame id, u32 count) (their sum = transactions, or none)
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactAnswer {
+    /// The header as built (before the proposer stamps and seals it).
+    pub header: alloy_consensus::Header,
+    /// How many transactions the block holds.
+    pub tx_count: u32,
+    /// The block's withdrawals (its rewards on a gov5 chain).
+    pub withdrawals: Vec<Withdrawal>,
+    /// The execution requests, when the build has them.
+    pub requests: Option<Vec<Bytes>>,
+    /// The EIP-7928 block access list, when the build has one.
+    pub block_access_list: Option<Bytes>,
+    /// Every transaction's hash, in block order. Empty only in a
+    /// layout-only answer (`N42_ANSWER_LAYOUT_ONLY`): `frame_layout` then
+    /// covers the block, and the hashes are fetched with the body if wanted.
+    pub tx_hashes: Vec<B256>,
+    /// The block's frame layout (`N42_FRAME_BLOCKS=1`), or empty.
+    pub frame_layout: Vec<(B256, u32)>,
+}
+
+/// Encodes a [`CompactAnswer`].
+pub fn encode_compact_answer(answer: &CompactAnswer) -> Vec<u8> {
+    let rlp = alloy_rlp::encode(&answer.header);
+    let mut w = Writer(Vec::with_capacity(
+        rlp.len() + 64 + answer.withdrawals.len() * 44 + answer.tx_hashes.len() * 32 + answer.frame_layout.len() * 36,
+    ));
+    w.u8(VERSION);
+    w.bytes(&rlp);
+    w.u32(answer.tx_count);
+    w.u32(answer.withdrawals.len() as u32);
+    for wd in &answer.withdrawals {
+        w.u64(wd.index); w.u64(wd.validator_index); w.fixed(wd.address.as_slice()); w.u64(wd.amount);
+    }
+    match &answer.requests {
+        Some(requests) => {
+            w.u8(1);
+            w.u32(requests.len() as u32);
+            for request in requests { w.bytes(request); }
+        }
+        None => w.u8(0),
+    }
+    match &answer.block_access_list {
+        Some(bal) => { w.u8(1); w.bytes(bal); }
+        None => w.u8(0),
+    }
+    w.u32(answer.tx_hashes.len() as u32);
+    for hash in &answer.tx_hashes { w.fixed(hash.as_slice()); }
+    w.u32(answer.frame_layout.len() as u32);
+    for (id, count) in &answer.frame_layout { w.fixed(id.as_slice()); w.u32(*count); }
+    w.0
+}
+
+/// Decodes what [`encode_compact_answer`] produced. Strict: the hashes must
+/// number the block's transactions (or be absent, with a frame layout that
+/// covers the block), a frame layout must sum to them, and
+/// nothing may follow.
+pub fn decode_compact_answer(buf: &[u8]) -> Result<CompactAnswer, String> {
+    use alloy_rlp::Decodable;
+    let mut r = Reader { rest: buf, shared: None };
+    if r.u8()? != VERSION { return Err("unknown raw engine version".into()); }
+    let rlp = r.bytes()?;
+    let mut cursor = &rlp[..];
+    let header = alloy_consensus::Header::decode(&mut cursor).map_err(|e| format!("header: {e}"))?;
+    if !cursor.is_empty() { return Err("header RLP has trailing bytes".into()); }
+    let tx_count = r.u32()?;
+    let n = r.count(44)?;
+    let mut withdrawals = Vec::with_capacity(n);
+    for _ in 0..n {
+        let index = r.u64()?; let validator_index = r.u64()?;
+        let address = Address::from_slice(r.take(20)?); let amount = r.u64()?;
+        withdrawals.push(Withdrawal { index, validator_index, address, amount });
+    }
+    let requests = if r.flag()? {
+        let n = r.count(4)?;
+        let mut list = Vec::with_capacity(n);
+        for _ in 0..n { list.push(r.bytes()?); }
+        Some(list)
+    } else { None };
+    let block_access_list = if r.flag()? { Some(r.bytes()?) } else { None };
+    let n = r.u32()? as usize;
+    // A layout-only answer has no hashes; whether its layout covers the
+    // block is checked below, once the layout has been read.
+    let layout_only = n == 0 && tx_count > 0;
+    if n != tx_count as usize && !layout_only {
+        return Err(format!("{n} transaction hashes for a block of {tx_count}"));
+    }
+    let raw = r.take(n.checked_mul(32).ok_or("hash count overflows")?)?;
+    let tx_hashes = raw.as_chunks::<32>().0.iter().copied().map(B256::from).collect();
+    let frames = r.u32()? as usize;
+    let raw = r.take(frames.checked_mul(36).ok_or("frame count overflows")?)?;
+    let mut frame_layout = Vec::with_capacity(frames);
+    let mut sum = 0u64;
+    for entry in raw.as_chunks::<36>().0 {
+        let mut count = [0u8; 4];
+        count.copy_from_slice(&entry[32..]);
+        let count = u32::from_le_bytes(count);
+        sum += u64::from(count);
+        frame_layout.push((B256::from_slice(&entry[..32]), count));
+    }
+    if frames > 0 && sum != u64::from(tx_count) {
+        return Err(format!("a frame layout of {sum} transactions for a block of {tx_count}"));
+    }
+    if layout_only && frames == 0 {
+        return Err(format!("no transaction hashes and no frame layout for a block of {tx_count}"));
+    }
+    if !r.rest.is_empty() {
+        return Err(format!("compact answer has {} trailing bytes", r.rest.len()));
+    }
+    Ok(CompactAnswer { header, tx_count, withdrawals, requests, block_access_list, tx_hashes, frame_layout })
 }
 
 /// Encodes the indices of [`reply::NEED_TXNS`].
@@ -146,8 +330,8 @@ pub fn encode_need_txns(indices: &[u32]) -> Vec<u8> {
 /// Decodes what [`encode_need_txns`] produced.
 pub fn decode_need_txns(buf: &[u8]) -> Result<Vec<u32>, String> {
     let mut r = Reader { rest: buf, shared: None };
-    let n = r.u32()? as usize;
-    let mut indices = Vec::with_capacity(n.min(1 << 20));
+    let n = r.count(4)?;
+    let mut indices = Vec::with_capacity(n);
     for _ in 0..n {
         indices.push(r.u32()?);
     }
@@ -178,9 +362,24 @@ impl<'a> Reader<'a> {
         let (a, b) = self.rest.split_at(n); self.rest = b; Ok(a)
     }
     fn u8(&mut self) -> Result<u8, String> { Ok(self.take(1)?[0]) }
+    fn flag(&mut self) -> Result<bool, String> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(format!("invalid boolean marker {other}")),
+        }
+    }
     fn u32(&mut self) -> Result<u32, String> { Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4"))) }
     fn u64(&mut self) -> Result<u64, String> { Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8"))) }
     fn b256(&mut self) -> Result<B256, String> { Ok(B256::from_slice(self.take(32)?)) }
+    /// Bounds a list by the bytes each element must occupy before allocating.
+    fn count(&mut self, minimum_bytes: usize) -> Result<usize, String> {
+        let n = self.u32()? as usize;
+        if n > self.rest.len() / minimum_bytes {
+            return Err("list count exceeds available bytes".into());
+        }
+        Ok(n)
+    }
     fn bytes(&mut self) -> Result<Bytes, String> {
         let n = self.u32()? as usize;
         let part = self.take(n)?;
@@ -279,6 +478,7 @@ pub fn decode_execution_data_shared(buf: &Bytes) -> Result<ExecutionData, String
 fn decode_with(mut r: Reader<'_>) -> Result<ExecutionData, String> {
     if r.u8()? != VERSION { return Err("unknown raw engine version".into()); }
     let kind = r.u8()?;
+    if !(1..=4).contains(&kind) { return Err(format!("unknown payload kind {kind}")); }
     let parent_hash = r.b256()?;
     let fee_recipient = Address::from_slice(r.take(20)?);
     let state_root = r.b256()?;
@@ -294,7 +494,7 @@ fn decode_with(mut r: Reader<'_>) -> Result<ExecutionData, String> {
     let block_hash = r.b256()?;
     let difficulty = U256::from_be_slice(r.take(32)?);
     let nonce = B64::from_slice(r.take(8)?);
-    let n = r.u32()? as usize;
+    let n = r.count(4)?;
     let mut transactions = Vec::with_capacity(n);
     for _ in 0..n { transactions.push(r.bytes()?); }
     let v1 = ExecutionPayloadV1 {
@@ -305,7 +505,7 @@ fn decode_with(mut r: Reader<'_>) -> Result<ExecutionData, String> {
     let payload = if kind == 1 {
         ExecutionPayload::V1(v1)
     } else {
-        let n = r.u32()? as usize;
+        let n = r.count(44)?;
         let mut withdrawals = Vec::with_capacity(n);
         for _ in 0..n {
             let index = r.u64()?; let validator_index = r.u64()?;
@@ -328,18 +528,18 @@ fn decode_with(mut r: Reader<'_>) -> Result<ExecutionData, String> {
             }
         }
     };
-    let cancun = if r.u8()? == 1 {
+    let cancun = if r.flag()? {
         let parent_beacon_block_root = r.b256()?;
-        let n = r.u32()? as usize;
+        let n = r.count(32)?;
         let mut versioned_hashes = Vec::with_capacity(n);
         for _ in 0..n { versioned_hashes.push(r.b256()?); }
         Some(CancunPayloadFields { parent_beacon_block_root, versioned_hashes })
     } else { None };
-    let prague = if r.u8()? == 1 {
-        let requests = if r.u8()? == 0 {
+    let prague = if r.flag()? {
+        let requests = if !r.flag()? {
             RequestsOrHash::Hash(r.b256()?)
         } else {
-            let n = r.u32()? as usize;
+            let n = r.count(4)?;
             let mut list = Vec::with_capacity(n);
             for _ in 0..n { list.push(r.bytes()?); }
             RequestsOrHash::Requests(Requests::new(list))
@@ -347,10 +547,12 @@ fn decode_with(mut r: Reader<'_>) -> Result<ExecutionData, String> {
         Some(PraguePayloadFields { requests })
     } else { None };
     let sidecar = match (cancun, prague) {
-        (None, _) => ExecutionPayloadSidecar::none(),
+        (None, None) => ExecutionPayloadSidecar::none(),
+        (None, Some(_)) => return Err("Prague sidecar without Cancun fields".into()),
         (Some(c), None) => ExecutionPayloadSidecar::v3(c),
         (Some(c), Some(p)) => ExecutionPayloadSidecar::v4(c, p),
     };
+    if !r.rest.is_empty() { return Err("execution data has trailing bytes".into()); }
     Ok(ExecutionData::new(payload, sidecar))
 }
 
@@ -440,6 +642,40 @@ const TAIL_CHAIN_HINT: u8 = 1;
 /// payload of its own: the tag is the request.
 const TAIL_WANT_HASHES: u8 = 2;
 
+/// The tag that asks for a [`reply::COMPACT_BUILT`] answer instead of the
+/// block (`N42_TAKE_COMPACT`). No payload of its own. An execution layer
+/// that predates it stops reading at the unknown tag and answers with the
+/// whole block, which the caller reads as ever.
+const TAIL_COMPACT_ANSWER: u8 = 3;
+
+/// The tag that tells the execution layer the proposer can do without the
+/// transaction hashes of a [`reply::COMPACT_BUILT`] answer when the block's
+/// frame layout covers it (`N42_ANSWER_LAYOUT_ONLY`). No payload of its own,
+/// and written last: an execution layer that predates it stops reading at the
+/// tag and answers with the hashes, which the decoder still accepts. The
+/// answer says for itself which shape it is (no hashes, a layout that sums
+/// to the block), so nothing else follows the request's mark.
+const TAIL_LAYOUT_ONLY: u8 = 4;
+
+/// A decoded build-on-own request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BuildOnOwn {
+    /// The sealed header of the block just built.
+    pub header: alloy_consensus::Header,
+    /// The attributes of the block to build on it.
+    pub attrs: PayloadAttributes,
+    /// The chain hint, when the request carried one.
+    pub chain: Option<ChainHint>,
+    /// Whether the answer should carry the transaction hashes.
+    pub want_hashes: bool,
+    /// Whether the answer may leave the transactions out
+    /// ([`reply::COMPACT_BUILT`]).
+    pub compact_answer: bool,
+    /// Whether a [`reply::COMPACT_BUILT`] answer may leave the hash list out
+    /// when the block's frame layout covers it.
+    pub layout_only: bool,
+}
+
 /// Encodes a build-on-own request: the sealed header of the block just built
 /// (RLP) and the attributes of the block to build on it.
 pub fn encode_build_on_own(header: &alloy_consensus::Header, attrs: &PayloadAttributes) -> Vec<u8> {
@@ -459,6 +695,36 @@ pub fn encode_build_on_own_chaining(
     attrs: &PayloadAttributes,
     chain: Option<ChainHint>,
     want_hashes: bool,
+) -> Vec<u8> {
+    encode_build_on_own_request(header, attrs, chain, want_hashes, false)
+}
+
+/// [`encode_build_on_own_chaining`], asking for a [`reply::COMPACT_BUILT`]
+/// answer when `compact_answer` is set (a tail after every other one).
+/// With it unset the frame is byte for byte the one
+/// [`encode_build_on_own_chaining`] has always written.
+pub fn encode_build_on_own_request(
+    header: &alloy_consensus::Header,
+    attrs: &PayloadAttributes,
+    chain: Option<ChainHint>,
+    want_hashes: bool,
+    compact_answer: bool,
+) -> Vec<u8> {
+    encode_build_on_own_request_layout(header, attrs, chain, want_hashes, compact_answer, false)
+}
+
+/// [`encode_build_on_own_request`], also telling the execution layer that a
+/// compact answer may carry the frame layout alone, without the hash list,
+/// when `layout_only` is set (a tag after every other one; meaningful only
+/// together with `compact_answer`). With it unset the frame is byte for byte
+/// the one [`encode_build_on_own_request`] writes.
+pub fn encode_build_on_own_request_layout(
+    header: &alloy_consensus::Header,
+    attrs: &PayloadAttributes,
+    chain: Option<ChainHint>,
+    want_hashes: bool,
+    compact_answer: bool,
+    layout_only: bool,
 ) -> Vec<u8> {
     let rlp = alloy_rlp::encode(header);
     let mut w = Writer(Vec::with_capacity(rlp.len() + 128 + attrs.withdrawals.as_ref().map_or(0, |w| w.len() * 44)));
@@ -497,6 +763,12 @@ pub fn encode_build_on_own_chaining(
     if want_hashes {
         w.u8(TAIL_WANT_HASHES);
     }
+    if compact_answer {
+        w.u8(TAIL_COMPACT_ANSWER);
+    }
+    if layout_only {
+        w.u8(TAIL_LAYOUT_ONLY);
+    }
     w.0
 }
 
@@ -505,16 +777,25 @@ pub fn encode_build_on_own_chaining(
 pub fn decode_build_on_own(
     buf: &[u8],
 ) -> Result<(alloy_consensus::Header, PayloadAttributes, Option<ChainHint>, bool), String> {
+    let request = decode_build_on_own_request(buf)?;
+    Ok((request.header, request.attrs, request.chain, request.want_hashes))
+}
+
+/// Decodes what [`encode_build_on_own_request`] produced, every tail
+/// included.
+pub fn decode_build_on_own_request(buf: &[u8]) -> Result<BuildOnOwn, String> {
     use alloy_rlp::Decodable;
     let mut r = Reader { rest: buf, shared: None };
     if r.u8()? != VERSION { return Err("unknown raw engine version".into()); }
     let rlp = r.bytes()?;
-    let header = alloy_consensus::Header::decode(&mut &rlp[..]).map_err(|e| format!("header: {e}"))?;
+    let mut cursor = &rlp[..];
+    let header = alloy_consensus::Header::decode(&mut cursor).map_err(|e| format!("header: {e}"))?;
+    if !cursor.is_empty() { return Err("header RLP has trailing bytes".into()); }
     let timestamp = r.u64()?;
     let prev_randao = r.b256()?;
     let suggested_fee_recipient = Address::from_slice(r.take(20)?);
-    let withdrawals = if r.u8()? == 1 {
-        let n = r.u32()? as usize;
+    let withdrawals = if r.flag()? {
+        let n = r.count(44)?;
         let mut list = Vec::with_capacity(n);
         for _ in 0..n {
             let index = r.u64()?; let validator_index = r.u64()?;
@@ -523,17 +804,21 @@ pub fn decode_build_on_own(
         }
         Some(list)
     } else { None };
-    let parent_beacon_block_root = if r.u8()? == 1 { Some(r.b256()?) } else { None };
-    let slot_number = if r.u8()? == 1 { Some(r.u64()?) } else { None };
-    let target_gas_limit = if r.u8()? == 1 { Some(r.u64()?) } else { None };
+    let parent_beacon_block_root = if r.flag()? { Some(r.b256()?) } else { None };
+    let slot_number = if r.flag()? { Some(r.u64()?) } else { None };
+    let target_gas_limit = if r.flag()? { Some(r.u64()?) } else { None };
     // The tail. Empty in every frame written before it existed, so its
     // absence is "no hint" rather than a truncated frame.
     let mut chain = None;
     let mut want_hashes = false;
+    let mut compact_answer = false;
+    let mut layout_only = false;
     while !r.rest.is_empty() {
         match r.u8()? {
-            TAIL_CHAIN_HINT => chain = Some(ChainHint { view: r.u64()?, chained: r.u8()? == 1 }),
+            TAIL_CHAIN_HINT => chain = Some(ChainHint { view: r.u64()?, chained: r.flag()? }),
             TAIL_WANT_HASHES => want_hashes = true,
+            TAIL_COMPACT_ANSWER => compact_answer = true,
+            TAIL_LAYOUT_ONLY => layout_only = true,
             // A tag from a newer peer. Its length is not known here, so
             // there is nothing to skip to: stop reading and keep what was
             // understood. Fields are only ever appended, so everything
@@ -541,7 +826,8 @@ pub fn decode_build_on_own(
             _ => break,
         }
     }
-    Ok((header, PayloadAttributes { timestamp, prev_randao, suggested_fee_recipient, withdrawals, parent_beacon_block_root, slot_number, target_gas_limit }, chain, want_hashes))
+    let attrs = PayloadAttributes { timestamp, prev_randao, suggested_fee_recipient, withdrawals, parent_beacon_block_root, slot_number, target_gas_limit };
+    Ok(BuildOnOwn { header, attrs, chain, want_hashes, compact_answer, layout_only })
 }
 
 /// Encodes a [`PayloadStatus`] for the channel.
@@ -563,7 +849,7 @@ pub fn encode_payload_status(status: &PayloadStatus) -> Vec<u8> {
 pub fn decode_payload_status(buf: &[u8]) -> Result<PayloadStatus, String> {
     let mut r = Reader { rest: buf, shared: None };
     let kind = r.u8()?;
-    let latest_valid_hash = if r.u8()? == 1 { Some(r.b256()?) } else { None };
+    let latest_valid_hash = if r.flag()? { Some(r.b256()?) } else { None };
     let error = String::from_utf8_lossy(&r.bytes()?).into_owned();
     let status = match kind {
         0 => PayloadStatusEnum::Valid,
@@ -572,6 +858,7 @@ pub fn decode_payload_status(buf: &[u8]) -> Result<PayloadStatus, String> {
         3 => PayloadStatusEnum::Accepted,
         other => return Err(format!("unknown payload status {other}")),
     };
+    if !r.rest.is_empty() { return Err("payload status has trailing bytes".into()); }
     Ok(PayloadStatus { status, latest_valid_hash })
 }
 
@@ -588,6 +875,64 @@ mod tests {
             transactions: vec![Bytes::from_static(&[0x02, 0x01]), Bytes::from_static(&[0xf8, 0x00, 0x11])],
             difficulty: U256::from(13), nonce: B64::repeat_byte(14),
         }
+    }
+
+    #[test]
+    fn truncated_lists_are_rejected_before_allocating_from_their_counts() {
+        let mut base = v1();
+        base.transactions.clear();
+        let v2 = ExecutionPayloadV2 { payload_inner: base.clone(), withdrawals: Vec::new() };
+        let v3 = ExecutionPayloadV3 { payload_inner: v2.clone(), blob_gas_used: 0, excess_blob_gas: 0 };
+        let cancun = CancunPayloadFields { parent_beacon_block_root: B256::ZERO, versioned_hashes: Vec::new() };
+        let cases = [
+            (ExecutionData::new(ExecutionPayload::V1(base), ExecutionPayloadSidecar::none()), 6),
+            (ExecutionData::new(ExecutionPayload::V2(v2), ExecutionPayloadSidecar::none()), 6),
+            (ExecutionData::new(ExecutionPayload::V3(v3.clone()), ExecutionPayloadSidecar::v3(cancun.clone())), 5),
+            (ExecutionData::new(ExecutionPayload::V3(v3), ExecutionPayloadSidecar::v4(cancun,
+                PraguePayloadFields { requests: RequestsOrHash::Requests(Requests::new(Vec::new())) })), 4),
+        ];
+        for (data, from_end) in cases {
+            let mut wire = encode_execution_data(&data);
+            assert!(decode_execution_data(&wire).is_ok());
+            let at = wire.len() - from_end;
+            wire[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(decode_execution_data(&wire).is_err());
+            assert!(decode_execution_data_shared(&Bytes::from(wire)).is_err());
+        }
+    }
+
+    #[test]
+    fn execution_data_rejects_unknown_kinds_and_trailing_bytes() {
+        let data = ExecutionData::new(ExecutionPayload::V1(v1()), ExecutionPayloadSidecar::none());
+        let wire = encode_execution_data(&data);
+        for kind in [0, 5, 255] {
+            let mut wrong = wire.clone();
+            wrong[1] = kind;
+            assert!(decode_execution_data(&wrong).is_err());
+        }
+        let mut padded = wire;
+        padded.push(0);
+        assert!(decode_execution_data(&padded).is_err());
+    }
+
+    #[test]
+    fn unknown_optional_markers_are_refused() {
+        let data = ExecutionData::new(ExecutionPayload::V1(v1()), ExecutionPayloadSidecar::none());
+        for from_end in [1, 2] {
+            for marker in [2, 255] {
+                let mut wire = encode_execution_data(&data);
+                let at = wire.len() - from_end;
+                wire[at] = marker;
+                assert!(decode_execution_data(&wire).is_err());
+            }
+        }
+        let status = PayloadStatus { status: PayloadStatusEnum::Valid, latest_valid_hash: None };
+        let mut wire = encode_payload_status(&status);
+        wire.push(0);
+        assert!(decode_payload_status(&wire).is_err());
+        wire.pop();
+        wire[1] = 2;
+        assert!(decode_payload_status(&wire).is_err());
     }
 
     #[test]
@@ -687,6 +1032,138 @@ mod tests {
         let mut padded = frame;
         padded.push(0);
         assert!(decode_need_txns(&padded).is_err());
+    }
+
+    fn compact_answer() -> CompactAnswer {
+        CompactAnswer {
+            header: alloy_consensus::Header {
+                number: 41,
+                gas_used: 3_423_000,
+                // Positional in RLP: a withdrawals root needs a base fee.
+                base_fee_per_gas: Some(7),
+                withdrawals_root: Some(B256::repeat_byte(4)),
+                extra_data: Bytes::from_static(&[9, 9]),
+                ..Default::default()
+            },
+            tx_count: 3,
+            withdrawals: vec![Withdrawal { index: 1, validator_index: 2, address: Address::repeat_byte(3), amount: 4 }],
+            requests: Some(vec![Bytes::from_static(&[0x01, 0x02])]),
+            block_access_list: Some(Bytes::from_static(&[0xc0])),
+            tx_hashes: vec![B256::repeat_byte(0xa1), B256::repeat_byte(0xa2), B256::repeat_byte(0xa3)],
+            frame_layout: vec![(B256::repeat_byte(0xf1), 2), (B256::repeat_byte(0xf2), 1)],
+        }
+    }
+
+    #[test]
+    fn a_compact_answer_round_trips_with_and_without_the_optional_parts() {
+        let full = compact_answer();
+        let bare = CompactAnswer {
+            withdrawals: Vec::new(),
+            requests: None,
+            block_access_list: None,
+            frame_layout: Vec::new(),
+            ..full.clone()
+        };
+        let empty = CompactAnswer { tx_count: 0, tx_hashes: Vec::new(), frame_layout: Vec::new(), ..bare.clone() };
+        for answer in [full, bare, empty] {
+            let encoded = encode_compact_answer(&answer);
+            assert_eq!(decode_compact_answer(&encoded).expect("decodes"), answer);
+            // No transaction bytes in it: the header, 32 bytes a hash and
+            // the small fields, whatever the block weighs.
+            assert!(encoded.len() < 1024 + answer.tx_hashes.len() * 32 + answer.frame_layout.len() * 36);
+        }
+    }
+
+    #[test]
+    fn a_malformed_compact_answer_is_refused() {
+        let encoded = encode_compact_answer(&compact_answer());
+        assert!(decode_compact_answer(&encoded[..encoded.len() - 1]).is_err(), "truncated");
+        let mut padded = encoded.clone();
+        padded.push(0);
+        assert!(decode_compact_answer(&padded).is_err(), "padded");
+        let mut wrong_version = encoded.clone();
+        wrong_version[0] = VERSION + 1;
+        assert!(decode_compact_answer(&wrong_version).is_err(), "unknown version");
+        // Hashes that do not number the block's transactions.
+        let short = CompactAnswer { tx_hashes: vec![B256::ZERO], ..compact_answer() };
+        assert!(decode_compact_answer(&encode_compact_answer(&short)).is_err());
+        // A frame layout that does not sum to them.
+        let layout = CompactAnswer { frame_layout: vec![(B256::ZERO, 2)], ..compact_answer() };
+        assert!(decode_compact_answer(&encode_compact_answer(&layout)).is_err());
+    }
+
+    /// `N42_ANSWER_LAYOUT_ONLY`: no hashes when the layout covers the block,
+    /// and nothing else accepted without them.
+    #[test]
+    fn a_layout_only_answer_round_trips_and_is_otherwise_strict() {
+        let answer = CompactAnswer { tx_hashes: Vec::new(), ..compact_answer() };
+        let encoded = encode_compact_answer(&answer);
+        assert_eq!(decode_compact_answer(&encoded).expect("decodes"), answer);
+        assert!(encoded.len() < encode_compact_answer(&compact_answer()).len());
+        // No hashes and no layout: not a block that can be described.
+        let bare = CompactAnswer { tx_hashes: Vec::new(), frame_layout: Vec::new(), ..compact_answer() };
+        assert!(decode_compact_answer(&encode_compact_answer(&bare)).is_err());
+        // A layout that does not cover the block.
+        let short = CompactAnswer { frame_layout: vec![(B256::ZERO, 2)], ..answer.clone() };
+        assert!(decode_compact_answer(&encode_compact_answer(&short)).is_err());
+        let long = CompactAnswer { frame_layout: vec![(B256::ZERO, 2), (B256::ZERO, 2)], ..answer };
+        assert!(decode_compact_answer(&encode_compact_answer(&long)).is_err());
+    }
+
+    #[test]
+    fn the_layout_only_mark_is_a_last_tag_and_off_is_the_old_frame() {
+        let header = alloy_consensus::Header { number: 41, ..Default::default() };
+        let attrs = PayloadAttributes {
+            timestamp: 1_700_000_000,
+            prev_randao: B256::repeat_byte(5),
+            suggested_fee_recipient: Address::repeat_byte(6),
+            withdrawals: Some(Vec::new()),
+            parent_beacon_block_root: Some(B256::repeat_byte(7)),
+            slot_number: None,
+            target_gas_limit: None,
+        };
+        let hint = Some(ChainHint { view: 7, chained: true });
+        let old = encode_build_on_own_request(&header, &attrs, hint, true, true);
+        assert_eq!(encode_build_on_own_request_layout(&header, &attrs, hint, true, true, false), old);
+        let marked = encode_build_on_own_request_layout(&header, &attrs, hint, true, true, true);
+        assert_eq!(&marked[..old.len()], &old[..]);
+        assert_eq!(marked.len(), old.len() + 1);
+        let request = decode_build_on_own_request(&marked).expect("decodes");
+        assert!(request.layout_only && request.compact_answer && request.want_hashes);
+        assert!(!decode_build_on_own_request(&old).expect("decodes").layout_only);
+        // A reader that predates the tag stops at it and keeps the rest.
+        assert_eq!(decode_build_on_own(&marked).expect("decodes"), (header, attrs, hint, true));
+    }
+
+    #[test]
+    fn the_compact_answer_tail_only_appends_and_off_is_the_old_frame() {
+        let header = alloy_consensus::Header { number: 41, ..Default::default() };
+        let attrs = PayloadAttributes {
+            timestamp: 1_700_000_000,
+            prev_randao: B256::repeat_byte(5),
+            suggested_fee_recipient: Address::repeat_byte(6),
+            withdrawals: Some(Vec::new()),
+            parent_beacon_block_root: Some(B256::repeat_byte(7)),
+            slot_number: None,
+            target_gas_limit: None,
+        };
+        let hint = Some(ChainHint { view: 7, chained: false });
+        for (chain, hashes) in [(None, false), (None, true), (hint, true)] {
+            // Off: byte for byte what the frame has always been.
+            let old = encode_build_on_own_chaining(&header, &attrs, chain, hashes);
+            assert_eq!(encode_build_on_own_request(&header, &attrs, chain, hashes, false), old);
+            let request = decode_build_on_own_request(&old).expect("decodes");
+            assert!(!request.compact_answer);
+            // On: the same frame and one tag after it.
+            let compact = encode_build_on_own_request(&header, &attrs, chain, hashes, true);
+            assert_eq!(&compact[..old.len()], &old[..]);
+            assert_eq!(compact.len(), old.len() + 1);
+            let request = decode_build_on_own_request(&compact).expect("decodes");
+            assert_eq!((request.header, request.attrs, request.chain, request.want_hashes, request.compact_answer),
+                (header.clone(), attrs.clone(), chain, hashes, true));
+            // The old decoder reads every other field of it unchanged.
+            assert_eq!(decode_build_on_own(&compact).expect("decodes"), (header.clone(), attrs.clone(), chain, hashes));
+        }
     }
 
     #[test]

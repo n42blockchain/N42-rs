@@ -133,8 +133,11 @@ impl TxAltSig {
     }
 
     /// Decodes the unsigned fields from the front of a list payload.
-    fn decode_fields(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        Ok(Self {
+    /// The unsigned fields with `pubkey` left empty, and the public key's raw
+    /// bytes (what `Bytes`' RLP decoding would copy): the caller places the
+    /// key ([`shared_key_and_signature`]).
+    fn decode_fields<'a>(buf: &mut &'a [u8]) -> alloy_rlp::Result<(Self, &'a [u8])> {
+        let tx = Self {
             chain_id: Decodable::decode(buf)?,
             nonce: Decodable::decode(buf)?,
             max_priority_fee_per_gas: Decodable::decode(buf)?,
@@ -145,8 +148,10 @@ impl TxAltSig {
             input: Decodable::decode(buf)?,
             access_list: Decodable::decode(buf)?,
             alg_type: Decodable::decode(buf)?,
-            pubkey: Decodable::decode(buf)?,
-        })
+            pubkey: Bytes::new(),
+        };
+        let pubkey = Header::decode_bytes(buf, false)?;
+        Ok((tx, pubkey))
     }
 
     /// The hash the signature is over:
@@ -305,17 +310,40 @@ impl AltSigTx {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let remaining = buf.len();
-        let tx = TxAltSig::decode_fields(buf)?;
-        let signature: Bytes = Decodable::decode(buf)?;
+        let (mut tx, pubkey) = TxAltSig::decode_fields(buf)?;
+        let signature = Header::decode_bytes(buf, false)?;
         if remaining - buf.len() != header.payload_length {
             return Err(alloy_rlp::Error::UnexpectedLength);
         }
+        let (pubkey, signature) = shared_key_and_signature(pubkey, signature);
+        tx.pubkey = pubkey;
         let consumed = original.len() - buf.len();
         let mut hasher = Keccak256::new();
         hasher.update([ALT_SIG_TX_TYPE_ID]);
         hasher.update(&original[..consumed]);
         Ok(Self { tx, signature, hash: hasher.finalize() })
     }
+}
+
+/// A decoded transaction's public key and signature, copied into one
+/// reference-counted buffer and handed out as two slices of it.
+///
+/// Decoded one at a time each would be a `Vec`-backed `Bytes`, whose first
+/// clone allocates a shared header and swaps it in (`bytes`'
+/// `shallow_clone_vec`): the block body's copy of every pooled transaction
+/// paid two of those on the build pool (8% of it in the loop314 profile).
+/// Here the buffer is shared from the start, one allocation for both parts,
+/// and every clone is a reference-count increment. The contents, and so
+/// equality, hashing and encoding, are unchanged.
+fn shared_key_and_signature(pubkey: &[u8], signature: &[u8]) -> (Bytes, Bytes) {
+    if pubkey.is_empty() && signature.is_empty() {
+        return (Bytes::new(), Bytes::new());
+    }
+    let mut joint = Vec::with_capacity(pubkey.len() + signature.len());
+    joint.extend_from_slice(pubkey);
+    joint.extend_from_slice(signature);
+    let joint = bytes::Bytes::from_owner(joint);
+    (Bytes(joint.slice(..pubkey.len())), Bytes(joint.slice(pubkey.len()..)))
 }
 
 /// `s < L` for the Ed25519 group order `L`, little-endian.
@@ -442,15 +470,17 @@ fn batch_equation_holds(messages: &[&[u8]], signatures: &[EdSignature], keys: &[
         })
         .collect();
     let base_coefficient: Scalar = s_values.iter().zip(&zs).map(|(s, z)| z * s).sum();
-    let mut key_bytes: Vec<&[u8; 32]> = Vec::new();
+    // Preserve first-seen point order, while avoiding a quadratic scan for
+    // batches in which every transaction belongs to a different sender.
+    let mut key_indices = std::collections::HashMap::with_capacity(keys.len());
     let mut key_points: Vec<EdwardsPoint> = Vec::new();
     let mut key_coefficients: Vec<Scalar> = Vec::new();
     for ((key, hram), z) in keys.iter().zip(&hrams).zip(&zs) {
         let term = Scalar::from_bytes_mod_order_wide(hram) * z;
-        match key_bytes.iter().position(|seen| *seen == key.as_bytes()) {
-            Some(at) => key_coefficients[at] += term,
-            None => {
-                key_bytes.push(key.as_bytes());
+        match key_indices.entry(*key.as_bytes()) {
+            std::collections::hash_map::Entry::Occupied(entry) => key_coefficients[*entry.get()] += term,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(key_points.len());
                 key_points.push(key.to_edwards());
                 key_coefficients.push(term);
             }
@@ -689,6 +719,85 @@ mod merged_batch_tests {
         merged
     }
 
+    fn decoded(tx: &AltSigTx) -> AltSigTx {
+        let mut encoded = Vec::new();
+        tx.encode_2718(&mut encoded);
+        AltSigTx::decode_2718_exact(&encoded).expect("decodes")
+    }
+
+    #[test]
+    fn decoded_key_and_signature_share_one_buffer_and_keep_their_bytes() {
+        let tx = signed(5, 9);
+        let back = decoded(&tx);
+        assert_eq!(back, tx);
+        assert_eq!(back.tx.pubkey, tx.tx.pubkey);
+        assert_eq!(back.signature, tx.signature);
+        assert_eq!(back.hash(), tx.hash());
+        assert_eq!(back.recover_signer().ok(), tx.recover_signer().ok());
+        // Adjacent slices of one buffer.
+        assert_eq!(back.tx.pubkey.as_ptr().wrapping_add(back.tx.pubkey.len()), back.signature.as_ptr());
+        let mut again = Vec::new();
+        back.encode_2718(&mut again);
+        let mut original = Vec::new();
+        tx.encode_2718(&mut original);
+        assert_eq!(again, original);
+    }
+
+    /// `cargo test -p n42-tx-types --release --lib -- --ignored --nocapture
+    /// body_clone_bench`: cloning 163,000 transactions the way the block body
+    /// copies them, with `Vec`-backed key and signature (the decode before)
+    /// against the shared buffer (the decode now). Each clone is dropped
+    /// after the pass, as the body is.
+    #[test]
+    #[ignore = "timing; run by hand in release"]
+    fn body_clone_bench() {
+        let one = signed(3, 1);
+        let n = 163_000;
+        let vec_backed = || {
+            let mut tx = decoded(&one);
+            tx.tx.pubkey = Bytes::copy_from_slice(&tx.tx.pubkey);
+            tx.signature = Bytes::copy_from_slice(&tx.signature);
+            tx
+        };
+        let mut best = [u128::MAX; 2];
+        for _ in 0..10 {
+            for (which, make) in [&vec_backed as &dyn Fn() -> AltSigTx, &|| decoded(&one)].into_iter().enumerate() {
+                let pool: Vec<AltSigTx> = (0..n).map(|_| make()).collect();
+                let at = std::time::Instant::now();
+                let body: Vec<AltSigTx> = pool.iter().cloned().collect();
+                best[which] = best[which].min(at.elapsed().as_micros());
+                drop(body);
+            }
+        }
+        println!("body clone of {n}: vec-backed {} us, shared {} us", best[0], best[1]);
+    }
+
+    /// `cargo test -p n42-tx-types --release --lib [--features
+    /// alloy-primitives/asm-keccak] -- --ignored --nocapture keccak_bench`:
+    /// the admission's hashes -- a 0x50 transaction's hash over its encoding
+    /// and a frame root's 64-byte node -- with whichever Keccak backend the
+    /// build selected. The digests are printed so two builds can be compared.
+    #[test]
+    #[ignore = "timing; run by hand in release"]
+    fn keccak_bench() {
+        let mut encoded = Vec::new();
+        signed(7, 3).encode_2718(&mut encoded);
+        let node = [0x5au8; 64];
+        let n = 1_000_000u32;
+        for (what, input) in [("tx encoding", encoded.as_slice()), ("64-byte node", &node[..])] {
+            let mut digest = keccak256(input);
+            let at = std::time::Instant::now();
+            for _ in 0..n {
+                digest = keccak256(core::hint::black_box(input));
+            }
+            let took = at.elapsed();
+            let mut hasher = Keccak256::new();
+            hasher.update(input);
+            assert_eq!(hasher.finalize(), digest);
+            println!("{what} ({} B): {:.1} ns a hash, digest {digest}", input.len(), took.as_nanos() as f64 / f64::from(n));
+        }
+    }
+
     #[test]
     fn merged_batch_verdicts_match_ed25519_dalek() {
         let one_sender: Vec<AltSigTx> = (0..128).map(|nonce| signed(7, nonce)).collect();
@@ -698,6 +807,12 @@ mod merged_batch_tests {
         let five_senders: Vec<AltSigTx> = (0..64u64).map(|nonce| signed((nonce % 5) as u8 + 1, nonce)).collect();
         let (hashes, signatures, keys) = parts(&five_senders);
         assert!(verdict(&hashes, &signatures, &keys), "five senders interleaved");
+
+        let distinct: Vec<AltSigTx> = (1..=255u8).map(|seed| signed(seed, u64::from(seed))).collect();
+        let (hashes, signatures, keys) = parts(&distinct);
+        assert!(verdict(&hashes, &signatures, &keys), "all distinct senders");
+        let refs: Vec<&AltSigTx> = distinct.iter().collect();
+        assert_eq!(verify_batch(&refs), distinct.iter().map(AltSigTx::verify).collect::<Vec<_>>());
 
         let (mut swapped, signatures, keys) = parts(&five_senders);
         swapped.swap(3, 4);

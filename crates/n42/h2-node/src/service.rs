@@ -230,6 +230,25 @@ pub struct H2Service<E> {
     /// Round 1 votes of the validators outside the quorum before proposing
     /// the next block (see [`Self::with_straggler_grace`]). `None`: not at all.
     straggler_grace: Option<Duration>,
+    /// Which voters the grace waits for (`N42_STRAGGLER_RULE`; see
+    /// [`crate::straggler`]). `All` is the grace as it always was.
+    straggler_rule: crate::straggler::StragglerRule,
+    /// The quorum rule's state (given-up voters, the measured cycle).
+    quorum_rule: crate::straggler::QuorumRule,
+    /// The view the straggler rule last deferred, and when that view's
+    /// predecessor was decided: what the "proposal sent" line's
+    /// `straggler_wait_us` is measured from.
+    straggler_wait: Option<(u64, std::time::Instant)>,
+    /// Proposals the straggler rule deferred at least once (cumulative).
+    straggler_waits: u64,
+    /// Votes straight to the leader (`N42_VOTE_TRANSPORT`; see
+    /// [`crate::direct_votes`]).
+    direct_votes: crate::direct_votes::DirectVotes,
+    /// This validator's hello, signed once.
+    vote_hello: Option<[u8; 96]>,
+    /// The leader's build throttle (see [`crate::build_throttle`] and
+    /// [`Self::with_build_throttle`]). `None`: off, the default.
+    build_throttle: Option<crate::build_throttle::BuildThrottle>,
     /// The last transport drain's split: poll ms, handle ms, slowest handle
     /// ms and its event kind (see `drain_transport`).
     last_drain: (u64, u64, u64, &'static str),
@@ -359,11 +378,25 @@ pub struct H2Service<E> {
     /// sent" line measures the next build's start from
     /// (`build_start_after_prev_send_us`).
     last_proposal_sent_at: Option<std::time::Instant>,
+    /// Proposals sent since start by what started their build: seal, send,
+    /// commit, other (`build_start_trigger`). A "send" start is a build the
+    /// one-ahead rule held until the previous proposal went out
+    /// (`docs/SHARED_EXECUTION_SCOPE.md` 18.4); the "proposal sent" line
+    /// carries the running counts so a leg reads its share from the last
+    /// line instead of a join.
+    build_start_counts: [u64; 4],
     body_requested_at: std::collections::HashMap<B256, std::time::Instant>,
     body_requested_order: std::collections::VecDeque<B256>,
     /// Height of the last block the execution layer is known to have
     /// imported, once read; what "far ahead" is measured from.
     imported_height: Option<u64>,
+    /// When the layer's height was last read for a held block; one forced
+    /// read every [`HELD_TOO_LONG`] at most.
+    last_forced_layer_read: Option<std::time::Instant>,
+    /// Keys that stopped voting, as this node sees them when it leads.
+    silent_keys: SilentKeys,
+    /// The view whose votes `silent_keys` last looked at.
+    silent_checked_view: Option<u64>,
     /// Bodies held back because they run far ahead of the execution layer:
     /// on a block more than 32 past its tip reth starts a backfill it has
     /// no peers for and answers every forkchoice with SYNCING from then on.
@@ -416,6 +449,14 @@ pub struct H2Service<E> {
     /// insertion order in `body_store_order`.
     body_store: std::collections::HashMap<B256, crate::body_channel::BodyBuf>,
     body_store_order: Vec<B256>,
+    /// Blocks this node built and took from its execution layer without
+    /// their transactions (`N42_TAKE_COMPACT`): the sealed header and the
+    /// access list, which with the body fetched on demand
+    /// ([`ExecutionLayer::own_block_body`]) make the gov5 body a peer asking
+    /// by hash is served. Such a block is not in `body_store` until a peer
+    /// asks. Bounded like the store; insertion order in `elided_order`.
+    elided_own: std::collections::HashMap<B256, (Header, Option<alloy_primitives::Bytes>)>,
+    elided_order: std::collections::VecDeque<B256>,
     /// Timestamps of blocks this node has seen the body of, for
     /// [`ProposalContext::head_timestamp`]. Bounded; insertion order in
     /// `timestamp_order`.
@@ -520,6 +561,35 @@ const MAX_PENDING_RANGES: usize = 8;
 /// closed is worse than the stall; `imported_height` is `None` until the first
 /// import, so this is simply inert until it can be right.
 const FAR_AHEAD_BLOCKS: u64 = 1;
+
+/// Parses `N42_FAR_AHEAD_BLOCKS`: an integer in `1..=8`, else the default
+/// [`FAR_AHEAD_BLOCKS`] (an invalid value is logged).
+fn far_ahead_blocks_from(value: Option<&str>) -> u64 {
+    let Some(text) = value else { return FAR_AHEAD_BLOCKS };
+    match text.trim().parse::<u64>() {
+        Ok(n) if (1..=8).contains(&n) => n,
+        _ => {
+            warn!(target: "n42.h2.node", value = text, "invalid N42_FAR_AHEAD_BLOCKS (want 1..=8); keeping the default");
+            FAR_AHEAD_BLOCKS
+        }
+    }
+}
+
+/// How far a block may run ahead of the execution layer's tip before it is
+/// held, read once from `N42_FAR_AHEAD_BLOCKS` (default [`FAR_AHEAD_BLOCKS`]).
+///
+/// At depth-2 deferred execution (header N carries the execution of N-2) a
+/// voted block is legitimately two ahead of the tip once votes no longer wait
+/// for imports (`N42_CHECK_BEFORE_SLOT=1`), so the default of one holds it and
+/// defeats the check-ahead. See docs/SHARED_EXECUTION_SCOPE.md section 20 and
+/// docs/BREAKTHROUGH_DESIGN.md 10.98.
+static FAR_AHEAD_LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// The effective far-ahead limit.
+fn far_ahead_limit() -> u64 {
+    *FAR_AHEAD_LIMIT
+        .get_or_init(|| far_ahead_blocks_from(std::env::var("N42_FAR_AHEAD_BLOCKS").ok().as_deref()))
+}
 /// Bodies held back at most; the oldest go first.
 /// How many gossiped transactions go to the forwarder in one handoff.
 const TX_FORWARD_MAX: usize = 1000;
@@ -569,6 +639,54 @@ fn encode_own_body(
         _ => None,
     };
     n42_h2_net::encode_block_rlp_raw(header, &execution.payload.as_v1().transactions, &rewards, bal.as_ref())
+}
+
+/// The compact body of a block this node built, made without its
+/// transactions: the gov5 body with an empty transaction list carries the
+/// same header, verifiers, rewards and access list as the whole one, and the
+/// compact encoders step over the transaction list without reading it -- so
+/// this is byte for byte what `publish_body` makes of the whole block.
+fn elided_compact_body(
+    execution: &alloy_rpc_types_engine::ExecutionData,
+    header: &alloy_consensus::Header,
+    tx_count: usize,
+    tx_hashes: &[B256],
+    frame_layout: &[(B256, u32)],
+    profile: HeaderProfile,
+) -> Result<Vec<u8>, n42_h2_consensus::BlockBodyError> {
+    elided_compact_body_with(
+        n42_tx_types::frame_blocks_requested(),
+        execution,
+        header,
+        tx_count,
+        tx_hashes,
+        frame_layout,
+        profile,
+    )
+}
+
+/// [`elided_compact_body`] with the frame-blocks switch given. Under frame
+/// blocks only the layout is read: the hash list may be empty
+/// (`N42_ANSWER_LAYOUT_ONLY`) and the bytes are the same as with it full.
+/// Without them the hashes are the body, and a list that does not number the
+/// block's transactions is refused rather than published as a block of none.
+fn elided_compact_body_with(
+    frame_blocks: bool,
+    execution: &alloy_rpc_types_engine::ExecutionData,
+    header: &alloy_consensus::Header,
+    tx_count: usize,
+    tx_hashes: &[B256],
+    frame_layout: &[(B256, u32)],
+    profile: HeaderProfile,
+) -> Result<Vec<u8>, n42_h2_consensus::BlockBodyError> {
+    let skeleton = encode_own_body(execution, header);
+    if frame_blocks && !frame_layout.is_empty() {
+        n42_h2_consensus::encode_compact_frame_body(&skeleton, frame_layout, profile)
+    } else if tx_hashes.len() != tx_count {
+        Err(n42_h2_consensus::BlockBodyError::InvalidRlp)
+    } else {
+        n42_h2_consensus::encode_compact_body(&skeleton, tx_hashes, profile)
+    }
 }
 
 /// Between one broadcast request for a block's body and the next.
@@ -900,17 +1018,70 @@ const fn head_stamp(remembered: Option<u64>, header: Option<&Header>) -> Option<
 /// arrives while its parent is still executing. Two is a block whose parent
 /// this node has not even started, and sending it would make the engine
 /// backfill from peers it does not have.
-const fn runs_far_ahead(number: u64, tip: u64) -> bool {
-    number > tip + FAR_AHEAD_BLOCKS
+fn runs_far_ahead(number: u64, tip: u64) -> bool {
+    number > tip + far_ahead_limit()
 }
 
-/// The execution layer's height from the two things that know it: the head
-/// the driver has moved to, and the highest block whose import is in flight.
-const fn tip_of(head: Option<u64>, in_flight: Option<u64>) -> Option<u64> {
-    match (head, in_flight) {
-        (Some(a), Some(b)) => Some(if a > b { a } else { b }),
-        (Some(a), None) => Some(a),
-        (None, b) => b,
+/// The execution layer's height from the three things that know it: the head
+/// the driver has moved to, the highest block whose import is in flight, and
+/// the height last read from the layer itself.
+///
+/// The layer read counts because with many keys sharing one layer (E=1) the
+/// layer is ahead of this key's own driver, and a key that missed the first
+/// blocks would otherwise hold every later block as "far ahead" forever.
+const fn tip_of(head: Option<u64>, in_flight: Option<u64>, layer: Option<u64>) -> Option<u64> {
+    const fn higher(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(if a > b { a } else { b }),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        }
+    }
+    higher(higher(head, in_flight), layer)
+}
+
+/// How many consecutive views a key may go without a verified vote before the
+/// leader names it.
+const SILENT_KEY_VIEWS: u64 = 16;
+
+/// The leader's record of when each validator key last voted, to name a key
+/// that has been silent for [`SILENT_KEY_VIEWS`] views: once per episode.
+#[derive(Debug, Default)]
+struct SilentKeys {
+    /// The first view observed; a key never seen is silent from here.
+    since: Option<u64>,
+    last_voted: std::collections::HashMap<u32, u64>,
+    warned: HashSet<u32>,
+}
+
+impl SilentKeys {
+    /// Looks at `view` (whose votes have had time to arrive) and returns the
+    /// keys that have just become silent, with their silent view count.
+    fn observe(
+        &mut self,
+        view: u64,
+        validators: u32,
+        me: u32,
+        last_seen: impl Fn(u32) -> Option<u64>,
+    ) -> Vec<(u32, u64)> {
+        let since = *self.since.get_or_insert(view);
+        let mut silent = Vec::new();
+        for voter in (0..validators).filter(|v| *v != me) {
+            if let Some(seen) = last_seen(voter) {
+                let known = self.last_voted.entry(voter).or_insert(seen);
+                *known = (*known).max(seen);
+            }
+            let last = self.last_voted.get(&voter).copied().unwrap_or(since);
+            let gap = view.saturating_sub(last);
+            if gap >= SILENT_KEY_VIEWS {
+                if self.warned.insert(voter) {
+                    silent.push((voter, gap));
+                }
+            } else {
+                self.warned.remove(&voter);
+            }
+        }
+        silent
     }
 }
 
@@ -933,12 +1104,13 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// without it the loop sees nothing the engine produces.
     pub fn new(
         transport: H2V4Transport,
-        engine: ConsensusEngine,
+        mut engine: ConsensusEngine,
         mut driver: ExecutionDriver<E>,
         outputs: mpsc::Receiver<EngineOutput>,
         validator_count: usize,
     ) -> Self {
         let identity = transport.identity();
+        engine.set_vote_aggregate(vote_aggregate_from_env());
         // How a body this node kept as bytes becomes a payload, for the
         // fallback when the execution layer will not take the bytes. The
         // transactions are slices of the body rather than copies: the body
@@ -973,6 +1145,13 @@ impl<E: ExecutionLayer> H2Service<E> {
             block_pacing: None,
             declined_view: None,
             straggler_grace: None,
+            straggler_rule: crate::straggler::StragglerRule::from_env(),
+            quorum_rule: crate::straggler::QuorumRule::default(),
+            straggler_wait: None,
+            straggler_waits: 0,
+            direct_votes: crate::direct_votes::DirectVotes::new(crate::direct_votes::VoteTransport::from_env()),
+            vote_hello: None,
+            build_throttle: None,
             last_drain: (0, 0, 0, ""),
             proposed_view: None,
             meshed: false,
@@ -1004,9 +1183,13 @@ impl<E: ExecutionLayer> H2Service<E> {
             build_on_seal: std::env::var("N42_BUILD_ON_SEAL").is_ok_and(|v| v != "0"),
             first_on_output_view: None,
             last_proposal_sent_at: None,
+            build_start_counts: [0; 4],
             body_requested_at: std::collections::HashMap::new(),
             body_requested_order: std::collections::VecDeque::new(),
             imported_height: None,
+            last_forced_layer_read: None,
+            silent_keys: SilentKeys::default(),
+            silent_checked_view: None,
             held_bodies: Vec::new(),
             held_since: std::collections::HashMap::new(),
             held_warned: HashSet::new(),
@@ -1027,6 +1210,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             pending_ranges: Vec::new(),
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
+            elided_own: std::collections::HashMap::new(),
+            elided_order: std::collections::VecDeque::new(),
             block_timestamps: std::collections::HashMap::new(),
             inbound_transactions: std::collections::VecDeque::new(),
             outbound_transactions: None,
@@ -1172,6 +1357,31 @@ impl<E: ExecutionLayer> H2Service<E> {
         // The followers' side of it: a block imported after its view passed
         // still tells that view's leader (a progress vote, not a vote).
         self.engine.set_progress_votes(self.straggler_grace.is_some());
+        self
+    }
+
+    /// Verifies votes in same-message batches at each transport drain's end
+    /// instead of one pairing per vote (`N42_VOTE_AGGREGATE_VERIFY=1`, read
+    /// by [`Self::new`]; see `n42_h2_consensus`'s `vote_batch`). Local: the
+    /// wire and what a vote attests are unchanged.
+    pub fn with_vote_aggregate(mut self, on: bool) -> Self {
+        self.engine.set_vote_aggregate(on);
+        self
+    }
+
+    /// Chooses how votes travel (`N42_VOTE_TRANSPORT`, read by
+    /// [`Self::new`]); see [`crate::direct_votes`].
+    pub fn with_vote_transport(mut self, mode: crate::direct_votes::VoteTransport) -> Self {
+        self.direct_votes = crate::direct_votes::DirectVotes::new(mode);
+        self
+    }
+
+    /// Holds this leader's proposals back while its execution layer carries
+    /// too many unpersisted blocks (see [`crate::build_throttle`]). Local
+    /// policy: the protocol and the wire are untouched, and a held leader
+    /// keeps voting and importing.
+    pub fn with_build_throttle(mut self, throttle: crate::build_throttle::BuildThrottle) -> Self {
+        self.build_throttle = Some(throttle);
         self
     }
 
@@ -1538,6 +1748,20 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
                 None => break,
             }
+        }
+        // The swarm's cost on this view's timing line: off the loop, what its
+        // own task spent polling and how deep the inbound queue got; inline,
+        // this drain's polls.
+        let (queue_max, task_poll_us) = self.transport.take_loop_stats();
+        let poll_us = if self.transport.is_off_loop() { task_poll_us } else { poll.as_micros() as u64 };
+        self.engine.note_transport(queue_max, poll_us);
+        // The drain boundary: the votes it queued are verified as batches.
+        if self.engine.vote_aggregate() {
+            let at = std::time::Instant::now();
+            if let Err(err) = self.engine.flush_votes() {
+                debug!(target: "n42.h2.node", %err, "engine rejected a vote batch");
+            }
+            handle += at.elapsed();
         }
         self.last_drain = (poll.as_millis() as u64, handle.as_millis() as u64, slowest.0.as_millis() as u64, slowest.1);
         let _ = events;
@@ -2045,6 +2269,26 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             TransportEvent::PeerConnected(peer) => {
                 debug!(target: "n42.h2.node", %peer, "peer connected");
+                self.send_vote_hello(peer);
+            }
+            TransportEvent::PeerDisconnected(peer) => {
+                self.direct_votes.forget_peer(&peer);
+            }
+            TransportEvent::VoteHello { peer, index, signature } => {
+                let verified = n42_h2_primitives::BlsSignature::from_bytes(&signature).is_ok_and(|signature| {
+                    self.engine
+                        .verify_vote_hello(index, self.identity.genesis_hash, &peer.to_bytes(), &signature)
+                });
+                if verified {
+                    debug!(target: "n42.h2.node", %peer, index, "validator announced for direct votes");
+                    self.direct_votes.learn(index, peer);
+                } else {
+                    debug!(target: "n42.h2.node", %peer, index, "vote hello did not verify; ignored");
+                }
+            }
+            TransportEvent::DirectVote { inner, .. } => {
+                self.direct_votes.note_direct();
+                return self.handle_transport_event_inner(*inner);
             }
             TransportEvent::Rejected { reason, .. } => {
                 debug!(target: "n42.h2.node", reason, "dropped a gossip payload");
@@ -2064,6 +2308,17 @@ impl<E: ExecutionLayer> H2Service<E> {
                 if trace_messages() {
                     info!(target: "n42.h2.trace", kind = message_kind(&message), view = message.view(), "recv");
                 }
+                // A vote that came by both paths reaches the engine once
+                // (only while direct votes are in use; see `direct_votes`).
+                if !self.direct_votes.admit(&message) {
+                    return;
+                }
+                // `N42_VOTE_AGGREGATE_VERIFY`: a vote waits for its batch,
+                // verified at the end of this drain (`flush_votes`). With the
+                // switch off every message comes straight back.
+                let Some(message) = self.engine.queue_vote(message) else {
+                    return;
+                };
                 // A message that fails the engine's own checks is a
                 // peer problem, not a local one: log it and keep the
                 // node running rather than taking the fleet's word for
@@ -2098,6 +2353,11 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.consider_catch_up(events).await;
         self.import_ranges(events).await;
         for (peer, hash, channel) in std::mem::take(&mut self.pending_block_requests) {
+            if let Some(body) = self.elided_body(hash).await {
+                debug!(target: "n42.h2.node", peer, ?hash, "peer asked for a block taken elided; body fetched from the execution layer");
+                self.transport.respond_block(channel, Some(body));
+                continue;
+            }
             let body = match self.driver.execution_layer().block_by_hash(hash).await {
                 Ok(Some(block)) => Some(alloy_primitives::Bytes::from(n42_h2_net::encode_block_rlp_raw(
                     &block.header,
@@ -2118,6 +2378,18 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.respond_served_txns(served);
         }
         for (request, channel) in std::mem::take(&mut self.pending_txns_requests) {
+            if let Some(body) = self.elided_body(request.hash).await {
+                let reply = fill_from_body(&body, self.header_profile, &request);
+                debug!(
+                    target: "n42.h2.node",
+                    hash = ?request.hash,
+                    wanted = request.indices.len(),
+                    served = reply.as_ref().map(Vec::len).unwrap_or(0),
+                    "peer asked for named transactions of a block taken elided; body fetched from the execution layer"
+                );
+                self.transport.respond_block_txns(channel, reply);
+                continue;
+            }
             let reply = match self.driver.execution_layer().block_by_hash(request.hash).await {
                 Ok(Some(block)) => request
                     .indices
@@ -2157,6 +2429,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         // could not do at the time. Through the same path as the original
         // request, so the resulting BlockImported reaches the engine the same
         // way.
+        self.refresh_layer_for_held().await;
         for block_hash in std::mem::take(&mut self.held_bodies) {
             if self.far_ahead(block_hash) {
                 self.held_bodies.push(block_hash);
@@ -2280,9 +2553,11 @@ impl<E: ExecutionLayer> H2Service<E> {
             // over the same topic as everything else, and the leader picks it
             // out. Treating these differently would mean inventing a channel
             // gov5 does not have.
-            EngineOutput::BroadcastMessage(message)
-            | EngineOutput::SendToValidator(_, message) => {
+            EngineOutput::BroadcastMessage(message) => {
                 self.publish(message, events);
+            }
+            EngineOutput::SendToValidator(target, message) => {
+                self.send_to_validator(target, message, events);
             }
             EngineOutput::BlockCommitted {
                 view,
@@ -2548,6 +2823,12 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// builder declined this view for the pacing and the tick is still ahead.
     fn deferred_pacing_tick(&self) -> Option<tokio::time::Instant> {
         let view = self.engine.current_view();
+        // A proposal the build throttle holds wakes at the throttle's target
+        // (or at the ordinary re-ask, which re-reads the count, if sooner).
+        if self.proposal_deferred && self.defer_reason == Some(crate::build_throttle::THROTTLE_REASON) {
+            let at = self.build_throttle.as_ref()?.wake_for(view)?;
+            return (at > std::time::Instant::now()).then(|| tokio::time::Instant::from_std(at));
+        }
         if !self.proposal_deferred
             || self.declined_view != Some(view)
             || self.defer_reason != Some("the attribute builder declined")
@@ -2560,22 +2841,115 @@ impl<E: ExecutionLayer> H2Service<E> {
         (tick > std::time::Instant::now()).then(|| tokio::time::Instant::from_std(tick))
     }
 
+    /// The quorum straggler rule ([`crate::straggler::StragglerRule::Quorum`]):
+    /// true when the proposal of `view` is deferred.
+    fn quorum_straggler_defers(&mut self, view: u64, grace: Duration) -> bool {
+        let previous = view - 1;
+        // Only a leader that led the previous view has a ledger for it, the
+        // same gate as the `All` rule's `seen > 0`.
+        if self.engine.voters_seen(previous) == 0 {
+            return false;
+        }
+        let Some(decided_at) = self.engine.last_committed_view_timing().and_then(|t| t.commit_qc_formed) else {
+            return false;
+        };
+        let me = self.engine.my_index();
+        let tenure = self.engine.leader_tenure();
+        let next_leader = crate::straggler::next_tenure_leader(view, tenure, me, |v| self.engine.leader_of_view(v));
+        let validator_count = self.engine.validator_count();
+        if self.engine.vote_aggregate() {
+            // Settle, for the voters the rule might wait for, the votes
+            // batching parked unverified: the next leader, every voter not
+            // verified within the bound, and the given-up ones (whose return
+            // ends their exclusion).
+            let behind: Vec<u32> = (0..validator_count)
+                .filter(|v| *v != me)
+                .filter(|v| {
+                    Some(*v) == next_leader
+                        || self
+                            .engine
+                            .voter_last_seen(*v)
+                            .is_none_or(|seen| seen + crate::straggler::LAG_VIEWS < view)
+                })
+                .collect();
+            if !behind.is_empty() {
+                let oldest = view.saturating_sub(n42_h2_consensus::VOTERS_SEEN_WINDOW as u64 + 1);
+                for v in oldest..view {
+                    self.engine.settle_voters_seen(v, Some(&behind));
+                }
+            }
+        }
+        let engine = &self.engine;
+        let last_seen = |voter: u32| engine.voter_last_seen(voter);
+        let ledger = crate::straggler::Ledger {
+            view,
+            validator_count,
+            me,
+            next_leader,
+            last_seen: &last_seen,
+        };
+        match self.quorum_rule.decide(&ledger, decided_at, grace, std::time::Instant::now()) {
+            crate::straggler::Verdict::Proceed => false,
+            crate::straggler::Verdict::Wait(waited) => {
+                if self.straggler_wait.is_none_or(|(v, _)| v != view) {
+                    debug!(target: "n42.h2.node", view, ?waited, next_leader, "quorum straggler rule: waiting");
+                }
+                self.proposal_deferred = true;
+                self.defer_reason = Some("waiting for the next leader or a lagging voter");
+                self.note_straggler_wait(view, decided_at);
+                true
+            }
+        }
+    }
+
+    /// Remembers that the straggler rule deferred `view`, decided at `at`.
+    fn note_straggler_wait(&mut self, view: u64, at: std::time::Instant) {
+        if self.straggler_wait.is_none_or(|(v, _)| v != view) {
+            self.straggler_wait = Some((view, at));
+            self.straggler_waits += 1;
+        }
+    }
+
+    /// The straggler wait behind the proposal of `view`, in microseconds
+    /// (0 when the rule did not defer it).
+    fn take_straggler_wait_us(&mut self, view: u64) -> u64 {
+        match self.straggler_wait {
+            Some((v, at)) if v == view => {
+                self.straggler_wait = None;
+                at.elapsed().as_micros() as u64
+            }
+            _ => 0,
+        }
+    }
+
     /// Builds and announces a block when this node is the leader of a view it
     /// has not yet proposed for.
     async fn propose_if_leader(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
-        let Some(build_attributes) = self.payload_attributes.as_ref() else {
+        if self.payload_attributes.is_none() {
             return Ok(());
-        };
+        }
         let view = self.engine.current_view();
         if self.proposed_view == Some(view) || !self.engine.is_current_leader() {
             self.proposal_deferred = false;
             self.defer_reason = None;
             return Ok(());
         }
+        if view > 2 {
+            self.check_silent_keys(view);
+        }
         // The stragglers' grace: see `with_straggler_grace`.
         if let Some(grace) = self.straggler_grace {
-            if view > 1 {
+            if view > 1 && self.straggler_rule == crate::straggler::StragglerRule::Quorum {
+                if self.quorum_straggler_defers(view, grace) {
+                    return Ok(());
+                }
+            } else if view > 1 {
                 let previous = view - 1;
+                // Batched verification parks the late votes unverified;
+                // this rule reads every voter, so all of them are settled.
+                if self.engine.vote_aggregate() {
+                    self.engine.settle_voters_seen(previous, None);
+                }
                 let seen = self.engine.voters_seen(previous);
                 let all = self.engine.validator_count() as usize;
                 let decided_at = self.engine.last_committed_view_timing().and_then(|t| t.commit_qc_formed);
@@ -2584,6 +2958,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         if at.elapsed() < grace {
                             self.proposal_deferred = true;
                             self.defer_reason = Some("waiting for the stragglers' votes");
+                            self.note_straggler_wait(view, at);
                             return Ok(());
                         }
                         debug!(target: "n42.h2.node", view, seen, all, "stragglers' grace ran out; proposing without them");
@@ -2591,6 +2966,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             }
         }
+        let Some(build_attributes) = self.payload_attributes.as_ref() else {
+            return Ok(());
+        };
         // The parent is the block the highest QC certifies, not whatever the
         // execution layer imported last: a proposal has to extend its justify
         // QC's block (the fleet refuses one that does not), and a leader that
@@ -2652,6 +3030,19 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.declined_view = Some(view);
             return Ok(());
         };
+        // The build throttle: a leader whose execution layer carries too many
+        // unpersisted blocks proposes later, which is a later take of the
+        // build made for this proposal and a later start of the one after it.
+        // Deferred like the pacing, never waited for here: the loop goes on
+        // voting and importing, and asks again at the target.
+        if let Some(throttle) = self.build_throttle.as_mut()
+            && let crate::build_throttle::Verdict::WaitUntil(_) =
+                throttle.ask(view, self.block_pacing, std::time::Instant::now())
+        {
+            self.proposal_deferred = true;
+            self.defer_reason = Some(crate::build_throttle::THROTTLE_REASON);
+            return Ok(());
+        }
         let attrs_at = decided.elapsed();
         // The proposal's timeline from here: when the builder had declined
         // for this view the proposal waited for the pacing tick, and the
@@ -2779,14 +3170,20 @@ impl<E: ExecutionLayer> H2Service<E> {
                     }
                 }
                 let describe_at = std::time::Instant::now();
-                let encoded = self.driver.take_encoded_body(built.hash);
-                self.publish_body(
-                    &built.execution_data,
-                    built.header.as_ref(),
-                    &built.tx_hashes,
-                    &built.frame_layout,
-                    encoded,
-                );
+                if built.elided {
+                    // Taken without its transactions (`N42_TAKE_COMPACT`):
+                    // the compact body is all there is to publish.
+                    self.publish_elided_body(&built);
+                } else {
+                    let encoded = self.driver.take_encoded_body(built.hash);
+                    self.publish_body(
+                        &built.execution_data,
+                        built.header.as_ref(),
+                        &built.tx_hashes,
+                        &built.frame_layout,
+                        encoded,
+                    );
+                }
                 let describe_us = describe_at.elapsed().as_micros() as u64;
                 let publish_at = std::time::Instant::now();
                 if let Err(err) = self
@@ -2832,7 +3229,28 @@ impl<E: ExecutionLayer> H2Service<E> {
                 let sent_at = std::time::Instant::now();
                 let (build_start_after_prev_send_us, build_start_trigger) =
                     build_start_fields(timing.start, self.last_proposal_sent_at);
+                // -1: no throttle, or the count was not known.
+                let (throttle_in_mem, throttle_delay_ms, throttle_hard_holds) =
+                    self.build_throttle.as_ref().map_or((-1, 0, 0), |throttle| {
+                        let applied = throttle.last_applied();
+                        (
+                            applied.in_mem.map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX)),
+                            applied.delay_ms,
+                            throttle.hard_holds(),
+                        )
+                    });
                 self.last_proposal_sent_at = Some(sent_at);
+                let trigger_slot = match build_start_trigger {
+                    "seal" => 0,
+                    "send" => 1,
+                    "commit" => 2,
+                    _ => 3,
+                };
+                self.build_start_counts[trigger_slot] += 1;
+                let [build_starts_seal, build_starts_send, build_starts_commit, build_starts_other] =
+                    self.build_start_counts;
+                let straggler_wait_us = self.take_straggler_wait_us(view);
+                let straggler_waits = self.straggler_waits;
                 info!(
                     target: "n42.h2.node",
                     view,
@@ -2849,6 +3267,24 @@ impl<E: ExecutionLayer> H2Service<E> {
                     tick_to_send_us = timeline_from.elapsed().as_micros() as u64,
                     build_start_after_prev_send_us,
                     build_start_trigger,
+                    build_starts_seal,
+                    build_starts_send,
+                    build_starts_commit,
+                    build_starts_other,
+                    answer_elided = timing.elided,
+                    answer_bytes = timing.answer.map_or(0, |a| a.bytes),
+                    answer_layout_only = timing.answer.is_some_and(|a| a.layout_only),
+                    answer_read_end_us = timing.answer.map_or(0, |a| a.read_end_us),
+                    answer_decode_end_us = timing.answer.map_or(0, |a| a.decode_end_us),
+                    throttle_in_mem,
+                    throttle_delay_ms,
+                    throttle_hard_holds,
+                    straggler_waits,
+                    straggler_wait_us,
+                    direct_received = self.direct_votes.received,
+                    direct_duplicates = self.direct_votes.duplicates,
+                    direct_sent = self.direct_votes.sent,
+                    direct_fallbacks = self.direct_votes.fallbacks,
                     "proposal sent"
                 );
                 // Build-on-seal: the next build starts here, on this block's
@@ -3062,6 +3498,86 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             }
         }
+        true
+    }
+
+    /// Announces this validator to `peer` for direct votes, when this node
+    /// uses them (see [`crate::direct_votes`]).
+    fn send_vote_hello(&mut self, peer: PeerId) {
+        if !self.direct_votes.announces() {
+            return;
+        }
+        let index = self.engine.my_index();
+        if index >= self.engine.validator_count() {
+            return;
+        }
+        let signature = match self.vote_hello {
+            Some(signature) => signature,
+            None => {
+                let signature = self
+                    .engine
+                    .sign_vote_hello(self.identity.genesis_hash, &self.transport.local_peer_id().to_bytes())
+                    .to_bytes();
+                self.vote_hello = Some(signature);
+                signature
+            }
+        };
+        self.transport.send_vote(peer, n42_h2_net::VoteRequest::Hello { index, signature });
+    }
+
+    /// A message addressed to one validator (a vote to the leader): straight
+    /// to it when direct votes are on and its peer is known, by gossip
+    /// otherwise or as well (`both`).
+    fn send_to_validator(
+        &mut self,
+        target: u32,
+        message: n42_h2_primitives::consensus::ConsensusMessage,
+        events: &mut Vec<ServiceEvent>,
+    ) {
+        use crate::direct_votes::VoteTransport;
+        use n42_h2_primitives::consensus::ConsensusMessage as M;
+        let mode = self.direct_votes.mode();
+        if mode != VoteTransport::Gossip && matches!(message, M::Vote(_) | M::CommitVote(_)) {
+            match self.direct_votes.peer_of(target) {
+                Some(peer) => {
+                    if self.send_direct_vote(peer, &message) {
+                        self.direct_votes.sent += 1;
+                        if mode == VoteTransport::Direct {
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    if mode == VoteTransport::Direct {
+                        self.direct_votes.fallbacks += 1;
+                    }
+                }
+            }
+        }
+        self.publish(message, events);
+    }
+
+    /// Encodes `message` as its gossip bytes and sends it to `peer` over the
+    /// vote protocol; false if it cannot be encoded.
+    fn send_direct_vote(&mut self, peer: PeerId, message: &n42_h2_primitives::consensus::ConsensusMessage) -> bool {
+        let Ok(envelope) = wire_bridge::to_wire(message, self.identity, B256::ZERO) else {
+            return false;
+        };
+        let request = if self.native_wire {
+            match n42_h2_wire::h2_wire::encode_gov5_gossip_message(&envelope.message) {
+                Ok(bytes) => n42_h2_net::VoteRequest::Native(bytes),
+                Err(_) => return false,
+            }
+        } else {
+            match n42_h2_wire::h2_v4::encode_gossip(&envelope) {
+                Ok(bytes) => n42_h2_net::VoteRequest::Envelope(bytes),
+                Err(_) => return false,
+            }
+        };
+        if trace_messages() {
+            info!(target: "n42.h2.trace", kind = message_kind(message), view = message.view(), %peer, "send direct");
+        }
+        self.transport.send_vote(peer, request);
         true
     }
 
@@ -3335,6 +3851,63 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
     }
 
+    /// Once a block has been held past [`HELD_TOO_LONG`], reads the layer's
+    /// height instead of waiting for a peer's height to prompt it: with one
+    /// layer shared by many keys the layer is already at the tip, no peer is
+    /// ever ahead of it, and the pull never starts.
+    async fn refresh_layer_for_held(&mut self) {
+        let now = std::time::Instant::now();
+        let overdue = self.held_since.values().any(|since| now.duration_since(*since) >= HELD_TOO_LONG);
+        if !overdue
+            || self.last_forced_layer_read.is_some_and(|at| now.duration_since(at) < HELD_TOO_LONG)
+        {
+            return;
+        }
+        self.last_forced_layer_read = Some(now);
+        match self.driver.execution_layer().latest_block_number().await {
+            Ok(Some(latest)) => self.note_imported(latest),
+            Ok(None) => {}
+            Err(err) => {
+                debug!(target: "n42.h2.node", %err, "could not read the execution layer's height for a held block");
+            }
+        }
+    }
+
+    /// Names a key that has not voted for [`SILENT_KEY_VIEWS`] views, once per
+    /// episode. Looks at the view before the previous one, whose votes have
+    /// had a full view to arrive.
+    fn check_silent_keys(&mut self, view: u64) {
+        let Some(observed) = view.checked_sub(2).filter(|v| *v > 0) else { return };
+        if self.silent_checked_view == Some(observed) {
+            return;
+        }
+        self.silent_checked_view = Some(observed);
+        let validators = self.engine.validator_count();
+        let me = self.engine.my_index();
+        if self.engine.vote_aggregate() {
+            // Batched verification parks late votes unverified; settle them
+            // for the keys that look silent so a slow vote is not read as none.
+            let stale: Vec<u32> = (0..validators)
+                .filter(|v| *v != me)
+                .filter(|v| self.engine.voter_last_seen(*v).is_none_or(|seen| seen < observed))
+                .collect();
+            if !stale.is_empty() {
+                self.engine.settle_voters_seen(observed, Some(&stale));
+            }
+        }
+        let engine = &self.engine;
+        let silent = self.silent_keys.observe(observed, validators, me, |voter| engine.voter_last_seen(voter));
+        for (key, silent_views) in silent {
+            warn!(
+                target: "n42.h2.node",
+                key,
+                silent_views,
+                view,
+                "a validator key has not voted for many views; the leader is waiting on it every view"
+            );
+        }
+    }
+
     /// Says that a block is being held, without saying it for every block on
     /// every drain: once when the block is first held, at most one line every
     /// [`HELD_LOG_EVERY`], and one WARN per block once it has been held for
@@ -3356,6 +3929,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 ?block_hash,
                 ?number,
                 tip = ?self.imported_tip(),
+                layer_height = ?self.imported_height,
                 head = ?self.driver.head(),
                 held_ms,
                 held = self.held_bodies.len(),
@@ -3397,15 +3971,14 @@ impl<E: ExecutionLayer> H2Service<E> {
         let head = self
             .block_headers
             .get(&self.driver.head())
-            .map(|header| header.number)
-            .or(self.imported_height);
+            .map(|header| header.number);
         let in_flight = self
             .driver
             .importing()
             .filter_map(|hash| self.block_headers.get(hash))
             .map(|header| header.number)
             .max();
-        tip_of(head, in_flight)
+        tip_of(head, in_flight, self.imported_height)
     }
 
 
@@ -3669,6 +4242,107 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.block_seen.remove(&oldest);
             }
         }
+    }
+
+    /// Publishes the body of a block taken without its transactions
+    /// (`N42_TAKE_COMPACT`): its compact body, made from the sealed header,
+    /// the rewards, the access list and the hashes (or frame layout) the
+    /// execution layer sent -- byte for byte the compact body
+    /// [`Self::publish_body`] makes of the whole block. It goes to the
+    /// direct-push peers that read compact bodies; a peer that does not, the
+    /// topic and the libp2p push get nothing here and fetch the block by
+    /// hash, which is then served from the execution layer
+    /// ([`Self::elided_body`]).
+    fn publish_elided_body(&mut self, built: &n42_h2_execution::BuiltBlock) {
+        let block_hash = built.hash;
+        let started = std::time::Instant::now();
+        let Some(header) = built.header.as_ref() else {
+            warn!(target: "n42.h2.node", ?block_hash, "a block taken elided has no sealed header; cannot publish it");
+            return;
+        };
+        let compact = match elided_compact_body(
+            &built.execution_data,
+            header,
+            built.tx_count,
+            &built.tx_hashes,
+            &built.frame_layout,
+            self.header_profile,
+        ) {
+            Ok(compact) => alloy_primitives::Bytes::from(compact),
+            Err(err) => {
+                warn!(target: "n42.h2.node", %err, ?block_hash, "cannot make a compact body for our own block taken elided");
+                return;
+            }
+        };
+        let bal = match &built.execution_data.payload {
+            alloy_rpc_types_engine::ExecutionPayload::V4(v4) => Some(v4.block_access_list.clone()),
+            _ => None,
+        };
+        self.remember_elided(block_hash, header.clone(), bal);
+        let compact_ms = started.elapsed().as_millis() as u64;
+        let (peers, taken) = match (&self.body_pushers, self.direct_push) {
+            (Some(pushers), true) if !pushers.is_empty() => (
+                pushers.len(),
+                pushers.push(crate::body_channel::OfferedBody {
+                    full: alloy_primitives::Bytes::new(),
+                    compact: Some(compact.clone()),
+                }),
+            ),
+            _ => (0, 0),
+        };
+        info!(
+            target: "n42.h2.node",
+            ?block_hash,
+            bytes = 0,
+            compact_bytes = compact.len(),
+            compact_ms,
+            elided = true,
+            peers,
+            taken,
+            push_ms = (started.elapsed().as_millis() as u64).saturating_sub(compact_ms),
+            "block body prepared"
+        );
+    }
+
+    /// Records a block taken elided, for [`Self::elided_body`].
+    fn remember_elided(&mut self, block_hash: B256, header: Header, bal: Option<alloy_primitives::Bytes>) {
+        if self.elided_own.insert(block_hash, (header, bal)).is_none() {
+            self.elided_order.push_back(block_hash);
+            while self.elided_order.len() > remembered_bodies() {
+                if let Some(oldest) = self.elided_order.pop_front() {
+                    self.elided_own.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    /// The gov5 body of a block this node took elided, fetched from the
+    /// execution layer on demand and kept in the body store, so the next
+    /// peer that asks is served from there. `None` for any other block, or
+    /// when the execution layer no longer has it.
+    async fn elided_body(&mut self, block_hash: B256) -> Option<alloy_primitives::Bytes> {
+        let (header, bal) = self.elided_own.get(&block_hash).cloned()?;
+        let block = match self.driver.execution_layer().own_block_body(&header).await {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                debug!(target: "n42.h2.node", ?block_hash, "the execution layer no longer holds a block taken elided");
+                return None;
+            }
+            Err(err) => {
+                debug!(target: "n42.h2.node", ?block_hash, %err, "could not fetch a block taken elided");
+                return None;
+            }
+        };
+        let body = alloy_primitives::Bytes::from(n42_h2_net::encode_block_rlp_raw(
+            &header,
+            &block.transactions,
+            &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
+            bal.as_ref(),
+        ));
+        self.elided_own.remove(&block_hash);
+        self.elided_order.retain(|hash| *hash != block_hash);
+        self.remember_body(block_hash, body.clone());
+        Some(body)
     }
 
     /// Publishes a block body, queueing it if the mesh is not ready.
@@ -3993,6 +4667,11 @@ async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeReques
 /// `N42_H2_TRACE_MSGS=1`: one info line per consensus message sent or
 /// received, with its kind and view, so a round's hops can be timed across
 /// the fleet's logs (all on one clock when the fleet is on one box).
+/// `N42_VOTE_AGGREGATE_VERIFY=1`: batched vote verification on a leader.
+fn vote_aggregate_from_env() -> bool {
+    std::env::var("N42_VOTE_AGGREGATE_VERIFY").is_ok_and(|v| v == "1")
+}
+
 fn trace_messages() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_H2_TRACE_MSGS").is_ok_and(|v| v == "1"))
@@ -4034,6 +4713,17 @@ fn body_request_grace() -> Duration {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn far_ahead_blocks_parse() {
+        use super::{far_ahead_blocks_from as f, FAR_AHEAD_BLOCKS};
+        assert_eq!(f(None), FAR_AHEAD_BLOCKS);
+        assert_eq!(f(Some("2")), 2);
+        assert_eq!(f(Some("8")), 8);
+        assert_eq!(f(Some("0")), FAR_AHEAD_BLOCKS);
+        assert_eq!(f(Some("9")), FAR_AHEAD_BLOCKS);
+        assert_eq!(f(Some("x")), FAR_AHEAD_BLOCKS);
+    }
+
     use super::*;
 
     /// Defect 18's bound: three rounds are asked, a fourth fetches the whole
@@ -4078,15 +4768,45 @@ mod tests {
         assert!(runs_far_ahead(384, 382), "two is not");
     }
 
+    /// The layer's own height counts: head 0, layer 5 is a tip of 5, and a
+    /// block 2 is no longer far ahead (E=1, the silent key).
+    #[test]
+    fn the_layer_height_lifts_the_tip_of_a_driver_at_genesis() {
+        assert_eq!(tip_of(Some(0), None, Some(5)), Some(5));
+        assert!(!runs_far_ahead(2, 5));
+        assert_eq!(tip_of(Some(0), None, None), Some(0), "without the read it is far ahead");
+        assert!(runs_far_ahead(2, 0));
+        assert_eq!(tip_of(Some(7), Some(8), Some(5)), Some(8), "a lagging layer lowers nothing");
+        assert_eq!(tip_of(None, None, Some(5)), Some(5));
+    }
+
+    /// A key silent for 16 views is named once; a vote ends the episode.
+    #[test]
+    fn a_silent_key_is_named_once_per_episode() {
+        let mut keys = SilentKeys::default();
+        let seen = |voter: u32| if voter == 4 { None } else { Some(100) };
+        // The first look starts the clock; nothing is silent yet.
+        assert!(keys.observe(3, 7, 0, seen).is_empty());
+        assert!(keys.observe(3 + SILENT_KEY_VIEWS - 1, 7, 0, seen).is_empty());
+        assert_eq!(keys.observe(3 + SILENT_KEY_VIEWS, 7, 0, seen), vec![(4, SILENT_KEY_VIEWS)]);
+        assert!(keys.observe(3 + SILENT_KEY_VIEWS + 1, 7, 0, seen).is_empty(), "once");
+        // It votes at view 40: the episode ends, and a new silence is named again.
+        let back = |voter: u32| if voter == 4 { Some(40) } else { Some(100) };
+        assert!(keys.observe(41, 7, 0, back).is_empty());
+        assert!(keys.warned.is_empty());
+        let gone = |voter: u32| if voter == 4 { Some(40) } else { Some(100) };
+        assert_eq!(keys.observe(40 + SILENT_KEY_VIEWS, 7, 0, gone), vec![(4, SILENT_KEY_VIEWS)]);
+    }
+
     /// The tip is the higher of the head and the imports in flight, and
     /// exists as soon as either does.
     #[test]
     fn the_tip_is_the_furthest_of_what_the_node_knows() {
-        assert_eq!(tip_of(Some(381), None), Some(381));
-        assert_eq!(tip_of(Some(381), Some(382)), Some(382), "an import in flight counts");
-        assert_eq!(tip_of(Some(383), Some(382)), Some(383));
-        assert_eq!(tip_of(None, Some(382)), Some(382));
-        assert_eq!(tip_of(None, None), None, "nothing known: nothing is far ahead");
+        assert_eq!(tip_of(Some(381), None, None), Some(381));
+        assert_eq!(tip_of(Some(381), Some(382), None), Some(382), "an import in flight counts");
+        assert_eq!(tip_of(Some(383), Some(382), None), Some(383));
+        assert_eq!(tip_of(None, Some(382), None), Some(382));
+        assert_eq!(tip_of(None, None, None), None, "nothing known: nothing is far ahead");
     }
 
     #[test]

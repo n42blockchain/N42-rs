@@ -76,12 +76,12 @@ fn a_leaders_view_summary_names_each_round_and_dashes_the_missing_ones() {
     timing.commit_qc_formed = at(70);
     timing.prepare_vote_count = 3;
     timing.commit_vote_count = 4;
-    assert_eq!(timing.summary(), "leader proposal=@10ms R1_collect=20ms R2_collect=40ms total=70ms votes=3+4");
+    assert_eq!(timing.summary(), "leader proposal=@10ms R1_collect=20ms R2_collect=40ms total=70ms votes=3+4 verify_us=0 verify_n=0 verify_batches=0 verify_fallbacks=0 inbound_queue_max=0 gossip_poll_us=0");
 
     let mut partial = ViewTiming::new();
     partial.view_start = base;
     partial.proposal_sent = at(10);
-    assert_eq!(partial.summary(), "leader proposal=@10ms R1_collect=- R2_collect=- total=- votes=0+0");
+    assert_eq!(partial.summary(), "leader proposal=@10ms R1_collect=- R2_collect=- total=- votes=0+0 verify_us=0 verify_n=0 verify_batches=0 verify_fallbacks=0 inbound_queue_max=0 gossip_poll_us=0");
 }
 
 #[test]
@@ -94,11 +94,11 @@ fn a_followers_view_summary_gives_the_vote_delay_and_the_commit_stamps() {
     timing.vote_sent = at(9);
     timing.commit_vote_sent = at(40);
     timing.commit_qc_formed = at(45);
-    assert_eq!(timing.summary(), "follower proposal=@5ms vote_delay=4ms commit_vote=@40ms total=@45ms");
+    assert_eq!(timing.summary(), "follower proposal=@5ms vote_delay=4ms commit_vote=@40ms total=@45ms inbound_queue_max=0 gossip_poll_us=0");
 
     let mut empty = ViewTiming::new();
     empty.view_start = base;
-    assert_eq!(empty.summary(), "follower proposal=@- vote_delay=- commit_vote=@- total=@-");
+    assert_eq!(empty.summary(), "follower proposal=@- vote_delay=- commit_vote=@- total=@- inbound_queue_max=0 gossip_poll_us=0");
 }
 
 // ---------------------------------------------------------------------------

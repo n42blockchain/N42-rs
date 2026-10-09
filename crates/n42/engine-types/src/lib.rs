@@ -3,7 +3,7 @@
 
 // The builder's phases line has more fields than `tracing`'s macros expand
 // under the default limit.
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 //mod addons;
 //pub use addons::N42NodeAddOns;
@@ -30,6 +30,8 @@ pub mod rpc;
 pub mod built_executions;
 pub mod canonical_head;
 pub mod chain_alias;
+pub mod fields_at_seal;
+pub mod post_seal;
 /// What a block's execution produced, by hash (deferred execution).
 pub use n42_qmdb_reth::executed_fields;
 pub mod direct_build;

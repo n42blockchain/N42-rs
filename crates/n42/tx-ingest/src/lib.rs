@@ -104,11 +104,13 @@
 //! could not. It is off unless `N42_TX_INGEST=<addr>` is set, and it should be
 //! bound to loopback.
 
+pub mod runtime;
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy_primitives::{Address, Bytes, B256};
-use n42_tx_queue::NewFrame;
+use n42_tx_queue::{NewFrame, TxQueue};
 use n42_tx_types::{ed25519_batch_size, AltSigSenderCache, AltSigTx, N42PooledTxEnvelope};
 use reth_primitives_traits::Recovered;
 use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool};
@@ -220,7 +222,8 @@ fn async_frames_in_flight() -> usize {
 /// 0 by default. At 10 or more, the scheduler gives the builder's and the
 /// engine's threads the core whenever they are runnable and recovery the
 /// cycles nobody else wants -- a budget that follows the load instead of a
-/// fixed one.
+/// fixed one. Unset, the node-wide `N42_BACKGROUND_NICE` applies instead.
+#[cfg(target_os = "linux")]
 fn recovery_nice() -> i32 {
     static NICE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     *NICE.get_or_init(|| {
@@ -236,11 +239,25 @@ fn recovery_nice() -> i32 {
 /// thread; blocking-pool threads are reused, so this is a few syscalls a
 /// frame at most.
 fn apply_recovery_nice() {
+    #[cfg(target_os = "linux")]
+    apply_recovery_nice_linux();
+}
+
+#[cfg(target_os = "linux")]
+fn apply_recovery_nice_linux() {
     thread_local! {
         static APPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
     let nice = recovery_nice();
-    if nice == 0 || APPLIED.with(|a| a.replace(true)) {
+    if nice == 0 {
+        // No recovery-specific value: the node-wide background priority
+        // (`N42_BACKGROUND_NICE`, nice 1-19 or SCHED_IDLE), when it is set.
+        if n42_core_layout::background_priority().is_some() && !APPLIED.with(|a| a.replace(true)) {
+            n42_core_layout::lower_current_thread_priority();
+        }
+        return;
+    }
+    if APPLIED.with(|a| a.replace(true)) {
         return;
     }
     // SAFETY: setpriority on the calling thread (PRIO_PROCESS with a thread
@@ -263,11 +280,13 @@ fn apply_recovery_nice() {
 /// `=2` pins over every logical CPU of the set instead (one thread per SMT
 /// thread, no migration); `=1` measured a loss -- 16 physical cores could not
 /// carry 20 slots, 12.7 cores of recovery against 20 unpinned.
+#[cfg(target_os = "linux")]
 fn recovery_pin() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| std::env::var("N42_TX_INGEST_RECOVER_PIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
+#[cfg(target_os = "linux")]
 fn physical_cores() -> &'static [usize] {
     static CORES: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
     CORES.get_or_init(|| {
@@ -299,6 +318,12 @@ fn physical_cores() -> &'static [usize] {
 /// Pins the calling thread to its core (see [`recovery_pin`]), once per
 /// thread.
 fn apply_recovery_affinity() {
+    #[cfg(target_os = "linux")]
+    apply_recovery_affinity_linux();
+}
+
+#[cfg(target_os = "linux")]
+fn apply_recovery_affinity_linux() {
     thread_local! {
         static PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
@@ -322,7 +347,7 @@ fn apply_recovery_affinity() {
 }
 
 /// The recovery slot count when it is bounded, `None` when unlimited.
-fn recovery_slot_count() -> Option<usize> {
+pub(crate) fn recovery_slot_count() -> Option<usize> {
     std::env::var("N42_TX_INGEST_RECOVER_PARALLEL")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -339,6 +364,10 @@ fn recovery_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
 
 /// Largest single transaction, in bytes.
 const MAX_TX_BYTES: u32 = 1 << 20;
+
+/// Bound the retained transaction bytes of one frame independently of its
+/// transaction count. The per-transaction cap alone allowed a 10 GiB frame.
+const MAX_FRAME_BYTES: usize = 64 << 20;
 
 /// How long to wait between checks when the pool is at its high water mark.
 const GATE_POLL: std::time::Duration = std::time::Duration::from_millis(2);
@@ -376,6 +405,7 @@ struct GateView {
 /// allowance for each block the chain is ahead of the pool.
 fn gate_view<P: TransactionPool + 'static>(
     pool: &P,
+    queue: Option<&TxQueue<P::Transaction>>,
     head: &std::sync::Arc<AtomicU64>,
     gate: usize,
     allowance: u64,
@@ -387,13 +417,14 @@ where
         .load(Ordering::Relaxed)
         .saturating_sub(pool.block_info().last_seen_block_number)
         .min(4);
-    let depth = u64::try_from(queue_depth(pool)).unwrap_or(u64::MAX);
+    let depth = u64::try_from(queue_depth(pool, queue)).unwrap_or(u64::MAX);
     let limit = gate as u64 + lag * allowance;
     GateView { open: depth < limit, depth, limit }
 }
 
 fn gate_open<P: TransactionPool + 'static>(
     pool: &P,
+    queue: Option<&TxQueue<P::Transaction>>,
     head: &std::sync::Arc<AtomicU64>,
     gate: usize,
     allowance: u64,
@@ -401,7 +432,7 @@ fn gate_open<P: TransactionPool + 'static>(
 where
     P::Transaction: 'static,
 {
-    gate_view(pool, head, gate, allowance).open
+    gate_view(pool, queue, head, gate, allowance).open
 }
 
 /// The node's gate: connections held at the high-water mark wait here, and
@@ -713,8 +744,13 @@ fn gate_sleep_cap(
 
 /// Polls the gate every `GATE_POLL` while anyone is waiting on it, and wakes
 /// every waiter when it is open; idles at a slower rate otherwise.
-fn spawn_gate_watcher<P>(pool: P, head: std::sync::Arc<AtomicU64>, gate: usize, allowance: u64)
-where
+fn spawn_gate_watcher<P>(
+    pool: P,
+    queue: Option<TxQueue<P::Transaction>>,
+    head: std::sync::Arc<AtomicU64>,
+    gate: usize,
+    allowance: u64,
+) where
     P: TransactionPool + 'static,
     P::Transaction: 'static,
 {
@@ -725,7 +761,7 @@ where
                 continue;
             }
             tokio::time::sleep(GATE_POLL).await;
-            if gate_open(&pool, &head, gate, allowance) {
+            if gate_open(&pool, queue.as_ref(), &head, gate, allowance) {
                 GATE.open.notify_waiters();
             }
         }
@@ -746,10 +782,16 @@ fn unbuffered_reads() -> bool {
 /// seconds in exactly that state -- depth 569,520 against a gate of 543,333,
 /// all of it parked, `rate` down to 30,591/s, its own blocks empty so
 /// nothing pruned it, and only the tenure change let it out.
-fn queue_depth<P: TransactionPool + 'static>(pool: &P) -> usize
+///
+/// `queue` is the queue the ingest resolved when it started ([`Setup`]);
+/// without one the installed queue is looked up, as before.
+fn queue_depth<P: TransactionPool + 'static>(pool: &P, queue: Option<&TxQueue<P::Transaction>>) -> usize
 where
     P::Transaction: 'static,
 {
+    if let Some(queue) = queue {
+        return queue.gate_len();
+    }
     match n42_tx_queue::global::<P::Transaction>() {
         Some(queue) => queue.gate_len(),
         None => pool.pool_size().pending,
@@ -777,6 +819,22 @@ fn spawn_stats_reporter() {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let now = std::time::Instant::now();
+            // The queue's lanes lock and inbox drain over the same interval
+            // (`docs/SHARED_EXECUTION_SCOPE.md` 11): taken every interval so
+            // each line reports its own.
+            let lock = n42_tx_queue::take_lock_stats();
+            let ahead_discards = n42_tx_queue::take_ahead_discards()
+                .iter()
+                .map(|(reason, count)| format!("{reason}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            // `N42_QUEUE_OFFLOCK`: preparations whose commit found the lanes
+            // moved, and those that then planned in one hold.
+            let (offlock_raced, offlock_fallback) = n42_tx_queue::take_offlock_stats();
+            // `N42_QUEUE_PLAN_SNAPSHOT`: snapshot plans whose commit found a
+            // lane they took from moved (re-planned), and those the locked
+            // path planned instead.
+            let (plan_snapshot_misses, plan_snapshot_fallbacks) = n42_tx_queue::take_plan_snapshot_stats();
             let (frames, txs, recover, pool, busy) = (
                 STATS.frames.load(Ordering::Relaxed),
                 STATS.txs.load(Ordering::Relaxed),
@@ -866,6 +924,32 @@ fn spawn_stats_reporter() {
                     // vote road missed a proposed block's transactions
                     // (defect 17); cumulative.
                     gate_opened_for_block = GATE_OPENED_FOR_BLOCK.load(Ordering::Relaxed),
+                    // The queue's lanes lock over the interval: holds, their
+                    // share of the interval, the longest hold and where it
+                    // was taken, the longest wait; and the inbox drains under
+                    // it: how many, what they moved, mean and longest.
+                    lock_holds = lock.holds,
+                    lock_duty_pct = (lock.hold_ns as f64 / 1e9 / secs * 100.0) as u64,
+                    lock_hold_max_us = lock.hold_max_ns / 1_000,
+                    lock_hold_max_at = %lock.hold_max_at.map_or_else(String::new, |at| format!("{}:{}", at.file(), at.line())),
+                    lock_wait_max_us = lock.wait_max_ns / 1_000,
+                    lock_wait_us = lock.wait_ns / 1_000,
+                    drains = lock.drains,
+                    drain_txs = lock.drain_txs,
+                    drain_us_mean = lock.drain_ns / lock.drains.max(1) / 1_000,
+                    drain_us_max = lock.drain_max_ns / 1_000,
+                    // `N42_TX_QUEUE_DRAIN_CHUNK`: the drainer's bounded holds,
+                    // the most one of them moved, and remainders another
+                    // holder (a build's start, a prune) finished unbounded.
+                    drain_chunks = lock.drain_chunks,
+                    drain_chunk_max_txs = lock.drain_chunk_max_txs,
+                    drain_finished = lock.drain_finished,
+                    // `N42_PLAN_AHEAD`: prepared plans discarded, by reason.
+                    plan_discards = %ahead_discards,
+                    offlock_raced,
+                    offlock_fallback,
+                    plan_snapshot_misses,
+                    plan_snapshot_fallbacks,
                     "ingest"
                 );
             }
@@ -884,6 +968,99 @@ fn block_txs_allowance() -> u64 {
         .unwrap_or(0)
 }
 
+/// Where a frame's recovery takes its slot.
+#[derive(Clone, Debug)]
+enum Slots {
+    /// A node-wide tokio semaphore the connection task awaits before it
+    /// spawns the recovery (the default).
+    Async(std::sync::Arc<tokio::sync::Semaphore>),
+    /// A counting semaphore the recovery's blocking thread waits on
+    /// (`N42_INGEST_RUNTIME=1`, [`runtime`]): no async task holds or awaits
+    /// a permit.
+    Blocking(std::sync::Arc<runtime::BlockingSlots>),
+}
+
+/// What every connection of one ingest shares, resolved once when it
+/// starts rather than read per frame.
+struct Setup<T: PoolTransaction> {
+    /// The builder's queue, when one is installed: what the gate measures
+    /// and what a direct frame goes into. `None` and the installed queue is
+    /// looked up per frame, as before.
+    queue: Option<TxQueue<T>>,
+    /// `N42_TX_INGEST_DIRECT`.
+    direct: bool,
+    /// `N42_TX_INGEST_ASYNC`.
+    asynchronous: bool,
+    /// The gate's high-water mark and per-block allowance.
+    gate: usize,
+    allowance: u64,
+    slots: Slots,
+}
+
+impl<T: PoolTransaction> Clone for Setup<T> {
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+            direct: self.direct,
+            asynchronous: self.asynchronous,
+            gate: self.gate,
+            allowance: self.allowance,
+            slots: self.slots.clone(),
+        }
+    }
+}
+
+impl<T: PoolTransaction + 'static> Setup<T> {
+    /// From the environment; `blocking_slots` says whether the recovery takes
+    /// its slot on the blocking side ([`runtime`]).
+    fn from_env(blocking_slots: bool) -> Self {
+        let slots = if blocking_slots {
+            Slots::Blocking(runtime::BlockingSlots::new(recovery_slot_count()))
+        } else {
+            Slots::Async(std::sync::Arc::clone(recovery_slots()))
+        };
+        Self {
+            queue: n42_tx_queue::global::<T>(),
+            direct: direct_to_queue(),
+            asynchronous: std::env::var("N42_TX_INGEST_ASYNC").is_ok(),
+            gate: high_water(),
+            allowance: block_txs_allowance(),
+            slots,
+        }
+    }
+}
+
+/// Starts the ingest on `addr`: on its own runtime under
+/// `N42_INGEST_RUNTIME=1` (with the recovery slots on the blocking side, see
+/// [`runtime`]), on the calling runtime otherwise, exactly as [`serve`].
+/// `on_error` is told if it stops.
+pub fn spawn_serve<P>(
+    addr: SocketAddr,
+    pool: P,
+    cache: Option<reth_evm::SenderRecoveryCache>,
+    head: std::sync::Arc<AtomicU64>,
+    chain_id: u64,
+    on_error: impl FnOnce(std::io::Error) + Send + 'static,
+) where
+    P: TransactionPool + Clone + 'static,
+    P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
+{
+    let own = runtime::handle();
+    let blocking_slots = own.is_some();
+    let task = async move {
+        if let Err(err) = serve_with(addr, pool, cache, head, chain_id, blocking_slots).await {
+            on_error(err);
+        }
+    };
+    match own {
+        Some(handle) => drop(handle.spawn(task)),
+        None => drop(tokio::spawn(task)),
+    }
+}
+
+/// Serves the ingest on `addr` on the calling runtime, with the recovery
+/// slots on the async side, until the process ends ([`spawn_serve`] picks
+/// the runtime from `N42_INGEST_RUNTIME`).
 pub async fn serve<P>(
     addr: SocketAddr,
     pool: P,
@@ -895,19 +1072,52 @@ where
     P: TransactionPool + Clone + 'static,
     P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
 {
+    serve_with(addr, pool, cache, head, chain_id, false).await
+}
+
+async fn serve_with<P>(
+    addr: SocketAddr,
+    pool: P,
+    cache: Option<reth_evm::SenderRecoveryCache>,
+    head: std::sync::Arc<AtomicU64>,
+    chain_id: u64,
+    blocking_slots: bool,
+) -> std::io::Result<()>
+where
+    P: TransactionPool + Clone + 'static,
+    P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
+{
     init_frame_attest(chain_id);
+    let setup = Setup::<P::Transaction>::from_env(blocking_slots);
     spawn_stats_reporter();
-    spawn_gate_watcher(pool.clone(), std::sync::Arc::clone(&head), high_water(), block_txs_allowance());
+    spawn_gate_watcher(pool.clone(), setup.queue.clone(), std::sync::Arc::clone(&head), setup.gate, setup.allowance);
     let listener = TcpListener::bind(addr).await?;
     info!(
         target: "n42.tx_ingest",
         %addr,
         buffered_reads = !unbuffered_reads(),
-        direct_to_queue = direct_to_queue(),
-        asynchronous = std::env::var("N42_TX_INGEST_ASYNC").is_ok(),
+        direct_to_queue = setup.direct,
+        asynchronous = setup.asynchronous,
         senders_claimed = n42_tx_types::senders_claimed_at_ingest(),
+        own_runtime = blocking_slots,
         "binary transaction ingest listening"
     );
+    serve_on(listener, pool, cache, head, setup).await
+}
+
+/// Accepts connections on `listener` for ever, each served on its own task
+/// of the calling runtime.
+async fn serve_on<P>(
+    listener: TcpListener,
+    pool: P,
+    cache: Option<reth_evm::SenderRecoveryCache>,
+    head: std::sync::Arc<AtomicU64>,
+    setup: Setup<P::Transaction>,
+) -> std::io::Result<()>
+where
+    P: TransactionPool + Clone + 'static,
+    P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
+{
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -919,8 +1129,9 @@ where
         let pool = pool.clone();
         let cache = cache.clone();
         let head = std::sync::Arc::clone(&head);
+        let setup = setup.clone();
         tokio::spawn(async move {
-            if let Err(err) = serve_connection(stream, pool, cache, head).await {
+            if let Err(err) = serve_connection(stream, pool, cache, head, setup).await {
                 debug!(target: "n42.tx_ingest", %peer, %err, "ingest connection ended");
             }
         });
@@ -932,14 +1143,15 @@ async fn serve_connection<P>(
     pool: P,
     cache: Option<reth_evm::SenderRecoveryCache>,
     head: std::sync::Arc<AtomicU64>,
+    setup: Setup<P::Transaction>,
 ) -> std::io::Result<()>
 where
     P: TransactionPool + Clone + 'static,
     P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
     P::Transaction: 'static,
 {
-    let gate = high_water();
-    let allowance = block_txs_allowance();
+    let gate = setup.gate;
+    let allowance = setup.allowance;
     // N42_TX_INGEST_ASYNC=1: answer a frame once it is past the gate and
     // admit it in the background, at most ASYNC_FRAMES_IN_FLIGHT frames at a
     // time per connection. The pool's write lock is taken for a block's
@@ -951,7 +1163,7 @@ where
     // pool will not take (a gap, a fee, a full pool) is no longer reported,
     // which is right for a generator that only sends valid transactions and
     // wrong for anything else, so this is not the default.
-    let asynchronous = std::env::var("N42_TX_INGEST_ASYNC").is_ok();
+    let asynchronous = setup.asynchronous;
     // `N42_INGEST_VERIFY=leader`: a claiming frame's sender is kept as the
     // claim the transaction is queued under, and nothing here verifies it.
     // `N42_INGEST_VERIFY=shard` keeps the claims too: the frame's claim is
@@ -969,12 +1181,13 @@ where
         );
     if asynchronous {
         let pool = pool.clone();
+        let setup = setup.clone();
         tokio::spawn(async move {
             while let Some(recovering) = admit_rx.recv().await {
                 let started = std::time::Instant::now();
                 match recovering.await {
                     Ok((decoded, frame)) => {
-                        let _ = admit_decoded(&pool, decoded, frame, started).await;
+                        let _ = admit_decoded(&pool, &setup, decoded, frame, started).await;
                     }
                     Err(err) => warn!(target: "n42.tx_ingest", %err, "sender recovery task failed"),
                 }
@@ -1018,12 +1231,20 @@ where
         let keep_claims = claiming && claimed_senders;
         let mut claims: Vec<Address> = if keep_claims { Vec::with_capacity(count as usize) } else { Vec::new() };
         let mut frame_buf = bytes::BytesMut::with_capacity(count as usize * 160);
+        let mut frame_bytes = 0usize;
         for _ in 0..count {
             let len = stream.read_u32_le().await? as usize;
             if len == 0 || len > MAX_TX_BYTES as usize {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("transaction of {len} bytes"),
+                ));
+            }
+            frame_bytes += len;
+            if frame_bytes > MAX_FRAME_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("frame exceeds {MAX_FRAME_BYTES} transaction bytes"),
                 ));
             }
             if claiming {
@@ -1090,14 +1311,14 @@ where
         let frame_read = std::time::Instant::now();
         let (GateExit::Open(at_gate) | GateExit::ForBlock(at_gate) | GateExit::Forced(at_gate)) =
             wait_at_gate(
-                || gate_view(&pool, &head, gate, allowance),
+                || gate_view(&pool, setup.queue.as_ref(), &head, gate, allowance),
                 block_pending_now,
                 gate_max_wait(),
             )
             .await;
         STATS.gate_ns.fetch_add(at_gate.as_nanos() as u64, Ordering::Relaxed);
         if asynchronous {
-            let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
+            let pending = u32::try_from(queue_depth(&pool, setup.queue.as_ref())).unwrap_or(u32::MAX);
             let cache = cache.clone();
             let acquiring = std::time::Instant::now();
             // Decoded here, on the connection's task, before the slot is
@@ -1115,20 +1336,30 @@ where
             // the async path is -- so what it drops is counted in the
             // `ingest` line's `dropped_*` instead.
             let offered = u32::try_from(pooled.len()).unwrap_or(u32::MAX);
-            let slot = std::sync::Arc::clone(recovery_slots())
-                .acquire_owned()
-                .await
-                .expect("the recovery semaphore is never closed");
+            let slot = match acquire_async_slot(&setup.slots).await {
+                Ok(slot) => slot,
+                Err(err) => return Err(err),
+            };
             let granted = std::time::Instant::now();
             STATS.acq_ns.fetch_add(granted.duration_since(acquiring).as_nanos() as u64, Ordering::Relaxed);
+            let blocking_slots = setup.slots.clone();
             let recovering = tokio::task::spawn_blocking(move || {
+                // Under the ingest runtime the slot is taken here, on the
+                // blocking thread (`acq_us_per_frame` is then this wait and
+                // `spawn_us_per_frame` the hand-off before it).
+                let started = std::time::Instant::now();
+                STATS.spawn_ns.fetch_add(started.duration_since(granted).as_nanos() as u64, Ordering::Relaxed);
                 let _slot = slot;
+                let held_slot = blocking_slot(&blocking_slots);
                 apply_recovery_nice();
                 apply_recovery_affinity();
                 let busy = std::time::Instant::now();
-                STATS.spawn_ns.fetch_add(busy.duration_since(granted).as_nanos() as u64, Ordering::Relaxed);
+                if held_slot.is_some() {
+                    STATS.acq_ns.fetch_add(busy.duration_since(started).as_nanos() as u64, Ordering::Relaxed);
+                }
                 let decoded = recover_frame::<P>(sent, pooled, claims, &attestations, cache.as_ref());
                 STATS.busy_ns.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                drop(held_slot);
                 decoded
             });
             // Full when ASYNC_FRAMES_IN_FLIGHT frames are still recovering or
@@ -1143,8 +1374,8 @@ where
             STATS.reply_ns.fetch_add(frame_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
             continue;
         }
-        let accepted = admit(&pool, raws, claims, attestations, cache.clone()).await;
-        let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
+        let accepted = admit(&pool, &setup, raws, claims, attestations, cache.clone()).await;
+        let pending = u32::try_from(queue_depth(&pool, setup.queue.as_ref())).unwrap_or(u32::MAX);
         write_half.write_u32_le(accepted).await?;
         write_half.write_u32_le(pending).await?;
     }
@@ -1267,6 +1498,7 @@ static STATS: IngestStats = IngestStats {
 
 async fn admit<P>(
     pool: &P,
+    setup: &Setup<P::Transaction>,
     raws: Vec<Bytes>,
     claims: Vec<Address>,
     attestations: Vec<n42_tx_types::FrameAttestation>,
@@ -1284,12 +1516,17 @@ where
     let started = std::time::Instant::now();
     let sent = raws.len();
     let (pooled, claims) = decode_frame::<P>(raws, claims);
-    let slot = std::sync::Arc::clone(recovery_slots())
-        .acquire_owned()
-        .await
-        .expect("the recovery semaphore is never closed");
+    let slot = match acquire_async_slot(&setup.slots).await {
+        Ok(slot) => slot,
+        Err(err) => {
+            warn!(target: "n42.tx_ingest", %err, "no recovery slot");
+            return 0;
+        }
+    };
+    let blocking_slots = setup.slots.clone();
     let decoded = match tokio::task::spawn_blocking(move || {
         let _slot = slot;
+        let _blocking_slot = blocking_slot(&blocking_slots);
         apply_recovery_nice();
         apply_recovery_affinity();
         let busy = std::time::Instant::now();
@@ -1306,7 +1543,30 @@ where
         }
     };
     let (decoded, frame) = decoded;
-    admit_decoded(pool, decoded, frame, started).await
+    admit_decoded(pool, setup, decoded, frame, started).await
+}
+
+/// The async side's slot: the semaphore's permit under [`Slots::Async`],
+/// nothing under [`Slots::Blocking`] (the blocking thread takes its own,
+/// [`blocking_slot`]).
+async fn acquire_async_slot(slots: &Slots) -> std::io::Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+    match slots {
+        Slots::Async(semaphore) => std::sync::Arc::clone(semaphore)
+            .acquire_owned()
+            .await
+            .map(Some)
+            .map_err(|err| std::io::Error::other(format!("the recovery semaphore closed: {err}"))),
+        Slots::Blocking(_) => Ok(None),
+    }
+}
+
+/// The blocking side's slot, waited for on the calling blocking thread
+/// under [`Slots::Blocking`]; nothing under [`Slots::Async`].
+fn blocking_slot(slots: &Slots) -> Option<runtime::BlockingSlot> {
+    match slots {
+        Slots::Blocking(slots) => Some(slots.acquire()),
+        Slots::Async(_) => None,
+    }
 }
 
 /// What the node runs on every frame admitted whole, before it is queued:
@@ -1326,6 +1586,7 @@ pub fn set_frame_hook(hook: FrameHook) {
 /// when their frame's recovery began.
 async fn admit_decoded<P>(
     pool: &P,
+    setup: &Setup<P::Transaction>,
     decoded: Vec<P::Transaction>,
     frame: Option<NewFrame>,
     started: std::time::Instant,
@@ -1365,8 +1626,9 @@ where
     // balance and fee -- which the builder's execution catches by dropping;
     // right for a generator that funds every sender, and the reason this is
     // opt-in.
-    if direct_to_queue() {
-        if let Some(queue) = n42_tx_queue::global::<P::Transaction>() {
+    let installed = if setup.direct && setup.queue.is_none() { n42_tx_queue::global::<P::Transaction>() } else { None };
+    if setup.direct {
+        if let Some(queue) = setup.queue.as_ref().or(installed.as_ref()) {
             // The frame's transactions stay in its index entry, so the vote
             // road takes the frame by reference (`TxQueue::push_frame`).
             let noted = frame.is_some();
@@ -1385,7 +1647,7 @@ where
     // transaction that did not come from this node: it is validated, priced and
     // gossiped exactly as one that arrived over RPC.
     let results = pool.add_transactions(TransactionOrigin::External, decoded).await;
-    if let Some(queue) = n42_tx_queue::global::<P::Transaction>() {
+    if let Some(queue) = setup.queue.clone().or_else(n42_tx_queue::global::<P::Transaction>) {
         note_frame(&queue, frame);
     }
     STATS.frames.fetch_add(1, Ordering::Relaxed);

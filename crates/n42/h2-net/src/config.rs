@@ -88,7 +88,69 @@ pub fn max_gossip_wire_size() -> usize {
 pub fn gov5_gossipsub_config(
     genesis_hash: B256,
 ) -> Result<gossipsub::Config, &'static str> {
+    let bounds = QueueBounds::from_env();
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        tracing::info!(target: "n42.h2.net",
+            handler_queue = bounds.handler_queue, max_ihave = bounds.max_ihave,
+            "gossipsub local queue bounds (N42_GOSSIP_HANDLER_QUEUE, N42_GOSSIP_MAX_IHAVE)");
+    });
+    gov5_gossipsub_config_with(genesis_hash, bounds)
+}
+
+/// Default of libp2p-gossipsub's `connection_handler_queue_len`.
+pub const DEFAULT_GOSSIP_HANDLER_QUEUE: usize = 5000;
+/// Default of libp2p-gossipsub's `max_control_messages_sent`, the cap on the ids
+/// of one IHAVE / IWANT (this libp2p version has no separate `max_ihave_length`).
+pub const DEFAULT_GOSSIP_MAX_IHAVE: usize = 5000;
+
+/// Local, wire-neutral bounds on gossipsub's memory: the per-peer send queue
+/// (in messages) and the ids per IHAVE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueBounds {
+    /// Messages a peer's send queue may hold.
+    pub handler_queue: usize,
+    /// Message ids one IHAVE may carry.
+    pub max_ihave: usize,
+}
+
+impl Default for QueueBounds {
+    fn default() -> Self {
+        Self {
+            handler_queue: DEFAULT_GOSSIP_HANDLER_QUEUE,
+            max_ihave: DEFAULT_GOSSIP_MAX_IHAVE,
+        }
+    }
+}
+
+impl QueueBounds {
+    /// Reads `N42_GOSSIP_HANDLER_QUEUE` and `N42_GOSSIP_MAX_IHAVE`.
+    pub fn from_env() -> Self {
+        Self::parse(
+            std::env::var("N42_GOSSIP_HANDLER_QUEUE").ok().as_deref(),
+            std::env::var("N42_GOSSIP_MAX_IHAVE").ok().as_deref(),
+        )
+    }
+
+    /// Unset, unparseable or zero values keep the default.
+    fn parse(queue: Option<&str>, ihave: Option<&str>) -> Self {
+        let get = |raw: Option<&str>, default: usize| {
+            raw.and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(default)
+        };
+        Self {
+            handler_queue: get(queue, DEFAULT_GOSSIP_HANDLER_QUEUE),
+            max_ihave: get(ihave, DEFAULT_GOSSIP_MAX_IHAVE),
+        }
+    }
+}
+
+fn gov5_gossipsub_config_with(
+    genesis_hash: B256,
+    bounds: QueueBounds,
+) -> Result<gossipsub::Config, &'static str> {
     gossipsub::ConfigBuilder::default()
+        .connection_handler_queue_len(bounds.handler_queue)
+        .max_control_messages_sent(bounds.max_ihave)
         .heartbeat_interval(GOSSIP_SUB_HEARTBEAT)
         .mesh_n(GOSSIP_SUB_D)
         .mesh_n_low(GOSSIP_SUB_D_LO)
@@ -126,6 +188,38 @@ mod tests {
     }
 
     #[test]
+    fn unset_env_leaves_the_default_config_field_for_field() {
+        let ours = gov5_gossipsub_config_with(B256::ZERO, QueueBounds::parse(None, None)).unwrap();
+        let lib = gossipsub::ConfigBuilder::default()
+            .heartbeat_interval(GOSSIP_SUB_HEARTBEAT)
+            .mesh_n(GOSSIP_SUB_D)
+            .mesh_n_low(GOSSIP_SUB_D_LO)
+            .mesh_n_high(GOSSIP_SUB_D_HI)
+            .history_length(GOSSIP_SUB_MCACHE_LEN)
+            .history_gossip(GOSSIP_SUB_MCACHE_GOSSIP)
+            .duplicate_cache_time(SEEN_MESSAGES_TTL)
+            .max_transmit_size(max_gossip_wire_size())
+            .validation_mode(gossipsub::ValidationMode::Anonymous)
+            .message_id_fn(gov5_message_id_fn(B256::ZERO))
+            .build()
+            .unwrap();
+        // Debug prints every field (the id function is a closure and is skipped).
+        assert_eq!(format!("{ours:?}"), format!("{lib:?}"));
+        assert_eq!(ours.connection_handler_queue_len(), 5000);
+        assert_eq!(ours.max_control_messages_sent(), 5000);
+    }
+
+    #[test]
+    fn env_values_are_applied_and_bad_ones_ignored() {
+        let b = QueueBounds::parse(Some(" 64 "), Some("500"));
+        assert_eq!(b, QueueBounds { handler_queue: 64, max_ihave: 500 });
+        let cfg = gov5_gossipsub_config_with(B256::ZERO, b).unwrap();
+        assert_eq!(cfg.connection_handler_queue_len(), 64);
+        assert_eq!(cfg.max_control_messages_sent(), 500);
+        assert_eq!(QueueBounds::parse(Some("0"), Some("x")), QueueBounds::default());
+    }
+
+    #[test]
     fn config_builds_with_gov5_parameters() {
         let cfg = gov5_gossipsub_config(B256::ZERO).unwrap();
         assert_eq!(cfg.mesh_n(), GOSSIP_SUB_D);
@@ -143,58 +237,17 @@ mod tests {
     }
 }
 
-/// The per-substream receive window for yamux, in bytes.
-///
-/// yamux's default is the specification's 256 KiB, which is a sensible number
-/// for a wide-area mesh of small messages and the wrong one for handing a
-/// twelve-megabyte block to a peer on the same host: the sender stops every
-/// 256 KiB until the receiver returns credit, so the transfer costs about
-/// forty-eight round trips through the receiver's event loop.
-///
-/// Measured on the seven-node fleet at the 163,000-transaction tier: a 12.2 MB
-/// body took 302 ms from published to received, which is 40 MB/s on loopback
-/// and 248 times what touching those bytes once costs. Every other step on the
-/// leader's path is 3-8 times that floor. Small bodies cross in 0.1 ms, which
-/// is what rules out a stalled event loop and leaves flow control.
-///
-/// The cost is memory: this much may be buffered per substream per peer. At the
-/// default of 16 MiB and six peers that is bounded by what the fleet already
-/// spends on one block, and `N42_YAMUX_WINDOW_MB` exists so a memory-constrained
-/// deployment can put it back.
-pub fn yamux_receive_window() -> Option<u32> {
-    const DEFAULT_MB: u32 = 16;
-    let mb = std::env::var("N42_YAMUX_WINDOW_MB")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(DEFAULT_MB);
-    (mb > 0).then(|| mb.clamp(1, 256) << 20)
-}
-
-/// yamux, with the receive window raised only if a round asked for it.
-///
-/// `N42_YAMUX_WINDOW_MB=0` leaves libp2p's default untouched. The distinction
-/// matters: libp2p-yamux 0.47 defaults to yamux 0.13, whose flow control tunes
-/// itself, while `set_receive_window_size` switches the connection back to
-/// yamux 0.12 and a fixed window. This is not "raise a number", it is "trade
-/// auto-tuning for a constant" — and on this fleet the constant wins, in a
-/// place that took two rounds each side to find.
+/// Yamux 0.14 uses adaptive receive windows. libp2p-yamux 0.48 no longer
+/// exposes the fixed-window and buffer-cap setters from the legacy backend.
+/// An explicit legacy window setting is reported once rather than silently
+/// implying that the old performance tuning is still in effect.
 pub fn yamux_config() -> libp2p::yamux::Config {
-    let Some(window) = yamux_receive_window() else {
-        return libp2p::yamux::Config::default();
-    };
-    let mut config = libp2p::yamux::Config::default();
-    #[allow(deprecated)]
-    config.set_receive_window_size(window);
-    // The buffer limit has to move with the window. yamux 0.12 keeps a
-    // separate per-stream buffer cap, 1 MiB by default, and closes the whole
-    // *connection* when a stream's unread data grows past it. A validator's
-    // loop does not poll its swarm while it awaits a block import -- 700 ms
-    // at the 163,000-transaction tier -- and a peer that keeps sending into a
-    // 16 MiB window fills the 1 MiB buffer in that time. Measured: 18-36
-    // `buffer of stream grows beyond limit` per node per round, each followed
-    // by a `dial failed` and, when it hit a proposal or a quorum's votes, a
-    // six-second view timeout. That was the tail of the block cycle.
-    #[allow(deprecated)]
-    config.set_max_buffer_size(window as usize);
-    config
+    static NOTICE: std::sync::Once = std::sync::Once::new();
+    NOTICE.call_once(|| {
+        if let Some(window) = std::env::var_os("N42_YAMUX_WINDOW_MB") {
+            tracing::warn!(target: "n42.h2.net", ?window,
+                "N42_YAMUX_WINDOW_MB is unsupported by libp2p 0.57; using adaptive Yamux flow control");
+        }
+    });
+    libp2p::yamux::Config::default()
 }

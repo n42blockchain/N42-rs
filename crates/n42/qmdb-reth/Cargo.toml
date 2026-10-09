@@ -15,6 +15,7 @@ n42-h2-primitives.workspace = true
 n42-qmdb-state.workspace = true
 rayon.workspace = true
 n42-twig-core.workspace = true
+n42-core-layout.workspace = true
 alloy-consensus.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives = { workspace = true, features = ["serde"] }
@@ -23,6 +24,11 @@ reth-chainspec.workspace = true
 reth-cli.workspace = true
 reth-engine-primitives.workspace = true
 reth-engine-tree.workspace = true
+reth-chain-state.workspace = true
+reth-network-p2p.workspace = true
+reth-payload-builder.workspace = true
+reth-payload-primitives.workspace = true
+reth-tasks.workspace = true
 reth-ethereum-cli.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-execution-types.workspace = true
@@ -46,6 +52,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+reth-ethereum-engine-primitives.workspace = true
 # The read_bench example: point reads of the same accounts from MDBX and from QMDB.
 reth-db = { workspace = true, features = ["mdbx"] }
 reth-db-api.workspace = true

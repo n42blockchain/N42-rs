@@ -254,7 +254,9 @@ pub(crate) enum ByRef<T: PoolTransaction> {
 #[derive(Debug)]
 struct FrameEntry<T: PoolTransaction> {
     hashes: Arc<[B256]>,
-    runs: Vec<SenderRun>,
+    /// Shared so a plan snapshot (`crate::snapshot`) copies a frame's runs
+    /// as one `Arc` clone.
+    runs: Arc<[SenderRun]>,
     gas: u64,
     /// The transactions themselves, in frame order, when the frame was
     /// noted with them ([`crate::TxQueue::push_frame`]); `None` and
@@ -301,7 +303,7 @@ impl<T: PoolTransaction> FrameEntry<T> {
         }
         let txs_gas =
             txs.as_ref().map_or(0, |txs| txs.iter().map(|tx| tx.gas_limit()).fold(0u64, u64::saturating_add));
-        Some((frame.id, Self { hashes: frame.hashes.into(), runs, gas: frame.gas, txs, txs_gas }))
+        Some((frame.id, Self { hashes: frame.hashes.into(), runs: runs.into(), gas: frame.gas, txs, txs_gas }))
     }
 
     /// Every position's (sender, nonce), in frame order.
@@ -312,6 +314,95 @@ impl<T: PoolTransaction> FrameEntry<T> {
             })
         })
     }
+}
+
+/// What [`check_runs_of`] reads of a lane: the lane itself under the
+/// lanes' lock, or a plan snapshot's copy of it (`crate::snapshot`).
+/// Entries are compared by allocation address only, never dereferenced.
+pub(crate) trait RunLane {
+    /// Whether the lane is parked behind a hole.
+    fn is_parked(&self) -> bool;
+    /// The lane's lowest queued nonce.
+    fn head(&self) -> Option<u64>;
+    /// (nonce, allocation address) of the entries in `lo..hi`, ascending;
+    /// `lo < hi`.
+    fn range_addrs(&self, lo: u64, hi: u64) -> impl Iterator<Item = (u64, usize)> + '_;
+    /// Whether the lane holds `nonce`.
+    fn holds(&self, nonce: u64) -> bool;
+    /// How many entries the lane holds in `lo..hi`; `lo < hi`.
+    fn count_in(&self, lo: u64, hi: u64) -> u64;
+}
+
+impl<T: PoolTransaction> RunLane for Lane<T> {
+    fn is_parked(&self) -> bool {
+        self.parked.is_some()
+    }
+    fn head(&self) -> Option<u64> {
+        self.by_nonce.first_key_value().map(|(nonce, _)| *nonce)
+    }
+    fn range_addrs(&self, lo: u64, hi: u64) -> impl Iterator<Item = (u64, usize)> + '_ {
+        self.by_nonce.range(lo..hi).map(|(nonce, held)| (*nonce, Arc::as_ptr(held) as usize))
+    }
+    fn holds(&self, nonce: u64) -> bool {
+        self.by_nonce.contains_key(&nonce)
+    }
+    fn count_in(&self, lo: u64, hi: u64) -> u64 {
+        self.by_nonce.range(lo..hi).count() as u64
+    }
+}
+
+/// [`FrameIndex::check_runs`] of one frame's runs and transactions against
+/// whatever `lane_of` reads the lanes from. A lane entry is the frame's own
+/// transaction when its allocation address is the frame's `Arc`'s (the
+/// frame keeps that allocation alive, so an equal address is the same
+/// allocation).
+pub(crate) fn check_runs_of<'l, T, L>(
+    runs: &[SenderRun],
+    txs: Option<&FrameTxs<T>>,
+    txs_gas: u64,
+    lane_of: impl Fn(&Address) -> Option<&'l L>,
+) -> RunCheck<T>
+where
+    T: PoolTransaction,
+    L: RunLane + 'l,
+{
+    let Some(txs) = txs else { return RunCheck::Slow };
+    let unusable = RunCheck::Unusable { gas: txs_gas };
+    let mut below = Vec::new();
+    for (idx, run) in runs.iter().enumerate() {
+        let Some(lane) = lane_of(&run.sender) else { return unusable };
+        if lane.is_parked() {
+            return unusable;
+        }
+        let Some(head) = lane.head() else { return unusable };
+        let Some(target) = run.first_nonce.checked_sub(u64::from(run.before)) else { return unusable };
+        if target < head {
+            return unusable;
+        }
+        let Some(last) = run.first_nonce.checked_add(u64::from(run.len)) else { return RunCheck::Slow };
+        let mut expect = run.first_nonce;
+        for (at, (nonce, held)) in (run.start as usize..).zip(lane.range_addrs(run.first_nonce, last)) {
+            if nonce != expect {
+                return unusable;
+            }
+            let Some(own) = txs.get(at) else { return RunCheck::Slow };
+            if held != Arc::as_ptr(own) as usize {
+                return RunCheck::Slow;
+            }
+            expect += 1;
+        }
+        if expect != last {
+            return unusable;
+        }
+        if run.before > 0 && !lane.holds(target) {
+            return unusable;
+        }
+        if target > head {
+            let Ok(idx) = u32::try_from(idx) else { return RunCheck::Slow };
+            below.push((idx, run.sender, lane.count_in(head, target)));
+        }
+    }
+    RunCheck::Ok { txs: Arc::clone(txs), gas: txs_gas, below }
 }
 
 /// The index itself: a plain map plus the arrival order.
@@ -378,19 +469,81 @@ impl<T: PoolTransaction> FrameIndex<T> {
     /// whose canonical watermark is at or past a run's first nonce. Called
     /// after a canonical prune has raised the watermarks.
     pub(crate) fn sweep(&mut self, lanes: &AddressHashMap<Lane<T>>) -> usize {
-        let before = self.frames.len();
-        self.frames.retain(|_, entry| {
-            !entry.runs.iter().any(|run| {
-                lanes.get(&run.sender).is_some_and(|lane| lane.chain_mined(run.first_nonce))
+        let mut gone = Vec::new();
+        self.sweep_into(lanes, &mut gone);
+        gone.len()
+    }
+
+    /// [`Self::sweep`], handing the dropped frames' transactions to `gone`
+    /// instead of freeing them here: the caller holds the lanes' lock, and a
+    /// frame's last reference to its transactions is often this one, so the
+    /// free of a block's worth (200,000 allocations) would otherwise happen
+    /// under it. Each dropped frame's own `by_first` entry is removed by its
+    /// first hash rather than by a pass over every indexed frame.
+    pub(crate) fn sweep_into(&mut self, lanes: &AddressHashMap<Lane<T>>, gone: &mut Vec<FrameTxs<T>>) -> usize {
+        let dead: Vec<B256> = self
+            .frames
+            .iter()
+            .filter(|(_, entry)| {
+                entry.runs.iter().any(|run| {
+                    lanes.get(&run.sender).is_some_and(|lane| lane.chain_mined(run.first_nonce))
+                })
             })
-        });
-        let gone = before - self.frames.len();
-        if gone > 0 {
-            let frames = &self.frames;
-            self.by_first.retain(|_, id| frames.contains_key(id));
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &dead {
+            if let Some(entry) = self.frames.remove(id) {
+                if let Some(first) = entry.hashes.first()
+                    && self.by_first.get(first) == Some(id)
+                {
+                    self.by_first.remove(first);
+                }
+                if let Some(txs) = entry.txs {
+                    gone.push(txs);
+                }
+            }
+        }
+        if !dead.is_empty() {
             self.compact();
         }
-        gone
+        dead.len()
+    }
+
+    /// [`Self::sweep_into`] over `ids` only, without compacting the arrival
+    /// order: one bounded hold of an off-lock prune's sweep
+    /// (`N42_QUEUE_OFFLOCK`), which compacts once at its end
+    /// ([`Self::compact_order`]). An id no longer indexed is passed over.
+    pub(crate) fn sweep_ids_into(
+        &mut self,
+        ids: &[B256],
+        lanes: &AddressHashMap<Lane<T>>,
+        gone: &mut Vec<FrameTxs<T>>,
+    ) -> usize {
+        let mut dead = 0usize;
+        for id in ids {
+            let Some(entry) = self.frames.get(id) else { continue };
+            if !entry.runs.iter().any(|run| lanes.get(&run.sender).is_some_and(|lane| lane.chain_mined(run.first_nonce))) {
+                continue;
+            }
+            if let Some(entry) = self.frames.remove(id) {
+                if let Some(first) = entry.hashes.first()
+                    && self.by_first.get(first) == Some(id)
+                {
+                    self.by_first.remove(first);
+                }
+                if let Some(txs) = entry.txs {
+                    gone.push(txs);
+                }
+                dead += 1;
+            }
+        }
+        dead
+    }
+
+    /// Compacts the arrival order when the ids no longer indexed outnumber
+    /// the live ones (what every sweep does at its end).
+    pub(crate) fn compact_order(&mut self) {
+        self.compact();
     }
 
     /// The frames in arrival order, each with whether a build could take it
@@ -437,7 +590,7 @@ impl<T: PoolTransaction> FrameIndex<T> {
         if entry.txs_gas > gas_left {
             return ByRef::Slow;
         }
-        for run in &entry.runs {
+        for run in entry.runs.iter() {
             let Some(lane) = lanes.get(&run.sender) else { return ByRef::Unusable };
             if lane.parked.is_some() {
                 return ByRef::Unusable;
@@ -480,43 +633,20 @@ impl<T: PoolTransaction> FrameIndex<T> {
     /// allocation, so no other frame's take removes one this frame holds.
     pub(crate) fn check_runs(&self, id: &B256, lanes: &AddressHashMap<Lane<T>>) -> RunCheck<T> {
         let Some(entry) = self.frames.get(id) else { return RunCheck::Slow };
-        let Some(txs) = entry.txs.as_ref() else { return RunCheck::Slow };
-        let unusable = RunCheck::Unusable { gas: entry.txs_gas };
-        let mut below = Vec::new();
-        for (idx, run) in entry.runs.iter().enumerate() {
-            let Some(lane) = lanes.get(&run.sender) else { return unusable };
-            if lane.parked.is_some() {
-                return unusable;
-            }
-            let Some((&head, _)) = lane.by_nonce.first_key_value() else { return unusable };
-            let Some(target) = run.first_nonce.checked_sub(u64::from(run.before)) else { return unusable };
-            if target < head {
-                return unusable;
-            }
-            let Some(last) = run.first_nonce.checked_add(u64::from(run.len)) else { return RunCheck::Slow };
-            let mut expect = run.first_nonce;
-            for (at, (&nonce, held)) in (run.start as usize..).zip(lane.by_nonce.range(run.first_nonce..last)) {
-                if nonce != expect {
-                    return unusable;
-                }
-                let Some(own) = txs.get(at) else { return RunCheck::Slow };
-                if !Arc::ptr_eq(held, own) {
-                    return RunCheck::Slow;
-                }
-                expect += 1;
-            }
-            if expect != last {
-                return unusable;
-            }
-            if run.before > 0 && !lane.by_nonce.contains_key(&target) {
-                return unusable;
-            }
-            if target > head {
-                let Ok(idx) = u32::try_from(idx) else { return RunCheck::Slow };
-                below.push((idx, run.sender, lane.by_nonce.range(head..target).count() as u64));
-            }
-        }
-        RunCheck::Ok { txs: Arc::clone(txs), gas: entry.txs_gas, below }
+        check_runs_of(&entry.runs, entry.txs.as_ref(), entry.txs_gas, |sender| lanes.get(sender))
+    }
+
+    /// What a plan snapshot copies of an indexed frame (`crate::snapshot`):
+    /// its runs, hashes, own transactions (`None` when noted without them)
+    /// and their gas, each one `Arc` clone. `None` for a frame not indexed.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn snapshot_of(
+        &self,
+        id: &B256,
+    ) -> Option<(Arc<[SenderRun]>, Arc<[B256]>, Option<FrameTxs<T>>, u64)> {
+        self.frames
+            .get(id)
+            .map(|entry| (Arc::clone(&entry.runs), Arc::clone(&entry.hashes), entry.txs.clone(), entry.txs_gas))
     }
 
     /// The gas of a frame's own transactions, summed at admission: `None`
@@ -528,7 +658,7 @@ impl<T: PoolTransaction> FrameIndex<T> {
     /// A frame's sender runs and hashes, for the take after
     /// [`Self::check_by_ref`].
     pub(crate) fn runs_and_hashes(&self, id: &B256) -> Option<(&[SenderRun], &Arc<[B256]>)> {
-        self.frames.get(id).map(|entry| (entry.runs.as_slice(), &entry.hashes))
+        self.frames.get(id).map(|entry| (&entry.runs[..], &entry.hashes))
     }
 
     /// The transactions a frame was noted with, shared: `None` for a frame

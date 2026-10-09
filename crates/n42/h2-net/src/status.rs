@@ -185,6 +185,11 @@ pub fn decode_varint(bytes: &[u8]) -> Result<(u64, usize), StatusError> {
     let mut value = 0u64;
     let mut shift = 0u32;
     for (i, byte) in bytes.iter().take(10).enumerate() {
+        // The tenth byte holds only bit 63. checked_shl checks the shift,
+        // not whether the value loses high bits when shifted.
+        if i == 9 && *byte > 1 {
+            return Err(StatusError::Varint);
+        }
         value |= u64::from(byte & 0x7f)
             .checked_shl(shift)
             .ok_or(StatusError::Varint)?;
@@ -229,6 +234,10 @@ pub fn unframe_payload_limit(bytes: &[u8], max_decoded: u64) -> Result<Vec<u8>, 
     decoder
         .read_exact(&mut out)
         .map_err(|e| StatusError::Snappy(e.to_string()))?;
+    let mut extra = [0u8; 1];
+    if decoder.read(&mut extra).map_err(|e| StatusError::Snappy(e.to_string()))? != 0 {
+        return Err(StatusError::Snappy("data exceeds declared length".into()));
+    }
     Ok(out)
 }
 
@@ -271,6 +280,9 @@ pub fn framed_len_limit(bytes: &[u8], max_decoded: u64) -> Result<Option<usize>,
         if body_end > bytes.len() {
             return Ok(None);
         }
+        if matches!(chunk_type, 0x00 | 0x01) && chunk_len < 4 {
+            return Err(StatusError::Snappy("data chunk shorter than its CRC".into()));
+        }
         match chunk_type {
             // Stream identifier: contributes nothing.
             0xff => {}
@@ -287,6 +299,9 @@ pub fn framed_len_limit(bytes: &[u8], max_decoded: u64) -> Result<Option<usize>,
             0x80..=0xfe => {}
             other => return Err(StatusError::Snappy(format!("reserved chunk type {other:#x}"))),
         }
+        if produced > declared {
+            return Err(StatusError::Snappy("data exceeds declared length".into()));
+        }
         cursor = body_end;
     }
     Ok(Some(cursor))
@@ -296,6 +311,38 @@ pub fn framed_len_limit(bytes: &[u8], max_decoded: u64) -> Result<Option<usize>,
 mod tests {
     use super::*;
     use serde::Deserialize;
+
+    #[test]
+    fn overflowing_varints_are_rejected() {
+        for last in [2, 0x7f, 0x80, 0xff] {
+            let mut bytes = vec![0x80; 9];
+            bytes.push(last);
+            assert!(matches!(decode_varint(&bytes), Err(StatusError::Varint)));
+            assert!(framed_len(&bytes).is_err());
+            assert!(unframe_payload(&bytes).is_err());
+        }
+        assert_eq!(decode_varint(&encode_varint(u64::MAX)).unwrap().0, u64::MAX);
+    }
+
+    #[test]
+    fn short_snappy_data_chunks_are_rejected_without_panicking() {
+        for kind in [0x00, 0x01] {
+            for len in 0..4u8 {
+                let mut bytes = encode_varint(1);
+                bytes.extend_from_slice(&[kind, len, 0, 0]);
+                bytes.extend(std::iter::repeat_n(0, len as usize));
+                assert!(framed_len(&bytes).is_err(), "kind {kind}, length {len}");
+            }
+        }
+    }
+
+    #[test]
+    fn snappy_chunk_cannot_exceed_declared_output() {
+        let mut bytes = frame_payload(&[42; 72]).unwrap();
+        bytes[0] = 1;
+        assert!(framed_len(&bytes).is_err());
+        assert!(unframe_payload(&bytes).is_err());
+    }
 
     #[derive(Deserialize)]
     struct Vector {

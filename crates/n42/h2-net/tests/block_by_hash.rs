@@ -30,6 +30,23 @@ async fn listening(transport: &mut H2V4Transport) -> Multiaddr {
 
 #[tokio::test]
 async fn a_peer_gets_the_body_it_asks_for_or_gov5s_not_found() {
+    round_trip_body(vec![0xc4, 0xc0, 0xc0, 0xc0, 0xc0]).await;
+}
+
+#[tokio::test]
+async fn an_incompressible_body_crosses_many_adaptive_receive_windows() {
+    // Public deterministic test bytes, intentionally not Snappy-compressible.
+    let mut state = 0x9e3779b97f4a7c15u64;
+    let body = (0..2 * 1024 * 1024).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    }).collect();
+    round_trip_body(body).await;
+}
+
+async fn round_trip_body(body: Vec<u8>) {
     let loopback: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
     let mut server = H2V4Transport::new(TransportConfig::new(IDENTITY).with_listen_addr(loopback.clone())).unwrap();
     let server_addr = listening(&mut server).await;
@@ -39,7 +56,6 @@ async fn a_peer_gets_the_body_it_asks_for_or_gov5s_not_found() {
 
     let known = B256::repeat_byte(0xAA);
     let unknown = B256::repeat_byte(0xBB);
-    let body = vec![0xc4, 0xc0, 0xc0, 0xc0, 0xc0];
 
     // The server answers whatever it is asked; the client asks once connected.
     let body_for_server = body.clone();

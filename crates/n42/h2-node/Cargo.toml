@@ -46,5 +46,11 @@ n42-qmdb-reth.workspace = true
 reth-cli.workspace = true
 url.workspace = true
 
+[features]
+# The assembly Keccak backend for the fleet examples (h2_validator, tx_flood):
+# bit-identical to the software backend, several times faster.
+default = ["asm-keccak"]
+asm-keccak = ["alloy-primitives/asm-keccak"]
+
 [lints]
 workspace = true

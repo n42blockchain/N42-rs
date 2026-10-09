@@ -7,7 +7,9 @@
 #![allow(missing_docs, unreachable_pub, unused_crate_dependencies)]
 
 use alloy_primitives::{Address, U256};
-use n42_engine_types::output_shards::{any_destroyed, hashed_post_state_of, output_shards, FrozenShards, OutputShards};
+use n42_engine_types::output_shards::{
+    any_destroyed, hashed_post_state_of, live_index_defer, output_shards, FrozenShards, LiveLockCounts, OutputShards,
+};
 use n42_engine_types::parallel_transfer::{append_reverts, graft_bundles_folded, install_staged, GraftFold, StagedGraft};
 use reth_revm::db::State;
 use revm::database::BundleState;
@@ -289,6 +291,241 @@ fn batches_writing_at_once_give_the_same_output() {
     }
 }
 
+/// `N42_LIVE_INDEX_DEFER`: a live index whose hand-overs leave shards to the
+/// freeze -- every other shard of every batch (`forced`), or the busy ones
+/// of batches handed over at once -- gives the direct graft's output, in
+/// order and reversed, at 1, 16 and 64 shards.
+#[test]
+fn a_live_index_with_shards_left_to_the_freeze_equals_the_direct_graft() {
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let (expected, _) = direct(&db, bundles.clone(), false);
+    let live = Mode { index: true, live: true };
+    for count in [1, 16, 64] {
+        for reversed in [false, true] {
+            let mut ordered = bundles.clone();
+            if reversed {
+                ordered.reverse();
+            }
+            let mut shards = shards_with(count, live);
+            shards.set_live_defer(true, true);
+            for bundle in ordered {
+                shards.add(bundle);
+            }
+            let got = sharded(&db, shards.freeze());
+            assert_same(&format!("{count} shards, forced deferral, reversed {reversed}"), &expected, &got);
+        }
+        for _ in 0..4 {
+            let mut shards = shards_with(count, live);
+            shards.set_live_defer(true, false);
+            std::thread::scope(|scope| {
+                for bundle in bundles.clone() {
+                    let shards = &shards;
+                    scope.spawn(move || shards.add(bundle));
+                }
+            });
+            let got = sharded(&db, shards.freeze());
+            assert_same(&format!("{count} shards, busy deferral, concurrent"), &expected, &got);
+        }
+    }
+    // The counters see the hand-overs: a forced deferral leaves shards and
+    // holds locks on this thread, and never waits.
+    let before = LiveLockCounts::now();
+    let mut shards = shards_with(16, live);
+    shards.set_live_defer(true, true);
+    for bundle in bundles.clone() {
+        shards.add(bundle);
+    }
+    let counts = LiveLockCounts::now().since(before);
+    assert!(counts.deferred > 0, "{counts:?}");
+    assert!(counts.hold_ns > 0, "{counts:?}");
+    assert_eq!(counts.waits, 0, "{counts:?}");
+    drop(shards.freeze());
+    assert!(!live_index_defer() || std::env::var("N42_LIVE_INDEX_DEFER").is_ok(), "off by default");
+}
+
+/// `N42_FREEZE_AFTER_SEAL`: the freeze on a thread of its own, joined after
+/// other work on the build pool and beside a job of its own (the receipts'
+/// place), leaves the same shards as the freeze inline: the merged bundle,
+/// the view the QMDB root and the hashed post-state read, the operations, and
+/// the staged fallback -- in every mode, with the live index's deferral forced
+/// and with busy shards left by concurrent hand-overs.
+/// `N42_FREEZE_POOL=own`: the freeze with its tasks and frees on a small pool
+/// of its own (here 3 threads, with the build pool busy beside it) freezes the
+/// same shards as on the build pool: accounts, beneficiary, the merged
+/// bundle, the view's QMDB operations and hashed post-state, at 1, 16 and 64
+/// shards in every index mode and live deferral.
+#[test]
+fn a_freeze_on_its_own_pool_equals_the_inline_freeze() {
+    use rayon::prelude::*;
+    let own = rayon::ThreadPoolBuilder::new().num_threads(3).build().expect("a pool for the test");
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let (expected, _) = direct(&db, bundles.clone(), false);
+    let fill = |count: usize, mode: Mode, deferral: Option<bool>| {
+        let mut shards = shards_with(count, mode);
+        if let Some(forced) = deferral {
+            shards.set_live_defer(true, forced);
+        }
+        for bundle in bundles.clone() {
+            shards.add(bundle);
+        }
+        shards
+    };
+    for count in [1, 16, 64] {
+        for mode in MODES {
+            let deferrals: &[Option<bool>] = if mode.live { &[None, Some(true), Some(false)] } else { &[None] };
+            for &deferral in deferrals {
+                let label = format!("{count} shards, index {mode}, deferral {deferral:?}");
+                let inline = fill(count, mode, deferral).freeze_on(n42_engine_types::parallel_transfer::build_pool());
+                let shards = fill(count, mode, deferral);
+                let (on_own, _) = rayon::join(
+                    || shards.freeze_on(&own),
+                    || {
+                        n42_engine_types::parallel_transfer::build_pool()
+                            .install(|| (0..200_000u64).into_par_iter().map(|i| i.wrapping_mul(i)).sum::<u64>())
+                    },
+                );
+                assert_eq!(on_own.shard_count(), inline.shard_count(), "{label}: shards");
+                assert_eq!(on_own.accounts(), inline.accounts(), "{label}: accounts");
+                assert_eq!(on_own.beneficiary_delta(), inline.beneficiary_delta(), "{label}: beneficiary");
+                let (on_own, own_residual) = sharded_parts(&db, on_own);
+                let (inline, inline_residual) = sharded_parts(&db, inline);
+                assert_same(&format!("{label}: residual"), &inline_residual, &own_residual);
+                let own_merged = on_own.merged(&own_residual);
+                assert_same(&format!("{label}: against the graft"), &expected, &own_merged);
+                assert_same(&format!("{label}: against the build pool"), &inline.merged(&inline_residual), &own_merged);
+                let own_overlaps = on_own.overlaps(&own_residual);
+                let inline_overlaps = inline.overlaps(&inline_residual);
+                let own_view = on_own.view(&own_residual, &own_overlaps);
+                let inline_view = inline.view(&inline_residual, &inline_overlaps);
+                for prague in [false, true] {
+                    assert_eq!(
+                        n42_qmdb_reth::sorted_operations_from_accounts(&own_view, prague),
+                        n42_qmdb_reth::sorted_operations_from_accounts(&inline_view, prague),
+                        "{label}: QMDB operations, prague {prague}"
+                    );
+                }
+                assert_eq!(hashed_post_state_of(&own_view), hashed_post_state_of(&inline_view), "{label}: hashed");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_freeze_on_its_own_thread_equals_the_inline_freeze() {
+    use rayon::prelude::*;
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let (expected, _) = direct(&db, bundles.clone(), false);
+    let fill = |count: usize, mode: Mode, deferral: Option<bool>, concurrent: bool| {
+        let mut shards = shards_with(count, mode);
+        if let Some(forced) = deferral {
+            shards.set_live_defer(true, forced);
+        }
+        if concurrent {
+            std::thread::scope(|scope| {
+                for bundle in bundles.clone() {
+                    let shards = &shards;
+                    scope.spawn(move || shards.add(bundle));
+                }
+            });
+        } else {
+            for bundle in bundles.clone() {
+                shards.add(bundle);
+            }
+        }
+        shards
+    };
+    for count in [1, 16, 64] {
+        for mode in MODES {
+            let deferrals: &[Option<bool>] = if mode.live { &[None, Some(true), Some(false)] } else { &[None] };
+            for &deferral in deferrals {
+                let label = format!("{count} shards, index {mode}, deferral {deferral:?}");
+                let inline = fill(count, mode, deferral, deferral == Some(false)).freeze();
+                let handle = match fill(count, mode, deferral, deferral == Some(false)).freeze_on_thread() {
+                    Ok(handle) => handle,
+                    Err(_) => panic!("{label}: no thread for the freeze"),
+                };
+                // The pool busy and a job beside the join, as behind the seal.
+                let busy: u64 = n42_engine_types::parallel_transfer::build_pool()
+                    .install(|| (0..200_000u64).into_par_iter().map(|i| i.wrapping_mul(i)).sum());
+                let (late, took, ended) = std::thread::scope(|scope| {
+                    let beside = scope.spawn(move || busy.count_ones());
+                    let joined = handle.join().map_err(|_| "the freeze panicked");
+                    let _ = beside.join();
+                    joined
+                })
+                .unwrap_or_else(|why| panic!("{label}: {why}"));
+                assert!(ended.elapsed() < std::time::Duration::from_secs(60) && took > std::time::Duration::ZERO, "{label}");
+                assert_eq!(late.shard_count(), inline.shard_count(), "{label}: shards");
+                assert_eq!(late.accounts(), inline.accounts(), "{label}: accounts");
+                assert_eq!(late.beneficiary_delta(), inline.beneficiary_delta(), "{label}: beneficiary");
+                let (late, late_residual) = sharded_parts(&db, late);
+                let (inline, inline_residual) = sharded_parts(&db, inline);
+                assert_same(&format!("{label}: residual"), &inline_residual, &late_residual);
+                let late_merged = late.merged(&late_residual);
+                assert_same(&format!("{label}: against the graft"), &expected, &late_merged);
+                assert_same(&format!("{label}: against the inline freeze"), &inline.merged(&inline_residual), &late_merged);
+                let late_overlaps = late.overlaps(&late_residual);
+                let inline_overlaps = inline.overlaps(&inline_residual);
+                let late_view = late.view(&late_residual, &late_overlaps);
+                let inline_view = inline.view(&inline_residual, &inline_overlaps);
+                for prague in [false, true] {
+                    assert_eq!(
+                        n42_qmdb_reth::sorted_operations_from_accounts(&late_view, prague),
+                        n42_qmdb_reth::sorted_operations_from_accounts(&inline_view, prague),
+                        "{label}: QMDB operations, prague {prague}"
+                    );
+                }
+                assert_eq!(hashed_post_state_of(&late_view), hashed_post_state_of(&inline_view), "{label}: hashed");
+            }
+            // The fallback: the late freeze placed into the staged graft.
+            let mut state = block_state(&db);
+            let late = match fill(count, mode, None, false).freeze_on_thread() {
+                Ok(handle) => handle.join().map(|(frozen, _, _)| frozen).unwrap_or_else(|_| panic!("the freeze panicked")),
+                Err(_) => panic!("no thread for the freeze"),
+            };
+            let graft = install_staged(&mut state, late.into_staged(), false).expect("an in-memory database");
+            let mut got = finish(&mut state, graft.beneficiary_delta, false, from_bundle);
+            append_reverts(&mut got, graft.reverts);
+            assert_same(&format!("{count} shards, index {mode}: staged after a late freeze"), &expected, &got);
+        }
+    }
+}
+
+/// `N42_ROOT_OPS_AHEAD`: the shards' operations encoded before the residual
+/// exists, finished as the root job finishes them (the residual's accounts the
+/// shards hold replaced by the overlaps, the rest added), equal the operations
+/// of the view and of the merged bundle, in every mode and shard count.
+#[test]
+fn the_operations_encoded_ahead_equal_the_views() {
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    for (count, mode) in [1, 16, 64].into_iter().flat_map(|count| MODES.map(|mode| (count, mode))) {
+        let (shards, residual) = sharded_parts(&db, shards_of(bundles.clone(), count, mode));
+        let empty = BundleState::default();
+        let ahead_accounts = shards.view(&empty, &[]);
+        let overlaps = shards.overlaps(&residual);
+        assert!(!overlaps.is_empty(), "{count} shards: an overlap to replace");
+        let view = shards.view(&residual, &overlaps);
+        let merged = shards.merged(&residual);
+        let replaced: Vec<_> =
+            residual.state.keys().filter_map(|address| shards.get(address).map(|account| (address, account))).collect();
+        let newer: Vec<_> = residual
+            .state
+            .iter()
+            .filter(|(address, _)| !shards.holds(address))
+            .chain(overlaps.iter().map(|(address, account)| (address, account)))
+            .collect();
+        for prague in [false, true] {
+            let got = n42_qmdb_reth::operations_ahead(&ahead_accounts, prague).finish(&replaced, &newer, prague);
+            assert_eq!(got, n42_qmdb_reth::sorted_operations_from_accounts(&view, prague), "{count} shards, {mode}: view");
+            assert_eq!(got, n42_qmdb_reth::sorted_operations_from_execution(&merged, prague), "{count} shards, {mode}: merged");
+        }
+    }
+}
+
 #[test]
 fn the_fallback_with_the_cache_kept_equals_the_direct_graft() {
     let db = parent();
@@ -551,4 +788,145 @@ fn the_batch_states_bundles_equal_the_states_through_the_index() {
     let indexed_ours = sharded(&db, shards_of(ours, 16, MODES[1]));
     assert_same("index", &indexed_ours, &indexed_theirs);
     assert_same("index against the graft", &indexed_ours, &direct_theirs);
+}
+
+/// `N42_MERGE_AT_SHARDS_READY` (`docs/SHARED_EXECUTION_SCOPE.md` 18.7 item
+/// 3): the merge on a pool of its own, parallel by source map
+/// (`FrozenShards::merged_on`), is the serial merge's bundle -- every account,
+/// the contracts, the reverts in their order and the sizes (the account map's
+/// iteration order is no property of either: its hasher is seeded per map,
+/// so two serial merges of the same shards iterate differently, and every
+/// consumer sorts) -- at 1, 16 and 64 shards, in every index mode and live
+/// deferral, on a one-thread and a four-thread pool, with the build pool busy
+/// beside it; and it equals the direct graft. The QMDB operations and the
+/// hashed post-state derived from it are the serial merge's.
+#[test]
+fn the_merge_on_its_own_pool_equals_the_serial_merge() {
+    use rayon::prelude::*;
+    let pools: Vec<rayon::ThreadPool> =
+        [1, 4].into_iter().map(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().expect("a pool for the test")).collect();
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let (expected, _) = direct(&db, bundles.clone(), false);
+    for count in [1, 16, 64] {
+        for mode in MODES {
+            let deferrals: &[Option<bool>] = if mode.live { &[None, Some(true), Some(false)] } else { &[None] };
+            for &deferral in deferrals {
+                let mut shards = shards_with(count, mode);
+                if let Some(forced) = deferral {
+                    shards.set_live_defer(true, forced);
+                }
+                for bundle in bundles.clone() {
+                    shards.add(bundle);
+                }
+                let (shards, residual) = sharded_parts(&db, shards.freeze());
+                let serial = shards.merged(&residual);
+                for pool in &pools {
+                    let label = format!("{count} shards, index {mode}, deferral {deferral:?}, {} threads", pool.current_num_threads());
+                    let ((parallel, split), _) = rayon::join(
+                        || shards.merged_on(&residual, pool),
+                        || {
+                            n42_engine_types::parallel_transfer::build_pool()
+                                .install(|| (0..200_000u64).into_par_iter().map(|i| i.wrapping_mul(i)).sum::<u64>())
+                        },
+                    );
+                    assert!(split.total_us >= split.append_us, "{label}: split");
+                    assert_same(&format!("{label}: against the serial merge"), &serial, &parallel);
+                    assert_same(&format!("{label}: against the graft"), &expected, &parallel);
+                    for prague in [false, true] {
+                        assert_eq!(
+                            n42_qmdb_reth::sorted_operations_from_execution(&parallel, prague),
+                            n42_qmdb_reth::sorted_operations_from_execution(&serial, prague),
+                            "{label}: QMDB operations, prague {prague}"
+                        );
+                    }
+                    let (parallel_accounts, serial_accounts): (Vec<_>, Vec<_>) =
+                        (parallel.state.iter().collect(), serial.state.iter().collect());
+                    assert_eq!(
+                        hashed_post_state_of(&parallel_accounts),
+                        hashed_post_state_of(&serial_accounts),
+                        "{label}: hashed post-state"
+                    );
+                    // The graft's own reverts appended after either merge.
+                    let mut tail = (serial.clone(), parallel.clone());
+                    let extra = vec![(addr(77_000_001), Default::default()), (addr(77_000_002), Default::default())];
+                    append_reverts(&mut tail.0, extra.clone());
+                    append_reverts(&mut tail.1, extra);
+                    assert_same(&format!("{label}: with the graft's reverts"), &tail.0, &tail.1);
+                }
+            }
+        }
+    }
+}
+
+/// `N42_FREEZE_SPLIT` (`docs/SHARED_EXECUTION_SCOPE.md` 18.7 item 4b): the
+/// live freeze's shard work split over two, four and eight tasks by address
+/// sub-range is the single task's: every address reads the same account
+/// through the frozen shards, the conflicts and account counts, the
+/// beneficiary's credit, the merged bundle (against the single task's and
+/// the direct graft), the view's QMDB operations and hashed post-state are
+/// equal -- with every other shard of every batch left to the freeze (the
+/// deferred entries the split works on), busy shards left by concurrent
+/// hand-overs, and none left, at 1, 16 and 64 shards.
+#[test]
+fn a_split_heavy_shard_freezes_as_one_task() {
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let (expected, _) = direct(&db, bundles.clone(), false);
+    let live = Mode { index: true, live: true };
+    let touched: Vec<Address> = expected.state.keys().copied().collect();
+    let fill = |count: usize, deferral: Option<bool>, split: usize| {
+        let mut shards = shards_with(count, live);
+        if let Some(forced) = deferral {
+            shards.set_live_defer(true, forced);
+        }
+        shards.set_freeze_split(split, true);
+        // Concurrent hand-overs, so busy shards are left too.
+        std::thread::scope(|scope| {
+            for chunk in bundles.chunks(4) {
+                let shards = &shards;
+                scope.spawn(move || {
+                    for bundle in chunk {
+                        shards.add(bundle.clone());
+                    }
+                });
+            }
+        });
+        shards.freeze()
+    };
+    for count in [1, 16, 64] {
+        for deferral in [Some(true), Some(false), None] {
+            let one = fill(count, deferral, 1);
+            for split in [2, 4, 8] {
+                let label = format!("{count} shards, deferral {deferral:?}, split {split}");
+                let many = fill(count, deferral, split);
+                if deferral == Some(true) {
+                    assert!(many.fold_split().split_tasks > 0, "{label}: the split ran");
+                }
+                assert_eq!(many.accounts(), one.accounts(), "{label}: accounts");
+                assert_eq!(many.index_conflicts(), one.index_conflicts(), "{label}: conflicts");
+                assert_eq!(many.beneficiary_delta(), one.beneficiary_delta(), "{label}: beneficiary");
+                for address in &touched {
+                    assert_eq!(many.get(address), one.get(address), "{label}: {address} read through the shards");
+                }
+                let (many, many_residual) = sharded_parts(&db, many);
+                let (one_again, one_residual) = sharded_parts(&db, fill(count, deferral, 1));
+                let many_merged = many.merged(&many_residual);
+                assert_same(&format!("{label}: against one task"), &one_again.merged(&one_residual), &many_merged);
+                assert_same(&format!("{label}: against the graft"), &expected, &many_merged);
+                let many_overlaps = many.overlaps(&many_residual);
+                let one_overlaps = one_again.overlaps(&one_residual);
+                let many_view = many.view(&many_residual, &many_overlaps);
+                let one_view = one_again.view(&one_residual, &one_overlaps);
+                for prague in [false, true] {
+                    assert_eq!(
+                        n42_qmdb_reth::sorted_operations_from_accounts(&many_view, prague),
+                        n42_qmdb_reth::sorted_operations_from_accounts(&one_view, prague),
+                        "{label}: QMDB operations, prague {prague}"
+                    );
+                }
+                assert_eq!(hashed_post_state_of(&many_view), hashed_post_state_of(&one_view), "{label}: hashed");
+            }
+        }
+    }
 }

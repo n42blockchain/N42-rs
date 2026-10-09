@@ -154,6 +154,50 @@ pub fn calculate_block_gas_limit(parent_gas_limit: u64, desired_gas_limit: u64) 
 }
 // reth/crates/ethereum/payload/src/config.rs
 
+/// The gas limit a block may take when its header carries another block's
+/// `gasUsed` (`deferredExecutionDepth` 2, docs/DEFERRED_DEPTH_2_DESIGN.md
+/// item 19): never below the carried gas, or the header fails
+/// `gas_used <= gas_limit`. `computed` is the ordinary step towards the
+/// desired limit; when it falls below the carried gas the limit is raised
+/// towards it, no further than the parent's limit allows. An unknown carried
+/// gas keeps the limit from shrinking at all.
+pub fn gas_limit_over_carried(computed: u64, parent_gas_limit: u64, carried_gas_used: Option<u64>) -> u64 {
+    let floor = carried_gas_used.unwrap_or(parent_gas_limit);
+    if computed >= floor {
+        return computed;
+    }
+    let max = parent_gas_limit.saturating_add((parent_gas_limit / GAS_LIMIT_BOUND_DIVISOR).saturating_sub(1));
+    floor.min(max).max(computed)
+}
+
+/// The fields a header carries, waited for when a build needs them:
+/// depth 1 is the parent's (under its sealed hash, or under `parent_built` as
+/// the builder filed it); depth 2 the grandparent's under the parent header's
+/// `parent_hash`, which [`crate::executed_fields`] follows to the builder's
+/// entry when this node built it (`note_built`).
+fn carried_fields_for_seal(
+    genesis: &alloy_genesis::Genesis,
+    parent: &reth_primitives_traits::SealedHeader,
+    parent_built: Option<B256>,
+    depth: u64,
+) -> Option<crate::executed_fields::ExecutedFields> {
+    if depth <= 1 {
+        return crate::hotstuff_consensus::parent_executed_fields_or_built(
+            genesis,
+            parent,
+            parent_built,
+            crate::hotstuff_consensus::PARENT_FIELDS_WAIT,
+        );
+    }
+    crate::hotstuff_consensus::ancestor_executed_fields_or_built(
+        genesis,
+        parent,
+        Some(parent.parent_hash),
+        depth,
+        crate::hotstuff_consensus::PARENT_FIELDS_WAIT,
+    )
+}
+
 type BestTransactionsIter<Pool> = Box<
     dyn BestTransactions<Item = Arc<ValidPoolTransaction<<Pool as TransactionPool>::Transaction>>>,
 >;
@@ -354,6 +398,14 @@ where
         let parent_hash = parent.hash();
         let parent_gas_limit = parent.gas_limit;
         let parent_built = parent_execution.built_hash();
+        // `deferredExecutionDepth` 2 (docs/DEFERRED_DEPTH_2_DESIGN.md item 5):
+        // the parent becomes the grandparent of the next build, whose header
+        // needs its result by the sealed hash, before the own-block hand-off
+        // has filed it there. The pair is in hand only here. Depth 1 notes
+        // nothing, so its lookups are what they were.
+        if reth_chainspec::qmdb::deferred_execution_depth_at(self.client.chain_spec().genesis(), attributes.timestamp) >= 2 {
+            crate::executed_fields::note_built(parent_hash, parent_built);
+        }
         let opener = match &parent_execution {
             crate::direct_build::ParentExecution::Ready(execution) => {
                 let executed = crate::direct_build::executed_under_seal(&parent, execution);
@@ -552,6 +604,77 @@ pub fn seal_at_exec() -> bool {
     *ON.get_or_init(|| std::env::var("N42_SEAL_AT_EXEC").is_ok_and(|v| v == "1"))
 }
 
+/// `N42_SEAL_ON_COUNTERS=1` (`docs/SHARED_EXECUTION_SCOPE.md` 16.4 item 1;
+/// `N42_SEAL_ON_COUNTS=1` is the same switch): with `N42_SEAL_AT_EXEC=1` and
+/// the body made in the prep, every batch counts its transfers, their gas and
+/// their fees as it executes, and a block that seals at the execution's end
+/// with every candidate executed in pull order seals on those sums, with the
+/// prep's body, and no pass over the slots on the seal's path (the pass on the
+/// build pool that finished behind the freeze's slowest task, 16.2). The
+/// references are then made behind the seal by the receipts job only. Any
+/// other block makes them as before. Off by default.
+pub fn seal_on_counters() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        ["N42_SEAL_ON_COUNTERS", "N42_SEAL_ON_COUNTS"]
+            .iter()
+            .any(|name| std::env::var(name).is_ok_and(|v| v.trim() == "1"))
+    })
+}
+
+/// `N42_FREEZE_AFTER_SEAL=1` (`docs/SHARED_EXECUTION_SCOPE.md` 15): with
+/// `N42_SEAL_AT_EXEC=1` and the output shards, the shards' freeze (the index's
+/// conflict sums, and under `N42_LIVE_INDEX_DEFER=1` the shards the batches
+/// left to it: `index_ms` 4-5 ms, 13 with the defer) runs on a thread of its
+/// own from the batches' end, beside the commit and the seal, and is joined
+/// behind the seal where the graft first reads the shards -- beside the
+/// receipts job. The seal reads the body, the transactions root and the
+/// parent's fields, none of which the freeze touches; the frozen shards are
+/// the same call on the same input either way. Off by default.
+pub fn freeze_after_seal() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FREEZE_AFTER_SEAL").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `N42_ROOT_OPS_AHEAD=1` (`docs/SHARED_EXECUTION_SCOPE.md` 15): with the
+/// output shards on a block that seals early, the shards' QMDB leaf
+/// operations are encoded and sorted on a thread of their own as soon as the
+/// shards are final (the graft's end), beside the receipts and the
+/// executor's finish; the root job behind the seal then encodes only the
+/// residual's few accounts and merges them in (`OpsAhead::finish`), instead
+/// of encoding the block's ~190,000 accounts after the finish. The same
+/// operations either way (`operations_ahead_finished_equal_the_whole_views`).
+/// Off by default.
+pub fn root_ops_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_ROOT_OPS_AHEAD").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The shards' operations encoded ahead ([`root_ops_ahead`]), and when they
+/// were done.
+type OpsAheadJob = std::thread::JoinHandle<(n42_qmdb_reth::OpsAhead, std::time::Instant)>;
+
+/// How the root job used the operations encoded ahead: its wait for them,
+/// the finish (the residual's encoded and merged in), and when they were
+/// done. All zero when it encoded the whole view itself.
+#[derive(Debug, Default, Clone, Copy)]
+struct OpsAheadUse {
+    waited: std::time::Duration,
+    finish: std::time::Duration,
+    done_at: Option<std::time::Instant>,
+}
+
+/// The output shards frozen on a thread of their own ([`freeze_after_seal`]).
+type LateFreeze = crate::output_shards::FreezeHandle;
+
+/// Starts the freeze of `shards` on a thread of its own
+/// ([`crate::output_shards::OutputShards::freeze_on_thread`]).
+fn spawn_freeze(shards: crate::output_shards::OutputShards) -> Result<LateFreeze, Option<Box<crate::output_shards::OutputShards>>> {
+    shards.freeze_on_thread().inspect_err(|_| {
+        tracing::debug!(target: "payload_builder", "no thread for the freeze; frozen before the seal");
+    })
+}
+
 /// `N42_STATE_AFTER_PULL=1` (plan v6 attempt G3, `FLEET7_PLAN_V4.md` 6.7):
 /// with the parallel build and the puller on, the builder opens the parent's
 /// state -- and applies the pre-execution changes, the one thing before the
@@ -644,6 +767,79 @@ fn pooled_consensus<P: PoolTransaction<Consensus = TransactionSigned>>(
     tx.transaction.consensus_ref().into_inner()
 }
 
+/// A candidate's (sender, recipient) when it is a plain transfer the parallel
+/// step takes -- the prep's check -- and `None` otherwise.
+fn transfer_key<P: PoolTransaction<Consensus = TransactionSigned>>(
+    tx: &reth_transaction_pool::ValidPoolTransaction<P>,
+) -> Option<(alloy_primitives::Address, alloy_primitives::Address)> {
+    let inner = &tx.transaction;
+    (inner.gas_limit() == MIN_TRANSACTION_GAS
+        && inner.input().is_empty()
+        && !inner.is_create()
+        && inner.access_list().is_none_or(|list| list.is_empty())
+        && !inner.is_eip4844()
+        && !inner.is_eip7702())
+    .then(|| (tx.sender(), inner.to().unwrap_or_default()))
+}
+
+/// The plan-ahead hook's work (`N42_PLAN_AHEAD_BODY=1`): from a prepared
+/// plan's segments, on the plan body's own pool, the candidates in plan
+/// order, their transfer keys, the body's transactions and senders and the
+/// hashes, the partition at the beneficiary this node builds for, and the
+/// empty slots -- what the next build's start, prep and gap made. `None`
+/// when not every candidate is a plain transfer (the build preps as before).
+fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
+    segments: &[(n42_tx_queue::FrameTxs<P>, usize)],
+) -> Option<crate::frame_blocks::PreparedBuild<P>> {
+    use rayon::prelude::*;
+    let at = std::time::Instant::now();
+    let pool = crate::parallel_transfer::plan_body_pool();
+    let parts: Vec<Vec<Arc<reth_transaction_pool::ValidPoolTransaction<P>>>> = pool.install(|| {
+        segments.par_iter().map(|(txs, taken)| txs.get(..*taken).map_or_else(Vec::new, <[_]>::to_vec)).collect()
+    });
+    let mut cands = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for part in parts {
+        cands.extend(part);
+    }
+    if cands.is_empty() {
+        return None;
+    }
+    // The prep's own pass, with no tip: the batches read the tips at the
+    // block's base fee (`N42_SEAL_ON_COUNTERS`), which this cannot know.
+    let (keys, made) = crate::parallel_transfer::BodyAhead::make_keyed_on(pool, &cands, |_, tx| {
+        (transfer_key(tx), pooled_consensus(tx).clone(), tx.sender(), 0, *tx.hash())
+    })?;
+    if keys.is_empty() {
+        return None;
+    }
+    let hashes = made.hashes;
+    let groups = crate::frame_blocks::noted_beneficiary().and_then(|beneficiary| {
+        crate::parallel_transfer::partition_by_sender(&keys, beneficiary).ok().map(|groups| (beneficiary, groups))
+    });
+    let slots = crate::parallel_transfer::empty_slots(pool, cands.len());
+    Some(crate::frame_blocks::PreparedBuild {
+        segments: segments.to_vec(),
+        cands,
+        keys,
+        transactions: made.transactions,
+        senders: made.senders,
+        hashes,
+        groups,
+        slots,
+        made_us: at.elapsed().as_micros() as u64,
+    })
+}
+
+/// Installs the plan-ahead hook on the queue once (`N42_PLAN_AHEAD_BODY=1`).
+fn install_plan_ahead_body<P: PoolTransaction<Consensus = TransactionSigned>>(queue: &n42_tx_queue::TxQueue<P>) {
+    if queue.has_plan_ahead_hook() {
+        return;
+    }
+    queue.set_plan_ahead_hook(Arc::new(|segments: &[(n42_tx_queue::FrameTxs<P>, usize)]| {
+        make_prepared_build(segments).map(|made| Box::new(made) as n42_tx_queue::PreparedBody)
+    }));
+}
+
 /// The cumulative gas through each transaction of a block the parallel step
 /// left in its slots, in block order, and the block's gas.
 fn cumulative_gas(
@@ -682,6 +878,34 @@ fn receipts_from_slots<P: PoolTransaction<Consensus = TransactionSigned>>(
 /// failure is loud, as for the finish behind the seal. `sealed` is the
 /// proposed block's hash and number, `None` when nothing was proposed yet
 /// (the error then goes back as it always did).
+/// The leader's merge of its output shards into the block's one bundle, as
+/// its thread ran it behind the fields' publication.
+#[derive(Debug, Default, Clone, Copy)]
+struct LeaderMerge {
+    /// The merge's start on its thread.
+    started: Option<std::time::Instant>,
+    /// Its end, before `StateReady` is filed.
+    ended: Option<std::time::Instant>,
+    /// `StateReady` filed with the merged bundle.
+    state_ready: Option<std::time::Instant>,
+    /// The halves ([`crate::output_shards::FrozenShards::merged_timed`]).
+    split: crate::output_shards::MergeSplit,
+    /// The graft's own reverts appended after the merge, us.
+    tail_us: u64,
+    /// The threads the merge ran on.
+    threads: u32,
+    /// The merged bundle's accounts.
+    accounts: usize,
+    /// The merged bundle's reverts.
+    reverts: usize,
+    /// `N42_MERGE_AT_SHARDS_READY`: the merge ran from `shards_ready` on
+    /// the merge pool.
+    early: bool,
+    /// How long the merger thread (spawned after the fields' publication)
+    /// waited for the early merge to end, us: 0 when it had ended.
+    join_wait_us: u64,
+}
+
 fn failed_after_seal(sealed: Option<(B256, u64)>, err: PayloadBuilderError) -> PayloadBuilderError {
     if let Some((block_hash, number)) = sealed {
         crate::built_executions::fail(block_hash);
@@ -808,44 +1032,29 @@ thread_local! {
     static HANDOFF_WAIT_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// The leader's last seal-first seal: the block's number and when its hook
-/// answered. A chained build on it reads the gap from there to its own
-/// entry and start (`next_start_gap_ms`, `next_entry_gap_ms`): what lies
-/// between one block's seal and the next build's first step -- the proposal,
-/// the chained request's trip and the payload service's set-up -- is on the
-/// leader's cycle but in no build's own timers (docs/BREAKTHROUGH_DESIGN.md
-/// 10.32: the cycle 132 against `sealed_at_ms` 114).
-static LAST_SEAL: std::sync::Mutex<Option<(u64, std::time::Instant)>> = std::sync::Mutex::new(None);
 
 /// What a build's `state_wait_ms` was on: the largest of the named waits
 /// ([`crate::direct_build::open_wait`]), or `open` when the rest of the wait
-/// -- the open itself: the overlay, the provider -- is larger than each;
-/// `none` for no wait.
-fn state_wait_label(total_ms: u64, on: &crate::direct_build::open_wait::OpenWait) -> &'static str {
-    let named = [on.output_ms, on.grandparent_ms, on.parent_root_ms, on.parent_complete_ms];
-    let rest = total_ms.saturating_sub(named.iter().sum());
-    if rest > 0 && named.iter().all(|ms| rest > *ms) {
+/// -- what no named wait covers, a millisecond or more -- is larger than
+/// each; `none` for no wait. Since loop333 the open's own two costs are named
+/// (`layer_release`, `provider_open`), so `open` is what is left after them.
+fn state_wait_label(total_us: u64, on: &crate::direct_build::open_wait::OpenWait) -> &'static str {
+    let named = on.named_us();
+    let rest = total_us.saturating_sub(named.iter().map(|(us, _)| us).sum());
+    if rest >= 1000 && named.iter().all(|(us, _)| rest > *us) {
         return "open";
     }
     on.label()
 }
 
+/// The leader's seal-first seal of `number`: when its hook answered. A
+/// chained build on it reads the road from there to its own entry and start
+/// (`post_seal`, `next_start_gap_ms`, `prev_seal_to_*_us`): what lies between
+/// one block's seal and the next build's first step -- the chain header's and
+/// the request's trips and the payload service's set-up -- is on the leader's
+/// cycle but in no build's own timers (docs/BREAKTHROUGH_DESIGN.md 10.32).
 fn note_sealed(number: u64) {
-    let now = std::time::Instant::now();
-    if let Ok(mut last) = LAST_SEAL.lock() {
-        *last = Some((number, now));
-    }
-}
-
-/// The gap from the seal of block `number - 1` (this process's own) to `at`,
-/// ms; 0 when the parent was not sealed here or not just before.
-fn gap_from_parent_seal(number: u64, at: std::time::Instant) -> u64 {
-    match LAST_SEAL.lock().ok().and_then(|last| *last) {
-        Some((sealed, when)) if sealed.checked_add(1) == Some(number) => {
-            at.saturating_duration_since(when).as_millis() as u64
-        }
-        _ => 0,
-    }
+    crate::post_seal::note(number, crate::post_seal::Mark::Sealed);
 }
 
 thread_local! {
@@ -948,6 +1157,15 @@ where
     } = config;
 
     let parent_hash_for_state = parent_header.hash();
+    // The parent's road from its seal to this build (`post_seal`): read by
+    // this build's phases line as `prev_seal_to_*_us`. Recorded here, at
+    // the start, because the line is written long after the parent's seal
+    // has been overwritten by this block's own (`next_start_gap_ms` read 0
+    // on every build until this moved here).
+    crate::post_seal::note_at(parent_header.number, crate::post_seal::Mark::ChildStarted, build_started);
+    if let Some(entered) = own_entered {
+        crate::post_seal::note_at(parent_header.number, crate::post_seal::Mark::ChildEntered, entered);
+    }
     let open_parent_state = || -> Result<reth_storage_api::StateProviderBox, reth_storage_api::errors::ProviderError> {
         match &parent_state {
             Some(open) => open(),
@@ -1026,7 +1244,20 @@ where
         timestamp: attributes.timestamp,
         suggested_fee_recipient: coinbase,
         prev_randao: attributes.prev_randao,
-        gas_limit: builder_config.gas_limit(parent_header.gas_limit),
+        gas_limit: {
+            let computed = builder_config.gas_limit(parent_header.gas_limit);
+            // `deferredExecutionDepth` 2 (docs/DEFERRED_DEPTH_2_DESIGN.md item
+            // 19): the header's `gasUsed` is the grandparent's, which a limit
+            // that shrank twice could fall under. Depth 1 is left as it was.
+            let depth = reth_chainspec::qmdb::deferred_execution_depth_at(chain_spec.genesis(), attributes.timestamp);
+            if depth >= 2 {
+                let carried = crate::hotstuff_consensus::ancestor_executed_fields(chain_spec.genesis(), &parent_header, depth)
+                    .map(|fields| fields.gas_used);
+                gas_limit_over_carried(computed, parent_header.gas_limit, carried)
+            } else {
+                computed
+            }
+        },
         parent_beacon_block_root: attributes.parent_beacon_block_root,
         withdrawals: attributes.withdrawals.clone().map(Into::into),
         extra_data: Default::default(),
@@ -1102,6 +1333,33 @@ where
 
     debug!(target: "payload_builder", ?block_gas_limit, ?base_fee, "payload builder block config");
 
+    // A height the chain has already committed: nothing will ask for this
+    // payload, and building it costs a block's worth of the queue and a
+    // build's worth of verdicts about a state consensus did not keep. Taken
+    // before anything is selected, so the queue is not touched at all:
+    // until loop322 this ran after `best_txs`, so a payload job on a parent
+    // the chain had passed (the build ahead on the old parent at a tenure
+    // handover) took and gave back a block's worth of frames under the
+    // queue's lock on every attempt before cancelling itself.
+    if skip_decided_builds() && crate::canonical_head::already_decided(parent_header.number + 1) {
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if say_once_a_second(&LAST) {
+            tracing::info!(
+                target: "payload_builder",
+                number = parent_header.number + 1,
+                head = crate::canonical_head::number(),
+                "a build for a height the chain has already decided was cancelled"
+            );
+        }
+        // Not `Cancelled`: reth's payload job treats that outcome as
+        // unreachable unless its own cancel signal fired, and panics the
+        // payload service -- which took the execution layer down on six
+        // legs of loop215-218 and left the dead node leader for the rest of
+        // its tenure (a TC moves the chain on by one view only). `Aborted`
+        // is a build that chose not to produce a block; the job logs it at
+        // debug and moves on.
+        return Ok(BuildOutcome::Aborted { fees: U256::ZERO, cached_reads });
+    }
     // The seal gap's first term named (plan v6 6.13, `par_start_ms`): the
     // selection, of which the wait for the parent's queue hand-off (set by
     // a chained build's selector, [`note_handoff_wait`]), the checks, the
@@ -1109,6 +1367,18 @@ where
     HANDOFF_WAIT_US.with(|cell| cell.set(0));
     let _ = crate::frame_blocks::take_select_times();
     let start_best_at = std::time::Instant::now();
+    // `N42_PULL_BY_FRAMES`: the selector may hand the block over as one
+    // vector out of the plan's frames, which only the parallel step with the
+    // puller consumes (`frame_blocks::take_bulk`).
+    crate::frame_blocks::want_bulk(parallel_build() && builder_puller() != 0);
+    // `N42_PLAN_AHEAD_BODY=1`: the queue makes the next block's body with its
+    // plan; the partition is made at this build's beneficiary.
+    if crate::frame_blocks::plan_ahead_body_wanted()
+        && let Some(queue) = n42_tx_queue::global::<Pool::Transaction>()
+    {
+        crate::frame_blocks::note_beneficiary(group_env.block_env.beneficiary);
+        install_plan_ahead_body(&queue);
+    }
     let mut best_txs = best_txs(BestTransactionsAttributes::new(
         base_fee,
         builder
@@ -1119,6 +1389,12 @@ where
     ));
     let start_best_us = start_best_at.elapsed().as_micros() as u64;
     let start_best_ms = start_best_us / 1_000;
+    let mut bulk = crate::frame_blocks::take_bulk::<Pool::Transaction>();
+    // `N42_PLAN_AHEAD_BODY=1`: what was made with the plan, its candidates
+    // already the bulk vector (always taken, so nothing is left behind).
+    let mut prepared_build = crate::frame_blocks::take_prepared::<Pool::Transaction>();
+    let from_bulk = bulk.is_some();
+    crate::frame_blocks::want_bulk(false);
     // `N42_FRAME_BLOCKS=1`: the frames the selector just took, whose layout
     // the transactions root is sealed over (`frame_blocks::sealed_root`).
     // The roots computed ahead over the pulled set are the MPT root and are
@@ -1170,29 +1446,6 @@ where
     // block, canonical and committed before the build ran. Counted so a leg
     // can say whether the case exists; acted on only under
     // `N42_BUILD_REFUSE_STALE_PARENT`.
-    // A height the chain has already committed: nothing will ask for this
-    // payload, and building it costs a block's worth of the queue and a
-    // build's worth of verdicts about a state consensus did not keep. Taken
-    // before anything is selected, so the queue is not touched at all.
-    if skip_decided_builds() && crate::canonical_head::already_decided(parent_header.number + 1) {
-        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if say_once_a_second(&LAST) {
-            tracing::info!(
-                target: "payload_builder",
-                number = parent_header.number + 1,
-                head = crate::canonical_head::number(),
-                "a build for a height the chain has already decided was cancelled"
-            );
-        }
-        // Not `Cancelled`: reth's payload job treats that outcome as
-        // unreachable unless its own cancel signal fired, and panics the
-        // payload service -- which took the execution layer down on six
-        // legs of loop215-218 and left the dead node leader for the rest of
-        // its tenure (a TC moves the chain on by one view only). `Aborted`
-        // is a build that chose not to produce a block; the job logs it at
-        // debug and moves on.
-        return Ok(BuildOutcome::Aborted { fees: U256::ZERO, cached_reads });
-    }
     let pruned_through = n42_tx_queue::global::<Pool::Transaction>().map_or(0, |queue| queue.pruned_through());
     let parent_behind = pruned_through > parent_header.number;
     if parent_behind {
@@ -1228,7 +1481,9 @@ where
     let start_puller_at = std::time::Instant::now();
     let puller = builder_puller();
     let mut pulled: Option<Puller<Pool::Transaction>> = None;
-    let mut best_txs = if puller == 0 {
+    // With the block in hand (`bulk`) there is nothing to pull: the
+    // iterator stays here for the refusals, on this thread.
+    let mut best_txs = if puller == 0 || bulk.is_some() {
         Some(best_txs)
     } else {
         pulled = Some(Puller::start(best_txs, puller));
@@ -1281,6 +1536,7 @@ where
     // parent's `StateReady`.
     let state_pending = std::cell::Cell::new(defer_state);
     let mut state_wait_ms = 0u64;
+    let mut state_wait_us = 0u64;
     // What that wait was on (`direct_build::open_wait`): the parent's output,
     // the grandparent's import, the parent's QMDB root or `Complete`, or the
     // open itself ("open": the rest of `state_wait_ms`).
@@ -1291,7 +1547,9 @@ where
                 let _ = crate::direct_build::open_wait::take();
                 let at = std::time::Instant::now();
                 let opened = open_parent_state();
-                state_wait_ms += at.elapsed().as_millis() as u64;
+                let waited = at.elapsed();
+                state_wait_ms += waited.as_millis() as u64;
+                state_wait_us += waited.as_micros() as u64;
                 state_wait_on = crate::direct_build::open_wait::take();
                 match opened {
                     Err(err) => Err(PayloadBuilderError::from(err)),
@@ -1376,7 +1634,11 @@ where
     // parallel step's output left in address-range shards and never grafted;
     // carried to the finish behind the seal, where the next build is let go
     // on it before the block's one bundle is built.
-    let mut output_shards: Option<crate::output_shards::FrozenShards> = None;
+    let mut output_shards: Option<Arc<crate::output_shards::FrozenShards>> = None;
+    // `N42_ROOT_OPS_AHEAD=1`: the shards' QMDB leaves encoded on a thread of
+    // their own from the graft's end (with the Prague flag they were encoded
+    // under), for the root job behind the seal to finish.
+    let mut ops_ahead: Option<(OpsAheadJob, bool)> = None;
     let mut out_shards = 0usize;
     let mut shard_append_ms = 0u64;
     let mut shard_fold_ms = 0u64;
@@ -1404,11 +1666,22 @@ where
     // executor's finish reports, built beside the parallel step instead of one executor commit
     // per transaction (see `direct_receipts_enabled`); taken by the finish behind the seal.
     let mut direct_receipts: Option<(Vec<n42_tx_types::Receipt>, u64)> = None;
+    // `N42_SHARDS_BEFORE_RECEIPTS=1`: the same receipts, still being built on
+    // a thread of their own when the shards are filed; joined where the
+    // receipts are first read (the receipts root behind the seal).
+    let mut receipts_pending: Option<std::thread::JoinHandle<(Vec<n42_tx_types::Receipt>, u64)>> = None;
     // The block's body as the same parallel pass leaves it, already split into
     // the transactions and their senders: the seal wants those two vectors and
     // used to make them by moving 163,000 recovered transactions through one
     // serial `unzip` (most of a 24 ms `tx_root_ms`).
     let mut direct_body: Option<(Vec<TransactionSigned>, Vec<alloy_primitives::Address>)> = None;
+    // The body's transaction hashes, made with it in the prep (or with the
+    // plan): the seal's frame layout reads them instead of collecting
+    // 200,000 hashes on its path. Set only beside `direct_body` from the same
+    // source, so they are its hashes in its order.
+    let mut direct_hashes: Option<Vec<B256>> = None;
+    // Whether the seal took them.
+    let mut seal_hashes_ahead = false;
     let deferred_now = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), attributes.timestamp);
     // What the seal-first path needs of the chain and the block, short of
     // the block being full (known after the parallel step).
@@ -1418,6 +1691,8 @@ where
     // which hash the builder gave this block's parent. The ordinary finish
     // needs it for exactly the same reason the early seal does.
     let parent_built = early_seal.as_ref().and_then(|early| early.parent_built);
+    // `deferredExecutionDepth`: which ancestor's result the header carries.
+    let carried_depth = reth_chainspec::qmdb::deferred_execution_depth_at(chain_spec.genesis(), attributes.timestamp);
     // `N42_SEAL_AT_EXEC=1`: the transactions root computed over the pulled
     // candidates beside the parallel step, whether the seal used it, and how
     // long the step's end waited for it.
@@ -1436,6 +1711,11 @@ where
     let mut gap_after_exec_ms = 0u64;
     let mut gap_before_seal_ms = 0u64;
     let mut index_ms = 0u64;
+    // `N42_FREEZE_AFTER_SEAL=1`: whether the freeze ran beside the seal, when
+    // it ended, and how long its join waited for it (us).
+    let mut freeze_late_used = false;
+    let mut freeze_ended_at: Option<std::time::Instant> = None;
+    let mut freeze_join_wait_us = 0u64;
     // Where the leader's time from the build's start to the seal goes, beside
     // the fields that already name it (plan v6, the seal gap). With the
     // parallel step taken, `sealed_at_ms` is, within a ms or two of rounding:
@@ -1469,6 +1749,20 @@ where
     let mut commit_body_ms = 0u64;
     // Whether the commit took the body made in the prep's pass.
     let mut commit_body_ahead_used = false;
+    // `N42_SEAL_ON_COUNTERS=1`: whether this block sealed on the batches'
+    // counters with no pass over the slots, and the batches' end to the
+    // seal's start, us (the commit, the give-back and the match between).
+    let mut seal_on_counters_used = false;
+    let mut exec_end_to_seal_us = 0u64;
+    // `N42_PLAN_AHEAD_BODY=1`: the prep took the keys and body made with the
+    // plan; the call took its partition and slots; the hand-off of this
+    // block was noted as its whole take.
+    let mut prep_from_plan = false;
+    let mut exec_partition_us = 0u64;
+    let mut exec_slots_us = 0u64;
+    let mut exec_prepared_groups = false;
+    let mut exec_prepared_slots = false;
+    let mut whole_take_noted = false;
     // Of `give_back_ms`: the body checked against the pulled set.
     let mut match_ms = 0u64;
     // Of `sealed_ms`: the header filled and `cons.seal`; the sealed and
@@ -1484,6 +1778,12 @@ where
     let mut seal_frames_indexed = 0usize;
     let mut seal_frames_hashed = 0usize;
     let mut seal_hook_ms = 0u64;
+    // The moment the sealed payload went to the hook: the origin of the
+    // `seal_to_*_us` stamps on the phases line (the finish behind the seal,
+    // up to this block's own fields published).
+    let mut sealed_instant: Option<std::time::Instant> = None;
+    // The same moment on the wall clock (`sealed_unix_us` on the line).
+    let mut sealed_unix_us = 0u64;
     // `N42_SEAL_AT_EXEC=1`: the block sealed and proposed at the parallel
     // step's end -- the payload, the block, its hash and number, and the seal's
     // timers -- for the fold and the finish that follow it.
@@ -1513,7 +1813,13 @@ where
                 // run of frames (by the build's plan or this node's frame
                 // index), the MPT root for any other body.
                 use alloy_consensus::transaction::TxHashRef as _;
-                let hashes: Vec<B256> = transactions.iter().map(|tx| *tx.tx_hash()).collect();
+                let hashes: Vec<B256> = match direct_hashes.take().filter(|hashes| hashes.len() == transactions.len()) {
+                    Some(hashes) => {
+                        seal_hashes_ahead = true;
+                        hashes
+                    }
+                    None => transactions.iter().map(|tx| *tx.tx_hash()).collect(),
+                };
                 let sealed = crate::frame_blocks::seal_root_timed(frame_plan.as_ref(), &hashes, || {
                     early_root.unwrap_or_else(|| crate::assembler::parallel_transaction_root(&transactions))
                 });
@@ -1533,15 +1839,13 @@ where
             // The parent's execution, as this header carries it: recorded
             // under its sealed hash, or -- a parent finishing behind its own
             // seal -- arriving under the builder's hash a moment from now.
-            let parent_fields = crate::hotstuff_consensus::parent_executed_fields_or_built(
-                chain_spec.genesis(),
-                &parent_header,
-                parent_built,
-                crate::hotstuff_consensus::PARENT_FIELDS_WAIT,
-            )
-            .ok_or_else(|| {
-                PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(parent_sealed))
-            })?;
+            // At depth 2 the grandparent's (`parent_fields_ms` keeps its name).
+            let parent_fields = carried_fields_for_seal(chain_spec.genesis(), &parent_header, parent_built, carried_depth)
+                .ok_or_else(|| {
+                    PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(
+                        crate::hotstuff_consensus::ancestor_hash(&parent_header, carried_depth),
+                    ))
+                })?;
             let fields_ms = (seal_at.elapsed().as_millis() as u64).saturating_sub(root_ms);
             header.transactions_root = transactions_root;
             header.state_root = parent_fields.state_root;
@@ -1585,6 +1889,10 @@ where
             let step_at = std::time::Instant::now();
             let payload = EthBuiltPayload::new(recovered.clone(), total_fees, None, None);
             ($hook)(payload.clone());
+            sealed_instant = Some(std::time::Instant::now());
+            sealed_unix_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_micros() as u64);
             note_sealed(block_number);
             seal_hook_ms = step_at.elapsed().as_millis() as u64;
             let sealed_ms = seal_at.elapsed().as_millis() as u64;
@@ -1593,7 +1901,7 @@ where
             (payload, recovered, block_hash, block_number, root_ms, fields_ms, sealed_ms, sealed_at_ms, parent_sealed)
         }};
     }
-    if parallel_build() && pulled.is_some() {
+    if parallel_build() && (pulled.is_some() || bulk.is_some()) {
         let par_at = std::time::Instant::now();
         par_start_ms = build_started.elapsed().as_millis() as u64;
         start_other_ms =
@@ -1601,7 +1909,7 @@ where
         let budget = (block_gas_limit.saturating_sub(cumulative_gas_used) / MIN_TRANSACTION_GAS) as usize;
         par_budget = budget;
         let mut cands: Vec<Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>> =
-            Vec::with_capacity(budget.min(262_144));
+            bulk.take().unwrap_or_else(|| Vec::with_capacity(budget.min(262_144)));
         // `N42_BUILD_PREFETCH=1`: each batch the puller hands over has its
         // senders' and recipients' accounts read on the worker pool while the
         // rest of the block is pulled and prepared, into a layer the
@@ -1664,7 +1972,18 @@ where
             // other (`par_prep_ms` 10, loop274). The sender is the one the
             // ingest recorded (the attested frame's, for 0x50); nothing is
             // hashed or recovered here.
-            let (all_transfers, keys, body_made) = crate::parallel_transfer::build_pool().install(|| {
+            // `N42_PLAN_AHEAD_BODY=1`: the keys and the body were made with the
+            // plan, from exactly these candidates (the bulk vector is the
+            // prepared one, uncut); nothing to read here.
+            let from_plan = body_at_prep
+                && prepared_build
+                    .as_ref()
+                    .is_some_and(|made| made.keys.len() == cands.len() && made.transactions.len() == cands.len());
+            prep_from_plan = from_plan;
+            let (all_transfers, keys, body_made) = if from_plan {
+                let keys = prepared_build.as_mut().map(|made| std::mem::take(&mut made.keys)).unwrap_or_default();
+                (!keys.is_empty(), keys, None)
+            } else { crate::parallel_transfer::build_pool().install(|| {
                 use rayon::prelude::*;
                 let transfer_key = |tx: &Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>| {
                     let inner = &tx.transaction;
@@ -1687,6 +2006,7 @@ where
                             consensus.clone(),
                             tx.sender(),
                             consensus.effective_tip_per_gas(base_fee).unwrap_or_default(),
+                            *tx.hash(),
                         )
                     });
                     return match made {
@@ -1712,7 +2032,7 @@ where
                 } else {
                     (true, keys, None)
                 }
-            });
+            }) };
             par_prep_ms = prep_at.elapsed().as_millis() as u64;
             (all_transfers, keys, body_made, std::time::Instant::now())
         });
@@ -1810,6 +2130,25 @@ where
                 pre_exec_ms = pre_exec_at.elapsed().as_millis() as u64;
                 let run_at = std::time::Instant::now();
                 run_started = Some(run_at);
+                // `N42_SEAL_ON_COUNTERS=1`: the batches count the block's
+                // transfers, gas and fees as they execute (a candidate's tip
+                // read beside its conversion, as the prep's body reads it), so
+                // the seal needs no pass over the slots.
+                let tip_of = |i: usize| pooled_consensus(&cands[i]).effective_tip_per_gas(base_fee).unwrap_or_default();
+                // `N42_PLAN_AHEAD_BODY=1`: the partition (at this block's
+                // beneficiary only) and the slots made with the plan.
+                let prepared_exec = prepared_build.as_mut().filter(|_| prep_from_plan).map(|made| {
+                    crate::parallel_transfer::PreparedExec {
+                        groups: made
+                            .groups
+                            .take()
+                            .filter(|(beneficiary, _)| *beneficiary == group_env.block_env.beneficiary)
+                            .map(|(_, groups)| groups),
+                        slots: Some(std::mem::take(&mut made.slots)),
+                    }
+                });
+                let counted_tips: Option<&(dyn Fn(usize) -> u128 + Sync)> =
+                    if seal_on_counters() && body_at_prep { Some(&tip_of) } else { None };
                 let executed = if defer_state {
                     // After the partition, before the batches: the builder's
                     // own state opened (the wait for a sealed parent's output
@@ -1821,17 +2160,29 @@ where
                             false
                         }
                     };
-                    crate::parallel_transfer::execute_for_build_in_place_after(
+                    crate::parallel_transfer::execute_for_build_counted(
                         &group_env,
                         &keys,
                         &convert,
                         &open,
                         sink,
                         in_place,
-                        &mut before_batches,
+                        Some(&mut before_batches),
+                        counted_tips,
+                        prepared_exec,
                     )
                 } else {
-                    crate::parallel_transfer::execute_for_build_in_place(&group_env, &keys, &convert, &open, sink, in_place)
+                    crate::parallel_transfer::execute_for_build_counted(
+                        &group_env,
+                        &keys,
+                        &convert,
+                        &open,
+                        sink,
+                        in_place,
+                        None,
+                        counted_tips,
+                        prepared_exec,
+                    )
                 };
                 let exec_done = std::time::Instant::now();
                 par_run_ms = exec_done.duration_since(run_at).as_millis() as u64;
@@ -1855,13 +2206,48 @@ where
                     // The batches are done: the fold, a task a shard on the
                     // build pool.
                     let freeze_at = std::time::Instant::now();
-                    let sharded_out = sharded_out.map(crate::output_shards::OutputShards::freeze);
+                    // `N42_FREEZE_AFTER_SEAL=1`: on a block that can seal at
+                    // the execution's end, the freeze starts on its own
+                    // thread and is joined where the shards are first read.
+                    let freeze_late = freeze_after_seal()
+                        && seal_at_exec()
+                        && direct_receipts_enabled()
+                        && seal_early_possible
+                        && block_blob_count == 0
+                        && early_seal.is_some();
+                    let mut freezing: Option<LateFreeze> = None;
+                    let mut sharded_out = match sharded_out {
+                        Some(shards) if freeze_late => match spawn_freeze(shards) {
+                            Ok(handle) => {
+                                freezing = Some(handle);
+                                None
+                            }
+                            Err(shards) => shards.map(|shards| shards.freeze()),
+                        },
+                        other => other.map(crate::output_shards::OutputShards::freeze),
+                    };
                     let index_us = freeze_at.elapsed().as_micros() as u64;
                     index_ms = index_us / 1_000;
+                    freeze_late_used = freezing.is_some();
                     if let Some(shards) = sharded_out.as_ref() {
                         out_shards = shards.shard_count();
                         shard_append_ms = shards.append_ms();
                         shard_fold_ms = shards.fold_ms();
+                    }
+                    // The late freeze joined: its counters as the inline
+                    // freeze sets them, `index_ms` its own wall (off the
+                    // seal's path), and when it ended and how long the join
+                    // waited for it.
+                    macro_rules! freeze_joined {
+                        ($joined:expr) => {{
+                            let (frozen, took, ended): (crate::output_shards::FrozenShards, std::time::Duration, std::time::Instant) = $joined;
+                            index_ms = took.as_millis() as u64;
+                            out_shards = frozen.shard_count();
+                            shard_append_ms = frozen.append_ms();
+                            shard_fold_ms = frozen.fold_ms();
+                            freeze_ended_at = Some(ended);
+                            frozen
+                        }};
                     }
                     par_collect_ms = run.phases.collect_ms;
                     par_release_ms = run.phases.release_ms;
@@ -1878,11 +2264,16 @@ where
                     // execution's end and the seal run on the build pool (each
                     // serial pass strides 163k slots of ~470 bytes).
                     let on_pool = seal_at_exec();
+                    // `N42_SEAL_ON_COUNTERS=1`: the count and the gas are the
+                    // batches' own (`RunCounters`, the same sums), and the
+                    // references are made below only for a block that does
+                    // not seal on the counters.
+                    let counters_first = seal_on_counters() && !run.slots.is_empty();
                     // Block order, by reference: a pointer a transfer, where the
                     // collect moved ~470 bytes of each.
                     // On the pool, the references and the block's gas are one
                     // pass (`slot_refs_and_gas`).
-                    let (refs, pool_gas) = if run.slots.is_empty() {
+                    let (mut refs, pool_gas) = if run.slots.is_empty() || counters_first {
                         (None, None)
                     } else if on_pool {
                         let (refs, gas) = crate::parallel_transfer::slot_refs_and_gas(&run.slots);
@@ -1891,6 +2282,7 @@ where
                         (Some(run.slots.iter().filter_map(std::sync::OnceLock::get).collect::<Vec<_>>()), None)
                     };
                     let (executed_count, executed_gas) = match (refs.as_ref(), pool_gas) {
+                        _ if counters_first => (run.counters.executed, run.counters.gas),
                         (Some(refs), Some(gas)) => (refs.len(), gas),
                         (Some(refs), None) => (refs.len(), refs.iter().map(|built| built.gas_used).sum::<u64>()),
                         (None, _) => (run.executed.len(), run.executed.iter().map(|built| built.gas_used).sum::<u64>()),
@@ -1921,7 +2313,60 @@ where
                     // cumulative gas per transaction and the block's gas: the
                     // seal needs neither.
                     let mut receipts_behind = false;
-                    if let (true, true, Some(refs)) = (seals_early_here, direct_receipts_enabled(), refs.as_ref()) {
+                    // `N42_SEAL_ON_COUNTERS=1`: a block that seals here with
+                    // every candidate executed in pull order is the body made
+                    // in the prep (`BodyAhead`) and the batches' fees; nothing
+                    // on the seal's path reads the slots. Any other block
+                    // makes the references now, as without the switch.
+                    let counted_body = if counters_first
+                        && ahead
+                        && run.skipped.is_empty()
+                        && executed_count == cands.len()
+                        && let Some(fees) = run.counters.fees
+                    {
+                        // The body made with the plan (`N42_PLAN_AHEAD_BODY`)
+                        // or in the prep, every candidate in pull order.
+                        if prep_from_plan
+                            && let Some(made) = prepared_build.as_mut().filter(|made| made.transactions.len() == cands.len())
+                        {
+                            Some((
+                                (
+                                    std::mem::take(&mut made.transactions),
+                                    std::mem::take(&mut made.senders),
+                                    std::mem::take(&mut made.hashes),
+                                ),
+                                fees,
+                            ))
+                        } else if body_ahead.as_ref().is_some_and(|made| made.transactions.len() == cands.len()) {
+                            body_ahead.take().map(|made| ((made.transactions, made.senders, made.hashes), fees))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if counters_first && counted_body.is_none() {
+                        let at = std::time::Instant::now();
+                        refs = Some(if on_pool {
+                            crate::parallel_transfer::slot_refs_and_gas(&run.slots).0
+                        } else {
+                            run.slots.iter().filter_map(std::sync::OnceLock::get).collect::<Vec<_>>()
+                        });
+                        commit_refs_ms += at.elapsed().as_millis() as u64;
+                    }
+                    seal_on_counters_used = counted_body.is_some();
+                    if let Some(((transactions, senders, hashes), fees)) = counted_body {
+                        total_fees += fees;
+                        commit_body_ahead_used = true;
+                        cumulative_gas_used += executed_gas;
+                        tx_count += executed_count as u64;
+                        direct_body = Some((transactions, senders));
+                        direct_hashes = Some(hashes);
+                        // The references, the cumulative gas and the receipts
+                        // are made behind the seal by the receipts job, which
+                        // reads the slots itself.
+                        receipts_behind = true;
+                    } else if let (true, true, Some(refs)) = (seals_early_here, direct_receipts_enabled(), refs.as_ref()) {
                         // The same body and receipts as the branch below, made
                         // from the slots: the transaction is copied out of its
                         // slot once, on the pool, straight into the body.
@@ -1952,6 +2397,7 @@ where
                         let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) = if let Some((made, fees)) = made {
                             total_fees += fees;
                             commit_body_ahead_used = true;
+                            direct_hashes = Some(made.hashes);
                             (made.transactions, made.senders)
                         } else if ahead {
                             let (transactions, senders, fees) = crate::parallel_transfer::body_and_fees(refs, |built| {
@@ -1975,7 +2421,7 @@ where
                             direct_receipts = Some((receipts_from_slots(refs, &cumulative, &cands), tx_gas));
                             // The slots' 77 MB are freed on the pool, off this thread.
                             let slots = std::mem::take(&mut run.slots);
-                            crate::parallel_transfer::build_pool().spawn(move || drop(slots));
+                            crate::parallel_transfer::behind_pool().spawn(move || drop(slots));
                         } else {
                             receipts_behind = true;
                         }
@@ -2050,6 +2496,19 @@ where
                     // turns the skip on; the cache insert per account was
                     // ~a third of a 70 ms graft.
                     let block_full = block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS;
+                    // Sealed early, nothing after the graft reads the cache
+                    // either: the serial loop never runs.
+                    let sealing_early = seal_early_possible && block_blob_count == 0 && (block_full || par_drained);
+                    // A block that will not seal early reads the shards below
+                    // (the withdrawals' check, the staged graft): the late
+                    // freeze is joined first. One that will is joined behind
+                    // the seal, beside the receipts.
+                    if !sealing_early && let Some(handle) = freezing.take() {
+                        let joined = handle.join().map_err(|_| {
+                            PayloadBuilderError::other(std::io::Error::other("the shards' freeze panicked"))
+                        })?;
+                        sharded_out = Some(freeze_joined!(joined));
+                    }
                     let withdrawals_clear = attributes.withdrawals.as_ref().is_none_or(|ws| match (staged.as_ref(), sharded_out.as_ref()) {
                         (Some(staged), _) => {
                             let staged = staged.lock().expect("the staged graft's lock");
@@ -2058,9 +2517,6 @@ where
                         (None, Some(shards)) => ws.iter().all(|w| !shards.holds(&w.address)),
                         (None, None) => ws.iter().all(|w| !run.bundles.iter().any(|b| b.state.contains_key(&w.address))),
                     });
-                    // Sealed early, nothing after the graft reads the cache
-                    // either: the serial loop never runs.
-                    let sealing_early = seal_early_possible && block_blob_count == 0 && (block_full || par_drained);
                     // The executor's finish credits the block's withdrawals
                     // through the cache, and a miss there would load the
                     // parent's account over the graft's (the faucet, on a
@@ -2080,6 +2536,10 @@ where
                     let mut seal_took = std::time::Duration::ZERO;
                     if ahead && let Some(EarlySeal { hook, parent_built: _ }) = early_seal.take() {
                         let seal_at = std::time::Instant::now();
+                        if let Some(run_at) = run_started {
+                            let exec_end = run_at + std::time::Duration::from_micros(run.phases.batches_end_us);
+                            exec_end_to_seal_us = seal_at.saturating_duration_since(exec_end).as_micros() as u64;
+                        }
                         let matches = root_ahead.is_some()
                             && run.skipped.is_empty()
                             && direct_body.as_ref().is_some_and(|(transactions, _)| {
@@ -2110,6 +2570,24 @@ where
                         gap_before_seal_ms = commit_end.elapsed().as_millis() as u64;
                         let sealed = seal_block!(hook, seal_at, if matches { root_ahead } else { None });
                         sealed_ahead_id = Some((sealed.2, sealed.3));
+                        // `N42_PLAN_AHEAD_BODY=1`: a block sealed on its
+                        // counters from the frames' bulk vector, uncut, is
+                        // its build's whole take in take order: the queue's
+                        // hand-off forgets it in O(1) (`forget_whole_take`).
+                        if seal_on_counters_used && from_bulk && crate::frame_blocks::plan_ahead_body_wanted() && !cands.is_empty() {
+                            let last = cands.len() - 1;
+                            let checks = [0, last / 2, last]
+                                .into_iter()
+                                .map(|i| (i, cands[i].sender(), cands[i].nonce()))
+                                .collect();
+                            crate::frame_blocks::note_whole_take(crate::frame_blocks::WholeTake {
+                                block: sealed.2,
+                                parent: parent_header.hash(),
+                                len: cands.len(),
+                                checks,
+                            });
+                            whole_take_noted = true;
+                        }
                         sealed_ahead = Some(sealed);
                         seal_took = seal_at.elapsed();
                     }
@@ -2122,34 +2600,92 @@ where
                     // state with no bundle of its own; otherwise the shards are
                     // folded into one staged map here and installed as the
                     // streamed graft is.
+                    // Decided once, for the shards frozen here and for the
+                    // late freeze joined in the scope below alike.
+                    let shards_stay = !keep_cache
+                        && sealing_early
+                        && tx_count > 0
+                        && builder.executor.evm_mut().db_mut().bundle_state.state.is_empty();
                     let (staged, mut sharded_out) = match sharded_out {
-                        Some(shards)
-                            if !keep_cache
-                                && sealing_early
-                                && tx_count > 0
-                                && builder.executor.evm_mut().db_mut().bundle_state.state.is_empty() =>
-                        {
-                            (None, Some(shards))
-                        }
+                        Some(shards) if shards_stay => (None, Some(shards)),
                         Some(shards) => (Some(std::sync::Mutex::new(shards.into_staged())), None),
                         None => (staged, None),
                     };
-                    let staged = staged.map(|staged| staged.into_inner().expect("the staged graft's lock"));
+                    let mut staged = staged.map(|staged| staged.into_inner().expect("the staged graft's lock"));
                     // Of the fold: the graft alone, without the transactions
                     // root that runs beside it -- `par_fold_ms` is the longer
                     // of the two, so a graft that falls under the root would
                     // not show in it (plan v5 attempt D).
                     let mut graft_ms = 0u64;
+                    // `N42_FREEZE_AFTER_SEAL=1`: set when the late freeze's
+                    // thread panicked; the graft is not run and the build
+                    // fails behind its seal.
+                    let mut freeze_failed = false;
+                    // `N42_SHARDS_BEFORE_RECEIPTS=1` on a block whose output
+                    // stays in its shards: the receipts are built on a thread
+                    // that owns their inputs (the slots and the candidates,
+                    // shared), so the shards are filed without waiting for
+                    // them (`docs/SHARED_EXECUTION_SCOPE.md` 18.7 item 4a):
+                    // the child reads the shards, never the receipts.
+                    let mut cands_shared: Option<Arc<Vec<_>>> = None;
+                    if receipts_behind && shards_stay && crate::output_shards::shards_before_receipts() {
+                        let shared = Arc::new(std::mem::take(&mut cands));
+                        let inputs = Arc::new(std::sync::Mutex::new(Some((std::mem::take(&mut run.slots), Arc::clone(&shared)))));
+                        let taken = Arc::clone(&inputs);
+                        let spawned = std::thread::Builder::new().name("n42-receipts-late".into()).spawn(move || {
+                            let Some((slots, pulled)) = taken.lock().ok().and_then(|mut cell| cell.take()) else {
+                                return (Vec::new(), 0);
+                            };
+                            let refs: Vec<_> = slots.iter().filter_map(std::sync::OnceLock::get).collect();
+                            let (cumulative, tx_gas) = cumulative_gas(&refs);
+                            let receipts = if crate::parallel_transfer::freeze_pool_own() {
+                                crate::parallel_transfer::behind_pool().install(|| receipts_from_slots(&refs, &cumulative, &pulled))
+                            } else {
+                                receipts_from_slots(&refs, &cumulative, &pulled)
+                            };
+                            drop(refs);
+                            // The slots' 77 MB are freed on the pool, off this thread.
+                            crate::parallel_transfer::behind_pool().spawn(move || drop((slots, pulled)));
+                            (receipts, tx_gas)
+                        });
+                        match spawned {
+                            Ok(handle) => {
+                                receipts_pending = Some(handle);
+                                cands_shared = Some(shared);
+                            }
+                            Err(err) => {
+                                // No thread: the inputs come back and the
+                                // receipts are built in the scope, as before.
+                                tracing::warn!(target: "payload_builder", %err, "no thread for the late receipts; built beside the graft");
+                                if let Some((slots, pulled)) = inputs.lock().ok().and_then(|mut cell| cell.take()) {
+                                    run.slots = slots;
+                                    drop(pulled);
+                                }
+                                match Arc::try_unwrap(shared) {
+                                    Ok(back) => cands = back,
+                                    Err(still) => cands_shared = Some(still),
+                                }
+                            }
+                        }
+                    }
+                    let receipts_in_scope = receipts_behind && receipts_pending.is_none();
                     let (graft, early_root, receipts) = std::thread::scope(|scope| {
                         // Sealed at the execution's end: the receipts from the
                         // slots, beside the graft, instead of the root.
-                        let receipts_job = receipts_behind.then(|| {
+                        let receipts_job = receipts_in_scope.then(|| {
                             let slots: &[_] = &run.slots;
                             let pulled: &[_] = &cands;
                             scope.spawn(move || {
                                 let refs: Vec<_> = slots.iter().filter_map(std::sync::OnceLock::get).collect();
                                 let (cumulative, tx_gas) = cumulative_gas(&refs);
-                                (receipts_from_slots(&refs, &cumulative, pulled), tx_gas)
+                                // `N42_FREEZE_POOL=own`: the receipts on the
+                                // pool behind the seal; the global pool else.
+                                let receipts = if crate::parallel_transfer::freeze_pool_own() {
+                                    crate::parallel_transfer::behind_pool().install(|| receipts_from_slots(&refs, &cumulative, pulled))
+                                } else {
+                                    receipts_from_slots(&refs, &cumulative, pulled)
+                                };
+                                (receipts, tx_gas)
                             })
                         });
                         let root = (sealing_early && sealed_ahead.is_none() && frame_plan.is_none()).then(|| match direct_body.as_ref() {
@@ -2162,9 +2698,27 @@ where
                                 scope.spawn(move || crate::assembler::parallel_transaction_root_recovered(txs))
                             }
                         });
+                        // `N42_FREEZE_AFTER_SEAL=1`: the shards are first read
+                        // here; the freeze has run beside the commit and the
+                        // seal, and the receipts job runs beside its end.
+                        if let Some(handle) = freezing.take() {
+                            let join_at = std::time::Instant::now();
+                            match handle.join() {
+                                Ok(joined) => {
+                                    let frozen = freeze_joined!(joined);
+                                    if shards_stay {
+                                        sharded_out = Some(frozen);
+                                    } else {
+                                        staged = Some(frozen.into_staged());
+                                    }
+                                }
+                                Err(_) => freeze_failed = true,
+                            }
+                            freeze_join_wait_us = join_at.elapsed().as_micros() as u64;
+                        }
                         let db = builder.executor.evm_mut().db_mut();
                         let at = std::time::Instant::now();
-                        let graft = match (staged, sharded_out.as_mut()) {
+                        let graft = if freeze_failed { None } else { Some(match (staged, sharded_out.as_mut()) {
                             // The block's output stays in its shards: only the
                             // accounts a pre-execution call left in the cache
                             // are committed, as deltas.
@@ -2185,7 +2739,7 @@ where
                                 crate::parallel_transfer::build_graft_fold(),
                                 graft_target.take(),
                             ),
-                        };
+                        }) };
                         // Kept at 0 when nothing was grafted.
                         graft_ms = if sharded_out.is_some() { 0 } else { at.elapsed().as_millis() as u64 };
                         (
@@ -2206,9 +2760,16 @@ where
                         direct_receipts = Some((receipts, tx_gas));
                         // The slots' 77 MB are freed on the pool, off this thread.
                         let slots = std::mem::take(&mut run.slots);
-                        crate::parallel_transfer::build_pool().spawn(move || drop(slots));
+                        crate::parallel_transfer::behind_pool().spawn(move || drop(slots));
                     }
-                    let graft = graft.map_err(|err| failed_after_seal(sealed_ahead_id, PayloadBuilderError::other(err)))?;
+                    let graft = graft
+                        .ok_or_else(|| {
+                            failed_after_seal(
+                                sealed_ahead_id,
+                                PayloadBuilderError::other(std::io::Error::other("the shards' freeze behind the seal panicked")),
+                            )
+                        })?
+                        .map_err(|err| failed_after_seal(sealed_ahead_id, PayloadBuilderError::other(err)))?;
                     // Zero on `install_staged`'s streamed graft
                     // (`N42_GRAFT_STREAM=1`) and on `GraftFold::Indexed`/
                     // `IndexedRanges`: only the default in-place fold
@@ -2262,13 +2823,37 @@ where
                         changes.insert(beneficiary, account);
                     }
                     revm::DatabaseCommit::commit(db, changes);
-                    output_shards = sharded_out;
+                    output_shards = sharded_out.map(Arc::new);
+                    // `N42_ROOT_OPS_AHEAD=1`: the shards are final here (the
+                    // cached accounts taken out of them); their QMDB leaves
+                    // are encoded and sorted now, beside the finish, and the
+                    // root job adds the residual's to them.
+                    if root_ops_ahead() && sealing_early && let Some(shards) = output_shards.as_ref() {
+                        let shards = Arc::clone(shards);
+                        let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
+                        let spawned = std::thread::Builder::new().name("n42-ops-ahead".into()).spawn(move || {
+                            n42_core_layout::enter(n42_core_layout::Set::Critical);
+                            let empty = revm::database::BundleState::default();
+                            let accounts = shards.view(&empty, &[]);
+                            (n42_qmdb_reth::operations_ahead(&accounts, prague), std::time::Instant::now())
+                        });
+                        match spawned {
+                            Ok(handle) => ops_ahead = Some((handle, prague)),
+                            Err(error) => {
+                                tracing::debug!(target: "payload_builder", %error, "no thread for the operations ahead; the root job encodes them");
+                            }
+                        }
+                    }
                     par_fold_ms = fold_at.elapsed().saturating_sub(seal_took).as_millis() as u64;
                     par_txs = tx_count;
                     par_groups = run.phases.groups;
                     par_batches = run.phases.batches;
                     par_part_ms = run.phases.partition_ms;
                     par_exec_ms = run.phases.groups_ms;
+                    exec_prepared_groups = run.phases.prepared_groups;
+                    exec_prepared_slots = run.phases.prepared_slots;
+                    exec_partition_us = run.phases.partition_us;
+                    exec_slots_us = run.phases.slots_us;
                     par_transfer_timers = run.phases.transfer_timers;
                     par_read_set = run.phases.read_set;
                     par_read_set_hits = run.phases.read_set_hits;
@@ -2284,8 +2869,11 @@ where
                     // transaction -- 5.2 s for a block's worth when the
                     // base fee had run past every candidate's fee (round 43).
                     // Given back with the leftovers at the end instead.
+                    // The candidates are shared with the late receipts'
+                    // thread when it runs (`N42_SHARDS_BEFORE_RECEIPTS`).
+                    let pulled_now: &[_] = cands_shared.as_deref().map_or(&cands[..], |shared| &shared[..]);
                     for i in run.skipped {
-                        deferred.push(Arc::clone(&cands[i]));
+                        deferred.push(Arc::clone(&pulled_now[i]));
                     }
                     // Why each skipped sender's head was refused, so the
                     // give-back below can say it. Handing every skipped
@@ -2566,8 +3154,24 @@ where
                 .map_err(|err| PayloadBuilderError::Internal(err.into()))?;
             // Receipts built beside the parallel step: the executor committed
             // none, so its finish reports none and no gas.
-            let direct_receipts_used = direct_receipts.is_some();
+            let receipts_late_used = receipts_pending.is_some();
+            let direct_receipts_used = direct_receipts.is_some() || receipts_late_used;
             if let Some((receipts, gas_used)) = direct_receipts {
+                execution_result.receipts = receipts;
+                execution_result.gas_used = gas_used;
+            }
+            // `N42_SHARDS_BEFORE_RECEIPTS`: the receipts still being built
+            // are joined where they are first read -- beside the QMDB root,
+            // after the shards are filed -- on the shard path, and here on any
+            // other (which never takes this road: it is chosen only for a
+            // block whose output stays in its shards).
+            let mut receipts_late = receipts_pending.take();
+            if output_shards.is_none()
+                && let Some(handle) = receipts_late.take()
+            {
+                let (receipts, gas_used) = handle.join().map_err(|_| {
+                    PayloadBuilderError::other(std::io::Error::other("the late receipts job panicked"))
+                })?;
                 execution_result.receipts = receipts;
                 execution_result.gas_used = gas_used;
             }
@@ -2582,6 +3186,7 @@ where
             // inside the 26 ms before the next build could start (loop138).
             // The hashed state comes with `complete`.
             let mut bundle = db.take_bundle();
+            let bundle_taken_at = std::time::Instant::now();
             if !execution_result.requests.is_empty() {
                 tracing::error!(
                     target: "payload_builder",
@@ -2597,18 +3202,54 @@ where
             // (`ParentExecution::Published`) has no builder hash: its tree is
             // filed under the sealed hash by its own import, and there is
             // nothing to rename.
+            // `N42_FIELDS_AT_SEAL` (INDUSTRY_SURVEY_2026_10 11.8): off, the
+            // rename waits for the parent's `Complete` (its merge and hashed
+            // post-state) as it always did; on, a parent record already filed
+            // under the builder's hash -- it is, whenever this block sealed on
+            // the parent's published fields, because the parent files its tree
+            // before it publishes them -- is renamed at once, and this block's
+            // root job no longer queues behind the parent's finish.
+            let fields_mode = crate::fields_at_seal::mode();
+            let verify_fields = fields_mode.verify();
+            let rename_wait_us = std::cell::Cell::new(0u64);
+            let rename_early = std::cell::Cell::new(false);
+            let renamed_at = std::cell::Cell::new(None::<std::time::Instant>);
             let rename_parent = || -> Result<(), PayloadBuilderError> {
-                if qmdb_state.root_of(&parent_sealed).is_none()
-                    && let Some(built) = parent_built.filter(|built| *built != parent_sealed)
-                {
-                    let _ = crate::built_executions::wait_for(built, crate::built_executions::Stage::Complete);
-                    if qmdb_state.root_of(&parent_sealed).is_none() {
-                        crate::chain_alias::rename(&qmdb_state, built, parent_sealed)
-                            .map_err(PayloadBuilderError::other)?;
-                    }
-                }
+                // At depth 2 this block's seal no longer waited for the
+                // parent's fields, which was what made sure the parent's tree
+                // was filed before this root job looked for it: the root job
+                // waits for them itself (docs/DEFERRED_DEPTH_2_DESIGN.md item 8).
+                let record_wait = (carried_depth >= 2).then_some(crate::hotstuff_consensus::PARENT_FIELDS_WAIT);
+                let filed = crate::fields_at_seal::file_parent_under_seal_with_barrier(
+                    &qmdb_state,
+                    parent_sealed,
+                    parent_built,
+                    fields_mode.early(),
+                    record_wait,
+                    || {
+                        if let Some(built) = parent_built {
+                            let _ = crate::built_executions::wait_for(built, crate::built_executions::Stage::Complete);
+                        }
+                    },
+                )
+                .map_err(PayloadBuilderError::other)?;
+                rename_wait_us.set(filed.waited_us);
+                rename_early.set(filed.early);
+                renamed_at.set(Some(std::time::Instant::now()));
                 Ok(())
             };
+            // The root job's own start and end, and the moment the fields
+            // were published (the `seal_to_*_us` stamps).
+            let root_started_at: Option<std::time::Instant>;
+            let root_ended_at: Option<std::time::Instant>;
+            let mut view_ready_at: Option<std::time::Instant> = None;
+            // When the shards were filed (`shards_ready`): the child's open
+            // proceeds from here.
+            let mut shards_ready_at: Option<std::time::Instant> = None;
+            let fields_published_at = std::cell::Cell::new(None::<std::time::Instant>);
+            // `N42_FIELDS_AT_SEAL=verify`: what the fields were published
+            // from, compared behind `Complete` with the late derivation.
+            let mut early_inputs;
             let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
             // `N42_OUTPUT_SHARDS`: the executor's bundle holds only what it
             // changed after the batches. The next build is let go on it laid
@@ -2619,11 +3260,19 @@ where
             let mut shard_ready_ms = 0u64;
             let mut shard_merge_ms = 0u64;
             let mut shards_used = 0usize;
+            // The leader's merge on its own thread (`merge_*` on the line),
+            // and the shard path's root job split into its operations (encode,
+            // join, sort) and the forest's compute.
+            let mut leader_merge = LeaderMerge::default();
+            let mut root_ops: (n42_qmdb_reth::OpsSplit, std::time::Duration, std::time::Duration, OpsAheadUse) = Default::default();
             let roots_ms;
             // Where the QMDB root spent its time (`root_*` on the phases line),
             // and how long its publication took.
             let root_split: n42_qmdb_reth::RootSplit;
             let root_publish_us = std::cell::Cell::new(0u64);
+            // `N42_SHARDS_BEFORE_RECEIPTS`: how long the receipts root waited
+            // for the late receipts, us (0 when they were in).
+            let receipts_late_wait_us = std::cell::Cell::new(0u64);
             let state_ready_ms;
             // The block's own execution fields, published the moment its QMDB
             // root is in: the child's header carries them (deferred
@@ -2633,15 +3282,14 @@ where
             let publish = |prepared: Result<n42_qmdb_reth::PreparedBlock, n42_qmdb_reth::NodeStateError>,
                            (receipts_root, logs_bloom): reth_consensus::ReceiptRootBloom,
                            gas_used: u64|
-             -> Result<(), PayloadBuilderError> {
+             -> Result<crate::executed_fields::ExecutedFields, PayloadBuilderError> {
                 let prepared = prepared.map_err(PayloadBuilderError::other)?;
                 let state_root = prepared.root;
                 qmdb_state.insert(block_hash, block_number, prepared).map_err(PayloadBuilderError::other)?;
-                crate::executed_fields::remember(
-                    block_hash,
-                    crate::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used },
-                );
-                Ok(())
+                let fields = crate::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used };
+                crate::executed_fields::remember(block_hash, fields);
+                fields_published_at.set(Some(std::time::Instant::now()));
+                Ok(fields)
             };
             let (execution_output, hashed_state) = match output_shards.take() {
                 None => {
@@ -2665,12 +3313,18 @@ where
             // The state provider is `Send` but not `Sync`: the hashed
             // post-state stays on this thread while the root and the
             // receipts run beside it.
-            let (hashed_state, prepared, roots) = std::thread::scope(|scope| {
+            let parent_root_early = verify_fields.then(|| qmdb_state.root_of(&parent_sealed)).flatten();
+            let (hashed_state, (prepared, root_started, root_ended, kept_ops), roots) = std::thread::scope(|scope| {
                 let receipts = &execution_result.receipts;
                 let qmdb_job = &qmdb_state;
                 let root = scope.spawn(move || {
+                    // The leader's QMDB root job: on the critical set.
+                    let started = std::time::Instant::now();
+                    n42_core_layout::enter(n42_core_layout::Set::Critical);
                     let ops = n42_qmdb_reth::sorted_operations_from_execution(bundle_ref, prague);
-                    qmdb_job.compute_operations(parent_sealed, ops)
+                    let kept = verify_fields.then(|| ops.clone());
+                    let prepared = qmdb_job.compute_operations(parent_sealed, ops);
+                    (prepared, started, std::time::Instant::now(), kept)
                 });
                 let receipts = scope.spawn(move || crate::hotstuff_consensus::gov5_receipt_root_bloom(receipts));
                 // `N42_HASHED_TABLES=off` (stage 6c): the tables this post-state is written to are
@@ -2685,16 +3339,22 @@ where
                 (hashed, prepared, roots)
             });
             let hashed_state = hashed_state.map_err(PayloadBuilderError::other)?;
+            root_started_at = Some(root_started);
+            root_ended_at = Some(root_ended);
             let published_at = std::time::Instant::now();
-            publish(prepared, roots, execution_result.gas_used)?;
+            let fields = publish(prepared, roots, execution_result.gas_used)?;
             root_publish_us.set(published_at.elapsed().as_micros() as u64);
+            early_inputs = kept_ops.map(|ops| crate::fields_at_seal::EarlyInputs {
+                fields,
+                ops,
+                parent_root: parent_root_early,
+            });
             roots_ms = roots_at.elapsed().as_millis() as u64;
             root_split = qmdb_state.take_root_split(&parent_sealed).unwrap_or_default();
             (execution_output, hashed_state)
                 }
                 Some(shards) => {
             shards_used = out_shards;
-            let shards = Arc::new(shards);
             // The residual is filed as it is, not copied: the root, the
             // hashed post-state and the merge below read it through the Arc.
             let residual = Arc::new(reth_execution_types::BlockExecutionOutput {
@@ -2711,12 +3371,54 @@ where
                 crate::built_executions::ShardedParent { residual: Arc::clone(&residual), shards: Arc::clone(&shards) },
             );
             shard_ready_ms = finish_at.elapsed().as_millis() as u64;
+            shards_ready_at = Some(std::time::Instant::now());
+            let shard_reverts = std::mem::take(&mut par_reverts);
+            // `N42_MERGE_AT_SHARDS_READY=1`: every input of the merge is in
+            // hand now (the shards frozen, the residual taken, the graft's
+            // reverts): it starts here on its own pool instead of after the
+            // fields' publication on one thread. The receipts are not an
+            // input (they join the merged bundle in the output below), and
+            // `StateReady` and `Complete` stay where they are: after the
+            // publication, which files this block's QMDB tree.
+            type EarlyMerge = (revm::database::BundleState, crate::output_shards::MergeSplit, u64, u32, std::time::Instant, std::time::Instant);
+            let (early_merge, shard_reverts): (Option<std::thread::JoinHandle<EarlyMerge>>, _) =
+                match crate::output_shards::merge_at_shards_ready().then(crate::output_shards::merge_pool).flatten() {
+                    Some(pool) => {
+                        let (shards, residual) = (Arc::clone(&shards), Arc::clone(&residual));
+                        let threads = u32::try_from(pool.current_num_threads()).unwrap_or(u32::MAX);
+                        // The graft's reverts reach the thread through a
+                        // cell, so a thread that cannot be had leaves them
+                        // here for the merge after the publication.
+                        let reverts_cell = Arc::new(std::sync::Mutex::new(Some(shard_reverts)));
+                        let cell = Arc::clone(&reverts_cell);
+                        let spawned = std::thread::Builder::new().name("n42-merge-early".into()).spawn(move || {
+                            n42_core_layout::background_thread();
+                            let reverts = cell.lock().ok().and_then(|mut cell| cell.take()).unwrap_or_default();
+                            let merge_at = std::time::Instant::now();
+                            let (mut merged, split) = shards.merged_on(&residual.state, pool);
+                            let tail_at = std::time::Instant::now();
+                            crate::parallel_transfer::append_reverts(&mut merged, reverts);
+                            let merge_end = std::time::Instant::now();
+                            let tail_us = merge_end.duration_since(tail_at).as_micros() as u64;
+                            (merged, split, tail_us, threads, merge_at, merge_end)
+                        });
+                        match spawned {
+                            Ok(handle) => (Some(handle), Vec::new()),
+                            Err(err) => {
+                                tracing::warn!(target: "payload_builder", %err, "no thread for the early merge; it runs after the fields' publication");
+                                let back = reverts_cell.lock().ok().and_then(|mut cell| cell.take()).unwrap_or_default();
+                                (None, back)
+                            }
+                        }
+                    }
+                    None => (None, shard_reverts),
+                };
             let residual_state = &residual.state;
             let overlaps = shards.overlaps(residual_state);
             let view = shards.view(residual_state, &overlaps);
+            view_ready_at = Some(std::time::Instant::now());
             let destroyed = crate::output_shards::any_destroyed(&view);
             let hashed_off = n42_qmdb_reth::n42_state::hashed_tables_off();
-            let shard_reverts = std::mem::take(&mut par_reverts);
             let view_ref = &view;
             let publish_ref = &publish;
             // The order behind the seal (BREAKTHROUGH_DESIGN 10.16): the QMDB
@@ -2733,15 +3435,71 @@ where
             // for it.
             let scoped = std::thread::scope(|scope| -> Result<_, PayloadBuilderError> {
                 let receipts = scope.spawn(move || {
+                    let mut execution_result = execution_result;
+                    // `N42_SHARDS_BEFORE_RECEIPTS`: the receipts join the
+                    // block's result here, after the shards were filed.
+                    let joined_at = std::time::Instant::now();
+                    if let Some(handle) = receipts_late {
+                        let (receipts, gas_used) = handle.join().map_err(|_| ())?;
+                        execution_result.receipts = receipts;
+                        execution_result.gas_used = gas_used;
+                    }
+                    let late_wait = joined_at.elapsed();
                     let roots = crate::hotstuff_consensus::gov5_receipt_root_bloom(&execution_result.receipts);
-                    (execution_result, roots)
+                    Ok::<_, ()>((execution_result, roots, late_wait))
                 });
                 rename_parent()?;
+                let parent_root_early = verify_fields.then(|| qmdb_state.root_of(&parent_sealed)).flatten();
                 let roots_from = std::time::Instant::now();
                 let qmdb_job = &qmdb_state;
+                let ahead = ops_ahead.take();
+                let shards_ref = &shards;
+                let overlaps_ref = &overlaps;
                 let root = scope.spawn(move || {
-                    let ops = n42_qmdb_reth::sorted_operations_from_accounts(view_ref, prague);
-                    qmdb_job.compute_operations(parent_sealed, ops)
+                    // The leader's QMDB root job: on the critical set.
+                    let started = std::time::Instant::now();
+                    n42_core_layout::enter(n42_core_layout::Set::Critical);
+                    // `N42_ROOT_OPS_AHEAD=1`: the shards' operations encoded
+                    // beside the finish; the residual's added here. A job
+                    // that failed, or ran under another Prague flag, leaves
+                    // the whole encode to this one.
+                    let finished = ahead.and_then(|(job, ahead_prague)| {
+                        let joined_at = std::time::Instant::now();
+                        let (ahead, done_at) = job.join().ok().filter(|_| ahead_prague == prague)?;
+                        let waited = joined_at.elapsed();
+                        let finish_at = std::time::Instant::now();
+                        let replaced: Vec<(&alloy_primitives::Address, &revm::database::BundleAccount)> = residual_state
+                            .state
+                            .keys()
+                            .filter_map(|address| shards_ref.get(address).map(|account| (address, account)))
+                            .collect();
+                        let newer: Vec<(&alloy_primitives::Address, &revm::database::BundleAccount)> = residual_state
+                            .state
+                            .iter()
+                            .filter(|(address, _)| !shards_ref.holds(address))
+                            .chain(overlaps_ref.iter().map(|(address, account)| (address, account)))
+                            .collect();
+                        let split = n42_qmdb_reth::OpsSplit {
+                            encode_us: ahead.encode_us,
+                            concat_us: 0,
+                            sort_us: ahead.sort_us,
+                        };
+                        let ops = ahead.finish(&replaced, &newer, prague);
+                        Some((ops, split, OpsAheadUse { waited, finish: finish_at.elapsed(), done_at: Some(done_at) }))
+                    });
+                    let (ops, split, ahead_use) = match finished {
+                        Some(finished) => finished,
+                        None => {
+                            let (ops, split) = n42_qmdb_reth::sorted_operations_from_accounts_timed(view_ref, prague);
+                            (ops, split, OpsAheadUse::default())
+                        }
+                    };
+                    let kept = verify_fields.then(|| ops.clone());
+                    let ops_done = std::time::Instant::now();
+                    let prepared = qmdb_job.compute_operations(parent_sealed, ops);
+                    let ended = std::time::Instant::now();
+                    let timed = (split, ops_done.duration_since(started), ended.duration_since(ops_done), ahead_use);
+                    (prepared, started, ended, kept, timed)
                 });
                 // The hashed post-state beside the root on a thread of its
                 // own, so the publication does not wait for it. A destroyed
@@ -2749,15 +3507,21 @@ where
                 // provider's own path, on the merged bundle, below.
                 let hashed = (!hashed_off && !destroyed)
                     .then(|| scope.spawn(move || crate::output_shards::hashed_post_state_of(view_ref)));
-                let prepared = root.join().map_err(|_| {
+                let (prepared, root_started, root_ended, kept_ops, ops_timed) = root.join().map_err(|_| {
                     PayloadBuilderError::other(std::io::Error::other("the QMDB root job panicked"))
                 })?;
-                let (execution_result, roots) = receipts.join().map_err(|_| {
-                    PayloadBuilderError::other(std::io::Error::other("the receipts root panicked"))
+                let (execution_result, roots, late_wait) = receipts.join().ok().and_then(Result::ok).ok_or_else(|| {
+                    PayloadBuilderError::other(std::io::Error::other("the receipts root (or the late receipts) panicked"))
                 })?;
+                receipts_late_wait_us.set(late_wait.as_micros() as u64);
                 let published_at = std::time::Instant::now();
-                publish_ref(prepared, roots, execution_result.gas_used)?;
+                let fields = publish_ref(prepared, roots, execution_result.gas_used)?;
                 root_publish_us.set(published_at.elapsed().as_micros() as u64);
+                let early = kept_ops.map(|ops| crate::fields_at_seal::EarlyInputs {
+                    fields,
+                    ops,
+                    parent_root: parent_root_early,
+                });
                 let roots_ms = roots_from.elapsed().as_millis() as u64;
                 let shards = Arc::clone(&shards);
                 let residual = Arc::clone(&residual);
@@ -2765,10 +3529,45 @@ where
                 let merger = std::thread::Builder::new()
                     .name("n42-shard-merge".into())
                     .spawn(move || {
-                        let merge_at = std::time::Instant::now();
-                        let mut merged = shards.merged(&residual.state);
-                        crate::parallel_transfer::append_reverts(&mut merged, shard_reverts);
-                        let merge_ms = merge_at.elapsed().as_millis() as u64;
+                        n42_core_layout::background_thread();
+                        // Every input is in hand when this thread starts (the
+                        // shards frozen, the residual taken, the publication
+                        // done): the merge waits for nothing, and its phases
+                        // say where its wall goes (`merge_*` on the line).
+                        // With the early merge it only takes that merge's
+                        // result, waiting for it if it is still running.
+                        let joined_at = std::time::Instant::now();
+                        let early = early_merge.map(|handle| {
+                            handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                        });
+                        let join_wait_us = early.as_ref().map_or(0, |_| joined_at.elapsed().as_micros() as u64);
+                        let (merged, split, tail_us, threads, merge_at, merge_end, was_early) = match early {
+                            Some((merged, split, tail_us, threads, merge_at, merge_end)) => {
+                                (merged, split, tail_us, threads, merge_at, merge_end, true)
+                            }
+                            None => {
+                                let merge_at = std::time::Instant::now();
+                                let (mut merged, split) = shards.merged_timed(&residual.state, false);
+                                let tail_at = std::time::Instant::now();
+                                crate::parallel_transfer::append_reverts(&mut merged, shard_reverts);
+                                let merge_end = std::time::Instant::now();
+                                let tail_us = merge_end.duration_since(tail_at).as_micros() as u64;
+                                (merged, split, tail_us, 1, merge_at, merge_end, false)
+                            }
+                        };
+                        let merge_ms = merge_end.duration_since(merge_at).as_millis() as u64;
+                        let timing = LeaderMerge {
+                            started: Some(merge_at),
+                            ended: Some(merge_end),
+                            split,
+                            tail_us,
+                            threads,
+                            accounts: merged.state.len(),
+                            reverts: merged.reverts.iter().map(Vec::len).sum(),
+                            state_ready: None,
+                            early: was_early,
+                            join_wait_us,
+                        };
                         let execution_output =
                             Arc::new(reth_execution_types::BlockExecutionOutput { state: merged, result: execution_result });
                         crate::built_executions::state_ready(
@@ -2780,7 +3579,8 @@ where
                                 trie_updates: Arc::new(TrieUpdates::default()),
                             },
                         );
-                        (execution_output, merge_ms, finish_at.elapsed().as_millis() as u64)
+                        let timing = LeaderMerge { state_ready: Some(std::time::Instant::now()), ..timing };
+                        (execution_output, merge_ms, finish_at.elapsed().as_millis() as u64, timing)
                     })
                     .map_err(PayloadBuilderError::other)?;
                 let hashed = match hashed {
@@ -2790,12 +3590,17 @@ where
                     None if hashed_off => Some(Default::default()),
                     None => None,
                 };
-                Ok((merger, hashed, roots_ms))
+                Ok((merger, hashed, roots_ms, (root_started, root_ended), early, ops_timed))
             });
-            let (merger, hashed, shard_roots_ms) = scoped?;
-            let (execution_output, merge_ms, filed_ms) = merger.join().map_err(|_| {
+            let (merger, hashed, shard_roots_ms, (root_started, root_ended), early, ops_timed) = scoped?;
+            root_started_at = Some(root_started);
+            root_ended_at = Some(root_ended);
+            early_inputs = early;
+            root_ops = ops_timed;
+            let (execution_output, merge_ms, filed_ms, merge_timing) = merger.join().map_err(|_| {
                 PayloadBuilderError::other(std::io::Error::other("the shards' merge panicked"))
             })?;
+            leader_merge = merge_timing;
             let hashed_state = match hashed {
                 Some(hashed) => hashed,
                 None => parent_state_ref()
@@ -2809,6 +3614,8 @@ where
             (execution_output, hashed_state)
                 }
             };
+            let late_output = early_inputs.as_ref().map(|_| Arc::clone(&execution_output));
+            let complete_at = std::time::Instant::now();
             crate::built_executions::complete(
                 block_hash,
                 crate::built_executions::BuiltExecution {
@@ -2819,6 +3626,33 @@ where
                 },
             );
             build_stage.at(7);
+            // `N42_FIELDS_AT_SEAL=verify`: behind `Complete`, so neither the
+            // child's seal nor the engine's hand-off waits for it. The late
+            // derivation: the operations from the merged bundle, the parent's
+            // root after the parent's own `Complete` (where the rename used
+            // to wait), and the receipts root and gas from the merged output.
+            if let (Some(early), Some(output)) = (early_inputs.take(), late_output) {
+                if let Some(built) = parent_built.filter(|built| *built != parent_sealed) {
+                    let _ = crate::built_executions::wait_for(built, crate::built_executions::Stage::Complete);
+                }
+                let late = crate::fields_at_seal::LateInputs {
+                    ops: n42_qmdb_reth::sorted_operations_from_execution(&output.state, prague),
+                    parent_root: qmdb_state.root_of(&parent_sealed),
+                    receipts: crate::hotstuff_consensus::gov5_receipt_root_bloom(&output.result.receipts),
+                    gas_used: output.result.gas_used,
+                };
+                let verdict = crate::fields_at_seal::compare(&early, &late);
+                crate::fields_at_seal::note(&verdict);
+                if let crate::fields_at_seal::Verdict::Differ(differ) = &verdict {
+                    tracing::error!(
+                        target: "payload_builder",
+                        number = block_number,
+                        %block_hash,
+                        ?differ,
+                        "the fields published at the seal differ from the late derivation"
+                    );
+                }
+            }
             if tx_count >= 1000 {
                 let (queued, usable, parked) = queue_depth();
                 // `N42_READ_DEPTH_COUNTS=1`: how many of this block's account
@@ -2827,6 +3661,24 @@ where
                 // historical provider (plan v6 6.4, `crate::direct_build::read_depth`).
                 let read_depth = crate::direct_build::read_depth::snapshot();
                 let overlay_depth = crate::direct_build::read_depth::overlay_depth();
+                // `N42_PHASE_TIMERS=1`: the layered overlay's blocks skipped on
+                // their address filters and bundles probed since the last line
+                // (the process's, so a follower import in between counts too).
+                let (overlay_filter_skips, overlay_probes) = if crate::fast_transfer::phase_timers() {
+                    reth_provider::providers::overlay_filter::take_counters()
+                } else {
+                    (0, 0)
+                };
+                let (overlay_filter_builds, overlay_filter_cached) =
+                    reth_provider::providers::overlay_filter::filter_stats();
+                // The QMDB view's reads that stood behind its head (or met a
+                // block being indexed) since the last line, the journals they
+                // binary-searched and those their filters skipped
+                // (`N42_VIEW_JOURNAL_FILTER`): whether the reads walk journals
+                // at all, and how deep (the process's, folded per 4,096 reads).
+                let (view_journal_reads, view_journal_searches, view_journal_skips) =
+                    n42_qmdb_reth::read_view::take_journal_counters();
+                let prev_road = crate::post_seal::road_us(parent_header.number);
                 tracing::info!(
                     target: "payload_builder",
                     number = block_number,
@@ -2855,6 +3707,39 @@ where
                     merge_ms,
                     state_ready_ms,
                     roots_ms,
+                    // The finish behind the seal, us from the seal (11.8's
+                    // uninstrumented ~80 ms): the finish's start, the bundle
+                    // taken, the shard view built (0 without shards), the
+                    // parent's tree renamed (and of it, the wait for the
+                    // parent's `Complete`), this block's QMDB root job's
+                    // start and end, and its fields published.
+                    // `N42_FIELDS_AT_SEAL`: the mode, whether the rename took
+                    // the early path, and under `verify` the process's
+                    // blocks found equal / unchecked / different.
+                    seal_to_finish_us = crate::fields_at_seal::us_between(sealed_instant, Some(finish_at)),
+                    seal_to_bundle_us = crate::fields_at_seal::us_between(sealed_instant, Some(bundle_taken_at)),
+                    seal_to_view_us = crate::fields_at_seal::us_between(sealed_instant, view_ready_at),
+                    // The shards filed (`shards_ready`): what the child's
+                    // open waits for (`docs/SHARED_EXECUTION_SCOPE.md` 18.2).
+                    seal_to_shards_ready_us = crate::fields_at_seal::us_between(sealed_instant, shards_ready_at),
+                    // `N42_SHARDS_BEFORE_RECEIPTS`: the receipts were built
+                    // past the shards' filing, and how long their root then
+                    // waited for them.
+                    receipts_late = receipts_late_used,
+                    receipts_late_wait_us = receipts_late_wait_us.get(),
+                    seal_to_rename_us = crate::fields_at_seal::us_between(sealed_instant, renamed_at.get()),
+                    rename_wait_us = rename_wait_us.get(),
+                    seal_to_root_start_us = crate::fields_at_seal::us_between(sealed_instant, root_started_at),
+                    seal_to_root_end_us = crate::fields_at_seal::us_between(sealed_instant, root_ended_at),
+                    seal_to_fields_us = crate::fields_at_seal::us_between(sealed_instant, fields_published_at.get()),
+                    fields_at_seal = fields_mode.label(),
+                    rename_early = rename_early.get(),
+                    fields_verified = crate::fields_at_seal::counts().0,
+                    fields_unchecked = crate::fields_at_seal::counts().1,
+                    fields_mismatches = crate::fields_at_seal::counts().2,
+                    rename_record_waits = crate::fields_at_seal::barrier_counts().0,
+                    rename_fallbacks = crate::fields_at_seal::barrier_counts().1,
+                    carried_depth,
                     finish_ms = finish_at.elapsed().as_millis() as u64,
                     total_ms = build_started.elapsed().as_millis() as u64,
                     reads_d0 = read_depth[0],
@@ -2866,6 +3751,13 @@ where
                     reads_d16p = read_depth[6],
                     reads_hist = read_depth[7],
                     overlay_depth,
+                    overlay_filter_skips,
+                    overlay_probes,
+                    overlay_filter_builds,
+                    overlay_filter_cached,
+                    view_journal_reads,
+                    view_journal_searches,
+                    view_journal_skips,
                     // `N42_PHASE_TIMERS=1` (plan v6 6.5/6.6): where the
                     // parallel step's wall time (`par_exec_ms` above) goes
                     // inside `N42Evm::transfer`, which door each account read
@@ -2899,6 +3791,50 @@ where
                     batch_txs_min = par_batch_spans.txs_min,
                     batch_start_skew_ms = par_batch_spans.start_skew_ms,
                     batch_wait_ms = par_batch_spans.wait_ms,
+                    // Every batch's wall and thread CPU summed (us), and the
+                    // batches' own minor faults and voluntary / involuntary
+                    // context switches (`ThreadMark`): what the off-CPU part
+                    // of a batch is -- first touches, blocking, preemption.
+                    batch_wall_sum_us = par_batch_spans.wall_sum_us,
+                    batch_cpu_sum_us = par_batch_spans.cpu_sum_us,
+                    batch_minflt = par_batch_spans.minflt,
+                    batch_vcsw = par_batch_spans.vcsw,
+                    batch_ivcsw = par_batch_spans.ivcsw,
+                    live_index_defer = crate::output_shards::live_index_defer(),
+                    // Where a batch can block (SHARED_EXECUTION_SCOPE 14):
+                    // major faults (a file page read from disk); reads that
+                    // waited for the QMDB read view's reader slot (a publish)
+                    // or offset-index shard (an advance's writes), count and
+                    // us; the live-index hand-over's blocked shard locks,
+                    // the time blocked, the time held, the shards left to
+                    // the freeze (`N42_LIVE_INDEX_DEFER=1`); the opens of the
+                    // parent's view, us summed and the longest.
+                    batch_majflt = par_batch_spans.majflt,
+                    batch_view_slot_waits = par_batch_spans.view_slot_waits,
+                    batch_view_slot_wait_us = par_batch_spans.view_slot_wait_us,
+                    batch_view_index_waits = par_batch_spans.view_index_waits,
+                    batch_view_index_wait_us = par_batch_spans.view_index_wait_us,
+                    batch_live_lock_waits = par_batch_spans.live_lock_waits,
+                    batch_live_lock_wait_us = par_batch_spans.live_lock_wait_us,
+                    batch_live_lock_hold_us = par_batch_spans.live_lock_hold_us,
+                    batch_live_deferred = par_batch_spans.live_deferred,
+                    batch_open_sum_us = par_batch_spans.open_sum_us,
+                    batch_open_max_us = par_batch_spans.open_max_us,
+                    // The dispatch, us from the batches' hand-over to the pool:
+                    // the first and the last batch's start, the moment every
+                    // thread that ran one had started its first (two waves:
+                    // `batch_last_start_us` less this is the first wave), the
+                    // last batch's end; the batches and the threads that ran
+                    // them; `N42_BUILD_ONE_WAVE`.
+                    batch_first_start_us = par_batch_spans.first_start_us,
+                    batch_last_start_us = par_batch_spans.last_start_us,
+                    batch_dispatch_us = par_batch_spans.dispatch_us,
+                    batch_last_end_us = par_batch_spans.last_end_us,
+                    batches = par_batch_spans.batches,
+                    batch_threads = par_batch_spans.threads,
+                    one_wave = crate::parallel_transfer::build_one_wave(),
+                    // `N42_BUILD_BATCHES`: batches asked for, largest first (0 off).
+                    build_batches = crate::parallel_transfer::build_batches(),
                     // `N42_PHASE_TIMERS=1`: the batch loop by section, ns of
                     // pool time a transaction (`LoopTimers`); zero when off.
                     loop_fetch_ns = par_loop_timers.per_tx(par_loop_timers.fetch_ns),
@@ -2935,6 +3871,50 @@ where
                     shard_fold_ms,
                     shard_ready_ms,
                     shard_merge_ms,
+                    // The leader's merge into the block's one bundle
+                    // (SHARED_EXECUTION_SCOPE 15), us from the seal: its
+                    // thread's start (every input is ready by then: it is
+                    // spawned after the fields' publication), its end,
+                    // `StateReady` filed, `Complete` filed (the engine's
+                    // hand-off; it also waits for the hashed post-state);
+                    // its halves (the account map, the revert set copied and
+                    // sorted, the sorted reverts appended, the graft's
+                    // reverts appended after), the threads it ran on, and
+                    // the accounts and reverts it copied.
+                    seal_to_merge_start_us = crate::fields_at_seal::us_between(sealed_instant, leader_merge.started),
+                    seal_to_merge_end_us = crate::fields_at_seal::us_between(sealed_instant, leader_merge.ended),
+                    seal_to_state_ready_us = crate::fields_at_seal::us_between(sealed_instant, leader_merge.state_ready),
+                    seal_to_complete_us = crate::fields_at_seal::us_between(sealed_instant, Some(complete_at)),
+                    merge_state_us = leader_merge.split.state_us,
+                    merge_reverts_us = leader_merge.split.reverts_us,
+                    merge_append_us = leader_merge.split.append_us,
+                    merge_tail_us = leader_merge.tail_us,
+                    merge_threads = leader_merge.threads,
+                    merge_accounts = leader_merge.accounts,
+                    merge_reverts = leader_merge.reverts,
+                    // `N42_MERGE_AT_SHARDS_READY`: the merge ran from the
+                    // shards' filing on its own pool, and how long the
+                    // merger (after the fields' publication) waited for it.
+                    merge_early = leader_merge.early,
+                    merge_join_wait_us = leader_merge.join_wait_us,
+                    // The shard path's QMDB root job, us: its operations
+                    // (the leaves encoded on the global pool, the chunks
+                    // joined, the sort) and the forest's compute (the lock,
+                    // the move, the apply -- `root_apply_total_us` -- the
+                    // note and the delta).
+                    root_ops_us = root_ops.1.as_micros() as u64,
+                    root_ops_encode_us = root_ops.0.encode_us,
+                    root_ops_concat_us = root_ops.0.concat_us,
+                    root_ops_sort_us = root_ops.0.sort_us,
+                    root_compute_us = root_ops.2.as_micros() as u64,
+                    // `N42_ROOT_OPS_AHEAD=1`: whether the root job finished
+                    // operations encoded ahead (the encode and sort above are
+                    // then the ahead job's), when that job was done (us from
+                    // the seal), the root job's wait for it, and its finish.
+                    root_ops_ahead = root_ops.3.done_at.is_some(),
+                    seal_to_ops_ahead_us = crate::fields_at_seal::us_between(sealed_instant, root_ops.3.done_at),
+                    root_ops_ahead_wait_us = root_ops.3.waited.as_micros() as u64,
+                    root_ops_finish_us = root_ops.3.finish.as_micros() as u64,
                     // `N42_SEAL_AT_EXEC=1` (plan v6 G2): sealed at the parallel
                     // step's end with the fold behind the proposal; the
                     // transactions root computed over the pulled set beside
@@ -2951,8 +3931,23 @@ where
                     // before) to this build's start and to its entry into
                     // `build_on_own` (0 when not chained on an own seal):
                     // the leader's cycle outside every build's timers.
-                    next_start_gap_ms = gap_from_parent_seal(block_number, build_started),
-                    next_entry_gap_ms = own_entered.map_or(0, |at| gap_from_parent_seal(block_number, at)),
+                    next_start_gap_ms = prev_road[4] / 1_000,
+                    next_entry_gap_ms = prev_road[3] / 1_000,
+                    // The same road in microseconds, with what lies between
+                    // (`post_seal`): the parent's chain header and answer
+                    // written to the validator, this build's request read,
+                    // `build_on_own` entered, this build started, and the
+                    // parent's first import request by header (at E=1 the
+                    // leader key's, just after its proposal). 0 = not seen.
+                    prev_seal_to_header_us = prev_road[0],
+                    prev_seal_to_answer_us = prev_road[1],
+                    prev_seal_to_request_us = prev_road[2],
+                    prev_seal_to_entry_us = prev_road[3],
+                    prev_seal_to_start_us = prev_road[4],
+                    prev_seal_to_import_us = prev_road[5],
+                    // This block's seal on the wall clock, to join the
+                    // validator's `proposal sent` and `block committed` lines.
+                    sealed_unix_us,
                     // Of `par_start_ms`: the selection (`best_txs`, which on a
                     // chained build waits for the parent's queue hand-off --
                     // `start_handoff_ms` of it -- and then takes the queue's
@@ -2964,10 +3959,31 @@ where
                     start_select_ms,
                     start_walk_ms,
                     start_walk_check_ms,
+                    // Of `start_walk_ms`, us: the ids listed, the parallel
+                    // check, the takes settled; the rest of the walk is the
+                    // decisions in arrival order and the segments.
+                    start_walk_ids_us = select_times.ids_us,
+                    start_walk_check_us = select_times.check_us,
+                    start_walk_settle_us = select_times.settle_us,
+                    start_walk_us = select_times.walk_us,
                     start_pull_ms,
                     start_best_other_ms,
                     start_frames_by_ref = select_times.by_ref,
                     start_frames_slow = select_times.slow,
+                    // `N42_PLAN_AHEAD`: 0 the plan was made at this start,
+                    // 1 it was prepared while the parent executed, 2 and
+                    // topped up here; its age at use, its preparation's
+                    // time, the top-up's transactions, and why a prepared
+                    // plan was discarded ("" when none was).
+                    plan_ahead = select_times.ahead,
+                    plan_age_us = select_times.ahead_age_us,
+                    plan_prep_us = select_times.ahead_prep_us,
+                    plan_topup_txs = select_times.ahead_topup_txs,
+                    plan_discard = select_times.ahead_discard,
+                    // `N42_PULL_BY_FRAMES`: the block taken out of its
+                    // frames at once (0 = through the puller) and how long.
+                    pull_bulk_txs = select_times.bulk_txs,
+                    pull_bulk_us = select_times.bulk_us,
                     start_check_ms,
                     start_puller_ms,
                     start_prepare_ms,
@@ -2981,6 +3997,24 @@ where
                     commit_fees_ms,
                     commit_body_ms,
                     commit_body_ahead_used,
+                    // `N42_SEAL_ON_COUNTERS=1`: sealed on the batches'
+                    // counters (no pass over the slots before the seal), and
+                    // the batches' end to the seal's start, us.
+                    seal_on_counters = seal_on_counters_used,
+                    exec_end_to_seal_us,
+                    // `N42_PLAN_AHEAD_BODY=1`: the plan's body (0 none, 1
+                    // used, 2 not ready, 3 not this build's) and its making
+                    // time, us; whether the prep, the partition and the slots
+                    // came with it; the partition's and the slots' time in
+                    // the call, us; the hand-off noted as a whole take.
+                    plan_body = select_times.body_ahead,
+                    plan_body_us = select_times.body_ahead_us,
+                    prep_from_plan,
+                    exec_prepared_groups,
+                    exec_prepared_slots,
+                    exec_partition_us,
+                    exec_slots_us,
+                    whole_take_noted,
                     match_ms,
                     seal_header_ms,
                     seal_block_ms,
@@ -2988,25 +4022,64 @@ where
                     seal_hook_ms,
                     seal_layout_ms,
                     seal_root_ms,
+                    // The seal's hash vector came with the body (no collect).
+                    seal_hashes_ahead,
                     seal_frames_indexed,
                     seal_frames_hashed,
                     gap_before_exec_ms,
                     gap_after_exec_ms,
                     gap_before_seal_ms,
                     index_ms,
+                    // `N42_FREEZE_AFTER_SEAL=1`: the freeze ran on its own
+                    // thread beside the commit and the seal (`index_ms` is then
+                    // its own wall, off the seal's path), when it ended (us
+                    // from the seal; 0 = before it), and how long its join
+                    // behind the seal waited.
+                    freeze_late = freeze_late_used,
+                    // `N42_FREEZE_POOL=own`: the freeze, the receipts and the
+                    // frees behind the seal ran on a pool of their own.
+                    freeze_pool_own = crate::parallel_transfer::freeze_pool_own(),
+                    seal_to_frozen_us = crate::fields_at_seal::us_between(sealed_instant, freeze_ended_at),
+                    freeze_join_wait_us,
                     // `N42_STATE_AFTER_PULL=1` (plan v6 G3): the parent's state
                     // opened after the pull, prep and partition, and the time
                     // inside that open (0 with the flag off: the open is then
                     // inside `setup_ms`).
                     state_after_pull = defer_state,
                     state_wait_ms,
-                    state_wait_on = state_wait_label(state_wait_ms, &state_wait_on),
+                    state_wait_us,
+                    state_wait_on = state_wait_label(state_wait_us, &state_wait_on),
                     state_wait_split = %state_wait_on.split(),
                     root_lock_wait_ms = root_split.lock_wait_ms,
                     root_lock_held_by = root_split.held_by,
                     root_move_ms = root_split.move_ms,
                     root_apply_ms = root_split.apply_ms,
                     root_hash_ms = root_split.hash_ms,
+                    // The apply by phase and the tail after it, us
+                    // (`RootSplit`): which of the root's pieces is serial.
+                    root_sort_us = root_split.sort_us,
+                    root_leaves_us = root_split.leaves_us,
+                    root_retire_us = root_split.retire_us,
+                    root_writes_us = root_split.writes_us,
+                    root_index_us = root_split.index_us,
+                    root_rehash_us = root_split.rehash_us + root_split.root_us,
+                    root_note_us = root_split.note_us,
+                    root_delta_us = root_split.delta_us,
+                    root_apply_total_us = root_split.apply_total_us,
+                    // Of the apply (SHARED_EXECUTION_SCOPE 15): the undo
+                    // record's lists inside `root_retire_us`, and what lies
+                    // between the phases (`root_apply_total_us` less them: the
+                    // sortedness check, the undo record's start, the scratch).
+                    root_undo_us = root_split.undo_us,
+                    root_apply_gap_us = root_split.apply_total_us.saturating_sub(
+                        root_split.sort_us
+                            + root_split.leaves_us
+                            + root_split.retire_us
+                            + root_split.writes_us
+                            + root_split.index_us
+                            + root_split.rehash_us
+                            + root_split.root_us
+                    ),
                     root_publish_ms = root_publish_us.get() / 1000,
                     root_faults = root_split.faults,
                     root_majflt = root_split.majflt,
@@ -3024,6 +4097,7 @@ where
                     populate_lag_mb = root_split.populate_lag_mb,
                     root_seals = root_split.seals,
                     root_seal_ms = root_split.seal_ms,
+                    core_layout = n42_core_layout::label(),
                     "seal-first build phases"
                 );
             }
@@ -3055,7 +4129,7 @@ where
     }
     // Receipts built for an early seal belong to its finish; this block's
     // executor committed none of those transactions, so it must not go on.
-    if direct_receipts.is_some() {
+    if direct_receipts.is_some() || receipts_pending.is_some() {
         return Err(PayloadBuilderError::other(std::io::Error::other(
             "receipts were built for an early seal that did not happen",
         )));
@@ -3507,13 +4581,14 @@ where
         // itself moments earlier, because its execution was still filed only
         // under the builder's hash (loop193 W1b: 289 of 347 refusals, each
         // 0.4-1.3 ms after the request).
-        let parent_fields = crate::hotstuff_consensus::parent_executed_fields_or_built(
-            chain_spec.genesis(),
-            &parent_header,
-            parent_built,
-            crate::hotstuff_consensus::PARENT_FIELDS_WAIT,
-        )
-        .ok_or_else(|| PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(parent_header.hash())))?;
+        // At depth 2 the grandparent's (docs/DEFERRED_DEPTH_2_DESIGN.md).
+        let carried_depth = reth_chainspec::qmdb::deferred_execution_depth_at(chain_spec.genesis(), attributes.timestamp);
+        let parent_fields = carried_fields_for_seal(chain_spec.genesis(), &parent_header, parent_built, carried_depth)
+            .ok_or_else(|| {
+                PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(
+                    crate::hotstuff_consensus::ancestor_hash(&parent_header, carried_depth),
+                ))
+            })?;
         header.state_root = parent_fields.state_root;
         header.receipts_root = parent_fields.receipts_root;
         header.logs_bloom = parent_fields.logs_bloom;
@@ -3673,7 +4748,8 @@ where
             par_ms,
             state_after_pull = defer_state,
             state_wait_ms,
-            state_wait_on = state_wait_label(state_wait_ms, &state_wait_on),
+            state_wait_us,
+            state_wait_on = state_wait_label(state_wait_us, &state_wait_on),
             state_wait_split = %state_wait_on.split(),
             refused = ?crate::fast_transfer::rejected(),
             queued,
@@ -3687,6 +4763,7 @@ where
             root_ms = root_took.as_millis() as u64,
             assemble_ms,
             total_ms = total.as_millis() as u64,
+            core_layout = n42_core_layout::label(),
             "payload build phases"
         );
     }
@@ -4056,5 +5133,267 @@ mod seal_at_exec_tests {
         let mut body = pulled.clone();
         body.swap(7, 8);
         assert!(!body_matches_pull(&body, &pulled, |h| *h, |h| *h));
+    }
+}
+
+#[cfg(test)]
+mod plan_body_tests {
+    //! `N42_PLAN_AHEAD_BODY=1` (`docs/SHARED_EXECUTION_SCOPE.md` 16.4 item 2):
+    //! what the plan-ahead hook makes equals what the build's start, prep and
+    //! gap make from the same candidates.
+    use super::*;
+    use crate::parallel_transfer::{execute_for_build_counted_dispatch, partition_by_sender, BodyAhead, PreparedExec};
+    use alloy_primitives::{Address, Bytes};
+    use n42_tx_types::{AltSigTx, N42TxEnvelope, TxAltSig, ALG_ED25519};
+    use reth_primitives_traits::Recovered;
+    use reth_transaction_pool::{
+        identifier::{SenderId, TransactionId},
+        TransactionOrigin, ValidPoolTransaction,
+    };
+    use revm::database::{CacheDB, EmptyDB};
+    use revm::state::AccountInfo;
+
+    type Cand = Arc<ValidPoolTransaction<crate::N42PooledTransaction>>;
+
+    fn address(i: u64) -> Address {
+        let mut a = [0u8; 20];
+        a[..8].copy_from_slice(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_be_bytes());
+        a[12..].copy_from_slice(&i.to_be_bytes());
+        Address::from(a)
+    }
+
+    /// `senders` frames of `run` 0x50 transfers each (one sender a frame,
+    /// nonces from `first`), recipients drawn from `space`, the senders funded
+    /// in `db`.
+    fn frames(senders: u64, run: u64, first: u64, space: u64, db: &mut CacheDB<EmptyDB>) -> Vec<(n42_tx_queue::FrameTxs<crate::N42PooledTransaction>, usize)> {
+        let mut seed = 0x2545_f491_4f6c_dd1du64 ^ first;
+        let mut out = Vec::new();
+        for s in 0..senders {
+            let sender = address(100 + s);
+            db.insert_account_info(sender, AccountInfo { balance: U256::from(10u128.pow(21)), nonce: first, ..Default::default() });
+            let mut pubkey = [0u8; 32];
+            pubkey[..8].copy_from_slice(&s.to_be_bytes());
+            let mut frame: Vec<Cand> = Vec::new();
+            for k in first..first + run {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let tx = TxAltSig {
+                    chain_id: 1,
+                    nonce: k,
+                    max_priority_fee_per_gas: 1_000_000_000 + u128::from(seed % 1_000),
+                    max_fee_per_gas: 10_000_000_000,
+                    gas_limit: 21_000,
+                    to: address(1_000_000 + seed % space),
+                    value: U256::from(1_000 + k),
+                    input: Bytes::new(),
+                    access_list: Default::default(),
+                    alg_type: ALG_ED25519,
+                    pubkey: Bytes::copy_from_slice(&pubkey),
+                };
+                let mut signature = [0u8; 64];
+                signature[..8].copy_from_slice(&seed.to_be_bytes());
+                let envelope = N42TxEnvelope::AltSig(AltSigTx::new(tx, Bytes::copy_from_slice(&signature)));
+                let encoded = alloy_eips::eip2718::Encodable2718::encode_2718_len(&envelope);
+                let pooled = crate::N42PooledTransaction::new(Recovered::new_unchecked(envelope, sender), encoded);
+                frame.push(Arc::new(ValidPoolTransaction {
+                    transaction: pooled,
+                    transaction_id: TransactionId::new(SenderId::from(s), k),
+                    propagate: false,
+                    timestamp: std::time::Instant::now(),
+                    origin: TransactionOrigin::External,
+                    authority_ids: None,
+                }));
+            }
+            let len = frame.len();
+            // A cut last frame, as a plan's last frame may be.
+            let taken = if s + 1 == senders { len.div_ceil(2) } else { len };
+            out.push((Arc::from(frame), taken));
+        }
+        out
+    }
+
+    /// The body made with the plan equals the body the build's prep makes
+    /// from the same candidates (keys, transactions, senders, hashes), its
+    /// partition is the call's, its slots are empty; and three blocks of
+    /// different shapes executed on the prepared partition and slots equal
+    /// the fresh call: transfers, gas, success, skips, counters and the
+    /// batches' bundles.
+    #[test]
+    fn body_made_with_the_plan_equals_body_made_at_start() {
+        let beneficiary = address(1);
+        crate::frame_blocks::note_beneficiary(beneficiary);
+        let base_fee = 1_000_000_000u64;
+        for (senders, run, first, space) in [(60u64, 20u64, 0u64, 500u64), (200, 3, 4, 50_000), (17, 90, 1, 40)] {
+            let mut db = CacheDB::new(EmptyDB::default());
+            db.insert_account_info(beneficiary, AccountInfo { balance: U256::from(7), ..Default::default() });
+            let segments = frames(senders, run, first, space, &mut db);
+            let made = make_prepared_build(&segments).expect("every candidate a transfer");
+            let cands: Vec<Cand> = segments.iter().flat_map(|(txs, taken)| txs[..*taken].to_vec()).collect();
+            assert_eq!(made.cands.len(), cands.len());
+            assert!(made.cands.iter().zip(&cands).all(|(a, b)| Arc::ptr_eq(a, b)), "the candidates, in plan order");
+            let in_place: Vec<(n42_tx_queue::FrameTxs<_>, usize, usize)> =
+                segments.iter().map(|(txs, taken)| (Arc::clone(txs), 0, *taken)).collect();
+            assert!(made.made_from(&in_place));
+            let mut cut = in_place.clone();
+            cut[0].2 -= 1;
+            assert!(!made.made_from(&cut), "another take is not the plan's");
+            // The prep, as the build runs it.
+            let (keys, fresh) = BodyAhead::make_keyed(&cands, |_, tx| {
+                let consensus = pooled_consensus(tx);
+                (transfer_key(tx), consensus.clone(), tx.sender(), consensus.effective_tip_per_gas(base_fee).unwrap_or_default(), *tx.hash())
+            })
+            .expect("transfers");
+            assert_eq!(made.keys, keys, "keys");
+            assert_eq!(made.transactions, fresh.transactions, "transactions");
+            assert_eq!(made.senders, fresh.senders, "senders");
+            let hashes: Vec<B256> = fresh.transactions.iter().map(|tx| *alloy_consensus::transaction::TxHashRef::tx_hash(tx)).collect();
+            assert_eq!(made.hashes, hashes, "hashes");
+            assert_eq!(fresh.hashes, hashes, "the prep's hashes are the seal's collect");
+            let (noted, groups) = made.groups.clone().expect("a beneficiary was noted");
+            assert_eq!(noted, beneficiary);
+            assert_eq!(groups, partition_by_sender(&keys, beneficiary).expect("a partition"), "partition");
+            assert_eq!(made.slots.len(), cands.len());
+            assert!(made.slots.iter().all(|slot| slot.get().is_none()), "empty slots");
+
+            // Executed on the prepared partition and slots, and fresh.
+            let header = alloy_consensus::Header {
+                number: 20_000_000,
+                beneficiary,
+                gas_limit: 5_000_000_000,
+                base_fee_per_gas: Some(base_fee),
+                timestamp: 1_800_000_000,
+                ..Default::default()
+            };
+            let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(
+                reth_chainspec::MAINNET.clone(),
+                crate::fast_transfer::N42EvmFactory::with_fast_transfers(true),
+            );
+            let evm_env = evm_config.evm_env(&header).expect("env");
+            let convert = |i: usize| ((), evm_config.tx_env(reth_transaction_pool::PoolTransaction::consensus_ref(&cands[i].transaction)));
+            let tip_of = |i: usize| pooled_consensus(&cands[i]).effective_tip_per_gas(base_fee).unwrap_or_default();
+            let run_with = |prepared: Option<PreparedExec<()>>| {
+                let run = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, false, Some(&tip_of), prepared)
+                    .expect("a block of transfers");
+                let executed: Vec<(usize, u64, bool)> =
+                    run.slots.iter().filter_map(std::sync::OnceLock::get).map(|b| (b.index, b.gas_used, b.result.is_success())).collect();
+                let mut accounts: Vec<(Address, Option<AccountInfo>)> =
+                    run.bundles.iter().flat_map(|b| b.state.iter().map(|(a, acc)| (*a, acc.info.clone()))).collect();
+                accounts.sort_by_key(|(a, _)| *a);
+                (executed, run.skipped, run.counters, accounts, run.phases.prepared_groups, run.phases.prepared_slots)
+            };
+            let fresh_run = run_with(None);
+            let mut made = made;
+            let prepared = PreparedExec { groups: made.groups.take().map(|(_, groups)| groups), slots: Some(std::mem::take(&mut made.slots)) };
+            let planned_run = run_with(Some(prepared));
+            assert!(planned_run.4 && planned_run.5, "the prepared partition and slots were taken");
+            assert!(!fresh_run.4 && !fresh_run.5);
+            assert_eq!(fresh_run.0.len(), cands.len(), "every transfer ran");
+            assert_eq!(fresh_run.0, planned_run.0, "executed transfers");
+            assert_eq!(fresh_run.1, planned_run.1, "skipped");
+            assert_eq!(fresh_run.2, planned_run.2, "counters");
+            assert_eq!(fresh_run.3, planned_run.3, "the batches' accounts");
+            // A partition or slots of another size are not taken.
+            let wrong = PreparedExec { groups: Some(vec![vec![0]]), slots: Some(crate::parallel_transfer::empty_slots(crate::parallel_transfer::build_pool(), 3)) };
+            let fallback = run_with(Some(wrong));
+            assert!(!fallback.4 && !fallback.5);
+            assert_eq!(fallback.0, fresh_run.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod depth_two_tests {
+    use super::*;
+    use reth_primitives_traits::SealedHeader;
+    use alloy_consensus::Header;
+
+    /// T9 of docs/DEFERRED_DEPTH_2_DESIGN.md: the limit step never goes below
+    /// the carried `gasUsed`, and never further than the parent allows.
+    #[test]
+    fn the_gas_limit_never_falls_under_the_carried_gas() {
+        let parent = 30_000_000u64;
+        let step = parent / GAS_LIMIT_BOUND_DIVISOR - 1;
+        // A shrinking step under the carried gas is raised to it.
+        let shrink = calculate_block_gas_limit(parent, 10_000_000);
+        assert_eq!(shrink, parent - step);
+        assert_eq!(gas_limit_over_carried(shrink, parent, Some(parent - 10)), parent - 10);
+        // Never above the parent's ramp.
+        assert_eq!(gas_limit_over_carried(shrink, parent, Some(parent + 2 * step)), parent + step);
+        // Over the carried gas already: unchanged; growth is unchanged too.
+        assert_eq!(gas_limit_over_carried(shrink, parent, Some(1_000)), shrink);
+        let grow = calculate_block_gas_limit(parent, 60_000_000);
+        assert_eq!(gas_limit_over_carried(grow, parent, Some(parent)), grow);
+        // An unknown carried gas holds the limit where it was.
+        assert_eq!(gas_limit_over_carried(shrink, parent, None), parent);
+        // A fixed limit (the bench) is never touched.
+        assert_eq!(gas_limit_over_carried(parent, parent, Some(parent)), parent);
+    }
+
+    fn depth_two_genesis() -> alloy_genesis::Genesis {
+        let mut genesis = alloy_genesis::Genesis::default();
+        genesis.config.extra_fields.insert(reth_chainspec::qmdb::DEFERRED_EXECUTION_TIME_KEY.to_owned(), serde_json::json!(0));
+        genesis.config.extra_fields.insert(reth_chainspec::qmdb::DEFERRED_EXECUTION_DEPTH_KEY.to_owned(), serde_json::json!(2));
+        genesis
+    }
+
+    fn fields(byte: u8) -> crate::executed_fields::ExecutedFields {
+        crate::executed_fields::ExecutedFields {
+            state_root: B256::repeat_byte(byte),
+            receipts_root: B256::repeat_byte(byte ^ 1),
+            logs_bloom: Default::default(),
+            gas_used: u64::from(byte),
+        }
+    }
+
+    /// T4: a chained build whose grandparent's result is filed under the
+    /// builder hash only (the own-block hand-off has not run) seals, through
+    /// the alias noted when the parent's build was requested; after a view
+    /// timeout re-seals the grandparent the new sealed hash is noted and
+    /// followed; with nothing filed the build fails (the loud `ParentUnknown`).
+    #[test]
+    fn a_chained_build_finds_its_grandparent_through_the_alias() {
+        let genesis = depth_two_genesis();
+        let (gp_built, gp_sealed, gp_resealed) = (alloy_primitives::keccak256(b"depth-two-tests-0xd1"), alloy_primitives::keccak256(b"depth-two-tests-0xd2"), alloy_primitives::keccak256(b"depth-two-tests-0xd3"));
+        crate::executed_fields::remember(gp_built, fields(0xd4));
+        // The parent was built on the grandparent's sealed hash.
+        let parent = SealedHeader::new(
+            Header { number: 12, timestamp: 12, parent_hash: gp_sealed, ..Default::default() },
+            alloy_primitives::keccak256(b"depth-two-tests-0xd5"),
+        );
+        let no_alias = SealedHeader::new(
+            Header { number: 12, timestamp: 12, parent_hash: alloy_primitives::keccak256(b"depth-two-tests-0xd6"), ..Default::default() },
+            alloy_primitives::keccak256(b"depth-two-tests-0xd7"),
+        );
+        // With nothing under the sealed hash the build waits, then fails.
+        let short = std::time::Duration::from_millis(20);
+        assert_eq!(
+            crate::hotstuff_consensus::ancestor_executed_fields_or_built(&genesis, &no_alias, Some(no_alias.parent_hash), 2, short),
+            None
+        );
+        // The parent's build request noted (sealed, built) for the grandparent.
+        crate::executed_fields::note_built(gp_sealed, gp_built);
+        crate::executed_fields::remember(gp_built, fields(0xd4));
+        assert_eq!(carried_fields_for_seal(&genesis, &parent, Some(parent.hash()), 2), Some(fields(0xd4)));
+        // A re-seal of the grandparent (a view timeout): the request on the
+        // re-sealed block notes its new hash, and a parent on it finds it.
+        crate::executed_fields::note_built(gp_resealed, gp_built);
+        // Filed again: the registry is process-wide and bounded, and work
+        // other tests left running may have pushed the entry out meanwhile.
+        crate::executed_fields::remember(gp_built, fields(0xd4));
+        let on_resealed = SealedHeader::new(
+            Header { number: 12, timestamp: 13, parent_hash: gp_resealed, ..Default::default() },
+            alloy_primitives::keccak256(b"depth-two-tests-0xd8"),
+        );
+        assert_eq!(carried_fields_for_seal(&genesis, &on_resealed, Some(on_resealed.hash()), 2), Some(fields(0xd4)));
+        // At the chain start (parent 1) the genesis result is the parent's own header.
+        let block1 = SealedHeader::new(
+            Header { number: 1, timestamp: 1, state_root: alloy_primitives::keccak256(b"depth-two-tests-0xd9"), ..Default::default() },
+            alloy_primitives::keccak256(b"depth-two-tests-0xda"),
+        );
+        assert_eq!(
+            carried_fields_for_seal(&genesis, &block1, None, 2).map(|f| f.state_root),
+            Some(alloy_primitives::keccak256(b"depth-two-tests-0xd9"))
+        );
     }
 }

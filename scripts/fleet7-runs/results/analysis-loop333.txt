@@ -1,0 +1,298 @@
+== loop333WARM
+  layer-0 leader window-1 builds 367: txs mean 200000, share >= 95% of the tier 100% (max 200000); sealed_at_ms 69.0/85.0; par_ms 59.0/78.0; par_exec_ms 27.0/30.0; roots_ms 29.0/34.0; parent_fields_ms 0.0/16.0; sealed_ms 6.0/23.0
+  proposal cycle window 1 (n=379): mean 81.8 median 81.4 p90 87.5 ms; blocks in the 30 s: 379
+  binding wait (tick / quorum / seal, share and mean cycle): tick 96.2% (81.4); quorum 0%; seal 3.8% (91.7)
+  vote delay after the proposal, slowest key per block: median 7.8 p90 28.4 ms (slowest minus the median key: median 0.7); last key: {1: 59, 2: 57, 3: 69, 4: 67, 5: 42, 6: 66} of 360 blocks
+  CPU in window 1 (cores busy): execution layers 23.0 over 1 process(es); validators 1.0 over 7 process(es)
+  execution layer peak RSS 43.9 G; in-memory blocks max 13 (node0 and others, all layers)
+  blocks built here 1998; none also directly imported
+  import-once counters at the last direct import: ; start-up lines with import_once=true: 1; queue-lock lines 0
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:1521000 t+20:1506500 t+40:1568500 t+60:1600750 t+80:1631500 t+100:1629500
+  flood: median per 5 s 2226043/s, final 400000000 accepted 0 rejected 176.9s
+  timeout / given-up lines: 1; 05:16:44 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop333G80
+  layer-0 leader window-1 builds 367: txs mean 200000, share >= 95% of the tier 100% (max 200000); sealed_at_ms 67.0/85.0; par_ms 58.0/78.0; par_exec_ms 26.0/31.0; roots_ms 29.0/35.0; parent_fields_ms 0.0/16.0; sealed_ms 5.0/22.0
+  proposal cycle window 1 (n=379): mean 81.8 median 81.4 p90 87.0 ms; blocks in the 30 s: 379
+  binding wait (tick / quorum / seal, share and mean cycle): tick 95.6% (81.3); quorum 0%; seal 4.4% (91.1)
+  vote delay after the proposal, slowest key per block: median 8.0 p90 29.4 ms (slowest minus the median key: median 0.7); last key: {1: 62, 2: 41, 3: 48, 4: 75, 5: 78, 6: 58} of 362 blocks
+  CPU in window 1 (cores busy): execution layers 23.5 over 1 process(es); validators 1.0 over 7 process(es)
+  execution layer peak RSS 43.4 G; in-memory blocks max 16 (node0 and others, all layers)
+  blocks built here 2000; none also directly imported
+  import-once counters at the last direct import: ; start-up lines with import_once=true: 1; queue-lock lines 0
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:1511500 t+20:1505000 t+40:1633250 t+60:1609500 t+80:1640250 t+100:1622000
+  flood: median per 5 s 2230255/s, final 400000000 accepted 0 rejected 177.2s
+  timeout / given-up lines: 1; 05:23:10 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop333G80b
+  layer-0 leader window-1 builds 367: txs mean 200000, share >= 95% of the tier 100% (max 200000); sealed_at_ms 71.0/93.0; par_ms 61.0/81.0; par_exec_ms 26.0/30.0; roots_ms 29.0/33.0; parent_fields_ms 0.0/18.0; sealed_ms 6.0/23.0
+  proposal cycle window 1 (n=379): mean 81.9 median 81.3 p90 87.9 ms; blocks in the 30 s: 379
+  binding wait (tick / quorum / seal, share and mean cycle): tick 94.0% (81.3); quorum 0%; seal 6.0% (90.7)
+  vote delay after the proposal, slowest key per block: median 8.3 p90 28.3 ms (slowest minus the median key: median 0.5); last key: {1: 52, 2: 51, 3: 60, 4: 71, 5: 59, 6: 71} of 364 blocks
+  CPU in window 1 (cores busy): execution layers 23.0 over 1 process(es); validators 1.0 over 7 process(es)
+  execution layer peak RSS 47.2 G; in-memory blocks max 14 (node0 and others, all layers)
+  blocks built here 1998; none also directly imported
+  import-once counters at the last direct import: ; start-up lines with import_once=true: 1; queue-lock lines 0
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:1527000 t+20:1507000 t+40:1603000 t+60:1578250 t+80:1624500 t+100:1665500
+  flood: median per 5 s 2257141/s, final 400000000 accepted 0 rejected 175.7s
+  timeout / given-up lines: 1; 05:29:34 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop333G70
+  layer-0 leader window-1 builds 377: txs mean 199865, share >= 95% of the tier 100% (max 200000); sealed_at_ms 70.0/91.0; par_ms 60.0/81.0; par_exec_ms 26.0/30.0; roots_ms 29.0/33.0; parent_fields_ms 0.0/15.0; sealed_ms 6.0/20.0
+  proposal cycle window 1 (n=392): mean 79.1 median 72.8 p90 99.3 ms; blocks in the 30 s: 392
+  binding wait (tick / quorum / seal, share and mean cycle): tick 57.4% (72.0); quorum 0%; seal 42.6% (89.4)
+  vote delay after the proposal, slowest key per block: median 10.4 p90 33.1 ms (slowest minus the median key: median 0.8); last key: {1: 68, 2: 51, 3: 58, 4: 76, 5: 54, 6: 68} of 375 blocks
+  CPU in window 1 (cores busy): execution layers 24.2 over 1 process(es); validators 1.0 over 7 process(es)
+  execution layer peak RSS 46.2 G; in-memory blocks max 13 (node0 and others, all layers)
+  blocks built here 2002; none also directly imported
+  import-once counters at the last direct import: ; start-up lines with import_once=true: 1; queue-lock lines 0
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:1507000 t+20:1504500 t+40:1605750 t+60:1571500 t+80:1580500 t+100:1677000
+  flood: median per 5 s 2238548/s, final 400000000 accepted 0 rejected 174.7s
+  timeout / given-up lines: 1; 05:35:56 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop333H100
+  layer-0 leader window-1 builds 294: txs mean 250000, share >= 95% of the tier 100% (max 250000); sealed_at_ms 88.0/107.0; par_ms 76.0/99.0; par_exec_ms 35.0/41.0; roots_ms 35.0/40.0; parent_fields_ms 0.0/16.0; sealed_ms 7.0/24.0
+  proposal cycle window 1 (n=303): mean 102.2 median 101.4 p90 106.7 ms; blocks in the 30 s: 303
+  binding wait (tick / quorum / seal, share and mean cycle): tick 96.6% (101.4); quorum 0%; seal 3.4% (123.4)
+  vote delay after the proposal, slowest key per block: median 8.1 p90 32.9 ms (slowest minus the median key: median 0.4); last key: {1: 30, 2: 40, 3: 52, 4: 65, 5: 46, 6: 55} of 288 blocks
+  CPU in window 1 (cores busy): execution layers 23.3 over 1 process(es); validators 0.8 over 7 process(es)
+  execution layer peak RSS 46.2 G; in-memory blocks max 13 (node0 and others, all layers)
+  blocks built here 1599; none also directly imported
+  import-once counters at the last direct import: ; start-up lines with import_once=true: 1; queue-lock lines 0
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:1458000 t+20:1457000 t+40:1558500 t+60:1536500 t+80:1562000 t+100:1673500
+  flood: median per 5 s 2250451/s, final 400000000 accepted 0 rejected 176.8s
+  timeout / given-up lines: 1; 05:42:23 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop333H80
+  layer-0 leader window-1 builds 302: txs mean 250000, share >= 95% of the tier 100% (max 250000); sealed_at_ms 84.5/106.0; par_ms 73.0/97.0; par_exec_ms 35.0/40.0; roots_ms 35.0/41.0; parent_fields_ms 0.0/13.0; sealed_ms 7.0/21.0
+  proposal cycle window 1 (n=313): mean 99.0 median 95.9 p90 119.7 ms; blocks in the 30 s: 313
+  binding wait (tick / quorum / seal, share and mean cycle): tick 18.5% (82.0); quorum 0%; seal 81.5% (103.5)
+  vote delay after the proposal, slowest key per block: median 12.4 p90 36.5 ms (slowest minus the median key: median 0.8); last key: {1: 51, 2: 63, 3: 57, 4: 46, 5: 41, 6: 42} of 300 blocks
+  CPU in window 1 (cores busy): execution layers 23.6 over 1 process(es); validators 0.8 over 7 process(es)
+  execution layer peak RSS 45.1 G; in-memory blocks max 13 (node0 and others, all layers)
+  blocks built here 1599; none also directly imported
+  import-once counters at the last direct import: ; start-up lines with import_once=true: 1; queue-lock lines 0
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:1456000 t+20:1440750 t+40:1633500 t+60:1500250 t+80:1603500 t+100:1529500
+  flood: median per 5 s 2234647/s, final 400000000 accepted 0 rejected 176.4s
+  timeout / given-up lines: 1; 05:48:38 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop333B70b
+  layer-0 leader window-1 builds 420: txs mean 163000, share >= 95% of the tier 100% (max 163000); sealed_at_ms 57.0/70.0; par_ms 46.0/65.0; par_exec_ms 22.0/25.0; roots_ms 24.0/29.0; parent_fields_ms 0.0/16.0; sealed_ms 4.0/20.0
+  proposal cycle window 1 (n=434): mean 71.5 median 71.3 p90 74.7 ms; blocks in the 30 s: 434
+  binding wait (tick / quorum / seal, share and mean cycle): tick 98.6% (71.4); quorum 0%; seal 1.4% (78.9)
+  vote delay after the proposal, slowest key per block: median 3.3 p90 16.0 ms (slowest minus the median key: median 0.4); last key: {1: 62, 2: 60, 3: 88, 4: 70, 5: 64, 6: 70} of 414 blocks
+  CPU in window 1 (cores busy): execution layers 22.5 over 1 process(es); validators 1.1 over 7 process(es)
+  execution layer peak RSS 45.8 G; in-memory blocks max 17 (node0 and others, all layers)
+  blocks built here 2453; also directly imported (executed a second time) 1; for those, the import's exec_ms / root_ms / total_ms median 48 / 146 / 203
+  import-once counters at the last direct import: once_reqs=7 once_served=0 once_served_total=12277 once_imports=2049 once_blocks=2049 once_takeovers=0; start-up lines with import_once=true: 1; queue-lock lines 0
+    per block: imports 1.00, reqs 0.00, served 0.00
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:1616500 t+20:1597750 t+40:1660500 t+60:1615250 t+80:1632500 t+100:1698500
+  flood: median per 5 s 2160843/s, final 400000000 accepted 0 rejected 186.3s
+  timeout / given-up lines: 1; 05:55:03 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop333X1
+  layer-0 leader window-1 builds 295: txs mean 250000, share >= 95% of the tier 100% (max 250000); sealed_at_ms 91.0/106.0; par_ms 76.0/100.0; par_exec_ms 35.0/40.0; roots_ms 34.0/40.0; parent_fields_ms 0.0/21.0; sealed_ms 7.0/28.0
+  proposal cycle window 1 (n=304): mean 101.9 median 101.4 p90 106.7 ms; blocks in the 30 s: 304
+  binding wait (tick / quorum / seal, share and mean cycle): tick 96.6% (101.4); quorum 0%; seal 3.4% (113.8)
+  vote delay after the proposal, slowest key per block: median 7.3 p90 28.8 ms (slowest minus the median key: median 0.4); last key: {1: 37, 2: 46, 3: 45, 4: 70, 5: 43, 6: 51} of 292 blocks
+  CPU in window 1 (cores busy): execution layers 0.0 over 0 process(es); validators 0.0 over 0 process(es)
+  execution layer peak RSS 46.1 G; in-memory blocks max 15 (node0 and others, all layers)
+  blocks built here 1599; none also directly imported
+  import-once counters at the last direct import: ; start-up lines with import_once=true: 1; queue-lock lines 0
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:1466500 t+20:1481500 t+40:1486250 t+60:1489250 t+80:1536000 t+100:1699500
+  flood: median per 5 s 2240947/s, final 400000000 accepted 0 rejected 176.9s
+  timeout / given-up lines: 1; 06:01:28 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop333Xb1
+  layer-0 leader window-1 builds 294: txs mean 250000, share >= 95% of the tier 100% (max 250000); sealed_at_ms 88.0/112.0; par_ms 74.0/103.0; par_exec_ms 35.0/42.0; roots_ms 35.0/42.0; parent_fields_ms 0.0/14.0; sealed_ms 7.0/22.0
+  proposal cycle window 1 (n=302): mean 102.4 median 101.5 p90 111.3 ms; blocks in the 30 s: 302
+  binding wait (tick / quorum / seal, share and mean cycle): tick 92.8% (101.4); quorum 0%; seal 7.2% (114.7)
+  vote delay after the proposal, slowest key per block: median 9.4 p90 40.7 ms (slowest minus the median key: median 0.7); last key: {1: 35, 2: 35, 3: 61, 4: 41, 5: 59, 6: 56} of 287 blocks
+  CPU in window 1 (cores busy): execution layers 23.3 over 1 process(es); validators 0.8 over 7 process(es)
+  execution layer peak RSS 44.6 G; in-memory blocks max 13 (node0 and others, all layers)
+  blocks built here 1599; none also directly imported
+  import-once counters at the last direct import: ; start-up lines with import_once=true: 1; queue-lock lines 0
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:1461250 t+20:1456500 t+40:1479000 t+60:1564500 t+80:1551000 t+100:1632000
+  flood: median per 5 s 2218309/s, final 400000000 accepted 0 rejected 176.5s
+  timeout / given-up lines: 1; 06:07:52 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop333X
+  layer-0 leader window-1 builds 367: txs mean 200000, share >= 95% of the tier 100% (max 200000); sealed_at_ms 73.0/91.0; par_ms 60.0/84.0; par_exec_ms 27.0/31.0; roots_ms 29.0/34.0; parent_fields_ms 0.0/17.0; sealed_ms 6.0/23.0
+  proposal cycle window 1 (n=379): mean 81.8 median 81.3 p90 84.5 ms; blocks in the 30 s: 379
+  binding wait (tick / quorum / seal, share and mean cycle): tick 96.5% (81.4); quorum 0%; seal 3.5% (92.5)
+  vote delay after the proposal, slowest key per block: median 7.8 p90 31.9 ms (slowest minus the median key: median 0.5); last key: {1: 46, 2: 34, 3: 56, 4: 68, 5: 84, 6: 76} of 364 blocks
+  CPU in window 1 (cores busy): execution layers 23.2 over 1 process(es); validators 1.0 over 7 process(es)
+  execution layer peak RSS 46.1 G; in-memory blocks max 15 (node0 and others, all layers)
+  blocks built here 1999; none also directly imported
+  import-once counters at the last direct import: ; start-up lines with import_once=true: 1; queue-lock lines 0
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:1529500 t+20:1506500 t+40:1621500 t+60:1666500 t+80:1614250 t+100:1675500
+  flood: median per 5 s 2240947/s, final 400000000 accepted 0 rejected 176.9s
+  timeout / given-up lines: 1; 06:14:21 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop333Xb
+  layer-0 leader window-1 builds 367: txs mean 200000, share >= 95% of the tier 100% (max 200000); sealed_at_ms 73.0/89.0; par_ms 59.0/80.0; par_exec_ms 26.0/31.0; roots_ms 30.0/36.0; parent_fields_ms 0.0/18.0; sealed_ms 6.0/24.0
+  proposal cycle window 1 (n=378): mean 82.0 median 81.5 p90 86.9 ms; blocks in the 30 s: 378
+  binding wait (tick / quorum / seal, share and mean cycle): tick 95.4% (81.4); quorum 0%; seal 4.6% (93.1)
+  vote delay after the proposal, slowest key per block: median 6.5 p90 27.2 ms (slowest minus the median key: median 0.5); last key: {1: 51, 2: 43, 3: 67, 4: 58, 5: 63, 6: 79} of 361 blocks
+  CPU in window 1 (cores busy): execution layers 24.1 over 1 process(es); validators 1.0 over 7 process(es)
+  execution layer peak RSS 47.3 G; in-memory blocks max 14 (node0 and others, all layers)
+  blocks built here 1999; none also directly imported
+  import-once counters at the last direct import: ; start-up lines with import_once=true: 1; queue-lock lines 0
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:1509250 t+20:1522750 t+40:1534250 t+60:1543500 t+80:1553250 t+100:1621500
+  flood: median per 5 s 2284947/s, final 400000000 accepted 0 rejected 175.8s
+  timeout / given-up lines: 1; 06:20:35 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop333WARM
+  feed: offered 4000000/s; delivered per 5 s median 2,221,746 p10 2,130,451 (n=26; first sample 2,700,462 not counted); first worker out of frames at +135s; final line: flood        : 400000000 accepted, 0 rejected, 176.9s, 2261460/s submitted
+  full blocks (>= 95% of 200000): sustained 177 s from the first full build to the last build; 2000 full builds in all; builds in window 1 367
+  ingest on layer 0 in window 1 (median): rate 2442556, slots_busy_pct 20, reply_us_per_frame 12900, gate_us_per_frame 6560, busy_us_per_tx 0, recover_us_per_tx 0
+  proposals 3947: throttle delayed 3 (max delay 273 ms, hard holds 0 max unpersisted 14); tick_late median/p90 1.0/1.6 ms; given up (proposals) 0; TC formed 1
+== loop333G80
+  feed: offered 4000000/s; delivered per 5 s median 2,233,701 p10 2,127,748 (n=26; first sample 2,672,664 not counted); first worker out of frames at +135s; final line: flood        : 400000000 accepted, 0 rejected, 177.2s, 2257222/s submitted
+  full blocks (>= 95% of 200000): sustained 178 s from the first full build to the last build; 2002 full builds in all; builds in window 1 367
+  ingest on layer 0 in window 1 (median): rate 2442464, slots_busy_pct 20, reply_us_per_frame 13040, gate_us_per_frame 5898, busy_us_per_tx 1, recover_us_per_tx 0
+  proposals 3913: throttle delayed 1 (max delay 60 ms, hard holds 0 max unpersisted 14); tick_late median/p90 0.9/1.5 ms; given up (proposals) 0; TC formed 1
+== loop333G80b
+  feed: offered 4000000/s; delivered per 5 s median 2,238,598 p10 2,103,552 (n=26; first sample 2,701,557 not counted); first worker out of frames at +135s; final line: flood        : 400000000 accepted, 0 rejected, 175.7s, 2277206/s submitted
+  full blocks (>= 95% of 200000): sustained 176 s from the first full build to the last build; 2000 full builds in all; builds in window 1 367
+  ingest on layer 0 in window 1 (median): rate 2441684, slots_busy_pct 20, reply_us_per_frame 12950, gate_us_per_frame 6135, busy_us_per_tx 1, recover_us_per_tx 0
+  proposals 3934: throttle delayed 3 (max delay 254 ms, hard holds 0 max unpersisted 15); tick_late median/p90 1.0/1.5 ms; given up (proposals) 0; TC formed 1
+== loop333G70
+  feed: offered 4000000/s; delivered per 5 s median 2,227,449 p10 2,104,947 (n=26; first sample 2,739,956 not counted); first worker out of frames at +135s; final line: flood        : 400000000 accepted, 0 rejected, 174.7s, 2289695/s submitted
+  full blocks (>= 95% of 200000): sustained 175 s from the first full build to the first short block; 2001 full builds in all; builds in window 1 377
+  ingest on layer 0 in window 1 (median): rate 2523644, slots_busy_pct 20, reply_us_per_frame 12603, gate_us_per_frame 5688, busy_us_per_tx 0, recover_us_per_tx 0
+  proposals 4109: throttle delayed 0 (max delay 0 ms, hard holds 0 max unpersisted 14); tick_late median/p90 0.8/1.5 ms; given up (proposals) 0; TC formed 1
+== loop333H100
+  feed: offered 4000000/s; delivered per 5 s median 2,242,190 p10 2,058,347 (n=26; first sample 2,753,768 not counted); first worker out of frames at +135s; final line: flood        : 400000000 accepted, 0 rejected, 176.8s, 2261978/s submitted
+  full blocks (>= 95% of 250000): sustained 177 s from the first full build to the last build; 1600 full builds in all; builds in window 1 294
+  ingest on layer 0 in window 1 (median): rate 2448689, slots_busy_pct 20, reply_us_per_frame 12908, gate_us_per_frame 5845, busy_us_per_tx 0, recover_us_per_tx 0
+  proposals 3137: throttle delayed 0 (max delay 0 ms, hard holds 0 max unpersisted 14); tick_late median/p90 1.0/1.6 ms; given up (proposals) 0; TC formed 1
+== loop333H80
+  feed: offered 4000000/s; delivered per 5 s median 2,217,750 p10 2,039,946 (n=26; first sample 2,736,558 not counted); first worker out of frames at +135s; final line: flood        : 400000000 accepted, 0 rejected, 176.4s, 2266991/s submitted
+  full blocks (>= 95% of 250000): sustained 177 s from the first full build to the last build; 1600 full builds in all; builds in window 1 302
+  ingest on layer 0 in window 1 (median): rate 2502266, slots_busy_pct 20, reply_us_per_frame 12552, gate_us_per_frame 5150, busy_us_per_tx 1, recover_us_per_tx 0
+  proposals 3335: throttle delayed 2 (max delay 134 ms, hard holds 0 max unpersisted 14); tick_late median/p90 1.0/1.5 ms; given up (proposals) 0; TC formed 1
+== loop333B70b
+  feed: offered 4000000/s; delivered per 5 s median 2,152,457 p10 1,987,151 (n=27; first sample 2,564,470 not counted); first worker out of frames at +140s; final line: flood        : 400000000 accepted, 0 rejected, 186.3s, 2147226/s submitted
+  full blocks (>= 95% of 163000): sustained 187 s from the first full build to the last build; 2455 full builds in all; builds in window 1 420
+  ingest on layer 0 in window 1 (median): rate 2273846, slots_busy_pct 18, reply_us_per_frame 13934, gate_us_per_frame 8410, busy_us_per_tx 0, recover_us_per_tx 0
+  proposals 4589: throttle delayed 2 (max delay 151 ms, hard holds 0 max unpersisted 16); tick_late median/p90 0.9/1.6 ms; given up (proposals) 0; TC formed 1
+== loop333X1
+  feed: offered 4000000/s; delivered per 5 s median 2,221,352 p10 2,105,346 (n=26; first sample 2,741,458 not counted); first worker out of frames at +135s; final line: flood        : 400000000 accepted, 0 rejected, 176.9s, 2260680/s submitted
+  full blocks (>= 95% of 250000): sustained 175 s from the first full build to the last build; 1600 full builds in all; builds in window 1 295
+  ingest on layer 0 in window 1 (median): rate 2457294, slots_busy_pct 20, reply_us_per_frame 12840, gate_us_per_frame 6078, busy_us_per_tx 0, recover_us_per_tx 0
+  proposals 3154: throttle delayed 2 (max delay 251 ms, hard holds 0 max unpersisted 16); tick_late median/p90 1.0/1.6 ms; given up (proposals) 0; TC formed 1
+== loop333Xb1
+  feed: offered 4000000/s; delivered per 5 s median 2,199,938 p10 2,120,344 (n=26; first sample 2,740,862 not counted); first worker out of frames at +135s; final line: flood        : 400000000 accepted, 0 rejected, 176.5s, 2266034/s submitted
+  full blocks (>= 95% of 250000): sustained 177 s from the first full build to the last build; 1600 full builds in all; builds in window 1 294
+  ingest on layer 0 in window 1 (median): rate 2443550, slots_busy_pct 20, reply_us_per_frame 13012, gate_us_per_frame 5862, busy_us_per_tx 0, recover_us_per_tx 0
+  proposals 3160: throttle delayed 2 (max delay 137 ms, hard holds 0 max unpersisted 14); tick_late median/p90 1.0/1.6 ms; given up (proposals) 0; TC formed 1
+== loop333X
+  feed: offered 4000000/s; delivered per 5 s median 2,221,352 p10 2,105,346 (n=26; first sample 2,741,458 not counted); first worker out of frames at +135s; final line: flood        : 400000000 accepted, 0 rejected, 176.9s, 2260680/s submitted
+  full blocks (>= 95% of 200000): sustained 177 s from the first full build to the last build; 2001 full builds in all; builds in window 1 367
+  ingest on layer 0 in window 1 (median): rate 2453385, slots_busy_pct 20, reply_us_per_frame 12918, gate_us_per_frame 6659, busy_us_per_tx 0, recover_us_per_tx 0
+  proposals 3928: throttle delayed 2 (max delay 256 ms, hard holds 0 max unpersisted 14); tick_late median/p90 1.0/1.6 ms; given up (proposals) 0; TC formed 1
+== loop333Xb
+  feed: offered 4000000/s; delivered per 5 s median 2,271,142 p10 2,092,456 (n=26; first sample 2,672,554 not counted); first worker out of frames at +135s; final line: flood        : 400000000 accepted, 0 rejected, 175.8s, 2275162/s submitted
+  full blocks (>= 95% of 200000): sustained 176 s from the first full build to the last build; 2001 full builds in all; builds in window 1 367
+  ingest on layer 0 in window 1 (median): rate 2453074, slots_busy_pct 20, reply_us_per_frame 12944, gate_us_per_frame 6509, busy_us_per_tx 1, recover_us_per_tx 0
+  proposals 3944: throttle delayed 2 (max delay 374 ms, hard holds 0 max unpersisted 14); tick_late median/p90 1.0/1.6 ms; given up (proposals) 0; TC formed 1
+== loop333WARM
+  window 1 canonical (the layer's `Block added to canonical chain`): 367 blocks, 73.4M tx = 2,446,667/s, full (>= 95% of 200000) 367
+  window 1: 367 builds, 73.4M tx (2,446,667/s = 100% of window 1); sealed_at 69/85/132; par_ms 59/78/127; parent_fields_ms 0/16/25; in-memory max 10, RSS 13.8 -> 21.0 G; queue min/median 1,314,000/1,594,000; throttle delayed 0 of 367
+  window 2 canonical (the layer's `Block added to canonical chain`): 331 blocks, 66.2M tx = 2,206,667/s, full (>= 95% of 200000) 331
+  window 2: 333 builds, 66.6M tx (2,220,000/s = 91% of window 1); sealed_at 72/131/207; par_ms 60/127/204; parent_fields_ms 0/16/25; in-memory max 12, RSS 21.8 -> 27.4 G; queue min/median 1,416,000/1,617,000; throttle delayed 0 of 307
+  window 3 canonical (the layer's `Block added to canonical chain`): 334 blocks, 66.8M tx = 2,226,667/s, full (>= 95% of 200000) 334
+  window 3: 333 builds, 66.6M tx (2,220,000/s = 91% of window 1); sealed_at 75/136/207; par_ms 65/132/207; parent_fields_ms 0/18/32; in-memory max 13, RSS 26.9 -> 32.0 G; queue min/median 1,425,000/1,612,500; throttle delayed 0 of 0
+  tail: 52 slow blocks (sealed_at >= 143 ms, top 5% of 1033 full builds in the first 90 s); sealed_at slow mean 175 against 75
+  largest differences (slow mean vs rest mean): root_faults 313 vs 73; par_run_ms 144 vs 37; par_ms 169 vs 67; sealed_at_ms 175 vs 75; gap_before_exec_ms 85 vs 8; state_wait_ms 83 vs 6; total_ms 266 vs 194; shard_append_ms 177 vs 239; par_exec_ms 59 vs 29; batch_max_ms 47 vs 20
+  slow blocks following a slow block: 0 of 52; by number mod 8 [(0, 4), (1, 8), (2, 5), (3, 5), (4, 7), (5, 9), (6, 6), (7, 8)]
+== loop333G80
+  window 1 canonical (the layer's `Block added to canonical chain`): 367 blocks, 73.4M tx = 2,446,667/s, full (>= 95% of 200000) 367
+  window 1: 367 builds, 73.4M tx (2,446,667/s = 100% of window 1); sealed_at 67/85/132; par_ms 58/78/126; parent_fields_ms 0/16/28; in-memory max 11, RSS 13.2 -> 21.4 G; queue min/median 1,100,000/1,592,500; throttle delayed 0 of 367
+  window 2 canonical (the layer's `Block added to canonical chain`): 336 blocks, 67.2M tx = 2,240,000/s, full (>= 95% of 200000) 336
+  window 2: 337 builds, 67.4M tx (2,246,667/s = 92% of window 1); sealed_at 75/133/225; par_ms 67/130/220; parent_fields_ms 0/20/30; in-memory max 16, RSS 21.6 -> 27.5 G; queue min/median 1,455,500/1,633,000; throttle delayed 0 of 307
+  window 3 canonical (the layer's `Block added to canonical chain`): 330 blocks, 66.0M tx = 2,200,000/s, full (>= 95% of 200000) 330
+  window 3: 331 builds, 66.2M tx (2,206,667/s = 90% of window 1); sealed_at 76/142/236; par_ms 69/138/232; parent_fields_ms 0/21/39; in-memory max 13, RSS 27.9 -> 32.5 G; queue min/median 1,489,000/1,621,500; throttle delayed 0 of 0
+  tail: 52 slow blocks (sealed_at >= 152 ms, top 5% of 1035 full builds in the first 90 s); sealed_at slow mean 189 against 75
+  largest differences (slow mean vs rest mean): root_faults 260 vs 59; sealed_at_ms 189 vs 75; par_run_ms 150 vs 36; par_ms 182 vs 68; total_ms 286 vs 195; gap_before_exec_ms 98 vs 8; state_wait_ms 95 vs 6; shard_append_ms 179 vs 235; finish_ms 84 vs 108; par_exec_ms 53 vs 29
+  slow blocks following a slow block: 1 of 52; by number mod 8 [(0, 10), (1, 2), (2, 5), (3, 11), (4, 9), (5, 6), (6, 5), (7, 4)]
+== loop333G80b
+  window 1 canonical (the layer's `Block added to canonical chain`): 367 blocks, 73.4M tx = 2,446,667/s, full (>= 95% of 200000) 367
+  window 1: 367 builds, 73.4M tx (2,446,667/s = 100% of window 1); sealed_at 71/93/144; par_ms 61/81/139; parent_fields_ms 0/18/25; in-memory max 10, RSS 13.3 -> 21.3 G; queue min/median 1,375,000/1,606,500; throttle delayed 0 of 367
+  window 2 canonical (the layer's `Block added to canonical chain`): 335 blocks, 67.0M tx = 2,233,333/s, full (>= 95% of 200000) 335
+  window 2: 335 builds, 67.0M tx (2,233,333/s = 91% of window 1); sealed_at 74/134/232; par_ms 65/126/226; parent_fields_ms 0/19/29; in-memory max 13, RSS 22.0 -> 27.9 G; queue min/median 1,441,500/1,624,000; throttle delayed 0 of 307
+  window 3 canonical (the layer's `Block added to canonical chain`): 335 blocks, 67.0M tx = 2,233,333/s, full (>= 95% of 200000) 335
+  window 3: 336 builds, 67.2M tx (2,240,000/s = 92% of window 1); sealed_at 75/130/215; par_ms 66/125/187; parent_fields_ms 0/19/34; in-memory max 14, RSS 27.9 -> 33.0 G; queue min/median 1,431,500/1,624,000; throttle delayed 0 of 0
+  tail: 54 slow blocks (sealed_at >= 146 ms, top 5% of 1038 full builds in the first 90 s); sealed_at slow mean 176 against 75
+  largest differences (slow mean vs rest mean): root_faults 228 vs 75; par_run_ms 142 vs 36; sealed_at_ms 176 vs 75; par_ms 167 vs 68; shard_append_ms 158 vs 236; gap_before_exec_ms 82 vs 8; state_wait_ms 80 vs 6; total_ms 268 vs 195; par_exec_ms 60 vs 29; finish_ms 79 vs 107
+  slow blocks following a slow block: 0 of 54; by number mod 8 [(0, 8), (1, 6), (2, 4), (3, 9), (4, 8), (5, 10), (6, 4), (7, 5)]
+== loop333G70
+  window 1 canonical (the layer's `Block added to canonical chain`): 377 blocks, 75.3M tx = 2,511,633/s, full (>= 95% of 200000) 376
+  window 1: 377 builds, 75.3M tx (2,511,633/s = 100% of window 1); sealed_at 70/91/142; par_ms 60/81/133; parent_fields_ms 0/15/26; in-memory max 11, RSS 14.3 -> 21.8 G; queue min/median 525,000/1,599,500; throttle delayed 0 of 378
+  window 2 canonical (the layer's `Block added to canonical chain`): 333 blocks, 66.6M tx = 2,220,000/s, full (>= 95% of 200000) 333
+  window 2: 335 builds, 67.0M tx (2,233,333/s = 89% of window 1); sealed_at 72/132/247; par_ms 63/128/243; parent_fields_ms 0/18/28; in-memory max 13, RSS 22.6 -> 27.7 G; queue min/median 1,462,500/1,628,000; throttle delayed 0 of 247
+  window 3 canonical (the layer's `Block added to canonical chain`): 341 blocks, 68.2M tx = 2,273,333/s, full (>= 95% of 200000) 341
+  window 3: 341 builds, 68.2M tx (2,273,333/s = 91% of window 1); sealed_at 72/134/215; par_ms 61/126/208; parent_fields_ms 0/16/25; in-memory max 12, RSS 28.0 -> 32.9 G; queue min/median 1,376,000/1,602,500; throttle delayed 0 of 0
+  tail: 53 slow blocks (sealed_at >= 145 ms, top 5% of 1053 full builds in the first 90 s); sealed_at slow mean 191 against 74
+  largest differences (slow mean vs rest mean): root_faults 288 vs 63; sealed_at_ms 191 vs 74; par_run_ms 153 vs 36; par_ms 184 vs 67; gap_before_exec_ms 104 vs 8; state_wait_ms 101 vs 6; total_ms 283 vs 193; shard_append_ms 180 vs 226; root_faults_undo 66 vs 20; root_append_faults 67 vs 24
+  slow blocks following a slow block: 0 of 53; by number mod 8 [(0, 8), (1, 5), (2, 9), (3, 3), (4, 6), (5, 7), (6, 5), (7, 10)]
+== loop333H100
+  window 1 canonical (the layer's `Block added to canonical chain`): 294 blocks, 73.5M tx = 2,450,000/s, full (>= 95% of 250000) 294
+  window 1: 294 builds, 73.5M tx (2,450,000/s = 100% of window 1); sealed_at 88/107/177; par_ms 76/99/172; parent_fields_ms 0/16/32; in-memory max 11, RSS 14.0 -> 24.2 G; queue min/median 1,082,500/1,600,750; throttle delayed 0 of 294
+  window 2 canonical (the layer's `Block added to canonical chain`): 275 blocks, 68.8M tx = 2,291,667/s, full (>= 95% of 250000) 275
+  window 2: 275 builds, 68.8M tx (2,291,667/s = 94% of window 1); sealed_at 90/162/240; par_ms 77/157/235; parent_fields_ms 0/19/37; in-memory max 12, RSS 24.6 -> 29.6 G; queue min/median 1,285,500/1,601,500; throttle delayed 0 of 275
+  window 3 canonical (the layer's `Block added to canonical chain`): 257 blocks, 64.2M tx = 2,141,667/s, full (>= 95% of 250000) 257
+  window 3: 258 builds, 64.5M tx (2,150,000/s = 88% of window 1); sealed_at 91/183/253; par_ms 77/175/249; parent_fields_ms 0/20/41; in-memory max 13, RSS 30.5 -> 35.6 G; queue min/median 1,395,500/1,610,750; throttle delayed 0 of 173
+  tail: 42 slow blocks (sealed_at >= 183 ms, top 5% of 827 full builds in the first 90 s); sealed_at slow mean 208 against 94
+  largest differences (slow mean vs rest mean): root_faults 445 vs 104; par_run_ms 168 vs 47; par_ms 200 vs 86; sealed_at_ms 208 vs 94; gap_before_exec_ms 100 vs 10; state_wait_ms 97 vs 7; shard_append_ms 260 vs 344; total_ms 323 vs 239; root_append_faults 79 vs 25; root_faults_undo 75 vs 23
+  slow blocks following a slow block: 0 of 42; by number mod 8 [(0, 3), (1, 10), (2, 2), (3, 5), (4, 4), (5, 7), (6, 6), (7, 5)]
+== loop333H80
+  window 1 canonical (the layer's `Block added to canonical chain`): 301 blocks, 75.2M tx = 2,508,333/s, full (>= 95% of 250000) 301
+  window 1: 302 builds, 75.5M tx (2,516,667/s = 100% of window 1); sealed_at 84/106/164; par_ms 73/97/159; parent_fields_ms 0/13/25; in-memory max 11, RSS 12.6 -> 23.6 G; queue min/median 1,067,500/1,558,250; throttle delayed 0 of 302
+  window 2 canonical (the layer's `Block added to canonical chain`): 270 blocks, 67.5M tx = 2,250,000/s, full (>= 95% of 250000) 270
+  window 2: 270 builds, 67.5M tx (2,250,000/s = 89% of window 1); sealed_at 90/183/253; par_ms 76/176/247; parent_fields_ms 0/19/37; in-memory max 12, RSS 24.4 -> 30.7 G; queue min/median 1,222,000/1,600,750; throttle delayed 0 of 270
+  window 3 canonical (the layer's `Block added to canonical chain`): 253 blocks, 63.2M tx = 2,108,333/s, full (>= 95% of 250000) 253
+  window 3: 253 builds, 63.2M tx (2,108,333/s = 84% of window 1); sealed_at 94/175/271; par_ms 77/167/264; parent_fields_ms 0/17/31; in-memory max 13, RSS 30.2 -> 33.8 G; queue min/median 1,363,000/1,598,000; throttle delayed 0 of 102
+  tail: 44 slow blocks (sealed_at >= 188 ms, top 5% of 825 full builds in the first 90 s); sealed_at slow mean 222 against 94
+  largest differences (slow mean vs rest mean): root_faults 355 vs 91; par_run_ms 182 vs 47; par_ms 213 vs 85; sealed_at_ms 222 vs 94; shard_append_ms 236 vs 341; total_ms 336 vs 236; state_wait_ms 104 vs 8; gap_before_exec_ms 106 vs 10; par_exec_ms 76 vs 38; batch_max_ms 57 vs 24
+  slow blocks following a slow block: 0 of 44; by number mod 8 [(0, 7), (1, 2), (2, 8), (3, 5), (4, 12), (5, 6), (6, 1), (7, 3)]
+== loop333B70b
+  window 1 canonical (the layer's `Block added to canonical chain`): 420 blocks, 68.5M tx = 2,282,000/s, full (>= 95% of 163000) 420
+  window 1: 420 builds, 68.5M tx (2,282,000/s = 100% of window 1); sealed_at 57/70/114; par_ms 46/65/111; parent_fields_ms 0/16/25; in-memory max 10, RSS 12.2 -> 19.9 G; queue min/median 1,178,500/1,630,500; throttle delayed 0 of 420
+  window 2 canonical (the layer's `Block added to canonical chain`): 392 blocks, 63.9M tx = 2,129,867/s, full (>= 95% of 163000) 392
+  window 2: 392 builds, 63.9M tx (2,129,867/s = 93% of window 1); sealed_at 60/110/173; par_ms 48/102/167; parent_fields_ms 0/14/24; in-memory max 13, RSS 20.0 -> 25.6 G; queue min/median 1,455,500/1,637,500; throttle delayed 0 of 204
+  window 3 canonical (the layer's `Block added to canonical chain`): 396 blocks, 64.5M tx = 2,151,600/s, full (>= 95% of 163000) 396
+  window 3: 396 builds, 64.5M tx (2,151,600/s = 94% of window 1); sealed_at 61/115/190; par_ms 52/111/181; parent_fields_ms 0/15/26; in-memory max 15, RSS 26.1 -> 31.2 G; queue min/median 1,504,000/1,626,500; throttle delayed 0 of 0
+  tail: 63 slow blocks (sealed_at >= 120 ms, top 5% of 1208 full builds in the first 90 s); sealed_at slow mean 148 against 61
+  largest differences (slow mean vs rest mean): root_faults 198 vs 63; par_run_ms 121 vs 30; sealed_at_ms 148 vs 61; par_ms 141 vs 55; gap_before_exec_ms 75 vs 6; state_wait_ms 73 vs 4; total_ms 225 vs 159; shard_append_ms 138 vs 176; par_exec_ms 47 vs 25; finish_ms 66 vs 87
+  slow blocks following a slow block: 0 of 63; by number mod 8 [(0, 10), (1, 8), (2, 6), (3, 8), (4, 6), (5, 10), (6, 10), (7, 5)]
+== loop333X1
+  window 1 canonical (the layer's `Block added to canonical chain`): 294 blocks, 73.5M tx = 2,450,000/s, full (>= 95% of 250000) 294
+  window 1: 295 builds, 73.8M tx (2,458,333/s = 100% of window 1); sealed_at 91/106/163; par_ms 76/100/158; parent_fields_ms 0/21/36; queue min/median 1,290,000/1,610,500; throttle delayed 0 of 295
+  window 2 canonical (the layer's `Block added to canonical chain`): 275 blocks, 68.8M tx = 2,291,667/s, full (>= 95% of 250000) 275
+  window 2: 274 builds, 68.5M tx (2,283,333/s = 93% of window 1); sealed_at 90/163/241; par_ms 76/156/237; parent_fields_ms 0/20/36; queue min/median 1,388,000/1,590,750; throttle delayed 0 of 274
+  window 3 canonical (the layer's `Block added to canonical chain`): 260 blocks, 65.0M tx = 2,166,667/s, full (>= 95% of 250000) 260
+  window 3: 261 builds, 65.2M tx (2,175,000/s = 88% of window 1); sealed_at 90/162/299; par_ms 75/156/284; parent_fields_ms 0/11/28; queue min/median 1,361,000/1,582,500; throttle delayed 0 of 173
+  tail: 43 slow blocks (sealed_at >= 171 ms, top 5% of 830 full builds in the first 90 s); sealed_at slow mean 222 against 94
+  largest differences (slow mean vs rest mean): root_faults 256 vs 92; par_run_ms 182 vs 47; sealed_at_ms 222 vs 94; par_ms 212 vs 84; state_wait_ms 112 vs 7; gap_before_exec_ms 114 vs 10; total_ms 335 vs 237; shard_append_ms 262 vs 342; finish_ms 98 vs 128; par_exec_ms 68 vs 38
+  slow blocks following a slow block: 2 of 43; by number mod 8 [(0, 8), (1, 7), (2, 6), (3, 2), (4, 5), (5, 5), (6, 5), (7, 5)]
+== loop333Xb1
+  window 1 canonical (the layer's `Block added to canonical chain`): 293 blocks, 73.2M tx = 2,441,667/s, full (>= 95% of 250000) 293
+  window 1: 294 builds, 73.5M tx (2,450,000/s = 100% of window 1); sealed_at 88/112/177; par_ms 74/103/173; parent_fields_ms 0/14/34; in-memory max 11, RSS 12.7 -> 23.3 G; queue min/median 1,182,500/1,572,000; throttle delayed 0 of 293
+  window 2 canonical (the layer's `Block added to canonical chain`): 272 blocks, 68.0M tx = 2,266,667/s, full (>= 95% of 250000) 272
+  window 2: 272 builds, 68.0M tx (2,266,667/s = 93% of window 1); sealed_at 89/168/249; par_ms 75/159/243; parent_fields_ms 0/11/27; in-memory max 13, RSS 24.1 -> 30.2 G; queue min/median 1,373,500/1,588,500; throttle delayed 0 of 273
+  window 3 canonical (the layer's `Block added to canonical chain`): 257 blocks, 64.2M tx = 2,141,667/s, full (>= 95% of 250000) 257
+  window 3: 256 builds, 64.0M tx (2,133,333/s = 87% of window 1); sealed_at 90/185/244; par_ms 77/181/240; parent_fields_ms 0/14/29; in-memory max 12, RSS 29.9 -> 34.7 G; queue min/median 1,259,500/1,607,500; throttle delayed 0 of 176
+  tail: 42 slow blocks (sealed_at >= 183 ms, top 5% of 822 full builds in the first 90 s); sealed_at slow mean 215 against 95
+  largest differences (slow mean vs rest mean): root_faults 267 vs 111; par_run_ms 174 vs 49; par_ms 206 vs 86; sealed_at_ms 215 vs 95; state_wait_ms 103 vs 9; gap_before_exec_ms 106 vs 11; total_ms 327 vs 237; shard_append_ms 260 vs 340; par_exec_ms 69 vs 38; finish_ms 98 vs 126
+  slow blocks following a slow block: 1 of 42; by number mod 8 [(0, 5), (1, 4), (2, 7), (3, 6), (4, 2), (5, 10), (6, 3), (7, 5)]
+== loop333X
+  window 1 canonical (the layer's `Block added to canonical chain`): 367 blocks, 73.4M tx = 2,446,667/s, full (>= 95% of 200000) 367
+  window 1: 367 builds, 73.4M tx (2,446,667/s = 100% of window 1); sealed_at 73/91/135; par_ms 60/84/132; parent_fields_ms 0/17/27; in-memory max 11, RSS 8.4 -> 20.9 G; queue min/median 798,000/1,611,500; throttle delayed 0 of 367
+  window 2 canonical (the layer's `Block added to canonical chain`): 333 blocks, 66.6M tx = 2,220,000/s, full (>= 95% of 200000) 333
+  window 2: 333 builds, 66.6M tx (2,220,000/s = 91% of window 1); sealed_at 74/128/232; par_ms 61/121/220; parent_fields_ms 0/16/28; in-memory max 15, RSS 21.4 -> 27.1 G; queue min/median 1,421,500/1,617,500; throttle delayed 0 of 307
+  window 3 canonical (the layer's `Block added to canonical chain`): 333 blocks, 66.6M tx = 2,220,000/s, full (>= 95% of 200000) 333
+  window 3: 334 builds, 66.8M tx (2,226,667/s = 91% of window 1); sealed_at 74/140/245; par_ms 67/134/242; parent_fields_ms 0/21/32; in-memory max 12, RSS 27.7 -> 32.0 G; queue min/median 1,441,500/1,630,500; throttle delayed 0 of 0
+  tail: 53 slow blocks (sealed_at >= 146 ms, top 5% of 1034 full builds in the first 90 s); sealed_at slow mean 183 against 75
+  largest differences (slow mean vs rest mean): root_faults 286 vs 61; par_run_ms 152 vs 36; par_ms 176 vs 68; sealed_at_ms 183 vs 75; total_ms 277 vs 193; gap_before_exec_ms 87 vs 8; state_wait_ms 85 vs 6; shard_append_ms 170 vs 229; par_exec_ms 66 vs 29; batch_max_ms 56 vs 19
+  slow blocks following a slow block: 0 of 53; by number mod 8 [(0, 2), (1, 9), (2, 7), (3, 10), (4, 7), (5, 7), (6, 5), (7, 6)]
+== loop333Xb
+  window 1 canonical (the layer's `Block added to canonical chain`): 366 blocks, 73.2M tx = 2,440,000/s, full (>= 95% of 200000) 366
+  window 1: 367 builds, 73.4M tx (2,446,667/s = 100% of window 1); sealed_at 73/89/127; par_ms 59/80/123; parent_fields_ms 0/18/27; in-memory max 10, RSS 12.9 -> 21.1 G; queue min/median 1,118,000/1,608,000; throttle delayed 0 of 366
+  window 2 canonical (the layer's `Block added to canonical chain`): 334 blocks, 66.8M tx = 2,226,667/s, full (>= 95% of 200000) 334
+  window 2: 333 builds, 66.6M tx (2,220,000/s = 91% of window 1); sealed_at 73/131/207; par_ms 65/125/203; parent_fields_ms 0/18/28; in-memory max 12, RSS 21.8 -> 27.8 G; queue min/median 1,477,500/1,617,500; throttle delayed 0 of 308
+  window 3 canonical (the layer's `Block added to canonical chain`): 337 blocks, 67.4M tx = 2,246,667/s, full (>= 95% of 200000) 337
+  window 3: 338 builds, 67.6M tx (2,253,333/s = 92% of window 1); sealed_at 74/139/213; par_ms 64/132/208; parent_fields_ms 0/18/30; in-memory max 12, RSS 28.1 -> 32.8 G; queue min/median 1,477,000/1,611,500; throttle delayed 0 of 0
+  tail: 53 slow blocks (sealed_at >= 144 ms, top 5% of 1038 full builds in the first 90 s); sealed_at slow mean 178 against 75
+  largest differences (slow mean vs rest mean): root_faults 279 vs 55; par_run_ms 147 vs 35; par_ms 172 vs 68; sealed_at_ms 178 vs 75; total_ms 270 vs 195; gap_before_exec_ms 81 vs 8; state_wait_ms 77 vs 6; shard_append_ms 169 vs 231; root_faults_undo 52 vs 12; root_append_faults 52 vs 13
+  slow blocks following a slow block: 0 of 53; by number mod 8 [(0, 5), (1, 6), (2, 6), (3, 8), (4, 7), (5, 9), (6, 10), (7, 2)]

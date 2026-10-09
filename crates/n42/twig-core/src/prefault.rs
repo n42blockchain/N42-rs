@@ -223,6 +223,9 @@ fn worker() -> Option<&'static Sender<Job>> {
             std::thread::Builder::new()
                 .name("n42-qmdb-prefault".into())
                 .spawn(move || {
+                    // Started from whichever thread asked first (a root's):
+                    // back to the background set, at the background priority.
+                    n42_core_layout::background_thread();
                     for job in receiver {
                         match job {
                             Job::TopUp => top_up(),
@@ -468,6 +471,7 @@ fn append_populator() -> Option<&'static Sender<PopulateJob>> {
             std::thread::Builder::new()
                 .name("n42-qmdb-append-populate".into())
                 .spawn(move || {
+                    n42_core_layout::background_thread();
                     for job in receiver {
                         let mut at = job.from;
                         while at < job.to {

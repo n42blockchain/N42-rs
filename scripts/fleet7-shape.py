@@ -4,7 +4,8 @@ distinct recipients 163,000 transfers touch, and how long each sender's run is.
 Round 43 found the flood paying 13,000 recipients a block for 42 rounds before
 anyone looked; every round records this line now.
 
-usage: fleet7-shape.py <http rpc base port> [label]
+usage: fleet7-shape.py <http rpc base port> [label] [block number]
+(a block number reads that block only; the log-mode rounds pass the number found in the layer's log, after the flood)
 """
 import json, sys, urllib.request
 
@@ -19,7 +20,8 @@ def rpc(m, p):
 try:
     head = int(rpc("eth_blockNumber", []), 16)
     best = None
-    for num in range(head - 1, max(head - 8, 0), -1):
+    fixed = int(sys.argv[3]) if len(sys.argv) > 3 and int(sys.argv[3]) > 0 else 0
+    for num in ([fixed] if fixed else range(head - 1, max(head - 8, 0), -1)):
         b = rpc("eth_getBlockByNumber", [hex(num), True])
         if b and len(b["transactions"]) > (len(best["transactions"]) if best else 0):
             best = b

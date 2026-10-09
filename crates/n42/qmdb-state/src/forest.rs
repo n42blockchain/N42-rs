@@ -21,6 +21,7 @@
 //! The window of held blocks is bounded, so it stays a window.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
 use n42_twig_core::qmdb_compat::{
@@ -64,6 +65,10 @@ pub struct PreparedBlock {
     /// The block's delta from its parent (see `BlockRecord::delta`); its head
     /// fields are filled in when the block is filed under its hash.
     delta: Option<ForestDelta>,
+    /// The entry-file offsets of the slots the block appended, in slot order,
+    /// captured by a root computed on a leased tree ([`TreeLease`]); see
+    /// `BlockRecord::offsets`.
+    offsets: Option<Arc<[u64]>>,
 }
 
 impl PreparedBlock {
@@ -100,7 +105,7 @@ impl ForestCheckpoint {
     pub const VERSION: u32 = 1;
 
     /// Moves this checkpoint forward by one delta: the cursor to the delta's
-    /// (truncating first on a rewind), the appended range live, the changed
+    /// (truncating first on a rewind), the appended entries' active flags, the changed
     /// slots to their flags. The entries themselves are in the file.
     pub fn apply_delta(&mut self, delta: &ForestDelta) -> Result<(), StateError> {
         if delta.version != ForestDelta::VERSION {
@@ -109,21 +114,45 @@ impl ForestCheckpoint {
         if delta.base_next_slot > self.next_slot {
             return Err(StateError::DeltaBase { expected: self.next_slot, found: delta.base_next_slot });
         }
+        // File-backed deltas omit appended payloads: their entries are
+        // already durable in the entry file. Heap deltas carry the span.
+        if !delta.appended.is_empty() {
+            delta.validate_span()?;
+        }
+        if delta.next_slot < delta.base_next_slot
+            || usize::try_from(delta.next_slot).ok().and_then(|n| n.checked_add(63)).is_none()
+        {
+            return Err(StateError::DeltaBase { expected: delta.base_next_slot, found: delta.next_slot });
+        }
         let words = |slots: u64| (slots as usize).div_ceil(64);
+        for (slot, active) in &delta.changed {
+            if *slot >= delta.next_slot
+                || (*slot < delta.base_next_slot && (*slot / 64) as usize >= self.active.len())
+                || (*slot >= delta.base_next_slot && (!delta.appended.is_empty() || *active))
+            {
+                return Err(StateError::DeltaSlot(*slot));
+            }
+        }
         // Truncate to the base.
         self.active.truncate(words(delta.base_next_slot));
         for slot in delta.base_next_slot..(self.active.len() as u64 * 64) {
             self.active[(slot / 64) as usize] &= !(1 << (slot % 64));
         }
-        // The appended range is live.
+        // A delta may span several blocks: an entry appended early in it
+        // can already have been retired by a later block.
         self.active.resize(words(delta.next_slot), 0);
-        for slot in delta.base_next_slot..delta.next_slot {
-            self.active[(slot / 64) as usize] |= 1 << (slot % 64);
+        if delta.appended.is_empty() {
+            for slot in delta.base_next_slot..delta.next_slot {
+                self.active[(slot / 64) as usize] |= 1 << (slot % 64);
+            }
+        }
+        for (offset, entry) in delta.appended.iter().enumerate() {
+            let slot = delta.base_next_slot + offset as u64;
+            if entry.active {
+                self.active[(slot / 64) as usize] |= 1 << (slot % 64);
+            }
         }
         for (slot, active) in &delta.changed {
-            if *slot >= delta.base_next_slot {
-                return Err(StateError::DeltaSlot(*slot));
-            }
             let word = (*slot / 64) as usize;
             if *active {
                 self.active[word] |= 1 << (*slot % 64);
@@ -180,24 +209,18 @@ impl ForestSnapshot {
                 found: delta.base_next_slot,
             });
         }
-        if delta.base_next_slot < self.tree.next_slot {
-            self.tree.entries.truncate(delta.base_next_slot as usize);
-            self.tree.next_slot = delta.base_next_slot;
-        }
         // Everything is checked before anything is written. A delta that fails
         // halfway leaves a snapshot that is neither state, and a caller holding
         // one has no way to tell.
-        if delta.base_next_slot + delta.appended.len() as u64 != delta.next_slot {
-            return Err(StateError::DeltaBase {
-                expected: delta.next_slot,
-                found: delta.base_next_slot + delta.appended.len() as u64,
-            });
-        }
+        delta.validate_span()?;
         for (slot, _) in &delta.changed {
             let index = usize::try_from(*slot).map_err(|_| StateError::DeltaSlot(*slot))?;
-            if index >= self.tree.entries.len() {
+            if *slot >= delta.base_next_slot || index >= self.tree.entries.len() {
                 return Err(StateError::DeltaSlot(*slot));
             }
+        }
+        if delta.base_next_slot < self.tree.next_slot {
+            self.tree.entries.truncate(delta.base_next_slot as usize);
         }
         for (slot, active) in &delta.changed {
             self.tree.entries[*slot as usize].active = *active;
@@ -236,12 +259,25 @@ pub struct ForestDelta {
     /// slot's content never changes after its append, so this is all a
     /// delta has to say about it (version 2; version 1 carried the entry,
     /// which cost 133,000 random reads of the retired slots a block).
+    /// File-backed deltas also carry false flags for appended slots retired
+    /// within this delta, since their entry payloads are omitted.
     pub changed: Vec<(u64, bool)>,
 }
 
 impl ForestDelta {
     /// The layout this crate writes.
     pub const VERSION: u32 = 2;
+
+    fn validate_span(&self) -> Result<(), StateError> {
+        let end = self.base_next_slot.checked_add(self.appended.len() as u64);
+        if end != Some(self.next_slot) {
+            return Err(StateError::DeltaBase {
+                expected: self.next_slot,
+                found: end.unwrap_or(u64::MAX),
+            });
+        }
+        Ok(())
+    }
 
     /// Roughly what this costs to store, for a caller deciding when a run of
     /// deltas has grown longer than the checkpoint it is replacing.
@@ -260,8 +296,10 @@ struct BlockRecord {
     /// a revert. Empty for the block the forest was restored at, which is
     /// never re-applied because nothing lies beneath it. One arena, so a
     /// record leaving the window is a couple of `free`s, not one a value
-    /// (`docs/BREAKTHROUGH_DESIGN.md` 10.39).
-    ops: QmdbOps,
+    /// (`docs/BREAKTHROUGH_DESIGN.md` 10.39). Shared, so a persistence batch
+    /// can list the block's changes from it without copying the keys under
+    /// the forest's lock ([`QmdbForest::block_changes_parts`]).
+    ops: Arc<QmdbOps>,
     root: B256,
     /// Present exactly while the block is applied on the tree's current path.
     undo: Option<BlockUndo>,
@@ -270,6 +308,12 @@ struct BlockRecord {
     /// the first persistence that uses it; `None` for a restored head and for
     /// a block persisted already.
     delta: Option<ForestDelta>,
+    /// The entry-file offsets of the slots the block appended (in slot order,
+    /// which is the order of its non-deleting operations), captured when its
+    /// root was computed on a leased tree. Present only while the block stays
+    /// applied as it was computed: a revert clears it, since a re-applied
+    /// block's records are written again.
+    offsets: Option<Arc<[u64]>>,
 }
 
 /// What [`QmdbForest::set_canonical_releasing`] took out of the forest: the
@@ -376,6 +420,153 @@ pub struct QmdbForest {
     /// Where the last [`Self::compute_operations`] spent its time: the move
     /// to the parent (microseconds) and the apply's phases.
     last_compute: (u64, n42_twig_core::qmdb_compat::ApplyPhases),
+    /// What the last [`Self::compute_operations`] spent after the apply, in
+    /// microseconds: the move's bookkeeping ([`Self::note_move`]) and the
+    /// block's delta ([`Self::delta_of_applied`]); and the apply's whole
+    /// call (its phases and what lies between them).
+    last_tail: (u64, u64, u64),
+    /// The append cursor the tree stood at when it was leased out
+    /// ([`Self::lease_tree`]); `None` while the tree is here. While it is out
+    /// `self.tree` is an empty placeholder and every method that reads the
+    /// tree refuses ([`StateError::TreeLeased`]) or answers without it.
+    leased_at: Option<u64>,
+    /// Every slot below this is written to the entry file (the last flush's
+    /// cursor, lowered by any move that rewound below it): what
+    /// [`Self::block_changes_parts`] checks instead of flushing.
+    flushed_slots: u64,
+}
+
+/// The shared tree, taken out of the forest so a block's root is computed
+/// without the forest's lock ([`QmdbForest::lease_tree`],
+/// `N42_QMDB_COMPUTE_OFFLOCK`). The forest's bookkeeping -- records, roots,
+/// renames, the reader's keep, the persisted blocks' changes -- stays usable
+/// while it is out; whatever needs the tree waits for
+/// [`QmdbForest::return_tree`].
+#[derive(Debug)]
+pub struct TreeLease {
+    tree: QmdbCompatTree,
+    parent: B256,
+    move_us: u64,
+}
+
+/// A root computed on a [`TreeLease`], to be handed back with the tree.
+#[derive(Debug)]
+pub struct LeasedRoot {
+    root: B256,
+    ops: QmdbOps,
+    undo: BlockUndo,
+    delta: ForestDelta,
+    offsets: Option<Arc<[u64]>>,
+    phases: n42_twig_core::qmdb_compat::ApplyPhases,
+    apply_us: u64,
+    delta_us: u64,
+}
+
+impl LeasedRoot {
+    /// The computed root.
+    pub const fn root(&self) -> B256 {
+        self.root
+    }
+}
+
+impl TreeLease {
+    /// The block the tree was stood at.
+    pub const fn parent(&self) -> B256 {
+        self.parent
+    }
+
+    /// [`QmdbForest::compute_operations`]'s apply, on the leased tree: the
+    /// root, the undo, the delta and the appended slots' entry-file offsets.
+    /// Nothing outside the tree is touched; [`QmdbForest::return_tree`] files
+    /// the result as pending work.
+    pub fn compute(&mut self, ops: impl Into<QmdbOps>) -> Result<LeasedRoot, StateError> {
+        let mut ops = ops.into();
+        if !ops.is_sorted() {
+            ops.sort();
+        }
+        let applied_at = std::time::Instant::now();
+        let (root, undo, phases) = self.tree.apply_ops_recorded_phased(&ops)?;
+        let apply_us = applied_at.elapsed().as_micros() as u64;
+        let delta_at = std::time::Instant::now();
+        let delta = delta_of_applied(&self.tree, &undo);
+        let offsets = if self.tree.entry_file().is_some() {
+            (undo.prev_next_slot..self.tree.next_slot())
+                .map(|slot| self.tree.entry_offset(slot))
+                .collect::<Option<Vec<u64>>>()
+                .map(Arc::from)
+        } else {
+            None
+        };
+        let delta_us = delta_at.elapsed().as_micros() as u64;
+        Ok(LeasedRoot { root: B256::from(root), ops, undo, delta, offsets, phases, apply_us, delta_us })
+    }
+}
+
+/// A filed block's changes as shared parts ([`QmdbForest::block_changes_parts`]):
+/// its operations and the offsets of the records it appended, listed outside
+/// the forest's lock with [`Self::changes`].
+#[derive(Debug, Clone)]
+pub struct BlockChangesParts {
+    ops: Arc<QmdbOps>,
+    offsets: Arc<[u64]>,
+}
+
+impl BlockChangesParts {
+    /// The highest record offset the block appended, if it appended any.
+    pub fn max_offset(&self) -> Option<u64> {
+        self.offsets.last().copied()
+    }
+
+    /// The same list as [`QmdbForest::block_changes`]: each operation's key in
+    /// key order with its record's offset, `None` for a deletion.
+    pub fn changes(&self) -> Vec<([u8; 32], Option<u64>)> {
+        let mut appended = self.offsets.iter();
+        self.ops
+            .iter()
+            .map(|(key, value)| (*key, if value.is_some() { appended.next().copied() } else { None }))
+            .collect()
+    }
+}
+
+/// The delta from the parent to the block just applied on `tree`; see
+/// [`QmdbForest::delta_of_applied`].
+fn delta_of_applied(tree: &QmdbCompatTree, undo: &BlockUndo) -> ForestDelta {
+    use rayon::prelude::*;
+    let base_next_slot = undo.prev_next_slot;
+    let next_slot = tree.next_slot();
+    // With the entries in the file, the file is the record of the
+    // appended range (synced before the delta is written); the delta
+    // names it by its bounds and carries nothing.
+    let appended: Vec<QmdbEntrySnapshot> = if tree.entry_file().is_some() {
+        Vec::new()
+    } else {
+        (base_next_slot..next_slot)
+            .into_par_iter()
+            .map(|slot| tree.entry_at(slot).expect("an appended slot is on the tree"))
+            .collect()
+    };
+    // The block only ever deactivates the slots its undo names (a
+    // revival is a move, not a block), so no read: the flag is false.
+    // Sized up front: grown by doubling it copied into fresh pages on
+    // every block, under the forest's lock.
+    let mut slots: Vec<u64> = Vec::with_capacity(undo.retired_len());
+    slots.extend(undo.retired_slots().filter(|slot| *slot < base_next_slot));
+    // Sorted on the worker pool: one thread sorting a full block's
+    // ~190,000 retired slots was 2.4 ms of the leader's root, under the
+    // forest's lock (`docs/SHARED_EXECUTION_SCOPE.md` 13). The same
+    // order either way.
+    slots.par_sort_unstable();
+    slots.dedup();
+    let changed: Vec<(u64, bool)> = slots.into_par_iter().map(|slot| (slot, false)).collect();
+    ForestDelta {
+        version: ForestDelta::VERSION,
+        head_number: 0,
+        head_hash: B256::ZERO,
+        base_next_slot,
+        next_slot,
+        appended,
+        changed,
+    }
 }
 
 impl QmdbForest {
@@ -450,13 +641,92 @@ impl QmdbForest {
 
     /// Makes the entry file's appends durable.
     pub fn sync_entries(&mut self) -> Result<(), StateError> {
-        self.tree.sync_entries().map_err(|e| StateError::EntryFile(e.to_string()))
+        self.refuse_leased()?;
+        self.tree.sync_entries().map_err(|e| StateError::EntryFile(e.to_string()))?;
+        self.flushed_slots = self.tree.next_slot();
+        Ok(())
     }
 
     /// Writes the entry file's pending appends and returns a handle to
     /// fsync outside the forest's lock; `None` without an entry file.
     pub fn flush_entries_for_sync(&mut self) -> Result<Option<std::fs::File>, StateError> {
-        self.tree.flush_entries_for_sync().map_err(|e| StateError::EntryFile(e.to_string()))
+        self.refuse_leased()?;
+        let handle = self.tree.flush_entries_for_sync().map_err(|e| StateError::EntryFile(e.to_string()))?;
+        self.flushed_slots = self.tree.next_slot();
+        Ok(handle)
+    }
+
+    /// Refuses a call that needs the tree while it is leased out.
+    const fn refuse_leased(&self) -> Result<(), StateError> {
+        if self.leased_at.is_some() { Err(StateError::TreeLeased) } else { Ok(()) }
+    }
+
+    /// Whether the tree is leased out ([`Self::lease_tree`]).
+    pub const fn is_leased(&self) -> bool {
+        self.leased_at.is_some()
+    }
+
+    /// Stands the tree at `parent` and takes it out of the forest, so the
+    /// block's root is computed ([`TreeLease::compute`]) without the lock the
+    /// forest lives under. Until [`Self::return_tree`] the forest answers what
+    /// needs no tree (roots, renames, the reader's keep, a persisted block's
+    /// changes through [`Self::block_changes_parts`]) and refuses the rest.
+    /// Nothing can cut or move the tree while it is out: every move goes
+    /// through the tree.
+    pub fn lease_tree(&mut self, parent: B256) -> Result<TreeLease, StateError> {
+        self.refuse_leased()?;
+        let moved_at = std::time::Instant::now();
+        self.move_to(parent)?;
+        let move_us = moved_at.elapsed().as_micros() as u64;
+        let tree = std::mem::take(&mut self.tree);
+        self.leased_at = Some(tree.next_slot());
+        Ok(TreeLease { tree, parent, move_us })
+    }
+
+    /// Puts a leased tree back and files what was computed on it as pending
+    /// work, as [`Self::compute_operations`] would have. The parent is where
+    /// the tree stands now: a rename while the tree was out moved the tip
+    /// with the record (`true` in the result), so the block is filed on the
+    /// parent's new hash. A failed computation puts the tree back and returns
+    /// the error.
+    pub fn return_tree(
+        &mut self,
+        lease: TreeLease,
+        computed: Result<LeasedRoot, StateError>,
+    ) -> Result<(PreparedBlock, bool), StateError> {
+        self.tree = lease.tree;
+        self.leased_at = None;
+        let computed = computed?;
+        self.last_compute = (lease.move_us, computed.phases);
+        let noted_at = std::time::Instant::now();
+        self.note_move(&computed.undo);
+        self.last_tail = (noted_at.elapsed().as_micros() as u64, computed.delta_us, computed.apply_us);
+        let renamed = self.tip != lease.parent;
+        let parent = self.tip;
+        self.pending = Some((parent, computed.undo));
+        Ok((
+            PreparedBlock {
+                root: computed.root,
+                parent,
+                ops: computed.ops,
+                delta: Some(computed.delta),
+                offsets: computed.offsets,
+            },
+            renamed,
+        ))
+    }
+
+    /// [`Self::block_changes`] without the tree: the block's shared
+    /// operations and the offsets captured when its root was computed on a
+    /// leased tree, for a block still applied as it was computed and whose
+    /// records are all written to the file. `None` otherwise (the caller
+    /// falls back to [`Self::block_changes`], which needs the tree).
+    pub fn block_changes_parts(&self, block_hash: &B256) -> Option<BlockChangesParts> {
+        let record = self.records.get(block_hash)?;
+        let undo = record.undo.as_ref()?;
+        let offsets = record.offsets.clone()?;
+        let end = undo.prev_next_slot + offsets.len() as u64;
+        (end <= self.flushed_slots).then(|| BlockChangesParts { ops: Arc::clone(&record.ops), offsets })
     }
 
     /// The canonical head as a file-mode checkpoint: the cursor and the
@@ -482,10 +752,11 @@ impl QmdbForest {
             BlockRecord {
                 parent: B256::ZERO,
                 number,
-                ops: QmdbOps::new(),
+                ops: Arc::new(QmdbOps::new()),
                 root,
                 undo: None,
                 delta: None,
+                offsets: None,
             },
         );
         Self {
@@ -502,6 +773,9 @@ impl QmdbForest {
             dirty_slots_deduped: 0,
             min_cursor: next_slot,
             last_compute: Default::default(),
+            last_tail: (0, 0, 0),
+            leased_at: None,
+            flushed_slots: 0,
         }
     }
 
@@ -510,6 +784,14 @@ impl QmdbForest {
     /// phases (the hashing is `rehash_us` and `root_us`).
     pub const fn last_compute(&self) -> (u64, n42_twig_core::qmdb_compat::ApplyPhases) {
         self.last_compute
+    }
+
+    /// What the last [`Self::compute_operations`] spent after the apply, in
+    /// microseconds: the move's bookkeeping and the block's delta, both
+    /// under the caller's lock and before the root is handed back; and the
+    /// apply's whole call.
+    pub const fn last_compute_tail(&self) -> (u64, u64, u64) {
+        self.last_tail
     }
 
     /// Records what a move touched: the slots the undo names, and how far back
@@ -522,6 +804,7 @@ impl QmdbForest {
             self.dirty_slots_deduped = self.dirty_slots.len();
         }
         self.min_cursor = self.min_cursor.min(self.tree.next_slot());
+        self.flushed_slots = self.flushed_slots.min(self.tree.next_slot());
     }
 
     /// Sets how many blocks behind the head are kept.
@@ -705,6 +988,7 @@ impl QmdbForest {
             parent,
             ops,
             delta: Some(delta),
+            offsets: None,
         })
     }
 
@@ -725,16 +1009,23 @@ impl QmdbForest {
             ops.sort();
         }
         // Applied from the arena the record keeps: no clone of the block.
+        let applied_at = std::time::Instant::now();
         let (root, undo, phases) = self.tree.apply_ops_recorded_phased(&ops)?;
+        let apply_us = applied_at.elapsed().as_micros() as u64;
         self.last_compute = (move_us, phases);
+        let noted_at = std::time::Instant::now();
         self.note_move(&undo);
+        let note_us = noted_at.elapsed().as_micros() as u64;
+        let delta_at = std::time::Instant::now();
         let delta = self.delta_of_applied(&undo);
+        self.last_tail = (note_us, delta_at.elapsed().as_micros() as u64, apply_us);
         self.pending = Some((parent, undo));
         Ok(PreparedBlock {
             root: B256::from(root),
             parent,
             ops,
             delta: Some(delta),
+            offsets: None,
         })
     }
 
@@ -749,39 +1040,7 @@ impl QmdbForest {
     /// and moving it back and forth was 50-200 ms of every block on both the
     /// build's and the hand-off's side of the forest's one lock (loop114).
     fn delta_of_applied(&self, undo: &BlockUndo) -> ForestDelta {
-        use rayon::prelude::*;
-        let base_next_slot = undo.prev_next_slot;
-        let next_slot = self.tree.next_slot();
-        let tree = &self.tree;
-        // With the entries in the file, the file is the record of the
-        // appended range (synced before the delta is written); the delta
-        // names it by its bounds and carries nothing.
-        let appended: Vec<QmdbEntrySnapshot> = if tree.entry_file().is_some() {
-            Vec::new()
-        } else {
-            (base_next_slot..next_slot)
-                .into_par_iter()
-                .map(|slot| tree.entry_at(slot).expect("an appended slot is on the tree"))
-                .collect()
-        };
-        // The block only ever deactivates the slots its undo names (a
-        // revival is a move, not a block), so no read: the flag is false.
-        // Sized up front: grown by doubling it copied into fresh pages on
-        // every block, under the forest's lock.
-        let mut slots: Vec<u64> = Vec::with_capacity(undo.retired_len());
-        slots.extend(undo.retired_slots().filter(|slot| *slot < base_next_slot));
-        slots.sort_unstable();
-        slots.dedup();
-        let changed: Vec<(u64, bool)> = slots.into_iter().map(|slot| (slot, false)).collect();
-        ForestDelta {
-            version: ForestDelta::VERSION,
-            head_number: 0,
-            head_hash: B256::ZERO,
-            base_next_slot,
-            next_slot,
-            appended,
-            changed,
-        }
+        delta_of_applied(&self.tree, undo)
     }
 
     /// The deltas that take the persisted state at `persisted_head` (whose
@@ -847,10 +1106,11 @@ impl QmdbForest {
             BlockRecord {
                 parent: prepared.parent,
                 number,
-                ops: prepared.ops,
+                ops: Arc::new(prepared.ops),
                 root: prepared.root,
                 undo,
                 delta,
+                offsets: if applied { prepared.offsets } else { None },
             },
         );
         if applied {
@@ -902,6 +1162,7 @@ impl QmdbForest {
     /// block reached its engine a second late, and the chained child's seal
     /// waited 600-670 ms for the parent's fields; `BREAKTHROUGH_DESIGN` 10.38).
     pub fn set_canonical_releasing(&mut self, block_hash: B256) -> Result<Released, StateError> {
+        self.refuse_leased()?;
         let number = self
             .records
             .get(&block_hash)
@@ -1004,21 +1265,25 @@ impl QmdbForest {
         // those slots travel as appends (the replay truncates to the base
         // first). Below that, the slots a move flipped travel as flags.
         let base = self.min_cursor.min(base_next_slot);
-        let appended = if self.tree.entry_file().is_some() {
+        let file_backed = self.tree.entry_file().is_some();
+        let appended = if file_backed {
             Vec::new()
         } else {
             (base..next_slot)
                 .map(|slot| self.tree.entry_at(slot).ok_or(StateError::DeltaSlot(slot)))
                 .collect::<Result<Vec<_>, _>>()?
         };
-        self.dirty_slots.retain(|slot| *slot < base);
+        self.dirty_slots.retain(|slot| *slot < if file_backed { next_slot } else { base });
         self.dirty_slots.sort_unstable();
         self.dirty_slots.dedup();
-        let changed = self
+        let mut changed = self
             .dirty_slots
             .iter()
             .map(|slot| self.tree.slot_active(*slot).map(|active| (*slot, active)).ok_or(StateError::DeltaSlot(*slot)))
             .collect::<Result<Vec<_>, _>>()?;
+        if file_backed {
+            changed.retain(|(slot, active)| *slot < base || !*active);
+        }
         self.dirty_slots.clear();
         self.dirty_slots_deduped = 0;
         self.min_cursor = next_slot;
@@ -1066,6 +1331,7 @@ impl QmdbForest {
     /// Stands the tree at `target`: reverts pending work, reverts up to the
     /// common ancestor, re-applies down.
     fn move_to(&mut self, target: B256) -> Result<(), StateError> {
+        self.refuse_leased()?;
         if let Some((_, undo)) = self.pending.take() {
             self.tree.apply_undo(&undo).map_err(|e| StateError::Undo(e.to_string()))?;
             self.note_move(&undo);
@@ -1100,6 +1366,7 @@ impl QmdbForest {
                 .undo
                 .take()
                 .ok_or(StateError::NotApplied(*hash))?;
+            record.offsets = None;
             self.tree
                 .apply_undo(&undo)
                 .map_err(|e| StateError::Undo(e.to_string()))?;
@@ -1232,6 +1499,81 @@ mod tests {
 
     fn h(byte: u8) -> B256 {
         B256::repeat_byte(byte)
+    }
+
+    fn checkpoint_from(snapshot: &ForestSnapshot) -> ForestCheckpoint {
+        let mut active = vec![0u64; (snapshot.tree.next_slot as usize).div_ceil(64)];
+        for (slot, entry) in snapshot.tree.entries.iter().enumerate() {
+            if entry.active {
+                active[slot / 64] |= 1 << (slot % 64);
+            }
+        }
+        ForestCheckpoint {
+            version: ForestCheckpoint::VERSION,
+            head_number: snapshot.head_number,
+            head_hash: snapshot.head_hash,
+            next_slot: snapshot.tree.next_slot,
+            active,
+        }
+    }
+
+    #[test]
+    fn a_multi_block_checkpoint_delta_keeps_retired_appends_inactive() {
+        for file_backed in [false, true] {
+            let mut forest = QmdbForest::genesis(GENESIS, &changes(1)).unwrap();
+            let path = std::env::temp_dir().join(format!("n42-audit-delta-{}.entries", std::process::id()));
+            if file_backed {
+                let _ = std::fs::remove_file(&path);
+                forest = forest.with_entry_file(&path).unwrap();
+            }
+            let base = forest.snapshot().unwrap();
+            let mut checkpoint = checkpoint_from(&base);
+            forest.apply(GENESIS, h(1), 1, &changes(1)).unwrap();
+            forest.apply(h(1), h(2), 2, &changes(1)).unwrap();
+            forest.set_canonical(h(2)).unwrap();
+            let delta = forest.delta_since(base.tree.next_slot).unwrap();
+            if file_backed {
+                assert!(delta.appended.is_empty());
+                assert!(delta.changed.iter().any(|(slot, active)| *slot >= delta.base_next_slot && !*active));
+            } else {
+                assert!(delta.appended.iter().any(|entry| !entry.active));
+            }
+            checkpoint.apply_delta(&delta).unwrap();
+            assert_eq!(checkpoint, checkpoint_from(&forest.snapshot().unwrap()));
+            drop(forest);
+            if file_backed {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_rewind_deltas_leave_snapshot_and_checkpoint_unchanged() {
+        let mut forest = QmdbForest::genesis(GENESIS, &changes(1)).unwrap();
+        let base = forest.snapshot().unwrap();
+        let checkpoint = checkpoint_from(&base);
+        for (next_slot, changed) in [(1, vec![]), (0, vec![(0, false)]), (u64::MAX, vec![])] {
+            let delta = ForestDelta {
+                version: ForestDelta::VERSION,
+                head_number: 1,
+                head_hash: h(1),
+                base_next_slot: 0,
+                next_slot,
+                appended: if next_slot == 1 {
+                    vec![base.tree.entries[0].clone(); 2]
+                } else {
+                    Vec::new()
+                },
+                changed,
+            };
+            let mut snapshot = base.clone();
+            assert!(snapshot.apply_delta(&delta).is_err());
+            assert_eq!(snapshot.tree, base.tree);
+            assert_eq!((snapshot.head_number, snapshot.head_hash), (base.head_number, base.head_hash));
+            let mut replayed = checkpoint.clone();
+            assert!(replayed.apply_delta(&delta).is_err());
+            assert_eq!(replayed, checkpoint);
+        }
     }
 
     #[test]

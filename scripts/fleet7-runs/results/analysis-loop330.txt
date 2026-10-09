@@ -1,0 +1,118 @@
+# loop330: tip 79fb07832 (E=1 tuning, seven keys on one execution layer, N42_IMPORT_ONCE=1; E=1 figures); legs 19:55-20:40, one claim; native n42 19:39:03, last .rs write 18:22:54
+== loop330WARM
+  layer-0 leader window-1 builds 205: txs mean 162934, share >= 95% of the tier 100% (max 163000); sealed_at_ms 141.0/235.0; par_ms 138.0/231.0; par_exec_ms 35.0/56.0; roots_ms 84.0/146.0; parent_fields_ms 0.0/168.0; sealed_ms 11.0/176.0
+  proposal cycle window 1 (n=215): mean 144.4 median 136.4 p90 236.8 ms; blocks in the 30 s: 215
+  binding wait (tick / quorum / seal, share and mean cycle): tick 36.1% (100.9); quorum 0.5% (107.5); seal 63.4% (172.5)
+  vote delay after the proposal, slowest key per block: median 20.8 p90 31.3 ms (slowest minus the median key: median 0.3); last key: {1: 30, 2: 33, 3: 39, 4: 30, 5: 41, 6: 29} of 202 blocks
+  CPU in window 1 (cores busy): execution layers 16.6 over 1 process(es); validators 0.5 over 7 process(es)
+  execution layer peak RSS 29.2 G; in-memory blocks max 12 (node0 and others, all layers)
+  blocks built here 1178; also directly imported (executed a second time) 1171; for those, the import's exec_ms / root_ms / total_ms median 35 / 76 / 131
+  import-once counters at the last direct import: once_reqs=7 once_served=0 once_served_total=11995 once_imports=2001 once_blocks=2001 once_takeovers=0; start-up lines with import_once=true: 1; queue-lock lines 0
+    per block: imports 1.00, reqs 0.00, served 0.00
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:871000 t+20:871500 t+40:871000 t+60:872000 t+80:868000 t+100:872000
+  flood: median per 5 s 1064272/s, final 192000000 accepted 0 rejected 177.0s
+  timeout / given-up lines: 1; 23:55:37 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop330A
+  layer-0 leader window-1 builds 190: txs mean 163000, share >= 95% of the tier 100% (max 163000); sealed_at_ms 155.0/244.0; par_ms 152.5/239.0; par_exec_ms 40.5/50.0; roots_ms 87.5/148.0; parent_fields_ms 22.5/169.0; sealed_ms 36.5/179.0
+  proposal cycle window 1 (n=200): mean 155.2 median 149.4 p90 247.9 ms; blocks in the 30 s: 200
+  binding wait (tick / quorum / seal, share and mean cycle): tick 28.4% (100.2); quorum 0%; seal 71.6% (181.0)
+  vote delay after the proposal, slowest key per block: median 25.9 p90 34.3 ms (slowest minus the median key: median 0.3); last key: {1: 26, 2: 41, 3: 30, 4: 30, 5: 34, 6: 26} of 187 blocks
+  CPU in window 1 (cores busy): execution layers 17.0 over 1 process(es); validators 0.5 over 7 process(es)
+  execution layer peak RSS 28.4 G; in-memory blocks max 12 (node0 and others, all layers)
+  blocks built here 1178; also directly imported (executed a second time) 1167; for those, the import's exec_ms / root_ms / total_ms median 38 / 74 / 134
+  import-once counters at the last direct import: once_reqs=7 once_served=0 once_served_total=11071 once_imports=1847 once_blocks=1847 once_takeovers=0; start-up lines with import_once=true: 1; queue-lock lines 0
+    per block: imports 1.00, reqs 0.00, served 0.00
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:871000 t+20:871500 t+40:872000 t+60:871000 t+80:872000 t+100:870000
+  flood: median per 5 s 994275/s, final 192000000 accepted 0 rejected 192.8s
+  timeout / given-up lines: 1; 00:00:43 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop330Ab
+  layer-0 leader window-1 builds 194: txs mean 163000, share >= 95% of the tier 100% (max 163000); sealed_at_ms 156.5/241.0; par_ms 151.5/238.0; par_exec_ms 40.0/50.0; roots_ms 86.0/153.0; parent_fields_ms 35.5/166.0; sealed_ms 47.5/176.0
+  proposal cycle window 1 (n=205): mean 151.7 median 152.4 p90 244.2 ms; blocks in the 30 s: 205
+  binding wait (tick / quorum / seal, share and mean cycle): tick 30.8% (100.9); quorum 0.5% (157.4); seal 68.7% (177.5)
+  vote delay after the proposal, slowest key per block: median 28.1 p90 36.2 ms (slowest minus the median key: median 0.3); last key: {1: 25, 2: 25, 3: 37, 4: 38, 5: 34, 6: 36} of 195 blocks
+  CPU in window 1 (cores busy): execution layers 17.6 over 1 process(es); validators 0.5 over 7 process(es)
+  execution layer peak RSS 29.0 G; in-memory blocks max 12 (node0 and others, all layers)
+  blocks built here 1178; also directly imported (executed a second time) 1170; for those, the import's exec_ms / root_ms / total_ms median 37 / 73 / 134
+  import-once counters at the last direct import: once_reqs=7 once_served=0 once_served_total=10903 once_imports=1819 once_blocks=1819 once_takeovers=0; start-up lines with import_once=true: 1; queue-lock lines 0
+    per block: imports 1.00, reqs 0.00, served 0.00
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:870750 t+20:870500 t+40:872000 t+60:871000 t+80:870500 t+100:872000
+  flood: median per 5 s 978026/s, final 192000000 accepted 0 rejected 195.0s
+  timeout / given-up lines: 1; 00:05:49 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop330A208
+  layer-0 leader window-1 builds 210: txs mean 162898, share >= 95% of the tier 100% (max 163000); sealed_at_ms 138.5/229.0; par_ms 134.5/226.0; par_exec_ms 34.0/44.0; roots_ms 75.0/143.0; parent_fields_ms 0.0/162.0; sealed_ms 11.0/170.0
+  proposal cycle window 1 (n=221): mean 140.3 median 133.3 p90 230.3 ms; blocks in the 30 s: 221
+  binding wait (tick / quorum / seal, share and mean cycle): tick 39.3% (100.9); quorum 0.5% (108.5); seal 60.2% (168.4)
+  vote delay after the proposal, slowest key per block: median 21.0 p90 33.3 ms (slowest minus the median key: median 0.4); last key: {1: 42, 2: 30, 3: 25, 4: 24, 5: 43, 6: 44} of 208 blocks
+  CPU in window 1 (cores busy): execution layers 17.2 over 1 process(es); validators 0.6 over 7 process(es)
+  execution layer peak RSS 29.0 G; in-memory blocks max 11 (node0 and others, all layers)
+  blocks built here 1179; also directly imported (executed a second time) 1175; for those, the import's exec_ms / root_ms / total_ms median 35 / 74 / 129
+  import-once counters at the last direct import: once_reqs=7 once_served=0 once_served_total=11917 once_imports=1988 once_blocks=1988 once_takeovers=0; start-up lines with import_once=true: 1; queue-lock lines 0
+    per block: imports 1.00, reqs 0.00, served 0.00
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:870500 t+20:870500 t+40:870500 t+60:872000 t+80:871500 t+100:871250
+  flood: median per 5 s 1074673/s, final 192000000 accepted 0 rejected 178.8s
+  timeout / given-up lines: 1; 00:10:55 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop330T64
+  layer-0 leader window-1 builds 228: txs mean 163000, share >= 95% of the tier 100% (max 163000); sealed_at_ms 138.0/212.0; par_ms 133.0/207.0; par_exec_ms 25.5/43.0; roots_ms 42.0/138.0; parent_fields_ms 27.5/142.0; sealed_ms 44.5/152.0
+  proposal cycle window 1 (n=237): mean 130.8 median 125.0 p90 194.8 ms; blocks in the 30 s: 237
+  binding wait (tick / quorum / seal, share and mean cycle): tick 41.0% (100.6); quorum 0%; seal 59.0% (153.7)
+  vote delay after the proposal, slowest key per block: median 19.2 p90 29.8 ms (slowest minus the median key: median 0.3); last key: {1: 33, 2: 34, 3: 38, 4: 48, 5: 40, 6: 32} of 225 blocks
+  CPU in window 1 (cores busy): execution layers 26.2 over 1 process(es); validators 0.6 over 7 process(es)
+  execution layer peak RSS 29.5 G; in-memory blocks max 12 (node0 and others, all layers)
+  blocks built here 1178; also directly imported (executed a second time) 1174; for those, the import's exec_ms / root_ms / total_ms median 29 / 82 / 126
+  import-once counters at the last direct import: once_reqs=7 once_served=0 once_served_total=12571 once_imports=2097 once_blocks=2097 once_takeovers=0; start-up lines with import_once=true: 1; queue-lock lines 0
+    per block: imports 1.00, reqs 0.00, served 0.00
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:869000 t+20:871000 t+40:872000 t+60:871500 t+80:871000 t+100:870500
+  flood: median per 5 s 1135372/s, final 192000000 accepted 0 rejected 167.9s
+  timeout / given-up lines: 1; 00:16:01 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop330T64R64
+  layer-0 leader window-1 builds 228: txs mean 163000, share >= 95% of the tier 100% (max 163000); sealed_at_ms 133.0/184.0; par_ms 128.5/182.0; par_exec_ms 26.5/44.0; roots_ms 35.5/133.0; parent_fields_ms 0.0/130.0; sealed_ms 12.0/138.0
+  proposal cycle window 1 (n=239): mean 130.2 median 125.8 p90 179.2 ms; blocks in the 30 s: 239
+  binding wait (tick / quorum / seal, share and mean cycle): tick 38.4% (100.7); quorum 0%; seal 61.6% (150.0)
+  vote delay after the proposal, slowest key per block: median 18.3 p90 27.9 ms (slowest minus the median key: median 0.3); last key: {1: 25, 2: 42, 3: 43, 4: 39, 5: 37, 6: 41} of 227 blocks
+  CPU in window 1 (cores busy): execution layers 30.9 over 1 process(es); validators 0.6 over 7 process(es)
+  execution layer peak RSS 30.0 G; in-memory blocks max 12 (node0 and others, all layers)
+  blocks built here 1178; also directly imported (executed a second time) 1176; for those, the import's exec_ms / root_ms / total_ms median 30 / 83 / 130
+  import-once counters at the last direct import: once_reqs=7 once_served=0 once_served_total=12631 once_imports=2107 once_blocks=2107 once_takeovers=0; start-up lines with import_once=true: 1; queue-lock lines 0
+    per block: imports 1.00, reqs 0.00, served 0.00
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:871000 t+20:871500 t+40:869500 t+60:871000 t+80:871000 t+100:870500
+  flood: median per 5 s 1139372/s, final 192000000 accepted 0 rejected 166.8s
+  timeout / given-up lines: 1; 00:21:08 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop330T96
+  layer-0 leader window-1 builds 235: txs mean 163000, share >= 95% of the tier 100% (max 163000); sealed_at_ms 137.0/177.0; par_ms 132.0/173.0; par_exec_ms 24.0/44.0; roots_ms 35.0/93.0; parent_fields_ms 0.0/113.0; sealed_ms 13.0/123.0
+  proposal cycle window 1 (n=245): mean 127.2 median 122.3 p90 166.7 ms; blocks in the 30 s: 245
+  binding wait (tick / quorum / seal, share and mean cycle): tick 44.3% (100.9); quorum 0.4% (119.2); seal 55.3% (149.7)
+  vote delay after the proposal, slowest key per block: median 18.8 p90 29.4 ms (slowest minus the median key: median 0.2); last key: {1: 35, 2: 42, 3: 33, 4: 49, 5: 29, 6: 43} of 231 blocks
+  CPU in window 1 (cores busy): execution layers 36.2 over 1 process(es); validators 0.6 over 7 process(es)
+  execution layer peak RSS 30.2 G; in-memory blocks max 12 (node0 and others, all layers)
+  blocks built here 1178; also directly imported (executed a second time) 1173; for those, the import's exec_ms / root_ms / total_ms median 29 / 83 / 127
+  import-once counters at the last direct import: once_reqs=7 once_served=0 once_served_total=12811 once_imports=2137 once_blocks=2137 once_takeovers=0; start-up lines with import_once=true: 1; queue-lock lines 0
+    per block: imports 1.00, reqs 0.00, served 0.00
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:869750 t+20:870500 t+40:870500 t+60:870000 t+80:871250 t+100:872000
+  flood: median per 5 s 1172470/s, final 192000000 accepted 0 rejected 164.1s
+  timeout / given-up lines: 1; 00:26:13 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop330BG
+  layer-0 leader window-1 builds 187: txs mean 200000, share >= 95% of the tier 100% (max 200000); sealed_at_ms 162.0/265.0; par_ms 158.0/261.0; par_exec_ms 31.0/52.0; roots_ms 88.0/163.0; parent_fields_ms 0.0/192.0; sealed_ms 13.0/202.0
+  proposal cycle window 1 (n=197): mean 157.8 median 153.8 p90 266.0 ms; blocks in the 30 s: 197
+  binding wait (tick / quorum / seal, share and mean cycle): tick 34.2% (101.2); quorum 0%; seal 65.8% (191.2)
+  vote delay after the proposal, slowest key per block: median 23.0 p90 33.0 ms (slowest minus the median key: median 0.7); last key: {1: 20, 2: 34, 3: 36, 4: 31, 5: 34, 6: 32} of 187 blocks
+  CPU in window 1 (cores busy): execution layers 31.6 over 1 process(es); validators 0.5 over 7 process(es)
+  execution layer peak RSS 31.1 G; in-memory blocks max 12 (node0 and others, all layers)
+  blocks built here 959; also directly imported (executed a second time) 955; for those, the import's exec_ms / root_ms / total_ms median 35 / 96 / 151
+  import-once counters at the last direct import: once_reqs=7 once_served=0 once_served_total=11407 once_imports=1903 once_blocks=1903 once_takeovers=0; start-up lines with import_once=true: 1; queue-lock lines 0
+    per block: imports 1.00, reqs 0.00, served 0.00
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:867500 t+20:871000 t+40:871000 t+60:871750 t+80:871250 t+100:871250
+  flood: median per 5 s 1163923/s, final 192000000 accepted 0 rejected 163.1s
+  timeout / given-up lines: 1; 00:31:19 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+== loop330BR
+  layer-0 leader window-1 builds 236: txs mean 163000, share >= 95% of the tier 100% (max 163000); sealed_at_ms 130.5/176.0; par_ms 126.5/170.0; par_exec_ms 23.0/49.0; roots_ms 33.0/93.0; parent_fields_ms 0.0/116.0; sealed_ms 14.5/126.0
+  proposal cycle window 1 (n=245): mean 126.6 median 119.8 p90 164.8 ms; blocks in the 30 s: 245
+  binding wait (tick / quorum / seal, share and mean cycle): tick 46.4% (100.9); quorum 0%; seal 53.6% (150.6)
+  vote delay after the proposal, slowest key per block: median 19.4 p90 30.2 ms (slowest minus the median key: median 0.3); last key: {1: 36, 2: 32, 3: 42, 4: 51, 5: 37, 6: 36} of 234 blocks
+  CPU in window 1 (cores busy): execution layers 35.3 over 1 process(es); validators 0.6 over 7 process(es)
+  execution layer peak RSS 30.1 G; in-memory blocks max 12 (node0 and others, all layers)
+  blocks built here 1178; also directly imported (executed a second time) 1173; for those, the import's exec_ms / root_ms / total_ms median 30 / 83 / 127
+  import-once counters at the last direct import: once_reqs=7 once_served=0 once_served_total=12781 once_imports=2132 once_blocks=2132 once_takeovers=0; start-up lines with import_once=true: 1; queue-lock lines 0
+    per block: imports 1.00, reqs 0.00, served 0.00
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:856500 t+20:870000 t+40:869500 t+60:870500 t+80:871500 t+100:870500
+  flood: median per 5 s 1140671/s, final 192000000 accepted 0 rejected 165.1s
+  timeout / given-up lines: 1; 00:36:22 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed

@@ -1,0 +1,785 @@
+# built beed93504+tree at 08:43 (native 08:27), launcher started at tip 5158351bb; tests incl. -p n42 --lib: 849 passed
+== loop323WARM: window-1 blocks 214, cycle mean/median/p90 138.9/131.0/192.5
+  sealed_at ms median/p90 78.0/127.0 (n=747)
+  follower fields_ready ms median/p90 87.0/140.0 (n=1924, whole leg)
+  answer (window 1, n=214, elided 0): encode 33.4/46.8  write 19.0/51.7  read 20.0/53.1 (n=214)  decode 13.4/20.8  answer_MB 31.3/31.3  [median/p90 ms]
+  modes: seal 143 (67%) mean 119.4  send 71 (33%) mean 178.0
+== loop323A: window-1 blocks 262, cycle mean/median/p90 104.5/101.6/111.9
+  sealed_at ms median/p90 69.0/148.0 (n=491)
+  follower fields_ready ms median/p90 81.0/160.0 (n=1387, whole leg)
+  answer (window 1, n=262, elided 262): encode 2.8/5.7  write 1.2/1.8  read 1.2/1.9 (n=262)  decode 0.5/1.0  answer_MB 5.2/5.2  [median/p90 ms]
+  modes: seal 184 (70%) mean 104.1  send 78 (30%) mean 105.4
+== loop323A16: window-1 blocks 238, cycle mean/median/p90 115.4/109.8/141.5
+  sealed_at ms median/p90 98.0/159.0 (n=750)
+  follower fields_ready ms median/p90 80.0/116.0 (n=1926, whole leg)
+  answer (window 1, n=238, elided 238): encode 4.7/8.3  write 1.7/6.6  read 1.8/6.5 (n=238)  decode 0.8/1.7  answer_MB 5.2/5.2  [median/p90 ms]
+  modes: seal 198 (83%) mean 116.4  send 40 (17%) mean 110.3
+== loop323A20: window-1 blocks 240, cycle mean/median/p90 114.5/109.7/140.7
+  sealed_at ms median/p90 96.0/158.0 (n=749)
+  follower fields_ready ms median/p90 81.0/125.0 (n=1925, whole leg)
+  answer (window 1, n=240, elided 240): encode 4.8/8.5  write 1.7/4.5  read 1.7/4.4 (n=240)  decode 0.7/1.8  answer_MB 5.2/5.2  [median/p90 ms]
+  modes: seal 199 (83%) mean 115.1  send 41 (17%) mean 111.3
+== loop323A20P90: window-1 blocks 238, cycle mean/median/p90 116.1/113.4/141.0
+  sealed_at ms median/p90 96.0/150.0 (n=721)
+  follower fields_ready ms median/p90 79.0/118.0 (n=1897, whole leg)
+  answer (window 1, n=238, elided 238): encode 4.1/7.2  write 1.5/4.5  read 1.6/4.5 (n=238)  decode 0.7/1.4  answer_MB 5.2/5.2  [median/p90 ms]
+  modes: seal 182 (76%) mean 115.0  send 56 (24%) mean 119.5
+== loop323A20P80: window-1 blocks 236, cycle mean/median/p90 116.4/113.7/142.8
+  sealed_at ms median/p90 97.0/148.0 (n=684)
+  follower fields_ready ms median/p90 79.0/111.0 (n=1860, whole leg)
+  answer (window 1, n=236, elided 236): encode 4.4/8.4  write 1.6/4.4  read 1.7/4.6 (n=236)  decode 0.7/1.8  answer_MB 5.2/5.2  [median/p90 ms]
+  modes: seal 182 (77%) mean 116.8  send 54 (23%) mean 114.7
+== loop323Ab: window-1 blocks 264, cycle mean/median/p90 103.8/101.6/111.4
+  sealed_at ms median/p90 65.0/119.0 (n=418)
+  follower fields_ready ms median/p90 78.0/159.0 (n=1252, whole leg)
+  answer (window 1, n=264, elided 264): encode 3.9/6.1  write 1.1/2.2  read 1.2/2.3 (n=264)  decode 0.5/1.1  answer_MB 5.1/5.2  [median/p90 ms]
+  modes: seal 191 (72%) mean 104.1  send 73 (28%) mean 103.1
+== loop323WARM
+  flood: per-5s rate median 951270/s, max 1307180/s, rejected 0, worker-seconds waiting at the gate 12152s (64 workers, 195s of flood), final: -
+  window-1 leader builds 216: txs mean 163000, share >= 95% of 163000: 100%
+  overlay_filter_builds per leader block: mean 1.76 (total 1310 over 746 blocks), overlay_filter_cached last 70
+  node-0 queue (queued after canonical prune), median per 10 s: t+0:644500 t+20:663250 t+40:584500 t+60:662000 t+80:575000 t+100:667000 t+120:860000 t+140:860000 t+160:858750 t+180:861500
+  handover/timeout lines (TC formed / Too deep reorg / build refused): 5; first ten:
+    2026-10-04T12:45:45.272434 node0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed, I am the new leader for view 2 view=1
+    2026-10-04T12:47:49.622925 node0 INFO n42.h2.el: commit forkchoice block=0xbde590b9afdfb5c242af881e90ebc8f9b7b073673711a3457720b0e731762842 elapsed_ms=203 ahead_of_import=false outcome=error: execution l
+    2026-10-04T12:47:49.623162 node0 WARN n42.h2.el: forkchoice to a committed block failed block=0xbde590b9afdfb5c242af881e90ebc8f9b7b073673711a3457720b0e731762842 error=execution layer: Too deep reorg (cod
+    2026-10-04T12:48:50.402641 node1 INFO n42.h2.el: commit forkchoice block=0x9f2f8d3d9023b78c3d907d82e4ccf762df36bc2e223a5b7b1aa61f713691fec0 elapsed_ms=201 ahead_of_import=false outcome=error: execution l
+    2026-10-04T12:48:50.402655 node1 WARN n42.h2.el: forkchoice to a committed block failed block=0x9f2f8d3d9023b78c3d907d82e4ccf762df36bc2e223a5b7b1aa61f713691fec0 error=execution layer: Too deep reorg (cod
+== loop323A
+  flood: per-5s rate median 1183342/s, max 1465380/s, rejected 0, worker-seconds waiting at the gate 6393s (64 workers, 165s of flood), final 192000000 accepted 0 rejected in 166.0s = 1156476/s
+  window-1 leader builds 289: txs mean 133981, share >= 95% of 163000: 54%
+  overlay_filter_builds per leader block: mean 1.80 (total 1348 over 749 blocks), overlay_filter_cached last 14
+  node-0 queue (queued after canonical prune), median per 10 s: t+0:240500 t+20:70000 t+40:72000 t+60:533750 t+80:843750 t+100:857500 t+120:860500 t+140:860500 t+160:847000
+  handover/timeout lines (TC formed / Too deep reorg / build refused): 5; first ten:
+    2026-10-04T12:51:29.526836 node0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed, I am the new leader for view 2 view=1
+    2026-10-04T12:53:15.467073 node0 INFO n42.h2.el: commit forkchoice block=0xf53f00869b7f36963c66aa53fba4595983e99a5a55ee86ee86707dbbefef8d76 elapsed_ms=0 ahead_of_import=false outcome=error: execution lay
+    2026-10-04T12:53:15.467082 node0 WARN n42.h2.el: forkchoice to a committed block failed block=0xf53f00869b7f36963c66aa53fba4595983e99a5a55ee86ee86707dbbefef8d76 error=execution layer: Too deep reorg (cod
+    2026-10-04T12:53:22.071889 node1 INFO n42.h2.el: commit forkchoice block=0x2ecf363765cab3fbb99d61f20c9a445079548bd5ecef43cd22b2c8831ccf7eaa elapsed_ms=4 ahead_of_import=false outcome=error: execution lay
+    2026-10-04T12:53:22.071915 node1 WARN n42.h2.el: forkchoice to a committed block failed block=0x2ecf363765cab3fbb99d61f20c9a445079548bd5ecef43cd22b2c8831ccf7eaa error=execution layer: Too deep reorg (cod
+== loop323A16
+  flood: per-5s rate median 1280266/s, max 1478576/s, rejected 0, worker-seconds waiting at the gate 9391s (64 workers, 150s of flood), final 192000000 accepted 0 rejected in 150.2s = 1278491/s
+  window-1 leader builds 261: txs mean 163000, share >= 95% of 163000: 100%
+  overlay_filter_builds per leader block: mean 1.96 (total 1468 over 749 blocks), overlay_filter_cached last 15
+  node-0 queue (queued after canonical prune), median per 10 s: t+0:409750 t+20:391500 t+40:535000 t+60:534500 t+80:574000 t+100:858500 t+120:859500 t+140:856500
+  handover/timeout lines (TC formed / Too deep reorg / build refused): 1; first ten:
+    2026-10-04T12:56:43.661303 node0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed, I am the new leader for view 2 view=1
+== loop323A20
+  flood: per-5s rate median 1300562/s, max 1510680/s, rejected 0, worker-seconds waiting at the gate 9432s (64 workers, 150s of flood), final 192000000 accepted 0 rejected in 152.1s = 1262072/s
+  window-1 leader builds 262: txs mean 162912, share >= 95% of 163000: 100%
+  overlay_filter_builds per leader block: mean 1.94 (total 1453 over 749 blocks), overlay_filter_cached last 16
+  node-0 queue (queued after canonical prune), median per 10 s: t+0:413500 t+20:410500 t+40:503250 t+60:551000 t+80:570000 t+100:868500 t+120:861250 t+140:855000
+  handover/timeout lines (TC formed / Too deep reorg / build refused): 5; first ten:
+    2026-10-04T13:01:50.217799 node0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed, I am the new leader for view 2 view=1
+    2026-10-04T13:03:48.245216 node1 INFO n42.h2.el: commit forkchoice block=0x3d106c40d8228fef89fc0806f13f298b8ca41c4b26399214fbaeaccdf9770ef9 elapsed_ms=0 ahead_of_import=false outcome=error: execution lay
+    2026-10-04T13:03:48.245225 node1 WARN n42.h2.el: forkchoice to a committed block failed block=0x3d106c40d8228fef89fc0806f13f298b8ca41c4b26399214fbaeaccdf9770ef9 error=execution layer: Too deep reorg (cod
+    2026-10-04T13:04:45.049835 node1 INFO n42.h2.el: commit forkchoice block=0x1677780ca654e2f120aca5cff621e9c69345882a12a07688fc44e3b727db4708 elapsed_ms=27 ahead_of_import=false outcome=error: execution la
+    2026-10-04T13:04:45.049863 node1 WARN n42.h2.el: forkchoice to a committed block failed block=0x1677780ca654e2f120aca5cff621e9c69345882a12a07688fc44e3b727db4708 error=execution layer: Too deep reorg (cod
+== loop323A20P90
+  flood: per-5s rate median 1308868/s, max 1498674/s, rejected 0, worker-seconds waiting at the gate 9424s (64 workers, 150s of flood), final 192000000 accepted 0 rejected in 151.7s = 1265831/s
+  window-1 leader builds 259: txs mean 162751, share >= 95% of 163000: 100%
+  overlay_filter_builds per leader block: mean 1.95 (total 1405 over 721 blocks), overlay_filter_cached last 17
+  node-0 queue (queued after canonical prune), median per 10 s: t+0:409000 t+20:408500 t+40:408250 t+60:583500 t+80:645500 t+100:866000 t+120:861500 t+140:853500
+  handover/timeout lines (TC formed / Too deep reorg / build refused): 9; first ten:
+    2026-10-04T13:06:55.545752 node0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed, I am the new leader for view 2 view=1
+    2026-10-04T13:08:26.323002 node0 INFO n42.h2.el: commit forkchoice block=0xe7c670c332fb662a1c5880a8b78f2e13ea618fc840e96564921dcff2844331fc elapsed_ms=27 ahead_of_import=false outcome=error: execution la
+    2026-10-04T13:08:26.323029 node0 WARN n42.h2.el: forkchoice to a committed block failed block=0xe7c670c332fb662a1c5880a8b78f2e13ea618fc840e96564921dcff2844331fc error=execution layer: Too deep reorg (cod
+    2026-10-04T13:08:44.714836 node0 INFO n42.h2.el: commit forkchoice block=0xe0ab16f407c591be813abbe1832796365a74a1297cec02bb203554264d4e4a84 elapsed_ms=45 ahead_of_import=false outcome=error: execution la
+    2026-10-04T13:08:44.714871 node0 WARN n42.h2.el: forkchoice to a committed block failed block=0xe0ab16f407c591be813abbe1832796365a74a1297cec02bb203554264d4e4a84 error=execution layer: Too deep reorg (cod
+    2026-10-04T13:08:50.435512 node1 INFO n42.h2.el: commit forkchoice block=0x944fd5357bde17e5732ada5fc5469de0eee752a3843678725778494f1b601a95 elapsed_ms=21 ahead_of_import=false outcome=error: execution la
+    2026-10-04T13:08:50.435523 node1 WARN n42.h2.el: forkchoice to a committed block failed block=0x944fd5357bde17e5732ada5fc5469de0eee752a3843678725778494f1b601a95 error=execution layer: Too deep reorg (cod
+    2026-10-04T13:09:27.705554 node1 INFO n42.h2.el: commit forkchoice block=0xaee5281f3a29ccb0d81f4267e1efcf904861b522fbfed7a5f528c6688740be14 elapsed_ms=0 ahead_of_import=false outcome=error: execution lay
+    2026-10-04T13:09:27.705558 node1 WARN n42.h2.el: forkchoice to a committed block failed block=0xaee5281f3a29ccb0d81f4267e1efcf904861b522fbfed7a5f528c6688740be14 error=execution layer: Too deep reorg (cod
+== loop323A20P80
+  flood: per-5s rate median 1272164/s, max 1492281/s, rejected 0, worker-seconds waiting at the gate 9428s (64 workers, 150s of flood), final 192000000 accepted 0 rejected in 151.3s = 1269044/s
+  window-1 leader builds 259: txs mean 163000, share >= 95% of 163000: 100%
+  overlay_filter_builds per leader block: mean 1.94 (total 1326 over 683 blocks), overlay_filter_cached last 16
+  node-0 queue (queued after canonical prune), median per 10 s: t+0:413500 t+20:361000 t+40:537500 t+60:597000 t+80:858500 t+100:863000 t+120:859250 t+140:858750
+  handover/timeout lines (TC formed / Too deep reorg / build refused): 7; first ten:
+    2026-10-04T13:12:02.609415 node0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed, I am the new leader for view 2 view=1
+    2026-10-04T13:13:06.274884 node0 INFO n42.h2.el: commit forkchoice block=0x81acf44d9eb81d77db6534584eb35060636a7a0a6e0b2a9bcc37fba50f1fce8c elapsed_ms=144 ahead_of_import=false outcome=error: execution l
+    2026-10-04T13:13:06.274901 node0 WARN n42.h2.el: forkchoice to a committed block failed block=0x81acf44d9eb81d77db6534584eb35060636a7a0a6e0b2a9bcc37fba50f1fce8c error=execution layer: Too deep reorg (cod
+    2026-10-04T13:13:22.611623 node0 INFO n42.h2.el: commit forkchoice block=0x57f13933f0891dacc6e5cdaab4a3cbc9c2cc137b48b4921b07b2c6732f195322 elapsed_ms=69 ahead_of_import=false outcome=error: execution la
+    2026-10-04T13:13:22.611635 node0 WARN n42.h2.el: forkchoice to a committed block failed block=0x57f13933f0891dacc6e5cdaab4a3cbc9c2cc137b48b4921b07b2c6732f195322 error=execution layer: Too deep reorg (cod
+    2026-10-04T13:14:47.747646 node1 INFO n42.h2.el: commit forkchoice block=0xa50b8d4172fbd2064b7b1b40951b20a2bd042ed778d192223bfa9cd7e5e90476 elapsed_ms=3 ahead_of_import=false outcome=error: execution lay
+    2026-10-04T13:14:47.747656 node1 WARN n42.h2.el: forkchoice to a committed block failed block=0xa50b8d4172fbd2064b7b1b40951b20a2bd042ed778d192223bfa9cd7e5e90476 error=execution layer: Too deep reorg (cod
+== loop323Ab
+  flood: per-5s rate median 1249966/s, max 1467883/s, rejected 0, worker-seconds waiting at the gate 5663s (64 workers, 165s of flood), final 192000000 accepted 0 rejected in 168.1s = 1142015/s
+  window-1 leader builds 290: txs mean 133509, share >= 95% of 163000: 52%
+  overlay_filter_builds per leader block: mean 1.80 (total 1346 over 749 blocks), overlay_filter_cached last 17
+  node-0 queue (queued after canonical prune), median per 10 s: t+0:213000 t+20:63000 t+40:94500 t+60:150250 t+80:839250 t+100:859000 t+120:847000 t+140:856500 t+160:852500
+  handover/timeout lines (TC formed / Too deep reorg / build refused): 3; first ten:
+    2026-10-04T13:17:11.026964 node0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed, I am the new leader for view 2 view=1
+    2026-10-04T13:18:59.171764 node1 WARN n42.h2.el: the build prepared ahead failed; building now err=build on the sealed block refused parent=0x44af5a273e806287bcb7c1b9f164db112cb68de1afe18a17845fe007135eb
+    2026-10-04T13:19:05.098896 node1 INFO process_event{view=1025 kind="message"}: n42::cl::timeout: TC formed, I am the new leader for view 1026 view=1025
+== loop323WARM
+  node0: proposals 1023, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 0, in_mem median/p90/max -1/-1/-1 (unknown 0)
+  node1: proposals 1024, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 0, in_mem median/p90/max -1/-1/-1 (unknown 0)
+  node2: proposals 109, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 0, in_mem median/p90/max -1/-1/-1 (unknown 0)
+== loop323A
+  node0: proposals 1023, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 8/11/13 (unknown 0)
+  node1: proposals 1024, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 8/11/15 (unknown 0)
+  node2: proposals 243, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 7/8/8 (unknown 0)
+== loop323A16
+  node0: proposals 1023, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 9/11/13 (unknown 0)
+  node1: proposals 1024, delayed 1 (0%), delay when applied median/p90 46/46 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 8/10/13 (unknown 0)
+  node2: proposals 282, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 7/8/8 (unknown 0)
+== loop323A20
+  node0: proposals 1023, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 9/11/12 (unknown 0)
+  node1: proposals 1024, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 8/10/14 (unknown 0)
+  node2: proposals 249, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 7/8/8 (unknown 0)
+== loop323A20P90
+  node0: proposals 1023, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 9/11/12 (unknown 0)
+  node1: proposals 1024, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 8/10/12 (unknown 0)
+  node2: proposals 393, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 7/8/8 (unknown 0)
+== loop323A20P80
+  node0: proposals 1023, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 8/10/13 (unknown 0)
+  node1: proposals 1024, delayed 1 (0%), delay when applied median/p90 97/97 ms, total delay 0.1 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 8/10/13 (unknown 0)
+  node2: proposals 566, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 7/8/9 (unknown 0)
+== loop323Ab
+  node0: proposals 1023, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 9/11/14 (unknown 0)
+  node1: proposals 1023, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 8/10/12 (unknown 0)
+  node2: proposals 255, delayed 0 (0%), delay when applied median/p90 0/0 ms, total delay 0.0 s, hard_holds (last) 0, max-hold WARN lines 1, in_mem median/p90/max 7/8/8 (unknown 0)
+== loop323WARM: T0 +0, handover +120s, last full block +195s, samples 127/127/127
+  node0: in-mem blocks +60s 34  handover 64  +150s 61  end 81  max 93  (first >40 at +45s)  peak RSS 34.2 G  backpressure_active samples 0/127  stalls 0 totalling 0.0s
+  node1: in-mem blocks +60s 29  handover 37  +150s 84  end 90  max 90  (first >40 at +83s)  peak RSS 34.1 G  backpressure_active samples 0/127  stalls 0 totalling 0.0s
+  node2: in-mem blocks +60s 26  handover 35  +150s 73  end 87  max 98  (first >40 at +83s)  peak RSS 34.0 G  backpressure_active samples 0/127  stalls 0 totalling 0.0s
+== loop323A: T0 +0, handover +84s, last full block +166s, samples 113/113/113
+  node0: in-mem blocks +60s 8  handover 11  +150s 10  end 9  max 14  (first >40 at -)  peak RSS 26.3 G  backpressure_active samples 0/113  stalls 0 totalling 0.0s
+  node1: in-mem blocks +60s 9  handover 11  +150s 10  end 9  max 15  (first >40 at -)  peak RSS 26.2 G  backpressure_active samples 0/113  stalls 0 totalling 0.0s
+  node2: in-mem blocks +60s 6  handover 9  +150s 9  end 11  max 14  (first >40 at -)  peak RSS 24.1 G  backpressure_active samples 0/113  stalls 0 totalling 0.0s
+== loop323A16: T0 +0, handover +91s, last full block +150s, samples 113/113/113
+  node0: in-mem blocks +60s 9  handover 9  +150s 8  end 8  max 18  (first >40 at -)  peak RSS 23.5 G  backpressure_active samples 0/113  stalls 0 totalling 0.0s
+  node1: in-mem blocks +60s 9  handover 10  +150s 9  end 9  max 12  (first >40 at -)  peak RSS 22.0 G  backpressure_active samples 0/113  stalls 0 totalling 0.0s
+  node2: in-mem blocks +60s 9  handover 8  +150s 10  end 10  max 13  (first >40 at -)  peak RSS 20.4 G  backpressure_active samples 0/113  stalls 0 totalling 0.0s
+== loop323A20: T0 +0, handover +90s, last full block +152s, samples 112/112/112
+  node0: in-mem blocks +60s 9  handover 10  +150s 10  end 11  max 13  (first >40 at -)  peak RSS 21.8 G  backpressure_active samples 0/112  stalls 0 totalling 0.0s
+  node1: in-mem blocks +60s 9  handover 8  +150s 10  end 13  max 13  (first >40 at -)  peak RSS 22.0 G  backpressure_active samples 0/112  stalls 0 totalling 0.0s
+  node2: in-mem blocks +60s 8  handover 8  +150s 12  end 11  max 13  (first >40 at -)  peak RSS 21.3 G  backpressure_active samples 0/112  stalls 0 totalling 0.0s
+== loop323A20P90: T0 +0, handover +87s, last full block +152s, samples 113/113/113
+  node0: in-mem blocks +60s 8  handover 9  +150s 10  end 9  max 16  (first >40 at -)  peak RSS 23.2 G  backpressure_active samples 0/113  stalls 0 totalling 0.0s
+  node1: in-mem blocks +60s 10  handover 8  +150s 11  end 9  max 11  (first >40 at -)  peak RSS 22.4 G  backpressure_active samples 0/113  stalls 0 totalling 0.0s
+  node2: in-mem blocks +60s 10  handover 10  +150s 11  end 11  max 15  (first >40 at -)  peak RSS 20.9 G  backpressure_active samples 0/113  stalls 0 totalling 0.0s
+== loop323A20P80: T0 +0, handover +82s, last full block +151s, samples 113/113/113
+  node0: in-mem blocks +60s 11  handover 8  +150s 11  end 10  max 14  (first >40 at -)  peak RSS 23.3 G  backpressure_active samples 0/113  stalls 0 totalling 0.0s
+  node1: in-mem blocks +60s 8  handover 10  +150s 11  end 8  max 13  (first >40 at -)  peak RSS 22.6 G  backpressure_active samples 0/113  stalls 0 totalling 0.0s
+  node2: in-mem blocks +60s 8  handover 10  +150s 9  end 11  max 13  (first >40 at -)  peak RSS 21.4 G  backpressure_active samples 0/113  stalls 0 totalling 0.0s
+== loop323Ab: T0 +0, handover +80s, last full block +168s, samples 114/114/114
+  node0: in-mem blocks +60s 10  handover 11  +150s 17  end 16  max 17  (first >40 at -)  peak RSS 25.9 G  backpressure_active samples 0/114  stalls 0 totalling 0.0s
+  node1: in-mem blocks +60s 9  handover 9  +150s 11  end 11  max 11  (first >40 at -)  peak RSS 25.0 G  backpressure_active samples 0/112  stalls 0 totalling 0.0s
+  node2: in-mem blocks +60s 9  handover 9  +150s 10  end 10  max 13  (first >40 at -)  peak RSS 22.0 G  backpressure_active samples 0/114  stalls 0 totalling 0.0s
+== loop323WARM
+  node0: batches 319, blocks persisted 1999, of them full 1187 (6.3 blocks/batch, 3.7 full/batch)
+    eng.save_blocks_duration_seconds                     sum   207.40s count   319     650.2 ms/call     650.2 ms/batch   174.73 ms/full block
+    db.save_blocks_total                                 sum   163.62s count   319     512.9 ms/call     512.9 ms/batch   137.84 ms/full block
+    db.save_blocks_scope                                 sum   143.47s count   319     449.8 ms/call     449.8 ms/batch   120.87 ms/full block
+    db.save_blocks_rocksdb                               sum   142.77s count   319     447.5 ms/call     447.5 ms/batch   120.27 ms/full block
+    db.save_blocks_sf                                    sum    82.85s count   319     259.7 ms/call     259.7 ms/batch    69.79 ms/full block
+    db.save_blocks_sf_transactions                       sum    59.56s count   319     186.7 ms/call     186.7 ms/batch    50.18 ms/full block
+    db.save_blocks_account_history_reads                 sum    54.83s count   319     171.9 ms/call     171.9 ms/batch    46.19 ms/full block
+    db.save_blocks_account_history_map                   sum    52.64s count   319     165.0 ms/call     165.0 ms/batch    44.34 ms/full block
+    db.save_blocks_account_history_batch                 sum    35.26s count   319     110.5 ms/call     110.5 ms/batch    29.70 ms/full block
+    db.save_blocks_commit_rocksdb                        sum    29.63s count   508      58.3 ms/call      92.9 ms/batch    24.96 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    21.53s count   319      67.5 ms/call      67.5 ms/batch    18.14 ms/full block
+    db.save_blocks_sf_receipts                           sum    21.50s count   319      67.4 ms/call      67.4 ms/batch    18.12 ms/full block
+    db.save_blocks_post_scope                            sum    17.85s count   319      56.0 ms/call      56.0 ms/batch    15.04 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    17.85s count   319      56.0 ms/call      56.0 ms/batch    15.04 ms/full block
+    db.save_blocks_commit_sf                             sum    11.85s count   508      23.3 ms/call      37.2 ms/batch     9.99 ms/full block
+    db.save_blocks_sf_senders                            sum    11.81s count   319      37.0 ms/call      37.0 ms/batch     9.95 ms/full block
+    db.save_blocks_pre_scope                             sum     2.29s count   319       7.2 ms/call       7.2 ms/batch     1.93 ms/full block
+    db.save_blocks_plain_reverts                         sum     2.29s count   319       7.2 ms/call       7.2 ms/batch     1.93 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     1.07s count   319       3.4 ms/call       3.4 ms/batch     0.90 ms/full block
+    db.save_blocks_sf_headers                            sum     0.74s count   319       2.3 ms/call       2.3 ms/batch     0.62 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.61s count   508       1.2 ms/call       1.9 ms/batch     0.51 ms/full block
+    db.save_blocks_mdbx                                  sum     0.08s count   319       0.3 ms/call       0.3 ms/batch     0.07 ms/full block
+    db.save_blocks_insert_block                          sum     0.06s count   319       0.2 ms/call       0.2 ms/batch     0.05 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.01s count   319       0.0 ms/call       0.0 ms/batch     0.01 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   319       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   319       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   319       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   319       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+  node1: batches 330, blocks persisted 1998, of them full 1187 (6.1 blocks/batch, 3.6 full/batch)
+    eng.save_blocks_duration_seconds                     sum   202.27s count   330     612.9 ms/call     612.9 ms/batch   170.41 ms/full block
+    db.save_blocks_total                                 sum   164.28s count   330     497.8 ms/call     497.8 ms/batch   138.40 ms/full block
+    db.save_blocks_scope                                 sum   142.00s count   330     430.3 ms/call     430.3 ms/batch   119.63 ms/full block
+    db.save_blocks_rocksdb                               sum   141.28s count   330     428.1 ms/call     428.1 ms/batch   119.02 ms/full block
+    db.save_blocks_sf                                    sum    93.71s count   330     284.0 ms/call     284.0 ms/batch    78.94 ms/full block
+    db.save_blocks_sf_transactions                       sum    63.33s count   330     191.9 ms/call     191.9 ms/batch    53.35 ms/full block
+    db.save_blocks_account_history_reads                 sum    53.40s count   330     161.8 ms/call     161.8 ms/batch    44.99 ms/full block
+    db.save_blocks_account_history_map                   sum    50.79s count   330     153.9 ms/call     153.9 ms/batch    42.78 ms/full block
+    db.save_blocks_account_history_batch                 sum    37.06s count   330     112.3 ms/call     112.3 ms/batch    31.22 ms/full block
+    db.save_blocks_commit_rocksdb                        sum    33.20s count   528      62.9 ms/call     100.6 ms/batch    27.97 ms/full block
+    db.save_blocks_sf_receipts                           sum    22.07s count   330      66.9 ms/call      66.9 ms/batch    18.60 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    20.80s count   330      63.0 ms/call      63.0 ms/batch    17.52 ms/full block
+    db.save_blocks_post_scope                            sum    20.14s count   330      61.0 ms/call      61.0 ms/batch    16.96 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    20.14s count   330      61.0 ms/call      61.0 ms/batch    16.96 ms/full block
+    db.save_blocks_sf_senders                            sum    11.50s count   330      34.8 ms/call      34.8 ms/batch     9.69 ms/full block
+    db.save_blocks_commit_sf                             sum     2.38s count   528       4.5 ms/call       7.2 ms/batch     2.01 ms/full block
+    db.save_blocks_pre_scope                             sum     2.15s count   330       6.5 ms/call       6.5 ms/batch     1.81 ms/full block
+    db.save_blocks_plain_reverts                         sum     2.15s count   330       6.5 ms/call       6.5 ms/batch     1.81 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     1.13s count   330       3.4 ms/call       3.4 ms/batch     0.95 ms/full block
+    db.save_blocks_sf_headers                            sum     0.82s count   330       2.5 ms/call       2.5 ms/batch     0.69 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.67s count   528       1.3 ms/call       2.0 ms/batch     0.56 ms/full block
+    db.save_blocks_mdbx                                  sum     0.06s count   330       0.2 ms/call       0.2 ms/batch     0.05 ms/full block
+    db.save_blocks_insert_block                          sum     0.04s count   330       0.1 ms/call       0.1 ms/batch     0.04 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.02s count   330       0.0 ms/call       0.0 ms/batch     0.01 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   330       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   330       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   330       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   330       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+  node2: batches 336, blocks persisted 1999, of them full 1187 (5.9 blocks/batch, 3.5 full/batch)
+    eng.save_blocks_duration_seconds                     sum   202.56s count   336     602.9 ms/call     602.9 ms/batch   170.65 ms/full block
+    db.save_blocks_total                                 sum   164.39s count   336     489.3 ms/call     489.3 ms/batch   138.49 ms/full block
+    db.save_blocks_scope                                 sum   141.17s count   336     420.1 ms/call     420.1 ms/batch   118.93 ms/full block
+    db.save_blocks_rocksdb                               sum   140.37s count   336     417.8 ms/call     417.8 ms/batch   118.25 ms/full block
+    db.save_blocks_sf                                    sum    91.31s count   336     271.8 ms/call     271.8 ms/batch    76.93 ms/full block
+    db.save_blocks_sf_transactions                       sum    61.82s count   336     184.0 ms/call     184.0 ms/batch    52.08 ms/full block
+    db.save_blocks_account_history_reads                 sum    53.02s count   336     157.8 ms/call     157.8 ms/batch    44.67 ms/full block
+    db.save_blocks_account_history_map                   sum    48.30s count   336     143.8 ms/call     143.8 ms/batch    40.69 ms/full block
+    db.save_blocks_account_history_batch                 sum    38.99s count   336     116.1 ms/call     116.1 ms/batch    32.85 ms/full block
+    db.save_blocks_commit_rocksdb                        sum    33.28s count   541      61.5 ms/call      99.0 ms/batch    28.03 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    21.43s count   336      63.8 ms/call      63.8 ms/batch    18.05 ms/full block
+    db.save_blocks_post_scope                            sum    20.83s count   336      62.0 ms/call      62.0 ms/batch    17.55 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    20.83s count   336      62.0 ms/call      62.0 ms/batch    17.55 ms/full block
+    db.save_blocks_sf_receipts                           sum    20.82s count   336      62.0 ms/call      62.0 ms/batch    17.54 ms/full block
+    db.save_blocks_sf_senders                            sum    12.07s count   336      35.9 ms/call      35.9 ms/batch    10.17 ms/full block
+    db.save_blocks_commit_sf                             sum     2.64s count   541       4.9 ms/call       7.8 ms/batch     2.22 ms/full block
+    db.save_blocks_pre_scope                             sum     2.39s count   336       7.1 ms/call       7.1 ms/batch     2.01 ms/full block
+    db.save_blocks_plain_reverts                         sum     2.39s count   336       7.1 ms/call       7.1 ms/batch     2.01 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     1.06s count   336       3.1 ms/call       3.1 ms/batch     0.89 ms/full block
+    db.save_blocks_sf_headers                            sum     0.76s count   336       2.3 ms/call       2.3 ms/batch     0.64 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.50s count   541       0.9 ms/call       1.5 ms/batch     0.42 ms/full block
+    db.save_blocks_mdbx                                  sum     0.07s count   336       0.2 ms/call       0.2 ms/batch     0.06 ms/full block
+    db.save_blocks_insert_block                          sum     0.05s count   336       0.1 ms/call       0.1 ms/batch     0.04 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.02s count   336       0.1 ms/call       0.1 ms/batch     0.02 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   336       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   336       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   336       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   336       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+== loop323A
+  node0: batches 690, blocks persisted 2133, of them full 1296 (3.1 blocks/batch, 1.9 full/batch)
+    eng.save_blocks_duration_seconds                     sum   141.39s count   690     204.9 ms/call     204.9 ms/batch   109.09 ms/full block
+    db.save_blocks_total                                 sum   105.58s count   690     153.0 ms/call     153.0 ms/batch    81.47 ms/full block
+    db.save_blocks_scope                                 sum    61.38s count   690      89.0 ms/call      89.0 ms/batch    47.36 ms/full block
+    db.save_blocks_sf                                    sum    61.34s count   690      88.9 ms/call      88.9 ms/batch    47.33 ms/full block
+    db.save_blocks_sf_transactions                       sum    60.44s count   690      87.6 ms/call      87.6 ms/batch    46.63 ms/full block
+    db.save_blocks_post_scope                            sum    40.04s count   690      58.0 ms/call      58.0 ms/batch    30.89 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    40.04s count   690      58.0 ms/call      58.0 ms/batch    30.89 ms/full block
+    db.save_blocks_commit_sf                             sum    33.12s count  1038      31.9 ms/call      48.0 ms/batch    25.55 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    22.73s count   690      32.9 ms/call      32.9 ms/batch    17.54 ms/full block
+    db.save_blocks_sf_receipts                           sum    21.43s count   690      31.1 ms/call      31.1 ms/batch    16.53 ms/full block
+    db.save_blocks_sf_senders                            sum    12.81s count   690      18.6 ms/call      18.6 ms/batch     9.89 ms/full block
+    db.save_blocks_pre_scope                             sum     4.16s count   690       6.0 ms/call       6.0 ms/batch     3.21 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.14s count   690       6.0 ms/call       6.0 ms/batch     3.20 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     2.42s count   690       3.5 ms/call       3.5 ms/batch     1.86 ms/full block
+    db.save_blocks_sf_headers                            sum     1.99s count   690       2.9 ms/call       2.9 ms/batch     1.53 ms/full block
+    db.save_blocks_rocksdb                               sum     0.54s count   690       0.8 ms/call       0.8 ms/batch     0.41 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.29s count  1038       0.3 ms/call       0.4 ms/batch     0.22 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.25s count  1038       0.2 ms/call       0.4 ms/batch     0.19 ms/full block
+    db.save_blocks_mdbx                                  sum     0.18s count   690       0.3 ms/call       0.3 ms/batch     0.14 ms/full block
+    db.save_blocks_insert_block                          sum     0.15s count   690       0.2 ms/call       0.2 ms/batch     0.11 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.03s count   690       0.0 ms/call       0.0 ms/batch     0.02 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   690       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   690       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   690       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   690       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+  node1: batches 708, blocks persisted 2132, of them full 1296 (3.0 blocks/batch, 1.8 full/batch)
+    eng.save_blocks_duration_seconds                     sum   108.99s count   708     153.9 ms/call     153.9 ms/batch    84.10 ms/full block
+    db.save_blocks_total                                 sum   102.18s count   708     144.3 ms/call     144.3 ms/batch    78.84 ms/full block
+    db.save_blocks_scope                                 sum    60.86s count   708      86.0 ms/call      86.0 ms/batch    46.96 ms/full block
+    db.save_blocks_sf                                    sum    60.83s count   708      85.9 ms/call      85.9 ms/batch    46.93 ms/full block
+    db.save_blocks_sf_transactions                       sum    60.02s count   708      84.8 ms/call      84.8 ms/batch    46.31 ms/full block
+    db.save_blocks_post_scope                            sum    36.57s count   708      51.6 ms/call      51.6 ms/batch    28.21 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    36.56s count   708      51.6 ms/call      51.6 ms/batch    28.21 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    22.93s count   708      32.4 ms/call      32.4 ms/batch    17.69 ms/full block
+    db.save_blocks_sf_receipts                           sum    21.33s count   708      30.1 ms/call      30.1 ms/batch    16.46 ms/full block
+    db.save_blocks_sf_senders                            sum    12.29s count   708      17.4 ms/call      17.4 ms/batch     9.48 ms/full block
+    db.save_blocks_pre_scope                             sum     4.75s count   708       6.7 ms/call       6.7 ms/batch     3.67 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.73s count   708       6.7 ms/call       6.7 ms/batch     3.65 ms/full block
+    db.save_blocks_commit_sf                             sum     4.10s count  1063       3.9 ms/call       5.8 ms/batch     3.17 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     2.35s count   708       3.3 ms/call       3.3 ms/batch     1.81 ms/full block
+    db.save_blocks_sf_headers                            sum     1.83s count   708       2.6 ms/call       2.6 ms/batch     1.41 ms/full block
+    db.save_blocks_rocksdb                               sum     0.45s count   708       0.6 ms/call       0.6 ms/batch     0.35 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.27s count  1063       0.2 ms/call       0.4 ms/batch     0.20 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.25s count  1063       0.2 ms/call       0.3 ms/batch     0.19 ms/full block
+    db.save_blocks_mdbx                                  sum     0.20s count   708       0.3 ms/call       0.3 ms/batch     0.15 ms/full block
+    db.save_blocks_insert_block                          sum     0.15s count   708       0.2 ms/call       0.2 ms/batch     0.12 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.03s count   708       0.0 ms/call       0.0 ms/batch     0.03 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   708       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   708       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   708       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   708       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+  node2: batches 702, blocks persisted 2133, of them full 1296 (3.0 blocks/batch, 1.8 full/batch)
+    eng.save_blocks_duration_seconds                     sum   106.66s count   702     151.9 ms/call     151.9 ms/batch    82.30 ms/full block
+    db.save_blocks_total                                 sum   100.15s count   702     142.7 ms/call     142.7 ms/batch    77.28 ms/full block
+    db.save_blocks_scope                                 sum    59.90s count   702      85.3 ms/call      85.3 ms/batch    46.22 ms/full block
+    db.save_blocks_sf                                    sum    59.86s count   702      85.3 ms/call      85.3 ms/batch    46.19 ms/full block
+    db.save_blocks_sf_transactions                       sum    58.94s count   702      84.0 ms/call      84.0 ms/batch    45.48 ms/full block
+    db.save_blocks_post_scope                            sum    36.08s count   702      51.4 ms/call      51.4 ms/batch    27.84 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    36.07s count   702      51.4 ms/call      51.4 ms/batch    27.83 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    23.06s count   702      32.9 ms/call      32.9 ms/batch    17.80 ms/full block
+    db.save_blocks_sf_receipts                           sum    21.52s count   702      30.7 ms/call      30.7 ms/batch    16.61 ms/full block
+    db.save_blocks_sf_senders                            sum    13.16s count   702      18.7 ms/call      18.7 ms/batch    10.15 ms/full block
+    db.save_blocks_pre_scope                             sum     4.17s count   702       5.9 ms/call       5.9 ms/batch     3.22 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.14s count   702       5.9 ms/call       5.9 ms/batch     3.20 ms/full block
+    db.save_blocks_commit_sf                             sum     3.91s count  1055       3.7 ms/call       5.6 ms/batch     3.02 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     2.46s count   702       3.5 ms/call       3.5 ms/batch     1.90 ms/full block
+    db.save_blocks_sf_headers                            sum     1.96s count   702       2.8 ms/call       2.8 ms/batch     1.51 ms/full block
+    db.save_blocks_rocksdb                               sum     0.47s count   702       0.7 ms/call       0.7 ms/batch     0.36 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.28s count  1055       0.3 ms/call       0.4 ms/batch     0.22 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.21s count  1055       0.2 ms/call       0.3 ms/batch     0.16 ms/full block
+    db.save_blocks_mdbx                                  sum     0.19s count   702       0.3 ms/call       0.3 ms/batch     0.15 ms/full block
+    db.save_blocks_insert_block                          sum     0.15s count   702       0.2 ms/call       0.2 ms/batch     0.12 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.04s count   702       0.1 ms/call       0.1 ms/batch     0.03 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   702       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   702       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   702       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   702       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+== loop323A16
+  node0: batches 705, blocks persisted 2167, of them full 1189 (3.1 blocks/batch, 1.7 full/batch)
+    eng.save_blocks_duration_seconds                     sum   134.92s count   705     191.4 ms/call     191.4 ms/batch   113.47 ms/full block
+    db.save_blocks_total                                 sum    97.78s count   705     138.7 ms/call     138.7 ms/batch    82.24 ms/full block
+    db.save_blocks_scope                                 sum    62.42s count   705      88.5 ms/call      88.5 ms/batch    52.50 ms/full block
+    db.save_blocks_sf                                    sum    62.38s count   705      88.5 ms/call      88.5 ms/batch    52.46 ms/full block
+    db.save_blocks_sf_transactions                       sum    61.32s count   705      87.0 ms/call      87.0 ms/batch    51.57 ms/full block
+    db.save_blocks_commit_sf                             sum    34.00s count  1062      32.0 ms/call      48.2 ms/batch    28.59 ms/full block
+    db.save_blocks_post_scope                            sum    30.54s count   705      43.3 ms/call      43.3 ms/batch    25.69 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    30.54s count   705      43.3 ms/call      43.3 ms/batch    25.69 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    24.74s count   705      35.1 ms/call      35.1 ms/batch    20.81 ms/full block
+    db.save_blocks_sf_receipts                           sum    22.12s count   705      31.4 ms/call      31.4 ms/batch    18.60 ms/full block
+    db.save_blocks_sf_senders                            sum    13.05s count   705      18.5 ms/call      18.5 ms/batch    10.98 ms/full block
+    db.save_blocks_pre_scope                             sum     4.81s count   705       6.8 ms/call       6.8 ms/batch     4.05 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.79s count   705       6.8 ms/call       6.8 ms/batch     4.03 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     2.24s count   705       3.2 ms/call       3.2 ms/batch     1.88 ms/full block
+    db.save_blocks_sf_headers                            sum     1.84s count   705       2.6 ms/call       2.6 ms/batch     1.55 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.33s count  1062       0.3 ms/call       0.5 ms/batch     0.28 ms/full block
+    db.save_blocks_rocksdb                               sum     0.33s count   705       0.5 ms/call       0.5 ms/batch     0.27 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.29s count  1062       0.3 ms/call       0.4 ms/batch     0.24 ms/full block
+    db.save_blocks_mdbx                                  sum     0.16s count   705       0.2 ms/call       0.2 ms/batch     0.13 ms/full block
+    db.save_blocks_insert_block                          sum     0.12s count   705       0.2 ms/call       0.2 ms/batch     0.10 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.03s count   705       0.0 ms/call       0.0 ms/batch     0.02 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.01s count   705       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   705       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   705       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   705       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+  node1: batches 721, blocks persisted 2169, of them full 1189 (3.0 blocks/batch, 1.6 full/batch)
+    eng.save_blocks_duration_seconds                     sum   105.91s count   721     146.9 ms/call     146.9 ms/batch    89.07 ms/full block
+    db.save_blocks_total                                 sum    97.95s count   721     135.9 ms/call     135.9 ms/batch    82.38 ms/full block
+    db.save_blocks_scope                                 sum    63.26s count   721      87.7 ms/call      87.7 ms/batch    53.21 ms/full block
+    db.save_blocks_sf                                    sum    63.22s count   721      87.7 ms/call      87.7 ms/batch    53.17 ms/full block
+    db.save_blocks_sf_transactions                       sum    62.32s count   721      86.4 ms/call      86.4 ms/batch    52.41 ms/full block
+    db.save_blocks_post_scope                            sum    29.88s count   721      41.4 ms/call      41.4 ms/batch    25.13 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    29.88s count   721      41.4 ms/call      41.4 ms/batch    25.13 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    24.91s count   721      34.5 ms/call      34.5 ms/batch    20.95 ms/full block
+    db.save_blocks_sf_receipts                           sum    21.95s count   721      30.4 ms/call      30.4 ms/batch    18.46 ms/full block
+    db.save_blocks_sf_senders                            sum    13.17s count   721      18.3 ms/call      18.3 ms/batch    11.07 ms/full block
+    db.save_blocks_pre_scope                             sum     4.81s count   721       6.7 ms/call       6.7 ms/batch     4.05 ms/full block
+    db.save_blocks_commit_sf                             sum     4.81s count  1082       4.4 ms/call       6.7 ms/batch     4.05 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.79s count   721       6.6 ms/call       6.6 ms/batch     4.03 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     2.73s count   721       3.8 ms/call       3.8 ms/batch     2.30 ms/full block
+    db.save_blocks_sf_headers                            sum     2.15s count   721       3.0 ms/call       3.0 ms/batch     1.81 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.32s count  1082       0.3 ms/call       0.4 ms/batch     0.27 ms/full block
+    db.save_blocks_rocksdb                               sum     0.28s count   721       0.4 ms/call       0.4 ms/batch     0.24 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.23s count  1082       0.2 ms/call       0.3 ms/batch     0.19 ms/full block
+    db.save_blocks_mdbx                                  sum     0.18s count   721       0.3 ms/call       0.3 ms/batch     0.16 ms/full block
+    db.save_blocks_insert_block                          sum     0.14s count   721       0.2 ms/call       0.2 ms/batch     0.12 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.03s count   721       0.0 ms/call       0.0 ms/batch     0.03 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   721       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   721       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   721       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   721       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+  node2: batches 720, blocks persisted 2169, of them full 1189 (3.0 blocks/batch, 1.7 full/batch)
+    eng.save_blocks_duration_seconds                     sum   101.70s count   720     141.3 ms/call     141.3 ms/batch    85.53 ms/full block
+    db.save_blocks_total                                 sum    94.07s count   720     130.6 ms/call     130.6 ms/batch    79.11 ms/full block
+    db.save_blocks_scope                                 sum    61.29s count   720      85.1 ms/call      85.1 ms/batch    51.55 ms/full block
+    db.save_blocks_sf                                    sum    61.25s count   720      85.1 ms/call      85.1 ms/batch    51.51 ms/full block
+    db.save_blocks_sf_transactions                       sum    60.28s count   720      83.7 ms/call      83.7 ms/batch    50.70 ms/full block
+    db.save_blocks_post_scope                            sum    28.44s count   720      39.5 ms/call      39.5 ms/batch    23.92 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    28.44s count   720      39.5 ms/call      39.5 ms/batch    23.92 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    23.98s count   720      33.3 ms/call      33.3 ms/batch    20.17 ms/full block
+    db.save_blocks_sf_receipts                           sum    21.88s count   720      30.4 ms/call      30.4 ms/batch    18.41 ms/full block
+    db.save_blocks_sf_senders                            sum    12.76s count   720      17.7 ms/call      17.7 ms/batch    10.73 ms/full block
+    db.save_blocks_commit_sf                             sum     4.58s count  1081       4.2 ms/call       6.4 ms/batch     3.86 ms/full block
+    db.save_blocks_pre_scope                             sum     4.34s count   720       6.0 ms/call       6.0 ms/batch     3.65 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.31s count   720       6.0 ms/call       6.0 ms/batch     3.63 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     2.65s count   720       3.7 ms/call       3.7 ms/batch     2.23 ms/full block
+    db.save_blocks_sf_headers                            sum     2.12s count   720       2.9 ms/call       2.9 ms/batch     1.78 ms/full block
+    db.save_blocks_rocksdb                               sum     0.55s count   720       0.8 ms/call       0.8 ms/batch     0.46 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.28s count  1081       0.3 ms/call       0.4 ms/batch     0.23 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.25s count  1081       0.2 ms/call       0.3 ms/batch     0.21 ms/full block
+    db.save_blocks_mdbx                                  sum     0.17s count   720       0.2 ms/call       0.2 ms/batch     0.14 ms/full block
+    db.save_blocks_insert_block                          sum     0.13s count   720       0.2 ms/call       0.2 ms/batch     0.11 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.03s count   720       0.0 ms/call       0.0 ms/batch     0.03 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   720       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   720       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   720       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   720       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+== loop323A20
+  node0: batches 699, blocks persisted 2127, of them full 1190 (3.0 blocks/batch, 1.7 full/batch)
+    eng.save_blocks_duration_seconds                     sum   135.82s count   699     194.3 ms/call     194.3 ms/batch   114.14 ms/full block
+    db.save_blocks_total                                 sum    99.40s count   699     142.2 ms/call     142.2 ms/batch    83.53 ms/full block
+    db.save_blocks_scope                                 sum    62.57s count   699      89.5 ms/call      89.5 ms/batch    52.58 ms/full block
+    db.save_blocks_sf                                    sum    62.53s count   699      89.5 ms/call      89.5 ms/batch    52.54 ms/full block
+    db.save_blocks_sf_transactions                       sum    61.52s count   699      88.0 ms/call      88.0 ms/batch    51.70 ms/full block
+    db.save_blocks_commit_sf                             sum    33.39s count  1050      31.8 ms/call      47.8 ms/batch    28.05 ms/full block
+    db.save_blocks_post_scope                            sum    32.25s count   699      46.1 ms/call      46.1 ms/batch    27.10 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    32.25s count   699      46.1 ms/call      46.1 ms/batch    27.10 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    23.49s count   699      33.6 ms/call      33.6 ms/batch    19.74 ms/full block
+    db.save_blocks_sf_receipts                           sum    21.69s count   699      31.0 ms/call      31.0 ms/batch    18.23 ms/full block
+    db.save_blocks_sf_senders                            sum    12.97s count   699      18.6 ms/call      18.6 ms/batch    10.90 ms/full block
+    db.save_blocks_pre_scope                             sum     4.58s count   699       6.6 ms/call       6.6 ms/batch     3.85 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.56s count   699       6.5 ms/call       6.5 ms/batch     3.83 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     2.41s count   699       3.5 ms/call       3.5 ms/batch     2.03 ms/full block
+    db.save_blocks_sf_headers                            sum     1.84s count   699       2.6 ms/call       2.6 ms/batch     1.55 ms/full block
+    db.save_blocks_rocksdb                               sum     0.54s count   699       0.8 ms/call       0.8 ms/batch     0.46 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.31s count  1050       0.3 ms/call       0.4 ms/batch     0.26 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.25s count  1050       0.2 ms/call       0.4 ms/batch     0.21 ms/full block
+    db.save_blocks_mdbx                                  sum     0.19s count   699       0.3 ms/call       0.3 ms/batch     0.16 ms/full block
+    db.save_blocks_insert_block                          sum     0.14s count   699       0.2 ms/call       0.2 ms/batch     0.12 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.04s count   699       0.1 ms/call       0.1 ms/batch     0.03 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   699       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   699       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   699       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   699       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+  node1: batches 705, blocks persisted 2127, of them full 1190 (3.0 blocks/batch, 1.7 full/batch)
+    eng.save_blocks_duration_seconds                     sum   106.75s count   705     151.4 ms/call     151.4 ms/batch    89.70 ms/full block
+    db.save_blocks_total                                 sum    98.68s count   705     140.0 ms/call     140.0 ms/batch    82.92 ms/full block
+    db.save_blocks_scope                                 sum    63.10s count   705      89.5 ms/call      89.5 ms/batch    53.02 ms/full block
+    db.save_blocks_sf                                    sum    63.06s count   705      89.5 ms/call      89.5 ms/batch    52.99 ms/full block
+    db.save_blocks_sf_transactions                       sum    62.09s count   706      88.0 ms/call      88.1 ms/batch    52.18 ms/full block
+    db.save_blocks_post_scope                            sum    30.97s count   705      43.9 ms/call      43.9 ms/batch    26.03 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    30.97s count   705      43.9 ms/call      43.9 ms/batch    26.03 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    24.61s count   705      34.9 ms/call      34.9 ms/batch    20.68 ms/full block
+    db.save_blocks_sf_receipts                           sum    22.23s count   706      31.5 ms/call      31.5 ms/batch    18.68 ms/full block
+    db.save_blocks_sf_senders                            sum    12.79s count   706      18.1 ms/call      18.1 ms/batch    10.75 ms/full block
+    db.save_blocks_commit_sf                             sum     4.98s count  1058       4.7 ms/call       7.1 ms/batch     4.18 ms/full block
+    db.save_blocks_pre_scope                             sum     4.60s count   706       6.5 ms/call       6.5 ms/batch     3.87 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.59s count   706       6.5 ms/call       6.5 ms/batch     3.85 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     1.88s count   705       2.7 ms/call       2.7 ms/batch     1.58 ms/full block
+    db.save_blocks_sf_headers                            sum     1.45s count   706       2.1 ms/call       2.1 ms/batch     1.22 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.33s count  1058       0.3 ms/call       0.5 ms/batch     0.28 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.27s count  1058       0.3 ms/call       0.4 ms/batch     0.23 ms/full block
+    db.save_blocks_rocksdb                               sum     0.23s count   705       0.3 ms/call       0.3 ms/batch     0.19 ms/full block
+    db.save_blocks_mdbx                                  sum     0.17s count   705       0.2 ms/call       0.2 ms/batch     0.14 ms/full block
+    db.save_blocks_insert_block                          sum     0.13s count   705       0.2 ms/call       0.2 ms/batch     0.11 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.03s count   705       0.0 ms/call       0.0 ms/batch     0.03 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   705       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   705       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   705       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   705       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+  node2: batches 705, blocks persisted 2130, of them full 1190 (3.0 blocks/batch, 1.7 full/batch)
+    eng.save_blocks_duration_seconds                     sum   104.11s count   705     147.7 ms/call     147.7 ms/batch    87.49 ms/full block
+    db.save_blocks_total                                 sum    96.57s count   705     137.0 ms/call     137.0 ms/batch    81.15 ms/full block
+    db.save_blocks_scope                                 sum    60.23s count   705      85.4 ms/call      85.4 ms/batch    50.61 ms/full block
+    db.save_blocks_sf                                    sum    60.19s count   705      85.4 ms/call      85.4 ms/batch    50.58 ms/full block
+    db.save_blocks_sf_transactions                       sum    59.17s count   705      83.9 ms/call      83.9 ms/batch    49.72 ms/full block
+    db.save_blocks_post_scope                            sum    32.22s count   705      45.7 ms/call      45.7 ms/batch    27.08 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    32.22s count   705      45.7 ms/call      45.7 ms/batch    27.08 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    22.36s count   705      31.7 ms/call      31.7 ms/batch    18.79 ms/full block
+    db.save_blocks_sf_receipts                           sum    20.93s count   705      29.7 ms/call      29.7 ms/batch    17.59 ms/full block
+    db.save_blocks_sf_senders                            sum    12.83s count   705      18.2 ms/call      18.2 ms/batch    10.79 ms/full block
+    db.save_blocks_commit_sf                             sum     4.38s count  1059       4.1 ms/call       6.2 ms/batch     3.68 ms/full block
+    db.save_blocks_pre_scope                             sum     4.12s count   705       5.8 ms/call       5.8 ms/batch     3.46 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.10s count   705       5.8 ms/call       5.8 ms/batch     3.44 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     2.94s count   705       4.2 ms/call       4.2 ms/batch     2.47 ms/full block
+    db.save_blocks_sf_headers                            sum     2.38s count   705       3.4 ms/call       3.4 ms/batch     2.00 ms/full block
+    db.save_blocks_rocksdb                               sum     0.46s count   705       0.6 ms/call       0.6 ms/batch     0.38 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.32s count  1059       0.3 ms/call       0.5 ms/batch     0.27 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.26s count  1059       0.2 ms/call       0.4 ms/batch     0.21 ms/full block
+    db.save_blocks_mdbx                                  sum     0.17s count   705       0.2 ms/call       0.2 ms/batch     0.14 ms/full block
+    db.save_blocks_insert_block                          sum     0.13s count   705       0.2 ms/call       0.2 ms/batch     0.11 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.03s count   705       0.0 ms/call       0.0 ms/batch     0.02 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   705       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   705       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   705       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   705       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+== loop323A20P90
+  node0: batches 738, blocks persisted 2261, of them full 1190 (3.1 blocks/batch, 1.6 full/batch)
+    eng.save_blocks_duration_seconds                     sum   134.72s count   738     182.5 ms/call     182.5 ms/batch   113.21 ms/full block
+    db.save_blocks_total                                 sum    96.58s count   738     130.9 ms/call     130.9 ms/batch    81.16 ms/full block
+    db.save_blocks_scope                                 sum    61.42s count   738      83.2 ms/call      83.2 ms/batch    51.61 ms/full block
+    db.save_blocks_sf                                    sum    61.37s count   738      83.2 ms/call      83.2 ms/batch    51.57 ms/full block
+    db.save_blocks_sf_transactions                       sum    60.30s count   738      81.7 ms/call      81.7 ms/batch    50.67 ms/full block
+    db.save_blocks_commit_sf                             sum    35.02s count  1110      31.5 ms/call      47.4 ms/batch    29.43 ms/full block
+    db.save_blocks_post_scope                            sum    30.45s count   738      41.3 ms/call      41.3 ms/batch    25.59 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    30.45s count   738      41.3 ms/call      41.3 ms/batch    25.59 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    23.15s count   738      31.4 ms/call      31.4 ms/batch    19.45 ms/full block
+    db.save_blocks_sf_receipts                           sum    21.30s count   738      28.9 ms/call      28.9 ms/batch    17.90 ms/full block
+    db.save_blocks_sf_senders                            sum    12.87s count   738      17.4 ms/call      17.4 ms/batch    10.81 ms/full block
+    db.save_blocks_pre_scope                             sum     4.71s count   738       6.4 ms/call       6.4 ms/batch     3.96 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.69s count   738       6.4 ms/call       6.4 ms/batch     3.94 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     2.66s count   738       3.6 ms/call       3.6 ms/batch     2.23 ms/full block
+    db.save_blocks_sf_headers                            sum     2.05s count   738       2.8 ms/call       2.8 ms/batch     1.72 ms/full block
+    db.save_blocks_rocksdb                               sum     0.48s count   738       0.6 ms/call       0.6 ms/batch     0.40 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.30s count  1110       0.3 ms/call       0.4 ms/batch     0.25 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.26s count  1110       0.2 ms/call       0.3 ms/batch     0.22 ms/full block
+    db.save_blocks_mdbx                                  sum     0.20s count   738       0.3 ms/call       0.3 ms/batch     0.17 ms/full block
+    db.save_blocks_insert_block                          sum     0.16s count   738       0.2 ms/call       0.2 ms/batch     0.14 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.03s count   738       0.0 ms/call       0.0 ms/batch     0.03 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   738       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   738       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   738       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   738       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+  node1: batches 753, blocks persisted 2260, of them full 1190 (3.0 blocks/batch, 1.6 full/batch)
+    eng.save_blocks_duration_seconds                     sum   105.97s count   753     140.7 ms/call     140.7 ms/batch    89.05 ms/full block
+    db.save_blocks_total                                 sum    98.82s count   753     131.2 ms/call     131.2 ms/batch    83.04 ms/full block
+    db.save_blocks_scope                                 sum    63.82s count   753      84.8 ms/call      84.8 ms/batch    53.63 ms/full block
+    db.save_blocks_sf                                    sum    63.78s count   753      84.7 ms/call      84.7 ms/batch    53.60 ms/full block
+    db.save_blocks_sf_transactions                       sum    62.90s count   753      83.5 ms/call      83.5 ms/batch    52.86 ms/full block
+    db.save_blocks_post_scope                            sum    30.44s count   753      40.4 ms/call      40.4 ms/batch    25.58 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    30.44s count   753      40.4 ms/call      40.4 ms/batch    25.58 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    22.93s count   753      30.5 ms/call      30.5 ms/batch    19.27 ms/full block
+    db.save_blocks_sf_receipts                           sum    22.36s count   753      29.7 ms/call      29.7 ms/batch    18.79 ms/full block
+    db.save_blocks_sf_senders                            sum    12.71s count   753      16.9 ms/call      16.9 ms/batch    10.68 ms/full block
+    db.save_blocks_pre_scope                             sum     4.56s count   753       6.1 ms/call       6.1 ms/batch     3.83 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.54s count   753       6.0 ms/call       6.0 ms/batch     3.81 ms/full block
+    db.save_blocks_commit_sf                             sum     4.20s count  1130       3.7 ms/call       5.6 ms/batch     3.53 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     1.96s count   753       2.6 ms/call       2.6 ms/batch     1.65 ms/full block
+    db.save_blocks_sf_headers                            sum     1.54s count   753       2.0 ms/call       2.0 ms/batch     1.30 ms/full block
+    db.save_blocks_rocksdb                               sum     0.27s count   753       0.4 ms/call       0.4 ms/batch     0.23 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.26s count  1130       0.2 ms/call       0.3 ms/batch     0.22 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.26s count  1130       0.2 ms/call       0.3 ms/batch     0.22 ms/full block
+    db.save_blocks_mdbx                                  sum     0.16s count   753       0.2 ms/call       0.2 ms/batch     0.14 ms/full block
+    db.save_blocks_insert_block                          sum     0.12s count   753       0.2 ms/call       0.2 ms/batch     0.10 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.03s count   753       0.0 ms/call       0.0 ms/batch     0.03 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   753       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   753       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   753       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   753       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+  node2: batches 748, blocks persisted 2262, of them full 1190 (3.0 blocks/batch, 1.6 full/batch)
+    eng.save_blocks_duration_seconds                     sum   102.34s count   748     136.8 ms/call     136.8 ms/batch    86.00 ms/full block
+    db.save_blocks_total                                 sum    95.13s count   748     127.2 ms/call     127.2 ms/batch    79.94 ms/full block
+    db.save_blocks_scope                                 sum    60.85s count   748      81.3 ms/call      81.3 ms/batch    51.13 ms/full block
+    db.save_blocks_sf                                    sum    60.80s count   748      81.3 ms/call      81.3 ms/batch    51.09 ms/full block
+    db.save_blocks_sf_transactions                       sum    59.79s count   748      79.9 ms/call      79.9 ms/batch    50.24 ms/full block
+    db.save_blocks_post_scope                            sum    30.25s count   748      40.4 ms/call      40.4 ms/batch    25.42 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    30.24s count   748      40.4 ms/call      40.4 ms/batch    25.41 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    22.88s count   748      30.6 ms/call      30.6 ms/batch    19.23 ms/full block
+    db.save_blocks_sf_receipts                           sum    21.68s count   748      29.0 ms/call      29.0 ms/batch    18.21 ms/full block
+    db.save_blocks_sf_senders                            sum    12.53s count   748      16.7 ms/call      16.7 ms/batch    10.53 ms/full block
+    db.save_blocks_pre_scope                             sum     4.03s count   748       5.4 ms/call       5.4 ms/batch     3.39 ms/full block
+    db.save_blocks_commit_sf                             sum     4.02s count  1124       3.6 ms/call       5.4 ms/batch     3.38 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.01s count   748       5.4 ms/call       5.4 ms/batch     3.37 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     2.91s count   748       3.9 ms/call       3.9 ms/batch     2.44 ms/full block
+    db.save_blocks_sf_headers                            sum     2.32s count   748       3.1 ms/call       3.1 ms/batch     1.95 ms/full block
+    db.save_blocks_rocksdb                               sum     0.61s count   748       0.8 ms/call       0.8 ms/batch     0.51 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.29s count  1124       0.3 ms/call       0.4 ms/batch     0.24 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.28s count  1124       0.2 ms/call       0.4 ms/batch     0.23 ms/full block
+    db.save_blocks_mdbx                                  sum     0.20s count   748       0.3 ms/call       0.3 ms/batch     0.17 ms/full block
+    db.save_blocks_insert_block                          sum     0.16s count   748       0.2 ms/call       0.2 ms/batch     0.13 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.04s count   748       0.0 ms/call       0.0 ms/batch     0.03 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   748       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   748       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   748       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   748       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+== loop323A20P80
+  node0: batches 785, blocks persisted 2407, of them full 1187 (3.1 blocks/batch, 1.5 full/batch)
+    eng.save_blocks_duration_seconds                     sum   135.00s count   785     172.0 ms/call     172.0 ms/batch   113.73 ms/full block
+    db.save_blocks_total                                 sum    97.70s count   785     124.5 ms/call     124.5 ms/batch    82.31 ms/full block
+    db.save_blocks_scope                                 sum    61.59s count   785      78.5 ms/call      78.5 ms/batch    51.89 ms/full block
+    db.save_blocks_sf                                    sum    61.55s count   785      78.4 ms/call      78.4 ms/batch    51.85 ms/full block
+    db.save_blocks_sf_transactions                       sum    60.66s count   785      77.3 ms/call      77.3 ms/batch    51.10 ms/full block
+    db.save_blocks_commit_sf                             sum    34.06s count  1183      28.8 ms/call      43.4 ms/batch    28.70 ms/full block
+    db.save_blocks_post_scope                            sum    31.57s count   785      40.2 ms/call      40.2 ms/batch    26.60 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    31.57s count   785      40.2 ms/call      40.2 ms/batch    26.59 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    23.34s count   785      29.7 ms/call      29.7 ms/batch    19.66 ms/full block
+    db.save_blocks_sf_receipts                           sum    22.27s count   785      28.4 ms/call      28.4 ms/batch    18.76 ms/full block
+    db.save_blocks_sf_senders                            sum    13.19s count   785      16.8 ms/call      16.8 ms/batch    11.11 ms/full block
+    db.save_blocks_pre_scope                             sum     4.54s count   785       5.8 ms/call       5.8 ms/batch     3.82 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.52s count   785       5.8 ms/call       5.8 ms/batch     3.81 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     2.53s count   785       3.2 ms/call       3.2 ms/batch     2.13 ms/full block
+    db.save_blocks_sf_headers                            sum     2.08s count   785       2.7 ms/call       2.7 ms/batch     1.75 ms/full block
+    db.save_blocks_rocksdb                               sum     0.45s count   785       0.6 ms/call       0.6 ms/batch     0.38 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.28s count  1183       0.2 ms/call       0.4 ms/batch     0.24 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.23s count  1183       0.2 ms/call       0.3 ms/batch     0.19 ms/full block
+    db.save_blocks_mdbx                                  sum     0.17s count   785       0.2 ms/call       0.2 ms/batch     0.15 ms/full block
+    db.save_blocks_insert_block                          sum     0.13s count   785       0.2 ms/call       0.2 ms/batch     0.11 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.03s count   785       0.0 ms/call       0.0 ms/batch     0.03 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.01s count   785       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   785       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   785       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   785       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+  node1: batches 801, blocks persisted 2406, of them full 1187 (3.0 blocks/batch, 1.5 full/batch)
+    eng.save_blocks_duration_seconds                     sum   105.64s count   801     131.9 ms/call     131.9 ms/batch    89.00 ms/full block
+    db.save_blocks_total                                 sum    97.62s count   801     121.9 ms/call     121.9 ms/batch    82.24 ms/full block
+    db.save_blocks_scope                                 sum    64.05s count   801      80.0 ms/call      80.0 ms/batch    53.96 ms/full block
+    db.save_blocks_sf                                    sum    64.00s count   801      79.9 ms/call      79.9 ms/batch    53.91 ms/full block
+    db.save_blocks_sf_transactions                       sum    63.02s count   801      78.7 ms/call      78.7 ms/batch    53.09 ms/full block
+    db.save_blocks_post_scope                            sum    28.83s count   801      36.0 ms/call      36.0 ms/batch    24.29 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    28.83s count   801      36.0 ms/call      36.0 ms/batch    24.28 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    22.77s count   801      28.4 ms/call      28.4 ms/batch    19.18 ms/full block
+    db.save_blocks_sf_receipts                           sum    21.88s count   801      27.3 ms/call      27.3 ms/batch    18.43 ms/full block
+    db.save_blocks_sf_senders                            sum    12.65s count   801      15.8 ms/call      15.8 ms/batch    10.65 ms/full block
+    db.save_blocks_commit_sf                             sum     4.98s count  1202       4.1 ms/call       6.2 ms/batch     4.20 ms/full block
+    db.save_blocks_pre_scope                             sum     4.74s count   801       5.9 ms/call       5.9 ms/batch     3.99 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.72s count   801       5.9 ms/call       5.9 ms/batch     3.98 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     1.91s count   801       2.4 ms/call       2.4 ms/batch     1.61 ms/full block
+    db.save_blocks_sf_headers                            sum     1.55s count   801       1.9 ms/call       1.9 ms/batch     1.31 ms/full block
+    db.save_blocks_rocksdb                               sum     0.37s count   801       0.5 ms/call       0.5 ms/batch     0.31 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.30s count  1202       0.2 ms/call       0.4 ms/batch     0.25 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.25s count  1202       0.2 ms/call       0.3 ms/batch     0.21 ms/full block
+    db.save_blocks_mdbx                                  sum     0.17s count   801       0.2 ms/call       0.2 ms/batch     0.14 ms/full block
+    db.save_blocks_insert_block                          sum     0.13s count   801       0.2 ms/call       0.2 ms/batch     0.11 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.03s count   801       0.0 ms/call       0.0 ms/batch     0.03 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   801       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   801       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   801       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   801       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+  node2: batches 796, blocks persisted 2406, of them full 1187 (3.0 blocks/batch, 1.5 full/batch)
+    eng.save_blocks_duration_seconds                     sum   100.59s count   796     126.4 ms/call     126.4 ms/batch    84.74 ms/full block
+    db.save_blocks_total                                 sum    93.06s count   796     116.9 ms/call     116.9 ms/batch    78.40 ms/full block
+    db.save_blocks_scope                                 sum    60.25s count   796      75.7 ms/call      75.7 ms/batch    50.76 ms/full block
+    db.save_blocks_sf                                    sum    60.22s count   796      75.6 ms/call      75.6 ms/batch    50.73 ms/full block
+    db.save_blocks_sf_transactions                       sum    59.25s count   796      74.4 ms/call      74.4 ms/batch    49.92 ms/full block
+    db.save_blocks_post_scope                            sum    28.49s count   796      35.8 ms/call      35.8 ms/batch    24.00 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    28.49s count   796      35.8 ms/call      35.8 ms/batch    24.00 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    22.66s count   796      28.5 ms/call      28.5 ms/batch    19.09 ms/full block
+    db.save_blocks_sf_receipts                           sum    21.02s count   796      26.4 ms/call      26.4 ms/batch    17.71 ms/full block
+    db.save_blocks_sf_senders                            sum    12.33s count   796      15.5 ms/call      15.5 ms/batch    10.39 ms/full block
+    db.save_blocks_commit_sf                             sum     4.56s count  1195       3.8 ms/call       5.7 ms/batch     3.84 ms/full block
+    db.save_blocks_pre_scope                             sum     4.32s count   796       5.4 ms/call       5.4 ms/batch     3.64 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.30s count   796       5.4 ms/call       5.4 ms/batch     3.62 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     2.58s count   796       3.2 ms/call       3.2 ms/batch     2.17 ms/full block
+    db.save_blocks_sf_headers                            sum     2.04s count   796       2.6 ms/call       2.6 ms/batch     1.72 ms/full block
+    db.save_blocks_rocksdb                               sum     0.28s count   796       0.4 ms/call       0.4 ms/batch     0.24 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.27s count  1195       0.2 ms/call       0.3 ms/batch     0.23 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.26s count  1195       0.2 ms/call       0.3 ms/batch     0.22 ms/full block
+    db.save_blocks_mdbx                                  sum     0.16s count   796       0.2 ms/call       0.2 ms/batch     0.13 ms/full block
+    db.save_blocks_insert_block                          sum     0.13s count   796       0.2 ms/call       0.2 ms/batch     0.11 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.03s count   796       0.0 ms/call       0.0 ms/batch     0.02 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   796       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   796       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   796       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   796       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+== loop323Ab
+  node0: batches 689, blocks persisted 2144, of them full 1316 (3.1 blocks/batch, 1.9 full/batch)
+    eng.save_blocks_duration_seconds                     sum   136.02s count   689     197.4 ms/call     197.4 ms/batch   103.36 ms/full block
+    db.save_blocks_total                                 sum   100.55s count   689     145.9 ms/call     145.9 ms/batch    76.41 ms/full block
+    db.save_blocks_scope                                 sum    60.41s count   689      87.7 ms/call      87.7 ms/batch    45.90 ms/full block
+    db.save_blocks_sf                                    sum    60.37s count   689      87.6 ms/call      87.6 ms/batch    45.87 ms/full block
+    db.save_blocks_sf_transactions                       sum    59.47s count   689      86.3 ms/call      86.3 ms/batch    45.19 ms/full block
+    db.save_blocks_post_scope                            sum    35.90s count   689      52.1 ms/call      52.1 ms/batch    27.28 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    35.90s count   689      52.1 ms/call      52.1 ms/batch    27.28 ms/full block
+    db.save_blocks_commit_sf                             sum    32.64s count  1037      31.5 ms/call      47.4 ms/batch    24.80 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    22.78s count   689      33.1 ms/call      33.1 ms/batch    17.31 ms/full block
+    db.save_blocks_sf_receipts                           sum    21.08s count   689      30.6 ms/call      30.6 ms/batch    16.01 ms/full block
+    db.save_blocks_sf_senders                            sum    12.95s count   689      18.8 ms/call      18.8 ms/batch     9.84 ms/full block
+    db.save_blocks_pre_scope                             sum     4.25s count   689       6.2 ms/call       6.2 ms/batch     3.23 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.23s count   689       6.1 ms/call       6.1 ms/batch     3.21 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     2.60s count   689       3.8 ms/call       3.8 ms/batch     1.98 ms/full block
+    db.save_blocks_sf_headers                            sum     2.15s count   689       3.1 ms/call       3.1 ms/batch     1.63 ms/full block
+    db.save_blocks_rocksdb                               sum     0.56s count   689       0.8 ms/call       0.8 ms/batch     0.42 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.31s count  1037       0.3 ms/call       0.4 ms/batch     0.23 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.25s count  1037       0.2 ms/call       0.4 ms/batch     0.19 ms/full block
+    db.save_blocks_mdbx                                  sum     0.17s count   689       0.2 ms/call       0.2 ms/batch     0.13 ms/full block
+    db.save_blocks_insert_block                          sum     0.13s count   689       0.2 ms/call       0.2 ms/batch     0.10 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.03s count   689       0.0 ms/call       0.0 ms/batch     0.02 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.01s count   689       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   689       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   689       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   689       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+  node1: batches 715, blocks persisted 2146, of them full 1316 (3.0 blocks/batch, 1.8 full/batch)
+    eng.save_blocks_duration_seconds                     sum   104.22s count   715     145.8 ms/call     145.8 ms/batch    79.19 ms/full block
+    db.save_blocks_total                                 sum    97.09s count   715     135.8 ms/call     135.8 ms/batch    73.78 ms/full block
+    db.save_blocks_scope                                 sum    62.06s count   715      86.8 ms/call      86.8 ms/batch    47.16 ms/full block
+    db.save_blocks_sf                                    sum    62.02s count   715      86.7 ms/call      86.7 ms/batch    47.13 ms/full block
+    db.save_blocks_sf_transactions                       sum    61.09s count   715      85.4 ms/call      85.4 ms/batch    46.42 ms/full block
+    db.save_blocks_post_scope                            sum    30.27s count   715      42.3 ms/call      42.3 ms/batch    23.00 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    30.27s count   715      42.3 ms/call      42.3 ms/batch    23.00 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    22.91s count   715      32.0 ms/call      32.0 ms/batch    17.41 ms/full block
+    db.save_blocks_sf_receipts                           sum    22.25s count   715      31.1 ms/call      31.1 ms/batch    16.91 ms/full block
+    db.save_blocks_sf_senders                            sum    12.86s count   715      18.0 ms/call      18.0 ms/batch     9.77 ms/full block
+    db.save_blocks_pre_scope                             sum     4.76s count   715       6.7 ms/call       6.7 ms/batch     3.62 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.74s count   715       6.6 ms/call       6.6 ms/batch     3.60 ms/full block
+    db.save_blocks_commit_sf                             sum     4.41s count  1073       4.1 ms/call       6.2 ms/batch     3.35 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     2.36s count   715       3.3 ms/call       3.3 ms/batch     1.79 ms/full block
+    db.save_blocks_sf_headers                            sum     1.83s count   715       2.6 ms/call       2.6 ms/batch     1.39 ms/full block
+    db.save_blocks_rocksdb                               sum     0.62s count   715       0.9 ms/call       0.9 ms/batch     0.47 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.24s count  1073       0.2 ms/call       0.3 ms/batch     0.18 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.24s count  1073       0.2 ms/call       0.3 ms/batch     0.18 ms/full block
+    db.save_blocks_mdbx                                  sum     0.18s count   715       0.3 ms/call       0.3 ms/batch     0.14 ms/full block
+    db.save_blocks_insert_block                          sum     0.14s count   715       0.2 ms/call       0.2 ms/batch     0.11 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.03s count   715       0.0 ms/call       0.0 ms/batch     0.03 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.01s count   715       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   715       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   715       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   715       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+  node2: batches 709, blocks persisted 2147, of them full 1316 (3.0 blocks/batch, 1.9 full/batch)
+    eng.save_blocks_duration_seconds                     sum   108.78s count   708     153.6 ms/call     153.4 ms/batch    82.66 ms/full block
+    db.save_blocks_total                                 sum   101.41s count   709     143.0 ms/call     143.0 ms/batch    77.06 ms/full block
+    db.save_blocks_scope                                 sum    60.97s count   709      86.0 ms/call      86.0 ms/batch    46.33 ms/full block
+    db.save_blocks_sf                                    sum    60.93s count   709      85.9 ms/call      85.9 ms/batch    46.30 ms/full block
+    db.save_blocks_sf_transactions                       sum    60.03s count   709      84.7 ms/call      84.7 ms/batch    45.62 ms/full block
+    db.save_blocks_post_scope                            sum    36.03s count   709      50.8 ms/call      50.8 ms/batch    27.38 ms/full block
+    db.save_blocks_qmdb_persisted                        sum    36.02s count   709      50.8 ms/call      50.8 ms/batch    27.37 ms/full block
+    db.save_blocks_sf_account_changesets                 sum    22.68s count   709      32.0 ms/call      32.0 ms/batch    17.24 ms/full block
+    db.save_blocks_sf_receipts                           sum    21.39s count   709      30.2 ms/call      30.2 ms/batch    16.26 ms/full block
+    db.save_blocks_sf_senders                            sum    12.71s count   709      17.9 ms/call      17.9 ms/batch     9.66 ms/full block
+    db.save_blocks_commit_sf                             sum     4.47s count  1064       4.2 ms/call       6.3 ms/batch     3.39 ms/full block
+    db.save_blocks_pre_scope                             sum     4.41s count   709       6.2 ms/call       6.2 ms/batch     3.35 ms/full block
+    db.save_blocks_plain_reverts                         sum     4.39s count   709       6.2 ms/call       6.2 ms/batch     3.34 ms/full block
+    db.save_blocks_sf_storage_changesets                 sum     2.72s count   709       3.8 ms/call       3.8 ms/batch     2.07 ms/full block
+    db.save_blocks_sf_headers                            sum     2.17s count   709       3.1 ms/call       3.1 ms/batch     1.65 ms/full block
+    db.save_blocks_rocksdb                               sum     0.50s count   709       0.7 ms/call       0.7 ms/batch     0.38 ms/full block
+    db.save_blocks_commit_rocksdb                        sum     0.30s count  1064       0.3 ms/call       0.4 ms/batch     0.23 ms/full block
+    db.save_blocks_commit_mdbx                           sum     0.29s count  1064       0.3 ms/call       0.4 ms/batch     0.22 ms/full block
+    db.save_blocks_mdbx                                  sum     0.17s count   709       0.2 ms/call       0.2 ms/batch     0.13 ms/full block
+    db.save_blocks_insert_block                          sum     0.13s count   709       0.2 ms/call       0.2 ms/batch     0.10 ms/full block
+    db.save_blocks_update_pipeline_stages                sum     0.03s count   709       0.0 ms/call       0.0 ms/batch     0.02 ms/full block
+    db.save_blocks_write_trie_updates                    sum     0.00s count   709       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_state                           sum     0.00s count   709       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_update_history_indices                sum     0.00s count   709       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_write_hashed_state                    sum     0.00s count   709       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_reads                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_map                   sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block
+    db.save_blocks_account_history_batch                 sum     0.00s count     0       0.0 ms/call       0.0 ms/batch     0.00 ms/full block

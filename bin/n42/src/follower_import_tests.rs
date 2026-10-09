@@ -461,3 +461,152 @@ fn a_timed_check_of_an_empty_block_passes_with_and_without_the_header_comparison
     )
     .expect("the noop consensus accepts the header");
 }
+
+// ---- held executions (`N42_VOTE_BEFORE_SLOT`) --------------------------------
+
+#[test]
+fn an_execution_without_a_hold_starts_at_once() {
+    assert_eq!(wait_for_release(B256::repeat_byte(0xe0)), Ok(()));
+}
+
+#[test]
+fn a_held_execution_waits_for_its_release() {
+    let hash = B256::repeat_byte(0xe1);
+    let release = hold_execution(hash);
+    let waiter = std::thread::spawn(move || wait_for_release(hash));
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    assert!(!waiter.is_finished(), "held until released");
+    release.send(true).expect("the waiter listens");
+    assert_eq!(waiter.join().expect("joins"), Ok(()));
+    // Taken once: a second import of the same hash is not held.
+    assert_eq!(wait_for_release(hash), Ok(()));
+}
+
+#[test]
+fn a_dropped_or_abandoned_hold_ends_the_execution() {
+    let dropped = B256::repeat_byte(0xe2);
+    let release = hold_execution(dropped);
+    release.send(false).expect("listens");
+    assert_eq!(wait_for_release(dropped), Err(HELD_DROPPED.to_owned()));
+
+    // No CHECKED frame went out, so no release byte will come: the sender is
+    // dropped and an execution already waiting ends instead of hanging.
+    let abandoned = B256::repeat_byte(0xe3);
+    drop(hold_execution(abandoned));
+    assert_eq!(wait_for_release(abandoned), Err(HELD_DROPPED.to_owned()));
+
+    // A hold whose import ended before its execution is forgotten.
+    let forgotten = B256::repeat_byte(0xe4);
+    let _release = hold_execution(forgotten);
+    forget_hold(forgotten);
+    assert_eq!(wait_for_release(forgotten), Ok(()));
+}
+
+// --- deferred execution at depth 2 (docs/DEFERRED_DEPTH_2_DESIGN.md) ----------
+
+fn depth_two_genesis() -> alloy_genesis::Genesis {
+    let mut genesis = deferred_genesis(0);
+    genesis.config.extra_fields.insert("deferredExecutionDepth".to_owned(), serde_json::json!(2));
+    genesis
+}
+
+fn some_fields(byte: u8) -> n42_engine_types::executed_fields::ExecutedFields {
+    n42_engine_types::executed_fields::ExecutedFields {
+        state_root: B256::repeat_byte(byte),
+        receipts_root: B256::repeat_byte(byte ^ 1),
+        logs_bloom: Default::default(),
+        gas_used: 0,
+    }
+}
+
+/// T6: at depth 2 the vote road's wait is for the grandparent's result: it
+/// passes while the parent's root is not computed (the parent's fields
+/// absent) and waits while the grandparent's are absent; at depth 1 the same
+/// call waits for the parent's, as before; at the chain start nothing is
+/// waited for. `parent_in` still owes the parent's own result at depth 2.
+#[test]
+fn at_depth_two_the_vote_waits_for_the_grandparents_result_not_the_parents() {
+    let genesis = depth_two_genesis();
+    let grandparent = B256::repeat_byte(0xA7);
+    let parent = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header {
+        number: 9,
+        timestamp: 9,
+        parent_hash: grandparent,
+        extra_data: b"depth-two-parent".to_vec().into(),
+        ..Default::default()
+    });
+    n42_engine_types::executed_fields::remember(grandparent, some_fields(0xA8));
+    assert!(n42_engine_types::executed_fields::get(&parent.hash()).is_none(), "the parent's root is not computed");
+    let at = std::time::Instant::now();
+    wait_for_ancestor_fields(&genesis, &parent, 2).expect("the grandparent's result is there");
+    assert!(at.elapsed() < std::time::Duration::from_millis(500), "no wait for the parent's root");
+
+    // The grandparent's result missing: the road waits for it.
+    let late_grandparent = B256::repeat_byte(0xA9);
+    let parent2 = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header {
+        number: 9,
+        timestamp: 9,
+        parent_hash: late_grandparent,
+        extra_data: b"depth-two-parent-2".to_vec().into(),
+        ..Default::default()
+    });
+    let filer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        n42_engine_types::executed_fields::remember(late_grandparent, some_fields(0xAA));
+    });
+    let at = std::time::Instant::now();
+    wait_for_ancestor_fields(&genesis, &parent2, 2).expect("the grandparent's result arrives");
+    assert!(at.elapsed() >= std::time::Duration::from_millis(50), "it waited: {:?}", at.elapsed());
+    filer.join().unwrap();
+
+    // Depth 1 on the same parent waits for the parent's own result.
+    let filer = {
+        let hash = parent.hash();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            n42_engine_types::executed_fields::remember(hash, some_fields(0xAB));
+        })
+    };
+    let at = std::time::Instant::now();
+    wait_for_ancestor_fields(&deferred_genesis(0), &parent, 1).expect("the parent's result arrives");
+    assert!(at.elapsed() >= std::time::Duration::from_millis(50));
+    filer.join().unwrap();
+
+    // The chain start: blocks 1 and 2 carry the genesis result, read off the
+    // parent's own header -- nothing recorded, nothing waited for.
+    let block1 = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header {
+        number: 1,
+        timestamp: 1,
+        parent_hash: B256::repeat_byte(0xAC),
+        extra_data: b"depth-two-block-1".to_vec().into(),
+        ..Default::default()
+    });
+    let at = std::time::Instant::now();
+    wait_for_ancestor_fields(&genesis, &block1, 2).expect("no lookup at the chain start");
+    assert!(at.elapsed() < std::time::Duration::from_millis(500));
+
+    // `parent_in` is unchanged: the parent counts as in only once its own
+    // result is recorded, whatever the depth.
+    let provider = MockEthProvider::default();
+    let unexecuted = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header {
+        number: 10,
+        timestamp: 10,
+        extra_data: b"depth-two-parent-in".to_vec().into(),
+        ..Default::default()
+    });
+    provider.add_header(unexecuted.hash(), unexecuted.header().clone());
+    assert!(parent_in(&provider, unexecuted.hash(), &genesis, true).unwrap().is_none());
+    n42_engine_types::executed_fields::remember(unexecuted.hash(), some_fields(0xAD));
+    assert!(parent_in(&provider, unexecuted.hash(), &genesis, true).unwrap().is_some());
+}
+
+#[test]
+fn the_capacity_knobs_default_to_the_depth_one_values() {
+    assert_eq!(kept_from_env("N42_TEST_KNOB_THAT_IS_NEVER_SET", PARENT_OUTPUTS_KEPT, 2..=16), PARENT_OUTPUTS_KEPT);
+    if std::env::var_os("N42_PARENT_OUTPUTS_KEPT").is_none() {
+        assert_eq!(parent_outputs_kept(), PARENT_OUTPUTS_KEPT);
+    }
+    if std::env::var_os("N42_FOLLOWER_SHARDS_KEPT").is_none() {
+        assert_eq!(follower_shards_kept(), FOLLOWER_SHARDS_KEPT);
+    }
+}

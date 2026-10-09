@@ -572,20 +572,20 @@ fn the_gate_view_is_the_pending_count_against_the_mark_plus_lag_allowance() {
     let head = Arc::new(AtomicU64::new(0));
 
     // Nothing pending: open against any positive mark, shut against zero.
-    assert_eq!(gate_view(&pool, &head, 10, 0), GateView { open: true, depth: 0, limit: 10 });
-    assert_eq!(gate_view(&pool, &head, 0, 0), GateView { open: false, depth: 0, limit: 0 });
-    assert!(gate_open(&pool, &head, 10, 0));
-    assert!(!gate_open(&pool, &head, 0, 0));
+    assert_eq!(gate_view(&pool, None, &head, 10, 0), GateView { open: true, depth: 0, limit: 10 });
+    assert_eq!(gate_view(&pool, None, &head, 0, 0), GateView { open: false, depth: 0, limit: 0 });
+    assert!(gate_open(&pool, None, &head, 10, 0));
+    assert!(!gate_open(&pool, None, &head, 0, 0));
 
     // The chain is ahead of the pool by two blocks: two allowances are added.
     head.store(2, Ordering::Relaxed);
-    assert_eq!(gate_view(&pool, &head, 0, 100), GateView { open: true, depth: 0, limit: 200 });
+    assert_eq!(gate_view(&pool, None, &head, 0, 100), GateView { open: true, depth: 0, limit: 200 });
     // The lag is capped at four blocks.
     head.store(1_000, Ordering::Relaxed);
-    assert_eq!(gate_view(&pool, &head, 5, 100).limit, 405);
+    assert_eq!(gate_view(&pool, None, &head, 5, 100).limit, 405);
     // A pool ahead of the chain never subtracts.
     let ahead = Arc::new(AtomicU64::new(0));
-    assert_eq!(gate_view(&pool, &ahead, 5, 100).limit, 5);
+    assert_eq!(gate_view(&pool, None, &ahead, 5, 100).limit, 5);
 }
 
 #[test]
@@ -632,7 +632,7 @@ async fn the_watcher_wakes_a_waiter_when_the_pools_depth_is_under_the_mark() {
     // The watcher reads the (empty) pool and finds the gate open; the waiter's
     // own reading stays shut for 300 ms of runtime time. The waiter would
     // otherwise sleep to its 2 s warning cap, so waking early is the watcher.
-    spawn_gate_watcher(Pool::new(), Arc::new(AtomicU64::new(0)), 10, 0);
+    spawn_gate_watcher(Pool::new(), None, Arc::new(AtomicU64::new(0)), 10, 0);
     let shut_until = tokio::time::Instant::now() + Duration::from_millis(300);
     let view = move || GateView { open: tokio::time::Instant::now() >= shut_until, depth: 1, limit: 0 };
     match wait_at_gate(view, || None, Some(Duration::from_secs(15))).await {
@@ -671,9 +671,11 @@ fn defaults_hold_when_the_environment_does_not_override_them() {
     if unset("N42_TX_INGEST_ASYNC_FRAMES") {
         assert_eq!(async_frames_in_flight(), ASYNC_FRAMES_IN_FLIGHT);
     }
+    #[cfg(target_os = "linux")]
     if unset("N42_TX_INGEST_RECOVER_NICE") {
         assert_eq!(recovery_nice(), 0);
     }
+    #[cfg(target_os = "linux")]
     if unset("N42_TX_INGEST_RECOVER_PIN") {
         assert_eq!(recovery_pin(), 0);
     }
@@ -702,6 +704,7 @@ fn defaults_hold_when_the_environment_does_not_override_them() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn recovery_threads_keep_their_priority_and_affinity_by_default() {
     if unset("N42_TX_INGEST_RECOVER_NICE") && unset("N42_TX_INGEST_RECOVER_PIN") {
         // Both are no-ops by default: run on a fresh thread and compare its nice value.
@@ -724,6 +727,7 @@ fn recovery_threads_keep_their_priority_and_affinity_by_default() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn physical_cores_are_a_sorted_subset_of_the_affinity_set() {
     let cores = physical_cores();
     assert!(!cores.is_empty());
@@ -759,7 +763,7 @@ mod wire {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
-        let handle = tokio::spawn(serve_connection(server, Pool::new(), None, Arc::new(AtomicU64::new(0))));
+        let handle = tokio::spawn(serve_connection(server, Pool::new(), None, Arc::new(AtomicU64::new(0)), Setup::from_env(false)));
         (client, handle)
     }
 
@@ -848,6 +852,22 @@ mod wire {
         client.write_all(&1u32.to_le_bytes()).await.unwrap();
         client.write_all(&(MAX_TX_BYTES + 1).to_le_bytes()).await.unwrap();
         refused(handle, client, &format!("transaction of {} bytes", MAX_TX_BYTES + 1)).await;
+    }
+
+    #[tokio::test]
+    async fn individually_valid_lengths_cannot_build_an_unbounded_frame() {
+        let (mut client, handle) = connect().await;
+        let per = MAX_TX_BYTES as usize;
+        let count = MAX_FRAME_BYTES / per;
+        client.write_all(&((count + 1) as u32).to_le_bytes()).await.unwrap();
+        let bytes = vec![0u8; per];
+        for _ in 0..count {
+            client.write_all(&MAX_TX_BYTES.to_le_bytes()).await.unwrap();
+            client.write_all(&bytes).await.unwrap();
+        }
+        // Refuse from the next length alone, before waiting for its body.
+        client.write_all(&1u32.to_le_bytes()).await.unwrap();
+        refused(handle, client, "frame exceeds").await;
     }
 
     #[tokio::test]
@@ -965,7 +985,7 @@ mod wire {
     async fn admit_returns_zero_for_an_empty_decode_and_counts_nothing() {
         let _g = counter_lock();
         let before = (load(&STATS.frames), load(&STATS.txs));
-        let accepted = admit::<Pool>(&Pool::new(), vec![Bytes::from_static(b"\x05")], Vec::new(), Vec::new(), None).await;
+        let accepted = admit::<Pool>(&Pool::new(), &Setup::from_env(false), vec![Bytes::from_static(b"\x05")], Vec::new(), Vec::new(), None).await;
         assert_eq!(accepted, 0);
         assert_eq!((load(&STATS.frames), load(&STATS.txs)), before);
     }
@@ -1005,6 +1025,94 @@ mod wire {
             .await
             .expect_err("the port is taken");
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    /// Four connections of eight frames of 25 transactions each, delivered
+    /// to a queue straight from the ingest (direct, asynchronous), with two
+    /// recovery slots. Returns each sender's nonces in the order a build is
+    /// offered them, and the frames the queue indexed.
+    fn deliver(own_runtime: bool) -> (std::collections::BTreeMap<Address, Vec<u64>>, usize) {
+        const CONNECTIONS: u8 = 4;
+        const FRAMES: u64 = 8;
+        const PER: u64 = 25;
+        let queue: n42_tx_queue::TxQueue<N42PooledTransaction> = n42_tx_queue::TxQueue::new();
+        let (runtime, slots) = if own_runtime {
+            (runtime::build(2, Some(2)).expect("the ingest runtime"), Slots::Blocking(runtime::BlockingSlots::new(Some(2))))
+        } else {
+            (
+                tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("a runtime"),
+                Slots::Async(Arc::new(tokio::sync::Semaphore::new(2))),
+            )
+        };
+        let setup = Setup {
+            queue: Some(queue.clone()),
+            direct: true,
+            asynchronous: true,
+            gate: 1 << 40,
+            allowance: 0,
+            slots,
+        };
+        let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).expect("a listener");
+        let addr = listener.local_addr().expect("an address");
+        runtime.spawn(serve_on(listener, Pool::new(), None, Arc::new(AtomicU64::new(0)), setup));
+        let clients: Vec<_> = (0..CONNECTIONS)
+            .map(|c| {
+                std::thread::spawn(move || {
+                    use std::io::{Read as _, Write as _};
+                    let key = 80 + c;
+                    let mut wire = Vec::new();
+                    for f in 0..FRAMES {
+                        let txs: Vec<Bytes> = (0..PER).map(|n| raw(&eth_tx(key, f * PER + n))).collect();
+                        wire.extend(frame(None, &txs, None));
+                    }
+                    let mut stream = std::net::TcpStream::connect(addr).expect("connected");
+                    stream.write_all(&wire).expect("frames written");
+                    for _ in 0..FRAMES {
+                        let mut answer = [0u8; 8];
+                        stream.read_exact(&mut answer).expect("an answer");
+                        let accepted = u32::from_le_bytes([answer[0], answer[1], answer[2], answer[3]]);
+                        assert_eq!(u64::from(accepted), PER, "every transaction of the frame acknowledged");
+                    }
+                })
+            })
+            .collect();
+        for client in clients {
+            client.join().expect("a client failed");
+        }
+        // The answers go out before the admission: wait for the queue.
+        let total = usize::from(CONNECTIONS) * (FRAMES * PER) as usize;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while (queue.len() < total || queue.frames_indexed() < usize::from(CONNECTIONS) * FRAMES as usize)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut by_sender: std::collections::BTreeMap<Address, Vec<u64>> = Default::default();
+        for tx in queue.best_for_build(B256::repeat_byte(1)) {
+            by_sender.entry(tx.sender()).or_default().push(tx.nonce());
+        }
+        let frames = queue.frames_indexed();
+        runtime.shutdown_background();
+        (by_sender, frames)
+    }
+
+    /// `N42_INGEST_RUNTIME=1`: the ingest on its own runtime with the slots
+    /// taken on the blocking side delivers exactly what it delivers on the
+    /// caller's runtime with the async semaphore -- every frame, indexed
+    /// whole, each sender's nonces in order with none missing.
+    #[test]
+    fn the_ingest_runtime_delivers_the_same_frames_in_the_same_order() {
+        let _g = counter_lock();
+        let (on, frames_on) = deliver(true);
+        let (off, frames_off) = deliver(false);
+        assert_eq!(frames_on, 32);
+        assert_eq!(frames_off, 32);
+        assert_eq!(on.len(), 4);
+        for c in 0..4u8 {
+            let nonces = on.get(&secp_address(80 + c)).expect("every sender delivered");
+            assert_eq!(*nonces, (0..200).collect::<Vec<u64>>(), "sender {c} in nonce order, none missing");
+        }
+        assert_eq!(on, off);
     }
 
     #[test]

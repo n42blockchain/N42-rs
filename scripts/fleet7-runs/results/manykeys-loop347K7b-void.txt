@@ -1,0 +1,27 @@
+== loop347K7b: 7 validator logs, f=2, quorum 5
+1. the leaders' commit lines
+  R1_collect (proposal -> prepare QC): n=264 p50 5.0 p90 5.0 p99 6.0 max 21.0 ms
+  R2_collect (prepare QC -> commit QC): n=264 p50 5.0 p90 5.0 p99 5.0 max 6.0 ms
+  total (proposal -> commit): n=264 p50 615.5 p90 622.0 p99 623.0 max 623.0 ms
+  votes at formation: R1 median 5 max 5 (quorum 5); R2 median 5 max 5
+2. vote collection at the traced leaders (first vote -> quorum -> last vote)
+ R1 (vote), 266 views:
+    proposal -> first vote: n=266 p50 2.5 p90 3.0 p99 5.4 max 16540.2 ms
+    first vote -> quorum: n=264 p50 2.1 p90 2.3 p99 2.7 max 18.1 ms
+    quorum -> last vote: n=264 p50 1.1 p90 1.2 p99 1.3 max 31.6 ms
+    proposal -> last vote (the slowest key): n=266 p50 5.8 p90 6.3 p99 51.6 max 21142.0 ms
+   views with fewer than 6 votes received: 266
+ R2 (commit_vote), 264 views:
+    proposal -> first vote: n=264 p50 7.7 p90 8.2 p99 8.6 max 23.0 ms
+    first vote -> quorum: n=264 p50 2.2 p90 2.3 p99 2.4 max 2.7 ms
+    quorum -> last vote: n=264 p50 0.9 p90 0.9 p99 1.1 max 24.9 ms
+    proposal -> last vote (the slowest key): n=264 p50 10.8 p90 11.3 p99 11.8 max 50.4 ms
+   views with fewer than 6 votes received: 1
+3. the straggler rule and the loop
+  proposal interval (same leader, consecutive views): n=265 p50 616.4 p90 622.5 p99 2558.0 max 16479.8 ms; >= 500 ms: 265
+  no `slow step` lines
+4. gossip propagation (proposal sent -> received at a traced follower)
+    proposal arrival delay: n=532 p50 0.3 p90 0.4 p99 2.6 max 6953.6 ms
+5. validators
+validators n=7: cpu total 1.05 cores, per key mean 0.150 median 0.171 max 0.180 (key 0) min 0.021; rss per key peak mean 1.539 max 1.817 G, sum of peaks 10.8 G; threads per key mean 43, total 301
+libp2p connections (last census of 5): 42 in all (a full mesh of 7 is 21); sockets per process min 6 median 6 max 8

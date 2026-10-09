@@ -1,0 +1,21 @@
+log: 1 lines match heal|inconsisten|unwind|corrupt|NippyJar|mismatch; the normal start-up line "Healing static file inconsistencies." x1 (at log line [10]); others: 0
+blocks checked: [460, 1190, 1922] transaction counts from the log: [200000, 200000, 135500]
+block 460: 200000 txs (log 200000), 200000 receipts, status ok 200000, cumulative gas rising: True, ends at 4,200,000,000 = block 461 header gasUsed 4,200,000,000: True, receipt hashes equal the block hash list in order: True
+   tx 0: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 50000: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 100000: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 150000: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 199999: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+block 1190: 200000 txs (log 200000), 200000 receipts, status ok 200000, cumulative gas rising: True, ends at 4,200,000,000 = block 1191 header gasUsed 4,200,000,000: True, receipt hashes equal the block hash list in order: True
+   tx 0: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 50000: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 100000: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 150000: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 199999: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+block 1922: 135500 txs (log 135500), 135500 receipts, status ok 135500, cumulative gas rising: True, ends at 2,845,500,000 = block 1923 header gasUsed 2,845,500,000: True, receipt hashes equal the block hash list in order: True
+   tx 0: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 33875: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 67750: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 101625: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 135499: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+RESULT ok

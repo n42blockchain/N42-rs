@@ -189,7 +189,8 @@ Three distinct kinds of crate directory exist, and they behave differently:
 1. **`crates/n42/*` — original N42 code.** Workspace members, freely editable.
 2. **Vendored reth forks that ARE workspace members** (`crates/chainspec`, `crates/consensus/consensus`,
    `crates/storage/{db,db-api,provider,storage-api}`, `crates/node/{core,builder}`,
-   `crates/ethereum/{cli,hardforks,node}`, `crates/net/peers`; plus `crates/rpc/rpc-types-compat`, a
+   `crates/ethereum/{cli,hardforks,node}`, `crates/net/peers`, `crates/chain-state` (since 2026-10-09:
+   `N42_CANON_NOTIFY_LEAN=1` builds canonical notifications without execution outcomes, bench-only); plus `crates/rpc/rpc-types-compat`, a
    member that is no longer a patch target since upstream renamed it `reth-rpc-convert`).
 3. **Vendored reth forks that are NOT workspace members but ARE patch targets**
    (`crates/revm`, `crates/net/network`, `crates/net/network-api`, `crates/storage/storage-overlay`
@@ -213,6 +214,10 @@ crates that were previously forked and have since been reverted to upstream. Don
   `recover_address()` / `seal_hash()` for APoS signature recovery from block headers.
 - `crates/storage/{provider,storage-overlay}` — the QMDB reader hooks (`n42_state::reader()`, `on` /
   `verify`, `N42_HASHED_TABLES=off`) on latest and historical/overlay state reads.
+- `crates/storage/provider/src/providers/n42_persist.rs` — persistence timers (`save_blocks_*`),
+  `N42_PERSIST_QMDB_IN_SCOPE=1` (QMDB view advance beside the backend writes) and
+  `N42_ACCOUNT_HISTORY=off` (skip the `AccountsHistory` index, changesets kept; gap marker
+  `N42AccountHistoryGap`, gap reads scan changesets; `docs/PERSISTENCE_COST_STUDY.md` section 9).
 - `crates/consensus/consensus/src/lib.rs` — the `Consensus` trait is extended with APoS operations
   (`prepare`, `seal`, `snapshot`, `propose`, `discard`, `proposals`, `total_difficulty`, `wiggle`,
   signer get/set) plus N42 error variants.
@@ -223,6 +228,12 @@ crates that were previously forked and have since been reverted to upstream. Don
   genesis JSON in `crates/chainspec/res/genesis/`.
 - `crates/node/core/src/args/dev.rs` — N42 CLI flags: `--dev.consensus-signer-private-key`,
   `--dev.migrate-old-chain-data-from-db`, `--dev.migrate-old-chain-data-from-rpc`.
+- `crates/n42/h2-execution/src/settlement.rs` (no forked crate touched) — `N42_SETTLEMENT_TAGS=split|legacy`
+  (default `split`): the HotStuff-2 driver's forkchoice sends latest = committed, safe = execution
+  certified (one block behind under deferred execution), finalized = certified and at or below this
+  node's persisted block (read through `n42Engine_persistedBlock` by the validator's existing
+  persistence poller); `legacy` is head = safe = finalized = committed, byte for byte. Node-local RPC
+  semantics only; `docs/PHASE_D_DEFERRED_EXECUTION.md` 17.7.
 
 `N42_CUSTOMIZATIONS.md` is the maintained (Chinese) inventory of these; update it when the set changes.
 

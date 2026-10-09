@@ -118,14 +118,16 @@ impl<ChainSpec: EthChainSpec + EthereumHardforks> HotStuffConsensus<ChainSpec> {
 /// Why a header failed the deferred-execution check.
 #[derive(Debug, thiserror::Error)]
 pub enum DeferredExecutionError {
-    /// The parent's execution result is not known here: it was not executed
-    /// on this node and the chain holds no receipts for it yet.
+    /// The carried ancestor's execution result (the parent's at depth 1, the
+    /// parent's parent's at depth 2) is not known here: it was not executed
+    /// on this node and the chain holds no receipts for it yet. Names the
+    /// ancestor's hash.
     #[error("deferred execution: the parent {0}'s execution result is not known here")]
     ParentUnknown(B256),
-    /// The header's execution fields are not the parent's result.
+    /// The header's execution fields are not the carried ancestor's result.
     #[error("deferred execution: header carries {got:?} for parent {parent}, this node executed {expected:?}")]
     Mismatch {
-        /// The parent.
+        /// The ancestor whose result the header carries (the parent at depth 1).
         parent: B256,
         /// What the header says.
         got: Box<crate::executed_fields::ExecutedFields>,
@@ -138,12 +140,74 @@ pub enum DeferredExecutionError {
 /// the parent's own header if the parent is before the fork (its header
 /// carries its own execution), the registry otherwise.
 pub fn parent_executed_fields(genesis: &alloy_genesis::Genesis, parent: &SealedHeader) -> Option<crate::executed_fields::ExecutedFields> {
+    ancestor_executed_fields(genesis, parent, 1)
+}
+
+/// The hash of the block whose execution result a child of `parent` carries
+/// at `depth` (`docs/DEFERRED_DEPTH_2_DESIGN.md` section 1.1): the parent at
+/// depth 1, the parent's parent at depth 2. By hash on the child's own chain,
+/// never by number.
+pub fn ancestor_hash(parent: &SealedHeader, depth: u64) -> B256 {
+    if depth <= 1 {
+        parent.hash()
+    } else {
+        parent.parent_hash
+    }
+}
+
+/// The execution result a header past the fork must carry when its parent
+/// is `parent` and the chain's deferred-execution depth is `depth`: the
+/// result of the ancestor at that distance on the child's own chain.
+///
+/// Depth 1 is [`parent_executed_fields`]: the parent's own header before the
+/// fork or at genesis, the registry under the parent's hash otherwise.
+pub fn ancestor_executed_fields(
+    genesis: &alloy_genesis::Genesis,
+    parent: &SealedHeader,
+    depth: u64,
+) -> Option<crate::executed_fields::ExecutedFields> {
+    if depth != 1 {
+        // Depth 2 and above (`n42_h2_consensus::deferred_depth`): the chain's
+        // gate is at genesis (`deferredExecutionDepth` is refused otherwise),
+        // so every block carries a deferred result; blocks 1..=D carry the
+        // genesis result, which the parent's own header carries too.
+        return n42_h2_consensus::deferred_depth::expected_fields(
+            &parent_link(parent),
+            depth,
+            crate::executed_fields::fields_from_child_header(parent.header()),
+            crate::executed_fields::get,
+        )
+        .ok();
+    }
     // The genesis header carries the genesis state by definition, whatever
     // the fork time says; so does every header before the fork.
     if parent.number == 0 || !reth_chainspec::qmdb::deferred_execution_active_at(genesis, parent.timestamp) {
         return Some(crate::executed_fields::fields_from_child_header(parent.header()));
     }
     crate::executed_fields::get(&parent.hash())
+}
+
+/// What the depth rule needs of a parent header.
+pub fn parent_link(parent: &SealedHeader) -> n42_h2_consensus::deferred_depth::ParentLink {
+    n42_h2_consensus::deferred_depth::ParentLink {
+        number: parent.number,
+        hash: parent.hash(),
+        parent_hash: parent.parent_hash,
+    }
+}
+
+/// Whether a child of `parent` at `depth` reads its expected fields from the
+/// registry (as opposed to the parent's own header at the chain start or
+/// before the fork): what a caller that waits for the ancestor's result asks
+/// first.
+pub fn ancestor_result_is_recorded(genesis: &alloy_genesis::Genesis, parent: &SealedHeader, depth: u64) -> bool {
+    if depth <= 1 {
+        return parent.number > 0 && reth_chainspec::qmdb::deferred_execution_active_at(genesis, parent.timestamp);
+    }
+    matches!(
+        n42_h2_consensus::deferred_depth::result_source(&parent_link(parent), depth),
+        Ok(n42_h2_consensus::deferred_depth::ResultSource::Recorded(_))
+    )
 }
 
 /// How long [`parent_executed_fields_or_built`] waits for a parent that is
@@ -176,12 +240,26 @@ pub fn parent_executed_fields_or_built(
     parent_built: Option<B256>,
     timeout: std::time::Duration,
 ) -> Option<crate::executed_fields::ExecutedFields> {
-    if let Some(fields) = parent_executed_fields(genesis, parent) {
+    ancestor_executed_fields_or_built(genesis, parent, parent_built, 1, timeout)
+}
+
+/// [`ancestor_executed_fields`], falling back to the hash the builder gave
+/// the ancestor (`ancestor_built`) and waiting for it there; the found fields
+/// are filed under the ancestor's sealed hash as well. At depth 1 this is
+/// [`parent_executed_fields_or_built`].
+pub fn ancestor_executed_fields_or_built(
+    genesis: &alloy_genesis::Genesis,
+    parent: &SealedHeader,
+    ancestor_built: Option<B256>,
+    depth: u64,
+    timeout: std::time::Duration,
+) -> Option<crate::executed_fields::ExecutedFields> {
+    if let Some(fields) = ancestor_executed_fields(genesis, parent, depth) {
         return Some(fields);
     }
-    let built = parent_built?;
+    let built = ancestor_built?;
     let fields = crate::executed_fields::wait_for(&built, timeout)?;
-    crate::executed_fields::remember(parent.hash(), fields);
+    crate::executed_fields::remember(ancestor_hash(parent, depth), fields);
     Some(fields)
 }
 
@@ -275,12 +353,16 @@ where
         // parent's own header carries). The first header past the fork
         // therefore repeats its parent's fields, the invariant at the switch.
         if reth_chainspec::qmdb::deferred_execution_active_at(self.chain_spec.genesis(), header.timestamp) {
-            let expected = parent_executed_fields(self.chain_spec.genesis(), parent)
-                .ok_or_else(|| ConsensusError::Other(Arc::new(DeferredExecutionError::ParentUnknown(parent.hash()))))?;
+            // `deferredExecutionDepth`: the parent's result at depth 1, the
+            // parent's parent's at depth 2 (docs/DEFERRED_DEPTH_2_DESIGN.md).
+            let depth = reth_chainspec::qmdb::deferred_execution_depth_at(self.chain_spec.genesis(), header.timestamp);
+            let ancestor = ancestor_hash(parent, depth);
+            let expected = ancestor_executed_fields(self.chain_spec.genesis(), parent, depth)
+                .ok_or_else(|| ConsensusError::Other(Arc::new(DeferredExecutionError::ParentUnknown(ancestor))))?;
             let got = crate::executed_fields::fields_from_child_header(header);
             if got != expected {
                 return Err(ConsensusError::Other(Arc::new(DeferredExecutionError::Mismatch {
-                    parent: parent.hash(),
+                    parent: ancestor,
                     got: Box::new(got),
                     expected: Box::new(expected),
                 })));
@@ -657,6 +739,163 @@ mod tests {
             B256::repeat_byte(0x73),
         );
         assert_eq!(parent_executed_fields_or_built(&genesis, &other, None, wait), None);
+    }
+
+    /// Depth as a parameter: at depth 1 the general form is the parent's
+    /// result exactly, on a genesis parent, a pre-fork parent, a recorded
+    /// parent and an unknown one (docs/DEFERRED_DEPTH_2_DESIGN.md step 0).
+    #[test]
+    fn at_depth_one_the_ancestor_is_the_parent() {
+        let mut late_fork = alloy_genesis::Genesis::default();
+        late_fork.config.extra_fields.insert(
+            reth_chainspec::qmdb::DEFERRED_EXECUTION_TIME_KEY.to_owned(),
+            serde_json::json!(1_000u64),
+        );
+        let recorded = SealedHeader::new(
+            Header { number: 7, timestamp: 2_000, parent_hash: B256::repeat_byte(0x5e), ..Default::default() },
+            B256::repeat_byte(0x5f),
+        );
+        crate::executed_fields::remember(recorded.hash(), fields(0x50));
+        let carried = Header { state_root: B256::repeat_byte(0x52), gas_used: 9, ..Default::default() };
+        let parents = [
+            SealedHeader::new(Header { number: 0, ..carried.clone() }, B256::repeat_byte(0x53)),
+            SealedHeader::new(Header { number: 3, timestamp: 10, ..carried.clone() }, B256::repeat_byte(0x54)),
+            recorded,
+            SealedHeader::new(Header { number: 8, timestamp: 2_001, ..carried }, B256::repeat_byte(0x55)),
+        ];
+        for genesis in [deferred_genesis(), late_fork] {
+            for parent in &parents {
+                assert_eq!(ancestor_executed_fields(&genesis, parent, 1), parent_executed_fields(&genesis, parent));
+                assert_eq!(ancestor_hash(parent, 1), parent.hash());
+                assert_eq!(
+                    ancestor_executed_fields_or_built(&genesis, parent, None, 1, std::time::Duration::ZERO),
+                    parent_executed_fields_or_built(&genesis, parent, None, std::time::Duration::ZERO),
+                );
+            }
+        }
+    }
+
+    /// A genesis whose headers carry the result two blocks back, from genesis.
+    fn depth_two_genesis() -> alloy_genesis::Genesis {
+        let mut genesis = deferred_genesis();
+        genesis.config.extra_fields.insert(
+            reth_chainspec::qmdb::DEFERRED_EXECUTION_DEPTH_KEY.to_owned(),
+            serde_json::json!(2),
+        );
+        genesis
+    }
+
+    fn carrying(mut header: Header, f: crate::executed_fields::ExecutedFields) -> Header {
+        header.state_root = f.state_root;
+        header.receipts_root = f.receipts_root;
+        header.logs_bloom = f.logs_bloom;
+        header.gas_used = f.gas_used;
+        header
+    }
+
+    /// T2: at depth 2 blocks 1 and 2 carry the genesis fields (no lookup),
+    /// block 3 the result of block 1, a later block its grandparent's by hash;
+    /// two sibling parents of one grandparent give equal expected fields,
+    /// different grandparents different ones; an unknown grandparent none.
+    #[test]
+    fn at_depth_two_the_ancestor_is_the_grandparent() {
+        let genesis = depth_two_genesis();
+        assert_eq!(reth_chainspec::qmdb::deferred_execution_depth_at(&genesis, 1), 2);
+        let genesis_fields = fields(0x80);
+        let block0 = SealedHeader::new(carrying(Header::default(), genesis_fields), alloy_primitives::keccak256(b"depth-two-consensus-0x81"));
+        // Block 1 carries the genesis result; so would block 2 (its parent is 1).
+        let block1 = SealedHeader::new(
+            carrying(Header { number: 1, timestamp: 1, parent_hash: block0.hash(), ..Default::default() }, genesis_fields),
+            alloy_primitives::keccak256(b"depth-two-consensus-0x82"),
+        );
+        assert_eq!(ancestor_executed_fields(&genesis, &block0, 2), Some(genesis_fields), "block 1");
+        assert_eq!(ancestor_executed_fields(&genesis, &block1, 2), Some(genesis_fields), "block 2");
+        assert!(!ancestor_result_is_recorded(&genesis, &block1, 2));
+        // Block 3 (parent 2, grandparent 1): result(1), from the registry.
+        let block2 = SealedHeader::new(
+            carrying(Header { number: 2, timestamp: 2, parent_hash: block1.hash(), ..Default::default() }, genesis_fields),
+            alloy_primitives::keccak256(b"depth-two-consensus-0x83"),
+        );
+        assert!(ancestor_result_is_recorded(&genesis, &block2, 2));
+        assert_eq!(ancestor_hash(&block2, 2), block1.hash());
+        assert_eq!(ancestor_executed_fields(&genesis, &block2, 2), None, "result(1) not recorded yet");
+        crate::executed_fields::remember(block1.hash(), fields(0x84));
+        crate::executed_fields::remember(block2.hash(), fields(0x86));
+        assert_eq!(ancestor_executed_fields(&genesis, &block2, 2), Some(fields(0x84)), "block 3 carries result(1)");
+        // Two siblings at height 2 on block 1: their children expect the same.
+        let sibling = SealedHeader::new(
+            Header { number: 2, timestamp: 3, parent_hash: block1.hash(), ..Default::default() },
+            alloy_primitives::keccak256(b"depth-two-consensus-0x87"),
+        );
+        assert_eq!(ancestor_executed_fields(&genesis, &sibling, 2), ancestor_executed_fields(&genesis, &block2, 2));
+        // A parent on another grandparent expects that one's result.
+        let other = SealedHeader::new(
+            Header { number: 3, timestamp: 4, parent_hash: block2.hash(), ..Default::default() },
+            alloy_primitives::keccak256(b"depth-two-consensus-0x88"),
+        );
+        assert_eq!(ancestor_executed_fields(&genesis, &other, 2), Some(fields(0x86)));
+        // At depth 1 the same parents expect their own results.
+        assert_eq!(ancestor_executed_fields(&genesis, &block2, 1), Some(fields(0x86)));
+        // The builder's fallback at depth 2: the grandparent filed under its
+        // builder hash only is found and filed under the sealed hash.
+        let unknown = SealedHeader::new(
+            Header { number: 9, timestamp: 9, parent_hash: alloy_primitives::keccak256(b"depth-two-consensus-0x89"), ..Default::default() },
+            alloy_primitives::keccak256(b"depth-two-consensus-0x8a"),
+        );
+        let wait = std::time::Duration::from_millis(20);
+        assert_eq!(ancestor_executed_fields_or_built(&genesis, &unknown, None, 2, wait), None);
+        crate::executed_fields::remember(alloy_primitives::keccak256(b"depth-two-consensus-0x8b"), fields(0x8c));
+        assert_eq!(
+            ancestor_executed_fields_or_built(&genesis, &unknown, Some(alloy_primitives::keccak256(b"depth-two-consensus-0x8b")), 2, wait),
+            Some(fields(0x8c))
+        );
+        assert_eq!(crate::executed_fields::get(&alloy_primitives::keccak256(b"depth-two-consensus-0x89")), Some(fields(0x8c)));
+        // A depth outside the rule has no expected fields.
+        assert_eq!(ancestor_executed_fields(&genesis, &block2, 3), None);
+    }
+
+    /// T3: the header check at depth 2 accepts result(N-2) and refuses
+    /// result(N-1) (the depth-1 value) and result(N-3); a depth-1 chain judges
+    /// the same headers the other way -- the mixed-fleet refusal, at unit level.
+    #[test]
+    fn each_depth_refuses_the_other_depths_header() {
+        let d2 = HotStuffConsensus::new(Arc::new(ChainSpecBuilder::mainnet().genesis(depth_two_genesis()).build()));
+        let d1 = deferred_consensus();
+        let grandparent = alloy_primitives::keccak256(b"depth-two-consensus-0x90");
+        crate::executed_fields::remember(grandparent, fields(0x92)); // result(N-2)
+        let mut parent_header = carrying(good_header(600, TS_SHANGHAI), fields(0x94)); // carries result(N-3)
+        parent_header.gas_used = 0;
+        parent_header.parent_hash = grandparent;
+        let parent = sealed(parent_header);
+        crate::executed_fields::remember(parent.hash(), fields(0x96)); // result(N-1)
+        let child_with = |f| {
+            let mut child = carrying(good_header(601, TS_SHANGHAI + 3), f);
+            child.parent_hash = parent.hash();
+            child.base_fee_per_gas = Some(875);
+            sealed(child)
+        };
+        assert!(d2.validate_header_against_parent(&child_with(fields(0x92)), &parent).is_ok());
+        for wrong in [fields(0x96), fields(0x94)] {
+            let err = d2.validate_header_against_parent(&child_with(wrong), &parent).unwrap_err();
+            assert!(matches!(
+                other_err::<DeferredExecutionError>(&err),
+                Some(DeferredExecutionError::Mismatch { parent, .. }) if *parent == grandparent
+            ));
+        }
+        assert!(d1.validate_header_against_parent(&child_with(fields(0x96)), &parent).is_ok());
+        assert!(d1.validate_header_against_parent(&child_with(fields(0x92)), &parent).is_err());
+        // An unknown grandparent is named.
+        let mut orphan_header = good_header(600, TS_SHANGHAI);
+        orphan_header.parent_hash = alloy_primitives::keccak256(b"depth-two-consensus-0x98");
+        let orphan = sealed(orphan_header);
+        let mut child = good_header(601, TS_SHANGHAI + 3);
+        child.parent_hash = orphan.hash();
+        child.base_fee_per_gas = Some(875);
+        let err = d2.validate_header_against_parent(&sealed(child), &orphan).unwrap_err();
+        assert!(matches!(
+            other_err::<DeferredExecutionError>(&err),
+            Some(DeferredExecutionError::ParentUnknown(h)) if *h == alloy_primitives::keccak256(b"depth-two-consensus-0x98")
+        ));
     }
 
     /// A block before the fork carries its own execution, so neither the

@@ -1,0 +1,16 @@
+[package]
+name = "n42-core-layout"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "A node-internal CPU layout: dedicated cores for the critical pools, the rest for background work"
+
+[lints]
+workspace = true
+
+[dependencies]
+libc.workspace = true
+tracing.workspace = true

@@ -44,7 +44,35 @@ pub struct BuiltExecution {
 /// each is ~100 MB at 163,000 transactions (block, bundle state, receipts),
 /// and on a box whose page cache is the contended resource every retained
 /// hundred megabytes is a hundred megabytes of state pages evicted.
-const KEEP: usize = 3;
+const DEFAULT_KEEP: usize = 3;
+
+/// Parses `N42_BUILT_KEEP`: an unsigned number in `3..=16`, else the default
+/// (with one warning for a value that is set but invalid).
+fn built_keep_from(value: Option<&str>) -> usize {
+    let Some(raw) = value else { return DEFAULT_KEEP };
+    match raw.trim().parse::<usize>() {
+        Ok(n) if (3..=16).contains(&n) => n,
+        _ => {
+            tracing::warn!(target: "n42.built_executions", value = raw, default = DEFAULT_KEEP, "N42_BUILT_KEEP must be an integer in 3..=16; using the default");
+            DEFAULT_KEEP
+        }
+    }
+}
+
+/// How many own built executions the stores keep (`N42_BUILT_KEEP`, `3..=16`,
+/// default 3), read once.
+///
+/// Why it is tunable: under pipeline depth 2 with `N42_CHECK_BEFORE_SLOT=1`
+/// and `N42_FAR_AHEAD_BLOCKS=2` the validators' import of an own block arrives
+/// 280-400 ms after its seal, 3-4 builds later (loop351 D2S12F2P45T64), so the
+/// entry was already evicted and 1115 of 1156 own blocks were re-executed
+/// through the direct import (136 ms) instead of the hand-off (48 ms).
+/// What an entry costs: one full 200k-transaction bundle with its hashed state
+/// and trie updates, freed on the `n42-built-free` thread.
+fn keep() -> usize {
+    static KEEP: OnceLock<usize> = OnceLock::new();
+    *KEEP.get_or_init(|| built_keep_from(std::env::var("N42_BUILT_KEEP").ok().as_deref()))
+}
 
 /// How far a build that was sealed before it finished has come
 /// (docs/PHASE_D_DEFERRED_EXECUTION.md section 13).
@@ -103,18 +131,106 @@ const WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn store() -> &'static (Mutex<VecDeque<(B256, Entry)>>, Condvar) {
     static STORE: OnceLock<(Mutex<VecDeque<(B256, Entry)>>, Condvar)> = OnceLock::new();
-    STORE.get_or_init(|| (Mutex::new(VecDeque::with_capacity(KEEP)), Condvar::new()))
+    STORE.get_or_init(|| (Mutex::new(VecDeque::with_capacity(keep())), Condvar::new()))
+}
+
+/// The store's hard bound: only builds still finishing behind their seal may
+/// take it past [`keep`].
+fn keep_finishing() -> usize {
+    2 * keep()
 }
 
 fn put(built_hash: B256, entry: Entry) {
     let (store, advanced) = store();
     let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
-    store.retain(|(hash, _)| *hash != built_hash);
-    while store.len() >= KEEP {
-        store.pop_front();
-    }
-    store.push_back((built_hash, entry));
+    let evicted = put_into(&mut store, built_hash, entry);
+    drop(store);
     advanced.notify_all();
+    free_off_path(evicted);
+}
+
+/// [`put`]'s change to the store, returning what left it instead of dropping
+/// it under the store's lock: an evicted `Complete` entry holds a full
+/// block's bundle, receipts and hashed state, whose free was `seal_remember_ms`
+/// 3 ms (p90 5) on the seal's path (`docs/SHARED_EXECUTION_SCOPE.md` 16.3).
+/// The store after it is the store `retain` + [`make_room`] + `push_back`
+/// left: the same entries in the same order.
+fn put_into(store: &mut VecDeque<(B256, Entry)>, built_hash: B256, entry: Entry) -> Vec<Entry> {
+    let mut evicted = Vec::new();
+    while let Some(at) = store.iter().position(|(hash, _)| *hash == built_hash) {
+        if let Some((_, old)) = store.remove(at) {
+            evicted.push(old);
+        }
+    }
+    make_room_into(store, &mut evicted);
+    store.push_back((built_hash, entry));
+    evicted
+}
+
+/// Drops evicted entries on a thread of their own (`n42-built-free`), off
+/// the caller's path and the store's lock; inline if that thread cannot be
+/// had. Nothing reads an entry once it left the store.
+fn free_off_path(evicted: Vec<Entry>) {
+    if evicted.is_empty() {
+        return;
+    }
+    static FREE: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Vec<Entry>>>>> = OnceLock::new();
+    let sender = FREE.get_or_init(|| {
+        let (send, receive) = std::sync::mpsc::channel::<Vec<Entry>>();
+        std::thread::Builder::new()
+            .name("n42-built-free".into())
+            .spawn(move || {
+                while let Ok(entries) = receive.recv() {
+                    drop(entries);
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(send))
+    });
+    let unsent = match sender {
+        Some(sender) => sender.lock().unwrap_or_else(|p| p.into_inner()).send(evicted).err().map(|err| err.0),
+        None => Some(evicted),
+    };
+    drop(unsent);
+}
+
+/// Frees a slot for one more build. A finished build goes first, oldest
+/// first; a build still finishing behind its seal is evicted only past
+/// [`keep_finishing`]. Its advances are dropped once it has left the store
+/// ([`advance`]), so evicting it loses the block for its own import
+/// ("the execution layer no longer holds own block"). loop320 FASb: with the
+/// fields published at the seal three own builds were finishing at once at
+/// the tenure handover, a given-up build ahead on the old parent had been
+/// filed finished beside them, and the oldest finishing build was evicted
+/// for the newest. Keeping a finishing entry costs nothing its finish does
+/// not hold anyway.
+#[cfg(test)]
+fn make_room(store: &mut VecDeque<(B256, Entry)>) {
+    while store.len() >= keep() {
+        if let Some(at) = store.iter().position(|(_, entry)| entry.stage == Stage::Complete) {
+            store.remove(at);
+        } else if store.len() >= keep_finishing() {
+            store.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+/// [`make_room`], the evicted entries handed to `evicted` rather than dropped.
+fn make_room_into(store: &mut VecDeque<(B256, Entry)>, evicted: &mut Vec<Entry>) {
+    while store.len() >= keep() {
+        let removed = if let Some(at) = store.iter().position(|(_, entry)| entry.stage == Stage::Complete) {
+            store.remove(at)
+        } else if store.len() >= keep_finishing() {
+            store.pop_front()
+        } else {
+            break;
+        };
+        if let Some((_, entry)) = removed {
+            evicted.push(entry);
+        }
+    }
 }
 
 /// Remembers a finished build under the hash the builder gave it.
@@ -163,7 +279,7 @@ fn advance(built_hash: B256, stage: Stage, execution: BuiltExecution) {
             entry.execution = Some(execution);
             entry.shards = None;
         }
-        // Evicted (a finish that ran longer than KEEP builds), or never
+        // Evicted (a finish that ran longer than `keep()` builds), or never
         // pending: not re-filed -- that would evict a live build the engine
         // or the next build still needs.
         None => {
@@ -317,7 +433,7 @@ pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, ga
     // the store's.
     let mut handed = handed().lock().unwrap_or_else(|p| p.into_inner());
     handed.retain(|(hash, _)| *hash != taken.0);
-    while handed.len() >= KEEP {
+    while handed.len() >= keep() {
         handed.pop_front();
     }
     handed.push_back(taken.clone());
@@ -327,7 +443,7 @@ pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, ga
 /// Builds [`take`] handed to the engine, still findable by [`find_kept`].
 fn handed() -> &'static Mutex<VecDeque<(B256, BuiltExecution)>> {
     static HANDED: OnceLock<Mutex<VecDeque<(B256, BuiltExecution)>>> = OnceLock::new();
-    HANDED.get_or_init(|| Mutex::new(VecDeque::with_capacity(KEEP)))
+    HANDED.get_or_init(|| Mutex::new(VecDeque::with_capacity(keep())))
 }
 
 /// The kept build matching these fields, at whatever stage it has reached,
@@ -403,31 +519,206 @@ fn matches_block(block: &RecoveredBlock<Block>, parent: B256, number: u64, state
 /// did not). Its conversion of the payload would decode every transaction
 /// again -- 48 ms at 163,000 transactions, on the leader's path between one
 /// proposal and the next build -- to produce the block that is already here.
-fn sealed_store() -> &'static Mutex<VecDeque<(B256, SealedBlock<Block>)>> {
-    static STORE: OnceLock<Mutex<VecDeque<(B256, SealedBlock<Block>)>>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(VecDeque::with_capacity(KEEP)))
+fn sealed_store() -> &'static Mutex<VecDeque<(B256, SealedKept)>> {
+    static STORE: OnceLock<Mutex<VecDeque<(B256, SealedKept)>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(VecDeque::with_capacity(keep())))
+}
+
+/// A sealed block in the store: its own copy, or the executed block handed
+/// to the engine, shared (`N42_HANDOFF_NO_CLONE`).
+#[derive(Debug)]
+enum SealedKept {
+    Owned(SealedBlock<Block>),
+    Shared(Arc<RecoveredBlock<Block>>),
+}
+
+impl SealedKept {
+    fn block(&self) -> &SealedBlock<Block> {
+        match self {
+            Self::Owned(block) => block,
+            Self::Shared(recovered) => recovered.sealed_block(),
+        }
+    }
+
+    /// The block by value: moved when this is its only holder, else copied.
+    fn into_block(self) -> SealedBlock<Block> {
+        match self {
+            Self::Owned(block) => block,
+            Self::Shared(recovered) => {
+                Arc::try_unwrap(recovered).map_or_else(|shared| shared.sealed_block().clone(), RecoveredBlock::into_sealed_block)
+            }
+        }
+    }
+}
+
+/// Parses `N42_HANDOFF_NO_CLONE`: on only for `1`.
+fn handoff_no_clone_from(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+/// Whether the own-block hand-off shares its executed block with the sealed
+/// store instead of copying the body for it (`N42_HANDOFF_NO_CLONE=1`,
+/// default off).
+///
+/// The hand-off copies the build's body once for the engine's insert -- the
+/// build is still held by the handed store ([`take`] keeps it for the build
+/// on the sealed block), so `Arc::try_unwrap` fails and the body is cloned --
+/// and once more for [`remember_sealed`]. The first copy is unavoidable while
+/// the handed store holds the build (the insert needs a block under the
+/// sealed header, and the body sits by value in the block); the second is
+/// not: the store can keep the very `Arc` the insert carries. Readers of the
+/// store copy out of it as before ([`find_sealed`]); a take moves the block
+/// only once the engine has dropped its copy.
+pub fn handoff_no_clone_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| handoff_no_clone_from(std::env::var("N42_HANDOFF_NO_CLONE").ok().as_deref()))
 }
 
 /// Keeps the sealed block under its sealed hash.
 pub fn remember_sealed(sealed_hash: B256, block: SealedBlock<Block>) {
+    let transactions = block.body().transactions.len();
+    keep_sealed(sealed_hash, transactions, SealedKept::Owned(block));
+}
+
+/// [`remember_sealed`] sharing the executed block handed to the engine
+/// (`N42_HANDOFF_NO_CLONE`): no copy of the body.
+pub fn remember_sealed_shared(sealed_hash: B256, block: Arc<RecoveredBlock<Block>>) {
+    let transactions = block.body().transactions.len();
+    keep_sealed(sealed_hash, transactions, SealedKept::Shared(block));
+}
+
+/// Parses `N42_HANDOFF_MOVE_BODY`: on only for `1`.
+fn handoff_move_body_from(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+/// Whether the own-block hand-off moves the build's body under the sealed
+/// header instead of copying it (`N42_HANDOFF_MOVE_BODY=1`, default off).
+///
+/// The hand-off needs the block under the header consensus sealed, and the
+/// body sits by value in a `RecoveredBlock`, so it can only be moved when the
+/// hand-off holds the block's last `Arc`. With the switch off the stores keep
+/// theirs (the build store entry and its execution, the handed list, a
+/// shared sealed block) and the 200k-transaction body and senders are cloned:
+/// `clone_ms` 36-38 ms on every slow hand-off (loop351 stage j). With it on,
+/// [`reseal_moving`] takes those `Arc`s out under the stores' locks, moves the
+/// body and senders under the sealed header, and puts the one new `Arc` back
+/// in every slot that held the build: the build hash then aliases the sealed
+/// block, so readers by the build's hash or by its fields find the same block
+/// (its header is the sealed one; every field they match on or compare is one
+/// a seal does not change). A holder outside the stores (a build on the
+/// sealed block reading it on a thread, a payload not yet dropped) makes the
+/// move fail; the body is then cloned as before and the hand-off line says
+/// `moved_body=false`.
+pub fn handoff_move_body_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| handoff_move_body_from(std::env::var("N42_HANDOFF_MOVE_BODY").ok().as_deref()))
+}
+
+/// The block under `sealed`, made by moving `block`'s body and senders when
+/// the stores' references to it are the only others (`Ok`), every store slot
+/// that held `block` then holding the returned `Arc`; `Err(block)` when a
+/// holder outside the stores keeps it alive, every slot left as it was.
+///
+/// A block already under the sealed hash (a second hand-off of the same
+/// block, which found the alias) is returned as it is.
+pub fn reseal_moving(
+    built_hash: B256,
+    block: Arc<RecoveredBlock<Block>>,
+    sealed: reth_primitives_traits::SealedHeader,
+) -> Result<Arc<RecoveredBlock<Block>>, Arc<RecoveredBlock<Block>>> {
+    if block.hash() == sealed.hash() {
+        return Ok(block);
+    }
+    // Lock order store -> handed -> sealed store; no other function holds
+    // two of these at once.
+    let (store, advanced) = store();
+    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+    let mut sealed_kept = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
+    let mut slots: Vec<&mut Arc<RecoveredBlock<Block>>> = Vec::new();
+    for (hash, entry) in store.iter_mut() {
+        if *hash != built_hash {
+            continue;
+        }
+        if Arc::ptr_eq(&entry.block, &block) {
+            slots.push(&mut entry.block);
+        }
+        if let Some(execution) = entry.execution.as_mut()
+            && Arc::ptr_eq(&execution.block, &block)
+        {
+            slots.push(&mut execution.block);
+        }
+    }
+    for (hash, built) in handed.iter_mut() {
+        if *hash == built_hash && Arc::ptr_eq(&built.block, &block) {
+            slots.push(&mut built.block);
+        }
+    }
+    for (_, kept) in sealed_kept.iter_mut() {
+        if let SealedKept::Shared(shared) = kept
+            && Arc::ptr_eq(shared, &block)
+        {
+            slots.push(shared);
+        }
+    }
+    // A stand-in while the block is out: cheap, and never seen outside the
+    // locks held here.
+    let stand_in = Arc::new(RecoveredBlock::new_sealed(SealedBlock::seal_slow(Block::default()), Vec::new()));
+    for slot in &mut slots {
+        drop(std::mem::replace(&mut **slot, Arc::clone(&stand_in)));
+    }
+    let result = match Arc::try_unwrap(block) {
+        Ok(owned) => {
+            let (built_block, senders) = owned.split_sealed();
+            let body = built_block.split_sealed_header_body().1;
+            Ok(Arc::new(RecoveredBlock::new_sealed(SealedBlock::from_sealed_parts(sealed, body), senders)))
+        }
+        Err(shared) => Err(shared),
+    };
+    let back = match &result {
+        Ok(moved) | Err(moved) => moved,
+    };
+    for slot in slots {
+        *slot = Arc::clone(back);
+    }
+    drop(sealed_kept);
+    drop(handed);
+    drop(store);
+    advanced.notify_all();
+    result
+}
+
+/// The block kept for the build `built_hash`, in the build store or on the
+/// handed list: after a [`reseal_moving`], the sealed block (the alias from
+/// the build hash).
+pub fn kept_block(built_hash: B256) -> Option<Arc<RecoveredBlock<Block>>> {
+    if let Some(entry) = store_get(built_hash) {
+        return Some(entry.block);
+    }
+    let handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+    handed.iter().rev().find(|(hash, _)| *hash == built_hash).map(|(_, built)| Arc::clone(&built.block))
+}
+
+fn keep_sealed(sealed_hash: B256, transactions: usize, block: SealedKept) {
     {
         let mut hints = sealed_hints().lock().unwrap_or_else(|p| p.into_inner());
         hints.retain(|(hash, _)| *hash != sealed_hash);
         while hints.len() >= SEALED_HINTS {
             hints.pop_front();
         }
-        hints.push_back((sealed_hash, block.body().transactions.len()));
+        hints.push_back((sealed_hash, transactions));
     }
     let mut store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
     store.retain(|(hash, _)| *hash != sealed_hash);
-    while store.len() >= KEEP {
+    while store.len() >= keep() {
         store.pop_front();
     }
     store.push_back((sealed_hash, block));
 }
 
 /// How many sealed hashes [`sealed_here_with_transactions`] remembers: the
-/// sealed blocks themselves are retired after [`KEEP`], their hashes and
+/// sealed blocks themselves are retired after [`keep`], their hashes and
 /// transaction counts stay much longer, so a header-only payload for a
 /// block whose body is gone is recognised as such.
 const SEALED_HINTS: usize = 256;
@@ -451,17 +742,17 @@ pub fn sealed_here_with_transactions(hash: B256) -> bool {
 pub fn take_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
     let mut store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
     let at = store.iter().position(|(hash, _)| *hash == sealed_hash)?;
-    store.remove(at).map(|(_, block)| block)
+    store.remove(at).map(|(_, block)| block.into_block())
 }
 
 /// The sealed block under this hash, left in the store: the engine converts
 /// a header-only own-block payload more than once on some paths (a sibling
 /// re-proposed after a TC was converted, then executed with the *empty*
 /// transaction list the payload carries: loop147-150), and every conversion
-/// must find the body. The store's bound (`KEEP`) retires it.
+/// must find the body. The store's bound (`keep()`) retires it.
 pub fn find_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
     let store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
-    store.iter().find(|(hash, _)| *hash == sealed_hash).map(|(_, block)| block.clone())
+    store.iter().find(|(hash, _)| *hash == sealed_hash).map(|(_, block)| block.block().clone())
 }
 
 /// [`find_sealed`] for a caller whose payload carries `transactions` in full:
@@ -477,10 +768,10 @@ pub fn find_or_take_sealed(sealed_hash: B256, transactions: usize) -> Option<Sea
     }
     let mut store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
     let at = store.iter().position(|(hash, _)| *hash == sealed_hash)?;
-    if store[at].1.body().transactions.len() != transactions {
-        return Some(store[at].1.clone());
+    if store[at].1.block().body().transactions.len() != transactions {
+        return Some(store[at].1.block().clone());
     }
-    store.remove(at).map(|(_, block)| block)
+    store.remove(at).map(|(_, block)| block.into_block())
 }
 
 /// Whether `N42_ENGINE_TAKE_SEALED=1` is set; see [`find_or_take_sealed`].
@@ -490,20 +781,155 @@ pub fn take_sealed_enabled() -> bool {
 }
 
 /// Serialises every test that files builds: the stores are process-global and
-/// bounded by [`KEEP`], so concurrent tests would evict each other's builds.
+/// bounded by [`keep`], so concurrent tests would evict each other's builds.
 #[cfg(test)]
 pub(crate) static STORE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn built_keep_parses_and_bounds() {
+        assert_eq!(built_keep_from(None), 3);
+        assert_eq!(built_keep_from(Some("8")), 8);
+        assert_eq!(built_keep_from(Some("16")), 16);
+        assert_eq!(built_keep_from(Some("2")), 3);
+        assert_eq!(built_keep_from(Some("17")), 3);
+        assert_eq!(built_keep_from(Some("x")), 3);
+    }
+
+    #[test]
+    fn handoff_no_clone_is_on_only_for_one() {
+        assert!(handoff_no_clone_from(Some("1")));
+        for off in [None, Some(""), Some("0"), Some("true")] {
+            assert!(!handoff_no_clone_from(off), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn handoff_move_body_is_on_only_for_one() {
+        assert!(handoff_move_body_from(Some("1")));
+        for off in [None, Some(""), Some("0"), Some("true")] {
+            assert!(!handoff_move_body_from(off), "{off:?}");
+        }
+    }
+
+    fn sealed_of(built: &Header) -> reth_primitives_traits::SealedHeader {
+        reth_primitives_traits::SealedHeader::seal_slow(Header { extra_data: b"sealed".as_slice().into(), ..built.clone() })
+    }
+
+    /// A handed build whose block is moved under the sealed header: the
+    /// hand-off was the last holder outside the stores, so nothing is cloned;
+    /// the sealed block is found under the sealed hash and, through the
+    /// alias, under the build hash and by its fields.
+    #[test]
+    fn a_handed_build_is_resealed_by_move_and_found_both_ways() {
+        let _guard = lock();
+        let h = header(0x61, 610);
+        let execution = built(&h);
+        let built_hash = execution.block.hash();
+        remember(built_hash, execution);
+        let (hash, taken) = take(h.parent_hash, 610, h.state_root, h.receipts_root, h.gas_used, None).expect("taken");
+        assert_eq!(hash, built_hash);
+        let sealed = sealed_of(&h);
+        let sealed_hash = sealed.hash();
+        let moved = reseal_moving(built_hash, taken.block, sealed).expect("the stores were the only other holders");
+        assert_eq!(moved.hash(), sealed_hash);
+        assert_eq!(moved.body().transactions.len(), 0);
+        remember_sealed_shared(sealed_hash, Arc::clone(&moved));
+        assert_eq!(find_sealed(sealed_hash).map(|block| block.hash()), Some(sealed_hash));
+        let aliased = kept_block(built_hash).expect("the build hash aliases the sealed block");
+        assert!(Arc::ptr_eq(&aliased, &moved));
+        let (kept_hash, by_fields, execution) =
+            find_kept_sealed(h.parent_hash, 610, h.state_root, h.receipts_root, h.gas_used, None).expect("by fields");
+        assert_eq!(kept_hash, built_hash);
+        assert!(Arc::ptr_eq(&by_fields, &moved));
+        assert!(execution.is_some_and(|execution| Arc::ptr_eq(&execution.block, &moved)));
+        assert!(wait_for(built_hash, Stage::Complete).is_some_and(|execution| execution.block.hash() == sealed_hash));
+    }
+
+    /// A build kept in the store (a header-only import that leaves it for the
+    /// build on seal) is resealed in the store's entry, its block and its
+    /// execution both.
+    #[test]
+    fn a_stored_build_is_resealed_in_both_of_its_slots() {
+        let _guard = lock();
+        let h = header(0x62, 620);
+        let execution = built(&h);
+        let built_hash = execution.block.hash();
+        remember(built_hash, execution);
+        let (_, found) = find(h.parent_hash, 620, h.state_root, h.receipts_root, h.gas_used, None).expect("found");
+        let sealed = sealed_of(&h);
+        let moved = reseal_moving(built_hash, found.block, sealed.clone()).expect("moved");
+        let entry = store_get(built_hash).expect("still stored");
+        assert!(Arc::ptr_eq(&entry.block, &moved));
+        assert!(entry.execution.is_some_and(|execution| Arc::ptr_eq(&execution.block, &moved)));
+    }
+
+    /// A holder outside the stores keeps the block: nothing moves, every slot
+    /// keeps the build as it was, and the caller gets the block back to copy.
+    #[test]
+    fn a_block_held_elsewhere_is_not_moved() {
+        let _guard = lock();
+        let h = header(0x63, 630);
+        let execution = built(&h);
+        let built_hash = execution.block.hash();
+        remember(built_hash, execution);
+        let (_, taken) = take(h.parent_hash, 630, h.state_root, h.receipts_root, h.gas_used, None).expect("taken");
+        let elsewhere = Arc::clone(&taken.block);
+        let back = reseal_moving(built_hash, taken.block, sealed_of(&h)).expect_err("held elsewhere");
+        assert!(Arc::ptr_eq(&back, &elsewhere));
+        assert_eq!(back.hash(), built_hash);
+        assert!(kept_block(built_hash).is_some_and(|kept| Arc::ptr_eq(&kept, &elsewhere)));
+    }
+
+    /// A second hand-off of the same block finds the alias, already under the
+    /// sealed hash: returned as it is, without a panic or a copy.
+    #[test]
+    fn a_second_handoff_of_a_resealed_block_returns_it() {
+        let _guard = lock();
+        let h = header(0x64, 640);
+        let execution = built(&h);
+        let built_hash = execution.block.hash();
+        remember(built_hash, execution);
+        let (_, taken) = take(h.parent_hash, 640, h.state_root, h.receipts_root, h.gas_used, None).expect("taken");
+        let sealed = sealed_of(&h);
+        let moved = reseal_moving(built_hash, taken.block, sealed.clone()).expect("moved");
+        let (_, again) =
+            find_kept(h.parent_hash, 640, h.state_root, h.receipts_root, h.gas_used, None).expect("found by the alias");
+        let second = reseal_moving(built_hash, again.block, sealed.clone()).expect("already sealed");
+        assert!(Arc::ptr_eq(&second, &moved));
+        assert_eq!(second.hash(), sealed.hash());
+    }
+
+    /// A shared sealed block is found by copy while the engine holds it and
+    /// moved out by a take once it does not.
+    #[test]
+    fn a_shared_sealed_block_is_found_and_taken() {
+        let _guard = lock();
+        let header = Header { number: 777, ..Default::default() };
+        let sealed = SealedBlock::<Block>::seal_slow(alloy_consensus::Block::new(header, BlockBody::default()));
+        let hash = sealed.hash();
+        let shared = Arc::new(RecoveredBlock::new_sealed(sealed, Vec::new()));
+        remember_sealed_shared(hash, Arc::clone(&shared));
+        assert_eq!(find_sealed(hash).map(|block| block.hash()), Some(hash));
+        drop(shared);
+        assert_eq!(take_sealed(hash).map(|block| block.hash()), Some(hash));
+        assert!(find_sealed(hash).is_none());
+    }
+
     use super::*;
     use alloy_consensus::Header;
     use n42_tx_types::{BlockBody, N42TxEnvelope};
     use reth_execution_types::BlockExecutionOutput;
     use std::time::{Duration, Instant};
 
+    /// Serialises the store's tests and starts each on an empty store: a
+    /// build a test left sealed and never finished would otherwise hold a
+    /// slot for the next test (`make_room` keeps finishing builds).
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        STORE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+        let guard = STORE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        store().0.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        guard
     }
 
     fn header(tag: u8, number: u64) -> Header {
@@ -575,10 +1001,72 @@ mod tests {
         assert_eq!(by_root(None), Some(hb));
     }
 
+    /// T11 of docs/DEFERRED_DEPTH_2_DESIGN.md: at depth 2 two blocks on
+    /// *different* parents of one grandparent carry the same four fields (the
+    /// grandparent's result); the store's identity includes the parent, so
+    /// each is found under its own and never under the other's.
+    #[test]
+    fn at_depth_two_cousins_with_the_same_fields_are_kept_apart() {
+        let _guard = lock();
+        let a = header(0x13, 503);
+        let b = Header { parent_hash: B256::repeat_byte(0x9a), ..a.clone() };
+        assert_eq!((a.state_root, a.receipts_root, a.gas_used), (b.state_root, b.receipts_root, b.gas_used));
+        let (ea, eb) = (built(&a), built(&b));
+        let (ha, hb) = (ea.block.hash(), eb.block.hash());
+        assert_ne!(ha, hb);
+        remember(ha, ea);
+        remember(hb, eb);
+        assert_eq!(find_by(&a).map(|(h, _)| h), Some(ha));
+        assert_eq!(find_by(&b).map(|(h, _)| h), Some(hb));
+        let by_parent = |parent| find(parent, 503, a.state_root, a.receipts_root, a.gas_used, Some(a.transactions_root)).map(|(h, _)| h);
+        assert_eq!(by_parent(a.parent_hash), Some(ha));
+        assert_eq!(by_parent(b.parent_hash), Some(hb));
+    }
+
+    /// The eviction moved off the store's lock leaves the store the inline
+    /// eviction left -- the same hashes and stages in the same order -- over
+    /// a long run of puts mixing finished and finishing builds and repeats,
+    /// and hands out exactly the entries the inline one dropped.
+    #[test]
+    fn an_evicted_entry_is_dropped_off_the_lock_and_the_store_is_the_same() {
+        use alloy_primitives::U256;
+        let block = built(&header(0x31, 1)).block;
+        let entry = |stage: Stage| Entry { stage, block: Arc::clone(&block), execution: None, shards: None };
+        let mut inline: VecDeque<(B256, Entry)> = VecDeque::new();
+        let mut moved: VecDeque<(B256, Entry)> = VecDeque::new();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut evicted_total = 0usize;
+        for n in 0..400u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            // Some hashes come back (a re-put), most are new.
+            let hash = B256::from(U256::from(if seed.is_multiple_of(5) { seed % 7 } else { 1_000 + n }));
+            let stage = match seed % 4 {
+                0 => Stage::Sealed,
+                1 => Stage::StateReady,
+                _ => Stage::Complete,
+            };
+            let before: usize = inline.len();
+            let replaced = inline.iter().filter(|(h, _)| *h == hash).count();
+            inline.retain(|(h, _)| *h != hash);
+            make_room(&mut inline);
+            let dropped = before - inline.len();
+            inline.push_back((hash, entry(stage)));
+            let evicted = put_into(&mut moved, hash, entry(stage));
+            assert_eq!(evicted.len(), dropped, "put {n}: as many entries leave ({replaced} replaced)");
+            evicted_total += evicted.len();
+            free_off_path(evicted);
+            let keys = |store: &VecDeque<(B256, Entry)>| store.iter().map(|(h, e)| (*h, e.stage)).collect::<Vec<_>>();
+            assert_eq!(keys(&inline), keys(&moved), "put {n}");
+        }
+        assert!(evicted_total > 0);
+    }
+
     #[test]
     fn the_store_keeps_only_the_last_few_builds() {
         let _guard = lock();
-        let hashes: Vec<B256> = (0..=KEEP as u8)
+        let hashes: Vec<B256> = (0..=keep() as u8)
             .map(|i| {
                 let execution = built(&header(0x20 + i, 510 + u64::from(i)));
                 let hash = execution.block.hash();
@@ -631,15 +1119,30 @@ mod tests {
         let execution = built(&h);
         let hash = execution.block.hash();
         remember_pending(hash, execution.block.clone());
+        // Ordered by the test, not by the clock: the old form measured the
+        // waiter's own elapsed time against the main thread's 100 ms sleep,
+        // and a waiter thread scheduled 10+ ms late on a loaded machine read
+        // under 90 ms. What it asserts is the same: the waiter returned with
+        // the block (a deadline returns `None`), and only after the stage was
+        // reached (`completed` is set before `complete` runs, and nothing
+        // else can move the build to `Complete`).
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let seen = std::sync::Arc::clone(&completed);
         let waiter = std::thread::spawn(move || {
-            let at = Instant::now();
-            (wait_for(hash, Stage::Complete).is_some(), at.elapsed())
+            let _ = ready_tx.send(());
+            let found = wait_for(hash, Stage::Complete).is_some();
+            (found, seen.load(std::sync::atomic::Ordering::SeqCst))
         });
-        std::thread::sleep(Duration::from_millis(100));
+        ready_rx.recv().expect("the waiter started");
+        // Not needed for the assertion; it gives the waiter time to block,
+        // so the test exercises the wake-up rather than the first look.
+        std::thread::sleep(Duration::from_millis(50));
+        completed.store(true, std::sync::atomic::Ordering::SeqCst);
         complete(hash, execution);
-        let (found, waited) = waiter.join().unwrap();
-        assert!(found);
-        assert!(waited >= Duration::from_millis(90) && waited < WAIT, "woke on the stage, not the deadline: {waited:?}");
+        let (found, after_complete) = waiter.join().unwrap();
+        assert!(found, "woke on the stage, not the deadline");
+        assert!(after_complete, "returned only once the stage was reached");
     }
 
     #[test]
@@ -660,6 +1163,57 @@ mod tests {
         assert!(waited < WAIT, "released by the failure, not the deadline: {waited:?}");
         assert_eq!(stage_of(hash), None);
         assert!(wait_for_state(hash).is_none());
+    }
+
+    /// loop320 FASb, node 1 at the tenure handover: own blocks 1024 and 1025
+    /// sealed, a given-up build ahead on the old parent filed finished, 1024
+    /// completed and taken by its own import, then 1026 and 1027 sealed while
+    /// 1025 was still finishing. The FIFO bound evicted 1025, its completion
+    /// was dropped, and its own import found nothing.
+    #[test]
+    fn a_build_still_finishing_is_not_evicted_for_a_newer_one() {
+        let _guard = lock();
+        let own: Vec<Header> = (0..4u8).map(|i| header(0x90 + i * 4, 1024 + u64::from(i))).collect();
+        let hash = |h: &Header| built(h).block.hash();
+        remember_pending(hash(&own[0]), built(&own[0]).block);
+        remember_pending(hash(&own[1]), built(&own[1]).block);
+        let stale = header(0xB0, 1021);
+        remember(hash(&stale), built(&stale));
+        complete(hash(&own[0]), built(&own[0]));
+        take(own[0].parent_hash, own[0].number, own[0].state_root, own[0].receipts_root, own[0].gas_used, None)
+            .expect("1024 taken by its own import");
+        remember_pending(hash(&own[2]), built(&own[2]).block);
+        remember_pending(hash(&own[3]), built(&own[3]).block);
+
+        assert_eq!(stage_of(hash(&own[1])), Some(Stage::Sealed), "1025 is still finishing and stays");
+        assert_eq!(stage_of(hash(&stale)), None, "the finished stale build made the room");
+        complete(hash(&own[1]), built(&own[1]));
+        assert_eq!(find_by(&own[1]).map(|(found, _)| found), Some(hash(&own[1])), "its own import finds it");
+        for h in &own[2..] {
+            assert_eq!(stage_of(hash(h)), Some(Stage::Sealed));
+            fail(hash(h));
+        }
+        fail(hash(&own[1]));
+    }
+
+    #[test]
+    fn finishing_builds_are_bounded_too() {
+        let _guard = lock();
+        let heads: Vec<Header> = (0..=keep_finishing() as u8).map(|i| header(0xC0 + i * 4, 1100 + u64::from(i))).collect();
+        let hashes: Vec<B256> = heads
+            .iter()
+            .map(|h| {
+                let block = built(h).block;
+                let hash = block.hash();
+                remember_pending(hash, block);
+                hash
+            })
+            .collect();
+        assert_eq!(stage_of(hashes[0]), None, "past the hard bound the oldest goes");
+        for hash in &hashes[1..] {
+            assert_eq!(stage_of(*hash), Some(Stage::Sealed));
+            fail(*hash);
+        }
     }
 
     #[test]
@@ -737,7 +1291,7 @@ mod tests {
     #[test]
     fn the_handed_list_is_bounded_too() {
         let _guard = lock();
-        let heads: Vec<Header> = (0..=KEEP as u8).map(|i| header(0x50 + i * 4, 540 + u64::from(i))).collect();
+        let heads: Vec<Header> = (0..=keep() as u8).map(|i| header(0x50 + i * 4, 540 + u64::from(i))).collect();
         for h in &heads {
             let execution = built(h);
             remember(execution.block.hash(), execution);
@@ -824,7 +1378,7 @@ mod tests {
     #[test]
     fn the_sealed_store_is_bounded_and_refiling_replaces() {
         let _guard = lock();
-        let blocks: Vec<_> = (0..=KEEP as u8).map(|i| sealed_block(0x80 + i, 1)).collect();
+        let blocks: Vec<_> = (0..=keep() as u8).map(|i| sealed_block(0x80 + i, 1)).collect();
         let hashes: Vec<B256> = blocks.iter().map(|b| b.hash()).collect();
         for block in blocks.iter().cloned() {
             remember_sealed(block.hash(), block);

@@ -604,3 +604,201 @@ async fn a_build_on_the_sealed_block_returns_the_block_the_layer_built() {
     assert_eq!(built.execution_data.sidecar.parent_beacon_block_root(), Some(B256::repeat_byte(8)));
     assert_eq!(observed.requests.lock().unwrap().len(), 1);
 }
+
+// ---- the elided answer and the body on demand (N42_TAKE_COMPACT) --------
+
+fn build_attrs() -> PayloadAttributes {
+    PayloadAttributes {
+        timestamp: 2,
+        prev_randao: B256::ZERO,
+        suggested_fee_recipient: Default::default(),
+        withdrawals: Some(Vec::new()),
+        parent_beacon_block_root: Some(B256::repeat_byte(8)),
+        slot_number: None,
+        target_gas_limit: None,
+    }
+}
+
+#[tokio::test]
+async fn a_compact_answer_is_read_as_an_elided_block_and_stamped() {
+    let (addr, observed) = serve(Arc::new(|kind, frame_bytes| {
+        assert_eq!(kind, request::BUILD_ON_OWN);
+        let (parent, attrs, _, _) = raw_engine::decode_build_on_own(frame_bytes).expect("decodes");
+        let answer = raw_engine::CompactAnswer {
+            header: cancun_header(parent.number + 1, attrs.parent_beacon_block_root.unwrap()),
+            tx_count: 2,
+            withdrawals: Vec::new(),
+            requests: None,
+            block_access_list: None,
+            tx_hashes: vec![B256::repeat_byte(1), B256::repeat_byte(2)],
+            frame_layout: Vec::new(),
+        };
+        Some(frame(reply::COMPACT_BUILT, &raw_engine::encode_compact_answer(&answer)))
+    }))
+    .await;
+    let client = EngineApiClient::new(Json::at(addr));
+    let parent = cancun_header(5, B256::ZERO);
+    let built = client.build_on_own_block(&parent, build_attrs()).await.expect("answered").expect("built");
+    assert!(built.elided);
+    assert_eq!((built.number, built.tx_count), (6, 2));
+    assert_eq!(built.tx_hashes, vec![B256::repeat_byte(1), B256::repeat_byte(2)]);
+    assert!(built.execution_data.payload.as_v1().transactions.is_empty());
+    assert_eq!(built.hash, cancun_header(6, B256::repeat_byte(8)).hash_slow());
+    let stamps = built.answer.expect("stamped");
+    assert!(stamps.bytes > 0 && stamps.read_end_us > 0 && stamps.decode_end_us >= stamps.read_end_us);
+    // With the switch off (the test's environment) the request is the frame
+    // it has always been: no compact-answer tail.
+    let requests = observed.requests.lock().unwrap();
+    let sent = &requests[0].1;
+    let expected = raw_engine::encode_build_on_own_chaining(&parent, &build_attrs(), None, n42_h2_execution::compact_body());
+    assert_eq!(sent, &expected, "switch off: byte for byte the old request");
+    assert!(!raw_engine::decode_build_on_own_request(sent).expect("decodes").compact_answer);
+}
+
+/// `N42_ANSWER_LAYOUT_ONLY`: an answer with the frame layout and no hash
+/// list is an elided block whose stamps say so, and a block with neither
+/// layout nor hashes is an error rather than a block.
+#[tokio::test]
+async fn a_layout_only_answer_is_read_as_an_elided_block_without_hashes() {
+    let (addr, _) = serve(Arc::new(|_, frame_bytes| {
+        let (parent, attrs, _, _) = raw_engine::decode_build_on_own(frame_bytes).expect("decodes");
+        let answer = raw_engine::CompactAnswer {
+            header: cancun_header(parent.number + 1, attrs.parent_beacon_block_root.unwrap()),
+            tx_count: 3,
+            withdrawals: Vec::new(),
+            requests: None,
+            block_access_list: None,
+            tx_hashes: Vec::new(),
+            frame_layout: vec![(B256::repeat_byte(0xf1), 2), (B256::repeat_byte(0xf2), 1)],
+        };
+        Some(frame(reply::COMPACT_BUILT, &raw_engine::encode_compact_answer(&answer)))
+    }))
+    .await;
+    let client = EngineApiClient::new(Json::at(addr));
+    let built = client
+        .build_on_own_block(&cancun_header(5, B256::ZERO), build_attrs())
+        .await
+        .expect("answered")
+        .expect("built");
+    assert!(built.elided && built.tx_hashes.is_empty());
+    assert_eq!(built.tx_count, 3);
+    assert_eq!(built.frame_layout, vec![(B256::repeat_byte(0xf1), 2), (B256::repeat_byte(0xf2), 1)]);
+    assert!(built.answer.expect("stamped").layout_only);
+
+    let (addr, _) = serve(Arc::new(|_, frame_bytes| {
+        let (parent, attrs, _, _) = raw_engine::decode_build_on_own(frame_bytes).expect("decodes");
+        let answer = raw_engine::CompactAnswer {
+            header: cancun_header(parent.number + 1, attrs.parent_beacon_block_root.unwrap()),
+            tx_count: 3,
+            withdrawals: Vec::new(),
+            requests: None,
+            block_access_list: None,
+            tx_hashes: Vec::new(),
+            frame_layout: Vec::new(),
+        };
+        Some(frame(reply::COMPACT_BUILT, &raw_engine::encode_compact_answer(&answer)))
+    }))
+    .await;
+    let client = EngineApiClient::new(Json::at(addr));
+    let built = client.build_on_own_block(&cancun_header(5, B256::ZERO), build_attrs()).await;
+    assert!(!matches!(built, Some(Ok(_))), "hashes missing and no layout: not a block");
+}
+
+#[tokio::test]
+async fn a_whole_answer_is_stamped_and_not_elided() {
+    let (addr, _) = serve(Arc::new(|_, frame_bytes| {
+        let (parent, attrs, _, _) = raw_engine::decode_build_on_own(frame_bytes).expect("decodes");
+        Some(built_answer(cancun_header(parent.number + 1, attrs.parent_beacon_block_root.unwrap())))
+    }))
+    .await;
+    let client = EngineApiClient::new(Json::at(addr));
+    let built = client
+        .build_on_own_block(&cancun_header(5, B256::ZERO), build_attrs())
+        .await
+        .expect("answered")
+        .expect("built");
+    assert!(!built.elided);
+    let stamps = built.answer.expect("stamped");
+    let whole = built_answer(cancun_header(6, B256::repeat_byte(8)));
+    assert_eq!(stamps.bytes, whole.len() as u64, "every byte of the answer counted");
+}
+
+/// The sealed header of a block whose built header is `built`: what the
+/// proposer stamps changes the extra data, not the roots.
+fn sealed_of(built: &Header) -> Header {
+    Header { extra_data: alloy_primitives::Bytes::from_static(&[0x42; 8]), ..built.clone() }
+}
+
+#[tokio::test]
+async fn an_elided_blocks_body_is_fetched_by_its_sealed_header() {
+    let built = cancun_header(6, B256::repeat_byte(8));
+    let answer = built_answer(built.clone());
+    let (addr, observed) = serve(Arc::new(move |kind, _| {
+        assert_eq!(kind, request::OWN_BODY);
+        Some(answer.clone())
+    }))
+    .await;
+    let json = Json::at(addr);
+    let client = EngineApiClient::new(json.clone());
+    let sealed = sealed_of(&built);
+    let block = client.own_block_body(&sealed).await.expect("answers").expect("held");
+    assert_eq!(block.header, sealed, "returned under the sealed header");
+    assert!(block.transactions.is_empty());
+    assert_eq!(block.withdrawals, Some(Vec::new()));
+    let requests = observed.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].1, alloy_rlp::encode(&sealed), "the frame is the sealed header's RLP");
+    assert_eq!(json.count("eth_getBlockByHash"), 0, "the registry answered; no lookup by hash");
+}
+
+#[tokio::test]
+async fn a_refused_own_body_falls_back_to_the_lookup_by_hash() {
+    let (addr, _) = serve(Arc::new(|kind, _| {
+        assert_eq!(kind, request::OWN_BODY);
+        Some(frame(2, b"unknown build"))
+    }))
+    .await;
+    let json = Json::new(move |method, _| match method {
+        "n42Engine_payloadEndpoint" => Ok(json!(addr.to_string())),
+        "eth_getBlockByHash" => Ok(Value::Null),
+        _ => Err(rpc(-32601)),
+    });
+    let client = EngineApiClient::new(json.clone());
+    let got = client.own_block_body(&sealed_of(&cancun_header(6, B256::ZERO))).await.expect("answers");
+    assert!(got.is_none());
+    assert_eq!(json.count("eth_getBlockByHash"), 1);
+}
+
+#[tokio::test]
+async fn a_body_for_another_block_is_refused() {
+    // The execution layer answering a block whose roots are not the sealed
+    // header's is a malformed answer, not a body.
+    let other = Header { number: 6, transactions_root: B256::repeat_byte(0xee), ..cancun_header(6, B256::ZERO) };
+    let answer = built_answer(other);
+    let (addr, _) = serve(Arc::new(move |_, _| Some(answer.clone()))).await;
+    let got = n42_h2_el_rpc::request_own_body(addr, &cancun_header(6, B256::ZERO)).await;
+    assert!(got.is_err());
+}
+
+#[tokio::test]
+async fn an_elided_own_block_imports_by_header_alone_or_says_it_cannot() {
+    let (addr, observed) = serve(Arc::new(|kind, _| match kind {
+        request::OWN_BLOCK => Some(frame(1, &status(PayloadStatusEnum::Valid))),
+        other => panic!("unexpected request {other}"),
+    }))
+    .await;
+    let client = EngineApiClient::new(Json::at(addr));
+    let header = cancun_header(5, B256::repeat_byte(4));
+    let got = client.import_own_block_by_header(&header).await.expect("imported");
+    assert!(valid(&got));
+    assert_eq!(observed.requests.lock().unwrap().len(), 1);
+
+    let (addr, observed) = serve(Arc::new(|kind, _| {
+        assert_eq!(kind, request::OWN_BLOCK, "nothing but the header is sent");
+        Some(frame(2, b"no build kept"))
+    }))
+    .await;
+    let client = EngineApiClient::new(Json::at(addr));
+    assert!(client.import_own_block_by_header(&header).await.is_none());
+    assert_eq!(observed.requests.lock().unwrap().len(), 1);
+}

@@ -1,0 +1,28 @@
+== loop347K99b: 99 validator logs, f=32, quorum 67
+1. the leaders' commit lines
+  R1_collect (proposal -> prepare QC): n=889 p50 66.0 p90 71.0 p99 218.0 max 5872.0 ms
+  R2_collect (prepare QC -> commit QC): n=889 p50 85.0 p90 89.0 p99 97.0 max 151.0 ms
+  total (proposal -> commit): n=889 p50 162.0 p90 311.0 p99 588.0 max 6015.0 ms
+  votes at formation: R1 median 67 max 67 (quorum 67); R2 median 67 max 67
+2. vote collection at the traced leaders (first vote -> quorum -> last vote)
+ R1 (vote), 889 views:
+    proposal -> first vote: n=889 p50 4.8 p90 8.5 p99 150.0 max 221.9 ms
+    first vote -> quorum: n=889 p50 57.7 p90 61.6 p99 65.2 max 5858.1 ms
+    quorum -> last vote: n=889 p50 25.1 p90 26.1 p99 32.1 max 93.5 ms
+    proposal -> last vote (the slowest key): n=889 p50 88.0 p90 94.4 p99 238.7 max 5894.3 ms
+   views with fewer than 98 votes received: 0
+ R2 (commit_vote), 889 views:
+    proposal -> first vote: n=889 p50 91.8 p90 100.2 p99 241.8 max 5898.4 ms
+    first vote -> quorum: n=889 p50 57.0 p90 59.6 p99 63.0 max 118.3 ms
+    quorum -> last vote: n=889 p50 5.2 p90 6.2 p99 9.0 max 34.6 ms
+    proposal -> last vote (the slowest key): n=889 p50 154.5 p90 164.0 p99 303.9 max 5963.6 ms
+   views with fewer than 98 votes received: 0
+3. the straggler rule and the loop
+  proposal interval (same leader, consecutive views): n=889 p50 162.7 p90 303.8 p99 568.3 max 5968.5 ms; >= 500 ms: 18
+  `slow step` lines: 2255 (transport+flush > 30 ms); by slowest event kind: native: 2255 (max 179 ms)
+  leaders' lines: 1782
+4. gossip propagation (proposal sent -> received at a traced follower)
+    proposal arrival delay: n=1780 p50 0.5 p90 2.1 p99 5.6 max 20.4 ms
+5. validators
+validators n=99: cpu total 26.02 cores, per key mean 0.263 median 0.251 max 0.986 (key 0) min 0.212; rss per key peak mean 1.005 max 1.263 G, sum of peaks 99.5 G; threads per key mean 123, total 12177
+libp2p connections (last census of 5): 9700 in all (a full mesh of 99 is 4851); sockets per process min 97 median 98 max 98

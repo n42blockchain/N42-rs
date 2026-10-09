@@ -12,8 +12,17 @@ pub use writer::{StaticFileProviderRW, StaticFileProviderRWRefMut};
 
 mod metrics;
 
+// N42: the transactions segment's write switches (`N42_SF_*`).
+mod n42_sf;
+
 #[cfg(test)]
 mod writer_tests;
+
+// N42: the transactions segment's write path, measured and tested on 0x50 transfers.
+mod n42_sf_tests;
+
+// N42: the receipts and account changeset segments' write paths, compared and benched.
+mod n42_sf_seg_tests;
 
 use reth_nippy_jar::NippyJar;
 use reth_static_file_types::{ChangesetOffsetReader, SegmentHeader, StaticFileSegment};

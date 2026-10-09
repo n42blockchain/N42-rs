@@ -1,0 +1,30 @@
+perf-loop314PROF2-node1.data: 320070 samples, kernel-leaf 82518 = 25.8%
+share of samples by thread family (all / kernel-leaf):
+  tokio-rt                31.6%  kernel  23.9% of the family  (7.6% of all samples)
+  n42-build               28.3%  kernel  19.3% of the family  (5.5% of all samples)
+  storage                 18.1%  kernel  18.8% of the family  (3.4% of all samples)
+  n                       11.6%  kernel  32.9% of the family  (3.8% of all samples)
+  jemalloc_bg_thd          4.1%  kernel  96.2% of the family  (3.9% of all samples)
+  n42-follower-me          1.7%  kernel  14.2% of the family  (0.2% of all samples)
+  engine                   1.1%  kernel  26.6% of the family  (0.3% of all samples)
+  persistence              0.9%  kernel  31.1% of the family  (0.3% of all samples)
+  rocksdb:low              0.7%  kernel  10.0% of the family  (0.1% of all samples)
+  rocksdb:high             0.6%  kernel  14.1% of the family  (0.1% of all samples)
+  txpool-prewarm           0.5%  kernel  11.5% of the family  (0.1% of all samples)
+  vote-check               0.3%  kernel  84.5% of the family  (0.2% of all samples)
+kernel entry frames (outermost kernel frame), share of ALL samples; first user frames:
+  ffffffffa460012b  17.82%  syscall 50%; [unknown] 22%; __madvise 22%; __sched_yield 6%
+  ffffffffa4600bb7   6.67%  <rayon::iter::collect::consumer::CollectResult<n42_tx_types: 24%; [unknown] 15%; <rayon::iter::map::MapFolder<rayon::iter::collect::consumer: 11%; <hashbrown::raw::RawTable<(alloy_primitives::bits::address:: 6%
+  ffffffffa4600f0b   0.71%  <revm_database::states::bundle_state::BundleState>::account 10%; keccak::backends::soft::keccak_p::<u64, 24> 8%; [unknown] 7%; <&n42_engine_types::parallel_transfer::execute_for_build_opt 3%
+  ffffffffa4946aca   0.28%  [unknown] 100%
+  ffffffffa4600b90   0.09%  [unknown] 23%; <hashbrown::raw::RawTable<(alloy_primitives::bits::address:: 22%; <hashbrown::map::HashMap<alloy_primitives::bits::address::Ad 8%; <rayon::iter::collect::consumer::CollectResult<n42_tx_types: 7%
+  ffffffffa4600f8b   0.05%  [unknown] 18%; keccak::backends::soft::keccak_p::<u64, 24> 10%; <revm_database::states::bundle_state::BundleState>::account 8%; n42_tx_ingest::recover_frame::<reth_transaction_pool::Pool<r 5%
+kernel leaf addresses, share of ALL samples; first user frames:
+  ffffffffa5d34f11   6.13%  __madvise 41%; <rayon::iter::collect::consumer::CollectResult<n42_tx_types: 17%; [unknown] 17%
+  ffffffffa4951f7e   1.27%  syscall 84%; [unknown] 8%; __sched_yield 4%
+  ffffffffa4a0943d   1.14%  syscall 73%; [unknown] 15%; __sched_yield 8%
+  ffffffffa4d5e90f   1.13%  syscall 84%; [unknown] 11%; __sched_yield 2%
+  ffffffffa4e2c90a   0.78%  [unknown] 23%; <rayon::iter::collect::consumer::CollectResult<n42_tx_types: 19%; <hashbrown::raw::RawTable<(alloy_primitives::bits::address:: 10%
+  ffffffffa5d34e94   0.71%  __madvise 43%; [unknown] 20%; <rayon::iter::collect::consumer::CollectResult<n42_tx_types: 16%
+  ffffffffa4d6231c   0.71%  syscall 86%; [unknown] 6%; __sched_yield 3%
+  ffffffffa5d34947   0.64%  __sched_yield 33%; [unknown] 16%; <rayon::iter::collect::consumer::CollectResult<n42_tx_types: 6%

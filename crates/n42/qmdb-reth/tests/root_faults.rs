@@ -30,6 +30,7 @@
 //! `N42_TWIG_POOL_FLOOR=0 N42_QMDB_APPEND_AHEAD_MB=0 N42_QMDB_OFFSET_SEGMENTS_AHEAD=0`
 //! turns the prefaulting off for the comparison.
 
+#![cfg(target_os = "linux")]
 #![allow(missing_docs)]
 
 use alloy_primitives::{Address, B256, U256};

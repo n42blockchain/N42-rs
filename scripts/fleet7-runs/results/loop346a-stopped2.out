@@ -1,0 +1,1635 @@
+/data free 592G at launch
+tree at 0725a4f62 (test(fleet7): read-back gas rule by deferred depth (header n+depth carries block); box free at 18:59; builds:
+built at 19:02; ingest/tx-types tests:
+test result: ok. 65 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+test result: ok. 21 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 8.88s
+flood tests:
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.81s
+tests from 19:03 (no claim)
+tests passed at 19:21: 2089 tests
+built 0725a4f62+tree at 19:25
+waiting for a quiet box from 19:25
+claimed at 19:26 (1791415564): avail 97G load 1.26
+tip 0725a4f62 tree: 2 changed files; native n42 built 19:02:14, h2_validator 19:00:25, deferred n42 19:25:03; last source change 18:59:43 (crates/n42/n42-testing/src/dev.rs)
+replay set for every leg: /data/n42-pregen/g900000-400m (senders 12500)
+leg loop346WARM: /data free 591G (needs 120 G)
+leg loop346WARM start 19:26:52 load 1.26
+round loop346WARM exit 0 at 19:29:51
+loop346WARM save stages (node0, seconds summed over the leg / count): batch_size=1932.0/630  batch_size=1932.0/630  reth_consensus_engine_beacon_persistence_duration=58.5/630  duration_seconds=54.4/630  total=49.9/630  scope=45.0/630  sf=44.4/630  sf_transactions=44.3/630  qmdb_persisted=22.3/630  sf_account_changesets=20.3/630
+el binary: /data/n42-build/target-n42-rs/native/release/n42 env: N42_IMPORT_ONCE=1 N42_SETTLEMENT_TAGS=legacy N42_BUILD_THROTTLE_SOFT=48 F7_EL_MAP=0,0,0,0,0,0,0 N42_FIELDS_AT_SEAL=1 N42_FREEZE_AFTER_SEAL=1 N42_FRAME_BLOCKS=1 N42_TX_INGEST_RECOVER_PARALLEL=24 N42_FREEZE_POOL=own N42_PARALLEL_BUILD_THREADS=32 N42_PLAN_AHEAD=1 N42_HASHED_TABLES=off F7_FLOOD_RATE=6000000 N42_COMPACT_BODY=1 N42_BUILD_BATCHES=128 MALLOC_CONF=thp:always,oversize_threshold:0,dirty_decay_ms:2000,background_thread:true N42_SEAL_ON_COUNTERS=1 N42_ACCOUNT_HISTORY=off N42_TAKE_COMPACT=1 N42_SF_EARLY_WRITEBACK=1 N42_ROAD_RUNTIME=1 N42_TX_INGEST_HIGH_WATER=2500000 F7_BENCH_POOL_SLOTS=3000000 N42_PLAN_AHEAD_BODY=1 N42_SEAL_AT_EXEC=1 N42_TX_QUEUE_DRAIN_CHUNK=8192 N42_ANSWER_LAYOUT_ONLY=1 N42_PULL_BY_FRAMES=1 N42_SF_PARALLEL_ENCODE=1 N42_BUILD_THROTTLE_HARD=80 N42_LIVE_INDEX_DEFER=1 RAYON_NUM_THREADS=16 N42_ROOT_OPS_AHEAD=1 TOKIO_WORKER_THREADS=16 N42_QMDB_READS=on N42_LEADER_LAYERS=3 N42_PERSIST_QMDB_IN_SCOPE=1 F7_BLOCK_INTERVAL_MS=60 F7_MEASURE_FROM_LOG=1
+validator env: N42_IMPORT_ONCE=1 N42_SETTLEMENT_TAGS=legacy N42_BUILD_THROTTLE_SOFT=48 F7_EL_MAP=0,0,0,0,0,0,0 N42_FIELDS_AT_SEAL=1 N42_FREEZE_AFTER_SEAL=1 N42_FRAME_BLOCKS=1 N42_TX_INGEST_RECOVER_PARALLEL=24 N42_FREEZE_POOL=own N42_PARALLEL_BUILD_THREADS=32 N42_PLAN_AHEAD=1 N42_HASHED_TABLES=off F7_FLOOD_RATE=6000000 N42_COMPACT_BODY=1 N42_BUILD_BATCHES=128 N42_SEAL_ON_COUNTERS=1 N42_ACCOUNT_HISTORY=off N42_TAKE_COMPACT=1 N42_SF_EARLY_WRITEBACK=1 N42_ROAD_RUNTIME=1 N42_TX_INGEST_HIGH_WATER=2500000 F7_BENCH_POOL_SLOTS=3000000 N42_PLAN_AHEAD_BODY=1 N42_SEAL_AT_EXEC=1 N42_TX_QUEUE_DRAIN_CHUNK=8192 N42_ANSWER_LAYOUT_ONLY=1 N42_PULL_BY_FRAMES=1 N42_SF_PARALLEL_ENCODE=1 N42_BUILD_THROTTLE_HARD=80 N42_LIVE_INDEX_DEFER=1 RAYON_NUM_THREADS=16 N42_ROOT_OPS_AHEAD=1 TOKIO_WORKER_THREADS=16 N42_QMDB_READS=on N42_LEADER_LAYERS=3 N42_PERSIST_QMDB_IN_SCOPE=1 F7_MEASURE_FROM_LOG=1
+loop346WARM once: start-up lines import_once=true 1; last direct-import counters 
+loop346WARM imports: layers=1 direct_imports=0 canonical_blocks=2645 import_once_lines=1 (per layer: direct imports should equal canonical blocks for one execution per block)
+grep: /data/blockchain/rust-fleet7-bench/node1/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node3/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node1/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node3/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node1/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node3/el.log: No such file or directory
+loop346WARM no_variant=0 own_not_committed=0 tc=1 invalid_blocks=0 incomplete=0 gas_mismatch=0 direct_imports_failed=0 stuck_at_hashed_state=0 engine_idles_over_5s=1 proposals_given_up=0 tables_off_nodes=1 unanswered_reads=0 seal_first_total=1430 seal_first_direct=1430 direct_guard_errors=0 commit_ms_median=0 fold_ms_median=8 sealed_at_ms_median=51 state_ready_ms_median=94 build_total_ms_median=168 recover_us_median=0 par_exec_ms_median=22 par_exec_ms_median=22 giveback_filtered=0 giveback_offered_max=200000 seal_first=1430 reader_lag_max=10 reader_lag_warns=0 view_invalidated=0 el_sum_peak_g=41.1 el_max_peak_g=41.1 val_sum_peak_g=2.0 flood_peak_g=0.6 two_roads_blocks=0 two_roads_overlap_ms_median=- exec_on_output_declined=0 r1_collect_ms_median=5 proposal_at_ms_median=49 view_total_ms_median=61 import_exec_ms_median=- import_total_ms_median=- import_senders_ms_median=- import_convert_ms_median=- import_groups_median=- imports_over_600ms=0 min_avail_g=72.1 road_foreign_body_recv_ms=- road_foreign_body_decode_ms=- road_foreign_body_senders_ms=- road_foreign_body_parent_wait_ms=- road_foreign_body_check_ms=- road_foreign_body_total_ms=- road_new_payload_recv_ms=- road_new_payload_decode_ms=- road_new_payload_senders_ms=- road_new_payload_parent_wait_ms=- road_new_payload_check_ms=- road_new_payload_total_ms=- road_foreign_body_blocks=0 road_new_payload_blocks=0 fcu_answered=1242 fcu_in_flight_ms_median=0 fcu_queued_ms_median=0 fcu_queued_ms_max=98 fcu_refused=0 fcu_slow=2427 bodies_held=0 road_reuse_ms=- road_prepare_ms=- road_dispatch_ms=- road_convert_ms=- road_remember_ms=- road_header_ms=- road_fields_ms=- road_other_ms=- import_engine_ms_median=- gate_forced=0 gate_warns=0 flood_timeouts=0 canonical_min=2678 canonical_max=2679 chained_builds=1815 chain_lead_ms_median=52 chain_wait_ms_median=4 chain_started=1819 chain_discarded=4 chain_discard_reasons=_1_reason="no_,_1_reason="the_build_was_aborted,_1_reason="the_chained_build_produced_nothing,_2_reason="the_execution_layer_produced_nothing,_1_reason="the_request_names_another_parent chain_alias_warns=0 el_chained=1833 bodies_held_warns=0 el_build_refused=5 el_build_refused_reasons=_2_the_build_was_aborted,_2_no_QMDB_tree_for_parent_block_0x,_1_2026-10-07T23:28:51.226183Z_WARN_build_on_own_blo queued_p5=2315000 queued_p50=2465000 road_compact_blocks=0 road_compact_recv_ms=- road_compact_assemble_ms=- road_compact_root_ms=- road_compact_miss_wait_ms=- road_compact_senders_ms=- road_compact_check_ms=- road_compact_other_ms=- road_compact_total_ms=- road_compact_misses_total= compact_refused_el=0 compact_fallbacks=0 compact_bytes_median=- pool_order9=13719 par_pull_ms_median=0 build_total_ms_median2=53 road_compact_filled_blocks=0 road_compact_filled_median=- road_compact_fill_ms_median=- need_txns=0 fill_failed=0 ingest_rate_gate_open_median=- ingest_gate_open_intervals=0 ingest_slots_busy_median=- flood_rate= fill_asked_proposer=0 fill_asked_other=0 loop_lines=1790 loop_unnamed_ms_median=47 loop_body_served_ms_median=- loop_txns_served_ms_median=- import_exec_ms_median2=- pip_partition_ms=- pip_env_ms=- pip_batch_ms=- pip_groups_ms=- pip_gas_ms=- pip_merge_ms=- pip_receipts_ms=- pip_drop_ms=- pip_other_ms=- pip_total_ms=- senders_indexed_median=- road_senders_ms_median=- road_total_ms_median=- pew_ms_median=- pew_ms_p90= gate_ms_median=- gate_ms_p90= root_ms_p50=- root_ms_p90= two_roads=0 not_on_output=0 not_on_output_why= ckpt_ms_first_q=2 ckpt_ms_last_q=48 ckpt_bytes_last=34069532 parent_still_importing=0 root_wait_ms_p50=- root_wait_ms_p90= tenures_low_seal=23 seal_first_share=0.99 empty_over_deep=0 near_empty_warns=0 no_seal_why=_1_why="the_parallel_step_built_nothing" par_skipped_median=- usable_p5=2315000 ckpt_replay_ms_last_q=15 candidates_zero=0 dropped_ingest=0 let_go_warns=0 let_go_reasons= parked_p50=0 parked_max=0 held_warns=0 park_capped_total=0 superseded_builds=2 empty_not_superseded=0 mass_park_warns=0 heads_lines=0 holes_lines=0 stale_parent_refusals=1 par_groups_p5=0 cancelled_decided=0 heads_nonce0=0 stale_unconfirmed= handovers=0 el_panics=0 decided_cancelled=0 min_window_blocks=455 road_desc_blocks=0 road_desc_total_ms=- road_desc_copy_ms=- desc_misses=0 fill_failed2=0 sf_par_collect_ms=0 sf_par_commit_ms=0 sf_par_fold_ms=8 sf_par_graft_ms=0 sf_par_prefault_ms=0 sf_par_exec_ms=22 sf_sealed_at_ms=51 sf_roots_ms=31 sf_state_ready_ms=94 sf_total_ms=168 ba_find_ms=0 ba_queue_ms=0 ba_total_ms=53 ba_on_output=1429 queue_fold_us=0 queue_lock_us=1 sf_par_exec_ms=22 sf_par_fold_ms=8 pip_groups_ms=- import_exec_ms_median2=- reads_d0=0 reads_hist=0 f_reads_d0=- f_reads_hist=- f_overlay_depth=- L_read_set_ms=0 read_set_accounts=0 read_set_unresolved=0 read_set_hits=0 read_set_misses=0 start_best_ms=- par_prep_ms=- gap_before_exec_ms=- gap_after_exec_ms=- gap_before_seal_ms=- index_ms=- road_copy_aside_ms=- road_copy_wait_ms=- road_total_ms=- queue_first_miss=queue_first_miss=18446744073709551615:1440,queue_first_miss=0:1204 root_append_behind=0 populate_lag_mb=0 swap_used_g=0 root_faults=- root_faults_p90= root_faults_entries=0 root_faults_offsets=0 root_faults_index=0 root_faults_bits=0 root_faults_twigs=0 root_faults_undo=0 root_faults_tmp=0 root_append_faults=4 root_twig_pool_misses=0 batch_max_ms=9 batch_min_ms=2 batch_median_ms=4 batch_cpu_max_ms=9 batch_txs_max=2000 batch_txs_min=1500 batch_start_skew_ms=16 batch_wait_ms=0 loop_fetch_ns=0 loop_check_ns=0 loop_transfer_ns=0 loop_receipt_ns=0 loop_gas_ns=0 loop_sink_ns=0 loop_other_ns=0 batch_setup_ns=0 batch_close_ns=0 imp_exec_part_ms=- imp_exec_batches_ms=- imp_exec_graft_ms=- imp_exec_batches=- imp_exec_threads=- imp_exec_batch_max_ms=- imp_exec_batch_median_ms=- imp_parent_output_wait_ms=- road_parent_output_wait_ms=- next_start_gap_ms=1 next_entry_gap_ms=0 commit_body_ahead_used=- imp_exec_keys_ms=- imp_keys_ahead=- imp_exec_sink_ms=- imp_exec_pre_ms=- imp_exec_post_ms=- imp_exec_receipts_ms=- imp_exec_drop_ms=- root_gap_ms=- queue_whole=queue_whole=true:1440,queue_whole=false:1204 tick_tick_late_us=944 tick_preamble_us=340 tick_take_sealed_us=1 tick_sign_us=0 tick_cache_us=0 tick_presealed=- tick_describe_us=11 tick_publish_us=597 tick_tick_to_send_us=1991 road_check_ms=- road_check_include_us=- road_check_scan_us=- road_check_fold_us=- road_check_senders_us=- road_check_frames_summarized=- road_check_frames_scanned=- imp_exec_start_gap_us=- imp_gap_road_us=- imp_gap_header_us=- imp_gap_senders_us=- imp_gap_parent_us=- imp_gap_setup_us=- imp_gap_keys_wait_us=- sealed_at_p90= sealed_over_130=0 roots_ms=- cycle_p90=61/63/62 batch_max_ms=- batch_median_ms=- imp_batch_max=- forest_lock_warns=1535 root_seal_ms=1 root_seals=39 root_majflt=18925 roots_p90= gp_layer=1439 ggp_missing=294 state_wait_split=0/0/0/0:462,8/0/0/0:88,9/0/0/0:76 qmdb_releases=0 state_wait_on= imp_road_end_ms=- imp_exec_start_ms=- imp_exec_end_ms=- imp_root_end_ms=- imp_fields_ready_ms=- imp_parent_fields_wait_ms=- imp_exec_ms=- imp_root_ms=- imp_checks_ms=- imp_engine_ms=- imp_total_ms=- road_parent_fields_wait_ms=- exec_read_ms=0 L_exec_evm_ms=0 L_exec_write_ms=0 L_exec_other_ms=0 L_reads_cache=0 L_reads_provider=0 L_reads_view=0 L_graft_base_ms=0 L_graft_reserve_ms=0 L_graft_insert_ms=0 L_graft_reverts_ms=0 L_graft_other_ms=0 L_par_exec_ms=22 L_par_graft_ms=0 F_exec_read_ms=- F_exec_evm_ms=- F_exec_write_ms=- F_exec_other_ms=- F_reads_cache=- F_reads_provider=- F_reads_view=- F_groups_ms=- L_tx_root_wait_ms=0 L_par_exec_ms=22 L_par_graft_ms=0 L_par_fold_ms=8 L_sealed_ms=6 L_state_ready_ms=94 L_roots_ms=31 L_finish_ms=102 L_total_ms=168 L_setup_ms=0 L_par_pull_ms=0 L_give_back_ms=0 L_state_wait_ms=7 L_state_after_pull=1430 L_seal_at_exec=1430 L_tx_root_ahead=0 flood_w1=3158531 txs_p10=200000 acq_us=470 slots_busy=12 ingest_rate=3113681 L_scope_join_ms=0 L_par_release_ms=0 L_commit_body_ms=0 L_par_commit_ms=0 L_give_back_ms=0 L_sealed_ms=6 L_par_exec_ms=22 L_state_wait_ms=7 L_par_pull_ms=0 L_par_prep_ms=0 L_par_start_ms=3 L_pre_exec_ms=0 L_par_run_ms=30 L_sealed_at_ms=51 F_partition_ms=- F_env_ms=- F_groups_ms=- F_merge_ms=- F_reverts_wait_ms=- F_ahead_wait_ms=- F_total_ms=- I_engine_ms=- I_root_ms=- I_total_ms=- H_engine_remember_ms=- H_engine_listing_ms=- H_engine_new_payload_ms=- busy_us=0 L_par_start_ms=3 L_start_handoff_ms=0 L_start_best_ms=3 L_start_puller_ms=0 L_par_pull_ms=0 L_par_prep_ms=0 L_state_wait_ms=7 L_par_exec_ms=22 L_par_commit_ms=0 L_sealed_ms=6 L_sealed_at_ms=51 L_par_graft_ms=0 L_graft_insert_ms=0 L_graft_reverts_ms=0 L_graft_split_us=0 L_graft_build_us=0 L_graft_merge_us=0 L_state_ready_ms=94 Q_queue_ms=0 R_dispatch_wait_ms=- R_total_ms=- R_road_runtime=1 gate_holds=0 peer_fetch=0 pool_limit=limit=4 gate_opened=gate_opened_for_block=0 I_root_ms=- flood_rate_hdr=rate=6000000/s fills=0 fill_waited=- slots_busy=12 acq_us=470 busy_us=0 converged=0 fallbacks=0 busy_us=0 recover_us=0 tf_on_output=2 tf_fallback=0 still_importing=0 busy_us=0 slots_busy=12 batches=altsig_txs=0 altsig_batches=0 tf_on_output=2 tf_fallback=0 gate_holds=0 sign_s=sign 0s replay_note=replay       : 64 files from /data/n42-pregen/g900000-400m, 400000000 transactio sign_s=sign 0s shard=shard_verified=0 shard_claimed=0 road_verified=- slots_busy=12 gate_us=7393 reply_us=7952 queued=2465000 assemble_ms=- road_take_ms=- road_body_ms=- road_encode_ms=- shards=16 shard_insert_ms=0 shard_wait_ms=0 shard_fold_ms=13 shard_append_ms=16 shard_merge_ms=57 state_ready_ms=94 roots_ms=31 exec_read_ms=0 exec_evm_ms=0 exec_write_ms=0 exec_other_ms=0 reads_cache=0 reads_provider=0 reads_view=0 par_run_ms=30 fold_task_cpu_max_us=13192 fold_task_minflt_max=1 fold_task_minflt_sum=1 fold_task_migrated=0 fold_task_nivcsw_max=0 fold_index=1 fold_index_build_ms=13 fold_index_conflicts=8207 fold_queue_us=58 fold_skew_us=34 fold_task_max_us=13189 fold_tail_us=17 start_best_ms=3 start_select_ms=0 start_walk_ms=0 start_walk_check_ms=0 start_best_other_ms=0 start_frames_by_ref=0 start_frames_slow=0 start_pull_ms=0 start_other_ms=0 start_handoff_ms=0 par_start_ms=3 par_prep_ms=0 par_commit_ms=0 commit_body_ms=0 par_fold_ms=8 sealed_ms=6 copy_ms=- prune_ms=0 frames=- frames_missing=- frame_root_ms=- root_ms=- frames_admitted=frames_admitted=571806 frames_unaligned=0 frame_root_indexed=- seal_layout_ms=0 seal_root_ms=0 attested= busy_us=0 slots_busy=12 reply_us=7952 prune_ms=0 body_refused=0 body_failed_late=0
+loop346WARM win1 tps=3,213,333 txs=96,400,000 blocks= 482 cycle=0.062s occupancy= 99.8% full(>=95%)=481/482 basefee=n/a (from the layer's log)
+loop346WARM win2 tps=3,126,667 txs=93,800,000 blocks= 469 cycle=0.064s occupancy=100.0% full(>=95%)=469/469 basefee=n/a (from the layer's log)
+loop346WARM win3 tps=3,073,333 txs=92,200,000 blocks= 461 cycle=0.065s occupancy=100.0% full(>=95%)=461/461 basefee=n/a (from the layer's log)
+loop346WARM win1 tps=3,133,333 txs=94,000,000 blocks= 470 cycle=0.064s occupancy= 99.8% full(>=95%)=469/470 basefee=n/a (from the layer's log)
+loop346WARM win2 tps=3,066,667 txs=92,000,000 blocks= 460 cycle=0.065s occupancy=100.0% full(>=95%)=460/460 basefee=n/a (from the layer's log)
+loop346WARM win3 tps=3,033,333 txs=91,000,000 blocks= 455 cycle=0.066s occupancy=100.0% full(>=95%)=455/455 basefee=n/a (from the layer's log)
+loop346WARM tps=3,213,333
+tps=3,133,333 round_txs=559400000 cycles_w1=
+loop346WARM imp_fields_p90= b_p75=19
+loop346WARM overlay: filter_skips=0 probes=0 ratio=- (ratio = skips/(skips+probes))
+loop346WARM overlay_manager:       1 state_trie_overlay=false  state-ovly_cpu=0
+loop346WARM verify: written to /data/blockchain/rust-fleet7-bench/bench-loop346WARM/verify.json
+== loop346WARM  (E=1: seven validator keys on one execution layer)
+  window 1: canonical 470 blocks, 94.0M tx = 3,133,333/s (100.0% of window 1), full 469/470 (100%); cycle mean/median/p90 63.8/61.4/68.6 ms
+    leader builds 471: sealed_at median/p90/p99 48/70/101; phases median/p90 ms: gap_before_exec 7/39, state_wait 7/39, par 49/89, par_exec 22/27, roots 29/41, parent_fields 3/17, sealed 4/18
+    state_wait_on {'output': 242, 'grandparent': 82, 'none': 145, 'open': 1, 'layer_release': 1}; builds with state_wait > 20 ms: 98 ([('grandparent', 75), ('output', 23)]); gp_layer {1.0: 471}, ggp_missing {0.0: 385, 1.0: 86}
+    queue at the builds min/median 1,878,000/2,516,500
+    new field batch_cpu_sum_us: median/p90/max 592021.0/746704.0/2144825, nonzero 471
+    new field batch_dispatch_us: median/p90/max 221.0/307.0/3300, nonzero 471
+    new field batch_first_start_us: median/p90/max 72.0/105.0/920, nonzero 471
+    new field batch_ivcsw: median/p90/max 1.0/7.0/30, nonzero 278
+    new field batch_last_end_us: median/p90/max 21939.0/27387.0/75565, nonzero 471
+    new field batch_last_start_us: median/p90/max 16741.0/21124.0/64393, nonzero 471
+    new field batch_live_deferred: median/p90/max 71.0/79.0/87, nonzero 471
+    new field batch_live_lock_hold_us: median/p90/max 10334.0/12299.0/16850, nonzero 471
+    new field batch_live_lock_wait_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_live_lock_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_majflt: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_minflt: median/p90/max 694.0/9316.0/27349, nonzero 471
+    new field batch_open_max_us: median/p90/max 435.0/529.0/1996, nonzero 471
+    new field batch_open_sum_us: median/p90/max 10411.0/13138.0/16258, nonzero 471
+    new field batch_threads: median/p90/max 32.0/32.0/32, nonzero 471
+    new field batch_vcsw: median/p90/max 174.0/490.0/890, nonzero 471
+    new field batch_view_index_wait_us: median/p90/max 0.0/19275.0/51583, nonzero 115
+    new field batch_view_index_waits: median/p90/max 0.0/259.0/586, nonzero 115
+    new field batch_view_slot_wait_us: median/p90/max 0.0/1909.0/4722, nonzero 127
+    new field batch_view_slot_waits: median/p90/max 0.0/52.0/131, nonzero 128
+    new field batch_wall_sum_us: median/p90/max 599627.0/758847.0/2148888, nonzero 471
+    new field batches: median/p90/max 128.0/128.0/128, nonzero 471
+    new field build_batches: median/p90/max 128.0/128.0/128, nonzero 471
+    new field carried_depth: median/p90/max 1.0/1.0/1, nonzero 471
+    new field exec_end_to_seal_us: median/p90/max 86.0/139.0/425, nonzero 471
+    new field exec_partition_us: median/p90/max 6.0/9.0/1359, nonzero 471
+    new field exec_prepared_groups: {'true': 467, 'false': 4}
+    new field exec_prepared_slots: {'true': 467, 'false': 4}
+    new field exec_slots_us: median/p90/max 0.0/0.0/1891, nonzero 4
+    new field freeze_join_wait_us: median/p90/max 8865.0/16435.0/34089, nonzero 471
+    new field freeze_late: {'true': 471}
+    new field freeze_pool_own: {'true': 471}
+    new field live_index_defer: {'true': 471}
+    new field merge_accounts: median/p90/max 191899.0/195303.0/197743, nonzero 471
+    new field merge_append_us: median/p90/max 2970.0/6920.0/13884, nonzero 471
+    new field merge_reverts: median/p90/max 191899.0/195303.0/197743, nonzero 471
+    new field merge_reverts_us: median/p90/max 14845.0/19502.0/26480, nonzero 471
+    new field merge_state_us: median/p90/max 37306.0/45359.0/62647, nonzero 471
+    new field merge_tail_us: median/p90/max 0.0/0.0/4, nonzero 3
+    new field merge_threads: median/p90/max 1.0/1.0/1, nonzero 471
+    new field one_wave: {'false': 471}
+    new field open_engine_us: median/p90/max 0.0/27326.0/72997, nonzero 86
+    new field open_fallback: {'false': 385, 'true': 86}
+    new field open_keep_us: median/p90/max 4.0/6.0/5604, nonzero 471
+    new field open_layers: median/p90/max 3.0/3.0/3, nonzero 471
+    new field open_provider_us: median/p90/max 88.0/149.0/980, nonzero 471
+    new field plan_age_us: median/p90/max 47567.0/97813.0/178244, nonzero 471
+    new field plan_ahead: median/p90/max 1.0/1.0/1, nonzero 471
+    new field plan_body: median/p90/max 1.0/1.0/2, nonzero 471
+    new field plan_body_us: median/p90/max 18261.0/21503.0/26327, nonzero 467
+    new field plan_discard: {'': 471}
+    new field plan_prep_us: median/p90/max 7187.0/12512.0/30074, nonzero 471
+    new field plan_topup_txs: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prep_from_plan: {'true': 467, 'false': 4}
+    new field prev_seal_to_answer_us: median/p90/max 2115.0/3837.0/7211, nonzero 471
+    new field prev_seal_to_entry_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prev_seal_to_header_us: median/p90/max 199.0/327.0/817, nonzero 471
+    new field prev_seal_to_import_us: median/p90/max 112952.0/145897.0/205534, nonzero 423
+    new field prev_seal_to_request_us: median/p90/max 969.0/66658.0/135623, nonzero 471
+    new field prev_seal_to_start_us: median/p90/max 1255.0/66890.0/135881, nonzero 471
+    new field pull_bulk_txs: median/p90/max 200000.0/200000.0/200000, nonzero 471
+    new field pull_bulk_us: median/p90/max 5.0/9.0/1111, nonzero 471
+    new field rename_fallbacks: median/p90/max 0.0/0.0/0, nonzero 0
+    new field rename_record_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_apply_gap_us: median/p90/max 10.0/12.0/35, nonzero 471
+    new field root_apply_total_us: median/p90/max 20668.0/27236.0/42253, nonzero 471
+    new field root_compute_us: median/p90/max 22659.0/30655.0/47566, nonzero 471
+    new field root_delta_us: median/p90/max 1132.0/3210.0/9844, nonzero 471
+    new field root_index_us: median/p90/max 2665.0/5019.0/18594, nonzero 471
+    new field root_leaves_us: median/p90/max 6858.0/10341.0/22136, nonzero 471
+    new field root_note_us: median/p90/max 147.0/220.0/1335, nonzero 471
+    new field root_ops_ahead: {'true': 471}
+    new field root_ops_ahead_wait_us: median/p90/max 2682.0/8598.0/22398, nonzero 470
+    new field root_ops_concat_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_ops_encode_us: median/p90/max 5374.0/9415.0/20181, nonzero 471
+    new field root_ops_finish_us: median/p90/max 2227.0/2829.0/8056, nonzero 471
+    new field root_ops_sort_us: median/p90/max 3128.0/6820.0/21906, nonzero 471
+    new field root_ops_us: median/p90/max 5016.0/10947.0/24529, nonzero 471
+    new field root_rehash_us: median/p90/max 1392.0/1754.0/10799, nonzero 471
+    new field root_retire_us: median/p90/max 1645.0/2568.0/6672, nonzero 471
+    new field root_sort_us: median/p90/max 183.0/375.0/1772, nonzero 471
+    new field root_undo_us: median/p90/max 348.0/663.0/2316, nonzero 471
+    new field root_writes_us: median/p90/max 6756.0/9568.0/20527, nonzero 471
+    new field seal_hashes_ahead: {'true': 471}
+    new field seal_on_counters: {'true': 471}
+    new field seal_to_complete_us: median/p90/max 105120.0/122640.0/150339, nonzero 471
+    new field seal_to_frozen_us: median/p90/max 8830.0/16405.0/34047, nonzero 356
+    new field seal_to_merge_end_us: median/p90/max 105061.0/122564.0/150222, nonzero 471
+    new field seal_to_merge_start_us: median/p90/max 47784.0/61373.0/75091, nonzero 471
+    new field seal_to_ops_ahead_us: median/p90/max 20424.0/30685.0/51423, nonzero 471
+    new field seal_to_state_ready_us: median/p90/max 105067.0/122572.0/150235, nonzero 471
+    new field sealed_unix_us: median/p90/max 1791415710047770.0/1791415722195437.0/1791415725338630, nonzero 471
+    new field start_walk_check_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_ids_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_settle_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field state_wait_us: median/p90/max 7624.0/39220.0/85843, nonzero 471
+    new field view_journal_reads: median/p90/max 4096.0/81920.0/167936, nonzero 236
+    new field view_journal_searches: median/p90/max 8674.0/218478.0/445882, nonzero 236
+    new field view_journal_skips: median/p90/max 0.0/0.0/0, nonzero 0
+    new field whole_take_noted: {'true': 471}
+    binding wait (tick / quorum / seal share, mean cycle): tick 97% (63); quorum 1% (123); seal 2% (68); feed-bound (blocks under 95% of the tier): 1 of 470
+    slowest key vote delay median/p90 9.8/52.8 ms
+    engine own-import total_ms per block median/p90/max 39/61/93 (n=469)
+    layer RSS 4.9 -> 26.6 G (max 26.8), in-memory blocks max 10
+    execution layer cores busy 35.0    validators cores busy 1.2
+    flood delivered (median per 5 s over the leg) 3,124,128/s
+  window 2: canonical 460 blocks, 92.0M tx = 3,066,667/s (97.9% of window 1), full 460/460 (100%); cycle mean/median/p90 63.4/61.3/69.6 ms
+    leader builds 458: sealed_at median/p90/p99 49/70/105; phases median/p90 ms: gap_before_exec 6/32, state_wait 5/32, par 50/73, par_exec 22/28, roots 31/45, parent_fields 5/22, sealed 6/23
+    state_wait_on {'output': 219, 'none': 164, 'grandparent': 73, 'layer_release': 1, 'provider_open': 1}; builds with state_wait > 20 ms: 70 ([('grandparent', 65), ('output', 5)]); gp_layer {1.0: 458}, ggp_missing {0.0: 382, 1.0: 76}
+    queue at the builds min/median 2,263,000/2,516,000
+    new field batch_cpu_sum_us: median/p90/max 601154.5/743061.0/1689732, nonzero 458
+    new field batch_dispatch_us: median/p90/max 221.0/308.0/544, nonzero 458
+    new field batch_first_start_us: median/p90/max 73.0/114.0/214, nonzero 458
+    new field batch_ivcsw: median/p90/max 1.0/6.0/43, nonzero 260
+    new field batch_last_end_us: median/p90/max 22357.5/27979.0/60898, nonzero 458
+    new field batch_last_start_us: median/p90/max 16887.5/21278.0/44302, nonzero 458
+    new field batch_live_deferred: median/p90/max 72.5/80.0/188, nonzero 458
+    new field batch_live_lock_hold_us: median/p90/max 10984.5/12983.0/20152, nonzero 458
+    new field batch_live_lock_wait_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_live_lock_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_majflt: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_minflt: median/p90/max 944.0/9240.0/25873, nonzero 458
+    new field batch_open_max_us: median/p90/max 445.0/548.0/3081, nonzero 458
+    new field batch_open_sum_us: median/p90/max 10865.5/13390.0/18666, nonzero 458
+    new field batch_threads: median/p90/max 32.0/32.0/32, nonzero 458
+    new field batch_vcsw: median/p90/max 182.0/487.0/769, nonzero 458
+    new field batch_view_index_wait_us: median/p90/max 0.0/18977.0/41049, nonzero 118
+    new field batch_view_index_waits: median/p90/max 0.0/266.0/543, nonzero 118
+    new field batch_view_slot_wait_us: median/p90/max 0.0/2195.0/5322, nonzero 126
+    new field batch_view_slot_waits: median/p90/max 0.0/50.0/108, nonzero 126
+    new field batch_wall_sum_us: median/p90/max 606311.5/754355.0/1691639, nonzero 458
+    new field batches: median/p90/max 128.0/128.0/128, nonzero 458
+    new field build_batches: median/p90/max 128.0/128.0/128, nonzero 458
+    new field carried_depth: median/p90/max 1.0/1.0/1, nonzero 458
+    new field exec_end_to_seal_us: median/p90/max 85.0/136.0/410, nonzero 458
+    new field exec_partition_us: median/p90/max 6.0/8.0/1319, nonzero 458
+    new field exec_prepared_groups: {'true': 454, 'false': 4}
+    new field exec_prepared_slots: {'true': 454, 'false': 4}
+    new field exec_slots_us: median/p90/max 0.0/0.0/1992, nonzero 4
+    new field freeze_join_wait_us: median/p90/max 8274.0/14889.0/25717, nonzero 457
+    new field freeze_late: {'true': 458}
+    new field freeze_pool_own: {'true': 458}
+    new field live_index_defer: {'true': 458}
+    new field merge_accounts: median/p90/max 192391.5/195509.0/198278, nonzero 458
+    new field merge_append_us: median/p90/max 3323.0/7214.0/17096, nonzero 458
+    new field merge_reverts: median/p90/max 192391.5/195509.0/198278, nonzero 458
+    new field merge_reverts_us: median/p90/max 15154.5/20315.0/33119, nonzero 458
+    new field merge_state_us: median/p90/max 38105.0/45183.0/64749, nonzero 458
+    new field merge_tail_us: median/p90/max 0.0/0.0/5, nonzero 5
+    new field merge_threads: median/p90/max 1.0/1.0/1, nonzero 458
+    new field one_wave: {'false': 458}
+    new field open_engine_us: median/p90/max 0.0/20344.0/91493, nonzero 76
+    new field open_fallback: {'false': 382, 'true': 76}
+    new field open_keep_us: median/p90/max 4.0/6.0/4647, nonzero 458
+    new field open_layers: median/p90/max 3.0/3.0/3, nonzero 458
+    new field open_provider_us: median/p90/max 91.0/137.0/2765, nonzero 458
+    new field plan_age_us: median/p90/max 46015.0/101035.0/137250, nonzero 457
+    new field plan_ahead: median/p90/max 1.0/1.0/1, nonzero 457
+    new field plan_body: median/p90/max 1.0/1.0/2, nonzero 457
+    new field plan_body_us: median/p90/max 16652.5/20535.0/29052, nonzero 454
+    new field plan_discard: {'': 457, 'not_on_its_parent': 1}
+    new field plan_prep_us: median/p90/max 7316.5/14212.0/31706, nonzero 457
+    new field plan_topup_txs: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prep_from_plan: {'true': 454, 'false': 4}
+    new field prev_seal_to_answer_us: median/p90/max 2081.0/3620.0/6287, nonzero 457
+    new field prev_seal_to_entry_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prev_seal_to_header_us: median/p90/max 184.5/301.0/641, nonzero 457
+    new field prev_seal_to_import_us: median/p90/max 115049.0/146747.0/218726, nonzero 426
+    new field prev_seal_to_request_us: median/p90/max 938.0/66427.0/90450, nonzero 457
+    new field prev_seal_to_start_us: median/p90/max 1195.0/66663.0/90695, nonzero 457
+    new field pull_bulk_txs: median/p90/max 200000.0/200000.0/200000, nonzero 458
+    new field pull_bulk_us: median/p90/max 5.0/8.0/1106, nonzero 458
+    new field rename_fallbacks: median/p90/max 0.0/0.0/0, nonzero 0
+    new field rename_record_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_apply_gap_us: median/p90/max 10.0/13.0/22, nonzero 458
+    new field root_apply_total_us: median/p90/max 22042.0/30161.0/49811, nonzero 458
+    new field root_compute_us: median/p90/max 24122.5/33077.0/83049, nonzero 458
+    new field root_delta_us: median/p90/max 1168.5/2839.0/8539, nonzero 458
+    new field root_index_us: median/p90/max 2777.5/6000.0/18595, nonzero 458
+    new field root_leaves_us: median/p90/max 6881.5/10959.0/29845, nonzero 458
+    new field root_note_us: median/p90/max 147.0/224.0/1574, nonzero 458
+    new field root_ops_ahead: {'true': 458}
+    new field root_ops_ahead_wait_us: median/p90/max 2936.0/8980.0/25746, nonzero 457
+    new field root_ops_concat_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_ops_encode_us: median/p90/max 5711.0/10112.0/27597, nonzero 458
+    new field root_ops_finish_us: median/p90/max 2160.0/3002.0/5272, nonzero 458
+    new field root_ops_sort_us: median/p90/max 3118.5/6795.0/13845, nonzero 458
+    new field root_ops_us: median/p90/max 5232.5/11131.0/27836, nonzero 458
+    new field root_rehash_us: median/p90/max 1980.0/2575.0/16256, nonzero 458
+    new field root_retire_us: median/p90/max 1911.0/2792.0/7277, nonzero 458
+    new field root_sort_us: median/p90/max 190.0/410.0/2078, nonzero 458
+    new field root_undo_us: median/p90/max 345.0/641.0/3208, nonzero 458
+    new field root_writes_us: median/p90/max 6961.5/9979.0/21511, nonzero 458
+    new field seal_hashes_ahead: {'true': 458}
+    new field seal_on_counters: {'true': 458}
+    new field seal_to_complete_us: median/p90/max 107943.0/125903.0/157644, nonzero 458
+    new field seal_to_frozen_us: median/p90/max 8236.0/14866.0/25601, nonzero 345
+    new field seal_to_merge_end_us: median/p90/max 107852.5/125798.0/157562, nonzero 458
+    new field seal_to_merge_start_us: median/p90/max 49602.5/63064.0/109544, nonzero 458
+    new field seal_to_ops_ahead_us: median/p90/max 20270.5/26964.0/42501, nonzero 458
+    new field seal_to_state_ready_us: median/p90/max 107860.0/125806.0/157570, nonzero 458
+    new field sealed_unix_us: median/p90/max 1791415740745494.0/1791415752178246.0/1791415755250271, nonzero 458
+    new field start_walk_check_us: median/p90/max 0.0/0.0/117, nonzero 1
+    new field start_walk_ids_us: median/p90/max 0.0/0.0/464, nonzero 1
+    new field start_walk_settle_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_us: median/p90/max 0.0/0.0/4588, nonzero 1
+    new field state_wait_us: median/p90/max 5763.0/32053.0/107856, nonzero 458
+    new field view_journal_reads: median/p90/max 8192.0/86016.0/139264, nonzero 237
+    new field view_journal_searches: median/p90/max 21138.5/230547.0/353969, nonzero 237
+    new field view_journal_skips: median/p90/max 0.0/0.0/0, nonzero 0
+    new field whole_take_noted: {'true': 458}
+    binding wait (tick / quorum / seal share, mean cycle): tick 99% (63); quorum 0%; seal 1% (66); feed-bound (blocks under 95% of the tier): 0 of 460
+    slowest key vote delay median/p90 4.7/36.8 ms
+    engine own-import total_ms per block median/p90/max 38/58/92 (n=460)
+    layer RSS 26.8 -> 34.2 G (max 34.2), in-memory blocks max 10
+    execution layer cores busy 34.1    validators cores busy 1.2
+  window 3: canonical 455 blocks, 91.0M tx = 3,033,333/s (96.8% of window 1), full 455/455 (100%); cycle -
+    leader builds 456: sealed_at median/p90/p99 55/81/103; phases median/p90 ms: gap_before_exec 8/54, state_wait 8/53, par 56/89, par_exec 21/28, roots 34/51, parent_fields 6/29, sealed 7/30
+    state_wait_on {'none': 126, 'output': 213, 'grandparent': 116, 'provider_open': 1}; builds with state_wait > 20 ms: 119 ([('grandparent', 108), ('output', 11)]); gp_layer {1.0: 456}, ggp_missing {0.0: 332, 1.0: 124}
+    queue at the builds min/median 1,518,500/2,515,750
+    new field batch_cpu_sum_us: median/p90/max 592510.5/733829.0/1612100, nonzero 456
+    new field batch_dispatch_us: median/p90/max 219.0/294.0/979, nonzero 456
+    new field batch_first_start_us: median/p90/max 73.0/103.0/543, nonzero 456
+    new field batch_ivcsw: median/p90/max 1.0/6.0/37, nonzero 286
+    new field batch_last_end_us: median/p90/max 21854.5/28275.0/63115, nonzero 456
+    new field batch_last_start_us: median/p90/max 16734.0/21107.0/38009, nonzero 456
+    new field batch_live_deferred: median/p90/max 72.0/89.0/444, nonzero 456
+    new field batch_live_lock_hold_us: median/p90/max 10894.0/13879.0/65131, nonzero 456
+    new field batch_live_lock_wait_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_live_lock_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_majflt: median/p90/max 0.0/0.0/10, nonzero 2
+    new field batch_minflt: median/p90/max 977.0/11078.0/36201, nonzero 456
+    new field batch_open_max_us: median/p90/max 444.5/563.0/1692, nonzero 456
+    new field batch_open_sum_us: median/p90/max 10706.0/13690.0/19857, nonzero 456
+    new field batch_threads: median/p90/max 32.0/32.0/32, nonzero 456
+    new field batch_vcsw: median/p90/max 181.0/492.0/964, nonzero 456
+    new field batch_view_index_wait_us: median/p90/max 0.0/20494.0/57687, nonzero 109
+    new field batch_view_index_waits: median/p90/max 0.0/267.0/701, nonzero 109
+    new field batch_view_slot_wait_us: median/p90/max 0.0/2059.0/5143, nonzero 115
+    new field batch_view_slot_waits: median/p90/max 0.0/50.0/127, nonzero 115
+    new field batch_wall_sum_us: median/p90/max 602597.0/750541.0/1617541, nonzero 456
+    new field batches: median/p90/max 128.0/128.0/128, nonzero 456
+    new field build_batches: median/p90/max 128.0/128.0/128, nonzero 456
+    new field carried_depth: median/p90/max 1.0/1.0/1, nonzero 456
+    new field exec_end_to_seal_us: median/p90/max 89.0/148.0/940, nonzero 456
+    new field exec_partition_us: median/p90/max 6.0/8.0/1369, nonzero 456
+    new field exec_prepared_groups: {'true': 454, 'false': 2}
+    new field exec_prepared_slots: {'true': 454, 'false': 2}
+    new field exec_slots_us: median/p90/max 0.0/0.0/1848, nonzero 2
+    new field freeze_join_wait_us: median/p90/max 7563.5/16126.0/23499, nonzero 456
+    new field freeze_late: {'true': 456}
+    new field freeze_pool_own: {'true': 456}
+    new field live_index_defer: {'true': 456}
+    new field merge_accounts: median/p90/max 191628.0/195153.0/198909, nonzero 456
+    new field merge_append_us: median/p90/max 3576.5/9018.0/16207, nonzero 456
+    new field merge_reverts: median/p90/max 191628.0/195153.0/198909, nonzero 456
+    new field merge_reverts_us: median/p90/max 15824.5/22405.0/31946, nonzero 456
+    new field merge_state_us: median/p90/max 39391.0/48926.0/60502, nonzero 456
+    new field merge_tail_us: median/p90/max 0.0/0.0/1, nonzero 2
+    new field merge_threads: median/p90/max 1.0/1.0/1, nonzero 456
+    new field one_wave: {'false': 456}
+    new field open_engine_us: median/p90/max 0.0/40333.0/100290, nonzero 124
+    new field open_fallback: {'false': 332, 'true': 124}
+    new field open_keep_us: median/p90/max 4.0/7.0/14, nonzero 456
+    new field open_layers: median/p90/max 3.0/3.0/3, nonzero 456
+    new field open_provider_us: median/p90/max 94.0/193.0/1879, nonzero 456
+    new field plan_age_us: median/p90/max 53132.0/92925.0/155431, nonzero 456
+    new field plan_ahead: median/p90/max 1.0/1.0/1, nonzero 456
+    new field plan_body: median/p90/max 1.0/1.0/2, nonzero 456
+    new field plan_body_us: median/p90/max 15214.0/19111.0/25859, nonzero 454
+    new field plan_discard: {'': 456}
+    new field plan_prep_us: median/p90/max 6980.5/12566.0/24440, nonzero 456
+    new field plan_topup_txs: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prep_from_plan: {'true': 454, 'false': 2}
+    new field prev_seal_to_answer_us: median/p90/max 1903.0/3535.0/5706, nonzero 456
+    new field prev_seal_to_entry_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prev_seal_to_header_us: median/p90/max 194.0/350.0/1470, nonzero 456
+    new field prev_seal_to_import_us: median/p90/max 125552.0/161518.0/210816, nonzero 406
+    new field prev_seal_to_request_us: median/p90/max 920.0/62243.0/99444, nonzero 456
+    new field prev_seal_to_start_us: median/p90/max 1221.5/62589.0/99707, nonzero 456
+    new field pull_bulk_txs: median/p90/max 200000.0/200000.0/200000, nonzero 456
+    new field pull_bulk_us: median/p90/max 5.0/8.0/994, nonzero 456
+    new field rename_fallbacks: median/p90/max 0.0/0.0/0, nonzero 0
+    new field rename_record_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_apply_gap_us: median/p90/max 11.0/13.0/20, nonzero 456
+    new field root_apply_total_us: median/p90/max 23199.0/31244.0/51832, nonzero 456
+    new field root_compute_us: median/p90/max 25366.5/34803.0/53446, nonzero 456
+    new field root_delta_us: median/p90/max 1237.5/3163.0/12317, nonzero 456
+    new field root_index_us: median/p90/max 2993.5/6903.0/16412, nonzero 456
+    new field root_leaves_us: median/p90/max 6991.5/10755.0/21635, nonzero 456
+    new field root_note_us: median/p90/max 137.0/209.0/889, nonzero 456
+    new field root_ops_ahead: {'true': 456}
+    new field root_ops_ahead_wait_us: median/p90/max 2638.5/9856.0/25910, nonzero 455
+    new field root_ops_concat_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_ops_encode_us: median/p90/max 5237.0/9568.0/23092, nonzero 456
+    new field root_ops_finish_us: median/p90/max 2276.0/3831.0/6962, nonzero 456
+    new field root_ops_sort_us: median/p90/max 3552.5/7315.0/17886, nonzero 456
+    new field root_ops_us: median/p90/max 5114.0/12681.0/30810, nonzero 456
+    new field root_rehash_us: median/p90/max 2531.0/3861.0/11150, nonzero 456
+    new field root_retire_us: median/p90/max 1816.0/2641.0/7852, nonzero 456
+    new field root_sort_us: median/p90/max 203.0/418.0/4658, nonzero 456
+    new field root_undo_us: median/p90/max 342.0/641.0/2056, nonzero 456
+    new field root_writes_us: median/p90/max 7128.5/9812.0/30774, nonzero 456
+    new field seal_hashes_ahead: {'true': 456}
+    new field seal_on_counters: {'true': 456}
+    new field seal_to_complete_us: median/p90/max 115145.0/136903.0/170380, nonzero 456
+    new field seal_to_frozen_us: median/p90/max 7518.5/16075.0/23471, nonzero 299
+    new field seal_to_merge_end_us: median/p90/max 115057.0/136793.0/170253, nonzero 456
+    new field seal_to_merge_start_us: median/p90/max 52416.0/70437.0/101468, nonzero 456
+    new field seal_to_ops_ahead_us: median/p90/max 21216.5/30465.0/50097, nonzero 456
+    new field seal_to_state_ready_us: median/p90/max 115063.0/136802.0/170260, nonzero 456
+    new field sealed_unix_us: median/p90/max 1791415770099915.0/1791415782200895.0/1791415785276977, nonzero 456
+    new field start_walk_check_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_ids_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_settle_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field state_wait_us: median/p90/max 8784.0/53677.0/116662, nonzero 456
+    new field view_journal_reads: median/p90/max 0.0/81920.0/139264, nonzero 225
+    new field view_journal_searches: median/p90/max 0.0/221450.0/431499, nonzero 225
+    new field view_journal_skips: median/p90/max 0.0/0.0/0, nonzero 0
+    new field whole_take_noted: {'true': 456}
+    engine own-import total_ms per block median/p90/max 47/72/104 (n=455)
+    layer RSS 33.7 -> 41.0 G (max 41.0), in-memory blocks max 11
+    execution layer cores busy 34.3    validators cores busy 1.2
+  round total (3 windows, canonical): 277.0M tx
+  layer peak RSS 41.0 G; in-memory blocks max 11
+  fields at seal: mode "early", verified 0, unchecked 0, mismatches 0 (last build line, cumulative)
+  own_executed_again (built here and also directly imported): 0 of 1429 built blocks
+== loop346WARM
+  layer-0 leader window-1 builds 471: txs mean 200000, share >= 95% of the tier 100% (max 200000); sealed_at_ms 48.0/70.0; par_ms 49.0/89.0; par_exec_ms 22.0/27.0; roots_ms 29.0/41.0; parent_fields_ms 3.0/17.0; sealed_ms 4.0/18.0
+  proposal cycle window 1 (n=486): mean 63.8 median 61.4 p90 68.6 ms; blocks in the 30 s: 486
+  binding wait (tick / quorum / seal, share and mean cycle): tick 97.2% (63.4); quorum 0.6% (123.4); seal 2.1% (68.4)
+  vote delay after the proposal, slowest key per block: median 9.8 p90 52.8 ms (slowest minus the median key: median 0.2); last key: {1: 108, 2: 60, 3: 111, 4: 68, 5: 63, 6: 60} of 470 blocks
+  CPU in window 1 (cores busy): execution layers 35.0 over 1 process(es); validators 1.2 over 7 process(es)
+  execution layer peak RSS 41.0 G; in-memory blocks max 11 (node0 and others, all layers)
+  blocks built here 1429; none also directly imported
+  import-once counters at the last direct import: ; start-up lines with import_once=true: 1; queue-lock lines 0
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:2477000 t+20:2474000 t+40:2487000 t+60:2427500 t+80:2454750
+  flood: median per 5 s 3124128/s, final -
+  timeout / given-up lines: 1; 23:27:47 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+loop346WARM page_faults_per_s_median: node0=180152 
+leg loop346WARMb: /data free 590G (needs 120 G)
+load 10.52 at 19:31:00, waiting
+leg loop346WARMb start 19:31:31 load 6.37
+round loop346WARMb exit 0 at 19:34:27
+loop346WARMb save stages (node0, seconds summed over the leg / count): batch_size=1964.0/642  batch_size=1964.0/642  reth_consensus_engine_beacon_persistence_duration=58.8/642  duration_seconds=54.3/642  total=49.9/642  scope=45.2/642  sf=45.1/642  sf_transactions=44.9/642  qmdb_persisted=21.1/642  sf_account_changesets=20.7/642
+el binary: /data/n42-build/target-n42-rs/native/release/n42 env: N42_IMPORT_ONCE=1 N42_SETTLEMENT_TAGS=legacy N42_BUILD_THROTTLE_SOFT=48 F7_EL_MAP=0,0,0,0,0,0,0 N42_FIELDS_AT_SEAL=1 N42_FREEZE_AFTER_SEAL=1 N42_FRAME_BLOCKS=1 N42_TX_INGEST_RECOVER_PARALLEL=24 N42_FREEZE_POOL=own N42_PARALLEL_BUILD_THREADS=32 N42_PLAN_AHEAD=1 N42_HASHED_TABLES=off F7_FLOOD_RATE=6000000 N42_COMPACT_BODY=1 N42_BUILD_BATCHES=128 MALLOC_CONF=thp:always,oversize_threshold:0,dirty_decay_ms:2000,background_thread:true N42_SEAL_ON_COUNTERS=1 N42_ACCOUNT_HISTORY=off N42_TAKE_COMPACT=1 N42_SF_EARLY_WRITEBACK=1 N42_ROAD_RUNTIME=1 N42_TX_INGEST_HIGH_WATER=2500000 F7_BENCH_POOL_SLOTS=3000000 N42_PLAN_AHEAD_BODY=1 N42_SEAL_AT_EXEC=1 N42_TX_QUEUE_DRAIN_CHUNK=8192 N42_ANSWER_LAYOUT_ONLY=1 N42_PULL_BY_FRAMES=1 N42_SF_PARALLEL_ENCODE=1 N42_BUILD_THROTTLE_HARD=80 N42_LIVE_INDEX_DEFER=1 RAYON_NUM_THREADS=16 N42_ROOT_OPS_AHEAD=1 TOKIO_WORKER_THREADS=16 N42_QMDB_READS=on N42_LEADER_LAYERS=3 N42_PERSIST_QMDB_IN_SCOPE=1 F7_BLOCK_INTERVAL_MS=60 F7_MEASURE_FROM_LOG=1
+validator env: N42_IMPORT_ONCE=1 N42_SETTLEMENT_TAGS=legacy N42_BUILD_THROTTLE_SOFT=48 F7_EL_MAP=0,0,0,0,0,0,0 N42_FIELDS_AT_SEAL=1 N42_FREEZE_AFTER_SEAL=1 N42_FRAME_BLOCKS=1 N42_TX_INGEST_RECOVER_PARALLEL=24 N42_FREEZE_POOL=own N42_PARALLEL_BUILD_THREADS=32 N42_PLAN_AHEAD=1 N42_HASHED_TABLES=off F7_FLOOD_RATE=6000000 N42_COMPACT_BODY=1 N42_BUILD_BATCHES=128 N42_SEAL_ON_COUNTERS=1 N42_ACCOUNT_HISTORY=off N42_TAKE_COMPACT=1 N42_SF_EARLY_WRITEBACK=1 N42_ROAD_RUNTIME=1 N42_TX_INGEST_HIGH_WATER=2500000 F7_BENCH_POOL_SLOTS=3000000 N42_PLAN_AHEAD_BODY=1 N42_SEAL_AT_EXEC=1 N42_TX_QUEUE_DRAIN_CHUNK=8192 N42_ANSWER_LAYOUT_ONLY=1 N42_PULL_BY_FRAMES=1 N42_SF_PARALLEL_ENCODE=1 N42_BUILD_THROTTLE_HARD=80 N42_LIVE_INDEX_DEFER=1 RAYON_NUM_THREADS=16 N42_ROOT_OPS_AHEAD=1 TOKIO_WORKER_THREADS=16 N42_QMDB_READS=on N42_LEADER_LAYERS=3 N42_PERSIST_QMDB_IN_SCOPE=1 F7_MEASURE_FROM_LOG=1
+loop346WARMb once: start-up lines import_once=true 1; last direct-import counters 
+loop346WARMb imports: layers=1 direct_imports=0 canonical_blocks=2721 import_once_lines=1 (per layer: direct imports should equal canonical blocks for one execution per block)
+grep: /data/blockchain/rust-fleet7-bench/node1/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node3/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node1/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node3/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node1/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node3/el.log: No such file or directory
+loop346WARMb no_variant=0 own_not_committed=0 tc=1 invalid_blocks=0 incomplete=0 gas_mismatch=0 direct_imports_failed=0 stuck_at_hashed_state=0 engine_idles_over_5s=1 proposals_given_up=0 tables_off_nodes=1 unanswered_reads=0 seal_first_total=1465 seal_first_direct=1465 direct_guard_errors=0 commit_ms_median=0 fold_ms_median=8 sealed_at_ms_median=50 state_ready_ms_median=93 build_total_ms_median=167 recover_us_median=0 par_exec_ms_median=22 par_exec_ms_median=22 giveback_filtered=0 giveback_offered_max=0 seal_first=1465 reader_lag_max=10 reader_lag_warns=0 view_invalidated=0 el_sum_peak_g=41.5 el_max_peak_g=41.5 val_sum_peak_g=2.0 flood_peak_g=0.6 two_roads_blocks=0 two_roads_overlap_ms_median=- exec_on_output_declined=0 r1_collect_ms_median=5 proposal_at_ms_median=49 view_total_ms_median=61 import_exec_ms_median=- import_total_ms_median=- import_senders_ms_median=- import_convert_ms_median=- import_groups_median=- imports_over_600ms=0 min_avail_g=73.1 road_foreign_body_recv_ms=- road_foreign_body_decode_ms=- road_foreign_body_senders_ms=- road_foreign_body_parent_wait_ms=- road_foreign_body_check_ms=- road_foreign_body_total_ms=- road_new_payload_recv_ms=- road_new_payload_decode_ms=- road_new_payload_senders_ms=- road_new_payload_parent_wait_ms=- road_new_payload_check_ms=- road_new_payload_total_ms=- road_foreign_body_blocks=0 road_new_payload_blocks=0 fcu_answered=1277 fcu_in_flight_ms_median=2 fcu_queued_ms_median=0 fcu_queued_ms_max=100 fcu_refused=0 fcu_slow=2367 bodies_held=0 road_reuse_ms=- road_prepare_ms=- road_dispatch_ms=- road_convert_ms=- road_remember_ms=- road_header_ms=- road_fields_ms=- road_other_ms=- import_engine_ms_median=- gate_forced=0 gate_warns=0 flood_timeouts=0 canonical_min=2755 canonical_max=2755 chained_builds=1840 chain_lead_ms_median=52 chain_wait_ms_median=3 chain_started=1843 chain_discarded=2 chain_discard_reasons=_1_reason="no_,_1_reason="the_execution_layer_produced_nothing,_1_reason="the_request_names_another_parent chain_alias_warns=0 el_chained=1857 bodies_held_warns=0 el_build_refused=2 el_build_refused_reasons=_2_no_QMDB_tree_for_parent_block_0x queued_p5=2317000 queued_p50=2475500 road_compact_blocks=0 road_compact_recv_ms=- road_compact_assemble_ms=- road_compact_root_ms=- road_compact_miss_wait_ms=- road_compact_senders_ms=- road_compact_check_ms=- road_compact_other_ms=- road_compact_total_ms=- road_compact_misses_total= compact_refused_el=0 compact_fallbacks=0 compact_bytes_median=6400816 pool_order9=14386 par_pull_ms_median=0 build_total_ms_median2=52 road_compact_filled_blocks=0 road_compact_filled_median=- road_compact_fill_ms_median=- need_txns=0 fill_failed=0 ingest_rate_gate_open_median=- ingest_gate_open_intervals=0 ingest_slots_busy_median=- flood_rate= fill_asked_proposer=0 fill_asked_other=0 loop_lines=1908 loop_unnamed_ms_median=47 loop_body_served_ms_median=- loop_txns_served_ms_median=- import_exec_ms_median2=- pip_partition_ms=- pip_env_ms=- pip_batch_ms=- pip_groups_ms=- pip_gas_ms=- pip_merge_ms=- pip_receipts_ms=- pip_drop_ms=- pip_other_ms=- pip_total_ms=- senders_indexed_median=- road_senders_ms_median=- road_total_ms_median=- pew_ms_median=- pew_ms_p90= gate_ms_median=- gate_ms_p90= root_ms_p50=- root_ms_p90= two_roads=0 not_on_output=0 not_on_output_why= ckpt_ms_first_q=2 ckpt_ms_last_q=50 ckpt_bytes_last=34663892 parent_still_importing=6 root_wait_ms_p50=- root_wait_ms_p90= tenures_low_seal=23 seal_first_share=0.99 empty_over_deep=0 near_empty_warns=0 no_seal_why= par_skipped_median=- usable_p5=2316000 ckpt_replay_ms_last_q=14 candidates_zero=0 dropped_ingest=0 let_go_warns=0 let_go_reasons= parked_p50=0 parked_max=0 held_warns=0 park_capped_total=0 superseded_builds=0 empty_not_superseded=0 mass_park_warns=0 heads_lines=0 holes_lines=0 stale_parent_refusals=0 par_groups_p5=0 cancelled_decided=2 heads_nonce0=0 stale_unconfirmed= handovers=6 el_panics=0 decided_cancelled=2 min_window_blocks=453 road_desc_blocks=0 road_desc_total_ms=- road_desc_copy_ms=- desc_misses=0 fill_failed2=0 sf_par_collect_ms=0 sf_par_commit_ms=0 sf_par_fold_ms=8 sf_par_graft_ms=0 sf_par_prefault_ms=0 sf_par_exec_ms=22 sf_sealed_at_ms=50 sf_roots_ms=31 sf_state_ready_ms=93 sf_total_ms=167 ba_find_ms=0 ba_queue_ms=0 ba_total_ms=52 ba_on_output=1463 queue_fold_us=0 queue_lock_us=2 sf_par_exec_ms=22 sf_par_fold_ms=8 pip_groups_ms=- import_exec_ms_median2=- reads_d0=0 reads_hist=0 f_reads_d0=- f_reads_hist=- f_overlay_depth=- L_read_set_ms=0 read_set_accounts=0 read_set_unresolved=0 read_set_hits=0 read_set_misses=0 start_best_ms=- par_prep_ms=- gap_before_exec_ms=- gap_after_exec_ms=- gap_before_seal_ms=- index_ms=- road_copy_aside_ms=- road_copy_wait_ms=- road_total_ms=- queue_first_miss=queue_first_miss=18446744073709551615:1476,queue_first_miss=0:1244 root_append_behind=0 populate_lag_mb=0 swap_used_g=0 root_faults=- root_faults_p90= root_faults_entries=0 root_faults_offsets=0 root_faults_index=0 root_faults_bits=0 root_faults_twigs=0 root_faults_undo=0 root_faults_tmp=0 root_append_faults=2 root_twig_pool_misses=0 batch_max_ms=9 batch_min_ms=2 batch_median_ms=4 batch_cpu_max_ms=8 batch_txs_max=2000 batch_txs_min=1500 batch_start_skew_ms=16 batch_wait_ms=0 loop_fetch_ns=0 loop_check_ns=0 loop_transfer_ns=0 loop_receipt_ns=0 loop_gas_ns=0 loop_sink_ns=0 loop_other_ns=0 batch_setup_ns=0 batch_close_ns=0 imp_exec_part_ms=- imp_exec_batches_ms=- imp_exec_graft_ms=- imp_exec_batches=- imp_exec_threads=- imp_exec_batch_max_ms=- imp_exec_batch_median_ms=- imp_parent_output_wait_ms=- road_parent_output_wait_ms=- next_start_gap_ms=1 next_entry_gap_ms=0 commit_body_ahead_used=- imp_exec_keys_ms=- imp_keys_ahead=- imp_exec_sink_ms=- imp_exec_pre_ms=- imp_exec_post_ms=- imp_exec_receipts_ms=- imp_exec_drop_ms=- root_gap_ms=- queue_whole=queue_whole=true:1466,queue_whole=false:1254 tick_tick_late_us=939 tick_preamble_us=340 tick_take_sealed_us=1 tick_sign_us=0 tick_cache_us=0 tick_presealed=- tick_describe_us=11 tick_publish_us=600 tick_tick_to_send_us=1990 road_check_ms=- road_check_include_us=- road_check_scan_us=- road_check_fold_us=- road_check_senders_us=- road_check_frames_summarized=- road_check_frames_scanned=- imp_exec_start_gap_us=- imp_gap_road_us=- imp_gap_header_us=- imp_gap_senders_us=- imp_gap_parent_us=- imp_gap_setup_us=- imp_gap_keys_wait_us=- sealed_at_p90= sealed_over_130=0 roots_ms=- cycle_p90=61/65/63 batch_max_ms=- batch_median_ms=- imp_batch_max=- forest_lock_warns=1423 root_seal_ms=1 root_seals=40 root_majflt=4 roots_p90= gp_layer=1474 ggp_missing=253 state_wait_split=0/0/0/0:490,7/0/0/0:74,8/0/0/0:73 qmdb_releases=0 state_wait_on= imp_road_end_ms=- imp_exec_start_ms=- imp_exec_end_ms=- imp_root_end_ms=- imp_fields_ready_ms=- imp_parent_fields_wait_ms=- imp_exec_ms=- imp_root_ms=- imp_checks_ms=- imp_engine_ms=- imp_total_ms=- road_parent_fields_wait_ms=- exec_read_ms=0 L_exec_evm_ms=0 L_exec_write_ms=0 L_exec_other_ms=0 L_reads_cache=0 L_reads_provider=0 L_reads_view=0 L_graft_base_ms=0 L_graft_reserve_ms=0 L_graft_insert_ms=0 L_graft_reverts_ms=0 L_graft_other_ms=0 L_par_exec_ms=22 L_par_graft_ms=0 F_exec_read_ms=- F_exec_evm_ms=- F_exec_write_ms=- F_exec_other_ms=- F_reads_cache=- F_reads_provider=- F_reads_view=- F_groups_ms=- L_tx_root_wait_ms=0 L_par_exec_ms=22 L_par_graft_ms=0 L_par_fold_ms=8 L_sealed_ms=6 L_state_ready_ms=93 L_roots_ms=31 L_finish_ms=102 L_total_ms=167 L_setup_ms=0 L_par_pull_ms=0 L_give_back_ms=0 L_state_wait_ms=6 L_state_after_pull=1465 L_seal_at_exec=1465 L_tx_root_ahead=11 flood_w1=3201719 txs_p10=200000 acq_us=467 slots_busy=13 ingest_rate=3194199 L_scope_join_ms=0 L_par_release_ms=0 L_commit_body_ms=0 L_par_commit_ms=0 L_give_back_ms=0 L_sealed_ms=6 L_par_exec_ms=22 L_state_wait_ms=6 L_par_pull_ms=0 L_par_prep_ms=0 L_par_start_ms=4 L_pre_exec_ms=0 L_par_run_ms=29 L_sealed_at_ms=50 F_partition_ms=- F_env_ms=- F_groups_ms=- F_merge_ms=- F_reverts_wait_ms=- F_ahead_wait_ms=- F_total_ms=- I_engine_ms=- I_root_ms=- I_total_ms=- H_engine_remember_ms=- H_engine_listing_ms=- H_engine_new_payload_ms=- busy_us=1 L_par_start_ms=4 L_start_handoff_ms=0 L_start_best_ms=4 L_start_puller_ms=0 L_par_pull_ms=0 L_par_prep_ms=0 L_state_wait_ms=6 L_par_exec_ms=22 L_par_commit_ms=0 L_sealed_ms=6 L_sealed_at_ms=50 L_par_graft_ms=0 L_graft_insert_ms=0 L_graft_reverts_ms=0 L_graft_split_us=0 L_graft_build_us=0 L_graft_merge_us=0 L_state_ready_ms=93 Q_queue_ms=0 R_dispatch_wait_ms=- R_total_ms=- R_road_runtime=1 gate_holds=0 peer_fetch=0 pool_limit=limit=4 gate_opened=gate_opened_for_block=0 I_root_ms=- flood_rate_hdr=rate=6000000/s fills=0 fill_waited=- slots_busy=13 acq_us=467 busy_us=1 converged=0 fallbacks=0 busy_us=1 recover_us=0 tf_on_output=2 tf_fallback=0 still_importing=6 busy_us=1 slots_busy=13 batches=altsig_txs=0 altsig_batches=0 tf_on_output=2 tf_fallback=0 gate_holds=0 sign_s=sign 0s replay_note=replay       : 64 files from /data/n42-pregen/g900000-400m, 400000000 transactio sign_s=sign 0s shard=shard_verified=0 shard_claimed=0 road_verified=- slots_busy=13 gate_us=6997 reply_us=7556 queued=2475500 assemble_ms=- road_take_ms=- road_body_ms=- road_encode_ms=- shards=16 shard_insert_ms=0 shard_wait_ms=0 shard_fold_ms=13 shard_append_ms=17 shard_merge_ms=58 state_ready_ms=93 roots_ms=31 exec_read_ms=0 exec_evm_ms=0 exec_write_ms=0 exec_other_ms=0 reads_cache=0 reads_provider=0 reads_view=0 par_run_ms=29 fold_task_cpu_max_us=13172 fold_task_minflt_max=1 fold_task_minflt_sum=1 fold_task_migrated=0 fold_task_nivcsw_max=0 fold_index=1 fold_index_build_ms=13 fold_index_conflicts=8228 fold_queue_us=60 fold_skew_us=33 fold_task_max_us=13169 fold_tail_us=16 start_best_ms=4 start_select_ms=0 start_walk_ms=0 start_walk_check_ms=0 start_best_other_ms=0 start_frames_by_ref=0 start_frames_slow=0 start_pull_ms=0 start_other_ms=0 start_handoff_ms=0 par_start_ms=4 par_prep_ms=0 par_commit_ms=0 commit_body_ms=0 par_fold_ms=8 sealed_ms=6 copy_ms=- prune_ms=0 frames=- frames_missing=- frame_root_ms=- root_ms=- frames_admitted=frames_admitted=585535 frames_unaligned=0 frame_root_indexed=- seal_layout_ms=0 seal_root_ms=0 attested= busy_us=1 slots_busy=13 reply_us=7556 prune_ms=0 body_refused=0 body_failed_late=0
+loop346WARMb win1 tps=3,159,867 txs=94,796,000 blocks= 474 cycle=0.063s occupancy= 99.9% full(>=95%)=473/474 basefee=n/a (from the layer's log)
+loop346WARMb win2 tps=3,100,000 txs=93,000,000 blocks= 465 cycle=0.065s occupancy=100.0% full(>=95%)=465/465 basefee=n/a (from the layer's log)
+loop346WARMb win3 tps=3,020,000 txs=90,600,000 blocks= 453 cycle=0.066s occupancy=100.0% full(>=95%)=453/453 basefee=n/a (from the layer's log)
+loop346WARMb win1 tps=3,186,667 txs=95,600,000 blocks= 478 cycle=0.063s occupancy=100.0% full(>=95%)=478/478 basefee=n/a (from the layer's log)
+loop346WARMb win2 tps=3,213,333 txs=96,400,000 blocks= 482 cycle=0.062s occupancy=100.0% full(>=95%)=482/482 basefee=n/a (from the layer's log)
+loop346WARMb win3 tps=3,033,333 txs=91,000,000 blocks= 455 cycle=0.066s occupancy=100.0% full(>=95%)=455/455 basefee=n/a (from the layer's log)
+loop346WARMb tps=3,159,867
+tps=3,186,667 round_txs=561396000 cycles_w1=
+loop346WARMb imp_fields_p90= b_p75=15
+loop346WARMb overlay: filter_skips=0 probes=0 ratio=- (ratio = skips/(skips+probes))
+loop346WARMb overlay_manager:       1 state_trie_overlay=false  state-ovly_cpu=0
+loop346WARMb verify: written to /data/blockchain/rust-fleet7-bench/bench-loop346WARMb/verify.json
+== loop346WARMb  (E=1: seven validator keys on one execution layer)
+  window 1: canonical 479 blocks, 95.8M tx = 3,193,333/s (100.0% of window 1), full 478/479 (100%); cycle mean/median/p90 62.8/61.4/67.6 ms
+    leader builds 478: sealed_at median/p90/p99 47/66/90; phases median/p90 ms: gap_before_exec 6/37, state_wait 6/36, par 48/77, par_exec 21/27, roots 28/41, parent_fields 3/19, sealed 4/20
+    state_wait_on {'output': 260, 'none': 168, 'grandparent': 48, 'open': 2}; builds with state_wait > 20 ms: 69 ([('grandparent', 45), ('output', 24)]); gp_layer {1.0: 478}, ggp_missing {0.0: 426, 1.0: 52}
+    queue at the builds min/median 994,000/2,515,750
+    new field batch_cpu_sum_us: median/p90/max 582072.5/736604.0/1511354, nonzero 478
+    new field batch_dispatch_us: median/p90/max 233.0/348.0/509, nonzero 478
+    new field batch_first_start_us: median/p90/max 76.0/122.0/258, nonzero 478
+    new field batch_ivcsw: median/p90/max 1.0/7.0/32, nonzero 271
+    new field batch_last_end_us: median/p90/max 21862.0/26913.0/60570, nonzero 478
+    new field batch_last_start_us: median/p90/max 16620.0/20474.0/42361, nonzero 478
+    new field batch_live_deferred: median/p90/max 71.0/79.0/86, nonzero 478
+    new field batch_live_lock_hold_us: median/p90/max 10138.0/11653.0/16266, nonzero 478
+    new field batch_live_lock_wait_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_live_lock_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_majflt: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_minflt: median/p90/max 806.0/7434.0/28867, nonzero 478
+    new field batch_open_max_us: median/p90/max 431.0/516.0/3048, nonzero 478
+    new field batch_open_sum_us: median/p90/max 10232.5/12921.0/19588, nonzero 478
+    new field batch_threads: median/p90/max 32.0/32.0/32, nonzero 478
+    new field batch_vcsw: median/p90/max 181.0/489.0/867, nonzero 478
+    new field batch_view_index_wait_us: median/p90/max 0.0/17695.0/54136, nonzero 111
+    new field batch_view_index_waits: median/p90/max 0.0/275.0/625, nonzero 111
+    new field batch_view_slot_wait_us: median/p90/max 0.0/1966.0/3786, nonzero 116
+    new field batch_view_slot_waits: median/p90/max 0.0/57.0/105, nonzero 116
+    new field batch_wall_sum_us: median/p90/max 595221.5/739558.0/1514100, nonzero 478
+    new field batches: median/p90/max 128.0/128.0/128, nonzero 478
+    new field build_batches: median/p90/max 128.0/128.0/128, nonzero 478
+    new field carried_depth: median/p90/max 1.0/1.0/1, nonzero 478
+    new field exec_end_to_seal_us: median/p90/max 89.0/135.0/466, nonzero 478
+    new field exec_partition_us: median/p90/max 6.0/8.0/1330, nonzero 478
+    new field exec_prepared_groups: {'true': 473, 'false': 5}
+    new field exec_prepared_slots: {'true': 473, 'false': 5}
+    new field exec_slots_us: median/p90/max 0.0/0.0/2476, nonzero 6
+    new field freeze_join_wait_us: median/p90/max 9182.0/17018.0/43518, nonzero 478
+    new field freeze_late: {'true': 478}
+    new field freeze_pool_own: {'true': 478}
+    new field live_index_defer: {'true': 478}
+    new field merge_accounts: median/p90/max 191424.0/195030.0/197952, nonzero 478
+    new field merge_append_us: median/p90/max 3481.5/7046.0/16203, nonzero 478
+    new field merge_reverts: median/p90/max 191424.0/195030.0/197952, nonzero 478
+    new field merge_reverts_us: median/p90/max 14578.5/18821.0/27046, nonzero 478
+    new field merge_state_us: median/p90/max 37581.0/45316.0/60710, nonzero 478
+    new field merge_tail_us: median/p90/max 0.0/0.0/1, nonzero 1
+    new field merge_threads: median/p90/max 1.0/1.0/1, nonzero 478
+    new field one_wave: {'false': 478}
+    new field open_engine_us: median/p90/max 0.0/17473.0/74784, nonzero 52
+    new field open_fallback: {'false': 426, 'true': 52}
+    new field open_keep_us: median/p90/max 4.0/6.0/15, nonzero 478
+    new field open_layers: median/p90/max 3.0/3.0/3, nonzero 478
+    new field open_provider_us: median/p90/max 91.0/150.0/393, nonzero 478
+    new field plan_age_us: median/p90/max 45877.5/96689.0/125162, nonzero 477
+    new field plan_ahead: median/p90/max 1.0/1.0/1, nonzero 477
+    new field plan_body: median/p90/max 1.0/1.0/2, nonzero 477
+    new field plan_body_us: median/p90/max 14981.5/18725.0/22982, nonzero 473
+    new field plan_discard: {'': 477, 'not_on_its_parent': 1}
+    new field plan_prep_us: median/p90/max 8516.0/15912.0/30734, nonzero 477
+    new field plan_topup_txs: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prep_from_plan: {'true': 473, 'false': 5}
+    new field prev_seal_to_answer_us: median/p90/max 1924.0/3306.0/6486, nonzero 478
+    new field prev_seal_to_entry_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prev_seal_to_header_us: median/p90/max 205.5/326.0/557, nonzero 478
+    new field prev_seal_to_import_us: median/p90/max 111754.0/144062.0/198145, nonzero 448
+    new field prev_seal_to_request_us: median/p90/max 964.5/68389.0/87514, nonzero 478
+    new field prev_seal_to_start_us: median/p90/max 1260.0/68657.0/87781, nonzero 478
+    new field pull_bulk_txs: median/p90/max 200000.0/200000.0/200000, nonzero 478
+    new field pull_bulk_us: median/p90/max 5.0/10.0/1921, nonzero 478
+    new field rename_fallbacks: median/p90/max 0.0/0.0/0, nonzero 0
+    new field rename_record_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_apply_gap_us: median/p90/max 10.0/12.0/24, nonzero 478
+    new field root_apply_total_us: median/p90/max 19939.0/28921.0/39257, nonzero 478
+    new field root_compute_us: median/p90/max 21960.0/32230.0/42607, nonzero 478
+    new field root_delta_us: median/p90/max 1133.0/2342.0/16426, nonzero 478
+    new field root_index_us: median/p90/max 2484.0/4091.0/13222, nonzero 478
+    new field root_leaves_us: median/p90/max 6597.0/10737.0/19700, nonzero 478
+    new field root_note_us: median/p90/max 148.0/201.0/1044, nonzero 478
+    new field root_ops_ahead: {'true': 478}
+    new field root_ops_ahead_wait_us: median/p90/max 2494.0/8078.0/19904, nonzero 477
+    new field root_ops_concat_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_ops_encode_us: median/p90/max 5242.5/9363.0/16729, nonzero 478
+    new field root_ops_finish_us: median/p90/max 2197.0/2877.0/7864, nonzero 478
+    new field root_ops_sort_us: median/p90/max 2932.5/6088.0/11904, nonzero 478
+    new field root_ops_us: median/p90/max 4796.5/10250.0/22105, nonzero 478
+    new field root_rehash_us: median/p90/max 1361.5/1782.0/13809, nonzero 478
+    new field root_retire_us: median/p90/max 1572.0/2704.0/7065, nonzero 478
+    new field root_sort_us: median/p90/max 186.0/375.0/3303, nonzero 478
+    new field root_undo_us: median/p90/max 332.5/655.0/3719, nonzero 478
+    new field root_writes_us: median/p90/max 6725.0/10008.0/23269, nonzero 478
+    new field seal_hashes_ahead: {'true': 478}
+    new field seal_on_counters: {'true': 478}
+    new field seal_to_complete_us: median/p90/max 105283.0/122787.0/138411, nonzero 478
+    new field seal_to_frozen_us: median/p90/max 9166.5/16960.0/43469, nonzero 365
+    new field seal_to_merge_end_us: median/p90/max 105205.5/122732.0/138340, nonzero 478
+    new field seal_to_merge_start_us: median/p90/max 47546.0/61213.0/74317, nonzero 478
+    new field seal_to_ops_ahead_us: median/p90/max 20560.5/30301.0/52521, nonzero 478
+    new field seal_to_state_ready_us: median/p90/max 105212.0/122738.0/138351, nonzero 478
+    new field sealed_unix_us: median/p90/max 1791415986226157.5/1791415998106380.0/1791416001197821, nonzero 478
+    new field start_walk_check_us: median/p90/max 0.0/0.0/103, nonzero 1
+    new field start_walk_ids_us: median/p90/max 0.0/0.0/96, nonzero 1
+    new field start_walk_settle_us: median/p90/max 0.0/0.0/72, nonzero 1
+    new field start_walk_us: median/p90/max 0.0/0.0/4693, nonzero 1
+    new field state_wait_us: median/p90/max 6339.5/36362.0/94266, nonzero 478
+    new field view_journal_reads: median/p90/max 12288.0/81920.0/151552, nonzero 252
+    new field view_journal_searches: median/p90/max 29479.5/233008.0/498655, nonzero 252
+    new field view_journal_skips: median/p90/max 0.0/0.0/0, nonzero 0
+    new field whole_take_noted: {'true': 478}
+    binding wait (tick / quorum / seal share, mean cycle): tick 97% (62); quorum 0% (108); seal 2% (74); feed-bound (blocks under 95% of the tier): 1 of 479
+    slowest key vote delay median/p90 6.9/44.9 ms
+    engine own-import total_ms per block median/p90/max 37/55/79 (n=478)
+    layer RSS 4.8 -> 27.3 G (max 27.3), in-memory blocks max 11
+    execution layer cores busy 34.9    validators cores busy 1.2
+    flood delivered (median per 5 s over the leg) 3,187,472/s
+  window 2: canonical 482 blocks, 96.4M tx = 3,213,333/s (100.6% of window 1), full 482/482 (100%); cycle mean/median/p90 62.2/61.4/66.2 ms
+    leader builds 484: sealed_at median/p90/p99 46/62/88; phases median/p90 ms: gap_before_exec 4/13, state_wait 4/13, par 47/62, par_exec 23/28, roots 31/44, parent_fields 5/20, sealed 6/21
+    state_wait_on {'output': 260, 'none': 189, 'grandparent': 32, 'open': 3}; builds with state_wait > 20 ms: 21 ([('grandparent', 21)]); gp_layer {1.0: 484}, ggp_missing {0.0: 451, 1.0: 33}
+    queue at the builds min/median 2,299,500/2,514,500
+    new field batch_cpu_sum_us: median/p90/max 628701.0/761462.0/2813233, nonzero 484
+    new field batch_dispatch_us: median/p90/max 220.0/301.0/456, nonzero 484
+    new field batch_first_start_us: median/p90/max 73.0/115.0/233, nonzero 484
+    new field batch_ivcsw: median/p90/max 1.0/8.0/23, nonzero 296
+    new field batch_last_end_us: median/p90/max 23150.0/28784.0/98355, nonzero 484
+    new field batch_last_start_us: median/p90/max 17858.5/21822.0/81581, nonzero 484
+    new field batch_live_deferred: median/p90/max 72.0/80.0/171, nonzero 484
+    new field batch_live_lock_hold_us: median/p90/max 10885.0/12827.0/25814, nonzero 484
+    new field batch_live_lock_wait_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_live_lock_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_majflt: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_minflt: median/p90/max 836.0/10050.0/27857, nonzero 484
+    new field batch_open_max_us: median/p90/max 428.0/510.0/741, nonzero 484
+    new field batch_open_sum_us: median/p90/max 10451.5/12807.0/17222, nonzero 484
+    new field batch_threads: median/p90/max 32.0/32.0/32, nonzero 484
+    new field batch_vcsw: median/p90/max 184.0/535.0/1079, nonzero 484
+    new field batch_view_index_wait_us: median/p90/max 0.0/20904.0/55264, nonzero 121
+    new field batch_view_index_waits: median/p90/max 0.0/305.0/778, nonzero 121
+    new field batch_view_slot_wait_us: median/p90/max 0.0/2231.0/5706, nonzero 126
+    new field batch_view_slot_waits: median/p90/max 0.0/66.0/126, nonzero 126
+    new field batch_wall_sum_us: median/p90/max 639655.0/774588.0/2818879, nonzero 484
+    new field batches: median/p90/max 128.0/128.0/128, nonzero 484
+    new field build_batches: median/p90/max 128.0/128.0/128, nonzero 484
+    new field carried_depth: median/p90/max 1.0/1.0/1, nonzero 484
+    new field exec_end_to_seal_us: median/p90/max 87.0/138.0/635, nonzero 484
+    new field exec_partition_us: median/p90/max 6.0/8.0/1670, nonzero 484
+    new field exec_prepared_groups: {'true': 481, 'false': 3}
+    new field exec_prepared_slots: {'true': 482, 'false': 2}
+    new field exec_slots_us: median/p90/max 0.0/0.0/3022, nonzero 2
+    new field freeze_join_wait_us: median/p90/max 6881.5/13777.0/21776, nonzero 484
+    new field freeze_late: {'true': 484}
+    new field freeze_pool_own: {'true': 484}
+    new field live_index_defer: {'true': 484}
+    new field merge_accounts: median/p90/max 192731.0/195435.0/198702, nonzero 484
+    new field merge_append_us: median/p90/max 3700.5/7381.0/13913, nonzero 484
+    new field merge_reverts: median/p90/max 192731.0/195435.0/198702, nonzero 484
+    new field merge_reverts_us: median/p90/max 14975.5/19997.0/33563, nonzero 484
+    new field merge_state_us: median/p90/max 39123.0/46634.0/72776, nonzero 484
+    new field merge_tail_us: median/p90/max 0.0/0.0/1, nonzero 2
+    new field merge_threads: median/p90/max 1.0/1.0/1, nonzero 484
+    new field one_wave: {'false': 484}
+    new field open_engine_us: median/p90/max 0.0/0.0/60371, nonzero 33
+    new field open_fallback: {'false': 451, 'true': 33}
+    new field open_keep_us: median/p90/max 4.0/6.0/35, nonzero 484
+    new field open_layers: median/p90/max 3.0/3.0/3, nonzero 484
+    new field open_provider_us: median/p90/max 96.0/148.0/569, nonzero 484
+    new field plan_age_us: median/p90/max 42486.0/95853.0/170225, nonzero 484
+    new field plan_ahead: median/p90/max 1.0/1.0/1, nonzero 484
+    new field plan_body: median/p90/max 1.0/1.0/2, nonzero 484
+    new field plan_body_us: median/p90/max 14055.0/17331.0/23291, nonzero 482
+    new field plan_discard: {'': 484}
+    new field plan_prep_us: median/p90/max 9702.0/17428.0/35125, nonzero 484
+    new field plan_topup_txs: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prep_from_plan: {'true': 482, 'false': 2}
+    new field prev_seal_to_answer_us: median/p90/max 1979.0/3287.0/6991, nonzero 484
+    new field prev_seal_to_entry_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prev_seal_to_header_us: median/p90/max 213.0/326.0/558, nonzero 484
+    new field prev_seal_to_import_us: median/p90/max 114159.0/146558.0/203041, nonzero 471
+    new field prev_seal_to_request_us: median/p90/max 983.5/68380.0/131909, nonzero 484
+    new field prev_seal_to_start_us: median/p90/max 1264.0/68610.0/132147, nonzero 484
+    new field pull_bulk_txs: median/p90/max 200000.0/200000.0/200000, nonzero 484
+    new field pull_bulk_us: median/p90/max 5.0/10.0/1234, nonzero 484
+    new field rename_fallbacks: median/p90/max 0.0/0.0/0, nonzero 0
+    new field rename_record_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_apply_gap_us: median/p90/max 10.0/13.0/21, nonzero 484
+    new field root_apply_total_us: median/p90/max 21183.0/28732.0/43682, nonzero 484
+    new field root_compute_us: median/p90/max 23292.5/32090.0/46057, nonzero 484
+    new field root_delta_us: median/p90/max 1201.5/3420.0/15087, nonzero 484
+    new field root_index_us: median/p90/max 2805.5/4770.0/13802, nonzero 484
+    new field root_leaves_us: median/p90/max 6635.0/10442.0/23274, nonzero 484
+    new field root_note_us: median/p90/max 150.0/216.0/628, nonzero 484
+    new field root_ops_ahead: {'true': 484}
+    new field root_ops_ahead_wait_us: median/p90/max 3161.0/9866.0/19273, nonzero 484
+    new field root_ops_concat_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_ops_encode_us: median/p90/max 5819.0/10260.0/16821, nonzero 484
+    new field root_ops_finish_us: median/p90/max 2275.5/3146.0/8151, nonzero 484
+    new field root_ops_sort_us: median/p90/max 3001.0/7221.0/16648, nonzero 484
+    new field root_ops_us: median/p90/max 5496.5/12269.0/21594, nonzero 484
+    new field root_rehash_us: median/p90/max 2045.0/2818.0/16000, nonzero 484
+    new field root_retire_us: median/p90/max 1649.0/2469.0/6417, nonzero 484
+    new field root_sort_us: median/p90/max 198.5/363.0/1870, nonzero 484
+    new field root_undo_us: median/p90/max 324.0/634.0/2991, nonzero 484
+    new field root_writes_us: median/p90/max 6860.0/8968.0/22393, nonzero 484
+    new field seal_hashes_ahead: {'true': 484}
+    new field seal_on_counters: {'true': 484}
+    new field seal_to_complete_us: median/p90/max 108269.5/125881.0/149134, nonzero 484
+    new field seal_to_frozen_us: median/p90/max 6854.5/13714.0/21718, nonzero 333
+    new field seal_to_merge_end_us: median/p90/max 108182.0/125810.0/149054, nonzero 484
+    new field seal_to_merge_start_us: median/p90/max 48459.5/62053.0/80921, nonzero 484
+    new field seal_to_ops_ahead_us: median/p90/max 20117.0/27408.0/41883, nonzero 484
+    new field seal_to_state_ready_us: median/p90/max 108189.5/125817.0/149062, nonzero 484
+    new field sealed_unix_us: median/p90/max 1791416016261332.5/1791416028288218.0/1791416031246545, nonzero 484
+    new field start_walk_check_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_ids_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_settle_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field state_wait_us: median/p90/max 4361.5/13675.0/73336, nonzero 484
+    new field view_journal_reads: median/p90/max 0.0/90112.0/151552, nonzero 234
+    new field view_journal_searches: median/p90/max 0.0/233138.0/405504, nonzero 234
+    new field view_journal_skips: median/p90/max 0.0/0.0/0, nonzero 0
+    new field whole_take_noted: {'true': 484}
+    binding wait (tick / quorum / seal share, mean cycle): tick 99% (62); quorum 0%; seal 1% (70); feed-bound (blocks under 95% of the tier): 0 of 482
+    slowest key vote delay median/p90 9.9/40.0 ms
+    engine own-import total_ms per block median/p90/max 37/56/89 (n=482)
+    layer RSS 26.6 -> 34.5 G (max 34.5), in-memory blocks max 10
+    execution layer cores busy 36.3    validators cores busy 1.2
+  window 3: canonical 455 blocks, 91.0M tx = 3,033,333/s (95.0% of window 1), full 455/455 (100%); cycle -
+    leader builds 454: sealed_at median/p90/p99 55/83/104; phases median/p90 ms: gap_before_exec 8/57, state_wait 8/57, par 57/94, par_exec 22/27, roots 32/49, parent_fields 5/25, sealed 6/26
+    state_wait_on {'output': 204, 'none': 107, 'grandparent': 141, 'open': 2}; builds with state_wait > 20 ms: 131 ([('grandparent', 121), ('output', 10)]); gp_layer {1.0: 454}, ggp_missing {0.0: 307, 1.0: 147}
+    queue at the builds min/median 2,245,500/2,499,250
+    new field batch_cpu_sum_us: median/p90/max 596640.5/721593.0/2270001, nonzero 454
+    new field batch_dispatch_us: median/p90/max 226.5/319.0/2206, nonzero 454
+    new field batch_first_start_us: median/p90/max 73.0/121.0/288, nonzero 454
+    new field batch_ivcsw: median/p90/max 1.0/7.0/35, nonzero 298
+    new field batch_last_end_us: median/p90/max 21984.5/27182.0/86256, nonzero 454
+    new field batch_last_start_us: median/p90/max 16915.5/20722.0/62983, nonzero 454
+    new field batch_live_deferred: median/p90/max 74.0/86.0/290, nonzero 454
+    new field batch_live_lock_hold_us: median/p90/max 11028.0/14187.0/44522, nonzero 454
+    new field batch_live_lock_wait_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_live_lock_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_majflt: median/p90/max 0.0/0.0/2, nonzero 1
+    new field batch_minflt: median/p90/max 976.5/10325.0/33654, nonzero 454
+    new field batch_open_max_us: median/p90/max 445.5/541.0/3085, nonzero 454
+    new field batch_open_sum_us: median/p90/max 10839.5/13458.0/19933, nonzero 454
+    new field batch_threads: median/p90/max 32.0/32.0/32, nonzero 454
+    new field batch_vcsw: median/p90/max 187.0/511.0/904, nonzero 454
+    new field batch_view_index_wait_us: median/p90/max 0.0/19655.0/44418, nonzero 109
+    new field batch_view_index_waits: median/p90/max 0.0/274.0/617, nonzero 109
+    new field batch_view_slot_wait_us: median/p90/max 0.0/1977.0/4951, nonzero 113
+    new field batch_view_slot_waits: median/p90/max 0.0/61.0/124, nonzero 113
+    new field batch_wall_sum_us: median/p90/max 601779.5/744574.0/2274236, nonzero 454
+    new field batches: median/p90/max 128.0/128.0/128, nonzero 454
+    new field build_batches: median/p90/max 128.0/128.0/128, nonzero 454
+    new field carried_depth: median/p90/max 1.0/1.0/1, nonzero 454
+    new field exec_end_to_seal_us: median/p90/max 92.5/153.0/668, nonzero 454
+    new field exec_partition_us: median/p90/max 6.0/8.0/1425, nonzero 454
+    new field exec_prepared_groups: {'true': 449, 'false': 5}
+    new field exec_prepared_slots: {'true': 449, 'false': 5}
+    new field exec_slots_us: median/p90/max 0.0/0.0/2487, nonzero 5
+    new field freeze_join_wait_us: median/p90/max 9385.5/16237.0/23626, nonzero 454
+    new field freeze_late: {'true': 454}
+    new field freeze_pool_own: {'true': 454}
+    new field live_index_defer: {'true': 454}
+    new field merge_accounts: median/p90/max 191522.5/194817.0/198642, nonzero 454
+    new field merge_append_us: median/p90/max 2815.0/8861.0/19264, nonzero 454
+    new field merge_reverts: median/p90/max 191522.5/194817.0/198642, nonzero 454
+    new field merge_reverts_us: median/p90/max 15673.0/20152.0/30730, nonzero 454
+    new field merge_state_us: median/p90/max 38629.0/46894.0/59958, nonzero 454
+    new field merge_tail_us: median/p90/max 0.0/0.0/1, nonzero 2
+    new field merge_threads: median/p90/max 1.0/1.0/1, nonzero 454
+    new field one_wave: {'false': 454}
+    new field open_engine_us: median/p90/max 0.0/40435.0/95507, nonzero 147
+    new field open_fallback: {'false': 307, 'true': 147}
+    new field open_keep_us: median/p90/max 4.0/7.0/12, nonzero 454
+    new field open_layers: median/p90/max 3.0/3.0/3, nonzero 454
+    new field open_provider_us: median/p90/max 89.0/151.0/696, nonzero 454
+    new field plan_age_us: median/p90/max 51655.5/88699.0/129157, nonzero 454
+    new field plan_ahead: median/p90/max 1.0/1.0/1, nonzero 454
+    new field plan_body: median/p90/max 1.0/1.0/2, nonzero 454
+    new field plan_body_us: median/p90/max 15888.5/21010.0/26068, nonzero 449
+    new field plan_discard: {'': 454}
+    new field plan_prep_us: median/p90/max 9416.5/16070.0/29483, nonzero 454
+    new field plan_topup_txs: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prep_from_plan: {'true': 449, 'false': 5}
+    new field prev_seal_to_answer_us: median/p90/max 1837.5/3224.0/6783, nonzero 454
+    new field prev_seal_to_entry_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prev_seal_to_header_us: median/p90/max 189.0/337.0/952, nonzero 454
+    new field prev_seal_to_import_us: median/p90/max 125368.5/157514.0/223764, nonzero 405
+    new field prev_seal_to_request_us: median/p90/max 934.5/61640.0/84713, nonzero 454
+    new field prev_seal_to_start_us: median/p90/max 1209.5/61923.0/85002, nonzero 454
+    new field pull_bulk_txs: median/p90/max 200000.0/200000.0/200000, nonzero 454
+    new field pull_bulk_us: median/p90/max 5.0/9.0/1082, nonzero 454
+    new field rename_fallbacks: median/p90/max 0.0/0.0/0, nonzero 0
+    new field rename_record_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_apply_gap_us: median/p90/max 10.0/13.0/33, nonzero 454
+    new field root_apply_total_us: median/p90/max 21847.5/31491.0/70814, nonzero 454
+    new field root_compute_us: median/p90/max 24079.0/34624.0/72289, nonzero 454
+    new field root_delta_us: median/p90/max 1219.0/3310.0/14213, nonzero 454
+    new field root_index_us: median/p90/max 2769.5/5336.0/19763, nonzero 454
+    new field root_leaves_us: median/p90/max 6831.0/11322.0/23963, nonzero 454
+    new field root_note_us: median/p90/max 140.0/203.0/1638, nonzero 454
+    new field root_ops_ahead: {'true': 454}
+    new field root_ops_ahead_wait_us: median/p90/max 3256.5/8896.0/32158, nonzero 454
+    new field root_ops_concat_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_ops_encode_us: median/p90/max 5354.0/8980.0/29443, nonzero 454
+    new field root_ops_finish_us: median/p90/max 2258.5/3379.0/7962, nonzero 454
+    new field root_ops_sort_us: median/p90/max 3598.0/7444.0/14251, nonzero 454
+    new field root_ops_us: median/p90/max 5907.0/11261.0/33921, nonzero 454
+    new field root_rehash_us: median/p90/max 2643.5/4144.0/32701, nonzero 454
+    new field root_retire_us: median/p90/max 1659.0/2581.0/7123, nonzero 454
+    new field root_sort_us: median/p90/max 188.5/379.0/3049, nonzero 454
+    new field root_undo_us: median/p90/max 335.5/617.0/4384, nonzero 454
+    new field root_writes_us: median/p90/max 6788.0/9616.0/17766, nonzero 454
+    new field seal_hashes_ahead: {'true': 454}
+    new field seal_on_counters: {'true': 454}
+    new field seal_to_complete_us: median/p90/max 111392.5/130845.0/176272, nonzero 454
+    new field seal_to_frozen_us: median/p90/max 9353.5/16198.0/23592, nonzero 332
+    new field seal_to_merge_end_us: median/p90/max 111293.0/130733.0/176161, nonzero 454
+    new field seal_to_merge_start_us: median/p90/max 51255.5/66080.0/96436, nonzero 454
+    new field seal_to_ops_ahead_us: median/p90/max 21136.5/29425.0/53219, nonzero 454
+    new field seal_to_state_ready_us: median/p90/max 111302.0/130743.0/176169, nonzero 454
+    new field sealed_unix_us: median/p90/max 1791416046171830.5/1791416058118833.0/1791416061200720, nonzero 454
+    new field start_walk_check_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_ids_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_settle_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field state_wait_us: median/p90/max 8474.5/57175.0/110525, nonzero 454
+    new field view_journal_reads: median/p90/max 0.0/77824.0/147456, nonzero 215
+    new field view_journal_searches: median/p90/max 0.0/221184.0/441472, nonzero 215
+    new field view_journal_skips: median/p90/max 0.0/0.0/0, nonzero 0
+    new field whole_take_noted: {'true': 454}
+    engine own-import total_ms per block median/p90/max 43/64/94 (n=455)
+    layer RSS 33.9 -> 41.4 G (max 41.4), in-memory blocks max 10
+    execution layer cores busy 34.5    validators cores busy 1.2
+  round total (3 windows, canonical): 283.2M tx
+  layer peak RSS 41.4 G; in-memory blocks max 11
+  fields at seal: mode "early", verified 0, unchecked 0, mismatches 0 (last build line, cumulative)
+  own_executed_again (built here and also directly imported): 0 of 1465 built blocks
+== loop346WARMb
+  layer-0 leader window-1 builds 478: txs mean 200000, share >= 95% of the tier 100% (max 200000); sealed_at_ms 47.0/67.0; par_ms 48.0/77.0; par_exec_ms 21.0/27.0; roots_ms 28.0/41.0; parent_fields_ms 3.0/19.0; sealed_ms 4.0/20.0
+  proposal cycle window 1 (n=494): mean 62.8 median 61.4 p90 67.6 ms; blocks in the 30 s: 494
+  binding wait (tick / quorum / seal, share and mean cycle): tick 97.5% (62.4); quorum 0.2% (108.5); seal 2.3% (73.8)
+  vote delay after the proposal, slowest key per block: median 6.9 p90 44.9 ms (slowest minus the median key: median 0.2); last key: {1: 76, 2: 69, 3: 100, 4: 68, 5: 87, 6: 78} of 478 blocks
+  CPU in window 1 (cores busy): execution layers 34.9 over 1 process(es); validators 1.2 over 7 process(es)
+  execution layer peak RSS 41.4 G; in-memory blocks max 11 (node0 and others, all layers)
+  blocks built here 1465; none also directly imported
+  import-once counters at the last direct import: ; start-up lines with import_once=true: 1; queue-lock lines 0
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:2480750 t+20:2475250 t+40:2491500 t+60:2460000 t+80:2437500
+  flood: median per 5 s 3187472/s, final -
+  timeout / given-up lines: 1; 23:32:23 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+loop346WARMb page_faults_per_s_median: node0=177957 
+leg loop346A1: /data free 588G (needs 120 G)
+load 10.14 at 19:35:40, waiting
+leg loop346A1 start 19:36:10 load 6.14
+round loop346A1 exit 0 at 19:39:07
+loop346A1 save stages (node0, seconds summed over the leg / count): batch_size=1934.0/627  batch_size=1934.0/627  reth_consensus_engine_beacon_persistence_duration=57.9/627  duration_seconds=52.9/627  total=48.4/627  scope=43.8/627  sf=43.7/627  sf_transactions=43.4/627  qmdb_persisted=20.5/627  sf_account_changesets=20.2/627
+el binary: /data/n42-build/target-n42-rs/native/release/n42 env: N42_IMPORT_ONCE=1 N42_SETTLEMENT_TAGS=legacy N42_BUILD_THROTTLE_SOFT=48 F7_EL_MAP=0,0,0,0,0,0,0 N42_FIELDS_AT_SEAL=1 N42_FREEZE_AFTER_SEAL=1 N42_FRAME_BLOCKS=1 N42_TX_INGEST_RECOVER_PARALLEL=24 N42_FREEZE_POOL=own N42_PARALLEL_BUILD_THREADS=32 N42_PLAN_AHEAD=1 N42_HASHED_TABLES=off F7_FLOOD_RATE=6000000 N42_COMPACT_BODY=1 N42_BUILD_BATCHES=128 MALLOC_CONF=thp:always,oversize_threshold:0,dirty_decay_ms:2000,background_thread:true N42_SEAL_ON_COUNTERS=1 N42_ACCOUNT_HISTORY=off N42_TAKE_COMPACT=1 N42_SF_EARLY_WRITEBACK=1 N42_ROAD_RUNTIME=1 N42_TX_INGEST_HIGH_WATER=2500000 F7_BENCH_POOL_SLOTS=3000000 N42_PLAN_AHEAD_BODY=1 N42_SEAL_AT_EXEC=1 N42_TX_QUEUE_DRAIN_CHUNK=8192 N42_ANSWER_LAYOUT_ONLY=1 N42_PULL_BY_FRAMES=1 N42_SF_PARALLEL_ENCODE=1 N42_BUILD_THROTTLE_HARD=80 N42_LIVE_INDEX_DEFER=1 RAYON_NUM_THREADS=16 N42_ROOT_OPS_AHEAD=1 TOKIO_WORKER_THREADS=16 N42_QMDB_READS=on N42_LEADER_LAYERS=3 N42_PERSIST_QMDB_IN_SCOPE=1 F7_BLOCK_INTERVAL_MS=60 F7_MEASURE_FROM_LOG=1
+validator env: N42_IMPORT_ONCE=1 N42_SETTLEMENT_TAGS=legacy N42_BUILD_THROTTLE_SOFT=48 F7_EL_MAP=0,0,0,0,0,0,0 N42_FIELDS_AT_SEAL=1 N42_FREEZE_AFTER_SEAL=1 N42_FRAME_BLOCKS=1 N42_TX_INGEST_RECOVER_PARALLEL=24 N42_FREEZE_POOL=own N42_PARALLEL_BUILD_THREADS=32 N42_PLAN_AHEAD=1 N42_HASHED_TABLES=off F7_FLOOD_RATE=6000000 N42_COMPACT_BODY=1 N42_BUILD_BATCHES=128 N42_SEAL_ON_COUNTERS=1 N42_ACCOUNT_HISTORY=off N42_TAKE_COMPACT=1 N42_SF_EARLY_WRITEBACK=1 N42_ROAD_RUNTIME=1 N42_TX_INGEST_HIGH_WATER=2500000 F7_BENCH_POOL_SLOTS=3000000 N42_PLAN_AHEAD_BODY=1 N42_SEAL_AT_EXEC=1 N42_TX_QUEUE_DRAIN_CHUNK=8192 N42_ANSWER_LAYOUT_ONLY=1 N42_PULL_BY_FRAMES=1 N42_SF_PARALLEL_ENCODE=1 N42_BUILD_THROTTLE_HARD=80 N42_LIVE_INDEX_DEFER=1 RAYON_NUM_THREADS=16 N42_ROOT_OPS_AHEAD=1 TOKIO_WORKER_THREADS=16 N42_QMDB_READS=on N42_LEADER_LAYERS=3 N42_PERSIST_QMDB_IN_SCOPE=1 F7_MEASURE_FROM_LOG=1
+loop346A1 once: start-up lines import_once=true 1; last direct-import counters 
+loop346A1 imports: layers=1 direct_imports=0 canonical_blocks=2674 import_once_lines=1 (per layer: direct imports should equal canonical blocks for one execution per block)
+grep: /data/blockchain/rust-fleet7-bench/node1/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node3/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node1/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node3/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node1/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node3/el.log: No such file or directory
+loop346A1 no_variant=0 own_not_committed=0 tc=1 invalid_blocks=0 incomplete=0 gas_mismatch=0 direct_imports_failed=0 stuck_at_hashed_state=0 engine_idles_over_5s=1 proposals_given_up=0 tables_off_nodes=1 unanswered_reads=0 seal_first_total=1435 seal_first_direct=1435 direct_guard_errors=0 commit_ms_median=0 fold_ms_median=9 sealed_at_ms_median=53 state_ready_ms_median=95 build_total_ms_median=173 recover_us_median=0 par_exec_ms_median=22 par_exec_ms_median=22 giveback_filtered=0 giveback_offered_max=200000 seal_first=1435 reader_lag_max=10 reader_lag_warns=0 view_invalidated=0 el_sum_peak_g=40.4 el_max_peak_g=40.4 val_sum_peak_g=1.9 flood_peak_g=0.6 two_roads_blocks=0 two_roads_overlap_ms_median=- exec_on_output_declined=0 r1_collect_ms_median=5 proposal_at_ms_median=49 view_total_ms_median=61 import_exec_ms_median=- import_total_ms_median=- import_senders_ms_median=- import_convert_ms_median=- import_groups_median=- imports_over_600ms=0 min_avail_g=74.8 road_foreign_body_recv_ms=- road_foreign_body_decode_ms=- road_foreign_body_senders_ms=- road_foreign_body_parent_wait_ms=- road_foreign_body_check_ms=- road_foreign_body_total_ms=- road_new_payload_recv_ms=- road_new_payload_decode_ms=- road_new_payload_senders_ms=- road_new_payload_parent_wait_ms=- road_new_payload_check_ms=- road_new_payload_total_ms=- road_foreign_body_blocks=0 road_new_payload_blocks=0 fcu_answered=1254 fcu_in_flight_ms_median=0 fcu_queued_ms_median=0 fcu_queued_ms_max=90 fcu_refused=0 fcu_slow=2533 bodies_held=0 road_reuse_ms=- road_prepare_ms=- road_dispatch_ms=- road_convert_ms=- road_remember_ms=- road_header_ms=- road_fields_ms=- road_other_ms=- import_engine_ms_median=- gate_forced=0 gate_warns=0 flood_timeouts=0 canonical_min=2707 canonical_max=2707 chained_builds=1851 chain_lead_ms_median=54 chain_wait_ms_median=5 chain_started=1855 chain_discarded=2 chain_discard_reasons=_1_reason="no_,_1_reason="the_execution_layer_produced_nothing,_1_reason="the_request_names_another_parent chain_alias_warns=0 el_chained=1869 bodies_held_warns=0 el_build_refused=2 el_build_refused_reasons=_2_no_QMDB_tree_for_parent_block_0x queued_p5=2317000 queued_p50=2464000 road_compact_blocks=0 road_compact_recv_ms=- road_compact_assemble_ms=- road_compact_root_ms=- road_compact_miss_wait_ms=- road_compact_senders_ms=- road_compact_check_ms=- road_compact_other_ms=- road_compact_total_ms=- road_compact_misses_total= compact_refused_el=0 compact_fallbacks=0 compact_bytes_median=- pool_order9=15030 par_pull_ms_median=0 build_total_ms_median2=55 road_compact_filled_blocks=0 road_compact_filled_median=- road_compact_fill_ms_median=- need_txns=0 fill_failed=0 ingest_rate_gate_open_median=- ingest_gate_open_intervals=0 ingest_slots_busy_median=- flood_rate= fill_asked_proposer=0 fill_asked_other=0 loop_lines=1766 loop_unnamed_ms_median=48 loop_body_served_ms_median=- loop_txns_served_ms_median=- import_exec_ms_median2=- pip_partition_ms=- pip_env_ms=- pip_batch_ms=- pip_groups_ms=- pip_gas_ms=- pip_merge_ms=- pip_receipts_ms=- pip_drop_ms=- pip_other_ms=- pip_total_ms=- senders_indexed_median=- road_senders_ms_median=- road_total_ms_median=- pew_ms_median=- pew_ms_p90= gate_ms_median=- gate_ms_p90= root_ms_p50=- root_ms_p90= two_roads=0 not_on_output=0 not_on_output_why= ckpt_ms_first_q=2 ckpt_ms_last_q=49 ckpt_bytes_last=34120100 parent_still_importing=2 root_wait_ms_p50=- root_wait_ms_p90= tenures_low_seal=23 seal_first_share=0.99 empty_over_deep=0 near_empty_warns=0 no_seal_why= par_skipped_median=- usable_p5=2316500 ckpt_replay_ms_last_q=15 candidates_zero=0 dropped_ingest=0 let_go_warns=0 let_go_reasons= parked_p50=0 parked_max=0 held_warns=0 park_capped_total=0 superseded_builds=0 empty_not_superseded=0 mass_park_warns=0 heads_lines=0 holes_lines=0 stale_parent_refusals=0 par_groups_p5=0 cancelled_decided=1 heads_nonce0=0 stale_unconfirmed= handovers=2 el_panics=0 decided_cancelled=1 min_window_blocks=455 road_desc_blocks=0 road_desc_total_ms=- road_desc_copy_ms=- desc_misses=0 fill_failed2=0 sf_par_collect_ms=0 sf_par_commit_ms=0 sf_par_fold_ms=9 sf_par_graft_ms=0 sf_par_prefault_ms=0 sf_par_exec_ms=22 sf_sealed_at_ms=53 sf_roots_ms=31 sf_state_ready_ms=95 sf_total_ms=173 ba_find_ms=0 ba_queue_ms=0 ba_total_ms=55 ba_on_output=1434 queue_fold_us=0 queue_lock_us=53 sf_par_exec_ms=22 sf_par_fold_ms=9 pip_groups_ms=- import_exec_ms_median2=- reads_d0=0 reads_hist=0 f_reads_d0=- f_reads_hist=- f_overlay_depth=- L_read_set_ms=0 read_set_accounts=0 read_set_unresolved=0 read_set_hits=0 read_set_misses=0 start_best_ms=- par_prep_ms=- gap_before_exec_ms=- gap_after_exec_ms=- gap_before_seal_ms=- index_ms=- road_copy_aside_ms=- road_copy_wait_ms=- road_total_ms=- queue_first_miss=queue_first_miss=18446744073709551615:1445,queue_first_miss=0:1230 root_append_behind=0 populate_lag_mb=0 swap_used_g=0 root_faults=- root_faults_p90= root_faults_entries=0 root_faults_offsets=0 root_faults_index=0 root_faults_bits=0 root_faults_twigs=0 root_faults_undo=0 root_faults_tmp=0 root_append_faults=0 root_twig_pool_misses=0 batch_max_ms=9 batch_min_ms=2 batch_median_ms=4 batch_cpu_max_ms=8 batch_txs_max=2000 batch_txs_min=1500 batch_start_skew_ms=17 batch_wait_ms=0 loop_fetch_ns=0 loop_check_ns=0 loop_transfer_ns=0 loop_receipt_ns=0 loop_gas_ns=0 loop_sink_ns=0 loop_other_ns=0 batch_setup_ns=0 batch_close_ns=0 imp_exec_part_ms=- imp_exec_batches_ms=- imp_exec_graft_ms=- imp_exec_batches=- imp_exec_threads=- imp_exec_batch_max_ms=- imp_exec_batch_median_ms=- imp_parent_output_wait_ms=- road_parent_output_wait_ms=- next_start_gap_ms=1 next_entry_gap_ms=0 commit_body_ahead_used=- imp_exec_keys_ms=- imp_keys_ahead=- imp_exec_sink_ms=- imp_exec_pre_ms=- imp_exec_post_ms=- imp_exec_receipts_ms=- imp_exec_drop_ms=- root_gap_ms=- queue_whole=queue_whole=true:1445,queue_whole=false:1230 tick_tick_late_us=950 tick_preamble_us=340 tick_take_sealed_us=1 tick_sign_us=0 tick_cache_us=0 tick_presealed=- tick_describe_us=10 tick_publish_us=599 tick_tick_to_send_us=2011 road_check_ms=- road_check_include_us=- road_check_scan_us=- road_check_fold_us=- road_check_senders_us=- road_check_frames_summarized=- road_check_frames_scanned=- imp_exec_start_gap_us=- imp_gap_road_us=- imp_gap_header_us=- imp_gap_senders_us=- imp_gap_parent_us=- imp_gap_setup_us=- imp_gap_keys_wait_us=- sealed_at_p90= sealed_over_130=0 roots_ms=- cycle_p90=61/64/63 batch_max_ms=- batch_median_ms=- imp_batch_max=- forest_lock_warns=1392 root_seal_ms=1 root_seals=39 root_majflt=3 roots_p90= gp_layer=1444 ggp_missing=361 state_wait_split=0/0/0/0:442,8/0/0/0:77,7/0/0/0:55 qmdb_releases=0 state_wait_on= imp_road_end_ms=- imp_exec_start_ms=- imp_exec_end_ms=- imp_root_end_ms=- imp_fields_ready_ms=- imp_parent_fields_wait_ms=- imp_exec_ms=- imp_root_ms=- imp_checks_ms=- imp_engine_ms=- imp_total_ms=- road_parent_fields_wait_ms=- exec_read_ms=0 L_exec_evm_ms=0 L_exec_write_ms=0 L_exec_other_ms=0 L_reads_cache=0 L_reads_provider=0 L_reads_view=0 L_graft_base_ms=0 L_graft_reserve_ms=0 L_graft_insert_ms=0 L_graft_reverts_ms=0 L_graft_other_ms=0 L_par_exec_ms=22 L_par_graft_ms=0 F_exec_read_ms=- F_exec_evm_ms=- F_exec_write_ms=- F_exec_other_ms=- F_reads_cache=- F_reads_provider=- F_reads_view=- F_groups_ms=- L_tx_root_wait_ms=0 L_par_exec_ms=22 L_par_graft_ms=0 L_par_fold_ms=9 L_sealed_ms=4 L_state_ready_ms=95 L_roots_ms=31 L_finish_ms=105 L_total_ms=173 L_setup_ms=0 L_par_pull_ms=0 L_give_back_ms=0 L_state_wait_ms=8 L_state_after_pull=1435 L_seal_at_exec=1435 L_tx_root_ahead=0 flood_w1=3161621 txs_p10=200000 acq_us=466 slots_busy=13 ingest_rate=3123312 L_scope_join_ms=0 L_par_release_ms=0 L_commit_body_ms=0 L_par_commit_ms=0 L_give_back_ms=0 L_sealed_ms=4 L_par_exec_ms=22 L_state_wait_ms=8 L_par_pull_ms=0 L_par_prep_ms=0 L_par_start_ms=3 L_pre_exec_ms=0 L_par_run_ms=32 L_sealed_at_ms=53 F_partition_ms=- F_env_ms=- F_groups_ms=- F_merge_ms=- F_reverts_wait_ms=- F_ahead_wait_ms=- F_total_ms=- I_engine_ms=- I_root_ms=- I_total_ms=- H_engine_remember_ms=- H_engine_listing_ms=- H_engine_new_payload_ms=- busy_us=1 L_par_start_ms=3 L_start_handoff_ms=0 L_start_best_ms=3 L_start_puller_ms=0 L_par_pull_ms=0 L_par_prep_ms=0 L_state_wait_ms=8 L_par_exec_ms=22 L_par_commit_ms=0 L_sealed_ms=4 L_sealed_at_ms=53 L_par_graft_ms=0 L_graft_insert_ms=0 L_graft_reverts_ms=0 L_graft_split_us=0 L_graft_build_us=0 L_graft_merge_us=0 L_state_ready_ms=95 Q_queue_ms=0 R_dispatch_wait_ms=- R_total_ms=- R_road_runtime=1 gate_holds=0 peer_fetch=0 pool_limit=limit=4 gate_opened=gate_opened_for_block=0 I_root_ms=- flood_rate_hdr=rate=6000000/s fills=0 fill_waited=- slots_busy=13 acq_us=466 busy_us=1 converged=0 fallbacks=0 busy_us=1 recover_us=0 tf_on_output=2 tf_fallback=0 still_importing=2 busy_us=1 slots_busy=13 batches=altsig_txs=0 altsig_batches=0 tf_on_output=2 tf_fallback=0 gate_holds=0 sign_s=sign 0s replay_note=replay       : 64 files from /data/n42-pregen/g900000-400m, 400000000 transactio sign_s=sign 0s shard=shard_verified=0 shard_claimed=0 road_verified=- slots_busy=13 gate_us=7255 reply_us=7827 queued=2464000 assemble_ms=- road_take_ms=- road_body_ms=- road_encode_ms=- shards=16 shard_insert_ms=0 shard_wait_ms=0 shard_fold_ms=13 shard_append_ms=17 shard_merge_ms=59 state_ready_ms=95 roots_ms=31 exec_read_ms=0 exec_evm_ms=0 exec_write_ms=0 exec_other_ms=0 reads_cache=0 reads_provider=0 reads_view=0 par_run_ms=32 fold_task_cpu_max_us=13243 fold_task_minflt_max=0 fold_task_minflt_sum=0 fold_task_migrated=0 fold_task_nivcsw_max=0 fold_index=1 fold_index_build_ms=13 fold_index_conflicts=8175 fold_queue_us=52 fold_skew_us=30 fold_task_max_us=13244 fold_tail_us=17 start_best_ms=3 start_select_ms=0 start_walk_ms=0 start_walk_check_ms=0 start_best_other_ms=0 start_frames_by_ref=0 start_frames_slow=0 start_pull_ms=0 start_other_ms=0 start_handoff_ms=0 par_start_ms=3 par_prep_ms=0 par_commit_ms=0 commit_body_ms=0 par_fold_ms=9 sealed_ms=4 copy_ms=- prune_ms=0 frames=- frames_missing=- frame_root_ms=- root_ms=- frames_admitted=frames_admitted=573494 frames_unaligned=0 frame_root_indexed=- seal_layout_ms=0 seal_root_ms=0 attested= busy_us=1 slots_busy=13 reply_us=7827 prune_ms=0 body_refused=0 body_failed_late=0
+loop346A1 win1 tps=3,165,783 txs=94,973,500 blocks= 475 cycle=0.063s occupancy= 99.8% full(>=95%)=473/475 basefee=n/a (from the layer's log)
+loop346A1 win2 tps=3,046,667 txs=91,400,000 blocks= 457 cycle=0.066s occupancy=100.0% full(>=95%)=457/457 basefee=n/a (from the layer's log)
+loop346A1 win3 tps=3,093,333 txs=92,800,000 blocks= 464 cycle=0.065s occupancy=100.0% full(>=95%)=464/464 basefee=n/a (from the layer's log)
+loop346A1 win1 tps=3,033,333 txs=91,000,000 blocks= 455 cycle=0.066s occupancy=100.0% full(>=95%)=455/455 basefee=n/a (from the layer's log)
+loop346A1 win2 tps=3,120,000 txs=93,600,000 blocks= 468 cycle=0.064s occupancy=100.0% full(>=95%)=468/468 basefee=n/a (from the layer's log)
+loop346A1 win3 tps=3,086,667 txs=92,600,000 blocks= 463 cycle=0.065s occupancy=100.0% full(>=95%)=463/463 basefee=n/a (from the layer's log)
+loop346A1 tps=3,165,783
+tps=3,033,333 round_txs=556373500 cycles_w1=
+loop346A1 imp_fields_p90= b_p75=21
+loop346A1 overlay: filter_skips=0 probes=0 ratio=- (ratio = skips/(skips+probes))
+loop346A1 overlay_manager:       1 state_trie_overlay=false  state-ovly_cpu=0
+loop346A1 verify: written to /data/blockchain/rust-fleet7-bench/bench-loop346A1/verify.json
+== loop346A1  (E=1: seven validator keys on one execution layer)
+  window 1: canonical 456 blocks, 91.2M tx = 3,040,000/s (100.0% of window 1), full 455/456 (100%); cycle mean/median/p90 65.6/61.5/80.0 ms
+    leader builds 457: sealed_at median/p90/p99 52/80/101; phases median/p90 ms: gap_before_exec 9/57, state_wait 8/57, par 53/94, par_exec 21/28, roots 28/41, parent_fields 0/19, sealed 1/20
+    state_wait_on {'output': 214, 'grandparent': 115, 'none': 127, 'open': 1}; builds with state_wait > 20 ms: 131 ([('grandparent', 108), ('output', 23)]); gp_layer {1.0: 457}, ggp_missing {0.0: 336, 1.0: 121}
+    queue at the builds min/median 1,116,000/2,516,500
+    new field batch_cpu_sum_us: median/p90/max 592820.0/766082.0/1847272, nonzero 457
+    new field batch_dispatch_us: median/p90/max 216.0/314.0/609, nonzero 457
+    new field batch_first_start_us: median/p90/max 74.0/115.0/305, nonzero 457
+    new field batch_ivcsw: median/p90/max 1.0/7.0/32, nonzero 298
+    new field batch_last_end_us: median/p90/max 21688.0/28845.0/65512, nonzero 457
+    new field batch_last_start_us: median/p90/max 16635.0/21790.0/49788, nonzero 457
+    new field batch_live_deferred: median/p90/max 71.0/78.0/90, nonzero 457
+    new field batch_live_lock_hold_us: median/p90/max 10172.0/12065.0/15587, nonzero 457
+    new field batch_live_lock_wait_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_live_lock_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_majflt: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_minflt: median/p90/max 767.0/9127.0/28141, nonzero 457
+    new field batch_open_max_us: median/p90/max 431.0/534.0/856, nonzero 457
+    new field batch_open_sum_us: median/p90/max 10416.0/12979.0/16808, nonzero 457
+    new field batch_threads: median/p90/max 32.0/32.0/32, nonzero 457
+    new field batch_vcsw: median/p90/max 179.0/527.0/1140, nonzero 457
+    new field batch_view_index_wait_us: median/p90/max 0.0/23132.0/67079, nonzero 110
+    new field batch_view_index_waits: median/p90/max 0.0/303.0/842, nonzero 110
+    new field batch_view_slot_wait_us: median/p90/max 0.0/2216.0/6978, nonzero 115
+    new field batch_view_slot_waits: median/p90/max 0.0/65.0/130, nonzero 116
+    new field batch_wall_sum_us: median/p90/max 600053.0/784586.0/1848967, nonzero 457
+    new field batches: median/p90/max 128.0/128.0/128, nonzero 457
+    new field build_batches: median/p90/max 128.0/128.0/128, nonzero 457
+    new field carried_depth: median/p90/max 1.0/1.0/1, nonzero 457
+    new field exec_end_to_seal_us: median/p90/max 86.0/139.0/526, nonzero 457
+    new field exec_partition_us: median/p90/max 6.0/8.0/1144, nonzero 457
+    new field exec_prepared_groups: {'true': 454, 'false': 3}
+    new field exec_prepared_slots: {'true': 454, 'false': 3}
+    new field exec_slots_us: median/p90/max 0.0/0.0/1632, nonzero 4
+    new field freeze_join_wait_us: median/p90/max 10345.0/17222.0/37070, nonzero 457
+    new field freeze_late: {'true': 457}
+    new field freeze_pool_own: {'true': 457}
+    new field live_index_defer: {'true': 457}
+    new field merge_accounts: median/p90/max 191644.0/195209.0/197846, nonzero 457
+    new field merge_append_us: median/p90/max 3709.0/7160.0/10590, nonzero 457
+    new field merge_reverts: median/p90/max 191644.0/195209.0/197846, nonzero 457
+    new field merge_reverts_us: median/p90/max 14986.0/19514.0/30334, nonzero 457
+    new field merge_state_us: median/p90/max 38007.0/45838.0/61902, nonzero 457
+    new field merge_tail_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field merge_threads: median/p90/max 1.0/1.0/1, nonzero 457
+    new field one_wave: {'false': 457}
+    new field open_engine_us: median/p90/max 0.0/41752.0/79202, nonzero 121
+    new field open_fallback: {'false': 336, 'true': 121}
+    new field open_keep_us: median/p90/max 4.0/7.0/43, nonzero 457
+    new field open_layers: median/p90/max 3.0/3.0/3, nonzero 457
+    new field open_provider_us: median/p90/max 91.0/149.0/517, nonzero 457
+    new field plan_age_us: median/p90/max 51232.0/95683.0/168267, nonzero 457
+    new field plan_ahead: median/p90/max 1.0/1.0/2, nonzero 457
+    new field plan_body: median/p90/max 1.0/1.0/2, nonzero 456
+    new field plan_body_us: median/p90/max 14471.0/19041.0/24581, nonzero 454
+    new field plan_discard: {'': 457}
+    new field plan_prep_us: median/p90/max 6899.0/14410.0/26548, nonzero 457
+    new field plan_topup_txs: median/p90/max 0.0/0.0/106500, nonzero 1
+    new field prep_from_plan: {'true': 454, 'false': 3}
+    new field prev_seal_to_answer_us: median/p90/max 1955.0/3264.0/6347, nonzero 457
+    new field prev_seal_to_entry_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prev_seal_to_header_us: median/p90/max 207.0/319.0/565, nonzero 457
+    new field prev_seal_to_import_us: median/p90/max 116082.0/148850.0/213347, nonzero 396
+    new field prev_seal_to_request_us: median/p90/max 954.0/65212.0/79601, nonzero 457
+    new field prev_seal_to_start_us: median/p90/max 1219.0/65496.0/79846, nonzero 457
+    new field pull_bulk_txs: median/p90/max 200000.0/200000.0/200000, nonzero 457
+    new field pull_bulk_us: median/p90/max 5.0/8.0/1221, nonzero 457
+    new field rename_fallbacks: median/p90/max 0.0/0.0/0, nonzero 0
+    new field rename_record_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_apply_gap_us: median/p90/max 10.0/12.0/20, nonzero 457
+    new field root_apply_total_us: median/p90/max 20065.0/27480.0/42745, nonzero 457
+    new field root_compute_us: median/p90/max 22066.0/31836.0/44707, nonzero 457
+    new field root_delta_us: median/p90/max 1137.0/2789.0/14097, nonzero 457
+    new field root_index_us: median/p90/max 2600.0/4163.0/17269, nonzero 457
+    new field root_leaves_us: median/p90/max 6726.0/10748.0/22139, nonzero 457
+    new field root_note_us: median/p90/max 147.0/203.0/1186, nonzero 457
+    new field root_ops_ahead: {'true': 457}
+    new field root_ops_ahead_wait_us: median/p90/max 2637.0/9095.0/22734, nonzero 457
+    new field root_ops_concat_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_ops_encode_us: median/p90/max 5527.0/9807.0/19722, nonzero 457
+    new field root_ops_finish_us: median/p90/max 2276.0/2908.0/9470, nonzero 457
+    new field root_ops_sort_us: median/p90/max 3023.0/6397.0/12239, nonzero 457
+    new field root_ops_us: median/p90/max 5004.0/11646.0/24554, nonzero 457
+    new field root_rehash_us: median/p90/max 1349.0/1858.0/14981, nonzero 457
+    new field root_retire_us: median/p90/max 1513.0/2320.0/5549, nonzero 457
+    new field root_sort_us: median/p90/max 160.0/322.0/2630, nonzero 457
+    new field root_undo_us: median/p90/max 338.0/659.0/2317, nonzero 457
+    new field root_writes_us: median/p90/max 6635.0/9138.0/20200, nonzero 457
+    new field seal_hashes_ahead: {'true': 457}
+    new field seal_on_counters: {'true': 457}
+    new field seal_to_complete_us: median/p90/max 106336.0/125318.0/141665, nonzero 457
+    new field seal_to_frozen_us: median/p90/max 10297.0/17181.0/37024, nonzero 364
+    new field seal_to_merge_end_us: median/p90/max 106248.0/125199.0/141555, nonzero 457
+    new field seal_to_merge_start_us: median/p90/max 48135.0/61585.0/76632, nonzero 457
+    new field seal_to_ops_ahead_us: median/p90/max 21544.0/32187.0/48259, nonzero 457
+    new field seal_to_state_ready_us: median/p90/max 106254.0/125205.0/141564, nonzero 457
+    new field sealed_unix_us: median/p90/max 1791416267047436.0/1791416278751971.0/1791416281647385, nonzero 457
+    new field start_walk_check_us: median/p90/max 0.0/0.0/121, nonzero 1
+    new field start_walk_ids_us: median/p90/max 0.0/0.0/100, nonzero 1
+    new field start_walk_settle_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_us: median/p90/max 0.0/0.0/2601, nonzero 1
+    new field state_wait_us: median/p90/max 8857.0/57814.0/98656, nonzero 457
+    new field view_journal_reads: median/p90/max 0.0/77824.0/151552, nonzero 216
+    new field view_journal_searches: median/p90/max 0.0/220388.0/413144, nonzero 216
+    new field view_journal_skips: median/p90/max 0.0/0.0/0, nonzero 0
+    new field whole_take_noted: {'true': 457}
+    binding wait (tick / quorum / seal share, mean cycle): tick 96% (64); quorum 3% (110); seal 2% (72); feed-bound (blocks under 95% of the tier): 1 of 456
+    slowest key vote delay median/p90 12.5/69.4 ms
+    engine own-import total_ms per block median/p90/max 40/62/88 (n=455)
+    layer RSS 4.8 -> 26.4 G (max 26.4), in-memory blocks max 10
+    execution layer cores busy 33.2    validators cores busy 1.2
+    flood delivered (median per 5 s over the leg) 3,140,207/s
+  window 2: canonical 468 blocks, 93.6M tx = 3,120,000/s (102.6% of window 1), full 468/468 (100%); cycle mean/median/p90 62.5/61.5/66.8 ms
+    leader builds 468: sealed_at median/p90/p99 52/71/106; phases median/p90 ms: gap_before_exec 6/42, state_wait 6/42, par 52/79, par_exec 22/29, roots 32/45, parent_fields 5/21, sealed 6/22
+    state_wait_on {'grandparent': 88, 'output': 225, 'none': 155}; builds with state_wait > 20 ms: 89 ([('grandparent', 76), ('output', 13)]); gp_layer {1.0: 468}, ggp_missing {1.0: 94, 0.0: 374}
+    queue at the builds min/median 2,265,500/2,514,750
+    new field batch_cpu_sum_us: median/p90/max 621496.5/779180.0/2059025, nonzero 468
+    new field batch_dispatch_us: median/p90/max 215.0/302.0/793, nonzero 468
+    new field batch_first_start_us: median/p90/max 77.0/128.0/617, nonzero 468
+    new field batch_ivcsw: median/p90/max 1.0/7.0/22, nonzero 269
+    new field batch_last_end_us: median/p90/max 22947.5/29741.0/71539, nonzero 468
+    new field batch_last_start_us: median/p90/max 17732.5/21823.0/55991, nonzero 468
+    new field batch_live_deferred: median/p90/max 71.0/80.0/198, nonzero 468
+    new field batch_live_lock_hold_us: median/p90/max 10705.5/12790.0/31716, nonzero 468
+    new field batch_live_lock_wait_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_live_lock_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_majflt: median/p90/max 0.0/0.0/1, nonzero 1
+    new field batch_minflt: median/p90/max 862.5/10436.0/37755, nonzero 468
+    new field batch_open_max_us: median/p90/max 440.0/543.0/3350, nonzero 468
+    new field batch_open_sum_us: median/p90/max 10944.5/13706.0/18804, nonzero 468
+    new field batch_threads: median/p90/max 32.0/32.0/32, nonzero 468
+    new field batch_vcsw: median/p90/max 187.0/486.0/861, nonzero 468
+    new field batch_view_index_wait_us: median/p90/max 0.0/19663.0/42660, nonzero 119
+    new field batch_view_index_waits: median/p90/max 0.0/275.0/565, nonzero 119
+    new field batch_view_slot_wait_us: median/p90/max 0.0/2090.0/7899, nonzero 125
+    new field batch_view_slot_waits: median/p90/max 0.0/53.0/107, nonzero 125
+    new field batch_wall_sum_us: median/p90/max 631075.5/793344.0/2061994, nonzero 468
+    new field batches: median/p90/max 128.0/128.0/128, nonzero 468
+    new field build_batches: median/p90/max 128.0/128.0/128, nonzero 468
+    new field carried_depth: median/p90/max 1.0/1.0/1, nonzero 468
+    new field exec_end_to_seal_us: median/p90/max 90.0/144.0/544, nonzero 468
+    new field exec_partition_us: median/p90/max 6.0/8.0/1124, nonzero 468
+    new field exec_prepared_groups: {'true': 466, 'false': 2}
+    new field exec_prepared_slots: {'true': 466, 'false': 2}
+    new field exec_slots_us: median/p90/max 0.0/0.0/1998, nonzero 3
+    new field freeze_join_wait_us: median/p90/max 8802.5/15573.0/30570, nonzero 468
+    new field freeze_late: {'true': 468}
+    new field freeze_pool_own: {'true': 468}
+    new field live_index_defer: {'true': 468}
+    new field merge_accounts: median/p90/max 191704.0/195197.0/198398, nonzero 468
+    new field merge_append_us: median/p90/max 3656.5/7568.0/16279, nonzero 468
+    new field merge_reverts: median/p90/max 191704.0/195197.0/198398, nonzero 468
+    new field merge_reverts_us: median/p90/max 15309.0/20393.0/29844, nonzero 468
+    new field merge_state_us: median/p90/max 40142.5/47939.0/62219, nonzero 468
+    new field merge_tail_us: median/p90/max 0.0/0.0/2, nonzero 4
+    new field merge_threads: median/p90/max 1.0/1.0/1, nonzero 468
+    new field one_wave: {'false': 468}
+    new field open_engine_us: median/p90/max 0.0/31926.0/102183, nonzero 94
+    new field open_fallback: {'false': 374, 'true': 94}
+    new field open_keep_us: median/p90/max 4.0/7.0/19, nonzero 468
+    new field open_layers: median/p90/max 3.0/3.0/3, nonzero 468
+    new field open_provider_us: median/p90/max 91.0/152.0/404, nonzero 468
+    new field plan_age_us: median/p90/max 48073.5/99114.0/143082, nonzero 467
+    new field plan_ahead: median/p90/max 1.0/1.0/1, nonzero 467
+    new field plan_body: median/p90/max 1.0/1.0/2, nonzero 467
+    new field plan_body_us: median/p90/max 15287.0/18876.0/22381, nonzero 466
+    new field plan_discard: {'': 467, 'not_on_its_parent': 1}
+    new field plan_prep_us: median/p90/max 7355.5/14829.0/28080, nonzero 467
+    new field plan_topup_txs: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prep_from_plan: {'true': 466, 'false': 2}
+    new field prev_seal_to_answer_us: median/p90/max 2063.5/3495.0/7745, nonzero 468
+    new field prev_seal_to_entry_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prev_seal_to_header_us: median/p90/max 211.5/331.0/1313, nonzero 468
+    new field prev_seal_to_import_us: median/p90/max 116922.5/149925.0/217534, nonzero 425
+    new field prev_seal_to_request_us: median/p90/max 959.0/64481.0/125855, nonzero 468
+    new field prev_seal_to_start_us: median/p90/max 1250.5/64765.0/126086, nonzero 468
+    new field pull_bulk_txs: median/p90/max 200000.0/200000.0/200000, nonzero 468
+    new field pull_bulk_us: median/p90/max 5.0/8.0/1007, nonzero 468
+    new field rename_fallbacks: median/p90/max 0.0/0.0/0, nonzero 0
+    new field rename_record_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_apply_gap_us: median/p90/max 11.0/13.0/28, nonzero 468
+    new field root_apply_total_us: median/p90/max 22057.5/31409.0/45544, nonzero 468
+    new field root_compute_us: median/p90/max 24142.5/34844.0/76190, nonzero 468
+    new field root_delta_us: median/p90/max 1164.5/2913.0/12712, nonzero 468
+    new field root_index_us: median/p90/max 2815.0/5242.0/14891, nonzero 468
+    new field root_leaves_us: median/p90/max 6872.0/10551.0/19788, nonzero 468
+    new field root_note_us: median/p90/max 146.0/230.0/1776, nonzero 468
+    new field root_ops_ahead: {'true': 468}
+    new field root_ops_ahead_wait_us: median/p90/max 3047.5/8346.0/17856, nonzero 468
+    new field root_ops_concat_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_ops_encode_us: median/p90/max 5572.5/9191.0/17974, nonzero 468
+    new field root_ops_finish_us: median/p90/max 2276.0/3229.0/8155, nonzero 468
+    new field root_ops_sort_us: median/p90/max 3260.0/6814.0/11318, nonzero 468
+    new field root_ops_us: median/p90/max 5408.0/11126.0/21479, nonzero 468
+    new field root_rehash_us: median/p90/max 1991.0/2872.0/16280, nonzero 468
+    new field root_retire_us: median/p90/max 1735.5/2830.0/6880, nonzero 468
+    new field root_sort_us: median/p90/max 187.0/380.0/3352, nonzero 468
+    new field root_undo_us: median/p90/max 354.5/644.0/2886, nonzero 468
+    new field root_writes_us: median/p90/max 7000.5/10777.0/27011, nonzero 468
+    new field seal_hashes_ahead: {'true': 468}
+    new field seal_on_counters: {'true': 468}
+    new field seal_to_complete_us: median/p90/max 110935.0/128119.0/158520, nonzero 468
+    new field seal_to_frozen_us: median/p90/max 8763.5/15537.0/30578, nonzero 332
+    new field seal_to_merge_end_us: median/p90/max 110853.5/128046.0/158350, nonzero 468
+    new field seal_to_merge_start_us: median/p90/max 50520.5/64814.0/100266, nonzero 468
+    new field seal_to_ops_ahead_us: median/p90/max 20439.0/28807.0/44617, nonzero 468
+    new field seal_to_state_ready_us: median/p90/max 110860.0/128054.0/158367, nonzero 468
+    new field sealed_unix_us: median/p90/max 1791416296291960.0/1791416308344612.0/1791416311636947, nonzero 468
+    new field start_walk_check_us: median/p90/max 0.0/0.0/1352, nonzero 1
+    new field start_walk_ids_us: median/p90/max 0.0/0.0/574, nonzero 1
+    new field start_walk_settle_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_us: median/p90/max 0.0/0.0/5866, nonzero 1
+    new field state_wait_us: median/p90/max 6683.5/42311.0/121390, nonzero 468
+    new field view_journal_reads: median/p90/max 4096.0/90112.0/163840, nonzero 237
+    new field view_journal_searches: median/p90/max 10863.0/249547.0/491675, nonzero 237
+    new field view_journal_skips: median/p90/max 0.0/0.0/0, nonzero 0
+    new field whole_take_noted: {'true': 468}
+    binding wait (tick / quorum / seal share, mean cycle): tick 99% (61); quorum 0%; seal 1% (141); feed-bound (blocks under 95% of the tier): 0 of 468
+    slowest key vote delay median/p90 5.9/29.0 ms
+    engine own-import total_ms per block median/p90/max 41/61/88 (n=468)
+    layer RSS 25.9 -> 33.8 G (max 33.8), in-memory blocks max 11
+    execution layer cores busy 34.7    validators cores busy 1.2
+  window 3: canonical 463 blocks, 92.6M tx = 3,086,667/s (101.5% of window 1), full 463/463 (100%); cycle -
+    leader builds 463: sealed_at median/p90/p99 54/77/97; phases median/p90 ms: gap_before_exec 8/51, state_wait 8/51, par 55/86, par_exec 22/28, roots 32/48, parent_fields 5/23, sealed 6/25
+    state_wait_on {'grandparent': 121, 'output': 199, 'none': 143}; builds with state_wait > 20 ms: 115 ([('grandparent', 102), ('output', 13)]); gp_layer {1.0: 463}, ggp_missing {1.0: 132, 0.0: 331}
+    queue at the builds min/median 2,283,000/2,512,500
+    new field batch_cpu_sum_us: median/p90/max 616337.0/753332.0/1944445, nonzero 463
+    new field batch_dispatch_us: median/p90/max 209.0/308.0/848, nonzero 463
+    new field batch_first_start_us: median/p90/max 69.0/104.0/228, nonzero 463
+    new field batch_ivcsw: median/p90/max 1.0/6.0/22, nonzero 286
+    new field batch_last_end_us: median/p90/max 22712.0/28652.0/69154, nonzero 463
+    new field batch_last_start_us: median/p90/max 17410.0/21523.0/50834, nonzero 463
+    new field batch_live_deferred: median/p90/max 73.0/81.0/190, nonzero 463
+    new field batch_live_lock_hold_us: median/p90/max 11030.0/13229.0/25325, nonzero 463
+    new field batch_live_lock_wait_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_live_lock_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_majflt: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_minflt: median/p90/max 879.0/10925.0/35321, nonzero 463
+    new field batch_open_max_us: median/p90/max 456.0/556.0/3229, nonzero 463
+    new field batch_open_sum_us: median/p90/max 11362.0/14121.0/19651, nonzero 463
+    new field batch_threads: median/p90/max 32.0/32.0/32, nonzero 463
+    new field batch_vcsw: median/p90/max 191.0/488.0/802, nonzero 463
+    new field batch_view_index_wait_us: median/p90/max 0.0/19109.0/45207, nonzero 116
+    new field batch_view_index_waits: median/p90/max 0.0/256.0/536, nonzero 116
+    new field batch_view_slot_wait_us: median/p90/max 0.0/1907.0/7166, nonzero 119
+    new field batch_view_slot_waits: median/p90/max 0.0/51.0/121, nonzero 119
+    new field batch_wall_sum_us: median/p90/max 626208.0/771315.0/1946422, nonzero 463
+    new field batches: median/p90/max 128.0/128.0/128, nonzero 463
+    new field build_batches: median/p90/max 128.0/128.0/128, nonzero 463
+    new field carried_depth: median/p90/max 1.0/1.0/1, nonzero 463
+    new field exec_end_to_seal_us: median/p90/max 85.0/138.0/492, nonzero 463
+    new field exec_partition_us: median/p90/max 6.0/8.0/1247, nonzero 463
+    new field exec_prepared_groups: {'true': 461, 'false': 2}
+    new field exec_prepared_slots: {'true': 461, 'false': 2}
+    new field exec_slots_us: median/p90/max 0.0/0.0/2884, nonzero 2
+    new field freeze_join_wait_us: median/p90/max 8568.0/15829.0/25203, nonzero 463
+    new field freeze_late: {'true': 463}
+    new field freeze_pool_own: {'true': 463}
+    new field live_index_defer: {'true': 463}
+    new field merge_accounts: median/p90/max 192662.0/195900.0/199078, nonzero 463
+    new field merge_append_us: median/p90/max 3959.0/8300.0/23476, nonzero 463
+    new field merge_reverts: median/p90/max 192662.0/195900.0/199078, nonzero 463
+    new field merge_reverts_us: median/p90/max 16064.0/21702.0/33733, nonzero 463
+    new field merge_state_us: median/p90/max 40426.0/48732.0/62447, nonzero 463
+    new field merge_tail_us: median/p90/max 0.0/0.0/1, nonzero 2
+    new field merge_threads: median/p90/max 1.0/1.0/1, nonzero 463
+    new field one_wave: {'false': 463}
+    new field open_engine_us: median/p90/max 0.0/40263.0/73528, nonzero 132
+    new field open_fallback: {'false': 331, 'true': 132}
+    new field open_keep_us: median/p90/max 4.0/7.0/65, nonzero 463
+    new field open_layers: median/p90/max 3.0/3.0/3, nonzero 463
+    new field open_provider_us: median/p90/max 91.0/160.0/1235, nonzero 463
+    new field plan_age_us: median/p90/max 51841.0/91603.0/138987, nonzero 463
+    new field plan_ahead: median/p90/max 1.0/1.0/1, nonzero 463
+    new field plan_body: median/p90/max 1.0/1.0/2, nonzero 463
+    new field plan_body_us: median/p90/max 18181.0/20675.0/23705, nonzero 461
+    new field plan_discard: {'': 463}
+    new field plan_prep_us: median/p90/max 7229.0/14801.0/34358, nonzero 463
+    new field plan_topup_txs: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prep_from_plan: {'true': 461, 'false': 2}
+    new field prev_seal_to_answer_us: median/p90/max 2004.0/3769.0/8002, nonzero 463
+    new field prev_seal_to_entry_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prev_seal_to_header_us: median/p90/max 177.0/305.0/748, nonzero 463
+    new field prev_seal_to_import_us: median/p90/max 122770.0/155983.0/200314, nonzero 412
+    new field prev_seal_to_request_us: median/p90/max 916.0/62253.0/88469, nonzero 463
+    new field prev_seal_to_start_us: median/p90/max 1192.0/62596.0/88706, nonzero 463
+    new field pull_bulk_txs: median/p90/max 200000.0/200000.0/200000, nonzero 463
+    new field pull_bulk_us: median/p90/max 5.0/8.0/973, nonzero 463
+    new field rename_fallbacks: median/p90/max 0.0/0.0/0, nonzero 0
+    new field rename_record_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_apply_gap_us: median/p90/max 11.0/13.0/22, nonzero 463
+    new field root_apply_total_us: median/p90/max 22294.0/32417.0/52298, nonzero 463
+    new field root_compute_us: median/p90/max 24241.0/35284.0/54246, nonzero 463
+    new field root_delta_us: median/p90/max 1155.0/2043.0/9759, nonzero 463
+    new field root_index_us: median/p90/max 2784.0/5288.0/17607, nonzero 463
+    new field root_leaves_us: median/p90/max 6930.0/11268.0/25628, nonzero 463
+    new field root_note_us: median/p90/max 141.0/202.0/1014, nonzero 463
+    new field root_ops_ahead: {'true': 463}
+    new field root_ops_ahead_wait_us: median/p90/max 2849.0/9533.0/28467, nonzero 463
+    new field root_ops_concat_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_ops_encode_us: median/p90/max 5446.0/9902.0/28357, nonzero 463
+    new field root_ops_finish_us: median/p90/max 2250.0/3412.0/9704, nonzero 463
+    new field root_ops_sort_us: median/p90/max 3139.0/7062.0/18717, nonzero 463
+    new field root_ops_us: median/p90/max 5186.0/12186.0/30958, nonzero 463
+    new field root_rehash_us: median/p90/max 2529.0/3358.0/13694, nonzero 463
+    new field root_retire_us: median/p90/max 1741.0/2707.0/7550, nonzero 463
+    new field root_sort_us: median/p90/max 193.0/409.0/3906, nonzero 463
+    new field root_undo_us: median/p90/max 349.0/649.0/3170, nonzero 463
+    new field root_writes_us: median/p90/max 6888.0/10234.0/36457, nonzero 463
+    new field seal_hashes_ahead: {'true': 463}
+    new field seal_on_counters: {'true': 463}
+    new field seal_to_complete_us: median/p90/max 114190.0/131824.0/159712, nonzero 463
+    new field seal_to_frozen_us: median/p90/max 8580.0/15777.0/25088, nonzero 321
+    new field seal_to_merge_end_us: median/p90/max 114099.0/131711.0/159596, nonzero 463
+    new field seal_to_merge_start_us: median/p90/max 50707.0/67617.0/86138, nonzero 463
+    new field seal_to_ops_ahead_us: median/p90/max 20321.0/29560.0/49953, nonzero 463
+    new field seal_to_state_ready_us: median/p90/max 114104.0/131725.0/159606, nonzero 463
+    new field sealed_unix_us: median/p90/max 1791416326496658.0/1791416338426522.0/1791416341621872, nonzero 463
+    new field start_walk_check_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_ids_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_settle_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field state_wait_us: median/p90/max 8031.0/51462.0/88322, nonzero 463
+    new field view_journal_reads: median/p90/max 8192.0/73728.0/135168, nonzero 242
+    new field view_journal_searches: median/p90/max 23743.0/204327.0/352995, nonzero 242
+    new field view_journal_skips: median/p90/max 0.0/0.0/0, nonzero 0
+    new field whole_take_noted: {'true': 463}
+    engine own-import total_ms per block median/p90/max 44/67/113 (n=463)
+    layer RSS 33.8 -> 40.3 G (max 40.6), in-memory blocks max 10
+    execution layer cores busy 34.9    validators cores busy 1.2
+  round total (3 windows, canonical): 277.4M tx
+  layer peak RSS 40.9 G; in-memory blocks max 11
+  fields at seal: mode "early", verified 0, unchecked 0, mismatches 0 (last build line, cumulative)
+  own_executed_again (built here and also directly imported): 0 of 1434 built blocks
+== loop346A1
+  layer-0 leader window-1 builds 458: txs mean 200000, share >= 95% of the tier 100% (max 200000); sealed_at_ms 52.0/80.0; par_ms 53.0/94.0; par_exec_ms 21.0/28.0; roots_ms 28.0/41.0; parent_fields_ms 0.0/19.0; sealed_ms 1.0/20.0
+  proposal cycle window 1 (n=472): mean 65.7 median 61.5 p90 80.5 ms; blocks in the 30 s: 472
+  binding wait (tick / quorum / seal, share and mean cycle): tick 95.8% (64.4); quorum 2.6% (110.4); seal 1.5% (72.4)
+  vote delay after the proposal, slowest key per block: median 12.6 p90 69.4 ms (slowest minus the median key: median 0.2); last key: {1: 61, 2: 59, 3: 69, 4: 67, 5: 131, 6: 69} of 456 blocks
+  CPU in window 1 (cores busy): execution layers 33.2 over 1 process(es); validators 1.2 over 7 process(es)
+  execution layer peak RSS 40.9 G; in-memory blocks max 11 (node0 and others, all layers)
+  blocks built here 1434; none also directly imported
+  import-once counters at the last direct import: ; start-up lines with import_once=true: 1; queue-lock lines 0
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:2480250 t+20:2482000 t+40:2475000 t+60:2494500 t+80:2448000
+  flood: median per 5 s 3140207/s, final -
+  timeout / given-up lines: 1; 23:37:03 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+loop346A1 page_faults_per_s_median: node0=180227 
+feedcheck loop346A1: ok (block 200,000 tx)
+== loop346A1: feed check (acq_us / gate_us / reply_us are per frame of 500; rate per 5 s `ingest` line)
+  window 1: ingest lines 6; acq_us 466 (max 1187); gate_us 7375; reply_us 7934; slots_busy 12%; delivered median 3,079,480/s max 3,275,164/s; queue at builds median 2,516,500 min 1,116,000; full 100% of 456 blocks
+  window 2: ingest lines 6; acq_us 467 (max 484); gate_us 7120; reply_us 7680; slots_busy 13%; delivered median 3,142,872/s max 3,220,798/s; queue at builds median 2,514,750 min 2,265,500; full 100% of 468 blocks
+  window 3: ingest lines 6; acq_us 464 (max 466); gate_us 7302; reply_us 7868; slots_busy 13%; delivered median 3,114,261/s max 3,155,400/s; queue at builds median 2,512,500 min 2,283,000; full 100% of 463 blocks
+  flood.log (+15..+100 s): rate per 5 s median 3,140,207/s max 3,268,326/s; reply latency median 61.0 ms max 67.5 ms
+== loop346A1: lanes lock, drain and pruner (new fields)
+  window 1: lock duty 53.0% (max 61.0); holds/5s 2,137; longest hold 25.29 ms median, 26.20 ms max by crates/n42/tx-queue/src/lib.rs:2046 (most frequent holders [('crates/n42/tx-queue/src/lib.rs:2046', 5), ('crates/n42/tx-queue/src/lib.rs:1766', 1)]); lock wait 2027.2 ms/5s, longest 42.72 ms; drains/5s 1,030 of 14945 tx, mean 1368 us, max 19.70 ms
+           prune (392 blocks): prune_ms 32/52; fold 0.5 ms, lock 0.0 ms, remove(hold) 9.0 ms, free 0.0 ms; frames_swept 400; coalesced on 392 of 392; prune_wait_ms 0/0; pruner busy 44% of a thread, lock held by it 2.0%
+  window 2: lock duty 59.0% (max 61.0); holds/5s 2,072; longest hold 27.92 ms median, 36.33 ms max by crates/n42/tx-queue/src/lib.rs:2576 (most frequent holders [('crates/n42/tx-queue/src/lib.rs:2046', 4), ('crates/n42/tx-queue/src/lib.rs:2576', 1)]); lock wait 2917.6 ms/5s, longest 33.38 ms; drains/5s 854 of 18425 tx, mean 1721 us, max 26.29 ms
+           prune (436 blocks): prune_ms 33/53; fold 0.5 ms, lock 0.0 ms, remove(hold) 10.5 ms, free 0.0 ms; frames_swept 400; coalesced on 436 of 436; prune_wait_ms 0/0; pruner busy 50% of a thread, lock held by it 1.7%
+  window 3: lock duty 59.0% (max 62.0); holds/5s 2,064; longest hold 25.30 ms median, 33.59 ms max by crates/n42/tx-queue/src/lib.rs:2692 (most frequent holders [('crates/n42/tx-queue/src/lib.rs:2046', 4), ('crates/n42/tx-queue/src/lib.rs:2692', 1)]); lock wait 3040.0 ms/5s, longest 33.61 ms; drains/5s 860 of 18091 tx, mean 1790 us, max 20.83 ms
+           prune (431 blocks): prune_ms 34/51; fold 0.5 ms, lock 0.0 ms, remove(hold) 9.7 ms, free 0.0 ms; frames_swept 400; coalesced on 431 of 431; prune_wait_ms 0/0; pruner busy 50% of a thread, lock held by it 2.0%
+== loop346A1: pruner (per block; busy = sum prune_ms / 30 s, lock = sum (remove_us + settle_us) / 30 s)
+  window 1: 392 prunes; prune_ms 32/52; remove_us 9.0/18.7 ms; forget_us 2.8/5.4 ms; settle_us 3.0 ms; pruner busy 44% of a worker; lanes lock held for removal 19%
+  window 2: 436 prunes; prune_ms 33/53; remove_us 10.5/19.9 ms; forget_us 2.7/5.0 ms; settle_us 2.9 ms; pruner busy 50% of a worker; lanes lock held for removal 23%
+  window 3: 431 prunes; prune_ms 34/51; remove_us 9.7/19.9 ms; forget_us 3.0/5.0 ms; settle_us 3.0 ms; pruner busy 50% of a worker; lanes lock held for removal 22%
+== loop346A1: seal start / pull, prepared plan, answer, chunked drain
+  window 1: 457 builds; start_best_ms 3/14; start_walk_us 0/0; start_pull_ms 0/0; par_pull_ms 0/0; par_start_ms 3/14; par_ms 53/94; sealed_at_ms 52/80; pull_bulk_us 5/8; pull_bulk_txs 200000/200000; plan_age_us 51232/95683; plan_prep_us 6899/14410; plan_topup_txs 0/0
+           plan_ahead {'2': 1, '1': 456}; plan_discard {'': 457}
+           answer: built-ahead bytes median/max 15,243/15,245, layout_only {'true': 455}; proposal sent bytes median/max 15,243/15,245, layout_only {'true': 455}
+           drain: chunks/5s 894, chunk max 8,192 tx, finished by others/5s 58; plan_discards (last ingest line) -
+  window 2: 468 builds; start_best_ms 4/15; start_walk_us 0/0; start_pull_ms 0/0; par_pull_ms 0/0; par_start_ms 4/16; par_ms 52/79; sealed_at_ms 52/71; pull_bulk_us 5/8; pull_bulk_txs 200000/200000; plan_age_us 48074/99114; plan_prep_us 7356/14829; plan_topup_txs 0/0
+           plan_ahead {'1': 467, '0': 1}; plan_discard {'': 467, 'not_on_its_parent': 1}
+           answer: built-ahead bytes median/max 15,245/15,245, layout_only {'true': 469}; proposal sent bytes median/max 15,245/15,245, layout_only {'true': 467}
+           drain: chunks/5s 704, chunk max 8,192 tx, finished by others/5s 66; plan_discards (last ingest line) -
+  window 3: 463 builds; start_best_ms 3/17; start_walk_us 0/0; start_pull_ms 0/0; par_pull_ms 0/0; par_start_ms 4/17; par_ms 55/86; sealed_at_ms 54/77; pull_bulk_us 5/8; pull_bulk_txs 200000/200000; plan_age_us 51841/91603; plan_prep_us 7229/14801; plan_topup_txs 0/0
+           plan_ahead {'1': 463}; plan_discard {'': 463}
+           answer: built-ahead bytes median/max 15,245/15,245, layout_only {'true': 464}; proposal sent bytes median/max 15,245/15,245, layout_only {'true': 464}
+           drain: chunks/5s 696, chunk max 8,192 tx, finished by others/5s 60; plan_discards (last ingest line) -
+Traceback (most recent call last):
+  File [35m"/data/n42-build/wt338/scripts/fleet7-runs/persist340.py"[0m, line [35m24[0m, in [35m<module>[0m
+    r = {k: [31mfloat[0m[1;31m(v)[0m for k, v in d.items() if k != 'pid' and re.fullmatch(r'-?[\d.e+-]+', v)}
+            [31m~~~~~[0m[1;31m^^^[0m
+[1;35mValueError[0m: [35mcould not convert string to float: '-'[0m
+== loop346A1: execution and root fields (median / p90 per block); over 1435 full builds: rename_fallbacks total 0, rename_record_waits total 0, carried_depth values ['1']
+    folded lines 456: pending_max max 84 (median 71); pending_us_max max 17,363; drops_max max 75478
+    flags: seal_on_counters true:457; freeze_pool_own true:457; plan_body 0:1/1:454/2:2; prep_from_plan false:3/true:454; plan_ahead 1:456/2:1; seal per 1,000 transfers 0.260 ms
+  window 1 (457 builds): on-CPU share 1.00/1.00; CPU per transfer 2.96/3.83 us; sealed_at_ms 52/80; par_exec_ms 21/28; par_fold_ms 10/17; index_ms 14/19; par_start_ms 3/14; gap_before_exec_ms 9/57; state_wait_us 8,857/57,814; parent_fields_ms 0/19; roots_ms 28/41; seal_to_fields_us 47,978/61,417; seal_to_complete_us 106,336/125,318; rename_fallbacks 0/0; rename_record_waits 0/0; carried_depth 1/1; plan_body_us 14,471/19,041; batch_max_ms 8/12; tx_root_ms 1/1; sealed_ms 1/20
+    folded lines 469: pending_max max 84 (median 70); pending_us_max max 18,852; drops_max max 40374
+    flags: seal_on_counters true:468; freeze_pool_own true:468; plan_body 0:1/1:466/2:1; prep_from_plan false:2/true:466; plan_ahead 0:1/1:467; seal per 1,000 transfers 0.258 ms
+  window 2 (468 builds): on-CPU share 1.00/1.00; CPU per transfer 3.11/3.90 us; sealed_at_ms 52/71; par_exec_ms 22/29; par_fold_ms 9/15; index_ms 13/19; par_start_ms 4/16; gap_before_exec_ms 6/42; state_wait_us 6,684/42,311; parent_fields_ms 5/21; roots_ms 32/45; seal_to_fields_us 50,422/64,709; seal_to_complete_us 110,935/128,119; rename_fallbacks 0/0; rename_record_waits 0/0; carried_depth 1/1; plan_body_us 15,287/18,876; batch_max_ms 9/15; tx_root_ms 1/1; sealed_ms 6/22
+    folded lines 464: pending_max max 86 (median 72); pending_us_max max 17,594; drops_max max 41064
+    flags: seal_on_counters true:463; freeze_pool_own true:463; plan_body 1:461/2:2; prep_from_plan false:2/true:461; plan_ahead 1:463; seal per 1,000 transfers 0.270 ms
+  window 3 (463 builds): on-CPU share 1.00/1.00; CPU per transfer 3.08/3.77 us; sealed_at_ms 54/77; par_exec_ms 22/28; par_fold_ms 8/16; index_ms 13/19; par_start_ms 4/17; gap_before_exec_ms 8/51; state_wait_us 8,031/51,462; parent_fields_ms 5/23; roots_ms 32/48; seal_to_fields_us 50,554/67,368; seal_to_complete_us 114,190/131,824; rename_fallbacks 0/0; rename_record_waits 0/0; carried_depth 1/1; plan_body_us 18,181/20,675; batch_max_ms 9/12; tx_root_ms 1/1; sealed_ms 6/25
+== loop346A1: 2965 proposals; proposal -> quorum (leader's commit) median 11.3 / p90 50.8 / max 118.3 ms; proposal interval median 61.4 / p90 66.2 ms; TC formed lines 1; leader views timed out 1; ParentUnknown lines 0
+   handover at view 1024: proposal intervals (view, ms) [(1023, 58), (1024, 134), (1025, 100), (1026, 61), (1027, 61)] against the median 61 ms
+   handover at view 2048: proposal intervals (view, ms) [(2047, 62), (2048, 61), (2049, 62), (2050, 62), (2051, 61)] against the median 61 ms
+     block 1024 (view 1024): sealed_at_ms 98, gap_before_exec_ms 13, parent_fields_ms 58, rename_fallbacks 0, rename_record_waits 0, carried_depth 1
+     block 1025 (view 1025): sealed_at_ms 32, gap_before_exec_ms 8, parent_fields_ms 4, rename_fallbacks 0, rename_record_waits 0, carried_depth 1
+     block 1026 (view 1026): sealed_at_ms 58, gap_before_exec_ms 8, parent_fields_ms 26, rename_fallbacks 0, rename_record_waits 0, carried_depth 1
+     block 1027 (view 1027): sealed_at_ms 46, gap_before_exec_ms 8, parent_fields_ms 14, rename_fallbacks 0, rename_record_waits 0, carried_depth 1
+no busy samples
+== loop346A1: 1388 full builds in the 3 windows
+  par_exec_ms 22/29; par_run_ms 32/71; batch_start_skew_ms 17/21; batch_median_ms 4/5; batch_max_ms 9/13; batch_first_start_us 73/115; batch_last_start_us 17189/21661; batch_dispatch_us 214/309; batch_last_end_us 22348/28959; batches 128/128; batch_threads 32/32; batch_txs_max 2000/2000; batch_txs_min 1500/1500; start_walk_ms 0/0; start_walk_check_ms 0/0; par_start_ms 3/16; sealed_at_ms 53/76; prev_seal_to_answer_us 1990/3531; prev_seal_to_entry_us 0/0; prev_seal_to_header_us 199/318; prev_seal_to_import_us 118524/152063; prev_seal_to_request_us 944/64017; prev_seal_to_start_us 1224/64249; start_walk_check_us 0/0; start_walk_ids_us 0/0; start_walk_settle_us 0/0; start_walk_us 0/0
+  one_wave {'false': 1388}
+  batches == batch_threads on 0 of 1388 builds
+  last - first batch start (ms) median/p90 17.12/21.57; under 2 ms on 0 of 1388 builds
+bodygate loop346A1: invalid_blocks=0 gas_mismatch=0 fields_mismatches=0 own_not_committed=0 proposals_given_up=0
+leg loop346A2: /data free 590G (needs 120 G)
+load 11.73 at 19:40:20, waiting
+leg loop346A2 start 19:40:50 load 7.11
+round loop346A2 exit 0 at 19:43:50
+loop346A2 save stages (node0, seconds summed over the leg / count): batch_size=1930.0/626  batch_size=1927.0/625  reth_consensus_engine_beacon_persistence_duration=58.3/625  duration_seconds=53.7/625  total=49.1/626  scope=44.7/626  sf=42.5/626  sf_transactions=42.2/626  qmdb_persisted=27.1/626  sf_account_changesets=19.5/626
+el binary: /data/n42-build/target-n42-rs/native/release/n42 env: N42_IMPORT_ONCE=1 N42_SETTLEMENT_TAGS=legacy N42_BUILD_THROTTLE_SOFT=48 F7_EL_MAP=0,0,0,0,0,0,0 N42_FIELDS_AT_SEAL=1 N42_FREEZE_AFTER_SEAL=1 N42_FRAME_BLOCKS=1 N42_TX_INGEST_RECOVER_PARALLEL=24 N42_FREEZE_POOL=own N42_PARALLEL_BUILD_THREADS=32 N42_PLAN_AHEAD=1 N42_HASHED_TABLES=off F7_FLOOD_RATE=6000000 N42_COMPACT_BODY=1 N42_BUILD_BATCHES=128 MALLOC_CONF=thp:always,oversize_threshold:0,dirty_decay_ms:2000,background_thread:true N42_SEAL_ON_COUNTERS=1 N42_ACCOUNT_HISTORY=off N42_TAKE_COMPACT=1 N42_SF_EARLY_WRITEBACK=1 N42_ROAD_RUNTIME=1 N42_TX_INGEST_HIGH_WATER=2500000 F7_BENCH_POOL_SLOTS=3000000 N42_PLAN_AHEAD_BODY=1 N42_SEAL_AT_EXEC=1 N42_TX_QUEUE_DRAIN_CHUNK=8192 N42_ANSWER_LAYOUT_ONLY=1 N42_PULL_BY_FRAMES=1 N42_SF_PARALLEL_ENCODE=1 N42_BUILD_THROTTLE_HARD=80 N42_LIVE_INDEX_DEFER=1 RAYON_NUM_THREADS=16 N42_ROOT_OPS_AHEAD=1 TOKIO_WORKER_THREADS=16 N42_QMDB_READS=on N42_LEADER_LAYERS=3 N42_PERSIST_QMDB_IN_SCOPE=1 F7_BLOCK_INTERVAL_MS=60 F7_MEASURE_FROM_LOG=1
+validator env: N42_IMPORT_ONCE=1 N42_SETTLEMENT_TAGS=legacy N42_BUILD_THROTTLE_SOFT=48 F7_EL_MAP=0,0,0,0,0,0,0 N42_FIELDS_AT_SEAL=1 N42_FREEZE_AFTER_SEAL=1 N42_FRAME_BLOCKS=1 N42_TX_INGEST_RECOVER_PARALLEL=24 N42_FREEZE_POOL=own N42_PARALLEL_BUILD_THREADS=32 N42_PLAN_AHEAD=1 N42_HASHED_TABLES=off F7_FLOOD_RATE=6000000 N42_COMPACT_BODY=1 N42_BUILD_BATCHES=128 N42_SEAL_ON_COUNTERS=1 N42_ACCOUNT_HISTORY=off N42_TAKE_COMPACT=1 N42_SF_EARLY_WRITEBACK=1 N42_ROAD_RUNTIME=1 N42_TX_INGEST_HIGH_WATER=2500000 F7_BENCH_POOL_SLOTS=3000000 N42_PLAN_AHEAD_BODY=1 N42_SEAL_AT_EXEC=1 N42_TX_QUEUE_DRAIN_CHUNK=8192 N42_ANSWER_LAYOUT_ONLY=1 N42_PULL_BY_FRAMES=1 N42_SF_PARALLEL_ENCODE=1 N42_BUILD_THROTTLE_HARD=80 N42_LIVE_INDEX_DEFER=1 RAYON_NUM_THREADS=16 N42_ROOT_OPS_AHEAD=1 TOKIO_WORKER_THREADS=16 N42_QMDB_READS=on N42_LEADER_LAYERS=3 N42_PERSIST_QMDB_IN_SCOPE=1 F7_MEASURE_FROM_LOG=1
+loop346A2 once: start-up lines import_once=true 1; last direct-import counters 
+loop346A2 imports: layers=1 direct_imports=0 canonical_blocks=2634 import_once_lines=1 (per layer: direct imports should equal canonical blocks for one execution per block)
+grep: /data/blockchain/rust-fleet7-bench/node1/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node3/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node1/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+grep: /data/blockchain/rust-fleet7-bench/node3/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node1/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node2/el.log: No such file or directory
+cat: /data/blockchain/rust-fleet7-bench/node3/el.log: No such file or directory
+loop346A2 no_variant=0 own_not_committed=0 tc=1 invalid_blocks=0 incomplete=0 gas_mismatch=0 direct_imports_failed=0 stuck_at_hashed_state=0 engine_idles_over_5s=1 proposals_given_up=0 tables_off_nodes=1 unanswered_reads=0 seal_first_total=1427 seal_first_direct=1427 direct_guard_errors=0 commit_ms_median=0 fold_ms_median=14 sealed_at_ms_median=42 state_ready_ms_median=96 build_total_ms_median=168 recover_us_median=0 par_exec_ms_median=21 par_exec_ms_median=21 giveback_filtered=0 giveback_offered_max=200000 seal_first=1427 reader_lag_max=10 reader_lag_warns=0 view_invalidated=0 el_sum_peak_g=40.7 el_max_peak_g=40.7 val_sum_peak_g=1.9 flood_peak_g=0.6 two_roads_blocks=0 two_roads_overlap_ms_median=- exec_on_output_declined=0 r1_collect_ms_median=5 proposal_at_ms_median=49 view_total_ms_median=61 import_exec_ms_median=- import_total_ms_median=- import_senders_ms_median=- import_convert_ms_median=- import_groups_median=- imports_over_600ms=0 min_avail_g=74.6 road_foreign_body_recv_ms=- road_foreign_body_decode_ms=- road_foreign_body_senders_ms=- road_foreign_body_parent_wait_ms=- road_foreign_body_check_ms=- road_foreign_body_total_ms=- road_new_payload_recv_ms=- road_new_payload_decode_ms=- road_new_payload_senders_ms=- road_new_payload_parent_wait_ms=- road_new_payload_check_ms=- road_new_payload_total_ms=- road_foreign_body_blocks=0 road_new_payload_blocks=0 fcu_answered=1239 fcu_in_flight_ms_median=0 fcu_queued_ms_median=0 fcu_queued_ms_max=100 fcu_refused=0 fcu_slow=2569 bodies_held=0 road_reuse_ms=- road_prepare_ms=- road_dispatch_ms=- road_convert_ms=- road_remember_ms=- road_header_ms=- road_fields_ms=- road_other_ms=- import_engine_ms_median=- gate_forced=0 gate_warns=0 flood_timeouts=0 canonical_min=2667 canonical_max=2667 chained_builds=1691 chain_lead_ms_median=55 chain_wait_ms_median=0 chain_started=1695 chain_discarded=3 chain_discard_reasons=_1_reason="no_,_1_reason="the_chained_build_produced_nothing,_1_reason="the_execution_layer_produced_nothing,_1_reason="the_request_names_another_parent chain_alias_warns=0 el_chained=1709 bodies_held_warns=0 el_build_refused=2 el_build_refused_reasons=_2_no_QMDB_tree_for_parent_block_0x queued_p5=2318000 queued_p50=2473500 road_compact_blocks=0 road_compact_recv_ms=- road_compact_assemble_ms=- road_compact_root_ms=- road_compact_miss_wait_ms=- road_compact_senders_ms=- road_compact_check_ms=- road_compact_other_ms=- road_compact_total_ms=- road_compact_misses_total= compact_refused_el=0 compact_fallbacks=0 compact_bytes_median=- pool_order9=13719 par_pull_ms_median=0 build_total_ms_median2=45 road_compact_filled_blocks=0 road_compact_filled_median=- road_compact_fill_ms_median=- need_txns=0 fill_failed=0 ingest_rate_gate_open_median=- ingest_gate_open_intervals=0 ingest_slots_busy_median=- flood_rate= fill_asked_proposer=0 fill_asked_other=0 loop_lines=1776 loop_unnamed_ms_median=48 loop_body_served_ms_median=- loop_txns_served_ms_median=- import_exec_ms_median2=- pip_partition_ms=- pip_env_ms=- pip_batch_ms=- pip_groups_ms=- pip_gas_ms=- pip_merge_ms=- pip_receipts_ms=- pip_drop_ms=- pip_other_ms=- pip_total_ms=- senders_indexed_median=- road_senders_ms_median=- road_total_ms_median=- pew_ms_median=- pew_ms_p90= gate_ms_median=- gate_ms_p90= root_ms_p50=- root_ms_p90= two_roads=0 not_on_output=0 not_on_output_why= ckpt_ms_first_q=2 ckpt_ms_last_q=48 ckpt_bytes_last=33836772 parent_still_importing=1 root_wait_ms_p50=- root_wait_ms_p90= tenures_low_seal=23 seal_first_share=0.99 empty_over_deep=0 near_empty_warns=0 no_seal_why= par_skipped_median=- usable_p5=2316500 ckpt_replay_ms_last_q=14 candidates_zero=0 dropped_ingest=0 let_go_warns=0 let_go_reasons= parked_p50=0 parked_max=0 held_warns=0 park_capped_total=0 superseded_builds=0 empty_not_superseded=0 mass_park_warns=0 heads_lines=0 holes_lines=0 stale_parent_refusals=0 par_groups_p5=0 cancelled_decided=1 heads_nonce0=0 stale_unconfirmed= handovers=1 el_panics=0 decided_cancelled=1 min_window_blocks=443 road_desc_blocks=0 road_desc_total_ms=- road_desc_copy_ms=- desc_misses=0 fill_failed2=0 sf_par_collect_ms=0 sf_par_commit_ms=0 sf_par_fold_ms=14 sf_par_graft_ms=0 sf_par_prefault_ms=0 sf_par_exec_ms=21 sf_sealed_at_ms=42 sf_roots_ms=31 sf_state_ready_ms=96 sf_total_ms=168 ba_find_ms=0 ba_queue_ms=0 ba_total_ms=45 ba_on_output=1426 queue_fold_us=0 queue_lock_us=1 sf_par_exec_ms=21 sf_par_fold_ms=14 pip_groups_ms=- import_exec_ms_median2=- reads_d0=0 reads_hist=0 f_reads_d0=- f_reads_hist=- f_overlay_depth=- L_read_set_ms=0 read_set_accounts=0 read_set_unresolved=0 read_set_hits=0 read_set_misses=0 start_best_ms=- par_prep_ms=- gap_before_exec_ms=- gap_after_exec_ms=- gap_before_seal_ms=- index_ms=- road_copy_aside_ms=- road_copy_wait_ms=- road_total_ms=- queue_first_miss=queue_first_miss=18446744073709551615:1437,queue_first_miss=0:1198 root_append_behind=0 populate_lag_mb=0 swap_used_g=0 root_faults=- root_faults_p90= root_faults_entries=0 root_faults_offsets=0 root_faults_index=0 root_faults_bits=0 root_faults_twigs=0 root_faults_undo=0 root_faults_tmp=0 root_append_faults=3 root_twig_pool_misses=0 batch_max_ms=8 batch_min_ms=2 batch_median_ms=4 batch_cpu_max_ms=8 batch_txs_max=2000 batch_txs_min=1500 batch_start_skew_ms=16 batch_wait_ms=0 loop_fetch_ns=0 loop_check_ns=0 loop_transfer_ns=0 loop_receipt_ns=0 loop_gas_ns=0 loop_sink_ns=0 loop_other_ns=0 batch_setup_ns=0 batch_close_ns=0 imp_exec_part_ms=- imp_exec_batches_ms=- imp_exec_graft_ms=- imp_exec_batches=- imp_exec_threads=- imp_exec_batch_max_ms=- imp_exec_batch_median_ms=- imp_parent_output_wait_ms=- road_parent_output_wait_ms=- next_start_gap_ms=1 next_entry_gap_ms=0 commit_body_ahead_used=- imp_exec_keys_ms=- imp_keys_ahead=- imp_exec_sink_ms=- imp_exec_pre_ms=- imp_exec_post_ms=- imp_exec_receipts_ms=- imp_exec_drop_ms=- root_gap_ms=- queue_whole=queue_whole=true:1437,queue_whole=false:1198 tick_tick_late_us=962 tick_preamble_us=340 tick_take_sealed_us=1 tick_sign_us=0 tick_cache_us=0 tick_presealed=- tick_describe_us=10 tick_publish_us=598 tick_tick_to_send_us=1989 road_check_ms=- road_check_include_us=- road_check_scan_us=- road_check_fold_us=- road_check_senders_us=- road_check_frames_summarized=- road_check_frames_scanned=- imp_exec_start_gap_us=- imp_gap_road_us=- imp_gap_header_us=- imp_gap_senders_us=- imp_gap_parent_us=- imp_gap_setup_us=- imp_gap_keys_wait_us=- sealed_at_p90= sealed_over_130=0 roots_ms=- cycle_p90=61/67/63 batch_max_ms=- batch_median_ms=- imp_batch_max=- forest_lock_warns=1671 root_seal_ms=1 root_seals=39 root_majflt=24962 roots_p90= gp_layer=1436 ggp_missing=352 state_wait_split=0/0/0/0:416,12/0/0/0:62,11/0/0/0:44 qmdb_releases=0 state_wait_on= imp_road_end_ms=- imp_exec_start_ms=- imp_exec_end_ms=- imp_root_end_ms=- imp_fields_ready_ms=- imp_parent_fields_wait_ms=- imp_exec_ms=- imp_root_ms=- imp_checks_ms=- imp_engine_ms=- imp_total_ms=- road_parent_fields_wait_ms=- exec_read_ms=0 L_exec_evm_ms=0 L_exec_write_ms=0 L_exec_other_ms=0 L_reads_cache=0 L_reads_provider=0 L_reads_view=0 L_graft_base_ms=0 L_graft_reserve_ms=0 L_graft_insert_ms=0 L_graft_reverts_ms=0 L_graft_other_ms=0 L_par_exec_ms=21 L_par_graft_ms=0 F_exec_read_ms=- F_exec_evm_ms=- F_exec_write_ms=- F_exec_other_ms=- F_reads_cache=- F_reads_provider=- F_reads_view=- F_groups_ms=- L_tx_root_wait_ms=0 L_par_exec_ms=21 L_par_graft_ms=0 L_par_fold_ms=14 L_sealed_ms=1 L_state_ready_ms=96 L_roots_ms=31 L_finish_ms=103 L_total_ms=168 L_setup_ms=0 L_par_pull_ms=0 L_give_back_ms=0 L_state_wait_ms=10 L_state_after_pull=1427 L_seal_at_exec=1427 L_tx_root_ahead=0 flood_w1=3002012 txs_p10=200000 acq_us=468 slots_busy=13 ingest_rate=3101163 L_scope_join_ms=0 L_par_release_ms=0 L_commit_body_ms=0 L_par_commit_ms=0 L_give_back_ms=0 L_sealed_ms=1 L_par_exec_ms=21 L_state_wait_ms=10 L_par_pull_ms=0 L_par_prep_ms=0 L_par_start_ms=3 L_pre_exec_ms=0 L_par_run_ms=33 L_sealed_at_ms=42 F_partition_ms=- F_env_ms=- F_groups_ms=- F_merge_ms=- F_reverts_wait_ms=- F_ahead_wait_ms=- F_total_ms=- I_engine_ms=- I_root_ms=- I_total_ms=- H_engine_remember_ms=- H_engine_listing_ms=- H_engine_new_payload_ms=- busy_us=1 L_par_start_ms=3 L_start_handoff_ms=0 L_start_best_ms=3 L_start_puller_ms=0 L_par_pull_ms=0 L_par_prep_ms=0 L_state_wait_ms=10 L_par_exec_ms=21 L_par_commit_ms=0 L_sealed_ms=1 L_sealed_at_ms=42 L_par_graft_ms=0 L_graft_insert_ms=0 L_graft_reverts_ms=0 L_graft_split_us=0 L_graft_build_us=0 L_graft_merge_us=0 L_state_ready_ms=96 Q_queue_ms=0 R_dispatch_wait_ms=- R_total_ms=- R_road_runtime=1 gate_holds=0 peer_fetch=0 pool_limit=limit=4 gate_opened=gate_opened_for_block=0 I_root_ms=- flood_rate_hdr=rate=6000000/s fills=0 fill_waited=- slots_busy=13 acq_us=468 busy_us=1 converged=0 fallbacks=0 busy_us=1 recover_us=0 tf_on_output=2 tf_fallback=0 still_importing=1 busy_us=1 slots_busy=13 batches=altsig_txs=0 altsig_batches=0 tf_on_output=2 tf_fallback=0 gate_holds=0 sign_s=sign 0s replay_note=replay       : 64 files from /data/n42-pregen/g900000-400m, 400000000 transactio sign_s=sign 0s shard=shard_verified=0 shard_claimed=0 road_verified=- slots_busy=13 gate_us=7134 reply_us=7704 queued=2473500 assemble_ms=- road_take_ms=- road_body_ms=- road_encode_ms=- shards=16 shard_insert_ms=0 shard_wait_ms=0 shard_fold_ms=15 shard_append_ms=16 shard_merge_ms=57 state_ready_ms=96 roots_ms=31 exec_read_ms=0 exec_evm_ms=0 exec_write_ms=0 exec_other_ms=0 reads_cache=0 reads_provider=0 reads_view=0 par_run_ms=33 fold_task_cpu_max_us=14756 fold_task_minflt_max=1 fold_task_minflt_sum=1 fold_task_migrated=0 fold_task_nivcsw_max=0 fold_index=1 fold_index_build_ms=14 fold_index_conflicts=8387 fold_queue_us=63 fold_skew_us=38 fold_task_max_us=14754 fold_tail_us=18 start_best_ms=3 start_select_ms=0 start_walk_ms=0 start_walk_check_ms=0 start_best_other_ms=0 start_frames_by_ref=0 start_frames_slow=0 start_pull_ms=0 start_other_ms=0 start_handoff_ms=0 par_start_ms=3 par_prep_ms=0 par_commit_ms=0 commit_body_ms=0 par_fold_ms=14 sealed_ms=1 copy_ms=- prune_ms=0 frames=- frames_missing=- frame_root_ms=- root_ms=- frames_admitted=frames_admitted=570228 frames_unaligned=0 frame_root_indexed=- seal_layout_ms=0 seal_root_ms=0 attested= busy_us=1 slots_busy=13 reply_us=7704 prune_ms=0 body_refused=0 body_failed_late=0
+loop346A2 win1 tps=3,126,667 txs=93,800,000 blocks= 469 cycle=0.064s occupancy= 99.8% full(>=95%)=468/469 basefee=n/a (from the layer's log)
+loop346A2 win2 tps=3,060,000 txs=91,800,000 blocks= 459 cycle=0.065s occupancy=100.0% full(>=95%)=459/459 basefee=n/a (from the layer's log)
+loop346A2 win3 tps=2,953,333 txs=88,600,000 blocks= 443 cycle=0.068s occupancy=100.0% full(>=95%)=443/443 basefee=n/a (from the layer's log)
+loop346A2 win1 tps=3,126,667 txs=93,800,000 blocks= 469 cycle=0.064s occupancy= 99.6% full(>=95%)=467/469 basefee=n/a (from the layer's log)
+loop346A2 win2 tps=3,060,000 txs=91,800,000 blocks= 459 cycle=0.065s occupancy=100.0% full(>=95%)=459/459 basefee=n/a (from the layer's log)
+loop346A2 win3 tps=2,993,333 txs=89,800,000 blocks= 449 cycle=0.067s occupancy=100.0% full(>=95%)=449/449 basefee=n/a (from the layer's log)
+loop346A2 tps=3,126,667
+tps=3,126,667 round_txs=549600000 cycles_w1=
+loop346A2 imp_fields_p90= b_p75=21
+loop346A2 overlay: filter_skips=0 probes=0 ratio=- (ratio = skips/(skips+probes))
+loop346A2 overlay_manager:       1 state_trie_overlay=false  state-ovly_cpu=0
+loop346A2 verify: written to /data/blockchain/rust-fleet7-bench/bench-loop346A2/verify.json
+== loop346A2  (E=1: seven validator keys on one execution layer)
+  window 1: canonical 469 blocks, 93.8M tx = 3,126,667/s (100.0% of window 1), full 467/469 (100%); cycle mean/median/p90 64.0/61.4/70.4 ms
+    leader builds 468: sealed_at median/p90/p99 42/77/101; phases median/p90 ms: gap_before_exec 11/51, state_wait 10/51, par 50/90, par_exec 21/28, roots 27/42, parent_fields 0/0, sealed 1/1
+    state_wait_on {'output': 251, 'grandparent': 90, 'none': 127}; builds with state_wait > 20 ms: 135 ([('grandparent', 87), ('output', 48)]); gp_layer {1.0: 468}, ggp_missing {0.0: 363, 1.0: 105}
+    queue at the builds min/median 1,714,000/2,478,500
+    new field batch_cpu_sum_us: median/p90/max 577704.5/782707.0/2038090, nonzero 468
+    new field batch_dispatch_us: median/p90/max 204.0/279.0/528, nonzero 468
+    new field batch_first_start_us: median/p90/max 76.0/114.0/246, nonzero 468
+    new field batch_ivcsw: median/p90/max 1.0/6.0/29, nonzero 294
+    new field batch_last_end_us: median/p90/max 21016.0/28703.0/69483, nonzero 468
+    new field batch_last_start_us: median/p90/max 16202.0/21631.0/60931, nonzero 468
+    new field batch_live_deferred: median/p90/max 72.0/80.0/86, nonzero 468
+    new field batch_live_lock_hold_us: median/p90/max 10039.0/11747.0/15057, nonzero 468
+    new field batch_live_lock_wait_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_live_lock_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_majflt: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_minflt: median/p90/max 814.0/8723.0/24634, nonzero 467
+    new field batch_open_max_us: median/p90/max 417.5/515.0/1789, nonzero 468
+    new field batch_open_sum_us: median/p90/max 10118.0/12629.0/17414, nonzero 468
+    new field batch_threads: median/p90/max 32.0/32.0/32, nonzero 468
+    new field batch_vcsw: median/p90/max 173.0/494.0/1071, nonzero 468
+    new field batch_view_index_wait_us: median/p90/max 0.0/19904.0/51318, nonzero 108
+    new field batch_view_index_waits: median/p90/max 0.0/295.0/760, nonzero 108
+    new field batch_view_slot_wait_us: median/p90/max 0.0/1709.0/5179, nonzero 113
+    new field batch_view_slot_waits: median/p90/max 0.0/53.0/151, nonzero 113
+    new field batch_wall_sum_us: median/p90/max 584615.5/786188.0/2039811, nonzero 468
+    new field batches: median/p90/max 128.0/128.0/128, nonzero 468
+    new field build_batches: median/p90/max 128.0/128.0/128, nonzero 468
+    new field carried_depth: median/p90/max 2.0/2.0/2, nonzero 468
+    new field exec_end_to_seal_us: median/p90/max 90.0/134.0/358, nonzero 468
+    new field exec_partition_us: median/p90/max 6.0/8.0/1795, nonzero 468
+    new field exec_prepared_groups: {'true': 459, 'false': 9}
+    new field exec_prepared_slots: {'true': 459, 'false': 9}
+    new field exec_slots_us: median/p90/max 0.0/0.0/2200, nonzero 10
+    new field freeze_join_wait_us: median/p90/max 14538.0/20925.0/30928, nonzero 468
+    new field freeze_late: {'true': 468}
+    new field freeze_pool_own: {'true': 468}
+    new field live_index_defer: {'true': 468}
+    new field merge_accounts: median/p90/max 191064.5/194901.0/197876, nonzero 468
+    new field merge_append_us: median/p90/max 3879.0/7258.0/12664, nonzero 468
+    new field merge_reverts: median/p90/max 191064.5/194901.0/197876, nonzero 468
+    new field merge_reverts_us: median/p90/max 14457.0/18136.0/24630, nonzero 468
+    new field merge_state_us: median/p90/max 37431.5/46118.0/69406, nonzero 468
+    new field merge_tail_us: median/p90/max 0.0/0.0/1, nonzero 3
+    new field merge_threads: median/p90/max 1.0/1.0/1, nonzero 468
+    new field one_wave: {'false': 468}
+    new field open_engine_us: median/p90/max 0.0/40188.0/69962, nonzero 105
+    new field open_fallback: {'false': 363, 'true': 105}
+    new field open_keep_us: median/p90/max 4.0/7.0/14, nonzero 468
+    new field open_layers: median/p90/max 3.0/3.0/3, nonzero 468
+    new field open_provider_us: median/p90/max 91.0/153.0/336, nonzero 468
+    new field plan_age_us: median/p90/max 47419.5/99772.0/119405, nonzero 468
+    new field plan_ahead: median/p90/max 1.0/1.0/1, nonzero 468
+    new field plan_body: median/p90/max 1.0/1.0/2, nonzero 468
+    new field plan_body_us: median/p90/max 14339.5/18545.0/26229, nonzero 459
+    new field plan_discard: {'': 468}
+    new field plan_prep_us: median/p90/max 7513.0/13228.0/34480, nonzero 468
+    new field plan_topup_txs: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prep_from_plan: {'true': 459, 'false': 9}
+    new field prev_seal_to_answer_us: median/p90/max 2105.5/3898.0/8779, nonzero 468
+    new field prev_seal_to_entry_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prev_seal_to_header_us: median/p90/max 192.5/302.0/548, nonzero 468
+    new field prev_seal_to_import_us: median/p90/max 115306.0/164053.0/216913, nonzero 420
+    new field prev_seal_to_request_us: median/p90/max 961.0/72083.0/87381, nonzero 468
+    new field prev_seal_to_start_us: median/p90/max 1245.0/72291.0/87614, nonzero 468
+    new field pull_bulk_txs: median/p90/max 200000.0/200000.0/200000, nonzero 468
+    new field pull_bulk_us: median/p90/max 6.0/10.0/1070, nonzero 468
+    new field rename_fallbacks: median/p90/max 0.0/0.0/0, nonzero 0
+    new field rename_record_waits: median/p90/max 17.0/35.0/37, nonzero 438
+    new field root_apply_gap_us: median/p90/max 10.0/12.0/21, nonzero 468
+    new field root_apply_total_us: median/p90/max 20010.0/28084.0/51027, nonzero 468
+    new field root_compute_us: median/p90/max 21966.0/32370.0/53745, nonzero 468
+    new field root_delta_us: median/p90/max 1107.0/3067.0/9617, nonzero 468
+    new field root_index_us: median/p90/max 2570.0/4405.0/14931, nonzero 468
+    new field root_leaves_us: median/p90/max 6541.5/10229.0/18614, nonzero 468
+    new field root_note_us: median/p90/max 146.0/231.0/1119, nonzero 468
+    new field root_ops_ahead: {'true': 468}
+    new field root_ops_ahead_wait_us: median/p90/max 2238.0/7482.0/23596, nonzero 466
+    new field root_ops_concat_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_ops_encode_us: median/p90/max 5328.0/9504.0/20703, nonzero 468
+    new field root_ops_finish_us: median/p90/max 2171.0/2987.0/6746, nonzero 468
+    new field root_ops_sort_us: median/p90/max 2863.5/6302.0/13113, nonzero 468
+    new field root_ops_us: median/p90/max 4380.0/9882.0/25867, nonzero 468
+    new field root_rehash_us: median/p90/max 1359.0/1816.0/12346, nonzero 468
+    new field root_retire_us: median/p90/max 1563.0/2750.0/6455, nonzero 468
+    new field root_sort_us: median/p90/max 185.5/417.0/3338, nonzero 468
+    new field root_undo_us: median/p90/max 340.0/659.0/3515, nonzero 468
+    new field root_writes_us: median/p90/max 6657.0/9920.0/33695, nonzero 468
+    new field seal_hashes_ahead: {'true': 468}
+    new field seal_on_counters: {'true': 468}
+    new field seal_to_complete_us: median/p90/max 110085.5/129126.0/155513, nonzero 468
+    new field seal_to_frozen_us: median/p90/max 14508.5/20868.0/30925, nonzero 467
+    new field seal_to_merge_end_us: median/p90/max 109993.5/129042.0/155392, nonzero 468
+    new field seal_to_merge_start_us: median/p90/max 51736.5/66706.0/87546, nonzero 468
+    new field seal_to_ops_ahead_us: median/p90/max 25694.5/33614.0/46858, nonzero 468
+    new field seal_to_state_ready_us: median/p90/max 110000.5/129049.0/155403, nonzero 468
+    new field sealed_unix_us: median/p90/max 1791416549188095.5/1791416561130561.0/1791416564300082, nonzero 468
+    new field start_walk_check_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_ids_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_settle_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field state_wait_us: median/p90/max 10999.5/51505.0/79212, nonzero 468
+    new field view_journal_reads: median/p90/max 0.0/77824.0/196608, nonzero 229
+    new field view_journal_searches: median/p90/max 0.0/194737.0/422670, nonzero 229
+    new field view_journal_skips: median/p90/max 0.0/0.0/0, nonzero 0
+    new field whole_take_noted: {'true': 468}
+    binding wait (tick / quorum / seal share, mean cycle): tick 98% (64); quorum 1% (111); seal 1% (72); feed-bound (blocks under 95% of the tier): 2 of 469
+    slowest key vote delay median/p90 9.7/58.5 ms
+    engine own-import total_ms per block median/p90/max 43/70/97 (n=468)
+    layer RSS 4.8 -> 26.9 G (max 26.9), in-memory blocks max 10
+    execution layer cores busy 34.4    validators cores busy 1.2
+    flood delivered (median per 5 s over the leg) 3,099,817/s
+  window 2: canonical 459 blocks, 91.8M tx = 3,060,000/s (97.9% of window 1), full 459/459 (100%); cycle mean/median/p90 66.4/61.7/87.0 ms
+    leader builds 461: sealed_at median/p90/p99 42/77/100; phases median/p90 ms: gap_before_exec 10/54, state_wait 10/54, par 50/87, par_exec 21/27, roots 32/49, parent_fields 0/0, sealed 1/1
+    state_wait_on {'none': 131, 'output': 216, 'grandparent': 114}; builds with state_wait > 20 ms: 118 ([('grandparent', 101), ('output', 17)]); gp_layer {1.0: 461}, ggp_missing {0.0: 334, 1.0: 127}
+    queue at the builds min/median 2,240,000/2,489,000
+    new field batch_cpu_sum_us: median/p90/max 568933.0/725513.0/2209304, nonzero 461
+    new field batch_dispatch_us: median/p90/max 236.0/325.0/3794, nonzero 461
+    new field batch_first_start_us: median/p90/max 79.0/122.0/242, nonzero 461
+    new field batch_ivcsw: median/p90/max 1.0/6.0/33, nonzero 278
+    new field batch_last_end_us: median/p90/max 21103.0/27109.0/77097, nonzero 461
+    new field batch_last_start_us: median/p90/max 16150.0/20440.0/60586, nonzero 461
+    new field batch_live_deferred: median/p90/max 73.0/81.0/227, nonzero 461
+    new field batch_live_lock_hold_us: median/p90/max 10199.0/12607.0/27647, nonzero 461
+    new field batch_live_lock_wait_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_live_lock_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_majflt: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_minflt: median/p90/max 871.0/9323.0/30185, nonzero 461
+    new field batch_open_max_us: median/p90/max 414.0/512.0/3168, nonzero 461
+    new field batch_open_sum_us: median/p90/max 9664.0/12523.0/32043, nonzero 461
+    new field batch_threads: median/p90/max 32.0/32.0/32, nonzero 461
+    new field batch_vcsw: median/p90/max 174.0/490.0/1082, nonzero 461
+    new field batch_view_index_wait_us: median/p90/max 0.0/20302.0/52288, nonzero 104
+    new field batch_view_index_waits: median/p90/max 0.0/265.0/783, nonzero 104
+    new field batch_view_slot_wait_us: median/p90/max 0.0/1627.0/8903, nonzero 112
+    new field batch_view_slot_waits: median/p90/max 0.0/47.0/145, nonzero 112
+    new field batch_wall_sum_us: median/p90/max 575642.0/739160.0/2212588, nonzero 461
+    new field batches: median/p90/max 128.0/128.0/128, nonzero 461
+    new field build_batches: median/p90/max 128.0/128.0/128, nonzero 461
+    new field carried_depth: median/p90/max 2.0/2.0/2, nonzero 461
+    new field exec_end_to_seal_us: median/p90/max 91.0/138.0/421, nonzero 461
+    new field exec_partition_us: median/p90/max 6.0/8.0/1625, nonzero 461
+    new field exec_prepared_groups: {'true': 448, 'false': 13}
+    new field exec_prepared_slots: {'true': 448, 'false': 13}
+    new field exec_slots_us: median/p90/max 0.0/0.0/2392, nonzero 16
+    new field freeze_join_wait_us: median/p90/max 13985.0/19388.0/33468, nonzero 461
+    new field freeze_late: {'true': 461}
+    new field freeze_pool_own: {'true': 461}
+    new field live_index_defer: {'true': 461}
+    new field merge_accounts: median/p90/max 192498.0/195383.0/199495, nonzero 461
+    new field merge_append_us: median/p90/max 3848.0/7988.0/19734, nonzero 461
+    new field merge_reverts: median/p90/max 192498.0/195383.0/199495, nonzero 461
+    new field merge_reverts_us: median/p90/max 14436.0/19734.0/29566, nonzero 461
+    new field merge_state_us: median/p90/max 38223.0/47103.0/71564, nonzero 461
+    new field merge_tail_us: median/p90/max 0.0/0.0/1, nonzero 3
+    new field merge_threads: median/p90/max 1.0/1.0/1, nonzero 461
+    new field one_wave: {'false': 461}
+    new field open_engine_us: median/p90/max 0.0/40240.0/77027, nonzero 127
+    new field open_fallback: {'false': 334, 'true': 127}
+    new field open_keep_us: median/p90/max 4.0/7.0/20, nonzero 461
+    new field open_layers: median/p90/max 3.0/3.0/3, nonzero 461
+    new field open_provider_us: median/p90/max 85.0/156.0/617, nonzero 461
+    new field plan_age_us: median/p90/max 46355.0/102238.0/147493, nonzero 460
+    new field plan_ahead: median/p90/max 1.0/1.0/1, nonzero 460
+    new field plan_body: median/p90/max 1.0/1.0/2, nonzero 460
+    new field plan_body_us: median/p90/max 17006.0/21504.0/31609, nonzero 448
+    new field plan_discard: {'': 460, 'not_on_its_parent': 1}
+    new field plan_prep_us: median/p90/max 7662.0/14233.0/23509, nonzero 460
+    new field plan_topup_txs: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prep_from_plan: {'true': 448, 'false': 13}
+    new field prev_seal_to_answer_us: median/p90/max 1962.0/3382.0/7166, nonzero 461
+    new field prev_seal_to_entry_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prev_seal_to_header_us: median/p90/max 190.0/317.0/558, nonzero 461
+    new field prev_seal_to_import_us: median/p90/max 124539.0/173112.0/215351, nonzero 413
+    new field prev_seal_to_request_us: median/p90/max 988.0/72940.0/116235, nonzero 461
+    new field prev_seal_to_start_us: median/p90/max 1289.0/73248.0/116390, nonzero 461
+    new field pull_bulk_txs: median/p90/max 200000.0/200000.0/200000, nonzero 461
+    new field pull_bulk_us: median/p90/max 6.0/10.0/1104, nonzero 461
+    new field rename_fallbacks: median/p90/max 0.0/0.0/0, nonzero 0
+    new field rename_record_waits: median/p90/max 58.0/81.0/94, nonzero 461
+    new field root_apply_gap_us: median/p90/max 10.0/13.0/21, nonzero 461
+    new field root_apply_total_us: median/p90/max 22479.0/32457.0/51288, nonzero 461
+    new field root_compute_us: median/p90/max 24773.0/35877.0/87726, nonzero 461
+    new field root_delta_us: median/p90/max 1125.0/2589.0/10813, nonzero 461
+    new field root_index_us: median/p90/max 2817.0/5794.0/23439, nonzero 461
+    new field root_leaves_us: median/p90/max 6911.0/12408.0/27397, nonzero 461
+    new field root_note_us: median/p90/max 139.0/209.0/763, nonzero 461
+    new field root_ops_ahead: {'true': 461}
+    new field root_ops_ahead_wait_us: median/p90/max 2824.0/9534.0/31388, nonzero 459
+    new field root_ops_concat_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_ops_encode_us: median/p90/max 6149.0/10619.0/24330, nonzero 461
+    new field root_ops_finish_us: median/p90/max 2009.0/3217.0/10201, nonzero 461
+    new field root_ops_sort_us: median/p90/max 2766.0/7125.0/26442, nonzero 461
+    new field root_ops_us: median/p90/max 5071.0/12082.0/33959, nonzero 461
+    new field root_rehash_us: median/p90/max 2005.0/2778.0/16474, nonzero 461
+    new field root_retire_us: median/p90/max 1638.0/2921.0/8952, nonzero 461
+    new field root_sort_us: median/p90/max 192.0/427.0/4956, nonzero 461
+    new field root_undo_us: median/p90/max 336.0/625.0/2700, nonzero 461
+    new field root_writes_us: median/p90/max 6736.0/10831.0/22655, nonzero 461
+    new field seal_hashes_ahead: {'true': 461}
+    new field seal_on_counters: {'true': 461}
+    new field seal_to_complete_us: median/p90/max 114629.0/142528.0/184736, nonzero 461
+    new field seal_to_frozen_us: median/p90/max 13921.0/19348.0/33440, nonzero 460
+    new field seal_to_merge_end_us: median/p90/max 114516.0/142439.0/184670, nonzero 461
+    new field seal_to_merge_start_us: median/p90/max 57023.0/75404.0/114696, nonzero 461
+    new field seal_to_ops_ahead_us: median/p90/max 25755.0/34089.0/47664, nonzero 461
+    new field seal_to_state_ready_us: median/p90/max 114522.0/142445.0/184678, nonzero 461
+    new field sealed_unix_us: median/p90/max 1791416579624772.0/1791416591430999.0/1791416594361997, nonzero 461
+    new field start_walk_check_us: median/p90/max 0.0/0.0/138, nonzero 1
+    new field start_walk_ids_us: median/p90/max 0.0/0.0/535, nonzero 1
+    new field start_walk_settle_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_us: median/p90/max 0.0/0.0/4522, nonzero 1
+    new field state_wait_us: median/p90/max 10146.0/54073.0/98301, nonzero 461
+    new field view_journal_reads: median/p90/max 0.0/69632.0/131072, nonzero 216
+    new field view_journal_searches: median/p90/max 0.0/196225.0/346004, nonzero 216
+    new field view_journal_skips: median/p90/max 0.0/0.0/0, nonzero 0
+    new field whole_take_noted: {'true': 461}
+    binding wait (tick / quorum / seal share, mean cycle): tick 97% (65); quorum 2% (106); seal 1% (87); feed-bound (blocks under 95% of the tier): 0 of 459
+    slowest key vote delay median/p90 14.4/72.3 ms
+    engine own-import total_ms per block median/p90/max 41/69/107 (n=459)
+    layer RSS 26.0 -> 33.6 G (max 33.6), in-memory blocks max 10
+    execution layer cores busy 34.2    validators cores busy 1.2
+  window 3: canonical 449 blocks, 89.8M tx = 2,993,333/s (95.7% of window 1), full 449/449 (100%); cycle -
+    leader builds 449: sealed_at median/p90/p99 42/78/125; phases median/p90 ms: gap_before_exec 10/44, state_wait 9/44, par 51/88, par_exec 21/32, roots 34/60, parent_fields 0/0, sealed 1/1
+    state_wait_on {'output': 218, 'none': 131, 'grandparent': 98, 'open': 1, 'provider_open': 1}; builds with state_wait > 20 ms: 112 ([('grandparent', 87), ('output', 25)]); gp_layer {1.0: 449}, ggp_missing {0.0: 337, 1.0: 112}
+    queue at the builds min/median 2,236,000/2,482,500
+    new field batch_cpu_sum_us: median/p90/max 575328.0/717133.0/2020275, nonzero 449
+    new field batch_dispatch_us: median/p90/max 207.0/289.0/2933, nonzero 449
+    new field batch_first_start_us: median/p90/max 76.0/106.0/227, nonzero 449
+    new field batch_ivcsw: median/p90/max 1.0/7.0/24, nonzero 252
+    new field batch_last_end_us: median/p90/max 21502.0/32803.0/123113, nonzero 449
+    new field batch_last_start_us: median/p90/max 16850.0/23885.0/116396, nonzero 449
+    new field batch_live_deferred: median/p90/max 74.0/87.0/476, nonzero 449
+    new field batch_live_lock_hold_us: median/p90/max 10817.0/13605.0/59746, nonzero 449
+    new field batch_live_lock_wait_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_live_lock_waits: median/p90/max 0.0/0.0/0, nonzero 0
+    new field batch_majflt: median/p90/max 0.0/135.0/16844, nonzero 67
+    new field batch_minflt: median/p90/max 1021.0/10453.0/30216, nonzero 449
+    new field batch_open_max_us: median/p90/max 436.0/532.0/1337, nonzero 449
+    new field batch_open_sum_us: median/p90/max 10748.0/13354.0/23534, nonzero 449
+    new field batch_threads: median/p90/max 32.0/32.0/32, nonzero 449
+    new field batch_vcsw: median/p90/max 192.0/671.0/17073, nonzero 449
+    new field batch_view_index_wait_us: median/p90/max 0.0/18835.0/1587175, nonzero 98
+    new field batch_view_index_waits: median/p90/max 0.0/248.0/641, nonzero 98
+    new field batch_view_slot_wait_us: median/p90/max 0.0/1541.0/146126, nonzero 119
+    new field batch_view_slot_waits: median/p90/max 0.0/40.0/95, nonzero 119
+    new field batch_wall_sum_us: median/p90/max 607499.0/858428.0/3813694, nonzero 449
+    new field batches: median/p90/max 128.0/128.0/128, nonzero 449
+    new field build_batches: median/p90/max 128.0/128.0/128, nonzero 449
+    new field carried_depth: median/p90/max 2.0/2.0/2, nonzero 449
+    new field exec_end_to_seal_us: median/p90/max 89.0/151.0/2130, nonzero 449
+    new field exec_partition_us: median/p90/max 6.0/8.0/1709, nonzero 449
+    new field exec_prepared_groups: {'true': 437, 'false': 12}
+    new field exec_prepared_slots: {'true': 437, 'false': 12}
+    new field exec_slots_us: median/p90/max 0.0/0.0/3323, nonzero 13
+    new field freeze_join_wait_us: median/p90/max 14076.0/20159.0/35132, nonzero 449
+    new field freeze_late: {'true': 449}
+    new field freeze_pool_own: {'true': 449}
+    new field live_index_defer: {'true': 449}
+    new field merge_accounts: median/p90/max 191678.0/194913.0/198077, nonzero 449
+    new field merge_append_us: median/p90/max 3717.0/10420.0/19287, nonzero 449
+    new field merge_reverts: median/p90/max 191678.0/194913.0/198077, nonzero 449
+    new field merge_reverts_us: median/p90/max 15228.0/21845.0/156322, nonzero 449
+    new field merge_state_us: median/p90/max 39250.0/49938.0/65598, nonzero 449
+    new field merge_tail_us: median/p90/max 0.0/0.0/6, nonzero 2
+    new field merge_threads: median/p90/max 1.0/1.0/1, nonzero 449
+    new field one_wave: {'false': 449}
+    new field open_engine_us: median/p90/max 0.0/31185.0/83185, nonzero 112
+    new field open_fallback: {'false': 337, 'true': 112}
+    new field open_keep_us: median/p90/max 4.0/6.0/11, nonzero 449
+    new field open_layers: median/p90/max 3.0/3.0/3, nonzero 449
+    new field open_provider_us: median/p90/max 89.0/164.0/1173, nonzero 449
+    new field plan_age_us: median/p90/max 46471.0/102327.0/287538, nonzero 449
+    new field plan_ahead: median/p90/max 1.0/1.0/1, nonzero 449
+    new field plan_body: median/p90/max 1.0/1.0/2, nonzero 449
+    new field plan_body_us: median/p90/max 14857.0/19420.0/27241, nonzero 437
+    new field plan_discard: {'': 449}
+    new field plan_prep_us: median/p90/max 8026.0/16299.0/83034, nonzero 449
+    new field plan_topup_txs: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prep_from_plan: {'true': 437, 'false': 12}
+    new field prev_seal_to_answer_us: median/p90/max 2045.0/3237.0/5468, nonzero 449
+    new field prev_seal_to_entry_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field prev_seal_to_header_us: median/p90/max 200.0/342.0/959, nonzero 449
+    new field prev_seal_to_import_us: median/p90/max 131811.0/181426.0/345734, nonzero 416
+    new field prev_seal_to_request_us: median/p90/max 985.0/71761.0/249768, nonzero 449
+    new field prev_seal_to_start_us: median/p90/max 1291.0/72023.0/250046, nonzero 449
+    new field pull_bulk_txs: median/p90/max 200000.0/200000.0/200000, nonzero 449
+    new field pull_bulk_us: median/p90/max 6.0/10.0/1507, nonzero 449
+    new field rename_fallbacks: median/p90/max 0.0/0.0/0, nonzero 0
+    new field rename_record_waits: median/p90/max 147.0/184.0/200, nonzero 449
+    new field root_apply_gap_us: median/p90/max 10.0/13.0/35, nonzero 449
+    new field root_apply_total_us: median/p90/max 24261.0/37913.0/197722, nonzero 449
+    new field root_compute_us: median/p90/max 26440.0/41823.0/198969, nonzero 449
+    new field root_delta_us: median/p90/max 1161.0/2604.0/20787, nonzero 449
+    new field root_index_us: median/p90/max 2830.0/6314.0/26674, nonzero 449
+    new field root_leaves_us: median/p90/max 7412.0/16160.0/185896, nonzero 449
+    new field root_note_us: median/p90/max 139.0/227.0/1105, nonzero 449
+    new field root_ops_ahead: {'true': 449}
+    new field root_ops_ahead_wait_us: median/p90/max 2256.0/11710.0/50226, nonzero 447
+    new field root_ops_concat_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field root_ops_encode_us: median/p90/max 6054.0/12357.0/68764, nonzero 449
+    new field root_ops_finish_us: median/p90/max 1996.0/3577.0/7707, nonzero 449
+    new field root_ops_sort_us: median/p90/max 3187.0/6632.0/29637, nonzero 449
+    new field root_ops_us: median/p90/max 4581.0/14565.0/54130, nonzero 449
+    new field root_rehash_us: median/p90/max 2582.0/4925.0/21448, nonzero 449
+    new field root_retire_us: median/p90/max 1905.0/2939.0/5350, nonzero 449
+    new field root_sort_us: median/p90/max 212.0/431.0/3006, nonzero 449
+    new field root_undo_us: median/p90/max 351.0/666.0/2025, nonzero 449
+    new field root_writes_us: median/p90/max 6893.0/10847.0/20361, nonzero 449
+    new field seal_hashes_ahead: {'true': 449}
+    new field seal_on_counters: {'true': 449}
+    new field seal_to_complete_us: median/p90/max 123887.0/157786.0/280916, nonzero 449
+    new field seal_to_frozen_us: median/p90/max 14059.0/20023.0/35106, nonzero 446
+    new field seal_to_merge_end_us: median/p90/max 123820.0/157690.0/280825, nonzero 449
+    new field seal_to_merge_start_us: median/p90/max 60696.0/90882.0/232985, nonzero 449
+    new field seal_to_ops_ahead_us: median/p90/max 25964.0/37098.0/87559, nonzero 449
+    new field seal_to_state_ready_us: median/p90/max 123826.0/157699.0/280832, nonzero 449
+    new field sealed_unix_us: median/p90/max 1791416608523015.0/1791416621234202.0/1791416624310520, nonzero 449
+    new field start_walk_check_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_ids_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_settle_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field start_walk_us: median/p90/max 0.0/0.0/0, nonzero 0
+    new field state_wait_us: median/p90/max 9790.0/44486.0/89674, nonzero 449
+    new field view_journal_reads: median/p90/max 4096.0/73728.0/180224, nonzero 228
+    new field view_journal_searches: median/p90/max 10792.0/208469.0/417629, nonzero 228
+    new field view_journal_skips: median/p90/max 0.0/0.0/0, nonzero 0
+    new field whole_take_noted: {'true': 449}
+    engine own-import total_ms per block median/p90/max 42/63/218 (n=449)
+    layer RSS 32.9 -> 40.8 G (max 40.8), in-memory blocks max 11
+    execution layer cores busy 33.2    validators cores busy 1.1
+  round total (3 windows, canonical): 275.4M tx
+  layer peak RSS 40.8 G; in-memory blocks max 11
+  fields at seal: mode "early", verified 0, unchecked 0, mismatches 0 (last build line, cumulative)
+  own_executed_again (built here and also directly imported): 0 of 1426 built blocks
+== loop346A2
+  layer-0 leader window-1 builds 469: txs mean 200000, share >= 95% of the tier 100% (max 200000); sealed_at_ms 42.0/77.0; par_ms 51.0/90.0; par_exec_ms 21.0/29.0; roots_ms 27.0/42.0; parent_fields_ms 0.0/0.0; sealed_ms 1.0/1.0
+  proposal cycle window 1 (n=484): mean 64.0 median 61.4 p90 70.4 ms; blocks in the 30 s: 484
+  binding wait (tick / quorum / seal, share and mean cycle): tick 97.9% (63.5); quorum 1.1% (110.9); seal 1.1% (72.5)
+  vote delay after the proposal, slowest key per block: median 9.8 p90 58.5 ms (slowest minus the median key: median 0.2); last key: {1: 97, 2: 81, 3: 102, 4: 70, 5: 59, 6: 59} of 468 blocks
+  CPU in window 1 (cores busy): execution layers 34.4 over 1 process(es); validators 1.2 over 7 process(es)
+  execution layer peak RSS 40.8 G; in-memory blocks max 11 (node0 and others, all layers)
+  blocks built here 1426; none also directly imported
+  import-once counters at the last direct import: ; start-up lines with import_once=true: 1; queue-lock lines 0
+  layer-0 queue (queued after canonical prune), median per 10 s: t+0:2496750 t+20:2469500 t+40:2455000 t+60:2503000 t+80:2465000
+  flood: median per 5 s 3099817/s, final -
+  timeout / given-up lines: 1; 23:41:46 v0 INFO process_event{view=1 kind="message"}: n42::cl::timeout: TC formed
+loop346A2 page_faults_per_s_median: node0=176272 
+== read-back check of loop346A2 (layer still up) from 19:44:57
+log: 1 lines match heal|inconsisten|unwind|corrupt|NippyJar|mismatch; the normal start-up line "Healing static file inconsistencies." x1 (at log line [11]); others: 0
+blocks checked: [460, 1172, 1885] transaction counts from the log: [200000, 200000, 114000]
+block 460: 200000 txs (log 200000), 200000 receipts, status ok 200000, cumulative gas rising: True, ends at 4,200,000,000 = block 462 header gasUsed 4,200,000,000: True, receipt hashes equal the block hash list in order: True
+   tx 0: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 50000: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 100000: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 150000: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 199999: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+block 1172: 200000 txs (log 200000), 200000 receipts, status ok 200000, cumulative gas rising: True, ends at 4,200,000,000 = block 1174 header gasUsed 4,200,000,000: True, receipt hashes equal the block hash list in order: True
+   tx 0: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 50000: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 100000: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 150000: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 199999: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+block 1885: 114000 txs (log 114000), 114000 receipts, status ok 114000, cumulative gas rising: True, ends at 2,394,000,000 = block 1887 header gasUsed 2,394,000,000: True, receipt hashes equal the block hash list in order: True
+   tx 0: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 28500: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 57000: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 85500: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+   tx 113999: hash recomputed ok (= the block hash list entry), Ed25519 signature verifies, from = keccak(alg||pubkey)[12:]
+RESULT ok
+== settlement tags of loop346A2
+  19:45:02 latest (3103, '0x47c8a10e13'), safe (3103, '0x47c8a10e13'), finalized (3103, '0x47c8a10e13'); latest-safe 0, latest-finalized 0
+  19:45:04 latest (3136, '0xd85fc66aa3'), safe (3136, '0xd85fc66aa3'), finalized (3136, '0xd85fc66aa3'); latest-safe 0, latest-finalized 0
+  19:45:06 latest (3168, '0xf67672b8f0'), safe (3168, '0xf67672b8f0'), finalized (3168, '0xf67672b8f0'); latest-safe 0, latest-finalized 0
+  19:45:08 latest (3201, '0x6d311ba5ac'), safe (3201, '0x6d311ba5ac'), finalized (3201, '0x6d311ba5ac'); latest-safe 0, latest-finalized 0
+  settlement / forkchoice error lines (-3800x, refused, unknown ancestor, ParentUnknown): 2076
+     ('node0', '2026-10-07T23:42:15.358413Z  INFO n42.h2.el: commit forkchoice block=0x828ac28cdf1d47b6474ad63a1684bd48caf0e9866b94914344c74d624e3714ab elapsed_ms=71 ahead_of_import=false outcome=error: execution lay')
+     ('node0', '2026-10-07T23:42:15.358416Z  WARN n42.h2.el: forkchoice to a committed block failed block=0x828ac28cdf1d47b6474ad63a1684bd48caf0e9866b94914344c74d624e3714ab error=execution layer: Too deep reorg (code')
+     ('node0', '2026-10-07T23:42:15.777139Z  INFO n42.h2.el: commit forkchoice block=0xb83cd88521f1c671ab1017b61a48a6cd8ba301b9fb7e163985266b0db6b0ff3f elapsed_ms=43 ahead_of_import=false outcome=error: execution lay')
+     ('node0', '2026-10-07T23:42:15.777157Z  WARN n42.h2.el: forkchoice to a committed block failed block=0xb83cd88521f1c671ab1017b61a48a6cd8ba301b9fb7e163985266b0db6b0ff3f error=execution layer: Too deep reorg (code')
+     ('node0', '2026-10-07T23:42:17.730363Z  INFO n42.h2.el: commit forkchoice block=0x4601add31a28e80029680ce47ba8c43440f84b35c1dc0fe4dd7d842beb6e6cb1 elapsed_ms=76 ahead_of_import=false outcome=error: execution lay')
+     ('node0', '2026-10-07T23:42:17.730370Z  WARN n42.h2.el: forkchoice to a committed block failed block=0x4601add31a28e80029680ce47ba8c43440f84b35c1dc0fe4dd7d842beb6e6cb1 error=execution layer: Too deep reorg (code')
+RESULT BAD: error lines
+== read-back check done 19:45:11
+READ-BACK CHECK FAILED on loop346A2: stopping the round (datadirs kept as evidence)
+released at 19:45
+ALLDONE

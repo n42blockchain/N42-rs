@@ -16,12 +16,14 @@ bytes.workspace = true
 reth-transaction-pool.workspace = true
 libc.workspace = true
 n42-tx-queue.workspace = true
+n42-core-layout.workspace = true
 n42-tx-types.workspace = true
 reth-primitives-traits.workspace = true
 reth-evm.workspace = true
 alloy-primitives.workspace = true
 alloy-eips.workspace = true
-tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "time"] }
+parking_lot.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

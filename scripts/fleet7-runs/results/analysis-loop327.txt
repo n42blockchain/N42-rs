@@ -1,0 +1,144 @@
+== loop327N
+  node1: window-1 direct imports 238; status {'Valid': 1303}
+    handoff_wait_us median/p90 18399.0/84145.0; handoff_before_canonical {'false': 238}; parent_engine_wait_ms median/p90 18.0/84.0, nonzero 125, exact multiples of 20 60, distribution {0: 121, 20: 28, 40: 22, 60: 38, 80: 27, 100: 2}
+    merge (ms, median/p90): merge_ms 71.5/89.0; merge_wait_ms 61.0/83.0; merge_state_ms 45.5/60.0; merge_reverts_ms 13.0/32.0; merge_append_ms 2.0/9.0; mode Counter({'on_path': 256}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 213.6/255.5 ms (n=240)
+  node2: window-1 direct imports 239; status {'Valid': 2046}
+    handoff_wait_us median/p90 33.0/40206.0; handoff_before_canonical {'false': 239}; parent_engine_wait_ms median/p90 0.0/40.0, nonzero 47, exact multiples of 20 36, distribution {0: 193, 20: 19, 40: 15, 60: 8, 80: 4}
+    merge (ms, median/p90): merge_ms 57.0/76.0; merge_wait_ms 42.0/60.0; merge_state_ms 40.0/50.0; merge_reverts_ms 11.0/24.0; merge_append_ms 2.0/9.0; mode Counter({'on_path': 256}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 148.1/210.4 ms (n=241)
+  watch: Sidechain block not found 0; invalid block 0; TC formed 1; Too deep reorg 4
+== loop327H
+  node1: window-1 direct imports 243; status {'Valid': 1283}
+    handoff_wait_us median/p90 36.0/19468.0; handoff_before_canonical {'false': 164, 'true': 79}; parent_engine_wait_ms median/p90 0.0/19.0, nonzero 30, exact multiples of 20 0, distribution {0: 220, 20: 21, 40: 2}
+    merge (ms, median/p90): merge_ms 65.0/85.0; merge_wait_ms 53.0/74.0; merge_state_ms 43.0/54.0; merge_reverts_ms 14.0/31.0; merge_append_ms 2.0/9.0; mode Counter({'on_path': 256}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 175.8/229.4 ms (n=244)
+  node2: window-1 direct imports 242; status {'Valid': 2046}
+    handoff_wait_us median/p90 32.0/66.0; handoff_before_canonical {'false': 171, 'true': 71}; parent_engine_wait_ms median/p90 0.0/0.0, nonzero 15, exact multiples of 20 0, distribution {0: 230, 20: 8, 40: 3, 60: 1}
+    merge (ms, median/p90): merge_ms 62.5/82.0; merge_wait_ms 51.0/72.0; merge_state_ms 42.0/56.0; merge_reverts_ms 14.0/28.0; merge_append_ms 3.0/11.0; mode Counter({'on_path': 256}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 166.0/210.6 ms (n=244)
+  watch: Sidechain block not found 0; invalid block 0; TC formed 1; Too deep reorg 6
+== loop327HMV
+  node1: window-1 direct imports 205; status {'Valid': 1023}
+    handoff_wait_us median/p90 28.0/47.0; handoff_before_canonical {'false': 186, 'true': 19}; parent_engine_wait_ms median/p90 0.0/0.0, nonzero 10, exact multiples of 20 2, distribution {0: 197, 20: 6, 40: 2}
+    merge (ms, median/p90): merge_ms 43.0/56.0; merge_wait_ms 154.0/168.0; merge_state_ms 39.0/48.0; merge_reverts_ms 15.0/20.0; merge_append_ms 3.0/6.0; mode Counter({'verify': 219}); at the end of the leg merge_verified 1013.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 254.9/294.1 ms (n=207)
+  node2: window-1 direct imports 205; status {'Valid': 1957}
+    handoff_wait_us median/p90 28.0/47.0; handoff_before_canonical {'false': 185, 'true': 20}; parent_engine_wait_ms median/p90 0.0/0.0, nonzero 11, exact multiples of 20 0, distribution {0: 201, 20: 2, 40: 2}
+    merge (ms, median/p90): merge_ms 43.0/55.0; merge_wait_ms 152.0/172.0; merge_state_ms 38.0/48.0; merge_reverts_ms 14.0/20.0; merge_append_ms 4.0/6.0; mode Counter({'verify': 219}); at the end of the leg merge_verified 1947.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 252.2/294.4 ms (n=207)
+  watch: Sidechain block not found 0; invalid block 0; TC formed 1; Too deep reorg 0
+== loop327HM
+  node1: window-1 direct imports 246; status {'Valid': 1270}
+    handoff_wait_us median/p90 34.0/63.0; handoff_before_canonical {'false': 164, 'true': 82}; parent_engine_wait_ms median/p90 0.0/0.0, nonzero 15, exact multiples of 20 2, distribution {0: 236, 20: 8, 40: 2}
+    merge (ms, median/p90): merge_ms 51.0/68.0; merge_wait_ms 36.0/57.0; merge_state_ms 45.0/57.0; merge_reverts_ms 16.0/25.0; merge_append_ms 4.0/12.0; mode Counter({'concurrent': 259}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 160.5/206.4 ms (n=246)
+  node2: window-1 direct imports 245; status {'Valid': 2046}
+    handoff_wait_us median/p90 32.0/52.0; handoff_before_canonical {'false': 209, 'true': 36}; parent_engine_wait_ms median/p90 0.0/0.0, nonzero 5, exact multiples of 20 0, distribution {0: 245}
+    merge (ms, median/p90): merge_ms 49.0/62.0; merge_wait_ms 31.0/46.0; merge_state_ms 43.0/53.0; merge_reverts_ms 16.0/23.0; merge_append_ms 4.0/10.0; mode Counter({'concurrent': 259}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 140.4/173.7 ms (n=246)
+  watch: Sidechain block not found 0; invalid block 0; TC formed 1; Too deep reorg 4
+== loop327Nb
+  node1: window-1 direct imports 241; status {'Valid': 1258}
+    handoff_wait_us median/p90 66.0/68799.0; handoff_before_canonical {'false': 241}; parent_engine_wait_ms median/p90 0.0/68.0, nonzero 115, exact multiples of 20 76, distribution {0: 131, 20: 37, 40: 25, 60: 34, 80: 12, 100: 2}
+    merge (ms, median/p90): merge_ms 63.0/87.0; merge_wait_ms 54.0/78.0; merge_state_ms 44.0/54.0; merge_reverts_ms 14.0/29.0; merge_append_ms 2.0/8.0; mode Counter({'on_path': 255}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 190.2/248.8 ms (n=242)
+  node2: window-1 direct imports 240; status {'Valid': 2046}
+    handoff_wait_us median/p90 33.0/40230.0; handoff_before_canonical {'false': 240}; parent_engine_wait_ms median/p90 0.0/40.0, nonzero 50, exact multiples of 20 42, distribution {0: 192, 20: 21, 40: 11, 60: 12, 80: 4}
+    merge (ms, median/p90): merge_ms 60.0/81.0; merge_wait_ms 47.0/68.0; merge_state_ms 43.0/51.0; merge_reverts_ms 12.0/27.0; merge_append_ms 2.0/9.0; mode Counter({'on_path': 255}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 155.2/208.1 ms (n=242)
+  watch: Sidechain block not found 0; invalid block 0; TC formed 1; Too deep reorg 2
+== loop327HMb
+  node1: window-1 direct imports 243; status {'Valid': 1257}
+    handoff_wait_us median/p90 35.0/96.0; handoff_before_canonical {'false': 171, 'true': 72}; parent_engine_wait_ms median/p90 0.0/0.0, nonzero 21, exact multiples of 20 1, distribution {0: 229, 20: 8, 40: 6}
+    merge (ms, median/p90): merge_ms 57.0/76.0; merge_wait_ms 43.0/64.0; merge_state_ms 48.0/61.0; merge_reverts_ms 17.0/24.0; merge_append_ms 7.0/17.0; mode Counter({'concurrent': 260}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 164.8/216.2 ms (n=245)
+  node2: window-1 direct imports 243; status {'Valid': 2046}
+    handoff_wait_us median/p90 33.0/57.0; handoff_before_canonical {'false': 203, 'true': 40}; parent_engine_wait_ms median/p90 0.0/0.0, nonzero 8, exact multiples of 20 0, distribution {0: 240, 20: 2, 40: 1}
+    merge (ms, median/p90): merge_ms 50.0/64.0; merge_wait_ms 33.0/47.0; merge_state_ms 44.0/54.0; merge_reverts_ms 17.0/24.0; merge_append_ms 4.0/11.0; mode Counter({'concurrent': 260}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 145.9/183.6 ms (n=245)
+  watch: Sidechain block not found 0; invalid block 0; TC formed 1; Too deep reorg 4
+-- binding wait per block (bench-loop327N); cycle mean 114.9
+   tick     48.1% of blocks, mean cycle  105.7, median  101.6
+   quorum   35.1% of blocks, mean cycle  124.5, median  122.7
+   seal     16.7% of blocks, mean cycle  121.0, median  116.7
+   last voter of the previous block: {2: 19, 1: 220}
+   last voter, receipt to Qc (ms, median / mean / p90):
+     receipt            -0.5   -1.5    1.6
+     wait_for_engine    44.4   45.2   90.3
+     assemble_check     33.1   35.7   45.7
+     transit             5.7    8.0   16.1
+     qc_minus_p         90.4   87.3  131.4
+   assembly start minus the voter's engine landing of block n-2: min 9.2 p10 20.7 median 32.7 p90 93.5 ms (never negative: 0 of 239 below 0)
+   quorum path by binding class (mean ms): tick: wait_for_engine 32, Qc-P 74; seal: wait_for_engine 16, Qc-P 55; quorum: wait_for_engine 77, Qc-P 121
+   node1: engine landing minus body arrival median 246 p90 291; parent_engine_wait_ms median 20; fields_ready median 82
+-- binding wait per block (bench-loop327H); cycle mean 113.1
+   tick     50.0% of blocks, mean cycle  103.2, median  101.6
+   seal     38.0% of blocks, mean cycle  122.7, median  118.4
+   quorum   12.0% of blocks, mean cycle  124.5, median  120.3
+   last voter of the previous block: {2: 104, 1: 138}
+   last voter, receipt to Qc (ms, median / mean / p90):
+     receipt            -0.7   -2.6   -0.3
+     wait_for_engine    13.8   21.7   60.5
+     assemble_check     38.1   40.4   60.2
+     transit             5.5    7.6   12.8
+     qc_minus_p         62.4   67.2  113.2
+   assembly start minus the voter's engine landing of block n-2: min 10.6 p10 27.3 median 61.1 p90 117.7 ms (never negative: 0 of 242 below 0)
+   quorum path by binding class (mean ms): tick: wait_for_engine 17, Qc-P 61; seal: wait_for_engine 16, Qc-P 58; quorum: wait_for_engine 60, Qc-P 121
+   node1: engine landing minus body arrival median 166 p90 233; parent_engine_wait_ms median 0; fields_ready median 86
+-- binding wait per block (bench-loop327HM); cycle mean 112.1
+   seal     59.0% of blocks, mean cycle  117.0, median  115.5
+   tick     36.5% of blocks, mean cycle  103.6, median  101.7
+   quorum    4.5% of blocks, mean cycle  117.0, median  118.3
+   last voter of the previous block: {2: 108, 1: 136}
+   last voter, receipt to Qc (ms, median / mean / p90):
+     receipt            -0.7   -4.0   -0.4
+     wait_for_engine     4.6   12.4   39.9
+     assemble_check     38.0   40.9   56.4
+     transit             5.8    8.5   19.3
+     qc_minus_p         53.0   57.9   92.7
+   assembly start minus the voter's engine landing of block n-2: min 11.5 p10 35.7 median 100.3 p90 137.0 ms (never negative: 0 of 244 below 0)
+   quorum path by binding class (mean ms): tick: wait_for_engine 14, Qc-P 59; seal: wait_for_engine 8, Qc-P 53; quorum: wait_for_engine 54, Qc-P 114
+   node1: engine landing minus body arrival median 133 p90 211; parent_engine_wait_ms median 0; fields_ready median 86
+-- binding wait per block (bench-loop327Nb); cycle mean 114.1
+   tick     47.5% of blocks, mean cycle  105.3, median  101.5
+   seal     29.6% of blocks, mean cycle  120.2, median  116.8
+   quorum   22.9% of blocks, mean cycle  124.3, median  122.4
+   last voter of the previous block: {1: 193, 2: 47}
+   last voter, receipt to Qc (ms, median / mean / p90):
+     receipt            -0.6   -1.1    1.6
+     wait_for_engine    34.1   36.6   85.1
+     assemble_check     33.5   35.4   48.9
+     transit             5.6    7.3   12.9
+     qc_minus_p         80.4   78.1  124.1
+   assembly start minus the voter's engine landing of block n-2: min 12.1 p10 23.5 median 41.6 p90 110.4 ms (never negative: 0 of 240 below 0)
+   quorum path by binding class (mean ms): tick: wait_for_engine 32, Qc-P 73; seal: wait_for_engine 13, Qc-P 53; quorum: wait_for_engine 78, Qc-P 121
+   node1: engine landing minus body arrival median 220 p90 278; parent_engine_wait_ms median 0; fields_ready median 83
+-- binding wait per block (bench-loop327HMb); cycle mean 112.5
+   seal     51.6% of blocks, mean cycle  120.3, median  115.2
+   tick     45.1% of blocks, mean cycle  102.5, median  101.7
+   quorum    3.3% of blocks, mean cycle  128.3, median  123.5
+   last voter of the previous block: {2: 102, 1: 142}
+   last voter, receipt to Qc (ms, median / mean / p90):
+     receipt            -0.7   -2.7   -0.5
+     wait_for_engine     4.5   13.2   37.7
+     assemble_check     37.1   38.8   51.7
+     transit             5.6    7.2   12.8
+     qc_minus_p         52.2   56.5   86.3
+   assembly start minus the voter's engine landing of block n-2: min 0.9 p10 34.6 median 87.3 p90 131.5 ms (never negative: 0 of 244 below 0)
+   quorum path by binding class (mean ms): tick: wait_for_engine 13, Qc-P 56; seal: wait_for_engine 10, Qc-P 53; quorum: wait_for_engine 65, Qc-P 124
+   node1: engine landing minus body arrival median 143 p90 214; parent_engine_wait_ms median 0; fields_ready median 86
+-- binding wait per block (bench-loop327HMV); cycle mean 133.6
+   quorum   78.0% of blocks, mean cycle  139.7, median  138.4
+   tick     22.0% of blocks, mean cycle  112.0, median  101.8
+   last voter of the previous block: {2: 51, 1: 154}
+   last voter, receipt to Qc (ms, median / mean / p90):
+     receipt            -0.2    0.7    2.9
+     wait_for_engine    90.7   90.5  122.8
+     assemble_check     28.6   29.8   38.2
+     transit             5.0    7.0   14.7
+     qc_minus_p        128.7  128.1  161.1
+   assembly start minus the voter's engine landing of block n-2: min 14.1 p10 19.5 median 26.8 p90 40.5 ms (never negative: 0 of 205 below 0)
+   quorum path by binding class (mean ms): tick: wait_for_engine 60, Qc-P 96; quorum: wait_for_engine 99, Qc-P 137
+   node1: engine landing minus body arrival median 324 p90 358; parent_engine_wait_ms median 0; fields_ready median 76
+   node2: engine landing minus body arrival median 287 p90 341; parent_engine_wait_ms median 0; fields_ready median 73

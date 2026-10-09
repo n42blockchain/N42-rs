@@ -115,6 +115,166 @@ pub fn output_index_live() -> bool {
     *ON.get_or_init(|| std::env::var("N42_OUTPUT_INDEX_LIVE").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `N42_LIVE_INDEX_DEFER=1` (live index only): a batch whose hand-over finds
+/// a shard's index lock busy twice (the rotated pass and one more) does not
+/// wait for it: the shard is left to the freeze, which enters the batch's
+/// addresses there under the same rules. loop341 measured the waits this
+/// removes: the hand-over (`shard_append_ms`) was 251 ms of pool time a block
+/// against 227 ms of the batches' time off the CPU (r = 0.99 over 1,453
+/// blocks; 541 / 520 ms with 48 threads), ~4 blocking lock calls a batch.
+/// The same index, conflicts and kept reverts come out (the batches' order
+/// at a shard is as arbitrary as before). Off by default. Read once.
+pub fn live_index_defer() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_LIVE_INDEX_DEFER").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `N42_MERGE_AT_SHARDS_READY=1` (off by default,
+/// `docs/SHARED_EXECUTION_SCOPE.md` 18.7 item 3): the leader's shard merge
+/// starts the moment the shards are filed (`shards_ready`, seal + ~18 ms at
+/// 200k) on a pool of its own ([`merge_pool`]), parallel by source map
+/// ([`FrozenShards::merged_on`]), instead of after the block's fields are
+/// published (seal + ~54 ms) on one thread. The merged bundle is the same
+/// bundle, built in the same insertion order; `StateReady` and `Complete`
+/// stay where they are in the finish's order (after the fields'
+/// publication), so they no longer wait for a merge. Read once.
+pub fn merge_at_shards_ready() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_MERGE_AT_SHARDS_READY").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `N42_SHARDS_BEFORE_RECEIPTS=1` (off by default,
+/// `docs/SHARED_EXECUTION_SCOPE.md` 18.7 item 4a): on a block that seals at
+/// the execution's end with its output left in its shards, the receipts from
+/// the slots are built on a thread that owns their inputs instead of in the
+/// graft's scope, so the scope ends with the freeze and the cached accounts'
+/// take, the executor's finish follows, and the shards are filed
+/// (`shards_ready`) without waiting for the receipts. The receipts join the
+/// block's result where they are first read (the receipts root, beside the
+/// QMDB root). The child's open reads the shards and the residual only.
+/// Read once.
+pub fn shards_before_receipts() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_SHARDS_BEFORE_RECEIPTS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The early merge's pool (`n42-merge-*`, `N42_MERGE_POOL_THREADS`, 16 by
+/// default): not the build pool (the child's execution runs there while the
+/// parent merges) and not the freeze's. `None` when no pool could be made;
+/// the merge then runs on one thread as before.
+pub fn merge_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("N42_MERGE_POOL_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|n: &usize| *n > 0)
+            .unwrap_or(16);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("n42-merge-{i}"))
+            .start_handler(|_| n42_core_layout::background_thread())
+            .build()
+            .inspect_err(|err| tracing::warn!(target: "payload_builder", %err, "no pool for the early merge; it runs on one thread"))
+            .ok()
+    })
+    .as_ref()
+}
+
+/// How a live hand-over treats a busy shard: wait for it (the default),
+/// leave it to the freeze (`N42_LIVE_INDEX_DEFER=1`), or, for tests, leave
+/// every other shard to the freeze whatever its lock says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveDefer {
+    Wait,
+    Busy,
+    Forced,
+}
+
+/// One thread's live-index hand-over counters, cumulative (see
+/// [`LiveLockCounts`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LiveLockCounts {
+    /// Shard locks the hand-over blocked on (the try passes found them busy).
+    pub waits: u64,
+    /// Nanoseconds blocked on them.
+    pub wait_ns: u64,
+    /// Nanoseconds the thread held shard locks entering addresses.
+    pub hold_ns: u64,
+    /// Shards left to the freeze (`N42_LIVE_INDEX_DEFER=1`).
+    pub deferred: u64,
+}
+
+impl LiveLockCounts {
+    /// The calling thread's counts now.
+    pub fn now() -> Self {
+        LIVE_LOCKS.try_with(std::cell::Cell::get).unwrap_or_default()
+    }
+
+    /// The counts between `earlier` and `self`.
+    pub const fn since(self, earlier: Self) -> Self {
+        Self {
+            waits: self.waits.saturating_sub(earlier.waits),
+            wait_ns: self.wait_ns.saturating_sub(earlier.wait_ns),
+            hold_ns: self.hold_ns.saturating_sub(earlier.hold_ns),
+            deferred: self.deferred.saturating_sub(earlier.deferred),
+        }
+    }
+
+    fn add(f: impl FnOnce(&mut Self)) {
+        let _ = LIVE_LOCKS.try_with(|cell| {
+            let mut counts = cell.get();
+            f(&mut counts);
+            cell.set(counts);
+        });
+    }
+}
+
+std::thread_local! {
+    static LIVE_LOCKS: std::cell::Cell<LiveLockCounts> = const {
+        std::cell::Cell::new(LiveLockCounts { waits: 0, wait_ns: 0, hold_ns: 0, deferred: 0 })
+    };
+}
+
+/// One batch's addresses and kept reverts of one shard entered into that
+/// shard's index part: `StagedGraft::add`'s rules as the frozen index build
+/// applies them, the conflicting accounts' sums left to the freeze (their
+/// order is the order of `drops`).
+fn enter_part(
+    part: &mut IndexPart,
+    id: u16,
+    accounts: &AddressHashMap<BundleAccount>,
+    reverts: &[(Address, AccountRevert)],
+    addresses: &[Address],
+    revert_at: &[u32],
+) {
+    let mut repeated: AddressHashSet = Default::default();
+    for address in addresses {
+        match part.index.entry(*address) {
+            alloy_primitives::map::hash_map::Entry::Vacant(slot) => {
+                slot.insert(id);
+            }
+            alloy_primitives::map::hash_map::Entry::Occupied(mut held) => {
+                let Some(account) = accounts.get(address) else { continue };
+                repeated.insert(*address);
+                part.size_less += account.size_hint();
+                let first = *held.get();
+                if first != CONFLICT {
+                    part.drops.push((first, *address));
+                    held.insert(CONFLICT);
+                }
+                part.drops.push((id, *address));
+            }
+        }
+    }
+    for &pos in revert_at {
+        let Some((address, _)) = reverts.get(pos as usize) else { continue };
+        if repeated.is_empty() || !repeated.contains(address) {
+            part.kept.push((id, pos));
+        }
+    }
+}
+
 /// The index's mark for an account several batches wrote: it is read from
 /// the shard's conflicts map, not from a batch's.
 const CONFLICT: u16 = u16::MAX;
@@ -233,6 +393,9 @@ struct BatchOut {
     /// Live index mode: the number the batch's index entries carry (its
     /// position in the frozen output), `usize::MAX` when not entered.
     live_id: usize,
+    /// Live index mode: the shards this batch left to the freeze
+    /// (`N42_LIVE_INDEX_DEFER=1`), empty when it entered every one.
+    deferred: Vec<u16>,
 }
 
 /// One batch's map and reverts kept as the block's output (index mode).
@@ -343,6 +506,13 @@ pub struct OutputShards {
     live: Option<Vec<Mutex<IndexPart>>>,
     /// The next live batch number.
     live_next: std::sync::atomic::AtomicUsize,
+    /// What a busy shard lock does to a live hand-over.
+    live_defer: LiveDefer,
+    /// How many tasks a heavy shard's freeze work is split over
+    /// ([`freeze_split`]); 1 keeps one task a shard.
+    freeze_split: usize,
+    /// Tests: split every shard with any work, heavy or not.
+    freeze_split_all: bool,
 }
 
 impl OutputShards {
@@ -386,7 +556,31 @@ impl OutputShards {
             index,
             live,
             live_next: std::sync::atomic::AtomicUsize::new(0),
+            live_defer: if live_index_defer() { LiveDefer::Busy } else { LiveDefer::Wait },
+            freeze_split: freeze_split(),
+            freeze_split_all: false,
         }
+    }
+
+    /// Tests: the heavy shard's split ([`freeze_split`]), whatever the
+    /// environment says; 1 keeps one task a shard. With `all`, every shard
+    /// with any work is split, heavy or not.
+    #[doc(hidden)]
+    pub fn set_freeze_split(&mut self, tasks: usize, all: bool) {
+        self.freeze_split = tasks.clamp(1, MAX_FREEZE_SPLIT);
+        self.freeze_split_all = all;
+    }
+
+    /// Tests: whether a live hand-over leaves busy shards to the freeze
+    /// (`N42_LIVE_INDEX_DEFER=1`'s rule), whatever the environment says; with
+    /// `forced`, every other shard of every batch is left to it, busy or not.
+    #[doc(hidden)]
+    pub fn set_live_defer(&mut self, on: bool, forced: bool) {
+        self.live_defer = match (on, forced) {
+            (_, true) => LiveDefer::Forced,
+            (true, false) => LiveDefer::Busy,
+            (false, false) => LiveDefer::Wait,
+        };
     }
 
     /// The live index's inserts for one batch (see [`output_index_live`]):
@@ -395,6 +589,11 @@ impl OutputShards {
     /// passed over while another is free. `StagedGraft::add`'s rules as the
     /// frozen index build applies them, the conflicting accounts' sums left
     /// to the freeze (their order is the order of `drops`).
+    ///
+    /// Returns the shards left to the freeze (`defer` other than
+    /// [`LiveDefer::Wait`]); the thread's [`LiveLockCounts`] take the waits,
+    /// the time held and the shards left.
+    #[allow(clippy::too_many_arguments)]
     fn enter_live(
         live: &[Mutex<IndexPart>],
         id: u16,
@@ -402,47 +601,62 @@ impl OutputShards {
         reverts: &[(Address, AccountRevert)],
         addresses: &[Vec<Address>],
         revert_at: &[Vec<u32>],
-    ) {
+        defer: LiveDefer,
+    ) -> Vec<u16> {
         let count = live.len();
-        let enter = |part: &mut IndexPart, shard: usize| {
-            let mut repeated: AddressHashSet = Default::default();
-            for address in addresses.get(shard).map_or(&[][..], Vec::as_slice) {
-                match part.index.entry(*address) {
-                    alloy_primitives::map::hash_map::Entry::Vacant(slot) => {
-                        slot.insert(id);
-                    }
-                    alloy_primitives::map::hash_map::Entry::Occupied(mut held) => {
-                        let Some(account) = accounts.get(address) else { continue };
-                        repeated.insert(*address);
-                        part.size_less += account.size_hint();
-                        let first = *held.get();
-                        if first != CONFLICT {
-                            part.drops.push((first, *address));
-                            held.insert(CONFLICT);
-                        }
-                        part.drops.push((id, *address));
-                    }
-                }
-            }
-            for &pos in revert_at.get(shard).map_or(&[][..], Vec::as_slice) {
-                let Some((address, _)) = reverts.get(pos as usize) else { continue };
-                if repeated.is_empty() || !repeated.contains(address) {
-                    part.kept.push((id, pos));
-                }
-            }
+        let mut hold_ns = 0u64;
+        let mut enter = |part: &mut IndexPart, shard: usize| {
+            let at = std::time::Instant::now();
+            enter_part(
+                part,
+                id,
+                accounts,
+                reverts,
+                addresses.get(shard).map_or(&[][..], Vec::as_slice),
+                revert_at.get(shard).map_or(&[][..], Vec::as_slice),
+            );
+            hold_ns += at.elapsed().as_nanos() as u64;
         };
         let mut left: Vec<usize> = Vec::new();
+        let mut deferred: Vec<u16> = Vec::new();
         for k in 0..count {
             let shard = (id as usize + k) % count;
+            if defer == LiveDefer::Forced && (id as usize + shard) % 2 == 1 {
+                deferred.push(shard as u16);
+                continue;
+            }
             match live[shard].try_lock() {
                 Ok(mut part) => enter(&mut part, shard),
                 Err(std::sync::TryLockError::Poisoned(poisoned)) => enter(&mut poisoned.into_inner(), shard),
                 Err(std::sync::TryLockError::WouldBlock) => left.push(shard),
             }
         }
+        let (mut waits, mut wait_ns) = (0u64, 0u64);
         for shard in left {
-            enter(&mut live[shard].lock().unwrap_or_else(PoisonError::into_inner), shard);
+            if defer != LiveDefer::Wait {
+                // One more try: the pass above took a while; a shard still
+                // busy now is the freeze's.
+                match live[shard].try_lock() {
+                    Ok(mut part) => enter(&mut part, shard),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => enter(&mut poisoned.into_inner(), shard),
+                    Err(std::sync::TryLockError::WouldBlock) => deferred.push(shard as u16),
+                }
+                continue;
+            }
+            let at = std::time::Instant::now();
+            let mut part = live[shard].lock().unwrap_or_else(PoisonError::into_inner);
+            waits += 1;
+            wait_ns += at.elapsed().as_nanos() as u64;
+            enter(&mut part, shard);
         }
+        let shards_left = deferred.len() as u64;
+        LiveLockCounts::add(|counts| {
+            counts.waits += waits;
+            counts.wait_ns += wait_ns;
+            counts.hold_ns += hold_ns;
+            counts.deferred += shards_left;
+        });
+        deferred
     }
 
     /// One batch's bundle handed over whole, on the batch's thread, with its
@@ -507,14 +721,16 @@ impl OutputShards {
         // more batches than an index entry can name is frozen the ordinary
         // way (every batch's lists are kept either way).
         let mut live_id = usize::MAX;
+        let mut deferred = Vec::new();
         if let Some(live) = self.live.as_deref() {
             let id = self.live_next.fetch_add(1, Ordering::Relaxed);
             if id < CONFLICT as usize {
                 live_id = id;
-                Self::enter_live(live, id as u16, &accounts, &reverts, &addresses, &revert_at);
+                deferred =
+                    Self::enter_live(live, id as u16, &accounts, &reverts, &addresses, &revert_at, self.live_defer);
             }
         }
-        let out = BatchOut { accounts, reverts, addresses, revert_at, size, beneficiary_delta, live_id };
+        let out = BatchOut { accounts, reverts, addresses, revert_at, size, beneficiary_delta, live_id, deferred };
         self.batches.lock().unwrap_or_else(PoisonError::into_inner).push(out);
         self.append_ns.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
@@ -527,6 +743,14 @@ impl OutputShards {
     /// of their reverts is the same parent value. The batches' maps are
     /// freed on the pool afterwards, off the caller's path.
     pub fn freeze(self) -> FrozenShards {
+        self.freeze_on(crate::parallel_transfer::behind_pool())
+    }
+
+    /// [`Self::freeze`] with its tasks and its frees on `pool`: the build
+    /// pool by default, a pool of its own with `N42_FREEZE_POOL=own`
+    /// ([`crate::parallel_transfer::behind_pool`]). The pool decides only
+    /// where the tasks run; the frozen shards are the same.
+    pub fn freeze_on(self, pool: &rayon::ThreadPool) -> FrozenShards {
         let at = std::time::Instant::now();
         let beneficiary = self.beneficiary;
         let count = self.count;
@@ -539,9 +763,10 @@ impl OutputShards {
             let entered = batches.iter().enumerate().all(|(i, batch)| batch.live_id == i);
             if let (Some(live), true) = (self.live, entered) {
                 let parts = live.into_iter().map(|part| part.into_inner().unwrap_or_else(PoisonError::into_inner)).collect();
-                return freeze_live(at, beneficiary, count, batches, contracts, self.append_ns.into_inner(), parts);
+                let split = (self.freeze_split, self.freeze_split_all);
+                return freeze_live(pool, at, beneficiary, count, batches, contracts, self.append_ns.into_inner(), parts, split);
             }
-            return freeze_indexed(at, beneficiary, count, batches, contracts, self.append_ns.into_inner());
+            return freeze_indexed(pool, at, beneficiary, count, batches, contracts, self.append_ns.into_inner());
         }
         let transposed = std::time::Instant::now();
         let batches_ref = &batches;
@@ -565,12 +790,12 @@ impl OutputShards {
         };
         let folded: Vec<(Shard, TaskCost)> = {
             use rayon::prelude::*;
-            crate::parallel_transfer::build_pool().install(|| (0..count).into_par_iter().map(fold).collect())
+            pool.install(|| (0..count).into_par_iter().map(fold).collect())
         };
         let done = std::time::Instant::now();
         // Freed on the pool, a job a batch, off the caller's path.
         for batch in batches {
-            crate::parallel_transfer::build_pool().spawn(move || drop(batch));
+            pool.spawn(move || drop(batch));
         }
         let split = fold_split(folded.iter().map(|(_, cost)| cost), at, transposed, done);
         let shards: Vec<Shard> = folded.into_iter().map(|(shard, _)| shard).collect();
@@ -585,6 +810,35 @@ impl OutputShards {
             fold_ns,
             index_build_ns: 0,
             split,
+        }
+    }
+}
+
+/// A freeze running on a thread of its own ([`OutputShards::freeze_on_thread`]):
+/// the frozen shards, the freeze's own wall, and the moment it ended.
+pub type FreezeHandle = std::thread::JoinHandle<(FrozenShards, std::time::Duration, std::time::Instant)>;
+
+impl OutputShards {
+    /// [`Self::freeze`] on a thread of its own, joined by the caller when it
+    /// first reads the shards (`N42_FREEZE_AFTER_SEAL`): the same call on the
+    /// same input, only started where the batches end and finished beside
+    /// whatever the caller does meanwhile. `Err` gives the shards back when
+    /// no thread could be had (`None` only if they were lost, which the
+    /// failed spawn cannot do: its closure is dropped unrun).
+    pub fn freeze_on_thread(self) -> Result<FreezeHandle, Option<Box<Self>>> {
+        let slot = std::sync::Arc::new(Mutex::new(Some(self)));
+        let taken = std::sync::Arc::clone(&slot);
+        let spawned = std::thread::Builder::new().name("n42-freeze".into()).spawn(move || {
+            let at = std::time::Instant::now();
+            let shards = taken.lock().unwrap_or_else(PoisonError::into_inner).take();
+            // Always present: the slot is filled before the spawn and emptied
+            // only here or, when the spawn failed, by the caller.
+            let frozen = shards.map(Self::freeze).unwrap_or_default();
+            (frozen, at.elapsed(), std::time::Instant::now())
+        });
+        match spawned {
+            Ok(handle) => Ok(handle),
+            Err(_) => Err(slot.lock().unwrap_or_else(PoisonError::into_inner).take().map(Box::new)),
         }
     }
 }
@@ -615,6 +869,12 @@ fn fold_split<'a>(
         task_minflt_sum: costs().map(|cost| cost.minflt).sum(),
         task_migrated: costs().filter(|cost| cost.migrated).count() as u64,
         task_nivcsw_max: costs().map(|cost| cost.nivcsw).max().unwrap_or(0),
+        pending_max: 0,
+        pending_us_max: 0,
+        drops_max: 0,
+        heavy_shard: 0,
+        heavy_work: 0,
+        split_tasks: 0,
     }
 }
 
@@ -643,6 +903,15 @@ fn log_folded(fold_ns: u64, split: &FoldSplit, index: Option<(u64, usize)>, live
         task_minflt_sum = split.task_minflt_sum,
         task_migrated = split.task_migrated,
         task_nivcsw_max = split.task_nivcsw_max,
+        pending_max = split.pending_max,
+        pending_us_max = split.pending_us_max,
+        drops_max = split.drops_max,
+        // The live freeze's heaviest shard, its work (deferred batches'
+        // addresses entered plus occurrences summed), and the tasks heavy
+        // shards were split over (`N42_FREEZE_SPLIT`; 0 when none was).
+        heavy_shard = split.heavy_shard,
+        heavy_work = split.heavy_work,
+        split_tasks = split.split_tasks,
         "output shards folded"
     );
 }
@@ -657,6 +926,7 @@ fn log_folded(fold_ns: u64, split: &FoldSplit, index: Option<(u64, usize)>, live
 /// After the tasks the conflicting accounts are taken out of the batches'
 /// maps, so every account lives in exactly one place.
 fn freeze_indexed(
+    pool: &rayon::ThreadPool,
     at: std::time::Instant,
     beneficiary: Address,
     count: usize,
@@ -712,17 +982,19 @@ fn freeze_indexed(
     };
     let built: Vec<(IndexPart, TaskCost)> = {
         use rayon::prelude::*;
-        crate::parallel_transfer::build_pool().install(|| (0..count).into_par_iter().map(build).collect())
+        pool.install(|| (0..count).into_par_iter().map(build).collect())
     };
     let done = std::time::Instant::now();
-    finish_indexed(at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, false)
+    finish_indexed(pool, at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, None)
 }
 
 /// The live index's freeze ([`output_index_live`]): the indexes and kept
 /// reverts are built; what is left is the conflicting accounts' sums, one
 /// task a shard with any, in `drops` order -- the first batch's account
 /// cloned, every later one's change added, as [`freeze_indexed`] does.
+#[allow(clippy::too_many_arguments)]
 fn freeze_live(
+    pool: &rayon::ThreadPool,
     at: std::time::Instant,
     beneficiary: Address,
     count: usize,
@@ -730,11 +1002,60 @@ fn freeze_live(
     contracts: B256HashMap<RevmBytecode>,
     append_ns: u64,
     parts: Vec<IndexPart>,
+    (split, split_all): (usize, bool),
 ) -> FrozenShards {
     let transposed = std::time::Instant::now();
     let batches_ref = &batches;
-    let sum = move |mut part: IndexPart| {
+    // `N42_LIVE_INDEX_DEFER=1`: the batches a shard was left by, in batch
+    // number order, entered here before the sums (the batches are sorted by
+    // number, so a batch's position is its number).
+    let mut pending: Vec<Vec<u16>> = vec![Vec::new(); parts.len()];
+    for (id, batch) in batches.iter().enumerate() {
+        for &shard in &batch.deferred {
+            if let Some(list) = pending.get_mut(shard as usize) {
+                list.push(id as u16);
+            }
+        }
+    }
+    let any_pending = pending.iter().any(|list| !list.is_empty());
+    // `N42_FREEZE_SPLIT`: each shard's work (the deferred batches' addresses
+    // it enters and the occurrences it sums); a heavy one is split.
+    let work: Vec<usize> = parts
+        .iter()
+        .zip(&pending)
+        .enumerate()
+        .map(|(shard, (part, list))| {
+            part.drops.len()
+                + list
+                    .iter()
+                    .filter_map(|id| batches.get(*id as usize))
+                    .map(|batch| batch.addresses.get(shard).map_or(0, Vec::len))
+                    .sum::<usize>()
+        })
+        .collect();
+    let heavy = if split_all && split > 1 { work.iter().map(|w| *w > 0).collect() } else { heavy_shards(&work, split) };
+    let heavy_count = heavy.iter().filter(|h| **h).count();
+    let (heavy_shard, heavy_work) =
+        work.iter().enumerate().max_by_key(|(_, work)| **work).map_or((0, 0), |(shard, work)| (shard, *work));
+    let sum = move |(mut part, pending): (IndexPart, Vec<u16>), shard: usize| {
+        if heavy.get(shard).copied().unwrap_or(false) {
+            return sum_split(part, &pending, shard, split, batches_ref);
+        }
         let probe = TaskProbe::start();
+        let entries = pending.len() as u64;
+        for id in pending {
+            let Some(batch) = batches_ref.get(id as usize) else { continue };
+            enter_part(
+                &mut part,
+                id,
+                &batch.accounts,
+                &batch.reverts,
+                batch.addresses.get(shard).map_or(&[][..], Vec::as_slice),
+                batch.revert_at.get(shard).map_or(&[][..], Vec::as_slice),
+            );
+        }
+        let pending_us = probe.start.elapsed().as_micros() as u64;
+        let drops = part.drops.len() as u64;
         for (id, address) in &part.drops {
             let Some(account) = batches_ref.get(*id as usize).and_then(|b| b.accounts.get(address)) else { continue };
             match part.conflicts.get_mut(address) {
@@ -748,18 +1069,185 @@ fn freeze_live(
                 }
             }
         }
-        (part, probe.finish())
+        (part, probe.finish(), (entries, pending_us, drops))
     };
-    let built: Vec<(IndexPart, TaskCost)> = {
+    let summed: Vec<(IndexPart, TaskCost, (u64, u64, u64))> = {
         use rayon::prelude::*;
-        if parts.iter().any(|part| !part.drops.is_empty()) {
-            crate::parallel_transfer::build_pool().install(|| parts.into_par_iter().map(sum).collect())
+        if any_pending || parts.iter().any(|part| !part.drops.is_empty()) {
+            let work: Vec<(IndexPart, Vec<u16>)> = parts.into_iter().zip(pending).collect();
+            pool.install(|| work.into_par_iter().enumerate().map(|(shard, item)| sum(item, shard)).collect())
         } else {
-            parts.into_iter().map(|part| (part, TaskProbe::start().finish())).collect()
+            parts.into_iter().map(|part| (part, TaskProbe::start().finish(), (0, 0, 0))).collect()
         }
     };
     let done = std::time::Instant::now();
-    finish_indexed(at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, true)
+    let (mut pending_max, mut pending_us_max, mut drops_max) = (0u64, 0u64, 0u64);
+    let built: Vec<(IndexPart, TaskCost)> = summed
+        .into_iter()
+        .map(|(part, cost, (entries, pending_us, drops))| {
+            pending_max = pending_max.max(entries);
+            pending_us_max = pending_us_max.max(pending_us);
+            drops_max = drops_max.max(drops);
+            (part, cost)
+        })
+        .collect();
+    let split_tasks = (heavy_count * split) as u64;
+    let pending = (pending_max, pending_us_max, drops_max, heavy_shard as u64, heavy_work as u64, split_tasks);
+    finish_indexed(pool, at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, Some(pending))
+}
+
+/// The largest `N42_FREEZE_SPLIT`.
+pub const MAX_FREEZE_SPLIT: usize = 8;
+
+/// `N42_FREEZE_SPLIT=<k>` (1 by default, at most [`MAX_FREEZE_SPLIT`];
+/// `docs/SHARED_EXECUTION_SCOPE.md` 18.7 item 4b): the live freeze's heavy
+/// shard -- the one whose deferred batches and repeated occurrences are the
+/// slowest task, ~73 of 128 batches and 16,000 occurrences at 200k -- is
+/// worked on by `k` tasks, each over the addresses of one sub-range of the
+/// shard (the address's third and fourth bytes), and put back together into
+/// the one shard part. The index, the conflicting accounts' sums, the kept
+/// reverts and the occurrences to drop are the ones the single task makes.
+/// Read once.
+pub fn freeze_split() -> usize {
+    static K: OnceLock<usize> = OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("N42_FREEZE_SPLIT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(1, |k| k.clamp(1, MAX_FREEZE_SPLIT))
+    })
+}
+
+/// Which shards are split over `split` tasks: those with at least 2,048
+/// units of work and at least one and a half times the mean (in practice the
+/// one heavy shard). None when `split` is 1.
+fn heavy_shards(work: &[usize], split: usize) -> Vec<bool> {
+    if split < 2 || work.is_empty() {
+        return vec![false; work.len()];
+    }
+    let mean = work.iter().sum::<usize>() / work.len();
+    work.iter().map(|w| *w >= 2048 && *w * 2 >= mean * 3).collect()
+}
+
+/// The sub-range of a shard `address` falls in when its work is split over
+/// `split` tasks: the address's third and fourth bytes (the first two pick
+/// the shard), scaled.
+fn sub_range(address: &Address, split: usize) -> usize {
+    let bits = u16::from_be_bytes([address.0[2], address.0[3]]) as usize;
+    (bits * split) >> 16
+}
+
+/// One sub-range's share of a split shard's freeze work.
+#[derive(Default)]
+struct SubPart {
+    /// Addresses the deferred batches entered that the live index did not
+    /// hold (`CONFLICT` once a later batch repeated them).
+    entered: AddressHashMap<u16>,
+    /// Addresses the live index held that a deferred batch repeated.
+    newly_conflicting: Vec<Address>,
+    /// The occurrences to drop the deferred batches added.
+    drops: Vec<(u16, Address)>,
+    kept: Vec<(u16, u32)>,
+    size_less: usize,
+    /// The conflicting accounts' sums of this sub-range.
+    conflicts: AddressHashMap<BundleAccount>,
+    /// The entry pass's wall, us.
+    pending_us: u64,
+}
+
+/// [`freeze_live`]'s per-shard work for a heavy shard, over `split` tasks:
+/// each enters the deferred batches' addresses of its sub-range in batch
+/// order (reading the live index, never writing it: what it adds is its
+/// own) under [`enter_part`]'s rules, then sums its sub-range's occurrences
+/// in the single task's order (the live ones, then the deferred ones). The
+/// sub-ranges are disjoint, so every address's entries, occurrences and sum
+/// are exactly the single task's, and they are put back into the shard part.
+fn sum_split(
+    mut part: IndexPart,
+    pending: &[u16],
+    shard: usize,
+    split: usize,
+    batches: &[BatchOut],
+) -> (IndexPart, TaskCost, (u64, u64, u64)) {
+    use rayon::prelude::*;
+    let probe = TaskProbe::start();
+    let base = &part.index;
+    let live_drops = &part.drops;
+    let subs: Vec<SubPart> = (0..split)
+        .into_par_iter()
+        .map(|sub| {
+            let at = std::time::Instant::now();
+            let mut out = SubPart::default();
+            let mut conflicting: AddressHashSet = Default::default();
+            for &id in pending {
+                let Some(batch) = batches.get(id as usize) else { continue };
+                let addresses = batch.addresses.get(shard).map_or(&[][..], Vec::as_slice);
+                let revert_at = batch.revert_at.get(shard).map_or(&[][..], Vec::as_slice);
+                let mut repeated: AddressHashSet = Default::default();
+                for address in addresses.iter().filter(|address| sub_range(address, split) == sub) {
+                    let held = if conflicting.contains(address) {
+                        Some(CONFLICT)
+                    } else {
+                        out.entered.get(address).copied().or_else(|| base.get(address).copied())
+                    };
+                    let Some(first) = held else {
+                        out.entered.insert(*address, id);
+                        continue;
+                    };
+                    let Some(account) = batch.accounts.get(address) else { continue };
+                    repeated.insert(*address);
+                    out.size_less += account.size_hint();
+                    if first != CONFLICT {
+                        out.drops.push((first, *address));
+                        if let Some(entry) = out.entered.get_mut(address) {
+                            *entry = CONFLICT;
+                        } else {
+                            conflicting.insert(*address);
+                            out.newly_conflicting.push(*address);
+                        }
+                    }
+                    out.drops.push((id, *address));
+                }
+                for &pos in revert_at {
+                    let Some((address, _)) = batch.reverts.get(pos as usize) else { continue };
+                    if sub_range(address, split) == sub && (repeated.is_empty() || !repeated.contains(address)) {
+                        out.kept.push((id, pos));
+                    }
+                }
+            }
+            out.pending_us = at.elapsed().as_micros() as u64;
+            let ours = live_drops.iter().filter(|(_, address)| sub_range(address, split) == sub).chain(out.drops.iter());
+            let mut conflicts: AddressHashMap<BundleAccount> = Default::default();
+            for (id, address) in ours {
+                let Some(account) = batches.get(*id as usize).and_then(|b| b.accounts.get(address)) else { continue };
+                match conflicts.get_mut(address) {
+                    Some(staged) => {
+                        if let Some(info) = staged.info.as_mut() {
+                            add_delta(info, account);
+                        }
+                    }
+                    None => {
+                        conflicts.insert(*address, account.clone());
+                    }
+                }
+            }
+            out.conflicts = conflicts;
+            out
+        })
+        .collect();
+    let pending_us = subs.iter().map(|sub| sub.pending_us).max().unwrap_or(0);
+    for sub in subs {
+        part.index.extend(sub.entered);
+        for address in sub.newly_conflicting {
+            part.index.insert(address, CONFLICT);
+        }
+        part.drops.extend(sub.drops);
+        part.kept.extend(sub.kept);
+        part.size_less += sub.size_less;
+        part.conflicts.extend(sub.conflicts);
+    }
+    let drops = part.drops.len() as u64;
+    (part, probe.finish(), (pending.len() as u64, pending_us, drops))
 }
 
 /// What both index freezes end with: the batches' maps kept as the output,
@@ -767,6 +1255,7 @@ fn freeze_live(
 /// beneficiary's credit summed.
 #[allow(clippy::too_many_arguments)]
 fn finish_indexed(
+    pool: &rayon::ThreadPool,
     at: std::time::Instant,
     transposed: std::time::Instant,
     done: std::time::Instant,
@@ -776,10 +1265,19 @@ fn finish_indexed(
     contracts: B256HashMap<RevmBytecode>,
     append_ns: u64,
     built: Vec<(IndexPart, TaskCost)>,
-    live: bool,
+    // The live freeze's (`Some`): the most entries, the longest entry pass
+    // and the most drops of one task (`FoldSplit::pending_max`), the
+    // heaviest shard and its work, and the tasks heavy shards were split
+    // over (`FoldSplit::heavy_shard`).
+    live: Option<(u64, u64, u64, u64, u64, u64)>,
 ) -> FrozenShards {
     let index_build_ns = done.duration_since(transposed).as_nanos() as u64;
-    let split = fold_split(built.iter().map(|(_, cost)| cost), at, transposed, done);
+    let mut split = fold_split(built.iter().map(|(_, cost)| cost), at, transposed, done);
+    if let Some((pending_max, pending_us_max, drops_max, heavy_shard, heavy_work, split_tasks)) = live {
+        (split.pending_max, split.pending_us_max, split.drops_max) = (pending_max, pending_us_max, drops_max);
+        (split.heavy_shard, split.heavy_work, split.split_tasks) = (heavy_shard, heavy_work, split_tasks);
+    }
+    let live = live.is_some();
     let mut state_size = 0usize;
     let mut beneficiary_delta = U256::ZERO;
     let mut kept_batches = Vec::with_capacity(batches.len());
@@ -791,7 +1289,7 @@ fn finish_indexed(
         lists.push((batch.addresses, batch.revert_at));
     }
     // The address lists are done with: freed on the pool.
-    crate::parallel_transfer::build_pool().spawn(move || drop(lists));
+    pool.spawn(move || drop(lists));
     let (mut index, mut conflicts, mut kept) =
         (Vec::with_capacity(count), Vec::with_capacity(count), Vec::with_capacity(count));
     let mut conflict_count = 0usize;
@@ -810,7 +1308,7 @@ fn finish_indexed(
         use rayon::prelude::*;
         let removals: usize = drops_of.iter().map(Vec::len).sum();
         if removals >= 1024 {
-            crate::parallel_transfer::build_pool().install(|| {
+            pool.install(|| {
                 kept_batches.par_iter_mut().zip(drops_of.par_iter()).for_each(|(batch, list)| {
                     for address in list {
                         batch.accounts.remove(address);
@@ -895,6 +1393,7 @@ impl Drop for FrozenShards {
         // Cleared off the dropping thread (a pass over every entry, a few ms
         // for the fleet's block): the last holder may be a build.
         let spawned = std::thread::Builder::new().name("n42-shard-recycle".into()).spawn(move || {
+            n42_core_layout::background_thread();
             for shard in &mut shards {
                 shard.state.clear();
                 shard.reverts.clear();
@@ -926,6 +1425,21 @@ pub struct FrozenShards {
     split: FoldSplit,
 }
 
+/// What [`FrozenShards::merged_timed`] spent, microseconds: the account map,
+/// the revert set (copied and sorted), their assembly, and the whole (the
+/// first two overlap when the merge runs them at once).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MergeSplit {
+    /// The account map.
+    pub state_us: u64,
+    /// The revert set, copied and sorted.
+    pub reverts_us: u64,
+    /// The sorted reverts appended to the block's own.
+    pub append_us: u64,
+    /// The whole merge.
+    pub total_us: u64,
+}
+
 /// The fold's wall time taken apart ([`OutputShards::freeze`]), microseconds:
 /// what the node's fold number is made of, which a bench off the node cannot
 /// say (the fold itself is 3.5-5 ms of 16 threads on the block's shape,
@@ -955,6 +1469,24 @@ pub struct FoldSplit {
     /// The most involuntary context switches one task took (its thread
     /// preempted by another runnable thread on its CPU).
     pub task_nivcsw_max: u64,
+    /// Live index with `N42_LIVE_INDEX_DEFER=1`: the most batches one task
+    /// entered at the freeze (the shards they left), the longest such entry
+    /// pass in one task (us), and the most conflicting occurrences one task
+    /// summed (`drops`). What the freeze's slowest task is made of.
+    pub pending_max: u64,
+    /// See `pending_max`.
+    pub pending_us_max: u64,
+    /// See `pending_max`.
+    pub drops_max: u64,
+    /// Live freeze: the shard with the most work (deferred batches'
+    /// addresses entered plus occurrences summed), and that work: whether
+    /// the heavy shard is a property of the address derivation.
+    pub heavy_shard: u64,
+    /// See `heavy_shard`.
+    pub heavy_work: u64,
+    /// `N42_FREEZE_SPLIT`: the tasks the heavy shards were split over (0
+    /// when none was).
+    pub split_tasks: u64,
 }
 
 /// One fold task's own cost, read from its thread: wall, CPU time, minor
@@ -1231,6 +1763,187 @@ impl FrozenShards {
     /// caller's thread (the build pool stays free for the next build). Built
     /// behind the seal, beside the roots, which read [`Self::view`] instead.
     pub fn merged(&self, residual: &BundleState) -> BundleState {
+        self.merged_timed(residual, false).0
+    }
+
+    /// [`Self::merged`], timed in its two halves, and with `concurrent` the
+    /// halves run at once: the account map on this thread, the revert set
+    /// (the shards' reverts copied and sorted, the larger part of a block of
+    /// transfers' merge after the map) on a scoped thread of its own. Neither
+    /// half reads the other's result; the bundle is assembled from both in
+    /// the same order either way, so it is the same bundle
+    /// (`N42_SHARDS_MERGE_OFF_PATH`, `docs/INDUSTRY_SURVEY_2026_10.md` 11.12).
+    pub fn merged_timed(&self, residual: &BundleState, concurrent: bool) -> (BundleState, MergeSplit) {
+        let started = std::time::Instant::now();
+        let reverts_job = || {
+            let at = std::time::Instant::now();
+            let reverts = self.merged_reverts();
+            (reverts, at.elapsed().as_micros() as u64)
+        };
+        let state_job = || {
+            let at = std::time::Instant::now();
+            let state = self.merged_state(residual);
+            (state, at.elapsed().as_micros() as u64)
+        };
+        let (((state, size), state_us), (reverts, reverts_us)) = if concurrent {
+            std::thread::scope(|scope| {
+                let reverts = std::thread::Builder::new()
+                    .name("n42-merge-reverts".into())
+                    .spawn_scoped(scope, reverts_job);
+                let state = state_job();
+                let reverts = match reverts {
+                    Ok(handle) => handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                    // No thread to be had: the half here, after the other.
+                    Err(_) => reverts_job(),
+                };
+                (state, reverts)
+            })
+        } else {
+            let state = state_job();
+            (state, reverts_job())
+        };
+        let mut contracts = self.contracts.clone();
+        contracts.extend(residual.contracts.iter().map(|(hash, code)| (*hash, code.clone())));
+        let block_reverts = residual.reverts.clone();
+        let reverts_size = block_reverts.iter().map(Vec::len).sum();
+        let state_size = usize::try_from(size.max(0)).unwrap_or(usize::MAX);
+        let mut bundle = BundleState { state, contracts, reverts: block_reverts, state_size, reverts_size };
+        let append_at = std::time::Instant::now();
+        crate::parallel_transfer::append_sorted_reverts(&mut bundle, reverts);
+        let split = MergeSplit {
+            state_us,
+            reverts_us,
+            append_us: append_at.elapsed().as_micros() as u64,
+            total_us: started.elapsed().as_micros() as u64,
+        };
+        (bundle, split)
+    }
+
+    /// [`Self::merged_timed`] on `pool`, parallel by source map: every source
+    /// map (a v4 shard's, or in index mode a batch's and a shard's conflicts)
+    /// is cloned -- with the residual laid over the accounts it also holds --
+    /// on a task of its own, and the copies are then inserted into the one
+    /// map in the serial merge's source order (a later source's account
+    /// replaces an earlier one's, as there): the same map. Its iteration
+    /// order is no property of either merge (the map's hasher is seeded per
+    /// map); every consumer sorts. The revert set is copied per source on the pool and sorted
+    /// as the serial merge sorts it; the account map and the reverts run at
+    /// once. `split.state_us` is the map's wall (the clones and the inserts).
+    pub fn merged_on(&self, residual: &BundleState, pool: &rayon::ThreadPool) -> (BundleState, MergeSplit) {
+        pool.install(|| {
+            let started = std::time::Instant::now();
+            let (((state, size), state_us), (reverts, reverts_us)) = rayon::join(
+                || {
+                    let at = std::time::Instant::now();
+                    let state = self.merged_state_parallel(residual);
+                    (state, at.elapsed().as_micros() as u64)
+                },
+                || {
+                    let at = std::time::Instant::now();
+                    let reverts = self.merged_reverts_parallel();
+                    (reverts, at.elapsed().as_micros() as u64)
+                },
+            );
+            let mut contracts = self.contracts.clone();
+            contracts.extend(residual.contracts.iter().map(|(hash, code)| (*hash, code.clone())));
+            let block_reverts = residual.reverts.clone();
+            let reverts_size = block_reverts.iter().map(Vec::len).sum();
+            let state_size = usize::try_from(size.max(0)).unwrap_or(usize::MAX);
+            let mut bundle = BundleState { state, contracts, reverts: block_reverts, state_size, reverts_size };
+            let append_at = std::time::Instant::now();
+            crate::parallel_transfer::append_sorted_reverts(&mut bundle, reverts);
+            let split = MergeSplit {
+                state_us,
+                reverts_us,
+                append_us: append_at.elapsed().as_micros() as u64,
+                total_us: started.elapsed().as_micros() as u64,
+            };
+            (bundle, split)
+        })
+    }
+
+    /// The source maps in the serial merge's order: the v4 shards', then
+    /// (index mode) the batches' and the conflicts'.
+    fn source_maps(&self) -> Vec<&AddressHashMap<BundleAccount>> {
+        let mut sources: Vec<&AddressHashMap<BundleAccount>> = self.shards.iter().map(|shard| &shard.state).collect();
+        if let Some(indexed) = &self.indexed {
+            sources.extend(indexed.batches.iter().map(|batch| &batch.accounts).chain(indexed.conflicts.iter()));
+        }
+        sources
+    }
+
+    /// [`Self::merged_state`], the clones on the current pool (see
+    /// [`Self::merged_on`]).
+    fn merged_state_parallel(&self, residual: &BundleState) -> (AddressHashMap<BundleAccount>, i128) {
+        use rayon::prelude::*;
+        let newer = &residual.state;
+        let sources = self.source_maps();
+        // Each source's accounts in its own iteration order, the residual
+        // laid over the ones it also holds, with the size that changes.
+        let copies: Vec<(Vec<(Address, BundleAccount)>, i128)> = sources
+            .par_iter()
+            .map(|map| {
+                let mut out = Vec::with_capacity(map.len());
+                let mut delta = 0i128;
+                for (address, account) in map.iter() {
+                    match newer.get(address) {
+                        Some(over) => {
+                            let merged = overlaid(account, over);
+                            delta += merged.size_hint() as i128 - account.size_hint() as i128 - over.size_hint() as i128;
+                            out.push((*address, merged));
+                        }
+                        None => out.push((*address, account.clone())),
+                    }
+                }
+                (out, delta)
+            })
+            .collect();
+        let total: usize = self.accounts() + newer.len();
+        let mut state: AddressHashMap<BundleAccount> = Default::default();
+        state.reserve(total);
+        let mut size = residual.state_size as i128;
+        size += self.indexed.as_ref().map_or(0, |indexed| indexed.state_size as i128);
+        size += self.shards.iter().map(|shard| shard.state_size as i128).sum::<i128>();
+        // The inserts in the serial merge's order, into the same capacity.
+        for (copy, delta) in copies {
+            size += delta;
+            for (address, account) in copy {
+                state.insert(address, account);
+            }
+        }
+        for (address, account) in newer {
+            if !self.holds(address) {
+                state.insert(*address, account.clone());
+            }
+        }
+        (state, size)
+    }
+
+    /// [`Self::merged_reverts`], the copies on the current pool.
+    fn merged_reverts_parallel(&self) -> Vec<(Address, AccountRevert)> {
+        use rayon::prelude::*;
+        let mut parts: Vec<Vec<(Address, AccountRevert)>> =
+            self.shards.par_iter().map(|shard| shard.reverts.clone()).collect();
+        if let Some(indexed) = &self.indexed {
+            parts.extend(
+                indexed
+                    .kept
+                    .par_iter()
+                    .map(|kept| kept.iter().filter_map(|&slot| indexed.revert(slot)).cloned().collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let mut reverts = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+        for part in parts {
+            reverts.extend(part);
+        }
+        crate::parallel_transfer::sort_reverts(&mut reverts);
+        reverts
+    }
+
+    /// The merged account map and its size: the shards' accounts with the
+    /// residual's laid over them, each account cloned once into the one map.
+    fn merged_state(&self, residual: &BundleState) -> (AddressHashMap<BundleAccount>, i128) {
         let newer = &residual.state;
         let total: usize = self.accounts() + newer.len();
         let mut state: AddressHashMap<BundleAccount> = Default::default();
@@ -1274,10 +1987,12 @@ impl FrozenShards {
                 state.insert(*address, account.clone());
             }
         }
-        let mut contracts = self.contracts.clone();
-        contracts.extend(residual.contracts.iter().map(|(hash, code)| (*hash, code.clone())));
-        let block_reverts = residual.reverts.clone();
-        let reverts_size = block_reverts.iter().map(Vec::len).sum();
+        (state, size)
+    }
+
+    /// The shards' reverts, copied and sorted by address as `append_reverts`
+    /// sorts them, ready for [`crate::parallel_transfer::append_sorted_reverts`].
+    fn merged_reverts(&self) -> Vec<(Address, AccountRevert)> {
         let mut reverts = Vec::with_capacity(self.shards.iter().map(|shard| shard.reverts.len()).sum());
         for shard in &self.shards {
             reverts.extend(shard.reverts.iter().cloned());
@@ -1286,10 +2001,8 @@ impl FrozenShards {
             reverts.reserve(indexed.kept.iter().map(Vec::len).sum());
             reverts.extend(indexed.kept.iter().flatten().filter_map(|&slot| indexed.revert(slot)).cloned());
         }
-        let state_size = usize::try_from(size.max(0)).unwrap_or(usize::MAX);
-        let mut bundle = BundleState { state, contracts, reverts: block_reverts, state_size, reverts_size };
-        crate::parallel_transfer::append_reverts(&mut bundle, reverts);
-        bundle
+        crate::parallel_transfer::sort_reverts(&mut reverts);
+        reverts
     }
 
     /// The accounts both the batches and the block's executor changed, as
@@ -1563,6 +2276,50 @@ mod frozen_tests {
             let bare = frozen.merged(&BundleState::default());
             assert_eq!(bare.state.len(), 3);
             assert!(frozen.overlaps(&BundleState::default()).is_empty());
+        }
+    }
+
+    /// `N42_SHARDS_MERGE_OFF_PATH`: the merge with its two halves at once is
+    /// the same bundle as the merge one half after the other -- accounts,
+    /// sizes, contracts and the sorted revert set -- in both modes, at a size
+    /// that takes the parallel revert sort (4,096 and more), with conflicting
+    /// writes and an executor change over the shards.
+    #[test]
+    fn the_concurrent_merge_is_the_on_path_merge() {
+        let wide = |i: u32| Address::from_word(B256::from(U256::from(0x1000_0000u64 + u64::from(i))));
+        for (index, live) in [(false, false), (true, false), (true, true)] {
+            let shards = OutputShards::with_index_live(addr(1), 12_000, 16, index, live);
+            for batch_no in 0..8u32 {
+                let mut builder = BundleState::builder(1..=1);
+                for i in 0..1_200u32 {
+                    let account = wide(batch_no * 1_200 + i);
+                    builder = builder
+                        .state_original_account_info(account, info(0, 1_000))
+                        .state_present_account_info(account, info(1, 900 + u64::from(i % 7)))
+                        .revert_account_info(1, account, Some(Some(info(0, 1_000))));
+                }
+                // One account every batch writes: a conflict in index mode.
+                builder = builder
+                    .state_original_account_info(addr(5), info(0, 50))
+                    .state_present_account_info(addr(5), info(0, 50 + u64::from(batch_no)))
+                    .revert_account_info(1, addr(5), Some(Some(info(0, 50))));
+                shards.add(builder.build());
+            }
+            let frozen = shards.freeze();
+            let residual = BundleState::builder(1..=1)
+                .state_original_account_info(wide(3), info(1, 900))
+                .state_present_account_info(wide(3), info(1, 950))
+                .state_present_account_info(addr(8), info(0, 3))
+                .revert_account_info(1, addr(8), Some(None))
+                .build();
+            let on_path = frozen.merged(&residual);
+            let (concurrent, split) = frozen.merged_timed(&residual, true);
+            let (sequential, _) = frozen.merged_timed(&residual, false);
+            assert_eq!(on_path.state.len(), 9_600 + 2, "index {index} live {live}");
+            assert!(on_path.reverts.iter().map(Vec::len).sum::<usize>() >= 4_096);
+            assert_eq!(concurrent, on_path, "index {index} live {live}: concurrent against on-path");
+            assert_eq!(sequential, on_path, "index {index} live {live}: sequential against on-path");
+            assert!(split.total_us >= split.append_us);
         }
     }
 

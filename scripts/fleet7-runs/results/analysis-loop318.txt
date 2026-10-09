@@ -1,0 +1,276 @@
+== loop318WARM: window-1 blocks 225, cycle mean/median/p90 132.7/122.3/178.8
+  sealed_at ms median/p90 81.0/142.0 (n=754)
+  follower fields_ready ms median/p90 87.0/133.0 (n=1930, whole leg)
+  answer (window 1, n=225, elided 0): encode 33.4/44.5  write 15.8/33.9  read 16.8/36.7 (n=225)  decode 13.6/19.9  answer_MB 31.3/31.3  [median/p90 ms]
+  modes: seal 165 (73%) mean 121.2  send 60 (27%) mean 164.5
+  on demand, whole leg, all nodes: EL {"own block's body served on demand": 0, 'compact body: asking for the transactions': 0, 'compact body refused': 0}  validator {"elided block's body fetched from the execution layer": 0, 'peer asked for a block taken elided': 0}
+== loop318BASE: window-1 blocks 216, cycle mean/median/p90 138.0/122.2/199.9
+  sealed_at ms median/p90 78.0/146.0 (n=752)
+  follower fields_ready ms median/p90 88.0/150.0 (n=1927, whole leg)
+  answer (window 1, n=216, elided 0): encode 34.2/47.4  write 18.0/53.1  read 19.5/53.9 (n=216)  decode 13.7/19.9  answer_MB 31.3/31.3  [median/p90 ms]
+  modes: seal 137 (63%) mean 115.1  send 79 (37%) mean 177.7
+  on demand, whole leg, all nodes: EL {"own block's body served on demand": 0, 'compact body: asking for the transactions': 0, 'compact body refused': 0}  validator {"elided block's body fetched from the execution layer": 0, 'peer asked for a block taken elided': 0}
+== loop318COMPACT: window-1 blocks 220, cycle mean/median/p90 124.2/115.2/158.0
+  sealed_at ms median/p90 113.0/202.0 (n=733)
+  follower fields_ready ms median/p90 91.0/169.0 (n=1740, whole leg)
+  answer (window 1, n=220, elided 220): encode 4.3/7.1  write 1.9/9.1  read 2.0/8.7 (n=220)  decode 0.7/1.8  answer_MB 5.2/5.2  [median/p90 ms]
+  modes: seal 205 (93%) mean 124.7  send 15 (7%) mean 117.1
+  on demand, whole leg, all nodes: EL {"own block's body served on demand": 3, 'compact body: asking for the transactions': 3, 'compact body refused': 1}  validator {"elided block's body fetched from the execution layer": 3, 'peer asked for a block taken elided': 0}
+== loop318BASEb: window-1 blocks 222, cycle mean/median/p90 134.0/122.9/180.8
+  sealed_at ms median/p90 85.0/181.0 (n=753)
+  follower fields_ready ms median/p90 88.0/150.0 (n=1928, whole leg)
+  answer (window 1, n=222, elided 0): encode 33.9/46.1  write 15.4/42.6  read 16.4/43.6 (n=222)  decode 13.7/20.6  answer_MB 31.3/31.3  [median/p90 ms]
+  modes: seal 153 (69%) mean 119.3  send 69 (31%) mean 166.5
+  on demand, whole leg, all nodes: EL {"own block's body served on demand": 0, 'compact body: asking for the transactions': 0, 'compact body refused': 0}  validator {"elided block's body fetched from the execution layer": 0, 'peer asked for a block taken elided': 0}
+== loop318COMPACTb: window-1 blocks 229, cycle mean/median/p90 119.6/108.0/158.1
+  sealed_at ms median/p90 112.5/187.0 (n=710)
+  follower fields_ready ms median/p90 94.0/231.0 (n=1840, whole leg)
+  answer (window 1, n=229, elided 229): encode 4.7/8.0  write 1.6/8.2  read 1.7/8.2 (n=229)  decode 0.7/1.9  answer_MB 5.2/5.2  [median/p90 ms]
+  modes: seal 210 (92%) mean 120.4  send 19 (8%) mean 110.5
+  on demand, whole leg, all nodes: EL {"own block's body served on demand": 0, 'compact body: asking for the transactions': 0, 'compact body refused': 0}  validator {"elided block's body fetched from the execution layer": 0, 'peer asked for a block taken elided': 0}
+== loop318COMPACTP90: window-1 blocks 215, cycle mean/median/p90 128.4/120.8/171.6
+  sealed_at ms median/p90 137.0/196.0 (n=721)
+  follower fields_ready ms median/p90 90.0/165.0 (n=1717, whole leg)
+  answer (window 1, n=215, elided 215): encode 4.9/8.0  write 1.8/7.1  read 1.8/6.7 (n=215)  decode 0.7/1.7  answer_MB 5.2/5.2  [median/p90 ms]
+  modes: seal 206 (96%) mean 129.5  send 9 (4%) mean 103.9
+  on demand, whole leg, all nodes: EL {"own block's body served on demand": 4, 'compact body: asking for the transactions': 4, 'compact body refused': 1}  validator {"elided block's body fetched from the execution layer": 4, 'peer asked for a block taken elided': 0}
+== bench-loop318BASE: 216 blocks, leader node0, cycle mean 138.0 median 122.2 p90 199.9; excess over 100 ms = 38.0
+segment                    median   mean    p90   share of excess   (ms)
+  late (timer)                0.4    1.0    9.5      2.7%
+  late (quorum overshoot)     0.0    2.7    0.0      7.2%
+  start_lag                   0.0    0.0    0.0      0.0%
+  queue                       0.0    0.0    0.0      0.0%
+  build                       0.0    0.8    0.0      2.0%
+  encode                      0.0    6.0   25.3     15.8%
+  delivery                    0.0   22.4   64.1     58.8%
+  send                        2.5    5.1   14.8     13.5%
+  build trigger seal: 137 blocks (63%), cycle mean 115.1 median 104.1
+  build trigger send: 79 blocks (37%), cycle mean 177.7 median 174.0
+  chain of the 92 blocks whose sealed-header wait was binding (take > 3 ms), unclipped, median/mean/p90:
+    req_after_prev_send       0.9  -17.7    1.8
+    queue                     4.0    7.2   17.0
+    build                    77.0   89.2  132.0
+    encode                   35.7   38.2   50.0
+    delivery                 54.5   59.1   95.8
+    prev_send_to_hand       164.3  169.0  206.8
+    of which trigger send (71): prev_send_to_hand  167.4  171.9  212.6
+  previous block quorum path (inside the tick wait unless it overshoots):
+    receipt                  -0.7   -3.2   -0.5
+    check                    27.0   28.6   40.3
+    transit                  18.7   27.7   59.1
+    Qc - P                   46.6   53.1   85.4
+groups: <=110 ms n=86, middle n=108, slowest 10% (>= 200 ms) n=22; mean of each segment
+                                 <=110    middle   slowest
+  cycle                          100.8     151.0     219.8
+  late (timer)                    -2.8       3.9       2.1
+  late (quorum overshoot)          0.0       4.6       4.4
+  start_lag                        0.0       0.0       0.0
+  queue                            0.0       0.0       0.0
+  build                            0.0       0.1       7.2
+  encode                           0.0       6.7      25.9
+  delivery                         0.0      29.7      73.5
+  send                             3.6       6.0       6.6
+  Qc - P                          45.5      58.8      54.5
+  share of blocks with the segment above 5 ms: late (timer) 14%, late (quorum overshoot) 6%, start_lag 0%, queue 0%, build 2%, encode 27%, delivery 43%, send 24%
+  cycle autocorrelation lag 1/2/3: -0.57 +0.58 -0.45
+  P(slow | previous slow) 0.00 (base rate 0.10); P(slow | previous fast <=110) 0.19
+  consecutive blocks on opposite sides of 110 ms: 69%
+  cross-node stages, slow blocks vs all (median ms; ratio):
+    node1 check          all   34.4  slow   23.9 (0.69x)  slow-1   35.5 (1.03x)
+    node1 exec           all   40.5  slow   35.0 (0.86x)  slow-1   43.0 (1.06x)
+    node1 root           all   29.0  slow   24.5 (0.84x)  slow-1   33.5 (1.16x)
+    node1 fields lag     all   82.0  slow   76.0 (0.93x)  slow-1   89.5 (1.09x)
+    node2 check          all   30.8  slow   23.3 (0.75x)  slow-1   32.4 (1.05x)
+    node2 exec           all   40.0  slow   36.5 (0.91x)  slow-1   43.5 (1.09x)
+    node2 root           all   28.0  slow   24.0 (0.86x)  slow-1   32.0 (1.14x)
+    node2 fields lag     all   80.0  slow   80.5 (1.01x)  slow-1   84.0 (1.05x)
+    leader par           all   74.0  slow   81.0 (1.09x)  slow-1   78.5 (1.06x)
+    leader handoff h     all  105.0  slow  120.2 (1.15x)  slow-1  116.7 (1.11x)
+    correlation of check between node1 and node2 over blocks: +0.06
+    correlation of exec between node1 and node2 over blocks: +0.63
+    correlation of root between node1 and node2 over blocks: +0.13
+    check: above own p90 on both followers 3, on exactly one 36 (independent expectation both 2.2)
+    exec: above own p90 on both followers 3, on exactly one 36 (independent expectation both 2.2)
+    root: above own p90 on both followers 1, on exactly one 39 (independent expectation both 2.2)
+  proposals per node (count, first view, last view): {0: (1023, 1, 1023), 1: (1024, 1024, 2047), 2: (16, 2048, 2063)}  seal-first builds: {0: 755, 1: 426, 2: 0}
+
+== bench-loop318COMPACT: 220 blocks, leader node0, cycle mean 124.2 median 115.2 p90 158.0; excess over 100 ms = 24.2
+segment                    median   mean    p90   share of excess   (ms)
+  late (timer)                0.3    1.1    1.8      4.7%
+  late (quorum overshoot)     0.0    8.2   26.3     33.8%
+  start_lag                   0.0    0.0    0.0      0.2%
+  queue                       0.0    0.0    0.0      0.1%
+  build                       0.0    7.4   27.3     30.8%
+  encode                      0.0    1.7    5.3      7.0%
+  delivery                    0.0    2.7    8.9     11.1%
+  send                        1.0    3.0    8.5     12.4%
+  build trigger seal: 205 blocks (93%), cycle mean 124.7 median 115.3
+  build trigger send: 15 blocks (7%), cycle mean 117.1 median 103.0
+  chain of the 99 blocks whose sealed-header wait was binding (take > 3 ms), unclipped, median/mean/p90:
+    req_after_prev_send     -10.4  -12.6   -4.9
+    queue                     4.0    4.0    6.0
+    build                   119.0  125.4  158.0
+    encode                    4.2    4.4    6.7
+    delivery                  3.3    5.8   11.0
+    prev_send_to_hand       119.9  124.7  150.3
+    of which trigger send (1): prev_send_to_hand   92.1   92.1   92.1
+  previous block quorum path (inside the tick wait unless it overshoots):
+    receipt                  -0.6   -2.4   -0.3
+    check                    30.8   34.0   44.9
+    transit                  18.2   34.2   85.4
+    Qc - P                   49.7   65.9  125.0
+groups: <=110 ms n=86, middle n=112, slowest 10% (>= 158 ms) n=22; mean of each segment
+                                 <=110    middle   slowest
+  cycle                          101.2     126.9     199.5
+  late (timer)                    -1.5       1.4      10.6
+  late (quorum overshoot)          0.2       4.2      59.3
+  start_lag                        0.0       0.0       0.4
+  queue                            0.0       0.0       0.3
+  build                            0.1      10.5      20.7
+  encode                           0.3       2.8       1.4
+  delivery                         0.8       4.3       1.9
+  send                             1.4       3.8       5.0
+  Qc - P                          52.7      61.7     138.3
+  share of blocks with the segment above 5 ms: late (timer) 9%, late (quorum overshoot) 15%, start_lag 0%, queue 0%, build 30%, encode 10%, delivery 15%, send 17%
+  cycle autocorrelation lag 1/2/3: -0.05 +0.01 -0.06
+  P(slow | previous slow) 0.09 (base rate 0.10); P(slow | previous fast <=110) 0.10
+  consecutive blocks on opposite sides of 110 ms: 39%
+  cross-node stages, slow blocks vs all (median ms; ratio):
+    node1 check          all   35.4  slow   33.4 (0.94x)  slow-1   35.1 (0.99x)
+    node1 exec           all   41.0  slow   41.0 (1.00x)  slow-1   41.0 (1.00x)
+    node1 root           all   28.0  slow   29.0 (1.04x)  slow-1   28.0 (1.00x)
+    node1 fields lag     all   81.0  slow   81.0 (1.00x)  slow-1   78.0 (0.96x)
+    node2 check          all   36.4  slow   31.0 (0.85x)  slow-1   54.2 (1.49x)
+    node2 exec           all   40.5  slow   38.5 (0.95x)  slow-1   41.0 (1.01x)
+    node2 root           all   28.0  slow   29.5 (1.05x)  slow-1   27.5 (0.98x)
+    node2 fields lag     all   80.0  slow   81.5 (1.02x)  slow-1   78.0 (0.98x)
+    leader par           all  104.5  slow  106.5 (1.02x)  slow-1  102.0 (0.98x)
+    leader handoff h     all   19.9  slow   79.2 (3.99x)  slow-1   23.8 (1.20x)
+    correlation of check between node1 and node2 over blocks: +0.09
+    correlation of exec between node1 and node2 over blocks: +0.63
+    correlation of root between node1 and node2 over blocks: +0.06
+    check: above own p90 on both followers 4, on exactly one 36 (independent expectation both 2.2)
+    exec: above own p90 on both followers 3, on exactly one 35 (independent expectation both 2.2)
+    root: above own p90 on both followers 2, on exactly one 39 (independent expectation both 2.2)
+  proposals per node (count, first view, last view): {0: (1023, 1, 1023), 1: (349, 1024, 1372)}  seal-first builds: {0: 756, 1: 291, 2: 0}
+
+== bench-loop318BASEb: 222 blocks, leader node0, cycle mean 134.0 median 122.9 p90 180.8; excess over 100 ms = 34.0
+segment                    median   mean    p90   share of excess   (ms)
+  late (timer)                0.5    2.6   16.3      7.7%
+  late (quorum overshoot)     0.0    2.3    0.0      6.8%
+  start_lag                   0.0    0.0    0.0      0.0%
+  queue                       0.0    0.0    0.0      0.0%
+  build                       0.0    0.6    0.0      1.7%
+  encode                      0.0    4.0   16.0     11.7%
+  delivery                    0.0   20.3   58.2     59.8%
+  send                        2.5    4.2    9.2     12.5%
+  build trigger seal: 153 blocks (69%), cycle mean 119.3 median 108.5
+  build trigger send: 69 blocks (31%), cycle mean 166.5 median 162.4
+  chain of the 96 blocks whose sealed-header wait was binding (take > 3 ms), unclipped, median/mean/p90:
+    req_after_prev_send       0.9  -22.2    5.9
+    queue                     4.0    5.5   13.0
+    build                    78.0   92.1  138.0
+    encode                   35.9   36.2   47.5
+    delivery                 52.2   54.1   76.6
+    prev_send_to_hand       155.1  160.3  193.3
+    of which trigger send (68): prev_send_to_hand  159.6  162.9  193.3
+  previous block quorum path (inside the tick wait unless it overshoots):
+    receipt                  -0.6   -2.2   -0.5
+    check                    27.6   29.7   40.7
+    transit                  23.0   30.4   66.2
+    Qc - P                   50.7   57.9   97.4
+groups: <=110 ms n=83, middle n=116, slowest 10% (>= 181 ms) n=23; mean of each segment
+                                 <=110    middle   slowest
+  cycle                          102.2     143.9     198.7
+  late (timer)                    -1.4       5.0       4.9
+  late (quorum overshoot)          0.1       3.2       5.6
+  start_lag                        0.0       0.0       0.0
+  queue                            0.0       0.0       0.0
+  build                            0.0       0.0       5.5
+  encode                           0.0       4.2      17.3
+  delivery                         0.1      26.8      60.3
+  send                             3.4       4.7       5.1
+  Qc - P                          54.2      59.1      65.0
+  share of blocks with the segment above 5 ms: late (timer) 18%, late (quorum overshoot) 8%, start_lag 0%, queue 0%, build 2%, encode 23%, delivery 43%, send 24%
+  cycle autocorrelation lag 1/2/3: -0.54 +0.40 -0.20
+  P(slow | previous slow) 0.00 (base rate 0.10); P(slow | previous fast <=110) 0.21
+  consecutive blocks on opposite sides of 110 ms: 63%
+  cross-node stages, slow blocks vs all (median ms; ratio):
+    node1 check          all   33.8  slow   32.5 (0.96x)  slow-1   31.0 (0.92x)
+    node1 exec           all   40.5  slow   40.0 (0.99x)  slow-1   40.0 (0.99x)
+    node1 root           all   29.0  slow   26.0 (0.90x)  slow-1   31.0 (1.07x)
+    node1 fields lag     all   83.0  slow   82.0 (0.99x)  slow-1   85.0 (1.02x)
+    node2 check          all   32.5  slow   26.0 (0.80x)  slow-1   31.0 (0.95x)
+    node2 exec           all   40.0  slow   38.0 (0.95x)  slow-1   40.0 (1.00x)
+    node2 root           all   28.0  slow   25.0 (0.89x)  slow-1   29.0 (1.04x)
+    node2 fields lag     all   79.0  slow   81.0 (1.03x)  slow-1   80.0 (1.01x)
+    leader par           all   77.0  slow   75.0 (0.97x)  slow-1   86.0 (1.12x)
+    leader handoff h     all  100.9  slow  106.3 (1.05x)  slow-1  105.2 (1.04x)
+    correlation of check between node1 and node2 over blocks: +0.05
+    correlation of exec between node1 and node2 over blocks: +0.35
+    correlation of root between node1 and node2 over blocks: +0.18
+    check: above own p90 on both followers 1, on exactly one 42 (independent expectation both 2.2)
+    exec: above own p90 on both followers 1, on exactly one 39 (independent expectation both 2.2)
+    root: above own p90 on both followers 2, on exactly one 38 (independent expectation both 2.2)
+  proposals per node (count, first view, last view): {0: (1023, 1, 1023), 1: (1024, 1024, 2047), 2: (36, 2048, 2083)}  seal-first builds: {0: 756, 1: 424, 2: 0}
+
+== bench-loop318COMPACTb: 229 blocks, leader node0, cycle mean 119.6 median 108.0 p90 158.1; excess over 100 ms = 19.6
+segment                    median   mean    p90   share of excess   (ms)
+  late (timer)                0.3    0.9    1.6      4.7%
+  late (quorum overshoot)     0.0    6.7   19.5     34.2%
+  start_lag                   0.0    0.0    0.0      0.0%
+  queue                       0.0    0.0    0.0      0.0%
+  build                       0.0    5.8   21.3     29.7%
+  encode                      0.0    1.5    4.9      7.8%
+  delivery                    0.0    1.9    4.3      9.6%
+  send                        1.0    2.7    8.1     14.0%
+  build trigger seal: 210 blocks (92%), cycle mean 120.4 median 108.1
+  build trigger send: 19 blocks (8%), cycle mean 110.5 median 107.9
+  chain of the 82 blocks whose sealed-header wait was binding (take > 3 ms), unclipped, median/mean/p90:
+    req_after_prev_send      -9.7  -12.3    0.8
+    queue                     3.0    4.0    6.0
+    build                   124.0  125.1  162.0
+    encode                    4.7    5.1    8.1
+    delivery                  2.9    5.6   12.6
+    prev_send_to_hand       121.3  125.3  154.5
+    of which trigger send (4): prev_send_to_hand  108.0  104.5  110.7
+  previous block quorum path (inside the tick wait unless it overshoots):
+    receipt                  -0.6   -2.0   -0.4
+    check                    29.2   31.6   44.5
+    transit                  13.9   29.5   71.4
+    Qc - P                   44.0   59.1  115.1
+groups: <=110 ms n=121, middle n=85, slowest 10% (>= 158 ms) n=23; mean of each segment
+                                 <=110    middle   slowest
+  cycle                          101.1     126.7     190.6
+  late (timer)                    -1.4       1.1      12.6
+  late (quorum overshoot)          0.1       3.6      52.8
+  start_lag                        0.0       0.0       0.0
+  queue                            0.0       0.0       0.0
+  build                            0.1      10.8      17.7
+  encode                           0.2       3.4       1.6
+  delivery                         0.3       4.1       2.3
+  send                             1.8       3.8       3.6
+  Qc - P                          45.3      59.0     132.1
+  share of blocks with the segment above 5 ms: late (timer) 8%, late (quorum overshoot) 12%, start_lag 0%, queue 0%, build 22%, encode 10%, delivery 10%, send 16%
+  cycle autocorrelation lag 1/2/3: +0.06 +0.08 +0.03
+  P(slow | previous slow) 0.17 (base rate 0.10); P(slow | previous fast <=110) 0.07
+  consecutive blocks on opposite sides of 110 ms: 36%
+  cross-node stages, slow blocks vs all (median ms; ratio):
+    node1 check          all   32.4  slow   30.0 (0.93x)  slow-1   35.3 (1.09x)
+    node1 exec           all   40.0  slow   42.0 (1.05x)  slow-1   40.0 (1.00x)
+    node1 root           all   28.0  slow   28.0 (1.00x)  slow-1   31.0 (1.11x)
+    node1 fields lag     all   80.0  slow   85.0 (1.06x)  slow-1   82.0 (1.03x)
+    node2 check          all   33.9  slow   33.9 (1.00x)  slow-1  111.2 (3.28x)
+    node2 exec           all   40.0  slow   42.0 (1.05x)  slow-1   41.0 (1.02x)
+    node2 root           all   27.0  slow   28.0 (1.04x)  slow-1   28.0 (1.04x)
+    node2 fields lag     all   79.0  slow   83.0 (1.05x)  slow-1   79.0 (1.00x)
+    leader par           all   99.0  slow  124.0 (1.25x)  slow-1  103.0 (1.04x)
+    leader handoff h     all   34.2  slow  114.6 (3.35x)  slow-1   30.4 (0.89x)
+    correlation of check between node1 and node2 over blocks: +0.18
+    correlation of exec between node1 and node2 over blocks: +0.79
+    correlation of root between node1 and node2 over blocks: +0.41
+    check: above own p90 on both followers 6, on exactly one 32 (independent expectation both 2.3)
+    exec: above own p90 on both followers 5, on exactly one 26 (independent expectation both 2.3)
+    root: above own p90 on both followers 2, on exactly one 37 (independent expectation both 2.3)
+  proposals per node (count, first view, last view): {0: (1023, 1, 1023), 1: (1024, 1024, 2047), 2: (67, 2048, 2114)}  seal-first builds: {0: 755, 1: 436, 2: 0}
+

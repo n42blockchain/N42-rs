@@ -71,6 +71,11 @@ impl StaticFileProviderMetrics {
         operation: StaticFileProviderOperation,
         duration: Option<Duration>,
     ) {
+        // N42: `N42_STORAGE_OP_METRICS=0` skips the per-operation records
+        // (one per appended transaction, receipt and sender).
+        if !crate::providers::op_metrics::enabled() {
+            return;
+        }
         let segment_operation = self
             .segment_operations
             .get(&(segment, operation))

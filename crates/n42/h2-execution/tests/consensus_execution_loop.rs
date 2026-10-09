@@ -223,6 +223,8 @@ async fn commit_finalizes_head_safe_and_finalized_together() {
     // The awaited commit path is what this test is about; the process
     // environment does not get to decide it (`N42_COMMIT_FCU_ASYNC`).
     driver.set_commit_fcu_async(false);
+    // The legacy settlement tags; the split ones are in `settlement_tags.rs`.
+    driver.set_settlement_tags(n42_h2_execution::SettlementTags::Legacy);
     let hash = B256::repeat_byte(0x22);
     driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
     driver.handle_output(&execute(hash)).await;
@@ -240,8 +242,7 @@ async fn commit_finalizes_head_safe_and_finalized_together() {
             _ => None,
         })
         .expect("commit must send a forkchoice update");
-    // HotStuff-2 finality is immediate: a committed block is head, safe, and
-    // finalized in one step — there is no separate justification round to wait for.
+    // Legacy: a committed block is head, safe, and finalized in one step.
     assert_eq!(fcu.head_block_hash, hash);
     assert_eq!(fcu.safe_block_hash, hash);
     assert_eq!(fcu.finalized_block_hash, hash);

@@ -21,6 +21,7 @@
 //! The payload builder side lives with the builder itself, in
 //! `n42-engine-types`, since that builder is this repo's code.
 
+pub mod exec_cache;
 pub mod executed_fields;
 pub mod chainspec;
 pub mod changes;
@@ -35,15 +36,19 @@ pub use chainspec::{
     STATE_SCHEME_KEY, STATE_SCHEME_QMDB,
 };
 pub use changes::{
-    changes_from_alloc, changes_from_bundle, changes_from_execution, with_prague_system_caller, sorted_operations_from_accounts, sorted_operations_from_execution,
+    changes_from_alloc, changes_from_bundle, changes_from_execution, with_prague_system_caller, sorted_operations_from_accounts, sorted_operations_from_accounts_timed, sorted_operations_from_execution, operations_ahead, OpsAhead, OpsSplit,
 };
 pub use hotstuff::{GenesisValidator, HotStuffConfigError, HotStuffGenesisConfig};
-pub use reth_chainspec::qmdb::{deferred_execution_active_at, deferred_execution_time};
+pub use reth_chainspec::qmdb::{
+    check_deferred_execution_depth, deferred_execution_active_at, deferred_execution_depth, deferred_execution_depth_at,
+    deferred_execution_time, DeferredDepthError, DEFERRED_EXECUTION_DEPTH_KEY, SUPPORTED_DEFERRED_EXECUTION_DEPTH,
+};
 /// The tree a producer computed for a block it has not yet sealed.
 pub use n42_qmdb_state::forest::PreparedBlock;
-pub use node_state::{NodeStateError, QmdbNodeState, RootSplit};
-pub use read_view::QmdbReadView;
+pub use node_state::{NodeStateError, OfflockCounters, PersistSplit, QmdbNodeState, RenameOutcome, RootSplit};
+pub use read_view::{QmdbReadView, ViewLockWaits};
 pub use state_reader::{check_hashed_tables_setting, register_state_reader, QmdbStateReader};
 /// The latest-state reader registry the providers consult (`N42_QMDB_READS`).
 pub use reth_storage_api::n42_state;
+pub use exec_cache::{ExecCacheOnInsert, N42TreeValidator, EXEC_CACHE_ENV};
 pub use strategy::{QmdbEngineValidatorBuilder, QmdbStateRootStrategy};

@@ -524,6 +524,8 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             prune_tx_lookup: self.prune_modes.transaction_lookup,
             storage_settings: self.cached_storage_settings(),
             pending_batches: self.pending_rocksdb_batches.clone(),
+            // N42: `N42_ACCOUNT_HISTORY=off` skips the `AccountsHistory` write.
+            write_account_history: !crate::providers::n42_persist::account_history_off(),
         }
     }
 
@@ -621,6 +623,8 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         // N42: each block's plain-state reverts, converted once for the static-file changesets and
         // the RocksDB history indices, which converted the same reverts four times a block
         // (~147,000 accounts each at the fleet's tier).
+        let n42_timers = crate::providers::n42_persist::metrics();
+        let reverts_start = Instant::now();
         let plain_reverts: Vec<revm::database::states::PlainStateReverts> = if first_number.is_some() {
             use rayon::prelude::*;
             blocks
@@ -630,6 +634,9 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         } else {
             Vec::new()
         };
+        n42_timers.save_blocks_plain_reverts.record(reverts_start.elapsed());
+        n42_timers.save_blocks_pre_scope.record(total_start.elapsed());
+        let scope_start = Instant::now();
 
         let mut sf_result = None;
         let mut rocksdb_result = None;
@@ -639,7 +646,20 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         // Propagate tracing context into rayon-spawned threads so that static file
         // and RocksDB write spans appear as children of save_blocks in traces.
         let span = tracing::Span::current();
-        runtime.storage_pool().in_place_scope(|s| {
+        // N42: with `N42_PERSIST_QMDB_IN_SCOPE=1` the QMDB read view's `on_state_persisted` runs
+        // beside the backend writes instead of after them (`n42_persist::run_with_qmdb_persisted`).
+        let n42_qmdb_in_scope = crate::providers::n42_persist::persist_qmdb_in_scope();
+        let n42_scope_reader = (n42_qmdb_in_scope &&
+            save_mode.with_state() &&
+            !state_trie_blocks.is_empty())
+        .then(reth_storage_api::n42_state::registered)
+        .flatten();
+        let n42_scope_blocks: Vec<_> = if n42_scope_reader.is_some() {
+            state_trie_blocks.iter().map(|block| block.recovered_block().num_hash()).collect()
+        } else {
+            Vec::new()
+        };
+        let n42_backend_writes = || runtime.storage_pool().in_place_scope(|s| {
             // SF writes
             if sf_ctx.is_some() {
                 s.spawn(|_| {
@@ -782,6 +802,14 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             if !blocks.is_empty() {
                 self.update_pipeline_stages(last_block_number, false)?;
             }
+            // N42: a batch that skipped the account-history index opens the gap marker (in this
+            // transaction, so it commits with the batch); see `n42_account_history.rs`.
+            if let (true, Some(first_number), Some(ctx)) =
+                (rocksdb_enabled, first_number, rocksdb_ctx.as_ref()) &&
+                !ctx.write_account_history
+            {
+                self.n42_note_account_history_skipped(first_number)?;
+            }
             if save_mode.with_state() {
                 let checkpoint = match partial_state_trie {
                     Some(partial_state_trie) => StageCheckpoint::new(last_block_number)
@@ -797,15 +825,25 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             timings.mdbx = mdbx_start.elapsed();
 
             Ok::<_, ProviderError>(())
-        })?;
+        });
+        crate::providers::n42_persist::run_with_qmdb_persisted(
+            n42_scope_reader,
+            &n42_scope_blocks,
+            true,
+            n42_backend_writes,
+        )?;
+        n42_timers.save_blocks_scope.record(scope_start.elapsed());
+        let post_scope_start = Instant::now();
 
         // N42: the state/trie blocks' hashed state is written (committed with this transaction); a
         // registered QMDB reader moves with it.
-        if save_mode.with_state() && !state_trie_blocks.is_empty() {
+        if !n42_qmdb_in_scope && save_mode.with_state() && !state_trie_blocks.is_empty() {
             if let Some(reader) = reth_storage_api::n42_state::registered() {
+                let qmdb_start = Instant::now();
                 let persisted: Vec<_> =
                     state_trie_blocks.iter().map(|block| block.recovered_block().num_hash()).collect();
                 reader.on_state_persisted(&persisted);
+                n42_timers.save_blocks_qmdb_persisted.record(qmdb_start.elapsed());
             }
         }
 
@@ -823,6 +861,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         }
 
         timings.total = total_start.elapsed();
+        n42_timers.save_blocks_post_scope.record(post_scope_start.elapsed());
 
         self.metrics.record_save_blocks(&timings);
         if let Some(first_number) = first_number {
@@ -1693,6 +1732,10 @@ impl<TX: DbTx, N: NodeTypes> ChangeSetReader for DatabaseProvider<TX, N> {
     }
 }
 
+// N42: the `N42_ACCOUNT_HISTORY=off` gap marker and the gap-aware historical account read.
+#[path = "n42_account_history.rs"]
+mod n42_account_history;
+
 impl<TX: DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
     /// Returns the `RocksDB` snapshot used for history lookups, creating it on first use.
     ///
@@ -1726,6 +1769,19 @@ impl<TX: DbTx + 'static, N: NodeTypes> HistoryReader for DatabaseProvider<TX, N>
         lowest_available_block_number: Option<BlockNumber>,
     ) -> ProviderResult<HistoryInfo> {
         let visible_tip = self.best_block_number()?;
+        // N42: above the `N42_ACCOUNT_HISTORY=off` gap the changesets answer, not the index.
+        if self.cached_storage_settings().storage_v2 &&
+            let Some(gap) = self.n42_account_history_gap()? &&
+            gap <= visible_tip
+        {
+            return self.n42_account_history_info_in_gap(
+                address,
+                block_number,
+                lowest_available_block_number,
+                visible_tip,
+                gap,
+            )
+        }
         let mut reader = EitherReader::new_accounts_history(self, self.history_rocksdb_snapshot())?;
         reader
             .account_history_info(address, block_number, lowest_available_block_number, visible_tip)
@@ -2396,6 +2452,8 @@ impl<TX: DbTxMut + DbTx, N: NodeTypes> DatabaseProvider<TX, N> {
             .min(block_number);
 
         self.update_pipeline_stages(block_number, true)?;
+        // N42: an unwind below the account-history gap closes it.
+        self.n42_close_account_history_gap(block_number)?;
         if partial_state_trie < block_number {
             self.save_stage_checkpoint(
                 StageId::Finish,
@@ -4054,6 +4112,11 @@ impl<TX: Send, N: NodeTypes> StoragePath for DatabaseProvider<TX, N> {
         self.db_path.clone()
     }
 }
+
+// N42: tests of `N42_PERSIST_QMDB_IN_SCOPE` and `N42_ACCOUNT_HISTORY`.
+#[cfg(test)]
+#[path = "n42_persist_tests.rs"]
+mod n42_persist_tests;
 
 #[cfg(test)]
 mod tests {

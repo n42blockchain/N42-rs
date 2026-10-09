@@ -1,0 +1,6 @@
+  20:31:51 latest (3087, '0xb76ffd5972'), safe (3087, '0xb76ffd5972'), finalized (3087, '0xb76ffd5972'); latest-safe 0, latest-finalized 0
+  20:31:53 latest (3120, '0xaae5da9ef0'), safe (3120, '0xaae5da9ef0'), finalized (3120, '0xaae5da9ef0'); latest-safe 0, latest-finalized 0
+  20:31:55 latest (3153, '0xd7cdf67eae'), safe (3153, '0xd7cdf67eae'), finalized (3153, '0xd7cdf67eae'); latest-safe 0, latest-finalized 0
+  20:31:57 latest (3185, '0x7e420e0e4a'), safe (3185, '0x7e420e0e4a'), finalized (3185, '0x7e420e0e4a'); latest-safe 0, latest-finalized 0
+  commit forkchoice lines 0, of which -38006 Too deep reorg 0 (0%; the depth-1 legs of the same fleet: loop346 WARM 1,754 / WARMb 1,684 / A1 1,928 such lines); stop-class lines (-38002, refused, unknown ancestor, ParentUnknown): 0
+RESULT ok

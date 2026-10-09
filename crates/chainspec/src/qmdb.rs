@@ -103,6 +103,124 @@ pub fn deferred_execution_active_at(genesis: &Genesis, timestamp: u64) -> bool {
     deferred_execution_time(genesis).is_some_and(|at| timestamp >= at)
 }
 
+/// Genesis `config` key: how many blocks behind a header the execution result
+/// it carries is (`docs/DEFERRED_DEPTH_2_DESIGN.md`). Absent means 1: a
+/// header carries its parent's result. At 2 it carries its parent's
+/// parent's. A chain constant, read once, for every block at or past
+/// [`DEFERRED_EXECUTION_TIME_KEY`].
+pub const DEFERRED_EXECUTION_DEPTH_KEY: &str = "deferredExecutionDepth";
+
+/// The deepest deferred-execution depth the rule is defined for.
+pub const MAX_DEFERRED_EXECUTION_DEPTH: u64 = 2;
+
+/// The deepest depth this build of the node runs. A depth the rule defines
+/// but the node does not yet implement is refused at start-up.
+pub const SUPPORTED_DEFERRED_EXECUTION_DEPTH: u64 = 2;
+
+/// Why a genesis's `deferredExecutionDepth` is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeferredDepthError {
+    /// Not a JSON integer (a string, a float, `null`, a negative number...).
+    NotAnInteger(String),
+    /// An integer outside `1..=MAX_DEFERRED_EXECUTION_DEPTH`.
+    OutOfRange(u64),
+    /// The depth is set but `deferredExecutionTime` is absent.
+    WithoutGate,
+    /// `deferredExecutionTime` is present but not an unsigned integer.
+    MalformedGate(String),
+    /// A depth above 1 with the gate after the genesis timestamp: a depth
+    /// above 1 applies from block 1 or not at all.
+    GateAfterGenesis {
+        /// `deferredExecutionTime`.
+        gate: u64,
+        /// The genesis timestamp.
+        genesis: u64,
+    },
+    /// A valid depth this build of the node does not implement yet.
+    NotImplemented(u64),
+}
+
+impl core::fmt::Display for DeferredDepthError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotAnInteger(value) => {
+                write!(f, "{DEFERRED_EXECUTION_DEPTH_KEY} must be an integer 1 or 2, found {value}")
+            }
+            Self::OutOfRange(depth) => {
+                write!(f, "{DEFERRED_EXECUTION_DEPTH_KEY} must be 1 or 2, found {depth}")
+            }
+            Self::WithoutGate => {
+                write!(f, "{DEFERRED_EXECUTION_DEPTH_KEY} is set but {DEFERRED_EXECUTION_TIME_KEY} is not")
+            }
+            Self::MalformedGate(value) => {
+                write!(f, "{DEFERRED_EXECUTION_TIME_KEY} must be an unsigned integer, found {value}")
+            }
+            Self::GateAfterGenesis { gate, genesis } => write!(
+                f,
+                "{DEFERRED_EXECUTION_DEPTH_KEY} above 1 needs {DEFERRED_EXECUTION_TIME_KEY} at or before the \
+                 genesis timestamp {genesis}, found {gate}"
+            ),
+            Self::NotImplemented(depth) => write!(
+                f,
+                "{DEFERRED_EXECUTION_DEPTH_KEY} {depth} is not implemented by this node yet (it runs depth \
+                 {SUPPORTED_DEFERRED_EXECUTION_DEPTH} at most)"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for DeferredDepthError {}
+
+/// The chain's deferred-execution depth, parsed strictly: absent is 1; a
+/// present value must be the integer 1 or 2, and needs
+/// `deferredExecutionTime` beside it (an unsigned integer); a depth above 1
+/// needs that gate at or before the genesis timestamp.
+///
+/// Strict because the other parsers here swallow a malformed value, and for
+/// the depth that would be a silent change of rule: a typo would give depth 1,
+/// and a depth-1 member of a depth-2 fleet refuses every header.
+pub fn deferred_execution_depth(genesis: &Genesis) -> Result<u64, DeferredDepthError> {
+    let Some(value) = genesis.config.extra_fields.get(DEFERRED_EXECUTION_DEPTH_KEY) else {
+        return Ok(1);
+    };
+    let gate = match genesis.config.extra_fields.get(DEFERRED_EXECUTION_TIME_KEY) {
+        None => return Err(DeferredDepthError::WithoutGate),
+        Some(gate) => gate.as_u64().ok_or_else(|| DeferredDepthError::MalformedGate(gate.to_string()))?,
+    };
+    let depth = value.as_u64().ok_or_else(|| DeferredDepthError::NotAnInteger(value.to_string()))?;
+    if !(1..=MAX_DEFERRED_EXECUTION_DEPTH).contains(&depth) {
+        return Err(DeferredDepthError::OutOfRange(depth));
+    }
+    if depth > 1 && gate > genesis.timestamp {
+        return Err(DeferredDepthError::GateAfterGenesis { gate, genesis: genesis.timestamp });
+    }
+    Ok(depth)
+}
+
+/// [`deferred_execution_depth`], and refused when this build of the node
+/// does not implement the depth: what a node calls at start-up.
+pub fn check_deferred_execution_depth(genesis: &Genesis) -> Result<u64, DeferredDepthError> {
+    let depth = deferred_execution_depth(genesis)?;
+    if depth > SUPPORTED_DEFERRED_EXECUTION_DEPTH {
+        return Err(DeferredDepthError::NotImplemented(depth));
+    }
+    Ok(depth)
+}
+
+/// The depth a header stamped `timestamp` follows: 1 before the gate (where
+/// a header carries its own execution and the depth is moot), the chain's
+/// depth at or past it.
+///
+/// A value [`deferred_execution_depth`] refuses reads as 1 here: the node
+/// refuses to start on such a genesis ([`check_deferred_execution_depth`]),
+/// so on a running node this is the validated depth.
+pub fn deferred_execution_depth_at(genesis: &Genesis, timestamp: u64) -> u64 {
+    if !deferred_execution_active_at(genesis, timestamp) {
+        return 1;
+    }
+    deferred_execution_depth(genesis).unwrap_or(1)
+}
+
 /// The QMDB root of a genesis allocation.
 pub fn qmdb_genesis_root(genesis: &Genesis) -> Result<B256, StateError> {
     // The hash the forest is filed under does not affect the root; the real

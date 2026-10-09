@@ -427,6 +427,14 @@ async fn push_loop(
         // The compact body only to a peer that greeted for it; everyone
         // else gets the bytes they have always been sent.
         let compact = (features & FEATURE_COMPACT != 0).then_some(body.compact.as_ref()).flatten();
+        // A block its leader took without the transactions
+        // (`N42_TAKE_COMPACT`) is offered with no whole body: a peer that
+        // does not read compact bodies is sent nothing and fetches the block
+        // by hash, which that leader serves from its execution layer.
+        if compact.is_none() && body.full.is_empty() {
+            debug!(target: "n42.h2.node", %addr, "no whole body to offer this peer; it fetches the block by hash");
+            continue;
+        }
         let sent = compact.unwrap_or(&body.full);
         let result = async {
             if compact.is_some() {
@@ -558,6 +566,41 @@ mod tests {
             assert_eq!(&got[..], &compact[..]);
         } else {
             assert_eq!(&got[..], &full[..]);
+        }
+    }
+
+    /// An offer with no whole body (a block its leader took elided,
+    /// `N42_TAKE_COMPACT`) reaches a peer that reads compact bodies as the
+    /// compact one, and a peer that does not as nothing at all -- never as
+    /// an empty body. The next offer after it arrives as ever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_offer_without_a_whole_body_is_never_sent_as_an_empty_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let (tx, mut rx) = mpsc::channel(4);
+        listen(addr, tx).await.unwrap();
+        let pushers = BodyPushers::connect(vec![addr]);
+        let compact = vec![2u8; 64];
+        assert_eq!(
+            pushers.push(OfferedBody {
+                full: alloy_primitives::Bytes::new(),
+                compact: Some(alloy_primitives::Bytes::from(compact.clone())),
+            }),
+            1
+        );
+        let next = vec![3u8; 32];
+        assert_eq!(
+            pushers.push(OfferedBody { full: alloy_primitives::Bytes::from(next.clone()), compact: None }),
+            1
+        );
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        if got.is_compact() {
+            assert_eq!(&got[..], &compact[..]);
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+            assert_eq!(&got[..], &next[..]);
+        } else {
+            assert_eq!(&got[..], &next[..], "the elided offer was skipped, not sent empty");
         }
     }
 }

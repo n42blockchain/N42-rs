@@ -90,6 +90,12 @@ const VERSION: u8 = 1;
 /// The frame-description version (see the module docs).
 const VERSION_FRAMES: u8 = 2;
 
+/// Maximum transactions described by a compact body, matching the direct
+/// channel's transaction-recovery index limit. Frame descriptions must be
+/// bounded independently of their wire size: one count can name billions
+/// of missing positions that the assembler would otherwise materialize.
+pub const MAX_COMPACT_TXS: usize = 1 << 20;
+
 /// Introduces the fill section. A frame either ends after the access list or
 /// carries exactly this and then the fill; anything else is refused, so the
 /// optional section cannot be read out of trailing rubbish.
@@ -188,6 +194,13 @@ impl<'a> Reader<'a> {
         let n = self.u32()? as usize;
         self.take(n)
     }
+    fn optional_bytes(&mut self) -> Result<Option<&'a [u8]>, BlockBodyError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => self.bytes().map(Some),
+            _ => Err(invalid()),
+        }
+    }
     /// The magic and a version this module reads; the version.
     fn start(&mut self) -> Result<u8, BlockBodyError> {
         if self.take(MAGIC.len())? != MAGIC {
@@ -204,6 +217,9 @@ impl<'a> Reader<'a> {
     fn listing(&mut self, version: u8) -> Result<(Vec<B256>, Option<Vec<(B256, u32)>>, usize), BlockBodyError> {
         if version == VERSION {
             let count = self.u32()? as usize;
+            if count > MAX_COMPACT_TXS {
+                return Err(invalid());
+            }
             let raw = self.take(count.checked_mul(32).ok_or_else(invalid)?)?;
             // Exactly `count` whole hashes: the take above sized the slice,
             // so the remainder `as_chunks` hands back is empty.
@@ -223,6 +239,9 @@ impl<'a> Reader<'a> {
                 return Err(invalid());
             }
             sum = sum.checked_add(count as usize).ok_or_else(invalid)?;
+            if sum > MAX_COMPACT_TXS {
+                return Err(invalid());
+            }
             frames.push((id, count));
         }
         if self.u32()? as usize != sum {
@@ -394,9 +413,7 @@ pub fn merge_fill(
     let (_, _, count) = r.listing(version)?;
     r.bytes()?;
     r.bytes()?;
-    if r.u8()? == 1 {
-        r.bytes()?;
-    }
+    r.optional_bytes()?;
     let base = frame.len() - r.0.len();
     let mut merged: std::collections::BTreeMap<usize, &[u8]> = std::collections::BTreeMap::new();
     if !r.0.is_empty() {
@@ -484,7 +501,7 @@ pub fn decode_compact_body(
     let (hashes, frames, count) = r.listing(version)?;
     let verifiers_rlp = r.bytes()?;
     let rewards_rlp = r.bytes()?;
-    let bal = if r.u8()? == 1 { Some(r.bytes()?) } else { None };
+    let bal = r.optional_bytes()?;
     // The fill, when the side that assembles appended one. Strict: the
     // marker must be exactly right and the section must end the frame.
     let mut fill = Vec::new();
@@ -493,7 +510,10 @@ pub fn decode_compact_body(
             return Err(invalid());
         }
         let n = r.u32()? as usize;
-        if n > count {
+        // Each fill entry needs at least an index and a length. A frame
+        // description can claim billions of transactions in a few bytes;
+        // never reserve from that count before checking the actual input.
+        if n > count || n > r.0.len() / 8 {
             return Err(invalid());
         }
         fill.reserve(n);
@@ -657,6 +677,45 @@ mod tests {
         let v1 = encode_compact_body(&body, &hashes, N42HeaderProfile::Ethereum).expect("encodes");
         assert!(!is_compact_frame_body(&v1));
         assert_eq!(v1[MAGIC.len()], VERSION);
+    }
+
+    #[test]
+    fn a_tiny_frame_cannot_reserve_a_huge_fill() {
+        let body = encode_block_rlp_raw(&header(), &[], &[], None);
+        let mut frame = encode_compact_frame_body(
+            &body,
+            &[(B256::ZERO, MAX_COMPACT_TXS as u32)],
+            N42HeaderProfile::Ethereum,
+        ).unwrap();
+        frame.push(FILL_PRESENT);
+        frame.extend_from_slice(&(MAX_COMPACT_TXS as u32).to_le_bytes());
+        assert!(decode_compact_body(&frame, N42HeaderProfile::Ethereum).is_err());
+    }
+
+    #[test]
+    fn frame_counts_are_bounded_even_without_a_fill() {
+        let body = encode_block_rlp_raw(&header(), &[], &[], None);
+        for frames in [
+            vec![(B256::ZERO, u32::MAX)],
+            vec![(B256::ZERO, MAX_COMPACT_TXS as u32), (B256::repeat_byte(1), 1)],
+        ] {
+            let frame = encode_compact_frame_body(&body, &frames, N42HeaderProfile::Ethereum).unwrap();
+            assert!(decode_compact_body(&frame, N42HeaderProfile::Ethereum).is_err());
+            assert!(merge_fill(&frame, &[]).is_err());
+        }
+        let frame = encode_compact_frame_body(
+            &body, &[(B256::ZERO, MAX_COMPACT_TXS as u32)], N42HeaderProfile::Ethereum,
+        ).unwrap();
+        assert_eq!(decode_compact_body(&frame, N42HeaderProfile::Ethereum).unwrap().len(), MAX_COMPACT_TXS);
+    }
+
+    #[test]
+    fn an_unknown_access_list_marker_is_refused() {
+        let body = encode_block_rlp_raw(&header(), &[], &[], None);
+        let mut frame = encode_compact_body(&body, &[], N42HeaderProfile::Ethereum).unwrap();
+        *frame.last_mut().unwrap() = 2;
+        assert!(decode_compact_body(&frame, N42HeaderProfile::Ethereum).is_err());
+        assert!(merge_fill(&frame, &[]).is_err());
     }
 
     #[test]

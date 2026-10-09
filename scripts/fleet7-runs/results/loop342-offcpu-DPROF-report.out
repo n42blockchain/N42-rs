@@ -1,0 +1,26 @@
+samples 106643, switch records 213848, stacks 15, off-CPU 200126.1 ms (200066.9 voluntary, 59.2 preempted)
+by blocking site (leaf-most named frames; share of off-CPU time, switches, mean ms):
+  100.0%   106607    1.877  [no named frame]
+    0.0%       10    3.618  <rayon_core::sleep::Sleep>::sleep::<<rayon_core::registry::WorkerThread>::wait_until_cold::{closure#0}>
+    0.0%        1    0.134  <rayon_core::sleep::Sleep>::sleep::<<rayon_core::registry::WorkerThread>::wait_until_cold::{closure#0}> <- rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::slice::IterProducer<alloc::vec::Vec<&alloc::vec::Vec<usize>>>, rayon::iter::map::MapConsumer<rayon::iter::collect::consumer::Col
+    0.0%        3    0.010  <std::sys::sync::mutex::futex::Mutex>::lock_contended <- <core::iter::adapters::map::Map<core::slice::iter::Iter<reth_chain_state::in_memory::ExecutedBlock<n42_tx_types::primitives::N42Primitives>>, reth_provider::providers::state::memory_overlay::filters_of<n42_tx_types::primitives::N42Primitives>:
+    0.0%        1    0.016  <std::sys::sync::mutex::futex::Mutex>::lock_contended <- reth_provider::providers::state::overlay_filter::filter_for::<alloy_consensus::receipt::receipt2::EthereumReceipt<n42_tx_types::envelope::N42TxType>>
+    0.0%        1    0.008  __sched_yield
+    0.0%        1    0.005  <std::sys::sync::mutex::futex::Mutex>::lock_contended <- <rayon_core::sleep::Sleep>::wake_specific_thread
+folded stacks: /data/n42-build/target-n42-rs/fleet-runs/offcpu-loop342DPROF.offcpu.folded (flamegraph.pl --countname=us)
+wchan samples (thread state, kernel wait channel; off-CPU only):
+  S	futex_do_wait	144875
+  S	0	743
+  S	futex_wait	7
+  S	prepare_task_switch	7
+  S	perf_event_switch_output	6
+  S	__futex_wait	4
+  S	do_syscall_64	3
+  S	perf_iterate_ctx	3
+  S	do_sched_yield	2
+  S	perf_event_output_forward	2
+  S	sched_clock	2
+  D	0	1
+  S	copy_from_user_nmi	1
+  S	perf_ctx_enable	1
+  S	schedule	1

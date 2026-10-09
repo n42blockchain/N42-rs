@@ -65,14 +65,23 @@ pub fn decode_tx_batch(payload: &[u8]) -> Result<Vec<Bytes>, TxGossipError> {
     match payload.first() {
         None => Err(TxGossipError::Empty),
         Some(&TX_BATCH_MARKER) => {
+            if payload.len() > TX_BATCH_MAX_BYTES {
+                return Err(TxGossipError::TooLarge(payload.len()));
+            }
             let mut cursor = &payload[1..];
-            let transactions =
-                Vec::<Bytes>::decode(&mut cursor).map_err(|_| TxGossipError::InvalidBatch)?;
-            if !cursor.is_empty() || transactions.is_empty() {
+            let header = alloy_rlp::Header::decode(&mut cursor).map_err(|_| TxGossipError::InvalidBatch)?;
+            if !header.list || header.payload_length != cursor.len() {
                 return Err(TxGossipError::InvalidBatch);
             }
-            if transactions.len() > TX_BATCH_MAX_TXS {
-                return Err(TxGossipError::TooMany(transactions.len()));
+            let mut transactions = Vec::new();
+            while !cursor.is_empty() {
+                if transactions.len() == TX_BATCH_MAX_TXS {
+                    return Err(TxGossipError::TooMany(TX_BATCH_MAX_TXS + 1));
+                }
+                transactions.push(Bytes::decode(&mut cursor).map_err(|_| TxGossipError::InvalidBatch)?);
+            }
+            if transactions.is_empty() {
+                return Err(TxGossipError::InvalidBatch);
             }
             Ok(transactions)
         }
@@ -83,6 +92,18 @@ pub fn decode_tx_batch(payload: &[u8]) -> Result<Vec<Bytes>, TxGossipError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_incoming_batch_obeys_the_encoder_limits() {
+        let mut oversized = vec![TX_BATCH_MARKER];
+        vec![Bytes::from(vec![0; TX_BATCH_MAX_BYTES])].encode(&mut oversized);
+        assert_eq!(decode_tx_batch(&oversized), Err(TxGossipError::TooLarge(oversized.len())));
+        let mut crowded = vec![TX_BATCH_MARKER];
+        vec![Bytes::new(); TX_BATCH_MAX_TXS + 1].encode(&mut crowded);
+        assert_eq!(decode_tx_batch(&crowded), Err(TxGossipError::TooMany(TX_BATCH_MAX_TXS + 1)));
+        let at_limit = vec![Bytes::new(); TX_BATCH_MAX_TXS];
+        assert_eq!(decode_tx_batch(&encode_tx_batch(&at_limit).unwrap()).unwrap(), at_limit);
+    }
 
     #[test]
     fn a_batch_round_trips_and_a_bare_transaction_is_one() {

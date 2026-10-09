@@ -211,6 +211,102 @@ async fn a_path_that_is_not_the_canonical_engine_api_is_not_this_way() {
     assert!(matches!(outcome, BodyOutcome::NotThisWay));
 }
 
+// ---- held bodies (`N42_VOTE_BEFORE_SLOT`) -----------------------------------
+
+/// What a held request's server saw: the prefix and kind it read, and the
+/// release byte, with whether the byte came before the test released.
+#[derive(Debug, Default)]
+struct HeldSeen {
+    prefix: u8,
+    kind: u8,
+    byte: Option<u8>,
+}
+
+/// One connection: reads `HOLD_EXECUTION`, the body request, answers
+/// CHECKED, reads the release byte, then answers VALUE (execute) or ERROR
+/// (drop), as the execution layer's server does.
+async fn serve_held() -> (std::net::SocketAddr, Arc<Mutex<HeldSeen>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds");
+    let addr = listener.local_addr().expect("addr");
+    let seen = Arc::new(Mutex::new(HeldSeen::default()));
+    let out = Arc::clone(&seen);
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else { return };
+        let Ok(prefix) = stream.read_u8().await else { return };
+        let Ok(kind) = stream.read_u8().await else { return };
+        let Ok(len) = stream.read_u32_le().await else { return };
+        let mut body = vec![0u8; len as usize];
+        if stream.read_exact(&mut body).await.is_err() {
+            return;
+        }
+        {
+            let mut seen = out.lock().unwrap();
+            seen.prefix = prefix;
+            seen.kind = kind;
+        }
+        if stream.write_all(&frame(reply::CHECKED, &status(PayloadStatusEnum::Valid))).await.is_err() {
+            return;
+        }
+        let Ok(byte) = stream.read_u8().await else { return };
+        out.lock().unwrap().byte = Some(byte);
+        let answer = if byte == raw_engine::release::EXECUTE {
+            frame(reply::VALUE, &status(PayloadStatusEnum::Valid))
+        } else {
+            frame(reply::ERROR, b"dropped")
+        };
+        let _ = stream.write_all(&answer).await;
+    });
+    (addr, seen)
+}
+
+#[tokio::test]
+async fn a_held_body_votes_then_waits_for_its_release_byte() {
+    env();
+    let (addr, seen) = serve_held().await;
+    let client = EngineApiClient::new(Endpoint(addr));
+    assert!(client.holds_execution());
+    let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let body = body(true);
+    let call = client.new_payload_body_held(ExecutionPath::LIVE_SEQUENTIAL, &body, checked_tx, release_rx);
+    tokio::pin!(call);
+    // The check arrives while the call is still open: the vote goes out
+    // before any slot.
+    let checked = tokio::select! {
+        checked = checked_rx => checked.expect("checked"),
+        outcome = &mut call => panic!("answered before the release: {outcome:?}"),
+    };
+    assert!(matches!(checked.status, PayloadStatusEnum::Valid));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(seen.lock().unwrap().byte, None, "no release byte before the slot");
+    release_tx.send(true).expect("the call waits for it");
+    let outcome = call.await;
+    assert!(matches!(outcome, BodyOutcome::Answered(Ok(_))), "{outcome:?}");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.prefix, request::HOLD_EXECUTION);
+    assert_eq!(seen.kind, request::COMPACT_BODY);
+    assert_eq!(seen.byte, Some(raw_engine::release::EXECUTE));
+}
+
+#[tokio::test]
+async fn a_dropped_held_body_sends_the_drop_byte_and_answers_the_drop() {
+    env();
+    let (addr, seen) = serve_held().await;
+    let client = EngineApiClient::new(Endpoint(addr));
+    let (checked_tx, _checked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<bool>();
+    // A dropped sender is a drop.
+    drop(release_tx);
+    let outcome = client.new_payload_body_held(ExecutionPath::LIVE_SEQUENTIAL, &body(false), checked_tx, release_rx).await;
+    match outcome {
+        BodyOutcome::Answered(Err(err)) => assert_eq!(err.to_string(), n42_h2_execution::HELD_IMPORT_DROPPED),
+        other => panic!("expected the drop, got {other:?}"),
+    }
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.kind, request::FOREIGN_BODY);
+    assert_eq!(seen.byte, Some(raw_engine::release::DROP));
+}
+
 // ---- hashed build answers --------------------------------------------------
 
 fn header(number: u64) -> Header {
@@ -336,4 +432,71 @@ async fn a_build_on_the_sealed_block_asks_for_hashes_and_reads_them() {
     };
     let built = client.build_on_own_block(&header(5), attrs).await.expect("answered").expect("built");
     assert_eq!(built.tx_hashes, hashes);
+}
+
+// ---- check-only requests (`N42_CHECK_BEFORE_SLOT`) --------------------------
+
+fn checked_status(named: B256) -> Vec<u8> {
+    raw_engine::encode_payload_status(&PayloadStatus { status: PayloadStatusEnum::Valid, latest_valid_hash: Some(named) })
+}
+
+/// A check-only request is one frame each way, and only a CHECKED frame
+/// naming exactly the block asked about vouches for it: a CHECKED frame for
+/// another build, an ERROR, a non-VALID status or a dead connection is no
+/// vote. The connection stays usable after every answer.
+#[tokio::test]
+async fn a_check_only_answer_vouches_only_for_the_block_asked_about() {
+    env();
+    let block = B256::repeat_byte(0x11);
+    let other = B256::repeat_byte(0x22);
+    let header_rlp = alloy_rlp::encode(Header { number: 7, ..Default::default() });
+    // The answer is chosen by the header's number byte: 1 the block, 2 another
+    // build, 3 an ERROR, 4 a SYNCING status.
+    let answer = Arc::new(Mutex::new(1u8));
+    let pick = Arc::clone(&answer);
+    let (addr, observed) = serve(Arc::new(move |kind, _frame| {
+        assert_eq!(kind, request::CHECK_ONLY, "a check-only request and nothing else");
+        Some(match *pick.lock().unwrap() {
+            1 => frame(reply::CHECKED, &checked_status(B256::repeat_byte(0x11))),
+            2 => frame(reply::CHECKED, &checked_status(B256::repeat_byte(0x22))),
+            3 => frame(reply::ERROR, b"not checked here"),
+            _ => frame(
+                reply::CHECKED,
+                &raw_engine::encode_payload_status(&PayloadStatus {
+                    status: PayloadStatusEnum::Syncing,
+                    latest_valid_hash: Some(B256::repeat_byte(0x11)),
+                }),
+            ),
+        })
+    }))
+    .await;
+    let client = EngineApiClient::new(Endpoint(addr));
+    assert!(client.checks_only());
+    for (which, want) in [(1u8, true), (2, false), (3, false), (4, false), (1, true)] {
+        *answer.lock().unwrap() = which;
+        assert_eq!(client.check_only(block, header_rlp.clone().into()).await, want, "answer {which}");
+    }
+    // The block named by answer 2 is vouched for only when asked about.
+    *answer.lock().unwrap() = 2;
+    assert!(client.check_only(other, header_rlp.clone().into()).await);
+    let requests = observed.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 6);
+    assert!(requests.iter().all(|(kind, frame)| *kind == request::CHECK_ONLY && frame == &header_rlp));
+    assert_eq!(observed.connections.load(Ordering::SeqCst), 1, "one connection, reused after every answer");
+}
+
+/// No raw channel: nothing is vouched for and the vote waits for the import.
+#[tokio::test]
+async fn a_check_only_request_without_a_channel_vouches_for_nothing() {
+    env();
+    #[derive(Debug)]
+    struct NoChannel;
+    #[async_trait::async_trait]
+    impl JsonRpcTransport for NoChannel {
+        async fn call(&self, _method: &str, _params: Vec<Value>) -> Result<Value, TransportError> {
+            Err(TransportError::Rpc(RpcError { code: -32601, message: "method not found".into() }))
+        }
+    }
+    let client = EngineApiClient::new(NoChannel);
+    assert!(!client.check_only(B256::repeat_byte(1), vec![0xc0].into()).await);
 }

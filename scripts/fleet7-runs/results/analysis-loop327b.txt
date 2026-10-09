@@ -1,0 +1,63 @@
+== loop327bHb
+  node1: window-1 direct imports 242; status {'Valid': 1266}
+    handoff_wait_us median/p90 33.0/63.0; handoff_before_canonical {'false': 192, 'true': 50}; parent_engine_wait_ms median/p90 0.0/0.0, nonzero 16, exact multiples of 20 1, distribution {0: 235, 20: 5, 40: 2}
+    merge (ms, median/p90): merge_ms 60.0/85.0; merge_wait_ms 46.0/73.0; merge_state_ms 42.0/53.0; merge_reverts_ms 13.0/28.0; merge_append_ms 2.0/8.0; mode Counter({'on_path': 255}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 160.9/211.5 ms (n=243)
+  node2: window-1 direct imports 241; status {'Valid': 2046}
+    handoff_wait_us median/p90 34.0/67.0; handoff_before_canonical {'false': 177, 'true': 64}; parent_engine_wait_ms median/p90 0.0/0.0, nonzero 13, exact multiples of 20 0, distribution {0: 232, 20: 6, 40: 3}
+    merge (ms, median/p90): merge_ms 57.0/83.0; merge_wait_ms 45.0/72.0; merge_state_ms 40.0/53.0; merge_reverts_ms 12.0/27.0; merge_append_ms 2.0/9.0; mode Counter({'on_path': 255}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 161.0/215.0 ms (n=243)
+  watch: Sidechain block not found 0; invalid block 0; TC formed 1; Too deep reorg 2
+== loop327bHMS
+  node1: window-1 direct imports 241; status {'Valid': 1281}
+    handoff_wait_us median/p90 35.0/62.0; handoff_before_canonical {'false': 171, 'true': 70}; parent_engine_wait_ms median/p90 0.0/0.0, nonzero 13, exact multiples of 20 0, distribution {0: 233, 20: 7, 40: 1}
+    merge (ms, median/p90): merge_ms 50.0/67.0; merge_wait_ms 35.0/54.0; merge_state_ms 44.0/57.0; merge_reverts_ms 17.0/24.0; merge_append_ms 4.0/13.0; mode Counter({'concurrent': 255}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 156.5/202.7 ms (n=242)
+  node2: window-1 direct imports 241; status {'Valid': 2046}
+    handoff_wait_us median/p90 32.0/49.0; handoff_before_canonical {'false': 192, 'true': 49}; parent_engine_wait_ms median/p90 0.0/0.0, nonzero 9, exact multiples of 20 0, distribution {0: 238, 20: 3}
+    merge (ms, median/p90): merge_ms 50.0/63.0; merge_wait_ms 33.0/48.0; merge_state_ms 44.0/53.0; merge_reverts_ms 16.0/23.0; merge_append_ms 4.0/12.0; mode Counter({'concurrent': 255}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 144.3/185.7 ms (n=243)
+  watch: Sidechain block not found 0; invalid block 0; TC formed 1; Too deep reorg 0
+== loop327bHMP90
+  node1: window-1 direct imports 241; status {'Valid': 1415}
+    handoff_wait_us median/p90 35.0/7352.0; handoff_before_canonical {'false': 148, 'true': 93}; parent_engine_wait_ms median/p90 0.0/7.0, nonzero 28, exact multiples of 20 1, distribution {0: 220, 20: 13, 40: 8}
+    merge (ms, median/p90): merge_ms 60.0/79.0; merge_wait_ms 47.0/69.0; merge_state_ms 51.0/68.0; merge_reverts_ms 18.0/25.0; merge_append_ms 7.0/16.0; mode Counter({'concurrent': 258}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 174.0/232.7 ms (n=243)
+  node2: window-1 direct imports 242; status {'Valid': 2046}
+    handoff_wait_us median/p90 34.0/68.0; handoff_before_canonical {'false': 164, 'true': 78}; parent_engine_wait_ms median/p90 0.0/0.0, nonzero 18, exact multiples of 20 0, distribution {0: 228, 20: 11, 40: 3}
+    merge (ms, median/p90): merge_ms 51.0/68.0; merge_wait_ms 37.0/54.0; merge_state_ms 45.0/57.0; merge_reverts_ms 17.0/25.0; merge_append_ms 4.0/13.0; mode Counter({'concurrent': 258}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 156.6/208.8 ms (n=243)
+  watch: Sidechain block not found 0; invalid block 0; TC formed 1; Too deep reorg 2
+== loop327bHMFS
+  node1: window-1 direct imports 243; status {'Valid': 1287}
+    handoff_wait_us median/p90 36.0/7699.0; handoff_before_canonical {'false': 152, 'true': 91}; parent_engine_wait_ms median/p90 0.0/7.0, nonzero 28, exact multiples of 20 1, distribution {0: 224, 20: 12, 40: 6, 60: 1}
+    merge (ms, median/p90): merge_ms 52.0/72.0; merge_wait_ms 39.0/60.0; merge_state_ms 45.0/59.0; merge_reverts_ms 17.0/25.0; merge_append_ms 5.0/15.0; mode Counter({'concurrent': 258}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 159.4/215.8 ms (n=245)
+  node2: window-1 direct imports 243; status {'Valid': 2046}
+    handoff_wait_us median/p90 36.0/87.0; handoff_before_canonical {'false': 132, 'true': 111}; parent_engine_wait_ms median/p90 0.0/0.0, nonzero 19, exact multiples of 20 2, distribution {0: 227, 20: 11, 40: 5}
+    merge (ms, median/p90): merge_ms 52.5/74.0; merge_wait_ms 40.0/62.0; merge_state_ms 46.0/60.0; merge_reverts_ms 16.0/24.0; merge_append_ms 5.0/17.0; mode Counter({'concurrent': 258}); at the end of the leg merge_verified 0.0 merge_mismatches 0.0
+    slot hold (vote-road start to slot release) median/p90 161.1/216.9 ms (n=245)
+  watch: Sidechain block not found 0; invalid block 0; TC formed 1; Too deep reorg 10
+-- binding wait per block (bench-loop327bHb); cycle mean 113.6
+   seal     49.8% of blocks, mean cycle  121.7, median  118.2
+   tick     46.5% of blocks, mean cycle  103.4, median  102.0
+   quorum    3.7% of blocks, mean cycle  133.7, median  138.9
+-- binding wait per block (bench-loop327bHMS); cycle mean 113.9
+   seal     66.8% of blocks, mean cycle  118.8, median  116.1
+   tick     32.4% of blocks, mean cycle  103.9, median  101.9
+   quorum    0.8% of blocks, mean cycle  111.8, median  111.8
+-- binding wait per block (bench-loop327bHMP90); cycle mean 114.0
+   seal     72.6% of blocks, mean cycle  118.0, median  115.8
+   tick     22.4% of blocks, mean cycle   99.2, median   92.1
+   quorum    5.0% of blocks, mean cycle  122.8, median  123.0
+-- binding wait per block (bench-loop327bHMFS); cycle mean 112.9
+   tick     69.1% of blocks, mean cycle  102.1, median  101.5
+   seal     26.3% of blocks, mean cycle  138.9, median  134.5
+   quorum    4.5% of blocks, mean cycle  125.5, median  118.7
+--- HMS settlement lines (v.log, n42.h2.el)
+2026-10-05T04:41:30.055564Z  INFO n42.h2.el: commit forkchoice answered block=0x7ea7f881272f487844712b2502ffedba61c83beeabd123bba188e02a98898a2d elapsed_ms=0 in_flight_ms=0 queued_ms=0 safe=Some(15) finalized=Some(9)
+2026-10-05T04:45:55.573433Z  INFO n42.h2.el: commit forkchoice answered block=0xf59eb65ec9116e3114a99e2bf743690327ea102f2ea80a9b07ea464e95340eb8 elapsed_ms=0 in_flight_ms=0 queued_ms=0 safe=Some(2301) finalized=Some(2294)
+2026-10-05T04:41:30.055739Z  INFO n42.h2.el: commit forkchoice answered block=0x7ea7f881272f487844712b2502ffedba61c83beeabd123bba188e02a98898a2d elapsed_ms=0 in_flight_ms=0 queued_ms=0 safe=Some(15) finalized=Some(9)
+2026-10-05T04:45:54.567012Z  INFO n42.h2.el: commit forkchoice answered block=0xc2168148a80572fd60b3958bf6e3fd0cc674318b2719026eb5945a231a26284f elapsed_ms=0 in_flight_ms=0 queued_ms=0 safe=Some(2291) finalized=Some(2283)
+2026-10-05T04:41:30.055850Z  INFO n42.h2.el: commit forkchoice answered block=0x7ea7f881272f487844712b2502ffedba61c83beeabd123bba188e02a98898a2d elapsed_ms=0 in_flight_ms=0 queued_ms=0 safe=Some(15) finalized=Some(9)
+2026-10-05T04:45:55.775068Z  INFO n42.h2.el: commit forkchoice answered block=0xc51a1d1c896f92fb28c84e147f9f7fcd328d9f1ccb5cd177de44d372e42ff75f elapsed_ms=0 in_flight_ms=0 queued_ms=0 safe=Some(2303) finalized=Some(2296)

@@ -8,6 +8,11 @@ mod database;
 pub use database::*;
 
 mod static_file;
+
+// N42: the `N42_STORAGE_OP_METRICS` switch.
+pub(crate) mod op_metrics;
+// N42: persistence-cycle timers and switches (`docs/PERSISTENCE_COST_STUDY.md`).
+pub(crate) mod n42_persist;
 pub use static_file::{
     StaticFileAccess, StaticFileJarProvider, StaticFileProvider, StaticFileProviderBuilder,
     StaticFileProviderRW, StaticFileProviderRWRefMut, StaticFileWriteCtx, StaticFileWriter,
@@ -18,6 +23,7 @@ pub use state::{
     historical::{compute_history_rank, history_info, needs_prev_shard_check, HistoryInfo},
     latest::{LatestStateProvider, LatestStateProviderRef},
     memory_overlay::{MemoryOverlayStateProvider, MemoryOverlayStateProviderRef},
+    overlay_filter,
 };
 
 mod blockchain_provider;

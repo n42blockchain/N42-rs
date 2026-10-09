@@ -9,7 +9,7 @@
 //! |---|---|---|
 //! | (leader for this view) | FCU-with-attrs, then resolve the build | [`ConsensusEvent::BlockReady`] |
 //! | [`EngineOutput::ExecuteBlock`] | `new_payload` for that hash | [`ConsensusEvent::BlockImported`] |
-//! | [`EngineOutput::BlockCommitted`] | FCU with head = safe = finalized | — |
+//! | [`EngineOutput::BlockCommitted`] | FCU with head = the committed block, safe = certified, finalized = certified and persisted ([`crate::settlement`]; `N42_SETTLEMENT_TAGS=legacy`: head = safe = finalized) | — |
 //!
 //! The middle row is the one that matters for safety: N42 votes are
 //! *import-gated*, so a follower only votes after its own execution layer has
@@ -109,7 +109,142 @@ impl Drop for ReportGuard {
 /// and the one being checked behind it. The rest queue -- the pipeline is
 /// one block deep by design, and every block admitted is a payload, a
 /// sender recovery and an executed state held at once.
-const DEFERRED_IN_FLIGHT: usize = 2;
+///
+/// The default of [`deferred_in_flight`] (`N42_DEFERRED_IN_FLIGHT`).
+pub const DEFERRED_IN_FLIGHT: usize = 2;
+
+/// The largest in-flight cap [`deferred_in_flight`] accepts.
+///
+/// A slot is freed only when the block has landed in the engine, so with
+/// `C` imports in flight the next block's check reads its parent's
+/// post-state through up to `C` unlanded ancestors (`C - 1` when it takes
+/// a slot itself, `C` when it votes before one, `N42_VOTE_BEFORE_SLOT`).
+/// The execution layer stacks at most four published outputs over the
+/// nearest landed ancestor and keeps only the last four
+/// (`PARENT_OUTPUTS_KEPT` in `bin/n42/src/follower_import.rs`); past that
+/// the check declines the stack and waits for the engine -- the stall the
+/// cap exists to avoid. Four is therefore the arithmetic limit with no
+/// slack (one published sibling would push an ancestor's output out);
+/// three keeps one.
+pub const DEFERRED_IN_FLIGHT_MAX: usize = 3;
+
+/// Follower lag under `N42_VOTE_BEFORE_SLOT`: imports in flight plus blocks
+/// voted for but not yet admitted to a slot (docs/PHASE_D_DEFERRED_EXECUTION.md
+/// 17.4, P3). A block arriving past it waits for a slot with its vote, as
+/// every queued block does without the switch -- the backpressure.
+pub const FOLLOWER_LAG_CAP: usize = 4;
+
+/// `N42_DEFERRED_IN_FLIGHT`, read once: how many deferred follower imports
+/// run at once (see [`DEFERRED_IN_FLIGHT`]). Valid `1..=`
+/// [`DEFERRED_IN_FLIGHT_MAX`]; anything else is refused loudly and the
+/// default kept.
+pub fn deferred_in_flight() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| match std::env::var("N42_DEFERRED_IN_FLIGHT") {
+        Err(_) => DEFERRED_IN_FLIGHT,
+        Ok(raw) => match parse_in_flight(&raw) {
+            Ok(cap) => cap,
+            Err(err) => {
+                warn!(target: "n42.h2.el", %err, default = DEFERRED_IN_FLIGHT, "N42_DEFERRED_IN_FLIGHT refused");
+                DEFERRED_IN_FLIGHT
+            }
+        },
+    })
+}
+
+/// An in-flight cap, checked against `1..=`[`DEFERRED_IN_FLIGHT_MAX`].
+pub fn parse_in_flight(raw: &str) -> Result<usize, String> {
+    let cap: usize = raw.trim().parse().map_err(|_| format!("{raw:?} is not a count"))?;
+    if (1..=DEFERRED_IN_FLIGHT_MAX).contains(&cap) {
+        Ok(cap)
+    } else {
+        Err(format!("{cap} is outside 1..={DEFERRED_IN_FLIGHT_MAX}"))
+    }
+}
+
+/// `N42_VOTE_BEFORE_SLOT`, read once (off by default): a deferred block
+/// that arrives while every import slot is taken runs its vote road at once
+/// -- the body's assembly, the check, the vote -- and only its execution and
+/// landing wait for a slot, in the order they always did. See
+/// [`ExecutionDriver::set_vote_before_slot`].
+pub fn vote_before_slot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_VOTE_BEFORE_SLOT").is_ok_and(|v| v == "1"))
+}
+
+/// `N42_CHECK_BEFORE_SLOT`, read once (off by default): a deferred block
+/// that arrives while every import slot is taken is *checked* at once by a
+/// check-only request ([`ExecutionLayer::check_only`],
+/// `raw_engine::request::CHECK_ONLY`) and its vote goes out on that answer;
+/// the block itself waits in the queue for its slot and is imported exactly
+/// as without the switch -- same order, same slot bound, same request. See
+/// [`ExecutionDriver::set_check_before_slot`].
+///
+/// Unlike [`vote_before_slot`] nothing is held on the execution layer's side
+/// (no release byte, no registry entry), so it composes with
+/// `N42_IMPORT_ONCE`, where several validator keys share one execution layer.
+pub fn check_before_slot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_CHECK_BEFORE_SLOT").is_ok_and(|v| v == "1"))
+}
+
+/// How many released checks the driver remembers, so a block checked ahead
+/// of its slot does not release its vote a second time when its import's own
+/// check arrives.
+const RELEASED_CHECKS_KEPT: usize = 64;
+
+/// What the check-ahead requests did since start (`N42_CHECK_BEFORE_SLOT`),
+/// for the import line: sent, vouched for, and declined (the vote then waits
+/// for the import's own check, as without the switch).
+#[derive(Debug, Default)]
+struct CheckAheadCounts {
+    sent: std::sync::atomic::AtomicU64,
+    vouched: std::sync::atomic::AtomicU64,
+    declined: std::sync::atomic::AtomicU64,
+}
+
+/// A block voted for ahead of its import slot (`N42_VOTE_BEFORE_SLOT`): its
+/// import task is running, the execution layer has (or is about to have)
+/// assembled and checked it, and its execution waits for `release`.
+#[derive(Debug)]
+struct HeldImport {
+    /// The block number, for the prerequisite rule and the drop rule.
+    number: u64,
+    /// `true` admits the execution to a slot, `false` drops it.
+    release: Option<tokio::sync::oneshot::Sender<bool>>,
+    /// When the block was held, for the slot wait.
+    since: std::time::Instant,
+    /// Where the slot wait goes once the block is released, for the
+    /// import's line.
+    slot_wait_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// What a deferred import's line says about its slot.
+#[derive(Debug, Clone)]
+struct SlotNote {
+    /// The vote ran before an import slot was free.
+    voted_before_slot: bool,
+    /// Blocks voted for and waiting for a slot when this one arrived.
+    held_at_arrival: usize,
+    /// How long the import waited for its slot, set when it got one.
+    slot_wait_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SlotNote {
+    fn new(voted_before_slot: bool, held_at_arrival: usize, slot_wait: Option<std::time::Duration>) -> Self {
+        Self {
+            voted_before_slot,
+            held_at_arrival,
+            slot_wait_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                slot_wait.map_or(0, |wait| wait.as_millis() as u64),
+            )),
+        }
+    }
+}
+
+/// What the execution layer is told when a held import is dropped, and what
+/// its answer then carries.
+pub const HELD_IMPORT_DROPPED: &str = "the held import was dropped before its execution";
 
 /// A commit whose forkchoice has not been sent yet
 /// (`N42_COMMIT_FCU_ASYNC=1`). One forkchoice is in flight at a time and
@@ -373,8 +508,11 @@ fn preseal(
         }
     };
     let cached = execution.clone();
+    // An elided block's payload lists no transactions: a body encoded from
+    // it would be a different block. Its compact body is made at the
+    // proposal from the hashes instead.
     let body = match (encoder, header.as_ref()) {
-        (Some(encode), Some(header)) => encode(&execution, header),
+        (Some(encode), Some(header)) if !built.elided => encode(&execution, header),
         _ => None,
     };
     if let Ok(mut slot) = slot.lock() {
@@ -398,6 +536,11 @@ pub struct BuildTiming {
     pub presealed: bool,
     /// When the block's build started and what started it.
     pub start: Option<crate::el::BuildStart>,
+    /// The size of the answer the block came in, and when the proposer
+    /// read and decoded it (see [`crate::el::AnswerStamps`]).
+    pub answer: Option<crate::el::AnswerStamps>,
+    /// Whether that answer left the transactions out (`N42_TAKE_COMPACT`).
+    pub elided: bool,
 }
 
 impl std::fmt::Debug for Normalizer {
@@ -531,12 +674,45 @@ pub struct ExecutionDriver<E> {
     /// layer orders them by parent. Blocks before the fork take the path
     /// above.
     deferred_execution_time: Option<u64>,
+    /// The chain's `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md):
+    /// a gated header carries the result of its ancestor this many blocks
+    /// back, so a commit certifies that ancestor ([`crate::settlement`]). 1
+    /// unless set.
+    deferred_depth: u64,
     /// Where a spawned import reports.
     foreign_imports: tokio::sync::mpsc::UnboundedSender<ImportReport>,
     /// The receiving end, until the loop takes it.
     foreign_imports_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ImportReport>>,
     /// Blocks waiting for the import in flight to finish (spawned mode).
+    /// Under `N42_VOTE_BEFORE_SLOT` it also holds, in the same order, the
+    /// blocks voted for ahead of their slot ([`Self::held`]).
     import_queue: std::collections::VecDeque<B256>,
+    /// When each queued block was queued and how many blocks were held
+    /// then, for its import's line.
+    queued_at: HashMap<B256, (std::time::Instant, usize)>,
+    /// Deferred imports in flight at once ([`deferred_in_flight`]).
+    in_flight_cap: usize,
+    /// `N42_VOTE_BEFORE_SLOT` ([`vote_before_slot`]).
+    vote_before_slot: bool,
+    /// `N42_CHECK_BEFORE_SLOT` ([`check_before_slot`]).
+    check_before_slot: bool,
+    /// Blocks whose check has released a vote, newest last, bounded
+    /// ([`RELEASED_CHECKS_KEPT`]): under [`Self::check_before_slot`] a block
+    /// checked ahead of its slot is checked again by its import, and that
+    /// second check releases nothing.
+    released_checks: std::collections::VecDeque<B256>,
+    /// The check-ahead requests' counts, shared with their tasks.
+    check_ahead: std::sync::Arc<CheckAheadCounts>,
+    /// Blocks voted for ahead of their import slot, by hash; each is in
+    /// `import_queue` too, where its turn is.
+    held: HashMap<B256, HeldImport>,
+    /// Held blocks dropped while their import task still runs: its reports
+    /// are swallowed when they arrive.
+    dropped_held: std::collections::HashSet<B256>,
+    /// Blocks dropped because a sibling was committed at their height (and
+    /// their queued descendants), newest last, bounded: a late child of one
+    /// is refused at once instead of waiting out its parent.
+    dead: std::collections::VecDeque<B256>,
     /// Payloads seen but not yet executed, keyed by block hash. Populated from
     /// proposals, direct pushes, and our own builds.
     payloads: HashMap<B256, ExecutionData>,
@@ -610,6 +786,9 @@ pub struct ExecutionDriver<E> {
     commit_reports: tokio::sync::mpsc::UnboundedSender<CommitReport>,
     /// The receiving end, until the loop takes it.
     commit_reports_rx: Option<tokio::sync::mpsc::UnboundedReceiver<CommitReport>>,
+    /// What the forkchoice's safe and finalized hashes are (see
+    /// [`crate::settlement`]).
+    settlement: crate::settlement::Settlement,
 }
 
 /// `N42_BODY_ONCE`, read once: opt-in, and read on the validator's side,
@@ -638,6 +817,67 @@ pub fn compact_body() -> bool {
             || std::env::var("N42_BLOCK_BY_DESCRIPTION").is_ok_and(|v| v == "1"))
             && body_once()
     })
+}
+
+/// Imports a block this node built. A whole payload goes the way it always
+/// went ([`ExecutionLayer::import_own_block`]: the sealed header, then the
+/// payload). An elided one (`elided` = the block's transaction count) has
+/// no payload to fall back on: the sealed header first, and when that is
+/// refused the body is fetched from the execution layer
+/// ([`ExecutionLayer::own_block_body`]) and the payload made whole from it.
+pub async fn import_own<E: ExecutionLayer + ?Sized>(
+    el: &E,
+    header: Option<&alloy_consensus::Header>,
+    payload: ExecutionData,
+    elided: Option<usize>,
+) -> Result<alloy_rpc_types_engine::PayloadStatus, ElError> {
+    let Some(tx_count) = elided else {
+        return el.import_own_block(header, payload).await;
+    };
+    let header = header.ok_or_else(|| ElError::new("an elided own block without its sealed header"))?;
+    if let Some(status) = el.import_own_block_by_header(header).await {
+        return Ok(status);
+    }
+    let block = el
+        .own_block_body(header)
+        .await?
+        .ok_or_else(|| ElError::new(format!("the execution layer no longer holds own block {}", header.number)))?;
+    let whole = crate::el::fill_elided(&payload, &block, tx_count)?;
+    el.new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, whole).await
+}
+
+/// `N42_TAKE_COMPACT`, read once: the proposer asks its execution layer for
+/// a build-on-own answer *without the transactions* -- the header, the small
+/// fields and the transaction hashes / frame layout the compact body is made
+/// of -- instead of the ~26 MB block (`docs/INDUSTRY_SURVEY_2026_10.md`
+/// 11.7: encode, write, read and decode of that answer were ~75 ms of a
+/// 160 ms `send`-trigger chain). Off by default.
+///
+/// It implies [`compact_body`]: without a compact body to publish, the
+/// proposer needs the whole body on its proposal path and there is nothing
+/// to save. What needs the bytes afterwards -- a peer's fetch by hash, a
+/// fill, the own import's fallback -- fetches them from the execution layer
+/// by the sealed header ([`crate::ExecutionLayer::own_block_body`]).
+pub fn take_compact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_TAKE_COMPACT").is_ok_and(|v| v == "1") && compact_body())
+}
+
+/// `N42_ANSWER_LAYOUT_ONLY`, read once: the proposer tells its execution
+/// layer that a compact build-on-own answer may leave the transaction hash
+/// list out when the block's frame layout covers it (~6.4 MB at 200,000
+/// transactions: encoded, written, read and decoded on the seal -> proposal
+/// road, and nothing on the proposer's side reads it under frame blocks: the
+/// frame description names the layout). Off by default.
+///
+/// It implies [`take_compact`]; the caller also has to be building frame
+/// blocks (`N42_FRAME_BLOCKS=1`), which this crate cannot see, so it
+/// combines the two. An execution layer that predates the request's mark
+/// answers with the hashes as ever, and a block whose layout is empty gets
+/// them too.
+pub fn answer_layout_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_ANSWER_LAYOUT_ONLY").is_ok_and(|v| v == "1") && take_compact())
 }
 
 /// `N42_COMMIT_FCU_ASYNC`, read once: opt-in, and only the *default* for a
@@ -680,6 +920,23 @@ struct BlockSize {
 }
 
 impl BlockSize {
+    /// The size of a block arriving as a payload or a body. A compact body is
+    /// a few kilobytes whatever the block holds, so its transactions are
+    /// counted from its listing (the header and the hashes or frames, no
+    /// transaction decoded); otherwise a held compact import never reaches
+    /// [`Self::worth_logging`] and its lines never print (loop325).
+    fn of(payload: Option<&ExecutionData>, body: Option<&ForeignBody>) -> Self {
+        let txs = match (payload, body) {
+            (Some(payload), _) => payload.payload.as_v1().transactions.len(),
+            (None, Some(body)) if body.compact => {
+                n42_h2_consensus::compact_body::decode_compact_body(&body.rlp, body.profile)
+                    .map_or(0, |compact| compact.len())
+            }
+            _ => 0,
+        };
+        Self { txs, bytes: body.map_or(0, |b| b.rlp.len()) }
+    }
+
     /// Big enough for the per-block lines, which exist for the bench tier.
     const fn worth_logging(self) -> bool {
         self.txs >= 10_000 || self.bytes >= 1_000_000
@@ -708,9 +965,19 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             own_importing: Default::default(),
             spawn_imports: false,
             deferred_execution_time: None,
+            deferred_depth: 1,
             foreign_imports: foreign_tx,
             foreign_imports_rx: Some(foreign_rx),
             import_queue: std::collections::VecDeque::new(),
+            queued_at: HashMap::new(),
+            in_flight_cap: deferred_in_flight(),
+            vote_before_slot: vote_before_slot(),
+            check_before_slot: check_before_slot(),
+            released_checks: std::collections::VecDeque::new(),
+            check_ahead: std::sync::Arc::default(),
+            held: HashMap::new(),
+            dropped_held: std::collections::HashSet::new(),
+            dead: std::collections::VecDeque::new(),
             payloads: HashMap::new(),
             bodies: HashMap::new(),
             body_decoder: None,
@@ -732,6 +999,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             commits_answered: 0,
             commit_reports: commit_tx,
             commit_reports_rx: Some(commit_rx),
+            settlement: crate::settlement::Settlement::new(crate::settlement::settlement_tags()),
         }
     }
 
@@ -783,13 +1051,96 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.head
     }
 
-    /// Last committed block.
+    /// Last committed block. Under the split settlement tags this is the
+    /// forkchoice's head, not its finalized hash: see [`Self::safe_tag`] and
+    /// [`Self::finalized_tag`].
     pub fn finalized(&self) -> B256 {
         self.finalized
     }
 
+    /// Picks the settlement tags mode; the default is
+    /// [`crate::settlement::settlement_tags`] (`N42_SETTLEMENT_TAGS`). This is
+    /// how a test picks it without the process environment.
+    pub fn set_settlement_tags(&mut self, mode: crate::settlement::SettlementTags) {
+        self.settlement.set_mode(mode);
+    }
+
+    /// The settlement tags mode in use.
+    pub fn settlement_tags(&self) -> crate::settlement::SettlementTags {
+        self.settlement.mode()
+    }
+
+    /// Installs the reading of this node's last persisted block, which
+    /// caps the finalized tag. Without one the finalized tag follows the
+    /// safe tag.
+    pub fn set_persisted_height(&mut self, source: crate::settlement::PersistedSource) {
+        self.settlement.set_persisted(source);
+    }
+
+    /// A node starting on a fresh chain: genesis is the floor of both tags.
+    /// A restarted node leaves this out, so its first forkchoices do not
+    /// move the tags its execution layer restored back to genesis.
+    pub fn set_settlement_floor(&mut self, genesis: B256) {
+        self.settlement.set_floor(genesis);
+    }
+
+    /// The newest block whose execution is certified, as the forkchoice
+    /// carries it under the split tags; `None` until known.
+    pub fn safe_tag(&self) -> Option<crate::settlement::Tag> {
+        self.settlement.safe()
+    }
+
+    /// The newest certified block at or below this node's persisted block;
+    /// `None` until known.
+    pub fn finalized_tag(&self) -> Option<crate::settlement::Tag> {
+        self.settlement.finalized()
+    }
+
+    /// The forkchoice a commit of `head` sends: legacy, head = safe =
+    /// finalized; split, the tags this commit moves (see
+    /// [`crate::settlement`]).
+    fn commit_forkchoice(&mut self, head: B256) -> ForkchoiceState {
+        if self.settlement.mode() == crate::settlement::SettlementTags::Legacy {
+            return ForkchoiceState { head_block_hash: head, safe_block_hash: head, finalized_block_hash: head };
+        }
+        self.note_lineage_of(head);
+        let deferred_from = self.deferred_execution_time;
+        let depth = self.deferred_depth;
+        self.settlement
+            .advance_at_depth(head, |timestamp| if deferred_from.is_some_and(|at| timestamp >= at) { depth } else { 0 });
+        let (safe, finalized) = self.settlement.tags_for(head);
+        ForkchoiceState { head_block_hash: head, safe_block_hash: safe, finalized_block_hash: finalized }
+    }
+
+    /// Records `block_hash`'s place in the chain from a payload or body this
+    /// driver still holds, if it has not been recorded already. Bodies are
+    /// read for the header alone.
+    fn note_lineage_of(&mut self, block_hash: B256) {
+        if self.settlement.knows(&block_hash) {
+            return;
+        }
+        if let Some(payload) = self.payloads.get(&block_hash) {
+            let (number, parent, timestamp) =
+                (payload.payload.block_number(), payload.payload.parent_hash(), payload.payload.timestamp());
+            self.settlement.note(block_hash, number, parent, timestamp);
+            return;
+        }
+        if let (Some(body), Some(parent)) = (self.bodies.get(&block_hash), self.parent_of(&block_hash)) {
+            let (number, timestamp) = (body.number, body.timestamp);
+            self.settlement.note(block_hash, number, parent, timestamp);
+        }
+    }
+
     /// Records a block payload so a later `ExecuteBlock` for it can proceed.
     pub fn cache_payload(&mut self, block_hash: B256, payload: ExecutionData) {
+        if self.settlement.mode() == crate::settlement::SettlementTags::Split {
+            self.settlement.note(
+                block_hash,
+                payload.payload.block_number(),
+                payload.payload.parent_hash(),
+                payload.payload.timestamp(),
+            );
+        }
         if self.payloads.insert(block_hash, payload).is_none() {
             self.payload_order.push(block_hash);
             while self.payload_order.len() > self.max_cached_payloads {
@@ -810,7 +1161,13 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// re-encoded from them. Bounded exactly as the payload cache is.
     pub fn cache_body(&mut self, body: ForeignBody) {
         let block_hash = body.block_hash;
+        let split = self.settlement.mode() == crate::settlement::SettlementTags::Split;
         if self.bodies.insert(block_hash, body).is_none() {
+            if split {
+                // The header alone; the lineage is what a commit of this
+                // block, or of a descendant, walks to set the tags.
+                self.note_lineage_of(block_hash);
+            }
             self.payload_order.push(block_hash);
             while self.payload_order.len() > self.max_cached_payloads {
                 let oldest = self.payload_order.remove(0);
@@ -855,6 +1212,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
 
     /// The forkchoice this driver would send right now.
     fn forkchoice(&self, head: B256) -> ForkchoiceState {
+        if self.settlement.mode() == crate::settlement::SettlementTags::Split {
+            let (safe, finalized) = self.settlement.tags_for(head);
+            return ForkchoiceState { head_block_hash: head, safe_block_hash: safe, finalized_block_hash: finalized };
+        }
         ForkchoiceState {
             head_block_hash: head,
             safe_block_hash: self.finalized,
@@ -1317,8 +1678,26 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         }
 
         let after_seal = started.elapsed();
-        let cached = cached.unwrap_or_else(|| built.execution_data.clone());
-        self.cache_payload(built.hash, cached);
+        // The settlement tags need every own block's place in the chain, and
+        // an elided one is never cached below: without this a leader's
+        // commits of its own blocks found no lineage and moved no tag for
+        // its whole tenure (loop326 SPLIT, node 0).
+        if self.settlement.mode() == crate::settlement::SettlementTags::Split {
+            self.settlement.note(
+                built.hash,
+                built.execution_data.payload.block_number(),
+                built.execution_data.payload.parent_hash(),
+                built.execution_data.payload.timestamp(),
+            );
+        }
+        // An elided block's payload lists no transactions, and a cached
+        // payload is what an import of the block would send: it is never
+        // cached. Its own import goes by the sealed header, and fetches the
+        // body when that is refused (`spawn_import_own_block`).
+        if !built.elided {
+            let cached = cached.unwrap_or_else(|| built.execution_data.clone());
+            self.cache_payload(built.hash, cached);
+        }
         let after_cache = started.elapsed();
         self.last_build_timing = BuildTiming {
             take_us: after_resolve.as_micros() as u64,
@@ -1326,6 +1705,8 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             cache_us: after_cache.saturating_sub(after_seal).as_micros() as u64,
             presealed: was_presealed,
             start: built.started,
+            answer: built.answer,
+            elided: built.elided,
         };
 
         info!(
@@ -1382,13 +1763,14 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let payload = built.execution_data.clone();
         let header = built.header.clone();
         let hash = built.hash;
+        let elided = built.elided.then_some(built.tx_count);
         let imported = self.own_imports.clone();
         self.own_importing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(hash);
         let done = OwnImportDone { importing: std::sync::Arc::clone(&self.own_importing), hash };
         tokio::spawn(async move {
             let _done = done;
             let started = std::time::Instant::now();
-            match el.import_own_block(header.as_ref(), payload).await {
+            match import_own(el.as_ref(), header.as_ref(), payload, elided).await {
                 Ok(status) => {
                     info!(
                         target: "n42.h2.el",
@@ -1509,6 +1891,305 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.deferred_execution_time = at;
     }
 
+    /// The chain's `deferredExecutionDepth` (see the field): 1 or 2. Anything
+    /// else is refused and leaves the depth as it was.
+    pub fn set_deferred_depth(&mut self, depth: u64) -> Result<(), String> {
+        if !(1..=n42_h2_consensus::deferred_depth::MAX_DEPTH).contains(&depth) {
+            return Err(format!("deferred execution depth {depth}: expected 1..={}", n42_h2_consensus::deferred_depth::MAX_DEPTH));
+        }
+        self.deferred_depth = depth;
+        Ok(())
+    }
+
+    /// The depth [`Self::set_deferred_depth`] set (1 by default).
+    pub const fn deferred_depth(&self) -> u64 {
+        self.deferred_depth
+    }
+
+    /// The deferred in-flight cap (see [`deferred_in_flight`], whose value is
+    /// the default): how a test picks it without the process environment.
+    pub fn set_deferred_in_flight(&mut self, cap: usize) -> Result<(), String> {
+        self.in_flight_cap = parse_in_flight(&cap.to_string())?;
+        Ok(())
+    }
+
+    /// `N42_VOTE_BEFORE_SLOT` (see [`vote_before_slot`], whose value is the
+    /// default). On: a deferred block arriving with every import slot taken
+    /// is handed to the execution layer at once with its execution held
+    /// ([`ExecutionLayer::new_payload_body_held`]), so the body is assembled
+    /// and checked and the vote goes out now; the execution is released into
+    /// a slot in queue order, exactly where the block would have started
+    /// without the switch. Only when the execution layer can hold an
+    /// execution ([`ExecutionLayer::holds_execution`]), the block came as a
+    /// body, no block one below it is still queued or held here (its fields,
+    /// which the check reads, would not exist yet), and fewer than
+    /// [`FOLLOWER_LAG_CAP`] imports are in flight or held. Otherwise the
+    /// block waits for its slot, vote and all, as without the switch.
+    pub fn set_vote_before_slot(&mut self, on: bool) {
+        self.vote_before_slot = on;
+    }
+
+    /// `N42_CHECK_BEFORE_SLOT` (see [`check_before_slot`], whose value is the
+    /// default). On: a deferred block arriving with every import slot taken
+    /// is queued for its slot exactly as without the switch, and beside that
+    /// its sealed header goes to the execution layer as a check-only request
+    /// ([`ExecutionLayer::check_only`]). When the execution layer vouches for
+    /// that very block (one of its own kept builds, or a check another key's
+    /// request already made there), the check is reported at once
+    /// ([`ImportReport::Checked`]) and the vote goes out; the import's own
+    /// check later releases nothing more. When it does not, nothing happens
+    /// and the vote waits for the import's check, as today. Only when the
+    /// execution layer answers check-only requests
+    /// ([`ExecutionLayer::checks_only`]) and the block came as a body.
+    pub fn set_check_before_slot(&mut self, on: bool) {
+        self.check_before_slot = on;
+    }
+
+    /// The check-ahead counts since start: (sent, vouched for, declined).
+    pub fn check_ahead_counts(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.check_ahead.sent.load(Relaxed), self.check_ahead.vouched.load(Relaxed), self.check_ahead.declined.load(Relaxed))
+    }
+
+    /// Sends the check-only request for a block queued behind busy slots
+    /// (see [`Self::set_check_before_slot`]); the import is not touched.
+    fn spawn_check_ahead(&self, block_hash: B256) {
+        if !self.check_before_slot || !self.el.checks_only() {
+            return;
+        }
+        let Some(body) = self.bodies.get(&block_hash) else { return };
+        // The sealed header the body carries, proved to be the block
+        // consensus named before anything is asked: a header that does not
+        // hash to it is no reason to vote.
+        let decoded = if body.compact {
+            n42_h2_consensus::decode_compact_body_header(&body.rlp, body.profile)
+        } else {
+            n42_h2_consensus::decode_block_body_header(&body.rlp, body.profile)
+        };
+        let Some(header) = decoded.ok().filter(|(hash, _)| *hash == block_hash).map(|(_, header)| header) else {
+            return;
+        };
+        let number = header.number;
+        let size = BlockSize::of(None, Some(body));
+        let header_rlp = alloy_primitives::Bytes::from(alloy_rlp::encode(&header));
+        let el = std::sync::Arc::clone(&self.el);
+        let report = self.foreign_imports.clone();
+        let counts = std::sync::Arc::clone(&self.check_ahead);
+        let busy = self.executing.len();
+        let queued = self.import_queue.len();
+        let queued_at = std::time::Instant::now();
+        counts.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tokio::spawn(async move {
+            let vouched = el.check_only(block_hash, header_rlp).await;
+            let check_us = queued_at.elapsed().as_micros() as u64;
+            if vouched {
+                counts.vouched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The vote goes out on this report; the stamp is from the
+                // block's arrival in the queue (its body was in hand).
+                let _ = report.send(ImportReport::Checked(block_hash));
+            } else {
+                counts.declined.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // `check_us`: the block's arrival in the queue (its body in
+            // hand) to the answer, i.e. to the vote's release when vouched.
+            if size.worth_logging() {
+                info!(target: "n42.h2.el", block = ?block_hash, number, vouched, check_us, slots_busy = busy, queued, bytes = size.bytes, "check ahead of the import slot");
+            } else {
+                debug!(target: "n42.h2.el", block = ?block_hash, number, vouched, check_us, slots_busy = busy, queued, "check ahead of the import slot");
+            }
+        });
+    }
+
+    /// Whether a check report releases a vote now: always without
+    /// `N42_CHECK_BEFORE_SLOT`; with it, only the first check of a block
+    /// (its check ahead of the slot or its import's, whichever came first).
+    fn first_check(&mut self, block_hash: B256) -> bool {
+        if !self.check_before_slot {
+            return true;
+        }
+        if self.released_checks.contains(&block_hash) {
+            return false;
+        }
+        self.released_checks.push_back(block_hash);
+        while self.released_checks.len() > RELEASED_CHECKS_KEPT {
+            self.released_checks.pop_front();
+        }
+        true
+    }
+
+    /// Blocks voted for ahead of their import slot and not yet admitted.
+    pub fn voted_ahead(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Whether `block_hash` was voted for ahead of its slot and still waits
+    /// for one.
+    pub fn is_voted_ahead(&self, block_hash: &B256) -> bool {
+        self.held.contains_key(block_hash)
+    }
+
+    /// How many blocks may be held at once: the lag cap less the slots.
+    fn held_cap(&self) -> usize {
+        FOLLOWER_LAG_CAP.saturating_sub(self.in_flight_cap)
+    }
+
+    /// The block number of a block this driver holds a payload or a body for.
+    fn number_of(&self, block_hash: &B256) -> Option<u64> {
+        if let Some(held) = self.held.get(block_hash) {
+            return Some(held.number);
+        }
+        self.payloads
+            .get(block_hash)
+            .map(|payload| payload.payload.block_number())
+            .or_else(|| self.bodies.get(block_hash).map(|body| body.number))
+    }
+
+    /// The parent of a block this driver holds a payload or a body for: the
+    /// payload says it, a body's header is read for it (the header alone,
+    /// not the transactions).
+    fn parent_of(&self, block_hash: &B256) -> Option<B256> {
+        if let Some(payload) = self.payloads.get(block_hash) {
+            return Some(payload.payload.parent_hash());
+        }
+        let body = self.bodies.get(block_hash)?;
+        let decoded = if body.compact {
+            n42_h2_consensus::decode_compact_body_header(&body.rlp, body.profile)
+        } else {
+            n42_h2_consensus::decode_block_body_header(&body.rlp, body.profile)
+        };
+        decoded.ok().map(|(_, header)| header.parent_hash)
+    }
+
+    /// Whether `block_hash` may vote before its slot now (see
+    /// [`Self::set_vote_before_slot`]); the body to hand over if so.
+    fn may_vote_before_slot(&self, block_hash: &B256) -> Option<ForeignBody> {
+        if !self.vote_before_slot || !self.el.holds_execution() {
+            return None;
+        }
+        if self.held.len() >= self.held_cap() || self.executing.len() + self.held.len() >= FOLLOWER_LAG_CAP {
+            return None;
+        }
+        let body = self.bodies.get(block_hash)?.clone();
+        // The check reads the parent's execution fields. A parent still
+        // queued here -- held or not -- has not executed, so the block waits
+        // for its slot exactly as it would without the switch. Read by
+        // number, not by parent hash: a sibling of the parent queued here
+        // holds the block back too, which errs on the side of today's road.
+        let below = body.number.checked_sub(1)?;
+        for queued in &self.import_queue {
+            if queued == block_hash {
+                continue;
+            }
+            match self.number_of(queued) {
+                Some(number) if number != below => {}
+                _ => return None,
+            }
+        }
+        Some(body)
+    }
+
+    /// Hands `block_hash` to the execution layer with its execution held.
+    fn hold_import(&mut self, block_hash: B256, body: ForeignBody, held_at_arrival: usize) {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let note = SlotNote::new(true, held_at_arrival, None);
+        self.held.insert(
+            block_hash,
+            HeldImport {
+                number: body.number,
+                release: Some(release_tx),
+                since: std::time::Instant::now(),
+                slot_wait_ms: std::sync::Arc::clone(&note.slot_wait_ms),
+            },
+        );
+        if !self.import_queue.contains(&block_hash) {
+            self.import_queue.push_back(block_hash);
+        }
+        self.queued_at.remove(&block_hash);
+        self.spawn_deferred_task(block_hash, Some(body), None, Some(release_rx), note);
+    }
+
+    /// Admits a held block's execution to a free slot.
+    fn release_held(&mut self, block_hash: B256) {
+        let Some(mut held) = self.held.remove(&block_hash) else { return };
+        held.slot_wait_ms
+            .store(held.since.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.executing.insert(block_hash);
+        if let Some(release) = held.release.take() {
+            // A task that already ended has its report on the channel; it
+            // frees this slot when it is read.
+            let _ = release.send(true);
+        }
+    }
+
+    /// Plain queued blocks whose prerequisites have since arrived (their
+    /// parent took a slot) vote now, in queue order.
+    fn promote_queued(&mut self) {
+        if !self.vote_before_slot {
+            return;
+        }
+        let queued: Vec<B256> = self.import_queue.iter().filter(|h| !self.held.contains_key(*h)).copied().collect();
+        for block_hash in queued {
+            if self.executing.len() < self.in_flight_cap {
+                // A free slot takes the queue's front on its own road.
+                break;
+            }
+            if let Some(body) = self.may_vote_before_slot(&block_hash) {
+                let held_at_arrival = self.queued_at.get(&block_hash).map_or(self.held.len(), |(_, held)| *held);
+                self.hold_import(block_hash, body, held_at_arrival);
+            }
+        }
+    }
+
+    /// Drops what a commit has made dead: a held block at the committed
+    /// block's height that is not it can never be canonical (a commit is
+    /// final), and neither can anything queued here that descends from it.
+    /// A held block's execution layer is told to drop it -- it frees the
+    /// assembled block and its senders without executing -- and the
+    /// task's report is swallowed. Under `N42_VOTE_BEFORE_SLOT` only; without
+    /// it a queued sibling is imported as a side block as before.
+    fn drop_losers_of(&mut self, committed: B256) {
+        if !self.vote_before_slot || self.held.is_empty() {
+            return;
+        }
+        let Some(height) = self.number_of(&committed) else { return };
+        let mut dead: Vec<B256> =
+            self.held.iter().filter(|(hash, held)| held.number == height && **hash != committed).map(|(h, _)| *h).collect();
+        if dead.is_empty() {
+            return;
+        }
+        // Their queued descendants, transitively, by the parent each names.
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for queued in self.import_queue.clone() {
+                if dead.contains(&queued) {
+                    continue;
+                }
+                if self.parent_of(&queued).is_some_and(|parent| dead.contains(&parent)) {
+                    dead.push(queued);
+                    grew = true;
+                }
+            }
+        }
+        for block_hash in dead {
+            if let Some(mut held) = self.held.remove(&block_hash) {
+                if let Some(release) = held.release.take() {
+                    let _ = release.send(false);
+                }
+                self.dropped_held.insert(block_hash);
+            }
+            info!(target: "n42.h2.el", block = ?block_hash, committed = ?committed, height, "a block voted ahead of its slot lost its height to a commit; dropped");
+            self.import_queue.retain(|queued| queued != &block_hash);
+            self.queued_at.remove(&block_hash);
+            self.pending_commits.remove(&block_hash);
+            self.forget_payload(block_hash);
+            self.dead.push_back(block_hash);
+            while self.dead.len() > 64 {
+                self.dead.pop_front();
+            }
+        }
+    }
+
     /// Whether `block_hash`'s import is in flight: a commit for it is not
     /// dropped as "not imported" but deferred to the import's success.
     pub fn is_importing(&self, block_hash: &B256) -> bool {
@@ -1523,6 +2204,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// node that fell behind stayed behind: by then most Decides came before
     /// the import started (loop160 C10 node5: 187 of 318; V10 node1: 96).
     pub fn commit_when_imported(&mut self, block_hash: B256) {
+        self.drop_losers_of(block_hash);
         self.remember_commit_ahead(block_hash);
     }
 
@@ -1539,9 +2221,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         }
     }
 
-    /// The blocks whose imports are in flight.
+    /// The blocks whose imports are in flight, and those voted for ahead of
+    /// their slot (`N42_VOTE_BEFORE_SLOT`), whose import tasks run too.
     pub fn importing(&self) -> impl Iterator<Item = &B256> {
-        self.executing.iter()
+        self.executing.iter().chain(self.held.keys())
     }
 
     /// Whether a block stamped `timestamp` is under deferred execution.
@@ -1554,43 +2237,93 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// parent's result as soon as the parent is in, and executes it after --
     /// and reports the check and then the import on the channel.
     fn spawn_execute_deferred(&mut self, block_hash: B256) -> DriverAction {
-        if self.executing.contains(&block_hash) {
+        if self.executing.contains(&block_hash) || self.held.contains_key(&block_hash) {
             return DriverAction::Ignored;
         }
-        if self.executing.len() >= DEFERRED_IN_FLIGHT {
+        if self.vote_before_slot
+            && !self.dead.is_empty()
+            && self.parent_of(&block_hash).is_some_and(|parent| self.dead.contains(&parent))
+        {
+            // Its parent lost its height to a commit: it can never be
+            // canonical, and its import would only wait out a parent that
+            // will not come.
+            self.import_queue.retain(|queued| queued != &block_hash);
+            self.queued_at.remove(&block_hash);
+            self.forget_payload(block_hash);
+            return DriverAction::Rejected {
+                block_hash,
+                reason: "its parent lost its height to a committed block".to_owned(),
+            };
+        }
+        if self.executing.len() >= self.in_flight_cap {
             if !self.import_queue.contains(&block_hash) {
+                let held_at_arrival = self.held.len();
+                if let Some(body) = self.may_vote_before_slot(&block_hash) {
+                    self.hold_import(block_hash, body, held_at_arrival);
+                    return DriverAction::Ignored;
+                }
                 self.import_queue.push_back(block_hash);
+                self.queued_at.insert(block_hash, (std::time::Instant::now(), held_at_arrival));
+                // `N42_CHECK_BEFORE_SLOT`: the vote need not wait for the
+                // slot; the import does.
+                self.spawn_check_ahead(block_hash);
             }
             return DriverAction::Ignored;
         }
         // The body when this node kept one (`N42_BODY_ONCE=1`), the payload
         // otherwise; a body's payload is only made if the execution layer
         // refuses the body.
+        let note = match self.queued_at.remove(&block_hash) {
+            Some((since, held_at_arrival)) => SlotNote::new(false, held_at_arrival, Some(since.elapsed())),
+            None => SlotNote::new(false, self.held.len(), None),
+        };
         let body = self.bodies.get(&block_hash).cloned();
         let payload = self.payloads.get(&block_hash).cloned();
         if body.is_none() && payload.is_none() {
             return DriverAction::PayloadMissing { block_hash };
         }
         self.executing.insert(block_hash);
+        self.spawn_deferred_task(block_hash, body, payload, None, note);
+        DriverAction::Ignored
+    }
+
+    /// The deferred import's task: the body (or the payload), the check
+    /// reported ahead of the import, then the verdict. With `release` the
+    /// execution layer holds the execution until the driver says (see
+    /// [`Self::set_vote_before_slot`]); such a block always goes as a body.
+    fn spawn_deferred_task(
+        &mut self,
+        block_hash: B256,
+        body: Option<ForeignBody>,
+        payload: Option<ExecutionData>,
+        release: Option<tokio::sync::oneshot::Receiver<bool>>,
+        note: SlotNote,
+    ) {
         let el = std::sync::Arc::clone(&self.el);
         let report = self.foreign_imports.clone();
         let guard = ReportGuard { block_hash, report: Some(report.clone()) };
-        let size = BlockSize {
-            txs: payload.as_ref().map_or(0, |p| p.payload.as_v1().transactions.len()),
-            bytes: body.as_ref().map_or(0, |b| b.rlp.len()),
-        };
         let decoder = self.body_decoder.clone();
+        let check_ahead = std::sync::Arc::clone(&self.check_ahead);
         tokio::spawn(async move {
             let started = std::time::Instant::now();
+            let size = BlockSize::of(payload.as_ref(), body.as_ref());
             // The body first. `None` is the execution layer saying "not this
             // way" before it answered anything, so nothing has been checked
             // and the payload below is the same block sent again; a failure
             // after the check comes back as `Some(Err(..))` and is not
             // retried.
             let mut answered = None;
+            let held = release.is_some();
             if let Some(body) = &body {
                 let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
-                let call = el.new_payload_body_checked(ExecutionPath::LIVE_SEQUENTIAL, body, checked_tx);
+                let call = async {
+                    match release {
+                        Some(release) => {
+                            el.new_payload_body_held(ExecutionPath::LIVE_SEQUENTIAL, body, checked_tx, release).await
+                        }
+                        None => el.new_payload_body_checked(ExecutionPath::LIVE_SEQUENTIAL, body, checked_tx).await,
+                    }
+                };
                 tokio::pin!(call);
                 let outcome = tokio::select! {
                     checked = checked_rx => {
@@ -1601,6 +2334,15 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 };
                 match outcome {
                     crate::BodyOutcome::Answered(answer) => answered = Some(answer),
+                    // A held block has no payload road: its release went to
+                    // the call that refused, and the payload road would run
+                    // the execution outside the slot. Asked for again, it
+                    // takes the ordinary road when its turn comes.
+                    crate::BodyOutcome::NotThisWay if held => {
+                        debug!(target: "n42.h2.el", block = ?block_hash, "the execution layer would not hold the body; asking again");
+                        guard.done(ImportVerdict::NotYet);
+                        return;
+                    }
                     crate::BodyOutcome::NotThisWay => {}
                     // The block is this block; it is only incomplete here.
                     // The loop fetches what is named and hands the body back.
@@ -1675,11 +2417,32 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 }
             };
             if size.worth_logging() {
-                info!(target: "n42.h2.el", block = ?block_hash, txs = size.txs, bytes = size.bytes, import_ms = started.elapsed().as_millis() as u64, "imported a block");
+                info!(
+                    target: "n42.h2.el",
+                    block = ?block_hash,
+                    txs = size.txs,
+                    bytes = size.bytes,
+                    import_ms = started.elapsed().as_millis() as u64,
+                    // `N42_VOTE_BEFORE_SLOT`: whether the vote went out before
+                    // the block had an import slot, how long the import then
+                    // waited for one (for a block queued without voting, its
+                    // time in the queue), and how many blocks were voted for
+                    // and waiting for a slot when it arrived.
+                    vote_before_slot = note.voted_before_slot,
+                    slot_wait_ms = note.slot_wait_ms.load(std::sync::atomic::Ordering::Relaxed),
+                    held_at_arrival = note.held_at_arrival,
+                    // `N42_CHECK_BEFORE_SLOT`, since start: check-only
+                    // requests sent for blocks queued behind busy slots, and
+                    // of them vouched for (the vote went out at once) and
+                    // declined (the vote waited for the import's check).
+                    check_ahead_sent = check_ahead.sent.load(std::sync::atomic::Ordering::Relaxed),
+                    check_ahead_vouched = check_ahead.vouched.load(std::sync::atomic::Ordering::Relaxed),
+                    check_ahead_declined = check_ahead.declined.load(std::sync::atomic::Ordering::Relaxed),
+                    "imported a block"
+                );
             }
             guard.done(ImportVerdict::of(outcome));
         });
-        DriverAction::Ignored
     }
 
     /// Starts `block_hash`'s import on a task, or queues it behind the one in
@@ -1724,11 +2487,28 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// unimported for good).
     pub async fn finish_execute(&mut self, report: ImportReport) -> Vec<DriverAction> {
         let (block_hash, verdict) = match report {
+            // A block dropped while held: its vote is moot, its height was
+            // committed to a sibling.
+            ImportReport::Checked(block_hash) if self.dropped_held.contains(&block_hash) => return Vec::new(),
+            ImportReport::Checked(block_hash) if !self.first_check(block_hash) => return Vec::new(),
             ImportReport::Checked(block_hash) => {
                 return vec![DriverAction::Consensus(Box::new(ConsensusEvent::BlockChecked(block_hash)))];
             }
+            ImportReport::Done(block_hash, _) if self.dropped_held.remove(&block_hash) => {
+                // It held no slot, and what it held is freed with the task.
+                self.promote_queued();
+                return Vec::new();
+            }
             ImportReport::Done(block_hash, verdict) => (block_hash, verdict),
         };
+        // A held block whose task ended before its release -- its check
+        // failed, its body did not assemble, or the execution layer would
+        // not hold it: it took no slot, so none is freed, and its turn in
+        // the queue is gone with it.
+        let ended_held = self.held.remove(&block_hash).is_some();
+        if ended_held {
+            self.import_queue.retain(|queued| queued != &block_hash);
+        }
         self.executing.remove(&block_hash);
         let mut actions = Vec::with_capacity(2);
         actions.push(match verdict {
@@ -1761,14 +2541,37 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 DriverAction::Rejected { block_hash, reason }
             }
         });
-        // The next block queued behind the imports in flight, on whichever
-        // path its timestamp puts it.
-        if let Some(next) = self.import_queue.pop_front() {
-            match self.execute(next).await {
-                DriverAction::Ignored => {}
-                other => actions.push(other),
+        if !self.vote_before_slot {
+            // The next block queued behind the imports in flight, on whichever
+            // path its timestamp puts it.
+            if let Some(next) = self.import_queue.pop_front() {
+                match self.execute(next).await {
+                    DriverAction::Ignored => {}
+                    other => actions.push(other),
+                }
+            }
+            return actions;
+        }
+        // `N42_VOTE_BEFORE_SLOT`: the free slots go to the queue's front in
+        // order -- a held block's execution is released, any other block
+        // starts as it would have -- and then the queued blocks whose parent
+        // now has a slot vote.
+        if !ended_held {
+            let mut budget = self.import_queue.len();
+            while self.executing.len() < self.in_flight_cap && budget > 0 {
+                budget -= 1;
+                let Some(next) = self.import_queue.pop_front() else { break };
+                if self.held.contains_key(&next) {
+                    self.release_held(next);
+                    continue;
+                }
+                match self.execute(next).await {
+                    DriverAction::Ignored => {}
+                    other => actions.push(other),
+                }
             }
         }
+        self.promote_queued();
         actions
     }
 
@@ -1783,10 +2586,14 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
 
     pub async fn import_own_block(&mut self, built: &BuiltBlock) -> Result<(), ElError> {
         let started = std::time::Instant::now();
-        let status = self
-            .el
-            .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, built.execution_data.clone())
-            .await?;
+        let status = if built.elided {
+            import_own(self.el.as_ref(), built.header.as_ref(), built.execution_data.clone(), Some(built.tx_count))
+                .await?
+        } else {
+            self.el
+                .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, built.execution_data.clone())
+                .await?
+        };
         info!(
             target: "n42.h2.el",
             block = ?built.hash,
@@ -1822,6 +2629,15 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// catch-up that skips a block leaves every later one without a parent.
     pub async fn import_pulled(&mut self, payload: ExecutionData) -> Result<B256, ElError> {
         let block_hash = payload.block_hash();
+        let split = self.settlement.mode() == crate::settlement::SettlementTags::Split;
+        if split {
+            self.settlement.note(
+                block_hash,
+                payload.payload.block_number(),
+                payload.payload.parent_hash(),
+                payload.payload.timestamp(),
+            );
+        }
         let status = self
             .el
             .new_payload_for(ExecutionPath::HISTORICAL_SEQUENTIAL, payload)
@@ -1835,10 +2651,17 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 return Err(ElError::new(format!("execution layer did not accept block {block_hash}: {other:?}")));
             }
         }
-        let state = ForkchoiceState {
-            head_block_hash: block_hash,
-            safe_block_hash: block_hash,
-            finalized_block_hash: self.finalized,
+        // Split tags: a pulled block is neither committed nor certified here,
+        // so it moves neither tag; the forkchoice carries the ones the
+        // driver has, when they are on the pulled block's chain.
+        let state = if split {
+            self.forkchoice(block_hash)
+        } else {
+            ForkchoiceState {
+                head_block_hash: block_hash,
+                safe_block_hash: block_hash,
+                finalized_block_hash: self.finalized,
+            }
         };
         let updated = self
             .el
@@ -1942,6 +2765,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     }
 
     async fn commit(&mut self, block_hash: B256) -> DriverAction {
+        self.drop_losers_of(block_hash);
         if self.is_importing(&block_hash) {
             // Still importing, or queued behind the imports in flight: the
             // forkchoice follows the import's success.
@@ -1962,11 +2786,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             self.queue_commit(block_hash, Vec::new());
             return DriverAction::Ignored;
         }
-        let state = ForkchoiceState {
-            head_block_hash: block_hash,
-            safe_block_hash: block_hash,
-            finalized_block_hash: block_hash,
-        };
+        let state = self.commit_forkchoice(block_hash);
         let started = std::time::Instant::now();
         let ahead = self.commits_ahead.contains(&block_hash);
         let answer = self
@@ -2062,11 +2882,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         };
         self.commit_in_flight = Some(pending.block_hash);
         let block_hash = pending.block_hash;
-        let state = ForkchoiceState {
-            head_block_hash: block_hash,
-            safe_block_hash: block_hash,
-            finalized_block_hash: block_hash,
-        };
+        let state = self.commit_forkchoice(block_hash);
         let el = std::sync::Arc::clone(&self.el);
         let guard = CommitGuard {
             report: Some(self.commit_reports.clone()),
@@ -2107,6 +2923,8 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 elapsed_ms = (queued + in_flight).as_millis() as u64,
                 in_flight_ms = in_flight.as_millis() as u64,
                 queued_ms = queued.as_millis() as u64,
+                safe = ?self.settlement.safe().map(|tag| tag.number),
+                finalized = ?self.settlement.finalized().map(|tag| tag.number),
                 "commit forkchoice answered"
             );
         }

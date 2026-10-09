@@ -22,6 +22,7 @@ pub mod tx_gossip;
 pub mod config;
 pub mod message_id;
 pub mod observer;
+mod pump;
 pub mod rpc;
 pub mod status;
 pub mod topic;
@@ -38,7 +39,7 @@ pub use libp2p::PeerId;
 pub use rpc::{
     BlockChunk, BlockReply, BlockTxnsReply, BlockTxnsRequest, RangeReply, RangeRequest,
     BLOCK_BY_HASH_PROTOCOL, BLOCK_PUSH_PROTOCOL, BLOCK_TXNS_PROTOCOL, BODIES_BY_RANGE_PROTOCOL,
-    MAX_RANGE_BLOCKS,
+    MAX_RANGE_BLOCKS, VOTE_PROTOCOL, VoteRequest, vote_hello_message,
 };
 pub use config::{gov5_gossipsub_config, max_gossip_size, max_gossip_wire_size};
 pub use message_id::{gov5_message_id_fn, gov5_message_id_parts};
@@ -49,4 +50,5 @@ pub use transport::{
     BlockRequestChannel, BlockTxnsChannel, H2V4Transport, RangeRequestChannel, PublishError, TransportConfig, TransportError,
     TransportEvent,
 };
+pub use pump::{INBOUND_CAPACITY, PUBLISH_CAPACITY, RETRY_CAPACITY};
 pub use tx_gossip::{decode_tx_batch, encode_tx_batch, TxGossipError, TX_BATCH_MAX_BYTES, TX_BATCH_MAX_TXS};

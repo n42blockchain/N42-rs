@@ -9,6 +9,8 @@ exclude = [".github/"]
 
 [workspace]
 members = [
+    "vendor/dependency-repairs/reth-nippy-jar-2.7.0",
+    "crates/n42/dependency-compat-tests",
     "bin/n42/",
     "crates/n42/primitives/",
     "crates/n42/clique/",
@@ -33,6 +35,7 @@ members = [
     "crates/n42/mobile-service",
     "crates/n42/qmdb-state",
     "crates/n42/qmdb-reth",
+    "crates/n42/core-layout",
     "crates/n42/tx-ingest",
     "crates/n42/tx-queue",
     "crates/n42/tx-types",
@@ -45,7 +48,7 @@ members = [
     #"crates/engine/invalid-block-hooks/",
     #"crates/evm/",
     "crates/chainspec/",
-    #"crates/chain-state",
+    "crates/chain-state",
     "crates/node/builder/",
     #"crates/consensus/auto-seal/",
     "crates/consensus/consensus/",
@@ -240,6 +243,7 @@ n42-h2-el-rpc = { path = "crates/n42/h2-el-rpc" }
 n42-mobile-service = { path = "crates/n42/mobile-service" }
 n42-qmdb-state = { path = "crates/n42/qmdb-state" }
 n42-qmdb-reth = { path = "crates/n42/qmdb-reth" }
+n42-core-layout = { path = "crates/n42/core-layout" }
 n42-tx-ingest = { path = "crates/n42/tx-ingest" }
 n42-tx-queue = { path = "crates/n42/tx-queue" }
 n42-h2-node = { path = "crates/n42/h2-node" }
@@ -371,6 +375,7 @@ reth-trie = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.7.0" }
 reth-trie-common = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.7.0" }
 reth-trie-db = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.7.0" }
 reth-trie-parallel = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.7.0" }
+reth-trie-sparse = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.7.0" }
 
 reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.7.0" }
 reth-ress-provider = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.7.0" }
@@ -431,24 +436,24 @@ alloy-transport-ws = { version = "2.3.0", default-features = false }
 # op
 # alloy-op-evm: optimism only, unused here
 alloy-op-hardforks = "0.4.4"
-op-alloy-rpc-types = { version = "0.23.1", default-features = false }
-op-alloy-rpc-types-engine = { version = "0.23.1", default-features = false }
-op-alloy-network = { version = "0.23.1", default-features = false }
-op-alloy-consensus = { version = "0.23.1", default-features = false }
-op-alloy-rpc-jsonrpsee = { version = "0.23.1", default-features = false }
+op-alloy-rpc-types = { version = "2.0.0", default-features = false }
+op-alloy-rpc-types-engine = { version = "2.0.0", default-features = false }
+op-alloy-network = { version = "2.0.0", default-features = false }
+op-alloy-consensus = { version = "2.0.0", default-features = false }
+op-alloy-rpc-jsonrpsee = { version = "2.0.0", default-features = false }
 op-alloy-flz = { version = "0.13.1", default-features = false }
 
 # misc
 hex = "0.4"
 sled = "0.34"
-derivative = "2"
+educe = "0.8.1"
 ethereum_hashing = "0.7.0"
 integer-sqrt = "0.1.5"
 aquamarine = "0.6"
 arrayvec = { version = "0.7.6", default-features = false }
 auto_impl = "1"
 backon = { version = "1.2", default-features = false, features = ["std-blocking-sleep", "tokio-sleep"] }
-bincode = "1.3"
+bincode = { package = "n42-legacy-codec", path = "crates/n42/legacy-codec" }
 bitflags = "2.4"
 blake3 = "1.8"
 boyer-moore-magiclen = "0.2.16"
@@ -567,7 +572,7 @@ proptest = "1.7"
 proptest-derive = "0.7"
 similar-asserts = { version = "1.5.0", features = ["serde"] }
 tempfile = "3.20"
-test-fuzz = "7"
+test-fuzz = "8.1.1"
 rstest = "0.26.1"
 test-case = "3"
 
@@ -604,7 +609,7 @@ data-encoding = "2"
 delegate = "0.13"
 digest = "0.10.5"
 hash-db = "=0.15.2"
-hickory-resolver = "0.26.1"
+hickory-resolver = "0.26.3"
 hmac = "0.12.1"
 human_bytes = "0.4.1"
 indexmap = "2"
@@ -625,7 +630,7 @@ rocksdb = { version = "0.24" }
 rolling-file = "0.2.0"
 sha3 = "0.10.5"
 snap = "1.1.1"
-libp2p = { version = "0.56", default-features = false }
+libp2p = { version = "0.57", default-features = false }
 socket2 = { version = "0.6", default-features = false }
 sysinfo = { version = "0.38", default-features = false }
 tracing-journald = "0.3"
@@ -648,6 +653,8 @@ tree_hash_derive = "0.12"
 # upstream after that tag. N42 capability lives in this repo now; see
 # docs/RETH_FORK_REDUCTION.md.
 [patch.'https://github.com/paradigmxyz/reth.git']
+reth-nippy-jar = { path = "vendor/dependency-repairs/reth-nippy-jar-2.7.0" }
+reth-transaction-pool = { path = "vendor/dependency-repairs/reth-transaction-pool-2.7.0" }
 reth = { path = "bin/reth" }
 reth-revm = { path = "crates/revm" }
 # reth-evm-ethereum is NOT forked any more: the vendored copy was byte-identical
@@ -689,9 +696,30 @@ reth-network-api = { path = "crates/net/network-api" }
 reth-network-peers = { path = "crates/net/peers"}
 # reth-rpc = { path = "crates/n42/reth-rpc" }  # Disabled: use upstream reth-rpc v1.9.3
 #reth-testing-utils={path="testing/testing-utils"}
-#reth-chain-state = { path = "crates/chain-state"}
+# Vendored since 2026-10-09 (v2.7.0, initially unchanged): carries the N42_CANON_NOTIFY_LEAN
+# switch that builds the canonical-state notification without cloning execution outcomes.
+reth-chain-state = { path = "crates/chain-state" }
 
 [patch.crates-io]
+pprof_util = { path = "vendor/dependency-repairs/pprof_util-0.8.2" }
+
+# Narrow upstream dependency repairs; provenance is recorded in vendor/dependency-repairs.
+alloy-primitives_0_8_26 = { package = "alloy-primitives", path = "vendor/dependency-repairs/alloy-primitives-0.8.26" }
+alloy-primitives_1_7_3 = { package = "alloy-primitives", path = "vendor/dependency-repairs/alloy-primitives-1.7.3" }
+aquamarine_0_6_0 = { package = "aquamarine", path = "vendor/dependency-repairs/aquamarine-0.6.0" }
+ark-ff_0_3_0 = { package = "ark-ff", path = "vendor/dependency-repairs/ark-ff-0.3.0" }
+ark-ff_0_4_2 = { package = "ark-ff", path = "vendor/dependency-repairs/ark-ff-0.4.2" }
+ark-ff_0_5_0 = { package = "ark-ff", path = "vendor/dependency-repairs/ark-ff-0.5.0" }
+boa_engine_0_21_1 = { package = "boa_engine", path = "vendor/dependency-repairs/boa_engine-0.21.1" }
+boa_string_0_21_1 = { package = "boa_string", path = "vendor/dependency-repairs/boa_string-0.21.1" }
+netlink-packet-core_0_8_2 = { package = "netlink-packet-core", path = "vendor/dependency-repairs/netlink-packet-core-0.8.2" }
+parking_lot_0_11_2 = { package = "parking_lot", path = "vendor/dependency-repairs/parking_lot-0.11.2" }
+parking_lot_core_0_8_6 = { package = "parking_lot_core", path = "vendor/dependency-repairs/parking_lot_core-0.8.6" }
+revm-bytecode_43_0_0 = { package = "revm-bytecode", path = "vendor/dependency-repairs/revm-bytecode-43.0.0" }
+sled_0_34_7 = { package = "sled", path = "vendor/dependency-repairs/sled-0.34.7" }
+syn-solidity_1_7_3 = { package = "syn-solidity", path = "vendor/dependency-repairs/syn-solidity-1.7.3" }
+test-fuzz-internal_8_1_1 = { package = "test-fuzz-internal", path = "vendor/dependency-repairs/test-fuzz-internal-8.1.1" }
+tikv-jemalloc-ctl_0_6_1 = { package = "tikv-jemalloc-ctl", path = "vendor/dependency-repairs/tikv-jemalloc-ctl-0.6.1" }
 #alloy-genesis = { path = "./crates/n42/alloy-genesis" }
 alloy-rpc-types-engine = { path = "./crates/n42/alloy-rpc-types-engine" }
 alloy-rpc-types-beacon = { path = "./crates/n42/alloy-rpc-types-beacon" }
@@ -736,3 +764,7 @@ alloy-rpc-types-beacon = { path = "./crates/n42/alloy-rpc-types-beacon" }
 # jsonrpsee-server = { git = "https://github.com/paradigmxyz/jsonrpsee", branch = "matt/make-rpc-service-pub" }
 # jsonrpsee-http-client = { git = "https://github.com/paradigmxyz/jsonrpsee", branch = "matt/make-rpc-service-pub" }
 # jsonrpsee-types = { git = "https://github.com/paradigmxyz/jsonrpsee", branch = "matt/make-rpc-service-pub" }
+
+
+[patch."https://github.com/paradigmxyz/revmc"]
+revmc-builtins = { path = "vendor/dependency-repairs/revmc-builtins-0.1.0" }

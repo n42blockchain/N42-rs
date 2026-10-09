@@ -1,0 +1,3 @@
+loop326SPLIT latest: "hash":"0x7e0962b2b65451b018611194a2e28860e35128c0443e52700044a59e237ae0b2" "number":"0x2b2"
+loop326SPLIT safe: "hash":"0xae9f5601219a665d5cbad47640ccb5d7d1a7832f5a09b5ab3bb3d0d3be12fd03" "number":"0x2b3"
+loop326SPLIT finalized: "hash":"0x23e62d0367d39212fd68934cd46a00e4d5ed4ac71b538e5409fc533bf4b53d38" "number":"0x2ac"

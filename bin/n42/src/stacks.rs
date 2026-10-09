@@ -13,12 +13,15 @@
 //! answer within the wait is reported as such and skipped. Frames resolve
 //! only with symbols: build with `--profile profiling`.
 
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Set by the handler to the thread id it ran on, so the sender knows the
 /// thread answered.
+#[cfg(target_os = "linux")]
 static ANSWERED: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(target_os = "linux")]
 extern "C" fn on_signal(_sig: libc::c_int) {
     let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u64;
     let mut name = [0 as libc::c_char; 32];
@@ -32,6 +35,7 @@ extern "C" fn on_signal(_sig: libc::c_int) {
 }
 
 /// Installs the handler. Idempotent.
+#[cfg(target_os = "linux")]
 pub fn install() {
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
@@ -44,6 +48,7 @@ pub fn install() {
 
 /// Prints every thread's stack to stderr, one at a time, waiting up to
 /// `each` for a thread to answer. Returns how many answered.
+#[cfg(target_os = "linux")]
 pub fn dump_all(each: std::time::Duration) -> usize {
     let me = unsafe { libc::syscall(libc::SYS_gettid) } as u64;
     let pid = unsafe { libc::getpid() };
@@ -76,3 +81,11 @@ pub fn dump_all(each: std::time::Duration) -> usize {
     eprintln!("=== stack dump done: {answered} answered");
     answered
 }
+
+/// Stack signalling requires Linux thread IDs and `/proc`; no handler is installed elsewhere.
+#[cfg(not(target_os = "linux"))]
+pub fn install() {}
+
+/// No threads are signalled on platforms without the Linux diagnostic backend.
+#[cfg(not(target_os = "linux"))]
+pub fn dump_all(_each: std::time::Duration) -> usize { 0 }

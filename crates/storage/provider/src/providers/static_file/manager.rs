@@ -27,7 +27,7 @@ use reth_db::{
 };
 use reth_db_api::{
     cursor::DbCursorRO,
-    models::{AccountBeforeTx, BlockNumberAddress, StorageBeforeTx, StoredBlockBodyIndices},
+    models::{BlockNumberAddress, StorageBeforeTx, StoredBlockBodyIndices},
     table::{Decompress, Table, Value},
     tables,
     transaction::DbTx,
@@ -501,11 +501,19 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         blocks: &[ExecutedBlock<N>],
         tx_nums: &[TxNumber],
     ) -> ProviderResult<()> {
+        // N42: `N42_SF_PARALLEL_ENCODE=1` encodes each block's rows in parallel (same bytes).
+        let parallel = super::n42_sf::parallel_encode();
         for (block, &first_tx) in blocks.iter().zip(tx_nums) {
             let b = block.recovered_block();
             w.increment_block(b.number())?;
-            for (i, tx) in b.body().transactions().iter().enumerate() {
-                w.append_transaction(first_tx + i as u64, tx)?;
+            super::n42_sf::append_block_transactions(
+                w,
+                b.body().transactions(),
+                first_tx,
+                parallel,
+            )?;
+            if super::n42_sf::early_writeback() {
+                w.n42_start_writeback();
             }
         }
         Ok(())
@@ -548,8 +556,15 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 continue
             }
 
-            for (i, receipt) in block.execution_outcome().receipts.iter().enumerate() {
-                w.append_receipt(first_tx + i as u64, receipt)?;
+            // N42: `N42_SF_PARALLEL_ENCODE=1` encodes the rows in parallel (same bytes).
+            super::n42_sf::append_block_receipts(
+                w,
+                &block.execution_outcome().receipts,
+                first_tx,
+                super::n42_sf::parallel_encode(),
+            )?;
+            if super::n42_sf::early_writeback() {
+                w.n42_start_writeback();
             }
         }
         Ok(())
@@ -562,15 +577,15 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         blocks: &[ExecutedBlock<N>],
         plain_reverts: &[revm::database::states::PlainStateReverts],
     ) -> ProviderResult<()> {
+        // N42: `N42_SF_PARALLEL_ENCODE=1` builds, sorts and encodes the rows in parallel (same
+        // bytes); without it the entries are collected and appended as before.
+        let parallel = super::n42_sf::parallel_encode();
         for (block, reverts) in blocks.iter().zip(plain_reverts) {
             let block_number = block.recovered_block().number();
-            let changeset: Vec<_> = reverts
-                .accounts
-                .iter()
-                .flatten()
-                .map(|(address, info)| AccountBeforeTx { address: *address, info: info.clone().map(Into::into) })
-                .collect();
-            w.append_account_changeset(changeset, block_number)?;
+            super::n42_sf::append_block_account_changeset(w, reverts, block_number, parallel)?;
+            if super::n42_sf::early_writeback() {
+                w.n42_start_writeback();
+            }
         }
         Ok(())
     }
@@ -617,9 +632,13 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     where
         F: FnOnce(&mut StaticFileProviderRWRefMut<'_, N>) -> ProviderResult<()>,
     {
+        // N42: each segment task timed, including its `sync_all`.
+        let start = std::time::Instant::now();
         let mut w = self.get_writer(first_block_number, segment)?;
         f(&mut w)?;
-        w.sync_all()
+        let result = w.sync_all();
+        crate::providers::n42_persist::metrics().record_segment(segment, start.elapsed());
+        result
     }
 
     /// Writes all static file data for multiple blocks in parallel per-segment.

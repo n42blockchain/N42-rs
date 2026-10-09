@@ -1,0 +1,13 @@
+layer pid 3693272, 97 args, 155 env vars, cwd /data/n42-build/wt338, 208 cpus
+SIGTERM to 7 validator / flood processes; gone within 30 s: True
+pre-restart head 145 hash 0x6bea5f42249acbd6 stateRoot 0xcd680e7be8b2c2dd; last block with transactions 121; account 0xc4e27d4c2123efda253bd69fc928aeb854c9071c, balance at the head ('0x2109fa304725119d797a73bfbe18', '0x3e8')
+layer SIGTERM, exited within 180 s: True
+restarted pid 3704464; RPC up: True
+restart head 145 (pre-restart head 145; 0 blocks lower)
+blocks compared (hash + stateRoot): 40, equal 40, different 0
+account 0xc4e27d4c2123efda253bd69fc928aeb854c9071c at block 145: before ('0x2109fa304725119d797a73bfbe18', '0x3e8'), after ('0x2109fa304725119d797a73bfbe18', '0x3e8')
+restart log: 62 lines, 3 matching panic|error|mismatch|corrupt|heal|unwind|inconsisten|rollback|replay|recover
+    2026-10-07T15:31:37.896093Z  INFO check_consistency: Healing static file inconsistencies.
+    2026-10-07T15:31:37.908611Z  INFO sender recovery cache population=9000000 mult=1 slots=16777216
+    2026-10-07T15:31:37.939440Z  INFO Pruner initialized prune_config=PruneConfig { block_interval: 5, segments: PruneModes { sender_recovery: None, transaction_lookup: Some(Full), receipts: None, account_history: None, stor
+RESULT ok

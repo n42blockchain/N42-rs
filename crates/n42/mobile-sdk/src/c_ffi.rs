@@ -5,7 +5,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
 
-use ethers::types::U256;
+use ethers_core::types::U256;
 
 use crate::blst_utils::generate_bls12_381_keypair;
 use crate::{

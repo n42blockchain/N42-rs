@@ -93,12 +93,72 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
 ) -> n42_tx_queue::QueueBest<T> {
     let mut times = SelectTimes::default();
     let best = if active() {
-        let (best, plan, took) = queue.frames_for_build_timed(parent, gas_limit);
+        let (mut best, plan, took) = queue.frames_for_build_timed(parent, gas_limit);
         times.select_us = took.lock_us + took.begin_us;
         times.walk_us = took.plan_us;
         times.check_us = took.check_us;
+        times.ids_us = took.ids_us;
+        times.settle_us = took.settle_us;
         times.by_ref = took.by_ref;
         times.slow = took.slow;
+        times.ahead = took.ahead;
+        times.ahead_age_us = took.ahead_age_us;
+        times.ahead_prep_us = took.ahead_prep_us;
+        times.ahead_topup_txs = took.ahead_topup_txs;
+        times.ahead_discard = took.ahead_discard.map_or("", n42_tx_queue::AheadDiscard::name);
+        if !plan.frames.is_empty()
+            && WANT_BULK.with(std::cell::Cell::get)
+            && pull_by_frames()
+            && !n42_tx_types::senders_claimed_at_ingest()
+        {
+            // The block's transactions out of its frames at once, each
+            // frame's slice cloned on the build pool, instead of 200,000
+            // `next` calls on the puller thread. Not with claimed senders:
+            // those go through the check's wrapper one batch at a time.
+            let at = std::time::Instant::now();
+            let segments = best.take_frame_segments();
+            // `N42_PLAN_AHEAD_BODY=1`: a plan used whole carries the body
+            // made with it; its candidates are these segments' transactions,
+            // already cloned, when the segments are the ones it was made from.
+            if times.ahead == 1 && plan_ahead_body_wanted() {
+                match best.take_prepared_body() {
+                    n42_tx_queue::PreparedBodyTake::Ready(body, made_us) => {
+                        times.body_ahead_us = made_us;
+                        match body.downcast::<PreparedBuild<T>>() {
+                            Ok(mut prepared) if prepared.made_from(&segments) => {
+                                let all = std::mem::take(&mut prepared.cands);
+                                times.body_ahead = 1;
+                                times.bulk_txs = all.len();
+                                times.bulk_us = at.elapsed().as_micros() as u64;
+                                BULK.with(|slot| *slot.borrow_mut() = Some(Box::new(all)));
+                                PREPARED.with(|slot| *slot.borrow_mut() = Some(prepared));
+                                SELECT_TIMES.with(|slot| slot.set(times));
+                                PLAN.with(|slot| *slot.borrow_mut() = Some(plan));
+                                return best;
+                            }
+                            _ => times.body_ahead = 3,
+                        }
+                    }
+                    n42_tx_queue::PreparedBodyTake::Late => times.body_ahead = 2,
+                    n42_tx_queue::PreparedBodyTake::None => {}
+                }
+            }
+            let parts: Vec<Vec<std::sync::Arc<reth_transaction_pool::ValidPoolTransaction<T>>>> =
+                crate::parallel_transfer::build_pool().install(|| {
+                    use rayon::prelude::*;
+                    segments
+                        .par_iter()
+                        .map(|(txs, from, to)| txs.get(*from..*to).map_or_else(Vec::new, <[_]>::to_vec))
+                        .collect()
+                });
+            let mut all = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+            for part in parts {
+                all.extend(part);
+            }
+            times.bulk_txs = all.len();
+            times.bulk_us = at.elapsed().as_micros() as u64;
+            BULK.with(|slot| *slot.borrow_mut() = Some(Box::new(all)));
+        }
         if plan.frames.is_empty() {
             // No frame a build could take whole (the funding block, a thin
             // pool, transactions that came by RPC): the ordinary walk, and
@@ -124,6 +184,169 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
     best
 }
 
+/// `N42_PLAN_AHEAD_BODY=1` (`docs/SHARED_EXECUTION_SCOPE.md` 16.4 item 2):
+/// with `N42_PLAN_AHEAD=1`, `N42_PULL_BY_FRAMES=1` and
+/// `N42_SEAL_ON_COUNTERS=1`, the next block's start, prep and gap are made
+/// with its plan while the parent executes ([`PreparedBuild`]): the
+/// candidates cloned out of the frames, the body's transactions and senders,
+/// the transfer keys, the sender partition and the empty slot array, on a
+/// pool of their own; and the parent's queue hand-off forgets a block that
+/// sealed on its counters as its whole take in O(1)
+/// ([`note_whole_take`]). Off by default.
+pub fn plan_ahead_body() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_PLAN_AHEAD_BODY").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Whether the build asks for the plan's prepared body: the switch and every
+/// switch it stands on.
+pub fn plan_ahead_body_wanted() -> bool {
+    plan_ahead_body() && n42_tx_queue::plan_ahead() && pull_by_frames() && crate::payload::seal_on_counters()
+}
+
+/// What the plan-ahead hook makes of a prepared plan (`N42_PLAN_AHEAD_BODY=1`):
+/// everything of the next block's start, prep and gap that is a function of
+/// the plan alone. Its transactions are the plan's in plan order, the order
+/// a build on the plan pulls them; `keys` is empty when not every one is a
+/// plain transfer (the build then preps as before).
+pub struct PreparedBuild<T: reth_transaction_pool::PoolTransaction> {
+    /// The plan's segments it was made from (each frame and how many it
+    /// takes): the build checks its own against them.
+    pub segments: Vec<(n42_tx_queue::FrameTxs<T>, usize)>,
+    /// The candidates, in plan order.
+    pub cands: Vec<std::sync::Arc<reth_transaction_pool::ValidPoolTransaction<T>>>,
+    /// Each candidate's (sender, recipient), as the prep's transfer key.
+    pub keys: Vec<(alloy_primitives::Address, alloy_primitives::Address)>,
+    /// The body's transactions, one a candidate.
+    pub transactions: Vec<n42_tx_types::N42TxEnvelope>,
+    /// Their senders.
+    pub senders: Vec<alloy_primitives::Address>,
+    /// The candidates' hashes (the pooled transactions' own, from ingest).
+    pub hashes: Vec<B256>,
+    /// The partition of `keys` at this beneficiary, when one was known.
+    pub groups: Option<(alloy_primitives::Address, Vec<Vec<usize>>)>,
+    /// One empty slot a candidate.
+    pub slots: Vec<std::sync::OnceLock<crate::parallel_transfer::BuiltTransfer<()>>>,
+    /// The hook's time.
+    pub made_us: u64,
+}
+
+impl<T: reth_transaction_pool::PoolTransaction> std::fmt::Debug for PreparedBuild<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedBuild").field("cands", &self.cands.len()).field("made_us", &self.made_us).finish()
+    }
+}
+
+impl<T: reth_transaction_pool::PoolTransaction> PreparedBuild<T> {
+    /// Whether the build's segments (frame, from, to) are the ones this was
+    /// made from: the same frames, each whole from its start to the plan's
+    /// take.
+    pub fn made_from(&self, segments: &[(n42_tx_queue::FrameTxs<T>, usize, usize)]) -> bool {
+        segments.len() == self.segments.len()
+            && segments
+                .iter()
+                .zip(&self.segments)
+                .all(|((txs, from, to), (made, taken))| *from == 0 && to == taken && std::sync::Arc::ptr_eq(txs, made))
+    }
+}
+
+/// A block that sealed on its counters as the whole take of its build
+/// (`N42_PLAN_AHEAD_BODY=1`): the parent the build stood on, the take's
+/// length and three (position, sender, nonce) points of it.
+#[derive(Debug, Clone)]
+pub struct WholeTake {
+    /// The sealed block (the builder's hash).
+    pub block: B256,
+    /// The parent the build stood on (the queue's build key).
+    pub parent: B256,
+    /// The body's length, which is the take's.
+    pub len: usize,
+    /// First, middle and last (position, sender, nonce).
+    pub checks: Vec<(usize, alloy_primitives::Address, u64)>,
+}
+
+static WHOLE_TAKES: Mutex<VecDeque<WholeTake>> = Mutex::new(VecDeque::new());
+
+/// Records that `take.block` is its build's whole take, by construction.
+pub fn note_whole_take(take: WholeTake) {
+    let mut takes = WHOLE_TAKES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    while takes.len() >= 8 {
+        takes.pop_front();
+    }
+    takes.push_back(take);
+}
+
+/// The record [`note_whole_take`] made for `block`, taken.
+pub fn take_whole_take(block: B256) -> Option<WholeTake> {
+    let mut takes = WHOLE_TAKES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = takes.iter().position(|take| take.block == block)?;
+    takes.remove(at)
+}
+
+/// The beneficiary the last build on this node used: the plan-ahead body
+/// partitions the next block's keys at it (the build checks it is its own).
+static PLAN_BENEFICIARY: Mutex<Option<alloy_primitives::Address>> = Mutex::new(None);
+
+/// Notes the beneficiary of the build on this node.
+pub fn note_beneficiary(beneficiary: alloy_primitives::Address) {
+    *PLAN_BENEFICIARY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(beneficiary);
+}
+
+/// The beneficiary [`note_beneficiary`] noted last.
+pub fn noted_beneficiary() -> Option<alloy_primitives::Address> {
+    *PLAN_BENEFICIARY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+std::thread_local! {
+    /// The plan's prepared build [`select`] found, for [`take_prepared`].
+    static PREPARED: std::cell::RefCell<Option<Box<dyn std::any::Any>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The prepared build [`select`] took on this thread, if it did (its
+/// candidates are already the bulk vector). Clears it either way.
+pub fn take_prepared<T: reth_transaction_pool::PoolTransaction>() -> Option<Box<PreparedBuild<T>>> {
+    let taken = PREPARED.with(|slot| slot.borrow_mut().take())?;
+    taken.downcast::<PreparedBuild<T>>().ok()
+}
+
+std::thread_local! {
+    /// Whether the build on this thread consumes a block's transactions in
+    /// one vector ([`want_bulk`]).
+    static WANT_BULK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The vector [`select`] made, for [`take_bulk`].
+    static BULK: std::cell::RefCell<Option<Box<dyn std::any::Any>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `N42_PULL_BY_FRAMES`, read once: a frame build takes its block's
+/// transactions out of the plan's frames at once ([`select`]) instead of
+/// through the puller thread. Off by default.
+pub fn pull_by_frames() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_PULL_BY_FRAMES").is_ok_and(|v| v == "1"))
+}
+
+/// Says whether the build about to select on this thread can take its
+/// transactions as one vector (the parallel step with the puller on): only
+/// then does [`select`] make one.
+pub fn want_bulk(on: bool) {
+    WANT_BULK.with(|slot| slot.set(on));
+    if !on {
+        BULK.with(|slot| slot.borrow_mut().take());
+        // A prepared build nobody took goes with its bulk vector.
+        PREPARED.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+/// The block's transactions [`select`] took out of its frames at once on
+/// this thread, in plan order, if it did. Whoever takes them owns them as it
+/// owns what the iterator hands out: anything not built goes back through
+/// the iterator's refusals.
+pub fn take_bulk<T: reth_transaction_pool::PoolTransaction>(
+) -> Option<Vec<std::sync::Arc<reth_transaction_pool::ValidPoolTransaction<T>>>> {
+    let taken = BULK.with(|slot| slot.borrow_mut().take())?;
+    taken.downcast::<Vec<std::sync::Arc<reth_transaction_pool::ValidPoolTransaction<T>>>>().ok().map(|boxed| *boxed)
+}
+
 /// Where the last [`select`] on this thread spent its time, in
 /// microseconds: the build's phase line splits `start_best_ms` with it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -136,6 +359,10 @@ pub struct SelectTimes {
     pub walk_us: u64,
     /// Of `walk_us`, the parallel check of the frames the gas reaches.
     pub check_us: u64,
+    /// Of `walk_us`, the live frame ids listed in arrival order.
+    pub ids_us: u64,
+    /// Of `walk_us`, the parallel part's takes applied before a serial part.
+    pub settle_us: u64,
     /// The ordinary walk's opening when no frame was usable, or the mode
     /// is off (`best_for_build`).
     pub pull_us: u64,
@@ -143,11 +370,50 @@ pub struct SelectTimes {
     pub by_ref: usize,
     /// Frames that needed the per-transaction check.
     pub slow: usize,
+    /// `N42_PLAN_AHEAD`: 0 planned here, 1 prepared ahead, 2 prepared ahead
+    /// and topped up ([`n42_tx_queue::FrameSelectTimes::ahead`]).
+    pub ahead: u8,
+    /// A used prepared plan's age at use, and its preparation's time.
+    pub ahead_age_us: u64,
+    /// Of a used prepared plan, its preparation's time.
+    pub ahead_prep_us: u64,
+    /// Transactions the top-up added.
+    pub ahead_topup_txs: usize,
+    /// Why a prepared plan was discarded, or "".
+    pub ahead_discard: &'static str,
+    /// `N42_PULL_BY_FRAMES`: the transactions taken out of the frames at
+    /// once, and how long that took.
+    pub bulk_txs: usize,
+    /// How long taking them took, the parallel clone included.
+    pub bulk_us: u64,
+    /// `N42_PLAN_AHEAD_BODY=1`: 0 no prepared body, 1 used, 2 not ready at
+    /// use, 3 not the build's segments.
+    pub body_ahead: u8,
+    /// The prepared body's making time (the hook's), us.
+    pub body_ahead_us: u64,
 }
 
 std::thread_local! {
     static SELECT_TIMES: std::cell::Cell<SelectTimes> = const {
-        std::cell::Cell::new(SelectTimes { select_us: 0, walk_us: 0, check_us: 0, pull_us: 0, by_ref: 0, slow: 0 })
+        std::cell::Cell::new(SelectTimes {
+            select_us: 0,
+            walk_us: 0,
+            check_us: 0,
+            ids_us: 0,
+            settle_us: 0,
+            pull_us: 0,
+            by_ref: 0,
+            slow: 0,
+            ahead: 0,
+            ahead_age_us: 0,
+            ahead_prep_us: 0,
+            ahead_topup_txs: 0,
+            ahead_discard: "",
+            bulk_txs: 0,
+            bulk_us: 0,
+            body_ahead: 0,
+            body_ahead_us: 0,
+        })
     };
 }
 
@@ -524,6 +790,31 @@ mod claimed_root_tests {
         let bare = B256::repeat_byte(0x79);
         remember_claimed(bare, root, &[]);
         assert_eq!(root_of_block(&bare), None);
+    }
+}
+
+#[cfg(test)]
+mod bulk_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    type Valid = reth_transaction_pool::ValidPoolTransaction<crate::N42PooledTransaction>;
+
+    /// The vector `select` leaves is taken once, only as the type it was
+    /// made with, and a build that does not want it clears it.
+    #[test]
+    fn the_bulk_is_taken_once_and_cleared_when_not_wanted() {
+        let made: Vec<Arc<Valid>> = Vec::new();
+        BULK.with(|slot| *slot.borrow_mut() = Some(Box::new(made)));
+        assert!(take_bulk::<crate::N42PooledTransaction>().is_some());
+        assert!(take_bulk::<crate::N42PooledTransaction>().is_none(), "taken once");
+        BULK.with(|slot| *slot.borrow_mut() = Some(Box::new(7u32)));
+        assert!(take_bulk::<crate::N42PooledTransaction>().is_none(), "another type is not a block");
+        BULK.with(|slot| *slot.borrow_mut() = Some(Box::new(Vec::<Arc<Valid>>::new())));
+        want_bulk(false);
+        assert!(take_bulk::<crate::N42PooledTransaction>().is_none(), "cleared when not wanted");
+        assert!(!WANT_BULK.with(std::cell::Cell::get));
+        assert!(!pull_by_frames(), "off unless N42_PULL_BY_FRAMES=1");
     }
 }
 

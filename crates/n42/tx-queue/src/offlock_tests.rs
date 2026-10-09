@@ -17,7 +17,7 @@ fn queue(offlock: bool) -> TxQueue<EthPooledTransaction> {
 
 /// The flood's shape: rounds `from..from + rounds` of one nonce for each of
 /// `senders` senders, cut into frames of `width` distinct senders.
-fn flood(queue: &TxQueue<EthPooledTransaction>, senders: u64, from: u64, rounds: u64, width: usize) {
+pub(crate) fn flood(queue: &TxQueue<EthPooledTransaction>, senders: u64, from: u64, rounds: u64, width: usize) {
     let all: Vec<(Address, u64)> = (from..from + rounds).flat_map(|n| (0..senders).map(move |s| (sender(s), n))).collect();
     for chunk in all.chunks(width) {
         let txs: Vec<EthPooledTransaction> = chunk.iter().map(|(s, n)| tx_hashed(*s, *n)).collect();
@@ -37,7 +37,7 @@ fn flood(queue: &TxQueue<EthPooledTransaction>, senders: u64, from: u64, rounds:
 
 /// The lanes' own count against what they hold, and the gate's mirror
 /// against the locked depth.
-fn assert_counts(queue: &TxQueue<EthPooledTransaction>) {
+pub(crate) fn assert_counts(queue: &TxQueue<EthPooledTransaction>) {
     let inner = queue.lock_inner_quiet();
     let held: usize = inner.lanes.values().map(|lane| lane.by_nonce.len()).sum();
     assert_eq!(inner.len, held, "len against the lanes");
@@ -46,7 +46,7 @@ fn assert_counts(queue: &TxQueue<EthPooledTransaction>) {
 }
 
 /// One build with the child's plan prepared, then every transaction taken.
-fn build(queue: &TxQueue<EthPooledTransaction>, parent: B256, gas: u64) -> (Vec<Tx>, FrameSelectTimes) {
+pub(crate) fn build(queue: &TxQueue<EthPooledTransaction>, parent: B256, gas: u64) -> (Vec<Tx>, FrameSelectTimes) {
     let (mut best, plan, times) = queue.frames_for_build_ahead(parent, gas, SelectMode::Parallel, false);
     queue.prepare_next_in(gas, SelectMode::Parallel);
     let txs: Vec<Tx> = best.by_ref().collect();
@@ -55,7 +55,7 @@ fn build(queue: &TxQueue<EthPooledTransaction>, parent: B256, gas: u64) -> (Vec<
     (txs, times)
 }
 
-fn seal(queue: &TxQueue<EthPooledTransaction>, built_on: B256, number: u64, hash: B256, txs: &[Tx]) {
+pub(crate) fn seal(queue: &TxQueue<EthPooledTransaction>, built_on: B256, number: u64, hash: B256, txs: &[Tx]) {
     let body = pairs(txs);
     let (dropped, _) = queue.forget_mined_parallel(built_on, body.len(), |i| body[i]);
     queue.hold_own_block(number, hash, dropped);
@@ -79,7 +79,7 @@ fn chain(offlock: bool, blocks: u64, gas: u64) -> (Vec<Vec<Tx>>, Vec<FrameSelect
     (out, times)
 }
 
-fn assert_chain_valid(blocks: &[Vec<Tx>]) {
+pub(crate) fn assert_chain_valid(blocks: &[Vec<Tx>]) {
     let mut next: HashMap<Address, u64> = HashMap::new();
     let mut seen: HashSet<B256> = HashSet::new();
     for (k, block) in blocks.iter().enumerate() {
@@ -215,9 +215,9 @@ fn a_hold_that_moves_the_lanes_between_the_holds_refuses_the_commit() {
 /// What a queue holds, for comparing two: each lane's nonces and mined
 /// watermarks (sorted by sender), the depth, the frames indexed, the build's
 /// taken list and whether a plan is prepared.
-type Lanes = Vec<(Address, Vec<u64>, Option<u64>, Option<u64>)>;
+pub(crate) type Lanes = Vec<(Address, Vec<u64>, Option<u64>, Option<u64>)>;
 
-fn state(queue: &TxQueue<EthPooledTransaction>) -> (Lanes, usize, usize, Vec<(Address, u64)>, Option<usize>) {
+pub(crate) fn state(queue: &TxQueue<EthPooledTransaction>) -> (Lanes, usize, usize, Vec<(Address, u64)>, Option<usize>) {
     let inner = queue.lock_inner_quiet();
     let mut lanes: Lanes = inner
         .lanes

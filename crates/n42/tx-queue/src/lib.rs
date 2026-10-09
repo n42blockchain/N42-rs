@@ -41,8 +41,10 @@
 //! [`global`].
 
 mod frames;
+mod snapshot;
 
 pub use frames::{FramePlan, FrameRef, FrameTxs, NewFrame, PlannedFrame, MAX_FRAMES};
+pub use snapshot::take_plan_snapshot_stats;
 
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
@@ -1427,6 +1429,9 @@ pub struct TxQueue<T: PoolTransaction> {
     ahead_hook: Arc<Mutex<Option<PlanAheadHook<T>>>>,
     /// `N42_QUEUE_OFFLOCK` unless a test said otherwise ([`queue_offlock`]).
     offlock: Arc<std::sync::atomic::AtomicBool>,
+    /// `N42_QUEUE_PLAN_SNAPSHOT` unless a test said otherwise
+    /// ([`snapshot::queue_plan_snapshot`]).
+    plan_snapshot: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Frames noted since the last drain, each with its transactions when the
@@ -1448,6 +1453,7 @@ impl<T: PoolTransaction> Clone for TxQueue<T> {
             drain_chunk: Arc::clone(&self.drain_chunk),
             ahead_hook: Arc::clone(&self.ahead_hook),
             offlock: Arc::clone(&self.offlock),
+            plan_snapshot: Arc::clone(&self.plan_snapshot),
         }
     }
 }
@@ -1611,6 +1617,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             drain_chunk: Arc::new(std::sync::atomic::AtomicUsize::new(drain_chunk())),
             ahead_hook: Arc::new(Mutex::new(None)),
             offlock: Arc::new(std::sync::atomic::AtomicBool::new(queue_offlock())),
+            plan_snapshot: Arc::new(std::sync::atomic::AtomicBool::new(snapshot::queue_plan_snapshot())),
         }
     }
 
@@ -2928,6 +2935,9 @@ impl<T: PoolTransaction> TxQueue<T> {
         mode: SelectMode,
         ahead: bool,
     ) -> (QueueBest<T>, FramePlan, FrameSelectTimes) {
+        if mode == SelectMode::Parallel && self.plan_snapshot_on() {
+            return self.frames_for_build_snapshot(parent, gas_limit, ahead);
+        }
         let mut times = FrameSelectTimes::default();
         let mut garbage = PruneGarbage::default();
         let at = std::time::Instant::now();
@@ -3012,6 +3022,24 @@ impl<T: PoolTransaction> TxQueue<T> {
             (out, mark)
         };
         garbage.free();
+        self.finish_frame_build(segments, plan, times, mark, prepared_body, gas_limit, mode, ahead)
+    }
+
+    /// The end of a frame build's selection, after its last hold: the noted
+    /// takes handed to the settling thread (which, with `ahead`, then
+    /// prepares the next build's plan), and the build's [`QueueBest`].
+    #[allow(clippy::too_many_arguments)]
+    fn finish_frame_build(
+        &self,
+        segments: Vec<(FrameTxs<T>, usize)>,
+        plan: FramePlan,
+        times: FrameSelectTimes,
+        mark: Option<SettleMark>,
+        prepared_body: Option<Arc<Mutex<BodySlot>>>,
+        gas_limit: u64,
+        mode: SelectMode,
+        ahead: bool,
+    ) -> (QueueBest<T>, FramePlan, FrameSelectTimes) {
         // The takes the plan left noted leave the lanes on a thread of their
         // own, off the build's start; any lock before that applies them first.
         // With `ahead`, the same thread then prepares the next build's plan.
@@ -3116,6 +3144,11 @@ impl<T: PoolTransaction> TxQueue<T> {
     }
 
     fn prepare_next_in(&self, gas_limit: u64, mode: SelectMode) -> bool {
+        if mode == SelectMode::Parallel && self.plan_snapshot_on() {
+            if let Some(made) = self.prepare_next_snapshot(gas_limit) {
+                return made;
+            }
+        }
         if self.offlock() && mode == SelectMode::Parallel {
             for attempt in 0..2 {
                 if let Some(made) = self.prepare_next_offlock(gas_limit) {
@@ -3534,6 +3567,7 @@ impl<T: PoolTransaction> Inner<T> {
             plan,
             times,
             &mut noted,
+            PLAN_MARGIN,
         );
         for (id, prefix) in noted {
             self.len -= prefix;
@@ -3752,6 +3786,21 @@ impl<T: PoolTransaction> Inner<T> {
     /// is the one a fresh plan would have made on the queue as it stood
     /// when it was prepared.
     fn prepared_verdict(&self, prepared: &Prepared<T>, parent: B256, gas_limit: u64) -> Result<(), AheadDiscard> {
+        self.prepared_verdict_in(prepared, parent, gas_limit, false)
+    }
+
+    /// [`Self::prepared_verdict`], with the per-sender part on the worker
+    /// pool when `parallel` (`N42_QUEUE_PLAN_SNAPSHOT`: ~150,000 lane
+    /// look-ups at the bench tier, under the build's first hold). The same
+    /// verdict either way: the first failing sender in the map's order
+    /// decides the reason.
+    fn prepared_verdict_in(
+        &self,
+        prepared: &Prepared<T>,
+        parent: B256,
+        gas_limit: u64,
+        parallel: bool,
+    ) -> Result<(), AheadDiscard> {
         if prepared.after != self.builds {
             return Err(AheadDiscard::OtherBuild);
         }
@@ -3769,6 +3818,19 @@ impl<T: PoolTransaction> Inner<T> {
             && prepared.lowest.iter().any(|(sender, lowest)| pruning.get(sender).is_some_and(|mined| mined >= lowest))
         {
             return Err(AheadDiscard::Mined);
+        }
+        if parallel {
+            use rayon::prelude::*;
+            let lowest: Vec<(&Address, &u64)> = prepared.lowest.iter().collect();
+            let lanes = &self.lanes;
+            let failed = lowest.par_iter().with_min_len(1024).find_map_first(|(sender, lowest)| {
+                let lane = lanes.get(*sender)?;
+                if lane.is_stale(**lowest) {
+                    return Some(AheadDiscard::Mined);
+                }
+                lane.by_nonce.first_key_value().is_some_and(|(nonce, _)| nonce < *lowest).then_some(AheadDiscard::Below)
+            });
+            return failed.map_or(Ok(()), Err);
         }
         for (sender, lowest) in &prepared.lowest {
             let Some(lane) = self.lanes.get(sender) else { continue };
@@ -4367,26 +4429,30 @@ impl<T: PoolTransaction> PlanSource<T> for LivePlanSource<'_, T> {
 /// is pushed to `noted` as (id, taken prefix), in plan order; nothing of the
 /// lanes is touched. Returns where the serial part continues and whether
 /// the plan has ended.
+#[allow(clippy::too_many_arguments)]
 fn plan_parallel_over<T: PoolTransaction, S: PlanSource<T>>(
-src: &S,
-ids: &[B256],
-gas_left: &mut u64,
-segments: &mut Vec<(FrameTxs<T>, usize)>,
-plan: &mut FramePlan,
-times: &mut FrameSelectTimes,
-noted: &mut Vec<(B256, usize)>,
+    src: &S,
+    ids: &[B256],
+    gas_left: &mut u64,
+    segments: &mut Vec<(FrameTxs<T>, usize)>,
+    plan: &mut FramePlan,
+    times: &mut FrameSelectTimes,
+    noted: &mut Vec<(B256, usize)>,
+    margin: usize,
 ) -> (usize, bool) {
     use rayon::prelude::*;
-    const MARGIN: usize = PLAN_MARGIN;
     let check_at = std::time::Instant::now();
     let mut end = 0usize;
     let mut reach = 0u64;
     let mut past = 0usize;
-    while end < ids.len() && past <= MARGIN {
-        if reach > *gas_left {
+    while end < ids.len() && past <= margin {
+        let gas = src.txs_gas_of(&ids[end]).unwrap_or(u64::MAX);
+        // A frame of no gas (a snapshot's frame that can take nothing) is
+        // decided without a check and costs no margin.
+        if reach > *gas_left && gas > 0 {
             past += 1;
         }
-        reach = reach.saturating_add(src.txs_gas_of(&ids[end]).unwrap_or(u64::MAX));
+        reach = reach.saturating_add(gas);
         end += 1;
     }
     let checks: Vec<frames::RunCheck<T>> =
@@ -6753,6 +6819,9 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod snapshot_tests;
 
 #[cfg(test)]
 mod prune_tests;

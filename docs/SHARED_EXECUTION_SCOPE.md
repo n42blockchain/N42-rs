@@ -1815,3 +1815,69 @@ Validator env: `N42_CHECK_BEFORE_SLOT=1` (with the existing `N42_IMPORT_ONCE=1`,
    `receipts_late_wait_us`, `split_tasks`, `task_max_us` (13.6 -> ~6-8), `heavy_shard` stable across legs or not, output wait.
 Correctness on every leg: `fields_mismatches` 0 (one leg with `N42_FIELDS_AT_SEAL=verify`), `invalid_blocks` 0,
 `fleet7-verify` clean, block hashes against A2P50 on the same replay.
+
+## 20. The seal chain at 50 ms and what the tail is (2026-10-08, loop350 BP50/B logs, no new leg)
+
+Question: at 50 ms pacing and 200k the cycle holds 53.9 ms median but 63.4 mean. What does the seal chain consist of, and what
+makes the tail? Read offline from loop350 `bench-loop350BP50/node0-el.log` (the layer; window 1, 475 builds) and the validator
+logs of BP50 and B (60 ms). Medians (p90) unless stated; sums of means are arithmetic, never a measurement.
+
+### 20.1 Seal chain anatomy at BP50 (base, 50 ms pacing, 200k)
+
+Order from build start to `sealed_at`: `par_start` (setup and header, `payload.rs` ~1721-1727) -> `state_wait_ms` (macro ~1548-1553;
+`direct_build.rs:405` `open_wait`: waits for the parent's StateReady or the grandparent's import; over all builds the wait was on
+the parent's output 673 times, on the grandparent 539, none 241) -> prep/part/pull (0 ms; ~2036, 2851) -> `par_exec_ms` (~2852;
+128 batches on build_pool, `parallel_transfer.rs:850-861`, `N42_BUILD_BATCHES` at ~1388) -> seal at the execution's end (2520-2545,
+hook 1880-1899, `sealed_at` stamped at 1899; `exec_end_to_seal` median 106 us). Not inside `sealed_at`: `par_fold` (after the
+seal), `index` (the freeze, on its own thread, ~2200-2245), roots, `state_ready`.
+
+| phase (ms) | median | p90 | mean | note |
+| --- | --- | --- | --- | --- |
+| par_start | 2 | 15 | 5.0 | |
+| state_wait | 20 | 57 | 25.2 | a wait, not work |
+| par_exec | 20 | 26 | 20.9 | the only parallel part |
+| sealed_ms | 3 | 21 | 7.8 | unexplained, see below |
+| tx_root | 1 | 1 | 0.8 | |
+| **sealed_at** | 59 | 82 | 60.6 | |
+| par_fold | 9 | 19 | 10.4 | after the seal |
+| index | 13 | 21 | 14.5 | beside |
+
+Means add up: 5.0 + 25.2 + 20.9 + 7.8 = 58.9 against `sealed_at` mean 60.6. corr(`sealed_at`, `state_wait`) = 0.81,
+corr(`sealed_at`, `par_exec`) = -0.13. Only `par_exec` (35%) is parallel; ~65% is serial or a wait. `sealed_ms` (mean 7.8, p90 21)
+is not explained: `seal_block_ms`, `seal_remember_ms`, `seal_hook_ms` are all 0. B at 60 ms: `state_wait` median 4 (mean 8.3),
+`sealed_at` median 46, p90 62: at 60 ms the parent's state is ready before the tick; at 50 ms the child waits 20-25 ms for it.
+
+### 20.2 The tail
+
+| | w1 | w2 |
+| --- | --- | --- |
+| views (consecutive `proposal sent`) | 473 | - |
+| cycle median / mean / p90 (ms) | 53.9 / 63.4 / 91.1 | 53.6 / 63.2 / - |
+| slow views (> 60 ms) | 173 (36.5%), mean 82.5 | same share |
+| other views, mean | 52.3 | |
+
+The tail costs ~11 ms of the mean. 94% of slow views (163/173, both windows) follow a view whose `R1_collect` exceeded 45 ms
+(R1 median 71-74 for slow against 24 for fast; corr(cycle, R1) 0.81 / 0.83; of views > 100 ms, 24/26 and 25/27 have R1 > 45).
+`R2_collect` is 3 ms and the leader's `verify_us` ~2.9 ms in both groups. `sealed_at` > 55 ms does not discriminate (63% of slow,
+55% of fast; corr 0.30 / -0.02). One tenure change in w1 (131.7 ms), none in w2; no periodicity (slow views flat across view
+mod 16, gaps between slow views mostly 2). `forest lock waited` warnings in 21% of slow against 17% of fast intervals: no link.
+So the tail is the previous view's R1 quorum (the first-vote road), not the seal chain.
+
+### 20.3 `par_exec` parallelism
+
+200,000 x 3.0 us / 20 ms = 30 effective cores. `build_pool` has 32 threads (`N42_PARALLEL_BUILD_THREADS=32` in the runner, default 16
+at `parallel_transfer.rs:853`; log `batch_threads=32 batches=128`); the layer at E=1 has 208 CPUs. Batches of 2000 run 4 ms median
+(8 max); 128 batches are ~4 waves on 32 threads; `batch_last_start` median 15.6 ms, last end 20.0; dispatch 0.2 ms. The bound is the
+pool size, not prep/partition/fold.
+
+### 20.4 What follows (loop351, environment-only, 50 ms, 200k, bookended)
+
+1. BP50 repeated.
+2. S1 alone (`N42_CHECK_BEFORE_SLOT=1`; in stage a it cut the first-vote p90 from 29-36 to 3-3.5 ms, the R1 tail of 20.2, and was
+   never run alone at 50 ms).
+3. S1 + `N42_PARALLEL_BUILD_THREADS=64` (`par_exec` 21 -> ~11 ms if the reads keep up).
+4. S1 + S3 (`N42_MERGE_AT_SHARDS_READY=1`, which removes the state wait of 20.1 without S2/S4's CPU competition).
+5. S1 + S3 + T64; then a 50 -> 45 -> 40 step-down of the best.
+
+Expected floor with S1+S3+T64: exec ~11 + state ready after seal ~15 + serial ~13 = ~40 ms, the 5M line at 200k if the tail goes.
+Runner: `scripts/fleet7-runs/run-loop351.sh`.

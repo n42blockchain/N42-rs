@@ -489,7 +489,18 @@ fn main() {
             // here by every canonical block on every node.
             if std::env::var("N42_TX_QUEUE").is_ok() {
                 let queue: n42_tx_queue::TxQueue<n42_engine_types::N42PooledTransaction> = n42_tx_queue::TxQueue::new();
-                if std::env::var("N42_TX_QUEUE_DRAINER").is_ok() {
+                if std::env::var("N42_TX_QUEUE_DRAINER").is_ok() && queue.wants_drainer_thread() {
+                    // N42_QUEUE_OFFLOCK: a thread of its own, woken early by a
+                    // deep inbox; while it runs the block path's holds drain
+                    // only a bounded slice. See TxQueue::run_drainer.
+                    let drained = queue.clone();
+                    if let Err(err) = std::thread::Builder::new()
+                        .name("tx-queue-drainer".into())
+                        .spawn(move || drained.run_drainer(std::time::Duration::from_millis(5)))
+                    {
+                        tracing::warn!(target: "reth::cli", %err, "could not start the queue's drainer thread");
+                    }
+                } else if std::env::var("N42_TX_QUEUE_DRAINER").is_ok() {
                     // The inbox drained off the builder's thread; see TxQueue::drain_now.
                     let drained = queue.clone();
                     tokio::spawn(async move {

@@ -880,6 +880,17 @@ struct Prepared<T: PoolTransaction> {
     body: Option<Arc<Mutex<BodySlot>>>,
 }
 
+/// A frame build's noted takes as its selection left them
+/// ([`TxQueue::settle_offlock`]): the build, how many frames, the first and
+/// last frame ids.
+#[derive(Clone, Copy, Debug)]
+struct SettleMark {
+    build: u64,
+    count: usize,
+    first: B256,
+    last: B256,
+}
+
 /// The first hold of an off-lock preparation (`N42_QUEUE_OFFLOCK`,
 /// [`TxQueue::offlock_plan`]): a plan stored there already, or one whose
 /// takes are noted and still in the lanes, for [`TxQueue::offlock_commit`].
@@ -1641,6 +1652,25 @@ impl<T: PoolTransaction> TxQueue<T> {
         let mut inner = self.inner.lock();
         let at = std::time::Instant::now();
         inner.settle();
+        TimedInner { guard: inner, at, waited: at.saturating_duration_since(asked), caller, mirror: &self.depth }
+    }
+
+    /// The lanes' lock for the drainer: with `N42_QUEUE_OFFLOCK`, without
+    /// applying a frame build's noted takes first, so the drainer never
+    /// pays for a selection's settle and [`Self::settle_offlock`] can apply
+    /// them in its own short hold. Arrivals do not need them applied: an
+    /// arrival at a noted (sender, nonce) is a duplicate either way, one
+    /// below is inserted below, and `len` already left them out. Without
+    /// the switch this is [`Self::lock_inner_quiet`].
+    #[track_caller]
+    fn lock_inner_unsettled(&self) -> TimedInner<'_, T> {
+        if !self.offlock() {
+            return self.lock_inner_quiet();
+        }
+        let caller = std::panic::Location::caller();
+        let asked = std::time::Instant::now();
+        let inner = self.inner.lock();
+        let at = std::time::Instant::now();
         TimedInner { guard: inner, at, waited: at.saturating_duration_since(asked), caller, mirror: &self.depth }
     }
 
@@ -2729,7 +2759,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             self.drain_chunked(chunk, usize::MAX);
             return;
         }
-        let mut inner = self.lock_inner_quiet();
+        let mut inner = self.lock_inner_unsettled();
         self.drain_inbox(&mut inner);
     }
 
@@ -2781,7 +2811,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             let moved;
             let done;
             {
-                let mut inner = self.lock_inner_quiet();
+                let mut inner = self.lock_inner_unsettled();
                 at = std::time::Instant::now();
                 // Moved, not copied: a `Vec` becomes the deque in O(1).
                 if let Some(batch) = batch.take() {
@@ -2902,7 +2932,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         let mut garbage = PruneGarbage::default();
         let at = std::time::Instant::now();
         let mut prepared_body: Option<Arc<Mutex<BodySlot>>> = None;
-        let (segments, plan) = {
+        let ((segments, plan), mark) = {
             let mut inner = self.lock_inner();
             times.lock_us = at.elapsed().as_micros() as u64;
             let begin_at = std::time::Instant::now();
@@ -2910,7 +2940,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             // be in its lane when the plan is judged.
             self.drain_inbox(&mut inner);
             let verdict = inner.prepared.as_ref().map(|prepared| inner.prepared_verdict(prepared, parent, gas_limit));
-            match (verdict, inner.prepared.take()) {
+            let out = match (verdict, inner.prepared.take()) {
                 (Some(Ok(())), Some(prepared)) => {
                     let Prepared { gas_used, cut, segments, plan, taken, made_at, prep_us, body, .. } = prepared;
                     prepared_body = body;
@@ -2969,7 +2999,17 @@ impl<T: PoolTransaction> TxQueue<T> {
                     times.plan_us = plan_at.elapsed().as_micros() as u64;
                     (segments, plan)
                 }
-            }
+            };
+            // With `N42_QUEUE_OFFLOCK` the noted takes are grouped off the
+            // lock by the thread below and applied in one short hold
+            // ([`Self::settle_offlock`]), unless a lock settles them first.
+            let mark = (self.offlock() && !inner.pending.is_empty()).then(|| SettleMark {
+                build: inner.builds,
+                count: inner.pending.len(),
+                first: inner.pending[0].0,
+                last: inner.pending[inner.pending.len() - 1].0,
+            });
+            (out, mark)
         };
         garbage.free();
         // The takes the plan left noted leave the lanes on a thread of their
@@ -2977,7 +3017,15 @@ impl<T: PoolTransaction> TxQueue<T> {
         // With `ahead`, the same thread then prepares the next build's plan.
         if mode == SelectMode::Parallel || ahead {
             let queue = self.clone();
+            // The noted takes are the plan's last segments, one each.
+            let noted: Option<(SettleMark, Vec<(FrameTxs<T>, usize)>)> = mark.and_then(|mark| {
+                let from = segments.len().checked_sub(mark.count)?;
+                Some((mark, segments[from..].to_vec()))
+            });
             let spawned = std::thread::Builder::new().name("n42-frame-settle".to_owned()).spawn(move || {
+                if let Some((mark, noted)) = noted {
+                    queue.settle_offlock(mark, noted);
+                }
                 if ahead {
                     queue.prepare_next_in(gas_limit, mode);
                 } else {
@@ -2999,6 +3047,61 @@ impl<T: PoolTransaction> TxQueue<T> {
             prepared_body,
         };
         (best, plan, times)
+    }
+
+    /// [`Inner::settle`] of a frame build's noted takes with the grouping
+    /// off the lanes' lock (`N42_QUEUE_OFFLOCK`): the taken list in plan
+    /// order (the frames' own `Arc`s, which the planner checked are the
+    /// lanes' entries) and each sender's run of nonces are made with no
+    /// lock held, then applied in one hold as one split per sender -- if
+    /// the noted takes are still the ones `mark` names. Every hold of the
+    /// lanes' lock but the drainer's settles them first, so if they are
+    /// still noted, nothing but arrivals has touched the lanes since they
+    /// were planned; if another hold settled them, there is nothing to do.
+    fn settle_offlock(&self, mark: SettleMark, noted: Vec<(FrameTxs<T>, usize)>) {
+        let mut garbage = PruneGarbage::default();
+        let count: usize = noted.iter().map(|(_, prefix)| *prefix).sum();
+        let mut taken: Vec<Arc<ValidPoolTransaction<T>>> = Vec::with_capacity(count);
+        for (txs, prefix) in &noted {
+            taken.extend(txs.iter().take(*prefix).cloned());
+        }
+        let mut runs: AddressHashMap<(u64, u64)> = AddressHashMap::default();
+        for t in &taken {
+            let nonce = t.nonce();
+            let run = runs.entry(t.sender()).or_insert((nonce, nonce));
+            if run.1 != nonce {
+                // Not one run a sender: the ordinary settle decides.
+                return;
+            }
+            run.1 = nonce.saturating_add(1);
+        }
+        let mut inner = self.lock_inner_unsettled();
+        let current = inner.builds == mark.build
+            && inner.pending.len() == mark.count
+            && inner.pending.first().is_some_and(|(id, _)| *id == mark.first)
+            && inner.pending.last().is_some_and(|(id, _)| *id == mark.last)
+            && inner.pending.iter().map(|(_, prefix)| *prefix).sum::<usize>() == count;
+        if !current {
+            return;
+        }
+        inner.pending.clear();
+        inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+        for (sender, (lo, hi)) in &runs {
+            let Some(lane) = inner.lanes.get_mut(sender) else { continue };
+            let mut run = lane.by_nonce.split_off(lo);
+            let mut tail = run.split_off(hi);
+            lane.by_nonce.append(&mut tail);
+            debug_assert_eq!(run.len() as u64, hi - lo);
+            if lane.by_nonce.is_empty() {
+                lane.queued = false;
+            }
+            garbage.lanes.push(run);
+        }
+        if let Some((_, list)) = inner.last_build.as_mut() {
+            list.extend(taken);
+        }
+        drop(inner);
+        garbage.free();
     }
 
     /// Prepares the next frame build's plan now ([`Prepared`],

@@ -438,3 +438,51 @@ fn a_build_between_the_hand_off_holds_gets_the_kept_part_back() {
     // take and the mined half are everything.
     assert_eq!(queue.len() + next.len() + mined.len(), 1_600, "nothing lost");
 }
+
+/// A frame build's noted takes applied by the off-lock settle leave the
+/// queue exactly as the ordinary settle does -- lanes, depth, taken list in
+/// plan order -- with arrivals drained in between (the drainer's holds do
+/// not settle under the switch); and a settle that finds the takes already
+/// applied by another hold does nothing.
+#[test]
+fn the_offlock_settle_is_the_ordinary_settle() {
+    let gas = 900 * 21_000;
+    for already in [false, true] {
+        let mut states = Vec::new();
+        for offlock in [false, true] {
+            let queue = queue(offlock);
+            flood(&queue, 400, 0, 4, 50);
+            let (segments, mark) = {
+                let mut inner = queue.lock_inner();
+                queue.begin_build(&mut inner, block_hash(0));
+                let mut times = FrameSelectTimes::default();
+                let (segments, plan, _) = inner.plan_frames(gas, &mut times, SelectMode::Parallel);
+                assert_eq!(plan.tx_count(), 900);
+                assert_eq!(inner.pending.len(), segments.len(), "the whole plan is noted");
+                let mark = SettleMark {
+                    build: inner.builds,
+                    count: inner.pending.len(),
+                    first: inner.pending[0].0,
+                    last: inner.pending[inner.pending.len() - 1].0,
+                };
+                (segments, mark)
+            };
+            // The next round arrives and is drained before the settle.
+            flood(&queue, 400, 4, 1, 50);
+            queue.drain_now();
+            if already {
+                drop(queue.lock_inner());
+            }
+            if offlock {
+                queue.settle_offlock(mark, segments);
+            } else {
+                drop(queue.lock_inner());
+            }
+            assert!(queue.lock_inner_unsettled().pending.is_empty());
+            assert_counts(&queue);
+            states.push(state(&queue));
+        }
+        assert_eq!(states[0], states[1], "already settled {already}");
+        assert_eq!(states[1].3.len(), 900);
+    }
+}

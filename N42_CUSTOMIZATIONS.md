@@ -541,3 +541,15 @@
   启动时打印一行 `gossipsub local queue bounds`。`flood_publish`、mesh 参数不变。
 - 队列深度在不修改库的前提下无法取得（只有开启 `metrics` feature 的 prometheus 直方图，没有最大值或事件），
   因此验证者的 timing 行没有 `gossip_queue_max`。
+
+## chain-state：精简的规范链通知（vendored `reth-chain-state` v2.7.0，`N42_CANON_NOTIFY_LEAN`）
+
+- `crates/chain-state` 自 2026-10-09 起 vendored（工作区成员，并在 `[patch.'https://github.com/paradigmxyz/reth.git']`
+  中覆盖 git 源）；首个提交与上游 v2.7.0 逐字节相同。
+- `crates/chain-state/src/in_memory.rs` `n42_canon_notify_lean()` / `NewCanonicalChain::blocks_to_chain_with`：
+  `N42_CANON_NOTIFY_LEAN=1`（默认关闭，只读一次）时，`CanonStateNotification` 里的 `Chain` 只带区块、trie 数据句柄
+  和 BAL，`ExecutionOutcome` 为空（`first_block` 正确），不再深拷贝每个块的收据和 BundleState、也不再逐块 `extend`。
+  测量依据：loop351 stage k（E=1、20 万笔转账的块），引擎树线程 59% 的时间花在 `on_canonical_chain_update`，每个规范化的块 23 ms。
+- 仅限 bench：交易池维护任务拿不到 changed accounts（已打包交易仍会移除，发送者的 nonce/余额只在其新交易验证时或 drift 时刷新），
+  payload 生成器的预缓存为空，RPC 块/收据缓存和 fee history 缓存不再从通知填充（回退到 provider 读取），
+  `logs` 与收据 pubsub 不再推送。`newHeads`、交易队列剪枝、QMDB/引擎头跟随者只读区块与交易，不受影响。

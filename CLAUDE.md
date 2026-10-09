@@ -189,7 +189,8 @@ Three distinct kinds of crate directory exist, and they behave differently:
 1. **`crates/n42/*` — original N42 code.** Workspace members, freely editable.
 2. **Vendored reth forks that ARE workspace members** (`crates/chainspec`, `crates/consensus/consensus`,
    `crates/storage/{db,db-api,provider,storage-api}`, `crates/node/{core,builder}`,
-   `crates/ethereum/{cli,hardforks,node}`, `crates/net/peers`; plus `crates/rpc/rpc-types-compat`, a
+   `crates/ethereum/{cli,hardforks,node}`, `crates/net/peers`, `crates/chain-state` (since 2026-10-09:
+   `N42_CANON_NOTIFY_LEAN=1` builds canonical notifications without execution outcomes, bench-only); plus `crates/rpc/rpc-types-compat`, a
    member that is no longer a patch target since upstream renamed it `reth-rpc-convert`).
 3. **Vendored reth forks that are NOT workspace members but ARE patch targets**
    (`crates/revm`, `crates/net/network`, `crates/net/network-api`, `crates/storage/storage-overlay`

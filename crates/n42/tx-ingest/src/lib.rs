@@ -828,6 +828,9 @@ fn spawn_stats_reporter() {
                 .map(|(reason, count)| format!("{reason}:{count}"))
                 .collect::<Vec<_>>()
                 .join(",");
+            // `N42_QUEUE_OFFLOCK`: preparations whose commit found the lanes
+            // moved, and those that then planned in one hold.
+            let (offlock_raced, offlock_fallback) = n42_tx_queue::take_offlock_stats();
             let (frames, txs, recover, pool, busy) = (
                 STATS.frames.load(Ordering::Relaxed),
                 STATS.txs.load(Ordering::Relaxed),
@@ -939,6 +942,8 @@ fn spawn_stats_reporter() {
                     drain_finished = lock.drain_finished,
                     // `N42_PLAN_AHEAD`: prepared plans discarded, by reason.
                     plan_discards = %ahead_discards,
+                    offlock_raced,
+                    offlock_fallback,
                     "ingest"
                 );
             }

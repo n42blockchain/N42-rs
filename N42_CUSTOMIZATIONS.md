@@ -286,6 +286,19 @@
   选帧；规范剪枝挖到其中 nonce 时立即作废。没有截断帧且 gas 有余时用其后到达的帧补足。构建阶段行新增
   `plan_ahead`（0 现场/1 预选/2 预选+补足）、`plan_age_us`、`plan_prep_us`、`plan_topup_txs`、
   `plan_discard`；`ingest` 行新增 `plan_discards`（按原因计数）。
+- `N42_QUEUE_OFFLOCK=1`（默认关；代码在 `crates/n42/tx-queue/src/lib.rs` `queue_offlock`、`Inner::lanes_gen`、
+  `prepare_next_offlock`、`remove_mined_offlock`、`forget_mined_parallel_offlock`、`settle_offlock`；测试在
+  `offlock_tests.rs`）：把队列锁下的重活移出锁或拆成短持锁，结果与一次持锁相同。预选帧：第一次持锁里选帧，
+  take 只记下不移出 lanes；锁外按 sender 归并成连续 nonce 段；第二次持锁只在 `lanes_gen` 未变时每个 sender
+  一次 split 取出并存为 `Prepared`，否则什么都不做、重试一次、再退回一次持锁的路径。`lanes_gen` 由每次
+  `lock_inner` 和非空的 settle 增加；只 drain、只读或不碰 lanes 的持锁（drainer、hand-off 的整块遗忘、
+  `hold_own_block`、深度读数）用 `lock_inner_quiet`，不增加。规范剪枝：先一次持锁 drain、登记
+  `Inner::pruning`（期间 verdict 拒绝含被剪 nonce 的预选计划）并作废相交的预选计划，再每 256 个 sender 一次
+  持锁 split lanes，最后一次持锁再查预选计划、切分 taken 列表，然后每 32 帧一次持锁清扫帧索引、最后压缩一次；
+  两次持锁之间释放锁并 yield。hand-off 的 `forget_mined_*`：短持锁取出 taken 列表，锁外比对/fold/partition，
+  再短持锁放回未挖部分（期间若已开始新构建，则按该构建开头的方式还回 lanes）。帧构建记下的 take 由 settle
+  线程锁外归并、一次短持锁按 sender split 应用（若仍是原来那批）；开关打开时 drainer 的持锁不再先 settle。
+  锁采样器照常计每次持锁；`take_offlock_stats()` 给出提交被拒（重试）与退回次数。
 - `N42_PULL_BY_FRAMES=1`（默认关；代码在 `crates/n42/engine-types/src/frame_blocks.rs` `select`/`take_bulk`
   与 `payload.rs`）：帧构建在并行步骤与 puller 都开启、且 sender 不是待验证的声明时，用
   `QueueBest::take_frame_segments` 整帧取出全部计划帧，在 build 池上并行复制每帧切片的 `Arc`，构建拿着这个

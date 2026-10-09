@@ -48,8 +48,8 @@ for tag in sys.argv[1:]:
         elif 'handed to the engine as executed' in l:
             l = ansi.sub('', l); d = dict(KV.findall(l))
             if 'total_ms' in d: own_imp.append((ts(l), float(d['total_ms'])))
-        elif 'direct import: executed here' in l:
-            m = re.search(r'number=(\d+)', l)
+        if 'direct import: executed here' in l:  # also carries 'handed to the engine as executed', so not an elif
+            m = re.search(r'number=(\d+)', ansi.sub('', l))
             if m: directed[int(m[1])] = 1
     num_builds = [{k: (num(v) if num(v) is not None else v.strip('"')) for k, v in d.items()} for d in builds]
     P, Pd, Tp, Qc, votes = {}, {}, {}, {}, {}

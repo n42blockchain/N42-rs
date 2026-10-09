@@ -561,6 +561,35 @@ const MAX_PENDING_RANGES: usize = 8;
 /// closed is worse than the stall; `imported_height` is `None` until the first
 /// import, so this is simply inert until it can be right.
 const FAR_AHEAD_BLOCKS: u64 = 1;
+
+/// Parses `N42_FAR_AHEAD_BLOCKS`: an integer in `1..=8`, else the default
+/// [`FAR_AHEAD_BLOCKS`] (an invalid value is logged).
+fn far_ahead_blocks_from(value: Option<&str>) -> u64 {
+    let Some(text) = value else { return FAR_AHEAD_BLOCKS };
+    match text.trim().parse::<u64>() {
+        Ok(n) if (1..=8).contains(&n) => n,
+        _ => {
+            warn!(target: "n42.h2.node", value = text, "invalid N42_FAR_AHEAD_BLOCKS (want 1..=8); keeping the default");
+            FAR_AHEAD_BLOCKS
+        }
+    }
+}
+
+/// How far a block may run ahead of the execution layer's tip before it is
+/// held, read once from `N42_FAR_AHEAD_BLOCKS` (default [`FAR_AHEAD_BLOCKS`]).
+///
+/// At depth-2 deferred execution (header N carries the execution of N-2) a
+/// voted block is legitimately two ahead of the tip once votes no longer wait
+/// for imports (`N42_CHECK_BEFORE_SLOT=1`), so the default of one holds it and
+/// defeats the check-ahead. See docs/SHARED_EXECUTION_SCOPE.md section 20 and
+/// docs/BREAKTHROUGH_DESIGN.md 10.98.
+static FAR_AHEAD_LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// The effective far-ahead limit.
+fn far_ahead_limit() -> u64 {
+    *FAR_AHEAD_LIMIT
+        .get_or_init(|| far_ahead_blocks_from(std::env::var("N42_FAR_AHEAD_BLOCKS").ok().as_deref()))
+}
 /// Bodies held back at most; the oldest go first.
 /// How many gossiped transactions go to the forwarder in one handoff.
 const TX_FORWARD_MAX: usize = 1000;
@@ -989,8 +1018,8 @@ const fn head_stamp(remembered: Option<u64>, header: Option<&Header>) -> Option<
 /// arrives while its parent is still executing. Two is a block whose parent
 /// this node has not even started, and sending it would make the engine
 /// backfill from peers it does not have.
-const fn runs_far_ahead(number: u64, tip: u64) -> bool {
-    number > tip + FAR_AHEAD_BLOCKS
+fn runs_far_ahead(number: u64, tip: u64) -> bool {
+    number > tip + far_ahead_limit()
 }
 
 /// The execution layer's height from the three things that know it: the head
@@ -4684,6 +4713,17 @@ fn body_request_grace() -> Duration {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn far_ahead_blocks_parse() {
+        use super::{far_ahead_blocks_from as f, FAR_AHEAD_BLOCKS};
+        assert_eq!(f(None), FAR_AHEAD_BLOCKS);
+        assert_eq!(f(Some("2")), 2);
+        assert_eq!(f(Some("8")), 8);
+        assert_eq!(f(Some("0")), FAR_AHEAD_BLOCKS);
+        assert_eq!(f(Some("9")), FAR_AHEAD_BLOCKS);
+        assert_eq!(f(Some("x")), FAR_AHEAD_BLOCKS);
+    }
+
     use super::*;
 
     /// Defect 18's bound: three rounds are asked, a fourth fetches the whole

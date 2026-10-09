@@ -370,6 +370,13 @@ struct Inner {
     /// The label the forest's lock was last taken for ([`QmdbNodeState::lock_as`]),
     /// read by a caller that has to wait to say whom it waited for.
     forest_holder: Mutex<&'static str>,
+    /// Renames queued by [`QmdbNodeState::rename_or_defer`] while another
+    /// caller held the forest, applied in order by the next holder
+    /// ([`QmdbNodeState::lock_as`]) before it touches the forest.
+    pending_renames: Mutex<Vec<PendingRename>>,
+    /// How many renames are queued, so a lock taker skips the queue's mutex
+    /// when there are none.
+    pending_rename_count: std::sync::atomic::AtomicUsize,
     /// The last roots' splits, by key ([`QmdbNodeState::take_root_split`]).
     root_splits: Mutex<std::collections::VecDeque<(B256, RootSplit)>>,
     chain: Arc<ChainSpec>,
@@ -413,6 +420,36 @@ struct Inner {
     compaction_ms_total: std::sync::atomic::AtomicU64,
     /// The last compaction's phases: read, replay, encode, write, sync.
     compaction_phases: Mutex<[u64; 5]>,
+}
+
+/// A rename queued by [`QmdbNodeState::rename_or_defer`].
+#[derive(Debug, Clone, Copy)]
+struct PendingRename {
+    from: B256,
+    alternate: Option<B256>,
+    to: B256,
+    queued_at: std::time::Instant,
+}
+
+/// What [`QmdbNodeState::rename_or_defer`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameOutcome {
+    /// The lock was free and the rename ran.
+    Applied,
+    /// The lock was held; the rename is queued for its next holder.
+    Deferred,
+}
+
+/// Moves the record under `from` (or, when nothing is filed there, under
+/// `alternate`) to `to`.
+fn apply_rename(forest: &mut QmdbForest, rename: &PendingRename) -> Result<(), StateError> {
+    match forest.rename(rename.from, rename.to) {
+        Ok(()) => Ok(()),
+        Err(err) => match rename.alternate {
+            Some(under) if under != rename.to && under != rename.from => forest.rename(under, rename.to),
+            _ => Err(err),
+        },
+    }
 }
 
 /// A forest-lock wait or hold longer than this is logged at WARN
@@ -661,6 +698,8 @@ impl QmdbNodeState {
             inner: Arc::new(Inner {
                 forest: Mutex::new(None),
                 forest_holder: Mutex::new(""),
+                pending_renames: Mutex::new(Vec::new()),
+                pending_rename_count: std::sync::atomic::AtomicUsize::new(0),
                 root_splits: Mutex::new(std::collections::VecDeque::new()),
                 chain,
                 dir: dir.into(),
@@ -911,13 +950,81 @@ impl QmdbNodeState {
                 (self.inner.forest.lock().unwrap_or_else(std::sync::PoisonError::into_inner), held_by)
             }
         };
+        self.guard_for(guard, label, asked, held_by)
+    }
+
+    /// The bookkeeping of a lock just taken: the wait is logged, the holder
+    /// named, and any rename queued by [`Self::rename_or_defer`] applied before
+    /// the caller sees the forest -- so every forest access that begins after
+    /// a deferred rename was queued sees the block under its new hash.
+    fn guard_for<'a>(
+        &'a self,
+        mut guard: MutexGuard<'a, Option<QmdbForest>>,
+        label: &'static str,
+        asked: std::time::Instant,
+        held_by: &'static str,
+    ) -> ForestGuard<'a> {
         let acquired = std::time::Instant::now();
         let waited_ms = acquired.saturating_duration_since(asked).as_millis() as u64;
         if waited_ms > FOREST_LOCK_WARN_MS {
             warn!(target: "n42.qmdb", label, ms = waited_ms, held_by, "forest lock waited");
         }
         *self.inner.forest_holder.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = label;
+        if self.inner.pending_rename_count.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            if let Some(forest) = guard.as_mut() {
+                self.drain_renames(forest);
+            }
+        }
         ForestGuard { guard, label, acquired, waited_ms, held_by }
+    }
+
+    /// Applies the queued renames in the order they were queued. A failure is
+    /// logged: the caller that queued it has already gone on.
+    fn drain_renames(&self, forest: &mut QmdbForest) {
+        let queued = {
+            let mut pending = self.inner.pending_renames.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.inner.pending_rename_count.store(0, std::sync::atomic::Ordering::Release);
+            std::mem::take(&mut *pending)
+        };
+        for rename in queued {
+            let waited_ms = rename.queued_at.elapsed().as_millis() as u64;
+            match apply_rename(forest, &rename) {
+                Ok(()) => debug!(target: "n42.qmdb", from = %rename.from, to = %rename.to, waited_ms, "deferred rename applied"),
+                Err(err) => warn!(
+                    target: "n42.qmdb",
+                    %err, from = %rename.from, alternate = ?rename.alternate, to = %rename.to, waited_ms,
+                    "deferred rename failed; the block is not filed under its sealed hash"
+                ),
+            }
+        }
+    }
+
+    /// [`Self::rename`] that does not wait behind another holder of the
+    /// forest (`N42_QMDB_RENAME_DEFER`). With the lock free, the rename runs
+    /// now and its result is returned ([`RenameOutcome::Applied`]); with the
+    /// lock held -- by `compute_operations`, ~30 ms on a quarter of the blocks
+    /// at 200k transfers -- it is queued and [`RenameOutcome::Deferred`] is
+    /// returned at once. The next taker of the lock, whoever it is, applies
+    /// the queue first ([`Self::lock_as`]): no forest access that starts after
+    /// this call returns can see the record under `from`. `alternate` is where
+    /// the build chain may have filed the record instead (`chain_alias`); it is
+    /// tried when `from` is not filed.
+    pub fn rename_or_defer(&self, from: B256, alternate: Option<B256>, to: B256) -> Result<RenameOutcome, NodeStateError> {
+        let asked = std::time::Instant::now();
+        let guard = match self.inner.forest.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let mut pending = self.inner.pending_renames.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                pending.push(PendingRename { from, alternate, to, queued_at: asked });
+                self.inner.pending_rename_count.store(pending.len(), std::sync::atomic::Ordering::Release);
+                return Ok(RenameOutcome::Deferred);
+            }
+        };
+        let mut guard = self.guard_for(guard, "rename", asked, "");
+        let forest = guard.as_mut().ok_or(NodeStateError::Uninitialised)?;
+        apply_rename(forest, &PendingRename { from, alternate, to, queued_at: asked })?;
+        Ok(RenameOutcome::Applied)
     }
 
     /// Runs `f` on the forest under the lock taken for `label`, or fails if
@@ -2161,6 +2268,39 @@ mod tests {
             state.compute(B256::ZERO, &BlockChanges::new()),
             Err(NodeStateError::Uninitialised)
         ));
+    }
+
+    /// A rename asked for while the forest is held is queued, not waited for,
+    /// and the next taker of the lock -- any taker -- sees it applied; with the
+    /// lock free it runs at once. The alternate is used when `from` is gone.
+    #[test]
+    fn a_rename_behind_a_holder_is_queued_and_seen_by_the_next_taker() {
+        let chain = qmdb_chain();
+        let state = QmdbNodeState::new(chain.clone(), scratch("rename-defer"));
+        let genesis_hash = chain.genesis_hash();
+        state.initialize((0, genesis_hash)).unwrap();
+        let built = B256::repeat_byte(0x21);
+        let root = state.compute(genesis_hash, &BlockChanges::new()).unwrap().root;
+        state.validate_block(genesis_hash, built, 1, &BlockChanges::new(), root).unwrap();
+
+        let sealed = B256::repeat_byte(0x22);
+        {
+            let _held = state.lock_as("test holder");
+            assert_eq!(state.rename_or_defer(built, None, sealed).unwrap(), RenameOutcome::Deferred);
+        }
+        // The next taker applies the queue before it reads.
+        assert_eq!(state.root_of(&sealed), Some(root));
+        assert_eq!(state.root_of(&built), None);
+
+        // Lock free: applied now; `from` gone, so the alternate is moved.
+        let resealed = B256::repeat_byte(0x23);
+        assert_eq!(
+            state.rename_or_defer(B256::repeat_byte(0x99), Some(sealed), resealed).unwrap(),
+            RenameOutcome::Applied
+        );
+        assert_eq!(state.root_of(&resealed), Some(root));
+        // A rename of a block never filed fails when applied now.
+        assert!(state.rename_or_defer(B256::repeat_byte(0x98), None, B256::repeat_byte(0x97)).is_err());
     }
 
     #[test]

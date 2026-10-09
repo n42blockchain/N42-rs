@@ -440,12 +440,22 @@ where
         .prune_pool
         .is_some()
         .then(|| recovered.body().transactions().map(|tx| *tx.tx_hash()).collect::<Vec<B256>>());
+    // The rename takes the forest's lock, which the next block's root holds
+    // for ~30 ms on a quarter of the blocks; `N42_QMDB_RENAME_DEFER=1` queues
+    // it for the lock's next holder instead of waiting
+    // (`chain_alias::rename_defer_enabled`).
+    let rename_at = std::time::Instant::now();
+    let mut rename_deferred = false;
     if let Some(qmdb) = &reuse.qmdb {
-        if let Err(err) = n42_engine_types::chain_alias::rename(qmdb, built_hash, sealed_hash) {
-            warn!(target: "n42.payload_serve", %err, %built_hash, %sealed_hash, "could not file the build's QMDB root under the sealed hash; importing the ordinary way");
-            return None;
+        match n42_engine_types::chain_alias::rename_for_handoff(qmdb, built_hash, sealed_hash) {
+            Ok(deferred) => rename_deferred = deferred,
+            Err(err) => {
+                warn!(target: "n42.payload_serve", %err, %built_hash, %sealed_hash, "could not file the build's QMDB root under the sealed hash; importing the ordinary way");
+                return None;
+            }
         }
     }
+    let rename_wait_ms = rename_at.elapsed().as_millis() as u64;
     // The build's own execution result, recorded by the builder under the
     // build's hash: under deferred execution the next block's header is
     // checked against it under the sealed hash.
@@ -523,6 +533,8 @@ where
                 convert_ms = converted.as_millis() as u64,
                 queue_prune_ms,
                 insert_wait_ms,
+                rename_wait_ms,
+                rename_deferred,
                 total_ms = started.elapsed().as_millis() as u64,
                 "own block handed to the engine as executed"
             );

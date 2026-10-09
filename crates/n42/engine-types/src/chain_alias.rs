@@ -87,9 +87,60 @@ pub fn rename(
     }
 }
 
+/// Parses `N42_QMDB_RENAME_DEFER`: on only for `1`.
+fn rename_defer_from(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+/// Whether the own-block hand-off queues its rename instead of waiting for
+/// the forest (`N42_QMDB_RENAME_DEFER=1`, default off).
+///
+/// The hand-off files the build's QMDB record under the sealed hash through
+/// the forest's lock, which the next block's `compute_operations` holds for
+/// ~30 ms on about a quarter of the blocks at 200k transfers: loop351 saw the
+/// rename wait over 20 ms (29 on average) on 226 of 1422 slow hand-offs, 204
+/// of them behind `compute_operations`. With the switch on, a rename that
+/// finds the lock held is queued and the next holder of the lock applies it
+/// before it touches the forest (`QmdbNodeState::rename_or_defer`), so no
+/// forest access that starts after the hand-off can miss the record under
+/// the sealed hash. Named for what it does (defer), not "lock free": the
+/// rename still runs under the lock, only nobody waits for it. The cost: a
+/// queued rename that fails (nothing filed under the builder's hash nor the
+/// chain's note) is a WARN when applied, not the hand-off's fallback to the
+/// ordinary import.
+pub fn rename_defer_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| rename_defer_from(std::env::var("N42_QMDB_RENAME_DEFER").ok().as_deref()))
+}
+
+/// [`rename`] for the own-block hand-off: with `N42_QMDB_RENAME_DEFER=1`
+/// it does not wait behind another holder of the forest (see
+/// [`rename_defer_enabled`]). Returns whether the rename was queued.
+pub fn rename_for_handoff(
+    qmdb: &n42_qmdb_reth::QmdbNodeState,
+    built: B256,
+    sealed: B256,
+) -> Result<bool, n42_qmdb_reth::NodeStateError> {
+    if !rename_defer_enabled() {
+        return rename(qmdb, built, sealed).map(|()| false);
+    }
+    let alternate = filed_under(built).filter(|under| *under != sealed);
+    let outcome = qmdb.rename_or_defer(built, alternate, sealed)?;
+    remember(built, sealed);
+    Ok(outcome == n42_qmdb_reth::RenameOutcome::Deferred)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rename_defer_switch_is_on_only_for_one() {
+        assert!(rename_defer_from(Some("1")));
+        for off in [None, Some(""), Some("0"), Some("true"), Some("on")] {
+            assert!(!rename_defer_from(off), "{off:?}");
+        }
+    }
 
     #[test]
     fn a_note_survives_until_it_is_replaced_or_crowded_out() {

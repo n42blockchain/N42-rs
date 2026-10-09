@@ -476,7 +476,10 @@ where
     let sealed_hash = sealed_header.hash();
     // The build's block is moved out when this is its last holder (the
     // registry gave it up in `take`): one clone of the 163,000-transaction
-    // body for the engine's copy instead of two.
+    // body for the engine's copy instead of two. The handed store
+    // (`built_executions::take`) still holds the build, so in practice the
+    // body is cloned here; `clone_ms` on the hand-off line is both copies.
+    let clone_at = std::time::Instant::now();
     let (body, senders) = match std::sync::Arc::try_unwrap(built.block) {
         Ok(block) => {
             let (sealed, senders) = block.split_sealed();
@@ -486,14 +489,24 @@ where
     };
     // For the engine's newPayload of this block, which follows the hand-off:
     // its conversion finds the block here instead of decoding the payload.
-    n42_engine_types::built_executions::remember_sealed(
-        sealed_hash,
-        SealedBlock::from_sealed_parts(sealed_header.clone(), body.clone()),
-    );
-    let recovered: reth_primitives_traits::RecoveredBlock<n42_tx_types::Block> = reth_primitives_traits::RecoveredBlock::new_sealed(
+    // `N42_HANDOFF_NO_CLONE=1` keeps the executed block's own `Arc` there
+    // instead of a second copy of the body
+    // (`built_executions::handoff_no_clone_enabled`).
+    let no_clone = n42_engine_types::built_executions::handoff_no_clone_enabled();
+    if !no_clone {
+        n42_engine_types::built_executions::remember_sealed(
+            sealed_hash,
+            SealedBlock::from_sealed_parts(sealed_header.clone(), body.clone()),
+        );
+    }
+    let recovered = std::sync::Arc::new(reth_primitives_traits::RecoveredBlock::<n42_tx_types::Block>::new_sealed(
         SealedBlock::from_sealed_parts(sealed_header, body),
         senders,
-    );
+    ));
+    if no_clone {
+        n42_engine_types::built_executions::remember_sealed_shared(sealed_hash, std::sync::Arc::clone(&recovered));
+    }
+    let clone_ms = clone_at.elapsed().as_millis() as u64;
     // For the pool prune below, taken now: the block moves into the engine's
     // insert.
     let pool_prune_hashes: Option<Vec<B256>> = reuse
@@ -525,7 +538,7 @@ where
         }
     }
     let executed = reth_payload_primitives::BuiltPayloadExecutedBlock::<n42_tx_types::N42Primitives> {
-        recovered_block: std::sync::Arc::new(recovered),
+        recovered_block: recovered,
         execution_output: built.execution_output,
         hashed_state: built.hashed_state,
         trie_updates: built.trie_updates,
@@ -595,6 +608,7 @@ where
                 insert_wait_ms,
                 rename_wait_ms,
                 rename_deferred,
+                clone_ms,
                 total_ms = started.elapsed().as_millis() as u64,
                 "own block handed to the engine as executed"
             );

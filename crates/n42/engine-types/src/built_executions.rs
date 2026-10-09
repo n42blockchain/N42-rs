@@ -519,20 +519,82 @@ fn matches_block(block: &RecoveredBlock<Block>, parent: B256, number: u64, state
 /// did not). Its conversion of the payload would decode every transaction
 /// again -- 48 ms at 163,000 transactions, on the leader's path between one
 /// proposal and the next build -- to produce the block that is already here.
-fn sealed_store() -> &'static Mutex<VecDeque<(B256, SealedBlock<Block>)>> {
-    static STORE: OnceLock<Mutex<VecDeque<(B256, SealedBlock<Block>)>>> = OnceLock::new();
+fn sealed_store() -> &'static Mutex<VecDeque<(B256, SealedKept)>> {
+    static STORE: OnceLock<Mutex<VecDeque<(B256, SealedKept)>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(VecDeque::with_capacity(keep())))
+}
+
+/// A sealed block in the store: its own copy, or the executed block handed
+/// to the engine, shared (`N42_HANDOFF_NO_CLONE`).
+#[derive(Debug)]
+enum SealedKept {
+    Owned(SealedBlock<Block>),
+    Shared(Arc<RecoveredBlock<Block>>),
+}
+
+impl SealedKept {
+    fn block(&self) -> &SealedBlock<Block> {
+        match self {
+            Self::Owned(block) => block,
+            Self::Shared(recovered) => recovered.sealed_block(),
+        }
+    }
+
+    /// The block by value: moved when this is its only holder, else copied.
+    fn into_block(self) -> SealedBlock<Block> {
+        match self {
+            Self::Owned(block) => block,
+            Self::Shared(recovered) => {
+                Arc::try_unwrap(recovered).map_or_else(|shared| shared.sealed_block().clone(), RecoveredBlock::into_sealed_block)
+            }
+        }
+    }
+}
+
+/// Parses `N42_HANDOFF_NO_CLONE`: on only for `1`.
+fn handoff_no_clone_from(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+/// Whether the own-block hand-off shares its executed block with the sealed
+/// store instead of copying the body for it (`N42_HANDOFF_NO_CLONE=1`,
+/// default off).
+///
+/// The hand-off copies the build's body once for the engine's insert -- the
+/// build is still held by the handed store ([`take`] keeps it for the build
+/// on the sealed block), so `Arc::try_unwrap` fails and the body is cloned --
+/// and once more for [`remember_sealed`]. The first copy is unavoidable while
+/// the handed store holds the build (the insert needs a block under the
+/// sealed header, and the body sits by value in the block); the second is
+/// not: the store can keep the very `Arc` the insert carries. Readers of the
+/// store copy out of it as before ([`find_sealed`]); a take moves the block
+/// only once the engine has dropped its copy.
+pub fn handoff_no_clone_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| handoff_no_clone_from(std::env::var("N42_HANDOFF_NO_CLONE").ok().as_deref()))
 }
 
 /// Keeps the sealed block under its sealed hash.
 pub fn remember_sealed(sealed_hash: B256, block: SealedBlock<Block>) {
+    let transactions = block.body().transactions.len();
+    keep_sealed(sealed_hash, transactions, SealedKept::Owned(block));
+}
+
+/// [`remember_sealed`] sharing the executed block handed to the engine
+/// (`N42_HANDOFF_NO_CLONE`): no copy of the body.
+pub fn remember_sealed_shared(sealed_hash: B256, block: Arc<RecoveredBlock<Block>>) {
+    let transactions = block.body().transactions.len();
+    keep_sealed(sealed_hash, transactions, SealedKept::Shared(block));
+}
+
+fn keep_sealed(sealed_hash: B256, transactions: usize, block: SealedKept) {
     {
         let mut hints = sealed_hints().lock().unwrap_or_else(|p| p.into_inner());
         hints.retain(|(hash, _)| *hash != sealed_hash);
         while hints.len() >= SEALED_HINTS {
             hints.pop_front();
         }
-        hints.push_back((sealed_hash, block.body().transactions.len()));
+        hints.push_back((sealed_hash, transactions));
     }
     let mut store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
     store.retain(|(hash, _)| *hash != sealed_hash);
@@ -567,7 +629,7 @@ pub fn sealed_here_with_transactions(hash: B256) -> bool {
 pub fn take_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
     let mut store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
     let at = store.iter().position(|(hash, _)| *hash == sealed_hash)?;
-    store.remove(at).map(|(_, block)| block)
+    store.remove(at).map(|(_, block)| block.into_block())
 }
 
 /// The sealed block under this hash, left in the store: the engine converts
@@ -577,7 +639,7 @@ pub fn take_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
 /// must find the body. The store's bound (`keep()`) retires it.
 pub fn find_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
     let store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
-    store.iter().find(|(hash, _)| *hash == sealed_hash).map(|(_, block)| block.clone())
+    store.iter().find(|(hash, _)| *hash == sealed_hash).map(|(_, block)| block.block().clone())
 }
 
 /// [`find_sealed`] for a caller whose payload carries `transactions` in full:
@@ -593,10 +655,10 @@ pub fn find_or_take_sealed(sealed_hash: B256, transactions: usize) -> Option<Sea
     }
     let mut store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
     let at = store.iter().position(|(hash, _)| *hash == sealed_hash)?;
-    if store[at].1.body().transactions.len() != transactions {
-        return Some(store[at].1.clone());
+    if store[at].1.block().body().transactions.len() != transactions {
+        return Some(store[at].1.block().clone());
     }
-    store.remove(at).map(|(_, block)| block)
+    store.remove(at).map(|(_, block)| block.into_block())
 }
 
 /// Whether `N42_ENGINE_TAKE_SEALED=1` is set; see [`find_or_take_sealed`].
@@ -620,6 +682,30 @@ mod tests {
         assert_eq!(built_keep_from(Some("2")), 3);
         assert_eq!(built_keep_from(Some("17")), 3);
         assert_eq!(built_keep_from(Some("x")), 3);
+    }
+
+    #[test]
+    fn handoff_no_clone_is_on_only_for_one() {
+        assert!(handoff_no_clone_from(Some("1")));
+        for off in [None, Some(""), Some("0"), Some("true")] {
+            assert!(!handoff_no_clone_from(off), "{off:?}");
+        }
+    }
+
+    /// A shared sealed block is found by copy while the engine holds it and
+    /// moved out by a take once it does not.
+    #[test]
+    fn a_shared_sealed_block_is_found_and_taken() {
+        let _guard = lock();
+        let header = Header { number: 777, ..Default::default() };
+        let sealed = SealedBlock::<Block>::seal_slow(alloy_consensus::Block::new(header, BlockBody::default()));
+        let hash = sealed.hash();
+        let shared = Arc::new(RecoveredBlock::new_sealed(sealed, Vec::new()));
+        remember_sealed_shared(hash, Arc::clone(&shared));
+        assert_eq!(find_sealed(hash).map(|block| block.hash()), Some(hash));
+        drop(shared);
+        assert_eq!(take_sealed(hash).map(|block| block.hash()), Some(hash));
+        assert!(find_sealed(hash).is_none());
     }
 
     use super::*;

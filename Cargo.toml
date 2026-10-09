@@ -48,7 +48,7 @@ members = [
     #"crates/engine/invalid-block-hooks/",
     #"crates/evm/",
     "crates/chainspec/",
-    #"crates/chain-state",
+    "crates/chain-state",
     "crates/node/builder/",
     #"crates/consensus/auto-seal/",
     "crates/consensus/consensus/",
@@ -375,6 +375,7 @@ reth-trie = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.7.0" }
 reth-trie-common = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.7.0" }
 reth-trie-db = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.7.0" }
 reth-trie-parallel = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.7.0" }
+reth-trie-sparse = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.7.0" }
 
 reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.7.0" }
 reth-ress-provider = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.7.0" }
@@ -695,7 +696,9 @@ reth-network-api = { path = "crates/net/network-api" }
 reth-network-peers = { path = "crates/net/peers"}
 # reth-rpc = { path = "crates/n42/reth-rpc" }  # Disabled: use upstream reth-rpc v1.9.3
 #reth-testing-utils={path="testing/testing-utils"}
-#reth-chain-state = { path = "crates/chain-state"}
+# Vendored since 2026-10-09 (v2.7.0, initially unchanged): carries the N42_CANON_NOTIFY_LEAN
+# switch that builds the canonical-state notification without cloning execution outcomes.
+reth-chain-state = { path = "crates/chain-state" }
 
 [patch.crates-io]
 pprof_util = { path = "vendor/dependency-repairs/pprof_util-0.8.2" }

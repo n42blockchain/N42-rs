@@ -532,7 +532,16 @@ impl QmdbReadView {
     /// forest's lock, before the lock that could let the tree cut them is
     /// released; the result goes to [`Self::advance`].
     pub fn raise_floor(&self, changes: &[(Hash, Option<u64>)]) -> Raised {
-        let floor = changes.iter().filter_map(|(_, offset)| *offset).max().map_or(0, |offset| record_end(&self.file, offset));
+        self.raise_floor_to(changes.iter().filter_map(|(_, offset)| *offset).max())
+    }
+
+    /// [`Self::raise_floor`] from the highest record offset the block's
+    /// changes name (`None` for a block that appended nothing), for a caller
+    /// that lists the changes only after the forest's lock is let go
+    /// (`QmdbForest::block_changes_parts`). The same rule: under the lock,
+    /// before anything that could cut the records.
+    pub fn raise_floor_to(&self, max_offset: Option<u64>) -> Raised {
+        let floor = max_offset.map_or(0, |offset| record_end(&self.file, offset));
         self.floor.fetch_max(floor, Ordering::SeqCst);
         Raised { floor, cuts: self.cuts.load(Ordering::SeqCst) }
     }

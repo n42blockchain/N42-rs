@@ -174,6 +174,95 @@ fn trim_twigs() -> bool {
     *ON.get_or_init(|| std::env::var("N42_QMDB_TRIM_TWIGS").map_or(true, |v| v != "0"))
 }
 
+/// `N42_QMDB_COMPUTE_OFFLOCK=1` (default off): a block's QMDB root
+/// (`compute_operations`, `insert_block_operations`,
+/// `validate_block_operations`) is computed on the tree leased out of the
+/// forest ([`QmdbForest::lease_tree`]): the forest's lock is held to stand
+/// the tree at the parent and take it, and again to put it back and file the
+/// block, not for the apply and its hashing (33-52 ms a hold at 200k
+/// transfers, loop351). Meanwhile `root_of`, renames, the reader's keep and
+/// a persisted block's changes are answered without waiting; whatever needs
+/// the tree waits for it ([`TREE_FREE_LABELS`]).
+fn compute_offlock_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_QMDB_COMPUTE_OFFLOCK").is_ok_and(|v| v == "1"))
+}
+
+/// `N42_QMDB_PERSIST_BATCH=1` (default off): [`QmdbNodeState::on_persisted`]
+/// lists a whole persistence batch's changes (and raises the read view's
+/// floor for each) under one hold of the forest's lock, then advances the
+/// view block by block outside it, instead of one hold per block.
+fn persist_batch_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_QMDB_PERSIST_BATCH").is_ok_and(|v| v == "1"))
+}
+
+/// The lock labels that never read the tree, so they do not wait for one
+/// leased out (`N42_QMDB_COMPUTE_OFFLOCK`): the record bookkeeping (roots,
+/// renames, the head, the reader's keep) and the lease's own return. Every
+/// other label waits until the tree is back.
+const TREE_FREE_LABELS: &[&str] = &[
+    "root_of",
+    "rename",
+    "head",
+    "is_initialized",
+    "on_unwound",
+    "release_reader_records",
+    "on_persisted_parts",
+    "lease_return",
+];
+
+/// How often (in persistence calls) the QMDB persist split's running sums
+/// are logged at INFO.
+const PERSIST_SPLIT_LOG_EVERY: u64 = 64;
+
+/// Where one [`QmdbNodeState::on_persisted`] spent its time, in microseconds:
+/// waiting for the forest's lock, holding it, and advancing the read view
+/// (listing the changes from shared parts included) outside it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PersistSplit {
+    /// Waiting for the forest's lock.
+    pub lock_wait_us: u64,
+    /// Holding it.
+    pub lock_hold_us: u64,
+    /// Advancing the view outside it.
+    pub advance_us: u64,
+    /// How many holds that took.
+    pub holds: u64,
+}
+
+/// What the off-lock root and the batched persistence have done so far
+/// ([`QmdbNodeState::offlock_counters`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OfflockCounters {
+    /// Roots computed on a leased tree.
+    pub leased_roots: u64,
+    /// Leased roots whose parent was renamed while the tree was out (filed
+    /// on the parent's new hash).
+    pub renamed_parents: u64,
+    /// Lock takers that waited for a leased tree to come back.
+    pub tree_waits: u64,
+    /// Persistence holds that could not list the batch from shared parts
+    /// (a record without captured offsets, or records not yet flushed) and
+    /// fell back to listing it from the tree.
+    pub persist_fallbacks: u64,
+    /// Persistence calls, and the sums of their splits.
+    pub persists: u64,
+    /// The sums of the persistence calls' splits.
+    pub persist_split: PersistSplit,
+}
+
+/// Why a persistence call stops following the database.
+enum PersistStop {
+    /// The view is already invalid.
+    Invalid,
+    /// The view is invalidated for this reason.
+    Invalidate(&'static str),
+}
+
+/// A persisted block's changes, listed with the floor they raised.
+type Listed = (u64, B256, Vec<([u8; 32], Option<u64>)>, crate::read_view::Raised);
+
 /// The forest with the configured record retention and twig trimming.
 fn with_configured_retention(forest: QmdbForest) -> QmdbForest {
     let forest = forest.with_twig_trimming(trim_twigs());
@@ -420,6 +509,22 @@ struct Inner {
     compaction_ms_total: std::sync::atomic::AtomicU64,
     /// The last compaction's phases: read, replay, encode, write, sync.
     compaction_phases: Mutex<[u64; 5]>,
+    /// Signalled (with the forest's mutex) when a leased tree comes back.
+    tree_back: std::sync::Condvar,
+    /// `N42_QMDB_COMPUTE_OFFLOCK`, or `set_compute_offlock`.
+    compute_offlock: std::sync::atomic::AtomicBool,
+    /// `N42_QMDB_PERSIST_BATCH`, or `set_persist_batch`.
+    persist_batch: std::sync::atomic::AtomicBool,
+    /// [`OfflockCounters`], field by field.
+    leased_roots: std::sync::atomic::AtomicU64,
+    renamed_parents: std::sync::atomic::AtomicU64,
+    tree_waits: std::sync::atomic::AtomicU64,
+    persist_fallbacks: std::sync::atomic::AtomicU64,
+    persists: std::sync::atomic::AtomicU64,
+    persist_wait_us: std::sync::atomic::AtomicU64,
+    persist_hold_us: std::sync::atomic::AtomicU64,
+    persist_advance_us: std::sync::atomic::AtomicU64,
+    persist_holds: std::sync::atomic::AtomicU64,
 }
 
 /// A rename queued by [`QmdbNodeState::rename_or_defer`].
@@ -489,6 +594,29 @@ impl Drop for ForestGuard<'_> {
             warn!(target: "n42.qmdb", label = self.label, ms, "forest lock held");
         }
     }
+}
+
+/// Fills a computed root's split from the forest's last computation.
+fn fill_split(forest: &QmdbForest, split: &mut RootSplit, publish_us: u64) {
+    let (move_us, phases) = forest.last_compute();
+    split.computed = true;
+    split.move_ms = move_us / 1000;
+    split.apply_ms = (phases.sort_us + phases.leaves_us + phases.retire_us + phases.writes_us + phases.index_us) / 1000;
+    split.hash_ms = (phases.rehash_us + phases.root_us) / 1000;
+    split.append_faults = phases.writes_faults;
+    split.faults_entries = phases.entries_faults;
+    split.faults_offsets = phases.offsets_faults;
+    split.faults_index = phases.index_faults;
+    split.faults_bits = phases.bits_faults;
+    split.faults_twigs = phases.twigs_faults;
+    split.faults_undo = phases.undo_faults;
+    split.faults_tmp = phases.tmp_faults;
+    split.publish_ms = publish_us / 1000;
+    (split.sort_us, split.leaves_us, split.retire_us, split.writes_us) =
+        (phases.sort_us, phases.leaves_us, phases.retire_us, phases.writes_us);
+    (split.index_us, split.rehash_us, split.root_us) = (phases.index_us, phases.rehash_us, phases.root_us);
+    (split.note_us, split.delta_us, split.apply_total_us) = forest.last_compute_tail();
+    split.undo_us = phases.undo_us;
 }
 
 /// Where one QMDB root spent its time ([`QmdbNodeState::take_root_split`]).
@@ -717,6 +845,18 @@ impl QmdbNodeState {
                 compaction_ms: std::sync::atomic::AtomicU64::new(0),
                 compaction_ms_total: std::sync::atomic::AtomicU64::new(0),
                 compaction_phases: Mutex::new([0; 5]),
+                tree_back: std::sync::Condvar::new(),
+                compute_offlock: std::sync::atomic::AtomicBool::new(compute_offlock_env()),
+                persist_batch: std::sync::atomic::AtomicBool::new(persist_batch_env()),
+                leased_roots: Default::default(),
+                renamed_parents: Default::default(),
+                tree_waits: Default::default(),
+                persist_fallbacks: Default::default(),
+                persists: Default::default(),
+                persist_wait_us: Default::default(),
+                persist_hold_us: Default::default(),
+                persist_advance_us: Default::default(),
+                persist_holds: Default::default(),
             }),
         }
     }
@@ -787,11 +927,23 @@ impl QmdbNodeState {
     /// until then (`QmdbForest::set_keep_from`), and drops the keep once the
     /// view is invalid.
     pub fn on_persisted(&self, blocks: &[(u64, B256)]) {
-        use crate::read_view::Position;
         let Some(view) = self.inner.read_view.get() else { return };
         // Called ahead of the batch's commit: the database's readers stay at
         // the view's head until then, however far the view advances here.
         view.hold_journals_from(view.head().0);
+        let mut split = PersistSplit::default();
+        if self.persist_batch() {
+            self.persist_batched(view, blocks, &mut split);
+        } else {
+            self.persist_each(view, blocks, &mut split);
+        }
+        self.note_persist(blocks.len(), split);
+        self.note_reader_lag();
+    }
+
+    /// [`Self::on_persisted`] one block per hold of the forest's lock.
+    fn persist_each(&self, view: &crate::read_view::QmdbReadView, blocks: &[(u64, B256)], split: &mut PersistSplit) {
+        use crate::read_view::Position;
         for &(number, hash) in blocks {
             match view.position(number, hash) {
                 Position::Held => {}
@@ -805,29 +957,255 @@ impl QmdbNodeState {
                     return self.release_reader_records();
                 }
                 Position::Next => {
-                    let changes = self.with_forest("on_persisted", |forest| {
-                        forest.flush_entries_for_sync()?;
-                        Ok(forest.block_changes(&hash).map(|changes| {
-                            let raised = view.raise_floor(&changes);
-                            forest.set_keep_from(Some(number + 1));
-                            (changes, raised)
-                        }))
-                    });
-                    match changes {
-                        Ok(Some((changes, raised))) => view.advance(number, hash, &changes, raised),
-                        Ok(None) => {
-                            view.invalidate("a persisted block's changes are not on the tree's path");
-                            return self.release_reader_records();
-                        }
-                        Err(_) => {
-                            view.invalidate("the forest could not list a persisted block's changes");
-                            return self.release_reader_records();
-                        }
+                    if !self.list_and_advance(view, &[(number, hash)], split) {
+                        return;
                     }
                 }
             }
         }
-        self.note_reader_lag();
+    }
+
+    /// [`Self::on_persisted`] with the whole batch under one hold
+    /// (`N42_QMDB_PERSIST_BATCH`): the blocks the view advances through are
+    /// picked out first, exactly as the per-block walk would meet them; their
+    /// changes are listed and the view's floor raised for each under one
+    /// hold; the view then advances through them in order outside it; and
+    /// whatever stopped the walk is applied last, as it would have been after
+    /// those advances.
+    fn persist_batched(&self, view: &crate::read_view::QmdbReadView, blocks: &[(u64, B256)], split: &mut PersistSplit) {
+        use crate::read_view::Position;
+        let mut todo: Vec<(u64, B256)> = Vec::new();
+        let mut stop = None;
+        let mut next = view.head().0 + 1;
+        for &(number, hash) in blocks {
+            if let Some(first) = todo.first().map(|block| block.0).filter(|first| (*first..next).contains(&number)) {
+                if todo[(number - first) as usize].1 != hash {
+                    stop = Some(PersistStop::Invalidate("a persisted block is not the block the view holds"));
+                    break;
+                }
+                continue;
+            }
+            if number == next {
+                if !view.is_valid() {
+                    stop = Some(PersistStop::Invalid);
+                    break;
+                }
+                todo.push((number, hash));
+                next += 1;
+                continue;
+            }
+            if number > next {
+                stop = Some(PersistStop::Invalidate("the database persisted past the view's next block"));
+                break;
+            }
+            match view.position(number, hash) {
+                Position::Held => {}
+                Position::Invalid => {
+                    stop = Some(PersistStop::Invalid);
+                    break;
+                }
+                Position::Mismatch => {
+                    stop = Some(PersistStop::Invalidate("a persisted block is not the block the view holds"));
+                    break;
+                }
+                Position::Next | Position::Gap => {
+                    stop = Some(PersistStop::Invalidate("the database persisted past the view's next block"));
+                    break;
+                }
+            }
+        }
+        if !todo.is_empty() && !self.list_and_advance(view, &todo, split) {
+            return;
+        }
+        match stop {
+            None => {}
+            Some(PersistStop::Invalid) => self.release_reader_records(),
+            Some(PersistStop::Invalidate(why)) => {
+                view.invalidate(why);
+                self.release_reader_records();
+            }
+        }
+    }
+
+    /// Lists `todo`'s changes (consecutive blocks, the first the view's next)
+    /// under one hold of the forest's lock -- raising the view's floor past
+    /// each block's records under that same hold, before any later holder
+    /// could cut them -- and advances the view through them outside it.
+    /// `false` when the view was invalidated on the way.
+    fn list_and_advance(
+        &self,
+        view: &crate::read_view::QmdbReadView,
+        todo: &[(u64, B256)],
+        split: &mut PersistSplit,
+    ) -> bool {
+        let (listed, failure) = self.list_persisted(view, todo, split);
+        let advancing = std::time::Instant::now();
+        for (number, hash, changes, raised) in listed {
+            view.advance(number, hash, &changes, raised);
+        }
+        split.advance_us += advancing.elapsed().as_micros() as u64;
+        match failure {
+            None => true,
+            Some(why) => {
+                view.invalidate(why);
+                self.release_reader_records();
+                false
+            }
+        }
+    }
+
+    /// `todo`'s changes with the floors they raised, and why the listing
+    /// stopped short, if it did. With `N42_QMDB_COMPUTE_OFFLOCK` the hold
+    /// first tries the blocks' shared parts, which need no tree (so it does
+    /// not wait for a leased one) and copy nothing under the lock; a block
+    /// without them sends the whole list to the tree, as without the switch.
+    fn list_persisted(
+        &self,
+        view: &crate::read_view::QmdbReadView,
+        todo: &[(u64, B256)],
+        split: &mut PersistSplit,
+    ) -> (Vec<Listed>, Option<&'static str>) {
+        let Some(&(last, _)) = todo.last() else { return (Vec::new(), None) };
+        if self.compute_offlock() {
+            let parts = self.with_forest_timed("on_persisted_parts", split, |forest| {
+                let mut parts = Vec::with_capacity(todo.len());
+                for (_, hash) in todo {
+                    let Some(block) = forest.block_changes_parts(hash) else { return Ok(None) };
+                    parts.push(block);
+                }
+                let raised: Vec<_> = parts.iter().map(|block| view.raise_floor_to(block.max_offset())).collect();
+                forest.set_keep_from(Some(last + 1));
+                Ok(Some((parts, raised)))
+            });
+            match parts {
+                Ok(Some((parts, raised))) => {
+                    let listing = std::time::Instant::now();
+                    let listed = todo
+                        .iter()
+                        .zip(parts)
+                        .zip(raised)
+                        .map(|((&(number, hash), block), raised)| (number, hash, block.changes(), raised))
+                        .collect();
+                    split.advance_us += listing.elapsed().as_micros() as u64;
+                    return (listed, None);
+                }
+                Ok(None) => {
+                    self.inner.persist_fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(_) => return (Vec::new(), Some("the forest could not list a persisted block's changes")),
+            }
+        }
+        let listed = self.with_forest_timed("on_persisted", split, |forest| {
+            forest.flush_entries_for_sync()?;
+            let mut listed = Vec::with_capacity(todo.len());
+            for &(number, hash) in todo {
+                let Some(changes) = forest.block_changes(&hash) else {
+                    return Ok((listed, Some("a persisted block's changes are not on the tree's path")));
+                };
+                let raised = view.raise_floor(&changes);
+                forest.set_keep_from(Some(number + 1));
+                listed.push((number, hash, changes, raised));
+            }
+            Ok((listed, None))
+        });
+        listed.unwrap_or_else(|_| (Vec::new(), Some("the forest could not list a persisted block's changes")))
+    }
+
+    /// [`Self::with_forest`], adding the wait for the lock and the hold to
+    /// `split`.
+    fn with_forest_timed<T>(
+        &self,
+        label: &'static str,
+        split: &mut PersistSplit,
+        f: impl FnOnce(&mut QmdbForest) -> Result<T, StateError>,
+    ) -> Result<T, NodeStateError> {
+        let asked = std::time::Instant::now();
+        let mut guard = self.lock_as(label);
+        let acquired = std::time::Instant::now();
+        let out = match guard.as_mut() {
+            Some(forest) => f(forest).map_err(NodeStateError::from),
+            None => Err(NodeStateError::Uninitialised),
+        };
+        drop(guard);
+        split.lock_wait_us += acquired.saturating_duration_since(asked).as_micros() as u64;
+        split.lock_hold_us += acquired.elapsed().as_micros() as u64;
+        split.holds += 1;
+        out
+    }
+
+    /// Logs one persistence call's split (DEBUG) and adds it to the running
+    /// sums, logged at INFO every [`PERSIST_SPLIT_LOG_EVERY`] calls.
+    fn note_persist(&self, blocks: usize, split: PersistSplit) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ms = |us: u64| us as f64 / 1000.0;
+        debug!(
+            target: "n42.qmdb",
+            blocks,
+            holds = split.holds,
+            qmdb_lock_wait_ms = ms(split.lock_wait_us),
+            qmdb_lock_hold_ms = ms(split.lock_hold_us),
+            qmdb_advance_ms = ms(split.advance_us),
+            "QMDB persist split",
+        );
+        let inner = &self.inner;
+        let persists = inner.persists.fetch_add(1, Relaxed) + 1;
+        let wait = inner.persist_wait_us.fetch_add(split.lock_wait_us, Relaxed) + split.lock_wait_us;
+        let hold = inner.persist_hold_us.fetch_add(split.lock_hold_us, Relaxed) + split.lock_hold_us;
+        let advance = inner.persist_advance_us.fetch_add(split.advance_us, Relaxed) + split.advance_us;
+        let holds = inner.persist_holds.fetch_add(split.holds, Relaxed) + split.holds;
+        if persists % PERSIST_SPLIT_LOG_EVERY == 0 {
+            info!(
+                target: "n42.qmdb",
+                persists,
+                holds,
+                qmdb_lock_wait_ms = ms(wait),
+                qmdb_lock_hold_ms = ms(hold),
+                qmdb_advance_ms = ms(advance),
+                fallbacks = inner.persist_fallbacks.load(Relaxed),
+                batch = self.persist_batch(),
+                offlock = self.compute_offlock(),
+                "QMDB persist split (running sums)",
+            );
+        }
+    }
+
+    /// Whether roots are computed on a leased tree (`N42_QMDB_COMPUTE_OFFLOCK`).
+    pub fn compute_offlock(&self) -> bool {
+        self.inner.compute_offlock.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Overrides `N42_QMDB_COMPUTE_OFFLOCK` for this state.
+    pub fn set_compute_offlock(&self, on: bool) {
+        self.inner.compute_offlock.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a persistence batch is listed under one hold (`N42_QMDB_PERSIST_BATCH`).
+    pub fn persist_batch(&self) -> bool {
+        self.inner.persist_batch.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Overrides `N42_QMDB_PERSIST_BATCH` for this state.
+    pub fn set_persist_batch(&self, on: bool) {
+        self.inner.persist_batch.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// What the off-lock root and the persistence holds have done so far.
+    pub fn offlock_counters(&self) -> OfflockCounters {
+        use std::sync::atomic::Ordering::Relaxed;
+        let inner = &self.inner;
+        OfflockCounters {
+            leased_roots: inner.leased_roots.load(Relaxed),
+            renamed_parents: inner.renamed_parents.load(Relaxed),
+            tree_waits: inner.tree_waits.load(Relaxed),
+            persist_fallbacks: inner.persist_fallbacks.load(Relaxed),
+            persists: inner.persists.load(Relaxed),
+            persist_split: PersistSplit {
+                lock_wait_us: inner.persist_wait_us.load(Relaxed),
+                lock_hold_us: inner.persist_hold_us.load(Relaxed),
+                advance_us: inner.persist_advance_us.load(Relaxed),
+                holds: inner.persist_holds.load(Relaxed),
+            },
+        }
     }
 
     /// The database unwound the state above `number`: the read view steps
@@ -950,7 +1328,27 @@ impl QmdbNodeState {
                 (self.inner.forest.lock().unwrap_or_else(std::sync::PoisonError::into_inner), held_by)
             }
         };
+        let (guard, held_by) = self.wait_for_tree(guard, label, held_by);
         self.guard_for(guard, label, asked, held_by)
+    }
+
+    /// A taker whose label reads the tree waits, with the lock released, until
+    /// a leased tree is back ([`TREE_FREE_LABELS`]); the wait is named
+    /// `tree_lease` in the WARN line.
+    fn wait_for_tree<'a>(
+        &'a self,
+        guard: MutexGuard<'a, Option<QmdbForest>>,
+        label: &'static str,
+        held_by: &'static str,
+    ) -> (MutexGuard<'a, Option<QmdbForest>>, &'static str) {
+        let leased = |forest: &mut Option<QmdbForest>| forest.as_ref().is_some_and(QmdbForest::is_leased);
+        let mut guard = guard;
+        if TREE_FREE_LABELS.contains(&label) || !leased(&mut guard) {
+            return (guard, held_by);
+        }
+        self.inner.tree_waits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let guard = self.inner.tree_back.wait_while(guard, leased).unwrap_or_else(std::sync::PoisonError::into_inner);
+        (guard, "tree_lease")
     }
 
     /// The bookkeeping of a lock just taken: the wait is logged, the holder
@@ -1055,33 +1453,79 @@ impl QmdbNodeState {
         let forest = guard.as_mut().ok_or(NodeStateError::Uninitialised)?;
         let (value, publish_us) = f(forest)?;
         if let Some(publish_us) = publish_us {
-            let (move_us, phases) = forest.last_compute();
-            split.computed = true;
-            split.move_ms = move_us / 1000;
-            split.apply_ms = (phases.sort_us + phases.leaves_us + phases.retire_us + phases.writes_us + phases.index_us) / 1000;
-            split.hash_ms = (phases.rehash_us + phases.root_us) / 1000;
-            split.append_faults = phases.writes_faults;
-            split.faults_entries = phases.entries_faults;
-            split.faults_offsets = phases.offsets_faults;
-            split.faults_index = phases.index_faults;
-            split.faults_bits = phases.bits_faults;
-            split.faults_twigs = phases.twigs_faults;
-            split.faults_undo = phases.undo_faults;
-            split.faults_tmp = phases.tmp_faults;
-            split.publish_ms = publish_us / 1000;
-            (split.sort_us, split.leaves_us, split.retire_us, split.writes_us) =
-                (phases.sort_us, phases.leaves_us, phases.retire_us, phases.writes_us);
-            (split.index_us, split.rehash_us, split.root_us) = (phases.index_us, phases.rehash_us, phases.root_us);
-            (split.note_us, split.delta_us, split.apply_total_us) = forest.last_compute_tail();
-            split.undo_us = phases.undo_us;
+            fill_split(forest, &mut split, publish_us);
         }
         drop(guard);
         before.finish(&mut split);
+        self.keep_split(key, split);
+        Ok(value)
+    }
+
+    /// Keeps a root's split under `key` for [`Self::take_root_split`].
+    fn keep_split(&self, key: B256, split: RootSplit) {
         let mut splits = self.inner.root_splits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if splits.len() >= ROOT_SPLITS_KEPT {
             splits.pop_front();
         }
         splits.push_back((key, split));
+    }
+
+    /// [`Self::with_forest_root`] on a leased tree (`N42_QMDB_COMPUTE_OFFLOCK`):
+    /// a short hold answers from `held` or stands the tree at `parent` and
+    /// leases it; the root is computed with no lock held; a second short hold
+    /// puts the tree back, files the result as pending work and runs `file`
+    /// on it (the caller's insert). Takers that need the tree wait for it
+    /// meanwhile, and nothing can move it underneath: every move goes through
+    /// the tree. A rename of the parent while it was out is followed (the
+    /// block is filed on the new hash) and counted. A panic in the
+    /// computation puts the tree back before it unwinds.
+    fn with_leased_root<T>(
+        &self,
+        label: &'static str,
+        key: B256,
+        parent: B256,
+        ops: QmdbOps,
+        held: impl FnOnce(&QmdbForest) -> Option<T>,
+        file: impl FnOnce(&mut QmdbForest, PreparedBlock) -> Result<T, StateError>,
+    ) -> Result<T, NodeStateError> {
+        let before = RootCounters::now();
+        let mut guard = self.lock_as(label);
+        let mut split = RootSplit { lock_wait_ms: guard.waited_ms, held_by: guard.held_by, ..RootSplit::default() };
+        let forest = guard.as_mut().ok_or(NodeStateError::Uninitialised)?;
+        if let Some(value) = held(forest) {
+            drop(guard);
+            before.finish(&mut split);
+            self.keep_split(key, split);
+            return Ok(value);
+        }
+        let mut lease = forest.lease_tree(parent)?;
+        drop(guard);
+        let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lease.compute(ops)));
+        let mut guard = self.lock_as("lease_return");
+        split.lock_wait_ms += guard.waited_ms;
+        let Some(forest) = guard.as_mut() else { return Err(NodeStateError::Uninitialised) };
+        let computed = match computed {
+            Ok(computed) => computed,
+            Err(panic) => {
+                let _ = forest.return_tree(lease, Err(StateError::TreeLeased));
+                self.inner.tree_back.notify_all();
+                drop(guard);
+                std::panic::resume_unwind(panic);
+            }
+        };
+        let returned = forest.return_tree(lease, computed);
+        self.inner.tree_back.notify_all();
+        self.inner.leased_roots.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (prepared, renamed) = returned?;
+        if renamed {
+            self.inner.renamed_parents.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let filed = std::time::Instant::now();
+        let value = file(forest, prepared)?;
+        fill_split(forest, &mut split, filed.elapsed().as_micros() as u64);
+        drop(guard);
+        before.finish(&mut split);
+        self.keep_split(key, split);
         Ok(value)
     }
 
@@ -1451,6 +1895,9 @@ impl QmdbNodeState {
     /// (`sorted_operations_from_execution`).
     pub fn compute_operations(&self, parent: B256, ops: impl Into<QmdbOps>) -> Result<PreparedBlock, NodeStateError> {
         let ops = ops.into();
+        if self.compute_offlock() {
+            return self.with_leased_root("compute_operations", parent, parent, ops, |_| None, |_, prepared| Ok(prepared));
+        }
         self.with_forest_root("compute_operations", parent, |forest| {
             forest.compute_operations(parent, ops).map(|prepared| (prepared, Some(0)))
         })
@@ -1466,6 +1913,28 @@ impl QmdbNodeState {
         header_root: B256,
     ) -> Result<B256, NodeStateError> {
         let ops = ops.into();
+        if self.compute_offlock() {
+            return self.with_leased_root(
+                "validate_block_operations",
+                block_hash,
+                parent,
+                ops,
+                |forest| forest.root_of(&block_hash),
+                |forest, prepared| {
+                    let root = prepared.root;
+                    if root == header_root {
+                        forest.insert(block_hash, number, prepared)?;
+                    } else {
+                        warn!(
+                            target: "n42.qmdb",
+                            %block_hash, number, computed = %root, header = %header_root,
+                            "block's state root does not match its QMDB root",
+                        );
+                    }
+                    Ok(root)
+                },
+            );
+        }
         self.with_forest_root("validate_block_operations", block_hash, |forest| {
             if let Some(root) = forest.root_of(&block_hash) {
                 return Ok((root, None));
@@ -1503,6 +1972,20 @@ impl QmdbNodeState {
         ops: impl Into<QmdbOps>,
     ) -> Result<B256, NodeStateError> {
         let ops = ops.into();
+        if self.compute_offlock() {
+            return self.with_leased_root(
+                "insert_block_operations",
+                block_hash,
+                parent,
+                ops,
+                |forest| forest.root_of(&block_hash),
+                |forest, prepared| {
+                    let root = prepared.root;
+                    forest.insert(block_hash, number, prepared)?;
+                    Ok(root)
+                },
+            );
+        }
         self.with_forest_root("insert_block_operations", block_hash, |forest| {
             if let Some(root) = forest.root_of(&block_hash) {
                 return Ok((root, None));

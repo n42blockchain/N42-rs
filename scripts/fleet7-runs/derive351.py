@@ -10,7 +10,7 @@ r = open(D + 'run-loop350.sh').read().replace('loop350', 'loop351').replace('LOO
 # a dry run owns no fleet: the EXIT trap must not kill the processes of a leg another stage is running (2026-10-08, S13P50)
 r = r.replace('cleanup() {\n', 'cleanup() {\n  # a dry run (LOOP351_DRY=1) owns no fleet: on 2026-10-08 a dry run of stage c, exited while stage a held the box, killed the running leg (S13P50) through this trap\n  [ "${LOOP351_DRY:-0}" = 1 ] && return 0\n', 1)
 r = r.replace('manykeys351', 'manykeys350').replace('valsample351', 'valsample350')
-r = re.sub(r'^# loop351 = .*\n# Stage a:.*\n', '''# loop351 = 200k blocks, 7 keys on one layer, 50 ms pacing: the base, check-before-slot alone (S1), 64 build threads (T64) and the merge at shards_ready (S3), then a step-down of the best. usage: run-loop351.sh <a|b|c>
+r = re.sub(r'^# loop351 = .*\n# Stage a:.*\n', '''# loop351 = 200k blocks, 7 keys on one layer, 50 ms pacing: the base, check-before-slot alone (S1), 64 build threads (T64) and the merge at shards_ready (S3), then a step-down of the best. usage: run-loop351.sh <a|b|c|d>
 # Stage a: WARM (60 ms), BP50, S1P50, S1P50T64, S13P50, S13P50T64, BP50b.  b: WARM, then 45 and 40 ms for the best stage-a configuration (window 1 at least 1.5% over max(BP50, BP50b), each step only while gate340 holds), else S1P50b and S1P50T64b.
 ''', r, count=1, flags=re.M)
 r = r.replace('(loop351: the same commit as the', '(loop351: the same commit as the')
@@ -64,17 +64,25 @@ stages = '''case $STAGE in
      b7 S12P50T64b F7_BLOCK_INTERVAL_MS=50 $S1 $S2 $T64
      b7 S123P50T64b F7_BLOCK_INTERVAL_MS=50 $S1 $S2 $S3 $T64
      b7 S2P50T64b F7_BLOCK_INTERVAL_MS=50 $S2 $T64 ;;
-  *) echo "unknown stage $STAGE (a, b or c)"; exit 2 ;;
+  d) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"
+     b7 S2P45T64 F7_BLOCK_INTERVAL_MS=45 $S2 $T64
+     b7 D2S2P50T64 $D2 F7_BLOCK_INTERVAL_MS=50 $S2 $T64
+     b7 D2S2P45T64 $D2 F7_BLOCK_INTERVAL_MS=45 $S2 $T64
+     b7 D2S2P40T64 $D2 F7_BLOCK_INTERVAL_MS=40 $S2 $T64
+     b7 D2S2P45T64b $D2 F7_BLOCK_INTERVAL_MS=45 $S2 $T64
+     b7 D2S2P40T64b $D2 F7_BLOCK_INTERVAL_MS=40 $S2 $T64 ;;
+  *) echo "unknown stage $STAGE (a, b, c or d)"; exit 2 ;;
 esac
 '''
 r = r[:i] + stages + r[j:]
 open(D + 'run-loop351.sh', 'w').write(r)
 
 l = '''#!/bin/bash
-# loop351 (200k, 7 keys on one layer, 50 ms pacing; derive351.py). usage: launch-loop351.sh <a|b|c>. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh a > target/fleet-runs/loop351a.out 2>&1 &
+# loop351 (200k, 7 keys on one layer, 50 ms pacing; derive351.py). usage: launch-loop351.sh <a|b|c|d>. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh a > target/fleet-runs/loop351a.out 2>&1 &
 # Waits for the box, checks the tree, and runs the stage. No build and no test gate: crates/ and bin/ are unchanged since the built commit (f2794a821), so the binaries in target/native and target/deferred are current.
 cd /data/n42-build/wt338
-STAGE=${1:-a}; case $STAGE in a|b|c) ;; *) echo "usage: launch-loop351.sh <a|b|c>"; exit 2;; esac
+STAGE=${1:-a}; case $STAGE in a|b|c|d) ;; *) echo "usage: launch-loop351.sh <a|b|c|d>"; exit 2;; esac
 BUILT=f2794a821
 git diff --quiet $BUILT HEAD -- crates bin || { echo "crates/ or bin/ changed since $BUILT: the binaries are not current; nothing run"; echo ALLDONE; exit 1; }
 if [ -n "$(git status --porcelain crates bin | grep -v pycache)" ]; then echo "uncommitted changes in crates/ or bin/; nothing run"; echo ALLDONE; exit 1; fi

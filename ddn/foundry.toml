@@ -1,0 +1,5 @@
+[profile.default]
+src = 'contracts/decision'
+test = 'contracts/decision/test'
+out = 'out/decision'
+solc_version = '0.8.24'

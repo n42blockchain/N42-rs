@@ -819,10 +819,21 @@ struct Inner<T: PoolTransaction> {
     /// other drain finishes it first, so the inbox's order is the lanes'
     /// order whoever drains.
     pending_drain: VecDeque<Arc<ValidPoolTransaction<T>>>,
-    /// The frames noted with that remainder, indexed once its last
-    /// transaction is in its lane (a frame is never indexed before its
-    /// transactions are queued, as in the one-hold drain).
-    pending_frames: Vec<(NewFrame, Option<FrameTxs<T>>)>,
+    /// The frames noted with that remainder, each with the count of
+    /// remainder transactions ever queued ([`Inner::pending_in`]) once its
+    /// own were in the remainder: indexed when [`Inner::pending_out`]
+    /// reaches that mark, i.e. once its last transaction is in its lane (a
+    /// frame is never indexed before its transactions are queued, as in
+    /// the one-hold drain). Marks never decrease, front to back.
+    pending_frames: VecDeque<(u64, NewFrame, Option<FrameTxs<T>>)>,
+    /// Transactions ever put in `pending_drain`, and ever moved out of it
+    /// into the lanes: the frame marks above count on these.
+    pending_in: u64,
+    pending_out: u64,
+    /// The last walk of the lanes [`TxQueue::usable`] made
+    /// (`N42_QUEUE_OFFLOCK`): reused while [`Inner::lanes_gen`] has not
+    /// moved, with what the quiet holds inserted since added.
+    usable_cache: Option<UsableWalk>,
     /// The child's frame plan, prepared while the build it follows is still
     /// executing (`N42_PLAN_AHEAD`, [`Prepared`]).
     prepared: Option<Prepared<T>>,
@@ -1446,7 +1457,52 @@ pub struct TxQueue<T: PoolTransaction> {
     /// `N42_QUEUE_PLAN_SNAPSHOT` unless a test said otherwise
     /// ([`snapshot::queue_plan_snapshot`]).
     plan_snapshot: Arc<std::sync::atomic::AtomicBool>,
+    /// The dedicated drainer's state and wake-up ([`TxQueue::run_drainer`]).
+    drainer: Arc<DrainerSignal>,
 }
+
+/// The dedicated drainer's state ([`TxQueue::run_drainer`]): whether one
+/// runs (then the block path's holds drain only a bounded slice of the
+/// inbox, [`TxQueue::drain_inbox_block`]), and the flag and condition it
+/// sleeps on between ticks, raised by a push that takes the inbox past
+/// [`DRAINER_WAKE`].
+#[derive(Debug, Default)]
+struct DrainerSignal {
+    running: std::sync::atomic::AtomicBool,
+    woken: Mutex<bool>,
+    wake: parking_lot::Condvar,
+}
+
+/// The last walk of the lanes [`TxQueue::usable`] made: at which
+/// [`Inner::lanes_gen`], what it counted, and `len` and `parked_len` then.
+#[derive(Debug, Clone, Copy)]
+struct UsableWalk {
+    lanes_gen: u64,
+    usable: usize,
+    len: usize,
+    parked_len: usize,
+}
+
+/// Transactions one hold on the block path moves from the inbox into the
+/// lanes when a dedicated drainer runs (`N42_QUEUE_OFFLOCK`,
+/// [`TxQueue::drain_inbox_block`]). At ~80 ns an insert in release this is
+/// ~0.2 ms; loop351 X8 measured whole-inbox drains of 23,000 transactions
+/// mean and 28.5 ms at worst inside the plan's, the snapshot's and
+/// `usable()`'s holds.
+const BLOCK_DRAIN_SLICE: usize = 2048;
+
+/// Transactions the dedicated drainer moves per hold, the lock released
+/// (and the thread yielding) between holds, when `N42_TX_QUEUE_DRAIN_CHUNK`
+/// does not say otherwise.
+const DRAINER_SLICE: usize = 8192;
+
+/// Inbox depth at which a push wakes the dedicated drainer before its tick.
+const DRAINER_WAKE: usize = 8192;
+
+/// Holds one call of the dedicated drainer makes at most, so a flood it
+/// cannot outrun still returns to its tick (and to the gate's readings)
+/// rather than looping in one call for ever.
+const DRAINER_MAX_HOLDS: usize = 256;
 
 /// Frames noted since the last drain, each with its transactions when the
 /// ingest handed them over ([`TxQueue::push_frame`]).
@@ -1468,6 +1524,7 @@ impl<T: PoolTransaction> Clone for TxQueue<T> {
             ahead_hook: Arc::clone(&self.ahead_hook),
             offlock: Arc::clone(&self.offlock),
             plan_snapshot: Arc::clone(&self.plan_snapshot),
+            drainer: Arc::clone(&self.drainer),
         }
     }
 }
@@ -1615,7 +1672,10 @@ impl<T: PoolTransaction> TxQueue<T> {
                 builds: 0,
                 frames: frames::FrameIndex::default(),
                 pending_drain: VecDeque::new(),
-                pending_frames: Vec::new(),
+                pending_frames: VecDeque::new(),
+                pending_in: 0,
+                pending_out: 0,
+                usable_cache: None,
                 prepared: None,
                 handed: None,
                 lanes_gen: 0,
@@ -1633,6 +1693,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             ahead_hook: Arc::new(Mutex::new(None)),
             offlock: Arc::new(std::sync::atomic::AtomicBool::new(queue_offlock())),
             plan_snapshot: Arc::new(std::sync::atomic::AtomicBool::new(snapshot::queue_plan_snapshot())),
+            drainer: Arc::new(DrainerSignal::default()),
         }
     }
 
@@ -1713,63 +1774,90 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// Moves what was pushed since the last drain into the lanes. Called
     /// with the lanes' lock held; a no-op when nothing was pushed.
     fn drain_inbox(&self, inner: &mut Inner<T>) {
+        self.drain_inbox_upto(inner, usize::MAX);
+    }
+
+    /// The block path's drain: the whole inbox, unless a dedicated drainer
+    /// runs under `N42_QUEUE_OFFLOCK` ([`Self::run_drainer`]) -- then at most
+    /// [`BLOCK_DRAIN_SLICE`] transactions, the rest left in order for the
+    /// drainer. An arrival left in the inbox is one that arrived a moment
+    /// later, which any arrival may: the lanes are always a prefix of the
+    /// arrivals in inbox order, whoever drained.
+    fn drain_inbox_block(&self, inner: &mut Inner<T>) {
+        let bound = if self.bounded_drains() { BLOCK_DRAIN_SLICE } else { usize::MAX };
+        self.drain_inbox_upto(inner, bound);
+    }
+
+    /// Whether the block path's holds drain a bounded slice
+    /// ([`Self::drain_inbox_block`]): `N42_QUEUE_OFFLOCK` and a dedicated
+    /// drainer running. Without the drainer nothing else would move the
+    /// rest, so every hold drains it all as before.
+    fn bounded_drains(&self) -> bool {
+        self.offlock() && self.drainer.running.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Moves at most `budget` transactions of what was pushed into the
+    /// lanes, oldest first: a chunked drain's remainder before the inbox,
+    /// the inbox (and the frames noted with it) appended to that remainder
+    /// first, so what this hold leaves is the next drain's start whoever
+    /// makes it. A frame is indexed in the hold that moves its last
+    /// transaction. Called with the lanes' lock held; returns how many it
+    /// moved.
+    fn drain_inbox_upto(&self, inner: &mut Inner<T>, budget: usize) -> usize {
         use std::sync::atomic::Ordering;
-        // A chunked drain's remainder is older than anything in the inbox:
-        // it goes into the lanes first, whoever drains.
-        if !inner.pending_drain.is_empty() || !inner.pending_frames.is_empty() {
-            let at = std::time::Instant::now();
-            let moved = inner.drain_pending(usize::MAX) as u64;
-            let took = at.elapsed().as_nanos() as u64;
-            let c = &LOCK_COUNTERS;
+        let had_pending = !inner.pending_drain.is_empty() || !inner.pending_frames.is_empty();
+        // Frames before the inbox: a frame is noted after its transactions
+        // were pushed, so every transaction of a frame taken here is in the
+        // inbox taken after it, or drained before.
+        let frames = if self.frames_staged.load(Ordering::Acquire) != 0 {
+            let mut noted = self.frame_inbox.lock();
+            let frames = std::mem::take(&mut *noted);
+            self.frames_staged.fetch_sub(frames.len(), Ordering::AcqRel);
+            frames
+        } else {
+            Vec::new()
+        };
+        let staged = if self.staged.load(Ordering::Acquire) != 0 {
+            // Taken and counted down under the inbox's lock, as a push adds
+            // under it: a drain that took a batch a push had already put in
+            // the inbox but not yet counted subtracted more than the counter
+            // held, and `staged` -- which the ingest gate reads through
+            // `len` -- wrapped to about 2^64 until the push's own increment
+            // landed.
+            let mut inbox = self.inbox.lock();
+            let staged = std::mem::take(&mut *inbox);
+            // The depth mirror counts the batch before `staged` lets go of
+            // it, so a gate reading the two without the lanes' lock never
+            // sees the batch in neither (an undercount that would open the
+            // gate for the drain's length). Between the two it is counted
+            // twice -- the safe side -- and the release of this lock stores
+            // the exact value again (the remainder counted with the lanes).
+            self.depth.fetch_add(staged.len() as u64, Ordering::AcqRel);
+            self.staged.fetch_sub(staged.len(), Ordering::AcqRel);
+            staged
+        } else {
+            Vec::new()
+        };
+        if !had_pending && frames.is_empty() && staged.is_empty() {
+            return 0;
+        }
+        inner.push_pending(staged, frames);
+        // Lanes only. Nothing here touches the by-hash index: this runs
+        // under the lanes' lock, with the builder's puller waiting on it.
+        let at = std::time::Instant::now();
+        let moved = inner.drain_pending(budget) as u64;
+        let took = at.elapsed().as_nanos() as u64;
+        let c = &LOCK_COUNTERS;
+        if had_pending {
             c.drain_finished.fetch_add(1, Ordering::Relaxed);
+        }
+        if moved > 0 {
+            c.drains.fetch_add(1, Ordering::Relaxed);
             c.drain_txs.fetch_add(moved, Ordering::Relaxed);
             c.drain_ns.fetch_add(took, Ordering::Relaxed);
             raise_max(&c.drain_max_ns, took);
         }
-        if self.frames_staged.load(Ordering::Acquire) != 0 {
-            let mut noted = self.frame_inbox.lock();
-            let frames = std::mem::take(&mut *noted);
-            self.frames_staged.fetch_sub(frames.len(), Ordering::AcqRel);
-            drop(noted);
-            for (frame, txs) in frames {
-                inner.frames.insert(frame, txs);
-            }
-        }
-        if self.staged.load(Ordering::Acquire) == 0 {
-            return;
-        }
-        // Taken and counted down under the inbox's lock, as a push adds
-        // under it: a drain that took a batch a push had already put in the
-        // inbox but not yet counted subtracted more than the counter held,
-        // and `staged` -- which the ingest gate reads through `len` --
-        // wrapped to about 2^64 until the push's own increment landed. It
-        // healed itself in a few nanoseconds, but a gate that reads it in
-        // that window shuts, and a debug build's `inner.len + staged`
-        // overflows.
-        let mut inbox = self.inbox.lock();
-        let staged = std::mem::take(&mut *inbox);
-        // The depth mirror counts the batch before `staged` lets go of it,
-        // so a gate reading the two without the lanes' lock never sees the
-        // batch in neither (an undercount that would open the gate for the
-        // drain's length). Between the two it is counted twice -- the safe
-        // side, a gate shut a few nanoseconds early -- and the release of
-        // this lock stores the exact value again.
-        self.depth.fetch_add(staged.len() as u64, Ordering::AcqRel);
-        self.staged.fetch_sub(staged.len(), Ordering::AcqRel);
-        drop(inbox);
-        // Lanes only. Nothing here touches the by-hash index: this runs
-        // under the lanes' lock, with the builder's puller waiting on it.
-        let at = std::time::Instant::now();
-        let count = staged.len() as u64;
-        for valid in staged {
-            inner.insert_valid(valid);
-        }
-        let took = at.elapsed().as_nanos() as u64;
-        let c = &LOCK_COUNTERS;
-        c.drains.fetch_add(1, Ordering::Relaxed);
-        c.drain_txs.fetch_add(count, Ordering::Relaxed);
-        c.drain_ns.fetch_add(took, Ordering::Relaxed);
-        raise_max(&c.drain_max_ns, took);
+        moved as usize
     }
 
     /// Notes a frame the ingest admitted whole: its id (root), its
@@ -1924,7 +2012,24 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// the second (`queued=334-360k` with every build finding nothing).
     /// One walk of the lanes (~6,000 at the bench tier), so it belongs on a
     /// per-block line and not in a loop.
+    ///
+    /// Under `N42_QUEUE_OFFLOCK` nothing is drained: the inbox, the
+    /// remainder and a chunked drain's batch in hand are counted as they
+    /// stand (an arrival a drain would drop as a duplicate or park is
+    /// counted too, and a parked lane whose hole an arrival still in the
+    /// inbox fills is counted parked until that arrival is in its lane),
+    /// and the walk is reused while [`Inner::lanes_gen`] has
+    /// not moved ([`Inner::usable_walked`]). loop351 X8: this hold, drain
+    /// and walk, was the lock's longest at 46.5 ms median.
     pub fn usable(&self) -> usize {
+        use std::sync::atomic::Ordering;
+        if self.offlock() {
+            let mut inner = self.lock_inner_quiet();
+            let inbox = inner.pending_drain.len()
+                + self.staged.load(Ordering::Acquire)
+                + self.in_hand.load(Ordering::Acquire);
+            return inner.usable_walked() + inbox;
+        }
         let mut inner = self.lock_inner_quiet();
         // What is in the inbox is a build away from the lanes -- the next
         // pull drains it -- so it counts, and counting it means draining
@@ -2041,7 +2146,17 @@ impl<T: PoolTransaction> TxQueue<T> {
         // always agree for a drain that holds it (see `drain_inbox`).
         let mut inbox = self.inbox.lock();
         inbox.extend(staged);
-        self.staged.fetch_add(count, std::sync::atomic::Ordering::AcqRel);
+        let before = self.staged.fetch_add(count, std::sync::atomic::Ordering::AcqRel);
+        drop(inbox);
+        // The dedicated drainer is woken once as the inbox crosses its mark,
+        // not on every push past it.
+        if before < DRAINER_WAKE
+            && before + count >= DRAINER_WAKE
+            && self.drainer.running.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            *self.drainer.woken.lock() = true;
+            self.drainer.wake.notify_one();
+        }
     }
 
     /// Forgets `hashes`, for a block the chain has committed: nothing will
@@ -2771,8 +2886,25 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// With `N42_TX_QUEUE_DRAIN_CHUNK=<n>` the lanes' lock is held for at
     /// most `n` transactions at a time ([`Self::drain_chunked`]); the result
     /// is the one-hold drain's.
+    ///
+    /// Under `N42_QUEUE_OFFLOCK` the drain is always sliced
+    /// ([`Self::drain_sliced`]: [`DRAINER_SLICE`] unless the chunk says
+    /// otherwise), and with a dedicated drainer running it also finishes
+    /// the remainder the block path's bounded holds left
+    /// ([`Self::drain_inbox_block`]).
     pub fn drain_now(&self) {
         use std::sync::atomic::Ordering;
+        if self.offlock() {
+            if self.staged.load(Ordering::Acquire) == 0
+                && self.frames_staged.load(Ordering::Acquire) == 0
+                && !self.bounded_drains()
+            {
+                return;
+            }
+            let chunk = self.drain_chunk.load(Ordering::Relaxed);
+            self.drain_sliced(if chunk > 0 { chunk } else { DRAINER_SLICE }, DRAINER_MAX_HOLDS);
+            return;
+        }
         if self.staged.load(Ordering::Acquire) == 0 {
             return;
         }
@@ -2835,16 +2967,8 @@ impl<T: PoolTransaction> TxQueue<T> {
             {
                 let mut inner = self.lock_inner_unsettled();
                 at = std::time::Instant::now();
-                // Moved, not copied: a `Vec` becomes the deque in O(1).
-                if let Some(batch) = batch.take() {
-                    if inner.pending_drain.is_empty() {
-                        inner.pending_drain = VecDeque::from(batch);
-                    } else {
-                        inner.pending_drain.extend(batch);
-                    }
-                }
-                if let Some(frames) = frames.take() {
-                    inner.pending_frames.extend(frames);
+                if let (Some(batch), Some(frames)) = (batch.take(), frames.take()) {
+                    inner.push_pending(batch, frames);
                 }
                 moved = inner.drain_pending(chunk) as u64;
                 done = inner.pending_drain.is_empty() && inner.pending_frames.is_empty();
@@ -2871,6 +2995,77 @@ impl<T: PoolTransaction> TxQueue<T> {
         holds
     }
 
+    /// The drainer's drain under `N42_QUEUE_OFFLOCK`: holds of at most
+    /// `slice` transactions each ([`Self::drain_inbox_upto`], the inbox
+    /// taken into the remainder in every hold), the lock released and the
+    /// thread yielding between them, until a hold leaves no remainder or
+    /// `max_holds` were made. Without the frame build's noted takes applied
+    /// ([`Self::lock_inner_unsettled`]). Returns how many holds it made.
+    ///
+    /// loop351 X8: the chunked drain took the inbox into the remainder and
+    /// the block path's next hold -- the plan's, the snapshot's,
+    /// `usable()`'s -- finished it in one go (668 drains per 5 s of 23,000
+    /// transactions mean, 28.5 ms at worst): with those holds bounded the
+    /// remainder is this drainer's alone.
+    fn drain_sliced(&self, slice: usize, max_holds: usize) -> usize {
+        use std::sync::atomic::Ordering;
+        let slice = slice.max(1);
+        let mut holds = 0;
+        loop {
+            let (moved, left) = {
+                let mut inner = self.lock_inner_unsettled();
+                let moved = self.drain_inbox_upto(&mut inner, slice);
+                (moved, !inner.pending_drain.is_empty() || !inner.pending_frames.is_empty())
+            };
+            holds += 1;
+            if moved > 0 {
+                let c = &LOCK_COUNTERS;
+                c.drain_chunks.fetch_add(1, Ordering::Relaxed);
+                raise_max(&c.drain_chunk_max_txs, moved as u64);
+            }
+            if !left || holds >= max_holds {
+                return holds;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// The dedicated drainer (`N42_TX_QUEUE_DRAINER` under
+    /// `N42_QUEUE_OFFLOCK`): [`Self::drain_now`] every `tick`, or at once
+    /// when a push takes the inbox past [`DRAINER_WAKE`]; never returns.
+    /// Run it on a thread of its own. While it runs, the block path's holds
+    /// drain only [`BLOCK_DRAIN_SLICE`] transactions each and leave the
+    /// rest to it.
+    pub fn run_drainer(&self, tick: std::time::Duration) {
+        let never = std::sync::atomic::AtomicBool::new(false);
+        self.run_drainer_until(tick, &never);
+    }
+
+    /// [`Self::run_drainer`] until `stop` is raised (checked every tick);
+    /// the queue's holds drain everything again once it returns.
+    pub fn run_drainer_until(&self, tick: std::time::Duration, stop: &std::sync::atomic::AtomicBool) {
+        use std::sync::atomic::Ordering;
+        self.drainer.running.store(true, Ordering::Relaxed);
+        while !stop.load(Ordering::Relaxed) {
+            {
+                let mut woken = self.drainer.woken.lock();
+                if !*woken {
+                    let _ = self.drainer.wake.wait_for(&mut woken, tick);
+                }
+                *woken = false;
+            }
+            self.drain_now();
+        }
+        self.drainer.running.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether this queue runs a dedicated drainer: what `bin/n42` asks
+    /// before choosing [`Self::run_drainer`] over a ticking task. True
+    /// under `N42_QUEUE_OFFLOCK`.
+    pub fn wants_drainer_thread(&self) -> bool {
+        self.offlock()
+    }
+
     /// The transactions for a build on `parent`, as the pool's iterator would
     /// hand them. Taking returns what the previous build on the same parent
     /// took, first.
@@ -2881,7 +3076,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             // A build that walks the lanes cannot use a frame plan: it goes
             // back before the walk, so the walk sees its transactions.
             if inner.prepared.is_some() {
-                self.drain_inbox(&mut inner);
+                self.drain_inbox_block(&mut inner);
                 garbage.taken = inner.discard_prepared();
                 note_ahead_discard(AheadDiscard::NotFrames);
             }
@@ -2963,7 +3158,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             let begin_at = std::time::Instant::now();
             // The inbox first: an arrival below a prepared plan's nonces must
             // be in its lane when the plan is judged.
-            self.drain_inbox(&mut inner);
+            self.drain_inbox_block(&mut inner);
             let verdict = inner.prepared.as_ref().map(|prepared| inner.prepared_verdict(prepared, parent, gas_limit));
             let out = match (verdict, inner.prepared.take()) {
                 (Some(Ok(())), Some(prepared)) => {
@@ -3227,7 +3422,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         let mut body_job: Option<BodyJob<T>> = None;
         let prepared = {
             let mut inner = self.lock_inner();
-            self.drain_inbox(&mut inner);
+            self.drain_inbox_block(&mut inner);
             if inner.prepared.is_some() {
                 // A plan nobody used (two builds' plans in a row without a
                 // build between them): it goes back first.
@@ -3277,7 +3472,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         let hook = self.ahead_hook.lock().clone();
         let mut body_job: Option<BodyJob<T>> = None;
         let mut inner = self.lock_inner();
-        self.drain_inbox(&mut inner);
+        self.drain_inbox_block(&mut inner);
         if inner.prepared.is_some() {
             garbage.taken = inner.discard_prepared();
             note_ahead_discard(AheadDiscard::OtherBuild);
@@ -3482,7 +3677,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// build's take given back, this build's taken list opened, the parked
     /// lanes whose park ended offered again.
     fn begin_build(&self, inner: &mut Inner<T>, parent: B256) {
-        self.drain_inbox(inner);
+        self.drain_inbox_block(inner);
         inner.open_build(parent, Vec::new());
     }
 }
@@ -4011,9 +4206,26 @@ impl<T: PoolTransaction> Inner<T> {
         mined
     }
 
-    /// Moves up to `budget` transactions of a chunked drain's remainder into
-    /// their lanes, in inbox order, and indexes the remainder's frames once
-    /// the last of them is in. Returns how many it moved.
+    /// Appends a batch taken from the inbox, and the frames noted with it,
+    /// to the remainder. Each frame's mark is the remainder count with the
+    /// batch in: every transaction of the frame is at or before it.
+    fn push_pending(&mut self, batch: Vec<Arc<ValidPoolTransaction<T>>>, frames: Vec<(NewFrame, Option<FrameTxs<T>>)>) {
+        self.pending_in += batch.len() as u64;
+        if !batch.is_empty() {
+            // Moved, not copied: a `Vec` becomes the deque in O(1).
+            if self.pending_drain.is_empty() {
+                self.pending_drain = VecDeque::from(batch);
+            } else {
+                self.pending_drain.extend(batch);
+            }
+        }
+        let mark = self.pending_in;
+        self.pending_frames.extend(frames.into_iter().map(|(frame, txs)| (mark, frame, txs)));
+    }
+
+    /// Moves up to `budget` transactions of the remainder into their lanes,
+    /// in inbox order, and indexes each remainder frame whose last
+    /// transaction is now in. Returns how many it moved.
     fn drain_pending(&mut self, budget: usize) -> usize {
         let mut moved = 0usize;
         while moved < budget {
@@ -4021,10 +4233,10 @@ impl<T: PoolTransaction> Inner<T> {
             self.insert_valid(valid);
             moved += 1;
         }
-        if self.pending_drain.is_empty() && !self.pending_frames.is_empty() {
-            for (frame, txs) in std::mem::take(&mut self.pending_frames) {
-                self.frames.insert(frame, txs);
-            }
+        self.pending_out += moved as u64;
+        while self.pending_frames.front().is_some_and(|(mark, _, _)| *mark <= self.pending_out) {
+            let Some((_, frame, txs)) = self.pending_frames.pop_front() else { break };
+            self.frames.insert(frame, txs);
         }
         moved
     }
@@ -4240,6 +4452,25 @@ impl<T: PoolTransaction> Inner<T> {
     /// arrival order does not offer.
     fn usable(&self) -> usize {
         self.lanes.values().filter(|lane| lane.queued).map(|lane| lane.by_nonce.len()).sum()
+    }
+
+    /// [`Inner::usable`], walked at most once per [`Inner::lanes_gen`]: the
+    /// holds that do not raise it only insert arrivals ([`TxQueue::lock_inner_quiet`]),
+    /// so what they changed is what `len` moved less what `parked_len`
+    /// moved. (An arrival that puts back a lane holding entries outside
+    /// the order -- a build's cursor lane -- adds those entries to the walk
+    /// but not here, until the next walk.)
+    fn usable_walked(&mut self) -> usize {
+        if let Some(walk) = self.usable_cache
+            && walk.lanes_gen == self.lanes_gen
+        {
+            let moved = (self.len as i64 - walk.len as i64) - (self.parked_len as i64 - walk.parked_len as i64);
+            return (walk.usable as i64 + moved).max(0) as usize;
+        }
+        let usable = self.usable();
+        self.usable_cache =
+            Some(UsableWalk { lanes_gen: self.lanes_gen, usable, len: self.len, parked_len: self.parked_len });
+        usable
     }
 
     /// The parked lanes and what they hold, walked. What
@@ -4907,7 +5138,7 @@ impl<T: PoolTransaction> Iterator for QueueBest<T> {
                 return Some(transaction);
             }
             let mut inner = self.queue.lock_inner();
-            self.queue.drain_inbox(&mut inner);
+            self.queue.drain_inbox_block(&mut inner);
             if self.batch <= 1 {
                 return inner.next_ready(&self.skipped);
             }
@@ -5857,6 +6088,13 @@ mod tests {
         build_refusing_gaps(&queue, B256::repeat_byte(1), &|_| 0);
         assert_eq!(queue.usable(), 0);
         queue.push((0..5).map(|n| tx(1, n)).collect::<Vec<_>>());
+        if queue.offlock() {
+            // `usable()` drains nothing under the switch: the filler counts
+            // as it stands in the inbox, the parked head only once the
+            // filler is in its lane and has ended the park.
+            assert_eq!(queue.usable(), 5);
+            queue.drain_now();
+        }
         // The lane is walked again at once: nonces 0-4 and the head the
         // first build handed back. The rest (6-9) is still that build's
         // take and comes back at the next build's start.

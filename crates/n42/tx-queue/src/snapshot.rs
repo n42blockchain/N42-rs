@@ -750,7 +750,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         let hook = self.ahead_hook.lock().clone();
         let mut snapshot = {
             let mut inner = self.lock_inner_quiet();
-            self.drain_inbox(&mut inner);
+            self.drain_inbox_block(&mut inner);
             let unused = inner.prepared.take();
             match unused {
                 None => Ok(inner.snapshot_frames(gas_limit)),
@@ -839,7 +839,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             let mut inner = self.lock_inner();
             times.lock_us = at.elapsed().as_micros() as u64;
             let begin_at = std::time::Instant::now();
-            self.drain_inbox(&mut inner);
+            self.drain_inbox_block(&mut inner);
             let verdict =
                 inner.prepared.as_ref().map(|prepared| inner.prepared_verdict_in(prepared, parent, gas_limit, true));
             match (verdict, inner.prepared.take()) {

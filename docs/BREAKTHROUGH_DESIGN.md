@@ -3235,3 +3235,50 @@ Every j, k and l leg is clean (no invalid block, gas or field mismatch, `proposa
 **What binds, and what is next.** At E=1 the own block now lands in about 6 ms (hand-off total mean 5.8 ms) and commits in 0.01 ms; the chain's binding resource is the transaction queue's single lock (94% duty): the plan-ahead prepare at `lib.rs:2576`, the select and the prunes all hold it for tens of milliseconds, and `par_start` (19-28 ms) is where the seal waits. Next, `N42_QUEUE_OFFLOCK` (Opus, in progress): plan-ahead prepare from a snapshot and batched prunes with short holds. Targets: lock duty below 40%, longest hold below 5 ms, `par_start` about 5 ms. The cycle should then follow the 45 / 40 ms tick: 3.34M at the 60 ms cycle is about 4.4M at 45 and 5M at 40. Stage m's pacing-40 and 35 ms legs and the three `b` legs are pending; the window-3 slowdown (persistence 68 ms a block) needs its own look once they land.
 
 Hand-off files: `target/fleet-runs/loop351{j,k,l,m}.out` (m incomplete at writing: P40 round done but not summarised, P35 and the `b` legs pending); kept legs under `/data/blockchain/rust-fleet7-bench/bench-loop351{D2S2P45T64,D2S2P45T64b,D2S12F6I3K8P45T64,D2S12F6I3K8P40T64,D2S2I3K8P45T64,D2S2I3K8P40T64,D2S2P45T64X3,D2S2P40T64X3,D2S2P45T64X3b,D2S2P40T64X3b,D2S12F6I3K8P45T64X3,D2S12F6I3K8P40T64X3,D2S2P45T64X4,D2S2P40T64X4,D2S2P45T64X4b,D2S2P40T64X4b,D2S12F6I3K8P45T64X4,D2S12F6I3K8P40T64X4,D2S12F6I3K8P45T64X5,D2S12F6I3K8P40T64X5}/`.
+
+### 10.101 loop351 stages n-q — the queue off its lock (3.95M at 40 ms, seal = tick), the pacing floor at 35 ms, persistence doubling by window 3 on the QMDB forest lock, and the QMDB tree lease
+
+Section 10.100 ended with the chain bound by the transaction queue's single lock (94% duty at X5). This section records stage n (the X5 S1 set, pacing sweep), stage o (the simple set at X5), stage p (X6 = X5 + `N42_QUEUE_OFFLOCK`) and the first leg of stage q (X7 = X6 + the two QMDB switches). Notation as in 10.99 / 10.100 (200k transfers a block, 7 keys on one execution layer, T64; S1 set = `D2S12F6I3K8` = check-before-slot + far-ahead 6 + 3 import slots + keep 8; simple set = `D2S2`; a trailing `b` is the repeat leg). Window 1 is the headline; windows 2 and 3 are shown because persistence moves the later ones (below).
+
+Switches (all default off, bench only):
+- X6 adds `N42_QUEUE_OFFLOCK=1` (Opus: da9e2e481 prepare-ahead in two holds, 601115563 batched prune, b310c8297 hand-off partition off the lock, 58b2bc709 settle in one hold, 068773e7e counters). Then `N42_QUEUE_PLAN_SNAPSHOT=1` (e6c372c0c / 31d377315 / 7f0ca9697: lane reads in 8192-sender holds, planning unlocked, per-lane validate-and-commit; debug bench longest hold 55 -> 13 ms) and the batched settle (aeeaa5c90: 73.7 ms in one hold -> 14 holds of <= 6.2 ms in debug) come with stage r (X8), not yet measured.
+- X7 adds `N42_QMDB_COMPUTE_OFFLOCK=1` (eb40db099: the tree lease. `lease_tree` lifts the tree out of the forest under a short lock, apply / hash / delta run unlocked, `return_tree` puts it back under a short lock; readers that need the tree wait on a condvar, `held_by=tree_lease`; block records share operations through an `Arc`, so `block_changes_parts` is O(1)) and `N42_QMDB_PERSIST_BATCH=1` (6b650f459: one forest hold per persistence batch; the timer is split into qmdb_lock_wait / hold / advance). Tests 4358b3348. Still behind a lease: `on_canonical` (twig trims) and `sync_entries_if_file`.
+
+Columns: w1 / w2 / w3 in M tx/s, round total in M tx, `sealed_at` median of window 1 (ms), cycle of window 1 (ms), queue lock duty in window 1.
+
+| leg | stage | pacing | w1 | w2 | w3 | round total | sealed_at median | cycle | lock duty w1 | note |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| D2S12F6I3K8P30T64X5 | n | 30 | 3.500 | 2.633 | 2.647 | 263.6 | 52 | 57 | 94.5% | |
+| D2S12F6I3K8P30T64X5b | n | 30 | 3.653 | 2.920 | 2.640 | 276.6 | 49 | 55 | 93.0% | |
+| D2S12F6I3K8P25T64X5 | n | 25 | 3.773 | 3.040 | 2.680 | 284.8 | 48 | 53 | 87.0% | |
+| D2S12F6I3K8P25T64X5b | n | 25 | 3.567 | 2.727 | 3.067 | 280.8 | 52 | 56 | 96.0% | |
+| D2S12F6I3K8P35T64X5 (printed under the b tag) | n | 35 | 3.773 | 2.987 | 2.660 | 271.8 | 50 | 53 | 89.5% | the P35 leg's lines carry the `b` tag; no separate `leg ... P35T64X5 start` line |
+| D2S12F6I3K8P35T64X5b | n | 35 | 3.547 | 2.880 | 2.627 | | | 56 | | |
+| D2S12F6I3K8P20T64X5 | n | 20 | 3.131 | 2.993 | 3.367 | 284.7 | 61 | 64 | 82.5% | VOID: an agent's cargo test ran at 170 cores, load 100 |
+| D2S2P40T64X5 | o | 40 | 3.693 | 3.620 | 3.373 | 320.6 | 36 | 54 | 67.0% | |
+| D2S2P35T64X5 | o | 35 | 3.653 | 3.713 | 3.447 | 324.6 | 38 | 55 | 66.5% | |
+| D2S2P35T64X5b | o | 35 | 3.600 | 3.700 | 3.347 | 319.6 | 36 | 56 | 65.5% | |
+| D2S2P30T64X5 | o | 30 | 3.726 | 3.713 | 3.353 | 323.8 | 36 | 54 | 68.0% | |
+| D2S2P30T64X5b | o | 30 | 3.680 | 3.627 | 3.413 | 321.8 | 38 | 54 | 68.0% | |
+| D2S2P25T64X5 | o | 25 | 3.767 | 3.607 | 3.553 | 328.0 | 36 | 53 | 72.0% | |
+| D2S12F6I3K8P40T64X6 | p | 40 | **3.953** | 3.820 | 3.460 | 337.0 | 39 | 51 | 77.5% | mislabel: ran as D2 S1 S2 X6 T64 (F6/I3/K8 never defined in the `p)` case); 13 builds also directly imported (keep-3 evictions) |
+| D2S12F6I3K8P35T64X6 | p | 35 | 3.840 | 3.787 | 3.500 | 333.9 | 40 | 52 | 75.0% | same mislabel; 24 also directly imported |
+| D2S12F6I3K8P35T64X6b | p | 35 | 3.893 | 3.867 | 3.567 | 340.0 | 40 | 51 | 77.5% | same mislabel |
+| D2S12F6I3K8P30T64X6 | p | 30 | 3.460 | 3.420 | 2.593 | 284.4 | 41 | 57 | 82.0% | same mislabel; planning hold 129 ms median in w3; 23 also directly imported |
+| D2S2P35T64X6 | p | 35 | 3.700 | 3.687 | 3.353 | 322.4 | 38 | 54 | 67.0% | |
+| D2S2P30T64X6 | p | 30 | 3.727 | 3.680 | 3.367 | 323.4 | 37 | 54 | 65.0% | |
+| D2S12F6I3K8P40T64X7 | q | 40 | 3.707 | 2.853 | 2.640 | 276.2 | 48 | 54 | 89.5% | first launch released without a leg (an agent's rebase made a source newer than the binary at claim time); `own_not_committed=2 tc=2`; BODYGATE stop |
+
+Stage p's `b` legs and any leg after the P30 simple-set one were still running at writing; stage q has only the one leg.
+
+**Findings (loop351 analysis):**
+- **Stage n: below 35 ms the pacing no longer matters.** With the X5 S1 set 30 ms reads 3.50 / 3.65M (cycle 57 / 55), 25 ms 3.77 / 3.57M, 35 ms 3.77 / 3.55M; the 20 ms leg (3.13M) is void. The inherent cycle is 50-57 ms with `sealed_at` 48-52 in window 1 (55-60 where the lock is worst) = the transaction queue's lock (`par_start` = hand-off wait + select). Windows 2 and 3 fall to 2.6-3.0M on every S1 X5 leg (round total 264-285M against 320-328M for the simple set): `sealed_at` climbs to 59-68 ms and persistence grows (below).
+- **Stage o: the simple set is bound by the vote's import-slot wait, the S1 set by the seal.** D2 S2 X5 T64 (no check-before-slot, two import slots, keep 3, far-ahead 1) reads 3.69 (40), 3.65 / 3.60 (35 / b), 3.73 / 3.68 (30 / b), 3.77M (25) with cycle 53-56 and `sealed_at` 36-37 (the seal is early; the vote waits for an import slot). Windows 2 and 3 hold (3.35-3.71M, totals 320-328M). Both sets land at about 54 ms: the execution layer's serial per-block lock work.
+- **The queue lock (X5, 45 ms leg).** Duty 94% (63% on X4), wait 10.1 s per 5 s, longest hold 56 ms median at `frames_for_build_ahead` (`lib.rs:2576`), prune 43-73 ms a block.
+- **Stage p (X6): the queue off its lock, the seal equals the tick.** The 40 ms leg reads **3.953M, cycle 51 ms, `sealed_at` 40 ms = the tick**; 35 ms reads 3.84 / 3.89M; round totals 334-340M (X5 S1: 264-285M), windows 2 and 3 now hold (3.79-3.87, 3.46-3.57M). Lock duty 94 -> 77%, wait 10.1 -> 5.2 s per 5 s, holds per 5 s 2,105 -> 27,500, 1,745 builds a leg against about 1,450. The longest hold is still 32-35 ms median (`frames_for_build_ahead`, now `lib.rs:2936`; `offlock_plan` hold 1, `lib.rs:3192`) = the planning itself, which the snapshot planner (stage r) moves off the lock. At 30 ms pacing the S1 leg falls to 3.46M (cycle 57): the planning hold balloons to 129 ms median in window 3 when the pacing is tighter than the queue can plan. The simple set gains little (35 ms 3.70M, 30 ms 3.73M): it is not bound by the queue. The 9-24 "also directly imported" own blocks on these legs are keep-3 evictions (the F6/I3/K8 mislabel above).
+- **Persistence doubles by window 3 on the QMDB forest lock (the m legs, P45).** Total 37 -> 41 -> 68 ms a block over the three windows (P35: 42 / 40 / 68); only the qmdb part grows (27 -> 64). The cause is forest-lock contention, not chain length: `compute_operations` holds the lock 33 ms (w1) to 52 ms (w3) a block, `on_persisted` / `sync_entries_if_file` queue behind it (persist-side lock cost 2.7 -> 22 ms a block), compaction never takes the lock; the index goes cache-cold. This is the window-3 fall in every S1 leg above, and the reason for the tree lease.
+- **Stage q (X7): not yet a result.** The first launch released without a leg (an agent's rebase made a source newer than the binary at claim time). The relaunched leg, with F6/I3/K8, reads 3.71M (cycle 54), lock duty 89.5%, `own_not_committed=2 tc=2`, and stops at BODYGATE: the signature of stage h's F6-without-K8 leg (10.99), under diagnosis (the far-ahead window against the tree lease). Stages r (X8 = X7 + snapshot planner, with F6I3K8) and s (the S1 set with and without F6/I3/K8 on X8, and K8 alone) are queued to separate the two.
+
+**What binds, and what is next.** With the queue off its lock the seal follows the tick (39-40 ms at 40 ms pacing) and the cycle (51 ms) is the layer's serial per-block lock work, so pacing below 35 ms buys nothing and 30 ms hurts the S1 set. Next: the snapshot planner (stage r) for the 32-35 ms planning hold, the tree lease for window 3 (persistence must stay at about 40 ms a block), then the F6/I3/K8 stop at stage s.
+
+Hand-off files: `target/fleet-runs/loop351{n,o,p,q}.out` (p incomplete at writing, q one leg), kept legs under `/data/blockchain/rust-fleet7-bench/bench-loop351D2S*T64X{5,6,7}/` (q's P40 X7 datadirs kept as BODYGATE evidence).

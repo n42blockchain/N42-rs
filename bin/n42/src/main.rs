@@ -384,7 +384,7 @@ fn main() {
                                 inserts: reth_node_builder::executed_inserts::sender(),
                                 canonical_head: Some(std::sync::Arc::new({
                                     let provider = node.provider.clone();
-                                    move || reth_provider::BlockNumReader::chain_info(&provider).ok().map(|info| info.best_hash)
+                                    move || reth_provider::BlockNumReader::chain_info(&provider).ok().map(|info| (info.best_hash, info.best_number))
                                 })),
                                 // Opt-in (N42_PRUNE_POOL_ON_IMPORT=1), measured and not
                                 // adopted: removing a block's 163,000 transactions from

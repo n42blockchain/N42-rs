@@ -188,7 +188,8 @@ pub struct OwnBlockReuse {
     /// followed executed the sibling on the fork path -- on QMDB, against
     /// the wrong state (loop147-152: every header after it rejected). The
     /// head is moved to the sibling's parent first, so the insert extends it.
-    pub canonical_head: Option<std::sync::Arc<dyn Fn() -> Option<B256> + Send + Sync>>,
+    /// The head's hash and number.
+    pub canonical_head: Option<std::sync::Arc<dyn Fn() -> Option<(B256, u64)> + Send + Sync>>,
 }
 
 /// Executes and checks another node's block; see [`OwnBlockReuse::import_foreign`].
@@ -394,6 +395,65 @@ fn build_executes_as_sealed(
         && built.parent_beacon_block_root == sealed.parent_beacon_block_root
         && built.transactions_root == sealed.transactions_root
         && built_withdrawals.unwrap_or_default() == payload_withdrawals.unwrap_or_default()
+}
+
+/// When the `request::OWN_BLOCK` path moves the engine's head to the own
+/// block's parent before the executed insert (`N42_HANDOFF_HEAD_MOVE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffHeadMove {
+    /// Whenever the head is not the parent (the default, today's behaviour).
+    NotParent,
+    /// Only when the head's number is at or above the block's
+    /// (`N42_HANDOFF_HEAD_MOVE=number`).
+    Number,
+}
+
+/// Parses `N42_HANDOFF_HEAD_MOVE`: `number` selects [`HandoffHeadMove::Number`];
+/// anything else (or nothing) keeps the default.
+fn handoff_head_move_from(raw: Option<&str>) -> HandoffHeadMove {
+    match raw {
+        Some("number") => HandoffHeadMove::Number,
+        _ => HandoffHeadMove::NotParent,
+    }
+}
+
+/// `N42_HANDOFF_HEAD_MOVE`, read once.
+///
+/// The head move exists for one case: reth's tree drops an executed insert
+/// whose number is at or below its canonical block number as outdated
+/// (engine/tree `InsertExecutedBlock`: `number <= canonical_block_number`),
+/// which is a sibling re-proposed after a TC at the height of an own block
+/// already canonical (see [`OwnBlockReuse::canonical_head`]). A head that is
+/// an ancestor of the parent (below the block's number) does not drop the
+/// insert: the tree files it (only a known hash is skipped besides), and the
+/// header-only `newPayload` that follows finds the hash in the tree and is
+/// answered `AlreadySeen(Valid)` before any execution, its conversion served
+/// from the remembered sealed block (`built_executions::find_sealed`). At E=1
+/// under depth 2 the head is n-1..n-4 at hand-off time, so the default moves
+/// it on most blocks (loop351: `moved_ms` 13-71, `Syncing` -- a no-op of
+/// 6 ms -- on 57%). Under `number` the head is moved only when its number is
+/// at or above the block's. The switch must stay off if a head below the
+/// block can be on a fork that does not contain the parent and the chain
+/// relies on the engine reorging before the insert: the later FCU to the
+/// block then walks back through the tree (`on_new_head`), and a parent that
+/// is not in the tree yet is the `Sidechain block not found in TreeState`
+/// WARN and a `Syncing` answer until the parent lands -- the same answer the
+/// default's head move gets today when the parent is not in the tree.
+fn handoff_head_move() -> HandoffHeadMove {
+    static MODE: std::sync::OnceLock<HandoffHeadMove> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| handoff_head_move_from(std::env::var("N42_HANDOFF_HEAD_MOVE").ok().as_deref()))
+}
+
+/// Whether the engine's head (`head`, at `head_number`) has to be moved to
+/// the own block's parent before the executed insert of block `number`.
+fn head_move_needed(mode: HandoffHeadMove, head: B256, head_number: u64, parent: B256, number: u64) -> bool {
+    if head == parent {
+        return false;
+    }
+    match mode {
+        HandoffHeadMove::NotParent => true,
+        HandoffHeadMove::Number => head_number >= number,
+    }
 }
 
 /// The hand-off of a build this node kept, under the sealed header consensus
@@ -646,8 +706,8 @@ where
     // after a TC): the head goes back to the parent first, or the tree
     // drops the executed insert as outdated and executes the payload
     // itself, on the fork path. See `OwnBlockReuse::canonical_head`.
-    if let Some(head) = reuse.canonical_head.as_ref().and_then(|current| current()) {
-        if head != header.parent_hash {
+    if let Some((head, head_number)) = reuse.canonical_head.as_ref().and_then(|current| current()) {
+        if head_move_needed(handoff_head_move(), head, head_number, header.parent_hash, number) {
             let moved_at = std::time::Instant::now();
             // Under the split settlement tags (`n42_h2_execution::settlement`)
             // the parent is committed, not certified or persisted: this head
@@ -667,6 +727,7 @@ where
                     target: "n42.payload_serve",
                     number, parent = ?header.parent_hash, engine_head = ?head, status = ?updated.payload_status.status,
                     head_number = number.saturating_sub(1),
+                    engine_head_number = head_number,
                     moved_ms = moved_at.elapsed().as_millis() as u64,
                     "own block forks from the engine's head; the head was moved to its parent first"
                 ),
@@ -3303,6 +3364,28 @@ mod tests {
     use alloy_consensus::{Block, BlockBody, Header, Signed, TxEip1559, TxLegacy};
     use alloy_primitives::{Address, Signature, TxKind, U256};
     use reth_ethereum_primitives::TransactionSigned;
+
+    /// `N42_HANDOFF_HEAD_MOVE=number` moves the head only for an insert the
+    /// tree would drop as outdated; the default moves it whenever the head is
+    /// not the parent; neither moves a head that is the parent.
+    #[test]
+    fn the_head_move_switch_decides_by_number() {
+        assert_eq!(handoff_head_move_from(Some("number")), HandoffHeadMove::Number);
+        for other in [None, Some(""), Some("1"), Some("parent")] {
+            assert_eq!(handoff_head_move_from(other), HandoffHeadMove::NotParent, "{other:?}");
+        }
+        let (parent, other) = (B256::repeat_byte(1), B256::repeat_byte(2));
+        for mode in [HandoffHeadMove::NotParent, HandoffHeadMove::Number] {
+            assert!(!head_move_needed(mode, parent, 9, parent, 10));
+        }
+        // An ancestor below the block: moved by default, not under `number`.
+        assert!(head_move_needed(HandoffHeadMove::NotParent, other, 7, parent, 10));
+        assert!(!head_move_needed(HandoffHeadMove::Number, other, 7, parent, 10));
+        assert!(!head_move_needed(HandoffHeadMove::Number, other, 9, parent, 10));
+        // A sibling at the block's height (or above): moved either way.
+        assert!(head_move_needed(HandoffHeadMove::Number, other, 10, parent, 10));
+        assert!(head_move_needed(HandoffHeadMove::Number, other, 11, parent, 10));
+    }
 
     /// The parallel encoding is alloy's, byte for byte.
     #[test]

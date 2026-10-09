@@ -409,6 +409,7 @@
 - `N42_FAR_AHEAD_BLOCKS=<1..8>`（验证者进程；`h2-node` `service.rs` `far_ahead_limit`，默认 1）：执行层 tip 之前多远的块仍直接发送而不被扣留；深度 2 时已投票的块领先 tip 两块，需设为 2，否则扣留会使 `N42_CHECK_BEFORE_SLOT` 失效。
 - `N42_BUILT_KEEP=<3..=16>`（执行层进程；`engine-types` `built_executions.rs` `keep()`，默认 3）：领导者自建执行结果（import-once 交接存储）保留的条数；深度 2 + `N42_CHECK_BEFORE_SLOT` + 远超前下验证者导入在封块后 280-400 ms 才到，条目已被淘汰，需调大（每条为一个完整的 20 万笔交易 bundle）。
 - `N42_QMDB_RENAME_DEFER=1`（执行层进程；`engine-types` `chain_alias.rs` `rename_defer_enabled()` + `qmdb-reth` `QmdbNodeState::rename_or_defer`，默认关）：自建块交接时把 QMDB 记录从构建哈希改名到封块哈希，若森林锁被下一块的 `compute_operations`（约 30 ms，四分之一的块）占着则入队不等待，由下一个取锁者在访问森林前按序应用；之后开始的任何森林访问都看得到新哈希。代价：入队的改名失败只记 WARN，不再回退到普通导入。交接日志行带 `rename_wait_ms` / `rename_deferred`。
+- `N42_HANDOFF_HEAD_MOVE=number`（执行层进程；`bin/n42` `payload_serve.rs` `handoff_head_move()`，默认为头不是父块就移动）：`request::OWN_BLOCK` 交接前把引擎头移到父块的 FCU 只在头的高度 >= 本块高度时才做（树把高度 <= 规范高度的已执行插入当作过时丢弃，只有 TC 后的同高兄弟块需要）；头是祖先时插入照常进树，随后的 header-only `newPayload` 以 `AlreadySeen(Valid)` 回答。父块尚未进树时之后的 FCU 回 `Syncing`（与默认下的头移动相同）。
 - `N42_CHECK_BEFORE_SLOT=1`（验证者进程；代码在 `h2-execution` `driver.rs` `spawn_check_ahead` / `first_check`、
   `el.rs` `ExecutionLayer::check_only` / `checks_only` / `vouches_for`、`raw_engine.rs` `request::CHECK_ONLY`（10），
   `h2-el-rpc` `engine.rs` `check_only_over_channel`，执行层 `bin/n42/src/payload_serve.rs` `check_only_answer`、

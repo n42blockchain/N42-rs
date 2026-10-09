@@ -1,0 +1,20 @@
+{
+  "model": "jev-1.13.0",
+  "optionOrder": {"q0": ["technical", "community", "funding", "needs_more_information"]},
+  "questions": {
+    "q0": {
+      "type": "choice",
+      "instructions": "Classify this public proposal by the queue that should review it first. Choose needs_more_information if the proposal lacks enough detail to route.",
+      "criteria": {
+        "technical": "Protocol, software, security, or infrastructure work",
+        "community": "Community programs, education, or events",
+        "funding": "Treasury funding or budget requests; classification is not approval",
+        "needs_more_information": "Insufficient information to choose a review queue"
+      }
+    },
+    "q1": {
+      "type": "noul",
+      "instructions": "Does this proposal contain enough concrete information for the assigned review queue to begin reviewing it?"
+    }
+  }
+}

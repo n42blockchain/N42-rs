@@ -3179,3 +3179,59 @@ Every f leg is clean (no invalid blocks, no gas mismatch, no failed direct impor
 **What binds, and what is next.** At E=1 below 50 ms pacing the chain is paced by the layer's landing pipeline: a head-move FCU and an `InsertExecutedBlock`, both queued behind the same engine loop that serves the validators' imports. The seal (47 ms) and the vote road (check-before-slot, 0.15 ms) are no longer the limit. Instrumentation added in 5d51ac7f0: per-message timing of the engine loop (target `n42.engine.loop`: `engine loop message` with kind / `took_ms` / `idle_before_ms` at or above `N42_ENGINE_LOOP_TRACE_MS` (5); `engine loop summary` every 5 s with per-kind count, total, max and busy / idle percent; kinds `orchestrator` (FCU + newPayload), `built_payloads`, `executed_insert`), `insert_wait_ms` on the hand-off line and `head_number` on the head-move line. Stage h (three slots without check-before-slot, plus the S1 legs without K8) and stage j (the reference and the K8 sets at 45 and 40 ms, with the timing) are queued. The next cut is decided from the engine-loop summary; the candidates are the head-move FCU and the insert sharing one serial loop: skip the head-move when the parent is already the head or about to be, make the insert not wait for the loop, or move own-block landing off the orchestrator's loop.
 
 Hand-off files: `target/fleet-runs/loop351{f,i}.out` (g and h: `nothing run`; j queued; i incomplete at writing); kept legs under `/data/blockchain/rust-fleet7-bench/bench-loop351{D2S12F2P45T64,D2S12F2P40T64,D2S12F2P35T64,D2S12F2P45T64b,D2S12F2P40T64b,D2S12F2P35T64b,D2S12F6I3K8P45T64,D2S12F6I3K8P40T64}/`.
+
+### 10.100 loop351 stages j-m — the landing path cut four times (head-move FCU, rename lock, body clone, canonical notification): the own block lands in ~6 ms and commits in 0.01 ms, 3.34M at 45 ms (a 200k record at E=1), and the chain moves to the transaction queue's lock (94% duty)
+
+Section 10.99 ended with the chain paced by the layer's landing pipeline. This section records stages j (timing of the engine loop and of the hand-off's own steps), k (X3: the first three cuts), l (X4: the moved body) and m (X5: the lean canonical notification) of loop351. Notation as in 10.99 (200k transfers a block, 7 keys on one execution layer, T64, D2, S2 = `N42_LEADER_LAYERS=6`; S12F6I3K8 = check-before-slot + far-ahead 6 + 3 import slots + `N42_BUILT_KEEP=8`; X3 / X4 / X5 = the cumulative switch sets below; a trailing `b` is the repeat leg). Stage m was still running at writing: its pacing-40 leg had finished its round but was not summarised, and the 35 ms and `b` legs had not started (pending).
+
+Switches (all default off, bench only; worktree wt-handoff):
+- X3: `N42_QMDB_RENAME_DEFER=1` (abb2fc543: the rename is queued when the QMDB forest lock is held and applied by the next taker), `N42_HANDOFF_HEAD_MOVE=number` (7872cbfa5: move the head only when the engine head's number is at or above the block's), `N42_HANDOFF_NO_CLONE=1` (16f0fd82e: the sealed store shares the handed `Arc`).
+- X4 adds `N42_HANDOFF_MOVE_BODY=1` (aa96dfcb7, b43089d6b: `reseal_moving` swaps every store slot, moves the body under the sealed header and puts one new `Arc` back; moved on 80% of hand-offs, the other 20% still have an outside holder).
+- X5 adds `N42_CANON_NOTIFY_LEAN=1` (95afc8f98 vendors reth-chain-state v2.7.0 into `crates/chain-state`; eb6200564: `blocks_to_chain` builds the `Chain` with an empty `ExecutionOutcome` instead of deep-cloning 200k receipts and a ~190k-account bundle per block; bench-only: the pool's sender state and the logs subscriptions go stale; d0daacc16 docs).
+
+All windows are 30 s of canonical blocks; w1/w2/w3 in M tx/s. "Lock duty" is the transaction queue's lock, window 1. "Directly imported" is the summary's "built here N; also directly imported", none unless stated.
+
+| leg | stage | pacing | w1 | w2 | w3 | round total (M tx) | sealed_at median ms (w1) | cycle ms (w1) | lock duty w1 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| WARM | j | 60 | 3.186 | 3.120 | 3.153 | 283.8 | 48 | 63 | 55.0% |
+| D2S2P45T64 | j | 45 | 3.151 | 3.127 | 3.093 | 281.1 | 34 | 62 | 57.0% |
+| D2S2P45T64b | j | 45 | 3.233 | 3.173 | 3.100 | 285.2 | 34 | 61 | 60.0% (1 block imported twice) |
+| D2S12F6I3K8P45T64 | j | 45 | 2.731 | 2.813 | 2.920 | 253.9 | 43 | 72 | 52.0% |
+| D2S12F6I3K8P40T64 | j | 40 | 2.873 | 2.893 | 2.733 | 255.0 | 46 | 65 | 56.0% |
+| D2S2I3K8P45T64 | j | 45 | 2.899 | 2.973 | 2.873 | 262.4 | 39 | 67 | 52.5% |
+| D2S2I3K8P40T64 | j | 40 | 2.900 | 3.093 | 2.913 | 267.2 | 39 | 65 | 51.0% |
+| WARM | k | 60 | 3.253 | 3.167 | 3.073 | 284.8 | 47 | 62 | 55.5% |
+| D2S2P45T64X3 | k | 45 | 3.260 | 3.007 | 3.040 | 279.2 | 38 | 60 | 62.0% |
+| D2S2P40T64X3 | k | 40 | 3.160 | 2.980 | 3.160 | 279.0 | 37 | 62 | 55.5% |
+| D2S12F6I3K8P45T64X3 | k | 45 | 3.213 | 3.100 | 2.987 | 279.0 | 46 | 61 | 62.5% |
+| D2S12F6I3K8P40T64X3 | k | 40 | 3.113 | 2.993 | 3.147 | 277.6 | 45 | 57 | 62.0% |
+| D2S2P45T64X3b | k | 45 | 3.193 | 2.987 | 3.047 | 276.8 | 35 | 63 | 56.0% |
+| D2S2P40T64X3b | k | 40 | 3.257 | 3.260 | 3.113 | 288.9 | 36 | 61 | 57.0% |
+| WARM | l | 60 | 3.133 | 3.200 | 3.153 | 284.6 | 49 | 64 | 52.5% |
+| D2S2P45T64X4 | l | 45 | 3.193 | 3.213 | 3.113 | 285.6 | 35 | 61 | 58.0% |
+| D2S2P40T64X4 | l | 40 | 3.213 | 3.167 | 3.153 | 286.0 | 35 | 61 | 60.0% |
+| D2S12F6I3K8P45T64X4 | l | 45 | 3.132 | 2.993 | 3.140 | 277.9 | 44 | 64 | 63.5% |
+| D2S12F6I3K8P40T64X4 | l | 40 | 3.100 | 3.180 | 2.980 | 277.8 | 45 | 64 | 60.5% |
+| D2S2P45T64X4b | l | 45 | 3.293 | 3.120 | 3.033 | 283.4 | 36 | 61 | 56.5% |
+| D2S2P40T64X4b | l | 40 | 3.232 | 3.160 | 3.047 | 283.2 | 35 | 59 | 55.5% |
+| WARM | m | 60 | 3.160 | 2.142 | 1.054 | 190.7 | 47 | 63 | 57.5% (flood fed 67% / 33% of the tier in w2 / w3: a feed fault, not a chain result) |
+| D2S12F6I3K8P45T64X5 | m | 45 | **3.346** | 3.447 | 2.720 | 285.4 | 48 | 60 | 94.0% |
+| D2S12F6I3K8P40T64X5 | m | 40 | pending | pending | pending | pending | pending | pending | pending |
+| D2S12F6I3K8P35T64X5 | m | 35 | pending | pending | pending | pending | pending | pending | pending |
+| D2S12F6I3K8P45T64X5b, P40b, P35b | m | | pending | pending | pending | pending | pending | pending | pending |
+
+Every j, k and l leg is clean (no invalid block, gas or field mismatch, `proposals_given_up` 0). The k and l legs show `tc` 0-1. Stage m's P45 leg is clean as well (`invalid_blocks` 0, `fields_mismatches` 0, one TC formed at the view-1024 handover: a 3.1 s proposal interval).
+
+**Findings (loop351 analysis):**
+- **Stage j: the engine loop is not the wait.** The consensus-engine tokio loop is a dispatcher (100% idle, about 950 messages / 5 s, 1 ms total). The waits are in the hand-off's own steps. Attribution on D2S2P45T64 (3823 hand-offs): `clone_ms` 36-38 ms on the 37% of hand-offs that are slow (mean 14.4): `Arc::try_unwrap` fails while the handed store still holds the build, and the 200k-transaction body plus senders are deep-copied under the sealed header. `rename_wait_ms` mean 2.7 (the QMDB forest lock, held by `compute_operations` for about 30 ms). `insert_wait_ms` about 0 (the engine insert is a channel send, 25 us on the tree thread). The head-move FCU before the hand-off: Valid 41 ms mean (610 of them), Syncing 10 ms (761); on the S1+K8 leg Syncing 67 ms (987) and Valid 129 ms (328), about 31 ms a block.
+- **K8 alone costs the no-S1 set about 10%** (2.89 against 3.17M): the store holds the `Arc` longer, so every hand-off clones. Three slots without S1 gave 3.17M at both 45 and 40 ms (no gain from the pacing). S1+F6 without K8 is unstable (stage h: tc 8, proposals given up 7, BODYGATE stop).
+- **Stage k (X3): the S1+K8 set recovers.** 3.21M at 45 and 3.11M at 40 (w1), up from 2.90 / 2.74 in 10.99. Hand-off total mean 18.6 to 5.8 ms; rename wait 0 (920 deferred); head-moves 0; clone 4.7 ms. The D2S2 legs read 3.25 / 3.19 at 45 and 3.16 / 3.26 at 40 (first leg / `b`).
+- **Stage l (X4): the moved body** reads 3.19 / 3.21 (45 / 40), 3.13 / 3.10 (S1+K8), 3.29 / 3.23 (`b`): `moved_body` on 4310 of 5363 hand-offs, clone 4.4 ms mean (the 20% with an outside holder still clone). Within the 10% noise of stage k: the hand-off was no longer the cycle.
+- **What bound after X3/X4 (cycle still 61-64 ms).** The tree thread spent 59% of its time in `on_canonical_chain_update`: `Canonical chain committed` elapsed median 27.9 ms, p90 146, sum 17.8 s of 30 s (23 ms per block canonicalised, 94 for a 2-block step, 152 for 3). The builder's anchor wait ended at that commit (cadence 76 ms).
+- **Stage m (X5): the commit disappears.** Canonical commit 0.01 ms (sum 0.1 s); the anchor waits are gone (grandparent 1-3 a window). D2S12F6I3K8P45T64X5 reads **3.346M in window 1, cycle 60 ms (54.0 mean), 100.2M transactions** (the layer's own count: 3.340M, 501 blocks), the best 200k-block window at E=1 so far; window 2 reads 3.447M (103.4M tx, cycle 58 ms). Window 3 falls to 2.720M and the round total (285.4M) is the same as the reference legs' 277-289M: sealed_at climbs 48 / 53 / 68 ms and `parent_fields` 0 / 0 / 12 ms across the windows, persistence at window 3 totals 68.5 ms a block (QMDB 64.2, scope 65.5) against 33-41 at stage l, with 17 blocks in memory at the sampler's peak. The window-1 record therefore does not yet hold for a round.
+- **sealed_at stays high (window medians 48 / 53 / 68 ms)** because `par_start` grew from 7 to 19 / 28 / 26 ms (p90 56 / 58 / 50), the parent's queue hand-off wait (`start_handoff_ms` 11 / 34) plus the select (`start_select_ms` 9 / 28), both on the transaction queue's single lock: **lock duty 94.0% (X4: 63%)**, lock wait 10.1 s per 5 s, longest hold median 56 ms by `crates/n42/tx-queue/src/lib.rs:2576` (`frames_for_build_ahead`; plan-ahead prepare 17 ms median, 35 p90). Pruning costs 43-73 ms a block (remove hold 8.7-13.5 ms, the pruner 78-83% of a thread). The QMDB forest lock waits rose 1.75 times (on_canonical / on_persisted / root_of) with the denser events.
+- **Proposal-to-quorum at stage m:** median 6.8, p90 7.8, max 29.9 ms (X4: p90 58-61, max 166), so the vote road and landing are no longer in the cycle; the cycle is the seal.
+
+**What binds, and what is next.** At E=1 the own block now lands in about 6 ms (hand-off total mean 5.8 ms) and commits in 0.01 ms; the chain's binding resource is the transaction queue's single lock (94% duty): the plan-ahead prepare at `lib.rs:2576`, the select and the prunes all hold it for tens of milliseconds, and `par_start` (19-28 ms) is where the seal waits. Next, `N42_QUEUE_OFFLOCK` (Opus, in progress): plan-ahead prepare from a snapshot and batched prunes with short holds. Targets: lock duty below 40%, longest hold below 5 ms, `par_start` about 5 ms. The cycle should then follow the 45 / 40 ms tick: 3.34M at the 60 ms cycle is about 4.4M at 45 and 5M at 40. Stage m's pacing-40 and 35 ms legs and the three `b` legs are pending; the window-3 slowdown (persistence 68 ms a block) needs its own look once they land.
+
+Hand-off files: `target/fleet-runs/loop351{j,k,l,m}.out` (m incomplete at writing: P40 round done but not summarised, P35 and the `b` legs pending); kept legs under `/data/blockchain/rust-fleet7-bench/bench-loop351{D2S2P45T64,D2S2P45T64b,D2S12F6I3K8P45T64,D2S12F6I3K8P40T64,D2S2I3K8P45T64,D2S2I3K8P40T64,D2S2P45T64X3,D2S2P40T64X3,D2S2P45T64X3b,D2S2P40T64X3b,D2S12F6I3K8P45T64X3,D2S12F6I3K8P40T64X3,D2S2P45T64X4,D2S2P40T64X4,D2S2P45T64X4b,D2S2P40T64X4b,D2S12F6I3K8P45T64X4,D2S12F6I3K8P40T64X4,D2S12F6I3K8P45T64X5,D2S12F6I3K8P40T64X5}/`.

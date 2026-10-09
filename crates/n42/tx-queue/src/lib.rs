@@ -2454,6 +2454,15 @@ impl<T: PoolTransaction> TxQueue<T> {
             *entry = (*entry).max(nonce);
         }
         times.fold_us = at.elapsed().as_micros() as u64;
+        if self.offlock() {
+            let Some((all, build)) = self.take_out_taken(parent, &mut times) else { return (Vec::new(), times) };
+            let at = std::time::Instant::now();
+            let (mined, kept): (Vec<_>, Vec<_>) =
+                all.into_iter().partition(|t| highest.get(&t.sender()).is_some_and(|nonce| t.nonce() <= *nonce));
+            times.partition_us = at.elapsed().as_micros() as u64;
+            self.put_back_kept(parent, build, kept, !mined.is_empty(), &mut times);
+            return (mined, times);
+        }
         let at = std::time::Instant::now();
         let mut inner = self.lock_inner();
         times.lock_us += at.elapsed().as_micros() as u64;
@@ -2505,6 +2514,9 @@ impl<T: PoolTransaction> TxQueue<T> {
             return self.forget_mined_timed(parent, (0..len).map(&mined_at));
         };
         let mut times = ForgetTimes::default();
+        if self.offlock() {
+            return self.forget_mined_parallel_offlock(pool, parent, len, mined_at, times);
+        }
         {
             let at = std::time::Instant::now();
             let mut inner = self.lock_inner();
@@ -2580,6 +2592,122 @@ impl<T: PoolTransaction> TxQueue<T> {
         }
         times.partition_us = at.elapsed().as_micros() as u64;
         (mined, times)
+    }
+
+    /// [`Self::forget_mined_parallel`] with the taken list out of the lanes'
+    /// lock while it is compared and partitioned (`N42_QUEUE_OFFLOCK`): one
+    /// short hold takes it out ([`Self::take_out_taken`]), the comparison
+    /// with the body, the fold and the partition run on the queue's pool
+    /// with no lock held, and a second short hold puts the kept part back
+    /// ([`Self::put_back_kept`]). The result is the one-hold path's.
+    fn forget_mined_parallel_offlock<F>(
+        &self,
+        pool: &rayon::ThreadPool,
+        parent: B256,
+        len: usize,
+        mined_at: F,
+        mut times: ForgetTimes,
+    ) -> (Vec<Arc<ValidPoolTransaction<T>>>, ForgetTimes)
+    where
+        T: Send + Sync,
+        F: Fn(usize) -> (Address, u64) + Sync + Send,
+    {
+        use rayon::prelude::*;
+        let Some((all, build)) = self.take_out_taken(parent, &mut times) else { return (Vec::new(), times) };
+        times.taken_len = all.len();
+        times.first_miss = usize::MAX;
+        if all.len() == len {
+            let at = std::time::Instant::now();
+            let list: &[Arc<ValidPoolTransaction<T>>] = &all;
+            let miss = pool.install(|| {
+                list.par_iter().with_min_len(1024).enumerate().position_first(|(i, t)| mined_at(i) != (t.sender(), t.nonce()))
+            });
+            times.partition_us = at.elapsed().as_micros() as u64;
+            times.first_miss = miss.unwrap_or(usize::MAX);
+            if miss.is_none() {
+                times.whole = true;
+                self.put_back_kept(parent, build, Vec::new(), true, &mut times);
+                return (all, times);
+            }
+        }
+        let at = std::time::Instant::now();
+        let fold_one = |mut highest: AddressHashMap<u64>, (sender, nonce): (Address, u64)| {
+            let entry = highest.entry(sender).or_insert(nonce);
+            *entry = (*entry).max(nonce);
+            highest
+        };
+        let highest: AddressHashMap<u64> = pool.install(|| {
+            (0..len).into_par_iter().map(&mined_at).fold(AddressHashMap::default, fold_one).reduce(
+                AddressHashMap::default,
+                |a, b| {
+                    let (big, small) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+                    small.into_iter().fold(big, fold_one)
+                },
+            )
+        });
+        times.fold_us = at.elapsed().as_micros() as u64;
+        let at = std::time::Instant::now();
+        let (mined, kept): (Vec<_>, Vec<_>) = pool.install(|| {
+            all.into_par_iter().partition(|t| highest.get(&t.sender()).is_some_and(|nonce| t.nonce() <= *nonce))
+        });
+        times.partition_us = at.elapsed().as_micros() as u64;
+        self.put_back_kept(parent, build, kept, !mined.is_empty(), &mut times);
+        (mined, times)
+    }
+
+    /// The first hold of an off-lock hand-off: the build on `parent`'s
+    /// taken list, taken out whole, with the build counter it belongs to;
+    /// `None` when the last build is not on `parent` or took nothing.
+    fn take_out_taken(&self, parent: B256, times: &mut ForgetTimes) -> Option<(Vec<Arc<ValidPoolTransaction<T>>>, u64)> {
+        let at = std::time::Instant::now();
+        let mut inner = self.lock_inner_quiet();
+        times.lock_us += at.elapsed().as_micros() as u64;
+        let build = inner.builds;
+        let (built_on, taken) = inner.last_build.as_mut()?;
+        if *built_on != parent || taken.is_empty() {
+            return None;
+        }
+        Some((std::mem::take(taken), build))
+    }
+
+    /// The second hold of an off-lock hand-off: what the block did not
+    /// mine goes back to the front of the build's taken list (ahead of
+    /// anything a settle added meanwhile), and a whole take (`mined_any`
+    /// with nothing kept) marks the hand-off for a prepared plan -- if that
+    /// build is still the last one. If another build began in between, its
+    /// opening found the list empty, so the kept part is given back to the
+    /// lanes here, as that opening would have (minus what the chain has
+    /// mined meanwhile).
+    fn put_back_kept(
+        &self,
+        parent: B256,
+        build: u64,
+        kept: Vec<Arc<ValidPoolTransaction<T>>>,
+        mined_any: bool,
+        times: &mut ForgetTimes,
+    ) {
+        let at = std::time::Instant::now();
+        let mut inner = self.lock_inner_quiet();
+        times.lock_us += at.elapsed().as_micros() as u64;
+        let whole = kept.is_empty() && mined_any;
+        let current = inner.builds == build;
+        match inner.last_build.as_mut() {
+            Some((built_on, taken)) if current && *built_on == parent => {
+                if !kept.is_empty() {
+                    let added = std::mem::replace(taken, kept);
+                    taken.extend(added);
+                }
+                if whole {
+                    inner.handed = Some(Handed { build, block: None });
+                }
+            }
+            _ => {
+                if !kept.is_empty() {
+                    inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+                    inner.give_back(kept);
+                }
+            }
+        }
     }
 
     /// Moves what the inbox holds into the lanes now. The builder does this

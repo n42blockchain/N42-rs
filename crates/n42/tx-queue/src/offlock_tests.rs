@@ -371,3 +371,70 @@ fn a_batched_prune_racing_builds_and_drains_loses_nothing() {
         assert_eq!(txs.len() + offered.len() + queue.len() + foreign_unseen, 600 * 5, "round {round}");
     }
 }
+
+/// The hand-off's forget with the taken list out of the lock is the
+/// one-hold forget: the same mined transactions in the same order, the same
+/// kept list, the same hand-off mark, for a whole take and a part of one,
+/// through the parallel and the serial door.
+#[test]
+fn the_offlock_hand_off_is_the_one_hold_hand_off() {
+    let gas = 1_000 * 21_000;
+    for (parallel, part) in [(true, false), (true, true), (false, false), (false, true)] {
+        let mut outcomes = Vec::new();
+        for offlock in [false, true] {
+            let queue = queue(offlock);
+            flood(&queue, 400, 0, 4, 50);
+            let p0 = block_hash(0);
+            let (mut best, _, _) = queue.frames_for_build_ahead(p0, gas, SelectMode::Parallel, false);
+            let took: Vec<Tx> = best.by_ref().collect();
+            drop(best);
+            let body = if part { pairs(&took[..took.len() / 2]) } else { pairs(&took) };
+            let (mined, times) = if parallel {
+                queue.forget_mined_parallel(p0, body.len(), |i| body[i])
+            } else {
+                queue.forget_mined_timed(p0, body.iter().copied())
+            };
+            assert_eq!(times.whole, parallel && !part);
+            assert_counts(&queue);
+            let handed = queue.lock_inner_quiet().handed;
+            outcomes.push((pairs(&mined), state(&queue), handed));
+        }
+        assert_eq!(outcomes[0], outcomes[1], "parallel {parallel} part {part}");
+    }
+}
+
+/// A build that begins between the hand-off's two holds finds the taken
+/// list empty; the second hold gives the kept part back to the lanes, as
+/// that build's opening would have, and the next build is offered it first.
+#[test]
+fn a_build_between_the_hand_off_holds_gets_the_kept_part_back() {
+    let gas = 1_000 * 21_000;
+    let queue = queue(true);
+    flood(&queue, 400, 0, 4, 50);
+    let p0 = block_hash(0);
+    let (mut best, _, _) = queue.frames_for_build_ahead(p0, gas, SelectMode::Parallel, false);
+    let took: Vec<Tx> = best.by_ref().collect();
+    drop(best);
+    let mut times = ForgetTimes::default();
+    let (all, build) = queue.take_out_taken(p0, &mut times).expect("the build's take");
+    assert_eq!(all.len(), took.len());
+    // Another build begins (on another parent) while the list is out.
+    let (best, _, _) = queue.frames_for_build_ahead(block_hash(7), gas, SelectMode::Parallel, false);
+    let walked: Vec<Tx> = best.collect();
+    let (mined, kept) = all.split_at(all.len() / 2);
+    queue.put_back_kept(p0, build, kept.to_vec(), true, &mut times);
+    assert_counts(&queue);
+    // The mined half is forgotten; the kept half is queued again and the
+    // next build on a new parent is offered it before anything newer.
+    let (mut best, _, _) = queue.frames_for_build_ahead(block_hash(8), 50 * 21_000, SelectMode::Parallel, false);
+    let next: Vec<Tx> = best.by_ref().collect();
+    drop(best);
+    let kept_set: HashSet<(Address, u64)> = pairs(kept).into_iter().collect();
+    let mined_set: HashSet<(Address, u64)> = pairs(mined).into_iter().collect();
+    assert!(!walked.is_empty());
+    assert!(next.iter().all(|t| !mined_set.contains(&(t.sender(), t.nonce()))));
+    assert!(next.iter().any(|t| kept_set.contains(&(t.sender(), t.nonce()))), "the kept part is offered again");
+    // Build 8's opening gave build 7's take back too: the queue, build 8's
+    // take and the mined half are everything.
+    assert_eq!(queue.len() + next.len() + mined.len(), 1_600, "nothing lost");
+}

@@ -587,6 +587,119 @@ pub fn remember_sealed_shared(sealed_hash: B256, block: Arc<RecoveredBlock<Block
     keep_sealed(sealed_hash, transactions, SealedKept::Shared(block));
 }
 
+/// Parses `N42_HANDOFF_MOVE_BODY`: on only for `1`.
+fn handoff_move_body_from(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+/// Whether the own-block hand-off moves the build's body under the sealed
+/// header instead of copying it (`N42_HANDOFF_MOVE_BODY=1`, default off).
+///
+/// The hand-off needs the block under the header consensus sealed, and the
+/// body sits by value in a `RecoveredBlock`, so it can only be moved when the
+/// hand-off holds the block's last `Arc`. With the switch off the stores keep
+/// theirs (the build store entry and its execution, the handed list, a
+/// shared sealed block) and the 200k-transaction body and senders are cloned:
+/// `clone_ms` 36-38 ms on every slow hand-off (loop351 stage j). With it on,
+/// [`reseal_moving`] takes those `Arc`s out under the stores' locks, moves the
+/// body and senders under the sealed header, and puts the one new `Arc` back
+/// in every slot that held the build: the build hash then aliases the sealed
+/// block, so readers by the build's hash or by its fields find the same block
+/// (its header is the sealed one; every field they match on or compare is one
+/// a seal does not change). A holder outside the stores (a build on the
+/// sealed block reading it on a thread, a payload not yet dropped) makes the
+/// move fail; the body is then cloned as before and the hand-off line says
+/// `moved_body=false`.
+pub fn handoff_move_body_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| handoff_move_body_from(std::env::var("N42_HANDOFF_MOVE_BODY").ok().as_deref()))
+}
+
+/// The block under `sealed`, made by moving `block`'s body and senders when
+/// the stores' references to it are the only others (`Ok`), every store slot
+/// that held `block` then holding the returned `Arc`; `Err(block)` when a
+/// holder outside the stores keeps it alive, every slot left as it was.
+///
+/// A block already under the sealed hash (a second hand-off of the same
+/// block, which found the alias) is returned as it is.
+pub fn reseal_moving(
+    built_hash: B256,
+    block: Arc<RecoveredBlock<Block>>,
+    sealed: reth_primitives_traits::SealedHeader,
+) -> Result<Arc<RecoveredBlock<Block>>, Arc<RecoveredBlock<Block>>> {
+    if block.hash() == sealed.hash() {
+        return Ok(block);
+    }
+    // Lock order store -> handed -> sealed store; no other function holds
+    // two of these at once.
+    let (store, advanced) = store();
+    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+    let mut sealed_kept = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
+    let mut slots: Vec<&mut Arc<RecoveredBlock<Block>>> = Vec::new();
+    for (hash, entry) in store.iter_mut() {
+        if *hash != built_hash {
+            continue;
+        }
+        if Arc::ptr_eq(&entry.block, &block) {
+            slots.push(&mut entry.block);
+        }
+        if let Some(execution) = entry.execution.as_mut()
+            && Arc::ptr_eq(&execution.block, &block)
+        {
+            slots.push(&mut execution.block);
+        }
+    }
+    for (hash, built) in handed.iter_mut() {
+        if *hash == built_hash && Arc::ptr_eq(&built.block, &block) {
+            slots.push(&mut built.block);
+        }
+    }
+    for (_, kept) in sealed_kept.iter_mut() {
+        if let SealedKept::Shared(shared) = kept
+            && Arc::ptr_eq(shared, &block)
+        {
+            slots.push(shared);
+        }
+    }
+    // A stand-in while the block is out: cheap, and never seen outside the
+    // locks held here.
+    let stand_in = Arc::new(RecoveredBlock::new_sealed(SealedBlock::seal_slow(Block::default()), Vec::new()));
+    for slot in &mut slots {
+        drop(std::mem::replace(&mut **slot, Arc::clone(&stand_in)));
+    }
+    let result = match Arc::try_unwrap(block) {
+        Ok(owned) => {
+            let (built_block, senders) = owned.split_sealed();
+            let body = built_block.split_sealed_header_body().1;
+            Ok(Arc::new(RecoveredBlock::new_sealed(SealedBlock::from_sealed_parts(sealed, body), senders)))
+        }
+        Err(shared) => Err(shared),
+    };
+    let back = match &result {
+        Ok(moved) | Err(moved) => moved,
+    };
+    for slot in slots {
+        *slot = Arc::clone(back);
+    }
+    drop(sealed_kept);
+    drop(handed);
+    drop(store);
+    advanced.notify_all();
+    result
+}
+
+/// The block kept for the build `built_hash`, in the build store or on the
+/// handed list: after a [`reseal_moving`], the sealed block (the alias from
+/// the build hash).
+pub fn kept_block(built_hash: B256) -> Option<Arc<RecoveredBlock<Block>>> {
+    if let Some(entry) = store_get(built_hash) {
+        return Some(entry.block);
+    }
+    let handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+    handed.iter().rev().find(|(hash, _)| *hash == built_hash).map(|(_, built)| Arc::clone(&built.block))
+}
+
 fn keep_sealed(sealed_hash: B256, transactions: usize, block: SealedKept) {
     {
         let mut hints = sealed_hints().lock().unwrap_or_else(|p| p.into_inner());
@@ -690,6 +803,102 @@ mod tests {
         for off in [None, Some(""), Some("0"), Some("true")] {
             assert!(!handoff_no_clone_from(off), "{off:?}");
         }
+    }
+
+    #[test]
+    fn handoff_move_body_is_on_only_for_one() {
+        assert!(handoff_move_body_from(Some("1")));
+        for off in [None, Some(""), Some("0"), Some("true")] {
+            assert!(!handoff_move_body_from(off), "{off:?}");
+        }
+    }
+
+    fn sealed_of(built: &Header) -> reth_primitives_traits::SealedHeader {
+        reth_primitives_traits::SealedHeader::seal_slow(Header { extra_data: b"sealed".as_slice().into(), ..built.clone() })
+    }
+
+    /// A handed build whose block is moved under the sealed header: the
+    /// hand-off was the last holder outside the stores, so nothing is cloned;
+    /// the sealed block is found under the sealed hash and, through the
+    /// alias, under the build hash and by its fields.
+    #[test]
+    fn a_handed_build_is_resealed_by_move_and_found_both_ways() {
+        let _guard = lock();
+        let h = header(0x61, 610);
+        let execution = built(&h);
+        let built_hash = execution.block.hash();
+        remember(built_hash, execution);
+        let (hash, taken) = take(h.parent_hash, 610, h.state_root, h.receipts_root, h.gas_used, None).expect("taken");
+        assert_eq!(hash, built_hash);
+        let sealed = sealed_of(&h);
+        let sealed_hash = sealed.hash();
+        let moved = reseal_moving(built_hash, taken.block, sealed).expect("the stores were the only other holders");
+        assert_eq!(moved.hash(), sealed_hash);
+        assert_eq!(moved.body().transactions.len(), 0);
+        remember_sealed_shared(sealed_hash, Arc::clone(&moved));
+        assert_eq!(find_sealed(sealed_hash).map(|block| block.hash()), Some(sealed_hash));
+        let aliased = kept_block(built_hash).expect("the build hash aliases the sealed block");
+        assert!(Arc::ptr_eq(&aliased, &moved));
+        let (kept_hash, by_fields, execution) =
+            find_kept_sealed(h.parent_hash, 610, h.state_root, h.receipts_root, h.gas_used, None).expect("by fields");
+        assert_eq!(kept_hash, built_hash);
+        assert!(Arc::ptr_eq(&by_fields, &moved));
+        assert!(execution.is_some_and(|execution| Arc::ptr_eq(&execution.block, &moved)));
+        assert!(wait_for(built_hash, Stage::Complete).is_some_and(|execution| execution.block.hash() == sealed_hash));
+    }
+
+    /// A build kept in the store (a header-only import that leaves it for the
+    /// build on seal) is resealed in the store's entry, its block and its
+    /// execution both.
+    #[test]
+    fn a_stored_build_is_resealed_in_both_of_its_slots() {
+        let _guard = lock();
+        let h = header(0x62, 620);
+        let execution = built(&h);
+        let built_hash = execution.block.hash();
+        remember(built_hash, execution);
+        let (_, found) = find(h.parent_hash, 620, h.state_root, h.receipts_root, h.gas_used, None).expect("found");
+        let sealed = sealed_of(&h);
+        let moved = reseal_moving(built_hash, found.block, sealed.clone()).expect("moved");
+        let entry = store_get(built_hash).expect("still stored");
+        assert!(Arc::ptr_eq(&entry.block, &moved));
+        assert!(entry.execution.is_some_and(|execution| Arc::ptr_eq(&execution.block, &moved)));
+    }
+
+    /// A holder outside the stores keeps the block: nothing moves, every slot
+    /// keeps the build as it was, and the caller gets the block back to copy.
+    #[test]
+    fn a_block_held_elsewhere_is_not_moved() {
+        let _guard = lock();
+        let h = header(0x63, 630);
+        let execution = built(&h);
+        let built_hash = execution.block.hash();
+        remember(built_hash, execution);
+        let (_, taken) = take(h.parent_hash, 630, h.state_root, h.receipts_root, h.gas_used, None).expect("taken");
+        let elsewhere = Arc::clone(&taken.block);
+        let back = reseal_moving(built_hash, taken.block, sealed_of(&h)).expect_err("held elsewhere");
+        assert!(Arc::ptr_eq(&back, &elsewhere));
+        assert_eq!(back.hash(), built_hash);
+        assert!(kept_block(built_hash).is_some_and(|kept| Arc::ptr_eq(&kept, &elsewhere)));
+    }
+
+    /// A second hand-off of the same block finds the alias, already under the
+    /// sealed hash: returned as it is, without a panic or a copy.
+    #[test]
+    fn a_second_handoff_of_a_resealed_block_returns_it() {
+        let _guard = lock();
+        let h = header(0x64, 640);
+        let execution = built(&h);
+        let built_hash = execution.block.hash();
+        remember(built_hash, execution);
+        let (_, taken) = take(h.parent_hash, 640, h.state_root, h.receipts_root, h.gas_used, None).expect("taken");
+        let sealed = sealed_of(&h);
+        let moved = reseal_moving(built_hash, taken.block, sealed.clone()).expect("moved");
+        let (_, again) =
+            find_kept(h.parent_hash, 640, h.state_root, h.receipts_root, h.gas_used, None).expect("found by the alias");
+        let second = reseal_moving(built_hash, again.block, sealed.clone()).expect("already sealed");
+        assert!(Arc::ptr_eq(&second, &moved));
+        assert_eq!(second.hash(), sealed.hash());
     }
 
     /// A shared sealed block is found by copy while the engine holds it and

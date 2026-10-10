@@ -1119,3 +1119,80 @@ async fn a_vote_by_gossip_and_directly_reaches_the_engine_once() {
     assert_eq!(rig.svc.direct_votes.received, 1);
     assert_eq!(rig.svc.direct_votes.duplicates, 1, "the gossip copy is dropped before the engine");
 }
+
+/// `N42_CHECK_AHEAD_UNHELD`: with one import slot busy and the next block
+/// queued, the block after it is two past the tip. Off, it is held as far
+/// ahead (today's behaviour) and no check reaches the layer. On, the driver
+/// admits it (its parent is queued, the pipeline is under the cap plus the
+/// queue bound), so it is not held and its check-only request goes out at
+/// once; the block after that, past the bound, is still held.
+#[tokio::test]
+async fn check_ahead_unheld_hands_a_far_ahead_block_to_the_driver_up_to_the_queue_bound() {
+    for unheld in [false, true] {
+        let mut rig = node(1, 0, None).await;
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        rig.el.set_behaviour(MockBehaviour {
+            take_bodies: true,
+            body_gate: Some(std::sync::Arc::clone(&gate)),
+            check_only: Some(None),
+            ..Default::default()
+        });
+        rig.svc.driver.set_deferred_execution_time(Some(0));
+        rig.svc.driver.set_check_before_slot(true);
+        rig.svc.driver.set_deferred_in_flight(1).expect("cap");
+        rig.svc.driver.set_check_ahead_queue(2).expect("queue bound");
+        rig.svc.check_ahead_unheld = unheld;
+        rig.svc.note_imported(0);
+
+        let mut parent = ID.genesis_hash;
+        let mut hashes = Vec::new();
+        for number in 1..=4 {
+            let built = MockExecutionLayer::built_block_on(number, parent);
+            let header = built.execution_data.clone().into_block_raw().expect("raw block").header;
+            let rlp = n42_h2_net::encode_block_rlp_raw(&header, &[], &[], None);
+            rig.svc.remember_block(built.hash, &header);
+            rig.svc.driver.cache_payload(built.hash, built.execution_data.clone());
+            rig.svc.driver.cache_body(n42_h2_execution::ForeignBody {
+                block_hash: built.hash,
+                number,
+                timestamp: built.timestamp,
+                profile: n42_h2_consensus::N42HeaderProfile::Ethereum,
+                rlp: rlp.into(),
+                compact: false,
+            });
+            parent = built.hash;
+            hashes.push(built.hash);
+        }
+        let mut events = Vec::new();
+        for hash in &hashes {
+            within(rig.svc.handle_output(EngineOutput::ExecuteBlock(*hash), &mut events)).await.expect("ok");
+        }
+        // Block 1 imports, block 2 is queued and checked ahead: neither is far.
+        let checks = |el: &MockExecutionLayer| -> Vec<B256> {
+            el.calls().into_iter().filter_map(|call| match call { ElCall::CheckOnly(h) => Some(h), _ => None }).collect()
+        };
+        let want_checks = if unheld { vec![hashes[1], hashes[2]] } else { vec![hashes[1]] };
+        within(async {
+            while checks(&rig.el).len() < want_checks.len() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let mut seen = checks(&rig.el);
+        seen.sort();
+        let mut want = want_checks.clone();
+        want.sort();
+        assert_eq!(seen, want, "unheld={unheld}: the check-only requests");
+        if unheld {
+            assert_eq!(rig.svc.held_bodies, vec![hashes[3]], "only the block past the queue bound is held");
+            assert!(rig.svc.driver.is_importing(&hashes[2]), "block 3 is queued in the driver");
+        } else {
+            assert_eq!(rig.svc.held_bodies, vec![hashes[2], hashes[3]], "switch off: both far-ahead blocks held");
+        }
+        // The release filter decides the same way on the next drain.
+        within(rig.svc.drain_outputs(&mut events)).await.expect("drain");
+        let held = if unheld { vec![hashes[3]] } else { vec![hashes[2], hashes[3]] };
+        assert_eq!(rig.svc.held_bodies, held, "unheld={unheld}: unchanged by a drain");
+        gate.add_permits(16);
+    }
+}

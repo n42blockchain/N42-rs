@@ -23,7 +23,7 @@ pub mod raw_engine;
 pub mod settlement;
 
 pub use driver::{
-    answer_layout_only, body_once, commit_fcu_async, compact_body, deferred_in_flight, parse_in_flight, take_compact, vote_before_slot, BodyDecoder,
+    answer_layout_only, body_once, check_ahead_queue, parse_check_ahead_queue, CHECK_AHEAD_QUEUE, commit_fcu_async, compact_body, deferred_in_flight, parse_in_flight, take_compact, vote_before_slot, BodyDecoder,
     BuildTiming, CommitReport, DriverAction, ExecutionDriver, ImportReport, ImportVerdict, DEFERRED_IN_FLIGHT,
     DEFERRED_IN_FLIGHT_MAX, FOLLOWER_LAG_CAP, HELD_IMPORT_DROPPED,
 };

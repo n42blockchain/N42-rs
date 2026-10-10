@@ -402,6 +402,8 @@ pub struct H2Service<E> {
     /// no peers for and answers every forkchoice with SYNCING from then on.
     /// Re-examined as the pull moves the tip. Bounded.
     held_bodies: Vec<B256>,
+    /// `N42_CHECK_AHEAD_UNHELD` ([`check_ahead_unheld`]).
+    check_ahead_unheld: bool,
     /// The highest height each peer is known to be at, from its status and
     /// from the blocks it gossips or serves; what a catch-up consults.
     peer_heights: std::collections::HashMap<PeerId, u64>,
@@ -590,6 +592,20 @@ fn far_ahead_limit() -> u64 {
     *FAR_AHEAD_LIMIT
         .get_or_init(|| far_ahead_blocks_from(std::env::var("N42_FAR_AHEAD_BLOCKS").ok().as_deref()))
 }
+/// `N42_CHECK_AHEAD_UNHELD`, read once (off by default): a block that runs
+/// far ahead of the execution layer's tip but which the driver can queue and
+/// check ahead at once ([`ExecutionDriver::check_ahead_admits`]: under
+/// `N42_CHECK_BEFORE_SLOT`, with its body, its parent already in the driver's
+/// pipeline, and the pipeline under the in-flight cap plus
+/// `N42_CHECK_AHEAD_QUEUE`) is handed to the driver instead of being held,
+/// so its vote goes out on the check rather than after its grandparent lands
+/// (loop351: 67% of views held with lead 2, voted 30 ms after the proposal
+/// instead of 2.4 ms). A block the driver refuses is held as before.
+fn check_ahead_unheld() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_CHECK_AHEAD_UNHELD").is_ok_and(|v| v == "1"))
+}
+
 /// Bodies held back at most; the oldest go first.
 /// How many gossiped transactions go to the forwarder in one handoff.
 const TX_FORWARD_MAX: usize = 1000;
@@ -1191,6 +1207,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             silent_keys: SilentKeys::default(),
             silent_checked_view: None,
             held_bodies: Vec::new(),
+            check_ahead_unheld: check_ahead_unheld(),
             held_since: std::collections::HashMap::new(),
             held_warned: HashSet::new(),
             last_held_log: None,
@@ -2431,7 +2448,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         // way.
         self.refresh_layer_for_held().await;
         for block_hash in std::mem::take(&mut self.held_bodies) {
-            if self.far_ahead(block_hash) {
+            if self.holds_far_ahead(block_hash) {
                 self.held_bodies.push(block_hash);
                 self.say_held(block_hash);
             } else {
@@ -2524,7 +2541,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             return Ok(());
         }
         if let EngineOutput::ExecuteBlock(block_hash) = &output
-            && (self.far_ahead(*block_hash))
+            && self.holds_far_ahead(*block_hash)
         {
             if !self.held_bodies.contains(block_hash) {
                 if self.held_bodies.len() >= MAX_HELD_BODIES {
@@ -3849,6 +3866,16 @@ impl<E: ExecutionLayer> H2Service<E> {
             (Some(header), Some(tip)) => runs_far_ahead(header.number, tip),
             _ => false,
         }
+    }
+
+    /// The hold decision: whether a block is held back from the driver.
+    /// [`Self::far_ahead`], unless `N42_CHECK_AHEAD_UNHELD` is on and the
+    /// driver admits the block to its queue for a check ahead of the slot
+    /// ([`ExecutionDriver::check_ahead_admits`]); a block the driver refuses
+    /// (no body, no check-ahead, parent not in its pipeline, or the pipeline
+    /// at its cap) is held as before.
+    fn holds_far_ahead(&self, block_hash: B256) -> bool {
+        self.far_ahead(block_hash) && !(self.check_ahead_unheld && self.driver.check_ahead_admits(&block_hash))
     }
 
     /// Once a block has been held past [`HELD_TOO_LONG`], reads the layer's

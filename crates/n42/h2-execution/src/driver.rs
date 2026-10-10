@@ -188,6 +188,32 @@ pub fn check_before_slot() -> bool {
     *ON.get_or_init(|| std::env::var("N42_CHECK_BEFORE_SLOT").is_ok_and(|v| v == "1"))
 }
 
+/// Blocks a check-ahead may queue past the in-flight cap before the service's
+/// far-ahead hold applies again (`N42_CHECK_AHEAD_QUEUE`, see
+/// [`ExecutionDriver::check_ahead_admits`]).
+pub const CHECK_AHEAD_QUEUE: usize = 2;
+
+/// Parses `N42_CHECK_AHEAD_QUEUE`: a count in `0..=8`.
+pub fn parse_check_ahead_queue(raw: &str) -> Result<usize, String> {
+    let n: usize = raw.trim().parse().map_err(|_| format!("{raw:?} is not a count"))?;
+    if n <= 8 { Ok(n) } else { Err(format!("{n} is outside 0..=8")) }
+}
+
+/// `N42_CHECK_AHEAD_QUEUE`, read once (default [`CHECK_AHEAD_QUEUE`]): under
+/// the service's `N42_CHECK_AHEAD_UNHELD=1`, how many blocks may wait in the
+/// import queue beside a full set of in-flight imports and still be handed
+/// to the driver (and checked ahead) instead of being held as far ahead.
+pub fn check_ahead_queue() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("N42_CHECK_AHEAD_QUEUE") {
+        Err(_) => CHECK_AHEAD_QUEUE,
+        Ok(raw) => parse_check_ahead_queue(&raw).unwrap_or_else(|err| {
+            warn!(target: "n42.h2.el", %err, default = CHECK_AHEAD_QUEUE, "N42_CHECK_AHEAD_QUEUE refused");
+            CHECK_AHEAD_QUEUE
+        }),
+    })
+}
+
 /// How many released checks the driver remembers, so a block checked ahead
 /// of its slot does not release its vote a second time when its import's own
 /// check arrives.
@@ -696,6 +722,9 @@ pub struct ExecutionDriver<E> {
     vote_before_slot: bool,
     /// `N42_CHECK_BEFORE_SLOT` ([`check_before_slot`]).
     check_before_slot: bool,
+    /// Blocks the check-ahead may queue past the in-flight cap
+    /// ([`check_ahead_queue`]).
+    check_ahead_queue: usize,
     /// Blocks whose check has released a vote, newest last, bounded
     /// ([`RELEASED_CHECKS_KEPT`]): under [`Self::check_before_slot`] a block
     /// checked ahead of its slot is checked again by its import, and that
@@ -973,6 +1002,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             in_flight_cap: deferred_in_flight(),
             vote_before_slot: vote_before_slot(),
             check_before_slot: check_before_slot(),
+            check_ahead_queue: check_ahead_queue(),
             released_checks: std::collections::VecDeque::new(),
             check_ahead: std::sync::Arc::default(),
             held: HashMap::new(),
@@ -1943,6 +1973,44 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// ([`ExecutionLayer::checks_only`]) and the block came as a body.
     pub fn set_check_before_slot(&mut self, on: bool) {
         self.check_before_slot = on;
+    }
+
+    /// The check-ahead queue bound (see [`check_ahead_queue`], whose value is
+    /// the default): how a test picks it without the process environment.
+    pub fn set_check_ahead_queue(&mut self, n: usize) -> Result<(), String> {
+        self.check_ahead_queue = parse_check_ahead_queue(&n.to_string())?;
+        Ok(())
+    }
+
+    /// Whether a block the service would hold as far ahead of the execution
+    /// layer can instead be handed to this driver, queued and checked ahead
+    /// at once (the service's `N42_CHECK_AHEAD_UNHELD=1`).
+    ///
+    /// Yes only when the check-ahead would run for it: `N42_CHECK_BEFORE_SLOT`
+    /// is on, the layer answers check-only requests, the block came as a body
+    /// and is under deferred execution. And only for a block whose parent is
+    /// already in this driver's pipeline (importing or queued), so no block is
+    /// sent whose parent the layer has not been given; a block already in the
+    /// pipeline is admitted as is. Bounded: the pipeline (imports in flight plus
+    /// queued) holds at most the in-flight cap plus [`check_ahead_queue`]
+    /// blocks; one arriving past that is refused, and the service holds it as
+    /// before, so a lagging layer still throttles the leader.
+    pub fn check_ahead_admits(&self, block_hash: &B256) -> bool {
+        if !self.check_before_slot || !self.el.checks_only() {
+            return false;
+        }
+        let Some(body) = self.bodies.get(block_hash) else { return false };
+        if !self.deferred_at(body.timestamp) {
+            return false;
+        }
+        if self.is_importing(block_hash) {
+            return true;
+        }
+        let Some(parent) = self.parent_of(block_hash) else { return false };
+        if !self.is_importing(&parent) {
+            return false;
+        }
+        self.executing.len() + self.import_queue.len() < self.in_flight_cap + self.check_ahead_queue
     }
 
     /// The check-ahead counts since start: (sent, vouched for, declined).

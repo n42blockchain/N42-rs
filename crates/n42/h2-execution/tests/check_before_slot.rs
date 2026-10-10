@@ -235,3 +235,46 @@ async fn without_the_switch_or_the_layer_or_the_header_nothing_is_asked() {
         assert_eq!(voted, vec![blocks[2].hash], "case {case}: voted on its import's check");
     }
 }
+
+/// The service's far-ahead admission (`N42_CHECK_AHEAD_UNHELD`): with both
+/// slots busy, a block whose parent is in the pipeline is admitted while the
+/// pipeline (in flight plus queued) is under the cap plus the queue bound,
+/// and once handed over it is checked ahead and voted for at once; past the
+/// bound it is refused (the service holds it). Without the switch, without a
+/// body, or with a parent outside the pipeline, nothing is admitted.
+#[tokio::test]
+async fn check_ahead_admits_a_block_two_ahead_up_to_the_queue_bound() {
+    let blocks = chain(6);
+    let (el, gate) = gated(Some(None));
+    let (mut driver, mut rx) = driver(&el, true);
+    driver.set_deferred_in_flight(2).expect("cap");
+    driver.set_check_ahead_queue(2).expect("bound");
+    for block in &blocks[..2] {
+        arrive(&mut driver, block, body_of(block)).await;
+    }
+    let mut voted = take_votes(&mut driver, &mut rx, 2).await;
+    assert!(!driver.check_ahead_admits(&blocks[2].hash), "no body yet");
+    // Blocks 3 and 4: slots full, parent in the pipeline, under 2 + 2.
+    for block in &blocks[2..4] {
+        driver.cache_body(body_of(block));
+        assert!(driver.check_ahead_admits(&block.hash), "admitted: {}", block.number);
+        arrive(&mut driver, block, body_of(block)).await;
+        voted.extend(take_votes(&mut driver, &mut rx, 1).await);
+        assert!(driver.check_ahead_admits(&block.hash), "a block in the pipeline stays admitted");
+    }
+    assert_eq!(&voted[2..], &[blocks[2].hash, blocks[3].hash], "checked ahead and voted at once");
+    // Block 5: the pipeline holds 2 + 2.
+    driver.cache_body(body_of(&blocks[4]));
+    assert!(!driver.check_ahead_admits(&blocks[4].hash), "past the queue bound");
+    // Block 6: its parent is not in the pipeline.
+    driver.cache_body(body_of(&blocks[5]));
+    assert!(!driver.check_ahead_admits(&blocks[5].hash), "a gap is never admitted");
+    driver.set_check_ahead_queue(4).expect("bound");
+    assert!(driver.check_ahead_admits(&blocks[4].hash), "a wider bound admits it");
+    driver.set_check_before_slot(false);
+    assert!(!driver.check_ahead_admits(&blocks[4].hash), "without the check-ahead, nothing is admitted");
+    driver.set_check_before_slot(true);
+    let (more_votes, imported) = land_all(&mut driver, &mut rx, &gate, 4).await;
+    assert!(more_votes.is_empty(), "{more_votes:?}");
+    assert_eq!(imported.len(), 4);
+}

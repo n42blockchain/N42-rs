@@ -81,8 +81,8 @@ fn a_vote_logged_after_the_last_checkpoint_still_binds_the_restarted_node() {
 
     // Signed view 11, then the process died before checkpointing.
     let log = store.vote_log().expect("log");
-    log.record_vote(11).expect("record");
-    log.record_commit_vote(11).expect("record");
+    log.record_vote(11, &QuorumCertificate::genesis()).expect("record");
+    log.record_commit_vote(11, &QuorumCertificate::genesis()).expect("record");
 
     let recovered = ConsensusStore::open(&dir.0)
         .expect("reopen")
@@ -104,13 +104,13 @@ fn the_vote_watermark_only_moves_forward() {
     let store = ConsensusStore::open(&dir.0).expect("open");
     let log = store.vote_log().expect("log");
 
-    log.record_vote(7).expect("record");
+    log.record_vote(7, &QuorumCertificate::genesis()).expect("record");
     // A stale message, a replayed event, a bug upstream — none of them may lower
     // the watermark, because the only thing it protects is "have I signed here".
-    log.record_vote(3).expect("record");
+    log.record_vote(3, &QuorumCertificate::genesis()).expect("record");
     assert_eq!(log.read().expect("read").0, 7);
 
-    log.record_vote(9).expect("record");
+    log.record_vote(9, &QuorumCertificate::genesis()).expect("record");
     assert_eq!(log.read().expect("read").0, 9);
 }
 
@@ -121,11 +121,11 @@ fn the_two_watermarks_are_independent() {
     let log = store.vote_log().expect("log");
 
     // R2 lags R1 by a phase, so recording one must not clear the other.
-    log.record_vote(9).expect("record");
-    log.record_commit_vote(8).expect("record");
+    log.record_vote(9, &QuorumCertificate::genesis()).expect("record");
+    log.record_commit_vote(8, &QuorumCertificate::genesis()).expect("record");
     assert_eq!(log.read().expect("read"), (9, 8));
 
-    log.record_vote(10).expect("record");
+    log.record_vote(10, &QuorumCertificate::genesis()).expect("record");
     assert_eq!(log.read().expect("read"), (10, 8), "R1 must not reset R2");
 }
 
@@ -136,7 +136,7 @@ fn the_two_watermarks_are_independent() {
 fn a_corrupt_vote_log_stops_the_node_rather_than_guessing() {
     let dir = TempDir::new("corrupt");
     let store = ConsensusStore::open(&dir.0).expect("open");
-    store.vote_log().expect("log").record_vote(5).expect("record");
+    store.vote_log().expect("log").record_vote(5, &QuorumCertificate::genesis()).expect("record");
 
     let path = dir.0.join("vote-log.bin");
     let mut bytes = std::fs::read(&path).expect("read");

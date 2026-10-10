@@ -26,5 +26,5 @@ pub mod straggler;
 pub mod tx_source;
 
 pub mod body_channel;
-pub use persistence::{ConsensusCheckpoint, ConsensusStore, FileVoteLog, StoreError};
+pub use persistence::{ConsensusCheckpoint, ConsensusStore, FileVoteLog, StoreError, VoteRecord};
 pub use service::{H2Service, ServiceError, ServiceEvent, ProposalContext};

@@ -222,7 +222,7 @@ impl ConsensusEngine {
             return Ok(());
         }
         self.round_state.record_commit_vote(view);
-        self.vote_log.record_commit_vote(view)?;
+        self.vote_log.record_commit_vote(view, self.round_state.locked_qc())?;
         let changes_hash = self.cached_changes_hash(&block_hash);
         let commit_msg = self
             .signing_profile

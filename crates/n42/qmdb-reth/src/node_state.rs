@@ -1539,10 +1539,11 @@ impl QmdbNodeState {
         key: B256,
         parent: B256,
         ops: QmdbOps,
-        held: impl FnOnce(&QmdbForest) -> Option<T>,
+        held: impl Fn(&QmdbForest) -> Option<T>,
         file: impl FnOnce(&mut QmdbForest, PreparedBlock) -> Result<T, StateError>,
     ) -> Result<T, NodeStateError> {
         let before = RootCounters::now();
+        let mut ops = ops;
         let mut guard = self.lock_as(label);
         let mut split = RootSplit { lock_wait_ms: guard.waited_ms, held_by: guard.held_by, ..RootSplit::default() };
         let forest = guard.as_mut().ok_or(NodeStateError::Uninitialised)?;
@@ -1552,9 +1553,31 @@ impl QmdbNodeState {
             self.keep_split(key, split);
             return Ok(value);
         }
+        // `N42_QMDB_PARALLEL_APPLY`: a block not held yet has its leaf hashes
+        // computed with the lock let go, before the lease, so the tree is out
+        // only for what needs it; the lock is then taken again and the block
+        // looked for again (another caller may have filed it meanwhile).
+        let mut leaves = None;
+        if n42_twig_core::qmdb_compat::parallel_apply() {
+            drop(guard);
+            if !ops.is_sorted() {
+                ops.sort();
+            }
+            leaves = Some(n42_twig_core::qmdb_compat::LeafHashes::of(&ops));
+            guard = self.lock_as(label);
+            split.lock_wait_ms += guard.waited_ms;
+            let held_again = held(guard.as_ref().ok_or(NodeStateError::Uninitialised)?);
+            if let Some(value) = held_again {
+                drop(guard);
+                before.finish(&mut split);
+                self.keep_split(key, split);
+                return Ok(value);
+            }
+        }
+        let forest = guard.as_mut().ok_or(NodeStateError::Uninitialised)?;
         let mut lease = forest.lease_tree(parent)?;
         drop(guard);
-        let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lease.compute(ops)));
+        let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lease.compute_with_leaves(ops, leaves.as_ref())));
         let mut guard = self.lock_as("lease_return");
         split.lock_wait_ms += guard.waited_ms;
         let Some(forest) = guard.as_mut() else { return Err(NodeStateError::Uninitialised) };

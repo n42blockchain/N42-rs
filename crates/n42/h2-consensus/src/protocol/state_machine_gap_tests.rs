@@ -509,3 +509,126 @@ fn a_new_engine_reports_the_state_it_starts_in() {
     assert!(engine.pacemaker().remaining() > before + Duration::from_secs(5), "the view clock moved out");
     assert!(engine.epoch_manager().current_validator_set().len() == 4);
 }
+
+// ---------------------------------------------------------------------------
+// Lock durability across a crash
+// ---------------------------------------------------------------------------
+
+/// An in-memory vote log that keeps every record, to stand in for the disk.
+#[derive(Debug, Default)]
+struct RecordingLog {
+    records: std::sync::Mutex<Vec<(&'static str, u64, QuorumCertificate)>>,
+}
+
+impl crate::vote_log::VoteLogWriter for RecordingLog {
+    fn record_vote(&self, view: u64, locked_qc: &QuorumCertificate) -> ConsensusResult<()> {
+        self.records.lock().expect("log").push(("r1", view, locked_qc.clone()));
+        Ok(())
+    }
+
+    fn record_commit_vote(&self, view: u64, locked_qc: &QuorumCertificate) -> ConsensusResult<()> {
+        self.records.lock().expect("log").push(("r2", view, locked_qc.clone()));
+        Ok(())
+    }
+}
+
+fn proposal_for(
+    engine: &ConsensusEngine,
+    sks: &[n42_h2_primitives::BlsSecretKey],
+    view: ViewNumber,
+    block_hash: B256,
+    justify_qc: QuorumCertificate,
+) -> ConsensusMessage {
+    let proposer = engine.leader_index_for_view(view);
+    let message = engine.signing_profile.proposal_message(view, block_hash, &None);
+    ConsensusMessage::Proposal(n42_h2_primitives::consensus::Proposal {
+        view,
+        block_hash,
+        justify_qc,
+        proposer,
+        signature: engine.signing_profile.sign(&sks[proposer as usize], &message),
+        prepare_qc: None,
+        tx_root_hash: None,
+        validator_changes: None,
+    })
+}
+
+#[test]
+fn a_lock_raised_before_a_crash_still_refuses_an_older_justification_after_it() {
+    let log = Arc::new(RecordingLog::default());
+    let (tx, mut rx) = mpsc::channel(1024);
+    let sks: Vec<_> = (0..4).map(|i| key(0x10 + i as u8)).collect();
+    let (_, _, vs, _) = make(4, 2);
+    let build = |view, locked: QuorumCertificate, voted, commit_voted, tx| {
+        ConsensusEngine::with_recovered_state_and_vote_log(
+            2,
+            sks[2].clone(),
+            EpochManager::new(vs.clone()),
+            60_000,
+            120_000,
+            tx,
+            view,
+            locked,
+            QuorumCertificate::genesis(),
+            0,
+            voted,
+            commit_voted,
+            log.clone(),
+        )
+    };
+
+    // View 1: R1 vote on the proposal, then the PrepareQC raises the lock to 1
+    // and the node commit-votes under it.
+    let mut engine = build(1, QuorumCertificate::genesis(), 0, 0, tx);
+    let hash = B256::repeat_byte(0x71);
+    let proposal = proposal_for(&engine, &sks, 1, hash, QuorumCertificate::genesis());
+    engine.process_event(ConsensusEvent::BlockImported(hash)).expect("import");
+    engine.process_event(ConsensusEvent::Message(proposal)).expect("proposal");
+    let qc = prepare_qc(1, hash, &sks, &vs, &[0, 1, 3]);
+    engine
+        .process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(PrepareQC { view: 1, block_hash: hash, qc: qc.clone() })))
+        .expect("prepare qc");
+    assert_eq!(engine.locked_qc(), &qc, "the lock is raised to view 1");
+    assert!(drain(&mut rx).iter().any(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_)))));
+
+    let (last_voted, last_commit_voted) = (engine.last_voted_view(), engine.last_commit_voted_view());
+    assert_eq!((last_voted, last_commit_voted), (1, 1));
+    let logged = log.records.lock().expect("log").clone();
+    assert!(
+        logged.iter().any(|(kind, view, lock)| *kind == "r2" && *view == 1 && lock == &qc),
+        "the commit vote is logged together with the raised lock",
+    );
+    // Crash before the commit: the checkpoint still holds the genesis lock, so
+    // recovery takes the higher of it and the log's.
+    drop(engine);
+    let recovered_lock = logged
+        .iter()
+        .map(|(_, _, lock)| lock.clone())
+        .chain([QuorumCertificate::genesis()])
+        .max_by_key(|lock| lock.view)
+        .expect("a lock");
+    assert_eq!(recovered_lock, qc);
+
+    // View 2: a proposal justified by something older than the lock is refused.
+    let (tx, mut rx) = mpsc::channel(1024);
+    let mut engine = build(2, recovered_lock.clone(), last_voted, last_commit_voted, tx);
+    let stale = proposal_for(&engine, &sks, 2, B256::repeat_byte(0x72), QuorumCertificate::genesis());
+    let error = engine
+        .process_event(ConsensusEvent::Message(stale))
+        .expect_err("the restored lock must refuse it");
+    assert!(matches!(error, ConsensusError::SafetyViolation { qc_view: 0, locked_view: 1 }), "{error:?}");
+
+    // View 1 again: no second R1 vote, even for a proposal the lock allows.
+    let (tx, mut rx1) = mpsc::channel(1024);
+    let mut engine = build(1, recovered_lock.clone(), last_voted, last_commit_voted, tx);
+    let again = B256::repeat_byte(0x73);
+    let proposal = proposal_for(&engine, &sks, 1, again, recovered_lock);
+    engine.process_event(ConsensusEvent::BlockImported(again)).expect("import");
+    engine.process_event(ConsensusEvent::Message(proposal)).expect("handled");
+    let outputs = drain(&mut rx1);
+    assert!(
+        !outputs.iter().any(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_)))),
+        "{outputs:?}",
+    );
+    assert!(drain(&mut rx).iter().all(|o| !matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_)))));
+}

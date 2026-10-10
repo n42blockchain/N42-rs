@@ -5,29 +5,37 @@
 //!
 //! Two things are stored, for two different reasons.
 //!
-//! **The vote log is a safety requirement.** HotStuff-2 forbids voting twice in
-//! one view. In memory that is `RoundState::last_voted_view`; across a crash it
-//! is this file. A node that restarts without it re-votes in views it had
-//! already signed, which is equivocation — indistinguishable, to everyone else,
-//! from a validator deliberately signing two conflicting values. So the log is
-//! written *before* the signature, and [`n42_h2_consensus::VoteLogWriter`]'s
-//! contract is that an fsync failure aborts the vote rather than proceeding
-//! unlogged.
+//! **The vote log is a safety requirement, and so is the lock in it.**
+//! HotStuff-2 forbids voting twice in one view. In memory that is
+//! `RoundState::last_voted_view`; across a crash it is this file. A node that
+//! restarts without it re-votes in views it had already signed, which is
+//! equivocation -- indistinguishable, to everyone else, from a validator
+//! deliberately signing two conflicting values. So the log is written *before*
+//! the signature, and [`n42_h2_consensus::VoteLogWriter`]'s contract is that an
+//! fsync failure aborts the vote rather than proceeding unlogged.
+//!
+//! The locked QC is recorded in the same fsync. A vote is also a promise not to
+//! support anything the current lock forbids; the lock normally reaches the
+//! checkpoint only at commit, so a node that raised its lock, commit-voted and
+//! crashed would restart with an older one and R1-vote for a proposal justified
+//! below the lock. One such amnesiac plus f Byzantine validators is enough to
+//! form a conflicting certificate.
 //!
 //! **The checkpoint is a liveness convenience.** It carries the view, the locked
 //! and committed QCs, and the timeout count, so a restarted node rejoins near
-//! the head instead of proposing from genesis — which a live node answers with
+//! the head instead of proposing from genesis -- which a live node answers with
 //! `-38006 Too deep reorg` from its execution layer. Losing it costs a resync,
 //! not safety.
 //!
-//! Recovery takes the *more conservative* of the two. The vote log is written
-//! ahead of the checkpoint, so it can legitimately be further along, and taking
-//! the checkpoint's older view would re-open exactly the window the log exists
-//! to close.
+//! Recovery takes the *more conservative* of the two: the larger watermarks and
+//! the higher lock. The vote log is written ahead of the checkpoint, so it can
+//! legitimately be further along, and taking the checkpoint's older values would
+//! re-open exactly the window the log exists to close. A vote log with no
+//! checkpoint at all still binds the node.
 //!
 //! A vote log that fails its checksum stops the node. The alternative is
-//! guessing at which views were already signed, and a wrong guess here is the
-//! one fault this file exists to prevent.
+//! guessing at which views were already signed and which lock was held, and a
+//! wrong guess here is the one fault this file exists to prevent.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -186,16 +194,17 @@ impl ConsensusStore {
         // The lock is a safety requirement like the watermarks: a vote cast
         // under a higher lock than the checkpoint's must not be followed by a
         // proposal that lock forbids.
-        if let Some(lock) = logged.locked_qc {
-            if lock.view > checkpoint.locked_qc.view {
-                debug!(
-                    target: "n42.h2.store",
-                    checkpoint_lock = checkpoint.locked_qc.view,
-                    logged_lock = lock.view,
-                    "vote log holds a higher lock than the checkpoint; taking the log",
-                );
-                checkpoint.locked_qc = lock;
-            }
+        if let Some(lock) = logged
+            .locked_qc
+            .filter(|lock| lock.view > checkpoint.locked_qc.view)
+        {
+            debug!(
+                target: "n42.h2.store",
+                checkpoint_lock = checkpoint.locked_qc.view,
+                logged_lock = lock.view,
+                "vote log holds a higher lock than the checkpoint; taking the log",
+            );
+            checkpoint.locked_qc = lock;
         }
         // A node must not resume in a view it has already voted in.
         checkpoint.view = checkpoint
@@ -337,16 +346,16 @@ impl FileVoteLog {
         };
         // The pre-lock format: exactly [vote][commit][crc32 over those 16].
         if buf.len() == LEGACY_RECORD_LEN {
-            if let (Some(vote), Some(commit), Some(stored)) = (u64_at(0), u64_at(8), u32_at(16)) {
-                if stored == crc32(&buf[..16]) {
-                    return Ok(VoteRecord {
+            return match (u64_at(0), u64_at(8), u32_at(16)) {
+                (Some(vote), Some(commit), Some(stored)) if stored == crc32(&buf[..16]) => {
+                    Ok(VoteRecord {
                         last_vote_view: vote,
                         last_commit_vote_view: commit,
                         locked_qc: None,
-                    });
+                    })
                 }
-            }
-            return Err(self.corrupt());
+                _ => Err(self.corrupt()),
+            };
         }
         let (Some(vote), Some(commit), Some(qc_len)) = (u64_at(0), u64_at(8), u32_at(16)) else {
             return Err(self.corrupt());

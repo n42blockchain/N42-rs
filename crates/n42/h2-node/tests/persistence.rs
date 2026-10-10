@@ -180,3 +180,121 @@ fn an_unreadable_checkpoint_is_reported_rather_than_silently_ignored() {
         other => panic!("expected a corrupt-checkpoint error, got {other:?}"),
     }
 }
+
+/// A QC for a view other than genesis; the bytes need not verify, the store
+/// only carries it.
+fn lock_at(view: u64) -> QuorumCertificate {
+    let mut qc = QuorumCertificate::genesis();
+    qc.view = view;
+    qc.block_hash = alloy_primitives::B256::repeat_byte(view as u8);
+    qc
+}
+
+/// The lock is the second half of what a vote promises. The checkpoint is only
+/// written at commit, so a crash between a commit vote and the commit leaves it
+/// stale; the log, written in the same fsync as the vote, must win.
+#[test]
+fn a_lock_logged_after_the_last_checkpoint_survives_a_stale_checkpoint() {
+    let dir = TempDir::new("lock-wins");
+    let store = ConsensusStore::open(&dir.0).expect("open");
+    store.save(&checkpoint(10, 10)).expect("save"); // genesis lock
+
+    let log = store.vote_log().expect("log");
+    log.record_vote(11, &lock_at(10)).expect("record");
+    log.record_commit_vote(11, &lock_at(11)).expect("record");
+
+    let recovered = ConsensusStore::open(&dir.0).expect("reopen").load().expect("load").expect("a checkpoint");
+    assert_eq!(recovered.locked_qc, lock_at(11));
+    assert_eq!(recovered.last_voted_view, 11);
+}
+
+#[test]
+fn the_logged_lock_never_goes_backwards() {
+    let dir = TempDir::new("lock-monotonic");
+    let store = ConsensusStore::open(&dir.0).expect("open");
+    let log = store.vote_log().expect("log");
+    log.record_vote(9, &lock_at(8)).expect("record");
+    log.record_vote(10, &lock_at(5)).expect("record");
+    assert_eq!(log.read_record().expect("read").locked_qc, Some(lock_at(8)));
+
+    // A checkpoint with a higher lock than the log keeps its own.
+    let mut saved = checkpoint(10, 10);
+    saved.locked_qc = lock_at(9);
+    store.save(&saved).expect("save");
+    let recovered = store.load().expect("load").expect("a checkpoint");
+    assert_eq!(recovered.locked_qc, lock_at(9));
+
+    // And the lock survives a reopen of the log.
+    let reopened = ConsensusStore::open(&dir.0).expect("reopen").vote_log().expect("log");
+    assert_eq!(reopened.read_record().expect("read").locked_qc, Some(lock_at(8)));
+}
+
+#[test]
+fn a_corrupt_lock_in_the_vote_log_stops_the_node() {
+    let dir = TempDir::new("lock-corrupt");
+    let store = ConsensusStore::open(&dir.0).expect("open");
+    store.vote_log().expect("log").record_vote(5, &lock_at(4)).expect("record");
+
+    let path = dir.0.join("vote-log.bin");
+    let mut bytes = std::fs::read(&path).expect("read");
+    bytes[24] ^= 0xFF; // inside the QC
+    std::fs::write(&path, &bytes).expect("write");
+
+    match ConsensusStore::open(&dir.0).expect("open").vote_log() {
+        Err(StoreError::CorruptVoteLog { .. }) => {}
+        other => panic!("expected the node to refuse to start, got {other:?}"),
+    }
+}
+
+/// A node that signed but never checkpointed is still bound by what it signed.
+#[test]
+fn a_vote_log_without_a_checkpoint_still_binds() {
+    let dir = TempDir::new("log-only");
+    let store = ConsensusStore::open(&dir.0).expect("open");
+    store.vote_log().expect("log").record_vote(6, &lock_at(5)).expect("record");
+
+    let recovered = ConsensusStore::open(&dir.0).expect("reopen").load().expect("load").expect("bound by the log");
+    assert_eq!(recovered.last_voted_view, 6);
+    assert_eq!(recovered.locked_qc, lock_at(5));
+    assert_eq!(recovered.view, 6);
+    assert_eq!(recovered.last_committed_qc, QuorumCertificate::genesis());
+}
+
+/// A log written before the lock was recorded is still read.
+#[test]
+fn a_pre_lock_vote_log_is_still_read() {
+    let dir = TempDir::new("legacy");
+    let store = ConsensusStore::open(&dir.0).expect("open");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&7u64.to_le_bytes());
+    bytes.extend_from_slice(&6u64.to_le_bytes());
+    bytes.extend_from_slice(&crc32fast_free(&bytes).to_le_bytes());
+    std::fs::write(dir.0.join("vote-log.bin"), &bytes).expect("write");
+    let log = store.vote_log().expect("a legacy record is not corruption");
+    assert_eq!(log.read().expect("read"), (7, 6));
+}
+
+/// CRC-32 (IEEE), the same as the log's.
+fn crc32fast_free(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+        }
+    }
+    !crc
+}
+
+/// The in-place rewrite relies on the record fitting one sector.
+#[test]
+fn a_512_signer_lock_fits_one_sector() {
+    let dir = TempDir::new("size");
+    let store = ConsensusStore::open(&dir.0).expect("open");
+    let mut qc = lock_at(3);
+    qc.signers.resize(512, true);
+    store.vote_log().expect("log").record_vote(3, &qc).expect("record");
+    let len = std::fs::metadata(dir.0.join("vote-log.bin")).expect("meta").len();
+    eprintln!("record bytes: {len}");
+    assert!(len <= 4096, "{len}");
+}

@@ -1,9 +1,7 @@
 # BFT recovery audit: vote and lock state across a restart
 
-Scope: the HotStuff-2 validator in `crates/n42/h2-consensus` (engine) and
-`crates/n42/h2-node` (`persistence.rs`, `ConsensusStore`, `FileVoteLog`).
-Trigger: arXiv 2610.07759, "When Can Stateless Recovery Defeat Byzantine
-Quorum Safety?".
+Scope: `crates/n42/h2-consensus` (engine), `crates/n42/h2-node` (`persistence.rs`).
+Trigger: arXiv 2610.07759, "When Can Stateless Recovery Defeat Byzantine Quorum Safety?".
 
 ## What the paper claims
 
@@ -104,8 +102,6 @@ afterwards is above the persisted `last_voted_view`; it commits a later view.
 Passes in about 1 s. The restarted member has a fresh mock execution layer, so
 it also pulls the chain by range.
 
-Run: `cargo test -p n42-h2-consensus -p n42-h2-node` (277 + 139 + 7 + 14 pass).
-
 ## Remaining gaps
 
 - No 7-node run with 2 Byzantine members plus restarts (the b + c arithmetic is
@@ -119,7 +115,6 @@ Run: `cargo test -p n42-h2-consensus -p n42-h2-node` (277 + 139 + 7 + 14 pass).
   directory and is not part of it. Restoring a validator onto a fresh consensus
   directory loses its watermarks and lock, which is exactly the amnesiac case
   above; keep the old store or do not reuse the key.
-- A deleted or replaced datadir is indistinguishable from a first start.
 
 ## Tracked, no action
 

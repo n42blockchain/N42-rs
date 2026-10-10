@@ -1084,6 +1084,8 @@ pub struct ApplyPhases {
     pub sort_us: u64,
     /// Leaf hashes and the current-slot lookups, on the worker pool.
     pub leaves_us: u64,
+    /// The leaf hashes alone (part of `leaves_us`).
+    pub leaf_hashes_us: u64,
     /// The undo record's entries, on the worker pool.
     pub undo_us: u64,
     /// `undo_us` plus the retirement of the slots the block replaces, on the
@@ -1125,6 +1127,21 @@ pub struct ApplyPhases {
     /// The key index: its removals in the writes, plus the inserts (also
     /// counted in `hash_faults`).
     pub index_faults: u64,
+    /// `writes_us` by structure, microseconds: the appends' key and slot
+    /// pairs.
+    pub writes_pairs_us: u64,
+    /// See `writes_pairs_us`: the undo record's appended keys (the serial
+    /// writes only; 0 when the writes ran beside each other).
+    pub writes_undo_us: u64,
+    /// See `writes_pairs_us`: the twigs' leaves and active bits (the serial
+    /// writes only).
+    pub writes_twigs_us: u64,
+    /// See `writes_pairs_us`: the entry store's appends (records, offsets,
+    /// active bits); the three writes together when they ran beside each
+    /// other.
+    pub writes_entries_us: u64,
+    /// See `writes_pairs_us`: the index removals of deleted keys.
+    pub writes_remove_us: u64,
 }
 
 /// Rehashes every twig marked in `dirty`, each independently of the others.
@@ -2002,6 +2019,7 @@ impl QmdbCompatTree {
         // The block's temporaries, the last block's with their pages in.
         let mut scratch = crate::prefault::take_apply_scratch(count);
         leaf_hashes(operations, &mut scratch.leaves);
+        phases.leaf_hashes_us = at.elapsed().as_micros() as u64;
         // The slot each key holds now, looked up on the worker pool: the
         // block's keys are distinct, so no lookup depends on an earlier write
         // of the same block, and the lookups are the random reads of a
@@ -2072,6 +2090,8 @@ impl QmdbCompatTree {
                 appended.push((*operations.op_key(i), first_slot + appended.len() as u64));
             }
         }
+        phases.writes_pairs_us = at.elapsed().as_micros() as u64;
+        let sub_at = std::time::Instant::now();
         let mut faults = faults_writes;
         let mut took = |into: &mut u64| {
             let now = crate::prefault::thread_faults();
@@ -2089,6 +2109,7 @@ impl QmdbCompatTree {
                 phases.undo_faults += undo_faults;
                 phases.twigs_faults += twigs_faults;
                 took(&mut 0);
+                phases.writes_entries_us = sub_at.elapsed().as_micros() as u64;
                 pushed
             }
             None => {
@@ -2096,11 +2117,17 @@ impl QmdbCompatTree {
                     record.appended_keys.extend(appended.iter().map(|(key, _)| *key));
                 }
                 took(&mut phases.undo_faults);
+                phases.writes_undo_us = sub_at.elapsed().as_micros() as u64;
+                let sub_at = std::time::Instant::now();
                 for (leaf, (_, slot)) in (0..count).filter_map(|i| appends(i).map(|(_, leaf)| leaf)).zip(appended.iter()) {
                     self.set_twig_leaf(*slot, leaf, &mut dirty);
                 }
                 took(&mut phases.twigs_faults);
-                self.entries.push_batch(records, &mut append_faults)
+                phases.writes_twigs_us = sub_at.elapsed().as_micros() as u64;
+                let sub_at = std::time::Instant::now();
+                let pushed = self.entries.push_batch(records, &mut append_faults);
+                phases.writes_entries_us = sub_at.elapsed().as_micros() as u64;
+                pushed
             }
         };
         self.next_slot = first_slot + appended.len() as u64;
@@ -2109,12 +2136,14 @@ impl QmdbCompatTree {
         phases.bits_faults = append_faults.bits;
         pushed.map_err(|e| QmdbOperationError::Store(e.to_string()))?;
         took(&mut 0);
+        let sub_at = std::time::Instant::now();
         for (i, old_slot) in held.iter().enumerate() {
             if old_slot.is_some() && appends(i).is_none() {
                 self.index.remove(operations.op_key(i), |slot| self.entries.key(slot as usize));
             }
         }
         took(&mut phases.index_faults);
+        phases.writes_remove_us = sub_at.elapsed().as_micros() as u64;
         phases.writes_us = at.elapsed().as_micros() as u64;
         let faults_hash = crate::prefault::thread_faults();
         phases.writes_faults = faults_hash.saturating_sub(faults_writes);

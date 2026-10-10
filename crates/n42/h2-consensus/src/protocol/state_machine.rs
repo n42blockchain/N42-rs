@@ -333,6 +333,10 @@ pub struct ConsensusEngine {
     /// what deferred execution (`docs/PHASE_D_DEFERRED_EXECUTION.md`) would
     /// give the cycle before any header changes.
     pub(super) vote_before_import: bool,
+    /// Retry budget of `emit` against a full output channel: attempts and the
+    /// wait before each. Production keeps the defaults; tests widen them.
+    output_retries: u32,
+    output_retry_wait: std::time::Duration,
     pub(super) round_state: RoundState,
     pub(super) pacemaker: Pacemaker,
     pub(super) vote_collector: Option<VoteCollector>,
@@ -475,6 +479,8 @@ impl ConsensusEngine {
             leader_tenure: 1,
             signing_profile: ConsensusSigningProfile::Native,
             vote_before_import: false,
+            output_retries: 3,
+            output_retry_wait: std::time::Duration::from_micros(500),
             round_state: RoundState::new(),
             pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
             vote_collector: None,
@@ -584,6 +590,8 @@ impl ConsensusEngine {
             leader_tenure: 1,
             signing_profile: ConsensusSigningProfile::Native,
             vote_before_import: false,
+            output_retries: 3,
+            output_retry_wait: std::time::Duration::from_micros(500),
             round_state: RoundState::from_snapshot(
                 recovered_view,
                 locked_qc,
@@ -982,6 +990,12 @@ impl ConsensusEngine {
 
     /// **Bench only, unsafe**: vote on a verified proposal before executing
     /// it, under the H2-v4 profile too. See the field.
+    /// Sets the `emit` retry budget (attempts and wait per attempt).
+    pub fn set_output_retry_budget(&mut self, retries: u32, wait: std::time::Duration) {
+        self.output_retries = retries;
+        self.output_retry_wait = wait;
+    }
+
     pub fn set_vote_before_import(&mut self, on: bool) {
         self.vote_before_import = on;
     }
@@ -1574,7 +1588,7 @@ impl ConsensusEngine {
     }
 
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {
-        const MAX_OUTPUT_SEND_RETRIES: u32 = 3;
+        let max_retries = self.output_retries;
 
         // Treat bounded-channel backpressure as recoverable. Only a closed channel
         // is immediately fatal to consensus.
@@ -1606,14 +1620,14 @@ impl ConsensusEngine {
             Err(tokio::sync::mpsc::error::TrySendError::Full(output)) => {
                 let mut pending = output;
 
-                for attempt in 1..=MAX_OUTPUT_SEND_RETRIES {
+                for attempt in 1..=max_retries {
                     // Brief sleep to give the channel consumer a chance to drain.
                     // 500µs × 3 retries = 1.5ms max blocking per emit() call.
                     // This is acceptable: channel backpressure is rare (capacity 64-1024),
                     // and 1.5ms is negligible relative to the 8-second slot target.
                     // std::thread::sleep is used deliberately here rather than tokio::time::sleep
                     // because emit() is a sync fn; the short duration minimises worker stall.
-                    std::thread::sleep(std::time::Duration::from_micros(500));
+                    std::thread::sleep(self.output_retry_wait);
                     match self.output_tx.try_send(pending) {
                         Ok(()) => {
                             if is_block_committed {
@@ -1651,13 +1665,13 @@ impl ConsensusEngine {
                     tracing::error!(
                         target: "n42::cl::engine",
                         "CRITICAL: BlockCommitted lost after {} retries",
-                        MAX_OUTPUT_SEND_RETRIES
+                        max_retries
                     );
                 } else {
                     tracing::error!(
                         target: "n42::cl::engine",
                         output = output_kind,
-                        retries = MAX_OUTPUT_SEND_RETRIES,
+                        retries = max_retries,
                         "consensus output channel remained full after retries"
                     );
                 }
@@ -2370,7 +2384,9 @@ mod tests {
     /// channel) while depending on ordering rather than on wall-clock timing.
     #[test]
     fn test_emit_retries_non_block_committed_output_when_channel_is_full() {
-        let (engine, _, _, mut rx) = make_engine_with_output_capacity(1, 0, 1);
+        let (mut engine, _, _, mut rx) = make_engine_with_output_capacity(1, 0, 1);
+        // A budget far above any scheduling delay: the drain always lands in it.
+        engine.set_output_retry_budget(200, std::time::Duration::from_millis(1));
 
         engine
             .emit(EngineOutput::ExecuteBlock(B256::repeat_byte(0xAB)))

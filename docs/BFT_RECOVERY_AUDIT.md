@@ -85,12 +85,26 @@ Also `a_lock_raised_before_a_crash_still_refuses_an_older_justification_after_it
 (stale checkpoint, log lock wins, older justification refused with
 `SafetyViolation`), and the 14 tests of `h2-node/tests/persistence.rs`.
 
-Finding (row "write lost"): the engine moves the in-memory watermark before
-calling the log. When the log fails, the vote is aborted but the view stays
-consumed: a retry in the same view is refused (asserted for R1 and R2). That is
-safe; the cost is liveness, since that node casts no vote in that view even if
-the disk recovers. Nothing was changed. If the lost view ever matters, the fix is
-to roll the watermark back on log error.
+Since e21c76dbb a failed log write rolls the in-memory watermark back, so the
+same view can be retried once the disk recovers (the test asserts the retry is
+signed after a fault, refused after a success, and that the node rebuilt after the
+retry will not vote that view again).
+
+Recovery bound, same file, one choreography, n = 7, q = 5, validators 0 and 1
+Byzantine (the test holds their keys and signs for them; no Byzantine engine
+code), 2-6 real engines. Views 7 and 8 (the leaders of both are Byzantine). The
+leader shows block A to members 2, 3, 4 only; 5 votes (3 honest + 2) give a
+PrepareQC and a commit QC for A. Member 4 then restarts (engine dropped with no
+flush) and the leader of view 8 proposes a conflicting B, justified by genesis,
+to 4, 5, 6. No Decide is delivered; the commit QC is the commit.
+
+| Test | b | c | Restored 4 | Result |
+| --- | --- | --- | --- | --- |
+| `two_byzantine_and_one_amnesiac_member_can_commit_conflicting_blocks` | 2 | 1 | genesis lock, zero watermarks | B gets 5 votes, PrepareQC and commit QC; both commit QCs verify, hashes differ, views 7 and 8: the bound is reached |
+| `two_byzantine_members_cannot_when_the_restarted_member_kept_its_vote_log` | 2 | 0 | lock = QC_A, watermarks 7 from its log | 4 returns `SafetyViolation { qc_view: 0, locked_view: 7 }`, signs nothing and logs nothing; B has 4 votes, `InsufficientVotes { have: 4, need: 5 }`, no QC |
+
+The first test shows the harness has teeth; the second is the guarantee of
+f24c85ac5.
 
 Live, `h2-node/tests/four_node_fleet.rs`
 (`a_member_restarted_from_its_store_rejoins_and_never_revotes_a_logged_view`):
@@ -104,12 +118,18 @@ it also pulls the chain by range.
 
 ## Remaining gaps
 
-- No 7-node run with 2 Byzantine members plus restarts (the b + c arithmetic is
-  tested only through single-node boundary cases).
-- Remote signers are out of scope: if a signer service holds the key, its own
-  watermark must be durable too; this repo has no such signer.
-- Disk-level faults (torn sector writes, fsync lying) are covered only by the crc
-  and the single-sector record size; there is no power-cut test.
+- Remote signers: none exist. The validator signs with an in-process
+  `BlsSecretKey`, so there is no second place that holds a key and a watermark.
+  Any future remote signer must apply the same rule on its side: persist the
+  watermark and lock before it signs.
+- Power cut: the engine-level crash tests drop the engine with no flush, which
+  is the state a SIGKILL or power cut leaves given the fsync before each
+  signature. The operator-level SIGKILL restart is `scripts/fleet7.sh roll <i>
+  --kill`. Torn sector writes and an fsync that lies are covered only by the crc
+  and the single-sector record; they are not injected.
+- A live 7-node run with 2 Byzantine members is not done. It adds little over
+  the engine-level test: the transport cannot change what an engine signs, and
+  the test already plays the network and the Byzantine keys exactly.
 - A snapshot restore (`LATE_SNAPSHOT`, `n42-init-snapshot`) restores only the
   execution layer. The consensus store (`vote-log.bin`, checkpoint) is a separate
   directory and is not part of it. Restoring a validator onto a fresh consensus

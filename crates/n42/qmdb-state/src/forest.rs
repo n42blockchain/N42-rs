@@ -434,6 +434,14 @@ pub struct QmdbForest {
     /// cursor, lowered by any move that rewound below it): what
     /// [`Self::block_changes_parts`] checks instead of flushing.
     flushed_slots: u64,
+    /// A head move recorded while the tree was leased out
+    /// ([`Self::set_canonical_deferring`]) still owes the twig trim it would
+    /// have done; [`Self::return_tree`] (or the next
+    /// [`Self::set_canonical_releasing`]) does it.
+    trim_due: bool,
+    /// The twig leaf trees a deferred trim evicted on [`Self::return_tree`],
+    /// for the caller to free off its lock ([`Self::take_deferred_release`]).
+    deferred_twigs: Vec<TwigNodes>,
 }
 
 /// The shared tree, taken out of the forest so a block's root is computed
@@ -696,7 +704,13 @@ impl QmdbForest {
     ) -> Result<(PreparedBlock, bool), StateError> {
         self.tree = lease.tree;
         self.leased_at = None;
-        let computed = computed?;
+        let computed = match computed {
+            Ok(computed) => computed,
+            Err(err) => {
+                self.apply_deferred_trim();
+                return Err(err);
+            }
+        };
         self.last_compute = (lease.move_us, computed.phases);
         let noted_at = std::time::Instant::now();
         self.note_move(&computed.undo);
@@ -704,6 +718,11 @@ impl QmdbForest {
         let renamed = self.tip != lease.parent;
         let parent = self.tip;
         self.pending = Some((parent, computed.undo));
+        // A head move recorded while the tree was out trims now, with the
+        // block just computed counted among the undos it must not cut into
+        // -- the bound the trim would have had had the move come after this
+        // return.
+        self.apply_deferred_trim();
         Ok((
             PreparedBlock {
                 root: computed.root,
@@ -776,6 +795,8 @@ impl QmdbForest {
             last_tail: (0, 0, 0),
             leased_at: None,
             flushed_slots: 0,
+            trim_due: false,
+            deferred_twigs: Vec::new(),
         }
     }
 
@@ -1180,32 +1201,94 @@ impl QmdbForest {
             self.move_to(block_hash)?;
         }
         self.head = (number, block_hash);
+        let mut released = Released { records: self.cut_records(number, block_hash), twig_nodes: Vec::new() };
+        // A trim a deferred head move left owing is this one.
+        self.trim_due = false;
+        self.trim_into(&mut released.twig_nodes);
+        Ok(released)
+    }
+
+    /// [`Self::set_canonical_releasing`] while the tree is leased out
+    /// (`N42_QMDB_CANONICAL_DEFER`): the head moves and the records below the
+    /// window are cut now -- neither needs the tree -- and the twig trim,
+    /// which does, is owed to [`Self::return_tree`]. `None` (nothing done)
+    /// when the tree is here (the caller takes the immediate path) or when
+    /// the head is not on the path through the tree's tip (a branch switch:
+    /// the tree must be moved, so the caller waits for it).
+    ///
+    /// The records cut are exactly the immediate path's (same cutoff, same
+    /// reader keep); the trim, done later, computes its bound from the
+    /// records and pending undo that exist then, so it never cuts into an
+    /// undo still held. Nothing moves the tree, so the entry file is never
+    /// truncated and the read view's cut count is untouched.
+    pub fn set_canonical_deferring(&mut self, block_hash: B256) -> Result<Option<Released>, StateError> {
+        if self.leased_at.is_none() {
+            return Ok(None);
+        }
+        let number = self
+            .records
+            .get(&block_hash)
+            .ok_or(StateError::UnknownBlock(block_hash))?
+            .number;
+        if !self.ancestry(self.tip).contains(&block_hash) {
+            return Ok(None);
+        }
+        self.head = (number, block_hash);
+        let records = self.cut_records(number, block_hash);
+        self.trim_due = true;
+        Ok(Some(Released { records, twig_nodes: Vec::new() }))
+    }
+
+    /// Whether a deferred head move still owes its twig trim.
+    pub const fn trim_due(&self) -> bool {
+        self.trim_due
+    }
+
+    /// What a deferred trim evicted on [`Self::return_tree`], for the caller
+    /// to free off its lock.
+    pub fn take_deferred_release(&mut self) -> Released {
+        Released { records: Vec::new(), twig_nodes: std::mem::take(&mut self.deferred_twigs) }
+    }
+
+    /// Does the trim a deferred head move owes, if any; the evicted leaf
+    /// trees wait in `deferred_twigs`.
+    fn apply_deferred_trim(&mut self) {
+        if !std::mem::take(&mut self.trim_due) {
+            return;
+        }
+        let mut evicted = std::mem::take(&mut self.deferred_twigs);
+        self.trim_into(&mut evicted);
+        self.deferred_twigs = evicted;
+    }
+
+    /// Cuts the records that fell out of the retention window below a head
+    /// at `number` (never the head's own, nor any the reader's keep holds).
+    fn cut_records(&mut self, number: u64, head: B256) -> Vec<BlockRecord> {
         let mut cutoff = number.saturating_sub(self.retain_depth);
         if let Some(keep) = self.keep_from {
             cutoff = cutoff.min(keep.max(number.saturating_sub(self.reader_keep_cap)));
         }
-        let mut released = Released {
-            records: self
-                .records
-                .extract_if(|hash, record| record.number < cutoff && *hash != block_hash)
-                .map(|(_, record)| record)
-                .collect(),
-            twig_nodes: Vec::new(),
-        };
-        if self.trim_twigs {
-            // Full twigs no retained undo (nor the pending block's) can cut
-            // into keep only their root and bits: the oldest cursor any of
-            // them could rewind to is the bound.
-            let oldest = self
-                .records
-                .values()
-                .filter_map(|record| record.undo.as_ref().map(|undo| undo.prev_next_slot))
-                .chain(self.pending.as_ref().map(|(_, undo)| undo.prev_next_slot))
-                .min()
-                .unwrap_or_else(|| self.tree.next_slot());
-            self.tree.evict_twig_nodes_into(oldest, &mut released.twig_nodes);
+        self.records
+            .extract_if(|hash, record| record.number < cutoff && *hash != head)
+            .map(|(_, record)| record)
+            .collect()
+    }
+
+    /// Evicts the leaf trees of full twigs no retained undo (nor the pending
+    /// block's) can cut into: they keep only their root and bits. The oldest
+    /// cursor any of them could rewind to is the bound. Needs the tree.
+    fn trim_into(&mut self, evicted: &mut Vec<TwigNodes>) {
+        if !self.trim_twigs {
+            return;
         }
-        Ok(released)
+        let oldest = self
+            .records
+            .values()
+            .filter_map(|record| record.undo.as_ref().map(|undo| undo.prev_next_slot))
+            .chain(self.pending.as_ref().map(|(_, undo)| undo.prev_next_slot))
+            .min()
+            .unwrap_or_else(|| self.tree.next_slot());
+        self.tree.evict_twig_nodes_into(oldest, evicted);
     }
 
     /// Whether full twigs below the retention window drop their leaf nodes on

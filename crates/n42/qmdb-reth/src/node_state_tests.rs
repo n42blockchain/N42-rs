@@ -759,3 +759,197 @@ fn a_batched_persist_leaves_the_view_where_one_hold_a_block_does() {
     assert_eq!(gap("batch-gap-one", true), gap("batch-gap-each", false));
     assert_eq!(gap("batch-gap-one2", true), ((2, hash_of(2)), false));
 }
+
+// ---------------------------------------------------------------------------
+// Canonical heads recorded during a lease (N42_QMDB_CANONICAL_DEFER)
+// ---------------------------------------------------------------------------
+
+/// A block wide enough (512 accounts) that full twigs fall below the
+/// retention window within a few dozen blocks and the trim has work.
+fn wide_changes(number: u64) -> BlockChanges {
+    let mut changes = BlockChanges::new();
+    for i in 0..512u64 {
+        changes.set_account(
+            Address::from_word(B256::from(U256::from(number * 1000 + i))),
+            AccountState { nonce: number, balance: U256::from(i + 1), code_hash: B256::ZERO },
+        );
+    }
+    changes
+}
+
+/// Leases the tree on `parent`, as `with_leased_root` does.
+fn take_lease(state: &QmdbNodeState, parent: B256) -> n42_qmdb_state::TreeLease {
+    let mut guard = state.lock_as("compute_operations");
+    guard.as_mut().expect("initialised").lease_tree(parent).expect("lease")
+}
+
+/// Computes `ops` on the lease and hands the tree back, as
+/// `with_leased_root` does; asserts the owed trim was done by the return.
+fn give_back(state: &QmdbNodeState, mut lease: n42_qmdb_state::TreeLease, ops: QmdbOps) -> PreparedBlock {
+    let computed = lease.compute(ops);
+    let mut guard = state.lock_as("lease_return");
+    let forest = guard.as_mut().expect("initialised");
+    let (prepared, _) = forest.return_tree(lease, computed).expect("return");
+    state.inner.tree_back.notify_all();
+    assert!(!forest.trim_due(), "the return does the owed trim");
+    drop(forest.take_deferred_release());
+    prepared
+}
+
+/// Calls `on_canonical` on another thread; whether it finished within
+/// `patience`, and the handle to join.
+fn canonical_on_the_side(
+    state: &QmdbNodeState,
+    hash: B256,
+    patience: std::time::Duration,
+) -> (bool, std::thread::JoinHandle<()>) {
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = {
+        let (state, done) = (state.clone(), done.clone());
+        std::thread::spawn(move || {
+            state.on_canonical(hash).expect("canonical");
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+    let until = std::time::Instant::now() + patience;
+    while !done.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    (done.load(std::sync::atomic::Ordering::SeqCst), handle)
+}
+
+/// What the head move and the trim leave behind: the head, the trimmed and
+/// total twigs, the root and whether the record 20 blocks below is still held.
+fn forest_shape(state: &QmdbNodeState) -> ((u64, B256), (usize, usize), Option<B256>, bool) {
+    let guard = state.lock_as("checkpoint");
+    let forest = guard.as_ref().expect("initialised");
+    let head = forest.head();
+    let old = hash_of(head.0.saturating_sub(20));
+    (head, forest.trimmed_twigs(), forest.root_of(&head.1), forest.root_of(&old).is_some())
+}
+
+#[test]
+fn a_canonical_head_during_a_lease_is_seen_at_once_and_trimmed_by_the_return() {
+    let (immediate, immediate_view, genesis) = switched("canon-defer-immediate", true, true);
+    let (deferred, view, _) = switched("canon-defer-deferred", true, true);
+    deferred.set_canonical_defer(true);
+    for state in [&immediate, &deferred] {
+        state.insert_block_operations(genesis, hash_of(1), 1, wide_changes(1).ops()).expect("block 1");
+        state.on_canonical(hash_of(1)).expect("the first checkpoint");
+    }
+    let patience = std::time::Duration::from_millis(150);
+    let mut leased_heads = 0u64;
+    let mut expected_deferred = 0u64;
+    let last = 40u64;
+    for number in 2..=last {
+        let parent = hash_of(number - 1);
+        // Deferred: block `number` is computed on a lease, and the head
+        // `number - 1` arrives meanwhile.
+        let lease = take_lease(&deferred, parent);
+        let waits = leased_heads % (CANONICAL_DEFER_MAX_STREAK + 1) == CANONICAL_DEFER_MAX_STREAK;
+        leased_heads += 1;
+        let (finished, handle) = canonical_on_the_side(&deferred, parent, patience);
+        if waits {
+            assert!(!finished, "head {}: the streak is spent, so it waits for the tree", number - 1);
+        } else {
+            expected_deferred += 1;
+            assert!(finished, "head {}: recorded without waiting for the lease", number - 1);
+            assert_eq!(deferred.head(), Some((number - 1, parent)), "the head is seen at once");
+            assert_eq!(deferred.root_of(&parent), immediate.root_of(&parent));
+            let guard = deferred.lock_as("root_of");
+            assert!(guard.as_ref().expect("initialised").trim_due(), "the trim is owed");
+        }
+        let prepared = give_back(&deferred, lease, wide_changes(number).ops());
+        handle.join().expect("the canonical thread");
+        deferred.insert(hash_of(number), number, prepared).expect("insert");
+        // Immediate: the same block, then the head, with the tree here.
+        immediate.insert_block_operations(parent, hash_of(number), number, wide_changes(number).ops()).expect("insert");
+        immediate.on_canonical(parent).expect("canonical");
+        assert_eq!(forest_shape(&deferred), forest_shape(&immediate), "after head {}", number - 1);
+        // The database persists in batches; the reader's keep moves with it.
+        if number % 8 == 0 {
+            let batch: Vec<(u64, B256)> = (number.saturating_sub(11).max(1)..=number - 4).map(|n| (n, hash_of(n))).collect();
+            for (state, view) in [(&immediate, &immediate_view), (&deferred, &view)] {
+                state.on_persisted(&batch);
+                assert_eq!(view.head(), (number - 4, hash_of(number - 4)));
+                assert!(view.is_valid(), "no record a reader keeps was cut");
+            }
+        }
+    }
+    assert_eq!(deferred.offlock_counters().deferred_canonicals, expected_deferred);
+    assert_eq!(immediate.offlock_counters().deferred_canonicals, 0);
+    let (trimmed, _) = forest_shape(&deferred).1;
+    assert!(trimmed > 0, "the trims had work");
+
+    // The last head with the tree here persists the deferred ones' deltas
+    // too; a restart from either directory stands at the same state.
+    for state in [&immediate, &deferred] {
+        state.on_canonical(hash_of(last)).expect("canonical");
+    }
+    assert_eq!(forest_shape(&deferred), forest_shape(&immediate));
+    let persisted: Vec<(u64, B256)> = (37..=39).map(|n| (n, hash_of(n))).collect();
+    for (state, view) in [(&immediate, &immediate_view), (&deferred, &view)] {
+        state.on_persisted(&persisted);
+        assert_eq!(view.head(), (39, hash_of(39)));
+        assert!(view.is_valid(), "no record a reader keeps was cut");
+    }
+    let root = immediate.state_root();
+    assert_eq!(deferred.state_root(), root);
+    for state in [immediate, deferred] {
+        let dir = state.inner.dir.clone();
+        drop(state);
+        let restarted = QmdbNodeState::new_with_entry_file(qmdb_chain(), &dir, true);
+        restarted.initialize((last, hash_of(last))).expect("restart");
+        assert_eq!(restarted.state_root(), root);
+    }
+}
+
+#[test]
+fn a_branch_switch_during_a_lease_waits_and_takes_the_owed_trim_first() {
+    let (state, view, genesis) = switched("canon-defer-reorg", true, true);
+    let (reference, _, _) = switched("canon-defer-reorg-ref", false, false);
+    state.set_canonical_defer(true);
+    let mut parent = genesis;
+    for number in 1..=20u64 {
+        for s in [&state, &reference] {
+            s.insert_block_operations(parent, hash_of(number), number, wide_changes(number).ops()).expect("insert");
+            if number <= 18 {
+                s.on_canonical(hash_of(number)).expect("canonical");
+            }
+        }
+        parent = hash_of(number);
+    }
+    // A sibling of 20, on 19.
+    let sibling = B256::repeat_byte(0x5a);
+    for s in [&state, &reference] {
+        s.insert_block_operations(hash_of(19), sibling, 20, wide_changes(99).ops()).expect("sibling");
+    }
+    // The tree is leased on 20; head 19 (on its path) defers its trim ...
+    let lease = take_lease(&state, hash_of(20));
+    let (finished, handle) = canonical_on_the_side(&state, hash_of(19), std::time::Duration::from_secs(2));
+    assert!(finished);
+    handle.join().expect("head 19");
+    assert!(state.lock_as("root_of").as_ref().expect("initialised").trim_due());
+    // ... and the switch to the sibling waits for the tree: it moves it.
+    let (finished, handle) = canonical_on_the_side(&state, sibling, std::time::Duration::from_millis(150));
+    assert!(!finished, "a branch switch waits for the leased tree");
+    give_back(&state, lease, wide_changes(21).ops());
+    handle.join().expect("the switch");
+    reference.on_canonical(hash_of(19)).expect("canonical");
+    reference.on_canonical(sibling).expect("canonical");
+    assert_eq!(state.head(), Some((20, sibling)));
+    assert_eq!(forest_shape(&state), forest_shape(&reference));
+    assert_eq!(state.state_root(), reference.state_root());
+    assert_eq!(state.offlock_counters().deferred_canonicals, 1);
+
+    // The chain goes on from the sibling, and the view follows it.
+    for s in [&state, &reference] {
+        s.insert_block_operations(sibling, hash_of(21), 21, wide_changes(21).ops()).expect("21");
+        s.on_canonical(hash_of(21)).expect("canonical");
+    }
+    assert_eq!(state.state_root(), reference.state_root());
+    let persisted: Vec<(u64, B256)> = (1..=19).map(|n| (n, hash_of(n))).chain([(20, sibling), (21, hash_of(21))]).collect();
+    state.on_persisted(&persisted);
+    assert_eq!(view.head(), (21, hash_of(21)));
+    assert!(view.is_valid());
+}

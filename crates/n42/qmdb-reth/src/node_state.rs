@@ -188,6 +188,31 @@ fn compute_offlock_env() -> bool {
     *ON.get_or_init(|| std::env::var("N42_QMDB_COMPUTE_OFFLOCK").is_ok_and(|v| v == "1"))
 }
 
+/// `N42_QMDB_CANONICAL_DEFER=1` (default off): a canonical head that
+/// arrives while the tree is leased out (`N42_QMDB_COMPUTE_OFFLOCK`) does
+/// not wait for it. [`QmdbNodeState::on_canonical`] records the advance
+/// under a short hold that needs no tree -- the head (what `head`, `root_of`
+/// and the readers see, at once), the canonical number, the records cut
+/// below the window -- and the twig trim it owes is done by the lease's
+/// return ([`QmdbForest::return_tree`]). The head's delta, the entry file's
+/// sync and the log append need the tree (the entry file's writer is inside
+/// it), so they ride with the next head that finds the tree here: its
+/// deltas chain from the persisted head through this one. At most
+/// [`CANONICAL_DEFER_MAX_STREAK`] heads in a row defer before one waits, and
+/// a head off the tree's path (a branch switch) always waits. Measured
+/// cause: on loop351 E=1 `on_canonical` waited ~25 ms behind the lease on
+/// most blocks, in the newPayload answer's serial chain.
+fn canonical_defer_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_QMDB_CANONICAL_DEFER").is_ok_and(|v| v == "1"))
+}
+
+/// How many canonical heads in a row may leave their persistence to a later
+/// head (`N42_QMDB_CANONICAL_DEFER`) before one waits for the tree. Below
+/// the forest's record retention (16), so the deferred heads' records and
+/// deltas are still held when the chain is persisted.
+const CANONICAL_DEFER_MAX_STREAK: u64 = 8;
+
 /// `N42_QMDB_PERSIST_BATCH=1` (default off): [`QmdbNodeState::on_persisted`]
 /// lists a whole persistence batch's changes (and raises the read view's
 /// floor for each) under one hold of the forest's lock, then advances the
@@ -210,6 +235,7 @@ const TREE_FREE_LABELS: &[&str] = &[
     "release_reader_records",
     "on_persisted_parts",
     "lease_return",
+    "on_canonical_defer",
 ];
 
 /// How often (in persistence calls) the QMDB persist split's running sums
@@ -250,6 +276,9 @@ pub struct OfflockCounters {
     pub persists: u64,
     /// The sums of the persistence calls' splits.
     pub persist_split: PersistSplit,
+    /// Canonical heads recorded without waiting for a leased tree
+    /// (`N42_QMDB_CANONICAL_DEFER`), their trim left to the lease's return.
+    pub deferred_canonicals: u64,
 }
 
 /// Why a persistence call stops following the database.
@@ -515,6 +544,11 @@ struct Inner {
     compute_offlock: std::sync::atomic::AtomicBool,
     /// `N42_QMDB_PERSIST_BATCH`, or `set_persist_batch`.
     persist_batch: std::sync::atomic::AtomicBool,
+    /// `N42_QMDB_CANONICAL_DEFER`, or `set_canonical_defer`.
+    canonical_defer: std::sync::atomic::AtomicBool,
+    /// Heads deferred so far, and in a row since the last persisted one.
+    deferred_canonicals: std::sync::atomic::AtomicU64,
+    canonical_defer_streak: std::sync::atomic::AtomicU64,
     /// [`OfflockCounters`], field by field.
     leased_roots: std::sync::atomic::AtomicU64,
     renamed_parents: std::sync::atomic::AtomicU64,
@@ -848,6 +882,9 @@ impl QmdbNodeState {
                 tree_back: std::sync::Condvar::new(),
                 compute_offlock: std::sync::atomic::AtomicBool::new(compute_offlock_env()),
                 persist_batch: std::sync::atomic::AtomicBool::new(persist_batch_env()),
+                canonical_defer: std::sync::atomic::AtomicBool::new(canonical_defer_env()),
+                deferred_canonicals: Default::default(),
+                canonical_defer_streak: Default::default(),
                 leased_roots: Default::default(),
                 renamed_parents: Default::default(),
                 tree_waits: Default::default(),
@@ -1189,6 +1226,17 @@ impl QmdbNodeState {
         self.inner.persist_batch.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Whether a canonical head arriving during a lease is recorded without
+    /// waiting for the tree (`N42_QMDB_CANONICAL_DEFER`).
+    pub fn canonical_defer(&self) -> bool {
+        self.inner.canonical_defer.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Overrides `N42_QMDB_CANONICAL_DEFER` for this state.
+    pub fn set_canonical_defer(&self, on: bool) {
+        self.inner.canonical_defer.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// What the off-lock root and the persistence holds have done so far.
     pub fn offlock_counters(&self) -> OfflockCounters {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1205,6 +1253,7 @@ impl QmdbNodeState {
                 advance_us: inner.persist_advance_us.load(Relaxed),
                 holds: inner.persist_holds.load(Relaxed),
             },
+            deferred_canonicals: inner.deferred_canonicals.load(Relaxed),
         }
     }
 
@@ -1509,21 +1558,35 @@ impl QmdbNodeState {
             Err(panic) => {
                 let _ = forest.return_tree(lease, Err(StateError::TreeLeased));
                 self.inner.tree_back.notify_all();
+                let trimmed = forest.take_deferred_release();
                 drop(guard);
+                release_off_lock(self.inner.canonical_number.load(std::sync::atomic::Ordering::Relaxed), trimmed);
                 std::panic::resume_unwind(panic);
             }
         };
         let returned = forest.return_tree(lease, computed);
         self.inner.tree_back.notify_all();
         self.inner.leased_roots.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (prepared, renamed) = returned?;
+        // What a deferred head move's trim evicted on the return
+        // (`N42_QMDB_CANONICAL_DEFER`), freed once the lock is let go.
+        let trimmed = forest.take_deferred_release();
+        let (prepared, renamed) = match returned {
+            Ok(returned) => returned,
+            Err(err) => {
+                drop(guard);
+                release_off_lock(self.inner.canonical_number.load(std::sync::atomic::Ordering::Relaxed), trimmed);
+                return Err(err.into());
+            }
+        };
         if renamed {
             self.inner.renamed_parents.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let filed = std::time::Instant::now();
-        let value = file(forest, prepared)?;
+        let value = file(forest, prepared);
         fill_split(forest, &mut split, filed.elapsed().as_micros() as u64);
         drop(guard);
+        release_off_lock(self.inner.canonical_number.load(std::sync::atomic::Ordering::Relaxed), trimmed);
+        let value = value?;
         before.finish(&mut split);
         self.keep_split(key, split);
         Ok(value)
@@ -2055,6 +2118,10 @@ impl QmdbNodeState {
     /// node's validation, and the forest can no longer compute the next root.
     pub fn on_canonical(&self, block_hash: B256) -> Result<(), NodeStateError> {
         let mut cursor = self.cursor();
+        if cursor.checkpoint_len != 0 && self.canonical_defer() && self.defer_canonical(block_hash)? {
+            return Ok(());
+        }
+        self.inner.canonical_defer_streak.store(0, std::sync::atomic::Ordering::Relaxed);
         // No checkpoint yet (a forest seeded from the alloc, or one whose log
         // has outgrown it): write the tree once, and the deltas that follow are
         // measured against it.
@@ -2136,6 +2203,35 @@ impl QmdbNodeState {
             return self.rewrite_checkpoint(block_hash, &mut cursor);
         }
         Ok(())
+    }
+
+    /// [`Self::on_canonical`] while the tree is leased out
+    /// (`N42_QMDB_CANONICAL_DEFER`): one short hold that needs no tree moves
+    /// the head and cuts the records below the window
+    /// ([`QmdbForest::set_canonical_deferring`]); the twig trim is left to
+    /// the lease's return, and the persistence (delta, entry sync, log
+    /// append) to the next head that finds the tree here. `false` (nothing
+    /// done) when the tree is here, when the head is off the tree's path (a
+    /// branch switch: the caller waits and moves it, which also does the
+    /// owed trim first), or after [`CANONICAL_DEFER_MAX_STREAK`] deferrals in
+    /// a row. Called with the persistence cursor held, so it is serialised
+    /// with the persisting path.
+    fn defer_canonical(&self, block_hash: B256) -> Result<bool, NodeStateError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.inner.canonical_defer_streak.load(Relaxed) >= CANONICAL_DEFER_MAX_STREAK {
+            return Ok(false);
+        }
+        let recorded = self.with_forest("on_canonical_defer", |forest| {
+            Ok(forest.set_canonical_deferring(block_hash)?.map(|released| (forest.head().0, released)))
+        })?;
+        let Some((number, released)) = recorded else { return Ok(false) };
+        release_off_lock(number, released);
+        self.inner.canonical_number.store(number, Relaxed);
+        self.inner.canonical_defer_streak.fetch_add(1, Relaxed);
+        self.inner.deferred_canonicals.fetch_add(1, Relaxed);
+        self.note_reader_lag();
+        debug!(target: "n42.qmdb", block = number, %block_hash, "canonical head recorded during a lease; trim and persistence deferred");
+        Ok(true)
     }
 
     /// In file mode, the entry file's appends are made durable before the

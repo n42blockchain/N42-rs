@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
 use n42_twig_core::qmdb_compat::{
-    gov5_account_key, gov5_storage_key, BlockUndo, QmdbCompatTree, QmdbEntrySnapshot,
+    gov5_account_key, gov5_storage_key, BlockUndo, LeafHashes, QmdbCompatTree, QmdbEntrySnapshot,
     QmdbOps, QmdbProof, QmdbSnapshot, TwigNodes,
 };
 use serde::{Deserialize, Serialize};
@@ -488,22 +488,30 @@ impl TreeLease {
     /// Nothing outside the tree is touched; [`QmdbForest::return_tree`] files
     /// the result as pending work.
     pub fn compute(&mut self, ops: impl Into<QmdbOps>) -> Result<LeasedRoot, StateError> {
+        self.compute_with_leaves(ops, None)
+    }
+
+    /// [`Self::compute`] with the operations' leaf hashes computed before the
+    /// lease was taken ([`LeafHashes::of`] on the sorted operations), so the
+    /// tree is out only for what needs it. Hashes that do not belong to the
+    /// operations are ignored; the root is the same either way.
+    pub fn compute_with_leaves(&mut self, ops: impl Into<QmdbOps>, leaves: Option<&LeafHashes>) -> Result<LeasedRoot, StateError> {
         let mut ops = ops.into();
         if !ops.is_sorted() {
             ops.sort();
         }
         let applied_at = std::time::Instant::now();
-        let (root, undo, phases) = self.tree.apply_ops_recorded_phased(&ops)?;
+        let (root, undo, phases) = self.tree.apply_ops_recorded_phased_with(&ops, leaves)?;
         let apply_us = applied_at.elapsed().as_micros() as u64;
         let delta_at = std::time::Instant::now();
-        let delta = delta_of_applied(&self.tree, &undo);
-        let offsets = if self.tree.entry_file().is_some() {
-            (undo.prev_next_slot..self.tree.next_slot())
-                .map(|slot| self.tree.entry_offset(slot))
-                .collect::<Option<Vec<u64>>>()
-                .map(Arc::from)
+        let tree = &self.tree;
+        let offsets = || {
+            tree.entry_file().is_some().then(|| appended_offsets(tree, undo.prev_next_slot)).flatten()
+        };
+        let (delta, offsets) = if n42_twig_core::qmdb_compat::parallel_apply() {
+            rayon::join(|| delta_of_applied(tree, &undo), offsets)
         } else {
-            None
+            (delta_of_applied(tree, &undo), offsets())
         };
         let delta_us = delta_at.elapsed().as_micros() as u64;
         Ok(LeasedRoot { root: B256::from(root), ops, undo, delta, offsets, phases, apply_us, delta_us })
@@ -534,6 +542,34 @@ impl BlockChangesParts {
             .map(|(key, value)| (*key, if value.is_some() { appended.next().copied() } else { None }))
             .collect()
     }
+}
+
+/// Says once per process which of the apply's switches this forest runs
+/// with (`N42_QMDB_PARALLEL_APPLY`).
+fn log_switches_once() {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        tracing::info!(
+            target: "n42.qmdb",
+            parallel_apply = n42_twig_core::qmdb_compat::parallel_apply_env(),
+            rayon_threads = rayon::current_num_threads(),
+            "QMDB block apply (N42_QMDB_PARALLEL_APPLY)",
+        );
+    });
+}
+
+/// The entry-file offsets of the slots appended since `from`, in slot order
+/// (`None` when one is missing): on the worker pool with
+/// `N42_QMDB_PARALLEL_APPLY`, the same list either way.
+fn appended_offsets(tree: &QmdbCompatTree, from: u64) -> Option<Arc<[u64]>> {
+    use rayon::prelude::*;
+    let count = usize::try_from(tree.next_slot().saturating_sub(from)).ok()?;
+    let offsets = if n42_twig_core::qmdb_compat::parallel_apply() {
+        (0..count).into_par_iter().with_min_len(8192).map(|k| tree.entry_offset(from + k as u64)).collect::<Option<Vec<u64>>>()
+    } else {
+        (0..count).map(|k| tree.entry_offset(from + k as u64)).collect::<Option<Vec<u64>>>()
+    };
+    offsets.map(Arc::from)
 }
 
 /// The delta from the parent to the block just applied on `tree`; see
@@ -763,6 +799,7 @@ impl QmdbForest {
     }
 
     fn at(number: u64, hash: B256, tree: QmdbCompatTree) -> Self {
+        log_switches_once();
         let root = B256::from(tree.root());
         let next_slot = tree.next_slot();
         let mut records = HashMap::new();

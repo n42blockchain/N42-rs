@@ -134,6 +134,13 @@ struct ChainState {
     defer_refused: bool,
     /// The start refused that way, waiting for its parent's take.
     deferred: Option<DeferredChain>,
+    /// `N42_BUILD_AHEAD_GATE` ([`AheadGate`]).
+    gate: AheadGate,
+    /// `N42_BUILD_AHEAD_GATE=seal`: the build started on the slot's build
+    /// once that one sealed, before the proposal path took it. It moves into
+    /// the slot when the slot's build is taken, and is thrown away with it
+    /// when that one is discarded. Always `None` under the default gate.
+    next: Option<Chained>,
 }
 
 /// A chain start that the one-ahead bound held back (see
@@ -174,6 +181,108 @@ impl std::fmt::Debug for DeferredChain {
 /// `N42_BUILD_AHEAD_AT_SEAL=1`: see [`ChainState::defer_refused`]. Default off.
 fn build_ahead_at_seal() -> bool {
     std::env::var("N42_BUILD_AHEAD_AT_SEAL").is_ok_and(|value| value == "1")
+}
+
+/// `N42_BUILD_AHEAD_GATE=seal|qc|send`: what lets the chain start block N
+/// while the slot still holds the untaken chained build of N-1.
+///
+/// `send` (the default, today's rule): nothing does. N starts when N-1 is
+/// taken, i.e. at the request that follows the previous proposal's send
+/// (deferred there under `N42_BUILD_AHEAD_AT_SEAL`, dropped otherwise). On
+/// loop351's D2S12P35T64X7DRc leg 16-17% of the builds waited for that send
+/// and cycled at ~70 ms against ~44.
+///
+/// `seal`: N-1 having sealed is enough. N starts at once and waits in a
+/// second place behind the slot ([`ChainState::next`]); "never two ahead"
+/// is then counted from the seal: while N-1 is still untaken, N's own seal
+/// starts nothing (N+1 is deferred under `N42_BUILD_AHEAD_AT_SEAL` until
+/// N-1 is taken, dropped otherwise), so at most one unsealed build is in
+/// flight and at most two sealed-or-building ones are ahead of the
+/// proposals. A build started this way stands or falls with N-1: when N-1
+/// is discarded (another parent asked for, its branch abandoned, nothing
+/// built) N is taken out with it and waited out the same way.
+///
+/// `qc` is accepted and means `send`: N-1 sits in the slot only until the
+/// proposal before it is sent, and no QC exists for a block before its own
+/// proposal, so a QC-gated start can never be earlier than the send.
+/// Anything else, or unset: `send`. Read once a client.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AheadGate {
+    /// Today's rule: the successor waits for the take (after the send).
+    #[default]
+    Send,
+    /// The successor starts at the parent's seal, one behind the slot.
+    Seal,
+}
+
+impl AheadGate {
+    /// The gate a value of `N42_BUILD_AHEAD_GATE` names.
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("seal") => Self::Seal,
+            // `qc` cannot be earlier than the send (see the type's docs).
+            _ => Self::Send,
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::parse(std::env::var("N42_BUILD_AHEAD_GATE").ok().as_deref())
+    }
+}
+
+/// A chained build as the gate compares it: its branch, its number and the
+/// parent it was started on (for a sealed header: the header's number and
+/// parent hash).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChainKey {
+    generation: u64,
+    number: u64,
+    parent: B256,
+}
+
+impl Chained {
+    fn key(&self) -> ChainKey {
+        ChainKey { generation: self.generation, number: self.number, parent: self.parent }
+    }
+}
+
+/// What [`chain_start_decision`] lets a sealed build's successor do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainStart {
+    /// Start, into the empty slot.
+    Slot,
+    /// Start, into the place behind the slot (`N42_BUILD_AHEAD_GATE=seal`).
+    Behind,
+    /// Keep the start for the take that makes room (`N42_BUILD_AHEAD_AT_SEAL`).
+    Defer,
+    /// Do not start.
+    Refuse,
+}
+
+/// The one-ahead rule as a function: `sealed` is the build whose seal asks
+/// for its successor, `slot` and `next` what the chain holds.
+fn chain_start_decision(
+    gate: AheadGate,
+    defer_refused: bool,
+    slot: Option<ChainKey>,
+    next: Option<ChainKey>,
+    sealed: ChainKey,
+) -> ChainStart {
+    match (slot, next) {
+        (None, None) => ChainStart::Slot,
+        // Never left this way (the take moves `next` into the slot); refused
+        // rather than guessed at.
+        (None, Some(_)) => ChainStart::Refuse,
+        (Some(slot), None) if slot == sealed => match gate {
+            AheadGate::Seal => ChainStart::Behind,
+            AheadGate::Send if defer_refused => ChainStart::Defer,
+            AheadGate::Send => ChainStart::Refuse,
+        },
+        // Two ahead of the proposals already: the successor of the build
+        // behind the slot waits for the slot's take.
+        (Some(_), Some(next)) if next == sealed && defer_refused => ChainStart::Defer,
+        _ => ChainStart::Refuse,
+    }
 }
 
 /// Chain connections kept for reuse.
@@ -407,8 +516,20 @@ fn abandon_chain(
         .slot
         .as_ref()
         .is_some_and(|waiting| waiting.generation == generation && waiting.parent == who.parent);
+    // `N42_BUILD_AHEAD_GATE=seal`: the build behind the slot, when it is
+    // this one, or when it stands on the slot's build that just went.
+    let behind_mine = state
+        .next
+        .as_ref()
+        .is_some_and(|waiting| waiting.generation == generation && waiting.parent == who.parent);
     if mine {
         state.slot = None;
+    }
+    // Behind a build that does not exist, or itself the one that produced
+    // nothing: dropped either way (the generation bump below stops any start
+    // its task would make).
+    if behind_mine || (mine && state.next.as_ref().is_some_and(|waiting| waiting.generation == generation)) {
+        state.next = None;
     }
     if state.generation == generation {
         state.generation = state.generation.wrapping_add(1);
@@ -468,21 +589,26 @@ fn start_chain_locked(
         );
         return;
     }
-    if let Some(waiting) = &state.slot {
-        // One ahead, never two: the previous chained build has not been
-        // taken, so the proposal is behind and a second would be a block of
-        // state nobody asked for.
-        //
-        // When the build in the slot is the very one that just sealed, the
-        // start is only early, not wrong: kept, it runs the moment that
-        // build is taken (`N42_BUILD_AHEAD_AT_SEAL`).
-        let own = waiting.generation == generation
-            && waiting.number == built.number
-            && waiting.parent == built.parent_hash;
-        if state.defer_refused && own {
+    // One ahead, never two: a previous chained build that has not been
+    // taken means the proposal is behind, and a second would be a block of
+    // state nobody asked for. When the build in the slot is the very one
+    // that just sealed, the start is only early, not wrong: kept, it runs
+    // the moment that build is taken (`N42_BUILD_AHEAD_AT_SEAL`), or at once
+    // behind it (`N42_BUILD_AHEAD_GATE=seal`).
+    let sealed_key = ChainKey { generation, number: built.number, parent: built.parent_hash };
+    let decision = chain_start_decision(
+        state.gate,
+        state.defer_refused,
+        state.slot.as_ref().map(Chained::key),
+        state.next.as_ref().map(Chained::key),
+        sealed_key,
+    );
+    match decision {
+        ChainStart::Slot | ChainStart::Behind => {}
+        ChainStart::Defer => {
             debug!(
                 target: "n42.h2.el",
-                number = waiting.number,
+                number = built.number,
                 "chain deferred: the sealed build has not been taken; its successor starts when it is"
             );
             state.deferred = Some(DeferredChain {
@@ -495,12 +621,14 @@ fn start_chain_locked(
             });
             return;
         }
-        debug!(
-            target: "n42.h2.el",
-            number = waiting.number,
-            "no chain: the previous chained build has not been taken"
-        );
-        return;
+        ChainStart::Refuse => {
+            debug!(
+                target: "n42.h2.el",
+                number = state.slot.as_ref().map_or(built.number, |waiting| waiting.number),
+                "no chain: the previous chained build has not been taken"
+            );
+            return;
+        }
     }
     let Some((sealed, attrs)) = (sealer)(built, built_with, view) else {
         debug!(target: "n42.h2.el", number = built.number, view, "no chain: the sealer declined");
@@ -533,8 +661,14 @@ fn start_chain_locked(
         // finished; the block is dropped with it.
         let _ = tx.send(built);
     });
-    info!(target: "n42.h2.el", number, ?parent, view = next_view, trigger = trigger.as_str(), "chain started");
-    state.slot = Some(Chained { generation, parent, attrs, number, started, trigger, answer });
+    let behind = decision == ChainStart::Behind;
+    info!(target: "n42.h2.el", number, ?parent, view = next_view, trigger = trigger.as_str(), behind, "chain started");
+    let chained = Chained { generation, parent, attrs, number, started, trigger, answer };
+    if behind {
+        state.next = Some(chained);
+    } else {
+        state.slot = Some(chained);
+    }
 }
 
 /// What a chained build's connection came back with: the block, or the
@@ -682,6 +816,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             chain_sealer: std::sync::OnceLock::new(),
             chain: std::sync::Arc::new(std::sync::Mutex::new(ChainState {
                 defer_refused: build_ahead_at_seal(),
+                gate: AheadGate::from_env(),
                 ..ChainState::default()
             })),
         }
@@ -698,6 +833,13 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         }
     }
 
+    /// Sets the build-ahead gate for this client (see [`AheadGate`]); the
+    /// environment (`N42_BUILD_AHEAD_GATE`) sets it at construction.
+    pub fn set_build_ahead_gate(&self, gate: AheadGate) {
+        let mut state = self.chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.gate = gate;
+    }
+
     /// The chained build for `(parent, attrs)`, if the chain started exactly
     /// that one. Anything else in the slot is discarded, with the reason, and
     /// the caller asks the execution layer the ordinary way.
@@ -711,12 +853,16 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         header: &alloy_consensus::Header,
         attrs: &PayloadAttributes,
     ) -> Option<Result<BuiltBlock, ElError>> {
-        let (chained, generation, deferred) = {
+        let (chained, generation, deferred, promoted) = {
             // Taken under the lock and waited for outside it: the task that
             // is finishing this build puts the next one in the same slot.
             let mut state = self.chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let chained = state.slot.take()?;
-            (chained, state.generation, state.deferred.take())
+            // `N42_BUILD_AHEAD_GATE=seal`: the build started behind this one
+            // takes its place (a discard below takes it out again).
+            state.slot = state.next.take();
+            let promoted = state.slot.as_ref().map(Chained::key);
+            (chained, state.generation, state.deferred.take(), promoted)
         };
         // Hashed only once there is something to compare it with, so a node
         // that never chains pays nothing for the chain being here.
@@ -738,16 +884,13 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         if reason.is_none()
             && let Some(deferred) = deferred
         {
-            self.start_deferred(&chained, deferred);
+            self.start_deferred(chained.key(), promoted, deferred);
         }
         if let Some(reason) = reason {
             // Abandon the branch first: the task finishing this build would
             // otherwise start the one after it, and a single wrong guess
             // would cost a build on every view that followed.
-            {
-                let mut state = self.chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.generation = state.generation.wrapping_add(1);
-            }
+            let orphan = self.abandon_branch();
             info!(
                 target: "n42.h2.el",
                 reason,
@@ -766,6 +909,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             // hung execution layer cannot hold the leader here.
             let drained = std::time::Instant::now();
             let _ = tokio::time::timeout(CHAIN_DRAIN, chained.answer).await;
+            Self::drain_orphan(orphan).await;
             debug!(
                 target: "n42.h2.el",
                 drain_ms = drained.elapsed().as_millis() as u64,
@@ -783,10 +927,8 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             // chain that was never there -- and the branch is abandoned,
             // since anything started behind this build stands on a block
             // that does not exist.
-            {
-                let mut state = self.chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.generation = state.generation.wrapping_add(1);
-            }
+            let orphan = self.abandon_branch();
+            Self::drain_orphan(orphan).await;
             info!(
                 target: "n42.h2.el",
                 reason = "the chained build produced nothing",
@@ -812,20 +954,53 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         Some(Ok(block))
     }
 
-    /// Starts the chain start [`start_chain`] deferred for `taken`, which
-    /// the proposal path has just taken: the block before it has been
-    /// proposed, so the successor of `taken` keeps the leader one block
-    /// ahead of its proposals and no further.
+    /// Bumps the generation (every build of the branch is abandoned) and
+    /// takes out the build that moved into the slot from behind the one
+    /// being discarded (`N42_BUILD_AHEAD_GATE=seal`): it stands on that one.
+    fn abandon_branch(&self) -> Vec<Chained> {
+        let mut state = self.chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.generation = state.generation.wrapping_add(1);
+        let current = state.generation;
+        state.deferred = None;
+        let stale = |waiting: &mut Chained| waiting.generation != current;
+        state.slot.take_if(stale).into_iter().chain(state.next.take_if(stale)).collect()
+    }
+
+    /// Waits out a build taken out by [`Self::abandon_branch`], as a
+    /// discarded chained build is: two builds drawing from the queue at once
+    /// is what the drain is there to prevent.
+    async fn drain_orphan(orphans: Vec<Chained>) {
+        for orphan in orphans {
+            let drained = std::time::Instant::now();
+            let number = orphan.number;
+            let _ = tokio::time::timeout(CHAIN_DRAIN, orphan.answer).await;
+            info!(
+                target: "n42.h2.el",
+                reason = "the build it stood on was discarded",
+                number,
+                drain_ms = drained.elapsed().as_millis() as u64,
+                "chain discarded"
+            );
+        }
+    }
+
+    /// Starts the chain start [`start_chain`] deferred for the build whose
+    /// seal asked for it: `taken`, which the proposal path has just taken
+    /// (the default gate), or `promoted`, the build that moved into the slot
+    /// from behind it (`N42_BUILD_AHEAD_GATE=seal`). Either way the leader is
+    /// kept within the one-ahead bound and no further.
     ///
     /// Only for the build it was deferred for, on the branch it was deferred
     /// on: anything else is dropped (the branch was abandoned, or the slot
     /// changed hands in between).
-    fn start_deferred(&self, taken: &Chained, deferred: DeferredChain) {
+    fn start_deferred(&self, taken: ChainKey, promoted: Option<ChainKey>, deferred: DeferredChain) {
         let mut state = self.chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let belongs = deferred.generation == taken.generation
-            && deferred.generation == state.generation
-            && deferred.built.number == taken.number
-            && deferred.built.parent_hash == taken.parent;
+        let owner = ChainKey {
+            generation: deferred.generation,
+            number: deferred.built.number,
+            parent: deferred.built.parent_hash,
+        };
+        let belongs = deferred.generation == state.generation && (owner == taken || Some(owner) == promoted);
         if !belongs || !state.defer_refused {
             debug!(target: "n42.h2.el", number = deferred.built.number, "deferred chain start dropped: not the build taken");
             return;
@@ -2684,5 +2859,113 @@ mod raw_payload_tests {
         // A body of another length is not this block.
         let short = ChainBlock { transactions: body.transactions[..2].to_vec(), ..body };
         assert!(n42_h2_execution::fill_elided(&sealed_elided, &short, elided.tx_count).is_err());
+    }
+}
+
+#[cfg(test)]
+mod ahead_gate_tests {
+    use super::*;
+
+    fn key(generation: u64, number: u64, parent: u8) -> ChainKey {
+        ChainKey { generation, number, parent: B256::repeat_byte(parent) }
+    }
+
+    #[test]
+    fn the_gate_parses_seal_and_falls_back_to_send() {
+        assert_eq!(AheadGate::parse(Some("seal")), AheadGate::Seal);
+        assert_eq!(AheadGate::parse(Some(" seal ")), AheadGate::Seal);
+        assert_eq!(AheadGate::parse(Some("send")), AheadGate::Send);
+        // A QC never precedes the send of the block it certifies.
+        assert_eq!(AheadGate::parse(Some("qc")), AheadGate::Send);
+        assert_eq!(AheadGate::parse(Some("bogus")), AheadGate::Send);
+        assert_eq!(AheadGate::parse(None), AheadGate::Send);
+    }
+
+    #[test]
+    fn an_empty_chain_starts_into_the_slot_under_every_gate() {
+        for gate in [AheadGate::Send, AheadGate::Seal] {
+            for defer in [false, true] {
+                assert_eq!(chain_start_decision(gate, defer, None, None, key(1, 5, 4)), ChainStart::Slot);
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_gate_keeps_todays_rule() {
+        let sealed = key(1, 5, 4);
+        // The slot holds the build that just sealed: deferred to its take, or
+        // dropped without `N42_BUILD_AHEAD_AT_SEAL`.
+        assert_eq!(chain_start_decision(AheadGate::Send, true, Some(sealed), None, sealed), ChainStart::Defer);
+        assert_eq!(chain_start_decision(AheadGate::Send, false, Some(sealed), None, sealed), ChainStart::Refuse);
+        // The slot holds another build: refused.
+        let other = key(1, 4, 3);
+        assert_eq!(chain_start_decision(AheadGate::Send, true, Some(other), None, sealed), ChainStart::Refuse);
+    }
+
+    #[test]
+    fn the_seal_gate_starts_behind_the_sealed_slot_and_never_two_ahead() {
+        let n1 = key(1, 5, 4);
+        let n = key(1, 6, 5);
+        // N-1 sealed while untaken: N starts behind it.
+        assert_eq!(chain_start_decision(AheadGate::Seal, false, Some(n1), None, n1), ChainStart::Behind);
+        assert_eq!(chain_start_decision(AheadGate::Seal, true, Some(n1), None, n1), ChainStart::Behind);
+        // N sealed while N-1 is still untaken: N+1 waits for N-1's take.
+        assert_eq!(chain_start_decision(AheadGate::Seal, true, Some(n1), Some(n), n), ChainStart::Defer);
+        assert_eq!(chain_start_decision(AheadGate::Seal, false, Some(n1), Some(n), n), ChainStart::Refuse);
+        // A seal of anything else (another branch, a stale build) starts nothing.
+        let stale = key(0, 5, 4);
+        assert_eq!(chain_start_decision(AheadGate::Seal, true, Some(n1), None, stale), ChainStart::Refuse);
+        assert_eq!(chain_start_decision(AheadGate::Seal, true, Some(n1), Some(n), n1), ChainStart::Refuse);
+        // Never left without a slot but with a build behind it.
+        assert_eq!(chain_start_decision(AheadGate::Seal, true, None, Some(n), n), ChainStart::Refuse);
+    }
+
+    fn chained(generation: u64, number: u64, parent: u8) -> (Chained, tokio::sync::oneshot::Sender<Option<Result<BuiltBlock, ElError>>>) {
+        let (tx, answer) = tokio::sync::oneshot::channel();
+        let chained = Chained {
+            generation,
+            parent: B256::repeat_byte(parent),
+            attrs: PayloadAttributes::default(),
+            number,
+            started: std::time::Instant::now(),
+            trigger: n42_h2_execution::BuildTrigger::Seal,
+            answer,
+        };
+        (chained, tx)
+    }
+
+    #[test]
+    fn abandoning_the_slots_build_drops_the_one_behind_it() {
+        let chain = std::sync::Arc::new(std::sync::Mutex::new(ChainState { gate: AheadGate::Seal, ..ChainState::default() }));
+        let (slot, _a) = chained(0, 5, 4);
+        let (next, _b) = chained(0, 6, 5);
+        {
+            let mut state = chain.lock().unwrap();
+            state.slot = Some(slot);
+            state.next = Some(next);
+        }
+        let who = ChainWho { parent: B256::repeat_byte(4), number: 5, started: std::time::Instant::now() };
+        abandon_chain(&chain, 0, who, "test");
+        let state = chain.lock().unwrap();
+        assert!(state.slot.is_none());
+        assert!(state.next.is_none());
+        assert_eq!(state.generation, 1);
+    }
+
+    #[test]
+    fn abandoning_the_build_behind_keeps_the_slot() {
+        let chain = std::sync::Arc::new(std::sync::Mutex::new(ChainState { gate: AheadGate::Seal, ..ChainState::default() }));
+        let (slot, _a) = chained(0, 5, 4);
+        let (next, _b) = chained(0, 6, 5);
+        {
+            let mut state = chain.lock().unwrap();
+            state.slot = Some(slot);
+            state.next = Some(next);
+        }
+        let who = ChainWho { parent: B256::repeat_byte(5), number: 6, started: std::time::Instant::now() };
+        abandon_chain(&chain, 0, who, "test");
+        let state = chain.lock().unwrap();
+        assert_eq!(state.slot.as_ref().map(|c| c.number), Some(5));
+        assert!(state.next.is_none());
     }
 }

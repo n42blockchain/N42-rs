@@ -568,3 +568,13 @@
 - 仅限 bench：交易池维护任务拿不到 changed accounts（已打包交易仍会移除，发送者的 nonce/余额只在其新交易验证时或 drift 时刷新），
   payload 生成器的预缓存为空，RPC 块/收据缓存和 fee history 缓存不再从通知填充（回退到 provider 读取），
   `logs` 与收据 pubsub 不再推送。`newHeads`、交易队列剪枝、QMDB/引擎头跟随者只读区块与交易，不受影响。
+
+## E=1 40 ms 周期：提前构建闸门与增量输出（不改任何 fork 的 reth crate）
+- `N42_BUILD_AHEAD_GATE=seal|qc|send`（默认 `send`，即今天的规则；代码在 `crates/n42/h2-el-rpc/src/engine.rs`
+  `AheadGate` / `chain_start_decision` / `ChainState::next` / `abandon_branch`）：`seal` 时，槽里尚未被提案取走的
+  链式构建 N-1 一旦 seal，N 立即开始，排在槽后的第二个位置（`next`）；N-1 被取走时 N 进入槽。"永不领先两个"从 seal
+  算起：N-1 仍未取走时 N 的 seal 不再启动 N+1（`N42_BUILD_AHEAD_AT_SEAL=1` 下延到 N-1 被取走时，否则丢弃），所以至多
+  一个未 seal 的构建在途。N-1 被丢弃（父块不符、分支放弃、执行层什么也没产出）时，N 随之取出并像被丢弃的链式构建一样
+  等它结束（`drain_orphan`，日志 "the build it stood on was discarded"）。`qc` 被接受但等同 `send`（区块在自身提案之前
+  没有 QC）。依据：loop351 D2S12P35T64X7DRc 中 16-17% 的构建在等上一提案的发送，这些块周期约 70 ms，把均值从 44 抬到
+  50.3 ms。叠放层（`N42_LEADER_LAYERS>=2`）下才有意义：N 的祖父块此时也未落地。测试 `engine::ahead_gate_tests`。

@@ -3371,3 +3371,40 @@ v1's early read (10.103) probed the cloned live index and then walked the deferr
 - **Not done: the address keccak cache.** The keccak in the profile is the historical layer's (QMDB key derivation for accounts the shards do not hold); the shard and early lookups hash with the map's hasher, not keccak, so a `B256` beside the batch entries would not remove it.
 
 Tests: `incremental_tests::{an_early_read_equals_the_frozen_read (with and without the incremental index, deferred or not), an_early_read_equals_the_frozen_read_for_overlapping_batches (24 random batches over a 2,000-address pool: info, original and status equal for every account, multi-batch count = index_conflicts), a_second_early_view_rebuilds_the_index_from_the_batches}`, `parallel_transfer::tests::the_by_index_reverts_sort_matches_the_plain_one`. A leg should rerun loop351 w's D2S12P40T64X7OI against X7 and read `par_exec`, `state_wait` and `seal_to_shards_ready_us`.
+
+### 10.106 loop351 stages y-ab — OI v2 serialises execution; the fold was one task (shard skew, N42_SHARD_MIX takes the seal 39 -> 33 ms) and the cycle still holds 51 ms; the vote road's far-ahead hold is a symptom, the import answer waits for the layer's build finish: two per-block serial chains (QMDB root under the tree lease ~37 ms, engine-thread hand-off + header newPayload ~38 ms) set the cycle
+
+Section 10.105 built OI v2 and left four stages to run. This section records stage y (OI v2 against X7), stage z (`N42_SHARD_MIX=1` after the skew was found), stage aa (far-ahead 2/3 on X7SM) and stage ab (`N42_CHECK_AHEAD_UNHELD=1`). Notation as in 10.104; `OI2` = `N42_OUTPUT_INCREMENTAL=1` with the v2 index (adf296770), `SM` = `N42_SHARD_MIX=1` (882053091), `F2` / `F3` = far-ahead window 2 / 3, `CAU` = `N42_CHECK_AHEAD_UNHELD=1` (6977bfea1), `X7` as the standing configuration. Columns: w1 / w2 / w3 in M tx/s, round total in M tx, `sealed_at` median of window 1 (ms), cycle of window 1 (ms).
+
+| leg | stage | pacing | w1 | w2 | w3 | round total | sealed_at | cycle | note |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| D2S12P40T64X7 | y | 40 | 3.960 | 3.980 | 3.667 | 348.2 | 38 | 51 | control; best round so far |
+| D2S12P40T64X7b | y | 40 | 3.865 | 3.920 | 3.633 | 342.6 | 39 | 52 | control |
+| D2S12P40T64X7OI2 | y | 40 | 1.358 | 1.367 | 1.373 | 122.9 | 145 | 147 | par_exec 133 |
+| D2S12P40T64X7OI2b | y | 40 | 1.380 | 1.387 | 1.373 | 124.2 | 143 | 145 | |
+| D2S12P35T64X7OI2 | y | 35 | 1.347 | 1.380 | 1.373 | 123.0 | 145 | 149 | |
+| D2S12P30T64X7OI2 | y | 30 | 1.390 | 1.393 | 1.380 | 124.9 | 141 | 144 | |
+| D2S12P40T64X7SM | z | 40 | 3.886 | 3.853 | 3.440 | 335.4 | 33 | 51 | `N42_SHARD_MIX=1` |
+| D2S12P40T64X7c | z | 40 | 3.960 | 3.900 | 3.587 | 343.4 | 39 | 51 | control |
+| D2S12P40T64X7SMb | z | 40 | 3.891 | 3.807 | 3.573 | 338.1 | 32 | 51 | SM |
+| D2S12P35T64X7SM | z | 35 | 3.867 | 3.813 | 3.673 | 340.6 | 34 | 52 | SM |
+| D2S12P30T64X7SM | z | 30 | 3.898 | 3.907 | 3.600 | 342.2 | 32 | 51 | SM |
+| D2S12P35T64X7SMb | z | 35 | 3.893 | 3.907 | 3.433 | 337.0 | 33 | 51 | SM |
+| D2S12F2P35T64X7SM | aa | 35 | 3.180 | 2.533 | 2.947 | 260.0 | 36 | 63 | far-ahead 2 |
+| D2S12F2P40T64X7SM | aa | 40 | 3.187 | 2.840 | 2.927 | 268.7 | 31 | 63 | far-ahead 2 |
+| D2S12F3P35T64X7SM | aa | 35 | 2.740 | 2.600 | 2.547 | 236.6 | 40 | 73 | far-ahead 3 |
+| D2S12F2P35T64X7SMb | aa | 35 | 3.140 | 2.660 | 3.327 | 273.8 | 32 | 64 | far-ahead 2 |
+| D2S12F2P30T64X7SM | aa | 30 | 3.393 | 3.047 | 3.413 | 295.8 | 33 | 59 | far-ahead 2 |
+| D2S12F2P40T64X7SMb | aa | 40 | 2.940 | 2.847 | 3.073 | 265.8 | 31 | 68 | far-ahead 2 |
+| D2S12P35T64X7SMCAU | ab | 35 | 3.160 | 2.793 | 2.873 | 265.0 | 33 | 63 | `N42_CHECK_AHEAD_UNHELD=1` |
+| D2S12P30T64X7SMCAU | ab | 30 | 3.060 | 3.247 | 3.400 | 291.2 | 30 | 65 | CAU |
+
+- **OI v2 is out (stage y, loop351 analysis).** The X7 controls read 3.96 / 3.98 / 3.67 and 3.87 / 3.92 / 3.63M (round 348M, a new best). X7 + OI v2 reads 1.36M with `sealed_at` 144 and `par_exec` 132 ms at every pacing from 30 to 40 ms: the per-batch early index inserts under 1024 locks run while the 64 build threads execute, and the shared writes serialise them. OI (v1 and v2) is excluded. Lesson: no shared writes during execution.
+- **The fold was one task (stage z).** `shard_index` (`output_shards.rs:374`) took the address's top 16 bits; the flood's recipients carry the slot number there, so ~190k of the 190.6k touched accounts land in shard 0 of 16 (`heavy_shard=0` on 60 of 60 blocks, `task_max_us` 18.1 ms = the fold, ~95 ns an account single-threaded; `N42_FREEZE_SPLIT=4` only halved the enter pass). `N42_SHARD_MIX=1` (splitmix over all 20 bytes, layout-only; the neutrality test is byte-identical over 8 fold modes) takes `sealed_at` from 39 to 33, the fold from 15 to 6 ms and `seal_to_shards_ready` from 22.7 to ~5 ms. TPS does not move: SM reads 3.89 / 3.85 / 3.44 and 3.89 / 3.81 / 3.57 at 40 ms, 3.87 / 3.81 / 3.67 and 3.89 / 3.91 / 3.43 at 35 ms, 3.90 / 3.91 / 3.60 at 30 ms, against the X7c control 3.96 / 3.90 / 3.59: the cycle is 51-52 at every pacing, so the 6-7 ms the seal gained are waited for somewhere else. SM stays on (layout-only, correct, no cost).
+- **Far-ahead 2/3 is worse again (stage aa).** On X7SM it reads 2.74-3.39M with the cycle at 59-73 ms: the leader then waits on its anchor.
+- **The vote road's hold is a symptom (stage ab, loop351 analysis).** With check-before-slot a block behind the in-flight cap sits in `import_queue`, invisible to `importing()` (`driver.rs:2226`), so the service's tip reads N-2 and `far_ahead` (`service.rs` ~3841) holds block N before `spawn_check_ahead` can run: 67% of views are held, the vote takes 30 ms median / 92 p90 against 2.4 ms unheld, and the release on landing is immediate (0.04 ms). `N42_CHECK_AHEAD_UNHELD=1` (`holds_far_ahead` `service.rs:3877`, `check_ahead_admits` `driver.rs:1998`, the pipeline cap = in_flight + `N42_CHECK_AHEAD_QUEUE`, 2) reads 3.16 / 2.79 / 2.87M at 35 ms with the cycle at 63 and first-vote p90 91-126 ms (3.06 / 3.25 / 3.40M at 30 ms, cycle 65): the hold was the throttle, and the blocks past the pipeline cap wait ~100 ms for a slot. Stays off. (The `X7SMc` control leg of stage ab had not finished when the output file was last written.)
+- **Why a slot is held ~100-150 ms at E=1 (loop351 analysis of the X7SM leg).** A follower's import of N is answered (`own block imported by header`, `payload_serve.rs:2488`, via `serve_from_own_build` 2436-2495) only after the layer's whole build of N finishes: ~134 ms after P(N) (seal 33 + roots 37 + hashed/finish), plus the hand-off (~20), plus the newPayload answer (18-25 ms, mostly `forest lock waited ... held_by=tree_lease` from `on_canonical`). The validator adds 0 ms after the answer; the commit FCU in `finish_execute` takes 15 / 62 ms (467 / 653 `Syncing`). Answer inter-arrival is 44 / 98 ms = the layer's two per-block serial chains: the QMDB root under the tree lease (37 ms) and the engine-thread hand-off + header newPayload (~38 ms including the `on_canonical` lock wait). Slots and queue depth only move the waiting (stage ac measures I3 / Q4 anyway).
+
+**What binds, and what is next.** The leader's build is no longer the cycle (`sealed_at` 33, fold 6): the 51 ms is the layer's two serial chains per block. Next is `N42_QMDB_CANONICAL_DEFER` (in progress): `on_canonical`'s twig trims deferred like the rename, so the newPayload answer does not wait for a lease. Beyond that only pipelining the root computation (a copy-on-write tree) shortens the serial chain.
+
+Hand-off files: `target/fleet-runs/loop351{y,z,aa,ab}.out`.

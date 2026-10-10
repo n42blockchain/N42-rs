@@ -749,15 +749,19 @@ fn run_boundary(kind: &'static str, fault: Fault) {
         assert_eq!(if kind == "r1" { sent_r1 } else { sent_r2 }, 1, "{label}: the vote is sent");
     }
 
-    // The watermark moves before the log call, so a failed persist still
-    // consumes the view in memory: the engine refuses a retry in that view.
+    // A failed persist rolls the watermark back, so the same view can be
+    // retried in memory; a successful one consumes the view.
     let (marker, other) = if kind == "r1" { (engine.last_voted_view(), 0) } else { (engine.last_commit_voted_view(), engine.last_voted_view()) };
-    assert_eq!(marker, 1, "{label}: the in-memory watermark is already advanced");
+    assert_eq!(marker, u64::from(!injected), "{label}: the in-memory watermark");
     assert_eq!(other, u64::from(kind == "r2"));
     let retry = if kind == "r1" { proposal.clone() } else { prepare() };
     let _ = engine.process_event(ConsensusEvent::Message(retry.clone()));
     let (retry_r1, retry_r2) = sent_votes(&drain(&mut rx));
-    assert_eq!(if kind == "r1" { retry_r1 } else { retry_r2 }, 0, "{label}: a retry in the same view is refused");
+    assert_eq!(
+        if kind == "r1" { retry_r1 } else { retry_r2 },
+        usize::from(injected),
+        "{label}: a retry in the same view is signed only after a failed persist",
+    );
 
     // Crash: rebuild from the durable records only (higher view and higher
     // lock win, as `ConsensusStore::load` does against a stale checkpoint).
@@ -766,7 +770,9 @@ fn run_boundary(kind: &'static str, fault: Fault) {
     let watermark = |k: &str| durable.iter().filter(|(kind, ..)| *kind == k).map(|(_, v, _)| *v).max().unwrap_or(0);
     let lock = durable.iter().map(|(_, _, l)| l.clone()).chain([QuorumCertificate::genesis()]).max_by_key(|l| l.view).expect("lock");
     let (voted, commit_voted) = (watermark("r1"), watermark("r2"));
-    let persisted = fault != Fault::LostWrite;
+    // The retry above wrote the record (only the first call faults), so the
+    // record is durable in every row and the rebuilt engine must not vote again.
+    let persisted = true;
     assert_eq!(if kind == "r1" { voted } else { commit_voted }, u64::from(persisted), "{label}: durable watermark");
     if kind == "r2" {
         // The lock raised by the PrepareQC is durable exactly when the
@@ -796,4 +802,226 @@ fn every_persist_boundary_of_a_vote_is_safe_for_both_rounds() {
             run_boundary(kind, fault);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The recovery bound (arXiv 2610.07759): n = 7, quorum 5, conflicting
+// certificates need b + c >= 2q - n = 3
+// ---------------------------------------------------------------------------
+
+/// Votes in the engine outputs, as `(voter, signature)`.
+fn r1_votes(outputs: &[EngineOutput]) -> Vec<(u32, n42_h2_primitives::BlsSignature)> {
+    outputs
+        .iter()
+        .filter_map(|o| match o {
+            EngineOutput::SendToValidator(_, ConsensusMessage::Vote(v)) => Some((v.voter, v.signature.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn r2_votes(outputs: &[EngineOutput]) -> Vec<(u32, n42_h2_primitives::BlsSignature)> {
+    outputs
+        .iter()
+        .filter_map(|o| match o {
+            EngineOutput::SendToValidator(_, ConsensusMessage::CommitVote(v)) => Some((v.voter, v.signature.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Seven validators; 0 and 1 are Byzantine and played by the test, which holds
+/// their keys. Honest members are real engines, restored at `view`.
+struct Seven {
+    sks: Vec<n42_h2_primitives::BlsSecretKey>,
+    vs: ValidatorSet,
+}
+
+impl Seven {
+    fn new() -> Self {
+        let (_, sks, vs, _) = make(7, 0);
+        Self { sks, vs }
+    }
+
+    fn engine(
+        &self,
+        index: u32,
+        view: ViewNumber,
+        locked: QuorumCertificate,
+        voted: ViewNumber,
+        commit_voted: ViewNumber,
+        log: Arc<dyn crate::vote_log::VoteLogWriter>,
+    ) -> (ConsensusEngine, mpsc::Receiver<EngineOutput>) {
+        let (tx, rx) = mpsc::channel(1024);
+        let engine = ConsensusEngine::with_recovered_state_and_vote_log(
+            index,
+            self.sks[index as usize].clone(),
+            EpochManager::new(self.vs.clone()),
+            60_000,
+            120_000,
+            tx,
+            view,
+            locked,
+            QuorumCertificate::genesis(),
+            0,
+            voted,
+            commit_voted,
+            log,
+        );
+        (engine, rx)
+    }
+
+    /// Builds a certificate from the honest votes plus the Byzantine pair's.
+    fn certify(
+        &self,
+        view: ViewNumber,
+        hash: B256,
+        honest: &[(u32, n42_h2_primitives::BlsSignature)],
+        commit: bool,
+    ) -> ConsensusResult<QuorumCertificate> {
+        use crate::protocol::quorum::{signing_message, VoteCollector};
+        let profile = ConsensusSigningProfile::Native;
+        let message =
+            if commit { profile.commit_message(view, hash, B256::ZERO) } else { signing_message(view, &hash).to_vec() };
+        let mut collector = VoteCollector::new(view, hash, self.vs.len());
+        for (voter, signature) in honest {
+            collector.add_vote(*voter, signature.clone())?;
+        }
+        for byzantine in [0u32, 1] {
+            collector.add_vote(byzantine, self.sks[byzantine as usize].sign(&message))?;
+        }
+        collector.build_qc_with_message(&self.vs, &message)
+    }
+}
+
+/// Plays both views and returns what the restarted member (4) did in the
+/// second one, plus the commit certificate of block A and, when the members
+/// reach one, of block B.
+struct Outcome {
+    commit_a: QuorumCertificate,
+    hash_a: B256,
+    hash_b: B256,
+    view_a: ViewNumber,
+    second_view_error: Option<ConsensusError>,
+    prepare_b: ConsensusResult<QuorumCertificate>,
+    commit_b: Option<QuorumCertificate>,
+    four_log: Vec<(&'static str, u64, QuorumCertificate)>,
+    four_log_after_restart: usize,
+}
+
+fn play(seven: &Seven, amnesiac: bool) -> Outcome {
+    let genesis = QuorumCertificate::genesis();
+    let leader = |e: &ConsensusEngine, v| e.leader_index_for_view(v);
+    // Views whose leader and successor are both Byzantine (0 or 1).
+    let (probe, _) = seven.engine(2, 0, genesis.clone(), 0, 0, Arc::new(crate::vote_log::NoopVoteLog));
+    let view_a = (1..30).find(|v| leader(&probe, *v) <= 1 && leader(&probe, v + 1) <= 1).expect("a Byzantine leader pair");
+    let view_b = view_a + 1;
+    let (hash_a, hash_b) = (B256::repeat_byte(0xA1), B256::repeat_byte(0xB2));
+
+    // View A: the Byzantine leader shows block A to members 2, 3 and 4 only.
+    let four_log = Arc::new(RecordingLog::default());
+    let mut honest = Vec::new();
+    for i in [2u32, 3, 4] {
+        let log: Arc<dyn crate::vote_log::VoteLogWriter> =
+            if i == 4 { four_log.clone() as Arc<dyn crate::vote_log::VoteLogWriter> } else { Arc::new(crate::vote_log::NoopVoteLog) };
+        honest.push(seven.engine(i, view_a, genesis.clone(), 0, 0, log));
+    }
+    let mut r1 = Vec::new();
+    for (engine, rx) in &mut honest {
+        let proposal = proposal_for(engine, &seven.sks, view_a, hash_a, genesis.clone());
+        engine.process_event(ConsensusEvent::BlockImported(hash_a)).expect("import");
+        engine.process_event(ConsensusEvent::Message(proposal)).expect("proposal A");
+        r1.extend(r1_votes(&drain(rx)));
+    }
+    assert_eq!(r1.len(), 3, "2, 3 and 4 vote for A");
+    let prepare_a = seven.certify(view_a, hash_a, &r1, false).expect("3 honest + 2 Byzantine = a quorum of 5");
+    let mut r2 = Vec::new();
+    for (engine, rx) in &mut honest {
+        let msg = PrepareQC { view: view_a, block_hash: hash_a, qc: prepare_a.clone() };
+        engine.process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(msg))).expect("prepare qc A");
+        assert_eq!(engine.locked_qc(), &prepare_a, "locked on A");
+        r2.extend(r2_votes(&drain(rx)));
+    }
+    assert_eq!(r2.len(), 3);
+    let commit_a = seven.certify(view_a, hash_a, &r2, true).expect("commit QC for A");
+    drop(honest);
+
+    // Member 4 crashes with no flush and comes back.
+    let logged = four_log.records.lock().expect("log").clone();
+    assert!(logged.iter().any(|(k, v, l)| *k == "r2" && *v == view_a && l == &prepare_a), "4 logged the lock before signing");
+    let (lock, voted, commit_voted) = if amnesiac { (genesis.clone(), 0, 0) } else { (prepare_a.clone(), view_a, view_a) };
+    let after = Arc::new(RecordingLog::default());
+    let (mut four, mut four_rx) = seven.engine(4, view_b, lock, voted, commit_voted, after.clone());
+
+    // View B: the Byzantine leader shows conflicting block B to 4, 5 and 6.
+    let mut r1 = Vec::new();
+    let mut error = None;
+    let mut rest = vec![(5u32, seven.engine(5, view_b, genesis.clone(), 0, 0, Arc::new(crate::vote_log::NoopVoteLog))), (
+        6,
+        seven.engine(6, view_b, genesis.clone(), 0, 0, Arc::new(crate::vote_log::NoopVoteLog)),
+    )];
+    let proposal = proposal_for(&four, &seven.sks, view_b, hash_b, genesis.clone());
+    four.process_event(ConsensusEvent::BlockImported(hash_b)).expect("import");
+    if let Err(e) = four.process_event(ConsensusEvent::Message(proposal.clone())) {
+        error = Some(e);
+    }
+    r1.extend(r1_votes(&drain(&mut four_rx)));
+    for (_, (engine, rx)) in &mut rest {
+        engine.process_event(ConsensusEvent::BlockImported(hash_b)).expect("import");
+        engine.process_event(ConsensusEvent::Message(proposal.clone())).expect("proposal B");
+        r1.extend(r1_votes(&drain(rx)));
+    }
+    let prepare_b = seven.certify(view_b, hash_b, &r1, false);
+    let mut commit_b = None;
+    if let Ok(qc) = &prepare_b {
+        let mut r2 = Vec::new();
+        let mut engines: Vec<(&mut ConsensusEngine, &mut mpsc::Receiver<EngineOutput>)> = vec![(&mut four, &mut four_rx)];
+        for (_, (engine, rx)) in &mut rest {
+            engines.push((engine, rx));
+        }
+        for (engine, rx) in engines {
+            let msg = PrepareQC { view: view_b, block_hash: hash_b, qc: qc.clone() };
+            engine.process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(msg))).expect("prepare qc B");
+            r2.extend(r2_votes(&drain(rx)));
+        }
+        commit_b = Some(seven.certify(view_b, hash_b, &r2, true).expect("commit QC for B"));
+    }
+    let four_log_after_restart = after.records.lock().expect("log").len();
+    Outcome { commit_a, hash_a, hash_b, view_a, second_view_error: error, prepare_b, commit_b, four_log: logged, four_log_after_restart }
+}
+
+#[test]
+fn two_byzantine_and_one_amnesiac_member_can_commit_conflicting_blocks() {
+    let seven = Seven::new();
+    assert_eq!(seven.vs.quorum_size(), 5);
+    let out = play(&seven, true);
+    assert!(out.second_view_error.is_none(), "the amnesiac sees nothing wrong with B: {:?}", out.second_view_error);
+    let commit_b = out.commit_b.expect("b = 2, c = 1: 2 + 1 + 2 honest = 5 votes for B");
+    let zero = B256::ZERO;
+    crate::protocol::quorum::verify_commit_qc(&out.commit_a, &seven.vs, &zero).expect("A is committed");
+    crate::protocol::quorum::verify_commit_qc(&commit_b, &seven.vs, &zero).expect("B is committed");
+    assert_ne!(out.hash_a, out.hash_b);
+    assert_eq!((out.commit_a.block_hash, commit_b.block_hash), (out.hash_a, out.hash_b));
+    assert_eq!((out.commit_a.view, commit_b.view), (out.view_a, out.view_a + 1), "conflicting commits at adjacent views");
+}
+
+#[test]
+fn two_byzantine_members_cannot_when_the_restarted_member_kept_its_vote_log() {
+    let seven = Seven::new();
+    let out = play(&seven, false);
+    crate::protocol::quorum::verify_commit_qc(&out.commit_a, &seven.vs, &B256::ZERO).expect("A is committed");
+    let error = out.second_view_error.expect("the restored lock refuses B");
+    assert!(
+        matches!(error, ConsensusError::SafetyViolation { qc_view: 0, locked_view } if locked_view == out.view_a),
+        "{error:?}",
+    );
+    // 5, 6 and the two Byzantine members make four, one short of the quorum.
+    assert!(
+        matches!(out.prepare_b, Err(ConsensusError::InsufficientVotes { have: 4, need: 5, .. })),
+        "{:?}",
+        out.prepare_b,
+    );
+    assert!(out.commit_b.is_none());
+    assert_eq!(out.four_log_after_restart, 0, "the restarted member recorded no new vote");
+    assert!(out.four_log.iter().all(|(_, v, _)| *v == out.view_a));
 }

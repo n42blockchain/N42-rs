@@ -3408,3 +3408,30 @@ Section 10.105 built OI v2 and left four stages to run. This section records sta
 **What binds, and what is next.** The leader's build is no longer the cycle (`sealed_at` 33, fold 6): the 51 ms is the layer's two serial chains per block. Next is `N42_QMDB_CANONICAL_DEFER` (in progress): `on_canonical`'s twig trims deferred like the rename, so the newPayload answer does not wait for a lease. Beyond that only pipelining the root computation (a copy-on-write tree) shortens the serial chain.
 
 Hand-off files: `target/fleet-runs/loop351{y,z,aa,ab}.out`.
+
+### 10.107 loop351 stages ac-ad and the checkpoint — three import slots, a deeper queue and the deferred canonical advance change nothing; E=1 on this box is a rate limit of the layer at ~3.9M (cycle 51 ms); window-1 best 4.03M; what 5M would take
+
+Two more rounds on the E=1 shape (seven validator keys on one execution layer, X7 + plain S1 set + `N42_SHARD_MIX=1`, switch list in 10.106). Both end the series of single-wait removals: none of them moves the cycle.
+
+| leg | stage | pacing | w1 | w2 | w3 | round total | sealed_at | cycle | note |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| I3S12P35 SM CAU | ac | 35 ms | 3.72M | 2.73M | 2.62M | 272.4M | 44 | 54 / 73 / 76 ms | CAU + I3 (three import slots); the leader waits on the layer again |
+| I3S12P30 SM CAU | ac | 30 ms | 3.26M | 2.57M | 2.95M | 263.4M | 51 | 61 / 78 / 68 ms | BODYGATE (own_not_committed=1), round stopped |
+| S12P35 SM CD | ad | 35 ms | 3.90M | 3.92M | 3.48M | 339.1M | 33 | 51 / 51 / 57 ms | `N42_QMDB_CANONICAL_DEFER=1` |
+| S12P30 SM CD | ad | 30 ms | **4.03M** | 3.86M | 3.68M | 347.4M | 33 | 50 / 52 / 54 ms | window-1 record (121.0M tx) |
+| S12P35 SM CD (b) | ad | 35 ms | 3.89M | 3.73M | 3.51M | 334.0M | 32 | 51 / 54 / 57 ms | repeat of the 35 ms leg |
+| S12P30 SM CD (b) | ad | 30 ms | 3.83M | 3.02M | 3.03M | 296.6M | 33 | 52 / 66 / 64 ms | repeat of the 30 ms leg: window 1 holds, 2-3 do not |
+| S12P40 SM CD | ad | 40 ms | 3.92M | 3.88M | 3.53M | 340.0M | 31 | 51 / 52 / 57 ms | |
+| S12P35 SM (control) | ad | 35 ms | 3.90M | 3.81M | 3.57M | 338.4M | 33 | 51 / 52 / 56 ms | deferred advance off |
+
+All legs: 200,000-transaction blocks, occupancy 99.6-100%, BODYGATE clean except the stage-ac 30 ms leg. The stage-ac and ad WARM legs (3.1-3.2M, cycle 63 ms, 283M) are the usual warm-up, not results.
+
+- **Stage ac: everything that lets the chain run ahead of the layer's landing moves the wait to the leader's anchor (loop351 analysis).** CAU + I3 / Q4 on X7SM: `sealed_at` returns to 44-51 ms (against 33), windows 2-3 fall to 2.6-2.9M, the 30 ms leg ends in BODYGATE (`own_not_committed=1`) and the round is stopped. CAU, I3 and Q4 (with F2 / F3 before them) are all out: deeper queues and more import slots only move where the leader waits.
+- **Stage ad: the deferred canonical advance is neutral.** `N42_QMDB_CANONICAL_DEFER=1` (1839b0ee4 / ac638c715: the head advances in place under a short hold while the tree is leased, trims are repaid by `return_tree`, delta / entry sync runs on a background thread) reads 3.90 / 3.92 / 3.48 and 3.89 / 3.73 / 3.51 at 35 ms, 4.03 / 3.86 / 3.68 and 3.83 / 3.02 / 3.03 at 30 ms, 3.92 / 3.88 / 3.53 at 40 ms, against the control 3.90 / 3.81 / 3.57. `forest lock waited on_canonical` falls 821 -> 733 only: the deferred path engages rarely, and the cycle does not change (50-52 ms). The 4.03M window is a best-of-N draw inside the noise (the repeat of the same leg reads 3.83M then 3.02M), not a new floor.
+- **The day's pattern (loop351 analysis).** Seal 59 -> 33 ms (shard mix), the vote hold removed, lock waits moved: each single wait removed leaves 3.9M at a 51 ms cycle. That is a rate limit of the layer, not a latency. Its per-block serial chains all sit at 37-50 ms: the QMDB root under the tree lease (37 ms), the engine-thread hand-off + header newPayload (~38 ms), and persistence (33-41 ms a block, `sf_tx` 31-35 ms the longest part; it kept up 100% at a 51 ms cycle at ~80% duty, so the wall is at ~40 ms).
+- **What 5M would take.** 5M is a 40 ms cycle at 200,000 transactions, so every chain has to be under ~30 ms with margin: pipelined root computation (a copy-on-write tree, so block N+1's root does not wait for the lease), parallel / sharded static-file persistence, and a shorter answer chain from the layer to the validator. Each is a multi-day structural project; none is a switch.
+- **Standing results.** Reproducible 3.9M at a 51 ms cycle with X7 + plain S1 set + `N42_SHARD_MIX=1`; window-1 best 4.03M (ad, 30 ms); round best 348M (y, X7 40 ms; ad 30 ms reads 347.4M). The default-off switch inventory added since 10.98 is X3-X7, SM and CD, plus the rejected ones (OI v1 / v2, AG, CAU, `QUEUE_PLAN_SNAPSHOT`, `FAR_AHEAD_BLOCKS>1`, `DEFERRED_IN_FLIGHT=3`, `CHECK_AHEAD_QUEUE`), which stay in the tree but out of the bench set.
+
+**Where it stands.** On this box one execution layer serving seven validator keys sustains about 3.9M transactions a second at a 51 ms cycle, reproducibly, with a best window of 4.03M and a best round of 348M transactions. The leader's build is no longer the limit (`sealed_at` 33 ms); the limit is the rate at which the layer completes its per-block serial chains (QMDB root 37 ms, hand-off + newPayload ~38 ms, persistence 33-41 ms), and every switch that removed one wait only exposed the next one at the same 51 ms. Reaching 5M needs those chains under ~30 ms through pipelined root computation, sharded static-file persistence and a shorter answer chain, which is structural work, not tuning.
+
+Hand-off files: `target/fleet-runs/loop351{ac,ad}.out`.

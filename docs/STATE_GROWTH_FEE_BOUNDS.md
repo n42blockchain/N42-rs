@@ -73,7 +73,7 @@ would replace it.
 All rows inferred. The bench rows are a ceiling the hardware does not reach (the bench measured ~14k
 new accounts per block, ~9% of a full block, and a 0.4+ s cycle); they show the protocol bound, not
 what the fleet can do. A bound in dollars needs the base fee: at the bench floor (~800 wei) a
-21,000-gas account costs ~1.7e-5 gwei-scale, effectively free (inferred).
+21,000-gas account costs ~1.7e7 wei (0.017 gwei), effectively free (inferred).
 
 ## 4. Experiment design (not run)
 

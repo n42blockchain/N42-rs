@@ -243,10 +243,18 @@ stages = '''case $STAGE in
      b7 D2S12P35T64X9 $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35
      b7 D2S12P40T64X9b $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=40
      b7 D2S12P35T64X9b $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35 ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v or w)"; exit 2 ;;
+  x) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     b7 D2S12P40T64X7PROF $D2 $S1 $S2 $X7 $T64 F7_BIN=$WT/target/profiling-build/profiling F7_BLOCK_INTERVAL_MS=40
+     P=$S/perf-loop351D2S12P40T64X7PROF; if [ "${LOOP351_DRY:-0}" != 1 ] && [ -f $P.data ]; then PB=$WT/target/profiling-build/profiling; { for sk in symbol dso,symbol comm,symbol; do echo "== perf report --sort $sk"; perf report -i $P.data --stdio --no-inline --no-children --sort $sk --percent-limit 0.5 2>/dev/null | grep -v '^#' | grep -v '^$'; done; } > $P.report.txt; echo "perf report: $P.report.txt"; fi ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w or x)"; exit 2 ;;
 esac
 '''
 r = r[:i] + stages + r[j:]
+# stage x: a perf recording of the layer between windows (window 2, ~5 s in), F7_BIN from the leg's args (profiling build)
+r = r.replace("  echo \"leg $tag start $(date +%H:%M:%S) load", "  case $tag in *7PROF) ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; sleep 45; F7_BIN=$WT/target/profiling-build/profiling bash scripts/fleet7-profile.sh 0 $S/perf-$tag 10 > $S/perf-$tag.run.out 2>&1 ) & ;; esac\n  echo \"leg $tag start $(date +%H:%M:%S) load", 1)
+assert '*7PROF' in r
 import os
 def atomic(path, text):
     # replace by rename: a runner may be reading the old file (a truncating write would corrupt its run)
@@ -254,11 +262,11 @@ def atomic(path, text):
 atomic(D + 'run-loop351.sh', r)
 
 l = r'''#!/bin/bash
-# loop351 (200k, 7 keys on one layer, 50 ms pacing; derive351.py). usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w>. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh f > target/fleet-runs/loop351f.out 2>&1 &
+# loop351 (200k, 7 keys on one layer, 50 ms pacing; derive351.py). usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x>. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh f > target/fleet-runs/loop351f.out 2>&1 &
 # Waits for the box, checks the tree, and runs the stage. When crates/ or bin/ changed since the last build, the launcher builds target/native (the legs' F7_BIN) after the box is free and the runner
 # runs its own test gate, clippy and the target/deferred build (once: this launcher does not export LOOP351_GATE_TREES for a changed tree). Unchanged tree: no build, no tests.
 cd /data/n42-build/wt338
-STAGE=${1:-a}; case $STAGE in a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w) ;; *) echo "usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w>"; exit 2;; esac
+STAGE=${1:-a}; case $STAGE in a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x) ;; *) echo "usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x>"; exit 2;; esac
 # the tree (crates/ and bin/) the binaries in target/native and target/deferred were built from: f2794a821 until a build here records another (the marker is written after a stage that built)
 MARK=target/fleet-runs/loop351-built-trees
 BUILT=f2794a821

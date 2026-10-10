@@ -113,6 +113,7 @@ run() { local tag=$1; shift
   case $tag in *STRACE) ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; sleep 12; p=$(ps -eo pid,args | grep '/n4[2] node' | grep 'rust-fleet7-bench/node0' | grep -v grep | awk '{print $1}' | head -1); [ -n "$p" ] && echo "$tag strace -c -f -p $p from $(date +%H:%M:%S) for 20 s" && timeout -s INT 20 strace -c -f -p $p -o $S/strace-$tag.txt; echo "strace exit $? at $(date +%H:%M:%S)" ) > $S/strace-$tag.log 2>&1 & ;; esac
   ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; exec env F7_EL_MAP=$EL_MAP python3 scripts/fleet7-runs/memsample.py $STRIP/mem.log $NEL ) > /dev/null 2>&1 & MS=$!
   case $tag in *DPROF) ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; sleep 30; bash scripts/fleet7-offcpu.sh --node 0 --secs 10 $S/offcpu-$tag > $S/offcpu-$tag.run.out 2>&1 ) & ;; esac
+  case $tag in *7PROF) ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; sleep 45; F7_BIN=$WT/target/profiling-build/profiling bash scripts/fleet7-profile.sh 0 $S/perf-$tag 10 > $S/perf-$tag.run.out 2>&1 ) & ;; esac
   echo "leg $tag start $(date +%H:%M:%S) load $(awk '{print $1}' /proc/loadavg)"
   local WARG=3; for kv in "$@"; do case "$kv" in F7_WINDOWS_ARG=*) WARG=${kv#*=};; esac; done
   env "$@" timeout -k 30 600 scripts/fleet7-bench.sh --tag "$tag" --windows $WARG --gasceil ${F7_GASCEIL_ARG:-3423000000} --senders ${F7_SENDERS_ARG:-6000} --pertx ${F7_PERTX_ARG:-20000} --conc ${F7_CONC_ARG:-64} --rpcbatch ${F7_RPCBATCH_ARG:-500} ${F7_OFFSET_ARG:+--offset $F7_OFFSET_ARG} ${F7_GASPRICE_ARG:+--gasprice $F7_GASPRICE_ARG} > $S/bench-$tag.out 2>&1; echo "round $tag exit $? at $(date +%H:%M:%S)"; kill $MS 2>/dev/null; wait $MS 2>/dev/null
@@ -528,7 +529,12 @@ case $STAGE in
      b7 D2S12P35T64X9 $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35
      b7 D2S12P40T64X9b $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=40
      b7 D2S12P35T64X9b $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35 ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v or w)"; exit 2 ;;
+  x) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     b7 D2S12P40T64X7PROF $D2 $S1 $S2 $X7 $T64 F7_BIN=$WT/target/profiling-build/profiling F7_BLOCK_INTERVAL_MS=40
+     P=$S/perf-loop351D2S12P40T64X7PROF; if [ "${LOOP351_DRY:-0}" != 1 ] && [ -f $P.data ]; then PB=$WT/target/profiling-build/profiling; { for sk in symbol dso,symbol comm,symbol; do echo "== perf report --sort $sk"; perf report -i $P.data --stdio --no-inline --no-children --sort $sk --percent-limit 0.5 2>/dev/null | grep -v '^#' | grep -v '^$'; done; } > $P.report.txt; echo "perf report: $P.report.txt"; fi ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w or x)"; exit 2 ;;
 esac
 
 if [ "${LOOP351_DRY:-0}" = 1 ]; then echo "dry run done"; exit 0; fi

@@ -115,12 +115,18 @@ impl RoundState {
 
     /// Records that this node has voted in `view`. Must be called immediately
     /// after `may_vote_in()` returns `true` and before the vote is broadcast.
-    pub fn record_vote(&mut self, view: ViewNumber) {
+    pub fn record_vote(&mut self, view: ViewNumber) -> ViewNumber {
         debug_assert!(
             view > self.last_voted_view,
             "record_vote called without may_vote_in guard"
         );
-        self.last_voted_view = view;
+        std::mem::replace(&mut self.last_voted_view, view)
+    }
+
+    /// Restores the R1 watermark returned by [`Self::record_vote`] when the
+    /// vote log write failed and no signature was produced.
+    pub fn rollback_vote(&mut self, previous: ViewNumber) {
+        self.last_voted_view = previous;
     }
 
     /// Returns `true` if this node has not cast an R2 commit vote in `view`.
@@ -129,12 +135,17 @@ impl RoundState {
     }
 
     /// Records an R2 commit vote before its signature is produced.
-    pub fn record_commit_vote(&mut self, view: ViewNumber) {
+    pub fn record_commit_vote(&mut self, view: ViewNumber) -> ViewNumber {
         debug_assert!(
             view > self.last_commit_voted_view,
             "record_commit_vote called without may_commit_vote_in guard"
         );
-        self.last_commit_voted_view = view;
+        std::mem::replace(&mut self.last_commit_voted_view, view)
+    }
+
+    /// Restores the R2 watermark returned by [`Self::record_commit_vote`].
+    pub fn rollback_commit_vote(&mut self, previous: ViewNumber) {
+        self.last_commit_voted_view = previous;
     }
 
     pub fn enter_voting(&mut self) {
@@ -381,5 +392,18 @@ mod tests {
         state.enter_pre_commit();
         state.advance_view(3);
         assert_eq!(state.phase(), Phase::WaitingForProposal);
+    }
+
+    #[test]
+    fn rollback_restores_the_watermarks_so_the_view_can_be_voted_again() {
+        let mut state = RoundState::new();
+        let prev = state.record_vote(3);
+        assert_eq!((prev, state.may_vote_in(3)), (0, false));
+        state.rollback_vote(prev);
+        assert!(state.may_vote_in(3));
+        let prev = state.record_commit_vote(3);
+        assert_eq!((prev, state.may_commit_vote_in(3)), (0, false));
+        state.rollback_commit_vote(prev);
+        assert!(state.may_commit_vote_in(3));
     }
 }

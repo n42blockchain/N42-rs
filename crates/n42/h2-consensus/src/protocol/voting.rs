@@ -221,8 +221,12 @@ impl ConsensusEngine {
                 "leader already cast a commit vote in this view; suppressing R2 self-vote");
             return Ok(());
         }
-        self.round_state.record_commit_vote(view);
-        self.vote_log.record_commit_vote(view, self.round_state.locked_qc())?;
+        let previous = self.round_state.record_commit_vote(view);
+        // A failed log write must not leave the watermark advanced: the
+        // retry after the disk recovers would otherwise be refused.
+        self.vote_log
+            .record_commit_vote(view, self.round_state.locked_qc())
+            .inspect_err(|_| self.round_state.rollback_commit_vote(previous))?;
         let changes_hash = self.cached_changes_hash(&block_hash);
         let commit_msg = self
             .signing_profile

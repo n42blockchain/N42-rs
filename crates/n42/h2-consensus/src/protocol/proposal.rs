@@ -235,10 +235,14 @@ impl ConsensusEngine {
             );
             return Ok(());
         }
-        self.round_state.record_vote(view);
+        let previous = self.round_state.record_vote(view);
         // Persist the leader self-vote with the same crash-safety contract as
         // send_vote(); a fsync failure aborts the proposal.
-        self.vote_log.record_vote(view, self.round_state.locked_qc())?;
+        // A failed log write must not leave the watermark advanced: the
+        // retry after the disk recovers would otherwise be refused.
+        self.vote_log
+            .record_vote(view, self.round_state.locked_qc())
+            .inspect_err(|_| self.round_state.rollback_vote(previous))?;
         // Reuse the vote_msg computed above (same view + block_hash).
         let leader_vote_sig = self.signing_profile.sign(&self.secret_key, &vote_msg);
         if let Some(ref mut collector) = self.vote_collector {
@@ -526,8 +530,12 @@ impl ConsensusEngine {
             return Ok(());
         }
         // Persist before signing for the same crash-safety reason as R1.
-        self.round_state.record_commit_vote(view);
-        self.vote_log.record_commit_vote(view, self.round_state.locked_qc())?;
+        let previous = self.round_state.record_commit_vote(view);
+        // A failed log write must not leave the watermark advanced: the
+        // retry after the disk recovers would otherwise be refused.
+        self.vote_log
+            .record_commit_vote(view, self.round_state.locked_qc())
+            .inspect_err(|_| self.round_state.rollback_commit_vote(previous))?;
 
         // Bind this R2 commit-vote signature to the same changes_hash the
         // leader's proposal carried.
@@ -579,8 +587,12 @@ impl ConsensusEngine {
         // (we err on the side of not voting rather than double-voting). The
         // vote_log fsync MUST succeed before we sign — otherwise a crash after
         // signing but before record could let the recovered node re-vote.
-        self.round_state.record_vote(view);
-        self.vote_log.record_vote(view, self.round_state.locked_qc())?;
+        let previous = self.round_state.record_vote(view);
+        // A failed log write must not leave the watermark advanced: the
+        // retry after the disk recovers would otherwise be refused.
+        self.vote_log
+            .record_vote(view, self.round_state.locked_qc())
+            .inspect_err(|_| self.round_state.rollback_vote(previous))?;
 
         let leader = self.leader_index_for_view(view);
         let vote_msg = self.signing_profile.vote_message(view, block_hash);

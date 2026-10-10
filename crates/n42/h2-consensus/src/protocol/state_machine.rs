@@ -5494,3 +5494,7 @@ mod tests {
 #[cfg(test)]
 #[path = "state_machine_gap_tests.rs"]
 mod gap_tests;
+
+#[cfg(test)]
+#[path = "state_machine_vote_retry_tests.rs"]
+mod vote_retry_tests;

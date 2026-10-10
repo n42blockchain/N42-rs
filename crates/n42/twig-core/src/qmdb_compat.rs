@@ -963,6 +963,44 @@ pub fn set_parallel_writes_on_this_thread(on: Option<bool>) {
     let _ = PARALLEL_WRITES_HERE.try_with(|here| here.set(on));
 }
 
+/// Whether the block apply's serial stretch runs on the worker pool
+/// (`N42_QMDB_PARALLEL_APPLY=1`, off by default; see
+/// [`QmdbCompatTree::parallel_apply_writes`]), or what
+/// [`set_parallel_apply_on_this_thread`] chose for the applying thread.
+pub fn parallel_apply() -> bool {
+    PARALLEL_APPLY_HERE
+        .try_with(std::cell::Cell::get)
+        .ok()
+        .flatten()
+        .unwrap_or_else(parallel_apply_env)
+}
+
+/// `N42_QMDB_PARALLEL_APPLY` as the environment sets it, read once.
+pub fn parallel_apply_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_QMDB_PARALLEL_APPLY").is_ok_and(|v| v.trim() == "1"))
+}
+
+std::thread_local! {
+    static PARALLEL_APPLY_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Applies whose writes ran on the worker pool ([`parallel_apply`]) since the
+/// process started.
+static PARALLEL_APPLY_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many applies took the parallel path ([`parallel_apply`]) so far.
+pub fn parallel_apply_runs() -> u64 {
+    PARALLEL_APPLY_RUNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Tests and benches: the parallel apply on or off for applies made on this
+/// thread, whatever the environment says (`None` follows it again).
+#[doc(hidden)]
+pub fn set_parallel_apply_on_this_thread(on: Option<bool>) {
+    let _ = PARALLEL_APPLY_HERE.try_with(|here| here.set(on));
+}
+
 fn mark_dirty(dirty: &mut Vec<u8>, twig_id: usize, level: u8) {
     if dirty.len() <= twig_id {
         dirty.resize(twig_id + 1, 0);
@@ -999,6 +1037,55 @@ fn leaf_hashes<O: LeafOps + ?Sized>(operations: &O, out: &mut Vec<Option<Hash>>)
     }
     #[cfg(not(feature = "rayon"))]
     out.extend((0..chunks).flat_map(chunk));
+}
+
+/// A block's leaf hashes, computed ahead of its apply
+/// ([`QmdbCompatTree::apply_ops_recorded_phased_with`]): the same hashes the
+/// apply computes for itself, one per operation (`None` for a deletion), on
+/// the worker pool, without the tree -- so a caller holding the tree behind a
+/// lock or a lease can hash before it takes the tree.
+#[derive(Debug, Clone, Default)]
+pub struct LeafHashes {
+    hashes: Vec<Option<Hash>>,
+}
+
+impl LeafHashes {
+    /// The leaf hashes of `operations`, which must be sorted (the apply's
+    /// order); unsorted operations give an empty set, which the apply
+    /// ignores.
+    pub fn of(operations: &QmdbOps) -> Self {
+        let mut hashes = Vec::new();
+        if operations.is_sorted() {
+            leaf_hashes(operations, &mut hashes);
+        }
+        Self { hashes }
+    }
+
+    /// How many operations the hashes cover.
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    /// Whether there are none.
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
+    }
+
+    /// Whether these are `operations`' hashes: one per operation, a hash
+    /// exactly where an operation writes a value, and the first, middle and
+    /// last written leaves equal to a fresh hash.
+    fn belongs_to<O: LeafOps + ?Sized>(&self, operations: &O) -> bool {
+        let count = operations.op_count();
+        if self.hashes.len() != count {
+            return false;
+        }
+        let probe = |i: usize| match (operations.op_value(i), self.hashes[i]) {
+            (Some(value), Some(hash)) => hash_leaf(operations.op_key(i), value) == hash,
+            (None, None) => true,
+            _ => false,
+        };
+        count == 0 || (probe(0) && probe(count / 2) && probe(count - 1))
+    }
 }
 
 /// Operations per unit of parallel work on the block path: small enough to
@@ -1979,6 +2066,28 @@ impl QmdbCompatTree {
         }
     }
 
+    /// [`Self::apply_ops_recorded_phased`] with the operations' leaf hashes
+    /// computed ahead ([`LeafHashes::of`], off whatever lock the caller holds
+    /// the tree under). Hashes that do not belong to `operations` -- another
+    /// length, or a spot-checked leaf that differs -- are ignored and the
+    /// leaves hashed here, as without them; the root is the same either way.
+    pub fn apply_ops_recorded_phased_with(
+        &mut self,
+        operations: &QmdbOps,
+        leaves: Option<&LeafHashes>,
+    ) -> Result<(Hash, BlockUndo, ApplyPhases), QmdbOperationError> {
+        let leaves = leaves.filter(|leaves| operations.is_sorted() && leaves.belongs_to(operations));
+        let Some(leaves) = leaves else { return self.apply_ops_recorded_phased(operations) };
+        self.start_undo_recording();
+        match self.apply_sorted_leaf_ops_with(operations, Some(&leaves.hashes)) {
+            Ok((root, phases)) => Ok((root, self.recording.take().unwrap_or_default(), phases)),
+            Err(error) => {
+                self.recording = None;
+                Err(error)
+            }
+        }
+    }
+
     /// [`Self::apply_sorted_slice_phased`] on a [`QmdbOps`].
     pub fn apply_ops_phased(&mut self, operations: &QmdbOps) -> Result<(Hash, ApplyPhases), QmdbOperationError> {
         if !operations.is_sorted() {
@@ -1991,6 +2100,17 @@ impl QmdbCompatTree {
 
     /// The block apply on sorted operations, whichever form holds them.
     fn apply_sorted_leaf_ops<O: LeafOps + ?Sized>(&mut self, operations: &O) -> Result<(Hash, ApplyPhases), QmdbOperationError> {
+        self.apply_sorted_leaf_ops_with(operations, None)
+    }
+
+    /// [`Self::apply_sorted_leaf_ops`], with the leaf hashes already
+    /// computed when `pre` holds them (one per operation, checked by the
+    /// caller).
+    fn apply_sorted_leaf_ops_with<O: LeafOps + ?Sized>(
+        &mut self,
+        operations: &O,
+        pre: Option<&[Option<Hash>]>,
+    ) -> Result<(Hash, ApplyPhases), QmdbOperationError> {
         let mut phases = ApplyPhases::default();
         let faults_at = crate::prefault::thread_faults();
         let at = std::time::Instant::now();
@@ -2018,15 +2138,39 @@ impl QmdbCompatTree {
         let at = std::time::Instant::now();
         // The block's temporaries, the last block's with their pages in.
         let mut scratch = crate::prefault::take_apply_scratch(count);
-        leaf_hashes(operations, &mut scratch.leaves);
-        phases.leaf_hashes_us = at.elapsed().as_micros() as u64;
-        // The slot each key holds now, looked up on the worker pool: the
-        // block's keys are distinct, so no lookup depends on an earlier write
-        // of the same block, and the lookups are the random reads of a
-        // multi-million-entry index that the serial loop was waiting on.
-        held_slots(&self.index, &self.entries, operations, &mut scratch.held);
+        let parallel = cfg!(feature = "rayon") && parallel_apply();
+        let pre = pre.filter(|pre| pre.len() == operations.op_count());
+        if pre.is_some() {
+            // Hashed ahead, off the caller's lock: only the lookups here.
+            held_slots(&self.index, &self.entries, operations, &mut scratch.held);
+        } else if parallel {
+            // The hashes and the lookups beside each other: both are on the
+            // pool, and neither waits for the other's stragglers.
+            #[cfg(feature = "rayon")]
+            {
+                let (index, entries) = (&self.index, &self.entries);
+                let (leaves, held) = (&mut scratch.leaves, &mut scratch.held);
+                phases.leaf_hashes_us = rayon::join(
+                    || {
+                        leaf_hashes(operations, leaves);
+                        at.elapsed().as_micros() as u64
+                    },
+                    || held_slots(index, entries, operations, held),
+                )
+                .0;
+            }
+        } else {
+            leaf_hashes(operations, &mut scratch.leaves);
+            phases.leaf_hashes_us = at.elapsed().as_micros() as u64;
+            // The slot each key holds now, looked up on the worker pool: the
+            // block's keys are distinct, so no lookup depends on an earlier
+            // write of the same block, and the lookups are the random reads
+            // of a multi-million-entry index that the serial loop was waiting
+            // on.
+            held_slots(&self.index, &self.entries, operations, &mut scratch.held);
+        }
         let crate::prefault::ApplyScratch { leaves, held, pairs: appended } = &mut scratch;
-        let (leaves, held) = (&*leaves, &*held);
+        let (leaves, held) = (pre.unwrap_or(leaves.as_slice()), &*held);
         phases.leaves_us = at.elapsed().as_micros() as u64;
         let at = std::time::Instant::now();
         // The undo record's entries -- what every retired slot held -- built
@@ -2069,8 +2213,18 @@ impl QmdbCompatTree {
         // The slots the block retires, cleared on the worker pool: every
         // entry and every twig checks its own against a bitmap, instead of
         // 133,000 random writes in sequence.
-        self.entries.retire(held);
-        retire_twigs(self.entries.len(), &mut self.twigs, &mut dirty, held);
+        if parallel {
+            // The entries' bits and the twigs' are disjoint: beside each other.
+            #[cfg(feature = "rayon")]
+            {
+                let slots = self.entries.len();
+                let (entries, twigs, dirty) = (&mut self.entries, &mut self.twigs, &mut dirty);
+                rayon::join(|| entries.retire(held), || retire_twigs(slots, twigs, dirty, held));
+            }
+        } else {
+            self.entries.retire(held);
+            retire_twigs(self.entries.len(), &mut self.twigs, &mut dirty, held);
+        }
         phases.retire_us = at.elapsed().as_micros() as u64;
         let faults_writes = crate::prefault::thread_faults();
         phases.prep_faults = faults_writes.saturating_sub(faults_at);
@@ -2085,12 +2239,19 @@ impl QmdbCompatTree {
         // The appends' index entries, inserted per shard afterwards; the
         // block's keys are distinct, so no operation reads one.
         let first_slot = self.next_slot;
-        for i in 0..count {
-            if appends(i).is_some() {
-                appended.push((*operations.op_key(i), first_slot + appended.len() as u64));
+        let pushed_in_parallel = if parallel {
+            self.parallel_apply_writes(operations, leaves, appended, &mut dirty, &mut phases)
+        } else {
+            None
+        };
+        if pushed_in_parallel.is_none() {
+            for i in 0..count {
+                if appends(i).is_some() {
+                    appended.push((*operations.op_key(i), first_slot + appended.len() as u64));
+                }
             }
+            phases.writes_pairs_us = at.elapsed().as_micros() as u64;
         }
-        phases.writes_pairs_us = at.elapsed().as_micros() as u64;
         let sub_at = std::time::Instant::now();
         let mut faults = faults_writes;
         let mut took = |into: &mut u64| {
@@ -2101,7 +2262,12 @@ impl QmdbCompatTree {
         took(&mut phases.tmp_faults);
         let mut append_faults = crate::entry_store::AppendFaults::default();
         let records = (0..count).filter_map(|i| appends(i).map(|(value, _)| (operations.op_key(i), value)));
-        let pushed = match self.parallel_writes(operations, leaves, appended, &mut dirty, records.clone(), &mut append_faults) {
+        let serial_writes = |this: &mut Self, dirty: &mut Vec<u8>, append_faults: &mut crate::entry_store::AppendFaults| {
+            this.parallel_writes(operations, leaves, appended, dirty, records.clone(), append_faults)
+        };
+        let pushed = match pushed_in_parallel {
+            Some(pushed) => pushed,
+            None => match serial_writes(self, &mut dirty, &mut append_faults) {
             Some((pushed, undo_faults, twigs_faults)) => {
                 // The undo keys, the twigs' leaves and the entries were
                 // written beside each other, each counting its own thread's
@@ -2129,6 +2295,7 @@ impl QmdbCompatTree {
                 phases.writes_entries_us = sub_at.elapsed().as_micros() as u64;
                 pushed
             }
+            },
         };
         self.next_slot = first_slot + appended.len() as u64;
         phases.entries_faults = append_faults.entries;
@@ -2137,9 +2304,28 @@ impl QmdbCompatTree {
         pushed.map_err(|e| QmdbOperationError::Store(e.to_string()))?;
         took(&mut 0);
         let sub_at = std::time::Instant::now();
-        for (i, old_slot) in held.iter().enumerate() {
-            if old_slot.is_some() && appends(i).is_none() {
-                self.index.remove(operations.op_key(i), |slot| self.entries.key(slot as usize));
+        if parallel {
+            // The deletions found on the pool (a transfer block has none),
+            // then removed in order as below.
+            #[cfg(feature = "rayon")]
+            {
+                use rayon::prelude::*;
+                let deleted: Vec<usize> = held
+                    .par_iter()
+                    .enumerate()
+                    .with_min_len(4096)
+                    .filter(|(i, old_slot)| old_slot.is_some() && appends(*i).is_none())
+                    .map(|(i, _)| i)
+                    .collect();
+                for i in deleted {
+                    self.index.remove(operations.op_key(i), |slot| self.entries.key(slot as usize));
+                }
+            }
+        } else {
+            for (i, old_slot) in held.iter().enumerate() {
+                if old_slot.is_some() && appends(i).is_none() {
+                    self.index.remove(operations.op_key(i), |slot| self.entries.key(slot as usize));
+                }
             }
         }
         took(&mut phases.index_faults);
@@ -2149,12 +2335,33 @@ impl QmdbCompatTree {
         phases.writes_faults = faults_hash.saturating_sub(faults_writes);
         let at = std::time::Instant::now();
         let entries = &self.entries;
-        self.index.insert_sorted(appended, |slot| entries.key(slot as usize));
-        phases.index_us = at.elapsed().as_micros() as u64;
-        phases.index_faults += crate::prefault::thread_faults().saturating_sub(faults_hash);
-        let at = std::time::Instant::now();
-        rehash_dirty(&mut self.twigs, &dirty);
-        phases.rehash_us = at.elapsed().as_micros() as u64;
+        if parallel {
+            // The index inserts and the twigs' rehash touch disjoint
+            // structures: beside each other on the pool.
+            #[cfg(feature = "rayon")]
+            {
+                let (index, twigs, dirty) = (&mut self.index, &mut self.twigs, &dirty);
+                let (index_us, rehash_us) = rayon::join(
+                    || {
+                        index.insert_sorted(appended, |slot| entries.key(slot as usize));
+                        at.elapsed().as_micros() as u64
+                    },
+                    || {
+                        rehash_dirty(twigs, dirty);
+                        at.elapsed().as_micros() as u64
+                    },
+                );
+                (phases.index_us, phases.rehash_us) = (index_us, rehash_us);
+            }
+            phases.index_faults += crate::prefault::thread_faults().saturating_sub(faults_hash);
+        } else {
+            self.index.insert_sorted(appended, |slot| entries.key(slot as usize));
+            phases.index_us = at.elapsed().as_micros() as u64;
+            phases.index_faults += crate::prefault::thread_faults().saturating_sub(faults_hash);
+            let at = std::time::Instant::now();
+            rehash_dirty(&mut self.twigs, &dirty);
+            phases.rehash_us = at.elapsed().as_micros() as u64;
+        }
         let at = std::time::Instant::now();
         let root = self.root();
         phases.root_us = at.elapsed().as_micros() as u64;
@@ -2236,6 +2443,118 @@ impl QmdbCompatTree {
             let _ = (operations, leaves, appended, dirty, records, append_faults);
             None
         }
+    }
+
+    /// `N42_QMDB_PARALLEL_APPLY=1`: the block apply's structural writes on
+    /// the worker pool, each structure split by position rather than run
+    /// whole beside the others ([`Self::parallel_writes`]). The operations
+    /// are counted a chunk at a time and every append is given its slot (the
+    /// operations' order, as the serial loop gives it); then, beside each
+    /// other, the appends' key and slot pairs, the undo record's appended
+    /// keys, the twigs' leaves and active bits (a twig to a task) and the
+    /// entries (the record bytes copied in pieces) are written. Every
+    /// structure ends as the serial writes leave it
+    /// (`parallel_apply_equals_the_serial_one`); the twigs' rehash and the
+    /// root are the caller's, unchanged. `None` (the caller writes serially,
+    /// with nothing written here) when nothing is appended or a twig the
+    /// appends reach is evicted. Fills `appended` and marks the touched twigs
+    /// in `dirty`; returns the entries' result.
+    #[cfg(feature = "rayon")]
+    fn parallel_apply_writes<O: LeafOps + ?Sized>(
+        &mut self,
+        operations: &O,
+        leaves: &[Option<Hash>],
+        appended: &mut Vec<(Hash, u64)>,
+        dirty: &mut Vec<u8>,
+        phases: &mut ApplyPhases,
+    ) -> Option<std::io::Result<()>> {
+        use rayon::prelude::*;
+        let at = std::time::Instant::now();
+        let count = operations.op_count();
+        let appends = |i: usize| operations.op_value(i).is_some() && leaves[i].is_some();
+        let chunk_range = |chunk: usize| chunk * LEAF_CHUNK..((chunk + 1) * LEAF_CHUNK).min(count);
+        let chunks = count.div_ceil(LEAF_CHUNK);
+        let counts: Vec<usize> = (0..chunks).into_par_iter().map(|chunk| chunk_range(chunk).filter(|&i| appends(i)).count()).collect();
+        let total: usize = counts.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        let first_slot = self.next_slot;
+        let (first_twig, last_twig) = (first_slot as usize / TWIG_SIZE, (first_slot as usize + total - 1) / TWIG_SIZE);
+        self.ensure_twig(last_twig);
+        if self.twigs.get(first_twig..=last_twig).is_none_or(|twigs| twigs.iter().any(|twig| twig.nodes.is_none())) {
+            return None;
+        }
+        // The operation behind every append, in order.
+        let mut append_ops = vec![0usize; total];
+        {
+            let mut rest = append_ops.as_mut_slice();
+            let mut pieces = Vec::with_capacity(chunks);
+            for (chunk, n) in counts.iter().enumerate() {
+                let (head, tail) = std::mem::take(&mut rest).split_at_mut(*n);
+                pieces.push((chunk, head));
+                rest = tail;
+            }
+            pieces.into_par_iter().for_each(|(chunk, out)| {
+                for (slot, i) in out.iter_mut().zip(chunk_range(chunk).filter(|&i| appends(i))) {
+                    *slot = i;
+                }
+            });
+        }
+        phases.writes_pairs_us = at.elapsed().as_micros() as u64;
+        let append_ops = append_ops.as_slice();
+        let key = |k: usize| operations.op_key(append_ops[k]);
+        let record = |k: usize| (operations.op_key(append_ops[k]), operations.op_value(append_ops[k]).unwrap_or_default());
+        let (recording, twigs, entries) = (&mut self.recording, &mut self.twigs[first_twig..=last_twig], &mut self.entries);
+        let (((), ()), (pushed, ())) = rayon::join(
+            || {
+                rayon::join(
+                    || appended.par_extend((0..total).into_par_iter().with_min_len(4096).map(|k| (*key(k), first_slot + k as u64))),
+                    || {
+                        if let Some(record) = recording.as_mut() {
+                            record.appended_keys.par_extend((0..total).into_par_iter().with_min_len(4096).map(|k| *key(k)));
+                        }
+                    },
+                )
+            },
+            || {
+                rayon::join(
+                    || entries.push_batch_parallel(total, &record),
+                    || {
+                        twigs.par_iter_mut().enumerate().for_each(|(offset, twig)| {
+                            let twig_start = (first_twig + offset) * TWIG_SIZE;
+                            let from = (first_slot as usize).max(twig_start);
+                            let to = (first_slot as usize + total).min(twig_start + TWIG_SIZE);
+                            for slot in from..to {
+                                let local = slot - twig_start;
+                                if let (Some(nodes), Some(leaf)) = (twig.nodes.as_deref_mut(), leaves[append_ops[slot - first_slot as usize]]) {
+                                    nodes[TWIG_SIZE + local] = leaf;
+                                }
+                                twig.bits[local / 8] |= 1 << (local % 8);
+                            }
+                        });
+                    },
+                )
+            },
+        );
+        for twig_id in first_twig..=last_twig {
+            mark_dirty(dirty, twig_id, DIRTY_LEAVES);
+        }
+        phases.writes_entries_us = at.elapsed().as_micros() as u64 - phases.writes_pairs_us;
+        PARALLEL_APPLY_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(pushed)
+    }
+
+    #[cfg(not(feature = "rayon"))]
+    fn parallel_apply_writes<O: LeafOps + ?Sized>(
+        &mut self,
+        _operations: &O,
+        _leaves: &[Option<Hash>],
+        _appended: &mut Vec<(Hash, u64)>,
+        _dirty: &mut Vec<u8>,
+        _phases: &mut ApplyPhases,
+    ) -> Option<std::io::Result<()>> {
+        None
     }
 
     /// The twig half of an append for the block apply: `slot`'s leaf and
@@ -2654,6 +2973,114 @@ mod tests {
         }
     }
 
+    /// `N42_QMDB_PARALLEL_APPLY`: the parallel apply -- with the leaf hashes
+    /// computed by the apply or handed in ahead ([`LeafHashes`]) -- leaves
+    /// the root, the undo record, the cursor, the snapshot and the entry
+    /// file the serial apply leaves, in memory and in a file whose chunks
+    /// (1 MiB in the unit tests) are sealed inside blocks, over blocks that
+    /// create, update, delete and re-create keys across many twigs, and
+    /// after reverts. Hashes that belong to other operations are ignored.
+    #[test]
+    fn parallel_apply_equals_the_serial_one() {
+        for in_file in [false, true] {
+            for ahead in [false, true] {
+                let dir = std::env::temp_dir().join(format!("n42-twig-parallel-apply-{}-{in_file}-{ahead}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                let mut seed = 0x2545_f491_4f6c_dd1du64;
+                let mut next = || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed
+                };
+                let key_of = |n: u64| {
+                    let mut key = [0u8; 32];
+                    key[..8].copy_from_slice(&n.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_be_bytes());
+                    key[24..].copy_from_slice(&n.to_be_bytes());
+                    key
+                };
+                let mut serial = QmdbCompatTree::new();
+                let mut parallel = QmdbCompatTree::new();
+                if in_file {
+                    serial.set_entry_file(&dir.join("serial.log")).unwrap();
+                    parallel.set_entry_file(&dir.join("parallel.log")).unwrap();
+                }
+                let runs_before = parallel_apply_runs();
+                let mut undos = Vec::new();
+                for block in 0..14u64 {
+                    let count = if block == 0 { 12_000 } else { 7_000 };
+                    let mut seen = std::collections::HashSet::new();
+                    let mut operations = Vec::new();
+                    while operations.len() < count {
+                        let r = next();
+                        let key = key_of(r % 20_000);
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                        let value = if r % 9 == 0 && block > 0 {
+                            None
+                        } else {
+                            Some((0..(4 + (r % 90) as usize)).map(|i| (r as u8).wrapping_add(i as u8)).collect())
+                        };
+                        operations.push(QmdbOperation { key, value });
+                    }
+                    let mut ops = QmdbOps::from(operations);
+                    ops.sort();
+                    set_parallel_apply_on_this_thread(Some(false));
+                    let (serial_root, serial_undo, _) = serial.apply_ops_recorded_phased(&ops).unwrap();
+                    set_parallel_apply_on_this_thread(Some(true));
+                    let leaves = ahead.then(|| LeafHashes::of(&ops));
+                    let (parallel_root, parallel_undo, _) = parallel.apply_ops_recorded_phased_with(&ops, leaves.as_ref()).unwrap();
+                    set_parallel_apply_on_this_thread(None);
+                    assert_eq!(parallel_root, serial_root, "root differs at block {block} (file {in_file}, ahead {ahead})");
+                    assert_eq!(parallel_undo, serial_undo, "undo record differs at block {block} (file {in_file}, ahead {ahead})");
+                    assert_eq!(parallel.next_slot(), serial.next_slot(), "cursor differs at block {block}");
+                    assert_eq!(parallel.snapshot(), serial.snapshot(), "snapshot differs at block {block} (file {in_file})");
+                    // Every fifth block is reverted on both and applied again
+                    // in parallel, so appends land over abandoned slots.
+                    if block % 5 == 4 {
+                        serial.apply_undo(&serial_undo).unwrap();
+                        parallel.apply_undo(&parallel_undo).unwrap();
+                        assert_eq!(parallel.root(), serial.root(), "root after the revert at block {block}");
+                        set_parallel_apply_on_this_thread(Some(false));
+                        let (serial_root, serial_undo, _) = serial.apply_ops_recorded_phased(&ops).unwrap();
+                        set_parallel_apply_on_this_thread(Some(true));
+                        let (parallel_root, parallel_undo, _) = parallel.apply_ops_recorded_phased_with(&ops, leaves.as_ref()).unwrap();
+                        set_parallel_apply_on_this_thread(None);
+                        assert_eq!(parallel_root, serial_root, "root differs re-applying block {block}");
+                        assert_eq!(parallel_undo, serial_undo, "undo differs re-applying block {block}");
+                        undos.push(parallel_undo);
+                    }
+                }
+                #[cfg(feature = "rayon")]
+                assert!(parallel_apply_runs() >= runs_before + 14, "the parallel apply ran");
+                let _ = runs_before;
+                // Hashes of other operations are ignored, not trusted.
+                let mut other = QmdbOps::from(vec![QmdbOperation { key: key_of(1), value: Some(vec![1, 2, 3]) }, QmdbOperation { key: key_of(2), value: Some(vec![4]) }]);
+                other.sort();
+                let mut mine = QmdbOps::from(vec![QmdbOperation { key: key_of(1), value: Some(vec![9, 9]) }, QmdbOperation { key: key_of(2), value: Some(vec![8]) }]);
+                mine.sort();
+                let wrong = LeafHashes::of(&other);
+                set_parallel_apply_on_this_thread(Some(false));
+                let (serial_root, _, _) = serial.apply_ops_recorded_phased(&mine).unwrap();
+                set_parallel_apply_on_this_thread(Some(true));
+                let (parallel_root, _, _) = parallel.apply_ops_recorded_phased_with(&mine, Some(&wrong)).unwrap();
+                set_parallel_apply_on_this_thread(None);
+                assert_eq!(parallel_root, serial_root, "foreign leaf hashes were used");
+                if in_file {
+                    serial.sync_entries().unwrap();
+                    parallel.sync_entries().unwrap();
+                    let serial_bytes = std::fs::read(dir.join("serial.log")).unwrap();
+                    let parallel_bytes = std::fs::read(dir.join("parallel.log")).unwrap();
+                    assert!(serial_bytes.len() > 3 << 20, "the blocks crossed several chunk seals");
+                    assert_eq!(serial_bytes, parallel_bytes, "the entry files differ");
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+
     /// `N42_QMDB_PARALLEL_WRITES`: the parallel structural writes leave the
     /// tree, the undo record, the snapshot and the entries the serial writes
     /// leave, in memory and in the entry file, over blocks that create,
@@ -2662,6 +3089,9 @@ mod tests {
     /// serially.
     #[test]
     fn parallel_writes_equal_the_serial_ones() {
+        // The parallel apply, when the environment turns it on, takes the
+        // writes over; this test is about the older switch.
+        set_parallel_apply_on_this_thread(Some(false));
         for in_file in [false, true] {
             let dir = std::env::temp_dir().join(format!("n42-twig-parallel-writes-{}-{in_file}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);

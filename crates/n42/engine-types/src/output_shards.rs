@@ -369,10 +369,60 @@ fn add_delta(staged: &mut revm::state::AccountInfo, account: &BundleAccount) {
     staged.nonce += new_nonce - old_nonce;
 }
 
+/// `N42_SHARD_MIX=1` (off by default): the shard layout reads a mix of the
+/// whole address ([`address_mix`]) instead of its top sixteen bits. Hashed
+/// addresses fill the shards evenly either way, but the bench flood's
+/// recipients (`tx_flood`: the slot in the top four bytes, below 2,000,000)
+/// all share their top sixteen bits, so one shard took ~138k of a 200k
+/// block's ~190k accounts and the live freeze's fold was that one task
+/// (loop351 stage y: `heavy_shard=0` on every block, `task_max_us` 18 ms of
+/// an 18 ms fold). The layout decides only which task and which map an
+/// account goes to: the index, the sums, the merged bundle, the sorted
+/// reverts and every read are the same (`shard_mix_dump`). Every user of the
+/// layout -- the shards, the early index's parts, the freeze split's
+/// sub-ranges -- reads the same switch. Read once.
+pub fn shard_mix() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_SHARD_MIX").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// A deterministic 64-bit mix of all twenty bytes of `address` (three words
+/// folded with odd multipliers, then splitmix64's finalizer), so that every
+/// bit of the result depends on every byte.
+#[inline]
+fn address_mix(address: &Address) -> u64 {
+    let bytes = &address.0 .0;
+    let mut low = [0u8; 8];
+    let mut mid = [0u8; 8];
+    let mut high = [0u8; 4];
+    low.copy_from_slice(&bytes[0..8]);
+    mid.copy_from_slice(&bytes[8..16]);
+    high.copy_from_slice(&bytes[16..20]);
+    let mut h = u64::from_le_bytes(low).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ u64::from_le_bytes(mid).rotate_left(29).wrapping_mul(0xc2b2_ae3d_27d4_eb4f)
+        ^ u64::from(u32::from_le_bytes(high)).wrapping_mul(0x1656_67b1_9e37_79f9);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
+}
+
 /// The shard of `shards` that owns `address`: the address's top sixteen bits,
-/// scaled. Addresses are hashes, so the shards fill evenly.
+/// scaled; with [`shard_mix`], the top sixteen bits of [`address_mix`].
+#[inline]
 fn shard_index(address: &Address, shards: usize) -> usize {
-    let top = u16::from_be_bytes([address.0[0], address.0[1]]) as usize;
+    shard_index_with(address, shards, shard_mix())
+}
+
+/// [`shard_index`] with the layout named rather than read from the switch.
+#[inline]
+fn shard_index_with(address: &Address, shards: usize, mix: bool) -> usize {
+    let top = if mix {
+        (address_mix(address) >> 48) as usize
+    } else {
+        u16::from_be_bytes([address.0[0], address.0[1]]) as usize
+    };
     (top * shards) >> 16
 }
 
@@ -1263,6 +1313,8 @@ fn log_folded(fold_ns: u64, split: &FoldSplit, index: Option<(u64, usize)>, live
         heavy_shard = split.heavy_shard,
         heavy_work = split.heavy_work,
         split_tasks = split.split_tasks,
+        // `N42_SHARD_MIX=1`: the layout reads the whole address.
+        shard_mix = u8::from(shard_mix()),
         "output shards folded"
     );
 }
@@ -1482,9 +1534,14 @@ fn heavy_shards(work: &[usize], split: usize) -> Vec<bool> {
 
 /// The sub-range of a shard `address` falls in when its work is split over
 /// `split` tasks: the address's third and fourth bytes (the first two pick
-/// the shard), scaled.
+/// the shard), scaled; with [`shard_mix`], the mix's next sixteen bits (its
+/// top sixteen pick the shard), so the sub-ranges stay independent of it.
 fn sub_range(address: &Address, split: usize) -> usize {
-    let bits = u16::from_be_bytes([address.0[2], address.0[3]]) as usize;
+    let bits = if shard_mix() {
+        ((address_mix(address) >> 32) & 0xffff) as usize
+    } else {
+        u16::from_be_bytes([address.0[2], address.0[3]]) as usize
+    };
     (bits * split) >> 16
 }
 
@@ -3056,5 +3113,253 @@ mod incremental_tests {
             frozen.index_conflicts(),
             early_ns / frozen_ns,
         );
+    }
+}
+
+#[cfg(test)]
+mod shard_mix_tests {
+    //! `N42_SHARD_MIX`: the shard layout is a scheduling choice only. The
+    //! switch is read once a process, so each layout runs in a child process
+    //! of this test binary ([`shard_mix_dump`]) and the parent compares the
+    //! two dumps byte for byte ([`the_shard_mix_is_layout_only`]).
+    use super::*;
+    use revm::{database::BundleState, state::AccountInfo};
+    use std::fmt::Write as _;
+
+    fn hashed(i: u32) -> Address {
+        Address::from_slice(&alloy_primitives::keccak256(i.to_be_bytes())[..20])
+    }
+
+    /// The bench flood's recipient shape (`tx_flood::recipient`): the slot in
+    /// the top four bytes, `0x42` after it, zeros to the end.
+    fn flood_recipient(slot: u32) -> Address {
+        let mut bytes = [0u8; 20];
+        bytes[..4].copy_from_slice(&slot.to_be_bytes());
+        bytes[4] = 0x42;
+        Address::new(bytes)
+    }
+
+    fn info(nonce: u64, balance: u64) -> AccountInfo {
+        AccountInfo { nonce, balance: U256::from(balance), ..Default::default() }
+    }
+
+    const BENEFICIARY: u32 = u32::MAX;
+
+    /// A block of random transfers in `batches` batches: each batch's senders
+    /// its own (hashed, nonce +1, balance down), its recipients drawn from a
+    /// pool of flood-shaped addresses shared by every batch (so they collide
+    /// across batches, ~2,000 conflicts) with a few hashed ones, the
+    /// beneficiary credited by every batch.
+    fn block(batches: u32, per_batch: u32, pool: u32, seed: u64) -> Vec<BundleState> {
+        let mut seed = seed | 1;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        (0..batches)
+            .map(|b| {
+                let mut builder = BundleState::builder(1..=1);
+                let mut seen = std::collections::HashSet::new();
+                for s in 0..per_batch {
+                    let sender = hashed(1_000_000 + b * per_batch + s);
+                    let (nonce, balance, amount) = (next() % 9, 1_000_000 + next() % 1_000_000, next() % 50_000);
+                    builder = builder
+                        .state_original_account_info(sender, info(nonce, balance))
+                        .state_present_account_info(sender, info(nonce + 1, balance - amount - 21))
+                        .revert_account_info(1, sender, Some(Some(info(nonce, balance))));
+                    let r = (next() % u64::from(pool)) as u32;
+                    let recipient = if r % 16 == 0 { hashed(r) } else { flood_recipient(r) };
+                    if seen.insert(recipient) {
+                        let base = u64::from(r) * 7;
+                        builder = builder
+                            .state_original_account_info(recipient, info(0, base))
+                            .state_present_account_info(recipient, info(0, base + amount))
+                            .revert_account_info(1, recipient, Some(Some(info(0, base))));
+                    }
+                }
+                builder = builder
+                    .state_original_account_info(hashed(BENEFICIARY), info(0, 0))
+                    .state_present_account_info(hashed(BENEFICIARY), info(0, 21 * u64::from(per_batch)));
+                builder.build()
+            })
+            .collect()
+    }
+
+    fn every_address(blocks: &[BundleState]) -> Vec<Address> {
+        let mut all: Vec<Address> = blocks.iter().flat_map(|b| b.state.keys().copied()).collect();
+        all.extend((0..64).map(|i| flood_recipient(9_000_000 + i)));
+        all.extend((0..64).map(|i| hashed(50_000_000 + i)));
+        all.sort_unstable();
+        all.dedup();
+        all
+    }
+
+    /// An executor residual over the block: the beneficiary and one
+    /// recipient changed again, and one account only the executor wrote.
+    fn residual() -> BundleState {
+        BundleState::builder(1..=1)
+            .state_original_account_info(hashed(BENEFICIARY), info(0, 0))
+            .state_present_account_info(hashed(BENEFICIARY), info(0, 5))
+            .state_original_account_info(flood_recipient(3), info(0, 21))
+            .state_present_account_info(flood_recipient(3), info(1, 9))
+            .state_original_account_info(hashed(77_777_777), info(0, 0))
+            .state_present_account_info(hashed(77_777_777), info(0, 1))
+            .build()
+    }
+
+    /// Everything a freeze leaves that a block's fields, bundle and reads are
+    /// made from, in a byte-comparable form.
+    fn dump_frozen(out: &mut String, label: &str, frozen: &FrozenShards, blocks: &[BundleState]) {
+        let _ = writeln!(
+            out,
+            "== {label}: accounts {} conflicts {} delta {}",
+            frozen.accounts(),
+            frozen.index_conflicts(),
+            frozen.beneficiary_delta()
+        );
+        for address in every_address(blocks) {
+            let _ = writeln!(out, "get {address} {:?}", frozen.get(&address));
+            let _ = writeln!(out, "read {address} {:?}", frozen.read_account(&address).as_deref());
+        }
+        for residual in [BundleState::default(), residual()] {
+            let overlaps = frozen.overlaps(&residual);
+            let mut view: Vec<_> = frozen.view(&residual, &overlaps);
+            view.sort_unstable_by_key(|(a, _)| **a);
+            let _ = writeln!(out, "overlaps {}", overlaps.len());
+            for (address, account) in &view {
+                let _ = writeln!(out, "view {address} {account:?}");
+            }
+            let hashed = hashed_post_state_of(&view);
+            let mut accounts: Vec<_> = hashed.accounts.iter().collect();
+            accounts.sort_unstable_by_key(|(k, _)| **k);
+            let _ = writeln!(out, "hashed {accounts:?} storages {}", hashed.storages.len());
+            for concurrent in [false, true] {
+                let (merged, _) = frozen.merged_timed(&residual, concurrent);
+                let mut state: Vec<_> = merged.state.iter().collect();
+                state.sort_unstable_by_key(|(a, _)| **a);
+                let _ = writeln!(out, "merged concurrent {concurrent} size {} state {state:?}", merged.state_size);
+                // The reverts as `sort_reverts_by_index` left them, unsorted here.
+                let _ = writeln!(out, "reverts {:?} size {}", merged.reverts, merged.reverts_size);
+            }
+        }
+    }
+
+    /// The child's side: one layout (the process's `N42_SHARD_MIX`) through
+    /// every fold mode, written to `N42_SHARD_MIX_DUMP` when it is set, with
+    /// the heaviest shard's count beside it. Without the variable it does
+    /// nothing (the parent runs it).
+    #[test]
+    fn shard_mix_dump() {
+        let Ok(path) = std::env::var("N42_SHARD_MIX_DUMP") else { return };
+        let blocks = block(16, 300, 5_000, 0x5eed);
+        let mut out = String::new();
+        let beneficiary = hashed(BENEFICIARY);
+        for (label, index, live, defer, early, split) in [
+            ("v4 fold", false, false, false, false, (1, false)),
+            ("index", true, false, false, false, (1, false)),
+            ("live", true, true, false, false, (1, false)),
+            ("live defer", true, true, true, false, (1, false)),
+            ("live split all 4", true, true, true, false, (4, true)),
+            ("live split heavy 8", true, true, true, false, (8, false)),
+            ("live incremental", true, true, false, true, (1, false)),
+            ("live incremental defer split", true, true, true, true, (4, true)),
+        ] {
+            let mut shards = OutputShards::with_index_live(beneficiary, 16_384, 16, index, live);
+            if live {
+                shards.set_live_defer(defer, defer);
+                shards.set_early_index(early);
+            }
+            shards.set_freeze_split(split.0, split.1);
+            for bundle in &blocks {
+                shards.add(bundle.clone());
+            }
+            let early_view = early.then(|| Arc::new(shards.early_view().expect("a live index")));
+            let frozen = shards.freeze();
+            let mut section = String::new();
+            dump_frozen(&mut section, label, &frozen, &blocks);
+            if let Some(view) = early_view {
+                let read = FrozenShards::early(view);
+                for address in every_address(&blocks) {
+                    let _ = writeln!(section, "early {address} {:?}", read.read_account(&address).as_deref());
+                }
+            }
+            // A digest a section keeps the dump small (the sections run to
+            // tens of megabytes); the bytes digested are the comparison.
+            let _ = writeln!(out, "{label}: {} bytes, keccak {}", section.len(), alloy_primitives::keccak256(&section));
+        }
+        let addresses = every_address(&blocks);
+        let mut per_shard = [0usize; 16];
+        for address in &addresses {
+            per_shard[shard_index(address, 16)] += 1;
+        }
+        let heaviest = per_shard.iter().max().copied().unwrap_or(0);
+        std::fs::write(&path, &out).expect("dump written");
+        std::fs::write(format!("{path}.spread"), format!("{} {heaviest} {}", u8::from(shard_mix()), addresses.len()))
+            .expect("spread written");
+    }
+
+    /// The parent's side: both layouts' dumps are the same bytes, and the
+    /// mixed layout does spread the flood's addresses.
+    #[test]
+    fn the_shard_mix_is_layout_only() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = std::env::temp_dir().join(format!("n42-shard-mix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dump dir");
+        let spawn = |mix: &str| {
+            std::process::Command::new(&exe)
+                .args(["output_shards::shard_mix_tests::shard_mix_dump", "--exact", "--test-threads=1", "--quiet"])
+                .env("N42_SHARD_MIX", mix)
+                .env("N42_SHARD_MIX_DUMP", dir.join(format!("mix{mix}")))
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("child test started")
+        };
+        // Both layouts at once.
+        let children = [("0", spawn("0")), ("1", spawn("1"))];
+        for (mix, mut child) in children {
+            assert!(child.wait().expect("child test ran").success(), "child with N42_SHARD_MIX={mix} failed");
+        }
+        let run = |mix: &str| {
+            let path = dir.join(format!("mix{mix}"));
+            let dump = std::fs::read(&path).expect("dump read");
+            let spread = std::fs::read_to_string(dir.join(format!("mix{mix}.spread"))).expect("spread read");
+            let spread: Vec<usize> = spread.split(' ').map(|n| n.parse().expect("number")).collect();
+            (dump, spread)
+        };
+        let (off, off_spread) = run("0");
+        let (on, on_spread) = run("1");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!((off_spread[0], on_spread[0]), (0, 1), "each child read its own switch");
+        assert_eq!(off.iter().filter(|b| **b == b'\n').count(), 8, "a digest a fold mode");
+        assert!(off == on, "the layouts' outputs differ:\n{}\n{}", String::from_utf8_lossy(&off), String::from_utf8_lossy(&on));
+        let total = off_spread[2];
+        // Top-16-bit layout: the flood's addresses (15/16 of the recipients)
+        // all fall in shard 0. Mixed: no shard holds twice its share.
+        assert!(off_spread[1] * 4 > total, "the plain layout is skewed: {off_spread:?}");
+        assert!(on_spread[1] * 8 < total, "the mixed layout spreads: {on_spread:?}");
+    }
+
+    #[test]
+    fn the_mix_is_deterministic_and_spreads_the_flood_shape() {
+        let mut plain = [0usize; 16];
+        let mut mixed = [0usize; 16];
+        for slot in 0..200_000u32 {
+            let address = flood_recipient(slot * 10);
+            assert_eq!(address_mix(&address), address_mix(&Address::new(address.0 .0)));
+            plain[shard_index_with(&address, 16, false)] += 1;
+            mixed[shard_index_with(&address, 16, true)] += 1;
+        }
+        assert_eq!(plain[0], 200_000, "the top sixteen bits of the flood's slots are zero");
+        for count in mixed {
+            assert!((11_500..13_500).contains(&count), "mixed shard holds {count} of 200,000: {mixed:?}");
+        }
+        // Early parts (1024) and the sub-ranges read other bits of the same mix.
+        let mut parts = vec![0usize; EARLY_PARTS];
+        for slot in 0..200_000u32 {
+            parts[shard_index_with(&flood_recipient(slot), EARLY_PARTS, true)] += 1;
+        }
+        assert!(parts.iter().all(|n| *n > 100), "every early part is used");
     }
 }

@@ -464,6 +464,15 @@
   按地址第 3-4 字节分成 k 个子区间并行处理（读 live 索引、只写自己的部分，再按单任务顺序求和），最后并回一个分片。
   "output shards folded" 行新增（恒开）`heavy_shard`、`heavy_work`、`split_tasks`。测试
   `tests/output_shards.rs` `a_split_heavy_shard_freezes_as_one_task`。
+- `N42_SHARD_MIX=1`（默认关；代码在 `output_shards.rs` `shard_mix` / `address_mix` / `shard_index_with` / `sub_range`）：
+  分片布局改读整个地址的 64 位混合（三个字折叠 + splitmix64 收尾）：分片取其高 16 位，early index 的 1024 个部分同一函数，
+  `N42_FREEZE_SPLIT` 的子区间取其次 16 位。原布局取地址高 16 位，bench flood 的收款地址（槽号在前 4 字节、小于 2,000,000）
+  全落分片 0（loop351 stage y：60/60 块 `heavy_shard=0`，~190k 账户中 ~138k，fold 即这一个任务 18 ms）。布局只决定账户进哪个
+  任务与哪张表：索引、冲突求和、合并 bundle、`sort_reverts_by_index` 后的 reverts、所有读取不变（QMDB 操作与 hashed
+  post-state 本就排序/按键）。"output shards folded" 行新增 `shard_mix`。测试 `output_shards::shard_mix_tests`
+  `the_shard_mix_is_layout_only`（子进程分别以开/关跑 8 种 fold 模式，摘要逐字节相同）、
+  `the_mix_is_deterministic_and_spreads_the_flood_shape`。`parallel_transfer.rs` 的 `ShardedGraft::shard_of`、
+  `graft_shard_of`、`warm_shard`（各自独立、取首字节）未改。
 
 ## HotStuff-2 结算标签（不改任何 fork 的 reth crate）:
 - `N42_SETTLEMENT_TAGS=split|legacy`（默认 `split`；代码在 `crates/n42/h2-execution/src/settlement.rs`，

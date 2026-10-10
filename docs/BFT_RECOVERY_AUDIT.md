@@ -141,3 +141,17 @@ it also pulls the chain by range.
 - EIP-8288 / PQ-proof ISA: no ZK light-client work in this repo.
 - EIP-7906 transaction assertions: N42's parallel builder is not Block-STM.
 - ATMACA threshold Falcon: no implementation to measure; FIPS 206 is still in development.
+
+## Operator-level SIGKILL restart, 2026-10-10
+
+Shape: all-Rust seven-node fleet (`scripts/fleet7.sh up --fresh`, chain 1143 genesis, 3000 ms pacing, one execution layer per validator, QMDB). All seven agreed from height 50 on and advanced steadily.
+
+Kill: `scripts/fleet7.sh roll 3 --kill` at member 3's committed height 63 (fleet common height ~62-63). Checkpoint values at the kill: `last_voted_view` 64, `last_commit_voted_view` 64, `locked_qc.view` 64 (checkpoint `view` 65). Validator and execution layer were both SIGKILLed.
+
+Vote log: the validator reached the point of loading it. Its first lines were "resuming at view 65 (last voted 64)", so the restored state equalled the checkpoint; it was not ahead. No "already voted" / "suppressed duplicate commit vote" line appeared (the script's grep reported none), because the member never got far enough to vote again.
+
+Result: member 3 did NOT rejoin. Its execution layer failed to start: on open, reth's consistency check found "partial state trie" (QMDB ahead of or inconsistent with MDBX), scheduled an unwind from 46 to 16, and the `MerkleUnwind` stage failed with "Failed to verify block state root" (Invalid state root on stage verification). The validator then exited with `ElError(transport ... 127.0.0.1:8603)` because the EL was down. Member 3 therefore never committed again (seconds to re-commit: not reached; the roll script's wait loop ran out).
+
+Other six: kept committing through and after the kill (common height of the others 62 at the kill, 108 about two minutes later, 111 at teardown), as expected with n=7, f=2.
+
+Finding: the BFT side of a SIGKILL restart (checkpoint and vote log restore) is fine; the gap is execution-layer crash recovery on a QMDB chain. After SIGKILL the consistency heal unwinds through the stock `MerkleUnwind` stage, which cannot verify the root for a QMDB-scheme chain. Next step: make `check_consistency` heal the QMDB forest to the MDBX tip (or roll MDBX forward) instead of unwinding, then rerun this test. The datadir of member 3 was left in the failed state under /data/blockchain/rust-fleet7/node3 until the next `up --fresh`.

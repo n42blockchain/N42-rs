@@ -133,7 +133,7 @@ pub fn output_index_live() -> bool {
 /// relies on. The freeze cannot then take the conflicting accounts out of
 /// the shared maps; it lists them per batch instead, and every walk over the
 /// maps skips them (`IndexedBatch::removed`).
-/// (`docs/BREAKTHROUGH_DESIGN.md` 10.103, 10.104.) Read once.
+/// (`docs/BREAKTHROUGH_DESIGN.md` 10.103, 10.105.) Read once.
 pub fn output_incremental() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_OUTPUT_INCREMENTAL").is_ok_and(|v| v.trim() == "1"))

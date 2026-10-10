@@ -17,6 +17,9 @@ r = re.sub(r'^# loop351 = .*\n# Stage a:.*\n', '''# loop351 = 200k blocks, 7 key
 ''', r, count=1, flags=re.M)
 r = r.replace('(loop351: the same commit as the', '(loop351: the same commit as the')
 r = r.replace('FAR_AHEAD_BLOCKS|', 'FAR_AHEAD_BLOCKS|BUILT_KEEP|')
+r = r.replace('VIEW_JOURNAL_FILTER|', 'VIEW_JOURNAL_FILTER|CHECK_AHEAD_UNHELD|') if False else r[:r.rindex('VIEW_JOURNAL_FILTER|')] + 'VIEW_JOURNAL_FILTER|CHECK_AHEAD_UNHELD|' + r[r.rindex('VIEW_JOURNAL_FILTER|')+len('VIEW_JOURNAL_FILTER|'):]
+r = r.replace('! grep -q N42_DEFERRED_IN_FLIGHT crates/n42/h2-execution/src/driver.rs', '! grep -q N42_DEFERRED_IN_FLIGHT crates/n42/h2-execution/src/driver.rs || ! grep -q N42_CHECK_AHEAD_UNHELD crates/n42/h2-node/src/service.rs', 1)
+assert 'N42_CHECK_AHEAD_UNHELD' in r
 # stage-defs
 i = r.index('S1="N42_CHECK_BEFORE_SLOT=1"')
 j = r.index('w1of() {')
@@ -278,7 +281,17 @@ stages = '''case $STAGE in
      b7 D2S12F2P35T64X7SMb $D2 $S1 $S2 $F2 $X7 $SM $T64 F7_BLOCK_INTERVAL_MS=35
      b7 D2S12F2P30T64X7SM $D2 $S1 $S2 $F2 $X7 $SM $T64 F7_BLOCK_INTERVAL_MS=30
      b7 D2S12F2P40T64X7SMb $D2 $S1 $S2 $F2 $X7 $SM $T64 F7_BLOCK_INTERVAL_MS=40 ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z or aa)"; exit 2 ;;
+  ab) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; CAU="N42_CHECK_AHEAD_UNHELD=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"
+     b7 D2S12P35T64X7SMCAU $D2 $S1 $S2 $X7 $SM $CAU $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P30T64X7SMCAU $D2 $S1 $S2 $X7 $SM $CAU $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P35T64X7SMc $D2 $S1 $S2 $X7 $SM $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X7SMCAUb $D2 $S1 $S2 $X7 $SM $CAU $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P30T64X7SMCAUb $D2 $S1 $S2 $X7 $SM $CAU $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P40T64X7SMCAU $D2 $S1 $S2 $X7 $SM $CAU $T64 F7_BLOCK_INTERVAL_MS=40 ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa or ab)"; exit 2 ;;
 esac
 '''
 r = r[:i] + stages + r[j:]
@@ -292,11 +305,11 @@ def atomic(path, text):
 atomic(D + 'run-loop351.sh', r)
 
 l = r'''#!/bin/bash
-# loop351 (200k, 7 keys on one layer, 50 ms pacing; derive351.py). usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z|aa>. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh f > target/fleet-runs/loop351f.out 2>&1 &
+# loop351 (200k, 7 keys on one layer, 50 ms pacing; derive351.py). usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z|aa|ab>. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh f > target/fleet-runs/loop351f.out 2>&1 &
 # Waits for the box, checks the tree, and runs the stage. When crates/ or bin/ changed since the last build, the launcher builds target/native (the legs' F7_BIN) after the box is free and the runner
 # runs its own test gate, clippy and the target/deferred build (once: this launcher does not export LOOP351_GATE_TREES for a changed tree). Unchanged tree: no build, no tests.
 cd /data/n42-build/wt338
-STAGE=${1:-a}; case $STAGE in a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z|aa) ;; *) echo "usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z|aa>"; exit 2;; esac
+STAGE=${1:-a}; case $STAGE in a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z|aa|ab) ;; *) echo "usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z|aa|ab>"; exit 2;; esac
 # the tree (crates/ and bin/) the binaries in target/native and target/deferred were built from: f2794a821 until a build here records another (the marker is written after a stage that built)
 MARK=target/fleet-runs/loop351-built-trees
 BUILT=f2794a821

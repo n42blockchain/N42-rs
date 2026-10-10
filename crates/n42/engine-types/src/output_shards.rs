@@ -2308,7 +2308,7 @@ impl FrozenShards {
         for part in parts {
             reverts.extend(part);
         }
-        crate::parallel_transfer::sort_reverts(&mut reverts);
+        crate::parallel_transfer::sort_reverts_by_index(&mut reverts);
         reverts
     }
 
@@ -2370,7 +2370,7 @@ impl FrozenShards {
             reverts.reserve(indexed.kept.iter().map(Vec::len).sum());
             reverts.extend(indexed.kept.iter().flatten().filter_map(|&slot| indexed.revert(slot)).cloned());
         }
-        crate::parallel_transfer::sort_reverts(&mut reverts);
+        crate::parallel_transfer::sort_reverts_by_index(&mut reverts);
         reverts
     }
 

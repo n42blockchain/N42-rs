@@ -3497,6 +3497,30 @@ fn sort_reverts_indexed(reverts: &mut [(Address, AccountRevert)]) {
     let mut order: Vec<(Address, u32)> =
         reverts.par_iter().enumerate().map(|(at, (address, _))| (*address, at as u32)).collect();
     order.par_sort_unstable_by_key(|(address, _)| *address);
+    permute_reverts(reverts, order);
+}
+
+/// [`sort_reverts`] by an index ([`sort_reverts_indexed`]'s move along the
+/// permutation), the index sorted by address and then position: the order
+/// [`sort_reverts`] gives a set holding each address once, and a stable
+/// sort's order for one that holds an address twice. For the output
+/// shards' merged reverts (`output_shards.rs` `merged_reverts`), which the
+/// whole-entry sort moved ~200 bytes at a time at every level.
+pub(crate) fn sort_reverts_by_index(reverts: &mut [(Address, AccountRevert)]) {
+    if reverts.len() < 4096 || reverts.len() > u32::MAX as usize {
+        reverts.sort_by_key(|(address, _)| *address);
+        return;
+    }
+    use rayon::prelude::*;
+    let mut order: Vec<(Address, u32)> =
+        reverts.par_iter().enumerate().map(|(at, (address, _))| (*address, at as u32)).collect();
+    order.par_sort_unstable();
+    permute_reverts(reverts, order);
+}
+
+/// `reverts` put in the order `order` names (`order[k].1`: the position
+/// whose revert belongs at `k`), each moved along its cycle.
+fn permute_reverts(reverts: &mut [(Address, AccountRevert)], order: Vec<(Address, u32)>) {
     // `source[k]`: the position whose revert belongs at `k`.
     let mut source: Vec<u32> = order.into_iter().map(|(_, at)| at).collect();
     for start in 0..source.len() {
@@ -5226,6 +5250,57 @@ mod tests {
         let mut indexed = reverts;
         sort_reverts_indexed(&mut indexed);
         assert_eq!(plain, indexed);
+    }
+
+    /// The output shards' sort ([`sort_reverts_by_index`]) leaves what the
+    /// plain sort leaves for a set holding each address once, at every size
+    /// either side of the parallel threshold, and a stable sort's order when
+    /// an address is held twice.
+    #[test]
+    fn the_by_index_reverts_sort_matches_the_plain_one() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut make = |n: u64, repeats: bool| -> Vec<(Address, AccountRevert)> {
+            (0..n)
+                .map(|i| {
+                    let mut a = [0u8; 20];
+                    a[..8].copy_from_slice(&next().to_be_bytes());
+                    if repeats {
+                        // ~1 in 4 entries shares its address with others.
+                        a[..8].copy_from_slice(&(next() % (n * 3 / 4 + 1)).to_be_bytes());
+                    } else {
+                        a[12..].copy_from_slice(&i.to_be_bytes());
+                    }
+                    let revert = AccountRevert {
+                        account: revm::database::states::reverts::AccountInfoRevert::RevertTo(AccountInfo {
+                            nonce: i,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    };
+                    (Address::from(a), revert)
+                })
+                .collect()
+        };
+        for n in [0u64, 1, 100, 4095, 4096, 4097, 50_000] {
+            let reverts = make(n, false);
+            let mut plain = reverts.clone();
+            sort_reverts(&mut plain);
+            let mut by_index = reverts;
+            sort_reverts_by_index(&mut by_index);
+            assert_eq!(plain, by_index, "{n} distinct");
+            let reverts = make(n, true);
+            let mut stable = reverts.clone();
+            stable.sort_by_key(|(address, _)| *address);
+            let mut by_index = reverts;
+            sort_reverts_by_index(&mut by_index);
+            assert_eq!(stable, by_index, "{n} with repeats");
+        }
     }
 
     /// Two bundles hold the same post-state: the same accounts with the same

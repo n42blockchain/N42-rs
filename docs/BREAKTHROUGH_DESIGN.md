@@ -3326,3 +3326,37 @@ The loop351 analysis of D2S12P35T64X7DRc put the E=1 seal chain at 44 ms in the 
 
 Tests: `engine::ahead_gate_tests` (6), `output_shards::incremental_tests` (3), `direct_build::tests::a_parent_filed_on_its_early_output_opens_as_on_its_frozen_set`. A leg should set `N42_OUTPUT_INCREMENTAL=1` and `N42_BUILD_AHEAD_GATE=seal` separately and read `output_incremental`, `seal_to_shards_ready_us`, `seal_to_shards_final_us`, `state_wait` and the build triggers.
 
+
+### 10.104 loop351 stages u-x — X7 on the plain S1 set is the standing configuration (3.9 / 3.9 / 3.5-3.6M at any pacing from 25 to 40 ms, cycle 51); S4 and 128 build threads do nothing; the incremental output (v1) and the seal-time build gate both regress; the profile says the path is latency, not CPU
+
+Section 10.102 left X7 on the plain S1 set (`D2S12` = D2 S1 S2 T64, no F6/I3/K8) at 3.93 / 3.93 / 3.52M and 10.103 designed two cuts for the 51 ms cycle. This section records stage u (X7DR repeated at 40 / 35 / 30 ms), stage v (S4 and 128 build threads), stage w (the two 10.103 cuts, one per leg) and stage x (a profiled X7 leg). Notation as in 10.99-10.103; `S4` = `N42_SHARDS_BEFORE_RECEIPTS=1 N42_FREEZE_SPLIT=4` (leg tag `S124`), `T128` = 128 build threads, `OI` = `N42_OUTPUT_INCREMENTAL=1`, `AG` = `N42_BUILD_AHEAD_GATE=seal`, `PROF` = the profiling build with perf attached; `b`/`c`/`d` = repeat legs.
+
+Columns: w1 / w2 / w3 in M tx/s, round total in M tx, `sealed_at` median of window 1 (ms), cycle of window 1 (ms). An empty cell = not recorded in this section.
+
+| leg | stage | pacing | w1 | w2 | w3 | round total | sealed_at | cycle | note |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| D2S12P40T64X7DRc | u | 40 | 3.920 | 3.913 | 3.487 | 339.6 | 40 | 51 | |
+| D2S12P40T64X7DRd | u | 40 | 3.853 | 3.860 | 3.600 | 339.4 | 39 | 52 | |
+| D2S12P35T64X7DRb | u | 35 | 3.900 | 3.893 | 3.640 | 343.0 | 40 | 51 | |
+| D2S12P35T64X7DRc | u | 35 | 3.967 | 3.933 | 3.487 | 341.6 | 39 | 50 | |
+| D2S12P30T64X7DR | u | 30 | 3.960 | 3.920 | 3.607 | 344.6 | 40 | 51 | |
+| D2S12P30T64X7DRb | u | 30 | 3.893 | 3.933 | 3.593 | 342.6 | 39 | 51 | |
+| D2S124P40T64X7DR | v | 40 | 3.867 | 3.833 | 3.513 | 336.4 | 38 | 52 | S4 |
+| D2S124P40T64X7DRb | v | 40 | 3.927 | 3.833 | 3.607 | 341.0 | 38 | 51 | S4 |
+| D2S12P40T128X7DR | v | 40 | 3.793 | 3.753 | 3.447 | 329.8 | 41 | 53 | T128 |
+| D2S124P40T128X7DR | v | 40 | 3.713 | 3.693 | 3.440 | 325.4 | 39 | 54 | S4 + T128 |
+| D2S124P40T128X7DRb | v | 40 | 3.660 | 3.680 | 3.400 | 322.2 | 39 | 55 | S4 + T128 |
+| D2S124P35T128X7DR | v | 35 | 3.720 | 3.667 | 3.340 | 321.8 | 39 | 54 | S4 + T128 |
+| D2S12P40T64X7OI | w | 40 | 3.591 | 3.613 | 3.320 | 315.7 | 51 | 56 | `N42_OUTPUT_INCREMENTAL=1` |
+| D2S12P40T64X7AG | w | 40 | 3.647 | 2.807 | 2.367 | 264.6 | 44 | 55 | `N42_BUILD_AHEAD_GATE=seal`; own_not_committed=3, BODYGATE, round stopped |
+| D2S12P40T64X7PROF | x | 40 | 3.900 | 2.673 | 3.633 | 306.2 | 40 | 51 | profiling build, perf 10 s in window 2 (w2 is the perf window) |
+
+- **X7 stands (stage u, loop351 analysis).** Six legs at 40 / 35 / 30 ms read 3.85-3.97 / 3.86-3.93 / 3.49-3.64M, rounds of 339-345M, with the cycle at 51 ms regardless of pacing (`sealed_at` 39-40). Pacing is not the lever between 25 and 40 ms; window 3 is the noisy one (3.49-3.64M across legs of one configuration).
+- **S4 and 128 build threads do nothing (stage v).** S4 reads 3.87 / 3.83 and 3.93 / 3.83M at 40 ms against X7DR's 3.85-3.97 (inside the spread; `sealed_at` 38 against 39-40); T128 reads 3.71-3.79M and S4 + T128 3.66-3.72M, i.e. 3-7% lower, with the cycle at 53-55 ms. Decision: T64 stays, S4 off.
+- **Where the 51 ms cycle goes (loop351 analysis, X7DR 35 ms leg, per-block means).** seal(N-1) -> the parent's output fold 20.3 ms (`seal_to_shards_ready`; `state_wait_on=output` on 489 of 595 builds) -> execution of N 2 + 16.7 -> fields and seal tail ~8 -> seal(N) = 44 ms. 17% of builds are gated by the one-ahead rule (`h2-el-rpc` `engine.rs:459-506` waits for the send of P(N-1)) at ~70 ms, which lifts the mean to 50.3 ms. The tick and the QC are not on the path (the seal runs 20-39 ms ahead of the send). Below 40 ms the next wall is `parent_fields` (block N-2's root, ~79 ms after its seal).
+- **The two 10.103 cuts both regress (stage w; "Opus cuts").** `OI` (v1): `seal_to_shards_ready` falls from 20 to 11.6 ms, but the child's `par_exec` rises from 15 to 39 ms because reads on the early view walk the batch maps; the leg reads 3.59 / 3.61 / 3.32M with `sealed_at` 52. `AG`: 3.65 / 2.81 / 2.37M, `sealed_at` 48, `own_not_committed=3` and the BODYGATE stop: a child started at the parent's seal lands on a replaced parent. Both stay off. Lesson: one switch per leg in release before stacking.
+- **The profile (stage x).** perf for 10 s on the execution layer in window 2, by thread family: `tokio-rt` 31.8% (the ingest: transaction keccak 10.5% + sha3 finalize 5.5% + update 3.4%, the pool HashMap 3.8%, `index_and_stage` 2.5%, AltSig decode 2.1%); the build pool 23.6% (about 15 cores averaged: revm ~8%, parent-state reads overlay -> `FrozenShards::get` -> `ShardLayer::basic_account` -> QMDB ~7%, address keccak 1.9%, alloc/drop 2.7%, sync 0.3%); the unnamed `n42` threads (QMDB root and forest workers plus the fold) 18.8% (blake3 3.0%, twig/index ~8.3%, `sort_reverts` `par_sort` over `(Address, AccountRevert)` 1.4%, the indexed variant existing and used only on the graft path); plan-body 3.5%, storage writers 2.9%, engine 0.8%, persistence 0.06%. No spin and no lock waits: the 51 ms cycle is serial latency on the fold and execution path, not saturation.
+
+**What binds, and what is next.** X7 on the plain S1 set at 3.9M with a 51 ms cycle is the standing configuration; nothing tried in u-x moves it. The next cut is OI v2: a per-batch index built during the parent's execution so early reads cost the same as frozen reads, the indexed sort at `output_shards.rs:2216` / `:2278`, and a cached address hash; it is measured alone against X7 in stage y.
+
+Hand-off files: `target/fleet-runs/loop351{u,v,w,x}.out`, `target/fleet-runs/perf-loop351D2S12P40T64X7PROF.report.txt`; the BODYGATE leg's datadirs (`P40T64X7AG` in w) are kept as evidence under `/data/blockchain/rust-fleet7-bench/`.

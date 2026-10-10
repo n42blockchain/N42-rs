@@ -1,0 +1,36 @@
+== loop351D2S2P45T64X5: 7 validator logs, f=2, quorum 5
+1. the leaders' commit lines
+  R1_collect (proposal -> prepare QC): n=5637 p50 3.0 p90 43.0 p99 93.0 max 149.0 ms
+  R2_collect (prepare QC -> commit QC): n=5637 p50 3.0 p90 3.0 p99 10.0 max 17.0 ms
+  total (proposal -> commit): n=5637 p50 46.0 p90 63.0 p99 122.0 max 713.0 ms
+  votes at formation: R1 median 5 max 5 (quorum 5); R2 median 5 max 5
+2. vote collection at the traced leaders (first vote -> quorum -> last vote)
+ R1 (vote), 3071 views:
+    proposal -> first vote: n=3071 p50 2.7 p90 59.6 p99 98.5 max 147.4 ms
+    first vote -> quorum: n=3071 p50 0.2 p90 0.5 p99 1.4 max 7.8 ms
+    quorum -> last vote: n=3071 p50 1.6 p90 1.8 p99 6.9 max 10.3 ms
+    proposal -> last vote (the slowest key): n=3071 p50 4.4 p90 61.1 p99 100.1 max 147.7 ms
+   views with fewer than 6 votes received: 1
+ R2 (commit_vote), 3071 views:
+    proposal -> first vote: n=3071 p50 6.1 p90 63.4 p99 101.6 max 151.0 ms
+    first vote -> quorum: n=3071 p50 0.3 p90 0.5 p99 1.2 max 4.3 ms
+    quorum -> last vote: n=3071 p50 3.1 p90 4.4 p99 12.8 max 22.5 ms
+    proposal -> last vote (the slowest key): n=3071 p50 9.3 p90 67.9 p99 106.0 max 155.0 ms
+   views with fewer than 6 votes received: 0
+3. the straggler rule and the loop
+  proposal interval (same leader, consecutive views): n=5631 p50 46.5 p90 52.4 p99 100.7 max 617.7 ms; >= 500 ms: 1
+  no `slow step` lines
+4. gossip propagation (proposal sent -> received at a traced follower)
+    proposal arrival delay: n=13840 p50 0.2 p90 0.3 p99 1.0 max 14.7 ms
+4b. the new fields (docs/E1_MANY_KEYS.md section 6), leaders' `block committed!` and `proposal sent` lines
+    verify_us: n=5637 p50 2908.0 p90 3159.0 p99 3410.0 max 5611.0 us
+    verify_n: n=5637 p50 10.0 p90 12.0 p99 14.0 max 14.0 
+    verify_batches: n=5637 p50 3.0 p90 3.0 p99 3.0 max 5.0 
+  verify_fallbacks: total 2 over 5637 blocks
+    inbound_queue_max: n=5637 p50 0.0 p90 0.0 p99 0.0 max 0.0 
+    gossip_poll_us: n=5637 p50 173.0 p90 262.0 p99 351.0 max 993.0 us
+  straggler_waits (cumulative per leader log, summed over 6 leaders): 4; waits with straggler_wait_us > 0: 4 of 5637 proposals, p50 29.7 p90 606.4 max 606.4 ms, total 0.67 s
+  direct votes at the leaders: received 55299 (duplicates dropped 0); sent by those nodes 24570, fallbacks to gossip 6140; leaders led 5637 views = 67644 vote messages expected (2 rounds x 6); direct share of those 81.8%
+5. validators
+validators n=7: cpu total 1.12 cores, per key mean 0.160 median 0.157 max 0.168 (key 2) min 0.149; rss per key peak mean 0.143 max 0.190 G, sum of peaks 1.0 G; threads per key mean 39, total 273
+libp2p connections (last census of 5): 36 in all (a full mesh of 7 is 21); sockets per process min 4 median 6 max 6

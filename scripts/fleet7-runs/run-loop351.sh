@@ -534,7 +534,17 @@ case $STAGE in
      X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
      b7 D2S12P40T64X7PROF $D2 $S1 $S2 $X7 $T64 F7_BIN=$WT/target/profiling-build/profiling F7_BLOCK_INTERVAL_MS=40
      P=$S/perf-loop351D2S12P40T64X7PROF; if [ "${LOOP351_DRY:-0}" != 1 ] && [ -f $P.data ]; then PB=$WT/target/profiling-build/profiling; { for sk in symbol dso,symbol comm,symbol; do echo "== perf report --sort $sk"; perf report -i $P.data --stdio --no-inline --no-children --sort $sk --percent-limit 0.5 2>/dev/null | grep -v '^#' | grep -v '^$'; done; } > $P.report.txt; echo "perf report: $P.report.txt"; fi ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w or x)"; exit 2 ;;
+  y) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     OI="N42_OUTPUT_INCREMENTAL=1"
+     b7 D2S12P40T64X7 $D2 $S1 $S2 $X7 $T64 F7_BLOCK_INTERVAL_MS=40
+     b7 D2S12P40T64X7OI2 $D2 $S1 $S2 $X7 $OI $T64 F7_BLOCK_INTERVAL_MS=40
+     b7 D2S12P40T64X7b $D2 $S1 $S2 $X7 $T64 F7_BLOCK_INTERVAL_MS=40
+     b7 D2S12P40T64X7OI2b $D2 $S1 $S2 $X7 $OI $T64 F7_BLOCK_INTERVAL_MS=40
+     b7 D2S12P35T64X7OI2 $D2 $S1 $S2 $X7 $OI $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P30T64X7OI2 $D2 $S1 $S2 $X7 $OI $T64 F7_BLOCK_INTERVAL_MS=30 ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x or y)"; exit 2 ;;
 esac
 
 if [ "${LOOP351_DRY:-0}" = 1 ]; then echo "dry run done"; exit 0; fi

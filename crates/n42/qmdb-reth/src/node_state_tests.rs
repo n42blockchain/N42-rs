@@ -367,7 +367,7 @@ fn a_due_checkpoint_rotates_the_log_and_the_compaction_runs_behind() {
     {
         let mut cursor = state.cursor();
         cursor.compacting = true;
-        state.rewrite_checkpoint(head, &mut cursor).expect("deferred");
+        state.rewrite_checkpoint(Some(head), &mut cursor).expect("deferred");
         cursor.compacting = false;
     }
     assert!(state.delta_log_path().exists());
@@ -378,7 +378,7 @@ fn a_due_checkpoint_rotates_the_log_and_the_compaction_runs_behind() {
     std::fs::remove_file(state.delta_log_path()).expect("remove");
     {
         let mut cursor = state.cursor();
-        state.rewrite_checkpoint(head, &mut cursor).expect("nothing to do");
+        state.rewrite_checkpoint(Some(head), &mut cursor).expect("nothing to do");
     }
     assert!(!state.sealed_log_path().exists());
     std::fs::write(state.delta_log_path(), &log).expect("restore");
@@ -386,7 +386,7 @@ fn a_due_checkpoint_rotates_the_log_and_the_compaction_runs_behind() {
     // The log is sealed and compacted on a thread of its own.
     {
         let mut cursor = state.cursor();
-        state.rewrite_checkpoint(head, &mut cursor).expect("rotated");
+        state.rewrite_checkpoint(Some(head), &mut cursor).expect("rotated");
         assert_eq!(cursor.log_len, 0, "the log starts again");
     }
     state.wait_for_compaction();
@@ -398,7 +398,7 @@ fn a_due_checkpoint_rotates_the_log_and_the_compaction_runs_behind() {
     seal_the_log(&state2);
     {
         let mut cursor = state2.cursor();
-        state2.rewrite_checkpoint(head2, &mut cursor).expect("retried");
+        state2.rewrite_checkpoint(Some(head2), &mut cursor).expect("retried");
     }
     state2.wait_for_compaction();
     assert!(!state2.sealed_log_path().exists(), "the leftover segment was folded");
@@ -832,33 +832,24 @@ fn forest_shape(state: &QmdbNodeState) -> ((u64, B256), (usize, usize), Option<B
 fn a_canonical_head_during_a_lease_is_seen_at_once_and_trimmed_by_the_return() {
     let (immediate, immediate_view, genesis) = switched("canon-defer-immediate", true, true);
     let (deferred, view, _) = switched("canon-defer-deferred", true, true);
+    immediate.set_canonical_defer(false);
     deferred.set_canonical_defer(true);
     for state in [&immediate, &deferred] {
         state.insert_block_operations(genesis, hash_of(1), 1, wide_changes(1).ops()).expect("block 1");
         state.on_canonical(hash_of(1)).expect("the first checkpoint");
     }
-    let patience = std::time::Duration::from_millis(150);
-    let mut leased_heads = 0u64;
-    let mut expected_deferred = 0u64;
+    let patience = std::time::Duration::from_secs(2);
     let last = 40u64;
     for number in 2..=last {
         let parent = hash_of(number - 1);
         // Deferred: block `number` is computed on a lease, and the head
         // `number - 1` arrives meanwhile.
         let lease = take_lease(&deferred, parent);
-        let waits = leased_heads % (CANONICAL_DEFER_MAX_STREAK + 1) == CANONICAL_DEFER_MAX_STREAK;
-        leased_heads += 1;
         let (finished, handle) = canonical_on_the_side(&deferred, parent, patience);
-        if waits {
-            assert!(!finished, "head {}: the streak is spent, so it waits for the tree", number - 1);
-        } else {
-            expected_deferred += 1;
-            assert!(finished, "head {}: recorded without waiting for the lease", number - 1);
-            assert_eq!(deferred.head(), Some((number - 1, parent)), "the head is seen at once");
-            assert_eq!(deferred.root_of(&parent), immediate.root_of(&parent));
-            let guard = deferred.lock_as("root_of");
-            assert!(guard.as_ref().expect("initialised").trim_due(), "the trim is owed");
-        }
+        assert!(finished, "head {}: recorded without waiting for the lease", number - 1);
+        assert_eq!(deferred.head(), Some((number - 1, parent)), "the head is seen at once");
+        assert_eq!(deferred.root_of(&parent), immediate.root_of(&parent));
+        assert!(deferred.lock_as("root_of").as_ref().expect("initialised").trim_due(), "the trim is owed");
         let prepared = give_back(&deferred, lease, wide_changes(number).ops());
         handle.join().expect("the canonical thread");
         deferred.insert(hash_of(number), number, prepared).expect("insert");
@@ -876,7 +867,9 @@ fn a_canonical_head_during_a_lease_is_seen_at_once_and_trimmed_by_the_return() {
             }
         }
     }
-    assert_eq!(deferred.offlock_counters().deferred_canonicals, expected_deferred);
+    // Heads 1-39 in the loop; the first head went by the waiting path
+    // (nothing was logged yet).
+    assert_eq!(deferred.offlock_counters().deferred_canonicals, last - 1);
     assert_eq!(immediate.offlock_counters().deferred_canonicals, 0);
     let (trimmed, _) = forest_shape(&deferred).1;
     assert!(trimmed > 0, "the trims had work");
@@ -886,6 +879,10 @@ fn a_canonical_head_during_a_lease_is_seen_at_once_and_trimmed_by_the_return() {
     for state in [&immediate, &deferred] {
         state.on_canonical(hash_of(last)).expect("canonical");
     }
+    // The catch-up persists the heads recorded without waiting; settling
+    // waits for it.
+    deferred.settle_canonical().expect("settle");
+    assert_eq!(deferred.cursor().head, hash_of(last), "the log reached the last head");
     assert_eq!(forest_shape(&deferred), forest_shape(&immediate));
     let persisted: Vec<(u64, B256)> = (37..=39).map(|n| (n, hash_of(n))).collect();
     for (state, view) in [(&immediate, &immediate_view), (&deferred, &view)] {
@@ -908,6 +905,7 @@ fn a_canonical_head_during_a_lease_is_seen_at_once_and_trimmed_by_the_return() {
 fn a_branch_switch_during_a_lease_waits_and_takes_the_owed_trim_first() {
     let (state, view, genesis) = switched("canon-defer-reorg", true, true);
     let (reference, _, _) = switched("canon-defer-reorg-ref", false, false);
+    reference.set_canonical_defer(false);
     state.set_canonical_defer(true);
     let mut parent = genesis;
     for number in 1..=20u64 {
@@ -940,6 +938,8 @@ fn a_branch_switch_during_a_lease_waits_and_takes_the_owed_trim_first() {
     assert_eq!(state.head(), Some((20, sibling)));
     assert_eq!(forest_shape(&state), forest_shape(&reference));
     assert_eq!(state.state_root(), reference.state_root());
+    // Only head 19, during the lease: heads 1-18 found the tree here and
+    // persisted at once, and the switch went by the waiting path.
     assert_eq!(state.offlock_counters().deferred_canonicals, 1);
 
     // The chain goes on from the sibling, and the view follows it.

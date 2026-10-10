@@ -435,7 +435,7 @@ pub struct QmdbForest {
     /// [`Self::block_changes_parts`] checks instead of flushing.
     flushed_slots: u64,
     /// A head move recorded while the tree was leased out
-    /// ([`Self::set_canonical_deferring`]) still owes the twig trim it would
+    /// ([`Self::set_canonical_in_place`]) still owes the twig trim it would
     /// have done; [`Self::return_tree`] (or the next
     /// [`Self::set_canonical_releasing`]) does it.
     trim_due: bool,
@@ -1208,23 +1208,21 @@ impl QmdbForest {
         Ok(released)
     }
 
-    /// [`Self::set_canonical_releasing`] while the tree is leased out
-    /// (`N42_QMDB_CANONICAL_DEFER`): the head moves and the records below the
-    /// window are cut now -- neither needs the tree -- and the twig trim,
-    /// which does, is owed to [`Self::return_tree`]. `None` (nothing done)
-    /// when the tree is here (the caller takes the immediate path) or when
-    /// the head is not on the path through the tree's tip (a branch switch:
-    /// the tree must be moved, so the caller waits for it).
+    /// [`Self::set_canonical_releasing`] for a head on the path through the
+    /// tree's tip, which needs no move (`N42_QMDB_CANONICAL_DEFER`), whether
+    /// or not the tree is leased out: the head moves and the records below
+    /// the window are cut now -- neither needs the tree. The twig trim,
+    /// which does, is done now with the tree here, and owed to
+    /// [`Self::return_tree`] with it out. `None` (nothing done) when the
+    /// head is off that path (a branch switch: the tree must be moved, so
+    /// the caller waits for it and calls [`Self::set_canonical_releasing`]).
     ///
     /// The records cut are exactly the immediate path's (same cutoff, same
-    /// reader keep); the trim, done later, computes its bound from the
-    /// records and pending undo that exist then, so it never cuts into an
-    /// undo still held. Nothing moves the tree, so the entry file is never
+    /// reader keep); a deferred trim computes its bound from the records and
+    /// pending undo that exist when it runs, so it never cuts into an undo
+    /// still held. Nothing moves the tree, so the entry file is never
     /// truncated and the read view's cut count is untouched.
-    pub fn set_canonical_deferring(&mut self, block_hash: B256) -> Result<Option<Released>, StateError> {
-        if self.leased_at.is_none() {
-            return Ok(None);
-        }
+    pub fn set_canonical_in_place(&mut self, block_hash: B256) -> Result<Option<Released>, StateError> {
         let number = self
             .records
             .get(&block_hash)
@@ -1232,6 +1230,9 @@ impl QmdbForest {
             .number;
         if !self.ancestry(self.tip).contains(&block_hash) {
             return Ok(None);
+        }
+        if self.leased_at.is_none() {
+            return self.set_canonical_releasing(block_hash).map(Some);
         }
         self.head = (number, block_hash);
         let records = self.cut_records(number, block_hash);

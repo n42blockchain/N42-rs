@@ -194,24 +194,22 @@ fn compute_offlock_env() -> bool {
 /// under a short hold that needs no tree -- the head (what `head`, `root_of`
 /// and the readers see, at once), the canonical number, the records cut
 /// below the window -- and the twig trim it owes is done by the lease's
-/// return ([`QmdbForest::return_tree`]). The head's delta, the entry file's
-/// sync and the log append need the tree (the entry file's writer is inside
-/// it), so they ride with the next head that finds the tree here: its
-/// deltas chain from the persisted head through this one. At most
-/// [`CANONICAL_DEFER_MAX_STREAK`] heads in a row defer before one waits, and
-/// a head off the tree's path (a branch switch) always waits. Measured
-/// cause: on loop351 E=1 `on_canonical` waited ~25 ms behind the lease on
-/// most blocks, in the newPayload answer's serial chain.
+/// return ([`QmdbForest::return_tree`]). The same in-place record (with the
+/// trim done in the hold) is used when the tree is here but the catch-up
+/// below holds the persistence cursor; with both free the head is persisted
+/// at once, as without the switch. The head's delta, the entry file's sync and the log
+/// append need the tree (the entry file's writer is inside it) and an
+/// fsync, so they go to a catch-up thread ([`QmdbNodeState::settle_canonical`])
+/// that persists whatever head the forest stands at by then, chaining the
+/// deltas of every head since the persisted one. A head off the tree's path
+/// (a branch switch), and the first head before anything is logged, take
+/// the waiting path as before. Measured cause: on loop351 E=1
+/// `on_canonical` waited ~25 ms behind the lease on most blocks, in the
+/// newPayload answer's serial chain.
 fn canonical_defer_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_QMDB_CANONICAL_DEFER").is_ok_and(|v| v == "1"))
 }
-
-/// How many canonical heads in a row may leave their persistence to a later
-/// head (`N42_QMDB_CANONICAL_DEFER`) before one waits for the tree. Below
-/// the forest's record retention (16), so the deferred heads' records and
-/// deltas are still held when the chain is persisted.
-const CANONICAL_DEFER_MAX_STREAK: u64 = 8;
 
 /// `N42_QMDB_PERSIST_BATCH=1` (default off): [`QmdbNodeState::on_persisted`]
 /// lists a whole persistence batch's changes (and raises the read view's
@@ -276,8 +274,9 @@ pub struct OfflockCounters {
     pub persists: u64,
     /// The sums of the persistence calls' splits.
     pub persist_split: PersistSplit,
-    /// Canonical heads recorded without waiting for a leased tree
-    /// (`N42_QMDB_CANONICAL_DEFER`), their trim left to the lease's return.
+    /// Canonical heads recorded without waiting (`N42_QMDB_CANONICAL_DEFER`),
+    /// their persistence left to the catch-up thread (and, during a lease,
+    /// their trim to the lease's return).
     pub deferred_canonicals: u64,
 }
 
@@ -546,9 +545,14 @@ struct Inner {
     persist_batch: std::sync::atomic::AtomicBool,
     /// `N42_QMDB_CANONICAL_DEFER`, or `set_canonical_defer`.
     canonical_defer: std::sync::atomic::AtomicBool,
-    /// Heads deferred so far, and in a row since the last persisted one.
+    /// Heads recorded without waiting so far.
     deferred_canonicals: std::sync::atomic::AtomicU64,
-    canonical_defer_streak: std::sync::atomic::AtomicU64,
+    /// Something has been logged (a checkpoint exists), so a head can be
+    /// recorded and its persistence left to the catch-up thread.
+    logged: std::sync::atomic::AtomicBool,
+    /// Wakes the catch-up thread ([`QmdbNodeState::settle_canonical`]);
+    /// one pending wake is enough, since it persists the newest head.
+    catch_up: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>>,
     /// [`OfflockCounters`], field by field.
     leased_roots: std::sync::atomic::AtomicU64,
     renamed_parents: std::sync::atomic::AtomicU64,
@@ -884,7 +888,8 @@ impl QmdbNodeState {
                 persist_batch: std::sync::atomic::AtomicBool::new(persist_batch_env()),
                 canonical_defer: std::sync::atomic::AtomicBool::new(canonical_defer_env()),
                 deferred_canonicals: Default::default(),
-                canonical_defer_streak: Default::default(),
+                logged: Default::default(),
+                catch_up: std::sync::OnceLock::new(),
                 leased_roots: Default::default(),
                 renamed_parents: Default::default(),
                 tree_waits: Default::default(),
@@ -2117,16 +2122,89 @@ impl QmdbNodeState {
     /// means a block reached the canonical chain without passing through this
     /// node's validation, and the forest can no longer compute the next root.
     pub fn on_canonical(&self, block_hash: B256) -> Result<(), NodeStateError> {
+        // `N42_QMDB_CANONICAL_DEFER`: with the persistence cursor free and
+        // the tree here, the head is persisted now, as without the switch.
+        // With the tree leased out, or the cursor held by the catch-up, the
+        // head is recorded in place and the catch-up woken.
+        let held = if self.canonical_defer() && self.inner.logged.load(std::sync::atomic::Ordering::Acquire) {
+            let cursor = match self.inner.persist.try_lock() {
+                Ok(cursor) => Some(cursor),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            };
+            if self.defer_canonical(block_hash, cursor.is_none())? {
+                drop(cursor);
+                self.wake_catch_up();
+                return Ok(());
+            }
+            cursor
+        } else {
+            None
+        };
+        let mut cursor = match held {
+            Some(cursor) => cursor,
+            None => self.cursor(),
+        };
+        let persisted = self.persist_canonical(Some(block_hash), &mut cursor);
+        if persisted.is_ok() && cursor.checkpoint_len != 0 {
+            self.inner.logged.store(true, std::sync::atomic::Ordering::Release);
+        }
+        persisted
+    }
+
+    /// Persists the canonical head the forest stands at, if the log is not
+    /// there yet: the catch-up of `N42_QMDB_CANONICAL_DEFER` (its thread
+    /// calls this after every recorded head), and what a caller that wants
+    /// the log settled -- a test, a shutdown -- calls. Waits for a leased
+    /// tree; the head is read under each hold, so a head recorded meanwhile
+    /// is never moved back.
+    pub fn settle_canonical(&self) -> Result<(), NodeStateError> {
         let mut cursor = self.cursor();
-        if cursor.checkpoint_len != 0 && self.canonical_defer() && self.defer_canonical(block_hash)? {
+        let Some((_, head)) = self.head() else { return Ok(()) };
+        if cursor.head == head && cursor.checkpoint_len != 0 {
             return Ok(());
         }
-        self.inner.canonical_defer_streak.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.persist_canonical(None, &mut cursor)
+    }
+
+    /// Wakes the catch-up thread, starting it on first use. It holds the
+    /// state weakly and ends with it.
+    fn wake_catch_up(&self) {
+        let sender = self.inner.catch_up.get_or_init(|| {
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<()>(1);
+            let inner = Arc::downgrade(&self.inner);
+            let spawned = std::thread::Builder::new().name("n42-qmdb-canon".into()).spawn(move || {
+                while receiver.recv().is_ok() {
+                    let Some(inner) = inner.upgrade() else { break };
+                    if let Err(error) = (QmdbNodeState { inner }).settle_canonical() {
+                        warn!(target: "n42.qmdb", %error, "the QMDB head's deferred persistence failed; the next head retries it");
+                    }
+                }
+            });
+            if let Err(error) = spawned {
+                warn!(target: "n42.qmdb", %error, "no QMDB catch-up thread; deferred heads persist inline");
+            }
+            sender
+        });
+        match sender.try_send(()) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => {}
+            Err(std::sync::mpsc::TrySendError::Disconnected(())) => {
+                if let Err(error) = self.settle_canonical() {
+                    warn!(target: "n42.qmdb", %error, "the QMDB head's persistence failed; the next head retries it");
+                }
+            }
+        }
+    }
+
+    /// [`Self::on_canonical`]'s persistence, with the persistence cursor
+    /// held: of `target`, or (`None`, the catch-up) of the head the forest
+    /// stands at, read under each hold.
+    fn persist_canonical(&self, target: Option<B256>, cursor: &mut PersistCursor) -> Result<(), NodeStateError> {
         // No checkpoint yet (a forest seeded from the alloc, or one whose log
         // has outgrown it): write the tree once, and the deltas that follow are
         // measured against it.
         if cursor.checkpoint_len == 0 {
-            return self.checkpoint(block_hash, &mut cursor);
+            return self.checkpoint(target, cursor);
         }
         // The block's own delta from its parent, captured when it was
         // computed, when the persisted state is its parent (or an ancestor
@@ -2142,13 +2220,18 @@ impl QmdbNodeState {
         // off this thread (`release_off_lock`): after a persistence batch it
         // is the whole batch, and freed under the lock it held every build's
         // and import's QMDB root for up to a second (BREAKTHROUGH_DESIGN 10.38).
-        let (number, ready, released) = self.with_forest("on_canonical", |forest| {
+        let (block_hash, number, ready, released) = self.with_forest("on_canonical", |forest| {
+            let block_hash = target.unwrap_or_else(|| forest.head().1);
             let released = forest.set_canonical_releasing(block_hash)?;
-            Ok((forest.head().0, forest.take_block_deltas(cursor.head, cursor.next_slot, block_hash), released))
+            Ok((block_hash, forest.head().0, forest.take_block_deltas(cursor.head, cursor.next_slot, block_hash), released))
         })?;
         release_off_lock(number, released);
-        self.inner.canonical_number.store(number, std::sync::atomic::Ordering::Relaxed);
-        self.note_reader_lag();
+        // The catch-up's head may be behind one recorded since; that one
+        // already set the number.
+        if target.is_some() {
+            self.inner.canonical_number.store(number, std::sync::atomic::Ordering::Relaxed);
+            self.note_reader_lag();
+        }
         if let Some(deltas) = ready {
             self.sync_entries_if_file()?;
             for delta in &deltas {
@@ -2170,13 +2253,13 @@ impl QmdbNodeState {
                 forest.forget_changes();
                 Ok(())
             })?;
-            if checkpoint_due(&cursor) {
-                return self.rewrite_checkpoint(block_hash, &mut cursor);
+            if checkpoint_due(cursor) {
+                return self.rewrite_checkpoint(target.map(|_| block_hash), cursor);
             }
             return Ok(());
         }
         let (delta, released) = self.with_forest("on_canonical#3", |forest| {
-            let released = forest.set_canonical_releasing(block_hash)?;
+            let released = forest.set_canonical_releasing(target.unwrap_or_else(|| forest.head().1))?;
             Ok((forest.delta_since(cursor.next_slot)?, released))
         })?;
         release_off_lock(number, released);
@@ -2190,6 +2273,7 @@ impl QmdbNodeState {
         // snapshot covers it too (the log is then emptied).
         self.sync_entries_if_file()?;
         let written = append_delta(&self.delta_log_path(), cursor.log_len, &delta)?;
+        let block_hash = delta.head_hash;
         cursor.head = block_hash;
         cursor.next_slot = delta.next_slot;
         cursor.log_len = written;
@@ -2199,38 +2283,37 @@ impl QmdbNodeState {
             appended = delta.appended.len(), changed = delta.changed.len(),
             "persisted the QMDB head as a delta",
         );
-        if checkpoint_due(&cursor) {
-            return self.rewrite_checkpoint(block_hash, &mut cursor);
+        if checkpoint_due(cursor) {
+            return self.rewrite_checkpoint(target.map(|_| block_hash), cursor);
         }
         Ok(())
     }
 
-    /// [`Self::on_canonical`] while the tree is leased out
-    /// (`N42_QMDB_CANONICAL_DEFER`): one short hold that needs no tree moves
-    /// the head and cuts the records below the window
-    /// ([`QmdbForest::set_canonical_deferring`]); the twig trim is left to
-    /// the lease's return, and the persistence (delta, entry sync, log
-    /// append) to the next head that finds the tree here. `false` (nothing
-    /// done) when the tree is here, when the head is off the tree's path (a
-    /// branch switch: the caller waits and moves it, which also does the
-    /// owed trim first), or after [`CANONICAL_DEFER_MAX_STREAK`] deferrals in
-    /// a row. Called with the persistence cursor held, so it is serialised
-    /// with the persisting path.
-    fn defer_canonical(&self, block_hash: B256) -> Result<bool, NodeStateError> {
+    /// [`Self::on_canonical`] without waiting (`N42_QMDB_CANONICAL_DEFER`),
+    /// when the tree is leased out or (`cursor_busy`) the catch-up holds the
+    /// persistence cursor -- otherwise `false` and the caller persists now:
+    /// one short hold moves the head and cuts the records below the window
+    /// ([`QmdbForest::set_canonical_in_place`]); with the tree leased out the
+    /// twig trim is left to the lease's return, with it here it is done in
+    /// the hold. The persistence (delta, entry sync, log append) is left to
+    /// the catch-up thread. `false` (nothing done) when the head is off the
+    /// tree's path (a branch switch: the caller takes the waiting path,
+    /// whose `set_canonical_releasing` does any owed trim before it moves
+    /// the tree).
+    fn defer_canonical(&self, block_hash: B256, cursor_busy: bool) -> Result<bool, NodeStateError> {
         use std::sync::atomic::Ordering::Relaxed;
-        if self.inner.canonical_defer_streak.load(Relaxed) >= CANONICAL_DEFER_MAX_STREAK {
-            return Ok(false);
-        }
         let recorded = self.with_forest("on_canonical_defer", |forest| {
-            Ok(forest.set_canonical_deferring(block_hash)?.map(|released| (forest.head().0, released)))
+            if !cursor_busy && !forest.is_leased() {
+                return Ok(None);
+            }
+            Ok(forest.set_canonical_in_place(block_hash)?.map(|released| (forest.head().0, released)))
         })?;
         let Some((number, released)) = recorded else { return Ok(false) };
         release_off_lock(number, released);
         self.inner.canonical_number.store(number, Relaxed);
-        self.inner.canonical_defer_streak.fetch_add(1, Relaxed);
         self.inner.deferred_canonicals.fetch_add(1, Relaxed);
         self.note_reader_lag();
-        debug!(target: "n42.qmdb", block = number, %block_hash, "canonical head recorded during a lease; trim and persistence deferred");
+        debug!(target: "n42.qmdb", block = number, %block_hash, "canonical head recorded without waiting; persistence left to the catch-up");
         Ok(true)
     }
 
@@ -2255,7 +2338,7 @@ impl QmdbNodeState {
     /// on this one (`N42_QMDB_CHECKPOINT_SYNC=1`).
     fn rewrite_checkpoint(
         &self,
-        block_hash: B256,
+        block_hash: Option<B256>,
         cursor: &mut PersistCursor,
     ) -> Result<(), NodeStateError> {
         if checkpoint_sync() {
@@ -2440,19 +2523,22 @@ impl QmdbNodeState {
     /// Writes the whole tree and starts a fresh log, from the live forest.
     fn checkpoint(
         &self,
-        block_hash: B256,
+        target: Option<B256>,
         cursor: &mut PersistCursor,
     ) -> Result<(), NodeStateError> {
         let started = std::time::Instant::now();
         if self.inner.entry_file {
             let ckpt = self.with_forest("checkpoint", |forest| {
-                forest.set_canonical(block_hash)?;
+                if let Some(block_hash) = target {
+                    forest.set_canonical(block_hash)?;
+                }
                 forest.sync_entries()?;
                 let ckpt = forest.checkpoint()?;
                 forest.forget_changes();
                 Ok(ckpt)
             })?;
             let mut phases = CompactPhases::default();
+            let block_hash = ckpt.head_hash;
             let len = write_ckpt(&self.ckpt_path(), &ckpt, &mut phases)?;
             let _ = std::fs::remove_file(self.delta_log_path());
             *cursor = PersistCursor {
@@ -2472,13 +2558,16 @@ impl QmdbNodeState {
             return Ok(());
         }
         let snapshot = self.with_forest("checkpoint#2", |forest| {
-            forest.set_canonical(block_hash)?;
+            if let Some(block_hash) = target {
+                forest.set_canonical(block_hash)?;
+            }
             let snapshot = forest.snapshot()?;
             // The changes are in the snapshot now, so the next delta must be
             // measured from it rather than carrying them a second time.
             forest.forget_changes();
             Ok(snapshot)
         })?;
+        let block_hash = snapshot.head_hash;
         let path = self.snapshot_path();
         let mut phases = CompactPhases::default();
         let len = write_snapshot(&path, &snapshot, &mut phases)?;

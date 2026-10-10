@@ -1259,7 +1259,13 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         rows: &[u8],
         lens: &[u32],
     ) -> ProviderResult<()> {
-        self.n42_append_encoded_tx_rows(StaticFileSegment::Transactions, first_tx_num, rows, lens)
+        self.n42_append_encoded_tx_rows(
+            StaticFileSegment::Transactions,
+            first_tx_num,
+            rows,
+            lens,
+            super::n42_sf::bulk_append(),
+        )
     }
 
     /// N42: appends `lens.len()` receipts whose rows are already encoded, numbered from
@@ -1271,16 +1277,44 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         rows: &[u8],
         lens: &[u32],
     ) -> ProviderResult<()> {
-        self.n42_append_encoded_tx_rows(StaticFileSegment::Receipts, first_tx_num, rows, lens)
+        self.n42_append_encoded_tx_rows(
+            StaticFileSegment::Receipts,
+            first_tx_num,
+            rows,
+            lens,
+            super::n42_sf::bulk_append(),
+        )
     }
 
-    /// N42: the shared body of the tx-numbered encoded appends.
+    /// N42: [`Self::append_transactions_encoded`] with the bulk switch given instead of read
+    /// from `N42_SF_BULK_APPEND` (tests compare both).
+    #[cfg(test)]
+    pub(crate) fn n42_append_transactions_encoded_with(
+        &mut self,
+        bulk: bool,
+        first_tx_num: TxNumber,
+        rows: &[u8],
+        lens: &[u32],
+    ) -> ProviderResult<()> {
+        self.n42_append_encoded_tx_rows(
+            StaticFileSegment::Transactions,
+            first_tx_num,
+            rows,
+            lens,
+            bulk,
+        )
+    }
+
+    /// N42: the shared body of the tx-numbered encoded appends. With `bulk` the chunk goes to
+    /// the data file in one write (`NippyJarWriter::append_encoded_rows`), else one
+    /// `append_column` per row; the files are the same.
     fn n42_append_encoded_tx_rows(
         &mut self,
         expected: StaticFileSegment,
         first_tx_num: TxNumber,
         rows: &[u8],
         lens: &[u32],
+        bulk: bool,
     ) -> ProviderResult<()> {
         let start = Instant::now();
         self.ensure_no_queued_prune()?;
@@ -1311,11 +1345,17 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             None => first_tx_num,
         };
 
-        let mut offset = 0;
-        for len in lens {
-            let end = offset + *len as usize;
-            self.writer.append_column(Some(Ok(&rows[offset..end]))).map_err(ProviderError::other)?;
-            offset = end;
+        if bulk {
+            self.writer.append_encoded_rows(rows, lens).map_err(ProviderError::other)?;
+        } else {
+            let mut offset = 0;
+            for len in lens {
+                let end = offset + *len as usize;
+                self.writer
+                    .append_column(Some(Ok(&rows[offset..end])))
+                    .map_err(ProviderError::other)?;
+                offset = end;
+            }
         }
         let tx_end = first_tx_num + lens.len() as u64 - 1;
         self.writer.user_header_mut().set_tx_range(tx_start, tx_end);

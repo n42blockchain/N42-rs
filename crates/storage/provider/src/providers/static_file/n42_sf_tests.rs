@@ -171,6 +171,40 @@ mod tests {
 
     const SIZES: &[usize] = &[0, 3, 10_000, 1, 0, 20_000, 8_191, 8_192, 12_345];
 
+    /// Writes `blocks` through `encode_parallel` and either append path.
+    fn write_encoded(
+        p: &StaticFileProvider<N42Primitives>,
+        blocks: &[Vec<N42TxEnvelope>],
+        bulk: bool,
+    ) {
+        let mut w = p.get_writer(0, StaticFileSegment::Transactions).expect("writer");
+        let mut tx = 0u64;
+        for (i, txs) in blocks.iter().enumerate() {
+            w.increment_block(i as u64).expect("increment");
+            for chunk in encode_parallel(txs) {
+                w.n42_append_transactions_encoded_with(bulk, tx, &chunk.rows, &chunk.lens)
+                    .expect("append");
+                tx += chunk.lens.len() as u64;
+            }
+        }
+        w.commit().expect("commit");
+    }
+
+    /// The bulk append leaves every file byte for byte as the per-row append does (the
+    /// configuration file carries `rows` and `max_row_size`), including multi-chunk blocks
+    /// and empty ones, and the rows read back.
+    #[test]
+    fn bulk_append_is_byte_identical_and_readable() {
+        let blocks = blocks(SIZES);
+        let (a, b) = (tempfile::tempdir().expect("tmp"), tempfile::tempdir().expect("tmp"));
+        let (pa, pb) = (provider(a.path(), 4), provider(b.path(), 4));
+        write_encoded(&pa, &blocks, false);
+        write_encoded(&pb, &blocks, true);
+        assert_same_files(a.path(), b.path());
+        assert_reads_back(&pa, &blocks);
+        assert_reads_back(&pb, &blocks);
+    }
+
     #[test]
     fn parallel_encode_is_byte_identical_and_readable() {
         let blocks = blocks(SIZES);

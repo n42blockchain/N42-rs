@@ -669,6 +669,26 @@ type LateFreeze = crate::output_shards::FreezeHandle;
 
 /// Starts the freeze of `shards` on a thread of its own
 /// ([`crate::output_shards::OutputShards::freeze_on_thread`]).
+fn spawn_freeze_maybe_early(
+    shards: crate::output_shards::OutputShards,
+    early: &mut Option<crate::output_shards::EarlyReceiver>,
+) -> Result<LateFreeze, Option<Box<crate::output_shards::OutputShards>>> {
+    if !crate::output_shards::output_incremental() {
+        return spawn_freeze(shards);
+    }
+    shards
+        .freeze_on_thread_early()
+        .map(|(receiver, handle)| {
+            *early = Some(receiver);
+            handle
+        })
+        .inspect_err(|_| {
+            tracing::debug!(target: "payload_builder", "no thread for the freeze; frozen before the seal");
+        })
+}
+
+/// Starts the freeze of `shards` on a thread of its own
+/// ([`crate::output_shards::OutputShards::freeze_on_thread`]).
 fn spawn_freeze(shards: crate::output_shards::OutputShards) -> Result<LateFreeze, Option<Box<crate::output_shards::OutputShards>>> {
     shards.freeze_on_thread().inspect_err(|_| {
         tracing::debug!(target: "payload_builder", "no thread for the freeze; frozen before the seal");
@@ -1716,6 +1736,16 @@ where
     let mut freeze_late_used = false;
     let mut freeze_ended_at: Option<std::time::Instant> = None;
     let mut freeze_join_wait_us = 0u64;
+    // `N42_OUTPUT_INCREMENTAL=1`: the receiver of the early output the late
+    // freeze hands over before it runs, that output once taken, the freeze
+    // left running (joined after the shards were filed on the early output),
+    // the cached accounts the early take committed (the frozen set gives
+    // them up when it lands), and when the frozen set was filed.
+    let mut early_rx: Option<crate::output_shards::EarlyReceiver> = None;
+    let mut early_out: Option<Arc<crate::output_shards::EarlyOutput>> = None;
+    let mut pending_freeze: Option<LateFreeze> = None;
+    let mut early_taken: Vec<alloy_primitives::Address> = Vec::new();
+    let mut shards_final_at: Option<std::time::Instant> = None;
     // Where the leader's time from the build's start to the seal goes, beside
     // the fields that already name it (plan v6, the seal gap). With the
     // parallel step taken, `sealed_at_ms` is, within a ms or two of rounding:
@@ -2217,7 +2247,7 @@ where
                         && early_seal.is_some();
                     let mut freezing: Option<LateFreeze> = None;
                     let mut sharded_out = match sharded_out {
-                        Some(shards) if freeze_late => match spawn_freeze(shards) {
+                        Some(shards) if freeze_late => match spawn_freeze_maybe_early(shards, &mut early_rx) {
                             Ok(handle) => {
                                 freezing = Some(handle);
                                 None
@@ -2701,6 +2731,22 @@ where
                         // `N42_FREEZE_AFTER_SEAL=1`: the shards are first read
                         // here; the freeze has run beside the commit and the
                         // seal, and the receipts job runs beside its end.
+                        // `N42_OUTPUT_INCREMENTAL=1`: on a block whose output
+                        // stays in its shards, the early output instead (~1 ms
+                        // into the freeze); the freeze is joined after the
+                        // shards were filed on it. No early output (no live
+                        // index, a thread that died first): joined here.
+                        if shards_stay
+                            && let Some(receiver) = early_rx.take()
+                            && freezing.is_some()
+                        {
+                            let wait_at = std::time::Instant::now();
+                            early_out = receiver.recv().ok().flatten();
+                            if early_out.is_some() {
+                                pending_freeze = freezing.take();
+                            }
+                            freeze_join_wait_us = wait_at.elapsed().as_micros() as u64;
+                        }
                         if let Some(handle) = freezing.take() {
                             let join_at = std::time::Instant::now();
                             match handle.join() {
@@ -2719,6 +2765,18 @@ where
                         let db = builder.executor.evm_mut().db_mut();
                         let at = std::time::Instant::now();
                         let graft = if freeze_failed { None } else { Some(match (staged, sharded_out.as_mut()) {
+                            // `N42_OUTPUT_INCREMENTAL=1`: the cached accounts'
+                            // changes read from the early output; the frozen
+                            // set gives them up when it lands.
+                            (None, None) if let Some(early) = early_out.as_ref() => {
+                                let (committed, taken) = early.take_cached(db);
+                                early_taken = taken;
+                                Ok(crate::parallel_transfer::Graft {
+                                    beneficiary_delta: early.beneficiary_delta(),
+                                    committed,
+                                    ..Default::default()
+                                })
+                            }
                             // The block's output stays in its shards: only the
                             // accounts a pre-execution call left in the cache
                             // are committed, as deltas.
@@ -2741,7 +2799,7 @@ where
                             ),
                         }) };
                         // Kept at 0 when nothing was grafted.
-                        graft_ms = if sharded_out.is_some() { 0 } else { at.elapsed().as_millis() as u64 };
+                        graft_ms = if sharded_out.is_some() || early_out.is_some() { 0 } else { at.elapsed().as_millis() as u64 };
                         (
                             graft,
                             root.map(|job| job.join().expect("the transactions root job does not panic")),
@@ -2796,6 +2854,16 @@ where
                                         sharded_out
                                             .as_ref()
                                             .and_then(|shards| shards.get(&withdrawal.address))
+                                            .and_then(|account| account.info.clone())
+                                    })
+                                    .or_else(|| {
+                                        // An account the early take committed
+                                        // is out of the output, as `take_cached`
+                                        // leaves it in the frozen set.
+                                        early_out
+                                            .as_ref()
+                                            .filter(|_| !early_taken.contains(&withdrawal.address))
+                                            .and_then(|early| early.account(&withdrawal.address))
                                             .and_then(|account| account.info.clone())
                                     });
                                 if let Some(info) = grafted {
@@ -3167,6 +3235,7 @@ where
             // block whose output stays in its shards).
             let mut receipts_late = receipts_pending.take();
             if output_shards.is_none()
+                && pending_freeze.is_none()
                 && let Some(handle) = receipts_late.take()
             {
                 let (receipts, gas_used) = handle.join().map_err(|_| {
@@ -3187,6 +3256,64 @@ where
             // The hashed state comes with `complete`.
             let mut bundle = db.take_bundle();
             let bundle_taken_at = std::time::Instant::now();
+            // `N42_OUTPUT_INCREMENTAL=1`: the shards are filed on the early
+            // output with this residual now -- the child's open proceeds --
+            // and only then is the freeze joined; its indexed set gives up the
+            // cached accounts the early take committed and is filed in the
+            // early output's place for every later reader.
+            let mut early_residual: Option<Arc<reth_execution_types::BlockExecutionOutput<n42_tx_types::Receipt>>> = None;
+            let mut early_ready: Option<(u64, std::time::Instant)> = None;
+            if let Some(handle) = pending_freeze.take() {
+                let residual = Arc::new(reth_execution_types::BlockExecutionOutput {
+                    state: std::mem::take(&mut bundle),
+                    result: reth_execution_types::BlockExecutionResult {
+                        receipts: Vec::new(),
+                        requests: Default::default(),
+                        gas_used: 0,
+                        blob_gas_used: 0,
+                    },
+                });
+                if let Some(early) = early_out.take() {
+                    crate::built_executions::shards_ready(
+                        block_hash,
+                        crate::built_executions::ShardedParent {
+                            residual: Arc::clone(&residual),
+                            shards: Arc::new(crate::output_shards::FrozenShards::early(early)),
+                        },
+                    );
+                    early_ready = Some((finish_at.elapsed().as_millis() as u64, std::time::Instant::now()));
+                }
+                let join_at = std::time::Instant::now();
+                let (mut frozen, took, ended) = handle.join().map_err(|_| {
+                    PayloadBuilderError::other(std::io::Error::other("the shards' freeze behind the early output panicked"))
+                })?;
+                freeze_join_wait_us += join_at.elapsed().as_micros() as u64;
+                index_ms = took.as_millis() as u64;
+                out_shards = frozen.shard_count();
+                shard_append_ms = frozen.append_ms();
+                shard_fold_ms = frozen.fold_ms();
+                freeze_ended_at = Some(ended);
+                frozen.take_out(&early_taken);
+                let frozen = Arc::new(frozen);
+                if root_ops_ahead() {
+                    let shards = Arc::clone(&frozen);
+                    let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
+                    let spawned = std::thread::Builder::new().name("n42-ops-ahead".into()).spawn(move || {
+                        n42_core_layout::enter(n42_core_layout::Set::Critical);
+                        let empty = revm::database::BundleState::default();
+                        let accounts = shards.view(&empty, &[]);
+                        (n42_qmdb_reth::operations_ahead(&accounts, prague), std::time::Instant::now())
+                    });
+                    match spawned {
+                        Ok(handle) => ops_ahead = Some((handle, prague)),
+                        Err(error) => {
+                            tracing::debug!(target: "payload_builder", %error, "no thread for the operations ahead; the root job encodes them");
+                        }
+                    }
+                }
+                output_shards = Some(frozen);
+                early_residual = Some(residual);
+            }
             if !execution_result.requests.is_empty() {
                 tracing::error!(
                     target: "payload_builder",
@@ -3357,21 +3484,37 @@ where
             shards_used = out_shards;
             // The residual is filed as it is, not copied: the root, the
             // hashed post-state and the merge below read it through the Arc.
-            let residual = Arc::new(reth_execution_types::BlockExecutionOutput {
-                state: bundle,
-                result: reth_execution_types::BlockExecutionResult {
-                    receipts: Vec::new(),
-                    requests: Default::default(),
-                    gas_used: 0,
-                    blob_gas_used: 0,
-                },
-            });
+            // (`N42_OUTPUT_INCREMENTAL=1`: the one the early output was filed
+            // with.)
+            let residual = match early_residual.take() {
+                Some(residual) => residual,
+                None => Arc::new(reth_execution_types::BlockExecutionOutput {
+                    state: bundle,
+                    result: reth_execution_types::BlockExecutionResult {
+                        receipts: Vec::new(),
+                        requests: Default::default(),
+                        gas_used: 0,
+                        blob_gas_used: 0,
+                    },
+                }),
+            };
             crate::built_executions::shards_ready(
                 block_hash,
                 crate::built_executions::ShardedParent { residual: Arc::clone(&residual), shards: Arc::clone(&shards) },
             );
-            shard_ready_ms = finish_at.elapsed().as_millis() as u64;
-            shards_ready_at = Some(std::time::Instant::now());
+            // The child's open proceeded at the early filing when there was
+            // one; this filing is the frozen set's.
+            match early_ready {
+                Some((ms, at)) => {
+                    shard_ready_ms = ms;
+                    shards_ready_at = Some(at);
+                    shards_final_at = Some(std::time::Instant::now());
+                }
+                None => {
+                    shard_ready_ms = finish_at.elapsed().as_millis() as u64;
+                    shards_ready_at = Some(std::time::Instant::now());
+                }
+            }
             let shard_reverts = std::mem::take(&mut par_reverts);
             // `N42_MERGE_AT_SHARDS_READY=1`: every input of the merge is in
             // hand now (the shards frozen, the residual taken, the graft's
@@ -3722,6 +3865,10 @@ where
                     // The shards filed (`shards_ready`): what the child's
                     // open waits for (`docs/SHARED_EXECUTION_SCOPE.md` 18.2).
                     seal_to_shards_ready_us = crate::fields_at_seal::us_between(sealed_instant, shards_ready_at),
+                    // `N42_OUTPUT_INCREMENTAL=1`: the shards were filed on the
+                    // early output (the time above), and the frozen set later.
+                    output_incremental = shards_final_at.is_some(),
+                    seal_to_shards_final_us = crate::fields_at_seal::us_between(sealed_instant, shards_final_at),
                     // `N42_SHARDS_BEFORE_RECEIPTS`: the receipts were built
                     // past the shards' filing, and how long their root then
                     // waited for them.

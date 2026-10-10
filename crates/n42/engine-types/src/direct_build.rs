@@ -2427,6 +2427,83 @@ mod tests {
         leader_layers::clear();
     }
 
+    /// `N42_OUTPUT_INCREMENTAL`: the shards filed on the early output (before
+    /// the freeze) open the child to the state the frozen set opens it to --
+    /// a conflicting recipient two batches credited, a batch left to the
+    /// freeze, the residual over both, an untouched and an absent account --
+    /// at one layer and laid under a second one.
+    #[test]
+    fn a_parent_filed_on_its_early_output_opens_as_on_its_frozen_set() {
+        let _guard = store_lock();
+        leader_layers::clear();
+        let x = |i: u8| Address::repeat_byte(i);
+        let (a, b, c, coinbase, untouched, absent) = (x(0x11), x(0x52), x(0x93), x(0xd4), x(0xe5), x(0xf6));
+        let engine = || {
+            let m = MockEthProvider::default();
+            m.add_account(a, ExtendedAccount::new(1, U256::from(100)));
+            m.add_account(b, ExtendedAccount::new(0, U256::from(7)));
+            m.add_account(c, ExtendedAccount::new(3, U256::from(50)));
+            m.add_account(coinbase, ExtendedAccount::new(0, U256::from(1)));
+            m.add_account(untouched, ExtendedAccount::new(4, U256::from(40)));
+            m
+        };
+        let batches = |number: u64| {
+            vec![
+                BundleState::builder(number..=number)
+                    .state_original_account_info(a, info(1, 100))
+                    .state_present_account_info(a, info(2, 90))
+                    .state_original_account_info(b, info(0, 7))
+                    .state_present_account_info(b, info(0, 12))
+                    .build(),
+                BundleState::builder(number..=number)
+                    .state_original_account_info(c, info(3, 50))
+                    .state_present_account_info(c, info(4, 45))
+                    .state_original_account_info(b, info(0, 7))
+                    .state_present_account_info(b, info(0, 10))
+                    .build(),
+            ]
+        };
+        let open = |number: u64, early: bool, depth: usize| {
+            let header = Header { number, parent_hash: B256::with_last_byte(0x70), gas_used: 42_000, ..Default::default() };
+            let residual = BundleState::builder(number..=number).state_present_account_info(coinbase, info(0, 9)).build();
+            let execution = execution_of(&header, residual);
+            let built_hash = execution.block.hash();
+            let sealed = SealedHeader::seal_slow(Header { extra_data: format!("view {number}").into_bytes().into(), ..header });
+            let mut shards = crate::output_shards::OutputShards::with_index_live(Address::with_last_byte(0x01), 8, 16, true, true);
+            // Every other shard of every batch left to the freeze.
+            shards.set_live_defer(true, true);
+            for batch in batches(number) {
+                shards.add(batch);
+            }
+            let filed = if early {
+                let view = shards.early_view().expect("a live index");
+                let frozen = shards.freeze();
+                assert!(frozen.index_conflicts() >= 1, "b is written by both batches");
+                crate::output_shards::FrozenShards::early(Arc::new(view))
+            } else {
+                shards.freeze()
+            };
+            crate::built_executions::remember_pending(built_hash, execution.block.clone());
+            crate::built_executions::shards_ready(
+                built_hash,
+                crate::built_executions::ShardedParent { residual: execution.execution_output.clone(), shards: Arc::new(filed) },
+            );
+            opener_on_sealed_parent_with(Scripted::new(engine()), sealed, built_hash, depth)().expect("the child opens")
+        };
+        let read = |state: &StateProviderBox, x: Address| state.basic_account(&x).expect("read").map(|x| (x.nonce, x.balance));
+        for (depth, numbers) in [(1usize, (341u64, 342u64)), (2, (343, 344))] {
+            let frozen = open(numbers.0, false, depth);
+            let early = open(numbers.1, true, depth);
+            for x in [a, b, c, coinbase, untouched, absent] {
+                assert_eq!(read(&early, x), read(&frozen, x), "{x} at depth {depth}");
+            }
+            assert_eq!(read(&early, b), Some((0, U256::from(15))), "7 + 5 + 3");
+            assert_eq!(read(&early, a), Some((2, U256::from(90))));
+            assert_eq!(read(&early, coinbase), Some((0, U256::from(9))), "the residual over the shards");
+            leader_layers::clear();
+        }
+    }
+
     #[test]
     fn the_layer_count_parses_two_to_eight_and_defaults_to_two() {
         assert_eq!(leader_layers::parse_depth(None), Some(2));

@@ -189,7 +189,7 @@ fn build_ahead_at_seal() -> bool {
 /// `send` (the default, today's rule): nothing does. N starts when N-1 is
 /// taken, i.e. at the request that follows the previous proposal's send
 /// (deferred there under `N42_BUILD_AHEAD_AT_SEAL`, dropped otherwise). On
-/// loop351's D2S12P35T64X7DRc leg 16-17% of the builds waited for that send
+/// loop351's `D2S12P35T64X7DRc` leg 16-17% of the builds waited for that send
 /// and cycled at ~70 ms against ~44.
 ///
 /// `seal`: N-1 having sealed is enough. N starts at once and waits in a
@@ -241,7 +241,7 @@ struct ChainKey {
 }
 
 impl Chained {
-    fn key(&self) -> ChainKey {
+    const fn key(&self) -> ChainKey {
         ChainKey { generation: self.generation, number: self.number, parent: self.parent }
     }
 }
@@ -270,9 +270,6 @@ fn chain_start_decision(
 ) -> ChainStart {
     match (slot, next) {
         (None, None) => ChainStart::Slot,
-        // Never left this way (the take moves `next` into the slot); refused
-        // rather than guessed at.
-        (None, Some(_)) => ChainStart::Refuse,
         (Some(slot), None) if slot == sealed => match gate {
             AheadGate::Seal => ChainStart::Behind,
             AheadGate::Send if defer_refused => ChainStart::Defer,
@@ -281,6 +278,9 @@ fn chain_start_decision(
         // Two ahead of the proposals already: the successor of the build
         // behind the slot waits for the slot's take.
         (Some(_), Some(next)) if next == sealed && defer_refused => ChainStart::Defer,
+        // Anything else, including a build behind an empty slot (never left
+        // that way: the take moves `next` into the slot), is refused rather
+        // than guessed at.
         _ => ChainStart::Refuse,
     }
 }

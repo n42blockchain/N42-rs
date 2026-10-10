@@ -578,3 +578,13 @@
   等它结束（`drain_orphan`，日志 "the build it stood on was discarded"）。`qc` 被接受但等同 `send`（区块在自身提案之前
   没有 QC）。依据：loop351 D2S12P35T64X7DRc 中 16-17% 的构建在等上一提案的发送，这些块周期约 70 ms，把均值从 44 抬到
   50.3 ms。叠放层（`N42_LEADER_LAYERS>=2`）下才有意义：N 的祖父块此时也未落地。测试 `engine::ahead_gate_tests`。
+- `N42_OUTPUT_INCREMENTAL=1`（默认关；需要 `N42_OUTPUT_INDEX_LIVE=1`、`N42_FREEZE_AFTER_SEAL=1`；代码在
+  `crates/n42/engine-types/src/output_shards.rs` `output_incremental` / `EarlyOutput` / `OutputShards::early_view` /
+  `freeze_on_thread_early` / `FrozenShards::early` / `read_account` / `take_out` / `IndexedBatch::removed`，`payload.rs`
+  的 graft scope 与 "behind the seal" 的分片分支）：freeze 线程先交出一个早期输出（共享各批次的 map、复制 live 索引、
+  按分片列出延后的批次），builder 用它提交缓存账户的增量、完成执行器、立即以早期输出登记 `shards_ready`（子块的打开
+  从这里开始），然后才 join freeze，并把冻结后的索引集（交出同样的缓存账户）重新登记给之后的读者。早期读取把写过该地址
+  的批次求和（与 freeze 相同的规则，只要求和不饱和——冻结集自身的任意批次顺序已依赖这一点）。共享的 map 不能删去冲突
+  账户，冻结集改为按批次记录 `removed`，view / merge / into_staged 均跳过它们；默认模式下 map 独占，行为不变。
+  阶段行新增 `output_incremental`、`seal_to_shards_final_us`；`seal_to_shards_ready_us` 记录早期登记的时刻。测试
+  `output_shards::incremental_tests`、`direct_build::tests::a_parent_filed_on_its_early_output_opens_as_on_its_frozen_set`。

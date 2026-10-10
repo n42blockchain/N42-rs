@@ -117,20 +117,23 @@ pub fn output_index_live() -> bool {
 
 /// `N42_OUTPUT_INCREMENTAL=1` (live index only, with `N42_FREEZE_AFTER_SEAL=1`;
 /// off by default): the child build opens on the parent's output before the
-/// freeze has run. The freeze thread first takes an [`EarlyOutput`] -- the
-/// batches' maps shared, not copied, the live index cloned, the deferred
-/// batches listed by shard -- and hands it to the builder, which commits the
-/// few cached accounts' changes from it, finishes its executor and files the
-/// shards (`shards_ready`) on it at once; the freeze runs on beside and its
-/// indexed set is filed in its place when it lands. A read on the early
-/// output sums the batches that wrote the address (one probe into the live
-/// index, a walk of the deferred batches of its shard, all batches for one
-/// the index marks conflicting): the values the frozen set holds, as long as
-/// no sum saturates -- the rule the frozen set's own arbitrary batch order
-/// already relies on. The freeze cannot then take the conflicting accounts
-/// out of the shared maps; it lists them per batch instead, and every walk
-/// over the maps skips them (`IndexedBatch::removed`).
-/// (`docs/BREAKTHROUGH_DESIGN.md` 10.103.) Read once.
+/// freeze has run. Each batch, as it ends, enters every address it kept into
+/// the early index ([`EARLY_PARTS`] small maps under their own locks, deferred
+/// shards included); the freeze thread first takes an [`EarlyOutput`] -- the
+/// batches' maps shared, not copied, and the early index moved out of its
+/// locks -- and hands it to the builder, which commits the few cached
+/// accounts' changes from it, finishes its executor and files the shards
+/// (`shards_ready`) on it at once; the freeze runs on beside and its indexed
+/// set is filed in its place when it lands. A read on the early output is
+/// one probe into the early index and one into the batch's map it names, as
+/// a frozen read is; an address several batches wrote (~4% of a block's) is
+/// marked and its writers listed, and the read sums their changes as the
+/// freeze does -- the values the frozen set holds, as long as no sum
+/// saturates, the rule the frozen set's own arbitrary batch order already
+/// relies on. The freeze cannot then take the conflicting accounts out of
+/// the shared maps; it lists them per batch instead, and every walk over the
+/// maps skips them (`IndexedBatch::removed`).
+/// (`docs/BREAKTHROUGH_DESIGN.md` 10.103, 10.104.) Read once.
 pub fn output_incremental() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_OUTPUT_INCREMENTAL").is_ok_and(|v| v.trim() == "1"))
@@ -299,6 +302,55 @@ fn enter_part(
 /// The index's mark for an account several batches wrote: it is read from
 /// the shard's conflicts map, not from a batch's.
 const CONFLICT: u16 = u16::MAX;
+
+/// The early index's parts (`N42_OUTPUT_INCREMENTAL`): many more than the
+/// shards, so that the batches entering their addresses as they end rarely
+/// meet on a part's lock, and each part's map stays small for the reads.
+const EARLY_PARTS: usize = 1024;
+
+/// One part of the early index ([`EarlyOutput`]): the batch that wrote each
+/// address, or [`CONFLICT`] for an address several batches wrote, its
+/// writers then listed in `multi` (sorted by batch when the view is taken)
+/// beside their sum, made by the first read of it and borrowed by the rest.
+/// Every address the batches kept is in it: no shard is left to the freeze.
+#[derive(Debug, Default)]
+struct EarlyPart {
+    index: AddressHashMap<u16>,
+    multi: AddressHashMap<(Vec<u16>, OnceLock<BundleAccount>)>,
+}
+
+impl EarlyPart {
+    fn with_capacity(each: usize) -> Self {
+        Self { index: AddressHashMap::with_capacity_and_hasher(each, Default::default()), multi: Default::default() }
+    }
+
+    /// `address` written by batch `id` (at most once a batch).
+    fn enter(&mut self, address: Address, id: u16) {
+        match self.index.entry(address) {
+            alloy_primitives::map::hash_map::Entry::Vacant(slot) => {
+                slot.insert(id);
+            }
+            alloy_primitives::map::hash_map::Entry::Occupied(mut held) => {
+                let first = *held.get();
+                if first == CONFLICT {
+                    self.multi.entry(address).or_default().0.push(id);
+                } else if first != id {
+                    held.insert(CONFLICT);
+                    self.multi.insert(address, (vec![first, id], OnceLock::new()));
+                }
+            }
+        }
+    }
+
+    /// The writers' lists in batch order: the order the frozen set's
+    /// conflict sums read as theirs (the sum commutes; the first writer's
+    /// account is the base).
+    fn settle(&mut self) {
+        for (ids, _) in self.multi.values_mut() {
+            ids.sort_unstable();
+        }
+    }
+}
 
 /// `staged` with the change `account` made to the parent's value added:
 /// `StagedGraft::add`'s rule for an account an earlier batch wrote.
@@ -569,6 +621,13 @@ pub struct OutputShards {
     freeze_split: usize,
     /// Tests: split every shard with any work, heavy or not.
     freeze_split_all: bool,
+    /// `N42_OUTPUT_INCREMENTAL` (live index only): the early index, filled
+    /// by each batch as it ends with every address it kept, read by
+    /// [`EarlyOutput`] without a walk over the batches. `None` otherwise.
+    early_index: Option<Vec<Mutex<EarlyPart>>>,
+    /// Whether [`Self::early_view`] took the early index's parts out (a
+    /// second view rebuilds them from the batches).
+    early_taken: std::sync::atomic::AtomicBool,
 }
 
 impl OutputShards {
@@ -603,6 +662,7 @@ impl OutputShards {
                 })
                 .collect()
         });
+        let early_index = (live.is_some() && output_incremental()).then(|| early_parts(capacity));
         Self {
             beneficiary,
             count,
@@ -615,7 +675,19 @@ impl OutputShards {
             live_defer: if live_index_defer() { LiveDefer::Busy } else { LiveDefer::Wait },
             freeze_split: freeze_split(),
             freeze_split_all: false,
+            early_index,
+            early_taken: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Tests: whether the batches fill the early index as they end
+    /// (`N42_OUTPUT_INCREMENTAL`'s rule), whatever the environment says.
+    /// Without it [`Self::early_view`] builds the same index from the
+    /// batches when it is taken. Call before the first batch.
+    #[doc(hidden)]
+    pub fn set_early_index(&mut self, on: bool) {
+        let capacity = EARLY_PARTS * 8;
+        self.early_index = (on && self.live.is_some()).then(|| early_parts(capacity));
     }
 
     /// Tests: the heavy shard's split ([`freeze_split`]), whatever the
@@ -786,6 +858,17 @@ impl OutputShards {
                     Self::enter_live(live, id as u16, &accounts, &reverts, &addresses, &revert_at, self.live_defer);
             }
         }
+        if live_id != usize::MAX
+            && let Some(parts) = self.early_index.as_deref()
+        {
+            // Every address the batch kept, deferred shards included: the
+            // early read is one probe. A part's lock is held for one insert.
+            let id = live_id as u16;
+            for address in addresses.iter().flatten() {
+                let part = &parts[shard_index(address, parts.len())];
+                part.lock().unwrap_or_else(PoisonError::into_inner).enter(*address, id);
+            }
+        }
         let accounts = Arc::new(accounts);
         let out = BatchOut { accounts, reverts, addresses, revert_at, size, beneficiary_delta, live_id, deferred };
         self.batches.lock().unwrap_or_else(PoisonError::into_inner).push(out);
@@ -913,11 +996,10 @@ impl OutputShards {
     /// index or when a batch was not entered in it (the freeze then folds
     /// the ordinary way, and so must the reader).
     pub fn early_view(&self) -> Option<EarlyOutput> {
-        let live = self.live.as_deref()?;
+        self.live.as_deref()?;
         let batches = self.batches.lock().unwrap_or_else(PoisonError::into_inner);
         let count = batches.len();
         let mut maps: Vec<Option<Arc<AddressHashMap<BundleAccount>>>> = vec![None; count];
-        let mut pending: Vec<Vec<u16>> = vec![Vec::new(); live.len()];
         let mut beneficiary_delta = U256::ZERO;
         for batch in batches.iter() {
             let slot = maps.get_mut(batch.live_id)?;
@@ -926,21 +1008,37 @@ impl OutputShards {
             }
             *slot = Some(Arc::clone(&batch.accounts));
             beneficiary_delta = beneficiary_delta.saturating_add(batch.beneficiary_delta);
-            for &shard in &batch.deferred {
-                pending.get_mut(shard as usize)?.push(batch.live_id as u16);
-            }
         }
-        drop(batches);
         let maps: Vec<_> = maps.into_iter().collect::<Option<_>>()?;
-        for list in &mut pending {
-            list.sort_unstable();
+        // The early index as the batches filled it, taken out of its locks
+        // (the batches are done); or, without it (or on a second view), the
+        // same index entered here from the batches' address lists.
+        let filled = self
+            .early_index
+            .as_deref()
+            .filter(|_| !self.early_taken.swap(true, Ordering::AcqRel))
+            .map(|parts| {
+                parts.iter().map(|part| std::mem::take(&mut *part.lock().unwrap_or_else(PoisonError::into_inner))).collect()
+            });
+        let mut parts: Vec<EarlyPart> = match filled {
+            Some(parts) => parts,
+            None => {
+                let mut parts = early_parts(maps.iter().map(|m| m.len()).sum()).into_iter().map(|p| p.into_inner().unwrap_or_else(PoisonError::into_inner)).collect::<Vec<_>>();
+                let n = parts.len();
+                for batch in batches.iter() {
+                    for address in batch.addresses.iter().flatten() {
+                        parts[shard_index(address, n)].enter(*address, batch.live_id as u16);
+                    }
+                }
+                parts
+            }
+        };
+        drop(batches);
+        for part in &mut parts {
+            part.settle();
         }
-        let index = live
-            .iter()
-            .map(|part| part.lock().unwrap_or_else(PoisonError::into_inner).index.clone())
-            .collect();
         let contracts = self.contracts.lock().unwrap_or_else(PoisonError::into_inner).clone();
-        Some(EarlyOutput { count: live.len(), batches: maps, index, pending, contracts, beneficiary_delta })
+        Some(EarlyOutput { batches: maps, parts, contracts, beneficiary_delta })
     }
 
     /// [`Self::freeze_on_thread`] that first hands over [`Self::early_view`]
@@ -965,57 +1063,49 @@ impl OutputShards {
 }
 
 /// The block's output before its freeze (`N42_OUTPUT_INCREMENTAL`): the
-/// batches' maps by batch number, the live index as the batches left it,
-/// and per shard the batches that left it to the freeze. Read by summing
-/// the batches that wrote an address, as the freeze sums them.
+/// batches' maps by batch number and the early index over them (every
+/// address the batches kept, in [`EARLY_PARTS`] parts). Read with one probe
+/// into the index and one into the batch's map it names -- what a frozen
+/// read costs -- except for an address several batches wrote, whose
+/// writers' changes are summed as the freeze sums them.
 #[derive(Debug)]
 pub struct EarlyOutput {
-    count: usize,
     batches: Vec<Arc<AddressHashMap<BundleAccount>>>,
-    index: Vec<AddressHashMap<u16>>,
-    pending: Vec<Vec<u16>>,
+    parts: Vec<EarlyPart>,
     contracts: B256HashMap<RevmBytecode>,
     beneficiary_delta: U256,
 }
 
 impl EarlyOutput {
     /// The account `address` as the frozen set will hold it: the one batch
-    /// that wrote it, or the first one's with every other one's change added
-    /// (`add_delta`). The holders: the live index's batch (all batches when
-    /// it marks a conflict) and the deferred batches of the address's shard.
+    /// that wrote it, or the first writer's with every other one's change
+    /// added (`add_delta`).
     pub fn account(&self, address: &Address) -> Option<std::borrow::Cow<'_, BundleAccount>> {
         use std::borrow::Cow;
-        let shard = shard_index(address, self.count);
-        let mut holders: Vec<&BundleAccount> = Vec::new();
-        match self.index.get(shard).and_then(|index| index.get(address)).copied() {
-            Some(CONFLICT) => {
-                holders.extend(self.batches.iter().filter_map(|batch| batch.get(address)));
-            }
-            live => {
-                if let Some(account) = live.and_then(|id| self.batches.get(id as usize)?.get(address)) {
-                    holders.push(account);
+        let part = self.parts.get(shard_index(address, self.parts.len()))?;
+        match *part.index.get(address)? {
+            CONFLICT => {
+                let (ids, sum) = part.multi.get(address)?;
+                if let Some(sum) = sum.get() {
+                    return Some(Cow::Borrowed(sum));
                 }
-                for &id in self.pending.get(shard).map_or(&[][..], Vec::as_slice) {
-                    if Some(id) == live {
-                        continue;
-                    }
-                    if let Some(account) = self.batches.get(id as usize).and_then(|batch| batch.get(address)) {
-                        holders.push(account);
+                let mut holders = ids.iter().filter_map(|&id| self.batches.get(id as usize)?.get(address));
+                let mut first = holders.next()?.clone();
+                if let Some(info) = first.info.as_mut() {
+                    for account in holders {
+                        add_delta(info, account);
                     }
                 }
+                // Racing first reads make the same sum; one is kept.
+                Some(Cow::Borrowed(sum.get_or_init(|| first)))
             }
+            id => self.batches.get(id as usize)?.get(address).map(Cow::Borrowed),
         }
-        let (first, rest) = holders.split_first()?;
-        if rest.is_empty() {
-            return Some(Cow::Borrowed(*first));
-        }
-        let mut sum = (*first).clone();
-        if let Some(info) = sum.info.as_mut() {
-            for account in rest {
-                add_delta(info, account);
-            }
-        }
-        Some(Cow::Owned(sum))
+    }
+
+    /// The accounts several batches wrote (read by summing).
+    pub fn multi_batch(&self) -> usize {
+        self.parts.iter().map(|part| part.multi.len()).sum()
     }
 
     /// The beneficiary's credit the batches summed, not applied.
@@ -1028,10 +1118,9 @@ impl EarlyOutput {
         self.contracts.get(code_hash)
     }
 
-    /// The accounts in the live index (a statistic: the deferred batches'
-    /// new addresses are not counted).
+    /// The accounts the batches wrote.
     pub fn accounts(&self) -> usize {
-        self.index.iter().map(AddressHashMap::len).sum()
+        self.parts.iter().map(|part| part.index.len()).sum()
     }
 
     /// [`FrozenShards::take_cached`] on the early output: the changes the
@@ -1055,6 +1144,12 @@ impl EarlyOutput {
         let committed = commit_cached(state, summed);
         (committed, taken)
     }
+}
+
+/// The early index's empty parts, sized for `capacity` accounts.
+fn early_parts(capacity: usize) -> Vec<Mutex<EarlyPart>> {
+    let each = capacity / EARLY_PARTS + capacity / (4 * EARLY_PARTS) + 4;
+    (0..EARLY_PARTS).map(|_| Mutex::new(EarlyPart::with_capacity(each))).collect()
 }
 
 /// `take_cached`'s commit: each account's change against its parent value
@@ -2697,8 +2792,15 @@ mod incremental_tests {
     }
 
     fn output(blocks: &[BundleState], defer: bool) -> OutputShards {
+        output_with(blocks, defer, true)
+    }
+
+    /// `incremental`: the batches fill the early index as they end;
+    /// otherwise the view builds it from the batches when it is taken.
+    fn output_with(blocks: &[BundleState], defer: bool, incremental: bool) -> OutputShards {
         let mut shards = OutputShards::with_index_live(addr(u32::MAX), 4096, 16, true, true);
         shards.set_live_defer(defer, defer);
+        shards.set_early_index(incremental);
         for bundle in blocks {
             shards.add(bundle.clone());
         }
@@ -2715,9 +2817,9 @@ mod incremental_tests {
 
     #[test]
     fn an_early_read_equals_the_frozen_read() {
-        for defer in [false, true] {
+        for (defer, incremental) in [(false, true), (true, true), (false, false), (true, false)] {
             let blocks = batches(12, 40, 120);
-            let shards = output(&blocks, defer);
+            let shards = output_with(&blocks, defer, incremental);
             let early = Arc::new(shards.early_view().expect("a live index with every batch entered"));
             let frozen = shards.freeze();
             assert!(frozen.index_conflicts() > 0, "recipients collide across batches");
@@ -2801,5 +2903,158 @@ mod incremental_tests {
             assert_eq!(a, b, "{address}");
         }
         assert_eq!(summary(&frozen), summary(&reference));
+    }
+
+    /// Random batches whose accounts overlap freely -- senders and
+    /// recipients alike drawn from one pool, so an address can be written by
+    /// any number of batches with nonce and balance going either way -- each
+    /// batch's original the same parent value.
+    fn overlapping(batches: u32, per_batch: u32, pool: u32, seed: u64) -> Vec<BundleState> {
+        let mut seed = seed | 1;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        (0..batches)
+            .map(|_| {
+                let mut builder = BundleState::builder(1..=1);
+                let mut seen = std::collections::HashSet::new();
+                for _ in 0..per_batch {
+                    let r = (next() % u64::from(pool)) as u32;
+                    if !seen.insert(r) {
+                        continue;
+                    }
+                    let address = addr(r);
+                    let (nonce, balance) = (u64::from(r % 5), 1_000_000 + u64::from(r) * 13);
+                    let roll = next();
+                    let (dn, up, amount) = (roll % 3, roll & 8 == 0, (roll >> 8) % 1000);
+                    let after = if up { balance + amount } else { balance - amount };
+                    builder = builder
+                        .state_original_account_info(address, info(nonce, balance))
+                        .state_present_account_info(address, info(nonce + dn, after))
+                        .revert_account_info(1, address, Some(Some(info(nonce, balance))));
+                }
+                builder = builder
+                    .state_original_account_info(addr(u32::MAX), info(0, 0))
+                    .state_present_account_info(addr(u32::MAX), info(0, 1));
+                builder.build()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_early_read_equals_the_frozen_read_for_overlapping_batches() {
+        for (seed, defer, incremental) in [(7, false, true), (11, true, true), (13, true, false), (17, false, false)] {
+            let blocks = overlapping(24, 300, 2_000, seed);
+            let shards = output_with(&blocks, defer, incremental);
+            let early = Arc::new(shards.early_view().expect("a live index with every batch entered"));
+            let frozen = shards.freeze();
+            assert!(frozen.index_conflicts() > 100, "the pool is small: {}", frozen.index_conflicts());
+            assert_eq!(early.multi_batch(), frozen.index_conflicts(), "seed {seed}: the multi-batch accounts are the conflicts");
+            assert_eq!(early.accounts(), frozen.accounts(), "seed {seed}");
+            let read = FrozenShards::early(Arc::clone(&early));
+            let mut checked = 0;
+            for address in every_address(&blocks).into_iter().chain((5_000..5_050).map(addr)) {
+                let want = frozen.get(&address).map(|a| (a.info.clone(), a.original_info.clone(), a.status));
+                let got = read.read_account(&address).map(|a| (a.info.clone(), a.original_info.clone(), a.status));
+                assert_eq!(got, want, "seed {seed}, defer {defer}, incremental {incremental}: {address}");
+                checked += usize::from(want.is_some());
+            }
+            assert_eq!(checked, frozen.accounts());
+            assert_eq!(read.beneficiary_delta(), frozen.beneficiary_delta());
+        }
+    }
+
+    #[test]
+    fn a_second_early_view_rebuilds_the_index_from_the_batches() {
+        let blocks = overlapping(8, 200, 500, 3);
+        let shards = output_with(&blocks, true, true);
+        let first = shards.early_view().expect("first");
+        let second = shards.early_view().expect("second");
+        assert_eq!(first.accounts(), second.accounts());
+        assert_eq!(first.multi_batch(), second.multi_batch());
+        for address in every_address(&blocks) {
+            assert_eq!(first.account(&address).map(|a| a.info.clone()), second.account(&address).map(|a| a.info.clone()));
+        }
+    }
+
+    /// Timing, not a check: reads of a ~200k-account block (64 batches,
+    /// ~4% of the accounts written by several, every account and 50k absent) on the early output against
+    /// the frozen set. `cargo test -p n42-engine-types --lib --release
+    /// early_reads_against_frozen_reads -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn early_reads_against_frozen_reads() {
+        // Senders unique to their batch; recipients from a pool that makes
+        // ~4% of the accounts multi-batch, as on the fleet (~8k of ~190k).
+        let (batches, per_batch) = (64u32, 1_560u32);
+        let mut seed = 0x2545_f491_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let blocks: Vec<BundleState> = (0..batches)
+            .map(|b| {
+                let mut builder = BundleState::builder(1..=1);
+                let mut seen = std::collections::HashSet::new();
+                for s in 0..per_batch {
+                    let sender = addr(10_000_000 + b * per_batch + s);
+                    builder = builder
+                        .state_original_account_info(sender, info(4, 1_000))
+                        .state_present_account_info(sender, info(5, 990))
+                        .revert_account_info(1, sender, Some(Some(info(4, 1_000))));
+                    let r = (next() % 600_000) as u32;
+                    if seen.insert(r) {
+                        let recipient = addr(r);
+                        builder = builder
+                            .state_original_account_info(recipient, info(0, 7))
+                            .state_present_account_info(recipient, info(0, 10))
+                            .revert_account_info(1, recipient, Some(Some(info(0, 7))));
+                    }
+                }
+                builder.build()
+            })
+            .collect();
+        // The batches' hand-over with and without the early index's inserts
+        // (one thread here; spread over the pool's on the node).
+        let at = std::time::Instant::now();
+        drop(output_with(&blocks, true, false));
+        let plain_add_us = at.elapsed().as_micros();
+        let at = std::time::Instant::now();
+        let shards = output_with(&blocks, true, true);
+        let early_add_us = at.elapsed().as_micros();
+        println!("hand-over of {batches} batches: {plain_add_us} us plain, {early_add_us} us with the early index");
+        let at = std::time::Instant::now();
+        let early = Arc::new(shards.early_view().expect("early"));
+        let view_us = at.elapsed().as_micros();
+        let frozen = shards.freeze();
+        let early = FrozenShards::early(early);
+        let mut reads: Vec<Address> = every_address(&blocks);
+        reads.extend((50_000_000..50_050_000).map(addr));
+        let time = |shards: &FrozenShards| {
+            let at = std::time::Instant::now();
+            let mut found = 0usize;
+            for _ in 0..5 {
+                for address in &reads {
+                    found += usize::from(std::hint::black_box(shards.read_account(address)).is_some());
+                }
+            }
+            (at.elapsed().as_nanos() as f64 / (5 * reads.len()) as f64, found)
+        };
+        let _ = (time(&frozen), time(&early));
+        let (frozen_ns, frozen_found) = time(&frozen);
+        let (early_ns, early_found) = time(&early);
+        assert_eq!(early_found, frozen_found);
+        println!(
+            "reads {} (accounts {}, multi-batch {}): frozen {frozen_ns:.1} ns, early {early_ns:.1} ns, ratio {:.2}; view taken in {view_us} us",
+            reads.len(),
+            frozen.accounts(),
+            frozen.index_conflicts(),
+            early_ns / frozen_ns,
+        );
     }
 }

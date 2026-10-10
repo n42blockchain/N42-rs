@@ -2472,6 +2472,7 @@ mod tests {
             let mut shards = crate::output_shards::OutputShards::with_index_live(Address::with_last_byte(0x01), 8, 16, true, true);
             // Every other shard of every batch left to the freeze.
             shards.set_live_defer(true, true);
+            shards.set_early_index(true);
             for batch in batches(number) {
                 shards.add(batch);
             }

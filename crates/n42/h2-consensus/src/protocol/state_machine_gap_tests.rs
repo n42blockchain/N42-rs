@@ -632,3 +632,168 @@ fn a_lock_raised_before_a_crash_still_refuses_an_older_justification_after_it() 
     );
     assert!(drain(&mut rx).iter().all(|o| !matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_)))));
 }
+
+// ---------------------------------------------------------------------------
+// Fault injection at every boundary of "record vote -> persist -> sign -> send"
+// ---------------------------------------------------------------------------
+
+/// What the injected fault does to the Nth call of one kind of record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    /// No fault: the record is durable and the vote is signed and sent.
+    None,
+    /// The fsync fails and nothing reaches the disk.
+    LostWrite,
+    /// The record reaches the disk but the call reports failure, which is a
+    /// crash between persist and sign as far as the engine can tell.
+    DurableThenCrash,
+}
+
+/// A vote log that fails on the first record of one kind.
+#[derive(Debug)]
+struct FaultyLog {
+    kind: &'static str,
+    fault: Fault,
+    calls: std::sync::Mutex<usize>,
+    durable: std::sync::Mutex<Vec<(&'static str, u64, QuorumCertificate)>>,
+}
+
+impl FaultyLog {
+    fn new(kind: &'static str, fault: Fault) -> Self {
+        Self { kind, fault, calls: Default::default(), durable: Default::default() }
+    }
+
+    fn write(&self, kind: &'static str, view: u64, lock: &QuorumCertificate) -> ConsensusResult<()> {
+        let fail = kind == self.kind && self.fault != Fault::None && {
+            let mut calls = self.calls.lock().expect("calls");
+            *calls += 1;
+            *calls == 1
+        };
+        if !fail || self.fault == Fault::DurableThenCrash {
+            self.durable.lock().expect("log").push((kind, view, lock.clone()));
+        }
+        if fail {
+            return Err(ConsensusError::VoteLogFsync(format!("injected fault on {kind}")));
+        }
+        Ok(())
+    }
+}
+
+impl crate::vote_log::VoteLogWriter for FaultyLog {
+    fn record_vote(&self, view: u64, locked_qc: &QuorumCertificate) -> ConsensusResult<()> {
+        self.write("r1", view, locked_qc)
+    }
+
+    fn record_commit_vote(&self, view: u64, locked_qc: &QuorumCertificate) -> ConsensusResult<()> {
+        self.write("r2", view, locked_qc)
+    }
+}
+
+fn sent_votes(outputs: &[EngineOutput]) -> (usize, usize) {
+    let r1 = outputs.iter().filter(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_)))).count();
+    let r2 = outputs.iter().filter(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::CommitVote(_)))).count();
+    (r1, r2)
+}
+
+/// Drives a follower through view 1 (proposal, then PrepareQC) against a log
+/// that faults on the first record of `kind`, then rebuilds the engine from
+/// what is durable and offers the same view again.
+fn run_boundary(kind: &'static str, fault: Fault) {
+    let log = Arc::new(FaultyLog::new(kind, fault));
+    let sks: Vec<_> = (0..4).map(|i| key(0x10 + i as u8)).collect();
+    let (_, _, vs, _) = make(4, 2);
+    let build = |locked: QuorumCertificate, voted, commit_voted, log: Arc<dyn crate::vote_log::VoteLogWriter>| {
+        let (tx, rx) = mpsc::channel(1024);
+        let engine = ConsensusEngine::with_recovered_state_and_vote_log(
+            2,
+            sks[2].clone(),
+            EpochManager::new(vs.clone()),
+            60_000,
+            120_000,
+            tx,
+            1,
+            locked,
+            QuorumCertificate::genesis(),
+            0,
+            voted,
+            commit_voted,
+            log,
+        );
+        (engine, rx)
+    };
+    let hash = B256::repeat_byte(0x81);
+    let qc = prepare_qc(1, hash, &sks, &vs, &[0, 1, 3]);
+    let prepare = || ConsensusMessage::PrepareQC(PrepareQC { view: 1, block_hash: hash, qc: qc.clone() });
+    let injected = fault != Fault::None;
+    let label = format!("{kind} {fault:?}");
+
+    let (mut engine, mut rx) = build(QuorumCertificate::genesis(), 0, 0, log.clone());
+    let proposal = proposal_for(&engine, &sks, 1, hash, QuorumCertificate::genesis());
+    engine.process_event(ConsensusEvent::BlockImported(hash)).expect("import");
+    let r1 = engine.process_event(ConsensusEvent::Message(proposal.clone()));
+    let first = if kind == "r2" {
+        r1.expect("R1 is not faulted in an R2 row");
+        engine.process_event(ConsensusEvent::Message(prepare()))
+    } else {
+        r1
+    };
+    let outputs = drain(&mut rx);
+    let (sent_r1, sent_r2) = sent_votes(&outputs);
+
+    // (a)/(b) The faulted record aborts the vote: an error and nothing sent.
+    if injected {
+        assert!(matches!(first, Err(ConsensusError::VoteLogFsync(_))), "{label}: {first:?}");
+        assert_eq!(if kind == "r1" { sent_r1 } else { sent_r2 }, 0, "{label}: no vote leaves after a failed persist");
+    } else {
+        first.expect("no fault");
+        assert_eq!(if kind == "r1" { sent_r1 } else { sent_r2 }, 1, "{label}: the vote is sent");
+    }
+
+    // The watermark moves before the log call, so a failed persist still
+    // consumes the view in memory: the engine refuses a retry in that view.
+    let (marker, other) = if kind == "r1" { (engine.last_voted_view(), 0) } else { (engine.last_commit_voted_view(), engine.last_voted_view()) };
+    assert_eq!(marker, 1, "{label}: the in-memory watermark is already advanced");
+    assert_eq!(other, u64::from(kind == "r2"));
+    let retry = if kind == "r1" { proposal.clone() } else { prepare() };
+    let _ = engine.process_event(ConsensusEvent::Message(retry.clone()));
+    let (retry_r1, retry_r2) = sent_votes(&drain(&mut rx));
+    assert_eq!(if kind == "r1" { retry_r1 } else { retry_r2 }, 0, "{label}: a retry in the same view is refused");
+
+    // Crash: rebuild from the durable records only (higher view and higher
+    // lock win, as `ConsensusStore::load` does against a stale checkpoint).
+    drop(engine);
+    let durable = log.durable.lock().expect("log").clone();
+    let watermark = |k: &str| durable.iter().filter(|(kind, ..)| *kind == k).map(|(_, v, _)| *v).max().unwrap_or(0);
+    let lock = durable.iter().map(|(_, _, l)| l.clone()).chain([QuorumCertificate::genesis()]).max_by_key(|l| l.view).expect("lock");
+    let (voted, commit_voted) = (watermark("r1"), watermark("r2"));
+    let persisted = fault != Fault::LostWrite;
+    assert_eq!(if kind == "r1" { voted } else { commit_voted }, u64::from(persisted), "{label}: durable watermark");
+    if kind == "r2" {
+        // The lock raised by the PrepareQC is durable exactly when the
+        // commit-vote record is; a lost write leaves the old lock, which is
+        // safe because no commit vote was signed under the new one.
+        assert_eq!(lock, if persisted { qc.clone() } else { QuorumCertificate::genesis() }, "{label}: durable lock");
+    }
+
+    let (mut again, mut rx) = build(lock, voted, commit_voted, Arc::new(crate::vote_log::NoopVoteLog));
+    again.process_event(ConsensusEvent::BlockImported(hash)).expect("import");
+    if kind == "r2" {
+        let _ = again.process_event(ConsensusEvent::Message(proposal));
+        drain(&mut rx);
+    }
+    let _ = again.process_event(ConsensusEvent::Message(retry));
+    let (again_r1, again_r2) = sent_votes(&drain(&mut rx));
+    let again_sent = if kind == "r1" { again_r1 } else { again_r2 };
+    // A lost write means nothing was signed, so the rebuilt node may vote; a
+    // durable record (signed or not) means it must not vote in that view again.
+    assert_eq!(again_sent, usize::from(!persisted), "{label}: rebuilt engine");
+}
+
+#[test]
+fn every_persist_boundary_of_a_vote_is_safe_for_both_rounds() {
+    for kind in ["r1", "r2"] {
+        for fault in [Fault::LostWrite, Fault::DurableThenCrash, Fault::None] {
+            run_boundary(kind, fault);
+        }
+    }
+}

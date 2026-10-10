@@ -9,9 +9,9 @@ D = '/data/n42-build/wt338/scripts/fleet7-runs/'
 r = open(D + 'run-loop350.sh').read().replace('loop350', 'loop351').replace('LOOP350', 'LOOP351')
 # a dry run owns no fleet: the EXIT trap must not kill the processes of a leg another stage is running (2026-10-08, S13P50)
 r = r.replace('cleanup() {\n', 'cleanup() {\n  # a dry run (LOOP351_DRY=1) owns no fleet: on 2026-10-08 a dry run of stage c, exited while stage a held the box, killed the running leg (S13P50) through this trap\n  [ "${LOOP351_DRY:-0}" = 1 ] && return 0\n', 1)
-r = r.replace('scripts/fleet7-runs/manykeys350.py ]; then echo "INSTRUMENTATION MISSING', 'scripts/fleet7-runs/manykeys350.py ] || ! grep -q N42_DEFERRED_IN_FLIGHT crates/n42/h2-execution/src/driver.rs || ! grep -q N42_BUILT_KEEP crates/n42/engine-types/src/built_executions.rs || ! grep -q N42_QMDB_RENAME_DEFER crates/n42/engine-types/src/chain_alias.rs || ! grep -q N42_HANDOFF_HEAD_MOVE bin/n42/src/payload_serve.rs || ! grep -q N42_HANDOFF_NO_CLONE crates/n42/engine-types/src/built_executions.rs || ! grep -q N42_HANDOFF_MOVE_BODY crates/n42/engine-types/src/built_executions.rs || ! grep -q N42_CANON_NOTIFY_LEAN crates/chain-state/src/in_memory.rs || ! grep -q N42_QUEUE_OFFLOCK crates/n42/tx-queue/src/lib.rs || ! grep -q N42_QMDB_COMPUTE_OFFLOCK crates/n42/qmdb-reth/src/node_state.rs || ! grep -q N42_QMDB_PERSIST_BATCH crates/n42/qmdb-reth/src/node_state.rs || ! grep -q N42_QUEUE_PLAN_SNAPSHOT crates/n42/tx-queue/src/snapshot.rs || ! grep -q N42_TX_QUEUE_DRAINER bin/n42/src/main.rs || ! grep -q N42_OUTPUT_INCREMENTAL crates/n42/engine-types/src/output_shards.rs || ! grep -q N42_BUILD_AHEAD_GATE crates/n42/h2-el-rpc/src/engine.rs; then echo "INSTRUMENTATION MISSING', 1)
+r = r.replace('scripts/fleet7-runs/manykeys350.py ]; then echo "INSTRUMENTATION MISSING', 'scripts/fleet7-runs/manykeys350.py ] || ! grep -q N42_DEFERRED_IN_FLIGHT crates/n42/h2-execution/src/driver.rs || ! grep -q N42_BUILT_KEEP crates/n42/engine-types/src/built_executions.rs || ! grep -q N42_QMDB_RENAME_DEFER crates/n42/engine-types/src/chain_alias.rs || ! grep -q N42_HANDOFF_HEAD_MOVE bin/n42/src/payload_serve.rs || ! grep -q N42_HANDOFF_NO_CLONE crates/n42/engine-types/src/built_executions.rs || ! grep -q N42_HANDOFF_MOVE_BODY crates/n42/engine-types/src/built_executions.rs || ! grep -q N42_CANON_NOTIFY_LEAN crates/chain-state/src/in_memory.rs || ! grep -q N42_QUEUE_OFFLOCK crates/n42/tx-queue/src/lib.rs || ! grep -q N42_QMDB_COMPUTE_OFFLOCK crates/n42/qmdb-reth/src/node_state.rs || ! grep -q N42_QMDB_PERSIST_BATCH crates/n42/qmdb-reth/src/node_state.rs || ! grep -q N42_QUEUE_PLAN_SNAPSHOT crates/n42/tx-queue/src/snapshot.rs || ! grep -q N42_TX_QUEUE_DRAINER bin/n42/src/main.rs || ! grep -q N42_OUTPUT_INCREMENTAL crates/n42/engine-types/src/output_shards.rs || ! grep -q N42_SHARD_MIX crates/n42/engine-types/src/output_shards.rs || ! grep -q N42_BUILD_AHEAD_GATE crates/n42/h2-el-rpc/src/engine.rs; then echo "INSTRUMENTATION MISSING', 1)
 r = r.replace('manykeys351', 'manykeys350').replace('valsample351', 'valsample350')
-r = r.replace('ACCOUNT_HISTORY|PERSIST_QMDB|', 'RENAME_DEFER|HANDOFF_|CANON_NOTIFY|QUEUE_OFFLOCK|QMDB_COMPUTE_OFFLOCK|QMDB_PERSIST_BATCH|QUEUE_PLAN_SNAPSHOT|TX_QUEUE_DRAINER|OUTPUT_INCREMENTAL|BUILD_AHEAD|ACCOUNT_HISTORY|PERSIST_QMDB|', 1)
+r = r.replace('ACCOUNT_HISTORY|PERSIST_QMDB|', 'RENAME_DEFER|HANDOFF_|CANON_NOTIFY|QUEUE_OFFLOCK|QMDB_COMPUTE_OFFLOCK|QMDB_PERSIST_BATCH|QUEUE_PLAN_SNAPSHOT|TX_QUEUE_DRAINER|OUTPUT_INCREMENTAL|SHARD_MIX|BUILD_AHEAD|ACCOUNT_HISTORY|PERSIST_QMDB|', 1)
 r = re.sub(r'^# loop351 = .*\n# Stage a:.*\n', '''# loop351 = 200k blocks, 7 keys on one layer, 50 ms pacing: the base, check-before-slot alone (S1), 64 build threads (T64) and the merge at shards_ready (S3), then a step-down of the best. usage: run-loop351.sh <a|b|c|d>
 # Stage a: WARM (60 ms), BP50, S1P50, S1P50T64, S13P50, S13P50T64, BP50b.  b: WARM, then 45 and 40 ms for the best stage-a configuration (window 1 at least 1.5% over max(BP50, BP50b), each step only while gate340 holds), else S1P50b and S1P50T64b.
 ''', r, count=1, flags=re.M)
@@ -258,7 +258,17 @@ stages = '''case $STAGE in
      b7 D2S12P40T64X7OI2b $D2 $S1 $S2 $X7 $OI $T64 F7_BLOCK_INTERVAL_MS=40
      b7 D2S12P35T64X7OI2 $D2 $S1 $S2 $X7 $OI $T64 F7_BLOCK_INTERVAL_MS=35
      b7 D2S12P30T64X7OI2 $D2 $S1 $S2 $X7 $OI $T64 F7_BLOCK_INTERVAL_MS=30 ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x or y)"; exit 2 ;;
+  z) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"
+     b7 D2S12P40T64X7SM $D2 $S1 $S2 $X7 $SM $T64 F7_BLOCK_INTERVAL_MS=40
+     b7 D2S12P40T64X7c $D2 $S1 $S2 $X7 $T64 F7_BLOCK_INTERVAL_MS=40
+     b7 D2S12P40T64X7SMb $D2 $S1 $S2 $X7 $SM $T64 F7_BLOCK_INTERVAL_MS=40
+     b7 D2S12P35T64X7SM $D2 $S1 $S2 $X7 $SM $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P30T64X7SM $D2 $S1 $S2 $X7 $SM $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P35T64X7SMb $D2 $S1 $S2 $X7 $SM $T64 F7_BLOCK_INTERVAL_MS=35 ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y or z)"; exit 2 ;;
 esac
 '''
 r = r[:i] + stages + r[j:]
@@ -272,11 +282,11 @@ def atomic(path, text):
 atomic(D + 'run-loop351.sh', r)
 
 l = r'''#!/bin/bash
-# loop351 (200k, 7 keys on one layer, 50 ms pacing; derive351.py). usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y>. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh f > target/fleet-runs/loop351f.out 2>&1 &
+# loop351 (200k, 7 keys on one layer, 50 ms pacing; derive351.py). usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z>. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh f > target/fleet-runs/loop351f.out 2>&1 &
 # Waits for the box, checks the tree, and runs the stage. When crates/ or bin/ changed since the last build, the launcher builds target/native (the legs' F7_BIN) after the box is free and the runner
 # runs its own test gate, clippy and the target/deferred build (once: this launcher does not export LOOP351_GATE_TREES for a changed tree). Unchanged tree: no build, no tests.
 cd /data/n42-build/wt338
-STAGE=${1:-a}; case $STAGE in a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y) ;; *) echo "usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y>"; exit 2;; esac
+STAGE=${1:-a}; case $STAGE in a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z) ;; *) echo "usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z>"; exit 2;; esac
 # the tree (crates/ and bin/) the binaries in target/native and target/deferred were built from: f2794a821 until a build here records another (the marker is written after a stage that built)
 MARK=target/fleet-runs/loop351-built-trees
 BUILT=f2794a821

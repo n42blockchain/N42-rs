@@ -1097,4 +1097,83 @@ mod tests {
         // runs the consistency check.
         let _ = NippyJarWriter::new(nippy).unwrap();
     }
+
+    /// N42: `append_encoded_rows` leaves the same data, offsets and config files as one
+    /// `append_column` per row, across chunks, an empty chunk, a mid-file commit and a reopen.
+    #[test]
+    fn append_encoded_rows_matches_per_row_append() {
+        use rand::{rngs::SmallRng, Rng, SeedableRng};
+        let mut rng = SmallRng::seed_from_u64(7);
+        // Chunk sizes in rows; a 3,000-row chunk of ~100 byte rows is well over the 8 KiB buffer.
+        let chunks: Vec<Vec<Vec<u8>>> = [5usize, 0, 3000, 1, 700]
+            .iter()
+            .map(|n| {
+                (0..*n)
+                    .map(|_| {
+                        let len = rng.random_range(0..200usize);
+                        (0..len).map(|_| rng.random::<u8>()).collect()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        for (which, dir) in dirs.iter().enumerate() {
+            let path = dir.path().join("jar");
+            for (n, chunk) in chunks.iter().enumerate() {
+                let nippy = if n == 0 {
+                    let nippy = NippyJar::new_without_header(1, &path);
+                    nippy.freeze_config().unwrap();
+                    nippy
+                } else {
+                    // Reopen between chunks 2 and 3 only, so both a live and a fresh writer run.
+                    NippyJar::load_without_header(&path).unwrap()
+                };
+                let mut writer = NippyJarWriter::new(nippy).unwrap();
+                if which == 0 {
+                    for row in chunk {
+                        writer.append_column(Some(Ok(row))).unwrap();
+                    }
+                } else {
+                    let rows: Vec<u8> = chunk.iter().flatten().copied().collect();
+                    let lens: Vec<u32> = chunk.iter().map(|r| r.len() as u32).collect();
+                    writer.append_encoded_rows(&rows, &lens).unwrap();
+                }
+                writer.commit().unwrap();
+            }
+        }
+
+        let read = |dir: &Path| {
+            let mut out = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let p = entry.unwrap().path();
+                out.insert(p.file_name().unwrap().to_owned(), std::fs::read(&p).unwrap());
+            }
+            out
+        };
+        let (a, b) = (read(dirs[0].path()), read(dirs[1].path()));
+        assert_eq!(a.len(), 3, "data, offsets and config files");
+        assert_eq!(a, b);
+
+        let total: usize = chunks.iter().map(Vec::len).sum();
+        let max = chunks.iter().flatten().map(Vec::len).max().unwrap();
+        for dir in &dirs {
+            let jar = NippyJar::load_without_header(&dir.path().join("jar")).unwrap();
+            assert_eq!((jar.rows, jar.max_row_size), (total, max));
+        }
+    }
+
+    #[test]
+    fn append_encoded_rows_rejects_other_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let nippy = NippyJar::new_without_header(2, &dir.path().join("two"));
+        let mut writer = NippyJarWriter::new(nippy).unwrap();
+        assert!(writer.append_encoded_rows(b"ab", &[2]).is_err());
+
+        let nippy = NippyJar::new_without_header(1, &dir.path().join("one"));
+        let mut writer = NippyJarWriter::new(nippy).unwrap();
+        assert!(writer.append_encoded_rows(b"abc", &[2]).is_err());
+        assert!(!writer.is_dirty());
+        assert_eq!(writer.rows(), 0);
+    }
 }

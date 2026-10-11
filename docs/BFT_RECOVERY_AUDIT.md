@@ -160,17 +160,26 @@ Finding: the BFT side of a SIGKILL restart (checkpoint and vote log restore) is 
 
 Root cause: since the reth 2.7.0 upgrade of 2026-10-02, `DEFAULT_NUM_STATE_MASKING_BLOCKS` is 30, so the hashed-state frontier trails the database tip by up to 30 blocks. A graceful stop catches the frontier up; a SIGKILL does not. On the next start reth's consistency check unwound the frontier through `MerkleUnwind`, which cannot verify a QMDB root and failed with "mismatched block state root".
 
-Fix: commits 4ab22608b (the masking suffix is forced to 0 on a QMDB chain; log line "State masking suffix is off on a QMDB chain") and 8e3e20154 (a lagging frontier is healed forward to the database tip instead of unwound; log line "Healed the hashed-state frontier forward to the database tip").
+Fix: commit 4ab22608b forces the masking suffix to 0 on a QMDB chain (log line "State masking suffix is off on a QMDB chain"). Commit 8e3e20154 also tried to heal a lagging frontier forward from plain state; that was wrong in principle and has been replaced.
 
-Rerun: same shape as above (seven members, `scripts/fleet7.sh roll 3 --kill` after the fleet agreed past height 60), two legs.
+Why the heal cannot work: with storage v2 the hashed tables are the state, and `save_blocks_inner` writes the masking suffix's blocks with only their bytecodes and changesets (`write_state` short-circuits; `disjointed_merge_batch` even withholds batch keys the suffix changes). The post-state of the masked blocks lives only in memory, so a SIGKILL loses it, and rewriting hashed state from plain state cannot restore it. Reth's own recovery is an unwind to the frontier plus a re-sync, and on a QMDB chain the unwind needs the QMDB forest to step back below its checkpoint, which `QmdbNodeState::initialize_file_mode` does not support.
 
-| Leg | Binary at up / at restart | Height at kill (member 3 / others) | Heal line | Rejoined | +60 s (member 3 / member 0) | +120 s (member 3 / member 0) |
+Replacement: the heal is removed. A QMDB datadir whose frontier lags the tip (only an older binary can write one) is refused at startup with the numbers and the instruction to re-initialise the execution layer; `scripts/fleet7.sh roll <i> --fresh` does exactly that (it deletes only `el` and `el.pid`, never `consensus`, which holds the vote log and checkpoint).
+
+Rerun: seven members, `scripts/fleet7.sh roll 3 --kill` after the fleet agreed past height 60.
+
+| Leg | Binary at up / at restart | Height at kill (member 3 / others) | Frontier handling | Rejoined | +60 s (member 3 / member 0) | +120 s (member 3 / member 0) |
 | --- | --- | --- | --- | --- | --- | --- |
-| A, upgrade | pre-fix / fixed | 64 / ~64 | frontier=16 tip=46 | NO | 46 / 82 | 46 / 99 |
+| A, upgrade, with the heal (8e3e20154) | pre-fix / heal build | 64 / ~64 | healed, frontier=16 tip=46 | NO | 46 / 82 | 46 / 99 |
 | B, fixed end to end | fixed / fixed | 68 / ~68 | none (masking suffix off) | yes | 91 / 91 | 111 / 111 |
+| C, upgrade, refusal then `roll 3 --fresh` | pre-fix / refusing build | 62 / ~62 | refused (see below) | `--kill` leg: no, by design; `--fresh` leg: NOT MEASURED | not measured | not measured |
 
-Leg B passes: no heal line, no unwind, the execution layer stays up, the validator logs "resuming at view 70 (last voted 69)" and commits alongside the others within 60 s.
+Leg B passes: no unwind, the execution layer stays up, the validator logs "resuming at view 70 (last voted 69)" and commits alongside the others within 60 s.
 
-Leg A shows the heal itself works (no unwind, no "Failed to verify block state root", execution layer up) but member 3 still did not rejoin. A datadir written by the pre-fix binary has its QMDB forest at block 46 and a plain state that, after the heal, does not reproduce the same root: the first pulled block (47) is rejected with "block's state root does not match its QMDB root" (computed 0x2eaa4ab8..., header 0x60d6ced8..., re-execution gives 0x1922d606...), every later payload "links to previously rejected block", and the validator's catch-up stops at 46. So an upgrade in place from a lagging-frontier datadir is not recovered by the heal; such a member needs a fresh execution layer (`LATE_VALIDATOR` / `LATE_SNAPSHOT` path) after the upgrade. Whether the 46 state is wrong in the plain tables or in the QMDB forest is not yet determined (witness dumps are under `el/invalid_block_hooks/witness/` of that run).
+Leg A: the heal ran (no unwind, no "Failed to verify block state root") but member 3 did not rejoin: the first pulled block (47) was rejected with "block's state root does not match its QMDB root", because the masked blocks' state had never been written. That is the observation that led to dropping the heal.
 
-Remaining gaps: the execution layer now restarts after SIGKILL on a QMDB chain written entirely by the fixed binary (leg B). The in-place upgrade case (leg A) still needs a root-cause investigation of the post-heal state mismatch, or an operator rule to resync such a member.
+Leg C, `roll 3 --kill` half: the new binary on the pre-fix datadir exits with `the hashed-state frontier #16 lags the database tip #46; on a QMDB chain this cannot be unwound (...) or healed (...); re-initialise this member's execution layer: scripts/fleet7.sh roll <i> --fresh, or delete the datadir and resync`, and the validator does not rejoin, as intended.
+
+Leg C, `roll 3 --fresh` half: not measured. Right after the refusal the whole fleet (all seven validators and execution layers, started with a different root than the other fleet that appeared on the box 45 s later) stopped without any error in its logs, at the same second, while another driver's fleet (`rust-fleet7-bench`, binaries under `/data/n42-build/wt338`) was starting; that fleet then held the box for the full 40-minute wait, so the leg was not rerun. The `--fresh` path itself (execution layer from genesis, validator pulls by range, consensus checkpoint preserved) therefore remains to be verified on the box. `roll` also aborted after the kill on `set -e` when the re-vote grep matched nothing; fixed.
+
+Remaining gap: leg C's `--fresh` half.

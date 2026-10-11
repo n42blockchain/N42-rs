@@ -608,9 +608,8 @@ reth 2.7 把 `num_state_masking_blocks` 默认值改为 30，持久化会让哈�
 
 - `builder/mod.rs` 的 `effective_tree_config`：QMDB 链（genesis `stateScheme == "qmdb"`）上若配置值大于 0，则强制为 0 并记一行
   `info!`（target `reth::cli`）。`bin/n42/src/main.rs` 的 `N42_HASHED_TABLES=off` 检查在 QMDB 链上不再按配置原值拒绝。
-- `launch/common.rs`：`plan_trie_recovery` 决定恢复方式。QMDB 链上前沿落后时，`heal_hashed_state_forward` 在一个事务里按
-  `(前沿, 头]` 内变更的账户与存储槽，从当前 plain state 重写哈希状态（与 `AccountHashingStage`/`StorageHashingStage` 增量分支
-  一致；`N42_HASHED_TABLES=off` 时只改检查点），再把 `Finish` 检查点改写为头且不带前沿，不再回滚。
-- 已持久化 `partial_state_trie_unwind` 标记的 QMDB 数据目录（旧二进制已开始回滚且失败）直接报错，要求重新初始化
-  （`fleet7.sh up --fresh`，或 `n42 init` 加重新同步）。
+- `launch/common.rs`：`plan_trie_recovery` 决定恢复方式。QMDB 链上前沿落后（只可能来自旧二进制写的数据目录）时返回 `Refuse`，
+  启动报错并给出前沿与头的块号，要求重新初始化该成员的执行层（`scripts/fleet7.sh roll <i> --fresh`，或删除数据目录重新同步）。
+  不能回滚（Merkle 阶段会校验区块头里没有的 MPT 根，QMDB 森林也无法退到检查点之下），也不能向前修复（存储 v2 下哈希表就是状态，
+  被遮蔽区块的状态从未落盘，试过的 `heal_hashed_state_forward` 会导致下一个区块 QMDB 根不匹配，已删除）。MPT 链仍走 `Unwind`。
 - 存储层不一致（rocksdb / static file）的回滚流水线在 QMDB 链上禁用 `MerkleUnwind` 与 `MerkleExecute`，保留哈希阶段的回滚。

@@ -258,8 +258,9 @@ written adds:
   `Finish` checkpoint's `partial_state_trie`), not at `best_number`. *Done differently:* that version lags the
   database tip only with `--engine.num-state-masking-blocks` above 0 (reth 2.7 defaults it to 30; the node builder
   forces it to 0 on a QMDB chain, `effective_tree_config` in `crates/node/builder/src/builder/mod.rs`, so the view
-  at `best_number` is at the version readers ask for). A frontier still left behind by a SIGKILL is healed forward
-  from plain state at startup (`heal_hashed_state_forward`) rather than unwound through the Merkle stage. (6) The follower's and the leader's hashed passes go;
+  at `best_number` is at the version readers ask for). A datadir whose frontier lags anyway (written by an older binary) is refused at startup with the numbers and the
+  instruction to re-initialise the execution layer (`scripts/fleet7.sh roll <i> --fresh`); a forward heal from plain
+  state was tried and cannot work, see `docs/BFT_RECOVERY_AUDIT.md`. (6) The follower's and the leader's hashed passes go;
   reth's validator keeps its own unless patched. (7) RPC that reads the tables directly (proofs, state root,
   witness) answers an error until it is served from QMDB proofs.
 - *Before turning it on.* Unit tests for no decline across a restart, an unwind within 64 blocks and a persistence

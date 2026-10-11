@@ -385,18 +385,18 @@ cmd_roll() {
     echo "node $i: checkpoint at the kill: $cp (the binary vote log next to it may be ahead and wins on load)"
     sleep 5
     echo "node $i: refusals to re-vote since the restart (a logged view was hit):"
-    grep -aiE "already voted|suppressed duplicate commit vote" "$d/v.log" | sed 's/\x1b\[[0-9;]*m//g' | head -5
-    echo "node $i: $(grep -aciE 'already voted|suppressed duplicate commit vote' "$d/v.log") such lines"
+    { grep -aiE "already voted|suppressed duplicate commit vote" "$d/v.log" || true; } | sed 's/\x1b\[[0-9;]*m//g' | head -5
+    echo "node $i: $(grep -aciE 'already voted|suppressed duplicate commit vote' "$d/v.log" || true) such lines"
   fi
   echo "node $i: restarted; how the QMDB forest came back:"
-  grep -a "QMDB" "$d/el.log" | sed 's/\x1b\[[0-9;]*m//g' | head -4
+  { grep -a "QMDB" "$d/el.log" || true; } | sed 's/\x1b\[[0-9;]*m//g' | head -4
   # A node that restarts but never commits again is worse than one that stayed
   # down, because the fleet still counts it toward a quorum it is not serving.
   echo "node $i: waiting to commit again..."
   for _ in $(seq 1 120); do grep -aq "^COMMIT" "$d/v.log" 2>/dev/null && break; sleep 1; done
   after=$(f7_height "$i")
   echo "node $i: height ${after:--} (fleet $(f7_height 0)), commits since restart $(grep -ac '^COMMIT' "$d/v.log")"
-  grep -aci "error" "$d/el.log" | xargs -I{} echo "node $i: {} error lines in the execution layer log"
+  { grep -aci "error" "$d/el.log" || true; } | xargs -I{} echo "node $i: {} error lines in the execution layer log"
 }
 
 # ------------------------------------------------------------------- plan ---

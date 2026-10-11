@@ -627,10 +627,13 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         let reverts_start = Instant::now();
         let plain_reverts: Vec<revm::database::states::PlainStateReverts> = if first_number.is_some() {
             use rayon::prelude::*;
+            use crate::providers::n42_persist::N42PlainReverts as _;
+            // An own block handed out before its revert set was merged
+            // (`N42_ANSWER_BEFORE_REVERTS`) is read with the complete set.
             blocks
                 .par_iter()
-                .map(|block| block.execution_outcome().state.reverts.to_plain_state_reverts())
-                .collect()
+                .map(|block| block.execution_outcome().n42_plain_reverts())
+                .collect::<ProviderResult<Vec<_>>>()?
         } else {
             Vec::new()
         };
@@ -744,17 +747,30 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                     // Must be written after blocks because of the receipt lookup.
                     // Skip receipts/account changesets if they're being written to static files.
                     let start = Instant::now();
+                    let config = StateWriteConfig {
+                        write_receipts: !sf_ctx.write_receipts,
+                        write_account_changesets: !sf_ctx.write_account_changesets,
+                        write_storage_changesets: !sf_ctx.write_storage_changesets,
+                    };
+                    // N42: the path that converts the outcome's own reverts reads an own block
+                    // handed out before its revert set was merged (`N42_ANSWER_BEFORE_REVERTS`)
+                    // with the complete set; the static-file-only path reads no reverts.
+                    let reads_reverts = !(self.cached_storage_settings().use_hashed_state() &&
+                        !config.write_receipts &&
+                        !config.write_account_changesets &&
+                        !config.write_storage_changesets);
+                    let completed = if reads_reverts {
+                        crate::providers::n42_persist::n42_completed_output(execution_output)?
+                    } else {
+                        None
+                    };
                     self.write_state(
                         WriteStateInput::Single {
-                            outcome: execution_output,
+                            outcome: completed.as_ref().unwrap_or(execution_output),
                             block: recovered_block.number(),
                         },
                         OriginalValuesKnown::No,
-                        StateWriteConfig {
-                            write_receipts: !sf_ctx.write_receipts,
-                            write_account_changesets: !sf_ctx.write_account_changesets,
-                            write_storage_changesets: !sf_ctx.write_storage_changesets,
-                        },
+                        config,
                     )?;
                     timings.write_state += start.elapsed();
                 }

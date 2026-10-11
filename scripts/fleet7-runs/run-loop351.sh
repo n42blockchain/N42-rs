@@ -267,7 +267,7 @@ legf() {
   local tag=$1; shift
   leg $tag "$@"
   [ -f $B/bench-loop351$tag/round.txt ] || return
-  python3 scripts/fleet7-runs/feedcheck335.py loop351$tag; python3 scripts/fleet7-runs/feed337.py loop351$tag 2>&1 | cut -c1-420; python3 scripts/fleet7-runs/feed338.py loop351$tag 2>&1 | cut -c1-900; python3 scripts/fleet7-runs/prune337.py loop351$tag 2>&1 | cut -c1-400; python3 scripts/fleet7-runs/plan339.py loop351$tag 2>&1 | cut -c1-420; python3 scripts/fleet7-runs/persist340.py loop351$tag 2>&1 | cut -c1-900; python3 scripts/fleet7-runs/fields346.py loop351$tag 2>&1 | cut -c1-4200; python3 scripts/fleet7-runs/voteroad346.py loop351$tag 2>&1 | cut -c1-420; python3 scripts/fleet7-runs/threadcpu337.py report $S/tidcpu-loop351$tag.tsv 2>&1 | cut -c1-300; python3 scripts/fleet7-runs/fields336.py loop351$tag 2>&1 | cut -c1-900
+  python3 scripts/fleet7-runs/feedcheck335.py loop351$tag; python3 scripts/fleet7-runs/feed337.py loop351$tag 2>&1 | cut -c1-420; python3 scripts/fleet7-runs/feed338.py loop351$tag 2>&1 | cut -c1-900; python3 scripts/fleet7-runs/prune337.py loop351$tag 2>&1 | cut -c1-400; python3 scripts/fleet7-runs/plan339.py loop351$tag 2>&1 | cut -c1-420; python3 scripts/fleet7-runs/persist340.py loop351$tag 2>&1 | cut -c1-900; python3 scripts/fleet7-runs/fields346.py loop351$tag 2>&1 | cut -c1-4200; python3 scripts/fleet7-runs/voteroad346.py loop351$tag 2>&1 | cut -c1-420; python3 scripts/fleet7-runs/threadcpu337.py report $S/tidcpu-loop351$tag.tsv 2>&1 | cut -c1-300; python3 scripts/fleet7-runs/threadcpu337.py families $S/tidcpu-loop351$tag.tsv 2>&1 | head -30; python3 scripts/fleet7-runs/fields336.py loop351$tag 2>&1 | cut -c1-900
   case "$*" in *PLAN_AHEAD_BODY=1*) bodygate loop351$tag ;; esac
   case "$*" in *n42_fleet7_bench_d2*) d2gate loop351$tag ;; esac
 }
@@ -776,7 +776,14 @@ case $STAGE in
      b7 D2S12P30T64X10MSAAIb $D2 $S1 $S2 $X10 $T64 $MSPLIT $AAI F7_BLOCK_INTERVAL_MS=30
      b7 D2S12P30T64X10MSAAIF2 $D2 $S1 $S2 $X10 $T64 $MSPLIT $AAI $F2 F7_BLOCK_INTERVAL_MS=30
      b7 D2S12P30T64X10MSAAIC16 $D2 $S1 $S2 $X10 $T64 $MSPLIT $AAI $C16 F7_BLOCK_INTERVAL_MS=30 ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq, ar or as)"; exit 2 ;;
+  at) mk WARM 7 16; warm_gate WARM
+     # the X10 set at 30 ms pacing, one leg, N42_CORE_LAYOUT unset: perf stat attached to the leader's layer in window 1
+     # (what the build batches contend for: CPU count, L3/memory or hyperthread siblings) beside the every-thread sampler
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     b7 D2S12P30T64X10h $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=30 ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq, ar, as or at)"; exit 2 ;;
 esac
 
 if [ "${LOOP351_DRY:-0}" = 1 ]; then echo "dry run done"; exit 0; fi

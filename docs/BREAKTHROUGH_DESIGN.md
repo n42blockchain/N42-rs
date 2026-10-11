@@ -3435,3 +3435,59 @@ All legs: 200,000-transaction blocks, occupancy 99.6-100%, BODYGATE clean except
 **Where it stands.** On this box one execution layer serving seven validator keys sustains about 3.9M transactions a second at a 51 ms cycle, reproducibly, with a best window of 4.03M and a best round of 348M transactions. The leader's build is no longer the limit (`sealed_at` 33 ms); the limit is the rate at which the layer completes its per-block serial chains (QMDB root 37 ms, hand-off + newPayload ~38 ms, persistence 33-41 ms), and every switch that removed one wait only exposed the next one at the same 51 ms. Reaching 5M needs those chains under ~30 ms through pipelined root computation, sharded static-file persistence and a shorter answer chain, which is structural work, not tuning.
 
 Hand-off files: `target/fleet-runs/loop351{ac,ad}.out`.
+
+### 10.108 loop351 stage af — parallel QMDB apply and bulk static-file append both do their local job and the cycle stays 51 ms; the answers arrive in pairs, and the forest lock chain is the suspect
+
+Stage af tested the two per-block cuts that 10.107 named: `PA` = `N42_QMDB_PARALLEL_APPLY=1` (the QMDB root's structural writes under the tree lease on the worker pool) and `BA` = `N42_SF_BULK_APPEND=1` (the static-file transaction rows appended as one write per chunk instead of 200,000 `append_column` calls). Same E=1 shape, X7 + plain S1 set + `N42_SHARD_MIX=1`, 200,000-transaction blocks; the control is the stage-ad SMe leg. Columns: w1 / w2 / w3 in M tx/s, round total in M tx, `cycle` = mean proposal cycle of window 1 (ms).
+
+| leg | pacing | w1 | w2 | w3 | round total | cycle | note |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| D2S12P35T64X7SMe | 35 | 3.913 | 3.760 | 3.740 | 342.4 | 46.8 | control |
+| D2S12P35T64X7SMPA | 35 | 3.884 | 3.687 | 3.720 | 338.7 | 48.6 | PA |
+| D2S12P35T64X7SMPABA | 35 | 3.973 | 3.900 | 3.907 | 353.4 | 47.4 | PA + BA, round best so far |
+| D2S12P30T64X7SMPABA | 30 | 4.025 | 3.833 | 3.700 | 346.8 | 43.1 | PA + BA |
+| D2S12P30T64X7SMPABAb | 30 | -- | -- | -- | -- | -- | no windows: funding failed |
+| D2S12P40T64X7SMPA | 40 | 3.927 | 3.740 | 3.720 | 341.6 | 49.4 | PA |
+| D2S12P40T64X7SMPABA | 40 | 3.804 | 3.807 | 3.587 | 335.9 | 49.9 | PA + BA |
+| D2S12P55T64X7SMPABA300 | 55 | 3.780 | 3.460 | 3.350 | 317.7 | 78.3 | 300,000-tx blocks |
+| D2S12P70T64X7SMPABA400 | 70 | 3.280 | 3.227 | 3.280 | 293.6 | 119.4 | 400,000-tx blocks |
+
+The `analyze334.py` cycle is the validator-0 proposal mean (46.8-49.9 here; its median is 37-42); the answer inter-arrival mean below (51-53 ms) is the figure 10.107 calls the cycle. A second P40 PA leg (3.86 / 3.91 / 3.54) was read from the run output, not re-analysed.
+
+- **Both switches engaged.** The startup lines are `n42.qmdb` "QMDB block apply" `parallel_apply=true rayon_threads=16` (PA, PABA legs; `false` in the control, found in `node0-v.log` of the E=1 fleet, not in the execution layer's log) and `N42_SF_BULK_APPEND bulk_append=true` (PABA legs; `false` in the control and the PA legs, in `node0-el.log`).
+- **P30 repeat leg.** `D2S12P30T64X7SMPABAb` printed no window lines because the flood's funding step failed (`12499 submitted, 1 rejected`, one raw transaction refused with `-32602 expected a valid hex string`, then `funding did not mine within 120s`); the chain produced only empty blocks and both switches were engaged, so the leg says nothing about them.
+
+Side by side, window 1, median / p90 in ms (`lease.py` over `node0-el.log` for the lease and answer rows, `analyze334.py` and `persist340.py` for the rest):
+
+| | SMe P35 | PA P35 | PABA P35 | PA P40 | PABA P40 |
+| --- | --- | --- | --- | --- | --- |
+| lease `root_compute` | 33.0 / 46 | 25.9 / 42 | 27.0 / 44 | 26.0 / 41 | 26.6 / 43 |
+| lease `apply_total` | 29.3 / 42 | 18.6 / 33 | 20.0 / 34 | 19.2 / 31 | 19.6 / 34 |
+| apply leaves / writes | 9.4 / 8.6 | 4.0 / 4.0 | 4.3 / 4.5 | 3.9 / 4.3 | 4.1 / 4.5 |
+| delta / note | 2.2 / 0.1 | 1.4 / 0.2 | 1.4 / 0.2 | 1.4 / 0.2 | 1.4 / 0.2 |
+| `on_canonical` waits per block | 0.41 | 0.11 | 0.11 | 0.11 | 0.11 |
+| `on_canonical` wait sum per block | 13.7 | 4.4 | 3.2 | 3.6 | 4.4 |
+| persistence total / `sf_tx` | 36.4 / 32.8 | 35.0 / 31.2 | 28.5 / 25.0 | 36.0 / 32.5 | 30-32 (w2-3) |
+| answer inter-arrival median / p90 (mean) | 41.0 / 98.5 (51.6) | 41.5 / 106 (53.4) | 35.6 / 112 (51.4) | 38.2 / 110 | 42.3 / 112 |
+| hand-off | 18 / 37 | 20 / 48 | 21 / 46 | 19 / 41 | 20 / 48 |
+| `roots_ms` | 38 / 55 | 31 / 51 | 31 / 52 | 31 / 50 | 32 / 51 |
+| `finish_ms` | 153 / 178 | 142 / 168 | 141 / 171 | 140 / 165 | 143 / 168 |
+| leader `sealed_at` | 32 / 46 | 32 / 44 | 32 / 46 | 31 / 44 | 31 / 42 |
+| leader `par_ms` (`par_exec`) | 34 (16) | 34 (17) | 34 (16) | 34 (16) | 33 (16) |
+
+- **PA does what the microbenchmark said.** The apply falls 29.3 -> 18.6 ms, `root_compute` 33 -> 26, the build's `roots_ms` 38 -> 31, and the `on_canonical` lock wait from 13.7 to 4.4 ms a block (0.41 -> 0.11 waits a block; each wait is still 26-31 ms when it happens). **BA does about half of what was expected**: `sf_tx` 33 -> 25-27 ms, persistence 36-39 -> 28.5-30.7 ms a block (-7..-8, the bound was -8..-16).
+- **And nothing downstream moves.** Answer inter-arrival mean 51.4-53.4 ms in every leg, hand-off 18-21 ms (p90 37-48), `sealed_at` 31-32, the leader's `par_ms` 33-34. TPS stays inside the 10.107 noise (PABA P35 3.97 / 3.90 / 3.91 is the best round, 353M, and the repeat at P40 reads 3.80 / 3.81 / 3.59).
+- **The answers arrive in pairs.** The inter-arrival of `own block imported by header` is not a steady 51 ms: p25 21-24 ms, median 36-42, p75 76-77, p90 98-112, `frac < 10 ms` 0 (SMe 24.2 / 41.0 / 75.5 / 98.5; PABA 20.6 / 35.6 / 76.9 / 111.5). Two blocks land about 22 ms apart, then a gap of about 76, so the layer completes about two blocks per ~100 ms.
+
+Block-size scaling (PABA legs, window 1, ms):
+
+| block | cycle (answer mean) | `root_compute` | persistence | hand-off | `sealed_at` |
+| --- | --- | --- | --- | --- | --- |
+| 200k | 51 | 27 | 28.5 | 21 | 32 |
+| 300k | 78 (3.78M) | 40 | 55 | 30 | 46 |
+| 400k | 119 (3.28M) | 53 | 82 | 38 | 66 |
+
+- **What binds now.** Not the lease hold alone: cutting it by 7-10 ms and the `on_canonical` wait by 9 ms a block left the answer rate untouched, and every chain (lease, hand-off + header newPayload, persistence) scales linearly with the accounts a block touches (no fixed part: 51 / 80 / 122 ms at 200k / 300k / 400k). Persistence is the nearest wall at the larger blocks (55 and 82 ms against cycles of 78 and 119) and runs at 57-76% duty at 200k.
+- **Hypothesis (under test, not a finding): the forest lock chain is the ~100 ms-per-two-blocks resource.** A block holds the tree lease for `root_compute` 26 ms, and the persistence thread takes it for `qmdb_persisted` 13 ms a block, persisting two blocks per hold, plus the canonical trims (`on_canonical`, 4-9 ms of waiting a block): about 26 + 13 + trims per block, serial, which fits a pair of answers per ~100 ms. The only hint in the logs is `forest lock waited on_persisted_parts ms=347 held_by=compute_operations` (twice in the PA leg); I did not trace lease occupancy second by second. An agent is now instrumenting the lock and moving `on_persisted` and the trims off it; the result decides whether a 40 ms cycle (every chain under ~30 ms a 200k block) is a lock-structure change or the three-project job 10.107 listed.
+
+Hand-off files: `target/fleet-runs/loop351af*.launch.out`, the per-leg `bench-<leg>.out` and `mem-<leg>.txt`.

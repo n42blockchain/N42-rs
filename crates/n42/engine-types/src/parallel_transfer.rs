@@ -64,6 +64,10 @@ pub struct Phases {
     pub partition_us: u64,
     /// See `partition_us`.
     pub slots_us: u64,
+    /// The caller's hook before the batches (the build's deferred state
+    /// opened and its pre-execution changes), microseconds; inside
+    /// `batches_start_us`.
+    pub hook_us: u64,
     /// From the call's entry to the batches' end, microseconds: the caller
     /// names the gap after the execution from here.
     pub batches_end_us: u64,
@@ -3821,10 +3825,13 @@ where
     phases.batches = batches.len();
     phases.partition_ms = at.elapsed().as_millis() as u64;
     phases.partition_us = at.elapsed().as_micros() as u64;
-    if let Some(hook) = before_batches
-        && !hook()
-    {
-        return Err(NotParallel::NoState);
+    if let Some(hook) = before_batches {
+        let hook_at = std::time::Instant::now();
+        let opened = hook();
+        phases.hook_us = hook_at.elapsed().as_micros() as u64;
+        if !opened {
+            return Err(NotParallel::NoState);
+        }
     }
 
     let at = std::time::Instant::now();

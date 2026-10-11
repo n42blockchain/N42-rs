@@ -181,6 +181,40 @@ fn carried_fields_for_seal(
     parent_built: Option<B256>,
     depth: u64,
 ) -> Option<crate::executed_fields::ExecutedFields> {
+    carried_fields_for_seal_traced(genesis, parent, parent_built, depth).0
+}
+
+/// [`carried_fields_for_seal`], saying what the seal waited on
+/// (`parent_fields_wait_on` on the phases line): "ready" when the carried
+/// ancestor's fields were in the registry at the call; otherwise the half
+/// of that ancestor's entry still missing when the wait began --
+/// "state_root" (its QMDB root job behind its own seal), "receipts" (its
+/// receipts root behind its seal), "both" (neither half filed yet), or
+/// "no_built" when there was no builder hash to wait under.
+fn carried_fields_for_seal_traced(
+    genesis: &alloy_genesis::Genesis,
+    parent: &reth_primitives_traits::SealedHeader,
+    parent_built: Option<B256>,
+    depth: u64,
+) -> (Option<crate::executed_fields::ExecutedFields>, &'static str) {
+    let depth = depth.max(1);
+    if let Some(fields) = crate::hotstuff_consensus::ancestor_executed_fields(genesis, parent, depth) {
+        return (Some(fields), "ready");
+    }
+    // The hash the wait below is under: the builder's hash of the parent at
+    // depth 1, the grandparent's sealed hash (an alias of its builder hash)
+    // at depth 2 -- as `carried_fields_for_seal_untraced` passes them.
+    let built = if depth <= 1 { parent_built } else { Some(parent.parent_hash) };
+    let on = built.map_or("no_built", |built| crate::executed_fields::missing_half(&built));
+    (carried_fields_for_seal_untraced(genesis, parent, parent_built, depth), on)
+}
+
+fn carried_fields_for_seal_untraced(
+    genesis: &alloy_genesis::Genesis,
+    parent: &reth_primitives_traits::SealedHeader,
+    parent_built: Option<B256>,
+    depth: u64,
+) -> Option<crate::executed_fields::ExecutedFields> {
     if depth <= 1 {
         return crate::hotstuff_consensus::parent_executed_fields_or_built(
             genesis,
@@ -1634,6 +1668,9 @@ where
     // the grandparent's import, the parent's QMDB root or `Complete`, or the
     // open itself ("open": the rest of `state_wait_ms`).
     let mut state_wait_on = crate::direct_build::open_wait::OpenWait::default();
+    // The pre-execution changes applied after that open, us: inside the
+    // parallel step's hook before the batches, outside `state_wait_us`.
+    let mut state_pre_changes_us = 0u64;
     macro_rules! open_deferred_state {
         () => {{
             if state_pending.get() {
@@ -1649,10 +1686,13 @@ where
                     Ok(provider) => {
                         let _ = parent_state_slot.set(provider);
                         state_pending.set(false);
-                        builder.apply_pre_execution_changes().map_err(|err| {
+                        let changes_at = std::time::Instant::now();
+                        let applied = builder.apply_pre_execution_changes().map_err(|err| {
                             warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
                             PayloadBuilderError::Internal(err.into())
-                        })
+                        });
+                        state_pre_changes_us += changes_at.elapsed().as_micros() as u64;
+                        applied
                     }
                 }
             } else {
@@ -1843,6 +1883,20 @@ where
     // and prefault threads joined, the scope's end, the deferred state's
     // re-check.
     let mut scope_join_ms = 0u64;
+    // The parallel step's wall time (`par_ms`) split at the seal under
+    // `N42_SEAL_AT_EXEC=1`: its start to the seal's start (on the seal's
+    // chain) and the seal's end to its end (the fold and the give-backs,
+    // behind the proposal), us. Both 0 when the step did not seal.
+    let mut par_to_seal_us = 0u64;
+    let mut par_behind_seal_us = 0u64;
+    // Of the batches' start: the hook before the batches whole (the
+    // deferred state's open, `state_wait_us`, and the pre-execution changes
+    // after it, `state_pre_changes_us`), us.
+    let mut par_hook_us = 0u64;
+    // The seal's wait for the carried ancestor's execution fields, us, and
+    // what it waited on (`carried_fields_for_seal_traced`).
+    let mut parent_fields_us = 0u64;
+    let mut parent_fields_wait_on: &'static str = "";
     // Of `par_commit_ms` on the slots path: the references to the filled
     // slots and the block's gas; the cumulative gas per transaction (behind
     // the seal on the ahead path, 0 there); the fees; the body and senders.
@@ -1943,7 +1997,12 @@ where
             // under its sealed hash, or -- a parent finishing behind its own
             // seal -- arriving under the builder's hash a moment from now.
             // At depth 2 the grandparent's (`parent_fields_ms` keeps its name).
-            let parent_fields = carried_fields_for_seal(chain_spec.genesis(), &parent_header, parent_built, carried_depth)
+            let fields_at = std::time::Instant::now();
+            let (parent_fields, fields_on) =
+                carried_fields_for_seal_traced(chain_spec.genesis(), &parent_header, parent_built, carried_depth);
+            parent_fields_us = fields_at.elapsed().as_micros() as u64;
+            parent_fields_wait_on = fields_on;
+            let parent_fields = parent_fields
                 .ok_or_else(|| {
                     PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(
                         crate::hotstuff_consensus::ancestor_hash(&parent_header, carried_depth),
@@ -2355,6 +2414,7 @@ where
                     }
                     par_collect_ms = run.phases.collect_ms;
                     par_release_ms = run.phases.release_ms;
+                    par_hook_us = run.phases.hook_us;
                     let fold_at = std::time::Instant::now();
                     if let Some(run_at) = run_started {
                         gap_before_exec_ms = (run_at.saturating_duration_since(prep_done).as_micros() as u64)
@@ -2640,6 +2700,7 @@ where
                     let mut seal_took = std::time::Duration::ZERO;
                     if ahead && let Some(EarlySeal { hook, parent_built: _ }) = early_seal.take() {
                         let seal_at = std::time::Instant::now();
+                        par_to_seal_us = seal_at.saturating_duration_since(par_at).as_micros() as u64;
                         if let Some(run_at) = run_started {
                             let exec_end = run_at + std::time::Duration::from_micros(run.phases.batches_end_us);
                             exec_end_to_seal_us = seal_at.saturating_duration_since(exec_end).as_micros() as u64;
@@ -3169,6 +3230,9 @@ where
             }
         }
         par_ms = par_at.elapsed().as_millis() as u64;
+        if sealed_ahead.is_some() {
+            par_behind_seal_us = sealed_instant.map_or(0, |at| at.elapsed().as_micros() as u64);
+        }
     }
     // `N42_STATE_AFTER_PULL=1`: every way out of the parallel step opened the
     // state already; this is a no-op kept so the serial loop and the finish
@@ -3962,6 +4026,19 @@ where
                     par_fold_ms,
                     tx_root_ms = root_ms,
                     parent_fields_ms = fields_ms,
+                    // The same wait in us and what it waited on: "ready"
+                    // (no wait), or the carried ancestor's missing half --
+                    // "state_root" (its QMDB root behind its seal),
+                    // "receipts", "both", "no_built".
+                    parent_fields_us,
+                    parent_fields_wait_on,
+                    // `par_ms` split at the seal: on the seal's chain and
+                    // behind it (the fold), us; and of the batches' start,
+                    // the hook (state open + pre-execution changes).
+                    par_to_seal_us,
+                    par_behind_seal_us,
+                    par_hook_us,
+                    state_pre_changes_us,
                     sealed_ms,
                     sealed_at_ms,
                     merge_ms,

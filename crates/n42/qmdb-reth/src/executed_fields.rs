@@ -159,6 +159,28 @@ pub fn built_of(sealed: &B256) -> Option<B256> {
     with_registry(|registry| registry.aliases.iter().rev().find(|(known, _)| known == sealed).map(|(_, built)| *built))
 }
 
+/// Which half of `block_hash`'s entry (or of the builder hash it was noted
+/// as) is still missing: "none" when complete, "state_root", "receipts",
+/// or "both" (no entry yet). Diagnostic: the builder's seal names what its
+/// wait for the carried ancestor's fields was on.
+pub fn missing_half(block_hash: &B256) -> &'static str {
+    // Read only: no `with_registry`, whose notify would wake every waiter.
+    let guard = REGISTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.as_ref().map_or("both", |registry| {
+        let entry = registry.by_hash.get(block_hash).copied().or_else(|| {
+            let built = registry.aliases.iter().rev().find(|(sealed, _)| sealed == block_hash)?.1;
+            registry.by_hash.get(&built).copied()
+        });
+        match entry {
+            None => "both",
+            Some(Partial { state_root: None, receipts: None }) => "both",
+            Some(Partial { state_root: None, .. }) => "state_root",
+            Some(Partial { receipts: None, .. }) => "receipts",
+            Some(_) => "none",
+        }
+    })
+}
+
 /// [`get`], waiting up to `timeout` for the fields to be recorded: a parent
 /// sealed before its finish (docs/PHASE_D_DEFERRED_EXECUTION.md section 13)
 /// records them a moment after its child's build has started.

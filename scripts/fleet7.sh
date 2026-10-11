@@ -394,9 +394,9 @@ cmd_roll() {
   { grep -a "QMDB" "$d/el.log" || true; } | sed 's/\x1b\[[0-9;]*m//g' | head -4
   # A node that restarts but never commits again is worse than one that stayed
   # down, because the fleet still counts it toward a quorum it is not serving.
-  after=$(f7_height "$i" || true)
+  echo "node $i: waiting to commit again..."
   for _ in $(seq 1 120); do grep -aq "^COMMIT" "$d/v.log" 2>/dev/null && break; sleep 1; done
-  after=$(f7_height "$i")
+  after=$(f7_height "$i" || true)
   echo "node $i: height ${after:--} (fleet $(f7_height 0)), commits since restart $(grep -ac '^COMMIT' "$d/v.log")"
   { grep -aci "error" "$d/el.log" || true; } | xargs -I{} echo "node $i: {} error lines in the execution layer log"
 }

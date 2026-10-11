@@ -3607,3 +3607,20 @@ Window 1 is 4.20-4.26M at every pacing (the window-1 record is now 4.258M, at 25
 The seal chain, accounted on the best 30 ms leg (1300176a0 adds the timers): the deferred state's open 2 ms (p99 13), the parallel execution of the 200k transfers 16 ms (p90 21, p99 48), the seal itself 4.5 ms (its frame layout and transactions root now come with the plan under `N42_PLAN_AHEAD_PARTS=1`, 298148214), and the wait for the grandparent's state and receipts roots (0 at p50, 11 at p90, 41 at p99: a depth-2 build needs the grandparent's execution complete, and its QMDB root lands ~71 ms after its seal, so at a cycle of ~36 ms the root's latency becomes the chain). The fold runs behind the seal. The execution's tail is half major faults (page-cache reclaim, in clusters) and half a 2-2.6x CPU slowdown of every batch with no waits or lock time when block N-1's QMDB root (global rayon pool) or merge runs during N's batches: cores and memory bandwidth, not a shared pool. Stage ap tests the plan-ahead parts and `N42_CORE_LAYOUT=isolate` with 64 build cores (siblings idle) at 30 ms.
 
 Where 5M stands: 200k per 40 ms mean. The median is at 37; the mean must lose 8-10 ms of tail, and the median a few more. The levers, in order: the execution's contention (isolate), the grandparent-root wait (a faster root, or a deeper pipeline), the major-fault clusters (the host), then the execution itself (16 ms for 200k transfers on 64 threads).
+
+### 10.113 loop351 stage ap — the plan-ahead parts are not a lever; isolating the build's cores cuts the execution 16 -> 13 ms and starves everything else; stage aq's layouts
+
+Stage ap (tree f7ceba36b, X10 set, 30 ms pacing, pool 27-28 GB):
+
+| leg | w1 | w2 | w3 | round | cycle | par_exec p50/p90 | state open p50 | state_ready p50 | sealed_at p50 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X10d, control | 4.16 | 3.91 | 4.15 | 366.6M | 48-51 | 16 / 21 | 0.8 | 150 | 33 |
+| X10PA, `N42_PLAN_AHEAD_PARTS=1` | 4.05 | 3.84 | 3.96 | 355.4M | 49-52 | 16 / 22 | 0.7 | 151 | 33 |
+| X10PAb | 4.07 | 3.72 | 3.37 | 335.0M | 49-59 | -- | -- | -- | -- |
+| X10PAI, parts + `N42_CORE_LAYOUT=isolate`, 64 build cores | 3.60 | 3.53 | 3.45 | 317.5M | 55-58 | 13 / 16 | 4.6 | 181 | 37 |
+| X10PAIb | 3.60 | 3.55 | 3.47 | 318.4M | 56-58 | -- | -- | -- | -- |
+| X10I, isolate alone | 3.55 | 3.25 | 3.19 | 299.6M | 56-63 | -- | -- | -- | -- |
+
+The parts carried with the plan were used on 72% of the seals (`seal_root_ahead=true`) and moved nothing: the seal's own time was 1 ms at p50 before and after (its p90 13 -> 16 is noise). Off, and the switch stays for a block shape where the layout costs more.
+
+The isolated layout confirms the contention named in 10.112 -- the batches alone on 64 physical cores run 16/21 -> 13/16 ms at p50/p90 -- and loses the leg anyway, because the layout as it stood starved the rest of the layer: the behind pool (16 threads: the freeze, receipts and frees behind the seal) was hard-pinned onto the same 64 CPUs, the siblings of the build cores sat idle, and the QMDB root job sat in a 4-core critical set, so the deferred state's open went 0.8 -> 4.6 ms, state ready 150 -> 181 and the seal 33 -> 37. Stage aq (84ea832f8 adds `N42_CORE_LAYOUT_SIBLINGS=background`, `N42_CORE_LAYOUT_BEHIND=build|critical|background`, `N42_CORE_LAYOUT_CRITICAL=background`) runs three layouts twice each against a control: ISOSIB (build 0-63 alone, root job on 64-67, behind pool and siblings to the background's 140 CPUs), ISOCRIT16 (root job on 64-79) and ISOREST (build alone on 0-63, everything else on the other 144 CPUs). A pool made lazily from a pinned thread inherits that thread's mask, which ISOREST sidesteps by keeping the critical threads on the background set.

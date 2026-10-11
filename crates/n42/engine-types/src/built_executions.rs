@@ -174,9 +174,18 @@ fn free_off_path(evicted: Vec<Entry>) {
     if evicted.is_empty() {
         return;
     }
-    static FREE: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Vec<Entry>>>>> = OnceLock::new();
+    free_boxed_off_path(Box::new(evicted));
+}
+
+/// Whatever left one of the stores, dropped on the `n42-built-free` thread
+/// (inline if that thread cannot be had): an evicted sealed block or handed
+/// build may be the last holder of a 200k-transaction body, whose free was
+/// 5-16 ms of the own-block hand-off's `clone_ms` when it ran there (loop351
+/// af, `moved_body=true` blocks).
+fn free_boxed_off_path(evicted: Box<dyn Send>) {
+    static FREE: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Box<dyn Send>>>>> = OnceLock::new();
     let sender = FREE.get_or_init(|| {
-        let (send, receive) = std::sync::mpsc::channel::<Vec<Entry>>();
+        let (send, receive) = std::sync::mpsc::channel::<Box<dyn Send>>();
         std::thread::Builder::new()
             .name("n42-built-free".into())
             .spawn(move || {
@@ -432,11 +441,18 @@ pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, ga
     // The execution is four `Arc`s, so the copy costs nothing; the budget is
     // the store's.
     let mut handed = handed().lock().unwrap_or_else(|p| p.into_inner());
-    handed.retain(|(hash, _)| *hash != taken.0);
+    let mut evicted = Vec::new();
+    while let Some(at) = handed.iter().position(|(hash, _)| *hash == taken.0) {
+        evicted.extend(handed.remove(at));
+    }
     while handed.len() >= keep() {
-        handed.pop_front();
+        evicted.extend(handed.pop_front());
     }
     handed.push_back(taken.clone());
+    drop(handed);
+    if !evicted.is_empty() {
+        free_boxed_off_path(Box::new(evicted));
+    }
     Some(taken)
 }
 
@@ -745,11 +761,18 @@ fn keep_sealed(sealed_hash: B256, transactions: usize, block: SealedKept) {
         hints.push_back((sealed_hash, transactions));
     }
     let mut store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
-    store.retain(|(hash, _)| *hash != sealed_hash);
+    let mut evicted = Vec::new();
+    while let Some(at) = store.iter().position(|(hash, _)| *hash == sealed_hash) {
+        evicted.extend(store.remove(at));
+    }
     while store.len() >= keep() {
-        store.pop_front();
+        evicted.extend(store.pop_front());
     }
     store.push_back((sealed_hash, block));
+    drop(store);
+    if !evicted.is_empty() {
+        free_boxed_off_path(Box::new(evicted));
+    }
 }
 
 /// How many sealed hashes [`sealed_here_with_transactions`] remembers: the
@@ -950,6 +973,30 @@ mod tests {
         drop(shared);
         assert_eq!(take_sealed(hash).map(|block| block.hash()), Some(hash));
         assert!(find_sealed(hash).is_none());
+    }
+
+    /// A sealed block evicted from the store is freed off the caller's
+    /// path: the caller's own reference stays the only one it sees, and the
+    /// evicted block is gone once the free thread has run.
+    #[test]
+    fn an_evicted_sealed_block_is_freed_off_the_path() {
+        let _guard = lock();
+        let first = Arc::new(RecoveredBlock::new_sealed(
+            SealedBlock::<Block>::seal_slow(alloy_consensus::Block::new(Header { number: 880, ..Default::default() }, BlockBody::default())),
+            Vec::new(),
+        ));
+        let gone = Arc::downgrade(&first);
+        remember_sealed_shared(first.hash(), first);
+        for number in 881..881 + keep() as u64 {
+            let next = SealedBlock::<Block>::seal_slow(alloy_consensus::Block::new(Header { number, ..Default::default() }, BlockBody::default()));
+            let hash = next.hash();
+            remember_sealed_shared(hash, Arc::new(RecoveredBlock::new_sealed(next, Vec::new())));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gone.upgrade().is_some() {
+            assert!(Instant::now() < deadline, "the evicted block was never freed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     use super::*;

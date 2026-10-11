@@ -460,10 +460,45 @@ pub fn find_kept_sealed(
     gas_used: u64,
     transactions_root: Option<B256>,
 ) -> Option<(B256, Arc<RecoveredBlock<Block>>, Option<BuiltExecution>)> {
+    find_kept_sealed_with(parent, number, state_root, receipts_root, gas_used, transactions_root, |hash, block, execution| {
+        (hash, Arc::clone(block), execution.cloned())
+    })
+}
+
+/// [`find_kept_sealed`] keeping no reference to the block: the builder hash,
+/// a copy of the block's header and of its withdrawals (a few hundred bytes).
+/// For a caller that only asks whether a header is one of this layer's
+/// builds -- every follower key's request on a shared layer asks it, as the
+/// own-block hand-off is about to move the block's body, which a reference
+/// held by such a lookup at that moment would make it copy instead.
+pub fn find_kept_sealed_header(
+    parent: B256,
+    number: u64,
+    state_root: B256,
+    receipts_root: B256,
+    gas_used: u64,
+    transactions_root: Option<B256>,
+) -> Option<(B256, alloy_consensus::Header, Option<Vec<alloy_eips::eip4895::Withdrawal>>)> {
+    find_kept_sealed_with(parent, number, state_root, receipts_root, gas_used, transactions_root, |hash, block, _| {
+        (hash, block.header().clone(), block.body().withdrawals.as_ref().map(|w| w.to_vec()))
+    })
+}
+
+/// The kept build matching these fields, `found` applied to it under the
+/// stores' lock (it must be cheap).
+fn find_kept_sealed_with<R>(
+    parent: B256,
+    number: u64,
+    state_root: B256,
+    receipts_root: B256,
+    gas_used: u64,
+    transactions_root: Option<B256>,
+    found: impl FnOnce(B256, &Arc<RecoveredBlock<Block>>, Option<&BuiltExecution>) -> R,
+) -> Option<R> {
     {
         let handed = handed().lock().unwrap_or_else(|p| p.into_inner());
         if let Some((hash, built)) = handed.iter().rev().find(|(_, built)| matches_build(built, parent, number, state_root, receipts_root, gas_used, transactions_root)) {
-            return Some((*hash, built.block.clone(), Some(built.clone())));
+            return Some(found(*hash, &built.block, Some(built)));
         }
     }
     let (store, _) = store();
@@ -472,7 +507,7 @@ pub fn find_kept_sealed(
         .iter()
         .rev()
         .find(|(_, entry)| matches_block(&entry.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
-        .map(|(hash, entry)| (*hash, entry.block.clone(), entry.execution.clone()))
+        .map(|(hash, entry)| found(*hash, &entry.block, entry.execution.as_ref()))
 }
 
 /// [`find`], also among the builds already taken by the engine's import --

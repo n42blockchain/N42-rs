@@ -724,7 +724,7 @@ where
     // result: the check a follower's import makes holds by construction,
     // without waiting for a build sealed before its finish.
     if let Some(once) = once
-        && n42_engine_types::built_executions::find_kept_sealed(
+        && n42_engine_types::built_executions::find_kept_sealed_header(
             parent_hash,
             number,
             state_root,
@@ -898,7 +898,7 @@ async fn build_on_own_block(
     // published, instead of the request being refused and the leader going
     // through the forkchoice and the payload job.
     if tenure_first_on_output()
-        && n42_engine_types::built_executions::find_kept_sealed(
+        && n42_engine_types::built_executions::find_kept_sealed_header(
             header.parent_hash,
             header.number,
             header.state_root,
@@ -2404,7 +2404,7 @@ async fn refuse_held(stream: &mut TcpStream, out: &mut Vec<u8>) -> std::io::Resu
 /// every own block on a shared layer miss and be executed a second time
 /// (loop328/330: 1,175 of 1,179 built blocks).
 fn is_own_build(header: &alloy_consensus::Header) -> bool {
-    let Some((_, built, _)) = n42_engine_types::built_executions::find_kept_sealed(
+    let Some((_, built, built_withdrawals)) = n42_engine_types::built_executions::find_kept_sealed_header(
         header.parent_hash,
         header.number,
         header.state_root,
@@ -2414,13 +2414,13 @@ fn is_own_build(header: &alloy_consensus::Header) -> bool {
     ) else {
         return false;
     };
-    let withdrawals_match = built.header().withdrawals_root == header.withdrawals_root
-        || built.header().withdrawals_root.is_some() && {
-            let withdrawals = built.body().withdrawals.as_ref().map_or(&[][..], |w| w.as_slice());
+    let withdrawals_match = built.withdrawals_root == header.withdrawals_root
+        || built.withdrawals_root.is_some() && {
+            let withdrawals = built_withdrawals.as_deref().unwrap_or_default();
             header.withdrawals_root
                 == Some(n42_h2_consensus::gov5_rewards_root(n42_h2_consensus::withdrawals_to_rewards(withdrawals)))
         };
-    withdrawals_match && build_executes_as_sealed(built.header(), None, header, None)
+    withdrawals_match && build_executes_as_sealed(&built, None, header, None)
 }
 
 /// The sealed header a follower's payload describes when it is one of this
@@ -2428,7 +2428,7 @@ fn is_own_build(header: &alloy_consensus::Header) -> bool {
 /// shape the seal may have given it, and proved by the payload's hash.
 fn own_sealed_header_of_payload(data: &alloy_rpc_types_engine::ExecutionData) -> Option<alloy_consensus::Header> {
     let v1 = data.payload.as_v1();
-    let (_, built, _) = n42_engine_types::built_executions::find_kept_sealed(
+    let (_, built, _) = n42_engine_types::built_executions::find_kept_sealed_header(
         v1.parent_hash,
         v1.block_number,
         v1.state_root,
@@ -2436,7 +2436,7 @@ fn own_sealed_header_of_payload(data: &alloy_rpc_types_engine::ExecutionData) ->
         v1.gas_used,
         None,
     )?;
-    let sealed = sealed_header_from_fields(data, built.header())?;
+    let sealed = sealed_header_from_fields(data, &built)?;
     (sealed.hash() == data.payload.block_hash() && is_own_build(sealed.header())).then(|| sealed.header().clone())
 }
 

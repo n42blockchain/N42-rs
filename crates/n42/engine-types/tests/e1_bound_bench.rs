@@ -123,6 +123,8 @@ fn memory_blocks() -> Vec<(reth_provider::providers::overlay_filter::BlockFilter
 #[derive(Debug, Clone)]
 struct StackDb(Arc<Stack>);
 
+impl n42_engine_types::parallel_transfer::AccountHint for StackDb {}
+
 impl Database for StackDb {
     type Error = std::convert::Infallible;
 

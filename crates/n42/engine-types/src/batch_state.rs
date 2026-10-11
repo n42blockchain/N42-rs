@@ -228,6 +228,23 @@ impl<G: Database> BatchState<G> {
     }
 }
 
+impl<G: Database + crate::parallel_transfer::AccountHint> BatchState<G> {
+    /// The hint for an account a transaction a few places ahead will read
+    /// (`N42_BUILD_MLP`): the batch's own entry prefetched when it holds the
+    /// account ([`Self::prefetch_account`]); otherwise the hint goes down the
+    /// parent's layers (`AccountHint`), each probing for it. Returns whether
+    /// it went beneath this map.
+    #[inline]
+    pub fn hint_account(&self, address: &Address) -> bool {
+        if self.accounts.contains_key(address) {
+            self.prefetch_account(address);
+            return false;
+        }
+        self.inner.hint_account(address);
+        true
+    }
+}
+
 impl<G: Database> Database for BatchState<G> {
     type Error = G::Error;
 

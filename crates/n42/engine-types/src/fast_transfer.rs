@@ -259,6 +259,14 @@ pub mod doors {
         }
     }
 
+    impl<G: crate::parallel_transfer::AccountHint> crate::parallel_transfer::AccountHint for CountedDb<G> {
+        /// Passed through uncounted: a hint is not a read.
+        #[inline]
+        fn hint_account(&self, address: &Address) -> bool {
+            self.inner.hint_account(address)
+        }
+    }
+
     impl<G: Database> Database for CountedDb<G> {
         type Error = G::Error;
 

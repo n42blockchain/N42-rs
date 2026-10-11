@@ -149,6 +149,9 @@ pub struct Phases {
     /// `N42_BUILD_MLP=<k>`: the lookahead distance the batches ran with, 0
     /// when off ([`build_mlp`]).
     pub mlp_k: usize,
+    /// `N42_BUILD_MLP`: the account hints the batches sent beneath their own
+    /// maps, into the parent's layers, summed over the batches.
+    pub mlp_hints: u64,
 }
 
 /// The calling thread's CPU time, nanoseconds (0 where it cannot be read).
@@ -1333,6 +1336,47 @@ impl ReadSet {
             self.hits.load(std::sync::atomic::Ordering::Relaxed),
             self.misses.load(std::sync::atomic::Ordering::Relaxed),
         )
+    }
+}
+
+/// A batch database's hint path (`N42_BUILD_MLP`): `address` will be read
+/// soon, so each layer probes for it -- the probe is the prefetch -- and, if
+/// it does not hold it, passes the hint beneath; the parent's state provider
+/// walks its own layers the same way
+/// (`AccountReader::n42_prefetch_account`). Nothing is materialised, no
+/// answer or counter changes, no lock is waited on. Returns whether a layer
+/// held the account. The default does nothing.
+pub trait AccountHint {
+    /// See the trait.
+    fn hint_account(&self, _address: &Address) -> bool {
+        false
+    }
+}
+
+impl<ExtDB> AccountHint for revm::database::CacheDB<ExtDB> {
+    fn hint_account(&self, address: &Address) -> bool {
+        self.cache.accounts.contains_key(address)
+    }
+}
+
+impl<DB: reth_storage_api::EvmStateProvider> AccountHint for reth_revm::database::StateProviderDatabase<DB> {
+    #[inline]
+    fn hint_account(&self, address: &Address) -> bool {
+        self.0.n42_prefetch_account(address)
+    }
+}
+
+impl<G: AccountHint> AccountHint for WarmDb<'_, G> {
+    #[inline]
+    fn hint_account(&self, address: &Address) -> bool {
+        self.warm.get(address).is_some() || self.inner.hint_account(address)
+    }
+}
+
+impl<G: AccountHint> AccountHint for ReadSetDb<'_, G> {
+    #[inline]
+    fn hint_account(&self, address: &Address) -> bool {
+        self.set.is_some_and(|set| set.get(address).is_some()) || self.inner.hint_account(address)
     }
 }
 
@@ -3635,7 +3679,7 @@ pub fn execute_for_build<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_with(evm_env, keys, convert, open, None)
@@ -3655,7 +3699,7 @@ pub fn execute_for_build_in_place<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_run(evm_env, keys, convert, open, on_bundle, in_place, None)
@@ -3678,7 +3722,7 @@ pub fn execute_for_build_in_place_after<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_run(evm_env, keys, convert, open, on_bundle, in_place, Some(before_batches))
@@ -3698,7 +3742,7 @@ pub fn execute_for_build_with<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_run(evm_env, keys, convert, open, on_bundle, false, None)
@@ -3716,7 +3760,7 @@ pub fn execute_for_build_read_set<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, Dispatch::from_env(), None, None)
@@ -3737,7 +3781,7 @@ pub fn execute_for_build_dispatch<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), None, None)
@@ -3754,7 +3798,7 @@ fn execute_for_build_run<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), None, None)
@@ -3780,7 +3824,7 @@ pub fn execute_for_build_counted<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), tip_of, prepared)
@@ -3802,7 +3846,7 @@ pub fn execute_for_build_counted_dispatch<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_opts(evm_env, keys, convert, open, None, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), tip_of, prepared)
@@ -3821,7 +3865,7 @@ pub fn execute_for_build_dispatched<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_opts(evm_env, keys, convert, open, on_bundle, true, None, read_set(), dispatch, None, None)
@@ -3843,7 +3887,7 @@ fn execute_for_build_opts<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let beneficiary = evm_env.block_env.beneficiary;
@@ -3915,7 +3959,7 @@ where
     phases.slots_us = slots_at.elapsed().as_micros() as u64;
     let slots_ref = &slots;
     type BatchResult =
-        (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, BatchSpan, LoopTimers, RunCounters);
+        (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, BatchSpan, LoopTimers, RunCounters, u64);
     // Each batch's span on the pool, against this instant (`BatchSpans`).
     let batches_at = std::time::Instant::now();
     phases.batches_start_us = batches_at.duration_since(call_at).as_micros() as u64;
@@ -3943,6 +3987,9 @@ where
         let mut counted = RunCounters { fees: tip_of.map(|_| U256::ZERO), ..Default::default() };
         let mut setup_ns = 0;
         let close_at;
+        // `N42_BUILD_MLP`: hints that went beneath the batch's map, for
+        // `par_mlp_hints`.
+        let mut mlp_hints = 0u64;
         {
             let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
             if let Some(at) = setup_at {
@@ -3988,9 +4035,13 @@ where
                                 if let Some(slot) = slots_ref.get(j) {
                                     prefetch_hint(slot);
                                 }
+                                // The sender's and the recipient's entries:
+                                // the batch's own when it holds them, else
+                                // down the parent's layers to the QMDB
+                                // view's index bucket.
                                 if let Some((sender, recipient)) = keys.get(j) {
-                                    evm.db_mut().prefetch_account(sender);
-                                    evm.db_mut().prefetch_account(recipient);
+                                    mlp_hints += u64::from(evm.db_mut().hint_account(sender));
+                                    mlp_hints += u64::from(evm.db_mut().hint_account(recipient));
                                 }
                             }
                             let (t, e) = convert(j);
@@ -4057,12 +4108,12 @@ where
                 sink(bundle);
                 let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
                 let span = BatchSpan::close(start_us, cpu_start, txs, batches_at).with_open_us(open_us);
-                Ok((skipped, None, timers, span, sampler.finish(setup_ns, close_ns), counted))
+                Ok((skipped, None, timers, span, sampler.finish(setup_ns, close_ns), counted, mlp_hints))
             }
             None => {
                 let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
                 let span = BatchSpan::close(start_us, cpu_start, txs, batches_at).with_open_us(open_us);
-                Ok((skipped, Some(bundle), timers, span, sampler.finish(setup_ns, close_ns), counted))
+                Ok((skipped, Some(bundle), timers, span, sampler.finish(setup_ns, close_ns), counted, mlp_hints))
             }
         }
     };
@@ -4126,8 +4177,9 @@ where
     run.counters.fees = tip_of.map(|_| U256::ZERO);
     let mut spans: Vec<BatchSpan> = Vec::with_capacity(results.len());
     for r in results {
-        let (skipped, bundle, timers, span, loop_timers, counted) = r?;
+        let (skipped, bundle, timers, span, loop_timers, counted, mlp_hints) = r?;
         run.counters.add(counted);
+        run.phases.mlp_hints += mlp_hints;
         spans.push(span);
         run.phases.loop_timers.add(loop_timers);
         run.skipped.extend(skipped);
@@ -4871,7 +4923,7 @@ where
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, BlockExecutorFactory = FastExecutorFactory> + Sync,
     DB: Database + std::fmt::Debug,
     DB::Error: Send + Sync + 'static,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_transfers_build_path_keyed(evm_config, block, main_db, open, None)
@@ -4980,7 +5032,7 @@ where
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, BlockExecutorFactory = FastExecutorFactory> + Sync,
     DB: Database + std::fmt::Debug,
     DB::Error: Send + Sync + 'static,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_transfers_build_path_on(evm_config, BuildPathBlock::of(block), main_db, open, keys_ahead)
@@ -5001,7 +5053,7 @@ where
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, BlockExecutorFactory = FastExecutorFactory> + Sync,
     DB: Database + std::fmt::Debug,
     DB::Error: Send + Sync + 'static,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
     T: BuildPathTx,
 {
@@ -5217,6 +5269,8 @@ mod tests {
     /// on a node every batch opens a state provider over the same store.
     #[derive(Debug, Clone)]
     struct SharedDb(std::sync::Arc<CacheDB<EmptyDB>>);
+
+    impl AccountHint for SharedDb {}
 
     impl Database for SharedDb {
         type Error = <CacheDB<EmptyDB> as revm::DatabaseRef>::Error;
@@ -6296,21 +6350,22 @@ mod tests {
                     .filter_map(std::sync::OnceLock::get)
                     .map(|b| (b.index, b.tx, b.gas_used, b.result.is_success()))
                     .collect();
-                let mlp_k = run.phases.mlp_k;
+                let (mlp_k, mlp_hints) = (run.phases.mlp_k, run.phases.mlp_hints);
                 let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();
                 let graft = graft_bundles(&mut state, run.bundles, beneficiary).unwrap();
                 state.merge_transitions(BundleRetention::Reverts);
                 let mut bundle = state.take_bundle();
                 append_reverts(&mut bundle, graft.reverts);
-                (executed, run.skipped, graft.beneficiary_delta, accounts_of(&bundle), reverts_of(&bundle), state_ops_of(&bundle), mlp_k)
+                (executed, run.skipped, graft.beneficiary_delta, accounts_of(&bundle), reverts_of(&bundle), state_ops_of(&bundle), mlp_k, mlp_hints)
             };
             let plain = grafted(None);
             assert!(!plain.1.is_empty(), "the underfunded senders' runs are skipped in part");
             assert!(plain.0.iter().all(|(index, tx, _, _)| index == tx));
-            assert_eq!(plain.6, 0);
+            assert_eq!((plain.6, plain.7), (0, 0));
             for k in [1usize, 4, 16, 10_000] {
                 let ahead = grafted(Some(k));
                 assert_eq!(ahead.6, k.min(BUILD_MLP_MAX), "the distance on the phases");
+                assert!(ahead.7 > 0, "hints went beneath the batches' maps, k={k}");
                 assert_eq!(plain.0, ahead.0, "executed transfers, their conversions and gas, k={k}");
                 assert_eq!(plain.1, ahead.1, "skipped, k={k}");
                 assert_eq!(plain.2, ahead.2, "beneficiary delta, k={k}");
@@ -7684,6 +7739,8 @@ mod tests {
         /// the node's provider door does (`n42_state::record_answer`).
         count: bool,
     }
+
+    impl AccountHint for ViewDb {}
 
     impl Database for ViewDb {
         type Error = std::convert::Infallible;

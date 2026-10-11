@@ -873,6 +873,7 @@ fn transfer_key<P: PoolTransaction<Consensus = TransactionSigned>>(
 /// when not every candidate is a plain transfer (the build preps as before).
 fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
     segments: &[(n42_tx_queue::FrameTxs<P>, usize)],
+    plan: &n42_tx_queue::FramePlan,
 ) -> Option<crate::frame_blocks::PreparedBuild<P>> {
     use rayon::prelude::*;
     let at = std::time::Instant::now();
@@ -900,6 +901,11 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
         crate::parallel_transfer::partition_by_sender(&keys, beneficiary).ok().map(|groups| (beneficiary, groups))
     });
     let slots = crate::parallel_transfer::empty_slots(pool, cands.len());
+    // `N42_PLAN_AHEAD_PARTS=1`: the body's frame layout and transactions
+    // root, found here with the plan rather than at the seal.
+    let root_ahead = (crate::frame_blocks::plan_ahead_parts() && crate::frame_blocks::active())
+        .then(|| pool.install(|| crate::frame_blocks::root_ahead(plan, &hashes)))
+        .flatten();
     Some(crate::frame_blocks::PreparedBuild {
         segments: segments.to_vec(),
         cands,
@@ -910,6 +916,7 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
         groups,
         slots,
         made_us: at.elapsed().as_micros() as u64,
+        root_ahead,
     })
 }
 
@@ -918,8 +925,8 @@ fn install_plan_ahead_body<P: PoolTransaction<Consensus = TransactionSigned>>(qu
     if queue.has_plan_ahead_hook() {
         return;
     }
-    queue.set_plan_ahead_hook(Arc::new(|segments: &[(n42_tx_queue::FrameTxs<P>, usize)]| {
-        make_prepared_build(segments).map(|made| Box::new(made) as n42_tx_queue::PreparedBody)
+    queue.set_plan_ahead_hook(Arc::new(|segments: &[(n42_tx_queue::FrameTxs<P>, usize)], plan: &n42_tx_queue::FramePlan| {
+        make_prepared_build(segments, plan).map(|made| Box::new(made) as n42_tx_queue::PreparedBody)
     }));
 }
 
@@ -1815,6 +1822,11 @@ where
     let mut direct_hashes: Option<Vec<B256>> = None;
     // Whether the seal took them.
     let mut seal_hashes_ahead = false;
+    // `N42_PLAN_AHEAD_PARTS=1`: the root found with the plan for the hashes
+    // in `direct_hashes` (set only beside them, from the same prepared
+    // build), and whether the seal took it.
+    let mut direct_root_ahead: Option<crate::frame_blocks::RootAhead> = None;
+    let mut seal_root_ahead = false;
     let deferred_now = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), attributes.timestamp);
     // What the seal-first path needs of the chain and the block, short of
     // the block being full (known after the parallel step).
@@ -1970,16 +1982,28 @@ where
                 // run of frames (by the build's plan or this node's frame
                 // index), the MPT root for any other body.
                 use alloy_consensus::transaction::TxHashRef as _;
+                let mut root_ahead = direct_root_ahead.take();
                 let hashes: Vec<B256> = match direct_hashes.take().filter(|hashes| hashes.len() == transactions.len()) {
                     Some(hashes) => {
                         seal_hashes_ahead = true;
                         hashes
                     }
-                    None => transactions.iter().map(|tx| *tx.tx_hash()).collect(),
+                    None => {
+                        // The root found ahead is for the prepared hashes only.
+                        root_ahead = None;
+                        transactions.iter().map(|tx| *tx.tx_hash()).collect()
+                    }
                 };
-                let sealed = crate::frame_blocks::seal_root_timed(frame_plan.as_ref(), &hashes, || {
-                    early_root.unwrap_or_else(|| crate::assembler::parallel_transaction_root(&transactions))
-                });
+                let carried = root_ahead
+                    .as_ref()
+                    .and_then(|ahead| crate::frame_blocks::seal_root_carried(ahead, frame_plan.as_ref(), &hashes));
+                seal_root_ahead = carried.is_some();
+                let sealed = match carried {
+                    Some(sealed) => sealed,
+                    None => crate::frame_blocks::seal_root_timed(frame_plan.as_ref(), &hashes, || {
+                        early_root.unwrap_or_else(|| crate::assembler::parallel_transaction_root(&transactions))
+                    }),
+                };
                 seal_layout_ms = sealed.layout_us / 1000;
                 seal_root_ms = sealed.root_us / 1000;
                 seal_frames_indexed = sealed.indexed;
@@ -2493,6 +2517,7 @@ where
                         if prep_from_plan
                             && let Some(made) = prepared_build.as_mut().filter(|made| made.transactions.len() == cands.len())
                         {
+                            direct_root_ahead = made.root_ahead.take();
                             Some((
                                 (
                                     std::mem::take(&mut made.transactions),
@@ -4379,6 +4404,9 @@ where
                     seal_root_ms,
                     // The seal's hash vector came with the body (no collect).
                     seal_hashes_ahead,
+                    // `N42_PLAN_AHEAD_PARTS=1`: the seal took the frame
+                    // layout and root found with the plan.
+                    seal_root_ahead,
                     seal_frames_indexed,
                     seal_frames_hashed,
                     gap_before_exec_ms,
@@ -5583,7 +5611,26 @@ mod plan_body_tests {
             let mut db = CacheDB::new(EmptyDB::default());
             db.insert_account_info(beneficiary, AccountInfo { balance: U256::from(7), ..Default::default() });
             let segments = frames(senders, run, first, space, &mut db);
-            let made = make_prepared_build(&segments).expect("every candidate a transfer");
+            // The plan the segments are: each frame's id its root, its
+            // hashes shared, the last one cut.
+            let mut plan = n42_tx_queue::FramePlan::default();
+            for (txs, taken) in &segments {
+                let frame_hashes: Vec<B256> = txs.iter().map(|tx| *tx.hash()).collect();
+                plan.frames.push(n42_tx_queue::PlannedFrame {
+                    id: n42_tx_types::frame_root(&frame_hashes),
+                    len: txs.len(),
+                    taken: *taken,
+                });
+                plan.push_hashes(Arc::from(frame_hashes), *taken);
+            }
+            let made = make_prepared_build(&segments, &plan).expect("every candidate a transfer");
+            // `N42_PLAN_AHEAD_PARTS=1`: the root found with the plan over the
+            // body's hashes is the seal's at the build.
+            let ahead = crate::frame_blocks::root_ahead(&plan, &made.hashes).expect("the body is the plan's");
+            let at_build = crate::frame_blocks::seal_root_timed(Some(&plan), &made.hashes, || B256::ZERO);
+            let carried = crate::frame_blocks::seal_root_carried(&ahead, Some(&plan), &made.hashes).expect("carried");
+            assert_eq!((carried.root, carried.indexed, carried.hashed), (at_build.root, at_build.indexed, at_build.hashed));
+            assert_ne!(at_build.root, B256::ZERO, "a frame root, not the fallback");
             let cands: Vec<Cand> = segments.iter().flat_map(|(txs, taken)| txs[..*taken].to_vec()).collect();
             assert_eq!(made.cands.len(), cands.len());
             assert!(made.cands.iter().zip(&cands).all(|(a, b)| Arc::ptr_eq(a, b)), "the candidates, in plan order");

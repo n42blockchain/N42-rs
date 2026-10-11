@@ -375,7 +375,7 @@ fn a_build_takes_its_frames_whole() {
 /// A plan-ahead hook for the tests: the plan's (sender, nonce) pairs in plan
 /// order, as the builder's body would list them.
 fn pairs_hook() -> PlanAheadHook<EthPooledTransaction> {
-    Arc::new(|segments: &[(FrameTxs<EthPooledTransaction>, usize)]| {
+    Arc::new(|segments: &[(FrameTxs<EthPooledTransaction>, usize)], _plan: &FramePlan| {
         let all: Vec<Tx> = segments.iter().flat_map(|(txs, taken)| txs[..*taken].to_vec()).collect();
         Some(Box::new(pairs(&all)) as PreparedBody)
     })

@@ -973,13 +973,16 @@ pub type PreparedBody = Box<dyn Any + Send + Sync>;
 
 /// The hook that makes a [`PreparedBody`] from a prepared plan's segments
 /// (each frame's transactions and how many the plan takes from its start,
-/// in plan order). Run on the thread that prepared the plan, after the
-/// lanes' lock is released; `None` makes no body.
-pub type PlanAheadHook<T> = Arc<dyn Fn(&[(FrameTxs<T>, usize)]) -> Option<PreparedBody> + Send + Sync>;
+/// in plan order), with the plan itself (its frames and hashes, for what
+/// the builder can make of the layout ahead). Run on the thread that
+/// prepared the plan, after the lanes' lock is released; `None` makes no
+/// body.
+pub type PlanAheadHook<T> = Arc<dyn Fn(&[(FrameTxs<T>, usize)], &FramePlan) -> Option<PreparedBody> + Send + Sync>;
 
-/// A prepared plan's segments and its body's slot, for the hook to fill
-/// after the lanes' lock is released.
-type BodyJob<T> = (Vec<(FrameTxs<T>, usize)>, Arc<Mutex<BodySlot>>);
+/// A prepared plan's segments, a copy of the plan (its frames and the
+/// frames' shared hash lists, by `Arc`) and its body's slot, for the hook
+/// to fill after the lanes' lock is released.
+type BodyJob<T> = (Vec<(FrameTxs<T>, usize)>, FramePlan, Arc<Mutex<BodySlot>>);
 
 /// A prepared plan's body, filled by the hook once it ran.
 #[derive(Default)]
@@ -3861,7 +3864,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         let cut = plan.frames.last().is_some_and(|frame| frame.taken < frame.len);
         let body = hook.is_some().then(|| {
             let slot = Arc::new(Mutex::new(BodySlot::default()));
-            body_job = Some((segments.clone(), Arc::clone(&slot)));
+            body_job = Some((segments.clone(), plan.clone(), Arc::clone(&slot)));
             slot
         });
         inner.prepared = Some(Prepared {
@@ -3885,9 +3888,9 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// The body, made off the lanes' lock. A build that takes the plan
     /// before this ends finds the slot empty and makes its own.
     fn run_body_hook(hook: Option<PlanAheadHook<T>>, body_job: Option<BodyJob<T>>) {
-        if let (Some(hook), Some((segments, slot))) = (hook, body_job) {
+        if let (Some(hook), Some((segments, plan, slot))) = (hook, body_job) {
             let at = std::time::Instant::now();
-            let body = hook(&segments);
+            let body = hook(&segments, &plan);
             let made_us = at.elapsed().as_micros() as u64;
             let mut slot = slot.lock();
             slot.body = body;
@@ -4478,7 +4481,7 @@ impl<T: PoolTransaction> Inner<T> {
         // transactions: the hook reads them outside the lock.
         let body = with_hook.then(|| {
             let slot = Arc::new(Mutex::new(BodySlot::default()));
-            *body_job = Some((segments.clone(), Arc::clone(&slot)));
+            *body_job = Some((segments.clone(), plan.clone(), Arc::clone(&slot)));
             slot
         });
         inner.prepared = Some(Prepared {

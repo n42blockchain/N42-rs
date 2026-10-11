@@ -235,6 +235,11 @@ pub struct PreparedBuild<T: reth_transaction_pool::PoolTransaction> {
     pub slots: Vec<std::sync::OnceLock<crate::parallel_transfer::BuiltTransfer<()>>>,
     /// The hook's time.
     pub made_us: u64,
+    /// `N42_PLAN_AHEAD_PARTS=1`: the transactions root of `hashes` laid out
+    /// by the plan the body was made with, found by the hook
+    /// ([`root_ahead`]); the seal takes it when it seals exactly these
+    /// hashes on that plan ([`seal_root_carried`]).
+    pub root_ahead: Option<RootAhead>,
 }
 
 impl<T: reth_transaction_pool::PoolTransaction> std::fmt::Debug for PreparedBuild<T> {
@@ -537,6 +542,105 @@ pub fn root_of_block(block: &B256) -> Option<B256> {
         .iter()
         .find(|(known, _)| known == block)
         .map(|(_, root)| *root)
+}
+
+/// `N42_PLAN_AHEAD_PARTS=1`: the plan-ahead hook also finds the body's
+/// frame layout and transactions root with the plan ([`root_ahead`]), and a
+/// build sealing exactly that body on that plan takes them instead of the
+/// seal's prefix check and frame tree ([`seal_root_carried`]). Off by
+/// default; only with [`plan_ahead_body_wanted`].
+pub fn plan_ahead_parts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_PLAN_AHEAD_PARTS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The transactions root of a prepared body, found with its plan ahead of
+/// the build ([`root_ahead`]): what [`seal_root_timed`]'s plan path finds at
+/// the seal, and what identifies the plan and body it was found for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootAhead {
+    /// The frame tree root.
+    pub root: B256,
+    /// The layout, (frame id, length) in body order.
+    pub layout: Vec<(B256, usize)>,
+    /// Leaves that were the plan's frame ids.
+    pub indexed: usize,
+    /// Leaves hashed from the body.
+    pub hashed: usize,
+    /// The body's length and its first and last hashes.
+    pub len: usize,
+    /// See `len`.
+    pub first: B256,
+    /// See `len`.
+    pub last: B256,
+    /// The plan's frame count and transaction count.
+    pub plan_frames: usize,
+    /// See `plan_frames`.
+    pub plan_txs: usize,
+    /// The hook's time on it, microseconds (off the build).
+    pub made_us: u64,
+}
+
+/// [`seal_root_timed`]'s plan path for `body_hashes` on `plan`, with no
+/// side effect: `None` when the body is empty or not a run of the plan's
+/// frames (the seal then finds its root as before).
+pub fn root_ahead(plan: &FramePlan, body_hashes: &[B256]) -> Option<RootAhead> {
+    let at = std::time::Instant::now();
+    let (&first, &last) = (body_hashes.first()?, body_hashes.last()?);
+    let layout = plan.layout_for(body_hashes)?;
+    let known: Vec<Option<B256>> =
+        layout.iter().zip(&plan.frames).map(|((id, take), frame)| (*take == frame.len).then_some(*id)).collect();
+    let counts: Vec<usize> = layout.iter().map(|(_, count)| *count).collect();
+    let tree = frame_tree_root_known(&counts, &known, body_hashes.len(), |i| body_hashes[i])?;
+    Some(RootAhead {
+        root: tree.root,
+        layout,
+        indexed: tree.indexed,
+        hashed: tree.hashed,
+        len: body_hashes.len(),
+        first,
+        last,
+        plan_frames: plan.frames.len(),
+        plan_txs: plan.tx_count(),
+        made_us: at.elapsed().as_micros() as u64,
+    })
+}
+
+/// The seal's root from a [`RootAhead`], when it was found for this plan
+/// and this body: the same plan's frame and transaction counts, the same
+/// body length and end hashes (the caller seals the very hashes the hook
+/// was given). Files the layout and counts the seal as
+/// [`seal_root_timed`] does; `None` (nothing done) when it does not fit.
+pub fn seal_root_carried(ahead: &RootAhead, plan: Option<&FramePlan>, body_hashes: &[B256]) -> Option<SealRoot> {
+    let plan = plan?;
+    let fits = ahead.plan_frames == plan.frames.len()
+        && ahead.plan_txs == plan.tx_count()
+        && ahead.len == body_hashes.len()
+        && body_hashes.first() == Some(&ahead.first)
+        && body_hashes.last() == Some(&ahead.last);
+    if !fits {
+        return None;
+    }
+    SEALED_ALIGNED.fetch_add(1, Ordering::Relaxed);
+    let described: Vec<(B256, u32)> =
+        ahead.layout.iter().map(|(id, count)| (*id, u32::try_from(*count).unwrap_or(u32::MAX))).collect();
+    if body_hashes.len() >= 1000 {
+        tracing::info!(
+            target: "payload_builder",
+            frames = described.len(),
+            skipped = plan.skipped,
+            txs = body_hashes.len(),
+            last = described.last().map_or(0, |(_, count)| *count),
+            indexed = ahead.indexed,
+            hashed = ahead.hashed,
+            layout_us = 0u64,
+            root_us = 0u64,
+            ahead_us = ahead.made_us,
+            "frame build sealed"
+        );
+    }
+    remember_layout(ahead.root, described);
+    Some(SealRoot { root: ahead.root, layout_us: 0, root_us: 0, indexed: ahead.indexed, hashed: ahead.hashed })
 }
 
 /// What [`seal_root_timed`] did, for the build's phase line.
@@ -952,6 +1056,47 @@ mod frame_root_tests {
         let cut = seal_root_timed(Some(&plan), &h[0..2], || mpt);
         assert_eq!((cut.indexed, cut.hashed), (0, 1));
         assert_eq!(cut.root, n42_tx_types::frame_tree_root(&[n42_tx_types::frame_root(&h[0..2])]));
+    }
+
+    /// `N42_PLAN_AHEAD_PARTS=1`: the root and layout found with the plan
+    /// ahead of the build are the ones the seal finds at the build, for
+    /// every body the plan can give (whole, stopped after a frame, cut
+    /// inside one); a carried root is refused for any other plan or body,
+    /// and a body that is not a run of the plan has none.
+    #[test]
+    fn the_root_found_with_the_plan_is_the_one_the_seal_finds() {
+        let (plan, h) = plan_of(0x38);
+        let mpt = B256::repeat_byte(0xAE);
+        for body in [&h[0..5], &h[0..3], &h[0..2]] {
+            let ahead = root_ahead(&plan, body).expect("a run of the plan's frames");
+            let at_build = seal_root_timed(Some(&plan), body, || mpt);
+            let carried = seal_root_carried(&ahead, Some(&plan), body).expect("the same plan and body");
+            // The same root and leaves; only the timers differ (0 when carried).
+            assert_eq!((carried.root, carried.indexed, carried.hashed), (at_build.root, at_build.indexed, at_build.hashed));
+            assert_eq!((carried.layout_us, carried.root_us), (0, 0));
+            assert_eq!(
+                ahead.layout,
+                plan.layout_for(body).expect("the layout at the build"),
+                "the layout carried is the build's"
+            );
+            assert_eq!(layout_by_root(&ahead.root), Some(ahead.layout.iter().map(|(id, n)| (*id, *n as u32)).collect()));
+        }
+        let ahead = root_ahead(&plan, &h[0..5]).expect("whole");
+        // Another body of the same length, another plan, or no plan: not carried.
+        let mut other = h[0..5].to_vec();
+        other[4] = B256::repeat_byte(0x99);
+        assert_eq!(seal_root_carried(&ahead, Some(&plan), &other), None);
+        assert_eq!(seal_root_carried(&ahead, Some(&plan), &h[0..4]), None);
+        let (other_plan, _) = plan_of(0x39);
+        let mut longer = other_plan.clone();
+        longer.push_hashes(Arc::from(&h[5..6]), 1);
+        assert_eq!(seal_root_carried(&ahead, Some(&longer), &h[0..5]), None);
+        assert_eq!(seal_root_carried(&ahead, None, &h[0..5]), None);
+        // Not a prefix of the plan, or empty: nothing found ahead.
+        let mut swapped = h[0..5].to_vec();
+        swapped.swap(0, 1);
+        assert_eq!(root_ahead(&plan, &swapped), None);
+        assert_eq!(root_ahead(&plan, &[]), None);
     }
 
     #[test]

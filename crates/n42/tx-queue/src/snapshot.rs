@@ -778,7 +778,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             return Some(false);
         }
         // The body, made off the lock into the stored plan's slot.
-        Self::run_body_hook(hook, slot.map(|slot| (planned.segments, slot)));
+        Self::run_body_hook(hook, slot.map(|slot| (planned.segments, planned.plan, slot)));
         Some(true)
     }
 

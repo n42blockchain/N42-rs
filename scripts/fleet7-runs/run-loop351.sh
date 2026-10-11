@@ -116,7 +116,7 @@ run() { local tag=$1; shift
   case $tag in *7PROF) ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; sleep 45; F7_BIN=$WT/target/profiling-build/profiling bash scripts/fleet7-profile.sh 0 $S/perf-$tag 10 > $S/perf-$tag.run.out 2>&1 ) & ;; esac
   case $tag in *X11prof) ( n=0; until grep -q 'first full block at epoch' $S/bench-$tag.out 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 600 ] && exit 0; done; sleep 4
      p=$(ps -eo pid,args | grep '/n4[2] node' | grep 'rust-fleet7-bench/node0/' | grep -v grep | awk '{print $1}' | head -1); [ -n "$p" ] || { echo "no node0 execution layer"; exit 0; }
-     tids=$(for t in /proc/$p/task/*; do [ "$(cat $t/comm 2>/dev/null)" = n42-build ] && echo ${t##*/}; done | paste -sd,); echo "$tag perf on pid $p, $(echo $tids | tr , '\n' | grep -c .) n42-build threads, from $(date +%H:%M:%S)"
+     tids=$(for t in /proc/$p/task/*; do case "$(cat $t/comm 2>/dev/null)" in n42-build|n42-build-*) echo ${t##*/};; esac; done | paste -sd,); echo "$tag perf on pid $p, $(echo $tids | tr , '\n' | grep -c .) n42-build threads, from $(date +%H:%M:%S)"
      [ -n "$tids" ] || tids=""; T=${tids:+-t $tids}; [ -n "$T" ] || T="-p $p"
      perf record -F 999 -g --call-graph dwarf,16384 $T -o $S/perf-$tag-build.data -- sleep 8; echo "cycles record exit $? at $(date +%H:%M:%S)"
      perf record -e ls_dmnd_fills_from_sys.dram_io_all -c 200 -e ls_dmnd_fills_from_sys.all -c 2000 -e cycles -c 400000 $T -o $S/perf-$tag-miss.data -- sleep 6; echo "miss record exit $? at $(date +%H:%M:%S)"

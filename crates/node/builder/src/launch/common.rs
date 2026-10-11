@@ -72,7 +72,8 @@ use reth_node_metrics::{
 use reth_provider::{
     providers::{NodeTypesForProvider, ProviderNodeTypes, RocksDBProvider, StaticFileProvider},
     BalStoreHandle, BlockHashReader, BlockNumReader, DBProvider, DatabaseProviderFactory,
-    MetadataProvider, MetadataWriter, ProviderError, ProviderFactory, ProviderResult,
+    AccountExtReader, HashingWriter, MetadataProvider, MetadataWriter, ProviderError,
+    StageCheckpointWriter, StorageReader, ProviderFactory, ProviderResult,
     RocksDBBalStore, RocksDBProviderFactory, StageCheckpointReader, StaticFileProviderBuilder,
     StaticFileProviderFactory, StorageSettingsCache,
 };
@@ -82,7 +83,7 @@ use reth_rpc_layer::JwtSecret;
 use reth_stages::{
     sets::DefaultStages,
     stages::{EraImportSource, MerkleStage},
-    MetricEvent, PipelineBuilder, PipelineTarget, StageId, StageSet,
+    MetricEvent, PipelineBuilder, PipelineTarget, StageCheckpoint, StageId, StageSet,
 };
 use reth_static_file::{blocks_per_file_for_prune_distance, StaticFileProducer, StaticFileSegment};
 use reth_storage_overlay::OverlayManager;
@@ -550,9 +551,30 @@ where
         let provider_ro = factory.database_provider_ro()?;
         // Finish is committed before Merkle during unwind, so this marker is authoritative when
         // resuming an interrupted partial trie unwind.
-        let (partial_trie_unwind, has_persisted_partial_trie_unwind) =
+        let (mut partial_trie_unwind, has_persisted_partial_trie_unwind) =
             get_partial_trie_unwind_marker(&provider_ro)?;
         drop(provider_ro);
+        let qmdb_chain = reth_chainspec::qmdb::state_scheme(self.chain_spec().genesis()) ==
+            reth_chainspec::qmdb::StateScheme::Qmdb;
+        match plan_trie_recovery(
+            qmdb_chain,
+            partial_trie_unwind,
+            has_persisted_partial_trie_unwind,
+        ) {
+            TrieRecovery::Nothing | TrieRecovery::Unwind(_) => {}
+            TrieRecovery::Heal { frontier, tip } => {
+                heal_hashed_state_forward(&factory, frontier, tip)?;
+                partial_trie_unwind = None;
+            }
+            TrieRecovery::Refuse => {
+                eyre::bail!(
+                    "this datadir's partial state trie unwind was started by an earlier binary and \
+                     cannot complete on a QMDB chain (the Merkle stage would verify a \
+                     Merkle-Patricia root the headers do not carry); re-initialise the datadir \
+                     (`fleet7.sh up --fresh`, or `n42 init` and resync)"
+                );
+            }
+        }
         let persist_partial_trie_unwind =
             !has_persisted_partial_trie_unwind && partial_trie_unwind.is_some();
         let partial_trie_unwind_target =
@@ -582,6 +604,12 @@ where
                 )
                 .builder()
                 .disable_all(disabled_stages);
+
+                if qmdb_chain {
+                    // A QMDB chain's headers carry a QMDB root, which the Merkle stages cannot
+                    // verify; the MDBX trie tables are stale from block 1 on.
+                    stages = stages.disable(StageId::MerkleUnwind).disable(StageId::MerkleExecute);
+                }
 
                 if walk_all_changed_branch_children {
                     // Partial trie recovery is not complete until Merkle has unwound.
@@ -1408,6 +1436,68 @@ pub fn metrics_hooks<N: NodeTypesWithDB>(provider_factory: &ProviderFactory<N>) 
         .build()
 }
 
+/// What startup does about a hashed-state/trie frontier that lags the `Finish` checkpoint.
+#[derive(Debug, PartialEq, Eq)]
+enum TrieRecovery {
+    /// The frontier is current.
+    Nothing,
+    /// Unwind the database to the marker's frontier through the Merkle stage (MPT chains).
+    Unwind(PartialStateTrieUnwindMarker),
+    /// Rewrite the hashed state of `(frontier, tip]` from plain state (QMDB chains).
+    Heal { frontier: BlockNumber, tip: BlockNumber },
+    /// A QMDB datadir with an unwind marker left by an earlier binary; not repairable.
+    Refuse,
+}
+
+/// Decides the recovery for a lagging frontier from the marker lookup result.
+fn plan_trie_recovery(
+    qmdb_chain: bool,
+    marker: Option<PartialStateTrieUnwindMarker>,
+    persisted: bool,
+) -> TrieRecovery {
+    match (qmdb_chain, marker) {
+        (_, None) => TrieRecovery::Nothing,
+        (false, Some(marker)) => TrieRecovery::Unwind(marker),
+        (true, Some(_)) if persisted => TrieRecovery::Refuse,
+        (true, Some(marker)) => TrieRecovery::Heal {
+            frontier: marker.partial_state_trie,
+            tip: marker.finish_block_number,
+        },
+    }
+}
+
+/// Moves a lagging hashed-state frontier forward to `tip` instead of unwinding to it.
+///
+/// Writes the hashed state of every account and storage slot changed in `(frontier, tip]` from
+/// the current plain state, as the incremental branches of the account and storage hashing
+/// stages do, then rewrites the `Finish` checkpoint as `tip` with no frontier, in one
+/// transaction.
+///
+/// Correct because every key unchanged in `(frontier, tip]` already holds its value at `tip` in
+/// the hashed tables, and every changed key is rewritten from plain state, which stands at
+/// `tip`. With `N42_HASHED_TABLES=off` the hashed tables are not written and only the checkpoint
+/// is rewritten. The QMDB state reader is not registered yet, so it is not consulted.
+fn heal_hashed_state_forward<N: ProviderNodeTypes>(
+    factory: &ProviderFactory<N>,
+    frontier: BlockNumber,
+    tip: BlockNumber,
+) -> eyre::Result<()> {
+    let provider_rw = factory.database_provider_rw()?;
+    if !reth_provider::n42_state::hashed_tables_off() {
+        let range = frontier + 1..=tip;
+        let accounts = provider_rw.changed_accounts_with_range(range.clone())?;
+        let accounts = provider_rw.basic_accounts(accounts)?;
+        provider_rw.insert_account_for_hashing(accounts)?;
+        let storages = provider_rw.changed_storages_with_range(range)?;
+        let storages = provider_rw.plain_state_storages(storages)?;
+        provider_rw.insert_storage_for_hashing(storages)?;
+    }
+    provider_rw.save_stage_checkpoint(StageId::Finish, StageCheckpoint::new(tip))?;
+    provider_rw.commit()?;
+    info!(target: "reth::cli", frontier, tip, "Healed the hashed-state frontier forward to the database tip");
+    Ok(())
+}
+
 fn get_partial_trie_unwind_marker(
     provider: &(impl MetadataProvider + StageCheckpointReader),
 ) -> ProviderResult<(Option<PartialStateTrieUnwindMarker>, bool)> {
@@ -1469,7 +1559,9 @@ fn delete_partial_trie_unwind_marker(provider: &impl MetadataWriter) -> Provider
 
 #[cfg(test)]
 mod tests {
-    use super::{get_partial_trie_unwind_marker, LaunchContext, NodeConfig};
+    use super::{
+        get_partial_trie_unwind_marker, plan_trie_recovery, LaunchContext, NodeConfig, TrieRecovery,
+    };
     use reth_config::Config;
     use reth_db_api::models::PartialStateTrieUnwindMarker;
     use reth_node_core::args::PruningArgs;
@@ -1662,5 +1754,23 @@ mod tests {
     #[test]
     fn get_partial_trie_unwind_marker_rejects_malformed_metadata() {
         assert!(get_partial_trie_unwind_marker(&MockProvider(Some(vec![0xff]), None)).is_err());
+    }
+
+    #[test]
+    fn plan_trie_recovery_by_chain_kind() {
+        let marker = PartialStateTrieUnwindMarker { finish_block_number: 46, partial_state_trie: 16 };
+        // An MPT chain keeps the unwind, persisted or not.
+        assert_eq!(plan_trie_recovery(false, Some(marker), false), TrieRecovery::Unwind(marker));
+        assert_eq!(plan_trie_recovery(false, Some(marker), true), TrieRecovery::Unwind(marker));
+        // A QMDB chain with a lagging frontier heals forward.
+        assert_eq!(
+            plan_trie_recovery(true, Some(marker), false),
+            TrieRecovery::Heal { frontier: 16, tip: 46 }
+        );
+        // A current frontier needs nothing.
+        assert_eq!(plan_trie_recovery(true, None, false), TrieRecovery::Nothing);
+        assert_eq!(plan_trie_recovery(false, None, false), TrieRecovery::Nothing);
+        // A persisted marker on a QMDB chain is refused.
+        assert_eq!(plan_trie_recovery(true, Some(marker), true), TrieRecovery::Refuse);
     }
 }

@@ -640,3 +640,10 @@
   账户表中的条目（`batch_state.rs` `BatchState::prefetch_account`，只读探测加 `prefetcht0`）发出预取提示。
   纯提示，结果不变（测试 `the_build_lookahead_equals_the_plain_build`）；阶段行字段 `par_mlp_k`；上限 256。
   不触及任何 fork 的 reth crate。说明见 `docs/BREAKTHROUGH_DESIGN.md` 10.117 末段。
+- 账户预取提示穿过 provider 各层（同一开关）：fork 的 `storage-api` 给 `AccountReader` 与 `EvmStateProvider` 加
+  `n42_prefetch_account`（默认空实现，返回是否某层持有该账户；`delegate_provider_impls` 与 EVM 适配器转发），
+  `N42StateReader` 加 `prefetch_account`；`provider` 的 memory overlay（过滤器 + bundle 表探测）与 latest provider
+  （交给 QMDB reader）实现之；`twig-core` `SharedOffsetIndex::prefetch`（仅 `try_read` 成功时预取桶行，不等待、不计数）、
+  `qmdb-reth` `QmdbReadView::prefetch_account`；`engine-types` `ShardLayer` / `CountingStateProvider` 实现、
+  `AccountHint` 链（`ReadSetDb`、`WarmDb`、`CountedDb`、`StateProviderDatabase`）与 `BatchState::hint_account`；
+  阶段行字段 `par_mlp_hints`。

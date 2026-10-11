@@ -167,6 +167,19 @@ pub fn merge_at_shards_ready() -> bool {
     *ON.get_or_init(|| std::env::var("N42_MERGE_AT_SHARDS_READY").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `N42_MERGE_SPLIT=1` (off by default): the leader's merge after the
+/// fields' publication -- the one that runs when `N42_MERGE_AT_SHARDS_READY`
+/// is off -- builds the account map and the revert set at once, the revert
+/// set on a scoped thread of its own ([`FrozenShards::merged_timed`] with
+/// `concurrent`), instead of one after the other on one thread. The bundle
+/// is assembled from both halves in the same order either way, so it is the
+/// same bundle; `StateReady` comes the reverts' half earlier (state 45 +
+/// reverts 44 ms at 200k transfers -> about the larger of the two). Read once.
+pub fn merge_split() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_MERGE_SPLIT").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// Puts a block's complete revert set ([`FrozenShards::late_reverts`]) into
 /// the bundle [`FrozenShards::merged_state_first`] gave.
 pub fn complete_reverts(bundle: &mut BundleState, reverts: revm::database::states::reverts::Reverts, size: usize) {
@@ -2799,6 +2812,56 @@ mod frozen_tests {
             assert_eq!(concurrent, on_path, "index {index} live {live}: concurrent against on-path");
             assert_eq!(sequential, on_path, "index {index} live {live}: sequential against on-path");
             assert!(split.total_us >= split.append_us);
+        }
+    }
+
+    /// `N42_MERGE_SPLIT`: the leader's merge after the publication, with its
+    /// two halves on two threads and the graft's reverts appended after it as
+    /// the leader appends them, is the bundle the one-thread merge leaves --
+    /// on a small shard set (under the parallel revert sort), in all three
+    /// fold modes, with a conflicting write, an executor change over the
+    /// shards and graft reverts that overlap the shards'.
+    #[test]
+    fn the_split_leader_merge_is_the_serial_one_on_a_small_shard_set() {
+        let wide = |i: u32| Address::from_word(B256::from(U256::from(0x3000_0000u64 + u64::from(i))));
+        for (index, live) in [(false, false), (true, false), (true, true)] {
+            let shards = OutputShards::with_index_live(addr(1), 64, 4, index, live);
+            for batch_no in 0..3u32 {
+                let mut builder = BundleState::builder(1..=1);
+                for i in 0..5u32 {
+                    let account = wide(batch_no * 5 + i);
+                    builder = builder
+                        .state_original_account_info(account, info(0, 1_000))
+                        .state_present_account_info(account, info(1, 990 - u64::from(i)))
+                        .revert_account_info(1, account, Some(Some(info(0, 1_000))));
+                }
+                builder = builder
+                    .state_original_account_info(addr(5), info(0, 50))
+                    .state_present_account_info(addr(5), info(0, 60 + u64::from(batch_no)))
+                    .revert_account_info(1, addr(5), Some(Some(info(0, 50))));
+                shards.add(builder.build());
+            }
+            let frozen = shards.freeze();
+            let residual = BundleState::builder(1..=1)
+                .state_original_account_info(wide(2), info(1, 988))
+                .state_present_account_info(wide(2), info(2, 900))
+                .state_present_account_info(addr(8), info(0, 3))
+                .revert_account_info(1, addr(8), Some(None))
+                .build();
+            let graft = || -> Vec<(Address, AccountRevert)> {
+                let revert = |balance| AccountRevert {
+                    account: revm::database::states::reverts::AccountInfoRevert::RevertTo(info(0, balance)),
+                    ..Default::default()
+                };
+                vec![(addr(9), revert(7)), (wide(4), revert(11))]
+            };
+            let (mut serial, _) = frozen.merged_timed(&residual, false);
+            crate::parallel_transfer::append_reverts(&mut serial, graft());
+            let (mut split, timing) = frozen.merged_timed(&residual, true);
+            crate::parallel_transfer::append_reverts(&mut split, graft());
+            assert_eq!(serial.state.len(), 15 + 2, "index {index} live {live}");
+            assert_eq!(split, serial, "index {index} live {live}: split against serial");
+            assert!(timing.total_us >= timing.append_us);
         }
     }
 

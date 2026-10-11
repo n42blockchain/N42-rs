@@ -3886,13 +3886,18 @@ where
                                 (merged, split, 0, 1, merge_at, merge_end, false, late)
                             }
                             None => {
+                                // `N42_MERGE_SPLIT=1`: the account map and the
+                                // revert set at once, on two threads; the same
+                                // bundle (`merged_timed`).
+                                let concurrent = crate::output_shards::merge_split();
                                 let merge_at = std::time::Instant::now();
-                                let (mut merged, split) = shards.merged_timed(&residual.state, false);
+                                let (mut merged, split) = shards.merged_timed(&residual.state, concurrent);
                                 let tail_at = std::time::Instant::now();
                                 crate::parallel_transfer::append_reverts(&mut merged, shard_reverts);
                                 let merge_end = std::time::Instant::now();
                                 let tail_us = merge_end.duration_since(tail_at).as_micros() as u64;
-                                (merged, split, tail_us, 1, merge_at, merge_end, false, None)
+                                let threads = if concurrent { 2 } else { 1 };
+                                (merged, split, tail_us, threads, merge_at, merge_end, false, None)
                             }
                         };
                         let merge_ms = merge_end.duration_since(merge_at).as_millis() as u64;

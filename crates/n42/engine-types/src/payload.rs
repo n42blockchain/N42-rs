@@ -536,6 +536,35 @@ where
     }
 }
 
+/// Hands the sealed block to the early seal's hook as the build's payload
+/// and returns, for the build's own return value, a stand-in under the same
+/// sealed header with an empty body and no senders.
+///
+/// The build's thread finishes the block behind the seal, files it
+/// (`built_executions::complete`), and only returns -- after the phases line,
+/// the cached reads' copy and the drop of every local of a 200k-transaction
+/// build -- well after the own-block hand-off has woken on that `complete`.
+/// A full payload held across that tail was the outside holder that made
+/// the hand-off's move of the body fail (`moved_body=false`) on most loaded
+/// blocks and cost it a copy of the body and senders (`clone_ms` 16-43 ms,
+/// loop351 af): of the hand-offs that began before the build's phases line,
+/// 326 of 334 could not move the body. The stand-in holds no reference to
+/// the block. The build's return is read only when the hook never ran
+/// (`N42PayloadBuilder::build_on_own` answers with the hook's payload
+/// whenever there is one), so no reader sees the stand-in.
+fn hand_out_early(
+    recovered: &Arc<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>>,
+    fees: U256,
+    hook: impl FnOnce(EthBuiltPayload),
+) -> EthBuiltPayload {
+    hook(EthBuiltPayload::new(Arc::clone(recovered), fees, None, None));
+    let stand_in = reth_primitives_traits::RecoveredBlock::new_sealed(
+        SealedBlock::from_sealed_parts(recovered.clone_sealed_header(), Default::default()),
+        Vec::new(),
+    );
+    EthBuiltPayload::new(Arc::new(stand_in), fees, None, None)
+}
+
 /// Where the builder is, for the watchdog: `parent_number << 8 | stage`, 0
 /// when no build is running. Stages: 1 setup, 2 selecting, 3 executing,
 /// 4 finishing, 5 sealing, 6 remembering, 7 payload.
@@ -1917,8 +1946,9 @@ where
             crate::built_executions::remember_pending(block_hash, recovered.clone());
             seal_remember_ms = step_at.elapsed().as_millis() as u64;
             let step_at = std::time::Instant::now();
-            let payload = EthBuiltPayload::new(recovered.clone(), total_fees, None, None);
-            ($hook)(payload.clone());
+            // The hook takes the one full payload; the build keeps a
+            // header-only stand-in for its own return (`hand_out_early`).
+            let payload = hand_out_early(&recovered, total_fees, $hook);
             sealed_instant = Some(std::time::Instant::now());
             sealed_unix_us = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -5542,5 +5572,48 @@ mod depth_two_tests {
             carried_fields_for_seal(&genesis, &block1, None, 2).map(|f| f.state_root),
             Some(alloy_primitives::keccak256(b"depth-two-tests-0xd9"))
         );
+    }
+}
+
+#[cfg(test)]
+mod hand_out_early_tests {
+    use super::{hand_out_early, EthBuiltPayload};
+    use alloy_consensus::Header;
+    use alloy_primitives::{Address, U256};
+    use reth_primitives_traits::{RecoveredBlock, SealedBlock};
+    use std::sync::Arc;
+
+    fn block() -> Arc<RecoveredBlock<n42_tx_types::Block>> {
+        let tx = n42_tx_types::N42TxEnvelope::Eth(reth_ethereum_primitives::TransactionSigned::new_unhashed(
+            reth_ethereum_primitives::Transaction::Legacy(alloy_consensus::TxLegacy { nonce: 1, ..Default::default() }),
+            alloy_primitives::Signature::test_signature(),
+        ));
+        let block = n42_tx_types::Block {
+            header: Header { number: 7, extra_data: b"sealed".as_slice().into(), ..Default::default() },
+            body: alloy_consensus::BlockBody { transactions: vec![tx], ommers: Vec::new(), withdrawals: None },
+        };
+        Arc::new(RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), vec![Address::with_last_byte(1)]))
+    }
+
+    /// The build keeps no reference to the block once the hook's payload is
+    /// gone: the own-block hand-off, the store's slots aside, is then the
+    /// block's last holder and can move its body.
+    #[test]
+    fn the_build_keeps_no_reference_to_the_block_it_handed_out() {
+        let recovered = block();
+        let (send, receive) = std::sync::mpsc::sync_channel::<EthBuiltPayload>(1);
+        let kept = hand_out_early(&recovered, U256::from(3), move |payload| {
+            let _ = send.send(payload);
+        });
+        let handed = receive.recv().expect("the hook's payload");
+        assert!(Arc::ptr_eq(handed.block_arc(), &recovered), "the hook gets the block itself");
+        assert_eq!(handed.recovered_block().senders().len(), 1);
+        drop(handed);
+        assert_eq!(Arc::strong_count(&recovered), 1, "the stand-in the build keeps holds no reference to the block");
+        assert_eq!(kept.block().hash(), recovered.hash(), "the stand-in is under the sealed header");
+        assert!(kept.block().body().transactions.is_empty());
+        assert_eq!(kept.fees(), U256::from(3));
+        // The hand-off's move then succeeds: the last holder unwraps it.
+        assert!(Arc::try_unwrap(recovered).is_ok());
     }
 }

@@ -114,6 +114,13 @@ run() { local tag=$1; shift
   ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; exec env F7_EL_MAP=$EL_MAP python3 scripts/fleet7-runs/memsample.py $STRIP/mem.log $NEL ) > /dev/null 2>&1 & MS=$!
   case $tag in *DPROF) ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; sleep 30; bash scripts/fleet7-offcpu.sh --node 0 --secs 10 $S/offcpu-$tag > $S/offcpu-$tag.run.out 2>&1 ) & ;; esac
   case $tag in *7PROF) ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; sleep 45; F7_BIN=$WT/target/profiling-build/profiling bash scripts/fleet7-profile.sh 0 $S/perf-$tag 10 > $S/perf-$tag.run.out 2>&1 ) & ;; esac
+  case $tag in *X11prof) ( n=0; until grep -q 'first full block at epoch' $S/bench-$tag.out 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 600 ] && exit 0; done; sleep 4
+     p=$(ps -eo pid,args | grep '/n4[2] node' | grep 'rust-fleet7-bench/node0/' | grep -v grep | awk '{print $1}' | head -1); [ -n "$p" ] || { echo "no node0 execution layer"; exit 0; }
+     tids=$(for t in /proc/$p/task/*; do [ "$(cat $t/comm 2>/dev/null)" = n42-build ] && echo ${t##*/}; done | paste -sd,); echo "$tag perf on pid $p, $(echo $tids | tr , '\n' | grep -c .) n42-build threads, from $(date +%H:%M:%S)"
+     [ -n "$tids" ] || tids=""; T=${tids:+-t $tids}; [ -n "$T" ] || T="-p $p"
+     perf record -F 999 -g --call-graph dwarf,16384 $T -o $S/perf-$tag-build.data -- sleep 8; echo "cycles record exit $? at $(date +%H:%M:%S)"
+     perf record -e ls_dmnd_fills_from_sys.dram_io_all -c 200 -e ls_dmnd_fills_from_sys.all -c 2000 -e cycles -c 400000 $T -o $S/perf-$tag-miss.data -- sleep 6; echo "miss record exit $? at $(date +%H:%M:%S)"
+     ) > $S/perf-$tag.run.out 2>&1 & ;; esac
   echo "leg $tag start $(date +%H:%M:%S) load $(awk '{print $1}' /proc/loadavg)"
   local WARG=3; for kv in "$@"; do case "$kv" in F7_WINDOWS_ARG=*) WARG=${kv#*=};; esac; done
   env "$@" timeout -k 30 600 scripts/fleet7-bench.sh --tag "$tag" --windows $WARG --gasceil ${F7_GASCEIL_ARG:-3423000000} --senders ${F7_SENDERS_ARG:-6000} --pertx ${F7_PERTX_ARG:-20000} --conc ${F7_CONC_ARG:-64} --rpcbatch ${F7_RPCBATCH_ARG:-500} ${F7_OFFSET_ARG:+--offset $F7_OFFSET_ARG} ${F7_GASPRICE_ARG:+--gasprice $F7_GASPRICE_ARG} > $S/bench-$tag.out 2>&1; echo "round $tag exit $? at $(date +%H:%M:%S)"; kill $MS 2>/dev/null; wait $MS 2>/dev/null
@@ -810,7 +817,23 @@ case $STAGE in
      b7 D2S12P30T64X11MLP8b $D2 $S1 $S2 $X11 $T64 N42_BUILD_MLP=8 F7_BLOCK_INTERVAL_MS=30
      b7 D2S12P30T64X11MLP16 $D2 $S1 $S2 $X11 $T64 N42_BUILD_MLP=16 F7_BLOCK_INTERVAL_MS=30
      b7 D2S12P30T64X11b $D2 $S1 $S2 $X11 $T64 F7_BLOCK_INTERVAL_MS=30 ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq, ar, as, at, au or av)"; exit 2 ;;
+  aw) mk WARM 7 16; warm_gate WARM
+     # the X11 set at 30 ms pacing on the profiling binary (symbols): perf record on the leader layer's n42-build threads in window 1
+     # (cycles with DWARF call graphs, then the DRAM and all demand fills), to see where the build's memory latency is (docs 10.117)
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     C16="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_SIBLINGS=background N42_CORE_LAYOUT_BEHIND=background"
+     X11="$X10 $C16"
+     # the profiling n42 (target/profiling-build, target-cpu=native) beside the native examples
+     PX=$WT/target/profiling-x11; PN=$WT/target/profiling-build/profiling/n42
+     if [ ! -x $PN ] || [ -n "$(find crates bin -name '*.rs' -newer $PN | head -1)" ]; then echo "no profiling n42 or a source newer than it: the X11prof leg is not run"
+     else mkdir -p $PX; ln -sfn $PN $PX/n42; ln -sfn $NAT/examples $PX/examples
+       b7 D2S12P30T64X11prof $D2 $S1 $S2 $X11 $T64 F7_BIN=$PX F7_BLOCK_INTERVAL_MS=30
+       P=$S/perf-loop351D2S12P30T64X11prof; if [ "${LOOP351_DRY:-0}" != 1 ]; then for k in build miss; do [ -f $P-$k.data ] || continue
+         { for sk in sym,dso comm,sym; do echo "== perf report --sort $sk"; perf report -i $P-$k.data --stdio --no-inline --no-children -g none --sort $sk --percent-limit 0.3 2>/dev/null | grep -v '^$'; done; } > $P-$k.report.txt; echo "perf report: $P-$k.report.txt"; done; fi
+     fi ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq, ar, as, at, au, av or aw)"; exit 2 ;;
 esac
 
 if [ "${LOOP351_DRY:-0}" = 1 ]; then echo "dry run done"; exit 0; fi

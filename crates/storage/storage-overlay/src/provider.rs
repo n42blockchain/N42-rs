@@ -444,6 +444,36 @@ where
         }
         self.basic_account_from_db(address)
     }
+
+    /// N42: the hint as [`Self::basic_account`] would read: an account the execution overlay
+    /// holds is probed there; one a historical fallback would answer is not hinted; anything
+    /// else goes to the registered QMDB reader, which prefetches its index bucket.
+    fn n42_prefetch_account(&self, address: &Address) -> bool {
+        self.n42_prefetch_account_into(address, reth_storage_api::n42_state::reader().map(|(reader, _)| reader))
+    }
+}
+
+impl<Provider, N: NodePrimitives> OverlayStateProvider<Provider, N> {
+    /// The hint of [`AccountReader::n42_prefetch_account`] with the reader given. The
+    /// execution overlay is only probed when already built: a hint never builds it.
+    fn n42_prefetch_account_into(
+        &self,
+        address: &Address,
+        reader: Option<&dyn reth_storage_api::n42_state::N42StateReader>,
+    ) -> bool {
+        if let Some(cached) = self.execution_overlay.get() {
+            if cached.overlay.account(address).is_some() {
+                return true
+            }
+            if cached.historical_fallback.is_some() {
+                return false
+            }
+        }
+        if let Some(reader) = reader {
+            reader.prefetch_account(address);
+        }
+        false
+    }
 }
 
 impl<Provider, N: NodePrimitives> OverlayStateProvider<Provider, N>
@@ -1380,6 +1410,45 @@ mod tests {
             Err(ProviderError::UnsupportedProvider)
         ));
         assert!(state_provider_factory.state_trie_overlay_cache.is_empty());
+    }
+
+    /// N42: the hint on an overlay provider stops at the execution overlay for an account it
+    /// holds and reaches the QMDB reader's prefetch for one it does not.
+    #[test]
+    fn n42_prefetch_hint_reaches_the_reader() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        #[derive(Default)]
+        struct Counting(AtomicU64);
+        impl reth_storage_api::n42_state::N42StateReader for Counting {
+            fn account(&self, _: &Address, _: u64) -> Option<Option<Account>> {
+                None
+            }
+            fn storage(&self, _: &Address, _: &B256, _: u64) -> Option<Option<U256>> {
+                None
+            }
+            fn prefetch_account(&self, _: &Address) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            fn on_state_persisted(&self, _: &[BlockNumHash]) {}
+            fn on_state_unwound(&self, _: u64) {}
+        }
+        let (factory, _) = setup_frontiers(1, 3);
+        let held = Address::with_last_byte(1);
+        let mut execution_overlay = ExecutionOverlay::default();
+        execution_overlay
+            .accounts_mut()
+            .insert(held, Some(AccountInfo { nonce: 1, ..Default::default() }));
+        let provider = OverlayStateProvider::<_, EthPrimitives>::new_with_execution(
+            factory.provider().unwrap(),
+            Arc::new(execution_overlay),
+            false,
+        );
+        let reader = Counting::default();
+        assert!(provider.n42_prefetch_account_into(&held, Some(&reader)));
+        assert_eq!(reader.0.load(Ordering::Relaxed), 0);
+        assert!(!provider.n42_prefetch_account_into(&Address::with_last_byte(2), Some(&reader)));
+        assert_eq!(reader.0.load(Ordering::Relaxed), 1);
+        assert!(!provider.n42_prefetch_account_into(&Address::with_last_byte(2), None));
     }
 
     #[test]

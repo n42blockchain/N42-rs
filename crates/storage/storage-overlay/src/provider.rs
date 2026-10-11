@@ -131,6 +131,10 @@ pub struct OverlayStateProvider<Provider, N: NodePrimitives = EthPrimitives> {
     state_trie_overlay: OnceCell<StateTrieOverlay>,
     state_trie_overlay_with_trie_changesets: OnceCell<StateTrieOverlay>,
     execution_overlay: OnceCell<CachedExecutionOverlay>,
+    /// N42: the QMDB reader's version for this provider's database transaction
+    /// ([`n42_hashed_state_version`]), read once: the transaction's checkpoints do not move
+    /// under it, the same assumption [`Self::execution_overlay`] makes for its frontiers.
+    n42_state_version: OnceCell<Option<u64>>,
     is_v2: bool,
 }
 
@@ -165,6 +169,7 @@ impl<Provider, N: NodePrimitives> OverlayStateProvider<OwnedProvider<Provider>, 
             state_trie_overlay: OnceCell::new(),
             state_trie_overlay_with_trie_changesets: OnceCell::new(),
             execution_overlay: OnceCell::new(),
+            n42_state_version: OnceCell::new(),
             is_v2,
         }
     }
@@ -186,6 +191,7 @@ impl<Provider, N: NodePrimitives> OverlayStateProvider<OwnedProvider<Provider>, 
                 overlay: execution_overlay,
                 historical_fallback: None,
             }),
+            n42_state_version: OnceCell::new(),
             is_v2,
         }
     }
@@ -206,6 +212,7 @@ impl<'a, Provider, N: NodePrimitives> OverlayStateProvider<&'a Provider, N> {
             state_trie_overlay: OnceCell::new(),
             state_trie_overlay_with_trie_changesets: OnceCell::new(),
             execution_overlay: OnceCell::new(),
+            n42_state_version: OnceCell::new(),
             is_v2,
         }
     }
@@ -223,6 +230,7 @@ impl<'a, Provider, N: NodePrimitives> OverlayStateProvider<&'a Provider, N> {
             state_trie_overlay: OnceCell::from(state_trie_overlay.clone()),
             state_trie_overlay_with_trie_changesets: OnceCell::from(state_trie_overlay),
             execution_overlay: OnceCell::new(),
+            n42_state_version: OnceCell::new(),
             is_v2,
         }
     }
@@ -445,11 +453,13 @@ where
 {
     fn basic_account_from_db(&self, address: &Address) -> ProviderResult<Option<Account>> {
         if self.provider().cached_storage_settings().use_hashed_state() {
-            let hashed_address = alloy_primitives::keccak256(address);
             // N42: the latest account comes from a registered QMDB reader
-            // (`on`) or is checked against it (`verify`).
+            // (`on`) or is checked against it (`verify`). The address is hashed
+            // only where a hashed table is read: not on the reader's answer.
             if let Some((reader, mode)) = reth_storage_api::n42_state::reader() &&
-                let Some(version) = n42_hashed_state_version(self.provider().tx())
+                let Some(version) = *self
+                    .n42_state_version
+                    .get_or_init(|| n42_hashed_state_version(self.provider().tx()))
             {
                 match reader.account(address, version) {
                     Some(answer) if mode == reth_storage_api::n42_state::ReadsMode::On => {
@@ -457,6 +467,7 @@ where
                         return Ok(answer)
                     }
                     Some(answer) => {
+                        let hashed_address = alloy_primitives::keccak256(address);
                         let database = self
                             .provider()
                             .tx()
@@ -474,6 +485,7 @@ where
                     format_args!("account {address}"),
                 )))
             }
+            let hashed_address = alloy_primitives::keccak256(address);
             self.provider()
                 .tx()
                 .get_by_encoded_key::<tables::HashedAccounts>(&hashed_address)
@@ -883,7 +895,9 @@ where
             // N42: the latest value comes from a registered QMDB reader
             // (`on`) or is checked against it (`verify`).
             if let Some((reader, mode)) = reth_storage_api::n42_state::reader() &&
-                let Some(version) = n42_hashed_state_version(self.provider().tx())
+                let Some(version) = *self
+                    .n42_state_version
+                    .get_or_init(|| n42_hashed_state_version(self.provider().tx()))
             {
                 match reader.storage(&address, &storage_key, version) {
                     Some(answer) if mode == reth_storage_api::n42_state::ReadsMode::On => {

@@ -541,6 +541,9 @@ struct Inner {
     tree_back: std::sync::Condvar,
     /// `N42_QMDB_COMPUTE_OFFLOCK`, or `set_compute_offlock`.
     compute_offlock: std::sync::atomic::AtomicBool,
+    /// Whether a build on an ancestor of the canonical head is refused
+    /// ([`QmdbNodeState::set_refuse_stale_builds`]).
+    refuse_stale_builds: std::sync::atomic::AtomicBool,
     /// `N42_QMDB_PERSIST_BATCH`, or `set_persist_batch`.
     persist_batch: std::sync::atomic::AtomicBool,
     /// `N42_QMDB_CANONICAL_DEFER`, or `set_canonical_defer`.
@@ -892,6 +895,7 @@ impl QmdbNodeState {
                 compaction_phases: Mutex::new([0; 5]),
                 tree_back: std::sync::Condvar::new(),
                 compute_offlock: std::sync::atomic::AtomicBool::new(compute_offlock_env()),
+                refuse_stale_builds: std::sync::atomic::AtomicBool::new(false),
                 persist_batch: std::sync::atomic::AtomicBool::new(persist_batch_env()),
                 canonical_defer: std::sync::atomic::AtomicBool::new(canonical_defer_env()),
                 deferred_canonicals: Default::default(),
@@ -1231,6 +1235,27 @@ impl QmdbNodeState {
     /// Whether roots are computed on a leased tree (`N42_QMDB_COMPUTE_OFFLOCK`).
     pub fn compute_offlock(&self) -> bool {
         self.inner.compute_offlock.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Refuses builds on an ancestor of the canonical head
+    /// (`QmdbForest::check_build_parent`). Only for a chain with finality,
+    /// where the canonical head follows the committed block and a parent
+    /// below it is a stale request (the HotStuff-2 node sets it); on a chain
+    /// without finality (APoS, the deferred-execution fork tests) a build on
+    /// an older block is a legitimate fork. Off by default.
+    pub fn set_refuse_stale_builds(&self, on: bool) {
+        self.inner.refuse_stale_builds.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether builds on an ancestor of the canonical head are refused.
+    pub fn refuse_stale_builds(&self) -> bool {
+        self.inner.refuse_stale_builds.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The build guard: [`QmdbForest::check_build_parent`] when
+    /// [`Self::refuse_stale_builds`] is on.
+    fn check_build_parent(&self, forest: &QmdbForest, parent: &B256) -> Result<(), StateError> {
+        if self.refuse_stale_builds() { forest.check_build_parent(parent) } else { Ok(()) }
     }
 
     /// Overrides `N42_QMDB_COMPUTE_OFFLOCK` for this state.
@@ -2009,12 +2034,12 @@ impl QmdbNodeState {
         self.with_forest("compute", |forest| forest.compute(parent, changes))
     }
 
-    /// [`Self::compute`] for a block being built: a parent below the
-    /// canonical head is refused before the tree moves
-    /// ([`StateError::StaleBuildParent`], `QmdbForest::check_build_parent`).
+    /// [`Self::compute`] for a block being built: with
+    /// [`Self::set_refuse_stale_builds`] a parent below the canonical head is
+    /// refused before the tree moves ([`StateError::StaleBuildParent`]).
     pub fn compute_build(&self, parent: B256, changes: &BlockChanges) -> Result<PreparedBlock, NodeStateError> {
         self.with_forest("compute", |forest| {
-            forest.check_build_parent(&parent)?;
+            self.check_build_parent(forest, &parent)?;
             forest.compute(parent, changes)
         })
     }
@@ -2030,13 +2055,13 @@ impl QmdbNodeState {
                 parent,
                 parent,
                 ops,
-                |forest| forest.check_build_parent(&parent).err().map(Err),
+                |forest| self.check_build_parent(forest, &parent).err().map(Err),
                 |_, prepared| Ok(Ok(prepared)),
             )?
             .map_err(NodeStateError::from);
         }
         self.with_forest_root("compute_operations", parent, |forest| {
-            forest.check_build_parent(&parent)?;
+            self.check_build_parent(forest, &parent)?;
             forest.compute_operations(parent, ops).map(|prepared| (prepared, Some(0)))
         })
     }

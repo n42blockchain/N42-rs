@@ -325,6 +325,8 @@ fn a_build_on_a_parent_below_the_head_is_refused_and_the_view_stays_valid() {
         let (state, view, hashes) = viewed(if offlock { "view-refuse-offlock" } else { "view-refuse" }, 4);
         state.set_compute_offlock(offlock);
         state.on_persisted(&[(1, hashes[1])]);
+        assert!(!state.refuse_stale_builds(), "off by default: a fork on an older block builds");
+        state.set_refuse_stale_builds(true);
         let refused = state.compute_operations(hashes[1], changes_for(9).operations()).unwrap_err();
         assert!(
             matches!(

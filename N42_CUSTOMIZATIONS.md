@@ -632,3 +632,11 @@
   `N42PlainReverts` / `n42_completed_output`，`database/provider.rs` `save_blocks_inner` 的 plain reverts 与
   `write_state` 的慢路径，`consistent.rs` 六处内存块 changeset 读取；`crates/chain-state/src/in_memory.rs`
   `n42_completed_outcome`（非 lean 通知的拷贝）。未登记的块按原样读取，行为不变。
+
+## 构建批次内的预取（`N42_BUILD_MLP=<k>`，默认关）
+- `crates/n42/engine-types/src/parallel_transfer.rs` `build_mlp` / `set_build_mlp` / `prefetch_hint`，循环在
+  `execute_for_build_opts` 的 `run_batch`：执行第 i 笔前，先转换批次顺序中 k 笔之后的那笔（其池中交易此时读入，
+  `(T, TxEnv)` 存于 k + 1 的环中；发送者被跳过的尾部条目直接丢弃），并对其结果槽、以及发送者和接收者在批次自己
+  账户表中的条目（`batch_state.rs` `BatchState::prefetch_account`，只读探测加 `prefetcht0`）发出预取提示。
+  纯提示，结果不变（测试 `the_build_lookahead_equals_the_plain_build`）；阶段行字段 `par_mlp_k`；上限 256。
+  不触及任何 fork 的 reth crate。说明见 `docs/BREAKTHROUGH_DESIGN.md` 10.117 末段。

@@ -638,6 +638,9 @@ where
     match handed {
         Ok(Ok(true)) => {
             crate::follower_import::note_import_landed();
+            // The hand-off took the build: its pin (`pin_sealed`, set when
+            // its sealed header arrived) is released.
+            n42_engine_types::built_executions::handed_off(built_hash);
             if let (Some(prune), Some(hashes)) = (reuse.prune_pool.clone(), pool_prune_hashes) {
                 let count = hashes.len();
                 let pruned_at = std::time::Instant::now();
@@ -927,6 +930,17 @@ async fn build_on_own_block(
         return Err("unknown build: block access list".to_owned());
     }
     let mut times = BuildOnOwnTimes { decode_ms: decode_at.elapsed().as_millis() as u64, ..Default::default() };
+    // Consensus has sealed the parent: if it is one of this layer's builds it
+    // is pinned in the build store until its own import hands it off, so the
+    // builds that follow cannot evict it first (loop351 stage aj).
+    n42_engine_types::built_executions::pin_sealed(
+        header.parent_hash,
+        header.number,
+        header.state_root,
+        header.receipts_root,
+        header.gas_used,
+        Some(header.transactions_root),
+    );
     // A parent this node did not build -- the previous leader's last block,
     // at a tenure's first build -- is not in the build registry; with the
     // flag it is built on the output this node's follower execution of it

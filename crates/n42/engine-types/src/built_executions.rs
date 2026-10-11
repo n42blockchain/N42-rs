@@ -100,6 +100,17 @@ struct Entry {
     /// accounts the executor changed after it, between [`shards_ready`] and
     /// `StateReady` (dropped then: the full bundle serves every later reader).
     shards: Option<ShardedParent>,
+    /// Consensus sealed this build ([`pin_sealed`]) and its hand-off has not
+    /// taken it yet ([`handed_off`]): never evicted for a newer build. See
+    /// [`make_room_into`] for when a pin is let go.
+    pinned: bool,
+}
+
+/// At most this many pinned builds; past it the oldest pin is let go (with a
+/// WARN), so a pin nothing ever releases cannot grow the store without bound
+/// while the canonical notifications that release pins lag.
+fn max_pinned() -> usize {
+    4 * keep()
 }
 
 /// A build's post-state before its one bundle exists: the batches' output
@@ -157,8 +168,10 @@ fn put(built_hash: B256, entry: Entry) {
 /// left: the same entries in the same order.
 fn put_into(store: &mut VecDeque<(B256, Entry)>, built_hash: B256, entry: Entry) -> Vec<Entry> {
     let mut evicted = Vec::new();
+    let mut entry = entry;
     while let Some(at) = store.iter().position(|(hash, _)| *hash == built_hash) {
         if let Some((_, old)) = store.remove(at) {
+            entry.pinned |= old.pinned;
             evicted.push(old);
         }
     }
@@ -213,26 +226,42 @@ fn free_boxed_off_path(evicted: Box<dyn Send>) {
 /// filed finished beside them, and the oldest finishing build was evicted
 /// for the newest. Keeping a finishing entry costs nothing its finish does
 /// not hold anyway.
+///
+/// A pinned build (sealed by consensus, not yet handed off: [`pin_sealed`])
+/// is never evicted here, and the bound counts unpinned builds only. Without
+/// that, a run of small blocks sealed faster than their imports arrive
+/// evicted a sealed own build before its hand-off, and every validator key's
+/// import of it then failed: the block was never imported and the chain
+/// stopped at it (loop351 stage aj, block 2081: 2082-2084 sealed within
+/// ~100 ms behind it). A pin is let go once the canonical chain reaches its
+/// number without a hand-off ([`release_passed_pins`]), or, past
+/// [`max_pinned`], the oldest first; both say so at WARN.
 #[cfg(test)]
 fn make_room(store: &mut VecDeque<(B256, Entry)>) {
-    while store.len() >= keep() {
-        if let Some(at) = store.iter().position(|(_, entry)| entry.stage == Stage::Complete) {
-            store.remove(at);
-        } else if store.len() >= keep_finishing() {
-            store.pop_front();
-        } else {
-            break;
-        }
-    }
+    let mut evicted = Vec::new();
+    make_room_into(store, &mut evicted);
 }
 
 /// [`make_room`], the evicted entries handed to `evicted` rather than dropped.
 fn make_room_into(store: &mut VecDeque<(B256, Entry)>, evicted: &mut Vec<Entry>) {
-    while store.len() >= keep() {
-        let removed = if let Some(at) = store.iter().position(|(_, entry)| entry.stage == Stage::Complete) {
+    release_passed_pins(store, crate::canonical_head::number());
+    while store.iter().filter(|(_, entry)| entry.pinned).count() >= max_pinned() {
+        let Some((hash, entry)) = store.iter_mut().find(|(_, entry)| entry.pinned) else { break };
+        entry.pinned = false;
+        tracing::warn!(
+            target: "n42.built_executions",
+            number = entry.block.header().number,
+            built_hash = %hash,
+            max_pinned = max_pinned(),
+            "a sealed own build was never handed off and too many are pinned; its pin is let go"
+        );
+    }
+    let unpinned = |store: &VecDeque<(B256, Entry)>| store.iter().filter(|(_, entry)| !entry.pinned).count();
+    while unpinned(store) >= keep() {
+        let removed = if let Some(at) = store.iter().position(|(_, entry)| !entry.pinned && entry.stage == Stage::Complete) {
             store.remove(at)
-        } else if store.len() >= keep_finishing() {
-            store.pop_front()
+        } else if unpinned(store) >= keep_finishing() {
+            store.iter().position(|(_, entry)| !entry.pinned).and_then(|at| store.remove(at))
         } else {
             break;
         };
@@ -242,15 +271,83 @@ fn make_room_into(store: &mut VecDeque<(B256, Entry)>, evicted: &mut Vec<Entry>)
     }
 }
 
+/// Lets go the pins of builds at or below `canonical`: the chain has a block
+/// at that height, and if it were this build its hand-off would have
+/// released the pin. Each is said once at WARN; the build then counts
+/// against [`keep`] like any other.
+fn release_passed_pins(store: &mut VecDeque<(B256, Entry)>, canonical: u64) {
+    for (hash, entry) in store.iter_mut() {
+        if entry.pinned && entry.block.header().number <= canonical {
+            entry.pinned = false;
+            tracing::warn!(
+                target: "n42.built_executions",
+                number = entry.block.header().number,
+                canonical,
+                built_hash = %hash,
+                "the chain passed a sealed own build that was never handed off; its pin is let go"
+            );
+        }
+    }
+}
+
+/// [`release_passed_pins`] on the store, for a caller that knows the chain
+/// reached `canonical` (and for tests, which cannot move the process-wide
+/// canonical head the store reads by itself).
+pub fn release_pins_through(canonical: u64) {
+    let (store, _) = store();
+    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    release_passed_pins(&mut store, canonical);
+}
+
+/// Pins the kept build that consensus sealed under this header's fields
+/// (parent, number, roots, gas, transactions root -- what a seal does not
+/// change): it stays in the store, whatever comes after it, until its
+/// hand-off ([`handed_off`]) or until the chain passes its number. Called
+/// when a sealed header naming one of this layer's builds arrives. Returns
+/// whether a build was pinned.
+pub fn pin_sealed(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> bool {
+    let (store, _) = store();
+    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    if number <= crate::canonical_head::number() {
+        return false;
+    }
+    match store
+        .iter_mut()
+        .rev()
+        .find(|(_, entry)| matches_block(&entry.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
+    {
+        Some((_, entry)) => {
+            entry.pinned = true;
+            true
+        }
+        None => false,
+    }
+}
+
+/// The build's hand-off has taken it: its pin (if any) is released and it
+/// counts against [`keep`] again.
+pub fn handed_off(built_hash: B256) {
+    let (store, _) = store();
+    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((_, entry)) = store.iter_mut().find(|(hash, _)| *hash == built_hash) {
+        entry.pinned = false;
+    }
+}
+
+/// Whether `built_hash` is kept and pinned.
+pub fn is_pinned(built_hash: B256) -> bool {
+    store_get(built_hash).is_some_and(|entry| entry.pinned)
+}
+
 /// Remembers a finished build under the hash the builder gave it.
 pub fn remember(built_hash: B256, execution: BuiltExecution) {
-    put(built_hash, Entry { stage: Stage::Complete, block: execution.block.clone(), execution: Some(execution), shards: None });
+    put(built_hash, Entry { stage: Stage::Complete, block: execution.block.clone(), execution: Some(execution), shards: None, pinned: false });
 }
 
 /// A block sealed before its finish: known from here on, waited for by
 /// whoever needs its state or its execution.
 pub fn remember_pending(built_hash: B256, block: Arc<RecoveredBlock<Block>>) {
-    put(built_hash, Entry { stage: Stage::Sealed, block, execution: None, shards: None });
+    put(built_hash, Entry { stage: Stage::Sealed, block, execution: None, shards: None, pinned: false });
 }
 
 /// The pending build's post-state is final (`execution` carries the bundle;
@@ -1113,7 +1210,7 @@ mod tests {
     fn an_evicted_entry_is_dropped_off_the_lock_and_the_store_is_the_same() {
         use alloy_primitives::U256;
         let block = built(&header(0x31, 1)).block;
-        let entry = |stage: Stage| Entry { stage, block: Arc::clone(&block), execution: None, shards: None };
+        let entry = |stage: Stage| Entry { stage, block: Arc::clone(&block), execution: None, shards: None, pinned: false };
         let mut inline: VecDeque<(B256, Entry)> = VecDeque::new();
         let mut moved: VecDeque<(B256, Entry)> = VecDeque::new();
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
@@ -1276,6 +1373,76 @@ mod tests {
             fail(hash(h));
         }
         fail(hash(&own[1]));
+    }
+
+    /// loop351 stage aj: a full build sealed by consensus, then three small
+    /// builds sealed behind it before its import arrives. Unpinned, the third
+    /// evicted it (keep 3) and its hand-off found nothing; pinned, its
+    /// hand-off still finds it, and once handed off it counts against the
+    /// bound again.
+    #[test]
+    fn a_sealed_build_is_kept_until_its_hand_off_however_many_follow() {
+        let _guard = lock();
+        let first = header(0xD0, 2_000_081);
+        let first_hash = built(&first).block.hash();
+        remember_pending(first_hash, built(&first).block);
+        complete(first_hash, built(&first));
+        assert!(pin_sealed(first.parent_hash, first.number, first.state_root, first.receipts_root, first.gas_used, Some(first.transactions_root)));
+        let small: Vec<Header> = (1..=3u8).map(|i| header(0xD0 + i * 4, 2_000_081 + u64::from(i))).collect();
+        for h in &small {
+            let execution = built(h);
+            let hash = execution.block.hash();
+            remember_pending(hash, execution.block.clone());
+            complete(hash, execution);
+        }
+        for h in &small {
+            let execution = built(h);
+            remember(execution.block.hash(), execution);
+        }
+        assert!(is_pinned(first_hash));
+        let (found, _) = find_by(&first).expect("the hand-off still finds the sealed build");
+        assert_eq!(found, first_hash);
+        handed_off(first_hash);
+        assert!(!is_pinned(first_hash));
+        let next = header(0xF0, 2_000_085);
+        remember(built(&next).block.hash(), built(&next));
+        assert_eq!(stage_of(first_hash), None, "handed off, it is the oldest finished build and goes");
+    }
+
+    /// A pinned build the chain passes without a hand-off (consensus sealed a
+    /// sibling's height, a view changed) is let go and evicted like any other.
+    #[test]
+    fn a_pin_is_let_go_when_the_chain_passes_it() {
+        let _guard = lock();
+        let stuck = header(0xE0, 3_000_010);
+        let stuck_hash = built(&stuck).block.hash();
+        remember(stuck_hash, built(&stuck));
+        assert!(pin_sealed(stuck.parent_hash, stuck.number, stuck.state_root, stuck.receipts_root, stuck.gas_used, Some(stuck.transactions_root)));
+        release_pins_through(3_000_009);
+        assert!(is_pinned(stuck_hash), "the chain is below it");
+        release_pins_through(3_000_010);
+        assert!(!is_pinned(stuck_hash), "the chain reached it");
+        for i in 1..=keep() as u8 {
+            let h = header(0xE0 + i * 4, 3_000_010 + u64::from(i));
+            remember(built(&h).block.hash(), built(&h));
+        }
+        assert_eq!(stage_of(stuck_hash), None, "released, it is evicted");
+    }
+
+    /// Pins are bounded: past `max_pinned` the oldest pin is let go.
+    #[test]
+    fn pins_are_bounded() {
+        let _guard = lock();
+        let heads: Vec<Header> = (0..=max_pinned() as u8).map(|i| header(0x10 + i * 4, 4_000_000 + u64::from(i))).collect();
+        for h in &heads {
+            remember(built(h).block.hash(), built(h));
+            assert!(pin_sealed(h.parent_hash, h.number, h.state_root, h.receipts_root, h.gas_used, Some(h.transactions_root)));
+        }
+        let extra = header(0xFC, 4_000_100);
+        remember(built(&extra).block.hash(), built(&extra));
+        let pinned = heads.iter().filter(|h| is_pinned(built(h).block.hash())).count();
+        assert!(pinned < max_pinned(), "{pinned} pins kept");
+        assert!(!is_pinned(built(&heads[0]).block.hash()), "the oldest pin went first");
     }
 
     #[test]

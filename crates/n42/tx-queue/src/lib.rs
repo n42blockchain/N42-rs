@@ -338,6 +338,18 @@ fn forget_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
+/// The pool the frame planner's checks run on ([`plan_parallel_over`]):
+/// the queue's own [`forget_pool`], whose other user (the forget's
+/// partition) runs under the lanes' lock as the live planner does, so the
+/// two never meet, and no executing block's work stands in front of a plan.
+/// The global pool when the threads could not be started.
+fn in_plan_pool<R: Send>(job: impl FnOnce() -> R + Send) -> R {
+    match forget_pool() {
+        Some(pool) => pool.install(job),
+        None => job(),
+    }
+}
+
 /// Where [`TxQueue::forget_mined_timed`] spent its time, in microseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ForgetTimes {
@@ -3750,7 +3762,18 @@ impl<T: PoolTransaction> TxQueue<T> {
         let mut times = FrameSelectTimes::default();
         let (segments, plan, gas_left) = inner.plan_frames(gas_limit, &mut times, SelectMode::Parallel);
         let serial_took = inner.last_build.as_ref().is_some_and(|(_, taken)| !taken.is_empty());
-        if serial_took || plan.frames.is_empty() || inner.pending.len() != segments.len() {
+        // `N42_FRAME_SWEEP_AT_TAKE`: stored in this hold, its takes settled
+        // here, as the plan whose serial part took always was before the
+        // sweep (the dead frames in the parallel window sent every plan to
+        // the serial part). Its takes left noted for a second hold raced the
+        // build start, the hand-off and the prune that follow a take: loop351
+        // stage am (`X9FS2`) refused 1,678 commits and planned 760 a third
+        // time, late for half the builds, where the control raced none.
+        if serial_took
+            || plan.frames.is_empty()
+            || inner.pending.len() != segments.len()
+            || inner.frames.sweep_at_take
+        {
             let made = inner.store_prepared(current, segments, plan, gas_left, gas_limit, at, hook.is_some(), &mut body_job);
             drop(inner);
             garbage.free();
@@ -5071,8 +5094,14 @@ fn plan_parallel_over<T: PoolTransaction, S: PlanSource<T>>(
         reach = reach.saturating_add(gas);
         end += 1;
     }
-    let checks: Vec<frames::RunCheck<T>> =
-        ids[..end].par_iter().with_min_len(4).map(|id| src.check_runs(id)).collect();
+    // On the queue's own pool ([`plan_pool`]), not the global one: a plan
+    // made while a block executes waited for the global pool's workers --
+    // loop351 stage am (`X9FS2`, the frame sweep on, so the checked window
+    // is live frames): `start_walk_check_us` p90 8.4 ms, max 152 ms, for a
+    // check of 400 frames.
+    let checks: Vec<frames::RunCheck<T>> = in_plan_pool(|| {
+        ids[..end].par_iter().with_min_len(4).map(|id| src.check_runs(id)).collect()
+    });
     // Senders some run needs entries below it taken of, and each frame's
     // runs of those senders: what the decisions below count.
     let shared: AddressHashSet = checks
@@ -5086,7 +5115,8 @@ fn plan_parallel_over<T: PoolTransaction, S: PlanSource<T>>(
     let draws: Vec<Vec<(u32, Address, u32)>> = if shared.is_empty() {
         Vec::new()
     } else {
-        ids[..end]
+        in_plan_pool(|| {
+            ids[..end]
             .par_iter()
             .zip(checks.par_iter())
             .map(|(id, check)| match check {
@@ -5100,6 +5130,7 @@ fn plan_parallel_over<T: PoolTransaction, S: PlanSource<T>>(
                 _ => Vec::new(),
             })
             .collect()
+        })
     };
     times.check_us = check_at.elapsed().as_micros() as u64;
     let mut taken_of: AddressHashMap<u64> = AddressHashMap::default();

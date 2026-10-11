@@ -663,3 +663,88 @@ fn with_the_sweep_every_prepared_plan_is_used_and_skips_nothing() {
         assert_chain_valid(&blocks);
     }
 }
+
+/// The production shape (the flood's, `offlock_tests::flood`): `rounds`
+/// rounds of one nonce for each of `senders` senders, in frames of `width`
+/// distinct senders (1.0 scale: 200,000 senders, 12 rounds, 500 a frame =
+/// 2.4M queued; a 200k block is one round), the queue off-lock with the
+/// frame sweep on.
+fn production_queue(senders: u64, rounds: u64, width: usize, sweep: bool) -> TxQueue<EthPooledTransaction> {
+    let queue: TxQueue<EthPooledTransaction> =
+        TxQueue::new().with_offlock(false).with_frame_sweep_at_take(sweep).with_hash_index(4_000_000);
+    crate::offlock_tests::flood(&queue, senders, 0, rounds, width);
+    // Drained in one hold (the off-lock drain leaves a remainder for a
+    // drainer thread), then off-lock as in production.
+    queue.drain_now();
+    queue.with_offlock(true)
+}
+
+/// Keeps every worker of the global rayon pool busy for `ms`, as an
+/// executing block does.
+fn busy_global_pool(ms: u64) {
+    for _ in 0..rayon::current_num_threads() {
+        rayon::spawn(move || std::thread::sleep(std::time::Duration::from_millis(ms)));
+    }
+    // Let the jobs start.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+}
+
+/// A take, then the one preparation that follows it, while the global pool
+/// is busy: the plan is full, and neither the build's walk nor the
+/// preparation waits for the pool. Returns (walk us, preparation us).
+fn take_then_prepare(senders: u64, rounds: u64, width: usize, sweep: bool) -> (u64, u64) {
+    let queue = production_queue(senders, rounds, width, sweep);
+    let block = senders;
+    let gas = block * 21_000;
+    busy_global_pool(1_000);
+    let at = std::time::Instant::now();
+    let (mut best, plan, times) = queue.frames_for_build_ahead(block_hash(0), gas, SelectMode::Parallel, false);
+    let walk_us = at.elapsed().as_micros() as u64;
+    assert_eq!(plan.tx_count() as u64, block);
+    assert_eq!(times.frames_index as u64, senders * rounds / width as u64);
+    // The take leaves the lanes first, as the settling thread does before
+    // it prepares.
+    let at = std::time::Instant::now();
+    drop(queue.lock_inner_quiet());
+    let settle_us = at.elapsed().as_micros() as u64;
+    let at = std::time::Instant::now();
+    assert!(queue.prepare_next_in(gas, SelectMode::Parallel));
+    let prepare_us = at.elapsed().as_micros() as u64;
+    eprintln!("sweep {sweep}: walk {walk_us} us, settle {settle_us} us, prepare {prepare_us} us");
+    let prepared = queue.lock_inner_quiet().prepared.as_ref().map(|p| (p.plan.tx_count() as u64, p.plan.skipped));
+    assert_eq!(prepared.map(|(count, _)| count), Some(block));
+    if sweep {
+        assert_eq!(prepared.map(|(_, skipped)| skipped), Some(0));
+    }
+    assert_eq!(best.by_ref().count() as u64, block);
+    (walk_us, prepare_us)
+}
+
+/// The production shape at a small scale (24k queued, 2k blocks, frames of
+/// 50): with the
+/// global pool busy for a second, the walk and the preparation take well
+/// under it.
+#[test]
+fn the_plan_prepared_after_a_take_is_full_and_does_not_wait_for_the_global_pool() {
+    let (walk_us, prepare_us) = take_then_prepare(2_000, 12, 50, true);
+    eprintln!("walk {walk_us} us, prepare {prepare_us} us");
+    assert!(walk_us < 300_000 && prepare_us < 300_000, "walk {walk_us} us, prepare {prepare_us} us");
+}
+
+/// The same at the production scale (2.4M queued in 500-transaction frames,
+/// a 200k take), against the queue without the sweep: the walk stays a few
+/// ms with the global pool busy, and the preparation (its own settle of the
+/// 200k take included) costs what it did without the sweep.
+/// `cargo test --release -p n42-tx-queue --lib -- --ignored
+/// the_plan_prepared_after_a_200k_take --nocapture`. Measured 2026-10-11 on
+/// eight throttled cores: walk 6.0 / 6.1 ms (on / off), the take's settle
+/// 30 / 28 ms, the preparation 54 / 59 ms.
+#[test]
+#[ignore = "2.4M transactions; run with --release"]
+fn the_plan_prepared_after_a_200k_take_of_a_2_4m_queue_is_full_and_fast() {
+    let (off_walk, off_prepare) = take_then_prepare(200_000, 12, 500, false);
+    let (walk_us, prepare_us) = take_then_prepare(200_000, 12, 500, true);
+    assert!(walk_us < 50_000, "walk {walk_us} us");
+    assert!(walk_us <= off_walk * 3 / 2 + 5_000, "walk {walk_us} us against {off_walk} us without the sweep");
+    assert!(prepare_us <= off_prepare * 3 / 2 + 5_000, "prepare {prepare_us} us against {off_prepare} us without the sweep");
+}

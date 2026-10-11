@@ -1147,6 +1147,18 @@ pub struct EarlyOutput {
 }
 
 impl EarlyOutput {
+    /// Whether a batch wrote `address`: [`Self::account`]'s probes (the
+    /// part's index, then the batch map or the conflicts map it names)
+    /// without the sum or the copy -- the hint path (`N42_BUILD_MLP`).
+    pub fn holds(&self, address: &Address) -> bool {
+        let Some(part) = self.parts.get(shard_index(address, self.parts.len())) else { return false };
+        match part.index.get(address) {
+            None => false,
+            Some(&CONFLICT) => part.multi.contains_key(address),
+            Some(&id) => self.batches.get(id as usize).is_some_and(|batch| batch.contains_key(address)),
+        }
+    }
+
     /// The account `address` as the frozen set will hold it: the one batch
     /// that wrote it, or the first writer's with every other one's change
     /// added (`add_delta`).
@@ -2134,6 +2146,16 @@ impl FrozenShards {
         }
     }
 
+    /// Whether the batches wrote `address`, early or frozen, by the probes
+    /// [`Self::read_account`] makes and nothing more (no sum, no copy): the
+    /// probe is the prefetch of the hint path (`N42_BUILD_MLP`).
+    pub fn holds_hint(&self, address: &Address) -> bool {
+        match &self.early {
+            Some(early) => early.holds(address),
+            None => self.get(address).is_some(),
+        }
+    }
+
     /// The shards folded into one map after all, for a build that needs the
     /// block's state in its executor (a serial loop, a cache-reading finish):
     /// installed by `install_staged` exactly as a streamed graft is.
@@ -2618,6 +2640,12 @@ impl AccountReader for ShardLayer {
             Some(account) => Ok(account.info.as_ref().map(Into::into)),
             None => self.historical.basic_account(address),
         }
+    }
+
+    /// The shard's probes for `address` as the hint (`N42_BUILD_MLP`); passed
+    /// beneath when the shards do not hold it.
+    fn n42_prefetch_account(&self, address: &Address) -> bool {
+        self.shards.holds_hint(address) || self.historical.n42_prefetch_account(address)
     }
 }
 

@@ -29,6 +29,12 @@ impl N42StateReader for QmdbStateReader {
         self.state.read_view_ref()?.storage(address, slot, version)
     }
 
+    fn prefetch_account(&self, address: &Address) {
+        if let Some(view) = self.state.read_view_ref() {
+            view.prefetch_account(address);
+        }
+    }
+
     fn on_state_persisted(&self, blocks: &[BlockNumHash]) {
         let blocks: Vec<(u64, B256)> = blocks.iter().map(|block| (block.number, block.hash)).collect();
         self.state.on_persisted(&blocks);

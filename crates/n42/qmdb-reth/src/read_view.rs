@@ -498,6 +498,16 @@ impl QmdbReadView {
         }
     }
 
+    /// A hint that the account at `address` will be read soon: its key
+    /// derived as [`Self::account`] derives it and the index's bucket line
+    /// for it prefetched (`SharedOffsetIndex::prefetch`, only when the
+    /// shard's read lock is free). The entry file's record is not: its offset
+    /// is in that bucket, which is the miss being hinted. No reader slot is
+    /// taken and no counter moves. Returns whether the hint was issued.
+    pub fn prefetch_account(&self, address: &Address) -> bool {
+        self.index.prefetch(&gov5_account_key(&address.0 .0))
+    }
+
     /// A storage slot as of block `at`; `Some(None)` for a zero (absent) slot.
     pub fn storage(&self, address: &Address, slot: &B256, at: u64) -> Option<Option<U256>> {
         match self.read_at(&gov5_storage_key(&address.0 .0, &slot.0), at, U256::try_from_be_slice)? {
@@ -857,6 +867,71 @@ mod tests {
     /// every depth its journals reach, for keys the blocks changed (some
     /// several times), keys they never changed and keys that do not exist;
     /// and the filters skip journals.
+    /// `prefetch_account` is a hint: for a key the view holds and one it does
+    /// not, at the head and behind it, every read answers as before and no
+    /// counter of the calling thread moves (journal walks, slot and index
+    /// waits).
+    #[test]
+    fn the_account_hint_changes_no_read_and_no_counter() {
+        use n42_twig_core::qmdb_compat::GOV5_EMPTY_CODE_HASH;
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("n42-view-hint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("entries.log");
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&path).expect("the entry file"));
+        let mut offset = 0u64;
+        let address = |i: u64| Address::from_slice(&alloy_primitives::keccak256(i.to_be_bytes())[12..]);
+        let mut put = |file: &mut std::io::BufWriter<std::fs::File>, i: u64, nonce: u64| {
+            let key = gov5_account_key(&address(i).0 .0);
+            let value = encode_gov5_account_value(nonce, &U256::from(nonce).to_be_bytes::<32>(), &GOV5_EMPTY_CODE_HASH);
+            file.write_all(&key).expect("write");
+            file.write_all(&(value.len() as u32).to_le_bytes()).expect("write");
+            file.write_all(&value).expect("write");
+            let at = offset;
+            offset += 36 + value.len() as u64;
+            (key, at)
+        };
+        let keys = 1_000u64;
+        let live: Vec<(Hash, u64)> = (0..keys).map(|i| put(&mut file, i, 1)).collect();
+        let mut changes: Vec<(Hash, Option<u64>)> = (0..keys)
+            .step_by(3)
+            .map(|i| {
+                let (key, at) = put(&mut file, i, 2);
+                (key, Some(at))
+            })
+            .collect();
+        changes.sort_unstable_by_key(|(key, _)| *key);
+        file.flush().expect("flush");
+        drop(file);
+        let view = QmdbReadView::build(&path, (1, B256::ZERO), live).expect("the view");
+        let raised = view.raise_floor(&changes);
+        view.advance(2, B256::with_last_byte(2), &changes, raised);
+        // Present keys and absent ones (`keys..keys + 200`), at the head (2)
+        // and one block behind it (1).
+        let reads = |view: &QmdbReadView| -> Vec<_> {
+            (0..keys + 200).flat_map(|i| [view.account(&address(i), 2), view.account(&address(i), 1)]).collect()
+        };
+        let before = reads(&view);
+        assert!(before.iter().all(Option::is_some), "the view answers");
+        assert!(before.iter().any(|a| matches!(a, Some(None))), "absent keys are read too");
+        let counters = || (JOURNAL_LOCAL.with(std::cell::Cell::get), ViewLockWaits::now());
+        let (journal, waits) = counters();
+        let mut issued = 0;
+        for i in 0..keys + 200 {
+            issued += usize::from(view.prefetch_account(&address(i)));
+        }
+        let (journal_after, waits_after) = counters();
+        assert_eq!(issued as u64, keys + 200, "an uncontended index takes every hint");
+        assert_eq!(journal, journal_after, "no journal walk counted");
+        assert_eq!(
+            (waits.slot_waits, waits.index_waits),
+            (waits_after.slot_waits, waits_after.index_waits),
+            "no lock wait counted"
+        );
+        assert_eq!(before, reads(&view), "every read answers as before");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn journal_filters_change_no_answer() {
         use n42_twig_core::qmdb_compat::GOV5_EMPTY_CODE_HASH;

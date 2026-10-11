@@ -169,6 +169,21 @@ impl<N: NodePrimitives> AccountReader for MemoryOverlayStateProviderRef<'_, N> {
 
         self.historical.basic_account(address)
     }
+
+    /// N42: the read's walk as a hint -- the blocks' filters and bundle maps probed
+    /// newest first (the probes are the prefetch), stopping at the block that holds the
+    /// account, else passed to `historical`. No counter is recorded.
+    fn n42_prefetch_account(&self, address: &Address) -> bool {
+        let key = FilterKey::address(address);
+        for (index, block) in self.in_memory.iter().enumerate() {
+            if overlay_filter::may_hold_account(self.filter(index), key) &&
+                block.execution_output.state.state.contains_key(address)
+            {
+                return true;
+            }
+        }
+        self.historical.n42_prefetch_account(address)
+    }
 }
 
 impl<N: NodePrimitives> StateRootProvider for MemoryOverlayStateProviderRef<'_, N> {

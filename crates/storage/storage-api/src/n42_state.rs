@@ -52,6 +52,11 @@ pub trait N42StateReader: Send + Sync + 'static {
     /// `Some(None)` for a zero slot.
     fn storage(&self, address: &Address, slot: &B256, version: BlockNumber) -> Option<Option<U256>>;
 
+    /// A hint that the account at `address` will be read soon: the reader may prefetch
+    /// what the read will touch first. Changes no answer and no counter, takes no lock
+    /// a read would wait on. The default does nothing.
+    fn prefetch_account(&self, _address: &Address) {}
+
     /// The hashed state of `blocks` (ascending) was written, ahead of its commit.
     fn on_state_persisted(&self, blocks: &[BlockNumHash]);
 

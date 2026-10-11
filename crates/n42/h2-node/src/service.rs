@@ -281,6 +281,9 @@ pub struct H2Service<E> {
     /// Set where imports are observed, which is a sync path, and acted on in
     /// the step, which is not.
     prepare_on: Option<B256>,
+    /// The highest block number consensus has committed here: a build ahead
+    /// on a parent below it is stale ([`stale_build_parent`]).
+    committed_height: Option<u64>,
     /// Whether to start a build before this node is leader. Off by default:
     /// it is a change to when the execution layer is asked for a payload, and
     /// the first measurement of it was a fourfold regression rather than the
@@ -1179,6 +1182,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             body_pushers: None,
             always_publish_topic: std::env::var("N42_BLOCK_TOPIC_ALWAYS").is_ok(),
             prepare_on: None,
+            committed_height: None,
             prepare_ahead: false,
             defer_reason: None,
             header_profile: HeaderProfile::Ethereum,
@@ -2587,6 +2591,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // it, and gov5 waits for a peer at or above its own height.
                 if let Some(number) = self.block_numbers.get(&block_hash).copied() {
                     self.transport.set_advertised_height(number);
+                    self.committed_height = Some(self.committed_height.map_or(number, |height| height.max(number)));
                 }
                 self.loop_spend.open(view);
                 events.push(ServiceEvent::Committed {
@@ -2726,6 +2731,25 @@ impl<E: ExecutionLayer> H2Service<E> {
             info!(target: "n42.h2.node", ?parent, next, "no build ahead: the parent's header is not remembered");
             return;
         };
+        if let Some(committed) = stale_build_parent(header.number, self.committed_height) {
+            // The import that set `prepare_on` completes behind the votes:
+            // with imports pipelined (a block is checked and voted on before
+            // its execution lands) the block whose import just finished can
+            // be two or three heights below what consensus has committed
+            // (loop351 X9j: 1020's import landed at the handover to view
+            // 1024, with 1023 committed). A build there is a sibling of a
+            // committed block; the execution layer refuses it, or reverts
+            // its state tree to compute it.
+            warn!(
+                target: "n42.h2.node",
+                ?parent,
+                parent_number = header.number,
+                committed,
+                next,
+                "no build ahead: the parent is below the committed height"
+            );
+            return;
+        }
         let context = ProposalContext {
             view: next,
             preparing: true,
@@ -4738,8 +4762,24 @@ fn body_request_grace() -> Duration {
     }))
 }
 
+/// The committed height when a build on a parent at `parent_number` would
+/// fork below it, `None` when the parent is at or above it (or nothing is
+/// committed yet).
+fn stale_build_parent(parent_number: u64, committed: Option<u64>) -> Option<u64> {
+    committed.filter(|&committed| parent_number < committed)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_build_ahead_below_the_committed_height_is_stale() {
+        use super::stale_build_parent;
+        assert_eq!(stale_build_parent(1020, Some(1023)), Some(1023), "loop351 X9j's handover");
+        assert_eq!(stale_build_parent(1023, Some(1023)), None, "the committed block is the parent");
+        assert_eq!(stale_build_parent(1024, Some(1023)), None, "an own block above it");
+        assert_eq!(stale_build_parent(5, None), None, "nothing committed yet");
+    }
+
     #[test]
     fn far_ahead_blocks_parse() {
         use super::{far_ahead_blocks_from as f, FAR_AHEAD_BLOCKS};

@@ -833,7 +833,18 @@ case $STAGE in
        P=$S/perf-loop351D2S12P30T64X11prof; if [ "${LOOP351_DRY:-0}" != 1 ]; then for k in build miss; do [ -f $P-$k.data ] || continue
          { for sk in sym,dso comm,sym; do echo "== perf report --sort $sk"; perf report -i $P-$k.data --stdio --no-inline --no-children -g none --sort $sk --percent-limit 0.3 2>/dev/null | grep -v '^$'; done; } > $P-$k.report.txt; echo "perf report: $P-$k.report.txt"; done; fi
      fi ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq, ar, as, at, au, av or aw)"; exit 2 ;;
+  ax) mk WARM 7 16; warm_gate WARM
+     # the X11 set at 30 ms pacing after the provider read-path fixes (2e9387835, 5b33e8d33, ce8aa472d): controls and N42_BUILD_MLP=16 alternating
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     C16="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_SIBLINGS=background N42_CORE_LAYOUT_BEHIND=background"
+     X11="$X10 $C16"
+     b7 D2S12P30T64X11c $D2 $S1 $S2 $X11 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11MLP16b $D2 $S1 $S2 $X11 $T64 N42_BUILD_MLP=16 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11d $D2 $S1 $S2 $X11 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11MLP16c $D2 $S1 $S2 $X11 $T64 N42_BUILD_MLP=16 F7_BLOCK_INTERVAL_MS=30 ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq, ar, as, at, au, av, aw or ax)"; exit 2 ;;
 esac
 
 if [ "${LOOP351_DRY:-0}" = 1 ]; then echo "dry run done"; exit 0; fi

@@ -3588,3 +3588,22 @@ Every bodygate passed; no stale-build refusal or skipped build-ahead was needed 
 - The 1,543 full builds of the control against 1,871-1,904 for the sweep legs are the same 90 s: the sweep legs sealed 20% more blocks.
 
 Next: pacing 25 and 28 ms on the X10 set with repeats (the tick is no longer the floor, so the layer's per-block rate is what the next cut must shorten: seal 32-35 ms, state ready at +150, the merge 92 ms, and the 35 ms tick's replacement), and a warm-host repeat once the tmpfs files are gone.
+
+### 10.112 loop351 stage ao — pacing 25, 28, 30 and 35 ms read the same 4.2-4.26M window 1 at a 47 ms cycle: the pacing is out of the picture, the seal chain is the floor of the median and the tail is the mean
+
+Stage ao ran the X10 set (10.111) at four pacings on tree b90dae8cc, the same host (pool 27-29 GB):
+
+| pacing | w1 | w2 | w3 | round | cycle (every window) | cycle median w1 | sealed_at w1 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 25 | 4.26 | 4.03 | 3.97 | 367.9M | 47-50 | 37.4 | 32 |
+| 25 (b) | 4.23 | 3.79 | 3.33 | 340.4M | 47-60 | 38.8 | 33 |
+| 28 | 4.25 | 3.95 | 3.83 | 361.0M | 47-52 | -- | -- |
+| 28 (b) | 4.26 | 3.97 | 4.06 | 368.5M | 47-50 | 36.5 | 32 |
+| 30 (c) | 4.20 | 3.95 | 3.83 | 359.6M | 48-52 | -- | -- |
+| 35 (c) | 4.23 | 3.90 | 4.04 | 365.0M | 47-51 | -- | -- |
+
+Window 1 is 4.20-4.26M at every pacing (the window-1 record is now 4.258M, at 25 ms) and the round 360-368M except one leg whose window 3 fell to 3.33M (the usual host tail). The cycle's median is 36.5-38.8 ms whatever the tick, equal to `sealed_at_ms` + ~5: the next proposal follows the build's seal, and the build takes 32-33 ms from its start (the parent's early seal) to its own seal. The mean, which sets the throughput, is 47-50: the tail of late seals (`sealed_at` p90 49, p99 79) and of the blocks that wait for the grandparent's fields.
+
+The seal chain, accounted on the best 30 ms leg (1300176a0 adds the timers): the deferred state's open 2 ms (p99 13), the parallel execution of the 200k transfers 16 ms (p90 21, p99 48), the seal itself 4.5 ms (its frame layout and transactions root now come with the plan under `N42_PLAN_AHEAD_PARTS=1`, 298148214), and the wait for the grandparent's state and receipts roots (0 at p50, 11 at p90, 41 at p99: a depth-2 build needs the grandparent's execution complete, and its QMDB root lands ~71 ms after its seal, so at a cycle of ~36 ms the root's latency becomes the chain). The fold runs behind the seal. The execution's tail is half major faults (page-cache reclaim, in clusters) and half a 2-2.6x CPU slowdown of every batch with no waits or lock time when block N-1's QMDB root (global rayon pool) or merge runs during N's batches: cores and memory bandwidth, not a shared pool. Stage ap tests the plan-ahead parts and `N42_CORE_LAYOUT=isolate` with 64 build cores (siblings idle) at 30 ms.
+
+Where 5M stands: 200k per 40 ms mean. The median is at 37; the mean must lose 8-10 ms of tail, and the median a few more. The levers, in order: the execution's contention (isolate), the grandparent-root wait (a faster root, or a deeper pipeline), the major-fault clusters (the host), then the execution itself (16 ms for 200k transfers on 64 threads).

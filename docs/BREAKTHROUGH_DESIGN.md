@@ -3648,3 +3648,21 @@ Where the 200 ms goes, median after the seal: the tree lease wait and the root's
 ### 10.115 loop351 stage ar — void: the merge-split legs died on a script variable, the control was disturbed, and every window 2-3 of the run sits below stage aq
 
 Stage ar (tree fab7367bc, X10 at 30 ms) was to re-measure the answer-latency cuts of 10.114. Its three `N42_MERGE_SPLIT` legs died at launch (`env: '334382': No such file`: the arm's `MS` variable overwrote the runner's memsample pid, fixed by renaming it in 80040e4e6), and its control X10f read 3.57 / 2.58 / 2.17 with 172 `an own block was still held when the bound was reached; its transactions are lost to the queue` warnings in the first-full-block minute, 184 plan-wait timeouts and a box load of 15 from something outside the fleet. The legs that ran: S3 4.12 / 3.69 / 3.56 (341.0M), AAI 4.06 / 3.84 / 3.55 (343.6M), S3+AAI 4.03 / 3.78 / 3.56 (341.0M), F2 4.28 / 3.82 / 3.57 (350.0M). Window 1 is at the X10 level (F2's 4.28 ties the record) but every window 3 of the run is 3.55-3.57 where stage aq's controls read 4.02-4.23 on the same configuration an hour earlier, so the run carries a common disturbance and says nothing about the cuts. Stage as repeats them with a fresh control: X10g, MS x2, MS+AAI x2, MS+AAI+F2, MS+AAI+CRIT16.
+
+### 10.116 loop351 stage as — the answer-latency cuts do lower the latency and lose the leg: the build's seal is elastic and pays for every thread added beside it
+
+Stage as (tree 80040e4e6, X10 at 30 ms, pool 26-28 GB, all gates passed):
+
+| leg | w1 | w2 | w3 | round | cycle median / mean w1 | sealed_at p50 / p90 | seal -> state ready | seal -> answer | ready -> answer |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X10g, control | 4.23 | 3.92 | 4.01 | 365.0M | 36.5 / 47.3 | 33 / 50 | 157 | 199 | 41 |
+| X10MS (`N42_MERGE_SPLIT=1`, merge_threads=2) | 4.15 | 3.73 | 3.57 | 343.6M | 39.7 / 48.2 | 39 / 77 | 133 | 180 | 44 |
+| X10MSb | 3.83 | 3.56 | 3.86 | 337.6M | | | | | |
+| X10MSAAI (+ `N42_ANSWER_AT_INSERT=1`) | 4.15 | 3.64 | 3.60 | 341.6M | 42.8 / 48.3 | 40 / -- | 146 | 170 | 20 |
+| X10MSAAIb | 3.93 | 3.73 | 3.54 | 336.0M | | | | | |
+| X10MSAAIF2 (+ `N42_FAR_AHEAD_BLOCKS=2`, outputs kept 6) | 2.38 | 2.24 | 2.09 | 201.1M | 56.4 / 69.1 | 56 / -- | 68 | 78 | 10 |
+| X10MSAAIC16 (MS + AAI + the 16-core critical set) | 4.09 | 3.91 | 3.83 | 354.8M | | | | | |
+
+The cuts do what they say to the latency: the two-thread merge brings state ready from 157 to 133 ms after the seal and the answer from 199 to 180; answer-at-insert takes another 10-24 off the answer (ready -> answer 41 -> 20). And the legs lose. The reason is in the build: with the merge's second thread (and the answer's side task) running beside the next block's build, `sealed_at_ms` goes 33 -> 39-40 at p50 and 50 -> 77 at p90, `par_exec` p90 21 -> 34, the root 59 -> 86 at p90, and the gap median -- which is the seal plus 3-5 ms -- rises from 36.5 to 39.7 (MS) and 42.8 (MS+AAI). The 19-29 ms taken off the answer were worth 5-7 ms of cycle under the four-block model and the build gave 3-6 ms of median plus a longer tail back; the mean did not move (47.3 -> 48.2 / 48.3) and windows 2-3 fell. With five blocks in flight (F2) the layer breaks down to half-size blocks at a 56 ms seal; not understood and not pursued. The 16-core critical set recovers part of it (354.8M) but stays under the control.
+
+What this says, with 10.113 (idle siblings gave the execution 13 ms and starved the rest) and 10.114 (nothing is saturated, the tree lease is busy 50-70%): the layer's blocks are not latency-bound and not lock-bound; they are bound by the CPU the build's 64-thread execution can get in its 16 ms while the previous blocks' root, merge, persistence and the ingest run beside it on the same 208 CPUs. Every cut that adds a thread next to the build is paid for by the build. The next lever is therefore the CPU each block costs, not the latency of its stages: the ingest's share (the tokio runtime's 16 workers ran at 16 CPUs flat in window 1, 4.1M transactions a second recovered and queued), the root's 16 threads x 31 ms, the merge's 96 ms, the persistence; and then the build itself. A per-block CPU budget of the layer under load is the measurement to make before the next cut.

@@ -4583,17 +4583,7 @@ impl<T: PoolTransaction> Inner<T> {
     /// height the chain settled elsewhere comes back -- and nothing would
     /// remove it a second time.
     fn give_back(&mut self, taken: Vec<Arc<ValidPoolTransaction<T>>>) -> GaveBack {
-        // `N42_FRAME_SWEEP_AT_TAKE`: a take coming back whole brings its
-        // frames back to the live index (each found by its first hash; a
-        // mined one is swept again by the next prune). A frame only partly
-        // returned stays aside: its transactions are frameless at their
-        // lanes, and the slow puller and the per-transaction check take
-        // them, as before.
-        if self.frames.retired_len() > 0 {
-            for valid in &taken {
-                self.frames.revive_by_first(valid.hash());
-            }
-        }
+        let revive = self.frames.retired_len() > 0;
         let mut senders: Vec<Address> = Vec::new();
         let mut unparked: Vec<Address> = Vec::new();
         let mut gave = GaveBack::default();
@@ -4612,6 +4602,15 @@ impl<T: PoolTransaction> Inner<T> {
                 continue;
             }
             gave.offered += 1;
+            // `N42_FRAME_SWEEP_AT_TAKE`: a take coming back whole brings its
+            // frames back to the live index, each found by its first hash
+            // (only for what is offered: a mined one stays aside). A frame
+            // only partly returned stays aside: its transactions are
+            // frameless at their lanes, and the slow puller and the
+            // per-transaction check take them, as before.
+            if revive {
+                self.frames.revive_by_first(valid.hash());
+            }
             // An own block the chain settled elsewhere comes back through
             // here, and it can carry the very nonce a lane is parked
             // behind.

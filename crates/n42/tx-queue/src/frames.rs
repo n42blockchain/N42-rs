@@ -590,16 +590,22 @@ impl<T: PoolTransaction> FrameIndex<T> {
         }
     }
 
-    /// The frames aside the chain has mined any transaction of leave for
-    /// good, their transactions (and those the bound pushed out) handed to
-    /// `gone` to be freed off the lock.
+    /// The frames aside whose first run the chain has mined leave for good,
+    /// their transactions (and those the bound pushed out) handed to `gone`
+    /// to be freed off the lock. One lane look-up a frame aside, not one a
+    /// run: the frames aside are up to [`MAX_FRAMES`] of hundreds of runs
+    /// each, and checking every run held the prune's lock 45 ms longer at
+    /// p90 in loop351 stage al (`X9FS`), long enough to make the plan
+    /// prepared after a take late for half the builds. A block takes a frame
+    /// whole, so its first run is mined with the rest; one mined some other
+    /// way leaves with the bound.
     pub(crate) fn sweep_retired_into(&mut self, lanes: &AddressHashMap<Lane<T>>, gone: &mut Vec<FrameTxs<T>>) -> usize {
         gone.append(&mut self.retired_gone);
         let dead: Vec<B256> = self
             .retired
             .iter()
             .filter(|(_, entry)| {
-                entry.runs.iter().any(|run| lanes.get(&run.sender).is_some_and(|lane| lane.chain_mined(run.first_nonce)))
+                entry.runs.first().is_some_and(|run| lanes.get(&run.sender).is_some_and(|lane| lane.chain_mined(run.first_nonce)))
             })
             .map(|(id, _)| *id)
             .collect();

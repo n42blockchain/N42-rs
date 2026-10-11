@@ -608,3 +608,58 @@ fn a_full_index_refuses_a_new_frame_instead_of_evicting_a_live_one() {
         assert_eq!(inner.frames.refused_at_cap, u64::from(on));
     }
 }
+
+/// The plan prepared right after a take, before the take's noted
+/// transactions have left their lanes (the settle), is full whether the
+/// taken frames are swept at the take or not, on the one-hold and the
+/// off-lock paths.
+#[test]
+fn the_plan_prepared_before_the_settle_of_a_take_is_full() {
+    for offlock in [false, true] {
+        for on in [false, true] {
+            let gas = 200 * 21_000;
+            let queue: TxQueue<EthPooledTransaction> =
+                TxQueue::new().with_offlock(offlock).with_frame_sweep_at_take(on);
+            fill(&queue, 40, 4, 5, 0);
+            queue.drain_now();
+            let (mut best, plan, _) = queue.frames_for_build_ahead(block_hash(0), gas, SelectMode::Parallel, false);
+            assert_eq!(plan.tx_count(), 200);
+            assert!(queue.prepare_next_in(gas, SelectMode::Parallel));
+            let prepared = queue.lock_inner_quiet().prepared.as_ref().map(|p| (p.plan.tx_count(), p.plan.skipped));
+            // Without the sweep the taken frames are still indexed and the
+            // plan passes over them (one each).
+            assert_eq!(prepared, Some((200, if on { 0 } else { 40 })), "offlock {offlock} sweep {on}");
+            assert_eq!(best.by_ref().count(), 200);
+        }
+    }
+}
+
+/// A chain of own blocks on plans prepared after each take: with the sweep
+/// every build after the first uses its prepared plan and the plan passes
+/// over no frame, and the live index shrinks by what each block took.
+#[test]
+fn with_the_sweep_every_prepared_plan_is_used_and_skips_nothing() {
+    for offlock in [false, true] {
+        let gas = 100 * 21_000;
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new().with_offlock(offlock).with_frame_sweep_at_take(true);
+        fill(&queue, 40, 12, 5, 0);
+        queue.drain_now();
+        let mut parent = block_hash(0);
+        let mut blocks = Vec::new();
+        for n in 1..=10u64 {
+            let (mut best, plan, times) = queue.frames_for_build_ahead(parent, gas, SelectMode::Parallel, false);
+            assert!(queue.prepare_next_in(gas, SelectMode::Parallel));
+            let txs: Vec<Tx> = best.by_ref().collect();
+            drop(best);
+            assert_eq!(txs.len(), 100);
+            assert_eq!(plan.skipped, 0, "offlock {offlock} block {n}");
+            if n > 1 {
+                assert_eq!(times.ahead, 1, "offlock {offlock} block {n}: {times:?}");
+            }
+            seal(&queue, parent, n, block_hash(n), &txs);
+            parent = block_hash(n);
+            blocks.push(txs);
+        }
+        assert_chain_valid(&blocks);
+    }
+}

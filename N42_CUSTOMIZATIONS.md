@@ -599,3 +599,18 @@
   账户，冻结集改为按批次记录 `removed`，view / merge / into_staged 均跳过它们；默认模式下 map 独占，行为不变。
   阶段行新增 `output_incremental`、`seal_to_shards_final_us`；`seal_to_shards_ready_us` 记录早期登记的时刻。测试
   `output_shards::incremental_tests`、`direct_build::tests::a_parent_filed_on_its_early_output_opens_as_on_its_frozen_set`。
+
+## node-builder：QMDB 链上的状态遮蔽后缀与哈希状态前沿恢复（vendored `reth-node-builder`）
+
+reth 2.7 把 `num_state_masking_blocks` 默认值改为 30，持久化会让哈希状态/trie 前沿（`Finish` 检查点的
+`partial_state_trie`）落后数据库头最多 30 个块；SIGKILL 后重启，上游会通过 `MerkleStage::new_unwind(true)` 把整个数据库
+回滚到该前沿并校验 Merkle-Patricia 根，而 QMDB 链的区块头里是 QMDB 根，校验永远无法通过。改动均为增量：
+
+- `builder/mod.rs` 的 `effective_tree_config`：QMDB 链（genesis `stateScheme == "qmdb"`）上若配置值大于 0，则强制为 0 并记一行
+  `info!`（target `reth::cli`）。`bin/n42/src/main.rs` 的 `N42_HASHED_TABLES=off` 检查在 QMDB 链上不再按配置原值拒绝。
+- `launch/common.rs`：`plan_trie_recovery` 决定恢复方式。QMDB 链上前沿落后时，`heal_hashed_state_forward` 在一个事务里按
+  `(前沿, 头]` 内变更的账户与存储槽，从当前 plain state 重写哈希状态（与 `AccountHashingStage`/`StorageHashingStage` 增量分支
+  一致；`N42_HASHED_TABLES=off` 时只改检查点），再把 `Finish` 检查点改写为头且不带前沿，不再回滚。
+- 已持久化 `partial_state_trie_unwind` 标记的 QMDB 数据目录（旧二进制已开始回滚且失败）直接报错，要求重新初始化
+  （`fleet7.sh up --fresh`，或 `n42 init` 加重新同步）。
+- 存储层不一致（rocksdb / static file）的回滚流水线在 QMDB 链上禁用 `MerkleUnwind` 与 `MerkleExecute`，保留哈希阶段的回滚。

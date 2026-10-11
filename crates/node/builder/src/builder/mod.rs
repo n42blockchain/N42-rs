@@ -746,7 +746,7 @@ where
     {
         let Self { builder, task_executor } = self;
 
-        let engine_tree_config = builder.config.tree_config();
+        let engine_tree_config = effective_tree_config(&builder.config);
 
         let launcher = DebugNodeLauncher::new(EngineNodeLauncher::new(
             task_executor,
@@ -759,7 +759,7 @@ where
     /// Returns an [`EngineNodeLauncher`] that can be used to launch the node with engine API
     /// support.
     pub fn engine_api_launcher(&self) -> EngineNodeLauncher {
-        let engine_tree_config = self.builder.config.tree_config();
+        let engine_tree_config = effective_tree_config(&self.builder.config);
         EngineNodeLauncher::new(
             self.task_executor.clone(),
             self.builder.config.datadir(),
@@ -1141,4 +1141,28 @@ mod tests {
         drop(reopened);
         assert!(datadir.join("db").exists());
     }
+}
+
+/// The engine tree configuration for `config`, with the state masking suffix forced off on a
+/// QMDB chain.
+///
+/// The suffix keeps the hashed-state/trie frontier `num_state_masking_blocks` behind the
+/// database tip. A restart after SIGKILL would then have to unwind the database to that
+/// frontier through the Merkle stage, which verifies a Merkle-Patricia root that a QMDB
+/// chain's headers do not carry.
+fn effective_tree_config<C: EthChainSpec>(
+    config: &reth_node_core::node_config::NodeConfig<C>,
+) -> reth_engine_primitives::TreeConfig {
+    let tree_config = config.tree_config();
+    let qmdb = reth_chainspec::qmdb::state_scheme(config.chain.genesis()) ==
+        reth_chainspec::qmdb::StateScheme::Qmdb;
+    if qmdb && tree_config.num_state_masking_blocks() > 0 {
+        info!(
+            target: "reth::cli",
+            configured = tree_config.num_state_masking_blocks(),
+            "State masking suffix is off on a QMDB chain: the trie frontier it leaves behind cannot be unwound through the Merkle stage"
+        );
+        return tree_config.with_num_state_masking_blocks(0)
+    }
+    tree_config
 }

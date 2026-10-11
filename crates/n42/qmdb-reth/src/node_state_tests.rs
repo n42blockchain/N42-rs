@@ -572,6 +572,23 @@ fn file_from_operations(state: &QmdbNodeState, number: u64, parent: B256) -> B25
 }
 
 #[test]
+fn the_occupancy_names_the_lease_and_the_lock_holders() {
+    let (leased, _view, genesis) = switched("occupancy-leased", true, true);
+    let mut parent = genesis;
+    for number in 1..=4u64 {
+        file_from_operations(&leased, number, parent);
+        leased.on_canonical(hash_of(number)).expect("canonical");
+        parent = hash_of(number);
+    }
+    let occupancy = leased.occupancy();
+    let of = |label: &str| occupancy.iter().find(|(name, _)| *name == label).map(|(_, sums)| *sums);
+    let lease = of("tree_lease").expect("the lease is counted");
+    assert_eq!(lease.holds, 4, "every root of the four on a leased tree");
+    assert_eq!(of("lease_return").expect("its return holds the lock").holds, 4);
+    assert_eq!(of("on_canonical").expect("the canonical hold").holds, 4);
+}
+
+#[test]
 fn a_root_on_a_leased_tree_equals_the_locked_one_and_the_views_agree() {
     let (locked, locked_view, genesis) = switched("offlock-equal-locked", false, false);
     let (leased, leased_view, _) = switched("offlock-equal-leased", true, true);

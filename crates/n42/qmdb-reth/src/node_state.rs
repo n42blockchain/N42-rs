@@ -563,6 +563,9 @@ struct Inner {
     persist_hold_us: std::sync::atomic::AtomicU64,
     persist_advance_us: std::sync::atomic::AtomicU64,
     persist_holds: std::sync::atomic::AtomicU64,
+    /// Who held the forest's lock and its tree, and who waited
+    /// ([`crate::occupancy`]).
+    occupancy: crate::occupancy::Occupancy,
 }
 
 /// A rename queued by [`QmdbNodeState::rename_or_defer`].
@@ -606,6 +609,7 @@ const ROOT_SPLITS_KEPT: usize = 32;
 /// hold over [`FOREST_LOCK_WARN_MS`] is logged when it is dropped.
 struct ForestGuard<'a> {
     guard: MutexGuard<'a, Option<QmdbForest>>,
+    inner: &'a Inner,
     label: &'static str,
     acquired: std::time::Instant,
     waited_ms: u64,
@@ -627,7 +631,10 @@ impl std::ops::DerefMut for ForestGuard<'_> {
 
 impl Drop for ForestGuard<'_> {
     fn drop(&mut self) {
-        let ms = self.acquired.elapsed().as_millis() as u64;
+        let held = self.acquired.elapsed();
+        self.inner.occupancy.hold(self.label, held);
+        self.inner.occupancy.maybe_log(self.inner.canonical_number.load(std::sync::atomic::Ordering::Relaxed));
+        let ms = held.as_millis() as u64;
         if ms > FOREST_LOCK_WARN_MS {
             warn!(target: "n42.qmdb", label = self.label, ms, "forest lock held");
         }
@@ -899,6 +906,7 @@ impl QmdbNodeState {
                 persist_hold_us: Default::default(),
                 persist_advance_us: Default::default(),
                 persist_holds: Default::default(),
+                occupancy: Default::default(),
             }),
         }
     }
@@ -1242,6 +1250,12 @@ impl QmdbNodeState {
         self.inner.canonical_defer.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// The forest's occupancy by label since its last periodic line
+    /// ([`crate::occupancy`]): `tree_lease` is the leased tree's time out.
+    pub fn occupancy(&self) -> Vec<(&'static str, crate::occupancy::LabelSums)> {
+        self.inner.occupancy.snapshot()
+    }
+
     /// What the off-lock root and the persistence holds have done so far.
     pub fn offlock_counters(&self) -> OfflockCounters {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1417,7 +1431,9 @@ impl QmdbNodeState {
         held_by: &'static str,
     ) -> ForestGuard<'a> {
         let acquired = std::time::Instant::now();
-        let waited_ms = acquired.saturating_duration_since(asked).as_millis() as u64;
+        let waited = acquired.saturating_duration_since(asked);
+        self.inner.occupancy.wait(label, waited);
+        let waited_ms = waited.as_millis() as u64;
         if waited_ms > FOREST_LOCK_WARN_MS {
             warn!(target: "n42.qmdb", label, ms = waited_ms, held_by, "forest lock waited");
         }
@@ -1427,7 +1443,7 @@ impl QmdbNodeState {
                 self.drain_renames(forest);
             }
         }
-        ForestGuard { guard, label, acquired, waited_ms, held_by }
+        ForestGuard { guard, inner: &self.inner, label, acquired, waited_ms, held_by }
     }
 
     /// Applies the queued renames in the order they were queued. A failure is
@@ -1576,9 +1592,11 @@ impl QmdbNodeState {
         }
         let forest = guard.as_mut().ok_or(NodeStateError::Uninitialised)?;
         let mut lease = forest.lease_tree(parent)?;
+        let leased_at = std::time::Instant::now();
         drop(guard);
         let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lease.compute_with_leaves(ops, leaves.as_ref())));
         let mut guard = self.lock_as("lease_return");
+        self.inner.occupancy.hold("tree_lease", leased_at.elapsed());
         split.lock_wait_ms += guard.waited_ms;
         let Some(forest) = guard.as_mut() else { return Err(NodeStateError::Uninitialised) };
         let computed = match computed {

@@ -417,6 +417,17 @@
   `the_continuous_preparation_plans_frames_that_arrive_after_the_take`、
   `a_wait_for_a_plan_that_never_fills_runs_out`、`without_the_switch_a_build_never_waits`。
   `docs/SHARED_EXECUTION_SCOPE.md` 16.4.1。
+- `N42_FRAME_SWEEP_AT_TAKE`（默认开；`=0` 恢复旧行为；代码在 `tx-queue` `frames.rs` `FrameIndex::retire` /
+  `revive_by_first` / `sweep_retired_into` / `frame_sweep_at_take`，`lib.rs` 各 take 落地处与 `give_back`）：
+  整帧被构建或预备计划取走时，在取走那一刻离开活跃帧索引（移到一旁：不再参与到达顺序的遍历，但按 id 与首个
+  交易哈希仍可查，供 settle、计划的最低 nonce 与 seal 的帧布局使用），直到链上挖出（prune 的 sweep）或被
+  `MAX_FRAMES` 个更新的退役帧挤出；被截断的帧仍在活跃索引里。整份 take 原样还回（放弃的构建、丢弃的预备计划）
+  时，其帧按首个交易哈希回到活跃索引的原到达位置；只部分还回的帧留在一旁，其交易在 lane 中无帧，由慢速 puller
+  与逐笔检查取用，与以前相同。活跃索引达到 `MAX_FRAMES` 时拒绝新帧（计入 `refused`，交易仍在 lane 中），
+  不再逐出最老的仍在队列中的帧。阶段行新增 `start_frames_skipped`、`start_frames_index`、
+  `start_frames_swept_at_take`、`start_frames_refused_at_cap`。测试：`ahead_tests.rs`
+  `a_taken_frame_leaves_the_index_at_the_take_and_comes_back_with_a_given_up_build`、
+  `a_full_index_refuses_a_new_frame_instead_of_evicting_a_live_one`。`docs/SHARED_EXECUTION_SCOPE.md` 16.4.2。
 - `N42_BUILD_BATCHES=<n>`（默认 0 = 原调度；代码在 `parallel_transfer.rs` `build_batches` / `Dispatch` /
   `largest_first`）：交易按整个发送者组、候选顺序装成 n 个大小相近的 batch，以 FIFO 从大到小投入 build pool
   （建议 96-128，32 个 worker）。测试 `the_largest_first_packing_keeps_every_sender_run_whole_and_in_order`，

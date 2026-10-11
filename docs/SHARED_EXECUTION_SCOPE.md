@@ -1364,6 +1364,25 @@ preparation is in flight and its plan is not full waits up to the switch's milli
 (`TxQueue::wait_for_plan`), then proceeds as before. The phase line carries `plan_wait_us` and `plan_wait_timeout`
 (true: the wait ran out before the plan was full). Measured in loop351 stage `al` (X9 set, 35 ms pacing).
 
+### 16.4.2 Dead and evicted frames in the index (`N42_FRAME_SWEEP_AT_TAKE`)
+
+Loop351 stage ak showed why the plan ran short while the queue stayed full, and the cause was the frame index, not
+the plan's timing. A frame taken into a build stayed in the index until the canonical prune swept it, and the queue
+pruner ran 140-157 blocks behind. So the index sat at its 16,384-frame cap (`MAX_FRAMES`) from block ~1150 on, and
+every build walked past 13-16k dead frames. At the cap the index evicted its oldest frame, even when that frame's
+transactions were still queued. Those transactions were then frameless at their senders' lane heads, and every later
+frame of the same senders failed the lane-head check. After the index shrank (from block ~2065, ~1,500 frames),
+builds still skipped 1,400-4,200 such blocked frames each. The frame take saw only the frames that arrived since the
+last take, while the 2.5M "usable" transactions were reachable only by the per-transaction puller. The control leg X9f
+shows the same thing (`start_frames_skipped` mean 3,834 over 1,844 builds).
+
+With `N42_FRAME_SWEEP_AT_TAKE` (on by default, `=0` restores the old behaviour) a frame taken whole leaves the live
+index at the take. It is kept aside, still found by id and first hash for the settle, the plan's lowest nonces and the
+seal's layout, until the chain mines it or `MAX_FRAMES` newer ones push it out. A take that comes back whole (a build
+given up on the same parent, a discarded prepared plan) revives its frames at their arrival position. Past the cap a
+new frame is refused instead of a live one being evicted. The build start logs `start_frames_skipped`,
+`start_frames_index`, `start_frames_swept_at_take` and `start_frames_refused_at_cap`. Measured in loop351 stage `al`.
+
 ### 16.5 The floor, and whether 40 ms is in reach
 
 After 1-4 (estimates): start 1 + prep 0.5 + gap 1.5 + exec 18.5 + join 0.5 + commit 1 + seal ~2 (header, block, hook; the

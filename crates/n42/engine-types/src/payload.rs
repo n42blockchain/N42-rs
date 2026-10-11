@@ -1799,6 +1799,8 @@ where
     // pull and the prep.
     let mut par_prefetch_ms = 0u64;
     let mut par_prefetch_wait_ms = 0u64;
+    // `N42_BUILD_MLP=<k>`: the batches' lookahead distance, 0 when off.
+    let mut par_mlp_k = 0usize;
     // The transactions root, computed beside the graft for a block that
     // will seal early.
     let mut early_transactions_root: Option<B256> = None;
@@ -3088,6 +3090,7 @@ where
                     par_read_set_misses = run.phases.read_set_misses;
                     par_batch_spans = run.phases.batch_spans;
                     par_loop_timers = run.phases.loop_timers;
+                    par_mlp_k = run.phases.mlp_k;
                     par_skipped = run.skipped.len();
                     // Read by the diagnosis below, which must see what this
                     // step actually built.
@@ -4053,6 +4056,7 @@ where
                     par_prefault_ms,
                     par_prefetch_ms,
                     par_prefetch_wait_ms,
+                    par_mlp_k,
                     par_fold_ms,
                     tx_root_ms = root_ms,
                     parent_fields_ms = fields_ms,

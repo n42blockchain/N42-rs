@@ -3703,3 +3703,18 @@ Stage au (tree 6feb9a285, X10 at 30 ms, pool 26-27 GB):
 Idle siblings give the build its best execution yet (11 ms p50, 15 p90, the memory-latency gain of 10.117) and lose the leg by a third: with 64 cores and their 64 siblings reserved, the rest of the layer has 80 CPUs, and the deferred state's open goes 0.3 -> 8.5 ms, the root 33 -> 44, state ready 145 -> 215, the seal 36 -> 43. 48 build cores with idle siblings is the same trade at a smaller scale. The C16 layout (build on 64 cores, root job on 16 cores, the siblings and everything else on the background set) is now the best set three times running (375.4M, 380.8M, 372.6M against 365-369M for the plain X10) with flat windows and the lowest sealed_at p90 (48); it is adopted as **X11 = X10 + C16**. The control's window 3 (2.72M) is the host's tail again (Shmem still 31 GB).
 
 The way to the execution gain without the starvation is therefore not a layout but memory-level parallelism inside the batches (10.117, `N42_BUILD_MLP=<k>`: the pooled transaction converted k ahead, the result slot and the batch map's entries prefetched, and the account hint walked down through the overlay, the shard layer and the QMDB view's index bucket, 33c2ad739 / bf9231be9 / 7e1a1554e). Stage av measures k = 4, 8, 16 on X11.
+
+### 10.119 loop351 stage av — the in-build lookahead does not move the execution's median; the legs with it read 372-374M against 355-358M controls, which is inside the noise until repeated
+
+Stage av (tree 9f0272cb5, X11 set at 30 ms, pool 26-28 GB):
+
+| leg | w1 | w2 | w3 | round | par_exec p50/p90 | sealed_at p50/p90 | hints per block |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| X11, control | 4.15 | 3.91 | 3.77 | 355.0M | 16 / 23 | 33 / 59 | -- |
+| X11MLP4 | 4.19 | 4.04 | 4.15 | 371.6M | 17 / 22 | 33 / 46 | 201,744 |
+| X11MLP8 | 4.17 | 2.92 | 2.48 | 287.3M | 16 / 22 | 40 / 77 | 203,344 |
+| X11MLP8b | 4.03 | 3.78 | 3.56 | 341.2M | | | |
+| X11MLP16 | 4.23 | 4.12 | 4.13 | 374.4M | | | |
+| X11b, control | 4.11 | 3.86 | 3.96 | 357.8M | | | |
+
+The lookahead issues one hint per transaction and changes nothing in the execution's median (16-17 ms): the misses are not where the hint reaches (the batch map, the overlay filters, the shard index, the QMDB index bucket), or the distance of k transactions is the wrong scale for a ~440-cycle miss, or the dependent chain's later links (the entry record, journals) are the misses. What the legs do show is a flatter tail: sealed_at p90 59 -> 46 and windows 2-3 at 4.0-4.15 for k = 4 and 16 (371.6M and 374.4M against 355.0M and 357.8M for the two controls), which is a 4-5% difference between single rounds and therefore not a result until repeated. X11MLP8 lost its windows 2-3 to the same disturbance as stage ar's control: 60 `an own block was still held when the bound was reached; its transactions are lost to the queue` warnings in the first-full-block minute (open item; it recurs on some legs and is not tied to a switch). Stage aw profiles the build's threads with symbols (`cargo build --profile profiling`, `perf record` on the n42-build threads in window 1) to find the miss sites before the next prefetch attempt.

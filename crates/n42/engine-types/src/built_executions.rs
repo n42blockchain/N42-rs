@@ -104,6 +104,9 @@ struct Entry {
     /// taken it yet ([`handed_off`]): never evicted for a newer build. See
     /// [`make_room_into`] for when a pin is let go.
     pinned: bool,
+    /// The hand-off has already taken this build ([`handed_off`]): a sealed
+    /// header arriving later must not pin it again, nothing would release it.
+    handed_off: bool,
 }
 
 /// At most this many pinned builds; past it the oldest pin is let go (with a
@@ -172,6 +175,7 @@ fn put_into(store: &mut VecDeque<(B256, Entry)>, built_hash: B256, entry: Entry)
     while let Some(at) = store.iter().position(|(hash, _)| *hash == built_hash) {
         if let Some((_, old)) = store.remove(at) {
             entry.pinned |= old.pinned;
+            entry.handed_off |= old.handed_off;
             evicted.push(old);
         }
     }
@@ -235,7 +239,11 @@ fn free_boxed_off_path(evicted: Box<dyn Send>) {
 /// stopped at it (loop351 stage aj, block 2081: 2082-2084 sealed within
 /// ~100 ms behind it). A pin is let go once the canonical chain reaches its
 /// number without a hand-off ([`release_passed_pins`]), or, past
-/// [`max_pinned`], the oldest first; both say so at WARN.
+/// [`max_pinned`], the oldest first; both say so at WARN. A build whose
+/// hand-off already happened is never pinned ([`pin_sealed`]): in loop351
+/// stage ak the late pin came from empty blocks, whose hand-off lands before
+/// the next build request (which carries the sealed header) arrives, and
+/// every such pin was only let go by the chain passing it, with a WARN.
 #[cfg(test)]
 fn make_room(store: &mut VecDeque<(B256, Entry)>) {
     let mut evicted = Vec::new();
@@ -304,7 +312,10 @@ pub fn release_pins_through(canonical: u64) {
 /// change): it stays in the store, whatever comes after it, until its
 /// hand-off ([`handed_off`]) or until the chain passes its number. Called
 /// when a sealed header naming one of this layer's builds arrives. Returns
-/// whether a build was pinned.
+/// whether a build was pinned. A build already handed off ([`handed_off`])
+/// is skipped: with empty blocks the hand-off of block N lands before the
+/// build request for N+1 brings the sealed header (loop351 stage ak), and a
+/// pin placed then would never be released.
 pub fn pin_sealed(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> bool {
     let (store, _) = store();
     let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
@@ -314,7 +325,7 @@ pub fn pin_sealed(parent: B256, number: u64, state_root: B256, receipts_root: B2
     match store
         .iter_mut()
         .rev()
-        .find(|(_, entry)| matches_block(&entry.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
+        .find(|(_, entry)| !entry.handed_off && matches_block(&entry.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
     {
         Some((_, entry)) => {
             entry.pinned = true;
@@ -325,12 +336,14 @@ pub fn pin_sealed(parent: B256, number: u64, state_root: B256, receipts_root: B2
 }
 
 /// The build's hand-off has taken it: its pin (if any) is released and it
-/// counts against [`keep`] again.
+/// counts against [`keep`] again. It is remembered as handed off, so a later
+/// [`pin_sealed`] for the same build is a no-op.
 pub fn handed_off(built_hash: B256) {
     let (store, _) = store();
     let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((_, entry)) = store.iter_mut().find(|(hash, _)| *hash == built_hash) {
         entry.pinned = false;
+        entry.handed_off = true;
     }
 }
 
@@ -341,13 +354,13 @@ pub fn is_pinned(built_hash: B256) -> bool {
 
 /// Remembers a finished build under the hash the builder gave it.
 pub fn remember(built_hash: B256, execution: BuiltExecution) {
-    put(built_hash, Entry { stage: Stage::Complete, block: execution.block.clone(), execution: Some(execution), shards: None, pinned: false });
+    put(built_hash, Entry { stage: Stage::Complete, block: execution.block.clone(), execution: Some(execution), shards: None, pinned: false, handed_off: false });
 }
 
 /// A block sealed before its finish: known from here on, waited for by
 /// whoever needs its state or its execution.
 pub fn remember_pending(built_hash: B256, block: Arc<RecoveredBlock<Block>>) {
-    put(built_hash, Entry { stage: Stage::Sealed, block, execution: None, shards: None, pinned: false });
+    put(built_hash, Entry { stage: Stage::Sealed, block, execution: None, shards: None, pinned: false, handed_off: false });
 }
 
 /// The pending build's post-state is final (`execution` carries the bundle;
@@ -1210,7 +1223,7 @@ mod tests {
     fn an_evicted_entry_is_dropped_off_the_lock_and_the_store_is_the_same() {
         use alloy_primitives::U256;
         let block = built(&header(0x31, 1)).block;
-        let entry = |stage: Stage| Entry { stage, block: Arc::clone(&block), execution: None, shards: None, pinned: false };
+        let entry = |stage: Stage| Entry { stage, block: Arc::clone(&block), execution: None, shards: None, pinned: false, handed_off: false };
         let mut inline: VecDeque<(B256, Entry)> = VecDeque::new();
         let mut moved: VecDeque<(B256, Entry)> = VecDeque::new();
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
@@ -1427,6 +1440,18 @@ mod tests {
             remember(built(&h).block.hash(), built(&h));
         }
         assert_eq!(stage_of(stuck_hash), None, "released, it is evicted");
+    }
+
+    /// A seal header arriving after the hand-off (empty blocks) pins nothing.
+    #[test]
+    fn a_pin_after_the_hand_off_is_a_no_op() {
+        let _guard = lock();
+        let h = header(0xC0, 4_500_010);
+        let hash = built(&h).block.hash();
+        remember(hash, built(&h));
+        handed_off(hash);
+        assert!(!pin_sealed(h.parent_hash, h.number, h.state_root, h.receipts_root, h.gas_used, Some(h.transactions_root)));
+        assert!(!is_pinned(hash));
     }
 
     /// Pins are bounded: past `max_pinned` the oldest pin is let go.

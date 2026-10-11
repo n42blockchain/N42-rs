@@ -32,8 +32,8 @@ if sys.argv[1] == 'sample':
             print(f'{now:.1f}\t{tid}\t{comm}\t{(int(f[11]) + int(f[12])) / HZ:.2f}', flush=True)
         time.sleep(5)
 elif sys.argv[1] == 'families':
-    # family = the name with trailing digits/separators removed (n42-build-12 -> n42-build, tokio-rt-worker stays)
-    fam = lambda c: re.sub(r'[-_ .#]*[0-9]+$', '', c) or c
+    # family = the name without a separated trailing number (n42-build-12 -> n42-build; n42 and tokio-rt-worker stay)
+    fam = lambda c: re.sub(r'[-_ .#]+[0-9]+$', '', c) or c
     rows, names = {}, {}
     for l in open(sys.argv[2]):
         t, tid, comm, c = l.rstrip('\n').split('\t'); rows.setdefault(tid, {})[float(t)] = float(c); names[tid] = comm

@@ -3491,3 +3491,47 @@ Block-size scaling (PABA legs, window 1, ms):
 - **Hypothesis (under test, not a finding): the forest lock chain is the ~100 ms-per-two-blocks resource.** A block holds the tree lease for `root_compute` 26 ms, and the persistence thread takes it for `qmdb_persisted` 13 ms a block, persisting two blocks per hold, plus the canonical trims (`on_canonical`, 4-9 ms of waiting a block): about 26 + 13 + trims per block, serial, which fits a pair of answers per ~100 ms. The only hint in the logs is `forest lock waited on_persisted_parts ms=347 held_by=compute_operations` (twice in the PA leg); I did not trace lease occupancy second by second. An agent is now instrumenting the lock and moving `on_persisted` and the trims off it; the result decides whether a 40 ms cycle (every chain under ~30 ms a 200k block) is a lock-structure change or the three-project job 10.107 listed.
 
 Hand-off files: `target/fleet-runs/loop351af*.launch.out`, the per-leg `bench-<leg>.out` and `mem-<leg>.txt`.
+
+### 10.109 loop351 stages ag-ak — the answer-at-insert cut moves the answer 18 ms earlier and the cycle does not follow; the median cycle already sits on the 35 ms tick, the mean is the tail; two build-store pin defects fixed; the small-block attractor
+
+Stages ag-ak (2026-10-10/11, trees fc442cc93 .. 6ddcd2159) tested the last cut on the own-block answer that 10.108 left open, after the forest lock-chain hypothesis of 10.108 was refuted by the always-on `forest occupancy` line (716592ebf): the lease is held 26 ms for the root and 13 ms for persistence per block, with no queueing between them.
+
+**The cut.** The critical path measured in stage ag was proposal(N+1) = answer(N-3) + 8 ms and answer = seal + 194 ms (state ready at seal + 152, the hand-off at +18, the header newPayload and the `own block imported by header` answer at +24). `N42_ANSWER_AT_INSERT=1` (AAI, 5b8e98adc, `bin/n42/src/answer_at_insert.rs`) answers VALID as soon as the hand-off's insert returns `Ok(true)`, dispatches the header newPayload on the FIFO engine channel before the answer and awaits it on a side task; INVALID, SYNCING or a lost reply latch the next answer; each answer waits for the previous pass.
+
+**Results** (window 1 / 2 / 3, M TPS; the cycle is the mean over the window):
+
+| stage | leg | w1 | w2 | w3 | cycle ms | note |
+| --- | --- | --- | --- | --- | --- | --- |
+| ag | X9 base, warm leg | 4.23 | 3.91 | 3.79 | 47 | window-1 record |
+| aj | X9e control | 3.67 | 2.68 | 2.67 | 54/75/75 | degraded host |
+| aj | X9 AAI | 3.85 | 2.85 | 1.99 | 52/70/100 | bodygate: own block 2081 never imported |
+| ak | X9f P35 control | 3.85 | 4.04 | 3.92 | 52/50/51 | the only leg flat at 4M |
+| ak | X9g P35 control | 3.95 | 2.85 | 2.71 | 51/70/74 | same configuration as X9f |
+| ak | X9f P30 control | 3.66 | 2.80 | 2.75 | 55/71/73 | |
+| ak | X9 AAIc P35 | 3.85 | 2.94 | 2.61 | 52/68/77 | |
+| ak | X9 AAIc P30 | 3.47 | 2.80 | 2.76 | 58/71/72 | |
+| ak | X9 AAIc P25 | 3.31 | 2.73 | 2.71 | 60/73/74 | |
+| ak | X9 AAId P35 | 3.51 | 2.68 | 1.96 | 57/70/41 | w3 at 40% occupancy, 57 of 729 blocks full |
+
+Every stage ak bodygate passed (`own_not_committed=0`, `proposals_given_up=0`). AAI never beat its control on window 1 and tighter pacing made it worse.
+
+**The host confound.** From stage ah on, the box carried 20 GB of gov5's leaked `/tmp/erigon-lfp-buf-*` files on the tmpfs (Shmem 28-31 GB, 21,857 then 23,661 files), the huge-page pool after `hugeprep` was 29-31 GB and the file cache near zero. Window 2 and 3 collapses (cycle 70-77 ms) appear in control and AAI legs alike, and two legs of one configuration (X9f, X9g) differ by 1.2M on window 2 with identical memory lines. Within a leg the collapse is the whole build chain growing, not the hand-off: against X9f window 2, X9g and AAIc window 2 read `sealed_at_ms` 32 -> 54/53, seal to state ready 159 -> 180/201, seal to root end 64 -> 71/83, while the merge stays at 91-95 ms and `insert_wait_ms` is 0 with `moved_body` 100% everywhere. Until the files are deleted only window 1 of a warm leg is a measurement, and only relative to a control in the same state.
+
+**What AAI does and why the cycle ignores it.** Per-block timing over all seven validator logs (proposal time = the first `proposal sent view=N` across the logs, so the rotating leader is picked by view; `scratchpad/crit5.py`):
+
+| leg, window | cycle median (mean) | sealed_at | seal -> state ready | seal -> answer | state ready -> answer | prop(N+1) - answer(N-3) |
+| --- | --- | --- | --- | --- | --- | --- |
+| X9f w1 | 38.6 (51.9) | 33 | 155 | 200 | 42 | 24 |
+| X9g w1 | 39.8 (50.7) | 34 | 152 | 199 | 44 | 25 |
+| AAIc P35 w1 | 42.8 (52.0) | 36 | 163 | 190 | 24 | 29 |
+| AAId P35 w1 | 46.0 (57.1) | 42 | 163 | 193 | 27 | 31 |
+| X9f P30 w1 | 42.4 (54.6) | 38 | 152 | 202 | 50 | 24 |
+| AAIc P30 w1 | 47.5 (57.8) | 40 | 165 | 198 | 27 | 29 |
+
+AAI cuts state ready -> answer from 42-50 ms to 24-27 ms as designed, with no INVALID, SYNCING or lost answers in 20k own blocks. The proposal does not follow: prop(N+1) - answer(N-3) grows from 24 to 29-31 ms, so the next proposal was never waiting on the answer in these legs; the 8 ms of stage ag was a property of that warm leg. Two things the table says that 10.107-10.108 did not: the **median** cycle is 38-40 ms, on the 35 ms pacing tick, and the **mean** of 50-52 ms that sets the throughput is the tail -- blocks whose seal came late (`sealed_at_ms` is the field that moves first). Shortening the answer path removes nothing from a block that is already sealed on the tick and adds nothing to the blocks in the tail. AAI stays off (it costs a side task per block and has no win to show); the code stays for a host whose cycle is answer-bound.
+
+**Two build-store defects found on the way, both fixed unconditionally.** (1) Stage aj's bodygate: with KEEP=3, three tiny blocks sealed within 100 ms (a starved queue on the degraded host) evicted sealed-but-not-handed-off build 2081; every validator's import then took the compact-body road with the transactions already gone, the block never reached the tree and the views timed out. `pin_sealed` on BUILD_ON_OWN now pins the parent build until its hand-off (ce9497758), released at WARN when the canonical head passes it, capped at 4 x keep. (2) Stage ak's ~2,500 WARN lines per leg were all in the empty-block phases: there the hand-off of N lands before the build request for N+1 pins it, and the late pin was only let go when the chain passed it. `Entry.handed_off` makes a late pin a no-op (6ddcd2159). Neither changes a loaded block.
+
+**The small-block attractor (AAId window 3).** From first full block + 60 s the blocks dropped to 49-87k transactions (median 65k) with 2.52M queued, 2.51M usable and nothing parked; the flood's pool stayed at its 2.5M cap with 0 rejected. The builds were correspondingly short (`sealed_at_ms` 21, state ready 38, cycle 36 ms) and the layer ran at 1.8M TPS at 40% occupancy. The block lines show `par_pull_ms=0` on the small blocks and `par_pull_ms=74` on the one 200k block among them: the build-ahead on the early seal takes whatever the queue's bulk pull has ready when the seal arrives, and once a block is small its cycle is shorter, so the next pull has even less time -- a stable regime where transactions per block = pull rate x cycle. 200k per 36 ms is 5.5M tx/s from a queue that is ingesting 3M tx/s at the same time, and the flood's reply time rose from 65 to 90-118 ms per node at the same moment, so the ingest and the pull contend. This is the first sign of the queue's supply rate as a limit and it is exactly the regime 5M needs (200k per 40 ms); what triggered the first short pull is not in the logs.
+
+**Where this leaves 5M.** The tick is the floor of the median cycle, the tail is the host and the build chain, and the queue's pull must keep 200k ready every 40 ms. In order: (a) a healthy host (the tmpfs files), then a warm-leg repeat of X9 to re-establish the 4.2M window; (b) `pull_bulk_txs` kept ready ahead of the seal (a pre-pulled 200k batch per block, refilled while the previous block builds) so the block size is independent of the cycle; (c) the pre-seal tail (`sealed_at_ms` 32 -> 54 under contention: the parallel execution's threads against the merge and persistence of the previous blocks); (d) pacing below 35 only after (b).

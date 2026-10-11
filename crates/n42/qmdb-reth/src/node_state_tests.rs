@@ -301,7 +301,11 @@ fn a_stale_build_below_the_persisted_blocks_does_not_invalidate_the_view() {
     let (state, view, hashes) = viewed("view-stale-build", 4);
     state.on_persisted(&[(1, hashes[1])]);
     assert_eq!(view.head(), (1, hashes[1]));
-    let _sibling = state.compute(hashes[1], &changes_for(9)).expect("a stale build on block 1");
+    // A side block on block 1 (builds there are refused; an import is not)
+    // leaves the tree on the sibling the same way.
+    state
+        .insert_block_operations(hashes[1], B256::repeat_byte(0x59), 2, changes_for(9).operations())
+        .expect("a side block on block 1");
     state.on_persisted(&[(2, hashes[2]), (3, hashes[3])]);
     assert!(view.is_valid(), "the persisted blocks were listed after standing the tree back on them");
     assert_eq!(view.head(), (3, hashes[3]));
@@ -313,6 +317,33 @@ fn a_stale_build_below_the_persisted_blocks_does_not_invalidate_the_view() {
     state.on_persisted(&[(4, hashes[4]), (5, hash)]);
     assert!(view.is_valid());
     assert_eq!(view.head(), (5, hash));
+}
+
+#[test]
+fn a_build_on_a_parent_below_the_head_is_refused_and_the_view_stays_valid() {
+    for offlock in [false, true] {
+        let (state, view, hashes) = viewed(if offlock { "view-refuse-offlock" } else { "view-refuse" }, 4);
+        state.set_compute_offlock(offlock);
+        state.on_persisted(&[(1, hashes[1])]);
+        let refused = state.compute_operations(hashes[1], changes_for(9).operations()).unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                NodeStateError::State(StateError::StaleBuildParent { parent_number: 1, head_number: 4, persisted: Some(1), .. })
+            ),
+            "{refused}"
+        );
+        assert!(matches!(
+            state.compute_build(hashes[2], &changes_for(9)),
+            Err(NodeStateError::State(StateError::StaleBuildParent { parent_number: 2, .. }))
+        ));
+        assert!(view.is_valid(), "a refused build touches neither the tree nor the view");
+        state.on_persisted(&[(2, hashes[2]), (3, hashes[3])]);
+        assert!(view.is_valid());
+        assert_eq!(view.head(), (3, hashes[3]));
+        // The head itself still builds.
+        assert!(state.compute_operations(hashes[4], changes_for(5).operations()).is_ok());
+    }
 }
 
 #[test]

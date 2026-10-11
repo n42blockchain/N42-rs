@@ -2009,14 +2009,34 @@ impl QmdbNodeState {
         self.with_forest("compute", |forest| forest.compute(parent, changes))
     }
 
+    /// [`Self::compute`] for a block being built: a parent below the
+    /// canonical head is refused before the tree moves
+    /// ([`StateError::StaleBuildParent`], `QmdbForest::check_build_parent`).
+    pub fn compute_build(&self, parent: B256, changes: &BlockChanges) -> Result<PreparedBlock, NodeStateError> {
+        self.with_forest("compute", |forest| {
+            forest.check_build_parent(&parent)?;
+            forest.compute(parent, changes)
+        })
+    }
+
     /// [`Self::compute`] from leaf operations already built
-    /// (`sorted_operations_from_execution`).
+    /// (`sorted_operations_from_execution`), for a block being built: a
+    /// stale parent is refused as in [`Self::compute_build`].
     pub fn compute_operations(&self, parent: B256, ops: impl Into<QmdbOps>) -> Result<PreparedBlock, NodeStateError> {
         let ops = ops.into();
         if self.compute_offlock() {
-            return self.with_leased_root("compute_operations", parent, parent, ops, |_| None, |_, prepared| Ok(prepared));
+            return self.with_leased_root(
+                "compute_operations",
+                parent,
+                parent,
+                ops,
+                |forest| forest.check_build_parent(&parent).err().map(Err),
+                |_, prepared| Ok(Ok(prepared)),
+            )?
+            .map_err(NodeStateError::from);
         }
         self.with_forest_root("compute_operations", parent, |forest| {
+            forest.check_build_parent(&parent)?;
             forest.compute_operations(parent, ops).map(|prepared| (prepared, Some(0)))
         })
     }

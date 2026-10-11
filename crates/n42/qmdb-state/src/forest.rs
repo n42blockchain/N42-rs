@@ -944,6 +944,30 @@ impl QmdbForest {
         Ok(true)
     }
 
+    /// Refuses a build on `parent` when it is a strict ancestor of the
+    /// canonical head ([`StateError::StaleBuildParent`]). A builder builds on
+    /// the head or on a block above it; on a committed chain an ancestor of
+    /// the head is a request that went stale (loop351 X9j: a build ahead on
+    /// block 1020 asked for while 1021 was canonical moved the tree off the
+    /// canonical path and held the forest 555 ms). Validation is not checked
+    /// here: an imported side block takes the ordinary move.
+    pub fn check_build_parent(&self, parent: &B256) -> Result<(), StateError> {
+        let (head_number, head_hash) = self.head;
+        let Some(record) = self.records.get(parent) else { return Ok(()) };
+        if *parent == head_hash || record.number >= head_number {
+            return Ok(());
+        }
+        if !self.ancestry(head_hash).contains(parent) {
+            return Ok(());
+        }
+        Err(StateError::StaleBuildParent {
+            parent: *parent,
+            parent_number: record.number,
+            head_number,
+            persisted: self.keep_from.map(|from| from.saturating_sub(1)),
+        })
+    }
+
     /// Every live entry's key and record offset at the tree's current block;
     /// `None` without an entry file.
     pub fn live_entry_offsets(&self) -> Option<Vec<([u8; 32], u64)>> {
@@ -2205,6 +2229,27 @@ mod tests {
         }
         // An unknown block is not moved to.
         assert!(!forest.restore_path_to(&[h(7)], h(7)).unwrap());
+    }
+
+    /// A build on an ancestor of the canonical head is refused before the
+    /// tree moves; the head, a block above it and a side branch are not.
+    #[test]
+    fn a_build_on_an_ancestor_of_the_head_is_refused() {
+        let mut forest = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap();
+        forest.apply(GENESIS, h(1), 1, &changes(1)).unwrap();
+        forest.apply(h(1), h(2), 2, &changes(2)).unwrap();
+        forest.set_canonical(h(2)).unwrap();
+        forest.apply(h(2), h(3), 3, &changes(3)).unwrap();
+        forest.set_keep_from(Some(2));
+        let err = forest.check_build_parent(&h(1)).unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::StaleBuildParent { parent_number: 1, head_number: 2, persisted: Some(1), .. }
+        ), "{err}");
+        assert!(err.to_string().contains("block 1") && err.to_string().contains("head 2"), "{err}");
+        assert!(forest.check_build_parent(&h(2)).is_ok(), "the head");
+        assert!(forest.check_build_parent(&h(3)).is_ok(), "above the head");
+        assert!(forest.check_build_parent(&h(7)).is_ok(), "unknown: compute reports it");
     }
 
     /// A reader's keep holds the records from its block up past the retention

@@ -219,6 +219,26 @@ pub enum StateError {
     /// history and not only on its state.
     #[error("no QMDB tree for parent block {0}")]
     UnknownParent(B256),
+    /// A block was to be built on an ancestor of the canonical head: a stale
+    /// build. Computing it would move the tree below the head, taking the
+    /// undos of every canonical block above the parent (the persisted ones'
+    /// listing included) and holding the forest for the whole revert, so it
+    /// is refused before the tree moves.
+    #[error(
+        "refused a build on block {parent_number} ({parent}): it is below the canonical head \
+         {head_number}{}, a stale parent",
+        persisted.map(|f| format!(" (persisted {f})")).unwrap_or_default()
+    )]
+    StaleBuildParent {
+        /// The parent asked for.
+        parent: B256,
+        /// Its number.
+        parent_number: u64,
+        /// The canonical head's number.
+        head_number: u64,
+        /// The block the reader's database persisted last, when known.
+        persisted: Option<u64>,
+    },
     /// A block was named that no tree is held for.
     #[error("no QMDB tree for block {0}")]
     UnknownBlock(B256),

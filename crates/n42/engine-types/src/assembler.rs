@@ -295,7 +295,7 @@ where
                             job.state.compute_operations(job.parent, ops).map_err(|e| e.to_string())
                         } else {
                             let changes = n42_qmdb_reth::changes_from_execution(bundle, job.prague);
-                            job.state.compute(job.parent, &changes).map_err(|e| e.to_string())
+                            job.state.compute_build(job.parent, &changes).map_err(|e| e.to_string())
                         };
                         *job.out.lock().unwrap_or_else(|p| p.into_inner()) = Some(prepared);
                         qmdb_ms.store(at.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);

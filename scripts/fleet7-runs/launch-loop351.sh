@@ -1,9 +1,9 @@
 #!/bin/bash
-# loop351 (200k, 7 keys on one layer, 50 ms pacing; derive351.py). usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z|aa|ab|ac|ad|ae|af|ag|ah|ai|aj|ak|al|am|an|ao|ap|aq|ar|as|at|au>. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh f > target/fleet-runs/loop351f.out 2>&1 &
+# loop351 (200k, 7 keys on one layer, 50 ms pacing; derive351.py). usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z|aa|ab|ac|ad|ae|af|ag|ah|ai|aj|ak|al|am|an|ao|ap|aq|ar|as|at|au|av>. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh f > target/fleet-runs/loop351f.out 2>&1 &
 # Waits for the box, checks the tree, and runs the stage. When crates/ or bin/ changed since the last build, the launcher builds target/native (the legs' F7_BIN) after the box is free and the runner
 # runs its own test gate, clippy and the target/deferred build (once: this launcher does not export LOOP351_GATE_TREES for a changed tree). Unchanged tree: no build, no tests.
 cd /data/n42-build/wt338
-STAGE=${1:-a}; case $STAGE in a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z|aa|ab|ac|ad|ae|af|ag|ah|ai|aj|ak|al|am|an|ao|ap|aq|ar|as|at|au) ;; *) echo "usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z|aa|ab|ac|ad|ae|af|ag|ah|ai|aj|ak|al|am|an|ao|ap|aq|ar|as|at|au>"; exit 2;; esac
+STAGE=${1:-a}; case $STAGE in a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z|aa|ab|ac|ad|ae|af|ag|ah|ai|aj|ak|al|am|an|ao|ap|aq|ar|as|at|au|av) ;; *) echo "usage: launch-loop351.sh <a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z|aa|ab|ac|ad|ae|af|ag|ah|ai|aj|ak|al|am|an|ao|ap|aq|ar|as|at|au|av>"; exit 2;; esac
 # the tree (crates/ and bin/) the binaries in target/native and target/deferred were built from: f2794a821 until a build here records another (the marker is written after a stage that built)
 MARK=target/fleet-runs/loop351-built-trees
 BUILT=f2794a821
@@ -30,6 +30,7 @@ else
   PKGS="-p n42 --bin n42 -p n42-h2-node --example h2_validator --example tx_flood --example h2_keygen --example send_tx"
   if ! RUSTFLAGS="-C target-cpu=native" nice -n 19 cargo build -j16 --release --target-dir target/native $PKGS > target/fleet-runs/build-native-loop351.log 2>&1; then echo "NATIVE BUILD FAILED"; grep -E '^error' -A6 target/fleet-runs/build-native-loop351.log | head -40; echo ALLDONE; exit 1; fi
   grep -aq N42_IMPORT_ONCE target/native/release/n42 || { echo "the built n42 does not know N42_IMPORT_ONCE; no leg can run"; echo ALLDONE; exit 1; }
+  grep -aq N42_BUILD_MLP target/native/release/n42 || { echo "the built n42 does not know N42_BUILD_MLP; nothing run"; echo ALLDONE; exit 1; }
   grep -aq N42_MERGE_SPLIT target/native/release/n42 || { echo "the built n42 does not know N42_MERGE_SPLIT; nothing run"; echo ALLDONE; exit 1; }
   grep -aq N42_FAR_AHEAD_BLOCKS target/native/release/examples/h2_validator || { echo "the built h2_validator does not know N42_FAR_AHEAD_BLOCKS; nothing run"; echo ALLDONE; exit 1; }
   [ -z "$(find crates bin -name '*.rs' -newer target/native/release/n42 | head -1)" ] || { echo "a source file is newer than the native binary; nothing run"; echo ALLDONE; exit 1; }

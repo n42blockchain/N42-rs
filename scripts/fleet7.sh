@@ -345,7 +345,9 @@ cmd_roll() {
   d=$(f7_node_dir "$i")
   f7_check_genesis || return 1
   f7_load_peerids
-  before=$(f7_height "$i")
+  # A member that is already down answers nothing; under `set -e` a failed
+  # substitution would abort the roll before it restarts anything.
+  before=$(f7_height "$i" || true)
   if ((kill)); then
     # The closest thing to a power cut: no flush, no graceful QMDB/MDBX close.
     # Deliberately bypasses f7_stop's never-SIGKILL rule; the execution layer
@@ -392,7 +394,7 @@ cmd_roll() {
   { grep -a "QMDB" "$d/el.log" || true; } | sed 's/\x1b\[[0-9;]*m//g' | head -4
   # A node that restarts but never commits again is worse than one that stayed
   # down, because the fleet still counts it toward a quorum it is not serving.
-  echo "node $i: waiting to commit again..."
+  after=$(f7_height "$i" || true)
   for _ in $(seq 1 120); do grep -aq "^COMMIT" "$d/v.log" 2>/dev/null && break; sleep 1; done
   after=$(f7_height "$i")
   echo "node $i: height ${after:--} (fleet $(f7_height 0)), commits since restart $(grep -ac '^COMMIT' "$d/v.log")"

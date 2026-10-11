@@ -155,3 +155,22 @@ Result: member 3 did NOT rejoin. Its execution layer failed to start: on open, r
 Other six: kept committing through and after the kill (common height of the others 62 at the kill, 108 about two minutes later, 111 at teardown), as expected with n=7, f=2.
 
 Finding: the BFT side of a SIGKILL restart (checkpoint and vote log restore) is fine; the gap is execution-layer crash recovery on a QMDB chain. After SIGKILL the consistency heal unwinds through the stock `MerkleUnwind` stage, which cannot verify the root for a QMDB-scheme chain. Next step: make `check_consistency` heal the QMDB forest to the MDBX tip (or roll MDBX forward) instead of unwinding, then rerun this test. The datadir of member 3 was left in the failed state under /data/blockchain/rust-fleet7/node3 until the next `up --fresh`.
+
+## Execution-layer recovery fixed, 2026-10-11
+
+Root cause: since the reth 2.7.0 upgrade of 2026-10-02, `DEFAULT_NUM_STATE_MASKING_BLOCKS` is 30, so the hashed-state frontier trails the database tip by up to 30 blocks. A graceful stop catches the frontier up; a SIGKILL does not. On the next start reth's consistency check unwound the frontier through `MerkleUnwind`, which cannot verify a QMDB root and failed with "mismatched block state root".
+
+Fix: commits 4ab22608b (the masking suffix is forced to 0 on a QMDB chain; log line "State masking suffix is off on a QMDB chain") and 8e3e20154 (a lagging frontier is healed forward to the database tip instead of unwound; log line "Healed the hashed-state frontier forward to the database tip").
+
+Rerun: same shape as above (seven members, `scripts/fleet7.sh roll 3 --kill` after the fleet agreed past height 60), two legs.
+
+| Leg | Binary at up / at restart | Height at kill (member 3 / others) | Heal line | Rejoined | +60 s (member 3 / member 0) | +120 s (member 3 / member 0) |
+| --- | --- | --- | --- | --- | --- | --- |
+| A, upgrade | pre-fix / fixed | 64 / ~64 | frontier=16 tip=46 | NO | 46 / 82 | 46 / 99 |
+| B, fixed end to end | fixed / fixed | 68 / ~68 | none (masking suffix off) | yes | 91 / 91 | 111 / 111 |
+
+Leg B passes: no heal line, no unwind, the execution layer stays up, the validator logs "resuming at view 70 (last voted 69)" and commits alongside the others within 60 s.
+
+Leg A shows the heal itself works (no unwind, no "Failed to verify block state root", execution layer up) but member 3 still did not rejoin. A datadir written by the pre-fix binary has its QMDB forest at block 46 and a plain state that, after the heal, does not reproduce the same root: the first pulled block (47) is rejected with "block's state root does not match its QMDB root" (computed 0x2eaa4ab8..., header 0x60d6ced8..., re-execution gives 0x1922d606...), every later payload "links to previously rejected block", and the validator's catch-up stops at 46. So an upgrade in place from a lagging-frontier datadir is not recovered by the heal; such a member needs a fresh execution layer (`LATE_VALIDATOR` / `LATE_SNAPSHOT` path) after the upgrade. Whether the 46 state is wrong in the plain tables or in the QMDB forest is not yet determined (witness dumps are under `el/invalid_block_hooks/witness/` of that run).
+
+Remaining gaps: the execution layer now restarts after SIGKILL on a QMDB chain written entirely by the fixed binary (leg B). The in-place upgrade case (leg A) still needs a root-cause investigation of the post-heal state mismatch, or an operator rule to resync such a member.

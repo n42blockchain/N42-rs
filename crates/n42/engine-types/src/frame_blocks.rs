@@ -108,6 +108,10 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
         times.ahead_discard = took.ahead_discard.map_or("", n42_tx_queue::AheadDiscard::name);
         times.ahead_wait_us = took.ahead_wait_us;
         times.ahead_wait_timeout = took.ahead_wait_timeout;
+        times.frames_index = took.frames_index;
+        times.frames_swept_at_take = took.frames_swept_at_take;
+        times.frames_refused_at_cap = took.frames_refused_at_cap;
+        times.frames_skipped = plan.skipped;
         if !plan.frames.is_empty()
             && WANT_BULK.with(std::cell::Cell::get)
             && pull_by_frames()
@@ -388,6 +392,17 @@ pub struct SelectTimes {
     pub ahead_wait_us: u64,
     /// Whether that wait ran out before the plan was full.
     pub ahead_wait_timeout: bool,
+    /// The live frame index's size at the start, the frames that left it
+    /// at a take since the previous start (`N42_FRAME_SWEEP_AT_TAKE`), the
+    /// frames refused at its bound since the process started, and the
+    /// frames the plan passed over.
+    pub frames_index: usize,
+    /// Frames that left the index at a take since the previous start.
+    pub frames_swept_at_take: u64,
+    /// Frames refused at the index's bound, since the process started.
+    pub frames_refused_at_cap: u64,
+    /// Frames the plan passed over.
+    pub frames_skipped: usize,
     /// `N42_PULL_BY_FRAMES`: the transactions taken out of the frames at
     /// once, and how long that took.
     pub bulk_txs: usize,
@@ -418,6 +433,10 @@ std::thread_local! {
             ahead_discard: "",
             ahead_wait_us: 0,
             ahead_wait_timeout: false,
+            frames_index: 0,
+            frames_swept_at_take: 0,
+            frames_refused_at_cap: 0,
+            frames_skipped: 0,
             bulk_txs: 0,
             bulk_us: 0,
             body_ahead: 0,

@@ -855,6 +855,8 @@ struct Inner<T: PoolTransaction> {
     /// any of them is refused at once ([`Inner::prepared_verdict`]), not
     /// after the prune's last batch.
     pruning: Option<Arc<AddressHashMap<u64>>>,
+    /// [`frames::FrameIndex::swept_at_take`] at the last build start.
+    swept_reported: u64,
 }
 
 /// A whole take handed off to an own block: the build counter of the build
@@ -909,7 +911,7 @@ impl<T: PoolTransaction> Prepared<T> {
 
     /// Whether a build with `gas_limit` would take nothing more after it:
     /// its last frame was cut, or no transaction's gas is left.
-    fn full(&self, gas_limit: u64) -> bool {
+    const fn full(&self, gas_limit: u64) -> bool {
         self.cut || gas_limit.saturating_sub(self.gas_used) < MIN_FRAME_TX_GAS
     }
 }
@@ -1737,6 +1739,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 handed: None,
                 lanes_gen: 0,
                 pruning: None,
+                swept_reported: 0,
             })),
             inbox: Arc::new(Mutex::new(Vec::new())),
             staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1763,6 +1766,14 @@ impl<T: PoolTransaction> TxQueue<T> {
     #[must_use]
     pub fn with_plan_ahead_wait(self, ms: u64) -> Self {
         self.ahead_wait.wait_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// The same queue with `N42_FRAME_SWEEP_AT_TAKE` set to `on` whatever
+    /// the environment says. What a test uses to choose the path.
+    #[must_use]
+    pub fn with_frame_sweep_at_take(self, on: bool) -> Self {
+        self.lock_inner_quiet().frames.sweep_at_take = on;
         self
     }
 
@@ -2491,6 +2502,13 @@ impl<T: PoolTransaction> TxQueue<T> {
             let (mut inner, held) = timed(&mut lock_us);
             let Inner { frames, lanes, .. } = &mut *inner;
             swept += frames.sweep_ids_into(chunk, lanes, &mut garbage.frames);
+            held_us += held.elapsed().as_micros() as u64;
+        }
+        {
+            // The frames aside (`N42_FRAME_SWEEP_AT_TAKE`) the chain mined.
+            let (mut inner, held) = timed(&mut lock_us);
+            let Inner { frames, lanes, .. } = &mut *inner;
+            swept += frames.sweep_retired_into(lanes, &mut garbage.frames);
             held_us += held.elapsed().as_micros() as u64;
         }
         if swept > 0 {
@@ -3231,6 +3249,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         let ((segments, plan), mark) = {
             let mut inner = self.lock_inner();
             times.lock_us = at.elapsed().as_micros() as u64;
+            inner.note_index(&mut times);
             let begin_at = std::time::Instant::now();
             // The inbox first: an arrival below a prepared plan's nonces must
             // be in its lane when the plan is judged.
@@ -3439,7 +3458,10 @@ impl<T: PoolTransaction> TxQueue<T> {
             if !current {
                 return;
             }
-            inner.pending.clear();
+            let noted = std::mem::take(&mut inner.pending);
+            for (id, prefix) in &noted {
+                inner.frames.retire(id, *prefix);
+            }
             inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
             inner.split_runs(&first, &mut garbage.lanes);
             inner.settling = runs;
@@ -3499,14 +3521,14 @@ impl<T: PoolTransaction> TxQueue<T> {
                 // moves its last transaction.
                 let mut inner = self.lock_inner_quiet();
                 self.drain_inbox_block(&mut inner);
-                let next = if inner.builds != after {
-                    Next::Done
-                } else {
+                let next = if inner.builds == after {
                     match &inner.prepared {
                         None => Next::Prepare,
                         Some(p) if p.after == after && !p.full(gas_limit) => Next::TopUp,
                         Some(_) => Next::Done,
                     }
+                } else {
+                    Next::Done
                 };
                 (next, inner.frames.inserted)
             };
@@ -3565,7 +3587,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         }
         let mut lowest: AddressHashMap<u64> = AddressHashMap::default();
         for frame in &more_plan.frames {
-            let Some((runs, _)) = inner.frames.runs_and_hashes(&frame.id) else { continue };
+            let Some((runs, _)) = inner.frames.runs_and_hashes_any(&frame.id) else { continue };
             for run in runs.iter().filter(|run| (run.start as usize) < frame.taken) {
                 let entry = lowest.entry(run.sender).or_insert(run.first_nonce);
                 *entry = (*entry).min(run.first_nonce);
@@ -3809,6 +3831,9 @@ impl<T: PoolTransaction> TxQueue<T> {
         }
         inner.len -= removed;
         inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+        for frame in &plan.frames {
+            inner.frames.retire(&frame.id, frame.taken);
+        }
         let lowest: AddressHashMap<u64> = runs.iter().map(|(sender, (lo, _))| (*sender, *lo)).collect();
         let cut = plan.frames.last().is_some_and(|frame| frame.taken < frame.len);
         let body = hook.is_some().then(|| {
@@ -3981,6 +4006,14 @@ impl<T: PoolTransaction> Inner<T> {
 }
 
 impl<T: PoolTransaction> Inner<T> {
+    /// A build start's index fields ([`FrameSelectTimes::frames_index`]).
+    pub(crate) fn note_index(&mut self, times: &mut FrameSelectTimes) {
+        times.frames_index = self.frames.len();
+        times.frames_swept_at_take = self.frames.swept_at_take - self.swept_reported;
+        self.swept_reported = self.frames.swept_at_take;
+        times.frames_refused_at_cap = self.frames.refused_at_cap;
+    }
+
     /// The frame plan of [`TxQueue::frames_for_build`], taken out of the
     /// lanes: the transactions in plan order, as one segment per frame (the
     /// frame's shared transactions and how many of them from its start),
@@ -4091,7 +4124,10 @@ impl<T: PoolTransaction> Inner<T> {
         let pending = std::mem::take(&mut self.pending);
         let mut list = self.last_build.as_mut().map(|(_, list)| list);
         for (id, prefix) in pending {
-            let Some((runs, _)) = self.frames.runs_and_hashes(&id) else { continue };
+            // Read live or aside: a frame retired below by an earlier take
+            // of the same id cannot be noted twice, but a reader must not
+            // depend on the order.
+            let Some((runs, _)) = self.frames.runs_and_hashes_any(&id) else { continue };
             if let Some(list) = list.as_mut() {
                 list.reserve(prefix);
             }
@@ -4115,6 +4151,8 @@ impl<T: PoolTransaction> Inner<T> {
                     lane.queued = false;
                 }
             }
+            // `N42_FRAME_SWEEP_AT_TAKE`: taken whole, it leaves the live index.
+            self.frames.retire(&id, prefix);
         }
     }
 
@@ -4197,6 +4235,7 @@ impl<T: PoolTransaction> Inner<T> {
                     debug_assert_eq!(taken, txs.len());
                     plan.push_hashes(Arc::clone(hashes), txs.len());
                     plan.frames.push(PlannedFrame { id, len: txs.len(), taken: txs.len() });
+                    self.frames.retire(&id, txs.len());
                     times.by_ref += 1;
                     segments.push((txs, taken));
                     *gas_left = gas_left.saturating_sub(gas);
@@ -4291,6 +4330,7 @@ impl<T: PoolTransaction> Inner<T> {
             }
             plan.push_hashes(taken_hashes.into(), taken);
             plan.frames.push(PlannedFrame { id, len: members.len(), taken });
+            self.frames.retire(&id, taken);
             *gas_left = gas_left.saturating_sub(gas);
             SlowFrame::Taken(out, taken == members.len())
         }
@@ -4403,7 +4443,7 @@ impl<T: PoolTransaction> Inner<T> {
         }
         let mut lowest: AddressHashMap<u64> = AddressHashMap::default();
         for frame in &plan.frames {
-            let Some((runs, _)) = inner.frames.runs_and_hashes(&frame.id) else { continue };
+            let Some((runs, _)) = inner.frames.runs_and_hashes_any(&frame.id) else { continue };
             for run in runs.iter().filter(|run| (run.start as usize) < frame.taken) {
                 let entry = lowest.entry(run.sender).or_insert(run.first_nonce);
                 *entry = (*entry).min(run.first_nonce);
@@ -4543,6 +4583,17 @@ impl<T: PoolTransaction> Inner<T> {
     /// height the chain settled elsewhere comes back -- and nothing would
     /// remove it a second time.
     fn give_back(&mut self, taken: Vec<Arc<ValidPoolTransaction<T>>>) -> GaveBack {
+        // `N42_FRAME_SWEEP_AT_TAKE`: a take coming back whole brings its
+        // frames back to the live index (each found by its first hash; a
+        // mined one is swept again by the next prune). A frame only partly
+        // returned stays aside: its transactions are frameless at their
+        // lanes, and the slow puller and the per-transaction check take
+        // them, as before.
+        if self.frames.retired_len() > 0 {
+            for valid in &taken {
+                self.frames.revive_by_first(valid.hash());
+            }
+        }
         let mut senders: Vec<Address> = Vec::new();
         let mut unparked: Vec<Address> = Vec::new();
         let mut gave = GaveBack::default();
@@ -5201,6 +5252,15 @@ pub struct FrameSelectTimes {
     pub ahead_wait_us: u64,
     /// Whether the wait above ran out before the plan was full.
     pub ahead_wait_timeout: bool,
+    /// The live frame index's size at this build's start, the frames that
+    /// left it at a take since the previous build's start
+    /// (`N42_FRAME_SWEEP_AT_TAKE`), and the frames it has refused at
+    /// [`MAX_FRAMES`] since the process started.
+    pub frames_index: usize,
+    /// Frames that left the index at a take since the previous start.
+    pub frames_swept_at_take: u64,
+    /// Frames refused at the bound, since the process started.
+    pub frames_refused_at_cap: u64,
 }
 
 /// How a frame build selects ([`Inner::plan_frames`]); the plan is the

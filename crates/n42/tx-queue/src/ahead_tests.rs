@@ -554,3 +554,57 @@ fn without_the_switch_a_build_never_waits() {
     assert_eq!((times.ahead_wait_us, times.ahead_wait_timeout), (0, false));
     assert_eq!(queue.ahead_wait.inflight.load(std::sync::atomic::Ordering::Acquire), 0);
 }
+
+/// `N42_FRAME_SWEEP_AT_TAKE`: the frames a build takes whole leave the
+/// live index at the take, so the next build walks no dead frame; a build
+/// on the same parent after one given up gets the given-back frames whole
+/// again (they come back to the index with their transactions).
+#[test]
+fn a_taken_frame_leaves_the_index_at_the_take_and_comes_back_with_a_given_up_build() {
+    let gas = 50 * 21_000;
+    let queue: TxQueue<EthPooledTransaction> = TxQueue::new().with_frame_sweep_at_take(true);
+    // Rounds 0 and 1 of 10 senders (5 nonces each) and one mixed frame.
+    fill(&queue, 10, 2, 5, 0);
+    queue.drain_now();
+    assert_eq!(queue.frames_indexed(), 21);
+    // A build given up: its take comes back whole, frames and all.
+    let (given_up, _, times) = build(&queue, block_hash(0), gas, false);
+    assert_eq!(given_up.len(), 50);
+    assert_eq!(times.frames_index, 21);
+    assert_eq!(queue.frames_indexed(), 11);
+    let (first, plan, times) = build(&queue, block_hash(0), gas, false);
+    assert_eq!(pairs(&first), pairs(&given_up));
+    assert_eq!((times.by_ref, times.slow, plan.skipped), (10, 0, 0), "{times:?}");
+    assert_eq!(times.frames_swept_at_take, 10);
+    assert_eq!(queue.frames_indexed(), 11);
+    seal(&queue, block_hash(0), 1, block_hash(1), &first);
+    // The next build skips nothing: round 0's frames are not in its walk.
+    let (second, plan, times) = build(&queue, block_hash(1), gas, false);
+    assert_eq!(second.len(), 50);
+    assert_eq!(plan.skipped, 0, "{plan:?}");
+    assert_eq!(times.frames_index, 11);
+    assert_chain_valid(&[first, second]);
+}
+
+/// At [`MAX_FRAMES`] live frames a new frame is refused, not the oldest
+/// evicted: every indexed frame's transactions stay reachable by frame, and
+/// the refused frame's transaction is still queued. With the switch off the
+/// oldest leaves, as before.
+#[test]
+fn a_full_index_refuses_a_new_frame_instead_of_evicting_a_live_one() {
+    for on in [true, false] {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new().with_frame_sweep_at_take(on);
+        for s in 0..=MAX_FRAMES as u64 {
+            frame(&queue, sender(s), 0, 1);
+        }
+        queue.drain_now();
+        assert_eq!(queue.frames_indexed(), MAX_FRAMES);
+        assert_eq!(queue.len(), MAX_FRAMES + 1);
+        let inner = queue.lock_inner_quiet();
+        let oldest = frame_id(sender(0), 0);
+        let newest = frame_id(sender(MAX_FRAMES as u64), 0);
+        assert_eq!(inner.frames.txs_gas_of(&oldest).is_some(), on, "switch {on}");
+        assert_eq!(inner.frames.txs_gas_of(&newest).is_some(), !on, "switch {on}");
+        assert_eq!(inner.frames.refused_at_cap, u64::from(on));
+    }
+}

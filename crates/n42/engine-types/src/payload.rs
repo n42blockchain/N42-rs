@@ -4234,6 +4234,15 @@ where
                     start_best_other_ms,
                     start_frames_by_ref = select_times.by_ref,
                     start_frames_slow = select_times.slow,
+                    // The frames the plan passed over, the live frame
+                    // index at this start, the frames that left it at a
+                    // take since the previous start
+                    // (`N42_FRAME_SWEEP_AT_TAKE`), and the frames it refused
+                    // at its bound (since the process started).
+                    start_frames_skipped = select_times.frames_skipped,
+                    start_frames_index = select_times.frames_index,
+                    start_frames_swept_at_take = select_times.frames_swept_at_take,
+                    start_frames_refused_at_cap = select_times.frames_refused_at_cap,
                     // `N42_PLAN_AHEAD`: 0 the plan was made at this start,
                     // 1 it was prepared while the parent executed, 2 and
                     // topped up here; its age at use, its preparation's

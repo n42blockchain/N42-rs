@@ -3718,3 +3718,21 @@ Stage av (tree 9f0272cb5, X11 set at 30 ms, pool 26-28 GB):
 | X11b, control | 4.11 | 3.86 | 3.96 | 357.8M | | | |
 
 The lookahead issues one hint per transaction and changes nothing in the execution's median (16-17 ms): the misses are not where the hint reaches (the batch map, the overlay filters, the shard index, the QMDB index bucket), or the distance of k transactions is the wrong scale for a ~440-cycle miss, or the dependent chain's later links (the entry record, journals) are the misses. What the legs do show is a flatter tail: sealed_at p90 59 -> 46 and windows 2-3 at 4.0-4.15 for k = 4 and 16 (371.6M and 374.4M against 355.0M and 357.8M for the two controls), which is a 4-5% difference between single rounds and therefore not a result until repeated. X11MLP8 lost its windows 2-3 to the same disturbance as stage ar's control: 60 `an own block was still held when the bound was reached; its transactions are lost to the queue` warnings in the first-full-block minute (open item; it recurs on some legs and is not tied to a switch). Stage aw profiles the build's threads with symbols (`cargo build --profile profiling`, `perf record` on the n42-build threads in window 1) to find the miss sites before the next prefetch attempt.
+
+### 10.120 loop351 stage aw — the build's threads with symbols: a third of their cycles are the recipient's read below the batch map, and about 17% of all cycles are software overhead in that read path, not memory
+
+Stage aw (75bb4b9da: a profiled X11 leg on a `--profile profiling` binary with `target-cpu=native`, `perf record` on the n42-build threads in window 1, 101k cycle samples; the leg read 3.66M in window 1 and lost window 2 to the DWARF flush; call graphs did not resolve, so the attribution is flat by symbol):
+
+| where the build thread's cycles go | share |
+| --- | --- |
+| the per-read wrapper of `MemoryOverlayStateProvider`: every `basic_account` (and every hint) goes through the delegate macro's `as_ref()`, which boxes `historical`, clones `trie_input` and drops both (malloc 4.7, drop glue 3.5, sdallocx 3.2) | ~11% |
+| `keccak256(address)` computed eagerly in storage-overlay before the QMDB reader answers (unused on the QMDB branch) | 3.8% |
+| one MDBX `StageCheckpoints` get per read (`n42_hashed_state_version`) | ~1% + 2.5% of fills |
+| the QMDB view: the journal filter walk in `read_at`, `account`, the offset index, decode, the entry record | ~7% |
+| the parent layers: `FrozenShards::get` 5.0 (samples on the hashbrown control-group probe and the key compare: table misses), `MemoryOverlay::basic_account` 5.1, `ShardLayer` 1.9, `OverlayStateProvider` 1.7, `WarmDb` 0.8 | ~14% |
+| the batch's own map (`BatchState::basic`, the BundleAccount maps, the address hash, `loaded`) | ~14% |
+| the loop itself (`execute_for_build_opts` with `transfer_plain` and the slot writes inlined 8.5, U256 add 4.2 -- skid from a stalled load --, the AltSig `TxEnv` 2.3 + clone 1.3) | ~16% |
+| the sink and the bundle (`take_bundle` reverts 3.5, `OutputShards::add` 2.5) | 6% |
+| kernel, unresolved | 8% |
+
+Two findings change the plan. First, the av hint never reached the QMDB index: `OverlayStateProvider` has no `n42_prefetch_account`, so storage-api's default `false` stopped it, and each hint paid the same Box alloc and free as a read -- which is why the lookahead left `par_exec` flat. Second, before any prefetch there is ~17% of software to remove from the read path: implement `basic_account` and the hint directly on `MemoryOverlayStateProvider` without the per-call `as_ref()`, compute the keccak only on the non-QMDB branch, cache the hashed-state version per provider, and forward the hint through `OverlayStateProvider` to the reader. All three are unconditional (no result changes); stage ax measures them with X11 and X11+MLP16 alternating.

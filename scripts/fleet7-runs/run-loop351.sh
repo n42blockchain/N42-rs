@@ -747,21 +747,36 @@ case $STAGE in
      b7 D2S12P30T64X10ISOCRIT16b $D2 $S1 $S2 $X10 $T64 $ISOCRIT16 F7_BLOCK_INTERVAL_MS=30 ;;
   ar) mk WARM 7 16; warm_gate WARM
      # the X10 set at 30 ms pacing, N42_CORE_LAYOUT unset: the cuts of the own-block answer's latency (rate ~ (seal->answer - 19 ms) / 4, loop351 X10e).
-     # MS = the leader's post-publication merge in two halves at once (N42_MERGE_SPLIT=1), S3 = the merge at shards_ready on a 16-thread pool,
+     # MSPLIT = the leader's post-publication merge in two halves at once (N42_MERGE_SPLIT=1), S3 = the merge at shards_ready on a 16-thread pool,
      # AAI = the answer at the hand-off insert, F2 = the vote hold one block further (a 5-block window; parent outputs kept raised to 6 for slack)
      D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
      X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
      SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
-     MS="N42_MERGE_SPLIT=1"; AAI="N42_ANSWER_AT_INSERT=1"; F2="N42_FAR_AHEAD_BLOCKS=2 N42_PARENT_OUTPUTS_KEPT=6"
+     MSPLIT="N42_MERGE_SPLIT=1"; AAI="N42_ANSWER_AT_INSERT=1"; F2="N42_FAR_AHEAD_BLOCKS=2 N42_PARENT_OUTPUTS_KEPT=6"
      b7 D2S12P30T64X10f $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=30
-     b7 D2S12P30T64X10MS $D2 $S1 $S2 $X10 $T64 $MS F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MS $D2 $S1 $S2 $X10 $T64 $MSPLIT F7_BLOCK_INTERVAL_MS=30
      b7 D2S12P30T64X10S3 $D2 $S1 $S2 $X10 $T64 $S3 F7_BLOCK_INTERVAL_MS=30
      b7 D2S12P30T64X10AAI $D2 $S1 $S2 $X10 $T64 $AAI F7_BLOCK_INTERVAL_MS=30
-     b7 D2S12P30T64X10MSAAI $D2 $S1 $S2 $X10 $T64 $MS $AAI F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MSAAI $D2 $S1 $S2 $X10 $T64 $MSPLIT $AAI F7_BLOCK_INTERVAL_MS=30
      b7 D2S12P30T64X10S3AAI $D2 $S1 $S2 $X10 $T64 $S3 $AAI F7_BLOCK_INTERVAL_MS=30
      b7 D2S12P30T64X10F2 $D2 $S1 $S2 $X10 $T64 $F2 F7_BLOCK_INTERVAL_MS=30
-     b7 D2S12P30T64X10MSAAIF2 $D2 $S1 $S2 $X10 $T64 $MS $AAI $F2 F7_BLOCK_INTERVAL_MS=30 ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq or ar)"; exit 2 ;;
+     b7 D2S12P30T64X10MSAAIF2 $D2 $S1 $S2 $X10 $T64 $MSPLIT $AAI $F2 F7_BLOCK_INTERVAL_MS=30 ;;
+  as) mk WARM 7 16; warm_gate WARM
+     # the X10 set at 30 ms pacing, N42_CORE_LAYOUT unset except the last leg: stage ar's answer cuts repeated (its MS legs failed on a variable collision):
+     # MSPLIT = N42_MERGE_SPLIT=1, AAI = the answer at the hand-off insert, F2 = the vote hold one block further, C16 = the aq ISOCRIT16 layout
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     MSPLIT="N42_MERGE_SPLIT=1"; AAI="N42_ANSWER_AT_INSERT=1"; F2="N42_FAR_AHEAD_BLOCKS=2 N42_PARENT_OUTPUTS_KEPT=6"
+     C16="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_SIBLINGS=background N42_CORE_LAYOUT_BEHIND=background"
+     b7 D2S12P30T64X10g $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MS $D2 $S1 $S2 $X10 $T64 $MSPLIT F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MSb $D2 $S1 $S2 $X10 $T64 $MSPLIT F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MSAAI $D2 $S1 $S2 $X10 $T64 $MSPLIT $AAI F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MSAAIb $D2 $S1 $S2 $X10 $T64 $MSPLIT $AAI F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MSAAIF2 $D2 $S1 $S2 $X10 $T64 $MSPLIT $AAI $F2 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MSAAIC16 $D2 $S1 $S2 $X10 $T64 $MSPLIT $AAI $C16 F7_BLOCK_INTERVAL_MS=30 ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq, ar or as)"; exit 2 ;;
 esac
 
 if [ "${LOOP351_DRY:-0}" = 1 ]; then echo "dry run done"; exit 0; fi

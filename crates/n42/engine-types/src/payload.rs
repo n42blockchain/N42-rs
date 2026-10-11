@@ -922,6 +922,50 @@ fn receipts_from_slots<P: PoolTransaction<Consensus = TransactionSigned>>(
         .collect()
 }
 
+/// Where the thread merging a block's revert set (`N42_ANSWER_BEFORE_REVERTS`)
+/// is sent the promise to fill, once the execution it belongs to exists.
+type LateRevertsTx = std::sync::mpsc::SyncSender<n42_deferred_reverts::LateReverts>;
+
+/// `N42_ANSWER_BEFORE_REVERTS`: starts the merge of the block's complete
+/// revert set (`FrozenShards::late_reverts`: the residual's, the shards', then
+/// the graft's `graft`) on a thread of its own, beside the account half; it
+/// fills the promise it is sent ([`LateRevertsTx`]) and ends. `graft` comes
+/// back with `None` when no thread could be had: the caller merges whole.
+fn spawn_late_reverts(
+    shards: &Arc<crate::output_shards::FrozenShards>,
+    residual: &revm::database::BundleState,
+    graft: Vec<(alloy_primitives::Address, revm::database::AccountRevert)>,
+    pool: Option<&'static rayon::ThreadPool>,
+) -> (Vec<(alloy_primitives::Address, revm::database::AccountRevert)>, Option<LateRevertsTx>) {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<n42_deferred_reverts::LateReverts>(1);
+    let shards = Arc::clone(shards);
+    let block_reverts = residual.reverts.clone();
+    let cell = Arc::new(std::sync::Mutex::new(Some(graft)));
+    let taken = Arc::clone(&cell);
+    let spawned = std::thread::Builder::new().name("n42-merge-late-reverts".into()).spawn(move || {
+        n42_core_layout::background_thread();
+        let graft = taken.lock().ok().and_then(|mut cell| cell.take()).unwrap_or_default();
+        let at = std::time::Instant::now();
+        let (reverts, size) = shards.late_reverts(block_reverts, graft, pool);
+        let merged_us = at.elapsed().as_micros() as u64;
+        // The promise comes once the execution exists; a build that ended
+        // before that sends none, and nothing is owed.
+        if let Ok(promise) = rx.recv() {
+            let waited_us = (at.elapsed().as_micros() as u64).saturating_sub(merged_us);
+            promise.fill(reverts, size);
+            tracing::debug!(target: "payload_builder", merged_us, waited_us, size, "late revert set filled");
+        }
+    });
+    match spawned {
+        Ok(_) => (Vec::new(), Some(tx)),
+        Err(err) => {
+            tracing::warn!(target: "payload_builder", %err, "no thread for the late revert set; the merge runs whole");
+            let back = cell.lock().ok().and_then(|mut cell| cell.take()).unwrap_or_default();
+            (back, None)
+        }
+    }
+}
+
 /// The error of a step that runs after the block was proposed
 /// (`N42_SEAL_AT_EXEC=1`): the store's waiters are told at once and the
 /// failure is loud, as for the finish behind the seal. `sealed` is the
@@ -3553,7 +3597,7 @@ where
             // input (they join the merged bundle in the output below), and
             // `StateReady` and `Complete` stay where they are: after the
             // publication, which files this block's QMDB tree.
-            type EarlyMerge = (revm::database::BundleState, crate::output_shards::MergeSplit, u64, u32, std::time::Instant, std::time::Instant);
+            type EarlyMerge = (revm::database::BundleState, crate::output_shards::MergeSplit, u64, u32, std::time::Instant, std::time::Instant, Option<LateRevertsTx>);
             let (early_merge, shard_reverts): (Option<std::thread::JoinHandle<EarlyMerge>>, _) =
                 match crate::output_shards::merge_at_shards_ready().then(crate::output_shards::merge_pool).flatten() {
                     Some(pool) => {
@@ -3568,12 +3612,26 @@ where
                             n42_core_layout::background_thread();
                             let reverts = cell.lock().ok().and_then(|mut cell| cell.take()).unwrap_or_default();
                             let merge_at = std::time::Instant::now();
+                            // `N42_ANSWER_BEFORE_REVERTS`: the account half
+                            // here, the revert set beside it on a thread of
+                            // its own (on the same pool).
+                            let (reverts, late) = match n42_deferred_reverts::answer_before_reverts() {
+                                true => spawn_late_reverts(&shards, &residual.state, reverts, Some(pool)),
+                                false => (reverts, None),
+                            };
+                            if late.is_some() {
+                                let (merged, state_us) = shards.merged_state_first(&residual.state, Some(pool));
+                                let merge_end = std::time::Instant::now();
+                                let total_us = merge_end.duration_since(merge_at).as_micros() as u64;
+                                let split = crate::output_shards::MergeSplit { state_us, total_us, ..Default::default() };
+                                return (merged, split, 0, threads, merge_at, merge_end, late);
+                            }
                             let (mut merged, split) = shards.merged_on(&residual.state, pool);
                             let tail_at = std::time::Instant::now();
                             crate::parallel_transfer::append_reverts(&mut merged, reverts);
                             let merge_end = std::time::Instant::now();
                             let tail_us = merge_end.duration_since(tail_at).as_micros() as u64;
-                            (merged, split, tail_us, threads, merge_at, merge_end)
+                            (merged, split, tail_us, threads, merge_at, merge_end, None)
                         });
                         match spawned {
                             Ok(handle) => (Some(handle), Vec::new()),
@@ -3714,9 +3772,29 @@ where
                             handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
                         });
                         let join_wait_us = early.as_ref().map_or(0, |_| joined_at.elapsed().as_micros() as u64);
-                        let (merged, split, tail_us, threads, merge_at, merge_end, was_early) = match early {
-                            Some((merged, split, tail_us, threads, merge_at, merge_end)) => {
-                                (merged, split, tail_us, threads, merge_at, merge_end, true)
+                        let (merged, split, tail_us, threads, merge_at, merge_end, was_early, late) = match early {
+                            Some((merged, split, tail_us, threads, merge_at, merge_end, late)) => {
+                                (merged, split, tail_us, threads, merge_at, merge_end, true, late)
+                            }
+                            None if n42_deferred_reverts::answer_before_reverts() => {
+                                // `N42_ANSWER_BEFORE_REVERTS`: the account
+                                // half, the revert set beside it.
+                                let merge_at = std::time::Instant::now();
+                                let (graft, late) = spawn_late_reverts(&shards, &residual.state, shard_reverts, None);
+                                let (merged, split) = match late {
+                                    Some(_) => {
+                                        let (merged, state_us) = shards.merged_state_first(&residual.state, None);
+                                        let total_us = merge_at.elapsed().as_micros() as u64;
+                                        (merged, crate::output_shards::MergeSplit { state_us, total_us, ..Default::default() })
+                                    }
+                                    None => {
+                                        let (mut merged, split) = shards.merged_timed(&residual.state, false);
+                                        crate::parallel_transfer::append_reverts(&mut merged, graft);
+                                        (merged, split)
+                                    }
+                                };
+                                let merge_end = std::time::Instant::now();
+                                (merged, split, 0, 1, merge_at, merge_end, false, late)
                             }
                             None => {
                                 let merge_at = std::time::Instant::now();
@@ -3725,7 +3803,7 @@ where
                                 crate::parallel_transfer::append_reverts(&mut merged, shard_reverts);
                                 let merge_end = std::time::Instant::now();
                                 let tail_us = merge_end.duration_since(tail_at).as_micros() as u64;
-                                (merged, split, tail_us, 1, merge_at, merge_end, false)
+                                (merged, split, tail_us, 1, merge_at, merge_end, false, None)
                             }
                         };
                         let merge_ms = merge_end.duration_since(merge_at).as_millis() as u64;
@@ -3743,6 +3821,15 @@ where
                         };
                         let execution_output =
                             Arc::new(reth_execution_types::BlockExecutionOutput { state: merged, result: execution_result });
+                        // Owed its revert set (`N42_ANSWER_BEFORE_REVERTS`):
+                        // registered before anyone can see the execution,
+                        // and the promise handed to the thread that merges it.
+                        if let Some(late) = late {
+                            let promise = n42_deferred_reverts::register(&execution_output);
+                            if let Err(std::sync::mpsc::SendError(promise)) = late.send(promise) {
+                                drop(promise);
+                            }
+                        }
                         crate::built_executions::state_ready(
                             block_hash,
                             crate::built_executions::BuiltExecution {

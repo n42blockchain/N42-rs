@@ -878,7 +878,8 @@ pub fn freeze_pool_own() -> bool {
 
 /// The pool the work behind the seal runs on: with `N42_FREEZE_POOL=own` a
 /// pool of `N42_FREEZE_POOL_THREADS` threads (16 by default, `n42-behind-*`,
-/// in the layout's build set as the build pool's are), else [`build_pool`].
+/// in the layout's build set as the build pool's are, or the set
+/// `N42_CORE_LAYOUT_BEHIND` names), else [`build_pool`].
 /// A pool that cannot be built falls back to [`build_pool`].
 pub fn behind_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
@@ -891,7 +892,8 @@ pub fn behind_pool() -> &'static rayon::ThreadPool {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .thread_name(|i| format!("n42-behind-{i}"))
-            .start_handler(|_| n42_core_layout::enter(n42_core_layout::Set::Build))
+            // The build set unless `N42_CORE_LAYOUT_BEHIND` places it elsewhere.
+            .start_handler(|_| n42_core_layout::enter(n42_core_layout::Set::Behind))
             .build()
             .inspect_err(|err| tracing::warn!(target: "payload_builder", %err, "no pool of its own for the freeze; the build pool takes it"))
             .ok()

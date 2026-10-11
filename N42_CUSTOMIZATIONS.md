@@ -599,3 +599,16 @@
   账户，冻结集改为按批次记录 `removed`，view / merge / into_staged 均跳过它们；默认模式下 map 独占，行为不变。
   阶段行新增 `output_incremental`、`seal_to_shards_final_us`；`seal_to_shards_ready_us` 记录早期登记的时刻。测试
   `output_shards::incremental_tests`、`direct_build::tests::a_parent_filed_on_its_early_output_opens_as_on_its_frozen_set`。
+
+## 迟到的回滚集：先应答导入，再合并 reverts（`N42_ANSWER_BEFORE_REVERTS`，触及 chain-state 与 provider）
+- 新 crate `crates/n42/deferred-reverts`（`n42-deferred-reverts`）：按 `BlockExecutionOutput` 的地址登记"欠着完整回滚集"
+  的执行结果（登记表持有该输出，地址不会复用；别人都不再持有时条目被清掉），`resolve` / `complete_in_place` 等待填入。
+- `crates/n42/engine-types/src/payload.rs` `spawn_late_reverts` 与两条合并路径（发布之后、以及
+  `N42_MERGE_AT_SHARDS_READY` 的 shards-ready 路径）：开关打开（默认关，首次使用时记一行日志）时先只合并账户表
+  （`FrozenShards::merged_state_first`），以执行器自己的 reverts 登记 StateReady/Complete，导入随即可以应答；
+  分片与 graft 的回滚集在另一线程合并（`FrozenShards::late_reverts`），填入登记项。依据：loop351 af，
+  seal 到 state ready 152 ms，其中合并 91 ms（账户 37 + reverts 50）。
+- 读 reverts 的地方先解析完整回滚集（等待填入）：`crates/storage/provider/src/providers/n42_persist.rs`
+  `N42PlainReverts` / `n42_completed_output`，`database/provider.rs` `save_blocks_inner` 的 plain reverts 与
+  `write_state` 的慢路径，`consistent.rs` 六处内存块 changeset 读取；`crates/chain-state/src/in_memory.rs`
+  `n42_completed_outcome`（非 lean 通知的拷贝）。未登记的块按原样读取，行为不变。

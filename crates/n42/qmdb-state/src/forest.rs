@@ -923,6 +923,27 @@ impl QmdbForest {
         .then_some(changes)
     }
 
+    /// Stands the tree back on `block_hash`'s path when a held block among
+    /// `blocks` is not applied on it, so [`Self::block_changes`] can list them.
+    ///
+    /// A block computed on an older parent -- a sibling of a canonical block
+    /// the database has not persisted yet, built for a stale request -- moves
+    /// the tree off the canonical path and takes the undos of every canonical
+    /// block above that parent. Until the next canonical computation moves the
+    /// tree back, the canonical blocks' changes cannot be listed, and the read
+    /// view, persisting one of them in that window, was invalidated for good
+    /// (loop351 X9j: a stale build on block 1020 while 1021 was persisted).
+    /// `block_hash` is the newest of `blocks`; the tree is moved only when it
+    /// is held and one of `blocks` lacks its undo. Returns whether it moved.
+    pub fn restore_path_to(&mut self, blocks: &[B256], block_hash: B256) -> Result<bool, StateError> {
+        let off_path = |hash: &B256| self.records.get(hash).is_some_and(|record| record.undo.is_none());
+        if !self.records.contains_key(&block_hash) || !blocks.iter().any(off_path) {
+            return Ok(false);
+        }
+        self.move_to(block_hash)?;
+        Ok(true)
+    }
+
     /// Every live entry's key and record offset at the tree's current block;
     /// `None` without an entry file.
     pub fn live_entry_offsets(&self) -> Option<Vec<([u8; 32], u64)>> {
@@ -2145,6 +2166,45 @@ mod tests {
         for (key, offset) in live {
             assert_eq!(view.key(offset), key);
         }
+    }
+
+    /// A canonical block whose undo a sibling's computation took is listed
+    /// again once the tree is stood back on its path, with the offsets of the
+    /// records it re-appended.
+    #[test]
+    fn a_block_moved_off_the_path_by_a_sibling_is_listed_after_restoring_it() {
+        let dir = std::env::temp_dir().join(format!("n42-forest-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("entries.log");
+        let mut forest = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap().with_entry_file(&path).unwrap();
+        forest.apply(GENESIS, h(1), 1, &changes(1)).unwrap();
+        forest.apply(h(1), h(2), 2, &changes(2)).unwrap();
+        forest.apply(h(2), h(3), 3, &changes(3)).unwrap();
+        forest.set_canonical(h(3)).unwrap();
+        // A stale build on block 1: computed, not filed (the payload builder's
+        // root), it leaves the tree on the sibling with blocks 2 and 3 reverted.
+        let _sibling = forest.compute(h(1), &changes(9)).unwrap();
+        assert!(forest.block_changes(&h(2)).is_none(), "block 2 is off the tree's path");
+        assert!(!forest.restore_path_to(&[h(1)], h(1)).unwrap(), "block 1 is on the path");
+        assert!(forest.restore_path_to(&[h(2), h(3)], h(3)).unwrap());
+        assert!(!forest.restore_path_to(&[h(2), h(3)], h(3)).unwrap(), "already on the path");
+        forest.flush_entries_for_sync().unwrap();
+        let view = n42_twig_core::entry_view::EntryFileView::open(&path).unwrap();
+        for n in 2..=3u8 {
+            let listed = forest.block_changes(&h(n)).expect("back on the tree's path");
+            let ops = { let mut ops = changes(n).operations(); ops.sort_unstable_by_key(|op| op.key); ops };
+            assert_eq!(listed.len(), ops.len());
+            for ((key, offset), op) in listed.iter().zip(&ops) {
+                assert_eq!(*key, op.key);
+                match (offset, &op.value) {
+                    (Some(offset), Some(value)) => assert_eq!(view.record(*offset), (op.key, value.as_slice())),
+                    other => panic!("mismatched change {other:?}"),
+                }
+            }
+        }
+        // An unknown block is not moved to.
+        assert!(!forest.restore_path_to(&[h(7)], h(7)).unwrap());
     }
 
     /// A reader's keep holds the records from its block up past the retention

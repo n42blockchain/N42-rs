@@ -1146,6 +1146,15 @@ impl QmdbNodeState {
             }
         }
         let listed = self.with_forest_timed("on_persisted", split, |forest| {
+            // A block computed on an older parent (a stale build) may have
+            // moved the tree off the persisted blocks' path; stand it back on
+            // them before listing, or the view is invalidated for good.
+            let hashes: Vec<B256> = todo.iter().map(|&(_, hash)| hash).collect();
+            if let Some(&last_hash) = hashes.last() {
+                if forest.restore_path_to(&hashes, last_hash)? {
+                    info!(target: "n42.qmdb", block = last, "stood the QMDB tree back on the persisted blocks' path");
+                }
+            }
             forest.flush_entries_for_sync()?;
             let mut listed = Vec::with_capacity(todo.len());
             for &(number, hash) in todo {

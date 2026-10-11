@@ -294,6 +294,28 @@ fn a_persisted_block_the_view_cannot_place_invalidates_it_and_releases_the_recor
 }
 
 #[test]
+fn a_stale_build_below_the_persisted_blocks_does_not_invalidate_the_view() {
+    // loop351 X9j: a build on an old parent (block 1020 while 1031 was the
+    // tip) moved the tree off the canonical path, and persisting 1021 in that
+    // window invalidated the view for good.
+    let (state, view, hashes) = viewed("view-stale-build", 4);
+    state.on_persisted(&[(1, hashes[1])]);
+    assert_eq!(view.head(), (1, hashes[1]));
+    let _sibling = state.compute(hashes[1], &changes_for(9)).expect("a stale build on block 1");
+    state.on_persisted(&[(2, hashes[2]), (3, hashes[3])]);
+    assert!(view.is_valid(), "the persisted blocks were listed after standing the tree back on them");
+    assert_eq!(view.head(), (3, hashes[3]));
+    let seven = Address::from_word(B256::from(U256::from(7u64)));
+    let answered = view.account(&seven, 3).expect("answered").expect("present");
+    assert_eq!((answered.nonce, answered.balance), (3, U256::from(9u64)));
+    // The tip still computes on top of the canonical chain.
+    let (hash, _) = advance(&state, 5, hashes[4]);
+    state.on_persisted(&[(4, hashes[4]), (5, hash)]);
+    assert!(view.is_valid());
+    assert_eq!(view.head(), (5, hash));
+}
+
+#[test]
 fn an_unwind_below_the_view_steps_it_back_and_one_above_it_changes_nothing() {
     let (state, view, hashes) = viewed("view-unwind", 6);
     for number in 1..=5u64 {

@@ -472,3 +472,85 @@ fn the_whole_take_hand_off_is_the_compared_one() {
     };
     assert_eq!(run(true), run(false));
 }
+
+/// One frame build under `N42_PLAN_AHEAD_WAIT_MS` (`ahead` on: the
+/// continuous preparation starts on the settling thread right after the
+/// take), the build taking every transaction offered.
+fn build_waiting(queue: &TxQueue<EthPooledTransaction>, parent: B256, gas: u64) -> (Vec<Tx>, FramePlan, FrameSelectTimes) {
+    let (mut best, plan, times) = queue.frames_for_build_ahead(parent, gas, SelectMode::Parallel, true);
+    let txs: Vec<Tx> = best.by_ref().collect();
+    drop(best);
+    (txs, plan, times)
+}
+
+/// Polls until `done` holds of the queue's prepared plan, at most 2 s.
+fn until_prepared(queue: &TxQueue<EthPooledTransaction>, done: impl Fn(Option<&Prepared<EthPooledTransaction>>) -> bool) {
+    let at = std::time::Instant::now();
+    while at.elapsed() < std::time::Duration::from_secs(2) {
+        if done(queue.lock_inner_quiet().prepared.as_ref()) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("the continuous preparation did not reach the expected plan");
+}
+
+/// The queue held nothing usable after a take: the continuous preparation
+/// keeps looking, prepares a plan from the frames that arrive later, tops
+/// it up with the ones after them until it fills the block's gas, and the
+/// next build uses it without a timed-out wait; the chain stays valid.
+#[test]
+fn the_continuous_preparation_plans_frames_that_arrive_after_the_take() {
+    // The later waves overrun it: the continuous plan fills (cut).
+    let gas = (2 * 40 * 5 + 5) * 21_000;
+    let queue: TxQueue<EthPooledTransaction> = TxQueue::new().with_plan_ahead_wait(200);
+    fill(&queue, 40, 1, 5, 0);
+    let (first, _, times) = build_waiting(&queue, block_hash(0), gas);
+    assert!(!first.is_empty());
+    assert_eq!(times.ahead, 0);
+    seal(&queue, block_hash(0), 1, block_hash(1), &first);
+    // Nothing usable is left; arrivals come in two waves.
+    fill(&queue, 40, 1, 5, 1);
+    until_prepared(&queue, |p| p.is_some());
+    fill(&queue, 40, 1, 5, 2);
+    until_prepared(&queue, |p| p.is_some_and(|p| p.tx_count_for_test() > 40 * 5 + 5));
+    let (second, plan, times) = build_waiting(&queue, block_hash(1), gas);
+    assert!(times.ahead >= 1, "{times:?}");
+    assert_eq!(times.ahead_discard, None);
+    assert!(!times.ahead_wait_timeout, "{times:?}");
+    assert_eq!(plan.tx_count(), second.len());
+    // The block full of both waves, every sender's nonces continuing the
+    // first block's.
+    assert_eq!(second.len() as u64 * 21_000, gas);
+    assert_chain_valid(&[first, second]);
+}
+
+/// A build that starts while the continuous preparation is in flight and
+/// nothing arrives waits the switch's milliseconds, says the wait ran out,
+/// and plans afresh as before.
+#[test]
+fn a_wait_for_a_plan_that_never_fills_runs_out() {
+    let gas = 1_000 * 21_000;
+    let queue: TxQueue<EthPooledTransaction> = TxQueue::new().with_plan_ahead_wait(20);
+    fill(&queue, 10, 1, 5, 0);
+    let (first, _, _) = build_waiting(&queue, block_hash(0), gas);
+    seal(&queue, block_hash(0), 1, block_hash(1), &first);
+    let (second, _, times) = build_waiting(&queue, block_hash(1), gas);
+    assert!(second.is_empty());
+    assert!(times.ahead_wait_timeout, "{times:?}");
+    assert!(times.ahead_wait_us >= 20_000, "{times:?}");
+    assert_eq!(times.ahead, 0);
+}
+
+/// Off (the default): no wait, and no continuous preparation in flight.
+#[test]
+fn without_the_switch_a_build_never_waits() {
+    let gas = 1_000 * 21_000;
+    let queue: TxQueue<EthPooledTransaction> = TxQueue::new().with_plan_ahead_wait(0);
+    fill(&queue, 10, 1, 5, 0);
+    let (first, _, _) = build_waiting(&queue, block_hash(0), gas);
+    seal(&queue, block_hash(0), 1, block_hash(1), &first);
+    let (_, _, times) = build_waiting(&queue, block_hash(1), gas);
+    assert_eq!((times.ahead_wait_us, times.ahead_wait_timeout), (0, false));
+    assert_eq!(queue.ahead_wait.inflight.load(std::sync::atomic::Ordering::Acquire), 0);
+}

@@ -106,6 +106,8 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
         times.ahead_prep_us = took.ahead_prep_us;
         times.ahead_topup_txs = took.ahead_topup_txs;
         times.ahead_discard = took.ahead_discard.map_or("", n42_tx_queue::AheadDiscard::name);
+        times.ahead_wait_us = took.ahead_wait_us;
+        times.ahead_wait_timeout = took.ahead_wait_timeout;
         if !plan.frames.is_empty()
             && WANT_BULK.with(std::cell::Cell::get)
             && pull_by_frames()
@@ -381,6 +383,11 @@ pub struct SelectTimes {
     pub ahead_topup_txs: usize,
     /// Why a prepared plan was discarded, or "".
     pub ahead_discard: &'static str,
+    /// `N42_PLAN_AHEAD_WAIT_MS`: how long the start waited for the
+    /// continuously prepared plan, us.
+    pub ahead_wait_us: u64,
+    /// Whether that wait ran out before the plan was full.
+    pub ahead_wait_timeout: bool,
     /// `N42_PULL_BY_FRAMES`: the transactions taken out of the frames at
     /// once, and how long that took.
     pub bulk_txs: usize,
@@ -409,6 +416,8 @@ std::thread_local! {
             ahead_prep_us: 0,
             ahead_topup_txs: 0,
             ahead_discard: "",
+            ahead_wait_us: 0,
+            ahead_wait_timeout: false,
             bulk_txs: 0,
             bulk_us: 0,
             body_ahead: 0,

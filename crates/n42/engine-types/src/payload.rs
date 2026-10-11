@@ -4244,6 +4244,11 @@ where
                     plan_prep_us = select_times.ahead_prep_us,
                     plan_topup_txs = select_times.ahead_topup_txs,
                     plan_discard = select_times.ahead_discard,
+                    // `N42_PLAN_AHEAD_WAIT_MS`: how long this start waited
+                    // for the continuously prepared plan, and whether the
+                    // wait ran out before it was full.
+                    plan_wait_us = select_times.ahead_wait_us,
+                    plan_wait_timeout = select_times.ahead_wait_timeout,
                     // `N42_PULL_BY_FRAMES`: the block taken out of its
                     // frames at once (0 = through the puller) and how long.
                     pull_bulk_txs = select_times.bulk_txs,

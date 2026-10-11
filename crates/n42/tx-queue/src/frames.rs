@@ -419,11 +419,21 @@ pub(crate) struct FrameIndex<T: PoolTransaction> {
     /// Frames `note_frame` refused because their id was already indexed or
     /// their record was malformed; since the process started.
     pub(crate) refused: u64,
+    /// Frames indexed since the process started: what the continuous
+    /// plan-ahead preparer (`N42_PLAN_AHEAD_WAIT_MS`) reads to plan again
+    /// only when a frame has arrived.
+    pub(crate) inserted: u64,
 }
 
 impl<T: PoolTransaction> Default for FrameIndex<T> {
     fn default() -> Self {
-        Self { frames: B256HashMap::default(), by_first: B256HashMap::default(), order: VecDeque::new(), refused: 0 }
+        Self {
+            frames: B256HashMap::default(),
+            by_first: B256HashMap::default(),
+            order: VecDeque::new(),
+            refused: 0,
+            inserted: 0,
+        }
     }
 }
 
@@ -446,6 +456,7 @@ impl<T: PoolTransaction> FrameIndex<T> {
         }
         self.frames.insert(id, entry);
         self.order.push_back(id);
+        self.inserted = self.inserted.wrapping_add(1);
         while self.frames.len() > MAX_FRAMES {
             let Some(oldest) = self.order.pop_front() else { break };
             if let Some(gone) = self.frames.remove(&oldest)

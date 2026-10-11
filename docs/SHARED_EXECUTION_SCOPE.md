@@ -1350,6 +1350,20 @@ savings are estimates unless stated.
 Order of work: 1 (and the 16.2 leg first, it costs one run and tells whether the nested-steal story holds), then 3 (an
 afternoon), 2, 4, 5. Items 1, 3 and 5 touch scheduling only; 2 and 4 touch what is prepared when, never what is built.
 
+### 16.4.1 The plan prepared continuously (`N42_PLAN_AHEAD_WAIT_MS`)
+
+`N42_PLAN_AHEAD_WAIT_MS=<ms>` (unset or 0: off; needs `N42_PLAN_AHEAD=1`; the non-snapshot path only) makes the
+next build's plan a continuous preparation instead of a one-shot one. Today the plan is prepared once, right after the
+take of the build it follows; when the frame index holds no usable frame at that moment it stores nothing, and the
+next build starts with `plan_ahead=0` and an empty `plan_discard` and takes only the frames indexed since (loop351
+stage ak, window 3: 592 such blocks of 8k-87k transactions). With the switch the preparer keeps going until the plan
+is full, the next build begins or 2 s pass: with no plan it plans again whenever a frame is indexed, and a short plan
+(last frame not cut, at least 21,000 gas of room) is topped up in place with the frames indexed since, exactly as a
+build's start tops it up (`TxQueue::prepare_continuously`, `top_up_prepared`). A frame build that starts while that
+preparation is in flight and its plan is not full waits up to the switch's milliseconds for it
+(`TxQueue::wait_for_plan`), then proceeds as before. The phase line carries `plan_wait_us` and `plan_wait_timeout`
+(true: the wait ran out before the plan was full). Measured in loop351 stage `al` (X9 set, 35 ms pacing).
+
 ### 16.5 The floor, and whether 40 ms is in reach
 
 After 1-4 (estimates): start 1 + prep 0.5 + gap 1.5 + exec 18.5 + join 0.5 + commit 1 + seal ~2 (header, block, hook; the

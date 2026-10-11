@@ -408,6 +408,15 @@
   `payload.rs` `body_made_with_the_plan_equals_body_made_at_start`。阶段行新增 `plan_body`、`plan_body_us`、
   `prep_from_plan`、`exec_prepared_groups`、`exec_prepared_slots`、`exec_partition_us`、`exec_slots_us`、
   `whole_take_noted`。
+- `N42_PLAN_AHEAD_WAIT_MS=<ms>`（默认未设 = 0 = 关；需 `N42_PLAN_AHEAD=1`；代码在 `tx-queue` `plan_ahead_wait_ms` /
+  `prepare_continuously` / `top_up_prepared` / `wait_for_plan` / `with_plan_ahead_wait`）：下一块的计划在上一块
+  take 之后持续预备，不再一次性：没有可用帧时，每有新帧索引就重新计划；计划未满（最后一帧未被截断且还有
+  21,000 gas 余量）时就地用新到的帧补足；直到计划满、下一块开始构建或 2 s 上限。帧构建开始时若这样的预备
+  仍在进行且计划未满，最多等待该毫秒数。阶段行新增 `plan_wait_us`、`plan_wait_timeout`（等待超时为 true）。
+  只作用于非快照路径（`N42_QUEUE_PLAN_SNAPSHOT` 未开）。测试：`ahead_tests.rs`
+  `the_continuous_preparation_plans_frames_that_arrive_after_the_take`、
+  `a_wait_for_a_plan_that_never_fills_runs_out`、`without_the_switch_a_build_never_waits`。
+  `docs/SHARED_EXECUTION_SCOPE.md` 16.4.1。
 - `N42_BUILD_BATCHES=<n>`（默认 0 = 原调度；代码在 `parallel_transfer.rs` `build_batches` / `Dispatch` /
   `largest_first`）：交易按整个发送者组、候选顺序装成 n 个大小相近的 batch，以 FIFO 从大到小投入 build pool
   （建议 96-128，32 个 worker）。测试 `the_largest_first_packing_keeps_every_sender_run_whole_and_in_order`，

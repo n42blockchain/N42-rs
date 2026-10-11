@@ -683,6 +683,8 @@ where
 /// Returns the status, the block number, and the hand-off and payload
 /// assembly times in milliseconds; an `Err` is the message to send back
 /// (`unknown build`), on which the caller sends the payload the old way.
+/// Under `N42_ANSWER_AT_INSERT` the status is VALID at the hand-off and the
+/// `newPayload` runs behind the answer (see [`crate::answer_at_insert`]).
 async fn own_block_by_header<T>(
     reuse: Option<&OwnBlockReuse>,
     engine: &ConsensusEngineHandle<T>,
@@ -690,6 +692,22 @@ async fn own_block_by_header<T>(
     // The import-once owner of this block (`N42_IMPORT_ONCE`): told the block
     // is checked as soon as the build is known to be this block's.
     once: Option<&crate::import_once::Owner>,
+) -> Result<(alloy_rpc_types_engine::PayloadStatus, u64, u64, u64), String>
+where
+    T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
+{
+    own_block_by_header_with(reuse, engine, frame, once, crate::answer_at_insert::active()).await
+}
+
+/// [`own_block_by_header`] with the deferred `newPayload` tracker given:
+/// `Some` answers at the hand-off (`N42_ANSWER_AT_INSERT`), `None` answers
+/// with the engine's `newPayload` status as before.
+async fn own_block_by_header_with<T>(
+    reuse: Option<&OwnBlockReuse>,
+    engine: &ConsensusEngineHandle<T>,
+    frame: &[u8],
+    once: Option<&crate::import_once::Owner>,
+    deferred: Option<&std::sync::Arc<crate::answer_at_insert::Deferred>>,
 ) -> Result<(alloy_rpc_types_engine::PayloadStatus, u64, u64, u64), String>
 where
     T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
@@ -824,6 +842,23 @@ where
     let data = n42_h2_consensus::execution_data_from_raw_parts(sealed_hash, &header, raw_transactions, withdrawals, None);
     let payload_ms = payload_at.elapsed().as_millis() as u64;
     stage.at(4);
+    if let Some(deferred) = deferred {
+        // `N42_ANSWER_AT_INSERT`: the header-only `newPayload` goes on the
+        // engine's channel now, behind the insert and ahead of whatever the
+        // validator sends once it hears the answer (its commit forkchoice),
+        // and only its reply is left for later. The answer waits for the
+        // previous own block's deferred pass and fails if any pass failed
+        // (crate::answer_at_insert, "Ordering" and "Failure").
+        let reply = crate::answer_at_insert::dispatch(engine, data);
+        let previous = deferred.track(number, sealed_hash, reply);
+        drop(stage);
+        deferred.settle(previous).await?;
+        let status = alloy_rpc_types_engine::PayloadStatus::new(
+            alloy_rpc_types_engine::PayloadStatusEnum::Valid,
+            Some(sealed_hash),
+        );
+        return Ok((status, header.number, handoff_ms, payload_ms));
+    }
     let status = engine.new_payload(data).await.map_err(|e| format!("engine: {e}"))?;
     drop(stage);
     if !status.status.is_valid() {
@@ -2558,6 +2593,7 @@ where
         import_once = once.is_some(),
         road_runtime = crate::road_runtime::enabled(),
         dispatch_wait = crate::road_runtime::measure_dispatch_wait(),
+        answer_at_insert = crate::answer_at_insert::enabled(),
         "raw payload channel listening"
     );
     loop {

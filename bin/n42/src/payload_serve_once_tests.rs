@@ -670,3 +670,87 @@ async fn a_check_only_request_vouches_for_a_kept_build_and_nothing_else() {
     let (vouched, declined) = crate::import_once::check_only_counts();
     assert!(vouched - vouched_before >= 2 && declined - declined_before >= 3);
 }
+
+/// The scripted engine of [`own_block_answered_at_insert`]: every
+/// `newPayload` is parked until the test answers it.
+fn parked_engine() -> (ConsensusEngineHandle<N42EngineTypes>, mpsc::UnboundedReceiver<BeaconEngineMessage<N42EngineTypes>>) {
+    let (engine_tx, engine_rx) = mpsc::unbounded_channel::<BeaconEngineMessage<N42EngineTypes>>();
+    (ConsensusEngineHandle::new(engine_tx), engine_rx)
+}
+
+/// A reuse whose executed inserts are taken at once.
+fn instant_reuse() -> OwnBlockReuse {
+    let (inserts_tx, mut inserts_rx) = mpsc::unbounded_channel::<reth_node_builder::executed_inserts::ExecutedInsert>();
+    tokio::spawn(async move {
+        while let Some(insert) = inserts_rx.recv().await {
+            let _ = insert.done.send(true);
+        }
+    });
+    let chain_spec = reth_chainspec::MAINNET.clone();
+    let profile = n42_engine_types::engine_validator::header_profile_for(&chain_spec);
+    OwnBlockReuse {
+        validator: Arc::new(n42_engine_types::engine_validator::N42EngineValidator::new(chain_spec, profile)),
+        qmdb: None,
+        inserts: inserts_tx,
+        prune_pool: None,
+        exec_probe: None,
+        import_foreign: None,
+        canonical_head: None,
+    }
+}
+
+/// `N42_ANSWER_AT_INSERT`: an own block is answered VALID while its header
+/// `newPayload` is still parked in the engine (but already on its channel),
+/// and a pass that comes back INVALID makes the next own block's answer fail.
+/// Without the switch the same call waits for the engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_block_answered_at_insert() {
+    let _builds = BUILDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let reuse = instant_reuse();
+    let (engine, mut engine_rx) = parked_engine();
+    let deferred = Arc::new(crate::answer_at_insert::Deferred::default());
+
+    let first = header(520, 0x52);
+    file_build(&first);
+    let (status, number, _, _) =
+        own_block_by_header_with(Some(&reuse), &engine, &alloy_rlp::encode(&first), None, Some(&deferred))
+            .await
+            .expect("answered at insert");
+    assert_eq!((status.status, number), (PayloadStatusEnum::Valid, 520));
+    assert_eq!(status.latest_valid_hash, Some(first.hash_slow()));
+    // The pass is on the engine's channel, unanswered.
+    let Ok(BeaconEngineMessage::NewPayload { tx: first_pass, .. }) = engine_rx.try_recv() else {
+        panic!("the header newPayload was not dispatched before the answer");
+    };
+    let _ = first_pass.send(Ok(PayloadStatus::from_status(PayloadStatusEnum::Invalid { validation_error: "bad".to_owned() })));
+
+    let second = header(521, 0x53);
+    file_build(&second);
+    let err = own_block_by_header_with(Some(&reuse), &engine, &alloy_rlp::encode(&second), None, Some(&deferred))
+        .await
+        .expect_err("the next answer fails after an INVALID pass");
+    assert!(err.contains("own block 520"), "{err}");
+
+    // Switch off: the answer is the engine's.
+    let third = header(522, 0x54);
+    file_build(&third);
+    let call = tokio::spawn({
+        let reuse = reuse.clone();
+        let engine = engine.clone();
+        let frame = alloy_rlp::encode(&third);
+        async move { own_block_by_header_with(Some(&reuse), &engine, &frame, None, None).await }
+    });
+    loop {
+        match engine_rx.recv().await.expect("message") {
+            BeaconEngineMessage::NewPayload { payload, tx } if payload.payload.block_number() == 522 => {
+                assert!(!call.is_finished(), "answered before the engine without the switch");
+                let _ = tx.send(Ok(PayloadStatus::from_status(PayloadStatusEnum::Valid)));
+                break;
+            }
+            // The second block's pass, still parked.
+            _ => {}
+        }
+    }
+    let (status, _, _, _) = call.await.expect("task").expect("answered");
+    assert_eq!(status.status, PayloadStatusEnum::Valid);
+}

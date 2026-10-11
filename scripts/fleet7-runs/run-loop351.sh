@@ -629,7 +629,18 @@ case $STAGE in
      b7 D2S12P30T64X9S3I3 $D2 $S1 $S2 $X9 $S3 $I3 $T64 F7_BLOCK_INTERVAL_MS=30
      b7 D2S12P30T64X9 $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=30
      b7 D2S12P35T64X9b $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35 ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af or ag)"; exit 2 ;;
+  ah) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"; I3="N42_DEFERRED_IN_FLIGHT=3"; ABR="N42_ANSWER_BEFORE_REVERTS=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"
+     b7 D2S12P35T64X9ABR $D2 $S1 $S2 $X9 $ABR $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9ABRS3 $D2 $S1 $S2 $X9 $ABR $S3 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9ABRI3 $D2 $S1 $S2 $X9 $ABR $I3 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9ABRS3I3 $D2 $S1 $S2 $X9 $ABR $S3 $I3 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P30T64X9ABR $D2 $S1 $S2 $X9 $ABR $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P25T64X9ABR $D2 $S1 $S2 $X9 $ABR $T64 F7_BLOCK_INTERVAL_MS=25
+     b7 D2S12P35T64X9ABRb $D2 $S1 $S2 $X9 $ABR $T64 F7_BLOCK_INTERVAL_MS=35 ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag or ah)"; exit 2 ;;
 esac
 
 if [ "${LOOP351_DRY:-0}" = 1 ]; then echo "dry run done"; exit 0; fi

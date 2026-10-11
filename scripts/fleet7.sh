@@ -9,10 +9,13 @@
 #   scripts/fleet7.sh status           heights, hashes, agreement
 #   scripts/fleet7.sh stats            resident memory, threads, disk written
 #   scripts/fleet7.sh watch <seconds>  sample stats over a window and report
-#   scripts/fleet7.sh roll <i> [--kill]  stop and restart one node, and check it rejoins;
+#   scripts/fleet7.sh roll <i> [--kill] [--fresh]  stop and restart one node, and check it rejoins;
 #                                      --kill sends SIGKILL to the validator and its execution
 #                                      layer (a power cut), then prints the recovered vote
-#                                      watermarks and whether the restart hit a logged view
+#                                      watermarks and whether the restart hit a logged view;
+#                                      --fresh then deletes only the execution layer (el, el.pid)
+#                                      so it re-initialises from the genesis and the validator
+#                                      pulls the chain by range; the consensus state is kept
 #
 # Every launch argument comes from scripts/fleet7-env.sh; see the comment at
 # the top of that file for why. `print` is how a change to that file is
@@ -20,7 +23,7 @@
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fleet7-env.sh"
 
-usage() { sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; }
+usage() { sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; }
 
 # --------------------------------------------------------------------- up ---
 cmd_up() {
@@ -330,8 +333,11 @@ print(f'{t/b:.1f}/block, {t/s:.1f} tps' if b else 'n/a')" "$txs" "$produced" "$s
 # and a fleet whose members cannot be restarted one at a time cannot be
 # upgraded, moved, or repaired without stopping the chain.
 cmd_roll() {
-  local i=${1:?which node} d before after pin kill=0 pid cp w
-  [[ ${2:-} == --kill ]] && kill=1
+  local i=${1:?which node} d before after pin kill=0 fresh=0 pid cp w arg
+  shift
+  for arg in "$@"; do
+    case $arg in --kill) kill=1 ;; --fresh) fresh=1 ;; *) echo "roll: unknown option $arg" >&2; return 1 ;; esac
+  done
   if ((F7_MAPPED || F7_SHARED)); then
     echo "roll is not defined for a fleet with F7_EL_MAP (a node is a layer and its validators); stop and start the fleet" >&2
     return 1
@@ -355,6 +361,15 @@ cmd_roll() {
     echo "node $i: at height ${before:--}, stopping"
     f7_stop "$i" v
     f7_stop "$i" el
+  fi
+  if ((fresh)); then
+    # Only the execution layer is removed. $d/consensus holds the vote log and the
+    # checkpoint, which are this member's BFT safety: deleting them could let it
+    # vote twice in a view it already voted in. Never touch it here.
+    cp="$d/consensus/consensus-checkpoint.json"
+    echo "node $i: consensus checkpoint kept: $([[ -r $cp ]] && jq -c '{last_voted_view, last_commit_voted_view, locked_qc_view: .locked_qc.view}' "$cp" 2>/dev/null || echo none readable)"
+    rm -rf "$d/el" "$d/el.pid"
+    echo "node $i: execution layer re-initialised; consensus state kept"
   fi
   f7_rotate_logs "$d"
   pin=$(f7_pin "$i")

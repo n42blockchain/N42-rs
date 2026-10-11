@@ -7268,6 +7268,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-deferred-reverts"
+version = "2.1.5"
+dependencies = [
+ "alloy-primitives 1.7.3",
+ "revm-database",
+ "tracing",
+]
+
+[[package]]
 name = "n42-dependency-compat-tests"
 version = "0.1.0"
 dependencies = [

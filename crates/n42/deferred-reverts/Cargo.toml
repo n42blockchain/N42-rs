@@ -1,0 +1,19 @@
+[package]
+name = "n42-deferred-reverts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Reverts of an own block completed after its import was answered (N42_ANSWER_BEFORE_REVERTS)"
+
+[dependencies]
+revm-database = { workspace = true, features = ["std"] }
+tracing.workspace = true
+
+[dev-dependencies]
+alloy-primitives.workspace = true
+
+[lints]
+workspace = true

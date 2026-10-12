@@ -225,6 +225,39 @@ pub fn merge_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
+/// `N42_ONE_PROBE=4`: the pool the freeze's lane materialisation runs on
+/// (`materialise_lanes`). By default a pool of its own,
+/// `N42_LANE_POOL_THREADS` threads (8), on the background set at the
+/// background priority: in loop351 stage bb the materialisation's ~10 ms on
+/// the behind pool took the threads the parent's QMDB root and its hashed
+/// post-state run beside (`roots_ms` p90 47 -> 64), and the child's seal
+/// waits for that root. The block's own root still needs the materialised
+/// accounts (its operations and its hashed post-state read `&BundleAccount`
+/// through `view`), so this moves the work off the cores the root path
+/// shares, not off the block's own chain. `N42_LANE_POOL=behind`: the
+/// freeze's pool, as before. `None` then, or when the pool cannot be built.
+pub fn lane_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        if std::env::var("N42_LANE_POOL").is_ok_and(|v| v.trim() == "behind") {
+            return None;
+        }
+        let threads = std::env::var("N42_LANE_POOL_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|n: &usize| *n > 0)
+            .unwrap_or(8);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("n42-lane-{i}"))
+            .start_handler(|_| n42_core_layout::background_thread())
+            .build()
+            .inspect_err(|err| tracing::warn!(target: "payload_builder", %err, "no pool for the lane materialisation; the freeze's pool takes it"))
+            .ok()
+    })
+    .as_ref()
+}
+
 /// How a live hand-over treats a busy shard: wait for it (the default),
 /// leave it to the freeze (`N42_LIVE_INDEX_DEFER=1`), or, for tests, leave
 /// every other shard to the freeze whatever its lock says.
@@ -1867,14 +1900,15 @@ fn finish_indexed(
     }
     let live = live.is_some();
     // `N42_ONE_PROBE=4`: the lane batches' accounts and reverts made, one
-    // task a shard, now that the index says which batch holds each.
+    // task a shard, now that the index says which batch holds each -- on the
+    // lane pool (`lane_pool`, background set) rather than the freeze's.
     let lane_at = std::time::Instant::now();
     let (lane_state, lane_reverts): (Vec<AddressHashMap<BundleAccount>>, Vec<Vec<(Address, AccountRevert)>>) =
         if batches.iter().any(|batch| batch.accounts.lane.is_some()) {
             use rayon::prelude::*;
             let batches_ref = &batches;
             let built_ref = &built;
-            pool.install(|| {
+            lane_pool().unwrap_or(pool).install(|| {
                 (0..count)
                     .into_par_iter()
                     .map(|shard| match built_ref.get(shard) {

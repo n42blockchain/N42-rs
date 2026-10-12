@@ -1285,6 +1285,34 @@ impl ChainSpecBuilder {
         self
     }
 
+    /// Enable Dao at genesis.
+    pub fn dao_activated(mut self) -> Self {
+        self = self.frontier_activated();
+        self.hardforks.insert(EthereumHardfork::Dao, ForkCondition::Block(0));
+        self
+    }
+
+    /// Enable Muir Glacier at genesis.
+    pub fn muirglacier_activated(mut self) -> Self {
+        self = self.istanbul_activated();
+        self.hardforks.insert(EthereumHardfork::MuirGlacier, ForkCondition::Block(0));
+        self
+    }
+
+    /// Enable Arrow Glacier at genesis.
+    pub fn arrowglacier_activated(mut self) -> Self {
+        self = self.london_activated();
+        self.hardforks.insert(EthereumHardfork::ArrowGlacier, ForkCondition::Block(0));
+        self
+    }
+
+    /// Enable Gray Glacier at genesis.
+    pub fn grayglacier_activated(mut self) -> Self {
+        self = self.arrowglacier_activated();
+        self.hardforks.insert(EthereumHardfork::GrayGlacier, ForkCondition::Block(0));
+        self
+    }
+
     /// Enable Paris at genesis.
     pub fn paris_activated(mut self) -> Self {
         self = self.london_activated();
@@ -1478,6 +1506,20 @@ mod tests {
         str::FromStr,
         string::String,
     };
+
+    #[test]
+    fn upstream_named_fork_builders_activate_requested_forks() {
+        let dao = ChainSpecBuilder::default().dao_activated();
+        assert_eq!(dao.hardforks.get(EthereumHardfork::Dao), Some(ForkCondition::Block(0)));
+        assert_eq!(dao.hardforks.get(EthereumHardfork::Homestead), Some(ForkCondition::Block(0)));
+        let muir = ChainSpecBuilder::default().muirglacier_activated();
+        assert_eq!(muir.hardforks.get(EthereumHardfork::MuirGlacier), Some(ForkCondition::Block(0)));
+        assert_eq!(muir.hardforks.get(EthereumHardfork::Istanbul), Some(ForkCondition::Block(0)));
+        let gray = ChainSpecBuilder::default().grayglacier_activated();
+        assert_eq!(gray.hardforks.get(EthereumHardfork::GrayGlacier), Some(ForkCondition::Block(0)));
+        assert_eq!(gray.hardforks.get(EthereumHardfork::ArrowGlacier), Some(ForkCondition::Block(0)));
+        assert_eq!(gray.hardforks.get(EthereumHardfork::London), Some(ForkCondition::Block(0)));
+    }
 
     fn test_hardfork_fork_ids(spec: &ChainSpec, cases: &[(EthereumHardfork, ForkId)]) {
         for (hardfork, expected_id) in cases {

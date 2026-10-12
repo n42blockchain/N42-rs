@@ -1965,6 +1965,18 @@ where
     // behind the proposal), us. Both 0 when the step did not seal.
     let mut par_to_seal_us = 0u64;
     let mut par_behind_seal_us = 0u64;
+    // The build's start to the parallel scope's start (where the batches'
+    // threads are spawned), split: the selection that takes the plan (its
+    // frames, any wait for its prepared body, the candidates' copy; the
+    // hand-off wait before it is left in `other`), the one-probe take and
+    // view (`N42_ONE_PROBE`: the resolve's hand-over and the verified
+    // prefix), the lane setup (the output shards, the sinks and the lane
+    // sink, the plan's partition and slots handed to the call) and the rest
+    // (the prep, the warm layer, the header, rounding), us.
+    let pre_par_take_us = start_best_us.saturating_sub(start_handoff_us);
+    let mut pre_par_view_us = 0u64;
+    let mut pre_par_lane_us = 0u64;
+    let mut pre_par_other_us = 0u64;
     // Of the batches' start: the hook before the batches whole (the
     // deferred state's open, `state_wait_us`, and the pre-execution changes
     // after it, `state_pre_changes_us`), us.
@@ -2313,6 +2325,7 @@ where
         // prepared build whose segments this build took (so the plan's keys
         // are this build's; each transaction is checked again as it runs),
         // and the verified prefix of built outputs under this build's parent.
+        let view_at = std::time::Instant::now();
         let one_probe_view = all_transfers
             .then(|| prepared_build.as_mut().and_then(|made| made.one_probe.take()))
             .flatten()
@@ -2326,6 +2339,8 @@ where
         if one_probe_view.is_some() {
             one_probe_ring_reject = "not_sealed_at_exec";
         }
+        let view_end = std::time::Instant::now();
+        pre_par_view_us = view_end.duration_since(view_at).as_micros() as u64;
         if !all_transfers {
             open_deferred_state!()?;
             for tx in cands.into_iter().rev() {
@@ -2426,6 +2441,12 @@ where
                 pre_exec_ms = pre_exec_at.elapsed().as_millis() as u64;
                 let run_at = std::time::Instant::now();
                 run_started = Some(run_at);
+                pre_par_lane_us = run_at.saturating_duration_since(view_end).as_micros() as u64;
+                pre_par_other_us = run_at
+                    .saturating_duration_since(build_started)
+                    .as_micros()
+                    .saturating_sub(u128::from(pre_par_take_us + pre_par_view_us + pre_par_lane_us))
+                    as u64;
                 // `N42_SEAL_ON_COUNTERS=1`: the batches count the block's
                 // transfers, gas and fees as they execute (a candidate's tip
                 // read beside its conversion, as the prep's body reads it), so
@@ -4243,6 +4264,10 @@ where
                     // behind it (the fold), us; and of the batches' start,
                     // the hook (state open + pre-execution changes).
                     par_to_seal_us,
+                    pre_par_take_us,
+                    pre_par_view_us,
+                    pre_par_lane_us,
+                    pre_par_other_us,
                     par_behind_seal_us,
                     par_hook_us,
                     state_pre_changes_us,

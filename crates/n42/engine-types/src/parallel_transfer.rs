@@ -7962,7 +7962,7 @@ mod tests {
     /// stage 2 with the lanes made at another width (not used: stage 1).
     #[test]
     fn a_build_on_resolved_reads_equals_the_plain_build() {
-        for mode in [Lanes::None, Lanes::Width, Lanes::OtherWidth, Lanes::Direct] {
+        for mode in [Lanes::None, Lanes::Width, Lanes::OtherWidth, Lanes::Direct, Lanes::Output] {
             three_blocks_through_the_plan(mode);
         }
     }
@@ -7974,6 +7974,79 @@ mod tests {
         OtherWidth,
         /// Stage 3: the lanes with the fold.
         Direct,
+        /// Stage 4: the lanes with the fold, handed to the output shards as
+        /// lanes.
+        Output,
+    }
+
+    /// The plan's resolve made for `mode`.
+    fn plan_for(mode: Lanes, resolved: crate::one_probe::Resolved, groups: &[Vec<usize>], width: usize) -> crate::one_probe::Resolved {
+        match mode {
+            Lanes::None => resolved,
+            Lanes::Width => resolved.with_lanes(groups, width),
+            Lanes::OtherWidth => resolved.with_lanes(groups, width + 1),
+            Lanes::Direct => resolved.with_lanes(groups, width).with_fold(true),
+            Lanes::Output => resolved.with_lanes(groups, width).with_fold(true).with_lane_output(true),
+        }
+    }
+
+    /// Stage 4: a block built through `through_shards` (its batches handed
+    /// to the output shards, the plan's lane batches as lanes) equals the
+    /// plain build -- transfers, gas, outcomes, skips, fees -- and its frozen
+    /// output equals the plain build's bundles frozen as maps: the merged
+    /// state (`merged_state_first`), the reverts (`late_reverts`), the
+    /// beneficiary's credit, every read, and the state root's operations
+    /// (`sorted_operations_from_accounts` over the view); its accounts are
+    /// the grafted bundle's.
+    fn assert_same_output(
+        ours: (BuildRun<()>, crate::output_shards::FrozenShards),
+        plain: BuildRun<()>,
+        parent: &CacheDB<EmptyDB>,
+        beneficiary: Address,
+        txs: usize,
+    ) -> BundleState {
+        let (run, frozen) = ours;
+        assert!(frozen.has_lanes(), "lane batches handed over as lanes");
+        assert_eq!(run.skipped, plain.skipped);
+        let executed = |run: &BuildRun<()>| -> Vec<(usize, u64, bool)> {
+            run.slots.iter().filter_map(std::sync::OnceLock::get).map(|b| (b.index, b.gas_used, b.result.is_success())).collect()
+        };
+        assert_eq!(executed(&run).len(), txs);
+        assert_eq!(executed(&run), executed(&plain), "transfers, gas and outcomes");
+        assert_eq!(run.counters.fees, plain.counters.fees, "fees");
+        assert_eq!(run.counters.gas, plain.counters.gas, "gas");
+        let reference = crate::output_shards::OutputShards::with_index_live(beneficiary, txs, 16, true, true);
+        for bundle in &plain.bundles {
+            reference.add(bundle.clone());
+        }
+        let reference = reference.freeze();
+        let residual = BundleState::default();
+        let (ours_state, _) = frozen.merged_state_first(&residual, None);
+        let (theirs_state, _) = reference.merged_state_first(&residual, None);
+        assert_eq!(ours_state.state, theirs_state.state, "merged state");
+        assert_eq!(ours_state.state_size, theirs_state.state_size);
+        assert_eq!(ours_state.contracts, theirs_state.contracts);
+        let ours_reverts = frozen.late_reverts(Default::default(), Vec::new(), None);
+        let theirs_reverts = reference.late_reverts(Default::default(), Vec::new(), None);
+        assert_eq!(ours_reverts, theirs_reverts, "reverts, sorted");
+        assert_eq!(frozen.beneficiary_delta(), reference.beneficiary_delta(), "the beneficiary's credit");
+        let mut ours_view = frozen.view(&residual, &[]);
+        let mut theirs_view = reference.view(&residual, &[]);
+        ours_view.sort_unstable_by_key(|(a, _)| **a);
+        theirs_view.sort_unstable_by_key(|(a, _)| **a);
+        assert_eq!(
+            n42_qmdb_reth::sorted_operations_from_accounts(&ours_view, true).to_operations(),
+            n42_qmdb_reth::sorted_operations_from_accounts(&theirs_view, true).to_operations(),
+            "the state root's operations"
+        );
+        let (_, grafted, fees) = grafted_run(plain, parent, beneficiary);
+        assert_eq!(fees, frozen.beneficiary_delta(), "the beneficiary's tips");
+        for (address, account) in &grafted.state {
+            if *address != beneficiary {
+                assert_eq!(frozen.get(address).and_then(|a| a.info.clone()), account.info.clone(), "{address}");
+            }
+        }
+        grafted
     }
 
     fn three_blocks_through_the_plan(mode: Lanes) {
@@ -8002,13 +8075,7 @@ mod tests {
                 keys.iter()
                     .zip(&groups)
                     .map(|(k, g)| {
-                        let resolved = resolve_with(&mut table, k);
-                        Arc::new(match mode {
-                            Lanes::None => resolved,
-                            Lanes::Width => resolved.with_lanes(g, width),
-                            Lanes::OtherWidth => resolved.with_lanes(g, width + 1),
-                            Lanes::Direct => resolved.with_lanes(g, width).with_fold(true),
-                        })
+                        Arc::new(plan_for(mode, resolve_with(&mut table, k), g, width))
                     })
                     .collect()
             });
@@ -8038,6 +8105,24 @@ mod tests {
                         prepared(k, &view.plan()),
                     )
                 };
+                // Stage 4: through the output shards (live index), lane
+                // batches as lanes.
+                let through_shards = |view: &BuildView, parent: &CacheDB<EmptyDB>| {
+                    let shards = crate::output_shards::OutputShards::with_index_live(beneficiary, keys[k].len(), 16, true, true);
+                    let sink = |bundle: BundleState| shards.add(bundle);
+                    let lane_sink = |bundle: BundleState, lane: crate::batch_state::LaneOutput| shards.add_lane(bundle, lane);
+                    let run = execute_for_build_lanes_dispatch(
+                        &evm_env,
+                        &keys[k],
+                        &convert,
+                        &|| Some(OneProbeDb::new(Some(view), parent.clone())),
+                        &sink,
+                        &lane_sink,
+                        true,
+                        prepared(k, &view.plan()),
+                    );
+                    run.map(|run| (run, shards.freeze()))
+                };
 
                 if k == 2 && mode != Lanes::OtherWidth {
                     // A peer's block at the parent's height: the same
@@ -8053,28 +8138,32 @@ mod tests {
                     // A plan is taken by one build: the peer's build gets
                     // its own (the same keys, resolved apart).
                     let peer_plan = build_pool().install(|| {
-                        let resolved = resolve_with(&mut Rolling::new(16), &keys[k]);
-                        Arc::new(match mode {
-                            Lanes::None => resolved,
-                            Lanes::Width => resolved.with_lanes(&groups[k], width),
-                            Lanes::OtherWidth => resolved.with_lanes(&groups[k], width + 1),
-                            Lanes::Direct => resolved.with_lanes(&groups[k], width).with_fold(true),
-                        })
+                        Arc::new(plan_for(mode, resolve_with(&mut Rolling::new(16), &keys[k]), &groups[k], width))
                     });
                     let peer_view = BuildView::new(peer_plan, peer_prefix, beneficiary);
                     let plain = execute_for_build_in_place(&evm_env, &keys[k], &convert, &|| Some(peer.clone()), None, true)
                         .expect("block on the peer's parent");
-                    let probed = through(&peer_view, &peer).expect("block on the peer's parent through the plan");
-                    assert_same_block(probed, plain, &peer, beneficiary, keys[k].len());
+                    if mode == Lanes::Output {
+                        let probed = through_shards(&peer_view, &peer).expect("block on the peer's parent through the shards");
+                        assert_same_output(probed, plain, &peer, beneficiary, keys[k].len());
+                    } else {
+                        let probed = through(&peer_view, &peer).expect("block on the peer's parent through the plan");
+                        assert_same_block(probed, plain, &peer, beneficiary, keys[k].len());
+                    }
                     assert_eq!(peer_view.hits(), 0, "nothing served on another parent");
                     assert!(peer_view.fallbacks() > 0);
                 }
 
                 let plain =
                     execute_for_build_in_place(&evm_env, &keys[k], &convert, &|| Some(state.clone()), None, true).expect("plain block");
-                let probed = through(&view, &state).expect("block through the plan's references");
                 assert!(plain.skipped.is_empty());
-                let bundle = assert_same_block(probed, plain, &state, beneficiary, keys[k].len());
+                let bundle = if mode == Lanes::Output {
+                    let probed = through_shards(&view, &state).expect("block through the plan's references and the shards");
+                    assert_same_output(probed, plain, &state, beneficiary, keys[k].len())
+                } else {
+                    let probed = through(&view, &state).expect("block through the plan's references");
+                    assert_same_block(probed, plain, &state, beneficiary, keys[k].len())
+                };
                 assert!(!view.mismatched());
                 if k > 0 {
                     assert!(view.hits() > 0, "block {k}: reads served from the outputs");
@@ -8082,7 +8171,7 @@ mod tests {
                 let lanes = plans[k].lanes.as_ref();
                 match mode {
                     Lanes::None => assert!(lanes.is_none()),
-                    Lanes::Width | Lanes::Direct => {
+                    Lanes::Width | Lanes::Direct | Lanes::Output => {
                         let lanes = lanes.expect("lanes");
                         assert!(lanes.used() && !lanes.broken(), "block {k} ran on the plan's lanes");
                         assert!(lanes.hits() > 0 && lanes.loaded() > 0);
@@ -8100,7 +8189,7 @@ mod tests {
                         two_senders_written += usize::from(plans[k].shared(bid));
                     }
                 }
-                if matches!(mode, Lanes::Width | Lanes::Direct) && space != 0 {
+                if matches!(mode, Lanes::Width | Lanes::Direct | Lanes::Output) && space != 0 {
                     assert!(two_senders_written > 0, "a recipient two senders of one batch pay is written through");
                 } else {
                     assert_eq!(two_senders_written, 0, "without lanes only one sender's accounts are written");
@@ -8108,7 +8197,7 @@ mod tests {
                 assert!(ring.record(&view, base(k), parent_built, built(k), vec![beneficiary]));
                 // Stage 3: the accounts several batches touched, folded at the
                 // record, hold the block's post-state too.
-                if mode == Lanes::Direct {
+                if matches!(mode, Lanes::Direct | Lanes::Output) {
                     let lanes = plans[k].lanes.as_ref().expect("lanes");
                     let mut cross_written = 0;
                     for (address, account) in &bundle.state {

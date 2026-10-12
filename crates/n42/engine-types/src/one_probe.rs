@@ -46,6 +46,22 @@ pub fn stage() -> u8 {
     *N.get_or_init(|| std::env::var("N42_ONE_PROBE").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0).min(4))
 }
 
+/// How long a build waits for its plan's body when the hook is still making
+/// it (`N42_ONE_PROBE_BODY_WAIT_MS`, 40 by default with [`stage`] above 0,
+/// 0 otherwise or to disable): without the body the build has no resolved
+/// references, its block is not recorded into the ring, and the next build
+/// finds no verified prefix (loop351 stage ba: half the blocks, every one
+/// with an empty prefix). Read once.
+pub fn body_wait() -> std::time::Duration {
+    static N: OnceLock<u64> = OnceLock::new();
+    std::time::Duration::from_millis(*N.get_or_init(|| {
+        if stage() == 0 {
+            return 0;
+        }
+        std::env::var("N42_ONE_PROBE_BODY_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(40).min(1000)
+    }))
+}
+
 /// The kept depth in plans and built outputs (`N42_ONE_PROBE_DEPTH`, 16 by
 /// default, 1..=64). Read once.
 pub fn depth() -> u64 {

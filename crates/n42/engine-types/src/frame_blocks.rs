@@ -134,7 +134,18 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
             // made with it; its candidates are these segments' transactions,
             // already cloned, when the segments are the ones it was made from.
             if times.ahead == 1 && plan_ahead_body_wanted() {
-                match best.take_prepared_body() {
+                // `N42_ONE_PROBE`: a build without its plan's body has no
+                // resolved references, is not recorded into the ring, and
+                // leaves the next build no verified prefix; the body is
+                // waited for (`N42_ONE_PROBE_BODY_WAIT_MS`) when it is late.
+                let wait = crate::one_probe::body_wait();
+                let (take, waited_us) = if wait.is_zero() {
+                    (best.take_prepared_body(), 0)
+                } else {
+                    best.take_prepared_body_within(wait)
+                };
+                times.body_wait_us = waited_us;
+                match take {
                     n42_tx_queue::PreparedBodyTake::Ready(body, made_us) => {
                         times.body_ahead_us = made_us;
                         match body.downcast::<PreparedBuild<T>>() {
@@ -440,6 +451,8 @@ pub struct SelectTimes {
     pub body_ahead: u8,
     /// The prepared body's making time (the hook's), us.
     pub body_ahead_us: u64,
+    /// How long the take waited for a late body (`N42_ONE_PROBE_BODY_WAIT_MS`), us.
+    pub body_wait_us: u64,
 }
 
 std::thread_local! {
@@ -468,6 +481,7 @@ std::thread_local! {
             bulk_us: 0,
             body_ahead: 0,
             body_ahead_us: 0,
+            body_wait_us: 0,
         })
     };
 }

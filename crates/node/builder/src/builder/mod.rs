@@ -1082,7 +1082,7 @@ mod tests {
         let datadir = root.path().join("node");
         let runtime = Runtime::test();
 
-        let config = || NodeConfig::new(Arc::new(ChainSpec::<alloy_consensus::Header>::default()));
+        let config = || NodeConfig::new(Arc::new(ChainSpec::default()));
         let first = NodeBuilder::new(config())
             .testing_node_with_persistent_datadir(runtime.clone(), datadir.clone());
         assert!(datadir.join("db").exists());

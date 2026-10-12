@@ -599,6 +599,28 @@ struct BatchOut {
     /// Live index mode: the shards this batch left to the freeze
     /// (`N42_LIVE_INDEX_DEFER=1`), empty when it entered every one.
     deferred: Vec<u16>,
+    /// `N42_ONE_PROBE=4`: for each address range, the positions in the
+    /// batch's lane of its lane accounts there (their addresses are in
+    /// `addresses` too); empty without a lane.
+    lane_at: Vec<Vec<u32>>,
+}
+
+impl BatchOut {
+    /// The lane's accounts and reverts moved into the batch's map and
+    /// revert list (as `take_bundle` would have left them): for a freeze
+    /// that copies the maps' accounts (v4) rather than indexing them.
+    fn flatten_lane(&mut self, count: usize) {
+        let Some(lane) = Arc::make_mut(&mut self.accounts).lane.take() else { return };
+        let (map, reverts) = lane.into_parts();
+        Arc::make_mut(&mut self.accounts).map.extend(map);
+        for (address, revert) in reverts {
+            if let Some(list) = self.revert_at.get_mut(shard_index(&address, count)) {
+                list.push(self.reverts.len() as u32);
+            }
+            self.reverts.push((address, revert));
+        }
+        self.lane_at.clear();
+    }
 }
 
 /// One batch's map and reverts kept as the block's output (index mode).
@@ -650,6 +672,13 @@ struct Indexed {
     index: Vec<AddressHashMap<u16>>,
     conflicts: Vec<AddressHashMap<BundleAccount>>,
     kept: Vec<Vec<(u16, u32)>>,
+    /// `N42_ONE_PROBE=4`: by shard, the lane batches' accounts the index
+    /// names their batch for, materialised by the freeze (empty without
+    /// lane batches): read where the batch's own map does not hold them.
+    lane_state: Vec<AddressHashMap<BundleAccount>>,
+    /// `N42_ONE_PROBE=4`: by shard, the lane batches' kept reverts (an
+    /// account several batches wrote keeps its first writer's).
+    lane_reverts: Vec<Vec<(Address, AccountRevert)>>,
     state_size: usize,
     beneficiary_delta: U256,
     conflict_count: usize,
@@ -670,7 +699,7 @@ impl Indexed {
         let shard = shard_index(address, self.index.len());
         match *self.index.get(shard)?.get(address)? {
             CONFLICT => self.conflicts.get(shard)?.get(address),
-            id => self.batches.get(id as usize)?.accounts.map.get(address),
+            id => self.batches.get(id as usize)?.accounts.map.get(address).or_else(|| self.lane_state.get(shard)?.get(address)),
         }
     }
 
@@ -680,7 +709,11 @@ impl Indexed {
 
     /// Every account, each once: the batches' maps, then the conflicts.
     fn iter(&self) -> impl Iterator<Item = (&Address, &BundleAccount)> {
-        self.batches.iter().flat_map(IndexedBatch::live).chain(self.conflicts.iter().flatten())
+        self.batches
+            .iter()
+            .flat_map(IndexedBatch::live)
+            .chain(self.conflicts.iter().flatten())
+            .chain(self.lane_state.iter().flatten())
     }
 
     /// `address` taken out of the output with its kept reverts; its size
@@ -690,7 +723,10 @@ impl Indexed {
         let id = self.index.get_mut(shard)?.remove(address)?;
         let account = match id {
             CONFLICT => self.conflicts.get_mut(shard)?.remove(address)?,
-            id => self.batches.get_mut(id as usize)?.remove(address)?,
+            id => match self.batches.get_mut(id as usize)?.remove(address) {
+                Some(account) => account,
+                None => self.lane_state.get_mut(shard)?.remove(address)?,
+            },
         };
         self.state_size = self.state_size.saturating_sub(account.size_hint());
         let batches = &self.batches;
@@ -698,6 +734,9 @@ impl Indexed {
             kept.retain(|&(id, at)| {
                 batches.get(id as usize).and_then(|b| b.reverts.get(at as usize)).is_none_or(|(a, _)| a != address)
             });
+        }
+        if let Some(reverts) = self.lane_reverts.get_mut(shard) {
+            reverts.retain(|(a, _)| a != address);
         }
         Some(account)
     }
@@ -923,6 +962,33 @@ impl OutputShards {
     /// addresses is a twelfth of the bytes; the account is copied once, at
     /// the fold, straight into its range's map.)
     pub fn add(&self, bundle: BundleState) {
+        self.add_parts(bundle, None);
+    }
+
+    /// `N42_ONE_PROBE=4`: [`Self::add`] for a lane batch, its bundle (the
+    /// accounts off the lane) and its lane ([`crate::batch_state::LaneOutput`])
+    /// handed over as they are: the lane's addresses listed by range and
+    /// entered in the live and early index like the map's, no `BundleAccount`
+    /// made. The freeze materialises them by shard with their reverts.
+    /// Outside index mode, or on a lane holding the beneficiary (whose credit
+    /// is summed from the map), the lane is put into the bundle first.
+    pub fn add_lane(&self, mut bundle: BundleState, lane: crate::batch_state::LaneOutput) {
+        if !self.index || lane.position(&self.beneficiary).is_some() {
+            let (map, reverts) = lane.into_parts();
+            bundle.state.extend(map);
+            if bundle.reverts.is_empty() {
+                bundle.reverts.push(Vec::new());
+            }
+            if let Some(last) = bundle.reverts.last_mut() {
+                last.extend(reverts);
+            }
+            self.add_parts(bundle, None);
+            return;
+        }
+        self.add_parts(bundle, Some(lane));
+    }
+
+    fn add_parts(&self, bundle: BundleState, lane: Option<crate::batch_state::LaneOutput>) {
         let at = std::time::Instant::now();
         let BundleState { state: accounts, contracts, mut reverts, .. } = bundle;
         let mut taken = std::mem::take(&mut *reverts);
@@ -962,6 +1028,7 @@ impl OutputShards {
                 accounts.remove(address);
             }
         } else {
+            debug_assert!(lane.is_none(), "a lane is flattened outside index mode");
             for address in accounts.keys() {
                 addresses[shard_index(address, count)].push(*address);
             }
@@ -973,7 +1040,24 @@ impl OutputShards {
             }
             revert_at[shard_index(address, count)].push(at as u32);
         }
-        let accounts = BatchAccounts::from_map(accounts);
+        // The lane's accounts: each changed and existing (a lane account
+        // moves only to an existing one), one unit of size, listed with the
+        // map's; their reverts are made by the freeze.
+        let mut lane_at: Vec<Vec<u32>> = Vec::new();
+        let accounts = match lane {
+            Some(lane) => {
+                lane_at = (0..count).map(|_| Vec::with_capacity(each(lane.len()))).collect();
+                for pos in 0..lane.len() {
+                    let Some(address) = lane.address(pos) else { continue };
+                    let shard = shard_index(address, count);
+                    size += 1;
+                    addresses[shard].push(*address);
+                    lane_at[shard].push(pos as u32);
+                }
+                BatchAccounts::with_lane(accounts, lane)
+            }
+            None => BatchAccounts::from_map(accounts),
+        };
         // Live index: numbered and entered now, on this thread. A block of
         // more batches than an index entry can name is frozen the ordinary
         // way (every batch's lists are kept either way).
@@ -999,7 +1083,7 @@ impl OutputShards {
             }
         }
         let accounts = Arc::new(accounts);
-        let out = BatchOut { accounts, reverts, addresses, revert_at, size, beneficiary_delta, live_id, deferred };
+        let out = BatchOut { accounts, reverts, addresses, revert_at, size, beneficiary_delta, live_id, deferred, lane_at };
         self.batches.lock().unwrap_or_else(PoisonError::into_inner).push(out);
         self.append_ns.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
@@ -1036,6 +1120,10 @@ impl OutputShards {
                 return freeze_live(pool, at, beneficiary, count, batches, contracts, self.append_ns.into_inner(), parts, split);
             }
             return freeze_indexed(pool, at, beneficiary, count, batches, contracts, self.append_ns.into_inner());
+        }
+        let mut batches = batches;
+        for batch in &mut batches {
+            batch.flatten_lane(count);
         }
         let transposed = std::time::Instant::now();
         let batches_ref = &batches;
@@ -1078,6 +1166,7 @@ impl OutputShards {
             append_ns: self.append_ns.into_inner(),
             fold_ns,
             index_build_ns: 0,
+            lane_ns: 0,
             split,
             early: None,
         }
@@ -1777,6 +1866,27 @@ fn finish_indexed(
         (split.heavy_shard, split.heavy_work, split.split_tasks) = (heavy_shard, heavy_work, split_tasks);
     }
     let live = live.is_some();
+    // `N42_ONE_PROBE=4`: the lane batches' accounts and reverts made, one
+    // task a shard, now that the index says which batch holds each.
+    let lane_at = std::time::Instant::now();
+    let (lane_state, lane_reverts): (Vec<AddressHashMap<BundleAccount>>, Vec<Vec<(Address, AccountRevert)>>) =
+        if batches.iter().any(|batch| batch.accounts.lane.is_some()) {
+            use rayon::prelude::*;
+            let batches_ref = &batches;
+            let built_ref = &built;
+            pool.install(|| {
+                (0..count)
+                    .into_par_iter()
+                    .map(|shard| match built_ref.get(shard) {
+                        Some((part, _)) => materialise_lanes(shard, batches_ref, part),
+                        None => Default::default(),
+                    })
+                    .unzip()
+            })
+        } else {
+            (Vec::new(), Vec::new())
+        };
+    let lane_ns = if lane_state.is_empty() { 0 } else { lane_at.elapsed().as_nanos() as u64 };
     let mut state_size = 0usize;
     let mut beneficiary_delta = U256::ZERO;
     let mut kept_batches = Vec::with_capacity(batches.len());
@@ -1784,8 +1894,13 @@ fn finish_indexed(
     for batch in batches {
         state_size += batch.size;
         beneficiary_delta = beneficiary_delta.saturating_add(batch.beneficiary_delta);
-        kept_batches.push(IndexedBatch { accounts: batch.accounts, removed: Default::default(), reverts: batch.reverts });
-        lists.push((batch.addresses, batch.revert_at));
+        let mut accounts = batch.accounts;
+        // Materialised: the lane goes unless an early output shares it.
+        if let Some(held) = Arc::get_mut(&mut accounts) {
+            held.lane = None;
+        }
+        kept_batches.push(IndexedBatch { accounts, removed: Default::default(), reverts: batch.reverts });
+        lists.push((batch.addresses, batch.revert_at, batch.lane_at));
     }
     // The address lists are done with: freed on the pool.
     pool.spawn(move || drop(lists));
@@ -1842,14 +1957,59 @@ fn finish_indexed(
             state_size,
             beneficiary_delta,
             conflict_count,
+            lane_state,
+            lane_reverts,
         })),
         contracts,
         append_ns,
         fold_ns,
         index_build_ns,
+        lane_ns,
         split,
         early: None,
     }
+}
+
+/// `N42_ONE_PROBE=4`: one shard's lane accounts made, with their reverts,
+/// as the batches' maps would have held them: an account the index names a
+/// lane batch for is closed into the shard's map with its revert; one
+/// several batches wrote (summed into the conflicts map by the freeze) keeps
+/// only its revert, from its first writer -- the batch the index held first,
+/// whose pair opens `drops` for it -- as the map path keeps the first
+/// writer's (every writer's revert is the same parent value).
+fn materialise_lanes(
+    shard: usize,
+    batches: &[BatchOut],
+    part: &IndexPart,
+) -> (AddressHashMap<BundleAccount>, Vec<(Address, AccountRevert)>) {
+    let wanted: usize = batches.iter().map(|batch| batch.lane_at.get(shard).map_or(0, Vec::len)).sum();
+    let mut firsts: AddressHashMap<u16> = Default::default();
+    for (id, address) in &part.drops {
+        firsts.entry(*address).or_insert(*id);
+    }
+    let mut state = AddressHashMap::with_capacity_and_hasher(wanted, Default::default());
+    let mut reverts = Vec::with_capacity(wanted);
+    for (id, batch) in batches.iter().enumerate() {
+        let (Some(lane), Some(positions)) = (batch.accounts.lane.as_ref(), batch.lane_at.get(shard)) else { continue };
+        let id = id as u16;
+        for &pos in positions {
+            let Some(address) = lane.address(pos as usize) else { continue };
+            let held = part.index.get(address).copied();
+            let own = held == Some(id);
+            if !own && !(held == Some(CONFLICT) && firsts.get(address) == Some(&id)) {
+                continue;
+            }
+            let Some((account, revert)) = lane.closed(pos as usize) else { continue };
+            debug_assert!(revert.is_some(), "a changed lane account always has a revert");
+            if let Some(revert) = revert {
+                reverts.push((*address, revert));
+            }
+            if own {
+                state.insert(*address, account);
+            }
+        }
+    }
+    (state, reverts)
 }
 
 /// Whether a block's shard maps go back to [`SHARD_POOL`] when its frozen
@@ -1925,6 +2085,9 @@ pub struct FrozenShards {
     append_ns: u64,
     fold_ns: u64,
     index_build_ns: u64,
+    /// `N42_ONE_PROBE=4`: the freeze's materialisation of the lane batches'
+    /// accounts and reverts by shard, nanoseconds (0 without lanes).
+    lane_ns: u64,
     split: FoldSplit,
 }
 
@@ -2083,6 +2246,17 @@ impl FrozenShards {
         self.indexed.as_ref().map_or(0, |indexed| indexed.conflict_count)
     }
 
+    /// `N42_ONE_PROBE=4`: the wall time of the freeze's materialisation of
+    /// the lane batches' accounts and reverts, microseconds.
+    pub const fn lane_materialise_us(&self) -> u64 {
+        self.lane_ns / 1000
+    }
+
+    /// Whether the output holds lane batches' accounts (`N42_ONE_PROBE=4`).
+    pub fn has_lanes(&self) -> bool {
+        self.indexed.as_ref().is_some_and(|indexed| !indexed.lane_state.is_empty())
+    }
+
     /// Index mode: the wall time of the parallel index build, microseconds.
     pub const fn index_build_us(&self) -> u64 {
         self.index_build_ns / 1000
@@ -2220,7 +2394,7 @@ impl FrozenShards {
     /// installed by `install_staged` exactly as a streamed graft is.
     pub fn into_staged(mut self) -> crate::parallel_transfer::StagedGraft {
         if let Some(indexed) = self.indexed.take() {
-            let Indexed { batches, conflicts, kept, state_size, beneficiary_delta, .. } = *indexed;
+            let Indexed { batches, conflicts, kept, state_size, beneficiary_delta, lane_state, lane_reverts, .. } = *indexed;
             let mut state: AddressHashMap<BundleAccount> = Default::default();
             state.reserve(batches.iter().map(|b| b.accounts.map.len()).sum::<usize>() + conflicts.iter().map(|c| c.len()).sum::<usize>());
             let mut slots: Vec<Vec<Option<(Address, AccountRevert)>>> = Vec::with_capacity(batches.len());
@@ -2232,7 +2406,11 @@ impl FrozenShards {
             for shard in conflicts {
                 state.extend(shard);
             }
+            for shard in lane_state {
+                state.extend(shard);
+            }
             let mut reverts = Vec::with_capacity(kept.iter().map(Vec::len).sum());
+            reverts.extend(lane_reverts.into_iter().flatten());
             for (id, at) in kept.into_iter().flatten() {
                 if let Some(revert) = slots.get_mut(id as usize).and_then(|batch| batch.get_mut(at as usize)).and_then(Option::take) {
                     reverts.push(revert);
@@ -2437,7 +2615,8 @@ impl FrozenShards {
                     .batches
                     .iter()
                     .map(|batch| (&batch.accounts.map, (!batch.removed.is_empty()).then_some(&batch.removed)))
-                    .chain(indexed.conflicts.iter().map(|map| (map, None))),
+                    .chain(indexed.conflicts.iter().map(|map| (map, None)))
+                    .chain(indexed.lane_state.iter().map(|map| (map, None))),
             );
         }
         sources
@@ -2506,6 +2685,7 @@ impl FrozenShards {
                     .map(|kept| kept.iter().filter_map(|&slot| indexed.revert(slot)).cloned().collect::<Vec<_>>())
                     .collect::<Vec<_>>(),
             );
+            parts.extend(indexed.lane_reverts.par_iter().map(Clone::clone).collect::<Vec<_>>());
         }
         let mut reverts = Vec::with_capacity(parts.iter().map(Vec::len).sum());
         for part in parts {
@@ -2572,6 +2752,7 @@ impl FrozenShards {
         if let Some(indexed) = &self.indexed {
             reverts.reserve(indexed.kept.iter().map(Vec::len).sum());
             reverts.extend(indexed.kept.iter().flatten().filter_map(|&slot| indexed.revert(slot)).cloned());
+            reverts.extend(indexed.lane_reverts.iter().flatten().cloned());
         }
         crate::parallel_transfer::sort_reverts_by_index(&mut reverts);
         reverts
@@ -3048,6 +3229,186 @@ mod frozen_tests {
         assert_eq!((empty.accounts(), empty.beneficiary_delta()), (0, U256::ZERO));
         assert!(!empty.holds(&addr(2)));
         assert!(empty.merged(&BundleState::default()).state.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    //! `N42_ONE_PROBE=4`: lane batches handed over as their lanes give the
+    //! same frozen output as their bundles do.
+    use super::*;
+    use crate::{
+        batch_state::{BatchState, LaneOutput},
+        fast_transfer::PlainTransfer,
+        one_probe::{resolve_with, Resolved, Rolling},
+    };
+    use revm::{
+        database::{CacheDB, EmptyDB},
+        state::AccountInfo,
+    };
+
+    fn addr(i: u32) -> Address {
+        let mut bytes = [0u8; 20];
+        bytes[..4].copy_from_slice(&(i.wrapping_mul(0x9e37_79b9)).to_be_bytes());
+        bytes[16..].copy_from_slice(&i.to_be_bytes());
+        Address::from(bytes)
+    }
+
+    const COINBASE: u32 = 999_999;
+
+    /// A block: `senders` senders paying `per` transfers each into a pool of
+    /// `pool` recipients (shared across batches), some to absent accounts;
+    /// one sender too poor to pay. Its plan's lanes at `width`.
+    fn block(senders: u32, per: u32, pool: u32, width: usize) -> (Vec<(Address, Address)>, Arc<Resolved>, CacheDB<EmptyDB>) {
+        let mut keys = Vec::new();
+        let mut groups = Vec::new();
+        for s in 0..senders {
+            let mut group = Vec::new();
+            for k in 0..per {
+                group.push(keys.len());
+                keys.push((addr(s), addr(100_000 + (s * 7 + k * 13) % pool)));
+            }
+            groups.push(group);
+        }
+        let plan = Arc::new(resolve_with(&mut Rolling::new(16), &keys).with_lanes(&groups, width));
+        let mut parent = CacheDB::new(EmptyDB::default());
+        for s in 0..senders {
+            let balance = if s == 3 { 1 } else { 1_000_000 };
+            parent.insert_account_info(addr(s), AccountInfo { balance: U256::from(balance), nonce: u64::from(s), ..Default::default() });
+        }
+        for r in (0..pool).step_by(2) {
+            parent.insert_account_info(addr(100_000 + r), AccountInfo { balance: U256::from(r), ..Default::default() });
+        }
+        parent.insert_account_info(addr(COINBASE), AccountInfo { balance: U256::from(1), ..Default::default() });
+        (keys, plan, parent)
+    }
+
+    /// Batch `b` of the plan run on its lane.
+    fn run(keys: &[(Address, Address)], plan: &Arc<Resolved>, parent: &CacheDB<EmptyDB>, b: usize) -> BatchState<CacheDB<EmptyDB>> {
+        use revm::Database as _;
+        let lanes = plan.lanes.as_ref().expect("lanes");
+        let mut state = BatchState::with_lane(parent.clone(), 4, Arc::clone(plan), b, false);
+        let coinbase = addr(COINBASE);
+        let mut broke: AddressHashSet = Default::default();
+        for (i, &(from, to)) in keys.iter().enumerate() {
+            if lanes.batch_of(i) != Some(b as u32) || broke.contains(&from) {
+                continue;
+            }
+            state.note_tx(i, &(from, to));
+            let s = state.basic(from).unwrap().expect("sender");
+            if s.balance < U256::from(10) {
+                broke.insert(from);
+                continue;
+            }
+            let r = state.basic(to).unwrap();
+            let c = state.basic(coinbase).unwrap().expect("beneficiary");
+            let plain = PlainTransfer {
+                caller: from,
+                sender_balance: s.balance - U256::from(10),
+                sender: s,
+                to,
+                recipient_balance: r.as_ref().map_or(U256::ZERO, |r| r.balance) + U256::from(9),
+                recipient: r,
+                beneficiary: coinbase,
+                coinbase_balance: c.balance + U256::from(1),
+                coinbase: c,
+            };
+            state.commit_transfer(plain).expect("commit");
+        }
+        state
+    }
+
+    fn shards(live: bool, defer: bool) -> OutputShards {
+        let mut out = OutputShards::with_index_live(addr(COINBASE), 64, 16, true, live);
+        out.set_early_index(live);
+        out.set_live_defer(defer, defer);
+        out
+    }
+
+    /// What a frozen output holds: every account read, the view, the
+    /// merged state and the reverts (sorted), the size, the beneficiary's
+    /// credit, the contracts.
+    fn summary(frozen: &FrozenShards, every: &[Address]) -> String {
+        let residual = BundleState::default();
+        let mut view: Vec<_> = frozen.view(&residual, &[]).into_iter().map(|(a, acc)| (*a, acc.clone())).collect();
+        view.sort_unstable_by_key(|(a, _)| *a);
+        let (merged, _) = frozen.merged_state_first(&residual, None);
+        let mut state: Vec<_> = merged.state.iter().map(|(a, acc)| (*a, acc.clone())).collect();
+        state.sort_unstable_by_key(|(a, _)| *a);
+        let (reverts, reverts_size) = frozen.late_reverts(Default::default(), Vec::new(), None);
+        let reads: Vec<_> = every.iter().map(|a| frozen.get(a).cloned()).collect();
+        let mut contracts: Vec<_> = merged.contracts.keys().copied().collect();
+        contracts.sort_unstable();
+        format!(
+            "{view:?}\n{state:?}\n{reverts:?} {reverts_size}\n{reads:?}\n{} {} {} {contracts:?}",
+            merged.state_size,
+            frozen.accounts(),
+            frozen.beneficiary_delta()
+        )
+    }
+
+    /// Lane batches handed over as lanes (all of them, or every other one
+    /// beside map batches) freeze to the output their bundles freeze to,
+    /// with the live index and without, deferred shards or not; the early
+    /// reads equal the frozen ones; the shard set folded into one graft
+    /// equals too.
+    #[test]
+    fn a_lane_output_freezes_to_the_bundles_output() {
+        for (senders, per, pool, width) in [(40u32, 6u32, 30u32, 4usize), (200, 3, 2_000, 8), (9, 20, 5, 3)] {
+            let (keys, plan, parent) = block(senders, per, pool, width);
+            let batches = plan.lanes.as_ref().unwrap().batches();
+            let mut every: Vec<Address> = keys.iter().flat_map(|(s, r)| [*s, *r]).collect();
+            every.push(addr(COINBASE));
+            every.sort_unstable();
+            every.dedup();
+            for (live, defer) in [(false, false), (true, false), (true, true)] {
+                let by_map = shards(live, defer);
+                let by_lane = shards(live, defer);
+                let mixed = shards(live, defer);
+                for b in (0..batches).rev() {
+                    by_map.add(run(&keys, &plan, &parent, b).take_bundle());
+                    let (bundle, lane) = run(&keys, &plan, &parent, b).take_output();
+                    let lane: LaneOutput = lane.expect("a lane");
+                    // The array form answers every account of the map form.
+                    let theirs = run(&keys, &plan, &parent, b).take_bundle();
+                    let ours = BatchAccounts::with_lane(bundle.state.clone(), lane.clone());
+                    assert_eq!(ours.len(), theirs.state.len());
+                    for (address, account) in ours.iter() {
+                        assert_eq!(theirs.state.get(address), Some(&*account), "batch {b}: {address}");
+                        assert_eq!(ours.get(address).as_deref(), Some(&*account));
+                    }
+                    by_lane.add_lane(bundle.clone(), lane.clone());
+                    if b % 2 == 0 {
+                        mixed.add_lane(bundle, lane);
+                    } else {
+                        mixed.add(theirs);
+                    }
+                }
+                let early = by_lane.early_view();
+                let theirs = by_map.freeze();
+                let theirs_summary = summary(&theirs, &every);
+                assert!(theirs.index_conflicts() > 0 || pool > 1_000, "batches share recipients");
+                if let Some(early) = early {
+                    for address in &every {
+                        assert_eq!(early.account(address).map(|a| a.into_owned()), theirs.get(address).cloned(), "early {address}");
+                    }
+                }
+                for (name, out) in [("lanes", by_lane), ("mixed", mixed)] {
+                    let frozen = out.freeze();
+                    assert!(frozen.has_lanes(), "{name}: lane accounts materialised");
+                    assert_eq!(summary(&frozen, &every), theirs_summary, "{name}, live {live}, defer {defer}, pool {pool}");
+                }
+            }
+            // Outside index mode the lanes are put into the bundles.
+            let v4 = OutputShards::with_index(addr(COINBASE), 64, 16, false);
+            let v4_map = OutputShards::with_index(addr(COINBASE), 64, 16, false);
+            for b in 0..batches {
+                let (bundle, lane) = run(&keys, &plan, &parent, b).take_output();
+                v4.add_lane(bundle, lane.expect("a lane"));
+                v4_map.add(run(&keys, &plan, &parent, b).take_bundle());
+            }
+            assert_eq!(summary(&v4.freeze(), &every), summary(&v4_map.freeze(), &every));
+        }
     }
 }
 

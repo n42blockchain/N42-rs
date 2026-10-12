@@ -11,15 +11,17 @@ upstream added are copied; files upstream deleted are deleted when this repo
 had not touched them, and listed otherwise. Without directories, every
 `path = "..."` in the reth patch table of Cargo.toml is synced.
 
-Upstream is read from the checkout at ../reth, which must have <new-rev>.
+Run from the repository root. Upstream is read from N42_RETH_SOURCE when set,
+otherwise from ../reth; that checkout must contain both revisions.
 """
 import pathlib
-import re
+import os
+import tomllib
 import subprocess
 import sys
 import tempfile
 
-RETH = pathlib.Path(__file__).resolve().parents[1].parent / "reth"
+RETH = pathlib.Path(os.environ.get("N42_RETH_SOURCE", pathlib.Path(__file__).resolve().parents[1].parent / "reth"))
 
 
 def show(rev, path):
@@ -28,9 +30,12 @@ def show(rev, path):
 
 
 def patched_dirs():
-    text = pathlib.Path("Cargo.toml").read_text()
-    table = text.split("[patch.'https://github.com/paradigmxyz/reth.git']", 1)[1].split("\n[", 1)[0]
-    return re.findall(r'path\s*=\s*"([^"]+)"', table)
+    manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+    patches = manifest.get("patch", {}).get("https://github.com/paradigmxyz/reth.git", {})
+    # TOML parsing excludes commented-out patch entries. Preserve order and
+    # avoid applying an upstream merge twice if two names share a directory.
+    return list(dict.fromkeys(entry["path"] for entry in patches.values()
+                             if isinstance(entry, dict) and "path" in entry))
 
 
 def main():

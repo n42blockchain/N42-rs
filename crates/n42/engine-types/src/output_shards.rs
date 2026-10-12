@@ -519,44 +519,61 @@ impl Shard {
     }
 }
 
-/// One batch's accounts as the batch handed them over: its map of closed
-/// bundle accounts. Read before the freeze through [`Self::get`] and
-/// [`Self::iter`], which answer owned or borrowed values (`Cow`), so a
-/// form that holds its accounts as other than `BundleAccount`s can answer
-/// them too; after the freeze the shards' maps hold every account and are
-/// read borrowed.
+/// One batch's accounts as the batch handed them over, in one of two forms:
+/// its map of closed bundle accounts (every batch but a stage-4 lane one),
+/// or (`N42_ONE_PROBE=4`) the lane array as the batch left it
+/// ([`crate::batch_state::LaneOutput`]) beside the small map of the
+/// accounts the lane does not hold (the beneficiary, spilled ones). Read
+/// before the freeze through [`Self::get`] and [`Self::iter`], which answer
+/// owned or borrowed values (`Cow`): a lane account is closed on the fly,
+/// as `BatchState::take_bundle` closes it. The freeze materialises the lane
+/// accounts by shard ([`Indexed`]'s `lane_state`); after it every account
+/// is in a map and is read borrowed.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct BatchAccounts {
-    /// The closed accounts.
+    /// The closed accounts (on a lane batch: those off the lane).
     map: AddressHashMap<BundleAccount>,
+    /// `N42_ONE_PROBE=4`: the lane's changed accounts, not materialised.
+    lane: Option<crate::batch_state::LaneOutput>,
 }
 
 impl BatchAccounts {
     /// The batch's accounts as a map.
-    pub(crate) const fn from_map(map: AddressHashMap<BundleAccount>) -> Self {
-        Self { map }
+    pub(crate) fn from_map(map: AddressHashMap<BundleAccount>) -> Self {
+        Self { map, lane: None }
+    }
+
+    /// A lane batch's output: its small map and its lane.
+    pub(crate) fn with_lane(map: AddressHashMap<BundleAccount>, lane: crate::batch_state::LaneOutput) -> Self {
+        Self { map, lane: Some(lane) }
     }
 
     /// The account `address` as the batch left it.
     #[inline]
     pub(crate) fn get(&self, address: &Address) -> Option<std::borrow::Cow<'_, BundleAccount>> {
-        self.map.get(address).map(std::borrow::Cow::Borrowed)
+        if let Some(account) = self.map.get(address) {
+            return Some(std::borrow::Cow::Borrowed(account));
+        }
+        self.lane.as_ref()?.get(address).map(std::borrow::Cow::Owned)
     }
 
     /// Whether the batch holds `address`.
     #[inline]
     pub(crate) fn contains_key(&self, address: &Address) -> bool {
-        self.map.contains_key(address)
+        self.map.contains_key(address) || self.lane.as_ref().is_some_and(|lane| lane.position(address).is_some())
     }
 
     /// The accounts held.
     pub(crate) fn len(&self) -> usize {
-        self.map.len()
+        self.map.len() + self.lane.as_ref().map_or(0, crate::batch_state::LaneOutput::len)
     }
 
-    /// Every account, each once, in the batch's order.
+    /// Every account, each once: the map's, then the lane's in lane order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&Address, std::borrow::Cow<'_, BundleAccount>)> {
-        self.map.iter().map(|(address, account)| (address, std::borrow::Cow::Borrowed(account)))
+        self.map
+            .iter()
+            .map(|(address, account)| (address, std::borrow::Cow::Borrowed(account)))
+            .chain(self.lane.iter().flat_map(|lane| lane.iter().map(|(address, account)| (address, std::borrow::Cow::Owned(account)))))
     }
 }
 

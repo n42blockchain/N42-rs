@@ -21,7 +21,7 @@
 use crate::fast_transfer::PlainTransfer;
 use alloy_primitives::{map::AddressMap, Address, B256, U256};
 use revm::{
-    database::states::{AccountStatus, BundleAccount, BundleState, TransitionAccount},
+    database::states::{reverts::AccountRevert, AccountStatus, BundleAccount, BundleState, TransitionAccount},
     primitives::KECCAK_EMPTY,
     state::{AccountInfo, Bytecode, EvmState},
     Database,
@@ -396,29 +396,15 @@ impl<G: Database> BatchState<G> {
         // the bundle (`TransitionAccount::create_revert`), and stays as its
         // `present_bundle_account` only if that revert exists, as there.
         accounts.retain(|address, entry| {
-            let previous_status = loaded_status(entry.original_info.as_ref());
-            if entry.status == previous_status {
+            if entry.status == loaded_status(entry.original_info.as_ref()) {
                 return false;
             }
             changed = true;
-            let (present_info, present_status) = (entry.info.clone(), entry.status);
-            let transition = TransitionAccount {
-                info: entry.info.take(),
-                status: entry.status,
-                previous_info: entry.original_info.clone(),
-                previous_status,
-                storage: std::mem::take(&mut entry.storage),
-                storage_was_destroyed: false,
-            };
-            if let Some((hash, code)) = transition.has_new_contract() {
+            let Some(revert) = close(entry, |hash, code| {
                 bundle.contracts.insert(hash, code.clone());
-            }
-            // `original_bundle_account`, updated by the transition.
-            entry.info = entry.original_info.clone();
-            entry.status = previous_status;
-            let Some(revert) = entry.update_and_create_revert(transition) else { return false };
-            entry.info = present_info;
-            entry.status = present_status;
+            }) else {
+                return false;
+            };
             state_size += entry.size_hint();
             reverts_size += revert.size_hint();
             reverts.push((*address, revert));
@@ -431,6 +417,237 @@ impl<G: Database> BatchState<G> {
             bundle.reverts_size = reverts_size;
         }
         bundle
+    }
+}
+
+/// One changed account's close (`entry`'s status moved off its loaded one):
+/// the revert `apply_transitions_and_create_reverts` makes for an account
+/// new to the bundle (`TransitionAccount::create_revert`), `None` when it
+/// makes none; `entry` is left as its `present_bundle_account`. A contract
+/// the transition brings is handed to `contract`.
+fn close(entry: &mut BundleAccount, mut contract: impl FnMut(B256, &Bytecode)) -> Option<AccountRevert> {
+    let previous_status = loaded_status(entry.original_info.as_ref());
+    let (present_info, present_status) = (entry.info.clone(), entry.status);
+    let transition = TransitionAccount {
+        info: entry.info.take(),
+        status: entry.status,
+        previous_info: entry.original_info.clone(),
+        previous_status,
+        storage: std::mem::take(&mut entry.storage),
+        storage_was_destroyed: false,
+    };
+    if let Some((hash, code)) = transition.has_new_contract() {
+        contract(hash, code);
+    }
+    // `original_bundle_account`, updated by the transition.
+    entry.info = entry.original_info.clone();
+    entry.status = previous_status;
+    let revert = entry.update_and_create_revert(transition)?;
+    entry.info = present_info;
+    entry.status = present_status;
+    Some(revert)
+}
+
+/// A batch's lane handed over as the batch's output (`N42_ONE_PROBE=4`,
+/// [`BatchState::take_output`]): the lane's entries as the batch left them
+/// (96 bytes each), the lane ids of the changed ones, and their addresses
+/// through the plan, with no `BundleAccount` made. [`Self::account`] and
+/// [`Self::revert`] make the closed account and its revert exactly as
+/// [`BatchState::take_bundle`] makes them; [`Self::get`] finds an address
+/// through a table of positions (four bytes a slot) built at the hand-over.
+#[derive(Clone)]
+pub struct LaneOutput {
+    plan: std::sync::Arc<crate::one_probe::Resolved>,
+    batch: usize,
+    work: Vec<Work>,
+    /// Lane ids of the changed entries, in lane order: the output's
+    /// positions.
+    kept: Vec<u32>,
+    /// Open addressing over the kept addresses: position + 1, 0 empty.
+    slots: Vec<u32>,
+    empty: Bytecode,
+}
+
+impl std::fmt::Debug for LaneOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaneOutput").field("batch", &self.batch).field("accounts", &self.kept.len()).finish()
+    }
+}
+
+/// [`LaneOutput`]'s table slot of `address` in a table of `mask + 1`.
+#[inline]
+fn lane_slot(address: &Address, mask: usize) -> usize {
+    let bytes = &address.0 .0;
+    let mut low = [0u8; 8];
+    let mut high = [0u8; 8];
+    low.copy_from_slice(&bytes[12..20]);
+    high.copy_from_slice(&bytes[0..8]);
+    let h = (u64::from_le_bytes(low) ^ u64::from_le_bytes(high).rotate_left(23)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (h >> 32) as usize & mask
+}
+
+impl LaneOutput {
+    fn new(plan: std::sync::Arc<crate::one_probe::Resolved>, batch: usize, work: Vec<Work>, kept: Vec<u32>, empty: Bytecode) -> Self {
+        let mut out = Self { plan, batch, work, kept, slots: Vec::new(), empty };
+        let size = (out.kept.len() * 2).next_power_of_two().max(8);
+        let mut slots = vec![0u32; size];
+        let addresses = out.lane_addresses();
+        for (pos, &lid) in out.kept.iter().enumerate() {
+            let Some(address) = addresses.get(lid as usize) else { continue };
+            let mut at = lane_slot(address, size - 1);
+            while slots[at] != 0 {
+                at = (at + 1) & (size - 1);
+            }
+            slots[at] = pos as u32 + 1;
+        }
+        out.slots = slots;
+        out
+    }
+
+    fn lane_addresses(&self) -> &[Address] {
+        self.plan.lanes.as_ref().and_then(|lanes| lanes.lane(self.batch)).unwrap_or_default()
+    }
+
+    /// The accounts held.
+    pub fn len(&self) -> usize {
+        self.kept.len()
+    }
+
+    /// Whether it holds none.
+    pub fn is_empty(&self) -> bool {
+        self.kept.is_empty()
+    }
+
+    /// The address at position `pos`.
+    #[inline]
+    pub fn address(&self, pos: usize) -> Option<&Address> {
+        self.lane_addresses().get(*self.kept.get(pos)? as usize)
+    }
+
+    /// The position of `address`, if the batch changed it on its lane.
+    #[inline]
+    pub fn position(&self, address: &Address) -> Option<usize> {
+        let mask = self.slots.len().checked_sub(1)?;
+        let mut at = lane_slot(address, mask);
+        loop {
+            let pos = (*self.slots.get(at)?).checked_sub(1)? as usize;
+            if self.address(pos) == Some(address) {
+                return Some(pos);
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    /// The closed account at position `pos`, as the map's close leaves it.
+    #[inline]
+    pub fn account(&self, pos: usize) -> Option<BundleAccount> {
+        let work = self.work.get(*self.kept.get(pos)? as usize)?;
+        Some(BundleAccount {
+            original_info: work.original(&self.empty),
+            info: work.info(&self.empty),
+            storage: Default::default(),
+            status: work.status,
+        })
+    }
+
+    /// The account at position `pos` with its revert, as the map's close
+    /// makes them.
+    pub fn closed(&self, pos: usize) -> Option<(BundleAccount, Option<AccountRevert>)> {
+        let mut account = self.account(pos)?;
+        let revert = close(&mut account, |_, _| {});
+        Some((account, revert))
+    }
+
+    /// The account `address` as the batch left it, closed.
+    pub fn get(&self, address: &Address) -> Option<BundleAccount> {
+        self.account(self.position(address)?)
+    }
+
+    /// Every account with its address, in lane order, closed.
+    pub fn iter(&self) -> impl Iterator<Item = (&Address, BundleAccount)> + '_ {
+        (0..self.kept.len()).filter_map(|pos| Some((self.address(pos)?, self.account(pos)?)))
+    }
+
+    /// The accounts and their reverts as [`BatchState::take_bundle`] leaves
+    /// them: the map form of this output.
+    pub fn into_parts(self) -> (alloy_primitives::map::AddressHashMap<BundleAccount>, Vec<(Address, AccountRevert)>) {
+        let mut map = alloy_primitives::map::AddressHashMap::with_capacity_and_hasher(self.kept.len(), Default::default());
+        let mut reverts = Vec::with_capacity(self.kept.len());
+        for pos in 0..self.kept.len() {
+            let (Some(address), Some((account, revert))) = (self.address(pos), self.closed(pos)) else { continue };
+            if let Some(revert) = revert {
+                reverts.push((*address, revert));
+                map.insert(*address, account);
+            }
+        }
+        (map, reverts)
+    }
+}
+
+impl<G: Database> BatchState<G> {
+    /// `N42_ONE_PROBE=4`: [`Self::take_bundle`] with the lane handed over as
+    /// it stands ([`LaneOutput`]) instead of put into the bundle's map: the
+    /// bundle holds the map's accounts (the beneficiary, spilled ones), the
+    /// lane's contracts (the empty code a created recipient carries), and the
+    /// fold's parts are handed to the plan as there. `None` for the lane on
+    /// a batch without one.
+    pub fn take_output(&mut self) -> (BundleState, Option<LaneOutput>) {
+        let Some(mut lane) = self.lane.take() else { return (self.take_bundle(), None) };
+        let lanes = lane.plan.lanes.as_ref();
+        let bids = lanes.filter(|_| lane.fold).and_then(|lanes| lanes.lane_bids(lane.batch)).unwrap_or_default();
+        let mut parts = Vec::new();
+        let mut kept = Vec::with_capacity(lane.work.len());
+        let mut created = false;
+        for (lid, work) in lane.work.iter().enumerate() {
+            if work.flags & LOADED == 0 {
+                continue;
+            }
+            lane.loaded += 1;
+            if work.flags & SPILL != 0 {
+                continue;
+            }
+            if let (Some(lanes), Some(&bid)) = (lanes, bids.get(lid))
+                && lanes.cross(bid)
+            {
+                parts.push(crate::one_probe::FoldPart {
+                    bid,
+                    original: (work.flags & ORIG_SOME != 0).then_some((work.orig_balance, work.orig_nonce)),
+                    current: (work.flags & CUR_SOME != 0).then_some((work.balance, work.nonce)),
+                });
+            }
+            let original = (work.flags & ORIG_SOME != 0).then_some(work.orig_balance);
+            if work.status == loaded_status_of(original.is_some(), work.orig_balance.is_zero() && work.orig_nonce == 0) {
+                continue;
+            }
+            // `TransitionAccount::has_new_contract`: an account that did not
+            // exist and now carries `Some` empty code.
+            created |= work.flags & (ORIG_SOME | CUR_SOME | CUR_CODE) == CUR_SOME | CUR_CODE;
+            kept.push(lid as u32);
+        }
+        if let Some(lanes) = lanes
+            && !parts.is_empty()
+        {
+            lanes.fold_part(parts);
+        }
+        let mut bundle = self.take_bundle();
+        if created {
+            bundle.contracts.insert(KECCAK_EMPTY, lane.empty.clone());
+        }
+        let work = std::mem::take(&mut lane.work);
+        let plan = std::sync::Arc::clone(&lane.plan);
+        let out = LaneOutput::new(plan, lane.batch, work, kept, lane.empty.clone());
+        (bundle, Some(out))
+    }
+}
+
+/// [`loaded_status`] from whether the read info existed and was empty (a
+/// lane's plain account: no code, so empty is a zero balance and nonce).
+#[inline]
+const fn loaded_status_of(existed: bool, empty: bool) -> AccountStatus {
+    match (existed, empty) {
+        (false, _) => AccountStatus::LoadedNotExisting,
+        (true, true) => AccountStatus::LoadedEmptyEIP161,
+        (true, false) => AccountStatus::Loaded,
     }
 }
 
@@ -818,5 +1035,76 @@ mod tests {
     fn the_refusal_names_the_account() {
         let text = Unsupported(addr(0x2a)).to_string();
         assert!(text.contains(&addr(0x2a).to_string()), "{text}");
+    }
+
+    /// `N42_ONE_PROBE=4`: a lane batch's output handed over as the lane
+    /// (`take_output`) closes into the bundle `take_bundle` leaves -- the
+    /// map's accounts, the lane's accounts and reverts, the empty code a
+    /// created recipient brings -- and finds every account by address.
+    #[test]
+    fn a_lane_output_closes_into_the_lane_bundle() {
+        use crate::one_probe::{resolve_with, Rolling};
+        let coinbase = addr(50);
+        // Sender 1 pays 9 (absent: created) twice and 8; sender 2 pays 8
+        // and the beneficiary's neighbour 7 (empty: EIP-161); sender 3 is
+        // too poor for its transfer (read only).
+        let keys = [(addr(1), addr(9)), (addr(1), addr(9)), (addr(1), addr(8)), (addr(2), addr(8)), (addr(2), addr(7)), (addr(3), addr(6))];
+        let groups = vec![vec![0, 1, 2], vec![3, 4], vec![5]];
+        let plan = std::sync::Arc::new(resolve_with(&mut Rolling::new(16), &keys).with_lanes(&groups, 1));
+        let mut parent = CacheDB::new(EmptyDB::default());
+        let plain = |balance: u64, nonce: u64| AccountInfo { balance: U256::from(balance), nonce, ..Default::default() };
+        parent.insert_account_info(addr(1), plain(1_000, 0));
+        parent.insert_account_info(addr(2), plain(1_000, 4));
+        parent.insert_account_info(addr(3), plain(1, 0));
+        parent.insert_account_info(addr(8), plain(5, 1));
+        parent.insert_account_info(addr(7), plain(0, 0));
+        parent.insert_account_info(addr(6), plain(5, 0));
+        parent.insert_account_info(coinbase, plain(1, 0));
+        let drive = |state: &mut BatchState<CacheDB<EmptyDB>>| {
+            for (i, &(from, to)) in keys.iter().enumerate() {
+                state.note_tx(i, &(from, to));
+                let s = state.basic(from).unwrap().expect("sender");
+                if s.balance < U256::from(10) {
+                    let _ = state.basic(to).unwrap();
+                    continue;
+                }
+                let r = state.basic(to).unwrap();
+                let c = state.basic(coinbase).unwrap().expect("beneficiary");
+                let plain = PlainTransfer {
+                    caller: from,
+                    sender_balance: s.balance - U256::from(10),
+                    sender: s,
+                    to,
+                    recipient_balance: r.as_ref().map_or(U256::ZERO, |r| r.balance) + U256::from(9),
+                    recipient: r,
+                    beneficiary: coinbase,
+                    coinbase_balance: c.balance + U256::from(1),
+                    coinbase: c,
+                };
+                state.commit_transfer(plain).expect("commit");
+            }
+        };
+        let mut by_map = BatchState::with_lane(parent.clone(), 4, std::sync::Arc::clone(&plan), 0, false);
+        drive(&mut by_map);
+        let theirs = by_map.take_bundle();
+        let mut by_lane = BatchState::with_lane(parent, 4, plan, 0, false);
+        drive(&mut by_lane);
+        let (bundle, lane) = by_lane.take_output();
+        let lane = lane.expect("a lane batch hands its lane over");
+        assert!(bundle.state.contains_key(&coinbase) && bundle.state.len() == 1, "the map keeps the beneficiary");
+        assert_eq!(bundle.contracts, theirs.contracts, "the created recipient's empty code");
+        assert!(!lane.is_empty() && lane.position(&addr(3)).is_none() && lane.position(&addr(6)).is_none(), "read only: left out");
+        for (address, account) in lane.iter() {
+            assert_eq!(lane.get(address).as_ref(), Some(&account));
+            assert_eq!(theirs.state.get(address), Some(&account), "{address}");
+        }
+        let (map, reverts) = lane.into_parts();
+        let mut state = map;
+        state.extend(bundle.state.clone());
+        assert_eq!(state, theirs.state);
+        let mut ours: std::collections::BTreeMap<_, _> = reverts.into_iter().collect();
+        ours.extend(bundle.reverts.iter().flatten().cloned());
+        let theirs: std::collections::BTreeMap<_, _> = theirs.reverts.iter().flatten().cloned().collect();
+        assert_eq!(ours, theirs, "reverts");
     }
 }

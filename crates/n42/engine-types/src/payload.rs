@@ -4329,6 +4329,9 @@ where
                     one_probe_lane_hits,
                     one_probe_lane_accounts,
                     one_probe_ring_reject,
+                    // Blocks built without their view (the resolve late)
+                    // and recorded from their post-state, cumulative.
+                    one_probe_late_records = crate::one_probe::late_records(),
                     par_mlp_k,
                     par_mlp_hints,
                     par_fold_ms,

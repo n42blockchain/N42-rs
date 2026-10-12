@@ -1,7 +1,8 @@
 # One-probe state for the build: a dense per-block account layout resolved at plan time
 
-Status: design, with a microbenchmark (`crates/n42/engine-types/tests/one_probe_bench.rs`). No
-production code changes yet. Follows `docs/BREAKTHROUGH_DESIGN.md` 10.117-10.124; linked from there as
+Status: stages 1 and 2 implemented behind `N42_ONE_PROBE=1|2` (off by default; sections 10 and 11),
+not yet measured on the fleet; stage 3 is design. Microbenchmark:
+`crates/n42/engine-types/tests/one_probe_bench.rs`. Follows `docs/BREAKTHROUGH_DESIGN.md` 10.117-10.124; linked from there as
 10.125.
 
 ## 1. The measured problem
@@ -469,3 +470,55 @@ plan), the per-id source (`srcs`, today folded into `PlanTx` and dropped after) 
 `BatchState`'s bundle made from the touched ids at batch end; the ring, the prefix rule, the residual
 bitmap and the write-through into `DenseOut` carry over unchanged (stage 2 writes `work` itself as the
 output).
+
+## 11. Stage 2, implementation
+
+`N42_ONE_PROBE=2` (implies stage 1; 3 runs as 2). What was built, and where it departs from sections 5-8:
+
+- **Plan-time batches and lanes** (`one_probe::Lanes`, `Resolved::with_lanes`, called from the plan hook
+  when the plan has its sender partition): the width is `parallel_transfer::lane_width(Dispatch::from_env())`
+  -- the build pool's threads for one wave, n for `N42_BUILD_BATCHES=n`, none for the halves dispatch
+  (which packs otherwise). The plan packs the groups with `batch_groups_one_wave` at that width, then per
+  batch (in parallel, a per-thread stamp array over the dense ids) gives every account a lane id in
+  first-touch order and records each transaction's batch and its two lane ids; a per-id owner word flags
+  ids more than one batch touches. Cost on 8 throttled cores, 200k flood transfers, 128 batches: 1.4 ms
+  beside the resolve's 5.0 ms (`bench_node_batch_state`).
+- **Use at the build** (`execute_for_build_opts`, handed the plan through `PreparedExec::one_probe`): only
+  when the call used the plan's groups and its dispatch's width and batch count are the plan's; then
+  `Lanes::used` is set before the batches run. Each batch checks that its transactions are the plan's and
+  the plan's batch; one that is not runs on its map and marks the lanes broken, which keeps the block's
+  output out of the ring. Any other width, a topped-up plan or the halves dispatch: stage 1 alone.
+- **The dense batch state** (`batch_state.rs` `BatchState::with_lane`): the lane is an array of `Work`
+  entries, 96 bytes each (`align(32)`): the balance and nonce as read and as they stand, the
+  `AccountStatus`, and flags (loaded, read info exists / carries `Some` empty code, current info exists /
+  carries it, spilled). It is found by the running transaction's lane ids, never by hashing; the per-batch
+  `BundleAccount` map shrinks to capacity 4 and keeps the beneficiary and any account the lane cannot hold
+  (code, an account id, non-empty `code`: spilled). A first touch reads beneath (the stage-1 reference or
+  the chain), normalised as `loaded` normalises; a commit moves the status with the same `on_changed`;
+  `take_bundle` puts the loaded entries into the map at the batch's end and closes it with today's code,
+  so the bundle and the reverts are the map path's account for account. The reverts' order within a batch
+  is the map's iteration order, as today (no consumer relies on it: the block's reverts are sorted when
+  assembled, `append_sorted_reverts`); the tests compare them as sets. Size: a 1,560-transfer batch's
+  lane of ~3,100 accounts is ~300 KB (L2-resident), against the ~1.07 MB map it replaces.
+- **Write-through with lanes**: an account is written to the block's dense output when one batch touches
+  it (`Resolved::one_writer`), so a recipient two senders of the same batch pay is now written; an account
+  two batches touch stays unwritten and is read through the chain by later blocks -- the design's lane
+  fold (`pre + sum(lane - pre)`) is not implemented, so the cross-batch case is not covered.
+- **Still read through the chain**: first touches whose reference is invalid or names an unwritten entry,
+  accounts two batches of their block touched, the residual accounts (section 5.3), the beneficiary (on
+  its map, once per batch), and everything when the prefix is empty.
+- **Fields**: `one_probe_lane_hits` (reads answered from a loaded lane entry), `one_probe_lane_accounts`
+  (entries loaded into lanes).
+- **Bench** (`bench_node_batch_state`: the node's `BatchState` driven as the batch loop drives it, parent
+  reads one map probe, infos without code as the provider gives them; 8 threads on cores 232-239, nice 19,
+  p50 of 7): map 14.4 ms, lane 13.2 ms. With `Some` empty code on every read info (a first version that
+  made a fresh `Bytecode::default()` each read) both were 50-62 ms -- the infos' code dominated, which is
+  why the lane now clones one per-lane empty bytecode. The gain is small because the lane still builds the
+  batch's `BundleAccount` map at its end; removing that is stage 3 (the dense output index, the bundle
+  made only by the merge behind the seal). The original bench's paths on the same run: today 25.0, stage1
+  24.2, stage1d 23.2, proto 3.0 ms.
+- **Tests**: `parallel_transfer::tests::a_build_on_resolved_reads_equals_the_plain_build` runs the three
+  blocks on stage 1, on stage 2 at the build's width (lanes used and hit, a recipient two senders of one
+  batch pay written through and equal to the block's post-state) and with lanes made at another width
+  (not used, still equal); `one_probe::tests::a_lane_holds_a_recipient_two_of_its_senders_pay`;
+  `bench_node_batch_state` checks every batch's bundle and reverts equal between map and lane.

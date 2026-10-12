@@ -644,7 +644,7 @@
   `warm_ahead_ms`、`warm_ahead_hits`、`warm_ahead_ready`。不触及任何 fork 的 reth crate。说明见
   `docs/BREAKTHROUGH_DESIGN.md` 10.122。
 
-## 计划时解析的单次探测状态，阶段 1（`N42_ONE_PROBE=1`，`N42_ONE_PROBE_DEPTH=<D>` 默认 16，默认关）
+## 计划时解析的单次探测状态，阶段 1-2（`N42_ONE_PROBE=1|2`，`N42_ONE_PROBE_DEPTH=<D>` 默认 16，默认关）
 - `crates/n42/engine-types/src/one_probe.rs`（新文件）：计划钩子（`payload.rs` `make_prepared_build`，需
   `N42_PLAN_AHEAD_BODY=1`）在 plan-body 线程池上给计划的每个不同地址分配稠密 id，并在滚动的“最后写入者”表
   （`Rolling`，64 分片，地址 -> 最新触及它的计划序号与其 id）中各探测一次、插入一次，得到每笔交易的
@@ -659,7 +659,14 @@
   稠密输出；交易与计划不符时该块不入环。块在执行末尾按计划整块封装（与 `warm_ahead::note_built` 同处）时其输出进入
   深度 D 的环。阶段行字段 `one_probe_stage`、`one_probe_resolved`、`one_probe_prefix`、`one_probe_hits`、
   `one_probe_fallbacks`、`one_probe_resolve_ms`。`warm_ahead::SYSTEM` 改为 `pub(crate)`。不触及任何 fork 的 reth
-  crate。说明见 `docs/ONE_PROBE_STATE_DESIGN.md`（含 "Stage 1, implementation"）。
+  crate。说明见 `docs/ONE_PROBE_STATE_DESIGN.md`（"Stage 1, implementation" 与 "Stage 2, implementation"）。
+- 阶段 2（`N42_ONE_PROBE=2`，含阶段 1）：计划钩子在已知划分与派发宽度（`parallel_transfer::lane_width`：one wave 为构建池
+  线程数，`N42_BUILD_BATCHES=n` 为 n；halves 无）时，按构建同样的 `batch_groups_one_wave` 在计划时分批，得到每笔交易
+  的批次与 lane 内 id、每个 lane 的地址、每个稠密 id 是否被多个批次触及（`one_probe::Lanes`）。`PreparedExec` 新增
+  `one_probe` 字段；`execute_for_build_opts` 在使用了计划的划分且宽度与批数一致时让各批次以 lane 运行
+  （`batch_state.rs` `BatchState::with_lane`：按 lane id 索引的 96 字节条目数组代替每批次的 `BundleAccount` 哈希表，
+  表中只剩 beneficiary 与 lane 放不下的账户；`take_bundle` 在批次末尾把 lane 的账户放回表后照旧结算），否则只用阶段 1。
+  有 lane 时写穿规则改为“只有一个批次触及”。阶段行字段 `one_probe_lane_hits`、`one_probe_lane_accounts`。
 
 ## 构建批次内的预取（`N42_BUILD_MLP=<k>`，默认关）
 - `crates/n42/engine-types/src/parallel_transfer.rs` `build_mlp` / `set_build_mlp` / `prefetch_hint`，循环在

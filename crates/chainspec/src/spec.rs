@@ -1511,7 +1511,8 @@ mod tests {
     fn upstream_named_fork_builders_activate_requested_forks() {
         let dao = ChainSpecBuilder::default().dao_activated();
         assert_eq!(dao.hardforks.get(EthereumHardfork::Dao), Some(ForkCondition::Block(0)));
-        assert_eq!(dao.hardforks.get(EthereumHardfork::Homestead), Some(ForkCondition::Block(0)));
+        assert_eq!(dao.hardforks.get(EthereumHardfork::Frontier), Some(ForkCondition::Block(0)));
+        assert_eq!(dao.hardforks.get(EthereumHardfork::Homestead), None);
         let muir = ChainSpecBuilder::default().muirglacier_activated();
         assert_eq!(muir.hardforks.get(EthereumHardfork::MuirGlacier), Some(ForkCondition::Block(0)));
         assert_eq!(muir.hardforks.get(EthereumHardfork::Istanbul), Some(ForkCondition::Block(0)));

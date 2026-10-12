@@ -633,6 +633,17 @@
   `write_state` 的慢路径，`consistent.rs` 六处内存块 changeset 读取；`crates/chain-state/src/in_memory.rs`
   `n42_completed_outcome`（非 lean 通知的拷贝）。未登记的块按原样读取，行为不变。
 
+## 随计划提前预读账户（`N42_PLAN_AHEAD_WARM=<threads>`，默认关）
+- `crates/n42/engine-types/src/warm_ahead.rs`（新文件）：计划钩子（`payload.rs` `make_prepared_build`，需
+  `N42_PLAN_AHEAD_BODY=1`）在独立线程池 `n42-warm-*`（核心布局 `Set::Background`）上，以正在构建的块 N 所读的状态
+  （N 的父块，构建开始时 `note_base` 发布其 opener）读取下一计划的发送者与接收者账户，排除 N 所取计划触及的账户，
+  写入 `FrozenWarm`；块 N+1 仅在 N 于执行末尾按该计划整块封装（`note_built`）、N+1 的父块即该块（builder hash）
+  且祖父块即读取所用状态时，经 `WarmDb` 使用（`usable`），并在取用时去掉 N 的 beneficiary、提款接收者与系统合约。
+  不等待：未读完的分片为空，读穿到原链。`parallel_transfer.rs` 的 `FrozenWarm` 增加 `from_shards` 与命中计数
+  （`WarmDb` drop 时累加），`frame_blocks.rs` `PreparedBuild` 增加 `warm_id`。阶段行字段 `warm_ahead_accounts`、
+  `warm_ahead_ms`、`warm_ahead_hits`、`warm_ahead_ready`。不触及任何 fork 的 reth crate。说明见
+  `docs/BREAKTHROUGH_DESIGN.md` 10.122。
+
 ## 构建批次内的预取（`N42_BUILD_MLP=<k>`，默认关）
 - `crates/n42/engine-types/src/parallel_transfer.rs` `build_mlp` / `set_build_mlp` / `prefetch_hint`，循环在
   `execute_for_build_opts` 的 `run_batch`：执行第 i 笔前，先转换批次顺序中 k 笔之后的那笔（其池中交易此时读入，

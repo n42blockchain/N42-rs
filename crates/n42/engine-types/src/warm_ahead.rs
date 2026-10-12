@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The warm read ahead of the build (`N42_PLAN_AHEAD_WARM=<threads>`,
-//! `docs/BREAKTHROUGH_DESIGN.md` 10.121).
+//! `docs/BREAKTHROUGH_DESIGN.md` 10.122).
 //!
 //! `N42_BUILD_PREFETCH=1` read every account of the block into a
 //! [`FrozenWarm`] layer the build's batches consult first, and halved the

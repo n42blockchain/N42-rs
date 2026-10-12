@@ -19,9 +19,10 @@
 //! [`BundleState::apply_transitions_and_create_reverts`] uses.
 
 use crate::fast_transfer::PlainTransfer;
-use alloy_primitives::{map::AddressMap, Address, B256};
+use alloy_primitives::{map::AddressMap, Address, B256, U256};
 use revm::{
     database::states::{AccountStatus, BundleAccount, BundleState, TransitionAccount},
+    primitives::KECCAK_EMPTY,
     state::{AccountInfo, Bytecode, EvmState},
     Database,
 };
@@ -62,6 +63,127 @@ impl std::fmt::Display for Unsupported {
 pub struct BatchState<G> {
     inner: G,
     accounts: AddressMap<BundleAccount>,
+    /// `N42_ONE_PROBE=2`: the batch's lane, holding every account the plan
+    /// says its transactions touch; `accounts` then holds only the rest (the
+    /// beneficiary, and any account the lane cannot hold).
+    lane: Option<DenseLane>,
+}
+
+/// [`Work::flags`]: the account was read into the lane.
+const LOADED: u8 = 1;
+/// [`Work::flags`]: the account existed when read.
+const ORIG_SOME: u8 = 2;
+/// [`Work::flags`]: the read info carried `Some` empty code.
+const ORIG_CODE: u8 = 4;
+/// [`Work::flags`]: the account exists now.
+const CUR_SOME: u8 = 8;
+/// [`Work::flags`]: the info now carries `Some` empty code.
+const CUR_CODE: u8 = 16;
+/// [`Work::flags`]: not a plain account; held in the batch's map instead.
+const SPILL: u8 = 32;
+
+/// One account of a batch's lane (`N42_ONE_PROBE=2`): the bundle account
+/// the batch's transition becomes, for a plain account (no code beyond
+/// `Some` empty code, no account id), in 96 bytes: the balance and nonce as
+/// read and as they stand, the status, and which of the read and the
+/// current info exist and carry `Some` empty code. Reconstructed into the
+/// same `AccountInfo` values the map would hold.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, align(32))]
+struct Work {
+    balance: U256,
+    orig_balance: U256,
+    nonce: u64,
+    orig_nonce: u64,
+    status: AccountStatus,
+    flags: u8,
+}
+
+impl Work {
+    const EMPTY: Self =
+        Self { balance: U256::ZERO, orig_balance: U256::ZERO, nonce: 0, orig_nonce: 0, status: AccountStatus::LoadedNotExisting, flags: 0 };
+
+    /// The entry for an account as [`loaded`] made it, if the lane can hold
+    /// it.
+    fn from_loaded(info: Option<&AccountInfo>) -> Option<Self> {
+        let status = loaded_status(info);
+        let Some(info) = info else { return Some(Self { status, flags: LOADED, ..Self::EMPTY }) };
+        if info.code_hash != KECCAK_EMPTY || info.account_id.is_some() || info.code.as_ref().is_some_and(|code| *code != Bytecode::default()) {
+            return None;
+        }
+        let code = if info.code.is_some() { ORIG_CODE | CUR_CODE } else { 0 };
+        Some(Self {
+            balance: info.balance,
+            orig_balance: info.balance,
+            nonce: info.nonce,
+            orig_nonce: info.nonce,
+            status,
+            flags: LOADED | ORIG_SOME | CUR_SOME | code,
+        })
+    }
+
+    #[inline]
+    fn make(balance: U256, nonce: u64, code: bool) -> AccountInfo {
+        AccountInfo { balance, nonce, code_hash: KECCAK_EMPTY, account_id: None, code: code.then(Bytecode::default) }
+    }
+
+    /// The info as it stands.
+    #[inline]
+    fn info(&self) -> Option<AccountInfo> {
+        (self.flags & CUR_SOME != 0).then(|| Self::make(self.balance, self.nonce, self.flags & CUR_CODE != 0))
+    }
+
+    /// The info as read.
+    fn original(&self) -> Option<AccountInfo> {
+        (self.flags & ORIG_SOME != 0).then(|| Self::make(self.orig_balance, self.orig_nonce, self.flags & ORIG_CODE != 0))
+    }
+
+    /// [`change`] on the lane's entry.
+    #[inline]
+    fn change(&mut self, info: &AccountInfo) {
+        let had_no_nonce_and_code = self.flags & CUR_SOME != 0 && self.nonce == 0;
+        self.status = self.status.on_changed(had_no_nonce_and_code);
+        self.balance = info.balance;
+        self.nonce = info.nonce;
+        self.flags = (self.flags & !CUR_CODE) | CUR_SOME | if info.code.is_some() { CUR_CODE } else { 0 };
+    }
+}
+
+/// A batch's lane (`N42_ONE_PROBE=2`): its entries by lane id, the plan
+/// that names them, and the running transaction's two accounts and ids.
+#[derive(Debug)]
+struct DenseLane {
+    plan: std::sync::Arc<crate::one_probe::Resolved>,
+    batch: usize,
+    work: Vec<Work>,
+    cur: Option<(Address, Address, u32, u32)>,
+    hits: u64,
+    /// Entries read into the lane, counted when the bundle is taken.
+    loaded: u64,
+}
+
+impl DenseLane {
+    /// The lane id of `address` when the running transaction names it.
+    #[inline]
+    fn lid(&self, address: &Address) -> Option<usize> {
+        let (sender, recipient, s, r) = self.cur.as_ref()?;
+        if address == sender {
+            Some(*s as usize)
+        } else if address == recipient {
+            Some(*r as usize)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for DenseLane {
+    fn drop(&mut self) {
+        if let Some(lanes) = self.plan.lanes.as_ref() {
+            lanes.hits.fetch_add(self.hits, std::sync::atomic::Ordering::Relaxed);
+            lanes.loaded.fetch_add(self.loaded, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 /// An account as `State` loads it into its cache (`load_cache_account`):
@@ -100,7 +222,25 @@ fn change(entry: &mut BundleAccount, info: AccountInfo) {
 impl<G: Database> BatchState<G> {
     /// A batch over `inner` with room for `accounts` without regrowing.
     pub fn with_capacity(inner: G, accounts: usize) -> Self {
-        Self { inner, accounts: AddressMap::with_capacity_and_hasher(accounts, Default::default()) }
+        Self { inner, accounts: AddressMap::with_capacity_and_hasher(accounts, Default::default()), lane: None }
+    }
+
+    /// `N42_ONE_PROBE=2`: a batch over `inner` whose transactions are batch
+    /// `batch` of `plan`'s lanes (checked by the caller): every account they
+    /// touch is held in the lane, found by the running transaction's lane
+    /// ids ([`Self::note_tx`]); the map keeps room for `accounts` others.
+    /// A plan without lanes or batch makes the plain state.
+    pub fn with_lane(inner: G, accounts: usize, plan: std::sync::Arc<crate::one_probe::Resolved>, batch: usize) -> Self {
+        let mut state = Self::with_capacity(inner, accounts);
+        if let Some(len) = plan.lanes.as_ref().and_then(|lanes| lanes.lane(batch)).map(<[Address]>::len) {
+            state.lane = Some(DenseLane { plan, batch, work: vec![Work::EMPTY; len], cur: None, hits: 0, loaded: 0 });
+        }
+        state
+    }
+
+    /// Whether the batch runs on a lane.
+    pub const fn on_lane(&self) -> bool {
+        self.lane.is_some()
     }
 
     /// A hint, nothing else: probes the batch's map for `address` (the probe
@@ -169,6 +309,17 @@ impl<G: Database> BatchState<G> {
             if info.is_empty() {
                 return Err(Unsupported(address));
             }
+            if let Some(lane) = self.lane.as_mut()
+                && let Some(lid) = lane.lid(&address)
+                && let Some(work) = lane.work.get_mut(lid)
+                && work.flags & SPILL == 0
+            {
+                if work.flags & LOADED == 0 || info.code_hash != KECCAK_EMPTY {
+                    return Err(Unsupported(address));
+                }
+                work.change(&info);
+                continue;
+            }
             let Some(entry) = self.accounts.get_mut(&address) else { return Err(Unsupported(address)) };
             change(entry, info);
         }
@@ -180,6 +331,27 @@ impl<G: Database> BatchState<G> {
     /// then `take_bundle`. The batch holds nothing afterwards.
     pub fn take_bundle(&mut self) -> BundleState {
         let mut accounts = std::mem::take(&mut self.accounts);
+        // `N42_ONE_PROBE=2`: the lane's accounts put into the map here, at
+        // the batch's end, in lane order: what the map path would hold.
+        if let Some(lane) = self.lane.as_ref() {
+            let addresses = lane.plan.lanes.as_ref().and_then(|lanes| lanes.lane(lane.batch)).unwrap_or_default();
+            accounts.reserve(lane.work.len());
+            for (work, address) in lane.work.iter().zip(addresses) {
+                if work.flags & LOADED == 0 || work.flags & SPILL != 0 {
+                    continue;
+                }
+                accounts.insert(
+                    *address,
+                    BundleAccount { original_info: work.original(), info: work.info(), storage: Default::default(), status: work.status },
+                );
+            }
+        }
+        if let Some(lane) = self.lane.as_mut() {
+            for work in &mut lane.work {
+                lane.loaded += u64::from(work.flags & LOADED != 0);
+                *work = Work::EMPTY;
+            }
+        }
         let mut bundle = BundleState::default();
         let mut reverts = Vec::with_capacity(accounts.len());
         let (mut state_size, mut reverts_size, mut changed) = (0usize, 0usize, false);
@@ -233,6 +405,9 @@ impl<G: Database + crate::parallel_transfer::AccountHint> BatchState<G> {
     /// (`key` its sender and recipient); passed to the layers beneath.
     #[inline]
     pub fn note_tx(&mut self, i: usize, key: &(Address, Address)) {
+        if let Some(lane) = self.lane.as_mut() {
+            lane.cur = lane.plan.lanes.as_ref().and_then(|lanes| lanes.lid(i)).map(|(s, r)| (key.0, key.1, s, r));
+        }
         self.inner.note_tx(i, key);
     }
 
@@ -244,6 +419,15 @@ impl<G: Database + crate::parallel_transfer::AccountHint> BatchState<G> {
     pub fn after_commit(&self) {
         if let Some(addresses) = self.inner.written_accounts() {
             for address in &addresses {
+                if let Some(lane) = self.lane.as_ref()
+                    && let Some(work) = lane.lid(address).and_then(|lid| lane.work.get(lid))
+                    && work.flags & SPILL == 0
+                {
+                    // The balance, nonce and code hash are what is written.
+                    let info = (work.flags & CUR_SOME != 0).then(|| Work::make(work.balance, work.nonce, false));
+                    self.inner.write_through(address, info.as_ref());
+                    continue;
+                }
                 self.inner.write_through(address, self.accounts.get(address).and_then(|entry| entry.info.as_ref()));
             }
         }
@@ -269,6 +453,30 @@ impl<G: Database> Database for BatchState<G> {
     type Error = G::Error;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        // `N42_ONE_PROBE=2`: the running transaction's accounts from the
+        // lane, read beneath it once (as the map path reads a miss).
+        if let Some(lane) = self.lane.as_mut()
+            && let Some(lid) = lane.lid(&address)
+            && let Some(work) = lane.work.get_mut(lid)
+        {
+            if work.flags & LOADED == 0 {
+                let entry = loaded(self.inner.basic(address)?);
+                match Work::from_loaded(entry.info.as_ref()) {
+                    Some(fresh) => *work = fresh,
+                    None => {
+                        work.flags = LOADED | SPILL;
+                        let info = entry.info.clone();
+                        self.accounts.insert(address, entry);
+                        return Ok(info);
+                    }
+                }
+                return Ok(work.info());
+            }
+            if work.flags & SPILL == 0 {
+                lane.hits += 1;
+                return Ok(work.info());
+            }
+        }
         let entry = match self.accounts.entry(address) {
             alloy_primitives::map::Entry::Occupied(entry) => entry.into_mut(),
             alloy_primitives::map::Entry::Vacant(entry) => entry.insert(loaded(self.inner.basic(address)?)),

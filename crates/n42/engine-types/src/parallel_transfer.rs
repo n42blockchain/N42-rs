@@ -919,6 +919,9 @@ pub struct PreparedExec<T> {
     pub groups: Option<Vec<Vec<usize>>>,
     /// One empty slot a candidate.
     pub slots: Option<Vec<std::sync::OnceLock<BuiltTransfer<T>>>>,
+    /// `N42_ONE_PROBE=2`: the plan's resolve with its batches and lanes,
+    /// used when the call packs the same groups at the same width.
+    pub one_probe: Option<std::sync::Arc<crate::one_probe::Resolved>>,
 }
 
 /// `n` empty slots, made and touched on `pool` (a full block's are ~94 MB).
@@ -3983,12 +3986,13 @@ where
     let call_at = at;
     // `N42_PLAN_AHEAD_BODY=1`: the partition and the slots made with the
     // plan, each used only when it is this call's size.
-    let (prepared_groups, prepared_slots) = match prepared {
-        Some(PreparedExec { groups, slots }) => (
+    let (prepared_groups, prepared_slots, lane_plan) = match prepared {
+        Some(PreparedExec { groups, slots, one_probe }) => (
             groups.filter(|groups| groups.iter().map(Vec::len).sum::<usize>() == keys.len()),
             slots.filter(|slots| slots.len() == keys.len()),
+            one_probe,
         ),
-        None => (None, None),
+        None => (None, None, None),
     };
     phases.prepared_groups = prepared_groups.is_some();
     phases.prepared_slots = prepared_slots.is_some();
@@ -4009,6 +4013,17 @@ where
             Dispatch::Halves => batch_groups(&groups, keys.len(), workers),
         };
     phases.batches = batches.len();
+    // `N42_ONE_PROBE=2`: the plan's lanes, when its batches are these: the
+    // plan's groups packed at this dispatch's width. Any other call runs on
+    // the batches' maps (and the plan's stage-1 references, if any).
+    let lane_plan = lane_plan.filter(|plan| {
+        phases.prepared_groups
+            && plan.len() == keys.len()
+            && plan.lanes.as_ref().is_some_and(|lanes| Some(lanes.width) == lane_width(dispatch) && lanes.batches() == batches.len())
+    });
+    if let Some(lanes) = lane_plan.as_ref().and_then(|plan| plan.lanes.as_ref()) {
+        lanes.used.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     phases.partition_ms = at.elapsed().as_millis() as u64;
     phases.partition_us = at.elapsed().as_micros() as u64;
     if let Some(hook) = before_batches {
@@ -4065,10 +4080,32 @@ where
         let opened = open().ok_or(NotParallel::NoState)?;
         let open_us = open_at.elapsed().as_micros() as u64;
         let db = ReadSetDb::new(read_set_ref, opened);
+        // `N42_ONE_PROBE=2`: this batch's lane, when every one of its
+        // transactions is the plan's and in the plan's batch; a batch that
+        // is not keeps the block's output out of the ring.
+        let lane = lane_plan.as_ref().and_then(|plan| {
+            let lanes = plan.lanes.as_ref()?;
+            let b = lanes.batch_of(*members.first()?.first()?)?;
+            let ours = lanes.batch_txs.get(b as usize) == Some(&txs)
+                && members.iter().all(|group| {
+                    group.iter().all(|&i| {
+                        lanes.batch_of(i) == Some(b)
+                            && plan.txs.get(i).zip(keys.get(i)).is_some_and(|(tx, key)| (tx.sender, tx.recipient) == *key)
+                    })
+                });
+            if !ours {
+                lanes.broken.store(true, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
+            Some((std::sync::Arc::clone(plan), b as usize))
+        });
         // A sender, a recipient a transfer and the beneficiary, sized
         // once: growing from empty rehashed the map a dozen times a
-        // batch.
-        let mut state = crate::batch_state::BatchState::with_capacity(db, txs + txs / 4 + 1);
+        // batch. On a lane the map holds only the beneficiary.
+        let mut state = match lane {
+            Some((plan, b)) => crate::batch_state::BatchState::with_lane(db, 4, plan, b),
+            None => crate::batch_state::BatchState::with_capacity(db, txs + txs / 4 + 1),
+        };
         let mut skipped = Vec::new();
         // The batch's count, gas and fees, kept as it executes.
         let mut counted = RunCounters { fees: tip_of.map(|_| U256::ZERO), ..Default::default() };
@@ -7869,18 +7906,34 @@ mod tests {
         their_bundle
     }
 
-    /// `N42_ONE_PROBE=1`: three consecutive blocks, their plans resolved
+    /// `N42_ONE_PROBE=1|2`: three consecutive blocks, their plans resolved
     /// ahead in order against the rolling table, each built on the previous
     /// one's post-state with its transactions' accounts read from the
     /// verified prefix's dense outputs, build the same blocks as the plain
     /// builds -- and the later blocks' reads are served from the outputs. A
     /// build on a parent that is not the resolved chain (a peer's block at
     /// that height, with other values) finds no prefix and still equals the
-    /// plain build there.
+    /// plain build there. Run three ways: stage 1 (the batches' maps), stage
+    /// 2 (the plan's lanes at the build's width: the dense batch state), and
+    /// stage 2 with the lanes made at another width (not used: stage 1).
     #[test]
     fn a_build_on_resolved_reads_equals_the_plain_build() {
+        for mode in [Lanes::None, Lanes::Width, Lanes::OtherWidth] {
+            three_blocks_through_the_plan(mode);
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Lanes {
+        None,
+        Width,
+        OtherWidth,
+    }
+
+    fn three_blocks_through_the_plan(mode: Lanes) {
         use crate::one_probe::{BuildView, OneProbeDb, Ring, Rolling, resolve_with};
         use std::sync::Arc;
+        let width = build_pool().current_num_threads().max(1);
         for (senders, per, space, run) in [(400u64, 60u64, 0u64, 60usize), (300, 30, 0, 1), (200, 45, 2_000, 7)] {
             let (block, db) = random_fixture(senders, per, space, run, 5);
             let evm_config =
@@ -7895,11 +7948,26 @@ mod tests {
                 .iter()
                 .map(|idx| idx.iter().map(|&i| (envs[i].caller, envs[i].kind.to().copied().unwrap())).collect())
                 .collect();
+            let groups: Vec<Vec<Vec<usize>>> = keys.iter().map(|k| partition_by_sender(k, beneficiary).expect("groups")).collect();
             // The plans, made in order before the blocks execute (plan k + 1
             // at block k's selection).
             let mut table = Rolling::new(16);
-            let plans: Vec<Arc<crate::one_probe::Resolved>> =
-                build_pool().install(|| keys.iter().map(|k| Arc::new(resolve_with(&mut table, k))).collect());
+            let plans: Vec<Arc<crate::one_probe::Resolved>> = build_pool().install(|| {
+                keys.iter()
+                    .zip(&groups)
+                    .map(|(k, g)| {
+                        let resolved = resolve_with(&mut table, k);
+                        Arc::new(match mode {
+                            Lanes::None => resolved,
+                            Lanes::Width => resolved.with_lanes(g, width),
+                            Lanes::OtherWidth => resolved.with_lanes(g, width + 1),
+                        })
+                    })
+                    .collect()
+            });
+            let prepared = |k: usize| {
+                Some(PreparedExec { groups: Some(groups[k].clone()), slots: None, one_probe: Some(Arc::clone(&plans[k])) })
+            };
             let mut ring = Ring::new(16);
             let mut state = db.clone();
             let built = |k: usize| B256::with_last_byte(10 + k as u8);
@@ -7911,8 +7979,20 @@ mod tests {
                 let prefix = ring.prefix(grandparent, parent_built, plans[k].seq);
                 assert_eq!(prefix.len(), k, "block {k}'s verified prefix");
                 let view = BuildView::new(Arc::clone(&plans[k]), prefix, beneficiary);
+                let through = |view: &BuildView, parent: &CacheDB<EmptyDB>| {
+                    execute_for_build_counted_dispatch(
+                        &evm_env,
+                        &keys[k],
+                        &convert,
+                        &|| Some(OneProbeDb::new(Some(view), parent.clone())),
+                        true,
+                        true,
+                        None,
+                        prepared(k),
+                    )
+                };
 
-                if k == 2 {
+                if k == 2 && mode != Lanes::OtherWidth {
                     // A peer's block at the parent's height: the same
                     // accounts with other balances, under another hash.
                     let mut peer = state.clone();
@@ -7926,15 +8006,7 @@ mod tests {
                     let peer_view = BuildView::new(Arc::clone(&plans[k]), peer_prefix, beneficiary);
                     let plain = execute_for_build_in_place(&evm_env, &keys[k], &convert, &|| Some(peer.clone()), None, true)
                         .expect("block on the peer's parent");
-                    let probed = execute_for_build_in_place(
-                        &evm_env,
-                        &keys[k],
-                        &convert,
-                        &|| Some(OneProbeDb::new(Some(&peer_view), peer.clone())),
-                        None,
-                        true,
-                    )
-                    .expect("block on the peer's parent through the plan");
+                    let probed = through(&peer_view, &peer).expect("block on the peer's parent through the plan");
                     assert_same_block(probed, plain, &peer, beneficiary, keys[k].len());
                     assert_eq!(peer_view.hits(), 0, "nothing served on another parent");
                     assert!(peer_view.fallbacks() > 0);
@@ -7942,29 +8014,38 @@ mod tests {
 
                 let plain =
                     execute_for_build_in_place(&evm_env, &keys[k], &convert, &|| Some(state.clone()), None, true).expect("plain block");
-                let probed = execute_for_build_in_place(
-                    &evm_env,
-                    &keys[k],
-                    &convert,
-                    &|| Some(OneProbeDb::new(Some(&view), state.clone())),
-                    None,
-                    true,
-                )
-                .expect("block through the plan's references");
+                let probed = through(&view, &state).expect("block through the plan's references");
                 assert!(plain.skipped.is_empty());
                 let bundle = assert_same_block(probed, plain, &state, beneficiary, keys[k].len());
                 assert!(!view.mismatched());
                 if k > 0 {
                     assert!(view.hits() > 0, "block {k}: reads served from the outputs");
                 }
+                let lanes = plans[k].lanes.as_ref();
+                match mode {
+                    Lanes::None => assert!(lanes.is_none()),
+                    Lanes::Width => {
+                        let lanes = lanes.expect("lanes");
+                        assert!(lanes.used() && !lanes.broken(), "block {k} ran on the plan's lanes");
+                        assert!(lanes.hits() > 0 && lanes.loaded() > 0);
+                    }
+                    Lanes::OtherWidth => assert!(!lanes.expect("lanes").used(), "another width: the batches' maps"),
+                }
                 // Every account the block wrote through holds its post-state.
+                let mut two_senders_written = 0;
                 for (address, account) in &bundle.state {
                     if let Some(bid) = plans[k].id_of(address)
                         && let Some((balance, nonce)) = plans[k].out.get(bid).and_then(crate::one_probe::Dense::load)
                     {
                         let info = account.info.as_ref().expect("a written account exists");
                         assert_eq!((balance, nonce), (info.balance, info.nonce), "block {k}'s output for {address}");
+                        two_senders_written += usize::from(plans[k].shared(bid));
                     }
+                }
+                if mode == Lanes::Width && space != 0 {
+                    assert!(two_senders_written > 0, "a recipient two senders of one batch pay is written through");
+                } else {
+                    assert_eq!(two_senders_written, 0, "without lanes only one sender's accounts are written");
                 }
                 assert!(ring.record(&view, base(k), parent_built, built(k), vec![beneficiary]));
                 for (address, account) in &bundle.state {

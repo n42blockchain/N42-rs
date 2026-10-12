@@ -1854,6 +1854,8 @@ where
     let mut one_probe_prefix = 0usize;
     let mut one_probe_hits = 0u64;
     let mut one_probe_fallbacks = 0u64;
+    let mut one_probe_lane_hits = 0u64;
+    let mut one_probe_lane_accounts = 0u64;
     // `N42_BUILD_MLP=<k>`: the batches' lookahead distance, 0 when off.
     let mut par_mlp_k = 0usize;
     let mut par_mlp_hints = 0u64;
@@ -2425,6 +2427,7 @@ where
                             .filter(|(beneficiary, _)| *beneficiary == group_env.block_env.beneficiary)
                             .map(|(_, groups)| groups),
                         slots: Some(std::mem::take(&mut made.slots)),
+                        one_probe: one_probe_view.as_ref().map(crate::one_probe::BuildView::plan),
                     }
                 });
                 let counted_tips: Option<&(dyn Fn(usize) -> u128 + Sync)> =
@@ -2476,6 +2479,10 @@ where
             if let Some(view) = one_probe_view.as_ref() {
                 one_probe_hits = view.hits();
                 one_probe_fallbacks = view.fallbacks();
+                if let Some(lanes) = view.resolved().lanes.as_ref().filter(|lanes| lanes.used()) {
+                    one_probe_lane_hits = lanes.hits();
+                    one_probe_lane_accounts = lanes.loaded();
+                }
             }
             par_prefault_ms = graft_target.as_ref().map_or(0, |target| target.prefault_us / 1000);
             if let Some(err) = deferred_state_err.take() {
@@ -4197,6 +4204,8 @@ where
                     one_probe_hits,
                     one_probe_fallbacks,
                     one_probe_resolve_ms,
+                    one_probe_lane_hits,
+                    one_probe_lane_accounts,
                     par_mlp_k,
                     par_mlp_hints,
                     par_fold_ms,
@@ -5837,7 +5846,7 @@ mod plan_body_tests {
             };
             let fresh_run = run_with(None);
             let mut made = made;
-            let prepared = PreparedExec { groups: made.groups.take().map(|(_, groups)| groups), slots: Some(std::mem::take(&mut made.slots)) };
+            let prepared = PreparedExec { groups: made.groups.take().map(|(_, groups)| groups), slots: Some(std::mem::take(&mut made.slots)), one_probe: None };
             let planned_run = run_with(Some(prepared));
             assert!(planned_run.4 && planned_run.5, "the prepared partition and slots were taken");
             assert!(!fresh_run.4 && !fresh_run.5);
@@ -5847,7 +5856,7 @@ mod plan_body_tests {
             assert_eq!(fresh_run.2, planned_run.2, "counters");
             assert_eq!(fresh_run.3, planned_run.3, "the batches' accounts");
             // A partition or slots of another size are not taken.
-            let wrong = PreparedExec { groups: Some(vec![vec![0]]), slots: Some(crate::parallel_transfer::empty_slots(crate::parallel_transfer::build_pool(), 3)) };
+            let wrong = PreparedExec { groups: Some(vec![vec![0]]), slots: Some(crate::parallel_transfer::empty_slots(crate::parallel_transfer::build_pool(), 3)), one_probe: None };
             let fallback = run_with(Some(wrong));
             assert!(!fallback.4 && !fallback.5);
             assert_eq!(fallback.0, fresh_run.0);

@@ -508,6 +508,12 @@ impl Lanes {
         self.hits.load(Ordering::Relaxed)
     }
 
+    /// Accounts read into lanes so far (counted as each batch's bundle is
+    /// taken).
+    pub fn loaded(&self) -> u64 {
+        self.loaded.load(Ordering::Relaxed)
+    }
+
     /// Whether the build runs its batches on the lanes.
     pub fn used(&self) -> bool {
         self.used.load(Ordering::Relaxed)
@@ -766,6 +772,12 @@ impl BuildView {
     /// The plan's resolve.
     pub fn resolved(&self) -> &Resolved {
         &self.resolved
+    }
+
+    /// The plan's resolve, shared (`N42_ONE_PROBE=2`: the lanes the batches
+    /// run on).
+    pub fn plan(&self) -> Arc<Resolved> {
+        Arc::clone(&self.resolved)
     }
 
     /// Transactions in the plan.

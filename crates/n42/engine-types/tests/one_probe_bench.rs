@@ -1026,17 +1026,19 @@ fn bench_node_batch_state() {
     let keys: Vec<(Address, Address)> = txs.iter().map(|tx| (tx.from, tx.to)).collect();
     let groups = parallel_transfer::partition_by_sender(&keys, beneficiary()).expect("groups");
     let batches = parallel_transfer::batch_groups_one_wave(&groups, keys.len(), nbatches);
-    let (mut map_ms, mut lane_ms, mut resolve_ms, mut lanes_ms) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut map_ms, mut lane_ms, mut direct_ms, mut resolve_ms, mut lanes_ms) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut table = one_probe::Rolling::new(16);
     for round in 0..rounds + 1 {
         let at = Instant::now();
         let resolved = pool.install(|| one_probe::resolve_with(&mut table, &keys));
         let resolve = at.elapsed().as_secs_f64() * 1e3;
         let at = Instant::now();
-        let plan = std::sync::Arc::new(pool.install(|| resolved.with_lanes(&groups, nbatches)));
+        let plan = std::sync::Arc::new(pool.install(|| resolved.with_lanes(&groups, nbatches).with_fold(true)));
         let lanes = at.elapsed().as_secs_f64() * 1e3;
         assert!(plan.lanes.as_ref().is_some_and(|l| l.batches() == batches.len()));
-        let run = |lane: bool| -> (f64, Vec<revm::database::BundleState>) {
+        // 0: the map (stage 1); 1: the lane (stage 2); 2: the lane with the
+        // fold's parts (stage 3).
+        let run = |mode: u8| -> (f64, Vec<revm::database::BundleState>) {
             let at = Instant::now();
             let bundles: Vec<revm::database::BundleState> = pool.install(|| {
                 use rayon::prelude::*;
@@ -1045,8 +1047,8 @@ fn bench_node_batch_state() {
                     .enumerate()
                     .map(|(b, members)| {
                         let txs_n = members.iter().map(|g| g.len()).sum::<usize>();
-                        let state = if lane {
-                            BatchState::with_lane(db.clone(), 4, std::sync::Arc::clone(&plan), b)
+                        let state = if mode > 0 {
+                            BatchState::with_lane(db.clone(), 4, std::sync::Arc::clone(&plan), b, mode == 2)
                         } else {
                             BatchState::with_capacity(db.clone(), txs_n + txs_n / 4 + 1)
                         };
@@ -1056,28 +1058,34 @@ fn bench_node_batch_state() {
             });
             (at.elapsed().as_secs_f64() * 1e3, bundles)
         };
-        let (map, map_bundles) = run(false);
-        let (dense, lane_bundles) = run(true);
+        let (map, map_bundles) = run(0);
+        let (dense, lane_bundles) = run(1);
+        let (direct, direct_bundles) = run(2);
         if round == 0 {
-            for (ours, theirs) in lane_bundles.iter().zip(&map_bundles) {
-                assert_eq!(ours.state, theirs.state, "the lane's bundle is the map's");
-                let ours: std::collections::BTreeMap<_, _> = ours.reverts.iter().flatten().cloned().collect();
-                let theirs: std::collections::BTreeMap<_, _> = theirs.reverts.iter().flatten().cloned().collect();
-                assert_eq!(ours, theirs, "reverts");
+            for bundles in [&lane_bundles, &direct_bundles] {
+                for (ours, theirs) in bundles.iter().zip(&map_bundles) {
+                    assert_eq!(ours.state, theirs.state, "the lane's bundle is the map's");
+                    assert_eq!((ours.state_size, ours.reverts_size), (theirs.state_size, theirs.reverts_size));
+                    let ours: std::collections::BTreeMap<_, _> = ours.reverts.iter().flatten().cloned().collect();
+                    let theirs: std::collections::BTreeMap<_, _> = theirs.reverts.iter().flatten().cloned().collect();
+                    assert_eq!(ours, theirs, "reverts");
+                }
             }
             continue;
         }
         map_ms.push(map);
         lane_ms.push(dense);
+        direct_ms.push(direct);
         resolve_ms.push(resolve);
         lanes_ms.push(lanes);
     }
     println!(
-        "node batch state, {} transfers, {} batches, {threads} threads, p50 of {rounds}: map (stage 1) {:.1} ms, lane (stage 2) {:.1} ms; plan time: resolve {:.1} ms, lanes {:.1} ms",
+        "node batch state, {} transfers, {} batches, {threads} threads, p50 of {rounds}: map (stage 1) {:.1} ms, lane (stage 2) {:.1} ms, lane with fold (stage 3) {:.1} ms; plan time: resolve {:.1} ms, lanes {:.1} ms",
         keys.len(),
         batches.len(),
         median(map_ms),
         median(lane_ms),
+        median(direct_ms),
         median(resolve_ms),
         median(lanes_ms)
     );

@@ -165,6 +165,9 @@ struct DenseLane {
     empty: Bytecode,
     /// Entries read into the lane, counted when the bundle is taken.
     loaded: u64,
+    /// `N42_ONE_PROBE=3`: the accounts several batches touch handed to the
+    /// plan's lane fold when the bundle is taken.
+    fold: bool,
 }
 
 impl DenseLane {
@@ -235,10 +238,13 @@ impl<G: Database> BatchState<G> {
     /// touch is held in the lane, found by the running transaction's lane
     /// ids ([`Self::note_tx`]); the map keeps room for `accounts` others.
     /// A plan without lanes or batch makes the plain state.
-    pub fn with_lane(inner: G, accounts: usize, plan: std::sync::Arc<crate::one_probe::Resolved>, batch: usize) -> Self {
+    /// With `fold` (`N42_ONE_PROBE=3`) the accounts several batches touch
+    /// are handed to the plan's lane fold ([`crate::one_probe::Lanes::fold_part`])
+    /// when the bundle is taken.
+    pub fn with_lane(inner: G, accounts: usize, plan: std::sync::Arc<crate::one_probe::Resolved>, batch: usize, fold: bool) -> Self {
         let mut state = Self::with_capacity(inner, accounts);
         if let Some(len) = plan.lanes.as_ref().and_then(|lanes| lanes.lane(batch)).map(<[Address]>::len) {
-            state.lane = Some(DenseLane { plan, batch, work: vec![Work::EMPTY; len], cur: None, hits: 0, empty: Bytecode::default(), loaded: 0 });
+            state.lane = Some(DenseLane { plan, batch, work: vec![Work::EMPTY; len], cur: None, hits: 0, empty: Bytecode::default(), loaded: 0, fold });
         }
         state
     }
@@ -339,11 +345,24 @@ impl<G: Database> BatchState<G> {
         // `N42_ONE_PROBE=2`: the lane's accounts put into the map here, at
         // the batch's end, in lane order: what the map path would hold.
         if let Some(lane) = self.lane.as_ref() {
-            let addresses = lane.plan.lanes.as_ref().and_then(|lanes| lanes.lane(lane.batch)).unwrap_or_default();
+            let lanes = lane.plan.lanes.as_ref();
+            let addresses = lanes.and_then(|lanes| lanes.lane(lane.batch)).unwrap_or_default();
+            // `N42_ONE_PROBE=3`: the lane fold's parts, in the same pass.
+            let bids = lanes.filter(|_| lane.fold).and_then(|lanes| lanes.lane_bids(lane.batch)).unwrap_or_default();
+            let mut parts = Vec::new();
             accounts.reserve(lane.work.len());
-            for (work, address) in lane.work.iter().zip(addresses) {
+            for (lid, (work, address)) in lane.work.iter().zip(addresses).enumerate() {
                 if work.flags & LOADED == 0 || work.flags & SPILL != 0 {
                     continue;
+                }
+                if let (Some(lanes), Some(&bid)) = (lanes, bids.get(lid))
+                    && lanes.cross(bid)
+                {
+                    parts.push(crate::one_probe::FoldPart {
+                        bid,
+                        original: (work.flags & ORIG_SOME != 0).then_some((work.orig_balance, work.orig_nonce)),
+                        current: (work.flags & CUR_SOME != 0).then_some((work.balance, work.nonce)),
+                    });
                 }
                 accounts.insert(
                     *address,
@@ -354,6 +373,11 @@ impl<G: Database> BatchState<G> {
                         status: work.status,
                     },
                 );
+            }
+            if let Some(lanes) = lanes
+                && !parts.is_empty()
+            {
+                lanes.fold_part(parts);
             }
         }
         if let Some(lane) = self.lane.as_mut() {

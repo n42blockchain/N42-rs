@@ -4103,7 +4103,12 @@ where
         // once: growing from empty rehashed the map a dozen times a
         // batch. On a lane the map holds only the beneficiary.
         let mut state = match lane {
-            Some((plan, b)) => crate::batch_state::BatchState::with_lane(db, 4, plan, b),
+            // `N42_ONE_PROBE=3`: the bundle made straight from the lane.
+            Some((plan, b)) => {
+                // `N42_ONE_PROBE=3`: with the lane fold's parts.
+                let fold = plan.lanes.as_ref().is_some_and(|lanes| lanes.fold);
+                crate::batch_state::BatchState::with_lane(db, 4, plan, b, fold)
+            }
             None => crate::batch_state::BatchState::with_capacity(db, txs + txs / 4 + 1),
         };
         let mut skipped = Vec::new();
@@ -7918,7 +7923,7 @@ mod tests {
     /// stage 2 with the lanes made at another width (not used: stage 1).
     #[test]
     fn a_build_on_resolved_reads_equals_the_plain_build() {
-        for mode in [Lanes::None, Lanes::Width, Lanes::OtherWidth] {
+        for mode in [Lanes::None, Lanes::Width, Lanes::OtherWidth, Lanes::Direct] {
             three_blocks_through_the_plan(mode);
         }
     }
@@ -7928,6 +7933,8 @@ mod tests {
         None,
         Width,
         OtherWidth,
+        /// Stage 3: the lanes with the fold.
+        Direct,
     }
 
     fn three_blocks_through_the_plan(mode: Lanes) {
@@ -7961,12 +7968,13 @@ mod tests {
                             Lanes::None => resolved,
                             Lanes::Width => resolved.with_lanes(g, width),
                             Lanes::OtherWidth => resolved.with_lanes(g, width + 1),
+                            Lanes::Direct => resolved.with_lanes(g, width).with_fold(true),
                         })
                     })
                     .collect()
             });
-            let prepared = |k: usize| {
-                Some(PreparedExec { groups: Some(groups[k].clone()), slots: None, one_probe: Some(Arc::clone(&plans[k])) })
+            let prepared = |k: usize, plan: &Arc<crate::one_probe::Resolved>| {
+                Some(PreparedExec { groups: Some(groups[k].clone()), slots: None, one_probe: Some(Arc::clone(plan)) })
             };
             let mut ring = Ring::new(16);
             let mut state = db.clone();
@@ -7988,7 +7996,7 @@ mod tests {
                         true,
                         true,
                         None,
-                        prepared(k),
+                        prepared(k, &view.plan()),
                     )
                 };
 
@@ -8003,7 +8011,18 @@ mod tests {
                     }
                     let peer_prefix = ring.prefix(grandparent, Some(B256::with_last_byte(77)), plans[k].seq);
                     assert!(peer_prefix.is_empty(), "no prefix on a parent this node did not seal from a plan");
-                    let peer_view = BuildView::new(Arc::clone(&plans[k]), peer_prefix, beneficiary);
+                    // A plan is taken by one build: the peer's build gets
+                    // its own (the same keys, resolved apart).
+                    let peer_plan = build_pool().install(|| {
+                        let resolved = resolve_with(&mut Rolling::new(16), &keys[k]);
+                        Arc::new(match mode {
+                            Lanes::None => resolved,
+                            Lanes::Width => resolved.with_lanes(&groups[k], width),
+                            Lanes::OtherWidth => resolved.with_lanes(&groups[k], width + 1),
+                            Lanes::Direct => resolved.with_lanes(&groups[k], width).with_fold(true),
+                        })
+                    });
+                    let peer_view = BuildView::new(peer_plan, peer_prefix, beneficiary);
                     let plain = execute_for_build_in_place(&evm_env, &keys[k], &convert, &|| Some(peer.clone()), None, true)
                         .expect("block on the peer's parent");
                     let probed = through(&peer_view, &peer).expect("block on the peer's parent through the plan");
@@ -8024,7 +8043,7 @@ mod tests {
                 let lanes = plans[k].lanes.as_ref();
                 match mode {
                     Lanes::None => assert!(lanes.is_none()),
-                    Lanes::Width => {
+                    Lanes::Width | Lanes::Direct => {
                         let lanes = lanes.expect("lanes");
                         assert!(lanes.used() && !lanes.broken(), "block {k} ran on the plan's lanes");
                         assert!(lanes.hits() > 0 && lanes.loaded() > 0);
@@ -8042,12 +8061,32 @@ mod tests {
                         two_senders_written += usize::from(plans[k].shared(bid));
                     }
                 }
-                if mode == Lanes::Width && space != 0 {
+                if matches!(mode, Lanes::Width | Lanes::Direct) && space != 0 {
                     assert!(two_senders_written > 0, "a recipient two senders of one batch pay is written through");
                 } else {
                     assert_eq!(two_senders_written, 0, "without lanes only one sender's accounts are written");
                 }
                 assert!(ring.record(&view, base(k), parent_built, built(k), vec![beneficiary]));
+                // Stage 3: the accounts several batches touched, folded at the
+                // record, hold the block's post-state too.
+                if mode == Lanes::Direct {
+                    let lanes = plans[k].lanes.as_ref().expect("lanes");
+                    let mut cross_written = 0;
+                    for (address, account) in &bundle.state {
+                        if let Some(bid) = plans[k].id_of(address)
+                            && lanes.cross(bid)
+                            && let Some((balance, nonce)) = plans[k].out.get(bid).and_then(crate::one_probe::Dense::load)
+                        {
+                            let info = account.info.as_ref().expect("a folded account exists");
+                            assert_eq!((balance, nonce), (info.balance, info.nonce), "block {k}'s fold for {address}");
+                            cross_written += 1;
+                        }
+                    }
+                    assert_eq!(cross_written as u64, lanes.folded(), "every folded account checked");
+                    if space != 0 {
+                        assert!(cross_written > 0, "accounts two batches pay are folded");
+                    }
+                }
                 for (address, account) in &bundle.state {
                     state.insert_account_info(*address, account.info.clone().unwrap_or_default());
                 }

@@ -1594,6 +1594,18 @@ impl Dispatch {
     }
 }
 
+/// The width the build packs its batches at under `dispatch` with
+/// [`batch_groups_one_wave`] -- the build pool's threads for one wave, `n`
+/// for `n` largest first -- or `None` for the halves, which pack otherwise.
+/// The plan's lanes (`N42_ONE_PROBE=2`) are made at this width.
+pub fn lane_width(dispatch: Dispatch) -> Option<usize> {
+    match dispatch {
+        Dispatch::Halves => None,
+        Dispatch::OneWave => Some(build_pool().current_num_threads().max(1)),
+        Dispatch::LargestFirst(n) => Some(n.max(1)),
+    }
+}
+
 /// The order [`Dispatch::LargestFirst`] hands batches to the pool in: by
 /// transfers, largest first, ties in batch order (longest processing time
 /// first).

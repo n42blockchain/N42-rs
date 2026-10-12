@@ -36,13 +36,14 @@ use revm::{Database, primitives::KECCAK_EMPTY, state::AccountInfo};
 use crate::parallel_transfer::{WARM_SHARDS, warm_shard};
 
 /// The stage (`N42_ONE_PROBE=1|2|3`), 0 (unset) is off. Stage 1 is the one
-/// implemented; 2 and 3 run as 1 until theirs exist. Read once.
+/// the plan-time resolve and the dense reads, 2 adds the plan's batches and
+/// the dense batch state ([`Lanes`]), 3 runs as 2 until it exists. Read once.
 pub fn stage() -> u8 {
     static N: OnceLock<u8> = OnceLock::new();
     *N.get_or_init(|| {
         let stage = std::env::var("N42_ONE_PROBE").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0).min(3);
-        if stage > 1 {
-            tracing::warn!(target: "payload_builder", stage, "N42_ONE_PROBE: only stage 1 exists; running stage 1");
+        if stage > 2 {
+            tracing::warn!(target: "payload_builder", stage, "N42_ONE_PROBE: stage 3 does not exist yet; running stage 2");
         }
         stage
     })
@@ -168,6 +169,9 @@ pub struct Resolved {
     /// build that takes the plan ([`DenseOut`]); made (and its pages
     /// touched) here, on the plan-body pool.
     pub(crate) out: Arc<DenseOut>,
+    /// `N42_ONE_PROBE=2`: the plan's batches and their lanes, when the plan
+    /// knew the partition and the dispatch's width ([`Lanes`]).
+    pub lanes: Option<Lanes>,
 }
 
 impl Resolved {
@@ -181,6 +185,28 @@ impl Resolved {
     #[inline]
     pub fn shared(&self, bid: u32) -> bool {
         self.shared.get(bid as usize).copied().unwrap_or(true)
+    }
+
+    /// Whether one batch's value of dense id `bid` is the block's: with the
+    /// plan's lanes in use, when only one batch touches it; otherwise when
+    /// only one sender's transactions do (a sender's are one group, a group
+    /// is in one batch).
+    #[inline]
+    pub fn one_writer(&self, bid: u32) -> bool {
+        match self.lanes.as_ref().filter(|lanes| lanes.used.load(Ordering::Relaxed)) {
+            Some(lanes) => !lanes.cross.get(bid as usize).is_none_or(|cross| cross.load(Ordering::Relaxed)),
+            None => !self.shared(bid),
+        }
+    }
+
+    /// The plan's lanes computed for `groups` (the sender partition of these
+    /// keys) packed by [`crate::parallel_transfer::batch_groups_one_wave`]
+    /// at `width`, on the current rayon pool.
+    pub fn with_lanes(mut self, groups: &[Vec<usize>], width: usize) -> Self {
+        let at = std::time::Instant::now();
+        self.lanes = Lanes::make(&self, groups, width);
+        self.resolve_us += at.elapsed().as_micros() as u64;
+        self
     }
 
     /// Transactions in the plan.
@@ -323,7 +349,7 @@ pub fn resolve_with(table: &mut Rolling, keys: &[(Address, Address)]) -> Resolve
         ids.push((offset, shard.map));
     }
     let out = Arc::new(DenseOut::new(accounts as usize));
-    Resolved { seq, txs, ids, shared, accounts: accounts as usize, resolve_us: at.elapsed().as_micros() as u64, out }
+    Resolved { seq, txs, ids, shared, accounts: accounts as usize, resolve_us: at.elapsed().as_micros() as u64, out, lanes: None }
 }
 
 /// The process's rolling table, made at the first plan.
@@ -336,13 +362,178 @@ fn rolling() -> &'static Mutex<Rolling> {
 /// keys resolved against the process's table on `pool` (the plan-body pool).
 /// Plans are resolved one at a time, in the order they are made. `None` when
 /// off or for an empty plan.
-pub fn resolve(pool: &rayon::ThreadPool, keys: &[(Address, Address)]) -> Option<Arc<Resolved>> {
+///
+/// `N42_ONE_PROBE=2`: with `groups` (the plan's sender partition) and a
+/// dispatch of a known width ([`crate::parallel_transfer::lane_width`]),
+/// also the plan's batches and lanes ([`Lanes`]).
+pub fn resolve(pool: &rayon::ThreadPool, keys: &[(Address, Address)], groups: Option<&[Vec<usize>]>) -> Option<Arc<Resolved>> {
     if stage() == 0 || keys.is_empty() || keys.len() > u32::MAX as usize / 2 {
         return None;
     }
     let mut table = rolling().lock().unwrap_or_else(PoisonError::into_inner);
     let table = &mut *table;
-    Some(Arc::new(pool.install(|| resolve_with(table, keys))))
+    let width = (stage() >= 2).then(|| crate::parallel_transfer::lane_width(crate::parallel_transfer::Dispatch::from_env())).flatten();
+    Some(Arc::new(pool.install(|| {
+        let resolved = resolve_with(table, keys);
+        match (groups, width) {
+            (Some(groups), Some(width)) => resolved.with_lanes(groups, width),
+            _ => resolved,
+        }
+    })))
+}
+
+/// The plan's batches and their lanes (`N42_ONE_PROBE=2`): the batches the
+/// build makes of the same groups at the same width, each transaction's
+/// batch and its two accounts' ids in its batch's lane, and each lane's
+/// accounts in first-touch order. A lane is the batch's own dense state: its
+/// accounts are found by the running transaction's ids, not by hashing.
+#[derive(Debug)]
+pub struct Lanes {
+    /// The dispatch width the batches were made at.
+    pub width: usize,
+    /// Each batch's transactions.
+    pub batch_txs: Vec<usize>,
+    /// Transaction -> its batch.
+    batch_of: Vec<u32>,
+    /// Transaction -> (sender's lane id, recipient's lane id).
+    lid: Vec<(u32, u32)>,
+    /// Batch -> its lane's addresses, by lane id.
+    lane_addrs: Vec<Vec<Address>>,
+    /// Dense id -> whether more than one batch touches it.
+    cross: Vec<std::sync::atomic::AtomicBool>,
+    /// Whether the build that took the plan runs its batches on these lanes.
+    pub(crate) used: std::sync::atomic::AtomicBool,
+    /// A batch whose transactions were not the plan's ran without its lane:
+    /// the block's output is not put in the ring.
+    pub(crate) broken: std::sync::atomic::AtomicBool,
+    /// Reads answered from a lane's loaded entry, flushed per batch.
+    pub(crate) hits: AtomicU64,
+    /// Accounts loaded into lanes, flushed per batch.
+    pub(crate) loaded: AtomicU64,
+}
+
+impl Lanes {
+    fn make(resolved: &Resolved, groups: &[Vec<usize>], width: usize) -> Option<Self> {
+        use rayon::prelude::*;
+        let n = resolved.txs.len();
+        if groups.iter().map(Vec::len).sum::<usize>() != n || width == 0 {
+            return None;
+        }
+        let batches = crate::parallel_transfer::batch_groups_one_wave(groups, n, width);
+        let accounts = resolved.accounts;
+        let owner: Vec<AtomicU32> = (0..accounts).into_par_iter().with_min_len(8192).map(|_| AtomicU32::new(u32::MAX)).collect();
+        let cross: Vec<std::sync::atomic::AtomicBool> =
+            (0..accounts).into_par_iter().with_min_len(8192).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+        let tx_lane: Vec<std::sync::atomic::AtomicU64> =
+            (0..n).into_par_iter().with_min_len(8192).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+        let lanes: Vec<(Vec<Address>, usize)> = batches
+            .par_iter()
+            .enumerate()
+            .map_init(
+                || vec![u32::MAX; accounts],
+                |stamp, (b, members)| {
+                    let mut addrs: Vec<Address> = Vec::new();
+                    let mut bids: Vec<u32> = Vec::new();
+                    let mut txs = 0usize;
+                    let mut lid_of = |bid: u32, address: Address| -> u32 {
+                        let slot = &mut stamp[bid as usize];
+                        if *slot == u32::MAX {
+                            *slot = addrs.len() as u32;
+                            addrs.push(address);
+                            bids.push(bid);
+                        }
+                        *slot
+                    };
+                    for group in members {
+                        for &i in group.iter() {
+                            let tx = &resolved.txs[i];
+                            let s = lid_of(tx.s_bid, tx.sender);
+                            let r = lid_of(tx.r_bid, tx.recipient);
+                            tx_lane[i].store((b as u64) << 48 | (s as u64) << 24 | r as u64, Ordering::Relaxed);
+                            txs += 1;
+                        }
+                    }
+                    for &bid in &bids {
+                        stamp[bid as usize] = u32::MAX;
+                        let previous = owner[bid as usize]
+                            .compare_exchange(u32::MAX, b as u32, Ordering::Relaxed, Ordering::Relaxed)
+                            .unwrap_or_else(|owner| owner);
+                        if previous != u32::MAX && previous != b as u32 {
+                            cross[bid as usize].store(true, Ordering::Relaxed);
+                        }
+                    }
+                    (addrs, txs)
+                },
+            )
+            .collect();
+        // Lane ids are packed in 24 bits and batches in 16.
+        if batches.len() > u16::MAX as usize || lanes.iter().any(|(addrs, _)| addrs.len() >= 1 << 24) {
+            return None;
+        }
+        let (batch_of, lid): (Vec<u32>, Vec<(u32, u32)>) = tx_lane
+            .par_iter()
+            .with_min_len(8192)
+            .map(|packed| {
+                let packed = packed.load(Ordering::Relaxed);
+                ((packed >> 48) as u32, (((packed >> 24) & 0xff_ffff) as u32, (packed & 0xff_ffff) as u32))
+            })
+            .unzip();
+        let (lane_addrs, batch_txs) = lanes.into_iter().unzip();
+        Some(Self {
+            width,
+            batch_txs,
+            batch_of,
+            lid,
+            lane_addrs,
+            cross,
+            used: Default::default(),
+            broken: Default::default(),
+            hits: Default::default(),
+            loaded: Default::default(),
+        })
+    }
+
+    /// Batches.
+    pub fn batches(&self) -> usize {
+        self.batch_txs.len()
+    }
+
+    /// The accounts of all lanes.
+    pub fn accounts(&self) -> usize {
+        self.lane_addrs.iter().map(Vec::len).sum()
+    }
+
+    /// Reads answered from lanes' loaded entries so far.
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    /// Whether the build runs its batches on the lanes.
+    pub fn used(&self) -> bool {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    /// Whether a batch ran without its lane.
+    pub fn broken(&self) -> bool {
+        self.broken.load(Ordering::Relaxed)
+    }
+
+    /// Transaction `i`'s batch.
+    #[inline]
+    pub fn batch_of(&self, i: usize) -> Option<u32> {
+        self.batch_of.get(i).copied()
+    }
+
+    /// Transaction `i`'s (sender, recipient) lane ids.
+    #[inline]
+    pub fn lid(&self, i: usize) -> Option<(u32, u32)> {
+        self.lid.get(i).copied()
+    }
+
+    /// Batch `b`'s lane addresses, by lane id.
+    pub fn lane(&self, b: usize) -> Option<&[Address]> {
+        self.lane_addrs.get(b).map(Vec::as_slice)
+    }
 }
 
 /// [`Dense::tag`]: never written (the account is read through the chain).
@@ -477,7 +668,7 @@ impl Ring {
 
     /// [`note_built`] on this ring.
     pub fn record(&mut self, view: &BuildView, base: B256, parent_built: Option<B256>, built: B256, extra: Vec<Address>) -> bool {
-        if view.mismatched() {
+        if view.mismatched() || view.resolved.lanes.as_ref().is_some_and(Lanes::broken) {
             return false;
         }
         self.push(BuiltOutput { seq: view.resolved.seq, base, parent_built, built, extra, out: Arc::clone(&view.resolved.out) });
@@ -749,7 +940,7 @@ impl<G: crate::parallel_transfer::AccountHint> crate::parallel_transfer::Account
         } else {
             return;
         };
-        if view.resolved.shared(bid) || *address == view.beneficiary {
+        if !view.resolved.one_writer(bid) || *address == view.beneficiary {
             return;
         }
         let Some(slot) = view.resolved.out.get(bid) else { return };
@@ -970,5 +1161,34 @@ mod tests {
         drop(db);
         assert!(view2.mismatched());
         assert!(!ring.record(&view2, B256::with_last_byte(101), Some(B256::with_last_byte(10)), B256::with_last_byte(11), vec![]));
+    }
+    /// The plan's batches and lanes: a recipient two senders of one batch
+    /// pay has one lane id there and one writer; the same recipient paid
+    /// from two batches is touched by two, and a lane id names each
+    /// transaction's accounts.
+    #[test]
+    fn a_lane_holds_a_recipient_two_of_its_senders_pay() {
+        let keys = [(a(1), a(9)), (a(2), a(9)), (a(3), a(8))];
+        let groups = vec![vec![0], vec![1], vec![2]];
+        let mut table = Rolling::new(16);
+        let two = resolve_with(&mut table, &keys).with_lanes(&groups, 2);
+        let lanes = two.lanes.as_ref().expect("lanes");
+        assert_eq!(lanes.batch_txs, vec![2, 1]);
+        assert_eq!((lanes.batch_of(0), lanes.batch_of(1), lanes.batch_of(2)), (Some(0), Some(0), Some(1)));
+        let r = two.id_of(&a(9)).unwrap();
+        assert!(two.shared(r), "two senders");
+        assert_eq!(lanes.lid(0).unwrap().1, lanes.lid(1).unwrap().1, "one lane id in the batch");
+        assert_eq!(lanes.lane(0).unwrap(), &[a(1), a(9), a(2)]);
+        assert_eq!(lanes.lane(1).unwrap(), &[a(3), a(8)]);
+        assert!(!two.one_writer(r), "lanes not in use: the sender rule");
+        lanes.used.store(true, Ordering::Relaxed);
+        assert!(two.one_writer(r), "lanes in use: one batch writes it");
+        let three = resolve_with(&mut table, &keys).with_lanes(&groups, 3);
+        let lanes = three.lanes.as_ref().unwrap();
+        lanes.used.store(true, Ordering::Relaxed);
+        assert_eq!(lanes.batches(), 3);
+        assert!(!three.one_writer(three.id_of(&a(9)).unwrap()), "two batches pay it");
+        assert!(three.one_writer(three.id_of(&a(8)).unwrap()));
+        assert!(resolve_with(&mut table, &keys).with_lanes(&[vec![0, 1]], 2).lanes.is_none(), "groups not covering the plan");
     }
 }

@@ -922,7 +922,8 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
     // `N42_ONE_PROBE=1`: every account of the plan resolved to where its
     // value lives before the block (`one_probe`), one rolling-table probe a
     // distinct address, here on the plan-body pool.
-    let one_probe = crate::one_probe::resolve(pool, &keys);
+    // `N42_ONE_PROBE=2`: with the partition, the plan's batches and lanes.
+    let one_probe = crate::one_probe::resolve(pool, &keys, groups.as_ref().map(|(_, groups)| groups.as_slice()));
     // `N42_PLAN_AHEAD_PARTS=1`: the body's frame layout and transactions
     // root, found here with the plan rather than at the seal.
     let root_ahead = (crate::frame_blocks::plan_ahead_parts() && crate::frame_blocks::active())

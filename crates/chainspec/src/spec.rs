@@ -95,11 +95,11 @@ pub fn make_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Hea
         .active_at_timestamp(genesis.timestamp)
         .then_some(EMPTY_BLOCK_ACCESS_LIST_HASH);
 
-    // If Amsterdam is activated at genesis we set slot number to 0
+    // If Amsterdam is activated at genesis we set slot number to the provided genesis or 0
     let slot_number = hardforks
         .fork(EthereumHardfork::Amsterdam)
         .active_at_timestamp(genesis.timestamp)
-        .then_some(0);
+        .then_some(genesis.slot_number.unwrap_or(0));
 
     Header {
         number: genesis.number.unwrap_or_default(),
@@ -414,6 +414,7 @@ pub fn create_chain_config(
         prague_time: timestamp(EthereumHardfork::Prague),
         osaka_time: timestamp(EthereumHardfork::Osaka),
         amsterdam_time: timestamp(EthereumHardfork::Amsterdam),
+        bogota_time: timestamp(EthereumHardfork::Bogota),
         bpo1_time: timestamp(EthereumHardfork::Bpo1),
         bpo2_time: timestamp(EthereumHardfork::Bpo2),
         bpo3_time: timestamp(EthereumHardfork::Bpo3),
@@ -1037,6 +1038,7 @@ impl From<Genesis> for ChainSpec {
             (EthereumHardfork::Bpo4.boxed(), genesis.config.bpo4_time),
             (EthereumHardfork::Bpo5.boxed(), genesis.config.bpo5_time),
             (EthereumHardfork::Amsterdam.boxed(), genesis.config.amsterdam_time),
+            (EthereumHardfork::Bogota.boxed(), genesis.config.bogota_time),
         ];
 
         let mut time_hardforks = time_hardfork_opts
@@ -1351,6 +1353,19 @@ impl ChainSpecBuilder {
     /// Enable Amsterdam at the given timestamp.
     pub fn with_amsterdam_at(mut self, timestamp: u64) -> Self {
         self.hardforks.insert(EthereumHardfork::Amsterdam, ForkCondition::Timestamp(timestamp));
+        self
+    }
+
+    /// Enable Bogota at genesis.
+    pub fn bogota_activated(mut self) -> Self {
+        self = self.amsterdam_activated();
+        self.hardforks.insert(EthereumHardfork::Bogota, ForkCondition::Timestamp(0));
+        self
+    }
+
+    /// Enable Bogota at the given timestamp.
+    pub fn with_bogota_at(mut self, timestamp: u64) -> Self {
+        self.hardforks.insert(EthereumHardfork::Bogota, ForkCondition::Timestamp(timestamp));
         self
     }
 
@@ -1958,6 +1973,31 @@ Post-merge hard forks (timestamp based):
                         next: 1760427360, // Osaka timestamp for Sepolia
                     },
                 ),
+                (
+                    EthereumHardfork::Osaka,
+                    ForkId {
+                        hash: ForkHash(hex!("0xe2ae4999")),
+                        next: sepolia::SEPOLIA_BPO1_TIMESTAMP,
+                    },
+                ),
+                (
+                    EthereumHardfork::Bpo1,
+                    ForkId {
+                        hash: ForkHash(hex!("0x56078a1e")),
+                        next: sepolia::SEPOLIA_BPO2_TIMESTAMP,
+                    },
+                ),
+                (
+                    EthereumHardfork::Bpo2,
+                    ForkId {
+                        hash: ForkHash(hex!("0x268956b6")),
+                        next: sepolia::SEPOLIA_AMSTERDAM_TIMESTAMP,
+                    },
+                ),
+                (
+                    EthereumHardfork::Amsterdam,
+                    ForkId { hash: ForkHash(hex!("0x6c1d9423")), next: 0 },
+                ),
             ],
         );
     }
@@ -2387,6 +2427,60 @@ Post-merge hard forks (timestamp based):
                         hash: ForkHash([0xed, 0x88, 0xb5, 0xfd]),
                         next: 1760427360, // Osaka timestamp for Sepolia
                     },
+                ),
+                // First BPO1 block
+                (
+                    Head {
+                        number: 1735377,
+                        timestamp: sepolia::SEPOLIA_BPO1_TIMESTAMP,
+                        ..Default::default()
+                    },
+                    ForkId {
+                        hash: ForkHash(hex!("0x56078a1e")),
+                        next: sepolia::SEPOLIA_BPO2_TIMESTAMP,
+                    },
+                ),
+                // First BPO2 block
+                (
+                    Head {
+                        number: 1735377,
+                        timestamp: sepolia::SEPOLIA_BPO2_TIMESTAMP,
+                        ..Default::default()
+                    },
+                    ForkId {
+                        hash: ForkHash(hex!("0x268956b6")),
+                        next: sepolia::SEPOLIA_AMSTERDAM_TIMESTAMP,
+                    },
+                ),
+                // Last block before Amsterdam
+                (
+                    Head {
+                        number: 1735377,
+                        timestamp: sepolia::SEPOLIA_AMSTERDAM_TIMESTAMP - 1,
+                        ..Default::default()
+                    },
+                    ForkId {
+                        hash: ForkHash(hex!("0x268956b6")),
+                        next: sepolia::SEPOLIA_AMSTERDAM_TIMESTAMP,
+                    },
+                ),
+                // First Amsterdam block
+                (
+                    Head {
+                        number: 1735377,
+                        timestamp: sepolia::SEPOLIA_AMSTERDAM_TIMESTAMP,
+                        ..Default::default()
+                    },
+                    ForkId { hash: ForkHash(hex!("0x6c1d9423")), next: 0 },
+                ),
+                // After Amsterdam
+                (
+                    Head {
+                        number: 1735377,
+                        timestamp: sepolia::SEPOLIA_AMSTERDAM_TIMESTAMP + 1,
+                        ..Default::default()
+                    },
+                    ForkId { hash: ForkHash(hex!("0x6c1d9423")), next: 0 },
                 ),
             ],
         );
@@ -3425,6 +3519,28 @@ Post-merge hard forks (timestamp based):
     }
 
     #[test]
+    fn test_amsterdam_genesis_slot_number() {
+        // a genesis-provided slot number is used as-is
+        let genesis =
+            Genesis { gas_limit: 0x2fefd8u64, ..Default::default() }.with_slot_number(Some(999));
+        let chainspec = ChainSpecBuilder::default()
+            .chain(Chain::from_id(1337))
+            .genesis(genesis)
+            .amsterdam_activated()
+            .build();
+        assert_eq!(chainspec.genesis_header().slot_number, Some(999));
+
+        // an omitted slot number defaults to 0
+        let genesis = Genesis { gas_limit: 0x2fefd8u64, ..Default::default() };
+        let chainspec = ChainSpecBuilder::default()
+            .chain(Chain::from_id(1337))
+            .genesis(genesis)
+            .amsterdam_activated()
+            .build();
+        assert_eq!(chainspec.genesis_header().slot_number, Some(0));
+    }
+
+    #[test]
     fn holesky_paris_activated_at_genesis() {
         assert!(HOLESKY
             .fork(EthereumHardfork::Paris)
@@ -3511,13 +3627,26 @@ Post-merge hard forks (timestamp based):
 
     #[test]
     fn latest_eth_mainnet_fork_id() {
-        assert_eq!(
-            ForkId {
-                hash: ForkHash([0x07, 0xc9, 0x46, 0x2e]), // Updated for Bpo2 (latest fork)
-                next: 0
-            },
-            MAINNET.latest_fork_id()
-        )
+        // BPO2
+        assert_eq!(ForkId { hash: ForkHash(hex!("0x07c9462e")), next: 0 }, MAINNET.latest_fork_id())
+    }
+
+    #[test]
+    fn latest_hoodi_mainnet_fork_id() {
+        // BPO2
+        assert_eq!(ForkId { hash: ForkHash(hex!("0x23aa1351")), next: 0 }, HOODI.latest_fork_id())
+    }
+
+    #[test]
+    fn latest_holesky_mainnet_fork_id() {
+        // BPO2
+        assert_eq!(ForkId { hash: ForkHash(hex!("0x9bc6cb31")), next: 0 }, HOLESKY.latest_fork_id())
+    }
+
+    #[test]
+    fn latest_sepolia_mainnet_fork_id() {
+        // Amsterdam
+        assert_eq!(ForkId { hash: ForkHash(hex!("0x6c1d9423")), next: 0 }, SEPOLIA.latest_fork_id())
     }
 
     #[test]

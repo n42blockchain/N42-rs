@@ -21,7 +21,6 @@ use reth_payload_primitives::{
     PayloadOrAttributes,
 };
 use reth_primitives_traits::{RecoveredBlock, SealedBlock};
-use reth_chain_state::ExecutedBlock;
 use std::sync::Arc;
 
 /// Validator for the ethereum engine API.
@@ -164,7 +163,7 @@ where
 
     fn validate_block(
         &mut self,
-        _block: SealedBlock<Block>,
+        _block: reth_primitives_traits::SealedBlockWith<Block, Option<reth_provider::RawBal>>,
         _ctx: reth_engine_tree::tree::payload_validator::TreeCtx<'_, EthPrimitives>,
     ) -> EthValidationOutcome {
         // NOTE: This is a simplified implementation for N42.

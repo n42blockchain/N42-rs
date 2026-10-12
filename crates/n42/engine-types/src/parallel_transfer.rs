@@ -64,6 +64,10 @@ pub struct Phases {
     pub partition_us: u64,
     /// See `partition_us`.
     pub slots_us: u64,
+    /// The caller's hook before the batches (the build's deferred state
+    /// opened and its pre-execution changes), microseconds; inside
+    /// `batches_start_us`.
+    pub hook_us: u64,
     /// From the call's entry to the batches' end, microseconds: the caller
     /// names the gap after the execution from here.
     pub batches_end_us: u64,
@@ -142,6 +146,12 @@ pub struct Phases {
     /// every batch (pool time) -- see [`LoopTimers`]. Zero when the flag is
     /// off.
     pub loop_timers: LoopTimers,
+    /// `N42_BUILD_MLP=<k>`: the lookahead distance the batches ran with, 0
+    /// when off ([`build_mlp`]).
+    pub mlp_k: usize,
+    /// `N42_BUILD_MLP`: the account hints the batches sent beneath their own
+    /// maps, into the parent's layers, summed over the batches.
+    pub mlp_hints: u64,
 }
 
 /// The calling thread's CPU time, nanoseconds (0 where it cannot be read).
@@ -874,7 +884,8 @@ pub fn freeze_pool_own() -> bool {
 
 /// The pool the work behind the seal runs on: with `N42_FREEZE_POOL=own` a
 /// pool of `N42_FREEZE_POOL_THREADS` threads (16 by default, `n42-behind-*`,
-/// in the layout's build set as the build pool's are), else [`build_pool`].
+/// in the layout's build set as the build pool's are, or the set
+/// `N42_CORE_LAYOUT_BEHIND` names), else [`build_pool`].
 /// A pool that cannot be built falls back to [`build_pool`].
 pub fn behind_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
@@ -887,7 +898,8 @@ pub fn behind_pool() -> &'static rayon::ThreadPool {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .thread_name(|i| format!("n42-behind-{i}"))
-            .start_handler(|_| n42_core_layout::enter(n42_core_layout::Set::Build))
+            // The build set unless `N42_CORE_LAYOUT_BEHIND` places it elsewhere.
+            .start_handler(|_| n42_core_layout::enter(n42_core_layout::Set::Behind))
             .build()
             .inspect_err(|err| tracing::warn!(target: "payload_builder", %err, "no pool of its own for the freeze; the build pool takes it"))
             .ok()
@@ -947,19 +959,78 @@ pub fn build_prefetch() -> bool {
     *ON.get_or_init(|| std::env::var("N42_BUILD_PREFETCH").is_ok_and(|v| v == "1"))
 }
 
+/// The lookahead distance cap of [`build_mlp`]: a batch's ring of converted
+/// transactions is `k + 1` entries, kept small.
+const BUILD_MLP_MAX: usize = 256;
+
+/// `usize::MAX`: [`build_mlp`] reads the environment; anything else is a
+/// distance set by [`set_build_mlp`].
+static BUILD_MLP_SET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Memory-level parallelism inside the leader's build batches
+/// (`N42_BUILD_MLP=<k>`, 0 or unset = off): before a batch runs transaction
+/// `i` it converts the transaction `k` places ahead in the batch's order
+/// (its pooled transaction's memory read then, the environment kept in a
+/// ring of `k + 1`), and issues prefetch hints for that transaction's result
+/// slot and for its sender's and recipient's entries in the batch's own
+/// account map ([`crate::batch_state::BatchState::prefetch_account`]). The
+/// hints change no result: the conversion is pure and the probes read only.
+/// Capped at 256.
+pub fn build_mlp() -> usize {
+    static ENV: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    match BUILD_MLP_SET.load(std::sync::atomic::Ordering::Relaxed) {
+        usize::MAX => *ENV.get_or_init(|| {
+            std::env::var("N42_BUILD_MLP").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0).min(BUILD_MLP_MAX)
+        }),
+        k => k,
+    }
+}
+
+/// Tests and benches: [`build_mlp`] answers `k` (capped) from now on;
+/// `None` returns it to the environment's value.
+#[doc(hidden)]
+pub fn set_build_mlp(k: Option<usize>) {
+    BUILD_MLP_SET.store(k.map_or(usize::MAX, |k| k.min(BUILD_MLP_MAX)), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A prefetch hint for the cache line at `p` into every level (`T0`): no
+/// load is made architecturally, so the pointer need not be valid. A no-op
+/// off x86_64.
+#[inline(always)]
+pub fn prefetch_hint<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    #[allow(unused_unsafe)]
+    // SAFETY: `prefetcht0` is a hint: it never faults and never reads
+    // architecturally, whatever the address; SSE is baseline on x86_64.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(p.cast::<i8>());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
 /// Shards of [`WarmAccounts`]: enough that the pool's prefetch jobs seldom
 /// meet on one lock, few enough that each job takes every lock once.
-const WARM_SHARDS: usize = 64;
+pub(crate) const WARM_SHARDS: usize = 64;
 
-/// The shard an address lands in: its first byte, which is uniform for the
-/// flood's addresses and for anything derived from a hash.
+/// The shard an address lands in: a multiplicative hash of all twenty
+/// bytes. Not the first byte alone: the flood's recipients
+/// (`tx_flood::recipient`) carry a slot under 2^20 big-endian in their first
+/// four bytes, so their first byte is 0 and every one of them landed in
+/// shard 0 (loop351 stage ay: one thread read ~147,000 recipients while 63
+/// shards held a few hundred senders).
 #[inline]
-fn warm_shard(address: &Address) -> usize {
-    address.0[0] as usize % WARM_SHARDS
+pub(crate) fn warm_shard(address: &Address) -> usize {
+    let b = &address.0;
+    let lo = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+    let mid = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+    let hi = u32::from_le_bytes([b[16], b[17], b[18], b[19]]) as u64;
+    let x = (lo ^ mid.rotate_left(21) ^ hi.rotate_left(42)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (x >> 58) as usize % WARM_SHARDS
 }
 
 /// An account as the parent's state answers it.
-type WarmInfo = Option<revm::state::AccountInfo>;
+pub(crate) type WarmInfo = Option<revm::state::AccountInfo>;
 
 /// The block's accounts as the parent's state has them, read ahead of the
 /// execution (`N42_BUILD_PREFETCH=1`).
@@ -1034,6 +1105,7 @@ impl WarmAccounts {
                 .into_iter()
                 .map(|shard| shard.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner))
                 .collect(),
+            hits: Default::default(),
         }
     }
 }
@@ -1042,9 +1114,26 @@ impl WarmAccounts {
 #[derive(Debug, Default)]
 pub struct FrozenWarm {
     shards: Vec<alloy_primitives::map::AddressHashMap<WarmInfo>>,
+    /// Reads [`WarmDb`] answered from the layer, flushed by each `WarmDb`
+    /// as it drops (one add a batch, not one a read).
+    hits: std::sync::atomic::AtomicU64,
 }
 
 impl FrozenWarm {
+    /// A layer made of `shards` maps, indexed by [`warm_shard`]
+    /// (`N42_PLAN_AHEAD_WARM`, [`crate::warm_ahead`]); a shard left empty
+    /// answers nothing.
+    pub(crate) fn from_shards(shards: Vec<alloy_primitives::map::AddressHashMap<WarmInfo>>) -> Self {
+        debug_assert!(shards.is_empty() || shards.len() == WARM_SHARDS);
+        Self { shards, hits: Default::default() }
+    }
+
+    /// The reads answered from the layer so far, by every [`WarmDb`] over
+    /// it that has dropped.
+    pub fn hits(&self) -> u64 {
+        self.hits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// What the prefetch read for `address`: `None` if it did not read it,
     /// `Some(None)` for an account the parent's state does not have.
     #[inline]
@@ -1072,12 +1161,22 @@ impl FrozenWarm {
 pub struct WarmDb<'a, G> {
     warm: &'a FrozenWarm,
     inner: G,
+    /// Reads answered from `warm`, added to its count on drop.
+    hits: u64,
 }
 
 impl<'a, G> WarmDb<'a, G> {
     /// `inner` behind `warm`.
     pub const fn new(warm: &'a FrozenWarm, inner: G) -> Self {
-        Self { warm, inner }
+        Self { warm, inner, hits: 0 }
+    }
+}
+
+impl<G> Drop for WarmDb<'_, G> {
+    fn drop(&mut self) {
+        if self.hits > 0 {
+            self.warm.hits.fetch_add(self.hits, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -1087,7 +1186,10 @@ impl<G: Database> Database for WarmDb<'_, G> {
     #[inline]
     fn basic(&mut self, address: Address) -> Result<WarmInfo, Self::Error> {
         match self.warm.get(&address) {
-            Some(info) => Ok(info.clone()),
+            Some(info) => {
+                self.hits += 1;
+                Ok(info.clone())
+            }
             None => self.inner.basic(address),
         }
     }
@@ -1274,6 +1376,47 @@ impl ReadSet {
             self.hits.load(std::sync::atomic::Ordering::Relaxed),
             self.misses.load(std::sync::atomic::Ordering::Relaxed),
         )
+    }
+}
+
+/// A batch database's hint path (`N42_BUILD_MLP`): `address` will be read
+/// soon, so each layer probes for it -- the probe is the prefetch -- and, if
+/// it does not hold it, passes the hint beneath; the parent's state provider
+/// walks its own layers the same way
+/// (`AccountReader::n42_prefetch_account`). Nothing is materialised, no
+/// answer or counter changes, no lock is waited on. Returns whether a layer
+/// held the account. The default does nothing.
+pub trait AccountHint {
+    /// See the trait.
+    fn hint_account(&self, _address: &Address) -> bool {
+        false
+    }
+}
+
+impl<ExtDB> AccountHint for revm::database::CacheDB<ExtDB> {
+    fn hint_account(&self, address: &Address) -> bool {
+        self.cache.accounts.contains_key(address)
+    }
+}
+
+impl<DB: reth_storage_api::EvmStateProvider> AccountHint for reth_revm::database::StateProviderDatabase<DB> {
+    #[inline]
+    fn hint_account(&self, address: &Address) -> bool {
+        self.0.n42_prefetch_account(address)
+    }
+}
+
+impl<G: AccountHint> AccountHint for WarmDb<'_, G> {
+    #[inline]
+    fn hint_account(&self, address: &Address) -> bool {
+        self.warm.get(address).is_some() || self.inner.hint_account(address)
+    }
+}
+
+impl<G: AccountHint> AccountHint for ReadSetDb<'_, G> {
+    #[inline]
+    fn hint_account(&self, address: &Address) -> bool {
+        self.set.is_some_and(|set| set.get(address).is_some()) || self.inner.hint_account(address)
     }
 }
 
@@ -3576,7 +3719,7 @@ pub fn execute_for_build<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_with(evm_env, keys, convert, open, None)
@@ -3596,7 +3739,7 @@ pub fn execute_for_build_in_place<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_run(evm_env, keys, convert, open, on_bundle, in_place, None)
@@ -3619,7 +3762,7 @@ pub fn execute_for_build_in_place_after<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_run(evm_env, keys, convert, open, on_bundle, in_place, Some(before_batches))
@@ -3639,7 +3782,7 @@ pub fn execute_for_build_with<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_run(evm_env, keys, convert, open, on_bundle, false, None)
@@ -3657,7 +3800,7 @@ pub fn execute_for_build_read_set<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, Dispatch::from_env(), None, None)
@@ -3678,7 +3821,7 @@ pub fn execute_for_build_dispatch<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), None, None)
@@ -3695,7 +3838,7 @@ fn execute_for_build_run<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), None, None)
@@ -3721,7 +3864,7 @@ pub fn execute_for_build_counted<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), tip_of, prepared)
@@ -3743,7 +3886,7 @@ pub fn execute_for_build_counted_dispatch<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_opts(evm_env, keys, convert, open, None, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), tip_of, prepared)
@@ -3762,7 +3905,7 @@ pub fn execute_for_build_dispatched<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_for_build_opts(evm_env, keys, convert, open, on_bundle, true, None, read_set(), dispatch, None, None)
@@ -3784,7 +3927,7 @@ fn execute_for_build_opts<T, G>(
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let beneficiary = evm_env.block_env.beneficiary;
@@ -3821,10 +3964,13 @@ where
     phases.batches = batches.len();
     phases.partition_ms = at.elapsed().as_millis() as u64;
     phases.partition_us = at.elapsed().as_micros() as u64;
-    if let Some(hook) = before_batches
-        && !hook()
-    {
-        return Err(NotParallel::NoState);
+    if let Some(hook) = before_batches {
+        let hook_at = std::time::Instant::now();
+        let opened = hook();
+        phases.hook_us = hook_at.elapsed().as_micros() as u64;
+        if !opened {
+            return Err(NotParallel::NoState);
+        }
     }
 
     let at = std::time::Instant::now();
@@ -3853,10 +3999,13 @@ where
     phases.slots_us = slots_at.elapsed().as_micros() as u64;
     let slots_ref = &slots;
     type BatchResult =
-        (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, BatchSpan, LoopTimers, RunCounters);
+        (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, BatchSpan, LoopTimers, RunCounters, u64);
     // Each batch's span on the pool, against this instant (`BatchSpans`).
     let batches_at = std::time::Instant::now();
     phases.batches_start_us = batches_at.duration_since(call_at).as_micros() as u64;
+    // `N42_BUILD_MLP=<k>`: the lookahead distance, 0 when off.
+    let mlp_k = build_mlp();
+    phases.mlp_k = mlp_k;
     let run_batch = |members: &Vec<&Vec<usize>>| -> Result<BatchResult, NotParallel> {
         let start_us = batches_at.elapsed().as_micros() as u64;
         let cpu_start = ThreadMark::now();
@@ -3878,11 +4027,24 @@ where
         let mut counted = RunCounters { fees: tip_of.map(|_| U256::ZERO), ..Default::default() };
         let mut setup_ns = 0;
         let close_at;
+        // `N42_BUILD_MLP`: hints that went beneath the batch's map, for
+        // `par_mlp_hints`.
+        let mut mlp_hints = 0u64;
         {
             let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
             if let Some(at) = setup_at {
                 setup_ns = at.elapsed().as_nanos() as u64;
             }
+            // `N42_BUILD_MLP=<k>`: the batch's transactions in the order
+            // the loop meets them, the position of the one running, how
+            // far the lookahead has converted, and the converted ones not
+            // yet run. A transaction skipped by its sender's break is
+            // passed over (its converted entry dropped unrun).
+            let order: Vec<usize> =
+                if mlp_k > 0 { members.iter().flat_map(|group| group.iter().copied()).collect() } else { Vec::new() };
+            let mut ahead: std::collections::VecDeque<(usize, T, TxEnv)> =
+                std::collections::VecDeque::with_capacity(if mlp_k > 0 { mlp_k + 1 } else { 0 });
+            let (mut pos, mut filled) = (0usize, 0usize);
             for group in members {
                 let mut rest = group.iter();
                 for &i in rest.by_ref() {
@@ -3894,7 +4056,46 @@ where
                     // Converted here, on the batch's thread: the
                     // conversion of a full block was 55-100 ms of
                     // the builder's own thread otherwise.
-                    let (tx, env) = convert(i);
+                    let (tx, env) = if mlp_k == 0 {
+                        convert(i)
+                    } else {
+                        while order.get(pos).is_some_and(|&at| at != i) {
+                            pos += 1;
+                        }
+                        // The transactions up to `k` places ahead:
+                        // converted now (their pooled transactions read
+                        // while this one's misses are outstanding), their
+                        // slots and their accounts in the batch's map
+                        // hinted. Only hints and pure conversions: every
+                        // result is as without them.
+                        let until = (pos + mlp_k + 1).min(order.len());
+                        while filled < until {
+                            let j = order[filled];
+                            if filled > pos {
+                                if let Some(slot) = slots_ref.get(j) {
+                                    prefetch_hint(slot);
+                                }
+                                // The sender's and the recipient's entries:
+                                // the batch's own when it holds them, else
+                                // down the parent's layers to the QMDB
+                                // view's index bucket.
+                                if let Some((sender, recipient)) = keys.get(j) {
+                                    mlp_hints += u64::from(evm.db_mut().hint_account(sender));
+                                    mlp_hints += u64::from(evm.db_mut().hint_account(recipient));
+                                }
+                            }
+                            let (t, e) = convert(j);
+                            ahead.push_back((j, t, e));
+                            filled += 1;
+                        }
+                        loop {
+                            match ahead.pop_front() {
+                                Some((j, t, e)) if j == i => break (t, e),
+                                Some(_) => continue,
+                                None => break convert(i),
+                            }
+                        }
+                    };
                     let t1 = mark();
                     match evm.transfer_plain(&env) {
                         Ok(Some((plain, result))) => {
@@ -3947,12 +4148,12 @@ where
                 sink(bundle);
                 let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
                 let span = BatchSpan::close(start_us, cpu_start, txs, batches_at).with_open_us(open_us);
-                Ok((skipped, None, timers, span, sampler.finish(setup_ns, close_ns), counted))
+                Ok((skipped, None, timers, span, sampler.finish(setup_ns, close_ns), counted, mlp_hints))
             }
             None => {
                 let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
                 let span = BatchSpan::close(start_us, cpu_start, txs, batches_at).with_open_us(open_us);
-                Ok((skipped, Some(bundle), timers, span, sampler.finish(setup_ns, close_ns), counted))
+                Ok((skipped, Some(bundle), timers, span, sampler.finish(setup_ns, close_ns), counted, mlp_hints))
             }
         }
     };
@@ -4016,8 +4217,9 @@ where
     run.counters.fees = tip_of.map(|_| U256::ZERO);
     let mut spans: Vec<BatchSpan> = Vec::with_capacity(results.len());
     for r in results {
-        let (skipped, bundle, timers, span, loop_timers, counted) = r?;
+        let (skipped, bundle, timers, span, loop_timers, counted, mlp_hints) = r?;
         run.counters.add(counted);
+        run.phases.mlp_hints += mlp_hints;
         spans.push(span);
         run.phases.loop_timers.add(loop_timers);
         run.skipped.extend(skipped);
@@ -4761,7 +4963,7 @@ where
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, BlockExecutorFactory = FastExecutorFactory> + Sync,
     DB: Database + std::fmt::Debug,
     DB::Error: Send + Sync + 'static,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_transfers_build_path_keyed(evm_config, block, main_db, open, None)
@@ -4870,7 +5072,7 @@ where
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, BlockExecutorFactory = FastExecutorFactory> + Sync,
     DB: Database + std::fmt::Debug,
     DB::Error: Send + Sync + 'static,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     execute_transfers_build_path_on(evm_config, BuildPathBlock::of(block), main_db, open, keys_ahead)
@@ -4891,7 +5093,7 @@ where
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, BlockExecutorFactory = FastExecutorFactory> + Sync,
     DB: Database + std::fmt::Debug,
     DB::Error: Send + Sync + 'static,
-    G: Database + std::fmt::Debug + Send,
+    G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
     T: BuildPathTx,
 {
@@ -5107,6 +5309,8 @@ mod tests {
     /// on a node every batch opens a state provider over the same store.
     #[derive(Debug, Clone)]
     struct SharedDb(std::sync::Arc<CacheDB<EmptyDB>>);
+
+    impl AccountHint for SharedDb {}
 
     impl Database for SharedDb {
         type Error = <CacheDB<EmptyDB> as revm::DatabaseRef>::Error;
@@ -6140,6 +6344,76 @@ mod tests {
         assert_eq!(phases.read_set.unresolved, 0);
         assert!(phases.read_set_hits > 0);
         assert_eq!(phases.read_set_misses, 0, "every account a transfer reads is in the set");
+    }
+
+    /// `N42_BUILD_MLP=<k>`: the lookahead's conversions and hints change
+    /// nothing -- the same transfers, gas, skips, grafted state, reverts and
+    /// the roots' inputs as without it -- at a short distance, at one longer
+    /// than any batch (the cap), on blocks of sender runs, of interleaved
+    /// senders and of shared recipients, with some senders funded for only
+    /// part of their run so the loop's skip-the-rest path meets converted
+    /// entries it must drop.
+    #[test]
+    fn the_build_lookahead_equals_the_plain_build() {
+        for (senders, per, space, run) in [(400u64, 50u64, 0u64, 50usize), (300, 30, 0, 1), (200, 40, 2_000, 7)] {
+            let (block, mut db) = random_fixture(senders, per, space, run, 5);
+            // Every seventh sender can pay for five of its transfers: the
+            // sixth is refused and the rest of its run skipped.
+            for s in (0..senders).step_by(7) {
+                let five = U256::from(5u64) * U256::from(21_000u64 * 10_000_000_000u64 + 2_000);
+                db.insert_account_info(addr(100 + s), AccountInfo { balance: five, nonce: 0, ..Default::default() });
+            }
+            let evm_config =
+                crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+            let evm_env = evm_config.evm_env(block.header()).expect("env");
+            let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
+            let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
+            let beneficiary = evm_env.block_env.beneficiary;
+            // The converted value carries the index: a lookahead that handed
+            // a transaction another's conversion would show in the slots.
+            let convert = |i: usize| (i, envs[i].clone());
+            let accounts_of = |bundle: &BundleState| -> std::collections::BTreeMap<Address, _> {
+                bundle.state.iter().map(|(a, acc)| (*a, (acc.info.clone(), acc.original_info.clone(), acc.status))).collect()
+            };
+            let reverts_of = |bundle: &BundleState| -> std::collections::BTreeMap<Address, _> {
+                bundle.reverts.iter().flatten().cloned().collect()
+            };
+            let state_ops_of = |bundle: &BundleState| n42_qmdb_reth::sorted_operations_from_execution(bundle, true).to_operations();
+            let grafted = |k: Option<usize>| {
+                set_build_mlp(Some(k.unwrap_or(0)));
+                let run = execute_for_build_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), None, true, false)
+                    .expect("a block of transfers");
+                set_build_mlp(None);
+                let executed: Vec<(usize, usize, u64, bool)> = run
+                    .slots
+                    .iter()
+                    .filter_map(std::sync::OnceLock::get)
+                    .map(|b| (b.index, b.tx, b.gas_used, b.result.is_success()))
+                    .collect();
+                let (mlp_k, mlp_hints) = (run.phases.mlp_k, run.phases.mlp_hints);
+                let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();
+                let graft = graft_bundles(&mut state, run.bundles, beneficiary).unwrap();
+                state.merge_transitions(BundleRetention::Reverts);
+                let mut bundle = state.take_bundle();
+                append_reverts(&mut bundle, graft.reverts);
+                (executed, run.skipped, graft.beneficiary_delta, accounts_of(&bundle), reverts_of(&bundle), state_ops_of(&bundle), mlp_k, mlp_hints)
+            };
+            let plain = grafted(None);
+            assert!(!plain.1.is_empty(), "the underfunded senders' runs are skipped in part");
+            assert!(plain.0.iter().all(|(index, tx, _, _)| index == tx));
+            assert_eq!((plain.6, plain.7), (0, 0));
+            for k in [1usize, 4, 16, 10_000] {
+                let ahead = grafted(Some(k));
+                assert_eq!(ahead.6, k.min(BUILD_MLP_MAX), "the distance on the phases");
+                assert!(ahead.7 > 0, "hints went beneath the batches' maps, k={k}");
+                assert_eq!(plain.0, ahead.0, "executed transfers, their conversions and gas, k={k}");
+                assert_eq!(plain.1, ahead.1, "skipped, k={k}");
+                assert_eq!(plain.2, ahead.2, "beneficiary delta, k={k}");
+                assert_eq!(plain.3, ahead.3, "grafted accounts, k={k}");
+                assert_eq!(plain.4, ahead.4, "reverts, k={k}");
+                assert_eq!(plain.5, ahead.5, "the state root's operations, k={k}");
+            }
+        }
     }
 
     /// `N42_BUILD_ONE_WAVE=1`: one batch a thread at most, spawned at once,
@@ -7431,6 +7705,91 @@ mod tests {
         (executed, bundle, graft.beneficiary_delta)
     }
 
+    /// `N42_PLAN_AHEAD_WARM`: block N+1's accounts read at block N's parent
+    /// state with block N's plan left out (`warm_ahead`), then N+1 built on
+    /// N's post-state with that layer in front, builds the same block as the
+    /// plain build on N's post-state -- and the same read without N left out
+    /// would have served stale accounts.
+    #[test]
+    fn a_build_on_the_warm_read_ahead_equals_the_plain_build() {
+        use crate::warm_ahead::WarmAhead;
+        use std::sync::Arc;
+        for (senders, per, space, run) in [(400u64, 50u64, 0u64, 50usize), (300, 30, 0, 1), (200, 40, 2_000, 7)] {
+            let (block, db) = random_fixture(senders, per, space, run, 5);
+            let evm_config =
+                crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+            let evm_env = evm_config.evm_env(block.header()).expect("env");
+            let beneficiary = evm_env.block_env.beneficiary;
+            let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
+            // Block N: each sender's first half; block N+1: the rest, in order.
+            let (n_idx, m_idx): (Vec<usize>, Vec<usize>) = (0..envs.len()).partition(|&i| envs[i].nonce < per / 2);
+            let keys_of = |idx: &[usize]| -> Vec<(Address, Address)> {
+                idx.iter().map(|&i| (envs[i].caller, envs[i].kind.to().copied().unwrap())).collect()
+            };
+            let (keys_n, keys_m) = (keys_of(&n_idx), keys_of(&m_idx));
+            let convert_n = |i: usize| ((), envs[n_idx[i]].clone());
+            let convert_m = |i: usize| ((), envs[m_idx[i]].clone());
+
+            let run_n = execute_for_build_in_place(&evm_env, &keys_n, &convert_n, &|| Some(db.clone()), None, true).expect("block N");
+            assert!(run_n.skipped.is_empty());
+            let (_, bundle_n, _) = grafted_run(run_n, &db, beneficiary);
+            let mut after = db.clone();
+            for (address, account) in &bundle_n.state {
+                after.insert_account_info(*address, account.info.clone().unwrap_or_default());
+            }
+
+            // The plans' reads, as the hook makes them: N's touched set, then
+            // N+1's accounts at N's parent leaving N's out.
+            let plan_n = Arc::new(WarmAhead::new(1, B256::ZERO));
+            let plan_m = WarmAhead::new(2, B256::ZERO);
+            build_pool().install(|| {
+                plan_n.run(&keys_n, || None, &|| Some(db.clone()), 4);
+                plan_m.run(&keys_m, || Some(Arc::clone(&plan_n)), &|| Some(db.clone()), 4);
+            });
+            assert!(plan_m.complete());
+            assert_eq!(plan_m.prev(), Some(1));
+            let (warm, ready) = plan_m.take(&[beneficiary]);
+            assert!(ready && !warm.is_empty(), "a layer: {}", warm.len());
+
+            let plain =
+                execute_for_build_in_place(&evm_env, &keys_m, &convert_m, &|| Some(after.clone()), None, true).expect("block N+1");
+            let warmed = execute_for_build_in_place(&evm_env, &keys_m, &convert_m, &|| Some(WarmDb::new(&warm, after.clone())), None, true)
+                .expect("block N+1 on the layer");
+            assert!(warm.hits() > 0, "the layer answered reads");
+            assert_eq!(plain.skipped, warmed.skipped);
+            let (ours, our_bundle, our_fees) = grafted_run(warmed, &after, beneficiary);
+            let (theirs, their_bundle, their_fees) = grafted_run(plain, &after, beneficiary);
+            assert_eq!(ours.len(), keys_m.len());
+            assert_eq!(ours, theirs, "transfers, gas and outcomes");
+            assert_eq!(our_fees, their_fees, "the beneficiary's tips");
+            assert_eq!(our_bundle.state.len(), their_bundle.state.len(), "accounts");
+            for (address, theirs) in &their_bundle.state {
+                assert_eq!(our_bundle.state.get(address), Some(theirs), "account {address}");
+            }
+            assert_eq!(our_bundle.reverts.len(), their_bundle.reverts.len());
+            for (ours, theirs) in our_bundle.reverts.iter().zip(their_bundle.reverts.iter()) {
+                let ours: std::collections::BTreeMap<_, _> = ours.iter().cloned().collect();
+                let theirs: std::collections::BTreeMap<_, _> = theirs.iter().cloned().collect();
+                assert_eq!(ours, theirs, "reverts");
+            }
+
+            // Without N left out the layer would hold N+1's senders as N's
+            // parent had them: stale.
+            let nothing = Arc::new(WarmAhead::new(3, B256::ZERO));
+            let unfiltered = WarmAhead::new(4, B256::ZERO);
+            build_pool().install(|| {
+                nothing.run(&[], || None, &|| Some(db.clone()), 4);
+                unfiltered.run(&keys_m, || Some(Arc::clone(&nothing)), &|| Some(db.clone()), 4);
+            });
+            let (unfiltered, _) = unfiltered.take(&[]);
+            let mut post = after.clone();
+            assert!(
+                keys_m.iter().any(|(sender, _)| unfiltered.get(sender) != Some(&post.basic(*sender).unwrap())),
+                "the exclusion is what keeps the layer exact"
+            );
+        }
+    }
+
     /// `N42_BUILD_PREFETCH`: a build whose batches read the prefetched layer
     /// first -- with some accounts prefetched and the rest not, and one
     /// account the parent does not have -- builds the same block as a build
@@ -7505,6 +7864,8 @@ mod tests {
         /// the node's provider door does (`n42_state::record_answer`).
         count: bool,
     }
+
+    impl AccountHint for ViewDb {}
 
     impl Database for ViewDb {
         type Error = std::convert::Infallible;

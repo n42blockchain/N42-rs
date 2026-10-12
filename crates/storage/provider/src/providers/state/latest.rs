@@ -134,6 +134,16 @@ impl<Provider: DBProvider + StorageSettingsCache> AccountReader
             self.tx().get_by_encoded_key::<tables::PlainAccountState>(address).map_err(Into::into)
         }
     }
+
+    /// N42: passed to the registered QMDB reader, which prefetches its index bucket for
+    /// the address. No version is resolved (that may read the database): the hint is the
+    /// same at any version.
+    fn n42_prefetch_account(&self, address: &Address) -> bool {
+        if let Some((reader, _)) = reth_storage_api::n42_state::reader() {
+            reader.prefetch_account(address);
+        }
+        false
+    }
 }
 
 impl<Provider: BlockHashReader> BlockHashReader for LatestStateProviderRef<'_, Provider> {

@@ -29,12 +29,13 @@ pub use delegate_impls_to_as_ref;
 /// [`StateProvider`](crate::StateProvider)
 #[macro_export]
 macro_rules! delegate_provider_impls {
-    ($target:ty $(where [$($generics:tt)*])?) => {
+    // N42: every trait but `AccountReader`, for a type that reads accounts itself.
+    (@except_account $target:ty $(where [$($generics:tt)*])?) => {
+        $crate::macros::delegate_provider_impls!(@rest $target $(where [$($generics)*])?);
+    };
+    (@rest $target:ty $(where [$($generics:tt)*])?) => {
         $crate::macros::delegate_impls_to_as_ref!(
             for $target =>
-            AccountReader $(where [$($generics)*])? {
-                fn basic_account(&self, address: &alloy_primitives::Address) -> reth_storage_api::errors::provider::ProviderResult<Option<reth_primitives_traits::Account>>;
-            }
             BlockHashReader $(where [$($generics)*])? {
                 fn block_hash(&self, number: u64) -> reth_storage_api::errors::provider::ProviderResult<Option<alloy_primitives::B256>>;
                 fn canonical_hashes_range(&self, start: alloy_primitives::BlockNumber, end: alloy_primitives::BlockNumber) -> reth_storage_api::errors::provider::ProviderResult<Vec<alloy_primitives::B256>>;
@@ -66,7 +67,17 @@ macro_rules! delegate_provider_impls {
                 fn hashed_post_state(&self, bundle_state: &revm::database::BundleState) -> reth_storage_api::errors::provider::ProviderResult<reth_trie::HashedPostState>;
             }
         );
-    }
+    };
+    ($target:ty $(where [$($generics:tt)*])?) => {
+        $crate::macros::delegate_impls_to_as_ref!(
+            for $target =>
+            AccountReader $(where [$($generics)*])? {
+                fn basic_account(&self, address: &alloy_primitives::Address) -> reth_storage_api::errors::provider::ProviderResult<Option<reth_primitives_traits::Account>>;
+                fn n42_prefetch_account(&self, address: &alloy_primitives::Address) -> bool;
+            }
+        );
+        $crate::macros::delegate_provider_impls!(@rest $target $(where [$($generics)*])?);
+    };
 }
 
 pub use delegate_provider_impls;

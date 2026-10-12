@@ -47,7 +47,11 @@ const LEN_LEN: usize = 4;
 /// mapping that was just re-established cost 50-80 ms of minor faults
 /// (loop123 E1, the follower's root phase 100-135 ms against ~56). Bytes
 /// past the last sealed chunk are read from a tail buffer.
+#[cfg(not(test))]
 const CHUNK_BYTES: usize = 256 << 20;
+/// Small in the unit tests, so a few blocks cross several seals.
+#[cfg(test)]
+const CHUNK_BYTES: usize = 1 << 20;
 
 /// Chunks sealed since the process started, and the microseconds their
 /// sealing took (the tail's write, the mapping), for a caller that wants
@@ -139,6 +143,23 @@ impl Offsets {
         }
         self.segments[slot >> Self::BITS][slot & Self::MASK] = offset;
         self.len += 1;
+    }
+
+    /// Appends `offsets` in order: what one [`Self::push`] each leaves, a
+    /// segment's run at a time.
+    #[cfg(feature = "rayon")]
+    fn extend_from_slice(&mut self, mut offsets: &[u64]) {
+        while !offsets.is_empty() {
+            let slot = self.len;
+            if slot >> Self::BITS == self.segments.len() {
+                self.segments.push(crate::prefault::take_offset_segment());
+            }
+            let at = slot & Self::MASK;
+            let run = (crate::prefault::OFFSET_SEGMENT_SLOTS - at).min(offsets.len());
+            self.segments[slot >> Self::BITS][at..at + run].copy_from_slice(&offsets[..run]);
+            self.len += run;
+            offsets = &offsets[run..];
+        }
     }
 
     fn truncate(&mut self, len: usize) {
@@ -455,6 +476,111 @@ impl FileEntries {
         sealed
     }
 
+    /// [`Self::push_batch`] with the record bytes copied on the worker pool
+    /// (`N42_QMDB_PARALLEL_APPLY`): `count` records, the `k`-th of them
+    /// `record(k)`. The records are split where `push` would seal the tail
+    /// -- before the record that would not fit in it -- and each run between
+    /// seals is laid out by its records' lengths and copied in pieces beside
+    /// each other; the offsets and the active bits are then written a run at
+    /// a time. The file, the tail, the offsets and the bits end as the same
+    /// sequence of `push` calls leaves them, and a failed seal keeps the
+    /// runs copied before it, whole.
+    #[cfg(feature = "rayon")]
+    fn push_batch_parallel<'a>(&mut self, count: usize, record: &(impl Fn(usize) -> (&'a Hash, &'a [u8]) + Sync)) -> io::Result<()> {
+        use rayon::prelude::*;
+        let lens: Vec<usize> = (0..count).into_par_iter().with_min_len(4096).map(|k| KEY_LEN + LEN_LEN + record(k).1.len()).collect();
+        let mut from = 0usize;
+        while from < count {
+            // The run that fits in the tail before `push` would seal it.
+            let room = CHUNK_BYTES.saturating_sub(self.tail.len());
+            let (mut to, mut bytes) = (from, 0usize);
+            while to < count && (bytes + lens[to] <= room || (to == from && self.tail.is_empty())) {
+                bytes += lens[to];
+                to += 1;
+            }
+            if to == from {
+                self.seal_tail()?;
+                continue;
+            }
+            if self.tail.capacity() < CHUNK_BYTES {
+                self.tail.reserve_exact(CHUNK_BYTES.max(self.tail.len() + bytes) - self.tail.len());
+            }
+            self.tail.reserve(bytes);
+            self.populate_ahead();
+            crate::prefault::note_append(self.populate_epoch, self.tail.len() + bytes);
+            // Each record's start within the run, and the run cut into
+            // pieces of whole records for the pool.
+            let mut starts: Vec<u64> = Vec::with_capacity(to - from);
+            let mut at = 0usize;
+            for len in &lens[from..to] {
+                starts.push(at as u64);
+                at += len;
+            }
+            const PIECE: usize = 2048;
+            let base = self.tail.len();
+            {
+                let mut spare = &mut self.tail.spare_capacity_mut()[..bytes];
+                let mut pieces = Vec::with_capacity((to - from).div_ceil(PIECE));
+                let mut first = from;
+                while first < to {
+                    let last = (first + PIECE).min(to);
+                    let piece_bytes = lens[first..last].iter().sum::<usize>();
+                    let (head, rest) = std::mem::take(&mut spare).split_at_mut(piece_bytes);
+                    pieces.push((first, last, head));
+                    spare = rest;
+                    first = last;
+                }
+                pieces.into_par_iter().for_each(|(first, last, out)| {
+                    let mut at = 0usize;
+                    for k in first..last {
+                        let (key, value) = record(k);
+                        out[at..at + KEY_LEN].write_copy_of_slice(key);
+                        at += KEY_LEN;
+                        out[at..at + LEN_LEN].write_copy_of_slice(&(value.len() as u32).to_le_bytes());
+                        at += LEN_LEN;
+                        out[at..at + value.len()].write_copy_of_slice(value);
+                        at += value.len();
+                    }
+                });
+            }
+            // SAFETY: `reserve` above made room for `bytes` past the length,
+            // and the pieces cover `[base, base + bytes)` exactly -- each
+            // piece is its records' summed lengths, cut in order -- and every
+            // byte of a piece was written by the loop that owned it (a record
+            // writes its key, its length and its value, `lens[k]` bytes in
+            // all). A panic in a piece propagates out of `for_each` before
+            // this line, leaving the length where it was.
+            unsafe { self.tail.set_len(base + bytes) };
+            let first_slot = self.offsets.len();
+            let first_byte = self.len_bytes;
+            for start in &mut starts {
+                *start += first_byte;
+            }
+            self.offsets.extend_from_slice(&starts);
+            self.len_bytes += bytes as u64;
+            self.set_active_run(first_slot, first_slot + (to - from));
+            from = to;
+        }
+        Ok(())
+    }
+
+    /// Marks slots `[from, to)` live, a word at a time, growing the bits as
+    /// `push` does.
+    #[cfg(feature = "rayon")]
+    fn set_active_run(&mut self, from: usize, to: usize) {
+        if self.active.len() * 64 < to {
+            self.active.resize(to.div_ceil(64), 0);
+        }
+        let mut slot = from;
+        while slot < to {
+            let bit = slot % 64;
+            let run = (64 - bit).min(to - slot);
+            let mask = if run == 64 { u64::MAX } else { ((1u64 << run) - 1) << bit };
+            self.active[slot / 64] |= mask;
+            slot += run;
+        }
+    }
+
     /// Asks the append populate thread to populate the tail buffer's pages
     /// ahead of the append cursor (`N42_QMDB_APPEND_AHEAD_MB`), so the
     /// appends a block's apply makes never fault.
@@ -723,6 +849,28 @@ impl Entries {
                 Ok(())
             }
             Self::File(file) => file.push_batch(records, faults),
+        }
+    }
+
+    /// [`Self::push_batch`] for `count` records, the `k`-th of them
+    /// `record(k)`, written on the worker pool (`N42_QMDB_PARALLEL_APPLY`):
+    /// the same entries in the same order.
+    #[cfg(feature = "rayon")]
+    pub(crate) fn push_batch_parallel<'a>(
+        &mut self,
+        count: usize,
+        record: &(impl Fn(usize) -> (&'a Hash, &'a [u8]) + Sync),
+    ) -> io::Result<()> {
+        use rayon::prelude::*;
+        match self {
+            Self::Heap(entries) => {
+                entries.par_extend((0..count).into_par_iter().with_min_len(1024).map(|k| {
+                    let (key, value) = record(k);
+                    Entry { key: *key, value: value.to_vec(), active: true }
+                }));
+                Ok(())
+            }
+            Self::File(file) => file.push_batch_parallel(count, record),
         }
     }
 

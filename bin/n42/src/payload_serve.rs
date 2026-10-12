@@ -638,6 +638,9 @@ where
     match handed {
         Ok(Ok(true)) => {
             crate::follower_import::note_import_landed();
+            // The hand-off took the build: its pin (`pin_sealed`, set when
+            // its sealed header arrived) is released.
+            n42_engine_types::built_executions::handed_off(built_hash);
             if let (Some(prune), Some(hashes)) = (reuse.prune_pool.clone(), pool_prune_hashes) {
                 let count = hashes.len();
                 let pruned_at = std::time::Instant::now();
@@ -683,6 +686,8 @@ where
 /// Returns the status, the block number, and the hand-off and payload
 /// assembly times in milliseconds; an `Err` is the message to send back
 /// (`unknown build`), on which the caller sends the payload the old way.
+/// Under `N42_ANSWER_AT_INSERT` the status is VALID at the hand-off and the
+/// `newPayload` runs behind the answer (see [`crate::answer_at_insert`]).
 async fn own_block_by_header<T>(
     reuse: Option<&OwnBlockReuse>,
     engine: &ConsensusEngineHandle<T>,
@@ -690,6 +695,22 @@ async fn own_block_by_header<T>(
     // The import-once owner of this block (`N42_IMPORT_ONCE`): told the block
     // is checked as soon as the build is known to be this block's.
     once: Option<&crate::import_once::Owner>,
+) -> Result<(alloy_rpc_types_engine::PayloadStatus, u64, u64, u64), String>
+where
+    T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
+{
+    own_block_by_header_with(reuse, engine, frame, once, crate::answer_at_insert::active()).await
+}
+
+/// [`own_block_by_header`] with the deferred `newPayload` tracker given:
+/// `Some` answers at the hand-off (`N42_ANSWER_AT_INSERT`), `None` answers
+/// with the engine's `newPayload` status as before.
+async fn own_block_by_header_with<T>(
+    reuse: Option<&OwnBlockReuse>,
+    engine: &ConsensusEngineHandle<T>,
+    frame: &[u8],
+    once: Option<&crate::import_once::Owner>,
+    deferred: Option<&std::sync::Arc<crate::answer_at_insert::Deferred>>,
 ) -> Result<(alloy_rpc_types_engine::PayloadStatus, u64, u64, u64), String>
 where
     T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
@@ -724,7 +745,7 @@ where
     // result: the check a follower's import makes holds by construction,
     // without waiting for a build sealed before its finish.
     if let Some(once) = once
-        && n42_engine_types::built_executions::find_kept_sealed(
+        && n42_engine_types::built_executions::find_kept_sealed_header(
             parent_hash,
             number,
             state_root,
@@ -824,6 +845,23 @@ where
     let data = n42_h2_consensus::execution_data_from_raw_parts(sealed_hash, &header, raw_transactions, withdrawals, None);
     let payload_ms = payload_at.elapsed().as_millis() as u64;
     stage.at(4);
+    if let Some(deferred) = deferred {
+        // `N42_ANSWER_AT_INSERT`: the header-only `newPayload` goes on the
+        // engine's channel now, behind the insert and ahead of whatever the
+        // validator sends once it hears the answer (its commit forkchoice),
+        // and only its reply is left for later. The answer waits for the
+        // previous own block's deferred pass and fails if any pass failed
+        // (crate::answer_at_insert, "Ordering" and "Failure").
+        let reply = crate::answer_at_insert::dispatch(engine, data);
+        let previous = deferred.track(number, sealed_hash, reply);
+        drop(stage);
+        deferred.settle(previous).await?;
+        let status = alloy_rpc_types_engine::PayloadStatus::new(
+            alloy_rpc_types_engine::PayloadStatusEnum::Valid,
+            Some(sealed_hash),
+        );
+        return Ok((status, header.number, handoff_ms, payload_ms));
+    }
     let status = engine.new_payload(data).await.map_err(|e| format!("engine: {e}"))?;
     drop(stage);
     if !status.status.is_valid() {
@@ -892,13 +930,24 @@ async fn build_on_own_block(
         return Err("unknown build: block access list".to_owned());
     }
     let mut times = BuildOnOwnTimes { decode_ms: decode_at.elapsed().as_millis() as u64, ..Default::default() };
+    // Consensus has sealed the parent: if it is one of this layer's builds it
+    // is pinned in the build store until its own import hands it off, so the
+    // builds that follow cannot evict it first (loop351 stage aj).
+    n42_engine_types::built_executions::pin_sealed(
+        header.parent_hash,
+        header.number,
+        header.state_root,
+        header.receipts_root,
+        header.gas_used,
+        Some(header.transactions_root),
+    );
     // A parent this node did not build -- the previous leader's last block,
     // at a tenure's first build -- is not in the build registry; with the
     // flag it is built on the output this node's follower execution of it
     // published, instead of the request being refused and the leader going
     // through the forkchoice and the payload job.
     if tenure_first_on_output()
-        && n42_engine_types::built_executions::find_kept_sealed(
+        && n42_engine_types::built_executions::find_kept_sealed_header(
             header.parent_hash,
             header.number,
             header.state_root,
@@ -2404,7 +2453,7 @@ async fn refuse_held(stream: &mut TcpStream, out: &mut Vec<u8>) -> std::io::Resu
 /// every own block on a shared layer miss and be executed a second time
 /// (loop328/330: 1,175 of 1,179 built blocks).
 fn is_own_build(header: &alloy_consensus::Header) -> bool {
-    let Some((_, built, _)) = n42_engine_types::built_executions::find_kept_sealed(
+    let Some((_, built, built_withdrawals)) = n42_engine_types::built_executions::find_kept_sealed_header(
         header.parent_hash,
         header.number,
         header.state_root,
@@ -2414,13 +2463,13 @@ fn is_own_build(header: &alloy_consensus::Header) -> bool {
     ) else {
         return false;
     };
-    let withdrawals_match = built.header().withdrawals_root == header.withdrawals_root
-        || built.header().withdrawals_root.is_some() && {
-            let withdrawals = built.body().withdrawals.as_ref().map_or(&[][..], |w| w.as_slice());
+    let withdrawals_match = built.withdrawals_root == header.withdrawals_root
+        || built.withdrawals_root.is_some() && {
+            let withdrawals = built_withdrawals.as_deref().unwrap_or_default();
             header.withdrawals_root
                 == Some(n42_h2_consensus::gov5_rewards_root(n42_h2_consensus::withdrawals_to_rewards(withdrawals)))
         };
-    withdrawals_match && build_executes_as_sealed(built.header(), None, header, None)
+    withdrawals_match && build_executes_as_sealed(&built, None, header, None)
 }
 
 /// The sealed header a follower's payload describes when it is one of this
@@ -2428,7 +2477,7 @@ fn is_own_build(header: &alloy_consensus::Header) -> bool {
 /// shape the seal may have given it, and proved by the payload's hash.
 fn own_sealed_header_of_payload(data: &alloy_rpc_types_engine::ExecutionData) -> Option<alloy_consensus::Header> {
     let v1 = data.payload.as_v1();
-    let (_, built, _) = n42_engine_types::built_executions::find_kept_sealed(
+    let (_, built, _) = n42_engine_types::built_executions::find_kept_sealed_header(
         v1.parent_hash,
         v1.block_number,
         v1.state_root,
@@ -2436,7 +2485,7 @@ fn own_sealed_header_of_payload(data: &alloy_rpc_types_engine::ExecutionData) ->
         v1.gas_used,
         None,
     )?;
-    let sealed = sealed_header_from_fields(data, built.header())?;
+    let sealed = sealed_header_from_fields(data, &built)?;
     (sealed.hash() == data.payload.block_hash() && is_own_build(sealed.header())).then(|| sealed.header().clone())
 }
 
@@ -2558,6 +2607,7 @@ where
         import_once = once.is_some(),
         road_runtime = crate::road_runtime::enabled(),
         dispatch_wait = crate::road_runtime::measure_dispatch_wait(),
+        answer_at_insert = crate::answer_at_insert::enabled(),
         "raw payload channel listening"
     );
     loop {

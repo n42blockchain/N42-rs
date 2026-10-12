@@ -294,6 +294,61 @@ fn a_persisted_block_the_view_cannot_place_invalidates_it_and_releases_the_recor
 }
 
 #[test]
+fn a_stale_build_below_the_persisted_blocks_does_not_invalidate_the_view() {
+    // loop351 X9j: a build on an old parent (block 1020 while 1031 was the
+    // tip) moved the tree off the canonical path, and persisting 1021 in that
+    // window invalidated the view for good.
+    let (state, view, hashes) = viewed("view-stale-build", 4);
+    state.on_persisted(&[(1, hashes[1])]);
+    assert_eq!(view.head(), (1, hashes[1]));
+    // A side block on block 1 (builds there are refused; an import is not)
+    // leaves the tree on the sibling the same way.
+    state
+        .insert_block_operations(hashes[1], B256::repeat_byte(0x59), 2, changes_for(9).operations())
+        .expect("a side block on block 1");
+    state.on_persisted(&[(2, hashes[2]), (3, hashes[3])]);
+    assert!(view.is_valid(), "the persisted blocks were listed after standing the tree back on them");
+    assert_eq!(view.head(), (3, hashes[3]));
+    let seven = Address::from_word(B256::from(U256::from(7u64)));
+    let answered = view.account(&seven, 3).expect("answered").expect("present");
+    assert_eq!((answered.nonce, answered.balance), (3, U256::from(9u64)));
+    // The tip still computes on top of the canonical chain.
+    let (hash, _) = advance(&state, 5, hashes[4]);
+    state.on_persisted(&[(4, hashes[4]), (5, hash)]);
+    assert!(view.is_valid());
+    assert_eq!(view.head(), (5, hash));
+}
+
+#[test]
+fn a_build_on_a_parent_below_the_head_is_refused_and_the_view_stays_valid() {
+    for offlock in [false, true] {
+        let (state, view, hashes) = viewed(if offlock { "view-refuse-offlock" } else { "view-refuse" }, 4);
+        state.set_compute_offlock(offlock);
+        state.on_persisted(&[(1, hashes[1])]);
+        assert!(!state.refuse_stale_builds(), "off by default: a fork on an older block builds");
+        state.set_refuse_stale_builds(true);
+        let refused = state.compute_operations(hashes[1], changes_for(9).operations()).unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                NodeStateError::State(StateError::StaleBuildParent { parent_number: 1, head_number: 4, persisted: Some(1), .. })
+            ),
+            "{refused}"
+        );
+        assert!(matches!(
+            state.compute_build(hashes[2], &changes_for(9)),
+            Err(NodeStateError::State(StateError::StaleBuildParent { parent_number: 2, .. }))
+        ));
+        assert!(view.is_valid(), "a refused build touches neither the tree nor the view");
+        state.on_persisted(&[(2, hashes[2]), (3, hashes[3])]);
+        assert!(view.is_valid());
+        assert_eq!(view.head(), (3, hashes[3]));
+        // The head itself still builds.
+        assert!(state.compute_operations(hashes[4], changes_for(5).operations()).is_ok());
+    }
+}
+
+#[test]
 fn an_unwind_below_the_view_steps_it_back_and_one_above_it_changes_nothing() {
     let (state, view, hashes) = viewed("view-unwind", 6);
     for number in 1..=5u64 {
@@ -569,6 +624,23 @@ fn file_from_operations(state: &QmdbNodeState, number: u64, parent: B256) -> B25
         state.insert(hash_of(number), number, prepared).expect("insert");
         root
     }
+}
+
+#[test]
+fn the_occupancy_names_the_lease_and_the_lock_holders() {
+    let (leased, _view, genesis) = switched("occupancy-leased", true, true);
+    let mut parent = genesis;
+    for number in 1..=4u64 {
+        file_from_operations(&leased, number, parent);
+        leased.on_canonical(hash_of(number)).expect("canonical");
+        parent = hash_of(number);
+    }
+    let occupancy = leased.occupancy();
+    let of = |label: &str| occupancy.iter().find(|(name, _)| *name == label).map(|(_, sums)| *sums);
+    let lease = of("tree_lease").expect("the lease is counted");
+    assert_eq!(lease.holds, 4, "every root of the four on a leased tree");
+    assert_eq!(of("lease_return").expect("its return holds the lock").holds, 4);
+    assert_eq!(of("on_canonical").expect("the canonical hold").holds, 4);
 }
 
 #[test]

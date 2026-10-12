@@ -28,7 +28,7 @@ cleanup() {
 trap cleanup EXIT
 [ -n "${LOOP351_NAT:-}" ] && NAT=$LOOP351_NAT   # a dry run from another checkout plans with the real binaries
 if [ "${LOOP351_DRY:-0}" != 1 ]; then
-if ! grep -q 'N42_ENGINE_EXEC_CACHE' crates/n42/qmdb-reth/src/exec_cache.rs || ! grep -q 'N42_SETTLEMENT_TAGS' crates/n42/h2-execution/src/settlement.rs || ! grep -q 'fn vote_before_slot' crates/n42/h2-execution/src/driver.rs || ! grep -q 'F7_PIN_SWAP' scripts/fleet7-env.sh || ! grep -q 'fn parse_in_flight' crates/n42/h2-execution/src/driver.rs || ! grep -q 'held_at_arrival' bin/n42/src/follower_import.rs crates/n42/h2-execution/src/driver.rs || ! grep -q 'fn push_reverted' crates/n42/tx-queue/src/lib.rs || ! grep -q 'fn fold_runs' bin/n42/src/follower_import.rs || ! grep -q 'fn commit_fcu_async' crates/n42/h2-execution/src/driver.rs || ! grep -q 'f7_check_validator_count' scripts/fleet7-env.sh || ! grep -q 'fn recovered_by_hashes' crates/n42/tx-queue/src/lib.rs || ! grep -q 'fn free_async' crates/n42/engine-types/src/parallel_transfer.rs || ! grep -q 'fn senders_from_queue' crates/n42/tx-queue/src/lib.rs || ! grep -q 'parent_engine_wait' bin/n42/src/payload_serve.rs || ! grep -q 'fn ancestry_of' bin/n42/src/follower_import.rs || ! grep -q 'root_wait' bin/n42/src/payload_serve.rs || ! grep -q 'fn seal_shortfall' crates/n42/engine-types/src/payload.rs || ! grep -q 'fn gate_len' crates/n42/tx-queue/src/lib.rs || [ ! -r crates/n42/engine-types/src/canonical_head.rs ] || ! grep -q 'fn with_park_lanes' crates/n42/tx-queue/src/lib.rs || ! grep -q 'fn pruned_through' crates/n42/tx-queue/src/lib.rs || ! grep -q 'N42_BUILD_SKIP_DECIDED' crates/n42/engine-types/src/payload.rs || ! grep -q 'N42_STATE_AFTER_PULL' crates/n42/engine-types/src/payload.rs || ! grep -q 'N42_GRAFT_PREFAULT' crates/n42/engine-types/src/parallel_transfer.rs || grep -q 'refuse_stale_parent() {\s*$' /dev/null || ! grep -q 'replay_ms' crates/n42/qmdb-reth/src/node_state.rs || ! grep -q 'leader loop between commit and preamble' crates/n42/h2-node/src/service.rs || [ ! -r crates/chainspec/res/genesis/n42_fleet7_bench.json ] || ! grep -q 'F7_EL_MAP' scripts/fleet7-env.sh || ! grep -q 'F7_VAL_CPUS' scripts/fleet7-env.sh || ! grep -rq 'N42_IMPORT_ONCE' bin/n42/src crates/n42 || ! grep -q 'other_ms' bin/n42/src/follower_import.rs || ! grep -q 'fn own_block_imported' crates/n42/h2-execution/src/driver.rs || ! grep -q 'fn take_chained' crates/n42/h2-el-rpc/src/engine.rs || ! grep -q 'fn parent_executed_fields_or_built' crates/n42/engine-types/src/hotstuff_consensus.rs || ! grep -q 'fn state_at_soon' crates/n42/engine-types/src/direct_build.rs || ! grep -q 'fn convert_compact_body_to_block' crates/n42/engine-types/src/engine_validator.rs || ! grep -q 'fn get_by_hashes' crates/n42/tx-queue/src/lib.rs || ! grep -q 'fn index_and_stage' crates/n42/tx-queue/src/lib.rs || ! grep -q 'NEED_TXNS' crates/n42/h2-execution/src/raw_engine.rs || ! grep -q 'gate_forced' crates/n42/tx-ingest/src/lib.rs || ! grep -q 'fn import_for_validator' bin/n42/src/payload_serve.rs || ! grep -q 'FOREIGN_BODY' crates/n42/h2-execution/src/raw_engine.rs || ! grep -q 'fn note_reader_lag' crates/n42/qmdb-reth/src/node_state.rs || ! grep -q 'fn two_roads' bin/n42/src/follower_import.rs || ! grep -q 'fn follower_graft_stream' crates/n42/engine-types/src/parallel_transfer.rs || ! grep -q 'fn sort_reverts' crates/n42/engine-types/src/parallel_transfer.rs || ! grep -q 'fn graft_stream' crates/n42/engine-types/src/parallel_transfer.rs || ! grep -q 'install_staged' crates/n42/engine-types/src/payload.rs || ! grep -q 'fn direct_receipts_enabled' crates/n42/engine-types/src/payload.rs || ! grep -q 'tx_count += executed_count as u64' crates/n42/engine-types/src/payload.rs || ! grep -q 'fn batch_equation_holds' crates/n42/tx-types/src/alt_sig.rs || ! grep -q 'spawn_scoped(scope, root_job)' bin/n42/src/follower_import.rs || ! grep -q 'f7_fleet_cpus' scripts/fleet7-env.sh || ! grep -q 'f7_trace_of' scripts/fleet7-env.sh || [ ! -r crates/chainspec/res/genesis/n42_fleet7_bench_v21.json ] || [ ! -r crates/chainspec/res/genesis/n42_fleet7_bench_v99.json ] || [ ! -r scripts/fleet7-runs/manykeys350.py ] || ! grep -q N42_DEFERRED_IN_FLIGHT crates/n42/h2-execution/src/driver.rs || ! grep -q N42_CHECK_AHEAD_UNHELD crates/n42/h2-node/src/service.rs || ! grep -q N42_BUILT_KEEP crates/n42/engine-types/src/built_executions.rs || ! grep -q N42_QMDB_RENAME_DEFER crates/n42/engine-types/src/chain_alias.rs || ! grep -q N42_HANDOFF_HEAD_MOVE bin/n42/src/payload_serve.rs || ! grep -q N42_HANDOFF_NO_CLONE crates/n42/engine-types/src/built_executions.rs || ! grep -q N42_HANDOFF_MOVE_BODY crates/n42/engine-types/src/built_executions.rs || ! grep -q N42_CANON_NOTIFY_LEAN crates/chain-state/src/in_memory.rs || ! grep -q N42_QUEUE_OFFLOCK crates/n42/tx-queue/src/lib.rs || ! grep -q N42_QMDB_COMPUTE_OFFLOCK crates/n42/qmdb-reth/src/node_state.rs || ! grep -q N42_QMDB_PERSIST_BATCH crates/n42/qmdb-reth/src/node_state.rs || ! grep -q N42_QUEUE_PLAN_SNAPSHOT crates/n42/tx-queue/src/snapshot.rs || ! grep -q N42_TX_QUEUE_DRAINER bin/n42/src/main.rs || ! grep -q N42_OUTPUT_INCREMENTAL crates/n42/engine-types/src/output_shards.rs || ! grep -q N42_SHARD_MIX crates/n42/engine-types/src/output_shards.rs || ! grep -q N42_BUILD_AHEAD_GATE crates/n42/h2-el-rpc/src/engine.rs || ! grep -q N42_QMDB_CANONICAL_DEFER crates/n42/qmdb-reth/src/node_state.rs; then echo "INSTRUMENTATION MISSING in the working tree; nothing built"; echo ALLDONE; exit 1; fi
+if ! grep -q 'N42_ENGINE_EXEC_CACHE' crates/n42/qmdb-reth/src/exec_cache.rs || ! grep -q 'N42_SETTLEMENT_TAGS' crates/n42/h2-execution/src/settlement.rs || ! grep -q 'fn vote_before_slot' crates/n42/h2-execution/src/driver.rs || ! grep -q 'F7_PIN_SWAP' scripts/fleet7-env.sh || ! grep -q 'fn parse_in_flight' crates/n42/h2-execution/src/driver.rs || ! grep -q 'held_at_arrival' bin/n42/src/follower_import.rs crates/n42/h2-execution/src/driver.rs || ! grep -q 'fn push_reverted' crates/n42/tx-queue/src/lib.rs || ! grep -q 'fn fold_runs' bin/n42/src/follower_import.rs || ! grep -q 'fn commit_fcu_async' crates/n42/h2-execution/src/driver.rs || ! grep -q 'f7_check_validator_count' scripts/fleet7-env.sh || ! grep -q 'fn recovered_by_hashes' crates/n42/tx-queue/src/lib.rs || ! grep -q 'fn free_async' crates/n42/engine-types/src/parallel_transfer.rs || ! grep -q 'fn senders_from_queue' crates/n42/tx-queue/src/lib.rs || ! grep -q 'parent_engine_wait' bin/n42/src/payload_serve.rs || ! grep -q 'fn ancestry_of' bin/n42/src/follower_import.rs || ! grep -q 'root_wait' bin/n42/src/payload_serve.rs || ! grep -q 'fn seal_shortfall' crates/n42/engine-types/src/payload.rs || ! grep -q 'fn gate_len' crates/n42/tx-queue/src/lib.rs || [ ! -r crates/n42/engine-types/src/canonical_head.rs ] || ! grep -q 'fn with_park_lanes' crates/n42/tx-queue/src/lib.rs || ! grep -q 'fn pruned_through' crates/n42/tx-queue/src/lib.rs || ! grep -q 'N42_BUILD_SKIP_DECIDED' crates/n42/engine-types/src/payload.rs || ! grep -q 'N42_STATE_AFTER_PULL' crates/n42/engine-types/src/payload.rs || ! grep -q 'N42_GRAFT_PREFAULT' crates/n42/engine-types/src/parallel_transfer.rs || grep -q 'refuse_stale_parent() {\s*$' /dev/null || ! grep -q 'replay_ms' crates/n42/qmdb-reth/src/node_state.rs || ! grep -q 'leader loop between commit and preamble' crates/n42/h2-node/src/service.rs || [ ! -r crates/chainspec/res/genesis/n42_fleet7_bench.json ] || ! grep -q 'F7_EL_MAP' scripts/fleet7-env.sh || ! grep -q 'F7_VAL_CPUS' scripts/fleet7-env.sh || ! grep -rq 'N42_IMPORT_ONCE' bin/n42/src crates/n42 || ! grep -q 'other_ms' bin/n42/src/follower_import.rs || ! grep -q 'fn own_block_imported' crates/n42/h2-execution/src/driver.rs || ! grep -q 'fn take_chained' crates/n42/h2-el-rpc/src/engine.rs || ! grep -q 'fn parent_executed_fields_or_built' crates/n42/engine-types/src/hotstuff_consensus.rs || ! grep -q 'fn state_at_soon' crates/n42/engine-types/src/direct_build.rs || ! grep -q 'fn convert_compact_body_to_block' crates/n42/engine-types/src/engine_validator.rs || ! grep -q 'fn get_by_hashes' crates/n42/tx-queue/src/lib.rs || ! grep -q 'fn index_and_stage' crates/n42/tx-queue/src/lib.rs || ! grep -q 'NEED_TXNS' crates/n42/h2-execution/src/raw_engine.rs || ! grep -q 'gate_forced' crates/n42/tx-ingest/src/lib.rs || ! grep -q 'fn import_for_validator' bin/n42/src/payload_serve.rs || ! grep -q 'FOREIGN_BODY' crates/n42/h2-execution/src/raw_engine.rs || ! grep -q 'fn note_reader_lag' crates/n42/qmdb-reth/src/node_state.rs || ! grep -q 'fn two_roads' bin/n42/src/follower_import.rs || ! grep -q 'fn follower_graft_stream' crates/n42/engine-types/src/parallel_transfer.rs || ! grep -q 'fn sort_reverts' crates/n42/engine-types/src/parallel_transfer.rs || ! grep -q 'fn graft_stream' crates/n42/engine-types/src/parallel_transfer.rs || ! grep -q 'install_staged' crates/n42/engine-types/src/payload.rs || ! grep -q 'fn direct_receipts_enabled' crates/n42/engine-types/src/payload.rs || ! grep -q 'tx_count += executed_count as u64' crates/n42/engine-types/src/payload.rs || ! grep -q 'fn batch_equation_holds' crates/n42/tx-types/src/alt_sig.rs || ! grep -q 'spawn_scoped(scope, root_job)' bin/n42/src/follower_import.rs || ! grep -q 'f7_fleet_cpus' scripts/fleet7-env.sh || ! grep -q 'f7_trace_of' scripts/fleet7-env.sh || [ ! -r crates/chainspec/res/genesis/n42_fleet7_bench_v21.json ] || [ ! -r crates/chainspec/res/genesis/n42_fleet7_bench_v99.json ] || [ ! -r scripts/fleet7-runs/manykeys350.py ] || ! grep -q N42_DEFERRED_IN_FLIGHT crates/n42/h2-execution/src/driver.rs || ! grep -q N42_CHECK_AHEAD_UNHELD crates/n42/h2-node/src/service.rs || ! grep -q N42_BUILT_KEEP crates/n42/engine-types/src/built_executions.rs || ! grep -q N42_QMDB_RENAME_DEFER crates/n42/engine-types/src/chain_alias.rs || ! grep -q N42_HANDOFF_HEAD_MOVE bin/n42/src/payload_serve.rs || ! grep -q N42_HANDOFF_NO_CLONE crates/n42/engine-types/src/built_executions.rs || ! grep -q N42_HANDOFF_MOVE_BODY crates/n42/engine-types/src/built_executions.rs || ! grep -q N42_CANON_NOTIFY_LEAN crates/chain-state/src/in_memory.rs || ! grep -q N42_QUEUE_OFFLOCK crates/n42/tx-queue/src/lib.rs || ! grep -q N42_QMDB_COMPUTE_OFFLOCK crates/n42/qmdb-reth/src/node_state.rs || ! grep -q N42_QMDB_PERSIST_BATCH crates/n42/qmdb-reth/src/node_state.rs || ! grep -q N42_QUEUE_PLAN_SNAPSHOT crates/n42/tx-queue/src/snapshot.rs || ! grep -q N42_TX_QUEUE_DRAINER bin/n42/src/main.rs || ! grep -q N42_OUTPUT_INCREMENTAL crates/n42/engine-types/src/output_shards.rs || ! grep -q N42_SHARD_MIX crates/n42/engine-types/src/output_shards.rs || ! grep -q N42_BUILD_AHEAD_GATE crates/n42/h2-el-rpc/src/engine.rs || ! grep -q N42_QMDB_CANONICAL_DEFER crates/n42/qmdb-reth/src/node_state.rs || ! grep -q N42_PLAN_AHEAD_WAIT_MS crates/n42/tx-queue/src/lib.rs || ! grep -q N42_FRAME_SWEEP_AT_TAKE crates/n42/tx-queue/src/frames.rs || ! grep -q N42_PLAN_AHEAD_PARTS crates/n42/engine-types/src/frame_blocks.rs || ! grep -q 'N42_CORE_LAYOUT=isolate' crates/n42/core-layout/src/lib.rs || ! grep -q 'n42_core_layout::init' bin/n42/src/main.rs || ! grep -q N42_CORE_LAYOUT_SIBLINGS crates/n42/core-layout/src/lib.rs || ! grep -q N42_CORE_LAYOUT_BEHIND crates/n42/core-layout/src/lib.rs || ! grep -q 'Set::Behind))' crates/n42/engine-types/src/parallel_transfer.rs || ! grep -q N42_MERGE_SPLIT crates/n42/engine-types/src/output_shards.rs || ! grep -q N42_ANSWER_AT_INSERT bin/n42/src/answer_at_insert.rs || ! grep -q N42_BUILD_MLP crates/n42/engine-types/src/parallel_transfer.rs || ! grep -q N42_PLAN_AHEAD_WARM crates/n42/engine-types/src/warm_ahead.rs; then echo "INSTRUMENTATION MISSING in the working tree; nothing built"; echo ALLDONE; exit 1; fi
 T=$S/tests-loop351.log; : > $T
 BUILD_FROM=$(date -u +%s)
 # the 40G scope needs the user systemd manager; when its bus is gone (it was, after claim a on 2026-10-08) run the test plain: the tests fit the box
@@ -114,6 +114,13 @@ run() { local tag=$1; shift
   ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; exec env F7_EL_MAP=$EL_MAP python3 scripts/fleet7-runs/memsample.py $STRIP/mem.log $NEL ) > /dev/null 2>&1 & MS=$!
   case $tag in *DPROF) ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; sleep 30; bash scripts/fleet7-offcpu.sh --node 0 --secs 10 $S/offcpu-$tag > $S/offcpu-$tag.run.out 2>&1 ) & ;; esac
   case $tag in *7PROF) ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; sleep 45; F7_BIN=$WT/target/profiling-build/profiling bash scripts/fleet7-profile.sh 0 $S/perf-$tag 10 > $S/perf-$tag.run.out 2>&1 ) & ;; esac
+  case $tag in *X11prof) ( n=0; until grep -q 'first full block at epoch' $S/bench-$tag.out 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 600 ] && exit 0; done; sleep 4
+     p=$(ps -eo pid,args | grep '/n4[2] node' | grep 'rust-fleet7-bench/node0/' | grep -v grep | awk '{print $1}' | head -1); [ -n "$p" ] || { echo "no node0 execution layer"; exit 0; }
+     tids=$(for t in /proc/$p/task/*; do case "$(cat $t/comm 2>/dev/null)" in n42-build|n42-build-*) echo ${t##*/};; esac; done | paste -sd,); echo "$tag perf on pid $p, $(echo $tids | tr , '\n' | grep -c .) n42-build threads, from $(date +%H:%M:%S)"
+     [ -n "$tids" ] || tids=""; T=${tids:+-t $tids}; [ -n "$T" ] || T="-p $p"
+     perf record -F 999 -g --call-graph dwarf,16384 $T -o $S/perf-$tag-build.data -- sleep 8; echo "cycles record exit $? at $(date +%H:%M:%S)"
+     perf record -e ls_dmnd_fills_from_sys.dram_io_all -c 200 -e ls_dmnd_fills_from_sys.all -c 2000 -e cycles -c 400000 $T -o $S/perf-$tag-miss.data -- sleep 6; echo "miss record exit $? at $(date +%H:%M:%S)"
+     ) > $S/perf-$tag.run.out 2>&1 & ;; esac
   echo "leg $tag start $(date +%H:%M:%S) load $(awk '{print $1}' /proc/loadavg)"
   local WARG=3; for kv in "$@"; do case "$kv" in F7_WINDOWS_ARG=*) WARG=${kv#*=};; esac; done
   env "$@" timeout -k 30 600 scripts/fleet7-bench.sh --tag "$tag" --windows $WARG --gasceil ${F7_GASCEIL_ARG:-3423000000} --senders ${F7_SENDERS_ARG:-6000} --pertx ${F7_PERTX_ARG:-20000} --conc ${F7_CONC_ARG:-64} --rpcbatch ${F7_RPCBATCH_ARG:-500} ${F7_OFFSET_ARG:+--offset $F7_OFFSET_ARG} ${F7_GASPRICE_ARG:+--gasprice $F7_GASPRICE_ARG} > $S/bench-$tag.out 2>&1; echo "round $tag exit $? at $(date +%H:%M:%S)"; kill $MS 2>/dev/null; wait $MS 2>/dev/null
@@ -128,7 +135,7 @@ for line in open(sys.argv[1], errors='ignore'):
 print('  '.join(f"{k.split('save_blocks')[-1].strip('_') or 'total'}={sums[k]:.1f}/{int(counts.get(k,0))}" for k in sorted(sums, key=lambda k: -sums[k])[:10]))
 PYEOF
 )"
-  e=$(pgrep -f '/n4[2] node --chain' | head -1); [ -n "$e" ] && echo "el binary: $(readlink /proc/$e/exe) env: $(tr '\0' '\n' < /proc/$e/environ | grep -E 'RENAME_DEFER|HANDOFF_|CANON_NOTIFY|QUEUE_OFFLOCK|QMDB_COMPUTE_OFFLOCK|QMDB_PERSIST_BATCH|QUEUE_PLAN_SNAPSHOT|TX_QUEUE_DRAINER|OUTPUT_INCREMENTAL|SHARD_MIX|BUILD_AHEAD|ACCOUNT_HISTORY|PERSIST_QMDB|FIELDS_AT_SEAL|LEADER_LAYERS|BUILD_ONE_WAVE|ROAD_RUNTIME|INGEST_RUNTIME|QUEUE_PRUNE_THREAD|SEAL_ON_COUNTERS|PLAN_AHEAD_BODY|BUILD_BATCHES|FREEZE_POOL|FREEZE_AFTER_SEAL|ROOT_OPS_AHEAD|SEAL_AT_EXEC|LIVE_INDEX_DEFER|QMDB_PARALLEL_WRITES|VIEW_JOURNAL_FILTER|PARALLEL_BUILD_THREADS|SF_PARALLEL_ENCODE|SF_EARLY_WRITEBACK|PERSIST_QMDB_IN_SCOPE|PLAN_AHEAD|PULL_BY_FRAMES|ANSWER_LAYOUT_ONLY|DRAIN_CHUNK|TAKE_COMPACT|FRAME_BLOCKS|RECOVER_PARALLEL|QMDB_APPEND_AHEAD_MB|QMDB_APPEND_REWALK|QMDB_UNDO_POOL|TWIG_POOL_FLOOR|F7_MEASURE_FROM_LOG|F7_FLOOD_RATE|F7_BENCH_POOL_SLOTS|N42_TX_INGEST_HIGH_WATER|F7_EL_MAP|F7_EL_CPUS|F7_VAL_CPUS|IMPORT_ONCE|RAYON_NUM_THREADS|PARALLEL_BUILD_THREADS|TOKIO_WORKER_THREADS|ENGINE_EXEC_CACHE|SETTLEMENT_TAGS|DEFERRED_IN_FLIGHT|CHECK_AHEAD_QUEUE|CANONICAL_DEFER|VOTE_BEFORE_SLOT|F7_PIN_SWAP|TAKE_COMPACT|COMPACT_BODY|BACKPRESSURE|BUILD_THROTTLE|QMDB_READS|HASHED_TABLES|EXEC_ON_PARENT_OUTPUT|BLOCK_INTERVAL|RAYON_NUM_THREADS|PARALLEL_BUILD_THREADS|INGEST_RECOVER_PARALLEL|DIRECT_RECEIPTS|MALLOC_CONF' | paste -sd' ')"
+  e=$(pgrep -f '/n4[2] node --chain' | head -1); [ -n "$e" ] && echo "el binary: $(readlink /proc/$e/exe) env: $(tr '\0' '\n' < /proc/$e/environ | grep -E 'CORE_LAYOUT|RENAME_DEFER|HANDOFF_|CANON_NOTIFY|QUEUE_OFFLOCK|QMDB_COMPUTE_OFFLOCK|QMDB_PERSIST_BATCH|QUEUE_PLAN_SNAPSHOT|TX_QUEUE_DRAINER|OUTPUT_INCREMENTAL|SHARD_MIX|BUILD_AHEAD|ACCOUNT_HISTORY|PERSIST_QMDB|FIELDS_AT_SEAL|LEADER_LAYERS|BUILD_ONE_WAVE|ROAD_RUNTIME|INGEST_RUNTIME|QUEUE_PRUNE_THREAD|SEAL_ON_COUNTERS|PLAN_AHEAD_BODY|BUILD_BATCHES|FREEZE_POOL|FREEZE_AFTER_SEAL|ROOT_OPS_AHEAD|SEAL_AT_EXEC|LIVE_INDEX_DEFER|QMDB_PARALLEL_WRITES|VIEW_JOURNAL_FILTER|PARALLEL_BUILD_THREADS|SF_PARALLEL_ENCODE|SF_EARLY_WRITEBACK|PERSIST_QMDB_IN_SCOPE|PLAN_AHEAD|PULL_BY_FRAMES|ANSWER_LAYOUT_ONLY|DRAIN_CHUNK|TAKE_COMPACT|FRAME_BLOCKS|RECOVER_PARALLEL|QMDB_APPEND_AHEAD_MB|QMDB_APPEND_REWALK|QMDB_UNDO_POOL|TWIG_POOL_FLOOR|F7_MEASURE_FROM_LOG|F7_FLOOD_RATE|F7_BENCH_POOL_SLOTS|N42_TX_INGEST_HIGH_WATER|F7_EL_MAP|F7_EL_CPUS|F7_VAL_CPUS|IMPORT_ONCE|RAYON_NUM_THREADS|PARALLEL_BUILD_THREADS|TOKIO_WORKER_THREADS|ENGINE_EXEC_CACHE|SETTLEMENT_TAGS|DEFERRED_IN_FLIGHT|CHECK_AHEAD_QUEUE|CANONICAL_DEFER|VOTE_BEFORE_SLOT|F7_PIN_SWAP|TAKE_COMPACT|COMPACT_BODY|BACKPRESSURE|BUILD_THROTTLE|QMDB_READS|HASHED_TABLES|EXEC_ON_PARENT_OUTPUT|BLOCK_INTERVAL|RAYON_NUM_THREADS|PARALLEL_BUILD_THREADS|INGEST_RECOVER_PARALLEL|DIRECT_RECEIPTS|MALLOC_CONF' | paste -sd' ')"
   v=$(pgrep -f 'h2_validato[r]' | head -1); [ -n "$v" ] && echo "validator env: $(tr '\0' '\n' < /proc/$v/environ | grep -E 'N42_QMDB_READS|N42_HASHED_TABLES|N42_BUILD_THROTTLE|TAKE_COMPACT|COMPACT_BODY|FIELDS_AT_SEAL|LEADER_LAYERS|BUILD_ONE_WAVE|ROAD_RUNTIME|INGEST_RUNTIME|QUEUE_PRUNE_THREAD|SEAL_ON_COUNTERS|PLAN_AHEAD_BODY|BUILD_BATCHES|FREEZE_POOL|FREEZE_AFTER_SEAL|ROOT_OPS_AHEAD|SEAL_AT_EXEC|LIVE_INDEX_DEFER|QMDB_PARALLEL_WRITES|VIEW_JOURNAL_FILTER|CHECK_AHEAD_UNHELD|PARALLEL_BUILD_THREADS|SF_PARALLEL_ENCODE|SF_EARLY_WRITEBACK|PERSIST_QMDB_IN_SCOPE|PLAN_AHEAD|PULL_BY_FRAMES|ANSWER_LAYOUT_ONLY|DRAIN_CHUNK|TAKE_COMPACT|FRAME_BLOCKS|RECOVER_PARALLEL|QMDB_APPEND_AHEAD_MB|QMDB_APPEND_REWALK|QMDB_UNDO_POOL|TWIG_POOL_FLOOR|F7_MEASURE_FROM_LOG|F7_FLOOD_RATE|F7_BENCH_POOL_SLOTS|N42_TX_INGEST_HIGH_WATER|F7_EL_MAP|F7_EL_CPUS|F7_VAL_CPUS|IMPORT_ONCE|RAYON_NUM_THREADS|PARALLEL_BUILD_THREADS|TOKIO_WORKER_THREADS|ENGINE_EXEC_CACHE|SETTLEMENT_TAGS|DEFERRED_IN_FLIGHT|VOTE_BEFORE_SLOT|F7_PIN_SWAP|BACKPRESSURE|ACCOUNT_HISTORY|PERSIST_QMDB' | paste -sd' ')"
   wait
   STRIP=$S/strip-$tag; mkdir -p $STRIP; cat $B/node*/el.log | sed -r 's/\x1b\[[0-9;]*m//g' > $STRIP/el.log; cat $B/node{0,1,2,3,4,5,6}/v.log | sed -r 's/\x1b\[[0-9;]*m//g' > $STRIP/v.log
@@ -267,7 +274,7 @@ legf() {
   local tag=$1; shift
   leg $tag "$@"
   [ -f $B/bench-loop351$tag/round.txt ] || return
-  python3 scripts/fleet7-runs/feedcheck335.py loop351$tag; python3 scripts/fleet7-runs/feed337.py loop351$tag 2>&1 | cut -c1-420; python3 scripts/fleet7-runs/feed338.py loop351$tag 2>&1 | cut -c1-900; python3 scripts/fleet7-runs/prune337.py loop351$tag 2>&1 | cut -c1-400; python3 scripts/fleet7-runs/plan339.py loop351$tag 2>&1 | cut -c1-420; python3 scripts/fleet7-runs/persist340.py loop351$tag 2>&1 | cut -c1-900; python3 scripts/fleet7-runs/fields346.py loop351$tag 2>&1 | cut -c1-4200; python3 scripts/fleet7-runs/voteroad346.py loop351$tag 2>&1 | cut -c1-420; python3 scripts/fleet7-runs/threadcpu337.py report $S/tidcpu-loop351$tag.tsv 2>&1 | cut -c1-300; python3 scripts/fleet7-runs/fields336.py loop351$tag 2>&1 | cut -c1-900
+  python3 scripts/fleet7-runs/feedcheck335.py loop351$tag; python3 scripts/fleet7-runs/feed337.py loop351$tag 2>&1 | cut -c1-420; python3 scripts/fleet7-runs/feed338.py loop351$tag 2>&1 | cut -c1-900; python3 scripts/fleet7-runs/prune337.py loop351$tag 2>&1 | cut -c1-400; python3 scripts/fleet7-runs/plan339.py loop351$tag 2>&1 | cut -c1-420; python3 scripts/fleet7-runs/persist340.py loop351$tag 2>&1 | cut -c1-900; python3 scripts/fleet7-runs/fields346.py loop351$tag 2>&1 | cut -c1-4200; python3 scripts/fleet7-runs/voteroad346.py loop351$tag 2>&1 | cut -c1-420; python3 scripts/fleet7-runs/threadcpu337.py report $S/tidcpu-loop351$tag.tsv 2>&1 | cut -c1-300; python3 scripts/fleet7-runs/threadcpu337.py families $S/tidcpu-loop351$tag.tsv 2>&1 | head -30; python3 scripts/fleet7-runs/fields336.py loop351$tag 2>&1 | cut -c1-900
   case "$*" in *PLAN_AHEAD_BODY=1*) bodygate loop351$tag ;; esac
   case "$*" in *n42_fleet7_bench_d2*) d2gate loop351$tag ;; esac
 }
@@ -594,7 +601,276 @@ case $STAGE in
      b7 D2S12P30T64X7SMCDb $D2 $S1 $S2 $X7 $SM $CD $T64 F7_BLOCK_INTERVAL_MS=30
      b7 D2S12P40T64X7SMCD $D2 $S1 $S2 $X7 $SM $CD $T64 F7_BLOCK_INTERVAL_MS=40
      b7 D2S12P35T64X7SMd $D2 $S1 $S2 $X7 $SM $T64 F7_BLOCK_INTERVAL_MS=35 ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac or ad)"; exit 2 ;;
+  ae) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"
+     b7 D2S12P55T64X7SM300 $D2 $S1 $S2 $X7 $SM $T64 F7_GASCEIL_ARG=6300000000 F7_BLOCK_INTERVAL_MS=55
+     b7 D2S12P70T64X7SM300 $D2 $S1 $S2 $X7 $SM $T64 F7_GASCEIL_ARG=6300000000 F7_BLOCK_INTERVAL_MS=70
+     b7 D2S12P70T64X7SM400 $D2 $S1 $S2 $X7 $SM $T64 F7_GASCEIL_ARG=8400000000 F7_BLOCK_INTERVAL_MS=70
+     b7 D2S12P90T64X7SM400 $D2 $S1 $S2 $X7 $SM $T64 F7_GASCEIL_ARG=8400000000 F7_BLOCK_INTERVAL_MS=90
+     b7 D2S12P55T64X7SM300b $D2 $S1 $S2 $X7 $SM $T64 F7_GASCEIL_ARG=6300000000 F7_BLOCK_INTERVAL_MS=55
+     b7 D2S12P70T64X7SM400b $D2 $S1 $S2 $X7 $SM $T64 F7_GASCEIL_ARG=8400000000 F7_BLOCK_INTERVAL_MS=70
+     b7 D2S12P35T64X7SMc $D2 $S1 $S2 $X7 $SM $T64 F7_BLOCK_INTERVAL_MS=35 ;;
+  af) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"
+     b7 D2S12P40T64X7SMPA $D2 $S1 $S2 $X7 $SM $PA $T64 F7_BLOCK_INTERVAL_MS=40
+     b7 D2S12P40T64X7SMPABA $D2 $S1 $S2 $X7 $SM $PA $BA $T64 F7_BLOCK_INTERVAL_MS=40
+     b7 D2S12P35T64X7SMPABA $D2 $S1 $S2 $X7 $SM $PA $BA $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P30T64X7SMPABA $D2 $S1 $S2 $X7 $SM $PA $BA $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P35T64X7SMe $D2 $S1 $S2 $X7 $SM $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X7SMPA $D2 $S1 $S2 $X7 $SM $PA $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P30T64X7SMPABAb $D2 $S1 $S2 $X7 $SM $PA $BA $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P55T64X7SMPABA300 $D2 $S1 $S2 $X7 $SM $PA $BA $T64 F7_GASCEIL_ARG=6300000000 F7_BLOCK_INTERVAL_MS=55
+     b7 D2S12P70T64X7SMPABA400 $D2 $S1 $S2 $X7 $SM $PA $BA $T64 F7_GASCEIL_ARG=8400000000 F7_BLOCK_INTERVAL_MS=70 ;;
+  ag) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"; I3="N42_DEFERRED_IN_FLIGHT=3"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"
+     b7 D2S12P35T64X9 $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9S3 $D2 $S1 $S2 $X9 $S3 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9I3 $D2 $S1 $S2 $X9 $I3 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9S3I3 $D2 $S1 $S2 $X9 $S3 $I3 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P30T64X9S3I3 $D2 $S1 $S2 $X9 $S3 $I3 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X9 $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P35T64X9b $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35 ;;
+  ah) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"; I3="N42_DEFERRED_IN_FLIGHT=3"; ABR="N42_ANSWER_BEFORE_REVERTS=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"
+     b7 D2S12P35T64X9ABR $D2 $S1 $S2 $X9 $ABR $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9ABRS3 $D2 $S1 $S2 $X9 $ABR $S3 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9ABRI3 $D2 $S1 $S2 $X9 $ABR $I3 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9ABRS3I3 $D2 $S1 $S2 $X9 $ABR $S3 $I3 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P30T64X9ABR $D2 $S1 $S2 $X9 $ABR $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P25T64X9ABR $D2 $S1 $S2 $X9 $ABR $T64 F7_BLOCK_INTERVAL_MS=25
+     b7 D2S12P35T64X9ABRb $D2 $S1 $S2 $X9 $ABR $T64 F7_BLOCK_INTERVAL_MS=35 ;;
+  ai) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"; I3="N42_DEFERRED_IN_FLIGHT=3"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"
+     b7 D2S12P35T64X9c $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P30T64X9c $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P40T64X9c $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=40
+     b7 D2S12P35T64X9d $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P30T64X9d $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=30 ;;
+  aj) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"; I3="N42_DEFERRED_IN_FLIGHT=3"; AAI="N42_ANSWER_AT_INSERT=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"
+     b7 D2S12P35T64X9e $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9AAI $D2 $S1 $S2 $X9 $AAI $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P30T64X9AAI $D2 $S1 $S2 $X9 $AAI $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P25T64X9AAI $D2 $S1 $S2 $X9 $AAI $T64 F7_BLOCK_INTERVAL_MS=25
+     b7 D2S12P30T64X9e $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P35T64X9AAIb $D2 $S1 $S2 $X9 $AAI $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P25T64X9AAIb $D2 $S1 $S2 $X9 $AAI $T64 F7_BLOCK_INTERVAL_MS=25 ;;
+  ak) mk WARM 7 16; warm_gate WARM
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"; I3="N42_DEFERRED_IN_FLIGHT=3"; AAI="N42_ANSWER_AT_INSERT=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"
+     b7 D2S12P35T64X9f $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9AAIc $D2 $S1 $S2 $X9 $AAI $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P30T64X9AAIc $D2 $S1 $S2 $X9 $AAI $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P25T64X9AAIc $D2 $S1 $S2 $X9 $AAI $T64 F7_BLOCK_INTERVAL_MS=25
+     b7 D2S12P30T64X9f $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P35T64X9AAId $D2 $S1 $S2 $X9 $AAI $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9g $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35 ;;
+  al) mk WARM 7 16; warm_gate WARM
+     # the frame index swept at the take (N42_FRAME_SWEEP_AT_TAKE, on by default; docs/SHARED_EXECUTION_SCOPE.md 16.4.2) on stage ak's X9 set at 35 ms pacing,
+     # between two controls with it off; one leg adds the continuously prepared plan (N42_PLAN_AHEAD_WAIT_MS, 16.4.1)
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; FS0="N42_FRAME_SWEEP_AT_TAKE=0"
+     b7 D2S12P35T64X9h $D2 $S1 $S2 $X9 $T64 $FS0 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9FS $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9FSb $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9FSPW30 $D2 $S1 $S2 $X9 $T64 N42_PLAN_AHEAD_WAIT_MS=30 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9i $D2 $S1 $S2 $X9 $T64 $FS0 F7_BLOCK_INTERVAL_MS=35 ;;
+  am) mk WARM 7 16; warm_gate WARM
+     # the frame sweep at take with the frames aside swept by their first run (e299a6561) on stage ak's X9 set at 35 ms pacing; one control with it off
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; FS0="N42_FRAME_SWEEP_AT_TAKE=0"
+     b7 D2S12P35T64X9j $D2 $S1 $S2 $X9 $T64 $FS0 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9FS2 $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9FS2b $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9FS2PW30 $D2 $S1 $S2 $X9 $T64 N42_PLAN_AHEAD_WAIT_MS=30 F7_BLOCK_INTERVAL_MS=35 ;;
+  an) mk WARM 7 16; warm_gate WARM
+     # the frame sweep with the plan checks on the queue's own pool and the preparation stored in its first hold, on stage ak's X9 set; X10 = X9 + the sweep + N42_PLAN_AHEAD_WAIT_MS=30, at 35 and 30 ms pacing
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; FS0="N42_FRAME_SWEEP_AT_TAKE=0"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     b7 D2S12P35T64X9k $D2 $S1 $S2 $X9 $T64 $FS0 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X9FS3 $D2 $S1 $S2 $X9 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X10 $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P35T64X10b $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=35
+     b7 D2S12P30T64X10 $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10b $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=30 ;;
+  ao) mk WARM 7 16; warm_gate WARM
+     # the X10 set (stage an's environment) at 25, 28, 30 and 35 ms pacing; no control leg
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     b7 D2S12P25T64X10 $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=25
+     b7 D2S12P25T64X10b $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=25
+     b7 D2S12P28T64X10 $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=28
+     b7 D2S12P28T64X10b $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=28
+     b7 D2S12P30T64X10c $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P35T64X10c $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=35 ;;
+  ap) mk WARM 7 16; warm_gate WARM
+     # the X10 set at 30 ms pacing: a control on this tree, the transactions root and frame layout found with the plan (N42_PLAN_AHEAD_PARTS=1),
+     # the same with the build pool on 64 physical cores of its own (N42_CORE_LAYOUT=isolate: inside the layer's 0-103,128-231 the build gets
+     # CPUs 0-63 with siblings 128-191 idle, the critical set 64-67 with 192-195 idle, everything else 68-103,196-231), and the isolate layout alone
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     PAP="N42_PLAN_AHEAD_PARTS=1"; ISO="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64"
+     b7 D2S12P30T64X10d $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10PA $D2 $S1 $S2 $X10 $T64 $PAP F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10PAb $D2 $S1 $S2 $X10 $T64 $PAP F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10PAI $D2 $S1 $S2 $X10 $T64 $PAP $ISO F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10PAIb $D2 $S1 $S2 $X10 $T64 $PAP $ISO F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10I $D2 $S1 $S2 $X10 $T64 $ISO F7_BLOCK_INTERVAL_MS=30 ;;
+  aq) mk WARM 7 16; warm_gate WARM
+     # the X10 set at 30 ms pacing: a control, then three isolate layouts that keep the build pool alone on 64 physical cores without starving the rest
+     # (inside the layer's 0-103,128-231; stage ap's plain isolate idled the build cores' siblings 128-191, put the behind pool on the build CPUs and the root job on 4):
+     # ISOSIB = build 0-63, siblings 128-191 to the background, behind pool on the background, critical (root job) 64-67, background 68-103,128-231 (140 CPUs);
+     # ISOCRIT16 = ISOSIB with the critical set on 16 cores, 64-79, background 80-103,128-231 (128 CPUs);
+     # ISOREST = ISOSIB with the critical threads on the background too: build 0-63, everything else on 64-103,128-231 (144 CPUs)
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     ISOSIB="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_SIBLINGS=background N42_CORE_LAYOUT_BEHIND=background"
+     ISOCRIT16="$ISOSIB N42_CORE_LAYOUT_CRITICAL_CORES=16"; ISOREST="$ISOSIB N42_CORE_LAYOUT_CRITICAL=background"
+     b7 D2S12P30T64X10e $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10ISOSIB $D2 $S1 $S2 $X10 $T64 $ISOSIB F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10ISOREST $D2 $S1 $S2 $X10 $T64 $ISOREST F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10ISOCRIT16 $D2 $S1 $S2 $X10 $T64 $ISOCRIT16 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10ISOSIBb $D2 $S1 $S2 $X10 $T64 $ISOSIB F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10ISORESTb $D2 $S1 $S2 $X10 $T64 $ISOREST F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10ISOCRIT16b $D2 $S1 $S2 $X10 $T64 $ISOCRIT16 F7_BLOCK_INTERVAL_MS=30 ;;
+  ar) mk WARM 7 16; warm_gate WARM
+     # the X10 set at 30 ms pacing, N42_CORE_LAYOUT unset: the cuts of the own-block answer's latency (rate ~ (seal->answer - 19 ms) / 4, loop351 X10e).
+     # MSPLIT = the leader's post-publication merge in two halves at once (N42_MERGE_SPLIT=1), S3 = the merge at shards_ready on a 16-thread pool,
+     # AAI = the answer at the hand-off insert, F2 = the vote hold one block further (a 5-block window; parent outputs kept raised to 6 for slack)
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     MSPLIT="N42_MERGE_SPLIT=1"; AAI="N42_ANSWER_AT_INSERT=1"; F2="N42_FAR_AHEAD_BLOCKS=2 N42_PARENT_OUTPUTS_KEPT=6"
+     b7 D2S12P30T64X10f $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MS $D2 $S1 $S2 $X10 $T64 $MSPLIT F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10S3 $D2 $S1 $S2 $X10 $T64 $S3 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10AAI $D2 $S1 $S2 $X10 $T64 $AAI F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MSAAI $D2 $S1 $S2 $X10 $T64 $MSPLIT $AAI F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10S3AAI $D2 $S1 $S2 $X10 $T64 $S3 $AAI F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10F2 $D2 $S1 $S2 $X10 $T64 $F2 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MSAAIF2 $D2 $S1 $S2 $X10 $T64 $MSPLIT $AAI $F2 F7_BLOCK_INTERVAL_MS=30 ;;
+  as) mk WARM 7 16; warm_gate WARM
+     # the X10 set at 30 ms pacing, N42_CORE_LAYOUT unset except the last leg: stage ar's answer cuts repeated (its MS legs failed on a variable collision):
+     # MSPLIT = N42_MERGE_SPLIT=1, AAI = the answer at the hand-off insert, F2 = the vote hold one block further, C16 = the aq ISOCRIT16 layout
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     MSPLIT="N42_MERGE_SPLIT=1"; AAI="N42_ANSWER_AT_INSERT=1"; F2="N42_FAR_AHEAD_BLOCKS=2 N42_PARENT_OUTPUTS_KEPT=6"
+     C16="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_SIBLINGS=background N42_CORE_LAYOUT_BEHIND=background"
+     b7 D2S12P30T64X10g $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MS $D2 $S1 $S2 $X10 $T64 $MSPLIT F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MSb $D2 $S1 $S2 $X10 $T64 $MSPLIT F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MSAAI $D2 $S1 $S2 $X10 $T64 $MSPLIT $AAI F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MSAAIb $D2 $S1 $S2 $X10 $T64 $MSPLIT $AAI F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MSAAIF2 $D2 $S1 $S2 $X10 $T64 $MSPLIT $AAI $F2 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10MSAAIC16 $D2 $S1 $S2 $X10 $T64 $MSPLIT $AAI $C16 F7_BLOCK_INTERVAL_MS=30 ;;
+  at) mk WARM 7 16; warm_gate WARM
+     # the X10 set at 30 ms pacing, one leg, N42_CORE_LAYOUT unset: perf stat attached to the leader's layer in window 1
+     # (what the build batches contend for: CPU count, L3/memory or hyperthread siblings) beside the every-thread sampler
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     b7 D2S12P30T64X10h $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=30 ;;
+  au) mk WARM 7 16; warm_gate WARM
+     # the X10 set at 30 ms pacing: the 16-core root set with the build cores' siblings left idle (stage aq's ISOCRIT16 sent them to the background):
+     # C16IDLE = build 0-63, critical 16, behind pool on the background, no N42_CORE_LAYOUT_SIBLINGS; C16 = aq's ISOCRIT16 repeated; C16IDLE48 = C16IDLE on 48 build cores
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     IDLE="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_BEHIND=background"
+     C16="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_SIBLINGS=background N42_CORE_LAYOUT_BEHIND=background"
+     IDLE48="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=48 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_BEHIND=background"
+     b7 D2S12P30T64X10i $D2 $S1 $S2 $X10 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10C16IDLE $D2 $S1 $S2 $X10 $T64 $IDLE F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10C16IDLEb $D2 $S1 $S2 $X10 $T64 $IDLE F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10C16 $D2 $S1 $S2 $X10 $T64 $C16 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X10C16IDLE48 $D2 $S1 $S2 $X10 $T64 $IDLE48 F7_BLOCK_INTERVAL_MS=30 ;;
+  av) mk WARM 7 16; warm_gate WARM
+     # the X11 set (X10 + the 16-core root layout of stage au's X10C16 leg) at 30 ms pacing: the in-build lookahead N42_BUILD_MLP = 0 (control), 4, 8, 16
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     C16="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_SIBLINGS=background N42_CORE_LAYOUT_BEHIND=background"
+     X11="$X10 $C16"
+     b7 D2S12P30T64X11 $D2 $S1 $S2 $X11 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11MLP4 $D2 $S1 $S2 $X11 $T64 N42_BUILD_MLP=4 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11MLP8 $D2 $S1 $S2 $X11 $T64 N42_BUILD_MLP=8 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11MLP8b $D2 $S1 $S2 $X11 $T64 N42_BUILD_MLP=8 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11MLP16 $D2 $S1 $S2 $X11 $T64 N42_BUILD_MLP=16 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11b $D2 $S1 $S2 $X11 $T64 F7_BLOCK_INTERVAL_MS=30 ;;
+  aw) mk WARM 7 16; warm_gate WARM
+     # the X11 set at 30 ms pacing on the profiling binary (symbols): perf record on the leader layer's n42-build threads in window 1
+     # (cycles with DWARF call graphs, then the DRAM and all demand fills), to see where the build's memory latency is (docs 10.117)
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     C16="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_SIBLINGS=background N42_CORE_LAYOUT_BEHIND=background"
+     X11="$X10 $C16"
+     # the profiling n42 (target/profiling-build, target-cpu=native) beside the native examples
+     PX=$WT/target/profiling-x11; PN=$WT/target/profiling-build/profiling/n42
+     if [ ! -x $PN ] || [ -n "$(find crates bin -name '*.rs' -newer $PN | head -1)" ]; then echo "no profiling n42 or a source newer than it: the X11prof leg is not run"
+     else mkdir -p $PX; ln -sfn $PN $PX/n42; ln -sfn $NAT/examples $PX/examples
+       b7 D2S12P30T64X11prof $D2 $S1 $S2 $X11 $T64 F7_BIN=$PX F7_BLOCK_INTERVAL_MS=30
+       P=$S/perf-loop351D2S12P30T64X11prof; if [ "${LOOP351_DRY:-0}" != 1 ]; then for k in build miss; do [ -f $P-$k.data ] || continue
+         { for sk in sym,dso comm,sym; do echo "== perf report --sort $sk"; perf report -i $P-$k.data --stdio --no-inline --no-children -g none --sort $sk --percent-limit 0.3 2>/dev/null | grep -v '^$'; done; } > $P-$k.report.txt; echo "perf report: $P-$k.report.txt"; done; fi
+     fi ;;
+  ax) mk WARM 7 16; warm_gate WARM
+     # the X11 set at 30 ms pacing after the provider read-path fixes (2e9387835, 5b33e8d33, ce8aa472d): controls and N42_BUILD_MLP=16 alternating
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     C16="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_SIBLINGS=background N42_CORE_LAYOUT_BEHIND=background"
+     X11="$X10 $C16"
+     b7 D2S12P30T64X11c $D2 $S1 $S2 $X11 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11MLP16b $D2 $S1 $S2 $X11 $T64 N42_BUILD_MLP=16 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11d $D2 $S1 $S2 $X11 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11MLP16c $D2 $S1 $S2 $X11 $T64 N42_BUILD_MLP=16 F7_BLOCK_INTERVAL_MS=30 ;;
+  ay) mk WARM 7 16; warm_gate WARM
+     # the X11 set at 30 ms pacing: the warm read ahead of the build (N42_PLAN_AHEAD_WARM=<threads>, docs 10.122) on 8 and 16
+     # background threads, alternating, between two controls
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     C16="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_SIBLINGS=background N42_CORE_LAYOUT_BEHIND=background"
+     X11="$X10 $C16"
+     b7 D2S12P30T64X11e $D2 $S1 $S2 $X11 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11W8 $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_WARM=8 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11W16 $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_WARM=16 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11W8b $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_WARM=8 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11W16b $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_WARM=16 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11f $D2 $S1 $S2 $X11 $T64 F7_BLOCK_INTERVAL_MS=30 ;;
+  az) mk WARM 7 16; warm_gate WARM
+     # the X11 set at 30 ms pacing on the fixed warm read (N42_PLAN_AHEAD_WARM=<threads>): 16 twice and 24 threads between two controls
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     C16="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_SIBLINGS=background N42_CORE_LAYOUT_BEHIND=background"
+     X11="$X10 $C16"
+     b7 D2S12P30T64X11g $D2 $S1 $S2 $X11 $T64 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11W16c $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_WARM=16 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11W16d $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_WARM=16 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11W24 $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_WARM=24 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11h $D2 $S1 $S2 $X11 $T64 F7_BLOCK_INTERVAL_MS=30 ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq, ar, as, at, au, av, aw, ax, ay or az)"; exit 2 ;;
 esac
 
 if [ "${LOOP351_DRY:-0}" = 1 ]; then echo "dry run done"; exit 0; fi

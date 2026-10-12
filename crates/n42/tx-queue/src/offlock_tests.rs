@@ -120,8 +120,10 @@ fn an_offlock_prepared_plan_is_the_one_hold_plan() {
 /// after it in later blocks.
 #[test]
 fn an_insert_between_the_holds_is_kept_and_the_plan_commits() {
+    // The two-hold commit runs without the frame sweep only: with it the
+    // preparation stores in its first hold.
     let gas = 300 * 21_000;
-    let queue = queue(true);
+    let queue = queue(true).with_frame_sweep_at_take(false);
     flood(&queue, 200, 0, 6, 50);
     let p0 = block_hash(0);
     let (mut best, _, _) = queue.frames_for_build_ahead(p0, gas, SelectMode::Parallel, false);
@@ -169,9 +171,11 @@ fn an_insert_between_the_holds_is_kept_and_the_plan_commits() {
 /// now are, and nothing mined is offered or lost.
 #[test]
 fn a_hold_that_moves_the_lanes_between_the_holds_refuses_the_commit() {
+    // The two-hold commit runs without the frame sweep only: with it the
+    // preparation stores in its first hold.
     let gas = 300 * 21_000;
     for prune in [false, true] {
-        let queue = queue(true);
+        let queue = queue(true).with_frame_sweep_at_take(false);
         flood(&queue, 200, 0, 6, 50);
         let total = queue.len();
         let p0 = block_hash(0);

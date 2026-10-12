@@ -964,6 +964,19 @@ pub fn n42_canon_notify_lean() -> bool {
     *LEAN.get_or_init(|| std::env::var("N42_CANON_NOTIFY_LEAN").is_ok_and(|v| v == "1"))
 }
 
+/// N42: a copy of `output` for a notification, with its complete revert set when it was handed
+/// out before that was merged (`N42_ANSWER_BEFORE_REVERTS`, `n42_deferred_reverts`), waiting for
+/// it. A set that never comes is logged and the copy carries what the block was handed out with.
+fn n42_completed_outcome<R: Clone>(
+    output: &reth_execution_types::BlockExecutionOutput<R>,
+) -> reth_execution_types::BlockExecutionOutput<R> {
+    let mut copy = output.clone();
+    if let Err(error) = n42_deferred_reverts::complete_in_place(output, &mut copy.state) {
+        tracing::error!(target: "n42.deferred_reverts", %error, "a canonical notification carries a block without its late revert set");
+    }
+    copy
+}
+
 impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
     /// Returns the length of the new chain.
     pub const fn new_block_count(&self) -> usize {
@@ -1015,7 +1028,7 @@ impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
                 let mut chain = Chain::from_block(
                     Arc::clone(&first.recovered_block),
                     ExecutionOutcome::from((
-                        first.execution_outcome().clone(),
+                        n42_completed_outcome(first.execution_outcome()),
                         first.block_number(),
                     )),
                     first.trie_data_handle(),
@@ -1024,7 +1037,7 @@ impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
                     chain.append_block(
                         Arc::clone(&exec.recovered_block),
                         ExecutionOutcome::from((
-                            exec.execution_outcome().clone(),
+                            n42_completed_outcome(exec.execution_outcome()),
                             exec.block_number(),
                         )),
                         exec.trie_data_handle(),

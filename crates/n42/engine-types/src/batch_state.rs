@@ -103,6 +103,26 @@ impl<G: Database> BatchState<G> {
         Self { inner, accounts: AddressMap::with_capacity_and_hasher(accounts, Default::default()) }
     }
 
+    /// A hint, nothing else: probes the batch's map for `address` (the probe
+    /// brings the map's control group and bucket into the cache) and, if the
+    /// account is here, prefetches the lines of its entry. Issued for a
+    /// transaction a few places ahead of the one running
+    /// (`N42_BUILD_MLP`, [`crate::parallel_transfer::build_mlp`]) so its
+    /// misses overlap the running one's instead of waiting their turn. Reads
+    /// only: the map and every answer are as without it.
+    #[inline]
+    pub fn prefetch_account(&self, address: &Address) {
+        if let Some(entry) = self.accounts.get(address) {
+            let at = (entry as *const BundleAccount).cast::<u8>();
+            let size = std::mem::size_of::<BundleAccount>();
+            let mut offset = 0;
+            while offset < size {
+                crate::parallel_transfer::prefetch_hint(at.wrapping_add(offset));
+                offset += 64;
+            }
+        }
+    }
+
     /// Applies a transaction's changes as `State::commit` would
     /// (`CacheAccount::change`, then `TransitionAccount::update` onto the
     /// batch's transition): the account's info replaced, its status moved on.
@@ -205,6 +225,23 @@ impl<G: Database> BatchState<G> {
             bundle.reverts_size = reverts_size;
         }
         bundle
+    }
+}
+
+impl<G: Database + crate::parallel_transfer::AccountHint> BatchState<G> {
+    /// The hint for an account a transaction a few places ahead will read
+    /// (`N42_BUILD_MLP`): the batch's own entry prefetched when it holds the
+    /// account ([`Self::prefetch_account`]); otherwise the hint goes down the
+    /// parent's layers (`AccountHint`), each probing for it. Returns whether
+    /// it went beneath this map.
+    #[inline]
+    pub fn hint_account(&self, address: &Address) -> bool {
+        if self.accounts.contains_key(address) {
+            self.prefetch_account(address);
+            return false;
+        }
+        self.inner.hint_account(address);
+        true
     }
 }
 

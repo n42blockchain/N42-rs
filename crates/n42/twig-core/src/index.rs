@@ -389,6 +389,20 @@ impl SharedOffsetIndex {
         self.read(key).get(key, &key_at).map(|(_, value)| value)
     }
 
+    /// A hint that `key` will be looked up soon: prefetches the bucket line its
+    /// probe reads first. Only if the shard's read lock is free right now -- a
+    /// hint never waits, and is not counted in [`thread_read_waits`]. Returns
+    /// whether it was issued.
+    pub fn prefetch(&self, key: &Hash) -> bool {
+        match self.shards[key[0] as usize].try_read() {
+            Ok(shard) => {
+                shard.prefetch(key);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Maps `key` to `value`, returning the value it replaced.
     pub fn insert(&self, key: Hash, value: u64, key_at: impl Fn(u64) -> Hash) -> Option<u64> {
         self.write(key[0] as usize).insert(&key, value, &key_at)

@@ -1341,6 +1341,54 @@ mod tests {
         Ok(())
     }
 
+    /// N42: the owned overlay's direct account read and hint (no borrowed provider built per
+    /// call) answer what the borrowed provider's walk answers, for accounts the in-memory
+    /// blocks hold and for accounts only the database below them holds.
+    #[test]
+    fn n42_overlay_direct_account_read_matches_borrowed() -> eyre::Result<()> {
+        use reth_storage_api::AccountReader as _;
+        let (provider, hashes) = n42_in_memory_chain(5, 40, 15)?;
+        let state = provider
+            .canonical_in_memory_state
+            .state_by_hash(*hashes.last().expect("blocks"))
+            .expect("in memory");
+        let blocks: Vec<ExecutedBlock<reth_ethereum_primitives::EthPrimitives>> =
+            state.chain().map(|state| state.block()).collect();
+        // The newest two blocks over a provider holding the older ones: an account the older
+        // blocks alone wrote is read below the top overlay.
+        let (top, lower) = blocks.split_at(2);
+        let noop = || -> reth_storage_api::StateProviderBox {
+            Box::new(reth_storage_api::noop::NoopProvider::default())
+        };
+        let over = |blocks: &[ExecutedBlock<reth_ethereum_primitives::EthPrimitives>],
+                    historical: reth_storage_api::StateProviderBox| {
+            crate::MemoryOverlayStateProvider::new(historical, blocks.to_vec())
+        };
+        let top_only = over(top, noop());
+        let whole = over(&blocks, noop());
+        let (mut in_top, mut below) = (0usize, 0usize);
+        for filtered in [true, false] {
+            let layered = over(top, Box::new(over(lower, noop())));
+            let overlay = if filtered { layered } else { layered.without_filters() };
+            for n in 0..300 {
+                let address = n42_address(n);
+                let direct = overlay.basic_account(&address)?;
+                assert_eq!(direct, overlay.as_ref().basic_account(&address)?, "account {n}");
+                assert_eq!(direct, whole.basic_account(&address)?, "account {n} against one overlay");
+                assert_eq!(
+                    overlay.n42_prefetch_account(&address),
+                    overlay.as_ref().n42_prefetch_account(&address),
+                    "hint {n}"
+                );
+                let held_on_top = top_only.basic_account(&address)?.is_some();
+                in_top += held_on_top as usize;
+                below += (direct.is_some() && !held_on_top) as usize;
+            }
+        }
+        assert!(in_top > 0 && below > 0, "{in_top} in the top blocks, {below} below them");
+        Ok(())
+    }
+
     /// N42: state under in-memory blocks read through `MemoryOverlayStateProvider` answers
     /// what upstream's flattened overlay answers, for every block of the chain.
     #[test]

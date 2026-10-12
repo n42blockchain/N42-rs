@@ -25,6 +25,12 @@ pub trait EvmStateProvider {
         account: Address,
         storage_key: StorageKey,
     ) -> ProviderResult<Option<StorageValue>>;
+
+    /// N42: the account reader's hint (`AccountReader::n42_prefetch_account`). The
+    /// default does nothing.
+    fn n42_prefetch_account(&self, _address: &Address) -> bool {
+        false
+    }
 }
 
 /// Type-erased provider for EVM execution.
@@ -45,6 +51,10 @@ impl<P> Deref for EvmStateProviderAdapter<P> {
 impl<P: StateProvider> EvmStateProvider for EvmStateProviderAdapter<P> {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
         self.0.basic_account(address)
+    }
+
+    fn n42_prefetch_account(&self, address: &Address) -> bool {
+        self.0.n42_prefetch_account(address)
     }
 
     fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {

@@ -722,6 +722,9 @@ impl<T: PoolTransaction> TxQueue<T> {
             SnapCommit::Prepare => {
                 // The runs were popped by the holds of
                 // `commit_prepare_batched`, the last of them this one.
+                for frame in &planned.plan.frames {
+                    inner.frames.retire(&frame.id, frame.taken);
+                }
                 let lowest: AddressHashMap<u64> = planned.runs.iter().map(|(sender, lo, _)| (*sender, *lo)).collect();
                 let cut = planned.plan.frames.last().is_some_and(|frame| frame.taken < frame.len);
                 inner.prepared = Some(Prepared {
@@ -775,7 +778,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             return Some(false);
         }
         // The body, made off the lock into the stored plan's slot.
-        Self::run_body_hook(hook, slot.map(|slot| (planned.segments, slot)));
+        Self::run_body_hook(hook, slot.map(|slot| (planned.segments, planned.plan, slot)));
         Some(true)
     }
 
@@ -838,6 +841,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         let (mut segments, mut plan, rest, discarded) = {
             let mut inner = self.lock_inner();
             times.lock_us = at.elapsed().as_micros() as u64;
+            inner.note_index(&mut times);
             let begin_at = std::time::Instant::now();
             self.drain_inbox_block(&mut inner);
             let verdict =

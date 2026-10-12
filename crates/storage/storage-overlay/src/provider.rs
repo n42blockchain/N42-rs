@@ -131,6 +131,10 @@ pub struct OverlayStateProvider<Provider, N: NodePrimitives = EthPrimitives> {
     state_trie_overlay: OnceCell<StateTrieOverlay>,
     state_trie_overlay_with_trie_changesets: OnceCell<StateTrieOverlay>,
     execution_overlay: OnceCell<CachedExecutionOverlay>,
+    /// N42: the QMDB reader's version for this provider's database transaction
+    /// ([`n42_hashed_state_version`]), read once: the transaction's checkpoints do not move
+    /// under it, the same assumption [`Self::execution_overlay`] makes for its frontiers.
+    n42_state_version: OnceCell<Option<u64>>,
     is_v2: bool,
 }
 
@@ -165,6 +169,7 @@ impl<Provider, N: NodePrimitives> OverlayStateProvider<OwnedProvider<Provider>, 
             state_trie_overlay: OnceCell::new(),
             state_trie_overlay_with_trie_changesets: OnceCell::new(),
             execution_overlay: OnceCell::new(),
+            n42_state_version: OnceCell::new(),
             is_v2,
         }
     }
@@ -186,6 +191,7 @@ impl<Provider, N: NodePrimitives> OverlayStateProvider<OwnedProvider<Provider>, 
                 overlay: execution_overlay,
                 historical_fallback: None,
             }),
+            n42_state_version: OnceCell::new(),
             is_v2,
         }
     }
@@ -206,6 +212,7 @@ impl<'a, Provider, N: NodePrimitives> OverlayStateProvider<&'a Provider, N> {
             state_trie_overlay: OnceCell::new(),
             state_trie_overlay_with_trie_changesets: OnceCell::new(),
             execution_overlay: OnceCell::new(),
+            n42_state_version: OnceCell::new(),
             is_v2,
         }
     }
@@ -223,6 +230,7 @@ impl<'a, Provider, N: NodePrimitives> OverlayStateProvider<&'a Provider, N> {
             state_trie_overlay: OnceCell::from(state_trie_overlay.clone()),
             state_trie_overlay_with_trie_changesets: OnceCell::from(state_trie_overlay),
             execution_overlay: OnceCell::new(),
+            n42_state_version: OnceCell::new(),
             is_v2,
         }
     }
@@ -436,6 +444,36 @@ where
         }
         self.basic_account_from_db(address)
     }
+
+    /// N42: the hint as [`Self::basic_account`] would read: an account the execution overlay
+    /// holds is probed there; one a historical fallback would answer is not hinted; anything
+    /// else goes to the registered QMDB reader, which prefetches its index bucket.
+    fn n42_prefetch_account(&self, address: &Address) -> bool {
+        self.n42_prefetch_account_into(address, reth_storage_api::n42_state::reader().map(|(reader, _)| reader))
+    }
+}
+
+impl<Provider, N: NodePrimitives> OverlayStateProvider<Provider, N> {
+    /// The hint of [`AccountReader::n42_prefetch_account`] with the reader given. The
+    /// execution overlay is only probed when already built: a hint never builds it.
+    fn n42_prefetch_account_into(
+        &self,
+        address: &Address,
+        reader: Option<&dyn reth_storage_api::n42_state::N42StateReader>,
+    ) -> bool {
+        if let Some(cached) = self.execution_overlay.get() {
+            if cached.overlay.account(address).is_some() {
+                return true
+            }
+            if cached.historical_fallback.is_some() {
+                return false
+            }
+        }
+        if let Some(reader) = reader {
+            reader.prefetch_account(address);
+        }
+        false
+    }
 }
 
 impl<Provider, N: NodePrimitives> OverlayStateProvider<Provider, N>
@@ -445,11 +483,13 @@ where
 {
     fn basic_account_from_db(&self, address: &Address) -> ProviderResult<Option<Account>> {
         if self.provider().cached_storage_settings().use_hashed_state() {
-            let hashed_address = alloy_primitives::keccak256(address);
             // N42: the latest account comes from a registered QMDB reader
-            // (`on`) or is checked against it (`verify`).
+            // (`on`) or is checked against it (`verify`). The address is hashed
+            // only where a hashed table is read: not on the reader's answer.
             if let Some((reader, mode)) = reth_storage_api::n42_state::reader() &&
-                let Some(version) = n42_hashed_state_version(self.provider().tx())
+                let Some(version) = *self
+                    .n42_state_version
+                    .get_or_init(|| n42_hashed_state_version(self.provider().tx()))
             {
                 match reader.account(address, version) {
                     Some(answer) if mode == reth_storage_api::n42_state::ReadsMode::On => {
@@ -457,6 +497,7 @@ where
                         return Ok(answer)
                     }
                     Some(answer) => {
+                        let hashed_address = alloy_primitives::keccak256(address);
                         let database = self
                             .provider()
                             .tx()
@@ -474,6 +515,7 @@ where
                     format_args!("account {address}"),
                 )))
             }
+            let hashed_address = alloy_primitives::keccak256(address);
             self.provider()
                 .tx()
                 .get_by_encoded_key::<tables::HashedAccounts>(&hashed_address)
@@ -883,7 +925,9 @@ where
             // N42: the latest value comes from a registered QMDB reader
             // (`on`) or is checked against it (`verify`).
             if let Some((reader, mode)) = reth_storage_api::n42_state::reader() &&
-                let Some(version) = n42_hashed_state_version(self.provider().tx())
+                let Some(version) = *self
+                    .n42_state_version
+                    .get_or_init(|| n42_hashed_state_version(self.provider().tx()))
             {
                 match reader.storage(&address, &storage_key, version) {
                     Some(answer) if mode == reth_storage_api::n42_state::ReadsMode::On => {
@@ -1366,6 +1410,45 @@ mod tests {
             Err(ProviderError::UnsupportedProvider)
         ));
         assert!(state_provider_factory.state_trie_overlay_cache.is_empty());
+    }
+
+    /// N42: the hint on an overlay provider stops at the execution overlay for an account it
+    /// holds and reaches the QMDB reader's prefetch for one it does not.
+    #[test]
+    fn n42_prefetch_hint_reaches_the_reader() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        #[derive(Default)]
+        struct Counting(AtomicU64);
+        impl reth_storage_api::n42_state::N42StateReader for Counting {
+            fn account(&self, _: &Address, _: u64) -> Option<Option<Account>> {
+                None
+            }
+            fn storage(&self, _: &Address, _: &B256, _: u64) -> Option<Option<U256>> {
+                None
+            }
+            fn prefetch_account(&self, _: &Address) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            fn on_state_persisted(&self, _: &[BlockNumHash]) {}
+            fn on_state_unwound(&self, _: u64) {}
+        }
+        let (factory, _) = setup_frontiers(1, 3);
+        let held = Address::with_last_byte(1);
+        let mut execution_overlay = ExecutionOverlay::default();
+        execution_overlay
+            .accounts_mut()
+            .insert(held, Some(AccountInfo { nonce: 1, ..Default::default() }));
+        let provider = OverlayStateProvider::<_, EthPrimitives>::new_with_execution(
+            factory.provider().unwrap(),
+            Arc::new(execution_overlay),
+            false,
+        );
+        let reader = Counting::default();
+        assert!(provider.n42_prefetch_account_into(&held, Some(&reader)));
+        assert_eq!(reader.0.load(Ordering::Relaxed), 0);
+        assert!(!provider.n42_prefetch_account_into(&Address::with_last_byte(2), Some(&reader)));
+        assert_eq!(reader.0.load(Ordering::Relaxed), 1);
+        assert!(!provider.n42_prefetch_account_into(&Address::with_last_byte(2), None));
     }
 
     #[test]

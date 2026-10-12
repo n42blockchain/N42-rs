@@ -153,22 +153,59 @@ impl<N: NodePrimitives> BlockHashReader for MemoryOverlayStateProviderRef<'_, N>
 
 impl<N: NodePrimitives> AccountReader for MemoryOverlayStateProviderRef<'_, N> {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
-        let key = FilterKey::address(address);
-        let mut skips = 0;
-        for (index, block) in self.in_memory.iter().enumerate() {
-            if !overlay_filter::may_hold_account(self.filter(index), key) {
-                skips += 1;
-                continue
-            }
-            if let Some(account) = block.execution_output.account(address) {
-                overlay_filter::record(skips, index as u64 + 1 - skips);
-                return Ok(account);
-            }
-        }
-        overlay_filter::record(skips, self.in_memory.len() as u64 - skips);
-
-        self.historical.basic_account(address)
+        overlay_basic_account(&self.in_memory, &self.filters, &*self.historical, address)
     }
+
+    fn n42_prefetch_account(&self, address: &Address) -> bool {
+        overlay_prefetch_account(&self.in_memory, &self.filters, &*self.historical, address)
+    }
+}
+
+/// N42: an account read through the overlay: the blocks newest first (a filter miss skips
+/// the block's bundle), else `historical`. Shared by the borrowed and the owned provider, so
+/// the owned one reads without building a [`MemoryOverlayStateProviderRef`] per call (a boxed
+/// `historical` allocated and freed on every read).
+fn overlay_basic_account<N: NodePrimitives, H: AccountReader + ?Sized>(
+    in_memory: &[ExecutedBlock<N>],
+    filters: &[Option<FilterCell>],
+    historical: &H,
+    address: &Address,
+) -> ProviderResult<Option<Account>> {
+    let key = FilterKey::address(address);
+    let mut skips = 0;
+    for (index, block) in in_memory.iter().enumerate() {
+        if !overlay_filter::may_hold_account(filters.get(index).and_then(Option::as_ref), key) {
+            skips += 1;
+            continue
+        }
+        if let Some(account) = block.execution_output.account(address) {
+            overlay_filter::record(skips, index as u64 + 1 - skips);
+            return Ok(account);
+        }
+    }
+    overlay_filter::record(skips, in_memory.len() as u64 - skips);
+
+    historical.basic_account(address)
+}
+
+/// N42: the read's walk as a hint -- the blocks' filters and bundle maps probed newest first
+/// (the probes are the prefetch), stopping at the block that holds the account, else passed to
+/// `historical`. No counter is recorded.
+fn overlay_prefetch_account<N: NodePrimitives, H: AccountReader + ?Sized>(
+    in_memory: &[ExecutedBlock<N>],
+    filters: &[Option<FilterCell>],
+    historical: &H,
+    address: &Address,
+) -> bool {
+    let key = FilterKey::address(address);
+    for (index, block) in in_memory.iter().enumerate() {
+        if overlay_filter::may_hold_account(filters.get(index).and_then(Option::as_ref), key) &&
+            block.execution_output.state.state.contains_key(address)
+        {
+            return true;
+        }
+    }
+    historical.n42_prefetch_account(address)
 }
 
 impl<N: NodePrimitives> StateRootProvider for MemoryOverlayStateProviderRef<'_, N> {
@@ -368,7 +405,7 @@ impl<N: NodePrimitives> MemoryOverlayStateProvider<N> {
 
     /// Returns a new provider that takes the `TX` as reference
     #[inline(always)]
-    fn as_ref(&self) -> MemoryOverlayStateProviderRef<'_, N> {
+    pub(crate) fn as_ref(&self) -> MemoryOverlayStateProviderRef<'_, N> {
         MemoryOverlayStateProviderRef {
             historical: Box::new(self.historical.as_ref()),
             in_memory: Cow::Borrowed(&self.in_memory),
@@ -383,5 +420,17 @@ impl<N: NodePrimitives> MemoryOverlayStateProvider<N> {
     }
 }
 
-// Delegates all provider impls to [`MemoryOverlayStateProviderRef`]
-reth_storage_api::macros::delegate_provider_impls!(MemoryOverlayStateProvider<N> where [N: NodePrimitives]);
+// N42: the account reads directly, without a [`MemoryOverlayStateProviderRef`] built per call
+// (the build's recipient reads came through here: a box allocated and freed on every read).
+impl<N: NodePrimitives> AccountReader for MemoryOverlayStateProvider<N> {
+    fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+        overlay_basic_account(&self.in_memory, &self.filters, &*self.historical, address)
+    }
+
+    fn n42_prefetch_account(&self, address: &Address) -> bool {
+        overlay_prefetch_account(&self.in_memory, &self.filters, &*self.historical, address)
+    }
+}
+
+// Delegates every other provider impl to [`MemoryOverlayStateProviderRef`]
+reth_storage_api::macros::delegate_provider_impls!(@except_account MemoryOverlayStateProvider<N> where [N: NodePrimitives]);

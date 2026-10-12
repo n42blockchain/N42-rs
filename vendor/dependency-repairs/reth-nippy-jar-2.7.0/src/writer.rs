@@ -224,6 +224,50 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
         Ok(())
     }
 
+    /// N42: appends `lens.len()` single-column rows whose bytes are already laid out back to back
+    /// in `rows`, as one write to the data file.
+    ///
+    /// The data file, the offsets and the row count and maximum row size in the configuration end
+    /// up exactly as after that many [`Self::append_column`] calls. Only valid for a jar with one
+    /// column, no compressor, and no partially written row; anything else is an error and nothing
+    /// is written. `fn commit()` should be called to flush offsets and config to disk.
+    pub fn append_encoded_rows(&mut self, rows: &[u8], lens: &[u32]) -> Result<(), NippyJarError> {
+        if self.jar.columns != 1 || self.jar.compressor.is_some() || self.column != 0 {
+            return Err(NippyJarError::Internal(
+                "append_encoded_rows needs a one-column jar without a compressor".into(),
+            ))
+        }
+        let total: u64 = lens.iter().map(|len| u64::from(*len)).sum();
+        if total != rows.len() as u64 {
+            return Err(NippyJarError::Internal(
+                "append_encoded_rows: row bytes do not match their lengths".into(),
+            ))
+        }
+        if lens.is_empty() {
+            return Ok(())
+        }
+        self.dirty = true;
+
+        if self.offsets.is_empty() {
+            // The offset of the first appended row.
+            self.offsets.push(self.data_file.stream_position()?);
+        }
+        // A chunk larger than the BufWriter's capacity bypasses it: one write(2).
+        self.data_file.write_all(rows)?;
+
+        self.offsets.reserve(lens.len());
+        let mut last = *self.offsets.last().expect("qed");
+        let mut max = 0usize;
+        for len in lens {
+            last += u64::from(*len);
+            self.offsets.push(last);
+            max = max.max(*len as usize);
+        }
+        self.jar.max_row_size = self.jar.max_row_size.max(max);
+        self.jar.rows += lens.len();
+        Ok(())
+    }
+
     /// Writes column to data file. If it's the last column of the row, call `finalize_row()`
     fn write_column(&mut self, value: &[u8]) -> Result<usize, NippyJarError> {
         self.uncompressed_row_size += value.len();

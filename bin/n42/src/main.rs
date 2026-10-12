@@ -277,6 +277,12 @@ fn main() {
                     .ok_or_else(|| eyre::eyre!("no hash for head block {}", info.best_number))?;
                 qmdb.initialize((info.best_number, head_hash))?;
                 info!(target: "reth::cli", block = info.best_number, %head_hash, "QMDB state ready");
+                // With HotStuff-2 finality the canonical head is the committed
+                // block, and a build on an ancestor of it is a stale request
+                // that would revert the state tree below the head.
+                if n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(node.chain_spec().genesis()).is_ok() {
+                    qmdb.set_refuse_stale_builds(true);
+                }
                 // `N42_QMDB_READS=verify|on`: the read view answers or checks the
                 // providers' latest-state reads (docs/QMDB_UPGRADE_PLAN.md, stage 6).
                 if n42_qmdb_reth::register_state_reader(qmdb) {

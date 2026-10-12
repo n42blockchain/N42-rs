@@ -342,6 +342,12 @@ pub mod read_depth {
             record_historical();
             self.historical.basic_account(address)
         }
+
+        /// The same walk as a hint, without the depth counters.
+        fn n42_prefetch_account(&self, address: &Address) -> bool {
+            self.executed.iter().any(|block| block.execution_output.state.state.contains_key(address))
+                || self.historical.n42_prefetch_account(address)
+        }
     }
 
     reth_storage_api::macros::delegate_impls_to_as_ref!(

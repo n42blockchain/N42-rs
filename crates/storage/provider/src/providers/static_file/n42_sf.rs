@@ -52,6 +52,17 @@ pub(crate) fn early_writeback() -> bool {
     *ON.get_or_init(|| flag("N42_SF_EARLY_WRITEBACK"))
 }
 
+/// `N42_SF_BULK_APPEND=1`, read once: an encoded chunk is appended to the data file in one
+/// write instead of one `append_column` per row.
+pub(crate) fn bulk_append() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = flag("N42_SF_BULK_APPEND");
+        tracing::info!(target: "providers::static_file", bulk_append = on, "N42_SF_BULK_APPEND");
+        on
+    })
+}
+
 /// One chunk of encoded rows: the `Compact` encodings back to back, and each length.
 #[derive(Debug, Default)]
 pub(crate) struct EncodedRows {

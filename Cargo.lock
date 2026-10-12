@@ -7268,6 +7268,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-deferred-reverts"
+version = "2.1.5"
+dependencies = [
+ "alloy-primitives 1.7.3",
+ "revm-database",
+ "tracing",
+]
+
+[[package]]
 name = "n42-dependency-compat-tests"
 version = "0.1.0"
 dependencies = [
@@ -7368,6 +7377,7 @@ dependencies = [
  "n42-clique-utils",
  "n42-consensus-traits",
  "n42-core-layout",
+ "n42-deferred-reverts",
  "n42-engine-primitives",
  "n42-h2-consensus",
  "n42-primitives",
@@ -9848,6 +9858,7 @@ dependencies = [
  "alloy-signer-local",
  "derive_more 2.1.1",
  "metrics",
+ "n42-deferred-reverts",
  "parking_lot 0.12.5",
  "pin-project",
  "rand 0.9.5",
@@ -11775,6 +11786,7 @@ dependencies = [
  "libc",
  "merkle_db_rs",
  "metrics",
+ "n42-deferred-reverts",
  "n42-primitives",
  "n42-tx-types",
  "notify",

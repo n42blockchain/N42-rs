@@ -12,6 +12,7 @@ use alloy_consensus::{
 };
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag, HashOrNumber};
 use alloy_primitives::{Address, BlockHash, BlockNumber, TxHash, TxNumber, B256};
+use crate::providers::n42_persist::N42PlainReverts as _;
 use reth_chain_state::{BlockState, CanonicalInMemoryState};
 use reth_chainspec::ChainInfo;
 use reth_db_api::models::{AccountBeforeTx, BlockNumberAddress, StoredBlockBodyIndices};
@@ -1115,9 +1116,7 @@ impl<N: ProviderNodeTypes> StorageChangeSetReader for ConsistentProvider<N> {
             let changesets = state
                 .block()
                 .execution_output
-                .state
-                .reverts
-                .to_plain_state_reverts()
+                .n42_plain_reverts()?
                 .storage
                 .into_iter()
                 .flatten()
@@ -1168,9 +1167,7 @@ impl<N: ProviderNodeTypes> StorageChangeSetReader for ConsistentProvider<N> {
             let changeset = state
                 .block_ref()
                 .execution_output
-                .state
-                .reverts
-                .to_plain_state_reverts()
+                .n42_plain_reverts()?
                 .storage
                 .into_iter()
                 .flatten()
@@ -1220,9 +1217,7 @@ impl<N: ProviderNodeTypes> StorageChangeSetReader for ConsistentProvider<N> {
                 let block_changesets = state
                     .block_ref()
                     .execution_output
-                    .state
-                    .reverts
-                    .to_plain_state_reverts()
+                .n42_plain_reverts()?
                     .storage
                     .into_iter()
                     .flatten()
@@ -1276,9 +1271,7 @@ impl<N: ProviderNodeTypes> ChangeSetReader for ConsistentProvider<N> {
             let changesets = state
                 .block_ref()
                 .execution_output
-                .state
-                .reverts
-                .to_plain_state_reverts()
+                .n42_plain_reverts()?
                 .accounts
                 .into_iter()
                 .flatten()
@@ -1321,9 +1314,7 @@ impl<N: ProviderNodeTypes> ChangeSetReader for ConsistentProvider<N> {
             let changeset = state
                 .block_ref()
                 .execution_output
-                .state
-                .reverts
-                .to_plain_state_reverts()
+                .n42_plain_reverts()?
                 .accounts
                 .into_iter()
                 .flatten()
@@ -1373,9 +1364,7 @@ impl<N: ProviderNodeTypes> ChangeSetReader for ConsistentProvider<N> {
                 let block_changesets = state
                     .block_ref()
                     .execution_output
-                    .state
-                    .reverts
-                    .to_plain_state_reverts()
+                .n42_plain_reverts()?
                     .accounts
                     .into_iter()
                     .flatten()

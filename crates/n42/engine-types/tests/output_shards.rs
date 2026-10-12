@@ -255,6 +255,39 @@ fn the_sharded_output_equals_the_direct_graft() {
     }
 }
 
+/// `N42_ANSWER_BEFORE_REVERTS`: the block handed out after the account half
+/// (the executor's own reverts only), registered, and completed by the late
+/// revert set, is the bundle the direct graft leaves once a consumer resolves
+/// it -- on 1, 16 and 64 shards, every fold mode, the caller's thread and a
+/// pool.
+#[test]
+fn the_output_answered_before_its_reverts_completes_to_the_direct_graft() {
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let (expected, _) = direct(&db, bundles.clone(), false);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().expect("pool");
+    for count in [1, 16, 64] {
+        for index in MODES {
+            for on_pool in [None, Some(&pool)] {
+                let label = format!("{count} shards, index {index}, pool {}", on_pool.is_some());
+                let (shards, residual) = sharded_parts(&db, shards_of(bundles.clone(), count, index));
+                let (first, _) = shards.merged_state_first(&residual, on_pool);
+                assert_eq!(first.state, expected.state, "{label}: the accounts at the answer");
+                let handed = std::sync::Arc::new(reth_execution_types::BlockExecutionOutput::<()> {
+                    state: first,
+                    result: Default::default(),
+                });
+                let promise = n42_deferred_reverts::register(&handed);
+                let (reverts, size) = shards.late_reverts(residual.reverts.clone(), Vec::new(), on_pool);
+                promise.fill(reverts, size);
+                let mut resolved = handed.state.clone();
+                n42_deferred_reverts::complete_in_place(&*handed, &mut resolved).expect("filled");
+                assert_same(&label, &expected, &resolved);
+            }
+        }
+    }
+}
+
 #[test]
 fn the_sharded_output_equals_the_staged_graft() {
     let db = parent();

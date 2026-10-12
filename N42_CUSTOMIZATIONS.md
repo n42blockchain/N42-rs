@@ -408,6 +408,26 @@
   `payload.rs` `body_made_with_the_plan_equals_body_made_at_start`。阶段行新增 `plan_body`、`plan_body_us`、
   `prep_from_plan`、`exec_prepared_groups`、`exec_prepared_slots`、`exec_partition_us`、`exec_slots_us`、
   `whole_take_noted`。
+- `N42_PLAN_AHEAD_WAIT_MS=<ms>`（默认未设 = 0 = 关；需 `N42_PLAN_AHEAD=1`；代码在 `tx-queue` `plan_ahead_wait_ms` /
+  `prepare_continuously` / `top_up_prepared` / `wait_for_plan` / `with_plan_ahead_wait`）：下一块的计划在上一块
+  take 之后持续预备，不再一次性：没有可用帧时，每有新帧索引就重新计划；计划未满（最后一帧未被截断且还有
+  21,000 gas 余量）时就地用新到的帧补足；直到计划满、下一块开始构建或 2 s 上限。帧构建开始时若这样的预备
+  仍在进行且计划未满，最多等待该毫秒数。阶段行新增 `plan_wait_us`、`plan_wait_timeout`（等待超时为 true）。
+  只作用于非快照路径（`N42_QUEUE_PLAN_SNAPSHOT` 未开）。测试：`ahead_tests.rs`
+  `the_continuous_preparation_plans_frames_that_arrive_after_the_take`、
+  `a_wait_for_a_plan_that_never_fills_runs_out`、`without_the_switch_a_build_never_waits`。
+  `docs/SHARED_EXECUTION_SCOPE.md` 16.4.1。
+- `N42_FRAME_SWEEP_AT_TAKE`（默认开；`=0` 恢复旧行为；代码在 `tx-queue` `frames.rs` `FrameIndex::retire` /
+  `revive_by_first` / `sweep_retired_into` / `frame_sweep_at_take`，`lib.rs` 各 take 落地处与 `give_back`）：
+  整帧被构建或预备计划取走时，在取走那一刻离开活跃帧索引（移到一旁：不再参与到达顺序的遍历，但按 id 与首个
+  交易哈希仍可查，供 settle、计划的最低 nonce 与 seal 的帧布局使用），直到链上挖出（prune 的 sweep）或被
+  `MAX_FRAMES` 个更新的退役帧挤出；被截断的帧仍在活跃索引里。整份 take 原样还回（放弃的构建、丢弃的预备计划）
+  时，其帧按首个交易哈希回到活跃索引的原到达位置；只部分还回的帧留在一旁，其交易在 lane 中无帧，由慢速 puller
+  与逐笔检查取用，与以前相同。活跃索引达到 `MAX_FRAMES` 时拒绝新帧（计入 `refused`，交易仍在 lane 中），
+  不再逐出最老的仍在队列中的帧。阶段行新增 `start_frames_skipped`、`start_frames_index`、
+  `start_frames_swept_at_take`、`start_frames_refused_at_cap`。测试：`ahead_tests.rs`
+  `a_taken_frame_leaves_the_index_at_the_take_and_comes_back_with_a_given_up_build`、
+  `a_full_index_refuses_a_new_frame_instead_of_evicting_a_live_one`。`docs/SHARED_EXECUTION_SCOPE.md` 16.4.2。
 - `N42_BUILD_BATCHES=<n>`（默认 0 = 原调度；代码在 `parallel_transfer.rs` `build_batches` / `Dispatch` /
   `largest_first`）：交易按整个发送者组、候选顺序装成 n 个大小相近的 batch，以 FIFO 从大到小投入 build pool
   （建议 96-128，32 个 worker）。测试 `the_largest_first_packing_keeps_every_sender_run_whole_and_in_order`，
@@ -613,3 +633,42 @@ reth 2.7 把 `num_state_masking_blocks` 默认值改为 30，持久化会让哈�
   不能回滚（Merkle 阶段会校验区块头里没有的 MPT 根，QMDB 森林也无法退到检查点之下），也不能向前修复（存储 v2 下哈希表就是状态，
   被遮蔽区块的状态从未落盘，试过的 `heal_hashed_state_forward` 会导致下一个区块 QMDB 根不匹配，已删除）。MPT 链仍走 `Unwind`。
 - 存储层不一致（rocksdb / static file）的回滚流水线在 QMDB 链上禁用 `MerkleUnwind` 与 `MerkleExecute`，保留哈希阶段的回滚。
+
+## 迟到的回滚集：先应答导入，再合并 reverts（`N42_ANSWER_BEFORE_REVERTS`，触及 chain-state 与 provider）
+- 新 crate `crates/n42/deferred-reverts`（`n42-deferred-reverts`）：按 `BlockExecutionOutput` 的地址登记"欠着完整回滚集"
+  的执行结果（登记表持有该输出，地址不会复用；别人都不再持有时条目被清掉），`resolve` / `complete_in_place` 等待填入。
+- `crates/n42/engine-types/src/payload.rs` `spawn_late_reverts` 与两条合并路径（发布之后、以及
+  `N42_MERGE_AT_SHARDS_READY` 的 shards-ready 路径）：开关打开（默认关，首次使用时记一行日志）时先只合并账户表
+  （`FrozenShards::merged_state_first`），以执行器自己的 reverts 登记 StateReady/Complete，导入随即可以应答；
+  分片与 graft 的回滚集在另一线程合并（`FrozenShards::late_reverts`），填入登记项。依据：loop351 af，
+  seal 到 state ready 152 ms，其中合并 91 ms（账户 37 + reverts 50）。
+- 读 reverts 的地方先解析完整回滚集（等待填入）：`crates/storage/provider/src/providers/n42_persist.rs`
+  `N42PlainReverts` / `n42_completed_output`，`database/provider.rs` `save_blocks_inner` 的 plain reverts 与
+  `write_state` 的慢路径，`consistent.rs` 六处内存块 changeset 读取；`crates/chain-state/src/in_memory.rs`
+  `n42_completed_outcome`（非 lean 通知的拷贝）。未登记的块按原样读取，行为不变。
+
+## 随计划提前预读账户（`N42_PLAN_AHEAD_WARM=<threads>`，默认关）
+- `crates/n42/engine-types/src/warm_ahead.rs`（新文件）：计划钩子（`payload.rs` `make_prepared_build`，需
+  `N42_PLAN_AHEAD_BODY=1`）在独立线程池 `n42-warm-*`（核心布局 `Set::Background`）上，以正在构建的块 N 所读的状态
+  （N 的父块，构建开始时 `note_base` 发布其 opener）读取下一计划的发送者与接收者账户，排除 N 所取计划触及的账户，
+  写入 `FrozenWarm`；块 N+1 仅在 N 于执行末尾按该计划整块封装（`note_built`）、N+1 的父块即该块（builder hash）
+  且祖父块即读取所用状态时，经 `WarmDb` 使用（`usable`），并在取用时去掉 N 的 beneficiary、提款接收者与系统合约。
+  不等待：未读完的分片为空，读穿到原链。`parallel_transfer.rs` 的 `FrozenWarm` 增加 `from_shards` 与命中计数
+  （`WarmDb` drop 时累加），`frame_blocks.rs` `PreparedBuild` 增加 `warm_id`。阶段行字段 `warm_ahead_accounts`、
+  `warm_ahead_ms`、`warm_ahead_hits`、`warm_ahead_ready`。不触及任何 fork 的 reth crate。说明见
+  `docs/BREAKTHROUGH_DESIGN.md` 10.122。
+
+## 构建批次内的预取（`N42_BUILD_MLP=<k>`，默认关）
+- `crates/n42/engine-types/src/parallel_transfer.rs` `build_mlp` / `set_build_mlp` / `prefetch_hint`，循环在
+  `execute_for_build_opts` 的 `run_batch`：执行第 i 笔前，先转换批次顺序中 k 笔之后的那笔（其池中交易此时读入，
+  `(T, TxEnv)` 存于 k + 1 的环中；发送者被跳过的尾部条目直接丢弃），并对其结果槽、以及发送者和接收者在批次自己
+  账户表中的条目（`batch_state.rs` `BatchState::prefetch_account`，只读探测加 `prefetcht0`）发出预取提示。
+  纯提示，结果不变（测试 `the_build_lookahead_equals_the_plain_build`）；阶段行字段 `par_mlp_k`；上限 256。
+  不触及任何 fork 的 reth crate。说明见 `docs/BREAKTHROUGH_DESIGN.md` 10.117 末段。
+- 账户预取提示穿过 provider 各层（同一开关）：fork 的 `storage-api` 给 `AccountReader` 与 `EvmStateProvider` 加
+  `n42_prefetch_account`（默认空实现，返回是否某层持有该账户；`delegate_provider_impls` 与 EVM 适配器转发），
+  `N42StateReader` 加 `prefetch_account`；`provider` 的 memory overlay（过滤器 + bundle 表探测）与 latest provider
+  （交给 QMDB reader）实现之；`twig-core` `SharedOffsetIndex::prefetch`（仅 `try_read` 成功时预取桶行，不等待、不计数）、
+  `qmdb-reth` `QmdbReadView::prefetch_account`；`engine-types` `ShardLayer` / `CountingStateProvider` 实现、
+  `AccountHint` 链（`ReadSetDb`、`WarmDb`、`CountedDb`、`StateProviderDatabase`）与 `BatchState::hint_account`；
+  阶段行字段 `par_mlp_hints`。

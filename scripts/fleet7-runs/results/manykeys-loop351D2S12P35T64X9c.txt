@@ -1,0 +1,33 @@
+== loop351D2S12P35T64X9c: 0 validator logs, f=-1, quorum 1
+1. the leaders' commit lines
+  R1_collect (proposal -> prepare QC): none
+  R2_collect (prepare QC -> commit QC): none
+  total (proposal -> commit): none
+2. vote collection at the traced leaders (first vote -> quorum -> last vote)
+  no trace lines: the leg ran without F7_TRACE_VALIDATOR
+ R1 (vote), 0 views:
+    proposal -> first vote: none
+    first vote -> quorum: none
+    quorum -> last vote: none
+    proposal -> last vote (the slowest key): none
+   views with fewer than -1 votes received: 0
+ R2 (commit_vote), 0 views:
+    proposal -> first vote: none
+    first vote -> quorum: none
+    quorum -> last vote: none
+    proposal -> last vote (the slowest key): none
+   views with fewer than -1 votes received: 0
+3. the straggler rule and the loop
+  proposal interval (same leader, consecutive views): none; >= 500 ms: 0
+  no `slow step` lines
+4. gossip propagation (proposal sent -> received at a traced follower)
+  no trace lines
+4b. the new fields (docs/E1_MANY_KEYS.md section 6), leaders' `block committed!` and `proposal sent` lines
+  verify_us: none
+  verify_n: none
+  verify_batches: none
+  verify_fallbacks: none
+  inbound_queue_max: none
+  gossip_poll_us: none
+5. validators
+  no valsample file

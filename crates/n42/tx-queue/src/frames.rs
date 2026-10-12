@@ -31,6 +31,19 @@
 //! (the canonical prune, [`FrameIndex::sweep`]): it can never be referenced
 //! whole again. What a build took, or an own block not yet committed, only
 //! makes the frame not whole-usable for the moment.
+//!
+//! With `N42_FRAME_SWEEP_AT_TAKE` (on unless `=0`) a frame taken whole into
+//! a build or a prepared plan leaves the live index at the take
+//! ([`FrameIndex::retire`]): builds walk live frames only. It is kept aside,
+//! out of the arrival walk but still found by id and by its first hash (the
+//! seal's layout, the settle and the plan's lowest nonces read it after the
+//! take), until the chain mines it (the sweep) or [`MAX_FRAMES`] newer ones
+//! push it out. A take that comes back to the lanes whole (a build given
+//! up, a prepared plan discarded) brings its frame back to the live index
+//! at its arrival position ([`FrameIndex::revive_by_first`]); a frame only
+//! partly returned (a build's tail handed back mid-frame) stays aside, and
+//! its transactions are frameless at their lanes: the slow puller and the
+//! per-transaction check take them, as before.
 
 use std::collections::VecDeque;
 
@@ -41,10 +54,25 @@ use reth_transaction_pool::{PoolTransaction, ValidPoolTransaction};
 
 use crate::Lane;
 
-/// The most frames the index holds; the oldest leave first past it. 16,384
-/// frames of 500 is 8.2M transactions, far past any queue's gate, so the
-/// bound only bites when nothing prunes (a node whose chain has stopped).
+/// The most frames the live index holds (and, apart, the most taken frames
+/// it keeps aside). 16,384 frames of 500 is 8.2M transactions, past any
+/// queue's gate -- but the bound is reached under load when taken frames
+/// stay indexed until the canonical prune sweeps them: loop351 stage ak
+/// held 16,384 from block ~1150 on with the queue pruner 140-157 blocks
+/// behind, 13-16k of them dead. With `N42_FRAME_SWEEP_AT_TAKE` (the
+/// default) taken frames leave at the take, and past the bound a new frame
+/// is refused (its transactions stay in the lanes for the slow puller)
+/// instead of evicting the oldest live one, whose transactions are still
+/// queued: an evicted live frame left them frameless at their lane heads,
+/// blocking every later frame of the same senders. With
+/// `N42_FRAME_SWEEP_AT_TAKE=0` the oldest frame leaves, as before.
 pub const MAX_FRAMES: usize = 16_384;
+
+/// `N42_FRAME_SWEEP_AT_TAKE`, read once: on unless `0`.
+pub(crate) fn frame_sweep_at_take() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FRAME_SWEEP_AT_TAKE").map_or(true, |v| v != "0"))
+}
 
 /// A frame's transactions as the queue holds them, in frame order, shared.
 pub type FrameTxs<T> = Arc<[Arc<ValidPoolTransaction<T>>]>;
@@ -419,11 +447,41 @@ pub(crate) struct FrameIndex<T: PoolTransaction> {
     /// Frames `note_frame` refused because their id was already indexed or
     /// their record was malformed; since the process started.
     pub(crate) refused: u64,
+    /// Frames indexed since the process started: what the continuous
+    /// plan-ahead preparer (`N42_PLAN_AHEAD_WAIT_MS`) reads to plan again
+    /// only when a frame has arrived.
+    pub(crate) inserted: u64,
+    /// `N42_FRAME_SWEEP_AT_TAKE`: taken frames leave the live index at the
+    /// take, and a full index refuses rather than evicts.
+    pub(crate) sweep_at_take: bool,
+    /// Frames taken whole, out of the live index ([`Self::retire`]).
+    retired: B256HashMap<FrameEntry<T>>,
+    /// Their ids in retirement order (an id no longer aside is skipped).
+    retired_order: VecDeque<B256>,
+    /// Transactions of frames pushed out of `retired` by the bound, for the
+    /// next sweep to hand to its caller to free off the lock.
+    retired_gone: Vec<FrameTxs<T>>,
+    /// Frames retired at a take, and frames refused at the bound; since the
+    /// process started.
+    pub(crate) swept_at_take: u64,
+    pub(crate) refused_at_cap: u64,
 }
 
 impl<T: PoolTransaction> Default for FrameIndex<T> {
     fn default() -> Self {
-        Self { frames: B256HashMap::default(), by_first: B256HashMap::default(), order: VecDeque::new(), refused: 0 }
+        Self {
+            frames: B256HashMap::default(),
+            by_first: B256HashMap::default(),
+            order: VecDeque::new(),
+            refused: 0,
+            inserted: 0,
+            sweep_at_take: frame_sweep_at_take(),
+            retired: B256HashMap::default(),
+            retired_order: VecDeque::new(),
+            retired_gone: Vec::new(),
+            swept_at_take: 0,
+            refused_at_cap: 0,
+        }
     }
 }
 
@@ -433,8 +491,15 @@ impl<T: PoolTransaction> FrameIndex<T> {
     }
 
     pub(crate) fn insert(&mut self, frame: NewFrame, txs: Option<FrameTxs<T>>) {
-        if self.frames.contains_key(&frame.id) {
+        if self.frames.contains_key(&frame.id) || self.retired.contains_key(&frame.id) {
             self.refused += 1;
+            return;
+        }
+        if self.sweep_at_take && self.frames.len() >= MAX_FRAMES {
+            // Refused, not evicting a live frame: its transactions are in
+            // the lanes already and the slow puller takes them.
+            self.refused += 1;
+            self.refused_at_cap += 1;
             return;
         }
         let Some((id, entry)) = FrameEntry::from_new(frame, txs) else {
@@ -446,6 +511,7 @@ impl<T: PoolTransaction> FrameIndex<T> {
         }
         self.frames.insert(id, entry);
         self.order.push_back(id);
+        self.inserted = self.inserted.wrapping_add(1);
         while self.frames.len() > MAX_FRAMES {
             let Some(oldest) = self.order.pop_front() else { break };
             if let Some(gone) = self.frames.remove(&oldest)
@@ -459,10 +525,109 @@ impl<T: PoolTransaction> FrameIndex<T> {
     }
 
     fn compact(&mut self) {
-        if self.order.len() > 2 * self.frames.len() + 64 {
-            let frames = &self.frames;
-            self.order.retain(|id| frames.contains_key(id));
+        // A frame aside keeps its arrival position: it comes back there.
+        if self.order.len() > 2 * (self.frames.len() + self.retired.len()) + 64 {
+            let (frames, retired) = (&self.frames, &self.retired);
+            self.order.retain(|id| frames.contains_key(id) || retired.contains_key(id));
         }
+    }
+
+    /// A frame taken into a build or a prepared plan, `taken` of its
+    /// transactions from its start (`N42_FRAME_SWEEP_AT_TAKE`): taken whole,
+    /// it leaves the live index for the frames aside; a cut frame's rest is
+    /// still in the lanes and the frame stays live. Returns whether it left.
+    pub(crate) fn retire(&mut self, id: &B256, taken: usize) -> bool {
+        if !self.sweep_at_take {
+            return false;
+        }
+        if !self.frames.get(id).is_some_and(|entry| taken >= entry.hashes.len()) {
+            return false;
+        }
+        let Some(entry) = self.frames.remove(id) else { return false };
+        self.retired.insert(*id, entry);
+        self.retired_order.push_back(*id);
+        self.swept_at_take += 1;
+        while self.retired.len() > MAX_FRAMES {
+            let Some(oldest) = self.retired_order.pop_front() else { break };
+            if let Some(gone) = self.retired.remove(&oldest) {
+                self.forget_first(&oldest, &gone);
+                if let Some(txs) = gone.txs {
+                    self.retired_gone.push(txs);
+                }
+            }
+        }
+        if self.retired_order.len() > 2 * self.retired.len() + 64 {
+            let retired = &self.retired;
+            self.retired_order.retain(|id| retired.contains_key(id));
+        }
+        true
+    }
+
+    /// A transaction back in its lane whose hash starts a frame aside: the
+    /// frame is live again, at its arrival position (a take given back
+    /// whole -- a build given up, a prepared plan discarded). Returns
+    /// whether a frame came back.
+    pub(crate) fn revive_by_first(&mut self, hash: &B256) -> bool {
+        if self.retired.is_empty() {
+            return false;
+        }
+        let Some(id) = self.by_first.get(hash).copied() else { return false };
+        let Some(entry) = self.retired.remove(&id) else { return false };
+        self.frames.insert(id, entry);
+        true
+    }
+
+    /// Frames aside now.
+    pub(crate) fn retired_len(&self) -> usize {
+        self.retired.len()
+    }
+
+    fn forget_first(&mut self, id: &B256, entry: &FrameEntry<T>) {
+        if let Some(first) = entry.hashes.first()
+            && self.by_first.get(first) == Some(id)
+        {
+            self.by_first.remove(first);
+        }
+    }
+
+    /// The frames aside whose first run the chain has mined leave for good,
+    /// their transactions (and those the bound pushed out) handed to `gone`
+    /// to be freed off the lock. One lane look-up a frame aside, not one a
+    /// run: the frames aside are up to [`MAX_FRAMES`] of hundreds of runs
+    /// each, and checking every run held the prune's lock 45 ms longer at
+    /// p90 in loop351 stage al (`X9FS`), long enough to make the plan
+    /// prepared after a take late for half the builds. A block takes a frame
+    /// whole, so its first run is mined with the rest; one mined some other
+    /// way leaves with the bound.
+    pub(crate) fn sweep_retired_into(&mut self, lanes: &AddressHashMap<Lane<T>>, gone: &mut Vec<FrameTxs<T>>) -> usize {
+        gone.append(&mut self.retired_gone);
+        let dead: Vec<B256> = self
+            .retired
+            .iter()
+            .filter(|(_, entry)| {
+                entry.runs.first().is_some_and(|run| lanes.get(&run.sender).is_some_and(|lane| lane.chain_mined(run.first_nonce)))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &dead {
+            if let Some(entry) = self.retired.remove(id) {
+                self.forget_first(id, &entry);
+                if let Some(txs) = entry.txs {
+                    gone.push(txs);
+                }
+            }
+        }
+        dead.len()
+    }
+
+    /// A frame live or aside, by id: for the reads that follow a take.
+    fn any(&self, id: &B256) -> Option<&FrameEntry<T>> {
+        self.frames.get(id).or_else(|| self.retired.get(id))
+    }
+
+    /// [`Self::runs_and_hashes`] of a frame live or aside.
+    pub(crate) fn runs_and_hashes_any(&self, id: &B256) -> Option<(&[SenderRun], &Arc<[B256]>)> {
+        self.any(id).map(|entry| (&entry.runs[..], &entry.hashes))
     }
 
     /// Drops every frame the chain has mined any transaction of: a lane
@@ -481,6 +646,7 @@ impl<T: PoolTransaction> FrameIndex<T> {
     /// under it. Each dropped frame's own `by_first` entry is removed by its
     /// first hash rather than by a pass over every indexed frame.
     pub(crate) fn sweep_into(&mut self, lanes: &AddressHashMap<Lane<T>>, gone: &mut Vec<FrameTxs<T>>) -> usize {
+        let aside = self.sweep_retired_into(lanes, gone);
         let dead: Vec<B256> = self
             .frames
             .iter()
@@ -506,7 +672,7 @@ impl<T: PoolTransaction> FrameIndex<T> {
         if !dead.is_empty() {
             self.compact();
         }
-        dead.len()
+        dead.len() + aside
     }
 
     /// [`Self::sweep_into`] over `ids` only, without compacting the arrival
@@ -664,7 +830,7 @@ impl<T: PoolTransaction> FrameIndex<T> {
     /// The transactions a frame was noted with, shared: `None` for a frame
     /// the index does not hold or one noted without them.
     pub(crate) fn txs_of(&self, id: &B256) -> Option<FrameTxs<T>> {
-        self.frames.get(id)?.txs.clone()
+        self.any(id)?.txs.clone()
     }
 
     /// How many indexed frames hold their transactions.
@@ -692,7 +858,7 @@ impl<T: PoolTransaction> FrameIndex<T> {
                 let start = at;
                 at = at.saturating_add(*len);
                 let slice = body.get(start..at)?;
-                let frame = self.frames.get(id)?;
+                let frame = self.any(id)?;
                 (&frame.hashes[..] == slice).then_some(*id)
             })
             .collect()
@@ -700,7 +866,7 @@ impl<T: PoolTransaction> FrameIndex<T> {
 
     /// A frame's transactions' hashes, in frame order.
     pub(crate) fn hashes_of(&self, id: &B256) -> Option<&[B256]> {
-        self.frames.get(id).map(|entry| &entry.hashes[..])
+        self.any(id).map(|entry| &entry.hashes[..])
     }
 
     /// The frame layout of a body given by its transactions' hashes: the
@@ -713,7 +879,7 @@ impl<T: PoolTransaction> FrameIndex<T> {
         let mut at = 0usize;
         while at < hashes.len() {
             let id = *self.by_first.get(&hashes[at])?;
-            let frame = &self.frames.get(&id)?.hashes;
+            let frame = &self.any(&id)?.hashes;
             let take = frame.len().min(hashes.len() - at);
             if frame[..take] != hashes[at..at + take] {
                 return None;

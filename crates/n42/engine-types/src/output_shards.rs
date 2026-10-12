@@ -167,6 +167,26 @@ pub fn merge_at_shards_ready() -> bool {
     *ON.get_or_init(|| std::env::var("N42_MERGE_AT_SHARDS_READY").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `N42_MERGE_SPLIT=1` (off by default): the leader's merge after the
+/// fields' publication -- the one that runs when `N42_MERGE_AT_SHARDS_READY`
+/// is off -- builds the account map and the revert set at once, the revert
+/// set on a scoped thread of its own ([`FrozenShards::merged_timed`] with
+/// `concurrent`), instead of one after the other on one thread. The bundle
+/// is assembled from both halves in the same order either way, so it is the
+/// same bundle; `StateReady` comes the reverts' half earlier (state 45 +
+/// reverts 44 ms at 200k transfers -> about the larger of the two). Read once.
+pub fn merge_split() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_MERGE_SPLIT").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Puts a block's complete revert set ([`FrozenShards::late_reverts`]) into
+/// the bundle [`FrozenShards::merged_state_first`] gave.
+pub fn complete_reverts(bundle: &mut BundleState, reverts: revm::database::states::reverts::Reverts, size: usize) {
+    bundle.reverts = reverts;
+    bundle.reverts_size = size;
+}
+
 /// `N42_SHARDS_BEFORE_RECEIPTS=1` (off by default,
 /// `docs/SHARED_EXECUTION_SCOPE.md` 18.7 item 4a): on a block that seals at
 /// the execution's end with its output left in its shards, the receipts from
@@ -1127,6 +1147,18 @@ pub struct EarlyOutput {
 }
 
 impl EarlyOutput {
+    /// Whether a batch wrote `address`: [`Self::account`]'s probes (the
+    /// part's index, then the batch map or the conflicts map it names)
+    /// without the sum or the copy -- the hint path (`N42_BUILD_MLP`).
+    pub fn holds(&self, address: &Address) -> bool {
+        let Some(part) = self.parts.get(shard_index(address, self.parts.len())) else { return false };
+        match part.index.get(address) {
+            None => false,
+            Some(&CONFLICT) => part.multi.contains_key(address),
+            Some(&id) => self.batches.get(id as usize).is_some_and(|batch| batch.contains_key(address)),
+        }
+    }
+
     /// The account `address` as the frozen set will hold it: the one batch
     /// that wrote it, or the first writer's with every other one's change
     /// added (`add_delta`).
@@ -2114,6 +2146,16 @@ impl FrozenShards {
         }
     }
 
+    /// Whether the batches wrote `address`, early or frozen, by the probes
+    /// [`Self::read_account`] makes and nothing more (no sum, no copy): the
+    /// probe is the prefetch of the hint path (`N42_BUILD_MLP`).
+    pub fn holds_hint(&self, address: &Address) -> bool {
+        match &self.early {
+            Some(early) => early.holds(address),
+            None => self.get(address).is_some(),
+        }
+    }
+
     /// The shards folded into one map after all, for a build that needs the
     /// block's state in its executor (a serial loop, a cache-reading finish):
     /// installed by `install_staged` exactly as a streamed graft is.
@@ -2275,6 +2317,51 @@ impl FrozenShards {
             };
             (bundle, split)
         })
+    }
+
+    /// `N42_ANSWER_BEFORE_REVERTS`: the account half of [`Self::merged_timed`]
+    /// (`pool` given: of [`Self::merged_on`]) -- the same accounts, contracts
+    /// and sizes -- with the block's own reverts (`residual`'s) only. The
+    /// shards' and the graft's reverts are added by [`Self::late_reverts`];
+    /// [`complete_reverts`] puts them in, and the bundle is then the one the
+    /// whole merge leaves. Returns the bundle and the account map's wall in
+    /// microseconds.
+    pub fn merged_state_first(&self, residual: &BundleState, pool: Option<&rayon::ThreadPool>) -> (BundleState, u64) {
+        let at = std::time::Instant::now();
+        let (state, size) = match pool {
+            Some(pool) => pool.install(|| self.merged_state_parallel(residual)),
+            None => self.merged_state(residual),
+        };
+        let state_us = at.elapsed().as_micros() as u64;
+        let mut contracts = self.contracts.clone();
+        contracts.extend(residual.contracts.iter().map(|(hash, code)| (*hash, code.clone())));
+        let reverts = residual.reverts.clone();
+        let reverts_size = reverts.iter().map(Vec::len).sum();
+        let state_size = usize::try_from(size.max(0)).unwrap_or(usize::MAX);
+        (BundleState { state, contracts, reverts, state_size, reverts_size }, state_us)
+    }
+
+    /// The other half of [`Self::merged_state_first`]: the block's complete
+    /// revert set and its size -- `block_reverts` (the residual's) with the
+    /// shards' sorted reverts appended as the merge appends them, then the
+    /// graft's (`graft`, as `append_reverts` adds them after the merge). On
+    /// `pool` the shards' set is copied in parallel, as [`Self::merged_on`]
+    /// copies it.
+    pub fn late_reverts(
+        &self,
+        block_reverts: revm::database::states::reverts::Reverts,
+        graft: Vec<(Address, AccountRevert)>,
+        pool: Option<&rayon::ThreadPool>,
+    ) -> (revm::database::states::reverts::Reverts, usize) {
+        let shards = match pool {
+            Some(pool) => pool.install(|| self.merged_reverts_parallel()),
+            None => self.merged_reverts(),
+        };
+        let reverts_size = block_reverts.iter().map(Vec::len).sum();
+        let mut carrier = BundleState { reverts: block_reverts, reverts_size, ..Default::default() };
+        crate::parallel_transfer::append_sorted_reverts(&mut carrier, shards);
+        crate::parallel_transfer::append_reverts(&mut carrier, graft);
+        (carrier.reverts, carrier.reverts_size)
     }
 
     /// The source maps in the serial merge's order: the v4 shards', then
@@ -2554,6 +2641,12 @@ impl AccountReader for ShardLayer {
             None => self.historical.basic_account(address),
         }
     }
+
+    /// The shard's probes for `address` as the hint (`N42_BUILD_MLP`); passed
+    /// beneath when the shards do not hold it.
+    fn n42_prefetch_account(&self, address: &Address) -> bool {
+        self.shards.holds_hint(address) || self.historical.n42_prefetch_account(address)
+    }
 }
 
 impl StateProvider for ShardLayer {
@@ -2747,6 +2840,113 @@ mod frozen_tests {
             assert_eq!(concurrent, on_path, "index {index} live {live}: concurrent against on-path");
             assert_eq!(sequential, on_path, "index {index} live {live}: sequential against on-path");
             assert!(split.total_us >= split.append_us);
+        }
+    }
+
+    /// `N42_MERGE_SPLIT`: the leader's merge after the publication, with its
+    /// two halves on two threads and the graft's reverts appended after it as
+    /// the leader appends them, is the bundle the one-thread merge leaves --
+    /// on a small shard set (under the parallel revert sort), in all three
+    /// fold modes, with a conflicting write, an executor change over the
+    /// shards and graft reverts that overlap the shards'.
+    #[test]
+    fn the_split_leader_merge_is_the_serial_one_on_a_small_shard_set() {
+        let wide = |i: u32| Address::from_word(B256::from(U256::from(0x3000_0000u64 + u64::from(i))));
+        for (index, live) in [(false, false), (true, false), (true, true)] {
+            let shards = OutputShards::with_index_live(addr(1), 64, 4, index, live);
+            for batch_no in 0..3u32 {
+                let mut builder = BundleState::builder(1..=1);
+                for i in 0..5u32 {
+                    let account = wide(batch_no * 5 + i);
+                    builder = builder
+                        .state_original_account_info(account, info(0, 1_000))
+                        .state_present_account_info(account, info(1, 990 - u64::from(i)))
+                        .revert_account_info(1, account, Some(Some(info(0, 1_000))));
+                }
+                builder = builder
+                    .state_original_account_info(addr(5), info(0, 50))
+                    .state_present_account_info(addr(5), info(0, 60 + u64::from(batch_no)))
+                    .revert_account_info(1, addr(5), Some(Some(info(0, 50))));
+                shards.add(builder.build());
+            }
+            let frozen = shards.freeze();
+            let residual = BundleState::builder(1..=1)
+                .state_original_account_info(wide(2), info(1, 988))
+                .state_present_account_info(wide(2), info(2, 900))
+                .state_present_account_info(addr(8), info(0, 3))
+                .revert_account_info(1, addr(8), Some(None))
+                .build();
+            let graft = || -> Vec<(Address, AccountRevert)> {
+                let revert = |balance| AccountRevert {
+                    account: revm::database::states::reverts::AccountInfoRevert::RevertTo(info(0, balance)),
+                    ..Default::default()
+                };
+                vec![(addr(9), revert(7)), (wide(4), revert(11))]
+            };
+            let (mut serial, _) = frozen.merged_timed(&residual, false);
+            crate::parallel_transfer::append_reverts(&mut serial, graft());
+            let (mut split, timing) = frozen.merged_timed(&residual, true);
+            crate::parallel_transfer::append_reverts(&mut split, graft());
+            assert_eq!(serial.state.len(), 15 + 2, "index {index} live {live}");
+            assert_eq!(split, serial, "index {index} live {live}: split against serial");
+            assert!(timing.total_us >= timing.append_us);
+        }
+    }
+
+    /// `N42_ANSWER_BEFORE_REVERTS`: the account half first and the revert
+    /// set completed afterwards leave the bundle the whole merge (and the
+    /// graft's reverts appended after it) leaves -- accounts, sizes,
+    /// contracts and every revert -- on the caller's thread and on a pool,
+    /// in all three fold modes, with conflicting writes, an executor change
+    /// over the shards and graft reverts that overlap the shards'.
+    #[test]
+    fn the_late_revert_set_completes_the_bundle_the_whole_merge_leaves() {
+        let wide = |i: u32| Address::from_word(B256::from(U256::from(0x2000_0000u64 + u64::from(i))));
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().expect("pool");
+        for (index, live) in [(false, false), (true, false), (true, true)] {
+            let shards = OutputShards::with_index_live(addr(1), 12_000, 16, index, live);
+            for batch_no in 0..8u32 {
+                let mut builder = BundleState::builder(1..=1);
+                for i in 0..900u32 {
+                    let account = wide(batch_no * 900 + i);
+                    builder = builder
+                        .state_original_account_info(account, info(0, 1_000))
+                        .state_present_account_info(account, info(1, 900 + u64::from(i % 5)))
+                        .revert_account_info(1, account, Some(Some(info(0, 1_000))));
+                }
+                builder = builder
+                    .state_original_account_info(addr(5), info(0, 50))
+                    .state_present_account_info(addr(5), info(0, 50 + u64::from(batch_no)))
+                    .revert_account_info(1, addr(5), Some(Some(info(0, 50))));
+                shards.add(builder.build());
+            }
+            let frozen = shards.freeze();
+            let residual = BundleState::builder(1..=1)
+                .state_original_account_info(wide(3), info(1, 900))
+                .state_present_account_info(wide(3), info(1, 950))
+                .state_present_account_info(addr(8), info(0, 3))
+                .revert_account_info(1, addr(8), Some(None))
+                .revert_account_info(1, wide(4), Some(Some(info(0, 1_000))))
+                .build();
+            // Graft reverts: one the shards also hold, two of their own.
+            let graft = |_: ()| -> Vec<(Address, AccountRevert)> {
+                let revert = |balance| AccountRevert {
+                    account: revm::database::states::reverts::AccountInfoRevert::RevertTo(info(0, balance)),
+                    ..Default::default()
+                };
+                vec![(addr(9), revert(7)), (wide(10), revert(11)), (addr(2), revert(13))]
+            };
+            let (mut whole, _) = frozen.merged_timed(&residual, false);
+            crate::parallel_transfer::append_reverts(&mut whole, graft(()));
+            for on_pool in [None, Some(&pool)] {
+                let (mut first, _) = frozen.merged_state_first(&residual, on_pool);
+                assert_eq!(first.state, whole.state, "index {index} live {live} pool {}", on_pool.is_some());
+                assert_eq!(first.reverts, residual.reverts, "handed out with the block's own reverts");
+                let (reverts, size) = frozen.late_reverts(residual.reverts.clone(), graft(()), on_pool);
+                complete_reverts(&mut first, reverts, size);
+                assert_eq!(first, whole, "index {index} live {live} pool {}", on_pool.is_some());
+                assert!(first.reverts_size >= 7_200);
+            }
         }
     }
 

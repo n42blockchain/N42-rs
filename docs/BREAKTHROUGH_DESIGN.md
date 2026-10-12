@@ -3435,3 +3435,345 @@ All legs: 200,000-transaction blocks, occupancy 99.6-100%, BODYGATE clean except
 **Where it stands.** On this box one execution layer serving seven validator keys sustains about 3.9M transactions a second at a 51 ms cycle, reproducibly, with a best window of 4.03M and a best round of 348M transactions. The leader's build is no longer the limit (`sealed_at` 33 ms); the limit is the rate at which the layer completes its per-block serial chains (QMDB root 37 ms, hand-off + newPayload ~38 ms, persistence 33-41 ms), and every switch that removed one wait only exposed the next one at the same 51 ms. Reaching 5M needs those chains under ~30 ms through pipelined root computation, sharded static-file persistence and a shorter answer chain, which is structural work, not tuning.
 
 Hand-off files: `target/fleet-runs/loop351{ac,ad}.out`.
+
+### 10.108 loop351 stage af — parallel QMDB apply and bulk static-file append both do their local job and the cycle stays 51 ms; the answers arrive in pairs, and the forest lock chain is the suspect
+
+Stage af tested the two per-block cuts that 10.107 named: `PA` = `N42_QMDB_PARALLEL_APPLY=1` (the QMDB root's structural writes under the tree lease on the worker pool) and `BA` = `N42_SF_BULK_APPEND=1` (the static-file transaction rows appended as one write per chunk instead of 200,000 `append_column` calls). Same E=1 shape, X7 + plain S1 set + `N42_SHARD_MIX=1`, 200,000-transaction blocks; the control is the stage-ad SMe leg. Columns: w1 / w2 / w3 in M tx/s, round total in M tx, `cycle` = mean proposal cycle of window 1 (ms).
+
+| leg | pacing | w1 | w2 | w3 | round total | cycle | note |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| D2S12P35T64X7SMe | 35 | 3.913 | 3.760 | 3.740 | 342.4 | 46.8 | control |
+| D2S12P35T64X7SMPA | 35 | 3.884 | 3.687 | 3.720 | 338.7 | 48.6 | PA |
+| D2S12P35T64X7SMPABA | 35 | 3.973 | 3.900 | 3.907 | 353.4 | 47.4 | PA + BA, round best so far |
+| D2S12P30T64X7SMPABA | 30 | 4.025 | 3.833 | 3.700 | 346.8 | 43.1 | PA + BA |
+| D2S12P30T64X7SMPABAb | 30 | -- | -- | -- | -- | -- | no windows: funding failed |
+| D2S12P40T64X7SMPA | 40 | 3.927 | 3.740 | 3.720 | 341.6 | 49.4 | PA |
+| D2S12P40T64X7SMPABA | 40 | 3.804 | 3.807 | 3.587 | 335.9 | 49.9 | PA + BA |
+| D2S12P55T64X7SMPABA300 | 55 | 3.780 | 3.460 | 3.350 | 317.7 | 78.3 | 300,000-tx blocks |
+| D2S12P70T64X7SMPABA400 | 70 | 3.280 | 3.227 | 3.280 | 293.6 | 119.4 | 400,000-tx blocks |
+
+The `analyze334.py` cycle is the validator-0 proposal mean (46.8-49.9 here; its median is 37-42); the answer inter-arrival mean below (51-53 ms) is the figure 10.107 calls the cycle. A second P40 PA leg (3.86 / 3.91 / 3.54) was read from the run output, not re-analysed.
+
+- **Both switches engaged.** The startup lines are `n42.qmdb` "QMDB block apply" `parallel_apply=true rayon_threads=16` (PA, PABA legs; `false` in the control, found in `node0-v.log` of the E=1 fleet, not in the execution layer's log) and `N42_SF_BULK_APPEND bulk_append=true` (PABA legs; `false` in the control and the PA legs, in `node0-el.log`).
+- **P30 repeat leg.** `D2S12P30T64X7SMPABAb` printed no window lines because the flood's funding step failed (`12499 submitted, 1 rejected`, one raw transaction refused with `-32602 expected a valid hex string`, then `funding did not mine within 120s`); the chain produced only empty blocks and both switches were engaged, so the leg says nothing about them.
+
+Side by side, window 1, median / p90 in ms (`lease.py` over `node0-el.log` for the lease and answer rows, `analyze334.py` and `persist340.py` for the rest):
+
+| | SMe P35 | PA P35 | PABA P35 | PA P40 | PABA P40 |
+| --- | --- | --- | --- | --- | --- |
+| lease `root_compute` | 33.0 / 46 | 25.9 / 42 | 27.0 / 44 | 26.0 / 41 | 26.6 / 43 |
+| lease `apply_total` | 29.3 / 42 | 18.6 / 33 | 20.0 / 34 | 19.2 / 31 | 19.6 / 34 |
+| apply leaves / writes | 9.4 / 8.6 | 4.0 / 4.0 | 4.3 / 4.5 | 3.9 / 4.3 | 4.1 / 4.5 |
+| delta / note | 2.2 / 0.1 | 1.4 / 0.2 | 1.4 / 0.2 | 1.4 / 0.2 | 1.4 / 0.2 |
+| `on_canonical` waits per block | 0.41 | 0.11 | 0.11 | 0.11 | 0.11 |
+| `on_canonical` wait sum per block | 13.7 | 4.4 | 3.2 | 3.6 | 4.4 |
+| persistence total / `sf_tx` | 36.4 / 32.8 | 35.0 / 31.2 | 28.5 / 25.0 | 36.0 / 32.5 | 30-32 (w2-3) |
+| answer inter-arrival median / p90 (mean) | 41.0 / 98.5 (51.6) | 41.5 / 106 (53.4) | 35.6 / 112 (51.4) | 38.2 / 110 | 42.3 / 112 |
+| hand-off | 18 / 37 | 20 / 48 | 21 / 46 | 19 / 41 | 20 / 48 |
+| `roots_ms` | 38 / 55 | 31 / 51 | 31 / 52 | 31 / 50 | 32 / 51 |
+| `finish_ms` | 153 / 178 | 142 / 168 | 141 / 171 | 140 / 165 | 143 / 168 |
+| leader `sealed_at` | 32 / 46 | 32 / 44 | 32 / 46 | 31 / 44 | 31 / 42 |
+| leader `par_ms` (`par_exec`) | 34 (16) | 34 (17) | 34 (16) | 34 (16) | 33 (16) |
+
+- **PA does what the microbenchmark said.** The apply falls 29.3 -> 18.6 ms, `root_compute` 33 -> 26, the build's `roots_ms` 38 -> 31, and the `on_canonical` lock wait from 13.7 to 4.4 ms a block (0.41 -> 0.11 waits a block; each wait is still 26-31 ms when it happens). **BA does about half of what was expected**: `sf_tx` 33 -> 25-27 ms, persistence 36-39 -> 28.5-30.7 ms a block (-7..-8, the bound was -8..-16).
+- **And nothing downstream moves.** Answer inter-arrival mean 51.4-53.4 ms in every leg, hand-off 18-21 ms (p90 37-48), `sealed_at` 31-32, the leader's `par_ms` 33-34. TPS stays inside the 10.107 noise (PABA P35 3.97 / 3.90 / 3.91 is the best round, 353M, and the repeat at P40 reads 3.80 / 3.81 / 3.59).
+- **The answers arrive in pairs.** The inter-arrival of `own block imported by header` is not a steady 51 ms: p25 21-24 ms, median 36-42, p75 76-77, p90 98-112, `frac < 10 ms` 0 (SMe 24.2 / 41.0 / 75.5 / 98.5; PABA 20.6 / 35.6 / 76.9 / 111.5). Two blocks land about 22 ms apart, then a gap of about 76, so the layer completes about two blocks per ~100 ms.
+
+Block-size scaling (PABA legs, window 1, ms):
+
+| block | cycle (answer mean) | `root_compute` | persistence | hand-off | `sealed_at` |
+| --- | --- | --- | --- | --- | --- |
+| 200k | 51 | 27 | 28.5 | 21 | 32 |
+| 300k | 78 (3.78M) | 40 | 55 | 30 | 46 |
+| 400k | 119 (3.28M) | 53 | 82 | 38 | 66 |
+
+- **What binds now.** Not the lease hold alone: cutting it by 7-10 ms and the `on_canonical` wait by 9 ms a block left the answer rate untouched, and every chain (lease, hand-off + header newPayload, persistence) scales linearly with the accounts a block touches (no fixed part: 51 / 80 / 122 ms at 200k / 300k / 400k). Persistence is the nearest wall at the larger blocks (55 and 82 ms against cycles of 78 and 119) and runs at 57-76% duty at 200k.
+- **Hypothesis (under test, not a finding): the forest lock chain is the ~100 ms-per-two-blocks resource.** A block holds the tree lease for `root_compute` 26 ms, and the persistence thread takes it for `qmdb_persisted` 13 ms a block, persisting two blocks per hold, plus the canonical trims (`on_canonical`, 4-9 ms of waiting a block): about 26 + 13 + trims per block, serial, which fits a pair of answers per ~100 ms. The only hint in the logs is `forest lock waited on_persisted_parts ms=347 held_by=compute_operations` (twice in the PA leg); I did not trace lease occupancy second by second. An agent is now instrumenting the lock and moving `on_persisted` and the trims off it; the result decides whether a 40 ms cycle (every chain under ~30 ms a 200k block) is a lock-structure change or the three-project job 10.107 listed.
+
+Hand-off files: `target/fleet-runs/loop351af*.launch.out`, the per-leg `bench-<leg>.out` and `mem-<leg>.txt`.
+
+### 10.109 loop351 stages ag-ak — the answer-at-insert cut moves the answer 18 ms earlier and the cycle does not follow; the median cycle already sits on the 35 ms tick, the mean is the tail; two build-store pin defects fixed; the small-block attractor
+
+Stages ag-ak (2026-10-10/11, trees fc442cc93 .. 6ddcd2159) tested the last cut on the own-block answer that 10.108 left open, after the forest lock-chain hypothesis of 10.108 was refuted by the always-on `forest occupancy` line (716592ebf): the lease is held 26 ms for the root and 13 ms for persistence per block, with no queueing between them.
+
+**The cut.** The critical path measured in stage ag was proposal(N+1) = answer(N-3) + 8 ms and answer = seal + 194 ms (state ready at seal + 152, the hand-off at +18, the header newPayload and the `own block imported by header` answer at +24). `N42_ANSWER_AT_INSERT=1` (AAI, 5b8e98adc, `bin/n42/src/answer_at_insert.rs`) answers VALID as soon as the hand-off's insert returns `Ok(true)`, dispatches the header newPayload on the FIFO engine channel before the answer and awaits it on a side task; INVALID, SYNCING or a lost reply latch the next answer; each answer waits for the previous pass.
+
+**Results** (window 1 / 2 / 3, M TPS; the cycle is the mean over the window):
+
+| stage | leg | w1 | w2 | w3 | cycle ms | note |
+| --- | --- | --- | --- | --- | --- | --- |
+| ag | X9 base, warm leg | 4.23 | 3.91 | 3.79 | 47 | window-1 record |
+| aj | X9e control | 3.67 | 2.68 | 2.67 | 54/75/75 | degraded host |
+| aj | X9 AAI | 3.85 | 2.85 | 1.99 | 52/70/100 | bodygate: own block 2081 never imported |
+| ak | X9f P35 control | 3.85 | 4.04 | 3.92 | 52/50/51 | the only leg flat at 4M |
+| ak | X9g P35 control | 3.95 | 2.85 | 2.71 | 51/70/74 | same configuration as X9f |
+| ak | X9f P30 control | 3.66 | 2.80 | 2.75 | 55/71/73 | |
+| ak | X9 AAIc P35 | 3.85 | 2.94 | 2.61 | 52/68/77 | |
+| ak | X9 AAIc P30 | 3.47 | 2.80 | 2.76 | 58/71/72 | |
+| ak | X9 AAIc P25 | 3.31 | 2.73 | 2.71 | 60/73/74 | |
+| ak | X9 AAId P35 | 3.51 | 2.68 | 1.96 | 57/70/41 | w3 at 40% occupancy, 57 of 729 blocks full |
+
+Every stage ak bodygate passed (`own_not_committed=0`, `proposals_given_up=0`). AAI never beat its control on window 1 and tighter pacing made it worse.
+
+**The host confound.** From stage ah on, the box carried 20 GB of gov5's leaked `/tmp/erigon-lfp-buf-*` files on the tmpfs (Shmem 28-31 GB, 21,857 then 23,661 files), the huge-page pool after `hugeprep` was 29-31 GB and the file cache near zero. Window 2 and 3 collapses (cycle 70-77 ms) appear in control and AAI legs alike, and two legs of one configuration (X9f, X9g) differ by 1.2M on window 2 with identical memory lines. Within a leg the collapse is the whole build chain growing, not the hand-off: against X9f window 2, X9g and AAIc window 2 read `sealed_at_ms` 32 -> 54/53, seal to state ready 159 -> 180/201, seal to root end 64 -> 71/83, while the merge stays at 91-95 ms and `insert_wait_ms` is 0 with `moved_body` 100% everywhere. Until the files are deleted only window 1 of a warm leg is a measurement, and only relative to a control in the same state.
+
+**What AAI does and why the cycle ignores it.** Per-block timing over all seven validator logs (proposal time = the first `proposal sent view=N` across the logs, so the rotating leader is picked by view; `scratchpad/crit5.py`):
+
+| leg, window | cycle median (mean) | sealed_at | seal -> state ready | seal -> answer | state ready -> answer | prop(N+1) - answer(N-3) |
+| --- | --- | --- | --- | --- | --- | --- |
+| X9f w1 | 38.6 (51.9) | 33 | 155 | 200 | 42 | 24 |
+| X9g w1 | 39.8 (50.7) | 34 | 152 | 199 | 44 | 25 |
+| AAIc P35 w1 | 42.8 (52.0) | 36 | 163 | 190 | 24 | 29 |
+| AAId P35 w1 | 46.0 (57.1) | 42 | 163 | 193 | 27 | 31 |
+| X9f P30 w1 | 42.4 (54.6) | 38 | 152 | 202 | 50 | 24 |
+| AAIc P30 w1 | 47.5 (57.8) | 40 | 165 | 198 | 27 | 29 |
+
+AAI cuts state ready -> answer from 42-50 ms to 24-27 ms as designed, with no INVALID, SYNCING or lost answers in 20k own blocks. The proposal does not follow: prop(N+1) - answer(N-3) grows from 24 to 29-31 ms, so the next proposal was never waiting on the answer in these legs; the 8 ms of stage ag was a property of that warm leg. Two things the table says that 10.107-10.108 did not: the **median** cycle is 38-40 ms, on the 35 ms pacing tick, and the **mean** of 50-52 ms that sets the throughput is the tail -- blocks whose seal came late (`sealed_at_ms` is the field that moves first). Shortening the answer path removes nothing from a block that is already sealed on the tick and adds nothing to the blocks in the tail. AAI stays off (it costs a side task per block and has no win to show); the code stays for a host whose cycle is answer-bound.
+
+**Two build-store defects found on the way, both fixed unconditionally.** (1) Stage aj's bodygate: with KEEP=3, three tiny blocks sealed within 100 ms (a starved queue on the degraded host) evicted sealed-but-not-handed-off build 2081; every validator's import then took the compact-body road with the transactions already gone, the block never reached the tree and the views timed out. `pin_sealed` on BUILD_ON_OWN now pins the parent build until its hand-off (ce9497758), released at WARN when the canonical head passes it, capped at 4 x keep. (2) Stage ak's ~2,500 WARN lines per leg were all in the empty-block phases: there the hand-off of N lands before the build request for N+1 pins it, and the late pin was only let go when the chain passed it. `Entry.handed_off` makes a late pin a no-op (6ddcd2159). Neither changes a loaded block.
+
+**The small-block attractor (AAId window 3).** From first full block + 60 s the blocks dropped to 49-87k transactions (median 65k) with 2.52M queued, 2.51M usable and nothing parked; the flood's pool stayed at its 2.5M cap with 0 rejected. The builds were correspondingly short (`sealed_at_ms` 21, state ready 38, cycle 36 ms) and the layer ran at 1.8M TPS at 40% occupancy. The block lines show `par_pull_ms=0` on the small blocks and `par_pull_ms=74` on the one 200k block among them: the build-ahead on the early seal takes whatever the queue's bulk pull has ready when the seal arrives, and once a block is small its cycle is shorter, so the next pull has even less time -- a stable regime where transactions per block = pull rate x cycle. 200k per 36 ms is 5.5M tx/s from a queue that is ingesting 3M tx/s at the same time, and the flood's reply time rose from 65 to 90-118 ms per node at the same moment, so the ingest and the pull contend. This is the first sign of the queue's supply rate as a limit and it is exactly the regime 5M needs (200k per 40 ms); what triggered the first short pull is not in the logs.
+
+**Where this leaves 5M.** The tick is the floor of the median cycle, the tail is the host and the build chain, and the queue's pull must keep 200k ready every 40 ms. In order: (a) a healthy host (the tmpfs files), then a warm-leg repeat of X9 to re-establish the 4.2M window; (b) `pull_bulk_txs` kept ready ahead of the seal (a pre-pulled 200k batch per block, refilled while the previous block builds) so the block size is independent of the cycle; (c) the pre-seal tail (`sealed_at_ms` 32 -> 54 under contention: the parallel execution's threads against the merge and persistence of the previous blocks); (d) pacing below 35 only after (b).
+
+### 10.110 loop351 stage al — the frame index: taken frames swept at the take remove the dead-frame walk and the small-block attractor; alone the sweep empties the plan prepared after a take (3.1M), with the plan wait it equals the control (4.07M) and holds window 3
+
+Stage ak's AAId window 3 (10.109) was traced to the transaction queue's frame index (`docs/SHARED_EXECUTION_SCOPE.md` 16.4.2): a taken frame stayed in the index until the pruner swept it, the pruner ran 140-157 blocks behind under load, the index sat at its 16,384 cap from block ~1150 in every leg (13-16k dead frames skipped per build; the control X9f skipped a median 2,800 and up to 15,673), and past the cap live frames were evicted, their transactions left frameless at their senders' lane heads, where they blocked every later frame of those senders. The fix (1b9327599, on by default, `N42_FRAME_SWEEP_AT_TAKE=0` is the old behaviour) retires a frame from the planner's walk at the take and refuses a new frame at the cap instead of evicting a live one; a given-up build's frames are revived at their arrival position. `N42_PLAN_AHEAD_WAIT_MS` (8261ee674, 16.4.1) prepares the next plan continuously and lets a build wait for it.
+
+| leg (P35, X9 set) | w1 | w2 | w3 | cycle median w1 (mean) | sealed_at | plan_ahead=1 on full builds | frames skipped median / max | index median / max |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X9h, sweep off | 4.14 | 3.99 | 3.73 | 38.6 (48.3) | 32 | 1825 / 1827 | 2,800 / 15,673 | 7,455 / 16,384 |
+| X9FS, sweep on | 3.13 | 2.73 | 2.57 | 55.3 (64.2) | 50 | 720 / 1308 | 0 / 0 | 4,750 / 5,494 |
+| X9FSb, sweep on | 3.02 | 2.56 | 2.43 | 57.7 (66.6) | 55 | 608 / 1242 | 0 / 0 | 4,788 / 5,496 |
+| X9FSPW30, sweep on + wait 30 ms | 4.07 | 3.92 | 3.83 | 39.7 (49.2) | 34 | 1826 / 1836 | 0 / 0 | 4,651 / 5,114 |
+| X9i, sweep off | 3.83 | 2.84 | 2.72 | -- | -- | -- | -- | -- |
+
+The sweep does its local job: no frame is ever skipped, the index holds the ~4,700 live frames of the 2.4M queue, 400 leave per take, nothing is refused. But with it alone the plan prepared right after a take is empty for half the builds (`plan_ahead=0`, age 320 us against 28.8 ms in the control, `start_walk_ms` up to 132) and the pre-seal time doubles (`sealed_at_ms` 50-59). A reading that the sweep left the taken transactions at their senders' lane heads was refuted in the code (`check_runs_of` reads the lanes only, and every lock settles the take before planning); a second reading, that the prune's sweep of the retired frames held the queue lock too long (72 ms at p90 against 27, 1,644 off-lock commit races) was fixed in e299a6561 and changed nothing in stage am. The 30 ms wait covers it (median wait 608 us, 7 timeouts in 1,836 builds) and the leg equals the control on window 1 and is the flattest of the stage on window 3. Stage am repeated the comparison and the cause of the late plan is still being traced (below).
+
+What this is and is not: the dead-frame walk cost the control nothing visible (`start_walk_ms` median 0), so the sweep is a guard against the attractor and the eviction of live frames, not a cut in the cycle. The cycle's median is still the 35 ms tick and its mean is still the tail of late seals.
+
+**Stage am (tree ef69c3ebc, the same degraded host, Shmem 31 GB; its first run stopped on the control, below).**
+
+| leg (P35, X9 set) | w1 | w2 | w3 | plan_ahead=1 on full builds | frames skipped median | index median / max | fresh walk max ms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| X9j, sweep off | 3.07 | 2.76 | 2.71 | 1319 / 1323 | 11,671 | 16,384 / 16,384 | 8 |
+| X9FS2, sweep on | 3.14 | 2.66 | 2.59 | 691 / 1306 | 0 | 4,803 / 5,494 | 153 |
+| X9FS2b, sweep on | 3.12 | 2.73 | 2.59 | 657 / 1315 | 0 | 4,780 / 5,501 | 104 |
+| X9FS2PW30, sweep on + wait 30 ms | 4.14 | 3.92 | 3.90 | 1847 / 1855 | 939 | 4,676 / 5,080 | 5 |
+
+Two rounds now say the same thing: the sweep with the continuously prepared plan (`N42_PLAN_AHEAD_WAIT_MS=30`: median wait 0, 4 timeouts) holds 3.9M through window 3 on a host where the control without the sweep reads 3.07 / 2.76 / 2.71 and sits at the index cap with 11.7k dead frames skipped per build. The window 2-3 collapse that 10.109 charged to the host is, at least in large part, the frame index at its cap: a slower host puts the pruner further behind, the index fills with dead frames, live frames are evicted and the walk degrades. The sweep alone still finds no plan after half its takes (the one-shot preparation after the take; the continuous one does not fail) and its fresh walk at the build start is slow (100-153 ms with nothing skipped); that is the open item, and until it is closed the wait is part of the configuration.
+
+The first run of stage am stopped on its control at block 1032 with a new failure: a validator's build-ahead on a stale parent (1020, with 1023 committed; the parent is the block whose import finished last, 2-3 blocks behind its votes) became a payload build of a sibling 1021', `compute_operations` moved the forest's tree back to 1020 (the undos of 1021-1031 dropped, the lock held 555 ms), persistence then listed canonical 1021 while the tree stood on 1021' and invalidated the read view ("a persisted block's changes are not on the tree's path"), after which every read was declined (`N42_HASHED_TABLES=off` leaves nothing else) and 1032 was judged invalid. Stale build-aheads happen 0-7 times a leg and only kill when the stale parent is exactly the view's head; the code had always allowed it. Fixed three ways: `QmdbForest::restore_path_to` stands the tree back on the persisted blocks' path in `list_persisted`'s fallback (dd3a7649b); a payload build whose parent is a strict ancestor of the canonical head is refused before the tree moves (`check_build_parent`, `StateError::StaleBuildParent`, 5d9fa0349; imports and validation still move the tree, a side block can arrive legitimately); the validator skips a build-ahead whose parent is below its committed height (12d5b7c07).
+
+### 10.111 loop351 stage an — the frame sweep alone, with the planner's checks on the queue's own pool, holds 3.9-4.1M through every window; 30 ms pacing now holds; round record 368.4M, window-1 record 4.25M
+
+Stage am's open item (10.110: with the sweep on, half the plans prepared after a take came late and the fresh walk at the build start took 100-153 ms) had two causes that exist only once the dead frames are gone (28443101b). In the control the dead frames filled the planner's parallel window, so every plan fell through to the serial walk, which takes as it goes on the calling thread and stores its plan in its first lock hold. With the sweep the parallel part does the real work: its `check_runs` ran on the global rayon pool behind the executing block's jobs (`start_walk_check_us` p90 8.4 ms, max 152), and the off-lock preparation committed its takes in a second lock hold that raced the build start, the hand-off and the prune (1,678 refused commits and 760 locked replans in X9FS2, none in the control). Now the checks run on the queue's own 8-thread pool (the one the forget step uses; both only run under the lanes' lock) and, with the sweep on, the preparation stores in its first hold. A production-shaped test (2.4M queued in 500-transaction frames, a 200k take, `--release`, ignored by default) reads the same walk (6.4 ms) and preparation (53 vs 59 ms, its own settle included) with the sweep on and off.
+
+Tree 1e69a5032 also carries the three guards against the stage am stall (10.110; the build refusal is on only for a chain whose genesis names a HotStuff-2 validator set, 1e69a5032, because an APoS chain forks legitimately). The legs, on the same degraded host (Shmem 31 GB, pool 28-29 GB after `hugeprep`):
+
+| leg (X9 set) | pacing | w1 | w2 | w3 | round (3 windows) | cycle w1 | plan_ahead=1 | frames skipped median | index median / max |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X9k, sweep off | 35 | 3.88 | 3.03 | 3.04 | 298.4M | 52 | 1541 / 1543 | 11,400 | 16,384 / 16,384 |
+| X9FS3, sweep on | 35 | 4.13 | 3.99 | 3.94 | 362.0M | 48 | 1866 / 1871 | 0 | 4,750 / 5,115 |
+| X10 = sweep + wait 30 ms | 35 | 4.06 | 3.79 | 4.05 | 357.2M | 49 | 1843 / 1845 | 0 | 4,751 / 5,113 |
+| X10b | 35 | 4.25 | 4.02 | 3.81 | 362.6M | 47 | 1871 / 1873 | 0 | 4,763 / 5,110 |
+| X10 | 30 | 4.25 | 3.89 | 4.09 | 367.2M | 47 | 1893 / 1894 | 0 | 4,737 / 5,107 |
+| X10b | 30 | 4.20 | 4.05 | 4.03 | 368.4M | 48 | 1903 / 1904 | 0 | 4,730 / 5,110 |
+
+Every bodygate passed; no stale-build refusal or skipped build-ahead was needed in these legs. What the stage says:
+
+- The sweep alone now does it: `plan_ahead=1` on 99.7% of full builds with no wait, the fresh walk at 0 ms, and 3.9-4.1M through window 3 where the control (index at its cap, 11,400 dead frames skipped per build) reads 3.0M. The wait switch costs nothing (median 0, max 26-39 ms, no timeouts) and stays in the X10 set as a guard; the sweep is on by default.
+- The window 2-3 collapse of stages ah-am was the frame index, not the host: five sweep legs in a row hold 3.8-4.1M in every window on the host that 10.109 called degraded.
+- 30 ms pacing holds (10.107 had every pacing below 35 collapse): both P30 legs are the two best rounds ever (367.2M and 368.4M, against 353.4M in 10.108), the window-1 record is 4.25M (4.23M before, on a warm leg) and the cycle at 30 ms pacing is 47-50 ms in every window, so the pacing is no longer what sets the cycle -- the layer's rate is.
+- The 1,543 full builds of the control against 1,871-1,904 for the sweep legs are the same 90 s: the sweep legs sealed 20% more blocks.
+
+Next: pacing 25 and 28 ms on the X10 set with repeats (the tick is no longer the floor, so the layer's per-block rate is what the next cut must shorten: seal 32-35 ms, state ready at +150, the merge 92 ms, and the 35 ms tick's replacement), and a warm-host repeat once the tmpfs files are gone.
+
+### 10.112 loop351 stage ao — pacing 25, 28, 30 and 35 ms read the same 4.2-4.26M window 1 at a 47 ms cycle: the pacing is out of the picture, the seal chain is the floor of the median and the tail is the mean
+
+Stage ao ran the X10 set (10.111) at four pacings on tree b90dae8cc, the same host (pool 27-29 GB):
+
+| pacing | w1 | w2 | w3 | round | cycle (every window) | cycle median w1 | sealed_at w1 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 25 | 4.26 | 4.03 | 3.97 | 367.9M | 47-50 | 37.4 | 32 |
+| 25 (b) | 4.23 | 3.79 | 3.33 | 340.4M | 47-60 | 38.8 | 33 |
+| 28 | 4.25 | 3.95 | 3.83 | 361.0M | 47-52 | -- | -- |
+| 28 (b) | 4.26 | 3.97 | 4.06 | 368.5M | 47-50 | 36.5 | 32 |
+| 30 (c) | 4.20 | 3.95 | 3.83 | 359.6M | 48-52 | -- | -- |
+| 35 (c) | 4.23 | 3.90 | 4.04 | 365.0M | 47-51 | -- | -- |
+
+Window 1 is 4.20-4.26M at every pacing (the window-1 record is now 4.258M, at 25 ms) and the round 360-368M except one leg whose window 3 fell to 3.33M (the usual host tail). The cycle's median is 36.5-38.8 ms whatever the tick, equal to `sealed_at_ms` + ~5: the next proposal follows the build's seal, and the build takes 32-33 ms from its start (the parent's early seal) to its own seal. The mean, which sets the throughput, is 47-50: the tail of late seals (`sealed_at` p90 49, p99 79) and of the blocks that wait for the grandparent's fields.
+
+The seal chain, accounted on the best 30 ms leg (1300176a0 adds the timers): the deferred state's open 2 ms (p99 13), the parallel execution of the 200k transfers 16 ms (p90 21, p99 48), the seal itself 4.5 ms (its frame layout and transactions root now come with the plan under `N42_PLAN_AHEAD_PARTS=1`, 298148214), and the wait for the grandparent's state and receipts roots (0 at p50, 11 at p90, 41 at p99: a depth-2 build needs the grandparent's execution complete, and its QMDB root lands ~71 ms after its seal, so at a cycle of ~36 ms the root's latency becomes the chain). The fold runs behind the seal. The execution's tail is half major faults (page-cache reclaim, in clusters) and half a 2-2.6x CPU slowdown of every batch with no waits or lock time when block N-1's QMDB root (global rayon pool) or merge runs during N's batches: cores and memory bandwidth, not a shared pool. Stage ap tests the plan-ahead parts and `N42_CORE_LAYOUT=isolate` with 64 build cores (siblings idle) at 30 ms.
+
+Where 5M stands: 200k per 40 ms mean. The median is at 37; the mean must lose 8-10 ms of tail, and the median a few more. The levers, in order: the execution's contention (isolate), the grandparent-root wait (a faster root, or a deeper pipeline), the major-fault clusters (the host), then the execution itself (16 ms for 200k transfers on 64 threads).
+
+### 10.113 loop351 stage ap — the plan-ahead parts are not a lever; isolating the build's cores cuts the execution 16 -> 13 ms and starves everything else; stage aq's layouts
+
+Stage ap (tree f7ceba36b, X10 set, 30 ms pacing, pool 27-28 GB):
+
+| leg | w1 | w2 | w3 | round | cycle | par_exec p50/p90 | state open p50 | state_ready p50 | sealed_at p50 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X10d, control | 4.16 | 3.91 | 4.15 | 366.6M | 48-51 | 16 / 21 | 0.8 | 150 | 33 |
+| X10PA, `N42_PLAN_AHEAD_PARTS=1` | 4.05 | 3.84 | 3.96 | 355.4M | 49-52 | 16 / 22 | 0.7 | 151 | 33 |
+| X10PAb | 4.07 | 3.72 | 3.37 | 335.0M | 49-59 | -- | -- | -- | -- |
+| X10PAI, parts + `N42_CORE_LAYOUT=isolate`, 64 build cores | 3.60 | 3.53 | 3.45 | 317.5M | 55-58 | 13 / 16 | 4.6 | 181 | 37 |
+| X10PAIb | 3.60 | 3.55 | 3.47 | 318.4M | 56-58 | -- | -- | -- | -- |
+| X10I, isolate alone | 3.55 | 3.25 | 3.19 | 299.6M | 56-63 | -- | -- | -- | -- |
+
+The parts carried with the plan were used on 72% of the seals (`seal_root_ahead=true`) and moved nothing: the seal's own time was 1 ms at p50 before and after (its p90 13 -> 16 is noise). Off, and the switch stays for a block shape where the layout costs more.
+
+The isolated layout confirms the contention named in 10.112 -- the batches alone on 64 physical cores run 16/21 -> 13/16 ms at p50/p90 -- and loses the leg anyway, because the layout as it stood starved the rest of the layer: the behind pool (16 threads: the freeze, receipts and frees behind the seal) was hard-pinned onto the same 64 CPUs, the siblings of the build cores sat idle, and the QMDB root job sat in a 4-core critical set, so the deferred state's open went 0.8 -> 4.6 ms, state ready 150 -> 181 and the seal 33 -> 37. Stage aq (84ea832f8 adds `N42_CORE_LAYOUT_SIBLINGS=background`, `N42_CORE_LAYOUT_BEHIND=build|critical|background`, `N42_CORE_LAYOUT_CRITICAL=background`) runs three layouts twice each against a control: ISOSIB (build 0-63 alone, root job on 64-67, behind pool and siblings to the background's 140 CPUs), ISOCRIT16 (root job on 64-79) and ISOREST (build alone on 0-63, everything else on the other 144 CPUs). A pool made lazily from a pinned thread inherits that thread's mask, which ISOREST sidesteps by keeping the critical threads on the background set.
+
+### 10.114 loop351 stage aq — core layouts: a 16-core critical set for the root job reads 375-381M twice (round record 380.8M, window-1 record 4.29M); the gaps are bimodal and the rate is the answer latency over a four-block vote window
+
+Stage aq (tree c14ea9813, X10 set, 30 ms pacing, pool 26-29 GB), the layouts of 10.113 (84ea832f8):
+
+| leg | w1 | w2 | w3 | round | par_exec p50/p90 | roots p50/p90 | state open p50 | state_ready p50 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X10e, control | 4.25 | 4.02 | 4.02 | 368.6M | 16 / 21 | 35 / 57 | 1.8 | 148 |
+| ISOSIB (build 0-63, root 64-67, rest + siblings 140 CPUs) | 4.13 | 4.10 | 3.94 | 365.2M | 17 / 22 | 34 / 54 | 3.4 | 150 |
+| ISOSIBb | 4.18 | 4.11 | 3.98 | 368.1M | | | | |
+| ISOCRIT16 (root job on 64-79) | 4.22 | 4.07 | 4.23 | 375.4M | 17 / 23 | 27 / 47 | 3.6 | 142 |
+| ISOCRIT16b | 4.29 | 4.17 | 4.23 | 380.8M | | | | |
+| ISOREST (build alone, all else on 144 CPUs) | 4.12 | 4.11 | 4.11 | 370.0M | 16 / 21 | 33 / 52 | 3.5 | 149 |
+| ISORESTb | 4.09 | 3.79 | 3.56 | 343.2M | | | | |
+
+With the siblings of the build cores given to the background the execution is not faster (16-17 ms; only idle siblings gave 13 in stage ap, at the price of the rest of the layer). What the 16-core critical set buys is the root: 35 -> 27 ms at p50, 57 -> 47 at p90, the grandparent-fields wait gone at p90 (10.4 ms -> 10 us), state ready 148 -> 142; the two legs read 375.4M and 380.8M against 368.6M, the only layout that moved the round, and its windows are flat. The median cycle did not move (37), which is the point of this stage:
+
+**The gaps are bimodal, and the rate is the answer latency over the vote window.** The proposal-to-proposal gap in X10e window 1 is p50 37.0, p75 58.9, p90 81.0, p99 114 ms; 42-47% of the window's time sits in gaps over 60 ms. Lining up the long gaps (154 of 636 views) with the layer's timestamps: 149 of them end 0.9 ms after block N-3's answer (`own block imported by header`) reaches the followers, which release their held vote on N (`FAR_AHEAD_BLOCKS=1`, `holds_far_ahead`, service.rs:3901; two import slots, `DEFERRED_IN_FLIGHT=2`, driver.rs:114), then commit +4.8 ms, next proposal +2.6: prop(N+1) = answer(N-3) + 8.6 ms. The leader seals three blocks at 37 ms each, then waits for the oldest answer; so the rate is about (seal-to-answer latency - 19) / 4 = (200 - 19) / 4 = 45 ms, measured 47. Nothing is saturated: state-ready and answer times of consecutive blocks are spaced 40 ms like the seals, the merge never queues, persistence waits 0-20 ms in total, the tree lease is busy 50-71% (23-25 ms per block in window 1; the 1.4 ms per block of 10.113's note was read after the flood had ended), the queue pruner is one thread at 82% but off the answer path.
+
+Where the 200 ms goes, median after the seal: the tree lease wait and the root's start +24 (about 8 of queueing), the root 31, the merge 96 **on one thread** (`merge_threads=1`: state 45.5 then reverts 43.9; the early merge S3 was the only multi-threaded path), state ready -> hand-off 12, hand-off -> canonical 0.5, canonical -> answer 24 (newPayload -> answer 20, the part `N42_ANSWER_AT_INSERT` removes). So the cuts that lower the rate are cuts in the answer latency (each 4 ms of latency is 1 ms of cycle) or a wider window: the two-thread merge (`N42_MERGE_SPLIT=1`, 29d796653: state and reverts merged concurrently, byte-identical; -44), the early merge S3 (-80 at best), answer at insert (-20), and `N42_FAR_AHEAD_BLOCKS=2` (five blocks in flight, /5 instead of /4). S3, AAI and F2 were all rejected in stages ag-aj, every one of them measured on the frame index at its cap (10.110-10.111) and the memory-starved host, so none of those verdicts stands. Stage ar re-measures them on X10: control, MS, S3, AAI, MS+AAI, S3+AAI, F2 (with `N42_PARENT_OUTPUTS_KEPT=6`), MS+AAI+F2. The arithmetic: MS + AAI put the latency at ~136 and the rate at ~29, below the seal's 37, so the seal becomes the floor again at 36-37 ms a block, i.e. 5.2-5.5M at full occupancy.
+
+### 10.115 loop351 stage ar — void: the merge-split legs died on a script variable, the control was disturbed, and every window 2-3 of the run sits below stage aq
+
+Stage ar (tree fab7367bc, X10 at 30 ms) was to re-measure the answer-latency cuts of 10.114. Its three `N42_MERGE_SPLIT` legs died at launch (`env: '334382': No such file`: the arm's `MS` variable overwrote the runner's memsample pid, fixed by renaming it in 80040e4e6), and its control X10f read 3.57 / 2.58 / 2.17 with 172 `an own block was still held when the bound was reached; its transactions are lost to the queue` warnings in the first-full-block minute, 184 plan-wait timeouts and a box load of 15 from something outside the fleet. The legs that ran: S3 4.12 / 3.69 / 3.56 (341.0M), AAI 4.06 / 3.84 / 3.55 (343.6M), S3+AAI 4.03 / 3.78 / 3.56 (341.0M), F2 4.28 / 3.82 / 3.57 (350.0M). Window 1 is at the X10 level (F2's 4.28 ties the record) but every window 3 of the run is 3.55-3.57 where stage aq's controls read 4.02-4.23 on the same configuration an hour earlier, so the run carries a common disturbance and says nothing about the cuts. Stage as repeats them with a fresh control: X10g, MS x2, MS+AAI x2, MS+AAI+F2, MS+AAI+CRIT16.
+
+### 10.116 loop351 stage as — the answer-latency cuts do lower the latency and lose the leg: the build's seal is elastic and pays for every thread added beside it
+
+Stage as (tree 80040e4e6, X10 at 30 ms, pool 26-28 GB, all gates passed):
+
+| leg | w1 | w2 | w3 | round | cycle median / mean w1 | sealed_at p50 / p90 | seal -> state ready | seal -> answer | ready -> answer |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X10g, control | 4.23 | 3.92 | 4.01 | 365.0M | 36.5 / 47.3 | 33 / 50 | 157 | 199 | 41 |
+| X10MS (`N42_MERGE_SPLIT=1`, merge_threads=2) | 4.15 | 3.73 | 3.57 | 343.6M | 39.7 / 48.2 | 39 / 77 | 133 | 180 | 44 |
+| X10MSb | 3.83 | 3.56 | 3.86 | 337.6M | | | | | |
+| X10MSAAI (+ `N42_ANSWER_AT_INSERT=1`) | 4.15 | 3.64 | 3.60 | 341.6M | 42.8 / 48.3 | 40 / -- | 146 | 170 | 20 |
+| X10MSAAIb | 3.93 | 3.73 | 3.54 | 336.0M | | | | | |
+| X10MSAAIF2 (+ `N42_FAR_AHEAD_BLOCKS=2`, outputs kept 6) | 2.38 | 2.24 | 2.09 | 201.1M | 56.4 / 69.1 | 56 / -- | 68 | 78 | 10 |
+| X10MSAAIC16 (MS + AAI + the 16-core critical set) | 4.09 | 3.91 | 3.83 | 354.8M | | | | | |
+
+The cuts do what they say to the latency: the two-thread merge brings state ready from 157 to 133 ms after the seal and the answer from 199 to 180; answer-at-insert takes another 10-24 off the answer (ready -> answer 41 -> 20). And the legs lose. The reason is in the build: with the merge's second thread (and the answer's side task) running beside the next block's build, `sealed_at_ms` goes 33 -> 39-40 at p50 and 50 -> 77 at p90, `par_exec` p90 21 -> 34, the root 59 -> 86 at p90, and the gap median -- which is the seal plus 3-5 ms -- rises from 36.5 to 39.7 (MS) and 42.8 (MS+AAI). The 19-29 ms taken off the answer were worth 5-7 ms of cycle under the four-block model and the build gave 3-6 ms of median plus a longer tail back; the mean did not move (47.3 -> 48.2 / 48.3) and windows 2-3 fell. With five blocks in flight (F2) the layer breaks down to half-size blocks at a 56 ms seal; not understood and not pursued. The 16-core critical set recovers part of it (354.8M) but stays under the control.
+
+What this says, with 10.113 (idle siblings gave the execution 13 ms and starved the rest) and 10.114 (nothing is saturated, the tree lease is busy 50-70%): the layer's blocks are not latency-bound and not lock-bound; they are bound by the CPU the build's 64-thread execution can get in its 16 ms while the previous blocks' root, merge, persistence and the ingest run beside it on the same 208 CPUs. Every cut that adds a thread next to the build is paid for by the build. The next lever is therefore the CPU each block costs, not the latency of its stages: the ingest's share (the tokio runtime's 16 workers ran at 16 CPUs flat in window 1, 4.1M transactions a second recovered and queued), the root's 16 threads x 31 ms, the merge's 96 ms, the persistence; and then the build itself. A per-block CPU budget of the layer under load is the measurement to make before the next cut.
+
+### 10.117 loop351 stage at — what the build's batches wait for: memory latency (IPC 0.42, 74% of dispatch slots stalled, 2.7 DRAM fills per thousand instructions) on a box that is 75% idle
+
+Stage at (tree bc40a2eb7, one X10 leg at 30 ms with `perf stat` attached through its windows: 4.19 / 4.01 / 3.90M, not a clean control) measured the execution layer per thread family in window 1 with the fixed thread sampler (f1722b878: every sample re-lists the process's tasks; the old sampler saw only the ~55 threads alive at its start, never the pools) and AMD PMU events (`de_no_dispatch_per_slot.*`, `ex_ret_instr`, `ls_dmnd_fills_from_sys.*`; the generic cache and stall events are not supported per thread on this Zen 5, and `perf stat -a` is refused at paranoid 1):
+
+| family (threads) | CPUs busy | IPC | backend-stalled slots | SMT-contended slots | L1D fills per k-instr | of which L2 / L3 / DRAM | DRAM GB/s |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| n42-build (64) | 21 | 0.42 | 74% | 10% | 18.3 | .72 / .13 / .15 | 5.9 |
+| tokio-rt (59) | 15-17 | 1.10 | 68% | 5% | 3.5 | .33 / .26 / .41 | 6.5 |
+| global rayon (18) | 10 | 0.70 | 71% | 7% | 6.1 | .51 / .16 / .33 | 3.5 |
+| n42-road + its merge and root children (8) | 4 | 0.56 | 79% | 4% | 15.4 | .19 / .16 / .65 | 5.7 |
+| storage (16) | 3 | 1.15 | 62% | | 2.8 | | |
+| n42-plan-body (8) | 2.5 | 0.25 | 88% | | 11.4 | DRAM .61 | |
+| n42-behind (16) | 1.3 | 0.27 | 81% | | 12.7 | | |
+| whole process | 63 | 0.70 | 72% | 7% | | | 25 (demand) |
+
+The box during window 1: 22% user, 2% system, 75% idle, run queue 34-54, PSI cpu / memory / io at or under 0.5%. The build's 64 threads average 21 CPUs (16 ms of execution in a 48 ms cycle), retire 0.42 instructions per cycle, stall three quarters of their dispatch slots in the back end, miss L1D 18 times per thousand instructions with 2.7 of those going to DRAM -- at ~440 cycles each that is about half of the ~2,400 cycles the build spends per thousand instructions. 72% of its misses are served from L2, which is per core and shared with the hyperthread sibling, and 10% of its slots are lost to the sibling: that is 10.113's idle-sibling gain (16 -> 13 ms). The work beside it (the road's merge and root, plan-body, persistence) is the DRAM-heavy kind (61-69% of its misses go to DRAM) and shares the build CCDs' L3. Of 631 full builds in the window, 3 ran with nothing beside them; a root overlapping more than half the build adds ~3 ms to the execution's p90 and ~14 ms to `sealed_at` p90, most of it waiting.
+
+So the build is bound by memory latency per thread, not by CPU count (the box is three quarters idle), not by bandwidth (25 GB/s of demand fills against twelve DDR5 channels), not by locks. Two levers follow, in order: (1) a layout that gives the build whole cores with idle or light siblings and keeps the DRAM-heavy work (merge, root, persistence) on other CCDs, with the root job's pool on 16 cores of its own (stage aq's gain) -- stage au; (2) memory-level parallelism inside the build: prefetching each batch's account and storage entries ahead of their use (the plan knows the addresses 30 ms before the build; software prefetch inside the batch loop; a denser state layout), since adding threads cannot help a latency-bound loop.
+
+**The in-build prefetch, implementation (`N42_BUILD_MLP=<k>`, off by default).** What a build batch touches per transfer (`parallel_transfer.rs` `execute_for_build_opts`, the loop at ~3951-4030): the candidate's pooled transaction through `cands[i]` (an `Arc` into the pool, converted to a `TxEnv` on the batch's thread), then three `basic()` reads in `fast_transfer.rs` `transfer_plain` (sender ~522, recipient ~535, beneficiary ~549), each through the batch's own map first (`batch_state.rs` `BatchState::basic`, ~234: a hashbrown `AddressMap<BundleAccount>` sized for the batch, ~3k transfers, so L2/L3-sized); the sender hits it after its run's first transfer and the beneficiary always does, but a recipient is almost always new and falls through the chain `ReadSetDb` -> `WarmDb` (empty unless `N42_BUILD_PREFETCH=1`) -> `CountedDb` -> `StateProviderDatabase<StateProviderBox>`: the parent's layer (`output_shards.rs` `ShardLayer::basic_account` ~2615 -> `FrozenShards::get` / `Indexed::get` ~611, a shard index probe then a probe of the batch map it names, ~150k accounts a block; or `direct_build.rs` `CountingStateProvider` ~335 walking the in-flight executed blocks' `BundleState` maps newest first), then the QMDB read view (`storage/provider/.../state/latest.rs` ~103 -> `qmdb-reth/src/read_view.rs` `read_at` ~458: the journals' filters, `twig-core/src/index.rs` `SharedOffsetIndex::get` ~388 over the ~2M-key index, `file.key(offset)` and `file.record(offset)` on the mapped entry file). Then the write side: `commit_transfer` updates three entries of the batch map, and `slots_ref[i].set` writes the result into a 75 MB slot array. The DRAM misses are, in all likelihood, the recipient's chain (several dependent probes into maps and a mapping far larger than L3) and the cold pooled transaction; the batch map and the beneficiary are cache-resident. None of the chain's addresses can be computed from the loop without the provider's internals (hashbrown's buckets are not addressable from outside, the QMDB key is a hash computed inside the view, the provider is a `dyn StateProvider`), so the switch does what the loop can do without touching the forked storage traits: before transaction i it converts the transaction k places ahead in the batch's order (its pooled transaction read then, so that miss overlaps the running transfer's; the `(T, TxEnv)` kept in a ring of k + 1, entries of a sender's skipped tail dropped unrun) and issues `prefetcht0` hints for that transaction's slot and, through `BatchState::prefetch_account`, a read-only probe of its sender's and recipient's entries in the batch map with the entry's lines prefetched. Pure conversions and probes: `the_build_lookahead_equals_the_plain_build` checks transfers, conversions, gas, skips, grafted accounts, reverts and the state root's operations at k = 1, 4, 16 and the cap (256), with underfunded senders. The distance is on the phases line as `par_mlp_k`. The old `N42_BUILD_PREFETCH=1` (`WarmAccounts`, plan v6 attempt H, `docs/FLEET7_PLAN_V4.md` 6.1 and 10.20 here) is a different thing: whole reads of every account on the pool during the pull, into a sharded map the batches read before the provider; it halved the bench's execution but cost 35-37 ms of wall and ~560 ms of pool time (3.5 us a read under sixteen threads against the view's then-global lock), so it stayed off. The recipient's chain is now hinted too (same switch): `AccountReader::n42_prefetch_account` and `EvmStateProvider::n42_prefetch_account` (forked `storage-api`, default no-op, forwarded by `delegate_provider_impls` and the EVM adapter) walk the provider's layers without materialising anything -- the memory overlay probes each block's address filter and bundle map newest first, the shard layer probes its index and the batch map it names (`FrozenShards::holds_hint`, no sum and no copy for an early output), the depth-counting overlay walks uncounted, and the latest provider passes the address to the QMDB reader, which derives the key (blake3, as `account` does) and prefetches the offset index's bucket line, only if the shard's read lock is free (`SharedOffsetIndex::prefetch`, `try_read`, never waits and is not counted). A layer that holds the account stops the walk; one that does not passes the hint beneath. In the batch, `BatchState::hint_account` prefetches its own entry when it has the account and otherwise sends the hint down `ReadSetDb -> WarmDb -> CountedDb (uncounted) -> StateProviderDatabase`; the hints sent are `par_mlp_hints`. Not prefetched: the entry file's record (its offset is inside the index bucket being hinted, so reading it ahead would take that miss serially; a two-stage hint at k and k/2 could), the journals behind the head (their filters are taken under the reader slot's lock), and the provider's version (resolving it may read the database; the index bucket is the same at any version). The view test `the_account_hint_changes_no_read_and_no_counter` checks that hints for present and absent keys, at the head and one block behind, leave every read and the thread's journal and lock-wait counters as they were.
+
+### 10.118 loop351 stage au — idle siblings for the build are not affordable at 208 CPUs; the 16-core root set with the siblings given to the background is the set (372-381M three times)
+
+Stage au (tree 6feb9a285, X10 at 30 ms, pool 26-27 GB):
+
+| leg | w1 | w2 | w3 | round | par_exec p50/p90 | state open p50 | roots p50/p90 | state_ready p50 | sealed_at p50/p90 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X10i, control | 4.14 | 3.69 | 2.72 | 316.8M | 15 / 21 | 0.3 | 33 / 56 | 145 | 36 / 63 |
+| C16IDLE (build 64 cores, siblings idle, root 16, behind background) | 2.99 | 2.99 | 2.91 | 266.8M | 11 / 15 | 8.5 | 44 / 74 | 215 | 43 / 68 |
+| C16IDLEb | 2.95 | 2.98 | 2.87 | 264.0M | | | | | |
+| C16 (as aq's ISOCRIT16: siblings to the background) | 4.21 | 4.01 | 4.21 | 372.6M | 16 / 21 | 3.5 | 30 / 48 | 144 | 33 / 48 |
+| C16IDLE48 (48 build cores, siblings idle) | 3.65 | 3.61 | 3.43 | 320.4M | | | | | |
+
+Idle siblings give the build its best execution yet (11 ms p50, 15 p90, the memory-latency gain of 10.117) and lose the leg by a third: with 64 cores and their 64 siblings reserved, the rest of the layer has 80 CPUs, and the deferred state's open goes 0.3 -> 8.5 ms, the root 33 -> 44, state ready 145 -> 215, the seal 36 -> 43. 48 build cores with idle siblings is the same trade at a smaller scale. The C16 layout (build on 64 cores, root job on 16 cores, the siblings and everything else on the background set) is now the best set three times running (375.4M, 380.8M, 372.6M against 365-369M for the plain X10) with flat windows and the lowest sealed_at p90 (48); it is adopted as **X11 = X10 + C16**. The control's window 3 (2.72M) is the host's tail again (Shmem still 31 GB).
+
+The way to the execution gain without the starvation is therefore not a layout but memory-level parallelism inside the batches (10.117, `N42_BUILD_MLP=<k>`: the pooled transaction converted k ahead, the result slot and the batch map's entries prefetched, and the account hint walked down through the overlay, the shard layer and the QMDB view's index bucket, 33c2ad739 / bf9231be9 / 7e1a1554e). Stage av measures k = 4, 8, 16 on X11.
+
+### 10.119 loop351 stage av — the in-build lookahead does not move the execution's median; the legs with it read 372-374M against 355-358M controls, which is inside the noise until repeated
+
+Stage av (tree 9f0272cb5, X11 set at 30 ms, pool 26-28 GB):
+
+| leg | w1 | w2 | w3 | round | par_exec p50/p90 | sealed_at p50/p90 | hints per block |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| X11, control | 4.15 | 3.91 | 3.77 | 355.0M | 16 / 23 | 33 / 59 | -- |
+| X11MLP4 | 4.19 | 4.04 | 4.15 | 371.6M | 17 / 22 | 33 / 46 | 201,744 |
+| X11MLP8 | 4.17 | 2.92 | 2.48 | 287.3M | 16 / 22 | 40 / 77 | 203,344 |
+| X11MLP8b | 4.03 | 3.78 | 3.56 | 341.2M | | | |
+| X11MLP16 | 4.23 | 4.12 | 4.13 | 374.4M | | | |
+| X11b, control | 4.11 | 3.86 | 3.96 | 357.8M | | | |
+
+The lookahead issues one hint per transaction and changes nothing in the execution's median (16-17 ms): the misses are not where the hint reaches (the batch map, the overlay filters, the shard index, the QMDB index bucket), or the distance of k transactions is the wrong scale for a ~440-cycle miss, or the dependent chain's later links (the entry record, journals) are the misses. What the legs do show is a flatter tail: sealed_at p90 59 -> 46 and windows 2-3 at 4.0-4.15 for k = 4 and 16 (371.6M and 374.4M against 355.0M and 357.8M for the two controls), which is a 4-5% difference between single rounds and therefore not a result until repeated. X11MLP8 lost its windows 2-3 to the same disturbance as stage ar's control: 60 `an own block was still held when the bound was reached; its transactions are lost to the queue` warnings in the first-full-block minute (open item; it recurs on some legs and is not tied to a switch). Stage aw profiles the build's threads with symbols (`cargo build --profile profiling`, `perf record` on the n42-build threads in window 1) to find the miss sites before the next prefetch attempt.
+
+### 10.120 loop351 stage aw — the build's threads with symbols: a third of their cycles are the recipient's read below the batch map, and about 17% of all cycles are software overhead in that read path, not memory
+
+Stage aw (75bb4b9da: a profiled X11 leg on a `--profile profiling` binary with `target-cpu=native`, `perf record` on the n42-build threads in window 1, 101k cycle samples; the leg read 3.66M in window 1 and lost window 2 to the DWARF flush; call graphs did not resolve, so the attribution is flat by symbol):
+
+| where the build thread's cycles go | share |
+| --- | --- |
+| the per-read wrapper of `MemoryOverlayStateProvider`: every `basic_account` (and every hint) goes through the delegate macro's `as_ref()`, which boxes `historical`, clones `trie_input` and drops both (malloc 4.7, drop glue 3.5, sdallocx 3.2) | ~11% |
+| `keccak256(address)` computed eagerly in storage-overlay before the QMDB reader answers (unused on the QMDB branch) | 3.8% |
+| one MDBX `StageCheckpoints` get per read (`n42_hashed_state_version`) | ~1% + 2.5% of fills |
+| the QMDB view: the journal filter walk in `read_at`, `account`, the offset index, decode, the entry record | ~7% |
+| the parent layers: `FrozenShards::get` 5.0 (samples on the hashbrown control-group probe and the key compare: table misses), `MemoryOverlay::basic_account` 5.1, `ShardLayer` 1.9, `OverlayStateProvider` 1.7, `WarmDb` 0.8 | ~14% |
+| the batch's own map (`BatchState::basic`, the BundleAccount maps, the address hash, `loaded`) | ~14% |
+| the loop itself (`execute_for_build_opts` with `transfer_plain` and the slot writes inlined 8.5, U256 add 4.2 -- skid from a stalled load --, the AltSig `TxEnv` 2.3 + clone 1.3) | ~16% |
+| the sink and the bundle (`take_bundle` reverts 3.5, `OutputShards::add` 2.5) | 6% |
+| kernel, unresolved | 8% |
+
+Two findings change the plan. First, the av hint never reached the QMDB index: `OverlayStateProvider` has no `n42_prefetch_account`, so storage-api's default `false` stopped it, and each hint paid the same Box alloc and free as a read -- which is why the lookahead left `par_exec` flat. Second, before any prefetch there is ~17% of software to remove from the read path: implement `basic_account` and the hint directly on `MemoryOverlayStateProvider` without the per-call `as_ref()`, compute the keccak only on the non-QMDB branch, cache the hashed-state version per provider, and forward the hint through `OverlayStateProvider` to the reader. All three are unconditional (no result changes); stage ax measures them with X11 and X11+MLP16 alternating.
+
+### 10.121 loop351 stage ax — the read-path fixes lift the X11 controls from 355-358M to 368-375M by cutting the tails; the lookahead equals the new control and is dropped
+
+Stage ax (tree d1270d05a: 2e9387835 no Box per read in the memory overlay's delegate, 5b33e8d33 keccak only where a hashed table is read and the hashed-state version cached per provider, ce8aa472d the account hint forwarded through `OverlayStateProvider`; X11 at 30 ms, pool 27-28 GB):
+
+| leg | w1 | w2 | w3 | round | par_exec p50/p90/p99 | sealed_at p50/p90 | roots p50/p90 | state_ready p50 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X11 (stage av, before) | 4.15 | 3.91 | 3.77 | 355.0M | 16 / 23 / 61 | 33 / 59 | 32 / 65 | 152 |
+| X11b (stage av, before) | 4.11 | 3.86 | 3.96 | 357.8M | | | | |
+| X11c | 4.24 | 4.06 | 4.18 | 374.5M | 16 / 20 / 50 | 33 / 45 | 29 / 46 | 145 |
+| X11d | 4.22 | 3.99 | 4.07 | 368.2M | | | | |
+| X11MLP16b | 4.13 | 3.97 | 4.11 | 366.4M | 16 / 22 / 54 | 34 / 52 | 26 / 47 | 141 |
+| X11MLP16c | 4.14 | 4.11 | 4.12 | 371.2M | | | | |
+
+The execution's median stays at 16 ms -- the per-read software was not the median's cost -- but every tail is shorter (execution p90 23 -> 20, seal p90 59 -> 45, root p90 65 -> 46), the windows are flat and the controls read 368-375M where they read 355-358M on the previous tree: the fixes are kept, unconditional. With the hint now reaching the QMDB index, the lookahead (`N42_BUILD_MLP=16`) reads the same as the control (366-371M) and its 10.119 margin was the tail it smoothed; it stays off. Window 1 has sat at 4.1-4.29M since stage ao whatever was changed: the first window is the seal's 33 ms plus the four-block vote window's wait, and only the build's execution itself moves it now. Next is the warm read ahead of the build (`N42_PLAN_AHEAD_WARM`: the old `N42_BUILD_PREFETCH`'s full read of the block's accounts, which halved the execution but cost 35 ms on the build's path, done in the plan's 30 ms window on a background pool instead), stage ay.
+
+### 10.122 the warm read ahead of the build, implementation
+
+`N42_PLAN_AHEAD_WARM=<threads>` (off when unset or 0; needs `N42_PLAN_AHEAD_BODY=1`; `crates/n42/engine-types/src/warm_ahead.rs`) moves 10.20's `N42_BUILD_PREFETCH` read -- every account of the block read once into the 64-shard `WarmAccounts` layer that the batches' `WarmDb` consults before the provider chain, which halved the execution but cost ~35 ms of the build's own path -- onto the plan's time. **The parent is not known to the plan.** The plan for block N+1 is made on the `n42-frame-settle` thread at build N's selection (the queue's `prepared_verdict` ties it to "the block build N hands off", not to a hash), while N is still executing: N+1's parent state does not exist yet. So the read is made at the state build N itself reads -- N's parent P, through the `ParentStateOpener` build N publishes at its start (`note_base`) -- and leaves out every account N can change: the senders and recipients of the plan N took (each plan's job first builds its own touched set by shard, which the next plan's job uses as its exclusion; build N names its plan with `note_selected`), and, at the take, N's beneficiary, N's withdrawal recipients and the system contracts (beacon roots, history storage, the 7002/7251 predeploys, the system caller). A block of plain 21,000-gas transfers changes nothing else, so for every account the layer holds N's post-state equals P's. **Mismatch detection.** Build N records `Built { plan, base: P, built: its builder hash, extra }` only when it sealed at the execution's end (`N42_SEAL_AT_EXEC`) from the plan's prepared body (`prep_from_plan`) with nothing executed before the parallel step; build N+1 takes the newest read made at its grandparent and uses it only if the read's excluded plan is `Built.plan`, its base is `Built.base`, N+1's `parent_header.parent_hash` is that base, and the `parent_built` N+1 was asked to build on (the builder hash of its parent, `EarlySeal`) is `Built.built` (`warm_ahead::usable`). A peer's block at that height, a second build at the height, a plan made again or topped up, a build that fell back to the serial loop or a build on the engine path (no opener, `clear_base`) all fail one of these and the read is dropped unread. **The pool.** `n42-warm-*`, `<threads>` threads, each entering `Set::Background` under the core layout (never the build set); the job buckets the plan's keys by shard, then reads shard groups with one provider opened per group, checking a cancel flag every 256 reads. **The build** takes the layer just before its batches run (after the pull and the prep, the latest point), never waits: shards not yet read are empty and fall through to the chain, and the read is cancelled. Fields on `seal-first build phases`: `warm_ahead_accounts` (accounts in the layer taken), `warm_ahead_ms` (the read's own wall, to its end or to the take), `warm_ahead_hits` (batch reads answered from it, flushed per `WarmDb` on drop), `warm_ahead_ready` (all 64 shards read when the build took it). Tests: `a_build_on_the_warm_read_ahead_equals_the_plain_build` (two consecutive blocks out of the lookahead test's three fixtures: N+1 built on N's post-state with the layer read at N's parent equals the plain build -- transfers, fees, accounts, reverts -- and the same read without N's exclusion holds stale senders), `a_warm_read_for_another_parent_is_not_used`, `the_taken_layer_leaves_out_the_extra_accounts`. **Expected cost.** 10.120 puts about a third of the build's 64 x 16 ms on the recipient's read, ~340 ms of CPU for ~200,000 reads, ~1.7 us a read through the five-layer chain; a block's read list is its ~200,000 recipients plus the senders N's plan does not share (few: a sender's run continues across blocks, and those accounts are answered by the chain's newest layer anyway). That is ~43 ms on 8 threads and ~21 ms on 16 against a window of 30-40 ms (the plan at N's selection plus `N42_PLAN_AHEAD_WAIT_MS`, to N+1's execution start after N's seal at ~33 ms and N+1's pull): 8 threads is expected to be partial (`warm_ahead_ready` false, a share of the shards), 16 complete; the background set takes the reads' DRAM traffic beside the build's. Smaller costs: the hook copies the plan's keys (~8 MB) and up to four reads' touched sets are kept. Stage ay measures W8 and W16 against X11 controls.
+
+**Stage ay's read was empty, and why (fixed in 05f5b61af).** On W16 `warm_ahead_accounts` read p50 0 and p99 ~380, ready on 80 of 1,918 builds, and `par_exec` did not move. Two causes, both in the code above, none in the exclusion (which is exact, by address): (1) `warm_shard` took the address's first byte, and every flood recipient (`tx_flood::recipient`: a slot under 2^20 big-endian in the first four bytes) has first byte 0, so all ~147,000 recipients of a block fell in shard 0, read by one thread that never finished before the take, while the other 63 shards held the few hundred senders the previous plan did not share -- the ~380 accounts the builds saw; (2) the read was named by an id carried in the prepared body, and a third of W16's builds took a plan whose body was late (`plan_body=2`, 615 builds against 272 on the control), so they named no plan and the next read had no exclusion. The shard is now a multiplicative hash of all twenty bytes (a test checks the flood's recipients spread 1,200-1,950 per shard over 100,000), and the read is named by the take's identity (`segments_ident`: each frame's allocation, length taken and first and last hash), computed by the plan hook first thing (the keys made on the warm pool) and by the build's selection from the same segments whether or not the body was ready; a block counts as its take's when it came from the frames' bulk vector with nothing pulled beyond it. Expected now: N+1's ~147,000 recipients less the ~16% N also paid (recipients are drawn from ~900,000), plus its senders outside N's plan, about 120,000-125,000 accounts a block, ~2,000 per shard.
+
+### 10.123 loop351 stage ay — the warm read ahead of the build was empty (about 350 accounts a block, complete on 4% of builds) and its legs equal the controls
+
+Stage ay (tree f4391de3e, X11 at 30 ms, pool 27-28 GB): X11e 4.15 / 3.95 / 3.67 (353.2M), W8 4.20 / 4.02 / 4.10 (369.6M), W16 4.19 / 4.03 / 4.15 (371.0M), W8b disturbed (3.26 / 2.48 / 2.39, the held-block loss again), W16b 4.16 / 3.95 / 4.07 (365.6M), X11f 4.10 / 4.14 / 3.93 (365.2M). The phases line says why nothing moved: `warm_ahead_accounts` p50 0 and p90 350-383 instead of ~200k, `warm_ahead_ready=true` on 80 of 1,918 builds, `par_exec` 15-16 ms as before. 10.122's note (e1887cb45) gives the cause and 05f5b61af the fix: the read spread the flood's recipients over its shards wrongly and followed the plan's body instead of the take, so nearly every account was left out or the map was made for a plan the build did not take. Stage az repeats W16 on the fix with 24 threads added.
+
+### 10.124 loop351 stage az — the warm read ahead, fixed, covers ~178k accounts and cuts the execution to 13-14 ms when it completes; it completes on 30% of builds and costs the layer more than it saves
+
+Stage az (tree d0609f990, X11 at 30 ms, pool 28 GB; the warm read fixed in 05f5b61af):
+
+| leg | w1 | w2 | w3 | round | warm accounts p50 / p90 | warm ms p50 | ready | par_exec p50/p90 | sealed_at p50/p90 | state_ready p50/p90 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X11g, control | 4.15 | 4.12 | 4.13 | 372.0M | -- | -- | -- | 15 / 20 | 32 / 45 | 149 / 176 |
+| X11W16c | 4.12 | 3.77 | 3.40 | 338.8M | 44,542 / 177,899 | 33 | 29% | 13 / 21 | 35 / 62 | 160 / 223 |
+| X11W16d | 4.04 | 3.72 | 3.51 | 338.2M | | | | | | |
+| X11W24 | 4.18 | 3.95 | 4.15 | 368.7M | 0 / 177,880 | 32 | 30% | 14 / 21 | 34 / 47 | 153 / 180 |
+| X11h, control | 4.22 | 4.01 | 4.09 | 369.6M | | | | | | |
+
+The read now does what it was meant to: when it runs it reads ~178k accounts (the plan's recipients and the senders block N does not touch) and the batches hit them (185k hits), and the execution's median drops to 13-14 ms from 15. But the read takes 32-33 ms on 16 or 24 threads -- the whole window between the plan and the build -- so it is complete for 29-30% of builds only, and its threads are 16-24 more walkers of the same dependent-miss chain on the same memory system beside the build, the root and the merge: with 16 threads the seal's p90 goes 45 -> 62 and state ready 176 -> 223 and the round loses 9%; with 24 threads the read finishes a little more often and the leg equals the control. Moving the read earlier does not make it cheaper; the memory work is the same, and the layer is bound by that work wherever it runs (10.117). The switch stays off.
+
+What stages at-az establish together: the build's 15-16 ms execution is dependent cache misses on hash-table probes (the batch map, the in-flight overlay maps, the shard layer, the QMDB index), and no rearrangement of when or where those probes happen (lookahead hints, the per-read software cuts, idle siblings, the warm read ahead) moves the median; the per-read software cuts and the core layout moved the tails and are kept. Window 1 is 4.1-4.29M and the round 365-381M on this host, with the frame index, the vote window and the seal where 10.111-10.114 put them. Going further means fewer or cheaper probes per transfer: a state layout where a transfer's two accounts are reached in one probe (a per-block dense index assigned with the plan, the in-flight outputs stored as arrays indexed by it rather than hash maps), which is structural work on the build, the shards and the overlay, not a switch.

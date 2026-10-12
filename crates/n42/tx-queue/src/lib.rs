@@ -338,6 +338,18 @@ fn forget_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
+/// The pool the frame planner's checks run on ([`plan_parallel_over`]):
+/// the queue's own [`forget_pool`], whose other user (the forget's
+/// partition) runs under the lanes' lock as the live planner does, so the
+/// two never meet, and no executing block's work stands in front of a plan.
+/// The global pool when the threads could not be started.
+fn in_plan_pool<R: Send>(job: impl FnOnce() -> R + Send) -> R {
+    match forget_pool() {
+        Some(pool) => pool.install(job),
+        None => job(),
+    }
+}
+
 /// Where [`TxQueue::forget_mined_timed`] spent its time, in microseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ForgetTimes {
@@ -855,6 +867,8 @@ struct Inner<T: PoolTransaction> {
     /// any of them is refused at once ([`Inner::prepared_verdict`]), not
     /// after the prune's last batch.
     pruning: Option<Arc<AddressHashMap<u64>>>,
+    /// [`frames::FrameIndex::swept_at_take`] at the last build start.
+    swept_reported: u64,
 }
 
 /// A whole take handed off to an own block: the build counter of the build
@@ -899,6 +913,19 @@ struct Prepared<T: PoolTransaction> {
     /// The body the plan-ahead hook makes from it (`N42_PLAN_AHEAD_BODY`),
     /// `None` without a hook.
     body: Option<Arc<Mutex<BodySlot>>>,
+}
+
+impl<T: PoolTransaction> Prepared<T> {
+    #[cfg(test)]
+    fn tx_count_for_test(&self) -> usize {
+        self.plan.tx_count()
+    }
+
+    /// Whether a build with `gas_limit` would take nothing more after it:
+    /// its last frame was cut, or no transaction's gas is left.
+    const fn full(&self, gas_limit: u64) -> bool {
+        self.cut || gas_limit.saturating_sub(self.gas_used) < MIN_FRAME_TX_GAS
+    }
 }
 
 /// A frame build's noted takes as its selection left them
@@ -946,13 +973,16 @@ pub type PreparedBody = Box<dyn Any + Send + Sync>;
 
 /// The hook that makes a [`PreparedBody`] from a prepared plan's segments
 /// (each frame's transactions and how many the plan takes from its start,
-/// in plan order). Run on the thread that prepared the plan, after the
-/// lanes' lock is released; `None` makes no body.
-pub type PlanAheadHook<T> = Arc<dyn Fn(&[(FrameTxs<T>, usize)]) -> Option<PreparedBody> + Send + Sync>;
+/// in plan order), with the plan itself (its frames and hashes, for what
+/// the builder can make of the layout ahead). Run on the thread that
+/// prepared the plan, after the lanes' lock is released; `None` makes no
+/// body.
+pub type PlanAheadHook<T> = Arc<dyn Fn(&[(FrameTxs<T>, usize)], &FramePlan) -> Option<PreparedBody> + Send + Sync>;
 
-/// A prepared plan's segments and its body's slot, for the hook to fill
-/// after the lanes' lock is released.
-type BodyJob<T> = (Vec<(FrameTxs<T>, usize)>, Arc<Mutex<BodySlot>>);
+/// A prepared plan's segments, a copy of the plan (its frames and the
+/// frames' shared hash lists, by `Arc`) and its body's slot, for the hook
+/// to fill after the lanes' lock is released.
+type BodyJob<T> = (Vec<(FrameTxs<T>, usize)>, FramePlan, Arc<Mutex<BodySlot>>);
 
 /// A prepared plan's body, filled by the hook once it ran.
 #[derive(Default)]
@@ -1073,6 +1103,27 @@ pub fn plan_ahead() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_PLAN_AHEAD").is_ok_and(|v| v == "1"))
 }
+
+/// `N42_PLAN_AHEAD_WAIT_MS=<ms>`, read once (unset or 0: off). With
+/// `N42_PLAN_AHEAD=1`, the next build's plan is prepared continuously from
+/// the take of the build it follows until it is full or the next build
+/// begins (planned again whenever a frame arrives, a short plan topped up
+/// in place, [`TxQueue::prepare_continuously`]), and a frame build that
+/// starts while that preparation is in flight and its plan is not yet full
+/// waits up to this many milliseconds for it ([`TxQueue::wait_for_plan`]);
+/// `docs/SHARED_EXECUTION_SCOPE.md` 16.4.1.
+pub fn plan_ahead_wait_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| std::env::var("N42_PLAN_AHEAD_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// The continuous preparer's poll ([`TxQueue::prepare_continuously`]):
+/// how often it looks for newly indexed frames.
+const AHEAD_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// The longest a continuous preparation runs for one build: a bound for a
+/// chain that stopped building, not a tuning knob.
+const AHEAD_LOOP_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// `N42_QUEUE_OFFLOCK`, read once (default off): the queue's heavy steps
 /// run off the lanes' lock or in short bounded holds instead of one long
@@ -1459,6 +1510,28 @@ pub struct TxQueue<T: PoolTransaction> {
     plan_snapshot: Arc<std::sync::atomic::AtomicBool>,
     /// The dedicated drainer's state and wake-up ([`TxQueue::run_drainer`]).
     drainer: Arc<DrainerSignal>,
+    /// The continuous plan-ahead preparation's state and its waiters
+    /// (`N42_PLAN_AHEAD_WAIT_MS`, [`AheadWait`]).
+    ahead_wait: Arc<AheadWait>,
+}
+
+/// `N42_PLAN_AHEAD_WAIT_MS`: the wait (0 = off; the environment's unless a
+/// test said otherwise), how many continuous preparations are running, and
+/// the condition a build start waits on, raised whenever one stores or
+/// tops up a plan or ends.
+#[derive(Debug, Default)]
+struct AheadWait {
+    wait_ms: std::sync::atomic::AtomicU64,
+    inflight: std::sync::atomic::AtomicUsize,
+    lock: Mutex<()>,
+    cv: parking_lot::Condvar,
+}
+
+impl AheadWait {
+    fn notify(&self) {
+        let _held = self.lock.lock();
+        self.cv.notify_all();
+    }
 }
 
 /// The dedicated drainer's state ([`TxQueue::run_drainer`]): whether one
@@ -1525,6 +1598,7 @@ impl<T: PoolTransaction> Clone for TxQueue<T> {
             offlock: Arc::clone(&self.offlock),
             plan_snapshot: Arc::clone(&self.plan_snapshot),
             drainer: Arc::clone(&self.drainer),
+            ahead_wait: Arc::clone(&self.ahead_wait),
         }
     }
 }
@@ -1680,6 +1754,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 handed: None,
                 lanes_gen: 0,
                 pruning: None,
+                swept_reported: 0,
             })),
             inbox: Arc::new(Mutex::new(Vec::new())),
             staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1694,7 +1769,31 @@ impl<T: PoolTransaction> TxQueue<T> {
             offlock: Arc::new(std::sync::atomic::AtomicBool::new(queue_offlock())),
             plan_snapshot: Arc::new(std::sync::atomic::AtomicBool::new(snapshot::queue_plan_snapshot())),
             drainer: Arc::new(DrainerSignal::default()),
+            ahead_wait: Arc::new(AheadWait {
+                wait_ms: std::sync::atomic::AtomicU64::new(plan_ahead_wait_ms()),
+                ..AheadWait::default()
+            }),
         }
+    }
+
+    /// The same queue with `N42_PLAN_AHEAD_WAIT_MS` set to `ms` whatever the
+    /// environment says (0 = off). What a test uses to choose the path.
+    #[must_use]
+    pub fn with_plan_ahead_wait(self, ms: u64) -> Self {
+        self.ahead_wait.wait_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// The same queue with `N42_FRAME_SWEEP_AT_TAKE` set to `on` whatever
+    /// the environment says. What a test uses to choose the path.
+    #[must_use]
+    pub fn with_frame_sweep_at_take(self, on: bool) -> Self {
+        self.lock_inner_quiet().frames.sweep_at_take = on;
+        self
+    }
+
+    fn plan_wait_ms(&self) -> u64 {
+        self.ahead_wait.wait_ms.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The same queue draining at most `chunk` transactions per hold of the
@@ -2418,6 +2517,13 @@ impl<T: PoolTransaction> TxQueue<T> {
             let (mut inner, held) = timed(&mut lock_us);
             let Inner { frames, lanes, .. } = &mut *inner;
             swept += frames.sweep_ids_into(chunk, lanes, &mut garbage.frames);
+            held_us += held.elapsed().as_micros() as u64;
+        }
+        {
+            // The frames aside (`N42_FRAME_SWEEP_AT_TAKE`) the chain mined.
+            let (mut inner, held) = timed(&mut lock_us);
+            let Inner { frames, lanes, .. } = &mut *inner;
+            swept += frames.sweep_retired_into(lanes, &mut garbage.frames);
             held_us += held.elapsed().as_micros() as u64;
         }
         if swept > 0 {
@@ -3149,12 +3255,16 @@ impl<T: PoolTransaction> TxQueue<T> {
             return self.frames_for_build_snapshot(parent, gas_limit, ahead);
         }
         let mut times = FrameSelectTimes::default();
+        if ahead {
+            (times.ahead_wait_us, times.ahead_wait_timeout) = self.wait_for_plan(gas_limit);
+        }
         let mut garbage = PruneGarbage::default();
         let at = std::time::Instant::now();
         let mut prepared_body: Option<Arc<Mutex<BodySlot>>> = None;
         let ((segments, plan), mark) = {
             let mut inner = self.lock_inner();
             times.lock_us = at.elapsed().as_micros() as u64;
+            inner.note_index(&mut times);
             let begin_at = std::time::Instant::now();
             // The inbox first: an arrival below a prepared plan's nonces must
             // be in its lane when the plan is judged.
@@ -3254,6 +3364,12 @@ impl<T: PoolTransaction> TxQueue<T> {
         // own, off the build's start; any lock before that applies them first.
         // With `ahead`, the same thread then prepares the next build's plan.
         if mode == SelectMode::Parallel || ahead {
+            // Counted in flight before this build returns, so the next
+            // build's start sees it whatever the thread's start delay.
+            let continuous = ahead && self.plan_wait_ms() > 0;
+            if continuous {
+                self.ahead_wait.inflight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
             let queue = self.clone();
             // The noted takes are the plan's last segments, one each.
             let noted: Option<(SettleMark, Vec<(FrameTxs<T>, usize)>)> = mark.and_then(|mark| {
@@ -3264,14 +3380,23 @@ impl<T: PoolTransaction> TxQueue<T> {
                 if let Some((mark, noted)) = noted {
                     queue.settle_offlock(mark, noted);
                 }
-                if ahead {
+                if continuous {
+                    queue.prepare_continuously(gas_limit, mode);
+                    queue.ahead_wait.inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    queue.ahead_wait.notify();
+                } else if ahead {
                     queue.prepare_next_in(gas_limit, mode);
                 } else {
                     drop(queue.lock_inner_quiet());
                 }
             });
-            if spawned.is_err() && mode == SelectMode::Parallel {
-                drop(self.lock_inner_quiet());
+            if spawned.is_err() {
+                if continuous {
+                    self.ahead_wait.inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                if mode == SelectMode::Parallel {
+                    drop(self.lock_inner_quiet());
+                }
             }
         }
         let best = QueueBest {
@@ -3348,7 +3473,10 @@ impl<T: PoolTransaction> TxQueue<T> {
             if !current {
                 return;
             }
-            inner.pending.clear();
+            let noted = std::mem::take(&mut inner.pending);
+            for (id, prefix) in &noted {
+                inner.frames.retire(id, *prefix);
+            }
             inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
             inner.split_runs(&first, &mut garbage.lanes);
             inner.settling = runs;
@@ -3378,6 +3506,161 @@ impl<T: PoolTransaction> TxQueue<T> {
                 inner.split_runs(&part, &mut garbage.lanes);
             }
             garbage.free();
+        }
+    }
+
+    /// The continuous preparation (`N42_PLAN_AHEAD_WAIT_MS`), run on the
+    /// settling thread right after a frame build's take: prepares the next
+    /// build's plan ([`Self::prepare_next_in`]); while there is none (the
+    /// queue held no usable frame) plans again whenever a frame is indexed,
+    /// and while it is short (its last frame not cut and room for a
+    /// transaction left) tops it up in place with the frames indexed since
+    /// ([`Self::top_up_prepared`]), until it is full, the next build begins
+    /// (a plan made after that is stored as the one-shot preparation's
+    /// would be), or [`AHEAD_LOOP_MAX`]. Every store or top-up wakes a build
+    /// start waiting in [`Self::wait_for_plan`].
+    fn prepare_continuously(&self, gas_limit: u64, mode: SelectMode) {
+        enum Next {
+            Prepare,
+            TopUp,
+            Done,
+        }
+        let started = std::time::Instant::now();
+        let (after, mut seen) = {
+            let inner = self.lock_inner_quiet();
+            (inner.builds, None::<u64>)
+        };
+        loop {
+            let (next, inserted) = {
+                // The arrivals first: a frame is indexed by the drain that
+                // moves its last transaction.
+                let mut inner = self.lock_inner_quiet();
+                self.drain_inbox_block(&mut inner);
+                let next = if inner.builds == after {
+                    match &inner.prepared {
+                        None => Next::Prepare,
+                        Some(p) if p.after == after && !p.full(gas_limit) => Next::TopUp,
+                        Some(_) => Next::Done,
+                    }
+                } else {
+                    Next::Done
+                };
+                (next, inner.frames.inserted)
+            };
+            match next {
+                Next::Done => return,
+                // Planned again only when a frame arrived since the last try.
+                _ if seen == Some(inserted) => {}
+                Next::Prepare => {
+                    seen = Some(inserted);
+                    if self.prepare_next_in(gas_limit, mode) {
+                        self.ahead_wait.notify();
+                    }
+                }
+                Next::TopUp => {
+                    seen = Some(inserted);
+                    if self.top_up_prepared(gas_limit, mode, after) > 0 {
+                        self.ahead_wait.notify();
+                    }
+                }
+            }
+            if started.elapsed() >= AHEAD_LOOP_MAX {
+                return;
+            }
+            std::thread::sleep(AHEAD_POLL);
+        }
+    }
+
+    /// Tops up the stored prepared plan made after build `after`, in place,
+    /// with the frames indexed since, planned on the lanes as the plan left
+    /// them -- exactly the top-up a build makes of a short plan at its
+    /// start ([`Self::frames_for_build_ahead`]), made ahead. The plan's
+    /// body (`N42_PLAN_AHEAD_BODY`) is dropped: it was made from the plan
+    /// before. Returns how many transactions it added.
+    fn top_up_prepared(&self, gas_limit: u64, mode: SelectMode, after: u64) -> usize {
+        let mut inner = self.lock_inner();
+        self.drain_inbox_block(&mut inner);
+        let room = match inner.prepared.as_ref() {
+            Some(p) if p.after == after && inner.builds == after && !p.full(gas_limit) => {
+                gas_limit.saturating_sub(p.gas_used)
+            }
+            _ => return 0,
+        };
+        // The top-up's takes go to a list of their own, as the preparation's.
+        let current = inner.last_build.take();
+        inner.last_build = Some((B256::ZERO, Vec::new()));
+        let mut times = FrameSelectTimes::default();
+        let (more, more_plan, gas_left) = inner.plan_frames(room, &mut times, mode);
+        inner.settle();
+        let taken = inner.last_build.take().map(|(_, taken)| taken).unwrap_or_default();
+        inner.last_build = current;
+        if more_plan.frames.is_empty() {
+            if !taken.is_empty() {
+                inner.give_back(taken);
+            }
+            return 0;
+        }
+        let mut lowest: AddressHashMap<u64> = AddressHashMap::default();
+        for frame in &more_plan.frames {
+            let Some((runs, _)) = inner.frames.runs_and_hashes_any(&frame.id) else { continue };
+            for run in runs.iter().filter(|run| (run.start as usize) < frame.taken) {
+                let entry = lowest.entry(run.sender).or_insert(run.first_nonce);
+                *entry = (*entry).min(run.first_nonce);
+            }
+        }
+        let cut = more_plan.frames.last().is_some_and(|frame| frame.taken < frame.len);
+        let added = more_plan.tx_count();
+        let Some(prepared) = inner.prepared.as_mut() else {
+            // Unreachable: the plan was checked under this hold.
+            inner.give_back(taken);
+            return 0;
+        };
+        prepared.gas_used = prepared.gas_used.saturating_add(room.saturating_sub(gas_left));
+        prepared.cut = cut;
+        prepared.segments.extend(more);
+        prepared.plan.frames.extend(more_plan.frames);
+        prepared.plan.parts.extend(more_plan.parts);
+        prepared.plan.skipped += more_plan.skipped;
+        prepared.taken.extend(taken);
+        for (sender, nonce) in lowest {
+            let entry = prepared.lowest.entry(sender).or_insert(nonce);
+            *entry = (*entry).min(nonce);
+        }
+        prepared.body = None;
+        added
+    }
+
+    /// A frame build's start under `N42_PLAN_AHEAD_WAIT_MS`: when a
+    /// continuous preparation is in flight and the plan for this build is
+    /// not yet full, waits for it up to the switch's milliseconds. Returns
+    /// how long it waited (microseconds) and whether the wait ran out.
+    fn wait_for_plan(&self, gas_limit: u64) -> (u64, bool) {
+        use std::sync::atomic::Ordering;
+        let ms = self.plan_wait_ms();
+        if ms == 0 {
+            return (0, false);
+        }
+        let at = std::time::Instant::now();
+        let deadline = at + std::time::Duration::from_millis(ms);
+        loop {
+            if self.ahead_wait.inflight.load(Ordering::Acquire) == 0 {
+                return (at.elapsed().as_micros() as u64, false);
+            }
+            let ready = {
+                let inner = self.lock_inner_quiet();
+                inner.prepared.as_ref().is_some_and(|p| p.after == inner.builds && p.full(gas_limit))
+            };
+            if ready {
+                return (at.elapsed().as_micros() as u64, false);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return (at.elapsed().as_micros() as u64, true);
+            }
+            // Bounded by the poll, so a wake raised between the check and
+            // the wait costs at most one poll.
+            let mut held = self.ahead_wait.lock.lock();
+            let _ = self.ahead_wait.cv.wait_for(&mut held, (deadline - now).min(AHEAD_POLL));
         }
     }
 
@@ -3482,7 +3765,18 @@ impl<T: PoolTransaction> TxQueue<T> {
         let mut times = FrameSelectTimes::default();
         let (segments, plan, gas_left) = inner.plan_frames(gas_limit, &mut times, SelectMode::Parallel);
         let serial_took = inner.last_build.as_ref().is_some_and(|(_, taken)| !taken.is_empty());
-        if serial_took || plan.frames.is_empty() || inner.pending.len() != segments.len() {
+        // `N42_FRAME_SWEEP_AT_TAKE`: stored in this hold, its takes settled
+        // here, as the plan whose serial part took always was before the
+        // sweep (the dead frames in the parallel window sent every plan to
+        // the serial part). Its takes left noted for a second hold raced the
+        // build start, the hand-off and the prune that follow a take: loop351
+        // stage am (`X9FS2`) refused 1,678 commits and planned 760 a third
+        // time, late for half the builds, where the control raced none.
+        if serial_took
+            || plan.frames.is_empty()
+            || inner.pending.len() != segments.len()
+            || inner.frames.sweep_at_take
+        {
             let made = inner.store_prepared(current, segments, plan, gas_left, gas_limit, at, hook.is_some(), &mut body_job);
             drop(inner);
             garbage.free();
@@ -3563,11 +3857,14 @@ impl<T: PoolTransaction> TxQueue<T> {
         }
         inner.len -= removed;
         inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+        for frame in &plan.frames {
+            inner.frames.retire(&frame.id, frame.taken);
+        }
         let lowest: AddressHashMap<u64> = runs.iter().map(|(sender, (lo, _))| (*sender, *lo)).collect();
         let cut = plan.frames.last().is_some_and(|frame| frame.taken < frame.len);
         let body = hook.is_some().then(|| {
             let slot = Arc::new(Mutex::new(BodySlot::default()));
-            body_job = Some((segments.clone(), Arc::clone(&slot)));
+            body_job = Some((segments.clone(), plan.clone(), Arc::clone(&slot)));
             slot
         });
         inner.prepared = Some(Prepared {
@@ -3591,9 +3888,9 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// The body, made off the lanes' lock. A build that takes the plan
     /// before this ends finds the slot empty and makes its own.
     fn run_body_hook(hook: Option<PlanAheadHook<T>>, body_job: Option<BodyJob<T>>) {
-        if let (Some(hook), Some((segments, slot))) = (hook, body_job) {
+        if let (Some(hook), Some((segments, plan, slot))) = (hook, body_job) {
             let at = std::time::Instant::now();
-            let body = hook(&segments);
+            let body = hook(&segments, &plan);
             let made_us = at.elapsed().as_micros() as u64;
             let mut slot = slot.lock();
             slot.body = body;
@@ -3735,6 +4032,14 @@ impl<T: PoolTransaction> Inner<T> {
 }
 
 impl<T: PoolTransaction> Inner<T> {
+    /// A build start's index fields ([`FrameSelectTimes::frames_index`]).
+    pub(crate) fn note_index(&mut self, times: &mut FrameSelectTimes) {
+        times.frames_index = self.frames.len();
+        times.frames_swept_at_take = self.frames.swept_at_take - self.swept_reported;
+        self.swept_reported = self.frames.swept_at_take;
+        times.frames_refused_at_cap = self.frames.refused_at_cap;
+    }
+
     /// The frame plan of [`TxQueue::frames_for_build`], taken out of the
     /// lanes: the transactions in plan order, as one segment per frame (the
     /// frame's shared transactions and how many of them from its start),
@@ -3845,7 +4150,10 @@ impl<T: PoolTransaction> Inner<T> {
         let pending = std::mem::take(&mut self.pending);
         let mut list = self.last_build.as_mut().map(|(_, list)| list);
         for (id, prefix) in pending {
-            let Some((runs, _)) = self.frames.runs_and_hashes(&id) else { continue };
+            // Read live or aside: a frame retired below by an earlier take
+            // of the same id cannot be noted twice, but a reader must not
+            // depend on the order.
+            let Some((runs, _)) = self.frames.runs_and_hashes_any(&id) else { continue };
             if let Some(list) = list.as_mut() {
                 list.reserve(prefix);
             }
@@ -3869,6 +4177,8 @@ impl<T: PoolTransaction> Inner<T> {
                     lane.queued = false;
                 }
             }
+            // `N42_FRAME_SWEEP_AT_TAKE`: taken whole, it leaves the live index.
+            self.frames.retire(&id, prefix);
         }
     }
 
@@ -3951,6 +4261,7 @@ impl<T: PoolTransaction> Inner<T> {
                     debug_assert_eq!(taken, txs.len());
                     plan.push_hashes(Arc::clone(hashes), txs.len());
                     plan.frames.push(PlannedFrame { id, len: txs.len(), taken: txs.len() });
+                    self.frames.retire(&id, txs.len());
                     times.by_ref += 1;
                     segments.push((txs, taken));
                     *gas_left = gas_left.saturating_sub(gas);
@@ -4045,6 +4356,7 @@ impl<T: PoolTransaction> Inner<T> {
             }
             plan.push_hashes(taken_hashes.into(), taken);
             plan.frames.push(PlannedFrame { id, len: members.len(), taken });
+            self.frames.retire(&id, taken);
             *gas_left = gas_left.saturating_sub(gas);
             SlowFrame::Taken(out, taken == members.len())
         }
@@ -4157,7 +4469,7 @@ impl<T: PoolTransaction> Inner<T> {
         }
         let mut lowest: AddressHashMap<u64> = AddressHashMap::default();
         for frame in &plan.frames {
-            let Some((runs, _)) = inner.frames.runs_and_hashes(&frame.id) else { continue };
+            let Some((runs, _)) = inner.frames.runs_and_hashes_any(&frame.id) else { continue };
             for run in runs.iter().filter(|run| (run.start as usize) < frame.taken) {
                 let entry = lowest.entry(run.sender).or_insert(run.first_nonce);
                 *entry = (*entry).min(run.first_nonce);
@@ -4169,7 +4481,7 @@ impl<T: PoolTransaction> Inner<T> {
         // transactions: the hook reads them outside the lock.
         let body = with_hook.then(|| {
             let slot = Arc::new(Mutex::new(BodySlot::default()));
-            *body_job = Some((segments.clone(), Arc::clone(&slot)));
+            *body_job = Some((segments.clone(), plan.clone(), Arc::clone(&slot)));
             slot
         });
         inner.prepared = Some(Prepared {
@@ -4297,6 +4609,7 @@ impl<T: PoolTransaction> Inner<T> {
     /// height the chain settled elsewhere comes back -- and nothing would
     /// remove it a second time.
     fn give_back(&mut self, taken: Vec<Arc<ValidPoolTransaction<T>>>) -> GaveBack {
+        let revive = self.frames.retired_len() > 0;
         let mut senders: Vec<Address> = Vec::new();
         let mut unparked: Vec<Address> = Vec::new();
         let mut gave = GaveBack::default();
@@ -4315,6 +4628,15 @@ impl<T: PoolTransaction> Inner<T> {
                 continue;
             }
             gave.offered += 1;
+            // `N42_FRAME_SWEEP_AT_TAKE`: a take coming back whole brings its
+            // frames back to the live index, each found by its first hash
+            // (only for what is offered: a mined one stays aside). A frame
+            // only partly returned stays aside: its transactions are
+            // frameless at their lanes, and the slow puller and the
+            // per-transaction check take them, as before.
+            if revive {
+                self.frames.revive_by_first(valid.hash());
+            }
             // An own block the chain settled elsewhere comes back through
             // here, and it can carry the very nonce a lane is parked
             // behind.
@@ -4775,8 +5097,14 @@ fn plan_parallel_over<T: PoolTransaction, S: PlanSource<T>>(
         reach = reach.saturating_add(gas);
         end += 1;
     }
-    let checks: Vec<frames::RunCheck<T>> =
-        ids[..end].par_iter().with_min_len(4).map(|id| src.check_runs(id)).collect();
+    // On the queue's own pool ([`plan_pool`]), not the global one: a plan
+    // made while a block executes waited for the global pool's workers --
+    // loop351 stage am (`X9FS2`, the frame sweep on, so the checked window
+    // is live frames): `start_walk_check_us` p90 8.4 ms, max 152 ms, for a
+    // check of 400 frames.
+    let checks: Vec<frames::RunCheck<T>> = in_plan_pool(|| {
+        ids[..end].par_iter().with_min_len(4).map(|id| src.check_runs(id)).collect()
+    });
     // Senders some run needs entries below it taken of, and each frame's
     // runs of those senders: what the decisions below count.
     let shared: AddressHashSet = checks
@@ -4790,7 +5118,8 @@ fn plan_parallel_over<T: PoolTransaction, S: PlanSource<T>>(
     let draws: Vec<Vec<(u32, Address, u32)>> = if shared.is_empty() {
         Vec::new()
     } else {
-        ids[..end]
+        in_plan_pool(|| {
+            ids[..end]
             .par_iter()
             .zip(checks.par_iter())
             .map(|(id, check)| match check {
@@ -4804,6 +5133,7 @@ fn plan_parallel_over<T: PoolTransaction, S: PlanSource<T>>(
                 _ => Vec::new(),
             })
             .collect()
+        })
     };
     times.check_us = check_at.elapsed().as_micros() as u64;
     let mut taken_of: AddressHashMap<u64> = AddressHashMap::default();
@@ -4950,6 +5280,20 @@ pub struct FrameSelectTimes {
     pub ahead_topup_txs: usize,
     /// Why a prepared plan was not used, when there was one.
     pub ahead_discard: Option<AheadDiscard>,
+    /// `N42_PLAN_AHEAD_WAIT_MS`: how long this build's start waited for the
+    /// continuous preparation's plan, and whether the wait ran out.
+    pub ahead_wait_us: u64,
+    /// Whether the wait above ran out before the plan was full.
+    pub ahead_wait_timeout: bool,
+    /// The live frame index's size at this build's start, the frames that
+    /// left it at a take since the previous build's start
+    /// (`N42_FRAME_SWEEP_AT_TAKE`), and the frames it has refused at
+    /// [`MAX_FRAMES`] since the process started.
+    pub frames_index: usize,
+    /// Frames that left the index at a take since the previous start.
+    pub frames_swept_at_take: u64,
+    /// Frames refused at the bound, since the process started.
+    pub frames_refused_at_cap: u64,
 }
 
 /// How a frame build selects ([`Inner::plan_frames`]); the plan is the

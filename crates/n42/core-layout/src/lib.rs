@@ -28,6 +28,19 @@
 //! `start_handler`), and helpers that a critical thread may spawn call
 //! [`background_thread`] to step back out.
 //!
+//! Three placements, all off by default (the layout above unchanged):
+//!
+//! - `N42_CORE_LAYOUT_SIBLINGS=background`: the siblings of the build and
+//!   critical cores join the background set instead of idling (the build
+//!   pool's threads still have their cores' first CPUs to themselves).
+//! - `N42_CORE_LAYOUT_BEHIND=build|critical|background`: where the pool
+//!   behind the seal (`N42_FREEZE_POOL=own`, [`Set::Behind`]) runs; `build`
+//!   (the default) shares the build set as before.
+//! - `N42_CORE_LAYOUT_CRITICAL=background`: the critical threads (the
+//!   leader's QMDB root job, the follower's root and vote-check pools) run on
+//!   the background set, and the critical cores are background cores too;
+//!   `N42_CORE_LAYOUT_CRITICAL_CORES` is then ignored.
+//!
 //! `N42_BACKGROUND_NICE=<1..19|idle>` lowers the priority of the background
 //! work that has no deadline of its own (merges, persistence, prefault /
 //! populate / release threads, the ingest's recovery), independent of the
@@ -53,6 +66,9 @@ pub enum Set {
     Critical,
     /// Everything else.
     Background,
+    /// The pool behind the seal (`N42_FREEZE_POOL=own`): the build set
+    /// unless `N42_CORE_LAYOUT_BEHIND` places it elsewhere.
+    Behind,
 }
 
 /// How the mask is split.
@@ -66,6 +82,15 @@ pub struct Config {
     pub critical_cores: usize,
     /// The fewest logical CPUs the background set may be left with.
     pub min_background_cpus: usize,
+    /// The build and critical cores' siblings go to the background set
+    /// rather than idle (`N42_CORE_LAYOUT_SIBLINGS=background`).
+    pub siblings_to_background: bool,
+    /// The set [`Set::Behind`] runs on (`N42_CORE_LAYOUT_BEHIND`): build,
+    /// critical or background.
+    pub behind: Set,
+    /// The critical threads run on the background set, which keeps the
+    /// critical cores (`N42_CORE_LAYOUT_CRITICAL=background`).
+    pub critical_to_background: bool,
 }
 
 impl Default for Config {
@@ -75,6 +100,9 @@ impl Default for Config {
             build_siblings: false,
             critical_cores: DEFAULT_CRITICAL_CORES,
             min_background_cpus: DEFAULT_MIN_BACKGROUND_CPUS,
+            siblings_to_background: false,
+            behind: Set::Build,
+            critical_to_background: false,
         }
     }
 }
@@ -90,6 +118,13 @@ impl Config {
             build_siblings: std::env::var("N42_CORE_LAYOUT_BUILD_SIBLINGS").is_ok_and(|v| v == "1"),
             critical_cores: num("N42_CORE_LAYOUT_CRITICAL_CORES").unwrap_or(defaults.critical_cores),
             min_background_cpus: defaults.min_background_cpus,
+            siblings_to_background: std::env::var("N42_CORE_LAYOUT_SIBLINGS").is_ok_and(|v| v.trim() == "background"),
+            behind: match std::env::var("N42_CORE_LAYOUT_BEHIND").ok().as_deref().map(str::trim) {
+                Some("background") => Set::Background,
+                Some("critical") => Set::Critical,
+                _ => Set::Build,
+            },
+            critical_to_background: std::env::var("N42_CORE_LAYOUT_CRITICAL").is_ok_and(|v| v.trim() == "background"),
         }
     }
 }
@@ -107,6 +142,10 @@ pub struct Layout {
     pub idle: Vec<usize>,
     /// Whether the build set holds its cores' siblings too.
     pub build_siblings: bool,
+    /// The set [`Set::Behind`] resolves to (never `Behind`).
+    pub behind: Set,
+    /// [`Set::Critical`] resolves to the background set.
+    pub critical_to_background: bool,
 }
 
 impl Layout {
@@ -114,9 +153,14 @@ impl Layout {
     pub fn cpus(&self, set: Set) -> &[usize] {
         match set {
             Set::Build => &self.build,
+            Set::Critical if self.critical_to_background => &self.background,
             Set::Critical if self.critical.is_empty() => &self.build,
             Set::Critical => &self.critical,
             Set::Background => &self.background,
+            Set::Behind => match self.behind {
+                Set::Behind => &self.build,
+                other => self.cpus(other),
+            },
         }
     }
 
@@ -125,7 +169,13 @@ impl Layout {
     pub fn tag(&self) -> String {
         let cores = if self.build_siblings { self.build.len() / 2 } else { self.build.len() };
         let siblings = if self.build_siblings { "x2" } else { "" };
-        format!("b{cores}{siblings}/c{}/bg{}", self.critical.len(), self.background.len())
+        let critical = if self.critical_to_background { "bg".to_string() } else { self.critical.len().to_string() };
+        let behind = match self.behind {
+            Set::Background => "/behind-bg",
+            Set::Critical => "/behind-c",
+            _ => "",
+        };
+        format!("b{cores}{siblings}/c{critical}/bg{}{behind}", self.background.len())
     }
 }
 
@@ -238,18 +288,21 @@ pub fn compute(
         return Err(LayoutError::EmptyMask);
     }
     let cores = physical_cores(mask, siblings);
-    let need = config.build_cores + config.critical_cores + 1;
+    let critical_count = if config.critical_to_background { 0 } else { config.critical_cores };
+    let need = config.build_cores + critical_count + 1;
     if config.build_cores == 0 || cores.len() < need {
         return Err(LayoutError::TooFewCores { have: cores.len(), need });
     }
     let (build_cores, rest) = cores.split_at(config.build_cores);
-    let (critical_cores, background_cores) = rest.split_at(config.critical_cores);
+    let (critical_cores, background_cores) = rest.split_at(critical_count);
     let mut layout = Layout {
         build: Vec::new(),
         critical: Vec::new(),
         background: background_cores.iter().flatten().copied().collect(),
         idle: Vec::new(),
         build_siblings: config.build_siblings,
+        behind: config.behind,
+        critical_to_background: config.critical_to_background,
     };
     for core in build_cores {
         if config.build_siblings {
@@ -264,6 +317,9 @@ pub fn compute(
             layout.critical.push(*first);
             layout.idle.extend_from_slice(others);
         }
+    }
+    if config.siblings_to_background {
+        layout.background.append(&mut layout.idle);
     }
     if layout.background.len() < config.min_background_cpus {
         return Err(LayoutError::TooFewBackground { have: layout.background.len(), need: config.min_background_cpus });
@@ -676,6 +732,49 @@ mod tests {
             assert!(!pin_current_thread(Set::Build).expect("no error when off"));
             assert_eq!(label(), "off");
         }
+    }
+
+    /// The E=1 layer's mask on this host (cores 0-103 with siblings at
+    /// +128): the placements that keep the build's 64 cores to the build and
+    /// give everything else the rest, siblings included.
+    #[test]
+    fn placements_give_the_rest_to_everyone_else() {
+        let mask: Vec<usize> = (0..104).chain(128..232).collect();
+        let base = Config { build_cores: 64, ..Config::default() };
+        let plain = compute(&mask, smt(128), &base).expect("fits");
+        assert_eq!(plain.build, (0..64).collect::<Vec<_>>());
+        assert_eq!(plain.critical, (64..68).collect::<Vec<_>>());
+        assert_eq!(plain.background, (68..104).chain(196..232).collect::<Vec<_>>());
+        assert_eq!(plain.idle, (128..196).collect::<Vec<_>>());
+        assert_eq!(plain.cpus(Set::Behind), plain.cpus(Set::Build), "the behind pool shares the build set by default");
+        assert_eq!(plain.tag(), "b64/c4/bg72");
+
+        let sib = Config { siblings_to_background: true, behind: Set::Background, ..base };
+        let layout = compute(&mask, smt(128), &sib).expect("fits");
+        assert_eq!(layout.build, (0..64).collect::<Vec<_>>());
+        assert_eq!(layout.critical, (64..68).collect::<Vec<_>>());
+        assert_eq!(layout.background, (68..104).chain(128..232).collect::<Vec<_>>());
+        assert!(layout.idle.is_empty());
+        assert_eq!(layout.cpus(Set::Behind), &layout.background[..]);
+        assert_eq!(layout.tag(), "b64/c4/bg140/behind-bg");
+
+        let crit16 = Config { critical_cores: 16, ..sib };
+        let layout = compute(&mask, smt(128), &crit16).expect("fits");
+        assert_eq!(layout.critical, (64..80).collect::<Vec<_>>());
+        assert_eq!(layout.background, (80..104).chain(128..232).collect::<Vec<_>>());
+
+        let rest = Config { critical_to_background: true, ..sib };
+        let layout = compute(&mask, smt(128), &rest).expect("fits");
+        assert!(layout.critical.is_empty());
+        assert_eq!(layout.background, (64..104).chain(128..232).collect::<Vec<_>>());
+        assert_eq!(layout.cpus(Set::Critical), &layout.background[..], "the root job on the whole rest");
+        assert_eq!(layout.cpus(Set::Build), &(0..64).collect::<Vec<_>>()[..]);
+        assert_eq!(layout.background.len(), 144);
+        assert_eq!(layout.tag(), "b64/cbg/bg144/behind-bg");
+        // Every CPU of the mask is in exactly one set.
+        let mut all: Vec<usize> = layout.build.iter().chain(&layout.background).chain(&layout.idle).copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, mask);
     }
 
     #[cfg(target_os = "linux")]

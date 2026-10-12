@@ -159,6 +159,28 @@ pub fn built_of(sealed: &B256) -> Option<B256> {
     with_registry(|registry| registry.aliases.iter().rev().find(|(known, _)| known == sealed).map(|(_, built)| *built))
 }
 
+/// Which half of `block_hash`'s entry (or of the builder hash it was noted
+/// as) is still missing: "none" when complete, "state_root", "receipts",
+/// or "both" (no entry yet). Diagnostic: the builder's seal names what its
+/// wait for the carried ancestor's fields was on.
+pub fn missing_half(block_hash: &B256) -> &'static str {
+    // Read only: no `with_registry`, whose notify would wake every waiter.
+    let guard = REGISTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.as_ref().map_or("both", |registry| {
+        let entry = registry.by_hash.get(block_hash).copied().or_else(|| {
+            let built = registry.aliases.iter().rev().find(|(sealed, _)| sealed == block_hash)?.1;
+            registry.by_hash.get(&built).copied()
+        });
+        match entry {
+            None => "both",
+            Some(Partial { state_root: None, receipts: None }) => "both",
+            Some(Partial { state_root: None, .. }) => "state_root",
+            Some(Partial { receipts: None, .. }) => "receipts",
+            Some(_) => "none",
+        }
+    })
+}
+
 /// [`get`], waiting up to `timeout` for the fields to be recorded: a parent
 /// sealed before its finish (docs/PHASE_D_DEFERRED_EXECUTION.md section 13)
 /// records them a moment after its child's build has started.
@@ -211,8 +233,18 @@ pub fn fields_from_child_header(child: &alloy_consensus::Header) -> ExecutedFiel
 mod tests {
     use super::*;
 
+    /// The registry is process-global: the eviction test floods it past
+    /// `KEEP` entries, which would evict the alias test's entries mid-run.
+    /// Tests that touch it hold this lock.
+    static REGISTRY_TESTS: Mutex<()> = Mutex::new(());
+
+    fn serialized() -> std::sync::MutexGuard<'static, ()> {
+        REGISTRY_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn an_entry_is_complete_only_with_both_halves_and_old_ones_fall_out() {
+        let _serial = serialized();
         let h = |b: u8| B256::repeat_byte(b);
         remember_state_root(h(1), h(0xA1));
         assert_eq!(get(&h(1)), None);
@@ -231,6 +263,7 @@ mod tests {
 
     #[test]
     fn a_sealed_hash_noted_as_an_alias_finds_the_builders_entry() {
+        let _serial = serialized();
         let h = |b: u8| B256::repeat_byte(b);
         let fields = ExecutedFields { state_root: h(0xC1), receipts_root: h(0xC2), logs_bloom: Bloom::default(), gas_used: 7 };
         // Filed under the builder's hash only, as a leader's own block is.

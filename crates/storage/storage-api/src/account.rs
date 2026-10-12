@@ -16,6 +16,15 @@ pub trait AccountReader {
     ///
     /// Returns `None` if the account doesn't exist.
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>>;
+
+    /// N42: a hint that `address` will be read soon. A layer that holds the account
+    /// probes for it (bringing its lines into the cache) and returns `true`; one that
+    /// does not passes the hint to the layer beneath and returns that layer's answer.
+    /// Never materialises anything, never changes a read's answer or a counter, and
+    /// never waits on a lock. The default does nothing.
+    fn n42_prefetch_account(&self, _address: &Address) -> bool {
+        false
+    }
 }
 
 /// Account reader

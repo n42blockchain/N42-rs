@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
 use n42_twig_core::qmdb_compat::{
-    gov5_account_key, gov5_storage_key, BlockUndo, QmdbCompatTree, QmdbEntrySnapshot,
+    gov5_account_key, gov5_storage_key, BlockUndo, LeafHashes, QmdbCompatTree, QmdbEntrySnapshot,
     QmdbOps, QmdbProof, QmdbSnapshot, TwigNodes,
 };
 use serde::{Deserialize, Serialize};
@@ -488,22 +488,30 @@ impl TreeLease {
     /// Nothing outside the tree is touched; [`QmdbForest::return_tree`] files
     /// the result as pending work.
     pub fn compute(&mut self, ops: impl Into<QmdbOps>) -> Result<LeasedRoot, StateError> {
+        self.compute_with_leaves(ops, None)
+    }
+
+    /// [`Self::compute`] with the operations' leaf hashes computed before the
+    /// lease was taken ([`LeafHashes::of`] on the sorted operations), so the
+    /// tree is out only for what needs it. Hashes that do not belong to the
+    /// operations are ignored; the root is the same either way.
+    pub fn compute_with_leaves(&mut self, ops: impl Into<QmdbOps>, leaves: Option<&LeafHashes>) -> Result<LeasedRoot, StateError> {
         let mut ops = ops.into();
         if !ops.is_sorted() {
             ops.sort();
         }
         let applied_at = std::time::Instant::now();
-        let (root, undo, phases) = self.tree.apply_ops_recorded_phased(&ops)?;
+        let (root, undo, phases) = self.tree.apply_ops_recorded_phased_with(&ops, leaves)?;
         let apply_us = applied_at.elapsed().as_micros() as u64;
         let delta_at = std::time::Instant::now();
-        let delta = delta_of_applied(&self.tree, &undo);
-        let offsets = if self.tree.entry_file().is_some() {
-            (undo.prev_next_slot..self.tree.next_slot())
-                .map(|slot| self.tree.entry_offset(slot))
-                .collect::<Option<Vec<u64>>>()
-                .map(Arc::from)
+        let tree = &self.tree;
+        let offsets = || {
+            tree.entry_file().is_some().then(|| appended_offsets(tree, undo.prev_next_slot)).flatten()
+        };
+        let (delta, offsets) = if n42_twig_core::qmdb_compat::parallel_apply() {
+            rayon::join(|| delta_of_applied(tree, &undo), offsets)
         } else {
-            None
+            (delta_of_applied(tree, &undo), offsets())
         };
         let delta_us = delta_at.elapsed().as_micros() as u64;
         Ok(LeasedRoot { root: B256::from(root), ops, undo, delta, offsets, phases, apply_us, delta_us })
@@ -534,6 +542,34 @@ impl BlockChangesParts {
             .map(|(key, value)| (*key, if value.is_some() { appended.next().copied() } else { None }))
             .collect()
     }
+}
+
+/// Says once per process which of the apply's switches this forest runs
+/// with (`N42_QMDB_PARALLEL_APPLY`).
+fn log_switches_once() {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        tracing::info!(
+            target: "n42.qmdb",
+            parallel_apply = n42_twig_core::qmdb_compat::parallel_apply_env(),
+            rayon_threads = rayon::current_num_threads(),
+            "QMDB block apply (N42_QMDB_PARALLEL_APPLY)",
+        );
+    });
+}
+
+/// The entry-file offsets of the slots appended since `from`, in slot order
+/// (`None` when one is missing): on the worker pool with
+/// `N42_QMDB_PARALLEL_APPLY`, the same list either way.
+fn appended_offsets(tree: &QmdbCompatTree, from: u64) -> Option<Arc<[u64]>> {
+    use rayon::prelude::*;
+    let count = usize::try_from(tree.next_slot().saturating_sub(from)).ok()?;
+    let offsets = if n42_twig_core::qmdb_compat::parallel_apply() {
+        (0..count).into_par_iter().with_min_len(8192).map(|k| tree.entry_offset(from + k as u64)).collect::<Option<Vec<u64>>>()
+    } else {
+        (0..count).map(|k| tree.entry_offset(from + k as u64)).collect::<Option<Vec<u64>>>()
+    };
+    offsets.map(Arc::from)
 }
 
 /// The delta from the parent to the block just applied on `tree`; see
@@ -763,6 +799,7 @@ impl QmdbForest {
     }
 
     fn at(number: u64, hash: B256, tree: QmdbCompatTree) -> Self {
+        log_switches_once();
         let root = B256::from(tree.root());
         let next_slot = tree.next_slot();
         let mut records = HashMap::new();
@@ -884,6 +921,51 @@ impl QmdbForest {
             other.undo.as_ref().is_some_and(|later| later.prev_next_slot == slot)
         }) || self.pending.as_ref().is_some_and(|(_, pending)| pending.prev_next_slot == slot))
         .then_some(changes)
+    }
+
+    /// Stands the tree back on `block_hash`'s path when a held block among
+    /// `blocks` is not applied on it, so [`Self::block_changes`] can list them.
+    ///
+    /// A block computed on an older parent -- a sibling of a canonical block
+    /// the database has not persisted yet, built for a stale request -- moves
+    /// the tree off the canonical path and takes the undos of every canonical
+    /// block above that parent. Until the next canonical computation moves the
+    /// tree back, the canonical blocks' changes cannot be listed, and the read
+    /// view, persisting one of them in that window, was invalidated for good
+    /// (loop351 X9j: a stale build on block 1020 while 1021 was persisted).
+    /// `block_hash` is the newest of `blocks`; the tree is moved only when it
+    /// is held and one of `blocks` lacks its undo. Returns whether it moved.
+    pub fn restore_path_to(&mut self, blocks: &[B256], block_hash: B256) -> Result<bool, StateError> {
+        let off_path = |hash: &B256| self.records.get(hash).is_some_and(|record| record.undo.is_none());
+        if !self.records.contains_key(&block_hash) || !blocks.iter().any(off_path) {
+            return Ok(false);
+        }
+        self.move_to(block_hash)?;
+        Ok(true)
+    }
+
+    /// Refuses a build on `parent` when it is a strict ancestor of the
+    /// canonical head ([`StateError::StaleBuildParent`]). A builder builds on
+    /// the head or on a block above it; on a committed chain an ancestor of
+    /// the head is a request that went stale (loop351 X9j: a build ahead on
+    /// block 1020 asked for while 1021 was canonical moved the tree off the
+    /// canonical path and held the forest 555 ms). Validation is not checked
+    /// here: an imported side block takes the ordinary move.
+    pub fn check_build_parent(&self, parent: &B256) -> Result<(), StateError> {
+        let (head_number, head_hash) = self.head;
+        let Some(record) = self.records.get(parent) else { return Ok(()) };
+        if *parent == head_hash || record.number >= head_number {
+            return Ok(());
+        }
+        if !self.ancestry(head_hash).contains(parent) {
+            return Ok(());
+        }
+        Err(StateError::StaleBuildParent {
+            parent: *parent,
+            parent_number: record.number,
+            head_number,
+            persisted: self.keep_from.map(|from| from.saturating_sub(1)),
+        })
     }
 
     /// Every live entry's key and record offset at the tree's current block;
@@ -2108,6 +2190,66 @@ mod tests {
         for (key, offset) in live {
             assert_eq!(view.key(offset), key);
         }
+    }
+
+    /// A canonical block whose undo a sibling's computation took is listed
+    /// again once the tree is stood back on its path, with the offsets of the
+    /// records it re-appended.
+    #[test]
+    fn a_block_moved_off_the_path_by_a_sibling_is_listed_after_restoring_it() {
+        let dir = std::env::temp_dir().join(format!("n42-forest-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("entries.log");
+        let mut forest = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap().with_entry_file(&path).unwrap();
+        forest.apply(GENESIS, h(1), 1, &changes(1)).unwrap();
+        forest.apply(h(1), h(2), 2, &changes(2)).unwrap();
+        forest.apply(h(2), h(3), 3, &changes(3)).unwrap();
+        forest.set_canonical(h(3)).unwrap();
+        // A stale build on block 1: computed, not filed (the payload builder's
+        // root), it leaves the tree on the sibling with blocks 2 and 3 reverted.
+        let _sibling = forest.compute(h(1), &changes(9)).unwrap();
+        assert!(forest.block_changes(&h(2)).is_none(), "block 2 is off the tree's path");
+        assert!(!forest.restore_path_to(&[h(1)], h(1)).unwrap(), "block 1 is on the path");
+        assert!(forest.restore_path_to(&[h(2), h(3)], h(3)).unwrap());
+        assert!(!forest.restore_path_to(&[h(2), h(3)], h(3)).unwrap(), "already on the path");
+        forest.flush_entries_for_sync().unwrap();
+        let view = n42_twig_core::entry_view::EntryFileView::open(&path).unwrap();
+        for n in 2..=3u8 {
+            let listed = forest.block_changes(&h(n)).expect("back on the tree's path");
+            let ops = { let mut ops = changes(n).operations(); ops.sort_unstable_by_key(|op| op.key); ops };
+            assert_eq!(listed.len(), ops.len());
+            for ((key, offset), op) in listed.iter().zip(&ops) {
+                assert_eq!(*key, op.key);
+                match (offset, &op.value) {
+                    (Some(offset), Some(value)) => assert_eq!(view.record(*offset), (op.key, value.as_slice())),
+                    other => panic!("mismatched change {other:?}"),
+                }
+            }
+        }
+        // An unknown block is not moved to.
+        assert!(!forest.restore_path_to(&[h(7)], h(7)).unwrap());
+    }
+
+    /// A build on an ancestor of the canonical head is refused before the
+    /// tree moves; the head, a block above it and a side branch are not.
+    #[test]
+    fn a_build_on_an_ancestor_of_the_head_is_refused() {
+        let mut forest = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap();
+        forest.apply(GENESIS, h(1), 1, &changes(1)).unwrap();
+        forest.apply(h(1), h(2), 2, &changes(2)).unwrap();
+        forest.set_canonical(h(2)).unwrap();
+        forest.apply(h(2), h(3), 3, &changes(3)).unwrap();
+        forest.set_keep_from(Some(2));
+        let err = forest.check_build_parent(&h(1)).unwrap_err();
+        assert!(matches!(
+            err,
+            StateError::StaleBuildParent { parent_number: 1, head_number: 2, persisted: Some(1), .. }
+        ), "{err}");
+        assert!(err.to_string().contains("block 1") && err.to_string().contains("head 2"), "{err}");
+        assert!(forest.check_build_parent(&h(2)).is_ok(), "the head");
+        assert!(forest.check_build_parent(&h(3)).is_ok(), "above the head");
+        assert!(forest.check_build_parent(&h(7)).is_ok(), "unknown: compute reports it");
     }
 
     /// A reader's keep holds the records from its block up past the retention

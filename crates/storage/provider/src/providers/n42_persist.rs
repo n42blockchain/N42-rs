@@ -311,3 +311,80 @@ mod tests {
         assert!(recorder.calls.lock().expect("recorder lock").is_empty());
     }
 }
+
+/// N42: a block's plain-state reverts, from its complete revert set: an own
+/// block handed to the engine before its revert set was merged
+/// (`N42_ANSWER_BEFORE_REVERTS`, `n42_deferred_reverts`) waits for it here.
+pub(crate) trait N42PlainReverts {
+    /// The plain reverts of the complete revert set.
+    fn n42_plain_reverts(&self) -> ProviderResult<revm::database::states::PlainStateReverts>;
+}
+
+impl<R> N42PlainReverts for reth_execution_types::BlockExecutionOutput<R> {
+    fn n42_plain_reverts(&self) -> ProviderResult<revm::database::states::PlainStateReverts> {
+        match n42_deferred_reverts::resolve(self).map_err(ProviderError::other)? {
+            Some((reverts, _)) => Ok(reverts.to_plain_state_reverts()),
+            None => Ok(self.state.reverts.to_plain_state_reverts()),
+        }
+    }
+}
+
+/// N42: `output` with its complete revert set put in, when it was handed out
+/// without it (`N42_ANSWER_BEFORE_REVERTS`); `None` when it is complete as it
+/// stands. A copy of the bundle: only for the paths that read the reverts
+/// through the outcome itself.
+pub(crate) fn n42_completed_output<R: Clone>(
+    output: &reth_execution_types::BlockExecutionOutput<R>,
+) -> ProviderResult<Option<reth_execution_types::BlockExecutionOutput<R>>> {
+    let Some((reverts, size)) = n42_deferred_reverts::resolve(output).map_err(ProviderError::other)? else {
+        return Ok(None);
+    };
+    let mut completed = output.clone();
+    completed.state.reverts = (*reverts).clone();
+    completed.state.reverts_size = size;
+    Ok(Some(completed))
+}
+
+#[cfg(test)]
+mod late_reverts_tests {
+    use super::{n42_completed_output, N42PlainReverts};
+    use alloy_primitives::Address;
+    use reth_execution_types::BlockExecutionOutput;
+    use revm::database::{states::reverts::Reverts, AccountRevert, BundleState};
+    use std::sync::Arc;
+
+    fn reverts(addresses: &[u8]) -> Reverts {
+        let mut reverts = Reverts::default();
+        reverts.push(
+            addresses
+                .iter()
+                .map(|a| (Address::with_last_byte(*a), AccountRevert { wipe_storage: true, ..Default::default() }))
+                .collect(),
+        );
+        reverts
+    }
+
+    #[test]
+    fn persistence_reads_a_late_revert_set_and_a_complete_bundle_as_it_stands() {
+        let complete = BundleState { reverts: reverts(&[1, 2, 3]), reverts_size: 3, ..Default::default() };
+        let handed = Arc::new(BlockExecutionOutput::<u8> {
+            state: BundleState { reverts: reverts(&[3]), reverts_size: 1, ..Default::default() },
+            result: Default::default(),
+        });
+        let plain = BlockExecutionOutput::<u8> { state: complete.clone(), result: Default::default() };
+        let debug = |reverts: revm::database::states::PlainStateReverts| format!("{reverts:?}");
+        assert_eq!(debug(plain.n42_plain_reverts().expect("plain")), debug(complete.reverts.to_plain_state_reverts()));
+        assert!(n42_completed_output(&plain).expect("plain").is_none());
+
+        let late = n42_deferred_reverts::register(&handed);
+        let filler = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            late.fill(reverts(&[1, 2, 3]), 3);
+        });
+        assert_eq!(debug(handed.n42_plain_reverts().expect("late")), debug(complete.reverts.to_plain_state_reverts()));
+        filler.join().expect("filler");
+        let completed = n42_completed_output(&*handed).expect("late").expect("registered");
+        assert_eq!(completed.state, complete);
+        assert_eq!(handed.state.reverts_size, 1, "the handed output itself is not changed");
+    }
+}

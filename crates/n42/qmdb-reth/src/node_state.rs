@@ -541,6 +541,9 @@ struct Inner {
     tree_back: std::sync::Condvar,
     /// `N42_QMDB_COMPUTE_OFFLOCK`, or `set_compute_offlock`.
     compute_offlock: std::sync::atomic::AtomicBool,
+    /// Whether a build on an ancestor of the canonical head is refused
+    /// ([`QmdbNodeState::set_refuse_stale_builds`]).
+    refuse_stale_builds: std::sync::atomic::AtomicBool,
     /// `N42_QMDB_PERSIST_BATCH`, or `set_persist_batch`.
     persist_batch: std::sync::atomic::AtomicBool,
     /// `N42_QMDB_CANONICAL_DEFER`, or `set_canonical_defer`.
@@ -563,6 +566,9 @@ struct Inner {
     persist_hold_us: std::sync::atomic::AtomicU64,
     persist_advance_us: std::sync::atomic::AtomicU64,
     persist_holds: std::sync::atomic::AtomicU64,
+    /// Who held the forest's lock and its tree, and who waited
+    /// ([`crate::occupancy`]).
+    occupancy: crate::occupancy::Occupancy,
 }
 
 /// A rename queued by [`QmdbNodeState::rename_or_defer`].
@@ -606,6 +612,7 @@ const ROOT_SPLITS_KEPT: usize = 32;
 /// hold over [`FOREST_LOCK_WARN_MS`] is logged when it is dropped.
 struct ForestGuard<'a> {
     guard: MutexGuard<'a, Option<QmdbForest>>,
+    inner: &'a Inner,
     label: &'static str,
     acquired: std::time::Instant,
     waited_ms: u64,
@@ -627,7 +634,10 @@ impl std::ops::DerefMut for ForestGuard<'_> {
 
 impl Drop for ForestGuard<'_> {
     fn drop(&mut self) {
-        let ms = self.acquired.elapsed().as_millis() as u64;
+        let held = self.acquired.elapsed();
+        self.inner.occupancy.hold(self.label, held);
+        self.inner.occupancy.maybe_log(self.inner.canonical_number.load(std::sync::atomic::Ordering::Relaxed));
+        let ms = held.as_millis() as u64;
         if ms > FOREST_LOCK_WARN_MS {
             warn!(target: "n42.qmdb", label = self.label, ms, "forest lock held");
         }
@@ -885,6 +895,7 @@ impl QmdbNodeState {
                 compaction_phases: Mutex::new([0; 5]),
                 tree_back: std::sync::Condvar::new(),
                 compute_offlock: std::sync::atomic::AtomicBool::new(compute_offlock_env()),
+                refuse_stale_builds: std::sync::atomic::AtomicBool::new(false),
                 persist_batch: std::sync::atomic::AtomicBool::new(persist_batch_env()),
                 canonical_defer: std::sync::atomic::AtomicBool::new(canonical_defer_env()),
                 deferred_canonicals: Default::default(),
@@ -899,6 +910,7 @@ impl QmdbNodeState {
                 persist_hold_us: Default::default(),
                 persist_advance_us: Default::default(),
                 persist_holds: Default::default(),
+                occupancy: Default::default(),
             }),
         }
     }
@@ -1138,6 +1150,15 @@ impl QmdbNodeState {
             }
         }
         let listed = self.with_forest_timed("on_persisted", split, |forest| {
+            // A block computed on an older parent (a stale build) may have
+            // moved the tree off the persisted blocks' path; stand it back on
+            // them before listing, or the view is invalidated for good.
+            let hashes: Vec<B256> = todo.iter().map(|&(_, hash)| hash).collect();
+            if let Some(&last_hash) = hashes.last() {
+                if forest.restore_path_to(&hashes, last_hash)? {
+                    info!(target: "n42.qmdb", block = last, "stood the QMDB tree back on the persisted blocks' path");
+                }
+            }
             forest.flush_entries_for_sync()?;
             let mut listed = Vec::with_capacity(todo.len());
             for &(number, hash) in todo {
@@ -1216,6 +1237,27 @@ impl QmdbNodeState {
         self.inner.compute_offlock.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Refuses builds on an ancestor of the canonical head
+    /// (`QmdbForest::check_build_parent`). Only for a chain with finality,
+    /// where the canonical head follows the committed block and a parent
+    /// below it is a stale request (the HotStuff-2 node sets it); on a chain
+    /// without finality (APoS, the deferred-execution fork tests) a build on
+    /// an older block is a legitimate fork. Off by default.
+    pub fn set_refuse_stale_builds(&self, on: bool) {
+        self.inner.refuse_stale_builds.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether builds on an ancestor of the canonical head are refused.
+    pub fn refuse_stale_builds(&self) -> bool {
+        self.inner.refuse_stale_builds.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The build guard: [`QmdbForest::check_build_parent`] when
+    /// [`Self::refuse_stale_builds`] is on.
+    fn check_build_parent(&self, forest: &QmdbForest, parent: &B256) -> Result<(), StateError> {
+        if self.refuse_stale_builds() { forest.check_build_parent(parent) } else { Ok(()) }
+    }
+
     /// Overrides `N42_QMDB_COMPUTE_OFFLOCK` for this state.
     pub fn set_compute_offlock(&self, on: bool) {
         self.inner.compute_offlock.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -1240,6 +1282,12 @@ impl QmdbNodeState {
     /// Overrides `N42_QMDB_CANONICAL_DEFER` for this state.
     pub fn set_canonical_defer(&self, on: bool) {
         self.inner.canonical_defer.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The forest's occupancy by label since its last periodic line
+    /// ([`crate::occupancy`]): `tree_lease` is the leased tree's time out.
+    pub fn occupancy(&self) -> Vec<(&'static str, crate::occupancy::LabelSums)> {
+        self.inner.occupancy.snapshot()
     }
 
     /// What the off-lock root and the persistence holds have done so far.
@@ -1417,7 +1465,9 @@ impl QmdbNodeState {
         held_by: &'static str,
     ) -> ForestGuard<'a> {
         let acquired = std::time::Instant::now();
-        let waited_ms = acquired.saturating_duration_since(asked).as_millis() as u64;
+        let waited = acquired.saturating_duration_since(asked);
+        self.inner.occupancy.wait(label, waited);
+        let waited_ms = waited.as_millis() as u64;
         if waited_ms > FOREST_LOCK_WARN_MS {
             warn!(target: "n42.qmdb", label, ms = waited_ms, held_by, "forest lock waited");
         }
@@ -1427,7 +1477,7 @@ impl QmdbNodeState {
                 self.drain_renames(forest);
             }
         }
-        ForestGuard { guard, label, acquired, waited_ms, held_by }
+        ForestGuard { guard, inner: &self.inner, label, acquired, waited_ms, held_by }
     }
 
     /// Applies the queued renames in the order they were queued. A failure is
@@ -1539,10 +1589,11 @@ impl QmdbNodeState {
         key: B256,
         parent: B256,
         ops: QmdbOps,
-        held: impl FnOnce(&QmdbForest) -> Option<T>,
+        held: impl Fn(&QmdbForest) -> Option<T>,
         file: impl FnOnce(&mut QmdbForest, PreparedBlock) -> Result<T, StateError>,
     ) -> Result<T, NodeStateError> {
         let before = RootCounters::now();
+        let mut ops = ops;
         let mut guard = self.lock_as(label);
         let mut split = RootSplit { lock_wait_ms: guard.waited_ms, held_by: guard.held_by, ..RootSplit::default() };
         let forest = guard.as_mut().ok_or(NodeStateError::Uninitialised)?;
@@ -1552,10 +1603,34 @@ impl QmdbNodeState {
             self.keep_split(key, split);
             return Ok(value);
         }
+        // `N42_QMDB_PARALLEL_APPLY`: a block not held yet has its leaf hashes
+        // computed with the lock let go, before the lease, so the tree is out
+        // only for what needs it; the lock is then taken again and the block
+        // looked for again (another caller may have filed it meanwhile).
+        let mut leaves = None;
+        if n42_twig_core::qmdb_compat::parallel_apply() {
+            drop(guard);
+            if !ops.is_sorted() {
+                ops.sort();
+            }
+            leaves = Some(n42_twig_core::qmdb_compat::LeafHashes::of(&ops));
+            guard = self.lock_as(label);
+            split.lock_wait_ms += guard.waited_ms;
+            let held_again = held(guard.as_ref().ok_or(NodeStateError::Uninitialised)?);
+            if let Some(value) = held_again {
+                drop(guard);
+                before.finish(&mut split);
+                self.keep_split(key, split);
+                return Ok(value);
+            }
+        }
+        let forest = guard.as_mut().ok_or(NodeStateError::Uninitialised)?;
         let mut lease = forest.lease_tree(parent)?;
+        let leased_at = std::time::Instant::now();
         drop(guard);
-        let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lease.compute(ops)));
+        let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lease.compute_with_leaves(ops, leaves.as_ref())));
         let mut guard = self.lock_as("lease_return");
+        self.inner.occupancy.hold("tree_lease", leased_at.elapsed());
         split.lock_wait_ms += guard.waited_ms;
         let Some(forest) = guard.as_mut() else { return Err(NodeStateError::Uninitialised) };
         let computed = match computed {
@@ -1959,14 +2034,34 @@ impl QmdbNodeState {
         self.with_forest("compute", |forest| forest.compute(parent, changes))
     }
 
+    /// [`Self::compute`] for a block being built: with
+    /// [`Self::set_refuse_stale_builds`] a parent below the canonical head is
+    /// refused before the tree moves ([`StateError::StaleBuildParent`]).
+    pub fn compute_build(&self, parent: B256, changes: &BlockChanges) -> Result<PreparedBlock, NodeStateError> {
+        self.with_forest("compute", |forest| {
+            self.check_build_parent(forest, &parent)?;
+            forest.compute(parent, changes)
+        })
+    }
+
     /// [`Self::compute`] from leaf operations already built
-    /// (`sorted_operations_from_execution`).
+    /// (`sorted_operations_from_execution`), for a block being built: a
+    /// stale parent is refused as in [`Self::compute_build`].
     pub fn compute_operations(&self, parent: B256, ops: impl Into<QmdbOps>) -> Result<PreparedBlock, NodeStateError> {
         let ops = ops.into();
         if self.compute_offlock() {
-            return self.with_leased_root("compute_operations", parent, parent, ops, |_| None, |_, prepared| Ok(prepared));
+            return self.with_leased_root(
+                "compute_operations",
+                parent,
+                parent,
+                ops,
+                |forest| self.check_build_parent(forest, &parent).err().map(Err),
+                |_, prepared| Ok(Ok(prepared)),
+            )?
+            .map_err(NodeStateError::from);
         }
         self.with_forest_root("compute_operations", parent, |forest| {
+            self.check_build_parent(forest, &parent)?;
             forest.compute_operations(parent, ops).map(|prepared| (prepared, Some(0)))
         })
     }

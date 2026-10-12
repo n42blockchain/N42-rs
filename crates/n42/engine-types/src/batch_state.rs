@@ -229,6 +229,26 @@ impl<G: Database> BatchState<G> {
 }
 
 impl<G: Database + crate::parallel_transfer::AccountHint> BatchState<G> {
+    /// `N42_ONE_PROBE`: the batch loop is about to run transaction `i`
+    /// (`key` its sender and recipient); passed to the layers beneath.
+    #[inline]
+    pub fn note_tx(&mut self, i: usize, key: &(Address, Address)) {
+        self.inner.note_tx(i, key);
+    }
+
+    /// `N42_ONE_PROBE`: after a commit, the batch's value of each account the
+    /// layers beneath keep ([`crate::parallel_transfer::AccountHint::written_accounts`])
+    /// written through to them: one probe of this map each, on entries the
+    /// commit just wrote. Nothing when no layer keeps any.
+    #[inline]
+    pub fn after_commit(&self) {
+        if let Some(addresses) = self.inner.written_accounts() {
+            for address in &addresses {
+                self.inner.write_through(address, self.accounts.get(address).and_then(|entry| entry.info.as_ref()));
+            }
+        }
+    }
+
     /// The hint for an account a transaction a few places ahead will read
     /// (`N42_BUILD_MLP`): the batch's own entry prefetched when it holds the
     /// account ([`Self::prefetch_account`]); otherwise the hint goes down the

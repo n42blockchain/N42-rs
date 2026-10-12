@@ -1391,6 +1391,26 @@ pub trait AccountHint {
     fn hint_account(&self, _address: &Address) -> bool {
         false
     }
+
+    /// `N42_ONE_PROBE`: the batch loop is about to run transaction `i`, whose
+    /// (sender, recipient) is `key` ([`crate::one_probe::OneProbeDb`]). The
+    /// default does nothing.
+    #[inline]
+    fn note_tx(&mut self, _i: usize, _key: &(Address, Address)) {}
+
+    /// `N42_ONE_PROBE`: the running transaction's accounts whose values after
+    /// its commit this layer keeps (written through by
+    /// [`crate::batch_state::BatchState::after_commit`]); `None`, the
+    /// default, for none.
+    #[inline]
+    fn written_accounts(&self) -> Option<[Address; 2]> {
+        None
+    }
+
+    /// `N42_ONE_PROBE`: `address`'s value in the batch after the running
+    /// transaction's commit. The default does nothing.
+    #[inline]
+    fn write_through(&self, _address: &Address, _info: Option<&revm::state::AccountInfo>) {}
 }
 
 impl<ExtDB> AccountHint for revm::database::CacheDB<ExtDB> {
@@ -1417,6 +1437,21 @@ impl<G: AccountHint> AccountHint for ReadSetDb<'_, G> {
     #[inline]
     fn hint_account(&self, address: &Address) -> bool {
         self.set.is_some_and(|set| set.get(address).is_some()) || self.inner.hint_account(address)
+    }
+
+    #[inline]
+    fn note_tx(&mut self, i: usize, key: &(Address, Address)) {
+        self.inner.note_tx(i, key);
+    }
+
+    #[inline]
+    fn written_accounts(&self) -> Option<[Address; 2]> {
+        self.inner.written_accounts()
+    }
+
+    #[inline]
+    fn write_through(&self, address: &Address, info: Option<&revm::state::AccountInfo>) {
+        self.inner.write_through(address, info);
     }
 }
 
@@ -4097,6 +4132,12 @@ where
                         }
                     };
                     let t1 = mark();
+                    // `N42_ONE_PROBE`: the transaction's accounts named to the
+                    // layer that serves them from the plan's references (a
+                    // no-op without one).
+                    if let Some(key) = keys.get(i) {
+                        evm.db_mut().note_tx(i, key);
+                    }
                     match evm.transfer_plain(&env) {
                         Ok(Some((plain, result))) => {
                             let t2 = mark();
@@ -4105,6 +4146,9 @@ where
                             // Straight into the batch's state, no
                             // `EvmState` built (`BatchState`).
                             evm.db_mut().commit_transfer(plain).map_err(|err| NotParallel::Failed(i, err.to_string()))?;
+                            // `N42_ONE_PROBE`: the committed accounts written
+                            // through to the block's dense output.
+                            evm.db_mut().after_commit();
                             let t4 = mark();
                             if slots_ref[i].set(BuiltTransfer { index: i, tx, result, gas_used }).is_err() {
                                 return Err(NotParallel::Failed(i, "executed twice".to_string()));

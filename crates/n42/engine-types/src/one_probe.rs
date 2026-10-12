@@ -22,12 +22,15 @@
 //! reference is valid (the verified prefix, section 5.3 of the design), and
 //! through today's chain otherwise.
 
-use std::sync::{
-    Arc, Mutex, OnceLock, PoisonError,
-    atomic::{AtomicU32, Ordering},
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex, OnceLock, PoisonError,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
 };
 
-use alloy_primitives::{Address, map::AddressMap};
+use alloy_primitives::{Address, B256, U256, map::AddressMap};
 
 use crate::parallel_transfer::{WARM_SHARDS, warm_shard};
 
@@ -160,6 +163,10 @@ pub struct Resolved {
     pub accounts: usize,
     /// The resolve's wall time, microseconds.
     pub resolve_us: u64,
+    /// The block's dense output in this plan's ids, written through by the
+    /// build that takes the plan ([`DenseOut`]); made (and its pages
+    /// touched) here, on the plan-body pool.
+    pub(crate) out: Arc<DenseOut>,
 }
 
 impl Resolved {
@@ -314,7 +321,8 @@ pub fn resolve_with(table: &mut Rolling, keys: &[(Address, Address)]) -> Resolve
         shared.extend(shard.shared);
         ids.push((offset, shard.map));
     }
-    Resolved { seq, txs, ids, shared, accounts: accounts as usize, resolve_us: at.elapsed().as_micros() as u64 }
+    let out = Arc::new(DenseOut::new(accounts as usize));
+    Resolved { seq, txs, ids, shared, accounts: accounts as usize, resolve_us: at.elapsed().as_micros() as u64, out }
 }
 
 /// The process's rolling table, made at the first plan.
@@ -334,6 +342,175 @@ pub fn resolve(pool: &rayon::ThreadPool, keys: &[(Address, Address)]) -> Option<
     let mut table = rolling().lock().unwrap_or_else(PoisonError::into_inner);
     let table = &mut *table;
     Some(Arc::new(pool.install(|| resolve_with(table, keys))))
+}
+
+/// [`Dense::tag`]: never written (the account is read through the chain).
+const TAG_EMPTY: u64 = 0;
+/// [`Dense::tag`]: a plain account (no code) with the balance and nonce held.
+const TAG_PLAIN: u64 = 1;
+/// [`Dense::tag`]: written with a value the array cannot hold (an account
+/// with code, or none): read through the chain.
+const TAG_POISON: u64 = 3;
+
+/// One account of a block's dense output: one cache line. Written by the one
+/// batch that owns the account (relaxed stores; the batches' join and the
+/// ring's lock order them before any read), read by later builds.
+#[repr(C, align(64))]
+#[derive(Debug, Default)]
+pub struct Dense {
+    balance: [AtomicU64; 4],
+    nonce: AtomicU64,
+    tag: AtomicU64,
+}
+
+impl Dense {
+    /// Holds a plain account's `balance` and `nonce`.
+    #[inline]
+    pub fn store(&self, balance: U256, nonce: u64) {
+        let limbs = balance.as_limbs();
+        for (slot, limb) in self.balance.iter().zip(limbs) {
+            slot.store(*limb, Ordering::Relaxed);
+        }
+        self.nonce.store(nonce, Ordering::Relaxed);
+        self.tag.store(TAG_PLAIN, Ordering::Relaxed);
+    }
+
+    /// Marks the account as one the array does not hold.
+    #[inline]
+    pub fn poison(&self) {
+        self.tag.store(TAG_POISON, Ordering::Relaxed);
+    }
+
+    /// The plain account held, if one is.
+    #[inline]
+    pub fn load(&self) -> Option<(U256, u64)> {
+        if self.tag.load(Ordering::Relaxed) != TAG_PLAIN {
+            return None;
+        }
+        let limbs = [
+            self.balance[0].load(Ordering::Relaxed),
+            self.balance[1].load(Ordering::Relaxed),
+            self.balance[2].load(Ordering::Relaxed),
+            self.balance[3].load(Ordering::Relaxed),
+        ];
+        Some((U256::from_limbs(limbs), self.nonce.load(Ordering::Relaxed)))
+    }
+
+    /// Whether nothing was ever written.
+    pub fn is_empty(&self) -> bool {
+        self.tag.load(Ordering::Relaxed) == TAG_EMPTY
+    }
+}
+
+/// A block's dense output: entry `id` is the account with dense id `id` in
+/// the block's plan, as the block left it -- 64 bytes an account (9.4 MB for
+/// 147,000 accounts). Only accounts one batch owns are written; the rest stay
+/// empty and are read through the chain.
+#[derive(Debug)]
+pub struct DenseOut(Box<[Dense]>);
+
+impl DenseOut {
+    /// `accounts` empty entries, made and touched on the current rayon pool.
+    pub fn new(accounts: usize) -> Self {
+        use rayon::prelude::*;
+        Self((0..accounts).into_par_iter().with_min_len(4096).map(|_| Dense::default()).collect::<Vec<_>>().into_boxed_slice())
+    }
+
+    /// Entry `id`.
+    #[inline]
+    pub fn get(&self, id: u32) -> Option<&Dense> {
+        self.0.get(id as usize)
+    }
+
+    /// Entries.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether it has none.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// One block sealed whole from its plan: its dense output and what the
+/// prefix check needs.
+#[derive(Debug)]
+pub struct BuiltOutput {
+    /// The plan's sequence number.
+    pub seq: u64,
+    /// The state the build read (its parent's sealed hash).
+    pub base: B256,
+    /// The builder's hash of the build's parent, when this node built it.
+    pub parent_built: Option<B256>,
+    /// The hash the builder sealed the block under.
+    pub built: B256,
+    /// Accounts the block changed outside its transfers: its beneficiary and
+    /// its withdrawal recipients (the system contracts are added by the
+    /// reader).
+    pub extra: Vec<Address>,
+    /// The dense output.
+    pub out: Arc<DenseOut>,
+}
+
+/// The ring of the last [`depth`] built outputs, newest first.
+#[derive(Debug)]
+pub struct Ring {
+    outputs: VecDeque<Arc<BuiltOutput>>,
+    depth: usize,
+}
+
+impl Ring {
+    /// An empty ring of `depth` outputs.
+    pub fn new(depth: usize) -> Self {
+        Self { outputs: VecDeque::with_capacity(depth.max(1) + 1), depth: depth.max(1) }
+    }
+
+    /// Puts `output` in front; one with the same plan or the same built hash
+    /// is replaced, and the oldest beyond the depth is dropped.
+    pub fn push(&mut self, output: BuiltOutput) {
+        self.outputs.retain(|o| o.seq != output.seq && o.built != output.built);
+        self.outputs.push_front(Arc::new(output));
+        self.outputs.truncate(self.depth);
+    }
+
+    /// Outputs held.
+    pub fn len(&self) -> usize {
+        self.outputs.len()
+    }
+
+    /// Whether it holds none.
+    pub fn is_empty(&self) -> bool {
+        self.outputs.is_empty()
+    }
+
+    /// The verified prefix of a build on the block the builder sealed as
+    /// `parent_built`, whose parent is `grandparent`, resolved by plan
+    /// `below`: the outputs of the parent, its parent, ... each sealed whole
+    /// from its plan on the previous one's built hash, their plans older in
+    /// turn, up to the first that is not held. Empty when the parent is not
+    /// one of them.
+    pub fn prefix(&self, grandparent: B256, parent_built: Option<B256>, below: u64) -> Vec<Arc<BuiltOutput>> {
+        let mut prefix: Vec<Arc<BuiltOutput>> = Vec::new();
+        let mut want = parent_built;
+        let mut below = below;
+        while let Some(hash) = want {
+            let Some(output) = self.outputs.iter().find(|o| o.built == hash) else { break };
+            if output.seq >= below || (prefix.is_empty() && output.base != grandparent) {
+                break;
+            }
+            below = output.seq;
+            want = output.parent_built;
+            prefix.push(Arc::clone(output));
+        }
+        prefix
+    }
+}
+
+/// The process's ring.
+fn ring() -> &'static Mutex<Ring> {
+    static RING: OnceLock<Mutex<Ring>> = OnceLock::new();
+    RING.get_or_init(|| Mutex::new(Ring::new(depth() as usize)))
 }
 
 #[cfg(test)]
@@ -416,5 +593,59 @@ mod tests {
             assert_eq!(t.s_src, src(1, p1.id_of(&t.sender).unwrap()));
             assert_eq!(t.r_src, src(1, p1.id_of(&t.recipient).unwrap()));
         }
+    }
+    fn output(seq: u64, base: u8, parent_built: Option<u8>, built: u8) -> BuiltOutput {
+        BuiltOutput {
+            seq,
+            base: B256::with_last_byte(base),
+            parent_built: parent_built.map(B256::with_last_byte),
+            built: B256::with_last_byte(built),
+            extra: Vec::new(),
+            out: Arc::new(DenseOut::new(1)),
+        }
+    }
+
+    /// The verified prefix follows built hashes down from the build's
+    /// parent while the plans get older, and is empty for a parent this node
+    /// did not seal from a plan.
+    #[test]
+    fn the_prefix_follows_the_built_chain() {
+        let mut ring = Ring::new(4);
+        // Blocks 10 <- 11 <- 12 (built hashes), canonical bases 100, 101, 102.
+        ring.push(output(1, 100, Some(9), 10));
+        ring.push(output(2, 101, Some(10), 11));
+        ring.push(output(3, 102, Some(11), 12));
+        let seqs = |p: Vec<Arc<BuiltOutput>>| p.iter().map(|o| o.seq).collect::<Vec<_>>();
+        assert_eq!(seqs(ring.prefix(B256::with_last_byte(102), Some(B256::with_last_byte(12)), 4)), vec![3, 2, 1]);
+        assert!(ring.prefix(B256::with_last_byte(102), Some(B256::with_last_byte(99)), 4).is_empty(), "another parent");
+        assert!(ring.prefix(B256::with_last_byte(102), None, 4).is_empty(), "a parent this node did not build");
+        assert!(ring.prefix(B256::with_last_byte(7), Some(B256::with_last_byte(12)), 4).is_empty(), "another grandparent");
+        assert!(ring.prefix(B256::with_last_byte(102), Some(B256::with_last_byte(12)), 3).is_empty(), "a plan not older");
+        assert_eq!(seqs(ring.prefix(B256::with_last_byte(101), Some(B256::with_last_byte(11)), 4)), vec![2, 1]);
+        // A gap: block 12 built on a block the ring does not hold.
+        let mut gap = Ring::new(4);
+        gap.push(output(1, 100, Some(9), 10));
+        gap.push(output(3, 102, Some(55), 12));
+        assert_eq!(seqs(gap.prefix(B256::with_last_byte(102), Some(B256::with_last_byte(12)), 4)), vec![3]);
+        // The depth: the oldest output drops.
+        ring.push(output(4, 103, Some(12), 13));
+        ring.push(output(5, 104, Some(13), 14));
+        assert_eq!(ring.len(), 4);
+        assert_eq!(seqs(ring.prefix(B256::with_last_byte(104), Some(B256::with_last_byte(14)), 6)), vec![5, 4, 3, 2]);
+    }
+
+    /// A dense entry holds a plain account, or says it holds none.
+    #[test]
+    fn a_dense_entry_holds_one_account() {
+        let out = DenseOut::new(3);
+        let entry = out.get(1).unwrap();
+        assert!(entry.is_empty() && entry.load().is_none());
+        let balance = U256::from_limbs([1, 2, 3, u64::MAX]);
+        entry.store(balance, 9);
+        assert_eq!(entry.load(), Some((balance, 9)));
+        entry.poison();
+        assert_eq!(entry.load(), None);
+        assert!(out.get(3).is_none());
+        assert_eq!(std::mem::size_of::<Dense>(), 64);
     }
 }

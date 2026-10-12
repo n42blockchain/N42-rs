@@ -644,7 +644,7 @@
   `warm_ahead_ms`、`warm_ahead_hits`、`warm_ahead_ready`。不触及任何 fork 的 reth crate。说明见
   `docs/BREAKTHROUGH_DESIGN.md` 10.122。
 
-## 计划时解析的单次探测状态，阶段 1-3（`N42_ONE_PROBE=1|2|3`，`N42_ONE_PROBE_DEPTH=<D>` 默认 16，默认关）
+## 计划时解析的单次探测状态，阶段 1-4（`N42_ONE_PROBE=1|2|3|4`，`N42_ONE_PROBE_DEPTH=<D>` 默认 16，默认关）
 - `crates/n42/engine-types/src/one_probe.rs`（新文件）：计划钩子（`payload.rs` `make_prepared_build`，需
   `N42_PLAN_AHEAD_BODY=1`）在 plan-body 线程池上给计划的每个不同地址分配稠密 id，并在滚动的“最后写入者”表
   （`Rolling`，64 分片，地址 -> 最新触及它的计划序号与其 id）中各探测一次、插入一次，得到每笔交易的
@@ -672,6 +672,18 @@
   变化相加）算出块后值写入该块稠密输出，使这类账户不再走原链。批次的输出仍是 `AddressMap<BundleAccount>`
   （`OutputShards::add` 与索引模式的 `BatchOut` 直接持有并供后续读取探测），去掉它需要改动 `output_shards`。
   `Resolved::with_fold`、`BatchState::with_lane` 新增 `fold` 参数。说明见 "Stage 3, implementation"。
+- 阶段 4（`N42_ONE_PROBE=4`，含 1-3）：lane 批次不再在末尾重建 `BundleAccount` 表。`BatchState::take_output` 把 lane
+  原样（`batch_state::LaneOutput`：96 字节条目、被改动条目的 lane id、每槽 4 字节的位置表）连同只含表内账户
+  （beneficiary、溢出账户）的 bundle 交出；`take_bundle` 的单账户结算抽成 `close`，`LaneOutput` 用它按需生成与
+  map 路径完全相同的账户与 revert。`output_shards.rs`：批次输出改为 `BatchAccounts`（map，或 map + lane），
+  冻结前的读取（live/early 索引录入、冲突求和、early 读）经 `get`/`iter` 返回 `Cow`；`OutputShards::add_lane`
+  按分片登记 lane 地址并录入 live/early 索引；索引冻结（`finish_indexed`）在索引定型后每分片一个任务把 lane 账户
+  及其 revert 物化进 `Indexed::lane_state` / `lane_reverts`（多批次写过的账户只保留首个写入者的 revert），
+  `get`/`take`/`view`/合并/`late_reverts`/`into_staged` 同时读这两者；非索引模式先把 lane 并回 bundle。
+  `parallel_transfer.rs`：`execute_for_build_opts` 与 `execute_for_build_counted` 新增 `on_lane`
+  （`LaneSink`），`payload.rs` 在输出分片模式下传入 `add_lane`；`Resolved::with_lane_output`、`Lanes::output`。
+  其余批次照旧走 map，两种形式在分片中共存。`FrozenShards::lane_materialise_us` / `has_lanes`。说明见
+  "Stage 4, implementation"。
 
 ## 构建批次内的预取（`N42_BUILD_MLP=<k>`，默认关）
 - `crates/n42/engine-types/src/parallel_transfer.rs` `build_mlp` / `set_build_mlp` / `prefetch_hint`，循环在

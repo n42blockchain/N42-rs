@@ -60,6 +60,7 @@ use alloy_primitives::{map::AddressHashMap, Address, U256};
 use revm::database::BundleAccount;
 use revm::database::AccountStatus;
 use revm::state::AccountInfo;
+use n42_engine_types::output_shards::OutputShards;
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -963,7 +964,16 @@ impl n42_engine_types::parallel_transfer::AccountHint for MapDb {}
 /// One batch of the node's `BatchState` -- on its map (stage 1) or on the
 /// plan's lane (stage 2) -- driven as the batch loop drives it: the
 /// transaction named, three reads, the commit; the bundle taken at the end.
-fn node_batch(txs: &[Tx], members: &[&Vec<usize>], mut state: n42_engine_types::batch_state::BatchState<MapDb>) -> revm::database::BundleState {
+fn node_batch(txs: &[Tx], members: &[&Vec<usize>], state: n42_engine_types::batch_state::BatchState<MapDb>) -> revm::database::BundleState {
+    node_batch_run(txs, members, state).take_bundle()
+}
+
+/// [`node_batch`]'s loop, the state left open.
+fn node_batch_run(
+    txs: &[Tx],
+    members: &[&Vec<usize>],
+    mut state: n42_engine_types::batch_state::BatchState<MapDb>,
+) -> n42_engine_types::batch_state::BatchState<MapDb> {
     use revm::Database as _;
     let coinbase = beneficiary();
     for group in members {
@@ -992,7 +1002,7 @@ fn node_batch(txs: &[Tx], members: &[&Vec<usize>], mut state: n42_engine_types::
             state.after_commit();
         }
     }
-    state.take_bundle()
+    state
 }
 
 /// The node's batch state on the flood's block: the per-batch map (stage 1)
@@ -1027,13 +1037,19 @@ fn bench_node_batch_state() {
     let groups = parallel_transfer::partition_by_sender(&keys, beneficiary()).expect("groups");
     let batches = parallel_transfer::batch_groups_one_wave(&groups, keys.len(), nbatches);
     let (mut map_ms, mut lane_ms, mut direct_ms, mut resolve_ms, mut lanes_ms) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // Stage 4: the batch loop handing lanes over, the shards' hand-over
+    // (`add_lane`), the freeze, and the freeze's lane materialisation; stage
+    // 3's hand-over and freeze of its bundles beside.
+    let (mut out_ms, mut out_add_ms, mut out_freeze_ms, mut out_mat_ms, mut s3_add_ms, mut s3_freeze_ms) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    type Output = (revm::database::BundleState, Option<n42_engine_types::batch_state::LaneOutput>);
     let mut table = one_probe::Rolling::new(16);
     for round in 0..rounds + 1 {
         let at = Instant::now();
         let resolved = pool.install(|| one_probe::resolve_with(&mut table, &keys));
         let resolve = at.elapsed().as_secs_f64() * 1e3;
         let at = Instant::now();
-        let plan = std::sync::Arc::new(pool.install(|| resolved.with_lanes(&groups, nbatches).with_fold(true)));
+        let plan = std::sync::Arc::new(pool.install(|| resolved.with_lanes(&groups, nbatches).with_fold(true).with_lane_output(true)));
         let lanes = at.elapsed().as_secs_f64() * 1e3;
         assert!(plan.lanes.as_ref().is_some_and(|l| l.batches() == batches.len()));
         // 0: the map (stage 1); 1: the lane (stage 2); 2: the lane with the
@@ -1061,7 +1077,50 @@ fn bench_node_batch_state() {
         let (map, map_bundles) = run(0);
         let (dense, lane_bundles) = run(1);
         let (direct, direct_bundles) = run(2);
+        // Stage 4: the same batches closed with `take_output`.
+        let at = Instant::now();
+        let outputs: Vec<Output> = pool.install(|| {
+            use rayon::prelude::*;
+            batches
+                .par_iter()
+                .enumerate()
+                .map(|(b, members)| {
+                    let state = BatchState::with_lane(db.clone(), 4, std::sync::Arc::clone(&plan), b, true);
+                    node_batch_run(&txs, members, state).take_output()
+                })
+                .collect()
+        });
+        let out_loop = at.elapsed().as_secs_f64() * 1e3;
+        let hand_over = |lanes: bool, outputs: Vec<Output>, bundles: Vec<revm::database::BundleState>| {
+            let shards = OutputShards::with_index_live(beneficiary(), keys.len(), 16, true, true);
+            let at = Instant::now();
+            pool.install(|| {
+                use rayon::prelude::*;
+                if lanes {
+                    outputs.into_par_iter().for_each(|(bundle, lane)| match lane {
+                        Some(lane) => shards.add_lane(bundle, lane),
+                        None => shards.add(bundle),
+                    });
+                } else {
+                    bundles.into_par_iter().for_each(|bundle| shards.add(bundle));
+                }
+            });
+            let add = at.elapsed().as_secs_f64() * 1e3;
+            let at = Instant::now();
+            let frozen = shards.freeze_on(&pool);
+            (add, at.elapsed().as_secs_f64() * 1e3, frozen)
+        };
+        let (s4_add, s4_freeze, s4_frozen) = hand_over(true, outputs, Vec::new());
+        let (s3_add, s3_freeze, s3_frozen) = hand_over(false, Vec::new(), direct_bundles.clone());
         if round == 0 {
+            assert!(s4_frozen.has_lanes());
+            let residual = revm::database::BundleState::default();
+            assert_eq!(s4_frozen.merged_state_first(&residual, None).0.state, s3_frozen.merged_state_first(&residual, None).0.state);
+            assert_eq!(
+                s4_frozen.late_reverts(Default::default(), Vec::new(), None),
+                s3_frozen.late_reverts(Default::default(), Vec::new(), None),
+                "stage 4's reverts are stage 3's"
+            );
             for bundles in [&lane_bundles, &direct_bundles] {
                 for (ours, theirs) in bundles.iter().zip(&map_bundles) {
                     assert_eq!(ours.state, theirs.state, "the lane's bundle is the map's");
@@ -1078,6 +1137,12 @@ fn bench_node_batch_state() {
         direct_ms.push(direct);
         resolve_ms.push(resolve);
         lanes_ms.push(lanes);
+        out_ms.push(out_loop);
+        out_add_ms.push(s4_add);
+        out_freeze_ms.push(s4_freeze);
+        out_mat_ms.push(s4_frozen.lane_materialise_us() as f64 / 1e3);
+        s3_add_ms.push(s3_add);
+        s3_freeze_ms.push(s3_freeze);
     }
     println!(
         "node batch state, {} transfers, {} batches, {threads} threads, p50 of {rounds}: map (stage 1) {:.1} ms, lane (stage 2) {:.1} ms, lane with fold (stage 3) {:.1} ms; plan time: resolve {:.1} ms, lanes {:.1} ms",
@@ -1088,5 +1153,14 @@ fn bench_node_batch_state() {
         median(direct_ms),
         median(resolve_ms),
         median(lanes_ms)
+    );
+    println!(
+        "stage 4 (lane output): batch loop {:.1} ms; hand-over {:.1} ms, freeze {:.1} ms of which lane materialisation {:.1} ms; stage 3 beside: hand-over {:.1} ms, freeze {:.1} ms (16 shards, live index)",
+        median(out_ms),
+        median(out_add_ms),
+        median(out_freeze_ms),
+        median(out_mat_ms),
+        median(s3_add_ms),
+        median(s3_freeze_ms)
     );
 }

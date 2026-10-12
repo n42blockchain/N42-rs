@@ -571,3 +571,69 @@ output).
   post-state; the shared-recipient fixture folds a nonzero number of them. A peer's build now gets its
   own plan, because a plan is taken by one build and its output and fold parts belong to that build.
   `bench_node_batch_state` checks the bundles and reverts of every path equal.
+
+## 13. Stage 4, implementation
+
+`N42_ONE_PROBE=4` (implies 1-3). The batch end no longer rebuilds the per-batch `AddressMap<BundleAccount>`:
+a lane batch hands its lane over as its output, and the `BundleAccount`s and reverts are made by the
+output shards' freeze, one task a shard.
+
+- **The borrowed-entry API** (`output_shards.rs`). A batch's output is `BatchAccounts`: today's map, or
+  (stage 4) the small map (the beneficiary, spilled accounts) plus the lane (`batch_state::LaneOutput`).
+  Every reader before the freeze -- the live and early index entries in `add` (`enter_part`/`enter_live`),
+  the conflict sums of `freeze_indexed`/`freeze_live`/`sum_split`, `EarlyOutput::account`/`holds` -- goes
+  through `BatchAccounts::get`/`iter`, which answer `Cow`: a lane account is closed on the fly. After the
+  freeze every account is in a map (the batches' maps, the conflicts maps, and the new per-shard
+  `Indexed::lane_state`), so `Indexed::get`, `FrozenShards::get`, `view`, `source_maps`, the merges,
+  `ShardLayer` and direct_build's `read_account` stay borrowed.
+- **The entry form.** `LaneOutput` keeps the lane's 96-byte `Work` entries as the batch left them (moved,
+  not copied), the lane ids of the changed entries (the output's positions; addresses come from the plan's
+  lane), and an open-addressing table of four-byte positions for `get`. `account(pos)` and `closed(pos)`
+  make the account and its revert with the code `take_bundle` uses (`batch_state::close`, factored out of
+  its `retain`). `take_output` hands the fold's parts to the plan as stage 3 does and puts the empty code a
+  created recipient brings into the bundle's contracts (`has_new_contract`'s case for a lane account).
+- **Index and freeze.** `OutputShards::add_lane` lists the lane's addresses by shard beside the map's (one
+  unit of size each) and enters them in the live and early index; it keeps per-shard lane positions
+  (`BatchOut::lane_at`), not reverts. `finish_indexed` (both index freezes), once the index is final,
+  materialises one shard a task (`materialise_lanes`): an account the index names its lane batch for is
+  closed into `lane_state` with its revert into `lane_reverts`; an account several batches wrote (summed into
+  the conflicts map) keeps only its first writer's revert -- the batch whose pair opens `drops` for it, the
+  one the map path keeps (every writer's revert is the same parent value). The reverts are unordered within
+  a shard; `merged_reverts`/`late_reverts` sort the block's as before (`sort_reverts_by_index`). `take`,
+  `into_staged` and both merges read `lane_state`/`lane_reverts`. Outside index mode, or on a lane holding
+  the beneficiary, the lane is put into the bundle at `add_lane` (`LaneOutput::into_parts`); the v4 fold of
+  an index-mode block of more than 65,534 batches flattens lanes first (`BatchOut::flatten_lane`).
+- **Wiring.** `Resolved::with_lane_output` (`Lanes::output`), set by `resolve` at stage 4.
+  `execute_for_build_opts`/`execute_for_build_counted` take a `LaneSink`; a batch run whole on its lane
+  (stage 2's checks) with both sinks present closes with `take_output` and goes to `on_lane`; any other
+  batch goes to the bundle sink as a map, so both forms coexist in the shards and in the ring. `payload.rs`
+  passes `OutputShards::add_lane` when the build uses output shards (`N42_OUTPUT_SHARDS`); with the
+  streamed graft or no sink there is no lane sink and stage 4 runs as 3.
+- **Still a map**: the batch's small map (beneficiary, spilled accounts with code or an account id), the
+  conflicts maps, and the per-shard `lane_state` the freeze builds -- the QMDB root (`view`), the hashed
+  post-state and the merges read `&BundleAccount`.
+- **Bench** (`bench_node_batch_state`, 8 threads on cores 232-239, nice 19, p50 of 7, 200k transfers, 128
+  batches, release; the hand-over and freeze on 16 shards, live index):
+
+  | | batch loop | hand-over (`add`) | freeze | of which lane materialisation | total |
+  | --- | --- | --- | --- | --- | --- |
+  | stage 3, `N42_SHARD_MIX=1` | 14.3 | 3.5 | 2.1 | -- | 19.9 |
+  | stage 4, `N42_SHARD_MIX=1` | 9.7 | 2.4 | 12.9 | 10.6 | 25.0 |
+  | stage 3, plain layout | 14.2 | 11.6 | 9.6 | -- | 35.4 |
+  | stage 4, plain layout | 9.2 | 13.4 | 81.8 | 69.0 | 104.4 |
+
+  The batch loop drops from 14.2 to 9.2-9.7 ms (the map rebuild was ~5 ms of it), but the materialisation
+  costs more than it saved: 10.6 ms on 8 threads for ~190k accounts (~450 ns an account-thread, the lane
+  entries read cold after the batches, fresh shard maps filled) against ~5 ms at the batch end with the
+  entries in cache. Without the shard mix the flood's recipients fall into one shard and its single task
+  materialises ~138k accounts (69 ms): stage 4 needs `N42_SHARD_MIX=1` (the fleet's setting). The net is a
+  shorter batch loop and a longer freeze; whether that pays depends on whether the freeze is on the seal's
+  path, which a fleet leg has to say. The prototype's 3.0 ms has no materialisation at all; reaching it
+  needs the root and the merge to read the lanes directly (a `view` over `Work` entries), not done here.
+- **Tests**: `batch_state::tests::a_lane_output_closes_into_the_lane_bundle`;
+  `output_shards::lane_tests::a_lane_output_freezes_to_the_bundles_output` (all lanes and lanes mixed with
+  maps, live index or not, deferred shards, early reads, v4); the three-block test's fifth way, stage 4
+  through live-index output shards (transfers, gas, outcomes, skips, fees; `merged_state_first`'s state,
+  sizes and contracts, `late_reverts`, the beneficiary's credit and the QMDB operations over the view
+  equal the plain bundles frozen as maps; reads equal the grafted bundle); `bench_node_batch_state` checks
+  stage 4's frozen state and reverts equal stage 3's.

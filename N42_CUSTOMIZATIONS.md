@@ -644,6 +644,23 @@
   `warm_ahead_ms`、`warm_ahead_hits`、`warm_ahead_ready`。不触及任何 fork 的 reth crate。说明见
   `docs/BREAKTHROUGH_DESIGN.md` 10.122。
 
+## 计划时解析的单次探测状态，阶段 1（`N42_ONE_PROBE=1`，`N42_ONE_PROBE_DEPTH=<D>` 默认 16，默认关）
+- `crates/n42/engine-types/src/one_probe.rs`（新文件）：计划钩子（`payload.rs` `make_prepared_build`，需
+  `N42_PLAN_AHEAD_BODY=1`）在 plan-body 线程池上给计划的每个不同地址分配稠密 id，并在滚动的“最后写入者”表
+  （`Rolling`，64 分片，地址 -> 最新触及它的计划序号与其 id）中各探测一次、插入一次，得到每笔交易的
+  `PlanTx`（发送者/接收者的 id 与来源）；超过 D 个计划的条目解析为 CHAIN，每 D 个计划清扫一次。结果
+  `Resolved`（含该块的稠密输出 `DenseOut`：每账户 64 字节一行）随 `frame_blocks.rs` `PreparedBuild` 的新字段
+  `one_probe` 传给构建。
+- 构建端：`OneProbeDb`（位于 `ReadSetDb` 与 `WarmDb` 之间）对正在执行的交易的发送者与接收者，在引用有效时直接
+  读引用所指块的稠密输出，否则走原链。有效条件：引用的计划属于“已验证前缀”（`Ring::prefix`：从父块起每个块都按
+  其计划整块封装、按 builder hash 逐块相连、计划序号递减），且该账户不是前缀块的 beneficiary/提款接收者、系统合约
+  或本块 beneficiary。批次循环经 `AccountHint` 新增的 `note_tx` / `written_accounts` / `write_through`（默认空实现，
+  `ReadSetDb` 转发）与 `BatchState::note_tx` / `after_commit` 把只被一个发送者的交易触及的账户提交后的值写入本块
+  稠密输出；交易与计划不符时该块不入环。块在执行末尾按计划整块封装（与 `warm_ahead::note_built` 同处）时其输出进入
+  深度 D 的环。阶段行字段 `one_probe_stage`、`one_probe_resolved`、`one_probe_prefix`、`one_probe_hits`、
+  `one_probe_fallbacks`、`one_probe_resolve_ms`。`warm_ahead::SYSTEM` 改为 `pub(crate)`。不触及任何 fork 的 reth
+  crate。说明见 `docs/ONE_PROBE_STATE_DESIGN.md`（含 "Stage 1, implementation"）。
+
 ## 构建批次内的预取（`N42_BUILD_MLP=<k>`，默认关）
 - `crates/n42/engine-types/src/parallel_transfer.rs` `build_mlp` / `set_build_mlp` / `prefetch_hint`，循环在
   `execute_for_build_opts` 的 `run_batch`：执行第 i 笔前，先转换批次顺序中 k 笔之后的那笔（其池中交易此时读入，

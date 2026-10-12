@@ -414,3 +414,58 @@ p50/p90, `sealed_at`, the round and window 1, and the plan-body pool's `made_us`
 - `tests/output_shards.rs` extended for stage 3: `view`, `merged`, `get` and `take` over `DenseIndexed`
   equal the index mode's.
 - `tests/one_probe_bench.rs` (ignored): the timing and the equality above.
+
+## 10. Stage 1, implementation
+
+`N42_ONE_PROBE=1` (off by default; needs `N42_PLAN_AHEAD_BODY=1`), `N42_ONE_PROBE_DEPTH=<D>` (16, 1..=64),
+in `crates/n42/engine-types/src/one_probe.rs`. What was built, and where it departs from sections 5-8:
+
+- **Plan time** (`payload.rs` `make_prepared_build`, on the plan-body pool, under one lock so plans resolve
+  in the order they are made): `resolve_with` buckets the 2n occurrences by `warm_shard`, dedupes each shard
+  into local ids, sums the shards' offsets into dense ids, then per shard one probe and one insert of the
+  rolling table (`seq << 32 | id`); an entry older than D plans resolves to `CHAIN` whether or not the sweep
+  (every D plans, per shard, before the inserts) has removed it yet. The result, `Resolved`, holds one
+  `PlanTx` a transaction -- 56 bytes, not 32: it carries the two addresses so the build can check each
+  transaction against the plan as it runs -- the address -> id maps by shard, a "shared" flag per id, and the
+  block's `DenseOut` (`Dense` = `[AtomicU64; 4]` balance, nonce, tag; 64 bytes, `align(64)`), made and
+  touched on the plan pool. It travels on `PreparedBuild::one_probe`; no separate identity check is needed
+  because the prepared build is only taken when its segments are the build's (`made_from`).
+- **Write-through** happens after `commit_transfer` (`BatchState::after_commit`: one probe each of the
+  batch map's two just-written entries), not inside it, through three new `AccountHint` methods with
+  no-op defaults (`note_tx`, `written_accounts`, `write_through`; `ReadSetDb` forwards them). Only ids that
+  transactions of a single sender touch are written: a sender's transactions are one group and a group is
+  in one batch, so one batch's final value is the block's. Ids two senders touch (a recipient of two
+  senders, a sender that is someone's recipient) are left empty and read through the chain: stage 1 has
+  no lanes. An account with code is marked unheld; the beneficiary is never written.
+- **Build side** (`payload.rs`, beside the warm take): the view is made when the build's keys are the
+  plan's length; `Ring::prefix` follows builder hashes from the build's `parent_built` while each held
+  output's `parent_built` names the next and the plan numbers decrease, and checks the first output's base
+  against the grandparent. The residual set (the prefix blocks' beneficiaries and withdrawal recipients,
+  `warm_ahead::SYSTEM`, this block's beneficiary) is a bitmap over the plan's ids. `OneProbeDb` sits
+  between `ReadSetDb` and `WarmDb`: `note_tx(i, key)` sets the running transaction's `PlanTx` (or flags a
+  mismatch, which keeps the block out of the ring); `basic` answers that transaction's sender or recipient
+  from `prefix[seq].out[id]` when the reference is valid and the entry holds a plain account, as
+  `AccountInfo::from(Account)` would (no code loaded), and from the chain otherwise. A block sealed at its
+  execution's end from its whole take (the `warm_ahead::note_built` condition) and of the plan's length
+  pushes its output into the ring.
+- **Fields** on the `seal-first build phases` line: `one_probe_stage`, `one_probe_resolved` (the plan's
+  distinct accounts), `one_probe_prefix` (verified depth), `one_probe_hits`, `one_probe_fallbacks` (a
+  named account read through the chain: no valid reference, forced, or an unwritten entry),
+  `one_probe_resolve_ms`.
+- **Memory**: 64 B per distinct account per block (9.4 MB at 147k, 12 MB at 192k), held by the plan until
+  its build ends and by the ring for D blocks; the rolling table ~1M entries at the flood's shape.
+- **Tests**: `one_probe::tests` (`resolve_names_the_newest_writer`, `the_rolling_table_forgets_past_the_depth`,
+  `a_large_plan_resolves_every_occurrence`, `the_prefix_follows_the_built_chain`,
+  `a_dense_entry_holds_one_account`, `the_residual_accounts_read_the_chain`) and
+  `parallel_transfer::tests::a_build_on_resolved_reads_equals_the_plain_build` (three consecutive blocks
+  on three fixtures equal the plain builds in transfers, gas, outcomes, fees, accounts and reverts, the
+  later ones with hits; a peer's parent finds no prefix and still equals; every written entry equals the
+  block's post-state).
+
+What stage 2 needs from stage 1: the plan's dense ids and `PlanTx` per transaction (to index a batch's
+`work` array instead of the batch map), the `shared` flag replaced by per-batch lanes made at plan time
+(which needs the batch assignment, i.e. `batch_groups_one_wave` at the build pool's width, moved to the
+plan), the per-id source (`srcs`, today folded into `PlanTx` and dropped after) kept for the reverts, and
+`BatchState`'s bundle made from the touched ids at batch end; the ring, the prefix rule, the residual
+bitmap and the write-through into `DenseOut` carry over unchanged (stage 2 writes `work` itself as the
+output).

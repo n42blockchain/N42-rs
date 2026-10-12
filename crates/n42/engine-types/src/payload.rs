@@ -333,7 +333,7 @@ where
     } = config;
 
     let state_provider = client.state_by_block_hash(parent_header.hash())?;
-    let state = StateProviderDatabase::new(&state_provider);
+    let state = StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state_provider));
     let mut db = State::builder()
         .with_database(cached_reads.as_db_mut(state))
         .with_bundle_update()

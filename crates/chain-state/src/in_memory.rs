@@ -966,15 +966,48 @@ pub fn n42_canon_notify_lean() -> bool {
 
 /// N42: a copy of `output` for a notification, with its complete revert set when it was handed
 /// out before that was merged (`N42_ANSWER_BEFORE_REVERTS`, `n42_deferred_reverts`), waiting for
-/// it. A set that never comes is logged and the copy carries what the block was handed out with.
+/// it. A failed fill must stop notification construction: a partial revert
+/// set would give subscribers incorrect historical state on a reorg.
 fn n42_completed_outcome<R: Clone>(
     output: &reth_execution_types::BlockExecutionOutput<R>,
 ) -> reth_execution_types::BlockExecutionOutput<R> {
     let mut copy = output.clone();
-    if let Err(error) = n42_deferred_reverts::complete_in_place(output, &mut copy.state) {
-        tracing::error!(target: "n42.deferred_reverts", %error, "a canonical notification carries a block without its late revert set");
-    }
+    n42_deferred_reverts::complete_in_place(output, &mut copy.state)
+        .expect("a canonical notification requires the block's complete revert set");
     copy
+}
+
+#[cfg(test)]
+mod completed_outcome_tests {
+    use super::n42_completed_outcome;
+    use reth_execution_types::BlockExecutionOutput;
+    use std::sync::Arc;
+
+    #[test]
+    fn failed_late_reverts_cannot_be_published_as_a_complete_outcome() {
+        let output = Arc::new(BlockExecutionOutput::<u8> {
+            state: Default::default(),
+            result: Default::default(),
+        });
+        drop(n42_deferred_reverts::register(&output));
+        assert!(std::panic::catch_unwind(|| n42_completed_outcome(&*output)).is_err());
+    }
+
+    #[test]
+    fn complete_and_filled_outcomes_are_preserved() {
+        let output = Arc::new(BlockExecutionOutput::<u8> {
+            state: Default::default(),
+            result: Default::default(),
+        });
+        assert_eq!(n42_completed_outcome(&*output).state, output.state);
+        let mut reverts = n42_deferred_reverts::Reverts::default();
+        reverts.push(Vec::new());
+        n42_deferred_reverts::register(&output).fill(reverts.clone(), 7);
+        let completed = n42_completed_outcome(&*output);
+        assert_eq!(completed.state.reverts, reverts);
+        assert_eq!(completed.state.reverts_size, 7);
+        assert!(output.state.reverts.is_empty());
+    }
 }
 
 impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {

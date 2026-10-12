@@ -19,6 +19,7 @@ pub mod blocks;
 pub mod integer_list;
 pub mod metadata;
 pub mod sharded_key;
+pub mod snap;
 pub mod storage_sharded_key;
 
 pub use accounts::*;
@@ -31,6 +32,7 @@ pub use reth_db_models::{
     StoredBlockBodyIndices, StoredBlockWithdrawals,
 };
 pub use sharded_key::ShardedKey;
+pub use snap::*;
 
 /// Macro that implements [`Encode`] and [`Decode`] for uint types.
 macro_rules! impl_uints {

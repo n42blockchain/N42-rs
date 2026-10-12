@@ -8222,6 +8222,101 @@ mod tests {
         }
     }
 
+    /// Body first (`one_probe::resolve_behind`): block 1's resolve is not
+    /// done when it reaches its view, so it builds on stage-0 reads (the
+    /// plain build); once its post-state is frozen its plan's output is
+    /// filled from it (`Resolved::fill_from` through the node's lookup) and
+    /// recorded, and block 2 still finds a verified prefix of two, is served
+    /// from it, and equals the plain build.
+    #[test]
+    fn a_block_built_without_its_view_is_recorded_late_and_keeps_the_prefix() {
+        use crate::one_probe::{BuildView, OneProbeDb, PendingResolve, Ring, Rolling, resolve_with};
+        use std::sync::Arc;
+        let (block, db) = random_fixture(400, 60, 0, 60, 5);
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_env = evm_config.evm_env(block.header()).expect("env");
+        let beneficiary = evm_env.block_env.beneficiary;
+        let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
+        let per = 60u64;
+        let blocks: Vec<Vec<usize>> = (0..3u64).map(|k| (0..envs.len()).filter(|&i| envs[i].nonce * 3 / per == k).collect()).collect();
+        let keys: Vec<Vec<(Address, Address)>> =
+            blocks.iter().map(|idx| idx.iter().map(|&i| (envs[i].caller, envs[i].kind.to().copied().unwrap())).collect()).collect();
+        let groups: Vec<Vec<Vec<usize>>> = keys.iter().map(|k| partition_by_sender(k, beneficiary).expect("groups")).collect();
+        let mut table = Rolling::new(16);
+        let plans: Vec<Arc<crate::one_probe::Resolved>> =
+            build_pool().install(|| keys.iter().map(|k| Arc::new(resolve_with(&mut table, k))).collect());
+        let mut ring = Ring::new(16);
+        let mut state = db.clone();
+        let built = |k: usize| B256::with_last_byte(10 + k as u8);
+        let base = |k: usize| B256::with_last_byte(100 + k as u8);
+        for k in 0..3 {
+            let convert = |i: usize| ((), envs[blocks[k][i]].clone());
+            let parent_built = k.checked_sub(1).map(built);
+            let grandparent = if k == 0 { B256::ZERO } else { base(k - 1) };
+            let prefix = ring.prefix(grandparent, parent_built, plans[k].seq);
+            assert_eq!(prefix.len(), k, "block {k}'s verified prefix");
+            let plain =
+                execute_for_build_in_place(&evm_env, &keys[k], &convert, &|| Some(state.clone()), None, true).expect("plain block");
+            assert!(plain.skipped.is_empty());
+            let bundle = if k == 1 {
+                // The resolve still running at the view: no view, the plain
+                // build is the block.
+                let pending = Arc::new(PendingResolve::default());
+                assert!(pending.ready().is_none(), "not done at the view");
+                let frozen = {
+                    let shards = crate::output_shards::OutputShards::with_index_live(beneficiary, keys[k].len(), 16, true, true);
+                    for bundle in &plain.bundles {
+                        shards.add(bundle.clone());
+                    }
+                    shards.freeze()
+                };
+                let (_, grafted, _) = grafted_run(plain, &state, beneficiary);
+                // The resolve lands; the record behind the shards' filing.
+                pending.finish(Some(Arc::clone(&plans[k])));
+                let resolved = pending.ready().flatten().expect("done");
+                let residual = BundleState::default();
+                let written = build_pool()
+                    .install(|| resolved.fill_from(&|address| crate::payload::one_probe_post_account(&frozen, &residual, address)));
+                assert!(written > 0, "the block's accounts filled from its post-state");
+                let mut checked = 0;
+                for (address, account) in &grafted.state {
+                    if let Some(bid) = resolved.id_of(address)
+                        && let Some((balance, nonce)) = resolved.out.get(bid).and_then(crate::one_probe::Dense::load)
+                    {
+                        let info = account.info.as_ref().expect("a written account exists");
+                        assert_eq!((balance, nonce), (info.balance, info.nonce), "the late output for {address}");
+                        checked += 1;
+                    }
+                }
+                assert_eq!(checked, written, "every filled entry is the block's post-state");
+                ring.record_filled(&resolved, base(k), parent_built, built(k), vec![beneficiary]);
+                grafted
+            } else {
+                let view = BuildView::new(Arc::clone(&plans[k]), prefix, beneficiary);
+                let probed = execute_for_build_counted_dispatch(
+                    &evm_env,
+                    &keys[k],
+                    &convert,
+                    &|| Some(OneProbeDb::new(Some(&view), state.clone())),
+                    true,
+                    true,
+                    None,
+                    Some(PreparedExec { groups: Some(groups[k].clone()), slots: None, one_probe: Some(view.plan()) }),
+                )
+                .expect("block through the plan");
+                let bundle = assert_same_block(probed, plain, &state, beneficiary, keys[k].len());
+                if k == 2 {
+                    assert!(view.hits() > 0, "block 2 served from the late-recorded output");
+                }
+                assert!(ring.record(&view, base(k), parent_built, built(k), vec![beneficiary]));
+                bundle
+            };
+            for (address, account) in &bundle.state {
+                state.insert_account_info(*address, account.info.clone().unwrap_or_default());
+            }
+        }
+    }
+
     /// `N42_BUILD_PREFETCH`: a build whose batches read the prefetched layer
     /// first -- with some accounts prefetched and the rest not, and one
     /// account the parent does not have -- builds the same block as a build

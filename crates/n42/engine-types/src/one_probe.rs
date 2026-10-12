@@ -596,14 +596,13 @@ pub fn record_late(
         }
         pool.install(|| resolved.fill_from(&*lookup));
         drop(lookup);
-        ring().lock().unwrap_or_else(PoisonError::into_inner).push(BuiltOutput {
-            seq: resolved.seq,
-            base: record.base,
-            parent_built: record.parent_built,
-            built: record.built,
-            extra: record.extra,
-            out: Arc::clone(&resolved.out),
-        });
+        ring().lock().unwrap_or_else(PoisonError::into_inner).record_filled(
+            &resolved,
+            record.base,
+            record.parent_built,
+            record.built,
+            record.extra,
+        );
         LATE_RECORDS.fetch_add(1, Ordering::Relaxed);
     }));
 }
@@ -1003,6 +1002,13 @@ impl Ring {
         }
         self.push(BuiltOutput { seq: view.resolved.seq, base, parent_built, built, extra, out: Arc::clone(&view.resolved.out) });
         true
+    }
+
+    /// [`record_late`] on this ring: a block built without a view, whose
+    /// plan's output `resolved` was filled from its post-state
+    /// ([`Resolved::fill_from`]).
+    pub fn record_filled(&mut self, resolved: &Resolved, base: B256, parent_built: Option<B256>, built: B256, extra: Vec<Address>) {
+        self.push(BuiltOutput { seq: resolved.seq, base, parent_built, built, extra, out: Arc::clone(&resolved.out) });
     }
 
     /// Outputs held.

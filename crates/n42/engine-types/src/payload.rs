@@ -1856,6 +1856,10 @@ where
     let mut one_probe_fallbacks = 0u64;
     let mut one_probe_lane_hits = 0u64;
     let mut one_probe_lane_accounts = 0u64;
+    // Why this block's output did not go into the ring ("" when it did, "-"
+    // with `N42_ONE_PROBE` off): "no_view" (no plan body, a length
+    // mismatch), "not_sealed_at_exec", "not_whole", "length", "mismatch".
+    let mut one_probe_ring_reject: &'static str = if crate::one_probe::stage() > 0 { "no_view" } else { "-" };
     // `N42_BUILD_MLP=<k>`: the batches' lookahead distance, 0 when off.
     let mut par_mlp_k = 0usize;
     let mut par_mlp_hints = 0u64;
@@ -2319,6 +2323,9 @@ where
                 crate::one_probe::view_for(resolved, parent_header.parent_hash, warm_parent_built, group_env.block_env.beneficiary)
             });
         one_probe_prefix = one_probe_view.as_ref().map_or(0, crate::one_probe::BuildView::prefix_depth);
+        if one_probe_view.is_some() {
+            one_probe_ring_reject = "not_sealed_at_exec";
+        }
         if !all_transfers {
             open_deferred_state!()?;
             for tx in cands.into_iter().rev() {
@@ -2902,11 +2909,16 @@ where
                         // `N42_ONE_PROBE=1`: the same block, built whole
                         // through its plan's references: its dense output
                         // goes into the ring for the builds above it.
-                        if let Some(view) = one_probe_view.as_ref()
-                            && built_whole
-                            && cands.len() == view.len()
-                        {
-                            crate::one_probe::note_built(view, parent_hash_for_state, warm_parent_built, sealed.2, extra());
+                        if let Some(view) = one_probe_view.as_ref() {
+                            one_probe_ring_reject = if !built_whole {
+                                "not_whole"
+                            } else if cands.len() != view.len() {
+                                "length"
+                            } else if crate::one_probe::note_built(view, parent_hash_for_state, warm_parent_built, sealed.2, extra()) {
+                                ""
+                            } else {
+                                "mismatch"
+                            };
                         }
                         // `N42_PLAN_AHEAD_BODY=1`: a block sealed on its
                         // counters from the frames' bulk vector, uncut, is
@@ -4215,6 +4227,7 @@ where
                     one_probe_resolve_ms,
                     one_probe_lane_hits,
                     one_probe_lane_accounts,
+                    one_probe_ring_reject,
                     par_mlp_k,
                     par_mlp_hints,
                     par_fold_ms,
@@ -4558,6 +4571,7 @@ where
                     // the call, us; the hand-off noted as a whole take.
                     plan_body = select_times.body_ahead,
                     plan_body_us = select_times.body_ahead_us,
+                    plan_body_wait_us = select_times.body_wait_us,
                     prep_from_plan,
                     exec_prepared_groups,
                     exec_prepared_slots,

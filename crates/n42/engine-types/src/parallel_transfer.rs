@@ -1013,11 +1013,20 @@ pub fn prefetch_hint<T>(p: *const T) {
 /// meet on one lock, few enough that each job takes every lock once.
 pub(crate) const WARM_SHARDS: usize = 64;
 
-/// The shard an address lands in: its first byte, which is uniform for the
-/// flood's addresses and for anything derived from a hash.
+/// The shard an address lands in: a multiplicative hash of all twenty
+/// bytes. Not the first byte alone: the flood's recipients
+/// (`tx_flood::recipient`) carry a slot under 2^20 big-endian in their first
+/// four bytes, so their first byte is 0 and every one of them landed in
+/// shard 0 (loop351 stage ay: one thread read ~147,000 recipients while 63
+/// shards held a few hundred senders).
 #[inline]
 pub(crate) fn warm_shard(address: &Address) -> usize {
-    address.0[0] as usize % WARM_SHARDS
+    let b = &address.0;
+    let lo = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+    let mid = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+    let hi = u32::from_le_bytes([b[16], b[17], b[18], b[19]]) as u64;
+    let x = (lo ^ mid.rotate_left(21) ^ hi.rotate_left(42)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (x >> 58) as usize % WARM_SHARDS
 }
 
 /// An account as the parent's state answers it.

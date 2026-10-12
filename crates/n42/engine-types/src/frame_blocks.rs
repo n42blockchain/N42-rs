@@ -123,6 +123,13 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
             // those go through the check's wrapper one batch at a time.
             let at = std::time::Instant::now();
             let segments = best.take_frame_segments();
+            // `N42_PLAN_AHEAD_WARM`: the identity of the take (its frames,
+            // each from its start), which names the plan's warm read whether
+            // or not the plan's body was ready.
+            if crate::warm_ahead::threads() > 0 {
+                let ident = crate::warm_ahead::segments_ident(segments.iter().map(|(txs, from, to)| (txs, *from, *to)));
+                WARM_IDENT.with(|slot| slot.set(ident));
+            }
             // `N42_PLAN_AHEAD_BODY=1`: a plan used whole carries the body
             // made with it; its candidates are these segments' transactions,
             // already cloned, when the segments are the ones it was made from.
@@ -240,9 +247,6 @@ pub struct PreparedBuild<T: reth_transaction_pool::PoolTransaction> {
     /// ([`root_ahead`]); the seal takes it when it seals exactly these
     /// hashes on that plan ([`seal_root_carried`]).
     pub root_ahead: Option<RootAhead>,
-    /// `N42_PLAN_AHEAD_WARM`: the plan's warm read id
-    /// ([`crate::warm_ahead::start`]), 0 for none.
-    pub warm_id: u64,
 }
 
 impl<T: reth_transaction_pool::PoolTransaction> std::fmt::Debug for PreparedBuild<T> {
@@ -309,6 +313,18 @@ pub fn note_beneficiary(beneficiary: alloy_primitives::Address) {
 /// The beneficiary [`note_beneficiary`] noted last.
 pub fn noted_beneficiary() -> Option<alloy_primitives::Address> {
     *PLAN_BENEFICIARY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+std::thread_local! {
+    /// The identity of the frames [`select`] took whole, for
+    /// [`take_warm_ident`] (`N42_PLAN_AHEAD_WARM`).
+    static WARM_IDENT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The identity [`select`] found for this thread's take
+/// ([`crate::warm_ahead::segments_ident`]), 0 for none. Clears it.
+pub fn take_warm_ident() -> u64 {
+    WARM_IDENT.with(|slot| slot.replace(0))
 }
 
 std::thread_local! {

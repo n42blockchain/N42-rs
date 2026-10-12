@@ -97,8 +97,33 @@ static BUILT: Mutex<Option<Built>> = Mutex::new(None);
 /// The latest warm reads, newest last.
 static RECENT: Mutex<VecDeque<Arc<WarmAhead>>> = Mutex::new(VecDeque::new());
 
-/// Warm ids, one a prepared plan (0 is none).
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// The identity of a take of whole frames: each segment's frame (its
+/// allocation), its length taken and the hashes of its first and last
+/// transaction taken, folded; 0 when a segment does not start at its
+/// frame's start or none is given. The plan hook and the build compute it
+/// from the same segments, so a build that takes a plan whole names that
+/// plan's read; the hashes keep a reused allocation from naming an older one.
+pub fn segments_ident<'a, T: reth_transaction_pool::PoolTransaction + 'a>(
+    segments: impl Iterator<Item = (&'a n42_tx_queue::FrameTxs<T>, usize, usize)>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut any = false;
+    for (txs, from, to) in segments {
+        if from != 0 || to == 0 || to > txs.len() {
+            return 0;
+        }
+        any = true;
+        (Arc::as_ptr(txs) as *const () as usize).hash(&mut hasher);
+        to.hash(&mut hasher);
+        txs[0].hash().hash(&mut hasher);
+        txs[to - 1].hash().hash(&mut hasher);
+    }
+    if !any {
+        return 0;
+    }
+    hasher.finish().max(1)
+}
 
 /// Build start: the state this build reads (`parent`, by `open`) is what the
 /// next plan's warm read reads.
@@ -300,26 +325,28 @@ pub fn usable(base: B256, prev: Option<u64>, built: Option<&Built>, grandparent:
     prev != 0 && prev == built.plan && base == built.base && grandparent == built.base && parent_built == built.built
 }
 
-/// The plan hook (`N42_PLAN_AHEAD_BODY=1` with `N42_PLAN_AHEAD_WARM`): a warm
-/// id for the plan whose transfers are `keys`, and its read started on the
-/// warm pool at the running build's state. 0 when off or when no build has
-/// published its state.
-pub fn start(keys: &[(Address, Address)]) -> u64 {
-    if threads() == 0 || keys.is_empty() {
-        return 0;
+/// The plan hook (`N42_PLAN_AHEAD_BODY=1` with `N42_PLAN_AHEAD_WARM`): the
+/// read of the plan whose take is `id` ([`segments_ident`]) started on the
+/// warm pool at the running build's state; `keys` (each transfer's sender
+/// and recipient, `None` when one is not a plain transfer) is made there.
+/// Nothing when off, when `id` is 0 or when no build has published its
+/// state.
+pub fn start(id: u64, keys: impl FnOnce() -> Option<Vec<(Address, Address)>> + Send + 'static) {
+    if threads() == 0 || id == 0 {
+        return;
     }
-    let Some(pool) = pool() else { return 0 };
+    let Some(pool) = pool() else { return };
     let Some((base, open)) =
         BASE.lock().unwrap_or_else(PoisonError::into_inner).as_ref().map(|b| (b.parent, Arc::clone(&b.open)))
     else {
-        return 0;
+        return;
     };
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let warm = Arc::new(WarmAhead::new(id, base));
     {
         let mut recent = RECENT.lock().unwrap_or_else(PoisonError::into_inner);
         // A plan made again for the same build supersedes the older one; a
-        // read at another base is the running build's own and stays.
+        // read at another base is the running build's own and stays. (One
+        // with this very take is superseded too: the newest is found first.)
         for older in recent.iter().filter(|older| older.base == base) {
             older.cancel();
         }
@@ -328,7 +355,6 @@ pub fn start(keys: &[(Address, Address)]) -> u64 {
         }
         recent.push_back(Arc::clone(&warm));
     }
-    let keys: Arc<[(Address, Address)]> = keys.into();
     let groups = threads();
     pool.spawn(move || {
         // The plan the running build took: the build on `base` notes it
@@ -342,7 +368,7 @@ pub fn start(keys: &[(Address, Address)]) -> u64 {
                     if selected == 0 {
                         return None;
                     }
-                    return RECENT.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|w| w.id == selected).cloned();
+                    return RECENT.lock().unwrap_or_else(PoisonError::into_inner).iter().rev().find(|w| w.id == selected).cloned();
                 }
                 if std::time::Instant::now() >= deadline {
                     return None;
@@ -357,9 +383,16 @@ pub fn start(keys: &[(Address, Address)]) -> u64 {
                 ))
             })
         };
-        warm.run(&keys, prev, &open_db, groups);
+        match keys() {
+            Some(keys) => warm.run(&keys, prev, &open_db, groups),
+            None => {
+                // Not every transaction a plain transfer: its touched set is
+                // unknown, so neither this read nor the next plan's is used.
+                let _ = warm.prev.set(0);
+                warm.failed.store(true, Ordering::Release);
+            }
+        }
     });
-    id
 }
 
 /// What a build found of the warm read ([`take_for`]).
@@ -423,6 +456,23 @@ mod tests {
         assert!(!usable(p, Some(0), Some(&built), p, Some(n)), "nothing left out");
         assert!(!usable(p, None, Some(&built), p, Some(n)), "the exclusion not yet known");
         assert!(!usable(p, Some(7), None, p, Some(n)), "no block sealed its plan whole");
+    }
+
+    /// The flood's recipients (a slot under 2^20 big-endian in the first
+    /// four bytes, 0x42 in the fifth) spread over every shard: by the first
+    /// byte alone they all landed in shard 0 (loop351 stage ay).
+    #[test]
+    fn the_floods_recipients_spread_over_the_shards() {
+        let mut per = vec![0usize; WARM_SHARDS];
+        for i in 0..100_000u32 {
+            let slot = i.wrapping_mul(2_654_435_761) % 900_000;
+            let mut bytes = [0u8; 20];
+            bytes[..4].copy_from_slice(&slot.to_be_bytes());
+            bytes[4] = 0x42;
+            per[warm_shard(&Address::new(bytes))] += 1;
+        }
+        let (min, max) = (per.iter().min().copied().unwrap(), per.iter().max().copied().unwrap());
+        assert!(min > 1_200 && max < 1_950, "{min}..{max}");
     }
 
     /// `take` leaves out the parent's beneficiary, its withdrawal

@@ -877,6 +877,24 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
 ) -> Option<crate::frame_blocks::PreparedBuild<P>> {
     use rayon::prelude::*;
     let at = std::time::Instant::now();
+    // `N42_PLAN_AHEAD_WARM=<threads>`: the plan's accounts read on the warm
+    // pool at the running build's state (`warm_ahead`), started before the
+    // body is made and keyed by the take's identity, so a build that takes
+    // this plan finds its read even when the body is late. The keys are made
+    // on the warm pool from the segments (`Arc`s, nothing copied here).
+    if crate::warm_ahead::threads() > 0 {
+        let ident = crate::warm_ahead::segments_ident(segments.iter().map(|(txs, taken)| (txs, 0, *taken)));
+        let owned = segments.to_vec();
+        crate::warm_ahead::start(ident, move || {
+            let mut keys = Vec::with_capacity(owned.iter().map(|(_, taken)| *taken).sum());
+            for (txs, taken) in &owned {
+                for tx in txs.get(..*taken)? {
+                    keys.push(transfer_key(tx)?);
+                }
+            }
+            Some(keys)
+        });
+    }
     let pool = crate::parallel_transfer::plan_body_pool();
     let parts: Vec<Vec<Arc<reth_transaction_pool::ValidPoolTransaction<P>>>> = pool.install(|| {
         segments.par_iter().map(|(txs, taken)| txs.get(..*taken).map_or_else(Vec::new, <[_]>::to_vec)).collect()
@@ -900,9 +918,6 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
     let groups = crate::frame_blocks::noted_beneficiary().and_then(|beneficiary| {
         crate::parallel_transfer::partition_by_sender(&keys, beneficiary).ok().map(|groups| (beneficiary, groups))
     });
-    // `N42_PLAN_AHEAD_WARM=<threads>`: the plan's accounts read on the warm
-    // pool at the running build's state (`warm_ahead`).
-    let warm_id = crate::warm_ahead::start(&keys);
     let slots = crate::parallel_transfer::empty_slots(pool, cands.len());
     // `N42_PLAN_AHEAD_PARTS=1`: the body's frame layout and transactions
     // root, found here with the plan rather than at the seal.
@@ -920,7 +935,6 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
         slots,
         made_us: at.elapsed().as_micros() as u64,
         root_ahead,
-        warm_id,
     })
 }
 
@@ -1542,11 +1556,14 @@ where
     // `N42_PLAN_AHEAD_BODY=1`: what was made with the plan, its candidates
     // already the bulk vector (always taken, so nothing is left behind).
     let mut prepared_build = crate::frame_blocks::take_prepared::<Pool::Transaction>();
-    let warm_plan_id = prepared_build.as_ref().map_or(0, |made| made.warm_id);
+    // `N42_PLAN_AHEAD_WARM`: the take's identity (its plan's warm read).
+    let warm_plan_id = crate::frame_blocks::take_warm_ident();
     if warm_ahead_on {
         crate::warm_ahead::note_selected(warm_plan_id, parent_hash_for_state);
     }
     let from_bulk = bulk.is_some();
+    // `N42_PLAN_AHEAD_WARM`: the take's own transactions, before any pull.
+    let bulk_len = bulk.as_ref().map_or(0, Vec::len);
     crate::frame_blocks::want_bulk(false);
     // `N42_FRAME_BLOCKS=1`: the frames the selector just took, whose layout
     // the transactions root is sealed over (`frame_blocks::sealed_root`).
@@ -2808,13 +2825,14 @@ where
                         let sealed = seal_block!(hook, seal_at, if matches { root_ahead } else { None });
                         sealed_ahead_id = Some((sealed.2, sealed.3));
                         // `N42_PLAN_AHEAD_WARM`: this block's transactions are
-                        // its plan's (`prep_from_plan`, nothing before the
-                        // step, nothing serial after a seal here), so it
+                        // among its take's (the frames' bulk vector, nothing
+                        // pulled beyond it, nothing before the step, nothing
+                        // serial after a seal here), so it
                         // changes no account outside the plan's senders and
                         // recipients, its beneficiary and its withdrawal
                         // recipients: the next build may use the read made
                         // at this build's parent leaving those out.
-                        if warm_ahead_on && prep_from_plan && nothing_before_par && warm_plan_id != 0 {
+                        if warm_ahead_on && from_bulk && cands.len() <= bulk_len && nothing_before_par && warm_plan_id != 0 {
                             let mut extra = vec![group_env.block_env.beneficiary];
                             if let Some(withdrawals) = attributes.withdrawals.as_ref() {
                                 extra.extend(withdrawals.iter().map(|w| w.address));

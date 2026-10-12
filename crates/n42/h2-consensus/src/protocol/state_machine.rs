@@ -639,6 +639,10 @@ impl ConsensusEngine {
         self.signing_profile = ConsensusSigningProfile::H2V4(identity);
     }
 
+    pub fn enable_gov5_legacy_signing(&mut self) {
+        self.signing_profile = ConsensusSigningProfile::Gov5Legacy;
+    }
+
     pub fn signing_profile(&self) -> ConsensusSigningProfile {
         self.signing_profile
     }
@@ -1453,7 +1457,7 @@ impl ConsensusEngine {
         // leader commonly reproposes the same uncommitted block, and reth will
         // not emit a second import completion for it. Native optimistic voting
         // does not need this cache beyond the view.
-        if !matches!(self.signing_profile, ConsensusSigningProfile::H2V4(_)) {
+        if !self.signing_profile.is_gov5() {
             self.imported_blocks.clear();
             self.imported_block_fifo.clear();
         }

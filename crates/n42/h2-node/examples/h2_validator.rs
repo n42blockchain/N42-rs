@@ -410,7 +410,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         // Without this the node signs under the native profile and every fleet
         // member rejects its votes.
-        engine.enable_h2_v4_signing(identity);
+        if hotstuff_config.as_ref().is_some_and(|config| !config.interop_v4) {
+            engine.enable_gov5_legacy_signing();
+            println!("signing      : Gov5 legacy (interopV4=false)");
+        } else {
+            engine.enable_h2_v4_signing(identity);
+            println!("signing      : H2-v4");
+        }
         engine.set_leader_tenure(leader_tenure);
         // Bench only: a vote before the import bounds what deferred execution
         // (docs/PHASE_D_DEFERRED_EXECUTION.md) would give the cycle.

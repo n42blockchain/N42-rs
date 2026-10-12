@@ -3853,7 +3853,7 @@ where
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, Dispatch::from_env(), None, None)
+    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, Dispatch::from_env(), None, None, None)
 }
 
 /// [`execute_for_build_in_place`] with the dispatch chosen by the caller
@@ -3874,7 +3874,7 @@ where
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), None, None)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), None, None, None)
 }
 
 fn execute_for_build_run<T, G>(
@@ -3891,7 +3891,7 @@ where
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), None, None)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), None, None, None)
 }
 
 /// [`execute_for_build_in_place_after`] (with `before_batches` optional) with
@@ -3911,13 +3911,43 @@ pub fn execute_for_build_counted<T, G>(
     before_batches: Option<&mut dyn FnMut() -> bool>,
     tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
     prepared: Option<PreparedExec<T>>,
+    on_lane: Option<&LaneSink<'_>>,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), tip_of, prepared)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), tip_of, prepared, on_lane)
+}
+
+/// `N42_ONE_PROBE=4`: where a batch run whole on its plan's lane hands its
+/// output over as the lane ([`crate::batch_state::BatchState::take_output`]):
+/// the bundle of the accounts off the lane and the lane, both given to the
+/// block's output shards ([`crate::output_shards::OutputShards::add_lane`]).
+/// Used only beside a bundle sink; any other batch goes to that sink.
+pub type LaneSink<'a> = dyn Fn(BundleState, crate::batch_state::LaneOutput) + Sync + 'a;
+
+/// [`execute_for_build_counted_dispatch`] with a bundle sink and, for the
+/// plan's lane batches, a lane sink: for tests of `N42_ONE_PROBE=4`.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn execute_for_build_lanes_dispatch<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    on_bundle: &(dyn Fn(BundleState) + Sync),
+    on_lane: &LaneSink<'_>,
+    one_wave: bool,
+    prepared: Option<PreparedExec<T>>,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send + AccountHint,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    execute_for_build_opts(evm_env, keys, convert, open, Some(on_bundle), true, None, read_set(), Dispatch::from_one_wave(one_wave), None, prepared, Some(on_lane))
 }
 
 /// [`execute_for_build_counted`] with the dispatch chosen by the caller: for
@@ -3939,7 +3969,7 @@ where
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, None, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), tip_of, prepared)
+    execute_for_build_opts(evm_env, keys, convert, open, None, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), tip_of, prepared, None)
 }
 
 /// [`execute_for_build_in_place`] with the [`Dispatch`] chosen by the caller:
@@ -3958,7 +3988,7 @@ where
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, true, None, read_set(), dispatch, None, None)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, true, None, read_set(), dispatch, None, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3974,6 +4004,7 @@ fn execute_for_build_opts<T, G>(
     dispatch: Dispatch,
     tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
     prepared: Option<PreparedExec<T>>,
+    on_lane: Option<&LaneSink<'_>>,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
@@ -4102,6 +4133,11 @@ where
         // A sender, a recipient a transfer and the beneficiary, sized
         // once: growing from empty rehashed the map a dozen times a
         // batch. On a lane the map holds only the beneficiary.
+        // `N42_ONE_PROBE=4`: a lane batch hands its lane over as its output
+        // when the block's sink takes lanes.
+        let lane_output = on_lane.is_some()
+            && on_bundle.is_some()
+            && lane.as_ref().is_some_and(|(plan, _)| plan.lanes.as_ref().is_some_and(|lanes| lanes.output));
         let mut state = match lane {
             // `N42_ONE_PROBE=3`: the bundle made straight from the lane.
             Some((plan, b)) => {
@@ -4229,7 +4265,7 @@ where
             }
             close_at = sampler.on.then(std::time::Instant::now);
         }
-        let bundle = state.take_bundle();
+        let (bundle, lane_out) = if lane_output { state.take_output() } else { (state.take_bundle(), None) };
         // Drained here, on the batch's own thread, right after its
         // transfers are done: `N42_PHASE_TIMERS=1` only (see
         // `fast_transfer::drain_timers`; zero and free otherwise). An
@@ -4243,7 +4279,10 @@ where
             // thread: the work is off the builder's chain, and the
             // sink's lock only ever holds one batch at a time.
             Some(sink) => {
-                sink(bundle);
+                match (lane_out, on_lane) {
+                    (Some(lane), Some(on_lane)) => on_lane(bundle, lane),
+                    _ => sink(bundle),
+                }
                 let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
                 let span = BatchSpan::close(start_us, cpu_start, txs, batches_at).with_open_us(open_us);
                 Ok((skipped, None, timers, span, sampler.finish(setup_ns, close_ns), counted, mlp_hints))

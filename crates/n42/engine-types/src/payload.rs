@@ -2361,6 +2361,13 @@ where
                 move |bundle: revm::database::BundleState| staged.lock().expect("the staged graft's lock").add(bundle)
             });
             let shard_sink = sharded_out.as_ref().map(|shards| move |bundle: revm::database::BundleState| shards.add(bundle));
+            // `N42_ONE_PROBE=4`: the plan's lane batches hand their lanes to
+            // the output shards as they are.
+            let lane_sink = sharded_out.as_ref().map(|shards| {
+                move |bundle: revm::database::BundleState, lane: crate::batch_state::LaneOutput| shards.add_lane(bundle, lane)
+            });
+            let lane_sink: Option<&crate::parallel_transfer::LaneSink<'_>> =
+                lane_sink.as_ref().map(|sink| sink as &crate::parallel_transfer::LaneSink<'_>);
             let sink: Option<&(dyn Fn(revm::database::BundleState) + Sync)> = match shard_sink.as_ref() {
                 Some(sink) => Some(sink as &(dyn Fn(revm::database::BundleState) + Sync)),
                 None => sink.as_ref().map(|sink| sink as &(dyn Fn(revm::database::BundleState) + Sync)),
@@ -2453,6 +2460,7 @@ where
                         Some(&mut before_batches),
                         counted_tips,
                         prepared_exec,
+                        lane_sink,
                     )
                 } else {
                     crate::parallel_transfer::execute_for_build_counted(
@@ -2465,6 +2473,7 @@ where
                         None,
                         counted_tips,
                         prepared_exec,
+                        lane_sink,
                     )
                 };
                 let exec_done = std::time::Instant::now();

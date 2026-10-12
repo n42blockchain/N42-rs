@@ -35,13 +35,15 @@ use revm::{Database, primitives::KECCAK_EMPTY, state::AccountInfo};
 
 use crate::parallel_transfer::{WARM_SHARDS, warm_shard};
 
-/// The stage (`N42_ONE_PROBE=1|2|3`), 0 (unset) is off. Stage 1 is
+/// The stage (`N42_ONE_PROBE=1|2|3|4`), 0 (unset) is off. Stage 1 is
 /// the plan-time resolve and the dense reads, 2 adds the plan's batches and
 /// the dense batch state ([`Lanes`]), 3 adds the lane fold
-/// ([`Lanes::fold_into`]). Read once.
+/// ([`Lanes::fold_into`]), 4 hands a lane batch's lane over as its output
+/// (`BatchState::take_output`, `OutputShards::add_lane`): no per-batch
+/// `BundleAccount` map, the accounts made by the freeze. Read once.
 pub fn stage() -> u8 {
     static N: OnceLock<u8> = OnceLock::new();
-    *N.get_or_init(|| std::env::var("N42_ONE_PROBE").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0).min(3))
+    *N.get_or_init(|| std::env::var("N42_ONE_PROBE").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0).min(4))
 }
 
 /// The kept depth in plans and built outputs (`N42_ONE_PROBE_DEPTH`, 16 by
@@ -192,6 +194,15 @@ impl Resolved {
             Some(lanes) => !lanes.cross.get(bid as usize).is_none_or(|cross| cross.load(Ordering::Relaxed)),
             None => !self.shared(bid),
         }
+    }
+
+    /// `N42_ONE_PROBE=4` when `on`: a batch run whole on its lane hands
+    /// the lane over as its output when the build's sink takes one.
+    pub fn with_lane_output(mut self, on: bool) -> Self {
+        if let Some(lanes) = self.lanes.as_mut() {
+            lanes.output = on;
+        }
+        self
     }
 
     /// `N42_ONE_PROBE=3` when `on`: the lane fold ([`Lanes::fold_into`]).
@@ -379,7 +390,7 @@ pub fn resolve(pool: &rayon::ThreadPool, keys: &[(Address, Address)], groups: Op
     Some(Arc::new(pool.install(|| {
         let resolved = resolve_with(table, keys);
         match (groups, width) {
-            (Some(groups), Some(width)) => resolved.with_lanes(groups, width).with_fold(stage() >= 3),
+            (Some(groups), Some(width)) => resolved.with_lanes(groups, width).with_fold(stage() >= 3).with_lane_output(stage() >= 4),
             _ => resolved,
         }
     })))
@@ -436,6 +447,9 @@ pub struct Lanes {
     /// `N42_ONE_PROBE=3`: the batches hand the accounts several batches
     /// touch to the lane fold.
     pub fold: bool,
+    /// `N42_ONE_PROBE=4`: the batches hand their lanes over as their output
+    /// (`BatchState::take_output`) to a sink that takes them.
+    pub output: bool,
 }
 
 impl Lanes {
@@ -527,6 +541,7 @@ impl Lanes {
             loaded: Default::default(),
             folded: Default::default(),
             fold: false,
+            output: false,
         })
     }
 

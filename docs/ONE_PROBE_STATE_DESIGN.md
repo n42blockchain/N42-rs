@@ -1,7 +1,8 @@
 # One-probe state for the build: a dense per-block account layout resolved at plan time
 
-Status: stages 1 and 2 implemented behind `N42_ONE_PROBE=1|2` (off by default; sections 10 and 11),
-not yet measured on the fleet; stage 3 is design. Microbenchmark:
+Status: stages 1-3 implemented behind `N42_ONE_PROBE=1|2|3` (off by default; sections 10-12), not yet
+measured on the fleet; stage 3 implements the lane fold, while the dense output index of section 7 is
+still design (section 12 says why). Microbenchmark:
 `crates/n42/engine-types/tests/one_probe_bench.rs`. Follows `docs/BREAKTHROUGH_DESIGN.md` 10.117-10.124; linked from there as
 10.125.
 
@@ -522,3 +523,51 @@ output).
   batch pay written through and equal to the block's post-state) and with lanes made at another width
   (not used, still equal); `one_probe::tests::a_lane_holds_a_recipient_two_of_its_senders_pay`;
   `bench_node_batch_state` checks every batch's bundle and reverts equal between map and lane.
+
+## 12. Stage 3, implementation
+
+`N42_ONE_PROBE=3` (implies 1 and 2). What the brief asked for, and what was built:
+
+- **What the merge consumes from a batch.** A batch's `BundleState` goes to the sink: with
+  `N42_OUTPUT_SHARDS` (the fleet's mode), `OutputShards::add` keeps the batch's
+  `AddressMap<BundleAccount>` as is, as `BatchOut::accounts` (an `Arc` of the map), lists its addresses
+  and revert positions per shard, and enters them in the live/early index. The block's output is read
+  afterwards through that map (`Indexed::get`: the shard's address -> batch probe, then a probe of the
+  batch's map), by the freeze, the merge behind the seal (`merged_state_first`) and later blocks'
+  reads. Reverts are kept as the batch's list; `late_reverts` and the graft sort them by address
+  (`append_sorted_reverts`), so nothing downstream depends on their order within a batch. **The merge's
+  input is a hashbrown map that must be filled.** Replacing it with arrays is the design's
+  `DenseIndexed` (section 7, stage 3 row): `output_shards`' `Indexed`, `get`, `view`, `merged`, `take`
+  and the live index would read the plan's ids and the lanes. That was not done here.
+- **One pass from the lane, measured.** Stage 2 already fills the map once, from the lane, at the
+  batch's end (no map traffic while the batch executes). A variant that closed each lane entry
+  straight into a pre-sized output map, skipping the stage-2 insert-then-`retain`, was built and
+  measured with `bench_node_batch_state` on the 8 throttled cores: 15.0-17.6 ms, against 13.0-14.0 for
+  stage 2's insert and in-place `retain`. Moving each 240-byte `BundleAccount` through a closing
+  function costs more than the probes it saves, so it was dropped.
+- **The lane fold** (`one_probe::FoldPart`, `Lanes::fold_part`, `Lanes::fold_into`). An account two
+  batches touch is not "the later batch wins": every batch reads it at the parent's value, and the
+  shards' merge sums the batches' changes in any order (`OutputShards::freeze`; a sender's transfers are
+  all in one group, so the other batches only credit it). `batch_groups_one_wave` orders batches by
+  group order, but no order matters for the sum. On stage 3 each lane batch, in the same pass that puts
+  its lane into its map, hands its read and its resulting `(balance, nonce)` of every such account to
+  the plan (one lock per batch). When the block is recorded into the ring, the fold sorts the parts by
+  dense id. For each account it checks that every part read the same parent value, sums the changes
+  onto that value (nonces likewise) and writes the result into the block's dense output. A block
+  whose lanes were broken (a batch not on its lane) is not recorded, so its fold never runs on missing
+  parts. A batch that touched the account only through a skipped transfer has no part, and its change
+  is zero.
+- **Kept from stage 2**: every fallback (width, groups, batch count, the per-batch check, the residual
+  accounts, the verified prefix).
+- **Bench** (`bench_node_batch_state`, 8 threads on cores 232-239, nice 19, p50 of 7; 200k transfers,
+  128 batches): map (stage 1) 14.4 ms, lane (stage 2) 13.1 ms, lane with the fold's parts (stage 3)
+  14.2 ms; plan time: resolve 5.1 ms, lanes 1.4 ms. The prototype's 3.0 ms has no `BundleAccount` at
+  all. Here every batch still produces the map the merge reads. Reaching the prototype's number needs
+  `DenseIndexed`: the batch output kept as the lane array plus the lane's addresses and dense ids, the
+  index pointing at (batch, lane id), and the `BundleAccount`s and reverts made only by the merge
+  behind the seal from the arrays and the per-id sources.
+- **Tests**: the three-block equality test runs a fourth way, stage 3. Its bundles, reverts, fees and
+  gas equal the plain builds, and every folded account in the dense output equals the block's
+  post-state; the shared-recipient fixture folds a nonzero number of them. A peer's build now gets its
+  own plan, because a plan is taken by one build and its output and fold parts belong to that build.
+  `bench_node_batch_state` checks the bundles and reverts of every path equal.

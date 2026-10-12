@@ -47,18 +47,18 @@ pub fn stage() -> u8 {
 }
 
 /// How long a build waits for its plan's body when the hook is still making
-/// it (`N42_ONE_PROBE_BODY_WAIT_MS`, 40 by default with [`stage`] above 0,
-/// 0 otherwise or to disable): without the body the build has no resolved
-/// references, its block is not recorded into the ring, and the next build
-/// finds no verified prefix (loop351 stage ba: half the blocks, every one
-/// with an empty prefix). Read once.
+/// it (`N42_ONE_PROBE_BODY_WAIT_MS`, 0 by default; at most 1000). Since the
+/// hook publishes the body before the resolve ([`resolve_behind`]) the body
+/// is as early as without one-probe, and a wait only delays the build
+/// (loop351 stage bb: the 40 ms default of then cost the pre-parallel part
+/// 7-17 ms). Kept as a knob. Read once.
 pub fn body_wait() -> std::time::Duration {
     static N: OnceLock<u64> = OnceLock::new();
     std::time::Duration::from_millis(*N.get_or_init(|| {
         if stage() == 0 {
             return 0;
         }
-        std::env::var("N42_ONE_PROBE_BODY_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(40).min(1000)
+        std::env::var("N42_ONE_PROBE_BODY_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0).min(1000)
     }))
 }
 
@@ -410,6 +410,202 @@ pub fn resolve(pool: &rayon::ThreadPool, keys: &[(Address, Address)], groups: Op
             _ => resolved,
         }
     })))
+}
+
+/// A plan's resolve run behind its body ([`resolve_behind`]): empty until
+/// the resolver thread finishes it. The build takes the result only if it is
+/// already done when the build reaches its view; it never waits for it.
+#[derive(Debug, Default)]
+pub struct PendingResolve {
+    /// `(done, result)`.
+    state: Mutex<(bool, Option<Arc<Resolved>>)>,
+}
+
+impl PendingResolve {
+    /// A resolve finished with `resolved` (made directly, as the hook made it
+    /// before the body-first order, and in tests).
+    pub fn done(resolved: Option<Arc<Resolved>>) -> Arc<Self> {
+        Arc::new(Self { state: Mutex::new((true, resolved)) })
+    }
+
+    /// Records the result.
+    pub fn finish(&self, resolved: Option<Arc<Resolved>>) {
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner) = (true, resolved);
+    }
+
+    /// `None` while the resolve runs; `Some(result)` once it is done.
+    pub fn ready(&self) -> Option<Option<Arc<Resolved>>> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.0.then(|| state.1.clone())
+    }
+}
+
+/// A job of the resolver thread.
+type ResolverJob = Box<dyn FnOnce() + Send>;
+
+/// The resolver thread's queue: one thread, so the plans' resolves (and the
+/// late records, [`record_late`]) run in the order they were handed in --
+/// the order the plans were made -- each resolve's parallel part on the
+/// pool it was given. `None` when the thread could not be spawned (the jobs
+/// then run on the caller).
+fn resolver() -> Option<&'static Mutex<std::sync::mpsc::Sender<ResolverJob>>> {
+    static TX: OnceLock<Option<Mutex<std::sync::mpsc::Sender<ResolverJob>>>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<ResolverJob>();
+        std::thread::Builder::new()
+            .name("n42-one-probe".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    job();
+                }
+            })
+            .inspect_err(|err| tracing::warn!(target: "payload_builder", %err, "no one-probe resolver thread; resolves run in the hook"))
+            .ok()
+            .map(|_| Mutex::new(tx))
+    })
+    .as_ref()
+}
+
+/// Runs `job` on the resolver thread, or here when there is none.
+fn on_resolver(job: ResolverJob) {
+    let job = match resolver() {
+        Some(tx) => match tx.lock().unwrap_or_else(PoisonError::into_inner).send(job) {
+            Ok(()) => return,
+            Err(std::sync::mpsc::SendError(job)) => job,
+        },
+        None => job,
+    };
+    job();
+}
+
+/// The plan hook's resolve, body first (`N42_ONE_PROBE`, loop351 stage bb):
+/// the hook publishes the prepared body at once and the resolve ([`resolve`]
+/// on `pool`, the plan-body pool, with the plan's lanes at stage 2) runs on
+/// the resolver thread, in plan order, its result attached to the returned
+/// [`PendingResolve`] when done. `None` when off or for an empty plan.
+///
+/// A build that reaches its view before the resolve is done builds without
+/// one (stage-0 reads, the map batches); its block is still recorded into the
+/// ring afterwards ([`record_late`]) from its post-state, so the prefix of
+/// the builds above it survives. The pool is the plan-body pool: bench it
+/// with `N42_PLAN_AHEAD_BODY_THREADS=16` (stage bb's record control: the
+/// body and the resolve both arrive earlier).
+pub fn resolve_behind(
+    pool: &'static rayon::ThreadPool,
+    keys: Vec<(Address, Address)>,
+    groups: Option<Vec<Vec<usize>>>,
+) -> Option<Arc<PendingResolve>> {
+    if stage() == 0 || keys.is_empty() || keys.len() > u32::MAX as usize / 2 {
+        return None;
+    }
+    let pending = Arc::new(PendingResolve::default());
+    let filled = Arc::clone(&pending);
+    on_resolver(Box::new(move || {
+        let resolved = resolve(pool, &keys, groups.as_deref());
+        filled.finish(resolved);
+        // The inputs are freed here, off the hook's thread.
+        drop((keys, groups));
+    }));
+    Some(pending)
+}
+
+/// One plan account in a block's post-state, for [`Resolved::fill_from`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostAccount {
+    /// A plain account: its balance and nonce.
+    Plain(U256, u64),
+    /// Changed, but not a plain account (code, destroyed, or changed outside
+    /// the batches): never served.
+    Unheld,
+    /// Not changed by the block: left empty, read through the chain.
+    Absent,
+}
+
+impl Resolved {
+    /// Fills this plan's dense output from the block's post-state as
+    /// `lookup` answers it, every distinct account once, a shard of ids a
+    /// task on the current rayon pool. Returns the entries written plain.
+    pub fn fill_from(&self, lookup: &(dyn Fn(&Address) -> PostAccount + Sync)) -> usize {
+        use rayon::prelude::*;
+        self.ids
+            .par_iter()
+            .map(|(offset, map)| {
+                let mut plain = 0usize;
+                for (address, local) in map {
+                    let Some(slot) = self.out.get(offset + local) else { continue };
+                    match lookup(address) {
+                        PostAccount::Plain(balance, nonce) => {
+                            slot.store(balance, nonce);
+                            plain += 1;
+                        }
+                        PostAccount::Unheld => slot.poison(),
+                        PostAccount::Absent => {}
+                    }
+                }
+                plain
+            })
+            .sum()
+    }
+}
+
+/// Blocks recorded into the ring by [`record_late`], cumulative.
+static LATE_RECORDS: AtomicU64 = AtomicU64::new(0);
+
+/// Blocks recorded into the ring by [`record_late`] so far.
+pub fn late_records() -> u64 {
+    LATE_RECORDS.load(Ordering::Relaxed)
+}
+
+/// What a block built without its view (its resolve late) needs to enter
+/// the ring once its post-state is final ([`record_late`]).
+#[derive(Debug)]
+pub struct LateRecord {
+    /// The plan's resolve, still running when the build reached its view.
+    pub pending: Arc<PendingResolve>,
+    /// The block's transactions: the plan's length when built whole.
+    pub len: usize,
+    /// As [`note_built`]: the state the build read, its parent's builder
+    /// hash, the block's built hash, its accounts outside the transfers.
+    pub base: B256,
+    /// See [`note_built`].
+    pub parent_built: Option<B256>,
+    /// See [`note_built`].
+    pub built: B256,
+    /// See [`note_built`].
+    pub extra: Vec<Address>,
+}
+
+/// A block sealed whole from its plan's take but built without the plan's
+/// view, because the resolve was not done (the body-first order,
+/// [`resolve_behind`]): on the resolver thread, after the resolve (handed in
+/// before it, so done), the plan's dense output is filled from the block's
+/// post-state (`lookup`, on `pool`) and pushed into the ring -- filled
+/// first, so the ring's lock orders every store before a later build's
+/// read. A build that takes its view before this lands finds no prefix
+/// through this block; the builds after it do. Nothing is recorded when the
+/// resolve made nothing or its plan's length is not the block's.
+pub fn record_late(
+    record: LateRecord,
+    pool: &'static rayon::ThreadPool,
+    lookup: Box<dyn Fn(&Address) -> PostAccount + Send + Sync>,
+) {
+    on_resolver(Box::new(move || {
+        let Some(resolved) = record.pending.ready().flatten() else { return };
+        if resolved.len() != record.len {
+            return;
+        }
+        pool.install(|| resolved.fill_from(&*lookup));
+        drop(lookup);
+        ring().lock().unwrap_or_else(PoisonError::into_inner).push(BuiltOutput {
+            seq: resolved.seq,
+            base: record.base,
+            parent_built: record.parent_built,
+            built: record.built,
+            extra: record.extra,
+            out: Arc::clone(&resolved.out),
+        });
+        LATE_RECORDS.fetch_add(1, Ordering::Relaxed);
+    }));
 }
 
 /// One batch's view of an account several batches touch (`N42_ONE_PROBE=3`):

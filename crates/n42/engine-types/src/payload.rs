@@ -919,16 +919,33 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
         crate::parallel_transfer::partition_by_sender(&keys, beneficiary).ok().map(|groups| (beneficiary, groups))
     });
     let slots = crate::parallel_transfer::empty_slots(pool, cands.len());
-    // `N42_ONE_PROBE=1`: every account of the plan resolved to where its
-    // value lives before the block (`one_probe`), one rolling-table probe a
-    // distinct address, here on the plan-body pool.
-    // `N42_ONE_PROBE=2`: with the partition, the plan's batches and lanes.
-    let one_probe = crate::one_probe::resolve(pool, &keys, groups.as_ref().map(|(_, groups)| groups.as_slice()));
     // `N42_PLAN_AHEAD_PARTS=1`: the body's frame layout and transactions
     // root, found here with the plan rather than at the seal.
     let root_ahead = (crate::frame_blocks::plan_ahead_parts() && crate::frame_blocks::active())
         .then(|| pool.install(|| crate::frame_blocks::root_ahead(plan, &hashes)))
         .flatten();
+    // `N42_ONE_PROBE=1`: every account of the plan resolved to where its
+    // value lives before the block (`one_probe`), one rolling-table probe a
+    // distinct address, on the plan-body pool. `N42_ONE_PROBE=2`: with the
+    // partition, the plan's batches and lanes. Body first (loop351 stage
+    // bb): the resolve runs on the resolver thread behind this hook, which
+    // returns -- publishes the body -- at once; the build uses the result
+    // only if it is done by the build's view (`one_probe::resolve_behind`).
+    // The inputs are copied for it here, on the pool.
+    let one_probe = (crate::one_probe::stage() > 0).then(|| {
+        let (keys, groups) = pool.install(|| {
+            rayon::join(
+                || keys.par_iter().copied().collect::<Vec<_>>(),
+                || {
+                    (crate::one_probe::stage() >= 2)
+                        .then(|| groups.as_ref().map(|(_, groups)| groups.par_iter().cloned().collect::<Vec<_>>()))
+                        .flatten()
+                },
+            )
+        });
+        crate::one_probe::resolve_behind(pool, keys, groups)
+    })
+    .flatten();
     Some(crate::frame_blocks::PreparedBuild {
         segments: segments.to_vec(),
         cands,
@@ -942,6 +959,28 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
         root_ahead,
         one_probe,
     })
+}
+
+/// `N42_ONE_PROBE`: one plan account in a block's post-state, as the batches'
+/// frozen shards and the residual (what the block changed outside the
+/// batches) hold it: plain, unheld (code, no account, or a residual change),
+/// or absent.
+pub(crate) fn one_probe_post_account(
+    shards: &crate::output_shards::FrozenShards,
+    residual: &revm::database::BundleState,
+    address: &alloy_primitives::Address,
+) -> crate::one_probe::PostAccount {
+    use crate::one_probe::PostAccount;
+    if residual.state.contains_key(address) {
+        return PostAccount::Unheld;
+    }
+    match shards.get(address) {
+        Some(account) => match account.info.as_ref() {
+            Some(info) if info.code_hash == revm::primitives::KECCAK_EMPTY => PostAccount::Plain(info.balance, info.nonce),
+            _ => PostAccount::Unheld,
+        },
+        None => PostAccount::Absent,
+    }
 }
 
 /// Installs the plan-ahead hook on the queue once (`N42_PLAN_AHEAD_BODY=1`).
@@ -1860,6 +1899,10 @@ where
     // with `N42_ONE_PROBE` off): "no_view" (no plan body, a length
     // mismatch), "not_sealed_at_exec", "not_whole", "length", "mismatch".
     let mut one_probe_ring_reject: &'static str = if crate::one_probe::stage() > 0 { "no_view" } else { "-" };
+    // Body first: the plan's resolve that was not done at the view, and the
+    // block's record waiting for its post-state (`one_probe::record_late`).
+    let mut one_probe_late: Option<Arc<crate::one_probe::PendingResolve>> = None;
+    let mut one_probe_late_record: Option<crate::one_probe::LateRecord> = None;
     // `N42_BUILD_MLP=<k>`: the batches' lookahead distance, 0 when off.
     let mut par_mlp_k = 0usize;
     let mut par_mlp_hints = 0u64;
@@ -2326,9 +2369,19 @@ where
         // are this build's; each transaction is checked again as it runs),
         // and the verified prefix of built outputs under this build's parent.
         let view_at = std::time::Instant::now();
+        // Body first: a resolve not done by now is not waited for; the block
+        // builds without a view and is recorded into the ring later from its
+        // post-state (`one_probe::record_late`).
         let one_probe_view = all_transfers
             .then(|| prepared_build.as_mut().and_then(|made| made.one_probe.take()))
             .flatten()
+            .and_then(|pending| match pending.ready() {
+                Some(resolved) => resolved,
+                None => {
+                    one_probe_late = Some(pending);
+                    None
+                }
+            })
             .filter(|resolved| resolved.len() == keys.len())
             .map(|resolved| {
                 one_probe_resolved = resolved.accounts;
@@ -2338,6 +2391,8 @@ where
         one_probe_prefix = one_probe_view.as_ref().map_or(0, crate::one_probe::BuildView::prefix_depth);
         if one_probe_view.is_some() {
             one_probe_ring_reject = "not_sealed_at_exec";
+        } else if one_probe_late.is_some() {
+            one_probe_ring_reject = "resolve_late";
         }
         let view_end = std::time::Instant::now();
         pre_par_view_us = view_end.duration_since(view_at).as_micros() as u64;
@@ -2940,6 +2995,20 @@ where
                             } else {
                                 "mismatch"
                             };
+                        } else if let Some(pending) = one_probe_late.take() {
+                            // Built without its view: recorded once the
+                            // post-state is final, at the shards' filing.
+                            one_probe_ring_reject = if built_whole { "resolve_late" } else { "not_whole" };
+                            if built_whole {
+                                one_probe_late_record = Some(crate::one_probe::LateRecord {
+                                    pending,
+                                    len: cands.len(),
+                                    base: parent_hash_for_state,
+                                    parent_built: warm_parent_built,
+                                    built: sealed.2,
+                                    extra: extra(),
+                                });
+                            }
                         }
                         // `N42_PLAN_AHEAD_BODY=1`: a block sealed on its
                         // counters from the frames' bulk vector, uncut, is
@@ -3848,6 +3917,17 @@ where
                 block_hash,
                 crate::built_executions::ShardedParent { residual: Arc::clone(&residual), shards: Arc::clone(&shards) },
             );
+            // `N42_ONE_PROBE`: a block built without its view enters the ring
+            // from this post-state (the batches' frozen shards; an account
+            // the residual changed is never served).
+            if let Some(record) = one_probe_late_record.take() {
+                let (shards, residual) = (Arc::clone(&shards), Arc::clone(&residual));
+                crate::one_probe::record_late(
+                    record,
+                    crate::parallel_transfer::plan_body_pool(),
+                    Box::new(move |address| one_probe_post_account(&shards, &residual.state, address)),
+                );
+            }
             // The child's open proceeded at the early filing when there was
             // one; this filing is the frozen set's.
             match early_ready {

@@ -134,10 +134,9 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
             // made with it; its candidates are these segments' transactions,
             // already cloned, when the segments are the ones it was made from.
             if times.ahead == 1 && plan_ahead_body_wanted() {
-                // `N42_ONE_PROBE`: a build without its plan's body has no
-                // resolved references, is not recorded into the ring, and
-                // leaves the next build no verified prefix; the body is
-                // waited for (`N42_ONE_PROBE_BODY_WAIT_MS`) when it is late.
+                // `N42_ONE_PROBE_BODY_WAIT_MS` (0 by default): how long a
+                // late body is waited for. The hook publishes the body before
+                // the one-probe resolve, so no wait is needed for it.
                 let wait = crate::one_probe::body_wait();
                 let (take, waited_us) = if wait.is_zero() {
                     (best.take_prepared_body(), 0)
@@ -259,8 +258,10 @@ pub struct PreparedBuild<T: reth_transaction_pool::PoolTransaction> {
     /// hashes on that plan ([`seal_root_carried`]).
     pub root_ahead: Option<RootAhead>,
     /// `N42_ONE_PROBE=1`: the plan's accounts resolved against the rolling
-    /// last-writer table ([`crate::one_probe::resolve`]).
-    pub one_probe: Option<std::sync::Arc<crate::one_probe::Resolved>>,
+    /// last-writer table, running behind the body
+    /// ([`crate::one_probe::resolve_behind`]); used only if done by the
+    /// build's view.
+    pub one_probe: Option<std::sync::Arc<crate::one_probe::PendingResolve>>,
 }
 
 impl<T: reth_transaction_pool::PoolTransaction> std::fmt::Debug for PreparedBuild<T> {

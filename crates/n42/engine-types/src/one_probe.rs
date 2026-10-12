@@ -199,6 +199,14 @@ impl Resolved {
         }
     }
 
+    /// `N42_ONE_PROBE=3` when `on`: the lane fold ([`Lanes::fold_into`]).
+    pub fn with_fold(mut self, on: bool) -> Self {
+        if let Some(lanes) = self.lanes.as_mut() {
+            lanes.fold = on;
+        }
+        self
+    }
+
     /// The plan's lanes computed for `groups` (the sender partition of these
     /// keys) packed by [`crate::parallel_transfer::batch_groups_one_wave`]
     /// at `width`, on the current rayon pool.
@@ -376,10 +384,22 @@ pub fn resolve(pool: &rayon::ThreadPool, keys: &[(Address, Address)], groups: Op
     Some(Arc::new(pool.install(|| {
         let resolved = resolve_with(table, keys);
         match (groups, width) {
-            (Some(groups), Some(width)) => resolved.with_lanes(groups, width),
+            (Some(groups), Some(width)) => resolved.with_lanes(groups, width).with_fold(stage() >= 3),
             _ => resolved,
         }
     })))
+}
+
+/// One batch's view of an account several batches touch (`N42_ONE_PROBE=3`):
+/// as the batch read it and as the batch left it (`None`: no account).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldPart {
+    /// The account's dense id.
+    pub bid: u32,
+    /// (balance, nonce) as read.
+    pub original: Option<(U256, u64)>,
+    /// (balance, nonce) as the batch left it.
+    pub current: Option<(U256, u64)>,
 }
 
 /// The plan's batches and their lanes (`N42_ONE_PROBE=2`): the batches the
@@ -399,6 +419,12 @@ pub struct Lanes {
     lid: Vec<(u32, u32)>,
     /// Batch -> its lane's addresses, by lane id.
     lane_addrs: Vec<Vec<Address>>,
+    /// Batch -> its lane's dense ids, by lane id.
+    lane_bids: Vec<Vec<u32>>,
+    /// `N42_ONE_PROBE=3`: each batch's values of the accounts several
+    /// batches touch, folded into the block's dense output when the block is
+    /// recorded ([`Lanes::fold_into`]).
+    parts: Mutex<Vec<FoldPart>>,
     /// Dense id -> whether more than one batch touches it.
     cross: Vec<std::sync::atomic::AtomicBool>,
     /// Whether the build that took the plan runs its batches on these lanes.
@@ -410,6 +436,11 @@ pub struct Lanes {
     pub(crate) hits: AtomicU64,
     /// Accounts loaded into lanes, flushed per batch.
     pub(crate) loaded: AtomicU64,
+    /// `N42_ONE_PROBE=3`: accounts the lane fold wrote.
+    pub(crate) folded: AtomicU64,
+    /// `N42_ONE_PROBE=3`: the batches hand the accounts several batches
+    /// touch to the lane fold.
+    pub fold: bool,
 }
 
 impl Lanes {
@@ -426,7 +457,7 @@ impl Lanes {
             (0..accounts).into_par_iter().with_min_len(8192).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
         let tx_lane: Vec<std::sync::atomic::AtomicU64> =
             (0..n).into_par_iter().with_min_len(8192).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
-        let lanes: Vec<(Vec<Address>, usize)> = batches
+        let lanes: Vec<(Vec<Address>, Vec<u32>, usize)> = batches
             .par_iter()
             .enumerate()
             .map_init(
@@ -462,12 +493,12 @@ impl Lanes {
                             cross[bid as usize].store(true, Ordering::Relaxed);
                         }
                     }
-                    (addrs, txs)
+                    (addrs, bids, txs)
                 },
             )
             .collect();
         // Lane ids are packed in 24 bits and batches in 16.
-        if batches.len() > u16::MAX as usize || lanes.iter().any(|(addrs, _)| addrs.len() >= 1 << 24) {
+        if batches.len() > u16::MAX as usize || lanes.iter().any(|(addrs, _, _)| addrs.len() >= 1 << 24) {
             return None;
         }
         let (batch_of, lid): (Vec<u32>, Vec<(u32, u32)>) = tx_lane
@@ -478,18 +509,29 @@ impl Lanes {
                 ((packed >> 48) as u32, (((packed >> 24) & 0xff_ffff) as u32, (packed & 0xff_ffff) as u32))
             })
             .unzip();
-        let (lane_addrs, batch_txs) = lanes.into_iter().unzip();
+        let mut lane_addrs = Vec::with_capacity(lanes.len());
+        let mut lane_bids = Vec::with_capacity(lanes.len());
+        let mut batch_txs = Vec::with_capacity(lanes.len());
+        for (addrs, bids, txs) in lanes {
+            lane_addrs.push(addrs);
+            lane_bids.push(bids);
+            batch_txs.push(txs);
+        }
         Some(Self {
             width,
             batch_txs,
             batch_of,
             lid,
             lane_addrs,
+            lane_bids,
+            parts: Mutex::new(Vec::new()),
             cross,
             used: Default::default(),
             broken: Default::default(),
             hits: Default::default(),
             loaded: Default::default(),
+            folded: Default::default(),
+            fold: false,
         })
     }
 
@@ -512,6 +554,11 @@ impl Lanes {
     /// taken).
     pub fn loaded(&self) -> u64 {
         self.loaded.load(Ordering::Relaxed)
+    }
+
+    /// Accounts the lane fold wrote into the block's output.
+    pub fn folded(&self) -> u64 {
+        self.folded.load(Ordering::Relaxed)
     }
 
     /// Whether the build runs its batches on the lanes.
@@ -539,6 +586,57 @@ impl Lanes {
     /// Batch `b`'s lane addresses, by lane id.
     pub fn lane(&self, b: usize) -> Option<&[Address]> {
         self.lane_addrs.get(b).map(Vec::as_slice)
+    }
+
+    /// Batch `b`'s lane dense ids, by lane id.
+    pub fn lane_bids(&self, b: usize) -> Option<&[u32]> {
+        self.lane_bids.get(b).map(Vec::as_slice)
+    }
+
+    /// Whether more than one batch touches dense id `bid`.
+    #[inline]
+    pub fn cross(&self, bid: u32) -> bool {
+        self.cross.get(bid as usize).is_none_or(|cross| cross.load(Ordering::Relaxed))
+    }
+
+    /// `N42_ONE_PROBE=3`: one batch's values of the accounts several batches
+    /// touch, kept for [`Self::fold_into`] (one lock a batch).
+    pub fn fold_part(&self, parts: Vec<FoldPart>) {
+        self.parts.lock().unwrap_or_else(PoisonError::into_inner).extend(parts);
+    }
+
+    /// `N42_ONE_PROBE=3`: the lane fold. Every batch read an account several
+    /// batches touch at the parent's value and changed it by its own
+    /// transfers (a sender's are all in one batch; the others only credit
+    /// it), and the block's merge sums those changes in any order
+    /// (`OutputShards::freeze`): so the block's value is the parent's plus
+    /// every batch's change. Written into `out` for each such account whose
+    /// batches agree on the parent's value and that exists afterwards;
+    /// returns how many. An account a batch touched only by a skipped
+    /// transfer has no part: its change is zero.
+    pub fn fold_into(&self, out: &DenseOut) -> usize {
+        let mut parts = std::mem::take(&mut *self.parts.lock().unwrap_or_else(PoisonError::into_inner));
+        parts.sort_unstable_by_key(|part| part.bid);
+        let mut written = 0;
+        for same in parts.chunk_by(|a, b| a.bid == b.bid) {
+            let original = same[0].original;
+            if same.iter().any(|part| part.original != original) {
+                continue;
+            }
+            let (base_balance, base_nonce) = original.unwrap_or_default();
+            let (mut balance, mut nonce, mut exists) = (base_balance, base_nonce, original.is_some());
+            for part in same {
+                let (b, n) = part.current.unwrap_or_default();
+                balance = balance.wrapping_add(b).wrapping_sub(base_balance);
+                nonce = nonce.wrapping_add(n).wrapping_sub(base_nonce);
+                exists |= part.current.is_some();
+            }
+            if exists && let Some(slot) = out.get(same[0].bid) {
+                slot.store(balance, nonce);
+                written += 1;
+            }
+        }
+        written
     }
 }
 
@@ -676,6 +774,10 @@ impl Ring {
     pub fn record(&mut self, view: &BuildView, base: B256, parent_built: Option<B256>, built: B256, extra: Vec<Address>) -> bool {
         if view.mismatched() || view.resolved.lanes.as_ref().is_some_and(Lanes::broken) {
             return false;
+        }
+        // `N42_ONE_PROBE=3`: the accounts several batches touched, folded.
+        if let Some(lanes) = view.resolved.lanes.as_ref().filter(|lanes| lanes.used()) {
+            lanes.folded.store(lanes.fold_into(&view.resolved.out) as u64, Ordering::Relaxed);
         }
         self.push(BuiltOutput { seq: view.resolved.seq, base, parent_built, built, extra, out: Arc::clone(&view.resolved.out) });
         true

@@ -5605,7 +5605,7 @@ mod tests {
     }
 
     #[test]
-    fn test_with_transactions_root_extra_data_validation() {
+    fn test_with_transactions_root_preserves_n42_extended_extra_data() {
         let payload = ExecutionPayloadV1 {
             difficulty: Default::default(),
             nonce: Default::default(),
@@ -5627,9 +5627,19 @@ mod tests {
 
         let fake_root = b256!("1111111111111111111111111111111111111111111111111111111111111111");
 
-        assert!(payload.clone().into_block_raw().is_err());
-        assert!(payload.clone().into_block_raw_with_transactions_root(fake_root).is_err());
-        assert!(payload.into_block_raw_with_transactions_root_opt(Some(fake_root)).is_err());
+        // N42 APoS and H2 headers carry seals/committee metadata beyond
+        // Ethereum's 32 bytes. Raw conversion preserves them; the selected
+        // consensus/header profile validates its own layout and bounds.
+        let extra = payload.extra_data.clone();
+        assert_eq!(payload.clone().into_block_raw().unwrap().header.extra_data, extra);
+        assert_eq!(
+            payload.clone().into_block_raw_with_transactions_root(fake_root).unwrap().header.extra_data,
+            extra,
+        );
+        assert_eq!(
+            payload.into_block_raw_with_transactions_root_opt(Some(fake_root)).unwrap().header.extra_data,
+            extra,
+        );
     }
 
     #[test]

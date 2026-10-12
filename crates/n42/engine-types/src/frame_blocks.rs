@@ -240,6 +240,9 @@ pub struct PreparedBuild<T: reth_transaction_pool::PoolTransaction> {
     /// ([`root_ahead`]); the seal takes it when it seals exactly these
     /// hashes on that plan ([`seal_root_carried`]).
     pub root_ahead: Option<RootAhead>,
+    /// `N42_PLAN_AHEAD_WARM`: the plan's warm read id
+    /// ([`crate::warm_ahead::start`]), 0 for none.
+    pub warm_id: u64,
 }
 
 impl<T: reth_transaction_pool::PoolTransaction> std::fmt::Debug for PreparedBuild<T> {

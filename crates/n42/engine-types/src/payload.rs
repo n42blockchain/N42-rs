@@ -900,6 +900,9 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
     let groups = crate::frame_blocks::noted_beneficiary().and_then(|beneficiary| {
         crate::parallel_transfer::partition_by_sender(&keys, beneficiary).ok().map(|groups| (beneficiary, groups))
     });
+    // `N42_PLAN_AHEAD_WARM=<threads>`: the plan's accounts read on the warm
+    // pool at the running build's state (`warm_ahead`).
+    let warm_id = crate::warm_ahead::start(&keys);
     let slots = crate::parallel_transfer::empty_slots(pool, cands.len());
     // `N42_PLAN_AHEAD_PARTS=1`: the body's frame layout and transactions
     // root, found here with the plan rather than at the seal.
@@ -917,6 +920,7 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
         slots,
         made_us: at.elapsed().as_micros() as u64,
         root_ahead,
+        warm_id,
     })
 }
 
@@ -1309,6 +1313,17 @@ where
     // `N42_STATE_AFTER_PULL=1`: opened after the parallel step's pull, prep
     // and partition instead of here (see `state_after_pull`). Only a build
     // that takes the parallel step defers; every other opens it here.
+    // `N42_PLAN_AHEAD_WARM`: the next plan's warm read is made at the state
+    // this build reads; the builder's hash of this build's parent and its
+    // grandparent decide whether the read made for this build fits.
+    let warm_ahead_on = crate::warm_ahead::threads() > 0;
+    if warm_ahead_on {
+        match parent_state.as_ref() {
+            Some(open) => crate::warm_ahead::note_base(parent_hash_for_state, Arc::clone(open)),
+            None => crate::warm_ahead::clear_base(),
+        }
+    }
+    let warm_parent_built = early_seal.as_ref().and_then(|early| early.parent_built);
     let defer_state = state_after_pull() && parallel_build() && builder_puller() != 0;
     let parent_state_slot: std::cell::OnceCell<reth_storage_api::StateProviderBox> = std::cell::OnceCell::new();
     if !defer_state {
@@ -1527,6 +1542,10 @@ where
     // `N42_PLAN_AHEAD_BODY=1`: what was made with the plan, its candidates
     // already the bulk vector (always taken, so nothing is left behind).
     let mut prepared_build = crate::frame_blocks::take_prepared::<Pool::Transaction>();
+    let warm_plan_id = prepared_build.as_ref().map_or(0, |made| made.warm_id);
+    if warm_ahead_on {
+        crate::warm_ahead::note_selected(warm_plan_id, parent_hash_for_state);
+    }
     let from_bulk = bulk.is_some();
     crate::frame_blocks::want_bulk(false);
     // `N42_FRAME_BLOCKS=1`: the frames the selector just took, whose layout
@@ -1799,6 +1818,13 @@ where
     // pull and the prep.
     let mut par_prefetch_ms = 0u64;
     let mut par_prefetch_wait_ms = 0u64;
+    // `N42_PLAN_AHEAD_WARM`: the layer read ahead with the plan -- its
+    // accounts, its own wall, the batch reads it answered and whether it was
+    // complete when the execution took it.
+    let mut warm_ahead_accounts = 0usize;
+    let mut warm_ahead_ms = 0u64;
+    let mut warm_ahead_hits = 0u64;
+    let mut warm_ahead_ready = false;
     // `N42_BUILD_MLP=<k>`: the batches' lookahead distance, 0 when off.
     let mut par_mlp_k = 0usize;
     let mut par_mlp_hints = 0u64;
@@ -2098,6 +2124,9 @@ where
             par_start_ms.saturating_sub(start_best_ms + start_check_ms + start_puller_ms + start_prepare_ms);
         let budget = (block_gas_limit.saturating_sub(cumulative_gas_used) / MIN_TRANSACTION_GAS) as usize;
         par_budget = budget;
+        // `N42_PLAN_AHEAD_WARM`: a block whose every transaction is the
+        // parallel step's (none executed before it).
+        let nothing_before_par = cumulative_gas_used == 0;
         let mut cands: Vec<Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>> =
             bulk.take().unwrap_or_else(|| Vec::with_capacity(budget.min(262_144)));
         // `N42_BUILD_PREFETCH=1`: each batch the puller hands over has its
@@ -2231,7 +2260,20 @@ where
         par_prefetch_wait_ms = prep_done.elapsed().as_millis() as u64;
         let pre_exec_at = std::time::Instant::now();
         par_prefetch_ms = warm_fill.as_ref().map_or(0, |warm| warm.busy_us() / 1000);
-        let warm = warm_fill.map(crate::parallel_transfer::WarmAccounts::freeze).unwrap_or_default();
+        // `N42_PLAN_AHEAD_WARM`: without the on-path prefetch, the layer read
+        // ahead with the plan, when it was made for this build's parent.
+        let warm = match warm_fill {
+            Some(fill) => fill.freeze(),
+            None => match all_transfers.then(|| crate::warm_ahead::take_for(parent_header.parent_hash, warm_parent_built)).flatten() {
+                Some(taken) => {
+                    warm_ahead_accounts = taken.accounts;
+                    warm_ahead_ms = taken.ms;
+                    warm_ahead_ready = taken.ready;
+                    taken.warm
+                }
+                None => Default::default(),
+            },
+        };
         if !all_transfers {
             open_deferred_state!()?;
             for tx in cands.into_iter().rev() {
@@ -2381,6 +2423,8 @@ where
                 tx_root_wait_ms = exec_done.elapsed().as_millis() as u64;
                 (executed, target.and_then(|job| job.join().ok()), root_ahead)
             });
+            // Every batch's `WarmDb` has dropped: its hits are counted.
+            warm_ahead_hits = warm.hits();
             par_prefault_ms = graft_target.as_ref().map_or(0, |target| target.prefault_us / 1000);
             if let Some(err) = deferred_state_err.take() {
                 return Err(err);
@@ -2763,6 +2807,25 @@ where
                         gap_before_seal_ms = commit_end.elapsed().as_millis() as u64;
                         let sealed = seal_block!(hook, seal_at, if matches { root_ahead } else { None });
                         sealed_ahead_id = Some((sealed.2, sealed.3));
+                        // `N42_PLAN_AHEAD_WARM`: this block's transactions are
+                        // its plan's (`prep_from_plan`, nothing before the
+                        // step, nothing serial after a seal here), so it
+                        // changes no account outside the plan's senders and
+                        // recipients, its beneficiary and its withdrawal
+                        // recipients: the next build may use the read made
+                        // at this build's parent leaving those out.
+                        if warm_ahead_on && prep_from_plan && nothing_before_par && warm_plan_id != 0 {
+                            let mut extra = vec![group_env.block_env.beneficiary];
+                            if let Some(withdrawals) = attributes.withdrawals.as_ref() {
+                                extra.extend(withdrawals.iter().map(|w| w.address));
+                            }
+                            crate::warm_ahead::note_built(crate::warm_ahead::Built {
+                                plan: warm_plan_id,
+                                base: parent_hash_for_state,
+                                built: sealed.2,
+                                extra,
+                            });
+                        }
                         // `N42_PLAN_AHEAD_BODY=1`: a block sealed on its
                         // counters from the frames' bulk vector, uncut, is
                         // its build's whole take in take order: the queue's
@@ -4058,6 +4121,10 @@ where
                     par_prefault_ms,
                     par_prefetch_ms,
                     par_prefetch_wait_ms,
+                    warm_ahead_accounts,
+                    warm_ahead_ms,
+                    warm_ahead_hits,
+                    warm_ahead_ready,
                     par_mlp_k,
                     par_mlp_hints,
                     par_fold_ms,

@@ -1011,17 +1011,17 @@ pub fn prefetch_hint<T>(p: *const T) {
 
 /// Shards of [`WarmAccounts`]: enough that the pool's prefetch jobs seldom
 /// meet on one lock, few enough that each job takes every lock once.
-const WARM_SHARDS: usize = 64;
+pub(crate) const WARM_SHARDS: usize = 64;
 
 /// The shard an address lands in: its first byte, which is uniform for the
 /// flood's addresses and for anything derived from a hash.
 #[inline]
-fn warm_shard(address: &Address) -> usize {
+pub(crate) fn warm_shard(address: &Address) -> usize {
     address.0[0] as usize % WARM_SHARDS
 }
 
 /// An account as the parent's state answers it.
-type WarmInfo = Option<revm::state::AccountInfo>;
+pub(crate) type WarmInfo = Option<revm::state::AccountInfo>;
 
 /// The block's accounts as the parent's state has them, read ahead of the
 /// execution (`N42_BUILD_PREFETCH=1`).
@@ -1096,6 +1096,7 @@ impl WarmAccounts {
                 .into_iter()
                 .map(|shard| shard.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner))
                 .collect(),
+            hits: Default::default(),
         }
     }
 }
@@ -1104,9 +1105,26 @@ impl WarmAccounts {
 #[derive(Debug, Default)]
 pub struct FrozenWarm {
     shards: Vec<alloy_primitives::map::AddressHashMap<WarmInfo>>,
+    /// Reads [`WarmDb`] answered from the layer, flushed by each `WarmDb`
+    /// as it drops (one add a batch, not one a read).
+    hits: std::sync::atomic::AtomicU64,
 }
 
 impl FrozenWarm {
+    /// A layer made of `shards` maps, indexed by [`warm_shard`]
+    /// (`N42_PLAN_AHEAD_WARM`, [`crate::warm_ahead`]); a shard left empty
+    /// answers nothing.
+    pub(crate) fn from_shards(shards: Vec<alloy_primitives::map::AddressHashMap<WarmInfo>>) -> Self {
+        debug_assert!(shards.is_empty() || shards.len() == WARM_SHARDS);
+        Self { shards, hits: Default::default() }
+    }
+
+    /// The reads answered from the layer so far, by every [`WarmDb`] over
+    /// it that has dropped.
+    pub fn hits(&self) -> u64 {
+        self.hits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// What the prefetch read for `address`: `None` if it did not read it,
     /// `Some(None)` for an account the parent's state does not have.
     #[inline]
@@ -1134,12 +1152,22 @@ impl FrozenWarm {
 pub struct WarmDb<'a, G> {
     warm: &'a FrozenWarm,
     inner: G,
+    /// Reads answered from `warm`, added to its count on drop.
+    hits: u64,
 }
 
 impl<'a, G> WarmDb<'a, G> {
     /// `inner` behind `warm`.
     pub const fn new(warm: &'a FrozenWarm, inner: G) -> Self {
-        Self { warm, inner }
+        Self { warm, inner, hits: 0 }
+    }
+}
+
+impl<G> Drop for WarmDb<'_, G> {
+    fn drop(&mut self) {
+        if self.hits > 0 {
+            self.warm.hits.fetch_add(self.hits, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -1149,7 +1177,10 @@ impl<G: Database> Database for WarmDb<'_, G> {
     #[inline]
     fn basic(&mut self, address: Address) -> Result<WarmInfo, Self::Error> {
         match self.warm.get(&address) {
-            Some(info) => Ok(info.clone()),
+            Some(info) => {
+                self.hits += 1;
+                Ok(info.clone())
+            }
             None => self.inner.basic(address),
         }
     }
@@ -7663,6 +7694,91 @@ mod tests {
         let mut bundle = state.take_bundle();
         append_reverts(&mut bundle, graft.reverts);
         (executed, bundle, graft.beneficiary_delta)
+    }
+
+    /// `N42_PLAN_AHEAD_WARM`: block N+1's accounts read at block N's parent
+    /// state with block N's plan left out (`warm_ahead`), then N+1 built on
+    /// N's post-state with that layer in front, builds the same block as the
+    /// plain build on N's post-state -- and the same read without N left out
+    /// would have served stale accounts.
+    #[test]
+    fn a_build_on_the_warm_read_ahead_equals_the_plain_build() {
+        use crate::warm_ahead::WarmAhead;
+        use std::sync::Arc;
+        for (senders, per, space, run) in [(400u64, 50u64, 0u64, 50usize), (300, 30, 0, 1), (200, 40, 2_000, 7)] {
+            let (block, db) = random_fixture(senders, per, space, run, 5);
+            let evm_config =
+                crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+            let evm_env = evm_config.evm_env(block.header()).expect("env");
+            let beneficiary = evm_env.block_env.beneficiary;
+            let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
+            // Block N: each sender's first half; block N+1: the rest, in order.
+            let (n_idx, m_idx): (Vec<usize>, Vec<usize>) = (0..envs.len()).partition(|&i| envs[i].nonce < per / 2);
+            let keys_of = |idx: &[usize]| -> Vec<(Address, Address)> {
+                idx.iter().map(|&i| (envs[i].caller, envs[i].kind.to().copied().unwrap())).collect()
+            };
+            let (keys_n, keys_m) = (keys_of(&n_idx), keys_of(&m_idx));
+            let convert_n = |i: usize| ((), envs[n_idx[i]].clone());
+            let convert_m = |i: usize| ((), envs[m_idx[i]].clone());
+
+            let run_n = execute_for_build_in_place(&evm_env, &keys_n, &convert_n, &|| Some(db.clone()), None, true).expect("block N");
+            assert!(run_n.skipped.is_empty());
+            let (_, bundle_n, _) = grafted_run(run_n, &db, beneficiary);
+            let mut after = db.clone();
+            for (address, account) in &bundle_n.state {
+                after.insert_account_info(*address, account.info.clone().unwrap_or_default());
+            }
+
+            // The plans' reads, as the hook makes them: N's touched set, then
+            // N+1's accounts at N's parent leaving N's out.
+            let plan_n = Arc::new(WarmAhead::new(1, B256::ZERO));
+            let plan_m = WarmAhead::new(2, B256::ZERO);
+            build_pool().install(|| {
+                plan_n.run(&keys_n, || None, &|| Some(db.clone()), 4);
+                plan_m.run(&keys_m, || Some(Arc::clone(&plan_n)), &|| Some(db.clone()), 4);
+            });
+            assert!(plan_m.complete());
+            assert_eq!(plan_m.prev(), Some(1));
+            let (warm, ready) = plan_m.take(&[beneficiary]);
+            assert!(ready && !warm.is_empty(), "a layer: {}", warm.len());
+
+            let plain =
+                execute_for_build_in_place(&evm_env, &keys_m, &convert_m, &|| Some(after.clone()), None, true).expect("block N+1");
+            let warmed = execute_for_build_in_place(&evm_env, &keys_m, &convert_m, &|| Some(WarmDb::new(&warm, after.clone())), None, true)
+                .expect("block N+1 on the layer");
+            assert!(warm.hits() > 0, "the layer answered reads");
+            assert_eq!(plain.skipped, warmed.skipped);
+            let (ours, our_bundle, our_fees) = grafted_run(warmed, &after, beneficiary);
+            let (theirs, their_bundle, their_fees) = grafted_run(plain, &after, beneficiary);
+            assert_eq!(ours.len(), keys_m.len());
+            assert_eq!(ours, theirs, "transfers, gas and outcomes");
+            assert_eq!(our_fees, their_fees, "the beneficiary's tips");
+            assert_eq!(our_bundle.state.len(), their_bundle.state.len(), "accounts");
+            for (address, theirs) in &their_bundle.state {
+                assert_eq!(our_bundle.state.get(address), Some(theirs), "account {address}");
+            }
+            assert_eq!(our_bundle.reverts.len(), their_bundle.reverts.len());
+            for (ours, theirs) in our_bundle.reverts.iter().zip(their_bundle.reverts.iter()) {
+                let ours: std::collections::BTreeMap<_, _> = ours.iter().cloned().collect();
+                let theirs: std::collections::BTreeMap<_, _> = theirs.iter().cloned().collect();
+                assert_eq!(ours, theirs, "reverts");
+            }
+
+            // Without N left out the layer would hold N+1's senders as N's
+            // parent had them: stale.
+            let nothing = Arc::new(WarmAhead::new(3, B256::ZERO));
+            let unfiltered = WarmAhead::new(4, B256::ZERO);
+            build_pool().install(|| {
+                nothing.run(&[], || None, &|| Some(db.clone()), 4);
+                unfiltered.run(&keys_m, || Some(Arc::clone(&nothing)), &|| Some(db.clone()), 4);
+            });
+            let (unfiltered, _) = unfiltered.take(&[]);
+            let mut post = after.clone();
+            assert!(
+                keys_m.iter().any(|(sender, _)| unfiltered.get(sender) != Some(&post.basic(*sender).unwrap())),
+                "the exclusion is what keeps the layer exact"
+            );
+        }
     }
 
     /// `N42_BUILD_PREFETCH`: a build whose batches read the prefetched layer

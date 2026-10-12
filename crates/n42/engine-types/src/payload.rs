@@ -1847,6 +1847,12 @@ where
     let mut warm_ahead_ms = 0u64;
     let mut warm_ahead_hits = 0u64;
     let mut warm_ahead_ready = false;
+    // `N42_ONE_PROBE=1`: the plan's resolve and the build's reads through it.
+    let mut one_probe_resolved = 0usize;
+    let mut one_probe_resolve_ms = 0u64;
+    let mut one_probe_prefix = 0usize;
+    let mut one_probe_hits = 0u64;
+    let mut one_probe_fallbacks = 0u64;
     // `N42_BUILD_MLP=<k>`: the batches' lookahead distance, 0 when off.
     let mut par_mlp_k = 0usize;
     let mut par_mlp_hints = 0u64;
@@ -2296,6 +2302,20 @@ where
                 None => Default::default(),
             },
         };
+        // `N42_ONE_PROBE=1`: the plan's resolved references, taken with the
+        // prepared build whose segments this build took (so the plan's keys
+        // are this build's; each transaction is checked again as it runs),
+        // and the verified prefix of built outputs under this build's parent.
+        let one_probe_view = all_transfers
+            .then(|| prepared_build.as_mut().and_then(|made| made.one_probe.take()))
+            .flatten()
+            .filter(|resolved| resolved.len() == keys.len())
+            .map(|resolved| {
+                one_probe_resolved = resolved.accounts;
+                one_probe_resolve_ms = resolved.resolve_us / 1000;
+                crate::one_probe::view_for(resolved, parent_header.parent_hash, warm_parent_built, group_env.block_env.beneficiary)
+            });
+        one_probe_prefix = one_probe_view.as_ref().map_or(0, crate::one_probe::BuildView::prefix_depth);
         if !all_transfers {
             open_deferred_state!()?;
             for tx in cands.into_iter().rev() {
@@ -2312,7 +2332,12 @@ where
             let convert = |i: usize| ((), evm_config.tx_env(cands[i].transaction.consensus_ref()));
             // Without the prefetch the layer is empty and every read goes
             // to the provider, as before.
-            let open = || open_db().map(|db| crate::parallel_transfer::WarmDb::new(&warm, db));
+            // `N42_ONE_PROBE=1`: the transactions' accounts served from the
+            // plan's references in front of that (a passthrough without).
+            let one_probe_ref = one_probe_view.as_ref();
+            let open = || {
+                open_db().map(|db| crate::one_probe::OneProbeDb::new(one_probe_ref, crate::parallel_transfer::WarmDb::new(&warm, db)))
+            };
             // `N42_GRAFT_STREAM=1`: each batch's bundle is folded into the
             // block's graft as that batch finishes, on the worker pool, rather
             // than all of them on this thread once the execution is over (the
@@ -2447,6 +2472,10 @@ where
             });
             // Every batch's `WarmDb` has dropped: its hits are counted.
             warm_ahead_hits = warm.hits();
+            if let Some(view) = one_probe_view.as_ref() {
+                one_probe_hits = view.hits();
+                one_probe_fallbacks = view.fallbacks();
+            }
             par_prefault_ms = graft_target.as_ref().map_or(0, |target| target.prefault_us / 1000);
             if let Some(err) = deferred_state_err.take() {
                 return Err(err);
@@ -2837,17 +2866,30 @@ where
                         // recipients, its beneficiary and its withdrawal
                         // recipients: the next build may use the read made
                         // at this build's parent leaving those out.
-                        if warm_ahead_on && from_bulk && cands.len() <= bulk_len && nothing_before_par && warm_plan_id != 0 {
+                        let built_whole = from_bulk && cands.len() <= bulk_len && nothing_before_par;
+                        let extra = || {
                             let mut extra = vec![group_env.block_env.beneficiary];
                             if let Some(withdrawals) = attributes.withdrawals.as_ref() {
                                 extra.extend(withdrawals.iter().map(|w| w.address));
                             }
+                            extra
+                        };
+                        if warm_ahead_on && built_whole && warm_plan_id != 0 {
                             crate::warm_ahead::note_built(crate::warm_ahead::Built {
                                 plan: warm_plan_id,
                                 base: parent_hash_for_state,
                                 built: sealed.2,
-                                extra,
+                                extra: extra(),
                             });
+                        }
+                        // `N42_ONE_PROBE=1`: the same block, built whole
+                        // through its plan's references: its dense output
+                        // goes into the ring for the builds above it.
+                        if let Some(view) = one_probe_view.as_ref()
+                            && built_whole
+                            && cands.len() == view.len()
+                        {
+                            crate::one_probe::note_built(view, parent_hash_for_state, warm_parent_built, sealed.2, extra());
                         }
                         // `N42_PLAN_AHEAD_BODY=1`: a block sealed on its
                         // counters from the frames' bulk vector, uncut, is
@@ -4148,6 +4190,12 @@ where
                     warm_ahead_ms,
                     warm_ahead_hits,
                     warm_ahead_ready,
+                    one_probe_stage = crate::one_probe::stage(),
+                    one_probe_resolved,
+                    one_probe_prefix,
+                    one_probe_hits,
+                    one_probe_fallbacks,
+                    one_probe_resolve_ms,
                     par_mlp_k,
                     par_mlp_hints,
                     par_fold_ms,

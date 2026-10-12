@@ -26,11 +26,12 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex, OnceLock, PoisonError,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
 
 use alloy_primitives::{Address, B256, U256, map::AddressMap};
+use revm::{Database, primitives::KECCAK_EMPTY, state::AccountInfo};
 
 use crate::parallel_transfer::{WARM_SHARDS, warm_shard};
 
@@ -474,6 +475,15 @@ impl Ring {
         self.outputs.truncate(self.depth);
     }
 
+    /// [`note_built`] on this ring.
+    pub fn record(&mut self, view: &BuildView, base: B256, parent_built: Option<B256>, built: B256, extra: Vec<Address>) -> bool {
+        if view.mismatched() {
+            return false;
+        }
+        self.push(BuiltOutput { seq: view.resolved.seq, base, parent_built, built, extra, out: Arc::clone(&view.resolved.out) });
+        true
+    }
+
     /// Outputs held.
     pub fn len(&self) -> usize {
         self.outputs.len()
@@ -511,6 +521,262 @@ impl Ring {
 fn ring() -> &'static Mutex<Ring> {
     static RING: OnceLock<Mutex<Ring>> = OnceLock::new();
     RING.get_or_init(|| Mutex::new(Ring::new(depth() as usize)))
+}
+
+/// What a build reads its plan's references through: the plan's resolve, the
+/// verified prefix's outputs, and the accounts forced to the chain.
+#[derive(Debug)]
+pub struct BuildView {
+    resolved: Arc<Resolved>,
+    prefix: Vec<Arc<BuiltOutput>>,
+    /// The prefix's plan sequence numbers, newest first (the read's scan).
+    seqs: Vec<u64>,
+    /// Dense ids (a bit each) never served from an output: the prefix
+    /// blocks' beneficiaries and withdrawal recipients, the system
+    /// contracts, and this block's beneficiary.
+    forced: Vec<u64>,
+    /// This block's beneficiary: never written through.
+    beneficiary: Address,
+    hits: AtomicU64,
+    fallbacks: AtomicU64,
+    /// A transaction the batches ran was not the plan's at its index: the
+    /// block's output is not put in the ring.
+    mismatch: AtomicBool,
+}
+
+impl BuildView {
+    /// The view of a build with beneficiary `beneficiary` that took
+    /// `resolved`, over `prefix` ([`Ring::prefix`]).
+    pub fn new(resolved: Arc<Resolved>, prefix: Vec<Arc<BuiltOutput>>, beneficiary: Address) -> Self {
+        let mut forced = vec![0u64; resolved.accounts.div_ceil(64)];
+        let residual = prefix
+            .iter()
+            .flat_map(|output| output.extra.iter())
+            .chain(crate::warm_ahead::SYSTEM.iter())
+            .chain(std::iter::once(&beneficiary));
+        for address in residual {
+            if let Some(bid) = resolved.id_of(address) {
+                forced[bid as usize / 64] |= 1 << (bid % 64);
+            }
+        }
+        let seqs = prefix.iter().map(|output| output.seq).collect();
+        Self {
+            resolved,
+            prefix,
+            seqs,
+            forced,
+            beneficiary,
+            hits: AtomicU64::new(0),
+            fallbacks: AtomicU64::new(0),
+            mismatch: AtomicBool::new(false),
+        }
+    }
+
+    /// The plan's resolve.
+    pub fn resolved(&self) -> &Resolved {
+        &self.resolved
+    }
+
+    /// Transactions in the plan.
+    pub fn len(&self) -> usize {
+        self.resolved.len()
+    }
+
+    /// Whether the plan has none.
+    pub fn is_empty(&self) -> bool {
+        self.resolved.is_empty()
+    }
+
+    /// The verified prefix's depth.
+    pub fn prefix_depth(&self) -> usize {
+        self.prefix.len()
+    }
+
+    /// Reads served from the outputs, by every [`OneProbeDb`] that dropped.
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    /// Reads of a transaction's account that went to the chain instead.
+    pub fn fallbacks(&self) -> u64 {
+        self.fallbacks.load(Ordering::Relaxed)
+    }
+
+    /// Whether a transaction the batches ran was not the plan's.
+    pub fn mismatched(&self) -> bool {
+        self.mismatch.load(Ordering::Relaxed)
+    }
+
+    /// Whether dense id `bid` is forced to the chain.
+    #[inline]
+    fn forced(&self, bid: u32) -> bool {
+        self.forced.get(bid as usize / 64).is_none_or(|word| word & (1 << (bid % 64)) != 0)
+    }
+
+    /// The value the reference `src` of dense id `bid` names, when it is
+    /// valid: not the chain, not forced, a plan of the verified prefix, and
+    /// an entry its block wrote with a plain account.
+    #[inline]
+    fn dense(&self, bid: u32, src: Src) -> Option<(U256, u64)> {
+        if src == CHAIN || self.forced(bid) {
+            return None;
+        }
+        let seq = src_seq(src);
+        let at = self.seqs.iter().position(|&s| s == seq)?;
+        self.prefix[at].out.get(src_id(src))?.load()
+    }
+}
+
+/// An account as the chain's provider answers a plain one
+/// (`AccountInfo::from(Account)`: no code loaded).
+#[inline]
+fn plain_info(balance: U256, nonce: u64) -> AccountInfo {
+    AccountInfo::from(reth_primitives_traits::Account { balance, nonce, bytecode_hash: None })
+}
+
+/// A batch's view of the parent's state with its plan's references in
+/// front: the running transaction's sender and recipient (named by
+/// [`note_tx`](crate::parallel_transfer::AccountHint::note_tx)) are answered
+/// from the output their reference names when it is valid, every other
+/// read -- and those when it is not -- from `inner`. A valid reference names
+/// the newest writer of the account below this block, so the answer is the
+/// parent's either way and the block the same byte for byte. With no view it
+/// is `inner` alone.
+#[derive(Debug)]
+pub struct OneProbeDb<'a, G> {
+    view: Option<&'a BuildView>,
+    inner: G,
+    cur: Option<PlanTx>,
+    hits: u64,
+    fallbacks: u64,
+}
+
+impl<'a, G> OneProbeDb<'a, G> {
+    /// `inner` behind `view`.
+    pub const fn new(view: Option<&'a BuildView>, inner: G) -> Self {
+        Self { view, inner, cur: None, hits: 0, fallbacks: 0 }
+    }
+}
+
+impl<G> Drop for OneProbeDb<'_, G> {
+    fn drop(&mut self) {
+        if let Some(view) = self.view {
+            if self.hits > 0 {
+                view.hits.fetch_add(self.hits, Ordering::Relaxed);
+            }
+            if self.fallbacks > 0 {
+                view.fallbacks.fetch_add(self.fallbacks, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl<G: Database> Database for OneProbeDb<'_, G> {
+    type Error = G::Error;
+
+    #[inline]
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        if let (Some(view), Some(cur)) = (self.view, self.cur.as_ref()) {
+            let named = if address == cur.sender {
+                Some((cur.s_bid, cur.s_src))
+            } else if address == cur.recipient {
+                Some((cur.r_bid, cur.r_src))
+            } else {
+                None
+            };
+            if let Some((bid, src)) = named {
+                match view.dense(bid, src) {
+                    Some((balance, nonce)) => {
+                        self.hits += 1;
+                        return Ok(Some(plain_info(balance, nonce)));
+                    }
+                    None => self.fallbacks += 1,
+                }
+            }
+        }
+        self.inner.basic(address)
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
+        self.inner.code_by_hash(code_hash)
+    }
+
+    fn storage(
+        &mut self,
+        address: Address,
+        index: revm::primitives::StorageKey,
+    ) -> Result<revm::primitives::StorageValue, Self::Error> {
+        self.inner.storage(address, index)
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        self.inner.block_hash(number)
+    }
+}
+
+impl<G: crate::parallel_transfer::AccountHint> crate::parallel_transfer::AccountHint for OneProbeDb<'_, G> {
+    #[inline]
+    fn hint_account(&self, address: &Address) -> bool {
+        self.inner.hint_account(address)
+    }
+
+    #[inline]
+    fn note_tx(&mut self, i: usize, key: &(Address, Address)) {
+        let Some(view) = self.view else { return };
+        self.cur = view.resolved.txs.get(i).copied().filter(|tx| tx.sender == key.0 && tx.recipient == key.1);
+        if self.cur.is_none() {
+            view.mismatch.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn written_accounts(&self) -> Option<[Address; 2]> {
+        self.view?;
+        self.cur.map(|tx| [tx.sender, tx.recipient])
+    }
+
+    /// Writes the batch's value of the running transaction's `address` into
+    /// this block's output when one batch owns the account (transactions of
+    /// one sender only touch it); an account with code or none is marked
+    /// unheld. The beneficiary is never written.
+    #[inline]
+    fn write_through(&self, address: &Address, info: Option<&AccountInfo>) {
+        let (Some(view), Some(cur)) = (self.view, self.cur.as_ref()) else { return };
+        let bid = if *address == cur.sender {
+            cur.s_bid
+        } else if *address == cur.recipient {
+            cur.r_bid
+        } else {
+            return;
+        };
+        if view.resolved.shared(bid) || *address == view.beneficiary {
+            return;
+        }
+        let Some(slot) = view.resolved.out.get(bid) else { return };
+        match info {
+            Some(info) if info.code_hash == KECCAK_EMPTY => slot.store(info.balance, info.nonce),
+            _ => slot.poison(),
+        }
+    }
+}
+
+/// Build start: the view of a build with beneficiary `beneficiary` on the
+/// block the builder sealed as `parent_built`, whose parent is
+/// `grandparent`, that took `resolved`: the verified prefix out of the
+/// process's ring.
+pub fn view_for(resolved: Arc<Resolved>, grandparent: B256, parent_built: Option<B256>, beneficiary: Address) -> BuildView {
+    let prefix = ring().lock().unwrap_or_else(PoisonError::into_inner).prefix(grandparent, parent_built, resolved.seq);
+    BuildView::new(resolved, prefix, beneficiary)
+}
+
+/// A block sealed at its execution's end from exactly its plan's take with
+/// nothing serial, built through `view` on `base` (the builder's hash of
+/// that parent `parent_built`) and sealed as `built`, changing nothing
+/// outside its transfers but `extra` (its beneficiary and withdrawal
+/// recipients): its output goes into the ring. Returns whether it did (not
+/// when a transaction ran that was not the plan's).
+pub fn note_built(view: &BuildView, base: B256, parent_built: Option<B256>, built: B256, extra: Vec<Address>) -> bool {
+    ring().lock().unwrap_or_else(PoisonError::into_inner).record(view, base, parent_built, built, extra)
 }
 
 #[cfg(test)]
@@ -647,5 +913,62 @@ mod tests {
         assert_eq!(entry.load(), None);
         assert!(out.get(3).is_none());
         assert_eq!(std::mem::size_of::<Dense>(), 64);
+    }
+    /// The previous blocks' beneficiaries and withdrawal recipients, the
+    /// system contracts and this block's beneficiary are read from the chain
+    /// even when a valid reference names them; the others from the output.
+    /// A transaction that is not the plan's keeps the block out of the ring.
+    #[test]
+    fn the_residual_accounts_read_the_chain() {
+        use crate::parallel_transfer::AccountHint as _;
+        use revm::database::{CacheDB, EmptyDB};
+        let (s, r, w, sys, b) = (a(1), a(2), a(3), crate::warm_ahead::SYSTEM[1], a(5));
+        let mut table = Rolling::new(16);
+        let mut ring = Ring::new(16);
+        let p1 = Arc::new(resolve_with(&mut table, &[(s, r), (s, w), (s, sys), (s, b)]));
+        let p2 = Arc::new(resolve_with(&mut table, &[(s, r), (s, w), (s, sys), (s, b)]));
+        // Block 1 wrote every account through (the system contract and `b`
+        // as plain accounts too).
+        let view1 = BuildView::new(Arc::clone(&p1), Vec::new(), a(99));
+        {
+            let mut db = OneProbeDb::new(Some(&view1), CacheDB::new(EmptyDB::default()));
+            for (i, key) in [(s, r), (s, w), (s, sys), (s, b)].iter().enumerate() {
+                db.note_tx(i, key);
+                for address in db.written_accounts().unwrap() {
+                    db.write_through(&address, Some(&plain_info(U256::from(1_000 + i as u64), 7)));
+                }
+            }
+        }
+        assert!(!view1.mismatched());
+        // `w` a withdrawal recipient of block 1.
+        assert!(ring.record(&view1, B256::with_last_byte(100), None, B256::with_last_byte(10), vec![a(99), w]));
+        let prefix = ring.prefix(B256::with_last_byte(100), Some(B256::with_last_byte(10)), p2.seq);
+        assert_eq!(prefix.len(), 1);
+        // Block 2's beneficiary is `b`; the chain has different values.
+        let view2 = BuildView::new(Arc::clone(&p2), prefix, b);
+        let mut chain = CacheDB::new(EmptyDB::default());
+        for address in [s, r, w, sys, b] {
+            chain.insert_account_info(address, plain_info(U256::from(5), 1));
+        }
+        let mut db = OneProbeDb::new(Some(&view2), chain);
+        let mut read = |i: usize, key: (Address, Address), address: Address| {
+            db.note_tx(i, &key);
+            db.basic(address).unwrap().unwrap().balance
+        };
+        assert_eq!(read(0, (s, r), s), U256::from(1_003), "the sender, last written by block 1's fourth transfer");
+        assert_eq!(read(0, (s, r), r), U256::from(1_000), "a plain recipient");
+        assert_eq!(read(1, (s, w), w), U256::from(5), "a withdrawal recipient of block 1");
+        assert_eq!(read(2, (s, sys), sys), U256::from(5), "a system contract");
+        assert_eq!(read(3, (s, b), b), U256::from(5), "this block's beneficiary");
+        assert_eq!(read(3, (s, b), r), U256::from(5), "an account the running transaction does not name");
+        drop(db);
+        assert_eq!((view2.hits(), view2.fallbacks()), (2, 3));
+        // A transaction that is not the plan's at its index.
+        let mut db = OneProbeDb::new(Some(&view2), CacheDB::new(EmptyDB::default()));
+        db.note_tx(0, &(r, s));
+        assert!(db.written_accounts().is_none());
+        drop(db);
+        assert!(view2.mismatched());
+        assert!(!ring.record(&view2, B256::with_last_byte(101), Some(B256::with_last_byte(10)), B256::with_last_byte(11), vec![]));
     }
 }

@@ -7834,6 +7834,134 @@ mod tests {
         }
     }
 
+    /// Asserts two runs of one block built the same block: transfers, gas
+    /// and outcomes, the beneficiary's tips, the grafted accounts and the
+    /// reverts.
+    fn assert_same_block(ours: BuildRun<()>, theirs: BuildRun<()>, parent: &CacheDB<EmptyDB>, beneficiary: Address, txs: usize) -> BundleState {
+        assert_eq!(ours.skipped, theirs.skipped);
+        let (ours, our_bundle, our_fees) = grafted_run(ours, parent, beneficiary);
+        let (theirs, their_bundle, their_fees) = grafted_run(theirs, parent, beneficiary);
+        assert_eq!(ours.len(), txs);
+        assert_eq!(ours, theirs, "transfers, gas and outcomes");
+        assert_eq!(our_fees, their_fees, "the beneficiary's tips");
+        assert_eq!(our_bundle.state.len(), their_bundle.state.len(), "accounts");
+        for (address, theirs) in &their_bundle.state {
+            assert_eq!(our_bundle.state.get(address), Some(theirs), "account {address}");
+        }
+        assert_eq!(our_bundle.reverts.len(), their_bundle.reverts.len());
+        for (ours, theirs) in our_bundle.reverts.iter().zip(their_bundle.reverts.iter()) {
+            let ours: std::collections::BTreeMap<_, _> = ours.iter().cloned().collect();
+            let theirs: std::collections::BTreeMap<_, _> = theirs.iter().cloned().collect();
+            assert_eq!(ours, theirs, "reverts");
+        }
+        their_bundle
+    }
+
+    /// `N42_ONE_PROBE=1`: three consecutive blocks, their plans resolved
+    /// ahead in order against the rolling table, each built on the previous
+    /// one's post-state with its transactions' accounts read from the
+    /// verified prefix's dense outputs, build the same blocks as the plain
+    /// builds -- and the later blocks' reads are served from the outputs. A
+    /// build on a parent that is not the resolved chain (a peer's block at
+    /// that height, with other values) finds no prefix and still equals the
+    /// plain build there.
+    #[test]
+    fn a_build_on_resolved_reads_equals_the_plain_build() {
+        use crate::one_probe::{BuildView, OneProbeDb, Ring, Rolling, resolve_with};
+        use std::sync::Arc;
+        for (senders, per, space, run) in [(400u64, 60u64, 0u64, 60usize), (300, 30, 0, 1), (200, 45, 2_000, 7)] {
+            let (block, db) = random_fixture(senders, per, space, run, 5);
+            let evm_config =
+                crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+            let evm_env = evm_config.evm_env(block.header()).expect("env");
+            let beneficiary = evm_env.block_env.beneficiary;
+            let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
+            // Three blocks: each sender's first, second and last third.
+            let blocks: Vec<Vec<usize>> =
+                (0..3u64).map(|k| (0..envs.len()).filter(|&i| envs[i].nonce * 3 / per == k).collect()).collect();
+            let keys: Vec<Vec<(Address, Address)>> = blocks
+                .iter()
+                .map(|idx| idx.iter().map(|&i| (envs[i].caller, envs[i].kind.to().copied().unwrap())).collect())
+                .collect();
+            // The plans, made in order before the blocks execute (plan k + 1
+            // at block k's selection).
+            let mut table = Rolling::new(16);
+            let plans: Vec<Arc<crate::one_probe::Resolved>> =
+                build_pool().install(|| keys.iter().map(|k| Arc::new(resolve_with(&mut table, k))).collect());
+            let mut ring = Ring::new(16);
+            let mut state = db.clone();
+            let built = |k: usize| B256::with_last_byte(10 + k as u8);
+            let base = |k: usize| B256::with_last_byte(100 + k as u8);
+            for k in 0..3 {
+                let convert = |i: usize| ((), envs[blocks[k][i]].clone());
+                let parent_built = k.checked_sub(1).map(built);
+                let grandparent = if k == 0 { B256::ZERO } else { base(k - 1) };
+                let prefix = ring.prefix(grandparent, parent_built, plans[k].seq);
+                assert_eq!(prefix.len(), k, "block {k}'s verified prefix");
+                let view = BuildView::new(Arc::clone(&plans[k]), prefix, beneficiary);
+
+                if k == 2 {
+                    // A peer's block at the parent's height: the same
+                    // accounts with other balances, under another hash.
+                    let mut peer = state.clone();
+                    for (sender, _) in &keys[1] {
+                        let mut info = peer.basic(*sender).unwrap().unwrap();
+                        info.balance -= U256::from(1);
+                        peer.insert_account_info(*sender, info);
+                    }
+                    let peer_prefix = ring.prefix(grandparent, Some(B256::with_last_byte(77)), plans[k].seq);
+                    assert!(peer_prefix.is_empty(), "no prefix on a parent this node did not seal from a plan");
+                    let peer_view = BuildView::new(Arc::clone(&plans[k]), peer_prefix, beneficiary);
+                    let plain = execute_for_build_in_place(&evm_env, &keys[k], &convert, &|| Some(peer.clone()), None, true)
+                        .expect("block on the peer's parent");
+                    let probed = execute_for_build_in_place(
+                        &evm_env,
+                        &keys[k],
+                        &convert,
+                        &|| Some(OneProbeDb::new(Some(&peer_view), peer.clone())),
+                        None,
+                        true,
+                    )
+                    .expect("block on the peer's parent through the plan");
+                    assert_same_block(probed, plain, &peer, beneficiary, keys[k].len());
+                    assert_eq!(peer_view.hits(), 0, "nothing served on another parent");
+                    assert!(peer_view.fallbacks() > 0);
+                }
+
+                let plain =
+                    execute_for_build_in_place(&evm_env, &keys[k], &convert, &|| Some(state.clone()), None, true).expect("plain block");
+                let probed = execute_for_build_in_place(
+                    &evm_env,
+                    &keys[k],
+                    &convert,
+                    &|| Some(OneProbeDb::new(Some(&view), state.clone())),
+                    None,
+                    true,
+                )
+                .expect("block through the plan's references");
+                assert!(plain.skipped.is_empty());
+                let bundle = assert_same_block(probed, plain, &state, beneficiary, keys[k].len());
+                assert!(!view.mismatched());
+                if k > 0 {
+                    assert!(view.hits() > 0, "block {k}: reads served from the outputs");
+                }
+                // Every account the block wrote through holds its post-state.
+                for (address, account) in &bundle.state {
+                    if let Some(bid) = plans[k].id_of(address)
+                        && let Some((balance, nonce)) = plans[k].out.get(bid).and_then(crate::one_probe::Dense::load)
+                    {
+                        let info = account.info.as_ref().expect("a written account exists");
+                        assert_eq!((balance, nonce), (info.balance, info.nonce), "block {k}'s output for {address}");
+                    }
+                }
+                assert!(ring.record(&view, base(k), parent_built, built(k), vec![beneficiary]));
+                for (address, account) in &bundle.state {
+                    state.insert_account_info(*address, account.info.clone().unwrap_or_default());
+                }
+            }
+        }
+    }
+
     /// `N42_BUILD_PREFETCH`: a build whose batches read the prefetched layer
     /// first -- with some accounts prefetched and the rest not, and one
     /// account the parent does not have -- builds the same block as a build

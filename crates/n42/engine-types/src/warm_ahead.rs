@@ -72,7 +72,7 @@ fn pool() -> Option<&'static rayon::ThreadPool> {
 /// The accounts no block of transfers changes through its transactions but
 /// the block's own pre- and post-execution system calls touch: never served
 /// from the layer.
-const SYSTEM: [Address; 5] = [
+pub(crate) const SYSTEM: [Address; 5] = [
     alloy_eips::eip4788::SYSTEM_ADDRESS,
     alloy_eips::eip4788::BEACON_ROOTS_ADDRESS,
     alloy_eips::eip2935::HISTORY_STORAGE_ADDRESS,

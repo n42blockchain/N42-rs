@@ -49,7 +49,7 @@ use reth_db_common::init::{
 };
 use reth_downloaders::{bodies::noop::NoopBodiesDownloader, headers::noop::NoopHeaderDownloader};
 use reth_engine_local::MiningMode;
-use reth_evm::{noop::NoopEvmConfig, ConfigureEvm};
+use reth_evm::{noop::NoopEvmConfig, ConfigureEvm, SenderRecoveryCache};
 use reth_exex::ExExManagerHandle;
 use reth_fs_util as fs;
 use reth_network_p2p::headers::client::HeadersClient;
@@ -71,10 +71,10 @@ use reth_node_metrics::{
 };
 use reth_provider::{
     providers::{NodeTypesForProvider, ProviderNodeTypes, RocksDBProvider, StaticFileProvider},
-    BalConfig, BalStoreHandle, BlockHashReader, BlockNumReader, DBProvider,
-    DatabaseProviderFactory, InMemoryBalStore, MetadataProvider, MetadataWriter, ProviderError,
-    ProviderFactory, ProviderResult, RocksDBProviderFactory, StageCheckpointReader,
-    StaticFileProviderBuilder, StaticFileProviderFactory, StorageSettingsCache,
+    BalStoreHandle, BlockHashReader, BlockNumReader, DBProvider, DatabaseProviderFactory,
+    MetadataProvider, MetadataWriter, ProviderError, ProviderFactory, ProviderResult,
+    RocksDBBalStore, RocksDBProviderFactory, StageCheckpointReader, StaticFileProviderBuilder,
+    StaticFileProviderFactory, StorageSettingsCache,
 };
 use reth_prune::{PruneMode, PruneModes, PrunerBuilder};
 use reth_rpc_builder::config::RethRpcServerConfig;
@@ -87,10 +87,7 @@ use reth_stages::{
 use reth_static_file::{blocks_per_file_for_prune_distance, StaticFileProducer, StaticFileSegment};
 use reth_storage_overlay::OverlayManager;
 use reth_tasks::TaskExecutor;
-use reth_tracing::{
-    throttle,
-    tracing::{debug, error, info, warn},
-};
+use reth_tracing::tracing::{debug, error, info, warn};
 use reth_transaction_pool::TransactionPool;
 use std::{num::NonZeroUsize, sync::Arc, thread::available_parallelism, time::Duration};
 use tokio::sync::{
@@ -521,17 +518,19 @@ where
                 .with_default_tables()
                 .with_metrics()
                 .with_statistics()
+                .with_block_cache_size_opt(self.node_config().db.rocksdb_block_cache_size)
                 .build()?
         };
 
-        let balstore_cache_size = self
+        let bal_store = self
             .node_config()
             .db
             .balstore_cache_size
-            .unwrap_or(BalConfig::DEFAULT_IN_MEMORY_RETENTION_DISTANCE);
-        let bal_store = BalStoreHandle::new(InMemoryBalStore::new(
-            BalConfig::with_in_memory_retention_distance(balstore_cache_size),
-        ));
+            .map(|distance| {
+                RocksDBBalStore::with_buffer_retention_distance(rocksdb_provider.clone(), distance)
+            })
+            .unwrap_or_else(|| RocksDBBalStore::new(rocksdb_provider.clone()));
+        let bal_store = BalStoreHandle::new(bal_store);
         let factory = ProviderFactory::new(
             self.right().clone(),
             self.chain_spec(),
@@ -947,6 +946,7 @@ where
             },
             node_adapter,
             head,
+            sender_recovery_cache: builder_ctx.sender_recovery_cache().cloned(),
         };
 
         let ctx = LaunchContextWith {
@@ -1007,6 +1007,11 @@ where
     /// Returns mutable reference to the configured `NodeAdapter`.
     pub const fn node_adapter_mut(&mut self) -> &mut NodeAdapter<T, CB::Components> {
         &mut self.right_mut().node_adapter
+    }
+
+    /// Returns the cache of recovered transaction senders shared by node components, if enabled.
+    pub const fn sender_recovery_cache(&self) -> Option<&SenderRecoveryCache> {
+        self.right().sender_recovery_cache.as_ref()
     }
 
     /// Returns a reference to the blockchain provider.
@@ -1372,28 +1377,33 @@ where
     db_provider_container: WithMeteredProvider<NodeTypesWithDBAdapter<T::Types, T::DB>>,
     node_adapter: NodeAdapter<T, CB::Components>,
     head: Head,
+    /// Cache of recovered transaction senders shared by node components, if enabled.
+    sender_recovery_cache: Option<SenderRecoveryCache>,
 }
 
 /// Returns the metrics hooks for the node.
+///
+/// The storage hooks walk their backing store, which scales with the dataset, so they are
+/// registered as background hooks: metrics collection still refreshes them at most every 5
+/// minutes, but renders the values of the previous refresh instead of waiting for the walk.
 pub fn metrics_hooks<N: NodeTypesWithDB>(provider_factory: &ProviderFactory<N>) -> Hooks {
     Hooks::builder()
-        .with_hook({
+        .with_background_interval(Duration::from_secs(5 * 60))
+        .with_background_hook({
             let db = provider_factory.db_ref().clone();
-            move || throttle!(Duration::from_secs(5 * 60), || db.report_metrics())
+            move || db.report_metrics()
         })
-        .with_hook({
+        .with_background_hook({
             let sfp = provider_factory.static_file_provider();
             move || {
-                throttle!(Duration::from_secs(5 * 60), || {
-                    if let Err(error) = sfp.report_metrics() {
-                        error!(%error, "Failed to report metrics from static file provider");
-                    }
-                })
+                if let Err(error) = sfp.report_metrics() {
+                    error!(%error, "Failed to report metrics from static file provider");
+                }
             }
         })
-        .with_hook({
+        .with_background_hook({
             let rocksdb = provider_factory.rocksdb_provider();
-            move || throttle!(Duration::from_secs(5 * 60), || rocksdb.report_metrics())
+            move || rocksdb.report_metrics()
         })
         .build()
 }

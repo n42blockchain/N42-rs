@@ -684,6 +684,8 @@ reth-network-peers = { path = "crates/net/peers"}
 #reth-chain-state = { path = "crates/chain-state"}
 
 [patch.crates-io]
+# TestRng trait compatibility with proptest 1.11 / rand 0.10.
+proptest-arbitrary-interop = { path = "vendor/dependency-repairs/proptest-arbitrary-interop-0.1.0" }
 #alloy-genesis = { path = "./crates/n42/alloy-genesis" }
 alloy-rpc-types-engine = { path = "./crates/n42/alloy-rpc-types-engine" }
 alloy-rpc-types-beacon = { path = "./crates/n42/alloy-rpc-types-beacon" }

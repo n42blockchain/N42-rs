@@ -3736,3 +3736,18 @@ Stage aw (75bb4b9da: a profiled X11 leg on a `--profile profiling` binary with `
 | kernel, unresolved | 8% |
 
 Two findings change the plan. First, the av hint never reached the QMDB index: `OverlayStateProvider` has no `n42_prefetch_account`, so storage-api's default `false` stopped it, and each hint paid the same Box alloc and free as a read -- which is why the lookahead left `par_exec` flat. Second, before any prefetch there is ~17% of software to remove from the read path: implement `basic_account` and the hint directly on `MemoryOverlayStateProvider` without the per-call `as_ref()`, compute the keccak only on the non-QMDB branch, cache the hashed-state version per provider, and forward the hint through `OverlayStateProvider` to the reader. All three are unconditional (no result changes); stage ax measures them with X11 and X11+MLP16 alternating.
+
+### 10.121 loop351 stage ax — the read-path fixes lift the X11 controls from 355-358M to 368-375M by cutting the tails; the lookahead equals the new control and is dropped
+
+Stage ax (tree d1270d05a: 2e9387835 no Box per read in the memory overlay's delegate, 5b33e8d33 keccak only where a hashed table is read and the hashed-state version cached per provider, ce8aa472d the account hint forwarded through `OverlayStateProvider`; X11 at 30 ms, pool 27-28 GB):
+
+| leg | w1 | w2 | w3 | round | par_exec p50/p90/p99 | sealed_at p50/p90 | roots p50/p90 | state_ready p50 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X11 (stage av, before) | 4.15 | 3.91 | 3.77 | 355.0M | 16 / 23 / 61 | 33 / 59 | 32 / 65 | 152 |
+| X11b (stage av, before) | 4.11 | 3.86 | 3.96 | 357.8M | | | | |
+| X11c | 4.24 | 4.06 | 4.18 | 374.5M | 16 / 20 / 50 | 33 / 45 | 29 / 46 | 145 |
+| X11d | 4.22 | 3.99 | 4.07 | 368.2M | | | | |
+| X11MLP16b | 4.13 | 3.97 | 4.11 | 366.4M | 16 / 22 / 54 | 34 / 52 | 26 / 47 | 141 |
+| X11MLP16c | 4.14 | 4.11 | 4.12 | 371.2M | | | | |
+
+The execution's median stays at 16 ms -- the per-read software was not the median's cost -- but every tail is shorter (execution p90 23 -> 20, seal p90 59 -> 45, root p90 65 -> 46), the windows are flat and the controls read 368-375M where they read 355-358M on the previous tree: the fixes are kept, unconditional. With the hint now reaching the QMDB index, the lookahead (`N42_BUILD_MLP=16`) reads the same as the control (366-371M) and its 10.119 margin was the tail it smoothed; it stays off. Window 1 has sat at 4.1-4.29M since stage ao whatever was changed: the first window is the seal's 33 ms plus the four-block vote window's wait, and only the build's execution itself moves it now. Next is the warm read ahead of the build (`N42_PLAN_AHEAD_WARM`: the old `N42_BUILD_PREFETCH`'s full read of the block's accounts, which halved the execution but cost 35 ms on the build's path, done in the plan's 30 ms window on a background pool instead), stage ay.

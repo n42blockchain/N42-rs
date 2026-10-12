@@ -122,20 +122,23 @@ impl Work {
         })
     }
 
+    /// A plain account's info; `code` the lane's own empty bytecode, cloned
+    /// when the info carries `Some` empty code (a fresh `Bytecode::default()`
+    /// a read was most of a lane read's cost).
     #[inline]
-    fn make(balance: U256, nonce: u64, code: bool) -> AccountInfo {
-        AccountInfo { balance, nonce, code_hash: KECCAK_EMPTY, account_id: None, code: code.then(Bytecode::default) }
+    fn make(balance: U256, nonce: u64, code: Option<&Bytecode>) -> AccountInfo {
+        AccountInfo { balance, nonce, code_hash: KECCAK_EMPTY, account_id: None, code: code.cloned() }
     }
 
     /// The info as it stands.
     #[inline]
-    fn info(&self) -> Option<AccountInfo> {
-        (self.flags & CUR_SOME != 0).then(|| Self::make(self.balance, self.nonce, self.flags & CUR_CODE != 0))
+    fn info(&self, empty: &Bytecode) -> Option<AccountInfo> {
+        (self.flags & CUR_SOME != 0).then(|| Self::make(self.balance, self.nonce, (self.flags & CUR_CODE != 0).then_some(empty)))
     }
 
     /// The info as read.
-    fn original(&self) -> Option<AccountInfo> {
-        (self.flags & ORIG_SOME != 0).then(|| Self::make(self.orig_balance, self.orig_nonce, self.flags & ORIG_CODE != 0))
+    fn original(&self, empty: &Bytecode) -> Option<AccountInfo> {
+        (self.flags & ORIG_SOME != 0).then(|| Self::make(self.orig_balance, self.orig_nonce, (self.flags & ORIG_CODE != 0).then_some(empty)))
     }
 
     /// [`change`] on the lane's entry.
@@ -158,6 +161,8 @@ struct DenseLane {
     work: Vec<Work>,
     cur: Option<(Address, Address, u32, u32)>,
     hits: u64,
+    /// The lane's empty bytecode, cloned into the infos that carry one.
+    empty: Bytecode,
     /// Entries read into the lane, counted when the bundle is taken.
     loaded: u64,
 }
@@ -233,7 +238,7 @@ impl<G: Database> BatchState<G> {
     pub fn with_lane(inner: G, accounts: usize, plan: std::sync::Arc<crate::one_probe::Resolved>, batch: usize) -> Self {
         let mut state = Self::with_capacity(inner, accounts);
         if let Some(len) = plan.lanes.as_ref().and_then(|lanes| lanes.lane(batch)).map(<[Address]>::len) {
-            state.lane = Some(DenseLane { plan, batch, work: vec![Work::EMPTY; len], cur: None, hits: 0, loaded: 0 });
+            state.lane = Some(DenseLane { plan, batch, work: vec![Work::EMPTY; len], cur: None, hits: 0, empty: Bytecode::default(), loaded: 0 });
         }
         state
     }
@@ -342,7 +347,12 @@ impl<G: Database> BatchState<G> {
                 }
                 accounts.insert(
                     *address,
-                    BundleAccount { original_info: work.original(), info: work.info(), storage: Default::default(), status: work.status },
+                    BundleAccount {
+                        original_info: work.original(&lane.empty),
+                        info: work.info(&lane.empty),
+                        storage: Default::default(),
+                        status: work.status,
+                    },
                 );
             }
         }
@@ -424,7 +434,7 @@ impl<G: Database + crate::parallel_transfer::AccountHint> BatchState<G> {
                     && work.flags & SPILL == 0
                 {
                     // The balance, nonce and code hash are what is written.
-                    let info = (work.flags & CUR_SOME != 0).then(|| Work::make(work.balance, work.nonce, false));
+                    let info = (work.flags & CUR_SOME != 0).then(|| Work::make(work.balance, work.nonce, None));
                     self.inner.write_through(address, info.as_ref());
                     continue;
                 }
@@ -470,11 +480,11 @@ impl<G: Database> Database for BatchState<G> {
                         return Ok(info);
                     }
                 }
-                return Ok(work.info());
+                return Ok(work.info(&lane.empty));
             }
             if work.flags & SPILL == 0 {
                 lane.hits += 1;
-                return Ok(work.info());
+                return Ok(work.info(&lane.empty));
             }
         }
         let entry = match self.accounts.entry(address) {

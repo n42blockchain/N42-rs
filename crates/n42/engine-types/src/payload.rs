@@ -919,6 +919,10 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
         crate::parallel_transfer::partition_by_sender(&keys, beneficiary).ok().map(|groups| (beneficiary, groups))
     });
     let slots = crate::parallel_transfer::empty_slots(pool, cands.len());
+    // `N42_ONE_PROBE=1`: every account of the plan resolved to where its
+    // value lives before the block (`one_probe`), one rolling-table probe a
+    // distinct address, here on the plan-body pool.
+    let one_probe = crate::one_probe::resolve(pool, &keys);
     // `N42_PLAN_AHEAD_PARTS=1`: the body's frame layout and transactions
     // root, found here with the plan rather than at the seal.
     let root_ahead = (crate::frame_blocks::plan_ahead_parts() && crate::frame_blocks::active())
@@ -935,6 +939,7 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
         slots,
         made_us: at.elapsed().as_micros() as u64,
         root_ahead,
+        one_probe,
     })
 }
 

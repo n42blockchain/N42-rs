@@ -48,6 +48,7 @@ pub mod frame_scan;
 pub mod batch_state;
 pub mod parallel_transfer;
 pub mod warm_ahead;
+pub mod one_probe;
 pub mod output_shards;
 pub mod hotstuff_consensus;
 mod network;

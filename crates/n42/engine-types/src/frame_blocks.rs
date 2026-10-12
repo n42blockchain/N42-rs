@@ -247,6 +247,9 @@ pub struct PreparedBuild<T: reth_transaction_pool::PoolTransaction> {
     /// ([`root_ahead`]); the seal takes it when it seals exactly these
     /// hashes on that plan ([`seal_root_carried`]).
     pub root_ahead: Option<RootAhead>,
+    /// `N42_ONE_PROBE=1`: the plan's accounts resolved against the rolling
+    /// last-writer table ([`crate::one_probe::resolve`]).
+    pub one_probe: Option<std::sync::Arc<crate::one_probe::Resolved>>,
 }
 
 impl<T: reth_transaction_pool::PoolTransaction> std::fmt::Debug for PreparedBuild<T> {

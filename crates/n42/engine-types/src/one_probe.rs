@@ -35,18 +35,13 @@ use revm::{Database, primitives::KECCAK_EMPTY, state::AccountInfo};
 
 use crate::parallel_transfer::{WARM_SHARDS, warm_shard};
 
-/// The stage (`N42_ONE_PROBE=1|2|3`), 0 (unset) is off. Stage 1 is the one
+/// The stage (`N42_ONE_PROBE=1|2|3`), 0 (unset) is off. Stage 1 is
 /// the plan-time resolve and the dense reads, 2 adds the plan's batches and
-/// the dense batch state ([`Lanes`]), 3 runs as 2 until it exists. Read once.
+/// the dense batch state ([`Lanes`]), 3 adds the lane fold
+/// ([`Lanes::fold_into`]). Read once.
 pub fn stage() -> u8 {
     static N: OnceLock<u8> = OnceLock::new();
-    *N.get_or_init(|| {
-        let stage = std::env::var("N42_ONE_PROBE").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0).min(3);
-        if stage > 2 {
-            tracing::warn!(target: "payload_builder", stage, "N42_ONE_PROBE: stage 3 does not exist yet; running stage 2");
-        }
-        stage
-    })
+    *N.get_or_init(|| std::env::var("N42_ONE_PROBE").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0).min(3))
 }
 
 /// The kept depth in plans and built outputs (`N42_ONE_PROBE_DEPTH`, 16 by

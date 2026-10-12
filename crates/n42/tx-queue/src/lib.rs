@@ -990,6 +990,8 @@ struct BodySlot {
     body: Option<PreparedBody>,
     /// The hook's own time.
     made_us: u64,
+    /// Whether the hook has run (its body may still be `None`).
+    done: bool,
 }
 
 /// What a build found of its plan's prepared body
@@ -3895,6 +3897,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             let mut slot = slot.lock();
             slot.body = body;
             slot.made_us = made_us;
+            slot.done = true;
         }
     }
 
@@ -5393,6 +5396,26 @@ impl<T: PoolTransaction> QueueBest<T> {
         match slot.body.take() {
             Some(body) => PreparedBodyTake::Ready(body, slot.made_us),
             None => PreparedBodyTake::Late,
+        }
+    }
+
+    /// [`Self::take_prepared_body`], waiting up to `max` for a hook still
+    /// running instead of answering [`PreparedBodyTake::Late`] at once, and
+    /// how long it waited (us). [`PreparedBodyTake::Late`] when the hook
+    /// ran without a body or did not finish within `max`.
+    pub fn take_prepared_body_within(&mut self, max: std::time::Duration) -> (PreparedBodyTake, u64) {
+        let Some(slot) = self.prepared_body.take() else { return (PreparedBodyTake::None, 0) };
+        let at = std::time::Instant::now();
+        loop {
+            let mut guard = slot.lock();
+            if let Some(body) = guard.body.take() {
+                return (PreparedBodyTake::Ready(body, guard.made_us), at.elapsed().as_micros() as u64);
+            }
+            if guard.done || at.elapsed() >= max {
+                return (PreparedBodyTake::Late, at.elapsed().as_micros() as u64);
+            }
+            drop(guard);
+            std::thread::sleep(std::time::Duration::from_micros(50));
         }
     }
 

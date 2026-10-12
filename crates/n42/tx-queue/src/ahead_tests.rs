@@ -426,6 +426,53 @@ fn a_prepared_body_is_the_take_of_the_build_on_its_plan() {
     }
 }
 
+/// A body the hook is still making when the build takes its plan: the plain
+/// take answers `Late`, the bounded take waits for it and hands it over, and
+/// a bound shorter than the hook still answers `Late`.
+#[test]
+fn a_late_body_is_waited_for_within_the_bound() {
+    let gas = 60 * 21_000;
+    for (wait, ready) in [(None, false), (Some(std::time::Duration::from_secs(5)), true), (Some(std::time::Duration::from_millis(1)), false)] {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let started_tx = std::sync::Mutex::new(started_tx);
+        let inner = pairs_hook();
+        queue.set_plan_ahead_hook(Arc::new(move |segments: &[(FrameTxs<EthPooledTransaction>, usize)], plan: &FramePlan| {
+            let _ = started_tx.lock().map(|tx| tx.send(()));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            inner(segments, plan)
+        }));
+        fill(&queue, 40, 12, 5, 0);
+        let (mut best, _, _) = queue.frames_for_build_ahead(block_hash(0), gas, SelectMode::Parallel, false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| queue.prepare_next_in(gas, SelectMode::Parallel));
+            started_rx.recv().expect("the hook starts");
+            let txs: Vec<Tx> = best.by_ref().collect();
+            drop(best);
+            seal(&queue, block_hash(0), 1, block_hash(1), &txs);
+            let (mut best, plan, times) = queue.frames_for_build_ahead(block_hash(1), gas, SelectMode::Parallel, false);
+            assert_eq!(times.ahead, 1, "{times:?}");
+            let (body, waited_us) = match wait {
+                None => (best.take_prepared_body(), 0),
+                Some(max) => best.take_prepared_body_within(max),
+            };
+            let txs: Vec<Tx> = best.by_ref().collect();
+            drop(best);
+            assert_eq!(plan.tx_count(), txs.len());
+            match body {
+                PreparedBodyTake::Ready(body, _) => {
+                    assert!(ready, "{wait:?}");
+                    assert!(waited_us > 0);
+                    let made = body.downcast::<Vec<(Address, u64)>>().expect("the hook's type");
+                    assert_eq!(*made, pairs(&txs));
+                }
+                PreparedBodyTake::Late => assert!(!ready, "{wait:?}"),
+                PreparedBodyTake::None => panic!("the build stands on the prepared plan"),
+            }
+        });
+    }
+}
+
 /// The O(1) hand-off of a whole take (`N42_PLAN_AHEAD_BODY=1`): on a build
 /// whose block is its take it forgets exactly what the position-by-position
 /// hand-off forgets, and marks the take handed so the next prepared plan is

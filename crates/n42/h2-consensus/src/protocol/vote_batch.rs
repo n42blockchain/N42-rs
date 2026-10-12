@@ -24,7 +24,9 @@
 //! * Round 1 votes that arrive after the PrepareQC, or after their view, are
 //!   parked unverified: the protocol does not need them and the voters
 //!   ledger only needs some of them, at proposal time
-//!   ([`ConsensusEngine::settle_voters_seen`]);
+//!   ([`ConsensusEngine::settle_voters_seen`]); each voter has two parked
+//!   slots per view, and further arrivals are checked individually so
+//!   forged signatures cannot crowd out a genuine later vote;
 //! * Round 2 votes after the CommitQC are dropped on the view mismatch, as
 //!   today, unverified.
 //!
@@ -101,6 +103,9 @@ impl ConsensusEngine {
                 if !self.is_current_leader() {
                     return None;
                 }
+                if self.validator_set_for_view(view).get_public_key(vote.voter).is_err() {
+                    return None;
+                }
                 let for_collector = self
                     .vote_collector
                     .as_ref()
@@ -125,6 +130,9 @@ impl ConsensusEngine {
                     return Some(ConsensusMessage::CommitVote(cv));
                 }
                 if !self.is_current_leader() {
+                    return None;
+                }
+                if self.validator_set_for_view(view).get_public_key(cv.voter).is_err() {
                     return None;
                 }
                 if self
@@ -170,7 +178,7 @@ impl ConsensusEngine {
         let leader = self.is_current_leader();
 
         // Group by signed message, in arrival order, dropping exact repeats.
-        let mut seen: HashSet<(bool, u32, [u8; 96])> = HashSet::new();
+        let mut seen: HashSet<(bool, u32, B256, [u8; 96])> = HashSet::new();
         let mut r1: Vec<(B256, Vec<Vote>)> = Vec::new();
         let mut r2: Vec<(B256, Vec<CommitVote>)> = Vec::new();
         for message in queued {
@@ -184,7 +192,7 @@ impl ConsensusEngine {
                         }
                         continue;
                     }
-                    if !leader || !seen.insert((false, vote.voter, vote.signature.to_bytes())) {
+                    if !leader || !seen.insert((false, vote.voter, vote.block_hash, vote.signature.to_bytes())) {
                         continue;
                     }
                     match r1.iter_mut().find(|(hash, _)| *hash == vote.block_hash) {
@@ -196,7 +204,7 @@ impl ConsensusEngine {
                     // A Round 2 vote of a past view is dropped, as today.
                     if cv.view != view
                         || !leader
-                        || !seen.insert((true, cv.voter, cv.signature.to_bytes()))
+                        || !seen.insert((true, cv.voter, cv.block_hash, cv.signature.to_bytes()))
                     {
                         continue;
                     }
@@ -355,6 +363,9 @@ impl ConsensusEngine {
         {
             return;
         }
+        if self.validator_set_for_view(vote.view).get_public_key(vote.voter).is_err() {
+            return;
+        }
         if self
             .voters_seen
             .get(&vote.view)
@@ -362,13 +373,22 @@ impl ConsensusEngine {
         {
             return;
         }
-        let cap = PARKED_PER_VALIDATOR.saturating_mul(self.validator_count() as usize);
         let parked = self.parked_votes.entry(vote.view).or_default();
-        if parked.len() >= cap
-            || parked
-                .iter()
-                .any(|p| p.vote.voter == vote.voter && p.vote.signature == vote.signature)
-        {
+        if parked.iter().any(|p| {
+            p.vote.voter == vote.voter && p.vote.block_hash == vote.block_hash && p.vote.signature == vote.signature
+        }) {
+            return;
+        }
+        // The limit is per voter, not just per view. Forged signatures for
+        // one voter must not occupy every other voter's slot. At that
+        // voter's limit verify arrivals immediately, so even two forgeries
+        // cannot keep a genuine later vote out of the progress ledger.
+        if parked.iter().filter(|p| p.vote.voter == vote.voter).count() >= PARKED_PER_VALIDATOR {
+            if vote.view < current {
+                self.note_late_vote(&vote);
+            } else if let Err(err) = self.process_vote(vote) {
+                tracing::debug!(target: "n42::cl::voting", %err, "parked vote overflow refused");
+            }
             return;
         }
         parked.push(ParkedVote { vote, in_view });

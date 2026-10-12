@@ -3761,3 +3761,19 @@ The execution's median stays at 16 ms -- the per-read software was not the media
 ### 10.123 loop351 stage ay — the warm read ahead of the build was empty (about 350 accounts a block, complete on 4% of builds) and its legs equal the controls
 
 Stage ay (tree f4391de3e, X11 at 30 ms, pool 27-28 GB): X11e 4.15 / 3.95 / 3.67 (353.2M), W8 4.20 / 4.02 / 4.10 (369.6M), W16 4.19 / 4.03 / 4.15 (371.0M), W8b disturbed (3.26 / 2.48 / 2.39, the held-block loss again), W16b 4.16 / 3.95 / 4.07 (365.6M), X11f 4.10 / 4.14 / 3.93 (365.2M). The phases line says why nothing moved: `warm_ahead_accounts` p50 0 and p90 350-383 instead of ~200k, `warm_ahead_ready=true` on 80 of 1,918 builds, `par_exec` 15-16 ms as before. 10.122's note (e1887cb45) gives the cause and 05f5b61af the fix: the read spread the flood's recipients over its shards wrongly and followed the plan's body instead of the take, so nearly every account was left out or the map was made for a plan the build did not take. Stage az repeats W16 on the fix with 24 threads added.
+
+### 10.124 loop351 stage az — the warm read ahead, fixed, covers ~178k accounts and cuts the execution to 13-14 ms when it completes; it completes on 30% of builds and costs the layer more than it saves
+
+Stage az (tree d0609f990, X11 at 30 ms, pool 28 GB; the warm read fixed in 05f5b61af):
+
+| leg | w1 | w2 | w3 | round | warm accounts p50 / p90 | warm ms p50 | ready | par_exec p50/p90 | sealed_at p50/p90 | state_ready p50/p90 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X11g, control | 4.15 | 4.12 | 4.13 | 372.0M | -- | -- | -- | 15 / 20 | 32 / 45 | 149 / 176 |
+| X11W16c | 4.12 | 3.77 | 3.40 | 338.8M | 44,542 / 177,899 | 33 | 29% | 13 / 21 | 35 / 62 | 160 / 223 |
+| X11W16d | 4.04 | 3.72 | 3.51 | 338.2M | | | | | | |
+| X11W24 | 4.18 | 3.95 | 4.15 | 368.7M | 0 / 177,880 | 32 | 30% | 14 / 21 | 34 / 47 | 153 / 180 |
+| X11h, control | 4.22 | 4.01 | 4.09 | 369.6M | | | | | | |
+
+The read now does what it was meant to: when it runs it reads ~178k accounts (the plan's recipients and the senders block N does not touch) and the batches hit them (185k hits), and the execution's median drops to 13-14 ms from 15. But the read takes 32-33 ms on 16 or 24 threads -- the whole window between the plan and the build -- so it is complete for 29-30% of builds only, and its threads are 16-24 more walkers of the same dependent-miss chain on the same memory system beside the build, the root and the merge: with 16 threads the seal's p90 goes 45 -> 62 and state ready 176 -> 223 and the round loses 9%; with 24 threads the read finishes a little more often and the leg equals the control. Moving the read earlier does not make it cheaper; the memory work is the same, and the layer is bound by that work wherever it runs (10.117). The switch stays off.
+
+What stages at-az establish together: the build's 15-16 ms execution is dependent cache misses on hash-table probes (the batch map, the in-flight overlay maps, the shard layer, the QMDB index), and no rearrangement of when or where those probes happen (lookahead hints, the per-read software cuts, idle siblings, the warm read ahead) moves the median; the per-read software cuts and the core layout moved the tails and are kept. Window 1 is 4.1-4.29M and the round 365-381M on this host, with the frame index, the vote window and the seal where 10.111-10.114 put them. Going further means fewer or cheaper probes per transfer: a state layout where a transfer's two accounts are reached in one probe (a per-block dense index assigned with the plan, the in-flight outputs stored as arrays indexed by it rather than hash maps), which is structural work on the build, the shards and the overlay, not a switch.

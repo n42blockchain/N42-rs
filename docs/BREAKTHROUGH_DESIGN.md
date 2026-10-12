@@ -3799,3 +3799,21 @@ Stage ba (branch feat/one-probe-state, tree 2ff000c72, X11 at 30 ms, pool 27-28 
 | X11j, control | 4.26 | 4.13 | 4.01 | 372.0M | | | | | | | | |
 
 The plan-time resolve runs (186k addresses a block, 9-13 ms on the plan-body pool) and the lanes carry every batch (199.6k lane hits a block), but the resolved references are almost never used: the verified prefix is 0 at p50 and 1-2 at p90, so the reads fall through to today's chain (124k-200k fallbacks a block), the execution's median stays at 15-16 ms, and the extra work (the resolve, the write-through, the fold parts, stage 4's freeze materialisation) costs 1-4 ms of seal (33 -> 34-37) and 1-2 ms of fold, which is the 5% the legs lose on window 1 (4.0-4.1 against 4.26-4.27). Nothing in these legs measures what the design is for; the condition under which a block enters the ring of built outputs (sealed at the end of its execution from its whole take, the plan's length, no mismatch, the builder-hash chain from `parent_built`) does not hold on the fleet's seal-first path and has to be found and fixed before the stages are judged.
+
+### 10.127 loop351 stage bb — with the body waited for, the one-probe reads apply (prefix 16, 145-153k hits a block) and the execution's path to the seal drops from 24 to 17 ms (stage 1) and 13 ms (stage 4); the seal does not move yet because the gain is spent before the parallel step and, for stage 4, in the freeze; a wider plan-body pool alone reads the window-1 record
+
+Stage bb (branch feat/one-probe-state, tree bab22e599: the build waits up to 40 ms for a late prepared body when `N42_ONE_PROBE` is on, 71374b5bf / bd87dac99; X11 at 30 ms, pool 27-28 GB):
+
+| leg | w1 | w2 | w3 | round | prefix p50 | hits / fallbacks p50 | par_exec p50/p90 | par_to_seal p50 | sealed_at p50/p90 | roots p90 | body wait p90 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X11k, control | 4.13 | 4.17 | 3.95 | 367.6M | | | 16 / 21 | 23.9 | 32 / 48 | 47 | |
+| X11T16 (`N42_PLAN_AHEAD_BODY_THREADS=16`) | 4.33 | 4.24 | 4.04 | 378.2M | | | 16 / 20 | | 31 / 45 | | |
+| X11OP1W (stage 1, wait 40) | 4.27 | 4.23 | 4.08 | 377.4M | 16 | 145k / 55k | 14 / 18 | 17.2 | 32 / 53 | 48 | 26.8 ms |
+| X11OP4W (stage 4, wait 40) | 3.99 | 3.85 | 3.89 | 351.8M | 16 | 153k / 47k | 10 / 22 | 12.8 | 38 / 65 | 64 | 8.9 ms |
+| X11OP4WT16 (stage 4, wait, 16 threads) | 2.81 | 2.46 | 2.19 | 223.9M | | | | | | | disturbed (40 held-block losses) |
+| X11OP4T16 (stage 4, no wait, 16 threads) | 4.13 | 4.17 | 3.82 | 363.6M | 2 | 32k / 139k | 14 / 22 | | 37 / 54 | | |
+| X11l, control | 4.18 | 4.18 | 4.09 | 373.6M | | | | | | | |
+
+With the body waited for, every full block is recorded (`one_probe_ring_reject` empty on all of them) and the prefix reaches the depth of 16: the resolved reads answer 145-153k of a block's reads and the parallel step's path to the seal shortens from 23.9 ms to 17.2 (stage 1) and 12.8 (stage 4) -- the first time anything has moved the execution since stage ao. The seal does not move because the time before the parallel step grows from ~6 ms to ~13 (stage 1) and ~23 (stage 4): the wait for the late body (p90 27 ms with 8 plan-body threads: the resolve's 10-12 ms are on the hook's path, so the body that used to arrive in 18-21 ms now takes ~30, against 30 ms pacing) and the view and lane hand-over; and stage 4's freeze materialisation (+10 ms on the behind pool) delays the parent's root (p90 47 -> 64) so the next build waits for the grandparent's fields (p90 14 ms). Without the wait and with 16 plan-body threads the body is late on 17% of blocks and the prefix falls to 2 at p50. The control with 16 plan-body threads alone reads the window-1 record (4.327M) and 378.2M: the plan's body arriving earlier is worth 3% by itself and goes into the set.
+
+Next: publish the body first and attach the resolve when it completes (no wait on the build's path), keep the stage-4 materialisation off the root's path, and account the pre-parallel part on the phases line; then stage bc on the T16 set.

@@ -19,6 +19,36 @@ const N: usize = 21;
 const LEADER: u32 = 1;
 const VIEW: u64 = 1;
 
+#[test]
+fn a_copied_signature_on_a_wrong_hash_cannot_shadow_a_real_vote() {
+    let sks = keys();
+    let block_hash = B256::repeat_byte(0xAA);
+    let (mut leader, mut rx) = leader_ready(&sks, true, block_hash);
+    let voters: Vec<_> = others().take(14).collect();
+    for voter in &voters {
+        let real = vote(&sks, *voter, block_hash);
+        let mut tampered = real.clone();
+        if let ConsensusMessage::Vote(vote) = &mut tampered {
+            vote.block_hash = B256::repeat_byte(0xBB);
+        }
+        feed(&mut leader, tampered);
+        feed(&mut leader, real);
+    }
+    leader.flush_votes().expect("prepare votes");
+    assert_eq!(broadcast_bytes(&mut rx).len(), 1, "the genuine votes form a PrepareQC");
+    for voter in voters {
+        let real = commit_vote(&sks, voter, block_hash);
+        let mut tampered = real.clone();
+        if let ConsensusMessage::CommitVote(vote) = &mut tampered {
+            vote.block_hash = B256::repeat_byte(0xBB);
+        }
+        feed(&mut leader, tampered);
+        feed(&mut leader, real);
+    }
+    leader.flush_votes().expect("commit votes");
+    assert_eq!(leader.current_view(), VIEW + 1);
+}
+
 fn keys() -> Vec<BlsSecretKey> {
     (0..N)
         .map(|i| BlsSecretKey::key_gen(&[0x40 + i as u8; 32]).expect("test key"))
@@ -249,7 +279,12 @@ fn late_progress_votes_settle_under_their_own_message() {
         voter: late,
         signature: sks[late as usize].sign(&progress),
     });
-    assert!(leader.queue_vote(message).is_none(), "parked, not processed");
+    let mut tampered = message.clone();
+    if let ConsensusMessage::Vote(vote) = &mut tampered {
+        vote.block_hash = B256::repeat_byte(0xBB);
+    }
+    assert!(leader.queue_vote(tampered).is_none());
+    assert!(leader.queue_vote(message).is_none(), "a copied signature with another hash cannot shadow it");
     assert_eq!(leader.voter_last_seen(late), None);
     leader.settle_voters_seen(VIEW, None);
     assert_eq!(leader.voter_last_seen(late), Some(VIEW));
@@ -278,4 +313,103 @@ fn followers_duplicates_and_the_switch() {
 
     let (mut off, _rx) = leader_ready(&sks, false, block_hash);
     assert!(off.queue_vote(vote(&sks, 2, block_hash)).is_some(), "off: handed back");
+}
+
+#[test]
+fn unknown_voters_cannot_fill_the_batch_or_starve_the_progress_ledger() {
+    let sks = keys();
+    let block_hash = B256::repeat_byte(0xA7);
+    let (mut leader, _rx) = leader_ready(&sks, true, block_hash);
+    for voter in N as u32..(N * 5) as u32 {
+        let mut unknown = match vote(&sks, 2, block_hash) {
+            ConsensusMessage::Vote(vote) => vote,
+            _ => unreachable!(),
+        };
+        unknown.voter = voter;
+        feed(&mut leader, ConsensusMessage::Vote(unknown));
+        let mut unknown_commit = match commit_vote(&sks, 2, block_hash) {
+            ConsensusMessage::CommitVote(vote) => vote,
+            _ => unreachable!(),
+        };
+        unknown_commit.voter = voter;
+        feed(&mut leader, ConsensusMessage::CommitVote(unknown_commit));
+    }
+    assert_eq!(leader.queued_votes(), 0, "unknown indices consume no batch slots");
+    let voters: Vec<_> = others().collect();
+    for voter in &voters[..14] {
+        feed(&mut leader, vote(&sks, *voter, block_hash));
+    }
+    leader.flush_votes().expect("prepare quorum");
+    let late = *voters.last().expect("late voter");
+    for voter in N as u32..(N * 4) as u32 {
+        feed(&mut leader, ConsensusMessage::Vote(Vote {
+            view: VIEW,
+            block_hash,
+            voter,
+            signature: sks[2].sign(b"unknown voter"),
+        }));
+    }
+    feed(&mut leader, vote(&sks, late, block_hash));
+    leader.settle_voters_seen(VIEW, None);
+    assert_eq!(leader.voter_last_seen(late), Some(VIEW));
+}
+
+#[test]
+fn forged_parked_votes_cannot_starve_a_real_voters_progress() {
+    let sks = keys();
+    let block_hash = B256::repeat_byte(0xA8);
+    let (mut leader, _rx) = leader_ready(&sks, true, block_hash);
+    let voters: Vec<_> = others().collect();
+    for voter in &voters[..14] {
+        feed(&mut leader, vote(&sks, *voter, block_hash));
+    }
+    leader.flush_votes().expect("prepare quorum");
+    let late = *voters.last().expect("late voter");
+    for n in 0..N * 3 {
+        feed(&mut leader, ConsensusMessage::Vote(Vote {
+            view: VIEW,
+            block_hash,
+            voter: late,
+            signature: sks[2].sign(&n.to_le_bytes()),
+        }));
+    }
+    feed(&mut leader, vote(&sks, late, block_hash));
+    leader.settle_voters_seen(VIEW, None);
+    assert_eq!(leader.voter_last_seen(late), Some(VIEW));
+    assert!(leader.parked_votes.values().all(|votes| votes.len() <= N * 2));
+}
+
+#[test]
+fn forged_late_votes_cannot_block_a_genuine_progress_vote() {
+    let sks = keys();
+    let block_hash = B256::repeat_byte(0xA9);
+    let (mut leader, _rx) = leader_ready(&sks, true, block_hash);
+    let voters: Vec<_> = others().collect();
+    for voter in &voters[..14] {
+        feed(&mut leader, vote(&sks, *voter, block_hash));
+    }
+    leader.flush_votes().expect("prepare quorum");
+    for voter in &voters[..14] {
+        feed(&mut leader, commit_vote(&sks, *voter, block_hash));
+    }
+    leader.flush_votes().expect("commit quorum");
+    assert_eq!(leader.current_view(), VIEW + 1);
+    let late = *voters.last().expect("late voter");
+    for n in 0..N * 3 {
+        feed(&mut leader, ConsensusMessage::Vote(Vote {
+            view: VIEW,
+            block_hash,
+            voter: late,
+            signature: sks[2].sign(&n.to_le_bytes()),
+        }));
+    }
+    let progress = leader.signing_profile.progress_vote_message(VIEW, block_hash);
+    feed(&mut leader, ConsensusMessage::Vote(Vote {
+        view: VIEW,
+        block_hash,
+        voter: late,
+        signature: sks[late as usize].sign(&progress),
+    }));
+    leader.settle_voters_seen(VIEW, None);
+    assert_eq!(leader.voter_last_seen(late), Some(VIEW));
 }

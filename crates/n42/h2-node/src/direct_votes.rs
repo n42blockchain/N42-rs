@@ -15,7 +15,7 @@
 //! `gossip` or `both`.
 //!
 //! A leader may receive one vote by both paths. Duplicates are dropped before
-//! the engine, keyed by (round, view, voter, signature): a real vote's two
+//! the engine, keyed by (round, view, voter, block hash, signature): a real vote's two
 //! copies are the same bytes, and a forged vote for the same (view, voter)
 //! cannot shadow the real one because its signature differs.
 
@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use n42_h2_net::PeerId;
 use n42_h2_primitives::consensus::ConsensusMessage;
+use alloy_primitives::B256;
 
 /// How votes travel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -50,7 +51,7 @@ impl VoteTransport {
 /// Votes remembered for de-duplication.
 const DEDUPE_CAPACITY: usize = 8192;
 
-type VoteKey = (bool, u64, u32, [u8; 96]);
+type VoteKey = (bool, u64, u32, B256, [u8; 96]);
 
 /// The direct vote path's state on one node.
 #[derive(Debug, Default)]
@@ -120,8 +121,8 @@ impl DirectVotes {
             return true;
         }
         let key = match message {
-            ConsensusMessage::Vote(v) => (false, v.view, v.voter, v.signature.to_bytes()),
-            ConsensusMessage::CommitVote(v) => (true, v.view, v.voter, v.signature.to_bytes()),
+            ConsensusMessage::Vote(v) => (false, v.view, v.voter, v.block_hash, v.signature.to_bytes()),
+            ConsensusMessage::CommitVote(v) => (true, v.view, v.voter, v.block_hash, v.signature.to_bytes()),
             _ => return true,
         };
         if !self.seen.insert(key) {
@@ -189,5 +190,19 @@ mod tests {
         assert_eq!(direct.peer_of(1), Some(peer));
         direct.forget_peer(&peer);
         assert_eq!(direct.peer_of(1), None);
+    }
+
+    #[test]
+    fn a_copied_signature_on_a_different_hash_is_not_a_duplicate() {
+        let key = BlsSecretKey::random().expect("key");
+        let mut direct = DirectVotes::new(VoteTransport::Both);
+        let real = vote(5, 3, &key);
+        let mut tampered = real.clone();
+        if let ConsensusMessage::Vote(vote) = &mut tampered {
+            vote.block_hash = B256::repeat_byte(2);
+        }
+        assert!(direct.admit(&tampered));
+        assert!(direct.admit(&real), "a changed unsigned hash must not shadow the real signed vote");
+        assert!(!direct.admit(&real), "an actual duplicate still drops");
     }
 }

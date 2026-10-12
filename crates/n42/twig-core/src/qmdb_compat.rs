@@ -1047,6 +1047,7 @@ fn leaf_hashes<O: LeafOps + ?Sized>(operations: &O, out: &mut Vec<Option<Hash>>)
 #[derive(Debug, Clone, Default)]
 pub struct LeafHashes {
     hashes: Vec<Option<Hash>>,
+    identity: Option<std::sync::Arc<()>>,
 }
 
 impl LeafHashes {
@@ -1058,7 +1059,7 @@ impl LeafHashes {
         if operations.is_sorted() {
             leaf_hashes(operations, &mut hashes);
         }
-        Self { hashes }
+        Self { hashes, identity: Some(std::sync::Arc::clone(operations.identity())) }
     }
 
     /// How many operations the hashes cover.
@@ -1071,20 +1072,12 @@ impl LeafHashes {
         self.hashes.is_empty()
     }
 
-    /// Whether these are `operations`' hashes: one per operation, a hash
-    /// exactly where an operation writes a value, and the first, middle and
-    /// last written leaves equal to a fresh hash.
-    fn belongs_to<O: LeafOps + ?Sized>(&self, operations: &O) -> bool {
-        let count = operations.op_count();
-        if self.hashes.len() != count {
-            return false;
-        }
-        let probe = |i: usize| match (operations.op_value(i), self.hashes[i]) {
-            (Some(value), Some(hash)) => hash_leaf(operations.op_key(i), value) == hash,
-            (None, None) => true,
-            _ => false,
-        };
-        count == 0 || (probe(0) && probe(count / 2) && probe(count - 1))
+    /// Whether these hashes belong to this exact immutable version of the
+    /// operations. The retained identity cannot be reused after a change
+    /// or after the original operations are dropped.
+    fn belongs_to(&self, operations: &QmdbOps) -> bool {
+        self.hashes.len() == operations.len()
+            && self.identity.as_ref().is_some_and(|id| std::sync::Arc::ptr_eq(id, operations.identity()))
     }
 }
 
@@ -2069,7 +2062,7 @@ impl QmdbCompatTree {
     /// [`Self::apply_ops_recorded_phased`] with the operations' leaf hashes
     /// computed ahead ([`LeafHashes::of`], off whatever lock the caller holds
     /// the tree under). Hashes that do not belong to `operations` -- another
-    /// length, or a spot-checked leaf that differs -- are ignored and the
+    /// immutable operation set -- are ignored and the
     /// leaves hashed here, as without them; the root is the same either way.
     pub fn apply_ops_recorded_phased_with(
         &mut self,
@@ -3079,6 +3072,44 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&dir);
             }
         }
+    }
+
+    #[test]
+    fn precomputed_leaves_reject_an_unprobed_interior_change() {
+        let make = |changed: bool| {
+            let mut ops = QmdbOps::new();
+            for i in 0..7u8 {
+                ops.push([i; 32], Some(&[if changed && i == 1 { 99 } else { i }]));
+            }
+            ops.sort();
+            ops
+        };
+        let original = make(false);
+        let leaves = LeafHashes::of(&original);
+        assert!(leaves.belongs_to(&original.clone()), "an unchanged clone keeps its identity");
+        let moved = original;
+        assert!(leaves.belongs_to(&moved), "moves preserve the cache");
+        let mut changed_clone = moved.clone();
+        changed_clone.push([9; 32], Some(&[9]));
+        assert!(!leaves.belongs_to(&changed_clone));
+        let mut resorted = moved.clone();
+        resorted.sort();
+        assert!(!leaves.belongs_to(&resorted));
+        let merged = moved.clone().merge_sorted(make(true), &[]);
+        assert!(!leaves.belongs_to(&merged));
+        let concatenated = QmdbOps::concat(vec![moved.clone()]);
+        assert!(!leaves.belongs_to(&concatenated));
+        let mut rewritten = moved.clone();
+        rewritten.push_with([8; 32], |values| values[1] = 99);
+        assert!(!leaves.belongs_to(&rewritten));
+        assert!(leaves.belongs_to(&moved), "mutating clones leaves the source intact");
+        let changed = make(true);
+        let mut expected = QmdbCompatTree::new();
+        let mut actual = QmdbCompatTree::new();
+        let (root, _, _) = expected.apply_ops_recorded_phased(&changed).unwrap();
+        let (got, _, _) = actual.apply_ops_recorded_phased_with(&changed, Some(&leaves)).unwrap();
+        assert_eq!(got, root, "foreign hashes must never change the state root");
+        assert_eq!(actual.snapshot(), expected.snapshot());
     }
 
     /// `N42_QMDB_PARALLEL_WRITES`: the parallel structural writes leave the

@@ -14,6 +14,7 @@
 
 use crate::qmdb_compat::QmdbOperation;
 use crate::Hash;
+use std::sync::{Arc, OnceLock};
 
 /// The span `len` of a deletion (`value: None`).
 const DELETE: usize = usize::MAX;
@@ -39,17 +40,25 @@ pub struct QmdbOps {
     /// [`Self::is_sorted`] answer without a pass over the keys (the root's
     /// path asked twice a block, ~190,000 32-byte compares each).
     sorted: bool,
+    /// Identity of this immutable version, allocated only when hashes are
+    /// cached. Clones share it until either copy is changed.
+    identity: OnceLock<Arc<()>>,
 }
 
 impl QmdbOps {
     /// No operations.
     pub const fn new() -> Self {
-        Self { ops: Vec::new(), values: Vec::new(), sorted: false }
+        Self { ops: Vec::new(), values: Vec::new(), sorted: false, identity: OnceLock::new() }
     }
 
     /// Room for `ops` operations whose values total `value_bytes`.
     pub fn with_capacity(ops: usize, value_bytes: usize) -> Self {
-        Self { ops: Vec::with_capacity(ops), values: Vec::with_capacity(value_bytes), sorted: false }
+        Self { ops: Vec::with_capacity(ops), values: Vec::with_capacity(value_bytes), sorted: false, identity: OnceLock::new() }
+    }
+
+    /// The retained identity of this immutable version for leaf-hash caches.
+    pub(crate) fn identity(&self) -> &Arc<()> {
+        self.identity.get_or_init(|| Arc::new(()))
     }
 
     /// How many operations.
@@ -72,6 +81,7 @@ impl QmdbOps {
         match value {
             Some(value) => self.push_with(key, |out| out.extend_from_slice(value)),
             None => {
+                self.identity.take();
                 self.sorted = false;
                 self.ops.push(OpSpan { key, start: self.values.len(), len: DELETE });
             }
@@ -81,6 +91,7 @@ impl QmdbOps {
     /// Appends a write whose value `write` appends to the buffer it is given
     /// (the arena itself: no allocation for the value).
     pub fn push_with(&mut self, key: Hash, write: impl FnOnce(&mut Vec<u8>)) {
+        self.identity.take();
         let start = self.values.len();
         write(&mut self.values);
         // A closure can only grow the buffer; saturating keeps a misbehaving
@@ -121,6 +132,7 @@ impl QmdbOps {
     /// Sorts the operations by key. Only the spans move; the values stay
     /// where they were written.
     pub fn sort(&mut self) {
+        self.identity.take();
         #[cfg(feature = "rayon")]
         {
             use rayon::prelude::*;
@@ -154,6 +166,7 @@ impl QmdbOps {
     /// operations of both, less the dropped ones, in the order [`Self::sort`]
     /// gives them.
     pub fn merge_sorted(mut self, other: Self, dropped: &[Hash]) -> Self {
+        self.identity.take();
         let both_sorted = self.is_sorted() && other.is_sorted();
         let base = self.values.len();
         self.values.extend_from_slice(&other.values);

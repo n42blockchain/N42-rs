@@ -262,6 +262,15 @@ fn same_message_with_fallback_suite(
     if signatures.is_empty() {
         return SameMessageOutcome::default();
     }
+    // A size refusal is not a failed cryptographic check. Do not turn it
+    // into an unbounded sequence of individual pairing checks.
+    if signatures.len() > MAX_BATCH_SIZE {
+        return SameMessageOutcome {
+            bad: (0..signatures.len()).collect(),
+            fell_back: false,
+            checks: 0,
+        };
+    }
     if same_message_batch_with_suite(message, signatures, public_keys, suite).is_ok() {
         return SameMessageOutcome {
             bad: Vec::new(),
@@ -410,6 +419,24 @@ mod tests {
 
     fn test_key(seed: u8) -> BlsSecretKey {
         BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
+    #[test]
+    fn oversized_same_message_fallback_refuses_without_pairing_checks() {
+        let message = b"oversized batch";
+        let (pks, sigs) = same_message_set(1, message);
+        let pk_refs = vec![&pks[0]; MAX_BATCH_SIZE + 1];
+        for sig in [sigs[0].clone(), BlsSecretKey::key_gen(&[42; 32]).unwrap().sign_h2_v4(message)] {
+            let sig_refs = vec![&sig; MAX_BATCH_SIZE + 1];
+            for outcome in [
+                verify_same_message_with_fallback(message, &sig_refs, &pk_refs),
+                verify_same_message_h2_v4_with_fallback(message, &sig_refs, &pk_refs),
+            ] {
+                assert_eq!(outcome.bad, (0..MAX_BATCH_SIZE + 1).collect::<Vec<_>>());
+                assert_eq!(outcome.checks, 0);
+                assert!(!outcome.fell_back);
+            }
+        }
     }
 
     fn same_message_set(n: u8, msg: &[u8]) -> (Vec<BlsPublicKey>, Vec<BlsSignature>) {

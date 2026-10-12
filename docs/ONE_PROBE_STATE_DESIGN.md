@@ -637,3 +637,58 @@ output shards' freeze, one task a shard.
   sizes and contracts, `late_reverts`, the beneficiary's credit and the QMDB operations over the view
   equal the plain bundles frozen as maps; reads equal the grafted bundle); `bench_node_batch_state` checks
   stage 4's frozen state and reverts equal stage 3's.
+
+## 14. Stage bb and the body-first resolve
+
+Stage bb (BREAKTHROUGH_DESIGN 10.127) made the resolved reads apply (prefix 16, 145-153k hits a block) and
+cut the parallel step's path to the seal from 23.9 ms to 17.2 (stage 1) and 12.8 (stage 4), but the seal
+did not move: the time before the parallel scope grew from ~6 ms to ~13 (stage 1) and ~23 (stage 4).
+
+- **Where it went, from the code.** Every one-probe step before the scope is small on the build's own
+  thread: `view_for` is one ring lock and a bitmap over the prefix blocks' extra accounts, and the lanes
+  are handed to the call as an `Arc`. The growth was in the selection. The resolve (10-12 ms, then the
+  lanes) ran inside the plan hook, which the queue runs on the thread that prepared the plan, before
+  the hook's body was published (`run_body_hook` fills the slot only when the hook returns). That cost
+  the build twice. The body arrived ~10 ms later, and the 40 ms body wait turned that into time on the
+  build's path (p90 27 ms). The plan-preparing thread was also busy with the previous plan's resolve
+  when the next build asked for its plan (`wait_for_plan`, `ahead_wait_us`). At stage 4 the parent's
+  late QMDB root (below) added the grandparent's fields wait (`parent_fields_ms` p90 14). The phases
+  line now splits the part: `pre_par_take_us` (the selection: the plan's take, any body wait, the
+  candidates' copy; the hand-off wait is left in `other`), `pre_par_view_us` (the one-probe take and
+  view), `pre_par_lane_us` (the output shards, the sinks, the lane sink and the plan's hand-over to the
+  call) and `pre_par_other_us`.
+- **Body first.** `make_prepared_build` makes the body as without one-probe and hands the resolve
+  (`one_probe::resolve_behind`: copies of the keys and, at stage 2, the partition) to one resolver thread
+  (`n42-one-probe`). That thread runs the resolves in the order the plans were made, each one's parallel
+  part on the plan-body pool, and attaches the result to the plan's `PendingResolve`. The hook returns
+  at once. The build takes the body as before and uses the resolve only if it is done when the build
+  reaches its view. It never waits for it. Otherwise the build runs on stage-0 reads and the map batches
+  (`one_probe_ring_reject=resolve_late`). `N42_ONE_PROBE_BODY_WAIT_MS` is 0 by default again and stays as
+  a knob. The resolve still runs on the plan-body pool. Bench with `N42_PLAN_AHEAD_BODY_THREADS=16`:
+  stage bb's control with it alone read the window-1 record, and the resolve finishes sooner on it.
+- **The ring rule for a block built without its view.** The ring needs the plan's dense ids, not the
+  view. A block sealed whole from its plan's take (the same `built_whole` condition) whose resolve was
+  late is recorded later (`one_probe::record_late`). At the frozen shards' filing
+  (`built_executions::shards_ready`) a job is queued on the resolver thread behind that plan's resolve,
+  so the resolve is done when the job runs. The job fills the plan's dense output from the block's
+  post-state (`Resolved::fill_from` through `payload::one_probe_post_account`): a plain account from the
+  frozen shards is stored, an account with code, without info or changed by the residual is poisoned,
+  and an account the block did not change stays empty and is read through the chain. Only then is the
+  output pushed into the ring, so the ring's lock orders every store before a later read. A child that
+  takes its view before the record lands finds no prefix through that block; the builds after it do.
+  `one_probe_late_records` counts the blocks recorded this way. Without output shards (the streamed
+  graft or no sink) a view-less block is not recorded, as before.
+- **Stage 4's freeze.** The materialisation cannot move behind the root. The block's QMDB root reads
+  every account through `view` as `&BundleAccount` (its operations and the hashed post-state), and the
+  merge after the publication reads `lane_state` too. So the order stays freeze, view, root, publication,
+  merge. What moved is where the materialisation runs. It now uses a pool of its own (`lane_pool`,
+  `N42_LANE_POOL_THREADS`, 8, background set and priority), not the freeze's (the behind or build pool),
+  whose threads the parent's root and hashed post-state share. `N42_LANE_POOL=behind` restores the old
+  placement. `bench_node_batch_state` (8 threads on cores 232-239, nice 19, shard mix, p50 of 7): batch
+  loop 9.8 ms (9.7 on the old placement), materialisation 8.3 ms on the lane pool against 10.9 on the
+  freeze's pool. Taking it off the block's own chain needs the root to read the lanes directly, which has
+  not been done.
+- **Tests.** `parallel_transfer::tests::a_block_built_without_its_view_is_recorded_late_and_keeps_the_prefix`:
+  block 1 builds while its resolve is pending. Its output is filled from its frozen post-state, and every
+  filled entry equals the grafted state. Block 2 finds a verified prefix of two, is served from it and
+  equals the plain build. The three-block test still passes on stages 1-4.

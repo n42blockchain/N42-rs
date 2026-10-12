@@ -936,3 +936,149 @@ fn bench_one_probe_state() {
     line("deep", &d_plan, &d_exec, &d_fold);
     println!("post-states equal to the serial application: yes (asserted)");
 }
+
+/// The node's own parent stand-in for [`bench_node_batch_state`]: one map
+/// probe a read (the stage-1 resolved read's cost order, not the layer walk).
+#[derive(Debug, Clone)]
+struct MapDb(std::sync::Arc<AddressHashMap<AccountInfo>>);
+
+impl revm::Database for MapDb {
+    type Error = std::convert::Infallible;
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        Ok(self.0.get(&address).cloned())
+    }
+    fn code_by_hash(&mut self, _code_hash: alloy_primitives::B256) -> Result<revm::state::Bytecode, Self::Error> {
+        Ok(revm::state::Bytecode::default())
+    }
+    fn storage(&mut self, _address: Address, _index: revm::primitives::StorageKey) -> Result<U256, Self::Error> {
+        Ok(U256::ZERO)
+    }
+    fn block_hash(&mut self, _number: u64) -> Result<alloy_primitives::B256, Self::Error> {
+        Ok(alloy_primitives::B256::ZERO)
+    }
+}
+
+impl n42_engine_types::parallel_transfer::AccountHint for MapDb {}
+
+/// One batch of the node's `BatchState` -- on its map (stage 1) or on the
+/// plan's lane (stage 2) -- driven as the batch loop drives it: the
+/// transaction named, three reads, the commit; the bundle taken at the end.
+fn node_batch(txs: &[Tx], members: &[&Vec<usize>], mut state: n42_engine_types::batch_state::BatchState<MapDb>) -> revm::database::BundleState {
+    use revm::Database as _;
+    let coinbase = beneficiary();
+    for group in members {
+        for &i in group.iter() {
+            let tx = &txs[i];
+            state.note_tx(i, &(tx.from, tx.to));
+            let s = state.basic(tx.from).unwrap().expect("sender");
+            let spend = U256::from(tx.value + FEE);
+            if s.nonce != tx.nonce || s.balance < spend {
+                break;
+            }
+            let r = state.basic(tx.to).unwrap();
+            let c = state.basic(coinbase).unwrap().expect("beneficiary");
+            let plain = n42_engine_types::fast_transfer::PlainTransfer {
+                caller: tx.from,
+                sender_balance: s.balance - spend,
+                sender: s,
+                to: tx.to,
+                recipient_balance: r.as_ref().map_or(U256::ZERO, |r| r.balance) + U256::from(tx.value),
+                recipient: r,
+                beneficiary: coinbase,
+                coinbase_balance: c.balance + U256::from(FEE),
+                coinbase: c,
+            };
+            state.commit_transfer(plain).expect("commit");
+            state.after_commit();
+        }
+    }
+    state.take_bundle()
+}
+
+/// The node's batch state on the flood's block: the per-batch map (stage 1)
+/// against the plan's lanes (stage 2, `BatchState::with_lane`), the same
+/// batches of whole sender groups on `OP_THREADS` threads, each batch's
+/// bundle checked equal; and the plan-time cost of the resolve and of the
+/// lanes (`one_probe::resolve_with`, `Resolved::with_lanes`) on the same
+/// pool.
+#[test]
+#[ignore = "a timing benchmark: run it pinned, release, on a quiet box"]
+fn bench_node_batch_state() {
+    use n42_engine_types::{batch_state::BatchState, one_probe, parallel_transfer};
+    let threads = env_usize("OP_THREADS", 64);
+    let rounds = env_usize("OP_ROUNDS", 7);
+    let nbatches = env_usize("OP_BATCHES", 128);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+    let mut rng = Rng(42);
+    let txs = block(&mut rng, 0);
+    let mut parent = AddressHashMap::default();
+    let rich = U256::from(10u64).pow(U256::from(24u64));
+    // As the node's provider answers: no code loaded (`AccountInfo::from(Account)`).
+    let plain = |balance: U256| AccountInfo { code: None, ..info(balance, 0) };
+    for s in 0..SENDERS {
+        parent.insert(sender(s), plain(rich));
+    }
+    for tx in &txs {
+        parent.entry(tx.to).or_insert_with(|| plain(U256::from(1_000_000_000u64)));
+    }
+    parent.insert(beneficiary(), plain(U256::from(1u64)));
+    let db = MapDb(std::sync::Arc::new(parent));
+    let keys: Vec<(Address, Address)> = txs.iter().map(|tx| (tx.from, tx.to)).collect();
+    let groups = parallel_transfer::partition_by_sender(&keys, beneficiary()).expect("groups");
+    let batches = parallel_transfer::batch_groups_one_wave(&groups, keys.len(), nbatches);
+    let (mut map_ms, mut lane_ms, mut resolve_ms, mut lanes_ms) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut table = one_probe::Rolling::new(16);
+    for round in 0..rounds + 1 {
+        let at = Instant::now();
+        let resolved = pool.install(|| one_probe::resolve_with(&mut table, &keys));
+        let resolve = at.elapsed().as_secs_f64() * 1e3;
+        let at = Instant::now();
+        let plan = std::sync::Arc::new(pool.install(|| resolved.with_lanes(&groups, nbatches)));
+        let lanes = at.elapsed().as_secs_f64() * 1e3;
+        assert!(plan.lanes.as_ref().is_some_and(|l| l.batches() == batches.len()));
+        let run = |lane: bool| -> (f64, Vec<revm::database::BundleState>) {
+            let at = Instant::now();
+            let bundles: Vec<revm::database::BundleState> = pool.install(|| {
+                use rayon::prelude::*;
+                batches
+                    .par_iter()
+                    .enumerate()
+                    .map(|(b, members)| {
+                        let txs_n = members.iter().map(|g| g.len()).sum::<usize>();
+                        let state = if lane {
+                            BatchState::with_lane(db.clone(), 4, std::sync::Arc::clone(&plan), b)
+                        } else {
+                            BatchState::with_capacity(db.clone(), txs_n + txs_n / 4 + 1)
+                        };
+                        node_batch(&txs, members, state)
+                    })
+                    .collect()
+            });
+            (at.elapsed().as_secs_f64() * 1e3, bundles)
+        };
+        let (map, map_bundles) = run(false);
+        let (dense, lane_bundles) = run(true);
+        if round == 0 {
+            for (ours, theirs) in lane_bundles.iter().zip(&map_bundles) {
+                assert_eq!(ours.state, theirs.state, "the lane's bundle is the map's");
+                let ours: std::collections::BTreeMap<_, _> = ours.reverts.iter().flatten().cloned().collect();
+                let theirs: std::collections::BTreeMap<_, _> = theirs.reverts.iter().flatten().cloned().collect();
+                assert_eq!(ours, theirs, "reverts");
+            }
+            continue;
+        }
+        map_ms.push(map);
+        lane_ms.push(dense);
+        resolve_ms.push(resolve);
+        lanes_ms.push(lanes);
+    }
+    println!(
+        "node batch state, {} transfers, {} batches, {threads} threads, p50 of {rounds}: map (stage 1) {:.1} ms, lane (stage 2) {:.1} ms; plan time: resolve {:.1} ms, lanes {:.1} ms",
+        keys.len(),
+        batches.len(),
+        median(map_ms),
+        median(lane_ms),
+        median(resolve_ms),
+        median(lanes_ms)
+    );
+}

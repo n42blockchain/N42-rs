@@ -287,7 +287,7 @@ std::thread_local! {
 fn enter_part(
     part: &mut IndexPart,
     id: u16,
-    accounts: &AddressHashMap<BundleAccount>,
+    accounts: &BatchAccounts,
     reverts: &[(Address, AccountRevert)],
     addresses: &[Address],
     revert_at: &[u32],
@@ -519,6 +519,47 @@ impl Shard {
     }
 }
 
+/// One batch's accounts as the batch handed them over: its map of closed
+/// bundle accounts. Read before the freeze through [`Self::get`] and
+/// [`Self::iter`], which answer owned or borrowed values (`Cow`), so a
+/// form that holds its accounts as other than `BundleAccount`s can answer
+/// them too; after the freeze the shards' maps hold every account and are
+/// read borrowed.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct BatchAccounts {
+    /// The closed accounts.
+    map: AddressHashMap<BundleAccount>,
+}
+
+impl BatchAccounts {
+    /// The batch's accounts as a map.
+    pub(crate) const fn from_map(map: AddressHashMap<BundleAccount>) -> Self {
+        Self { map }
+    }
+
+    /// The account `address` as the batch left it.
+    #[inline]
+    pub(crate) fn get(&self, address: &Address) -> Option<std::borrow::Cow<'_, BundleAccount>> {
+        self.map.get(address).map(std::borrow::Cow::Borrowed)
+    }
+
+    /// Whether the batch holds `address`.
+    #[inline]
+    pub(crate) fn contains_key(&self, address: &Address) -> bool {
+        self.map.contains_key(address)
+    }
+
+    /// The accounts held.
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Every account, each once, in the batch's order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&Address, std::borrow::Cow<'_, BundleAccount>)> {
+        self.map.iter().map(|(address, account)| (address, std::borrow::Cow::Borrowed(account)))
+    }
+}
+
 /// One batch's output as the batch left it -- its account map, whole, and
 /// its reverts in one list -- with, for each address range, the addresses
 /// of its accounts there (in the map's order) and the positions of its
@@ -526,7 +567,7 @@ impl Shard {
 struct BatchOut {
     /// Shared with an [`EarlyOutput`] (`N42_OUTPUT_INCREMENTAL`); held alone
     /// otherwise.
-    accounts: Arc<AddressHashMap<BundleAccount>>,
+    accounts: Arc<BatchAccounts>,
     reverts: Vec<(Address, AccountRevert)>,
     addresses: Vec<Vec<Address>>,
     revert_at: Vec<Vec<u32>>,
@@ -545,7 +586,7 @@ struct BatchOut {
 
 /// One batch's map and reverts kept as the block's output (index mode).
 struct IndexedBatch {
-    accounts: Arc<AddressHashMap<BundleAccount>>,
+    accounts: Arc<BatchAccounts>,
     /// The accounts taken out of the output that are still in `accounts`
     /// because an [`EarlyOutput`] shares the map: every walk skips them.
     /// Empty when the map was held alone (it then lost them).
@@ -557,16 +598,16 @@ impl IndexedBatch {
     /// The batch's accounts still in the output.
     fn live(&self) -> impl Iterator<Item = (&Address, &BundleAccount)> {
         let removed = &self.removed;
-        self.accounts.iter().filter(move |(address, _)| removed.is_empty() || !removed.contains(*address))
+        self.accounts.map.iter().filter(move |(address, _)| removed.is_empty() || !removed.contains(*address))
     }
 
     /// `address` out of the output: out of the map when it is held alone,
     /// listed as removed when it is shared. Returns it.
     fn remove(&mut self, address: &Address) -> Option<BundleAccount> {
         match Arc::get_mut(&mut self.accounts) {
-            Some(map) => map.remove(address),
+            Some(accounts) => accounts.map.remove(address),
             None => {
-                let account = self.accounts.get(address)?.clone();
+                let account = self.accounts.map.get(address)?.clone();
                 self.removed.insert(*address).then_some(account)
             }
         }
@@ -574,7 +615,7 @@ impl IndexedBatch {
 
     /// The map, owned, less the removed accounts.
     fn into_live_map(self) -> AddressHashMap<BundleAccount> {
-        let mut map = Arc::try_unwrap(self.accounts).unwrap_or_else(|shared| (*shared).clone());
+        let mut map = Arc::try_unwrap(self.accounts).map_or_else(|shared| shared.map.clone(), |accounts| accounts.map);
         for address in &self.removed {
             map.remove(address);
         }
@@ -612,7 +653,7 @@ impl Indexed {
         let shard = shard_index(address, self.index.len());
         match *self.index.get(shard)?.get(address)? {
             CONFLICT => self.conflicts.get(shard)?.get(address),
-            id => self.batches.get(id as usize)?.accounts.get(address),
+            id => self.batches.get(id as usize)?.accounts.map.get(address),
         }
     }
 
@@ -795,7 +836,7 @@ impl OutputShards {
     fn enter_live(
         live: &[Mutex<IndexPart>],
         id: u16,
-        accounts: &AddressHashMap<BundleAccount>,
+        accounts: &BatchAccounts,
         reverts: &[(Address, AccountRevert)],
         addresses: &[Vec<Address>],
         revert_at: &[Vec<u32>],
@@ -915,6 +956,7 @@ impl OutputShards {
             }
             revert_at[shard_index(address, count)].push(at as u32);
         }
+        let accounts = BatchAccounts::from_map(accounts);
         // Live index: numbered and entered now, on this thread. A block of
         // more batches than an index entry can name is frozen the ordinary
         // way (every batch's lists are kept either way).
@@ -992,7 +1034,7 @@ impl OutputShards {
             for batch in batches_ref {
                 shard.add(
                     beneficiary,
-                    batch.addresses[index].iter().filter_map(|address| batch.accounts.get_key_value(address)),
+                    batch.addresses[index].iter().filter_map(|address| batch.accounts.map.get_key_value(address)),
                     batch.revert_at[index].iter().filter_map(|at| batch.reverts.get(*at as usize)),
                 );
             }
@@ -1069,7 +1111,7 @@ impl OutputShards {
         self.live.as_deref()?;
         let batches = self.batches.lock().unwrap_or_else(PoisonError::into_inner);
         let count = batches.len();
-        let mut maps: Vec<Option<Arc<AddressHashMap<BundleAccount>>>> = vec![None; count];
+        let mut maps: Vec<Option<Arc<BatchAccounts>>> = vec![None; count];
         let mut beneficiary_delta = U256::ZERO;
         for batch in batches.iter() {
             let slot = maps.get_mut(batch.live_id)?;
@@ -1140,7 +1182,7 @@ impl OutputShards {
 /// writers' changes are summed as the freeze sums them.
 #[derive(Debug)]
 pub struct EarlyOutput {
-    batches: Vec<Arc<AddressHashMap<BundleAccount>>>,
+    batches: Vec<Arc<BatchAccounts>>,
     parts: Vec<EarlyPart>,
     contracts: B256HashMap<RevmBytecode>,
     beneficiary_delta: U256,
@@ -1172,16 +1214,16 @@ impl EarlyOutput {
                     return Some(Cow::Borrowed(sum));
                 }
                 let mut holders = ids.iter().filter_map(|&id| self.batches.get(id as usize)?.get(address));
-                let mut first = holders.next()?.clone();
+                let mut first = holders.next()?.into_owned();
                 if let Some(info) = first.info.as_mut() {
                     for account in holders {
-                        add_delta(info, account);
+                        add_delta(info, &account);
                     }
                 }
                 // Racing first reads make the same sum; one is kept.
                 Some(Cow::Borrowed(sum.get_or_init(|| first)))
             }
-            id => self.batches.get(id as usize)?.get(address).map(Cow::Borrowed),
+            id => self.batches.get(id as usize)?.get(address),
         }
     }
 
@@ -1394,14 +1436,14 @@ fn freeze_indexed(
                         let first = *held.get();
                         if first != CONFLICT {
                             if let Some(base) = batches_ref.get(first as usize).and_then(|b| b.accounts.get(address)) {
-                                part.conflicts.insert(*address, base.clone());
+                                part.conflicts.insert(*address, base.into_owned());
                             }
                             part.drops.push((first, *address));
                             held.insert(CONFLICT);
                         }
                         part.drops.push((id, *address));
                         if let Some(staged) = part.conflicts.get_mut(address).and_then(|a| a.info.as_mut()) {
-                            add_delta(staged, account);
+                            add_delta(staged, &account);
                         }
                     }
                 }
@@ -1496,11 +1538,11 @@ fn freeze_live(
             match part.conflicts.get_mut(address) {
                 Some(staged) => {
                     if let Some(info) = staged.info.as_mut() {
-                        add_delta(info, account);
+                        add_delta(info, &account);
                     }
                 }
                 None => {
-                    part.conflicts.insert(*address, account.clone());
+                    part.conflicts.insert(*address, account.into_owned());
                 }
             }
         }
@@ -1663,11 +1705,11 @@ fn sum_split(
                 match conflicts.get_mut(address) {
                     Some(staged) => {
                         if let Some(info) = staged.info.as_mut() {
-                            add_delta(info, account);
+                            add_delta(info, &account);
                         }
                     }
                     None => {
-                        conflicts.insert(*address, account.clone());
+                        conflicts.insert(*address, account.into_owned());
                     }
                 }
             }
@@ -2163,7 +2205,7 @@ impl FrozenShards {
         if let Some(indexed) = self.indexed.take() {
             let Indexed { batches, conflicts, kept, state_size, beneficiary_delta, .. } = *indexed;
             let mut state: AddressHashMap<BundleAccount> = Default::default();
-            state.reserve(batches.iter().map(|b| b.accounts.len()).sum::<usize>() + conflicts.iter().map(|c| c.len()).sum::<usize>());
+            state.reserve(batches.iter().map(|b| b.accounts.map.len()).sum::<usize>() + conflicts.iter().map(|c| c.len()).sum::<usize>());
             let mut slots: Vec<Vec<Option<(Address, AccountRevert)>>> = Vec::with_capacity(batches.len());
             for mut batch in batches {
                 let reverts = std::mem::take(&mut batch.reverts);
@@ -2377,7 +2419,7 @@ impl FrozenShards {
                 indexed
                     .batches
                     .iter()
-                    .map(|batch| (&*batch.accounts, (!batch.removed.is_empty()).then_some(&batch.removed)))
+                    .map(|batch| (&batch.accounts.map, (!batch.removed.is_empty()).then_some(&batch.removed)))
                     .chain(indexed.conflicts.iter().map(|map| (map, None))),
             );
         }

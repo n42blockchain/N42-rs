@@ -5103,11 +5103,13 @@ mod tests {
                     },
                 )))
                 .expect("valid future timeout should be collected");
-            assert_eq!(
-                engine.current_view(),
-                1,
-                "fewer than quorum future timeouts must never advance the view"
-            );
+            if sender == 0 {
+                assert_eq!(engine.current_view(), 1, "one future report cannot synchronize");
+            } else {
+                // Two verified future reports plus our own timeout supply
+                // all three signatures of this four-validator TC.
+                assert_eq!(engine.current_view(), 6);
+            }
         }
 
         engine
@@ -5254,6 +5256,35 @@ mod tests {
             2,
             "only the local signer and one external signer may be counted"
         );
+    }
+
+    #[test]
+    fn future_reports_synchronize_without_replacing_quorum_or_finality() {
+        let (mut engine, sks, _, mut rx) = make_engine(7, 0);
+        let view = 5;
+        for sender in 1..=3 {
+            let message = engine.signing_profile.timeout_message(view);
+            engine.process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(TimeoutMessage {
+                view,
+                high_qc: QuorumCertificate::genesis(),
+                sender,
+                signature: engine.signing_profile.sign(&sks[sender as usize], &message),
+            }))).unwrap();
+            assert_eq!(engine.current_view(), if sender < 3 { 1 } else { view });
+            assert_eq!(engine.round_state.locked_qc().view, 0);
+            assert_eq!(engine.last_committed_qc().view, 0);
+        }
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|o| matches!(o,
+            EngineOutput::BroadcastMessage(ConsensusMessage::NewView(_)))));
+        let message = engine.signing_profile.timeout_message(view);
+        engine.process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(TimeoutMessage {
+            view,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 4,
+            signature: engine.signing_profile.sign(&sks[4], &message),
+        }))).unwrap();
+        assert_eq!(engine.current_view(), 6, "only the full five-signature TC advances to the successor");
+        assert_eq!(engine.last_committed_qc().view, 0);
     }
 
     #[test]

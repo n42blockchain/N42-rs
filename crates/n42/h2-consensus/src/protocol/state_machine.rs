@@ -5262,6 +5262,47 @@ mod tests {
     }
 
     #[test]
+    fn verified_five_of_seven_timeouts_skip_two_offline_leaders() {
+        for mode in 0..3 {
+            let (mut engine, sks, _, mut rx) = make_engine(7, 0);
+            if mode == 1 {
+                engine.enable_gov5_legacy_signing();
+            } else if mode == 2 {
+                engine.enable_h2_v4_signing(n42_h2_primitives::consensus::H2V4ChainIdentity {
+                    chain_id: 94,
+                    genesis_hash: B256::repeat_byte(0x11),
+                });
+            }
+            engine.advance_to_view(4).unwrap();
+            while rx.try_recv().is_ok() {}
+            // Only validators 0..4 are online. Views 5 and 6 select dead leaders.
+            for view in 4..=6 {
+                engine.on_timeout().unwrap();
+                for sender in 1..=4 {
+                    if sender == 4 {
+                        assert_eq!(engine.current_view(), view, "four signatures cannot advance");
+                    }
+                    let message = engine.signing_profile.timeout_message(view);
+                    let timeout = TimeoutMessage {
+                        view,
+                        high_qc: QuorumCertificate::genesis(),
+                        sender,
+                        signature: engine.signing_profile.sign(&sks[sender as usize], &message),
+                    };
+                    engine.process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout))).unwrap();
+                }
+                assert_eq!(engine.current_view(), view + 1);
+                while let Ok(output) = rx.try_recv() {
+                    if let EngineOutput::BroadcastMessage(ConsensusMessage::NewView(nv)) = output {
+                        assert_eq!(nv.view, 7, "non-leaders cannot announce NewView");
+                        assert_eq!(nv.leader, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_tc_non_leader_no_newview() {
         use crate::protocol::quorum::timeout_signing_message;
         use n42_h2_primitives::consensus::TimeoutMessage;
@@ -5293,7 +5334,7 @@ mod tests {
             o,
             EngineOutput::BroadcastMessage(ConsensusMessage::NewView(_))
         )));
-        assert_eq!(engine.current_view(), 1);
+        assert_eq!(engine.current_view(), 2);
     }
 
     #[test]

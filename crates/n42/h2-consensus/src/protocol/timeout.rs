@@ -9,8 +9,7 @@ use crate::error::{ConsensusError, ConsensusResult};
 impl ConsensusEngine {
     /// Verifies and collects a timeout vote for a bounded future view.
     ///
-    /// A lone future timeout never changes the local view. Only the exact
-    /// next-view leader may aggregate a quorum of distinct, verified timeout
+    /// A lone future timeout never changes the local view. Any receiver may aggregate a quorum of distinct, verified timeout
     /// signatures into a TC and advance. Validator-set lookup is strict so an
     /// unstaged future epoch can never be verified using the current set as a
     /// fallback.
@@ -93,7 +92,7 @@ impl ConsensusEngine {
         }
 
         let quorum_size = view_set.quorum_size();
-        if local_next_index != Some(next_leader) || !collector.has_quorum(quorum_size) {
+        if !collector.has_quorum(quorum_size) {
             return Ok(false);
         }
 
@@ -182,7 +181,7 @@ impl ConsensusEngine {
             )))?;
 
             // Check if quorum was reached while we were waiting (messages may have
-            // arrived between repeats). Only the next leader can form the TC.
+            // arrived between repeats). A quorum can advance even without the next leader.
             let quorum_size = self.validator_set_for_view(view).quorum_size();
             let next_view = view.saturating_add(1);
             // edition-2021: N42-26 writes this as a let-chain.
@@ -190,7 +189,7 @@ impl ConsensusEngine {
                 .timeout_collector
                 .as_ref()
                 .is_some_and(|collector| collector.has_quorum(quorum_size));
-            if collector_has_quorum && self.is_leader_for_view(next_view) {
+            if collector_has_quorum {
                 self.try_form_tc_and_advance(view, next_view)?;
             }
             return Ok(());
@@ -334,7 +333,7 @@ impl ConsensusEngine {
             "received timeout"
         );
 
-        let should_form_tc = has_quorum && self.is_leader_for_view(next_view);
+        let should_form_tc = has_quorum;
 
         if should_form_tc {
             self.try_form_tc_and_advance(view, next_view)?;
@@ -432,30 +431,35 @@ impl ConsensusEngine {
     fn advance_with_tc(&mut self, tc: TimeoutCertificate, next_view: u64) -> ConsensusResult<()> {
         tracing::info!(target: "n42::cl::timeout",
             view = tc.view,
-            "TC formed, I am the new leader for view {}", next_view
+            "TC formed, advancing to view {}", next_view
         );
 
         self.round_state.update_locked_qc(&tc.high_qc);
 
-        let nv_message = self.signing_profile.new_view_message(next_view);
-        let nv_sig = self.signing_profile.sign(&self.secret_key, &nv_message);
+        // A verified timeout quorum advances locally even if the next leader
+        // is offline. Only that leader may sign and announce NewView.
+        if self.is_leader_for_view(next_view) {
+            let nv_message = self.signing_profile.new_view_message(next_view);
+            let nv_sig = self.signing_profile.sign(&self.secret_key, &nv_message);
 
-        let leader = self.local_validator_index_for_view(next_view).ok_or(
-            ConsensusError::LocalValidatorNotInSet {
-                epoch: self.epoch_manager.current_epoch() + 1,
-            },
-        )?;
+            let leader = self.local_validator_index_for_view(next_view).ok_or(
+                ConsensusError::LocalValidatorNotInSet {
+                    epoch: self.epoch_manager.current_epoch() + 1,
+                },
+            )?;
 
-        let new_view = NewView {
-            view: next_view,
-            timeout_cert: tc,
-            leader,
-            signature: nv_sig,
-        };
+            let new_view = NewView {
+                view: next_view,
+                timeout_cert: tc,
+                leader,
+                signature: nv_sig,
+            };
 
-        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::NewView(
-            new_view,
-        )))?;
+            self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::NewView(
+                new_view,
+            )))?;
+
+        }
 
         self.advance_to_view(next_view)?;
         // Use actual view: advance_to_view may replay buffered messages pushing view further.

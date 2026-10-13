@@ -13,8 +13,10 @@
 
 ```sh
 cargo build --release --offline --locked -p n42 --bin n42 --bin n42-init-snapshot
-cargo build --release --offline --locked -p n42-h2-node --bin h2_validator
+cargo build --release --offline --locked -p n42-h2-node --example h2_validator
 ```
 
 实际依赖修复差异与来源见 `vendor/dependency-repairs/revm-inspectors-0.44.1/N42-PATCH.diff`
 及 `N42-PROVENANCE.md`。完整运行验收以最终重建二进制 SHA256 和混合七节点 summary 为准。
+
+Validator 是既有 example target；099 的错误 bin selector 记录保留，最终重建使用与先前已通过的恢复构建相同的 example 命令。

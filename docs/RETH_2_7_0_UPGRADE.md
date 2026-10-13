@@ -20,3 +20,13 @@ cargo build --release --offline --locked -p n42-h2-node --example h2_validator
 及 `N42-PROVENANCE.md`。完整运行验收以最终重建二进制 SHA256 和混合七节点 summary 为准。
 
 Validator 是既有 example target；099 的错误 bin selector 记录保留，最终重建使用与先前已通过的恢复构建相同的 example 命令。
+
+
+## 混合生产节奏补全（待最终回归）
+
+首次修复后的混合90秒窗口完成43块/167成功交易/0失败且七执行头一致，但仅六个
+生产者覆盖，故 FAIL 保留。兼容节点的墙钟父时间限制让过了自己的 leader view。
+借用 main 已有 head_stamp 与父时间+period规则，receipt-based pacing 维持不变，
+genesis fallback 和时间溢出另验。无 Ed25519/帧协议或 quorum 改动。
+新增1个父时间恢复与4个节奏用例，语法/差异检查完成后分段推送。
+最终 full workspace 与运行回归尚待共享机器；上文1941数值只对应前一版二进制。

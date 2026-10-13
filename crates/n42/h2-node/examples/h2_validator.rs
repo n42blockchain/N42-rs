@@ -497,20 +497,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
-/// Attributes for a block this node proposes.
-///
-/// `prev_randao` is zero and the beacon root is zero because HotStuff-2 has no
-/// beacon chain supplying them; what matters is that every member computes the
-/// same values for the same block, and a constant satisfies that.
-///
-/// Returns `None` when it is too soon to propose again. An Engine API timestamp
-/// is a whole second and each block's must exceed its parent's, while HotStuff-2
-/// commits in tens of milliseconds — so a leader that proposes every view either
-/// repeats a second (the execution layer never finishes the build and
-/// `getPayload` blocks until the view times out) or runs the chain's clock into
-/// the future (the execution layer rejects the block outright). Both were
-/// observed on a live node. Declining in between paces the chain at roughly one
-/// block per second, which is what the timestamp resolution allows.
+/// Gov5 producer attributes: pace by receipt time, stamp from parent + period.
+/// This is the existing rule on Gov5 and the performance mainline.
 fn block_attributes(
     fee_recipient: Address,
     withdrawals: Vec<alloy_eips::eip4895::Withdrawal>,
@@ -524,38 +512,11 @@ fn block_attributes(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    // Two clocks constrain a block's timestamp, and they are not the same
-    // clock. The stamp is the wall clock — gov5 ignores any gossiped block
-    // whose timestamp is ahead of its own clock, with no tolerance — and it
-    // must exceed the parent's, which for a Go parent is `parent + period`
-    // stamped however early the Go leader proposed (`hotstuff/adapter.go`
-    // `Prepare`): after a Go block this node waits for the clock to pass the
-    // parent's stamp. Pacing, meanwhile, is `period` after the parent was
-    // *seen* here, by this node's clock, not after the parent's stamp: waiting
-    // for the clock to reach `parent + period` after a Go block that is
-    // already a period ahead lost every such view to the timeout (measured).
-    // Without the parent (a restart, a head this node never saw the body of),
-    // pace against this node's own last proposal.
-    match (head_timestamp, head_seen) {
-        (Some(parent), seen) => {
-            if now <= parent {
-                return None;
-            }
-            if seen.is_some_and(|seen| seen.elapsed().as_secs() < period_secs) {
-                return None;
-            }
-        }
-        (None, _) => {
-            if now < LAST.load(Ordering::Relaxed).saturating_add(period_secs) {
-                return None;
-            }
-        }
-    }
-    let timestamp = now;
-    if LAST.fetch_max(timestamp, Ordering::Relaxed) >= timestamp {
-        // Already proposed in this second.
-        return None;
-    }
+    let timestamp = paced_timestamp(
+        now, LAST.load(Ordering::Relaxed), period_secs,
+        head_timestamp, head_seen.map(|seen| seen.elapsed()),
+    )?;
+    LAST.fetch_max(now, Ordering::Relaxed);
     Some(PayloadAttributes {
         timestamp,
         prev_randao: B256::ZERO,
@@ -587,3 +548,56 @@ h2_validator — run a participating HotStuff-2 v4 node against an execution lay
   --fault-tolerance <u32>   override f; defaults to (n-1)/3
   --timeout-ms <u64>        base view timeout (default: genesis hotstuff.baseTimeout, else 4000)
 ";
+
+
+// H2 validates parent time, not a wall-clock ceiling. A Go parent can already
+// be ahead of the host clock, while receipt-based pacing remains unchanged.
+fn paced_timestamp(
+    now: u64,
+    last: u64,
+    period: u64,
+    parent: Option<u64>,
+    seen_elapsed: Option<std::time::Duration>,
+) -> Option<u64> {
+    let period = period.max(1);
+    match parent {
+        Some(parent) => {
+            if seen_elapsed.is_some_and(|elapsed| elapsed.as_secs() < period) {
+                return None;
+            }
+            parent.checked_add(period)
+        }
+        None if now < last.saturating_add(period) => None,
+        None => Some(now),
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn future_parent_uses_deterministic_chain_time() {
+        assert_eq!(paced_timestamp(1000, 0, 3, Some(1040), Some(Duration::from_secs(3))), Some(1043));
+        assert_eq!(paced_timestamp(1012, 0, 3, Some(1040), Some(Duration::from_secs(3))), Some(1043));
+    }
+
+    #[test]
+    fn recent_parent_still_obeys_receipt_pacing() {
+        assert_eq!(paced_timestamp(1100, 0, 3, Some(1040), Some(Duration::from_secs(2))), None);
+        assert_eq!(paced_timestamp(1100, 0, 3, Some(1040), Some(Duration::from_secs(3))), Some(1043));
+    }
+
+    #[test]
+    fn restart_parent_and_genesis_fallback_are_distinct() {
+        assert_eq!(paced_timestamp(1000, 0, 3, Some(1040), None), Some(1043));
+        assert_eq!(paced_timestamp(1000, 998, 3, None, None), None);
+        assert_eq!(paced_timestamp(1001, 998, 3, None, None), Some(1001));
+    }
+
+    #[test]
+    fn overflowing_parent_is_not_proposed() {
+        assert_eq!(paced_timestamp(1000, 0, 3, Some(u64::MAX), None), None);
+    }
+}

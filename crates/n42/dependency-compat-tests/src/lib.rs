@@ -26,17 +26,35 @@ mod tests {
 
     #[test]
     fn database_records_survive_reopening_with_the_replaced_hash_and_clock() {
-        let base = std::env::temp_dir().join(format!("n42-sled-compat-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        {
-            let db = sled::open(&base).unwrap();
-            let tree = db.open_tree(b"validator-history").unwrap();
-            for height in 0..1024u64 {
-                tree.insert(height.to_be_bytes(), &height.to_le_bytes())
-                    .unwrap();
+        const WRITER_PATH: &str = "N42_SLED_COMPAT_WRITER_PATH";
+        if let Some(path) = std::env::var_os(WRITER_PATH) {
+            let base = std::path::PathBuf::from(path);
+            {
+                let db = sled::open(&base).unwrap();
+                let tree = db.open_tree(b"validator-history").unwrap();
+                for height in 0..1024u64 {
+                    tree.insert(height.to_be_bytes(), &height.to_le_bytes())
+                        .unwrap();
+                }
+                tree.flush().unwrap();
             }
-            tree.flush().unwrap();
+            return;
         }
+        let base = std::env::temp_dir().join(format!("n42-sled-compat-{}", std::process::id()));
+        std::fs::create_dir(&base).unwrap();
+        // Sled's background workers can retain the file lock after Db/Tree drop.
+        // A separate writer process makes this a real persistence/reopen check:
+        // its successful exit releases every worker and database handle.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::database_records_survive_reopening_with_the_replaced_hash_and_clock",
+                "--nocapture",
+            ])
+            .env(WRITER_PATH, &base)
+            .status()
+            .unwrap();
+        assert!(status.success(), "database writer subprocess failed");
         {
             let db = sled::open(&base).unwrap();
             let tree = db.open_tree(b"validator-history").unwrap();

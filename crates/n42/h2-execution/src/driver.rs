@@ -168,6 +168,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.normalizer = Some(Normalizer(Box::new(normalizer)));
     }
 
+    /// Restores a locally available execution head without changing finality.
+    pub fn with_recovered_head(mut self, head: B256) -> Self {
+        self.head = head;
+        self
+    }
+
     /// Overrides the payload cache bound.
     pub fn with_max_cached_payloads(mut self, max: usize) -> Self {
         self.max_cached_payloads = max.max(1);

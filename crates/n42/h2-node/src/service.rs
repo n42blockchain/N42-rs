@@ -1104,10 +1104,11 @@ impl<E: ExecutionLayer> H2Service<E> {
         // Marked before the build, not after: a build that fails should not be
         // retried on every subsequent event in the same view, which would pin
         // the loop against a broken execution layer.
+        let head_timestamp = head_stamp(self.block_timestamps.get(&head).copied(), head_header.as_ref());
         let context = ProposalContext {
             view,
             head,
-            head_timestamp: self.block_timestamps.get(&head).copied(),
+            head_timestamp,
             head_header,
             head_seen: self.block_seen.get(&head).copied(),
         };
@@ -1940,5 +1941,29 @@ mod range_tests {
         assert_linked(&served, 1);
         // The production budget is the requester's.
         assert_eq!(n42_h2_net::MAX_RANGE_BYTES, 256 << 20);
+    }
+}
+
+
+// Same parent-time recovery rule as the performance mainline: a restarted
+// validator may have the header in its execution layer but no local cache.
+const fn head_stamp(remembered: Option<u64>, header: Option<&Header>) -> Option<u64> {
+    match (remembered, header) {
+        (Some(stamp), _) => Some(stamp),
+        (None, Some(header)) => Some(header.timestamp),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod recovered_parent_time_tests {
+    use super::*;
+
+    #[test]
+    fn remembered_time_precedes_header_and_restart_uses_header() {
+        let header = Header { timestamp: 1040, ..Default::default() };
+        assert_eq!(head_stamp(Some(1030), Some(&header)), Some(1030));
+        assert_eq!(head_stamp(None, Some(&header)), Some(1040));
+        assert_eq!(head_stamp(None, None), None);
     }
 }

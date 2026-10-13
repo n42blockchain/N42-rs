@@ -49,7 +49,9 @@ async fn debug_trace_call_matches_geth_prestate_snapshot() -> Result<()> {
             .build(),
     );
 
-    let (node, _) = EthereumNode::test_setup(1, chain_spec).build_single().await?;
+    let (node, _) = EthereumNode::test_setup(1, chain_spec)
+        .build_single()
+        .await?;
     let provider = node.rpc_provider();
 
     // <https://etherscan.io/tx/0x391f4b6a382d3bcc3120adc2ea8c62003e604e487d97281129156fd284a1a89d>
@@ -80,13 +82,33 @@ async fn debug_trace_call_matches_geth_prestate_snapshot() -> Result<()> {
 
     let trace: PreStateFrame = provider
         .debug_trace_call_prestate(
-            request,
+            request.clone(),
             BlockId::latest(),
             GethDebugTracingOptions::prestate_tracer(PreStateConfig::default()).into(),
         )
         .await?;
 
     similar_asserts::assert_eq!(trace, expected_frame);
+
+    // The beneficiary is required in default prestate even when traceCall
+    // does not charge fees. It must remain absent from an unchanged diff.
+    let diff: PreStateFrame = provider
+        .debug_trace_call_prestate(
+            request,
+            BlockId::latest(),
+            GethDebugTracingOptions::prestate_tracer(PreStateConfig {
+                diff_mode: Some(true),
+                ..Default::default()
+            })
+            .into(),
+        )
+        .await?;
+    let PreStateFrame::Diff(diff) = diff else {
+        return Err(eyre!("expected diff prestate frame"));
+    };
+    let beneficiary = address!("0x95222290dd7278aa3ddd389cc1e1d165cc4bafe5");
+    assert!(!diff.pre.contains_key(&beneficiary));
+    assert!(!diff.post.contains_key(&beneficiary));
 
     Ok(())
 }

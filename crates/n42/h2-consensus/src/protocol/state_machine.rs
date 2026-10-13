@@ -2178,34 +2178,29 @@ mod tests {
         assert!(debug_str.contains("my_index"));
     }
 
-    /// A full channel must not drop a non-critical output: `emit` retries, and
-    /// once the consumer drains, both outputs arrive in order.
-    ///
-    /// Deliberately does not make the drain wait. `emit`'s whole retry budget
-    /// is 1.5ms (3 x 500us), which is far below the thread-scheduling jitter on
-    /// a loaded machine — an earlier version slept 1ms before draining and
-    /// failed whenever the box was busy, because the drain landed after the
-    /// budget was already spent. Any test that needs the drain to happen
-    /// *late but within 1.5ms* is unschedulable by construction. Draining
-    /// immediately still exercises the path (the emit below races a full
-    /// channel) while depending on ordering rather than on wall-clock timing.
+    /// Queued outputs remain ordered after a full channel drains. Synchronize
+    /// the consumer rather than relying on OS scheduling within the retry
+    /// deadline; the separate bounded-retry test covers an undrained channel.
     #[test]
-    fn test_emit_retries_non_block_committed_output_when_channel_is_full() {
+    fn test_emit_preserves_order_after_a_full_channel_drains() {
         let (engine, _, _, mut rx) = make_engine_with_output_capacity(1, 0, 1);
 
         engine
             .emit(EngineOutput::ExecuteBlock(B256::repeat_byte(0xAB)))
             .expect("first output should fill the channel");
 
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
         let drain = std::thread::spawn(move || {
             let first = rx.blocking_recv().expect("expected first output");
-            let second = rx.blocking_recv().expect("expected retried output");
+            drained_tx.send(()).expect("notify first drain");
+            let second = rx.blocking_recv().expect("expected second output");
             (first, second)
         });
 
+        drained_rx.recv().expect("consumer drained the full channel");
         engine
             .emit(EngineOutput::ViewChanged { new_view: 2 })
-            .expect("backpressure on non-critical outputs should be retried");
+            .expect("second output should preserve ordering");
 
         let (first, second) = drain.join().expect("drain thread should complete");
         assert!(

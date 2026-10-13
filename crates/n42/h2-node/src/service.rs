@@ -70,6 +70,26 @@ use n42_h2_wire::{H2Message, H2V4Envelope};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+/// Read the actual canonical execution head before announcing startup status.
+/// A restored consensus QC can name a block this execution layer has not imported.
+pub async fn execution_start_block<E: ExecutionLayer>(
+    el: &E,
+) -> Result<n42_h2_execution::ChainBlock, n42_h2_execution::ElError> {
+    let height = el.latest_block_number().await?.ok_or_else(|| {
+        n42_h2_execution::ElError::new("execution layer did not report its startup height")
+    })?;
+    let block = el
+        .block_by_number(height)
+        .await?
+        .ok_or_else(|| n42_h2_execution::ElError::new("execution startup head is unavailable"))?;
+    if block.header.number != height {
+        return Err(n42_h2_execution::ElError::new(
+            "execution startup block has the wrong height",
+        ));
+    }
+    Ok(block)
+}
+
 /// Decides what a leader proposes for a view, given the view number and the
 /// current head. `None` declines the view — see
 /// [`H2Service::with_payload_attributes`].
@@ -1742,6 +1762,36 @@ mod range_tests {
                 assert_eq!(*parent, served[i - 1].1, "block {number} does not link to the one before");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn startup_anchor_uses_the_actual_execution_head() {
+        let blocks = chain(B256::ZERO, 20, 0xA);
+        let el = Reorging::new(blocks.clone(), None, usize::MAX);
+        let block = execution_start_block(&el).await.unwrap();
+        assert_eq!(block.header.number, 19);
+        assert_eq!(block.hash, blocks[19].hash);
+        let genesis = B256::repeat_byte(0x11);
+        let driver = ExecutionDriver::new(el, genesis).with_recovered_head(block.hash);
+        assert_eq!(driver.head(), block.hash);
+        assert_eq!(
+            driver.finalized(),
+            genesis,
+            "reading a head cannot manufacture finality"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_anchor_rejects_an_unavailable_or_unknown_head() {
+        let mut el = Reorging::new(chain(B256::ZERO, 3, 0xA), None, usize::MAX);
+        el.reports_head = false;
+        assert!(execution_start_block(&el).await.is_err());
+        el.reports_head = true;
+        el.head_overstated_by = 1;
+        assert!(execution_start_block(&el).await.is_err());
+        el.head_overstated_by = 0;
+        el.head_error = true;
+        assert!(execution_start_block(&el).await.is_err());
     }
 
     #[tokio::test]

@@ -233,7 +233,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     runtime.block_on(async move {
-        let transport = match keypair {
+        let mut transport = match keypair {
             Some(keypair) => H2V4Transport::with_keypair(config, keypair)?,
             None => H2V4Transport::new(config)?,
         };
@@ -365,7 +365,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => println!("head         : could not be checked against the execution layer: {error}"),
             }
         }
-        let driver = ExecutionDriver::new(el, recovered_head.unwrap_or(identity.genesis_hash));
+        let execution_head = n42_h2_node::service::execution_start_block(&el).await?;
+        // Status is exchanged when peers first connect, before a new commit.
+        // Announcing the default zero height hides every restored chain gap.
+        transport.set_advertised_height(execution_head.header.number);
+        let driver = ExecutionDriver::new(el, recovered_head.unwrap_or(identity.genesis_hash))
+            .with_recovered_head(execution_head.hash);
 
         let mut service = H2Service::new(transport, engine, driver, output_rx, validator_count);
         if let Some(store) = store {

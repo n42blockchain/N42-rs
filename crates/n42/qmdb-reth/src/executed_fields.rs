@@ -296,19 +296,24 @@ mod tests {
         remember(hot, live);
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = calls.clone();
+        let cold = alloy_primitives::keccak256(b"historical wait");
+        let cold_hashes: Vec<_> = (1..=(KEEP + 4)).map(|n| {
+            let mut value = b"historical-reader-test:".to_vec();
+            value.extend_from_slice(&n.to_le_bytes());
+            alloy_primitives::keccak256(value)
+        }).collect();
+        let allowed: std::collections::HashSet<_> = cold_hashes.iter().copied().chain([cold]).collect();
         set_historical_reader(move |hash| {
             counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            (*hash != B256::ZERO).then_some(ExecutedFields { state_root: *hash, ..live })
+            allowed.contains(hash).then_some(ExecutedFields { state_root: *hash, ..live })
         });
         assert_eq!(get(&hot), Some(live));
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
-        for n in 1..=(KEEP + 4) {
-            let hash = alloy_primitives::keccak256(n.to_le_bytes());
+        for hash in cold_hashes {
             assert_eq!(get(&hash).unwrap().state_root, hash);
         }
         assert_eq!(get(&hot), Some(live), "cold history did not occupy the live window");
         assert_eq!(get(&B256::ZERO), None);
-        let cold = alloy_primitives::keccak256(b"historical wait");
         assert_eq!(wait_for(&cold, std::time::Duration::ZERO).unwrap().state_root, cold);
         *HISTORICAL_READER.lock().unwrap() = None;
     }

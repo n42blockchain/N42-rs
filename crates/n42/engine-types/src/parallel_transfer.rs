@@ -2117,15 +2117,16 @@ fn graft_shard_of(address: &Address) -> usize {
 }
 
 /// Puts a [`GraftTarget`]'s memory in as the block's bundle map and the
-/// graft's revert list, if the block's bundle is still empty and has no
-/// memory of its own. The largest bundle may still become the base after
+/// graft's revert list when it offers more capacity than the existing map.
+/// Preserve pre-execution accounts and storage by moving them into that map.
+/// The largest bundle may still become the base after
 /// this: [`take_base_bundle`] moves it into the target's map rather than
 /// putting its own map in the target's place.
 fn install_target<DB: Database>(state: &mut State<DB>, target: Option<GraftTarget>, graft: &mut Graft) {
-    if let Some(target) = target
-        && state.bundle_state.state.is_empty()
-        && state.bundle_state.state.capacity() == 0
+    if let Some(mut target) = target
+        && state.bundle_state.state.capacity() < target.accounts.capacity()
     {
+        target.accounts.extend(std::mem::take(&mut state.bundle_state.state));
         state.bundle_state.state = target.accounts;
         graft.reverts = target.reverts;
     }
@@ -2633,8 +2634,8 @@ pub fn follower_graft_fold() -> GraftFold {
 /// same reverts, the same beneficiary credit (`the_indexed_fold_equals_the_graft`).
 ///
 /// `target`: memory mapped for the block's bundle ahead of the graft
-/// ([`GraftTarget::prefaulted`]), taken if the block's bundle is still
-/// empty. It changes where the accounts are written, never what is written.
+/// ([`GraftTarget::prefaulted`]), taken when it provides more capacity.
+/// Existing entries are preserved; only their backing memory changes.
 pub fn graft_bundles_folded<DB: Database>(
     state: &mut State<DB>,
     bundles: Vec<BundleState>,
@@ -5825,6 +5826,10 @@ mod tests {
     /// bundle already carrying the first's accounts, which is the path a
     /// builder takes when its serial loop ran before the graft.
     fn fold_fixture_run(fold: GraftFold, keep_cache: bool, held_in_cache: bool) -> FoldSnapshot {
+        fold_fixture_run_with_target(fold, keep_cache, held_in_cache, false)
+    }
+
+    fn fold_fixture_run_with_target(fold: GraftFold, keep_cache: bool, held_in_cache: bool, prefault_second: bool) -> FoldSnapshot {
         let beneficiary = addr(9);
         let held = addr(5);
         let mut db = CacheDB::new(EmptyDB::default());
@@ -5841,8 +5846,13 @@ mod tests {
         let mut committed = 0usize;
         let mut delta = U256::ZERO;
         let mut reverts = Vec::new();
-        for half in [bundles, rest] {
-            let graft = graft_bundles_folded(&mut state, half, beneficiary, keep_cache, fold, None).expect("the fold");
+        for (index, half) in [bundles, rest].into_iter().enumerate() {
+            let target = (prefault_second && index == 1).then(|| GraftTarget::prefaulted(1024));
+            let prepared_capacity = target.as_ref().map(|target| target.accounts.capacity());
+            let graft = graft_bundles_folded(&mut state, half, beneficiary, keep_cache, fold, target).expect("the fold");
+            if let Some(capacity) = prepared_capacity {
+                assert!(state.bundle_state.state.capacity() >= capacity, "prepared memory must be used for a populated bundle");
+            }
             grafted += graft.accounts;
             committed += graft.committed;
             delta = delta.saturating_add(graft.beneficiary_delta);
@@ -6019,6 +6029,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn prefault_preserves_a_populated_bundle_and_its_graft_accounting() {
+        for keep_cache in [false, true] {
+            for held_in_cache in [false, true] {
+                let expected = fold_fixture_run(GraftFold::Direct, keep_cache, held_in_cache);
+                for fold in [GraftFold::Direct, GraftFold::Indexed, GraftFold::IndexedRanges] {
+                    assert_eq!(fold_fixture_run_with_target(fold, keep_cache, held_in_cache, true), expected,
+                        "{fold:?}, cache {keep_cache}, held {held_in_cache}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefault_keeps_pre_execution_storage_and_bundle_metadata() {
+        let mut state = State::builder().with_database(EmptyDB::default()).with_bundle_update().build();
+        let mut account = BundleAccount::new(
+            Some(fold_fixture_info(100, 0)), Some(fold_fixture_info(90, 1)),
+            Default::default(), revm::database::AccountStatus::Changed,
+        );
+        account.storage.insert(Default::default(), revm::database::states::StorageSlot::new_changed(U256::from(11), U256::from(22)));
+        state.bundle_state.state.insert(addr(5), account);
+        state.bundle_state.state_size = 2;
+        let expected = state.bundle_state.clone();
+        let target = GraftTarget::prefaulted(1024);
+        let capacity = target.accounts.capacity();
+        let mut graft = Graft::default();
+        install_target(&mut state, Some(target), &mut graft);
+        assert!(state.bundle_state.state.capacity() >= capacity);
+        assert_eq!(state.bundle_state, expected);
     }
 
     /// The same, on a block big enough for the index to sort and for the

@@ -1,6 +1,7 @@
 //! A bounded, checksummed parent-root frontier for compacted depth-two checkpoints.
 
 use alloy_primitives::{B256, keccak256};
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,7 +30,12 @@ pub(crate) fn decode(bytes: &[u8], chain_id: u64, genesis: B256) -> Result<[Opti
     if digest != keccak256(payload).as_slice() {
         return Err("frontier checksum mismatch".into());
     }
-    let file: File = bincode::deserialize(payload).map_err(|err| err.to_string())?;
+    let file: File = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(1024)
+        .reject_trailing_bytes()
+        .deserialize(payload)
+        .map_err(|err| err.to_string())?;
     if file.version != 1 || file.chain_id != chain_id || file.genesis != genesis {
         return Err("frontier version or chain identity mismatch".into());
     }
@@ -110,5 +116,10 @@ mod tests {
         conflicting.parent_root = B256::ZERO;
         assert!(update(Some(&bytes), 1144, genesis, conflicting).is_err());
         assert_eq!(update(Some(&bytes), 1144, genesis, record(1)).unwrap(), bytes);
+        let mut payload = bytes[32..].to_vec();
+        payload.push(0);
+        let mut trailing = keccak256(&payload).to_vec();
+        trailing.extend_from_slice(&payload);
+        assert!(decode(&trailing, 1144, genesis).is_err());
     }
 }

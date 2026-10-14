@@ -5455,8 +5455,9 @@ impl<T: reth_transaction_pool::PoolTransaction> Puller<T> {
         let (refusals, refusal_rx) = std::sync::mpsc::channel::<Refusal<T>>();
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = done.clone();
-        let apply = move |best: &mut Box<dyn BestTransactions<Item = Arc<reth_transaction_pool::ValidPoolTransaction<T>>>>| {
-            while let Ok(refusal) = refusal_rx.try_recv() {
+        let apply = move |best: &mut Box<dyn BestTransactions<Item = Arc<reth_transaction_pool::ValidPoolTransaction<T>>>>, wait: bool| {
+            let first = wait.then(|| refusal_rx.recv_timeout(std::time::Duration::from_millis(5)).ok()).flatten();
+            for refusal in first.into_iter().chain(std::iter::from_fn(|| refusal_rx.try_recv().ok())) {
                 match refusal {
                     Refusal::Invalid(tx, err) => best.mark_invalid(&tx, err),
                     Refusal::Blobs => best.skip_blobs(),
@@ -5465,7 +5466,7 @@ impl<T: reth_transaction_pool::PoolTransaction> Puller<T> {
         };
         let spawned = std::thread::Builder::new().name("n42-builder-puller".into()).spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                apply(&mut best);
+                apply(&mut best, false);
                 let mut pulled = Vec::with_capacity(batch);
                 for _ in 0..batch {
                     match best.next() {
@@ -5473,12 +5474,22 @@ impl<T: reth_transaction_pool::PoolTransaction> Puller<T> {
                         None => break,
                     }
                 }
-                if pulled.is_empty() || batch_tx.send(pulled).is_err() {
+                if pulled.is_empty() {
+                    // End the candidate stream without ending the iterator:
+                    // execution can still reject dispatched candidates. Its
+                    // give-back must hear those refusals before the next build.
+                    drop(batch_tx);
+                    while !stop.load(Ordering::Relaxed) {
+                        apply(&mut best, true);
+                    }
+                    break;
+                }
+                if batch_tx.send(pulled).is_err() {
                     break;
                 }
             }
             // The build's last refusals, then the walk's own give-back on drop.
-            apply(&mut best);
+            apply(&mut best, false);
         });
         let thread = match spawned {
             Ok(handle) => Some(handle),
@@ -5495,7 +5506,7 @@ impl<T: reth_transaction_pool::PoolTransaction> Puller<T> {
     }
 
     fn refuse(&self, refusal: Refusal<T>) {
-        // A puller that already ended has nothing to refuse.
+        // An exhausted walk stays alive to receive the build's last refusals.
         let _ = self.refusals.send(refusal);
     }
 }
@@ -5531,6 +5542,64 @@ fn ticks() -> u64 {
     {
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+    }
+}
+
+#[cfg(test)]
+mod puller_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct EmptyWalk {
+        refused: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+    }
+    impl Iterator for EmptyWalk {
+        type Item = Arc<reth_transaction_pool::ValidPoolTransaction<crate::N42PooledTransaction>>;
+        fn next(&mut self) -> Option<Self::Item> {
+            None
+        }
+    }
+    impl BestTransactions for EmptyWalk {
+        fn mark_invalid(&mut self, _: &Self::Item, _: InvalidPoolTransactionError) {}
+        fn no_updates(&mut self) {}
+        fn set_skip_blobs(&mut self, skip: bool) {
+            if skip {
+                self.refused.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+    impl Drop for EmptyWalk {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn an_exhausted_puller_accepts_refusals_until_the_build_finishes() {
+        let refused = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let puller = Puller::start(
+            Box::new(EmptyWalk {
+                refused: refused.clone(),
+                dropped: dropped.clone(),
+            }),
+            4,
+        );
+        assert!(matches!(
+            puller
+                .batches()
+                .recv_timeout(std::time::Duration::from_secs(2)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+        puller.refuse(Refusal::Blobs);
+        drop(puller);
+        assert_eq!(
+            refused.load(Ordering::SeqCst),
+            1,
+            "late refusal must reach the iterator before its give-back"
+        );
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 }
 

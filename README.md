@@ -1,5 +1,7 @@
 # N42 Public Chain
 
+**Code audit:** [三工程近一个月审计与修复](docs/monthly-audit-20261014.md)。
+
 [![Rust](https://img.shields.io/badge/rust-1.50%2B-orange.svg)](https://www.rust-lang.org)
 [![GitHub Actions](https://github.com/n42blockchain/N42-rs/actions/workflows/devskim.yml/badge.svg)](https://github.com/n42blockchain/N42-rs/actions/workflows/devskim.yml)
 [![License](https://img.shields.io/github/license/n42blockchain/N42-rs)](https://github.com/n42blockchain/N42-rs/blob/main/LICENSE)

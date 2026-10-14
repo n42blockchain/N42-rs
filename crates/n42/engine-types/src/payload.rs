@@ -1792,6 +1792,9 @@ where
     // Of the fold: the graft alone. `par_fold_ms` covers the receipts loop
     // and then the longer of the graft and the transactions root beside it.
     let mut par_graft_ms = 0u64;
+    // Time left waiting for overlapped jobs after the graft has completed.
+    let mut par_root_wait_ms = 0u64;
+    let mut par_receipts_wait_ms = 0u64;
     // `N42_PHASE_TIMERS=1` (plan v6 6.5): the graft's own sub-phases, the
     // default in-place fold only (`graft_bundles_direct`), and the parallel
     // step's transfers by phase and read door -- see `Phases::transfer_timers`.
@@ -3044,11 +3047,13 @@ where
                         }) };
                         // Kept at 0 when nothing was grafted.
                         graft_ms = if sharded_out.is_some() || early_out.is_some() { 0 } else { at.elapsed().as_millis() as u64 };
-                        (
-                            graft,
-                            root.map(|job| job.join().expect("the transactions root job does not panic")),
-                            receipts_job.map(|job| job.join()),
-                        )
+                        let root_wait_at = std::time::Instant::now();
+                        let root_done = root.map(|job| job.join().expect("the transactions root job does not panic"));
+                        par_root_wait_ms = root_wait_at.elapsed().as_millis() as u64;
+                        let receipts_wait_at = std::time::Instant::now();
+                        let receipts_done = receipts_job.map(|job| job.join());
+                        par_receipts_wait_ms = receipts_wait_at.elapsed().as_millis() as u64;
+                        (graft, root_done, receipts_done)
                     });
                     par_graft_ms = graft_ms;
                     early_transactions_root = early_root;
@@ -5226,6 +5231,17 @@ where
             par_fold_ms,
             par_committed,
             par_ms,
+            par_commit_ms,
+            par_collect_ms,
+            par_prep_ms,
+            par_prefault_ms,
+            par_root_wait_ms,
+            par_receipts_wait_ms,
+            par_graft_base_ms,
+            par_graft_reserve_ms,
+            par_graft_insert_ms,
+            par_graft_reverts_ms,
+            par_graft_other_ms,
             state_after_pull = defer_state,
             state_wait_ms,
             state_wait_us,

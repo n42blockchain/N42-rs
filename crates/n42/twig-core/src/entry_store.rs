@@ -255,7 +255,16 @@ impl FileEntries {
     /// (missing bits read as dead). Returns the store and how many records
     /// it holds.
     pub(crate) fn open_existing(path: &Path, slots: u64, active: &[u64]) -> io::Result<(Self, u64)> {
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        Self::open_existing_mode(path, slots, active, true)
+    }
+
+    /// Reads a historical prefix without shortening the live entry file.
+    pub(crate) fn open_existing_readonly(path: &Path, slots: u64, active: &[u64]) -> io::Result<(Self, u64)> {
+        Self::open_existing_mode(path, slots, active, false)
+    }
+
+    fn open_existing_mode(path: &Path, slots: u64, active: &[u64], truncate: bool) -> io::Result<(Self, u64)> {
+        let mut file = OpenOptions::new().read(true).write(truncate).open(path)?;
         let len = file.metadata()?.len();
         // Walk the record headers: a scan of the whole file's bytes, in
         // 64 MB pieces so the tree's rebuild does not hold the file twice.
@@ -280,7 +289,9 @@ impl FileEntries {
         drop(reader);
         let kept = offsets.len() as u64;
         let len_bytes = at;
-        file.set_len(len_bytes)?;
+        if truncate {
+            file.set_len(len_bytes)?;
+        }
         let mut store = Self {
             path: path.to_path_buf(),
             file,
@@ -985,6 +996,25 @@ impl Entries {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_readonly_historical_prefix_preserves_the_live_entry_file() {
+        let path = scratch("readonly-prefix");
+        let mut file = FileEntries::create(&path).unwrap();
+        for n in 0..4u8 {
+            file.push(&[n; 32], &[n; 8]).unwrap();
+        }
+        file.sync().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let (old, kept) = FileEntries::open_existing_readonly(&path, 2, &[3]).unwrap();
+        assert_eq!(kept, 2);
+        assert_eq!(old.key(1), [1; 32]);
+        assert_eq!(old.value(1), &[1; 8]);
+        drop(old);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let (_, kept) = FileEntries::open_existing(&path, 4, &[15]).unwrap();
+        assert_eq!(kept, 4);
+    }
 
     fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("n42-entry-store-{name}-{}", std::process::id())).join("entries.log")

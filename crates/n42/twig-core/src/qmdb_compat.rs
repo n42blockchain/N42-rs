@@ -1612,7 +1612,30 @@ impl QmdbCompatTree {
         next_slot: u64,
         active: &[u64],
     ) -> Result<(Self, u64), QmdbSnapshotError> {
-        let (file, kept) = crate::entry_store::FileEntries::open_existing(path, next_slot, active)
+        Self::from_entry_file_mode(path, next_slot, active, false)
+    }
+
+    /// Reconstructs a historical prefix without truncating entries after it.
+    pub fn from_entry_file_readonly(
+        path: &std::path::Path,
+        next_slot: u64,
+        active: &[u64],
+    ) -> Result<(Self, u64), QmdbSnapshotError> {
+        Self::from_entry_file_mode(path, next_slot, active, true)
+    }
+
+    fn from_entry_file_mode(
+        path: &std::path::Path,
+        next_slot: u64,
+        active: &[u64],
+        readonly: bool,
+    ) -> Result<(Self, u64), QmdbSnapshotError> {
+        let opened = if readonly {
+            crate::entry_store::FileEntries::open_existing_readonly(path, next_slot, active)
+        } else {
+            crate::entry_store::FileEntries::open_existing(path, next_slot, active)
+        };
+        let (file, kept) = opened
             .map_err(|e| QmdbSnapshotError::EntryFile(e.to_string()))?;
         let entries = Entries::File(file);
         let n = kept as usize;

@@ -2172,7 +2172,8 @@ impl<E: ExecutionLayer> H2Service<E> {
                     // The same path a gossiped body takes; the hash the peer
                     // sent it under is checked by the decode, not trusted.
                     match self.accept_body_once(chunk.rlp) {
-                        Ok((block_hash, _, _)) if block_hash == hash => {
+                        Ok((block_hash, header, _)) if block_hash == hash => {
+                            self.note_peer_height(peer, header.number);
                             self.import_eagerly(hash);
                             self.received_bodies.push(hash);
                         }
@@ -2189,6 +2190,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     // sent it under is checked by the decode, not trusted.
                     match n42_h2_net::decode_block_rlp_shared(&chunk.rlp, self.header_profile) {
                         Ok(block) if block.block_hash == hash => {
+                            self.note_peer_height(peer, block.header.number);
                             self.remember_block(hash, &block.header);
                             self.remember_body(hash, chunk.rlp.clone());
                             self.driver.cache_payload(hash, block.execution_data());
@@ -2210,11 +2212,13 @@ impl<E: ExecutionLayer> H2Service<E> {
             TransportEvent::BlockPushed { peer, chunk } if n42_h2_execution::body_once() => {
                 // As below, with only the header read here.
                 match self.accept_body_once(chunk.rlp) {
-                    Ok((hash, _, true)) => {
+                    Ok((hash, header, true)) => {
+                        self.note_peer_height(peer, header.number);
                         self.import_eagerly(hash);
                         self.received_bodies.push(hash);
                     }
-                    Ok((hash, _, false)) => {
+                    Ok((hash, header, false)) => {
+                        self.note_peer_height(peer, header.number);
                         debug!(target: "n42.h2.node", %peer, ?hash, "a pushed body this node already holds");
                     }
                     Err(err) => debug!(target: "n42.h2.node", %peer, %err, "a pushed body could not be read"),
@@ -2230,6 +2234,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // already been emptied by whichever copy came first.
                 match n42_h2_net::decode_block_rlp_shared(&chunk.rlp, self.header_profile) {
                     Ok(block) => {
+                        self.note_peer_height(peer, block.header.number);
                         let hash = block.block_hash;
                         if !self.body_store.contains_key(&hash) {
                             self.remember_block(hash, &block.header);

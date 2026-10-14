@@ -832,6 +832,7 @@ async fn a_pushed_body_is_imported_once_whoever_sends_it() {
     assert_eq!(rig.svc.ready_bodies, vec![hash]);
     assert!(rig.svc.driver.has_payload(&hash));
     assert_eq!(rig.svc.block_headers.get(&hash), Some(&header));
+    assert_eq!(rig.svc.peer_heights[&peer], 6, "pushes refresh peer height for range catchup");
 
     rig.svc.handle_transport_event(TransportEvent::BlockPushed { peer, chunk: chunk(&rlp) }).expect("ok");
     assert_eq!(rig.svc.received_bodies, vec![hash], "the copy that follows is recognised");

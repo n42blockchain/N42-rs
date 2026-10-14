@@ -425,6 +425,34 @@ fn peer_of(rig: &Rig) -> PeerId {
 }
 
 #[tokio::test]
+async fn a_named_direct_body_pulls_a_parent_missed_before_the_peer_connected() {
+    let (mut a, b) = pair(0).await;
+    let blocks = chain(2);
+    for (_, _, body) in &blocks {
+        let payload = n42_h2_net::decode_block_rlp_raw(body, HeaderProfile::Ethereum).unwrap().execution_data();
+        b.el.new_payload(payload).await.unwrap();
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let (tx, mut rx) = mpsc::channel(4);
+    crate::body_channel::listen(addr, tx).await.unwrap();
+    let pushers = crate::body_channel::BodyPushers::connect(vec![addr]);
+    pushers.announce(peer_of(&b).to_string());
+    pushers.push(crate::body_channel::OfferedBody { full: blocks[1].2.clone(), compact: None });
+    let received = within(rx.recv()).await.unwrap();
+    a.svc.handle_direct_body(received);
+    assert_eq!(a.svc.peer_heights[&peer_of(&b)], 2, "direct traffic must refresh the stale connect status");
+    let mut events = Vec::new();
+    within(a.svc.consider_catch_up(&mut events)).await;
+    let pull = a.svc.catch_up.as_ref().unwrap();
+    assert_eq!((pull.next, pull.target), (1, 2), "pull includes the absent parent");
+    let mut b = b;
+    pump(&mut a, &mut b, (true, true), &mut events, |a, _, _| a.svc.driver.head() == blocks[1].0 && a.svc.catch_up.is_none()).await;
+    assert!(a.el.block_by_hash(blocks[0].0).await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn named_transactions_are_served_from_the_stored_whole_body() {
     let (mut a, mut b) = pair(0).await;
     let (hash, frame, txs) = compact_frame(5);

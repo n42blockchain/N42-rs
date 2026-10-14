@@ -364,14 +364,14 @@ const RELEASE_LOG_RECORDS: usize = 4;
 /// second late (`own block imported by header round_trip_ms=1003`) and the
 /// chained child's seal waited 600-670 ms for the parent's fields.
 fn release_off_lock(head: u64, released: Released) {
-    use std::sync::mpsc::Sender;
+    use std::sync::mpsc::SyncSender;
     use std::sync::OnceLock;
-    static RELEASER: OnceLock<Option<Sender<(u64, Released)>>> = OnceLock::new();
+    static RELEASER: OnceLock<Option<SyncSender<(u64, Released)>>> = OnceLock::new();
     if released.is_empty() {
         return;
     }
     let releaser = RELEASER.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<(u64, Released)>();
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<(u64, Released)>(2);
         std::thread::Builder::new()
             .name("n42-qmdb-release".into())
             .spawn(move || {
@@ -394,10 +394,16 @@ fn release_off_lock(head: u64, released: Released) {
     // Without the thread (it could not be spawned, or it is gone) the frees
     // happen here: still after the forest's lock is released.
     if let Some(sender) = releaser {
-        let sent = sender.send((head, released));
-        if let Err(std::sync::mpsc::SendError(unsent)) = sent {
-            drop(unsent);
-        }
+        drop(try_queue_release(sender, (head, released)));
+    }
+}
+
+// A full retirement queue must not retain an unbounded forest history.
+// Return ownership for inline disposal, always after the forest lock is gone.
+fn try_queue_release<T: Send>(sender: &std::sync::mpsc::SyncSender<T>, value: T) -> Option<T> {
+    match sender.try_send(value) {
+        Ok(()) => None,
+        Err(std::sync::mpsc::TrySendError::Full(value) | std::sync::mpsc::TrySendError::Disconnected(value)) => Some(value),
     }
 }
 
@@ -3022,6 +3028,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("n42-qmdb-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn forest_release_queue_returns_full_and_disconnected_batches() {
+        let (send, recv) = std::sync::mpsc::sync_channel(1);
+        assert!(try_queue_release(&send, 1).is_none());
+        assert_eq!(try_queue_release(&send, 2), Some(2));
+        assert_eq!(recv.recv().unwrap(), 1);
+        drop(recv);
+        assert_eq!(try_queue_release(&send, 3), Some(3));
     }
 
     #[test]

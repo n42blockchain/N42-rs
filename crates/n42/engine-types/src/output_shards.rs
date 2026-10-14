@@ -231,10 +231,10 @@ pub fn merge_pool() -> Option<&'static rayon::ThreadPool> {
 /// background priority: in loop351 stage bb the materialisation's ~10 ms on
 /// the behind pool took the threads the parent's QMDB root and its hashed
 /// post-state run beside (`roots_ms` p90 47 -> 64), and the child's seal
-/// waits for that root. The block's own root still needs the materialised
-/// accounts (its operations and its hashed post-state read `&BundleAccount`
-/// through `view`), so this moves the work off the cores the root path
-/// shares, not off the block's own chain. `N42_LANE_POOL=behind`: the
+/// waits for that root. Since the root reads the lanes in place
+/// (`N42_LANE_ROOT`, [`FrozenShards::view_lanes`]) the maps are made here by
+/// the first reader that needs one -- the merge behind the publication --
+/// not by the freeze. `N42_LANE_POOL=behind`: the
 /// freeze's pool, as before. `None` then, or when the pool cannot be built.
 pub fn lane_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
@@ -559,9 +559,9 @@ impl Shard {
 /// accounts the lane does not hold (the beneficiary, spilled ones). Read
 /// before the freeze through [`Self::get`] and [`Self::iter`], which answer
 /// owned or borrowed values (`Cow`): a lane account is closed on the fly,
-/// as `BatchState::take_bundle` closes it. The freeze materialises the lane
-/// accounts by shard ([`Indexed`]'s `lane_state`); after it every account
-/// is in a map and is read borrowed.
+/// as `BatchState::take_bundle` closes it. After the freeze the lane
+/// accounts stay in their lanes, read in place by the root and by address,
+/// and are made into maps only for a reader that needs one ([`LaneSet`]).
 #[derive(Debug, Default, Clone)]
 pub(crate) struct BatchAccounts {
     /// The closed accounts (on a lane batch: those off the lane).
@@ -695,6 +695,81 @@ impl IndexedBatch {
     }
 }
 
+/// Whether a stage-4 block's QMDB root and hashed post-state read the lane
+/// batches' accounts in their lanes (`N42_LANE_ROOT`, on by default; `0`
+/// materialises them at the freeze as before, loop351). Read once.
+pub fn lane_root() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_LANE_ROOT").map_or(true, |v| v.trim() != "0"))
+}
+
+/// The lane batches' accounts and kept reverts as maps, by shard.
+type LaneMaps = (Vec<AddressHashMap<BundleAccount>>, Vec<Vec<(Address, AccountRevert)>>);
+
+/// `N42_ONE_PROBE=4`: what the index-mode output keeps of its lane batches.
+/// The accounts stay in the lanes (`BatchAccounts::lane`, kept by the
+/// batches): a read by address is a probe of the index and of the lane's
+/// position table ([`Indexed::get_cow`]), and the root reads them where they
+/// lie ([`FrozenShards::view_lanes`]). The maps ([`materialise_lanes`]: the
+/// accounts the index names their lane batch for, closed, and the kept
+/// reverts) are made once, on the lane pool, by the first reader that needs
+/// a `&BundleAccount` or the reverts -- the merges behind the publication,
+/// `take`, `into_staged`, [`FrozenShards::get`] -- or at the freeze with
+/// `N42_LANE_ROOT=0`.
+#[derive(Default)]
+struct LaneSet {
+    /// Whether any batch handed its lane over.
+    any: bool,
+    /// By batch: its lane's positions by shard (`BatchOut::lane_at`).
+    lane_at: Vec<Vec<Vec<u32>>>,
+    /// By shard: the conflicting `(batch, address)` pairs in index order
+    /// (`IndexPart::drops`): an account's first writer keeps its revert.
+    drops: Vec<Vec<(u16, Address)>>,
+    /// The maps, once made.
+    made: OnceLock<LaneMaps>,
+    /// The materialisation's wall time, nanoseconds.
+    made_ns: AtomicU64,
+}
+
+/// One lane account of a block's output as the root reads it: a lane and a
+/// position in it ([`FrozenShards::view_lanes`]).
+#[derive(Clone, Copy)]
+pub struct LaneLeaf<'a> {
+    lane: &'a crate::batch_state::LaneOutput,
+    pos: u32,
+}
+
+impl std::fmt::Debug for LaneLeaf<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaneLeaf").field("address", &self.lane.address(self.pos as usize)).field("pos", &self.pos).finish()
+    }
+}
+
+impl LaneLeaf<'_> {
+    /// Whether the account was destroyed over an existing one.
+    fn destroyed(&self) -> bool {
+        self.lane.leaf(self.pos as usize).is_some_and(|(_, destroyed)| destroyed)
+    }
+
+    /// The account as `BundleAccount` closes it (tests).
+    pub fn account(&self) -> Option<BundleAccount> {
+        self.lane.account(self.pos as usize)
+    }
+}
+
+impl n42_qmdb_reth::PlainAccountLeaf for LaneLeaf<'_> {
+    #[inline]
+    fn leaf_address(&self) -> &Address {
+        static NONE: Address = Address::ZERO;
+        self.lane.address(self.pos as usize).unwrap_or(&NONE)
+    }
+
+    #[inline]
+    fn leaf_plain(&self) -> Option<(u64, U256)> {
+        self.lane.leaf(self.pos as usize).and_then(|(plain, _)| plain)
+    }
+}
+
 /// The block's output in index mode: the batches' maps, a map a shard from
 /// address to the batch holding it ([`CONFLICT`]: the shard's conflicts map
 /// holds it, summed), and the reverts kept, a `(batch, position)` pair each.
@@ -705,13 +780,9 @@ struct Indexed {
     index: Vec<AddressHashMap<u16>>,
     conflicts: Vec<AddressHashMap<BundleAccount>>,
     kept: Vec<Vec<(u16, u32)>>,
-    /// `N42_ONE_PROBE=4`: by shard, the lane batches' accounts the index
-    /// names their batch for, materialised by the freeze (empty without
-    /// lane batches): read where the batch's own map does not hold them.
-    lane_state: Vec<AddressHashMap<BundleAccount>>,
-    /// `N42_ONE_PROBE=4`: by shard, the lane batches' kept reverts (an
-    /// account several batches wrote keeps its first writer's).
-    lane_reverts: Vec<Vec<(Address, AccountRevert)>>,
+    /// `N42_ONE_PROBE=4`: the lane batches' accounts, read in their lanes
+    /// and materialised into maps only when a reader needs one ([`LaneSet`]).
+    lanes: LaneSet,
     state_size: usize,
     beneficiary_delta: U256,
     conflict_count: usize,
@@ -728,12 +799,65 @@ impl std::fmt::Debug for Indexed {
 }
 
 impl Indexed {
+    /// The lane maps, made on the first call ([`LaneSet`]).
+    fn lane_maps(&self) -> &LaneMaps {
+        self.lanes.made.get_or_init(|| {
+            if !self.lanes.any {
+                return Default::default();
+            }
+            use rayon::prelude::*;
+            let at = std::time::Instant::now();
+            let make = || {
+                (0..self.index.len())
+                    .into_par_iter()
+                    .map(|shard| materialise_lanes(shard, &self.batches, &self.lanes, &self.index[shard]))
+                    .unzip()
+            };
+            let maps: LaneMaps = match lane_pool() {
+                Some(pool) => pool.install(make),
+                None => make(),
+            };
+            self.lanes.made_ns.store(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            maps
+        })
+    }
+
+    /// The lane maps if made.
+    fn lane_maps_made(&self) -> Option<&LaneMaps> {
+        self.lanes.made.get().filter(|_| self.lanes.any)
+    }
+
     fn get(&self, address: &Address) -> Option<&BundleAccount> {
         let shard = shard_index(address, self.index.len());
         match *self.index.get(shard)?.get(address)? {
             CONFLICT => self.conflicts.get(shard)?.get(address),
-            id => self.batches.get(id as usize)?.accounts.map.get(address).or_else(|| self.lane_state.get(shard)?.get(address)),
+            id => self.batches.get(id as usize)?.accounts.map.get(address).or_else(|| self.lane_maps().0.get(shard)?.get(address)),
         }
+    }
+
+    /// [`Self::get`] without making the lane maps: a lane account is closed
+    /// from its lane.
+    fn get_cow(&self, address: &Address) -> Option<std::borrow::Cow<'_, BundleAccount>> {
+        let shard = shard_index(address, self.index.len());
+        match *self.index.get(shard)?.get(address)? {
+            CONFLICT => self.conflicts.get(shard)?.get(address).map(std::borrow::Cow::Borrowed),
+            id => {
+                let batch = self.batches.get(id as usize)?;
+                if let Some(account) = batch.accounts.map.get(address) {
+                    return Some(std::borrow::Cow::Borrowed(account));
+                }
+                if let Some((state, _)) = self.lane_maps_made() {
+                    return state.get(shard)?.get(address).map(std::borrow::Cow::Borrowed);
+                }
+                batch.accounts.lane.as_ref()?.get(address).map(std::borrow::Cow::Owned)
+            }
+        }
+    }
+
+    /// Whether the output holds `address`: one index probe.
+    fn holds(&self, address: &Address) -> bool {
+        let shard = shard_index(address, self.index.len());
+        self.index.get(shard).is_some_and(|index| index.contains_key(address))
     }
 
     fn revert(&self, (id, at): (u16, u32)) -> Option<&(Address, AccountRevert)> {
@@ -746,19 +870,57 @@ impl Indexed {
             .iter()
             .flat_map(IndexedBatch::live)
             .chain(self.conflicts.iter().flatten())
-            .chain(self.lane_state.iter().flatten())
+            .chain(self.lane_maps().0.iter().flatten())
+    }
+
+    /// [`Self::iter`] less the lane accounts: the batches' maps and the
+    /// conflicts.
+    fn iter_maps(&self) -> impl Iterator<Item = (&Address, &BundleAccount)> {
+        self.batches.iter().flat_map(IndexedBatch::live).chain(self.conflicts.iter().flatten())
+    }
+
+    /// Every lane account the index names its lane batch for, as a
+    /// [`LaneLeaf`], less those `skip` names; a batch a task on the current
+    /// rayon pool.
+    fn lane_leaves(&self, skip: impl Fn(&Address) -> bool + Sync) -> Vec<LaneLeaf<'_>> {
+        use rayon::prelude::*;
+        let count = self.index.len();
+        let parts: Vec<Vec<LaneLeaf<'_>>> = self
+            .batches
+            .par_iter()
+            .enumerate()
+            .map(|(id, batch)| {
+                let Some(lane) = batch.accounts.lane.as_ref() else { return Vec::new() };
+                let mut out = Vec::with_capacity(lane.len());
+                for pos in 0..lane.len() {
+                    let Some(address) = lane.address(pos) else { continue };
+                    let own = self.index.get(shard_index(address, count)).and_then(|index| index.get(address)) == Some(&(id as u16));
+                    if own && !skip(address) {
+                        out.push(LaneLeaf { lane, pos: pos as u32 });
+                    }
+                }
+                out
+            })
+            .collect();
+        let mut leaves = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+        for part in parts {
+            leaves.extend(part);
+        }
+        leaves
     }
 
     /// `address` taken out of the output with its kept reverts; its size
     /// taken off.
     fn take(&mut self, address: &Address) -> Option<BundleAccount> {
+        // The lane maps are made from the index: made before it changes.
+        let _ = self.lane_maps();
         let shard = shard_index(address, self.index.len());
         let id = self.index.get_mut(shard)?.remove(address)?;
         let account = match id {
             CONFLICT => self.conflicts.get_mut(shard)?.remove(address)?,
             id => match self.batches.get_mut(id as usize)?.remove(address) {
                 Some(account) => account,
-                None => self.lane_state.get_mut(shard)?.remove(address)?,
+                None => self.lanes.made.get_mut()?.0.get_mut(shard)?.remove(address)?,
             },
         };
         self.state_size = self.state_size.saturating_sub(account.size_hint());
@@ -768,7 +930,7 @@ impl Indexed {
                 batches.get(id as usize).and_then(|b| b.reverts.get(at as usize)).is_none_or(|(a, _)| a != address)
             });
         }
-        if let Some(reverts) = self.lane_reverts.get_mut(shard) {
+        if let Some(reverts) = self.lanes.made.get_mut().and_then(|(_, reverts)| reverts.get_mut(shard)) {
             reverts.retain(|(a, _)| a != address);
         }
         Some(account)
@@ -1899,28 +2061,12 @@ fn finish_indexed(
         (split.heavy_shard, split.heavy_work, split.split_tasks) = (heavy_shard, heavy_work, split_tasks);
     }
     let live = live.is_some();
-    // `N42_ONE_PROBE=4`: the lane batches' accounts and reverts made, one
-    // task a shard, now that the index says which batch holds each -- on the
-    // lane pool (`lane_pool`, background set) rather than the freeze's.
-    let lane_at = std::time::Instant::now();
-    let (lane_state, lane_reverts): (Vec<AddressHashMap<BundleAccount>>, Vec<Vec<(Address, AccountRevert)>>) =
-        if batches.iter().any(|batch| batch.accounts.lane.is_some()) {
-            use rayon::prelude::*;
-            let batches_ref = &batches;
-            let built_ref = &built;
-            lane_pool().unwrap_or(pool).install(|| {
-                (0..count)
-                    .into_par_iter()
-                    .map(|shard| match built_ref.get(shard) {
-                        Some((part, _)) => materialise_lanes(shard, batches_ref, part),
-                        None => Default::default(),
-                    })
-                    .unzip()
-            })
-        } else {
-            (Vec::new(), Vec::new())
-        };
-    let lane_ns = if lane_state.is_empty() { 0 } else { lane_at.elapsed().as_nanos() as u64 };
+    // `N42_ONE_PROBE=4`: the lane batches' accounts stay in their lanes;
+    // what makes their maps later is kept ([`LaneSet`]).
+    let any_lane = batches.iter().any(|batch| batch.accounts.lane.is_some());
+    let lane_drops: Vec<Vec<(u16, Address)>> =
+        if any_lane { built.iter().map(|(part, _)| part.drops.clone()).collect() } else { Vec::new() };
+    let mut lane_at = Vec::with_capacity(if any_lane { batches.len() } else { 0 });
     let mut state_size = 0usize;
     let mut beneficiary_delta = U256::ZERO;
     let mut kept_batches = Vec::with_capacity(batches.len());
@@ -1928,13 +2074,14 @@ fn finish_indexed(
     for batch in batches {
         state_size += batch.size;
         beneficiary_delta = beneficiary_delta.saturating_add(batch.beneficiary_delta);
-        let mut accounts = batch.accounts;
-        // Materialised: the lane goes unless an early output shares it.
-        if let Some(held) = Arc::get_mut(&mut accounts) {
-            held.lane = None;
-        }
+        let accounts = batch.accounts;
         kept_batches.push(IndexedBatch { accounts, removed: Default::default(), reverts: batch.reverts });
-        lists.push((batch.addresses, batch.revert_at, batch.lane_at));
+        if any_lane {
+            lane_at.push(batch.lane_at);
+            lists.push((batch.addresses, batch.revert_at, Vec::new()));
+        } else {
+            lists.push((batch.addresses, batch.revert_at, batch.lane_at));
+        }
     }
     // The address lists are done with: freed on the pool.
     pool.spawn(move || drop(lists));
@@ -1980,20 +2127,27 @@ fn finish_indexed(
     }
     let fold_ns = at.elapsed().as_nanos() as u64;
     log_folded(fold_ns, &split, Some((index_build_ns, conflict_count)), live);
+    let indexed = Indexed {
+        batches: kept_batches,
+        index,
+        conflicts,
+        kept,
+        state_size,
+        beneficiary_delta,
+        conflict_count,
+        lanes: LaneSet { any: any_lane, lane_at, drops: lane_drops, ..Default::default() },
+    };
+    // `N42_LANE_ROOT=0`: the maps made here, as loop351 made them.
+    let lane_ns = if any_lane && !lane_root() {
+        let _ = indexed.lane_maps();
+        indexed.lanes.made_ns.load(Ordering::Relaxed)
+    } else {
+        0
+    };
     FrozenShards {
         beneficiary,
         shards: Vec::new(),
-        indexed: Some(Box::new(Indexed {
-            batches: kept_batches,
-            index,
-            conflicts,
-            kept,
-            state_size,
-            beneficiary_delta,
-            conflict_count,
-            lane_state,
-            lane_reverts,
-        })),
+        indexed: Some(Box::new(indexed)),
         contracts,
         append_ns,
         fold_ns,
@@ -2013,22 +2167,24 @@ fn finish_indexed(
 /// writer's (every writer's revert is the same parent value).
 fn materialise_lanes(
     shard: usize,
-    batches: &[BatchOut],
-    part: &IndexPart,
+    batches: &[IndexedBatch],
+    lanes: &LaneSet,
+    index: &AddressHashMap<u16>,
 ) -> (AddressHashMap<BundleAccount>, Vec<(Address, AccountRevert)>) {
-    let wanted: usize = batches.iter().map(|batch| batch.lane_at.get(shard).map_or(0, Vec::len)).sum();
+    let lane_at = |id: usize| lanes.lane_at.get(id).and_then(|at| at.get(shard));
+    let wanted: usize = (0..batches.len()).map(|id| lane_at(id).map_or(0, Vec::len)).sum();
     let mut firsts: AddressHashMap<u16> = Default::default();
-    for (id, address) in &part.drops {
+    for (id, address) in lanes.drops.get(shard).map_or(&[][..], Vec::as_slice) {
         firsts.entry(*address).or_insert(*id);
     }
     let mut state = AddressHashMap::with_capacity_and_hasher(wanted, Default::default());
     let mut reverts = Vec::with_capacity(wanted);
     for (id, batch) in batches.iter().enumerate() {
-        let (Some(lane), Some(positions)) = (batch.accounts.lane.as_ref(), batch.lane_at.get(shard)) else { continue };
+        let (Some(lane), Some(positions)) = (batch.accounts.lane.as_ref(), lane_at(id)) else { continue };
         let id = id as u16;
         for &pos in positions {
             let Some(address) = lane.address(pos as usize) else { continue };
-            let held = part.index.get(address).copied();
+            let held = index.get(address).copied();
             let own = held == Some(id);
             if !own && !(held == Some(CONFLICT) && firsts.get(address) == Some(&id)) {
                 continue;
@@ -2282,13 +2438,29 @@ impl FrozenShards {
 
     /// `N42_ONE_PROBE=4`: the wall time of the freeze's materialisation of
     /// the lane batches' accounts and reverts, microseconds.
-    pub const fn lane_materialise_us(&self) -> u64 {
-        self.lane_ns / 1000
+    /// With the lanes read in place (`N42_LANE_ROOT`), the time of the
+    /// later materialisation, once a reader made it (0 until then).
+    pub fn lane_materialise_us(&self) -> u64 {
+        let later = self.indexed.as_ref().map_or(0, |indexed| indexed.lanes.made_ns.load(Ordering::Relaxed));
+        self.lane_ns.max(later) / 1000
+    }
+
+    /// Whether the lane batches' maps are made (`N42_ONE_PROBE=4`).
+    pub fn lanes_materialised(&self) -> bool {
+        self.indexed.as_ref().is_some_and(|indexed| indexed.lane_maps_made().is_some())
+    }
+
+    /// Makes the lane batches' maps now, on the lane pool, if they are not
+    /// yet: what a merge would otherwise make on its own thread.
+    pub fn materialise_lanes(&self) {
+        if let Some(indexed) = &self.indexed {
+            let _ = indexed.lane_maps();
+        }
     }
 
     /// Whether the output holds lane batches' accounts (`N42_ONE_PROBE=4`).
     pub fn has_lanes(&self) -> bool {
-        self.indexed.as_ref().is_some_and(|indexed| !indexed.lane_state.is_empty())
+        self.indexed.as_ref().is_some_and(|indexed| indexed.lanes.any)
     }
 
     /// Index mode: the wall time of the parallel index build, microseconds.
@@ -2324,7 +2496,19 @@ impl FrozenShards {
 
     /// Whether the batches wrote `address`.
     pub fn holds(&self, address: &Address) -> bool {
-        self.get(address).is_some()
+        match &self.indexed {
+            Some(indexed) => indexed.holds(address),
+            None => self.get(address).is_some(),
+        }
+    }
+
+    /// [`Self::get`] without making the lane batches' maps
+    /// (`N42_ONE_PROBE=4`): a lane account is closed from its lane, owned.
+    pub fn get_cow(&self, address: &Address) -> Option<std::borrow::Cow<'_, BundleAccount>> {
+        match &self.indexed {
+            Some(indexed) => indexed.get_cow(address),
+            None => self.get(address).map(std::borrow::Cow::Borrowed),
+        }
     }
 
     /// The accounts written, over every shard.
@@ -2409,7 +2593,7 @@ impl FrozenShards {
     pub fn read_account(&self, address: &Address) -> Option<std::borrow::Cow<'_, BundleAccount>> {
         match &self.early {
             Some(early) => early.account(address),
-            None => self.get(address).map(std::borrow::Cow::Borrowed),
+            None => self.get_cow(address),
         }
     }
 
@@ -2419,7 +2603,7 @@ impl FrozenShards {
     pub fn holds_hint(&self, address: &Address) -> bool {
         match &self.early {
             Some(early) => early.holds(address),
-            None => self.get(address).is_some(),
+            None => self.get_cow(address).is_some(),
         }
     }
 
@@ -2428,7 +2612,9 @@ impl FrozenShards {
     /// installed by `install_staged` exactly as a streamed graft is.
     pub fn into_staged(mut self) -> crate::parallel_transfer::StagedGraft {
         if let Some(indexed) = self.indexed.take() {
-            let Indexed { batches, conflicts, kept, state_size, beneficiary_delta, lane_state, lane_reverts, .. } = *indexed;
+            let _ = indexed.lane_maps();
+            let Indexed { batches, conflicts, kept, state_size, beneficiary_delta, lanes, .. } = *indexed;
+            let (lane_state, lane_reverts) = lanes.made.into_inner().unwrap_or_default();
             let mut state: AddressHashMap<BundleAccount> = Default::default();
             state.reserve(batches.iter().map(|b| b.accounts.map.len()).sum::<usize>() + conflicts.iter().map(|c| c.len()).sum::<usize>());
             let mut slots: Vec<Vec<Option<(Address, AccountRevert)>>> = Vec::with_capacity(batches.len());
@@ -2650,7 +2836,7 @@ impl FrozenShards {
                     .iter()
                     .map(|batch| (&batch.accounts.map, (!batch.removed.is_empty()).then_some(&batch.removed)))
                     .chain(indexed.conflicts.iter().map(|map| (map, None)))
-                    .chain(indexed.lane_state.iter().map(|map| (map, None))),
+                    .chain(indexed.lane_maps().0.iter().map(|map| (map, None))),
             );
         }
         sources
@@ -2719,7 +2905,7 @@ impl FrozenShards {
                     .map(|kept| kept.iter().filter_map(|&slot| indexed.revert(slot)).cloned().collect::<Vec<_>>())
                     .collect::<Vec<_>>(),
             );
-            parts.extend(indexed.lane_reverts.par_iter().map(Clone::clone).collect::<Vec<_>>());
+            parts.extend(indexed.lane_maps().1.par_iter().map(Clone::clone).collect::<Vec<_>>());
         }
         let mut reverts = Vec::with_capacity(parts.iter().map(Vec::len).sum());
         for part in parts {
@@ -2786,7 +2972,7 @@ impl FrozenShards {
         if let Some(indexed) = &self.indexed {
             reverts.reserve(indexed.kept.iter().map(Vec::len).sum());
             reverts.extend(indexed.kept.iter().flatten().filter_map(|&slot| indexed.revert(slot)).cloned());
-            reverts.extend(indexed.lane_reverts.iter().flatten().cloned());
+            reverts.extend(indexed.lane_maps().1.iter().flatten().cloned());
         }
         crate::parallel_transfer::sort_reverts_by_index(&mut reverts);
         reverts
@@ -2800,7 +2986,7 @@ impl FrozenShards {
         residual
             .state
             .iter()
-            .filter_map(|(address, over)| self.get(address).map(|account| (*address, overlaid(account, over))))
+            .filter_map(|(address, over)| self.get_cow(address).map(|account| (*address, overlaid(&account, over))))
             .collect()
     }
 
@@ -2835,6 +3021,79 @@ impl FrozenShards {
         view.extend(overlaps.iter().map(|(address, account)| (address, account)));
         view
     }
+
+    /// [`Self::view`] with a stage-4 block's lane accounts left in their
+    /// lanes (`N42_LANE_ROOT`): the accounts in maps, and the lane accounts
+    /// as [`LaneLeaf`]s -- together the same set of values. What the QMDB
+    /// root (`n42_qmdb_reth::sorted_operations_from_parts_timed`) and the
+    /// hashed post-state ([`hashed_post_state_of_parts`]) read, so the lane
+    /// maps are not made before the root. The leaves are found on the
+    /// current rayon pool. Without lanes, or with their maps already made,
+    /// the leaves are empty and the first part is [`Self::view`].
+    pub fn view_lanes<'a>(
+        &'a self,
+        residual: &'a BundleState,
+        overlaps: &'a [(Address, BundleAccount)],
+    ) -> (Vec<(&'a Address, &'a BundleAccount)>, Vec<LaneLeaf<'a>>) {
+        let Some(indexed) = self.indexed.as_ref().filter(|indexed| indexed.lanes.any && indexed.lane_maps_made().is_none()) else {
+            return (self.view(residual, overlaps), Vec::new());
+        };
+        debug_assert!(self.early.is_none(), "an early output has no view: the frozen set is read for it");
+        let mut view = Vec::with_capacity(self.accounts() + residual.state.len());
+        let overlapping = |address: &Address| !overlaps.is_empty() && residual.state.contains_key(address);
+        view.extend(indexed.iter_maps().filter(|(address, _)| !overlapping(address)));
+        view.extend(residual.state.iter().filter(|(address, _)| !self.holds(address)));
+        view.extend(overlaps.iter().map(|(address, account)| (address, account)));
+        let leaves = indexed.lane_leaves(overlapping);
+        (view, leaves)
+    }
+}
+
+/// [`hashed_post_state_of`] over a view and its lane accounts
+/// ([`FrozenShards::view_lanes`]): a lane account hashes as a
+/// `BundleAccount` with its info and no storage does.
+pub fn hashed_post_state_of_parts(accounts: &[(&Address, &BundleAccount)], leaves: &[LaneLeaf<'_>]) -> HashedPostState {
+    use n42_qmdb_reth::PlainAccountLeaf as _;
+    use rayon::prelude::*;
+    if leaves.is_empty() {
+        return hashed_post_state_of(accounts);
+    }
+    // Both parts in chunks on the pool, then one map sized for all (as
+    // `hashed_post_state_of` sizes it: growing it chunk by chunk rehashes).
+    let (mut chunks, lane_chunks): (Vec<HashedPostState>, Vec<HashedPostState>) = rayon::join(
+        || {
+            accounts
+                .par_chunks(4096)
+                .map(|chunk| HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(chunk.iter().copied()))
+                .collect()
+        },
+        || {
+            leaves
+                .par_chunks(4096)
+                .map(|chunk| {
+                    chunk
+                        .iter()
+                        .map(|leaf| {
+                            let hashed_address = alloy_primitives::keccak256(leaf.leaf_address());
+                            let account = leaf.leaf_plain().map(|(nonce, balance)| Account { nonce, balance, bytecode_hash: None, ..Default::default() });
+                            (hashed_address, account, None)
+                        })
+                        .collect::<HashedPostState>()
+                })
+                .collect()
+        },
+    );
+    chunks.extend(lane_chunks);
+    let mut hashed = HashedPostState::with_capacity(accounts.len() + leaves.len());
+    for chunk in chunks {
+        hashed.extend(chunk);
+    }
+    hashed
+}
+
+/// [`any_destroyed`] over a view and its lane accounts.
+pub fn any_destroyed_parts(accounts: &[(&Address, &BundleAccount)], leaves: &[LaneLeaf<'_>]) -> bool {
+    any_destroyed(accounts) || leaves.iter().any(LaneLeaf::destroyed)
 }
 
 /// An account the batches wrote and the executor changed again: the newer
@@ -3364,13 +3623,25 @@ mod lane_tests {
     /// credit, the contracts.
     fn summary(frozen: &FrozenShards, every: &[Address]) -> String {
         let residual = BundleState::default();
-        let mut view: Vec<_> = frozen.view(&residual, &[]).into_iter().map(|(a, acc)| (*a, acc.clone())).collect();
+        // The lanes read in place first (`N42_LANE_ROOT`): the root's view
+        // and every read by address, before anything makes the lane maps.
+        let reads_in_place: Vec<_> = every.iter().map(|a| frozen.get_cow(a).map(std::borrow::Cow::into_owned)).collect();
+        let (maps, leaves) = frozen.view_lanes(&residual, &[]);
+        let mut view: Vec<_> = maps.into_iter().map(|(a, acc)| (*a, acc.clone())).collect();
+        view.extend(leaves.iter().map(|leaf| {
+            let account = leaf.account().expect("a leaf's account");
+            (*n42_qmdb_reth::PlainAccountLeaf::leaf_address(leaf), account)
+        }));
         view.sort_unstable_by_key(|(a, _)| *a);
+        let mut made: Vec<_> = frozen.view(&residual, &[]).into_iter().map(|(a, acc)| (*a, acc.clone())).collect();
+        made.sort_unstable_by_key(|(a, _)| *a);
+        assert_eq!(view, made, "the view over the lanes is the view over their maps");
         let (merged, _) = frozen.merged_state_first(&residual, None);
         let mut state: Vec<_> = merged.state.iter().map(|(a, acc)| (*a, acc.clone())).collect();
         state.sort_unstable_by_key(|(a, _)| *a);
         let (reverts, reverts_size) = frozen.late_reverts(Default::default(), Vec::new(), None);
         let reads: Vec<_> = every.iter().map(|a| frozen.get(a).cloned()).collect();
+        assert_eq!(reads, reads_in_place, "reads by address in place");
         let mut contracts: Vec<_> = merged.contracts.keys().copied().collect();
         contracts.sort_unstable();
         format!(

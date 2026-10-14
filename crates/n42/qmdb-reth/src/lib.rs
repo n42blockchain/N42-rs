@@ -37,7 +37,7 @@ pub use chainspec::{
     STATE_SCHEME_KEY, STATE_SCHEME_QMDB,
 };
 pub use changes::{
-    changes_from_alloc, changes_from_bundle, changes_from_execution, with_prague_system_caller, sorted_operations_from_accounts, sorted_operations_from_accounts_timed, sorted_operations_from_execution, operations_ahead, OpsAhead, OpsSplit,
+    changes_from_alloc, changes_from_bundle, changes_from_execution, with_prague_system_caller, sorted_operations_from_accounts, sorted_operations_from_accounts_timed, sorted_operations_from_parts_timed, operations_ahead_parts, PlainAccountLeaf, sorted_operations_from_execution, operations_ahead, OpsAhead, OpsSplit,
 };
 pub use hotstuff::{GenesisValidator, HotStuffConfigError, HotStuffGenesisConfig};
 pub use reth_chainspec::qmdb::{

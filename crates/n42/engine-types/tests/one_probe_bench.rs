@@ -1049,6 +1049,8 @@ fn bench_node_batch_state() {
     // the resolver thread behind the build) is timed apart.
     let table = one_probe::Rolling::new(16);
     let mut record_ms = Vec::new();
+    let mut root_rows: Vec<[f64; 10]> = Vec::new();
+    let mut leaves_n = 0usize;
     let mut previous: Option<(u64, std::sync::Arc<one_probe::PlanIds>)> = None;
     for round in 0..rounds + 1 {
         let at = Instant::now();
@@ -1125,6 +1127,35 @@ fn bench_node_batch_state() {
         };
         let (s4_add, s4_freeze, s4_frozen) = hand_over(true, outputs, Vec::new());
         let (s3_add, s3_freeze, s3_frozen) = hand_over(false, Vec::new(), direct_bundles.clone());
+        // The block's root path behind the seal: the view, the QMDB root's
+        // operations and the hashed post-state (each timed alone, on the
+        // pool). Stage 4 reads its lanes in place (`N42_LANE_ROOT`), then
+        // the lane maps are made as the merge behind the publication makes
+        // them; stage 4 as loop351 ran it is that materialisation plus the
+        // view and the root over the maps; stage 3 has maps throughout.
+        let empty = revm::database::BundleState::default();
+        let root_of = |frozen: &n42_engine_types::output_shards::FrozenShards| {
+            let at = Instant::now();
+            let (maps, leaves) = pool.install(|| frozen.view_lanes(&empty, &[]));
+            let view = at.elapsed().as_secs_f64() * 1e3;
+            let at = Instant::now();
+            let ops = pool.install(|| n42_qmdb_reth::sorted_operations_from_parts_timed(&maps, &leaves, true).0);
+            let ops_ms = at.elapsed().as_secs_f64() * 1e3;
+            let at = Instant::now();
+            let hashed = pool.install(|| n42_engine_types::output_shards::hashed_post_state_of_parts(&maps, &leaves));
+            let hashed_ms = at.elapsed().as_secs_f64() * 1e3;
+            (view, ops_ms, hashed_ms, leaves.len(), ops.to_operations(), hashed.accounts.len())
+        };
+        let s4_lanes = root_of(&s4_frozen);
+        let at = Instant::now();
+        s4_frozen.materialise_lanes();
+        let s4_made = at.elapsed().as_secs_f64() * 1e3;
+        let s4_maps = root_of(&s4_frozen);
+        let s3_root = root_of(&s3_frozen);
+        assert_eq!(s4_maps.3, 0, "the maps are made");
+        assert_eq!(s4_lanes.4, s3_root.4, "the root's operations over the lanes are stage 3's");
+        assert_eq!(s4_maps.4, s3_root.4, "and over the made maps");
+        assert_eq!(s4_lanes.5, s3_root.5, "hashed accounts");
         if round == 0 {
             assert!(s4_frozen.has_lanes());
             let residual = revm::database::BundleState::default();
@@ -1154,7 +1185,9 @@ fn bench_node_batch_state() {
         out_ms.push(out_loop);
         out_add_ms.push(s4_add);
         out_freeze_ms.push(s4_freeze);
-        out_mat_ms.push(s4_frozen.lane_materialise_us() as f64 / 1e3);
+        out_mat_ms.push(s4_made);
+        root_rows.push([s4_lanes.0, s4_lanes.1, s4_lanes.2, s4_made, s4_maps.0, s4_maps.1, s4_maps.2, s3_root.0, s3_root.1, s3_root.2]);
+        leaves_n = s4_lanes.3;
         s3_add_ms.push(s3_add);
         s3_freeze_ms.push(s3_freeze);
     }
@@ -1171,12 +1204,19 @@ fn bench_node_batch_state() {
         table.len()
     );
     println!(
-        "stage 4 (lane output): batch loop {:.1} ms; hand-over {:.1} ms, freeze {:.1} ms of which lane materialisation {:.1} ms; stage 3 beside: hand-over {:.1} ms, freeze {:.1} ms (16 shards, live index)",
+        "stage 4 (lane output): batch loop {:.1} ms; hand-over {:.1} ms, freeze {:.1} ms, lane maps made {:.1} ms (at the freeze with N42_LANE_ROOT=0, else behind); stage 3 beside: hand-over {:.1} ms, freeze {:.1} ms (16 shards, live index)",
         median(out_ms),
         median(out_add_ms),
         median(out_freeze_ms),
         median(out_mat_ms),
         median(s3_add_ms),
         median(s3_freeze_ms)
+    );
+    let col = |i: usize| median(root_rows.iter().map(|row| row[i]).collect());
+    println!(
+        "root path: stage 4 over lanes ({leaves_n} lane accounts): view {:.1} + ops {:.1} + hashed {:.1} = {:.1} ms, maps made behind {:.1} ms; stage 4 as loop351 (maps first): materialisation {:.1} + view {:.1} + ops {:.1} + hashed {:.1} = {:.1} ms; stage 3: view {:.1} + ops {:.1} + hashed {:.1} = {:.1} ms",
+        col(0), col(1), col(2), col(0) + col(1) + col(2), col(3),
+        col(3), col(4), col(5), col(6), col(3) + col(4) + col(5) + col(6),
+        col(7), col(8), col(9), col(7) + col(8) + col(9)
     );
 }

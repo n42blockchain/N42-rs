@@ -8021,6 +8021,34 @@ mod tests {
         }
         let reference = reference.freeze();
         let residual = BundleState::default();
+        // `N42_LANE_ROOT`: the root's operations and the hashed post-state
+        // read over the lanes, before anything made the lane maps, equal the
+        // reference's over its maps; so does every read by address.
+        {
+            let (maps, leaves) = frozen.view_lanes(&residual, &[]);
+            assert_eq!(leaves.is_empty(), !crate::output_shards::lane_root(), "lane leaves only when read in place");
+            let theirs_view = reference.view(&residual, &[]);
+            assert_eq!(
+                n42_qmdb_reth::sorted_operations_from_parts_timed(&maps, &leaves, true).0.to_operations(),
+                n42_qmdb_reth::sorted_operations_from_accounts(&theirs_view, true).to_operations(),
+                "the state root's operations over the lanes"
+            );
+            assert_eq!(
+                n42_qmdb_reth::operations_ahead_parts(&maps, &leaves, true).finish(&[], &[], true).to_operations(),
+                n42_qmdb_reth::sorted_operations_from_accounts(&theirs_view, true).to_operations(),
+                "the operations made ahead over the lanes"
+            );
+            let ours_hashed = crate::output_shards::hashed_post_state_of_parts(&maps, &leaves);
+            let theirs_hashed = crate::output_shards::hashed_post_state_of(&theirs_view);
+            assert_eq!(ours_hashed.accounts, theirs_hashed.accounts, "the hashed accounts over the lanes");
+            assert_eq!(ours_hashed.storages, theirs_hashed.storages, "the hashed storages over the lanes");
+            assert_eq!(maps.len() + leaves.len(), theirs_view.len(), "each account once");
+            assert!(!crate::output_shards::any_destroyed_parts(&maps, &leaves));
+            for (address, account) in &theirs_view {
+                assert_eq!(frozen.get_cow(address).as_deref(), Some(*account), "read by address {address}");
+            }
+            assert_eq!(frozen.lanes_materialised(), !crate::output_shards::lane_root(), "the root made no map");
+        }
         let (ours_state, _) = frozen.merged_state_first(&residual, None);
         let (theirs_state, _) = reference.merged_state_first(&residual, None);
         assert_eq!(ours_state.state, theirs_state.state, "merged state");

@@ -550,6 +550,17 @@ impl LaneOutput {
         })
     }
 
+    /// The account at position `pos` as the root reads it, without making
+    /// it: `Some((nonce, balance))` for an info (a lane account has no code:
+    /// `KECCAK_EMPTY`), `None` for none; and whether it was destroyed over
+    /// an existing account (`BundleAccount::was_destroyed` with an original).
+    #[inline]
+    pub fn leaf(&self, pos: usize) -> Option<(Option<(u64, U256)>, bool)> {
+        let work = self.work.get(*self.kept.get(pos)? as usize)?;
+        let plain = (work.flags & CUR_SOME != 0).then_some((work.nonce, work.balance));
+        Some((plain, work.status.was_destroyed() && work.flags & ORIG_SOME != 0))
+    }
+
     /// The account at position `pos` with its revert, as the map's close
     /// makes them.
     pub fn closed(&self, pos: usize) -> Option<(BundleAccount, Option<AccountRevert>)> {

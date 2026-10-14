@@ -1004,7 +1004,7 @@ pub(crate) fn one_probe_post_account(
     if residual.state.contains_key(address) {
         return PostAccount::Unheld;
     }
-    match shards.get(address) {
+    match shards.get_cow(address) {
         Some(account) => match account.info.as_ref() {
             Some(info) if info.code_hash == revm::primitives::KECCAK_EMPTY => PostAccount::Plain(info.balance, info.nonce),
             _ => PostAccount::Unheld,
@@ -3342,8 +3342,8 @@ where
                         let spawned = std::thread::Builder::new().name("n42-ops-ahead".into()).spawn(move || {
                             n42_core_layout::enter(n42_core_layout::Set::Critical);
                             let empty = revm::database::BundleState::default();
-                            let accounts = shards.view(&empty, &[]);
-                            (n42_qmdb_reth::operations_ahead(&accounts, prague), std::time::Instant::now())
+                            let (accounts, leaves) = shards.view_lanes(&empty, &[]);
+                            (n42_qmdb_reth::operations_ahead_parts(&accounts, &leaves, prague), std::time::Instant::now())
                         });
                         match spawned {
                             Ok(handle) => ops_ahead = Some((handle, prague)),
@@ -3746,8 +3746,8 @@ where
                     let spawned = std::thread::Builder::new().name("n42-ops-ahead".into()).spawn(move || {
                         n42_core_layout::enter(n42_core_layout::Set::Critical);
                         let empty = revm::database::BundleState::default();
-                        let accounts = shards.view(&empty, &[]);
-                        (n42_qmdb_reth::operations_ahead(&accounts, prague), std::time::Instant::now())
+                        let (accounts, leaves) = shards.view_lanes(&empty, &[]);
+                        (n42_qmdb_reth::operations_ahead_parts(&accounts, &leaves, prague), std::time::Instant::now())
                     });
                     match spawned {
                         Ok(handle) => ops_ahead = Some((handle, prague)),
@@ -4028,9 +4028,13 @@ where
                 };
             let residual_state = &residual.state;
             let overlaps = shards.overlaps(residual_state);
-            let view = shards.view(residual_state, &overlaps);
+            // `N42_LANE_ROOT` (stage 4): the lane accounts stay in their
+            // lanes; the root and the hashed post-state read them there and
+            // their maps are made later, by the merge behind the publication.
+            let (view, lane_leaves) = shards.view_lanes(residual_state, &overlaps);
             view_ready_at = Some(std::time::Instant::now());
-            let destroyed = crate::output_shards::any_destroyed(&view);
+            let destroyed = crate::output_shards::any_destroyed_parts(&view, &lane_leaves);
+            let leaves_ref = &lane_leaves;
             let hashed_off = n42_qmdb_reth::n42_state::hashed_tables_off();
             let view_ref = &view;
             let publish_ref = &publish;
@@ -4081,11 +4085,13 @@ where
                         let (ahead, done_at) = job.join().ok().filter(|_| ahead_prague == prague)?;
                         let waited = joined_at.elapsed();
                         let finish_at = std::time::Instant::now();
-                        let replaced: Vec<(&alloy_primitives::Address, &revm::database::BundleAccount)> = residual_state
+                        let replaced: Vec<(&alloy_primitives::Address, std::borrow::Cow<'_, revm::database::BundleAccount>)> = residual_state
                             .state
                             .keys()
-                            .filter_map(|address| shards_ref.get(address).map(|account| (address, account)))
+                            .filter_map(|address| shards_ref.get_cow(address).map(|account| (address, account)))
                             .collect();
+                        let replaced: Vec<(&alloy_primitives::Address, &revm::database::BundleAccount)> =
+                            replaced.iter().map(|(address, account)| (*address, &**account)).collect();
                         let newer: Vec<(&alloy_primitives::Address, &revm::database::BundleAccount)> = residual_state
                             .state
                             .iter()
@@ -4103,7 +4109,7 @@ where
                     let (ops, split, ahead_use) = match finished {
                         Some(finished) => finished,
                         None => {
-                            let (ops, split) = n42_qmdb_reth::sorted_operations_from_accounts_timed(view_ref, prague);
+                            let (ops, split) = n42_qmdb_reth::sorted_operations_from_parts_timed(view_ref, leaves_ref, prague);
                             (ops, split, OpsAheadUse::default())
                         }
                     };
@@ -4119,7 +4125,7 @@ where
                 // account's storage is zeroed from the database: the
                 // provider's own path, on the merged bundle, below.
                 let hashed = (!hashed_off && !destroyed)
-                    .then(|| scope.spawn(move || crate::output_shards::hashed_post_state_of(view_ref)));
+                    .then(|| scope.spawn(move || crate::output_shards::hashed_post_state_of_parts(view_ref, leaves_ref)));
                 let (prepared, root_started, root_ended, kept_ops, ops_timed) = root.join().map_err(|_| {
                     PayloadBuilderError::other(std::io::Error::other("the QMDB root job panicked"))
                 })?;

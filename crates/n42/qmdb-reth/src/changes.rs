@@ -265,6 +265,94 @@ fn encode_account_pieces(accounts: &[(&Address, &revm_database::BundleAccount)],
         .collect()
 }
 
+/// A plain account given without a `BundleAccount`: no code and no storage
+/// written (`N42_ONE_PROBE=4`'s lane accounts, read by the root where they
+/// lie). Its leaf is the one a `BundleAccount` with the same info writes.
+pub trait PlainAccountLeaf: Sync {
+    /// The account's address.
+    fn leaf_address(&self) -> &Address;
+    /// `Some((nonce, balance))` for an account with no code
+    /// (`KECCAK_EMPTY`), `None` for one deleted.
+    fn leaf_plain(&self) -> Option<(u64, U256)>;
+}
+
+/// [`sorted_operations_from_accounts_timed`] over `accounts` and `plain`
+/// together (each address once across both): the same operations as over
+/// one list holding `plain` as bundle accounts with that info and no
+/// storage.
+pub fn sorted_operations_from_parts_timed<L: PlainAccountLeaf>(
+    accounts: &[(&Address, &revm_database::BundleAccount)],
+    plain: &[L],
+    prague_active: bool,
+) -> (QmdbOps, OpsSplit) {
+    let at = std::time::Instant::now();
+    let (mut pieces, plain_pieces) =
+        rayon::join(|| encode_account_pieces(accounts, prague_active), || encode_plain_pieces(plain, prague_active));
+    pieces.extend(plain_pieces);
+    let encoded = std::time::Instant::now();
+    let mut ops = QmdbOps::concat(pieces);
+    if prague_active {
+        push_prague_system_caller(&mut ops);
+    }
+    let joined = std::time::Instant::now();
+    ops.sort();
+    let split = OpsSplit {
+        encode_us: encoded.duration_since(at).as_micros() as u64,
+        concat_us: joined.duration_since(encoded).as_micros() as u64,
+        sort_us: joined.elapsed().as_micros() as u64,
+    };
+    (ops, split)
+}
+
+/// [`operations_ahead`] over `accounts` and `plain` together (see
+/// [`sorted_operations_from_parts_timed`]).
+pub fn operations_ahead_parts<L: PlainAccountLeaf>(
+    accounts: &[(&Address, &revm_database::BundleAccount)],
+    plain: &[L],
+    prague_active: bool,
+) -> OpsAhead {
+    let at = std::time::Instant::now();
+    let (mut pieces, plain_pieces) =
+        rayon::join(|| encode_account_pieces(accounts, prague_active), || encode_plain_pieces(plain, prague_active));
+    pieces.extend(plain_pieces);
+    let mut ops = QmdbOps::concat(pieces);
+    let encoded = std::time::Instant::now();
+    ops.sort();
+    OpsAhead {
+        ops,
+        encode_us: encoded.duration_since(at).as_micros() as u64,
+        sort_us: encoded.elapsed().as_micros() as u64,
+    }
+}
+
+/// The account leaves of `plain`, a chunk an arena on the worker pool, as
+/// [`encode_account_pieces`] writes a storage-less account with that info;
+/// the system caller's left out on a Prague block.
+fn encode_plain_pieces<L: PlainAccountLeaf>(plain: &[L], prague_active: bool) -> Vec<QmdbOps> {
+    use n42_twig_core::qmdb_compat::{encode_gov5_account_value_into, gov5_account_key};
+    use rayon::prelude::*;
+    plain
+        .par_chunks(ACCOUNTS_PER_CHUNK)
+        .map(|chunk| {
+            let mut ops = QmdbOps::with_capacity(chunk.len(), chunk.len() * 16);
+            for leaf in chunk {
+                let address = leaf.leaf_address();
+                if prague_active && *address == PRAGUE_SYSTEM_CALLER {
+                    continue;
+                }
+                let key = gov5_account_key(&address.0 .0);
+                match leaf.leaf_plain() {
+                    Some((nonce, balance)) => ops.push_with(key, |out| {
+                        encode_gov5_account_value_into(out, nonce, &balance.to_be_bytes::<32>(), &alloy_primitives::KECCAK256_EMPTY.0)
+                    }),
+                    None => ops.push(key, None),
+                }
+            }
+            ops
+        })
+        .collect()
+}
+
 /// Accounts a worker writes into one arena in [`sorted_operations_from_accounts`].
 const ACCOUNTS_PER_CHUNK: usize = 1024;
 

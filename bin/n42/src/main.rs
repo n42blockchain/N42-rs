@@ -270,6 +270,14 @@ fn main() {
                 ));
             }
             if let Some(qmdb) = &qmdb_for_startup {
+                let durable_provider = node.provider.clone();
+                qmdb.set_durable_head_reader(move || {
+                    use reth_provider::DatabaseProviderFactory;
+                    use reth_db_api::transaction::DbTx;
+                    let database = durable_provider.database_provider_ro().ok()?;
+                    database.tx_ref().get::<reth_db_api::tables::StageCheckpoints>("Finish".to_owned())
+                        .ok()?.map(|checkpoint| checkpoint.block_number)
+                });
                 let info = node.provider.chain_info()?;
                 let head_hash = node
                     .provider

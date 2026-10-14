@@ -489,6 +489,7 @@ struct Inner {
     forest: Mutex<Option<QmdbForest>>,
     /// Serialises the bounded checkpoint-parent sidecar's atomic replacements.
     frontier_write: Mutex<()>,
+    durable_head_reader: Mutex<Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>>,
     /// The label the forest's lock was last taken for ([`QmdbNodeState::lock_as`]),
     /// read by a caller that has to wait to say whom it waited for.
     forest_holder: Mutex<&'static str>,
@@ -879,6 +880,7 @@ impl QmdbNodeState {
             inner: Arc::new(Inner {
                 forest: Mutex::new(None),
                 frontier_write: Mutex::new(()),
+                durable_head_reader: Mutex::new(None),
                 forest_holder: Mutex::new(""),
                 pending_renames: Mutex::new(Vec::new()),
                 pending_rename_count: std::sync::atomic::AtomicUsize::new(0),
@@ -1729,6 +1731,9 @@ impl QmdbNodeState {
             return Err(unavailable());
         };
         if snapshot.head_number > number {
+            if let Some(historical) = self.archived_heap_snapshot((number, hash))? {
+                return Ok(QmdbForest::from_snapshot(&historical)?.root());
+            }
             return self.parent_root_from_frontier((snapshot.head_number, snapshot.head_hash), (number, hash));
         }
         if snapshot.head_hash != hash {
@@ -1741,6 +1746,86 @@ impl QmdbNodeState {
             return Err(unavailable());
         }
         Ok(QmdbForest::from_snapshot(&snapshot)?.root())
+    }
+
+    /// Supplies a database-transaction durability boundary for archive retirement.
+    /// Without a readable boundary, recovery history is retained rather than guessed.
+    pub fn set_durable_head_reader(&self, reader: impl Fn() -> Option<u64> + Send + Sync + 'static) {
+        *self.inner.durable_head_reader.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(reader));
+    }
+
+    fn prune_heap_archives(&self) -> Result<(), NodeStateError> {
+        let reader = self.inner.durable_head_reader.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let Some(durable) = reader.and_then(|reader| reader()) else { return Ok(()) };
+        let root = self.inner.dir.join("recovery-archive");
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(NodeStateError::Io { path: root, source }),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|source| NodeStateError::Io { path: root.clone(), source })?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(number) = name.strip_prefix("fold-").and_then(|suffix| suffix.split('-').next()).and_then(|number| number.parse::<u64>().ok()) else { continue };
+            // Retain the database head's parent frontier as well as its head.
+            if number.checked_add(1).is_none_or(|parent_boundary| parent_boundary >= durable) { continue; }
+            std::fs::remove_dir_all(entry.path()).map_err(|source| NodeStateError::Io { path: entry.path(), source })?;
+        }
+        std::fs::File::open(&root).and_then(|f| f.sync_all()).map_err(|source| NodeStateError::Io { path: root, source })
+    }
+
+    // Heap checkpoints may follow canonical execution ahead of the EL's
+    // database transaction. Keep the overwritten base and folded log together.
+    fn archive_heap_pair(&self, label: &str, log: &Path) -> Result<(), NodeStateError> {
+        let root = self.inner.dir.join("recovery-archive");
+        let target = root.join(label);
+        if target.exists() { return Ok(()); }
+        let io = |path: &Path, source| NodeStateError::Io { path: path.to_path_buf(), source };
+        std::fs::create_dir_all(&root).map_err(|e| io(&root, e))?;
+        std::fs::File::open(&self.inner.dir).and_then(|f| f.sync_all()).map_err(|e| io(&root, e))?;
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let temporary = root.join(format!(".pending-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        std::fs::create_dir(&temporary).map_err(|e| io(&temporary, e))?;
+        std::fs::hard_link(self.snapshot_path(), temporary.join("forest.bin")).map_err(|e| io(&temporary, e))?;
+        if log.exists() {
+            std::fs::hard_link(log, temporary.join("forest.log")).map_err(|e| io(&temporary, e))?;
+        } else {
+            std::fs::File::create(temporary.join("forest.log")).and_then(|f| f.sync_all()).map_err(|e| io(&temporary, e))?;
+        }
+        if label.starts_with("rollback-") && self.sealed_log_path().exists() {
+            std::fs::hard_link(self.sealed_log_path(), temporary.join("forest.log.sealed")).map_err(|e| io(&temporary, e))?;
+        }
+        std::fs::File::open(&temporary).and_then(|f| f.sync_all()).map_err(|e| io(&temporary, e))?;
+        std::fs::rename(&temporary, &target).map_err(|e| io(&target, e))?;
+        std::fs::File::open(&root).and_then(|f| f.sync_all()).map_err(|e| io(&root, e))?;
+        Ok(())
+    }
+
+    fn archived_heap_snapshot(&self, target: (u64, B256)) -> Result<Option<ForestSnapshot>, NodeStateError> {
+        let root = self.inner.dir.join("recovery-archive");
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(NodeStateError::Io { path: root, source }),
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| NodeStateError::Io { path: root.clone(), source })?;
+            if entry.file_name().to_string_lossy().starts_with('.') { continue; }
+            paths.push(entry.path());
+        }
+        paths.sort();
+        for path in paths.into_iter().rev() {
+            let Some(snapshot) = read_snapshot(&path.join("forest.bin"))? else { continue };
+            if snapshot.head_number > target.0 { continue; }
+            let (snapshot, _) = replay_delta_log(&path.join("forest.log.sealed"), snapshot, Some(target.1))?;
+            let (snapshot, _) = replay_delta_log(&path.join("forest.log"), snapshot, Some(target.1))?;
+            if (snapshot.head_number, snapshot.head_hash) == target {
+                return Ok(Some(snapshot));
+            }
+        }
+        Ok(None)
     }
 
     fn frontier_path(&self) -> PathBuf {
@@ -1852,7 +1937,27 @@ impl QmdbNodeState {
         let log_path = self.delta_log_path();
 
         let forest = match read_snapshot(&path)? {
-            Some(checkpoint) => {
+            Some(mut checkpoint) => {
+                if checkpoint.head_number > head_number {
+                    let restored = self.archived_heap_snapshot(head)?.ok_or(NodeStateError::SnapshotMismatch {
+                        snapshot_number: checkpoint.head_number, snapshot_hash: checkpoint.head_hash,
+                        head_number, head_hash,
+                    })?;
+                    self.archive_heap_pair(&format!("rollback-{:020}-{:x}", head_number, head_hash), &log_path)?;
+                    write_snapshot(&path, &restored, &mut CompactPhases::default())?;
+                    // These future records remain in the immutable archive;
+                    // certified bodies will be validated again by EL replay.
+                    for future in [log_path.clone(), self.sealed_log_path()] {
+                        match std::fs::remove_file(&future) {
+                            Ok(()) => {},
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                            Err(source) => return Err(NodeStateError::Io { path: future, source }),
+                        }
+                    }
+                    std::fs::File::open(&self.inner.dir).and_then(|f| f.sync_all())
+                        .map_err(|source| NodeStateError::Io { path: self.inner.dir.clone(), source })?;
+                    checkpoint = restored;
+                }
                 let checkpoint_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 // A segment a compaction had sealed but not folded in when the
                 // node last stopped comes first: the log's deltas continue
@@ -2675,6 +2780,7 @@ impl QmdbNodeState {
                 path: path.clone(),
                 head_number: sealed_head.0,
             })?;
+            self.archive_heap_pair(&format!("fold-{:020}-{:x}", sealed_head.0, sealed_head.1), &sealed_path)?;
             let read_ms = started.elapsed().as_millis() as u64;
             let replay_at = std::time::Instant::now();
             let (snapshot, _) = replay_delta_log(&sealed_path, checkpoint, Some(sealed_head.1))?;
@@ -2713,6 +2819,10 @@ impl QmdbNodeState {
                 // the segment is retried at the next due point.
                 warn!(target: "n42.qmdb", %err, "QMDB compaction failed; the sealed segment is kept");
             }
+        }
+        drop(cursor);
+        if let Err(err) = self.prune_heap_archives() {
+            warn!(target: "n42.qmdb", %err, "could not retire covered recovery archives");
         }
     }
 
@@ -3296,6 +3406,52 @@ mod tests {
             assert_eq!(reader.state_root(), state.state_root());
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    #[test]
+    fn compacted_heap_checkpoint_recovers_a_database_rollback_and_its_parent() {
+        use alloy_primitives::U256;
+        use n42_qmdb_state::AccountState;
+        let chain = deferred_chain();
+        let dir = scratch("archive-database-rollback");
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, false);
+        state.set_persist_batch(false);
+        state.set_canonical_defer(false);
+        let mut parent = chain.genesis_hash();
+        state.initialize((0, parent)).unwrap();
+        let mut roots = Vec::new();
+        let hashes = [B256::repeat_byte(0xb1), B256::repeat_byte(0xb2), B256::repeat_byte(0xb3), B256::repeat_byte(0xb4)];
+        for (index, hash) in hashes.iter().enumerate() {
+            let number = index as u64 + 1;
+            let mut changes = BlockChanges::new();
+            changes.set_account(Address::with_last_byte(3), AccountState { nonce: number, balance: U256::from(number), code_hash: B256::ZERO });
+            let prepared = state.compute(parent, &changes).unwrap();
+            roots.push(prepared.root);
+            state.insert(*hash, number, prepared).unwrap();
+            state.on_canonical(*hash).unwrap();
+            parent = *hash;
+        }
+        std::fs::rename(state.delta_log_path(), state.sealed_log_path()).unwrap();
+        state.compact((4, hashes[3]));
+        assert!(!state.sealed_log_path().exists());
+        let reader = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, false);
+        assert_eq!(reader.persisted_state_root(1, hashes[0]).unwrap(), roots[0]);
+        reader.remember_checkpoint_parent((2, hashes[1]), hashes[0], roots[0]).unwrap();
+        reader.initialize((2, hashes[1])).unwrap();
+        assert_eq!(reader.state_root(), roots[1]);
+        assert_eq!(read_snapshot(&reader.snapshot_path()).unwrap().unwrap().head_number, 2);
+        let again = QmdbNodeState::new_with_entry_file(chain, &dir, false);
+        again.initialize((2, hashes[1])).unwrap();
+        assert_eq!(again.state_root(), roots[1]);
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(4));
+        let boundary = durable.clone();
+        reader.set_durable_head_reader(move || Some(boundary.load(std::sync::atomic::Ordering::Relaxed)));
+        reader.prune_heap_archives().unwrap();
+        assert!(reader.archived_heap_snapshot((1, hashes[0])).unwrap().is_some(), "database parent may still need the folded segment");
+        durable.store(6, std::sync::atomic::Ordering::Relaxed);
+        reader.prune_heap_archives().unwrap();
+        assert!(reader.archived_heap_snapshot((1, hashes[0])).unwrap().is_none(), "covered compaction history can retire");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

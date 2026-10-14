@@ -333,6 +333,10 @@ pub struct ConsensusEngine {
     /// what deferred execution (`docs/PHASE_D_DEFERRED_EXECUTION.md`) would
     /// give the cycle before any header changes.
     pub(super) vote_before_import: bool,
+    /// Retry budget of `emit` against a full output channel: attempts and the
+    /// wait before each. Production keeps the defaults; tests widen them.
+    output_retries: u32,
+    output_retry_wait: std::time::Duration,
     pub(super) round_state: RoundState,
     pub(super) pacemaker: Pacemaker,
     pub(super) vote_collector: Option<VoteCollector>,
@@ -475,6 +479,8 @@ impl ConsensusEngine {
             leader_tenure: 1,
             signing_profile: ConsensusSigningProfile::Native,
             vote_before_import: false,
+            output_retries: 3,
+            output_retry_wait: std::time::Duration::from_micros(500),
             round_state: RoundState::new(),
             pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
             vote_collector: None,
@@ -584,6 +590,8 @@ impl ConsensusEngine {
             leader_tenure: 1,
             signing_profile: ConsensusSigningProfile::Native,
             vote_before_import: false,
+            output_retries: 3,
+            output_retry_wait: std::time::Duration::from_micros(500),
             round_state: RoundState::from_snapshot(
                 recovered_view,
                 locked_qc,
@@ -629,6 +637,10 @@ impl ConsensusEngine {
     /// unaffected unless the participant bridge is also explicitly enabled.
     pub fn enable_h2_v4_signing(&mut self, identity: H2V4ChainIdentity) {
         self.signing_profile = ConsensusSigningProfile::H2V4(identity);
+    }
+
+    pub fn enable_gov5_legacy_signing(&mut self) {
+        self.signing_profile = ConsensusSigningProfile::Gov5Legacy;
     }
 
     pub fn signing_profile(&self) -> ConsensusSigningProfile {
@@ -982,6 +994,12 @@ impl ConsensusEngine {
 
     /// **Bench only, unsafe**: vote on a verified proposal before executing
     /// it, under the H2-v4 profile too. See the field.
+    /// Sets the `emit` retry budget (attempts and wait per attempt).
+    pub fn set_output_retry_budget(&mut self, retries: u32, wait: std::time::Duration) {
+        self.output_retries = retries;
+        self.output_retry_wait = wait;
+    }
+
     pub fn set_vote_before_import(&mut self, on: bool) {
         self.vote_before_import = on;
     }
@@ -1439,7 +1457,7 @@ impl ConsensusEngine {
         // leader commonly reproposes the same uncommitted block, and reth will
         // not emit a second import completion for it. Native optimistic voting
         // does not need this cache beyond the view.
-        if !matches!(self.signing_profile, ConsensusSigningProfile::H2V4(_)) {
+        if !self.signing_profile.is_gov5() {
             self.imported_blocks.clear();
             self.imported_block_fifo.clear();
         }
@@ -1574,7 +1592,7 @@ impl ConsensusEngine {
     }
 
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {
-        const MAX_OUTPUT_SEND_RETRIES: u32 = 3;
+        let max_retries = self.output_retries;
 
         // Treat bounded-channel backpressure as recoverable. Only a closed channel
         // is immediately fatal to consensus.
@@ -1606,14 +1624,14 @@ impl ConsensusEngine {
             Err(tokio::sync::mpsc::error::TrySendError::Full(output)) => {
                 let mut pending = output;
 
-                for attempt in 1..=MAX_OUTPUT_SEND_RETRIES {
+                for attempt in 1..=max_retries {
                     // Brief sleep to give the channel consumer a chance to drain.
                     // 500µs × 3 retries = 1.5ms max blocking per emit() call.
                     // This is acceptable: channel backpressure is rare (capacity 64-1024),
                     // and 1.5ms is negligible relative to the 8-second slot target.
                     // std::thread::sleep is used deliberately here rather than tokio::time::sleep
                     // because emit() is a sync fn; the short duration minimises worker stall.
-                    std::thread::sleep(std::time::Duration::from_micros(500));
+                    std::thread::sleep(self.output_retry_wait);
                     match self.output_tx.try_send(pending) {
                         Ok(()) => {
                             if is_block_committed {
@@ -1651,13 +1669,13 @@ impl ConsensusEngine {
                     tracing::error!(
                         target: "n42::cl::engine",
                         "CRITICAL: BlockCommitted lost after {} retries",
-                        MAX_OUTPUT_SEND_RETRIES
+                        max_retries
                     );
                 } else {
                     tracing::error!(
                         target: "n42::cl::engine",
                         output = output_kind,
-                        retries = MAX_OUTPUT_SEND_RETRIES,
+                        retries = max_retries,
                         "consensus output channel remained full after retries"
                     );
                 }
@@ -2357,34 +2375,31 @@ mod tests {
         assert!(debug_str.contains("my_index"));
     }
 
-    /// A full channel must not drop a non-critical output: `emit` retries, and
-    /// once the consumer drains, both outputs arrive in order.
-    ///
-    /// Deliberately does not make the drain wait. `emit`'s whole retry budget
-    /// is 1.5ms (3 x 500us), which is far below the thread-scheduling jitter on
-    /// a loaded machine — an earlier version slept 1ms before draining and
-    /// failed whenever the box was busy, because the drain landed after the
-    /// budget was already spent. Any test that needs the drain to happen
-    /// *late but within 1.5ms* is unschedulable by construction. Draining
-    /// immediately still exercises the path (the emit below races a full
-    /// channel) while depending on ordering rather than on wall-clock timing.
+    /// Queued outputs remain ordered after a full channel drains. Synchronize
+    /// the consumer rather than relying on OS scheduling within the retry
+    /// deadline; the separate bounded-retry test covers an undrained channel.
     #[test]
-    fn test_emit_retries_non_block_committed_output_when_channel_is_full() {
-        let (engine, _, _, mut rx) = make_engine_with_output_capacity(1, 0, 1);
+    fn test_emit_preserves_order_after_a_full_channel_drains() {
+        let (mut engine, _, _, mut rx) = make_engine_with_output_capacity(1, 0, 1);
+        // A budget far above any scheduling delay: the drain always lands in it.
+        engine.set_output_retry_budget(200, std::time::Duration::from_millis(1));
 
         engine
             .emit(EngineOutput::ExecuteBlock(B256::repeat_byte(0xAB)))
             .expect("first output should fill the channel");
 
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
         let drain = std::thread::spawn(move || {
             let first = rx.blocking_recv().expect("expected first output");
-            let second = rx.blocking_recv().expect("expected retried output");
+            drained_tx.send(()).expect("notify first drain");
+            let second = rx.blocking_recv().expect("expected second output");
             (first, second)
         });
 
+        drained_rx.recv().expect("consumer drained the full channel");
         engine
             .emit(EngineOutput::ViewChanged { new_view: 2 })
-            .expect("backpressure on non-critical outputs should be retried");
+            .expect("second output should preserve ordering");
 
         let (first, second) = drain.join().expect("drain thread should complete");
         assert!(
@@ -5088,11 +5103,13 @@ mod tests {
                     },
                 )))
                 .expect("valid future timeout should be collected");
-            assert_eq!(
-                engine.current_view(),
-                1,
-                "fewer than quorum future timeouts must never advance the view"
-            );
+            if sender == 0 {
+                assert_eq!(engine.current_view(), 1, "one future report cannot synchronize");
+            } else {
+                // Two verified future reports plus our own timeout supply
+                // all three signatures of this four-validator TC.
+                assert_eq!(engine.current_view(), 6);
+            }
         }
 
         engine
@@ -5242,6 +5259,76 @@ mod tests {
     }
 
     #[test]
+    fn future_reports_synchronize_without_replacing_quorum_or_finality() {
+        let (mut engine, sks, _, mut rx) = make_engine(7, 0);
+        let view = 5;
+        for sender in 1..=3 {
+            let message = engine.signing_profile.timeout_message(view);
+            engine.process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(TimeoutMessage {
+                view,
+                high_qc: QuorumCertificate::genesis(),
+                sender,
+                signature: engine.signing_profile.sign(&sks[sender as usize], &message),
+            }))).unwrap();
+            assert_eq!(engine.current_view(), if sender < 3 { 1 } else { view });
+            assert_eq!(engine.round_state.locked_qc().view, 0);
+            assert_eq!(engine.last_committed_qc().view, 0);
+        }
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|o| matches!(o,
+            EngineOutput::BroadcastMessage(ConsensusMessage::NewView(_)))));
+        let message = engine.signing_profile.timeout_message(view);
+        engine.process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(TimeoutMessage {
+            view,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 4,
+            signature: engine.signing_profile.sign(&sks[4], &message),
+        }))).unwrap();
+        assert_eq!(engine.current_view(), 6, "only the full five-signature TC advances to the successor");
+        assert_eq!(engine.last_committed_qc().view, 0);
+    }
+
+    #[test]
+    fn verified_five_of_seven_timeouts_skip_two_offline_leaders() {
+        for mode in 0..3 {
+            let (mut engine, sks, _, mut rx) = make_engine(7, 0);
+            if mode == 1 {
+                engine.enable_gov5_legacy_signing();
+            } else if mode == 2 {
+                engine.enable_h2_v4_signing(n42_h2_primitives::consensus::H2V4ChainIdentity {
+                    chain_id: 94,
+                    genesis_hash: B256::repeat_byte(0x11),
+                });
+            }
+            engine.advance_to_view(4).unwrap();
+            while rx.try_recv().is_ok() {}
+            // Only validators 0..4 are online. Views 5 and 6 select dead leaders.
+            for view in 4..=6 {
+                engine.on_timeout().unwrap();
+                for sender in 1..=4 {
+                    if sender == 4 {
+                        assert_eq!(engine.current_view(), view, "four signatures cannot advance");
+                    }
+                    let message = engine.signing_profile.timeout_message(view);
+                    let timeout = TimeoutMessage {
+                        view,
+                        high_qc: QuorumCertificate::genesis(),
+                        sender,
+                        signature: engine.signing_profile.sign(&sks[sender as usize], &message),
+                    };
+                    engine.process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout))).unwrap();
+                }
+                assert_eq!(engine.current_view(), view + 1);
+                while let Ok(output) = rx.try_recv() {
+                    if let EngineOutput::BroadcastMessage(ConsensusMessage::NewView(nv)) = output {
+                        assert_eq!(nv.view, 7, "non-leaders cannot announce NewView");
+                        assert_eq!(nv.leader, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_tc_non_leader_no_newview() {
         use crate::protocol::quorum::timeout_signing_message;
         use n42_h2_primitives::consensus::TimeoutMessage;
@@ -5273,7 +5360,7 @@ mod tests {
             o,
             EngineOutput::BroadcastMessage(ConsensusMessage::NewView(_))
         )));
-        assert_eq!(engine.current_view(), 1);
+        assert_eq!(engine.current_view(), 2);
     }
 
     #[test]
@@ -5494,3 +5581,7 @@ mod tests {
 #[cfg(test)]
 #[path = "state_machine_gap_tests.rs"]
 mod gap_tests;
+
+#[cfg(test)]
+#[path = "state_machine_vote_retry_tests.rs"]
+mod vote_retry_tests;

@@ -9,7 +9,13 @@
 #   scripts/fleet7.sh status           heights, hashes, agreement
 #   scripts/fleet7.sh stats            resident memory, threads, disk written
 #   scripts/fleet7.sh watch <seconds>  sample stats over a window and report
-#   scripts/fleet7.sh roll <i>         stop and restart one node, and check it rejoins
+#   scripts/fleet7.sh roll <i> [--kill] [--fresh]  stop and restart one node, and check it rejoins;
+#                                      --kill sends SIGKILL to the validator and its execution
+#                                      layer (a power cut), then prints the recovered vote
+#                                      watermarks and whether the restart hit a logged view;
+#                                      --fresh then deletes only the execution layer (el, el.pid)
+#                                      so it re-initialises from the genesis and the validator
+#                                      pulls the chain by range; the consensus state is kept
 #
 # Every launch argument comes from scripts/fleet7-env.sh; see the comment at
 # the top of that file for why. `print` is how a change to that file is
@@ -17,7 +23,7 @@
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fleet7-env.sh"
 
-usage() { sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; }
+usage() { sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; }
 
 # --------------------------------------------------------------------- up ---
 cmd_up() {
@@ -327,7 +333,11 @@ print(f'{t/b:.1f}/block, {t/s:.1f} tps' if b else 'n/a')" "$txs" "$produced" "$s
 # and a fleet whose members cannot be restarted one at a time cannot be
 # upgraded, moved, or repaired without stopping the chain.
 cmd_roll() {
-  local i=${1:?which node} d before after pin
+  local i=${1:?which node} d before after pin kill=0 fresh=0 pid cp w arg
+  shift
+  for arg in "$@"; do
+    case $arg in --kill) kill=1 ;; --fresh) fresh=1 ;; *) echo "roll: unknown option $arg" >&2; return 1 ;; esac
+  done
   if ((F7_MAPPED || F7_SHARED)); then
     echo "roll is not defined for a fleet with F7_EL_MAP (a node is a layer and its validators); stop and start the fleet" >&2
     return 1
@@ -335,10 +345,34 @@ cmd_roll() {
   d=$(f7_node_dir "$i")
   f7_check_genesis || return 1
   f7_load_peerids
-  before=$(f7_height "$i")
-  echo "node $i: at height ${before:--}, stopping"
-  f7_stop "$i" v
-  f7_stop "$i" el
+  # A member that is already down answers nothing; under `set -e` a failed
+  # substitution would abort the roll before it restarts anything.
+  before=$(f7_height "$i" || true)
+  if ((kill)); then
+    # The closest thing to a power cut: no flush, no graceful QMDB/MDBX close.
+    # Deliberately bypasses f7_stop's never-SIGKILL rule; the execution layer
+    # may need recovery on the way back up, which is part of what this tests.
+    echo "node $i: at height ${before:--}, SIGKILL"
+    for w in v el; do
+      pid=$(f7_pid "$i" "$w") && kill -KILL "$pid" && while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
+    done
+    # Read it now: the restarted validator rewrites the file on its next commit.
+    cp="$d/consensus/consensus-checkpoint.json"
+    cp=$([[ -r $cp ]] && jq -c '{last_voted_view, last_commit_voted_view, locked_qc_view: .locked_qc.view}' "$cp" 2>/dev/null || echo "none readable")
+  else
+    echo "node $i: at height ${before:--}, stopping"
+    f7_stop "$i" v
+    f7_stop "$i" el
+  fi
+  if ((fresh)); then
+    # Only the execution layer is removed. $d/consensus holds the vote log and the
+    # checkpoint, which are this member's BFT safety: deleting them could let it
+    # vote twice in a view it already voted in. Never touch it here.
+    cp="$d/consensus/consensus-checkpoint.json"
+    echo "node $i: consensus checkpoint kept: $([[ -r $cp ]] && jq -c '{last_voted_view, last_commit_voted_view, locked_qc_view: .locked_qc.view}' "$cp" 2>/dev/null || echo none readable)"
+    rm -rf "$d/el" "$d/el.pid"
+    echo "node $i: execution layer re-initialised; consensus state kept"
+  fi
   f7_rotate_logs "$d"
   pin=$(f7_pin "$i")
   f7_el_args "$i"
@@ -349,15 +383,22 @@ cmd_roll() {
   for _ in $(seq 1 120); do grep -aq "RPC auth server started" "$d/el.log" 2>/dev/null && break; sleep 1; done
   f7_validator_args "$i"
   RUST_LOG="$F7_LOG_V" f7_spawn "$d/v.pid" "$d/v.log" $pin ${F7_VAL_NO_MALLOC_CONF:+env -u MALLOC_CONF -u _RJEM_MALLOC_CONF} ${F7_VAL_MALLOC_CONF:+env MALLOC_CONF=$F7_VAL_MALLOC_CONF} "$F7_BIN/examples/h2_validator" "${F7_V_ARGS[@]}"
+  if ((kill)); then
+    echo "node $i: checkpoint at the kill: $cp (the binary vote log next to it may be ahead and wins on load)"
+    sleep 5
+    echo "node $i: refusals to re-vote since the restart (a logged view was hit):"
+    { grep -aiE "already voted|suppressed duplicate commit vote" "$d/v.log" || true; } | sed 's/\x1b\[[0-9;]*m//g' | head -5
+    echo "node $i: $(grep -aciE 'already voted|suppressed duplicate commit vote' "$d/v.log" || true) such lines"
+  fi
   echo "node $i: restarted; how the QMDB forest came back:"
-  grep -a "QMDB" "$d/el.log" | sed 's/\x1b\[[0-9;]*m//g' | head -4
+  { grep -a "QMDB" "$d/el.log" || true; } | sed 's/\x1b\[[0-9;]*m//g' | head -4
   # A node that restarts but never commits again is worse than one that stayed
   # down, because the fleet still counts it toward a quorum it is not serving.
   echo "node $i: waiting to commit again..."
   for _ in $(seq 1 120); do grep -aq "^COMMIT" "$d/v.log" 2>/dev/null && break; sleep 1; done
-  after=$(f7_height "$i")
+  after=$(f7_height "$i" || true)
   echo "node $i: height ${after:--} (fleet $(f7_height 0)), commits since restart $(grep -ac '^COMMIT' "$d/v.log")"
-  grep -aci "error" "$d/el.log" | xargs -I{} echo "node $i: {} error lines in the execution layer log"
+  { grep -aci "error" "$d/el.log" || true; } | xargs -I{} echo "node $i: {} error lines in the execution layer log"
 }
 
 # ------------------------------------------------------------------- plan ---

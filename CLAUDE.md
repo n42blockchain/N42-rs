@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this repo is
 
 N42 is a **partial fork of [reth](https://github.com/paradigmxyz/reth)**. Most of reth is consumed as a
-git dependency pinned to a tag (`reth = { git = "...", tag = "v1.11.0" }` — grep `Cargo.toml` for the tag
+git dependency pinned to a tag (`reth = { git = "...", tag = "v2.7.0" }` — grep `Cargo.toml` for the tag
 to confirm the current version); a subset of reth crates is vendored under `crates/` and substituted into
 the whole dependency graph via `[patch.'https://github.com/paradigmxyz/reth.git']` in the root `Cargo.toml`.
 N42-specific code lives under `crates/n42/` and `bin/n42/`.
@@ -287,7 +287,7 @@ Three N42 clients live side by side on this host, and code moves between them:
   production `mainnet_qmdb_staggered` 7-node HotStuff fleet and owns the
   byte-exact interop fixtures. Also has an `eth-el` mode (`--chain eth-mainnet`)
   and writes reth-format MDBX tables for cross-client work.
-- `../N42-26` — the newer Rust client, on reth **2.4.1** (edition 2024, rustc
+- `../N42-26` — the newer Rust client, on reth **2.7.0** (edition 2024, rustc
   1.97) with HotStuff-2 and QMDB. Depends on reth by local path (`../reth`).
 - `../reth` — a checkout of the n42blockchain/reth fork with upstream tags
   fetched; `scripts/reth-sync.py` reads upstream revisions from it. This repo

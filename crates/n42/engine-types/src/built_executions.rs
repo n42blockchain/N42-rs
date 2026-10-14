@@ -200,9 +200,9 @@ fn free_off_path(evicted: Vec<Entry>) {
 /// 5-16 ms of the own-block hand-off's `clone_ms` when it ran there (loop351
 /// af, `moved_body=true` blocks).
 fn free_boxed_off_path(evicted: Box<dyn Send>) {
-    static FREE: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Box<dyn Send>>>>> = OnceLock::new();
+    static FREE: OnceLock<Option<Mutex<std::sync::mpsc::SyncSender<Box<dyn Send>>>>> = OnceLock::new();
     let sender = FREE.get_or_init(|| {
-        let (send, receive) = std::sync::mpsc::channel::<Box<dyn Send>>();
+        let (send, receive) = std::sync::mpsc::sync_channel::<Box<dyn Send>>(2);
         std::thread::Builder::new()
             .name("n42-built-free".into())
             .spawn(move || {
@@ -214,10 +214,19 @@ fn free_boxed_off_path(evicted: Box<dyn Send>) {
             .map(|_| Mutex::new(send))
     });
     let unsent = match sender {
-        Some(sender) => sender.lock().unwrap_or_else(|p| p.into_inner()).send(evicted).err().map(|err| err.0),
+        Some(sender) => try_queue_free(&sender.lock().unwrap_or_else(|p| p.into_inner()), evicted),
         None => Some(evicted),
     };
     drop(unsent);
+}
+
+// Retired bundles are still large while queued. Keep at most two waiting;
+// if the worker falls behind, free outside the stores' locks on the caller.
+fn try_queue_free(sender: &std::sync::mpsc::SyncSender<Box<dyn Send>>, value: Box<dyn Send>) -> Option<Box<dyn Send>> {
+    match sender.try_send(value) {
+        Ok(()) => None,
+        Err(std::sync::mpsc::TrySendError::Full(value) | std::sync::mpsc::TrySendError::Disconnected(value)) => Some(value),
+    }
 }
 
 /// Frees a slot for one more build. A finished build goes first, oldest
@@ -955,6 +964,25 @@ pub(crate) static STORE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn saturated_or_disconnected_free_worker_returns_ownership_without_waiting() {
+        struct CountDrop(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for CountDrop {
+            fn drop(&mut self) { self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+        }
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (send, recv) = std::sync::mpsc::sync_channel(1);
+        assert!(try_queue_free(&send, Box::new(CountDrop(drops.clone()))).is_none());
+        let unsent = try_queue_free(&send, Box::new(CountDrop(drops.clone())));
+        assert!(unsent.is_some());
+        drop(unsent);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(recv.recv().unwrap());
+        drop(recv);
+        drop(try_queue_free(&send, Box::new(CountDrop(drops.clone()))));
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
     #[test]
     fn built_keep_parses_and_bounds() {
         assert_eq!(built_keep_from(None), 3);

@@ -227,3 +227,21 @@ Nothing was run on a node or the fleet; no throughput round was taken on v2.7.0.
 the new overlay path (`N42_QMDB_READS=verify|on`, `N42_HASHED_TABLES=off`) are compiled but not
 exercised by any test. Tests of the vendored non-member crates (network, storage-overlay, revm,
 bin/reth) were not run.
+
+
+## 2026-10-13 完整 workspace 回归收尾
+
+修复 `debug_traceCall` default prestate 缺少 block beneficiary 的差异。
+实际执行使用上游 RPC 的 `revm_inspectors::DebugInspector`，旧
+`crates/n42/reth-rpc` 未启用，未修改该旧路径。新增 exact-version 0.44.1
+本地依赖替换，源码、原许可证、来源 checksum 和 `N42-PATCH.diff` 均保留。
+Default prestate 补读预执行数据库中的 beneficiary；已存在的账户/存储结果保持原样，
+diff 模式和 disableCode 语义保留。未改变执行结果或已有 Geth 快照工件。
+Geth 对照：[OnTxStart](https://github.com/ethereum/go-ethereum/blob/master/eth/tracers/native/prestate.go)。
+
+专项：原 Geth 快照 E2E 通过，新增 unchanged-beneficiary diff 检查通过；另外 17 个 RPC E2E 通过。
+完整命令：`CARGO_BUILD_JOBS=8 RAYON_NUM_THREADS=8 cargo test --release --workspace --locked --offline -- --test-threads=4`。
+完整结果：151 个测试结果组、3352 通过、0 失败、87 声明忽略，退出码 0。
+工件在 n42-26 的 `.artifacts/reth-stable-completion-20261012/build-service/093.log` 与 `093.result.json`。
+早先的失败日志保留；忽略项未改成通过。该回归包含主线测试、文档测试，
+自定义链七节点运行另由升级兼容分支及混合运行工件验收。

@@ -1,0 +1,13 @@
+[package]
+name = "proptest-arbitrary-interop"
+description = "Interop glue between arbitrary and proptest crates"
+authors = ["Graydon Hoare <graydon@pobox.com>"]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+keywords = ["property", "propcheck", "arbitrary", "fuzz", "testing"]
+readme = "README.md"
+
+[dependencies]
+proptest = "1.0.0"
+arbitrary = "1.1.3"

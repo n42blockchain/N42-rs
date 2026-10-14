@@ -703,6 +703,10 @@ reth-network-peers = { path = "crates/net/peers"}
 reth-chain-state = { path = "crates/chain-state" }
 
 [patch.crates-io]
+# Fee-disabled traceCall must retain the Geth beneficiary prestate.
+revm-inspectors = { path = "vendor/dependency-repairs/revm-inspectors-0.44.1" }
+# TestRng trait compatibility with proptest 1.11 / rand 0.10.
+proptest-arbitrary-interop = { path = "vendor/dependency-repairs/proptest-arbitrary-interop-0.1.0" }
 pprof_util = { path = "vendor/dependency-repairs/pprof_util-0.8.2" }
 
 # Narrow upstream dependency repairs; provenance is recorded in vendor/dependency-repairs.

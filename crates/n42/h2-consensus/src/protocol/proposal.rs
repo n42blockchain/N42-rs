@@ -149,10 +149,7 @@ impl ConsensusEngine {
         // Include any pending validator changes so all nodes apply the same
         // changes at CommitQC time (consensus-safe commit-then-activate).
         let validator_changes = self.epoch_manager.pending_changes_for_proposal();
-        if matches!(
-            self.signing_profile,
-            super::quorum::ConsensusSigningProfile::H2V4(_)
-        ) && validator_changes
+        if self.signing_profile.is_gov5() && validator_changes
             .as_ref()
             .is_some_and(|changes| !changes.is_empty())
         {
@@ -235,10 +232,14 @@ impl ConsensusEngine {
             );
             return Ok(());
         }
-        self.round_state.record_vote(view);
+        let previous = self.round_state.record_vote(view);
         // Persist the leader self-vote with the same crash-safety contract as
         // send_vote(); a fsync failure aborts the proposal.
-        self.vote_log.record_vote(view)?;
+        // A failed log write must not leave the watermark advanced: the
+        // retry after the disk recovers would otherwise be refused.
+        self.vote_log
+            .record_vote(view, self.round_state.locked_qc())
+            .inspect_err(|_| self.round_state.rollback_vote(previous))?;
         // Reuse the vote_msg computed above (same view + block_hash).
         let leader_vote_sig = self.signing_profile.sign(&self.secret_key, &vote_msg);
         if let Some(ref mut collector) = self.vote_collector {
@@ -280,10 +281,7 @@ impl ConsensusEngine {
         }
 
         let pk = view_set.get_public_key(proposal.proposer)?;
-        if matches!(
-            self.signing_profile,
-            super::quorum::ConsensusSigningProfile::H2V4(_)
-        ) && proposal
+        if self.signing_profile.is_gov5() && proposal
             .validator_changes
             .as_ref()
             .is_some_and(|changes| !changes.is_empty())
@@ -436,10 +434,7 @@ impl ConsensusEngine {
         // Gov5's H2 profile is import-gated: an R1 vote attests that this node
         // has executed and validated the proposed payload, not merely seen its
         // hash. Keep the native profile's established optimistic path intact.
-        if matches!(
-            self.signing_profile,
-            super::quorum::ConsensusSigningProfile::H2V4(_)
-        ) && !self.vote_before_import
+        if self.signing_profile.is_gov5() && !self.vote_before_import
         {
             self.pending_proposal = Some(super::state_machine::PendingProposal {
                 view,
@@ -526,8 +521,12 @@ impl ConsensusEngine {
             return Ok(());
         }
         // Persist before signing for the same crash-safety reason as R1.
-        self.round_state.record_commit_vote(view);
-        self.vote_log.record_commit_vote(view)?;
+        let previous = self.round_state.record_commit_vote(view);
+        // A failed log write must not leave the watermark advanced: the
+        // retry after the disk recovers would otherwise be refused.
+        self.vote_log
+            .record_commit_vote(view, self.round_state.locked_qc())
+            .inspect_err(|_| self.round_state.rollback_commit_vote(previous))?;
 
         // Bind this R2 commit-vote signature to the same changes_hash the
         // leader's proposal carried.
@@ -579,8 +578,12 @@ impl ConsensusEngine {
         // (we err on the side of not voting rather than double-voting). The
         // vote_log fsync MUST succeed before we sign — otherwise a crash after
         // signing but before record could let the recovered node re-vote.
-        self.round_state.record_vote(view);
-        self.vote_log.record_vote(view)?;
+        let previous = self.round_state.record_vote(view);
+        // A failed log write must not leave the watermark advanced: the
+        // retry after the disk recovers would otherwise be refused.
+        self.vote_log
+            .record_vote(view, self.round_state.locked_qc())
+            .inspect_err(|_| self.round_state.rollback_vote(previous))?;
 
         let leader = self.leader_index_for_view(view);
         let vote_msg = self.signing_profile.vote_message(view, block_hash);
@@ -633,10 +636,7 @@ impl ConsensusEngine {
                     && self.round_state.may_vote_in(pending.view)
             })
             .map(|pending| pending.view);
-        let profile_is_h2_v4 = matches!(
-            self.signing_profile,
-            super::quorum::ConsensusSigningProfile::H2V4(_)
-        );
+        let profile_is_h2_v4 = self.signing_profile.is_gov5();
         if let Some(view) = pending_vote_view.filter(|_| profile_is_h2_v4) {
             if !self.extends_justify(block_hash) {
                 return Ok(());

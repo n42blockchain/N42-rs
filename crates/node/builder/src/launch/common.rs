@@ -72,7 +72,8 @@ use reth_node_metrics::{
 use reth_provider::{
     providers::{NodeTypesForProvider, ProviderNodeTypes, RocksDBProvider, StaticFileProvider},
     BalStoreHandle, BlockHashReader, BlockNumReader, DBProvider, DatabaseProviderFactory,
-    MetadataProvider, MetadataWriter, ProviderError, ProviderFactory, ProviderResult,
+    MetadataProvider, MetadataWriter, ProviderError,
+    ProviderFactory, ProviderResult,
     RocksDBBalStore, RocksDBProviderFactory, StageCheckpointReader, StaticFileProviderBuilder,
     StaticFileProviderFactory, StorageSettingsCache,
 };
@@ -553,6 +554,24 @@ where
         let (partial_trie_unwind, has_persisted_partial_trie_unwind) =
             get_partial_trie_unwind_marker(&provider_ro)?;
         drop(provider_ro);
+        let qmdb_chain = reth_chainspec::qmdb::state_scheme(self.chain_spec().genesis()) ==
+            reth_chainspec::qmdb::StateScheme::Qmdb;
+        match plan_trie_recovery(
+            qmdb_chain,
+            partial_trie_unwind,
+            has_persisted_partial_trie_unwind,
+        ) {
+            TrieRecovery::Nothing | TrieRecovery::Unwind(_) => {}
+            TrieRecovery::Refuse { frontier, tip } => {
+                eyre::bail!(
+                    "the hashed-state frontier #{frontier} lags the database tip #{tip}; on a QMDB \
+                     chain this cannot be unwound (the Merkle stage would verify a Merkle-Patricia \
+                     root the headers do not carry) or healed (the masked blocks' state was never \
+                     written); re-initialise this member's execution layer: `scripts/fleet7.sh \
+                     roll <i> --fresh`, or delete the datadir and resync"
+                );
+            }
+        }
         let persist_partial_trie_unwind =
             !has_persisted_partial_trie_unwind && partial_trie_unwind.is_some();
         let partial_trie_unwind_target =
@@ -582,6 +601,12 @@ where
                 )
                 .builder()
                 .disable_all(disabled_stages);
+
+                if qmdb_chain {
+                    // A QMDB chain's headers carry a QMDB root, which the Merkle stages cannot
+                    // verify; the MDBX trie tables are stale from block 1 on.
+                    stages = stages.disable(StageId::MerkleUnwind).disable(StageId::MerkleExecute);
+                }
 
                 if walk_all_changed_branch_children {
                     // Partial trie recovery is not complete until Merkle has unwound.
@@ -1408,6 +1433,34 @@ pub fn metrics_hooks<N: NodeTypesWithDB>(provider_factory: &ProviderFactory<N>) 
         .build()
 }
 
+/// What startup does about a hashed-state/trie frontier that lags the `Finish` checkpoint.
+#[derive(Debug, PartialEq, Eq)]
+enum TrieRecovery {
+    /// The frontier is current.
+    Nothing,
+    /// Unwind the database to the marker's frontier through the Merkle stage (MPT chains).
+    Unwind(PartialStateTrieUnwindMarker),
+    /// A QMDB datadir whose frontier lags the tip (written by an older binary): neither
+    /// unwindable nor healable, the operator must re-initialise the execution layer.
+    Refuse { frontier: BlockNumber, tip: BlockNumber },
+}
+
+/// Decides the recovery for a lagging frontier from the marker lookup result.
+fn plan_trie_recovery(
+    qmdb_chain: bool,
+    marker: Option<PartialStateTrieUnwindMarker>,
+    _persisted: bool,
+) -> TrieRecovery {
+    match (qmdb_chain, marker) {
+        (_, None) => TrieRecovery::Nothing,
+        (false, Some(marker)) => TrieRecovery::Unwind(marker),
+        (true, Some(marker)) => TrieRecovery::Refuse {
+            frontier: marker.partial_state_trie,
+            tip: marker.finish_block_number,
+        },
+    }
+}
+
 fn get_partial_trie_unwind_marker(
     provider: &(impl MetadataProvider + StageCheckpointReader),
 ) -> ProviderResult<(Option<PartialStateTrieUnwindMarker>, bool)> {
@@ -1469,7 +1522,9 @@ fn delete_partial_trie_unwind_marker(provider: &impl MetadataWriter) -> Provider
 
 #[cfg(test)]
 mod tests {
-    use super::{get_partial_trie_unwind_marker, LaunchContext, NodeConfig};
+    use super::{
+        get_partial_trie_unwind_marker, plan_trie_recovery, LaunchContext, NodeConfig, TrieRecovery,
+    };
     use reth_config::Config;
     use reth_db_api::models::PartialStateTrieUnwindMarker;
     use reth_node_core::args::PruningArgs;
@@ -1662,5 +1717,25 @@ mod tests {
     #[test]
     fn get_partial_trie_unwind_marker_rejects_malformed_metadata() {
         assert!(get_partial_trie_unwind_marker(&MockProvider(Some(vec![0xff]), None)).is_err());
+    }
+
+    #[test]
+    fn plan_trie_recovery_by_chain_kind() {
+        let marker = PartialStateTrieUnwindMarker { finish_block_number: 46, partial_state_trie: 16 };
+        // An MPT chain keeps the unwind, persisted or not.
+        assert_eq!(plan_trie_recovery(false, Some(marker), false), TrieRecovery::Unwind(marker));
+        assert_eq!(plan_trie_recovery(false, Some(marker), true), TrieRecovery::Unwind(marker));
+        // A QMDB chain with a lagging frontier is refused, persisted marker or not.
+        assert_eq!(
+            plan_trie_recovery(true, Some(marker), false),
+            TrieRecovery::Refuse { frontier: 16, tip: 46 }
+        );
+        // A current frontier needs nothing.
+        assert_eq!(plan_trie_recovery(true, None, false), TrieRecovery::Nothing);
+        assert_eq!(plan_trie_recovery(false, None, false), TrieRecovery::Nothing);
+        assert_eq!(
+            plan_trie_recovery(true, Some(marker), true),
+            TrieRecovery::Refuse { frontier: 16, tip: 46 }
+        );
     }
 }

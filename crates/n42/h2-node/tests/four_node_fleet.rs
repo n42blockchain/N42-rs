@@ -18,6 +18,7 @@
 //! and `docs/N42_26_PORT.md` records how far that got. It proves the Rust half
 //! is a working fleet rather than a pile of working parts.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
@@ -119,6 +120,43 @@ async fn build_node(
     propose: bool,
     gov5_profile: bool,
 ) -> (Node, libp2p::Multiaddr) {
+    build_node_with_store(index, key, validator_set, identity, peer, propose, gov5_profile, None).await
+}
+
+/// A vote log that forwards to the real file and remembers every R1 view the
+/// engine asked to record, i.e. every R1 vote it was about to sign.
+#[derive(Debug)]
+struct TapLog {
+    inner: n42_h2_node::persistence::FileVoteLog,
+    r1_views: std::sync::Mutex<Vec<u64>>,
+}
+
+impl n42_h2_consensus::VoteLogWriter for TapLog {
+    fn record_vote(&self, view: u64, locked_qc: &n42_h2_primitives::consensus::QuorumCertificate) -> n42_h2_consensus::ConsensusResult<()> {
+        self.r1_views.lock().expect("tap").push(view);
+        self.inner.record_vote(view, locked_qc)
+    }
+
+    fn record_commit_vote(&self, view: u64, locked_qc: &n42_h2_primitives::consensus::QuorumCertificate) -> n42_h2_consensus::ConsensusResult<()> {
+        self.inner.record_commit_vote(view, locked_qc)
+    }
+}
+
+/// `build_node`, optionally backed by a `ConsensusStore` wired the way
+/// `examples/h2_validator.rs` does: the file vote log in the engine, the
+/// checkpoint written inside the service, and the engine recovered from
+/// `load()` when the directory has run before.
+#[allow(clippy::too_many_arguments)]
+async fn build_node_with_store(
+    index: usize,
+    key: BlsSecretKey,
+    validator_set: &ValidatorSet,
+    identity: H2V4ChainIdentity,
+    peer: Option<libp2p::Multiaddr>,
+    propose: bool,
+    gov5_profile: bool,
+    store: Option<(&std::path::Path, Arc<TapLog>)>,
+) -> (Node, libp2p::Multiaddr) {
     let mut config = TransportConfig::new(identity)
         .with_listen_addr("/ip4/127.0.0.1/tcp/0".parse().unwrap());
     if let Some(addr) = peer {
@@ -144,22 +182,53 @@ async fn build_node(
 
     let (output_tx, output_rx) = mpsc::channel::<EngineOutput>(256);
     let seal_key = key.clone();
-    let mut engine = ConsensusEngine::new(
-        index as u32,
-        key,
-        validator_set.clone(),
-        // Short enough that a stuck view recovers inside the test's budget,
-        // long enough that a slow machine does not time out a healthy view.
-        1_000,
-        4_000,
-        output_tx,
-    );
+    let recovered = match &store {
+        Some((dir, _)) => n42_h2_node::persistence::ConsensusStore::open(dir).expect("store").load().expect("a readable store"),
+        None => None,
+    };
+    // Short enough that a stuck view recovers inside the test's budget, long
+    // enough that a slow machine does not time out a healthy view.
+    let mut engine = match (&store, recovered) {
+        (Some((_, tap)), Some(r)) => ConsensusEngine::with_recovered_state_and_vote_log(
+            index as u32,
+            key,
+            n42_h2_consensus::EpochManager::new(validator_set.clone()),
+            1_000,
+            4_000,
+            output_tx,
+            r.view,
+            r.locked_qc,
+            r.last_committed_qc,
+            r.consecutive_timeouts,
+            r.last_voted_view,
+            r.last_commit_voted_view,
+            tap.clone(),
+        ),
+        (Some((_, tap)), None) => ConsensusEngine::with_epoch_manager_and_vote_log(
+            index as u32,
+            key,
+            n42_h2_consensus::EpochManager::new(validator_set.clone()),
+            1_000,
+            4_000,
+            output_tx,
+            tap.clone(),
+        ),
+        (None, _) => ConsensusEngine::new(index as u32, key, validator_set.clone(), 1_000, 4_000, output_tx),
+    };
     engine.enable_h2_v4_signing(identity);
 
     let driver = ExecutionDriver::new(MockExecutionLayer::new(), identity.genesis_hash);
     let mut service = H2Service::new(transport, engine, driver, output_rx, VALIDATORS);
     if gov5_profile {
         service = service.with_gov5_h2_profile(seal_key);
+    }
+    if let Some((dir, _)) = &store {
+        let writer = n42_h2_node::persistence::ConsensusStore::open(dir).expect("store");
+        service = service.with_checkpoint(move |engine| {
+            writer
+                .save(&n42_h2_node::persistence::checkpoint_from(engine))
+                .map_err(|error| error.to_string())
+        });
     }
     if propose {
         service = service.with_payload_attributes(attributes);
@@ -447,4 +516,82 @@ async fn a_member_that_starts_behind_pulls_the_chain_from_its_peers() {
     let (height, complete) = synced.expect("the late member syncs within the budget");
     assert!(complete, "the pull stopped short at {height}");
     assert!(height >= 3, "synced only to {height}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_restarted_from_its_store_rejoins_and_never_revotes_a_logged_view() {
+    // Four members, each with a real ConsensusStore. After the first commit
+    // member 3 is stopped, rebuilt from its store directory (file vote log and
+    // checkpoint, as h2_validator does), and rejoins. Every R1 view its new
+    // engine asks to sign must lie above the view it had already voted in.
+    use n42_h2_node::persistence::ConsensusStore;
+    let identity = identity();
+    let (keys, validator_set) = validator_keys();
+    let root = std::env::temp_dir().join(format!("h2-fleet-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let tap_for = |store: &ConsensusStore| {
+        Arc::new(TapLog { inner: store.vote_log().expect("vote log"), r1_views: Default::default() })
+    };
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut handles = Vec::new();
+    let mut first_addr = None;
+    let mut stores = Vec::new();
+    for (index, key) in keys.iter().cloned().enumerate() {
+        let dir = root.join(format!("node{index}"));
+        let store = ConsensusStore::open(&dir).expect("store");
+        let tap = tap_for(&store);
+        let (node, addr) = build_node_with_store(index, key, &validator_set, identity, first_addr.clone(), true, false, Some((&dir, tap))).await;
+        if first_addr.is_none() {
+            first_addr = Some(addr);
+        }
+        handles.push(spawn_node(index, node, tx.clone()));
+        stores.push(store);
+    }
+
+    let first_view = tokio::time::timeout(Duration::from_secs(60), async {
+        while let Some((index, event)) = rx.recv().await {
+            if index == 3
+                && let ServiceEvent::Committed { view, .. } = event
+            {
+                return view;
+            }
+        }
+        panic!("event channel closed");
+    })
+    .await
+    .expect("member 3 commits before the restart");
+
+    let victim = handles.remove(3);
+    victim.abort();
+    let _ = victim.await;
+
+    let persisted = stores[3].load().expect("load").expect("member 3 persisted state before stopping");
+    assert!(persisted.last_voted_view >= 1, "member 3 had voted before the restart");
+    let tap = tap_for(&stores[3]);
+    let (node, _) = build_node_with_store(3, keys[3].clone(), &validator_set, identity, first_addr, true, false, Some((&root.join("node3"), tap.clone()))).await;
+    assert!(node.service.engine().last_voted_view() >= persisted.last_voted_view, "the engine starts at or above the persisted vote watermark");
+    assert!(node.service.engine().locked_qc().view >= persisted.locked_qc.view, "the engine keeps the persisted lock");
+    handles.push(spawn_node(3, node, tx.clone()));
+
+    let later = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some((index, event)) = rx.recv().await {
+            if index == 3
+                && let ServiceEvent::Committed { view, .. } = event
+                && view > first_view
+            {
+                return view;
+            }
+        }
+        panic!("event channel closed");
+    })
+    .await;
+    for handle in handles {
+        handle.abort();
+    }
+    let revotes: Vec<u64> = tap.r1_views.lock().expect("tap").iter().copied().filter(|v| *v <= persisted.last_voted_view).collect();
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(revotes.is_empty(), "the restarted engine tried to sign R1 in already-voted views {revotes:?} (persisted {})", persisted.last_voted_view);
+    let later = later.expect("the restarted member commits a later block");
+    assert!(later > first_view);
 }

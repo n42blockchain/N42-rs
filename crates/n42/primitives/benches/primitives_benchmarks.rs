@@ -180,9 +180,8 @@ fn bench_tally_operations(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark RLP encoding/decoding for snapshot-like structures
-fn bench_rlp_operations(c: &mut Criterion) {
-    use alloy_rlp::{Decodable, Encodable};
+/// Benchmark the Snapshot serde JSON round trip used by its serialization tests.
+fn bench_snapshot_serialization(c: &mut Criterion) {
 
     let config = APosConfig::default();
     let signers: Vec<Address> = (0..21)
@@ -195,23 +194,20 @@ fn bench_rlp_operations(c: &mut Criterion) {
 
     let snap = Snapshot::new_snapshot(config, 1000, B256::repeat_byte(0x42), signers);
 
-    let mut group = c.benchmark_group("rlp_operations");
+    let mut group = c.benchmark_group("snapshot_json");
 
-    // Benchmark RLP encoding
+    // Benchmark JSON encoding
     group.bench_function("encode", |b| {
         b.iter(|| {
-            let mut buf = Vec::new();
-            snap.encode(&mut buf);
-            black_box(buf)
+            black_box(serde_json::to_vec(&snap).expect("snapshot serializes"))
         });
     });
 
-    // Benchmark RLP decoding
-    let mut encoded = Vec::new();
-    snap.encode(&mut encoded);
+    // Benchmark JSON decoding
+    let encoded = serde_json::to_vec(&snap).expect("snapshot serializes");
 
     group.bench_function("decode", |b| {
-        b.iter(|| black_box(Snapshot::decode(&mut encoded.as_slice()).unwrap()));
+        b.iter(|| black_box(serde_json::from_slice::<Snapshot>(&encoded).expect("snapshot decodes")));
     });
 
     group.finish();
@@ -222,26 +218,26 @@ fn bench_u256_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("u256_operations");
 
     let a = U256::from(1_000_000_000_000u64);
-    let b = U256::from(500_000_000_000u64);
+    let operand = U256::from(500_000_000_000u64);
 
     // Addition
     group.bench_function("addition", |b| {
-        b.iter(|| black_box(a + b));
+        b.iter(|| black_box(a + operand));
     });
 
     // Subtraction
     group.bench_function("subtraction", |b| {
-        b.iter(|| black_box(a - b));
+        b.iter(|| black_box(a - operand));
     });
 
     // Comparison
     group.bench_function("comparison", |b| {
-        b.iter(|| black_box(a > b));
+        b.iter(|| black_box(a > operand));
     });
 
     // Saturating subtraction (safe arithmetic)
     group.bench_function("saturating_sub", |b| {
-        b.iter(|| black_box(a.saturating_sub(b)));
+        b.iter(|| black_box(a.saturating_sub(operand)));
     });
 
     // From u64
@@ -295,7 +291,7 @@ criterion_group!(
     bench_snapshot_hash,
     bench_signer_operations,
     bench_tally_operations,
-    bench_rlp_operations,
+    bench_snapshot_serialization,
     bench_u256_operations,
     bench_address_operations,
 );

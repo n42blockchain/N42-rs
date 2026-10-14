@@ -256,7 +256,14 @@ fn main() {
             }
             // A state masking suffix leaves the hashed-state version behind the database tip,
             // and a view built at restart holds no journals to answer behind its head.
-            if n42_qmdb_reth::n42_state::hashed_tables_off() && node.config.engine.num_state_masking_blocks > 0 {
+            // The node builder forces the suffix to 0 on a QMDB chain, so the configured value only
+            // matters on a chain without QMDB.
+            let qmdb_chain = reth_chainspec::qmdb::state_scheme(node.chain_spec().genesis())
+                == reth_chainspec::qmdb::StateScheme::Qmdb;
+            if n42_qmdb_reth::n42_state::hashed_tables_off()
+                && !qmdb_chain
+                && node.config.engine.num_state_masking_blocks > 0
+            {
                 return Err(eyre::eyre!(
                     "N42_HASHED_TABLES=off needs --engine.num-state-masking-blocks 0 (got {}): the QMDB read view answers at the database tip",
                     node.config.engine.num_state_masking_blocks

@@ -95,6 +95,80 @@ async fn under_gov5s_profile_consensus_goes_out_on_the_native_topic() {
 }
 
 #[tokio::test]
+async fn queued_native_consensus_flushes_without_a_v4_mesh() {
+    use futures::StreamExt;
+    use libp2p::gossipsub::{Behaviour, ConfigBuilder, MessageAuthenticity, ValidationMode};
+    let (keys, set) = keys(4);
+    let mut a = node_in(&keys, &set, 0, None).await;
+    a.svc = a.svc.with_gov5_h2_profile(keys[0].clone());
+    a.svc.engine.on_timeout().unwrap();
+    let mut events = Vec::new();
+    within(a.svc.drain_outputs(&mut events)).await.unwrap();
+    assert!(!a.svc.outbox.is_empty());
+
+    let config = ConfigBuilder::default()
+        .validation_mode(ValidationMode::Anonymous)
+        .build()
+        .unwrap();
+    let mut peer: libp2p::Swarm<Behaviour> = libp2p::SwarmBuilder::with_existing_identity(
+        libp2p::identity::Keypair::generate_secp256k1(),
+    )
+    .with_tokio()
+    .with_tcp(
+        Default::default(),
+        libp2p::noise::Config::new,
+        libp2p::yamux::Config::default,
+    )
+    .unwrap()
+    .with_behaviour(|_| Behaviour::new(MessageAuthenticity::Anonymous, config).unwrap())
+    .unwrap()
+    .build();
+    peer.behaviour_mut()
+        .subscribe(&n42_h2_net::topic::fork_scoped_topic(
+            ID.genesis_hash,
+            "hotstuff_consensus",
+        ))
+        .unwrap();
+    peer.dial(a.addr.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while a.svc.transport.native_mesh_size() == 0 {
+            tokio::select! {
+                event = a.svc.transport.next_event() => {
+                    a.svc.handle_transport_event(event.unwrap()).unwrap();
+                }
+                _ = peer.next() => {}
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    })
+    .await
+    .expect("native mesh forms");
+    assert_eq!(
+        a.svc.transport.mesh_size(),
+        0,
+        "peer never subscribed to v4"
+    );
+    a.svc.flush_outbox(&mut events);
+    assert!(
+        a.svc.outbox.is_empty(),
+        "native messages must not wait for a v4 mesh"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                event = a.svc.transport.next_event() => {
+                    a.svc.handle_transport_event(event.unwrap()).unwrap();
+                }
+                event = peer.next() => {
+                    if matches!(event, Some(libp2p::swarm::SwarmEvent::Behaviour(libp2p::gossipsub::Event::Message { .. }))) {
+                        break;
+                    }
+                }
+            }
+        }
+    }).await.expect("queued native consensus reaches the peer");
+}
+#[tokio::test]
 async fn messages_and_bodies_queued_before_the_mesh_are_sent_when_it_forms() {
     let (keys, set) = keys(4);
     let mut a = node_in(&keys, &set, 0, None).await;

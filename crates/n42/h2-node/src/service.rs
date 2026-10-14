@@ -4715,11 +4715,21 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Only worth attempting when there is somewhere to send: retrying into an
     /// empty mesh just re-queues everything and burns the loop.
     fn flush_outbox(&mut self, events: &mut Vec<ServiceEvent>) {
-        if self.transport.mesh_size() == 0 {
-            return;
+        let v4_mesh = self.transport.mesh_size();
+        if v4_mesh > 0 {
+            for data in std::mem::take(&mut self.body_outbox) {
+                self.send_body(data, B256::ZERO);
+            }
         }
-        for data in std::mem::take(&mut self.body_outbox) {
-            self.send_body(data, B256::ZERO);
+        // Native consensus has an independently formed gossip mesh. Observer
+        // readiness on v4 must not prevent queued timeouts/proposals leaving.
+        let consensus_mesh = if self.native_wire {
+            self.transport.native_mesh_size()
+        } else {
+            v4_mesh
+        };
+        if consensus_mesh == 0 {
+            return;
         }
         for message in std::mem::take(&mut self.outbox) {
             self.publish(message, events);

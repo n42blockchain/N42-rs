@@ -77,9 +77,24 @@ fn main() -> Result<()> {
             "transaction root mismatch at {number}"
         );
         ensure!(
-            block.body.ommers.is_empty()
-                && block.body.withdrawals.as_ref().is_none_or(|w| w.is_empty()),
-            "unsupported nonempty rewards/ommers at {number}"
+            block.body.ommers.is_empty(),
+            "unsupported nonempty ommers at {number}"
+        );
+        let withdrawals = block
+            .body
+            .withdrawals
+            .as_ref()
+            .map(|w| w.as_slice())
+            .unwrap_or_default();
+        let rewards = n42_h2_consensus::withdrawals_to_rewards(withdrawals);
+        ensure!(
+            n42_h2_consensus::rewards_to_withdrawals(&rewards)? == withdrawals,
+            "withdrawal metadata does not represent gov5 rewards at {number}"
+        );
+        ensure!(
+            block.header.withdrawals_root
+                == Some(n42_h2_consensus::gov5_rewards_root(rewards.iter().copied())),
+            "reward commitment mismatch at {number}"
         );
         ensure!(
             block.header.block_access_list_hash.is_none(),
@@ -91,7 +106,8 @@ fn main() -> Result<()> {
             .iter()
             .map(|tx| tx.encoded_2718().into())
             .collect();
-        let body = n42_h2_consensus::encode_block_rlp_raw(&block.header, &transactions, &[], None);
+        let body =
+            n42_h2_consensus::encode_block_rlp_raw(&block.header, &transactions, &rewards, None);
         let (decoded_hash, _) = n42_h2_consensus::decode_block_body_header(
             &body,
             n42_h2_consensus::N42HeaderProfile::Gov5H2,
@@ -108,7 +124,7 @@ fn main() -> Result<()> {
         parent = hash;
     }
     let manifest = json!({"source_datadir":datadir,"genesis":genesis_path,"durable_finish":durable,
-        "exported_through":last,"verification":"canonical header hashes, ancestry and transaction roots; execution replay pending","blocks":rows});
+        "exported_through":last,"verification":"canonical header hashes, ancestry, transaction roots and reward commitments; execution replay pending","blocks":rows});
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)

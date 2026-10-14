@@ -311,6 +311,31 @@ fn main() {
                 }
                 qmdb.initialize((info.best_number, head_hash))?;
                 info!(target: "reth::cli", block = info.best_number, %head_hash, "QMDB state ready");
+                // A lagging CL may re-submit persisted blocks below this EL's
+                // recovered frontier. Their deferred results are committed in
+                // canonical depth-D descendant headers, not in their own header.
+                // Resolve misses without replaying QMDB or evicting live results.
+                let historical_provider = node.provider.clone();
+                let historical_genesis = genesis.clone();
+                n42_engine_types::executed_fields::set_historical_reader(move |hash| {
+                    use reth_provider::DatabaseProviderFactory;
+                    let database = historical_provider.database_provider_ro().ok()?;
+                    let ancestor = database.header(*hash).ok()??;
+                    if ancestor.hash_slow() != *hash { return None; }
+                    if database.block_hash(ancestor.number).ok()? != Some(*hash) { return None; }
+                    if !reth_chainspec::qmdb::deferred_execution_active_at(&historical_genesis, ancestor.timestamp) {
+                        return Some(n42_engine_types::executed_fields::fields_from_child_header(&ancestor));
+                    }
+                    let depth = u8::try_from(reth_chainspec::qmdb::deferred_execution_depth_at(&historical_genesis, ancestor.timestamp)).ok()?;
+                    if !(1..=2).contains(&depth) { return None; }
+                    let mut descendants = Vec::with_capacity(usize::from(depth));
+                    for step in 1..=depth {
+                        descendants.push(database.header_by_number(ancestor.number.checked_add(u64::from(step))?).ok()??);
+                    }
+                    let carrying = descendants.last()?;
+                    if reth_chainspec::qmdb::deferred_execution_depth_at(&historical_genesis, carrying.timestamp) != u64::from(depth) { return None; }
+                    n42_engine_types::executed_fields::fields_from_descendants(&ancestor, &descendants, depth)
+                });
                 // With HotStuff-2 finality the canonical head is the committed
                 // block, and a build on an ancestor of it is a stale request
                 // that would revert the state tree below the head.

@@ -994,6 +994,16 @@ impl QmdbForest {
         self.records.get(block_hash).map(|record| record.root)
     }
 
+    /// The checkpoint number, parent hash and parent root needed at depth two.
+    pub fn checkpoint_parent(&self, block_hash: &B256) -> Option<(u64, B256, B256)> {
+        let record = self.records.get(block_hash)?;
+        let parent = self.records.get(&record.parent)?;
+        if parent.number.checked_add(1) != Some(record.number) {
+            return None;
+        }
+        Some((record.number, record.parent, parent.root))
+    }
+
     /// Files a computed block under a different hash.
     ///
     /// A builder computes a block's root before consensus seals its header,

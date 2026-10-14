@@ -184,7 +184,7 @@ if rows:
 PYEOF
   echo "$tag imp_fields_p90=$(cat $STRIP/el.log | grep -E 'direct import: executed here' | grep 'txs=163000' | grep -oE 'fields_ready_ms=[0-9]+' | cut -d= -f2 | sort -n | awk '{a[NR]=$1} END{print a[int(NR*0.9)]}') b_p75=$(cat $STRIP/v.log | grep 'block committed' | grep -oE 'R1_collect=[0-9]+' | cut -d= -f2 | sort -n | awk '{a[NR]=$1} END{print a[int(NR*0.75)]}')"
   echo "$tag overlay: filter_skips=$(grep 'seal-first build phases' $STRIP/el.log | grep -oE ' overlay_filter_skips=[0-9]+' | cut -d= -f2 | paste -sd+ | bc) probes=$(grep 'seal-first build phases' $STRIP/el.log | grep -oE ' overlay_probes=[0-9]+' | cut -d= -f2 | paste -sd+ | bc) ratio=$(grep 'seal-first build phases' $STRIP/el.log | grep -oE ' overlay_(filter_skips|probes)=[0-9]+' | awk -F= '/skips/{s+=$2} /probes/{p+=$2} END{if(p+s>0) printf "%.3f", s/(s+p); else print "-"}') (ratio = skips/(skips+probes))"
-  echo "$tag one_probe_retained_mb_max=$(grep -a 'seal-first build phases' $STRIP/el.log | grep 'txs=163000' | grep -oE ' one_probe_retained_mb=[0-9]+' | cut -d= -f2 | sort -n | tail -1)"
+  echo "$tag one_probe_retained_mb_max=$(grep -a 'seal-first build phases' $STRIP/el.log | grep 'txs=200000' | grep -oE ' one_probe_retained_mb=[0-9]+' | cut -d= -f2 | sort -n | tail -1)"
   echo "$tag overlay_manager: $(cat $STRIP/el.log | grep 'Overlay manager created' | grep -oE 'state_trie_overlay=[a-z]+' | sort | uniq -c | tr '\n' ' ') state-ovly_cpu=$(awk '$4 ~ /^state-ovly/{s+=$5} END{print s+0}' $S/threadcpu-$tag.tsv 2>/dev/null)"
   echo "$tag verify: $(F7_GENESIS=${GLEG:-$F7_GENESIS} F7_VALIDATORS=$NV F7_ELS=$NEL F7_HTTP_BASE=8700 timeout 60 python3 scripts/fleet7-verify.py --window 32 --settle 2 --json $B/bench-$tag/verify.json 2>&1 | tail -1)"
   [ -f $S/valmem-$tag.txt ] && cat $S/valmem-$tag.txt | cut -c1-300; echo "== many-keys report $tag"; python3 scripts/fleet7-runs/manykeys350.py $tag $S/val-$tag.tsv 2>&1 | cut -c1-300 | tee $S/manykeys-$tag.out; mkdir -p scripts/fleet7-runs/results; cp $S/manykeys-$tag.out scripts/fleet7-runs/results/manykeys-$tag.txt 2>/dev/null
@@ -948,7 +948,20 @@ case $STAGE in
      b7 D2S12P30T64X11T16OP1f $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_ONE_PROBE=1 F7_BLOCK_INTERVAL_MS=30
      b7 D2S12P30T64X11T16OP4f $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_ONE_PROBE=4 F7_BLOCK_INTERVAL_MS=30
      b7 D2S12P30T64X11T16l $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 F7_BLOCK_INTERVAL_MS=30 ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq, ar, as, at, au, av, aw, ax, ay, az, ba, bb, bc, bd, be or bg)"; exit 2 ;;
+  bh) mk WARM 7 16; warm_gate WARM
+     # the T16 set at 30 ms pacing: a five-block vote window (N42_FAR_AHEAD_BLOCKS=2, parent outputs kept 6 or 8) between T16 controls, and one F2 leg at 25 ms
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     C16="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_SIBLINGS=background N42_CORE_LAYOUT_BEHIND=background"
+     X11="$X10 $C16"
+     b7 D2S12P30T64X11T16m $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11T16F2 $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_FAR_AHEAD_BLOCKS=2 N42_PARENT_OUTPUTS_KEPT=6 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11T16F2b $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_FAR_AHEAD_BLOCKS=2 N42_PARENT_OUTPUTS_KEPT=6 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11T16F2K8 $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_FAR_AHEAD_BLOCKS=2 N42_PARENT_OUTPUTS_KEPT=8 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P25T64X11T16F2 $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_FAR_AHEAD_BLOCKS=2 N42_PARENT_OUTPUTS_KEPT=6 F7_BLOCK_INTERVAL_MS=25
+     b7 D2S12P30T64X11T16n $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 F7_BLOCK_INTERVAL_MS=30 ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq, ar, as, at, au, av, aw, ax, ay, az, ba, bb, bc, bd, be, bg or bh)"; exit 2 ;;
 esac
 
 if [ "${LOOP351_DRY:-0}" = 1 ]; then echo "dry run done"; exit 0; fi

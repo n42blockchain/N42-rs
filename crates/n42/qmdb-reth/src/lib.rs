@@ -27,6 +27,7 @@ pub mod chainspec;
 pub mod changes;
 pub mod hotstuff;
 pub mod node_state;
+mod recovery_frontier;
 pub mod occupancy;
 pub mod read_view;
 pub mod state_reader;

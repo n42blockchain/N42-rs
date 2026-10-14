@@ -32,7 +32,6 @@ else
   grep -aq N42_IMPORT_ONCE target/native/release/n42 || { echo "the built n42 does not know N42_IMPORT_ONCE; no leg can run"; echo ALLDONE; exit 1; }
   grep -aq N42_BUILD_MLP target/native/release/n42 || { echo "the built n42 does not know N42_BUILD_MLP; nothing run"; echo ALLDONE; exit 1; }
   grep -aq N42_MERGE_SPLIT target/native/release/n42 || { echo "the built n42 does not know N42_MERGE_SPLIT; nothing run"; echo ALLDONE; exit 1; }
-  grep -aq N42_ONE_PROBE target/native/release/n42 || { echo "the built n42 does not know N42_ONE_PROBE; nothing run"; echo ALLDONE; exit 1; }
   grep -aq N42_FAR_AHEAD_BLOCKS target/native/release/examples/h2_validator || { echo "the built h2_validator does not know N42_FAR_AHEAD_BLOCKS; nothing run"; echo ALLDONE; exit 1; }
   [ -z "$(find crates bin -name '*.rs' -newer target/native/release/n42 | head -1)" ] || { echo "a source file is newer than the native binary; nothing run"; echo ALLDONE; exit 1; }
   echo "native build done at $(date +%H:%M)"

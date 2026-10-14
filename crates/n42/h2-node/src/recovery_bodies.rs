@@ -77,6 +77,10 @@ impl RecoveryBodies {
 
     /// Flushes a complete body before the caller allows a vote to be signed.
     pub fn save(&self, hash: B256, body: &[u8], profile: HeaderProfile) -> Result<(), String> {
+        static TIMING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let timing =
+            *TIMING.get_or_init(|| std::env::var("N42_RECOVERY_PHASES").is_ok_and(|v| v == "1"));
+        let started = std::time::Instant::now();
         if body.len() as u64 > MAX_BODY_BYTES {
             return Err("recovery body exceeds size bound".into());
         }
@@ -85,7 +89,9 @@ impl RecoveryBodies {
         if actual != hash {
             return Err("recovery body hash mismatch".into());
         }
+        let decoded = std::time::Instant::now();
         let _guard = self.writing.lock().map_err(|e| e.to_string())?;
+        let locked = std::time::Instant::now();
         let path = self.path(hash);
         if path.exists() {
             if self.read(hash)?.as_deref() != Some(body) {
@@ -100,13 +106,25 @@ impl RecoveryBodies {
             .write(true)
             .open(&tmp)
             .map_err(|e| e.to_string())?;
-        file.write_all(body)
-            .and_then(|_| file.sync_all())
-            .map_err(|e| e.to_string())?;
+        file.write_all(body).map_err(|e| e.to_string())?;
+        let written = std::time::Instant::now();
+        file.sync_all().map_err(|e| e.to_string())?;
+        let synced = std::time::Instant::now();
         std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
         File::open(&self.dir)
             .and_then(|f| f.sync_all())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if timing {
+            tracing::info!(target: "n42.h2.recovery", block_hash = ?hash, bytes = body.len(),
+                decode_us = decoded.duration_since(started).as_micros() as u64,
+                lock_us = locked.duration_since(decoded).as_micros() as u64,
+                write_us = written.duration_since(locked).as_micros() as u64,
+                file_sync_us = synced.duration_since(written).as_micros() as u64,
+                publish_us = synced.elapsed().as_micros() as u64,
+                total_us = started.elapsed().as_micros() as u64,
+                "durable recovery body phases");
+        }
+        Ok(())
     }
 
     /// Reads a bounded body. Temporary files from interrupted writes are ignored.

@@ -91,8 +91,10 @@ impl<ChainSpec> N42BlockAssembler<ChainSpec> {
 /// [`parallel_transaction_root`] over recovered transactions.
 pub fn parallel_transaction_root_recovered<T: Encodable2718 + Sync>(transactions: &[reth_primitives_traits::Recovered<T>]) -> B256 {
     use rayon::prelude::*;
-    let encoded: Vec<Vec<u8>> = transactions.par_iter().map(|tx| tx.inner().encoded_2718()).collect();
-    parallel_ordered_trie_root(&encoded)
+    with_transaction_root_pool(|| {
+        let encoded: Vec<Vec<u8>> = transactions.par_iter().map(|tx| tx.inner().encoded_2718()).collect();
+        parallel_ordered_trie_root_inner(&encoded)
+    })
 }
 
 /// [`parallel_transaction_root`] over `len` transactions that are not laid
@@ -102,8 +104,10 @@ pub fn parallel_transaction_root_recovered<T: Encodable2718 + Sync>(transactions
 /// block's body exists.
 pub fn parallel_transaction_root_by(len: usize, encode: impl Fn(usize) -> Vec<u8> + Sync) -> B256 {
     use rayon::prelude::*;
-    let encoded: Vec<Vec<u8>> = (0..len).into_par_iter().map(&encode).collect();
-    parallel_ordered_trie_root(&encoded)
+    with_transaction_root_pool(|| {
+        let encoded: Vec<Vec<u8>> = (0..len).into_par_iter().map(&encode).collect();
+        parallel_ordered_trie_root_inner(&encoded)
+    })
 }
 
 /// The block's transactions root by the chain's rule -- the one place that
@@ -143,8 +147,10 @@ pub fn transactions_root_by_rule<T: Encodable2718 + Sync>(
 
 pub fn parallel_transaction_root<T: Encodable2718 + Sync>(transactions: &[T]) -> B256 {
     use rayon::prelude::*;
-    let encoded: Vec<Vec<u8>> = transactions.par_iter().map(|tx| tx.encoded_2718()).collect();
-    parallel_ordered_trie_root(&encoded)
+    with_transaction_root_pool(|| {
+        let encoded: Vec<Vec<u8>> = transactions.par_iter().map(|tx| tx.encoded_2718()).collect();
+        parallel_ordered_trie_root_inner(&encoded)
+    })
 }
 
 /// Below this many items the sequential builder is used: the split's
@@ -168,6 +174,30 @@ const PARALLEL_TRIE_MIN_ITEMS: usize = 2_048;
 /// follower's import and ~110 ms of every leader's build; it is on both
 /// critical paths, and nothing else in either overlaps with it.
 pub fn parallel_ordered_trie_root<T: AsRef<[u8]> + Sync>(items: &[T]) -> B256 {
+    with_transaction_root_pool(|| parallel_ordered_trie_root_inner(items))
+}
+
+// Signature verification and root encoding otherwise share Rayon's global
+// queue. Opt-in isolation retains the same ordered-MPT algorithm and values.
+fn with_transaction_root_pool(operation: impl FnOnce() -> B256 + Send) -> B256 {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        let threads = std::env::var("N42_TX_ROOT_THREADS").ok()?.parse::<usize>().ok()?;
+        if !(1..=128).contains(&threads) { return None; }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("n42-tx-root-{index}"))
+            .build().expect("transaction root worker pool");
+        tracing::info!(target: "n42.tx_root", threads, "dedicated transaction root worker pool enabled");
+        Some(pool)
+    });
+    match pool {
+        Some(pool) => pool.install(operation),
+        None => operation(),
+    }
+}
+
+fn parallel_ordered_trie_root_inner<T: AsRef<[u8]> + Sync>(items: &[T]) -> B256 {
     use alloy_trie::{HashBuilder, Nibbles};
     use rayon::prelude::*;
 

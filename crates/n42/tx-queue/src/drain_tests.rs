@@ -333,7 +333,11 @@ fn the_drainer_keeps_up_under_a_flood() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let inner = queue.lock_inner_quiet();
-        if inner.len == total && inner.pending_drain.is_empty() && inner.pending_frames.is_empty() {
+        // Transactions are staged before their frame descriptor. A drain can
+        // therefore finish the last transactions while the descriptor is still
+        // in frame_inbox; wait for both inboxes before asserting completion.
+        if inner.len == total && inner.pending_drain.is_empty() && inner.pending_frames.is_empty()
+            && queue.frames_staged.load(Ordering::Acquire) == 0 {
             assert_eq!(inner.frames.len(), (SENDERS * ROUNDS) as usize);
             break;
         }

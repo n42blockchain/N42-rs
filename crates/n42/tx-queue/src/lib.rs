@@ -1577,6 +1577,37 @@ const DRAINER_WAKE: usize = 8192;
 /// Holds one call of the dedicated drainer makes at most, so a flood it
 /// cannot outrun still returns to its tick (and to the gate's readings)
 /// rather than looping in one call for ever.
+/// The default of [`own_hold_blocks`].
+pub const OWN_HOLD_BLOCKS: usize = 16;
+
+/// `N42_OWN_HOLD_BLOCKS`, read once: how many own blocks
+/// [`TxQueue::hold_own_block`] keeps until the chain settles their heights
+/// (default [`OWN_HOLD_BLOCKS`], valid `4..=1024`).
+///
+/// A block is settled by the canonical pruner, so the bound has to cover
+/// the blocks in flight (the vote window, `N42_FAR_AHEAD_BLOCKS` + 3) plus
+/// however far the pruner runs behind the chain. Past it the oldest held
+/// block is evicted: harmless when that block was committed (its
+/// transactions are mined), a hole in every lane it took from when
+/// another block was committed at its height.
+pub fn own_hold_blocks() -> usize {
+    static BOUND: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BOUND.get_or_init(|| own_hold_blocks_from(std::env::var("N42_OWN_HOLD_BLOCKS").ok().as_deref()))
+}
+
+/// Parses an `N42_OWN_HOLD_BLOCKS` value; anything outside `4..=1024` is
+/// refused loudly and the default kept.
+pub fn own_hold_blocks_from(value: Option<&str>) -> usize {
+    let Some(text) = value else { return OWN_HOLD_BLOCKS };
+    match text.trim().parse::<usize>() {
+        Ok(n) if (4..=1024).contains(&n) => n,
+        _ => {
+            tracing::warn!(target: "n42.tx_queue", value = text, default = OWN_HOLD_BLOCKS, "invalid N42_OWN_HOLD_BLOCKS (want 4..=1024)");
+            OWN_HOLD_BLOCKS
+        }
+    }
+}
+
 const DRAINER_MAX_HOLDS: usize = 256;
 
 /// Frames noted since the last drain, each with its transactions when the
@@ -2605,10 +2636,12 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// Keeps the transactions an own block took out of the queue until the
     /// chain settles that height; see `Inner::held`.
     pub fn hold_own_block(&self, number: u64, hash: B256, transactions: Vec<Arc<ValidPoolTransaction<T>>>) {
-        const HELD_BLOCKS: usize = 16;
         if transactions.is_empty() {
             return;
         }
+        let held_blocks = own_hold_blocks();
+        // Freed after the lock: an evicted block is 200,000 `Arc`s.
+        let mut evicted_all: Vec<Vec<Arc<ValidPoolTransaction<T>>>> = Vec::new();
         let mut inner = self.lock_inner_quiet();
         // The block a whole hand-off just forgot the take of: what a plan
         // prepared ahead of the next build is accepted against.
@@ -2619,7 +2652,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         {
             handed.block = Some(hash);
         }
-        while inner.held.len() >= HELD_BLOCKS {
+        while inner.held.len() >= held_blocks {
             let Some((evicted, _, gone)) = inner.held.pop_front() else { break };
             // Nothing else holds these: the block they were taken for was
             // never settled, so this is a hole in every lane they came
@@ -2632,10 +2665,14 @@ impl<T: PoolTransaction> TxQueue<T> {
                 number = evicted,
                 txs = gone.len(),
                 holding = number,
+                bound = held_blocks,
                 "an own block was still held when the bound was reached; its transactions are lost to the queue"
             );
+            evicted_all.push(gone);
         }
         inner.held.push_back((number, hash, transactions));
+        drop(inner);
+        drop(evicted_all);
     }
 
     /// The chain committed `hash` at `number`: an own block held at that
@@ -6944,6 +6981,16 @@ mod tests {
             gas: 21_000 * members.len() as u64,
         });
         hashes
+    }
+
+    #[test]
+    fn the_own_hold_bound_parses_within_its_range() {
+        assert_eq!(own_hold_blocks_from(None), OWN_HOLD_BLOCKS);
+        assert_eq!(own_hold_blocks_from(Some("64")), 64);
+        assert_eq!(own_hold_blocks_from(Some(" 4 ")), 4);
+        assert_eq!(own_hold_blocks_from(Some("3")), OWN_HOLD_BLOCKS);
+        assert_eq!(own_hold_blocks_from(Some("2000")), OWN_HOLD_BLOCKS);
+        assert_eq!(own_hold_blocks_from(Some("lots")), OWN_HOLD_BLOCKS);
     }
 
     /// A noted frame is arriving until a hold drains it into the index; a

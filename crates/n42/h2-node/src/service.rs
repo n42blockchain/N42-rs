@@ -4606,12 +4606,22 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// bookkeeping as a pushed one, identified by what it decodes to.
     fn handle_direct_body(&mut self, rlp: crate::body_channel::BodyBuf) {
         let started = std::time::Instant::now();
+        let from = rlp.from().and_then(|id| id.parse::<PeerId>().ok());
+        // A direct push can replace gossip entirely. Its peer/height hint must
+        // still reach the range pull, or missing an early parent leaves this
+        // EL at genesis while every later body is held waiting for that parent.
+        if !rlp.is_compact()
+            && let Some(peer) = from
+            && self.transport.connected_peer_ids().contains(&peer)
+            && let Ok((_, header)) = n42_h2_consensus::decode_block_body_header(&rlp, self.header_profile)
+        {
+            self.note_peer_height(peer, header.number);
+        }
         if rlp.is_compact() {
             // 5.2 MB instead of 26: the block with its transactions named by
             // hash, which this node already holds, decoded and with their
             // senders, because it ingests every transaction the leader does.
             let shared = alloy_primitives::Bytes::copy_from_slice(&rlp[..]);
-            let from = rlp.from().and_then(|id| id.parse::<PeerId>().ok());
             drop(rlp);
             match self.accept_compact_body(shared, from) {
                 Ok((hash, _, true)) => {

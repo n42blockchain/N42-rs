@@ -3286,14 +3286,16 @@ mod tests {
         }
         let snapshot = std::fs::read(state.snapshot_path()).unwrap();
         let log = std::fs::read(state.delta_log_path()).unwrap();
-        std::fs::remove_file(state.frontier_path()).unwrap();
-        // A directory in place of the file forces an actual I/O failure even
-        // when the tests run with permission to bypass mode bits.
-        std::fs::create_dir(state.frontier_path()).unwrap();
+        let frontier = std::fs::read(state.frontier_path()).unwrap();
+        // A directory in place of the staging file forces an actual write
+        // failure even when tests can bypass permission bits.
+        let blocked = state.frontier_path().with_extension("frontiers.tmp");
+        std::fs::create_dir(&blocked).unwrap();
         assert!(state.checkpoint(Some(hashes[2]), &mut state.cursor()).is_err());
         assert_eq!(std::fs::read(state.snapshot_path()).unwrap(), snapshot);
         assert_eq!(std::fs::read(state.delta_log_path()).unwrap(), log);
-        std::fs::remove_dir(state.frontier_path()).unwrap();
+        assert_eq!(std::fs::read(state.frontier_path()).unwrap(), frontier);
+        std::fs::remove_dir(blocked).unwrap();
         assert_eq!(state.persisted_state_root(2, hashes[1]).unwrap(), state.root_of(&hashes[1]).unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }

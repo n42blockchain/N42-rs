@@ -37,7 +37,7 @@ else
   [ -z "$(find crates bin -name '*.rs' -newer target/native/release/n42 | head -1)" ] || { echo "a source file is newer than the native binary; nothing run"; echo ALLDONE; exit 1; }
   echo "native build done at $(date +%H:%M)"
 fi
-swap_used=$(free -m | awk '/Swap:/{print $3}'); if [ "${swap_used:-0}" -gt 1024 ]; then echo "SWAP IN USE: ${swap_used} MiB; waiting up to 4 h for it to be emptied."; n=0; while [ "$(free -m | awk '/Swap:/{print $3}')" -gt 1024 ]; do sleep 120; n=$((n+1)); [ $n -gt 120 ] && { echo "swap still in use after 4 h; giving up"; echo ALLDONE; exit 1; }; done; fi
+swap_used=$(free -m | awk '/Swap:/{print $3}'); avail_g=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo); if [ "${swap_used:-0}" -gt 1024 ] && [ "${avail_g:-0}" -lt 60 ]; then echo "SWAP IN USE: ${swap_used} MiB; waiting up to 4 h for it to be emptied."; n=0; while [ "$(free -m | awk '/Swap:/{print $3}')" -gt 1024 ]; do sleep 120; n=$((n+1)); [ $n -gt 120 ] && { echo "swap still in use after 4 h; giving up"; echo ALLDONE; exit 1; }; done; fi
 bash scripts/fleet7-runs/run-loop351.sh $STAGE
 # record the tree the binaries now match when the runner's gate built target/deferred in this run
 if [ "$BUILT_TREES" != "$CUR_TREES" ] && [ target/deferred/release/n42 -nt $STAMP ] && [ target/native/release/n42 -nt $STAMP ]; then echo "$CUR_TREES" > $MARK; fi

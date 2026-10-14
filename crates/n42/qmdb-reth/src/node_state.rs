@@ -1779,17 +1779,28 @@ impl QmdbNodeState {
     // database transaction. Keep the overwritten base and folded log together.
     fn archive_heap_pair(&self, label: &str, log: &Path) -> Result<(), NodeStateError> {
         let root = self.inner.dir.join("recovery-archive");
-        let target = root.join(label);
-        if target.exists() { return Ok(()); }
         let io = |path: &Path, source| NodeStateError::Io { path: path.to_path_buf(), source };
         std::fs::create_dir_all(&root).map_err(|e| io(&root, e))?;
         std::fs::File::open(&self.inner.dir).and_then(|f| f.sync_all()).map_err(|e| io(&root, e))?;
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let temporary = root.join(format!(".pending-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let (target, temporary) = loop {
+            let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let target = root.join(format!("{label}-{}-{sequence}", std::process::id()));
+            let temporary = root.join(format!(".pending-{}-{sequence}", std::process::id()));
+            if !target.exists() && !temporary.exists() { break (target, temporary); }
+        };
         std::fs::create_dir(&temporary).map_err(|e| io(&temporary, e))?;
         std::fs::hard_link(self.snapshot_path(), temporary.join("forest.bin")).map_err(|e| io(&temporary, e))?;
         if log.exists() {
-            std::fs::hard_link(log, temporary.join("forest.log")).map_err(|e| io(&temporary, e))?;
+            let archived_log = temporary.join("forest.log");
+            if label.starts_with("rollback-") {
+                // The current log can be truncated or appended after an
+                // interrupted rollback. Its archive must own independent bytes.
+                std::fs::copy(log, &archived_log).map_err(|e| io(&temporary, e))?;
+                std::fs::File::open(&archived_log).and_then(|f| f.sync_all()).map_err(|e| io(&temporary, e))?;
+            } else {
+                std::fs::hard_link(log, archived_log).map_err(|e| io(&temporary, e))?;
+            }
         } else {
             std::fs::File::create(temporary.join("forest.log")).and_then(|f| f.sync_all()).map_err(|e| io(&temporary, e))?;
         }
@@ -3451,6 +3462,31 @@ mod tests {
         durable.store(6, std::sync::atomic::Ordering::Relaxed);
         reader.prune_heap_archives().unwrap();
         assert!(reader.archived_heap_snapshot((1, hashes[0])).unwrap().is_none(), "covered compaction history can retire");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rollback_archive_keeps_independent_current_logs_and_repeated_attempts() {
+        let chain = deferred_chain();
+        let dir = scratch("archive-current-log-copy");
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, false);
+        state.set_persist_batch(false);
+        state.set_canonical_defer(false);
+        state.initialize((0, chain.genesis_hash())).unwrap();
+        let hash = B256::repeat_byte(0xc1);
+        let prepared = state.compute(chain.genesis_hash(), &BlockChanges::new()).unwrap();
+        state.insert(hash, 1, prepared).unwrap();
+        state.on_canonical(hash).unwrap();
+        let log = state.delta_log_path();
+        std::fs::write(&log, b"first future log").unwrap();
+        state.archive_heap_pair("rollback-00000000000000000001-test", &log).unwrap();
+        std::fs::write(&log, b"second future log").unwrap();
+        state.archive_heap_pair("rollback-00000000000000000001-test", &log).unwrap();
+        std::fs::write(&log, b"replacement current log").unwrap();
+        let mut logs: Vec<_> = std::fs::read_dir(dir.join("recovery-archive")).unwrap()
+            .map(|entry| std::fs::read(entry.unwrap().path().join("forest.log")).unwrap()).collect();
+        logs.sort();
+        assert_eq!(logs, vec![b"first future log".to_vec(), b"second future log".to_vec()]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

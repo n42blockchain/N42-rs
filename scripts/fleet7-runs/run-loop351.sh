@@ -2,7 +2,7 @@
 # loop351 = 200k blocks, 7 keys on one layer, 50 ms pacing: the base, check-before-slot alone (S1), 64 build threads (T64) and the merge at shards_ready (S3), then a step-down of the best. usage: run-loop351.sh <a|b|c|d>
 # Stage a: WARM (60 ms), BP50, S1P50, S1P50T64, S13P50, S13P50T64, BP50b.  b: WARM, then 45 and 40 ms for the best stage-a configuration (window 1 at least 1.5% over max(BP50, BP50b), each step only while gate340 holds), else S1P50b and S1P50T64b.
 # Same gates as loop346: build and test gate, free-space gate 120G a leg, 75-minute claim cap per stage, per-leg timeout 600 s, claim released on exit, datadirs wiped at the end. Launch: setsid nohup bash target/fleet-runs/launch-loop351.sh <stage> > target/fleet-runs/loop351<stage>.out 2>&1 &
-WT=${LOOP351_WT:-/data/n42-build/wt338}; STAGE=${1:-a}
+WT=${LOOP351_WT:-/data/n42-build/wt-main}; STAGE=${1:-a}
 cd $WT
 S=$WT/target/fleet-runs; [ "${LOOP351_DRY:-0}" = 1 ] && S=${LOOP351_S:-/tmp/loop351-dry} && mkdir -p $S
 B=/data/blockchain/rust-fleet7-bench

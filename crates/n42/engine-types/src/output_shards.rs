@@ -911,16 +911,21 @@ impl Indexed {
 
     /// `address` taken out of the output with its kept reverts; its size
     /// taken off.
+    ///
+    /// A lane account is taken without making the lane maps: once out of the
+    /// index, their later making leaves it and its revert out, as the made
+    /// maps lose them here.
     fn take(&mut self, address: &Address) -> Option<BundleAccount> {
-        // The lane maps are made from the index: made before it changes.
-        let _ = self.lane_maps();
         let shard = shard_index(address, self.index.len());
         let id = self.index.get_mut(shard)?.remove(address)?;
         let account = match id {
             CONFLICT => self.conflicts.get_mut(shard)?.remove(address)?,
             id => match self.batches.get_mut(id as usize)?.remove(address) {
                 Some(account) => account,
-                None => self.lanes.made.get_mut()?.0.get_mut(shard)?.remove(address)?,
+                None => match self.lanes.made.get_mut() {
+                    Some((state, _)) => state.get_mut(shard)?.remove(address)?,
+                    None => self.batches.get(id as usize)?.accounts.lane.as_ref()?.get(address)?,
+                },
             },
         };
         self.state_size = self.state_size.saturating_sub(account.size_hint());
@@ -3670,8 +3675,12 @@ mod lane_tests {
                 let by_map = shards(live, defer);
                 let by_lane = shards(live, defer);
                 let mixed = shards(live, defer);
+                let (taken_map, taken_lane) = (shards(live, defer), shards(live, defer));
                 for b in (0..batches).rev() {
                     by_map.add(run(&keys, &plan, &parent, b).take_bundle());
+                    taken_map.add(run(&keys, &plan, &parent, b).take_bundle());
+                    let (bundle, lane) = run(&keys, &plan, &parent, b).take_output();
+                    taken_lane.add_lane(bundle, lane.expect("a lane"));
                     let (bundle, lane) = run(&keys, &plan, &parent, b).take_output();
                     let lane: LaneOutput = lane.expect("a lane");
                     // The array form answers every account of the map form.
@@ -3703,6 +3712,13 @@ mod lane_tests {
                     assert!(frozen.has_lanes(), "{name}: lane accounts materialised");
                     assert_eq!(summary(&frozen, &every), theirs_summary, "{name}, live {live}, defer {defer}, pool {pool}");
                 }
+                // Accounts taken out (the early-taken ones at the freeze)
+                // before the lane maps are made: the same output.
+                let taken: Vec<Address> = every.iter().step_by(3).copied().collect();
+                let (mut ours, mut theirs) = (taken_lane.freeze(), taken_map.freeze());
+                assert_eq!(ours.take_out(&taken), theirs.take_out(&taken));
+                assert_eq!(ours.lanes_materialised(), !lane_root(), "a take makes no map");
+                assert_eq!(summary(&ours, &every), summary(&theirs, &every), "taken, live {live}, defer {defer}, pool {pool}");
             }
             // Outside index mode the lanes are put into the bundles.
             let v4 = OutputShards::with_index(addr(COINBASE), 64, 16, false);

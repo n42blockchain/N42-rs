@@ -1043,11 +1043,24 @@ fn bench_node_batch_state() {
     let (mut out_ms, mut out_add_ms, mut out_freeze_ms, mut out_mat_ms, mut s3_add_ms, mut s3_freeze_ms) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     type Output = (revm::database::BundleState, Option<n42_engine_types::batch_state::LaneOutput>);
-    let mut table = one_probe::Rolling::new(16);
+    // The persistent address table in the fleet's steady state: when a plan
+    // resolves, the previous plan (its block being built) is pending and
+    // every older one is recorded. The record (the merge into the table, on
+    // the resolver thread behind the build) is timed apart.
+    let table = one_probe::Rolling::new(16);
+    let mut record_ms = Vec::new();
+    let mut previous: Option<(u64, std::sync::Arc<one_probe::PlanIds>)> = None;
     for round in 0..rounds + 1 {
         let at = Instant::now();
-        let resolved = pool.install(|| one_probe::resolve_with(&mut table, &keys));
+        let resolved = pool.install(|| one_probe::resolve_with(&table, &keys));
         let resolve = at.elapsed().as_secs_f64() * 1e3;
+        let at = Instant::now();
+        if let Some((seq, ids)) = previous.take() {
+            pool.install(|| table.record(seq, &ids));
+        }
+        let record = at.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(table.pending(), 1);
+        previous = Some((resolved.seq, resolved.ids()));
         let at = Instant::now();
         let plan = std::sync::Arc::new(pool.install(|| resolved.with_lanes(&groups, nbatches).with_fold(true).with_lane_output(true)));
         let lanes = at.elapsed().as_secs_f64() * 1e3;
@@ -1136,6 +1149,7 @@ fn bench_node_batch_state() {
         lane_ms.push(dense);
         direct_ms.push(direct);
         resolve_ms.push(resolve);
+        record_ms.push(record);
         lanes_ms.push(lanes);
         out_ms.push(out_loop);
         out_add_ms.push(s4_add);
@@ -1145,14 +1159,16 @@ fn bench_node_batch_state() {
         s3_freeze_ms.push(s3_freeze);
     }
     println!(
-        "node batch state, {} transfers, {} batches, {threads} threads, p50 of {rounds}: map (stage 1) {:.1} ms, lane (stage 2) {:.1} ms, lane with fold (stage 3) {:.1} ms; plan time: resolve {:.1} ms, lanes {:.1} ms",
+        "node batch state, {} transfers, {} batches, {threads} threads, p50 of {rounds}: map (stage 1) {:.1} ms, lane (stage 2) {:.1} ms, lane with fold (stage 3) {:.1} ms; plan time: resolve {:.1} ms, lanes {:.1} ms; table record (behind) {:.1} ms, {} entries",
         keys.len(),
         batches.len(),
         median(map_ms),
         median(lane_ms),
         median(direct_ms),
         median(resolve_ms),
-        median(lanes_ms)
+        median(lanes_ms),
+        median(record_ms),
+        table.len()
     );
     println!(
         "stage 4 (lane output): batch loop {:.1} ms; hand-over {:.1} ms, freeze {:.1} ms of which lane materialisation {:.1} ms; stage 3 beside: hand-over {:.1} ms, freeze {:.1} ms (16 shards, live index)",

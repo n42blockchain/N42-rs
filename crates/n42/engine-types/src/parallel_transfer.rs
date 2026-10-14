@@ -8070,12 +8070,12 @@ mod tests {
             let groups: Vec<Vec<Vec<usize>>> = keys.iter().map(|k| partition_by_sender(k, beneficiary).expect("groups")).collect();
             // The plans, made in order before the blocks execute (plan k + 1
             // at block k's selection).
-            let mut table = Rolling::new(16);
+            let table = Rolling::new(16);
             let plans: Vec<Arc<crate::one_probe::Resolved>> = build_pool().install(|| {
                 keys.iter()
                     .zip(&groups)
                     .map(|(k, g)| {
-                        Arc::new(plan_for(mode, resolve_with(&mut table, k), g, width))
+                        Arc::new(plan_for(mode, resolve_with(&table, k), g, width))
                     })
                     .collect()
             });
@@ -8242,9 +8242,9 @@ mod tests {
         let keys: Vec<Vec<(Address, Address)>> =
             blocks.iter().map(|idx| idx.iter().map(|&i| (envs[i].caller, envs[i].kind.to().copied().unwrap())).collect()).collect();
         let groups: Vec<Vec<Vec<usize>>> = keys.iter().map(|k| partition_by_sender(k, beneficiary).expect("groups")).collect();
-        let mut table = Rolling::new(16);
+        let table = Rolling::new(16);
         let plans: Vec<Arc<crate::one_probe::Resolved>> =
-            build_pool().install(|| keys.iter().map(|k| Arc::new(resolve_with(&mut table, k))).collect());
+            build_pool().install(|| keys.iter().map(|k| Arc::new(resolve_with(&table, k))).collect());
         let mut ring = Ring::new(16);
         let mut state = db.clone();
         let built = |k: usize| B256::with_last_byte(10 + k as u8);

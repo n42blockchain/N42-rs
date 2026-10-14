@@ -115,16 +115,59 @@ pub struct PlanTx {
     pub r_src: Src,
 }
 
-/// The rolling last-writer table: address -> the newest plan that touched it
-/// and the account's id there ([`Src`]), in [`WARM_SHARDS`] shards by
-/// [`warm_shard`]. Updated per plan, in plan order, under one lock.
+/// One plan's address -> dense id maps, by [`warm_shard`]: each shard's
+/// offset and its map of local ids.
+pub type PlanIds = Vec<(u32, AddressMap<u32>)>;
+
+/// A plan resolved but not yet merged into the table ([`Rolling::record`]):
+/// its ids once its dedupe is done (`None` when the resolve made none).
+#[derive(Debug, Default)]
+struct PendingIds(OnceLock<Option<Arc<PlanIds>>>);
+
+/// Sets a plan's pending ids to `None` if its resolve ends without them (a
+/// panic), so a later plan waiting for them goes on.
+struct PendingGuard(Arc<PendingIds>);
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        let _ = self.0.0.set(None);
+    }
+}
+
+/// The table's plan order: the next sequence number, the plans resolved and
+/// not yet merged (oldest first), and the merges since the last sweep.
+#[derive(Debug)]
+struct Order {
+    next_seq: u64,
+    pending: VecDeque<(u64, Arc<PendingIds>)>,
+    records: u64,
+    /// The newest plan whose merge has finished: every table entry is of a
+    /// plan at or below it, or of one still pending.
+    merged_max: u64,
+}
+
+/// The persistent cross-block address table: address -> the newest recorded
+/// plan that touched it and the account's id there ([`Src`]), in
+/// [`WARM_SHARDS`] shards by [`warm_shard`], each behind its own lock.
+///
+/// A plan's resolve ([`resolve_with`]) only reads it: one read lock a shard,
+/// one probe a distinct address, no ordering with other plans beyond its
+/// sequence number. A plan enters the table when its block is recorded into
+/// the ring ([`Self::record`], on the resolver thread, off the build's
+/// path). Until then the plan is pending: a later plan's resolve also probes
+/// the pending plans newer than the table's entry, newest first (in the
+/// steady state one or two: the block being built and one whose record has
+/// not run yet). So a resolve names the newest plan within the depth that
+/// touched the address -- the old rolling table's answer -- without the old
+/// table's insert under one lock in plan order.
+///
+/// A plan never recorded (abandoned, its block not built whole) leaves the
+/// pending list once it is `depth` plans old; a reference to it is never in
+/// a verified prefix anyway.
 #[derive(Debug)]
 pub struct Rolling {
-    shards: Vec<AddressMap<Src>>,
-    /// The next plan's sequence number (from 1).
-    next_seq: u64,
-    /// The plan at which the last eviction sweep ran.
-    swept_at: u64,
+    shards: Box<[std::sync::RwLock<AddressMap<Src>>]>,
+    order: Mutex<Order>,
     /// Kept depth in plans: an entry older than this many plans resolves to
     /// [`CHAIN`] and is swept.
     depth: u64,
@@ -133,12 +176,17 @@ pub struct Rolling {
 impl Rolling {
     /// An empty table keeping `depth` plans.
     pub fn new(depth: u64) -> Self {
-        Self { shards: (0..WARM_SHARDS).map(|_| AddressMap::default()).collect(), next_seq: 1, swept_at: 0, depth: depth.max(1) }
+        Self {
+            shards: (0..WARM_SHARDS).map(|_| std::sync::RwLock::new(AddressMap::default())).collect(),
+            order: Mutex::new(Order { next_seq: 1, pending: VecDeque::new(), records: 0, merged_max: 0 }),
+            depth: depth.max(1),
+        }
     }
 
-    /// Entries held (tests and diagnostics).
+    /// Entries merged into the table (tests and diagnostics; pending plans
+    /// are not counted).
     pub fn len(&self) -> usize {
-        self.shards.iter().map(AddressMap::len).sum()
+        self.shards.iter().map(|shard| shard.read().unwrap_or_else(PoisonError::into_inner).len()).sum()
     }
 
     /// Whether it holds none.
@@ -146,10 +194,22 @@ impl Rolling {
         self.len() == 0
     }
 
+    /// Plans resolved and not yet merged.
+    pub fn pending(&self) -> usize {
+        self.order.lock().unwrap_or_else(PoisonError::into_inner).pending.len()
+    }
+
     /// The entry for `address`, as the next plan would resolve it.
     pub fn source(&self, address: &Address) -> Src {
-        let seq = self.next_seq;
-        self.shards[warm_shard(address)].get(address).copied().filter(|&s| self.live(s, seq)).unwrap_or(CHAIN)
+        let (seq, merged, newer) = {
+            let order = self.order.lock().unwrap_or_else(PoisonError::into_inner);
+            (order.next_seq, order.merged_max, order.pending.iter().rev().map(|(s, p)| (*s, Arc::clone(p))).collect::<Vec<_>>())
+        };
+        let newer: Vec<(u64, Arc<PlanIds>)> =
+            newer.into_iter().filter_map(|(s, p)| p.0.get().cloned().flatten().map(|ids| (s, ids))).collect();
+        let shard = warm_shard(address);
+        let table = self.shards[shard].read().unwrap_or_else(PoisonError::into_inner);
+        self.lookup(shard, address, &table, seq, Before { merged, newer: &newer })
     }
 
     /// Whether an entry is within the kept depth of plan `seq`.
@@ -157,6 +217,98 @@ impl Rolling {
     const fn live(&self, entry: Src, seq: u64) -> bool {
         src_seq(entry) + self.depth > seq
     }
+
+    /// A new plan's sequence number, its pending slot, and the plans before
+    /// it not yet merged, newest first, with their ids (waited for when a
+    /// plan resolving at the same time has not finished its dedupe -- with
+    /// the queue's one plan at a time, never).
+    fn begin(&self) -> (u64, PendingGuard, u64, Vec<(u64, Arc<PlanIds>)>) {
+        let slot = Arc::new(PendingIds::default());
+        let (seq, merged, before) = {
+            let mut order = self.order.lock().unwrap_or_else(PoisonError::into_inner);
+            let seq = order.next_seq;
+            order.next_seq += 1;
+            let depth = self.depth;
+            order.pending.retain(|(s, _)| s + depth > seq);
+            let before: Vec<(u64, Arc<PendingIds>)> = order.pending.iter().rev().map(|(s, p)| (*s, Arc::clone(p))).collect();
+            order.pending.push_back((seq, Arc::clone(&slot)));
+            (seq, order.merged_max, before)
+        };
+        let newer = before.into_iter().filter_map(|(s, p)| p.0.wait().clone().map(|ids| (s, ids))).collect();
+        (seq, PendingGuard(slot), merged, newer)
+    }
+
+    /// `address`'s source for plan `seq`: the table's entry (`table`, its
+    /// shard `shard` read-locked), unless a pending plan newer than it
+    /// touched the address (`before.newer`, newest first). A pending plan
+    /// newer than every finished merge (`before.merged`) is probed before
+    /// the table: what it names is newer than any entry there (a plan whose
+    /// merge runs now is pending too, and probed first if newer), so a hit
+    /// there -- every account the previous plan touched -- costs no table
+    /// probe.
+    #[inline]
+    fn lookup(&self, shard: usize, address: &Address, table: &AddressMap<Src>, seq: u64, before: Before<'_>) -> Src {
+        let probe = |pseq: u64, ids: &PlanIds| {
+            let (offset, map) = ids.get(shard)?;
+            map.get(address).map(|local| src(pseq, offset + local))
+        };
+        let mut rest = before.newer;
+        while let Some(((pseq, ids), older)) = rest.split_first().filter(|((pseq, _), _)| *pseq > before.merged) {
+            if let Some(found) = probe(*pseq, ids) {
+                return if self.live(found, seq) { found } else { CHAIN };
+            }
+            rest = older;
+        }
+        let entry = table.get(address).copied().filter(|&s| self.live(s, seq)).unwrap_or(CHAIN);
+        for (pseq, ids) in rest {
+            if entry != CHAIN && *pseq <= src_seq(entry) {
+                break;
+            }
+            if let Some(found) = probe(*pseq, ids) {
+                return if self.live(found, seq) { found } else { entry };
+            }
+        }
+        entry
+    }
+
+    /// Merges plan `seq`'s ids (its block recorded into the ring) into the
+    /// table, a shard a task on the current rayon pool, each address kept at
+    /// its newest plan, then drops the plan from the pending list (in that
+    /// order, so a resolve that no longer sees it pending finds it here).
+    /// Every `depth` merges the table drops entries no later plan can use.
+    pub fn record(&self, seq: u64, ids: &PlanIds) {
+        use rayon::prelude::*;
+        let (sweep_below, next) = {
+            let mut order = self.order.lock().unwrap_or_else(PoisonError::into_inner);
+            order.records += 1;
+            ((order.records % self.depth == 0).then_some(order.next_seq), order.next_seq)
+        };
+        let depth = self.depth;
+        if seq + depth > next {
+            self.shards.par_iter().zip(ids.par_iter()).for_each(|(shard, (offset, map))| {
+                let mut table = shard.write().unwrap_or_else(PoisonError::into_inner);
+                if let Some(next) = sweep_below {
+                    table.retain(|_, entry| src_seq(*entry) + depth > next);
+                }
+                table.reserve(map.len());
+                for (address, local) in map {
+                    let fresh = src(seq, offset + local);
+                    table.entry(*address).and_modify(|entry| if src_seq(*entry) < seq { *entry = fresh }).or_insert(fresh);
+                }
+            });
+        }
+        let mut order = self.order.lock().unwrap_or_else(PoisonError::into_inner);
+        order.pending.retain(|(s, _)| *s != seq);
+        order.merged_max = order.merged_max.max(seq);
+    }
+}
+
+/// What a resolve reads besides the table: the newest finished merge when it
+/// began, and the plans then pending before it, newest first, with their ids.
+#[derive(Clone, Copy)]
+struct Before<'a> {
+    merged: u64,
+    newer: &'a [(u64, Arc<PlanIds>)],
 }
 
 /// What the plan hook makes and the build takes: the plan's dense ids and
@@ -169,7 +321,7 @@ pub struct Resolved {
     pub txs: Vec<PlanTx>,
     /// address -> dense id, by [`warm_shard`] (each shard's ids local, plus
     /// its offset).
-    ids: Vec<(u32, AddressMap<u32>)>,
+    ids: Arc<PlanIds>,
     /// Dense id -> whether transactions of more than one sender touch it:
     /// such an account may be written by several batches, so no single
     /// batch's value is the block's and it is never written through.
@@ -188,6 +340,11 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    /// The plan's address -> dense id maps (what [`Rolling::record`] merges).
+    pub fn ids(&self) -> Arc<PlanIds> {
+        Arc::clone(&self.ids)
+    }
+
     /// The dense id of `address` in this plan, if the plan touches it.
     pub fn id_of(&self, address: &Address) -> Option<u32> {
         let (offset, map) = self.ids.get(warm_shard(address))?;
@@ -250,31 +407,29 @@ impl Resolved {
     }
 }
 
-/// One shard's dedupe: its distinct addresses (local ids in first-touch
-/// order), each one's first sender and whether another sender touched it,
-/// and every occurrence's (index, local id).
+/// One shard's dedupe: its distinct addresses' sources (in first-touch
+/// order: the local ids), each one's first sender and whether another
+/// sender touched it, and every occurrence's (index, local id).
 #[derive(Default)]
 struct ShardIds {
     map: AddressMap<u32>,
-    addrs: Vec<Address>,
+    srcs: Vec<Src>,
     owner: Vec<Address>,
     shared: Vec<bool>,
     occ: Vec<(u32, u32)>,
 }
 
 /// Resolves a plan's keys (each transaction's sender and recipient, in plan
-/// order) against `table` and records the plan there as every one of its
-/// addresses' newest writer, on the current rayon pool: the occurrences
-/// bucketed by shard, each shard deduplicated into local ids, the shards'
-/// offsets summed into dense ids, one probe and one insert a distinct
-/// address, then one record a transaction. Every [`Rolling::depth`] plans
-/// the table drops entries older than the depth (they resolve to [`CHAIN`]
-/// whether swept or not).
-pub fn resolve_with(table: &mut Rolling, keys: &[(Address, Address)]) -> Resolved {
+/// order) against `table` on the current rayon pool: the occurrences
+/// bucketed by shard, each shard deduplicated into local ids with one
+/// read-only lookup a new address (the table's entry, or a pending plan
+/// newer than it: [`Rolling`]), the shards' offsets summed into dense ids,
+/// then one record a transaction. The plan is pending in the table from
+/// here until its block is recorded ([`Rolling::record`]).
+pub fn resolve_with(table: &Rolling, keys: &[(Address, Address)]) -> Resolved {
     use rayon::prelude::*;
     let at = std::time::Instant::now();
-    let seq = table.next_seq;
-    table.next_seq += 1;
+    let (seq, slot, merged, newer) = table.begin();
     // Occurrence `2i` is transaction i's sender, `2i + 1` its recipient.
     let buckets: Vec<Vec<Vec<u32>>> = keys
         .par_chunks(16_384)
@@ -293,20 +448,22 @@ pub fn resolve_with(table: &mut Rolling, keys: &[(Address, Address)]) -> Resolve
         let (sender, recipient) = &keys[(occ / 2) as usize];
         if occ % 2 == 0 { sender } else { recipient }
     };
+    let before = Before { merged, newer: &newer };
     let mut shards: Vec<ShardIds> = (0..WARM_SHARDS)
         .into_par_iter()
         .map(|s| {
             let total = buckets.iter().map(|b| b[s].len()).sum::<usize>();
             let mut ids = ShardIds { occ: Vec::with_capacity(total), ..Default::default() };
             ids.map.reserve(total / 2 + 1);
+            let rolling = table.shards[s].read().unwrap_or_else(PoisonError::into_inner);
             for bucket in &buckets {
                 for &occ in &bucket[s] {
                     let address = address_of(occ);
                     let sender = &keys[(occ / 2) as usize].0;
-                    let next = ids.addrs.len() as u32;
+                    let next = ids.srcs.len() as u32;
                     let local = *ids.map.entry(*address).or_insert(next);
                     if local == next {
-                        ids.addrs.push(*address);
+                        ids.srcs.push(table.lookup(s, address, &rolling, seq, before));
                         ids.owner.push(*sender);
                         ids.shared.push(false);
                     } else if ids.owner[local as usize] != *sender {
@@ -323,45 +480,28 @@ pub fn resolve_with(table: &mut Rolling, keys: &[(Address, Address)]) -> Resolve
     let mut accounts = 0u32;
     for ids in &shards {
         offsets.push(accounts);
-        accounts += ids.addrs.len() as u32;
+        accounts += ids.srcs.len() as u32;
     }
-    // One probe and one insert a distinct address, each shard of the table
-    // by its own thread; then every occurrence's dense id.
+    // Every occurrence's dense id, a shard a task.
     let occ_bid: Vec<AtomicU32> = (0..2 * keys.len()).into_par_iter().with_min_len(8192).map(|_| AtomicU32::new(0)).collect();
-    let sweep = seq >= table.swept_at + table.depth;
-    let depth = table.depth;
-    let srcs_by_shard: Vec<Vec<Src>> = table
-        .shards
-        .par_iter_mut()
-        .zip(shards.par_iter_mut())
-        .zip(offsets.par_iter())
-        .map(|((rolling, ids), &offset)| {
-            if sweep {
-                rolling.retain(|_, entry| src_seq(*entry) + depth > seq);
-            }
-            let srcs = ids
-                .addrs
-                .iter()
-                .enumerate()
-                .map(|(local, address)| {
-                    let bid = offset + local as u32;
-                    let before = rolling.insert(*address, src(seq, bid));
-                    before.filter(|&entry| src_seq(entry) + depth > seq).unwrap_or(CHAIN)
-                })
-                .collect();
-            for &(occ, local) in &ids.occ {
-                occ_bid[occ as usize].store(offset + local, Ordering::Relaxed);
-            }
-            ids.occ = Vec::new();
-            ids.owner = Vec::new();
-            ids.addrs = Vec::new();
-            srcs
-        })
-        .collect();
-    if sweep {
-        table.swept_at = seq;
+    shards.par_iter_mut().zip(offsets.par_iter()).for_each(|(ids, &offset)| {
+        for &(occ, local) in &ids.occ {
+            occ_bid[occ as usize].store(offset + local, Ordering::Relaxed);
+        }
+        ids.occ = Vec::new();
+        ids.owner = Vec::new();
+    });
+    let mut srcs: Vec<Src> = Vec::with_capacity(accounts as usize);
+    let mut shared = Vec::with_capacity(accounts as usize);
+    let mut ids = Vec::with_capacity(WARM_SHARDS);
+    for (shard, offset) in shards.into_iter().zip(offsets) {
+        srcs.extend(shard.srcs);
+        shared.extend(shard.shared);
+        ids.push((offset, shard.map));
     }
-    let srcs: Vec<Src> = srcs_by_shard.into_iter().flatten().collect();
+    let ids = Arc::new(ids);
+    // Pending from here: a later plan's resolve sees these ids.
+    let _ = slot.0.0.set(Some(Arc::clone(&ids)));
     let txs: Vec<PlanTx> = keys
         .par_iter()
         .enumerate()
@@ -372,26 +512,29 @@ pub fn resolve_with(table: &mut Rolling, keys: &[(Address, Address)]) -> Resolve
             PlanTx { sender: *sender, recipient: *recipient, s_bid, r_bid, s_src: srcs[s_bid as usize], r_src: srcs[r_bid as usize] }
         })
         .collect();
-    let mut shared = Vec::with_capacity(accounts as usize);
-    let mut ids = Vec::with_capacity(WARM_SHARDS);
-    for (shard, offset) in shards.into_iter().zip(offsets) {
-        shared.extend(shard.shared);
-        ids.push((offset, shard.map));
-    }
     let out = Arc::new(DenseOut::new(accounts as usize));
     Resolved { seq, txs, ids, shared, accounts: accounts as usize, resolve_us: at.elapsed().as_micros() as u64, out, lanes: None }
 }
 
-/// The process's rolling table, made at the first plan.
-fn rolling() -> &'static Mutex<Rolling> {
-    static TABLE: OnceLock<Mutex<Rolling>> = OnceLock::new();
-    TABLE.get_or_init(|| Mutex::new(Rolling::new(depth())))
+/// The process's address table, made at the first plan.
+fn rolling() -> &'static Rolling {
+    static TABLE: OnceLock<Rolling> = OnceLock::new();
+    TABLE.get_or_init(|| Rolling::new(depth()))
+}
+
+/// Plan `seq`'s block entered the process's ring: its ids merged into the
+/// process's table on the resolver thread (on the plan-body pool), behind
+/// any resolve or late record handed in before.
+fn record_into_table(seq: u64, ids: Arc<PlanIds>) {
+    on_resolver(Box::new(move || {
+        crate::parallel_transfer::plan_body_pool().install(|| rolling().record(seq, &ids));
+    }));
 }
 
 /// The plan hook (`N42_PLAN_AHEAD_BODY=1` with `N42_ONE_PROBE`): the plan's
 /// keys resolved against the process's table on `pool` (the plan-body pool).
-/// Plans are resolved one at a time, in the order they are made. `None` when
-/// off or for an empty plan.
+/// Plans may resolve at the same time: each reads the table and the plans
+/// pending before it. `None` when off or for an empty plan.
 ///
 /// `N42_ONE_PROBE=2`: with `groups` (the plan's sender partition) and a
 /// dispatch of a known width ([`crate::parallel_transfer::lane_width`]),
@@ -400,8 +543,7 @@ pub fn resolve(pool: &rayon::ThreadPool, keys: &[(Address, Address)], groups: Op
     if stage() == 0 || keys.is_empty() || keys.len() > u32::MAX as usize / 2 {
         return None;
     }
-    let mut table = rolling().lock().unwrap_or_else(PoisonError::into_inner);
-    let table = &mut *table;
+    let table = rolling();
     let width = (stage() >= 2).then(|| crate::parallel_transfer::lane_width(crate::parallel_transfer::Dispatch::from_env())).flatten();
     Some(Arc::new(pool.install(|| {
         let resolved = resolve_with(table, keys);
@@ -603,6 +745,7 @@ pub fn record_late(
             record.built,
             record.extra,
         );
+        pool.install(|| rolling().record(resolved.seq, &resolved.ids));
         LATE_RECORDS.fetch_add(1, Ordering::Relaxed);
     }));
 }
@@ -1308,8 +1451,14 @@ pub fn view_for(resolved: Arc<Resolved>, grandparent: B256, parent_built: Option
 /// outside its transfers but `extra` (its beneficiary and withdrawal
 /// recipients): its output goes into the ring. Returns whether it did (not
 /// when a transaction ran that was not the plan's).
+/// The plan's ids then enter the process's address table, behind on the
+/// resolver thread ([`Rolling::record`]).
 pub fn note_built(view: &BuildView, base: B256, parent_built: Option<B256>, built: B256, extra: Vec<Address>) -> bool {
-    ring().lock().unwrap_or_else(PoisonError::into_inner).record(view, base, parent_built, built, extra)
+    let recorded = ring().lock().unwrap_or_else(PoisonError::into_inner).record(view, base, parent_built, built, extra);
+    if recorded {
+        record_into_table(view.resolved.seq, Arc::clone(&view.resolved.ids));
+    }
+    recorded
 }
 
 #[cfg(test)]
@@ -1325,9 +1474,9 @@ mod tests {
     /// Three plans through the table: ids, sources, the shared flag.
     #[test]
     fn resolve_names_the_newest_writer() {
-        let mut table = Rolling::new(16);
+        let table = Rolling::new(16);
         // Plan 1: s1 -> r1, s1 -> r2, s2 -> r2 (r2 shared by two senders).
-        let p1 = resolve_with(&mut table, &[(a(1), a(11)), (a(1), a(12)), (a(2), a(12))]);
+        let p1 = resolve_with(&table, &[(a(1), a(11)), (a(1), a(12)), (a(2), a(12))]);
         assert_eq!(p1.seq, 1);
         assert_eq!(p1.accounts, 4);
         assert!(p1.txs.iter().all(|t| t.s_src == CHAIN && t.r_src == CHAIN), "nothing before the first plan");
@@ -1342,34 +1491,43 @@ mod tests {
         seen.sort_unstable();
         assert_eq!(seen, vec![0, 1, 2, 3]);
         // Plan 2: r1 now sends to s1 (s1 a recipient of another sender: shared).
-        let p2 = resolve_with(&mut table, &[(a(11), a(1)), (a(3), a(13))]);
+        let p2 = resolve_with(&table, &[(a(11), a(1)), (a(3), a(13))]);
         assert_eq!(p2.txs[0].s_src, src(1, p1.id_of(&a(11)).unwrap()));
         assert_eq!(p2.txs[0].r_src, src(1, p1.id_of(&a(1)).unwrap()));
         assert_eq!(p2.txs[1].s_src, CHAIN);
+        // Plan 1's block recorded (the table), plan 2 still pending.
+        table.record(1, &p1.ids);
         // Plan 3: the newest writer of s1 is plan 2; of r2 still plan 1.
-        let p3 = resolve_with(&mut table, &[(a(1), a(12))]);
+        let p3 = resolve_with(&table, &[(a(1), a(12))]);
         assert_eq!(p3.txs[0].s_src, src(2, p2.id_of(&a(1)).unwrap()));
         assert_eq!(p3.txs[0].r_src, src(1, r2));
         assert_eq!(p3.id_of(&a(13)), None);
     }
 
-    /// An entry older than the kept depth resolves to the chain, and the
-    /// sweep every `depth` plans drops it from the table.
+    /// An entry older than the kept depth resolves to the chain; a plan
+    /// enters the table when recorded, unless it is past the depth by then,
+    /// and the sweep every `depth` records drops what no later plan can use.
     #[test]
     fn the_rolling_table_forgets_past_the_depth() {
-        let mut table = Rolling::new(2);
-        let p1 = resolve_with(&mut table, &[(a(1), a(11))]);
-        let p2 = resolve_with(&mut table, &[(a(2), a(12))]);
+        let table = Rolling::new(2);
+        let p1 = resolve_with(&table, &[(a(1), a(11))]);
+        let p2 = resolve_with(&table, &[(a(2), a(12))]);
         assert_eq!(table.source(&a(1)), CHAIN, "plan 1 is two plans back when plan 3 resolves");
         assert_eq!(table.source(&a(2)), src(2, p2.id_of(&a(2)).unwrap()));
-        assert_eq!(table.len(), 4, "plan 2 swept nothing within the depth");
-        let p3 = resolve_with(&mut table, &[(a(1), a(12))]);
+        assert_eq!((table.len(), table.pending()), (0, 2), "nothing recorded yet");
+        table.record(1, &p1.ids);
+        table.record(2, &p2.ids);
+        assert_eq!((table.len(), table.pending()), (2, 0), "plan 1 was past the depth when recorded");
+        assert_eq!(table.source(&a(2)), src(2, p2.id_of(&a(2)).unwrap()), "now from the table");
+        let p3 = resolve_with(&table, &[(a(1), a(12))]);
         assert_eq!(p3.txs[0].s_src, CHAIN, "beyond the depth");
         assert_eq!(p3.txs[0].r_src, src(2, p2.id_of(&a(12)).unwrap()));
-        let _ = p1;
-        // The sweeps run at plans 2 and 4: plan 4's keeps plans 3 and 4.
-        let _p4 = resolve_with(&mut table, &[(a(5), a(15))]);
-        assert_eq!(table.len(), 4, "a(1) and a(12) from plan 3, a(5) and a(15) from plan 4");
+        table.record(3, &p3.ids);
+        assert_eq!(table.source(&a(12)), src(3, p3.id_of(&a(12)).unwrap()), "the newer record wins");
+        // The sweep at the fourth record (plan 5 next) drops plans 2 and 3.
+        let p4 = resolve_with(&table, &[(a(5), a(15))]);
+        table.record(4, &p4.ids);
+        assert_eq!(table.len(), 2, "a(5) and a(15) from plan 4");
         assert_eq!(table.source(&a(11)), CHAIN);
         assert_eq!(table.source(&a(2)), CHAIN);
     }
@@ -1378,16 +1536,16 @@ mod tests {
     /// occurrence to its own address's id.
     #[test]
     fn a_large_plan_resolves_every_occurrence() {
-        let mut table = Rolling::new(16);
+        let table = Rolling::new(16);
         let keys: Vec<(Address, Address)> = (0..40_000u64).map(|i| (a(i / 16), a(1_000_000 + (i * 7919) % 30_000))).collect();
-        let p1 = resolve_with(&mut table, &keys);
+        let p1 = resolve_with(&table, &keys);
         assert_eq!(p1.accounts, 2_500 + 30_000);
         for (i, t) in p1.txs.iter().enumerate() {
             assert_eq!((t.sender, t.recipient), keys[i]);
             assert_eq!(p1.id_of(&t.sender), Some(t.s_bid));
             assert_eq!(p1.id_of(&t.recipient), Some(t.r_bid));
         }
-        let p2 = resolve_with(&mut table, &keys[..100]);
+        let p2 = resolve_with(&table, &keys[..100]);
         for t in &p2.txs {
             assert_eq!(t.s_src, src(1, p1.id_of(&t.sender).unwrap()));
             assert_eq!(t.r_src, src(1, p1.id_of(&t.recipient).unwrap()));
@@ -1456,10 +1614,10 @@ mod tests {
         use crate::parallel_transfer::AccountHint as _;
         use revm::database::{CacheDB, EmptyDB};
         let (s, r, w, sys, b) = (a(1), a(2), a(3), crate::warm_ahead::SYSTEM[1], a(5));
-        let mut table = Rolling::new(16);
+        let table = Rolling::new(16);
         let mut ring = Ring::new(16);
-        let p1 = Arc::new(resolve_with(&mut table, &[(s, r), (s, w), (s, sys), (s, b)]));
-        let p2 = Arc::new(resolve_with(&mut table, &[(s, r), (s, w), (s, sys), (s, b)]));
+        let p1 = Arc::new(resolve_with(&table, &[(s, r), (s, w), (s, sys), (s, b)]));
+        let p2 = Arc::new(resolve_with(&table, &[(s, r), (s, w), (s, sys), (s, b)]));
         // Block 1 wrote every account through (the system contract and `b`
         // as plain accounts too).
         let view1 = BuildView::new(Arc::clone(&p1), Vec::new(), a(99));
@@ -1512,8 +1670,8 @@ mod tests {
     fn a_lane_holds_a_recipient_two_of_its_senders_pay() {
         let keys = [(a(1), a(9)), (a(2), a(9)), (a(3), a(8))];
         let groups = vec![vec![0], vec![1], vec![2]];
-        let mut table = Rolling::new(16);
-        let two = resolve_with(&mut table, &keys).with_lanes(&groups, 2);
+        let table = Rolling::new(16);
+        let two = resolve_with(&table, &keys).with_lanes(&groups, 2);
         let lanes = two.lanes.as_ref().expect("lanes");
         assert_eq!(lanes.batch_txs, vec![2, 1]);
         assert_eq!((lanes.batch_of(0), lanes.batch_of(1), lanes.batch_of(2)), (Some(0), Some(0), Some(1)));
@@ -1525,12 +1683,12 @@ mod tests {
         assert!(!two.one_writer(r), "lanes not in use: the sender rule");
         lanes.used.store(true, Ordering::Relaxed);
         assert!(two.one_writer(r), "lanes in use: one batch writes it");
-        let three = resolve_with(&mut table, &keys).with_lanes(&groups, 3);
+        let three = resolve_with(&table, &keys).with_lanes(&groups, 3);
         let lanes = three.lanes.as_ref().unwrap();
         lanes.used.store(true, Ordering::Relaxed);
         assert_eq!(lanes.batches(), 3);
         assert!(!three.one_writer(three.id_of(&a(9)).unwrap()), "two batches pay it");
         assert!(three.one_writer(three.id_of(&a(8)).unwrap()));
-        assert!(resolve_with(&mut table, &keys).with_lanes(&[vec![0, 1]], 2).lanes.is_none(), "groups not covering the plan");
+        assert!(resolve_with(&table, &keys).with_lanes(&[vec![0, 1]], 2).lanes.is_none(), "groups not covering the plan");
     }
 }

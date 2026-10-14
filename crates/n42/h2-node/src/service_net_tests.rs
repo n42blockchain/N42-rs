@@ -453,6 +453,24 @@ async fn a_named_direct_body_pulls_a_parent_missed_before_the_peer_connected() {
 }
 
 #[tokio::test]
+async fn a_fetched_certified_child_pulls_its_missing_ancestry() {
+    let (mut a, mut b) = pair(0).await;
+    let blocks = chain(2);
+    for (_, _, body) in &blocks {
+        b.el.new_payload(n42_h2_net::decode_block_rlp_raw(body, HeaderProfile::Ethereum).unwrap().execution_data()).await.unwrap();
+    }
+    a.svc.handle_transport_event(TransportEvent::BlockFetched {
+        peer: peer_of(&b), hash: blocks[1].0, reply: Ok(chunk(&blocks[1].2)),
+    }).unwrap();
+    assert_eq!(a.svc.peer_heights[&peer_of(&b)], 2);
+    let mut events = Vec::new();
+    within(a.svc.consider_catch_up(&mut events)).await;
+    assert_eq!(a.svc.catch_up.as_ref().unwrap().next, 1);
+    pump(&mut a, &mut b, (true, true), &mut events, |a, _, _| a.svc.driver.head() == blocks[1].0 && a.svc.catch_up.is_none()).await;
+    assert!(a.el.block_by_hash(blocks[0].0).await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn named_transactions_are_served_from_the_stored_whole_body() {
     let (mut a, mut b) = pair(0).await;
     let (hash, frame, txs) = compact_frame(5);

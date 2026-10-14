@@ -698,6 +698,21 @@ reth 2.7 把 `num_state_masking_blocks` 默认值改为 30，持久化会让哈�
   （`LaneSink`），`payload.rs` 在输出分片模式下传入 `add_lane`；`Resolved::with_lane_output`、`Lanes::output`。
   其余批次照旧走 map，两种形式在分片中共存。`FrozenShards::lane_materialise_us` / `has_lanes`。说明见
   "Stage 4, implementation"。
+- 持久的跨块地址表（loop352 前）：`one_probe::Rolling` 改为进程级持久表（地址 -> 最近一个已入环计划及其 id，
+  64 个分片各一把 `RwLock`），计划的解析只读：每个分片在去重的同一遍中对新地址做一次查表，不再在一把锁下按计划
+  顺序探测加插入。计划在其块入环时（`note_built`、`record_late`）由解析线程在计划池上并入表（`Rolling::record`，
+  每个地址保留最新计划，每 D 次并入清扫一次）；入表之前该计划处于 pending，之后的解析先查比所有已完成并入更新的
+  pending 计划，再查表，再查其余较新的 pending 计划，结果与旧滚动表相同。`Resolved::ids()`、`PlanIds`、
+  `Rolling::pending`。计划钩子默认先解析（`one_probe::resolve_first`，`N42_ONE_PROBE_RESOLVE=behind` 恢复
+  loop351 的 body 优先）：先算 keys 与划分、解析（含 lanes），再做 body，两者一起发布。
+- 阶段 4 的根直接读 lane（`N42_LANE_ROOT`，默认开，`0` 恢复冻结时物化）：冻结不再物化 lane 账户；
+  `FrozenShards::view_lanes` 返回 map 中的账户与 lane 账户（`LaneLeaf`：lane + 位置），QMDB 根
+  （`qmdb-reth` 新增 `PlainAccountLeaf`、`sorted_operations_from_parts_timed`、`operations_ahead_parts`）与 hashed
+  post-state（`hashed_post_state_of_parts`）直接由 `Work` 条目编码；按地址读（`get_cow`、`read_account`、`holds`、
+  `overlaps`、`one_probe_post_account`）从 lane 现取。lane 的 map 与 revert（`LaneSet`）由第一个需要 `&BundleAccount`
+  或 revert 的读者在 lane 池上做一次：发布之后的合并、`take`、`into_staged`、`FrozenShards::get`。
+  `LaneOutput::leaf`、`FrozenShards::lanes_materialised` / `materialise_lanes`、`any_destroyed_parts`。说明见
+  `docs/ONE_PROBE_STATE_DESIGN.md` 第 15 节。
 
 ## 构建批次内的预取（`N42_BUILD_MLP=<k>`，默认关）
 - `crates/n42/engine-types/src/parallel_transfer.rs` `build_mlp` / `set_build_mlp` / `prefetch_hint`，循环在

@@ -692,3 +692,80 @@ did not move: the time before the parallel scope grew from ~6 ms to ~13 (stage 1
   block 1 builds while its resolve is pending. Its output is filled from its frozen post-state, and every
   filled entry equals the grafted state. Block 2 finds a verified prefix of two, is served from it and
   equals the plain build. The three-block test still passes on stages 1-4.
+
+## 15. The persistent table and the root reading lanes
+
+Stage bb and bc (BREAKTHROUGH_DESIGN 10.127-10.128) left two costs on the block's chain: the resolve (one
+probe and one insert a distinct address into a rolling table, under one lock, in plan order) either delayed
+the prepared body or, run behind it, arrived in time for half the builds; and stage 4's materialisation of
+the lane accounts into per-shard `BundleAccount` maps delayed the parent's QMDB root, because the root and
+the hashed post-state read every account through `view` as `&BundleAccount`.
+
+- **The persistent address table** (`one_probe::Rolling`, same name). One process-wide table, address ->
+  `seq << 32 | id` of the newest *recorded* plan that touched it, in 64 shards by `warm_shard`, each an
+  `AddressMap<u64>` behind its own `RwLock`. A plan enters it when its block enters the ring (`note_built`,
+  `record_late`): `Rolling::record` merges the plan's id maps (`PlanIds`, shared with the `Resolved` by `Arc`)
+  a shard a task on the plan-body pool, from the resolver thread, keeping each address at its newest plan;
+  every D merges it sweeps entries no later plan can use. Memory: ~33 B an entry (28 B slot, control byte,
+  load factor); the flood's shape holds 192k entries a block in the bench and at most D to 2D blocks of
+  distinct accounts on the fleet (2-4M entries, ~70-130 MB, twice that while a shard grows), the same order
+  as the rolling table it replaces.
+- **The resolve reads it.** `resolve_with(&Rolling, keys)` takes a sequence number and a snapshot of the
+  plans still pending (resolved, not yet merged: in the steady state the block being built and perhaps one
+  whose merge has not run) under a short lock, then does the old dedupe a shard a task with one read lock a
+  shard, and for each new address: the pending plans newer than every finished merge, newest first (a hit
+  there -- every account the previous plan touched -- costs no table probe); else the table's entry; else a
+  pending plan older than the merges but newer than the entry. The answer is the old table's (the newest
+  plan within D that touched the address), so the verified-prefix rule (5.3) is unchanged. No ordering with
+  other plans: two resolves may overlap; a later one waits only for an earlier one's dedupe
+  (`OnceLock::wait`, never with the queue's one plan at a time). A plan never recorded leaves the pending
+  list once D plans old.
+- **Resolve first in the hook.** `make_prepared_build` makes the keys and the partition, resolves (and makes
+  the lanes) on the plan-body pool, then makes the body, and publishes both when it returns
+  (`PendingResolve::done`): a build that takes the body has its resolve. `resolve_late` stays as the counter
+  of a build without one. `N42_ONE_PROBE_RESOLVE=behind` restores loop351's body-first order.
+- **The root reads the lanes** (`N42_LANE_ROOT`, on by default; `0` makes the maps at the freeze as before).
+  The freeze keeps what the materialisation needs (`LaneSet`: each lane batch's positions by shard, the
+  conflicting pairs for the first writer's revert) and makes no map. `FrozenShards::view_lanes` returns the
+  accounts in maps (the batches' maps, the conflicts, the residual, the overlaps) and the lane accounts the
+  index names their lane batch for as `LaneLeaf` (a lane and a position: 16 bytes, one index probe each, found
+  a batch a task). The QMDB operations (`qmdb-reth` `sorted_operations_from_parts_timed`, and
+  `operations_ahead_parts` for `N42_ROOT_OPS_AHEAD`) encode a lane account's leaf from its `Work` entry
+  (`LaneOutput::leaf`: nonce, balance, `KECCAK_EMPTY`), the hashed post-state (`hashed_post_state_of_parts`)
+  hashes it as a storage-less account, and `any_destroyed_parts` checks its status. A read by address
+  (`get_cow`, `read_account`, `holds`, `overlaps`, the late record's lookup) closes a lane account from its
+  lane; a `take` (the early-taken accounts at the freeze) removes it from the index and the later
+  materialisation leaves it and its revert out.
+- **What still needs a map**, made once by the first such reader on the lane pool (`Indexed::lane_maps`,
+  a `OnceLock`): the merges (`merged_state_first`, `merged`, `source_maps`), the reverts
+  (`merged_reverts`, `late_reverts`), `into_staged`, the borrowed `FrozenShards::get`, `iter`/`view`. On the
+  fleet's order all of these run after the root's publication (the merge behind it), so the
+  materialisation has left the block's chain: it is behind the hand-off. With `N42_MERGE_AT_SHARDS_READY=1`
+  the early merge makes them beside the root, not before it.
+- **Bench** (`bench_node_batch_state`, 8 threads on cores 232-239, nice 19, `N42_SHARD_MIX=1`, p50 of 7, three
+  runs each; the root path's three parts timed alone on the pool):
+
+  | | before | after |
+  | --- | --- | --- |
+  | resolve (plan time) | 5.2-5.5 ms | 4.8-5.0 ms, plus the merge behind: 1.4 ms |
+  | lanes (plan time) | 1.4-1.5 | 1.5 |
+  | stage 4 batch loop | 9.1-9.9 | 9.1-10.1 |
+  | stage 4 freeze | 10.7-10.9 (8.4 materialisation) | 2.2-2.5 |
+
+  | root path | view | ops | hashed | total |
+  | --- | --- | --- | --- | --- |
+  | stage 4 over the lanes | 2.5-2.7 | 7.1-9.6 | 27.8-28.1 | 37.6-40.2 |
+  | stage 4 with the maps made first (loop351) | 8.7 + 0.8-1.1 | 7.6 | 28.1-28.6 | 45.5-45.7 |
+  | stage 3 | 0.7 | 7.5-7.7 | 28.5-29.1 | 36.7-37.3 |
+
+  The materialisation (8.7-8.9 ms) is now made behind; the view over the lanes costs ~1.5 ms more than the
+  maps' (an index probe a lane account), so stage 4's root path is stage 3's within the noise. The bench's
+  resolve keeps one plan pending (the previous one) and every older one merged, the fleet's steady state; its
+  keys are the same every round, so every address hits the pending plan.
+- **Tests.** `one_probe::tests`: `resolve_names_the_newest_writer` (a recorded plan in the table, a newer one
+  pending), `the_rolling_table_forgets_past_the_depth` (merges, the sweep, a plan past the depth when
+  recorded). The three-block test (stage 4) checks, before anything makes the lane maps, that the root's
+  operations (both encoders), the hashed post-state and every read by address over the lanes equal the
+  reference's over its maps, and that the root made no map. `output_shards::lane_tests`' summary compares
+  the view over the lanes with the view over the made maps and the reads in place with the borrowed reads,
+  and takes every third account out of a lane output and a map output before anything makes the maps.

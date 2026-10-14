@@ -486,10 +486,15 @@ pub enum NodeStateError {
         /// What went wrong.
         source: bincode::Error,
     },
+    /// The execution frontier required by a deferred checkpoint is unavailable or corrupt.
+    #[error("QMDB deferred recovery: {0}")]
+    RecoveryFrontier(String),
 }
 
 struct Inner {
     forest: Mutex<Option<QmdbForest>>,
+    /// Serialises the bounded checkpoint-parent sidecar's atomic replacements.
+    frontier_write: Mutex<()>,
     /// The label the forest's lock was last taken for ([`QmdbNodeState::lock_as`]),
     /// read by a caller that has to wait to say whom it waited for.
     forest_holder: Mutex<&'static str>,
@@ -879,6 +884,7 @@ impl QmdbNodeState {
         Self {
             inner: Arc::new(Inner {
                 forest: Mutex::new(None),
+                frontier_write: Mutex::new(()),
                 forest_holder: Mutex::new(""),
                 pending_renames: Mutex::new(Vec::new()),
                 pending_rename_count: std::sync::atomic::AtomicUsize::new(0),
@@ -1689,6 +1695,139 @@ impl QmdbNodeState {
         splits.remove(at).map(|(_, split)| split)
     }
 
+    /// Reads an exact persisted historical root without moving the live forest.
+    /// Call at startup, before persistence and compaction tasks are running.
+    /// Entry-file reconstruction must be read-only: opening an older prefix for
+    /// normal recovery would truncate entries belonging to the database head.
+    pub fn persisted_state_root(&self, number: u64, hash: B256) -> Result<B256, NodeStateError> {
+        let unavailable = || NodeStateError::RecoveryFrontier(format!("no persisted root for block {number} ({hash})"));
+        if let Some(mut checkpoint) = read_ckpt(&self.ckpt_path())? {
+            if checkpoint.version != ForestCheckpoint::VERSION {
+                return Err(unavailable());
+            }
+            if checkpoint.head_number > number {
+                return self.parent_root_from_frontier((checkpoint.head_number, checkpoint.head_hash), (number, hash));
+            }
+            if checkpoint.head_hash != hash {
+                checkpoint = replay_delta_log(&self.sealed_log_path(), checkpoint, Some(hash))?.0;
+            }
+            if checkpoint.head_number < number {
+                checkpoint = replay_delta_log(&self.delta_log_path(), checkpoint, Some(hash))?.0;
+            }
+            if (checkpoint.head_number, checkpoint.head_hash) != (number, hash) {
+                return Err(unavailable());
+            }
+            let (tree, kept) = n42_twig_core::qmdb_compat::QmdbCompatTree::from_entry_file_readonly(
+                &self.entry_file_path(),
+                checkpoint.next_slot,
+                &checkpoint.active,
+            )
+            .map_err(|error| NodeStateError::RecoveryFrontier(error.to_string()))?;
+            if kept != checkpoint.next_slot {
+                return Err(unavailable());
+            }
+            return Ok(B256::from(tree.root()));
+        }
+        let Some(mut snapshot) = read_snapshot(&self.snapshot_path())? else {
+            if number == 0 && hash == self.inner.chain.genesis_hash() {
+                return Ok(self.inner.chain.genesis_header.state_root);
+            }
+            return Err(unavailable());
+        };
+        if snapshot.head_number > number {
+            return self.parent_root_from_frontier((snapshot.head_number, snapshot.head_hash), (number, hash));
+        }
+        if snapshot.head_hash != hash {
+            snapshot = replay_delta_log(&self.sealed_log_path(), snapshot, Some(hash))?.0;
+        }
+        if snapshot.head_number < number {
+            snapshot = replay_delta_log(&self.delta_log_path(), snapshot, Some(hash))?.0;
+        }
+        if (snapshot.head_number, snapshot.head_hash) != (number, hash) {
+            return Err(unavailable());
+        }
+        Ok(QmdbForest::from_snapshot(&snapshot)?.root())
+    }
+
+    fn frontier_path(&self) -> PathBuf {
+        self.inner.dir.join("forest.frontiers")
+    }
+
+    fn read_frontier_bytes(&self) -> Result<Option<Vec<u8>>, NodeStateError> {
+        use std::io::Read;
+        let path = self.frontier_path();
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(NodeStateError::Io { path, source }),
+        };
+        let mut bytes = Vec::new();
+        file.take(1025).read_to_end(&mut bytes).map_err(|source| NodeStateError::Io { path, source })?;
+        Ok(Some(bytes))
+    }
+
+    fn checkpoint_frontier(&self, head: (u64, B256)) -> Result<Option<crate::recovery_frontier::Frontier>, NodeStateError> {
+        let Some(bytes) = self.read_frontier_bytes()? else { return Ok(None) };
+        let records = crate::recovery_frontier::decode(&bytes, self.inner.chain.genesis.config.chain_id, self.inner.chain.genesis_hash())
+            .map_err(NodeStateError::RecoveryFrontier)?;
+        Ok(records.into_iter().flatten().find(|record| (record.number, record.hash) == head))
+    }
+
+    fn parent_root_from_frontier(&self, checkpoint: (u64, B256), parent: (u64, B256)) -> Result<B256, NodeStateError> {
+        if parent.0.checked_add(1) == Some(checkpoint.0) {
+            if let Some(frontier) = self.checkpoint_frontier(checkpoint)? {
+                if frontier.parent_hash == parent.1 {
+                    return Ok(frontier.parent_root);
+                }
+            }
+        }
+        Err(NodeStateError::RecoveryFrontier(format!(
+            "checkpoint {} ({}) has no matching parent result for {} ({})",
+            checkpoint.0, checkpoint.1, parent.0, parent.1
+        )))
+    }
+
+    /// Records a canonical parent reconstructed from legacy checkpoint/log data
+    /// before initialisation may resume a compaction or migrate to entry-file mode.
+    pub fn remember_checkpoint_parent(&self, head: (u64, B256), parent_hash: B256, parent_root: B256) -> Result<(), NodeStateError> {
+        use crate::recovery_frontier::{Frontier, update};
+        let _write = self.inner.frontier_write.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = self.read_frontier_bytes()?;
+        let bytes = update(
+            previous.as_deref(),
+            self.inner.chain.genesis.config.chain_id,
+            self.inner.chain.genesis_hash(),
+            Frontier { number: head.0, hash: head.1, parent_hash, parent_root },
+        )
+        .map_err(NodeStateError::RecoveryFrontier)?;
+        if previous.as_deref() == Some(bytes.as_slice()) {
+            return Ok(());
+        }
+        let path = self.frontier_path();
+        std::fs::create_dir_all(&self.inner.dir).map_err(|source| NodeStateError::Io { path: self.inner.dir.clone(), source })?;
+        write_durably(&path.with_extension("frontiers.tmp"), &path, &bytes, &mut CompactPhases::default())
+            .map_err(|source| NodeStateError::Io { path, source })
+    }
+
+    fn save_checkpoint_frontier(&self, head: (u64, B256)) -> Result<(), NodeStateError> {
+        if head.0 == 0
+            || reth_chainspec::qmdb::deferred_execution_depth_at(&self.inner.chain.genesis, self.inner.chain.genesis.timestamp) != 2
+        {
+            return Ok(());
+        }
+        if self.checkpoint_frontier(head)?.is_some() {
+            return Ok(());
+        }
+        let parent = self.lock_as("root_of").as_ref().and_then(|forest| forest.checkpoint_parent(&head.1));
+        let Some((number, parent_hash, parent_root)) = parent else {
+            return Err(NodeStateError::RecoveryFrontier(format!("cannot compact block {} ({}) without its parent root", head.0, head.1)));
+        };
+        if number != head.0 {
+            return Err(NodeStateError::RecoveryFrontier("checkpoint number mismatch".into()));
+        }
+        self.remember_checkpoint_parent(head, parent_hash, parent_root)
+    }
+
     /// Restores the trees for a database whose canonical head is `head`.
     ///
     /// From the snapshot if it matches the head; from the alloc if the database
@@ -2451,6 +2590,9 @@ impl QmdbNodeState {
             return Ok(());
         }
         let head = self.with_forest("rewrite_checkpoint", |forest| Ok(forest.head()))?;
+        // Durable before rotating the log or replacing its checkpoint. Until
+        // replacement completes, the old checkpoint's frontier stays in the file.
+        self.save_checkpoint_frontier(head)?;
         let sealed_path = self.sealed_log_path();
         if sealed_path.exists() {
             // A compaction that failed left its segment behind (it is still
@@ -2512,6 +2654,7 @@ impl QmdbNodeState {
         let sealed_path = self.sealed_log_path();
         let mut phases = CompactPhases::default();
         let result = (|| -> Result<(u64, u64), NodeStateError> {
+            self.save_checkpoint_frontier(sealed_head)?;
             if self.inner.entry_file {
                 let ckpt_path = self.ckpt_path();
                 let ckpt = read_ckpt(&ckpt_path)?.ok_or_else(|| NodeStateError::NoSnapshot {
@@ -2640,6 +2783,7 @@ impl QmdbNodeState {
             })?;
             let mut phases = CompactPhases::default();
             let block_hash = ckpt.head_hash;
+            self.save_checkpoint_frontier((ckpt.head_number, block_hash))?;
             let len = write_ckpt(&self.ckpt_path(), &ckpt, &mut phases)?;
             let _ = std::fs::remove_file(self.delta_log_path());
             *cursor = PersistCursor {
@@ -2671,6 +2815,7 @@ impl QmdbNodeState {
         let block_hash = snapshot.head_hash;
         let path = self.snapshot_path();
         let mut phases = CompactPhases::default();
+        self.save_checkpoint_frontier((snapshot.head_number, block_hash))?;
         let len = write_snapshot(&path, &snapshot, &mut phases)?;
         // Order matters: the log is emptied only once the checkpoint that
         // supersedes it is on disk, so a crash between the two leaves a log
@@ -3028,6 +3173,135 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("n42-qmdb-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    fn deferred_chain() -> Arc<ChainSpec> {
+        let mut genesis = qmdb_chain().genesis.clone();
+        genesis.config.extra_fields.insert("deferredExecutionTime".into(), serde_json::json!(0));
+        genesis.config.extra_fields.insert("deferredExecutionDepth".into(), serde_json::json!(2));
+        Arc::new(crate::chainspec::with_declared_state_scheme(genesis.into()).unwrap())
+    }
+
+    #[test]
+    fn deferred_parent_restores_from_logs_and_survives_checkpoint_compaction() {
+        use alloy_primitives::U256;
+        use n42_qmdb_state::AccountState;
+        for entry_file in [false, true] {
+            let chain = deferred_chain();
+            let dir = scratch(if entry_file { "deferred-file" } else { "deferred-heap" });
+            let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+            state.set_persist_batch(false);
+            state.set_canonical_defer(false);
+            state.initialize((0, chain.genesis_hash())).unwrap();
+            let mut parent = chain.genesis_hash();
+            let mut roots = Vec::new();
+            let hashes = [B256::repeat_byte(0x81), B256::repeat_byte(0x82), B256::repeat_byte(0x83)];
+            for (index, hash) in hashes.iter().enumerate() {
+                let number = index as u64 + 1;
+                let mut changes = BlockChanges::new();
+                changes.set_account(
+                    Address::with_last_byte(3),
+                    AccountState { nonce: number, balance: U256::from(number), code_hash: B256::ZERO },
+                );
+                let prepared = state.compute(parent, &changes).unwrap();
+                roots.push(prepared.root);
+                state.insert(*hash, number, prepared).unwrap();
+                state.on_canonical(*hash).unwrap();
+                parent = *hash;
+            }
+            let log_before = std::fs::read(state.delta_log_path()).unwrap();
+            let entries_before = entry_file.then(|| std::fs::read(state.entry_file_path()).unwrap());
+            assert_eq!(state.persisted_state_root(2, hashes[1]).unwrap(), roots[1]);
+            assert_eq!(std::fs::read(state.delta_log_path()).unwrap(), log_before);
+            if let Some(bytes) = entries_before {
+                assert_eq!(std::fs::read(state.entry_file_path()).unwrap(), bytes);
+            }
+            assert!(state.persisted_state_root(2, B256::repeat_byte(0x99)).is_err());
+            // Also cover an interrupted log rotation: historical replay must
+            // read the sealed segment before the current log.
+            std::fs::rename(state.delta_log_path(), state.sealed_log_path()).unwrap();
+            assert_eq!(state.persisted_state_root(2, hashes[1]).unwrap(), roots[1]);
+            std::fs::rename(state.sealed_log_path(), state.delta_log_path()).unwrap();
+            // Sync compaction deletes the history that supplied root(2).
+            state.checkpoint(Some(hashes[2]), &mut state.cursor()).unwrap();
+            let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+            assert_eq!(restarted.persisted_state_root(2, hashes[1]).unwrap(), roots[1]);
+            restarted.initialize((3, hashes[2])).unwrap();
+            assert_eq!(restarted.state_root(), roots[2]);
+            // An arbitrary older block or corrupt frontier must not get the
+            // head root substituted for its missing historical root.
+            assert!(restarted.persisted_state_root(1, hashes[0]).is_err());
+            let mut corrupt = std::fs::read(restarted.frontier_path()).unwrap();
+            corrupt[35] ^= 1;
+            std::fs::write(restarted.frontier_path(), corrupt).unwrap();
+            assert!(restarted.persisted_state_root(2, hashes[1]).is_err());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn deferred_parent_survives_background_compaction_and_a_torn_restart_boundary() {
+        for entry_file in [false, true] {
+            let chain = deferred_chain();
+            let dir = scratch(if entry_file { "deferred-bg-file" } else { "deferred-bg-heap" });
+            let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+            state.set_persist_batch(false);
+            state.set_canonical_defer(false);
+            state.initialize((0, chain.genesis_hash())).unwrap();
+            let mut parent = chain.genesis_hash();
+            let hashes = [B256::repeat_byte(0x91), B256::repeat_byte(0x92), B256::repeat_byte(0x93)];
+            for (index, hash) in hashes.iter().enumerate() {
+                let prepared = state.compute(parent, &BlockChanges::new()).unwrap();
+                state.insert(*hash, index as u64 + 1, prepared).unwrap();
+                state.on_canonical(*hash).unwrap();
+                parent = *hash;
+            }
+            let root = state.root_of(&hashes[1]).unwrap();
+            state.save_checkpoint_frontier((3, hashes[2])).unwrap();
+            std::fs::rename(state.delta_log_path(), state.sealed_log_path()).unwrap();
+            let sealed = std::fs::read(state.sealed_log_path()).unwrap();
+            state.compact((3, hashes[2]));
+            assert!(!state.sealed_log_path().exists(), "compaction must complete");
+            let reader = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+            assert_eq!(reader.persisted_state_root(2, hashes[1]).unwrap(), root);
+            // Crash after the new checkpoint rename but before segment removal.
+            std::fs::write(state.sealed_log_path(), sealed).unwrap();
+            assert_eq!(reader.persisted_state_root(2, hashes[1]).unwrap(), root);
+            reader.initialize((3, hashes[2])).unwrap();
+            reader.wait_for_compaction();
+            assert_eq!(reader.state_root(), state.state_root());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_frontier_write_failure_preserves_the_checkpoint_and_replay_log() {
+        let chain = deferred_chain();
+        let dir = scratch("deferred-write-failure");
+        let state = QmdbNodeState::new_with_entry_file(chain, &dir, false);
+        state.set_persist_batch(false);
+        state.set_canonical_defer(false);
+        let mut parent = state.inner.chain.genesis_hash();
+        state.initialize((0, parent)).unwrap();
+        let hashes = [B256::repeat_byte(0xa1), B256::repeat_byte(0xa2), B256::repeat_byte(0xa3)];
+        for (index, hash) in hashes.iter().enumerate() {
+            let prepared = state.compute(parent, &BlockChanges::new()).unwrap();
+            state.insert(*hash, index as u64 + 1, prepared).unwrap();
+            state.on_canonical(*hash).unwrap();
+            parent = *hash;
+        }
+        let snapshot = std::fs::read(state.snapshot_path()).unwrap();
+        let log = std::fs::read(state.delta_log_path()).unwrap();
+        std::fs::remove_file(state.frontier_path()).unwrap();
+        // A directory in place of the file forces an actual I/O failure even
+        // when the tests run with permission to bypass mode bits.
+        std::fs::create_dir(state.frontier_path()).unwrap();
+        assert!(state.checkpoint(Some(hashes[2]), &mut state.cursor()).is_err());
+        assert_eq!(std::fs::read(state.snapshot_path()).unwrap(), snapshot);
+        assert_eq!(std::fs::read(state.delta_log_path()).unwrap(), log);
+        std::fs::remove_dir(state.frontier_path()).unwrap();
+        assert_eq!(state.persisted_state_root(2, hashes[1]).unwrap(), state.root_of(&hashes[1]).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

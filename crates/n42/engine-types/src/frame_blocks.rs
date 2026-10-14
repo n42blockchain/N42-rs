@@ -182,7 +182,23 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
             times.bulk_us = at.elapsed().as_micros() as u64;
             BULK.with(|slot| *slot.borrow_mut() = Some(Box::new(all)));
         }
-        if plan.frames.is_empty() {
+        if plan.frames.is_empty() && queue.frames_arriving() {
+            // Frames are on their way into the index (a flood's first burst
+            // still draining): this build takes nothing rather than walk the
+            // lanes, whose heads are those frames' first transactions. A
+            // walked block leaves one frame prefix per sender taken and
+            // every later frame of those senders unusable to the planner
+            // for the rest of the leg ([`n42_tx_queue::TxQueue::frames_arriving`]).
+            FRAME_BUILDS_WALK_REFUSED.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                target: "n42.payload",
+                refused = FRAME_BUILDS_WALK_REFUSED.load(Ordering::Relaxed),
+                "frame plan empty while frames are arriving; the build does not walk the lanes"
+            );
+            // No plan is left for the seal: an empty body takes the MPT
+            // root, as a walked one that came out empty did.
+            best
+        } else if plan.frames.is_empty() {
             // No frame a build could take whole (the funding block, a thin
             // pool, transactions that came by RPC): the ordinary walk, and
             // the seal gives the body the MPT root unless it turns out
@@ -494,6 +510,9 @@ pub fn take_select_times() -> SelectTimes {
 
 /// Builds under the flag that found no usable frame and walked the queue.
 pub static FRAME_BUILDS_WALKED: AtomicU64 = AtomicU64::new(0);
+/// Builds under the flag that found no usable frame while frames were
+/// arriving, and took nothing instead of walking the queue.
+pub static FRAME_BUILDS_WALK_REFUSED: AtomicU64 = AtomicU64::new(0);
 /// Non-empty blocks this node sealed with the frame-tree root.
 pub static SEALED_ALIGNED: AtomicU64 = AtomicU64::new(0);
 /// Non-empty blocks this node sealed under the flag with the MPT root (a

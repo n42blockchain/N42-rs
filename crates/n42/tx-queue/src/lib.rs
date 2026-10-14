@@ -2000,6 +2000,25 @@ impl<T: PoolTransaction> TxQueue<T> {
         }
     }
 
+    /// Whether frames are on their way into the index: noted in the frame
+    /// inbox, or waiting in a chunked drain's remainder for their last
+    /// transaction to reach its lane.
+    ///
+    /// A build whose frame plan came back empty while this holds must not
+    /// walk the lanes instead: the walk takes the heads of lanes whose
+    /// frames are about to be indexed, one frame's prefix per sender, and
+    /// every frame of those senders is then unusable to the planner (its
+    /// first nonce is no longer a lane head) for the rest of the leg
+    /// (loop351 stage bh: legs whose first full block was walked read
+    /// 2.3-2.9M with ~20,000 frames skipped a build; the others 4.0-4.4M
+    /// with none).
+    pub fn frames_arriving(&self) -> bool {
+        if self.frames_staged.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            return true;
+        }
+        !self.lock_inner_quiet().pending_frames.is_empty()
+    }
+
     /// How many frames the index holds, counting those still in its inbox.
     pub fn frames_indexed(&self) -> usize {
         self.lock_inner_quiet().frames.len() + self.frames_staged.load(std::sync::atomic::Ordering::Acquire)
@@ -6925,6 +6944,21 @@ mod tests {
             gas: 21_000 * members.len() as u64,
         });
         hashes
+    }
+
+    /// A noted frame is arriving until a hold drains it into the index; a
+    /// queue that only ever saw plain pushes has nothing arriving.
+    #[test]
+    fn frames_arrive_until_the_inbox_is_drained() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        let a = Address::repeat_byte(1);
+        queue.push([tx_hashed(a, 0)]);
+        assert!(!queue.frames_arriving(), "plain transactions are no frame");
+        let _ = queue.frames_in_arrival_order().count();
+        push_frame(&queue, 0xf1, &[(a, 1), (a, 2)]);
+        assert!(queue.frames_arriving());
+        assert_eq!(queue.frames_in_arrival_order().count(), 1);
+        assert!(!queue.frames_arriving());
     }
 
     #[test]

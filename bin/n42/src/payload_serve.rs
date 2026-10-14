@@ -393,6 +393,8 @@ fn build_executes_as_sealed(
         && built.gas_limit == sealed.gas_limit
         && built.base_fee_per_gas == sealed.base_fee_per_gas
         && built.parent_beacon_block_root == sealed.parent_beacon_block_root
+        && built.excess_blob_gas == sealed.excess_blob_gas
+        && built.blob_gas_used == sealed.blob_gas_used
         && built.transactions_root == sealed.transactions_root
         && built_withdrawals.unwrap_or_default() == payload_withdrawals.unwrap_or_default()
 }
@@ -3654,6 +3656,24 @@ mod tests {
     /// view change -- is not executed as this node's build: its beneficiary,
     /// timestamp or rewards differ; this node's own block, which differs only
     /// in the view the extra data carries, is (loop157 W).
+    #[test]
+    fn a_reseal_cannot_change_blob_gas_execution_inputs() {
+        let built = Header {
+            excess_blob_gas: Some(0),
+            blob_gas_used: Some(0),
+            ..Default::default()
+        };
+        let mut sealed = built.clone();
+        sealed.extra_data = vec![0xBB].into();
+        assert!(build_executes_as_sealed(&built, None, &sealed, None));
+        // BLOBBASEFEE is an execution input even without blob transactions.
+        sealed.excess_blob_gas = Some(8_000_000);
+        assert!(!build_executes_as_sealed(&built, None, &sealed, None));
+        sealed.excess_blob_gas = built.excess_blob_gas;
+        sealed.blob_gas_used = Some(131_072);
+        assert!(!build_executes_as_sealed(&built, None, &sealed, None));
+    }
+
     #[test]
     fn a_sibling_on_the_same_parent_is_not_executed_as_the_build() {
         use alloy_eips::eip4895::Withdrawal;

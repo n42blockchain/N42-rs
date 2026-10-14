@@ -62,6 +62,14 @@ pub fn body_wait() -> std::time::Duration {
     }))
 }
 
+/// Whether the plan hook resolves before it makes the body
+/// (`N42_ONE_PROBE_RESOLVE`, `first` by default; `behind` is loop351's
+/// body-first order, [`resolve_behind`]). Read once.
+pub fn resolve_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_ONE_PROBE_RESOLVE").map_or(true, |v| v.trim() != "behind"))
+}
+
 /// The kept depth in plans and built outputs (`N42_ONE_PROBE_DEPTH`, 16 by
 /// default, 1..=64). Read once.
 pub fn depth() -> u64 {

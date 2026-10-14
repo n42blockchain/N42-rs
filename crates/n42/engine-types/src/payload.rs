@@ -906,18 +906,47 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
     if cands.is_empty() {
         return None;
     }
+    // `N42_ONE_PROBE`, resolve first (the default since the persistent
+    // address table made the resolve a read-only lookup a few ms long): the
+    // keys and the partition, then the resolve on this pool, then the body;
+    // the two are published together when the hook returns, so a build that
+    // takes the body has its resolve (`one_probe_ring_reject=resolve_late`
+    // counts the rare build that does not). `N42_ONE_PROBE_RESOLVE=behind`
+    // keeps loop351's body-first order (the resolve on the resolver thread
+    // behind the hook).
+    let first = crate::one_probe::stage() > 0 && crate::one_probe::resolve_first();
+    let keys_first: Option<Vec<(alloy_primitives::Address, alloy_primitives::Address)>> = if first {
+        Some(pool.install(|| cands.par_iter().with_min_len(1024).map(|tx| transfer_key(tx)).collect::<Option<Vec<_>>>())?)
+    } else {
+        None
+    };
+    let partition = |keys: &[(alloy_primitives::Address, alloy_primitives::Address)]| {
+        crate::frame_blocks::noted_beneficiary().and_then(|beneficiary| {
+            crate::parallel_transfer::partition_by_sender(keys, beneficiary).ok().map(|groups| (beneficiary, groups))
+        })
+    };
+    let groups_first = keys_first.as_deref().map(partition);
+    let resolved_first = keys_first.as_deref().map(|keys| {
+        let groups = groups_first.as_ref().and_then(|groups| groups.as_ref()).filter(|_| crate::one_probe::stage() >= 2);
+        crate::one_probe::PendingResolve::done(crate::one_probe::resolve(pool, keys, groups.map(|(_, groups)| groups.as_slice())))
+    });
     // The prep's own pass, with no tip: the batches read the tips at the
     // block's base fee (`N42_SEAL_ON_COUNTERS`), which this cannot know.
-    let (keys, made) = crate::parallel_transfer::BodyAhead::make_keyed_on(pool, &cands, |_, tx| {
-        (transfer_key(tx), pooled_consensus(tx).clone(), tx.sender(), 0, *tx.hash())
+    let (keys, made) = crate::parallel_transfer::BodyAhead::make_keyed_on(pool, &cands, |i, tx| {
+        let key = match &keys_first {
+            Some(keys) => keys.get(i).copied(),
+            None => transfer_key(tx),
+        };
+        (key, pooled_consensus(tx).clone(), tx.sender(), 0, *tx.hash())
     })?;
     if keys.is_empty() {
         return None;
     }
     let hashes = made.hashes;
-    let groups = crate::frame_blocks::noted_beneficiary().and_then(|beneficiary| {
-        crate::parallel_transfer::partition_by_sender(&keys, beneficiary).ok().map(|groups| (beneficiary, groups))
-    });
+    let groups = match groups_first {
+        Some(groups) => groups,
+        None => partition(&keys),
+    };
     let slots = crate::parallel_transfer::empty_slots(pool, cands.len());
     // `N42_PLAN_AHEAD_PARTS=1`: the body's frame layout and transactions
     // root, found here with the plan rather than at the seal.
@@ -927,12 +956,13 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
     // `N42_ONE_PROBE=1`: every account of the plan resolved to where its
     // value lives before the block (`one_probe`), one rolling-table probe a
     // distinct address, on the plan-body pool. `N42_ONE_PROBE=2`: with the
-    // partition, the plan's batches and lanes. Body first (loop351 stage
-    // bb): the resolve runs on the resolver thread behind this hook, which
-    // returns -- publishes the body -- at once; the build uses the result
-    // only if it is done by the build's view (`one_probe::resolve_behind`).
-    // The inputs are copied for it here, on the pool.
-    let one_probe = (crate::one_probe::stage() > 0).then(|| {
+    // partition, the plan's batches and lanes. Made above, before the body,
+    // by default; with `N42_ONE_PROBE_RESOLVE=behind` (loop351 stage bb)
+    // the resolve runs on the resolver thread behind this hook, which
+    // returns -- publishes the body -- at once, and the build uses the
+    // result only if it is done by the build's view
+    // (`one_probe::resolve_behind`); the inputs are copied for it here.
+    let one_probe = resolved_first.or_else(|| (crate::one_probe::stage() > 0).then(|| {
         let (keys, groups) = pool.install(|| {
             rayon::join(
                 || keys.par_iter().copied().collect::<Vec<_>>(),
@@ -945,7 +975,7 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
         });
         crate::one_probe::resolve_behind(pool, keys, groups)
     })
-    .flatten();
+    .flatten());
     Some(crate::frame_blocks::PreparedBuild {
         segments: segments.to_vec(),
         cands,

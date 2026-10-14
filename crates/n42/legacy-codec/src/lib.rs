@@ -23,6 +23,22 @@ pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
         .map_err(|e| Box::new(ErrorKind::Decode(e)))
 }
 
+/// Decodes new bounded records with the legacy byte layout, requiring full consumption.
+pub fn deserialize_exact<const LIMIT: usize, T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
+    use bincode_reloaded::error::DecodeError;
+    if bytes.len() > LIMIT {
+        return Err(Box::new(ErrorKind::Decode(DecodeError::LimitExceeded)));
+    }
+    let (value, consumed) = bincode_reloaded::serde::decode_from_slice(
+        bytes,
+        bincode_reloaded::config::legacy().with_limit::<LIMIT>(),
+    ).map_err(|error| Box::new(ErrorKind::Decode(error)))?;
+    if consumed != bytes.len() {
+        return Err(Box::new(ErrorKind::Decode(DecodeError::Other("trailing bytes"))));
+    }
+    Ok(value)
+}
+
 pub fn serialize_into<W: std::io::Write, T: Serialize + ?Sized>(
     mut writer: W,
     value: &T,

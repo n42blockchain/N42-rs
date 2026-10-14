@@ -5601,6 +5601,61 @@ mod puller_tests {
         );
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
+#[test]
+fn late_refused_nonces_remain_available_on_the_next_parent() {
+    use alloy_consensus::{Signed, TxEip1559};
+    use alloy_primitives::{Address, Signature, TxKind, U256};
+    use reth_transaction_pool::EthPooledTransaction;
+    let queue = n42_tx_queue::TxQueue::<EthPooledTransaction>::with_run_length(4);
+    let transactions = (0..4).map(|nonce| {
+        let tx = TxEip1559 {
+            chain_id: 1,
+            nonce,
+            gas_limit: 21_000,
+            max_fee_per_gas: 10,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::repeat_byte(9)),
+            value: U256::from(1),
+            ..Default::default()
+        };
+        let signed = Signed::new_unchecked(tx, Signature::test_signature(), Default::default());
+        let recovered = reth_primitives_traits::Recovered::new_unchecked(
+            reth_ethereum_primitives::TransactionSigned::from(signed),
+            Address::repeat_byte(1),
+        );
+        EthPooledTransaction::new(recovered, 120)
+    });
+    queue.push(transactions);
+    let puller = Puller::start(Box::new(queue.best_for_build(B256::repeat_byte(1))), 4);
+    let batch = puller
+        .batches()
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(batch.len(), 4);
+    assert!(matches!(
+        puller
+            .batches()
+            .recv_timeout(std::time::Duration::from_secs(2)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    ));
+    for tx in batch.into_iter().rev() {
+        puller.refuse(Refusal::Invalid(
+            tx,
+            InvalidPoolTransactionError::ExceedsGasLimit(21_000, 42_000),
+        ));
+    }
+    drop(puller);
+    let nonces: Vec<_> = queue
+        .best_for_build(B256::repeat_byte(2))
+        .map(|tx| tx.nonce())
+        .collect();
+    assert_eq!(
+        nonces,
+        vec![0, 1, 2, 3],
+        "a parent change must not discard rejected candidates"
+    );
+}
+
 }
 
 #[cfg(test)]

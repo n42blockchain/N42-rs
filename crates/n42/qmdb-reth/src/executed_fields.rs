@@ -79,6 +79,8 @@ impl Registry {
 }
 
 static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
+type HistoricalReader = dyn Fn(&B256) -> Option<ExecutedFields> + Send + Sync;
+static HISTORICAL_READER: Mutex<Option<std::sync::Arc<HistoricalReader>>> = Mutex::new(None);
 /// Signalled on every access, for [`wait_for`].
 static WRITTEN: std::sync::Condvar = std::sync::Condvar::new();
 
@@ -126,7 +128,32 @@ pub fn remember(block_hash: B256, fields: ExecutedFields) {
 /// or under the builder hash `block_hash` was noted as an alias of
 /// ([`note_built`]).
 pub fn get(block_hash: &B256) -> Option<ExecutedFields> {
-    with_registry(|registry| registry.complete(block_hash))
+    if let Some(fields) = with_registry(|registry| registry.complete(block_hash)) {
+        return Some(fields);
+    }
+    let reader = HISTORICAL_READER.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()?;
+    // Cold catch-up must not fill/evict the live result window with old blocks.
+    // Invoke outside both locks: the reader may open a database transaction.
+    reader(block_hash)
+}
+
+/// Installs a reader for already validated, persisted canonical ancestry.
+/// It must return None for unknown or non-canonical hashes, never head fields.
+pub fn set_historical_reader(reader: impl Fn(&B256) -> Option<ExecutedFields> + Send + Sync + 'static) {
+    *HISTORICAL_READER.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(reader));
+}
+
+/// Reads deferred fields only from an exact, contiguous descendant chain.
+/// The caller must obtain all headers from one canonical database snapshot and
+/// enforce the chain's deferred fork/depth at the carrying header.
+pub fn fields_from_descendants(ancestor: &alloy_consensus::Header, descendants: &[alloy_consensus::Header], depth: u8) -> Option<ExecutedFields> {
+    if !(1..=2).contains(&depth) || descendants.len() != usize::from(depth) { return None; }
+    let mut parent = ancestor;
+    for child in descendants {
+        if child.number != parent.number.checked_add(1)? || child.parent_hash != parent.hash_slow() { return None; }
+        parent = child;
+    }
+    Some(fields_from_child_header(parent))
 }
 
 /// Notes that the block consensus sealed as `sealed` is the one this node's
@@ -185,6 +212,7 @@ pub fn missing_half(block_hash: &B256) -> &'static str {
 /// sealed before its finish (docs/PHASE_D_DEFERRED_EXECUTION.md section 13)
 /// records them a moment after its child's build has started.
 pub fn wait_for(block_hash: &B256, timeout: std::time::Duration) -> Option<ExecutedFields> {
+    if let Some(fields) = get(block_hash) { return Some(fields); }
     let deadline = std::time::Instant::now() + timeout;
     let mut guard = REGISTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     loop {
@@ -240,6 +268,49 @@ mod tests {
 
     fn serialized() -> std::sync::MutexGuard<'static, ()> {
         REGISTRY_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn deferred_history_requires_the_exact_descendant_ancestry_and_depth() {
+        let ancestor = alloy_consensus::Header { number: 151, state_root: B256::repeat_byte(1), ..Default::default() };
+        let child = alloy_consensus::Header { number: 152, parent_hash: ancestor.hash_slow(), state_root: B256::repeat_byte(2), ..Default::default() };
+        let carrying = alloy_consensus::Header { number: 153, parent_hash: child.hash_slow(), state_root: B256::repeat_byte(3), gas_used: 21_000, ..Default::default() };
+        assert_eq!(fields_from_descendants(&ancestor, &[child.clone(), carrying.clone()], 2), Some(fields_from_child_header(&carrying)));
+        assert_ne!(fields_from_child_header(&ancestor), fields_from_child_header(&carrying));
+        assert_eq!(fields_from_descendants(&ancestor, &[child.clone()], 2), None);
+        assert_eq!(fields_from_descendants(&ancestor, &[child.clone(), carrying.clone()], 1), None);
+        let mut wrong = carrying;
+        wrong.parent_hash = B256::ZERO;
+        assert_eq!(fields_from_descendants(&ancestor, &[child.clone(), wrong], 2), None);
+        let mut gap = child.clone();
+        gap.number += 1;
+        assert_eq!(fields_from_descendants(&ancestor, &[gap], 1), None);
+        assert_eq!(fields_from_descendants(&ancestor, &[child.clone()], 1), Some(fields_from_child_header(&child)));
+    }
+
+    #[test]
+    fn historical_reads_do_not_evict_live_fields_or_replace_cached_aliases() {
+        let _serial = serialized();
+        let hot = alloy_primitives::keccak256(b"hot deferred historical resolver test");
+        let live = ExecutedFields { state_root: B256::repeat_byte(9), receipts_root: B256::repeat_byte(8), logs_bloom: Bloom::default(), gas_used: 1 };
+        remember(hot, live);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        set_historical_reader(move |hash| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (*hash != B256::ZERO).then_some(ExecutedFields { state_root: *hash, ..live })
+        });
+        assert_eq!(get(&hot), Some(live));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        for n in 1..=(KEEP + 4) {
+            let hash = alloy_primitives::keccak256(n.to_le_bytes());
+            assert_eq!(get(&hash).unwrap().state_root, hash);
+        }
+        assert_eq!(get(&hot), Some(live), "cold history did not occupy the live window");
+        assert_eq!(get(&B256::ZERO), None);
+        let cold = alloy_primitives::keccak256(b"historical wait");
+        assert_eq!(wait_for(&cold, std::time::Duration::ZERO).unwrap().state_root, cold);
+        *HISTORICAL_READER.lock().unwrap() = None;
     }
 
     #[test]

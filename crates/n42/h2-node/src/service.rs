@@ -3668,6 +3668,21 @@ impl<E: ExecutionLayer> H2Service<E> {
             // design, and gov5's message id is a hash of the payload.
             Ok(_) => events.push(ServiceEvent::Published { view }),
             Err(err) if err.is_already_published() => {
+                // Local gossip de-duplication does not mean late subscribers
+                // received this timeout. Retries must remain deliverable after
+                // the gossip history has expired while its id is still cached.
+                if matches!(message, n42_h2_primitives::consensus::ConsensusMessage::Timeout(_)) {
+                    let peers = self.transport.connected_peer_ids();
+                    debug!(target: "n42.h2.node", view, peers = peers.len(),
+                           "duplicate timeout gossip; retransmitting directly");
+                    // Bind RPC retries to the full chain identity even when
+                    // normal consensus gossip uses the native topic.
+                    if let Ok(bytes) = n42_h2_wire::h2_v4::encode_gossip(&envelope) {
+                        for peer in peers {
+                            self.transport.send_vote(peer, n42_h2_net::VoteRequest::Envelope(bytes.clone()));
+                        }
+                    }
+                }
                 events.push(ServiceEvent::Published { view });
             }
             Err(err) if err.is_transient() => {
@@ -4797,6 +4812,7 @@ fn transport_event_kind(event: &TransportEvent) -> &'static str {
     match event {
         TransportEvent::Envelope { .. } => "envelope",
         TransportEvent::Native { .. } => "native",
+        TransportEvent::DirectVote { .. } => "direct_vote",
         TransportEvent::Rejected { .. } => "rejected",
         TransportEvent::Transactions { .. } => "transactions",
         TransportEvent::Block { .. } => "block",

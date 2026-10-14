@@ -351,3 +351,61 @@ async fn a_body_channel_gives_the_service_a_receiver_and_announces_its_identity(
     let sent = svc.push_body(&alloy_primitives::Bytes::from_static(b"body"), None, B256::repeat_byte(1));
     assert!(!sent, "no connected peer: not every member was reached");
 }
+
+#[tokio::test]
+async fn a_repeated_timeout_reaches_a_late_peer_over_the_direct_protocol() {
+    let (keys, set) = keys(4);
+    let mut a = node_in(&keys, &set, 0, None).await;
+    a.svc = a.svc.with_gov5_h2_profile(keys[0].clone());
+    a.svc.engine.on_timeout().unwrap();
+    let mut events = Vec::new();
+    within(a.svc.drain_outputs(&mut events)).await.unwrap();
+    let timeout = a.svc.outbox.last().unwrap().clone();
+    let mut b = node_in(&keys, &set, 1, Some(a.addr.clone())).await;
+    b.svc = b.svc.with_gov5_h2_profile(keys[1].clone());
+    pump(&mut a, &mut b, (false, false), &mut events, |a, b, _| {
+        a.svc.transport.native_mesh_size() > 0 && b.svc.transport.native_mesh_size() > 0
+    })
+    .await;
+    a.svc.flush_outbox(&mut events);
+    pump(&mut a, &mut b, (false, false), &mut events, |_, b, _| {
+        b.seen.contains(&"native")
+    })
+    .await;
+    let envelope = wire_bridge::to_wire(&timeout, ID, B256::ZERO).unwrap();
+    assert!(a
+        .svc
+        .transport
+        .publish_native(&envelope.message)
+        .unwrap_err()
+        .is_already_published());
+    let mut late = node_in(&keys, &set, 2, Some(a.addr.clone())).await;
+    late.svc = late.svc.with_gov5_h2_profile(keys[2].clone());
+    pump(
+        &mut a,
+        &mut late,
+        (false, false),
+        &mut events,
+        |a, late, _| {
+            a.svc
+                .transport
+                .connected_peer_ids()
+                .contains(late.svc.transport.local_peer_id())
+                && late.svc.transport.native_mesh_size() > 0
+        },
+    )
+    .await;
+    a.svc.publish(timeout, &mut events);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        pump(
+            &mut a,
+            &mut late,
+            (false, false),
+            &mut events,
+            |_, late, _| late.seen.contains(&"direct_vote"),
+        ),
+    )
+    .await
+    .expect("a gossip duplicate must still retransmit the signed timeout directly");
+}

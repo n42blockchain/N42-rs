@@ -34,7 +34,7 @@ fn catching_up(rig: &mut Rig, peer: PeerId, next: u64, target: u64) {
 
 async fn import(rig: &mut Rig) -> Vec<ServiceEvent> {
     let mut events = Vec::new();
-    within(rig.svc.import_ranges(&mut events)).await;
+    within(rig.svc.import_ranges(&mut events)).await.expect("import range");
     events
 }
 

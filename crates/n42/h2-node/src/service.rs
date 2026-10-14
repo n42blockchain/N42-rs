@@ -101,6 +101,9 @@ pub enum ServiceError {
     /// The consensus engine returned a fatal error.
     #[error("consensus engine: {0}")]
     Engine(#[from] n42_h2_consensus::ConsensusError),
+    /// A body could not be made durable before voting.
+    #[error("durable proposal body: {0}")]
+    RecoveryBody(String),
 }
 
 /// What the service is doing, for a caller that wants to watch without owning
@@ -260,6 +263,8 @@ pub struct H2Service<E> {
     meshed: bool,
     /// Persists consensus state before a commit is announced as final.
     checkpoint: Option<Box<CheckpointWriter>>,
+    recovery_bodies: Option<Arc<crate::recovery_bodies::RecoveryBodies>>,
+    recovery_saved: std::collections::HashSet<B256>,
     /// The builder declined to propose for the current view — the period had
     /// not elapsed — so the next step must not wait for the view to time out
     /// before asking again. See [`PROPOSE_RETRY`].
@@ -1175,6 +1180,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             proposed_view: None,
             meshed: false,
             checkpoint: None,
+            recovery_bodies: None,
+            recovery_saved: std::collections::HashSet::new(),
             proposal_deferred: false,
             inbound_forward: None,
             body_arrived: std::collections::HashMap::new(),
@@ -1305,6 +1312,21 @@ impl<E: ExecutionLayer> H2Service<E> {
     ) -> Self {
         self.checkpoint = Some(Box::new(writer));
         self
+    }
+
+    /// Makes proposal bodies durable before either a leader or follower votes.
+    pub fn with_recovery_bodies(mut self, bodies: Arc<crate::recovery_bodies::RecoveryBodies>) -> Self {
+        self.recovery_bodies = Some(bodies);
+        self
+    }
+
+    fn persist_body_before_vote(&mut self, hash: B256) -> Result<(), ServiceError> {
+        let Some(store) = &self.recovery_bodies else { return Ok(()); };
+        if self.recovery_saved.contains(&hash) { return Ok(()); }
+        let body = self.body_store.get(&hash).ok_or_else(|| ServiceError::RecoveryBody(format!("full body for {hash:#x} is unavailable; compact-only voting cannot provide crash recovery")))?;
+        store.save(hash, body, self.header_profile).map_err(ServiceError::RecoveryBody)?;
+        self.recovery_saved.insert(hash);
+        Ok(())
     }
 
     /// Makes this node produce blocks when it is leader.
@@ -2372,7 +2394,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     async fn drain_outputs(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
         let drain_at = std::time::Instant::now();
         self.consider_catch_up(events).await;
-        self.import_ranges(events).await;
+        self.import_ranges(events).await?;
         for (peer, hash, channel) in std::mem::take(&mut self.pending_block_requests) {
             if let Some(body) = self.elided_body(hash).await {
                 debug!(target: "n42.h2.node", peer, ?hash, "peer asked for a block taken elided; body fetched from the execution layer");
@@ -3227,6 +3249,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
                 let describe_us = describe_at.elapsed().as_micros() as u64;
                 let publish_at = std::time::Instant::now();
+                self.persist_body_before_vote(built.hash)?;
                 if let Err(err) = self
                     .engine
                     .process_event(ConsensusEvent::BlockReady(built.hash, None))
@@ -3374,6 +3397,9 @@ impl<E: ExecutionLayer> H2Service<E> {
     ) -> Result<(), ServiceError> {
         match action {
             DriverAction::Consensus(event) => {
+                if let ConsensusEvent::BlockImported(hash) | ConsensusEvent::BlockChecked(hash) = event.as_ref() {
+                    self.persist_body_before_vote(*hash)?;
+                }
                 // The engine's extends rule reads the parent of an imported
                 // block; every block imported here came with its header.
                 if let ConsensusEvent::BlockImported(block_hash) | ConsensusEvent::BlockChecked(block_hash) =
@@ -3757,7 +3783,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// layer, at most [`PULLED_BLOCKS_PER_STEP`] per call — what is left of a
     /// reply waits for the next step; asks for the next range while the
     /// target is not reached.
-    async fn import_ranges(&mut self, events: &mut Vec<ServiceEvent>) {
+    async fn import_ranges(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
         let mut budget = PULLED_BLOCKS_PER_STEP;
         let mut replies = std::mem::take(&mut self.pending_imports).into_iter();
         while let Some((peer, request, chunks)) = replies.next() {
@@ -3788,14 +3814,14 @@ impl<E: ExecutionLayer> H2Service<E> {
                     Err(err) => {
                         warn!(target: "n42.h2.node", %peer, %err, "peer served a block this node cannot read; catch-up stopped");
                         self.finish_catch_up(events, false);
-                        return;
+                        return Ok(());
                     }
                 };
                 let expected = self.catch_up.as_ref().map(|c| c.next).unwrap_or_default();
                 if block.header.number != expected {
                     warn!(target: "n42.h2.node", %peer, got = block.header.number, expected, "peer served blocks out of order; catch-up stopped");
                     self.finish_catch_up(events, false);
-                    return;
+                    return Ok(());
                 }
                 let hash = block.block_hash;
                 let number = block.header.number;
@@ -3816,6 +3842,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         self.note_imported(number);
                         self.remember_block(hash, &block.header);
                         self.remember_body(hash, chunk.rlp.clone());
+                        self.persist_body_before_vote(hash)?;
                         if let Some(c) = self.catch_up.as_mut() {
                             c.next += 1;
                         }
@@ -3823,7 +3850,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     Err(err) => {
                         warn!(target: "n42.h2.node", %peer, number = block.header.number, %err, "could not import a pulled block; catch-up stopped");
                         self.finish_catch_up(events, false);
-                        return;
+                        return Ok(());
                     }
                 }
             }
@@ -3842,7 +3869,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 let mut pending = vec![(peer, rest, Vec::from(chunks))];
                 pending.extend(replies);
                 self.pending_imports = pending;
-                return;
+                return Ok(());
             }
             let window_filled = catch_up.next > catch_up.target;
             if window_filled {
@@ -3860,6 +3887,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.request_next_range();
             }
         }
+        Ok(())
     }
 
     fn finish_catch_up(&mut self, events: &mut Vec<ServiceEvent>, complete: bool) {
@@ -4108,6 +4136,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             while self.body_store_order.len() > remembered_bodies() {
                 let oldest = self.body_store_order.remove(0);
                 self.body_store.remove(&oldest);
+                self.recovery_saved.remove(&oldest);
             }
         }
     }

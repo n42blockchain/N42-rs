@@ -97,6 +97,42 @@ async fn within<F: std::future::Future>(f: F) -> F::Output {
 // Pure helpers
 // ---------------------------------------------------------------------------
 
+#[tokio::test]
+async fn recovery_body_write_failure_stops_the_execution_event_before_a_vote() {
+    let mut rig = node(4, 1, None).await;
+    let dir = std::env::temp_dir().join(format!("n42-service-recovery-failure-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(crate::recovery_bodies::RecoveryBodies::open(&dir).unwrap());
+    rig.svc = rig.svc.with_recovery_bodies(store.clone());
+    let (hash, header, bytes) = block(1, ID.genesis_hash);
+    rig.svc.remember_block(hash, &header);
+    rig.svc.remember_body(hash, bytes);
+    std::fs::create_dir(dir.join(format!("{hash:x}.tmp"))).unwrap();
+    let before = crate::persistence::checkpoint_from(&rig.svc.engine);
+    let result = rig.svc.apply_driver_action(DriverAction::Consensus(Box::new(ConsensusEvent::BlockChecked(hash))), &mut Vec::new());
+    assert!(matches!(result, Err(ServiceError::RecoveryBody(_))));
+    assert_eq!(crate::persistence::checkpoint_from(&rig.svc.engine), before);
+    assert!(!rig.svc.recovery_saved.contains(&hash));
+    assert!(store.read(hash).unwrap().is_none());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_checked_body_is_durable_before_it_reaches_the_consensus_engine() {
+    let mut rig = node(4, 1, None).await;
+    let dir = std::env::temp_dir().join(format!("n42-service-recovery-success-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(crate::recovery_bodies::RecoveryBodies::open(&dir).unwrap());
+    rig.svc = rig.svc.with_recovery_bodies(store.clone());
+    let (hash, header, bytes) = block(1, ID.genesis_hash);
+    rig.svc.remember_block(hash, &header);
+    rig.svc.remember_body(hash, bytes.clone());
+    rig.svc.apply_driver_action(DriverAction::Consensus(Box::new(ConsensusEvent::BlockChecked(hash))), &mut Vec::new()).unwrap();
+    assert_eq!(store.read(hash).unwrap().as_deref(), Some(bytes.as_ref()));
+    assert!(rig.svc.recovery_saved.contains(&hash));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn the_loop_spend_window_sums_per_kind_and_only_reports_slow_views() {
     let mut spend = LoopSpend::default();

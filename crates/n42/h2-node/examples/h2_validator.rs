@@ -338,6 +338,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .map(ConsensusStore::open)
             .transpose()?;
+        let recovery_profile = if gov5_profile { n42_h2_net::HeaderProfile::Gov5H2 } else { n42_h2_net::HeaderProfile::Ethereum };
+        let recovery_bodies = datadir.as_ref().map(|dir| {
+            n42_h2_node::recovery_bodies::RecoveryBodies::open(
+                Path::new(dir).join("execution-recovery").join(format!("{}-{:x}", identity.chain_id, identity.genesis_hash)),
+            ).map(Arc::new)
+        }).transpose().map_err(std::io::Error::other)?;
+        let el = EngineApiClient::new(HttpTransport::new(el_url.clone(), jwt, Duration::from_secs(8))?);
+        if let (Some(store), Some(bodies)) = (&store, &recovery_bodies) {
+            // Several validators can share one EL. Serialize their startup
+            // replay so one cannot move forkchoice backwards during another's
+            // replay. The lock contains no chain data and is released on crash.
+            let locks = std::env::var_os("N42_RECOVERY_LOCK_DIR").map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::temp_dir().join("n42-el-recovery-locks"));
+            std::fs::create_dir_all(&locks)?;
+            let lock = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+                .open(locks.join(format!("{:x}.lock", alloy_primitives::keccak256(el_url.as_str().as_bytes()))))?;
+            lock.lock()?;
+            if let Some(recovered) = store.load()? {
+                let probe = HttpTransport::new(el_url.clone(), jwt, Duration::from_secs(8))?;
+                let gauge = n42_h2_el_rpc::in_memory::InMemoryGauge::default();
+                n42_h2_el_rpc::in_memory::poll_persisted_once(&probe, &gauge).await;
+                let n42_h2_execution::PersistedHeight::Known(persisted) = gauge.persisted() else {
+                    return Err(std::io::Error::other("cannot establish durable EL height for consensus recovery").into());
+                };
+                for qc in [&recovered.last_committed_qc, &recovered.locked_qc] {
+                    if qc.view == 0 { continue; }
+                    let count = n42_h2_node::recovery_bodies::recover(
+                        &el, bodies, qc.block_hash, recovery_profile,
+                    ).await.map_err(std::io::Error::other)?;
+                    n42_h2_node::recovery_bodies::snapshot(&el, bodies, qc.block_hash, persisted, recovery_profile)
+                        .await.map_err(std::io::Error::other)?;
+                    println!("recovery     : replayed {count} blocks for durable QC view {}", qc.view);
+                }
+            }
+            drop(lock);
+        }
         // The execution layer's head has to be recovered alongside the view. A
         // node that resumes consensus at view N but points its driver at genesis
         // sends a forkchoiceUpdated for a block thousands behind, and a live
@@ -383,7 +419,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             recovered.view, recovered.last_voted_view,
                         );
                         if recovered.last_committed_qc.view > 0 {
-                            recovered_head = Some(recovered.last_committed_qc.block_hash);
+                            recovered_head = Some(if recovered.locked_qc.view > recovered.last_committed_qc.view {
+                                recovered.locked_qc.block_hash
+                            } else { recovered.last_committed_qc.block_hash });
                             println!(
                                 "head         : {}",
                                 recovered.last_committed_qc.block_hash,
@@ -421,11 +459,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Bench only: a vote before the import bounds what deferred execution
         // (docs/PHASE_D_DEFERRED_EXECUTION.md) would give the cycle.
         if std::env::var("N42_VOTE_BEFORE_IMPORT").is_ok_and(|v| v == "1") {
+            if recovery_bodies.is_some() {
+                return Err(std::io::Error::other("durable validators cannot bypass the pre-vote recovery body write").into());
+            }
             engine.set_vote_before_import(true);
             println!("UNSAFE        : voting before import (N42_VOTE_BEFORE_IMPORT=1) -- a measurement, not a node");
         }
 
-        let el = EngineApiClient::new(HttpTransport::new(el_url.clone(), jwt, Duration::from_secs(8))?);
         // The driver starts where the execution layer actually is. The
         // checkpoint's last committed block may be one this node committed on
         // the fleet's certificates while behind, without ever importing it; a
@@ -493,15 +533,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let mut service = H2Service::new(transport, engine, driver, output_rx, validator_count);
+        if let Some(bodies) = recovery_bodies.clone() {
+            service = service.with_recovery_bodies(bodies);
+        }
         if let Some(store) = store {
             // Inside the service, not on the event it emits: the checkpoint has
             // to be durable before the commit reaches the execution layer, and
             // by the time an event is handed back here the forkchoice has
             // already gone out.
+            let gauge = persistence_gauge.clone();
+            let last_pruned = AtomicU64::new(0);
             service = service.with_checkpoint(move |engine| {
                 store
                     .save(&n42_h2_node::persistence::checkpoint_from(engine))
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                if let (Some(bodies), Some(gauge)) = (&recovery_bodies, &gauge) {
+                    if let n42_h2_execution::PersistedHeight::Known(height) = gauge.persisted() {
+                        if height.saturating_sub(last_pruned.load(Ordering::Relaxed)) >= 64 {
+                            bodies.prune(height, recovery_profile)?;
+                            last_pruned.store(height, Ordering::Relaxed);
+                        }
+                    }
+                }
+                Ok(())
             });
         }
         if gov5_profile {

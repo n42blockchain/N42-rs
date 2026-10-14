@@ -3712,6 +3712,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         for (peer, height) in std::mem::take(&mut self.pending_status) {
             self.note_peer_height(peer, height);
         }
+        self.request_missing_held_parent(events);
         if self.catch_up.is_some()
             || self
                 .catch_up_retry_after
@@ -4128,6 +4129,32 @@ impl<E: ExecutionLayer> H2Service<E> {
 
     fn note_imported(&mut self, number: u64) {
         self.imported_height = Some(self.imported_height.map_or(number, |tip| tip.max(number)));
+    }
+
+    /// A direct body may carry no source identity or arrive before its peer's
+    /// status is refreshed. The earliest held child's parent hash still names
+    /// exactly what is missing, without trusting an advertised height.
+    fn request_missing_held_parent(&mut self, events: &mut Vec<ServiceEvent>) {
+        let Some(tip) = self.imported_tip() else { return };
+        let Some(parent) = self.held_bodies.iter()
+            .filter_map(|hash| self.block_headers.get(hash))
+            .filter(|header| header.number > tip.saturating_add(1))
+            .min_by_key(|header| header.number)
+            .map(|header| header.parent_hash) else { return };
+        if self.imported.contains(&parent) || self.body_store.contains_key(&parent)
+            || self.driver.has_body(&parent) || self.driver.importing().any(|hash| *hash == parent)
+        {
+            return;
+        }
+        let peers = self.transport.connected_peer_ids();
+        if peers.is_empty() || !self.body_request_due(parent) { return };
+        self.awaiting_bodies.insert(parent);
+        for peer in peers {
+            self.transport.request_block(peer, parent);
+        }
+        info!(target: "n42.h2.node", block_hash = ?parent, tip,
+              "held child is missing its parent; asking peers by hash");
+        events.push(ServiceEvent::PayloadMissing { block_hash: parent });
     }
 
     fn note_peer_height(&mut self, peer: PeerId, height: u64) {

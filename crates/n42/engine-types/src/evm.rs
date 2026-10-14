@@ -253,7 +253,23 @@ thread_local! {
     /// to reach it; the executor clears this before every transaction and
     /// takes it after. Other threads executing the same transactions (the
     /// engine's prewarming) fill their own copy, which nothing reads.
-    static SIGHTINGS: RefCell<TxSightings> = RefCell::new(TxSightings::default());
+    static SIGHTINGS: RefCell<Option<TxSightings>> = const { RefCell::new(None) };
+}
+
+// Only the block executor consumes sightings. Prewarming/raw EVM execution
+// must not collect unbounded writes; errors and panics disable capture too.
+struct TxCapture(std::marker::PhantomData<std::rc::Rc<()>>);
+impl TxCapture {
+    fn start() -> Self {
+        SIGHTINGS.with(|sightings| *sightings.borrow_mut() = Some(TxSightings::default()));
+        Self(std::marker::PhantomData)
+    }
+    fn finish(self) -> TxSightings {
+        SIGHTINGS.with(|sightings| sightings.borrow_mut().take().unwrap_or_default())
+    }
+}
+impl Drop for TxCapture {
+    fn drop(&mut self) { SIGHTINGS.with(|sightings| { sightings.borrow_mut().take(); }); }
 }
 
 /// Opcode `0xEF`: no instruction in legacy code. When the frame's code is an
@@ -272,7 +288,7 @@ fn eof_guard<H: Host + ?Sized>(ctx: InstructionContext<'_, H, EthInterpreter>) -
             len: code.len(),
         };
         SIGHTINGS.with(|sightings| {
-            sightings.borrow_mut().eof.get_or_insert(sighting);
+            if let Some(sightings) = sightings.borrow_mut().as_mut() { sightings.eof.get_or_insert(sighting); }
         });
     }
     control::unknown(ctx)
@@ -288,7 +304,7 @@ fn recording_sstore<H: Host + ?Sized>(ctx: InstructionContext<'_, H, EthInterpre
     let result = host::sstore(ctx);
     if result.is_ok() {
         if let Some(store) = store {
-            SIGHTINGS.with(|sightings| sightings.borrow_mut().sstores.push(store));
+            SIGHTINGS.with(|sightings| { if let Some(sightings) = sightings.borrow_mut().as_mut() { sightings.sstores.push(store); } });
         }
     }
     result
@@ -444,9 +460,10 @@ where
     ) -> Result<Self::Result, BlockExecutionError> {
         let (tx_env, recovered) = tx.into_parts();
         let hash = *recovered.tx().tx_hash();
-        SIGHTINGS.with(|sightings| *sightings.borrow_mut() = TxSightings::default());
-        let result = self.inner.execute_transaction_without_commit((tx_env, recovered))?;
-        let TxSightings { eof, sstores } = SIGHTINGS.with(|sightings| std::mem::take(&mut *sightings.borrow_mut()));
+        let capture = TxCapture::start();
+        let executed = self.inner.execute_transaction_without_commit((tx_env, recovered));
+        let TxSightings { eof, sstores } = capture.finish();
+        let result = executed?;
 
         if let Some(sighting) = eof {
             let block: u64 = revm::context::Block::number(alloy_evm::Evm::block(self.inner.evm())).saturating_to();
@@ -673,6 +690,16 @@ mod tests {
         let context_key = restored_slots_execution_key(PARENT_HASH, restored_slots_env_key(&env.block_env), ctx.parent_beacon_block_root, ctx.withdrawals.as_deref(), []);
         let key = restored_slots_key(context_key, block.body().transactions.iter().map(|tx| *tx.tx_hash()));
         n42_qmdb_reth::restored_slots(key).map(|slots| slots.to_vec()).unwrap_or_default()
+    }
+
+    #[test]
+    fn capture_is_disabled_outside_execution_and_after_unwinding() {
+        assert!(SIGHTINGS.with(|sightings| sightings.borrow().is_none()));
+        let capture = TxCapture::start();
+        assert!(SIGHTINGS.with(|sightings| sightings.borrow().is_some()));
+        assert!(capture.finish().sstores.is_empty());
+        let _ = std::panic::catch_unwind(|| { let _capture = TxCapture::start(); panic!("failed execution"); });
+        assert!(SIGHTINGS.with(|sightings| sightings.borrow().is_none()));
     }
 
     #[test]

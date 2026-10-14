@@ -147,12 +147,162 @@ fn main() {
                 StateScheme::Mpt => None,
             };
             let qmdb_for_startup = qmdb.clone();
+            let qmdb_before_launch = qmdb.clone();
 
             let NodeHandle {
                 node,
                 node_exit_future,
             } = builder
                 .node(N42Node::with_qmdb(qmdb))
+                // Restore state and deferred results before engine/RPC launch.
+                // A cold checkpoint can take seconds to read; an early payload
+                // must not be permanently marked invalid while it is loading.
+                .on_component_initialized(move |node| {
+                    use reth_provider::ChainSpecProvider;
+                    if let Some(qmdb) = &qmdb_before_launch {
+                        let durable_provider = node.provider.clone();
+                        qmdb.set_durable_head_reader(move || {
+                            use reth_provider::DatabaseProviderFactory;
+                            use reth_db_api::transaction::DbTx;
+                            let database = durable_provider.database_provider_ro().ok()?;
+                            database.tx_ref().get::<reth_db_api::tables::StageCheckpoints>("Finish".to_owned())
+                                .ok()?.map(|checkpoint| checkpoint.block_number)
+                        });
+                        let info = node.provider.chain_info()?;
+                        let head_hash = node
+                            .provider
+                            .block_hash(info.best_number)?
+                            .ok_or_else(|| eyre::eyre!("no hash for head block {}", info.best_number))?;
+                        use reth_provider::{HeaderProvider, ReceiptProvider};
+                        let head = node.provider.sealed_header(info.best_number)?
+                            .ok_or_else(|| eyre::eyre!("no header for head block {}", info.best_number))?;
+                        if head.hash() != head_hash {
+                            return Err(eyre::eyre!("canonical head changed during QMDB startup"));
+                        }
+                        let chain_spec = node.provider.chain_spec();
+                        let genesis = chain_spec.genesis();
+                        if info.best_number > 0 && reth_chainspec::qmdb::deferred_execution_depth_at(genesis, head.timestamp) == 2 {
+                            // The first child carries result(head-1), then the next
+                            // carries result(head). Restore the frontier before QMDB
+                            // initialisation can resume a compaction or migrate files.
+                            let parent = node.provider.sealed_header(info.best_number - 1)?
+                                .ok_or_else(|| eyre::eyre!("no header for deferred recovery parent {}", info.best_number - 1))?;
+                            if parent.hash() != head.parent_hash {
+                                return Err(eyre::eyre!("deferred recovery parent is not canonical"));
+                            }
+                            let state_root = if parent.number == 0 {
+                                parent.state_root
+                            } else {
+                                qmdb.persisted_state_root(parent.number, parent.hash())?
+                            };
+                            let receipts = match node.provider.receipts_by_block(parent.hash().into())? {
+                                Some(receipts) => receipts,
+                                None if parent.transactions_root == alloy_consensus::EMPTY_ROOT_HASH => Vec::new(),
+                                None => return Err(eyre::eyre!("missing receipts for deferred recovery parent {}", parent.number)),
+                            };
+                            let (receipts_root, logs_bloom) = n42_engine_types::hotstuff_consensus::gov5_receipt_root_bloom(&receipts);
+                            let gas_used = receipts.last().map_or(0, |receipt| receipt.cumulative_gas_used);
+                            qmdb.remember_checkpoint_parent((head.number, head.hash()), parent.hash(), state_root)?;
+                            n42_engine_types::executed_fields::remember(parent.hash(),
+                                n42_engine_types::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used });
+                            info!(target: "reth::cli", block = parent.number, hash = %parent.hash(), "restored deferred execution parent result");
+                        }
+                        qmdb.initialize((info.best_number, head_hash))?;
+                        info!(target: "reth::cli", block = info.best_number, %head_hash, "QMDB state ready");
+                        // A lagging CL may re-submit persisted blocks below this EL's
+                        // recovered frontier. Their deferred results are committed in
+                        // canonical depth-D descendant headers, not in their own header.
+                        // Resolve misses without replaying QMDB or evicting live results.
+                        let historical_provider = node.provider.clone();
+                        let historical_genesis = genesis.clone();
+                        n42_engine_types::executed_fields::set_historical_reader(move |hash| {
+                            use reth_provider::DatabaseProviderFactory;
+                            let database = historical_provider.database_provider_ro().ok()?;
+                            let ancestor = database.header(*hash).ok()??;
+                            if ancestor.hash_slow() != *hash { return None; }
+                            if database.block_hash(ancestor.number).ok()? != Some(*hash) { return None; }
+                            if !reth_chainspec::qmdb::deferred_execution_active_at(&historical_genesis, ancestor.timestamp) {
+                                return Some(n42_engine_types::executed_fields::fields_from_child_header(&ancestor));
+                            }
+                            let depth = u8::try_from(reth_chainspec::qmdb::deferred_execution_depth_at(&historical_genesis, ancestor.timestamp)).ok()?;
+                            if !(1..=2).contains(&depth) { return None; }
+                            let mut descendants = Vec::with_capacity(usize::from(depth));
+                            for step in 1..=depth {
+                                descendants.push(database.header_by_number(ancestor.number.checked_add(u64::from(step))?).ok()??);
+                            }
+                            let carrying = descendants.last()?;
+                            if reth_chainspec::qmdb::deferred_execution_depth_at(&historical_genesis, carrying.timestamp) != u64::from(depth) { return None; }
+                            n42_engine_types::executed_fields::fields_from_descendants(&ancestor, &descendants, depth)
+                        });
+                        // With HotStuff-2 finality the canonical head is the committed
+                        // block, and a build on an ancestor of it is a stale request
+                        // that would revert the state tree below the head.
+                        if n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(node.provider.chain_spec().genesis()).is_ok() {
+                            qmdb.set_refuse_stale_builds(true);
+                        }
+                        // `N42_QMDB_READS=verify|on`: the read view answers or checks the
+                        // providers' latest-state reads (docs/QMDB_UPGRADE_PLAN.md, stage 6).
+                        if n42_qmdb_reth::register_state_reader(qmdb) {
+                            info!(target: "reth::cli", "QMDB read view registered as the state reader");
+                        }
+                        n42_qmdb_reth::check_hashed_tables_setting().map_err(|err| eyre::eyre!(err))?;
+                        if n42_qmdb_reth::n42_state::hashed_tables_off() {
+                            info!(target: "reth::cli", "hashed state tables are not written; QMDB answers the latest state");
+                        }
+                        // The head's execution result, for the first header after a
+                        // restart under deferred execution: before the fork the
+                        // header carries it; past the fork the forest holds the root
+                        // and the database the receipts.
+                        {
+                            if reth_chainspec::qmdb::deferred_execution_active_at(genesis, head.timestamp) {
+                                let receipts = match node.provider.receipts_by_block(head.hash().into())? {
+                                    Some(receipts) => receipts,
+                                    None if head.transactions_root == alloy_consensus::EMPTY_ROOT_HASH => Vec::new(),
+                                    None => return Err(eyre::eyre!("missing receipts for deferred recovery head {}", head.number)),
+                                };
+                                let (receipts_root, logs_bloom) = n42_engine_types::hotstuff_consensus::gov5_receipt_root_bloom(&receipts);
+                                let gas_used = receipts.last().map_or(0, |r| r.cumulative_gas_used);
+                                {
+                                    let state_root = qmdb.root_of(&head.hash())
+                                        .ok_or_else(|| eyre::eyre!("missing QMDB root for recovery head {}", head.number))?;
+                                    n42_engine_types::executed_fields::remember(
+                                        head.hash(),
+                                        n42_engine_types::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used },
+                                    );
+                                }
+                            } else {
+                                n42_engine_types::executed_fields::seed_from_header(head.hash(), head.header());
+                            }
+                        }
+
+                        // Follow the canonical chain so the persisted head keeps up with
+                        // the database's. Lagging is tolerable — only the tip matters,
+                        // and every tree in between was filed at validation.
+                        let mut canonical = node.provider.subscribe_to_canonical_state();
+                        let follower = qmdb.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                match canonical.recv().await {
+                                    Ok(notification) => {
+                                        let behind = canonical.len();
+                                        if behind > 8 {
+                                            warn!(target: "reth::cli", behind, "canonical subscriber lag: qmdb head follower");
+                                        }
+                                        let tip = notification.tip().hash();
+                                        if let Err(error) = follower.on_canonical(tip) {
+                                            error!(target: "reth::cli", %error, "QMDB head could not follow the canonical chain");
+                                        }
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                        warn!(target: "reth::cli", skipped, "QMDB head follower fell behind canonical notifications");
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                        });
+                    }
+                    Ok(())
+                })
                 .extend_rpc_modules(move |ctx| {
                     let consensus = ctx.node().consensus().clone();
                     let provider = ctx.provider().clone();
@@ -268,148 +418,6 @@ fn main() {
                     "N42_HASHED_TABLES=off needs --engine.num-state-masking-blocks 0 (got {}): the QMDB read view answers at the database tip",
                     node.config.engine.num_state_masking_blocks
                 ));
-            }
-            if let Some(qmdb) = &qmdb_for_startup {
-                let durable_provider = node.provider.clone();
-                qmdb.set_durable_head_reader(move || {
-                    use reth_provider::DatabaseProviderFactory;
-                    use reth_db_api::transaction::DbTx;
-                    let database = durable_provider.database_provider_ro().ok()?;
-                    database.tx_ref().get::<reth_db_api::tables::StageCheckpoints>("Finish".to_owned())
-                        .ok()?.map(|checkpoint| checkpoint.block_number)
-                });
-                let info = node.provider.chain_info()?;
-                let head_hash = node
-                    .provider
-                    .block_hash(info.best_number)?
-                    .ok_or_else(|| eyre::eyre!("no hash for head block {}", info.best_number))?;
-                use reth_provider::{HeaderProvider, ReceiptProvider};
-                let head = node.provider.sealed_header(info.best_number)?
-                    .ok_or_else(|| eyre::eyre!("no header for head block {}", info.best_number))?;
-                if head.hash() != head_hash {
-                    return Err(eyre::eyre!("canonical head changed during QMDB startup"));
-                }
-                let chain_spec = node.chain_spec();
-                let genesis = chain_spec.genesis();
-                if info.best_number > 0 && reth_chainspec::qmdb::deferred_execution_depth_at(genesis, head.timestamp) == 2 {
-                    // The first child carries result(head-1), then the next
-                    // carries result(head). Restore the frontier before QMDB
-                    // initialisation can resume a compaction or migrate files.
-                    let parent = node.provider.sealed_header(info.best_number - 1)?
-                        .ok_or_else(|| eyre::eyre!("no header for deferred recovery parent {}", info.best_number - 1))?;
-                    if parent.hash() != head.parent_hash {
-                        return Err(eyre::eyre!("deferred recovery parent is not canonical"));
-                    }
-                    let state_root = if parent.number == 0 {
-                        parent.state_root
-                    } else {
-                        qmdb.persisted_state_root(parent.number, parent.hash())?
-                    };
-                    let receipts = match node.provider.receipts_by_block(parent.hash().into())? {
-                        Some(receipts) => receipts,
-                        None if parent.transactions_root == alloy_consensus::EMPTY_ROOT_HASH => Vec::new(),
-                        None => return Err(eyre::eyre!("missing receipts for deferred recovery parent {}", parent.number)),
-                    };
-                    let (receipts_root, logs_bloom) = n42_engine_types::hotstuff_consensus::gov5_receipt_root_bloom(&receipts);
-                    let gas_used = receipts.last().map_or(0, |receipt| receipt.cumulative_gas_used);
-                    qmdb.remember_checkpoint_parent((head.number, head.hash()), parent.hash(), state_root)?;
-                    n42_engine_types::executed_fields::remember(parent.hash(),
-                        n42_engine_types::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used });
-                    info!(target: "reth::cli", block = parent.number, hash = %parent.hash(), "restored deferred execution parent result");
-                }
-                qmdb.initialize((info.best_number, head_hash))?;
-                info!(target: "reth::cli", block = info.best_number, %head_hash, "QMDB state ready");
-                // A lagging CL may re-submit persisted blocks below this EL's
-                // recovered frontier. Their deferred results are committed in
-                // canonical depth-D descendant headers, not in their own header.
-                // Resolve misses without replaying QMDB or evicting live results.
-                let historical_provider = node.provider.clone();
-                let historical_genesis = genesis.clone();
-                n42_engine_types::executed_fields::set_historical_reader(move |hash| {
-                    use reth_provider::DatabaseProviderFactory;
-                    let database = historical_provider.database_provider_ro().ok()?;
-                    let ancestor = database.header(*hash).ok()??;
-                    if ancestor.hash_slow() != *hash { return None; }
-                    if database.block_hash(ancestor.number).ok()? != Some(*hash) { return None; }
-                    if !reth_chainspec::qmdb::deferred_execution_active_at(&historical_genesis, ancestor.timestamp) {
-                        return Some(n42_engine_types::executed_fields::fields_from_child_header(&ancestor));
-                    }
-                    let depth = u8::try_from(reth_chainspec::qmdb::deferred_execution_depth_at(&historical_genesis, ancestor.timestamp)).ok()?;
-                    if !(1..=2).contains(&depth) { return None; }
-                    let mut descendants = Vec::with_capacity(usize::from(depth));
-                    for step in 1..=depth {
-                        descendants.push(database.header_by_number(ancestor.number.checked_add(u64::from(step))?).ok()??);
-                    }
-                    let carrying = descendants.last()?;
-                    if reth_chainspec::qmdb::deferred_execution_depth_at(&historical_genesis, carrying.timestamp) != u64::from(depth) { return None; }
-                    n42_engine_types::executed_fields::fields_from_descendants(&ancestor, &descendants, depth)
-                });
-                // With HotStuff-2 finality the canonical head is the committed
-                // block, and a build on an ancestor of it is a stale request
-                // that would revert the state tree below the head.
-                if n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(node.chain_spec().genesis()).is_ok() {
-                    qmdb.set_refuse_stale_builds(true);
-                }
-                // `N42_QMDB_READS=verify|on`: the read view answers or checks the
-                // providers' latest-state reads (docs/QMDB_UPGRADE_PLAN.md, stage 6).
-                if n42_qmdb_reth::register_state_reader(qmdb) {
-                    info!(target: "reth::cli", "QMDB read view registered as the state reader");
-                }
-                n42_qmdb_reth::check_hashed_tables_setting().map_err(|err| eyre::eyre!(err))?;
-                if n42_qmdb_reth::n42_state::hashed_tables_off() {
-                    info!(target: "reth::cli", "hashed state tables are not written; QMDB answers the latest state");
-                }
-                // The head's execution result, for the first header after a
-                // restart under deferred execution: before the fork the
-                // header carries it; past the fork the forest holds the root
-                // and the database the receipts.
-                {
-                    if reth_chainspec::qmdb::deferred_execution_active_at(genesis, head.timestamp) {
-                        let receipts = match node.provider.receipts_by_block(head.hash().into())? {
-                            Some(receipts) => receipts,
-                            None if head.transactions_root == alloy_consensus::EMPTY_ROOT_HASH => Vec::new(),
-                            None => return Err(eyre::eyre!("missing receipts for deferred recovery head {}", head.number)),
-                        };
-                        let (receipts_root, logs_bloom) = n42_engine_types::hotstuff_consensus::gov5_receipt_root_bloom(&receipts);
-                        let gas_used = receipts.last().map_or(0, |r| r.cumulative_gas_used);
-                        {
-                            let state_root = qmdb.root_of(&head.hash())
-                                .ok_or_else(|| eyre::eyre!("missing QMDB root for recovery head {}", head.number))?;
-                            n42_engine_types::executed_fields::remember(
-                                head.hash(),
-                                n42_engine_types::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used },
-                            );
-                        }
-                    } else {
-                        n42_engine_types::executed_fields::seed_from_header(head.hash(), head.header());
-                    }
-                }
-
-                // Follow the canonical chain so the persisted head keeps up with
-                // the database's. Lagging is tolerable — only the tip matters,
-                // and every tree in between was filed at validation.
-                let mut canonical = node.provider.subscribe_to_canonical_state();
-                let follower = qmdb.clone();
-                tokio::spawn(async move {
-                    loop {
-                        match canonical.recv().await {
-                            Ok(notification) => {
-                                let behind = canonical.len();
-                                if behind > 8 {
-                                    warn!(target: "reth::cli", behind, "canonical subscriber lag: qmdb head follower");
-                                }
-                                let tip = notification.tip().hash();
-                                if let Err(error) = follower.on_canonical(tip) {
-                                    error!(target: "reth::cli", %error, "QMDB head could not follow the canonical chain");
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                warn!(target: "reth::cli", skipped, "QMDB head follower fell behind canonical notifications");
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                });
             }
 
             // A chained build that waits for an ancestor to reach the engine is

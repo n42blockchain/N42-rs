@@ -364,9 +364,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 for qc in [&recovered.last_committed_qc, &recovered.locked_qc] {
                     if qc.view == 0 { continue; }
-                    let count = n42_h2_node::recovery_bodies::recover(
+                    let count = match n42_h2_node::recovery_bodies::recover(
                         &el, bodies, qc.block_hash, recovery_profile,
-                    ).await.map_err(std::io::Error::other)?;
+                    ).await {
+                        Ok(count) => count,
+                        Err(n42_h2_node::recovery_bodies::RecoveryError::MissingBody(hash)) => {
+                            // Keep the recovered lock and vote watermarks. The EL head
+                            // remains the driver's head until validated peer catchup.
+                            println!("recovery     : awaiting peer body {hash:#x} for durable QC view {}", qc.view);
+                            continue;
+                        }
+                        Err(error) => return Err(std::io::Error::other(error).into()),
+                    };
                     n42_h2_node::recovery_bodies::snapshot(&el, bodies, qc.block_hash, persisted, recovery_profile)
                         .await.map_err(std::io::Error::other)?;
                     println!("recovery     : replayed {count} blocks for durable QC view {}", qc.view);

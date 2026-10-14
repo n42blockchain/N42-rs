@@ -16,6 +16,29 @@ const MAX_BODY_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_REPLAY_BLOCKS: usize = 4096;
 const MAX_REPLAY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
+/// Missing local ancestry can be fetched from peers without changing vote watermarks.
+#[derive(Debug, thiserror::Error)]
+pub enum RecoveryError {
+    /// Valid ancestry is unavailable locally; peer synchronization may supply it.
+    #[error("certified block {0:#x} is absent from EL and durable recovery bodies")]
+    MissingBody(B256),
+    /// Invalid data, storage failures, and rejected EL execution remain fatal.
+    #[error("{0}")]
+    Invalid(String),
+}
+
+impl From<String> for RecoveryError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl From<&str> for RecoveryError {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.into())
+    }
+}
+
 /// A local write-ahead store, enabled for validators with durable consensus state.
 #[derive(Debug)]
 pub struct RecoveryBodies {
@@ -145,7 +168,7 @@ pub async fn recover<E: ExecutionLayer>(
     bodies: &RecoveryBodies,
     target: B256,
     profile: HeaderProfile,
-) -> Result<usize, String> {
+) -> Result<usize, RecoveryError> {
     let mut pending = Vec::new();
     let mut bytes = 0usize;
     let mut hash = target;
@@ -158,9 +181,7 @@ pub async fn recover<E: ExecutionLayer>(
         if pending.len() >= MAX_REPLAY_BLOCKS {
             return Err("recovery ancestry exceeds replay bound".into());
         }
-        let body = bodies.read(hash)?.ok_or_else(|| {
-            format!("certified block {hash:#x} is absent from EL and durable recovery bodies")
-        })?;
+        let body = bodies.read(hash)?.ok_or(RecoveryError::MissingBody(hash))?;
         bytes = bytes
             .checked_add(body.len())
             .ok_or("recovery byte count overflow")?;
@@ -187,7 +208,7 @@ pub async fn recover<E: ExecutionLayer>(
             .await
             .map_err(|e| e.to_string())?;
         if status.status != PayloadStatusEnum::Valid {
-            return Err(format!("EL rejected recovery payload: {:?}", status.status));
+            return Err(format!("EL rejected recovery payload: {:?}", status.status).into());
         }
         let choice = el
             .fork_choice_updated(ForkchoiceState {
@@ -201,7 +222,8 @@ pub async fn recover<E: ExecutionLayer>(
             return Err(format!(
                 "EL rejected recovery forkchoice: {:?}",
                 choice.payload_status.status
-            ));
+            )
+            .into());
         }
     }
     Ok(count)
@@ -416,11 +438,10 @@ mod tests {
         dir.store()
             .save(second, &bytes2, HeaderProfile::Ethereum)
             .unwrap();
-        assert!(
-            recover(&el, &dir.store(), second, HeaderProfile::Ethereum)
-                .await
-                .is_err()
-        );
+        assert!(matches!(
+            recover(&el, &dir.store(), second, HeaderProfile::Ethereum).await,
+            Err(RecoveryError::MissingBody(hash)) if hash == first
+        ));
         assert_eq!(
             el.calls().len(),
             1,
@@ -433,11 +454,10 @@ mod tests {
             new_payload_status: PayloadStatusEnum::Syncing,
             ..Default::default()
         });
-        assert!(
-            recover(&el, &dir.store(), second, HeaderProfile::Ethereum)
-                .await
-                .is_err()
-        );
+        assert!(matches!(
+            recover(&el, &dir.store(), second, HeaderProfile::Ethereum).await,
+            Err(RecoveryError::Invalid(message)) if message.contains("EL rejected recovery payload")
+        ));
         assert!(
             !el.calls()
                 .iter()

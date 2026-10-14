@@ -3859,3 +3859,25 @@ Stage bh (tree 49e175a22, the T16 set at 30 ms; `N42_FAR_AHEAD_BLOCKS=2` lets th
 | X11T16n, control | 4.15 | 4.29 | 4.29 | 382.0M |
 
 The five-block window is the first lever since stage an that moves the rate (10.114's model: the answer latency over the window), and its one good leg sets three records -- while holding 1,956 `an own block was still held when the bound was reached; its transactions are lost to the queue` warnings, i.e. the queue's hold of an own block's transactions is bounded for four blocks in flight and loses the fifth's on nearly every block. The three collapsed legs stall the builds instead (`sealed_at` 57 ms at p50 and 160 at p90 against 31 / 43, 921 full builds instead of ~1,970) with 201-240 `Sidechain block not found in TreeState`: a build asked on a parent the tree does not hold, the five-deep pipeline outrunning the import or the held-block loss starving it -- under diagnosis. Both the hold bound and the build-parent condition must follow the window before the lever can be adopted; the next stage runs the fix three times against two controls.
+
+### 10.132 loop351 stage bi — after the flood-start walk fix the five-block window no longer collapses, but it costs 3-4% of the sustained rate; X11+T16 stays the set
+
+Stage bi (tree 8341f00db = bh's tree plus e4893e175, the frame build refusing the lane walk while frames are arriving, and f24431dfd, `N42_OWN_HOLD_BLOCKS`, default 16; the F2 legs run it at 64) repeats the five-block vote window (`N42_FAR_AHEAD_BLOCKS=2 N42_PARENT_OUTPUTS_KEPT=6`) three times, adds a variant with the queue pruner on its own thread (`N42_QUEUE_PRUNE_THREAD=1`), and bookends them with two T16 controls at 30 ms pacing. Every leg started with a huge-page pool of 10.7-11.6k order-9 blocks (comparable).
+
+| leg | w1 | w2 | w3 | round |
+| --- | --- | --- | --- | --- |
+| X11T16o, control | 4.260 | 4.273 | 4.227 | 382.8M |
+| X11T16F2c | 4.247 | 3.980 | 4.087 | 369.4M |
+| X11T16F2d | 4.304 | 4.107 | 4.047 | 373.7M |
+| X11T16F2e | 4.287 | 4.073 | 4.013 | 371.2M |
+| X11T16F2PT (+ prune thread) | 4.345 | 4.033 | 3.973 | 370.6M |
+| X11T16p, control | 4.173 | 4.267 | 4.280 | 381.6M |
+
+What it says:
+
+1. **The collapse is gone.** In stage bh three of four F2 legs read 203-239M (10.131: the flood-start lane walk skipped 20-38k transactions per block for the rest of the leg). Here none of four did; the worst window is 3.97M. The per-leg counter `frame_walk_refused` read 0 on every leg, so the refusal itself never fired: the walk was not attempted while frames were arriving in any of these legs. The other difference against bh is the own-block hold bound (16 -> 64 for the F2 legs), and bh's collapsed legs did log the hold WARNs. Which of the two changes removed the collapse is not settled by this stage; it would take an F2 leg at the default hold bound. It is not worth a leg while the window is not adopted (3.).
+2. **The five-block window is not a net gain at 30 ms.** Window 1 is slightly higher than the controls (4.25-4.35M against 4.17-4.26M, the two highest window-1 readings of the stage are F2 legs), but windows 2 and 3 are lower in all four F2 legs (3.97-4.11M against 4.23-4.28M), and the round totals (369-374M) sit 2-4% under both controls (382M). Four legs agreeing in the same direction is not the 5% round-to-round noise of one leg. The 386.9M record of stage bh (10.131) is therefore the upper tail of this configuration, not its centre: the window buys answer latency in the first seconds and then loses it to whatever five blocks in flight cost in the steady state (more parent outputs retained, more blocks held in memory -- in-memory blocks max 13 against 11 -- and a pruner that is already 9-255 notifications behind).
+3. **The pruner thread does not recover windows 2-3.** F2PT reads the stage's best window 1 (4.345M) and its worst window 3 (3.973M); the round total is in the middle of the three plain F2 legs. The pruner's position on the tokio runtime is not what the five-block window loses.
+4. **Verdict.** X12 (= X11 + T16 + F2 + hold 64) is not adopted. The stable set stays X11 + T16 at 30 ms: six controls on this tree now read 380.4-383.1M (bd d/e, bg k, bh m/n, bi o/p), window 1 4.17-4.30M, with ~1/3 of legs at or above 4.3M in some window.
+
+Next (stage bj): the levers that remain on X11+T16 are pacing (25 and 28 ms; 10.114's model puts the median cycle at 37 ms, so 25 ms is expected to be answer-latency bound, but the plain set has never run under 30 ms) and the pruner thread on its own, each between 30 ms controls.

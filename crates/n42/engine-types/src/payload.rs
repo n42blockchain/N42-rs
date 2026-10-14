@@ -377,6 +377,7 @@ where
         )
         .map_err(PayloadBuilderError::other)?;
 
+    let restored_context_key = n42_qmdb_reth::restored_slots_execution_key(parent_header.hash(), n42_qmdb_reth::restored_slots_env_key(builder.evm_mut().block()), attributes.parent_beacon_block_root, attributes.withdrawals.as_deref(), []);
     let chain_spec = client.chain_spec();
 
     debug!(target: "payload_builder", id=%payload_id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, "building new payload");
@@ -547,7 +548,7 @@ where
                 builder.finish(&state_provider, Some((B256::ZERO, TrieUpdates::default())))?;
             let bundle = db.take_bundle();
             let restored = n42_qmdb_reth::restored_slots(n42_qmdb_reth::restored_slots_key(
-                parent_header.hash(),
+                restored_context_key,
                 outcome.block.body().transactions().map(|tx| *alloy_consensus::transaction::TxHashRef::tx_hash(tx)),
             ))
             .unwrap_or_default();

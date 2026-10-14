@@ -95,7 +95,7 @@ where
 {
     fn prepare(
         &self,
-        _ctx: StateRootJobContext<'_, N, P, Evm>,
+        ctx: StateRootJobContext<'_, N, P, Evm>,
     ) -> ProviderResult<PreparedStateRootJob<N>> {
         // No streaming capability: the whole bundle arrives at `finish`, and a
         // QMDB root is an ordered batch over the whole block anyway — there is
@@ -103,6 +103,7 @@ where
         Ok(PreparedStateRootJob::new(
             Box::new(QmdbStateRootJob {
                 state: self.state.clone(),
+                env_key: crate::restored_slots_env_key(&ctx.env().evm_env.block_env),
                 prague_at: self.prague_at.clone(),
             }),
             None,
@@ -111,6 +112,7 @@ where
 }
 
 struct QmdbStateRootJob {
+    env_key: alloy_primitives::B256,
     state: QmdbNodeState,
     prague_at: PragueAt,
 }
@@ -129,8 +131,9 @@ impl<N: NodePrimitives> StateRootJob<N> for QmdbStateRootJob {
         let header = block.header();
         // The slots the block changed and restored, as the executor saw them
         // go by; a block executed elsewhere (none is) would have none filed.
+        let context_key = crate::restored_slots_execution_key(header.parent_hash(), self.env_key, header.parent_beacon_block_root(), block.body().withdrawals().map(|w| w.as_slice()), []);
         let key = crate::restored_slots_key(
-            header.parent_hash(),
+            context_key,
             block.body().transactions().iter().map(|tx| *tx.tx_hash()),
         );
         let restored = crate::restored_slots(key).unwrap_or_default();

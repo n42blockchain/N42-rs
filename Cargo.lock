@@ -8188,6 +8188,7 @@ name = "n42-qmdb-reth"
 version = "2.1.5"
 dependencies = [
  "alloy-consensus 2.5.0",
+ "alloy-eips 2.5.0",
  "alloy-genesis",
  "alloy-primitives 1.7.3",
  "alloy-rpc-types-engine 2.5.0",
@@ -8210,6 +8211,7 @@ dependencies = [
  "reth-provider",
  "reth-storage-overlay",
  "reth-trie",
+ "revm",
  "revm-database",
  "revm-state",
  "serde",

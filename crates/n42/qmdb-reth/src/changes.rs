@@ -28,6 +28,9 @@
 use alloy_primitives::{address, Address, B256, U256};
 use n42_qmdb_state::{AccountState, BlockChanges};
 use revm_database::BundleState;
+use revm::context_interface::Block as EvmBlock;
+use alloy_eips::eip4895::Withdrawal;
+use alloy_primitives::keccak256;
 
 /// The leaves a block writes, from the bundle its execution left behind.
 pub fn changes_from_bundle(bundle: &BundleState) -> BlockChanges {
@@ -89,17 +92,58 @@ pub fn changes_from_bundle(bundle: &BundleState) -> BlockChanges {
 /// (`n42_engine_types::evm`), keyed by what both it and the root job know.
 pub type RestoredSlot = (Address, U256, U256);
 
-/// The key a block's restored slots are filed under: keccak of the parent
-/// hash and the committed transactions' hashes, in order — what the
-/// executor knows before the header exists, and what the root job knows
-/// from the block.
-pub fn restored_slots_key(parent_hash: B256, tx_hashes: impl IntoIterator<Item = B256>) -> B256 {
+/// Bind ordered transactions to the complete execution context.
+pub fn restored_slots_key(context_key: B256, tx_hashes: impl IntoIterator<Item = B256>) -> B256 {
     let mut preimage = Vec::with_capacity(32 * 64);
-    preimage.extend_from_slice(parent_hash.as_slice());
+    preimage.extend_from_slice(context_key.as_slice());
     for hash in tx_hashes {
         preimage.extend_from_slice(hash.as_slice());
     }
     alloy_primitives::keccak256(&preimage)
+}
+
+/// Bind restored writes to the block environment, not just parent and txs.
+/// Two speculative builds may execute identical transactions at different
+/// timestamps, coinbases or blob prices and restore different storage slots.
+pub fn restored_slots_env_key(block: &impl EvmBlock) -> B256 {
+    let mut bytes = Vec::with_capacity(256);
+    bytes.extend_from_slice(&block.number().to_be_bytes::<32>());
+    bytes.extend_from_slice(&block.timestamp().to_be_bytes::<32>());
+    bytes.extend_from_slice(block.beneficiary().as_slice());
+    bytes.extend_from_slice(&block.gas_limit().to_be_bytes());
+    bytes.extend_from_slice(&block.basefee().to_be_bytes());
+    bytes.extend_from_slice(&block.difficulty().to_be_bytes::<32>());
+    bytes.push(u8::from(block.prevrandao().is_some()));
+    bytes.extend_from_slice(block.prevrandao().unwrap_or_default().as_slice());
+    bytes.push(u8::from(block.blob_excess_gas().is_some()));
+    bytes.extend_from_slice(&block.blob_excess_gas().unwrap_or_default().to_be_bytes());
+    bytes.extend_from_slice(&block.blob_gasprice().unwrap_or_default().to_be_bytes());
+    bytes.extend_from_slice(&block.slot_num().to_be_bytes());
+    keccak256(bytes)
+}
+
+pub fn restored_slots_execution_key(
+    parent_hash: B256,
+    env_key: B256,
+    parent_beacon_root: Option<B256>,
+    withdrawals: Option<&[Withdrawal]>,
+    tx_hashes: impl IntoIterator<Item = B256>,
+) -> B256 {
+    let mut bytes = Vec::with_capacity(32 * 64);
+    bytes.extend_from_slice(b"N42 restored storage context v1");
+    bytes.extend_from_slice(parent_hash.as_slice());
+    bytes.extend_from_slice(env_key.as_slice());
+    bytes.push(u8::from(parent_beacon_root.is_some()));
+    bytes.extend_from_slice(parent_beacon_root.unwrap_or_default().as_slice());
+    let withdrawals = withdrawals.unwrap_or_default();
+    bytes.extend_from_slice(&(withdrawals.len() as u64).to_be_bytes());
+    for withdrawal in withdrawals {
+        // The index fields do not change the executed balance credit.
+        bytes.extend_from_slice(withdrawal.address.as_slice());
+        bytes.extend_from_slice(&withdrawal.amount.to_be_bytes());
+    }
+    for hash in tx_hashes { bytes.extend_from_slice(hash.as_slice()); }
+    keccak256(bytes)
 }
 
 /// Restored slots of recently executed blocks, by key. Bounded: a block is
@@ -396,4 +440,29 @@ mod tests {
         assert_eq!(bob.code_hash, KECCAK_EMPTY, "no code means the empty-code hash");
         assert!(!changes.storage.contains_key(&BOB));
     }
+}
+
+#[cfg(test)]
+mod execution_context_tests {
+    use super::*;
+    #[test]
+    fn execution_context_separates_same_parent_and_transactions() {
+        let parent = B256::repeat_byte(0xCC);
+        let tx = B256::repeat_byte(0xDD);
+        let env = revm::context::BlockEnv::default();
+        let key = |env: &revm::context::BlockEnv, beacon, withdrawals| {
+            let context = restored_slots_execution_key(parent, restored_slots_env_key(env), beacon, withdrawals, []);
+            restored_slots_key(context, [tx])
+        };
+        let original = key(&env, None, None);
+        let mut later = env.clone(); later.timestamp += U256::from(1);
+        assert_ne!(original, key(&later, None, None));
+        later = env.clone(); later.beneficiary = Address::repeat_byte(1);
+        assert_ne!(original, key(&later, None, None));
+        assert_ne!(original, key(&env, Some(B256::ZERO), None));
+        let rewards = [Withdrawal { index: 0, validator_index: 0, address: Address::repeat_byte(2), amount: 1 }];
+        assert_ne!(original, key(&env, None, Some(&rewards)));
+        assert_eq!(original, key(&env, None, Some(&[])));
+    }
+
 }

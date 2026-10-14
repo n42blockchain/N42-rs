@@ -17,7 +17,7 @@
 //! changes are seen with their values at the start of that transaction; the
 //! first sighting of a slot in a block is its value at the block's start,
 //! and that is the value gov5 rewrites when the slot ends up back there. The
-//! root job looks them up by parent hash and transaction hashes.
+//! root job looks them up by parent, execution context and transaction hashes.
 //!
 //! The same within one transaction: gov5's `stateObject.SetState` marks a
 //! slot dirty on the first `SSTORE` of a value other than the one it holds,
@@ -64,11 +64,11 @@ use alloy_evm::{
     },
     eth::{EthBlockExecutionCtx, EthBlockExecutorFactory, EthEvm, EthEvmContext, EthEvmFactory},
     precompiles::PrecompilesMap,
-    Database, EvmEnv, EvmFactory, RecoveredTx,
+    Database, Evm, EvmEnv, EvmFactory, RecoveredTx,
 };
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_engine::ExecutionData;
-use n42_qmdb_reth::{record_restored_slots, restored_slots_key, RestoredSlot};
+use n42_qmdb_reth::{record_restored_slots, restored_slots_key, restored_slots_env_key, restored_slots_execution_key, RestoredSlot};
 use reth_chainspec::ChainSpec;
 use reth_ethereum_primitives::{Block, EthPrimitives};
 use reth_evm::{
@@ -375,10 +375,10 @@ impl BlockExecutorFactory for TrackingBlockExecutorFactory {
         DB: StateDB,
         I: Inspector<EthEvmContext<DB>>,
     {
-        let parent_hash = ctx.parent_hash;
+        let context_key = restored_slots_execution_key(ctx.parent_hash, restored_slots_env_key(evm.block()), ctx.parent_beacon_block_root, ctx.withdrawals.as_deref(), []);
         TrackingExecutor {
             inner: self.inner.create_executor(evm, ctx),
-            parent_hash,
+            context_key,
             tx_hashes: Vec::new(),
             first_seen: HashMap::new(),
             pending: None,
@@ -414,7 +414,7 @@ pub struct EofRequired {
 #[derive(Debug)]
 pub struct TrackingExecutor<E> {
     inner: E,
-    parent_hash: B256,
+    context_key: B256,
     /// The committed transactions, in order.
     tx_hashes: Vec<B256>,
     /// Each slot changed so far, with its value at the block's start.
@@ -522,7 +522,7 @@ where
             .map(|((address, slot), original)| (address, slot, original))
             .collect();
         restored.sort_unstable();
-        record_restored_slots(restored_slots_key(self.parent_hash, self.tx_hashes.iter().copied()), restored);
+        record_restored_slots(restored_slots_key(self.context_key, self.tx_hashes.iter().copied()), restored);
         self.inner.finish()
     }
 
@@ -667,8 +667,31 @@ mod tests {
     }
 
     fn restored_for(block: &RecoveredBlock<Block>) -> Vec<RestoredSlot> {
-        let key = restored_slots_key(PARENT_HASH, block.body().transactions.iter().map(|tx| *tx.tx_hash()));
+        let config = N42EvmConfig::new(gov5_chain());
+        let env = config.evm_env(block.header()).unwrap();
+        let ctx = config.context_for_block(block.sealed_block()).unwrap();
+        let context_key = restored_slots_execution_key(PARENT_HASH, restored_slots_env_key(&env.block_env), ctx.parent_beacon_block_root, ctx.withdrawals.as_deref(), []);
+        let key = restored_slots_key(context_key, block.body().transactions.iter().map(|tx| *tx.tx_hash()));
         n42_qmdb_reth::restored_slots(key).map(|slots| slots.to_vec()).unwrap_or_default()
+    }
+
+    #[test]
+    fn speculative_timestamps_do_not_overwrite_restored_writes() {
+        // Store timestamp & 1, then restore slot zero. Odd timestamps create
+        // a dirty restored slot; even timestamps perform only unchanged stores.
+        let first = block_with(901, TxKind::Call(CONTRACT), Bytes::new());
+        let make = |timestamp| RecoveredBlock::new_unhashed(
+            Block::new(Header { timestamp, ..first.header().clone() }, first.body().clone()),
+            vec![SENDER],
+        );
+        let odd = make(1_800_000_001);
+        let even = make(1_800_000_002);
+        let accounts = || vec![(CONTRACT, contract(bytes!("42600116600055600060005500")), vec![(U256::ZERO, U256::ZERO)])];
+        execute(gov5_chain(), accounts(), &odd).unwrap();
+        assert_eq!(restored_for(&odd), vec![(CONTRACT, U256::ZERO, U256::ZERO)]);
+        execute(gov5_chain(), accounts(), &even).unwrap();
+        assert!(restored_for(&even).is_empty());
+        assert_eq!(restored_for(&odd), vec![(CONTRACT, U256::ZERO, U256::ZERO)]);
     }
 
     #[test]

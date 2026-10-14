@@ -275,6 +275,40 @@ fn main() {
                     .provider
                     .block_hash(info.best_number)?
                     .ok_or_else(|| eyre::eyre!("no hash for head block {}", info.best_number))?;
+                use reth_provider::{HeaderProvider, ReceiptProvider};
+                let head = node.provider.sealed_header(info.best_number)?
+                    .ok_or_else(|| eyre::eyre!("no header for head block {}", info.best_number))?;
+                if head.hash() != head_hash {
+                    return Err(eyre::eyre!("canonical head changed during QMDB startup"));
+                }
+                let chain_spec = node.chain_spec();
+                let genesis = chain_spec.genesis();
+                if info.best_number > 0 && reth_chainspec::qmdb::deferred_execution_depth_at(genesis, head.timestamp) == 2 {
+                    // The first child carries result(head-1), then the next
+                    // carries result(head). Restore the frontier before QMDB
+                    // initialisation can resume a compaction or migrate files.
+                    let parent = node.provider.sealed_header(info.best_number - 1)?
+                        .ok_or_else(|| eyre::eyre!("no header for deferred recovery parent {}", info.best_number - 1))?;
+                    if parent.hash() != head.parent_hash {
+                        return Err(eyre::eyre!("deferred recovery parent is not canonical"));
+                    }
+                    let state_root = if parent.number == 0 {
+                        parent.state_root
+                    } else {
+                        qmdb.persisted_state_root(parent.number, parent.hash())?
+                    };
+                    let receipts = match node.provider.receipts_by_block(parent.hash().into())? {
+                        Some(receipts) => receipts,
+                        None if parent.transactions_root == alloy_consensus::EMPTY_ROOT_HASH => Vec::new(),
+                        None => return Err(eyre::eyre!("missing receipts for deferred recovery parent {}", parent.number)),
+                    };
+                    let (receipts_root, logs_bloom) = n42_engine_types::hotstuff_consensus::gov5_receipt_root_bloom(&receipts);
+                    let gas_used = receipts.last().map_or(0, |receipt| receipt.cumulative_gas_used);
+                    qmdb.remember_checkpoint_parent((head.number, head.hash()), parent.hash(), state_root)?;
+                    n42_engine_types::executed_fields::remember(parent.hash(),
+                        n42_engine_types::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used });
+                    info!(target: "reth::cli", block = parent.number, hash = %parent.hash(), "restored deferred execution parent result");
+                }
                 qmdb.initialize((info.best_number, head_hash))?;
                 info!(target: "reth::cli", block = info.best_number, %head_hash, "QMDB state ready");
                 // With HotStuff-2 finality the canonical head is the committed
@@ -296,15 +330,18 @@ fn main() {
                 // restart under deferred execution: before the fork the
                 // header carries it; past the fork the forest holds the root
                 // and the database the receipts.
-                use reth_provider::{HeaderProvider, ReceiptProvider};
-                if let Some(head) = node.provider.sealed_header(info.best_number)? {
-                    let chain_spec = node.chain_spec();
-                    let genesis = chain_spec.genesis();
+                {
                     if reth_chainspec::qmdb::deferred_execution_active_at(genesis, head.timestamp) {
-                        let receipts = node.provider.receipts_by_block(head.hash().into())?.unwrap_or_default();
+                        let receipts = match node.provider.receipts_by_block(head.hash().into())? {
+                            Some(receipts) => receipts,
+                            None if head.transactions_root == alloy_consensus::EMPTY_ROOT_HASH => Vec::new(),
+                            None => return Err(eyre::eyre!("missing receipts for deferred recovery head {}", head.number)),
+                        };
                         let (receipts_root, logs_bloom) = n42_engine_types::hotstuff_consensus::gov5_receipt_root_bloom(&receipts);
                         let gas_used = receipts.last().map_or(0, |r| r.cumulative_gas_used);
-                        if let Some(state_root) = qmdb.root_of(&head.hash()) {
+                        {
+                            let state_root = qmdb.root_of(&head.hash())
+                                .ok_or_else(|| eyre::eyre!("missing QMDB root for recovery head {}", head.number))?;
                             n42_engine_types::executed_fields::remember(
                                 head.hash(),
                                 n42_engine_types::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used },

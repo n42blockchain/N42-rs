@@ -156,9 +156,19 @@ impl JsonRpcTransport for HttpTransport {
 /// where a wrong port or a proxy in the way shows up.
 pub fn parse_response(body: Value) -> Result<Value, TransportError> {
     if let Some(error) = body.get("error") {
-        let error: RpcError = serde_json::from_value(error.clone())
+        let mut decoded: RpcError = serde_json::from_value(error.clone())
             .map_err(|e| TransportError::Transport(format!("unparsable JSON-RPC error: {e}")))?;
-        return Err(TransportError::Rpc(error));
+        // Reth puts the underlying engine/provider failure in data.err.
+        // Retain it without changing the RPC code used for version fallback.
+        if let Some(detail) = error
+            .get("data")
+            .and_then(|data| data.get("err"))
+            .and_then(Value::as_str)
+        {
+            decoded.message.push_str(": ");
+            decoded.message.push_str(detail);
+        }
+        return Err(TransportError::Rpc(decoded));
     }
     body.get("result").cloned().ok_or_else(|| {
         TransportError::Transport("JSON-RPC response has neither result nor error".into())
@@ -168,6 +178,21 @@ pub fn parse_response(body: Value) -> Result<Value, TransportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_error_preserves_engine_detail_and_code() {
+        let error = parse_response(json!({"error": {
+            "code": -32603,
+            "message": "Server error",
+            "data": {"err": "parent state unavailable"},
+        }})).unwrap_err();
+        assert!(matches!(&error, TransportError::Rpc(e) if e.code == -32603));
+        assert!(error.to_string().contains("parent state unavailable"));
+        let error = parse_response(json!({"error": {
+            "code": -38005, "message": "Unsupported fork",
+        }})).unwrap_err();
+        assert_eq!(error.to_string(), "execution layer: Unsupported fork (code -38005)");
+    }
 
     #[test]
     fn a_result_comes_back_as_a_result() {

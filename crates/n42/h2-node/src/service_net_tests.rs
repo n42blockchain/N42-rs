@@ -471,6 +471,26 @@ async fn a_fetched_certified_child_pulls_its_missing_ancestry() {
 }
 
 #[tokio::test]
+async fn an_unnamed_held_child_fetches_its_parent_without_a_peer_height_hint() {
+    let (mut a, mut b) = pair(0).await;
+    let blocks = chain(2);
+    for (_, _, body) in &blocks {
+        b.el.new_payload(n42_h2_net::decode_block_rlp_raw(body, HeaderProfile::Ethereum).unwrap().execution_data()).await.unwrap();
+    }
+    a.svc.imported_height = Some(0);
+    a.svc.handle_direct_body(blocks[1].2.clone().into());
+    a.svc.held_bodies.push(blocks[1].0);
+    a.svc.peer_heights.clear();
+    let mut events = Vec::new();
+    within(a.svc.consider_catch_up(&mut events)).await;
+    assert!(a.svc.awaiting_bodies.contains(&blocks[0].0), "the parent is requested even without a range target");
+    assert!(a.svc.catch_up.is_none());
+    assert!(events.iter().any(|event| matches!(event, ServiceEvent::PayloadMissing { block_hash } if *block_hash == blocks[0].0)));
+    pump(&mut a, &mut b, (true, true), &mut events, |a, _, _| a.svc.driver.head() == blocks[1].0).await;
+    assert!(a.el.block_by_hash(blocks[0].0).await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn named_transactions_are_served_from_the_stored_whole_body() {
     let (mut a, mut b) = pair(0).await;
     let (hash, frame, txs) = compact_frame(5);

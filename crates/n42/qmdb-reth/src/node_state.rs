@@ -3098,8 +3098,49 @@ fn replay_delta_log<T: DeltaTarget>(
             })
         }
     };
-    let mut at = 0usize;
-    let mut good = 0u64;
+    // A lower height after a forward delta is a real branch rewind, not
+    // evidence that the checkpoint already covers it. Locate coverage using
+    // the checkpoint's exact identity instead of comparing with a moving head.
+    #[derive(serde::Deserialize)]
+    struct Prefix {
+        version: u32,
+        head_number: u64,
+        head_hash: B256,
+        base_next_slot: u64,
+        next_slot: u64,
+    }
+    let mut scan = 0usize;
+    let mut covered = 0usize;
+    let mut highest = None::<u64>;
+    while scan + RECORD_HEADER <= bytes.len() {
+        let len = u64::from_le_bytes(bytes[scan..scan + 8].try_into().expect("eight bytes"));
+        let Ok(len) = usize::try_from(len) else { break };
+        let start = scan + RECORD_HEADER;
+        let Some(end) = start.checked_add(len) else { break };
+        let Some(payload) = bytes.get(start..end) else { break };
+        if !digest_matches(&bytes[scan + 8..start], payload) { break; }
+        // The legacy codec deliberately permits trailing bytes. Decoding only
+        // this fixed prefix avoids allocating/copying large appended entries.
+        let Ok(prefix) = bincode::deserialize::<Prefix>(payload) else { break };
+        if prefix.version != ForestDelta::VERSION || prefix.base_next_slot > prefix.next_slot { break; }
+        highest = Some(highest.map_or(prefix.head_number, |head| head.max(prefix.head_number)));
+        if (prefix.head_number, prefix.head_hash, prefix.next_slot) ==
+            (state.head_number(), state.head_hash(), state.next_slot())
+        {
+            covered = end;
+        }
+        scan = end;
+    }
+    // A sealed segment wholly below the new checkpoint was folded by
+    // compaction before its deletion was interrupted. Current logs can start
+    // with a genuine rewind, so this exception belongs only to sealed files.
+    if covered == 0 && path.file_name().is_some_and(|name| name == SEALED_LOG_FILE)
+        && highest.is_some_and(|head| head <= state.head_number())
+    {
+        covered = scan;
+    }
+    let mut at = covered;
+    let mut good = covered as u64;
     while at + RECORD_HEADER <= bytes.len() {
         let len = u64::from_le_bytes(
             bytes[at..at + 8].try_into().expect("eight bytes"),
@@ -3120,17 +3161,6 @@ fn replay_delta_log<T: DeltaTarget>(
             warn!(target: "n42.qmdb", offset = at, "QMDB delta did not decode; ignoring the rest");
             break;
         };
-        // A delta the checkpoint already covers -- a sealed segment whose
-        // compaction wrote its checkpoint and then stopped before deleting
-        // the segment -- stands on an older cursor and lands no later than
-        // the state does; it is skipped. A delta on the wrong cursor that
-        // would move the state forward is the corruption `apply_delta`
-        // refuses.
-        if delta.base_next_slot != state.next_slot() && delta.head_number <= state.head_number() {
-            at = end;
-            good = at as u64;
-            continue;
-        }
         state.apply(&delta)?;
         at = end;
         good = at as u64;
@@ -3687,6 +3717,47 @@ mod tests {
     /// first four bytes of a keccak. A node that upgrades has to replay it:
     /// rejecting it would drop every block since the checkpoint, leave the
     /// forest behind the database head, and refuse to start.
+    #[test]
+    fn replay_applies_branch_rewinds_instead_of_treating_them_as_checkpoint_coverage() {
+        use n42_twig_core::qmdb_compat::{QmdbEntrySnapshot, QmdbSnapshot};
+        let entry = |key, value| QmdbEntrySnapshot { key: [key; 32], value: vec![value], active: true };
+        let checkpoint = ForestSnapshot {
+            version: ForestSnapshot::VERSION, head_number: 1, head_hash: B256::repeat_byte(1),
+            tree: QmdbSnapshot { next_slot: 2, entries: vec![entry(1, 1), entry(2, 1)] },
+        };
+        let delta = |number, hash, base, appended: Vec<QmdbEntrySnapshot>, changed| ForestDelta {
+            version: ForestDelta::VERSION, head_number: number, head_hash: B256::repeat_byte(hash),
+            base_next_slot: base, next_slot: base + appended.len() as u64, appended, changed,
+        };
+        let old = delta(2, 2, 2, vec![entry(1, 2), entry(3, 2)], vec![(0, false)]);
+        let rewind = delta(1, 3, 2, vec![], vec![(0, true)]);
+        let replacement = delta(2, 4, 2, vec![entry(3, 3), entry(1, 3)], vec![(0, false)]);
+        let next = delta(3, 5, 4, vec![entry(3, 4)], vec![(2, false)]);
+        let dir = scratch("replay-rewind");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DELTA_LOG_FILE);
+        let bytes: Vec<_> = [&old, &rewind, &replacement, &next].into_iter()
+            .flat_map(|delta| frame_delta(delta).unwrap()).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let (replayed, good) = replay_delta_log(&path, checkpoint.clone(), Some(next.head_hash)).unwrap();
+        let mut expected = checkpoint;
+        for delta in [&rewind, &replacement, &next] { expected.apply_delta(delta).unwrap(); }
+        assert_eq!(replayed.tree, expected.tree);
+        assert_eq!(good, bytes.len() as u64);
+        assert_eq!(QmdbForest::from_snapshot(&replayed).unwrap().root(), QmdbForest::from_snapshot(&expected).unwrap().root());
+
+        // A replacement at the checkpoint height must also be applied when
+        // it is the first record; height alone is never coverage evidence.
+        let mut covered = expected;
+        let rewrite = delta(3, 6, 4, vec![entry(4, 9)], vec![(2, false)]);
+        let bytes = frame_delta(&rewrite).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let (replayed, _) = replay_delta_log(&path, covered.clone(), Some(rewrite.head_hash)).unwrap();
+        covered.apply_delta(&rewrite).unwrap();
+        assert_eq!(replayed.tree, covered.tree);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_keccak_framed_delta_log_still_replays() {
         let dir = scratch("keccak-log");

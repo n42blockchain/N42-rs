@@ -249,6 +249,8 @@ pub async fn recover<E: ExecutionLayer>(
 
 /// Bootstraps a validator upgraded while its EL still holds unpersisted blocks.
 /// Starting a journal only at the next proposal would leave a gap behind it.
+/// The caller must establish the starting hash in the EL through recovery first;
+/// this copies missing bodies and is not a replacement for execution validation.
 pub async fn snapshot<E: ExecutionLayer>(
     el: &E,
     bodies: &RecoveryBodies,
@@ -256,12 +258,38 @@ pub async fn snapshot<E: ExecutionLayer>(
     persisted: u64,
     profile: HeaderProfile,
 ) -> Result<(), String> {
+    let mut child_number = None;
     for _ in 0..MAX_REPLAY_BLOCKS {
+        // Recovery has already validated this ancestry through the EL. Existing
+        // durable bodies need no full-transaction RPC round trip merely to find
+        // their parent, especially when several validators share one EL.
+        if let Some(body) = bodies.read(hash)? {
+            let (actual, header) = n42_h2_consensus::decode_block_body_header(&body, profile)
+                .map_err(|e| e.to_string())?;
+            if actual != hash {
+                return Err("recovery snapshot body hash mismatch".into());
+            }
+            if child_number.is_some_and(|child| header.number.checked_add(1) != Some(child)) {
+                return Err("non-contiguous recovery snapshot ancestry".into());
+            }
+            if header.number <= persisted {
+                return Ok(());
+            }
+            child_number = Some(header.number);
+            hash = header.parent_hash;
+            continue;
+        }
         let block = el
             .block_by_hash(hash)
             .await
             .map_err(|e| e.to_string())?
             .ok_or("EL lost a block during recovery snapshot")?;
+        if block.header.hash_slow() != hash {
+            return Err("recovery snapshot EL header hash mismatch".into());
+        }
+        if child_number.is_some_and(|child| block.header.number.checked_add(1) != Some(child)) {
+            return Err("non-contiguous recovery snapshot ancestry".into());
+        }
         if block.header.number <= persisted {
             return Ok(());
         }
@@ -282,6 +310,7 @@ pub async fn snapshot<E: ExecutionLayer>(
             );
             bodies.save(hash, &body, profile)?;
         }
+        child_number = Some(block.header.number);
         hash = block.header.parent_hash;
     }
     Err("recovery snapshot exceeds ancestry bound".into())
@@ -379,6 +408,44 @@ mod tests {
             .set_len(MAX_BODY_BYTES + 1)
             .unwrap();
         assert!(dir.store().read(hash).is_err());
+    }
+
+    #[tokio::test]
+    async fn snapshot_uses_existing_durable_headers_without_full_block_rpc() {
+        let dir = Scratch::new();
+        let store = dir.store();
+        let mut parent = B256::ZERO;
+        for number in 0..=3 {
+            let (hash, bytes, _) = body(number, parent);
+            store.save(hash, &bytes, HeaderProfile::Ethereum).unwrap();
+            parent = hash;
+        }
+        // Any lookup on this empty EL returns None: the previous RPC-first
+        // snapshot fails here even though the complete journal is present.
+        snapshot(
+            &MockExecutionLayer::new(),
+            &store,
+            parent,
+            0,
+            HeaderProfile::Ethereum,
+        )
+        .await
+        .unwrap();
+        let (wrong_hash, wrong_body, _) = body(4, parent);
+        std::fs::write(store.path(parent), wrong_body).unwrap();
+        assert_ne!(wrong_hash, parent);
+        assert!(
+            snapshot(
+                &MockExecutionLayer::new(),
+                &store,
+                parent,
+                0,
+                HeaderProfile::Ethereum
+            )
+            .await
+            .unwrap_err()
+            .contains("body hash mismatch")
+        );
     }
 
     #[tokio::test]

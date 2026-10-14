@@ -457,7 +457,10 @@ fn close(entry: &mut BundleAccount, mut contract: impl FnMut(B256, &Bytecode)) -
 /// through a table of positions (four bytes a slot) built at the hand-over.
 #[derive(Clone)]
 pub struct LaneOutput {
-    plan: std::sync::Arc<crate::one_probe::Resolved>,
+    /// The lane's addresses, by lane id (shared with the plan's lanes; the
+    /// plan itself is not kept, so a frozen output never holds a plan's
+    /// resolve and dense output alive past the ring).
+    addresses: std::sync::Arc<[Address]>,
     batch: usize,
     work: Vec<Work>,
     /// Lane ids of the changed entries, in lane order: the output's
@@ -466,6 +469,8 @@ pub struct LaneOutput {
     /// Open addressing over the kept addresses: position + 1, 0 empty.
     slots: Vec<u32>,
     empty: Bytecode,
+    /// Counted in [`crate::one_probe::retained`].
+    _retained: crate::one_probe::Retained,
 }
 
 impl std::fmt::Debug for LaneOutput {
@@ -487,9 +492,11 @@ fn lane_slot(address: &Address, mask: usize) -> usize {
 }
 
 impl LaneOutput {
-    fn new(plan: std::sync::Arc<crate::one_probe::Resolved>, batch: usize, work: Vec<Work>, kept: Vec<u32>, empty: Bytecode) -> Self {
-        let mut out = Self { plan, batch, work, kept, slots: Vec::new(), empty };
-        let size = (out.kept.len() * 2).next_power_of_two().max(8);
+    fn new(addresses: std::sync::Arc<[Address]>, batch: usize, work: Vec<Work>, kept: Vec<u32>, empty: Bytecode) -> Self {
+        let size = (kept.len() * 2).next_power_of_two().max(8);
+        let bytes = work.capacity() * size_of::<Work>() + kept.capacity() * 4 + size * 4;
+        let retained = crate::one_probe::Retained::new(&crate::one_probe::LANE_OUTPUT_BYTES, bytes as u64);
+        let mut out = Self { addresses, batch, work, kept, slots: Vec::new(), empty, _retained: retained };
         let mut slots = vec![0u32; size];
         let addresses = out.lane_addresses();
         for (pos, &lid) in out.kept.iter().enumerate() {
@@ -505,7 +512,7 @@ impl LaneOutput {
     }
 
     fn lane_addresses(&self) -> &[Address] {
-        self.plan.lanes.as_ref().and_then(|lanes| lanes.lane(self.batch)).unwrap_or_default()
+        &self.addresses
     }
 
     /// The accounts held.
@@ -645,8 +652,8 @@ impl<G: Database> BatchState<G> {
             bundle.contracts.insert(KECCAK_EMPTY, lane.empty.clone());
         }
         let work = std::mem::take(&mut lane.work);
-        let plan = std::sync::Arc::clone(&lane.plan);
-        let out = LaneOutput::new(plan, lane.batch, work, kept, lane.empty.clone());
+        let addresses = lanes.and_then(|lanes| lanes.lane_shared(lane.batch)).unwrap_or_else(|| std::sync::Arc::from(Vec::new()));
+        let out = LaneOutput::new(addresses, lane.batch, work, kept, lane.empty.clone());
         (bundle, Some(out))
     }
 }

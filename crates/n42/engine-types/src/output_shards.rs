@@ -3657,6 +3657,89 @@ mod lane_tests {
         )
     }
 
+    /// `N42_ONE_PROBE=4` over many blocks: 50 consecutive plans through one
+    /// persistent table, each block's lane batches handed over as lanes and
+    /// frozen, its view over the ring's prefix, its dense output recorded
+    /// into a ring of depth `D` and its ids into the table, its frozen output
+    /// kept for `KEEP > D` blocks (as the chain keeps a block's post-state).
+    /// What a block leaves behind is bounded: its plan's resolve is freed
+    /// with the build even while its frozen lanes live (a lane output keeps
+    /// only its lane's addresses), its dense output once the ring evicts it,
+    /// and the table keeps at most the depth's plans.
+    #[test]
+    fn the_one_probe_footprint_is_flat_over_many_blocks() {
+        use crate::one_probe::{BuildView, DenseOut, Ring};
+        use std::{collections::VecDeque, sync::Weak};
+        const D: usize = 4;
+        const KEEP: usize = 8;
+        const BLOCKS: u32 = 50;
+        let hash = |i: u32| B256::from(U256::from(u64::from(i) + 1));
+        let table = Rolling::new(D as u64);
+        let mut ring = Ring::new(D);
+        let mut frozen_kept: VecDeque<FrozenShards> = VecDeque::new();
+        let mut plans: Vec<Weak<Resolved>> = Vec::new();
+        let mut outs: Vec<Weak<DenseOut>> = Vec::new();
+        let mut prefixes = 0usize;
+        for n in 0..BLOCKS {
+            // 30 senders, rotating, 4 transfers each into a moving window of
+            // recipients: consecutive blocks share most accounts.
+            let mut keys = Vec::new();
+            let mut groups = Vec::new();
+            for s in 0..30u32 {
+                let sender = addr((n * 5 + s) % 90);
+                let group: Vec<usize> = (0..4u32)
+                    .map(|k| {
+                        keys.push((sender, addr(100_000 + (n * 11 + s * 7 + k * 13) % 400)));
+                        keys.len() - 1
+                    })
+                    .collect();
+                groups.push(group);
+            }
+            let plan = Arc::new(resolve_with(&table, &keys).with_lanes(&groups, 4).with_lane_output(true));
+            let mut parent = CacheDB::new(EmptyDB::default());
+            for (sender, _) in &keys {
+                parent.insert_account_info(*sender, AccountInfo { balance: U256::from(1_000_000), ..Default::default() });
+            }
+            parent.insert_account_info(addr(COINBASE), AccountInfo { balance: U256::from(1), ..Default::default() });
+            // The build: its view over the ring's verified prefix, its lane
+            // batches handed over as lanes, the frozen output.
+            let (grandparent, parent_built) = (n.checked_sub(2).map_or(B256::ZERO, hash), n.checked_sub(1).map(hash));
+            let view = BuildView::new(Arc::clone(&plan), ring.prefix(grandparent, parent_built, plan.seq), addr(COINBASE));
+            prefixes += view.prefix_depth();
+            let out = shards(true, false);
+            for b in 0..plan.lanes.as_ref().expect("lanes").batches() {
+                let (bundle, lane) = run(&keys, &plan, &parent, b).take_output();
+                out.add_lane(bundle, lane.expect("a lane"));
+            }
+            let frozen = out.freeze();
+            assert!(frozen.has_lanes(), "block {n}: lane outputs");
+            // The block enters the ring and the table.
+            assert!(ring.record(&view, parent_built.unwrap_or(B256::ZERO), parent_built, hash(n), vec![addr(COINBASE)]), "block {n}");
+            table.record(plan.seq, &plan.ids());
+            plans.push(Arc::downgrade(&plan));
+            outs.push(Arc::downgrade(&plan.out));
+            drop((view, plan));
+            frozen_kept.push_back(frozen);
+            if frozen_kept.len() > KEEP {
+                frozen_kept.pop_front();
+            }
+            // Bounded: no resolve outlives its build, no dense output its
+            // ring slot, whatever the frozen outputs still kept.
+            let n = n as usize;
+            assert_eq!(plans.iter().filter(|p| p.strong_count() > 0).count(), 0, "block {n}: a plan's resolve held by its frozen lanes");
+            for (i, out) in outs.iter().enumerate() {
+                assert_eq!(out.strong_count() > 0, i + D > n, "block {n}: block {i}'s dense output (ring depth {D})");
+            }
+            assert!(ring.len() <= D);
+            assert_eq!(table.pending(), 0, "block {n}: every recorded plan left the pending list");
+            assert!(table.len() <= (D + 1) * 2 * keys.len(), "block {n}: the table swept to its depth ({})", table.len());
+        }
+        assert!(prefixes > 0, "the builds read through their prefixes");
+        // The frozen outputs still read every lane account.
+        let last = frozen_kept.back().expect("a frozen output");
+        assert!(last.accounts() > 0);
+    }
+
     /// Lane batches handed over as lanes (all of them, or every other one
     /// beside map batches) freeze to the output their bundles freeze to,
     /// with the live index and without, deferred shards or not; the early

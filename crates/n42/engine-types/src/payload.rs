@@ -4368,6 +4368,9 @@ where
                     // Blocks built without their view (the resolve late)
                     // and recorded from their post-state, cumulative.
                     one_probe_late_records = crate::one_probe::late_records(),
+                    // The one-probe path's live per-plan bytes (resolves,
+                    // dense outputs, lane outputs): flat in a healthy leg.
+                    one_probe_retained_mb = crate::one_probe::retained_bytes() >> 20,
                     par_mlp_k,
                     par_mlp_hints,
                     par_fold_ms,

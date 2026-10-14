@@ -230,7 +230,9 @@ impl Rolling {
     /// it not yet merged, newest first, with their ids (waited for when a
     /// plan resolving at the same time has not finished its dedupe -- with
     /// the queue's one plan at a time, never).
-    fn begin(&self) -> (u64, PendingGuard, u64, Vec<(u64, Arc<PlanIds>)>) {
+    ///
+    /// It may block, so it never runs on a rayon worker (see [`Begun`]).
+    fn begin(&self) -> Begun {
         let slot = Arc::new(PendingIds::default());
         let (seq, merged, before) = {
             let mut order = self.order.lock().unwrap_or_else(PoisonError::into_inner);
@@ -243,7 +245,7 @@ impl Rolling {
             (seq, order.merged_max, before)
         };
         let newer = before.into_iter().filter_map(|(s, p)| p.0.wait().clone().map(|ids| (s, ids))).collect();
-        (seq, PendingGuard(slot), merged, newer)
+        Begun { seq, slot: PendingGuard(slot), merged, newer }
     }
 
     /// `address`'s source for plan `seq`: the table's entry (`table`, its
@@ -311,6 +313,37 @@ impl Rolling {
     }
 }
 
+/// A plan begun in the table ([`Rolling::begin`]): its sequence number, its
+/// pending slot, the newest finished merge and the plans pending before it
+/// with their ids.
+///
+/// Beginning waits for the plans before it to finish their dedupe, so it is
+/// done on the caller's thread, never inside a rayon pool: a worker blocked
+/// in that wait could be the one whose stack holds the plan it waits for (a
+/// worker waiting in a `join` steals a later hook's `install`), and the
+/// plan-body pool then never resolves again -- every later hook blocks with
+/// its body's inputs held (loop351 stage be: 115 GB).
+#[derive(Debug)]
+pub struct Begun {
+    seq: u64,
+    slot: PendingGuard,
+    merged: u64,
+    newer: Vec<(u64, Arc<PlanIds>)>,
+}
+
+impl std::fmt::Debug for PendingGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PendingGuard")
+    }
+}
+
+impl Rolling {
+    /// [`Self::begin`] for a resolve run later ([`resolve_begun`]).
+    pub fn begin_plan(&self) -> Begun {
+        self.begin()
+    }
+}
+
 /// What a resolve reads besides the table: the newest finished merge when it
 /// began, and the plans then pending before it, newest first, with their ids.
 #[derive(Clone, Copy)]
@@ -342,6 +375,8 @@ pub struct Resolved {
     /// build that takes the plan ([`DenseOut`]); made (and its pages
     /// touched) here, on the plan-body pool.
     pub(crate) out: Arc<DenseOut>,
+    /// This plan's heap, counted in [`retained_bytes`].
+    retained: Retained,
     /// `N42_ONE_PROBE=2`: the plan's batches and their lanes, when the plan
     /// knew the partition and the dispatch's width ([`Lanes`]).
     pub lanes: Option<Lanes>,
@@ -400,6 +435,9 @@ impl Resolved {
     pub fn with_lanes(mut self, groups: &[Vec<usize>], width: usize) -> Self {
         let at = std::time::Instant::now();
         self.lanes = Lanes::make(&self, groups, width);
+        if let Some(lanes) = self.lanes.as_ref() {
+            self.retained.add(lanes.heap_bytes() as u64);
+        }
         self.resolve_us += at.elapsed().as_micros() as u64;
         self
     }
@@ -435,9 +473,20 @@ struct ShardIds {
 /// then one record a transaction. The plan is pending in the table from
 /// here until its block is recorded ([`Rolling::record`]).
 pub fn resolve_with(table: &Rolling, keys: &[(Address, Address)]) -> Resolved {
-    use rayon::prelude::*;
     let at = std::time::Instant::now();
-    let (seq, slot, merged, newer) = table.begin();
+    let begun = table.begin();
+    resolve_begun_at(table, begun, keys, at)
+}
+
+/// [`resolve_with`] for a plan begun already ([`Rolling::begin_plan`], on the
+/// caller's thread): the part that runs on the current rayon pool.
+pub fn resolve_begun(table: &Rolling, begun: Begun, keys: &[(Address, Address)]) -> Resolved {
+    resolve_begun_at(table, begun, keys, std::time::Instant::now())
+}
+
+fn resolve_begun_at(table: &Rolling, begun: Begun, keys: &[(Address, Address)], at: std::time::Instant) -> Resolved {
+    use rayon::prelude::*;
+    let Begun { seq, slot, merged, newer } = begun;
     // Occurrence `2i` is transaction i's sender, `2i + 1` its recipient.
     let buckets: Vec<Vec<Vec<u32>>> = keys
         .par_chunks(16_384)
@@ -521,7 +570,19 @@ pub fn resolve_with(table: &Rolling, keys: &[(Address, Address)]) -> Resolved {
         })
         .collect();
     let out = Arc::new(DenseOut::new(accounts as usize));
-    Resolved { seq, txs, ids, shared, accounts: accounts as usize, resolve_us: at.elapsed().as_micros() as u64, out, lanes: None }
+    let ids_bytes: usize = ids.iter().map(|(_, map)| map.capacity() * (size_of::<Address>() + size_of::<u32>() + 1)).sum();
+    let bytes = txs.capacity() * size_of::<PlanTx>() + shared.capacity() + ids_bytes;
+    Resolved {
+        seq,
+        txs,
+        ids,
+        shared,
+        accounts: accounts as usize,
+        resolve_us: at.elapsed().as_micros() as u64,
+        out,
+        lanes: None,
+        retained: Retained::new(&RESOLVED_BYTES, bytes as u64),
+    }
 }
 
 /// The process's address table, made at the first plan.
@@ -551,15 +612,30 @@ pub fn resolve(pool: &rayon::ThreadPool, keys: &[(Address, Address)], groups: Op
     if stage() == 0 || keys.is_empty() || keys.len() > u32::MAX as usize / 2 {
         return None;
     }
-    let table = rolling();
     let width = (stage() >= 2).then(|| crate::parallel_transfer::lane_width(crate::parallel_transfer::Dispatch::from_env())).flatten();
-    Some(Arc::new(pool.install(|| {
-        let resolved = resolve_with(table, keys);
-        match (groups, width) {
-            (Some(groups), Some(width)) => resolved.with_lanes(groups, width).with_fold(stage() >= 3).with_lane_output(stage() >= 4),
-            _ => resolved,
+    Some(Arc::new(resolve_in(rolling(), pool, keys, groups.zip(width), stage())))
+}
+
+/// [`resolve`] against `table` at stage `stage`, with the lanes for
+/// `lanes` (the sender partition and the dispatch width) at stage 2 and up.
+/// The plan is begun here, on the caller's thread, and only the rest runs
+/// on `pool`: the wait for the plans before it must not hold a worker
+/// ([`Begun`]).
+pub fn resolve_in(
+    table: &Rolling,
+    pool: &rayon::ThreadPool,
+    keys: &[(Address, Address)],
+    lanes: Option<(&[Vec<usize>], usize)>,
+    stage: u8,
+) -> Resolved {
+    let begun = table.begin();
+    pool.install(|| {
+        let resolved = resolve_begun(table, begun, keys);
+        match lanes.filter(|_| stage >= 2) {
+            Some((groups, width)) => resolved.with_lanes(groups, width).with_fold(stage >= 3).with_lane_output(stage >= 4),
+            None => resolved,
         }
-    })))
+    })
 }
 
 /// A plan's resolve run behind its body ([`resolve_behind`]): empty until
@@ -698,6 +774,63 @@ impl Resolved {
     }
 }
 
+/// Live bytes of the one-probe path's per-plan structures, by kind: the
+/// plans' resolves (records, ids, lanes), their dense outputs, and the
+/// stage-4 lane outputs. Steady at about the ring's depth of dense outputs
+/// plus the plans and lane outputs the chain still holds; growth with the
+/// block count is a leak ([`retained_bytes`], `one_probe_retained_mb`).
+static RESOLVED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// See [`RESOLVED_BYTES`].
+static DENSE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// See [`RESOLVED_BYTES`].
+pub(crate) static LANE_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes counted in one of the live totals ([`RESOLVED_BYTES`]) while the
+/// value holding it lives: added when made or cloned, taken off when dropped.
+#[derive(Debug)]
+pub(crate) struct Retained {
+    kind: &'static AtomicU64,
+    bytes: u64,
+}
+
+impl Retained {
+    /// `bytes` counted in `kind`.
+    pub(crate) fn new(kind: &'static AtomicU64, bytes: u64) -> Self {
+        kind.fetch_add(bytes, Ordering::Relaxed);
+        Self { kind, bytes }
+    }
+
+    /// `more` bytes counted besides.
+    pub(crate) fn add(&mut self, more: u64) {
+        self.kind.fetch_add(more, Ordering::Relaxed);
+        self.bytes += more;
+    }
+}
+
+impl Clone for Retained {
+    fn clone(&self) -> Self {
+        Self::new(self.kind, self.bytes)
+    }
+}
+
+impl Drop for Retained {
+    fn drop(&mut self) {
+        self.kind.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// The one-probe path's live bytes: (plans' resolves, dense outputs, lane
+/// outputs).
+pub fn retained() -> (u64, u64, u64) {
+    (RESOLVED_BYTES.load(Ordering::Relaxed), DENSE_BYTES.load(Ordering::Relaxed), LANE_OUTPUT_BYTES.load(Ordering::Relaxed))
+}
+
+/// The one-probe path's live bytes in all ([`retained`]).
+pub fn retained_bytes() -> u64 {
+    let (resolved, dense, lanes) = retained();
+    resolved + dense + lanes
+}
+
 /// Blocks recorded into the ring by [`record_late`], cumulative.
 static LATE_RECORDS: AtomicU64 = AtomicU64::new(0);
 
@@ -786,7 +919,7 @@ pub struct Lanes {
     /// Transaction -> (sender's lane id, recipient's lane id).
     lid: Vec<(u32, u32)>,
     /// Batch -> its lane's addresses, by lane id.
-    lane_addrs: Vec<Vec<Address>>,
+    lane_addrs: Vec<Arc<[Address]>>,
     /// Batch -> its lane's dense ids, by lane id.
     lane_bids: Vec<Vec<u32>>,
     /// `N42_ONE_PROBE=3`: each batch's values of the accounts several
@@ -884,7 +1017,7 @@ impl Lanes {
         let mut lane_bids = Vec::with_capacity(lanes.len());
         let mut batch_txs = Vec::with_capacity(lanes.len());
         for (addrs, bids, txs) in lanes {
-            lane_addrs.push(addrs);
+            lane_addrs.push(Arc::from(addrs));
             lane_bids.push(bids);
             batch_txs.push(txs);
         }
@@ -914,7 +1047,7 @@ impl Lanes {
 
     /// The accounts of all lanes.
     pub fn accounts(&self) -> usize {
-        self.lane_addrs.iter().map(Vec::len).sum()
+        self.lane_addrs.iter().map(|lane| lane.len()).sum()
     }
 
     /// Reads answered from lanes' loaded entries so far.
@@ -957,7 +1090,24 @@ impl Lanes {
 
     /// Batch `b`'s lane addresses, by lane id.
     pub fn lane(&self, b: usize) -> Option<&[Address]> {
-        self.lane_addrs.get(b).map(Vec::as_slice)
+        self.lane_addrs.get(b).map(|lane| &**lane)
+    }
+
+    /// Batch `b`'s lane addresses, shared: what a lane output keeps of the
+    /// plan, so a block's frozen output does not hold the plan's resolve
+    /// (its ids, records, lanes and dense output) alive.
+    pub fn lane_shared(&self, b: usize) -> Option<Arc<[Address]>> {
+        self.lane_addrs.get(b).cloned()
+    }
+
+    /// The heap the lanes hold, roughly.
+    fn heap_bytes(&self) -> usize {
+        self.batch_of.capacity() * 4
+            + self.lid.capacity() * 8
+            + self.batch_txs.capacity() * size_of::<usize>()
+            + self.lane_addrs.iter().map(|lane| lane.len() * size_of::<Address>()).sum::<usize>()
+            + self.lane_bids.iter().map(|lane| lane.capacity() * 4).sum::<usize>()
+            + self.cross.capacity()
     }
 
     /// Batch `b`'s lane dense ids, by lane id.
@@ -1075,13 +1225,15 @@ impl Dense {
 /// 147,000 accounts). Only accounts one batch owns are written; the rest stay
 /// empty and are read through the chain.
 #[derive(Debug)]
-pub struct DenseOut(Box<[Dense]>);
+pub struct DenseOut(Box<[Dense]>, #[allow(dead_code)] Retained);
 
 impl DenseOut {
     /// `accounts` empty entries, made and touched on the current rayon pool.
     pub fn new(accounts: usize) -> Self {
         use rayon::prelude::*;
-        Self((0..accounts).into_par_iter().with_min_len(4096).map(|_| Dense::default()).collect::<Vec<_>>().into_boxed_slice())
+        let entries = (0..accounts).into_par_iter().with_min_len(4096).map(|_| Dense::default()).collect::<Vec<_>>().into_boxed_slice();
+        let bytes = (entries.len() * size_of::<Dense>()) as u64;
+        Self(entries, Retained::new(&DENSE_BYTES, bytes))
     }
 
     /// Entry `id`.
@@ -1477,6 +1629,47 @@ mod tests {
         let mut bytes = [0u8; 20];
         bytes[12..].copy_from_slice(&n.to_be_bytes());
         Address::new(bytes)
+    }
+
+    /// A plan resolving while an earlier plan's dedupe has not finished
+    /// waits off the pool: with a one-thread pool, the earlier plan still
+    /// gets the worker and both finish (before the begin left the pool, the
+    /// later plan's wait held the only worker and neither ever did -- in a
+    /// fleet leg a worker waiting in a `join` stole a later hook's resolve
+    /// and the plan-body pool stopped for good, every later hook holding its
+    /// body's inputs: loop351 stage be's 115 GB).
+    #[test]
+    fn a_resolve_waits_for_an_earlier_plan_off_the_pool() {
+        let table = Arc::new(Rolling::new(16));
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().expect("a pool"));
+        let first_keys: Vec<(Address, Address)> = (0..64).map(|i| (a(i), a(1000 + i))).collect();
+        let second_keys: Vec<(Address, Address)> = (0..64).map(|i| (a(i), a(2000 + i))).collect();
+        // The first plan begun, its dedupe not yet run.
+        let first = table.begin_plan();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let later = {
+            let (table, pool, tx) = (Arc::clone(&table), Arc::clone(&pool), tx.clone());
+            std::thread::spawn(move || {
+                let resolved = resolve_in(&table, &pool, &second_keys, None, 1);
+                let _ = tx.send(("second", resolved.seq, resolved.txs.iter().all(|t| t.s_src != CHAIN)));
+            })
+        };
+        // Give the later plan time to start its wait.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        {
+            let (table, pool) = (Arc::clone(&table), Arc::clone(&pool));
+            std::thread::spawn(move || {
+                let resolved = pool.install(|| resolve_begun(&table, first, &first_keys));
+                let _ = tx.send(("first", resolved.seq, true));
+            });
+        }
+        let mut done = Vec::new();
+        for _ in 0..2 {
+            done.push(rx.recv_timeout(std::time::Duration::from_secs(20)).expect("both resolves finish"));
+        }
+        later.join().expect("the later resolve");
+        done.sort_unstable();
+        assert_eq!(done, vec![("first", 1, true), ("second", 2, true)], "the second plan sees the first's senders pending");
     }
 
     /// Three plans through the table: ids, sources, the shared flag.

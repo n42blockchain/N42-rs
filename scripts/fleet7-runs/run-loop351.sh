@@ -263,10 +263,10 @@ bodygate() {
 d2gate() {
   local tag=$1 f=$B/bench-$1/node0-el.log inv fm pu tc rf rw vp
   inv=$(grep -ac 'Encountered invalid block' $f 2>/dev/null); fm=$(grep -a 'seal-first build phases' $f 2>/dev/null | grep -oE 'fields_mismatches=[0-9]+' | cut -d= -f2 | sort -n | tail -1)
-  pu=$(cat $B/bench-$1/node*-v.log $f 2>/dev/null | grep -ac 'ParentUnknown'); tc=$(cat $B/bench-$1/node*-v.log 2>/dev/null | grep -ac 'TC formed')
+  pu=$(cat $B/bench-$1/node*-v.log $f 2>/dev/null | grep -ac 'ParentUnknown'); tc=$(cat $B/bench-$1/node*-v.log 2>/dev/null | grep -a 'TC formed' | grep -av 'view=1$' | grep -ac .); tc1=$(cat $B/bench-$1/node*-v.log 2>/dev/null | grep -a 'TC formed' | grep -ac 'view=1$')
   rf=$(grep -a 'seal-first build phases' $f 2>/dev/null | grep -oE 'rename_fallbacks=[0-9]+' | cut -d= -f2 | paste -sd+ | bc); rw=$(grep -a 'seal-first build phases' $f 2>/dev/null | grep -oE 'rename_record_waits=[0-9]+' | cut -d= -f2 | paste -sd+ | bc)
   vp=$(python3 -c "import json; d=json.load(open('$B/bench-$1/verify.json')); print('pass' if d.get('pass') and not d.get('disagreements') else 'FAIL')" 2>/dev/null)
-  echo "d2gate $tag: invalid_blocks=${inv:-0} fields_mismatches=${fm:-none} ParentUnknown=${pu:-0} TC_formed_lines=${tc:-0} verify=${vp:-none} rename_fallbacks_total=${rf:-0} rename_record_waits_total=${rw:-0}"
+  echo "d2gate $tag: invalid_blocks=${inv:-0} fields_mismatches=${fm:-none} ParentUnknown=${pu:-0} TC_formed_lines=${tc:-0} (view-1 start-up TC lines ${tc1:-0}, not gated) verify=${vp:-none} rename_fallbacks_total=${rf:-0} rename_record_waits_total=${rw:-0}"
   if [ "${inv:-0}" != 0 ] || [ "${fm:-0}" != 0 ] || [ "${pu:-0}" != 0 ] || [ "${vp:-none}" != pass ] || [ "${tc:-0}" -gt 1 ]; then
     echo "D2GATE FAILED on $tag: stopping the round (datadirs kept as evidence)"; cleanup; echo "released at $(date +%H:%M)"; echo ALLDONE; exit 1
   fi
@@ -988,7 +988,17 @@ case $STAGE in
      b7 D2S12P30T64X11T16at28 $D2 $S1 $S2 $X11 $T64 $T16 F7_BLOCK_INTERVAL_MS=28
      b7 D2S12P30T64X11T16PTq $D2 $S1 $S2 $X11 $T64 $T16 N42_QUEUE_PRUNE_THREAD=1 F7_BLOCK_INTERVAL_MS=30
      b7 D2S12P30T64X11T16r $D2 $S1 $S2 $X11 $T64 $T16 F7_BLOCK_INTERVAL_MS=30 ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq, ar, as, at, au, av, aw, ax, ay, az, ba, bb, bc, bd, be, bg, bh, bi or bj)"; exit 2 ;;
+  bk) mk WARM 7 16; warm_gate WARM
+     # the two stage-bj legs the view-1 gate stopped: the queue-prune thread alone (x2) against a 30 ms control
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     C16="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_SIBLINGS=background N42_CORE_LAYOUT_BEHIND=background"
+     X11="$X10 $C16"; T16="N42_PLAN_AHEAD_BODY_THREADS=16"
+     b7 D2S12P30T64X11T16PTq $D2 $S1 $S2 $X11 $T64 $T16 N42_QUEUE_PRUNE_THREAD=1 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11T16r $D2 $S1 $S2 $X11 $T64 $T16 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11T16PTr $D2 $S1 $S2 $X11 $T64 $T16 N42_QUEUE_PRUNE_THREAD=1 F7_BLOCK_INTERVAL_MS=30 ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq, ar, as, at, au, av, aw, ax, ay, az, ba, bb, bc, bd, be, bg, bh, bi, bj or bk)"; exit 2 ;;
 esac
 
 if [ "${LOOP351_DRY:-0}" = 1 ]; then echo "dry run done"; exit 0; fi

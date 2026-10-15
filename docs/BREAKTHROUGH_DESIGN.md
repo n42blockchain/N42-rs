@@ -3881,3 +3881,17 @@ What it says:
 4. **Verdict.** X12 (= X11 + T16 + F2 + hold 64) is not adopted. The stable set stays X11 + T16 at 30 ms: six controls on this tree now read 380.4-383.1M (bd d/e, bg k, bh m/n, bi o/p), window 1 4.17-4.30M, with ~1/3 of legs at or above 4.3M in some window.
 
 Next (stage bj): the levers that remain on X11+T16 are pacing (25 and 28 ms; 10.114's model puts the median cycle at 37 ms, so 25 ms is expected to be answer-latency bound, but the plain set has never run under 30 ms) and the pruner thread on its own, each between 30 ms controls.
+
+### 10.133 loop351 stage bj — pacing 25 and 28 ms read the same as 30 ms on X11+T16; the pacer is not the limiter; a view-1 start-up timeout was stopping stages
+
+Stage bj (tree b5b210e61 = bi's tree plus runner changes) runs the X11+T16 set at 25 and 28 ms pacing after a 30 ms control. The prune-thread leg and the closing control did not run: the D2 gate stopped the stage after the 28 ms leg (below).
+
+| leg | pacing | w1 | w2 | w3 | round | blocks per window |
+| --- | --- | --- | --- | --- | --- | --- |
+| X11T16q, control | 30 ms | 4.293 | 4.193 | 4.273 | 382.8M | 629-644 |
+| X11T16at25 | 25 ms | 4.273 | 4.313 | 4.240 | 384.8M | 636-647 |
+| X11T16at28 | 28 ms | 4.267 | 4.287 | 4.227 | 383.4M | 634-643 |
+
+1. **Pacing below 30 ms changes nothing.** 25 and 28 ms read 384.8M and 383.4M against seven 30 ms controls at 380.4-383.1M -- inside the noise, and the block count per window is the same 630-647 whatever the pacer says (a 46-47 ms cycle at every setting). This is 10.114's model confirmed from the other side: the cycle is the seal-to-answer latency over the vote window (median 37 ms, mean 47), so the pacer only matters once it is above that. 30 ms stays; pacing is closed as a lever on this set. (Stage bh's F2 leg at 25 ms collapsed for the flood-start reason of 10.131, not because of the pacing.)
+2. **The gate incident.** `d2gate` counted `TC formed` lines across the seven validator logs and stopped the stage at more than one. Every validator logs every TC, so one TC is seven lines; the TC in question is `view=1`, formed at fleet start before the flood (the validators come up a few hundred milliseconds apart and the first view times out). It appears in some legs and not others (bi's X11T16p, bf's X11T16h -- which is why stage bf's i and j legs never ran -- and this stage's at28), costs nothing (at28 is a normal leg), and says nothing about the configuration. The gate now excludes view-1 TC lines (they are still printed, `view-1 start-up TC lines N, not gated`) and still stops on any later TC.
+3. **Stage bk** reruns what the gate stopped: the queue pruner on its own thread (`N42_QUEUE_PRUNE_THREAD=1`, twice) against a 30 ms control.

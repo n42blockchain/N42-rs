@@ -3284,6 +3284,20 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// hand them. Taking returns what the previous build on the same parent
     /// took, first.
     pub fn best_for_build(&self, parent: B256) -> QueueBest<T> {
+        self.best_walking(parent, true)
+    }
+
+    /// [`Self::best_for_build`] for a frame-mode build whose plan came back
+    /// empty: the walk takes only what the lanes hold now. It never drains
+    /// the inbox on a refill, and it ends as soon as frames are arriving, so
+    /// a flood's first burst stays in the inbox for the next frame plan
+    /// instead of being streamed into the walk and cut at the gas cap
+    /// (`docs/STAGE_BR_ANALYSIS.md` Q1).
+    pub fn best_for_walk(&self, parent: B256) -> QueueBest<T> {
+        self.best_walking(parent, false)
+    }
+
+    fn best_walking(&self, parent: B256, drain: bool) -> QueueBest<T> {
         let mut garbage = PruneGarbage::default();
         {
             let mut inner = self.lock_inner();
@@ -3306,6 +3320,8 @@ impl<T: PoolTransaction> TxQueue<T> {
             frames_ended: false,
             segments: VecDeque::new(),
             prepared_body: None,
+            drain,
+            walk_cut_short: false,
         }
     }
 
@@ -3516,6 +3532,8 @@ impl<T: PoolTransaction> TxQueue<T> {
             frames_ended: false,
             segments: segments.into_iter().map(|(txs, taken)| (txs, 0, taken)).collect(),
             prepared_body,
+            drain: true,
+            walk_cut_short: false,
         };
         (best, plan, times)
     }
@@ -5347,6 +5365,12 @@ pub struct QueueBest<T: PoolTransaction> {
     /// The body made with the prepared plan this build stands on, when the
     /// plan was used whole (not topped up) and a hook made one.
     prepared_body: Option<Arc<Mutex<BodySlot>>>,
+    /// A walk drains the inbox on every refill (`true`, [`TxQueue::best_for_build`])
+    /// or takes only what the lanes held at its start (`false`,
+    /// [`TxQueue::best_for_walk`]).
+    drain: bool,
+    /// A non-draining walk that ended because frames began arriving.
+    walk_cut_short: bool,
 }
 
 /// Where a frame build's selection ([`TxQueue::frames_for_build_timed`])
@@ -5491,6 +5515,12 @@ impl<T: PoolTransaction> Inner<T> {
 }
 
 impl<T: PoolTransaction> QueueBest<T> {
+    /// Whether this non-draining walk ended early because frames began
+    /// arriving ([`TxQueue::best_for_walk`]).
+    pub const fn walk_cut_short(&self) -> bool {
+        self.walk_cut_short
+    }
+
     /// The body made with the prepared plan this build stands on
     /// (`N42_PLAN_AHEAD_BODY=1`, [`TxQueue::set_plan_ahead_hook`]): only when
     /// the plan was used whole, once. [`PreparedBodyTake::Late`] when the
@@ -5589,8 +5619,27 @@ impl<T: PoolTransaction> Iterator for QueueBest<T> {
                 }
                 return Some(transaction);
             }
+            if !self.drain {
+                if self.walk_cut_short {
+                    return None;
+                }
+                // Checked once a refill, before the lanes' lock (the check
+                // takes it itself): frames arriving mid-walk end the walk, and
+                // the build seals what it gathered.
+                if self.queue.frames_arriving() {
+                    self.walk_cut_short = true;
+                    tracing::info!(
+                        target: "n42.tx_queue",
+                        walk_cut_short = true,
+                        "frames began arriving during a frame-mode walk; the walk ends here"
+                    );
+                    return None;
+                }
+            }
             let mut inner = self.queue.lock_inner();
-            self.queue.drain_inbox_block(&mut inner);
+            if self.drain {
+                self.queue.drain_inbox_block(&mut inner);
+            }
             if self.batch <= 1 {
                 return inner.next_ready(&self.skipped);
             }
@@ -7010,6 +7059,37 @@ mod tests {
             gas: 21_000 * members.len() as u64,
         });
         hashes
+    }
+
+    /// A frame-mode walk (`best_for_walk`) leaves frames that arrive during
+    /// it in the inbox and ends; the ordinary walk (`best_for_build`) drains
+    /// them into the lanes and hands them out.
+    #[test]
+    fn a_frame_mode_walk_does_not_drain_the_frame_inbox() {
+        let (a, b) = (Address::repeat_byte(1), Address::repeat_byte(2));
+
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        queue.push([tx_hashed(a, 0), tx_hashed(a, 1)]);
+        let mut walk = queue.best_for_walk(B256::repeat_byte(1));
+        assert_eq!(walk.next().map(|t| t.sender()), Some(a));
+        push_frame(&queue, 0xf1, &[(b, 0), (b, 1)]);
+        assert!(walk.next().is_none(), "frames arriving end the walk");
+        assert!(walk.walk_cut_short());
+        assert!(walk.next().is_none());
+        drop(walk);
+        assert!(queue.frames_arriving(), "the frame is still in the inbox");
+        assert_eq!(queue.frames_in_arrival_order().count(), 1);
+
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        queue.push([tx_hashed(a, 0), tx_hashed(a, 1)]);
+        let mut walk = queue.best_for_build(B256::repeat_byte(1));
+        assert_eq!(walk.next().map(|t| t.sender()), Some(a));
+        push_frame(&queue, 0xf1, &[(b, 0), (b, 1)]);
+        let rest: Vec<_> = walk.by_ref().map(|t| (t.sender(), t.nonce())).collect();
+        assert!(!walk.walk_cut_short());
+        assert_eq!(rest.len(), 3, "the draining walk takes the frame: {rest:?}");
+        assert!(rest.contains(&(b, 0)) && rest.contains(&(b, 1)));
+        assert!(!queue.frames_arriving(), "the draining walk emptied the inbox");
     }
 
     #[test]

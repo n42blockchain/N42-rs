@@ -3777,3 +3777,15 @@ Stage az (tree d0609f990, X11 at 30 ms, pool 28 GB; the warm read fixed in 05f5b
 The read now does what it was meant to: when it runs it reads ~178k accounts (the plan's recipients and the senders block N does not touch) and the batches hit them (185k hits), and the execution's median drops to 13-14 ms from 15. But the read takes 32-33 ms on 16 or 24 threads -- the whole window between the plan and the build -- so it is complete for 29-30% of builds only, and its threads are 16-24 more walkers of the same dependent-miss chain on the same memory system beside the build, the root and the merge: with 16 threads the seal's p90 goes 45 -> 62 and state ready 176 -> 223 and the round loses 9%; with 24 threads the read finishes a little more often and the leg equals the control. Moving the read earlier does not make it cheaper; the memory work is the same, and the layer is bound by that work wherever it runs (10.117). The switch stays off.
 
 What stages at-az establish together: the build's 15-16 ms execution is dependent cache misses on hash-table probes (the batch map, the in-flight overlay maps, the shard layer, the QMDB index), and no rearrangement of when or where those probes happen (lookahead hints, the per-read software cuts, idle siblings, the warm read ahead) moves the median; the per-read software cuts and the core layout moved the tails and are kept. Window 1 is 4.1-4.29M and the round 365-381M on this host, with the frame index, the vote window and the seal where 10.111-10.114 put them. Going further means fewer or cheaper probes per transfer: a state layout where a transfer's two accounts are reached in one probe (a per-block dense index assigned with the plan, the in-flight outputs stored as arrays indexed by it rather than hash maps), which is structural work on the build, the shards and the overlay, not a switch.
+
+### 10.136 loop351 stage bm — the colleague's checkpoint-frontier fsync group costs nothing on main's tree
+
+Stage bm (wt-main, tree ce51c9ea5 = main c446f80a3 plus the first group of the colleague's perf/deferred-frontier-recovery-20261013 branch: `bcd9c81dd` retain deferred checkpoint parent roots and `7cd9f2722` replay branch rewinds after checkpoint coverage, cherry-picked with `-x` from 17dd9c03c and e515c85ec; 2,398 tests pass) runs the X11+T16 set at 30 ms three times.
+
+| leg | w1 | w2 | w3 | round |
+| --- | --- | --- | --- | --- |
+| X11T16G1a | 4.193 | 3.953 | 4.133 | 368.4M |
+| X11T16G1b | 4.247 | 4.260 | 4.247 | 382.6M |
+| X11T16G1c | 4.260 | 4.247 | 4.267 | 383.2M |
+
+Two of three legs sit inside the eleven controls' 375-385M (and above bf's X11T16h, 379.0M, main's tree without the group); the third has a single window-2 dip to 3.95M and is the kind of one-leg reading the controls themselves produce (bk's X11T16r read 375.4M with a 4.08M window 1). No leg is below 370M in two windows and no gate tripped. **Group 1 costs nothing the fleet can see and is cleared to merge.** Next: group 2 (f18b4c60a, cc86e7bcf: recovery-archive hard links and fsyncs) the same way, stage bn.

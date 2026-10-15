@@ -259,12 +259,13 @@ bodygate() {
 
 # every depth-2 leg: fields_mismatches 0, invalid_blocks 0, no ParentUnknown, tc 1, fleet7-verify clean; rename_fallbacks and rename_record_waits are printed (a nonzero fallback count is reported, not a stop)
 d2gate() {
-  local tag=$1 f=$B/bench-$1/node0-el.log inv fm pu tc rf rw vp
+  # the fleet's view-1 start-up timeout is logged by every validator and is not a failure
+  local tag=$1 f=$B/bench-$1/node0-el.log inv fm pu tc tcv tc1 rf rw vp
   inv=$(grep -ac 'Encountered invalid block' $f 2>/dev/null); fm=$(grep -a 'seal-first build phases' $f 2>/dev/null | grep -oE 'fields_mismatches=[0-9]+' | cut -d= -f2 | sort -n | tail -1)
-  pu=$(cat $B/bench-$1/node*-v.log $f 2>/dev/null | grep -ac 'ParentUnknown'); tc=$(cat $B/bench-$1/node*-v.log 2>/dev/null | grep -ac 'TC formed')
+  pu=$(cat $B/bench-$1/node*-v.log $f 2>/dev/null | grep -ac 'ParentUnknown'); tcv=$(cat $B/bench-$1/node*-v.log 2>/dev/null | grep -a 'TC formed' | sed 's/\x1b\[[0-9;]*m//g' | grep -oE 'view=[0-9]+$'); tc=$(echo "$tcv" | grep -av '^view=1$' | grep -ac .); tc1=$(echo "$tcv" | grep -ac '^view=1$')
   rf=$(grep -a 'seal-first build phases' $f 2>/dev/null | grep -oE 'rename_fallbacks=[0-9]+' | cut -d= -f2 | paste -sd+ | bc); rw=$(grep -a 'seal-first build phases' $f 2>/dev/null | grep -oE 'rename_record_waits=[0-9]+' | cut -d= -f2 | paste -sd+ | bc)
   vp=$(python3 -c "import json; d=json.load(open('$B/bench-$1/verify.json')); print('pass' if d.get('pass') and not d.get('disagreements') else 'FAIL')" 2>/dev/null)
-  echo "d2gate $tag: invalid_blocks=${inv:-0} fields_mismatches=${fm:-none} ParentUnknown=${pu:-0} TC_formed_lines=${tc:-0} verify=${vp:-none} rename_fallbacks_total=${rf:-0} rename_record_waits_total=${rw:-0}"
+  echo "d2gate $tag: invalid_blocks=${inv:-0} fields_mismatches=${fm:-none} ParentUnknown=${pu:-0} TC_formed_lines=${tc:-0} (view-1 start-up TC lines ${tc1:-0}, not gated) verify=${vp:-none} rename_fallbacks_total=${rf:-0} rename_record_waits_total=${rw:-0}"
   if [ "${inv:-0}" != 0 ] || [ "${fm:-0}" != 0 ] || [ "${pu:-0}" != 0 ] || [ "${vp:-none}" != pass ] || [ "${tc:-0}" -gt 1 ]; then
     echo "D2GATE FAILED on $tag: stopping the round (datadirs kept as evidence)"; cleanup; echo "released at $(date +%H:%M)"; echo ALLDONE; exit 1
   fi

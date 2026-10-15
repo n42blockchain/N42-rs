@@ -3906,3 +3906,14 @@ Stage bk (tree 33499bf8d) ran the pruner-thread lever alone. The closing leg (PT
 | X11T16r, control | 4.080 | 4.253 | 4.180 | 375.4M |
 
 The pruner thread changes nothing the fleet can see: 378.2M against controls at 375.4-383.1M (ten controls on this tree, 375-385M). The pruner's own numbers are the same with or without the thread (prune_ms 33-38 median, 65-70 p90, busy 72-78% of a worker), so moving it off the tokio runtime neither shortens the prune nor frees anything the build chain was waiting for. Stage bl runs PTr and one more control to close the lever with two legs; after that the set's remaining work is the colleague's commits (same-condition legs on main's tree, 10.131's step order).
+
+### 10.135 loop351 stage bl — the pruner-thread lever is closed; the view-1 gate now reports and continues
+
+Stage bl (tree 1e62771d1) ran the second pruner-thread leg and a control. The control's fleet had the view-1 start-up timeout (`view-1 start-up TC lines 7, not gated`) and the stage went on -- the gate change of 10.134 behaves.
+
+| leg | w1 | w2 | w3 | round |
+| --- | --- | --- | --- | --- |
+| X11T16PTr (`N42_QUEUE_PRUNE_THREAD=1`) | 4.213 | 4.127 | 4.067 | 372.2M |
+| X11T16s, control | 4.260 | 4.253 | 4.253 | 383.0M |
+
+With PTq (378.2M, 10.134) the pruner thread reads 372-378M against eleven controls at 375-385M on this tree: no gain, if anything the lower side. Closed. On X11+T16 every lever tried since stage bd -- the five-block window, pacing 25/28, the pruner thread -- leaves the round at 375-385M and window 1 at 4.08-4.35M; the cycle is the seal-to-answer latency (10.114), and the next move has to shorten that path itself, not the pacer or the housekeeping around it. The immediate next stage (bm, on main's tree in wt-main) is the colleague's checkpoint-frontier fsync group, three legs, against this control set.

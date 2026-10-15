@@ -3789,3 +3789,17 @@ Stage bm (wt-main, tree ce51c9ea5 = main c446f80a3 plus the first group of the c
 | X11T16G1c | 4.260 | 4.247 | 4.267 | 383.2M |
 
 Two of three legs sit inside the eleven controls' 375-385M (and above bf's X11T16h, 379.0M, main's tree without the group); the third has a single window-2 dip to 3.95M and is the kind of one-leg reading the controls themselves produce (bk's X11T16r read 375.4M with a 4.08M window 1). No leg is below 370M in two windows and no gate tripped. **Group 1 costs nothing the fleet can see and is cleared to merge.** Next: group 2 (f18b4c60a, cc86e7bcf: recovery-archive hard links and fsyncs) the same way, stage bn.
+
+### 10.137 loop351 stage bn — the colleague's recovery-archive group costs nothing either; groups 1 and 2 cleared
+
+Stage bn (wt-main, tree ef2e027e5 = 10.136's tree plus the second group of the colleague's branch: `90995ff91` preserve heap rollback history until EL durability covers it and `11ecc5648` preserve independent logs across repeated rollbacks, cherry-picked with `-x` from f18b4c60a and cc86e7bcf; 2,406 tests pass) runs the X11+T16 set at 30 ms three times.
+
+| leg | w1 | w2 | w3 | round |
+| --- | --- | --- | --- | --- |
+| X11T16G2a | 4.320 | 3.913 | 4.220 | 373.6M |
+| X11T16G2b | 4.187 | 4.260 | 4.240 | 380.6M |
+| X11T16G2c | 4.327 | 4.227 | 4.160 | 381.4M |
+
+Two legs inside the controls' 375-385M, the third 373.6M with a single window-2 dip (3.91M) beside the stage's two highest window-1 readings (4.32-4.33M) -- the same shape as bm's G1a. No gate tripped, no view-1 timeout this time. **Group 2 costs nothing the fleet can see and is cleared to merge with group 1.** The window-2 dip on one leg in three now appears in both main-tree stages (bm, bn) and once in eleven wt338 controls; it is worth a look at what happens between seconds 30 and 60 of those legs before more groups are stacked, but it is not a property of either group.
+
+Remaining from the colleague's branch, in the review's step order: group 3 (69787edfb, 961fb0f1f, c15390d57, the startup reorder -- c15390d57 makes every executed_fields miss take a global mutex and an MDBX transaction, so its legs must be read with the per-leg executed_fields miss lines), then d4db75f58 (graft map); the two groups that need changes (synchronous pre-vote body persist; puller park) stay out. Paused here at the user's request to leave the box to other sessions.

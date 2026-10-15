@@ -172,7 +172,20 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
             times.bulk_us = at.elapsed().as_micros() as u64;
             BULK.with(|slot| *slot.borrow_mut() = Some(Box::new(all)));
         }
-        if plan.frames.is_empty() && queue.frames_arriving() {
+        // Refuse the walk while frames are on their way into the index, or
+        // already in it (frames a plan passed over): a flood's pool is never
+        // frameless, so only a thin one (funding, RPC) is walked
+        // (`docs/LANE_WALK_COLLAPSE.md` 5).
+        let refuse_walk = if !plan.frames.is_empty() {
+            None
+        } else if queue.frames_arriving() {
+            Some("arriving")
+        } else if queue.frames_indexed() > 0 {
+            Some("indexed")
+        } else {
+            None
+        };
+        if let Some(reason) = refuse_walk {
             // Frames are on their way into the index (a flood's first burst
             // still draining): this build takes nothing rather than walk the
             // lanes, whose heads are those frames' first transactions. A
@@ -183,6 +196,7 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
             tracing::info!(
                 target: "n42.payload",
                 refused = FRAME_BUILDS_WALK_REFUSED.load(Ordering::Relaxed),
+                reason,
                 "frame plan empty while frames are arriving; the build does not walk the lanes"
             );
             // No plan is left for the seal: an empty body takes the MPT

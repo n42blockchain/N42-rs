@@ -3895,3 +3895,14 @@ Stage bj (tree b5b210e61 = bi's tree plus runner changes) runs the X11+T16 set a
 1. **Pacing below 30 ms changes nothing.** 25 and 28 ms read 384.8M and 383.4M against seven 30 ms controls at 380.4-383.1M -- inside the noise, and the block count per window is the same 630-647 whatever the pacer says (a 46-47 ms cycle at every setting). This is 10.114's model confirmed from the other side: the cycle is the seal-to-answer latency over the vote window (median 37 ms, mean 47), so the pacer only matters once it is above that. 30 ms stays; pacing is closed as a lever on this set. (Stage bh's F2 leg at 25 ms collapsed for the flood-start reason of 10.131, not because of the pacing.)
 2. **The gate incident.** `d2gate` counted `TC formed` lines across the seven validator logs and stopped the stage at more than one. Every validator logs every TC, so one TC is seven lines; the TC in question is `view=1`, formed at fleet start before the flood (the validators come up a few hundred milliseconds apart and the first view times out). It appears in some legs and not others (bi's X11T16p, bf's X11T16h -- which is why stage bf's i and j legs never ran -- and this stage's at28), costs nothing (at28 is a normal leg), and says nothing about the configuration. The gate now excludes view-1 TC lines (they are still printed, `view-1 start-up TC lines N, not gated`) and still stops on any later TC.
 3. **Stage bk** reruns what the gate stopped: the queue pruner on its own thread (`N42_QUEUE_PRUNE_THREAD=1`, twice) against a 30 ms control.
+
+### 10.134 loop351 stage bk — the queue pruner on its own thread reads the same as the controls; the view-1 gate fix had not matched the coloured log
+
+Stage bk (tree 33499bf8d) ran the pruner-thread lever alone. The closing leg (PTr) did not run: the D2 gate stopped the stage after the control, again on the fleet's view-1 start-up TC -- 10.133's exclusion matched `view=1` at the end of the line, but the validator logs carry ANSI colour codes after the value, so nothing was excluded. The gate now strips the colour codes before matching (verified on this leg's logs: 13 start-up lines, 0 gated).
+
+| leg | w1 | w2 | w3 | round |
+| --- | --- | --- | --- | --- |
+| X11T16PTq (`N42_QUEUE_PRUNE_THREAD=1`) | 4.213 | 4.200 | 4.193 | 378.2M |
+| X11T16r, control | 4.080 | 4.253 | 4.180 | 375.4M |
+
+The pruner thread changes nothing the fleet can see: 378.2M against controls at 375.4-383.1M (ten controls on this tree, 375-385M). The pruner's own numbers are the same with or without the thread (prune_ms 33-38 median, 65-70 p90, busy 72-78% of a worker), so moving it off the tokio runtime neither shortens the prune nor frees anything the build chain was waiting for. Stage bl runs PTr and one more control to close the lever with two legs; after that the set's remaining work is the colleague's commits (same-condition legs on main's tree, 10.131's step order).

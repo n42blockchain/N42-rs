@@ -175,12 +175,13 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
         // Refuse the walk while frames are on their way into the index, or
         // already in it (frames a plan passed over): a flood's pool is never
         // frameless, so only a thin one (funding, RPC) is walked
-        // (`docs/LANE_WALK_COLLAPSE.md` 5).
+        // (`docs/LANE_WALK_COLLAPSE.md` 5). The `indexed` refusal only under
+        // `N42_FRAME_WALK_REFUSE_INDEXED=1` ([`frame_walk_refuse_indexed`]).
         let refuse_walk = if !plan.frames.is_empty() {
             None
         } else if queue.frames_arriving() {
             Some("arriving")
-        } else if queue.frames_indexed() > 0 {
+        } else if frame_walk_refuse_indexed() && queue.frames_indexed() > 0 {
             Some("indexed")
         } else {
             None
@@ -225,6 +226,16 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
     };
     SELECT_TIMES.with(|slot| slot.set(times));
     best
+}
+
+/// `N42_FRAME_WALK_REFUSE_INDEXED=1`: a build whose frame plan came back
+/// empty also refuses to walk the lanes while frames are in the live index
+/// (frames the plan passed over), not only while they are arriving.
+/// Off by default: frames unusable for a reason other than a walk, beside
+/// RPC lanes, would otherwise build empty blocks instead of walking them.
+pub fn frame_walk_refuse_indexed() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FRAME_WALK_REFUSE_INDEXED").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// `N42_PLAN_AHEAD_BODY=1` (`docs/SHARED_EXECUTION_SCOPE.md` 16.4 item 2):

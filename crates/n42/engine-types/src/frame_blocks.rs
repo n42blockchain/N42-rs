@@ -211,7 +211,11 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
             drop(best);
             FRAME_BUILDS_WALKED.fetch_add(1, Ordering::Relaxed);
             let at = std::time::Instant::now();
-            let best = queue.best_for_build(parent);
+            // Only what the lanes hold now: a walk that drained the inbox
+            // would stream a flood's first burst in and cut senders at the
+            // gas cap, leaving their later frames unusable
+            // (`docs/STAGE_BR_ANALYSIS.md` Q1).
+            let best = queue.best_for_walk(parent);
             times.pull_us = at.elapsed().as_micros() as u64;
             best
         } else {

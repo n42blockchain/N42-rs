@@ -3957,3 +3957,26 @@ Stage bo (wt-main, tree 6085c9b56 = 10.137's tree plus the colleague's start-up 
 G3a is not a slow leg but the collapse of 10.131: `start_frames_skipped` 15-17k per build on every build of the leg, blocks 63% full, sealed_at median 56-62 ms with p90 165-183 ms and `plan_wait_timeout` on half the builds, lanes lock duty 84%. That is the flood-start lane walk (the first full block's plan empty while frames drain into the index; later frames of the walked senders never become lane heads again), a defect of the tree before the one-probe branch's e4893e175 / f24431fdd, and main's tree has neither. On main's tree it has now shown once in ten X11+T16 legs (bf h, bm a-c, bn a-c, bo a-c); on the one-probe tree after those two commits, zero in fourteen. The signature carries no trace of this group (no executed_fields line in the summaries; the leader's par_exec 10-11 ms and roots 15-16 ms are the usual, it is the plan that is short), so the leg says nothing about the group, and the two clean legs sit inside the controls' 375-385M.
 
 **Verdict: the start-up reorder group costs nothing the fleet can see on the legs that ran normally; cleared to merge, with the note that it has two clean legs rather than three.** Two follow-ups for main's tree, independent of the colleague's branch: port e4893e175 and f24431fdd (whichever of the two removed the collapse -- 10.132 could not attribute it, `frame_walk_refused` read 0 on every leg), and keep counting collapses per tree. Last group: d4db75f58 (graft map), stage bp.
+
+### 10.139 loop351 stage bp — the graft-map commit reads as the controls; all four groups of the colleague's branch cleared, merge recommendation
+
+Stage bp (wt-main, tree 879e751e7 = 10.138's tree plus `ced5314db` preserve populated state in prefaulted graft memory, cherry-picked from d4db75f58; 2,416 tests pass) runs the X11+T16 set at 30 ms three times. No leg collapsed (`start_frames_skipped` 0 on every build; the main-tree collapse count stays at 1 in 13 legs).
+
+| leg | w1 | w2 | w3 | round |
+| --- | --- | --- | --- | --- |
+| X11T16G4a | 4.293 | 4.020 | 3.993 | 369.2M |
+| X11T16G4b | 4.353 | 4.227 | 4.287 | 386.0M |
+| X11T16G4c | 4.300 | 4.267 | 4.220 | 383.6M |
+
+Two legs inside the controls' 375-385M (G4b, 386.0M, is the second-highest round of the whole loop351 series after bh's 386.9M, with a 4.353M window 1); G4a has the softer windows 2-3 (4.0M) seen once per three legs in bm and bn as well. No gate tripped. **Cleared.**
+
+Closing table of the colleague's perf/deferred-frontier-recovery-20261013 branch on main's tree (every stage: X11+T16 at 30 ms, three legs, controls 375-385M from eleven legs on the one-probe tree and bf's 379.0M on main's):
+
+| stage | group | commits (as cherry-picked on bench/main-x11t16) | legs (round, M) | verdict |
+| --- | --- | --- | --- | --- |
+| bm | 1 checkpoint-frontier fsyncs | bcd9c81dd, 7cd9f2722 (from 17dd9c03c, e515c85ec) | 368.4 / 382.6 / 383.2 | cleared |
+| bn | 2 recovery-archive rollback history | 90995ff91, 11ecc5648 (from f18b4c60a, cc86e7bcf) | 373.6 / 380.6 / 381.4 | cleared |
+| bo | 3 start-up reorder | 40ec4c7d1, 588892d3b (hand-merged move), 9a29302dc (from 69787edfb, 961fb0f1f, c15390d57) | collapse (203.5, main-tree defect) / 383.4 / 379.6 | cleared on two legs |
+| bp | 4 graft map | ced5314db (from d4db75f58) | 369.2 / 386.0 / 383.6 | cleared |
+
+Merge recommendation: take groups 1-4 onto main in this order -- `bench/main-x11t16` from 491a80473 to 879e751e7 minus the runner-script commits is exactly that series, including the hand-merged move of 961fb0f1f whose block equals the colleague's. Keep out, until changed as the review asked: the synchronous pre-vote body persist group (e52df8675, d05a15be7, c4ea27859, 20c77a414, 5113da198: a fsync in the service loop, fatal under compact bodies -- gate it behind an environment variable and never make it fatal) and the puller park (6c1617382, 199259ff2: Drop may wait 5 ms -- drop the refusals sender before the join). Separately, port e4893e175 and f24431fdd from feat/one-probe-state to main: the flood-start walk collapse hit 1 of 13 main-tree legs and 0 of 14 one-probe legs after those two commits (10.132 could not say which of the two did it).

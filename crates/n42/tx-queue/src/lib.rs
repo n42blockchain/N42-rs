@@ -671,6 +671,27 @@ pub fn take_lock_stats() -> LockStats {
     }
 }
 
+/// Counts `n` into an in-hand counter for as long as it lives, so every way
+/// out of the holder (an early return, a panic) lowers it again.
+#[derive(Debug)]
+struct InHandGuard<'a> {
+    counter: &'a std::sync::atomic::AtomicUsize,
+    n: usize,
+}
+
+impl<'a> InHandGuard<'a> {
+    fn raise(counter: &'a std::sync::atomic::AtomicUsize, n: usize) -> Self {
+        counter.fetch_add(n, std::sync::atomic::Ordering::AcqRel);
+        Self { counter, n }
+    }
+}
+
+impl Drop for InHandGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.n, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Raises `max` to `value` if it is larger; returns whether it did. A load
 /// first, so the common case (not a new maximum) writes nothing to a line
 /// every lock of the queue would otherwise share.
@@ -1499,6 +1520,12 @@ pub struct TxQueue<T: PoolTransaction> {
     /// (taken out of `staged`, not yet under the lanes' lock): counted by
     /// [`Self::gate_len`], so the batch is never in none of the readings.
     in_hand: Arc<std::sync::atomic::AtomicUsize>,
+    /// Frames a chunked drain took off `frame_inbox` (out of
+    /// `frames_staged`) and has not yet handed to `Inner::pending_frames`:
+    /// while the drainer waits for the lanes' lock they are in neither, and
+    /// [`Self::frames_arriving`] must still see them
+    /// (`docs/LANE_WALK_COLLAPSE.md` 2).
+    frames_in_hand: Arc<std::sync::atomic::AtomicUsize>,
     /// `N42_TX_QUEUE_DRAIN_CHUNK` unless a test said otherwise.
     drain_chunk: Arc<std::sync::atomic::AtomicUsize>,
     /// The builder's plan-ahead hook ([`Self::set_plan_ahead_hook`]).
@@ -1624,6 +1651,7 @@ impl<T: PoolTransaction> Clone for TxQueue<T> {
             frames_staged: Arc::clone(&self.frames_staged),
             depth: Arc::clone(&self.depth),
             in_hand: Arc::clone(&self.in_hand),
+            frames_in_hand: Arc::clone(&self.frames_in_hand),
             drain_chunk: Arc::clone(&self.drain_chunk),
             ahead_hook: Arc::clone(&self.ahead_hook),
             offlock: Arc::clone(&self.offlock),
@@ -1795,6 +1823,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             pruned_mirror: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             depth: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             in_hand: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            frames_in_hand: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             drain_chunk: Arc::new(std::sync::atomic::AtomicUsize::new(drain_chunk())),
             ahead_hook: Arc::new(Mutex::new(None)),
             offlock: Arc::new(std::sync::atomic::AtomicBool::new(queue_offlock())),
@@ -2042,7 +2071,13 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// 2.3-2.9M with ~20,000 frames skipped a build; the others 4.0-4.4M
     /// with none).
     pub fn frames_arriving(&self) -> bool {
-        if self.frames_staged.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        use std::sync::atomic::Ordering;
+        // In hand before staged: a drain raises `frames_in_hand` before it
+        // lowers `frames_staged`, so reading in this order never misses a
+        // batch between the two.
+        if self.frames_in_hand.load(Ordering::Acquire) != 0
+            || self.frames_staged.load(Ordering::Acquire) != 0
+        {
             return true;
         }
         !self.lock_inner_quiet().pending_frames.is_empty()
@@ -2050,7 +2085,10 @@ impl<T: PoolTransaction> TxQueue<T> {
 
     /// How many frames the index holds, counting those still in its inbox.
     pub fn frames_indexed(&self) -> usize {
-        self.lock_inner_quiet().frames.len() + self.frames_staged.load(std::sync::atomic::Ordering::Acquire)
+        use std::sync::atomic::Ordering;
+        self.lock_inner_quiet().frames.len()
+            + self.frames_in_hand.load(Ordering::Acquire)
+            + self.frames_staged.load(Ordering::Acquire)
     }
 
     /// The indexed frames in the order they arrived, each with its count,
@@ -3100,9 +3138,14 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// pending); returns how many transactions each hold moved.
     fn drain_chunked(&self, chunk: usize, max_holds: usize) -> Vec<u64> {
         use std::sync::atomic::Ordering;
+        // Lowered when the batch is in `Inner::pending_frames` (after the
+        // first hold) or on any other way out of this function.
+        let mut frames_guard = None;
         let frames = if self.frames_staged.load(Ordering::Acquire) != 0 {
             let mut noted = self.frame_inbox.lock();
             let frames = std::mem::take(&mut *noted);
+            // In hand before out of `frames_staged`, as for `in_hand`.
+            frames_guard = Some(InHandGuard::raise(&self.frames_in_hand, frames.len()));
             self.frames_staged.fetch_sub(frames.len(), Ordering::AcqRel);
             frames
         } else {
@@ -3139,6 +3182,8 @@ impl<T: PoolTransaction> TxQueue<T> {
             if first {
                 // After the release that put the batch in the mirror.
                 self.in_hand.fetch_sub(total, Ordering::AcqRel);
+                // The frames are in `pending_frames` now.
+                drop(frames_guard.take());
                 first = false;
             }
             if moved > 0 {
@@ -3155,6 +3200,13 @@ impl<T: PoolTransaction> TxQueue<T> {
             }
         }
         holds
+    }
+
+    /// Test hook: frames held as a chunked drain holds them between the
+    /// frame inbox and the lanes' lock, until the guard is dropped.
+    #[cfg(test)]
+    fn hold_frames_in_hand(&self, n: usize) -> InHandGuard<'_> {
+        InHandGuard::raise(&self.frames_in_hand, n)
     }
 
     /// The drainer's drain under `N42_QUEUE_OFFLOCK`: holds of at most
@@ -6982,6 +7034,28 @@ mod tests {
         push_frame(&queue, 0xf1, &[(a, 1), (a, 2)]);
         assert!(queue.frames_arriving());
         assert_eq!(queue.frames_in_arrival_order().count(), 1);
+        assert!(!queue.frames_arriving());
+    }
+
+    /// Frames a chunked drain has taken off the frame inbox but not yet
+    /// handed to the lanes (waiting for their lock) are still arriving: the
+    /// window in which a build used to walk the lanes
+    /// (`docs/LANE_WALK_COLLAPSE.md` 2).
+    #[test]
+    fn frames_in_the_drainers_hands_are_arriving() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        assert!(!queue.frames_arriving());
+        let held = queue.hold_frames_in_hand(3);
+        assert!(queue.frames_arriving(), "frames in hand must count as arriving");
+        assert_eq!(queue.frames_indexed(), 3);
+        drop(held);
+        assert!(!queue.frames_arriving());
+        assert_eq!(queue.frames_indexed(), 0);
+        // A real chunked drain leaves nothing in hand.
+        let a = Address::repeat_byte(2);
+        push_frame(&queue, 0xf2, &[(a, 0), (a, 1)]);
+        let _ = queue.drain_chunked(1, usize::MAX);
+        assert_eq!(queue.frames_in_hand.load(std::sync::atomic::Ordering::Acquire), 0);
         assert!(!queue.frames_arriving());
     }
 

@@ -3898,7 +3898,7 @@ Stage bj (tree b5b210e61 = bi's tree plus runner changes) runs the X11+T16 set a
 
 ### 10.134 loop351 stage bk — the queue pruner on its own thread reads the same as the controls; the view-1 gate fix had not matched the coloured log
 
-Stage bk (tree 33499bf8d) ran the pruner-thread lever alone. The closing leg (PTr) did not run: the D2 gate stopped the stage after the control, again on the fleet's view-1 start-up TC -- 10.133's exclusion matched `view=1` at the end of the line, but the validator logs carry ANSI colour codes after the value, so nothing was excluded. The gate now strips the colour codes before matching (verified on this leg's logs: 13 start-up lines, 0 gated).
+Stage bk (tree 33499bf8d) ran the pruner-thread lever alone. The closing leg (PTr) did not run: the D2 gate stopped the stage after the control, again on the fleet's view-1 start-up TC -- 10.133's exclusion matched `view=1` at the end of the line, but the validator logs carry ANSI colour codes after the value, so nothing was excluded. The gate now strips the colour codes before matching (verified on this leg's logs: 7 start-up lines, 0 gated).
 
 | leg | w1 | w2 | w3 | round |
 | --- | --- | --- | --- | --- |

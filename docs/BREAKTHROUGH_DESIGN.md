@@ -3840,3 +3840,15 @@ Closing table of the colleague's perf/deferred-frontier-recovery-20261013 branch
 | bp | 4 graft map | ced5314db (from d4db75f58) | 369.2 / 386.0 / 383.6 | cleared |
 
 Merge recommendation: take groups 1-4 onto main in this order -- `bench/main-x11t16` from 491a80473 to 879e751e7 minus the runner-script commits is exactly that series, including the hand-merged move of 961fb0f1f whose block equals the colleague's. Keep out, until changed as the review asked: the synchronous pre-vote body persist group (e52df8675, d05a15be7, c4ea27859, 20c77a414, 5113da198: a fsync in the service loop, fatal under compact bodies -- gate it behind an environment variable and never make it fatal) and the puller park (6c1617382, 199259ff2: Drop may wait 5 ms -- drop the refusals sender before the join). Separately, port e4893e175 and f24431fdd from feat/one-probe-state to main: the flood-start walk collapse hit 1 of 13 main-tree legs and 0 of 14 one-probe legs after those two commits (10.132 could not say which of the two did it).
+
+### 10.140 loop351 stage bq — main's tree with the four groups and the two flood-start commits: two legs at 382.6M, one leg collapses in window 2; the collapse is not fixed by e4893e175
+
+Stage bq (wt-main, tree 2323e4573 = 10.139's tree plus `5718f46f8` (e4893e175: the frame build refuses the lane walk while frames are arriving) and `0ae1e5536` (f24431dfd: `N42_OWN_HOLD_BLOCKS`); 2,420 tests pass) runs the X11+T16 set at 30 ms three times.
+
+| leg | w1 | w2 | w3 | round | start_frames_skipped per build (median / p90, builds nonzero) |
+| --- | --- | --- | --- | --- | --- |
+| X11T16Fa | 4.347 | 4.293 | 4.147 | 382.6M | 0 / 0, 0 |
+| X11T16Fb | 4.208 | 2.800 | 2.307 | 236.5M | w1 2,418 / 8,884, 617; w2 20,172 / 37,936, 353; w3 32,165 / 48,295, 457 |
+| X11T16Fc | 4.273 | 4.260 | 4.220 | 382.6M | 0 / 0, 0 |
+
+Fa and Fc read as the controls (375-385M), so the two commits cost nothing and main now carries the colleague's four groups and both (main c00da0335, pushed after this stage). Fb is the lane-walk collapse of 10.131 again -- but with a new shape: the leg starts full (window 1 at 4.21M) while already skipping a few thousand frames per build, and the skipping grows through windows 2 and 3 until blocks are 84-85% full. So the collapse is not only a flood-start event, and e4893e175's refusal (which guards the first full block's walk while frames are arriving) does not remove it: this is the second collapse in 16 legs on main's tree, against zero in fourteen on the one-probe tree -- whatever protects that tree is among its other commits (the persistent lane table d0c39d343, resolve-first e68af1d3d, root over lanes 9a110b8f8, or 2463720f7), not these two. Fb's logs are kept under bench-loop351D2S12P30T64X11T16Fb/ for the onset analysis. Stage br (answer before reverts, 10.141) runs next on this tree.

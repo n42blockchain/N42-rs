@@ -4444,6 +4444,13 @@ where
                     // (`N42_FRAME_SWEEP_AT_TAKE`), and the frames it refused
                     // at its bound (since the process started).
                     start_frames_skipped = select_times.frames_skipped,
+                    // Builds since the process started that found no frame
+                    // to plan and walked the lanes, or refused to: after a
+                    // flood's first full block the walked count must not move.
+                    frame_builds_walked =
+                        crate::frame_blocks::FRAME_BUILDS_WALKED.load(std::sync::atomic::Ordering::Relaxed),
+                    frame_walk_refused = crate::frame_blocks::FRAME_BUILDS_WALK_REFUSED
+                        .load(std::sync::atomic::Ordering::Relaxed),
                     start_frames_index = select_times.frames_index,
                     start_frames_swept_at_take = select_times.frames_swept_at_take,
                     start_frames_refused_at_cap = select_times.frames_refused_at_cap,

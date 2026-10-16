@@ -2776,6 +2776,143 @@ pub fn merge_parallel() -> usize {
 /// The most parts [`merge_parallel`] splits the merge into.
 pub const MAX_MERGE_PARTS: usize = 64;
 
+/// `N42_MERGE_PARALLEL_CORES=<set>`: where the parallel merge's threads (its
+/// scoped part threads and the merging thread itself, for the merge's
+/// duration) run. `critical` (the default: the QMDB root's cores, as
+/// before), `background` and `build` name the core layout's sets
+/// (`N42_CORE_LAYOUT=isolate`; with the layout off nothing is pinned, as
+/// before), and an explicit CPU list (`0-7,64-71`) pins to those CPUs with or
+/// without the layout. An unparsable value is the default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeCores {
+    /// The layout's critical set (today's placement).
+    Critical,
+    /// The layout's background set.
+    Background,
+    /// The layout's build set.
+    Build,
+    /// These logical CPUs.
+    List(Vec<usize>),
+}
+
+impl MergeCores {
+    /// The placement `value` names, `None` when it names none.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "" | "critical" => Some(Self::Critical),
+            "background" => Some(Self::Background),
+            "build" => Some(Self::Build),
+            list => n42_core_layout::parse_cpu_list(list).filter(|cpus| !cpus.is_empty()).map(Self::List),
+        }
+    }
+
+    /// The tag the phases line carries under `merge_cores=`: the set's name,
+    /// or the CPU list.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Critical => "critical".to_string(),
+            Self::Background => "background".to_string(),
+            Self::Build => "build".to_string(),
+            Self::List(cpus) => n42_core_layout::format_cpu_list(cpus),
+        }
+    }
+
+    /// The CPUs to pin to, `None` when nothing is pinned (a layout set with
+    /// the layout off).
+    pub fn cpus(&self) -> Option<&[usize]> {
+        let set = match self {
+            Self::List(cpus) => return Some(cpus),
+            Self::Critical => n42_core_layout::Set::Critical,
+            Self::Background => n42_core_layout::Set::Background,
+            Self::Build => n42_core_layout::Set::Build,
+        };
+        n42_core_layout::layout().map(|layout| layout.cpus(set))
+    }
+}
+
+/// The placement `N42_MERGE_PARALLEL_CORES` names ([`MergeCores`]). Read once.
+pub fn merge_cores() -> &'static MergeCores {
+    static CORES: OnceLock<MergeCores> = OnceLock::new();
+    CORES.get_or_init(|| {
+        let value = std::env::var("N42_MERGE_PARALLEL_CORES").unwrap_or_default();
+        MergeCores::parse(&value).unwrap_or_else(|| {
+            tracing::warn!(target: "n42::output_shards", %value, "N42_MERGE_PARALLEL_CORES: not a set or a CPU list, using critical");
+            MergeCores::Critical
+        })
+    })
+}
+
+/// [`merge_cores`]' label, for the phases line.
+pub fn merge_cores_label() -> &'static str {
+    static LABEL: OnceLock<String> = OnceLock::new();
+    LABEL.get_or_init(|| merge_cores().label())
+}
+
+/// Times a merge thread could not be pinned to [`merge_cores`] (it then ran
+/// where it was: no pinning).
+static MERGE_PIN_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// The process's count of failed merge pins so far (`merge_pin_failed=`).
+pub fn merge_pin_failed() -> u64 {
+    MERGE_PIN_FAILED.load(Ordering::Relaxed)
+}
+
+/// Pins the calling thread to `cores`; a failure is counted and leaves the
+/// thread where it was. Whether it was pinned.
+fn pin_to_merge_cores(cores: &MergeCores) -> bool {
+    let Some(cpus) = cores.cpus() else { return false };
+    n42_core_layout::log_once();
+    match n42_core_layout::pin_current_thread_to(cpus) {
+        Ok(()) => true,
+        Err(err) => {
+            MERGE_PIN_FAILED.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(target: "n42::output_shards", %err, cores = %cores.label(), "could not pin a merge thread");
+            false
+        }
+    }
+}
+
+/// The merging thread on [`merge_cores`] for a parallel merge's duration:
+/// [`MergePin::enter`] pins it, dropping the guard puts it back. With the
+/// default placement the thread goes back to the background set, as before;
+/// with another, to the mask it had.
+#[derive(Debug)]
+pub struct MergePin {
+    restore: Option<Vec<usize>>,
+    critical: bool,
+}
+
+impl MergePin {
+    /// Pins the calling thread when `parts > 0` (a parallel merge); a no-op
+    /// guard otherwise.
+    pub fn enter(parts: usize) -> Self {
+        if parts == 0 {
+            return Self { restore: None, critical: false };
+        }
+        let cores = merge_cores();
+        if *cores == MergeCores::Critical {
+            // Today's placement, call for call.
+            n42_core_layout::enter(n42_core_layout::Set::Critical);
+            return Self { restore: None, critical: true };
+        }
+        let previous = n42_core_layout::current_thread_cpus().ok();
+        let restore = if pin_to_merge_cores(cores) { previous } else { None };
+        Self { restore, critical: false }
+    }
+}
+
+impl Drop for MergePin {
+    fn drop(&mut self) {
+        if self.critical {
+            n42_core_layout::enter(n42_core_layout::Set::Background);
+        } else if let Some(cpus) = self.restore.take() {
+            if n42_core_layout::pin_current_thread_to(&cpus).is_err() {
+                MERGE_PIN_FAILED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// One account of the parallel merge's scatter: its bucket in the merged
 /// map, its address and account in its source map, and the residual's
 /// value to lay over it.
@@ -2791,7 +2928,7 @@ fn buckets_of_capacity(capacity: usize) -> usize {
     (capacity / 7 * 8).next_power_of_two()
 }
 
-/// `job(0..parts)` on scoped threads pinned to the critical set, the results
+/// `job(0..parts)` on scoped threads pinned to [`merge_cores`], the results
 /// in part order; a part whose thread cannot be spawned runs here.
 fn run_parts<T: Send>(parts: usize, job: &(dyn Fn(usize) -> T + Sync)) -> Vec<T> {
     std::thread::scope(|scope| {
@@ -2800,7 +2937,14 @@ fn run_parts<T: Send>(parts: usize, job: &(dyn Fn(usize) -> T + Sync)) -> Vec<T>
                 std::thread::Builder::new()
                     .name("n42-merge-part".into())
                     .spawn_scoped(scope, move || {
-                        n42_core_layout::enter(n42_core_layout::Set::Critical);
+                        // `N42_MERGE_PARALLEL_CORES`: the critical set by
+                        // default; a failed pin is counted, the part runs.
+                        match merge_cores() {
+                            MergeCores::Critical => n42_core_layout::enter(n42_core_layout::Set::Critical),
+                            cores => {
+                                pin_to_merge_cores(cores);
+                            }
+                        }
                         job(part)
                     })
                     .map_err(|_| part)
@@ -2963,6 +3107,39 @@ reth_storage_api::macros::delegate_impls_to_as_ref!(
 mod frozen_tests {
     use super::*;
     use revm::{database::BundleState, state::AccountInfo};
+
+    /// `N42_MERGE_PARALLEL_CORES`: the names and CPU lists it takes, and an
+    /// explicit list pinned and restored by the guard (a failed pin counted,
+    /// never fatal).
+    #[test]
+    fn merge_cores_parse_and_pin() {
+        assert_eq!(MergeCores::parse(""), Some(MergeCores::Critical));
+        assert_eq!(MergeCores::parse("critical"), Some(MergeCores::Critical));
+        assert_eq!(MergeCores::parse(" background "), Some(MergeCores::Background));
+        assert_eq!(MergeCores::parse("build"), Some(MergeCores::Build));
+        let list = MergeCores::parse("0-7,64-71").expect("a cpu list");
+        assert_eq!(list, MergeCores::List((0..8).chain(64..72).collect()));
+        assert_eq!(list.label(), "0-7,64-71");
+        assert_eq!(MergeCores::parse("nowhere"), None);
+        // A list pins with or without the layout; a set needs it.
+        assert!(list.cpus().is_some());
+        if n42_core_layout::layout().is_none() {
+            assert!(MergeCores::Background.cpus().is_none());
+        }
+        // The calling thread's own first CPU: the pin holds and is undone.
+        let before = n42_core_layout::current_thread_cpus().unwrap_or_default();
+        if let Some(&first) = before.first() {
+            assert!(pin_to_merge_cores(&MergeCores::List(vec![first])));
+            assert_eq!(n42_core_layout::current_thread_cpus().unwrap_or_default(), vec![first]);
+            n42_core_layout::pin_current_thread_to(&before).expect("restore");
+        }
+        // A CPU no box has: counted, the thread left where it was.
+        let failed = merge_pin_failed();
+        assert!(!pin_to_merge_cores(&MergeCores::List(vec![100_000])));
+        assert_eq!(merge_pin_failed(), failed + 1);
+        assert_eq!(n42_core_layout::current_thread_cpus().unwrap_or_default(), before);
+    }
+
 
     fn addr(i: u8) -> Address {
         Address::with_last_byte(i)

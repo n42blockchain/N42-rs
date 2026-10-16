@@ -4069,14 +4069,11 @@ where
                                         // in N parts on the critical set (the root's
                                         // cores, idle now), and the combine here on
                                         // it too; this thread goes back after.
+                                        // `N42_MERGE_PARALLEL_CORES` picks another set.
                                         let parts = crate::output_shards::merge_parallel();
-                                        if parts > 0 {
-                                            n42_core_layout::enter(n42_core_layout::Set::Critical);
-                                        }
+                                        let pin = crate::output_shards::MergePin::enter(parts);
                                         let (merged, split) = shards.merged_state_first_split(&residual.state, parts);
-                                        if parts > 0 {
-                                            n42_core_layout::enter(n42_core_layout::Set::Background);
-                                        }
+                                        drop(pin);
                                         let total_us = merge_at.elapsed().as_micros() as u64;
                                         (merged, crate::output_shards::MergeSplit { total_us, ..split })
                                     }
@@ -4096,13 +4093,9 @@ where
                                 let concurrent = crate::output_shards::merge_split();
                                 let parts = crate::output_shards::merge_parallel();
                                 let merge_at = std::time::Instant::now();
-                                if parts > 0 {
-                                    n42_core_layout::enter(n42_core_layout::Set::Critical);
-                                }
+                                let pin = crate::output_shards::MergePin::enter(parts);
                                 let (mut merged, split) = shards.merged_timed(&residual.state, concurrent);
-                                if parts > 0 {
-                                    n42_core_layout::enter(n42_core_layout::Set::Background);
-                                }
+                                drop(pin);
                                 let tail_at = std::time::Instant::now();
                                 crate::parallel_transfer::append_reverts(&mut merged, shard_reverts);
                                 let merge_end = std::time::Instant::now();
@@ -4503,6 +4496,10 @@ where
                     merge_fill_us = leader_merge.split.fill_us,
                     merge_faults = leader_merge.split.faults,
                     merge_parallel_parts = leader_merge.split.parts,
+                    // `N42_MERGE_PARALLEL_CORES`: where the parts ran, and the
+                    // merge threads that could not be pinned there (so far).
+                    merge_cores = crate::output_shards::merge_cores_label(),
+                    merge_pin_failed = crate::output_shards::merge_pin_failed(),
                     merge_gather_us = leader_merge.split.gather_us,
                     merge_combine_us = leader_merge.split.combine_us,
                     merge_tail_us = leader_merge.tail_us,

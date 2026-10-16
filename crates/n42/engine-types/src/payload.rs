@@ -4798,6 +4798,9 @@ where
                     // (`RootSplit`): which of the root's pieces is serial.
                     root_sort_us = root_split.sort_us,
                     root_leaves_us = root_split.leaves_us,
+                    // Of `root_leaves_us`: the key index lookups alone (the
+                    // only gated phase that merely reads the parent's tree).
+                    root_lookup_us = root_split.lookup_us,
                     root_retire_us = root_split.retire_us,
                     root_writes_us = root_split.writes_us,
                     root_index_us = root_split.index_us,

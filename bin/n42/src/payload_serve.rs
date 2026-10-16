@@ -1094,7 +1094,6 @@ fn hold_and_signal(
         times
     };
     n42_engine_types::frame_blocks::note_handoff_hold(times.hold_us, times.evict_free_us);
-    n42_engine_types::frame_blocks::note_handoff_hold_lock(times.lock_us, times.locked_us);
 }
 
 /// `N42_BUILD_ON_OUTPUT=1`: a build on an own block starts at the parent's

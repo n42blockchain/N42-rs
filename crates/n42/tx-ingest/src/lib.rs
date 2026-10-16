@@ -944,11 +944,6 @@ fn spawn_stats_reporter() {
                     drain_chunks = lock.drain_chunks,
                     drain_chunk_max_txs = lock.drain_chunk_max_txs,
                     drain_finished = lock.drain_finished,
-                    // The lock's duty per holder: `file:line=held_us/holds`,
-                    // the largest first, and what the rest held.
-                    lock_holders = %n42_tx_queue::format_lock_holders(&lock.holders),
-                    lock_holders_rest_us = lock.holders_rest_ns / 1_000,
-                    lock_holders_rest = lock.holders_rest,
                     // `N42_PLAN_AHEAD`: prepared plans discarded, by reason.
                     plan_discards = %ahead_discards,
                     offlock_raced,

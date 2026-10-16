@@ -520,25 +520,6 @@ std::thread_local! {
 /// `seal-first build phases` line (`handoff_hold_us`, `evict_free_us`).
 static HANDOFF_HOLD_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HANDOFF_EVICT_FREE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// The same hold's lock wait and time under the lock, microseconds
-/// (`handoff_hold_lock_us`, `handoff_hold_locked_us`).
-static HANDOFF_HOLD_LOCK_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static HANDOFF_HOLD_LOCKED_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Records an own-block hand-off's hold lock wait and locked time
-/// ([`take_handoff_hold_lock`]).
-pub fn note_handoff_hold_lock(lock_us: u64, locked_us: u64) {
-    HANDOFF_HOLD_LOCK_US.store(lock_us, std::sync::atomic::Ordering::Relaxed);
-    HANDOFF_HOLD_LOCKED_US.store(locked_us, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The last hand-off's (lock wait, locked) hold times, taken (reset).
-pub fn take_handoff_hold_lock() -> (u64, u64) {
-    (
-        HANDOFF_HOLD_LOCK_US.swap(0, std::sync::atomic::Ordering::Relaxed),
-        HANDOFF_HOLD_LOCKED_US.swap(0, std::sync::atomic::Ordering::Relaxed),
-    )
-}
 
 /// Records an own-block hand-off's hold times ([`take_handoff_hold`]).
 pub fn note_handoff_hold(hold_us: u64, evict_free_us: u64) {

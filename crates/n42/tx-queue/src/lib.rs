@@ -379,12 +379,6 @@ pub struct ForgetTimes {
 pub struct PruneTimes {
     /// The own block held at the height settled (its own lock).
     pub settle_us: u64,
-    /// Of `settle_us`: waiting for the lock the settle takes (the lanes'
-    /// lock, or the ledger's with `N42_QUEUE_LEDGER_LOCK`), and the time
-    /// held under it, a give-back's lanes hold included.
-    pub settle_lock_us: u64,
-    /// See `settle_lock_us`.
-    pub settle_held_us: u64,
     /// The block's pairs folded to one nonce a sender, outside the lock.
     pub fold_us: u64,
     /// Waiting for the lanes' lock.
@@ -599,11 +593,6 @@ pub struct HoldTimes {
     pub evict_free_us: u64,
     /// Transactions evicted.
     pub evicted: usize,
-    /// Waiting for the lock the hold takes (the lanes' lock, or the
-    /// ledger's with `N42_QUEUE_LEDGER_LOCK`).
-    pub lock_us: u64,
-    /// Under it: the hand-off named, the eviction loop and the push.
-    pub locked_us: u64,
 }
 
 impl<T: PoolTransaction + 'static> PruneGarbage<T> {
@@ -773,129 +762,6 @@ static LOCK_COUNTERS: LockCounters = LockCounters {
 /// The caller that set the current longest hold, beside it.
 static HOLD_MAX_AT: Mutex<Option<&'static std::panic::Location<'static>>> = Mutex::new(None);
 
-/// Slots of the per-holder duty table ([`note_holder`]): call sites of the
-/// lanes' lock, claimed on first use and kept for the process (the sites
-/// are a fixed set of `file:line`s).
-const HOLDER_SLOTS: usize = 64;
-
-/// How many holders [`take_lock_stats`] reports, the largest first.
-pub const LOCK_HOLDERS_REPORTED: usize = 8;
-
-/// One call site's share of the lanes' lock: held nanoseconds and holds
-/// since the last report.
-struct HolderSlot {
-    site: std::sync::atomic::AtomicPtr<std::panic::Location<'static>>,
-    hold_ns: std::sync::atomic::AtomicU64,
-    holds: std::sync::atomic::AtomicU64,
-}
-
-impl HolderSlot {
-    const fn new() -> Self {
-        Self {
-            site: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
-            hold_ns: std::sync::atomic::AtomicU64::new(0),
-            holds: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-}
-
-static HOLDERS: [HolderSlot; HOLDER_SLOTS] = [const { HolderSlot::new() }; HOLDER_SLOTS];
-
-/// Holds of sites that found the table full: counted, not named.
-static HOLDERS_REST: [std::sync::atomic::AtomicU64; 2] =
-    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
-
-/// Adds one hold of `held_ns` to `caller`'s slot: lock-free, an open
-/// addressing probe on the site's address, a slot claimed by a CAS from
-/// null. Called at every release of the lanes' lock, so two relaxed adds
-/// in the common case.
-fn note_holder(caller: &'static std::panic::Location<'static>, held_ns: u64) {
-    use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
-    let ptr = std::ptr::from_ref(caller).cast_mut();
-    let start = ((ptr as usize >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as usize)) % HOLDER_SLOTS;
-    for i in 0..HOLDER_SLOTS {
-        let slot = &HOLDERS[(start + i) % HOLDER_SLOTS];
-        let mut site = slot.site.load(Acquire);
-        if site.is_null() {
-            site = match slot.site.compare_exchange(std::ptr::null_mut(), ptr, AcqRel, Acquire) {
-                Ok(_) => ptr,
-                Err(other) => other,
-            };
-        }
-        if site == ptr {
-            slot.hold_ns.fetch_add(held_ns, Relaxed);
-            slot.holds.fetch_add(1, Relaxed);
-            return;
-        }
-    }
-    HOLDERS_REST[0].fetch_add(held_ns, Relaxed);
-    HOLDERS_REST[1].fetch_add(1, Relaxed);
-}
-
-/// One holder of the lanes' lock over a report's interval
-/// ([`LockStats::holders`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HolderDuty {
-    /// The call site that took the lock.
-    pub at: &'static std::panic::Location<'static>,
-    /// Nanoseconds it held the lock in all.
-    pub hold_ns: u64,
-    /// Times it took the lock.
-    pub holds: u64,
-}
-
-/// The table's interval, taken (reset): every site that held the lock,
-/// merged by `file:line` (one site can have several `Location`s across
-/// instantiations), the largest first; and what is beyond the reported
-/// few, as (held ns, holds).
-fn take_holders() -> ([Option<HolderDuty>; LOCK_HOLDERS_REPORTED], u64, u64) {
-    use std::sync::atomic::Ordering::{Acquire, Relaxed};
-    let mut all: Vec<HolderDuty> = Vec::new();
-    for slot in &HOLDERS {
-        let site = slot.site.load(Acquire);
-        if site.is_null() {
-            continue;
-        }
-        let (hold_ns, holds) = (slot.hold_ns.swap(0, Relaxed), slot.holds.swap(0, Relaxed));
-        if holds == 0 {
-            continue;
-        }
-        // SAFETY: a claimed slot only ever holds a `&'static Location`.
-        let at: &'static std::panic::Location<'static> = unsafe { &*site };
-        match all.iter_mut().find(|d| d.at.file() == at.file() && d.at.line() == at.line()) {
-            Some(d) => {
-                d.hold_ns += hold_ns;
-                d.holds += holds;
-            }
-            None => all.push(HolderDuty { at, hold_ns, holds }),
-        }
-    }
-    all.sort_by(|a, b| b.hold_ns.cmp(&a.hold_ns));
-    let mut rest_ns = HOLDERS_REST[0].swap(0, Relaxed);
-    let mut rest = HOLDERS_REST[1].swap(0, Relaxed);
-    let mut top = [None; LOCK_HOLDERS_REPORTED];
-    for (i, d) in all.into_iter().enumerate() {
-        if i < LOCK_HOLDERS_REPORTED {
-            top[i] = Some(d);
-        } else {
-            rest_ns += d.hold_ns;
-            rest += d.holds;
-        }
-    }
-    (top, rest_ns, rest)
-}
-
-/// [`LockStats::holders`] as one whitespace-free field for a log line:
-/// `file:line=held_us/holds`, comma-separated, the largest first.
-pub fn format_lock_holders(holders: &[Option<HolderDuty>]) -> String {
-    holders
-        .iter()
-        .flatten()
-        .map(|d| format!("{}:{}={}/{}", d.at.file(), d.at.line(), d.hold_ns / 1_000, d.holds))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 /// What [`take_lock_stats`] reports: the lanes' lock and the inbox drain
 /// since the previous call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -929,13 +795,6 @@ pub struct LockStats {
     /// Chunked remainders another lock holder finished before draining the
     /// inbox (a build's start, a prune): those holds are not bounded.
     pub drain_finished: u64,
-    /// The lock's duty per holder (call site), the largest first: what
-    /// each site held in all and how often ([`format_lock_holders`]).
-    pub holders: [Option<HolderDuty>; LOCK_HOLDERS_REPORTED],
-    /// The holders beyond the reported few: held nanoseconds and holds.
-    pub holders_rest_ns: u64,
-    /// See `holders_rest_ns`.
-    pub holders_rest: u64,
 }
 
 /// The lanes' lock and drain counters since the last call, which resets
@@ -944,7 +803,6 @@ pub fn take_lock_stats() -> LockStats {
     use std::sync::atomic::Ordering::Relaxed;
     let c = &LOCK_COUNTERS;
     let hold_max_at = HOLD_MAX_AT.lock().take();
-    let (holders, holders_rest_ns, holders_rest) = take_holders();
     LockStats {
         holds: c.holds.swap(0, Relaxed),
         hold_ns: c.hold_ns.swap(0, Relaxed),
@@ -959,9 +817,6 @@ pub fn take_lock_stats() -> LockStats {
         drain_chunks: c.drain_chunks.swap(0, Relaxed),
         drain_chunk_max_txs: c.drain_chunk_max_txs.swap(0, Relaxed),
         drain_finished: c.drain_finished.swap(0, Relaxed),
-        holders,
-        holders_rest_ns,
-        holders_rest,
     }
 }
 
@@ -1032,7 +887,6 @@ impl<T: PoolTransaction> Drop for TimedInner<'_, T> {
         if raise_max(&c.hold_max_ns, held_ns) {
             *HOLD_MAX_AT.lock() = Some(self.caller);
         }
-        note_holder(self.caller, held_ns);
         if held >= SLOW_LOCK || self.waited >= SLOW_LOCK {
             tracing::warn!(
                 target: "n42.tx_queue",
@@ -2814,14 +2668,12 @@ impl<T: PoolTransaction> TxQueue<T> {
         // Built only if an own block is held at this height (rarely): a
         // 200,000-entry set every block on every node was 10-20 ms.
         let carried = std::cell::OnceCell::new();
-        let (back, settle_lock_us, settle_held_us) = self.settle_own_block_timed(number, hash, |sender, nonce| {
+        let back = self.settle_own_block(number, hash, |sender, nonce| {
             carried
                 .get_or_init(|| mined.iter().copied().collect::<std::collections::HashSet<(Address, u64)>>())
                 .contains(&(*sender, nonce))
         });
         times.settle_us = at.elapsed().as_micros() as u64;
-        times.settle_lock_us = settle_lock_us;
-        times.settle_held_us = settle_held_us;
         let at = std::time::Instant::now();
         let highest = fold_highest(mined.iter().copied());
         times.senders = highest.len();
@@ -2893,16 +2745,12 @@ impl<T: PoolTransaction> TxQueue<T> {
             let at = std::time::Instant::now();
             let mined = block.mined;
             let carried = std::cell::OnceCell::new();
-            let (gave, settle_lock_us, settle_held_us) =
-                self.settle_own_block_timed(block.number, block.hash, |sender, nonce| {
-                    carried
-                        .get_or_init(|| mined.iter().copied().collect::<std::collections::HashSet<(Address, u64)>>())
-                        .contains(&(*sender, nonce))
-                });
-            back += gave;
+            back += self.settle_own_block(block.number, block.hash, |sender, nonce| {
+                carried
+                    .get_or_init(|| mined.iter().copied().collect::<std::collections::HashSet<(Address, u64)>>())
+                    .contains(&(*sender, nonce))
+            });
             times.settle_us += at.elapsed().as_micros() as u64;
-            times.settle_lock_us += settle_lock_us;
-            times.settle_held_us += settle_held_us;
             run.push(*block);
         }
         if !run.is_empty() {
@@ -3255,7 +3103,6 @@ impl<T: PoolTransaction> TxQueue<T> {
         // Freed after the lock: an evicted block is 200,000 `Arc`s.
         let mut evicted_all: Vec<Vec<Arc<ValidPoolTransaction<T>>>> = Vec::new();
         let mut inner = self.lock_inner_quiet();
-        times.lock_us = inner.waited.as_micros() as u64;
         // The block a whole hand-off just forgot the take of: what a plan
         // prepared ahead of the next build is accepted against.
         Self::mark_handed_in(&mut inner, hash);
@@ -3283,7 +3130,6 @@ impl<T: PoolTransaction> TxQueue<T> {
             evicted_all.push(gone);
         }
         inner.held.push_back((number, hash, transactions));
-        times.locked_us = inner.at.elapsed().as_micros() as u64;
         drop(inner);
         let freed = std::time::Instant::now();
         if lean && !evicted_all.is_empty() {
@@ -3302,31 +3148,9 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// says which (sender, nonce) it does) go back to the lanes. Returns how
     /// many went back. Heights the chain has passed are dropped too.
     pub fn settle_own_block(&self, number: u64, hash: B256, carried: impl Fn(&Address, u64) -> bool) -> usize {
-        self.settle_own_block_timed(number, hash, carried).0
-    }
-
-    /// [`Self::settle_own_block`], with its (lock wait, held) microseconds.
-    fn settle_own_block_timed(
-        &self,
-        number: u64,
-        hash: B256,
-        carried: impl Fn(&Address, u64) -> bool,
-    ) -> (usize, u64, u64) {
         // Quiet: only a give-back below moves the lanes, and raises the
         // generation itself.
-        let inner = self.lock_inner_quiet();
-        let lock_us = inner.waited.as_micros() as u64;
-        let at = inner.at;
-        let back = Self::settle_own_block_in(inner, number, hash, carried);
-        (back, lock_us, at.elapsed().as_micros() as u64)
-    }
-
-    fn settle_own_block_in(
-        mut inner: TimedInner<'_, T>,
-        number: u64,
-        hash: B256,
-        carried: impl Fn(&Address, u64) -> bool,
-    ) -> usize {
+        let mut inner = self.lock_inner_quiet();
         if inner.held.is_empty() {
             return 0;
         }

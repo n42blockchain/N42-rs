@@ -40,18 +40,6 @@ for tag in sys.argv[1:]:
               f'longest hold {med(g(iw, "lock_hold_max_us")) / 1e3:.2f} ms median, {max(g(iw, "lock_hold_max_us") or [0]) / 1e3:.2f} ms max by {mx.get("lock_hold_max_at", "-")} (most frequent holders {who}); '
               f'lock wait {med(g(iw, "lock_wait_us")) / 1e3:.1f} ms/5s, longest {max(g(iw, "lock_wait_max_us") or [0]) / 1e3:.2f} ms; '
               f'drains/5s {med(g(iw, "drains")):,.0f} of {med(g(iw, "drain_txs")) / max(1, med(g(iw, "drains"))):.0f} tx, mean {med(g(iw, "drain_us_mean")):.0f} us, max {max(g(iw, "drain_us_max") or [0]) / 1e3:.2f} ms')
-        # Stage 0 of docs/LANES_LOCK_SPLIT_DESIGN.md: lock_holders=file:line=held_us/holds,... per 5 s line.
-        held, holds = Counter(), Counter()
-        for d in iw:
-            for item in filter(None, d.get('lock_holders', '').split(',')):
-                site, _, v = item.rpartition('=')
-                us, _, n = v.partition('/')
-                site = site.rsplit('/', 1)[-1]
-                held[site] += int(us); holds[site] += int(n)
-        if held:
-            span = 5e6 * len(iw)
-            print('           holders (share of the window, holds/5s, mean hold): ' + '; '.join(
-                f'{k} {v / span:.1%} {holds[k] / len(iw):,.0f} {v / max(1, holds[k]):.0f} us' for k, v in held.most_common(8)))
         if pw:
             print(f'           prune ({len(pw)} blocks): prune_ms {med(g(pw, "prune_ms")):.0f}/{pct(g(pw, "prune_ms"), .9):.0f}; fold {med(g(pw, "fold_us")) / 1e3:.1f} ms, lock {med(g(pw, "lock_us")) / 1e3:.1f} ms, '
                   f'remove(hold) {med(g(pw, "remove_us")) / 1e3:.1f} ms, free {med(g(pw, "free_us")) / 1e3:.1f} ms; frames_swept {med(g(pw, "frames_swept")):.0f}; '

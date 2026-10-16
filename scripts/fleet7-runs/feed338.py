@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 """loop338 (docs 10.85): the lanes lock, the drain and the pruner per leg, from the new fields (scope section 11.4) in the three 30 s windows from the first
 full canonical block on layer 0 (as analyze334.py). usage: feed338.py <tag> ...
-`ingest` line (5 s): lock_duty_pct, lock_hold_max_us with its holder lock_hold_max_at, lock_wait_us / lock_wait_max_us, drains, drain_txs, drain_us_mean / max,
+`ingest` line (5 s): lock_duty_pct, lock_hold_max_us with its holder lock_hold_max_at, lock_wait_us / lock_wait_max_us, drains, drain_txs, drain_us_mean / max, drain_insert_us, drain_group_us, drain_runs, drain_run_txs,
 plus the rate and the semaphore wait. `canonical blocks pruned` line (per block): prune_ms, fold_us, lock_us, remove_us (now the hold alone), free_us,
 frames_swept, coalesced, prune_wait_ms."""
 import importlib.util, os, re, statistics as st, sys
@@ -39,7 +39,9 @@ for tag in sys.argv[1:]:
         print(f'  window {w + 1}: lock duty {med(g(iw, "lock_duty_pct")):.1f}% (max {max(g(iw, "lock_duty_pct") or [0]):.1f}); holds/5s {med(g(iw, "lock_holds")):,.0f}; '
               f'longest hold {med(g(iw, "lock_hold_max_us")) / 1e3:.2f} ms median, {max(g(iw, "lock_hold_max_us") or [0]) / 1e3:.2f} ms max by {mx.get("lock_hold_max_at", "-")} (most frequent holders {who}); '
               f'lock wait {med(g(iw, "lock_wait_us")) / 1e3:.1f} ms/5s, longest {max(g(iw, "lock_wait_max_us") or [0]) / 1e3:.2f} ms; '
-              f'drains/5s {med(g(iw, "drains")):,.0f} of {med(g(iw, "drain_txs")) / max(1, med(g(iw, "drains"))):.0f} tx, mean {med(g(iw, "drain_us_mean")):.0f} us, max {max(g(iw, "drain_us_max") or [0]) / 1e3:.2f} ms')
+              f'drains/5s {med(g(iw, "drains")):,.0f} of {med(g(iw, "drain_txs")) / max(1, med(g(iw, "drains"))):.0f} tx, mean {med(g(iw, "drain_us_mean")):.0f} us, max {max(g(iw, "drain_us_max") or [0]) / 1e3:.2f} ms; '
+              f'insert {med(g(iw, "drain_insert_us")) / 1e3:.1f} ms/5s ({med(g(iw, "drain_insert_us")) * 1e3 / max(1, med(g(iw, "drain_txs"))):.0f} ns/tx), '
+              f'group off-lock {med(g(iw, "drain_group_us")) / 1e3:.1f} ms/5s, runs/5s {med(g(iw, "drain_runs")):,.0f} of {med(g(iw, "drain_run_txs")):,.0f} tx')
         if pw:
             print(f'           prune ({len(pw)} blocks): prune_ms {med(g(pw, "prune_ms")):.0f}/{pct(g(pw, "prune_ms"), .9):.0f}; fold {med(g(pw, "fold_us")) / 1e3:.1f} ms, lock {med(g(pw, "lock_us")) / 1e3:.1f} ms, '
                   f'remove(hold) {med(g(pw, "remove_us")) / 1e3:.1f} ms, free {med(g(pw, "free_us")) / 1e3:.1f} ms; frames_swept {med(g(pw, "frames_swept")):.0f}; '

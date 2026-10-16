@@ -131,7 +131,7 @@ const PARK_BUILDS: u64 = 8;
 ///
 /// Parking is off because a parked lane is a sink. Nothing drains it -- that
 /// is the point -- but the generator keeps feeding its sender at full rate,
-/// `insert_valid` keeps adding to it, and [`TxQueue::gate_len`] leaves it
+/// `insert_keyed` keeps adding to it, and [`TxQueue::gate_len`] leaves it
 /// out, so the ingest never pushes back on it either. loop211 Pd node1 held
 /// its parked lanes at exactly the 64 the cap allows and watched them grow
 /// from 1,434 transactions each to 5,505 over fourteen blocks -- 91,764 to
@@ -492,6 +492,20 @@ pub const LEAN_DRAIN_WAKE_MAX: usize = 8 * DRAINER_SLICE;
 /// it holds the last reference to once it is behind the engine).
 pub fn free_later<G: Send + 'static>(garbage: G) {
     free_off_path(Box::new(garbage));
+}
+
+/// A pushed transaction with its sender and nonce, read when it was pushed
+/// (`TxQueue::index_and_stage`, the transaction in the pusher's cache) so
+/// the drain under the lanes' lock never reads the transaction itself
+/// ([`Inner::insert_keyed`]). Under a deep remainder a transaction drains
+/// half a second or more after its push, its memory long out of cache: on
+/// loop351 by's lean legs a drained transaction cost 125 ns of the lock in
+/// window 1 and 149-155 ns once the remainder held the whole ingest gate
+/// (controls 114-115 ns), and the drain took 65% of the lock against 47%.
+struct Keyed<T: PoolTransaction> {
+    sender: Address,
+    nonce: u64,
+    valid: Arc<ValidPoolTransaction<T>>,
 }
 
 /// What a prune took out of the queue, held until every lock is released.
@@ -986,7 +1000,7 @@ struct Inner<T: PoolTransaction> {
     /// yet in their lanes, in inbox order. Counted in the depth mirror. Any
     /// other drain finishes it first, so the inbox's order is the lanes'
     /// order whoever drains.
-    pending_drain: VecDeque<Arc<ValidPoolTransaction<T>>>,
+    pending_drain: VecDeque<Keyed<T>>,
     /// The frames noted with that remainder, each with the count of
     /// remainder transactions ever queued ([`Inner::pending_in`]) once its
     /// own were in the remainder: indexed when [`Inner::pending_out`]
@@ -1632,7 +1646,7 @@ impl<T: PoolTransaction> HashIndex<T> {
 /// prof3: 72% of a follower's samples on one kernel address).
 pub struct TxQueue<T: PoolTransaction> {
     inner: Arc<Mutex<Inner<T>>>,
-    inbox: Arc<Mutex<Vec<Arc<ValidPoolTransaction<T>>>>>,
+    inbox: Arc<Mutex<Vec<Keyed<T>>>>,
     staged: Arc<std::sync::atomic::AtomicUsize>,
     /// The by-hash index, when this queue keeps one. `None` is the default
     /// and costs the drain nothing at all -- not a lock, not a hash.
@@ -2477,11 +2491,17 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// a writer that held the queue's lock while waiting for them put the
     /// builder's pull from 22 ms to 103 (loop195 P2).
     fn index_and_stage(&self, staged: Vec<Arc<ValidPoolTransaction<T>>>) {
-        if let Some(index) = self.by_hash.as_ref() {
-            for transaction in &staged {
-                index.insert(transaction);
-            }
-        }
+        let index = self.by_hash.as_ref();
+        // Keyed here, while the pusher has the transaction in cache.
+        let staged: Vec<Keyed<T>> = staged
+            .into_iter()
+            .map(|valid| {
+                if let Some(index) = index {
+                    index.insert(&valid);
+                }
+                Keyed { sender: valid.sender(), nonce: valid.nonce(), valid }
+            })
+            .collect();
         let count = staged.len();
         // Counted under the inbox's lock, so the counter and the inbox
         // always agree for a drain that holds it (see `drain_inbox`).
@@ -3538,7 +3558,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// it), handed to `Inner::pending_drain` under the lock, and inserted
     /// `chunk` at a time, the lock released between chunks. The insert is
     /// the one-hold drain's, transaction by transaction in inbox order
-    /// (`Inner::insert_valid`), and the frames are indexed in the hold that
+    /// (`Inner::insert_keyed`), and the frames are indexed in the hold that
     /// inserts the last transaction. Whoever else drains while a remainder
     /// is pending finishes it first ([`Self::drain_inbox`]), so the lanes
     /// see the inbox's order whoever moves it; a lock holder that does not
@@ -5058,7 +5078,7 @@ impl<T: PoolTransaction> Inner<T> {
     /// Appends a batch taken from the inbox, and the frames noted with it,
     /// to the remainder. Each frame's mark is the remainder count with the
     /// batch in: every transaction of the frame is at or before it.
-    fn push_pending(&mut self, batch: Vec<Arc<ValidPoolTransaction<T>>>, frames: Vec<(NewFrame, Option<FrameTxs<T>>)>) {
+    fn push_pending(&mut self, batch: Vec<Keyed<T>>, frames: Vec<(NewFrame, Option<FrameTxs<T>>)>) {
         self.pending_in += batch.len() as u64;
         if !batch.is_empty() {
             // Moved, not copied: a `Vec` becomes the deque in O(1).
@@ -5078,8 +5098,8 @@ impl<T: PoolTransaction> Inner<T> {
     fn drain_pending(&mut self, budget: usize) -> usize {
         let mut moved = 0usize;
         while moved < budget {
-            let Some(valid) = self.pending_drain.pop_front() else { break };
-            self.insert_valid(valid);
+            let Some(Keyed { sender, nonce, valid }) = self.pending_drain.pop_front() else { break };
+            self.insert_keyed(sender, nonce, valid);
             moved += 1;
         }
         self.pending_out += moved as u64;
@@ -5090,10 +5110,10 @@ impl<T: PoolTransaction> Inner<T> {
         moved
     }
 
-    /// Queues one transaction the pusher has already wrapped.
-    fn insert_valid(&mut self, valid: Arc<ValidPoolTransaction<T>>) {
-        let sender = valid.sender();
-        let nonce = valid.nonce();
+    /// Queues one transaction the pusher has already wrapped, its sender
+    /// and nonce read at the push ([`Keyed`]): this never reads the
+    /// transaction itself.
+    fn insert_keyed(&mut self, sender: Address, nonce: u64, valid: Arc<ValidPoolTransaction<T>>) {
         let lane = self
             .lanes
             .entry(sender)
@@ -5183,14 +5203,14 @@ impl<T: PoolTransaction> Inner<T> {
                 self.len += 1;
             }
             let parked = lane.parked.is_some();
-            // As in `insert_valid`: a parked lane comes back through
+            // As in `insert_keyed`: a parked lane comes back through
             // `readmit_parked` and not through a give-back of the very
             // transactions the build could not use.
             if !lane.queued && !parked {
                 lane.queued = true;
                 senders.push(sender);
             }
-            // As in `insert_valid`: into the parked total first, then out
+            // As in `insert_keyed`: into the parked total first, then out
             // of it with the rest of the lane.
             if parked && fresh {
                 self.parked_len += 1;

@@ -4079,3 +4079,21 @@ Stage bv (wt-main, tree 96e406f83 = main 1f369746e + perf/handoff-done-first: `N
 2. **And the rate did not move**: pairs read +1.6%, -1.2%, +0.3% (one of three at the +1.5% rule). The reason is in the flags line: on the knob legs most builds start without a prepared body -- `prep_from_plan false` on 412 of 654 window-1 builds and 612 of 641 window-2 builds (controls: 19 and 6), `plan_body 0` on the same builds -- so what the hand-off saved, the build lost by planning from scratch. The early `done` was foreseen to need `mark_handed_block` so the selector's `handed == Some(Handed{build, block: Some(parent)})` check still passes; either that is not sufficient, or the lean pruner's mined watermarks (`lane_every_mined`) invalidate the prepared plan. The rejection reason in the Zka log settles which; the fix follows on the branch, then the pair is rerun.
 3. Window-1 record 4.513M (Zb, a control). The whole stage sits below stage bu (380-387M against 394-399M), controls included, with two foreign claims on the box during the legs; it is compared within the stage only.
 4. Structural next step, independent of this fix: docs/LANES_LOCK_SPLIT_DESIGN.md -- the lanes lock at 93-97% duty (inbox drain ~51%, pruner 16-35%, own-block eviction 10-18%); stage 0 timers and stage 1 (`N42_QUEUE_LEDGER_LOCK`, a separate lock for takes / handed / held / drops) are implemented on perf/queue-ledger-lock (9c16fc261, 96 tests) and wait for a stage.
+
+### 10.146 loop351 stage bw — each knob alone: the early hand-off reads 400.0M (round record) with its plans intact; the lean pruner is what starves the frame index; the ledger lock sets the window-1 record (4.613M) and fades in windows 2-3
+
+Stage bw (wt-main, tree 253bd28fe = main 1f369746e + perf/handoff-done-first (hand-off, lean pruner, frame census) + perf/queue-ledger-lock (stage 0 timers, `N42_QUEUE_LEDGER_LOCK`); 2,434 tests pass): two X14 controls, each knob of 10.145 alone, and the ledger lock twice.
+
+| leg | w1 | w2 | w3 | round | plan_body 0 : 1 (w1 / w2) | handoff_hold_us p50 | pruner prune_ms p50, remove_us |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| X11T16La, control | 4.498 | 4.113 | 4.060 | 380.1M | 3:659 / 1:608 | 7,578 | 45, 14.0 ms |
+| X11T16Lha, `N42_HANDOFF_DONE_FIRST=1` | 4.553 | 4.367 | 4.413 | **400.0M** | 7:617 / 1:624 | 599 | 48, 15.9 ms |
+| X11T16Lpa, `N42_PRUNE_LEAN=1` | 4.253 | 4.159 | 4.205 | 378.5M | **377:253 / 593:30** | 1,258 | 34, 4.9 ms |
+| X11T16Lla, `N42_QUEUE_LEDGER_LOCK=1` | **4.613** | 4.327 | 4.187 | 393.8M | 2:634 / 1:623 | 6,233 | 42, 14.5 ms |
+| X11T16Lb, control | 4.447 | 4.147 | 4.220 | 384.4M | 3:652 / 1:613 | 7,894 | 59, 19.4 ms |
+| X11T16Llb, `N42_QUEUE_LEDGER_LOCK=1` | 4.580 | 4.173 | 4.073 | 384.8M | 3:631 / 1:605 | 5,825 | 45, 15.5 ms |
+
+1. **The lean pruner is the culprit of 10.145.** Alone it reproduces the starvation exactly (plan_body 0 on 377 of 638 window-1 builds and 593 of 626 in window 2; the controls and every other leg: 1-7) while doing its own job (prune 34 ms, removals 4.9 ms). Its mined-watermark path (`lane_every_mined`, the folded removal) leaves the live frame index near empty with 2.4M transactions queued; the frame census it now carries says where the frames go. It stays off until fixed.
+2. **The early hand-off alone is a gain**: 400.0M -- the first round at 400M and the record (399.0M in 10.144) -- with the plan intact (plan_body 0 on 7 builds), the hold off the path (7.6 ms -> 0.6 ms p50) and windows 2-3 at 4.37-4.41M where the controls read 4.06-4.22M. One leg; stage bx reruns it twice before X15 is declared.
+3. **The ledger lock** takes the window-1 record to 4.613M (Lla) and 4.580M (Llb) -- the two highest first windows ever -- and then loses it: windows 2-3 at 4.07-4.33M, rounds 393.8M and 384.8M against 380.1M and 384.4M (+3.6%, +0.1%). The hold stays on the path (handoff_hold_us 5.8-6.2 ms: the ledger lock moves the hold off the lanes lock, not off the hand-off task), so it and the early hand-off are complementary; what fades after window 1 is the next question (the lock_holders table and ledger_* fields of these legs carry the answer). Stage bx runs the two together.
+4. Records: round 400.0M (Lha), window 1 4.613M (Lla).

@@ -475,7 +475,8 @@
   `shards_ready` 时（而不是字段发布之后）在自己的线程池（`n42-merge-*`）上按源 map 并行开始；合并出的 bundle 与单线程
   合并相同（账户、合约、按序 reverts、大小）。`StateReady` 与 `Complete` 仍在字段发布之后（发布写入本块的 QMDB 树，
   引擎插入与持久化要读），只是不再等合并。阶段行新增 `seal_to_shards_ready_us`（恒开）、`merge_early`、
-  `merge_join_wait_us`。测试 `tests/output_shards.rs` `the_merge_on_its_own_pool_equals_the_serial_merge`。
+  `merge_join_wait_us`，以及 `merge_start_ms`（从 seal 起）与 `merge_overlap_ms`（合并与 QMDB 根任务同时运行的时间；
+  开关关闭时为 0）。测试 `tests/output_shards.rs` `the_merge_on_its_own_pool_equals_the_serial_merge`。
 - `N42_SHARDS_BEFORE_RECEIPTS=1`（代码在 `output_shards.rs` `shards_before_receipts`，`payload.rs` 的 graft scope 与
   分片分支）：执行结束即 seal、输出留在分片中的块，slot 的 receipts 改在拥有其输入的线程（`n42-receipts-late`）上构建，
   graft scope 只等 freeze 与 `take_cached`，执行器 finish 之后立即登记 `shards_ready`；receipts 在第一次被读处（QMDB

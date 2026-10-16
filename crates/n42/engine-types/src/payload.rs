@@ -4393,6 +4393,18 @@ where
                     // merger (after the fields' publication) waited for it.
                     merge_early = leader_merge.early,
                     merge_join_wait_us = leader_merge.join_wait_us,
+                    // The merge's start from the seal and how long it ran
+                    // beside the QMDB root job, ms (VOTE_BOUND_GAPS 4: with
+                    // the merge after the publication the overlap is 0; at
+                    // shards ready it starts at seal + ~15, under the root).
+                    merge_start_ms = crate::fields_at_seal::us_between(sealed_instant, leader_merge.started) as f64 / 1000.0,
+                    merge_overlap_ms = crate::fields_at_seal::overlap_us(
+                        leader_merge.started,
+                        leader_merge.ended,
+                        root_started_at,
+                        root_ended_at,
+                    ) as f64
+                        / 1000.0,
                     // The shard path's QMDB root job, us: its operations
                     // (the leaves encoded on the global pool, the chunks
                     // joined, the sort) and the forest's compute (the lock,

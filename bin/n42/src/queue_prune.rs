@@ -138,6 +138,114 @@ pub fn prune_notification(
     }
 }
 
+/// The lean prune of one wake's notifications (`N42_PRUNE_LEAN`): the
+/// committed blocks of consecutive notifications folded into one
+/// [`TxQueue::prune_blocks`]; a reorg ends the run before it (its reverted
+/// transactions are offered again after the earlier blocks' prune and before
+/// its new chain's, as on the per-notification path). `waited` is the
+/// oldest notification's wait.
+pub fn prune_notifications_lean(
+    queue: &TxQueue<N42PooledTransaction>,
+    notifications: &[&CanonStateNotification<N42Primitives>],
+    waited: std::time::Duration,
+) {
+    let started = std::time::Instant::now();
+    let coalesced = notifications.len();
+    let mut sum = n42_tx_queue::PruneTimes::default();
+    let mut mined = 0usize;
+    // Every block's pairs and hashes of the run, in order.
+    let mut run: Vec<(u64, alloy_primitives::B256, Vec<(alloy_primitives::Address, u64)>, Vec<alloy_primitives::B256>)> =
+        Vec::new();
+    let flush = |run: &mut Vec<(u64, alloy_primitives::B256, Vec<(alloy_primitives::Address, u64)>, Vec<alloy_primitives::B256>)>,
+                 sum: &mut n42_tx_queue::PruneTimes| {
+        if run.is_empty() {
+            return;
+        }
+        let inputs: Vec<n42_tx_queue::PruneInput<'_>> = run
+            .iter()
+            .map(|(number, hash, pairs, hashes)| n42_tx_queue::PruneInput { number: *number, hash: *hash, mined: pairs, hashes })
+            .collect();
+        let (back, times) = queue.prune_blocks(&inputs);
+        if back > 0 {
+            warn!(target: "n42.tx_queue", blocks = inputs.len(), back, "an own block at a pruned height was not the one committed; its transactions are offered again");
+        }
+        sum.settle_us += times.settle_us;
+        sum.fold_us += times.fold_us;
+        sum.lock_us += times.lock_us;
+        sum.remove_us += times.remove_us;
+        sum.forget_us += times.forget_us;
+        sum.free_us += times.free_us;
+        sum.frames_swept += times.frames_swept;
+        sum.removals += times.removals;
+        sum.folded += times.folded;
+        run.clear();
+    };
+    for notification in notifications {
+        if let CanonStateNotification::Reorg { old, new } = notification {
+            flush(&mut run, &mut sum);
+            let reverted_blocks = old.blocks_iter().count();
+            let back = crate::queue_reorg::reverted_transactions(old, new);
+            let offered = back.len();
+            queue.push_reverted(back);
+            warn!(target: "n42.tx_queue", reverted_blocks, offered, new_blocks = new.blocks_iter().count(), "reorg: the reverted blocks' transactions are offered again");
+        }
+        for block in notification.committed().blocks_iter() {
+            n42_engine_types::canonical_head::saw(block.number());
+            queue.note_pruned(block.number());
+            let mut hashes: Vec<alloy_primitives::B256> = Vec::new();
+            let pairs: Vec<(alloy_primitives::Address, u64)> = block
+                .transactions_with_sender()
+                .map(|(sender, tx)| {
+                    hashes.push(*alloy_consensus::transaction::TxHashRef::tx_hash(tx));
+                    (*sender, alloy_consensus::Transaction::nonce(tx))
+                })
+                .collect();
+            mined += pairs.len();
+            run.push((block.number(), block.hash(), pairs, hashes));
+        }
+    }
+    flush(&mut run, &mut sum);
+    if mined > 10_000 {
+        let (parked_lanes, parked, park_capped) = queue.parked();
+        info!(
+            target: "n42.tx_queue",
+            mined,
+            queued = queue.len(),
+            usable = queue.usable(),
+            parked,
+            parked_lanes,
+            park_capped,
+            frames_indexed = queue.frames_indexed(),
+            prune_ms = started.elapsed().as_millis() as u64,
+            settle_us = sum.settle_us,
+            remove_us = sum.remove_us,
+            forget_us = sum.forget_us,
+            fold_us = sum.fold_us,
+            lock_us = sum.lock_us,
+            free_us = sum.free_us,
+            frames_swept = sum.frames_swept,
+            coalesced,
+            prune_wait_ms = waited.as_millis() as u64,
+            // `N42_PRUNE_LEAN`: the lock holds' sum is `remove_us`; these
+            // say how many removals the wake made and how many blocks were
+            // folded into them.
+            lean = true,
+            prune_removals = sum.removals,
+            blocks_folded = sum.folded,
+            "canonical blocks pruned from the queue"
+        );
+        let drops = queue.take_drops();
+        if drops.interesting() {
+            warn!(
+                target: "n42.tx_queue",
+                by_reason = ?drops.named(),
+                first = ?drops.samples,
+                "the queue let go of transactions"
+            );
+        }
+    }
+}
+
 /// A notification on its way to the pruning thread, with when it arrived.
 type Queued = (CanonStateNotification<N42Primitives>, std::time::Instant);
 
@@ -153,6 +261,12 @@ pub fn spawn_thread(queue: TxQueue<N42PooledTransaction>) -> Option<std::sync::m
                 batch.push(next);
             }
             let coalesced = batch.len();
+            if n42_tx_queue::prune_lean() {
+                let waited = batch[0].1.elapsed();
+                let notifications: Vec<&CanonStateNotification<N42Primitives>> = batch.iter().map(|(n, _)| n).collect();
+                prune_notifications_lean(&queue, &notifications, waited);
+                continue;
+            }
             for (notification, arrived) in batch {
                 prune_notification(&queue, &notification, coalesced, arrived.elapsed());
             }

@@ -398,6 +398,42 @@ pub struct PruneTimes {
     /// References released by the free (a transaction is freed when its
     /// last one goes).
     pub freed: usize,
+    /// `N42_PRUNE_LEAN`: the removals made (one per run of blocks folded
+    /// together, see [`TxQueue::prune_blocks`]), and the blocks folded into
+    /// them; 0 on the per-block path.
+    pub removals: usize,
+    /// Blocks folded into those removals.
+    pub folded: usize,
+}
+
+/// One canonical block for [`TxQueue::prune_blocks`]: its height and hash,
+/// its `(sender, nonce)` pairs and its transaction hashes.
+#[derive(Clone, Copy, Debug)]
+pub struct PruneInput<'a> {
+    /// The block's height.
+    pub number: u64,
+    /// The block's hash.
+    pub hash: B256,
+    /// The block's `(sender, nonce)` pairs.
+    pub mined: &'a [(Address, u64)],
+    /// The block's transaction hashes.
+    pub hashes: &'a [B256],
+}
+
+/// Whether the canonical pruner runs lean (`N42_PRUNE_LEAN=1`, default off),
+/// read and logged once: it does not drain the inbox inside its holds (the
+/// builders' drains move it), and the blocks of one wake are folded into one
+/// removal ([`TxQueue::prune_blocks`]). The pruner's first hold drained the
+/// ingest's backlog and was the lanes lock's longest holder (33-45 ms per
+/// 5 s), and a prune per block at ~22 blocks/s kept the pruner at a
+/// utilisation of ~1 (docs/DEGRADED_ONSET_ANALYSIS.md).
+pub fn prune_lean() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("N42_PRUNE_LEAN").is_ok_and(|v| v == "1");
+        tracing::info!(target: "n42.tx_queue", prune_lean = on, "N42_PRUNE_LEAN");
+        on
+    })
 }
 
 /// What a prune took out of the queue, held until every lock is released.
@@ -2572,6 +2608,106 @@ impl<T: PoolTransaction> TxQueue<T> {
         (back, times)
     }
 
+    /// The lean prune of several canonical blocks in order
+    /// (`N42_PRUNE_LEAN`): each block's own-block settle in order, and the
+    /// blocks' removals folded into one -- one fold of every pair to the
+    /// highest nonce a sender, one removal under the lock (or one bounded
+    /// pass under `N42_QUEUE_OFFLOCK`), one by-hash pass -- with no inbox
+    /// drain inside the holds.
+    ///
+    /// The result is that of [`Self::prune_block`] on each block in turn:
+    /// - a split at a sender's highest nonce over the blocks is the splits
+    ///   at each block's, and the watermark is their maximum;
+    /// - a settle that gives transactions back (an own block held at the
+    ///   height whose hash is not the committed one) needs the earlier
+    ///   blocks' removals made first, so the run folded so far is removed
+    ///   before such a settle; a settle that gives nothing back commutes
+    ///   with the removals;
+    /// - the inbox is not drained: a mined transaction still in it is left
+    ///   for the next drain, which refuses it against its lane's watermark
+    ///   (counted as `Dropped::Mined`), so a sender the block mined that has
+    ///   no lane yet gets an empty one carrying the watermark. The lanes,
+    ///   their depth and watermarks after that drain are the per-block
+    ///   path's; a frame of such transactions is indexed by that drain and
+    ///   swept by the next prune instead of this one.
+    ///
+    /// Returns how many transactions the settles gave back, and the times
+    /// summed (`removals`, `folded` say how the blocks were folded).
+    pub fn prune_blocks(&self, blocks: &[PruneInput<'_>]) -> (usize, PruneTimes)
+    where
+        T: 'static,
+    {
+        let mut times = PruneTimes::default();
+        let mut back = 0usize;
+        let mut run: Vec<PruneInput<'_>> = Vec::new();
+        for block in blocks {
+            if self.held_other_at(block.number, block.hash) && !run.is_empty() {
+                self.remove_folded(&run, &mut times);
+                run.clear();
+            }
+            let at = std::time::Instant::now();
+            let mined = block.mined;
+            let carried = std::cell::OnceCell::new();
+            back += self.settle_own_block(block.number, block.hash, |sender, nonce| {
+                carried
+                    .get_or_init(|| mined.iter().copied().collect::<std::collections::HashSet<(Address, u64)>>())
+                    .contains(&(*sender, nonce))
+            });
+            times.settle_us += at.elapsed().as_micros() as u64;
+            run.push(*block);
+        }
+        if !run.is_empty() {
+            self.remove_folded(&run, &mut times);
+        }
+        (back, times)
+    }
+
+    /// Whether an own block other than `hash` is held at `number`: its
+    /// settle would give transactions back ([`Self::prune_blocks`]).
+    fn held_other_at(&self, number: u64, hash: B256) -> bool {
+        let inner = self.lock_inner_quiet();
+        inner.held.iter().any(|(held_number, held_hash, _)| *held_number == number && *held_hash != hash)
+    }
+
+    /// One folded removal of `run`'s blocks ([`Self::prune_blocks`]).
+    fn remove_folded(&self, run: &[PruneInput<'_>], times: &mut PruneTimes)
+    where
+        T: 'static,
+    {
+        let at = std::time::Instant::now();
+        let highest = fold_highest(run.iter().flat_map(|block| block.mined.iter().copied()));
+        times.senders += highest.len();
+        times.fold_us += at.elapsed().as_micros() as u64;
+        let mut garbage = PruneGarbage::default();
+        let at = std::time::Instant::now();
+        if self.offlock() {
+            let (swept, lock_us, remove_us) = self.remove_mined_offlock_with(highest, &mut garbage, false);
+            times.frames_swept += swept;
+            times.lock_us += lock_us;
+            times.remove_us += remove_us;
+        } else {
+            let mut inner = self.lock_inner();
+            times.lock_us += at.elapsed().as_micros() as u64;
+            let held = std::time::Instant::now();
+            inner.lane_every_mined(&highest);
+            times.frames_swept += inner.remove_mined_highest(&highest, &mut garbage);
+            times.remove_us += held.elapsed().as_micros() as u64;
+        }
+        let at = std::time::Instant::now();
+        if let Some(index) = self.by_hash.as_ref() {
+            for block in run {
+                garbage.index.extend(index.remove_all(block.hashes));
+            }
+        }
+        times.forget_us += at.elapsed().as_micros() as u64;
+        let at = std::time::Instant::now();
+        times.freed += garbage.len();
+        garbage.free();
+        times.free_us += at.elapsed().as_micros() as u64;
+        times.removals += 1;
+        times.folded += run.len();
+    }
+
     /// [`Inner::remove_mined_highest`] in bounded holds of the lanes' lock
     /// with the lock released between them (`N42_QUEUE_OFFLOCK`): a first
     /// hold drains the inbox, names the block's nonces as being pruned
@@ -2591,6 +2727,18 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// last. Returns the frames swept, the waits for the lock and the holds'
     /// sum, in microseconds.
     fn remove_mined_offlock(&self, highest: AddressHashMap<u64>, garbage: &mut PruneGarbage<T>) -> (usize, u64, u64) {
+        self.remove_mined_offlock_with(highest, garbage, true)
+    }
+
+    /// [`Self::remove_mined_offlock`]; `drain` false is the lean prune's
+    /// (`N42_PRUNE_LEAN`): the first hold gives every mined sender a lane
+    /// for its watermark instead of draining the inbox.
+    fn remove_mined_offlock_with(
+        &self,
+        highest: AddressHashMap<u64>,
+        garbage: &mut PruneGarbage<T>,
+        drain: bool,
+    ) -> (usize, u64, u64) {
         let (mut lock_us, mut held_us) = (0u64, 0u64);
         let highest = Arc::new(highest);
         let senders: Vec<(Address, u64)> = highest.iter().map(|(sender, nonce)| (*sender, *nonce)).collect();
@@ -2602,7 +2750,11 @@ impl<T: PoolTransaction> TxQueue<T> {
         };
         {
             let (mut inner, held) = timed(&mut lock_us);
-            self.drain_inbox(&mut inner);
+            if drain {
+                self.drain_inbox(&mut inner);
+            } else {
+                inner.lane_every_mined(&highest);
+            }
             inner.pruning = Some(Arc::clone(&highest));
             if inner.prepared_holds_mined(&highest) {
                 garbage.taken.extend(inner.discard_prepared());
@@ -5052,6 +5204,23 @@ impl<T: PoolTransaction> Inner<T> {
     /// the lanes, then the frame index, then the build's taken list; what
     /// leaves goes to `garbage` for the caller to free after the lock.
     /// Returns how many frames the sweep dropped.
+    /// An empty lane for every sender in `highest` that has none, so the
+    /// removal records its watermark and a mined transaction still in the
+    /// inbox is refused when it drains (`N42_PRUNE_LEAN`, which leaves the
+    /// inbox to the builders' drains). Lanes are never removed, so this is
+    /// the lane the per-block path's drain would have made.
+    fn lane_every_mined(&mut self, highest: &AddressHashMap<u64>) {
+        for sender in highest.keys() {
+            self.lanes.entry(*sender).or_insert_with(|| Lane {
+                by_nonce: BTreeMap::new(),
+                queued: false,
+                mined: None,
+                chain_mined: None,
+                parked: None,
+            });
+        }
+    }
+
     fn remove_mined_highest(&mut self, highest: &AddressHashMap<u64>, garbage: &mut PruneGarbage<T>) -> usize {
         for (sender, nonce) in highest {
             if let Some(gone) = self.remove_mined_taking(*sender, *nonce, true) {

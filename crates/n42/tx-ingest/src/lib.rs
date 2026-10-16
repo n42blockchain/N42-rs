@@ -944,6 +944,13 @@ fn spawn_stats_reporter() {
                     drain_chunks = lock.drain_chunks,
                     drain_chunk_max_txs = lock.drain_chunk_max_txs,
                     drain_finished = lock.drain_finished,
+                    // The drains' insert under the lock and, with
+                    // `N42_TX_QUEUE_DRAIN_RUNS`, their grouping off it, and
+                    // the runs inserted whole and what they carried.
+                    drain_group_us = lock.drain_group_ns / 1_000,
+                    drain_insert_us = lock.drain_insert_ns / 1_000,
+                    drain_runs = lock.drain_runs,
+                    drain_run_txs = lock.drain_run_txs,
                     // `N42_PLAN_AHEAD`: prepared plans discarded, by reason.
                     plan_discards = %ahead_discards,
                     offlock_raced,

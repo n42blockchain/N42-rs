@@ -742,6 +742,10 @@ struct LockCounters {
     drain_chunks: std::sync::atomic::AtomicU64,
     drain_chunk_max_txs: std::sync::atomic::AtomicU64,
     drain_finished: std::sync::atomic::AtomicU64,
+    drain_group_ns: std::sync::atomic::AtomicU64,
+    drain_insert_ns: std::sync::atomic::AtomicU64,
+    drain_runs: std::sync::atomic::AtomicU64,
+    drain_run_txs: std::sync::atomic::AtomicU64,
 }
 
 static LOCK_COUNTERS: LockCounters = LockCounters {
@@ -757,6 +761,10 @@ static LOCK_COUNTERS: LockCounters = LockCounters {
     drain_chunks: std::sync::atomic::AtomicU64::new(0),
     drain_chunk_max_txs: std::sync::atomic::AtomicU64::new(0),
     drain_finished: std::sync::atomic::AtomicU64::new(0),
+    drain_group_ns: std::sync::atomic::AtomicU64::new(0),
+    drain_insert_ns: std::sync::atomic::AtomicU64::new(0),
+    drain_runs: std::sync::atomic::AtomicU64::new(0),
+    drain_run_txs: std::sync::atomic::AtomicU64::new(0),
 };
 
 /// The caller that set the current longest hold, beside it.
@@ -795,6 +803,18 @@ pub struct LockStats {
     /// Chunked remainders another lock holder finished before draining the
     /// inbox (a build's start, a prune): those holds are not bounded.
     pub drain_finished: u64,
+    /// Time the drains spent grouping their batches into per-sender runs
+    /// off the lanes' lock (`N42_TX_QUEUE_DRAIN_RUNS`), nanoseconds.
+    pub drain_group_ns: u64,
+    /// Time the drains spent inserting transactions into the lanes under
+    /// the lock (per transaction or run by run), nanoseconds: `drain_ns`
+    /// without the frame indexing and the remainder's bookkeeping.
+    pub drain_insert_ns: u64,
+    /// Per-sender runs inserted whole under the lock, and the transactions
+    /// they carried (the rest of `drain_txs` went in one at a time).
+    pub drain_runs: u64,
+    /// Transactions inserted as part of a run.
+    pub drain_run_txs: u64,
 }
 
 /// The lanes' lock and drain counters since the last call, which resets
@@ -817,6 +837,10 @@ pub fn take_lock_stats() -> LockStats {
         drain_chunks: c.drain_chunks.swap(0, Relaxed),
         drain_chunk_max_txs: c.drain_chunk_max_txs.swap(0, Relaxed),
         drain_finished: c.drain_finished.swap(0, Relaxed),
+        drain_group_ns: c.drain_group_ns.swap(0, Relaxed),
+        drain_insert_ns: c.drain_insert_ns.swap(0, Relaxed),
+        drain_runs: c.drain_runs.swap(0, Relaxed),
+        drain_run_txs: c.drain_run_txs.swap(0, Relaxed),
     }
 }
 
@@ -5097,10 +5121,15 @@ impl<T: PoolTransaction> Inner<T> {
     /// transaction is now in. Returns how many it moved.
     fn drain_pending(&mut self, budget: usize) -> usize {
         let mut moved = 0usize;
+        let at = std::time::Instant::now();
         while moved < budget {
             let Some(Keyed { sender, nonce, valid }) = self.pending_drain.pop_front() else { break };
             self.insert_keyed(sender, nonce, valid);
             moved += 1;
+        }
+        if moved > 0 {
+            let took = at.elapsed().as_nanos() as u64;
+            LOCK_COUNTERS.drain_insert_ns.fetch_add(took, std::sync::atomic::Ordering::Relaxed);
         }
         self.pending_out += moved as u64;
         while self.pending_frames.front().is_some_and(|(mark, _, _)| *mark <= self.pending_out) {

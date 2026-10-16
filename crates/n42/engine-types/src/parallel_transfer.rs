@@ -347,6 +347,14 @@ pub struct BatchSpans {
     pub open_sum_us: u64,
     /// The longest of them.
     pub open_max_us: u64,
+    /// When the first thread went idle (its last batch's end), microseconds
+    /// after the batches' start.
+    pub first_idle_us: u64,
+    /// The batches' end (`total_us`) less [`Self::first_idle_us`]: how long
+    /// the step ran with some thread idle (`par_steal_ms`).
+    pub steal_us: u64,
+    /// The wall time of the batch that ended last (`par_last_batch_ms`).
+    pub last_batch_us: u64,
 }
 
 impl BatchSpans {
@@ -370,6 +378,17 @@ impl BatchSpans {
             }
         }
         let dispatch_us = first_by_thread.iter().map(|(_, first)| *first).max().unwrap_or(0);
+        // Each thread's last end; the earliest of those is when the first
+        // thread ran out of batches.
+        let mut last_by_thread: Vec<(usize, u64)> = Vec::with_capacity(first_by_thread.len());
+        for span in spans.iter() {
+            match last_by_thread.iter_mut().find(|(thread, _)| *thread == span.thread) {
+                Some((_, last)) => *last = (*last).max(span.end_us),
+                None => last_by_thread.push((span.thread, span.end_us)),
+            }
+        }
+        let first_idle_us = last_by_thread.iter().map(|(_, last)| *last).min().unwrap_or(0);
+        let last_batch_us = spans.iter().max_by_key(|s| s.end_us).map_or(0, wall);
         let (batches, threads) = (spans.len(), first_by_thread.len());
         let wall_sum_us = spans.iter().map(wall).sum();
         let cpu_sum_us = spans.iter().map(|s| s.cpu_us).sum();
@@ -406,6 +425,9 @@ impl BatchSpans {
             live_deferred,
             open_sum_us,
             open_max_us,
+            first_idle_us,
+            steal_us: total_us.max(last_end).saturating_sub(first_idle_us),
+            last_batch_us,
             batches,
             threads,
             first_start_us: first_start,
@@ -1531,6 +1553,28 @@ pub fn build_batches() -> usize {
     *N.get_or_init(|| std::env::var("N42_BUILD_BATCHES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
+/// `N42_BUILD_WORK_STEALING=1` (`docs/SEALED_AT_FLOOR.md` cut 2): the
+/// build's batches (the `N42_BUILD_BATCHES` packing, [`STEAL_BATCHES_PER_WORKER`]
+/// a pool thread when that is 0) are not one pool job each: one task a pool
+/// thread opens its view of the parent and its batch state once, then takes
+/// the next unstarted batch (largest first) from a shared atomic cursor
+/// until none is left, executing every batch it takes into the same state.
+/// With `N42_BUILD_BATCHES=128` each pool job opened its own view, so the
+/// batches could not be made small; here a batch costs no open, the tail
+/// after the first thread goes idle is about one small batch, and a thread
+/// slowed by its batches simply takes fewer of them. Each batch's contents
+/// are the packing's; which thread ran it changes only which bundle holds
+/// its changes, and the graft adds the bundles' deltas, so the block's
+/// state, receipts and gas are the same. Off by default.
+pub fn build_work_stealing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILD_WORK_STEALING").is_ok_and(|v| v == "1"))
+}
+
+/// The batches a pool thread under [`Dispatch::Stealing`] with no
+/// `N42_BUILD_BATCHES`: 8, so 512 batches of ~400 transfers on 64 threads.
+pub const STEAL_BATCHES_PER_WORKER: usize = 8;
+
 /// How a build's batches are made and handed to the pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dispatch {
@@ -1542,11 +1586,18 @@ pub enum Dispatch {
     OneWave,
     /// `n` batches, spawned largest first (`N42_BUILD_BATCHES=<n>`).
     LargestFirst(usize),
+    /// `n` batches pulled largest first from one shared cursor by one task a
+    /// pool thread, each opening its view of the parent once
+    /// (`N42_BUILD_WORK_STEALING=1`).
+    Stealing(usize),
 }
 
 impl Dispatch {
     /// The dispatch the environment asks for.
     pub fn from_env() -> Self {
+        if build_work_stealing() {
+            return Self::Stealing(build_batches());
+        }
         match build_batches() {
             0 if build_one_wave() => Self::OneWave,
             0 => Self::Halves,
@@ -3960,6 +4011,8 @@ where
         match dispatch {
             Dispatch::OneWave => batch_groups_one_wave(&groups, keys.len(), workers),
             Dispatch::LargestFirst(n) => batch_groups_one_wave(&groups, keys.len(), n.max(1)),
+            Dispatch::Stealing(0) => batch_groups_one_wave(&groups, keys.len(), workers * STEAL_BATCHES_PER_WORKER),
+            Dispatch::Stealing(n) => batch_groups_one_wave(&groups, keys.len(), n),
             Dispatch::Halves => batch_groups(&groups, keys.len(), workers),
         };
     phases.batches = batches.len();
@@ -4000,17 +4053,24 @@ where
     phases.slots_us = slots_at.elapsed().as_micros() as u64;
     let slots_ref = &slots;
     type BatchResult =
-        (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, BatchSpan, LoopTimers, RunCounters, u64);
+        (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, Vec<BatchSpan>, LoopTimers, RunCounters, u64);
     // Each batch's span on the pool, against this instant (`BatchSpans`).
     let batches_at = std::time::Instant::now();
     phases.batches_start_us = batches_at.duration_since(call_at).as_micros() as u64;
     // `N42_BUILD_MLP=<k>`: the lookahead distance, 0 when off.
     let mlp_k = build_mlp();
     phases.mlp_k = mlp_k;
-    let run_batch = |members: &Vec<&Vec<usize>>| -> Result<BatchResult, NotParallel> {
+    // Runs the batches `claim` hands out, in the order it hands them, into one
+    // view of the parent and one batch state: one batch for the pool-job
+    // dispatches, as many as the shared cursor gives under
+    // `N42_BUILD_WORK_STEALING=1`. `capacity` sizes the state's map in
+    // transfers. `None` when `claim` gave nothing (no view opened).
+    let batch_txs = |index: usize| batches.get(index).map_or(0, |members| members.iter().map(|group| group.len()).sum::<usize>());
+    let run_claimed = |claim: &dyn Fn() -> Option<usize>, capacity: usize| -> Result<Option<BatchResult>, NotParallel> {
+        let Some(mut index) = claim() else { return Ok(None) };
         let start_us = batches_at.elapsed().as_micros() as u64;
         let cpu_start = ThreadMark::now();
-        let txs = members.iter().map(|group| group.len()).sum::<usize>();
+        let txs = capacity;
         let mut sampler = LoopSampler::new();
         let setup_at = sampler.on.then(std::time::Instant::now);
         // The open of the parent's view, timed on every batch: one of the
@@ -4031,9 +4091,18 @@ where
         // `N42_BUILD_MLP`: hints that went beneath the batch's map, for
         // `par_mlp_hints`.
         let mut mlp_hints = 0u64;
-        {
+        // One span a batch run here: the first from before the open (with
+        // the open's time), each later one from its claim.
+        let mut spans: Vec<BatchSpan> = Vec::with_capacity(1);
+        let (mut span_start, mut span_mark, mut span_open) = (start_us, cpu_start, open_us);
+        loop {
+            let Some(members) = batches.get(index) else {
+                return Err(NotParallel::Failed(index, "a claimed batch does not exist".to_string()));
+            };
             let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
-            if let Some(at) = setup_at {
+            if let Some(at) = setup_at
+                && spans.is_empty()
+            {
                 setup_ns = at.elapsed().as_nanos() as u64;
             }
             // `N42_BUILD_MLP=<k>`: the batch's transactions in the order
@@ -4130,8 +4199,19 @@ where
                 }
                 skipped.extend(rest.copied());
             }
-            close_at = sampler.on.then(std::time::Instant::now);
+            drop(evm);
+            spans.push(BatchSpan::close(span_start, span_mark, batch_txs(index), batches_at).with_open_us(span_open));
+            match claim() {
+                Some(next) => {
+                    index = next;
+                    span_start = batches_at.elapsed().as_micros() as u64;
+                    span_mark = ThreadMark::now();
+                    span_open = 0;
+                }
+                None => break,
+            }
         }
+        close_at = sampler.on.then(std::time::Instant::now);
         let bundle = state.take_bundle();
         // Drained here, on the batch's own thread, right after its
         // transfers are done: `N42_PHASE_TIMERS=1` only (see
@@ -4148,17 +4228,72 @@ where
             Some(sink) => {
                 sink(bundle);
                 let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
-                let span = BatchSpan::close(start_us, cpu_start, txs, batches_at).with_open_us(open_us);
-                Ok((skipped, None, timers, span, sampler.finish(setup_ns, close_ns), counted, mlp_hints))
+                Ok(Some((skipped, None, timers, spans, sampler.finish(setup_ns, close_ns), counted, mlp_hints)))
             }
             None => {
                 let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
-                let span = BatchSpan::close(start_us, cpu_start, txs, batches_at).with_open_us(open_us);
-                Ok((skipped, Some(bundle), timers, span, sampler.finish(setup_ns, close_ns), counted, mlp_hints))
+                Ok(Some((skipped, Some(bundle), timers, spans, sampler.finish(setup_ns, close_ns), counted, mlp_hints)))
             }
         }
     };
-    let results: Vec<Result<BatchResult, NotParallel>> = if let Dispatch::LargestFirst(_) = dispatch {
+    // One batch, `index`, as one pool job (the pool-job dispatches).
+    let run_batch = |index: usize| -> Result<BatchResult, NotParallel> {
+        let taken = std::sync::atomic::AtomicBool::new(false);
+        let claim = || (!taken.swap(true, std::sync::atomic::Ordering::Relaxed)).then_some(index);
+        run_claimed(&claim, batch_txs(index))?
+            .ok_or_else(|| NotParallel::Failed(index, "a batch did not run".to_string()))
+    };
+    let results: Vec<Result<BatchResult, NotParallel>> = if let Dispatch::Stealing(_) = dispatch {
+        // One task a pool thread over a shared cursor into the largest-first
+        // order: a thread takes the next unstarted batch when it finishes
+        // its last, so none waits behind a fixed share. A task that starts
+        // after the cursor ran out opens nothing; one that fails stops the
+        // others taking more.
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let sizes: Vec<usize> = (0..batches.len()).map(batch_txs).collect();
+        let order = largest_first(&sizes);
+        let cursor = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let claim = || {
+            if failed.load(Ordering::Relaxed) {
+                return None;
+            }
+            order.get(cursor.fetch_add(1, Ordering::Relaxed)).copied()
+        };
+        // A thread's share, with headroom for the batches it steals.
+        let capacity = keys.len() / workers + 1;
+        let tasks = workers.min(batches.len()).max(1);
+        let mut outcomes: Vec<Option<Result<Option<BatchResult>, NotParallel>>> = (0..tasks).map(|_| None).collect();
+        {
+            let (run_claimed, claim, failed) = (&run_claimed, &claim, &failed);
+            pool.scope(|scope| {
+                for outcome in outcomes.iter_mut() {
+                    scope.spawn(move |_| {
+                        let result = run_claimed(claim, capacity);
+                        if result.is_err() {
+                            failed.store(true, Ordering::Relaxed);
+                        }
+                        *outcome = Some(result);
+                    });
+                }
+            });
+        }
+        let mut results: Vec<Result<BatchResult, NotParallel>> = Vec::with_capacity(tasks);
+        for (i, outcome) in outcomes.into_iter().enumerate() {
+            match outcome {
+                Some(Ok(Some(result))) => results.push(Ok(result)),
+                Some(Ok(None)) => {}
+                Some(Err(err)) => results.push(Err(err)),
+                None => results.push(Err(NotParallel::Failed(i, "a stealing task did not run".to_string()))),
+            }
+        }
+        // Every batch taken: the cursor passed the last one (a task that
+        // failed returned its error above).
+        if cursor.load(Ordering::Relaxed) < order.len() && !failed.load(Ordering::Relaxed) {
+            results.push(Err(NotParallel::Failed(0, "a batch did not run".to_string())));
+        }
+        results
+    } else if let Dispatch::LargestFirst(_) = dispatch {
         // Spawned FIFO in the largest-first order: the workers take the
         // longest batches first and the short ones fill the tail. Results
         // are read back in batch order, as in the other dispatches.
@@ -4170,8 +4305,8 @@ where
             let run_batch = &run_batch;
             pool.scope_fifo(|scope| {
                 for &i in &order {
-                    if let (Some(slot), Some(members)) = (by_index.get_mut(i).and_then(Option::take), batches.get(i)) {
-                        scope.spawn_fifo(move |_| *slot = Some(run_batch(members)));
+                    if let Some(slot) = by_index.get_mut(i).and_then(Option::take) {
+                        scope.spawn_fifo(move |_| *slot = Some(run_batch(i)));
                     }
                 }
             });
@@ -4189,8 +4324,8 @@ where
         let mut slots: Vec<Option<Result<BatchResult, NotParallel>>> = (0..batches.len()).map(|_| None).collect();
         let run_batch = &run_batch;
         pool.scope(|scope| {
-            for (slot, members) in slots.iter_mut().zip(batches.iter()) {
-                scope.spawn(move |_| *slot = Some(run_batch(members)));
+            for (i, slot) in slots.iter_mut().enumerate() {
+                scope.spawn(move |_| *slot = Some(run_batch(i)));
             }
         });
         slots
@@ -4201,7 +4336,7 @@ where
     } else {
         pool.install(|| {
             use rayon::prelude::*;
-            batches.par_iter().map(run_batch).collect()
+            (0..batches.len()).into_par_iter().map(run_batch).collect()
         })
     };
     let batches_us = batches_at.elapsed().as_micros() as u64;
@@ -4218,10 +4353,10 @@ where
     run.counters.fees = tip_of.map(|_| U256::ZERO);
     let mut spans: Vec<BatchSpan> = Vec::with_capacity(results.len());
     for r in results {
-        let (skipped, bundle, timers, span, loop_timers, counted, mlp_hints) = r?;
+        let (skipped, bundle, timers, batch_spans, loop_timers, counted, mlp_hints) = r?;
         run.counters.add(counted);
         run.phases.mlp_hints += mlp_hints;
-        spans.push(span);
+        spans.extend(batch_spans);
         run.phases.loop_timers.add(loop_timers);
         run.skipped.extend(skipped);
         if let Some(bundle) = bundle {
@@ -6578,6 +6713,29 @@ mod tests {
                 let merged = frozen.merged(&BundleState::default());
                 let largest = (receipts_root_of(&executed), run.skipped, frozen.beneficiary_delta(), accounts_of(&merged), reverts_of(&merged), state_ops_of(&merged));
                 assert_eq!(two, largest, "{n} batches largest first equal the default dispatch");
+            }
+
+            // `N42_BUILD_WORK_STEALING=1`: the same batches pulled from one
+            // cursor, several into one state a thread, equal the default
+            // dispatch (0 is the per-worker default count).
+            for n in [0usize, 7, 128, 512] {
+                let shards = crate::output_shards::OutputShards::with_index_live(beneficiary, keys.len(), 16, true, true);
+                let sink = |bundle: BundleState| shards.add(bundle);
+                let run = execute_for_build_dispatched(&evm_env, &keys, &convert, &|| Some(db.clone()), Some(&sink), Dispatch::Stealing(n))
+                    .expect("a block of transfers");
+                assert!(run.phases.batches > 0);
+                assert_eq!(run.phases.batch_spans.batches, run.phases.batches, "{n}: one span a batch");
+                assert!(run.phases.batch_spans.threads <= build_pool().current_num_threads());
+                let executed: Vec<(usize, u64, bool)> = run
+                    .slots
+                    .iter()
+                    .filter_map(std::sync::OnceLock::get)
+                    .map(|b| (b.index, b.gas_used, b.result.is_success()))
+                    .collect();
+                let frozen = shards.freeze();
+                let merged = frozen.merged(&BundleState::default());
+                let stolen = (receipts_root_of(&executed), run.skipped, frozen.beneficiary_delta(), accounts_of(&merged), reverts_of(&merged), state_ops_of(&merged));
+                assert_eq!(two, stolen, "{n} batches by work stealing equal the default dispatch");
             }
         }
     }

@@ -707,6 +707,23 @@ fn main() {
                                             break;
                                         }
                                     }
+                                    None if n42_tx_queue::prune_lean() => {
+                                        // `N42_PRUNE_LEAN`: every notification
+                                        // already waiting is folded into this
+                                        // wake's one removal.
+                                        let mut batch = vec![notification];
+                                        loop {
+                                            match canonical.try_recv() {
+                                                Ok(next) => batch.push(next),
+                                                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                                                    warn!(target: "n42.tx_queue", skipped, "queue pruning fell behind canonical notifications");
+                                                }
+                                                Err(_) => break,
+                                            }
+                                        }
+                                        let notifications: Vec<_> = batch.iter().collect();
+                                        n42::queue_prune::prune_notifications_lean(&queue, &notifications, std::time::Duration::ZERO);
+                                    }
                                     None => n42::queue_prune::prune_notification(&queue, &notification, 1, std::time::Duration::ZERO),
                                 }
                             }

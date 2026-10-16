@@ -101,6 +101,7 @@ pub fn prune_notification(
         // is what loop207-208's defect 13 was -- 334-360k queued, empty
         // blocks, and no line saying which of the two it was.
         let (parked_lanes, parked, park_capped) = queue.parked();
+        let census = queue.frame_census();
         info!(
             target: "n42.tx_queue",
             mined,
@@ -110,6 +111,10 @@ pub fn prune_notification(
             parked_lanes,
             park_capped,
             frames_indexed = queue.frames_indexed(),
+            frames_aside = census.aside,
+            frames_pending = census.pending,
+            frames_inserted = census.inserted,
+            frames_refused = census.refused,
             prune_ms = started.elapsed().as_millis() as u64,
             settle_us = sum.settle_us,
             remove_us = sum.remove_us,
@@ -207,6 +212,7 @@ pub fn prune_notifications_lean(
     flush(&mut run, &mut sum);
     if mined > 10_000 {
         let (parked_lanes, parked, park_capped) = queue.parked();
+        let census = queue.frame_census();
         info!(
             target: "n42.tx_queue",
             mined,
@@ -216,6 +222,10 @@ pub fn prune_notifications_lean(
             parked_lanes,
             park_capped,
             frames_indexed = queue.frames_indexed(),
+            frames_aside = census.aside,
+            frames_pending = census.pending,
+            frames_inserted = census.inserted,
+            frames_refused = census.refused,
             prune_ms = started.elapsed().as_millis() as u64,
             settle_us = sum.settle_us,
             remove_us = sum.remove_us,

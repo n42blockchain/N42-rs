@@ -406,6 +406,23 @@ pub struct PruneTimes {
     pub folded: usize,
 }
 
+/// [`TxQueue::frame_census`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameCensus {
+    /// Frames in the live index.
+    pub live: usize,
+    /// Frames aside: taken whole, kept until mined or given back.
+    pub aside: usize,
+    /// Frames in a chunked drain's remainder, not indexed yet.
+    pub pending: usize,
+    /// Frames ever indexed.
+    pub inserted: u64,
+    /// Frames ever refused at the index's door.
+    pub refused: u64,
+    /// Of those, refused because the live index was full.
+    pub refused_at_cap: u64,
+}
+
 /// One canonical block for [`TxQueue::prune_blocks`]: its height and hash,
 /// its `(sender, nonce)` pairs and its transaction hashes.
 #[derive(Clone, Copy, Debug)]
@@ -2158,6 +2175,25 @@ impl<T: PoolTransaction> TxQueue<T> {
             return true;
         }
         !self.lock_inner_quiet().pending_frames.is_empty()
+    }
+
+    /// Where the frame index's entries are, for the pruner's per-block line:
+    /// live, aside (taken whole, `N42_FRAME_SWEEP_AT_TAKE`), waiting in a
+    /// chunked drain's remainder, and the running totals of frames indexed
+    /// and refused (an id already live or aside, a malformed record, or a
+    /// full index). A queue deep in transactions whose frames are neither
+    /// live nor waiting holds them frameless, where no frame build takes
+    /// them.
+    pub fn frame_census(&self) -> FrameCensus {
+        let inner = self.lock_inner_quiet();
+        FrameCensus {
+            live: inner.frames.len(),
+            aside: inner.frames.retired_len(),
+            pending: inner.pending_frames.len(),
+            inserted: inner.frames.inserted,
+            refused: inner.frames.refused,
+            refused_at_cap: inner.frames.refused_at_cap,
+        }
     }
 
     /// How many frames the index holds, counting those still in its inbox.

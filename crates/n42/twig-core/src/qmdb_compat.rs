@@ -985,6 +985,29 @@ std::thread_local! {
     static PARALLEL_APPLY_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether a block apply refreshes the cached upper tree from the twigs it
+/// marked dirty only (`N42_ROOT_UPPER_DIRTY=1`, off by default), instead of
+/// comparing every twig slot with the cached leaf level; or what
+/// [`set_root_upper_dirty_on_this_thread`] chose for the applying thread.
+/// The root is the same either way (`upper_tree_dirty_refresh_equals_the_full_fold`).
+pub fn root_upper_dirty() -> bool {
+    ROOT_UPPER_DIRTY_HERE.try_with(std::cell::Cell::get).ok().flatten().unwrap_or_else(|| {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("N42_ROOT_UPPER_DIRTY").is_ok_and(|v| v.trim() == "1"))
+    })
+}
+
+std::thread_local! {
+    static ROOT_UPPER_DIRTY_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests and benches: the dirty-only upper refresh on or off for applies made
+/// on this thread, whatever the environment says (`None` follows it again).
+#[doc(hidden)]
+pub fn set_root_upper_dirty_on_this_thread(on: Option<bool>) {
+    let _ = ROOT_UPPER_DIRTY_HERE.try_with(|here| here.set(on));
+}
+
 /// Applies whose writes ran on the worker pool ([`parallel_apply`]) since the
 /// process started.
 static PARALLEL_APPLY_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1179,6 +1202,10 @@ pub struct ApplyPhases {
     pub rehash_us: u64,
     /// The upper tree's refresh and the root read after the rehash.
     pub root_us: u64,
+    /// Twigs in the tree when the root was read.
+    pub twigs: usize,
+    /// Twigs the block marked for a rehash (leaves or bits).
+    pub dirty_twigs: usize,
     /// Page faults the applying thread took before the writes: the sort,
     /// the leaf hashes and lookups, the undo, the reserves, the retirement
     /// (the worker pool's own faults are not counted).
@@ -1437,10 +1464,66 @@ impl std::hash::Hasher for KeyPrefixHasher {
 /// call. A root read compares the leaf level with the twigs (a sequential scan
 /// of 32-byte roots) and rehashes only the ancestors of the roots that changed,
 /// so no mutation path has to report what it touched.
+///
+/// `synced` says the leaf level equals the twigs' roots as of the last refresh
+/// and no mutation has run since: only then may a block apply refresh it from
+/// the twigs it marked ([`root_upper_dirty`]). Every mutation path outside the
+/// block apply clears it ([`QmdbCompatTree::upper_stale`]); the apply clears it
+/// on entry and sets it again only with the root it returns.
 #[derive(Clone, Default)]
 struct UpperTree {
     cap: usize,
     nodes: Vec<Hash>,
+    synced: bool,
+}
+
+impl UpperTree {
+    /// Rebuilds every level for `count` twigs at capacity `cap`.
+    fn rebuild(&mut self, cap: usize, count: usize, root_of: impl Fn(usize) -> Hash) {
+        self.cap = cap;
+        self.nodes = vec![NULL_HASH; cap * 2];
+        for index in 0..count {
+            self.nodes[cap + index] = root_of(index);
+        }
+        for index in (1..cap).rev() {
+            self.nodes[index] = hash_node(&self.nodes[index * 2], &self.nodes[index * 2 + 1]);
+        }
+    }
+
+    /// Writes the roots of the twigs `ids` names (ascending, below `cap`) into
+    /// the leaf level and rehashes the ancestors of those that changed. With
+    /// `0..cap` this is the full scan [`QmdbCompatTree::root`] does.
+    fn refresh(&mut self, ids: impl Iterator<Item = usize>, root_of: impl Fn(usize) -> Hash) {
+        let cap = self.cap;
+        let mut changed: Vec<usize> = Vec::new();
+        for index in ids {
+            let root = root_of(index);
+            if self.nodes[cap + index] != root {
+                self.nodes[cap + index] = root;
+                changed.push(cap + index);
+            }
+        }
+        // `changed` ascends, so each level's parents ascend and dedup in place.
+        while changed.first().is_some_and(|node| *node > 1) {
+            let mut parents: Vec<usize> = changed.iter().map(|node| node / 2).collect();
+            parents.dedup();
+            let nodes = &self.nodes;
+            let hash_parent = |parent: &usize| hash_node(&nodes[parent * 2], &nodes[parent * 2 + 1]);
+            #[cfg(feature = "rayon")]
+            let hashes: Vec<Hash> = if parents.len() >= 1024 {
+                use rayon::prelude::*;
+                parents.par_iter().with_min_len(256).map(hash_parent).collect()
+            } else {
+                parents.iter().map(hash_parent).collect()
+            };
+            #[cfg(not(feature = "rayon"))]
+            let hashes: Vec<Hash> = parents.iter().map(hash_parent).collect();
+            for (parent, hash) in parents.iter().zip(hashes) {
+                self.nodes[*parent] = hash;
+            }
+            changed = parents;
+        }
+    }
 }
 
 /// Told before a tree cuts its entry file, so a reader that addresses the file
@@ -1782,6 +1865,7 @@ impl QmdbCompatTree {
 
     /// Append a new frozen leaf, deactivating an earlier live slot for `key`.
     pub fn set(&mut self, key: Hash, value: Vec<u8>) {
+        self.upper_stale();
         if let Some(old_slot) = self.index.get(&key, |slot| self.entries.key(slot as usize)) {
             self.record_deactivation(old_slot);
             self.deactivate(old_slot);
@@ -1805,6 +1889,7 @@ impl QmdbCompatTree {
 
     /// Deactivate a key without erasing its frozen leaf.
     pub fn delete(&mut self, key: &Hash) -> bool {
+        self.upper_stale();
         let Some(slot) = self.index.remove(key, |slot| self.entries.key(slot as usize)) else {
             return false;
         };
@@ -1891,6 +1976,7 @@ impl QmdbCompatTree {
     /// Nothing is mutated until every check has passed, so a refused record
     /// leaves the tree exactly as it was.
     pub fn apply_undo(&mut self, undo: &BlockUndo) -> Result<(), QmdbUndoError> {
+        self.upper_stale();
         if self.recording.is_some() {
             return Err(QmdbUndoError::RecordingActive);
         }
@@ -2128,6 +2214,14 @@ impl QmdbCompatTree {
         pre: Option<&[Option<Hash>]>,
     ) -> Result<(Hash, ApplyPhases), QmdbOperationError> {
         let mut phases = ApplyPhases::default();
+        // Whether the upper tree was in step with the twigs as the apply
+        // began; it is not from here until the apply's root is read, so an
+        // apply that fails half way leaves the next one the full scan.
+        let upper_synced = {
+            let upper = self.upper.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(&mut upper.synced, false)
+        };
+        let old_twigs = self.twigs.len();
         let faults_at = crate::prefault::thread_faults();
         let at = std::time::Instant::now();
         for i in 1..operations.op_count() {
@@ -2378,8 +2472,10 @@ impl QmdbCompatTree {
             rehash_dirty(&mut self.twigs, &dirty);
             phases.rehash_us = at.elapsed().as_micros() as u64;
         }
+        phases.twigs = self.twigs.len();
+        phases.dirty_twigs = dirty.iter().filter(|mark| **mark != 0).count();
         let at = std::time::Instant::now();
-        let root = self.root();
+        let root = self.root_after_apply(upper_synced, old_twigs, &dirty);
         phases.root_us = at.elapsed().as_micros() as u64;
         phases.hash_faults = crate::prefault::thread_faults().saturating_sub(faults_hash);
         crate::prefault::recycle_apply_scratch(scratch);
@@ -2591,55 +2687,65 @@ impl QmdbCompatTree {
             return NULL_HASH;
         }
         let cap = self.twigs.len().next_power_of_two();
-        let mut upper = self.upper.lock().unwrap_or_else(|poisoned| {
+        let mut upper = self.lock_upper();
+        let root_of = |index: usize| self.twigs.get(index).map_or(NULL_HASH, |twig| twig.root);
+        if upper.cap != cap {
+            // The tree grew or shrank past a power of two: the shape changed.
+            upper.rebuild(cap, self.twigs.len(), root_of);
+        } else {
+            // Every slot against the cached leaf level: O(cap), whatever changed.
+            upper.refresh(0..cap, root_of);
+        }
+        upper.synced = true;
+        let root = upper.nodes[1];
+        debug_assert_eq!(root, self.root_full(), "the cached upper tree diverged from the full fold");
+        root
+    }
+
+    /// The upper tree, rebuilt on the next read if a panic left it poisoned.
+    fn lock_upper(&self) -> std::sync::MutexGuard<'_, UpperTree> {
+        self.upper.lock().unwrap_or_else(|poisoned| {
             // A panic mid-refresh may have left the levels inconsistent: rebuild.
             let mut upper = poisoned.into_inner();
             upper.cap = 0;
+            upper.synced = false;
             upper
-        });
-        let root = if upper.cap != cap {
-            // The tree grew or shrank past a power of two: the shape changed.
-            upper.cap = cap;
-            upper.nodes = vec![NULL_HASH; cap * 2];
-            for (index, twig) in self.twigs.iter().enumerate() {
-                upper.nodes[cap + index] = twig.root;
-            }
-            for index in (1..cap).rev() {
-                upper.nodes[index] = hash_node(&upper.nodes[index * 2], &upper.nodes[index * 2 + 1]);
-            }
-            upper.nodes[1]
-        } else {
-            let mut changed: Vec<usize> = Vec::new();
-            for index in 0..cap {
-                let root = self.twigs.get(index).map_or(NULL_HASH, |twig| twig.root);
-                if upper.nodes[cap + index] != root {
-                    upper.nodes[cap + index] = root;
-                    changed.push(cap + index);
-                }
-            }
-            // `changed` ascends, so each level's parents ascend and dedup in place.
-            while changed.first().is_some_and(|node| *node > 1) {
-                let mut parents: Vec<usize> = changed.iter().map(|node| node / 2).collect();
-                parents.dedup();
-                let nodes = &upper.nodes;
-                let hash_parent = |parent: &usize| hash_node(&nodes[parent * 2], &nodes[parent * 2 + 1]);
-                #[cfg(feature = "rayon")]
-                let hashes: Vec<Hash> = if parents.len() >= 1024 {
-                    use rayon::prelude::*;
-                    parents.par_iter().with_min_len(256).map(hash_parent).collect()
-                } else {
-                    parents.iter().map(hash_parent).collect()
-                };
-                #[cfg(not(feature = "rayon"))]
-                let hashes: Vec<Hash> = parents.iter().map(hash_parent).collect();
-                for (parent, hash) in parents.iter().zip(hashes) {
-                    upper.nodes[*parent] = hash;
-                }
-                changed = parents;
-            }
-            upper.nodes[1]
-        };
-        debug_assert_eq!(root, self.root_full(), "the cached upper tree diverged from the full fold");
+        })
+    }
+
+    /// Marks the cached upper tree as possibly behind the twigs: the next
+    /// block apply refreshes it by the full scan. Called by every mutation
+    /// outside the block apply.
+    fn upper_stale(&mut self) {
+        match self.upper.get_mut() {
+            Ok(upper) => upper.synced = false,
+            Err(poisoned) => poisoned.into_inner().synced = false,
+        }
+    }
+
+    /// The root after a block apply: with [`root_upper_dirty`] on and the
+    /// upper tree in step with the twigs when the apply began (`synced`),
+    /// only the twigs the block marked in `dirty` and those it opened past
+    /// `old_twigs` are compared and their ancestors rehashed, O(dirty) where
+    /// [`Self::root`] scans every slot. A capacity change, or a cache not in
+    /// step, takes [`Self::root`].
+    fn root_after_apply(&self, synced: bool, old_twigs: usize, dirty: &[u8]) -> Hash {
+        if self.twigs.is_empty() {
+            return NULL_HASH;
+        }
+        let cap = self.twigs.len().next_power_of_two();
+        let mut upper = self.lock_upper();
+        if !synced || !root_upper_dirty() || upper.cap != cap || old_twigs > self.twigs.len() {
+            drop(upper);
+            return self.root();
+        }
+        let count = self.twigs.len();
+        let marked = dirty.iter().take(old_twigs.min(count)).enumerate().filter(|(_, mark)| **mark != 0).map(|(i, _)| i);
+        let ids = marked.chain(old_twigs..count);
+        upper.refresh(ids, |index| self.twigs[index].root);
+        upper.synced = true;
+        let root = upper.nodes[1];
+        debug_assert_eq!(root, self.root_full(), "the dirty-only upper refresh diverged from the full fold");
         root
     }
 
@@ -3888,6 +3994,117 @@ mod undo_tests {
         assert_eq!(tree.apply_undo(&undo), Err(QmdbUndoError::RecordingActive));
         tree.stop_undo_recording();
         tree.apply_undo(&undo).unwrap();
+    }
+
+    /// A splitmix64 step: the tests' deterministic randomness.
+    fn mix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// `N42_ROOT_UPPER_DIRTY`'s refresh: over 100,000 twigs with ~5,000
+    /// changed a round, refreshing the changed ids only lands on the full fold
+    /// and on what the full scan lands on.
+    #[test]
+    fn upper_tree_dirty_refresh_equals_the_full_fold() {
+        let count = 100_000usize;
+        let leaf = |i: usize, round: u64| *blake3::hash(&[(i as u64).to_le_bytes(), round.to_le_bytes()].concat()).as_bytes();
+        let mut roots: Vec<Hash> = (0..count).map(|i| leaf(i, 0)).collect();
+        let cap = count.next_power_of_two();
+        let mut dirty_only = UpperTree::default();
+        dirty_only.rebuild(cap, count, |i| roots[i]);
+        let mut scanned = dirty_only.clone();
+        assert_eq!(dirty_only.nodes[1], fold_portable_twig_roots(&roots));
+        let mut state = 42u64;
+        for round in 1..=4u64 {
+            let mut ids: Vec<usize> = (0..5_000).map(|_| (mix(&mut state) % count as u64) as usize).collect();
+            // A dense run as well: the block's tail twigs.
+            ids.extend(count - 9..count);
+            ids.sort_unstable();
+            ids.dedup();
+            for (n, id) in ids.iter().enumerate() {
+                // Every tenth marked twig keeps its root: a mark is not a change.
+                if n % 10 != 0 {
+                    roots[*id] = leaf(*id, round);
+                }
+            }
+            let root_of = |i: usize| roots.get(i).copied().unwrap_or(NULL_HASH);
+            dirty_only.refresh(ids.iter().copied(), root_of);
+            scanned.refresh(0..cap, root_of);
+            let full = fold_portable_twig_roots(&roots);
+            assert_eq!(dirty_only.nodes[1], full, "round {round}: dirty-only refresh");
+            assert_eq!(scanned.nodes[1], full, "round {round}: full scan");
+            assert!(dirty_only.nodes == scanned.nodes, "round {round}: every level agrees");
+        }
+    }
+
+    /// The block apply with `N42_ROOT_UPPER_DIRTY` on, through overwrites,
+    /// deletes, appends past capacity changes, one-off sets and undos (each of
+    /// which leaves the cache out of step until the next full scan): every
+    /// root equals the full fold and the root of the same history with the
+    /// switch off.
+    #[test]
+    fn dirty_only_upper_refresh_matches_the_full_scan_over_blocks() {
+        // ~29 twigs to start, crossing a capacity of 32 on the way, and few
+        // overwrites a block: most twigs are clean in any one block, so a
+        // twig left out of step by an undo or a set would show.
+        let mut on = QmdbCompatTree::new();
+        let mut off = QmdbCompatTree::new();
+        on.apply_sorted_ops(sets(0..60_000, 0xA0)).unwrap();
+        off.apply_sorted_ops(sets(0..60_000, 0xA0)).unwrap();
+        let mut state = 7u64;
+        let mut next = 60_000u64;
+        let mut undos = Vec::new();
+        for block in 0..24u64 {
+            let mut keys: Vec<u64> = (0..30).map(|_| mix(&mut state) % next).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            let mut ops: Vec<QmdbOperation> = keys
+                .iter()
+                .map(|n| QmdbOperation {
+                    key: key(*n),
+                    value: if *n % 13 == 5 { None } else { Some(vec![0xC0 ^ block as u8, *n as u8]) },
+                })
+                .collect();
+            let appended = 300 + mix(&mut state) % 600;
+            let before = next;
+            ops.extend(sets(next..next + appended, 0xE0 ^ block as u8));
+            next += appended;
+            ops.sort_by_key(|op| op.key);
+            // Every other block through the parallel apply's writes too.
+            set_parallel_apply_on_this_thread(Some(block % 2 == 1));
+            set_root_upper_dirty_on_this_thread(Some(true));
+            let (root_on, undo_on) = on.apply_sorted_ops_recorded(ops.clone()).unwrap();
+            set_root_upper_dirty_on_this_thread(Some(false));
+            let (root_off, undo_off) = off.apply_sorted_ops_recorded(ops).unwrap();
+            set_root_upper_dirty_on_this_thread(None);
+            set_parallel_apply_on_this_thread(None);
+            assert_eq!(root_on, root_off, "block {block}: on against off");
+            assert_eq!(root_on, on.root_full(), "block {block}: on against the full fold");
+            undos.push((undo_on, undo_off));
+            match block % 6 {
+                // An undo straight into the next apply, with no root read between.
+                3 => {
+                    let (undo_on, undo_off) = undos.pop().unwrap();
+                    on.apply_undo(&undo_on).unwrap();
+                    off.apply_undo(&undo_off).unwrap();
+                    next = before;
+                }
+                // A one-off set, again with no root read before the next apply.
+                5 => {
+                    let n = mix(&mut state) % next;
+                    on.set(key(n), vec![0x77, block as u8]);
+                    off.set(key(n), vec![0x77, block as u8]);
+                }
+                _ => {}
+            }
+        }
+        assert!(on.twig_count() > 32, "the test must cross a capacity of 32 twigs");
+        assert_eq!(on.root(), off.root());
+        assert_eq!(on.root(), on.root_full());
     }
 
     /// The cached upper tree against the full fold, as the tree grows through

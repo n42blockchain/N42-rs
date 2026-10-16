@@ -756,6 +756,19 @@ pub fn root_ops_ahead() -> bool {
     *ON.get_or_init(|| std::env::var("N42_ROOT_OPS_AHEAD").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `N42_ROOT_OPS_BEFORE_GATE=1` (`docs/ROOT_FIELDS_RACE.md` option B): on
+/// the output-shard path the leader's QMDB root job starts before
+/// `rename_parent` waits for the parent's fields, and does there what reads
+/// nothing of the parent: the operations' finish (the residual's accounts
+/// merged into the operations encoded ahead, or the whole encode) and their
+/// sort and leaf hashes (`LeafHashes::of`, which the leased compute would
+/// otherwise take before the lease). Only the tree's apply at the parent
+/// waits for the gate. The same operations and root either way. Off by default.
+pub fn root_ops_before_gate() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_ROOT_OPS_BEFORE_GATE").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// The shards' operations encoded ahead ([`root_ops_ahead`]), and when they
 /// were done.
 type OpsAheadJob = std::thread::JoinHandle<(n42_qmdb_reth::OpsAhead, std::time::Instant)>;
@@ -768,6 +781,11 @@ struct OpsAheadUse {
     waited: std::time::Duration,
     finish: std::time::Duration,
     done_at: Option<std::time::Instant>,
+    /// [`root_ops_before_gate`]: the job's work before the parent-fields
+    /// gate (the operations' finish, sort and leaf hashes), and how long it
+    /// then waited for the gate. Zero with the flag off.
+    pre_gate: std::time::Duration,
+    gate_wait: std::time::Duration,
 }
 
 /// The output shards frozen on a thread of their own ([`freeze_after_seal`]).
@@ -3961,16 +3979,17 @@ where
                     let roots = crate::hotstuff_consensus::gov5_receipt_root_bloom(&execution_result.receipts);
                     Ok::<_, ()>((execution_result, roots, late_wait))
                 });
-                rename_parent()?;
-                let parent_root_early = verify_fields.then(|| qmdb_state.root_of(&parent_sealed)).flatten();
-                let roots_from = std::time::Instant::now();
                 let qmdb_job = &qmdb_state;
                 let ahead = ops_ahead.take();
                 let shards_ref = &shards;
                 let overlaps_ref = &overlaps;
-                let root = scope.spawn(move || {
+                // `N42_ROOT_OPS_BEFORE_GATE=1`: the job starts before the
+                // rename below and waits on `gate` only for the apply.
+                let before_gate = root_ops_before_gate();
+                let (gate_open, gate) = std::sync::mpsc::sync_channel::<()>(1);
+                let root_body = move || {
                     // The leader's QMDB root job: on the critical set.
-                    let started = std::time::Instant::now();
+                    let spawned = std::time::Instant::now();
                     n42_core_layout::enter(n42_core_layout::Set::Critical);
                     // `N42_ROOT_OPS_AHEAD=1`: the shards' operations encoded
                     // beside the finish; the residual's added here. A job
@@ -3998,9 +4017,13 @@ where
                             sort_us: ahead.sort_us,
                         };
                         let ops = ahead.finish(&replaced, &newer, prague);
-                        Some((ops, split, OpsAheadUse { waited, finish: finish_at.elapsed(), done_at: Some(done_at) }))
+                        Some((
+                            ops,
+                            split,
+                            OpsAheadUse { waited, finish: finish_at.elapsed(), done_at: Some(done_at), ..Default::default() },
+                        ))
                     });
-                    let (ops, split, ahead_use) = match finished {
+                    let (ops, split, mut ahead_use) = match finished {
                         Some(finished) => finished,
                         None => {
                             let (ops, split) = n42_qmdb_reth::sorted_operations_from_accounts_timed(view_ref, prague);
@@ -4009,20 +4032,59 @@ where
                     };
                     let kept = verify_fields.then(|| ops.clone());
                     let ops_done = std::time::Instant::now();
-                    let prepared = qmdb_job.compute_operations(parent_sealed, ops);
+                    // Before the gate, the operations are sorted and their
+                    // leaf hashes taken here (what the leased compute does
+                    // before its lease under `N42_QMDB_PARALLEL_APPLY`): none
+                    // of it reads the parent's tree or fields.
+                    let (ops, leaves) = if before_gate {
+                        let mut ops = ops;
+                        let leaves = n42_qmdb_reth::sort_and_hash_leaves(&mut ops);
+                        (ops, leaves)
+                    } else {
+                        (ops, None)
+                    };
+                    let started = if before_gate {
+                        let head_done = std::time::Instant::now();
+                        // The rename failed (its sender dropped): no apply.
+                        gate.recv().ok()?;
+                        let opened = std::time::Instant::now();
+                        ahead_use.pre_gate = head_done.duration_since(spawned);
+                        ahead_use.gate_wait = opened.duration_since(head_done);
+                        opened
+                    } else {
+                        spawned
+                    };
+                    let prepared = qmdb_job.compute_operations_with_leaves(parent_sealed, ops, leaves);
                     let ended = std::time::Instant::now();
-                    let timed = (split, ops_done.duration_since(started), ended.duration_since(ops_done), ahead_use);
-                    (prepared, started, ended, kept, timed)
-                });
+                    // The operations' phase is its own length whichever side
+                    // of the gate it ran; the compute is the apply after it.
+                    let compute_from = if before_gate { started } else { ops_done };
+                    let timed = (split, ops_done.duration_since(spawned), ended.duration_since(compute_from), ahead_use);
+                    Some((prepared, started, ended, kept, timed))
+                };
+                let mut root_body = Some(root_body);
+                let early_root = if before_gate { root_body.take().map(|body| scope.spawn(body)) } else { None };
+                rename_parent()?;
+                // Opens the gate; with the flag off nothing waits on it.
+                let _ = gate_open.send(());
+                let parent_root_early = verify_fields.then(|| qmdb_state.root_of(&parent_sealed)).flatten();
+                let roots_from = std::time::Instant::now();
+                let root = match early_root {
+                    Some(root) => root,
+                    None => scope.spawn(root_body.take().ok_or_else(|| {
+                        PayloadBuilderError::other(std::io::Error::other("the QMDB root job was not spawned"))
+                    })?),
+                };
                 // The hashed post-state beside the root on a thread of its
                 // own, so the publication does not wait for it. A destroyed
                 // account's storage is zeroed from the database: the
                 // provider's own path, on the merged bundle, below.
                 let hashed = (!hashed_off && !destroyed)
                     .then(|| scope.spawn(move || crate::output_shards::hashed_post_state_of(view_ref)));
-                let (prepared, root_started, root_ended, kept_ops, ops_timed) = root.join().map_err(|_| {
-                    PayloadBuilderError::other(std::io::Error::other("the QMDB root job panicked"))
-                })?;
+                let (prepared, root_started, root_ended, kept_ops, ops_timed) =
+                    root.join().ok().flatten().ok_or_else(|| {
+                        PayloadBuilderError::other(std::io::Error::other("the QMDB root job panicked"))
+                    })?;
                 let (execution_result, roots, late_wait) = receipts.join().ok().and_then(Result::ok).ok_or_else(|| {
                     PayloadBuilderError::other(std::io::Error::other("the receipts root (or the late receipts) panicked"))
                 })?;
@@ -4511,6 +4573,10 @@ where
                     seal_to_ops_ahead_us = crate::fields_at_seal::us_between(sealed_instant, root_ops.3.done_at),
                     root_ops_ahead_wait_us = root_ops.3.waited.as_micros() as u64,
                     root_ops_finish_us = root_ops.3.finish.as_micros() as u64,
+                    // `N42_ROOT_OPS_BEFORE_GATE=1`: the root job's work before
+                    // the parent-fields gate and its wait there (0 when off).
+                    root_pre_gate_us = root_ops.3.pre_gate.as_micros() as u64,
+                    root_gate_wait_us = root_ops.3.gate_wait.as_micros() as u64,
                     // `N42_SEAL_AT_EXEC=1` (plan v6 G2): sealed at the parallel
                     // step's end with the fold behind the proposal; the
                     // transactions root computed over the pulled set beside
@@ -4685,6 +4751,13 @@ where
                     root_writes_us = root_split.writes_us,
                     root_index_us = root_split.index_us,
                     root_rehash_us = root_split.rehash_us + root_split.root_us,
+                    // The two halves of `root_rehash_us`: the twigs' rehash
+                    // (timed from the join with the index inserts) and the
+                    // upper tree's refresh with the root read.
+                    root_twig_rehash_us = root_split.rehash_us,
+                    root_upper_us = root_split.root_us,
+                    root_twigs = root_split.twigs,
+                    root_dirty_twigs = root_split.dirty_twigs,
                     root_note_us = root_split.note_us,
                     root_delta_us = root_split.delta_us,
                     root_apply_total_us = root_split.apply_total_us,

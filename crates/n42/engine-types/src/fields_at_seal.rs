@@ -295,8 +295,35 @@ pub fn us_between(from: Option<std::time::Instant>, to: Option<std::time::Instan
     }
 }
 
+/// How long two spans `[a_from, a_to]` and `[b_from, b_to]` ran at once, us:
+/// 0 when either is missing or they do not meet.
+pub fn overlap_us(
+    a_from: Option<std::time::Instant>,
+    a_to: Option<std::time::Instant>,
+    b_from: Option<std::time::Instant>,
+    b_to: Option<std::time::Instant>,
+) -> u64 {
+    match (a_from, a_to, b_from, b_to) {
+        (Some(a_from), Some(a_to), Some(b_from), Some(b_to)) => {
+            us_between(Some(a_from.max(b_from)), Some(a_to.min(b_to)))
+        }
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn overlap_is_the_shared_part_of_two_spans() {
+        let t0 = std::time::Instant::now();
+        let at = |us: u64| Some(t0 + std::time::Duration::from_micros(us));
+        assert_eq!(super::overlap_us(at(0), at(100), at(40), at(160)), 60);
+        assert_eq!(super::overlap_us(at(40), at(160), at(0), at(100)), 60);
+        assert_eq!(super::overlap_us(at(10), at(20), at(0), at(100)), 10);
+        assert_eq!(super::overlap_us(at(0), at(10), at(20), at(30)), 0);
+        assert_eq!(super::overlap_us(None, at(10), at(0), at(30)), 0);
+    }
+
     use super::*;
 
     #[test]

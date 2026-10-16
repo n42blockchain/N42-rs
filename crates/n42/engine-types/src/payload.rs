@@ -4603,6 +4603,9 @@ where
                     // the call, us; the hand-off noted as a whole take.
                     plan_body = select_times.body_ahead,
                     plan_body_us = select_times.body_ahead_us,
+                    // `N42_PLAN_BODY_WAIT_MS`: the time waited for a late
+                    // body, us (0 when not late or not waiting).
+                    plan_body_wait_us = select_times.body_ahead_wait_us,
                     prep_from_plan,
                     exec_prepared_groups,
                     exec_prepared_slots,

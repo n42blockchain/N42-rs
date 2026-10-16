@@ -134,7 +134,9 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
             // made with it; its candidates are these segments' transactions,
             // already cloned, when the segments are the ones it was made from.
             if times.ahead == 1 && plan_ahead_body_wanted() {
-                match best.take_prepared_body() {
+                let (take, waited_us) = best.take_prepared_body_within(plan_body_wait());
+                times.body_ahead_wait_us = waited_us;
+                match take {
                     n42_tx_queue::PreparedBodyTake::Ready(body, made_us) => {
                         times.body_ahead_us = made_us;
                         match body.downcast::<PreparedBuild<T>>() {
@@ -254,6 +256,18 @@ pub fn frame_walk_refuse_indexed() -> bool {
 pub fn plan_ahead_body() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_PLAN_AHEAD_BODY").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `N42_PLAN_BODY_WAIT_MS` (default 0, no wait): when the plan's body is not
+/// ready at the take (its hook still running), the build waits for it at
+/// most this long, parked on the body's slot, before making its own.
+pub fn plan_body_wait() -> std::time::Duration {
+    static WAIT: OnceLock<std::time::Duration> = OnceLock::new();
+    *WAIT.get_or_init(|| {
+        std::time::Duration::from_millis(
+            std::env::var("N42_PLAN_BODY_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0),
+        )
+    })
 }
 
 /// Whether the build asks for the plan's prepared body: the switch and every
@@ -482,6 +496,9 @@ pub struct SelectTimes {
     pub body_ahead: u8,
     /// The prepared body's making time (the hook's), us.
     pub body_ahead_us: u64,
+    /// `N42_PLAN_BODY_WAIT_MS`: how long the take waited for a body whose
+    /// hook had not finished, us (0 when it did not wait).
+    pub body_ahead_wait_us: u64,
 }
 
 std::thread_local! {
@@ -510,6 +527,7 @@ std::thread_local! {
             bulk_us: 0,
             body_ahead: 0,
             body_ahead_us: 0,
+            body_ahead_wait_us: 0,
         })
     };
 }

@@ -1160,6 +1160,54 @@ struct BodySlot {
     body: Option<PreparedBody>,
     /// The hook's own time.
     made_us: u64,
+    /// Whether the hook has run (its body may still be `None`).
+    filled: bool,
+    /// A build waiting for the body ([`QueueBest::take_prepared_body_within`]),
+    /// unparked when the hook fills the slot.
+    waiter: Option<std::thread::Thread>,
+}
+
+/// Fills a body slot with the hook's result and wakes a build waiting on it.
+fn fill_body_slot(slot: &Mutex<BodySlot>, body: Option<PreparedBody>, made_us: u64) {
+    let waiter = {
+        let mut slot = slot.lock();
+        slot.body = body;
+        slot.made_us = made_us;
+        slot.filled = true;
+        slot.waiter.take()
+    };
+    if let Some(waiter) = waiter {
+        waiter.unpark();
+    }
+}
+
+/// Takes a slot's body, waiting at most `max` for a hook that has not run
+/// yet (parked on the slot, unparked by [`fill_body_slot`]). Returns the take
+/// and the time waited, us (0 without a wait).
+fn take_body_slot(slot: &Mutex<BodySlot>, max: std::time::Duration) -> (PreparedBodyTake, u64) {
+    let mut start: Option<std::time::Instant> = None;
+    loop {
+        {
+            let mut guard = slot.lock();
+            let waited_us = start.map_or(0, |at| at.elapsed().as_micros() as u64);
+            if let Some(body) = guard.body.take() {
+                guard.waiter = None;
+                return (PreparedBodyTake::Ready(body, guard.made_us), waited_us);
+            }
+            if guard.filled || max.is_zero() {
+                guard.waiter = None;
+                return (PreparedBodyTake::Late, waited_us);
+            }
+            let at = *start.get_or_insert_with(std::time::Instant::now);
+            if at.elapsed() >= max {
+                guard.waiter = None;
+                return (PreparedBodyTake::Late, waited_us);
+            }
+            guard.waiter = Some(std::thread::current());
+        }
+        let at = start.unwrap_or_else(std::time::Instant::now);
+        std::thread::park_timeout(max.saturating_sub(at.elapsed()));
+    }
 }
 
 /// What a build found of its plan's prepared body
@@ -4449,9 +4497,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             let at = std::time::Instant::now();
             let body = hook(&segments, &plan);
             let made_us = at.elapsed().as_micros() as u64;
-            let mut slot = slot.lock();
-            slot.body = body;
-            slot.made_us = made_us;
+            fill_body_slot(&slot, body, made_us);
         }
     }
 
@@ -5986,12 +6032,16 @@ impl<T: PoolTransaction> QueueBest<T> {
     /// the plan was used whole, once. [`PreparedBodyTake::Late`] when the
     /// hook had not finished.
     pub fn take_prepared_body(&mut self) -> PreparedBodyTake {
-        let Some(slot) = self.prepared_body.take() else { return PreparedBodyTake::None };
-        let mut slot = slot.lock();
-        match slot.body.take() {
-            Some(body) => PreparedBodyTake::Ready(body, slot.made_us),
-            None => PreparedBodyTake::Late,
-        }
+        self.take_prepared_body_within(std::time::Duration::ZERO).0
+    }
+
+    /// [`Self::take_prepared_body`], waiting at most `max` for a body whose
+    /// hook has not finished (`N42_PLAN_BODY_WAIT_MS`): parked on the slot
+    /// and woken when the hook fills it. Also returns the time waited, us
+    /// (0 when the body was ready or `max` is zero).
+    pub fn take_prepared_body_within(&mut self, max: std::time::Duration) -> (PreparedBodyTake, u64) {
+        let Some(slot) = self.prepared_body.take() else { return (PreparedBodyTake::None, 0) };
+        take_body_slot(&slot, max)
     }
 
     /// A frame build's planned frames not yet handed out, all at once, in

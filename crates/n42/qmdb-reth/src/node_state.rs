@@ -668,6 +668,12 @@ pub fn sort_and_hash_leaves(ops: &mut QmdbOps) -> Option<n42_twig_core::qmdb_com
     n42_twig_core::qmdb_compat::parallel_apply().then(|| n42_twig_core::qmdb_compat::LeafHashes::of(ops))
 }
 
+/// [`sort_and_hash_leaves`] on operations already sorted, read through a
+/// shared reference (the early key lookups read them beside it).
+pub fn sort_and_hash_leaves_sorted(ops: &QmdbOps) -> Option<n42_twig_core::qmdb_compat::LeafHashes> {
+    n42_twig_core::qmdb_compat::parallel_apply().then(|| n42_twig_core::qmdb_compat::LeafHashes::of(ops))
+}
+
 /// Fills a computed root's split from the forest's last computation.
 fn fill_split(forest: &QmdbForest, split: &mut RootSplit, publish_us: u64) {
     let (move_us, phases) = forest.last_compute();
@@ -691,6 +697,8 @@ fn fill_split(forest: &QmdbForest, split: &mut RootSplit, publish_us: u64) {
     (split.note_us, split.delta_us, split.apply_total_us) = forest.last_compute_tail();
     split.undo_us = phases.undo_us;
     split.lookup_us = phases.lookup_us;
+    (split.lookup_early, split.lookup_fallback, split.lookup_saved_us) =
+        (phases.lookup_early, phases.lookup_fallback, phases.lookup_saved_us);
 }
 
 /// Where one QMDB root spent its time ([`QmdbNodeState::take_root_split`]).
@@ -786,6 +794,14 @@ pub struct RootSplit {
     /// Of `leaves_us`: the key index lookups alone (each touched key resolved
     /// to the slot it holds), microseconds.
     pub lookup_us: u64,
+    /// `N42_ROOT_LOOKUPS_EARLY`: whether the apply used the lookups taken
+    /// as soon as the parent's tree was in ([`QmdbNodeState::lookup_early`]).
+    pub lookup_early: bool,
+    /// Whether it was handed early lookups the tree had moved away from
+    /// (the apply looked the keys up again).
+    pub lookup_fallback: bool,
+    /// The lookups' time the early ones took off the apply, microseconds.
+    pub lookup_saved_us: u64,
 }
 
 /// The counters a [`RootSplit`] is the difference of.
@@ -1625,6 +1641,7 @@ impl QmdbNodeState {
         parent: B256,
         ops: QmdbOps,
         pre_leaves: Option<n42_twig_core::qmdb_compat::LeafHashes>,
+        early: Option<n42_twig_core::qmdb_compat::EarlyLookups>,
         held: impl Fn(&QmdbForest) -> Option<T>,
         file: impl FnOnce(&mut QmdbForest, PreparedBlock) -> Result<T, StateError>,
     ) -> Result<T, NodeStateError> {
@@ -1667,7 +1684,7 @@ impl QmdbNodeState {
         let mut lease = forest.lease_tree(parent)?;
         let leased_at = std::time::Instant::now();
         drop(guard);
-        let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lease.compute_with_leaves(ops, leaves.as_ref())));
+        let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lease.compute_with_early(ops, leaves.as_ref(), early.as_ref())));
         let mut guard = self.lock_as("lease_return");
         self.inner.occupancy.hold("tree_lease", leased_at.elapsed());
         split.lock_wait_ms += guard.waited_ms;
@@ -2349,6 +2366,54 @@ impl QmdbNodeState {
         ops: impl Into<QmdbOps>,
         pre_leaves: Option<n42_twig_core::qmdb_compat::LeafHashes>,
     ) -> Result<PreparedBlock, NodeStateError> {
+        self.compute_operations_with_early(parent, ops, pre_leaves, None)
+    }
+
+    /// The block's key lookups (`N42_ROOT_LOOKUPS_EARLY`): the tree is stood
+    /// at `parent` and leased for as long as the index reads take -- each of
+    /// the sorted `ops`' keys resolved to the slot it holds -- then put back
+    /// unchanged, so the block's apply ([`Self::compute_operations_with_early`])
+    /// starts with them in hand. Exact without any overlay: the reads are of
+    /// the parent's final tree, and the apply uses them only if the tree is
+    /// still in that state when it leases it. `None` (the apply looks the
+    /// keys up itself) on the locked path, for unsorted operations, a parent
+    /// the forest does not hold or refuses to build on, or a failed move.
+    pub fn lookup_early(&self, parent: B256, ops: &QmdbOps) -> Option<n42_twig_core::qmdb_compat::EarlyLookups> {
+        if !self.compute_offlock() || !ops.is_sorted() {
+            return None;
+        }
+        let mut guard = self.lock_as("lookup_early");
+        let forest = guard.as_mut()?;
+        if forest.root_of(&parent).is_none() || self.check_build_parent(forest, &parent).is_err() {
+            return None;
+        }
+        let lease = forest.lease_tree(parent).ok()?;
+        let leased_at = std::time::Instant::now();
+        drop(guard);
+        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lease.lookup_early(ops)));
+        let mut guard = self.lock_as("lease_return");
+        self.inner.occupancy.hold("tree_lease", leased_at.elapsed());
+        let Some(forest) = guard.as_mut() else { return None };
+        // Nothing was computed: the tree goes back as it was leased.
+        let _ = forest.return_tree(lease, Err(StateError::TreeLeased));
+        self.inner.tree_back.notify_all();
+        let trimmed = forest.take_deferred_release();
+        drop(guard);
+        release_off_lock(self.inner.canonical_number.load(std::sync::atomic::Ordering::Relaxed), trimmed);
+        early.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
+    /// [`Self::compute_operations_with_leaves`] with the block's key lookups
+    /// taken early ([`Self::lookup_early`]). Lookups the tree has moved away
+    /// from since are not used (the apply makes its own and counts the
+    /// fallback); the root is the same either way. Ignored on the locked path.
+    pub fn compute_operations_with_early(
+        &self,
+        parent: B256,
+        ops: impl Into<QmdbOps>,
+        pre_leaves: Option<n42_twig_core::qmdb_compat::LeafHashes>,
+        early: Option<n42_twig_core::qmdb_compat::EarlyLookups>,
+    ) -> Result<PreparedBlock, NodeStateError> {
         let ops = ops.into();
         if self.compute_offlock() {
             return self.with_leased_root(
@@ -2357,6 +2422,7 @@ impl QmdbNodeState {
                 parent,
                 ops,
                 pre_leaves,
+                early,
                 |forest| self.check_build_parent(forest, &parent).err().map(Err),
                 |_, prepared| Ok(Ok(prepared)),
             )?
@@ -2384,6 +2450,7 @@ impl QmdbNodeState {
                 block_hash,
                 parent,
                 ops,
+                None,
                 None,
                 |forest| forest.root_of(&block_hash),
                 |forest, prepared| {
@@ -2444,6 +2511,7 @@ impl QmdbNodeState {
                 block_hash,
                 parent,
                 ops,
+                None,
                 None,
                 |forest| forest.root_of(&block_hash),
                 |forest, prepared| {

@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
 use n42_twig_core::qmdb_compat::{
-    gov5_account_key, gov5_storage_key, BlockUndo, LeafHashes, QmdbCompatTree, QmdbEntrySnapshot,
+    gov5_account_key, gov5_storage_key, BlockUndo, EarlyLookups, LeafHashes, QmdbCompatTree, QmdbEntrySnapshot,
     QmdbOps, QmdbProof, QmdbSnapshot, TwigNodes,
 };
 use serde::{Deserialize, Serialize};
@@ -496,12 +496,32 @@ impl TreeLease {
     /// tree is out only for what needs it. Hashes that do not belong to the
     /// operations are ignored; the root is the same either way.
     pub fn compute_with_leaves(&mut self, ops: impl Into<QmdbOps>, leaves: Option<&LeafHashes>) -> Result<LeasedRoot, StateError> {
+        self.compute_with_early(ops, leaves, None)
+    }
+
+    /// The block's key lookups on the leased tree as it stands, for a
+    /// later [`Self::compute_with_early`] on the same state
+    /// (`N42_ROOT_LOOKUPS_EARLY`); `None` for unsorted operations.
+    pub fn lookup_early(&self, ops: &QmdbOps) -> Option<EarlyLookups> {
+        self.tree.lookup_early(ops)
+    }
+
+    /// [`Self::compute_with_leaves`] with the block's key lookups taken
+    /// early ([`Self::lookup_early`], on this lease or an earlier one).
+    /// Lookups taken on another state of the tree are not used (the apply
+    /// makes its own and counts the fallback); the root is the same either way.
+    pub fn compute_with_early(
+        &mut self,
+        ops: impl Into<QmdbOps>,
+        leaves: Option<&LeafHashes>,
+        early: Option<&EarlyLookups>,
+    ) -> Result<LeasedRoot, StateError> {
         let mut ops = ops.into();
         if !ops.is_sorted() {
             ops.sort();
         }
         let applied_at = std::time::Instant::now();
-        let (root, undo, phases) = self.tree.apply_ops_recorded_phased_with(&ops, leaves)?;
+        let (root, undo, phases) = self.tree.apply_ops_recorded_phased_early(&ops, leaves, early)?;
         let apply_us = applied_at.elapsed().as_micros() as u64;
         let delta_at = std::time::Instant::now();
         let tree = &self.tree;

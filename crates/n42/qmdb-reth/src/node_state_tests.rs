@@ -691,6 +691,46 @@ fn a_root_on_a_leased_tree_equals_the_locked_one_and_the_views_agree() {
     assert_eq!(locked.offlock_counters().leased_roots, 0);
 }
 
+/// `N42_ROOT_LOOKUPS_EARLY`: a producer's root computed with the key
+/// lookups taken early on the leased path equals the locked root; lookups
+/// taken before the tree moved (a sibling computed on the parent in between)
+/// are not used, and the root is still the same.
+#[test]
+fn early_lookups_on_the_leased_path_give_the_locked_roots() {
+    let (locked, _locked_view, genesis) = switched("early-lookups-locked", false, false);
+    let (leased, _leased_view, _) = switched("early-lookups-leased", true, true);
+    let mut parent = genesis;
+    for number in 1..=10u64 {
+        let want = file_from_operations(&locked, number, parent);
+        let mut ops: QmdbOps = changes_for(number).ops().into();
+        ops.sort();
+        let early = leased.lookup_early(parent, &ops).expect("the parent is held and the path is leased");
+        let moved = number % 4 == 2;
+        if moved {
+            // A sibling computed on the parent: the tree stands at it, unfiled.
+            let sibling = changes_for(number + 100).ops();
+            leased.validate_block_operations(parent, hash_of(number + 100), number, sibling, B256::ZERO).expect("sibling");
+        }
+        let prepared = leased.compute_operations_with_early(parent, ops, None, Some(early)).expect("compute");
+        let split = leased.take_root_split(&parent).expect("the split is keyed by the parent");
+        assert_eq!(prepared.root, want, "block {number}'s root");
+        assert_eq!(split.lookup_early, !moved, "block {number}");
+        assert_eq!(split.lookup_fallback, moved, "block {number}");
+        leased.insert(hash_of(number), number, prepared).expect("insert");
+        locked.on_canonical(hash_of(number)).expect("canonical");
+        leased.on_canonical(hash_of(number)).expect("canonical");
+        parent = hash_of(number);
+    }
+    assert_eq!(leased.state_root(), locked.state_root());
+    // The locked path takes no early lookups.
+    let ops: QmdbOps = {
+        let mut ops: QmdbOps = changes_for(11).ops().into();
+        ops.sort();
+        ops
+    };
+    assert!(locked.lookup_early(parent, &ops).is_none());
+}
+
 #[test]
 fn a_rename_while_the_tree_is_leased_is_followed_and_tree_readers_wait_for_it() {
     let (state, view, genesis) = switched("offlock-lease-race", true, true);

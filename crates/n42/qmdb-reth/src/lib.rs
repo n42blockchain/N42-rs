@@ -48,8 +48,11 @@ pub use reth_chainspec::qmdb::{
 /// The tree a producer computed for a block it has not yet sealed.
 pub use n42_qmdb_state::forest::PreparedBlock;
 pub use node_state::{
-    sort_and_hash_leaves, NodeStateError, OfflockCounters, PersistSplit, QmdbNodeState, RenameOutcome, RootSplit,
+    sort_and_hash_leaves, sort_and_hash_leaves_sorted, NodeStateError, OfflockCounters, PersistSplit, QmdbNodeState, RenameOutcome, RootSplit,
 };
+/// The block's key lookups taken before its apply (`N42_ROOT_LOOKUPS_EARLY`),
+/// and how many applies of this process could not use theirs.
+pub use n42_twig_core::qmdb_compat::{root_lookup_fallbacks, EarlyLookups};
 pub use read_view::{QmdbReadView, ViewLockWaits};
 pub use state_reader::{check_hashed_tables_setting, register_state_reader, QmdbStateReader};
 /// The latest-state reader registry the providers consult (`N42_QMDB_READS`).

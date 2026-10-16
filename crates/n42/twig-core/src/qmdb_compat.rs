@@ -1192,6 +1192,13 @@ pub struct ApplyPhases {
     /// The current-slot lookups alone (part of `leaves_us`): the key index
     /// reads that resolve each operation's key to the slot it holds.
     pub lookup_us: u64,
+    /// Whether the apply used lookups taken early ([`EarlyLookups`]) in
+    /// place of its own (`lookup_us` is then 0).
+    pub lookup_early: bool,
+    /// Whether it was handed early lookups it could not use.
+    pub lookup_fallback: bool,
+    /// The lookups' time the early ones saved the apply, microseconds.
+    pub lookup_saved_us: u64,
     /// The undo record's entries, on the worker pool.
     pub undo_us: u64,
     /// `undo_us` plus the retirement of the slots the block replaces, on the
@@ -1562,6 +1569,63 @@ pub struct QmdbCompatTree {
     /// as fast as it opens new ones, so a 128 KiB tree is recycled instead of
     /// freed on the eviction and allocated again on the append.
     spare_twig_nodes: Vec<TwigNodes>,
+    /// Which state of the key index and the entries this is: a number no
+    /// other tree state of the process has had, renewed by every mutation
+    /// ([`Self::epoch`]). Lookups taken early ([`EarlyLookups`]) are used
+    /// only on the state they were taken on.
+    epoch: u64,
+}
+
+/// The source of [`QmdbCompatTree::epoch`]: every tree state gets a fresh one.
+static TREE_EPOCHS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn fresh_epoch() -> u64 {
+    TREE_EPOCHS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Early lookups the apply could not use (the tree had moved since they were
+/// taken, or they belonged to other operations): the lookups were made again.
+static ROOT_LOOKUP_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many block applies of this process were handed early lookups
+/// ([`QmdbCompatTree::lookup_early`]) they could not use.
+pub fn root_lookup_fallbacks() -> u64 {
+    ROOT_LOOKUP_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The block's key lookups made before its apply (`N42_ROOT_LOOKUPS_EARLY`):
+/// the slot each operation's key held when they were taken, `None` for a key
+/// the tree does not hold. They answer for the apply exactly when the tree
+/// is still in the state they were read from (the same [`QmdbCompatTree::epoch`]
+/// and append cursor) and the operations are the same immutable version.
+#[derive(Debug, Clone, Default)]
+pub struct EarlyLookups {
+    held: Vec<Option<u64>>,
+    epoch: u64,
+    next_slot: u64,
+    identity: Option<std::sync::Arc<()>>,
+    /// The lookups' own time, microseconds: what the apply saves using them.
+    pub lookup_us: u64,
+}
+
+impl EarlyLookups {
+    /// How many operations the lookups cover.
+    pub fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Whether there are none.
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    /// Whether these lookups answer for `operations` on `tree` as it is now.
+    fn answer_for(&self, tree: &QmdbCompatTree, operations: &QmdbOps) -> bool {
+        self.epoch == tree.epoch
+            && self.next_slot == tree.next_slot
+            && self.held.len() == operations.len()
+            && self.identity.as_ref().is_some_and(|id| std::sync::Arc::ptr_eq(id, operations.identity()))
+    }
 }
 
 /// The most evicted leaf trees a tree keeps for reuse: 128 MiB. A head move
@@ -1613,6 +1677,7 @@ impl Clone for QmdbCompatTree {
             evicted_below: self.evicted_below,
             truncation_guard: self.truncation_guard.clone(),
             spare_twig_nodes: Vec::new(),
+            epoch: fresh_epoch(),
         }
     }
 }
@@ -1629,6 +1694,7 @@ impl QmdbCompatTree {
             evicted_below: 0,
             truncation_guard: None,
             spare_twig_nodes: Vec::new(),
+            epoch: fresh_epoch(),
         }
     }
 
@@ -1769,6 +1835,7 @@ impl QmdbCompatTree {
             evicted_below: full,
             truncation_guard: None,
             spare_twig_nodes: Vec::new(),
+            epoch: fresh_epoch(),
         };
         for slot in 0..n {
             if tree.entries.is_active(slot)
@@ -2181,16 +2248,75 @@ impl QmdbCompatTree {
         operations: &QmdbOps,
         leaves: Option<&LeafHashes>,
     ) -> Result<(Hash, BlockUndo, ApplyPhases), QmdbOperationError> {
-        let leaves = leaves.filter(|leaves| operations.is_sorted() && leaves.belongs_to(operations));
-        let Some(leaves) = leaves else { return self.apply_ops_recorded_phased(operations) };
-        self.start_undo_recording();
-        match self.apply_sorted_leaf_ops_with(operations, Some(&leaves.hashes)) {
-            Ok((root, phases)) => Ok((root, self.recording.take().unwrap_or_default(), phases)),
-            Err(error) => {
-                self.recording = None;
-                Err(error)
-            }
+        self.apply_ops_recorded_phased_early(operations, leaves, None)
+    }
+
+    /// The slot each of `operations`' keys holds now, `None` for a key the
+    /// tree does not hold: the lookups of the block apply, taken ahead of it
+    /// (`N42_ROOT_LOOKUPS_EARLY`) on the state the apply will start from, for
+    /// [`Self::apply_ops_recorded_phased_early`]. `None` for unsorted
+    /// operations (the apply sorts them into another version).
+    pub fn lookup_early(&self, operations: &QmdbOps) -> Option<EarlyLookups> {
+        if !operations.is_sorted() {
+            return None;
         }
+        let at = std::time::Instant::now();
+        let mut held = Vec::new();
+        held_slots(&self.index, &self.entries, operations, &mut held);
+        Some(EarlyLookups {
+            held,
+            epoch: self.epoch,
+            next_slot: self.next_slot,
+            identity: Some(std::sync::Arc::clone(operations.identity())),
+            lookup_us: at.elapsed().as_micros() as u64,
+        })
+    }
+
+    /// The state of the key index and the entries ([`EarlyLookups`]): equal
+    /// on two reads exactly when nothing mutated the tree between them.
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// [`Self::apply_ops_recorded_phased_with`] with the block's lookups
+    /// taken early ([`Self::lookup_early`]). Lookups taken on another state
+    /// of the tree, or for other operations, are not used: the apply looks
+    /// the keys up itself and counts the fallback
+    /// ([`root_lookup_fallbacks`]). The root is the same either way.
+    pub fn apply_ops_recorded_phased_early(
+        &mut self,
+        operations: &QmdbOps,
+        leaves: Option<&LeafHashes>,
+        early: Option<&EarlyLookups>,
+    ) -> Result<(Hash, BlockUndo, ApplyPhases), QmdbOperationError> {
+        let offered = early.is_some();
+        let early = early.filter(|early| operations.is_sorted() && early.answer_for(self, operations));
+        let fallback = offered && early.is_none();
+        if fallback {
+            ROOT_LOOKUP_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let leaves = leaves.filter(|leaves| operations.is_sorted() && leaves.belongs_to(operations));
+        let held = early.map(|early| early.held.as_slice());
+        let result = if leaves.is_none() && held.is_none() {
+            self.apply_ops_recorded_phased(operations)
+        } else {
+            self.start_undo_recording();
+            match self.apply_sorted_leaf_ops_held(operations, leaves.map(|leaves| leaves.hashes.as_slice()), held) {
+                Ok((root, phases)) => Ok((root, self.recording.take().unwrap_or_default(), phases)),
+                Err(error) => {
+                    self.recording = None;
+                    Err(error)
+                }
+            }
+        };
+        result.map(|(root, undo, mut phases)| {
+            phases.lookup_fallback = fallback;
+            if let Some(early) = early {
+                phases.lookup_early = true;
+                phases.lookup_saved_us = early.lookup_us;
+            }
+            (root, undo, phases)
+        })
     }
 
     /// [`Self::apply_sorted_slice_phased`] on a [`QmdbOps`].
@@ -2216,6 +2342,18 @@ impl QmdbCompatTree {
         operations: &O,
         pre: Option<&[Option<Hash>]>,
     ) -> Result<(Hash, ApplyPhases), QmdbOperationError> {
+        self.apply_sorted_leaf_ops_held(operations, pre, None)
+    }
+
+    /// [`Self::apply_sorted_leaf_ops_with`], with the slot each key holds
+    /// already looked up when `early` holds them (one per operation, on this
+    /// exact state of the tree: checked by the caller).
+    fn apply_sorted_leaf_ops_held<O: LeafOps + ?Sized>(
+        &mut self,
+        operations: &O,
+        pre: Option<&[Option<Hash>]>,
+        early: Option<&[Option<u64>]>,
+    ) -> Result<(Hash, ApplyPhases), QmdbOperationError> {
         let mut phases = ApplyPhases::default();
         // Whether the upper tree was in step with the twigs as the apply
         // began; it is not from here until the apply's root is read, so an
@@ -2224,6 +2362,9 @@ impl QmdbCompatTree {
             let upper = self.upper.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
             std::mem::replace(&mut upper.synced, false)
         };
+        // Whatever the apply does from here, early lookups taken before it
+        // no longer answer for this tree.
+        self.epoch = fresh_epoch();
         let old_twigs = self.twigs.len();
         let faults_at = crate::prefault::thread_faults();
         let at = std::time::Instant::now();
@@ -2253,7 +2394,14 @@ impl QmdbCompatTree {
         let mut scratch = crate::prefault::take_apply_scratch(count);
         let parallel = cfg!(feature = "rayon") && parallel_apply();
         let pre = pre.filter(|pre| pre.len() == operations.op_count());
-        if pre.is_some() {
+        let early = early.filter(|early| early.len() == operations.op_count());
+        if pre.is_some() && early.is_some() {
+            // Hashed ahead and looked up ahead: nothing to do here.
+        } else if early.is_some() {
+            // Looked up ahead: only the leaf hashes here.
+            leaf_hashes(operations, &mut scratch.leaves);
+            phases.leaf_hashes_us = at.elapsed().as_micros() as u64;
+        } else if pre.is_some() {
             // Hashed ahead, off the caller's lock: only the lookups here.
             let lookups_at = std::time::Instant::now();
             held_slots(&self.index, &self.entries, operations, &mut scratch.held);
@@ -2289,7 +2437,7 @@ impl QmdbCompatTree {
             phases.lookup_us = lookups_at.elapsed().as_micros() as u64;
         }
         let crate::prefault::ApplyScratch { leaves, held, pairs: appended } = &mut scratch;
-        let (leaves, held) = (pre.unwrap_or(leaves.as_slice()), &*held);
+        let (leaves, held) = (pre.unwrap_or(leaves.as_slice()), early.unwrap_or(held.as_slice()));
         phases.leaves_us = at.elapsed().as_micros() as u64;
         let at = std::time::Instant::now();
         // The undo record's entries -- what every retired slot held -- built
@@ -2726,6 +2874,7 @@ impl QmdbCompatTree {
     /// block apply refreshes it by the full scan. Called by every mutation
     /// outside the block apply.
     fn upper_stale(&mut self) {
+        self.epoch = fresh_epoch();
         match self.upper.get_mut() {
             Ok(upper) => upper.synced = false,
             Err(poisoned) => poisoned.into_inner().synced = false,
@@ -4235,5 +4384,79 @@ mod undo_tests {
             QmdbOperation { key: key(1), value: Some(vec![1]) },
         ]);
         assert_eq!(tree.apply_ops_recorded(&duplicate).map(|_| ()), Err(QmdbOperationError::DuplicateKey(key(1))));
+    }
+
+    /// `N42_ROOT_LOOKUPS_EARLY`: an apply handed the lookups taken before it
+    /// on the same state gives the plain apply's root and undo, through
+    /// overwrites, deletions, appends, undos, both apply modes and with or
+    /// without leaf hashes taken ahead; lookups the tree moved away from
+    /// (a set between the lookups and the apply) are not used, the apply
+    /// looks the keys up itself, and the fallback is counted.
+    #[test]
+    fn early_lookups_give_the_plain_root_and_fall_back_when_the_tree_moved() {
+        let mut early_tree = QmdbCompatTree::new();
+        let mut plain = QmdbCompatTree::new();
+        early_tree.apply_sorted_ops(sets(0..20_000, 0xA0)).unwrap();
+        plain.apply_sorted_ops(sets(0..20_000, 0xA0)).unwrap();
+        let mut state = 11u64;
+        let mut next = 20_000u64;
+        let mut undos = Vec::new();
+        for block in 0..30u64 {
+            let mut keys: Vec<u64> = (0..400).map(|_| mix(&mut state) % next).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            let mut ops: Vec<QmdbOperation> = keys
+                .iter()
+                .map(|n| QmdbOperation {
+                    key: key(*n),
+                    value: if *n % 17 == 3 { None } else { Some(vec![0xC0 ^ block as u8, *n as u8]) },
+                })
+                .collect();
+            let appended = 100 + mix(&mut state) % 3000;
+            let before = next;
+            ops.extend(sets(next..next + appended, 0xE0 ^ block as u8));
+            // A key never written: looked up as absent.
+            ops.push(QmdbOperation { key: key(1 << 40 | block), value: Some(vec![block as u8]) });
+            next += appended;
+            let mut ops = QmdbOps::from(ops);
+            ops.sort();
+            set_parallel_apply_on_this_thread(Some(block % 2 == 1));
+            let leaves = (block % 3 != 0).then(|| LeafHashes::of(&ops));
+            let early = early_tree.lookup_early(&ops).expect("sorted operations are looked up");
+            assert_eq!(early.len(), ops.len());
+            let stale = block % 5 == 4;
+            if stale {
+                // The tree moves after the lookups: they no longer answer.
+                let n = mix(&mut state) % next.min(before);
+                early_tree.set(key(n), vec![0x77, block as u8]);
+                plain.set(key(n), vec![0x77, block as u8]);
+            }
+            let fallbacks = root_lookup_fallbacks();
+            let (root_early, undo_early, phases) =
+                early_tree.apply_ops_recorded_phased_early(&ops, leaves.as_ref(), Some(&early)).unwrap();
+            let (root_plain, undo_plain, plain_phases) = plain.apply_ops_recorded_phased_with(&ops, leaves.as_ref()).unwrap();
+            set_parallel_apply_on_this_thread(None);
+            assert_eq!(root_early, root_plain, "block {block}: early against plain");
+            assert_eq!(undo_early, undo_plain, "block {block}: the undo records");
+            assert_eq!(root_early, early_tree.root_full(), "block {block}: against the full fold");
+            assert_eq!(phases.lookup_early, !stale, "block {block}");
+            assert_eq!(phases.lookup_fallback, stale, "block {block}");
+            assert!(!plain_phases.lookup_early && !plain_phases.lookup_fallback);
+            if stale {
+                assert!(root_lookup_fallbacks() > fallbacks, "block {block}: the fallback is counted");
+            } else {
+                assert_eq!(phases.lookup_saved_us, early.lookup_us);
+            }
+            // The same lookups no longer answer once the block is applied.
+            assert!(!early.answer_for(&early_tree, &ops), "block {block}: stale after the apply");
+            undos.push((undo_early, undo_plain));
+            if block % 6 == 3 {
+                let (undo_early, undo_plain) = undos.pop().unwrap();
+                early_tree.apply_undo(&undo_early).unwrap();
+                plain.apply_undo(&undo_plain).unwrap();
+                next = before;
+            }
+        }
+        assert_eq!(early_tree.root(), plain.root());
     }
 }

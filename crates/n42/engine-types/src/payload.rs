@@ -744,6 +744,21 @@ pub fn root_ops_before_gate() -> bool {
     *ON.get_or_init(|| std::env::var("N42_ROOT_OPS_BEFORE_GATE").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `N42_ROOT_LOOKUPS_EARLY=1` (`docs/ROOT_PIPELINE_DESIGN.md` stage 1), with
+/// [`root_ops_before_gate`]: as soon as the parent-fields gate opens (the
+/// tree is at the parent's final state), a thread of the root job leases the
+/// tree and resolves every key of the block's sorted operations to the slot
+/// it holds (the apply's key index lookups), beside the job's leaf hashes,
+/// and puts the tree back; the gated apply then uses those slots instead of
+/// looking the keys up again. Exact without an overlay: the reads are of the
+/// parent's final tree, and the apply falls back to its own lookups (counted
+/// in `root_lookup_fallbacks`) if the tree moved in between. The same root
+/// either way. Off by default.
+pub fn root_lookups_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_ROOT_LOOKUPS_EARLY").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// The shards' operations encoded ahead ([`root_ops_ahead`]), and when they
 /// were done.
 type OpsAheadJob = std::thread::JoinHandle<(n42_qmdb_reth::OpsAhead, std::time::Instant)>;
@@ -761,6 +776,11 @@ struct OpsAheadUse {
     /// then waited for the gate. Zero with the flag off.
     pre_gate: std::time::Duration,
     gate_wait: std::time::Duration,
+    /// [`root_lookups_early`]: the early pass's wall (the lease, the
+    /// lookups, the return), and whether it produced lookups. Zero / false
+    /// with the flag off.
+    lookup_early: std::time::Duration,
+    lookup_early_taken: bool,
 }
 
 /// The output shards frozen on a thread of their own ([`freeze_after_seal`]).
@@ -3961,6 +3981,7 @@ where
                 // `N42_ROOT_OPS_BEFORE_GATE=1`: the job starts before the
                 // rename below and waits on `gate` only for the apply.
                 let before_gate = root_ops_before_gate();
+                let lookups_early = before_gate && root_lookups_early();
                 let (gate_open, gate) = std::sync::mpsc::sync_channel::<()>(1);
                 let root_body = move || {
                     // The leader's QMDB root job: on the critical set.
@@ -4011,25 +4032,54 @@ where
                     // leaf hashes taken here (what the leased compute does
                     // before its lease under `N42_QMDB_PARALLEL_APPLY`): none
                     // of it reads the parent's tree or fields.
-                    let (ops, leaves) = if before_gate {
+                    let mut early = None;
+                    let (ops, leaves) = if before_gate && lookups_early {
+                        // `N42_ROOT_LOOKUPS_EARLY=1`: the key lookups on a
+                        // thread of their own from the gate's opening, beside
+                        // the leaf hashes; the apply waits for both.
+                        let mut ops = ops;
+                        if !ops.is_sorted() {
+                            ops.sort();
+                        }
+                        let ops_ref = &ops;
+                        let (leaves, head_done, opened) = std::thread::scope(|inner| {
+                            let side = std::thread::Builder::new().name("n42-root-lookups".into()).spawn_scoped(inner, move || {
+                                n42_core_layout::enter(n42_core_layout::Set::Critical);
+                                gate.recv().ok()?;
+                                let opened = std::time::Instant::now();
+                                let found = qmdb_job.lookup_early(parent_sealed, ops_ref);
+                                Some((opened, opened.elapsed(), found))
+                            });
+                            let leaves = n42_qmdb_reth::sort_and_hash_leaves_sorted(ops_ref);
+                            let head_done = std::time::Instant::now();
+                            // A thread that could not start, or a rename that
+                            // failed (the gate's sender dropped): no apply.
+                            let (opened, took, found) = side.ok()?.join().ok().flatten()?;
+                            ahead_use.lookup_early = took;
+                            ahead_use.lookup_early_taken = found.is_some();
+                            early = found;
+                            Some((leaves, head_done, opened))
+                        })?;
+                        ahead_use.pre_gate = head_done.duration_since(spawned);
+                        ahead_use.gate_wait = opened.saturating_duration_since(head_done);
+                        (ops, leaves)
+                    } else if before_gate {
                         let mut ops = ops;
                         let leaves = n42_qmdb_reth::sort_and_hash_leaves(&mut ops);
-                        (ops, leaves)
-                    } else {
-                        (ops, None)
-                    };
-                    let started = if before_gate {
                         let head_done = std::time::Instant::now();
                         // The rename failed (its sender dropped): no apply.
                         gate.recv().ok()?;
                         let opened = std::time::Instant::now();
                         ahead_use.pre_gate = head_done.duration_since(spawned);
                         ahead_use.gate_wait = opened.duration_since(head_done);
-                        opened
+                        (ops, leaves)
                     } else {
-                        spawned
+                        (ops, None)
                     };
-                    let prepared = qmdb_job.compute_operations_with_leaves(parent_sealed, ops, leaves);
+                    // The gated compute starts when the head and (with the
+                    // early lookups) the lookups are both done.
+                    let started = if before_gate { std::time::Instant::now() } else { spawned };
+                    let prepared = qmdb_job.compute_operations_with_early(parent_sealed, ops, leaves, early);
                     let ended = std::time::Instant::now();
                     // The operations' phase is its own length whichever side
                     // of the gate it ran; the compute is the apply after it.
@@ -4552,6 +4602,15 @@ where
                     // the parent-fields gate and its wait there (0 when off).
                     root_pre_gate_us = root_ops.3.pre_gate.as_micros() as u64,
                     root_gate_wait_us = root_ops.3.gate_wait.as_micros() as u64,
+                    // `N42_ROOT_LOOKUPS_EARLY=1`: the early key lookups' pass
+                    // (lease, lookups, return; from the gate's opening),
+                    // whether the apply used them, the lookup time that took
+                    // off the gated apply, and the process's fallbacks so far
+                    // (early lookups the tree had moved away from).
+                    root_lookup_early_us = root_ops.3.lookup_early.as_micros() as u64,
+                    root_lookup_early = root_split.lookup_early,
+                    root_lookup_saved_us = root_split.lookup_saved_us,
+                    root_lookup_fallbacks = n42_qmdb_reth::root_lookup_fallbacks(),
                     // `N42_SEAL_AT_EXEC=1` (plan v6 G2): sealed at the parallel
                     // step's end with the fold behind the proposal; the
                     // transactions root computed over the pulled set beside

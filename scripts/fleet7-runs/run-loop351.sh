@@ -1097,7 +1097,21 @@ case $STAGE in
      b7 D2S12P30T64X11T16Npb $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_ANSWER_BEFORE_REVERTS=1 N42_REGISTER_FREE_OFFLOCK=1 N42_PRUNE_LEAN=1 F7_BLOCK_INTERVAL_MS=30
      b7 D2S12P30T64X11T16Nc $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_ANSWER_BEFORE_REVERTS=1 N42_REGISTER_FREE_OFFLOCK=1 F7_BLOCK_INTERVAL_MS=30
      b7 D2S12P30T64X11T16Npc $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_ANSWER_BEFORE_REVERTS=1 N42_REGISTER_FREE_OFFLOCK=1 N42_PRUNE_LEAN=1 F7_BLOCK_INTERVAL_MS=30 ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq, ar, as, at, au, av, aw, ax, ay, az, ba, bb, bc, bd, be, bf, bm, bn, bo, bp, bq, br, bs, bt, bu, bv, bw, bx or by)"; exit 2 ;;
+  bz) mk WARM 7 16; warm_gate WARM
+      # VOTE_BOUND_GAPS levers on X14 — the five-block window and the merge at shards-ready — on the 600M replay set (no 400M cap), scored by drain rate (scripts/fleet7-runs/drainrate.py); proof: vote-bound share <20%, gaps >80 ms <30, start delay <2 ms, drain >=4.6M/s, no hold-bound/Sidechain WARNs; merge_overlap_ms >0 and sealed_at unchanged on the Pm legs
+     R6="F7_FLOOD_REPLAY=/data/n42-pregen/g900000-600m"; export F7_SENDERS_ARG=18750; echo "stage bz: replay set $R6 (senders $F7_SENDERS_ARG; the WARM leg above used the 400M set)"
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     C16="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_SIBLINGS=background N42_CORE_LAYOUT_BEHIND=background"
+     X11="$X10 $C16"
+     b7 D2S12P30T64X11T16Pa $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_ANSWER_BEFORE_REVERTS=1 N42_REGISTER_FREE_OFFLOCK=1 $R6 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11T16Pfa $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_ANSWER_BEFORE_REVERTS=1 N42_REGISTER_FREE_OFFLOCK=1 N42_FAR_AHEAD_BLOCKS=2 N42_PARENT_OUTPUTS_KEPT=6 N42_OWN_HOLD_BLOCKS=64 $R6 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11T16Pma $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_ANSWER_BEFORE_REVERTS=1 N42_REGISTER_FREE_OFFLOCK=1 N42_MERGE_AT_SHARDS_READY=1 $R6 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11T16Pb $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_ANSWER_BEFORE_REVERTS=1 N42_REGISTER_FREE_OFFLOCK=1 $R6 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11T16Pfb $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_ANSWER_BEFORE_REVERTS=1 N42_REGISTER_FREE_OFFLOCK=1 N42_FAR_AHEAD_BLOCKS=2 N42_PARENT_OUTPUTS_KEPT=6 N42_OWN_HOLD_BLOCKS=64 $R6 F7_BLOCK_INTERVAL_MS=30
+     b7 D2S12P30T64X11T16Pmb $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_ANSWER_BEFORE_REVERTS=1 N42_REGISTER_FREE_OFFLOCK=1 N42_MERGE_AT_SHARDS_READY=1 $R6 F7_BLOCK_INTERVAL_MS=30 ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq, ar, as, at, au, av, aw, ax, ay, az, ba, bb, bc, bd, be, bf, bm, bn, bo, bp, bq, br, bs, bt, bu, bv, bw, bx, by or bz)"; exit 2 ;;
 esac
 
 if [ "${LOOP351_DRY:-0}" = 1 ]; then echo "dry run done"; exit 0; fi

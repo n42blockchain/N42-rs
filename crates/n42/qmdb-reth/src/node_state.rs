@@ -675,6 +675,7 @@ fn fill_split(forest: &QmdbForest, split: &mut RootSplit, publish_us: u64) {
     (split.sort_us, split.leaves_us, split.retire_us, split.writes_us) =
         (phases.sort_us, phases.leaves_us, phases.retire_us, phases.writes_us);
     (split.index_us, split.rehash_us, split.root_us) = (phases.index_us, phases.rehash_us, phases.root_us);
+    (split.twigs, split.dirty_twigs) = (phases.twigs as u64, phases.dirty_twigs as u64);
     (split.note_us, split.delta_us, split.apply_total_us) = forest.last_compute_tail();
     split.undo_us = phases.undo_us;
 }
@@ -754,6 +755,10 @@ pub struct RootSplit {
     pub rehash_us: u64,
     /// See `sort_us`.
     pub root_us: u64,
+    /// Twigs in the tree at the root read.
+    pub twigs: u64,
+    /// Twigs the block marked for a rehash.
+    pub dirty_twigs: u64,
     /// After the apply, under the lock: the move's bookkeeping and the
     /// block's delta, microseconds.
     pub note_us: u64,

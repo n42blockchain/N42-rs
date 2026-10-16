@@ -4683,6 +4683,13 @@ where
                     root_writes_us = root_split.writes_us,
                     root_index_us = root_split.index_us,
                     root_rehash_us = root_split.rehash_us + root_split.root_us,
+                    // The two halves of `root_rehash_us`: the twigs' rehash
+                    // (timed from the join with the index inserts) and the
+                    // upper tree's refresh with the root read.
+                    root_twig_rehash_us = root_split.rehash_us,
+                    root_upper_us = root_split.root_us,
+                    root_twigs = root_split.twigs,
+                    root_dirty_twigs = root_split.dirty_twigs,
                     root_note_us = root_split.note_us,
                     root_delta_us = root_split.delta_us,
                     root_apply_total_us = root_split.apply_total_us,

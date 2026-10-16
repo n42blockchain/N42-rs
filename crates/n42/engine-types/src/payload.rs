@@ -329,6 +329,7 @@ where
                     // are the frames' claims; the wrapper verifies each one
                     // before the build can include it (`claimed_build`).
                     Some(queue) => {
+                        release_replaced_own_blocks(&queue, block_number);
                         // `N42_FRAME_BLOCKS=1`: whole frames in arrival
                         // order instead of the walk (`frame_blocks`).
                         let best = crate::frame_blocks::select(&queue, parent_hash, parent_gas_limit);
@@ -402,6 +403,28 @@ where
     }
 }
 
+/// `N42_BUILD_AHEAD_GATE=seal` (two-ahead): a build at `number` replaces the
+/// own blocks the queue holds at that height or above -- a block built two
+/// ahead that was never proposed (a tenure end, a timeout), held when the
+/// build on it started -- and their transactions go back to the lanes before
+/// this build selects, instead of when the chain settles the height
+/// (`n42_tx_queue::release_replaced_own_blocks`). Nothing under the default
+/// gate.
+fn release_replaced_own_blocks<T: PoolTransaction>(queue: &n42_tx_queue::TxQueue<T>, number: u64) {
+    if !n42_tx_queue::release_replaced_own_blocks() {
+        return;
+    }
+    let offered = queue.release_own_blocks_from(number);
+    if offered > 0 {
+        tracing::info!(
+            target: "n42.tx_queue",
+            number,
+            offered,
+            "own blocks held at or above this build's height were replaced; their transactions are offered again"
+        );
+    }
+}
+
 // The raw payload channel's way in: a build on a block this node built and
 // consensus has just sealed, from that build's own post-state, with reth's
 // payload service out of the way. See `direct_build`.
@@ -431,6 +454,7 @@ where
         OWN_ENTERED.with(|cell| cell.set(Some(pre_at)));
         let parent_hash = parent.hash();
         let parent_gas_limit = parent.gas_limit;
+        let block_number = parent.number + 1;
         let parent_built = parent_execution.built_hash();
         // `deferredExecutionDepth` 2 (docs/DEFERRED_DEPTH_2_DESIGN.md item 5):
         // the parent becomes the grandparent of the next build, whose header
@@ -493,6 +517,7 @@ where
                         "the parent's queue hand-off is done; the build pulls"
                     );
                 }
+                release_replaced_own_blocks(&queue, block_number);
                 let best = crate::frame_blocks::select(&queue, parent_hash, parent_gas_limit);
                 crate::claimed_build::selection(&queue, best)
             }

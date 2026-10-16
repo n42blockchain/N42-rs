@@ -1470,6 +1470,44 @@ mod tests {
         assert_eq!(stage_of(stuck_hash), None, "released, it is evicted");
     }
 
+    /// Two-ahead's orphan (`N42_BUILD_AHEAD_GATE=seal`): block N and the
+    /// build on it, N+1, both sealed and pinned, and N is never proposed; the
+    /// height is built again on the same parent. The replacement and its child
+    /// are found by their own fields and never as the orphans (the identity
+    /// includes the parent and the roots), and once the chain passes N+1 both
+    /// orphans' pins go and they are evicted like any other build.
+    #[test]
+    fn an_orphaned_two_ahead_pair_is_released_and_the_replacement_is_found() {
+        let _guard = lock();
+        let orphan = header(0x50, 5_000_010);
+        let orphan_hash = built(&orphan).block.hash();
+        remember(orphan_hash, built(&orphan));
+        assert!(pin_sealed(orphan.parent_hash, orphan.number, orphan.state_root, orphan.receipts_root, orphan.gas_used, Some(orphan.transactions_root)));
+        let child = Header { parent_hash: orphan_hash, ..header(0x54, 5_000_011) };
+        let child_hash = built(&child).block.hash();
+        remember(child_hash, built(&child));
+        assert!(pin_sealed(child.parent_hash, child.number, child.state_root, child.receipts_root, child.gas_used, Some(child.transactions_root)));
+        // The replacement: the same parent and height, other transactions.
+        let replacement = Header { parent_hash: orphan.parent_hash, ..header(0x58, 5_000_010) };
+        let replacement_hash = built(&replacement).block.hash();
+        remember(replacement_hash, built(&replacement));
+        assert_eq!(find_by(&replacement).map(|(h, _)| h), Some(replacement_hash));
+        assert_eq!(find_by(&orphan).map(|(h, _)| h), Some(orphan_hash), "kept apart, not confused");
+        // A build on the replacement with the orphan child's fields finds nothing.
+        let on_replacement = Header { parent_hash: replacement_hash, ..child.clone() };
+        assert!(find_by(&on_replacement).is_none());
+        handed_off(replacement_hash);
+        // The chain commits the replacement and its own child: both pins go.
+        release_pins_through(5_000_011);
+        assert!(!is_pinned(orphan_hash) && !is_pinned(child_hash));
+        for i in 1..=keep() as u8 {
+            let h = header(0x60 + i * 4, 5_000_011 + u64::from(i));
+            remember(built(&h).block.hash(), built(&h));
+        }
+        assert_eq!(stage_of(orphan_hash), None, "released, the orphan is evicted");
+        assert_eq!(stage_of(child_hash), None, "released, the orphan's child is evicted");
+    }
+
     /// A seal header arriving after the hand-off (empty blocks) pins nothing.
     #[test]
     fn a_pin_after_the_hand_off_is_a_no_op() {

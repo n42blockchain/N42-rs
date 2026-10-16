@@ -690,6 +690,7 @@ fn fill_split(forest: &QmdbForest, split: &mut RootSplit, publish_us: u64) {
     (split.twigs, split.dirty_twigs) = (phases.twigs as u64, phases.dirty_twigs as u64);
     (split.note_us, split.delta_us, split.apply_total_us) = forest.last_compute_tail();
     split.undo_us = phases.undo_us;
+    split.lookup_us = phases.lookup_us;
 }
 
 /// Where one QMDB root spent its time ([`QmdbNodeState::take_root_split`]).
@@ -782,6 +783,9 @@ pub struct RootSplit {
     pub apply_total_us: u64,
     /// Of `retire_us`: the undo record's lists, microseconds.
     pub undo_us: u64,
+    /// Of `leaves_us`: the key index lookups alone (each touched key resolved
+    /// to the slot it holds), microseconds.
+    pub lookup_us: u64,
 }
 
 /// The counters a [`RootSplit`] is the difference of.

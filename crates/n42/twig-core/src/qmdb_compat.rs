@@ -1189,6 +1189,9 @@ pub struct ApplyPhases {
     pub leaves_us: u64,
     /// The leaf hashes alone (part of `leaves_us`).
     pub leaf_hashes_us: u64,
+    /// The current-slot lookups alone (part of `leaves_us`): the key index
+    /// reads that resolve each operation's key to the slot it holds.
+    pub lookup_us: u64,
     /// The undo record's entries, on the worker pool.
     pub undo_us: u64,
     /// `undo_us` plus the retirement of the slots the block replaces, on the
@@ -2252,7 +2255,9 @@ impl QmdbCompatTree {
         let pre = pre.filter(|pre| pre.len() == operations.op_count());
         if pre.is_some() {
             // Hashed ahead, off the caller's lock: only the lookups here.
+            let lookups_at = std::time::Instant::now();
             held_slots(&self.index, &self.entries, operations, &mut scratch.held);
+            phases.lookup_us = lookups_at.elapsed().as_micros() as u64;
         } else if parallel {
             // The hashes and the lookups beside each other: both are on the
             // pool, and neither waits for the other's stragglers.
@@ -2260,14 +2265,16 @@ impl QmdbCompatTree {
             {
                 let (index, entries) = (&self.index, &self.entries);
                 let (leaves, held) = (&mut scratch.leaves, &mut scratch.held);
-                phases.leaf_hashes_us = rayon::join(
+                (phases.leaf_hashes_us, phases.lookup_us) = rayon::join(
                     || {
                         leaf_hashes(operations, leaves);
                         at.elapsed().as_micros() as u64
                     },
-                    || held_slots(index, entries, operations, held),
-                )
-                .0;
+                    || {
+                        held_slots(index, entries, operations, held);
+                        at.elapsed().as_micros() as u64
+                    },
+                );
             }
         } else {
             leaf_hashes(operations, &mut scratch.leaves);
@@ -2277,7 +2284,9 @@ impl QmdbCompatTree {
             // write of the same block, and the lookups are the random reads
             // of a multi-million-entry index that the serial loop was waiting
             // on.
+            let lookups_at = std::time::Instant::now();
             held_slots(&self.index, &self.entries, operations, &mut scratch.held);
+            phases.lookup_us = lookups_at.elapsed().as_micros() as u64;
         }
         let crate::prefault::ApplyScratch { leaves, held, pairs: appended } = &mut scratch;
         let (leaves, held) = (pre.unwrap_or(leaves.as_slice()), &*held);

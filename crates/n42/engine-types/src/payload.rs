@@ -4124,6 +4124,7 @@ where
                 let (view_journal_reads, view_journal_searches, view_journal_skips) =
                     n42_qmdb_reth::read_view::take_journal_counters();
                 let prev_road = crate::post_seal::road_us(parent_header.number);
+                let advance_timing = crate::built_executions::advance_timing(block_hash);
                 tracing::info!(
                     target: "payload_builder",
                     number = block_number,
@@ -4444,6 +4445,13 @@ where
                     // (`N42_FRAME_SWEEP_AT_TAKE`), and the frames it refused
                     // at its bound (since the process started).
                     start_frames_skipped = select_times.frames_skipped,
+                    // `built_executions::advance` for this build, us: the
+                    // store lock's hold and, of it, the drop of the replaced
+                    // output shards; the advances whose drop was the shard
+                    // set's last holder (`N42_ADVANCE_FREE_OFFLOCK`).
+                    advance_lock_us = advance_timing.lock_us,
+                    advance_free_us = advance_timing.free_us,
+                    advance_free_last = advance_timing.free_last,
                     // Builds since the process started that found no frame
                     // to plan and walked the lanes, or refused to: after a
                     // flood's first full block the walked count must not move.

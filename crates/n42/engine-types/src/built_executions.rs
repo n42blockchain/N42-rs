@@ -398,14 +398,59 @@ pub fn complete(built_hash: B256, execution: BuiltExecution) {
     advance(built_hash, Stage::Complete, execution);
 }
 
+/// What [`advance`] cost a build, summed over its advances: the store
+/// lock's hold, us, the drop of the replaced output shards, us, and the
+/// advances whose drop released the last holder of the shard set.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdvanceTiming {
+    /// The store lock held by `advance`, us (the shards' free included).
+    pub lock_us: u64,
+    /// The drop of the replaced output shards, us.
+    pub free_us: u64,
+    /// Advances whose drop was the shard set's last holder.
+    pub free_last: u64,
+}
+
+fn advance_timings() -> &'static Mutex<VecDeque<(B256, AdvanceTiming)>> {
+    static TIMINGS: OnceLock<Mutex<VecDeque<(B256, AdvanceTiming)>>> = OnceLock::new();
+    TIMINGS.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn record_advance_timing(built_hash: B256, timing: AdvanceTiming) {
+    let mut timings = advance_timings().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((_, kept)) = timings.iter_mut().find(|(hash, _)| *hash == built_hash) {
+        kept.lock_us += timing.lock_us;
+        kept.free_us += timing.free_us;
+        kept.free_last += timing.free_last;
+        return;
+    }
+    if timings.len() >= 16 {
+        timings.pop_front();
+    }
+    timings.push_back((built_hash, timing));
+}
+
+/// What [`advance`] cost the build `built_hash` so far (zero if unknown).
+pub fn advance_timing(built_hash: B256) -> AdvanceTiming {
+    let timings = advance_timings().lock().unwrap_or_else(|p| p.into_inner());
+    timings.iter().find(|(hash, _)| *hash == built_hash).map(|(_, timing)| *timing).unwrap_or_default()
+}
+
 fn advance(built_hash: B256, stage: Stage, execution: BuiltExecution) {
     let (store, advanced) = store();
     let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    let locked_at = std::time::Instant::now();
+    let mut timing = AdvanceTiming::default();
     match store.iter_mut().find(|(hash, _)| *hash == built_hash) {
         Some((_, entry)) => {
             entry.stage = stage;
             entry.execution = Some(execution);
+            if let Some(shards) = entry.shards.as_ref() {
+                timing.free_last = u64::from(Arc::strong_count(&shards.shards) == 1);
+            }
+            let free_at = std::time::Instant::now();
             entry.shards = None;
+            timing.free_us = free_at.elapsed().as_micros() as u64;
         }
         // Evicted (a finish that ran longer than `keep()` builds), or never
         // pending: not re-filed -- that would evict a live build the engine
@@ -415,6 +460,8 @@ fn advance(built_hash: B256, stage: Stage, execution: BuiltExecution) {
         }
     }
     drop(store);
+    timing.lock_us = locked_at.elapsed().as_micros() as u64;
+    record_advance_timing(built_hash, timing);
     // A copy on the handed list (taken before it was complete) is refreshed.
     if stage == Stage::Complete {
         let mut handed = handed().lock().unwrap_or_else(|p| p.into_inner());

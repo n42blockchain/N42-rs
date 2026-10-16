@@ -508,6 +508,82 @@ struct Keyed<T: PoolTransaction> {
     valid: Arc<ValidPoolTransaction<T>>,
 }
 
+/// A drain slice grouped by sender off the lanes' lock
+/// (`N42_TX_QUEUE_DRAIN_RUNS`, [`group_runs`]): the slice's transactions
+/// with each sender's together, the senders in the order of their first
+/// arrival in the slice, each sender's in nonce order (arrival order among
+/// equal nonces), and where each run ends and each transaction arrived.
+struct RunSlice<T: PoolTransaction> {
+    items: Vec<Keyed<T>>,
+    meta: RunMeta,
+}
+
+/// A grouped slice's shape, kept beside its transactions in
+/// `Inner::pending_drain` ([`PendingSeg::Runs`]).
+#[derive(Debug)]
+struct RunMeta {
+    /// Each transaction's arrival index in the slice, in the grouped order.
+    pos: Vec<u32>,
+    /// Each run's end, an offset into the grouped order.
+    ends: Vec<u32>,
+}
+
+/// A stretch of `Inner::pending_drain`: plain transactions in inbox order,
+/// inserted one at a time, or a grouped slice inserted run by run and only
+/// whole. Only kept while a grouped slice is pending: with none, the whole
+/// remainder is plain and this list is empty.
+#[derive(Debug)]
+enum PendingSeg {
+    Plain(usize),
+    Runs(RunMeta),
+}
+
+/// Groups one drain slice by sender, off the lanes' lock: reads only the
+/// sender and nonce the push recorded ([`Keyed`]), never a transaction.
+/// Stable: a sender's transactions keep their arrival order among equal
+/// nonces, so the first of two duplicates is still the one a lane keeps.
+fn group_runs<T: PoolTransaction>(batch: Vec<Keyed<T>>) -> RunSlice<T> {
+    let n = batch.len();
+    let mut index: AddressHashMap<u32> = AddressHashMap::with_capacity_and_hasher(n, Default::default());
+    let mut run_of: Vec<u32> = Vec::with_capacity(n);
+    let mut counts: Vec<u32> = Vec::new();
+    for keyed in &batch {
+        let next = counts.len() as u32;
+        let run = *index.entry(keyed.sender).or_insert(next);
+        if run == next {
+            counts.push(0);
+        }
+        counts[run as usize] += 1;
+        run_of.push(run);
+    }
+    let mut ends = Vec::with_capacity(counts.len());
+    let mut cursor = Vec::with_capacity(counts.len());
+    let mut acc = 0u32;
+    for count in &counts {
+        cursor.push(acc);
+        acc += count;
+        ends.push(acc);
+    }
+    let mut slots: Vec<Option<(u32, Keyed<T>)>> = std::iter::repeat_with(|| None).take(n).collect();
+    for (pos, (keyed, run)) in batch.into_iter().zip(run_of).enumerate() {
+        let at = &mut cursor[run as usize];
+        slots[*at as usize] = Some((pos as u32, keyed));
+        *at += 1;
+    }
+    let nonce = |slot: &Option<(u32, Keyed<T>)>| slot.as_ref().map_or(0, |(_, keyed)| keyed.nonce);
+    let mut start = 0usize;
+    for &end in &ends {
+        let run = &mut slots[start..end as usize];
+        if !run.windows(2).all(|w| nonce(&w[0]) <= nonce(&w[1])) {
+            // Stable: equal nonces stay in arrival order.
+            run.sort_by_key(|slot| nonce(slot));
+        }
+        start = end as usize;
+    }
+    let (pos, items): (Vec<u32>, Vec<Keyed<T>>) = slots.into_iter().flatten().unzip();
+    RunSlice { items, meta: RunMeta { pos, ends } }
+}
+
 /// What a prune took out of the queue, held until every lock is released.
 struct PruneGarbage<T: PoolTransaction> {
     lanes: Vec<BTreeMap<u64, Arc<ValidPoolTransaction<T>>>>,
@@ -1025,6 +1101,10 @@ struct Inner<T: PoolTransaction> {
     /// other drain finishes it first, so the inbox's order is the lanes'
     /// order whoever drains.
     pending_drain: VecDeque<Keyed<T>>,
+    /// How `pending_drain` divides into plain stretches and grouped slices
+    /// (`N42_TX_QUEUE_DRAIN_RUNS`), front to back; empty while no grouped
+    /// slice is pending, and then all of `pending_drain` is plain.
+    pending_segs: VecDeque<PendingSeg>,
     /// The frames noted with that remainder, each with the count of
     /// remainder transactions ever queued ([`Inner::pending_in`]) once its
     /// own were in the remainder: indexed when [`Inner::pending_out`]
@@ -1373,6 +1453,21 @@ fn drain_chunk() -> usize {
     *N.get_or_init(|| std::env::var("N42_TX_QUEUE_DRAIN_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
+/// `N42_TX_QUEUE_DRAIN_RUNS=1`, read once: the drainer's chunked and sliced
+/// drains ([`TxQueue::drain_now`]) take their batch off the lanes' lock,
+/// group it by sender into nonce-ordered runs there ([`group_runs`]), and
+/// insert it run by run under the lock ([`Inner::insert_run_slice`]): one
+/// lane look-up a run instead of one a transaction
+/// (`docs/LANES_LOCK_SPLIT_DESIGN.md` stage 2). Off by default.
+fn drain_runs() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("N42_TX_QUEUE_DRAIN_RUNS").is_ok_and(|v| v == "1");
+        tracing::info!(target: "n42.tx_queue", drain_runs = on, "N42_TX_QUEUE_DRAIN_RUNS");
+        on
+    })
+}
+
 /// How many consecutive nonces a build takes from one sender before moving
 /// to the next: `N42_TX_QUEUE_RUN`, 1 by default (strict rotation).
 ///
@@ -1701,6 +1796,15 @@ pub struct TxQueue<T: PoolTransaction> {
     frames_in_hand: Arc<std::sync::atomic::AtomicUsize>,
     /// `N42_TX_QUEUE_DRAIN_CHUNK` unless a test said otherwise.
     drain_chunk: Arc<std::sync::atomic::AtomicUsize>,
+    /// `N42_TX_QUEUE_DRAIN_RUNS` unless a test said otherwise ([`drain_runs`]).
+    drain_runs: Arc<std::sync::atomic::AtomicBool>,
+    /// Held by a grouped drain ([`TxQueue::drain_grouped`]) from before it
+    /// takes the inbox until the hold that puts its batch in the remainder:
+    /// while it is held no other drain takes the inbox or the frame inbox,
+    /// so nothing pushed after the grouped batch reaches the lanes before
+    /// it, and no frame whose transactions are in the batch is indexed
+    /// before they are. Others only ever try it, under the lanes' lock.
+    drain_gate: Arc<Mutex<()>>,
     /// The builder's plan-ahead hook ([`Self::set_plan_ahead_hook`]).
     ahead_hook: Arc<Mutex<Option<PlanAheadHook<T>>>>,
     /// `N42_QUEUE_OFFLOCK` unless a test said otherwise ([`queue_offlock`]).
@@ -1826,6 +1930,8 @@ impl<T: PoolTransaction> Clone for TxQueue<T> {
             in_hand: Arc::clone(&self.in_hand),
             frames_in_hand: Arc::clone(&self.frames_in_hand),
             drain_chunk: Arc::clone(&self.drain_chunk),
+            drain_runs: Arc::clone(&self.drain_runs),
+            drain_gate: Arc::clone(&self.drain_gate),
             ahead_hook: Arc::clone(&self.ahead_hook),
             offlock: Arc::clone(&self.offlock),
             plan_snapshot: Arc::clone(&self.plan_snapshot),
@@ -1978,6 +2084,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 builds: 0,
                 frames: frames::FrameIndex::default(),
                 pending_drain: VecDeque::new(),
+                pending_segs: VecDeque::new(),
                 pending_frames: VecDeque::new(),
                 pending_in: 0,
                 pending_out: 0,
@@ -1998,6 +2105,8 @@ impl<T: PoolTransaction> TxQueue<T> {
             in_hand: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             frames_in_hand: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             drain_chunk: Arc::new(std::sync::atomic::AtomicUsize::new(drain_chunk())),
+            drain_runs: Arc::new(std::sync::atomic::AtomicBool::new(drain_runs())),
+            drain_gate: Arc::new(Mutex::new(())),
             ahead_hook: Arc::new(Mutex::new(None)),
             offlock: Arc::new(std::sync::atomic::AtomicBool::new(queue_offlock())),
             plan_snapshot: Arc::new(std::sync::atomic::AtomicBool::new(snapshot::queue_plan_snapshot())),
@@ -2036,6 +2145,16 @@ impl<T: PoolTransaction> TxQueue<T> {
     pub fn with_drain_chunk(self, chunk: usize) -> Self {
         self.drain_chunk.store(chunk, std::sync::atomic::Ordering::Relaxed);
         self
+    }
+
+    /// `N42_TX_QUEUE_DRAIN_RUNS` for this queue, whatever the environment says.
+    pub fn with_drain_runs(self, on: bool) -> Self {
+        self.drain_runs.store(on, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    fn drain_runs_on(&self) -> bool {
+        self.drain_runs.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The lanes' lock, with a frame build's noted takes applied first
@@ -2138,10 +2257,16 @@ impl<T: PoolTransaction> TxQueue<T> {
     fn drain_inbox_upto(&self, inner: &mut Inner<T>, budget: usize) -> usize {
         use std::sync::atomic::Ordering;
         let had_pending = !inner.pending_drain.is_empty() || !inner.pending_frames.is_empty();
+        // A grouped drain holding the gate has taken (or is taking) the
+        // inbox off the lock: what is in the inbox now arrived after its
+        // batch, so this hold leaves the inbox and the frame inbox alone and
+        // only works the remainder, as if the arrivals came a moment later.
+        let gate = if self.drain_runs_on() { self.drain_gate.try_lock() } else { None };
+        let may_take = gate.is_some() || !self.drain_runs_on();
         // Frames before the inbox: a frame is noted after its transactions
         // were pushed, so every transaction of a frame taken here is in the
         // inbox taken after it, or drained before.
-        let frames = if self.frames_staged.load(Ordering::Acquire) != 0 {
+        let frames = if may_take && self.frames_staged.load(Ordering::Acquire) != 0 {
             let mut noted = self.frame_inbox.lock();
             let frames = std::mem::take(&mut *noted);
             self.frames_staged.fetch_sub(frames.len(), Ordering::AcqRel);
@@ -2149,7 +2274,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         } else {
             Vec::new()
         };
-        let staged = if self.staged.load(Ordering::Acquire) != 0 {
+        let staged = if may_take && self.staged.load(Ordering::Acquire) != 0 {
             // Taken and counted down under the inbox's lock, as a push adds
             // under it: a drain that took a batch a push had already put in
             // the inbox but not yet counted subtracted more than the counter
@@ -2170,6 +2295,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         } else {
             Vec::new()
         };
+        drop(gate);
         if !had_pending && frames.is_empty() && staged.is_empty() {
             return 0;
         }
@@ -3593,6 +3719,9 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// pending); returns how many transactions each hold moved.
     fn drain_chunked(&self, chunk: usize, max_holds: usize) -> Vec<u64> {
         use std::sync::atomic::Ordering;
+        if self.drain_runs_on() {
+            return self.drain_grouped(chunk, max_holds, false);
+        }
         // Lowered when the batch is in `Inner::pending_frames` (after the
         // first hold) or on any other way out of this function.
         let mut frames_guard = None;
@@ -3657,6 +3786,104 @@ impl<T: PoolTransaction> TxQueue<T> {
         holds
     }
 
+    /// [`Self::drain_chunked`] and [`Self::drain_sliced`] under
+    /// `N42_TX_QUEUE_DRAIN_RUNS`: the frame inbox and the inbox are taken
+    /// off the lanes' lock (counted in `frames_in_hand` / `in_hand`, the
+    /// drain gate held so no other drain takes newer arrivals meanwhile),
+    /// cut into slices of `slice` transactions in inbox order and each slice
+    /// grouped by sender there ([`group_runs`]). The first hold puts the
+    /// grouped slices (and the frames, marked at the batch's end as in the
+    /// one-hold drain) in the remainder; each hold inserts at most one slice,
+    /// run by run ([`Inner::insert_run_slice`]), the lock released and the
+    /// thread yielding between holds. Whoever else drains meanwhile finishes
+    /// the remainder in order, a grouped slice only whole.
+    ///
+    /// With `again` (the sliced drainer) the inbox is taken again while it
+    /// holds anything and fewer than `max_holds` holds were made. Returns
+    /// how many transactions each hold moved.
+    fn drain_grouped(&self, slice: usize, max_holds: usize, again: bool) -> Vec<u64> {
+        use std::sync::atomic::Ordering;
+        let slice = slice.max(1);
+        let c = &LOCK_COUNTERS;
+        let mut holds = Vec::new();
+        loop {
+            let gate = self.drain_gate.lock();
+            let mut frames_guard = None;
+            let frames = if self.frames_staged.load(Ordering::Acquire) != 0 {
+                let mut noted = self.frame_inbox.lock();
+                let frames = std::mem::take(&mut *noted);
+                frames_guard = Some(InHandGuard::raise(&self.frames_in_hand, frames.len()));
+                self.frames_staged.fetch_sub(frames.len(), Ordering::AcqRel);
+                frames
+            } else {
+                Vec::new()
+            };
+            let batch = {
+                let mut inbox = self.inbox.lock();
+                let batch = std::mem::take(&mut *inbox);
+                self.in_hand.fetch_add(batch.len(), Ordering::AcqRel);
+                self.staged.fetch_sub(batch.len(), Ordering::AcqRel);
+                batch
+            };
+            let total = batch.len();
+            let grouped: Vec<RunSlice<T>> = if total == 0 {
+                Vec::new()
+            } else {
+                let at = std::time::Instant::now();
+                let mut grouped = Vec::with_capacity(total.div_ceil(slice));
+                let mut rest = batch;
+                while !rest.is_empty() {
+                    let tail = if rest.len() > slice { rest.split_off(slice) } else { Vec::new() };
+                    grouped.push(group_runs(rest));
+                    rest = tail;
+                }
+                c.drain_group_ns.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                grouped
+            };
+            let (mut grouped, mut frames) = (Some(grouped), Some(frames));
+            let mut gate = Some(gate);
+            loop {
+                let at;
+                let moved;
+                let done;
+                {
+                    let mut inner = self.lock_inner_unsettled();
+                    at = std::time::Instant::now();
+                    if let (Some(grouped), Some(frames)) = (grouped.take(), frames.take()) {
+                        inner.push_runs(grouped, frames);
+                    }
+                    moved = inner.drain_pending(slice) as u64;
+                    done = inner.pending_drain.is_empty() && inner.pending_frames.is_empty();
+                }
+                let took = at.elapsed().as_nanos() as u64;
+                if gate.is_some() {
+                    // After the release that put the batch in the mirror.
+                    self.in_hand.fetch_sub(total, Ordering::AcqRel);
+                    drop(frames_guard.take());
+                    drop(gate.take());
+                }
+                if moved > 0 {
+                    c.drains.fetch_add(1, Ordering::Relaxed);
+                    c.drain_chunks.fetch_add(1, Ordering::Relaxed);
+                    c.drain_txs.fetch_add(moved, Ordering::Relaxed);
+                    c.drain_ns.fetch_add(took, Ordering::Relaxed);
+                    raise_max(&c.drain_max_ns, took);
+                    raise_max(&c.drain_chunk_max_txs, moved);
+                }
+                holds.push(moved);
+                if done || moved == 0 || holds.len() >= max_holds {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            let more = self.staged.load(Ordering::Acquire) != 0 || self.frames_staged.load(Ordering::Acquire) != 0;
+            if !again || !more || holds.len() >= max_holds {
+                return holds;
+            }
+            std::thread::yield_now();
+        }
+    }
+
     /// Test hook: frames held as a chunked drain holds them between the
     /// frame inbox and the lanes' lock, until the guard is dropped.
     #[cfg(test)]
@@ -3679,6 +3906,9 @@ impl<T: PoolTransaction> TxQueue<T> {
     fn drain_sliced(&self, slice: usize, max_holds: usize) -> usize {
         use std::sync::atomic::Ordering;
         let slice = slice.max(1);
+        if self.drain_runs_on() {
+            return self.drain_grouped(slice, max_holds, true).len();
+        }
         let mut holds = 0;
         loop {
             let (moved, left) = {
@@ -5104,6 +5334,14 @@ impl<T: PoolTransaction> Inner<T> {
     /// batch in: every transaction of the frame is at or before it.
     fn push_pending(&mut self, batch: Vec<Keyed<T>>, frames: Vec<(NewFrame, Option<FrameTxs<T>>)>) {
         self.pending_in += batch.len() as u64;
+        if !batch.is_empty() && !self.pending_segs.is_empty() {
+            // Behind a grouped slice: a plain stretch of its own.
+            if let Some(PendingSeg::Plain(n)) = self.pending_segs.back_mut() {
+                *n += batch.len();
+            } else {
+                self.pending_segs.push_back(PendingSeg::Plain(batch.len()));
+            }
+        }
         if !batch.is_empty() {
             // Moved, not copied: a `Vec` becomes the deque in O(1).
             if self.pending_drain.is_empty() {
@@ -5116,16 +5354,79 @@ impl<T: PoolTransaction> Inner<T> {
         self.pending_frames.extend(frames.into_iter().map(|(frame, txs)| (mark, frame, txs)));
     }
 
+    /// [`Self::push_pending`] for a grouped batch (`N42_TX_QUEUE_DRAIN_RUNS`):
+    /// its slices go behind whatever the remainder holds, each a
+    /// [`PendingSeg::Runs`], and the frames are marked at the batch's end.
+    fn push_runs(&mut self, slices: Vec<RunSlice<T>>, frames: Vec<(NewFrame, Option<FrameTxs<T>>)>) {
+        let total: usize = slices.iter().map(|slice| slice.items.len()).sum();
+        if total > 0 && self.pending_segs.is_empty() && !self.pending_drain.is_empty() {
+            self.pending_segs.push_back(PendingSeg::Plain(self.pending_drain.len()));
+        }
+        for slice in slices {
+            if slice.items.is_empty() {
+                continue;
+            }
+            if self.pending_drain.is_empty() {
+                self.pending_drain = VecDeque::from(slice.items);
+            } else {
+                self.pending_drain.extend(slice.items);
+            }
+            self.pending_segs.push_back(PendingSeg::Runs(slice.meta));
+        }
+        self.pending_in += total as u64;
+        let mark = self.pending_in;
+        self.pending_frames.extend(frames.into_iter().map(|(frame, txs)| (mark, frame, txs)));
+    }
+
     /// Moves up to `budget` transactions of the remainder into their lanes,
     /// in inbox order, and indexes each remainder frame whose last
     /// transaction is now in. Returns how many it moved.
+    ///
+    /// A grouped slice (`N42_TX_QUEUE_DRAIN_RUNS`) goes in whole or not at
+    /// all: a hold that has moved nothing yet takes one past its budget,
+    /// one that has moved something stops before a slice that would.
     fn drain_pending(&mut self, budget: usize) -> usize {
         let mut moved = 0usize;
         let at = std::time::Instant::now();
-        while moved < budget {
-            let Some(Keyed { sender, nonce, valid }) = self.pending_drain.pop_front() else { break };
-            self.insert_keyed(sender, nonce, valid);
-            moved += 1;
+        if self.pending_segs.is_empty() {
+            while moved < budget {
+                let Some(Keyed { sender, nonce, valid }) = self.pending_drain.pop_front() else { break };
+                self.insert_keyed(sender, nonce, valid);
+                moved += 1;
+            }
+        } else {
+            while moved < budget {
+                let plain = match self.pending_segs.front_mut() {
+                    None => break,
+                    Some(PendingSeg::Plain(n)) => {
+                        let k = (*n).min(budget - moved);
+                        *n -= k;
+                        Some((k, *n == 0))
+                    }
+                    Some(PendingSeg::Runs(meta)) => {
+                        if moved > 0 && moved + meta.pos.len() > budget {
+                            break;
+                        }
+                        None
+                    }
+                };
+                match plain {
+                    Some((k, emptied)) => {
+                        if emptied {
+                            self.pending_segs.pop_front();
+                        }
+                        for _ in 0..k {
+                            let Some(Keyed { sender, nonce, valid }) = self.pending_drain.pop_front() else { break };
+                            self.insert_keyed(sender, nonce, valid);
+                        }
+                        moved += k;
+                    }
+                    None => {
+                        let Some(PendingSeg::Runs(meta)) = self.pending_segs.pop_front() else { break };
+                        moved += self.insert_run_slice(meta);
+                    }
+                }
+            }
         }
         if moved > 0 {
             let took = at.elapsed().as_nanos() as u64;
@@ -5136,6 +5437,100 @@ impl<T: PoolTransaction> Inner<T> {
             let Some((_, frame, txs)) = self.pending_frames.pop_front() else { break };
             self.frames.insert(frame, txs);
         }
+        moved
+    }
+
+    /// Inserts the grouped slice at the front of `pending_drain`
+    /// (`N42_TX_QUEUE_DRAIN_RUNS`) run by run: one lane look-up a run, one
+    /// nonce-map search a transaction. The result is the per-transaction
+    /// drain's ([`Self::insert_keyed`] in arrival order): the duplicate and
+    /// watermark checks are a lane's own and the watermark does not move
+    /// during a drain; the senders a slice puts in the arrival order go in
+    /// at their first inserted arrival, and the drop samples in arrival
+    /// order. With any lane parked a hole fill would unpark and requeue
+    /// between arrivals, so the slice then goes in one transaction at a
+    /// time in arrival order. Returns how many transactions it moved.
+    fn insert_run_slice(&mut self, meta: RunMeta) -> usize {
+        let n = meta.pos.len();
+        if !self.parked_order.is_empty() {
+            let mut items: Vec<(u32, Keyed<T>)> = Vec::with_capacity(n);
+            for &pos in &meta.pos {
+                let Some(keyed) = self.pending_drain.pop_front() else { break };
+                items.push((pos, keyed));
+            }
+            items.sort_unstable_by_key(|(pos, _)| *pos);
+            let moved = items.len();
+            for (_, Keyed { sender, nonce, valid }) in items {
+                self.insert_keyed(sender, nonce, valid);
+            }
+            return moved;
+        }
+        let sampling = self.drops.samples.len() < DROP_SAMPLES;
+        let mut samples: Vec<(u32, Dropped, Address, u64)> = Vec::new();
+        let mut pushes: Vec<(u32, Address)> = Vec::new();
+        let mut in_order = true;
+        let mut inserted = 0usize;
+        let mut moved = 0usize;
+        let mut start = 0usize;
+        for &end in &meta.ends {
+            let end = end as usize;
+            let Some(sender) = self.pending_drain.front().map(|keyed| keyed.sender) else { break };
+            let lane = self.lanes.entry(sender).or_insert_with(|| Lane {
+                by_nonce: BTreeMap::new(),
+                queued: false,
+                mined: None,
+                chain_mined: None,
+                parked: None,
+            });
+            let mut first_in: Option<u32> = None;
+            for &pos in &meta.pos[start..end] {
+                let Some(Keyed { nonce, valid, .. }) = self.pending_drain.pop_front() else { break };
+                moved += 1;
+                match lane.by_nonce.entry(nonce) {
+                    std::collections::btree_map::Entry::Occupied(_) => {
+                        self.drops.counts[Dropped::Duplicate.index()] += 1;
+                    }
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        if lane.mined.is_some_and(|mined| nonce <= mined) {
+                            let reason = if lane.chain_mined.is_some_and(|mined| nonce <= mined) {
+                                Dropped::Mined
+                            } else {
+                                Dropped::StaleArrival
+                            };
+                            self.drops.counts[reason.index()] += 1;
+                            if sampling && reason != Dropped::Mined {
+                                samples.push((pos, reason, sender, nonce));
+                            }
+                        } else {
+                            slot.insert(valid);
+                            inserted += 1;
+                            first_in = Some(first_in.map_or(pos, |first| first.min(pos)));
+                        }
+                    }
+                }
+            }
+            if let Some(first) = first_in.filter(|_| !lane.queued) {
+                lane.queued = true;
+                if pushes.last().is_some_and(|(last, _)| *last > first) {
+                    in_order = false;
+                }
+                pushes.push((first, sender));
+            }
+            start = end;
+        }
+        self.len += inserted;
+        if !in_order {
+            pushes.sort_unstable_by_key(|(pos, _)| *pos);
+        }
+        self.arrivals.extend(pushes.into_iter().map(|(_, sender)| sender));
+        if !samples.is_empty() {
+            samples.sort_unstable_by_key(|(pos, ..)| *pos);
+            let room = DROP_SAMPLES.saturating_sub(self.drops.samples.len());
+            self.drops.samples.extend(samples.into_iter().take(room).map(|(_, reason, sender, nonce)| (reason, sender, nonce)));
+        }
+        let c = &LOCK_COUNTERS;
+        c.drain_runs.fetch_add(meta.ends.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        c.drain_run_txs.fetch_add(moved as u64, std::sync::atomic::Ordering::Relaxed);
         moved
     }
 
@@ -8235,3 +8630,6 @@ mod offlock_tests;
 
 #[cfg(test)]
 mod lean_tests;
+
+#[cfg(test)]
+mod drain_runs_tests;

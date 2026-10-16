@@ -88,6 +88,8 @@ pub fn prune_notification(
             warn!(target: "n42.tx_queue", number = block.number(), back, "an own block at this height was not the one committed; its transactions are offered again");
         }
         sum.settle_us += times.settle_us;
+        sum.settle_lock_us += times.settle_lock_us;
+        sum.settle_held_us += times.settle_held_us;
         sum.fold_us += times.fold_us;
         sum.lock_us += times.lock_us;
         sum.remove_us += times.remove_us;
@@ -112,6 +114,8 @@ pub fn prune_notification(
             frames_indexed = queue.frames_indexed(),
             prune_ms = started.elapsed().as_millis() as u64,
             settle_us = sum.settle_us,
+            settle_lock_us = sum.settle_lock_us,
+            settle_held_us = sum.settle_held_us,
             remove_us = sum.remove_us,
             forget_us = sum.forget_us,
             fold_us = sum.fold_us,
@@ -170,6 +174,8 @@ pub fn prune_notifications_lean(
             warn!(target: "n42.tx_queue", blocks = inputs.len(), back, "an own block at a pruned height was not the one committed; its transactions are offered again");
         }
         sum.settle_us += times.settle_us;
+        sum.settle_lock_us += times.settle_lock_us;
+        sum.settle_held_us += times.settle_held_us;
         sum.fold_us += times.fold_us;
         sum.lock_us += times.lock_us;
         sum.remove_us += times.remove_us;
@@ -218,6 +224,8 @@ pub fn prune_notifications_lean(
             frames_indexed = queue.frames_indexed(),
             prune_ms = started.elapsed().as_millis() as u64,
             settle_us = sum.settle_us,
+            settle_lock_us = sum.settle_lock_us,
+            settle_held_us = sum.settle_held_us,
             remove_us = sum.remove_us,
             forget_us = sum.forget_us,
             fold_us = sum.fold_us,

@@ -11,9 +11,8 @@ use reth_transaction_pool::EthPooledTransaction;
 /// What a hold sequence leaves: the drop report, the held blocks and the
 /// lanes' depth.
 fn hold_state(queue: &TxQueue<EthPooledTransaction>) -> (DropReport, Vec<(u64, B256, usize)>, usize) {
-    let inner = queue.lock_inner_quiet();
-    let held = inner.held.iter().map(|(n, h, txs)| (*n, *h, txs.len())).collect();
-    (inner.drops.clone(), held, inner.len)
+    let len = queue.lock_inner_quiet().len;
+    (queue.drops_view(), queue.held_view(), len)
 }
 
 fn hold_sequence(lean: bool) -> ((DropReport, Vec<(u64, B256, usize)>, usize), usize) {
@@ -56,9 +55,9 @@ fn prune_state(queue: &TxQueue<EthPooledTransaction>) -> PruneState {
         .map(|(sender, lane)| (*sender, lane.by_nonce.keys().copied().collect(), lane.mined, lane.chain_mined))
         .collect();
     lanes.sort();
-    let held = inner.held.iter().map(|(n, h, txs)| (*n, *h, txs.len())).collect();
     let len = inner.len;
     drop(inner);
+    let held = queue.held_view();
     (lanes, len, queue.hash_index_len(), held)
 }
 

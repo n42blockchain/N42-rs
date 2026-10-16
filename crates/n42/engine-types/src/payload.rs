@@ -4355,6 +4355,12 @@ where
                     batch_txs_min = par_batch_spans.txs_min,
                     batch_start_skew_ms = par_batch_spans.start_skew_ms,
                     batch_wait_ms = par_batch_spans.wait_ms,
+                    // From the first thread going idle (its last batch's
+                    // end) to the parallel step's end, and the wall of the
+                    // batch that ended last: the execution's tail
+                    // (`N42_BUILD_WORK_STEALING=1` shrinks it).
+                    par_steal_ms = par_batch_spans.steal_us / 1000,
+                    par_last_batch_ms = par_batch_spans.last_batch_us / 1000,
                     // Every batch's wall and thread CPU summed (us), and the
                     // batches' own minor faults and voluntary / involuntary
                     // context switches (`ThreadMark`): what the off-CPU part
@@ -4399,6 +4405,8 @@ where
                     one_wave = crate::parallel_transfer::build_one_wave(),
                     // `N42_BUILD_BATCHES`: batches asked for, largest first (0 off).
                     build_batches = crate::parallel_transfer::build_batches(),
+                    // `N42_BUILD_WORK_STEALING=1`: batches pulled from a shared cursor.
+                    build_work_stealing = crate::parallel_transfer::build_work_stealing(),
                     // `N42_PHASE_TIMERS=1`: the batch loop by section, ns of
                     // pool time a transaction (`LoopTimers`); zero when off.
                     loop_fetch_ns = par_loop_timers.per_tx(par_loop_timers.fetch_ns),

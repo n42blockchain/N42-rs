@@ -656,6 +656,18 @@ impl Drop for ForestGuard<'_> {
     }
 }
 
+/// Sorts `ops` and, under `N42_QMDB_PARALLEL_APPLY`, takes their leaf hashes:
+/// what the leased compute does before its lease, for a caller that does it
+/// earlier and hands the hashes to
+/// [`QmdbNodeState::compute_operations_with_leaves`] (`N42_ROOT_OPS_BEFORE_GATE`).
+/// Reads nothing but `ops`.
+pub fn sort_and_hash_leaves(ops: &mut QmdbOps) -> Option<n42_twig_core::qmdb_compat::LeafHashes> {
+    if !ops.is_sorted() {
+        ops.sort();
+    }
+    n42_twig_core::qmdb_compat::parallel_apply().then(|| n42_twig_core::qmdb_compat::LeafHashes::of(ops))
+}
+
 /// Fills a computed root's split from the forest's last computation.
 fn fill_split(forest: &QmdbForest, split: &mut RootSplit, publish_us: u64) {
     let (move_us, phases) = forest.last_compute();
@@ -1608,6 +1620,7 @@ impl QmdbNodeState {
         key: B256,
         parent: B256,
         ops: QmdbOps,
+        pre_leaves: Option<n42_twig_core::qmdb_compat::LeafHashes>,
         held: impl Fn(&QmdbForest) -> Option<T>,
         file: impl FnOnce(&mut QmdbForest, PreparedBlock) -> Result<T, StateError>,
     ) -> Result<T, NodeStateError> {
@@ -1626,8 +1639,11 @@ impl QmdbNodeState {
         // computed with the lock let go, before the lease, so the tree is out
         // only for what needs it; the lock is then taken again and the block
         // looked for again (another caller may have filed it meanwhile).
-        let mut leaves = None;
-        if n42_twig_core::qmdb_compat::parallel_apply() {
+        // Leaf hashes the caller computed before it asked
+        // (`compute_operations_with_leaves`) take the place of these; hashes
+        // of other operations are ignored by the apply.
+        let mut leaves = pre_leaves;
+        if leaves.is_none() && n42_twig_core::qmdb_compat::parallel_apply() {
             drop(guard);
             if !ops.is_sorted() {
                 ops.sort();
@@ -2314,6 +2330,21 @@ impl QmdbNodeState {
     /// (`sorted_operations_from_execution`), for a block being built: a
     /// stale parent is refused as in [`Self::compute_build`].
     pub fn compute_operations(&self, parent: B256, ops: impl Into<QmdbOps>) -> Result<PreparedBlock, NodeStateError> {
+        self.compute_operations_with_leaves(parent, ops, None)
+    }
+
+    /// [`Self::compute_operations`] with the operations' leaf hashes already
+    /// computed by the caller (`LeafHashes::of` on the sorted operations,
+    /// before the parent was filed: `N42_ROOT_OPS_BEFORE_GATE`). Used on the
+    /// leased path (`N42_QMDB_COMPUTE_OFFLOCK`) in place of the hashes it
+    /// would compute before the lease; ignored on the locked path. The root
+    /// is the same either way: hashes that do not belong to `ops` are not used.
+    pub fn compute_operations_with_leaves(
+        &self,
+        parent: B256,
+        ops: impl Into<QmdbOps>,
+        pre_leaves: Option<n42_twig_core::qmdb_compat::LeafHashes>,
+    ) -> Result<PreparedBlock, NodeStateError> {
         let ops = ops.into();
         if self.compute_offlock() {
             return self.with_leased_root(
@@ -2321,6 +2352,7 @@ impl QmdbNodeState {
                 parent,
                 parent,
                 ops,
+                pre_leaves,
                 |forest| self.check_build_parent(forest, &parent).err().map(Err),
                 |_, prepared| Ok(Ok(prepared)),
             )?
@@ -2348,6 +2380,7 @@ impl QmdbNodeState {
                 block_hash,
                 parent,
                 ops,
+                None,
                 |forest| forest.root_of(&block_hash),
                 |forest, prepared| {
                     let root = prepared.root;
@@ -2407,6 +2440,7 @@ impl QmdbNodeState {
                 block_hash,
                 parent,
                 ops,
+                None,
                 |forest| forest.root_of(&block_hash),
                 |forest, prepared| {
                     let root = prepared.root;

@@ -748,3 +748,40 @@ fn the_plan_prepared_after_a_200k_take_of_a_2_4m_queue_is_full_and_fast() {
     assert!(walk_us <= off_walk * 3 / 2 + 5_000, "walk {walk_us} us against {off_walk} us without the sweep");
     assert!(prepare_us <= off_prepare * 3 / 2 + 5_000, "prepare {prepare_us} us against {off_prepare} us without the sweep");
 }
+
+/// `N42_PLAN_BODY_WAIT_MS`: a body that arrives 1 ms after the take is taken
+/// by a take that may wait, and is `Late` to one that may not; a take whose
+/// bound expires before the body is `Late`, and one whose hook made no body
+/// returns at once.
+#[test]
+fn a_late_body_is_taken_by_a_take_that_waits() {
+    use std::time::Duration;
+    let late = |wait: Duration, after: Duration| {
+        let slot = Arc::new(Mutex::new(BodySlot::default()));
+        let filler = {
+            let slot = Arc::clone(&slot);
+            std::thread::spawn(move || {
+                std::thread::sleep(after);
+                fill_body_slot(&slot, Some(Box::new(7u32) as PreparedBody), 42);
+            })
+        };
+        let take = take_body_slot(&slot, wait);
+        filler.join().expect("the filler");
+        take
+    };
+    match late(Duration::from_millis(500), Duration::from_millis(1)) {
+        (PreparedBodyTake::Ready(body, made_us), waited_us) => {
+            assert_eq!(made_us, 42);
+            assert_eq!(*body.downcast::<u32>().expect("the body's type"), 7);
+            assert!(waited_us > 0 && waited_us < 500_000, "waited {waited_us} us");
+        }
+        other => panic!("the body arrived within the bound: {other:?}"),
+    }
+    assert!(matches!(late(Duration::ZERO, Duration::from_millis(1)), (PreparedBodyTake::Late, 0)));
+    let (take, waited_us) = late(Duration::from_millis(2), Duration::from_millis(100));
+    assert!(matches!(take, PreparedBodyTake::Late), "{take:?}");
+    assert!(waited_us >= 2_000, "waited {waited_us} us");
+    let empty = Mutex::new(BodySlot::default());
+    fill_body_slot(&empty, None, 3);
+    assert!(matches!(take_body_slot(&empty, Duration::from_secs(5)), (PreparedBodyTake::Late, 0)));
+}

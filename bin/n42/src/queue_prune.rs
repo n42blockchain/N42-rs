@@ -189,6 +189,9 @@ pub fn prune_notifications_lean(
         sum.frames_swept += times.frames_swept;
         sum.removals += times.removals;
         sum.folded += times.folded;
+        sum.drained += times.drained;
+        sum.drain_holds += times.drain_holds;
+        sum.drain_us += times.drain_us;
         run.clear();
     };
     for notification in notifications {
@@ -250,6 +253,10 @@ pub fn prune_notifications_lean(
             lean = true,
             prune_removals = sum.removals,
             blocks_folded = sum.folded,
+            // The remainder finished after the removal, in bounded holds.
+            prune_drained = sum.drained,
+            prune_drain_holds = sum.drain_holds,
+            prune_drain_us = sum.drain_us,
             "canonical blocks pruned from the queue"
         );
         let drops = queue.take_drops();

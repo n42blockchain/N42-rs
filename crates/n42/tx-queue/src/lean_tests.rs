@@ -136,3 +136,47 @@ fn the_frame_census_follows_a_frame_from_arrival_to_aside() {
     let census = queue.frame_census();
     assert_eq!((census.live, census.aside, census.refused), (1, 1, 1));
 }
+
+/// The starvation of loop351 bw's lean leg: frames for senders whose
+/// earlier nonces a folded wake prunes, still in a chunked drain's
+/// remainder when the wake comes. The per-block prune's first hold drained
+/// them all; the lean prune must leave every one of them indexed too, not
+/// pending until the drainer's bounded holds reach them.
+#[test]
+fn lean_prune_indexes_the_frames_a_remainder_holds() {
+    for offlock in [false, true] {
+        let queue = TxQueue::<EthPooledTransaction>::new().with_offlock(offlock).with_drain_chunk(3);
+        // Nonces 0..4 of 30 senders, in their lanes.
+        for s in 0..30 {
+            frame(&queue, sender(s), 0, 4);
+        }
+        queue.drain_now();
+        // Nonces 4..8 arrive; one chunked hold leaves the rest pending.
+        for s in 0..30 {
+            frame(&queue, sender(s), 4, 4);
+        }
+        let _ = queue.drain_chunked(3, 1);
+        let before = queue.frame_census();
+        assert!(before.pending > 20, "offlock={offlock}: a remainder is pending ({before:?})");
+        // Two blocks folded into one wake mine nonces 0..4 of every sender.
+        let blocks: Vec<(u64, Vec<(Address, u64)>, Vec<B256>)> = (1..=2u64)
+            .map(|n| {
+                let mined: Vec<(Address, u64)> =
+                    (0..30).flat_map(|s| (2 * (n - 1)..2 * n).map(move |nonce| (sender(s), nonce))).collect();
+                let hashes = mined.iter().map(|(s, nonce)| *tx_hashed(*s, *nonce).hash()).collect();
+                (n, mined, hashes)
+            })
+            .collect();
+        let inputs: Vec<PruneInput<'_>> = blocks
+            .iter()
+            .map(|(n, mined, hashes)| PruneInput { number: *n, hash: block_hash(*n), mined, hashes })
+            .collect();
+        let (_, times) = queue.prune_blocks(&inputs);
+        assert_eq!(times.removals, 1);
+        let census = queue.frame_census();
+        assert_eq!(census.pending, 0, "offlock={offlock}: nothing left pending ({census:?})");
+        assert_eq!(census.live, 30, "offlock={offlock}: every later frame indexed ({census:?})");
+        assert_eq!(queue.len(), 30 * 4, "offlock={offlock}");
+        assert!(times.drained > 0 && times.drain_holds > 1, "offlock={offlock}: {times:?}");
+    }
+}

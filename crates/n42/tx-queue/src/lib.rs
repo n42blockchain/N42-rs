@@ -410,6 +410,15 @@ pub struct PruneTimes {
     pub removals: usize,
     /// Blocks folded into those removals.
     pub folded: usize,
+    /// `N42_PRUNE_LEAN`: transactions the wake moved from a chunked drain's
+    /// remainder (and the inbox as it stood) into their lanes, in bounded
+    /// holds after the removal ([`TxQueue::finish_remainder`]), the holds
+    /// made and their sum in microseconds.
+    pub drained: usize,
+    /// Those holds.
+    pub drain_holds: usize,
+    /// Their sum, lock waits included.
+    pub drain_us: u64,
 }
 
 /// [`TxQueue::frame_census`].
@@ -3082,7 +3091,67 @@ impl<T: PoolTransaction> TxQueue<T> {
         if !run.is_empty() {
             self.remove_folded(&run, &mut times);
         }
+        let at = std::time::Instant::now();
+        let (drained, holds) = self.finish_remainder();
+        times.drained += drained;
+        times.drain_holds += holds;
+        times.drain_us += at.elapsed().as_micros() as u64;
         (back, times)
+    }
+
+    /// The lean prune's drain (`N42_PRUNE_LEAN`): what a chunked drain left
+    /// in the remainder, and the inbox as it stands now, moved into the
+    /// lanes in holds of at most one drainer slice each, the lock released
+    /// between them, until everything that was pending when the first hold
+    /// began is in its lane (what arrives after is the drainer's).
+    ///
+    /// The per-block path's first hold drained all of it at once (the
+    /// pruner's 33-45 ms hold). Without any such drain the remainder is
+    /// moved only by the drainer's and the block path's bounded holds,
+    /// which under a lock at ~99% duty move what the builds take and no
+    /// more: on loop351 bw's lean leg the remainder held ~4,900 frames
+    /// (~2.4M transactions, the whole ingest gate) while the live index
+    /// held 20-130, because a remainder frame is indexed only once its last
+    /// transaction is in its lane. Returns the transactions moved and the
+    /// holds made.
+    fn finish_remainder(&self) -> (usize, usize) {
+        let chunk = self.drain_chunk.load(std::sync::atomic::Ordering::Relaxed);
+        let slice = if chunk > 0 { chunk } else { DRAINER_SLICE };
+        let (mut moved, mut holds) = (0usize, 0usize);
+        let mut target = None;
+        loop {
+            let done = {
+                let mut inner = self.lock_inner_unsettled();
+                holds += 1;
+                if target.is_none() {
+                    // The first hold takes the inbox into the remainder:
+                    // everything pending now is at or before this mark.
+                    moved += self.drain_inbox_upto(&mut inner, slice);
+                    target = Some(inner.pending_in);
+                } else {
+                    let at = std::time::Instant::now();
+                    let n = inner.drain_pending(slice);
+                    if n > 0 {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let took = at.elapsed().as_nanos() as u64;
+                        let c = &LOCK_COUNTERS;
+                        c.drains.fetch_add(1, Relaxed);
+                        c.drain_chunks.fetch_add(1, Relaxed);
+                        c.drain_txs.fetch_add(n as u64, Relaxed);
+                        c.drain_ns.fetch_add(took, Relaxed);
+                        raise_max(&c.drain_max_ns, took);
+                        raise_max(&c.drain_chunk_max_txs, n as u64);
+                    }
+                    moved += n;
+                }
+                target.is_some_and(|mark| inner.pending_out >= mark)
+                    || (inner.pending_drain.is_empty() && inner.pending_frames.is_empty())
+            };
+            if done {
+                return (moved, holds);
+            }
+            std::thread::yield_now();
+        }
     }
 
     /// Whether an own block other than `hash` is held at `number`: its

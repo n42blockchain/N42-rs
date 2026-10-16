@@ -4097,3 +4097,21 @@ Stage bw (wt-main, tree 253bd28fe = main 1f369746e + perf/handoff-done-first (ha
 2. **The early hand-off alone is a gain**: 400.0M -- the first round at 400M and the record (399.0M in 10.144) -- with the plan intact (plan_body 0 on 7 builds), the hold off the path (7.6 ms -> 0.6 ms p50) and windows 2-3 at 4.37-4.41M where the controls read 4.06-4.22M. One leg; stage bx reruns it twice before X15 is declared.
 3. **The ledger lock** takes the window-1 record to 4.613M (Lla) and 4.580M (Llb) -- the two highest first windows ever -- and then loses it: windows 2-3 at 4.07-4.33M, rounds 393.8M and 384.8M against 380.1M and 384.4M (+3.6%, +0.1%). The hold stays on the path (handoff_hold_us 5.8-6.2 ms: the ledger lock moves the hold off the lanes lock, not off the hand-off task), so it and the early hand-off are complementary; what fades after window 1 is the next question (the lock_holders table and ledger_* fields of these legs carry the answer). Stage bx runs the two together.
 4. Records: round 400.0M (Lha), window 1 4.613M (Lla).
+
+### 10.147 loop351 stage bx — on a quiet box the X14 controls read 400.0M twice; the early hand-off trades window 1 for window 3 and is not adopted; neither is the ledger lock
+
+Stage bx (wt-main, tree abd017dd3, the bw tree; no foreign claim on the box this time) reruns the early hand-off twice and the hand-off with the ledger lock twice between two X14 controls.
+
+| leg | w1 | w2 | w3 | round | handoff_hold_us p50 (w1/w2/w3) | plan_body 2 (topped up) w1/w2/w3 |
+| --- | --- | --- | --- | --- | --- | --- |
+| X11T16Ma, control | 4.453 | 4.427 | 4.454 | **400.0M** | 6,905 / 8,204 / 7,978 | 16 / 13 / 11 |
+| X11T16Mha, hand-off | 4.580 | 4.467 | 4.283 (695 blocks, 185k txs mean) | 399.9M | 257 / 595 / 618 | 66 / 67 / 50 |
+| X11T16Mhla, hand-off + ledger | 4.533 | 4.213 | 4.300 | 391.4M | 12 / 13 / 12 | 63 / 42 / 70 |
+| X11T16Mb, control | 4.500 | 4.353 | 4.480 | **400.0M** | 8,171 / 8,848 / 8,157 | 22 / 11 / 9 |
+| X11T16Mhb, hand-off | 4.560 | 4.287 | 4.273 | 393.6M | 479 / 131 / 249 | 55 / 39 / 50 |
+| X11T16Mhlb, hand-off + ledger | 4.447 | 4.407 | 4.267 | 393.6M | 11 / 12 / 12 | 70 / 75 / 55 |
+
+1. **The controls set the mark.** With no other session on the box, X14 reads 400.0M on both controls (4.43-4.50M on every window; 10.146's 400.0M record is equalled twice by the plain set). The 380-388M of stages bv-bw, controls included, were the box: compare within a stage only, and treat a stage with foreign claims as a relative measurement.
+2. **The early hand-off is not adopted.** It does what it says (hold 7-8 ms -> 0.1-0.6 ms, with the ledger lock 12 us) and lifts window 1 to 4.53-4.58M on all four legs that carry it, but windows 2-3 fall to 4.21-4.30M where the controls hold 4.35-4.48M: rounds 399.9 / 393.6M against 400.0 / 400.0M (0 of 2 pairs at +1.5%). Mha's third window is the tell: 695 blocks -- more than any control -- but only 185k transactions each; and the topped-up plans (`plan_body 2`) run at 50-75 per window against 9-22 on the controls. With the hold off the hand-off task the next build starts sooner than the plan ahead is full, so it seals a thinner block sooner: the pacer is not binding, so earlier seals make more, emptier blocks, and nothing is gained -- the same shape as 10.145's starvation in a mild form. The gain would need the plan ahead to be ready that much earlier as well.
+3. **The ledger lock adds nothing on top** (391.4 / 393.6M) and the window-1 record of 10.146 was not repeated; 10.146's two ledger legs are now read as the same w1-for-w2/3 trade.
+4. **Set stays X14.** On a quiet box: 393.8-400.0M on seven legs across bu and bx. Next: the fixed lean pruner (perf/handoff-done-first be8643a79: the remainder drained in bounded holds after the folded removal) alone against X14 -- it attacks the pruner's utilisation-1 state, the root of the degraded onset, rather than the hand-off symptom -- and an analysis of why an earlier build start yields thinner blocks (the plan-ahead's readiness).

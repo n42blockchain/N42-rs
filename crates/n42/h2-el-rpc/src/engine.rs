@@ -531,7 +531,24 @@ fn abandon_chain(
     if behind_mine || (mine && state.next.as_ref().is_some_and(|waiting| waiting.generation == generation)) {
         state.next = None;
     }
-    if state.generation == generation {
+    if behind_mine && !mine {
+        // Only the build behind the slot failed (`N42_BUILD_AHEAD_GATE=seal`):
+        // the slot's build stands on its own parent, not on this one, and is
+        // still the block the next request asks for. Bumping the generation
+        // here abandoned it too, so its take read "its branch was abandoned"
+        // and the leader built that height again -- without the transactions
+        // the failed build's request had already held for it (stage w,
+        // blocks 2164 and 2184: `own_not_committed`, BODYGATE). Only a start
+        // this build's own seal deferred goes with it; the branch stays.
+        let deferred_by_it = state.deferred.as_ref().is_some_and(|deferred| {
+            deferred.generation == generation
+                && deferred.built.number == who.number
+                && deferred.built.parent_hash == who.parent
+        });
+        if deferred_by_it {
+            state.deferred = None;
+        }
+    } else if state.generation == generation {
         state.generation = state.generation.wrapping_add(1);
     }
     drop(state);
@@ -2967,5 +2984,41 @@ mod ahead_gate_tests {
         let state = chain.lock().unwrap();
         assert_eq!(state.slot.as_ref().map(|c| c.number), Some(5));
         assert!(state.next.is_none());
+        // The slot's branch is not abandoned: its take must still match.
+        assert_eq!(state.generation, 0, "a failed build behind the slot must not abandon the slot's branch");
+    }
+
+    #[test]
+    fn a_failed_build_behind_takes_only_its_own_deferred_start() {
+        let chain = std::sync::Arc::new(std::sync::Mutex::new(ChainState {
+            gate: AheadGate::Seal,
+            defer_refused: true,
+            ..ChainState::default()
+        }));
+        let (slot, _a) = chained(0, 5, 4);
+        let (next, _b) = chained(0, 6, 5);
+        let sealer: ChainSealer = std::sync::Arc::new(|_: &alloy_consensus::Header, _: &PayloadAttributes, _: u64| None);
+        // The build behind (6, on 5) sealed while 5 was untaken: its
+        // successor was deferred, owned by it.
+        let built = alloy_consensus::Header { number: 6, parent_hash: B256::repeat_byte(5), ..Default::default() };
+        {
+            let mut state = chain.lock().unwrap();
+            state.slot = Some(slot);
+            state.next = Some(next);
+            state.deferred = Some(DeferredChain {
+                generation: 0,
+                sealer,
+                addr: std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+                built,
+                built_with: PayloadAttributes::default(),
+                view: 7,
+            });
+        }
+        let who = ChainWho { parent: B256::repeat_byte(5), number: 6, started: std::time::Instant::now() };
+        abandon_chain(&chain, 0, who, "test");
+        let state = chain.lock().unwrap();
+        assert!(state.deferred.is_none(), "a start deferred by the failed build cannot run");
+        assert_eq!(state.slot.as_ref().map(|c| c.key()), Some(key(0, 5, 4)));
+        assert_eq!(state.generation, 0);
     }
 }

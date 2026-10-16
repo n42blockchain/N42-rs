@@ -1960,6 +1960,13 @@ where
     // behind the proposal), us. Both 0 when the step did not seal.
     let mut par_to_seal_us = 0u64;
     let mut par_behind_seal_us = 0u64;
+    // Between the parallel step's end and the shards' filing, us: the drop
+    // of the step's scope (the pulled set `cands`, the warm layer, the
+    // transfer keys), the give-backs of the lookahead and the deferred
+    // candidates to the queue, and the puller's drop (its thread joined, the
+    // walk's own give-back). The rest of that road is `par_to_finish_us`.
+    let mut par_end_at: Option<std::time::Instant> = None;
+    let mut pulled_drop_us = 0u64;
     // Of the batches' start: the hook before the batches whole (the
     // deferred state's open, `state_wait_us`, and the pre-execution changes
     // after it, `state_pre_changes_us`), us.
@@ -3359,7 +3366,10 @@ where
         if sealed_ahead.is_some() {
             par_behind_seal_us = sealed_instant.map_or(0, |at| at.elapsed().as_micros() as u64);
         }
+        par_end_at = Some(std::time::Instant::now());
     }
+    // The step's scope has dropped: the pulled set among it.
+    pulled_drop_us += par_end_at.map_or(0, |at| at.elapsed().as_micros() as u64);
     // `N42_STATE_AFTER_PULL=1`: every way out of the parallel step opened the
     // state already; this is a no-op kept so the serial loop and the finish
     // below never run on a state without its pre-execution changes.
@@ -3450,6 +3460,7 @@ where
             let seal_at = std::time::Instant::now();
             // Whatever was taken ahead and not built goes back to the queue,
             // as the loop's end does; the puller stops at its next batch.
+            let giveback_at = std::time::Instant::now();
             for pool_tx in lookahead.into_iter().rev() {
                 refuse!(
                     &pool_tx,
@@ -3460,7 +3471,10 @@ where
                 let err = deferred_refusal!(skipped_heads, pool_tx);
                 refuse!(&pool_tx, err);
             }
+            let giveback_us = giveback_at.elapsed().as_micros() as u64;
+            let puller_drop_at = std::time::Instant::now();
             drop(pulled.take());
+            let puller_drop_us = puller_drop_at.elapsed().as_micros() as u64;
             let seal_at_exec_used = sealed_ahead.is_some();
             let (payload, recovered, block_hash, block_number, root_ms, fields_ms, sealed_ms, sealed_at_ms, parent_sealed) =
                 match sealed_ahead.take() {
@@ -4184,6 +4198,15 @@ where
                     // the hook (state open + pre-execution changes).
                     par_to_seal_us,
                     par_behind_seal_us,
+                    // The parallel step's end to the finish's start and to
+                    // the shards' filing, and the steps between them: the
+                    // step's scope drop (the pulled set), the give-backs, the
+                    // puller's drop.
+                    par_to_finish_us = crate::fields_at_seal::us_between(par_end_at, Some(finish_at)),
+                    par_to_shards_us = crate::fields_at_seal::us_between(par_end_at, shards_ready_at),
+                    pulled_drop_us,
+                    giveback_us,
+                    puller_drop_us,
                     par_hook_us,
                     state_pre_changes_us,
                     sealed_ms,

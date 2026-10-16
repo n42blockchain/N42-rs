@@ -4029,3 +4029,21 @@ Stage ca (wt-main, tree a1a395100 = the bz tree + perf/handoff-done-first throug
 2. **256 batches is not adopted**: 4.311 / 4.425M/s, one leg under and one over the controls, sealed_at 35-36 unchanged.
 3. The controls read 4.250 / 4.410 against bz's 4.382 / 4.382 with 75e9b71b2 (the inbox carries sender and nonce from the push) in the tree: no cost visible beyond the stage's spread.
 4. perf/handoff-done-first is merged to main up to 80bf6fe4a; every knob stays off by default and X15 sets the two at the bench level. Next: docs/LANES_LOCK_SPLIT_DESIGN.md stage 2 (`N42_TX_QUEUE_DRAIN_RUNS`, perf/drain-runs-offlock) alone and with the fixed lean pruner, on X15 (stage cb).
+
+### 10.151 loop351 stage cb — the fixed lean pruner holds its steady state and, with the drain runs, reads 4.52-4.58M/s against 4.37 (X16); the drain runs alone change nothing
+
+Stage cb (wt-main, tree 6e093b165 = main 80bf6fe4a-equivalent + merge timers + drainrate.py + the unadopted ledger lock reverted + the drain runs 053cd9ed6/b89ff1eda; 2,445 tests pass), 600M set, drain-rate scored: two X15 controls, two legs of `N42_TX_QUEUE_DRAIN_RUNS=1`, two of the drain runs plus the fixed `N42_PRUNE_LEAN=1` (dca6c41c7: the remainder drained in bounded shares, notifications freed off the pruner thread; e823ecbba: sender and nonce read at push).
+
+| leg | w1 | w2 | w3 | round | drain M/s |
+| --- | --- | --- | --- | --- | --- |
+| X11T16Ra, X15 control | 4.573 | 4.360 | 4.160 | 392.8M | 4.365 |
+| X11T16Rda, drain runs | 4.407 | 4.160 | 4.500 | 392.0M | 4.373 |
+| X11T16Rla, drain runs + lean pruner | 4.560 | 4.440 | 4.533 | 406.0M | 4.515 |
+| X11T16Rb, X15 control | 4.560 | 4.307 | 4.247 | 393.4M | 4.373 |
+| X11T16Rdb, drain runs | 4.347 | 4.427 | 4.313 | 392.6M | 4.367 |
+| X11T16Rlb, drain runs + lean pruner | **4.600** | **4.607** | 4.493 | **411.0M** | **4.580** |
+
+1. **X16 = X15 + `N42_TX_QUEUE_DRAIN_RUNS=1 N42_PRUNE_LEAN=1`.** Both legs beat both controls (+3.3% and +4.7% drain rate), and this time the lean pruner's third window holds (4.49-4.53M where 10.148's lean legs fell to 4.09-4.11): the steady-state fix did its job -- the remainder no longer swallows the queue, the pruner keeps up for the whole round. The two legs' windows 2-3 (4.44-4.61M) are the best sustained windows so far.
+2. **The drain runs alone read as the controls** (4.373 / 4.367 against 4.365 / 4.373). The lanes lock's share of per-transaction work under the lock fell as designed, but on X15 the lock was not what bound the round; the knob stays in the set only because the lean pruner was measured with it and the pair is what X16 is.
+3. The stage's controls read 4.37M/s where stage ca's X15 legs read 4.56-4.58: the drift between stages that 10.148 noted again; pairs within a stage are what count.
+4. perf/drain-runs-offlock is merged to main (the lean fixes were already there; every knob stays off by default). Next (stage cc): the build-side cuts of docs/X15_BUILD_NEXT.md on X16, each alone and together: `N42_PLAN_BODY_WAIT_MS=5`, `N42_BUILD_WORK_STEALING=1`, `N42_ROOT_UPPER_DIRTY=1 N42_ROOT_OPS_BEFORE_GATE=1`.

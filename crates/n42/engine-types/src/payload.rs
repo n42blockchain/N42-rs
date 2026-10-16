@@ -4065,9 +4065,20 @@ where
                                 let (graft, late) = spawn_late_reverts(&shards, &residual.state, shard_reverts, None);
                                 let (merged, split) = match late {
                                     Some(_) => {
-                                        let (merged, state_us) = shards.merged_state_first(&residual.state, None);
+                                        // `N42_MERGE_PARALLEL=<N>`: the account map
+                                        // in N parts on the critical set (the root's
+                                        // cores, idle now), and the combine here on
+                                        // it too; this thread goes back after.
+                                        let parts = crate::output_shards::merge_parallel();
+                                        if parts > 0 {
+                                            n42_core_layout::enter(n42_core_layout::Set::Critical);
+                                        }
+                                        let (merged, split) = shards.merged_state_first_split(&residual.state, parts);
+                                        if parts > 0 {
+                                            n42_core_layout::enter(n42_core_layout::Set::Background);
+                                        }
                                         let total_us = merge_at.elapsed().as_micros() as u64;
-                                        (merged, crate::output_shards::MergeSplit { state_us, total_us, ..Default::default() })
+                                        (merged, crate::output_shards::MergeSplit { total_us, ..split })
                                     }
                                     None => {
                                         let (mut merged, split) = shards.merged_timed(&residual.state, false);
@@ -4083,8 +4094,15 @@ where
                                 // revert set at once, on two threads; the same
                                 // bundle (`merged_timed`).
                                 let concurrent = crate::output_shards::merge_split();
+                                let parts = crate::output_shards::merge_parallel();
                                 let merge_at = std::time::Instant::now();
+                                if parts > 0 {
+                                    n42_core_layout::enter(n42_core_layout::Set::Critical);
+                                }
                                 let (mut merged, split) = shards.merged_timed(&residual.state, concurrent);
+                                if parts > 0 {
+                                    n42_core_layout::enter(n42_core_layout::Set::Background);
+                                }
                                 let tail_at = std::time::Instant::now();
                                 crate::parallel_transfer::append_reverts(&mut merged, shard_reverts);
                                 let merge_end = std::time::Instant::now();
@@ -4477,6 +4495,16 @@ where
                     merge_state_us = leader_merge.split.state_us,
                     merge_reverts_us = leader_merge.split.reverts_us,
                     merge_append_us = leader_merge.split.append_us,
+                    // The account map taken apart: its allocation, the serial
+                    // fill (clones and inserts), the inserting thread's minor
+                    // faults; `N42_MERGE_PARALLEL`: the parts, their wall
+                    // (scatter, sort, clone) and the in-order combine.
+                    merge_alloc_us = leader_merge.split.alloc_us,
+                    merge_fill_us = leader_merge.split.fill_us,
+                    merge_faults = leader_merge.split.faults,
+                    merge_parallel_parts = leader_merge.split.parts,
+                    merge_gather_us = leader_merge.split.gather_us,
+                    merge_combine_us = leader_merge.split.combine_us,
                     merge_tail_us = leader_merge.tail_us,
                     // The output registry's `register` (N42_ANSWER_BEFORE_REVERTS):
                     // the lock's wait, its hold, and the eviction's free under it.

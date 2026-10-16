@@ -1882,6 +1882,22 @@ pub struct MergeSplit {
     pub append_us: u64,
     /// The whole merge.
     pub total_us: u64,
+    /// The account map's allocation: the map made and its capacity reserved.
+    pub alloc_us: u64,
+    /// The serial account map: every account cloned and inserted, in the
+    /// sources' order (0 when the map was built in parts).
+    pub fill_us: u64,
+    /// `N42_MERGE_PARALLEL`: the parts' wall -- the accounts scattered by
+    /// their bucket in the merged map, then each bucket range sorted and
+    /// cloned -- before the combine.
+    pub gather_us: u64,
+    /// `N42_MERGE_PARALLEL`: the combine -- every part's accounts inserted
+    /// into the one map in bucket order.
+    pub combine_us: u64,
+    /// Minor page faults on the inserting thread while it filled the map.
+    pub faults: u64,
+    /// `N42_MERGE_PARALLEL`: the parts the map was built in (0: serial).
+    pub parts: u32,
 }
 
 /// The fold's wall time taken apart ([`OutputShards::freeze`]), microseconds:
@@ -2239,10 +2255,10 @@ impl FrozenShards {
         };
         let state_job = || {
             let at = std::time::Instant::now();
-            let state = self.merged_state(residual);
+            let state = self.merged_state_split(residual, merge_parallel());
             (state, at.elapsed().as_micros() as u64)
         };
-        let (((state, size), state_us), (reverts, reverts_us)) = if concurrent {
+        let (((state, size, sub), state_us), (reverts, reverts_us)) = if concurrent {
             std::thread::scope(|scope| {
                 let reverts = std::thread::Builder::new()
                     .name("n42-merge-reverts".into())
@@ -2272,6 +2288,7 @@ impl FrozenShards {
             reverts_us,
             append_us: append_at.elapsed().as_micros() as u64,
             total_us: started.elapsed().as_micros() as u64,
+            ..sub
         };
         (bundle, split)
     }
@@ -2314,6 +2331,7 @@ impl FrozenShards {
                 reverts_us,
                 append_us: append_at.elapsed().as_micros() as u64,
                 total_us: started.elapsed().as_micros() as u64,
+                ..Default::default()
             };
             (bundle, split)
         })
@@ -2327,18 +2345,40 @@ impl FrozenShards {
     /// whole merge leaves. Returns the bundle and the account map's wall in
     /// microseconds.
     pub fn merged_state_first(&self, residual: &BundleState, pool: Option<&rayon::ThreadPool>) -> (BundleState, u64) {
+        match pool {
+            Some(pool) => {
+                let at = std::time::Instant::now();
+                let (state, size) = pool.install(|| self.merged_state_parallel(residual));
+                let state_us = at.elapsed().as_micros() as u64;
+                (self.state_first_bundle(residual, state, size), state_us)
+            }
+            None => {
+                let (bundle, split) = self.merged_state_first_split(residual, 0);
+                (bundle, split.state_us)
+            }
+        }
+    }
+
+    /// [`Self::merged_state_first`] on the caller's thread, timed in its
+    /// parts: `parts` 0 builds the account map serially, `parts` > 0 in that
+    /// many parts on threads of the critical set
+    /// ([`Self::merged_state_split`], `N42_MERGE_PARALLEL`). `split.state_us`
+    /// is the account map's wall; `total_us` is left to the caller.
+    pub fn merged_state_first_split(&self, residual: &BundleState, parts: usize) -> (BundleState, MergeSplit) {
         let at = std::time::Instant::now();
-        let (state, size) = match pool {
-            Some(pool) => pool.install(|| self.merged_state_parallel(residual)),
-            None => self.merged_state(residual),
-        };
+        let (state, size, split) = self.merged_state_split(residual, parts);
         let state_us = at.elapsed().as_micros() as u64;
+        (self.state_first_bundle(residual, state, size), MergeSplit { state_us, ..split })
+    }
+
+    /// The bundle [`Self::merged_state_first`] hands out around its account map.
+    fn state_first_bundle(&self, residual: &BundleState, state: AddressHashMap<BundleAccount>, size: i128) -> BundleState {
         let mut contracts = self.contracts.clone();
         contracts.extend(residual.contracts.iter().map(|(hash, code)| (*hash, code.clone())));
         let reverts = residual.reverts.clone();
         let reverts_size = reverts.iter().map(Vec::len).sum();
         let state_size = usize::try_from(size.max(0)).unwrap_or(usize::MAX);
-        (BundleState { state, contracts, reverts, state_size, reverts_size }, state_us)
+        BundleState { state, contracts, reverts, state_size, reverts_size }
     }
 
     /// The other half of [`Self::merged_state_first`]: the block's complete
@@ -2457,20 +2497,29 @@ impl FrozenShards {
     }
 
     /// The merged account map and its size: the shards' accounts with the
-    /// residual's laid over them, each account cloned once into the one map.
-    fn merged_state(&self, residual: &BundleState) -> (AddressHashMap<BundleAccount>, i128) {
+    /// residual's laid over them, each account cloned once into the one map;
+    /// built serially (`parts` 0) or in `parts` parts
+    /// ([`Self::merged_state_in_parts`]). The same map and size either way.
+    /// The split carries the allocation, the fill (or the parts' gather and
+    /// the combine) and the inserting thread's minor faults.
+    pub fn merged_state_split(&self, residual: &BundleState, parts: usize) -> (AddressHashMap<BundleAccount>, i128, MergeSplit) {
+        if parts > 0 {
+            return self.merged_state_in_parts(residual, parts);
+        }
         let newer = &residual.state;
         let total: usize = self.accounts() + newer.len();
+        let alloc_at = std::time::Instant::now();
         let mut state: AddressHashMap<BundleAccount> = Default::default();
         state.reserve(total);
-        let mut size = residual.state_size as i128;
-        size += self.indexed.as_ref().map_or(0, |indexed| indexed.state_size as i128);
+        let alloc_us = alloc_at.elapsed().as_micros() as u64;
+        let faults_at = thread_minor_faults();
+        let fill_at = std::time::Instant::now();
+        let mut size = self.base_state_size(residual);
         // One pass, each account cloned straight into its slot of the one
         // map: the copy into per-shard vectors on the build pool first, then
         // moved into the map, wrote and read every account a second time and
         // put sixteen threads of memory traffic beside the roots. (Index
         // mode: the batches' maps and the conflicts, each account once.)
-        size += self.shards.iter().map(|shard| shard.state_size as i128).sum::<i128>();
         let mut put = |map: &AddressHashMap<BundleAccount>, removed: Option<&AddressHashSet>| {
             if newer.is_empty() && removed.is_none() {
                 state.extend(map.iter().map(|(address, account)| (*address, account.clone())));
@@ -2500,7 +2549,149 @@ impl FrozenShards {
                 state.insert(*address, account.clone());
             }
         }
-        (state, size)
+        let split = MergeSplit {
+            alloc_us,
+            fill_us: fill_at.elapsed().as_micros() as u64,
+            faults: thread_minor_faults().saturating_sub(faults_at),
+            ..Default::default()
+        };
+        (state, size, split)
+    }
+
+    /// The merged map's size before the overlays' changes: the residual's,
+    /// the index's or the shards'.
+    fn base_state_size(&self, residual: &BundleState) -> i128 {
+        residual.state_size as i128
+            + self.indexed.as_ref().map_or(0, |indexed| indexed.state_size as i128)
+            + self.shards.iter().map(|shard| shard.state_size as i128).sum::<i128>()
+    }
+
+    /// `N42_MERGE_PARALLEL=<parts>`: the serial merge's map built in parts
+    /// on scoped threads of the critical set (the QMDB root's cores, idle once
+    /// the root is published; never the build pool). The serial merge is
+    /// bound by its inserts into a ~70 MB table at random positions -- every
+    /// account a cache miss (and a page touched first) on the table, after
+    /// one on its source map -- so the parts do everything but the inserts,
+    /// and leave them in the order of the buckets they land in:
+    ///
+    /// 1. scatter: each part walks a contiguous run of the source maps (in
+    ///    the serial order) and files every account by the bucket its hash
+    ///    gives in the merged map (whose capacity -- so bucket count -- and
+    ///    hasher are fixed before the parts start) into one of `parts` bucket
+    ///    ranges;
+    /// 2. gather: each part takes one range, from every part in part order,
+    ///    sorts it by bucket (stable: an address several sources hold keeps
+    ///    the serial order, so the later one still wins) and clones the
+    ///    accounts, the residual laid over them as the serial merge does;
+    /// 3. combine, on the calling thread: the ranges inserted in order, so
+    ///    the table is written front to back.
+    ///
+    /// The map holds the serial merge's accounts and the size is its size;
+    /// a std map cannot be filled from several threads, so the inserts stay
+    /// serial. A part whose thread cannot be had runs on the calling thread.
+    fn merged_state_in_parts(&self, residual: &BundleState, parts: usize) -> (AddressHashMap<BundleAccount>, i128, MergeSplit) {
+        let parts = parts.clamp(1, MAX_MERGE_PARTS);
+        let newer = &residual.state;
+        let total: usize = self.accounts() + newer.len();
+        let alloc_at = std::time::Instant::now();
+        let mut state: AddressHashMap<BundleAccount> = Default::default();
+        state.reserve(total);
+        let alloc_us = alloc_at.elapsed().as_micros() as u64;
+        let buckets = buckets_of_capacity(state.capacity()) as u64;
+        let mask = buckets - 1;
+        let hasher = state.hasher().clone();
+        let range_of = |bucket: u64| ((bucket * parts as u64) / buckets) as usize;
+
+        let gather_at = std::time::Instant::now();
+        let sources = self.source_maps();
+        // Contiguous runs of the sources, balanced by their accounts; the
+        // residual's own accounts (the serial merge's last inserts) go
+        // with the last run.
+        let mut runs: Vec<std::ops::Range<usize>> = Vec::with_capacity(parts);
+        {
+            let weight: usize = sources.iter().map(|(map, _)| map.len()).sum::<usize>().max(1);
+            let (mut from, mut seen) = (0usize, 0usize);
+            for (at, (map, _)) in sources.iter().enumerate() {
+                seen += map.len();
+                if runs.len() + 1 < parts && seen * parts >= weight * (runs.len() + 1) {
+                    runs.push(from..at + 1);
+                    from = at + 1;
+                }
+            }
+            runs.push(from..sources.len());
+            runs.resize(parts, sources.len()..sources.len());
+        }
+        let scatter = |part: usize| -> Vec<Vec<Gathered<'_>>> {
+            let mut out: Vec<Vec<Gathered<'_>>> =
+                (0..parts).map(|_| Vec::with_capacity(total / (parts * parts) + 16)).collect();
+            for (map, removed) in &sources[runs[part].clone()] {
+                for (address, account) in map.iter() {
+                    if removed.is_some_and(|removed| removed.contains(address)) {
+                        continue;
+                    }
+                    let bucket = std::hash::BuildHasher::hash_one(&hasher, address) & mask;
+                    out[range_of(bucket)].push((bucket as u32, address, account, newer.get(address)));
+                }
+            }
+            if part + 1 == parts {
+                for (address, account) in newer {
+                    if !self.holds(address) {
+                        let bucket = std::hash::BuildHasher::hash_one(&hasher, address) & mask;
+                        out[range_of(bucket)].push((bucket as u32, address, account, None));
+                    }
+                }
+            }
+            out
+        };
+        let scattered: Vec<Vec<Vec<Gathered<'_>>>> = run_parts(parts, &scatter);
+        // Range `r` of every part, in part order.
+        let mut by_range: Vec<Vec<Vec<Gathered<'_>>>> = (0..parts).map(|_| Vec::with_capacity(parts)).collect();
+        for part in scattered {
+            for (range, list) in part.into_iter().enumerate() {
+                by_range[range].push(list);
+            }
+        }
+        let by_range: Vec<Mutex<Vec<Vec<Gathered<'_>>>>> = by_range.into_iter().map(Mutex::new).collect();
+        let gather = |range: usize| -> (Vec<(Address, BundleAccount)>, i128) {
+            let lists = std::mem::take(&mut *by_range[range].lock().unwrap_or_else(PoisonError::into_inner));
+            let mut list: Vec<Gathered<'_>> = Vec::with_capacity(lists.iter().map(Vec::len).sum());
+            for part in lists {
+                list.extend(part);
+            }
+            list.sort_by_key(|entry| entry.0);
+            let mut delta = 0i128;
+            let accounts = list
+                .into_iter()
+                .map(|(_, address, account, over)| match over {
+                    Some(over) => {
+                        let merged = overlaid(account, over);
+                        delta += merged.size_hint() as i128 - account.size_hint() as i128 - over.size_hint() as i128;
+                        (*address, merged)
+                    }
+                    None => (*address, account.clone()),
+                })
+                .collect();
+            (accounts, delta)
+        };
+        let gathered = run_parts(parts, &gather);
+        let gather_us = gather_at.elapsed().as_micros() as u64;
+
+        let faults_at = thread_minor_faults();
+        let combine_at = std::time::Instant::now();
+        let mut size = self.base_state_size(residual);
+        for (accounts, delta) in gathered {
+            size += delta;
+            state.extend(accounts);
+        }
+        let split = MergeSplit {
+            alloc_us,
+            gather_us,
+            combine_us: combine_at.elapsed().as_micros() as u64,
+            faults: thread_minor_faults().saturating_sub(faults_at),
+            parts: parts as u32,
+            ..Default::default()
+        };
+        (state, size, split)
     }
 
     /// The shards' reverts, copied and sorted by address as `append_reverts`
@@ -2566,6 +2757,79 @@ impl FrozenShards {
 /// An account the batches wrote and the executor changed again: the newer
 /// value, against the parent's original the shard carries, with the storage
 /// of both (the newer slots winning).
+/// `N42_MERGE_PARALLEL=<N>` (0 or unset: off, the default): the leader's
+/// account merge after the root (the `n42-shard-merge` thread) builds its
+/// map in `N` parts on threads of the critical set
+/// ([`FrozenShards::merged_state_split`]); at most [`MAX_MERGE_PARTS`].
+/// The same bundle. Read once.
+pub fn merge_parallel() -> usize {
+    static PARTS: OnceLock<usize> = OnceLock::new();
+    *PARTS.get_or_init(|| {
+        std::env::var("N42_MERGE_PARALLEL")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(MAX_MERGE_PARTS)
+    })
+}
+
+/// The most parts [`merge_parallel`] splits the merge into.
+pub const MAX_MERGE_PARTS: usize = 64;
+
+/// One account of the parallel merge's scatter: its bucket in the merged
+/// map, its address and account in its source map, and the residual's
+/// value to lay over it.
+type Gathered<'a> = (u32, &'a Address, &'a BundleAccount, Option<&'a BundleAccount>);
+
+/// The buckets of a hashbrown table (std's map) of `capacity`: a power of
+/// two of which the capacity is 7/8 (or one less, below eight buckets). Only
+/// the parallel merge's insert order depends on it, never its result.
+fn buckets_of_capacity(capacity: usize) -> usize {
+    if capacity < 8 {
+        return (capacity + 1).next_power_of_two().max(1);
+    }
+    (capacity / 7 * 8).next_power_of_two()
+}
+
+/// `job(0..parts)` on scoped threads pinned to the critical set, the results
+/// in part order; a part whose thread cannot be spawned runs here.
+fn run_parts<T: Send>(parts: usize, job: &(dyn Fn(usize) -> T + Sync)) -> Vec<T> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..parts)
+            .map(|part| {
+                std::thread::Builder::new()
+                    .name("n42-merge-part".into())
+                    .spawn_scoped(scope, move || {
+                        n42_core_layout::enter(n42_core_layout::Set::Critical);
+                        job(part)
+                    })
+                    .map_err(|_| part)
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| match handle {
+                Ok(handle) => handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                Err(part) => job(part),
+            })
+            .collect()
+    })
+}
+
+/// The calling thread's minor page faults so far (0 where it cannot be read).
+fn thread_minor_faults() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: getrusage fills the rusage it is given; zeroed is a valid one.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; RUSAGE_THREAD names the calling thread.
+        if unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) } == 0 {
+            return u64::try_from(usage.ru_minflt).unwrap_or(0);
+        }
+    }
+    0
+}
+
 fn overlaid(account: &BundleAccount, over: &BundleAccount) -> BundleAccount {
     let mut merged = over.clone();
     merged.original_info = account.original_info.clone();
@@ -2890,6 +3154,96 @@ mod frozen_tests {
             assert_eq!(serial.state.len(), 15 + 2, "index {index} live {live}");
             assert_eq!(split, serial, "index {index} live {live}: split against serial");
             assert!(timing.total_us >= timing.append_us);
+        }
+    }
+
+    /// The parallel merge's bucket count is the table std's map reserves:
+    /// its capacity is 7/8 of a power of two at the merge's sizes.
+    #[test]
+    fn the_bucket_count_matches_the_reserved_table() {
+        for n in [1usize, 7, 8, 100, 1_000, 190_000, 262_144, 1_000_000] {
+            let mut map: AddressHashMap<u8> = Default::default();
+            map.reserve(n);
+            let buckets = buckets_of_capacity(map.capacity());
+            assert!(buckets.is_power_of_two(), "{n}");
+            assert!(buckets > map.capacity() || map.capacity() < 8, "{n}");
+            if map.capacity() >= 8 {
+                assert_eq!(buckets / 8 * 7, map.capacity(), "{n}");
+            }
+        }
+    }
+
+    /// `N42_MERGE_PARALLEL`: the account map built in parts (scattered by
+    /// bucket, sorted, cloned, combined in bucket order) is the serial
+    /// merge's -- every account, the state size, the contracts, the block's
+    /// reverts -- on randomized blocks: batches of random sizes over an
+    /// address space small enough that batches collide (the index mode's
+    /// conflicts, the v4 fold's sums), accounts with storage, and a residual
+    /// that overlays some of the shards' accounts (storage on both sides)
+    /// and adds its own, in all three fold modes, at 1-17 parts.
+    #[test]
+    fn the_merge_in_parts_equals_the_serial_merge_on_random_blocks() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below.max(1)
+        };
+        let wide = |i: u64| Address::from_word(B256::from(U256::from(0x4000_0000u64 + i)));
+        let slots = |pairs: &[(u64, u64, u64)]| -> alloy_primitives::map::U256Map<(U256, U256)> {
+            pairs.iter().map(|&(slot, before, after)| (U256::from(slot), (U256::from(before), U256::from(after)))).collect()
+        };
+        for round in 0..12u64 {
+            let (index, live) = [(false, false), (true, false), (true, true)][(round % 3) as usize];
+            let space = 200 + next(4_000);
+            let batches = 1 + next(24);
+            let shards = OutputShards::with_index_live(addr(1), (space * 2) as usize, 1 + next(32) as usize, index, live);
+            for _ in 0..batches {
+                let mut builder = BundleState::builder(1..=1);
+                let mut used = std::collections::HashSet::new();
+                for _ in 0..next(space / 2 + 1) {
+                    let i = next(space);
+                    if !used.insert(i) {
+                        continue;
+                    }
+                    let account = wide(i);
+                    builder = builder
+                        .state_original_account_info(account, info(0, 1_000 + i))
+                        .state_present_account_info(account, info(1, 900 + next(50)))
+                        .revert_account_info(1, account, Some(Some(info(0, 1_000 + i))));
+                    if next(5) == 0 {
+                        builder = builder.state_storage(account, slots(&[(next(4), 0, 1 + next(9)), (7, 1, 2)]));
+                    }
+                }
+                shards.add(builder.build());
+            }
+            let frozen = shards.freeze();
+            let mut residual = BundleState::builder(1..=1);
+            for _ in 0..next(64) {
+                let i = next(space * 2);
+                let account = wide(i);
+                residual = residual
+                    .state_original_account_info(account, info(1, 900))
+                    .state_present_account_info(account, info(2, 950 + next(9)));
+                if next(3) == 0 {
+                    residual = residual.state_storage(account, slots(&[(next(4), 1, 5 + next(9))]));
+                }
+            }
+            let residual = residual.state_present_account_info(addr(8), info(0, 3)).revert_account_info(1, addr(8), Some(None)).build();
+            let (serial, serial_split) = frozen.merged_state_first_split(&residual, 0);
+            assert_eq!(serial_split.parts, 0);
+            assert!(!serial.state.is_empty());
+            for parts in [1usize, 2, 3, 8, 17] {
+                let label = format!("round {round} index {index} live {live} parts {parts}");
+                let (parallel, split) = frozen.merged_state_first_split(&residual, parts);
+                assert_eq!(split.parts as usize, parts, "{label}");
+                assert_eq!(parallel.state, serial.state, "{label}: accounts");
+                assert_eq!(parallel, serial, "{label}: bundle");
+                let (map, size, _) = frozen.merged_state_split(&residual, parts);
+                let (serial_map, serial_size, _) = frozen.merged_state_split(&residual, 0);
+                assert_eq!((map, size), (serial_map, serial_size), "{label}: map and signed size");
+            }
         }
     }
 

@@ -553,3 +553,120 @@ fn live_mode(
         or_zero(roots),
     );
 }
+
+/// `N42_MERGE_PARALLEL`: the leader's account merge after the root, serial
+/// (the allocation, the fill, the inserting thread's faults) and in parts
+/// (the parts' gather and the in-order combine), on the index mode's output
+/// of the fleet's shape. `BENCH_MERGE_PARTS` lists the part counts (default
+/// `4,8,16`).
+#[test]
+#[ignore = "a timing benchmark: run it pinned, release, on a quiet box"]
+fn bench_merge_in_parts() {
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let accounts: usize = bundles.iter().map(|b| b.state.len()).sum();
+    let parts: Vec<usize> = std::env::var("BENCH_MERGE_PARTS")
+        .unwrap_or_else(|_| "4,8,16".into())
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    let shards = OutputShards::with_index_live(beneficiary(), accounts, 16, true, false);
+    for bundle in bundles {
+        shards.add(bundle);
+    }
+    let frozen = shards.freeze();
+    let residual = BundleState::default();
+    eprintln!("accounts {}, entry {} B", frozen.accounts(), std::mem::size_of::<(Address, BundleAccount)>());
+    eprintln!("| parts | wall ms | alloc | fill | gather | combine | faults |");
+    eprintln!("| --- | --- | --- | --- | --- | --- | --- |");
+    for &n in std::iter::once(&0).chain(parts.iter()) {
+        let mut rows = Vec::new();
+        for round in 0..WARMUPS + ROUNDS {
+            let at = Instant::now();
+            let (bundle, split) = frozen.merged_state_first_split(&residual, n);
+            let wall = at.elapsed();
+            drop(bundle);
+            if round >= WARMUPS {
+                rows.push((wall, split));
+            }
+        }
+        rows.sort_by_key(|row| row.0);
+        let (wall, s) = rows[rows.len() / 2];
+        eprintln!(
+            "| {n} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {} |",
+            wall.as_secs_f64() * 1e3,
+            s.alloc_us as f64 / 1e3,
+            s.fill_us as f64 / 1e3,
+            s.gather_us as f64 / 1e3,
+            s.combine_us as f64 / 1e3,
+            s.faults
+        );
+    }
+    // The clones alone (no map): what the fill pays besides its inserts.
+    let mut clones = Vec::new();
+    for _ in 0..WARMUPS + ROUNDS {
+        let overlaps = frozen.overlaps(&residual);
+        let view = frozen.view(&residual, &overlaps);
+        let at = Instant::now();
+        let copied: Vec<(Address, BundleAccount)> = view.iter().map(|(a, b)| (**a, (*b).clone())).collect();
+        clones.push(at.elapsed());
+        drop(copied);
+    }
+    eprintln!("clones alone into a vector: {:.2} ms", median(clones));
+}
+
+/// What the merge's inserts cost by order: the accounts moved into a
+/// reserved map as the sources give them, and sorted by the bucket they
+/// land in (the parallel merge's combine), against 8-byte values in the
+/// same two orders (the table's probing without the 264-byte moves).
+#[test]
+#[ignore = "a timing benchmark: run it pinned, release, on a quiet box"]
+fn bench_merge_insert_order() {
+    use std::hash::BuildHasher as _;
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let entries: Vec<(Address, BundleAccount)> =
+        bundles.iter().flat_map(|b| b.state.iter().map(|(a, acc)| (*a, acc.clone()))).collect();
+    let n = entries.len();
+    let mut times: [Vec<Duration>; 4] = Default::default();
+    for round in 0..WARMUPS + ROUNDS {
+        let mut map: alloy_primitives::map::AddressHashMap<BundleAccount> = Default::default();
+        map.reserve(n);
+        let buckets = (map.capacity() / 7 * 8).next_power_of_two() as u64;
+        let hasher = map.hasher().clone();
+        let mut sorted = entries.clone();
+        sorted.sort_by_key(|(a, _)| hasher.hash_one(a) & (buckets - 1));
+        let at = Instant::now();
+        map.extend(sorted);
+        let t_sorted = at.elapsed();
+        let mut map2: alloy_primitives::map::AddressHashMap<BundleAccount> = Default::default();
+        map2.reserve(n);
+        let copy = entries.clone();
+        let at = Instant::now();
+        map2.extend(copy);
+        let t_plain = at.elapsed();
+        let mut small: alloy_primitives::map::AddressHashMap<u64> = Default::default();
+        small.reserve(n);
+        let h = small.hasher().clone();
+        let sb = (small.capacity() / 7 * 8).next_power_of_two() as u64;
+        let mut keys: Vec<(Address, u64)> = entries.iter().map(|(a, _)| (*a, 1)).collect();
+        let plain_keys = keys.clone();
+        keys.sort_by_key(|(a, _)| h.hash_one(a) & (sb - 1));
+        let at = Instant::now();
+        small.extend(keys);
+        let t_small_sorted = at.elapsed();
+        let mut small2: alloy_primitives::map::AddressHashMap<u64> = Default::default();
+        small2.reserve(n);
+        let at = Instant::now();
+        small2.extend(plain_keys);
+        let t_small_plain = at.elapsed();
+        if round >= WARMUPS {
+            for (i, t) in [t_plain, t_sorted, t_small_plain, t_small_sorted].into_iter().enumerate() {
+                times[i].push(t);
+            }
+        }
+        drop((map, map2, small, small2));
+    }
+    let [a, b, c, d] = times.map(median);
+    eprintln!("{n} entries: accounts source order {a:.2} / bucket order {b:.2} ms; u64 source order {c:.2} / bucket order {d:.2} ms");
+}

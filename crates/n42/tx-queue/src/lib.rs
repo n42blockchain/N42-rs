@@ -446,6 +446,47 @@ fn freeing_thread() -> Option<&'static std::sync::mpsc::SyncSender<Freeable>> {
         .as_ref()
 }
 
+/// Hands `garbage` to the queue's freeing thread ([`freeing_thread`]), or
+/// drops it here when that thread is full or absent.
+fn free_off_path(garbage: Freeable) {
+    let Some(sender) = freeing_thread() else {
+        drop(garbage);
+        return;
+    };
+    if let Err(std::sync::mpsc::TrySendError::Full(garbage) | std::sync::mpsc::TrySendError::Disconnected(garbage)) =
+        sender.try_send(garbage)
+    {
+        drop(garbage);
+    }
+}
+
+/// Whether an own block's hand-off signals the next build before holding
+/// the block (`N42_HANDOFF_DONE_FIRST=1`, default off), read and logged
+/// once. On, [`TxQueue::hold_own_block`] also folds an eviction's drop
+/// accounting into one add and frees the evicted transactions on the
+/// queue's freeing thread: after the degraded onset every hold evicts a
+/// 200,000-transaction block, and the next build's selector waited on that
+/// eviction (`start_handoff_ms` 2 -> 10-12, docs/DEGRADED_ONSET_ANALYSIS.md).
+pub fn handoff_done_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("N42_HANDOFF_DONE_FIRST").is_ok_and(|v| v == "1");
+        tracing::info!(target: "n42.tx_queue", handoff_done_first = on, "N42_HANDOFF_DONE_FIRST");
+        on
+    })
+}
+
+/// Where [`TxQueue::hold_own_block_timed`] spent its time, microseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HoldTimes {
+    /// The whole hold, the eviction and its free included.
+    pub hold_us: u64,
+    /// The evicted blocks' free (or its hand-over to the freeing thread).
+    pub evict_free_us: u64,
+    /// Transactions evicted.
+    pub evicted: usize,
+}
+
 impl<T: PoolTransaction + 'static> PruneGarbage<T> {
     /// Releases everything on the freeing thread ([`freeing_thread`]), or
     /// here when it is full or absent. The by-hash index's references go
@@ -2671,16 +2712,25 @@ impl<T: PoolTransaction> TxQueue<T> {
 
     /// Keeps the transactions an own block took out of the queue until the
     /// chain settles that height; see `Inner::held`.
-    pub fn hold_own_block(&self, number: u64, hash: B256, transactions: Vec<Arc<ValidPoolTransaction<T>>>) {
-        if transactions.is_empty() {
-            return;
-        }
-        let held_blocks = own_hold_blocks();
-        // Freed after the lock: an evicted block is 200,000 `Arc`s.
-        let mut evicted_all: Vec<Vec<Arc<ValidPoolTransaction<T>>>> = Vec::new();
+    pub fn hold_own_block(&self, number: u64, hash: B256, transactions: Vec<Arc<ValidPoolTransaction<T>>>)
+    where
+        T: 'static,
+    {
+        self.hold_own_block_timed(number, hash, transactions);
+    }
+
+    /// Names `hash` as the block the last whole hand-off forgot the take of
+    /// -- what a plan prepared ahead of the next build is accepted against
+    /// (`Inner::handed`). [`Self::hold_own_block`] does the same first
+    /// thing; a hand-off that signals the next build before holding the
+    /// block (`N42_HANDOFF_DONE_FIRST`) calls this before the signal, so the
+    /// next build's selector sees the same `handed` it saw before.
+    pub fn mark_handed_block(&self, hash: B256) {
         let mut inner = self.lock_inner_quiet();
-        // The block a whole hand-off just forgot the take of: what a plan
-        // prepared ahead of the next build is accepted against.
+        Self::mark_handed_in(&mut inner, hash);
+    }
+
+    fn mark_handed_in(inner: &mut Inner<T>, hash: B256) {
         let build = inner.builds;
         if let Some(handed) = inner.handed.as_mut()
             && handed.build == build
@@ -2688,13 +2738,59 @@ impl<T: PoolTransaction> TxQueue<T> {
         {
             handed.block = Some(hash);
         }
+    }
+
+    /// [`Self::hold_own_block`], saying where its time went
+    /// ([`HoldTimes`]). With `N42_HANDOFF_DONE_FIRST` ([`handoff_done_first`])
+    /// an evicted block's drop accounting is one folded add per block
+    /// instead of a call per transaction under the lock, and its
+    /// transactions are freed on the queue's freeing thread; the resulting
+    /// state (counts, samples, held blocks) is the same.
+    pub fn hold_own_block_timed(
+        &self,
+        number: u64,
+        hash: B256,
+        transactions: Vec<Arc<ValidPoolTransaction<T>>>,
+    ) -> HoldTimes
+    where
+        T: 'static,
+    {
+        self.hold_own_block_with(number, hash, transactions, handoff_done_first())
+    }
+
+    fn hold_own_block_with(
+        &self,
+        number: u64,
+        hash: B256,
+        transactions: Vec<Arc<ValidPoolTransaction<T>>>,
+        lean: bool,
+    ) -> HoldTimes
+    where
+        T: 'static,
+    {
+        let mut times = HoldTimes::default();
+        if transactions.is_empty() {
+            return times;
+        }
+        let at = std::time::Instant::now();
+        let held_blocks = own_hold_blocks();
+        // Freed after the lock: an evicted block is 200,000 `Arc`s.
+        let mut evicted_all: Vec<Vec<Arc<ValidPoolTransaction<T>>>> = Vec::new();
+        let mut inner = self.lock_inner_quiet();
+        // The block a whole hand-off just forgot the take of: what a plan
+        // prepared ahead of the next build is accepted against.
+        Self::mark_handed_in(&mut inner, hash);
         while inner.held.len() >= held_blocks {
             let Some((evicted, _, gone)) = inner.held.pop_front() else { break };
             // Nothing else holds these: the block they were taken for was
             // never settled, so this is a hole in every lane they came
             // from. Said out loud rather than counted alone.
-            for valid in &gone {
-                inner.dropped(Dropped::HeldEvicted, valid.sender(), valid.nonce());
+            if lean {
+                inner.dropped_many(Dropped::HeldEvicted, gone.iter().map(|valid| (valid.sender(), valid.nonce())));
+            } else {
+                for valid in &gone {
+                    inner.dropped(Dropped::HeldEvicted, valid.sender(), valid.nonce());
+                }
             }
             tracing::warn!(
                 target: "n42.tx_queue",
@@ -2704,11 +2800,20 @@ impl<T: PoolTransaction> TxQueue<T> {
                 bound = held_blocks,
                 "an own block was still held when the bound was reached; its transactions are lost to the queue"
             );
+            times.evicted += gone.len();
             evicted_all.push(gone);
         }
         inner.held.push_back((number, hash, transactions));
         drop(inner);
-        drop(evicted_all);
+        let freed = std::time::Instant::now();
+        if lean && !evicted_all.is_empty() {
+            free_off_path(Box::new(evicted_all));
+        } else {
+            drop(evicted_all);
+        }
+        times.evict_free_us = freed.elapsed().as_micros() as u64;
+        times.hold_us = at.elapsed().as_micros() as u64;
+        times
     }
 
     /// The chain committed `hash` at `number`: an own block held at that
@@ -4796,6 +4901,18 @@ impl<T: PoolTransaction> Inner<T> {
             self.arrivals.push_front(sender);
         }
         gave
+    }
+
+    /// [`Self::dropped`] for many transactions of one reason, folded: the
+    /// count is one add and only the samples still wanted are visited. The
+    /// result is that of one [`Self::dropped`] call per item, in order.
+    fn dropped_many(&mut self, reason: Dropped, items: impl ExactSizeIterator<Item = (Address, u64)>) {
+        self.drops.counts[reason.index()] += items.len() as u64;
+        if reason == Dropped::Duplicate || reason == Dropped::Mined {
+            return;
+        }
+        let room = DROP_SAMPLES.saturating_sub(self.drops.samples.len());
+        self.drops.samples.extend(items.take(room).map(|(sender, nonce)| (reason, sender, nonce)));
     }
 
     /// Records that a transaction left the queue, or never entered it.
@@ -7743,3 +7860,6 @@ mod ahead_tests;
 
 #[cfg(test)]
 mod offlock_tests;
+
+#[cfg(test)]
+mod lean_tests;

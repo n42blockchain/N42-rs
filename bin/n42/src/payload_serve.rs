@@ -1068,6 +1068,34 @@ fn build_start_async() -> bool {
     *ON.get_or_init(|| std::env::var("N42_BUILD_START_ASYNC").is_ok_and(|v| v == "1"))
 }
 
+/// An own block's hand-off ends: the block's transactions held until the
+/// chain settles its height, and the next build's selector told it may go
+/// (`done`, which it waits on as `start_handoff_ms`). By default the hold
+/// comes first. With `N42_HANDOFF_DONE_FIRST=1` the selector is told first:
+/// the one thing it reads of the hold -- the block named as the hand-off's
+/// (`TxQueue::mark_handed_block`, what a plan prepared ahead is accepted
+/// against) -- is set before the signal, and the hold itself (an eviction of
+/// a 200,000-transaction block on every hold once the pruner falls behind)
+/// runs after it. The hold's times go to the next build's line.
+fn hold_and_signal(
+    queue: &n42_tx_queue::TxQueue<n42_engine_types::N42PooledTransaction>,
+    number: u64,
+    sealed_hash: alloy_primitives::B256,
+    transactions: Vec<std::sync::Arc<reth_transaction_pool::ValidPoolTransaction<n42_engine_types::N42PooledTransaction>>>,
+    done: &std::sync::mpsc::SyncSender<()>,
+) {
+    let times = if n42_tx_queue::handoff_done_first() {
+        queue.mark_handed_block(sealed_hash);
+        let _ = done.send(());
+        queue.hold_own_block_timed(number, sealed_hash, transactions)
+    } else {
+        let times = queue.hold_own_block_timed(number, sealed_hash, transactions);
+        let _ = done.send(());
+        times
+    };
+    n42_engine_types::frame_blocks::note_handoff_hold(times.hold_us, times.evict_free_us);
+}
+
 /// `N42_BUILD_ON_OUTPUT=1`: a build on an own block starts at the parent's
 /// seal instead of at its `StateReady` (plan v6 attempt J). Off by default.
 fn build_on_output() -> bool {
@@ -1151,8 +1179,7 @@ async fn build_on_published_output(
                 });
                 let removed = queue.remove_mined_batch_collecting(mined);
                 let forgotten = removed.len();
-                queue.hold_own_block(number, sealed_hash, removed);
-                let _ = done.send(());
+                hold_and_signal(&queue, number, sealed_hash, removed, &done);
                 info!(
                     target: "n42.payload_serve",
                     number,
@@ -1264,8 +1291,7 @@ async fn build_on_sealed_output(
                     parent = ?block.header().parent_hash,
                     "own block's transactions forgotten by the queue beside the build"
                 );
-                queue.hold_own_block(block.number(), sealed_hash, dropped);
-                let _ = done.send(());
+                hold_and_signal(&queue, block.number(), sealed_hash, dropped, &done);
                 (at.elapsed().as_millis() as u64, forget)
             });
             (Some(task), Some(handed))

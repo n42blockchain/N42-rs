@@ -514,6 +514,27 @@ std::thread_local! {
     };
 }
 
+/// The last own-block hand-off's hold (`TxQueue::hold_own_block_timed`):
+/// the whole hold with its eviction, and the evicted blocks' free,
+/// microseconds. Written by the hand-off task, taken by the next build's
+/// `seal-first build phases` line (`handoff_hold_us`, `evict_free_us`).
+static HANDOFF_HOLD_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HANDOFF_EVICT_FREE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Records an own-block hand-off's hold times ([`take_handoff_hold`]).
+pub fn note_handoff_hold(hold_us: u64, evict_free_us: u64) {
+    HANDOFF_HOLD_US.store(hold_us, std::sync::atomic::Ordering::Relaxed);
+    HANDOFF_EVICT_FREE_US.store(evict_free_us, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The last hand-off's (hold, eviction free) times, taken (reset to zero).
+pub fn take_handoff_hold() -> (u64, u64) {
+    (
+        HANDOFF_HOLD_US.swap(0, std::sync::atomic::Ordering::Relaxed),
+        HANDOFF_EVICT_FREE_US.swap(0, std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// The times [`select`] left on this thread, taken (reset to zero).
 pub fn take_select_times() -> SelectTimes {
     SELECT_TIMES.with(|slot| slot.replace(SelectTimes::default()))

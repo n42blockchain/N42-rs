@@ -1056,6 +1056,13 @@ struct LeaderMerge {
     /// How long the merger thread (spawned after the fields' publication)
     /// waited for the early merge to end, us: 0 when it had ended.
     join_wait_us: u64,
+    /// `N42_ANSWER_BEFORE_REVERTS`: the output's registration between the
+    /// merge's end and `StateReady` (the registry lock's wait, its hold,
+    /// the eviction's free under it, the entries evicted).
+    register: n42_deferred_reverts::RegisterTiming,
+    /// The `built_executions::state_ready` call, us (the store's lock, and
+    /// the drop of the entry's output shards under it).
+    state_ready_call_us: u64,
 }
 
 fn failed_after_seal(sealed: Option<(B256, u64)>, err: PayloadBuilderError) -> PayloadBuilderError {
@@ -4003,18 +4010,23 @@ where
                             state_ready: None,
                             early: was_early,
                             join_wait_us,
+                            register: Default::default(),
+                            state_ready_call_us: 0,
                         };
                         let execution_output =
                             Arc::new(reth_execution_types::BlockExecutionOutput { state: merged, result: execution_result });
                         // Owed its revert set (`N42_ANSWER_BEFORE_REVERTS`):
                         // registered before anyone can see the execution,
                         // and the promise handed to the thread that merges it.
+                        let mut register_timing = n42_deferred_reverts::RegisterTiming::default();
                         if let Some(late) = late {
-                            let promise = n42_deferred_reverts::register(&execution_output);
+                            let (promise, timed) = n42_deferred_reverts::register_timed(&execution_output);
+                            register_timing = timed;
                             if let Err(std::sync::mpsc::SendError(promise)) = late.send(promise) {
                                 drop(promise);
                             }
                         }
+                        let state_ready_call = std::time::Instant::now();
                         crate::built_executions::state_ready(
                             block_hash,
                             crate::built_executions::BuiltExecution {
@@ -4024,7 +4036,12 @@ where
                                 trie_updates: Arc::new(TrieUpdates::default()),
                             },
                         );
-                        let timing = LeaderMerge { state_ready: Some(std::time::Instant::now()), ..timing };
+                        let timing = LeaderMerge {
+                            state_ready: Some(std::time::Instant::now()),
+                            register: register_timing,
+                            state_ready_call_us: state_ready_call.elapsed().as_micros() as u64,
+                            ..timing
+                        };
                         (execution_output, merge_ms, finish_at.elapsed().as_millis() as u64, timing)
                     })
                     .map_err(PayloadBuilderError::other)?;
@@ -4357,6 +4374,13 @@ where
                     merge_reverts_us = leader_merge.split.reverts_us,
                     merge_append_us = leader_merge.split.append_us,
                     merge_tail_us = leader_merge.tail_us,
+                    // The output registry's `register` (N42_ANSWER_BEFORE_REVERTS):
+                    // the lock's wait, its hold, and the eviction's free under it.
+                    register_wait_us = leader_merge.register.wait_us,
+                    register_lock_us = leader_merge.register.lock_us,
+                    register_free_us = leader_merge.register.free_us,
+                    register_evicted = leader_merge.register.evicted,
+                    state_ready_call_us = leader_merge.state_ready_call_us,
                     merge_threads = leader_merge.threads,
                     merge_accounts = leader_merge.accounts,
                     merge_reverts = leader_merge.reverts,

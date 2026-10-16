@@ -112,12 +112,46 @@ impl Drop for LateReverts {
 /// reverts only) as owed its complete revert set. Entries whose output
 /// nobody else holds any more are dropped here.
 pub fn register<T: Send + Sync + 'static>(output: &Arc<T>) -> LateReverts {
+    register_timed(output).0
+}
+
+/// What one [`register`] cost, us: the wait for the registry lock, the time
+/// it was held, and the part of that spent dropping the entries whose output
+/// nobody else held (the last holder frees the output there).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RegisterTiming {
+    /// Waiting for the registry lock.
+    pub wait_us: u64,
+    /// The lock held: the eviction and the insert.
+    pub lock_us: u64,
+    /// The eviction (and the free of what it evicted) under the lock.
+    pub free_us: u64,
+    /// The entries evicted.
+    pub evicted: usize,
+}
+
+/// [`register`], timed.
+pub fn register_timed<T: Send + Sync + 'static>(output: &Arc<T>) -> (LateReverts, RegisterTiming) {
     let slot = Arc::new(Slot::default());
     let keep: Arc<dyn Any + Send + Sync> = output.clone();
+    let asked = std::time::Instant::now();
     let mut entries = registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let locked = std::time::Instant::now();
+    let before = entries.len();
     entries.retain(|entry| Arc::strong_count(&entry.keep) > 1);
+    let evicted = before - entries.len();
+    let freed = std::time::Instant::now();
     entries.push(Entry { key: key_of(Arc::as_ptr(output)), keep, slot: Arc::clone(&slot) });
-    LateReverts { slot, filled: false }
+    drop(entries);
+    let released = std::time::Instant::now();
+    let us = |from: std::time::Instant, to: std::time::Instant| to.duration_since(from).as_micros() as u64;
+    let timing = RegisterTiming {
+        wait_us: us(asked, locked),
+        lock_us: us(locked, released),
+        free_us: us(locked, freed),
+        evicted,
+    };
+    (LateReverts { slot, filled: false }, timing)
 }
 
 /// Why a registered output's revert set could not be had.

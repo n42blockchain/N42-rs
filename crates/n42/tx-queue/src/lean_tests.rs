@@ -181,3 +181,62 @@ fn lean_prune_indexes_the_frames_a_remainder_holds() {
         assert!(times.drained > 0 && times.drain_holds > 1, "offlock={offlock}: {times:?}");
     }
 }
+
+/// loop351 by's lean legs: a pruner behind the engine folded more blocks a
+/// wake and drained everything that had piled up since the last one, until
+/// a wake drained 1.1M transactions in 135 holds. A wake's drain is bounded
+/// by its blocks ([`lean_drain_budget`] each, [`LEAN_DRAIN_WAKE_MAX`] in
+/// all), whatever the remainder holds; the rest stays pending, in order, for
+/// the drainer, which indexes every frame once it is through.
+#[test]
+fn lean_prune_drains_a_bounded_share_a_wake() {
+    for offlock in [false, true] {
+        let queue = TxQueue::<EthPooledTransaction>::new().with_offlock(offlock).with_drain_chunk(DRAINER_SLICE);
+        let senders = 64u64;
+        for s in 0..senders {
+            frame(&queue, sender(s), 0, 4);
+        }
+        queue.drain_now();
+        // 64 x 800 transactions arrive and stay in the remainder.
+        for s in 0..senders {
+            frame(&queue, sender(s), 4, 800);
+        }
+        let _ = queue.drain_chunked(DRAINER_SLICE, 1);
+        let pending = |queue: &TxQueue<EthPooledTransaction>| queue.lock_inner_quiet().pending_drain.len();
+        let deep = pending(&queue);
+        assert!(deep > 2 * LEAN_DRAIN_PER_BLOCK, "offlock={offlock}: a deep remainder ({deep})");
+        let wake = |numbers: std::ops::RangeInclusive<u64>| {
+            let blocks: Vec<(u64, Vec<(Address, u64)>, Vec<B256>)> = numbers
+                .map(|n| {
+                    let mined: Vec<(Address, u64)> = (0..senders).map(|s| (sender(s), n - 1)).collect();
+                    let hashes = mined.iter().map(|(s, nonce)| *tx_hashed(*s, *nonce).hash()).collect();
+                    (n, mined, hashes)
+                })
+                .collect();
+            let inputs: Vec<PruneInput<'_>> = blocks
+                .iter()
+                .map(|(n, mined, hashes)| PruneInput { number: *n, hash: block_hash(*n), mined, hashes })
+                .collect();
+            queue.prune_blocks(&inputs).1
+        };
+        // One block: one block's budget, the rest left pending.
+        let times = wake(1..=1);
+        assert!(times.drained <= LEAN_DRAIN_PER_BLOCK, "offlock={offlock}: {times:?}");
+        assert!(times.drain_holds <= LEAN_DRAIN_PER_BLOCK.div_ceil(DRAINER_SLICE), "offlock={offlock}: {times:?}");
+        assert_eq!(pending(&queue), deep - times.drained, "offlock={offlock}");
+        // Three blocks folded: three blocks' budget, never past the cap.
+        let before = pending(&queue);
+        let times = wake(2..=4);
+        assert!(times.drained <= (3 * LEAN_DRAIN_PER_BLOCK).min(LEAN_DRAIN_WAKE_MAX), "offlock={offlock}: {times:?}");
+        assert_eq!(pending(&queue), before - times.drained, "offlock={offlock}");
+        // The drainer's share: every frame indexed once the remainder is in.
+        {
+            let mut inner = queue.lock_inner_quiet();
+            queue.drain_inbox(&mut inner);
+        }
+        let census = queue.frame_census();
+        assert_eq!(census.pending, 0, "offlock={offlock}: {census:?}");
+        assert_eq!(census.live, senders as usize, "offlock={offlock}: {census:?}");
+        assert_eq!(queue.len(), (senders * 800) as usize, "offlock={offlock}");
+    }
+}

@@ -462,6 +462,38 @@ pub fn prune_lean() -> bool {
     })
 }
 
+/// The lean pruner's drain budget a folded block, in transactions
+/// (`N42_PRUNE_LEAN_DRAIN_TXS`, default [`LEAN_DRAIN_PER_BLOCK`]), read and
+/// logged once; a wake drains at most this times its blocks, and at most
+/// [`LEAN_DRAIN_WAKE_MAX`] ([`TxQueue::finish_remainder`]). 0 drains nothing.
+pub fn lean_drain_budget() -> usize {
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let budget = std::env::var("N42_PRUNE_LEAN_DRAIN_TXS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(LEAN_DRAIN_PER_BLOCK);
+        tracing::info!(target: "n42.tx_queue", lean_drain_txs = budget, "N42_PRUNE_LEAN_DRAIN_TXS");
+        budget
+    })
+}
+
+/// [`lean_drain_budget`]'s default: two drainer slices a block. A wake one
+/// block behind on loop351 by's lean legs (window 1) drained 2,000-49,000.
+pub const LEAN_DRAIN_PER_BLOCK: usize = 2 * DRAINER_SLICE;
+
+/// The most a lean wake drains whatever it folded: eight drainer slices.
+pub const LEAN_DRAIN_WAKE_MAX: usize = 8 * DRAINER_SLICE;
+
+/// Frees `garbage` on the queue's freeing thread ([`freeing_thread`]), or
+/// here when that thread is full or absent: for a caller off the queue's
+/// locks that would otherwise pay a large free on a thread that has other
+/// work (the pruner dropping a wake's canonical notifications, whose blocks
+/// it holds the last reference to once it is behind the engine).
+pub fn free_later<G: Send + 'static>(garbage: G) {
+    free_off_path(Box::new(garbage));
+}
+
 /// What a prune took out of the queue, held until every lock is released.
 struct PruneGarbage<T: PoolTransaction> {
     lanes: Vec<BTreeMap<u64, Arc<ValidPoolTransaction<T>>>>,
@@ -2705,7 +2737,8 @@ impl<T: PoolTransaction> TxQueue<T> {
             self.remove_folded(&run, &mut times);
         }
         let at = std::time::Instant::now();
-        let (drained, holds) = self.finish_remainder();
+        let budget = lean_drain_budget().saturating_mul(blocks.len().max(1)).min(LEAN_DRAIN_WAKE_MAX);
+        let (drained, holds) = self.finish_remainder(budget);
         times.drained += drained;
         times.drain_holds += holds;
         times.drain_us += at.elapsed().as_micros() as u64;
@@ -2727,7 +2760,21 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// held 20-130, because a remainder frame is indexed only once its last
     /// transaction is in its lane. Returns the transactions moved and the
     /// holds made.
-    fn finish_remainder(&self) -> (usize, usize) {
+    ///
+    /// At most `budget` transactions a wake ([`lean_drain_budget`] a folded
+    /// block, [`LEAN_DRAIN_WAKE_MAX`] in all); what is left is the
+    /// dedicated drainer's. Unbounded, the drain was "everything pending at
+    /// the wake", which grows with the time since the last wake: on loop351
+    /// by's lean legs a pruner one block behind folded 2-3 blocks, drained
+    /// what had piled up meanwhile and fell further behind, until a wake
+    /// folded 25 blocks and drained 1.1M transactions in 135 holds (449 of
+    /// its 885 ms). At a lanes lock near 99% duty those holds only take the
+    /// lock's share from the drainer and the builders; they add no drain
+    /// rate, and they made the pruner a second drainer.
+    fn finish_remainder(&self, budget: usize) -> (usize, usize) {
+        if budget == 0 {
+            return (0, 0);
+        }
         let chunk = self.drain_chunk.load(std::sync::atomic::Ordering::Relaxed);
         let slice = if chunk > 0 { chunk } else { DRAINER_SLICE };
         let (mut moved, mut holds) = (0usize, 0usize);
@@ -2736,6 +2783,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             let done = {
                 let mut inner = self.lock_inner_unsettled();
                 holds += 1;
+                let slice = slice.min(budget - moved);
                 if target.is_none() {
                     // The first hold takes the inbox into the remainder:
                     // everything pending now is at or before this mark.
@@ -2757,7 +2805,8 @@ impl<T: PoolTransaction> TxQueue<T> {
                     }
                     moved += n;
                 }
-                target.is_some_and(|mark| inner.pending_out >= mark)
+                moved >= budget
+                    || target.is_some_and(|mark| inner.pending_out >= mark)
                     || (inner.pending_drain.is_empty() && inner.pending_frames.is_empty())
             };
             if done {

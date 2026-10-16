@@ -282,6 +282,12 @@ pub fn spawn_thread(queue: TxQueue<N42PooledTransaction>) -> Option<std::sync::m
                 let waited = batch[0].1.elapsed();
                 let notifications: Vec<&CanonStateNotification<N42Primitives>> = batch.iter().map(|(n, _)| n).collect();
                 prune_notifications_lean(&queue, &notifications, waited);
+                drop(notifications);
+                // Freed on the queue's freeing thread: a pruner behind the
+                // engine holds the last reference to the wake's blocks, and
+                // their free was ~13 ms a block on this thread after the
+                // logged prune (loop351 by, lean legs, 25-block wakes).
+                n42_tx_queue::free_later(batch);
                 continue;
             }
             for (notification, arrived) in batch {

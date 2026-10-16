@@ -44,6 +44,53 @@ pub fn answer_before_reverts() -> bool {
     })
 }
 
+/// Whether [`register`] frees the outputs it evicts after the registry lock
+/// is released, on a thread of its own (`N42_REGISTER_FREE_OFFLOCK=1`,
+/// default off), read and logged once. Off, the eviction drops them under
+/// the lock on the registering thread -- the merger, between the merge's end
+/// and `StateReady`, where the last holder of an older block's output frees
+/// its ~185k-account bundle.
+pub fn register_free_offlock() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("N42_REGISTER_FREE_OFFLOCK").is_ok_and(|v| v == "1");
+        tracing::info!(target: "n42.deferred_reverts", register_free_offlock = on, "N42_REGISTER_FREE_OFFLOCK");
+        on
+    })
+}
+
+/// Drops evicted entries on a thread of their own (`n42-reverts-free`); the
+/// caller drops them (outside the lock) when that thread is two behind or
+/// cannot be had. Nothing reads an entry once it left the registry.
+fn free_off_path(evicted: Vec<Entry>) {
+    if evicted.is_empty() {
+        return;
+    }
+    static FREE: OnceLock<Option<Mutex<std::sync::mpsc::SyncSender<Vec<Entry>>>>> = OnceLock::new();
+    let sender = FREE.get_or_init(|| {
+        let (send, receive) = std::sync::mpsc::sync_channel::<Vec<Entry>>(2);
+        std::thread::Builder::new()
+            .name("n42-reverts-free".into())
+            .spawn(move || {
+                while let Ok(entries) = receive.recv() {
+                    drop(entries);
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(send))
+    });
+    let unsent = match sender {
+        Some(sender) => match sender.lock().unwrap_or_else(std::sync::PoisonError::into_inner).try_send(evicted) {
+            Ok(()) => None,
+            Err(
+                std::sync::mpsc::TrySendError::Full(evicted) | std::sync::mpsc::TrySendError::Disconnected(evicted),
+            ) => Some(evicted),
+        },
+        None => Some(evicted),
+    };
+    drop(unsent);
+}
+
 /// A fill's state.
 #[derive(Debug, Default)]
 enum Fill {
@@ -124,7 +171,8 @@ pub struct RegisterTiming {
     pub wait_us: u64,
     /// The lock held: the eviction and the insert.
     pub lock_us: u64,
-    /// The eviction (and the free of what it evicted) under the lock.
+    /// The eviction under the lock: with the free of what it evicted, unless
+    /// `N42_REGISTER_FREE_OFFLOCK` moves that free off the lock.
     pub free_us: u64,
     /// The entries evicted.
     pub evicted: usize,
@@ -138,12 +186,20 @@ pub fn register_timed<T: Send + Sync + 'static>(output: &Arc<T>) -> (LateReverts
     let mut entries = registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let locked = std::time::Instant::now();
     let before = entries.len();
-    entries.retain(|entry| Arc::strong_count(&entry.keep) > 1);
+    // Off the lock: the evicted entries are only moved out under it, and
+    // dropped (with the outputs they last held) once it is released.
+    let mut out = Vec::new();
+    if register_free_offlock() {
+        out = entries.extract_if(.., |entry| Arc::strong_count(&entry.keep) <= 1).collect();
+    } else {
+        entries.retain(|entry| Arc::strong_count(&entry.keep) > 1);
+    }
     let evicted = before - entries.len();
     let freed = std::time::Instant::now();
     entries.push(Entry { key: key_of(Arc::as_ptr(output)), keep, slot: Arc::clone(&slot) });
     drop(entries);
     let released = std::time::Instant::now();
+    free_off_path(out);
     let us = |from: std::time::Instant, to: std::time::Instant| to.duration_since(from).as_micros() as u64;
     let timing = RegisterTiming {
         wait_us: us(asked, locked),

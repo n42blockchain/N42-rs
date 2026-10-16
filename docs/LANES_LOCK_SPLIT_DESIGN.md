@@ -141,21 +141,3 @@ Risks:
    which is why it comes last and only if stage bv's lean pruner leaves the onset in place.
 6. **Measurement**: lock duty is per 5 s and per node; a stage that only moves waits between the lanes and the ledger
    lock shows as duty down and nothing else -- judge by `start_handoff_ms`, `sealed_at_ms` and the window totals.
-
-## 5. Implementation notes (stages 0 and 1)
-
-Stage 0 fields: `handoff_hold_lock_us` / `handoff_hold_locked_us` (seal-first build phases line, beside
-`handoff_hold_us`), `settle_lock_us` / `settle_held_us` (pruner line, beside `settle_us`), and on the ingest line
-`lock_holders` (`file:line=held_us/holds`, the eight largest holders of the lanes lock in the 5 s interval) with
-`lock_holders_rest_us` / `lock_holders_rest`. `scripts/fleet7-runs/feed338.py` prints the table per window.
-
-Stage 1 (`N42_QUEUE_LEDGER_LOCK=1`, `crates/n42/tx-queue/src/lib.rs` `Ledger`): lock order lanes -> ledger, never
-the reverse (debug-asserted). A take is *published* to the ledger at the end of a build-start hold that opened on a
-prepared plan (`Inner::publish_take`, only with no noted takes pending); `last_build`'s list is then empty and the
-ledger's list is its front. `forget_whole_take` takes it under the ledger lock alone; anything on the lanes side that
-reads, removes from, appends to or gives back the list first moves it back (`Inner::reclaim_take`; the hand-off then
-falls back to the lanes path), except the canonical prune, which splits the published list in place, and the
-plan-ahead preparation's window (its list stands on the zero parent). `handed`, `held` and the held-block drops live in
-the ledger; `settle_own_block` gives transactions back by releasing the ledger lock and then taking the lanes lock.
-Proof counters on the ingest line: `ledger_forgets`, `ledger_fallbacks`, `ledger_reclaims`, `ledger_duty_pct`,
-`ledger_wait_us`; `queue_lock_us` on "built ahead on the sealed own block" is then the ledger wait.

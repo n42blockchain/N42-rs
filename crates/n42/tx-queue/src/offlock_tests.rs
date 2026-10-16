@@ -229,7 +229,7 @@ pub(crate) fn state(queue: &TxQueue<EthPooledTransaction>) -> (Lanes, usize, usi
         .map(|(who, lane)| (*who, lane.by_nonce.keys().copied().collect(), lane.mined, lane.chain_mined))
         .collect();
     lanes.sort_by_key(|(who, ..)| *who);
-    let taken = inner.taken_view().map(|taken| pairs(&taken)).unwrap_or_default();
+    let taken = inner.last_build.as_ref().map(|(_, taken)| pairs(taken)).unwrap_or_default();
     (lanes, inner.len, inner.frames.len(), taken, inner.prepared.as_ref().map(|prepared| prepared.taken.len()))
 }
 
@@ -400,7 +400,7 @@ fn the_offlock_hand_off_is_the_one_hold_hand_off() {
             };
             assert_eq!(times.whole, parallel && !part);
             assert_counts(&queue);
-            let handed = queue.handed_view();
+            let handed = queue.lock_inner_quiet().handed;
             outcomes.push((pairs(&mined), state(&queue), handed));
         }
         assert_eq!(outcomes[0], outcomes[1], "parallel {parallel} part {part}");

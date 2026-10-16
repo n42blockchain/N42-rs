@@ -673,33 +673,6 @@ pub struct DropReport {
 }
 
 impl DropReport {
-    /// One transaction let go of ([`Inner::dropped`]).
-    fn note(&mut self, reason: Dropped, sender: Address, nonce: u64) {
-        self.counts[reason.index()] += 1;
-        if self.samples.len() < DROP_SAMPLES && reason != Dropped::Duplicate && reason != Dropped::Mined {
-            self.samples.push((reason, sender, nonce));
-        }
-    }
-
-    /// [`Self::note`] for many of one reason, folded.
-    fn note_many(&mut self, reason: Dropped, items: impl ExactSizeIterator<Item = (Address, u64)>) {
-        self.counts[reason.index()] += items.len() as u64;
-        if reason == Dropped::Duplicate || reason == Dropped::Mined {
-            return;
-        }
-        let room = DROP_SAMPLES.saturating_sub(self.samples.len());
-        self.samples.extend(items.take(room).map(|(sender, nonce)| (reason, sender, nonce)));
-    }
-
-    /// Adds `other`'s counts, and its samples while there is room.
-    fn merge(&mut self, other: Self) {
-        for (count, more) in self.counts.iter_mut().zip(other.counts) {
-            *count += more;
-        }
-        let room = DROP_SAMPLES.saturating_sub(self.samples.len());
-        self.samples.extend(other.samples.into_iter().take(room));
-    }
-
     /// Whether anything was let go of that a hole could be hiding behind.
     ///
     /// A duplicate is the generator re-sending, and a transaction the chain
@@ -756,124 +729,6 @@ const fn pack_depth(len: usize, parked: usize) -> u64 {
     let parked = if parked > u32::MAX as usize { u32::MAX as u64 } else { parked as u64 };
     (parked << 32) | len
 }
-
-/// The own-block ledger (`N42_QUEUE_LEDGER_LOCK`, [`queue_ledger_lock`]):
-/// what the hand-off and the pruner's own-block settle touch, behind a lock
-/// of its own.
-///
-/// Lock order: the lanes' lock first, then the ledger's. A holder of the
-/// lanes' lock may take the ledger's inside it (nested, short); a holder of
-/// the ledger's lock never takes the lanes' lock -- an operation that needs
-/// both after a ledger step (a settle giving transactions back to the
-/// lanes) releases the ledger first. Debug builds assert it
-/// ([`LEDGER_HELD`]).
-///
-/// With the switch off nothing here is used: `Inner::handed`, `Inner::held`
-/// and `Inner::drops` carry the same state under the lanes' lock.
-struct Ledger<T: PoolTransaction> {
-    /// A build's take published whole at its start ([`Inner::publish_take`]):
-    /// logically the front of `Inner::last_build`'s list, which is empty
-    /// while it is here. Taken by [`TxQueue::forget_whole_take`] without the
-    /// lanes' lock, or moved back by [`Inner::reclaim_take`] before any
-    /// lanes-side step that reads or changes the list.
-    whole: Option<LedgerTake<T>>,
-    /// `Inner::handed`, with the switch on.
-    handed: Option<Handed>,
-    /// `Inner::builds` as of the last build start, mirrored under both
-    /// locks by [`Inner::open_build`]: what a hand-off naming its block
-    /// compares against.
-    builds: u64,
-    /// `Inner::held`, with the switch on.
-    held: VecDeque<(u64, B256, Vec<Arc<ValidPoolTransaction<T>>>)>,
-    /// The drops the ledger's own steps count (an evicted or passed own
-    /// block); merged with the lanes' by [`TxQueue::take_drops`].
-    drops: DropReport,
-}
-
-impl<T: PoolTransaction> Default for Ledger<T> {
-    fn default() -> Self {
-        Self { whole: None, handed: None, builds: 0, held: VecDeque::new(), drops: DropReport::default() }
-    }
-}
-
-/// A take published to the ledger: the build that took it, its parent, the
-/// list in take order.
-struct LedgerTake<T: PoolTransaction> {
-    build: u64,
-    parent: B256,
-    taken: Vec<Arc<ValidPoolTransaction<T>>>,
-}
-
-thread_local! {
-    /// Whether this thread holds a ledger lock: the lanes' lock must not be
-    /// taken then (the lock order, [`Ledger`]).
-    static LEDGER_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// The ledger's lock as [`lock_ledger`] hands it out, measured like the
-/// lanes' ([`LockStats::ledger_holds`]).
-struct LedgerGuard<'a, T: PoolTransaction> {
-    guard: parking_lot::MutexGuard<'a, Ledger<T>>,
-    at: std::time::Instant,
-    waited: std::time::Duration,
-}
-
-fn lock_ledger<T: PoolTransaction>(ledger: &Mutex<Ledger<T>>) -> LedgerGuard<'_, T> {
-    let asked = std::time::Instant::now();
-    let guard = ledger.lock();
-    let at = std::time::Instant::now();
-    LEDGER_HELD.set(true);
-    LedgerGuard { guard, at, waited: at.saturating_duration_since(asked) }
-}
-
-impl<T: PoolTransaction> std::ops::Deref for LedgerGuard<'_, T> {
-    type Target = Ledger<T>;
-    fn deref(&self) -> &Ledger<T> {
-        &self.guard
-    }
-}
-
-impl<T: PoolTransaction> std::ops::DerefMut for LedgerGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut Ledger<T> {
-        &mut self.guard
-    }
-}
-
-impl<T: PoolTransaction> Drop for LedgerGuard<'_, T> {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        LEDGER_HELD.set(false);
-        let c = &LEDGER_COUNTERS;
-        c.holds.fetch_add(1, Relaxed);
-        c.hold_ns.fetch_add(self.at.elapsed().as_nanos() as u64, Relaxed);
-        let waited_ns = self.waited.as_nanos() as u64;
-        if waited_ns > 0 {
-            c.wait_ns.fetch_add(waited_ns, Relaxed);
-            raise_max(&c.wait_max_ns, waited_ns);
-        }
-    }
-}
-
-/// The ledger lock's counters for the 5 s report ([`take_lock_stats`]).
-struct LedgerCounters {
-    holds: std::sync::atomic::AtomicU64,
-    hold_ns: std::sync::atomic::AtomicU64,
-    wait_ns: std::sync::atomic::AtomicU64,
-    wait_max_ns: std::sync::atomic::AtomicU64,
-    forgets: std::sync::atomic::AtomicU64,
-    fallbacks: std::sync::atomic::AtomicU64,
-    reclaims: std::sync::atomic::AtomicU64,
-}
-
-static LEDGER_COUNTERS: LedgerCounters = LedgerCounters {
-    holds: std::sync::atomic::AtomicU64::new(0),
-    hold_ns: std::sync::atomic::AtomicU64::new(0),
-    wait_ns: std::sync::atomic::AtomicU64::new(0),
-    wait_max_ns: std::sync::atomic::AtomicU64::new(0),
-    forgets: std::sync::atomic::AtomicU64::new(0),
-    fallbacks: std::sync::atomic::AtomicU64::new(0),
-    reclaims: std::sync::atomic::AtomicU64::new(0),
-};
 
 /// The (len, parked) a packed mirror holds.
 const fn unpack_depth(packed: u64) -> (u64, u64) {
@@ -1081,24 +936,6 @@ pub struct LockStats {
     pub holders_rest_ns: u64,
     /// See `holders_rest_ns`.
     pub holders_rest: u64,
-    /// `N42_QUEUE_LEDGER_LOCK`: the ledger lock's holds, their sum, the
-    /// waits' sum and the longest wait, nanoseconds.
-    pub ledger_holds: u64,
-    /// See `ledger_holds`.
-    pub ledger_hold_ns: u64,
-    /// See `ledger_holds`.
-    pub ledger_wait_ns: u64,
-    /// See `ledger_holds`.
-    pub ledger_wait_max_ns: u64,
-    /// Whole takes the hand-off forgot from the ledger, without the lanes'
-    /// lock.
-    pub ledger_forgets: u64,
-    /// Whole-take hand-offs that found nothing published and took the
-    /// lanes' path.
-    pub ledger_fallbacks: u64,
-    /// Published takes moved back into the lanes' side before the hand-off
-    /// took them (a refusal, a top-up, a give-back of the build).
-    pub ledger_reclaims: u64,
 }
 
 /// The lanes' lock and drain counters since the last call, which resets
@@ -1125,13 +962,6 @@ pub fn take_lock_stats() -> LockStats {
         holders,
         holders_rest_ns,
         holders_rest,
-        ledger_holds: LEDGER_COUNTERS.holds.swap(0, Relaxed),
-        ledger_hold_ns: LEDGER_COUNTERS.hold_ns.swap(0, Relaxed),
-        ledger_wait_ns: LEDGER_COUNTERS.wait_ns.swap(0, Relaxed),
-        ledger_wait_max_ns: LEDGER_COUNTERS.wait_max_ns.swap(0, Relaxed),
-        ledger_forgets: LEDGER_COUNTERS.forgets.swap(0, Relaxed),
-        ledger_fallbacks: LEDGER_COUNTERS.fallbacks.swap(0, Relaxed),
-        ledger_reclaims: LEDGER_COUNTERS.reclaims.swap(0, Relaxed),
     }
 }
 
@@ -1355,14 +1185,6 @@ struct Inner<T: PoolTransaction> {
     pruning: Option<Arc<AddressHashMap<u64>>>,
     /// [`frames::FrameIndex::swept_at_take`] at the last build start.
     swept_reported: u64,
-    /// The own-block ledger, when `N42_QUEUE_LEDGER_LOCK` is on ([`Ledger`];
-    /// taken only nested inside the lanes' lock from here).
-    ledger: Option<Arc<Mutex<Ledger<T>>>>,
-    /// The parent of the take [`Self::publish_take`] last put in the ledger,
-    /// while it may still be there: `last_build`'s list is then empty and
-    /// its logical content is the ledger's. A hint -- the hand-off may have
-    /// taken it since; [`Self::reclaim_take`] looks.
-    published: Option<B256>,
 }
 
 /// A whole take handed off to an own block: the build counter of the build
@@ -1634,22 +1456,6 @@ const AHEAD_LOOP_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 fn queue_offlock() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_QUEUE_OFFLOCK").is_ok_and(|v| v == "1"))
-}
-
-/// `N42_QUEUE_LEDGER_LOCK=1` (default off): the own-block ledger -- a
-/// build's completed take, `handed`, the held own blocks and their drop
-/// counts -- behind a lock of its own ([`Ledger`]), so the hand-off's
-/// forget of a whole take, the own-block hold and a settle that gives
-/// nothing back never wait for the lanes' lock
-/// (`docs/LANES_LOCK_SPLIT_DESIGN.md` stage 1). Read once; a test sets it
-/// per queue ([`TxQueue::with_ledger_lock`]).
-pub fn queue_ledger_lock() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var("N42_QUEUE_LEDGER_LOCK").is_ok_and(|v| v == "1");
-        tracing::info!(target: "n42.tx_queue", queue_ledger_lock = on, "N42_QUEUE_LEDGER_LOCK");
-        on
-    })
 }
 
 /// Senders whose lanes one hold of an off-lock prune splits
@@ -2029,11 +1835,6 @@ pub struct TxQueue<T: PoolTransaction> {
     /// The continuous plan-ahead preparation's state and its waiters
     /// (`N42_PLAN_AHEAD_WAIT_MS`, [`AheadWait`]).
     ahead_wait: Arc<AheadWait>,
-    /// The own-block ledger ([`Ledger`]); used only with `ledger_on`.
-    ledger: Arc<Mutex<Ledger<T>>>,
-    /// `N42_QUEUE_LEDGER_LOCK` unless a test said otherwise
-    /// ([`queue_ledger_lock`]).
-    ledger_on: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// `N42_PLAN_AHEAD_WAIT_MS`: the wait (0 = off; the environment's unless a
@@ -2152,8 +1953,6 @@ impl<T: PoolTransaction> Clone for TxQueue<T> {
             plan_snapshot: Arc::clone(&self.plan_snapshot),
             drainer: Arc::clone(&self.drainer),
             ahead_wait: Arc::clone(&self.ahead_wait),
-            ledger: Arc::clone(&self.ledger),
-            ledger_on: Arc::clone(&self.ledger_on),
         }
     }
 }
@@ -2280,8 +2079,6 @@ impl<T: PoolTransaction> TxQueue<T> {
 
     /// An empty queue taking `run` consecutive nonces per sender per turn.
     pub fn with_run_length(run: usize) -> Self {
-        let ledger = Arc::new(Mutex::new(Ledger::default()));
-        let ledger_on = queue_ledger_lock();
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 lanes: AddressHashMap::default(),
@@ -2312,11 +2109,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 lanes_gen: 0,
                 pruning: None,
                 swept_reported: 0,
-                ledger: ledger_on.then(|| Arc::clone(&ledger)),
-                published: None,
             })),
-            ledger,
-            ledger_on: Arc::new(std::sync::atomic::AtomicBool::new(ledger_on)),
             inbox: Arc::new(Mutex::new(Vec::new())),
             staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             by_hash: None,
@@ -2392,7 +2185,6 @@ impl<T: PoolTransaction> TxQueue<T> {
     #[track_caller]
     fn lock_inner_quiet(&self) -> TimedInner<'_, T> {
         let caller = std::panic::Location::caller();
-        debug_assert!(!LEDGER_HELD.get(), "the lanes' lock taken while holding the ledger's (lock order: lanes, then ledger)");
         let asked = std::time::Instant::now();
         let mut inner = self.inner.lock();
         let at = std::time::Instant::now();
@@ -2413,31 +2205,10 @@ impl<T: PoolTransaction> TxQueue<T> {
             return self.lock_inner_quiet();
         }
         let caller = std::panic::Location::caller();
-        debug_assert!(!LEDGER_HELD.get(), "the lanes' lock taken while holding the ledger's (lock order: lanes, then ledger)");
         let asked = std::time::Instant::now();
         let inner = self.inner.lock();
         let at = std::time::Instant::now();
         TimedInner { guard: inner, at, waited: at.saturating_duration_since(asked), caller, mirror: &self.depth }
-    }
-
-    /// The same queue with `N42_QUEUE_LEDGER_LOCK` set to `on` whatever the
-    /// environment says ([`Ledger`]). For a fresh queue: what a test uses to
-    /// choose the path.
-    #[must_use]
-    pub fn with_ledger_lock(self, on: bool) -> Self {
-        self.ledger_on.store(on, std::sync::atomic::Ordering::Relaxed);
-        self.inner.lock().ledger = on.then(|| Arc::clone(&self.ledger));
-        self
-    }
-
-    /// Whether the own-block ledger has its own lock ([`queue_ledger_lock`]).
-    fn ledger_on(&self) -> bool {
-        self.ledger_on.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// The ledger's lock (never with the lanes' lock taken after it).
-    fn lock_ledger(&self) -> LedgerGuard<'_, T> {
-        lock_ledger(&self.ledger)
     }
 
     /// Whether this queue runs its heavy steps off the lanes' lock
@@ -2818,12 +2589,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// the first few named ([`Dropped`]). Taking it clears it, so a caller
     /// logging this reports a window and not a running total.
     pub fn take_drops(&self) -> DropReport {
-        let mut drops = std::mem::take(&mut self.lock_inner_quiet().drops);
-        // The lanes' lock is released before the ledger's is taken.
-        if self.ledger_on() {
-            drops.merge(std::mem::take(&mut self.lock_ledger().drops));
-        }
-        drops
+        std::mem::take(&mut self.lock_inner_quiet().drops)
     }
 
     /// The lanes parked behind a hole, how many transactions they hold, and
@@ -2947,7 +2713,6 @@ impl<T: PoolTransaction> TxQueue<T> {
     pub fn forget_taken(&self, transaction: &Arc<ValidPoolTransaction<T>>) {
         {
             let mut inner = self.lock_inner();
-            inner.reclaim_take();
             if let Some((_, taken)) = inner.last_build.as_mut()
                 && let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, transaction))
             {
@@ -3226,10 +2991,6 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// Whether an own block other than `hash` is held at `number`: its
     /// settle would give transactions back ([`Self::prune_blocks`]).
     fn held_other_at(&self, number: u64, hash: B256) -> bool {
-        if self.ledger_on() {
-            let ledger = self.lock_ledger();
-            return ledger.held.iter().any(|(held_number, held_hash, _)| *held_number == number && *held_hash != hash);
-        }
         let inner = self.lock_inner_quiet();
         inner.held.iter().any(|(held_number, held_hash, _)| *held_number == number && *held_hash != hash)
     }
@@ -3424,9 +3185,6 @@ impl<T: PoolTransaction> TxQueue<T> {
                 removed.extend(mined);
             }
         }
-        // A take published to the ledger is split in place, not reclaimed:
-        // the hand-off may still forget it from there.
-        inner.split_published(|t| highest.get(&t.sender()).is_some_and(|m| t.nonce() <= *m), &mut removed);
         removed
     }
 
@@ -3446,25 +3204,8 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// block (`N42_HANDOFF_DONE_FIRST`) calls this before the signal, so the
     /// next build's selector sees the same `handed` it saw before.
     pub fn mark_handed_block(&self, hash: B256) {
-        if self.ledger_on() {
-            let mut ledger = self.lock_ledger();
-            Self::mark_handed_ledger(&mut ledger, hash);
-            return;
-        }
         let mut inner = self.lock_inner_quiet();
         Self::mark_handed_in(&mut inner, hash);
-    }
-
-    /// [`Self::mark_handed_in`] on the ledger: its mirror of the build
-    /// counter is the lanes' as of the last build start.
-    fn mark_handed_ledger(ledger: &mut Ledger<T>, hash: B256) {
-        let build = ledger.builds;
-        if let Some(handed) = ledger.handed.as_mut()
-            && handed.build == build
-            && handed.block.is_none()
-        {
-            handed.block = Some(hash);
-        }
     }
 
     fn mark_handed_in(inner: &mut Inner<T>, hash: B256) {
@@ -3513,63 +3254,21 @@ impl<T: PoolTransaction> TxQueue<T> {
         let held_blocks = own_hold_blocks();
         // Freed after the lock: an evicted block is 200,000 `Arc`s.
         let mut evicted_all: Vec<Vec<Arc<ValidPoolTransaction<T>>>> = Vec::new();
-        if self.ledger_on() {
-            // The ledger alone: the lanes' lock is not taken.
-            let mut ledger = self.lock_ledger();
-            times.lock_us = ledger.waited.as_micros() as u64;
-            Self::mark_handed_ledger(&mut ledger, hash);
-            let Ledger { held, drops, .. } = &mut *ledger;
-            Self::evict_held(held, drops, held_blocks, number, lean, &mut times, &mut evicted_all);
-            held.push_back((number, hash, transactions));
-            times.locked_us = ledger.at.elapsed().as_micros() as u64;
-            drop(ledger);
-        } else {
-            let mut inner = self.lock_inner_quiet();
-            times.lock_us = inner.waited.as_micros() as u64;
-            // The block a whole hand-off just forgot the take of: what a plan
-            // prepared ahead of the next build is accepted against.
-            Self::mark_handed_in(&mut inner, hash);
-            let Inner { held, drops, .. } = &mut *inner;
-            Self::evict_held(held, drops, held_blocks, number, lean, &mut times, &mut evicted_all);
-            held.push_back((number, hash, transactions));
-            times.locked_us = inner.at.elapsed().as_micros() as u64;
-            drop(inner);
-        }
-        let freed = std::time::Instant::now();
-        if lean && !evicted_all.is_empty() {
-            free_off_path(Box::new(evicted_all));
-        } else {
-            drop(evicted_all);
-        }
-        times.evict_free_us = freed.elapsed().as_micros() as u64;
-        times.hold_us = at.elapsed().as_micros() as u64;
-        times
-    }
-
-    /// The eviction loop of an own-block hold: blocks past the bound leave
-    /// `held`, counted as `Dropped::HeldEvicted` in `drops`, into
-    /// `evicted_all` to be freed after the lock. The same on the lanes'
-    /// side and the ledger's.
-    #[allow(clippy::too_many_arguments)]
-    fn evict_held(
-        held: &mut VecDeque<(u64, B256, Vec<Arc<ValidPoolTransaction<T>>>)>,
-        drops: &mut DropReport,
-        held_blocks: usize,
-        number: u64,
-        lean: bool,
-        times: &mut HoldTimes,
-        evicted_all: &mut Vec<Vec<Arc<ValidPoolTransaction<T>>>>,
-    ) {
-        while held.len() >= held_blocks {
-            let Some((evicted, _, gone)) = held.pop_front() else { break };
+        let mut inner = self.lock_inner_quiet();
+        times.lock_us = inner.waited.as_micros() as u64;
+        // The block a whole hand-off just forgot the take of: what a plan
+        // prepared ahead of the next build is accepted against.
+        Self::mark_handed_in(&mut inner, hash);
+        while inner.held.len() >= held_blocks {
+            let Some((evicted, _, gone)) = inner.held.pop_front() else { break };
             // Nothing else holds these: the block they were taken for was
             // never settled, so this is a hole in every lane they came
             // from. Said out loud rather than counted alone.
             if lean {
-                drops.note_many(Dropped::HeldEvicted, gone.iter().map(|valid| (valid.sender(), valid.nonce())));
+                inner.dropped_many(Dropped::HeldEvicted, gone.iter().map(|valid| (valid.sender(), valid.nonce())));
             } else {
                 for valid in &gone {
-                    drops.note(Dropped::HeldEvicted, valid.sender(), valid.nonce());
+                    inner.dropped(Dropped::HeldEvicted, valid.sender(), valid.nonce());
                 }
             }
             tracing::warn!(
@@ -3582,7 +3281,19 @@ impl<T: PoolTransaction> TxQueue<T> {
             );
             times.evicted += gone.len();
             evicted_all.push(gone);
-    }
+        }
+        inner.held.push_back((number, hash, transactions));
+        times.locked_us = inner.at.elapsed().as_micros() as u64;
+        drop(inner);
+        let freed = std::time::Instant::now();
+        if lean && !evicted_all.is_empty() {
+            free_off_path(Box::new(evicted_all));
+        } else {
+            drop(evicted_all);
+        }
+        times.evict_free_us = freed.elapsed().as_micros() as u64;
+        times.hold_us = at.elapsed().as_micros() as u64;
+        times
     }
 
     /// The chain committed `hash` at `number`: an own block held at that
@@ -3601,28 +3312,6 @@ impl<T: PoolTransaction> TxQueue<T> {
         hash: B256,
         carried: impl Fn(&Address, u64) -> bool,
     ) -> (usize, u64, u64) {
-        if self.ledger_on() {
-            let mut ledger = self.lock_ledger();
-            let mut lock_us = ledger.waited.as_micros() as u64;
-            let at = ledger.at;
-            let Ledger { held, drops, .. } = &mut *ledger;
-            let back = if held.is_empty() { Vec::new() } else { Self::settle_held(held, drops, number, hash, carried) };
-            drop(ledger);
-            if back.is_empty() {
-                return (0, lock_us, at.elapsed().as_micros() as u64);
-            }
-            // The give-back alone needs the lanes: taken after the ledger's
-            // lock is released (the lock order, [`Ledger`]). Between the two
-            // the transactions are in neither; a build meanwhile sees the
-            // queue as if this settle had come a moment later.
-            let mut inner = self.lock_inner_quiet();
-            let lanes_wait = inner.waited.as_micros() as u64;
-            lock_us += lanes_wait;
-            inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
-            let offered = inner.give_back_unmined(back).offered;
-            drop(inner);
-            return (offered, lock_us, (at.elapsed().as_micros() as u64).saturating_sub(lanes_wait));
-        }
         // Quiet: only a give-back below moves the lanes, and raises the
         // generation itself.
         let inner = self.lock_inner_quiet();
@@ -3641,8 +3330,35 @@ impl<T: PoolTransaction> TxQueue<T> {
         if inner.held.is_empty() {
             return 0;
         }
-        let Inner { held, drops, .. } = &mut *inner;
-        let back = Self::settle_held(held, drops, number, hash, carried);
+        let mut back = Vec::new();
+        let mut kept = VecDeque::with_capacity(inner.held.len());
+        let mut behind: Vec<(u64, Vec<Arc<ValidPoolTransaction<T>>>)> = Vec::new();
+        for (held_number, held_hash, transactions) in std::mem::take(&mut inner.held) {
+            if held_number == number && held_hash != hash {
+                back.extend(transactions.into_iter().filter(|t| !carried(&t.sender(), t.nonce())));
+            } else if held_number > number {
+                kept.push_back((held_number, held_hash, transactions));
+            } else if held_number < number {
+                // A height the chain has passed with this block still held:
+                // the pruner should have settled it at its own height, so
+                // this is a hole and not housekeeping.
+                behind.push((held_number, transactions));
+            }
+            // The same hash at this height: settled, and mined.
+        }
+        inner.held = kept;
+        for (held_number, gone) in behind {
+            for valid in &gone {
+                inner.dropped(Dropped::HeldBehind, valid.sender(), valid.nonce());
+            }
+            tracing::warn!(
+                target: "n42.tx_queue",
+                number = held_number,
+                txs = gone.len(),
+                settling = number,
+                "an own block was still held at a height the chain had passed; its transactions are lost to the queue"
+            );
+        }
         if back.is_empty() {
             return 0;
         }
@@ -3664,50 +3380,6 @@ impl<T: PoolTransaction> TxQueue<T> {
         // watermark from what the chain actually mined, so lowering it here
         // cannot re-admit anything the chain holds.
         inner.give_back_unmined(back).offered
-    }
-
-    /// The held own blocks settled at `number` (`hash` committed): the same
-    /// hash dropped as mined, another hash's transactions the committed
-    /// block does not carry returned (to go back to the lanes), heights the
-    /// chain has passed counted as `Dropped::HeldBehind`. The same on the
-    /// lanes' side and the ledger's.
-    fn settle_held(
-        held: &mut VecDeque<(u64, B256, Vec<Arc<ValidPoolTransaction<T>>>)>,
-        drops: &mut DropReport,
-        number: u64,
-        hash: B256,
-        carried: impl Fn(&Address, u64) -> bool,
-    ) -> Vec<Arc<ValidPoolTransaction<T>>> {
-        let mut back = Vec::new();
-        let mut kept = VecDeque::with_capacity(held.len());
-        let mut behind: Vec<(u64, Vec<Arc<ValidPoolTransaction<T>>>)> = Vec::new();
-        for (held_number, held_hash, transactions) in std::mem::take(held) {
-            if held_number == number && held_hash != hash {
-                back.extend(transactions.into_iter().filter(|t| !carried(&t.sender(), t.nonce())));
-            } else if held_number > number {
-                kept.push_back((held_number, held_hash, transactions));
-            } else if held_number < number {
-                // A height the chain has passed with this block still held:
-                // the pruner should have settled it at its own height, so
-                // this is a hole and not housekeeping.
-                behind.push((held_number, transactions));
-            }
-            // The same hash at this height: settled, and mined.
-        }
-        *held = kept;
-        for (held_number, gone) in behind {
-            for valid in &gone {
-                drops.note(Dropped::HeldBehind, valid.sender(), valid.nonce());
-            }
-            tracing::warn!(
-                target: "n42.tx_queue",
-                number = held_number,
-                txs = gone.len(),
-                settling = number,
-                "an own block was still held at a height the chain had passed; its transactions are lost to the queue"
-            );
-        }
-        back
     }
 
     /// Forgets the transactions the build on `parent` took that a block has
@@ -3742,9 +3414,8 @@ impl<T: PoolTransaction> TxQueue<T> {
         // outside the lock the puller needs.
         {
             let at = std::time::Instant::now();
-            let mut inner = self.lock_inner();
+            let inner = self.lock_inner();
             times.lock_us += at.elapsed().as_micros() as u64;
-            inner.reclaim_take();
             match inner.last_build.as_ref() {
                 Some((built_on, taken)) if *built_on == parent && !taken.is_empty() => {}
                 _ => return (Vec::new(), times),
@@ -3769,7 +3440,6 @@ impl<T: PoolTransaction> TxQueue<T> {
         let at = std::time::Instant::now();
         let mut inner = self.lock_inner();
         times.lock_us += at.elapsed().as_micros() as u64;
-        inner.reclaim_take();
         let at = std::time::Instant::now();
         let Some((built_on, taken)) = inner.last_build.as_mut() else { return (Vec::new(), times) };
         if *built_on != parent || taken.is_empty() {
@@ -3782,7 +3452,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         *taken = kept;
         if whole {
             let build = inner.builds;
-            inner.set_handed(Handed { build, block: None });
+            inner.handed = Some(Handed { build, block: None });
         }
         times.partition_us = at.elapsed().as_micros() as u64;
         (mined, times)
@@ -3825,7 +3495,6 @@ impl<T: PoolTransaction> TxQueue<T> {
             let at = std::time::Instant::now();
             let mut inner = self.lock_inner();
             times.lock_us += at.elapsed().as_micros() as u64;
-            inner.reclaim_take();
             let Some((built_on, taken)) = inner.last_build.as_mut() else { return (Vec::new(), times) };
             if *built_on != parent || taken.is_empty() {
                 return (Vec::new(), times);
@@ -3855,7 +3524,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                     times.whole = true;
                     let whole = std::mem::take(taken);
                     let build = inner.builds;
-                    inner.set_handed(Handed { build, block: None });
+                    inner.handed = Some(Handed { build, block: None });
                     return (whole, times);
                 }
             }
@@ -3880,7 +3549,6 @@ impl<T: PoolTransaction> TxQueue<T> {
         let at = std::time::Instant::now();
         let mut inner = self.lock_inner();
         times.lock_us += at.elapsed().as_micros() as u64;
-        inner.reclaim_take();
         let at = std::time::Instant::now();
         let Some((built_on, taken)) = inner.last_build.as_mut() else { return (Vec::new(), times) };
         if *built_on != parent || taken.is_empty() {
@@ -3894,7 +3562,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         *taken = kept;
         if whole {
             let build = inner.builds;
-            inner.set_handed(Handed { build, block: None });
+            inner.handed = Some(Handed { build, block: None });
         }
         times.partition_us = at.elapsed().as_micros() as u64;
         (mined, times)
@@ -3968,7 +3636,6 @@ impl<T: PoolTransaction> TxQueue<T> {
         let at = std::time::Instant::now();
         let mut inner = self.lock_inner_quiet();
         times.lock_us += at.elapsed().as_micros() as u64;
-        inner.reclaim_take();
         let build = inner.builds;
         let (built_on, taken) = inner.last_build.as_mut()?;
         if *built_on != parent || taken.is_empty() {
@@ -3996,7 +3663,6 @@ impl<T: PoolTransaction> TxQueue<T> {
         let at = std::time::Instant::now();
         let mut inner = self.lock_inner_quiet();
         times.lock_us += at.elapsed().as_micros() as u64;
-        inner.reclaim_take();
         let whole = kept.is_empty() && mined_any;
         let current = inner.builds == build;
         match inner.last_build.as_mut() {
@@ -4006,7 +3672,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                     taken.extend(added);
                 }
                 if whole {
-                    inner.set_handed(Handed { build, block: None });
+                    inner.handed = Some(Handed { build, block: None });
                 }
             }
             _ => {
@@ -4395,12 +4061,6 @@ impl<T: PoolTransaction> TxQueue<T> {
                     (segments, plan)
                 }
             };
-            // `N42_QUEUE_LEDGER_LOCK`: a build that opened on a prepared
-            // plan has its whole take now (unless a top-up noted more);
-            // published, the hand-off forgets it without the lanes' lock.
-            if times.ahead > 0 {
-                inner.publish_take();
-            }
             // With `N42_QUEUE_OFFLOCK` the noted takes are grouped off the
             // lock by the thread below and applied in one short hold
             // ([`Self::settle_offlock`]), unless a lock settles them first.
@@ -4553,7 +4213,6 @@ impl<T: PoolTransaction> TxQueue<T> {
             inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
             inner.split_runs(&first, &mut garbage.lanes);
             inner.settling = runs;
-            inner.reclaim_take();
             if let Some((_, list)) = inner.last_build.as_mut() {
                 list.extend(taken);
             }
@@ -5001,40 +4660,9 @@ impl<T: PoolTransaction> TxQueue<T> {
         checks: &[(usize, Address, u64)],
     ) -> Option<(Vec<Arc<ValidPoolTransaction<T>>>, ForgetTimes)> {
         let mut times = ForgetTimes::default();
-        if self.ledger_on() {
-            let at = std::time::Instant::now();
-            let mut ledger = self.lock_ledger();
-            times.lock_us = at.elapsed().as_micros() as u64;
-            if let Some(whole) = ledger.whole.as_ref() {
-                // Published whole at its build's start ([`Inner::publish_take`]),
-                // and `last_build`'s list is empty meanwhile: the same
-                // comparisons as below, on the same list, without the lanes.
-                if whole.parent != parent || whole.taken.len() != len || len == 0 {
-                    return None;
-                }
-                let taken = &whole.taken;
-                let matches = checks.iter().all(|(i, sender, nonce)| {
-                    taken.get(*i).is_some_and(|t| t.sender() == *sender && t.nonce() == *nonce)
-                });
-                if !matches {
-                    return None;
-                }
-                let whole = ledger.whole.take()?;
-                ledger.handed = Some(Handed { build: whole.build, block: None });
-                drop(ledger);
-                LEDGER_COUNTERS.forgets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                times.taken_len = len;
-                times.first_miss = usize::MAX;
-                times.whole = true;
-                return Some((whole.taken, times));
-            }
-            drop(ledger);
-            LEDGER_COUNTERS.fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         let at = std::time::Instant::now();
         let mut inner = self.lock_inner_quiet();
-        times.lock_us += at.elapsed().as_micros() as u64;
-        inner.reclaim_take();
+        times.lock_us = at.elapsed().as_micros() as u64;
         let build = inner.builds;
         let (built_on, taken) = inner.last_build.as_mut()?;
         if *built_on != parent || taken.len() != len || len == 0 {
@@ -5050,7 +4678,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         times.first_miss = usize::MAX;
         times.whole = true;
         let whole = std::mem::take(taken);
-        inner.set_handed(Handed { build, block: None });
+        inner.handed = Some(Handed { build, block: None });
         Some((whole, times))
     }
 
@@ -5085,97 +4713,6 @@ impl<T: PoolTransaction> TxQueue<T> {
 }
 
 impl<T: PoolTransaction> Inner<T> {
-    /// `handed` set: in the ledger with `N42_QUEUE_LEDGER_LOCK` (nested
-    /// inside the lanes' lock, the permitted order), here otherwise.
-    fn set_handed(&mut self, handed: Handed) {
-        match self.ledger.as_ref() {
-            Some(ledger) => lock_ledger(ledger).handed = Some(handed),
-            None => self.handed = Some(handed),
-        }
-    }
-
-    /// `handed` as the plan-ahead verdict reads it.
-    fn handed_now(&self) -> Option<Handed> {
-        match self.ledger.as_ref() {
-            Some(ledger) => lock_ledger(ledger).handed,
-            None => self.handed,
-        }
-    }
-
-    /// Whether a take published to the ledger is still there: it is then
-    /// the front of `last_build`'s list.
-    fn take_in_ledger(&self) -> bool {
-        match (self.published, self.ledger.as_ref()) {
-            (Some(parent), Some(ledger)) => lock_ledger(ledger).whole.as_ref().is_some_and(|w| w.parent == parent),
-            _ => false,
-        }
-    }
-
-    /// Publishes the current build's take to the ledger
-    /// (`N42_QUEUE_LEDGER_LOCK`): called at the end of a build start that
-    /// opened on a prepared plan, under the lanes' lock. Only a complete
-    /// take is published -- no noted takes (`pending`) or off-lock runs
-    /// (`settling`) still to be applied to it -- so the hand-off can forget
-    /// it whole from the ledger. A no-op with the switch off.
-    fn publish_take(&mut self) {
-        let Some(ledger) = self.ledger.clone() else { return };
-        self.reclaim_take();
-        if !self.pending.is_empty() || !self.settling.is_empty() {
-            return;
-        }
-        let Some((parent, list)) = self.last_build.as_mut() else { return };
-        // A zero parent is the marker the plan-ahead preparation's own
-        // list stands on (`prepare_next_locked`); never published.
-        if list.is_empty() || *parent == B256::ZERO {
-            return;
-        }
-        let parent = *parent;
-        let mut ledger = lock_ledger(&ledger);
-        if ledger.whole.is_some() {
-            return;
-        }
-        ledger.whole = Some(LedgerTake { build: self.builds, parent, taken: std::mem::take(list) });
-        self.published = Some(parent);
-    }
-
-    /// Moves a take published to the ledger back to the front of
-    /// `last_build`'s list, if the hand-off has not taken it. Called (under
-    /// the lanes' lock, the ledger's nested) before every lanes-side step
-    /// that reads the whole list, removes from it, gives it back or appends
-    /// to it; a step after which the hand-off falls back to the lanes'
-    /// path. A plan-ahead preparation's window (`last_build` on the zero
-    /// parent) is left alone: its list is the next plan's.
-    fn reclaim_take(&mut self) {
-        let Some(parent) = self.published else { return };
-        if self.last_build.as_ref().map(|(built_on, _)| *built_on) != Some(parent) {
-            return;
-        }
-        self.published = None;
-        let Some(ledger) = self.ledger.clone() else { return };
-        let whole = lock_ledger(&ledger).whole.take_if(|w| w.parent == parent);
-        let Some(whole) = whole else { return };
-        LEDGER_COUNTERS.reclaims.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some((_, list)) = self.last_build.as_mut() {
-            let tail = std::mem::replace(list, whole.taken);
-            list.extend(tail);
-        }
-    }
-
-    /// A canonical prune's split of a published take, in place in the
-    /// ledger: the same partition the lanes' list gets, so the logical
-    /// list (the ledger's, then `last_build`'s) is split as one.
-    fn split_published(&mut self, mined: impl Fn(&Arc<ValidPoolTransaction<T>>) -> bool, removed: &mut Vec<Arc<ValidPoolTransaction<T>>>) {
-        let (Some(parent), Some(ledger)) = (self.published, self.ledger.as_ref()) else { return };
-        let mut ledger = lock_ledger(ledger);
-        let Some(whole) = ledger.whole.as_mut().filter(|w| w.parent == parent) else { return };
-        if whole.taken.is_empty() {
-            return;
-        }
-        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut whole.taken).into_iter().partition(|t| mined(t));
-        whole.taken = kept;
-        removed.extend(gone);
-    }
-
     /// A build's opening once the inbox is drained: the previous build's
     /// take given back, this build's taken list opened with `taken` (empty,
     /// or a prepared plan's), the parked lanes whose park ended offered
@@ -5183,14 +4720,8 @@ impl<T: PoolTransaction> Inner<T> {
     fn open_build(&mut self, parent: B256, taken: Vec<Arc<ValidPoolTransaction<T>>>) {
         let inner = self;
         {
-            // The previous build's take, wherever it is, is given back
-            // below.
-            inner.reclaim_take();
             inner.builds += 1;
             let build = inner.builds;
-            if let Some(ledger) = inner.ledger.as_ref() {
-                lock_ledger(ledger).builds = build;
-            }
             match inner.last_build.take() {
                 // "The same parent again" does not mean the block built from
                 // that take was not committed: with two builds in flight on
@@ -5264,9 +4795,6 @@ impl<T: PoolTransaction> Inner<T> {
         times: &mut FrameSelectTimes,
         mode: SelectMode,
     ) -> (Vec<(FrameTxs<T>, usize)>, FramePlan, u64) {
-        // Its takes are appended to `last_build`'s list (a no-op inside a
-        // preparation's window, whose list stands on the zero parent).
-        self.reclaim_take();
         let mut segments: Vec<(FrameTxs<T>, usize)> = Vec::new();
         let mut plan = FramePlan::default();
         let mut gas_left = gas_limit;
@@ -5353,7 +4881,6 @@ impl<T: PoolTransaction> Inner<T> {
         }
         self.lanes_gen = self.lanes_gen.wrapping_add(1);
         let pending = std::mem::take(&mut self.pending);
-        self.reclaim_take();
         let mut list = self.last_build.as_mut().map(|(_, list)| list);
         for (id, prefix) in pending {
             // Read live or aside: a frame retired below by an earlier take
@@ -5606,11 +5133,8 @@ impl<T: PoolTransaction> Inner<T> {
         if prepared.after != self.builds {
             return Err(AheadDiscard::OtherBuild);
         }
-        if self.handed_now() != Some(Handed { build: self.builds, block: Some(parent) }) {
+        if self.handed != Some(Handed { build: self.builds, block: Some(parent) }) {
             return Err(AheadDiscard::NotOnItsParent);
-        }
-        if self.take_in_ledger() {
-            return Err(AheadDiscard::TakeLeft);
         }
         match &self.last_build {
             Some((built_on, taken)) if *built_on != parent && taken.is_empty() => {}
@@ -5881,9 +5405,27 @@ impl<T: PoolTransaction> Inner<T> {
         gave
     }
 
+    /// [`Self::dropped`] for many transactions of one reason, folded: the
+    /// count is one add and only the samples still wanted are visited. The
+    /// result is that of one [`Self::dropped`] call per item, in order.
+    fn dropped_many(&mut self, reason: Dropped, items: impl ExactSizeIterator<Item = (Address, u64)>) {
+        self.drops.counts[reason.index()] += items.len() as u64;
+        if reason == Dropped::Duplicate || reason == Dropped::Mined {
+            return;
+        }
+        let room = DROP_SAMPLES.saturating_sub(self.drops.samples.len());
+        self.drops.samples.extend(items.take(room).map(|(sender, nonce)| (reason, sender, nonce)));
+    }
+
     /// Records that a transaction left the queue, or never entered it.
     fn dropped(&mut self, reason: Dropped, sender: Address, nonce: u64) {
-        self.drops.note(reason, sender, nonce);
+        self.drops.counts[reason.index()] += 1;
+        if self.drops.samples.len() < DROP_SAMPLES
+            && reason != Dropped::Duplicate
+            && reason != Dropped::Mined
+        {
+            self.drops.samples.push((reason, sender, nonce));
+        }
     }
 
     /// [`Self::give_back`] for transactions no block of the chain ever
@@ -6064,9 +5606,6 @@ impl<T: PoolTransaction> Inner<T> {
     /// The build's taken list split by a canonical block's highest nonces
     /// per sender: the mined ones to `garbage`, the rest kept in order.
     fn forget_taken_mined(&mut self, highest: &AddressHashMap<u64>, garbage: &mut PruneGarbage<T>) {
-        // A take published to the ledger is split in place, not reclaimed:
-        // the hand-off may still forget it from there.
-        self.split_published(|t| highest.get(&t.sender()).is_some_and(|m| t.nonce() <= *m), &mut garbage.taken);
         if let Some((_, taken)) = self.last_build.as_mut()
             && !taken.is_empty()
         {
@@ -6181,7 +5720,6 @@ impl<T: PoolTransaction> Inner<T> {
     /// The next transaction: the lowest nonce of the sender at the front of
     /// the arrival order, skipping senders the build marked.
     fn next_ready(&mut self, skipped: &AddressHashSet) -> Option<Arc<ValidPoolTransaction<T>>> {
-        self.reclaim_take();
         // Continue the current sender's run first.
         if let Some((sender, left)) = self.current.take() {
             if left > 0 && !skipped.contains(&sender) {
@@ -6597,7 +6135,6 @@ impl<T: PoolTransaction> Inner<T> {
     /// it (loop323 Ab, the tenure handover).
     fn untake_all(&mut self, returned: Returned<T>) {
         let Returned { transactions, mut by_ptr } = returned;
-        self.reclaim_take();
         if let Some((_, taken)) = self.last_build.as_mut()
             && !taken.is_empty()
         {
@@ -6655,7 +6192,6 @@ impl<T: PoolTransaction> QueueBest<T> {
     /// that the build took it. The taken list ends with the buffered ones,
     /// so the search from the back is short.
     fn untake(inner: &mut Inner<T>, transaction: Arc<ValidPoolTransaction<T>>) {
-        inner.reclaim_take();
         if let Some((_, taken)) = inner.last_build.as_mut() {
             if let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, &transaction)) {
                 taken.remove(at);
@@ -6797,7 +6333,6 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
                 drop(inner);
                 self.skipped.insert(sender);
                 let mut inner = self.queue.lock_inner();
-                inner.reclaim_take();
                 if let Some((_, taken)) = inner.last_build.as_mut()
                     && let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, transaction))
                 {
@@ -6816,7 +6351,6 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
             // The sender is deliberately not skipped for the rest of this
             // build: its higher nonces are what the chain wants next, and
             // this one being stale says nothing against them.
-            inner.reclaim_take();
             if let Some((_, taken)) = inner.last_build.as_mut()
                 && let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, transaction))
             {
@@ -6828,7 +6362,6 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
         }
         self.skipped.insert(sender);
         let mut inner = self.queue.lock_inner();
-        inner.reclaim_take();
         if let Some((_, taken)) = inner.last_build.as_mut() {
             // The refused transaction is the one just yielded or one of the
             // few buffered after it: found from the back. A scan of
@@ -6870,50 +6403,6 @@ pub fn install<T: PoolTransaction + 'static>(queue: TxQueue<T>) -> bool {
 /// The installed queue for `T`, if one was installed with that type.
 pub fn global<T: PoolTransaction + 'static>() -> Option<TxQueue<T>> {
     GLOBAL.get()?.as_ref()?.downcast_ref::<TxQueue<T>>().cloned()
-}
-
-/// Test views of the state the ledger may carry (`N42_QUEUE_LEDGER_LOCK`):
-/// the same reading whichever lock it lives under.
-#[cfg(test)]
-impl<T: PoolTransaction> TxQueue<T> {
-    /// The held own blocks as (number, hash, transactions).
-    pub(crate) fn held_view(&self) -> Vec<(u64, B256, usize)> {
-        let view = |held: &VecDeque<(u64, B256, Vec<Arc<ValidPoolTransaction<T>>>)>| {
-            held.iter().map(|(n, h, txs)| (*n, *h, txs.len())).collect()
-        };
-        if self.ledger_on() { view(&self.lock_ledger().held) } else { view(&self.lock_inner_quiet().held) }
-    }
-
-    /// The drops not yet reported, the ledger's merged in.
-    pub(crate) fn drops_view(&self) -> DropReport {
-        let mut drops = self.lock_inner_quiet().drops.clone();
-        if self.ledger_on() {
-            drops.merge(self.lock_ledger().drops.clone());
-        }
-        drops
-    }
-
-    /// `handed`, wherever it lives.
-    pub(crate) fn handed_view(&self) -> Option<Handed> {
-        self.lock_inner_quiet().handed_now()
-    }
-}
-
-#[cfg(test)]
-impl<T: PoolTransaction> Inner<T> {
-    /// `last_build`'s logical list: a take still published to the ledger,
-    /// then the list here.
-    pub(crate) fn taken_view(&self) -> Option<Vec<Arc<ValidPoolTransaction<T>>>> {
-        let (_, list) = self.last_build.as_ref()?;
-        let mut all = Vec::new();
-        if let (Some(parent), Some(ledger)) = (self.published, self.ledger.as_ref())
-            && let Some(whole) = lock_ledger(ledger).whole.as_ref().filter(|w| w.parent == parent)
-        {
-            all.extend(whole.taken.iter().cloned());
-        }
-        all.extend(list.iter().cloned());
-        Some(all)
-    }
 }
 
 #[cfg(test)]
@@ -8893,6 +8382,3 @@ mod offlock_tests;
 
 #[cfg(test)]
 mod lean_tests;
-
-#[cfg(test)]
-mod ledger_tests;

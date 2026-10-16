@@ -949,17 +949,6 @@ fn spawn_stats_reporter() {
                     lock_holders = %n42_tx_queue::format_lock_holders(&lock.holders),
                     lock_holders_rest_us = lock.holders_rest_ns / 1_000,
                     lock_holders_rest = lock.holders_rest,
-                    // `N42_QUEUE_LEDGER_LOCK`: the ledger lock's holds, duty
-                    // and waits, and how the whole-take hand-offs went
-                    // (from the ledger, fallen back to the lanes, taken
-                    // back before the hand-off).
-                    ledger_holds = lock.ledger_holds,
-                    ledger_duty_pct = (lock.ledger_hold_ns as f64 / 1e9 / secs * 100.0) as u64,
-                    ledger_wait_us = lock.ledger_wait_ns / 1_000,
-                    ledger_wait_max_us = lock.ledger_wait_max_ns / 1_000,
-                    ledger_forgets = lock.ledger_forgets,
-                    ledger_fallbacks = lock.ledger_fallbacks,
-                    ledger_reclaims = lock.ledger_reclaims,
                     // `N42_PLAN_AHEAD`: prepared plans discarded, by reason.
                     plan_discards = %ahead_discards,
                     offlock_raced,

@@ -15,7 +15,7 @@ chain produced 52 empty blocks in the last 1.8 s of the window. The round metric
 
 ## 2. Window 3 of Mha against Ma (canonical blocks)
 
-| leg | w3 blocks | empty | non-empty mean | w3 txs | last block with txs | 
+| leg | w3 blocks | empty | non-empty mean | w3 txs | last block with txs |
 | --- | --- | --- | --- | --- | --- |
 | Ma, control | 675 | 6 | 199.7k | 133.61M | T0+89.79 s |
 | Mb, control | 675 | 3 | 200.0k | 134.40M | T0+89.90 s |
@@ -57,24 +57,24 @@ p50 1-2 ms against 8-11). What differs is the tail: gaps over 80 ms, T0..+88 s:
 | Mha | 115 | 10.8 s | 95 ms | 52.5 ms | 42.7 ms | 0.09 ms |
 | Mhb | 131 | 12.9 s | 98 ms | 42.9 ms | 55.2 ms | 0.07 ms |
 | Mhla | 123 | 11.9 s | 97 ms | 34.4 ms | 62.5 ms | 0.49 ms |
-| Mhlb | 144 | 13.8 s | -- | -- | -- | -- |
+| Mhlb | 139 | 13.3 s | 96 ms | 51.9 ms | 43.9 ms | 0.65 ms |
 
 In a long gap the next build *starts* 35-52 ms late (start delay = gap - sealed_at), with its plan ready: the leader is waiting
 for the chain (the vote-bound gaps of DEGRADED_ONSET_ANALYSIS Q1: vote side (L - 12)/4 = 38-39 ms, plus deferred depth 2), not
 for the queue. The early hand-off seals faster, so more gaps cross over to vote-bound, and the extra 1.3-4.8 s of long gaps
-per round eats what the shorter build saved. That is the w1-up / w2-3-down shape; 10.146's ledger lock and 10.132's five-block
+per round (hand-off 115-139 long gaps, 10.8-13.3 s; controls 95-101, 9.0-9.5 s) eats what the shorter build saved. That is the w1-up / w2-3-down shape; 10.146's ledger lock and 10.132's five-block
 window show the same signature and should be re-read the same way (gap tail, not block size).
 
 ## 5. Supply and flood
 
-| leg | flood submit time | flood rate median / 5 s | delivered (ingest) median w1 / w2 / w3 | slots_busy | flood wait share | drain rate (400M / time to last tx block) |
+| leg | flood submit time | flood mean rate | delivered (ingest) median w1 / w2 / w3 | slots_busy | flood wait share | drain rate (400M / time to last tx block) |
 | --- | --- | --- | --- | --- | --- | --- |
-| Ma | 89.5 s | 4.46M/s | 4.51 / 4.47 / 4.45M/s | 19% | 96% | **4.455M/s** |
-| Mb | -- | 4.45M/s | -- | 19-20% | 96% | **4.449M/s** |
-| Mha | 87.8 s | 4.59M/s | 4.61 / 4.50 / 4.53M/s | 20-21% | 96% | **4.535M/s** (+1.8%) |
-| Mhb | -- | -- | -- | -- | -- | 4.386M/s (-1.5%) |
-| Mhla | -- | 4.17M/s (+60..+85 s) | -- | -- | -- | 4.357M/s (-2.1%) |
-| Mhlb | -- | -- | -- | -- | -- | 4.383M/s (-1.5%) |
+| Ma | 89.5 s | 4.47M/s | 4.51 / 4.47 / 4.45M/s | 19% | 96% | **4.455M/s** |
+| Mb | 89.6 s | 4.46M/s | 4.51 / 4.41 / 4.47M/s | 20% | 96% | **4.449M/s** |
+| Mha | 87.8 s | 4.56M/s | 4.61 / 4.50 / 4.53M/s | 20-21% | 96% | **4.535M/s** (+1.8%) |
+| Mhb | 90.9 s | 4.40M/s | 4.57 / 4.49 / 4.23M/s | 18-20% | 96% | 4.386M/s (-1.5%) |
+| Mhla | 91.4 s | 4.37M/s | 4.57 / 4.42 / 4.12M/s | 18-20% | 96% | 4.357M/s (-2.1%) |
+| Mhlb | 90.9 s | 4.40M/s | 4.50 / 4.37 / 4.40M/s | 20-21% | 96% | 4.383M/s (-1.5%) |
 
 (Stage bw for comparison: Lha's set ran out at T0+89.80 s, so its 400.0M "record" is the same cap.)
 
@@ -99,5 +99,5 @@ window show the same signature and should be re-read the same way (gap tail, not
    --pregen-txs 500000000 --senders 15625 --pertx 32000 ...` as in derive333.py, before any 5M claim can be measured.
 
 Next step: score legs by drain rate (400M / time to the last non-empty block) or move the bench to a >= 500M set, so that a
-faster leg reads higher instead of filling window 3 with empty blocks; then attack the vote-bound long gaps (95-144 per round,
-9-14 s) rather than the build's start.
+faster leg reads higher instead of filling window 3 with empty blocks; then attack the vote-bound long gaps (95-139 per round,
+9-13 s) rather than the build's start.

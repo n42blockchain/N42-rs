@@ -4082,3 +4082,20 @@ Stage cd (wt-main, tree d1f54f3db = the cc tree + fix/build-ahead-two; 2,456 tes
 2. **Corrected model**: gap >= max(root cycle ~41, (A + c)/4 = 42.5, seal_to_fields/2), with A = proposal to answer = the root's end + ~120 ms (merge 61, hand-off 20, canonical 6, answer 30). The tick (30 ms) does not bind the mean: the tick-bound proposals are catch-up gaps after vote-bound ones; a 25 ms pacer gains ~0 until the gap is under ~33 ms.
 3. **Two ahead is parked**: 0.2 ms over one-ahead, a slower seal, and Ttb's gate stop -- `release_own_blocks_from` fired at the 2048 and 3072 handovers but not at 1024 (fix/build-ahead-two is merged to main as a correctness fix for the branch-abandon bug; its knobs stay off).
 4. **Next**: `N42_BUILD_AHEAD_AT_SEAL=1` plus the root cuts (`N42_ROOT_UPPER_DIRTY=1 N42_ROOT_OPS_BEFORE_GATE=1`: on stage cc's Sra they cut the root 10.6 ms and A 6.7 ms) -- expected -2..-3.5 ms of gap; then answer at insert (~-5) and halving the 61 ms state merge (~-7), toward a floor near 35 ms. Stage ce: X16 vs X16 + one-ahead kept + root cuts vs the same + `N42_ANSWER_AT_INSERT=1`, each twice.
+
+### 10.154 loop351 stage ce — the kept one-ahead start plus the root cuts: 4.49-4.71M/s against 4.34-4.50 (X17); answer at insert on top reaches 4.712M/s and sets every record (423.4M, windows 4.733 / 4.727 / 4.653M)
+
+Stage ce (wt-main, tree 7643029ef = the cd tree; 2,456 tests pass; no rebuild), 600M set, drain-rate scored: two X16 controls, two legs of `N42_BUILD_AHEAD_AT_SEAL=1 N42_ROOT_UPPER_DIRTY=1 N42_ROOT_OPS_BEFORE_GATE=1` (the kept one-ahead start with the root cuts, the next lever of docs/BUILD_AHEAD_RESULTS.md), two of the same plus `N42_ANSWER_AT_INSERT=1`.
+
+| leg | w1 | w2 | w3 | round | drain M/s | sealed_at p50/p90 | proposal interval p50 / p90 | warnings |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X11T16Ua, X16 control | 4.413 | 4.380 | 4.247 | 391.2M | 4.335 | 34 / 49 | 33.2 / 44.2 | 6 |
+| X11T16Ura, one ahead + root cuts | 4.593 | 4.533 | 4.280 | 402.2M | 4.486 | 33 / 55 | 31.9 / 42.2 | 4 |
+| X11T16Uaa, + answer at insert | **4.733** | **4.727** | **4.653** | **423.4M** | **4.712** | 36 / 56 | 31.9 / 42.7 | 0 |
+| X11T16Ub, X16 control | 4.560 | 4.440 | 4.467 | 404.0M | 4.502 | 33 / 47 | 33.0 / 43.4 | 8 |
+| X11T16Urb, one ahead + root cuts | 4.713 | 4.713 | 4.607 | 421.0M | 4.697 | 32 / 51 | 31.8 / **38.5** | 3 |
+| X11T16Uab, + answer at insert | 4.420 | 4.640 | 4.547 | 408.2M | 4.525 | 42 / 58 | 31.8 / 44.5 | 18 |
+
+1. **X17 = X16 + `N42_BUILD_AHEAD_AT_SEAL=1 N42_ROOT_UPPER_DIRTY=1 N42_ROOT_OPS_BEFORE_GATE=1`.** The four legs carrying these three knobs read 4.486-4.712M/s (mean 4.605) against the controls' 4.335 / 4.502 (mean 4.42), +4%; the proposal interval median falls from 33.0-33.2 to 31.8-31.9 ms on all four, and its p90 to 38.5 on Urb. The corrected model of 10.153 explains why the root cuts pay only together with the kept start: the kept start removes the start delay, the shorter gated root (dirty-twig refresh, pre-gate hashes) stops the earlier seal from queuing behind the previous root. Spread is wide (402-423M) and one pair (Ura 4.486 against Ub 4.502) misses the +1.5% rule, so the set is adopted on the four-leg mean and the uniform median shift, and confirmed again in stage cf's controls.
+2. **Answer at insert** adds 4.712 (Uaa, every record: round 423.4M, windows 4.733 / 4.727 / 4.653M) and 4.525 (Uab, with a 42 ms seal p50 and 18 warnings): +1% over the root-cut legs on average, not yet a verdict. It stays a variant in stage cf.
+3. perf/root-upper-dirty is merged to main (knobs off by default). Next (stage cf): on X17, answer at insert again and the parallel state merge (`N42_MERGE_PARALLEL=8`, perf/parallel-state-merge: the 61 ms merge is ~190k accounts cloned from ~270 maps into one 70 MB table, cache-miss bound; eight critical-set threads scatter and sort by bucket, serial insert in bucket order; 22.3 -> 13.5 ms on the bench), each twice.

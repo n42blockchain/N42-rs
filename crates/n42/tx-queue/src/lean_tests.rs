@@ -112,3 +112,28 @@ fn lean_prune_matches_the_per_block_prune() {
         assert_eq!(lean, plain, "offlock={offlock}");
     }
 }
+
+/// The census follows a frame from the inbox to the live index and aside at
+/// a whole take, and counts a re-sent frame refused while it is aside.
+#[test]
+fn the_frame_census_follows_a_frame_from_arrival_to_aside() {
+    let queue: TxQueue<EthPooledTransaction> = TxQueue::new().with_frame_sweep_at_take(true);
+    frame(&queue, sender(1), 0, 4);
+    frame(&queue, sender(2), 0, 4);
+    queue.drain_now();
+    let census = queue.frame_census();
+    assert_eq!((census.live, census.aside, census.pending, census.inserted), (2, 0, 0, 2));
+    let (mut best, plan, _) = queue.frames_for_build_ahead(block_hash(0), 4 * 21_000, SelectMode::Parallel, false);
+    assert_eq!(plan.tx_count(), 4);
+    assert_eq!(best.by_ref().count(), 4);
+    drop(best);
+    let census = queue.frame_census();
+    assert_eq!((census.live, census.aside), (1, 1));
+    // The taken frame again, while it is aside: refused, its id known.
+    let taken = plan.frames[0].id;
+    let who = if taken == frame_id(sender(1), 0) { sender(1) } else { sender(2) };
+    frame(&queue, who, 0, 4);
+    queue.drain_now();
+    let census = queue.frame_census();
+    assert_eq!((census.live, census.aside, census.refused), (1, 1, 1));
+}

@@ -202,6 +202,30 @@ pub fn shards_before_receipts() -> bool {
     *ON.get_or_init(|| std::env::var("N42_SHARDS_BEFORE_RECEIPTS").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `N42_CHILD_ON_OUTPUT=1` (off by default, read once;
+/// docs/AFTER_MERGE_CUT.md lever 2): the child build opens on its parent's
+/// output -- the frozen shards and the residual -- the moment they exist,
+/// instead of after the parent's receipts. With `N42_FREEZE_AFTER_SEAL=1`
+/// the freeze has ended ~0.2 ms after the seal (`seal_to_frozen_us`), so the
+/// 9-10 ms between the parent's seal and `shards_ready` is not the frozen
+/// set: it is the receipts job the graft's scope joins (~200k receipts
+/// built from the slots on the behind pool). The child reads none of the
+/// receipts (`direct_build`'s
+/// `a_sharded_parent_opens_the_same_with_or_without_its_receipts`), so they
+/// are built on a thread of their own and joined beside the QMDB root, as
+/// [`shards_before_receipts`] does; on top of that, the pulled set shared
+/// with that thread is freed off the builder's path. The shards and the
+/// residual are published immutable (an `Arc` each, never written after the
+/// filing), so the child's reads are the reads it made on them before.
+pub fn child_on_output() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("N42_CHILD_ON_OUTPUT").is_ok_and(|v| v.trim() == "1");
+        tracing::info!(target: "payload_builder", child_on_output = on, "N42_CHILD_ON_OUTPUT");
+        on
+    })
+}
+
 /// The early merge's pool (`n42-merge-*`, `N42_MERGE_POOL_THREADS`, 16 by
 /// default): not the build pool (the child's execution runs there while the
 /// parent merges) and not the freeze's. `None` when no pool could be made;

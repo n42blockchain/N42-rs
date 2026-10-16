@@ -1582,6 +1582,7 @@ where
     // The parent's hand-off hold (`N42_HANDOFF_DONE_FIRST` runs it after
     // the signal this build waited on), with its eviction's free.
     let (handoff_hold_us, evict_free_us) = crate::frame_blocks::take_handoff_hold();
+    let (handoff_hold_lock_us, handoff_hold_locked_us) = crate::frame_blocks::take_handoff_hold_lock();
     // `start_best_ms` split: the queue's frame take opening (lock, build
     // start), the plan (the frames checked and taken), the ordinary walk's
     // opening, and the rest (the hand-off above is its own key).
@@ -4452,6 +4453,8 @@ where
                     start_handoff_ms,
                     handoff_hold_us,
                     evict_free_us,
+                    handoff_hold_lock_us,
+                    handoff_hold_locked_us,
                     // Of `start_best_ms` (`frame_blocks::SelectTimes`).
                     start_select_ms,
                     start_walk_ms,

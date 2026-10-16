@@ -1976,6 +1976,13 @@ where
     let mut gap_after_exec_ms = 0u64;
     let mut gap_before_seal_ms = 0u64;
     let mut index_ms = 0u64;
+    // The freeze's own wall, us (`index_ms` in microseconds; the one set on
+    // this build's output, inline or on its own thread).
+    let mut freeze_us = 0u64;
+    // The graft scope's join of the receipts job behind the seal, us: what
+    // the shards' filing waits for when the receipts are built in the scope
+    // (`N42_CHILD_ON_OUTPUT` moves them off it).
+    let mut scope_receipts_wait_us = 0u64;
     // `N42_FREEZE_AFTER_SEAL=1`: whether the freeze ran beside the seal, when
     // it ended, and how long its join waited for it (us).
     let mut freeze_late_used = false;
@@ -2032,6 +2039,12 @@ where
     // transfer keys, kept past the step's scope and freed off the path after
     // the shards are filed.
     let mut pulled_keep: Option<Box<dyn Send>> = None;
+    // `N42_CHILD_ON_OUTPUT=1`: the builder's reference to the pulled set it
+    // shares with the late receipts' thread, freed off the path with the
+    // give-backs: whichever reference drops last frees 200k pooled
+    // transactions (6.9-7.6 ms, docs/SEALED_AT_FLOOR.md), and it must not be
+    // this thread's before the shards are filed.
+    let mut pulled_shared_keep: Option<Box<dyn Send>> = None;
     // Of the batches' start: the hook before the batches whole (the
     // deferred state's open, `state_wait_us`, and the pre-execution changes
     // after it, `state_pre_changes_us`), us.
@@ -2564,6 +2577,7 @@ where
                     };
                     let index_us = freeze_at.elapsed().as_micros() as u64;
                     index_ms = index_us / 1_000;
+                    freeze_us = index_us;
                     freeze_late_used = freezing.is_some();
                     if let Some(shards) = sharded_out.as_ref() {
                         out_shards = shards.shard_count();
@@ -2578,6 +2592,7 @@ where
                         ($joined:expr) => {{
                             let (frozen, took, ended): (crate::output_shards::FrozenShards, std::time::Duration, std::time::Instant) = $joined;
                             index_ms = took.as_millis() as u64;
+                            freeze_us = took.as_micros() as u64;
                             out_shards = frozen.shard_count();
                             shard_append_ms = frozen.append_ms();
                             shard_fold_ms = frozen.fold_ms();
@@ -2987,7 +3002,10 @@ where
                     // them (`docs/SHARED_EXECUTION_SCOPE.md` 18.7 item 4a):
                     // the child reads the shards, never the receipts.
                     let mut cands_shared: Option<Arc<Vec<_>>> = None;
-                    if receipts_behind && shards_stay && crate::output_shards::shards_before_receipts() {
+                    if receipts_behind
+                        && shards_stay
+                        && (crate::output_shards::shards_before_receipts() || crate::output_shards::child_on_output())
+                    {
                         let shared = Arc::new(std::mem::take(&mut cands));
                         let inputs = Arc::new(std::sync::Mutex::new(Some((std::mem::take(&mut run.slots), Arc::clone(&shared)))));
                         let taken = Arc::clone(&inputs);
@@ -3135,6 +3153,7 @@ where
                         let receipts_wait_at = std::time::Instant::now();
                         let receipts_done = receipts_job.map(|job| job.join());
                         par_receipts_wait_ms = receipts_wait_at.elapsed().as_millis() as u64;
+                        scope_receipts_wait_us = receipts_wait_at.elapsed().as_micros() as u64;
                         (graft, root_done, receipts_done)
                     });
                     par_graft_ms = graft_ms;
@@ -3275,6 +3294,11 @@ where
                     let pulled_now: &[_] = cands_shared.as_deref().map_or(&cands[..], |shared| &shared[..]);
                     for i in run.skipped {
                         deferred.push(Arc::clone(&pulled_now[i]));
+                    }
+                    if crate::output_shards::child_on_output()
+                        && let Some(shared) = cands_shared.take()
+                    {
+                        pulled_shared_keep = Some(Box::new(shared));
                     }
                     // Why each skipped sender's head was refused, so the
                     // give-back below can say it. Handing every skipped
@@ -3561,6 +3585,11 @@ where
                             crate::built_executions::free_boxed_off_path(keep);
                             pulled_drop_us += free_at.elapsed().as_micros() as u64;
                         }
+                        if let Some(keep) = pulled_shared_keep.take() {
+                            let free_at = std::time::Instant::now();
+                            crate::built_executions::free_boxed_off_path(keep);
+                            pulled_drop_us += free_at.elapsed().as_micros() as u64;
+                        }
                     }
                 };
             }
@@ -3661,6 +3690,7 @@ where
                 })?;
                 freeze_join_wait_us += join_at.elapsed().as_micros() as u64;
                 index_ms = took.as_millis() as u64;
+                freeze_us = took.as_micros() as u64;
                 out_shards = frozen.shard_count();
                 shard_append_ms = frozen.append_ms();
                 shard_fold_ms = frozen.fold_ms();
@@ -4729,6 +4759,14 @@ where
                     freeze_pool_own = crate::parallel_transfer::freeze_pool_own(),
                     seal_to_frozen_us = crate::fields_at_seal::us_between(sealed_instant, freeze_ended_at),
                     freeze_join_wait_us,
+                    // The freeze's own wall (us), the graft scope's wait for
+                    // the receipts job (us), and, `N42_CHILD_ON_OUTPUT`, when
+                    // the child could open on this block's output: the shards
+                    // and the residual filed, ms from the seal.
+                    freeze_us,
+                    scope_receipts_wait_us,
+                    child_on_output = crate::output_shards::child_on_output(),
+                    child_view_ready_ms = crate::fields_at_seal::us_between(sealed_instant, shards_ready_at) / 1_000,
                     // `N42_STATE_AFTER_PULL=1` (plan v6 G3): the parent's state
                     // opened after the pull, prep and partition, and the time
                     // inside that open (0 with the flag off: the open is then

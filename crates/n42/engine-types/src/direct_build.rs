@@ -2433,6 +2433,139 @@ mod tests {
         leader_layers::clear();
     }
 
+    /// `N42_CHILD_ON_OUTPUT` on randomized blocks: a parent filed as the
+    /// graft scope files it today (its receipts and gas in the residual's
+    /// result, i.e. after the receipts job) and filed the moment its shards
+    /// and residual exist (no receipts yet) give the child the same build.
+    /// Each round makes a parent of several batches (disjoint senders,
+    /// overlapping recipients, every other shard left to the freeze), a
+    /// residual over some of the same accounts, files it both ways, opens
+    /// the child on each and runs the same random transfers through both:
+    /// the post-state, the receipts and every read must be equal.
+    #[test]
+    fn a_child_built_on_its_parents_output_before_the_receipts_matches_the_one_built_after() {
+        let _guard = store_lock();
+        leader_layers::clear();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let account = |i: u64| Address::from_word(alloy_primitives::B256::from(U256::from(0x1000 + i)));
+        let coinbase = Address::with_last_byte(0x01);
+        for round in 0..24u64 {
+            let accounts = 24 + next() % 40;
+            let engine_balance = |i: u64| 1_000 + (i * 37) % 500;
+            let engine = || {
+                let m = MockEthProvider::default();
+                for i in 0..accounts {
+                    m.add_account(account(i), ExtendedAccount::new(i % 3, U256::from(engine_balance(i))));
+                }
+                m.add_account(coinbase, ExtendedAccount::new(0, U256::from(1)));
+                m
+            };
+            // The parent's batches: each batch's senders are its own, its
+            // recipients drawn from every account (so several batches credit
+            // some of them: the conflicts the freeze sums).
+            let batch_count = 2 + next() % 5;
+            let mut batches = Vec::new();
+            for b in 0..batch_count {
+                let mut moved: std::collections::BTreeMap<u64, (u64, u64, u64, u64)> = Default::default();
+                let senders: Vec<u64> = (0..accounts).filter(|i| i % batch_count == b).collect();
+                for &from in senders.iter().take(4) {
+                    let to = next() % accounts;
+                    if senders.contains(&to) {
+                        continue;
+                    }
+                    let value = 1 + next() % 50;
+                    let (n, bal) = (from % 3, engine_balance(from));
+                    let e = moved.entry(from).or_insert((n, bal, n, bal));
+                    e.2 += 1;
+                    e.3 -= value;
+                    let (n, bal) = (to % 3, engine_balance(to));
+                    let e = moved.entry(to).or_insert((n, bal, n, bal));
+                    e.3 += value;
+                }
+                let mut builder = BundleState::builder(100 + round..=100 + round);
+                for (i, (on, ob, nn, nb)) in moved {
+                    builder = builder
+                        .state_original_account_info(account(i), info(on, ob))
+                        .state_present_account_info(account(i), info(nn, nb));
+                }
+                batches.push(builder.build());
+            }
+            let residual_of = |number: u64| {
+                BundleState::builder(number..=number)
+                    .state_present_account_info(coinbase, info(0, 1 + round))
+                    .state_present_account_info(account(round % accounts), info(9, 77 + round))
+                    .build()
+            };
+            let open = |number: u64, with_receipts: bool| {
+                let header = Header { number, parent_hash: B256::with_last_byte(0x70), gas_used: 21_000, ..Default::default() };
+                let mut execution = execution_of(&header, residual_of(number));
+                if with_receipts {
+                    let mut output = (*execution.execution_output).clone();
+                    output.result.receipts = vec![n42_tx_types::Receipt {
+                        tx_type: Default::default(),
+                        success: true,
+                        cumulative_gas_used: 21_000,
+                        logs: Vec::new(),
+                    }];
+                    output.result.gas_used = 21_000;
+                    execution.execution_output = Arc::new(output);
+                }
+                let built_hash = execution.block.hash();
+                let sealed = SealedHeader::seal_slow(Header { extra_data: format!("on output {number}").into_bytes().into(), ..header });
+                let mut shards = crate::output_shards::OutputShards::with_index_live(coinbase, 64, 16, true, true);
+                shards.set_live_defer(true, true);
+                for batch in &batches {
+                    shards.add(batch.clone());
+                }
+                crate::built_executions::remember_pending(built_hash, execution.block.clone());
+                crate::built_executions::shards_ready(
+                    built_hash,
+                    crate::built_executions::ShardedParent { residual: execution.execution_output.clone(), shards: Arc::new(shards.freeze()) },
+                );
+                opener_on_sealed_parent_with(Scripted::new(engine()), sealed, built_hash, 1)().expect("the child opens")
+            };
+            let after = open(2 * (1_000 + round), true);
+            let before = open(2 * (1_000 + round) + 1, false);
+            let read = |state: &StateProviderBox, x: Address| state.basic_account(&x).expect("read").map(|x| (x.nonce, x.balance));
+            for i in 0..accounts + 2 {
+                assert_eq!(read(&after, account(i)), read(&before, account(i)), "round {round}: account {i}");
+            }
+            assert_eq!(read(&after, coinbase), read(&before, coinbase), "round {round}: coinbase");
+            // The child's own transfers, run through each opened state.
+            let transfers: Vec<(u64, u64, u64)> =
+                (0..32).map(|_| (next() % accounts, next() % (accounts + 2), next() % 2_000)).collect();
+            let child = |state: &StateProviderBox| {
+                let mut post: std::collections::BTreeMap<Address, (u64, U256)> = Default::default();
+                let mut receipts = Vec::new();
+                let mut gas = 0u64;
+                for &(from, to, value) in &transfers {
+                    let (from, to, value) = (account(from), account(to), U256::from(value));
+                    let mut get = |x: Address, post: &std::collections::BTreeMap<Address, (u64, U256)>| {
+                        post.get(&x).copied().unwrap_or_else(|| read(state, x).unwrap_or((0, U256::ZERO)))
+                    };
+                    let (fnonce, fbal) = get(from, &post);
+                    let success = fbal >= value;
+                    if success {
+                        post.insert(from, (fnonce + 1, fbal - value));
+                        let (tnonce, tbal) = get(to, &post);
+                        post.insert(to, (tnonce, tbal + value));
+                    }
+                    gas += 21_000;
+                    receipts.push((success, gas));
+                }
+                (post, receipts)
+            };
+            assert_eq!(child(&after), child(&before), "round {round}: the child's post-state and receipts");
+        }
+        leader_layers::clear();
+    }
+
     /// `N42_OUTPUT_INCREMENTAL`: the shards filed on the early output (before
     /// the freeze) open the child to the state the frozen set opens it to --
     /// a conflicting recipient two batches credited, a batch left to the

@@ -1579,6 +1579,9 @@ where
     let frame_plan = crate::frame_blocks::take_plan();
     let start_handoff_us = HANDOFF_WAIT_US.with(std::cell::Cell::get);
     let start_handoff_ms = start_handoff_us / 1_000;
+    // The parent's hand-off hold (`N42_HANDOFF_DONE_FIRST` runs it after
+    // the signal this build waited on), with its eviction's free.
+    let (handoff_hold_us, evict_free_us) = crate::frame_blocks::take_handoff_hold();
     // `start_best_ms` split: the queue's frame take opening (lock, build
     // start), the plan (the frames checked and taken), the ordinary walk's
     // opening, and the rest (the hand-off above is its own key).
@@ -4447,6 +4450,8 @@ where
                     // the puller's thread, `cons.prepare`, and the rest.
                     start_best_ms,
                     start_handoff_ms,
+                    handoff_hold_us,
+                    evict_free_us,
                     // Of `start_best_ms` (`frame_blocks::SelectTimes`).
                     start_select_ms,
                     start_walk_ms,

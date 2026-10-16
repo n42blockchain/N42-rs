@@ -667,6 +667,24 @@ pub fn seal_at_exec() -> bool {
     *ON.get_or_init(|| std::env::var("N42_SEAL_AT_EXEC").is_ok_and(|v| v == "1"))
 }
 
+/// `N42_SHARDS_READY_FIRST=1` (docs/SEALED_AT_FLOOR.md candidate 1): on a
+/// block sealed at the parallel step's end (`N42_SEAL_AT_EXEC=1`), the
+/// shards are filed (`shards_ready`, what the child's open waits for) before
+/// the lookahead and deferred candidates are given back to the queue and the
+/// puller is dropped, and the pulled set (with the step's warm layer and
+/// transfer keys) is freed on the `n42-built-free` thread after them instead
+/// of at the step's scope end. Nothing that reads the shards reads the queue:
+/// the child's selection precedes its open, and the merge and the root read
+/// only the shards. Off by default; read and logged once.
+pub fn shards_ready_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("N42_SHARDS_READY_FIRST").is_ok_and(|v| v == "1");
+        tracing::info!(target: "payload_builder", shards_ready_first = on, "N42_SHARDS_READY_FIRST");
+        on
+    })
+}
+
 /// `N42_SEAL_ON_COUNTERS=1` (`docs/SHARED_EXECUTION_SCOPE.md` 16.4 item 1;
 /// `N42_SEAL_ON_COUNTS=1` is the same switch): with `N42_SEAL_AT_EXEC=1` and
 /// the body made in the prep, every batch counts its transfers, their gas and
@@ -1967,6 +1985,10 @@ where
     // walk's own give-back). The rest of that road is `par_to_finish_us`.
     let mut par_end_at: Option<std::time::Instant> = None;
     let mut pulled_drop_us = 0u64;
+    // `N42_SHARDS_READY_FIRST=1`: the step's pulled set, warm layer and
+    // transfer keys, kept past the step's scope and freed off the path after
+    // the shards are filed.
+    let mut pulled_keep: Option<Box<dyn Send>> = None;
     // Of the batches' start: the hook before the batches whole (the
     // deferred state's open, `state_wait_us`, and the pre-execution changes
     // after it, `state_pre_changes_us`), us.
@@ -2313,7 +2335,7 @@ where
         };
         if !all_transfers {
             open_deferred_state!()?;
-            for tx in cands.into_iter().rev() {
+            for tx in std::mem::take(&mut cands).into_iter().rev() {
                 lookahead.push_front(tx);
             }
         } else {
@@ -3356,7 +3378,7 @@ where
                     static DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let declined = DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     tracing::info!(target: "payload_builder", %why, candidates = cands.len(), declined, "parallel build declined; building serially");
-                    for tx in cands.into_iter().rev() {
+                    for tx in std::mem::take(&mut cands).into_iter().rev() {
                         lookahead.push_front(tx);
                     }
                 }
@@ -3367,6 +3389,9 @@ where
             par_behind_seal_us = sealed_instant.map_or(0, |at| at.elapsed().as_micros() as u64);
         }
         par_end_at = Some(std::time::Instant::now());
+        if sealed_ahead.is_some() && shards_ready_first() {
+            pulled_keep = Some(Box::new((std::mem::take(&mut cands), warm, keys)));
+        }
     }
     // The step's scope has dropped: the pulled set among it.
     pulled_drop_us += par_end_at.map_or(0, |at| at.elapsed().as_micros() as u64);
@@ -3460,21 +3485,46 @@ where
             let seal_at = std::time::Instant::now();
             // Whatever was taken ahead and not built goes back to the queue,
             // as the loop's end does; the puller stops at its next batch.
-            let giveback_at = std::time::Instant::now();
-            for pool_tx in lookahead.into_iter().rev() {
-                refuse!(
-                    &pool_tx,
-                    InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit)
-                );
+            // Then the puller is dropped (the walk's own give-back) and,
+            // under `N42_SHARDS_READY_FIRST`, the kept pulled set freed off
+            // the path. By default here, before the seal or the finish;
+            // with `N42_SHARDS_READY_FIRST=1` on a block sealed at the
+            // step's end, right after the shards are filed (or the
+            // `StateReady` of a block without shards), and in any case
+            // before this branch returns.
+            let mut give_backs = Some((lookahead, deferred));
+            let mut giveback_us = 0u64;
+            let mut puller_drop_us = 0u64;
+            macro_rules! give_back_now {
+                () => {
+                    if let Some((lookahead, deferred)) = give_backs.take() {
+                        let giveback_at = std::time::Instant::now();
+                        for pool_tx in lookahead.into_iter().rev() {
+                            refuse!(
+                                &pool_tx,
+                                InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit)
+                            );
+                        }
+                        for pool_tx in deferred.into_iter().rev() {
+                            let err = deferred_refusal!(skipped_heads, pool_tx);
+                            refuse!(&pool_tx, err);
+                        }
+                        giveback_us = giveback_at.elapsed().as_micros() as u64;
+                        let puller_drop_at = std::time::Instant::now();
+                        drop(pulled.take());
+                        puller_drop_us = puller_drop_at.elapsed().as_micros() as u64;
+                        if let Some(keep) = pulled_keep.take() {
+                            let free_at = std::time::Instant::now();
+                            crate::built_executions::free_boxed_off_path(keep);
+                            pulled_drop_us += free_at.elapsed().as_micros() as u64;
+                        }
+                    }
+                };
             }
-            for pool_tx in deferred.into_iter().rev() {
-                let err = deferred_refusal!(skipped_heads, pool_tx);
-                refuse!(&pool_tx, err);
+            let shards_first = sealed_ahead.is_some() && shards_ready_first();
+            if !shards_first {
+                give_back_now!();
             }
-            let giveback_us = giveback_at.elapsed().as_micros() as u64;
-            let puller_drop_at = std::time::Instant::now();
-            drop(pulled.take());
-            let puller_drop_us = puller_drop_at.elapsed().as_micros() as u64;
             let seal_at_exec_used = sealed_ahead.is_some();
             let (payload, recovered, block_hash, block_number, root_ms, fields_ms, sealed_ms, sealed_at_ms, parent_sealed) =
                 match sealed_ahead.take() {
@@ -3560,6 +3610,7 @@ where
                         },
                     );
                     early_ready = Some((finish_at.elapsed().as_millis() as u64, std::time::Instant::now()));
+                    give_back_now!();
                 }
                 let join_at = std::time::Instant::now();
                 let (mut frozen, took, ended) = handle.join().map_err(|_| {
@@ -3712,6 +3763,7 @@ where
             };
             crate::built_executions::state_ready(block_hash, provisional);
             state_ready_ms = finish_at.elapsed().as_millis() as u64;
+            give_back_now!();
             rename_parent()?;
             let roots_at = std::time::Instant::now();
             let bundle_ref = &execution_output.state;
@@ -3793,6 +3845,7 @@ where
                     shards_ready_at = Some(std::time::Instant::now());
                 }
             }
+            give_back_now!();
             let shard_reverts = std::mem::take(&mut par_reverts);
             // `N42_MERGE_AT_SHARDS_READY=1`: every input of the merge is in
             // hand now (the shards frozen, the residual taken, the graft's
@@ -4647,7 +4700,22 @@ where
             }
             Ok(())
             };
-            return match behind_the_seal() {
+            let finished = behind_the_seal();
+            // A finish that failed before the shards were filed still gives
+            // back what it took.
+            let late = give_backs.is_some();
+            give_back_now!();
+            if late {
+                tracing::debug!(
+                    target: "payload_builder",
+                    number = block_number,
+                    giveback_us,
+                    puller_drop_us,
+                    pulled_drop_us,
+                    "the give-backs ran after a finish that ended before the shards were filed"
+                );
+            }
+            return match finished {
                 Ok(()) => {
                     let _ = cons.set_cached_reads(block_hash, cached_reads.clone());
                     Ok(BuildOutcome::Better { payload, cached_reads })

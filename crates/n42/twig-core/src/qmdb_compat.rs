@@ -1179,6 +1179,10 @@ pub struct ApplyPhases {
     pub rehash_us: u64,
     /// The upper tree's refresh and the root read after the rehash.
     pub root_us: u64,
+    /// Twigs in the tree when the root was read.
+    pub twigs: usize,
+    /// Twigs the block marked for a rehash (leaves or bits).
+    pub dirty_twigs: usize,
     /// Page faults the applying thread took before the writes: the sort,
     /// the leaf hashes and lookups, the undo, the reserves, the retirement
     /// (the worker pool's own faults are not counted).
@@ -2378,6 +2382,8 @@ impl QmdbCompatTree {
             rehash_dirty(&mut self.twigs, &dirty);
             phases.rehash_us = at.elapsed().as_micros() as u64;
         }
+        phases.twigs = self.twigs.len();
+        phases.dirty_twigs = dirty.iter().filter(|mark| **mark != 0).count();
         let at = std::time::Instant::now();
         let root = self.root();
         phases.root_us = at.elapsed().as_micros() as u64;

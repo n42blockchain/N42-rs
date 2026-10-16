@@ -6,7 +6,7 @@ blocks, E=1; both 400.0M, drain 4.455 / 4.449M/s; docs/EARLY_START_THIN_BLOCKS.m
 `own block imported by header` (the answer), canonical and hand-off lines; on every validator `proposal sent`, `send kind`
 (proposal, prepare_qc), `block committed!`, `recv kind="proposal"`, `compact block body received`, `imported a block`,
 `import starting`, the import-gated vote lines and `vote log sync was slow`. Blocks are joined by hash (Ma's views run one
-ahead of the numbers, Mb's do not). Scripts (outside the repo): `/home/n42/.claude/jobs/03ef7830/tmp/vbg/`
+ahead of the numbers, Mb's do not). Scripts (outside the repo, in the analysis job's `tmp/vbg/`):
 (`parse.py`, `ana.py`, `anat.py`, `cls.py`, `L.py`, `sim.py`, `prop.py`).
 
 ## 1. The answer in brief

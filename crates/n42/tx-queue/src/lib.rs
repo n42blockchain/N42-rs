@@ -216,6 +216,18 @@ impl<T: PoolTransaction> Lane<T> {
         }
     }
 
+    /// An own block holding this nonce was replaced before the chain settled
+    /// it: the build-side watermark drops below it, the chain's does not
+    /// ([`TxQueue::release_own_blocks_from`]).
+    fn unmine_unconfirmed(&mut self, nonce: u64) {
+        if self.chain_mined(nonce) {
+            return;
+        }
+        if self.mined.is_some_and(|mined| mined >= nonce) {
+            self.mined = nonce.checked_sub(1).max(self.chain_mined);
+        }
+    }
+
     /// Whether this lane's park is still holding at build `build`.
     ///
     /// A pure test: every park is ended through [`Inner::unpark`], which is
@@ -642,6 +654,23 @@ fn free_off_path(garbage: Freeable) {
     {
         drop(garbage);
     }
+}
+
+/// `N42_BUILD_AHEAD_GATE=seal` (two-ahead) on the execution layer: a build
+/// starting at a height gives back the own blocks held at that height or
+/// above ([`TxQueue::release_own_blocks_from`]). Off by default.
+///
+/// Why only there: under two-ahead the build of N+1 starts on sealed N before
+/// N is proposed, and that start holds N's transactions. When N is then not
+/// proposed (a tenure end, a timeout) the leader builds the height again on
+/// another parent, and N's transactions stayed held until the chain settled
+/// the height -- out of the replacement's reach, then offered again as "an own
+/// block at this height was not the one committed" (stage w's block 1024).
+/// Under the default gate an own block is held only once its proposal is
+/// handed off, so a build at its height replacing it is a view change.
+pub fn release_replaced_own_blocks() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILD_AHEAD_GATE").is_ok_and(|v| v.trim() == "seal"))
 }
 
 /// Whether an own block's hand-off signals the next build before holding
@@ -3402,6 +3431,45 @@ impl<T: PoolTransaction> TxQueue<T> {
         // watermark from what the chain actually mined, so lowering it here
         // cannot re-admit anything the chain holds.
         inner.give_back_unmined(back).offered
+    }
+
+    /// A build is starting at height `number`: every own block held at that
+    /// height or above stands on a branch this build replaces, so its
+    /// transactions go back to the lanes now instead of when the chain
+    /// settles the height ([`release_replaced_own_blocks`]). Returns how many
+    /// were offered again; a released block is gone from the holds, so the
+    /// settle of its height later gives nothing back a second time.
+    ///
+    /// Only the build-side watermark is lowered for them: a nonce a canonical
+    /// block mined stays filtered, so a release can never re-admit what the
+    /// chain holds. If the released block is committed after all, the
+    /// canonical prune removes its transactions from the lanes as for any
+    /// foreign block.
+    pub fn release_own_blocks_from(&self, number: u64) -> usize {
+        let mut inner = self.lock_inner_quiet();
+        if inner.held.iter().all(|(held_number, _, _)| *held_number < number) {
+            return 0;
+        }
+        let mut back = Vec::new();
+        let mut kept = VecDeque::with_capacity(inner.held.len());
+        for (held_number, held_hash, transactions) in std::mem::take(&mut inner.held) {
+            if held_number >= number {
+                back.extend(transactions);
+            } else {
+                kept.push_back((held_number, held_hash, transactions));
+            }
+        }
+        inner.held = kept;
+        if back.is_empty() {
+            return 0;
+        }
+        inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
+        for valid in &back {
+            if let Some(lane) = inner.lanes.get_mut(&valid.sender()) {
+                lane.unmine_unconfirmed(valid.nonce());
+            }
+        }
+        inner.give_back(back).offered
     }
 
     /// Forgets the transactions the build on `parent` took that a block has

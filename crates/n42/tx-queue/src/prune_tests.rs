@@ -508,3 +508,60 @@ fn bench_drain() {
         );
     }
 }
+
+/// Two-ahead's orphan (`N42_BUILD_AHEAD_GATE=seal`): an own block held at a
+/// height that a new build at that height replaces gives its transactions
+/// back at once, exactly once -- the settle of the height afterwards gives
+/// nothing back again (no "not the one committed"), and what the committed
+/// block carried is pruned as for any block.
+#[test]
+fn a_replaced_own_block_is_released_once_and_its_height_settles_clean() {
+    let (queue, rounds) = deep_queue(20, 2, 50);
+    let (block, _) = &rounds[0];
+    let held = queue.remove_mined_batch_collecting(block.iter().copied());
+    assert_eq!(held.len(), 1_000);
+    queue.hold_own_block(9, B256::repeat_byte(0x90), held);
+    assert_eq!(queue.len(), 1_000);
+    // A build at the next height replaces nothing.
+    assert_eq!(queue.release_own_blocks_from(10), 0);
+    assert_eq!(queue.len(), 1_000);
+    // A build at its own height replaces it: everything comes back, in
+    // nonce order, offered from nonce 0.
+    assert_eq!(queue.release_own_blocks_from(9), 1_000);
+    assert_eq!(queue.len(), 2_000);
+    let from: HashMap<Address, u64> = (0..20).map(|s| (sender(s), 0)).collect();
+    let mut all: Vec<(Address, u64)> = block.clone();
+    all.extend(rounds[1].0.iter().copied());
+    assert_offered(&offered(&queue, 0x40), &from, &all);
+    // A second release finds nothing: no duplicate give-back.
+    assert_eq!(queue.release_own_blocks_from(9), 0);
+    // The replacement is committed at 9 carrying the first ten nonces of
+    // every sender: the settle gives nothing back, the prune removes them.
+    let carried: Vec<(Address, u64)> = block.iter().filter(|(_, n)| *n < 10).copied().collect();
+    let (back, _) = queue.prune_block(9, B256::repeat_byte(0x91), &carried, &[]);
+    assert_eq!(back, 0, "a released block is not given back a second time by its height's settle");
+    let from: HashMap<Address, u64> = (0..20).map(|s| (sender(s), 10)).collect();
+    let rest: Vec<(Address, u64)> = all.iter().filter(|(_, n)| *n >= 10).copied().collect();
+    assert_offered(&offered(&queue, 0x41), &from, &rest);
+    assert_eq!(queue.take_drops().counts[Dropped::HeldBehind.index()], 0);
+}
+
+/// A release never re-admits a nonce the chain mined: a held own block whose
+/// transactions a canonical block at a lower height already carried (the
+/// orphan's branch and the chain overlap) gives back only the rest.
+#[test]
+fn a_release_keeps_what_the_chain_mined_filtered() {
+    let (queue, rounds) = deep_queue(20, 2, 50);
+    let (block, _) = &rounds[0];
+    let held = queue.remove_mined_batch_collecting(block.iter().copied());
+    queue.hold_own_block(9, B256::repeat_byte(0x90), held);
+    // The chain mines nonces 0..5 of every sender at 8 (another branch).
+    let mined: Vec<(Address, u64)> = block.iter().filter(|(_, n)| *n < 5).copied().collect();
+    let (back, _) = queue.prune_block(8, B256::repeat_byte(0x80), &mined, &[]);
+    assert_eq!(back, 0);
+    assert_eq!(queue.release_own_blocks_from(9), 900, "nonces 5..50 of twenty senders");
+    let from: HashMap<Address, u64> = (0..20).map(|s| (sender(s), 5)).collect();
+    let mut rest: Vec<(Address, u64)> = block.iter().filter(|(_, n)| *n >= 5).copied().collect();
+    rest.extend(rounds[1].0.iter().copied());
+    assert_offered(&offered(&queue, 0x42), &from, &rest);
+}

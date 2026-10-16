@@ -199,7 +199,7 @@ fn free_off_path(evicted: Vec<Entry>) {
 /// build may be the last holder of a 200k-transaction body, whose free was
 /// 5-16 ms of the own-block hand-off's `clone_ms` when it ran there (loop351
 /// af, `moved_body=true` blocks).
-fn free_boxed_off_path(evicted: Box<dyn Send>) {
+pub(crate) fn free_boxed_off_path(evicted: Box<dyn Send>) {
     static FREE: OnceLock<Option<Mutex<std::sync::mpsc::SyncSender<Box<dyn Send>>>>> = OnceLock::new();
     let sender = FREE.get_or_init(|| {
         let (send, receive) = std::sync::mpsc::sync_channel::<Box<dyn Send>>(2);

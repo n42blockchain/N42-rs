@@ -892,6 +892,42 @@ fn the_merge_on_its_own_pool_equals_the_serial_merge() {
     }
 }
 
+/// `N42_MERGE_PARALLEL`: the account half of the merge built in parts (on
+/// scoped threads, the inserts in bucket order) equals the serial one and,
+/// with the late revert set put in, the direct graft -- in every fold mode,
+/// at 1, 16 and 64 shards, at 1-8 parts -- and its QMDB operations and
+/// hashed post-state are the serial merge's.
+#[test]
+fn the_merge_in_parts_equals_the_serial_merge() {
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    for count in [1, 16, 64] {
+        for mode in MODES {
+            let shards = shards_of(bundles.clone(), count, mode);
+            let (shards, residual) = sharded_parts(&db, shards);
+            let (serial, _) = shards.merged_state_first_split(&residual, 0);
+            let whole = shards.merged(&residual);
+            assert_eq!(serial.state, whole.state, "{count} shards, index {mode}: the serial half");
+            for parts in [1, 2, 5, 8] {
+                let label = format!("{count} shards, index {mode}, {parts} parts");
+                let (parallel, split) = shards.merged_state_first_split(&residual, parts);
+                assert_eq!(split.parts as usize, parts, "{label}");
+                assert_eq!(split.fill_us, 0, "{label}: no serial fill");
+                assert_eq!(parallel, serial, "{label}: against the serial half");
+                for prague in [false, true] {
+                    assert_eq!(
+                        n42_qmdb_reth::sorted_operations_from_execution(&parallel, prague),
+                        n42_qmdb_reth::sorted_operations_from_execution(&serial, prague),
+                        "{label}: QMDB operations, prague {prague}"
+                    );
+                }
+                let (a, b): (Vec<_>, Vec<_>) = (parallel.state.iter().collect(), serial.state.iter().collect());
+                assert_eq!(hashed_post_state_of(&a), hashed_post_state_of(&b), "{label}: hashed post-state");
+            }
+        }
+    }
+}
+
 /// `N42_FREEZE_SPLIT` (`docs/SHARED_EXECUTION_SCOPE.md` 18.7 item 4b): the
 /// live freeze's shard work split over two, four and eight tasks by address
 /// sub-range is the single task's: every address reads the same account

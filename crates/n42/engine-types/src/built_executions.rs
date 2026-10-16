@@ -436,11 +436,20 @@ pub fn advance_timing(built_hash: B256) -> AdvanceTiming {
     timings.iter().find(|(hash, _)| *hash == built_hash).map(|(_, timing)| *timing).unwrap_or_default()
 }
 
+/// `N42_ADVANCE_FREE_OFFLOCK=1` (default off): [`advance`] takes the
+/// replaced output shards out under the store's lock and frees them after
+/// it is released, off the caller's path.
+fn advance_free_offlock() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_ADVANCE_FREE_OFFLOCK").is_ok_and(|v| v == "1"))
+}
+
 fn advance(built_hash: B256, stage: Stage, execution: BuiltExecution) {
     let (store, advanced) = store();
     let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
     let locked_at = std::time::Instant::now();
     let mut timing = AdvanceTiming::default();
+    let mut replaced: Option<ShardedParent> = None;
     match store.iter_mut().find(|(hash, _)| *hash == built_hash) {
         Some((_, entry)) => {
             entry.stage = stage;
@@ -448,9 +457,13 @@ fn advance(built_hash: B256, stage: Stage, execution: BuiltExecution) {
             if let Some(shards) = entry.shards.as_ref() {
                 timing.free_last = u64::from(Arc::strong_count(&shards.shards) == 1);
             }
-            let free_at = std::time::Instant::now();
-            entry.shards = None;
-            timing.free_us = free_at.elapsed().as_micros() as u64;
+            if advance_free_offlock() {
+                replaced = entry.shards.take();
+            } else {
+                let free_at = std::time::Instant::now();
+                entry.shards = None;
+                timing.free_us = free_at.elapsed().as_micros() as u64;
+            }
         }
         // Evicted (a finish that ran longer than `keep()` builds), or never
         // pending: not re-filed -- that would evict a live build the engine
@@ -461,6 +474,14 @@ fn advance(built_hash: B256, stage: Stage, execution: BuiltExecution) {
     }
     drop(store);
     timing.lock_us = locked_at.elapsed().as_micros() as u64;
+    // `N42_ADVANCE_FREE_OFFLOCK`: the replaced shard set, often its last
+    // holder, is freed on the `n42-built-free` thread (inline if that thread
+    // is behind or missing), outside the store's lock.
+    if let Some(replaced) = replaced {
+        let free_at = std::time::Instant::now();
+        free_boxed_off_path(Box::new(replaced));
+        timing.free_us = free_at.elapsed().as_micros() as u64;
+    }
     record_advance_timing(built_hash, timing);
     // A copy on the handed list (taken before it was complete) is refreshed.
     if stage == Stage::Complete {

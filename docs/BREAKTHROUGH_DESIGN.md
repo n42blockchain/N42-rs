@@ -4324,3 +4324,20 @@ Stage cj (wt-main, tree d3553ba8d + fix/build-ahead-two-handover 3889f6921; 2,47
 1. **Two ahead is correct now and slow**: no orphan left behind at any handover (the 1024 race is gone), and the drain rate is 6-7% under the controls -- the second build in flight costs the first one its cores (10.153: sealed_at 34 -> 38-42). Parked for good on this box; the orphan fix stays in main as correctness.
 2. **The five-block window** reads 4.561 / 4.654 against 4.655 / 4.717: not a gain. Both structural levers that the models rated at -3.3..-3.7 ms are measured negative or flat (10.149, 10.153, here).
 3. **Where 5M stands.** X17, storm-free, reads 4.60-4.75M/s with records at round 424.0M and windows 4.747 / 4.800 / 4.753M. Its mean proposal gap is 42.3-43.5 ms against the 40.0 the goal needs; every remaining single cut is worth <=1.5 ms (docs/LONG_GAP_TAIL.md, docs/AFTER_MERGE_CUT.md), three floors sit within 3 ms of one another, and the two structural levers lose on this box. What is left is design work -- carried depth 3 with the index overlay (docs/ROOT_PIPELINE_DESIGN.md C1 stage 2 and stage 4), or more cores -- or accepting 4.7M/s as the seven-node, single-box figure for this chain shape.
+
+### 10.160 loop351 stage ck — block size 200k / 300k / 400k on X17: the gap grows with the block, so bigger blocks buy nothing; the "fixed part" of the gap is ~0, not 12-18 ms
+
+Stage ck (wt-main, tree 32e1e1084 = the cj tree + `N42_STATE_READY_WITHOUT_MERGE` (off); 2,477 tests pass), 600M set, X17: two 200k/30 ms controls, two legs at 300k/45 ms (`F7_GASCEIL_ARG=6300000000`), two at 400k/60 ms (`8400000000`); `--gasceil` sets the tier's gas limit in the genesis. Direction A of docs/ARCHITECTURE_TOWARD_5M.md.
+
+| leg | tier / pacing | w1 | w2 | w3 | round | txs/block | cycle |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| X11T16Ba | 200k / 30 | 4.491 | 4.513 | 4.593 | 407.9M | 200k | 44-45 ms |
+| X11T16B3a | 300k / 45 | 4.399 | 4.402 | 4.344 | 394.3M | 296k | 67-68 ms |
+| X11T16B4a | 400k / 60 | 4.374 | 4.464 | 4.451 | 398.7M | 377k | 83-86 ms |
+| X11T16Bb | 200k / 30 | 4.420 | 4.540 | 4.620 | 407.4M | 200k | 43-45 ms |
+| X11T16B3b | 300k / 45 | 4.488 | 4.496 | 4.285 | 398.1M | 295k | 66-70 ms |
+| X11T16B4b | 400k / 60 | 4.527 | 4.539 | 4.565 | 408.9M | 372k | 81-85 ms |
+
+1. **The cycle is proportional to the block**: 44.5 ms at 200k, 67 at 300k, 84 at 400k -- about 0.21 ms per thousand transactions with no constant term worth the name. The roadmap's bet was that 12-18 ms of the 42.5 ms gap were fixed per round (consensus, hand-off, pacing) so that fewer, larger rounds would carry more transactions per second; the measurement says the gap is made of per-transaction work (build, root, merge, answer path all scale with the block) and the rounds at 300k and 400k read 4.29-4.57M/s, the same as 200k's 4.42-4.62. Direction A is closed on this box; 200k/30 ms stays the tier.
+2. The 400k legs ran clean (verify pass, full blocks at 93-94% of the tier: the gas ceiling is met by ~375k transfers of 21,000 + the per-block overhead), so the tier is not what limits either.
+3. Next (stage cl): direction B's first step -- `N42_STATE_READY_WITHOUT_MERGE=1` (with `N42_ANSWER_AT_INSERT=1`): the answer leaves at the root's end instead of after the 61 ms merge; expected L 178 -> 70-85 ms, blocks in flight 4.2 -> ~2, gap 43.4 -> 41-42; measured against X17 and X17 + answer-at-insert.

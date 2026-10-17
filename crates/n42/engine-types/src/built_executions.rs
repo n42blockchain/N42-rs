@@ -426,6 +426,72 @@ pub fn answerable_at(built_hash: B256) -> Option<std::time::Instant> {
     table.iter().rev().find(|(hash, _)| *hash == built_hash).map(|(_, at)| *at)
 }
 
+/// Parses `N42_STATE_READY_WITHOUT_MERGE`: on only for `1`.
+pub fn state_ready_without_merge_from(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+/// `N42_STATE_READY_WITHOUT_MERGE=1` (default off, read once): an own block's
+/// header-only import is answered once the build's fields are published
+/// ([`find_answerable`]), without waiting for the merged post-state map;
+/// the merge runs behind the answer unchanged, and the executed insert goes
+/// to the engine when the map lands (docs/DELTA_LOG_DESIGN.md stage 1).
+/// Takes effect only with `N42_ANSWER_AT_INSERT=1`, whose deferred
+/// `newPayload` carries the insert's outcome.
+pub fn state_ready_without_merge() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = state_ready_without_merge_from(std::env::var("N42_STATE_READY_WITHOUT_MERGE").ok().as_deref());
+        tracing::info!(target: "n42.built_executions", state_ready_without_merge = on, "N42_STATE_READY_WITHOUT_MERGE");
+        on
+    })
+}
+
+/// The kept build matching these fields once its import can be answered:
+/// its fields published ([`answerable`]) or `Complete`, waited for up to
+/// [`WAIT`]. Gives its builder hash and its block; the build stays in the
+/// store for the insert that follows when its map lands.
+pub fn find_answerable(
+    parent: B256,
+    number: u64,
+    state_root: B256,
+    receipts_root: B256,
+    gas_used: u64,
+    transactions_root: Option<B256>,
+) -> Option<(B256, Arc<RecoveredBlock<Block>>)> {
+    let (store, advanced) = store();
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut guard = store.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        let found = guard
+            .iter()
+            .rev()
+            .find(|(_, entry)| matches_block(&entry.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
+            .map(|(hash, entry)| (*hash, entry.stage, Arc::clone(&entry.block)));
+        match found {
+            Some((hash, stage, block)) if stage == Stage::Complete || answerable_at(hash).is_some() => {
+                return Some((hash, block))
+            }
+            Some(_) => {}
+            None => {
+                drop(guard);
+                let handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+                return handed
+                    .iter()
+                    .rev()
+                    .find(|(_, built)| matches_block(&built.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
+                    .map(|(hash, built)| (*hash, Arc::clone(&built.block)));
+            }
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let (g, _) = advanced.wait_timeout(guard, deadline - now).unwrap_or_else(|p| p.into_inner());
+        guard = g;
+    }
+}
+
 /// The pending build is finished.
 pub fn complete(built_hash: B256, execution: BuiltExecution) {
     advance(built_hash, Stage::Complete, execution);
@@ -1363,6 +1429,39 @@ mod tests {
         assert_eq!(stage_of(hash), Some(Stage::Complete));
         assert!(find_by(&h).is_some());
         assert!(Stage::Complete > Stage::StateReady && Stage::StateReady > Stage::Sealed, "stages are ordered");
+    }
+
+    #[test]
+    fn an_answer_is_found_at_the_fields_before_the_merge_completes() {
+        let _guard = lock();
+        let h = header(0x3A, 525);
+        let execution = built(&h);
+        let hash = execution.block.hash();
+        remember_pending(hash, execution.block.clone());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (p, sr, rr, gas) = (h.parent_hash, h.state_root, h.receipts_root, h.gas_used);
+        let waiter = std::thread::spawn(move || {
+            let _ = ready_tx.send(());
+            let found = find_answerable(p, 525, sr, rr, gas, None);
+            (found.map(|(hash, _)| hash), stage_of(hash))
+        });
+        ready_rx.recv().expect("the waiter started");
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(answerable_at(hash).is_none());
+        // The fields published: the answer goes, the merge has not landed.
+        answerable(hash);
+        let (found, stage_then) = waiter.join().unwrap();
+        assert_eq!(found, Some(hash), "found at the fields, not at the deadline");
+        assert_eq!(stage_then, Some(Stage::Sealed), "answered before Complete");
+        assert!(answerable_at(hash).is_some());
+        // Still in the store for the insert that follows the map.
+        assert_eq!(stage_of(hash), Some(Stage::Sealed));
+        complete(hash, execution.clone());
+        let (taken, insert) = take(p, 525, sr, rr, gas, None).expect("the insert takes the completed build");
+        assert_eq!(taken, hash);
+        assert!(Arc::ptr_eq(&insert.execution_output, &execution.execution_output), "the same map the merge filed");
+        assert!(state_ready_without_merge_from(Some("1")));
+        assert!(!state_ready_without_merge_from(None) && !state_ready_without_merge_from(Some("0")));
     }
 
     #[test]

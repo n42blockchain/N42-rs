@@ -320,7 +320,7 @@ import re; m=re.search(r'sum of peaks ([0-9.]+) G', b.getvalue()); print(m[1] if
 VB="N42_VOTE_AGGREGATE_VERIFY=1 N42_VOTE_TRANSPORT=direct N42_GOSSIP_HANDLER_QUEUE=64 N42_GOSSIP_MAX_IHAVE=500"
 S1="N42_CHECK_BEFORE_SLOT=1"; S2="N42_LEADER_LAYERS=6"; S3="N42_MERGE_AT_SHARDS_READY=1 N42_MERGE_POOL_THREADS=16"; S4="N42_SHARDS_BEFORE_RECEIPTS=1 N42_FREEZE_SPLIT=4"; T64="N42_PARALLEL_BUILD_THREADS=64"
 VB="N42_VOTE_AGGREGATE_VERIFY=1 N42_VOTE_TRANSPORT=direct N42_GOSSIP_HANDLER_QUEUE=64 N42_GOSSIP_MAX_IHAVE=500"
-b7() { local tag=$1; shift; mk $tag 7 16 $VB "$@"; }
+b7() { local tag=$1; shift; case "$*" in *X11T16*) [ -n "$X11" ] && [ -n "$D2" ] || { echo "REFUSING $tag: X11/D2 are empty in this stage block (10.158: a stage that forgets the X3..X11/D2 lines runs the WARM configuration)"; exit 2; };; esac; mk $tag 7 16 $VB "$@"; }
 # a configuration is NAME:SUFFIX (S1:, S1:T64, S13:, S13:T64); its flags and its leg tag at a pacing
 cflags() { local f=""; case $1 in S1*) f="$S1";; S13*) f="$S1 $S3";; esac; case $1 in *T64) f="$f $T64";; esac; echo "$f"; }
 ctag() { local c=$1 p=$2; case $c in *T64) echo "${c%T64}P${p}T64";; *) echo "${c}P${p}";; esac; }

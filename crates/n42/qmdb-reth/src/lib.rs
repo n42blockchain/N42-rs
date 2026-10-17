@@ -57,5 +57,5 @@ pub use read_view::{QmdbReadView, ViewLockWaits};
 pub use state_reader::{check_hashed_tables_setting, register_state_reader, QmdbStateReader};
 /// The latest-state reader registry the providers consult (`N42_QMDB_READS`).
 pub use reth_storage_api::n42_state;
-pub use exec_cache::{ExecCacheOnInsert, N42TreeValidator, EXEC_CACHE_ENV};
+pub use exec_cache::{exec_cache_insert_counts, ExecCacheOnInsert, N42TreeValidator, EXEC_CACHE_ENV};
 pub use strategy::{QmdbEngineValidatorBuilder, QmdbStateRootStrategy};

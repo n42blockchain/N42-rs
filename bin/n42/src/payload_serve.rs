@@ -286,6 +286,7 @@ where
     let (parent_hash, number, state_root, receipts_root, gas_used) =
         (v1.parent_hash, v1.block_number, v1.state_root, v1.receipts_root, v1.gas_used);
     let keep = shared && build_on_seal();
+    let lookup_at = std::time::Instant::now();
     // On a thread: a build sealed before its finish is waited for.
     let (built_hash, built) = tokio::task::spawn_blocking(move || {
         if keep {
@@ -296,6 +297,7 @@ where
     })
     .await
     .ok()??;
+    let waits = AnswerWaits::after_take(built_hash, lookup_at);
     let started = std::time::Instant::now();
     let expected_hash = data.payload.block_hash();
     // The sealed header, first from the fields alone: the payload carries
@@ -332,7 +334,36 @@ where
         debug!(target: "n42.payload_serve", number, "a build on the same parent is not this block; importing it the ordinary way");
         return None;
     }
-    hand_off_own_build::<T>(reuse, built_hash, built, sealed_header, converted).await
+    hand_off_own_build::<T>(reuse, built_hash, built, sealed_header, converted, waits).await
+}
+
+/// Who waited on the build's merged post-state map, us
+/// (`docs/DELTA_LOG_DESIGN.md` stage 0): the answer path's lookup beyond the
+/// moment the build's fields were published, and the executed insert's.
+/// While the answer path carries the insert (every road but
+/// `N42_STATE_READY_WITHOUT_MERGE`) the two are the same wait.
+#[derive(Debug, Default, Clone, Copy)]
+struct AnswerWaits {
+    answer_wait_merge_us: u64,
+    insert_wait_merge_us: u64,
+}
+
+impl AnswerWaits {
+    /// The lookup started at `lookup_at` has just returned the build
+    /// `built_hash` at `Complete`: the part of its wait after the fields were
+    /// published was the merge (0 when the fields' time is unknown).
+    fn after_take(built_hash: B256, lookup_at: std::time::Instant) -> Self {
+        let us = merge_wait_us(built_hash, lookup_at);
+        Self { answer_wait_merge_us: us, insert_wait_merge_us: us }
+    }
+}
+
+/// How long a wait that started at `since` and ends now outlasted the
+/// publication of `built_hash`'s fields, us; 0 when they were not recorded.
+fn merge_wait_us(built_hash: B256, since: std::time::Instant) -> u64 {
+    n42_engine_types::built_executions::answerable_at(built_hash).map_or(0, |at| {
+        std::time::Instant::now().saturating_duration_since(at.max(since)).as_micros() as u64
+    })
 }
 
 /// The transactions of the last blocks this node served, in the form a payload
@@ -536,6 +567,7 @@ async fn hand_off_own_build<T>(
     built: n42_engine_types::built_executions::BuiltExecution,
     sealed_header: reth_primitives_traits::SealedHeader,
     converted: std::time::Duration,
+    waits: AnswerWaits,
 ) -> Option<B256>
 where
     T: PayloadTypes<ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
@@ -658,6 +690,7 @@ where
                     "own block's transactions taken out of the pool"
                 );
             }
+            let (tree_exec_cache_updates, tree_exec_cache_skips) = n42_qmdb_reth::exec_cache_insert_counts();
             info!(
                 target: "n42.payload_serve",
                 number = block_number,
@@ -669,6 +702,14 @@ where
                 clone_ms,
                 moved_body,
                 total_ms = started.elapsed().as_millis() as u64,
+                // Who waited on the merged map (DELTA_LOG_DESIGN stage 0),
+                // and the engine tree's executed inserts that wrote reth's
+                // cross-block cache / skipped it since start-up (the first
+                // stays 0 on a QMDB chain unless N42_ENGINE_EXEC_CACHE=on).
+                answer_wait_merge_us = waits.answer_wait_merge_us,
+                insert_wait_merge_us = waits.insert_wait_merge_us,
+                tree_exec_cache_updates,
+                tree_exec_cache_skips,
                 "own block handed to the engine as executed"
             );
             Some(built_hash)
@@ -759,6 +800,7 @@ where
     {
         once.checked();
     }
+    let lookup_at = std::time::Instant::now();
     let (built_hash, built) = tokio::task::spawn_blocking(move || {
         if build_on_seal() {
             n42_engine_types::built_executions::find(parent_hash, number, state_root, receipts_root, gas_used, transactions_root)
@@ -769,6 +811,7 @@ where
     .await
     .map_err(|err| format!("build lookup: {err}"))?
     .ok_or("unknown build")?;
+    let waits = AnswerWaits::after_take(built_hash, lookup_at);
     let sealed_hash = header.hash_slow();
     let sealed_header = reth_primitives_traits::SealedHeader::new(header.clone(), sealed_hash);
     let withdrawals = built.block.body().withdrawals.clone().map(|w| w.to_vec()).unwrap_or_default();
@@ -832,7 +875,7 @@ where
     }
     let handoff_at = std::time::Instant::now();
     stage.at(2);
-    hand_off_own_build::<T>(reuse, built_hash, built, sealed_header, std::time::Duration::ZERO)
+    hand_off_own_build::<T>(reuse, built_hash, built, sealed_header, std::time::Duration::ZERO, waits)
         .await
         .ok_or("the engine did not take the executed block")?;
     let handoff_ms = handoff_at.elapsed().as_millis() as u64;

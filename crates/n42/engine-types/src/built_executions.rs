@@ -393,6 +393,39 @@ pub fn shards_ready(built_hash: B256, parent: ShardedParent) {
     advanced.notify_all();
 }
 
+/// Builds whose execution fields are published (the QMDB root filed, the
+/// receipts root and gas known) and when: what an answer to the block's import
+/// needs, which comes before the merged post-state map `Complete` carries
+/// (`docs/DELTA_LOG_DESIGN.md` 1). Bounded; the oldest goes first.
+fn answerable_table() -> &'static Mutex<VecDeque<(B256, std::time::Instant)>> {
+    static TABLE: OnceLock<Mutex<VecDeque<(B256, std::time::Instant)>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(VecDeque::with_capacity(4 * keep())))
+}
+
+/// The build's fields are published: its import can be answered before its
+/// merged map lands.
+pub fn answerable(built_hash: B256) {
+    {
+        let mut table = answerable_table().lock().unwrap_or_else(|p| p.into_inner());
+        table.retain(|(hash, _)| *hash != built_hash);
+        while table.len() >= 4 * keep() {
+            table.pop_front();
+        }
+        table.push_back((built_hash, std::time::Instant::now()));
+    }
+    // A waiter checks the table under the store's lock: taking it here
+    // before the notify means none can miss this wake-up.
+    let (store, advanced) = store();
+    drop(store.lock().unwrap_or_else(|p| p.into_inner()));
+    advanced.notify_all();
+}
+
+/// When the build's fields were published ([`answerable`]), if they were.
+pub fn answerable_at(built_hash: B256) -> Option<std::time::Instant> {
+    let table = answerable_table().lock().unwrap_or_else(|p| p.into_inner());
+    table.iter().rev().find(|(hash, _)| *hash == built_hash).map(|(_, at)| *at)
+}
+
 /// The pending build is finished.
 pub fn complete(built_hash: B256, execution: BuiltExecution) {
     advance(built_hash, Stage::Complete, execution);

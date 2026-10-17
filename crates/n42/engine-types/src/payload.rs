@@ -329,7 +329,7 @@ where
                     // are the frames' claims; the wrapper verifies each one
                     // before the build can include it (`claimed_build`).
                     Some(queue) => {
-                        release_replaced_own_blocks(&queue, block_number);
+                        release_replaced_own_blocks(&queue, block_number, parent_hash);
                         // `N42_FRAME_BLOCKS=1`: whole frames in arrival
                         // order instead of the walk (`frame_blocks`).
                         let best = crate::frame_blocks::select(&queue, parent_hash, parent_gas_limit);
@@ -410,15 +410,20 @@ where
 /// this build selects, instead of when the chain settles the height
 /// (`n42_tx_queue::release_replaced_own_blocks`). Nothing under the default
 /// gate.
-fn release_replaced_own_blocks<T: PoolTransaction>(queue: &n42_tx_queue::TxQueue<T>, number: u64) {
+///
+/// Also an own block held at the height below under another hash than this
+/// build's parent: a sibling of the parent, whose hold landed after the build
+/// that replaced it had started (`TxQueue::release_own_blocks_for_build`).
+fn release_replaced_own_blocks<T: PoolTransaction>(queue: &n42_tx_queue::TxQueue<T>, number: u64, parent: B256) {
     if !n42_tx_queue::release_replaced_own_blocks() {
         return;
     }
-    let offered = queue.release_own_blocks_from(number);
+    let offered = queue.release_own_blocks_for_build(number, parent);
     if offered > 0 {
         tracing::info!(
             target: "n42.tx_queue",
             number,
+            ?parent,
             offered,
             "own blocks held at or above this build's height were replaced; their transactions are offered again"
         );
@@ -517,7 +522,7 @@ where
                         "the parent's queue hand-off is done; the build pulls"
                     );
                 }
-                release_replaced_own_blocks(&queue, block_number);
+                release_replaced_own_blocks(&queue, block_number, parent_hash);
                 let best = crate::frame_blocks::select(&queue, parent_hash, parent_gas_limit);
                 crate::claimed_build::selection(&queue, best)
             }

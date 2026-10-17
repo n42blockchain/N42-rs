@@ -256,6 +256,25 @@ impl EngineNodeLauncher {
                 info!(target: "reth::cli", %message, "engine message taken off the stream");
             }
         });
+        // N42: `N42_STATE_READY_WITHOUT_MERGE` answers an own block before its
+        // executed insert is sent (`executed_inserts::pending`). A forkchoice
+        // naming such a block, or a payload on top of it, waits here until the
+        // insert has been forwarded, so the tree holds the block first. The
+        // stream stays in order: whatever follows a held message waits behind
+        // it. Nothing is pending with the switch off.
+        let consensus_engine_stream = consensus_engine_stream.then(|message| async move {
+            let needs = match &message {
+                reth_engine_primitives::BeaconEngineMessage::ForkchoiceUpdated { state, .. } => state.head_block_hash,
+                reth_engine_primitives::BeaconEngineMessage::NewPayload { payload, .. } |
+                reth_engine_primitives::BeaconEngineMessage::RethNewPayload { payload, .. } => {
+                    reth_engine_primitives::ExecutionPayload::parent_hash(payload)
+                }
+            };
+            if let Some(waited) = super::executed_inserts::pending::wait_for_insert(needs).await {
+                debug!(target: "reth::cli", hash = %needs, waited_us = waited.as_micros() as u64, "engine message held for an own block's executed insert");
+            }
+            message
+        });
 
         let engine_kind = if ctx.chain_spec().is_optimism() {
             EngineApiKind::OpStack

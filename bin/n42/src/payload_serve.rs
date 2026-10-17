@@ -600,6 +600,36 @@ where
         .prune_pool
         .is_some()
         .then(|| recovered.body().transactions().map(|tx| *tx.tx_hash()).collect::<Vec<B256>>());
+    let (rename_wait_ms, rename_deferred) = file_root_and_fields(reuse, built_hash, sealed_hash)?;
+    let executed = reth_payload_primitives::BuiltPayloadExecutedBlock::<n42_tx_types::N42Primitives> {
+        recovered_block: recovered,
+        execution_output: built.execution_output,
+        hashed_state: built.hashed_state,
+        trie_updates: built.trie_updates,
+    };
+    // The block's transactions leave the queue before this returns, as a
+    // foreign block's do: the build ahead starts on the return, and a queue
+    // that still lists this build as the last one gives its 163,000
+    // transactions back to the lanes at the next build's start (57 ms of a
+    // full block's build, under the lock) for the canonical pruner to take
+    // out again 100 ms later (78 ms, waiting on the same lock).
+    //
+    // Not by removing them from the lanes (`remove_mined_batch`: 39-51 ms
+    // here, most of it freeing the 163,000 transactions its retain drops)
+    // but by forgetting the mined part of the build's taken list, with the
+    // drop on a blocking thread. Forgetting the *whole* list lost the
+    // puller's batches in flight when the block filled -- a few thousand
+    // transactions across every sender -- and every sender's lane then
+    // started above the chain's nonce (loop29E400a: 7% occupancy).
+    let queue_prune_ms = forget_own_block(&executed.recovered_block, executed.recovered_block.hash());
+    let line = HandoffLine { block_number, converted, queue_prune_ms, rename_wait_ms, rename_deferred, clone_ms, moved_body, started, waits };
+    insert_handed_off(reuse, built_hash, executed, pool_prune_hashes, line).await
+}
+
+/// The hand-off's filings under the sealed hash: the build's QMDB root (the
+/// rename) and its execution fields. Returns the rename's wait (ms) and
+/// whether it was deferred; `None` when the root could not be filed.
+fn file_root_and_fields(reuse: &OwnBlockReuse, built_hash: B256, sealed_hash: B256) -> Option<(u64, bool)> {
     // The rename takes the forest's lock, which the next block's root holds
     // for ~30 ms on a quarter of the blocks; `N42_QMDB_RENAME_DEFER=1` queues
     // it for the lock's next holder instead of waiting
@@ -624,39 +654,51 @@ where
             n42_engine_types::executed_fields::remember(sealed_hash, fields);
         }
     }
-    let executed = reth_payload_primitives::BuiltPayloadExecutedBlock::<n42_tx_types::N42Primitives> {
-        recovered_block: recovered,
-        execution_output: built.execution_output,
-        hashed_state: built.hashed_state,
-        trie_updates: built.trie_updates,
-    };
-    // The block's transactions leave the queue before this returns, as a
-    // foreign block's do: the build ahead starts on the return, and a queue
-    // that still lists this build as the last one gives its 163,000
-    // transactions back to the lanes at the next build's start (57 ms of a
-    // full block's build, under the lock) for the canonical pruner to take
-    // out again 100 ms later (78 ms, waiting on the same lock).
-    //
-    // Not by removing them from the lanes (`remove_mined_batch`: 39-51 ms
-    // here, most of it freeing the 163,000 transactions its retain drops)
-    // but by forgetting the mined part of the build's taken list, with the
-    // drop on a blocking thread. Forgetting the *whole* list lost the
-    // puller's batches in flight when the block filled -- a few thousand
-    // transactions across every sender -- and every sender's lane then
-    // started above the chain's nonce (loop29E400a: 7% occupancy).
-    let queue_prune_ms = n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>().map(|queue| {
+    Some((rename_wait_ms, rename_deferred))
+}
+
+/// The own block's transactions forgotten by the queue and held under
+/// `hash` until the chain settles its height; the time it took, ms.
+fn forget_own_block(block: &reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>, hash: B256) -> Option<u64> {
+    n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>().map(|queue| {
         let at = std::time::Instant::now();
-        let mined = executed
-            .recovered_block
+        let mined = block
             .transactions_with_sender()
             .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)));
-        let dropped = queue.forget_mined(executed.recovered_block.header().parent_hash, mined);
+        let dropped = queue.forget_mined(block.header().parent_hash, mined);
         debug!(target: "n42.payload_serve", forgotten = dropped.len(), "own block's transactions forgotten by the queue");
         // Held, not dropped, until the chain settles this height: a block
         // consensus never commits gives them back (round 43).
-        queue.hold_own_block(executed.recovered_block.number(), executed.recovered_block.hash(), dropped);
+        queue.hold_own_block(block.number(), hash, dropped);
         at.elapsed().as_millis() as u64
-    });
+    })
+}
+
+/// What the hand-off line reports beside the insert.
+#[derive(Debug, Clone, Copy)]
+struct HandoffLine {
+    block_number: u64,
+    converted: std::time::Duration,
+    queue_prune_ms: Option<u64>,
+    rename_wait_ms: u64,
+    rename_deferred: bool,
+    clone_ms: u64,
+    moved_body: bool,
+    started: std::time::Instant,
+    waits: AnswerWaits,
+}
+
+/// The executed insert of an own block and what follows it landing: the
+/// build's pin released, the pool pruned, the hand-off line. `Some` with the
+/// build's hash once the engine took the block.
+async fn insert_handed_off(
+    reuse: &OwnBlockReuse,
+    built_hash: B256,
+    executed: reth_payload_primitives::BuiltPayloadExecutedBlock<n42_tx_types::N42Primitives>,
+    pool_prune_hashes: Option<Vec<B256>>,
+    line: HandoffLine,
+) -> Option<B256> {
+    let HandoffLine { block_number, converted, queue_prune_ms, rename_wait_ms, rename_deferred, clone_ms, moved_body, started, waits } = line;
     let (done, handed) = tokio::sync::oneshot::channel();
     let insert_sent_at = std::time::Instant::now();
     if reuse
@@ -800,6 +842,11 @@ where
     {
         once.checked();
     }
+    if let Some(deferred) = deferred
+        && n42_engine_types::built_executions::state_ready_without_merge()
+    {
+        return own_block_before_merge::<T>(reuse, engine, header, deferred, stage).await;
+    }
     let lookup_at = std::time::Instant::now();
     let (built_hash, built) = tokio::task::spawn_blocking(move || {
         if build_on_seal() {
@@ -836,43 +883,7 @@ where
                 .map_err(|err| format!("encoding the transactions: {err}"))?
         }
     };
-    // A block that forks from the engine's head (a sibling re-proposed
-    // after a TC): the head goes back to the parent first, or the tree
-    // drops the executed insert as outdated and executes the payload
-    // itself, on the fork path. See `OwnBlockReuse::canonical_head`.
-    if let Some((head, head_number)) = reuse.canonical_head.as_ref().and_then(|current| current()) {
-        if head_move_needed(handoff_head_move(), head, head_number, header.parent_hash, number) {
-            let moved_at = std::time::Instant::now();
-            // Under the split settlement tags (`n42_h2_execution::settlement`)
-            // the parent is committed, not certified or persisted: this head
-            // move leaves safe and finalized where the validator's driver put
-            // them (zero is "unchanged" to the engine).
-            let tag = match n42_h2_execution::settlement_tags() {
-                n42_h2_execution::SettlementTags::Legacy => header.parent_hash,
-                n42_h2_execution::SettlementTags::Split => alloy_primitives::B256::ZERO,
-            };
-            let state = alloy_rpc_types_engine::ForkchoiceState {
-                head_block_hash: header.parent_hash,
-                safe_block_hash: tag,
-                finalized_block_hash: tag,
-            };
-            match engine.fork_choice_updated(state, None).await {
-                Ok(updated) => info!(
-                    target: "n42.payload_serve",
-                    number, parent = ?header.parent_hash, engine_head = ?head, status = ?updated.payload_status.status,
-                    head_number = number.saturating_sub(1),
-                    engine_head_number = head_number,
-                    moved_ms = moved_at.elapsed().as_millis() as u64,
-                    "own block forks from the engine's head; the head was moved to its parent first"
-                ),
-                Err(err) => warn!(
-                    target: "n42.payload_serve",
-                    number, parent = ?header.parent_hash, engine_head = ?head, %err,
-                    "own block forks from the engine's head and the head could not be moved to its parent"
-                ),
-            }
-        }
-    }
+    move_head_to_parent_if_forked(reuse, engine, &header, number).await;
     let handoff_at = std::time::Instant::now();
     stage.at(2);
     hand_off_own_build::<T>(reuse, built_hash, built, sealed_header, std::time::Duration::ZERO, waits)
@@ -913,6 +924,212 @@ where
         return Err(format!("engine answered {:?} to the header-only payload", status.status));
     }
     Ok((status, header.number, handoff_ms, payload_ms))
+}
+
+/// A block that forks from the engine's head (a sibling re-proposed after a
+/// TC): the head goes back to the parent first, or the tree drops the
+/// executed insert as outdated and executes the payload itself, on the fork
+/// path. See `OwnBlockReuse::canonical_head`.
+async fn move_head_to_parent_if_forked<T>(
+    reuse: &OwnBlockReuse,
+    engine: &ConsensusEngineHandle<T>,
+    header: &alloy_consensus::Header,
+    number: u64,
+) where
+    T: PayloadTypes<ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
+{
+    if let Some((head, head_number)) = reuse.canonical_head.as_ref().and_then(|current| current()) {
+        if head_move_needed(handoff_head_move(), head, head_number, header.parent_hash, number) {
+            let moved_at = std::time::Instant::now();
+            // Under the split settlement tags (`n42_h2_execution::settlement`)
+            // the parent is committed, not certified or persisted: this head
+            // move leaves safe and finalized where the validator's driver put
+            // them (zero is "unchanged" to the engine).
+            let tag = match n42_h2_execution::settlement_tags() {
+                n42_h2_execution::SettlementTags::Legacy => header.parent_hash,
+                n42_h2_execution::SettlementTags::Split => alloy_primitives::B256::ZERO,
+            };
+            let state = alloy_rpc_types_engine::ForkchoiceState {
+                head_block_hash: header.parent_hash,
+                safe_block_hash: tag,
+                finalized_block_hash: tag,
+            };
+            match engine.fork_choice_updated(state, None).await {
+                Ok(updated) => info!(
+                    target: "n42.payload_serve",
+                    number, parent = ?header.parent_hash, engine_head = ?head, status = ?updated.payload_status.status,
+                    head_number = number.saturating_sub(1),
+                    engine_head_number = head_number,
+                    moved_ms = moved_at.elapsed().as_millis() as u64,
+                    "own block forks from the engine's head; the head was moved to its parent first"
+                ),
+                Err(err) => warn!(
+                    target: "n42.payload_serve",
+                    number, parent = ?header.parent_hash, engine_head = ?head, %err,
+                    "own block forks from the engine's head and the head could not be moved to its parent"
+                ),
+            }
+        }
+    }
+}
+
+/// [`own_block_by_header_with`] under `N42_STATE_READY_WITHOUT_MERGE`
+/// (docs/DELTA_LOG_DESIGN.md stage 1): answered VALID once the build's fields
+/// are published, before its merged post-state map lands. What the next
+/// block needs from this one is done before the answer, as on the ordinary
+/// road: the QMDB root and the fields filed under the sealed hash, the queue
+/// told. The executed insert, the pool prune and the header-only
+/// `newPayload` follow on a task once the merge files `Complete`; until the
+/// insert is forwarded, a forkchoice naming the block (or a payload on top
+/// of it) waits in the engine's stream (`executed_inserts::pending`). The
+/// deferred `newPayload`'s outcome is latched as under
+/// `N42_ANSWER_AT_INSERT`; a build whose merge failed is executed by that
+/// `newPayload` itself (it carries the transactions).
+async fn own_block_before_merge<T>(
+    reuse: &OwnBlockReuse,
+    engine: &ConsensusEngineHandle<T>,
+    header: alloy_consensus::Header,
+    deferred: &std::sync::Arc<crate::answer_at_insert::Deferred>,
+    stage: crate::follower_import::HandoffStage,
+) -> Result<(alloy_rpc_types_engine::PayloadStatus, u64, u64, u64), String>
+where
+    T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
+{
+    use reth_node_builder::executed_inserts::pending;
+    let (parent_hash, number, state_root, receipts_root, gas_used, transactions_root) =
+        (header.parent_hash, header.number, header.state_root, header.receipts_root, header.gas_used, Some(header.transactions_root));
+    let lookup_at = std::time::Instant::now();
+    let (built_hash, block) = tokio::task::spawn_blocking(move || {
+        n42_engine_types::built_executions::find_answerable(parent_hash, number, state_root, receipts_root, gas_used, transactions_root)
+    })
+    .await
+    .map_err(|err| format!("build lookup: {err}"))?
+    .ok_or("unknown build")?;
+    let answer_wait_merge_us = merge_wait_us(built_hash, lookup_at);
+    let sealed_hash = header.hash_slow();
+    let sealed_header = reth_primitives_traits::SealedHeader::new(header.clone(), sealed_hash);
+    let withdrawals = block.body().withdrawals.clone().map(|w| w.to_vec()).unwrap_or_default();
+    // The transactions travel with the deferred `newPayload`, for the same
+    // reason as on the ordinary road (an insert dropped as outdated).
+    let raw_transactions = match listed_for(built_hash) {
+        Some(listed) => listed.as_ref().clone(),
+        None => {
+            let block = std::sync::Arc::clone(&block);
+            tokio::task::spawn_blocking(move || encoded_transactions(&block))
+                .await
+                .map_err(|err| format!("encoding the transactions: {err}"))?
+        }
+    };
+    move_head_to_parent_if_forked(reuse, engine, &header, number).await;
+    let handoff_at = std::time::Instant::now();
+    stage.at(2);
+    let started = std::time::Instant::now();
+    let (rename_wait_ms, rename_deferred) =
+        file_root_and_fields(reuse, built_hash, sealed_hash).ok_or("the engine did not take the executed block")?;
+    let queue_prune_ms = forget_own_block(&block, sealed_hash);
+    drop(block);
+    // From here until its insert is forwarded the tree does not hold the
+    // block: what needs it waits.
+    pending::expect(sealed_hash);
+    let handoff_ms = handoff_at.elapsed().as_millis() as u64;
+    let payload_at = std::time::Instant::now();
+    stage.at(3);
+    let data = n42_h2_consensus::execution_data_from_raw_parts(sealed_hash, &header, raw_transactions, withdrawals, None);
+    let payload_ms = payload_at.elapsed().as_millis() as u64;
+    stage.at(4);
+    let answered_at = std::time::Instant::now();
+    let reuse = reuse.clone();
+    let engine = engine.clone();
+    let job = async move {
+        let waited_at = std::time::Instant::now();
+        let built = tokio::task::spawn_blocking(move || {
+            if build_on_seal() {
+                n42_engine_types::built_executions::find(parent_hash, number, state_root, receipts_root, gas_used, transactions_root)
+            } else {
+                n42_engine_types::built_executions::take(parent_hash, number, state_root, receipts_root, gas_used, transactions_root)
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+        .filter(|(hash, _)| *hash == built_hash);
+        let insert_wait_merge_us = waited_at.elapsed().as_micros() as u64;
+        let merge_behind_answer_us = answered_at.elapsed().as_micros() as u64;
+        // The parent's insert first, if it is still to come: the tree gets
+        // the chain in order.
+        let parent_wait_us = pending::wait_for_insert(parent_hash).await.map_or(0, |w| w.as_micros() as u64);
+        let inserted = match built {
+            Some((built_hash, built)) => {
+                let clone_at = std::time::Instant::now();
+                let (recovered, moved_body) = resealed_for_handoff(
+                    built_hash,
+                    built.block,
+                    sealed_header,
+                    n42_engine_types::built_executions::handoff_move_body_enabled(),
+                    n42_engine_types::built_executions::handoff_no_clone_enabled(),
+                );
+                let clone_ms = clone_at.elapsed().as_millis() as u64;
+                let pool_prune_hashes: Option<Vec<B256>> = reuse
+                    .prune_pool
+                    .is_some()
+                    .then(|| recovered.body().transactions().map(|tx| *tx.tx_hash()).collect::<Vec<B256>>());
+                let executed = reth_payload_primitives::BuiltPayloadExecutedBlock::<n42_tx_types::N42Primitives> {
+                    recovered_block: recovered,
+                    execution_output: built.execution_output,
+                    hashed_state: built.hashed_state,
+                    trie_updates: built.trie_updates,
+                };
+                let waits = AnswerWaits { answer_wait_merge_us, insert_wait_merge_us };
+                let line = HandoffLine {
+                    block_number: number,
+                    converted: std::time::Duration::ZERO,
+                    queue_prune_ms,
+                    rename_wait_ms,
+                    rename_deferred,
+                    clone_ms,
+                    moved_body,
+                    started,
+                    waits,
+                };
+                insert_handed_off(&reuse, built_hash, executed, pool_prune_hashes, line).await.is_some()
+            }
+            None => false,
+        };
+        // Forwarded (or given up: the `newPayload` below then executes the
+        // block itself): the held messages go on.
+        pending::landed(sealed_hash);
+        let insert_after_answer_us = answered_at.elapsed().as_micros() as u64;
+        let held = pending::take_counts();
+        info!(
+            target: "n42.payload_serve",
+            number,
+            inserted,
+            answer_wait_merge_us,
+            merge_behind_answer_us,
+            insert_wait_merge_us,
+            insert_parent_wait_us = parent_wait_us,
+            insert_after_answer_us,
+            fcu_wait_insert_n = held.held,
+            fcu_wait_insert_us = held.held_us,
+            fcu_wait_insert_max_us = held.held_max_us,
+            fcu_wait_insert_timeouts = held.timeouts,
+            "own block inserted behind its answer (N42_STATE_READY_WITHOUT_MERGE)"
+        );
+        if !inserted {
+            warn!(target: "n42.payload_serve", number, %sealed_hash, "own block answered before its merge was not inserted as executed; its newPayload executes it");
+        }
+        engine.new_payload(data).await
+    };
+    // Tracked as `N42_ANSWER_AT_INSERT` tracks its deferred pass; the answer
+    // does not wait for the previous block's (that one waits for its own
+    // merge), only fails on a latched failure.
+    let _previous = deferred.track(number, sealed_hash, Box::pin(job));
+    drop(stage);
+    if let Some(failure) = deferred.failure() {
+        return Err(failure);
+    }
+    let status = alloy_rpc_types_engine::PayloadStatus::new(alloy_rpc_types_engine::PayloadStatusEnum::Valid, Some(sealed_hash));
+    Ok((status, number, handoff_ms, payload_ms))
 }
 
 /// Where a build on an own block spent its time, for the log line.
@@ -1999,6 +2216,13 @@ where
                     crate::import_once::note_own_executed_again();
                     warn!(target: "n42.payload_serve", number, "a block this execution layer built was executed again");
                 }
+                // `N42_STATE_READY_WITHOUT_MERGE`: a block on top of an own
+                // block answered before its insert goes in after it (no wait
+                // when nothing is pending).
+                let _ = reth_node_builder::executed_inserts::pending::wait_for_insert(
+                    executed.recovered_block.header().parent_hash,
+                )
+                .await;
                 let insert_at = std::time::Instant::now();
                 let (done, handed) = tokio::sync::oneshot::channel();
                 let sent = inserts

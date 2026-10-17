@@ -48,6 +48,21 @@ use reth_trie::LazyTrieData;
 /// insert: `on` updates, anything else (or unset) skips.
 pub const EXEC_CACHE_ENV: &str = "N42_ENGINE_EXEC_CACHE";
 
+/// Executed inserts that went through reth's hook (`Update`: the cross-block
+/// execution cache written when its block is the parent) and those that
+/// skipped it, since start-up. The delta-log plan's precondition
+/// (`docs/DELTA_LOG_DESIGN.md` stage 0): on the bench configuration the first
+/// stays 0, so no reader of the tree's cache depends on an own block's map.
+static CACHE_UPDATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CACHE_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(updates, skips)`: executed inserts handed to reth's cache-updating hook
+/// and those that skipped it, since start-up.
+pub fn exec_cache_insert_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (CACHE_UPDATES.load(Relaxed), CACHE_SKIPS.load(Relaxed))
+}
+
 /// The blocking worker the trie sort runs on, the name reth's own hook uses.
 const DEFERRED_TRIE_WORKER_NAME: &str = "deferred-trie";
 
@@ -175,9 +190,16 @@ where
         &self,
         block: BuiltPayloadExecutedBlock<N>,
     ) -> ProviderResult<ExecutedBlock<N>> {
+        use std::sync::atomic::Ordering::Relaxed;
         match self.mode {
-            ExecCacheOnInsert::Update => self.inner.on_inserted_executed_block(block),
-            ExecCacheOnInsert::Skip => Ok(executed_block_without_cache(block, &self.runtime)),
+            ExecCacheOnInsert::Update => {
+                CACHE_UPDATES.fetch_add(1, Relaxed);
+                self.inner.on_inserted_executed_block(block)
+            }
+            ExecCacheOnInsert::Skip => {
+                CACHE_SKIPS.fetch_add(1, Relaxed);
+                Ok(executed_block_without_cache(block, &self.runtime))
+            }
         }
     }
 

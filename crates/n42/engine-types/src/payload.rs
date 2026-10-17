@@ -3792,6 +3792,7 @@ where
                 qmdb_state.insert(block_hash, block_number, prepared).map_err(PayloadBuilderError::other)?;
                 let fields = crate::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used };
                 crate::executed_fields::remember(block_hash, fields);
+                crate::built_executions::answerable(block_hash);
                 fields_published_at.set(Some(std::time::Instant::now()));
                 Ok(fields)
             };

@@ -1613,7 +1613,66 @@ impl<R: std::io::Read> FrameReader<R> {
 struct ReplayFile {
     path: std::path::PathBuf,
     header: PregenHeader,
-    reader: FrameReader<std::io::BufReader<std::fs::File>>,
+    reader: FrameReader<std::io::BufReader<AdviseFile>>,
+}
+
+/// A replay file that drops its consumed pages from the page cache.
+///
+/// The set is read once, front to back; left alone its pages fill the cache
+/// and evict the execution layer's hot pages. Every `ADVISE_STEP` bytes read,
+/// the consumed range gets `POSIX_FADV_DONTNEED`. `F7_FLOOD_REPLAY_DONTNEED=0`
+/// turns it off.
+struct AdviseFile {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+    enabled: bool,
+    read: u64,
+    advised: u64,
+}
+
+const ADVISE_STEP: u64 = 32 << 20;
+
+impl AdviseFile {
+    fn new(file: std::fs::File, path: std::path::PathBuf, enabled: bool) -> Self {
+        if enabled {
+            use std::os::fd::AsRawFd;
+            // SAFETY: plain advisory call on an fd this struct owns.
+            unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
+        }
+        Self { file, path, enabled, read: 0, advised: 0 }
+    }
+
+    fn advise(&mut self) {
+        use std::os::fd::AsRawFd;
+        let len = self.read - self.advised;
+        // SAFETY: plain advisory call on an fd this struct owns.
+        unsafe {
+            libc::posix_fadvise(self.file.as_raw_fd(), self.advised as i64, len as i64, libc::POSIX_FADV_DONTNEED)
+        };
+        self.advised = self.read;
+    }
+}
+
+impl std::io::Read for AdviseFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.file.read(buf)?;
+        self.read += n as u64;
+        if self.enabled && (self.read - self.advised >= ADVISE_STEP || (n == 0 && self.read > self.advised)) {
+            self.advise();
+        }
+        Ok(n)
+    }
+}
+
+impl Drop for AdviseFile {
+    fn drop(&mut self) {
+        if self.enabled {
+            if self.read > self.advised {
+                self.advise();
+            }
+            println!("replay       : {} read {} bytes, advised {} bytes DONTNEED", self.path.display(), self.read, self.advised);
+        }
+    }
 }
 
 /// Opens every worker's file of the set in `dir` and checks each header
@@ -1637,6 +1696,8 @@ fn open_replay_set(
                 args.offset
             )
         })?;
+        let dontneed = std::env::var("F7_FLOOD_REPLAY_DONTNEED").map(|v| v != "0").unwrap_or(true);
+        let file = AdviseFile::new(file, path.clone(), dontneed);
         let mut inner = std::io::BufReader::with_capacity(8 << 20, file);
         let mut raw = [0u8; PREGEN_HEADER_LEN];
         inner.read_exact(&mut raw).map_err(|err| format!("REFUSING --replay: {}: {err}", path.display()))?;

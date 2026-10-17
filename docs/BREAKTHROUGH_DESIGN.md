@@ -4305,3 +4305,22 @@ Stage ci (wt-main, tree 02bbc7d0a = the ch tree; no rebuild), 600M set, the WARM
 | X11T16Yd | 3.033 | 3.120 | 3.000 | 274.6M | 3.063 | 37 / 59 | 31.4 / 49.2 | -- | -- | 662 |
 
 The same configuration and binary read 4.640 / 4.660M/s in stage ch two hours earlier. Here every leg is a third slower from its first window, with full 200k blocks at 15 blocks/s: the build is not the limit (sealed_at 37-40, the lanes lock half idle at 45-48%), the consensus side is -- proposal-to-quorum p90 63 ms against 39 in ch (median 6.9 in both), 500-660 "Sidechain block not found" lines on the leader's execution layer (2-10 in a normal leg), zero major faults, zero gate failures. **Resolved by docs/STAGE_CI_COLLAPSE.md** (bench/main-x11t16): the `ci)` block copied the leg lines but not the `D2`/`X3`..`X11` variable lines, so the legs ran the default genesis at deferred depth 1 without 17 of X11's knobs, i.e. the WARM configuration (3.1-3.2M/s). The table is a WARM-class measurement, not X17. The earlier reading of what differed was (a) the WARM leg running on the 600M set with 18,750 senders (the X17 legs were unchanged), (b) the box (a gov5 run started at 00:39, after the legs; the per-leg CPU sampler found no execution-layer process, which it did in ch). Stage cj puts the WARM leg back on the 400M set and runs X17 controls first: if they read 4.6 again the warm-up on the 600M set is the cause and is dropped; it then runs the two levers docs/LONG_GAP_TAIL.md left -- two blocks ahead with the handover race fixed (fix/build-ahead-two-handover) and the five-block vote window -- each twice.
+
+### 10.159 loop351 stage cj — healthy X17 controls (4.655 / 4.717M/s, round record 424.0M, window-2 record 4.800M); two blocks ahead and the five-block window both lose; where 5M stands
+
+Stage cj (wt-main, tree d3553ba8d + fix/build-ahead-two-handover 3889f6921; 2,476 tests pass; WARM back on the 400M set; `b7` now refuses a leg whose X11/D2 lines are missing), 600M set, drain-rate scored.
+
+| leg | w1 | w2 | w3 | round | drain M/s | gates |
+| --- | --- | --- | --- | --- | --- | --- |
+| X11T16Za, X17 control | 4.687 | 4.713 | 4.527 | 417.8M | 4.655 | clean |
+| X11T16Zb, X17 control | 4.747 | **4.800** | 4.587 | **424.0M** | **4.717** | clean |
+| X11T16Zta, two ahead (handover race fixed) | 4.433 | 4.400 | 4.280 | 393.4M | 4.381 | own_not_committed 0, no BODYGATE |
+| X11T16Zfa, five-block window | 4.633 | 4.700 | 4.307 | 409.2M | 4.561 | clean |
+| X11T16Ztb, two ahead | 4.173 | 4.347 | 4.507 | 390.8M | 4.360 | clean |
+| X11T16Zfb, five-block window | 4.507 | 4.653 | 4.753 | 431.8M* | 4.654 | clean |
+
+(*Zfb's windows add to 417.4M; drainrate.py counts 431.8M of transactions over its span.)
+
+1. **Two ahead is correct now and slow**: no orphan left behind at any handover (the 1024 race is gone), and the drain rate is 6-7% under the controls -- the second build in flight costs the first one its cores (10.153: sealed_at 34 -> 38-42). Parked for good on this box; the orphan fix stays in main as correctness.
+2. **The five-block window** reads 4.561 / 4.654 against 4.655 / 4.717: not a gain. Both structural levers that the models rated at -3.3..-3.7 ms are measured negative or flat (10.149, 10.153, here).
+3. **Where 5M stands.** X17, storm-free, reads 4.60-4.75M/s with records at round 424.0M and windows 4.747 / 4.800 / 4.753M. Its mean proposal gap is 42.3-43.5 ms against the 40.0 the goal needs; every remaining single cut is worth <=1.5 ms (docs/LONG_GAP_TAIL.md, docs/AFTER_MERGE_CUT.md), three floors sit within 3 ms of one another, and the two structural levers lose on this box. What is left is design work -- carried depth 3 with the index overlay (docs/ROOT_PIPELINE_DESIGN.md C1 stage 2 and stage 4), or more cores -- or accepting 4.7M/s as the seven-node, single-box figure for this chain shape.

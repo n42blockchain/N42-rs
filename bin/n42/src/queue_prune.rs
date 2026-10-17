@@ -85,7 +85,7 @@ pub fn prune_notification(
         // pruned where this block mined a higher nonce).
         let (back, times) = queue.prune_block(block.number(), block.hash(), &pairs, &hashes);
         if back > 0 {
-            warn!(target: "n42.tx_queue", number = block.number(), back, "an own block at this height was not the one committed; its transactions are offered again");
+            note_settled_back(Some(block.number()), 1, back);
         }
         sum.settle_us += times.settle_us;
         sum.fold_us += times.fold_us;
@@ -172,7 +172,7 @@ pub fn prune_notifications_lean(
             .collect();
         let (back, times) = queue.prune_blocks(&inputs);
         if back > 0 {
-            warn!(target: "n42.tx_queue", blocks = inputs.len(), back, "an own block at a pruned height was not the one committed; its transactions are offered again");
+            note_settled_back(None, inputs.len(), back);
         }
         sum.settle_us += times.settle_us;
         sum.fold_us += times.fold_us;
@@ -304,5 +304,28 @@ pub fn spawn_thread(queue: TxQueue<N42PooledTransaction>) -> Option<std::sync::m
             warn!(target: "n42.tx_queue", %err, "N42_QUEUE_PRUNE_THREAD=1 but its thread could not be started; pruning on the runtime");
             None
         }
+    }
+}
+
+/// The canonical prune gave back an own block held at a height the chain
+/// committed another block at. Under two-ahead (`N42_BUILD_AHEAD_GATE=seal`)
+/// that is the release of a block the handover replaced when no build of this
+/// execution layer released it first (this node does not build the next
+/// height, or its hold landed after every such build had started): said at
+/// info with its own wording. Otherwise it is a view change the queue
+/// recovers from, said as a warning as before.
+fn note_settled_back(number: Option<u64>, blocks: usize, back: usize) {
+    if n42_tx_queue::release_replaced_own_blocks() {
+        info!(
+            target: "n42.tx_queue",
+            ?number,
+            blocks,
+            back,
+            "an own block replaced at a handover was released when the chain committed its height; its transactions are offered again"
+        );
+    } else if let Some(number) = number {
+        warn!(target: "n42.tx_queue", number, back, "an own block at this height was not the one committed; its transactions are offered again");
+    } else {
+        warn!(target: "n42.tx_queue", blocks, back, "an own block at a pruned height was not the one committed; its transactions are offered again");
     }
 }

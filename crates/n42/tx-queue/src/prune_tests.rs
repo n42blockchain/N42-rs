@@ -546,6 +546,65 @@ fn a_replaced_own_block_is_released_once_and_its_height_settles_clean() {
     assert_eq!(queue.take_drops().counts[Dropped::HeldBehind.index()], 0);
 }
 
+/// The first tenure handover (loop351 leg Ttb, block 1024): the old leader's
+/// orphan at 9 is held only after the replacement build at 9 has started and
+/// checked the holds, so that build releases nothing. The replacement's
+/// successor at 10, on the replacement's hash, releases the orphan held at 9
+/// under another hash -- once -- and the settle of 9 gives nothing back. A
+/// build at 10 on the held block itself (the ordinary two-ahead hold) keeps it.
+#[test]
+fn an_orphan_held_after_its_replacement_started_is_released_by_the_next_build() {
+    let (queue, rounds) = deep_queue(20, 2, 50);
+    let (block, _) = &rounds[0];
+    // The replacement at 9 starts before the orphan's hold lands.
+    assert_eq!(queue.release_own_blocks_for_build(9, B256::repeat_byte(0x80)), 0);
+    let held = queue.remove_mined_batch_collecting(block.iter().copied());
+    assert_eq!(held.len(), 1_000);
+    queue.hold_own_block(9, B256::repeat_byte(0x90), held);
+    // The orphan's own successor at 10 stands on it: kept.
+    assert_eq!(queue.release_own_blocks_for_build(10, B256::repeat_byte(0x90)), 0);
+    assert_eq!(queue.len(), 1_000);
+    // The replacement's successor at 10 stands on 0x91: released, once.
+    assert_eq!(queue.release_own_blocks_for_build(10, B256::repeat_byte(0x91)), 1_000);
+    assert_eq!(queue.len(), 2_000);
+    assert_eq!(queue.release_own_blocks_for_build(10, B256::repeat_byte(0x91)), 0);
+    let (back, _) = queue.prune_block(9, B256::repeat_byte(0x91), &[], &[]);
+    assert_eq!(back, 0, "a released block is not given back a second time by its height's settle");
+    assert_eq!(queue.take_drops().counts[Dropped::HeldBehind.index()], 0);
+}
+
+/// The same handover when this execution layer builds nothing at 10: the
+/// chain commits the foreign replacement at 9 and the settle of 9 gives the
+/// orphan back, exactly once; nothing is left held for a later height.
+#[test]
+fn an_orphan_is_released_once_by_the_commit_of_a_foreign_block_at_its_height() {
+    let (queue, rounds) = deep_queue(20, 2, 50);
+    let (block, _) = &rounds[0];
+    let held = queue.remove_mined_batch_collecting(block.iter().copied());
+    queue.hold_own_block(9, B256::repeat_byte(0x90), held);
+    let (back, _) = queue.prune_block(9, B256::repeat_byte(0x91), &[], &[]);
+    assert_eq!(back, 1_000);
+    assert_eq!(queue.len(), 2_000);
+    let (back, _) = queue.prune_block(9, B256::repeat_byte(0x91), &[], &[]);
+    assert_eq!(back, 0);
+    assert_eq!(queue.release_own_blocks_for_build(10, B256::repeat_byte(0x91)), 0);
+    let (back, _) = queue.prune_block(10, B256::repeat_byte(0xa1), &[], &[]);
+    assert_eq!(back, 0);
+    assert_eq!(queue.take_drops().counts[Dropped::HeldBehind.index()], 0);
+}
+
+/// The release on a build still works for the build at the held height
+/// itself, whatever its parent.
+#[test]
+fn a_build_at_the_held_height_releases_it_on_any_parent() {
+    let (queue, rounds) = deep_queue(20, 2, 50);
+    let (block, _) = &rounds[0];
+    let held = queue.remove_mined_batch_collecting(block.iter().copied());
+    queue.hold_own_block(9, B256::repeat_byte(0x90), held);
+    assert_eq!(queue.release_own_blocks_for_build(9, B256::repeat_byte(0x80)), 1_000);
+    assert_eq!(queue.release_own_blocks_for_build(9, B256::repeat_byte(0x80)), 0);
+}
+
 /// A release never re-admits a nonce the chain mined: a held own block whose
 /// transactions a canonical block at a lower height already carried (the
 /// orphan's branch and the chain overlap) gives back only the rest.

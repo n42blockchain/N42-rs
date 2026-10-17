@@ -3398,14 +3398,38 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// canonical prune removes its transactions from the lanes as for any
     /// foreign block.
     pub fn release_own_blocks_from(&self, number: u64) -> usize {
+        self.release_held_where(|held_number, _| held_number >= number)
+    }
+
+    /// A build is starting at height `number` on `parent`: what
+    /// [`Self::release_own_blocks_from`] releases, and also an own block held
+    /// at `number - 1` under another hash than `parent` -- a sibling of the
+    /// parent this build stands on, so a block this build's branch replaces.
+    ///
+    /// That second rule is the first tenure handover's case (loop351 leg Ttb,
+    /// block 1024): the old leader's two-ahead build of 1025 on its sealed
+    /// 1024 holds 1024's transactions in its hand-off, and with small warm-up
+    /// blocks that hold can land after the new leader's replacement 1024 has
+    /// already started (and checked the holds at 1024, finding none). The
+    /// replacement's successor at 1025, on the replacement, then finds the
+    /// orphan held at 1024 under another hash and gives it back, before the
+    /// chain settles the height. The parent itself held at `number - 1` (the
+    /// ordinary two-ahead hold) is kept for the settle.
+    pub fn release_own_blocks_for_build(&self, number: u64, parent: B256) -> usize {
+        self.release_held_where(|held_number, held_hash| {
+            held_number >= number || (held_number + 1 == number && held_hash != parent)
+        })
+    }
+
+    fn release_held_where(&self, replaced: impl Fn(u64, B256) -> bool) -> usize {
         let mut inner = self.lock_inner_quiet();
-        if inner.held.iter().all(|(held_number, _, _)| *held_number < number) {
+        if !inner.held.iter().any(|(held_number, held_hash, _)| replaced(*held_number, *held_hash)) {
             return 0;
         }
         let mut back = Vec::new();
         let mut kept = VecDeque::with_capacity(inner.held.len());
         for (held_number, held_hash, transactions) in std::mem::take(&mut inner.held) {
-            if held_number >= number {
+            if replaced(held_number, held_hash) {
                 back.extend(transactions);
             } else {
                 kept.push_back((held_number, held_hash, transactions));

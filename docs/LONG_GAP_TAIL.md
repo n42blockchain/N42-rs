@@ -63,15 +63,8 @@ The seal exec tail is +0.46 / 0.54 / 0.54. L ready -> handed is +0.21 / 0.13 / 0
 release chain runs -0.13..-0.22: QC and commit are faster on these gaps). Inside the state-ready jumps of 20 ms or more
 (Xb 51), the largest piece is the root 24 times, fields-after-root 12 times, the merge 11 times and the root wait 4 times.
 On Xea it is the merge 24 times and the root 16 times.
-Blocks whose build sealed above the sealed_at p90 (50 ms, Xb 188) look like this against all blocks:
-
-* par_exec 34 ms against 18;
-* batch_max 30 ms against 12.5;
-* batch start skew 19.6 ms against 10.3;
-* involuntary context switches 13.8 against 5.5;
-* majflt 0.
-
-So the exec tail is a straggler batch that starts late and is preempted: CPU contention, not memory.
+Blocks sealed above the `sealed_at` p90 (50 ms, Xb 188) against all: par_exec 34 / 18, batch_max 30 / 12.5, batch start skew
+19.6 / 10.3, involuntary switches 13.8 / 5.5, majflt 0: a straggler batch started late and preempted (CPU contention, not memory).
 
 ## 4. Clustered or scattered?
 
@@ -127,22 +120,11 @@ The replay assumes the tail would not reappear elsewhere. `sealed_at` is elastic
 
 **It did not, inside the window.** The 39.6 / 45.2 figures are the validators' proposal interval over all proposals of the
 leg: 8,431 on Xea against 6,936 on Xb. Xea logged ~1,300 more tick-paced 31.8 ms intervals after the window, and they
-pull the leg-wide p90 down. Inside the window the two legs match:
-
-| | Xb | Xea |
-| --- | --- | --- |
-| proposal p90 | 68.0 | 68.0 |
-| canonical-interval p90 | 69.5 | 68.4 |
-| mean gap | 42.77 | 42.72 |
-| gaps over 80 ms | 94 | 92 |
-
-So the stage table's interval p90 is not a tail metric. Score the tail with in-window gaps over 80 ms.
-What the early lookups did remove is real but small:
-
-* `on_canonical*` waits behind the lease fell 431 -> 274 (12.5 -> 7.4 s summed);
-* gaps containing a forest wait of 20 ms or more fell from 38% to 26% of gaps;
-* the root shortened (21.0 against 25.0 p50), but its wait grew (31.9 against 25.4);
-* the state-ready jumps moved to the merge (24 of 52 against 11 of 51).
+pull the leg-wide p90 down. Inside the window they match: proposal p90 68.0 / 68.0, canonical-interval p90 69.5 / 68.4,
+mean gap 42.77 / 42.72, gaps over 80 ms 94 / 92 (Xb / Xea). The stage table's interval p90 is not a tail metric; score the
+tail with in-window gaps over 80 ms. What the early lookups did remove is real but small: `on_canonical*` waits behind the
+lease 431 -> 274 (12.5 -> 7.4 s summed), gaps holding a forest wait >= 20 ms 38% -> 26%, the root 25.0 -> 21.0 ms p50 but its
+wait 25.4 -> 31.9, and the state-ready jumps moved to the merge (24 of 52 against 11 of 51).
 
 That is the hint: a cut inside L moves the jitter to the next stage of the same chain, and the tail stays. The tail falls
 only when the chain's jitter is cut as a whole (section 5, "all L parts") or when the 6-block loop stops doubling it.

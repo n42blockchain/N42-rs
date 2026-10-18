@@ -4235,3 +4235,19 @@ Stage cm (wt-main, tree 750694033 = the cl tree + aa56811f8: the sealed block he
 1. **The mechanism is right now**: no direct import, no re-execution, the merge finishes 27 ms behind the answer, and the proposal-to-quorum p90 falls from 31-33 ms to 8 -- the followers no longer wait on the leader's answer path: the vote window is open.
 2. **And the drain rate is the controls'** (4.607 / 4.486 against 4.593 / 4.689). docs/AFTER_MERGE_CUT.md said three floors sit within 3 ms -- the one-ahead start loop through the vote window, the builder's wait on its parent output, the fields two-cycle at carried depth 2; removing the first lands the gap on the next two (interval p50 unchanged at 31.8, p90 44-46). Answer at insert alone reads 4.672 / 4.586: not adopted either. **X17 stands.**
 3. **What this settles**: direction B's stages 2-3 (the delta log) would cut L further, but L is no longer what binds; the floors left are the builder (sealed_at 31-35 ms: par_exec 16-17 + hand-off + fields) and carried depth 2 (fields two-cycle), i.e. the roadmap's remaining items -- depth 3 with the index overlay (needs gov5 to implement D=3), the builder's execution floor itself (13 ms CPU + imbalance on 64 cores), or more cores. perf/state-ready-without-merge is merged to main as default-off code, since the vote window will matter again once the seal falls.
+
+### 10.163 loop351 stage cn — more build cores do not shorten the parallel step: par_exec stays at 16 ms with 64, 80 or 88 cores; the build is memory-bound
+
+Stage cn (wt-main, tree 9802986da; no rebuild), 600M set, on X17 (b64/c16 layout): two controls, `N42_CORE_LAYOUT_BUILD_CORES=80` twice, `=88` twice (the critical set stays 16; the layout line confirms 64 / 80 / 88 took effect).
+
+| leg | build cores | w1 | w2 | w3 | round | drain M/s | sealed_at p50 | par_exec p50 / p90 | roots p50 | interval p90 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X11T16Ea | 64 | 4.653 | 4.633 | 4.620 | 417.2M | 4.649 | 31 | 16 / 31 | 34 | 39.2 |
+| X11T16E80a | 80 | 4.380 | 4.553 | 4.213 | 394.4M | 4.390 | 35 | 16 / 37 | 31 | 43.8 |
+| X11T16E88a | 88 | 4.560 | 4.400 | 4.380 | 400.2M | 4.461 | 35 | 15 / 25 | 40 | 42.6 |
+| X11T16Eb | 64 | 4.613 | 4.527 | 4.307 | 403.4M | 4.494 | 32 | 16 / 34 | 33 | 42.1 |
+| X11T16E80b | 80 | 4.340 | 4.247 | 4.547 | 394.0M | 4.389 | 34 | 16 / 32 | 32 | 42.5 |
+| X11T16E88b | 88 | 4.533 | 4.420 | 4.433 | 401.6M | 4.466 | 38 | 16 / 22 | 41 | 43.7 |
+
+1. **par_exec does not move** (16 ms p50 at 64, 80 and 88 cores; only its p90 narrows at 88): the parallel execution of 200k transfers is bound by memory, not by cores, as docs/SEALED_AT_FLOOR.md's "CPU floor" already hinted (QMDB journal searches, cache misses). Meanwhile sealed_at rises 3-6 ms and the roots at 88 cores take 40-41 ms instead of 33-34 -- the extra build cores and their SMT siblings crowd the critical set -- so the legs read 4.39-4.47M/s against 4.49-4.65. Closed: the 64-core build is the right size on this box.
+2. **Where this leaves the goal**: after X17 every lever has been measured -- seal cuts, build-ahead, the vote window, the merge, block size, the answer before the merge (10.162: it opens the vote window and the gap lands on the builder and the fields floors), build cores -- and each reads within ±1.5% of X17. X17 on this box is 4.5-4.75M/s (records: round 424.0M, windows 4.747 / 4.800 / 4.753M). The 5M goal needs the two remaining floors to move together: the builder's memory-bound execution (16 ms for 200k transfers) and the carried-depth-2 fields cycle -- design work (a different execution state layout for the transfer fast path; carried depth 3 with the index overlay), or a second box.

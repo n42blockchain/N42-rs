@@ -4341,3 +4341,20 @@ Stage ck (wt-main, tree 32e1e1084 = the cj tree + `N42_STATE_READY_WITHOUT_MERGE
 1. **The cycle is proportional to the block**: 44.5 ms at 200k, 67 at 300k, 84 at 400k -- about 0.21 ms per thousand transactions with no constant term worth the name. The roadmap's bet was that 12-18 ms of the 42.5 ms gap were fixed per round (consensus, hand-off, pacing) so that fewer, larger rounds would carry more transactions per second; the measurement says the gap is made of per-transaction work (build, root, merge, answer path all scale with the block) and the rounds at 300k and 400k read 4.29-4.57M/s, the same as 200k's 4.42-4.62. Direction A is closed on this box; 200k/30 ms stays the tier.
 2. The 400k legs ran clean (verify pass, full blocks at 93-94% of the tier: the gas ceiling is met by ~375k transfers of 21,000 + the per-block overhead), so the tier is not what limits either.
 3. Next (stage cl): direction B's first step -- `N42_STATE_READY_WITHOUT_MERGE=1` (with `N42_ANSWER_AT_INSERT=1`): the answer leaves at the root's end instead of after the 61 ms merge; expected L 178 -> 70-85 ms, blocks in flight 4.2 -> ~2, gap 43.4 -> 41-42; measured against X17 and X17 + answer-at-insert.
+
+### 10.161 loop351 stage cl — answer before the state merge halves the rate: the leader seals in 19-22 ms and the fleet runs at 2.3-2.6M/s; answer-at-insert alone is inconsistent
+
+Stage cl (wt-main, tree 32e1e1084; 2,477 tests pass), 600M set, on X17: two controls, `N42_ANSWER_AT_INSERT=1` twice, the same plus `N42_STATE_READY_WITHOUT_MERGE=1` twice (docs/DELTA_LOG_DESIGN.md stage 1: the own block answered VALID when its fields are published, the merge and the ExecutedInsert behind it, an engine-stream gate holding forkchoice/newPayload whose insert is pending).
+
+| leg | w1 | w2 | w3 | round | drain M/s | sealed_at p50/p90 | interval p50 / p90 | proposal -> quorum p90 | gate/timeout lines |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X11T16Ca, X17 control | 4.507 | 4.485 | 4.487 | 404.4M | 4.513 | 39 / 54 | 31.8 / 44.8 | 24.1 | 2,092 |
+| X11T16Caa, answer at insert | 4.453 | 3.773 | 3.713 | 358.2M | 3.974 | 38 / 60 | 31.8 / 42.6 | 26.7 | 1,847 |
+| X11T16Csa, + state ready without merge | 2.407 | 2.347 | 2.313 | 212.0M | 2.364 | **19 / 35** | 31.7 / **77.1** | **73.4** | 7,987 |
+| X11T16Cb, X17 control | 4.540 | 4.473 | 4.573 | 407.6M | 4.539 | 31 / 51 | 31.8 / 38.3 | 21.1 | 2,106 |
+| X11T16Cab, answer at insert | 4.673 | 4.667 | 4.553 | 416.8M | 4.628 | 35 / 56 | 31.8 / 44.0 | 28.6 | 2,149 |
+| X11T16Csb, + state ready without merge | 2.620 | 2.327 | 2.307 | 217.6M | 2.424 | 22 / 45 | 31.7 / 75.7 | 72.2 | 8,257 |
+
+1. **The mechanism fires and the fleet halves.** With the answer at the root's end the leader's own seal falls to 19-22 ms p50 (the parent's state is ready far earlier), but the proposal-to-quorum p90 goes from 21-27 to 72-73 ms and the interval p90 to 76-77: the followers' votes now wait ~50 ms longer than before, and the round reads 2.36-2.42M/s. Every leg verifies clean and no own block is lost, so this is latency, not correctness: the obvious suspects are the engine-stream gate (forkchoice/newPayload held until the insert lands -- the 2 s guard and its timeouts are among the ~8,000 gate lines per leg against ~2,100 on the controls) and the deferred newPayload / insert ordering the followers' vote path depends on. Read from the Csa logs before any change.
+2. **Answer at insert alone**: 4.628 (Cab) and 3.974 (Caa, windows 2-3 at 3.7M) -- the same inconsistency as 10.154-10.157 (4.71 / 4.53 / 4.51 / 4.63 before); it is not adopted on its own.
+3. X17 controls 4.513 / 4.539. Direction B's step 1 stays on the branch (off) until the vote-side latency it introduces is understood; no stage is queued, the box is free.

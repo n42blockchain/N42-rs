@@ -337,6 +337,24 @@ where
     hand_off_own_build::<T>(reuse, built_hash, built, sealed_header, converted, waits).await
 }
 
+/// Imports that found their block's own-block insert pending
+/// (`N42_STATE_READY_WITHOUT_MERGE`) and waited for it, and how long, us;
+/// reported and reset by the "own block inserted behind its answer" line.
+static DIRECT_IMPORT_WAITED_INSERT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIRECT_IMPORT_WAITED_INSERT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Waits (bounded by `executed_inserts::pending::WAIT`) for the executed
+/// insert of `hash` when it was answered before its insert. `true` when it
+/// waited and the insert is no longer pending: the engine then holds the
+/// block, or the block's own deferred `newPayload` executes it.
+async fn wait_for_own_insert(hash: B256) -> bool {
+    use reth_node_builder::executed_inserts::pending;
+    let Some(waited) = pending::wait_for_insert(hash).await else { return false };
+    DIRECT_IMPORT_WAITED_INSERT_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DIRECT_IMPORT_WAITED_INSERT_US.fetch_add(waited.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    !pending::is_pending(hash)
+}
+
 /// Who waited on the build's merged post-state map, us
 /// (`docs/DELTA_LOG_DESIGN.md` stage 0): the answer path's lookup beyond the
 /// moment the build's fields were published, and the executed insert's.
@@ -1041,6 +1059,10 @@ where
     let reuse = reuse.clone();
     let engine = engine.clone();
     let job = async move {
+        // The sealed block stays kept until this block's `newPayload` below
+        // has been converted: the blocks answered behind it would otherwise
+        // retire it first (`built_executions::hold_sealed`).
+        let sealed_hold = n42_engine_types::built_executions::hold_sealed(sealed_hash);
         let waited_at = std::time::Instant::now();
         let built = tokio::task::spawn_blocking(move || {
             if build_on_seal() {
@@ -1113,12 +1135,16 @@ where
             fcu_wait_insert_us = held.held_us,
             fcu_wait_insert_max_us = held.held_max_us,
             fcu_wait_insert_timeouts = held.timeouts,
+            direct_import_waited_insert_n = DIRECT_IMPORT_WAITED_INSERT_N.swap(0, std::sync::atomic::Ordering::Relaxed),
+            direct_import_waited_insert_us = DIRECT_IMPORT_WAITED_INSERT_US.swap(0, std::sync::atomic::Ordering::Relaxed),
             "own block inserted behind its answer (N42_STATE_READY_WITHOUT_MERGE)"
         );
         if !inserted {
             warn!(target: "n42.payload_serve", number, %sealed_hash, "own block answered before its merge was not inserted as executed; its newPayload executes it");
         }
-        engine.new_payload(data).await
+        let status = engine.new_payload(data).await;
+        drop(sealed_hold);
+        status
     };
     // Tracked as `N42_ANSWER_AT_INSERT` tracks its deferred pass; the answer
     // does not wait for the previous block's (that one waits for its own
@@ -1979,10 +2005,16 @@ where
     // Not on the described road: its payload has no list yet, and a
     // compact body is never one of this node's own builds (those arrive as
     // `request::OWN_BLOCK`).
-    let reused = match reuse.filter(|_| listing.is_none()) {
-        Some(reuse) => reuse_own_build::<T>(reuse, &data, once.is_some()).await.is_some(),
-        None => false,
-    };
+    // `N42_STATE_READY_WITHOUT_MERGE`: an own block answered before its
+    // executed insert went in. The import waits for that insert and then
+    // hands the engine the payload, which finds the block already held,
+    // instead of executing the block a second time here.
+    let inserted_behind_answer = wait_for_own_insert(data.payload.block_hash()).await;
+    let reused = inserted_behind_answer
+        || match reuse.filter(|_| listing.is_none()) {
+            Some(reuse) => reuse_own_build::<T>(reuse, &data, once.is_some()).await.is_some(),
+            None => false,
+        };
     if reused && once.is_some() {
         crate::import_once::note_own_from_build();
     }

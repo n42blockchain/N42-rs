@@ -969,6 +969,41 @@ pub fn kept_block(built_hash: B256) -> Option<Arc<RecoveredBlock<Block>>> {
     handed.iter().rev().find(|(hash, _)| *hash == built_hash).map(|(_, built)| Arc::clone(&built.block))
 }
 
+/// Sealed hashes the store must not retire yet ([`hold_sealed`]); one entry
+/// per hold, so two holds of one hash need two releases.
+fn sealed_held() -> &'static Mutex<Vec<B256>> {
+    static HELD: OnceLock<Mutex<Vec<B256>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Keeps the sealed block under `sealed_hash` (once remembered) out of the
+/// store's eviction until the returned guard is dropped.
+///
+/// `N42_STATE_READY_WITHOUT_MERGE` answers an own block before its insert and
+/// sends its header-only `newPayload` only once the merge lands, 50-90 ms
+/// later, while the next blocks are remembered behind it: with the default
+/// bound of three the block was retired before the engine converted its
+/// payload (loop351 stage cl, block 891: the conversion fell back to the
+/// payload, the deferred pass failed, the failure latched and every later own
+/// block was executed again). The hold spans that pass.
+pub fn hold_sealed(sealed_hash: B256) -> SealedHold {
+    sealed_held().lock().unwrap_or_else(|p| p.into_inner()).push(sealed_hash);
+    SealedHold(sealed_hash)
+}
+
+/// A hold on a kept sealed block ([`hold_sealed`]), let go on drop.
+#[derive(Debug)]
+pub struct SealedHold(B256);
+
+impl Drop for SealedHold {
+    fn drop(&mut self) {
+        let mut held = sealed_held().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(at) = held.iter().position(|hash| *hash == self.0) {
+            held.swap_remove(at);
+        }
+    }
+}
+
 fn keep_sealed(sealed_hash: B256, transactions: usize, block: SealedKept) {
     {
         let mut hints = sealed_hints().lock().unwrap_or_else(|p| p.into_inner());
@@ -984,7 +1019,13 @@ fn keep_sealed(sealed_hash: B256, transactions: usize, block: SealedKept) {
         evicted.extend(store.remove(at));
     }
     while store.len() >= keep() {
-        evicted.extend(store.pop_front());
+        // The oldest block no deferred `newPayload` still needs
+        // ([`hold_sealed`]); when every kept block is held the store grows
+        // past its bound until a hold is let go.
+        let held = sealed_held().lock().unwrap_or_else(|p| p.into_inner());
+        let Some(at) = store.iter().position(|(hash, _)| !held.contains(hash)) else { break };
+        drop(held);
+        evicted.extend(store.remove(at));
     }
     store.push_back((sealed_hash, block));
     drop(store);
@@ -1063,6 +1104,31 @@ pub(crate) static STORE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_held_sealed_block_outlives_the_bound() {
+        let _guard = super::STORE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let block = |n: u64| {
+            let mut b = super::Block::default();
+            b.header.number = n;
+            reth_primitives_traits::SealedBlock::seal_slow(b)
+        };
+        let first = block(9_100);
+        let first_hash = first.hash();
+        let hold = super::hold_sealed(first_hash);
+        super::remember_sealed(first_hash, first);
+        for n in 9_101..9_101 + super::keep() as u64 + 2 {
+            let b = block(n);
+            super::remember_sealed(b.hash(), b);
+        }
+        assert!(super::find_sealed(first_hash).is_some(), "held: not retired");
+        drop(hold);
+        for n in 9_200..9_200 + super::keep() as u64 {
+            let b = block(n);
+            super::remember_sealed(b.hash(), b);
+        }
+        assert!(super::find_sealed(first_hash).is_none(), "released: retired by the bound");
+    }
+
     #[test]
     fn saturated_or_disconnected_free_worker_returns_ownership_without_waiting() {
         struct CountDrop(std::sync::Arc<std::sync::atomic::AtomicUsize>);

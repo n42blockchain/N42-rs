@@ -4358,3 +4358,20 @@ Stage cl (wt-main, tree 32e1e1084; 2,477 tests pass), 600M set, on X17: two cont
 1. **The mechanism fires and the fleet halves.** With the answer at the root's end the leader's own seal falls to 19-22 ms p50 (the parent's state is ready far earlier), but the proposal-to-quorum p90 goes from 21-27 to 72-73 ms and the interval p90 to 76-77: the followers' votes now wait ~50 ms longer than before, and the round reads 2.36-2.42M/s. Every leg verifies clean and no own block is lost; the cause is in the log: 5,984 of the leg's ~6,900 blocks were **imported through the direct path and executed again** on the shared execution layer ("direct import: executed here, handed to the engine as executed"; 0 on the controls). The answer now leaves before the engine tree holds N, and the followers' import of the proposal -- on E=1 the same process -- does not find N in the tree, so it executes the block itself and the vote waits for that execution. The engine-stream gate covers forkchoice and newPayload (fcu_wait_insert_timeouts 0, merge_behind_answer_us ~0.1 ms) but not the direct-import path, which must wait for the pending insert instead of executing.
 2. **Answer at insert alone**: 4.628 (Cab) and 3.974 (Caa, windows 2-3 at 3.7M) -- the same inconsistency as 10.154-10.157 (4.71 / 4.53 / 4.51 / 4.63 before); it is not adopted on its own.
 3. X17 controls 4.513 / 4.539. Direction B's step 1 stays on the branch (off) until the vote-side latency it introduces is understood; no stage is queued, the box is free.
+
+### 10.162 loop351 stage cm — the answer before the merge now works (quorum p90 31 -> 8 ms, no re-execution) and the round does not move: the vote window was one of three floors
+
+Stage cm (wt-main, tree 750694033 = the cl tree + aa56811f8: the sealed block held until its deferred newPayload converts, the direct import waiting for a pending own insert; 2,477 tests pass), 600M set, on X17.
+
+| leg | w1 | w2 | w3 | round | drain M/s | quorum p90 | interval p50 / p90 | direct imports | merge behind answer |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| X11T16Da, X17 control | 4.660 | 4.553 | 4.527 | 412.2M | 4.593 | 31.4 | 31.8 / 41.2 | 0 | -- |
+| X11T16Dsa, + answer at insert + state ready without merge | 4.427 | 4.593 | 4.753 | 413.2M | 4.607 | **8.0** | 31.8 / 44.7 | 0 | 27 ms |
+| X11T16Daa, + answer at insert | 4.600 | **4.780** | 4.627 | 420.2M | 4.672 | 30.8 | 31.8 / 44.2 | 0 | -- |
+| X11T16Db, X17 control | 4.673 | 4.627 | 4.727 | 420.8M | 4.689 | 33.1 | 31.7 / 39.6 | 0 | -- |
+| X11T16Dsb, as Dsa | 4.567 | 4.340 | 4.493 | 402.0M | 4.486 | **7.7** | 31.8 / 45.7 | 0 | 27 ms |
+| X11T16Dab, + answer at insert | 4.667 | 4.533 | 4.520 | 412.2M | 4.586 | 30.5 | 31.8 / 44.6 | 0 | -- |
+
+1. **The mechanism is right now**: no direct import, no re-execution, the merge finishes 27 ms behind the answer, and the proposal-to-quorum p90 falls from 31-33 ms to 8 -- the followers no longer wait on the leader's answer path: the vote window is open.
+2. **And the drain rate is the controls'** (4.607 / 4.486 against 4.593 / 4.689). docs/AFTER_MERGE_CUT.md said three floors sit within 3 ms -- the one-ahead start loop through the vote window, the builder's wait on its parent output, the fields two-cycle at carried depth 2; removing the first lands the gap on the next two (interval p50 unchanged at 31.8, p90 44-46). Answer at insert alone reads 4.672 / 4.586: not adopted either. **X17 stands.**
+3. **What this settles**: direction B's stages 2-3 (the delta log) would cut L further, but L is no longer what binds; the floors left are the builder (sealed_at 31-35 ms: par_exec 16-17 + hand-off + fields) and carried depth 2 (fields two-cycle), i.e. the roadmap's remaining items -- depth 3 with the index overlay (needs gov5 to implement D=3), the builder's execution floor itself (13 ms CPU + imbalance on 64 cores), or more cores. perf/state-ready-without-merge is merged to main as default-off code, since the vote window will matter again once the seal falls.

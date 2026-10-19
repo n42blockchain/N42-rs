@@ -49,12 +49,17 @@ const DEFAULT_KEEP: usize = 3;
 /// Parses `N42_BUILT_KEEP`: an unsigned number in `3..=16`, else the default
 /// (with one warning for a value that is set but invalid).
 fn built_keep_from(value: Option<&str>) -> usize {
-    let Some(raw) = value else { return DEFAULT_KEEP };
+    built_keep_or(value, DEFAULT_KEEP)
+}
+
+/// [`built_keep_from`] with `default` for an absent or invalid value.
+fn built_keep_or(value: Option<&str>, default: usize) -> usize {
+    let Some(raw) = value else { return default };
     match raw.trim().parse::<usize>() {
         Ok(n) if (3..=16).contains(&n) => n,
         _ => {
-            tracing::warn!(target: "n42.built_executions", value = raw, default = DEFAULT_KEEP, "N42_BUILT_KEEP must be an integer in 3..=16; using the default");
-            DEFAULT_KEEP
+            tracing::warn!(target: "n42.built_executions", value = raw, default, "N42_BUILT_KEEP must be an integer in 3..=16; using the default");
+            default
         }
     }
 }
@@ -71,7 +76,11 @@ fn built_keep_from(value: Option<&str>) -> usize {
 /// and trie updates, freed on the `n42-built-free` thread.
 fn keep() -> usize {
     static KEEP: OnceLock<usize> = OnceLock::new();
-    *KEEP.get_or_init(|| built_keep_from(std::env::var("N42_BUILT_KEEP").ok().as_deref()))
+    *KEEP.get_or_init(|| {
+        // One more under `N42_DEFERRED_DEPTH3=1` (docs/DEPTH3_DESIGN.md item 9).
+        let default = DEFAULT_KEEP + usize::from(reth_chainspec::qmdb::deferred_depth3_opted_in());
+        built_keep_or(std::env::var("N42_BUILT_KEEP").ok().as_deref(), default)
+    })
 }
 
 /// How far a build that was sealed before it finished has come
@@ -1156,6 +1165,10 @@ mod tests {
         assert_eq!(built_keep_from(Some("2")), 3);
         assert_eq!(built_keep_from(Some("17")), 3);
         assert_eq!(built_keep_from(Some("x")), 3);
+        // The depth-3 default (one more) under the same bounds.
+        assert_eq!(built_keep_or(None, 4), 4);
+        assert_eq!(built_keep_or(Some("2"), 4), 4);
+        assert_eq!(built_keep_or(Some("8"), 4), 8);
     }
 
     #[test]

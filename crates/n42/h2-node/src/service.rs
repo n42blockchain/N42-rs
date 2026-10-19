@@ -570,14 +570,26 @@ const FAR_AHEAD_BLOCKS: u64 = 1;
 /// Parses `N42_FAR_AHEAD_BLOCKS`: an integer in `1..=8`, else the default
 /// [`FAR_AHEAD_BLOCKS`] (an invalid value is logged).
 fn far_ahead_blocks_from(value: Option<&str>) -> u64 {
-    let Some(text) = value else { return FAR_AHEAD_BLOCKS };
+    far_ahead_blocks_or(value, FAR_AHEAD_BLOCKS)
+}
+
+/// [`far_ahead_blocks_from`] with `default` for an absent or invalid value.
+fn far_ahead_blocks_or(value: Option<&str>, default: u64) -> u64 {
+    let Some(text) = value else { return default };
     match text.trim().parse::<u64>() {
         Ok(n) if (1..=8).contains(&n) => n,
         _ => {
             warn!(target: "n42.h2.node", value = text, "invalid N42_FAR_AHEAD_BLOCKS (want 1..=8); keeping the default");
-            FAR_AHEAD_BLOCKS
+            default
         }
     }
+}
+
+/// The default far-ahead limit: [`FAR_AHEAD_BLOCKS`], one more under
+/// `N42_DEFERRED_DEPTH3=1` (docs/DEPTH3_DESIGN.md item 9: at depth 3 a voted
+/// block runs one further ahead of the tip).
+fn far_ahead_default() -> u64 {
+    FAR_AHEAD_BLOCKS + u64::from(n42_qmdb_reth::deferred_depth3_opted_in())
 }
 
 /// How far a block may run ahead of the execution layer's tip before it is
@@ -593,7 +605,7 @@ static FAR_AHEAD_LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 /// The effective far-ahead limit.
 fn far_ahead_limit() -> u64 {
     *FAR_AHEAD_LIMIT
-        .get_or_init(|| far_ahead_blocks_from(std::env::var("N42_FAR_AHEAD_BLOCKS").ok().as_deref()))
+        .get_or_init(|| far_ahead_blocks_or(std::env::var("N42_FAR_AHEAD_BLOCKS").ok().as_deref(), far_ahead_default()))
 }
 /// `N42_CHECK_AHEAD_UNHELD`, read once (off by default): a block that runs
 /// far ahead of the execution layer's tip but which the driver can queue and
@@ -4857,6 +4869,11 @@ mod tests {
         assert_eq!(f(Some("0")), FAR_AHEAD_BLOCKS);
         assert_eq!(f(Some("9")), FAR_AHEAD_BLOCKS);
         assert_eq!(f(Some("x")), FAR_AHEAD_BLOCKS);
+        // The depth-3 default (one more) under the same bounds.
+        use super::far_ahead_blocks_or as g;
+        assert_eq!(g(None, FAR_AHEAD_BLOCKS + 1), 2);
+        assert_eq!(g(Some("9"), FAR_AHEAD_BLOCKS + 1), 2);
+        assert_eq!(g(Some("6"), FAR_AHEAD_BLOCKS + 1), 6);
     }
 
     use super::*;

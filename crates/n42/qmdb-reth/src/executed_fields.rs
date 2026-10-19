@@ -58,6 +58,10 @@ const KEEP: usize = 256;
 /// grandparent's, noted one block earlier; a few views of re-seals besides.
 const ALIASES_KEPT: usize = 16;
 
+/// Parent links kept ([`note_parent`]): as many as results, so a block whose
+/// result is still here can still be reached from its descendants.
+const LINEAGE_KEPT: usize = KEEP;
+
 struct Registry {
     by_hash: HashMap<B256, Partial>,
     order: VecDeque<B256>,
@@ -65,6 +69,11 @@ struct Registry {
     /// the hash its builder gave it and is known to its descendants by the
     /// hash consensus sealed.
     aliases: VecDeque<(B256, B256)>,
+    /// `hash -> parent hash` ([`note_parent`]), for depth 3, where the
+    /// carried ancestor is named by no header in hand.
+    parents: HashMap<B256, B256>,
+    /// The order `parents` was filled in, oldest first, for eviction.
+    parents_order: VecDeque<B256>,
 }
 
 impl Registry {
@@ -76,17 +85,34 @@ impl Registry {
             self.by_hash.get(&built).and_then(Partial::complete)
         })
     }
+
+    /// The parent noted for `hash`, or for the builder hash `hash` is an
+    /// alias of.
+    fn parent(&self, hash: &B256) -> Option<B256> {
+        self.parents.get(hash).copied().or_else(|| {
+            let built = self.aliases.iter().rev().find(|(sealed, _)| sealed == hash)?.1;
+            self.parents.get(&built).copied()
+        })
+    }
 }
 
 static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
 type HistoricalReader = dyn Fn(&B256) -> Option<ExecutedFields> + Send + Sync;
 static HISTORICAL_READER: Mutex<Option<std::sync::Arc<HistoricalReader>>> = Mutex::new(None);
+type LineageReader = dyn Fn(&B256) -> Option<B256> + Send + Sync;
+static LINEAGE_READER: Mutex<Option<std::sync::Arc<LineageReader>>> = Mutex::new(None);
 /// Signalled on every access, for [`wait_for`].
 static WRITTEN: std::sync::Condvar = std::sync::Condvar::new();
 
 fn with_registry<T>(f: impl FnOnce(&mut Registry) -> T) -> T {
     let mut guard = REGISTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let registry = guard.get_or_insert_with(|| Registry { by_hash: HashMap::new(), order: VecDeque::new(), aliases: VecDeque::new() });
+    let registry = guard.get_or_insert_with(|| Registry {
+        by_hash: HashMap::new(),
+        order: VecDeque::new(),
+        aliases: VecDeque::new(),
+        parents: HashMap::new(),
+        parents_order: VecDeque::new(),
+    });
     let out = f(registry);
     drop(guard);
     WRITTEN.notify_all();
@@ -147,7 +173,7 @@ pub fn set_historical_reader(reader: impl Fn(&B256) -> Option<ExecutedFields> + 
 /// The caller must obtain all headers from one canonical database snapshot and
 /// enforce the chain's deferred fork/depth at the carrying header.
 pub fn fields_from_descendants(ancestor: &alloy_consensus::Header, descendants: &[alloy_consensus::Header], depth: u8) -> Option<ExecutedFields> {
-    if !(1..=2).contains(&depth) || descendants.len() != usize::from(depth) { return None; }
+    if !(1..=reth_chainspec::qmdb::MAX_DEFERRED_EXECUTION_DEPTH).contains(&u64::from(depth)) || descendants.len() != usize::from(depth) { return None; }
     let mut parent = ancestor;
     for child in descendants {
         if child.number != parent.number.checked_add(1)? || child.parent_hash != parent.hash_slow() { return None; }
@@ -179,6 +205,55 @@ pub fn note_built(sealed: B256, built: B256) {
             registry.aliases.pop_front();
         }
     });
+}
+
+/// Notes that the block `hash` is a child of `parent_hash`
+/// (`docs/DEPTH3_DESIGN.md` item 4): the lineage a depth-3 lookup walks,
+/// since a header names its parent and grandparent but not the
+/// great-grandparent whose result its child carries.
+///
+/// Noted under the hash a caller knows the block by (a sealed hash, or a
+/// builder hash: [`parent_of`] follows a sealed-to-built alias the way
+/// [`get`] does). Bounded like the results; a block noted again keeps its
+/// place (its parent cannot change: the parent hash is part of its header).
+/// Depths 1 and 2 never read it.
+pub fn note_parent(hash: B256, parent_hash: B256) {
+    with_registry(|registry| {
+        if registry.parents.insert(hash, parent_hash).is_none() {
+            registry.parents_order.push_back(hash);
+            while registry.parents_order.len() > LINEAGE_KEPT {
+                if let Some(old) = registry.parents_order.pop_front() {
+                    registry.parents.remove(&old);
+                }
+            }
+        }
+    });
+}
+
+/// The parent hash noted for `hash` ([`note_parent`]), directly or through
+/// the builder hash it is an alias of, else from the installed lineage
+/// reader ([`set_lineage_reader`]: the provider's headers, for a restart or
+/// a late joiner). `None` when no one knows: a depth-3 caller reports it,
+/// never falls back to a nearer ancestor.
+pub fn parent_of(hash: &B256) -> Option<B256> {
+    // Read only: no `with_registry`, whose notify would wake every waiter.
+    let noted = REGISTRY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|registry| registry.parent(hash));
+    if noted.is_some() {
+        return noted;
+    }
+    let reader = LINEAGE_READER.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()?;
+    // Outside both locks: the reader may open a database transaction.
+    reader(hash)
+}
+
+/// Installs the fallback [`parent_of`] asks when no parent was noted: it must
+/// return the parent hash of a header it holds by `hash`, `None` otherwise.
+pub fn set_lineage_reader(reader: impl Fn(&B256) -> Option<B256> + Send + Sync + 'static) {
+    *LINEAGE_READER.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(reader));
 }
 
 /// The builder hash `sealed` was noted as, if any.
@@ -362,5 +437,62 @@ mod tests {
             note_built(h(0x40 + i), h(0x31));
         }
         assert_eq!(built_of(&h(0x32)), None, "the oldest aliases are evicted");
+    }
+
+    /// Depth 3's lineage: a child of block 4 carries result(2), named by
+    /// walking 4 -> 3 (the parent header) -> 2 (the lineage). A five-block
+    /// chain, parents noted the way builds and header checks note them.
+    #[test]
+    fn the_lineage_walks_parents_and_follows_aliases() {
+        let _serial = serialized();
+        let h = |n: u8| alloy_primitives::keccak256([0xD3, n]);
+        for n in 1..=4u8 {
+            note_parent(h(n), h(n - 1));
+        }
+        assert_eq!(parent_of(&h(4)), Some(h(3)));
+        assert_eq!(parent_of(&h(3)), Some(h(2)));
+        assert_eq!(parent_of(&h(1)), Some(h(0)));
+        assert_eq!(parent_of(&h(0)), None, "genesis has no noted parent");
+        // Re-noting keeps one entry and the same parent.
+        note_parent(h(3), h(2));
+        assert_eq!(parent_of(&h(3)), Some(h(2)));
+        // A leader's own block known by its sealed hash, its parent noted
+        // under the builder's: the alias reaches it.
+        let (sealed, built) = (alloy_primitives::keccak256(b"d3 sealed 5"), alloy_primitives::keccak256(b"d3 built 5"));
+        note_parent(built, h(4));
+        assert_eq!(parent_of(&sealed), None);
+        note_built(sealed, built);
+        assert_eq!(parent_of(&sealed), Some(h(4)));
+        // An alias noted 16 aliases back still reaches (depth 3 needs the
+        // one noted two builds earlier).
+        for i in 0..(ALIASES_KEPT as u8 - 1) {
+            note_built(alloy_primitives::keccak256([0xD4, i]), alloy_primitives::keccak256([0xD5, i]));
+        }
+        assert_eq!(parent_of(&sealed), Some(h(4)), "within the alias window");
+        // The fallback reader answers what was never noted, and only that.
+        let unnoted = alloy_primitives::keccak256(b"d3 from the provider");
+        set_lineage_reader(move |hash| (*hash == unnoted).then_some(B256::repeat_byte(0x77)));
+        assert_eq!(parent_of(&unnoted), Some(B256::repeat_byte(0x77)));
+        assert_eq!(parent_of(&h(4)), Some(h(3)), "a noted parent wins over the reader");
+        assert_eq!(parent_of(&B256::repeat_byte(0x78)), None);
+        *LINEAGE_READER.lock().unwrap() = None;
+        // Old links fall out with the window.
+        for i in 0..(LINEAGE_KEPT as u32 + 4) {
+            let hash = alloy_primitives::keccak256(i.to_le_bytes());
+            note_parent(hash, B256::ZERO);
+        }
+        assert_eq!(parent_of(&h(4)), None, "the oldest parent links are evicted");
+    }
+
+    #[test]
+    fn deferred_history_at_depth_three() {
+        let a = alloy_consensus::Header { number: 10, state_root: B256::repeat_byte(1), ..Default::default() };
+        let b = alloy_consensus::Header { number: 11, parent_hash: a.hash_slow(), ..Default::default() };
+        let c = alloy_consensus::Header { number: 12, parent_hash: b.hash_slow(), ..Default::default() };
+        let d = alloy_consensus::Header { number: 13, parent_hash: c.hash_slow(), state_root: B256::repeat_byte(4), gas_used: 9, ..Default::default() };
+        assert_eq!(fields_from_descendants(&a, &[b.clone(), c.clone(), d.clone()], 3), Some(fields_from_child_header(&d)));
+        assert_eq!(fields_from_descendants(&a, &[b.clone(), c.clone()], 3), None);
+        assert_eq!(fields_from_descendants(&a, &[b.clone(), c.clone(), d.clone(), d], 4), None);
+        assert_eq!(fields_from_descendants(&a, &[b, c.clone()], 2), Some(fields_from_child_header(&c)));
     }
 }

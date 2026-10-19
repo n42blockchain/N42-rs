@@ -589,7 +589,7 @@ fn far_ahead_blocks_or(value: Option<&str>, default: u64) -> u64 {
 /// `N42_DEFERRED_DEPTH3=1` (docs/DEPTH3_DESIGN.md item 9: at depth 3 a voted
 /// block runs one further ahead of the tip).
 fn far_ahead_default() -> u64 {
-    FAR_AHEAD_BLOCKS + u64::from(n42_qmdb_reth::deferred_depth3_opted_in())
+    FAR_AHEAD_BLOCKS + u64::from(n42_h2_consensus::deferred_depth::depth3_opted_in())
 }
 
 /// How far a block may run ahead of the execution layer's tip before it is

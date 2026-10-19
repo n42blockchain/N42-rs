@@ -1859,6 +1859,16 @@ impl QmdbCompatTree {
         self.entries.flush_for_sync()
     }
 
+    /// Hands the entry file's pending appends to a writer that runs
+    /// outside the lock this tree lives under (`N42_QMDB_FLUSH_OFFLOCK`):
+    /// the caller writes and fsyncs them with
+    /// [`OffLockWrite::write_and_sync`]; every later flush, sync, truncate
+    /// or seal of the file waits for that write to land. `None` in the heap
+    /// or when nothing is pending.
+    pub fn take_unwritten_entries(&mut self) -> std::io::Result<Option<crate::entry_store::OffLockWrite>> {
+        self.entries.take_unwritten()
+    }
+
     pub fn next_slot(&self) -> u64 {
         self.next_slot
     }

@@ -434,6 +434,9 @@ pub struct QmdbForest {
     /// cursor, lowered by any move that rewound below it): what
     /// [`Self::block_changes_parts`] checks instead of flushing.
     flushed_slots: u64,
+    /// The cursor of an off-lock write not yet reported landed
+    /// ([`Self::take_unwritten_entries`]); a move clears it.
+    pending_flushed_slots: Option<u64>,
     /// A head move recorded while the tree was leased out
     /// ([`Self::set_canonical_in_place`]) still owes the twig trim it would
     /// have done; [`Self::return_tree`] (or the next
@@ -720,6 +723,26 @@ impl QmdbForest {
         Ok(handle)
     }
 
+    /// Hands the entry file's pending appends to an off-lock writer
+    /// (`N42_QMDB_FLUSH_OFFLOCK`); `None` without an entry file or when
+    /// nothing is pending. The records count as written only once the
+    /// caller reports the write landed ([`Self::note_entries_written`]).
+    pub fn take_unwritten_entries(&mut self) -> Result<Option<n42_twig_core::OffLockWrite>, StateError> {
+        self.refuse_leased()?;
+        let job = self.tree.take_unwritten_entries().map_err(|e| StateError::EntryFile(e.to_string()))?;
+        self.pending_flushed_slots = Some(self.tree.next_slot());
+        Ok(job)
+    }
+
+    /// The write handed out by [`Self::take_unwritten_entries`] is on the
+    /// file: its slots count as written, unless a move rewound the cursor
+    /// in between (then the next flush says so). Needs no tree.
+    pub fn note_entries_written(&mut self) {
+        if let Some(slots) = self.pending_flushed_slots.take() {
+            self.flushed_slots = self.flushed_slots.max(slots);
+        }
+    }
+
     /// Refuses a call that needs the tree while it is leased out.
     const fn refuse_leased(&self) -> Result<(), StateError> {
         if self.leased_at.is_some() { Err(StateError::TreeLeased) } else { Ok(()) }
@@ -852,6 +875,7 @@ impl QmdbForest {
             last_tail: (0, 0, 0),
             leased_at: None,
             flushed_slots: 0,
+            pending_flushed_slots: None,
             trim_due: false,
             deferred_twigs: Vec::new(),
         }
@@ -883,6 +907,7 @@ impl QmdbForest {
         }
         self.min_cursor = self.min_cursor.min(self.tree.next_slot());
         self.flushed_slots = self.flushed_slots.min(self.tree.next_slot());
+        self.pending_flushed_slots = None;
     }
 
     /// Sets how many blocks behind the head are kept.

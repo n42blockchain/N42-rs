@@ -20,6 +20,7 @@ pub mod qmdb_ops;
 mod simd;
 
 use flat::FlatIndex;
+pub use entry_store::OffLockWrite;
 pub use simd::{hash_singleblock_batch, kernel_name as simd_kernel_name};
 pub use index::{thread_read_waits, SharedOffsetIndex, MAX_INDEX_VALUE};
 

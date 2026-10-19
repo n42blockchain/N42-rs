@@ -193,8 +193,11 @@ pub(crate) struct FileEntries {
     /// append is a memory copy and not a write syscall (147,000 of those a
     /// block were the file store's root phase, loop125).
     tail: Vec<u8>,
-    /// How many bytes of `tail` the file already holds.
+    /// How many bytes of `tail` the file already holds, or has handed to
+    /// an off-lock writer ([`Self::take_unwritten`]).
     written: usize,
+    /// Off-lock writes of tail bytes not yet on the file.
+    in_flight: std::sync::Arc<InFlight>,
     /// The tail buffer's address when `populated` was last set, and how
     /// many of its bytes are populated or asked to be
     /// ([`Self::populate_ahead`]).
@@ -238,6 +241,7 @@ impl FileEntries {
             sealed_len: 0,
             tail: Vec::new(),
             written: 0,
+            in_flight: std::sync::Arc::default(),
             populated_base: 0,
             populated: 0,
             populate_epoch: 0,
@@ -299,6 +303,7 @@ impl FileEntries {
             sealed_len: 0,
             tail: Vec::new(),
             written: 0,
+            in_flight: std::sync::Arc::default(),
             populated_base: 0,
             populated: 0,
             populate_epoch: 0,
@@ -632,8 +637,33 @@ impl FileEntries {
         }
     }
 
+    /// Waits until every off-lock write handed out by
+    /// [`Self::take_unwritten`] is on the file. The writer never takes the
+    /// lock that guards this store, so waiting under it cannot deadlock.
+    fn wait_in_flight(&self) {
+        self.in_flight.wait_idle();
+    }
+
+    /// Hands the tail's unwritten bytes to a writer that runs outside
+    /// whatever lock guards this store (`N42_QMDB_FLUSH_OFFLOCK`): the bytes
+    /// are copied out and counted as written, and every later `flush`,
+    /// `sync`, `truncate` and seal waits for the write to land first.
+    /// `None` when nothing is pending.
+    pub(crate) fn take_unwritten(&mut self) -> io::Result<Option<OffLockWrite>> {
+        if self.written >= self.tail.len() {
+            return Ok(None);
+        }
+        let file = self.file.try_clone()?;
+        let offset = self.sealed_len + self.written as u64;
+        let bytes = self.tail[self.written..].to_vec();
+        self.written = self.tail.len();
+        self.in_flight.begin();
+        Ok(Some(OffLockWrite { file, offset, bytes, in_flight: std::sync::Arc::clone(&self.in_flight) }))
+    }
+
     /// Writes the tail's unwritten bytes to the file, in one call.
     fn flush(&mut self) -> io::Result<()> {
+        self.wait_in_flight();
         if self.written < self.tail.len() {
             self.file.seek(io::SeekFrom::Start(self.sealed_len + self.written as u64))?;
             self.file.write_all(&self.tail[self.written..])?;
@@ -682,6 +712,7 @@ impl FileEntries {
 
     /// Writes what the tail still holds and makes every record durable.
     pub(crate) fn sync(&mut self) -> io::Result<()> {
+        self.wait_in_flight();
         self.flush()?;
         self.file.sync_data()
     }
@@ -690,8 +721,10 @@ impl FileEntries {
     /// the file, so the caller can `sync_data` it without holding whatever
     /// lock guards this store: the fsync of a block's ~20 MB is tens of
     /// milliseconds, and under the forest lock it stalled the builder and
-    /// the importer on every block (loop126).
+    /// the importer on every block (loop126). The write itself can move
+    /// off the lock too: [`Self::take_unwritten`] (`N42_QMDB_FLUSH_OFFLOCK`).
     pub(crate) fn flush_for_sync(&mut self) -> io::Result<File> {
+        self.wait_in_flight();
         self.flush()?;
         self.file.try_clone()
     }
@@ -701,6 +734,9 @@ impl FileEntries {
         if len >= self.offsets.len() {
             return Ok(());
         }
+        // A pending write past the cut would grow the file again after
+        // `set_len`.
+        self.wait_in_flight();
         let new_len_bytes = self.offsets[len];
         self.offsets.truncate(len);
         for slot in len..self.active.len() * 64 {
@@ -760,6 +796,9 @@ impl FileEntries {
             sealed_len: self.sealed_len,
             tail: self.tail.clone(),
             written: self.written,
+            // The same pending writes: the copy's tail bytes past them are
+            // on the file only once they land.
+            in_flight: std::sync::Arc::clone(&self.in_flight),
             populated_base: 0,
             populated: 0,
             populate_epoch: 0,
@@ -775,6 +814,83 @@ impl FileEntries {
     #[cfg(test)]
     fn seal_now(&mut self) -> io::Result<()> {
         self.seal_tail()
+    }
+}
+
+/// A count of off-lock writes not yet on the file, and the condition its
+/// waiters sleep on until it is zero.
+#[derive(Debug, Default)]
+pub(crate) struct InFlight {
+    count: std::sync::Mutex<usize>,
+    idle: std::sync::Condvar,
+}
+
+impl InFlight {
+    fn begin(&self) {
+        *self.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+    }
+
+    fn end(&self) {
+        let mut count = self.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.idle.notify_all();
+        }
+    }
+
+    fn wait_idle(&self) {
+        let mut count = self.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *count > 0 {
+            count = self.idle.wait(count).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    #[cfg(test)]
+    fn pending(&self) -> usize {
+        *self.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Bytes of the entry file's tail handed out by `take_unwritten`, to be
+/// written (and made durable) by a caller that holds no lock on the store.
+/// The store's next flush, sync, truncate or seal waits until this is
+/// dropped; dropping it without writing (an error path) releases the wait.
+pub struct OffLockWrite {
+    file: File,
+    offset: u64,
+    bytes: Vec<u8>,
+    in_flight: std::sync::Arc<InFlight>,
+}
+
+impl std::fmt::Debug for OffLockWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OffLockWrite").field("offset", &self.offset).field("bytes", &self.bytes.len()).finish()
+    }
+}
+
+impl OffLockWrite {
+    /// How many bytes this write carries.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Whether this write carries no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Writes the bytes at their offset (a positional write: the store's
+    /// own file cursor is untouched) and `sync_data`s the file.
+    pub fn write_and_sync(self) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file.write_all_at(&self.bytes, self.offset)?;
+        self.file.sync_data()
+    }
+}
+
+impl Drop for OffLockWrite {
+    fn drop(&mut self) {
+        self.in_flight.end();
     }
 }
 
@@ -960,6 +1076,16 @@ impl Entries {
         }
     }
 
+    /// Hands the file's pending appends to an off-lock writer
+    /// ([`FileEntries::take_unwritten`]); `None` for the heap or when
+    /// nothing is pending.
+    pub(crate) fn take_unwritten(&mut self) -> io::Result<Option<OffLockWrite>> {
+        match self {
+            Self::Heap(_) => Ok(None),
+            Self::File(file) => file.take_unwritten(),
+        }
+    }
+
     pub(crate) fn try_clone(&self) -> io::Result<Self> {
         match self {
             Self::Heap(entries) => Ok(Self::Heap(entries.clone())),
@@ -1018,6 +1144,54 @@ mod tests {
 
     fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("n42-entry-store-{name}-{}", std::process::id())).join("entries.log")
+    }
+
+    #[test]
+    fn an_off_lock_write_lands_the_pending_bytes_before_the_seal_maps_them() {
+        let path = scratch("offlock");
+        let mut file = FileEntries::create(&path).unwrap();
+        for n in 0..4u8 {
+            file.push(&[n; 32], &[n; 8]).unwrap();
+        }
+        let job = file.take_unwritten().unwrap().expect("pending bytes");
+        assert_eq!(file.in_flight.pending(), 1);
+        assert!(file.take_unwritten().unwrap().is_none());
+        for n in 4..6u8 {
+            file.push(&[n; 32], &[n; 8]).unwrap();
+        }
+        // A second write of a disjoint range while the first is pending.
+        let second = file.take_unwritten().unwrap().expect("pending bytes");
+        assert_eq!(file.in_flight.pending(), 2);
+        second.write_and_sync().unwrap();
+        job.write_and_sync().unwrap();
+        assert_eq!(file.in_flight.pending(), 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), file.len_bytes);
+        file.seal_now().unwrap();
+        for n in 0..6u8 {
+            assert_eq!(file.key(n as usize), [n; 32]);
+            assert_eq!(file.value(n as usize), &[n; 8]);
+        }
+        let (reopened, kept) = FileEntries::open_existing(&path, 6, &[63]).unwrap();
+        assert_eq!(kept, 6);
+        assert_eq!(reopened.value(5), &[5u8; 8]);
+    }
+
+    #[test]
+    fn a_flush_waits_for_a_pending_off_lock_write() {
+        let path = scratch("offlock-wait");
+        let mut file = FileEntries::create(&path).unwrap();
+        file.push(&[1; 32], &[1; 8]).unwrap();
+        let job = file.take_unwritten().unwrap().expect("pending bytes");
+        let writer = std::thread::spawn(move || job.write_and_sync());
+        // Returns only once the writer's bytes are on the file.
+        file.flush().unwrap();
+        assert_eq!(file.in_flight.pending(), 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), file.len_bytes);
+        writer.join().unwrap().unwrap();
+        // A dropped (unwritten) job releases the wait as well.
+        file.push(&[2; 32], &[2; 8]).unwrap();
+        drop(file.take_unwritten().unwrap());
+        file.sync().unwrap();
     }
 
     #[test]

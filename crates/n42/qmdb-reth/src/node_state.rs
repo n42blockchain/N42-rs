@@ -174,6 +174,21 @@ fn trim_twigs() -> bool {
     *ON.get_or_init(|| std::env::var("N42_QMDB_TRIM_TWIGS").map_or(true, |v| v != "0"))
 }
 
+/// `N42_QMDB_FLUSH_OFFLOCK=1` (default off): the entry file's pending bytes
+/// (a block's ~20 MB) are written outside the forest lock, not only fsynced
+/// there: under it the write held the lock 20-86 ms, 30-50 times a leg, and
+/// the builder's insert, `root_of` and the persisted parts waited on it.
+fn flush_offlock_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("N42_QMDB_FLUSH_OFFLOCK").is_ok_and(|v| v == "1");
+        if on {
+            tracing::info!(target: "n42.qmdb", "N42_QMDB_FLUSH_OFFLOCK");
+        }
+        on
+    })
+}
+
 /// `N42_QMDB_COMPUTE_OFFLOCK=1` (default off): a block's QMDB root
 /// (`compute_operations`, `insert_block_operations`,
 /// `validate_block_operations`) is computed on the tree leased out of the
@@ -234,6 +249,7 @@ const TREE_FREE_LABELS: &[&str] = &[
     "on_persisted_parts",
     "lease_return",
     "on_canonical_defer",
+    "entries_written",
 ];
 
 /// How often (in persistence calls) the QMDB persist split's running sums
@@ -2788,9 +2804,24 @@ impl QmdbNodeState {
     /// delta that names them is written: the write of the pending bytes
     /// under the forest lock (milliseconds), the fsync on a second handle
     /// outside it (tens of milliseconds, which under the lock stalled every
-    /// block's build and import, loop126).
+    /// block's build and import, loop126). With `N42_QMDB_FLUSH_OFFLOCK=1`
+    /// the write moves out too: the lock is held only to copy the pending
+    /// bytes out, a positional write and the fsync follow outside it, and a
+    /// second short hold reports the records written (needs no tree). Any
+    /// flush, truncate or seal of the file meanwhile waits for the write.
     fn sync_entries_if_file(&self) -> Result<(), NodeStateError> {
         if !self.inner.entry_file {
+            return Ok(());
+        }
+        if flush_offlock_env() {
+            let job = self.with_forest("sync_entries_if_file", |forest| forest.take_unwritten_entries())?;
+            if let Some(job) = job {
+                job.write_and_sync().map_err(|source| NodeStateError::Io { path: self.entry_file_path(), source })?;
+            }
+            self.with_forest("entries_written", |forest| {
+                forest.note_entries_written();
+                Ok(())
+            })?;
             return Ok(());
         }
         let handle = self.with_forest("sync_entries_if_file", |forest| forest.flush_entries_for_sync())?;

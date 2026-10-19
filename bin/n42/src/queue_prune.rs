@@ -283,6 +283,24 @@ pub fn min_fold() -> (usize, std::time::Duration) {
     })
 }
 
+/// `N42_PRUNE_MAX_FOLD=<n>` (default 0, unbounded): the most blocks one
+/// wake of the pruning thread folds; what is over is carried into the next
+/// wake, which starts at once, so the lanes' lock is released between
+/// them. Round 10.172: with the prune ~37 ms a block, linear in the blocks
+/// folded, against a ~42 ms block cadence, a minimum fold of 4 ran away to
+/// 35-68-block wakes of 0.3-0.4 s on the thread (the builder's state wait
+/// p50 0.2 -> 5 ms, and the inbox backlog came back on the long wakes).
+pub fn max_fold() -> usize {
+    static KNOB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *KNOB.get_or_init(|| {
+        let n = std::env::var("N42_PRUNE_MAX_FOLD").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        if n > 0 {
+            info!(target: "n42.tx_queue", max_fold = n, "N42_PRUNE_MAX_FOLD");
+        }
+        n
+    })
+}
+
 /// A notification on its way to the pruning thread, with when it arrived.
 type Queued = (CanonStateNotification<N42Primitives>, std::time::Instant);
 
@@ -292,9 +310,20 @@ pub fn spawn_thread(queue: TxQueue<N42PooledTransaction>) -> Option<std::sync::m
     let (tx, rx) = std::sync::mpsc::channel::<Queued>();
     let spawned = std::thread::Builder::new().name("n42-queue-prune".to_owned()).spawn(move || {
         let (min_fold, max_wait) = min_fold();
-        while let Ok(first) = rx.recv() {
+        let max_fold = max_fold();
+        // What a capped wake left over (`N42_PRUNE_MAX_FOLD`); the next
+        // wake starts from it without blocking.
+        let mut carry: Vec<Queued> = Vec::new();
+        loop {
             // Everything already waiting is taken in this wake, in order.
-            let mut batch = vec![first];
+            let mut batch = if carry.is_empty() {
+                match rx.recv() {
+                    Ok(first) => vec![first],
+                    Err(_) => break,
+                }
+            } else {
+                std::mem::take(&mut carry)
+            };
             while let Ok(next) = rx.try_recv() {
                 batch.push(next);
             }
@@ -317,6 +346,9 @@ pub fn spawn_thread(queue: TxQueue<N42PooledTransaction>) -> Option<std::sync::m
                         Err(_) => break,
                     }
                 }
+            }
+            if max_fold > 0 && batch.len() > max_fold {
+                carry = batch.split_off(max_fold);
             }
             let coalesced = batch.len();
             if n42_tx_queue::prune_lean() {

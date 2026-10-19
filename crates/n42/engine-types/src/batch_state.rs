@@ -21,10 +21,40 @@
 use crate::fast_transfer::PlainTransfer;
 use alloy_primitives::{map::AddressMap, Address, B256};
 use revm::{
-    database::states::{AccountStatus, BundleAccount, BundleState, TransitionAccount},
+    database::states::{
+        reverts::{AccountInfoRevert, AccountRevert, RevertToSlot},
+        AccountStatus, BundleAccount, BundleState, StorageWithOriginalValues, TransitionAccount,
+    },
+    primitives::StorageKeyMap,
     state::{AccountInfo, Bytecode, EvmState},
     Database,
 };
+use std::sync::LazyLock;
+
+/// `N42_TAKE_BUNDLE_TRANSFER=1`, read once: [`BatchState::take_bundle`] builds each changed
+/// account's present entry and revert directly ([`BatchState::take_bundle_transfer`]) instead of
+/// through a [`TransitionAccount`] and [`BundleAccount::update_and_create_revert`], and the
+/// empty storage maps of a loaded account and of a revert are cloned from one empty map
+/// instead of each drawing a fresh hasher seed (`gen_per_hasher_seed`, 1.31% of the build
+/// threads' cycles, `docs/BUILDER_FLOOR_PROFILE.md` 4). The bundle is equal either way.
+pub fn take_bundle_transfer() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_TAKE_BUNDLE_TRANSFER").is_ok_and(|v| v == "1"))
+}
+
+/// An empty account storage map whose hasher was seeded once: a clone copies the seed and
+/// allocates nothing, where `Default` draws a new seed per map. The maps stay the public types;
+/// only their hashers share a seed (still random per process).
+fn seedless_storage() -> StorageWithOriginalValues {
+    static EMPTY: LazyLock<StorageWithOriginalValues> = LazyLock::new(Default::default);
+    EMPTY.clone()
+}
+
+/// [`seedless_storage`] for a revert's storage map.
+fn seedless_revert_storage() -> StorageKeyMap<RevertToSlot> {
+    static EMPTY: LazyLock<StorageKeyMap<RevertToSlot>> = LazyLock::new(Default::default);
+    EMPTY.clone()
+}
 
 /// A change [`BatchState::commit`] does not model: the transfer path never
 /// makes one, and a batch that meets one sends the block to the serial
@@ -68,13 +98,20 @@ pub struct BatchState<G> {
 /// its info as `CacheAccount::account_info` then returns it, and its status;
 /// the same info kept as the original.
 fn loaded(info: Option<AccountInfo>) -> BundleAccount {
+    loaded_with(info, take_bundle_transfer())
+}
+
+/// [`loaded`], with the empty storage map from [`seedless_storage`] when `seedless`.
+#[inline]
+fn loaded_with(info: Option<AccountInfo>, seedless: bool) -> BundleAccount {
     let info = match info {
         // `CacheAccount::new_loaded_empty_eip161`: an empty plain account.
         Some(info) if info.is_empty() => Some(AccountInfo::default()),
         info => info,
     };
     let status = loaded_status(info.as_ref());
-    BundleAccount { original_info: info.clone(), info, storage: Default::default(), status }
+    let storage = if seedless { seedless_storage() } else { Default::default() };
+    BundleAccount { original_info: info.clone(), info, storage, status }
 }
 
 /// The status [`loaded`] gives an account whose loaded info is `original`:
@@ -178,7 +215,18 @@ impl<G: Database> BatchState<G> {
     /// The batch's changes against `G`, with their reverts: the bundle
     /// `State` returns from `merge_transitions(BundleRetention::Reverts)`
     /// then `take_bundle`. The batch holds nothing afterwards.
+    /// `N42_TAKE_BUNDLE_TRANSFER=1` takes [`Self::take_bundle_transfer`], the same bundle.
     pub fn take_bundle(&mut self) -> BundleState {
+        if take_bundle_transfer() {
+            self.take_bundle_transfer()
+        } else {
+            self.take_bundle_generic()
+        }
+    }
+
+    /// [`Self::take_bundle`] through revm's own steps: a [`TransitionAccount`] per changed
+    /// account and [`BundleAccount::update_and_create_revert`] onto its original.
+    fn take_bundle_generic(&mut self) -> BundleState {
         let mut accounts = std::mem::take(&mut self.accounts);
         let mut bundle = BundleState::default();
         let mut reverts = Vec::with_capacity(accounts.len());
@@ -226,6 +274,94 @@ impl<G: Database> BatchState<G> {
         }
         bundle
     }
+
+    /// [`Self::take_bundle_generic`]'s bundle built directly for the changes the batch
+    /// models (no storage written, nothing created or destroyed): the present entry is the
+    /// batch's entry as it stands, and the revert is the one
+    /// [`BundleAccount::update_and_create_revert`] makes from the account's loaded original
+    /// for a `Changed` or `InMemoryChange` transition with empty storage -- the info reverted
+    /// to the original (or deleted, for an account loaded as not existing) when it differs,
+    /// no storage reverts, the loaded status as the previous one. Any other status pair is
+    /// handed to the generic step for that account.
+    fn take_bundle_transfer(&mut self) -> BundleState {
+        let mut accounts = std::mem::take(&mut self.accounts);
+        let mut bundle = BundleState::default();
+        let mut reverts = Vec::with_capacity(accounts.len());
+        let (mut state_size, mut reverts_size, mut changed) = (0usize, 0usize, false);
+        accounts.retain(|address, entry| {
+            let previous_status = loaded_status(entry.original_info.as_ref());
+            if entry.status == previous_status {
+                return false;
+            }
+            changed = true;
+            // `TransitionAccount::has_new_contract` on the transition the generic step builds.
+            let present_code_hash = entry.info.as_ref().map(|info| &info.code_hash);
+            let previous_code_hash = entry.original_info.as_ref().map(|info| &info.code_hash);
+            if present_code_hash != previous_code_hash
+                && let Some((hash, code)) =
+                    entry.info.as_ref().and_then(|info| info.code.as_ref().map(|code| (info.code_hash, code)))
+            {
+                bundle.contracts.insert(hash, code.clone());
+            }
+            let info_revert = if entry.original_info != entry.info {
+                AccountInfoRevert::RevertTo(entry.original_info.clone().unwrap_or_default())
+            } else {
+                AccountInfoRevert::DoNothing
+            };
+            let account = match (entry.status, previous_status) {
+                (AccountStatus::Changed, AccountStatus::Loaded | AccountStatus::LoadedEmptyEIP161)
+                | (AccountStatus::InMemoryChange, AccountStatus::Loaded | AccountStatus::LoadedEmptyEIP161) => {
+                    info_revert
+                }
+                (AccountStatus::InMemoryChange, AccountStatus::LoadedNotExisting) => AccountInfoRevert::DeleteIt,
+                _ => {
+                    let Some(revert) = generic_revert(entry, previous_status) else { return false };
+                    state_size += entry.size_hint();
+                    reverts_size += revert.size_hint();
+                    reverts.push((*address, revert));
+                    return true;
+                }
+            };
+            let revert =
+                AccountRevert { account, storage: seedless_revert_storage(), previous_status, wipe_storage: false };
+            state_size += entry.size_hint();
+            reverts_size += revert.size_hint();
+            reverts.push((*address, revert));
+            true
+        });
+        if changed {
+            bundle.state = accounts;
+            bundle.reverts.push(reverts);
+            bundle.state_size = state_size;
+            bundle.reverts_size = reverts_size;
+        }
+        bundle
+    }
+}
+
+/// The generic step of [`BatchState::take_bundle_generic`] for one changed account whose
+/// transition the transfer path does not build directly; the contract, if any, is recorded
+/// by the caller already. `None` when revm makes no revert (the entry is then dropped).
+#[cold]
+fn generic_revert(
+    entry: &mut BundleAccount,
+    previous_status: AccountStatus,
+) -> Option<AccountRevert> {
+    let (present_info, present_status) = (entry.info.clone(), entry.status);
+    let transition = TransitionAccount {
+        info: entry.info.take(),
+        status: entry.status,
+        previous_info: entry.original_info.clone(),
+        previous_status,
+        storage: std::mem::take(&mut entry.storage),
+        storage_was_destroyed: false,
+    };
+    entry.info = entry.original_info.clone();
+    entry.status = previous_status;
+    let revert = entry.update_and_create_revert(transition)?;
+    entry.info = present_info;
+    entry.status = present_status;
+    Some(revert)
 }
 
 impl<G: Database + crate::parallel_transfer::AccountHint> BatchState<G> {
@@ -384,6 +520,87 @@ mod tests {
         assert_eq!(direct.reverts, theirs.reverts);
         assert!(!ours.state.contains_key(&addr(40)));
         assert!(batch.accounts.is_empty());
+    }
+
+    /// `N42_TAKE_BUNDLE_TRANSFER`: the transfer-only close gives the generic close's bundle
+    /// (and `State`'s) on a few hundred accounts -- existing with and without a nonce, empty
+    /// (EIP-161) and missing recipients created by the transfer, a beneficiary, accounts only
+    /// read -- through both `commit` and `commit_transfer`, with seedless storage maps.
+    #[test]
+    fn the_transfer_close_equals_the_generic_close() {
+        let account = |i: u64| Address::from_word(B256::from(U256::from(i + 1)));
+        let mut db = CacheDB::new(EmptyDB::default());
+        // 0..100: funded, no nonce; 100..200: funded with a nonce; 200..300: empty.
+        for i in 0..300u64 {
+            let info = match i / 100 {
+                0 => AccountInfo { balance: U256::from(1_000_000u64), ..Default::default() },
+                1 => AccountInfo { balance: U256::from(2_000_000u64), nonce: i, ..Default::default() },
+                _ => AccountInfo::default(),
+            };
+            db.insert_account_info(account(i), info);
+        }
+        let coinbase = account(0);
+        let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();
+        let mut generic = BatchState::with_capacity(db.clone(), 600);
+        let mut transfer = BatchState::with_capacity(db, 600);
+        for k in 0..400u64 {
+            let from = account(1 + k % 199);
+            // Existing, empty, and missing (created by the transfer) recipients, some repeated.
+            let to = match k % 4 {
+                0 => account(k % 200),
+                1 => account(200 + k % 100),
+                2 => account(1_000 + k),
+                _ => account(1_000 + k % 50),
+            };
+            // A transfer's three accounts are distinct.
+            let to = if to == from || to == coinbase { account(1_000 + k) } else { to };
+            let value = 10 + k;
+            let made = changes(&mut state, from, to, coinbase, value);
+            state.commit(made);
+            for batch in [&mut generic, &mut transfer] {
+                if k % 2 == 0 {
+                    let made = changes(batch, from, to, coinbase, value);
+                    batch.commit(made).expect("a plain transfer");
+                } else {
+                    let _ = changes(batch, from, to, coinbase, value);
+                    let computed = plain(batch, from, to, coinbase, value);
+                    batch.commit_transfer(computed).expect("a plain transfer");
+                }
+            }
+        }
+        // Accounts only read stay out of both.
+        for i in 5_000..5_010u64 {
+            assert!(generic.basic(account(i)).expect("read").is_none());
+            assert!(transfer.basic(account(i)).expect("read").is_none());
+        }
+        // The knob's loaded accounts: seedless storage maps.
+        for entry in transfer.accounts.values_mut() {
+            entry.storage = seedless_storage();
+        }
+        state.merge_transitions(BundleRetention::Reverts);
+        let mut theirs = state.take_bundle();
+        let mut generic = generic.take_bundle_generic();
+        let mut ours = transfer.take_bundle_transfer();
+        for bundle in [&mut theirs, &mut generic, &mut ours] {
+            for reverts in bundle.reverts.iter_mut() {
+                reverts.sort_by_key(|(address, _)| *address);
+            }
+        }
+        assert!(ours.state.len() > 300, "{} accounts changed", ours.state.len());
+        assert_eq!(ours, generic);
+        assert_eq!(ours.state, theirs.state);
+        assert_eq!(ours.contracts, theirs.contracts);
+        assert_eq!(ours.reverts, theirs.reverts);
+        assert_eq!((ours.state_size, ours.reverts_size), (theirs.state_size, theirs.reverts_size));
+        assert!(transfer.accounts.is_empty());
+    }
+
+    #[test]
+    fn a_seedless_loaded_account_equals_the_default_one() {
+        for info in [None, Some(AccountInfo::default()), Some(funded())] {
+            assert_eq!(loaded_with(info.clone(), true), loaded_with(info, false));
+        }
+        assert!(seedless_storage().is_empty() && seedless_revert_storage().is_empty());
     }
 
     use revm::state::EvmStorageSlot;

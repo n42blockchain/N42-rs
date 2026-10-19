@@ -733,8 +733,30 @@ fn main() {
                                                 Err(_) => break,
                                             }
                                         }
+                                        // `N42_PRUNE_MIN_FOLD`: hold the wake
+                                        // until at least `min_fold` blocks are
+                                        // in, or `max_wait` has passed since
+                                        // the first (see `n42::queue_prune`).
+                                        let (min_fold, max_wait) = n42::queue_prune::min_fold();
+                                        let first_at = std::time::Instant::now();
+                                        if min_fold > 1 {
+                                            let deadline = first_at + max_wait;
+                                            while batch.len() < min_fold {
+                                                let now = std::time::Instant::now();
+                                                if now >= deadline {
+                                                    break;
+                                                }
+                                                match tokio::time::timeout(deadline - now, canonical.recv()).await {
+                                                    Ok(Ok(next)) => batch.push(next),
+                                                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                                                        warn!(target: "n42.tx_queue", skipped, "queue pruning fell behind canonical notifications");
+                                                    }
+                                                    Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) => break,
+                                                }
+                                            }
+                                        }
                                         let notifications: Vec<_> = batch.iter().collect();
-                                        n42::queue_prune::prune_notifications_lean(&queue, &notifications, std::time::Duration::ZERO);
+                                        n42::queue_prune::prune_notifications_lean(&queue, &notifications, first_at.elapsed());
                                     }
                                     None => n42::queue_prune::prune_notification(&queue, &notification, 1, std::time::Duration::ZERO),
                                 }

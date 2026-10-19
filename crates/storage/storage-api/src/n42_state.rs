@@ -72,6 +72,51 @@ pub fn hashed_tables_off() -> bool {
     *OFF.get_or_init(|| std::env::var("N42_HASHED_TABLES").is_ok_and(|v| v == "off"))
 }
 
+/// Whether an account read below the database tip (an overlay anchored behind it, a
+/// "historical fallback") asks the reader at the anchor's version before the per-block
+/// changeset scan (`N42_BUILD_READS_NO_CHANGESET=1`), read once. The reader answers a version
+/// behind its head through its journals and declines one it cannot answer exactly; a declined
+/// read takes the changeset scan as before.
+pub fn build_reads_no_changeset() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILD_READS_NO_CHANGESET").is_ok_and(|v| v == "1"))
+}
+
+// Historical-fallback account reads: per-thread accumulators folded into the totals every
+// `HISTORICAL_FLUSH_EVERY` reads, so a read pays a thread-local add and no shared atomic.
+static HISTORICAL_SCANS: AtomicU64 = AtomicU64::new(0);
+static HISTORICAL_ANSWERS: AtomicU64 = AtomicU64::new(0);
+const HISTORICAL_FLUSH_EVERY: u32 = 4096;
+
+std::thread_local! {
+    static HISTORICAL_LOCAL: core::cell::Cell<(u64, u64, u32)> = const { core::cell::Cell::new((0, 0, 0)) };
+}
+
+/// Counts one account read that reached the database below its tip: `answered` when the
+/// reader answered it at the anchor's version, otherwise it took the changeset scan.
+#[inline]
+pub fn record_historical_read(answered: bool) {
+    let _ = HISTORICAL_LOCAL.try_with(|local| {
+        let (scans, answers, n) = local.get();
+        let (scans, answers, n) =
+            (scans + u64::from(!answered), answers + u64::from(answered), n + 1);
+        if n >= HISTORICAL_FLUSH_EVERY {
+            HISTORICAL_SCANS.fetch_add(scans, Ordering::Relaxed);
+            HISTORICAL_ANSWERS.fetch_add(answers, Ordering::Relaxed);
+            local.set((0, 0, 0));
+        } else {
+            local.set((scans, answers, n));
+        }
+    });
+}
+
+/// `(changeset_scans, qmdb_answers)` since startup of the account reads below the database tip.
+/// Each thread folds its counts in every 4096 reads, so up to that many a thread are not yet
+/// counted.
+pub fn historical_read_counts() -> (u64, u64) {
+    (HISTORICAL_SCANS.load(Ordering::Relaxed), HISTORICAL_ANSWERS.load(Ordering::Relaxed))
+}
+
 /// A latest-state read the reader did not answer while the hashed tables are not written.
 #[derive(Debug, Clone)]
 pub struct UnansweredRead(alloc::string::String);

@@ -4303,6 +4303,11 @@ where
                 // at all, and how deep (the process's, folded per 4,096 reads).
                 let (view_journal_reads, view_journal_searches, view_journal_skips) =
                     n42_qmdb_reth::read_view::take_journal_counters();
+                // Account reads below the database tip (the overlay anchored behind it)
+                // since startup: those the changeset scan answered, and those the QMDB
+                // reader answered at the anchor (`N42_BUILD_READS_NO_CHANGESET=1`).
+                let (hist_changeset_scans, hist_qmdb_answers) =
+                    reth_storage_api::n42_state::historical_read_counts();
                 let prev_road = crate::post_seal::road_us(parent_header.number);
                 tracing::info!(
                     target: "payload_builder",
@@ -4415,6 +4420,8 @@ where
                     view_journal_reads,
                     view_journal_searches,
                     view_journal_skips,
+                    hist_changeset_scans,
+                    hist_qmdb_answers,
                     // `N42_PHASE_TIMERS=1` (plan v6 6.5/6.6): where the
                     // parallel step's wall time (`par_exec_ms` above) goes
                     // inside `N42Evm::transfer`, which door each account read

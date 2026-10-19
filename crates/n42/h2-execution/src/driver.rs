@@ -140,25 +140,52 @@ pub const FOLLOWER_LAG_CAP: usize = 4;
 /// default kept.
 pub fn deferred_in_flight() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| match std::env::var("N42_DEFERRED_IN_FLIGHT") {
-        Err(_) => DEFERRED_IN_FLIGHT,
-        Ok(raw) => match parse_in_flight(&raw) {
-            Ok(cap) => cap,
-            Err(err) => {
-                warn!(target: "n42.h2.el", %err, default = DEFERRED_IN_FLIGHT, "N42_DEFERRED_IN_FLIGHT refused");
-                DEFERRED_IN_FLIGHT
-            }
-        },
+    *CAP.get_or_init(|| {
+        let default = deferred_in_flight_default();
+        match std::env::var("N42_DEFERRED_IN_FLIGHT") {
+            Err(_) => default,
+            Ok(raw) => match parse_in_flight(&raw) {
+                Ok(cap) => cap,
+                Err(err) => {
+                    warn!(target: "n42.h2.el", %err, default, "N42_DEFERRED_IN_FLIGHT refused");
+                    default
+                }
+            },
+        }
     })
 }
 
-/// An in-flight cap, checked against `1..=`[`DEFERRED_IN_FLIGHT_MAX`].
+/// One more block in flight at depth 3 (`N42_DEFERRED_DEPTH3=1`,
+/// `docs/DEPTH3_DESIGN.md` item 9): the vote no longer waits for the
+/// grandparent's root, so checks run one block further ahead of the tip.
+fn depth3_extra() -> usize {
+    usize::from(n42_h2_consensus::deferred_depth::depth3_opted_in())
+}
+
+/// The default in-flight cap: [`DEFERRED_IN_FLIGHT`], one more with the
+/// depth-3 opt-in.
+pub fn deferred_in_flight_default() -> usize {
+    DEFERRED_IN_FLIGHT + depth3_extra()
+}
+
+/// The largest in-flight cap accepted: [`DEFERRED_IN_FLIGHT_MAX`], one more
+/// with the depth-3 opt-in (whose follower keeps one more published output).
+pub fn deferred_in_flight_max() -> usize {
+    DEFERRED_IN_FLIGHT_MAX + depth3_extra()
+}
+
+/// An in-flight cap, checked against `1..=`[`deferred_in_flight_max`].
 pub fn parse_in_flight(raw: &str) -> Result<usize, String> {
+    parse_in_flight_up_to(raw, deferred_in_flight_max())
+}
+
+/// An in-flight cap, checked against `1..=max`.
+pub fn parse_in_flight_up_to(raw: &str, max: usize) -> Result<usize, String> {
     let cap: usize = raw.trim().parse().map_err(|_| format!("{raw:?} is not a count"))?;
-    if (1..=DEFERRED_IN_FLIGHT_MAX).contains(&cap) {
+    if (1..=max).contains(&cap) {
         Ok(cap)
     } else {
-        Err(format!("{cap} is outside 1..={DEFERRED_IN_FLIGHT_MAX}"))
+        Err(format!("{cap} is outside 1..={max}"))
     }
 }
 
@@ -1921,15 +1948,19 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.deferred_execution_time = at;
     }
 
-    /// The chain's `deferredExecutionDepth` (see the field): 1 or 2. Anything
-    /// else is refused and leaves the depth as it was.
+    /// The chain's `deferredExecutionDepth` (see the field): 1 or 2, and 3
+    /// with `N42_DEFERRED_DEPTH3=1`. Anything else is refused and leaves the
+    /// depth as it was.
     pub fn set_deferred_depth(&mut self, depth: u64) -> Result<(), String> {
-        // The rule is defined to `deferred_depth::MAX_DEPTH` (3); the driver's
-        // in-flight caps and settlement are wired for depth 2 at most until
-        // `docs/DEPTH3_DESIGN.md` stage 2.
-        const DRIVER_MAX_DEPTH: u64 = 2;
-        if !(1..=DRIVER_MAX_DEPTH).contains(&depth) {
-            return Err(format!("deferred execution depth {depth}: expected 1..={DRIVER_MAX_DEPTH}"));
+        self.set_deferred_depth_up_to(depth, n42_h2_consensus::deferred_depth::run_max_depth())
+    }
+
+    /// [`Self::set_deferred_depth`] against an explicit deepest depth
+    /// (capped at the rule's `MAX_DEPTH`) instead of this process's opt-in.
+    pub fn set_deferred_depth_up_to(&mut self, depth: u64, max: u64) -> Result<(), String> {
+        let max = max.min(n42_h2_consensus::deferred_depth::MAX_DEPTH);
+        if !(1..=max).contains(&depth) {
+            return Err(format!("deferred execution depth {depth}: expected 1..={max}"));
         }
         self.deferred_depth = depth;
         Ok(())

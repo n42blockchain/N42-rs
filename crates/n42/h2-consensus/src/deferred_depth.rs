@@ -44,6 +44,30 @@ use alloy_primitives::B256;
 /// parent header; depth 3 needs one step of lineage beyond it.
 pub const MAX_DEPTH: u64 = 3;
 
+/// The environment variable that opts a process in to *run* depth 3
+/// (`N42_DEFERRED_DEPTH3=1`, `docs/DEPTH3_DESIGN.md` section 4); the same
+/// variable `reth_chainspec::qmdb` reads for the start-up check. The rule is
+/// defined to [`MAX_DEPTH`] either way; this gates the wiring and the
+/// capacities sized for depth 3.
+pub const DEPTH3_ENV: &str = "N42_DEFERRED_DEPTH3";
+
+/// Whether a value of [`DEPTH3_ENV`] opts in: exactly `1`.
+pub fn depth3_opted_in_from(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.trim() == "1")
+}
+
+/// [`DEPTH3_ENV`], read once.
+pub fn depth3_opted_in() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| depth3_opted_in_from(std::env::var(DEPTH3_ENV).ok().as_deref()))
+}
+
+/// The deepest depth this process runs: [`MAX_DEPTH`] with [`DEPTH3_ENV`],
+/// else 2.
+pub fn run_max_depth() -> u64 {
+    if depth3_opted_in() { MAX_DEPTH } else { 2 }
+}
+
 /// What the rule needs to know about a block's parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParentLink {

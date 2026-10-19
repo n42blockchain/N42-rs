@@ -115,11 +115,43 @@ pub const DEFERRED_EXECUTION_DEPTH_KEY: &str = "deferredExecutionDepth";
 /// naming it parses.
 pub const MAX_DEFERRED_EXECUTION_DEPTH: u64 = 3;
 
-/// The deepest depth this build of the node runs. A depth the rule defines
-/// but the node does not yet implement is refused at start-up
-/// ([`DeferredDepthError::NotImplemented`]): depth 3 parses but stays
-/// refused until its wiring lands (`docs/DEPTH3_DESIGN.md` stages 2-3).
+/// The deepest depth this build of the node runs by default. A depth the
+/// rule defines but the node does not run is refused at start-up
+/// ([`DeferredDepthError::NotImplemented`]): depth 3 parses, and runs only
+/// with [`DEFERRED_DEPTH3_ENV`] set ([`supported_deferred_execution_depth`]).
 pub const SUPPORTED_DEFERRED_EXECUTION_DEPTH: u64 = 2;
+
+/// The environment variable that opts this binary in to *accept* a depth-3
+/// genesis (`N42_DEFERRED_DEPTH3=1`, `docs/DEPTH3_DESIGN.md` section 4). The
+/// depth itself is a chain rule and comes from the genesis only; without
+/// the opt-in a depth-3 genesis is refused at start-up, and with it nothing
+/// changes for a depth-1 or depth-2 genesis except the capacities that are
+/// sized for depth 3.
+pub const DEFERRED_DEPTH3_ENV: &str = "N42_DEFERRED_DEPTH3";
+
+/// Whether a value of [`DEFERRED_DEPTH3_ENV`] opts in: exactly `1`.
+pub fn deferred_depth3_opted_in_from(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.trim() == "1")
+}
+
+/// [`DEFERRED_DEPTH3_ENV`], read once.
+pub fn deferred_depth3_opted_in() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| deferred_depth3_opted_in_from(std::env::var(DEFERRED_DEPTH3_ENV).ok().as_deref()))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        false
+    }
+}
+
+/// The deepest depth this process runs: 3 with [`DEFERRED_DEPTH3_ENV`],
+/// else [`SUPPORTED_DEFERRED_EXECUTION_DEPTH`].
+pub fn supported_deferred_execution_depth() -> u64 {
+    if deferred_depth3_opted_in() { MAX_DEFERRED_EXECUTION_DEPTH } else { SUPPORTED_DEFERRED_EXECUTION_DEPTH }
+}
 
 /// Why a genesis's `deferredExecutionDepth` is refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +172,8 @@ pub enum DeferredDepthError {
         /// The genesis timestamp.
         genesis: u64,
     },
-    /// A valid depth this build of the node does not implement yet.
+    /// A valid depth this process does not run (depth 3 without
+    /// [`DEFERRED_DEPTH3_ENV`]).
     NotImplemented(u64),
 }
 
@@ -166,8 +199,9 @@ impl core::fmt::Display for DeferredDepthError {
             ),
             Self::NotImplemented(depth) => write!(
                 f,
-                "{DEFERRED_EXECUTION_DEPTH_KEY} {depth} is not implemented by this node yet (it runs depth \
-                 {SUPPORTED_DEFERRED_EXECUTION_DEPTH} at most)"
+                "{DEFERRED_EXECUTION_DEPTH_KEY} {depth} is not run by this node (it runs depth \
+                 {SUPPORTED_DEFERRED_EXECUTION_DEPTH} at most; depth {MAX_DEFERRED_EXECUTION_DEPTH} needs \
+                 {DEFERRED_DEPTH3_ENV}=1)"
             ),
         }
     }
@@ -206,8 +240,14 @@ pub fn deferred_execution_depth(genesis: &Genesis) -> Result<u64, DeferredDepthE
 /// [`deferred_execution_depth`], and refused when this build of the node
 /// does not implement the depth: what a node calls at start-up.
 pub fn check_deferred_execution_depth(genesis: &Genesis) -> Result<u64, DeferredDepthError> {
+    check_deferred_execution_depth_up_to(genesis, supported_deferred_execution_depth())
+}
+
+/// [`check_deferred_execution_depth`] against an explicit deepest depth
+/// `supported` instead of this process's.
+pub fn check_deferred_execution_depth_up_to(genesis: &Genesis, supported: u64) -> Result<u64, DeferredDepthError> {
     let depth = deferred_execution_depth(genesis)?;
-    if depth > SUPPORTED_DEFERRED_EXECUTION_DEPTH {
+    if depth > supported {
         return Err(DeferredDepthError::NotImplemented(depth));
     }
     Ok(depth)

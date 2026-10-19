@@ -27,8 +27,8 @@ fn the_depth_is_parsed_strictly() {
     // Absent is 1, with or without the gate.
     assert_eq!(deferred_execution_depth(&genesis(json!({}), 0)), Ok(1));
     assert_eq!(deferred_execution_depth(&genesis(json!({ "deferredExecutionTime": 0 }), 0)), Ok(1));
-    // 1 and 2 with the gate at genesis.
-    for depth in [1u64, 2] {
+    // 1, 2 and 3 with the gate at genesis.
+    for depth in [1u64, 2, 3] {
         let g = genesis(json!({ "deferredExecutionTime": 0, "deferredExecutionDepth": depth }), 0);
         assert_eq!(deferred_execution_depth(&g), Ok(depth));
         assert_eq!(deferred_execution_depth_at(&g, 5), depth);
@@ -43,7 +43,8 @@ fn the_depth_is_parsed_strictly() {
         (json!(2.0), DeferredDepthError::NotAnInteger("2.0".into())),
         (json!(-1), DeferredDepthError::NotAnInteger("-1".into())),
         (json!(0), DeferredDepthError::OutOfRange(0)),
-        (json!(3), DeferredDepthError::OutOfRange(3)),
+        (json!(4), DeferredDepthError::OutOfRange(4)),
+        (json!(64), DeferredDepthError::OutOfRange(64)),
     ] {
         let g = genesis(json!({ "deferredExecutionTime": 0, "deferredExecutionDepth": value }), 0);
         assert_eq!(deferred_execution_depth(&g), Err(err));
@@ -81,9 +82,27 @@ fn the_node_refuses_a_depth_it_does_not_implement() {
     } else {
         assert_eq!(checked, Err(DeferredDepthError::NotImplemented(2)));
     }
+    // Depth 3 is defined by the rule but not run by this node yet: it
+    // parses and is refused at start-up.
+    let three = genesis(json!({ "deferredExecutionTime": 0, "deferredExecutionDepth": 3 }), 0);
+    assert_eq!(deferred_execution_depth(&three), Ok(3));
+    let checked = check_deferred_execution_depth(&three);
+    if SUPPORTED_DEFERRED_EXECUTION_DEPTH >= 3 {
+        assert_eq!(checked, Ok(3));
+    } else {
+        assert_eq!(checked, Err(DeferredDepthError::NotImplemented(3)));
+    }
     // Errors of the value come first.
-    let bad = genesis(json!({ "deferredExecutionTime": 0, "deferredExecutionDepth": 3 }), 0);
-    assert_eq!(check_deferred_execution_depth(&bad), Err(DeferredDepthError::OutOfRange(3)));
+    let bad = genesis(json!({ "deferredExecutionTime": 0, "deferredExecutionDepth": 4 }), 0);
+    assert_eq!(check_deferred_execution_depth(&bad), Err(DeferredDepthError::OutOfRange(4)));
+    // Depth 3 with the gate after genesis is refused like depth 2.
+    let late = genesis(json!({ "deferredExecutionTime": 101, "deferredExecutionDepth": 3 }), 100);
+    assert_eq!(deferred_execution_depth(&late), Err(DeferredDepthError::GateAfterGenesis { gate: 101, genesis: 100 }));
+    // The messages name the defined range.
+    assert_eq!(
+        DeferredDepthError::OutOfRange(4).to_string(),
+        "deferredExecutionDepth must be 1..=3, found 4"
+    );
 }
 
 #[test]

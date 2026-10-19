@@ -1924,8 +1924,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// The chain's `deferredExecutionDepth` (see the field): 1 or 2. Anything
     /// else is refused and leaves the depth as it was.
     pub fn set_deferred_depth(&mut self, depth: u64) -> Result<(), String> {
-        if !(1..=n42_h2_consensus::deferred_depth::MAX_DEPTH).contains(&depth) {
-            return Err(format!("deferred execution depth {depth}: expected 1..={}", n42_h2_consensus::deferred_depth::MAX_DEPTH));
+        // The rule is defined to `deferred_depth::MAX_DEPTH` (3); the driver's
+        // in-flight caps and settlement are wired for depth 2 at most until
+        // `docs/DEPTH3_DESIGN.md` stage 2.
+        const DRIVER_MAX_DEPTH: u64 = 2;
+        if !(1..=DRIVER_MAX_DEPTH).contains(&depth) {
+            return Err(format!("deferred execution depth {depth}: expected 1..={DRIVER_MAX_DEPTH}"));
         }
         self.deferred_depth = depth;
         Ok(())

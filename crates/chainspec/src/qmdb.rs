@@ -106,15 +106,19 @@ pub fn deferred_execution_active_at(genesis: &Genesis, timestamp: u64) -> bool {
 /// Genesis `config` key: how many blocks behind a header the execution result
 /// it carries is (`docs/DEFERRED_DEPTH_2_DESIGN.md`). Absent means 1: a
 /// header carries its parent's result. At 2 it carries its parent's
-/// parent's. A chain constant, read once, for every block at or past
+/// parent's, at 3 the parent's parent's parent's (`docs/DEPTH3_DESIGN.md`).
+/// A chain constant, read once, for every block at or past
 /// [`DEFERRED_EXECUTION_TIME_KEY`].
 pub const DEFERRED_EXECUTION_DEPTH_KEY: &str = "deferredExecutionDepth";
 
-/// The deepest deferred-execution depth the rule is defined for.
-pub const MAX_DEFERRED_EXECUTION_DEPTH: u64 = 2;
+/// The deepest deferred-execution depth the rule is defined for: a genesis
+/// naming it parses.
+pub const MAX_DEFERRED_EXECUTION_DEPTH: u64 = 3;
 
 /// The deepest depth this build of the node runs. A depth the rule defines
-/// but the node does not yet implement is refused at start-up.
+/// but the node does not yet implement is refused at start-up
+/// ([`DeferredDepthError::NotImplemented`]): depth 3 parses but stays
+/// refused until its wiring lands (`docs/DEPTH3_DESIGN.md` stages 2-3).
 pub const SUPPORTED_DEFERRED_EXECUTION_DEPTH: u64 = 2;
 
 /// Why a genesis's `deferredExecutionDepth` is refused.
@@ -144,10 +148,10 @@ impl core::fmt::Display for DeferredDepthError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NotAnInteger(value) => {
-                write!(f, "{DEFERRED_EXECUTION_DEPTH_KEY} must be an integer 1 or 2, found {value}")
+                write!(f, "{DEFERRED_EXECUTION_DEPTH_KEY} must be an integer 1..={MAX_DEFERRED_EXECUTION_DEPTH}, found {value}")
             }
             Self::OutOfRange(depth) => {
-                write!(f, "{DEFERRED_EXECUTION_DEPTH_KEY} must be 1 or 2, found {depth}")
+                write!(f, "{DEFERRED_EXECUTION_DEPTH_KEY} must be 1..={MAX_DEFERRED_EXECUTION_DEPTH}, found {depth}")
             }
             Self::WithoutGate => {
                 write!(f, "{DEFERRED_EXECUTION_DEPTH_KEY} is set but {DEFERRED_EXECUTION_TIME_KEY} is not")
@@ -172,13 +176,15 @@ impl core::fmt::Display for DeferredDepthError {
 impl core::error::Error for DeferredDepthError {}
 
 /// The chain's deferred-execution depth, parsed strictly: absent is 1; a
-/// present value must be the integer 1 or 2, and needs
+/// present value must be an integer in `1..=MAX_DEFERRED_EXECUTION_DEPTH`, and needs
 /// `deferredExecutionTime` beside it (an unsigned integer); a depth above 1
 /// needs that gate at or before the genesis timestamp.
 ///
 /// Strict because the other parsers here swallow a malformed value, and for
 /// the depth that would be a silent change of rule: a typo would give depth 1,
-/// and a depth-1 member of a depth-2 fleet refuses every header.
+/// and a depth-1 member of a depth-2 fleet refuses every header. A depth
+/// the rule defines but this node does not run parses here and is refused by
+/// [`check_deferred_execution_depth`].
 pub fn deferred_execution_depth(genesis: &Genesis) -> Result<u64, DeferredDepthError> {
     let Some(value) = genesis.config.extra_fields.get(DEFERRED_EXECUTION_DEPTH_KEY) else {
         return Ok(1);

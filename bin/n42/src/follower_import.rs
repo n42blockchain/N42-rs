@@ -658,7 +658,7 @@ fn wait_for_ancestor_fields(
     if !n42_engine_types::hotstuff_consensus::ancestor_result_is_recorded(genesis, parent, depth) {
         return Ok(());
     }
-    let ancestor = n42_engine_types::hotstuff_consensus::ancestor_hash(parent, depth);
+    let ancestor = n42_engine_types::hotstuff_consensus::ancestor_hash_checked(parent, depth).map_err(|err| err.to_string())?;
     n42_engine_types::executed_fields::wait_for(&ancestor, PARENT_WAIT)
         .map(|_| ())
         .ok_or_else(|| format!("ancestor {ancestor}'s execution fields not recorded within {PARENT_WAIT:?}"))

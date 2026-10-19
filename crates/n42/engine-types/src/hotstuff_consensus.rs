@@ -124,6 +124,15 @@ pub enum DeferredExecutionError {
     /// ancestor's hash.
     #[error("deferred execution: the parent {0}'s execution result is not known here")]
     ParentUnknown(B256),
+    /// Depth 3 and above: the carried ancestor is named through the
+    /// executed-fields registry's parent links, and none is known here for
+    /// this hash (`docs/DEPTH3_DESIGN.md` item 4). Never a fallback to a
+    /// nearer ancestor.
+    #[error("deferred execution: the parent of {0} is not known here, so the carried ancestor cannot be named")]
+    LineageUnknown(B256),
+    /// A depth the rule does not define.
+    #[error("deferred execution depth {0} is not defined")]
+    UnsupportedDepth(u64),
     /// The header's execution fields are not the carried ancestor's result.
     #[error("deferred execution: header carries {got:?} for parent {parent}, this node executed {expected:?}")]
     Mismatch {
@@ -144,14 +153,37 @@ pub fn parent_executed_fields(genesis: &alloy_genesis::Genesis, parent: &SealedH
 }
 
 /// The hash of the block whose execution result a child of `parent` carries
-/// at `depth` (`docs/DEFERRED_DEPTH_2_DESIGN.md` section 1.1): the parent at
-/// depth 1, the parent's parent at depth 2. By hash on the child's own chain,
-/// never by number.
-pub fn ancestor_hash(parent: &SealedHeader, depth: u64) -> B256 {
+/// at `depth` (`docs/DEFERRED_DEPTH_2_DESIGN.md` section 1.1,
+/// `docs/DEPTH3_DESIGN.md` item 3): the parent at depth 1 (and 0), the
+/// parent's parent at depth 2, at depth 3 the parent of that, through the
+/// executed-fields registry's parent links. By hash on the child's own chain,
+/// never by number; an ancestor that cannot be named is an error, never the
+/// nearer one.
+pub fn ancestor_hash_checked(parent: &SealedHeader, depth: u64) -> Result<B256, DeferredExecutionError> {
     if depth <= 1 {
-        parent.hash()
-    } else {
-        parent.parent_hash
+        return Ok(parent.hash());
+    }
+    n42_h2_consensus::deferred_depth::ancestor_hash(&parent_link(parent), depth, crate::executed_fields::parent_of).map_err(
+        |err| match err {
+            n42_h2_consensus::deferred_depth::AncestorError::LineageUnknown(hash) => DeferredExecutionError::LineageUnknown(hash),
+            n42_h2_consensus::deferred_depth::AncestorError::Depth(depth) => DeferredExecutionError::UnsupportedDepth(depth.0),
+        },
+    )
+}
+
+/// [`ancestor_hash_checked`], `None` where it errs. Always `Some` at depth
+/// 0, 1 and 2.
+pub fn ancestor_hash(parent: &SealedHeader, depth: u64) -> Option<B256> {
+    ancestor_hash_checked(parent, depth).ok()
+}
+
+/// The error for a child of `parent` whose carried ancestor's result is not
+/// known here: [`DeferredExecutionError::ParentUnknown`] naming the ancestor
+/// (at depth 1 and 2 always), or why the ancestor cannot be named.
+pub fn ancestor_unknown(parent: &SealedHeader, depth: u64) -> DeferredExecutionError {
+    match ancestor_hash_checked(parent, depth) {
+        Ok(ancestor) => DeferredExecutionError::ParentUnknown(ancestor),
+        Err(err) => err,
     }
 }
 
@@ -175,6 +207,7 @@ pub fn ancestor_executed_fields(
             &parent_link(parent),
             depth,
             crate::executed_fields::fields_from_child_header(parent.header()),
+            crate::executed_fields::parent_of,
             crate::executed_fields::get,
         )
         .ok();
@@ -234,10 +267,9 @@ pub fn ancestor_result_is_recorded(genesis: &alloy_genesis::Genesis, parent: &Se
     if depth <= 1 {
         return parent.number > 0 && reth_chainspec::qmdb::deferred_execution_active_at(genesis, parent.timestamp);
     }
-    matches!(
-        n42_h2_consensus::deferred_depth::result_source(&parent_link(parent), depth),
-        Ok(n42_h2_consensus::deferred_depth::ResultSource::Recorded(_))
-    )
+    // Past the chain start (and at a defined depth) the result is recorded;
+    // naming which ancestor it is recorded under is the caller's next step.
+    matches!(n42_h2_consensus::deferred_depth::carries_genesis(&parent_link(parent), depth), Ok(false))
 }
 
 /// How long [`parent_executed_fields_or_built`] waits for a parent that is
@@ -287,9 +319,16 @@ pub fn ancestor_executed_fields_or_built(
     if let Some(fields) = ancestor_executed_fields(genesis, parent, depth) {
         return Some(fields);
     }
-    let built = ancestor_built?;
+    // Depth 3 and above: the wait is on the ancestor's own (sealed) hash,
+    // named through the lineage -- whose builder alias `wait_for` follows --
+    // whatever `ancestor_built` says. A caller that still passes the
+    // grandparent (the depth-2 key) would otherwise have that block's result
+    // filed under the great-grandparent's hash. Depth 1 and 2 are unchanged.
+    let built = if depth >= 3 { ancestor_hash(parent, depth)? } else { ancestor_built? };
     let fields = crate::executed_fields::wait_for(&built, timeout)?;
-    crate::executed_fields::remember(ancestor_hash(parent, depth), fields);
+    if let Some(ancestor) = ancestor_hash(parent, depth) {
+        crate::executed_fields::remember(ancestor, fields);
+    }
     Some(fields)
 }
 
@@ -386,11 +425,13 @@ where
             // `deferredExecutionDepth`: the parent's result at depth 1, the
             // parent's parent's at depth 2 (docs/DEFERRED_DEPTH_2_DESIGN.md).
             let depth = reth_chainspec::qmdb::deferred_execution_depth_at(self.chain_spec.genesis(), header.timestamp);
-            let ancestor = ancestor_hash(parent, depth);
             let expected = ancestor_executed_fields(self.chain_spec.genesis(), parent, depth)
-                .ok_or_else(|| ConsensusError::Other(Arc::new(DeferredExecutionError::ParentUnknown(ancestor))))?;
+                .ok_or_else(|| ConsensusError::Other(Arc::new(ancestor_unknown(parent, depth))))?;
             let got = crate::executed_fields::fields_from_child_header(header);
             if got != expected {
+                // Always named at depth 1 and 2; at depth 3 the chain start
+                // (no lineage asked) names the parent, as the rule does.
+                let ancestor = ancestor_hash(parent, depth).unwrap_or_else(|| parent.hash());
                 return Err(ConsensusError::Other(Arc::new(DeferredExecutionError::Mismatch {
                     parent: ancestor,
                     got: Box::new(got),
@@ -796,7 +837,7 @@ mod tests {
         for genesis in [deferred_genesis(), late_fork] {
             for parent in &parents {
                 assert_eq!(ancestor_executed_fields(&genesis, parent, 1), parent_executed_fields(&genesis, parent));
-                assert_eq!(ancestor_hash(parent, 1), parent.hash());
+                assert_eq!(ancestor_hash(parent, 1), Some(parent.hash()));
                 assert_eq!(
                     ancestor_executed_fields_or_built(&genesis, parent, None, 1, std::time::Duration::ZERO),
                     parent_executed_fields_or_built(&genesis, parent, None, std::time::Duration::ZERO),
@@ -847,7 +888,7 @@ mod tests {
             alloy_primitives::keccak256(b"depth-two-consensus-0x83"),
         );
         assert!(ancestor_result_is_recorded(&genesis, &block2, 2));
-        assert_eq!(ancestor_hash(&block2, 2), block1.hash());
+        assert_eq!(ancestor_hash(&block2, 2), Some(block1.hash()));
         assert_eq!(ancestor_executed_fields(&genesis, &block2, 2), None, "result(1) not recorded yet");
         crate::executed_fields::remember(block1.hash(), fields(0x84));
         crate::executed_fields::remember(block2.hash(), fields(0x86));
@@ -881,7 +922,69 @@ mod tests {
         );
         assert_eq!(crate::executed_fields::get(&alloy_primitives::keccak256(b"depth-two-consensus-0x89")), Some(fields(0x8c)));
         // A depth outside the rule has no expected fields.
-        assert_eq!(ancestor_executed_fields(&genesis, &block2, 3), None);
+        assert_eq!(ancestor_executed_fields(&genesis, &block2, 4), None);
+        assert_eq!(ancestor_hash(&block2, 4), None);
+        assert!(matches!(ancestor_unknown(&block2, 4), DeferredExecutionError::UnsupportedDepth(4)));
+    }
+
+    /// Depth 3 (`docs/DEPTH3_DESIGN.md` item 3): the ancestor is the
+    /// great-grandparent, named through the registry's parent links -- never
+    /// the grandparent silently. Blocks 1..=3 carry the genesis fields with
+    /// no lookup; a child of block 4 carries result(2); without the link the
+    /// ancestor is unnamed and the error says so; the builder fallback waits
+    /// on the depth-3 hash whatever hash it is handed.
+    #[test]
+    fn at_depth_three_the_ancestor_is_named_through_the_lineage() {
+        let genesis = deferred_genesis();
+        let h = |n: u8| alloy_primitives::keccak256([0xD3, 0xC0, n]);
+        let genesis_fields = fields(0x90);
+        let mut blocks = vec![SealedHeader::new(carrying(Header::default(), genesis_fields), h(0))];
+        for n in 1..=4u8 {
+            let parent = blocks.last().expect("a parent").hash();
+            let header = Header { number: u64::from(n), timestamp: u64::from(n), parent_hash: parent, ..Default::default() };
+            blocks.push(SealedHeader::new(carrying(header, genesis_fields), h(n)));
+        }
+        // Chain start: children of genesis, 1 and 2 carry the genesis fields.
+        for parent in &blocks[..3] {
+            assert_eq!(ancestor_executed_fields(&genesis, parent, 3), Some(genesis_fields), "child of {}", parent.number);
+            assert!(!ancestor_result_is_recorded(&genesis, parent, 3));
+        }
+        assert!(ancestor_result_is_recorded(&genesis, &blocks[3], 3));
+        // A child of 4 is block 5 and carries result(2): 4 is the parent,
+        // 3 (its header's parent hash) the grandparent, 2 (the lineage's
+        // parent of 3) the great-grandparent.
+        let parent = &blocks[4];
+        assert_eq!(ancestor_hash(parent, 1), Some(h(4)));
+        assert_eq!(ancestor_hash(parent, 2), Some(h(3)));
+        assert_eq!(ancestor_hash(parent, 3), None, "no lineage noted yet");
+        assert!(matches!(ancestor_unknown(parent, 3), DeferredExecutionError::LineageUnknown(hash) if hash == h(3)));
+        assert_eq!(ancestor_executed_fields(&genesis, parent, 3), None);
+        crate::executed_fields::note_parent(h(3), h(2));
+        assert_eq!(ancestor_hash(parent, 3), Some(h(2)), "the great-grandparent");
+        crate::executed_fields::remember(h(2), fields(0x92));
+        crate::executed_fields::remember(h(3), fields(0x93));
+        assert_eq!(ancestor_executed_fields(&genesis, parent, 3), Some(fields(0x92)), "child 5 carries result(2)");
+        assert_eq!(ancestor_executed_fields(&genesis, parent, 2), Some(fields(0x93)), "depth 2 unchanged: result(3)");
+        // The builder fallback at depth 3 waits on the depth-3 hash, not on
+        // the grandparent it is handed (the depth-2 key).
+        let child_of = |n: u8, tag: &[u8]| {
+            let parent_hash = alloy_primitives::keccak256(tag);
+            SealedHeader::new(Header { number: 9, timestamp: 9, parent_hash, ..Default::default() }, h(n))
+        };
+        let wait = std::time::Duration::from_millis(20);
+        let lone = child_of(0x40, b"depth3 lone grandparent");
+        crate::executed_fields::remember(lone.parent_hash, fields(0x94));
+        assert_eq!(
+            ancestor_executed_fields_or_built(&genesis, &lone, Some(lone.parent_hash), 3, wait),
+            None,
+            "the grandparent's result is never taken for the great-grandparent's"
+        );
+        let great = alloy_primitives::keccak256(b"depth3 great-grandparent");
+        crate::executed_fields::note_parent(lone.parent_hash, great);
+        let great_built = alloy_primitives::keccak256(b"depth3 great-grandparent built");
+        crate::executed_fields::note_built(great, great_built);
+        crate::executed_fields::remember(great_built, fields(0x96));
+        assert_eq!(ancestor_executed_fields_or_built(&genesis, &lone, Some(lone.parent_hash), 3, wait), Some(fields(0x96)));
     }
 
     /// T3: the header check at depth 2 accepts result(N-2) and refuses

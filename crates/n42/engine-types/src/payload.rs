@@ -2197,9 +2197,7 @@ where
             parent_fields_wait_on = fields_on;
             let parent_fields = parent_fields
                 .ok_or_else(|| {
-                    PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(
-                        crate::hotstuff_consensus::ancestor_hash(&parent_header, carried_depth),
-                    ))
+                    PayloadBuilderError::other(crate::hotstuff_consensus::ancestor_unknown(&parent_header, carried_depth))
                 })?;
             let fields_ms = (seal_at.elapsed().as_millis() as u64).saturating_sub(root_ms);
             header.transactions_root = transactions_root;
@@ -5459,9 +5457,7 @@ where
         let carried_depth = reth_chainspec::qmdb::deferred_execution_depth_at(chain_spec.genesis(), attributes.timestamp);
         let parent_fields = carried_fields_for_seal(chain_spec.genesis(), &parent_header, parent_built, carried_depth)
             .ok_or_else(|| {
-                PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(
-                    crate::hotstuff_consensus::ancestor_hash(&parent_header, carried_depth),
-                ))
+                PayloadBuilderError::other(crate::hotstuff_consensus::ancestor_unknown(&parent_header, carried_depth))
             })?;
         header.state_root = parent_fields.state_root;
         header.receipts_root = parent_fields.receipts_root;

@@ -4397,6 +4397,9 @@ where
                     rename_record_waits = crate::fields_at_seal::barrier_counts().0,
                     rename_fallbacks = crate::fields_at_seal::barrier_counts().1,
                     carried_depth,
+                    // Which block's result the header carries (stage 0 of
+                    // docs/DEPTH3_DESIGN.md): `<number>/<depth>`.
+                    carried = %crate::hotstuff_consensus::Carried::of(block_number, true, carried_depth),
                     finish_ms = finish_at.elapsed().as_millis() as u64,
                     total_ms = build_started.elapsed().as_millis() as u64,
                     reads_d0 = read_depth[0],
@@ -5491,6 +5494,11 @@ where
             assemble_ms,
             total_ms = total.as_millis() as u64,
             core_layout = n42_core_layout::label(),
+            carried = %crate::hotstuff_consensus::Carried::of(
+                block_number,
+                reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), attributes.timestamp),
+                reth_chainspec::qmdb::deferred_execution_depth_at(chain_spec.genesis(), attributes.timestamp),
+            ),
             "payload build phases"
         );
     }

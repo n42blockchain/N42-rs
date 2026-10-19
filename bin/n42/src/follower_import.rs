@@ -1892,6 +1892,9 @@ struct RoadPhases {
     /// vote road waited for it.
     copy_aside_us: u64,
     copy_wait_us: u64,
+    /// Not a duration: which block's result the header carries, at which
+    /// depth (`carried=<number>/<depth>`, `docs/DEPTH3_DESIGN.md` stage 0).
+    carried: n42_engine_types::hotstuff_consensus::Carried,
 }
 
 impl RoadPhases {
@@ -2015,6 +2018,7 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         parent_read = parent_read_name(phases.parent_read),
         other_ms = total.saturating_sub(named) / 1000,
         total_ms = total / 1000,
+        carried = %phases.carried,
         "vote road"
     );
 }
@@ -2194,7 +2198,11 @@ where
     if !header_on_vote_road && let Some(sealed) = &owned {
         pre_execution_checks(consensus, sealed)?;
     }
-    let mut phases = RoadPhases { header_us: started.elapsed().as_micros() as u64, ..Default::default() };
+    let mut phases = RoadPhases {
+        header_us: started.elapsed().as_micros() as u64,
+        carried: n42_engine_types::hotstuff_consensus::Carried::of(number, deferred, carried_depth),
+        ..Default::default()
+    };
     let header_ms = phases.header_us / 1000;
     let senders_at = std::time::Instant::now();
     stage.at(2);

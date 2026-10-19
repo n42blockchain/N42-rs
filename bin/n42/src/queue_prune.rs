@@ -260,6 +260,7 @@ fn prune_one(
         sum.remove_us += times.remove_us;
         sum.forget_us += times.forget_us;
         sum.free_us += times.free_us;
+        sum.free_inline += times.free_inline;
         sum.frames_swept += times.frames_swept;
         sum.retire_us += times.retire_us;
         sum.retired += times.retired;
@@ -291,6 +292,7 @@ fn prune_one(
             fold_us = sum.fold_us,
             lock_us = sum.lock_us,
             free_us = sum.free_us,
+            prune_free_inline = sum.free_inline,
             frames_swept = sum.frames_swept,
             retire_us = sum.retire_us,
             retired = sum.retired,
@@ -366,6 +368,7 @@ fn prune_lean_items(queue: &TxQueue<N42PooledTransaction>, items: &[FeedRef<'_>]
         sum.remove_us += times.remove_us;
         sum.forget_us += times.forget_us;
         sum.free_us += times.free_us;
+        sum.free_inline += times.free_inline;
         sum.frames_swept += times.frames_swept;
         sum.retire_us += times.retire_us;
         sum.retired += times.retired;
@@ -420,6 +423,7 @@ fn prune_lean_items(queue: &TxQueue<N42PooledTransaction>, items: &[FeedRef<'_>]
             fold_us = sum.fold_us,
             lock_us = sum.lock_us,
             free_us = sum.free_us,
+            prune_free_inline = sum.free_inline,
             frames_swept = sum.frames_swept,
             retire_us = sum.retire_us,
             retired = sum.retired,

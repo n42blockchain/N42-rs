@@ -4411,3 +4411,51 @@ Next (stage cx): the same minimum fold on the pruning thread (`N42_QUEUE_PRUNE_T
 the knob and the batch is freed off-thread), so the runtime is not blocked; judged by the subscriber-lag count, state_wait
 p50, the selector wait and the two-pair rule. If the thread's wake still grows past ~10 blocks, cap the fold (a maximum a
 wake, the lock released between) before trying n=2 or 3.
+
+### 10.172 loop351 stage cx — the minimum fold on the pruning thread passes the two-pair rule (4.754 / 4.636 vs 4.564 / 4.415), but the wake runs away: the prune is linear at ~37 ms a block against a 42 ms cadence
+
+Stage cx (wt-main c5007988c; X17 + `N42_ANSWER_AT_INSERT=1 N42_STATE_READY_WITHOUT_MERGE=1` as control, Qa/Qb, against the same
+plus `N42_QUEUE_PRUNE_THREAD=1 N42_PRUNE_MIN_FOLD=4` (the fold of f6ad12a5f on the pruning thread, batch freed off-thread),
+QT4/QT4b; depth 2, 600M set; d2gate clean, verify pass; `N42_PRUNE_MIN_FOLD min_fold=4` and `canonical queue pruner on its
+own thread` logged on both knob legs, 0 subscriber-lag warns on every leg).
+
+| leg | drain | gap mean/median | sealed_at | start_best_other / hand-off | live frames at take | frames_pending | prune wakes / blocks a wake (max, p90) / prune_ms / wait | prune_ms a folded block | `mined` backlog | state_wait p50/p90 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Qa | 4.564M/s | 43.9/42.1 | 42.1 | 5.1 / 4.5 | 1,705 | 3,191 | 1,263 / 1.7 (7, 3) / 66 / 0 | 41.6 | 335k | 0.25/7.3 |
+| QT4 | **4.754M/s** | 42.1/38.1 | 39.9 | 0.3 / 2.2 | 4,434 | 266 | 224 / 9.9 (**35**, 19) / 340 / 361 | 37.0 | 1.97M | **5.7/13.8** |
+| Qb | 4.415M/s | 45.3/43.8 | 43.5 | 8.2 / 5.4 | 1,022 | 4,148 | 1,466 / 1.4 (6, 2) / 55 / 0 | — | — | 0.2/6.0 |
+| QT4b | 4.636M/s | 43.2/39.9 | 41.2 | 2.3 / 3.0 | 3,248 | 2,874 | 188 / 11.5 (**68**, 44) / 439 / 451 | 37.7 | 2.28M | **4.6/11.8** |
+
+Two-pair: QT4 +4.2% / +7.7% and QT4b +1.6% / +5.0% over Qa / Qb — both knob legs over both controls by 1.5% or more (QT4b
+over Qa at the margin), the first pair-rule pass since X17. QT4 is the second-best 600M-set leg (PP4b 4.766, Uaa 4.712).
+The controls themselves sat low (Qb 4.415 is the bottom of the X17 band, its supply floor the deepest yet: pending 4,148,
+index 1,022, selector wait 8.2 ms), which is the bistable floor of 10.169 — the knob's gain is as much the floor's absence
+as anything it adds.
+
+What the thread changed and what it did not:
+
+- On the thread, the long wake no longer blocks the runtime: 0 subscriber-lag warns (31 on PP4 in 10.171) and the
+  hand-off wait is back to 2-3 ms. The selector's wait is 0.3 ms on QT4 with a 4,434-frame live index and 266 frames
+  pending — the supply floor gone, as in 10.171.
+- The prune is **linear in the blocks folded, ~37 ms a block** (41.6 on the once-a-block controls, 37.0-37.7 on the folds):
+  settle 6.5 -> 22.5 ms, remove 5.9 -> 13.5, forget 6.6 -> 27.9 for 1.7 -> 9.9 blocks. There is no coalescing gain; a
+  wake of n blocks holds the queue for n x 37 ms. Against a ~42 ms block cadence the thread runs at ~88% utilisation
+  with no fold, and a minimum fold of 4 (a 150 ms wake, 3.5 blocks arriving under it) leaves no slack: QT4's fold ran
+  6.2 / 9.6 / 15.6 / 8.1 blocks by quarter, QT4b's 5.8 / 4.7 / 4.9 / **30.6** — in its last quarter the wakes were 68 blocks
+  and 0.4 s, and the inbox backlog came back under them (pending 2,874, selector wait 2.3 ms), which is QT4b's 4.636.
+- The long wake costs the builder: `state_wait` p50 0.2-0.25 -> 4.6-5.7 ms, p90 6-7 -> 12-14, and the queue carries a
+  `mined` backlog of 2.0-2.3M transactions (10 blocks not yet pruned) against 335k, which the lane walk pays (par_exec
+  19.3 -> 20.3, par_fold 8.4 -> 9.5).
+
+So the fold's gain is the drainer's uninterrupted window between wakes, not the wake's fixed cost, and the knob as it
+stands trades the supply floor for a runaway wake. Decision: **X17 + AAI + SRWM + `N42_QUEUE_PRUNE_THREAD=1
+N42_PRUNE_MIN_FOLD=4` is the candidate (two-pair passed), to be confirmed with the wake bounded.** `N42_PRUNE_MAX_FOLD=<n>`
+(9c19d418c, pruning thread only): a wake folds at most n blocks, the rest is carried into the next wake, which starts at
+once, so the queue is released between — the backlog then shows as more wakes, not longer ones. The runtime's lean task
+does not honour the cap (the candidate prunes on the thread).
+
+Next (stage cy, c2aa83ebb): Ra/Rb = the candidate (thread + fold 4, uncapped) against RC8/RC8b = the same +
+`N42_PRUNE_MAX_FOLD=8`, judged by the two-pair rule, the wake's maximum (want <= 8), state_wait p50 (want back under 1 ms),
+frames_pending and the `mined` backlog. If the cap holds the wake but the rate does not move, the fold's window is what
+matters and a minimum of 2-3 with the cap is the next pair; if the thread cannot keep up at ~37 ms a block, the per-block
+prune cost (settle + forget dominate) is the next lever.

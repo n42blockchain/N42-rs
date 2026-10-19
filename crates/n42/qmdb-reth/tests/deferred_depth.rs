@@ -161,3 +161,35 @@ fn the_depth_two_bench_files_are_chains_of_their_own() {
         assert_ne!(hash(one), hash(two), "a depth-2 chain has its own genesis hash");
     }
 }
+
+/// `docs/DEPTH3_DESIGN.md` item 17: the depth-3 bench file is the depth-2
+/// one with `deferredExecutionDepth: 3` and `extraData` 0xd3 (so its genesis
+/// hash, fork digest and gossip topic differ from both other chains). It
+/// parses as depth 3 and a node runs it only with `N42_DEFERRED_DEPTH3=1`.
+#[test]
+fn the_depth_three_bench_file_needs_the_opt_in() {
+    let two: Genesis =
+        serde_json::from_str(include_str!("../../../chainspec/res/genesis/n42_fleet7_bench_d2.json")).expect("a genesis");
+    let three: Genesis =
+        serde_json::from_str(include_str!("../../../chainspec/res/genesis/n42_fleet7_bench_d3.json")).expect("a genesis");
+    let one: Genesis =
+        serde_json::from_str(include_str!("../../../chainspec/res/genesis/n42_fleet7_bench.json")).expect("a genesis");
+    assert_eq!(deferred_execution_depth(&three), Ok(3));
+    assert_eq!(check_deferred_execution_depth_up_to(&three, SUPPORTED_DEFERRED_EXECUTION_DEPTH), Err(DeferredDepthError::NotImplemented(3)));
+    assert_eq!(check_deferred_execution_depth_up_to(&three, 3), Ok(3));
+    if supported_deferred_execution_depth() < 3 {
+        assert_eq!(check_deferred_execution_depth(&three), Err(DeferredDepthError::NotImplemented(3)));
+    }
+    assert_eq!(two.alloc, three.alloc);
+    assert_eq!(two.timestamp, three.timestamp);
+    assert_eq!(two.config.chain_id, three.config.chain_id);
+    assert_ne!(two.extra_data, three.extra_data);
+    let hash = |genesis: Genesis| {
+        n42_qmdb_reth::with_declared_state_scheme(reth_chainspec::ChainSpec::from(genesis))
+            .expect("a qmdb chain")
+            .genesis_hash()
+    };
+    let (h1, h2, h3) = (hash(one), hash(two), hash(three));
+    assert_ne!(h3, h2, "a depth-3 chain has its own genesis hash");
+    assert_ne!(h3, h1);
+}

@@ -4543,3 +4543,43 @@ back (the state wait) is 3-6 ms of the very thing we need. So the plan narrows t
 
 Main: `N42_PRUNE_MIN_FOLD` / `N42_PRUNE_MAX_FOLD` / the thread's fold ported (0d276ebfe, 6af8aaa81, dfc793b17; checked,
 pushed). X18's two extra knobs for a bench on main: `N42_QUEUE_PRUNE_THREAD=1 N42_PRUNE_MIN_FOLD=4`.
+
+### 10.175 loop351 stage da — two freeing threads do what they should (no inline free, wakes <= 9 blocks), but the stage ran on a box another fleet had just left (4.18-4.43, all under the X18 band): rerun as db. The builder's state wait is the parent's output, not the pruner
+
+Stage da (wt-main e7712d133, knob 0eea07d86; Ta/Tb = X18 against TF2/TF2b = X18 + `N42_QUEUE_FREE_THREADS=2`; depth 2,
+600M set; d2gate clean, verify pass; `N42_QUEUE_FREE_THREADS threads=2` logged on both knob legs). The launcher waited
+from 12:08 to 13:27 for another session's seven-node fleet (gov5 claim, load 214) and the legs ran straight after it.
+
+| leg | drain | gap mean/median | sealed_at | hand-off / selector wait | frames_pending / live index | wakes / blocks a wake (max) / prune_ms / free_ms a wake / inline frees | state_wait: none / output / grandparent (n, p50 ms) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Ta | 4.181M/s | 47.8/39.5 | 33.4 | 1.6 / 0.2 | 107 / 4,635 | 335 / 5.8 (41) / 158 / 35.2 / 38 | 904 0.15 / 872 6.0 / 87 31.4 |
+| TF2 | 4.416M/s | 45.3/41.1 | 37.7 | 2.9 / 2.0 | 1,316 / 3,385 | 438 / 4.7 (9) / 129 / 0.0 / 0 | 1,054 0.19 / 947 6.0 / 26 34.3 |
+| Tb | 4.432M/s | 45.2/42.6 | 42.7 | 5.4 / 6.1 | 3,848 / 909 | 423 / 4.9 (16) / 167 / 10.9 / 27 | 1,491 0.19 / 551 5.4 / — |
+| TF2b | 4.253M/s | 47.1/41.1 | 34.9 | 3.5 / 3.2 | 2,332 / 2,407 | 450 / 4.4 (8) / 121 / 0.0 / 0 | 1,472 0.17 / 440 4.7 / — |
+
+Not a measurement of the knob: every leg is 5-13% under X18's eight legs (4.636-4.788), and the shape is the long-gap
+tail, not the build — Ta sealed at 33.4 ms (the fastest builds of any X18 leg) with a 47.8 ms mean gap against a 39.5
+median, 8.3 ms of tail where the band's legs carry 3.5-4. The box had just run another fleet for an hour (the replay
+set's page cache and the huge-page pool both cold; the WARM leg warms the 400M set only). Rerun as stage db (e35efadca,
+launched 14:46 on a quiet box, load 0).
+
+What the knob did is readable all the same: with two freeing threads no wake freed inline (`prune_free_inline` 0 against
+27-38, `free_us` 0 against 11-35 ms a wake) and the wake stopped running away (max 8-9 blocks against 16-41, prune_ms
+121-129 against 158-167). The mechanism is as designed; whether it moves the rate is db's question.
+
+**The builder's state wait is the parent's output (12:50 analysis, cz/cy legs).** Grouped by `state_wait_on`: on the
+record leg Ra 1,651 of 2,219 builds waited on "output" (the parent's execution output) at p50 6.8 ms, on SF2b (fold 2)
+774 of 2,106 at p50 4.8, "none" the rest at 0.2. The wait is not a pruner cost: a leg whose selector wait is 0.3 ms
+reaches the point where the child needs the parent's output sooner, and waits there — the pipeline floor (parent's
+output -> child par_exec ~20 -> par_fold ~9 -> child's output) showing where the slack went. The fold-4 legs' 3-6 ms
+state wait is therefore not the −3 ms to 5M; 10.174's plan item 1 is reduced to whether a shorter wake moves the
+own-block insert on the hand-off path.
+
+**The identifiable tail is the "grandparent" wait**: builds waiting for the grandparent's layer at p50 26-34 ms — Ra 79
+(2.3 s of its 93 s leg, 2.5%), Ta 87, Sa 38, Sb 12, SF2b 7. On the fast legs it is the difference between a 41.8 ms
+mean gap and ~40.8. What triggers it (the layer's release or merge timing under depth 2, the pruner's lock, or the
+follower's vote) is the next analysis: the per-build fields around a grandparent wait (`state_wait_split`, the
+merge/release timestamps of N−2) on Ra.
+
+Next: db's pair rule (knob adopted as X19 and 0eea07d86 ported to main if it passes); then the grandparent tail; the
+transfer fast-path state layout stays the lever on par_exec (20 ms, memory-bound, 10.165).

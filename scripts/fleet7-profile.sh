@@ -93,8 +93,12 @@ fi
 # this profile has to perturb the node as little as possible. `-F 199` is a
 # prime rate, so the sampler cannot lock step with a periodic block cycle and
 # report one phase of it as the whole node.
-perf record -F 199 -g --pid "$pid" -o "$PREFIX.data" -- sleep "$SECS" 2>/dev/null || {
-  echo "perf record failed; /proc/sys/kernel/perf_event_paranoid is $(cat /proc/sys/kernel/perf_event_paranoid)" >&2
+# perf's own stderr is kept beside the data: a failure's reason is otherwise lost
+# (paranoid level, mmap pages over the mlock limit, a killed recorder).
+perf record -F 199 -g --pid "$pid" -o "$PREFIX.data" -- sleep "$SECS" 2>"$PREFIX.perf.err" || {
+  rc=$?
+  echo "perf record failed (exit $rc); /proc/sys/kernel/perf_event_paranoid is $(cat /proc/sys/kernel/perf_event_paranoid); stderr in $PREFIX.perf.err:" >&2
+  tail -n 5 "$PREFIX.perf.err" >&2
   exit 1
 }
 

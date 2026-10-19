@@ -423,24 +423,11 @@ where
             return Ok(account.as_ref().map(Account::from))
         }
         if let Some(historical_fallback) = historical_fallback {
-            return match self.provider().account_history_info(
-                *address,
-                historical_fallback.block_number,
-                historical_fallback.account_history_block_number,
-            )? {
-                HistoryInfo::NotYetWritten => Ok(None),
-                HistoryInfo::InChangeset(changeset_block_number) => self
-                    .provider()
-                    .get_account_before_block(changeset_block_number, *address)?
-                    .ok_or(ProviderError::AccountChangesetNotFound {
-                        block_number: changeset_block_number,
-                        address: *address,
-                    })
-                    .map(|account_before| account_before.info),
-                HistoryInfo::InPlainState | HistoryInfo::MaybeInPlainState => {
-                    self.basic_account_from_db(address)
-                }
+            if reth_storage_api::n42_state::build_reads_no_changeset() {
+                return self.basic_account_at_anchor(address, historical_fallback)
             }
+            reth_storage_api::n42_state::record_historical_read(false);
+            return self.basic_account_by_changeset(address, historical_fallback)
         }
         self.basic_account_from_db(address)
     }
@@ -450,6 +437,78 @@ where
     /// else goes to the registered QMDB reader, which prefetches its index bucket.
     fn n42_prefetch_account(&self, address: &Address) -> bool {
         self.n42_prefetch_account_into(address, reth_storage_api::n42_state::reader().map(|(reader, _)| reader))
+    }
+}
+
+impl<Provider, N: NodePrimitives> OverlayStateProvider<Provider, N>
+where
+    Provider: Deref,
+    Provider::Target: DBProvider
+        + HistoryReader
+        + StorageSettingsCache
+        + StageCheckpointReader
+        + PruneCheckpointReader
+        + ChangeSetReader
+        + StorageChangeSetReader
+        + BlockNumReader,
+{
+    /// The account below the database tip, at the execution overlay's anchor: the first
+    /// changeset entry from the anchor's child to the tip, or the latest value if none.
+    fn basic_account_by_changeset(
+        &self,
+        address: &Address,
+        historical_fallback: &HistoricalFallback,
+    ) -> ProviderResult<Option<Account>> {
+        match self.provider().account_history_info(
+            *address,
+            historical_fallback.block_number,
+            historical_fallback.account_history_block_number,
+        )? {
+            HistoryInfo::NotYetWritten => Ok(None),
+            HistoryInfo::InChangeset(changeset_block_number) => self
+                .provider()
+                .get_account_before_block(changeset_block_number, *address)?
+                .ok_or(ProviderError::AccountChangesetNotFound {
+                    block_number: changeset_block_number,
+                    address: *address,
+                })
+                .map(|account_before| account_before.info),
+            HistoryInfo::InPlainState | HistoryInfo::MaybeInPlainState => {
+                self.basic_account_from_db(address)
+            }
+        }
+    }
+
+    /// N42 (`N42_BUILD_READS_NO_CHANGESET=1`): the account at the overlay's anchor from the
+    /// QMDB reader, without the changeset scan. The fallback's `block_number` is the anchor's
+    /// child (`anchor + 1`, the first block whose changeset holds the anchor's value), so the
+    /// reader is asked at version `anchor`: the state after the anchor block, which it answers
+    /// through its journals while the anchor is within their depth behind its head, and
+    /// declines (`None`) otherwise. A declined read, a hashed-state-less chain, or no reader in
+    /// `on`/`verify` takes the changeset scan; in `verify` the scan answers and the reader's
+    /// answer is compared with it.
+    fn basic_account_at_anchor(
+        &self,
+        address: &Address,
+        historical_fallback: &HistoricalFallback,
+    ) -> ProviderResult<Option<Account>> {
+        use reth_storage_api::n42_state;
+        if let Some(anchor) = historical_fallback.block_number.checked_sub(1) &&
+            self.provider().cached_storage_settings().use_hashed_state() &&
+            let Some((reader, mode)) = n42_state::reader() &&
+            let Some(answer) = reader.account(address, anchor)
+        {
+            if mode == n42_state::ReadsMode::On {
+                n42_state::record_historical_read(true);
+                return Ok(answer)
+            }
+            n42_state::record_historical_read(false);
+            let scanned = self.basic_account_by_changeset(address, historical_fallback)?;
+            n42_state::verify_account(address, anchor, &answer, &scanned);
+            return Ok(scanned)
+        }
+        n42_state::record_historical_read(false);
+        self.basic_account_by_changeset(address, historical_fallback)
     }
 }
 
@@ -465,7 +524,10 @@ impl<Provider, N: NodePrimitives> OverlayStateProvider<Provider, N> {
             if cached.overlay.account(address).is_some() {
                 return true
             }
-            if cached.historical_fallback.is_some() {
+            // N42: under `N42_BUILD_READS_NO_CHANGESET=1` the reader answers a fallback read too.
+            if cached.historical_fallback.is_some() &&
+                !reth_storage_api::n42_state::build_reads_no_changeset()
+            {
                 return false
             }
         }

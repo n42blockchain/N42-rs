@@ -187,6 +187,36 @@ pub fn ancestor_executed_fields(
     crate::executed_fields::get(&parent.hash())
 }
 
+/// `carried=<number>/<depth>` on a build's phases line and on a follower's
+/// vote-road line (`docs/DEPTH3_DESIGN.md` stage 0): which block's result the
+/// header of a block carries, and at which depth. Depth 0 before the
+/// deferred-execution gate, where a header carries its own result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Carried {
+    /// The number of the block whose result the header carries.
+    pub number: u64,
+    /// The chain's deferred-execution depth at the header (0 before the gate).
+    pub depth: u64,
+}
+
+impl Carried {
+    /// For block `number`: `deferred` is whether its header is past the gate,
+    /// `depth` the chain's depth there.
+    pub const fn of(number: u64, deferred: bool, depth: u64) -> Self {
+        if deferred {
+            Self { number: n42_h2_consensus::deferred_depth::carried_number(number, depth), depth }
+        } else {
+            Self { number, depth: 0 }
+        }
+    }
+}
+
+impl core::fmt::Display for Carried {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}/{}", self.number, self.depth)
+    }
+}
+
 /// What the depth rule needs of a parent header.
 pub fn parent_link(parent: &SealedHeader) -> n42_h2_consensus::deferred_depth::ParentLink {
     n42_h2_consensus::deferred_depth::ParentLink {

@@ -4358,3 +4358,27 @@ knob proposed `N42_PRUNE_MIN_FOLD`), so its fixed cost is paid once per N blocks
 chain is untouched (node-local queue scheduling). Expected: `frames_pending` ~0 and `start_best_other` ≤0.5 ms on every leg,
 removing 2-10 ms of selector wait from the bad-mode legs; the band should tighten toward its upper edge (4.65-4.78M/s). Not
 a path to 5M alone, but it is the first lever that removes a floor rather than trades one for another.
+
+### 10.170 loop351 stage cv — the pruner's minimum fold: the knob was inert (pruner on the runtime, not its thread), so the stage is a spread calibration of the bistable mode
+
+Stage cv (wt-main bd29265ab; X17 + `N42_ANSWER_AT_INSERT=1 N42_STATE_READY_WITHOUT_MERGE=1` as control, Oa/Ob, against the same
+plus `N42_PRUNE_MIN_FOLD=4`, OP4/OP4b; depth 2, 600M set; d2gate clean, verify pass).
+
+| leg | drain | gap mean/median | sealed_at | start_best_other | frames live at take | frames_pending (prune lines) | prune wakes / blocks a wake |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Oa | 4.534M/s | 44.1/42.7 | 42.4 | 6.9 | 1,351 | 3,805 | 1,491 / 1.4 |
+| OP4 | 4.715M/s | 42.4/39.7 | 40.7 | 2.5 | 2,799 | 2,325 | 1,116 / 2.0 |
+| Ob | 4.635M/s | 43.2/40.5 | 41.4 | 3.1 | 2,587 | 2,440 | 1,134 / 1.9 |
+| OP4b | 4.658M/s | 43.0/40.3 | 41.2 | 3.2 | 2,442 | 2,672 | 1,127 / 1.9 |
+
+OP4 +4.0% / +1.7%, OP4b +2.7% / +0.5%: not the two-pair rule — and not the knob. f6ad12a5f put the minimum fold on the
+pruning thread (`queue_prune::spawn_thread`), but the bench runs the pruner on the runtime's canonical-subscriber task
+(`N42_QUEUE_PRUNE_THREAD` is not in X17: "PRUNE_THREAD no effect", 10.14x), whose lean branch folds only what `try_recv`
+finds. No `N42_PRUNE_MIN_FOLD` line in any log; OP4's 2.0 blocks a wake equals the controls'. The four legs are therefore
+four draws of the mode of 10.169: Oa landed in the bad one (3,805 pending, 6.9 ms of selector wait, 4.534M/s) and the other
+three in the middle (2.3-2.7k pending, 2.5-3.2 ms, 4.635-4.715M/s). With cu's legs that is eight draws of X17+AAI+SRWM:
+4.53-4.72M/s, and the selector's wait explains the order (0.3 ms -> 4.653, 6.9 -> 4.534, 10.6 -> 4.378).
+
+Fix: the runtime task's lean branch now honours the knob too (holds the wake with `tokio::time::timeout` on `canonical.recv()`
+until `min_fold` notifications are in or `N42_PRUNE_MIN_FOLD_MS` has passed since the first; the wait is reported as
+`prune_wait_ms`); `min_fold()` is public and read by both paths. Rerun as stage cw.

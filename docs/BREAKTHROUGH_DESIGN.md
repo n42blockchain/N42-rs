@@ -4382,3 +4382,32 @@ three in the middle (2.3-2.7k pending, 2.5-3.2 ms, 4.635-4.715M/s). With cu's le
 Fix: the runtime task's lean branch now honours the knob too (holds the wake with `tokio::time::timeout` on `canonical.recv()`
 until `min_fold` notifications are in or `N42_PRUNE_MIN_FOLD_MS` has passed since the first; the wait is reported as
 `prune_wait_ms`); `min_fold()` is public and read by both paths. Rerun as stage cw.
+
+### 10.171 loop351 stage cw — the minimum fold on the runtime pruner: the supply floor is gone (selector wait 0.3-0.6 ms, live index 4,200), but the wake runs away on the runtime and blocks it
+
+Stage cw (wt-main 5d73c7073; X17 + `N42_ANSWER_AT_INSERT=1 N42_STATE_READY_WITHOUT_MERGE=1` as control, Pa/Pb, against the same
+plus `N42_PRUNE_MIN_FOLD=4` honoured by the runtime's lean prune task (79f46f8dc), PP4/PP4b; depth 2, 600M set; d2gate clean,
+verify pass; `N42_PRUNE_MIN_FOLD min_fold=4` logged on both knob legs).
+
+| leg | drain | gap mean/median | sealed_at | start_best_other / hand-off | live frames at take | frames_pending | prune wakes / blocks a wake / prune_ms | state_wait p50/p90 (on) | subscriber lag warns (max behind) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Pa | 4.651M/s | 43.0/39.6 | 41.3 | 1.8 / 3.9 | 3,123 | 1,804 | 1,003 / 2.2 / 82 | 2.3/11.2 (output 1,068, none 980) | 0 |
+| PP4 | 4.591M/s | 43.6/39.6 | 41.6 | 0.6 / 1.7 | 4,241 | 670 | **85 / 25.5 / 745** | **6.5/20.3** (output 1,593) | **31 (64)** |
+| Pb | 4.532M/s | 44.1/42.5 | 42.4 | 5.4 / 5.7 | 1,458 | 3,608 | 1,333 / 1.6 / 64 | 0.2/5.7 (none 1,524) | 0 |
+| PP4b | **4.766M/s** | 42.0/39.2 | 40.2 | 0.3 / 2.3 | 4,210 | 488 | 254 / 8.7 / 276 | 5.6/12.8 (output 1,641) | 22 (40) |
+
+PP4 −1.3% / +1.3%, PP4b +2.5% / +5.2%: not the two-pair rule, and the knob legs are two different things. **The supply
+floor of 10.169 is removed on both**: the selector's unnamed wait falls to 0.3-0.6 ms (controls 1.8 and 5.4), the hand-off
+wait to 1.7-2.3 (3.9-5.7), the live frame index sits at 4,200 and `frames_pending` at 500-700 (controls 1,800-3,600).
+PP4b is the top of the X17 band (4.766 is the best 600M-set leg since Uaa). **But the wake runs away**: with the task holding
+for 4 notifications, the pruner is never ahead again, and on the runtime's worker a wake of 40-69 blocks costs 0.9-2.2 s
+(`forget_us` 208-228 ms, `remove_us` 26-35 ms; the unnamed rest is the batch's own drop on the task — the thread path hands
+it to `free_later`, the runtime path does not). While it runs the runtime's worker is gone: `canonical subscriber lag` warns
+(behind up to 64), and the builder's `state_wait` on the parent's output doubles (p50 2.3 -> 6.5 ms, p90 11 -> 20 on PP4;
+PP4b 5.6/12.8). PP4 gave back in state wait what it gained at the selector; PP4b's wakes stayed at 8.7 blocks and it kept
+most of it.
+
+Next (stage cx): the same minimum fold on the pruning thread (`N42_QUEUE_PRUNE_THREAD=1`, where f6ad12a5f already honours
+the knob and the batch is freed off-thread), so the runtime is not blocked; judged by the subscriber-lag count, state_wait
+p50, the selector wait and the two-pair rule. If the thread's wake still grows past ~10 blocks, cap the fold (a maximum a
+wake, the lock released between) before trying n=2 or 3.

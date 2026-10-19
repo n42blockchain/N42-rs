@@ -263,6 +263,25 @@ pub fn prune_notifications_lean(
     }
 }
 
+/// `N42_PRUNE_MIN_FOLD=<n>` (default 1: off) and `N42_PRUNE_MIN_FOLD_MS=<ms>`
+/// (default 200), read and logged once: the pruning thread holds a wake
+/// until at least `n` canonical notifications are in, or `ms` have passed
+/// since the first arrived, so the wake's fixed cost (settle, forget,
+/// remove: `prune_ms` 40-60 on loop351) is paid once per `n` blocks and
+/// the lanes' lock is left to the drainer between wakes. Round 10.169: a
+/// pruner waking once a block starved the inbox drain, the live frame
+/// index emptied, and the selector waited 4-10 ms a build for frames;
+/// legs whose pruner happened to fold 4-6 blocks a wake did not.
+fn min_fold() -> (usize, std::time::Duration) {
+    static KNOB: std::sync::OnceLock<(usize, std::time::Duration)> = std::sync::OnceLock::new();
+    *KNOB.get_or_init(|| {
+        let n = std::env::var("N42_PRUNE_MIN_FOLD").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
+        let ms = std::env::var("N42_PRUNE_MIN_FOLD_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(200);
+        info!(target: "n42.tx_queue", min_fold = n, max_wait_ms = ms, "N42_PRUNE_MIN_FOLD");
+        (n, std::time::Duration::from_millis(ms))
+    })
+}
+
 /// A notification on its way to the pruning thread, with when it arrived.
 type Queued = (CanonStateNotification<N42Primitives>, std::time::Instant);
 
@@ -271,11 +290,32 @@ type Queued = (CanonStateNotification<N42Primitives>, std::time::Instant);
 pub fn spawn_thread(queue: TxQueue<N42PooledTransaction>) -> Option<std::sync::mpsc::Sender<Queued>> {
     let (tx, rx) = std::sync::mpsc::channel::<Queued>();
     let spawned = std::thread::Builder::new().name("n42-queue-prune".to_owned()).spawn(move || {
+        let (min_fold, max_wait) = min_fold();
         while let Ok(first) = rx.recv() {
             // Everything already waiting is taken in this wake, in order.
             let mut batch = vec![first];
             while let Ok(next) = rx.try_recv() {
                 batch.push(next);
+            }
+            // `N42_PRUNE_MIN_FOLD`: wait for more, up to `max_wait` after
+            // the first arrived, so the wake folds at least `min_fold`.
+            if min_fold > 1 {
+                let deadline = batch[0].1 + max_wait;
+                while batch.len() < min_fold {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    match rx.recv_timeout(deadline - now) {
+                        Ok(next) => {
+                            batch.push(next);
+                            while let Ok(more) = rx.try_recv() {
+                                batch.push(more);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
             }
             let coalesced = batch.len();
             if n42_tx_queue::prune_lean() {

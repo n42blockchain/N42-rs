@@ -4459,3 +4459,44 @@ Next (stage cy, c2aa83ebb): Ra/Rb = the candidate (thread + fold 4, uncapped) ag
 frames_pending and the `mined` backlog. If the cap holds the wake but the rate does not move, the fold's window is what
 matters and a minimum of 2-3 with the cap is the next pair; if the thread cannot keep up at ~37 ms a block, the per-block
 prune cost (settle + forget dominate) is the next lever.
+
+### 10.173 loop351 stage cy — X18 confirmed (four legs 4.694-4.788 M/s, record leg 4.788); the fold cap is neutral; the prune's time is the freeing: 13-15 ms a block dropped inline because the one freeing thread is full
+
+Stage cy (wt-main c2aa83ebb, cap 9c19d418c; Ra/Rb = X17 + `N42_ANSWER_AT_INSERT=1 N42_STATE_READY_WITHOUT_MERGE=1
+N42_QUEUE_PRUNE_THREAD=1 N42_PRUNE_MIN_FOLD=4` uncapped, against RC8/RC8b = the same + `N42_PRUNE_MAX_FOLD=8`; depth 2,
+600M set; d2gate clean, verify pass; `N42_PRUNE_MAX_FOLD` logged on the two capped legs, 0 subscriber-lag warns).
+
+| leg | drain | gap mean/median | sealed_at | start_best_other / hand-off | live frames at take | frames_pending | prune wakes / blocks a wake (max, p90) / prune_ms / wait | `mined` backlog | state_wait p50/p90 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Ra | **4.788M/s** | 41.8/38.x | 39.8 | 0.3 / 2.1 | 4,439 | 284 | 178 / 12.5 (47, 30) / 435 / 471 | 2.49M | 5.9/12.8 |
+| RC8 | 4.779M/s | 41.9/38.x | 40.0 | 0.3 / 2.0 | 4,229 | 315 | 208 / 10.7 (21, 14) / 386 / 3,285 | 2.13M | 5.7/12.4 |
+| Rb | 4.694M/s | 42.6/39.x | 40.6 | 2.2 / 3.8 | 2,779 | 2,363 | 312 / 7.0 (34, 11) / 243 / 248 | 1.39M | 2.4/10.5 |
+| RC8b | 4.759M/s | 42.1/39.x | 40.2 | 0.9 / 2.6 | 3,816 | 1,492 | 243 / 9.1 (21, 14) / 323 / 1,144 | 1.81M | 5.3/11.7 |
+
+**X18 = X17 + `N42_ANSWER_AT_INSERT=1 N42_STATE_READY_WITHOUT_MERGE=1 N42_QUEUE_PRUNE_THREAD=1 N42_PRUNE_MIN_FOLD=4` is
+adopted**: six legs over two stages read 4.636-4.788 M/s (cx QT4 4.754, QT4b 4.636; cy 4.694-4.788) against the eight
+X17+AAI+SRWM draws of 4.53-4.72 and the cx controls 4.564 / 4.415; Ra 4.788 is the best 600M-set leg (PP4b 4.766, Uaa
+4.712). Four of the six have the selector's wait at 0.3-0.9 ms and a 3,800-4,400-frame live index; the two low ones
+(QT4b 4.636, Rb 4.694) are the legs whose wakes ran long enough for the inbox backlog to come back.
+
+The cap: RC8 −0.2% against Ra, RC8b +1.4% against Rb — not a pair, neutral. It did not bound the wake as meant: it counts
+notifications and a notification can carry several blocks, so the capped wakes still folded 9-11 blocks (max 21, p90 14
+against 30-47 uncapped); and it only moved the backlog from the wake into the carry (`prune_wait_ms` 1.1-3.3 s on the
+capped legs, 0.25-0.47 uncapped). The settle shrank (20 -> 5-8 ms a wake), nothing else did. Not adopted; the knob stays
+(off).
+
+Where a wake's 240-435 ms goes (means a wake; `remove_folded`): free 51-173 ms, forget 22-34, settle 5-21, lock 13-17,
+remove 10-14, fold 6-13, drain 10-17 — **the free is 40% of the wake, 13-15 ms a block, and it is inline**:
+`PruneGarbage::free` hands the garbage to the queue's one freeing thread (`n42-queue-free`, a channel of four) and drops
+it on the pruning thread when the channel is full. A 10-12-block wake makes one garbage item of 2-2.4M transactions and
+one batch of as many block bodies (`free_later`); the freeing thread is behind them for the whole next wake, so the next
+wake finds the channel full and frees inline. The freeing, not the fold, is what makes the prune ~36 ms a block linear
+and the thread ~86% busy; it is the ceiling on the fold (10.172) and the reason the wake runs away.
+
+Next: (1) stage cz (0f893c78b, running): a minimum fold of 2 against 4, the cheap test of whether a shorter wake keeps
+the drainer's window and cuts the builder's state wait (p50 5-6 ms on the fold-4 legs, 0.2 on the controls); (2) the
+freeing: count the inline frees a wake, and `N42_QUEUE_FREE_THREADS=<n>` (several freeing threads, round-robin) — the
+2026-09 measurement that parallel frees contend (110-150 ms against 27-31 a block) was with the system allocator, the
+fleet runs jemalloc; if frees contend there too, the lever is the transaction's allocation count (one arena a frame)
+rather than the thread count. (3) `N42_PRUNE_MIN_FOLD` (+ thread) ported to main (cherry-picks 0d276ebfe, 6af8aaa81,
+dfc793b17; check pending).

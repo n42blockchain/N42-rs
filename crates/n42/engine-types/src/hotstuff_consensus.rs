@@ -425,6 +425,11 @@ where
             // `deferredExecutionDepth`: the parent's result at depth 1, the
             // parent's parent's at depth 2 (docs/DEFERRED_DEPTH_2_DESIGN.md).
             let depth = reth_chainspec::qmdb::deferred_execution_depth_at(self.chain_spec.genesis(), header.timestamp);
+            // Depth 3: the header's own parent link, for the lineage its
+            // descendants walk (docs/DEPTH3_DESIGN.md item 4).
+            if depth >= 3 {
+                crate::executed_fields::note_parent(header.hash(), header.parent_hash);
+            }
             let expected = ancestor_executed_fields(self.chain_spec.genesis(), parent, depth)
                 .ok_or_else(|| ConsensusError::Other(Arc::new(ancestor_unknown(parent, depth))))?;
             let got = crate::executed_fields::fields_from_child_header(header);
@@ -1029,6 +1034,50 @@ mod tests {
             other_err::<DeferredExecutionError>(&err),
             Some(DeferredExecutionError::ParentUnknown(h)) if *h == alloy_primitives::keccak256(b"depth-two-consensus-0x98")
         ));
+    }
+
+    /// Depth 3 (docs/DEPTH3_DESIGN.md stage 2): the header check accepts
+    /// result(N-3), named through the lineage, and refuses result(N-2) (the
+    /// depth-2 value) and result(N-1); a missing link is named, never read as
+    /// the grandparent. The check notes the child's own link for its
+    /// descendants.
+    #[test]
+    fn at_depth_three_a_header_carrying_the_grandparents_result_is_refused() {
+        let mut genesis = depth_two_genesis();
+        genesis.config.extra_fields.insert(reth_chainspec::qmdb::DEFERRED_EXECUTION_DEPTH_KEY.to_owned(), serde_json::json!(3));
+        let d3 = HotStuffConsensus::new(Arc::new(ChainSpecBuilder::mainnet().genesis(genesis).build()));
+        let great = alloy_primitives::keccak256(b"depth-three-consensus-ggp");
+        let grandparent = alloy_primitives::keccak256(b"depth-three-consensus-gp");
+        crate::executed_fields::remember(great, fields(0xa2)); // result(N-3)
+        crate::executed_fields::remember(grandparent, fields(0xa4)); // result(N-2)
+        let mut parent_header = carrying(good_header(700, TS_SHANGHAI), fields(0xa0));
+        parent_header.gas_used = 0;
+        parent_header.parent_hash = grandparent;
+        let parent = sealed(parent_header);
+        crate::executed_fields::remember(parent.hash(), fields(0xa6)); // result(N-1)
+        let child_with = |f| {
+            let mut child = carrying(good_header(701, TS_SHANGHAI + 3), f);
+            child.parent_hash = parent.hash();
+            child.base_fee_per_gas = Some(875);
+            sealed(child)
+        };
+        // No link for the grandparent yet: the ancestor is unnamed.
+        let err = d3.validate_header_against_parent(&child_with(fields(0xa4)), &parent).unwrap_err();
+        assert!(matches!(
+            other_err::<DeferredExecutionError>(&err),
+            Some(DeferredExecutionError::LineageUnknown(h)) if *h == grandparent
+        ));
+        crate::executed_fields::note_parent(grandparent, great);
+        let good = child_with(fields(0xa2));
+        assert!(d3.validate_header_against_parent(&good, &parent).is_ok());
+        assert_eq!(crate::executed_fields::parent_of(&good.hash()), Some(parent.hash()), "the check noted the child's link");
+        for wrong in [fields(0xa4), fields(0xa6)] {
+            let err = d3.validate_header_against_parent(&child_with(wrong), &parent).unwrap_err();
+            assert!(matches!(
+                other_err::<DeferredExecutionError>(&err),
+                Some(DeferredExecutionError::Mismatch { parent, .. }) if *parent == great
+            ));
+        }
     }
 
     /// A block before the fork carries its own execution, so neither the

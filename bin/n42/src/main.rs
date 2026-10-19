@@ -234,6 +234,18 @@ fn main() {
                             if reth_chainspec::qmdb::deferred_execution_depth_at(&historical_genesis, carrying.timestamp) != u64::from(depth) { return None; }
                             n42_engine_types::executed_fields::fields_from_descendants(&ancestor, &descendants, depth)
                         });
+                        // Depth 3 (docs/DEPTH3_DESIGN.md item 4): a parent link the
+                        // registry did not note (a restart, a late joiner, a block
+                        // imported by the engine) is read from the stored header.
+                        if reth_chainspec::qmdb::deferred_execution_depth(genesis).unwrap_or(1) >= 3 {
+                            let lineage_provider = node.provider.clone();
+                            n42_engine_types::executed_fields::set_lineage_reader(move |hash| {
+                                use reth_provider::DatabaseProviderFactory;
+                                let database = lineage_provider.database_provider_ro().ok()?;
+                                let header = database.header(*hash).ok()??;
+                                (header.hash_slow() == *hash).then_some(header.parent_hash)
+                            });
+                        }
                         // With HotStuff-2 finality the canonical head is the committed
                         // block, and a build on an ancestor of it is a stale request
                         // that would revert the state tree below the head.

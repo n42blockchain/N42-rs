@@ -307,7 +307,14 @@ const PARENT_OUTPUTS_KEPT: usize = 4;
 /// depth-1 value. Read once.
 fn parent_outputs_kept() -> usize {
     static KEPT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *KEPT.get_or_init(|| kept_from_env("N42_PARENT_OUTPUTS_KEPT", PARENT_OUTPUTS_KEPT, 2..=16))
+    *KEPT.get_or_init(|| kept_from_env("N42_PARENT_OUTPUTS_KEPT", PARENT_OUTPUTS_KEPT + depth3_extra(), 2..=16))
+}
+
+/// One more kept block under `N42_DEFERRED_DEPTH3=1` (docs/DEPTH3_DESIGN.md
+/// item 9): checks run one block further ahead of the tip at depth 3. The
+/// env overrides still win.
+fn depth3_extra() -> usize {
+    usize::from(reth_chainspec::qmdb::deferred_depth3_opted_in())
 }
 
 /// A capacity knob: `name` parsed as a count within `range`, else `default`
@@ -423,7 +430,7 @@ const FOLLOWER_SHARDS_KEPT: usize = 2;
 /// (1..=8), as [`parent_outputs_kept`]. Read once.
 fn follower_shards_kept() -> usize {
     static KEPT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *KEPT.get_or_init(|| kept_from_env("N42_FOLLOWER_SHARDS_KEPT", FOLLOWER_SHARDS_KEPT, 1..=8))
+    *KEPT.get_or_init(|| kept_from_env("N42_FOLLOWER_SHARDS_KEPT", FOLLOWER_SHARDS_KEPT + depth3_extra(), 1..=8))
 }
 
 /// Whether the child's check and execution read a parent executed here on the
@@ -2170,6 +2177,12 @@ where
     // for. The includability check and the execution read the *parent's*
     // output at every depth.
     let carried_depth = reth_chainspec::qmdb::deferred_execution_depth_at(chain_spec.genesis(), head.timestamp);
+    // Depth 3 (docs/DEPTH3_DESIGN.md item 4): this block's parent link, which
+    // its grandchild's child walks to name its carried ancestor. Noted before
+    // any check: a hash fixes its parent whether or not the block is valid.
+    if carried_depth >= 3 {
+        n42_engine_types::executed_fields::note_parent(block_hash, parent_hash);
+    }
     // Before the fork the parent must be in already, as it always was: an
     // unknown parent fails here at once and the engine's own path answers
     // SYNCING, with no wait and no sender recovery spent on it. From the

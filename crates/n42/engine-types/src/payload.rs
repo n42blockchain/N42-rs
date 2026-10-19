@@ -202,10 +202,13 @@ fn carried_fields_for_seal_traced(
         return (Some(fields), "ready");
     }
     // The hash the wait below is under: the builder's hash of the parent at
-    // depth 1, the grandparent's sealed hash (an alias of its builder hash)
-    // at depth 2 -- as `carried_fields_for_seal_untraced` passes them.
-    let built = if depth <= 1 { parent_built } else { Some(parent.parent_hash) };
-    let on = built.map_or("no_built", |built| crate::executed_fields::missing_half(&built));
+    // depth 1, the carried ancestor's sealed hash (an alias of its builder
+    // hash) from depth 2 on -- the grandparent, or at depth 3 the
+    // great-grandparent named through the lineage -- as
+    // `carried_fields_for_seal_untraced` passes them.
+    let built = if depth <= 1 { parent_built } else { crate::hotstuff_consensus::ancestor_hash(parent, depth) };
+    let unnamed = if depth >= 3 { "no_lineage" } else { "no_built" };
+    let on = built.map_or(unnamed, |built| crate::executed_fields::missing_half(&built));
     (carried_fields_for_seal_untraced(genesis, parent, parent_built, depth), on)
 }
 
@@ -223,10 +226,12 @@ fn carried_fields_for_seal_untraced(
             crate::hotstuff_consensus::PARENT_FIELDS_WAIT,
         );
     }
+    // The carried ancestor's sealed hash: the grandparent at depth 2, the
+    // great-grandparent (through the lineage) at depth 3.
     crate::hotstuff_consensus::ancestor_executed_fields_or_built(
         genesis,
         parent,
-        Some(parent.parent_hash),
+        crate::hotstuff_consensus::ancestor_hash(parent, depth),
         depth,
         crate::hotstuff_consensus::PARENT_FIELDS_WAIT,
     )
@@ -466,8 +471,16 @@ where
         // needs its result by the sealed hash, before the own-block hand-off
         // has filed it there. The pair is in hand only here. Depth 1 notes
         // nothing, so its lookups are what they were.
-        if reth_chainspec::qmdb::deferred_execution_depth_at(self.client.chain_spec().genesis(), attributes.timestamp) >= 2 {
+        let carried_depth = reth_chainspec::qmdb::deferred_execution_depth_at(self.client.chain_spec().genesis(), attributes.timestamp);
+        if carried_depth >= 2 {
             crate::executed_fields::note_built(parent_hash, parent_built);
+        }
+        // Depth 3 (docs/DEPTH3_DESIGN.md item 4): the parent's own link, so
+        // that two builds from now -- when the parent is the child's
+        // grandparent -- the great-grandparent can be named. Depth 1 and 2
+        // note nothing.
+        if carried_depth >= 3 {
+            crate::executed_fields::note_parent(parent_hash, parent.parent_hash);
         }
         let opener = match &parent_execution {
             crate::direct_build::ParentExecution::Ready(execution) => {
@@ -1963,6 +1976,11 @@ where
     let parent_built = early_seal.as_ref().and_then(|early| early.parent_built);
     // `deferredExecutionDepth`: which ancestor's result the header carries.
     let carried_depth = reth_chainspec::qmdb::deferred_execution_depth_at(chain_spec.genesis(), attributes.timestamp);
+    // Every build (the engine API's as well as the own-block road's) notes
+    // its parent's link at depth 3, the lineage the next builds walk.
+    if carried_depth >= 3 {
+        crate::executed_fields::note_parent(parent_header.hash(), parent_header.parent_hash);
+    }
     // `N42_SEAL_AT_EXEC=1`: the transactions root computed over the pulled
     // candidates beside the parallel step, whether the seal used it, and how
     // long the step's end waited for it.
@@ -6078,6 +6096,59 @@ mod depth_two_tests {
         assert_eq!(gas_limit_over_carried(shrink, parent, None), parent);
         // A fixed limit (the bench) is never touched.
         assert_eq!(gas_limit_over_carried(parent, parent, Some(parent)), parent);
+    }
+
+    /// Depth 3 (docs/DEPTH3_DESIGN.md item 6): the header carries the gas of
+    /// the block three back, so the limit may have shrunk three times since
+    /// that block was full. Each step is held at the carried gas, so the
+    /// carried gas never exceeds the limit of the block that carries it.
+    #[test]
+    fn the_gas_limit_over_three_shrinking_blocks_holds_the_carried_gas() {
+        let start = 30_000_000u64;
+        // Block 0 was full at the start limit; blocks 1..=3 want to shrink hard.
+        let mut limits = vec![start];
+        let mut used = vec![start];
+        for n in 1..=6usize {
+            let parent = limits[n - 1];
+            let computed = calculate_block_gas_limit(parent, 10_000_000);
+            // Block n carries the gas of block n - 3 (genesis's below that).
+            let carried = used[n.saturating_sub(3)];
+            let limit = gas_limit_over_carried(computed, parent, Some(carried));
+            assert!(limit >= carried, "block {n}: limit {limit} under the carried gas {carried}");
+            assert!(limit >= parent - (parent / GAS_LIMIT_BOUND_DIVISOR - 1), "block {n}: within the step down");
+            limits.push(limit);
+            // Blocks 1..=6 are empty: from block 4 on the carried gas is 0.
+            used.push(0);
+        }
+        // Blocks 1..=3 carry block 0's full gas and hold the limit; from
+        // block 4 the carried gas is 0 and the limit steps down.
+        assert_eq!(&limits[1..=3], &[start, start, start]);
+        assert!(limits[4] < start && limits[5] < limits[4] && limits[6] < limits[5]);
+        // The ordinary step alone would have fallen under the carried gas.
+        assert!(calculate_block_gas_limit(start, 10_000_000) < start);
+    }
+
+    /// Depth 3's seal wait: the key is the great-grandparent's sealed hash,
+    /// named through the lineage the builds note, and a leader's own block
+    /// filed only under its builder hash is found through its alias.
+    #[test]
+    fn a_depth_three_build_waits_on_the_great_grandparent() {
+        let mut genesis = depth_two_genesis();
+        genesis.config.extra_fields.insert(reth_chainspec::qmdb::DEFERRED_EXECUTION_DEPTH_KEY.to_owned(), serde_json::json!(3));
+        let k = |tag: &[u8]| alloy_primitives::keccak256([b"depth-three-tests-".as_slice(), tag].concat());
+        let (ggp_sealed, ggp_built, gp_sealed) = (k(b"ggp"), k(b"ggp-built"), k(b"gp"));
+        let parent = SealedHeader::new(Header { number: 20, timestamp: 20, parent_hash: gp_sealed, ..Default::default() }, k(b"p"));
+        // With no lineage the seal names what it lacks and finds nothing.
+        let (found, on) = carried_fields_for_seal_traced(&genesis, &parent, None, 3);
+        assert_eq!((found, on), (None, "no_lineage"));
+        // The build on the grandparent noted gp -> ggp; the build on the
+        // great-grandparent noted its alias.
+        crate::executed_fields::note_parent(gp_sealed, ggp_sealed);
+        crate::executed_fields::note_built(ggp_sealed, ggp_built);
+        crate::executed_fields::remember(gp_sealed, fields(0xe1));
+        crate::executed_fields::remember(ggp_built, fields(0xe2));
+        assert_eq!(carried_fields_for_seal(&genesis, &parent, Some(parent.hash()), 3), Some(fields(0xe2)), "result(N-3), not N-2's");
+        assert_eq!(carried_fields_for_seal(&genesis, &parent, Some(parent.hash()), 2), Some(fields(0xe1)), "depth 2 unchanged");
     }
 
     fn depth_two_genesis() -> alloy_genesis::Genesis {

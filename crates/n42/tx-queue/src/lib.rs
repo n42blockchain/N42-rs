@@ -403,6 +403,8 @@ pub struct PruneTimes {
     /// Handing what left the queue to the freeing thread (or freeing it
     /// here when that thread is four blocks behind), with no lock held.
     pub free_us: u64,
+    /// Frees made here because every freeing thread was full.
+    pub free_inline: usize,
     /// Senders in the block.
     pub senders: usize,
     /// Frames the sweep dropped.
@@ -497,7 +499,7 @@ pub const LEAN_DRAIN_PER_BLOCK: usize = 2 * DRAINER_SLICE;
 /// The most a lean wake drains whatever it folded: eight drainer slices.
 pub const LEAN_DRAIN_WAKE_MAX: usize = 8 * DRAINER_SLICE;
 
-/// Frees `garbage` on the queue's freeing thread ([`freeing_thread`]), or
+/// Frees `garbage` on the queue's freeing threads ([`freeing_threads`]), or
 /// here when that thread is full or absent: for a caller off the queue's
 /// locks that would otherwise pay a large free on a thread that has other
 /// work (the pruner dropping a wake's canonical notifications, whose blocks
@@ -624,34 +626,63 @@ type Freeable = Box<dyn Send>;
 /// four blocks; a prune that finds it full frees its own garbage, so a
 /// freeing thread that falls behind slows the prune down rather than letting
 /// memory grow. `None` if the thread could not be started.
-fn freeing_thread() -> Option<&'static std::sync::mpsc::SyncSender<Freeable>> {
-    static SENDER: OnceLock<Option<std::sync::mpsc::SyncSender<Freeable>>> = OnceLock::new();
-    SENDER
-        .get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<Freeable>(4);
-            std::thread::Builder::new()
-                .name("n42-queue-free".to_owned())
-                .spawn(move || {
-                    while let Ok(garbage) = rx.recv() {
-                        drop(garbage);
-                    }
-                })
-                .ok()
-                .map(|_| tx)
-        })
-        .as_ref()
+///
+/// `N42_QUEUE_FREE_THREADS=<n>` (default 1) runs `n` of them, a channel of
+/// four each, offered in turn and the next tried when one is full. Round
+/// 10.173: on loop351 a folded wake of 10-12 blocks found the one thread
+/// behind the previous wake's garbage every time and freed 13-15 ms a
+/// block inline, 40% of the wake. The 2026-09 contention measurement was
+/// with the system allocator; the fleet runs jemalloc.
+fn freeing_threads() -> &'static [std::sync::mpsc::SyncSender<Freeable>] {
+    static SENDERS: OnceLock<Vec<std::sync::mpsc::SyncSender<Freeable>>> = OnceLock::new();
+    SENDERS.get_or_init(|| {
+        let threads =
+            std::env::var("N42_QUEUE_FREE_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
+        if threads > 1 {
+            tracing::info!(target: "n42.tx_queue", threads, "N42_QUEUE_FREE_THREADS");
+        }
+        (0..threads)
+            .filter_map(|i| {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<Freeable>(4);
+                let name = if i == 0 { "n42-queue-free".to_owned() } else { format!("n42-queue-free{i}") };
+                std::thread::Builder::new()
+                    .name(name)
+                    .spawn(move || {
+                        while let Ok(garbage) = rx.recv() {
+                            drop(garbage);
+                        }
+                    })
+                    .ok()
+                    .map(|_| tx)
+            })
+            .collect()
+    })
 }
 
-/// Hands `garbage` to the queue's freeing thread ([`freeing_thread`]), or
+/// Offers `garbage` to the freeing threads in turn; `Some` gives it back
+/// when every one is full (or none could be started), to be dropped here.
+fn offer_to_freeing(mut garbage: Freeable) -> Option<Freeable> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let senders = freeing_threads();
+    if senders.is_empty() {
+        return Some(garbage);
+    }
+    let first = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for i in 0..senders.len() {
+        match senders[(first + i) % senders.len()].try_send(garbage) {
+            Ok(()) => return None,
+            Err(std::sync::mpsc::TrySendError::Full(back) | std::sync::mpsc::TrySendError::Disconnected(back)) => {
+                garbage = back;
+            }
+        }
+    }
+    Some(garbage)
+}
+
+/// Hands `garbage` to the queue's freeing threads ([`freeing_threads`]), or
 /// drops it here when that thread is full or absent.
 fn free_off_path(garbage: Freeable) {
-    let Some(sender) = freeing_thread() else {
-        drop(garbage);
-        return;
-    };
-    if let Err(std::sync::mpsc::TrySendError::Full(garbage) | std::sync::mpsc::TrySendError::Disconnected(garbage)) =
-        sender.try_send(garbage)
-    {
+    if let Some(garbage) = offer_to_freeing(garbage) {
         drop(garbage);
     }
 }
@@ -701,22 +732,20 @@ pub struct HoldTimes {
 }
 
 impl<T: PoolTransaction + 'static> PruneGarbage<T> {
-    /// Releases everything on the freeing thread ([`freeing_thread`]), or
+    /// Releases everything on the freeing thread ([`freeing_threads`]), or
     /// here when it is full or absent. The by-hash index's references go
     /// last: they are usually the last ones, so that is where the
     /// transactions themselves are freed.
-    fn free(self) {
+    /// `true` when it was freed here (every freeing thread full or absent).
+    fn free(self) -> bool {
         if self.lanes.is_empty() && self.taken.is_empty() && self.frames.is_empty() && self.index.is_empty() {
-            return;
+            return false;
         }
-        let Some(sender) = freeing_thread() else {
-            drop(self);
-            return;
-        };
-        match sender.try_send(Box::new(self)) {
-            Ok(()) => {}
-            Err(std::sync::mpsc::TrySendError::Full(garbage) | std::sync::mpsc::TrySendError::Disconnected(garbage)) => {
+        match offer_to_freeing(Box::new(self)) {
+            None => false,
+            Some(garbage) => {
                 drop(garbage);
+                true
             }
         }
     }
@@ -2852,7 +2881,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         self.drain_inbox(&mut inner);
         inner.remove_mined_highest(&highest, &mut garbage);
         drop(inner);
-        garbage.free();
+        let _ = garbage.free();
     }
 
     /// A canonical block's whole prune, in the order the node's pruner ran
@@ -2879,7 +2908,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// - nothing is freed under a lock: every `Arc` that leaves the lanes,
     ///   the taken list, the frame index or the by-hash index is collected
     ///   and handed at the end (`free_us`) to the queue's freeing thread,
-    ///   with no lock held ([`freeing_thread`]).
+    ///   with no lock held ([`freeing_threads`]).
     pub fn prune_block(
         &self,
         number: u64,
@@ -2927,7 +2956,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         times.forget_us = at.elapsed().as_micros() as u64;
         let at = std::time::Instant::now();
         times.freed = garbage.len();
-        garbage.free();
+        let _ = garbage.free();
         times.free_us = at.elapsed().as_micros() as u64;
         (back, times)
     }
@@ -3103,7 +3132,9 @@ impl<T: PoolTransaction> TxQueue<T> {
         times.forget_us += at.elapsed().as_micros() as u64;
         let at = std::time::Instant::now();
         times.freed += garbage.len();
-        garbage.free();
+        if garbage.free() {
+            times.free_inline += 1;
+        }
         times.free_us += at.elapsed().as_micros() as u64;
         times.removals += 1;
         times.folded += run.len();
@@ -4135,7 +4166,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             }
             self.begin_build(&mut inner, parent);
         }
-        garbage.free();
+        let _ = garbage.free();
         QueueBest {
             queue: self.clone(),
             skipped: AddressHashSet::default(),
@@ -4290,7 +4321,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             });
             (out, mark)
         };
-        garbage.free();
+        let _ = garbage.free();
         self.finish_frame_build(segments, plan, times, mark, prepared_body, gas_limit, mode, ahead)
     }
 
@@ -4435,7 +4466,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 list.extend(taken);
             }
         }
-        garbage.free();
+        let _ = garbage.free();
         drop(first);
         self.settle_rest(batch, max_holds.saturating_sub(1));
     }
@@ -4456,7 +4487,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 inner.lanes_gen = inner.lanes_gen.wrapping_add(1);
                 inner.split_runs(&part, &mut garbage.lanes);
             }
-            garbage.free();
+            let _ = garbage.free();
         }
     }
 
@@ -4671,7 +4702,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             let (segments, plan, gas_left) = inner.plan_frames(gas_limit, &mut times, mode);
             inner.store_prepared(current, segments, plan, gas_left, gas_limit, at, hook.is_some(), &mut body_job)
         };
-        garbage.free();
+        let _ = garbage.free();
         Self::run_body_hook(hook, body_job);
         prepared
     }
@@ -4730,7 +4761,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         {
             let made = inner.store_prepared(current, segments, plan, gas_left, gas_limit, at, hook.is_some(), &mut body_job);
             drop(inner);
-            garbage.free();
+            let _ = garbage.free();
             Self::run_body_hook(hook, body_job);
             return OffPlanned::Done(made);
         }
@@ -4753,7 +4784,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             hook,
         };
         drop(inner);
-        garbage.free();
+        let _ = garbage.free();
         OffPlanned::Planned(planned)
     }
 
@@ -4831,7 +4862,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             body,
         });
         drop(inner);
-        garbage.free();
+        let _ = garbage.free();
         Self::run_body_hook(hook, body_job);
         Some(true)
     }

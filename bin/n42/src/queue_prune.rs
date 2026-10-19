@@ -93,6 +93,7 @@ pub fn prune_notification(
         sum.remove_us += times.remove_us;
         sum.forget_us += times.forget_us;
         sum.free_us += times.free_us;
+        sum.free_inline += times.free_inline;
         sum.frames_swept += times.frames_swept;
     }
     if mined > 10_000 {
@@ -122,6 +123,7 @@ pub fn prune_notification(
             fold_us = sum.fold_us,
             lock_us = sum.lock_us,
             free_us = sum.free_us,
+            prune_free_inline = sum.free_inline,
             frames_swept = sum.frames_swept,
             coalesced,
             prune_wait_ms = waited.as_millis() as u64,
@@ -180,6 +182,7 @@ pub fn prune_notifications_lean(
         sum.remove_us += times.remove_us;
         sum.forget_us += times.forget_us;
         sum.free_us += times.free_us;
+        sum.free_inline += times.free_inline;
         sum.frames_swept += times.frames_swept;
         sum.removals += times.removals;
         sum.folded += times.folded;
@@ -236,6 +239,7 @@ pub fn prune_notifications_lean(
             fold_us = sum.fold_us,
             lock_us = sum.lock_us,
             free_us = sum.free_us,
+            prune_free_inline = sum.free_inline,
             frames_swept = sum.frames_swept,
             coalesced,
             prune_wait_ms = waited.as_millis() as u64,

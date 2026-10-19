@@ -4315,3 +4315,46 @@ Stage ct (wt-main 4414c53d9; the depth-3 shape of 10.167 as control, Ja/Jb, agai
 JSR is +0.2% / +4.1% against the two controls, JSRb −1.2% / +2.7%: not the two-pair rule. SRWM does not remove the grandparent state wait (73-74 builds over 20 ms in the windows where it appears; it is absent in the windows where the builder sits in `none` with `sealed_at` 43-45 — a slow start loop instead, the third floor). The four depth-3 legs read 4.41-4.59M/s; the depth-2 X17 band over the same two days is 4.53-4.78 (co/cp/cq/cr/cs: 4.641, 4.776, 4.536, 4.691, 4.683, 4.667, 4.527). Depth 3 is correct and costs nothing in validity, but on this box it only exchanges the fields floor for the state-readiness floor, as 10.146's "three floors within 3 ms" predicts: removing one floor exposes the next within 1-3 ms.
 
 Standing after 10.165-10.168: X17 at depth 2 = **4.5-4.78M/s** is the box's rate; the builder's CPU floor is memory-latency-bound (19.5 DRAM fills per transfer), the two cheapest cuts and depth 3 are flat, and every lever below the architecture level since 10.147 is within ±1.5%. What is left: (a) the merged in-memory index over the state layers (ARCHITECTURE_TOWARD_5M rank 1 / DEPTH3_DESIGN C1 stage 2 — the only change that attacks the state-readiness floor *and* the builder's probe chain at once, 1-1.5 ms of CPU plus an earlier-ready layer; weeks of work, uncertain to reach 40 ms), (b) a second box (the fleet's seven validators and the flood on their own cores), (c) accepting 4.75M as the one-box ceiling. The loop stops here for that decision; `perf/depth3` (stages 0-2, tested) and `perf/state-ready-without-merge` stay as they are, `perf/builder-fast-path` unmerged.
+
+### 10.169 loop351 stage cu — the five-block window on top of state ready before the merge: split pair; the loser's cause is a bistable inbox backlog in the transaction queue
+
+Stage cu (wt-main 40ec87b67; DELTA_LOG_DESIGN section 5's next step: X17 + `N42_ANSWER_AT_INSERT=1 N42_STATE_READY_WITHOUT_MERGE=1`
+as control, Ma/Mb, against the same plus `N42_FAR_AHEAD_BLOCKS=2 N42_PARENT_OUTPUTS_KEPT=6 N42_OWN_HOLD_BLOCKS=64`, MF5/MF5b; depth 2,
+600M set, two pairs; d2gate clean on all four, verify pass).
+
+| leg | config | drain | gap mean/median | sealed_at | start_best (hand-off / other) | state_wait | frames live at take | prune wakes (1-block) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Ma | control | 4.653M/s | 43.0/38.9 | 41.2 | 3.0 (1.7 / 0.3) | 9.0 ms | 4,398 | 380 (115) |
+| MF5 | + five-block window | **4.378M/s** | 45.7/44.5 | 44.0 | **17.4 (5.6 / 10.6)** | 0.6 ms | **227** | 1,687 (1,425) |
+| Mb | control | 4.610M/s | 43.4/40.9 | 41.7 | 10.0 (4.5 / 3.8) | 3.4 ms | 2,253 | 1,190 (607) |
+| MF5b | + five-block window | 4.680M/s | 42.7/39.3 | 41.0 | 7.8 (4.0 / 1.8) | 4.3 ms | 3,394 | 1,052 (400) |
+
+MF5 −5.9% / −5.0%, MF5b +0.6% / +1.5%: not the two-pair rule; the window is not adopted. SRWM did not change the window's
+failure mode, but this round names it.
+
+**The cause is on the supply side, not in the chain.** Across the six legs of cs/ct/cu with full phase lines, the unnamed part of
+the selector's time (`start_best_other_ms`) is a monotone function of the live frame index at the take: Ma 4,398 frames /
+0.3 ms, MF5b 3,394 / 1.8, Ja 2,948 / 2.7, Mb 2,253 / 3.8, Jb 538 / 8.2, MF5 227 / 10.6 (`plan_wait_timeout` 0 everywhere,
+`start_frames_refused_at_cap` 0, `start_pull_ms` 0). The queue's prune lines show where the frames are:
+`frames_indexed=61 frames_aside=1890 frames_pending=4772` in MF5 against `frames_indexed=4594 frames_aside=2800 frames_pending=0`
+in Ma — the ingest's inbox (`Inner::pending_frames`, a frame is indexed in the hold that moves its last transaction into the
+lanes, `drain_pending`) holds 2.4M transactions that are "queued" but not selectable. The selector then waits, inside its
+30 ms plan wait, for the drainer to index a block's worth. The ingest sees it as back-pressure (`gate_us_per_frame` 4,451 vs
+2,057).
+
+Why bistable: the inbox is drained under the lanes' lock by the drainer thread (`drain_now`) and by the lean pruner
+(`N42_PRUNE_LEAN_DRAIN_TXS`, default 2 x 8,192 a folded block, at most 65,536 a wake). A drain costs 125-155 ns a transaction
+of lock time, so 200,000 arrivals a block are ~25-30 ms of the lock per 42 ms block; the pruner's wake has a fixed cost
+(settle 6.4 + forget 7.9 + remove 1.3 ms named, `prune_ms` 40-60). A pruner that wakes once a block (MF5: 1,425 of 1,687
+wakes folded one block) spends the lock on its fixed cost, the drainer falls behind, the inbox fills to the ingest gate and
+stays there — once behind, every take empties the live index and the next build waits again. A pruner that fell behind
+early and folds 4-6 blocks a wake (Ma: 380 wakes for 2,158 blocks) pays its fixed cost a sixth as often, the drainer keeps
+up, and the live index holds 4,000+ frames. Which mode a leg lands in is set in its first seconds. This is the mechanism
+behind "every added load hits the pruner/lanes-lock saturation" (10.150s) and the leg-to-leg spread of 3-6% that has
+masked every ≤1.5 ms cut since X17: Mb (control) sits in the bad mode too (2,253 live, 3.8 ms other, 4.610 vs Ma 4.653).
+
+Lever: make the good mode deterministic — the pruner folds at least N blocks a wake (a minimum fold / coalesce window;
+knob proposed `N42_PRUNE_MIN_FOLD`), so its fixed cost is paid once per N blocks and the lock is left to the drainer. The
+chain is untouched (node-local queue scheduling). Expected: `frames_pending` ~0 and `start_best_other` ≤0.5 ms on every leg,
+removing 2-10 ms of selector wait from the bad-mode legs; the band should tighten toward its upper edge (4.65-4.78M/s). Not
+a path to 5M alone, but it is the first lever that removes a floor rather than trades one for another.

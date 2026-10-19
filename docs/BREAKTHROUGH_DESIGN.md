@@ -4500,3 +4500,46 @@ freeing: count the inline frees a wake, and `N42_QUEUE_FREE_THREADS=<n>` (severa
 fleet runs jemalloc; if frees contend there too, the lever is the transaction's allocation count (one arena a frame)
 rather than the thread count. (3) `N42_PRUNE_MIN_FOLD` (+ thread) ported to main (cherry-picks 0d276ebfe, 6af8aaa81,
 dfc793b17; check pending).
+
+### 10.174 loop351 stage cz — a minimum fold of 2 loses (4.614 / 4.537 vs 4.680 / 4.645); where the last 4-7% to 5M is, and the plan
+
+Stage cz (wt-main 0f893c78b; Sa/Sb = X18, against SF2/SF2b = X18 with `N42_PRUNE_MIN_FOLD=2`; depth 2, 600M set; d2gate
+clean, verify pass).
+
+| leg | drain | gap mean | sealed_at | selector wait | frames_pending / live index | prune wakes / blocks a wake (max) / prune_ms / free_ms a wake | state_wait p50/p90 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Sa (fold 4) | 4.680M/s | 42.8 | 39.7 | 1.3 | 1,279 / 3,318 | 366 / 5.9 (35) / 190 / 25.5 | 2.9/10.9 |
+| SF2 (fold 2) | 4.614M/s | 43.4 | 40.2 | 1.5 | 1,402 / 3,265 | 496 / 4.3 (46) / 156 / 24.3 | 3.4/11.1 |
+| Sb (fold 4) | 4.645M/s | 43.1 | 40.9 | 3.5 | 2,733 / 1,873 | 384 / 5.6 (35) / 193 / 25.0 | 0.3/8.5 |
+| SF2b (fold 2) | 4.537M/s | 44.1 | 38.3 | 3.0 | 2,196 / 2,479 | 786 / 2.7 (8) / 90 / 0.2 | 0.3/6.8 |
+
+Fold 2 is −1.4% / −2.3% against fold 4: not adopted. SF2b shows the other side of the fold: 2.7-block wakes, the freeing
+thread keeping up (free 0.2 ms a wake, nothing inline), the builder's state wait back at 0.3 ms — and the lowest rate of
+the four, because 786 wakes a leg take the queue's lock 786 times and the drainer's window is gone again (pending
+2,196). The fold's value is the uninterrupted window; the fold's cost is the inline free and the builder's state wait.
+X18 now stands at eight legs 4.636-4.788 (median 4.69); this stage's two controls sat at its lower half.
+
+**Where the goal stands.** The drain rate is 200,000 transactions over the mean block gap: 4.788M/s is a 41.8 ms gap,
+5M/s needs 40.0, and the X18 median (42.8) needs −2.8 ms. The gap is the builder's `sealed_at` (38-41 ms: par_exec 20,
+par_fold 9, select + hand-off 2-4, root behind the seal) plus the builder's waits (state_wait p50 3-6 ms on the
+fold-4 legs, 0.2-0.3 on those whose freeing kept up) plus the long-gap tail (gaps over 80 ms, 4-6 s a window). Every
+seal-side cut since X17 moved under 1.5 ms (cc-cn); the fold was the one lever over 1.5% since X17, and what it costs
+back (the state wait) is 3-6 ms of the very thing we need. So the plan narrows to the queue's garbage:
+
+1. **Stage da (e7712d133, running)**: `N42_QUEUE_FREE_THREADS=2` (0eea07d86: garbage offered to each freeing thread in
+   turn, freed inline only when all are full; `prune_free_inline` counts those) against one, both on X18. If the second
+   thread takes the inline free out of the wake (free_ms a wake 25-170 -> ~0, `prune_free_inline` 0) the wake halves,
+   the fold stops running away and the state wait should fall toward 0.3 ms with the drainer's window kept: that is the
+   −3 ms. If jemalloc's frees contend like the system allocator's did (110-150 ms a block from several threads), the
+   wake gets longer, not shorter, and the knob is off.
+2. If (1) is flat because the free is not the state wait's cause: measure the wait's object (`state_wait_on`) on a
+   fold-4 leg against a fold-2 leg — the wait is on the parent's output or the grandparent's layer, and a 190 ms wake
+   can only reach it through the queue's lock (the own-block insert on the hand-off path takes it) or memory bandwidth.
+3. The structural fix, if the frees are the cost whichever thread pays them: one allocation a frame (a frame's
+   transactions in one arena, freed as one), which also removes the 600k reference drops a block. Days, not weeks;
+   it is the lever behind `free_us`, `forget_us` and the drain's 125-155 ns a transaction alike.
+4. Not pursued further: the fold cap (neutral), fold 2 (loses), seal-side cuts (all under 1.5 ms), depth 3, bigger
+   blocks, more build cores — all closed in 10.132-10.173.
+
+Main: `N42_PRUNE_MIN_FOLD` / `N42_PRUNE_MAX_FOLD` / the thread's fold ported (0d276ebfe, 6af8aaa81, dfc793b17; checked,
+pushed). X18's two extra knobs for a bench on main: `N42_QUEUE_PRUNE_THREAD=1 N42_PRUNE_MIN_FOLD=4`.

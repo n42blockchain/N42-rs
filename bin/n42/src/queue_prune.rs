@@ -271,8 +271,9 @@ pub fn prune_notifications_lean(
 /// the lanes' lock is left to the drainer between wakes. Round 10.169: a
 /// pruner waking once a block starved the inbox drain, the live frame
 /// index emptied, and the selector waited 4-10 ms a build for frames;
-/// legs whose pruner happened to fold 4-6 blocks a wake did not.
-fn min_fold() -> (usize, std::time::Duration) {
+/// legs whose pruner happened to fold 4-6 blocks a wake did not. Read by
+/// the pruning thread and by the runtime's lean prune task (`main.rs`).
+pub fn min_fold() -> (usize, std::time::Duration) {
     static KNOB: std::sync::OnceLock<(usize, std::time::Duration)> = std::sync::OnceLock::new();
     *KNOB.get_or_init(|| {
         let n = std::env::var("N42_PRUNE_MIN_FOLD").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);

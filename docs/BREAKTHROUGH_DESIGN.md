@@ -4397,3 +4397,25 @@ Stage cn (wt-main, tree 9802986da; no rebuild), 600M set, on X17 (b64/c16 layout
 ### 10.164 loop351 stage co — the profiled leg runs at the control's rate, but perf could not record: the host's perf_event_paranoid is 4
 
 Stage co (wt-main, tree a085267aa; the profiling build `target/profiling-build/profiling`, 17m52s): X11T16Fa (native X17) 4.513 / 4.460 / 4.600 = 4.533M/s; X11T16F7PROF (profiling binary, same configuration) 4.527 / 4.520 / 4.600 = 4.563M/s -- the debug-info build costs nothing measurable. The 7PROF hook's `perf record` failed: `/proc/sys/kernel/perf_event_paranoid` is 4 on this host (it was lower when loop278/loop279 were profiled). The builder-floor profile (where the 16 ms of par_exec go: journal lookups, decode, hashing, cache misses) needs `kernel.perf_event_paranoid` at 1 or lower (a root sysctl) and then a rerun of this stage.
+
+### 10.165 loop351 stages co, cp, cq — the builder floor profiled: 48% of the build threads' cycles are state lookups, ~19.5 DRAM fills per transfer, and no single change is worth 2 ms
+
+The host's `perf_event_paranoid` went to 1 at 20:00 (set by hand; it resets at every reboot). Stage co then ran: X11T16Fa (native X17) 4.641M/s, X11T16F7PROF (profiling binary) 4.638M/s — the profiling build costs nothing — but the 7PROF hook's `perf record --pid` on the whole layer wrote 5 MB and died (exit 255, data-size field 0). Stage cp kept perf's stderr (fleet7-profile.sh writes `<prefix>.perf.err`): same death, only "Ignored open failure for pid" warnings — an event per thread x 256 CPUs on a layer of several hundred threads is too much for one recorder; the leg itself read 4.776M/s (w1 4.82M, the profiling binary's best). Stage cq used stage aw's thread-list hook instead (`-t` on the 64 `n42-build` threads, DWARF 4 KB stacks, 499 Hz, 8 s at the first full block + 40 s, then the DRAM-fill events for 6 s): 320 MB / 75,160 samples and 53 MB / 1.34M samples, leg 4.536M/s. Caveat for the miss record: the three `-c` periods collapsed to the last one (400,000), so the DRAM-fill table rests on 1,323 samples; and the user-space call chains did not unwind, so every share is self time.
+
+`docs/BUILDER_FLOOR_PROFILE.md` (8be4c77ec). The 64 build threads were on-CPU 29% of the time: 12.9 ms per thread per block, the CPU floor; 1% of their cycles is ~0.13 ms per block.
+
+| group | share of build cycles | ms / block |
+| --- | --- | --- |
+| state lookups (parent/in-memory layers 18.1, batch map + warm cache 14.0, address hashing 5.8, QMDB read view 5.6, **changeset scans 4.9-11.9**) | 48.5% | 6.3 |
+| transfer execution (batch loop, `alt_sig_tx_env`, U256 arithmetic, commit) | 18.6% | 2.4 |
+| bundle building at each thread's end (`take_bundle`, revert maps) | 9.1% | 1.2 |
+| kernel (futex sleep/wake, faults; unresolved) | 7.0% | 0.9 |
+| libc memmove | 5.1% | 0.65 |
+| rayon / epoch / locks | 3.2% | 0.4 |
+| blake3, decode, body prep, jemalloc | <5% | <0.6 |
+
+DRAM: 19.5 DRAM fills and 78 L1 misses per transfer, 25% of L1 misses go to DRAM, 5.6 GB/s — the floor is memory *latency* (about eight dependent probes per cold recipient: batch map, warm cache, overlay, in-memory blocks, frozen shards, shard layer, QMDB journal, QMDB view), not bandwidth and not compute. 28% of the DRAM fills land in the parent/in-memory layers (`FrozenShards::get` alone 9.5%), 17.6% in the batch map, 13% in `take_bundle`, 7.8% in `alt_sig_tx_env` (first touch of the cold pooled 0x50 body). Rayon spin and steal are 0.4 ms per block: the 4.9 ms batch imbalance is threads *asleep* (each thread's `take_bundle` + sink after its last batch; bursty changeset scans), which a cycles profile cannot attribute.
+
+Ranked: (1) stop the per-block changeset scan in the builder's reads — when the overlay's anchor is below the database tip and `N42_ACCOUNT_HISTORY=off`, each cold account first scans one changeset per block (`storage-overlay/src/provider.rs:420-446` → `n42_account_history.rs:44-64`) before QMDB answers; answer from QMDB at the anchor's version, or re-anchor: 0.6-1.5 ms, medium confidence. (2) A transfer-only `take_bundle` (present `BundleAccount` + `AccountRevert` with empty storage directly, no `TransitionAccount`/`RevertToSlot` map) and a fixed hasher for the empty storage map in `loaded`: 0.4-0.7 ms. (3) The merged in-memory address index over the layers (ARCHITECTURE_TOWARD_5M rank 1, DEPTH3_DESIGN C1): 1-1.5 ms, weeks. (4) Body prefetch further ahead: 0.2-0.3 ms. **No single change is credibly ≥2 ms of the 16**; (1)+(2) together 1.0-2.2 ms of the CPU floor, and whether `par_exec`'s wall time follows depends on the sleeping tail.
+
+Decision: implement (1) and (2) knob-gated (`N42_BUILD_READS_NO_CHANGESET=1`, `N42_TAKE_BUNDLE_TRANSFER=1`, off by default, with a counter for how often the changeset fallback fires first), measure in stage cr (X17 control + both knobs, 600M set, two pairs), and in parallel start DEPTH3_DESIGN stage 0-1 — the depth-3 genesis and `N42_DEFERRED_DEPTH3=1` — since the roadmap's 5.25-5.55M/s needs both the cheaper builder and the third carried block.

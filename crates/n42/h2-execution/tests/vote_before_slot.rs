@@ -197,6 +197,9 @@ fn the_in_flight_knob_accepts_one_to_three() {
     assert!(n42_h2_execution::parse_in_flight("0").is_err());
     assert!(n42_h2_execution::parse_in_flight("4").is_err());
     assert!(n42_h2_execution::parse_in_flight("two").is_err());
+    // With the depth-3 opt-in the cap may go one further.
+    assert_eq!(n42_h2_execution::parse_in_flight_up_to("4", n42_h2_execution::DEFERRED_IN_FLIGHT_MAX + 1), Ok(4));
+    assert!(n42_h2_execution::parse_in_flight_up_to("5", n42_h2_execution::DEFERRED_IN_FLIGHT_MAX + 1).is_err());
     let (el, _gate) = gated();
     let (mut driver, _rx) = driver(&el, false);
     assert!(driver.set_deferred_in_flight(4).is_err());

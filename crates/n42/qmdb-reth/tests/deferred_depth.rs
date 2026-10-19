@@ -7,7 +7,8 @@
 
 use alloy_genesis::Genesis;
 use n42_qmdb_reth::{
-    check_deferred_execution_depth, deferred_execution_depth, deferred_execution_depth_at, DeferredDepthError,
+    check_deferred_execution_depth, check_deferred_execution_depth_up_to, deferred_depth3_opted_in_from,
+    deferred_execution_depth, deferred_execution_depth_at, supported_deferred_execution_depth, DeferredDepthError,
     SUPPORTED_DEFERRED_EXECUTION_DEPTH,
 };
 
@@ -87,10 +88,19 @@ fn the_node_refuses_a_depth_it_does_not_implement() {
     let three = genesis(json!({ "deferredExecutionTime": 0, "deferredExecutionDepth": 3 }), 0);
     assert_eq!(deferred_execution_depth(&three), Ok(3));
     let checked = check_deferred_execution_depth(&three);
-    if SUPPORTED_DEFERRED_EXECUTION_DEPTH >= 3 {
+    if supported_deferred_execution_depth() >= 3 {
         assert_eq!(checked, Ok(3));
     } else {
         assert_eq!(checked, Err(DeferredDepthError::NotImplemented(3)));
+    }
+    // The opt-in (`N42_DEFERRED_DEPTH3=1`) runs it; the default does not.
+    assert_eq!(SUPPORTED_DEFERRED_EXECUTION_DEPTH, 2);
+    assert_eq!(check_deferred_execution_depth_up_to(&three, 3), Ok(3));
+    assert_eq!(check_deferred_execution_depth_up_to(&three, 2), Err(DeferredDepthError::NotImplemented(3)));
+    assert_eq!(check_deferred_execution_depth_up_to(&two, 3), Ok(2));
+    assert!(DeferredDepthError::NotImplemented(3).to_string().contains("N42_DEFERRED_DEPTH3=1"));
+    for (value, on) in [(None, false), (Some("1"), true), (Some(" 1 "), true), (Some("0"), false), (Some("true"), false), (Some(""), false)] {
+        assert_eq!(deferred_depth3_opted_in_from(value), on, "{value:?}");
     }
     // Errors of the value come first.
     let bad = genesis(json!({ "deferredExecutionTime": 0, "deferredExecutionDepth": 4 }), 0);

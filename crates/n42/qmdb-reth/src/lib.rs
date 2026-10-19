@@ -43,7 +43,7 @@ pub use changes::{
 pub use hotstuff::{GenesisValidator, HotStuffConfigError, HotStuffGenesisConfig};
 pub use reth_chainspec::qmdb::{
     check_deferred_execution_depth, deferred_execution_active_at, deferred_execution_depth, deferred_execution_depth_at,
-    deferred_execution_time, DeferredDepthError, DEFERRED_EXECUTION_DEPTH_KEY, SUPPORTED_DEFERRED_EXECUTION_DEPTH,
+    deferred_execution_time, DeferredDepthError, DEFERRED_EXECUTION_DEPTH_KEY, SUPPORTED_DEFERRED_EXECUTION_DEPTH, check_deferred_execution_depth_up_to, deferred_depth3_opted_in, deferred_depth3_opted_in_from, supported_deferred_execution_depth, DEFERRED_DEPTH3_ENV,
 };
 /// The tree a producer computed for a block it has not yet sealed.
 pub use n42_qmdb_state::forest::PreparedBlock;

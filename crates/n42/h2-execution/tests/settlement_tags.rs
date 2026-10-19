@@ -391,3 +391,39 @@ async fn at_depth_two_safe_is_two_behind_the_tip() {
     }
     assert_eq!(driver.safe_tag(), Some(Tag { number: 14, hash: blocks[13].0 }));
 }
+
+/// `docs/DEPTH3_DESIGN.md` item 11 through the driver: at depth 3 a commit
+/// certifies the block three behind it, so safe trails the tip by three
+/// (blocks 1..=3 move nothing past the floor) and finalized stays capped by
+/// persistence. The depth is set against an explicit deepest depth, which is
+/// what `N42_DEFERRED_DEPTH3=1` gives `set_deferred_depth`.
+#[tokio::test]
+async fn at_depth_three_safe_is_three_behind_the_tip() {
+    let el = MockExecutionLayer::new();
+    let persisted = Arc::new(AtomicU64::new(0));
+    let mut driver = split_driver(&el, &persisted);
+    assert!(driver.set_deferred_depth_up_to(3, 2).is_err(), "without the opt-in depth 3 is refused");
+    assert!(driver.set_deferred_depth_up_to(4, 4).is_err(), "never past the rule's depth");
+    assert_eq!(driver.deferred_depth(), 1, "a refusal leaves the depth as it was");
+    driver.set_deferred_depth_up_to(3, 3).expect("depth 3");
+    assert_eq!(driver.deferred_depth(), 3);
+    let blocks = chain_on(GENESIS, 1, 16);
+    let mut last = (0u64, 0u64);
+    for (i, (hash, payload)) in blocks.iter().enumerate() {
+        let number = i as u64 + 1;
+        if number.is_multiple_of(8) {
+            persisted.store(number - 6, Ordering::Relaxed);
+        }
+        driver.cache_payload(*hash, payload.clone());
+        driver.handle_output(&committed(*hash)).await;
+        let sent = *forkchoices(&el).last().expect("a commit sends a forkchoice");
+        assert_eq!(sent.head_block_hash, *hash);
+        let safe = number_of(&blocks, sent.safe_block_hash);
+        assert_eq!(safe, number.saturating_sub(3), "block {number}: safe is the great-grandparent");
+        let finalized = number_of(&blocks, sent.finalized_block_hash);
+        assert_eq!(finalized, safe.min(persisted.load(Ordering::Relaxed)));
+        assert!(safe >= last.0 && finalized >= last.1, "block {number}: a tag moved backwards");
+        last = (safe, finalized);
+    }
+    assert_eq!(driver.safe_tag(), Some(Tag { number: 13, hash: blocks[12].0 }));
+}

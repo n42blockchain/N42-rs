@@ -114,11 +114,11 @@ run() { local tag=$1; shift
   ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; exec env F7_EL_MAP=$EL_MAP python3 scripts/fleet7-runs/memsample.py $STRIP/mem.log $NEL ) > /dev/null 2>&1 & MS=$!
   case $tag in *DPROF) ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; sleep 30; bash scripts/fleet7-offcpu.sh --node 0 --secs 10 $S/offcpu-$tag > $S/offcpu-$tag.run.out 2>&1 ) & ;; esac
   case $tag in *7PROF) ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; sleep 45; F7_BIN=$WT/target/profiling-build/profiling bash scripts/fleet7-profile.sh 0 $S/perf-$tag 10 > $S/perf-$tag.run.out 2>&1 ) & ;; esac
-  case $tag in *X11prof) ( n=0; until grep -q 'first full block at epoch' $S/bench-$tag.out 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 600 ] && exit 0; done; sleep 4
+  case $tag in *X11prof) ( n=0; until grep -q 'first full block at epoch' $S/bench-$tag.out 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 600 ] && exit 0; done; sleep 40
      p=$(ps -eo pid,args | grep '/n4[2] node' | grep 'rust-fleet7-bench/node0/' | grep -v grep | awk '{print $1}' | head -1); [ -n "$p" ] || { echo "no node0 execution layer"; exit 0; }
      tids=$(for t in /proc/$p/task/*; do case "$(cat $t/comm 2>/dev/null)" in n42-build|n42-build-*) echo ${t##*/};; esac; done | paste -sd,); echo "$tag perf on pid $p, $(echo $tids | tr , '\n' | grep -c .) n42-build threads, from $(date +%H:%M:%S)"
      [ -n "$tids" ] || tids=""; T=${tids:+-t $tids}; [ -n "$T" ] || T="-p $p"
-     perf record -F 999 -g --call-graph dwarf,16384 $T -o $S/perf-$tag-build.data -- sleep 8; echo "cycles record exit $? at $(date +%H:%M:%S)"
+     perf record -F 499 -g --call-graph dwarf,4096 $T -o $S/perf-$tag-build.data -- sleep 8; echo "cycles record exit $? at $(date +%H:%M:%S)"
      perf record -e ls_dmnd_fills_from_sys.dram_io_all -c 200 -e ls_dmnd_fills_from_sys.all -c 2000 -e cycles -c 400000 $T -o $S/perf-$tag-miss.data -- sleep 6; echo "miss record exit $? at $(date +%H:%M:%S)"
      ) > $S/perf-$tag.run.out 2>&1 & ;; esac
   echo "leg $tag start $(date +%H:%M:%S) load $(awk '{print $1}' /proc/loadavg)"
@@ -1319,7 +1319,16 @@ case $STAGE in
      C16="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_SIBLINGS=background N42_CORE_LAYOUT_BEHIND=background"
      X11="$X10 $C16"
      b7 D2S12P30T64X11T16G7PROF $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_ANSWER_BEFORE_REVERTS=1 N42_REGISTER_FREE_OFFLOCK=1 N42_HANDOFF_DONE_FIRST=1 N42_SHARDS_READY_FIRST=1 N42_TX_QUEUE_DRAIN_RUNS=1 N42_PRUNE_LEAN=1 N42_BUILD_AHEAD_AT_SEAL=1 N42_ROOT_UPPER_DIRTY=1 N42_ROOT_OPS_BEFORE_GATE=1 F7_BIN=$WT/target/profiling-build/profiling $R6 F7_BLOCK_INTERVAL_MS=30 ;;
-  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq, ar, as, at, au, av, aw, ax, ay, az, ba, bb, bc, bd, be, bf, bm, bn, bo, bp, bq, br, bs, bt, bu, bv, bw, bx, by, bz, ca, cb, cc, cd, ce, cf, cg, ch, ci, cj, ck, cl, cm, cn, co or cp)"; exit 2 ;;
+  cq) mk WARM 7 16; warm_gate WARM
+      # stage cq: the profiled X17 leg with the X11prof hook instead (perf -t on the n42-build threads only, DWARF call graphs, 8 s at first full block + 40 s): the 7PROF hook's `perf record --pid` on the whole layer (every thread x 256 CPUs) died twice with exit 255 and no error line
+     R6="F7_FLOOD_REPLAY=/data/n42-pregen/g900000-600m"; export F7_SENDERS_ARG=18750; echo "stage cq: replay set $R6 (senders $F7_SENDERS_ARG; the WARM leg above used the 400M set)"
+     D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
+     X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"
+     SM="N42_SHARD_MIX=1"; X9="$X7 $SM $PA $BA"; X10="$X9 N42_PLAN_AHEAD_WAIT_MS=30"
+     C16="N42_CORE_LAYOUT=isolate N42_CORE_LAYOUT_BUILD_CORES=64 N42_CORE_LAYOUT_CRITICAL_CORES=16 N42_CORE_LAYOUT_SIBLINGS=background N42_CORE_LAYOUT_BEHIND=background"
+     X11="$X10 $C16"
+     b7 D2S12P30T64X11T16bX11prof $D2 $S1 $S2 $X11 $T64 N42_PLAN_AHEAD_BODY_THREADS=16 N42_ANSWER_BEFORE_REVERTS=1 N42_REGISTER_FREE_OFFLOCK=1 N42_HANDOFF_DONE_FIRST=1 N42_SHARDS_READY_FIRST=1 N42_TX_QUEUE_DRAIN_RUNS=1 N42_PRUNE_LEAN=1 N42_BUILD_AHEAD_AT_SEAL=1 N42_ROOT_UPPER_DIRTY=1 N42_ROOT_OPS_BEFORE_GATE=1 F7_BIN=$WT/target/profiling-build/profiling $R6 F7_BLOCK_INTERVAL_MS=30 ;;
+  *) echo "unknown stage $STAGE (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa, ab, ac, ad, ae, af, ag, ah, ai, aj, ak, al, am, an, ao, ap, aq, ar, as, at, au, av, aw, ax, ay, az, ba, bb, bc, bd, be, bf, bm, bn, bo, bp, bq, br, bs, bt, bu, bv, bw, bx, by, bz, ca, cb, cc, cd, ce, cf, cg, ch, ci, cj, ck, cl, cm, cn, co, cp or cq)"; exit 2 ;;
 esac
 
 if [ "${LOOP351_DRY:-0}" = 1 ]; then echo "dry run done"; exit 0; fi

@@ -419,10 +419,32 @@ f7_check_genesis() {
 # --------------------------------------------------------------- validators -
 # Derived, not drawn: the same seed reproduces the set in the genesis, so the
 # fleet can be rebuilt from this file and the chain spec alone. Dev only.
+# f7_consensus_dir <node dir> -- makes <node dir>/consensus. With F7_CONSENSUS_ROOT=<dir> it is a
+# link to <dir>/<node dir's name>: the vote log's sync_data (twice a view, on the vote path) then
+# lands on a device the seven execution layers are not committing to (10.186: 8-12 ms mean on
+# /data's NVMe beside them). f7_wipe_consensus empties the target with the node's datadirs.
+f7_consensus_dir() {
+  local d=$1 t
+  if [[ -n ${F7_CONSENSUS_ROOT:-} ]]; then
+    t="$F7_CONSENSUS_ROOT/$(basename "$d")"
+    mkdir -p "$t"
+    [[ -L $d/consensus ]] || { rm -rf "$d/consensus"; ln -s "$t" "$d/consensus"; }
+  else
+    mkdir -p "$d/consensus"
+  fi
+}
+
+# f7_wipe_consensus <node dir> -- removes <node dir>/consensus and, under F7_CONSENSUS_ROOT, its target.
+f7_wipe_consensus() {
+  local d=$1
+  [[ -n ${F7_CONSENSUS_ROOT:-} ]] && rm -rf "${F7_CONSENSUS_ROOT:?}/$(basename "$d")"
+  rm -rf "$d/consensus"
+}
+
 f7_place_keys() {
   local i=$1 d
   d=$(f7_node_dir "$i")
-  mkdir -p "$d/consensus"
+  f7_consensus_dir "$d"
   f7_is_first "$i" && mkdir -p "$d/el"
   [[ -f $F7_ROOT/keys/validator-$i.key ]] || {
     mkdir -p "$F7_ROOT/keys"

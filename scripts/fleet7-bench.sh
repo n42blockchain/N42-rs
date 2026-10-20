@@ -314,7 +314,8 @@ F7_HUGEPREP=${F7_HUGEPREP:-40}
 if [[ "$(pgrep -fc 'n4[2] node')" == 0 ]]; then
   for ((i = 0; i < F7_NODES; i++)); do
     d=$(f7_node_dir "$i")
-    rm -rf "$d/el" "$d/consensus"
+    rm -rf "$d/el"
+    f7_wipe_consensus "$d"
   done
   sync
 fi

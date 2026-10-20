@@ -54,7 +54,8 @@ cmd_up() {
     for ((i = 0; i < F7_NODES; i++)); do
       d=$(f7_node_dir "$i")
       f7_rotate_logs "$d"
-      rm -rf "$d/el" "$d/consensus" "$d/el.pid" "$d/v.pid"
+      rm -rf "$d/el" "$d/el.pid" "$d/v.pid"
+      f7_wipe_consensus "$d"
     done
   fi
 

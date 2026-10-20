@@ -4125,3 +4125,25 @@ outputs stays bounded (`sharded_outputs=` at most 61 on node 0).
   (4.709 x 1.015 = 4.780), but EMa (4.588) is under the X18 band floor of 4.64.
 - Next: stage dw confirms with a fresh pair of controls, and adds EW2 = X18 + elision on depth 2 alone, to
   see whether elision needs the depth-3 stack.
+
+## 10.193 -- merge elision passes the two-pair rule; X19 = X18 + N42_MERGE_ELIDE=1 (stage dw, 2026-10-20)
+
+| leg | config | drain M/s | mean gap ms | shard_merge ms | state_ready ms | sealed_at ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| EWa | X18 | 4.696 | 42.6 | 67 | 128 | 37 |
+| EWb | X18 | 4.763 | 42.0 | 69 | 131 | 37 |
+| EW1 | D3 + road + cuts + elide | 4.852 | 41.2 | 0 | 109 | 34 |
+| EW1b | D3 + road + cuts + elide | **4.939** | **40.5** | 0 | 116 | 34 |
+| EW2 | X18 + elide (depth 2) | 4.925 | 40.6 | 0 | 65 | 36 |
+
+- Both controls are inside the X18 band. Every elision leg clears 1.5% above both controls (4.763 x 1.015 =
+  4.834), so the two-pair rule passes. EW1b (4.939) is the new record leg, and with dv's EM1/EM1b
+  (4.830/4.834) that makes five elision legs, all above every control.
+- EW2 shows that elision needs neither depth 3 nor the road. On plain X18 it halves state_ready
+  (128 -> 65 ms) and reads the same as the full stack. The adopted set is the simple one:
+  **X19 = X18 + N42_MERGE_ELIDE=1**.
+- Every gate is clean: invalid 0, gas mismatches 0, fields mismatches 0, tc 0, verify pass. Verify
+  fallbacks were 1-2 per leg, plus 26 on one leg, all with verify=pass.
+- The gap is now 40.5-41.2 ms against the 40 ms that 5M needs. The remaining distance is about 1-3%.
+- Next: port perf/merge-elide to main, then confirm X19 with X19-only pairs. The open question is whether
+  depth 3 + road adds anything on top of X19 (EW1/EW1b vs EW2 is within noise).

@@ -41,7 +41,8 @@ On E=1 every block is built by this queue's own builder, and the flood's frames 
   the frame is the first it ever sent -- else the lanes path), and the sender's lane entries are counted into
   `lane_debt` (an atomic: transactions of road senders still in the lanes). A frame whose member nonce is not `next`,
   an unattested or unaligned frame, goes the lanes path and marks its senders `lane_owned` (their later frames too, until
-  the sender's lane is empty and nothing of it is in flight -- then it may re-join).
+  the sender's lane is empty and nothing of it is in flight -- then it may re-join). **Corrected in section 5:** a
+  `lane_owned` sender with frames still queued on the road deadlocks the road; stage 1 invalidates the road instead.
 * **The gate (invariant R1).** Road frames are eligible only while `lane_debt == 0`: no transaction of a road sender is
   in the lanes, so a road frame's predecessors were all taken by this build's ancestors. The lanes path decrements
   `lane_debt` when it takes (settles) or prunes a road sender's entry and increments it when it gives one back. On the
@@ -75,3 +76,46 @@ then sits on the tick (30 + 1.6), the serial root (`roots_ms` 35-37) and the vot
 | 1 | the build takes road frames first; hand-back and retire; accounting | unit tests: take / give-back / commit / interleaved lanes sender (R1), depth mirror exact; fleet: lock duty < 40%, plan wait 0, `fields_mismatches=0`, verify pass |
 | 2 | invalidation path (refusal, foreign canonical block), restart | unit tests + `roll --kill` |
 | 3 | bench: X18 + road vs X18, two pairs; then + the cuts + NOSYNC | two-pair rule |
+
+## 5. Stage 1 as built (2026-10-20, branch perf/frame-road)
+
+`crates/n42/tx-queue/src/road.rs`, hooks in `lib.rs`; `N42_FRAME_ROAD=1` is the road, `=count` stage 0 (admission and
+seeding counted, every frame still on the lanes path). Where it differs from section 2, and why:
+
+* **No `lane_owned`; a refusal invalidates the road.** The frame planner takes a lane's head as the account's next nonce.
+  A frame of a road sender S that goes the lanes path while S still has frames queued on the road (`k..k+3` on the road,
+  `k+4` in the lanes) is planned ahead of them -- the block refuses it -- and the gate, shut by that very lane entry, never
+  takes `k..k+3`: the road stops for good. So whenever a transaction of a sender *on the road* (one with an admitted frame
+  this epoch) would reach the lanes beside its road frames -- a refused frame naming it, a frameless push (pool listener,
+  reorg), a road frame given back in part (a refusal mid-frame, an untake), a lanes give-back of it -- the road is
+  **invalidated** (`Inner::road_flush`): the map is cleared and the epoch raised (every sender seeds again), the FIFO's
+  frames are inserted into the lanes in admission order and indexed there. A refused frame whose senders were seeded but
+  not yet on the road only moves their `next` past it (no flush). Taken frames of an older epoch handed back go to the
+  lanes and are indexed. This is stage 2's "refusal" item, pulled in because stage 1 is not live without it.
+* **Seeding** holds the drain gate and drains everything pushed so far in the seeding hold (the lane tail must include
+  frames still in the inbox, or `next` is too low and the next frame refused). A sender whose lane is empty but known is
+  *not* seeded from the mined watermark: what it has in flight (a build's take, an own block) is not in the lanes, so the
+  watermark cannot say where it is; the frame is refused `unknown` and the sender joins at its next frame. A sender the
+  lanes never saw joins at its nonce in the frame and gets an empty lane (for the chain's watermark and a give-back).
+* **`lane_debt` is recounted at the gate**, not kept by increments: a lane carries the epoch its sender joined in, every
+  insert into such a lane (drain, run slice, give-back) adds the sender to a debt set, and the gate prunes the set of empty
+  lanes and counts what is left (the `lane_debt` gauge). Exact where it is read, and no hook on the take or prune paths.
+* **Prepared plans** (plan-ahead): a plan holding road frames records the epoch; its verdict refuses it (`Below`) when the
+  epoch moved or a road sender has debt again (a give-back between the plan and the build). Road frames at a top-up's tail
+  are correct: their predecessors are earlier in the same body.
+* **Gate stuck.** Debt the frame planner can never take (a road sender's frameless lane entry, a frame's tail) would shut
+  the gate for good, and with frames on the road `frames_arriving` refuses the walk. The gate shut for 8 builds with the
+  debt not shrinking invalidates the road.
+* **Retire**: a canonical prune (`prune_block`, `remove_folded`) drops the taken frames whose first member the block
+  mined; a give-back recognises a whole frame by the pointer of its first transaction followed by the rest in order.
+  The taken list gets the road's transactions in plan order, on the planner's pool past 16,384 (a reference count each,
+  a cache miss each).
+* Other: with `N42_QUEUE_PLAN_SNAPSHOT` the road only counts (the snapshot planner never takes from it); a walking build
+  invalidates a non-empty road first; `take_frames` finds a taken road frame by id.
+
+**Left for stage 2:** a canonical block not built here (stale road frames on the FIFO and in prepared plans: their
+`lowest` does not list road senders); the window between a refused frame's admission decision and its staging into the
+inbox, in which the sender's next frame can be admitted and planned before the refused one reaches the lanes (the
+block refuses it and the road is invalidated, so it is a stall, not a fault); a flush loop when untakeable debt keeps
+coming back (each cycle builds from the lanes); restart; the 16 KB hash copy per admitted frame (`RoadFrame::of`).
+

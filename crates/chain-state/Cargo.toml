@@ -22,6 +22,7 @@ reth-trie-sparse = { workspace = true, features = ["std"] }
 reth-trie.workspace = true
 # N42: an own block handed out before its revert set was merged (`N42_ANSWER_BEFORE_REVERTS`).
 n42-deferred-reverts.workspace = true
+n42-sharded-output.workspace = true
 
 # ethereum
 alloy-eips.workspace = true

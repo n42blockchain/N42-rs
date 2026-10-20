@@ -967,11 +967,19 @@ pub fn n42_canon_notify_lean() -> bool {
 /// N42: a copy of `output` for a notification, with its complete revert set when it was handed
 /// out before that was merged (`N42_ANSWER_BEFORE_REVERTS`, `n42_deferred_reverts`), waiting for
 /// it. A failed fill must stop notification construction: a partial revert
-/// set would give subscribers incorrect historical state on a reorg.
+/// set would give subscribers incorrect historical state on a reorg. An output
+/// handed out with a thin bundle (`N42_MERGE_ELIDE`, refused from here on: a
+/// notification that carries the outcome reads the whole map) gets its shards'
+/// accounts put in.
 fn n42_completed_outcome<R: Clone>(
     output: &reth_execution_types::BlockExecutionOutput<R>,
 ) -> reth_execution_types::BlockExecutionOutput<R> {
     let mut copy = output.clone();
+    if let Some(whole) =
+        n42_sharded_output::materialized(output, &output.state, "a canonical notification carries the outcome")
+    {
+        copy.state = whole;
+    }
     n42_deferred_reverts::complete_in_place(output, &mut copy.state)
         .expect("a canonical notification requires the block's complete revert set");
     copy

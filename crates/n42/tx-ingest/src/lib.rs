@@ -957,6 +957,9 @@ fn spawn_stats_reporter() {
                     offlock_fallback,
                     plan_snapshot_misses,
                     plan_snapshot_fallbacks,
+                    // `N42_MERGE_ELIDE`: own outputs registered with their
+                    // shard sets; bounded by the blocks held in memory.
+                    sharded_outputs = n42_sharded_output::entries(),
                     "ingest"
                 );
                 // `N42_LOCK_SITES=1`: the same interval's lock duty by caller.

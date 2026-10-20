@@ -21,7 +21,11 @@ use reth_storage_api::{
 };
 use reth_trie::{updates::TrieUpdatesSorted, HashedPostStateSorted, TrieInputSorted};
 use reth_trie_db::DatabaseHashedPostState;
-use revm::{bytecode::Bytecode, database::BundleState, state::AccountInfo};
+use revm::{
+    bytecode::Bytecode,
+    database::{BundleAccount, BundleState},
+    state::AccountInfo,
+};
 use std::{
     ops::RangeInclusive,
     sync::Arc,
@@ -85,14 +89,32 @@ pub struct ExecutionOverlay {
 trait BundleLayer: Send + Sync {
     /// The block's post-execution bundle state.
     fn bundle(&self) -> &BundleState;
+
+    /// The account the block's post-state holds at `address`.
+    fn account(&self, address: &Address) -> Option<&BundleAccount> {
+        self.bundle().account(address)
+    }
 }
 
-/// N42: an [`ExecutedBlock`] as a [`BundleLayer`].
-struct BlockLayer<N: NodePrimitives>(ExecutedBlock<N>);
+/// N42: an [`ExecutedBlock`] as a [`BundleLayer`], with its shard set when its output was
+/// handed out with a thin bundle (`N42_MERGE_ELIDE`), resolved once at the layer's creation.
+struct BlockLayer<N: NodePrimitives>(ExecutedBlock<N>, Option<n42_sharded_output::Shards>);
+
+impl<N: NodePrimitives> BlockLayer<N> {
+    fn new(block: ExecutedBlock<N>) -> Self {
+        let shards = n42_sharded_output::shards_of(&*block.execution_output);
+        Self(block, shards)
+    }
+}
 
 impl<N: NodePrimitives> BundleLayer for BlockLayer<N> {
     fn bundle(&self) -> &BundleState {
         &self.0.execution_output.state
+    }
+
+    /// The thin bundle's account, else the shards': what the merged bundle holds.
+    fn account(&self, address: &Address) -> Option<&BundleAccount> {
+        n42_sharded_output::account(self.1.as_deref(), &self.0.execution_output.state, address)
     }
 }
 
@@ -115,7 +137,7 @@ impl ExecutionOverlay {
             blocks.iter().rev().map(|block| block.recovered_block().num_hash()).collect();
         let layers = blocks
             .into_iter()
-            .map(|block| Arc::new(BlockLayer(block)) as Arc<dyn BundleLayer>)
+            .map(|block| Arc::new(BlockLayer::new(block)) as Arc<dyn BundleLayer>)
             .collect();
         Self { block_hashes, layers: ExecutionLayers(layers), ..Default::default() }
     }
@@ -132,10 +154,7 @@ impl ExecutionOverlay {
             return Some(account.clone())
         }
         self.layers.0.iter().find_map(|layer| {
-            layer
-                .bundle()
-                .account(address)
-                .map(|account| Self::normalized_account_info(account.info.clone()))
+            layer.account(address).map(|account| Self::normalized_account_info(account.info.clone()))
         })
     }
 
@@ -152,7 +171,7 @@ impl ExecutionOverlay {
     /// next older block is asked.
     fn layered_storage_value(&self, address: Address, slot: U256) -> Option<U256> {
         for layer in &self.layers.0 {
-            let Some(account) = layer.bundle().account(&address) else { continue };
+            let Some(account) = layer.account(&address) else { continue };
             if let Some(value) = account.storage.get(&slot) {
                 return Some(value.present_value)
             }
@@ -215,9 +234,19 @@ impl ExecutionOverlay {
     }
 
     /// Extends this overlay with the execution state of a later block.
+    /// N42: an output handed out with a thin bundle (`N42_MERGE_ELIDE`) is extended with its
+    /// shards' accounts put in; the flattening reads the whole map, so elision is refused from
+    /// here on.
     pub(crate) fn extend_block<N: NodePrimitives>(&mut self, block: &ExecutedBlock<N>) {
         self.block_hashes.push(block.recovered_block().num_hash());
-        self.extend_state(&block.execution_output.state);
+        match n42_sharded_output::materialized(
+            &*block.execution_output,
+            &block.execution_output.state,
+            "the flattened execution overlay",
+        ) {
+            Some(whole) => self.extend_state(&whole),
+            None => self.extend_state(&block.execution_output.state),
+        }
     }
 
     /// Extends this overlay with a later bundle state.

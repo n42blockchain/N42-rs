@@ -4803,3 +4803,23 @@ F7_CONSENSUS_ROOT=/home/n42/.cache/n42-consensus` (RD1 / RD1b), 600M replay set,
 4. Next (stage dr): the leader-side cuts that shorten that chain (`N42_BUILD_READS_NO_CHANGESET`,
    `N42_QMDB_FLUSH_OFFLOCK`, `N42_SHARDS_BEFORE_RECEIPTS`, `N42_LEADER_LAYERS=8`) were exact but flat in 10.183 while
    the lanes lock bound; they are stacked on the road now.
+
+## 10.188 -- road + leader cuts: the parent's view is early, and the serial root is the floor (stage dr, 2026-10-20)
+
+Stage dr: X18 (RCa / RCb) against X18 + road + consensus on nvme0 + `N42_BUILD_READS_NO_CHANGESET=1
+N42_QMDB_FLUSH_OFFLOCK=1 N42_SHARDS_BEFORE_RECEIPTS=1 N42_LEADER_LAYERS=8` (RC1 / RC1b).
+
+| leg | drain M/s | mean gap | lanes duty p50 | seal_to_view ms | state_wait | sealed_at | roots_ms | root_lookup / apply | parent_fields | gaps >= 45 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| RCa / RCb | 4.646 / 4.762 | 43.0 / 42.0 | 86 / 88 | 12.5 / 12.3 | 5.2 / 5.1 | 41.1 / 40.2 | 37.0 / 37.8 | 5.0 / 19.9, 5.4 / 22.0 | 2.3 / 2.9 | 744 / 690 |
+| RC1 / RC1b | 4.338 / 4.737 | 46.1 / 42.2 | 10 / 10 | 2.2 / 2.8 | 5.0 / 3.7 | 38.3 / 38.8 | 38.7 / 39.9 | 10.1 / 27.4, 9.6 / 27.9 | 8.1 / 8.9 | 451 / 547 |
+
+1. Not adopted (RC1 -6.6%, RC1b -0.5%). d2gates pass on all four.
+2. The cuts do what they did in 10.183: the parent's view is ready 2.5 ms after its seal instead of 12.4, and the
+   state wait of 10.187 is gone. `sealed_at` falls 2.1 ms and the long gaps fall by a third.
+3. **The serial root absorbs it.** The faster pipeline puts the root's apply beside the next block's execution:
+   lookups double (5 -> 10 ms), apply rises 21 -> 27.6 ms and `roots_ms` 37.4 -> 39.3. The next build now waits for
+   the parent's fields (`parent_fields_ms` 2.6 -> 8.5). RC1's mean also carries vote-side tails (prevsend->tick 50 on
+   its long gaps).
+4. Next (stage ds): the same plus `N42_ROOT_LOOKUPS_EARLY=1` (cg: -4.7 ms on the root, flat while the lanes lock
+   bound), which takes the lookups off the root's serial chain.

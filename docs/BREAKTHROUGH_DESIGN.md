@@ -3908,3 +3908,20 @@ Stage di: PRa / PRb (X18) against PRk / PRkb (X18 + the four cuts of 10.177-10.1
    3. *Index refill independent of the pruner*: the frame indexer yields to every prune wake for the lanes; an indexer that keeps a reserve (or a lane-free index snapshot) makes the supply immune to the pruner's rhythm. Days to a week.
    4. *Vote pace*: two blocks of build-ahead is parked (cj: -6%) because the pipeline's other resources saturate; revisit only after 1-3.
 4. The loop stops here pending a choice among these; nothing in the bench tree is adopted beyond X18 (main = X18 knobs; the four cuts stay off by default on the bench tree: 8bc3ca974's content, e78124b00, and the existing `N42_SHARDS_BEFORE_RECEIPTS`).
+
+### 10.184 loop351 stage dj — the grandparent waits are the engine's commit lag under the anchor; eight layers remove them and are flat alone
+
+**Cause of the grandparent waits (10.182-10.183).** At `N42_LEADER_LAYERS=6` a build lays its parent and five ancestors over the engine, so its anchor is N-7. Matching each build's start against the engine's log (PRkb, PRa): on every build that waited on the grandparent the engine's **committed** tip was N-8 or N-9 (317 of 317 on PRkb, 48 of 48 on PRa); on the others it was N-2..N-10, mostly N-5..N-7. The anchor is simply not committed yet: the commit lag of 5-9 blocks (seal → state_ready 116-141 ms, then insert and commit) exceeds the layer stack on 2-15% of builds. `N42_LEADER_LAYERS` goes to 8 (anchor N-9) with no code change; the engine's buffer target 6 covers the anchor.
+
+Stage dj: ANa / ANb (X18) against AN8 / AN8b (X18 + `N42_LEADER_LAYERS=8`).
+
+| leg | drain (M tx/s) | mean / median gap | open layers | grandparent waits (n, p50) | output waits (n, p50) | exec | kept accounts | sealed_at |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ANa | 4.773 | 41.9 / 38.9 | 6 | 40, 25 | 1568, 6 | 20.8 | 1.14M | 40.0 |
+| AN8 | 4.716 | 42.4 / 39.6 | 8 | 26, 30 | 1440, 6 | 21.3 | 1.53M | 40.5 |
+| ANb | 4.650 | 43.1 / 40.5 | 6 | 22, 29 | 1040, 6 | 20.2 | 1.15M | 41.2 |
+| AN8b | 4.804 | 41.7 / 39.0 | 8 | **0** | 1510, 6 | 21.2 | 1.53M | 39.8 |
+
+1. Eight layers do what they should (AN8b: no grandparent wait at all; AN8: 26, the builds where the lag reached 10) for +0.5 ms of execution (the two extra layers' probes) and 0.4M more kept accounts. Rate -1.2 / +1.4% and +0.6 / +3.3%: fails the two-pair rule.
+2. **The pattern of 10.176-10.184.** Each exact cut moved its own wait to the next one: the slow executions (changeset reads) → the output wait (shards at seal + 11) → with the shards early, the grandparent wait (commit lag) and the plan wait (frame index under a faster pipeline) → with eight layers alone, the output wait is back as the binder. The seal chain is seal → wait → execution → fold → seal, and the wait is whichever input is last; removing one input never removes the max.
+3. **Stage dk** removes all of them at once: X18 + `N42_BUILD_READS_NO_CHANGESET=1` + `N42_QMDB_FLUSH_OFFLOCK=1` + `N42_SHARDS_BEFORE_RECEIPTS=1` + `N42_PRUNE_MIN_FOLD=12 N42_PRUNE_MIN_FOLD_MS=600 N42_QUEUE_FREE_THREADS=2` + `N42_LEADER_LAYERS=8` (AL5 / AL5b) against X18 (ALa / ALb). Expected if nothing new appears: the wait before the execution falls from ~6 to ~1 ms and the execution from 21 to 17, so sealed_at 40 → ~33 and the gap toward the 30 ms pacing tick. If a sixth wait appears it will be named in the build line.

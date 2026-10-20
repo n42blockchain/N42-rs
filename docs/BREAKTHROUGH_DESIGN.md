@@ -4823,3 +4823,25 @@ N42_QMDB_FLUSH_OFFLOCK=1 N42_SHARDS_BEFORE_RECEIPTS=1 N42_LEADER_LAYERS=8` (RC1 
    its long gaps).
 4. Next (stage ds): the same plus `N42_ROOT_LOOKUPS_EARLY=1` (cg: -4.7 ms on the root, flat while the lanes lock
    bound), which takes the lookups off the root's serial chain.
+
+## 10.189 -- early root lookups move the wait to the operations; the depth-2 fields chain is the floor (stage ds, 2026-10-20)
+
+Stage ds: X18 (REa / REb) against the dr configuration plus `N42_ROOT_LOOKUPS_EARLY=1` (RE1 / RE1b).
+
+| leg | drain M/s | mean gap | sealed_at | roots_ms | root_apply | ops encode | ops-ahead wait | seal_to_root_start | seal_to_fields | parent_fields |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| REa / REb | 4.734 / 4.552 | 42.3 / 43.9 | 40.5 / 38.8 | 38.3 / 36.4 | 21.6 / 19.6 | 9.8 / 9.6 | 11.7 / 11.1 | 38.4 / 37.1 | 68.1 / 64.1 | 2.8 / 2.0 |
+| RE1 / RE1b | 4.558 / 4.544 | 43.9 / 44.0 | 41.9 / 41.0 | 42.8 / 40.8 | 19.8 / 18.2 | 16.0 / 14.1 | 17.2 / 15.3 | 52.9 / 49.0 | 80.7 / 75.0 | 12.4 / 9.9 |
+
+1. Not adopted (RE1 -3.7% against REa; REb sits below the X18 band, so that pair does not count). d2gates pass.
+2. The lookups leave the apply (27.6 -> 19 ms), and the root's operations encoding on the critical cores slows by the
+   same amount (9.7 -> 15 ms): the work moved to the cores where the next block executes, and they share memory
+   bandwidth. This is the third time a cut on the root chain has moved its cost somewhere else, after cf and cg.
+3. **The model.** At depth 2 the build of N+1 starts at N's seal and needs N-1's fields, so the gap g satisfies
+   2g >= seal_to_fields + fields_to_seal. On the controls `seal_to_fields` is 64-68 ms and not binding (parent_fields
+   2-3 ms). On every road-plus-cuts leg it is 75-81 ms and binding (parent_fields 8.5-12.4): (78 + ~8) / 2 = 43.
+   Every cut that shortens the build lengthens the root beside it, and the fields chain then holds the gap.
+4. **Next (stage dt): carried depth 3** (perf/depth3, already in the bench tree) on road + cuts. It divides the
+   fields chain by 3: (78 + 8) / 3 = 29, under the seal floor of ~38. Depth 3 lost in cs and ct (-2..-7%) to the
+   grandparent layer's state wait, which `N42_LEADER_LAYERS=8` removes (10.184), and to the lanes lock, which the
+   road removes (10.187).

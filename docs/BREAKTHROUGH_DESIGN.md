@@ -3975,3 +3975,25 @@ pre-tick part grows (votes; vote-log `sync_data` 8-12 ms mean, 4,000-8,000 slow 
 5. **Next: the frame road** (docs/FRAME_ROAD_DESIGN.md): attested, nonce-aligned frames admitted whole into a FIFO off
    the lanes lock (a sharded per-sender `next` map), taken whole by the build, handed back or retired whole; seeded from
    the lane tail with a lane-debt gate. Expected duty 85-98% -> ~20%, plan wait 0. Then the vote log on its own device.
+
+## 10.187 -- the frame road removes the lanes lock, and the state chain takes its place (stage dq, 2026-10-20)
+
+Stage dq: X18 controls (RDa / RDb) against X18 + `N42_FRAME_ROAD=1 N42_LOCK_SITES=1
+F7_CONSENSUS_ROOT=/home/n42/.cache/n42-consensus` (RD1 / RD1b), 600M replay set, 30 ms pacing.
+
+| leg | config | drain M/s | mean gap ms | lanes-lock duty p50 / p90 | plan_prep ms | state_wait ms | par_run ms | slow vote syncs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| RDa / RDb | X18 | 4.765 / 4.703 | 42.0 / 42.5 | 84 / 98, 93 / 98 | 10.1 / 9.4 | 4.5 / 4.3 | 26.4 / 25.8 | 4,024 / 4,984 |
+| RD1 / RD1b | + road + consensus on nvme0 | 4.610 / 4.766 | 43.4 / 42.0 | 7 / 8, 8 / 9 | 2.8 / 2.7 | 11.7 / 11.7 | 33.0 / 32.4 | 70 / 61 |
+
+1. Controls inside the X18 band. The road legs do not pass the two-pair rule; not adopted. All four d2gates pass
+   (invalid 0, fields mismatches 0, verify pass).
+2. **The mechanism is exact**: the lanes lock's duty falls from 84-98% to 7-9%, the plan's preparation from ~10 ms to
+   2.7 ms, and the vote log on nvme0 removes the slow syncs (4,000-5,000 -> 61-70).
+3. **The saving is absorbed by the parent's state**: the build now starts earlier and waits for the parent's view
+   (state_wait 4.4 -> 11.7 ms, gap_before_exec 5.1 -> 12.2, par_run +6.6 of which the hook wait is +7.4). The gap is
+   seal-bound on 99-100% of views. The chain floor is now seal -> parent view (seal_to_view 14.3 ms, shards ready 12.9)
+   -> execution -> fold -> seal.
+4. Next (stage dr): the leader-side cuts that shorten that chain (`N42_BUILD_READS_NO_CHANGESET`,
+   `N42_QMDB_FLUSH_OFFLOCK`, `N42_SHARDS_BEFORE_RECEIPTS`, `N42_LEADER_LAYERS=8`) were exact but flat in 10.183 while
+   the lanes lock bound; they are stacked on the road now.

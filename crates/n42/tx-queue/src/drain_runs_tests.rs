@@ -72,7 +72,7 @@ fn scenario(queue: &TxQueue<EthPooledTransaction>) {
         // A lane out of the arrival order with a watermark: its first
         // arrival below is refused, so it enters the order behind a sender
         // that arrived after it.
-        let lane = Lane { by_nonce: BTreeMap::new(), queued: false, mined: Some(5), chain_mined: Some(5), parked: None };
+        let lane = Lane { by_nonce: BTreeMap::new(), queued: false, mined: Some(5), chain_mined: Some(5), parked: None, road: 0 };
         inner.lanes.insert(sender(910), lane);
     }
     queue.push([tx_hashed(sender(910), 3), tx_hashed(sender(911), 0), tx_hashed(sender(910), 7)]);

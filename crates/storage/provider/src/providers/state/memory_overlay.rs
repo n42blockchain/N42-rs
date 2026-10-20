@@ -18,6 +18,10 @@
 //! ([`overlay_filter`](super::overlay_filter)): a filter miss skips the block's bundle, so a read
 //! that no in-memory block touched costs one filter probe a block instead of one hash-map
 //! probe a block. `N42_OVERLAY_FILTER=0` turns it off.
+//!
+//! N42: a block handed out with a thin bundle over its output shards (`N42_MERGE_ELIDE`) is
+//! read through its registry entry ([`n42_sharded_output`]), resolved once when the provider is
+//! built: the thin bundle, then the shards -- what the merged bundle would hold at the key.
 
 use reth_chain_state::ExecutedBlock;
 use alloy_consensus::BlockHeader;
@@ -38,6 +42,8 @@ use revm::database::BundleState;
 use std::{borrow::Cow, sync::OnceLock};
 
 use super::overlay_filter::{self, FilterCell, FilterKey};
+use n42_sharded_output::Shards;
+use revm::database::BundleAccount;
 
 /// The filter slots of `in_memory`, one a block in the same order (none when the filters are off).
 fn filters_of<N: NodePrimitives>(in_memory: &[ExecutedBlock<N>]) -> Vec<Option<FilterCell>> {
@@ -45,6 +51,30 @@ fn filters_of<N: NodePrimitives>(in_memory: &[ExecutedBlock<N>]) -> Vec<Option<F
         return Vec::new()
     }
     in_memory.iter().map(|block| overlay_filter::filter_for(&block.execution_output)).collect()
+}
+
+/// N42: the shard sets of `in_memory`'s elided outputs, one slot a block in the same order (empty
+/// when none of them is elided, as with `N42_MERGE_ELIDE` off).
+fn sharded_of<N: NodePrimitives>(in_memory: &[ExecutedBlock<N>]) -> Vec<Option<Shards>> {
+    let sharded: Vec<Option<Shards>> =
+        in_memory.iter().map(|block| n42_sharded_output::shards_of(&*block.execution_output)).collect();
+    if sharded.iter().all(Option::is_none) {
+        return Vec::new()
+    }
+    sharded
+}
+
+/// N42: the account the block at `index` holds at `address`: its bundle's, or for an elided
+/// output its thin bundle's and then its shards'.
+#[inline(always)]
+fn block_account<'b, N: NodePrimitives>(
+    block: &'b ExecutedBlock<N>,
+    sharded: &'b [Option<Shards>],
+    index: usize,
+    address: &Address,
+) -> Option<&'b BundleAccount> {
+    let shards = sharded.get(index).and_then(Option::as_deref);
+    n42_sharded_output::account(shards, &block.execution_output.state, address)
 }
 
 /// A state provider that stores references to in-memory blocks along with their state as well as a
@@ -62,6 +92,8 @@ pub struct MemoryOverlayStateProviderRef<
     trie_input: OnceLock<TrieInput>,
     /// N42: the blocks' address filters, in `in_memory`'s order (empty when off).
     filters: Cow<'a, [Option<FilterCell>]>,
+    /// N42: the blocks' shard sets, in `in_memory`'s order (empty when no block is elided).
+    sharded: Cow<'a, [Option<Shards>]>,
 }
 
 impl<'a, N: NodePrimitives> MemoryOverlayStateProviderRef<'a, N> {
@@ -74,7 +106,14 @@ impl<'a, N: NodePrimitives> MemoryOverlayStateProviderRef<'a, N> {
     ///   database.
     pub fn new(historical: Box<dyn StateProvider + 'a>, in_memory: Vec<ExecutedBlock<N>>) -> Self {
         let filters = Cow::Owned(filters_of(&in_memory));
-        Self { historical, in_memory: Cow::Owned(in_memory), trie_input: OnceLock::new(), filters }
+        let sharded = Cow::Owned(sharded_of(&in_memory));
+        Self {
+            historical,
+            in_memory: Cow::Owned(in_memory),
+            trie_input: OnceLock::new(),
+            filters,
+            sharded,
+        }
     }
 
     /// N42: the filter slot of the block at `index` (`None`: probe it).
@@ -153,11 +192,11 @@ impl<N: NodePrimitives> BlockHashReader for MemoryOverlayStateProviderRef<'_, N>
 
 impl<N: NodePrimitives> AccountReader for MemoryOverlayStateProviderRef<'_, N> {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
-        overlay_basic_account(&self.in_memory, &self.filters, &*self.historical, address)
+        overlay_basic_account(&self.in_memory, &self.filters, &self.sharded, &*self.historical, address)
     }
 
     fn n42_prefetch_account(&self, address: &Address) -> bool {
-        overlay_prefetch_account(&self.in_memory, &self.filters, &*self.historical, address)
+        overlay_prefetch_account(&self.in_memory, &self.filters, &self.sharded, &*self.historical, address)
     }
 }
 
@@ -168,6 +207,7 @@ impl<N: NodePrimitives> AccountReader for MemoryOverlayStateProviderRef<'_, N> {
 fn overlay_basic_account<N: NodePrimitives, H: AccountReader + ?Sized>(
     in_memory: &[ExecutedBlock<N>],
     filters: &[Option<FilterCell>],
+    sharded: &[Option<Shards>],
     historical: &H,
     address: &Address,
 ) -> ProviderResult<Option<Account>> {
@@ -178,9 +218,9 @@ fn overlay_basic_account<N: NodePrimitives, H: AccountReader + ?Sized>(
             skips += 1;
             continue
         }
-        if let Some(account) = block.execution_output.account(address) {
+        if let Some(account) = block_account(block, sharded, index, address) {
             overlay_filter::record(skips, index as u64 + 1 - skips);
-            return Ok(account);
+            return Ok(account.info.as_ref().map(Into::into));
         }
     }
     overlay_filter::record(skips, in_memory.len() as u64 - skips);
@@ -194,13 +234,14 @@ fn overlay_basic_account<N: NodePrimitives, H: AccountReader + ?Sized>(
 fn overlay_prefetch_account<N: NodePrimitives, H: AccountReader + ?Sized>(
     in_memory: &[ExecutedBlock<N>],
     filters: &[Option<FilterCell>],
+    sharded: &[Option<Shards>],
     historical: &H,
     address: &Address,
 ) -> bool {
     let key = FilterKey::address(address);
     for (index, block) in in_memory.iter().enumerate() {
         if overlay_filter::may_hold_account(filters.get(index).and_then(Option::as_ref), key) &&
-            block.execution_output.state.state.contains_key(address)
+            block_account(block, sharded, index, address).is_some()
         {
             return true;
         }
@@ -342,7 +383,9 @@ impl<N: NodePrimitives> StateProvider for MemoryOverlayStateProviderRef<'_, N> {
                 skips += 1;
                 continue
             }
-            if let Some(value) = block.execution_output.storage(&address, storage_key.into()) {
+            if let Some(value) = block_account(block, &self.sharded, index, &address)
+                .and_then(|account| account.storage_slot(storage_key.into()))
+            {
                 overlay_filter::record(skips, index as u64 + 1 - skips);
                 return Ok(Some(value));
             }
@@ -381,6 +424,8 @@ pub struct MemoryOverlayStateProvider<N: NodePrimitives> {
     trie_input: OnceLock<TrieInput>,
     /// N42: the blocks' address filters, in `in_memory`'s order (empty when off).
     filters: Vec<Option<FilterCell>>,
+    /// N42: the blocks' shard sets, in `in_memory`'s order (empty when no block is elided).
+    sharded: Vec<Option<Shards>>,
 }
 
 impl<N: NodePrimitives> MemoryOverlayStateProvider<N> {
@@ -393,7 +438,8 @@ impl<N: NodePrimitives> MemoryOverlayStateProvider<N> {
     ///   database.
     pub fn new(historical: StateProviderBox, in_memory: Vec<ExecutedBlock<N>>) -> Self {
         let filters = filters_of(&in_memory);
-        Self { historical, in_memory, trie_input: OnceLock::new(), filters }
+        let sharded = sharded_of(&in_memory);
+        Self { historical, in_memory, trie_input: OnceLock::new(), filters, sharded }
     }
 
     /// N42: this provider with its address filters dropped, so every read probes every
@@ -411,6 +457,7 @@ impl<N: NodePrimitives> MemoryOverlayStateProvider<N> {
             in_memory: Cow::Borrowed(&self.in_memory),
             trie_input: self.trie_input.clone(),
             filters: Cow::Borrowed(&self.filters),
+            sharded: Cow::Borrowed(&self.sharded),
         }
     }
 
@@ -424,13 +471,126 @@ impl<N: NodePrimitives> MemoryOverlayStateProvider<N> {
 // (the build's recipient reads came through here: a box allocated and freed on every read).
 impl<N: NodePrimitives> AccountReader for MemoryOverlayStateProvider<N> {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
-        overlay_basic_account(&self.in_memory, &self.filters, &*self.historical, address)
+        overlay_basic_account(&self.in_memory, &self.filters, &self.sharded, &*self.historical, address)
     }
 
     fn n42_prefetch_account(&self, address: &Address) -> bool {
-        overlay_prefetch_account(&self.in_memory, &self.filters, &*self.historical, address)
+        overlay_prefetch_account(&self.in_memory, &self.filters, &self.sharded, &*self.historical, address)
     }
 }
 
 // Delegates every other provider impl to [`MemoryOverlayStateProviderRef`]
 reth_storage_api::macros::delegate_provider_impls!(@except_account MemoryOverlayStateProvider<N> where [N: NodePrimitives]);
+
+#[cfg(test)]
+mod elided_tests {
+    use super::*;
+    use crate::test_utils::{ExtendedAccount, MockEthProvider};
+    use alloy_consensus::Header;
+    use alloy_primitives::map::AddressHashMap;
+    use reth_trie::ComputedTrieData;
+    use reth_ethereum_primitives::EthPrimitives;
+    use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
+    use reth_primitives_traits::SealedBlock;
+    use revm::{
+        database::{states::StorageSlot, AccountStatus},
+        state::AccountInfo,
+    };
+    use std::sync::Arc;
+
+    struct Map(AddressHashMap<BundleAccount>);
+
+    impl n42_sharded_output::ShardedState for Map {
+        fn shard_account(&self, address: &Address) -> Option<&BundleAccount> {
+            self.0.get(address)
+        }
+        fn shard_accounts(&self) -> usize {
+            self.0.len()
+        }
+        fn for_each_shard_account(&self, f: &mut dyn FnMut(&Address, &BundleAccount)) {
+            for (address, account) in &self.0 {
+                f(address, account);
+            }
+        }
+    }
+
+    fn account(nonce: u64, slot: Option<(u64, u64)>) -> BundleAccount {
+        let storage = slot
+            .map(|(slot, value)| (U256::from(slot), StorageSlot::new_changed(U256::ZERO, U256::from(value))))
+            .into_iter()
+            .collect();
+        BundleAccount {
+            info: Some(AccountInfo { nonce, ..Default::default() }),
+            original_info: None,
+            storage,
+            status: AccountStatus::Changed,
+        }
+    }
+
+    fn block(number: u64, state: BundleState) -> ExecutedBlock {
+        let sealed = SealedBlock::<reth_ethereum_primitives::Block>::from_sealed_parts(
+            reth_primitives_traits::SealedHeader::new(
+                Header { number, ..Default::default() },
+                B256::with_last_byte(number as u8),
+            ),
+            Default::default(),
+        );
+        let output = Arc::new(BlockExecutionOutput {
+            result: BlockExecutionResult {
+                receipts: vec![],
+                requests: Default::default(),
+                gas_used: 0,
+                blob_gas_used: 0,
+            },
+            state,
+        });
+        ExecutedBlock::new(Arc::new(sealed.try_recover().expect("recovers")), output, ComputedTrieData::default())
+    }
+
+    /// `N42_MERGE_ELIDE`: a block handed out with a thin bundle is read through its shards --
+    /// account, slot and the prefetch hint, newest block first over an older plain block and
+    /// the historical state -- and, unregistered, its thin bundle alone is what it holds.
+    #[test]
+    fn an_elided_block_is_read_through_its_shards() {
+        let (a, b, c, d) = (
+            Address::with_last_byte(0xa1),
+            Address::with_last_byte(0xb2),
+            Address::with_last_byte(0xc3),
+            Address::with_last_byte(0xd4),
+        );
+        let mut shards = AddressHashMap::default();
+        shards.insert(a, account(11, Some((1, 7))));
+        shards.insert(b, account(12, None));
+        let mut thin = BundleState::default();
+        thin.state.insert(b, account(22, Some((2, 9))));
+        let newer = block(2, thin);
+        let mut older_state = BundleState::default();
+        older_state.state.insert(c, account(31, None));
+        older_state.state.insert(a, account(1, None));
+        let older = block(1, older_state);
+        let historical = MockEthProvider::default();
+        historical.add_account(d, ExtendedAccount::new(41, U256::ZERO));
+        let open = || {
+            MemoryOverlayStateProvider::new(Box::new(historical.clone()), vec![newer.clone(), older.clone()])
+                .without_filters()
+        };
+        let nonce = |provider: &MemoryOverlayStateProvider<EthPrimitives>, address: Address| {
+            provider.basic_account(&address).expect("read").map(|account| account.nonce)
+        };
+
+        let plain = open();
+        assert_eq!(nonce(&plain, a), Some(1), "unregistered: the older block answers");
+        n42_sharded_output::register(&newer.execution_output, Arc::new(Map(shards)));
+        let elided = open();
+        assert_eq!(
+            (nonce(&elided, a), nonce(&elided, b), nonce(&elided, c), nonce(&elided, d)),
+            (Some(11), Some(22), Some(31), Some(41))
+        );
+        assert_eq!(elided.storage(a, U256::from(1).into()).expect("slot"), Some(U256::from(7)));
+        assert_eq!(elided.storage(b, U256::from(2).into()).expect("slot"), Some(U256::from(9)));
+        assert!(elided.n42_prefetch_account(&a));
+        let filter = overlay_filter::BlockFilter::build(&newer.execution_output);
+        assert!(filter.may_hold_account(FilterKey::address(&a)), "the filter holds the shards' keys");
+        assert_eq!(nonce(&plain, a), Some(1), "a provider built before the registration reads as built");
+    }
+}

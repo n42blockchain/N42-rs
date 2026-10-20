@@ -7382,6 +7382,7 @@ dependencies = [
  "n42-h2-consensus",
  "n42-primitives",
  "n42-qmdb-reth",
+ "n42-sharded-output",
  "n42-twig-core",
  "n42-tx-queue",
  "n42-tx-types",
@@ -7760,6 +7761,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-sharded-output"
+version = "2.1.5"
+dependencies = [
+ "alloy-primitives 1.7.3",
+ "revm-database",
+ "tracing",
+]
+
+[[package]]
 name = "n42-storage"
 version = "2.1.5"
 dependencies = [
@@ -7864,6 +7874,7 @@ dependencies = [
  "libc",
  "n42-core-layout",
  "n42-engine-types",
+ "n42-sharded-output",
  "n42-tx-queue",
  "n42-tx-types",
  "parking_lot 0.12.5",
@@ -9857,6 +9868,7 @@ dependencies = [
  "derive_more 2.1.1",
  "metrics",
  "n42-deferred-reverts",
+ "n42-sharded-output",
  "parking_lot 0.12.5",
  "pin-project",
  "rand 0.9.5",
@@ -11786,6 +11798,7 @@ dependencies = [
  "metrics",
  "n42-deferred-reverts",
  "n42-primitives",
+ "n42-sharded-output",
  "n42-tx-types",
  "notify",
  "parking_lot 0.12.5",
@@ -12450,6 +12463,7 @@ dependencies = [
  "alloy-eips",
  "alloy-primitives 1.7.3",
  "metrics",
+ "n42-sharded-output",
  "parking_lot 0.12.5",
  "rayon",
  "reth-chain-state",

@@ -168,13 +168,28 @@ pub struct BlockFilter {
 
 impl BlockFilter {
     /// Builds the filters of `output`'s bundle: one pass over its accounts and contracts.
+    /// N42: an elided output (`N42_MERGE_ELIDE`) is keyed by its thin bundle's addresses and
+    /// its shards' ([`n42_sharded_output::for_each_account`]): the merged map's key set.
     pub fn build<R>(output: &BlockExecutionOutput<R>) -> Self {
         BUILDS.fetch_add(1, Ordering::Relaxed);
         let bundle = &output.state;
-        let mut accounts = SplitBloom::with_capacity(bundle.state.len());
-        for address in bundle.state.keys() {
-            accounts.insert(FilterKey::address(address));
-        }
+        let accounts = match n42_sharded_output::shards_of(output) {
+            None => {
+                let mut accounts = SplitBloom::with_capacity(bundle.state.len());
+                for address in bundle.state.keys() {
+                    accounts.insert(FilterKey::address(address));
+                }
+                accounts
+            }
+            Some(shards) => {
+                let mut accounts =
+                    SplitBloom::with_capacity(n42_sharded_output::accounts(Some(&*shards), bundle));
+                n42_sharded_output::for_each_account(Some(&*shards), bundle, &mut |address, _| {
+                    accounts.insert(FilterKey::address(address));
+                });
+                accounts
+            }
+        };
         let mut contracts = SplitBloom::with_capacity(bundle.contracts.len());
         for hash in bundle.contracts.keys() {
             contracts.insert(FilterKey::code_hash(hash));

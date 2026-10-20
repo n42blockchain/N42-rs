@@ -180,6 +180,47 @@ pub fn merge_split() -> bool {
     *ON.get_or_init(|| std::env::var("N42_MERGE_SPLIT").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `N42_MERGE_ELIDE=1` (off by default, `docs/MERGE_ELISION_DESIGN.md`): the
+/// leader's merger hands out a thin bundle ([`FrozenShards::thin_state_first`])
+/// with the frozen shards registered under it (`n42_sharded_output`) instead of
+/// the merged account map. Read once and logged; refused, with a warning and the
+/// merge as before, when a mode that reads the whole map is on
+/// ([`merge_elide_refusal`]), and from the first whole-map reader found at run
+/// time on (`n42_sharded_output::refuse`: persistence that converts the bundle,
+/// storage v1). Applies to the merge that runs with `N42_ANSWER_BEFORE_REVERTS`
+/// beside a late revert set.
+pub fn merge_elide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = std::env::var("N42_MERGE_ELIDE").is_ok_and(|v| v.trim() == "1");
+        let refusal = asked.then(merge_elide_refusal).flatten();
+        if let Some(refusal) = refusal {
+            tracing::warn!(target: "payload_builder", refusal, "N42_MERGE_ELIDE refused: the leader merges its output as before");
+        }
+        let on = asked && refusal.is_none();
+        tracing::info!(target: "payload_builder", merge_elide = on, "N42_MERGE_ELIDE");
+        on
+    })
+}
+
+/// The mode that reads an own block's whole merged map, if one is on: the
+/// thin bundle would give it the residual alone.
+pub fn merge_elide_refusal() -> Option<&'static str> {
+    if !n42_deferred_reverts::answer_before_reverts() {
+        Some("N42_ANSWER_BEFORE_REVERTS is off: the thin bundle carries no revert set")
+    } else if !reth_chain_state::n42_canon_notify_lean() {
+        Some("canonical notifications carry the outcome (N42_CANON_NOTIFY_LEAN is not 1)")
+    } else if n42_qmdb_reth::ExecCacheOnInsert::from_env() == n42_qmdb_reth::ExecCacheOnInsert::Update {
+        Some("N42_ENGINE_EXEC_CACHE=on reads the block's map into the cache")
+    } else if !n42_qmdb_reth::n42_state::hashed_tables_off() {
+        Some("the hashed tables are written (N42_HASHED_TABLES is not off)")
+    } else if crate::fields_at_seal::mode().verify() {
+        Some("N42_FIELDS_AT_SEAL=verify derives the operations from the merged map")
+    } else {
+        None
+    }
+}
+
 /// Puts a block's complete revert set ([`FrozenShards::late_reverts`]) into
 /// the bundle [`FrozenShards::merged_state_first`] gave.
 pub fn complete_reverts(bundle: &mut BundleState, reverts: revm::database::states::reverts::Reverts, size: usize) {
@@ -2395,6 +2436,31 @@ impl FrozenShards {
         (self.state_first_bundle(residual, state, size), MergeSplit { state_us, ..split })
     }
 
+    /// `N42_MERGE_ELIDE`: [`Self::merged_state_first`]'s bundle without the
+    /// shards' accounts -- the residual's, each laid over the shard's account
+    /// at its address as the merge lays it, so the map holds exactly the
+    /// merged map's entries at the residual's keys -- with the merged map's
+    /// contracts, `state_size` and (the block's own) reverts. Every other
+    /// account is read from the shards (`n42_sharded_output::account`).
+    pub fn thin_state_first(&self, residual: &BundleState) -> BundleState {
+        let mut size = self.base_state_size(residual);
+        let mut state: AddressHashMap<BundleAccount> = Default::default();
+        state.reserve(residual.state.len());
+        for (address, over) in &residual.state {
+            match self.get(address) {
+                Some(account) => {
+                    let merged = overlaid(account, over);
+                    size += merged.size_hint() as i128 - account.size_hint() as i128 - over.size_hint() as i128;
+                    state.insert(*address, merged);
+                }
+                None => {
+                    state.insert(*address, over.clone());
+                }
+            }
+        }
+        self.state_first_bundle(residual, state, size)
+    }
+
     /// The bundle [`Self::merged_state_first`] hands out around its account map.
     fn state_first_bundle(&self, residual: &BundleState, state: AddressHashMap<BundleAccount>, size: i128) -> BundleState {
         let mut contracts = self.contracts.clone();
@@ -2998,6 +3064,29 @@ fn thread_minor_faults() -> u64 {
     0
 }
 
+/// The registry's view of a frozen output (`N42_MERGE_ELIDE`): the accounts
+/// [`FrozenShards::get`] answers, walked in the merge's source order.
+impl n42_sharded_output::ShardedState for FrozenShards {
+    fn shard_account(&self, address: &Address) -> Option<&BundleAccount> {
+        self.get(address)
+    }
+
+    fn shard_accounts(&self) -> usize {
+        self.accounts()
+    }
+
+    fn for_each_shard_account(&self, f: &mut dyn FnMut(&Address, &BundleAccount)) {
+        for (map, removed) in self.source_maps() {
+            for (address, account) in map {
+                if removed.is_some_and(|removed| removed.contains(address)) {
+                    continue;
+                }
+                f(address, account);
+            }
+        }
+    }
+}
+
 fn overlaid(account: &BundleAccount, over: &BundleAccount) -> BundleAccount {
     let mut merged = over.clone();
     merged.original_info = account.original_info.clone();
@@ -3446,6 +3535,146 @@ mod frozen_tests {
                 assert_eq!((map, size), (serial_map, serial_size), "{label}: map and signed size");
             }
         }
+    }
+
+    /// `N42_MERGE_ELIDE`: the thin bundle and the registry's lookups through
+    /// the frozen shards answer what the merged bundle holds -- every account
+    /// and slot at every key the merge holds and at keys it does not, the
+    /// length, the walk and the materialized map -- and the thin bundle's
+    /// contracts, size and reverts are the merged bundle's. Random blocks in
+    /// all three fold modes, with accounts taken out after the freeze (the
+    /// index's removed sets, an early view sharing the batches' maps), and a
+    /// residual that overlays shard accounts (storage on both sides),
+    /// destroys some (with and without new storage) and adds its own.
+    #[test]
+    fn the_registry_lookups_equal_the_merged_bundle_on_random_blocks() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below.max(1)
+        };
+        let wide = |i: u64| Address::from_word(B256::from(U256::from(0x5000_0000u64 + i)));
+        let slots = |pairs: &[(u64, u64, u64)]| -> alloy_primitives::map::U256Map<(U256, U256)> {
+            pairs.iter().map(|&(slot, before, after)| (U256::from(slot), (U256::from(before), U256::from(after)))).collect()
+        };
+        let code = |i: u64| {
+            let bytecode = RevmBytecode::new_raw(alloy_primitives::Bytes::from(vec![0x60, i as u8, 0x00]));
+            (bytecode.hash_slow(), bytecode)
+        };
+        let (mut early_rounds, mut overlaid_accounts) = (0, 0);
+        for round in 0..18u64 {
+            let (index, live) = [(false, false), (true, false), (true, true)][(round % 3) as usize];
+            let space = 100 + next(3_000);
+            let shards = OutputShards::with_index_live(addr(1), (space * 2) as usize, 1 + next(32) as usize, index, live);
+            for batch_no in 0..1 + next(20) {
+                let mut builder = BundleState::builder(1..=1);
+                let mut used = std::collections::HashSet::new();
+                for _ in 0..next(space / 2 + 1) {
+                    let i = next(space);
+                    if !used.insert(i) {
+                        continue;
+                    }
+                    let account = wide(i);
+                    builder = builder
+                        .state_original_account_info(account, info(0, 1_000 + i))
+                        .state_present_account_info(account, info(1, 900 + next(50)))
+                        .revert_account_info(1, account, Some(Some(info(0, 1_000 + i))));
+                    if next(4) == 0 {
+                        builder = builder.state_storage(account, slots(&[(next(4), 0, 1 + next(9)), (7, 1, 2)]));
+                    }
+                }
+                if next(3) == 0 {
+                    let (hash, bytecode) = code(batch_no);
+                    builder = builder.contract(hash, bytecode);
+                }
+                shards.add(builder.build());
+            }
+            // An early view shares the batches' maps, so a take after the
+            // freeze lists the account as removed instead of dropping it.
+            let early = (round % 2 == 0).then(|| shards.early_view()).flatten();
+            let mut frozen = shards.freeze();
+            let taken: Vec<Address> = (0..next(8)).map(|_| wide(next(space))).collect();
+            frozen.take_out(&taken);
+            let mut residual = BundleState::builder(1..=1);
+            for _ in 0..next(64) {
+                let account = wide(next(space * 2));
+                residual = residual
+                    .state_original_account_info(account, info(1, 900))
+                    .state_present_account_info(account, info(2, 950 + next(9)));
+                if next(3) == 0 {
+                    residual = residual.state_storage(account, slots(&[(next(4), 1, 5 + next(9))]));
+                }
+            }
+            let (hash, bytecode) = code(200 + round);
+            let mut residual = residual
+                .state_present_account_info(addr(8), info(0, 3))
+                .revert_account_info(1, addr(8), Some(None))
+                .contract(hash, bytecode)
+                .build();
+            // Destroyed accounts, over shard accounts and not: without
+            // storage, and re-created with a slot of their own.
+            for k in 0..1 + next(6) {
+                let account = wide(next(space * 2));
+                let storage = if k % 2 == 0 { slots(&[(next(4), 3, 4)]) } else { Default::default() };
+                let status = if k % 2 == 0 {
+                    revm::database::AccountStatus::DestroyedChanged
+                } else {
+                    revm::database::AccountStatus::Destroyed
+                };
+                let present = (k % 2 == 0).then(|| info(0, 5 + k));
+                let storage = storage
+                    .into_iter()
+                    .map(|(slot, (before, after))| (slot, revm::database::states::StorageSlot::new_changed(before, after)))
+                    .collect();
+                residual.state.insert(
+                    account,
+                    BundleAccount { info: present, original_info: Some(info(1, 900)), storage, status },
+                );
+            }
+
+            let label = format!("round {round} index {index} live {live} early {}", early.is_some());
+            let (merged, _) = frozen.merged_state_first_split(&residual, 0);
+            let thin = frozen.thin_state_first(&residual);
+            assert_eq!(thin.contracts, merged.contracts, "{label}: contracts");
+            assert_eq!(thin.state_size, merged.state_size, "{label}: state size");
+            assert_eq!((&thin.reverts, thin.reverts_size), (&merged.reverts, merged.reverts_size), "{label}: reverts");
+            assert!(thin.state.len() <= residual.state.len(), "{label}: thin");
+            let registered: &dyn n42_sharded_output::ShardedState = &frozen;
+            let mut probes: Vec<Address> = merged.state.keys().copied().collect();
+            probes.extend((0..space * 2 + 8).map(wide));
+            probes.extend(taken.iter().copied());
+            probes.extend([addr(1), addr(8), addr(9)]);
+            for address in &probes {
+                let looked = n42_sharded_output::account(Some(registered), &thin, address);
+                let held = merged.state.get(address);
+                assert_eq!(looked, held, "{label}: account {address}");
+                for slot in [0u64, 1, 2, 3, 7, 11] {
+                    let slot = U256::from(slot);
+                    assert_eq!(
+                        looked.and_then(|account| account.storage_slot(slot)),
+                        held.and_then(|account| account.storage_slot(slot)),
+                        "{label}: slot {slot} of {address}"
+                    );
+                }
+            }
+            assert_eq!(n42_sharded_output::accounts(Some(registered), &thin), merged.state.len(), "{label}: length");
+            let mut walked = Vec::new();
+            n42_sharded_output::for_each_account(Some(registered), &thin, &mut |address, account| {
+                walked.push((*address, account.clone()));
+            });
+            assert_eq!(walked.len(), merged.state.len(), "{label}: each address once");
+            assert!(walked.iter().all(|(address, account)| merged.state.get(address) == Some(account)), "{label}: walk");
+            let mut whole = thin.clone();
+            n42_sharded_output::materialize(registered, &mut whole);
+            assert_eq!(whole, merged, "{label}: materialized");
+            assert_eq!(registered.shard_accounts(), frozen.accounts());
+            early_rounds += usize::from(early.is_some());
+            overlaid_accounts += thin.state.keys().filter(|address| frozen.holds(address)).count();
+            drop(early);
+        }
+        assert!(early_rounds > 0 && overlaid_accounts > 0, "the shapes the test is for were drawn");
     }
 
     /// `N42_ANSWER_BEFORE_REVERTS`: the account half first and the revert

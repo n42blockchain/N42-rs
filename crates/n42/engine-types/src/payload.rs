@@ -4218,6 +4218,9 @@ where
                             handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
                         });
                         let join_wait_us = early.as_ref().map_or(0, |_| joined_at.elapsed().as_micros() as u64);
+                        // `N42_MERGE_ELIDE`: no account map at all -- the
+                        // thin bundle, the shards registered under it below.
+                        let mut elided = false;
                         let (merged, split, tail_us, threads, merge_at, merge_end, was_early, late) = match early {
                             Some((merged, split, tail_us, threads, merge_at, merge_end, late)) => {
                                 (merged, split, tail_us, threads, merge_at, merge_end, true, late)
@@ -4227,7 +4230,16 @@ where
                                 // half, the revert set beside it.
                                 let merge_at = std::time::Instant::now();
                                 let (graft, late) = spawn_late_reverts(&shards, &residual.state, shard_reverts, None);
+                                let elide = crate::output_shards::merge_elide()
+                                    && n42_sharded_output::refused().is_none()
+                                    && !shards.is_early();
                                 let (merged, split) = match late {
+                                    Some(_) if elide => {
+                                        elided = true;
+                                        let merged = shards.thin_state_first(&residual.state);
+                                        let total_us = merge_at.elapsed().as_micros() as u64;
+                                        (merged, crate::output_shards::MergeSplit { total_us, ..Default::default() })
+                                    }
                                     Some(_) => {
                                         // `N42_MERGE_PARALLEL=<N>`: the account map
                                         // in N parts on the critical set (the root's
@@ -4275,7 +4287,11 @@ where
                             split,
                             tail_us,
                             threads,
-                            accounts: merged.state.len(),
+                            accounts: if elided {
+                                n42_sharded_output::accounts(Some(&*shards), &merged)
+                            } else {
+                                merged.state.len()
+                            },
                             reverts: merged.reverts.iter().map(Vec::len).sum(),
                             state_ready: None,
                             early: was_early,
@@ -4285,6 +4301,12 @@ where
                         };
                         let execution_output =
                             Arc::new(reth_execution_types::BlockExecutionOutput { state: merged, result: execution_result });
+                        // Elided: its accounts are read through the shards
+                        // (`n42_sharded_output`), registered before anyone
+                        // can see the execution.
+                        if elided {
+                            n42_sharded_output::register(&execution_output, Arc::clone(&shards) as n42_sharded_output::Shards);
+                        }
                         // Owed its revert set (`N42_ANSWER_BEFORE_REVERTS`):
                         // registered before anyone can see the execution,
                         // and the promise handed to the thread that merges it.
@@ -4306,6 +4328,12 @@ where
                                 trie_updates: Arc::new(TrieUpdates::default()),
                             },
                         );
+                        // The entries of blocks that left memory go (their
+                        // shards freed here, off the build's path), also
+                        // after a refusal at run time stopped new ones.
+                        if crate::output_shards::merge_elide() {
+                            n42_sharded_output::sweep();
+                        }
                         let timing = LeaderMerge {
                             state_ready: Some(std::time::Instant::now()),
                             register: register_timing,

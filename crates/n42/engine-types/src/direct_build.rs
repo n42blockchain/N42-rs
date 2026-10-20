@@ -982,8 +982,14 @@ pub mod leader_layers {
         let kept = KEPT.lock().unwrap_or_else(|p| p.into_inner());
         let accounts = kept
             .iter()
-            .map(|(executed, shards)| {
-                shards.as_ref().map_or(0, |shards| shards.accounts()) + executed.execution_output.state.state.len()
+            .map(|(executed, shards)| match shards {
+                Some(shards) => shards.accounts() + executed.execution_output.state.state.len(),
+                // A filed bundle, or (`N42_MERGE_ELIDE`) a thin one over its shards.
+                None => {
+                    let output = &*executed.execution_output;
+                    let elided = n42_sharded_output::shards_of(output);
+                    n42_sharded_output::accounts(elided.as_deref(), &output.state)
+                }
             })
             .sum();
         (kept.len(), accounts)

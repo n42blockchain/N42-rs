@@ -512,8 +512,12 @@ fn advance(built_hash: B256, stage: Stage, execution: BuiltExecution) {
     match store.iter_mut().find(|(hash, _)| *hash == built_hash) {
         Some((_, entry)) => {
             entry.stage = stage;
+            // `N42_MERGE_ELIDE`: an output handed out with a thin bundle keeps
+            // its shard set, the next build's read of it ([`wait_for_state`]).
+            if !n42_sharded_output::is_elided(&*execution.execution_output) {
+                entry.shards = None;
+            }
             entry.execution = Some(execution);
-            entry.shards = None;
         }
         // Evicted (a finish that ran longer than `keep()` builds), or never
         // pending: not re-filed -- that would evict a live build the engine
@@ -585,14 +589,21 @@ pub fn wait_for(built_hash: B256, stage: Stage) -> Option<BuiltExecution> {
 }
 
 /// [`wait_for`] `StateReady`, or the shard set if [`shards_ready`] comes
-/// first: the post-state the next build opens on.
+/// first: the post-state the next build opens on. An output handed out with a
+/// thin bundle (`N42_MERGE_ELIDE`) is given as its shard set after
+/// `StateReady` too: the only entries that keep one past it.
 pub fn wait_for_state(built_hash: B256) -> Option<ParentState> {
     let (store, advanced) = store();
     let deadline = std::time::Instant::now() + WAIT;
     let mut guard = store.lock().unwrap_or_else(|p| p.into_inner());
     loop {
         match guard.iter().find(|(hash, _)| *hash == built_hash) {
-            Some((_, entry)) if entry.stage >= Stage::StateReady => return entry.execution.clone().map(ParentState::Full),
+            Some((_, entry)) if entry.stage >= Stage::StateReady => {
+                if let Some(shards) = &entry.shards {
+                    return Some(ParentState::Sharded(shards.clone()));
+                }
+                return entry.execution.clone().map(ParentState::Full);
+            }
             Some((_, entry)) if entry.shards.is_some() => return entry.shards.clone().map(ParentState::Sharded),
             Some(_) => {}
             None => {

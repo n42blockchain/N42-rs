@@ -330,18 +330,31 @@ impl<R> N42PlainReverts for reth_execution_types::BlockExecutionOutput<R> {
 }
 
 /// N42: `output` with its complete revert set put in, when it was handed out
-/// without it (`N42_ANSWER_BEFORE_REVERTS`); `None` when it is complete as it
-/// stands. A copy of the bundle: only for the paths that read the reverts
-/// through the outcome itself.
+/// without it (`N42_ANSWER_BEFORE_REVERTS`), and with its shards' accounts put
+/// in, when it was handed out with a thin bundle (`N42_MERGE_ELIDE`, which this
+/// path, a reader of the whole map, then refuses from here on); `None` when it
+/// is complete as it stands. A copy of the bundle: only for the paths that read
+/// the reverts or the accounts through the outcome itself.
 pub(crate) fn n42_completed_output<R: Clone>(
     output: &reth_execution_types::BlockExecutionOutput<R>,
 ) -> ProviderResult<Option<reth_execution_types::BlockExecutionOutput<R>>> {
-    let Some((reverts, size)) = n42_deferred_reverts::resolve(output).map_err(ProviderError::other)? else {
+    let late = n42_deferred_reverts::resolve(output).map_err(ProviderError::other)?;
+    let whole = n42_sharded_output::materialized(
+        output,
+        &output.state,
+        "persistence converts the whole bundle (storage v1, or changesets written to MDBX)",
+    );
+    if late.is_none() && whole.is_none() {
         return Ok(None);
-    };
+    }
     let mut completed = output.clone();
-    completed.state.reverts = (*reverts).clone();
-    completed.state.reverts_size = size;
+    if let Some(whole) = whole {
+        completed.state = whole;
+    }
+    if let Some((reverts, size)) = late {
+        completed.state.reverts = (*reverts).clone();
+        completed.state.reverts_size = size;
+    }
     Ok(Some(completed))
 }
 

@@ -4877,3 +4877,30 @@ Stage dt: X18 at depth 2 (RFa / RFb) against `$D3` (carried depth 3) + road + co
    root's operations encoding, or the transfer state layout of 10.165. The alternatives are a second host for the
    validators, or accepting ~4.8M on this box. The road, the cuts and depth 3 stay off by default. They are each
    exact, and they are what a cheaper per-block footprint would stack on.
+
+## 10.191 -- nothing on the host is saturated; the merge runs on the build cores' siblings (stage du, 2026-10-20)
+
+Stage du is a diagnostic pair (UMa X18 4.395, UM1 road + cuts 4.586; gates pass). An outside sampler read
+`/proc/stat` every 5 s for the core-layout sets and `/proc/<el>/task` for the threads.
+
+| set (CPUs) | UMa busy | UM1 busy |
+| --- | --- | --- |
+| build (0-63) | 34-38% | 30-38% |
+| critical (64-79) | 2% | 2-3% |
+| background cores (80-103) | 39-40% | 29-36% |
+| build siblings (128-191) | 25-32% | 38-46% |
+| critical siblings (192-207) | 29-40% | 22-41% |
+
+Threads (CPUs used): `n42-build` 19-24, `tokio-rt` 16.5-19.3, an unnamed `n…` group 9-11, `n42-plan-body` 1.7-4.5,
+storage 2.4-3.9, `n42-behind` 1-2.3. Short-lived per-block threads (merge, root, ops-ahead) fall between samples.
+
+1. **10.190's bandwidth explanation is withdrawn.** The host is about 35% busy, the critical set is nearly idle, and
+   the merge's demand is ~1.3 GB/s. The floors are dependency chains of latency-bound steps, as 10.117 found for the
+   build.
+2. The lever that remains is 10.113/10.117's: the build's execution runs 13 ms with idle siblings and 16-21 with
+   background work on them. The merge (74.5 ms a block, ~1.8 in flight) and tokio's ingest (17-19 CPUs) are the
+   heaviest background work.
+3. **Next: merge elision** (docs/MERGE_ELISION_DESIGN.md). The audit finds no whole-map reader of the merged bundle
+   on the bench path, only point lookups (next build, in-memory overlay, `BlockLayer`), a background filter scan and
+   length metrics. The design replaces the merge with a sharded-output registry. The test is whether `par_exec_ms`
+   falls by at least 1.5 ms.

@@ -41,9 +41,11 @@
 //! [`global`].
 
 mod frames;
+mod road;
 mod snapshot;
 
 pub use frames::{FramePlan, FrameRef, FrameTxs, NewFrame, PlannedFrame, MAX_FRAMES};
+pub use road::{road_stats, RoadMode, RoadStats};
 pub use snapshot::take_plan_snapshot_stats;
 
 use std::any::Any;
@@ -1892,6 +1894,8 @@ pub struct TxQueue<T: PoolTransaction> {
     /// The continuous plan-ahead preparation's state and its waiters
     /// (`N42_PLAN_AHEAD_WAIT_MS`, [`AheadWait`]).
     ahead_wait: Arc<AheadWait>,
+    /// The frame road (`N42_FRAME_ROAD`, [`road`]).
+    road: Arc<road::Road>,
 }
 
 /// `N42_PLAN_AHEAD_WAIT_MS`: the wait (0 = off; the environment's unless a
@@ -2012,6 +2016,7 @@ impl<T: PoolTransaction> Clone for TxQueue<T> {
             plan_snapshot: Arc::clone(&self.plan_snapshot),
             drainer: Arc::clone(&self.drainer),
             ahead_wait: Arc::clone(&self.ahead_wait),
+            road: Arc::clone(&self.road),
         }
     }
 }
@@ -2033,6 +2038,10 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// the by-hash index iff `N42_COMPACT_BODY=1` asked for one.
     pub fn new() -> Self {
         let queue = Self::with_run_length(run_length());
+        // The process's queue: its road's counters go on the ingest's line.
+        if queue.road.mode() != RoadMode::Off {
+            road::register(&queue.road.counters);
+        }
         match hash_index_capacity() {
             Some(cap) => queue.with_hash_index(cap),
             None => queue,
@@ -2190,7 +2199,22 @@ impl<T: PoolTransaction> TxQueue<T> {
                 wait_ms: std::sync::atomic::AtomicU64::new(plan_ahead_wait_ms()),
                 ..AheadWait::default()
             }),
+            road: Arc::new(road::Road::new(road::road_mode_env())),
         }
+    }
+
+    /// The same queue with `N42_FRAME_ROAD` set to `mode` whatever the
+    /// environment says. What a test uses to choose the path.
+    #[must_use]
+    pub fn with_frame_road(self, mode: RoadMode) -> Self {
+        self.road.set_mode(mode);
+        self
+    }
+
+    /// The road's counters: running totals since the queue was made, and
+    /// its gauges ([`RoadStats`]).
+    pub fn road_stats(&self) -> RoadStats {
+        self.road.counters.read()
     }
 
     /// The same queue with `N42_PLAN_AHEAD_WAIT_MS` set to `ms` whatever the
@@ -2330,14 +2354,21 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// transaction. Called with the lanes' lock held; returns how many it
     /// moved.
     fn drain_inbox_upto(&self, inner: &mut Inner<T>, budget: usize) -> usize {
+        self.drain_inbox_upto_in(inner, budget, false)
+    }
+
+    /// [`Self::drain_inbox_upto`]; `gate_held` says the caller holds the
+    /// drain gate itself (the road's seeding, [`Self::road_seed`]), so the
+    /// inbox is taken without trying it.
+    fn drain_inbox_upto_in(&self, inner: &mut Inner<T>, budget: usize, gate_held: bool) -> usize {
         use std::sync::atomic::Ordering;
         let had_pending = !inner.pending_drain.is_empty() || !inner.pending_frames.is_empty();
         // A grouped drain holding the gate has taken (or is taking) the
         // inbox off the lock: what is in the inbox now arrived after its
         // batch, so this hold leaves the inbox and the frame inbox alone and
         // only works the remainder, as if the arrivals came a moment later.
-        let gate = if self.drain_runs_on() { self.drain_gate.try_lock() } else { None };
-        let may_take = gate.is_some() || !self.drain_runs_on();
+        let gate = if !gate_held && self.drain_runs_on() { self.drain_gate.try_lock() } else { None };
+        let may_take = gate_held || gate.is_some() || !self.drain_runs_on();
         // Frames before the inbox: a frame is noted after its transactions
         // were pushed, so every transaction of a frame taken here is in the
         // inbox taken after it, or drained before.
@@ -2426,10 +2457,118 @@ impl<T: PoolTransaction> TxQueue<T> {
             .map(|transaction| valid_for(transaction, now, TransactionOrigin::External))
             .collect();
         let txs = frame.as_ref().filter(|_| frame_arcs()).and_then(|frame| frame_txs_in_order(&frame.hashes, &staged));
+        if self.road.mode() != RoadMode::Off {
+            // Stage 0: decided and counted; the frame still goes the lanes'
+            // path below.
+            self.road_admit(frame.as_ref(), txs.as_ref(), &staged);
+        }
         self.index_and_stage(staged);
         if let Some(frame) = frame {
             self.stage_frame(frame, txs);
         }
+    }
+
+    /// The road's admission of a frame the ingest pushed
+    /// (`docs/FRAME_ROAD_DESIGN.md` 2): whether it was admitted. Unknown
+    /// senders are seeded first, in one hold of the lanes' lock for the
+    /// frame ([`Self::road_seed`]); a frame refused with a member already
+    /// on the road invalidates the road ([`Self::road_flush`]). A push
+    /// without a frame record is a lanes' arrival for every sender in it.
+    fn road_admit(
+        &self,
+        frame: Option<&NewFrame>,
+        txs: Option<&FrameTxs<T>>,
+        staged: &[Arc<ValidPoolTransaction<T>>],
+    ) -> bool {
+        let Some(frame) = frame else {
+            self.road_note_frameless(staged);
+            return false;
+        };
+        // The record must describe the transactions exactly: the road plans
+        // by the members' nonces and hands out the transactions.
+        let matched = !frame.members.is_empty()
+            && frame.members.len() == frame.hashes.len()
+            && txs.is_some_and(|txs| {
+                txs.len() == frame.members.len()
+                    && txs.iter().zip(&frame.members).all(|(t, (sender, nonce))| t.sender() == *sender && t.nonce() == *nonce)
+            });
+        let mut outcome = self.road.admit(frame, matched, true, || {});
+        if let road::Admit::Seed(unknown) = &outcome {
+            self.road_seed(unknown);
+            outcome = self.road.admit(frame, matched, false, || {});
+        }
+        match outcome {
+            road::Admit::Admitted => true,
+            road::Admit::Refused { flush, .. } => {
+                if flush {
+                    self.road_flush();
+                }
+                false
+            }
+            road::Admit::Seed(_) => false,
+        }
+    }
+
+    /// Transactions pushed without a frame (the pool's listener, a reorg,
+    /// a frameless push): a sender on the road among them invalidates it,
+    /// so none of them is planned from the lanes ahead of that sender's
+    /// road frames.
+    fn road_note_frameless(&self, staged: &[Arc<ValidPoolTransaction<T>>]) {
+        if self.road.mode() == RoadMode::Off || staged.is_empty() {
+            return;
+        }
+        let arrivals: Vec<(Address, u64)> = staged.iter().map(|t| (t.sender(), t.nonce())).collect();
+        if self.road.note_lanes_arrivals(&arrivals) {
+            self.road_flush();
+        }
+    }
+
+    /// Seeds the road with `unknown` senders (`docs/FRAME_ROAD_DESIGN.md`
+    /// 2, "Seeding"): in one hold of the lanes' lock with everything pushed
+    /// so far drained into them (the drain gate held, so no grouped drain
+    /// has a batch in hand), each sender's `next` is its lane's highest
+    /// nonce + 1; a sender the lanes have never seen starts at its nonce in
+    /// the frame (the first it ever sent). A sender with an empty lane is
+    /// left unknown: what it has in flight (a build's take, an own block)
+    /// is not in the lanes, so its lane cannot say where it is. A chunked
+    /// drain holding a batch off the lock (without the gate) makes the
+    /// hold try again, a few times.
+    fn road_seed(&self, unknown: &[(Address, u64)]) {
+        use std::sync::atomic::Ordering;
+        for _ in 0..4 {
+            let gate = self.drain_gate.lock();
+            let mut inner = self.lock_inner_quiet();
+            self.drain_inbox_upto_in(&mut inner, usize::MAX, true);
+            if self.in_hand.load(Ordering::Acquire) != 0 || self.frames_in_hand.load(Ordering::Acquire) != 0 {
+                drop(inner);
+                drop(gate);
+                std::thread::yield_now();
+                continue;
+            }
+            let counters = &self.road.counters;
+            counters.seed_holds.fetch_add(1, Ordering::Relaxed);
+            let mut shards = self.road.lock_senders(unknown.iter().map(|(sender, _)| sender));
+            for (sender, nonce) in unknown {
+                if shards.get(sender).is_some() {
+                    continue;
+                }
+                let next = match inner.lanes.get(sender) {
+                    Some(lane) => match lane.by_nonce.last_key_value() {
+                        Some((last, _)) => last.saturating_add(1),
+                        None => continue,
+                    },
+                    None => *nonce,
+                };
+                shards.insert(*sender, road::RoadSender { next, ..road::RoadSender::default() });
+                counters.seeded.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+    }
+
+    /// Invalidates the road: every sender seeds again from the lanes.
+    fn road_flush(&self) {
+        self.road.invalidate();
     }
 
     /// Whether frames are on their way into the index: noted in the frame
@@ -2693,19 +2832,21 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// written here, off every lock this queue has. See [`HashIndex`].
     pub fn push(&self, transactions: impl IntoIterator<Item = T>) {
         let now = std::time::Instant::now();
-        self.index_and_stage(
-            transactions
-                .into_iter()
-                .map(|transaction| valid_for(transaction, now, TransactionOrigin::External))
-                .collect(),
-        );
+        let staged: Vec<Arc<ValidPoolTransaction<T>>> = transactions
+            .into_iter()
+            .map(|transaction| valid_for(transaction, now, TransactionOrigin::External))
+            .collect();
+        self.road_note_frameless(&staged);
+        self.index_and_stage(staged);
     }
 
     /// Queues transactions the pool has already validated, as the pool holds
     /// them. What the pool's new-transaction listener yields; the queue is a
     /// view of the pool's arrivals, whichever door they came in by.
     pub fn push_valid(&self, transactions: impl IntoIterator<Item = Arc<ValidPoolTransaction<T>>>) {
-        self.index_and_stage(transactions.into_iter().collect());
+        let staged: Vec<Arc<ValidPoolTransaction<T>>> = transactions.into_iter().collect();
+        self.road_note_frameless(&staged);
+        self.index_and_stage(staged);
     }
 
     /// Indexes what was pushed and puts it in the inbox.
@@ -8771,3 +8912,6 @@ mod lean_tests;
 
 #[cfg(test)]
 mod drain_runs_tests;
+
+#[cfg(test)]
+mod road_tests;

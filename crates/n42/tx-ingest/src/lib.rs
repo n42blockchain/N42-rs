@@ -816,6 +816,7 @@ fn spawn_stats_reporter() {
         let slots = recovery_slot_count();
         let mut last = (std::time::Instant::now(), 0u64, 0u64, 0u64, 0u64, 0u64);
         let mut last_reply = (0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut last_road = n42_tx_queue::RoadStats::default();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let now = std::time::Instant::now();
@@ -981,6 +982,29 @@ fn spawn_stats_reporter() {
                         .collect::<Vec<_>>()
                         .join(" ");
                     tracing::info!(target: "n42.tx_ingest", secs = secs as u64, sites = %top, "queue lock sites (held ms / holds / waited ms)");
+                }
+                // `N42_FRAME_ROAD`: the road's admissions and refusals over
+                // the same interval, and its gauges
+                // (`docs/FRAME_ROAD_DESIGN.md` 4, stage 0's proof).
+                if let Some(road) = n42_tx_queue::road_stats() {
+                    let d = |now: u64, before: u64| now.saturating_sub(before);
+                    tracing::info!(
+                        target: "n42.tx_ingest",
+                        secs = secs as u64,
+                        road_frames = d(road.frames, last_road.frames),
+                        road_txs = d(road.txs, last_road.txs),
+                        refused_unknown = d(road.refused_unknown, last_road.refused_unknown),
+                        refused_gap = d(road.refused_gap, last_road.refused_gap),
+                        refused_no_frame = d(road.refused_no_frame, last_road.refused_no_frame),
+                        refused_dup_sender = d(road.refused_dup_sender, last_road.refused_dup_sender),
+                        flushes = d(road.flushes, last_road.flushes),
+                        seeded = d(road.seeded, last_road.seeded),
+                        seed_holds = d(road.seed_holds, last_road.seed_holds),
+                        road_len = road.len_txs,
+                        lane_debt = road.lane_debt,
+                        "frame road"
+                    );
+                    last_road = road;
                 }
             }
             last = (now, frames, txs, recover, pool, busy);

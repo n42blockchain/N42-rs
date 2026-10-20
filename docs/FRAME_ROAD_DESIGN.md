@@ -34,13 +34,20 @@ On E=1 every block is built by this queue's own builder, and the flood's frames 
   Members of one frame are distinct senders in the flood; a frame that names a sender twice needs consecutive nonces in
   frame order (checked the same way). The shards are locked in ascending order for one frame (no deadlock), or one shard
   at a time with a two-phase check-then-advance under all touched shards.
-* **Seeding.** A sender enters the road only from the lanes: when the lanes path settles a sender whose lane is empty
-  and whose next nonce is known (the build's take of its last lane entry, or the canonical prune's watermark + 1 with an
-  empty lane), it records `next` in the road map. Everything else (first sight of a sender, a gap, an unattested or
-  unaligned frame, a sender with lane entries) goes the existing lanes path and marks the sender `lane_owned`; a
-  `lane_owned` sender returns to the road when its lane empties (the same seeding rule). So the road never holds a
-  transaction whose predecessor is in the lanes, and the lanes never hold one whose predecessor is on the road
-  (invariant R1).
+* **Seeding.** The flood's senders always have lane entries (~120 each), so a sender cannot wait for an empty lane. A
+  sender joins the road at the first aligned, attested frame that names it while the road is on: under the lanes lock,
+  once per sender (18,750 senders in the 600M set), `next` = its lane's highest nonce + 1 (or the mined watermark + 1
+  with an empty lane, or the frame's nonce when the sender is unknown to the lanes and to the chain's watermark only if
+  the frame is the first it ever sent -- else the lanes path), and the sender's lane entries are counted into
+  `lane_debt` (an atomic: transactions of road senders still in the lanes). A frame whose member nonce is not `next`,
+  an unattested or unaligned frame, goes the lanes path and marks its senders `lane_owned` (their later frames too, until
+  the sender's lane is empty and nothing of it is in flight -- then it may re-join).
+* **The gate (invariant R1).** Road frames are eligible only while `lane_debt == 0`: no transaction of a road sender is
+  in the lanes, so a road frame's predecessors were all taken by this build's ancestors. The lanes path decrements
+  `lane_debt` when it takes (settles) or prunes a road sender's entry and increments it when it gives one back. On the
+  flood the debt drains in ~0.5 s after the switch (2.3M queued at 5M/s) and then stays 0; a lanes give-back of a road
+  sender (an abandoned build) closes the gate until that entry is taken again. Its abandoned children give their road
+  frames back to the FIFO front, so the order holds.
 * **Build.** The plan takes road frames first, FIFO, whole, up to the gas limit, without a per-transaction check; then the
   existing frame/lanes planner fills the rest. The road frames of a build are its *road take*.
 * **Hand-back.** A build that is not committed returns its road take to the FIFO front in order (the senders' `next`

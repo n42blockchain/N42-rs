@@ -10,6 +10,7 @@ libc.workspace = true
 #n42
 n42-engine-primitives.workspace = true
 n42-deferred-reverts.workspace = true
+n42-sharded-output.workspace = true
 n42-clique.workspace = true
 # The APoS block signer, credited as the beneficiary when a block is executed (n42_evm.rs).
 n42-clique-utils.workspace = true

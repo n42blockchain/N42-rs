@@ -3940,3 +3940,38 @@ Stage dk: ALa / ALb (X18) against AL5 / AL5b (X18 + `N42_BUILD_READS_NO_CHANGESE
 1. **Every state input is now early**: no grandparent wait, output waits on 3-4% of builds, shards 0.6 ms after the seal, exec 16.8 ms, the fold off the seal path (0.1 ms). The build is 5-7 ms shorter from its start to its seal than X18 — and starts 10-11 ms later (`par_start` 15-16 against 4-6), entirely in the **plan wait** (8-9 ms): the planned body is not ready because the frame index holds ~190 frames at the take against 3,300-4,300. Rate -6%.
 2. **Why the index starves**: the bench runs `N42_QUEUE_OFFLOCK=1` without `N42_TX_QUEUE_DRAINER`, so the frame inbox is moved into the index only by the drains inside the pruner's wakes (`prune_drained` 40-63k a wake) and by the builder's own pulls. The pinned pruner (minimum fold 12 over up to 600 ms) wakes on its own schedule and the frames pile up (4,364 pending at a prune against 494). The X18 controls' pruner (fold 4 within 200 ms) wakes often enough to keep the index fed — by accident. That is the common cause of the "pruner wake count" results of 10.176, 10.180 and 10.182: the supply was riding on the pruner.
 3. **Stage dl**: the dedicated drainer (`N42_TX_QUEUE_DRAINER=1`: its own thread, 5 ms tick, woken at 8,192 staged, sliced holds of 8,192) on top of every cut: DR6 / DR6b against X18 (DRa / DRb). It lost on X8 (10.10x, lanes lock at 95% duty); the lanes are far less busy now (pruner off-runtime, lean prune, drain runs).
+
+### 10.186 loop351 stages dl-do — the gap is the seal or the vote, and both ride on the lanes lock at 85-98% duty
+
+**The gap's anatomy** (proposals of all seven validators in the full-block window): previous send -> tick 27-29 ms (the
+30 ms pacing) plus tick -> send 10-17 ms, of which the take of the sealed build 5-13 ms. The decision is in before the
+tick on 94-98% of views: with the frame supply healthy the proposal waits for its seal; when the build gets fast the
+pre-tick part grows (votes; vote-log `sync_data` 8-12 ms mean, 4,000-8,000 slow syncs a leg on /data's NVMe).
+
+| stage / leg | config | drain (M tx/s) | mean / median gap | plan wait | par_start | sealed_at | frames at take | pre-tick | vote-log syncs (mean) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| dl DRa / DRb | X18 | 4.451 / 4.551 | 45.0 / 43.9 | 0.2 | 3.4 | 34.8 / 37.8 | -- | 34.2 / 32.2 | -- |
+| dl DR6 / DR6b | cuts + drainer | 4.415 / 4.489 | 45.5 / 44.6 | 4.7 / 4.1 | 9.7 / 9.2 | 37.3 / 35.2 | -- | 32.8 / 34.7 | -- |
+| dm DQa / DQb | X18 | 4.610 / 4.536 | 43.4 / 44.1 | 0.2 | 4.2 / 4.3 | 38.8 / 36.5 | -- | 31.0 / 33.3 | 6,200-6,569 (8.1-8.3) |
+| dm DQ6 / DQ6b | cuts + drainer | 4.606 / 4.336 | 43.4 / 46.9 | 0 / 10.4 | 4.1 / 17.8 | 35.4 / 44.0 | 4,275 / 406 | 34.5 / 28.1 | 6,203 / 3,826 |
+| dn DNa / DNb | X18 | 4.398 / 4.683 | 45.5 / 42.7 | 3.1 / 0.3 | 9.1 / 4.7 | 39.0 / 37.8 | 2,744 / 4,021 | 30.8 / 32.4 | 4,265 / 7,123 |
+| dn DNc / DNcb | cuts + drainer, X18 pruner | 4.292 / 4.256 | 46.6 / 47.0 | 8.2 / 0.2 | 14.6 / 3.1 | 39.4 / **28.5** | 1,110 / 4,393 | 31.9 / **40.9** | 4,658 / 8,044 (11.7) |
+| dn DNs / DNsb | + `N42_VOTE_LOG_NOSYNC=1` | 4.721 / 4.387 | 42.4 / 45.7 | 0.9 / 6.4 | 5.8 / 12.6 | 40.3 / 40.0 | 3,794 / 1,288 | 31.1 / 34.7 | 1 / 3 |
+| do LSa / LSs | X18 / cuts + NOSYNC, `N42_LOCK_SITES=1` | 4.631 / 4.546 | 43.2 / 44.1 | | | | | | |
+
+1. dl ran right after a gov5 fleet (cold box: controls below the band); dm-dn controls 4.40-4.68. No knob passes the
+   two-pair rule; nothing adopted. All d2gates pass.
+2. **The frame supply is bistable on every configuration, controls included**: the index at the take is 2,700-4,400 or
+   400-1,300 frames, and the starved legs wait 3-10 ms for their plan. The drainer moves the frames (pending 451 against
+   4,327 on the starved legs) only while it wins the lanes lock.
+3. **The lanes lock** (ingest line): duty 86-98% on every dn leg, 5-9 s of waits per 5 s. `N42_LOCK_SITES=1` (new,
+   988a22b1f) names the holders: `drain_grouped` 46-50% (770-960 us a hold, ~95 ns a transaction: the flood's frames
+   are runs of length ~1), `offlock_plan` 14-26% (6-11 ms a block: `plan_frames` checks every frame against its lanes),
+   `top_up_prepared` 0-17%, the prune and settle 3-8%. About 0.2 us of lanes-lock work per transaction: 100% at ~5M/s,
+   the ceiling ARCHITECTURE_TOWARD_5M section 2 extrapolated. Every cut that speeds the pipeline raises its demand,
+   which is why 10.176-10.185 were all flat.
+4. When the supply holds, the build seals in 28.5 ms (DNcb) and the vote side binds (pre-tick 40.9 mean, 67 on the
+   long gaps, vote-log syncs 11.7 ms mean).
+5. **Next: the frame road** (docs/FRAME_ROAD_DESIGN.md): attested, nonce-aligned frames admitted whole into a FIFO off
+   the lanes lock (a sharded per-sender `next` map), taken whole by the build, handed back or retired whole; seeded from
+   the lane tail with a lane-debt gate. Expected duty 85-98% -> ~20%, plan wait 0. Then the vote log on its own device.

@@ -4904,3 +4904,30 @@ storage 2.4-3.9, `n42-behind` 1-2.3. Short-lived per-block threads (merge, root,
    on the bench path, only point lookups (next build, in-memory overlay, `BlockLayer`), a background filter scan and
    length metrics. The design replaces the merge with a sharded-output registry. The test is whether `par_exec_ms`
    falls by at least 1.5 ms.
+
+## 10.192 -- merge elision: the merge goes, the grandparent wait goes with it (stage dv, 2026-10-20)
+
+Stage dv ran merge elision (`N42_MERGE_ELIDE=1`, `docs/MERGE_ELISION_DESIGN.md`, stages 0-1 on
+perf/merge-elide) on carried depth 3 + frame road + the leader cuts, with EM0 = the same leg without elision.
+
+| leg | config | drain M/s | mean gap ms | shard_merge ms | state_ready ms | par_exec ms | sealed_at ms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| EMa | X18 | 4.588 | 43.6 | 64 | 127 | 18 | 38 |
+| EMb | X18 | 4.709 | 42.5 | 66 | 124 | 17 | 37 |
+| EM0 | D3 + road + cuts | 4.690 | 42.7 | 75 | 184 | 19 | 35 |
+| EM1 | EM0 + elide | 4.830 | 41.4 | 0 | 118 | 20 | 35 |
+| EM1b | EM0 + elide | 4.834 | 41.4 | 0 | 114 | 20 | 34 |
+
+Every gate is clean (bodygate, verify fallbacks 0, fields mismatches 0, tc 0), and the registry of sharded
+outputs stays bounded (`sharded_outputs=` at most 61 on node 0).
+
+- The predicted mechanism did not happen. par_exec does not fall (19 -> 20 ms): the merge's work on the
+  siblings was not what slowed execution.
+- The gain is somewhere else. state_ready drops 184 -> 114-118 ms, and the depth-3 grandparent wait goes
+  with it: state_wait_split's 20/40 ms buckets fall from 91 blocks to 11-14. The merge was the long pole of
+  the parent output that the next-but-one build waits on.
+- Both elision legs sit at the round-record level (record leg 4.835) and 3% above EM0.
+- The strict two-pair rule fails only on the band: both elision legs are at least 1.5% above both controls
+  (4.709 x 1.015 = 4.780), but EMa (4.588) is under the X18 band floor of 4.64.
+- Next: stage dw confirms with a fresh pair of controls, and adds EW2 = X18 + elision on depth 2 alone, to
+  see whether elision needs the depth-3 stack.

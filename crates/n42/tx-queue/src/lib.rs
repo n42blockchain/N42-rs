@@ -875,6 +875,49 @@ static LOCK_COUNTERS: LockCounters = LockCounters {
 /// The caller that set the current longest hold, beside it.
 static HOLD_MAX_AT: Mutex<Option<&'static std::panic::Location<'static>>> = Mutex::new(None);
 
+/// `N42_LOCK_SITES=1`: the lanes' lock's holds summed by the caller that
+/// took them (`file:line`, holds, held and waited nanoseconds), so the 5 s
+/// `ingest` line can be followed by who holds the lock's duty. A few dozen
+/// sites, searched linearly under a lock of their own at each release.
+static HOLD_SITES: Mutex<Vec<LockSite>> = Mutex::new(Vec::new());
+
+/// One caller's share of the lanes' lock since the last [`take_lock_sites`].
+#[derive(Clone, Copy, Debug)]
+pub struct LockSite {
+    /// Where the lock was taken.
+    pub at: &'static std::panic::Location<'static>,
+    /// Holds taken there.
+    pub holds: u64,
+    /// Their holds' sum, nanoseconds.
+    pub hold_ns: u64,
+    /// Their waits' sum, nanoseconds.
+    pub wait_ns: u64,
+}
+
+fn lock_sites_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_LOCK_SITES").is_ok_and(|v| v == "1"))
+}
+
+fn note_lock_site(at: &'static std::panic::Location<'static>, hold_ns: u64, wait_ns: u64) {
+    let mut sites = HOLD_SITES.lock();
+    if let Some(site) = sites.iter_mut().find(|site| std::ptr::eq(site.at, at)) {
+        site.holds += 1;
+        site.hold_ns += hold_ns;
+        site.wait_ns += wait_ns;
+    } else {
+        sites.push(LockSite { at, holds: 1, hold_ns, wait_ns });
+    }
+}
+
+/// The lanes' lock by caller since the last call, which resets it, the
+/// largest duty first; empty unless `N42_LOCK_SITES=1`.
+pub fn take_lock_sites() -> Vec<LockSite> {
+    let mut sites = std::mem::take(&mut *HOLD_SITES.lock());
+    sites.sort_unstable_by(|a, b| b.hold_ns.cmp(&a.hold_ns));
+    sites
+}
+
 /// What [`take_lock_stats`] reports: the lanes' lock and the inbox drain
 /// since the previous call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1015,6 +1058,9 @@ impl<T: PoolTransaction> Drop for TimedInner<'_, T> {
         }
         if raise_max(&c.hold_max_ns, held_ns) {
             *HOLD_MAX_AT.lock() = Some(self.caller);
+        }
+        if lock_sites_on() {
+            note_lock_site(self.caller, held_ns, waited_ns);
         }
         if held >= SLOW_LOCK || self.waited >= SLOW_LOCK {
             tracing::warn!(

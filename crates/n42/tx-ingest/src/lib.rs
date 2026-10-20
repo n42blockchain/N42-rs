@@ -959,6 +959,26 @@ fn spawn_stats_reporter() {
                     plan_snapshot_fallbacks,
                     "ingest"
                 );
+                // `N42_LOCK_SITES=1`: the same interval's lock duty by caller.
+                let sites = n42_tx_queue::take_lock_sites();
+                if !sites.is_empty() {
+                    let top = sites
+                        .iter()
+                        .take(12)
+                        .map(|site| {
+                            format!(
+                                "{}:{}={}/{}/{}",
+                                site.at.file().rsplit('/').next().unwrap_or(""),
+                                site.at.line(),
+                                site.hold_ns / 1_000_000,
+                                site.holds,
+                                site.wait_ns / 1_000_000
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    tracing::info!(target: "n42.tx_ingest", secs = secs as u64, sites = %top, "queue lock sites (held ms / holds / waited ms)");
+                }
             }
             last = (now, frames, txs, recover, pool, busy);
         }

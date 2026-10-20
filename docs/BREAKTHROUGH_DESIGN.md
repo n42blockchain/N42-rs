@@ -4039,3 +4039,35 @@ Stage ds: X18 (REa / REb) against the dr configuration plus `N42_ROOT_LOOKUPS_EA
    fields chain by 3: (78 + 8) / 3 = 29, under the seal floor of ~38. Depth 3 lost in cs and ct (-2..-7%) to the
    grandparent layer's state wait, which `N42_LEADER_LAYERS=8` removes (10.184), and to the lanes lock, which the
    road removes (10.187).
+
+## 10.190 -- carried depth 3 on the road with the cuts: every serial floor converges at ~40 ms (stage dt, 2026-10-20)
+
+Stage dt: X18 at depth 2 (RFa / RFb) against `$D3` (carried depth 3) + road + consensus on nvme0 + leader cuts
+(RF3 / RF3b).
+
+| leg | drain M/s | mean gap | tick-bound | sealed_at | state_wait | parent_fields | seal_to_root_start | seal_to_fields | roots_ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| RFa / RFb | 4.377 / 4.801 | 45.7 / 41.7 | 74 / 85% | 33.9 / 39.7 | 4.1-4.4 / 5.7-6.2 | 1.5 / 4.0 | 34.2 / 40.3 | 59.0 / 72.5 | 34.3 / 39.1 |
+| RF3 / RF3b | 4.687 / 4.771 | 42.7 / 41.9 | 98 / 97% | 38.3 / 39.1 | 6.6 / 8.5 | 6.8 / 5.7 | 59.3 / 57.5 | 95.1 / 93.9 | 38.8 / 39.2 |
+
+1. Not adopted: RF3b -0.6% against RFb. RFa lies below the X18 band (vote-side tails: prevsend->tick 49.5 ms on its
+   long gaps), so that pair does not count. All gates pass on all four (depth-3 legs: invalid 0, fields mismatches 0,
+   verify written, 2,181 / 2,218 seal-first directs).
+2. Depth 3 does what the model said to the fields chain: the root runs 95 ms behind the seal instead of 75-81 without
+   throttling the build. The gap does not move. The leader is seal-bound on 97-98% of views at `sealed_at` 38-39 ms,
+   and the builds wait 6-8 ms for state.
+3. **Four structural stages, four floors at the same place.** dq removed the lanes lock (duty 85-98% -> 7-10%), dr
+   made the parent's view early (12.4 -> 2.5 ms), ds took the lookups off the root, and dt took the fields chain off
+   the build. Each time the next floor appeared within 1-3 ms of the old one: the parent's state (10.187), the root
+   beside the next execution (10.188), the operations encoding (10.189), and now the seal plus its state wait. Every
+   leg of the four stages lies in 4.34-4.80M/s, the X18 band.
+4. The common term is the box. Each cut moved work onto cores that run concurrently with the next block's execution,
+   and that work slowed by about the amount saved: lookups 5 -> 10 ms, apply +6.7, operations encoding 9.7 -> 15. This
+   is the memory-bandwidth floor of 10.165 (19.5 DRAM fills a transfer, latency-bound) seen from the pipeline side.
+   On one host the per-block memory traffic of build + root + merge + seven validators bounds the cycle at ~40-42 ms,
+   about 4.8M/s.
+5. What would still move it: cut the per-block memory traffic, not the latency. The candidates are the 68 ms shard
+   merge (`shard_merge_ms`, the largest single body of work a block, off the seal chain but on the same memory), the
+   root's operations encoding, or the transfer state layout of 10.165. The alternatives are a second host for the
+   validators, or accepting ~4.8M on this box. The road, the cuts and depth 3 stay off by default. They are each
+   exact, and they are what a cheaper per-block footprint would stack on.

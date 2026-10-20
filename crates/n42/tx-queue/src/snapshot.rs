@@ -738,6 +738,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                     made_at: std::time::Instant::now(),
                     prep_us: at.elapsed().as_micros() as u64,
                     body,
+                    road_epoch: 0,
                 });
                 None
             }

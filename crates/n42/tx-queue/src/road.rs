@@ -16,14 +16,26 @@
 //! `N42_FRAME_ROAD=count` is stage 0 of the design: admission and seeding
 //! run and are counted ([`RoadStats`]), and every frame still goes the
 //! lanes' path, so nothing a build sees changes.
+//!
+//! `N42_FRAME_ROAD=1` is stage 1: an admitted frame does not enter the
+//! lanes. It waits in the road's FIFO ([`RoadFrame`]) until a frame plan
+//! takes it whole, first, while no transaction of a road sender is in the
+//! lanes (the gate, invariant R1); it is then remembered as taken until the
+//! chain mines it ([`Road::retire`]) or a give-back hands it back whole to
+//! the FIFO, in its order ([`Road::hand_back`]). Anything else that would
+//! put a road sender's transaction in the lanes invalidates the road
+//! ([`Road::invalidate`]): its queued frames go to the lanes, its map is
+//! cleared, and its senders seed again.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use alloy_primitives::{map::AddressHashMap, Address};
+use alloy_primitives::{map::{AddressHashMap, B256HashMap}, Address, B256};
 use parking_lot::{Mutex, MutexGuard};
+use reth_transaction_pool::{PoolTransaction, ValidPoolTransaction};
 
-use crate::NewFrame;
+use crate::{FrameTxs, NewFrame};
 
 /// Shards of the road's per-sender map. A 500-member frame of distinct
 /// senders touches nearly all of them, so this bounds the contention of
@@ -40,26 +52,121 @@ pub enum RoadMode {
     /// Stage 0: admission and seeding counted, every frame still goes the
     /// lanes' path.
     Count = 1,
+    /// Stage 1: admitted frames bypass the lanes and are taken by the frame
+    /// plan first.
+    On = 2,
 }
 
 impl RoadMode {
     const fn from_u8(value: u8) -> Self {
         match value {
             1 => Self::Count,
+            2 => Self::On,
             _ => Self::Off,
         }
     }
 }
 
-/// `N42_FRAME_ROAD`, read once: `1` or `count` counts (stage 0), anything
-/// else is off.
+/// `N42_FRAME_ROAD`, read once: `1` is the road (stage 1), `count` counts
+/// only (stage 0), anything else is off.
 pub(crate) fn road_mode_env() -> RoadMode {
     static MODE: OnceLock<RoadMode> = OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("N42_FRAME_ROAD").as_deref() {
-        Ok("1" | "count") => RoadMode::Count,
+        Ok("1") => RoadMode::On,
+        Ok("count") => RoadMode::Count,
         _ => RoadMode::Off,
     })
 }
+
+/// A frame on the road: admitted whole, its transactions in frame order.
+pub(crate) struct RoadFrame<T: PoolTransaction> {
+    /// Admission order: the FIFO is sorted by it, and a hand-back goes back
+    /// to its place.
+    pub(crate) seq: u64,
+    /// [`Road::epoch`] at admission: a frame taken before an invalidation
+    /// and handed back after it goes the lanes' path.
+    pub(crate) epoch: u64,
+    pub(crate) id: B256,
+    pub(crate) hashes: Arc<[B256]>,
+    pub(crate) members: Arc<[(Address, u64)]>,
+    pub(crate) gas: u64,
+    pub(crate) txs: FrameTxs<T>,
+}
+
+impl<T: PoolTransaction> Clone for RoadFrame<T> {
+    fn clone(&self) -> Self {
+        Self {
+            seq: self.seq,
+            epoch: self.epoch,
+            id: self.id,
+            hashes: Arc::clone(&self.hashes),
+            members: Arc::clone(&self.members),
+            gas: self.gas,
+            txs: Arc::clone(&self.txs),
+        }
+    }
+}
+
+impl<T: PoolTransaction> RoadFrame<T> {
+    /// A frame for the queue of the road, from the ingest's record.
+    pub(crate) fn of(frame: &NewFrame, txs: FrameTxs<T>) -> Self {
+        Self {
+            seq: 0,
+            epoch: 0,
+            id: frame.id,
+            hashes: Arc::from(frame.hashes.as_slice()),
+            members: Arc::from(frame.members.as_slice()),
+            gas: frame.gas,
+            txs,
+        }
+    }
+
+    /// The ingest's record again, for the frame index (a frame leaving the
+    /// road for the lanes).
+    pub(crate) fn new_frame(&self) -> NewFrame {
+        NewFrame { id: self.id, hashes: self.hashes.to_vec(), members: self.members.to_vec(), gas: self.gas }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.txs.len()
+    }
+
+    fn first_ptr(&self) -> Option<usize> {
+        self.txs.first().map(|first| Arc::as_ptr(first) as usize)
+    }
+}
+
+/// The frames builds took off the road and the chain has not yet mined:
+/// what a give-back is recognised against, by the pointer of a frame's
+/// first transaction, and what [`crate::TxQueue::take_frames`] finds by id.
+struct RoadTaken<T: PoolTransaction> {
+    by_id: B256HashMap<RoadFrame<T>>,
+    by_ptr: HashMap<usize, B256>,
+    /// Ids in take order, for the bound; an id already retired is skipped.
+    order: VecDeque<B256>,
+}
+
+impl<T: PoolTransaction> Default for RoadTaken<T> {
+    fn default() -> Self {
+        Self { by_id: B256HashMap::default(), by_ptr: HashMap::new(), order: VecDeque::new() }
+    }
+}
+
+impl<T: PoolTransaction> RoadTaken<T> {
+    fn remove(&mut self, id: &B256) -> Option<RoadFrame<T>> {
+        let frame = self.by_id.remove(id)?;
+        if let Some(ptr) = frame.first_ptr() {
+            self.by_ptr.remove(&ptr);
+        }
+        Some(frame)
+    }
+}
+
+/// The most taken frames the road remembers (~65M transactions of 500-frames,
+/// far past what a held window of own blocks takes). Past it the oldest is
+/// forgotten: a give-back of it is then not recognised, and goes the lanes'
+/// path with an invalidation, which is correct, only slower.
+const ROAD_TAKEN_MAX: usize = 131_072;
 
 /// One sender as the road knows it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -116,6 +223,9 @@ pub(crate) struct RoadCounters {
     pub(crate) seed_holds: AtomicU64,
     pub(crate) len_txs: AtomicU64,
     pub(crate) lane_debt: AtomicU64,
+    pub(crate) taken: AtomicU64,
+    pub(crate) handed_back: AtomicU64,
+    pub(crate) retired: AtomicU64,
 }
 
 /// The road's counters as read ([`road_stats`], [`crate::TxQueue::road_stats`]):
@@ -146,6 +256,12 @@ pub struct RoadStats {
     /// Transactions of road senders still in the lanes, as last counted (a
     /// gauge).
     pub lane_debt: u64,
+    /// Frames frame plans took off the road.
+    pub taken: u64,
+    /// Taken frames a give-back put back on the road.
+    pub handed_back: u64,
+    /// Taken frames the chain mined.
+    pub retired: u64,
 }
 
 impl RoadCounters {
@@ -163,6 +279,9 @@ impl RoadCounters {
             seed_holds: get(&self.seed_holds),
             len_txs: get(&self.len_txs),
             lane_debt: get(&self.lane_debt),
+            taken: get(&self.taken),
+            handed_back: get(&self.handed_back),
+            retired: get(&self.retired),
         }
     }
 }
@@ -195,15 +314,20 @@ fn mask_of<'a>(senders: impl IntoIterator<Item = &'a Address>) -> u64 {
     senders.into_iter().fold(0u64, |mask, sender| mask | (1u64 << shard_of(sender)))
 }
 
-/// The road's shared state.
-#[derive(Debug)]
-pub(crate) struct Road {
+/// The road's shared state. Lock order: the lanes' lock, then shards
+/// (ascending), then the FIFO or the taken frames; the FIFO and the taken
+/// frames are leaves.
+pub(crate) struct Road<T: PoolTransaction> {
     mode: AtomicU8,
     shards: Box<[Mutex<AddressHashMap<RoadSender>>]>,
     /// Admission attempts, for [`RoadSender::stamp`].
     stamps: AtomicU64,
-    /// Raised by every invalidation.
+    /// Raised by every invalidation, which holds every shard.
     epoch: AtomicU64,
+    /// Admitted frames not yet taken, in admission order.
+    fifo: Mutex<VecDeque<RoadFrame<T>>>,
+    next_seq: AtomicU64,
+    taken: Mutex<RoadTaken<T>>,
     pub(crate) counters: Arc<RoadCounters>,
 }
 
@@ -229,15 +353,185 @@ impl ShardGuards<'_> {
     }
 }
 
-impl Road {
+impl<T: PoolTransaction> Road<T> {
     pub(crate) fn new(mode: RoadMode) -> Self {
         Self {
             mode: AtomicU8::new(mode as u8),
             shards: (0..ROAD_SHARDS).map(|_| Mutex::new(AddressHashMap::default())).collect(),
             stamps: AtomicU64::new(0),
             epoch: AtomicU64::new(1),
+            fifo: Mutex::new(VecDeque::new()),
+            next_seq: AtomicU64::new(0),
+            taken: Mutex::new(RoadTaken::default()),
             counters: Arc::new(RoadCounters::default()),
         }
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Transactions queued on the road.
+    pub(crate) fn len_txs(&self) -> usize {
+        self.counters.len_txs.load(Ordering::Acquire) as usize
+    }
+
+    /// Lowers the queued count by transactions that left the road for the
+    /// lanes, once the lanes' depth mirror counts them.
+    pub(crate) fn sub_len(&self, n: usize) {
+        self.counters.len_txs.fetch_sub(n as u64, Ordering::AcqRel);
+    }
+
+    /// Queues an admitted frame; called under its senders' shard locks
+    /// ([`Self::admit`]'s `on_admit`), so frames of one sender queue in the
+    /// order they were admitted.
+    pub(crate) fn queue_frame(&self, mut frame: RoadFrame<T>) {
+        frame.epoch = self.epoch();
+        let n = frame.len() as u64;
+        let mut fifo = self.fifo.lock();
+        frame.seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        fifo.push_back(frame);
+        // Counted before the lock is released: a depth reading never misses
+        // a frame that is queued.
+        self.counters.len_txs.fetch_add(n, Ordering::AcqRel);
+    }
+
+    /// Takes frames off the front of the FIFO, whole, while each fits
+    /// `gas_left`; they are remembered as taken.
+    pub(crate) fn take_upto(&self, gas_left: &mut u64) -> Vec<RoadFrame<T>> {
+        let mut out = Vec::new();
+        {
+            let mut fifo = self.fifo.lock();
+            while fifo.front().is_some_and(|frame| frame.gas <= *gas_left) {
+                let Some(frame) = fifo.pop_front() else { break };
+                *gas_left -= frame.gas;
+                out.push(frame);
+            }
+        }
+        if out.is_empty() {
+            return out;
+        }
+        let n: usize = out.iter().map(RoadFrame::len).sum();
+        self.counters.len_txs.fetch_sub(n as u64, Ordering::AcqRel);
+        self.counters.taken.fetch_add(out.len() as u64, Ordering::Relaxed);
+        let mut evicted = Vec::new();
+        {
+            let mut taken = self.taken.lock();
+            for frame in &out {
+                if let Some(ptr) = frame.first_ptr() {
+                    taken.by_ptr.insert(ptr, frame.id);
+                }
+                taken.order.push_back(frame.id);
+                taken.by_id.insert(frame.id, frame.clone());
+            }
+            while taken.by_id.len() > ROAD_TAKEN_MAX {
+                let Some(id) = taken.order.pop_front() else { break };
+                if let Some(frame) = taken.remove(&id) {
+                    evicted.push(frame);
+                }
+            }
+            if taken.order.len() > 2 * taken.by_id.len() + 1024 {
+                let RoadTaken { by_id, order, .. } = &mut *taken;
+                order.retain(|id| by_id.contains_key(id));
+            }
+        }
+        drop(evicted);
+        out
+    }
+
+    /// Splits a give-back into the taken frames it holds whole (each found
+    /// by its first transaction and followed by the rest of it, in order),
+    /// forgotten as taken, and the rest of the transactions in their order.
+    pub(crate) fn recognize(
+        &self,
+        given: Vec<Arc<ValidPoolTransaction<T>>>,
+    ) -> (Vec<RoadFrame<T>>, Vec<Arc<ValidPoolTransaction<T>>>) {
+        let mut taken = self.taken.lock();
+        if taken.by_id.is_empty() {
+            return (Vec::new(), given);
+        }
+        let mut whole = Vec::new();
+        let mut keep = vec![true; given.len()];
+        let mut i = 0;
+        while i < given.len() {
+            let ptr = Arc::as_ptr(&given[i]) as usize;
+            let found = taken.by_ptr.get(&ptr).copied().and_then(|id| {
+                let frame = taken.by_id.get(&id)?;
+                let n = frame.len();
+                let all = given
+                    .get(i..i + n)
+                    .is_some_and(|run| run.iter().zip(frame.txs.iter()).all(|(a, b)| Arc::ptr_eq(a, b)));
+                all.then_some((id, n))
+            });
+            match found {
+                Some((id, n)) => {
+                    if let Some(frame) = taken.remove(&id) {
+                        whole.push(frame);
+                    }
+                    keep[i..i + n].iter_mut().for_each(|k| *k = false);
+                    i += n;
+                }
+                None => i += 1,
+            }
+        }
+        drop(taken);
+        if whole.is_empty() {
+            return (whole, given);
+        }
+        let rest = given.into_iter().zip(keep).filter_map(|(t, k)| k.then_some(t)).collect();
+        (whole, rest)
+    }
+
+    /// Puts taken frames back on the FIFO, each at its admission place.
+    pub(crate) fn hand_back(&self, frames: Vec<RoadFrame<T>>) {
+        if frames.is_empty() {
+            return;
+        }
+        let n: usize = frames.iter().map(RoadFrame::len).sum();
+        let count = frames.len() as u64;
+        let mut fifo = self.fifo.lock();
+        for frame in frames {
+            let at = fifo.partition_point(|queued| queued.seq < frame.seq);
+            fifo.insert(at, frame);
+        }
+        self.counters.len_txs.fetch_add(n as u64, Ordering::AcqRel);
+        self.counters.handed_back.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Forgets the taken frames whose first member a canonical block mined
+    /// (`highest`: the block's highest nonce per sender): they are in the
+    /// chain and can never be handed back whole. Returns them, to be
+    /// dropped after the caller's locks.
+    pub(crate) fn retire(&self, highest: &AddressHashMap<u64>) -> Vec<RoadFrame<T>> {
+        let mut taken = self.taken.lock();
+        if taken.by_id.is_empty() {
+            return Vec::new();
+        }
+        let mined: Vec<B256> = taken
+            .by_id
+            .iter()
+            .filter(|(_, frame)| {
+                frame.members.first().is_some_and(|(sender, nonce)| highest.get(sender).is_some_and(|m| m >= nonce))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let out: Vec<RoadFrame<T>> = mined.iter().filter_map(|id| taken.remove(id)).collect();
+        self.counters.retired.fetch_add(out.len() as u64, Ordering::Relaxed);
+        out
+    }
+
+    /// A taken frame's transactions, by id.
+    pub(crate) fn taken_txs(&self, id: &B256) -> Option<FrameTxs<T>> {
+        self.taken.lock().by_id.get(id).map(|frame| Arc::clone(&frame.txs))
+    }
+
+    /// Whether any of `senders` is on the road.
+    pub(crate) fn any_on_road(&self, senders: &[Address]) -> bool {
+        if senders.is_empty() {
+            return false;
+        }
+        let shards = self.lock_senders(senders.iter());
+        senders.iter().any(|sender| shards.get(sender).is_some_and(|entry| entry.on_road))
     }
 
     pub(crate) fn mode(&self) -> RoadMode {
@@ -354,14 +648,32 @@ impl Road {
 
     /// Invalidates the road: every shard locked (ascending), the map
     /// cleared and the epoch raised, so every sender seeds again from the
-    /// lanes. Counted as a flush.
-    pub(crate) fn invalidate(&self) {
+    /// lanes; the queued frames are returned in order, for the caller to
+    /// put in the lanes (still counted as queued on the road: the caller
+    /// lowers the count with [`Self::sub_len`] once the lanes count them).
+    /// Counted as a flush.
+    pub(crate) fn invalidate(&self) -> Vec<RoadFrame<T>> {
         let mut shards = self.lock_shards(u64::MAX);
         for slot in shards.guards.iter_mut().flatten() {
             slot.clear();
         }
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.counters.flushes.fetch_add(1, Ordering::Relaxed);
+        let frames: Vec<RoadFrame<T>> = std::mem::take(&mut *self.fifo.lock()).into();
+        drop(shards);
+        frames
+    }
+
+    /// The FIFO's frames' ids in order (tests).
+    #[cfg(test)]
+    pub(crate) fn queued_ids(&self) -> Vec<B256> {
+        self.fifo.lock().iter().map(|frame| frame.id).collect()
+    }
+
+    /// How many taken frames the road remembers (tests).
+    #[cfg(test)]
+    pub(crate) fn taken_len(&self) -> usize {
+        self.taken.lock().by_id.len()
     }
 
     /// How many senders the road knows (tests).

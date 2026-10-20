@@ -89,6 +89,11 @@ struct Lane<T: PoolTransaction> {
     /// in this lane can execute until the missing nonce arrives. See
     /// [`Parked`].
     parked: Option<Parked>,
+    /// The road's epoch in which this sender joined the frame road
+    /// (`N42_FRAME_ROAD=1`, [`road`]), 0 if it never did: while it equals
+    /// the queue's [`Inner::road_epoch`], an entry of this lane is lane
+    /// debt and closes the road's gate.
+    road: u64,
 }
 
 /// A lane held out of the arrival order because a build found a hole below
@@ -1048,6 +1053,13 @@ impl<T: PoolTransaction> Drop for TimedInner<'_, T> {
         // concerned: it left `staged` and is on its way into the lanes.
         let queued = self.guard.len + self.guard.pending_drain.len();
         self.mirror.store(pack_depth(queued, self.guard.parked_len), Release);
+        // Road transactions a flush put in the lanes leave the road's count
+        // only now, after the mirror counts them: a gate reading the road's
+        // count before the mirror never misses them (`N42_FRAME_ROAD`).
+        if self.guard.road_unaccounted != 0 {
+            let moved = std::mem::take(&mut self.guard.road_unaccounted);
+            self.guard.road.sub_len(moved);
+        }
         let held = self.at.elapsed();
         let held_ns = held.as_nanos() as u64;
         let waited_ns = self.waited.as_nanos() as u64;
@@ -1220,7 +1232,34 @@ struct Inner<T: PoolTransaction> {
     pruning: Option<Arc<AddressHashMap<u64>>>,
     /// [`frames::FrameIndex::swept_at_take`] at the last build start.
     swept_reported: u64,
+    /// The frame road (`N42_FRAME_ROAD`), shared with [`TxQueue`].
+    road: Arc<road::Road<T>>,
+    /// The road's epoch while it runs as the road (`N42_FRAME_ROAD=1`), 0
+    /// otherwise: every road hook under this lock is off at 0. Raised only
+    /// under this lock ([`Inner::road_flush`]).
+    road_epoch: u64,
+    /// Road senders that may hold lane entries -- the lane debt of
+    /// invariant R1 -- kept loosely: a sender is added when an entry
+    /// reaches its lane by any door, and dropped by
+    /// [`Inner::road_gate_open`] once its lane is empty.
+    road_debt: AddressHashSet,
+    /// Road frames the last [`Inner::plan_frames`] took.
+    road_planned: usize,
+    /// Road transactions this hold moved into the lanes (a flush), lowered
+    /// from the road's count after the depth mirror counts them.
+    road_unaccounted: usize,
+    /// Since which build the road's gate has been shut with the debt not
+    /// shrinking, and the debt then ([`Inner::road_note_stuck`]).
+    road_stuck: Option<(u64, u64)>,
 }
+
+/// Road transactions a plan takes at which their taken-list entries are
+/// made on the planner's pool ([`Inner::plan_road`]).
+const ROAD_PARALLEL_CLONE: usize = 16_384;
+
+/// Builds the road's gate may stay shut with its debt not shrinking before
+/// the road is invalidated ([`Inner::road_note_stuck`]).
+const ROAD_STUCK_BUILDS: u64 = 8;
 
 /// A whole take handed off to an own block: the build counter of the build
 /// that took it, and the block's sealed hash once
@@ -1264,6 +1303,9 @@ struct Prepared<T: PoolTransaction> {
     /// The body the plan-ahead hook makes from it (`N42_PLAN_AHEAD_BODY`),
     /// `None` without a hook.
     body: Option<Arc<Mutex<BodySlot>>>,
+    /// The road's epoch when it holds road frames (`N42_FRAME_ROAD=1`), 0
+    /// when it holds none, `u64::MAX` when a top-up mixed two epochs.
+    road_epoch: u64,
 }
 
 impl<T: PoolTransaction> Prepared<T> {
@@ -1895,7 +1937,7 @@ pub struct TxQueue<T: PoolTransaction> {
     /// (`N42_PLAN_AHEAD_WAIT_MS`, [`AheadWait`]).
     ahead_wait: Arc<AheadWait>,
     /// The frame road (`N42_FRAME_ROAD`, [`road`]).
-    road: Arc<road::Road>,
+    road: Arc<road::Road<T>>,
 }
 
 /// `N42_PLAN_AHEAD_WAIT_MS`: the wait (0 = off; the environment's unless a
@@ -2147,6 +2189,13 @@ impl<T: PoolTransaction> TxQueue<T> {
 
     /// An empty queue taking `run` consecutive nonces per sender per turn.
     pub fn with_run_length(run: usize) -> Self {
+        // The plan snapshot plans from its own copy of the lanes and never
+        // takes from the road: with it on, the road only counts.
+        let road_mode = match road::road_mode_env() {
+            RoadMode::On if snapshot::queue_plan_snapshot() => RoadMode::Count,
+            mode => mode,
+        };
+        let road = Arc::new(road::Road::new(road_mode));
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 lanes: AddressHashMap::default(),
@@ -2178,6 +2227,12 @@ impl<T: PoolTransaction> TxQueue<T> {
                 lanes_gen: 0,
                 pruning: None,
                 swept_reported: 0,
+                road: Arc::clone(&road),
+                road_epoch: if road_mode == RoadMode::On { road.epoch() } else { 0 },
+                road_debt: AddressHashSet::default(),
+                road_planned: 0,
+                road_unaccounted: 0,
+                road_stuck: None,
             })),
             inbox: Arc::new(Mutex::new(Vec::new())),
             staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2199,7 +2254,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 wait_ms: std::sync::atomic::AtomicU64::new(plan_ahead_wait_ms()),
                 ..AheadWait::default()
             }),
-            road: Arc::new(road::Road::new(road::road_mode_env())),
+            road,
         }
     }
 
@@ -2208,6 +2263,10 @@ impl<T: PoolTransaction> TxQueue<T> {
     #[must_use]
     pub fn with_frame_road(self, mode: RoadMode) -> Self {
         self.road.set_mode(mode);
+        {
+            let mut inner = self.lock_inner_quiet();
+            inner.road_epoch = if mode == RoadMode::On { self.road.epoch() } else { 0 };
+        }
         self
     }
 
@@ -2457,10 +2516,20 @@ impl<T: PoolTransaction> TxQueue<T> {
             .map(|transaction| valid_for(transaction, now, TransactionOrigin::External))
             .collect();
         let txs = frame.as_ref().filter(|_| frame_arcs()).and_then(|frame| frame_txs_in_order(&frame.hashes, &staged));
-        if self.road.mode() != RoadMode::Off {
-            // Stage 0: decided and counted; the frame still goes the lanes'
-            // path below.
-            self.road_admit(frame.as_ref(), txs.as_ref(), &staged);
+        let mode = self.road.mode();
+        if mode != RoadMode::Off {
+            // `N42_FRAME_ROAD=count` decides and counts, and the frame still
+            // goes the lanes' path below; `=1` keeps an admitted frame out
+            // of the lanes: it waits on the road for a frame plan.
+            let consume = mode == RoadMode::On;
+            if self.road_admit(frame.as_ref(), txs.as_ref(), &staged, consume) && consume {
+                if let Some(index) = self.by_hash.as_ref() {
+                    for valid in &staged {
+                        index.insert(valid);
+                    }
+                }
+                return;
+            }
         }
         self.index_and_stage(staged);
         if let Some(frame) = frame {
@@ -2479,6 +2548,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         frame: Option<&NewFrame>,
         txs: Option<&FrameTxs<T>>,
         staged: &[Arc<ValidPoolTransaction<T>>],
+        consume: bool,
     ) -> bool {
         let Some(frame) = frame else {
             self.road_note_frameless(staged);
@@ -2492,10 +2562,21 @@ impl<T: PoolTransaction> TxQueue<T> {
                 txs.len() == frame.members.len()
                     && txs.iter().zip(&frame.members).all(|(t, (sender, nonce))| t.sender() == *sender && t.nonce() == *nonce)
             });
-        let mut outcome = self.road.admit(frame, matched, true, || {});
+        // Made before the shard locks; queued under them if admitted.
+        let mut queued = txs.filter(|_| consume && matched).map(|txs| road::RoadFrame::of(frame, Arc::clone(txs)));
+        let road = &self.road;
+        let mut outcome = road.admit(frame, matched, true, || {
+            if let Some(frame) = queued.take() {
+                road.queue_frame(frame);
+            }
+        });
         if let road::Admit::Seed(unknown) = &outcome {
             self.road_seed(unknown);
-            outcome = self.road.admit(frame, matched, false, || {});
+            outcome = road.admit(frame, matched, false, || {
+                if let Some(frame) = queued.take() {
+                    road.queue_frame(frame);
+                }
+            });
         }
         match outcome {
             road::Admit::Admitted => true,
@@ -2548,16 +2629,45 @@ impl<T: PoolTransaction> TxQueue<T> {
             let counters = &self.road.counters;
             counters.seed_holds.fetch_add(1, Ordering::Relaxed);
             let mut shards = self.road.lock_senders(unknown.iter().map(|(sender, _)| sender));
+            // With the road on, a joining sender's lane is marked: what it
+            // still holds is lane debt (the gate stays shut until a build
+            // has taken it), and anything that reaches it later is too. A
+            // sender the lanes never saw gets an empty lane, so the chain's
+            // watermark and a give-back have a lane to land in.
+            let epoch = inner.road_epoch;
+            let Inner { lanes, road_debt, .. } = &mut *inner;
             for (sender, nonce) in unknown {
                 if shards.get(sender).is_some() {
                     continue;
                 }
-                let next = match inner.lanes.get(sender) {
+                let next = match lanes.get_mut(sender) {
                     Some(lane) => match lane.by_nonce.last_key_value() {
-                        Some((last, _)) => last.saturating_add(1),
+                        Some((last, _)) => {
+                            let next = last.saturating_add(1);
+                            if epoch != 0 {
+                                lane.road = epoch;
+                                road_debt.insert(*sender);
+                            }
+                            next
+                        }
                         None => continue,
                     },
-                    None => *nonce,
+                    None => {
+                        if epoch != 0 {
+                            lanes.insert(
+                                *sender,
+                                Lane {
+                                    by_nonce: BTreeMap::new(),
+                                    queued: false,
+                                    mined: None,
+                                    chain_mined: None,
+                                    parked: None,
+                                    road: epoch,
+                                },
+                            );
+                        }
+                        *nonce
+                    }
                 };
                 shards.insert(*sender, road::RoadSender { next, ..road::RoadSender::default() });
                 counters.seeded.fetch_add(1, Ordering::Relaxed);
@@ -2566,9 +2676,11 @@ impl<T: PoolTransaction> TxQueue<T> {
         }
     }
 
-    /// Invalidates the road: every sender seeds again from the lanes.
+    /// Invalidates the road ([`Inner::road_flush`]): its queued frames go
+    /// to the lanes, and every sender seeds again from them.
     fn road_flush(&self) {
-        self.road.invalidate();
+        let mut inner = self.lock_inner_quiet();
+        inner.road_flush();
     }
 
     /// Whether frames are on their way into the index: noted in the frame
@@ -2590,6 +2702,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         // batch between the two.
         if self.frames_in_hand.load(Ordering::Acquire) != 0
             || self.frames_staged.load(Ordering::Acquire) != 0
+            || self.road.len_txs() != 0
         {
             return true;
         }
@@ -2660,6 +2773,12 @@ impl<T: PoolTransaction> TxQueue<T> {
                 if let Some(txs) = inner.frames.txs_of(id) {
                     return Some(txs);
                 }
+                // A frame a build took off the road is in no index.
+                if inner.road_epoch != 0
+                    && let Some(txs) = self.road.taken_txs(id)
+                {
+                    return Some(txs);
+                }
                 let members = inner.frames.members_of(id)?;
                 let mut out = Vec::with_capacity(members.len());
                 for (sender, nonce, hash) in members {
@@ -2719,6 +2838,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             + inner.pending_drain.len()
             + self.staged.load(Ordering::Acquire)
             + self.in_hand.load(Ordering::Acquire)
+            + self.road.len_txs()
     }
 
     /// How many of them a build could take now: what [`Self::len`] counts,
@@ -2747,14 +2867,15 @@ impl<T: PoolTransaction> TxQueue<T> {
             let inbox = inner.pending_drain.len()
                 + self.staged.load(Ordering::Acquire)
                 + self.in_hand.load(Ordering::Acquire);
-            return inner.usable_walked() + inbox;
+            // The road's frames are a frame plan away, as the inbox is.
+            return inner.usable_walked() + inbox + self.road.len_txs();
         }
         let mut inner = self.lock_inner_quiet();
         // What is in the inbox is a build away from the lanes -- the next
         // pull drains it -- so it counts, and counting it means draining
         // it. The drainer task normally leaves nothing to do here.
         self.drain_inbox(&mut inner);
-        inner.usable()
+        inner.usable() + self.road.len_txs()
     }
 
     /// The depth the ingest's gate is held against: everything queued, less
@@ -2787,8 +2908,11 @@ impl<T: PoolTransaction> TxQueue<T> {
         // each step adding to the next before taking from the last: read in
         // that order, the batch is in at least one of the readings.
         let in_hand = self.in_hand.load(Ordering::Acquire) as u64;
+        // The road's queued transactions before the mirror: a flush raises
+        // the mirror before it lowers the road's count (`TimedInner::drop`).
+        let road = self.road.len_txs() as u64;
         let (len, parked) = unpack_depth(self.depth.load(Ordering::Acquire));
-        usize::try_from((len + staged + in_hand).saturating_sub(parked)).unwrap_or(usize::MAX)
+        usize::try_from((len + staged + in_hand + road).saturating_sub(parked)).unwrap_or(usize::MAX)
     }
 
     /// [`Self::gate_len`] read under the lanes' lock, as it was before the
@@ -2799,7 +2923,8 @@ impl<T: PoolTransaction> TxQueue<T> {
         (inner.len
             + inner.pending_drain.len()
             + self.staged.load(Ordering::Acquire)
-            + self.in_hand.load(Ordering::Acquire))
+            + self.in_hand.load(Ordering::Acquire)
+            + self.road.len_txs())
         .saturating_sub(inner.parked_len)
     }
 
@@ -3044,6 +3169,10 @@ impl<T: PoolTransaction> TxQueue<T> {
         let highest = fold_highest(mined.iter().copied());
         times.senders = highest.len();
         times.fold_us = at.elapsed().as_micros() as u64;
+        // The road's taken frames this block carries are retired: off the
+        // lanes' lock, and dropped here (their transactions live on in the
+        // own block's hold).
+        drop(self.road.retire(&highest));
         let mut garbage = PruneGarbage::default();
         let at = std::time::Instant::now();
         if self.offlock() {
@@ -3218,6 +3347,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         let highest = fold_highest(run.iter().flat_map(|block| block.mined.iter().copied()));
         times.senders += highest.len();
         times.fold_us += at.elapsed().as_micros() as u64;
+        drop(self.road.retire(&highest));
         let mut garbage = PruneGarbage::default();
         let at = std::time::Instant::now();
         if self.offlock() {
@@ -4265,6 +4395,12 @@ impl<T: PoolTransaction> TxQueue<T> {
         let mut garbage = PruneGarbage::default();
         {
             let mut inner = self.lock_inner();
+            // A walk never takes the road's frames: they go to the lanes
+            // first, so a node building without frames is not starved by a
+            // road only a frame plan would take from.
+            if inner.road_epoch != 0 && self.road.len_txs() != 0 {
+                inner.road_flush();
+            }
             // A build that walks the lanes cannot use a frame plan: it goes
             // back before the walk, so the walk sees its transactions.
             if inner.prepared.is_some() {
@@ -4681,6 +4817,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         inner.last_build = Some((B256::ZERO, Vec::new()));
         let mut times = FrameSelectTimes::default();
         let (more, more_plan, gas_left) = inner.plan_frames(room, &mut times, mode);
+        let road_more = inner.road_planned;
         inner.settle();
         let taken = inner.last_build.take().map(|(_, taken)| taken).unwrap_or_default();
         inner.last_build = current;
@@ -4712,6 +4849,10 @@ impl<T: PoolTransaction> TxQueue<T> {
         prepared.plan.parts.extend(more_plan.parts);
         prepared.plan.skipped += more_plan.skipped;
         prepared.taken.extend(taken);
+        if road_more > 0 {
+            let epoch = self.road.epoch();
+            prepared.road_epoch = if prepared.road_epoch == 0 || prepared.road_epoch == epoch { epoch } else { u64::MAX };
+        }
         for (sender, nonce) in lowest {
             let entry = prepared.lowest.entry(sender).or_insert(nonce);
             *entry = (*entry).min(nonce);
@@ -4968,6 +5109,9 @@ impl<T: PoolTransaction> TxQueue<T> {
             made_at: std::time::Instant::now(),
             prep_us: at.elapsed().as_micros() as u64,
             body,
+            // A plan holding road frames is stored by the first hold
+            // (its taken list is not empty), never here.
+            road_epoch: 0,
         });
         drop(inner);
         garbage.free();
@@ -5155,6 +5299,11 @@ impl<T: PoolTransaction> Inner<T> {
         let mut segments: Vec<(FrameTxs<T>, usize)> = Vec::new();
         let mut plan = FramePlan::default();
         let mut gas_left = gas_limit;
+        // The road's frames first (`N42_FRAME_ROAD=1`), then the index's.
+        self.road_planned = 0;
+        if self.road_epoch != 0 {
+            self.plan_road(&mut gas_left, &mut segments, &mut plan);
+        }
         // The ids only: the per-position check below is at least as strict
         // as the index's whole-usable test (each position at its sender's
         // lane head, unparked, holding the frame's hash), so the frames past
@@ -5182,6 +5331,142 @@ impl<T: PoolTransaction> Inner<T> {
             self.plan_serial(&ids[from..], &mut gas_left, &mut segments, &mut plan, times, mode == SelectMode::PerTx);
         }
         (segments, plan, gas_left)
+    }
+
+    /// The road's part of a frame plan (`docs/FRAME_ROAD_DESIGN.md` 2,
+    /// "Build"): while the gate is open -- no road sender holds a lane
+    /// entry, so every predecessor of a road frame is in this build's
+    /// ancestors or earlier in its body (invariant R1) -- frames come off
+    /// the road's FIFO whole, in admission order, while each fits the gas,
+    /// with no check per transaction. Their transactions join the taken
+    /// list in plan order (the hand-off compares the body with it), and the
+    /// frames are remembered as taken by the road until the chain mines
+    /// them or a give-back hands them back.
+    fn plan_road(&mut self, gas_left: &mut u64, segments: &mut Vec<(FrameTxs<T>, usize)>, plan: &mut FramePlan) {
+        if self.road.len_txs() == 0 {
+            return;
+        }
+        if !self.road_gate_open() {
+            self.road_note_stuck();
+            return;
+        }
+        self.road_stuck = None;
+        let frames = self.road.take_upto(gas_left);
+        if frames.is_empty() {
+            return;
+        }
+        if let Some((_, list)) = self.last_build.as_mut() {
+            let total: usize = frames.iter().map(road::RoadFrame::len).sum();
+            list.reserve(total);
+            if total >= ROAD_PARALLEL_CLONE {
+                // One reference count a transaction, on allocations a build
+                // has not touched since the ingest: a cache miss each, so
+                // spread over the planner's pool rather than paid in line
+                // under the lock (a full block is ~200,000 of them).
+                use rayon::prelude::*;
+                let parts: Vec<Vec<Arc<ValidPoolTransaction<T>>>> =
+                    in_plan_pool(|| frames.par_iter().map(|frame| frame.txs.to_vec()).collect());
+                for part in parts {
+                    list.extend(part);
+                }
+            } else {
+                for frame in &frames {
+                    list.extend(frame.txs.iter().cloned());
+                }
+            }
+        }
+        self.road_planned = frames.len();
+        for frame in frames {
+            let n = frame.len();
+            plan.push_hashes(Arc::clone(&frame.hashes), n);
+            plan.frames.push(PlannedFrame { id: frame.id, len: n, taken: n });
+            segments.push((frame.txs, n));
+        }
+    }
+
+    /// The road's gate (invariant R1): open when no road sender of this
+    /// epoch holds a lane entry. The debt set is pruned of senders whose
+    /// lanes are empty, and the transactions still owed are counted for the
+    /// ingest's line. Costs a look-up per owing sender, none once the debt
+    /// is paid.
+    fn road_gate_open(&mut self) -> bool {
+        let epoch = self.road_epoch;
+        let Self { road_debt, lanes, road, .. } = self;
+        if road_debt.is_empty() {
+            return true;
+        }
+        let mut owed = 0usize;
+        road_debt.retain(|sender| {
+            lanes.get(sender).is_some_and(|lane| {
+                let owes = lane.road == epoch && !lane.by_nonce.is_empty();
+                if owes {
+                    owed += lane.by_nonce.len();
+                }
+                owes
+            })
+        });
+        road.counters.lane_debt.store(owed as u64, std::sync::atomic::Ordering::Relaxed);
+        road_debt.is_empty()
+    }
+
+    /// The gate found shut with road frames waiting: if the debt has not
+    /// shrunk over [`ROAD_STUCK_BUILDS`] builds, the road is invalidated.
+    /// A road sender's lane entry the frame planner can never take -- one
+    /// that reached the lane without a frame, or a frame's tail -- would
+    /// otherwise keep the gate shut for good, and with frames on the road
+    /// no build walks the lanes ([`TxQueue::frames_arriving`]).
+    fn road_note_stuck(&mut self) {
+        let owed = self.road.counters.lane_debt.load(std::sync::atomic::Ordering::Relaxed);
+        match self.road_stuck {
+            Some((since, last)) if owed >= last => {
+                if self.builds.saturating_sub(since) >= ROAD_STUCK_BUILDS {
+                    self.road_stuck = None;
+                    self.road_flush();
+                }
+            }
+            _ => self.road_stuck = Some((self.builds, owed)),
+        }
+    }
+
+    /// [`Self::road_gate_open`] without pruning the debt set, for a reader
+    /// of a shared borrow (a prepared plan's verdict).
+    fn road_debt_paid(&self) -> bool {
+        let epoch = self.road_epoch;
+        self.road_debt
+            .iter()
+            .all(|sender| self.lanes.get(sender).is_none_or(|lane| lane.road != epoch || lane.by_nonce.is_empty()))
+    }
+
+    /// Invalidates the road (`docs/FRAME_ROAD_DESIGN.md` 2, "Failure"): its
+    /// map is cleared and its epoch raised (every sender seeds again), and
+    /// its queued frames go into the lanes in admission order, each indexed
+    /// once its transactions are in. What a build took off the road before
+    /// this is handed back to the lanes, not the road, when it comes back
+    /// ([`Self::give_back`]).
+    ///
+    /// Needed whenever a road sender's transaction would reach the lanes
+    /// beside its queued road frames: the frame planner takes a lane's head
+    /// as the account's next nonce, so a later nonce in the lanes would be
+    /// planned ahead of the road frames below it, and the gate -- shut by
+    /// that very lane entry -- would never take them.
+    fn road_flush(&mut self) {
+        let road = Arc::clone(&self.road);
+        let frames = road.invalidate();
+        if self.road_epoch != 0 {
+            self.road_epoch = road.epoch();
+        }
+        self.road_debt.clear();
+        if frames.is_empty() {
+            return;
+        }
+        self.lanes_gen = self.lanes_gen.wrapping_add(1);
+        for frame in frames {
+            for (valid, (sender, nonce)) in frame.txs.iter().zip(frame.members.iter()) {
+                self.insert_keyed(*sender, *nonce, Arc::clone(valid));
+            }
+            self.road_unaccounted += frame.len();
+            self.frames.insert(frame.new_frame(), Some(Arc::clone(&frame.txs)));
+        }
     }
 
     /// The first part of [`Self::plan_frames`]: the frames the block's gas
@@ -5490,6 +5775,12 @@ impl<T: PoolTransaction> Inner<T> {
         if prepared.after != self.builds {
             return Err(AheadDiscard::OtherBuild);
         }
+        // Road frames planned ahead stand on the gate as it was then: since,
+        // a road sender may have had an entry given back to its lane (below
+        // the road frames' nonces), or the road was invalidated.
+        if prepared.road_epoch != 0 && (prepared.road_epoch != self.road_epoch || !self.road_debt_paid()) {
+            return Err(AheadDiscard::Below);
+        }
         if self.handed != Some(Handed { build: self.builds, block: Some(parent) }) {
             return Err(AheadDiscard::NotOnItsParent);
         }
@@ -5574,6 +5865,7 @@ impl<T: PoolTransaction> Inner<T> {
             *body_job = Some((segments.clone(), plan.clone(), Arc::clone(&slot)));
             slot
         });
+        let road_epoch = if inner.road_planned > 0 { inner.road_epoch } else { 0 };
         inner.prepared = Some(Prepared {
             after,
             gas_used: gas_limit.saturating_sub(gas_left),
@@ -5585,6 +5877,7 @@ impl<T: PoolTransaction> Inner<T> {
             made_at: std::time::Instant::now(),
             prep_us: at.elapsed().as_micros() as u64,
             body,
+            road_epoch,
         });
         true
     }
@@ -5760,6 +6053,7 @@ impl<T: PoolTransaction> Inner<T> {
                 mined: None,
                 chain_mined: None,
                 parked: None,
+                road: 0,
             });
             let mut first_in: Option<u32> = None;
             for &pos in &meta.pos[start..end] {
@@ -5787,6 +6081,9 @@ impl<T: PoolTransaction> Inner<T> {
                         }
                     }
                 }
+            }
+            if first_in.is_some() && lane.road != 0 && lane.road == self.road_epoch {
+                self.road_debt.insert(sender);
             }
             if let Some(first) = first_in.filter(|_| !lane.queued) {
                 lane.queued = true;
@@ -5820,7 +6117,7 @@ impl<T: PoolTransaction> Inner<T> {
         let lane = self
             .lanes
             .entry(sender)
-            .or_insert_with(|| Lane { by_nonce: BTreeMap::new(), queued: false, mined: None, chain_mined: None, parked: None });
+            .or_insert_with(|| Lane { by_nonce: BTreeMap::new(), queued: false, mined: None, chain_mined: None, parked: None, road: 0 });
         if lane.by_nonce.contains_key(&nonce) {
             self.dropped(Dropped::Duplicate, sender, nonce);
             return;
@@ -5837,6 +6134,10 @@ impl<T: PoolTransaction> Inner<T> {
         let parked = lane.parked.is_some();
         lane.by_nonce.insert(nonce, valid);
         self.len += 1;
+        // A road sender's lane is lane debt (`N42_FRAME_ROAD`).
+        if lane.road != 0 && lane.road == self.road_epoch {
+            self.road_debt.insert(sender);
+        }
         // A lane still parked stays out of the order whatever arrives: the
         // flood keeps feeding a gapped sender its *later* nonces, and
         // putting the lane back for each of them would undo the park a few
@@ -5869,6 +6170,60 @@ impl<T: PoolTransaction> Inner<T> {
     /// height the chain settled elsewhere comes back -- and nothing would
     /// remove it a second time.
     fn give_back(&mut self, taken: Vec<Arc<ValidPoolTransaction<T>>>) -> GaveBack {
+        if self.road_epoch == 0 {
+            return self.give_back_lanes(taken);
+        }
+        self.give_back_road(taken)
+    }
+
+    /// [`Self::give_back`] with the road on (`docs/FRAME_ROAD_DESIGN.md` 2,
+    /// "Hand-back"): a road frame given back whole and unmined goes back to
+    /// the road's FIFO at its admission place (its senders' `next` already
+    /// counts it); one taken before the road's last invalidation goes to the
+    /// lanes and is indexed there. Everything else takes the lanes' door;
+    /// if a sender on the road is among it -- a road frame given back in
+    /// part, or a lanes entry of a road sender -- the road is invalidated
+    /// after ([`Self::road_flush`]).
+    fn give_back_road(&mut self, taken: Vec<Arc<ValidPoolTransaction<T>>>) -> GaveBack {
+        let road = Arc::clone(&self.road);
+        let epoch = self.road_epoch;
+        let (whole, mut rest) = road.recognize(taken);
+        let mut gave = GaveBack::default();
+        let mut back = Vec::new();
+        let mut revive = Vec::new();
+        for frame in whole {
+            let mined = frame.members.iter().any(|(sender, nonce)| self.lanes.get(sender).is_some_and(|lane| lane.is_stale(*nonce)));
+            if mined {
+                rest.extend(frame.txs.iter().cloned());
+            } else if frame.epoch == epoch {
+                gave.offered += frame.len();
+                back.push(frame);
+            } else {
+                revive.push(frame);
+            }
+        }
+        let senders: Vec<Address> = rest.iter().map(|t| t.sender()).collect();
+        let flush = road.any_on_road(&senders);
+        for frame in &revive {
+            rest.extend(frame.txs.iter().cloned());
+        }
+        if !rest.is_empty() {
+            let lanes = self.give_back_lanes(rest);
+            gave.offered += lanes.offered;
+            gave.filtered += lanes.filtered;
+        }
+        for frame in revive {
+            self.frames.insert(frame.new_frame(), Some(Arc::clone(&frame.txs)));
+        }
+        road.hand_back(back);
+        if flush {
+            self.road_flush();
+        }
+        gave
+    }
+
+    /// [`Self::give_back`] by the lanes' door.
+    fn give_back_lanes(&mut self, taken: Vec<Arc<ValidPoolTransaction<T>>>) -> GaveBack {
         let revive = self.frames.retired_len() > 0;
         let mut senders: Vec<Address> = Vec::new();
         let mut unparked: Vec<Address> = Vec::new();
@@ -5904,6 +6259,10 @@ impl<T: PoolTransaction> Inner<T> {
             let fresh = lane.by_nonce.insert(nonce, valid).is_none();
             if fresh {
                 self.len += 1;
+            }
+            // A road sender's lane is lane debt again (`N42_FRAME_ROAD`).
+            if lane.road != 0 && lane.road == self.road_epoch {
+                self.road_debt.insert(sender);
             }
             let parked = lane.parked.is_some();
             // As in `insert_keyed`: a parked lane comes back through
@@ -6094,6 +6453,7 @@ impl<T: PoolTransaction> Inner<T> {
                 mined: None,
                 chain_mined: None,
                 parked: None,
+                road: 0,
             });
         }
     }

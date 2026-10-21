@@ -62,7 +62,13 @@ theirs_request() { local f v older=${1:-9999999999} waited=${2:-0} now; now=$(da
 REQ=/data/blockchain/.box-request-rust; REQ2=/data/blockchain/wr-logs/.box-request-rust
 # our own request, written when the stage queues (box-gate.sh FIFO, 2026-10-21): a fresh one keeps its place in the queue
 if [ "${LOOP351_DRY:-0}" != 1 ]; then r0=$(tr -dc '0-9' < $REQ2 2>/dev/null | cut -c1-10); if [ -z "$r0" ] || [ $(( $(date -u +%s) - r0 )) -gt 10800 ]; then r0=$(date -u +%s); fi; echo "$r0" > $REQ; echo "$r0" > $REQ2; MYREQ=$r0; fi
-quiet() { local n=0; while [ $n -lt 3 ]; do [ -z "$(theirs_claim)" ] || return 1; good || return 1; theirs_request ${MYREQ:-9999999999} > /dev/null && return 1; n=$((n+1)); [ $n -lt 3 ] && sleep 30; done; return 0; }
+# box-gate rule 4: an older request whose owner leaves the box idle (load1 < 8) and unclaimed for 20 minutes lapses.
+# IDLE_SINCE is this runner's own clock of that, kept across quiet() calls; any live foreign claim or load resets it.
+idle_clock() { if [ -z "$(theirs_claim)" ] && [ "$(awk '{printf "%d", $1}' /proc/loadavg)" -lt 8 ]; then : "${IDLE_SINCE:=$(date -u +%s)}"; else IDLE_SINCE=""; fi; }
+request_blocks() { local r; r=$(theirs_request ${MYREQ:-9999999999}) || return 1; idle_clock
+  if [ -n "$IDLE_SINCE" ] && [ $(( $(date -u +%s) - IDLE_SINCE )) -ge 1200 ]; then [ "$r" = "${LAPSED_SAID:-}" ] || { echo "request $r lapsed: box idle and unclaimed for 20 minutes ($(date +%H:%M))"; LAPSED_SAID=$r; }; return 1; fi
+  return 0; }
+quiet() { local n=0; while [ $n -lt 3 ]; do idle_clock; [ -z "$(theirs_claim)" ] || return 1; good || return 1; request_blocks && return 1; n=$((n+1)); [ $n -lt 3 ] && sleep 30; done; return 0; }
 mkdir -p /data/blockchain/wr-logs
 echo "waiting for a quiet box from $(date +%H:%M)"
 while true; do

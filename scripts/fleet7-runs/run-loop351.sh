@@ -18,7 +18,7 @@ CLAIM=/data/blockchain/.box-claim-rust; CLAIM2=/data/blockchain/wr-logs/.box-cla
 cleanup() {
   # a dry run (LOOP351_DRY=1) owns no fleet: on 2026-10-08 a dry run of stage c, exited while stage a held the box, killed the running leg (S13P50) through this trap
   [ "${LOOP351_DRY:-0}" = 1 ] && return 0
-  rm -f $CLAIM $CLAIM2
+  rm -f $CLAIM $CLAIM2 ${REQ:-} ${REQ2:-}
   # The fleet this runner started goes with it. Killing the runner alone left
   # seven nodes and seven validators running for four and a half hours on
   # 2026-09-19: they held the box against this runner's own quiet check and
@@ -55,10 +55,14 @@ good() { local cpus; cpus=$(nproc)
     && [ "$(awk '{printf "%d", $1}' /proc/loadavg)" -lt $(( cpus / 4 )) ]; }
 theirs_claim() { local f n=""; for f in /data/blockchain/.box-claim-* /data/blockchain/wr-logs/.box-claim-*; do [ -e "$f" ] || continue; case "$f" in *box-claim-rust) continue;; esac; v=$(tr -c '0-9\n' ' ' < "$f" | tr -s ' ' '\n' | grep -E '^[0-9]+$' | sort -n | tail -1); [ -z "$v" ] && v=9999999999; [ "$v" != 9999999999 ] && [ $(( $(date -u +%s) - v )) -gt 5400 ] && { echo "ignoring a claim older than 90 minutes: $f ($v)" >&2; continue; }; n="$n $v"; done; echo $n | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n | tail -1; }
 # another driver's request for the box (BOX-CLAIM-PROTOCOL, 2026-10-21): a file /data/blockchain/wr-logs/.box-request-<them>
-# holding epoch seconds. The runner starts no leg while one younger than three hours exists, and a running stage
-# skips its remaining legs at the next leg boundary and releases, so the box changes hands without a signal or a wait.
-theirs_request() { local f v; for f in /data/blockchain/wr-logs/.box-request-*; do [ -e "$f" ] || continue; case "$f" in *box-request-rust) continue;; esac; v=$(tr -c '0-9\n' ' ' < "$f" | tr -s ' ' '\n' | grep -E '^[0-9]+$' | tail -1); [ -n "$v" ] && [ $(( $(date -u +%s) - v )) -gt 10800 ] && continue; echo "$f"; return 0; done; return 1; }
-quiet() { local n=0; while [ $n -lt 3 ]; do [ -z "$(theirs_claim)" ] || return 1; good || return 1; theirs_request > /dev/null && return 1; n=$((n+1)); [ $n -lt 3 ] && sleep 30; done; return 0; }
+# holding epoch seconds, FIFO with /data/blockchain/gov5-work/box-gate.sh. The runner writes its own request when the stage
+# queues and drops it at its claim, starts only when no request older than its own is waiting, and a running stage skips its
+# remaining legs at the next leg boundary once a foreign request has waited 20 minutes (a complete stage is ~35 minutes).
+theirs_request() { local f v older=${1:-9999999999} waited=${2:-0} now; now=$(date -u +%s); for f in /data/blockchain/wr-logs/.box-request-*; do [ -e "$f" ] || continue; case "$f" in *box-request-rust) continue;; esac; v=$(tr -c '0-9\n' ' ' < "$f" | tr -s ' ' '\n' | grep -E '^[0-9]+$' | head -1); [ -n "$v" ] || v=0; [ $(( now - v )) -gt 10800 ] && continue; [ "$v" -lt "$older" ] || continue; [ $(( now - v )) -ge "$waited" ] || continue; echo "$f"; return 0; done; return 1; }
+REQ=/data/blockchain/.box-request-rust; REQ2=/data/blockchain/wr-logs/.box-request-rust
+# our own request, written when the stage queues (box-gate.sh FIFO, 2026-10-21): a fresh one keeps its place in the queue
+if [ "${LOOP351_DRY:-0}" != 1 ]; then r0=$(tr -dc '0-9' < $REQ2 2>/dev/null | cut -c1-10); if [ -z "$r0" ] || [ $(( $(date -u +%s) - r0 )) -gt 10800 ]; then r0=$(date -u +%s); fi; echo "$r0" > $REQ; echo "$r0" > $REQ2; MYREQ=$r0; fi
+quiet() { local n=0; while [ $n -lt 3 ]; do [ -z "$(theirs_claim)" ] || return 1; good || return 1; theirs_request ${MYREQ:-9999999999} > /dev/null && return 1; n=$((n+1)); [ $n -lt 3 ] && sleep 30; done; return 0; }
 mkdir -p /data/blockchain/wr-logs
 echo "waiting for a quiet box from $(date +%H:%M)"
 while true; do
@@ -70,6 +74,7 @@ while true; do
   if good && { [ -z "$theirs" ] || [ "$theirs" -gt "$mine" ]; }; then break; fi
   rm -f $CLAIM $CLAIM2; echo "stood down at $(date +%H:%M): another claim or the box got busy"; sleep 60
 done
+rm -f $REQ $REQ2
 echo "claimed at $(date +%H:%M) ($mine): avail $(free -g | awk '/Mem:/{print $7}')G load $(awk '{print $1}' /proc/loadavg)"
 CLAIMED_AT=$(date -u +%s)
 # A binary older than this runner's build is fine when cargo had nothing to relink (loop351: the same commit as the
@@ -218,7 +223,7 @@ fvgate() {
 
 leg() {
   if [ "${LOOP351_DRY:-0}" != 1 ] && [ $(( $(date -u +%s) - CLAIMED_AT )) -gt 4500 ]; then echo "leg loop351$1 skipped: 75 minutes of the claim used"; return; fi
-  if [ "${LOOP351_DRY:-0}" != 1 ] && r=$(theirs_request); then echo "leg loop351$1 skipped: $r requests the box (yielding at the leg boundary)"; return; fi
+  if [ "${LOOP351_DRY:-0}" != 1 ] && r=$(theirs_request 9999999999 1200); then echo "leg loop351$1 skipped: $r requests the box (yielding at the leg boundary)"; return; fi
   local tag=$1; shift
   printf '%q ' "$@" > $S/args-loop351$tag.txt
   eval "LA_${tag}=(\"\$@\")"

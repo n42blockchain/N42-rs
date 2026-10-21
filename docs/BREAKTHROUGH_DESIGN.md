@@ -4172,3 +4172,34 @@ outputs stays bounded (`sharded_outputs=` at most 61 on node 0).
 - The last 0.7 ms to the 40 ms that 5M needs lives in that long-gap tail (gaps >= 45 ms, 30% of blocks,
   about 7 ms each over the 32 ms floor).
 - Next: break down what the builder waits for on those blocks (state_wait, parent output, plan) under X19.
+
+## 10.195 -- the long-gap tail and the allocator: a 30 s decay reads 4.999M/s (stage dy, 2026-10-21)
+
+**The tail under X19, from XA1's build lines** (blocks behind gaps of 45 ms or more, against those behind
+gaps under 34 ms):
+- sealed_at is 52.9 vs 30.6 ms, and par_exec is 28.9 vs 18.5 ms.
+- The batches' summed CPU is 1.19 vs 0.77 s for the same 200k transfers. Every batch is slower (median
+  and max), and their starts are more skewed. No single straggler explains it.
+- Builds whose execution window overlaps a queue prune event (30% of builds) run par_exec 23.6 vs 20.8 ms.
+  That is about 0.85 ms a block on the mean, the size of the remaining distance to 40 ms.
+- Hypothesis: the pruner's mass frees are purged by jemalloc (dirty_decay_ms 2000), and the madvise
+  shootdowns land on the batch threads.
+
+Stage dy tests the decay on X19 (`MALLOC_CONF` per leg; the env check confirms each leg's value).
+
+| leg | allocator | drain M/s | mean gap ms | gaps >= 100 ms | batch minflt (fast blocks) | min avail GB |
+| --- | --- | --- | --- | --- | --- | --- |
+| YAa | X19 (decay 2 s) | 4.812 | 41.6 | - | 2517 | 81.3 |
+| YAb | X19 (decay 2 s) | 4.912 | 40.7 | - | 2425 | 80.6 |
+| YA1 | no purge (-1/-1) | 4.844 | 41.3 | - | 17 | 52.7 |
+| YA1b | no purge (-1/-1) | 4.197 | 44.6 | 51 | 25 | 37.1 |
+| YA2 | dirty decay 30 s, muzzy 0 | **4.999** | **40.0** | 9 | 267 | 69.1 |
+
+- **No purge removes the faults, but not the slowness.** The slow-block share stays at 13-19% and
+  par_exec moves 21.1 -> 20.5. The heap grows instead (EL peak 78-84 GB, min available down to 37 GB), and
+  YA1b stalls (51 gaps of 100 ms or more). The fault-zeroing part of the hypothesis is at most a small
+  effect. Unbounded retention is out.
+- **The 30 s decay is the first leg at the 5M mark:** 4.999M/s, mean gap 40.0. It has fewer long gaps (580
+  vs 673-709) and a median take_sealed of 4.4 vs 6.2. It is one leg, and it clears 1.5% over YAb by 0.013M.
+  Not adopted until a pair confirms it.
+- **Next: stage dz.** A confirmation pair of dirty_decay_ms:30000 against X19, plus one leg at 10 s.

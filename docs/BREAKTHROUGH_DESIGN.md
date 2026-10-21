@@ -4249,12 +4249,16 @@ JF1b did not run. A Gov5 request had waited 20 minutes, so the runner yielded at
   - state_ready falls 5 ms, and the leader's state_wait falls 5 -> 3 ms.
 - **The drain rate does not move.** 4.890 sits between the two controls (+0.45% / -0.6%). That is one leg,
   so it is short of the two-pair rule, and it is not adopted.
-- **The builder is not what sets the gap.** sealed_at moves only 1 ms. chain_wait is 30 ms at the median
-  on every leg: the next build is ready and waits for the 30 ms pacing and its parent. Shortening
-  execution therefore does not move the block interval.
-  - The X19 mean gap of 40.7-41.1 is set by the chain cycle: the vote/commit round trip and the root cycle
-    at depth 2. It is not set by the build.
+- **Correction (same day, from the build lines): the builder does set the gap.** The leader's builds form a
+  serial seal chain. Each one starts 1.7 ms after its parent's seal, so seal -> seal = 1.7 + sealed_at
+  (means 41.1 / 40.9 / 40.6 against a sealed_at of 39.3 / 39.1 / 38.9). chain_wait is a different wait.
+  - On JF1 the filter's -2.4 ms of par_exec went to par_start (3.2 / 4.5 -> 5.8 ms; start_handoff
+    1.7 / 2.5 -> 3.3) and par_fold (+0.9). Execution-to-seal fell 28.6 / 27.1 -> 26.2 ms.
+  - The filter is built inside the view advance, on the seal-to-view path (seal_to_view +1.4 ms). Its
+    cost may be what moved into the next build's start. The controls' par_start spread (3.2-4.5) is as
+    wide as the move, so this one leg does not decide it.
 - JF1's EL peak is 70 GB, against 43-56 GB on the controls. The filters are about 64 journals of up to
   ~400k keys. Memory is not short, but the extra memory is a cost.
-- **Next:** decompose the 40.7 ms gap from the consensus side. Measure where a block waits between its
-  seal and the next proposal (take_sealed, vote round trip, commit), and stop cutting the builder.
+- **Next: stage eb.** Pair X19 against `N42_VIEW_JOURNAL_FILTER_ASYNC=1` (3fe80fd2b: the advance
+  publishes the journal unfiltered, and a background thread files the filter), plus JF2, the sync filter's
+  second leg.

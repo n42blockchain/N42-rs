@@ -5009,3 +5009,27 @@ Stage dy tests the decay on X19 (`MALLOC_CONF` per leg; the env check confirms e
   vs 673-709) and a median take_sealed of 4.4 vs 6.2. It is one leg, and it clears 1.5% over YAb by 0.013M.
   Not adopted until a pair confirms it.
 - **Next: stage dz.** A confirmation pair of dirty_decay_ms:30000 against X19, plus one leg at 10 s.
+
+## 10.196 -- the 30 s allocator decay does not confirm (stage dz, 2026-10-21)
+
+Stage dz is the confirmation pair for 10.195's one leg at 4.999M/s, run in the order a, 1, b, 1b, 2.
+
+| leg | allocator | drain M/s | mean gap ms | median gap ms | EL peak GB | min avail GB |
+| --- | --- | --- | --- | --- | --- | --- |
+| ZDa | X19 (decay 2 s) | 4.645 | 43.1 | 41.5 | 55.2 | 74.3 |
+| ZDb | X19 (decay 2 s) | 4.813 | 41.5 | 40.9 | 55.7 | 68.8 |
+| ZD1 | dirty decay 30 s, muzzy 0 | 4.720 | 42.4 | 40.4 | 55.8 | 75.7 |
+| ZD1b | dirty decay 30 s, muzzy 0 | 4.853 | 41.2 | 38.8 | 58.7 | 75.4 |
+| ZD2 | dirty decay 10 s, muzzy 0 | 4.781 | 41.8 | 39.7 | 54.4 | 75.3 |
+
+All legs pass the body and depth-2 gates, with no engine idles over 5 s.
+
+- **The two-pair rule fails.** ZD1 is below ZDb. Pooled over dy and dz, the 30 s decay reads
+  4.720-4.999 (mean 4.857) against X19's four controls 4.645-4.912 (mean 4.796), +1.3%. That is inside
+  the spread of a single configuration. The 10 s decay sits in the same band.
+- **YA2's 4.999 was the upper tail.** The decay is not adopted, and X19 stays as it is.
+- X19's controls since adoption read 4.645-4.916 over eight legs. The 5M mark (a 40 ms mean gap) has been
+  reached once, on one leg.
+- The remaining distance is the long-gap tail (10.195): slow batches on about 30% of blocks. The allocator
+  is not their cause. The open lever from 10.194 is the view-journal reads (about +2 ms of par_exec on
+  two thirds of builds).

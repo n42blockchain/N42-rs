@@ -4953,3 +4953,28 @@ outputs stays bounded (`sharded_outputs=` at most 61 on node 0).
 - The gap is now 40.5-41.2 ms against the 40 ms that 5M needs. The remaining distance is about 1-3%.
 - Next: port perf/merge-elide to main, then confirm X19 with X19-only pairs. The open question is whether
   depth 3 + road adds anything on top of X19 (EW1/EW1b vs EW2 is within noise).
+
+## 10.194 -- X19 confirmed on its own; road + cuts on depth 2 loses (stage dx, 2026-10-21)
+
+| leg | config | drain M/s | mean gap ms | state_ready ms | sealed_at ms |
+| --- | --- | --- | --- | --- | --- |
+| XAa | X18 | 4.596 | 43.5 | 124 | 37 |
+| XAb | X18 | 4.707 | 42.5 | 127 | 37 |
+| XA1 | X19 | 4.916 | 40.7 | 65 | 36 |
+| XA1b | X19 | 4.895 | 40.9 | 67 | 36 |
+| XA2 | X19 + road + cuts (depth 2) | 4.215 | 47.5 | 81 | 36 |
+
+- **X19 is confirmed.** Both X19 legs are at least 1.5% above both controls (4.707 x 1.015 = 4.778).
+- **Three pure-X19 legs now read 4.895-4.925** (EW2, XA1, XA1b), against eleven X18 controls at
+  4.59-4.84. Of all the controls across rounds, XAa is again just under the band floor.
+- Gates are clean. The controls' tc=7 are the view-1 start-up TCs, which are not gated.
+- **XA2 (road + cuts on depth 2 + elision) is a single bad leg at 4.215.** It joins the dq/dr pattern: the
+  road stack without depth 3 never beat X18. It is parked and will not be pursued.
+- **Gap anatomy (propwin, XA1 vs XAb):**
+  - Mean gap: 40.7 vs 42.6.
+  - The gaps under 45 ms are unchanged.
+  - The gaps of 45 ms or more are fewer (634 vs 698) and shorter.
+  - Still 96% tick-bound. On the long gaps, take_sealed is 22.6 ms: the tick waits for the sealed block.
+- The last 0.7 ms to the 40 ms that 5M needs lives in that long-gap tail (gaps >= 45 ms, 30% of blocks,
+  about 7 ms each over the 32 ms floor).
+- Next: break down what the builder waits for on those blocks (state_wait, parent output, plan) under X19.

@@ -4262,3 +4262,33 @@ JF1b did not run. A Gov5 request had waited 20 minutes, so the runner yielded at
 - **Next: stage eb.** Pair X19 against `N42_VIEW_JOURNAL_FILTER_ASYNC=1` (3fe80fd2b: the advance
   publishes the journal unfiltered, and a background thread files the filter), plus JF2, the sync filter's
   second leg.
+
+## 10.198 -- a faster build waits for the queue: the journal filter's saving moves into par_start (stage eb, 2026-10-21)
+
+Stage eb pairs X19 against `N42_VIEW_JOURNAL_FILTER_ASYNC=1` (3fe80fd2b). JA1b and JF2 did not run: a Gov5
+request had waited 20 minutes, so the runner yielded at the leg boundary.
+
+| leg | config | drain M/s | seal -> seal mean | sealed_at mean | par_start | par_exec | start_handoff | start_frames_skipped | start_frames_index |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| JAa | X19 | 4.825 | 41.4 | 39.5 | 4.5 | 21.1 | 2.6 | 0 | 4,404 |
+| JA1 | X19 + async filter | 4.709 | 42.4 | 40.5 | **10.5** | **17.8** | 4.7 | **638** | 2,329 |
+| JAb | X19 | 4.865 | 41.1 | 39.3 | 5.4 | 20.9 | 3.0 | 0 | 4,072 |
+
+(Times in ms. The last four columns are build-line means.)
+
+- **The filter shortens execution on both variants.** par_exec drops 3.1 ms here (2.4 ms on JF1). Filing
+  the filter off the advance keeps the view path clean (seal_to_view 10.4 vs 10.9-11.2 ms).
+- **Each millisecond saved reappears at the next build's start.** Of JA1's +5.5 ms par_start:
+  - start_handoff (the wait for the parent's queue hand-off) is +2 ms.
+  - start_best_other and the frame walk are +3.5 ms. The selector meets **638 frames it has to skip**,
+    against 0 on every control, and the frame index is half as full (2,329 vs 4,072-4,404).
+  - In short, a build that reaches the queue earlier finds the parent's hand-off unfinished and its frames
+    not yet swept.
+  - JF1 (10.197) showed the same signature in smaller size.
+- **The serial seal chain is gated by the transaction queue's hand-off, not by execution.** Execution has
+  about 3 ms of slack before the queue binds. That is why every builder cut since X17 (10.165-10.168,
+  10.183, 10.197) measured exact and moved nothing.
+- **Neither filter variant is adopted.** The async switch stays in the tree, off by default.
+- **Next: the queue hand-off.** The work is to make the parent's hand-off and frame sweep finish before the
+  child's selector arrives (handoff_hold 0.65-1.1 ms, start_handoff 2.6-4.7 ms), or to let the selector
+  take frames without waiting for the sweep. With that floor lowered, the filter's 3 ms becomes reachable.

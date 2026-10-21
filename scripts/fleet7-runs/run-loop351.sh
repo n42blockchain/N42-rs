@@ -54,7 +54,11 @@ good() { local cpus; cpus=$(nproc)
     && [ "$(free -g | awk '/Mem:/{print $7}')" -ge 80 ] \
     && [ "$(awk '{printf "%d", $1}' /proc/loadavg)" -lt $(( cpus / 4 )) ]; }
 theirs_claim() { local f n=""; for f in /data/blockchain/.box-claim-* /data/blockchain/wr-logs/.box-claim-*; do [ -e "$f" ] || continue; case "$f" in *box-claim-rust) continue;; esac; v=$(tr -c '0-9\n' ' ' < "$f" | tr -s ' ' '\n' | grep -E '^[0-9]+$' | sort -n | tail -1); [ -z "$v" ] && v=9999999999; [ "$v" != 9999999999 ] && [ $(( $(date -u +%s) - v )) -gt 5400 ] && { echo "ignoring a claim older than 90 minutes: $f ($v)" >&2; continue; }; n="$n $v"; done; echo $n | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n | tail -1; }
-quiet() { local n=0; while [ $n -lt 3 ]; do [ -z "$(theirs_claim)" ] || return 1; good || return 1; n=$((n+1)); [ $n -lt 3 ] && sleep 30; done; return 0; }
+# another driver's request for the box (BOX-CLAIM-PROTOCOL, 2026-10-21): a file /data/blockchain/wr-logs/.box-request-<them>
+# holding epoch seconds. The runner starts no leg while one younger than three hours exists, and a running stage
+# skips its remaining legs at the next leg boundary and releases, so the box changes hands without a signal or a wait.
+theirs_request() { local f v; for f in /data/blockchain/wr-logs/.box-request-*; do [ -e "$f" ] || continue; case "$f" in *box-request-rust) continue;; esac; v=$(tr -c '0-9\n' ' ' < "$f" | tr -s ' ' '\n' | grep -E '^[0-9]+$' | tail -1); [ -n "$v" ] && [ $(( $(date -u +%s) - v )) -gt 10800 ] && continue; echo "$f"; return 0; done; return 1; }
+quiet() { local n=0; while [ $n -lt 3 ]; do [ -z "$(theirs_claim)" ] || return 1; good || return 1; theirs_request > /dev/null && return 1; n=$((n+1)); [ $n -lt 3 ] && sleep 30; done; return 0; }
 mkdir -p /data/blockchain/wr-logs
 echo "waiting for a quiet box from $(date +%H:%M)"
 while true; do
@@ -214,6 +218,7 @@ fvgate() {
 
 leg() {
   if [ "${LOOP351_DRY:-0}" != 1 ] && [ $(( $(date -u +%s) - CLAIMED_AT )) -gt 4500 ]; then echo "leg loop351$1 skipped: 75 minutes of the claim used"; return; fi
+  if [ "${LOOP351_DRY:-0}" != 1 ] && r=$(theirs_request); then echo "leg loop351$1 skipped: $r requests the box (yielding at the leg boundary)"; return; fi
   local tag=$1; shift
   printf '%q ' "$@" > $S/args-loop351$tag.txt
   eval "LA_${tag}=(\"\$@\")"

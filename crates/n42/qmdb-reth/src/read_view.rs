@@ -72,23 +72,33 @@ type Journal = Arc<JournalData>;
 /// change skips the journal's binary search (~17 dependent probes of a
 /// ~9 MB vector at a full block: 200-300 ns a journal on the E=1 bench,
 /// `docs/SHARED_EXECUTION_SCOPE.md` 13). A filter has no false negatives:
-/// every answer is the one the search gives.
+/// every answer is the one the search gives. With
+/// `N42_VIEW_JOURNAL_FILTER_ASYNC=1` the filter is filed after the advance,
+/// on a thread of its own; until then a read searches the journal.
 #[derive(Debug)]
 struct JournalData {
     entries: Vec<(Hash, Option<u64>)>,
-    filter: Option<reth_provider::providers::overlay_filter::SplitBloom>,
+    filter: std::sync::OnceLock<reth_provider::providers::overlay_filter::SplitBloom>,
 }
 
 impl JournalData {
     fn new(entries: Vec<(Hash, Option<u64>)>, with_filter: bool) -> Self {
-        let filter = with_filter.then(|| {
-            let mut filter = reth_provider::providers::overlay_filter::SplitBloom::with_capacity(entries.len());
-            for (key, _) in &entries {
+        let data = Self { entries, filter: std::sync::OnceLock::new() };
+        if with_filter {
+            data.fill_filter();
+        }
+        data
+    }
+
+    /// Builds and files the journal's address filter (once).
+    fn fill_filter(&self) {
+        self.filter.get_or_init(|| {
+            let mut filter = reth_provider::providers::overlay_filter::SplitBloom::with_capacity(self.entries.len());
+            for (key, _) in &self.entries {
                 filter.insert(journal_key(key));
             }
             filter
         });
-        Self { entries, filter }
     }
 
     /// The offset `key` held before the block, if the block changed it.
@@ -113,10 +123,47 @@ fn journal_key(key: &Hash) -> reth_provider::providers::overlay_filter::FilterKe
 }
 
 /// Whether the view files a filter with each block's journal
-/// (`N42_VIEW_JOURNAL_FILTER=1`, off by default).
+/// (`N42_VIEW_JOURNAL_FILTER=1`, or `N42_VIEW_JOURNAL_FILTER_ASYNC=1`; off by default).
 pub fn journal_filter() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_VIEW_JOURNAL_FILTER").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| {
+        journal_filter_async() || std::env::var("N42_VIEW_JOURNAL_FILTER").is_ok_and(|v| v.trim() == "1")
+    })
+}
+
+/// Whether a journal's filter is built after the advance instead of inside
+/// it (`N42_VIEW_JOURNAL_FILTER_ASYNC=1`, off by default): the advance
+/// publishes the journal without one and a background thread files it, so
+/// the filter's ~200k inserts leave the seal-to-view path.
+pub fn journal_filter_async() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_VIEW_JOURNAL_FILTER_ASYNC").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Hands `journal` to the filter thread (started on first use); fills it
+/// inline if the thread cannot be started.
+fn fill_filter_later(journal: Journal) {
+    static FILLER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Journal>>> = std::sync::OnceLock::new();
+    let sender = FILLER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Journal>();
+        std::thread::Builder::new()
+            .name("n42-view-filter".into())
+            .spawn(move || {
+                for journal in rx {
+                    journal.fill_filter();
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    match sender {
+        Some(tx) => {
+            if let Err(std::sync::mpsc::SendError(journal)) = tx.send(journal) {
+                journal.fill_filter();
+            }
+        }
+        None => journal.fill_filter(),
+    }
 }
 
 /// Reads that walked journals: per-thread accumulators folded into the
@@ -471,7 +518,7 @@ impl QmdbReadView {
             let filter_key = journal_key(key);
             let (mut searches, mut skips) = (0u64, 0u64);
             let found = frozen.journals.iter().skip(frozen.journals.len() - behind).chain(frozen.pending.iter()).find_map(|journal| {
-                if journal.filter.as_ref().is_some_and(|filter| !filter.may_contain(filter_key)) {
+                if journal.filter.get().is_some_and(|filter| !filter.may_contain(filter_key)) {
                     skips += 1;
                     return None;
                 }
@@ -582,7 +629,12 @@ impl QmdbReadView {
         let key_at = |offset: u64| self.file.key(offset);
         let journal: Vec<(Hash, Option<u64>)> =
             changes.par_iter().with_min_len(1024).map(|(key, _)| (*key, self.index.get(key, key_at))).collect();
-        let journal = Arc::new(JournalData::new(journal, self.filter_journals.load(Ordering::Relaxed)));
+        let with_filter = self.filter_journals.load(Ordering::Relaxed);
+        let filter_later = with_filter && journal_filter_async();
+        let journal = Arc::new(JournalData::new(journal, with_filter && !filter_later));
+        if filter_later {
+            fill_filter_later(journal.clone());
+        }
         {
             let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
             versions.pending = Some(journal.clone());
@@ -930,6 +982,35 @@ mod tests {
         );
         assert_eq!(before, reads(&view), "every read answers as before");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A journal whose filter is filed later (`N42_VIEW_JOURNAL_FILTER_ASYNC`)
+    /// answers like one without: no filter until it is filed, then one that
+    /// holds every changed key.
+    #[test]
+    fn journal_filter_filed_later() {
+        let entries: Vec<(Hash, Option<u64>)> = (0u64..5_000)
+            .map(|i| {
+                let mut key = [0u8; 32];
+                key[..8].copy_from_slice(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
+                (key, (i % 3 != 0).then_some(i))
+            })
+            .collect();
+        let mut entries = entries;
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let journal: Journal = Arc::new(JournalData::new(entries.clone(), false));
+        assert!(journal.filter.get().is_none());
+        fill_filter_later(journal.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while journal.filter.get().is_none() {
+            assert!(std::time::Instant::now() < deadline, "the filter thread filed nothing");
+            std::thread::yield_now();
+        }
+        let filter = journal.filter.get().expect("filed");
+        for (key, offset) in &entries {
+            assert!(filter.may_contain(journal_key(key)));
+            assert_eq!(journal.before(key), Some(*offset));
+        }
     }
 
     #[test]

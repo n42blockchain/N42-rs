@@ -4227,3 +4227,34 @@ All legs pass the body and depth-2 gates, with no engine idles over 5 s.
 - The remaining distance is the long-gap tail (10.195): slow batches on about 30% of blocks. The allocator
   is not their cause. The open lever from 10.194 is the view-journal reads (about +2 ms of par_exec on
   two thirds of builds).
+
+## 10.197 -- the view-journal filter cuts par_exec by 2.5 ms; the gap does not move (stage ea, 2026-10-21)
+
+**Why this stage.** Under X19, about two thirds of the builds read the QMDB view behind its head and walk
+its journals: about 140,000-157,000 binary searches a build. On ZDa, ZDb and ZD1b those builds ran par_exec
++1.6-2.4 ms on the mean and +80-100 ms of batch CPU. Stage ea pairs X19 against X19 +
+`N42_VIEW_JOURNAL_FILTER=1`, which files an address filter with each journal.
+
+JF1b did not run. A Gov5 request had waited 20 minutes, so the runner yielded at the leg boundary.
+
+| leg | config | drain M/s | mean gap ms | par_exec median | state_ready median | sealed_at median | journal searches a build | EL peak GB | min avail GB |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| JFa | X19 | 4.868 | 41.1 | 19 | 68 | 36 | 143,057 | 43.1 | 81.4 |
+| JF1 | X19 + filter | 4.890 | 40.9 | **16** | **63** | 35 | **982** | 70.3 | 61.7 |
+| JFb | X19 | 4.918 | 40.7 | 18 | 68 | 36 | 138,117 | 56.0 | 66.5 |
+
+- **The mechanism holds.** The filter skips 99.3% of the searches.
+  - par_exec falls 2.5 ms at the median.
+  - Batch CPU falls about 120 ms a build, on builds with and without journal reads alike.
+  - state_ready falls 5 ms, and the leader's state_wait falls 5 -> 3 ms.
+- **The drain rate does not move.** 4.890 sits between the two controls (+0.45% / -0.6%). That is one leg,
+  so it is short of the two-pair rule, and it is not adopted.
+- **The builder is not what sets the gap.** sealed_at moves only 1 ms. chain_wait is 30 ms at the median
+  on every leg: the next build is ready and waits for the 30 ms pacing and its parent. Shortening
+  execution therefore does not move the block interval.
+  - The X19 mean gap of 40.7-41.1 is set by the chain cycle: the vote/commit round trip and the root cycle
+    at depth 2. It is not set by the build.
+- JF1's EL peak is 70 GB, against 43-56 GB on the controls. The filters are about 64 journals of up to
+  ~400k keys. Memory is not short, but the extra memory is a cost.
+- **Next:** decompose the 40.7 ms gap from the consensus side. Measure where a block waits between its
+  seal and the next proposal (take_sealed, vote round trip, commit), and stop cutting the builder.

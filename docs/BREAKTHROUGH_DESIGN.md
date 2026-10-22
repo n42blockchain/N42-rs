@@ -5438,3 +5438,34 @@ both knob legs, with 0 flushes and 0 `unknown` refusals.)
 - **Both chains sit at the same place.** On the knob legs, sealed_at reads ~38-39 ms, made of the 32-thread
   execution (29 ms) plus the fold and the seal; the root chain has ~5 ms of slack (parent_fields ~3 ms).
 - **Next: stage en**, a third repeat (LJa/LJb against LJ1/LJ1b/LJ1c).
+
+## 10.209 -- two more legs over 5.0M/s; the reseed covers only the flushed senders (stage en, 2026-10-22)
+
+**Why this stage.** Stage en is the third repeat of the 10.207 configuration (fused receipts + 32 threads +
+road + reseed) against X19.
+
+| leg | config | drain M/s | seal -> seal mean | windows (M/s) | road flushes | refused unknown | queued p50 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| LJa | X19 | 4.802 | 41.7 | 4.83 / 4.74 / 4.81 | - | - | 2,321,500 |
+| LJ1 | knob | **5.065** | **39.5** | 5.07 / 4.99 / 5.07 | 0 | 0 | 1,924,000 |
+| LJb | X19 | 4.939 | 40.5 | 4.99 / 4.90 / 4.92 | - | - | 2,350,500 |
+| LJ1b | knob | 4.717 | 42.8 | 4.81 / 4.85 / 4.55 | 3 | 59,893 | 2,241,500 |
+| LJ1c | knob | **5.041** | **39.6** | 5.19 / 4.93 / 5.02 | 0 | 0 | 2,285,000 |
+
+(All five d2gates pass; there were no handovers.)
+
+- **Two knob legs clear both controls by >= 1.5%:** LJ1 by +2.6% and +5.5%, LJ1c by +2.1% and +5.0%.
+  LJ1b did not.
+- **The knob config so far.** Across el, em and en it has six legs: 5.004, 4.905, 5.022, 5.065, 4.717
+  and 5.041 (mean 4.959). The six X19 controls read 4.784-4.939 (mean 4.864), a gain of +2.0%. Four of
+  the six knob legs are at or over 5.0M/s.
+- **LJ1b is the road's flush case, half fixed.** The road ran clean for ~85 s. Then two flushes came:
+  7,163 senders were reseeded, but `unknown` refusals followed, and the road shut for the rest of the leg.
+  - The reason: the reseed covered only the senders whose frames the flush put back in the lanes.
+    `Road::invalidate` clears the whole sender map, so the other ~11,600 senders stay unknown, and their
+    lanes are empty.
+- **Fix in hand (not yet tested; the box was held).** With the knob on, the flush now keeps every sender
+  the map knew. Each re-enters at max(lane tail + 1, its old `next`), or at its old `next` when its lane
+  is empty: everything below it is in a build's take or mined. New test:
+  `a_flush_keeps_the_next_of_a_sender_whose_frames_were_taken`.
+- **Next: stage eo.** It runs this config with the full-map reseed, after its unit tests pass.

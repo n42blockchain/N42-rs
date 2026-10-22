@@ -184,6 +184,18 @@ pub(crate) struct RoadSender {
     pub(crate) stamp: u64,
 }
 
+/// `N42_ROAD_RESEED_AT_FLUSH=1` (off by default): a flush seeds again, at
+/// once, every sender whose frames it put back in the lanes, from those
+/// lanes. Seeding is otherwise lazy, at the sender's next frame. By then a
+/// build has usually taken the lane empty, and a sender with an empty
+/// lane cannot be seeded. At 5M/s every sender is then refused for the
+/// rest of the leg, and the road stays shut (10.206: `seeded` 0 and
+/// `refused_unknown` ~40,000 per 5 s after the one flush).
+fn reseed_at_flush() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_ROAD_RESEED_AT_FLUSH").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// Why a frame was not admitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
@@ -329,6 +341,8 @@ pub(crate) struct Road<T: PoolTransaction> {
     next_seq: AtomicU64,
     taken: Mutex<RoadTaken<T>>,
     pub(crate) counters: Arc<RoadCounters>,
+    /// [`reseed_at_flush`], read at construction (tests set it).
+    reseed: std::sync::atomic::AtomicBool,
 }
 
 /// Guards of the shards a frame touches, locked in ascending order (so two
@@ -364,7 +378,19 @@ impl<T: PoolTransaction> Road<T> {
             next_seq: AtomicU64::new(0),
             taken: Mutex::new(RoadTaken::default()),
             counters: Arc::new(RoadCounters::default()),
+            reseed: std::sync::atomic::AtomicBool::new(reseed_at_flush()),
         }
+    }
+
+    /// Whether a flush seeds its senders again at once ([`reseed_at_flush`]).
+    pub(crate) fn reseed(&self) -> bool {
+        self.reseed.load(Ordering::Relaxed)
+    }
+
+    /// Sets [`Self::reseed`] (tests).
+    #[cfg(test)]
+    pub(crate) fn set_reseed(&self, on: bool) {
+        self.reseed.store(on, Ordering::Relaxed);
     }
 
     pub(crate) fn epoch(&self) -> u64 {

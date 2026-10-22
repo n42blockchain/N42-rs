@@ -5281,3 +5281,39 @@ leg had any.)
 - **Next: stage ei.** It cuts the root chain without the road. `N42_ROOT_LOOKUPS_EARLY=1` (cg: -4.7 ms on
   the root, exact) moves the lookups before the gate, and `N42_RECEIPTS_FUSED=1` shortens the build chain.
   The legs: LEa/LEb run X19; LE1/LE1b run fused receipts + build pool + lookups early; LE2 adds the road.
+
+## 10.204 -- the root's lookups run twice as slow whenever they overlap a build's execution (stage ei, 2026-10-22)
+
+**Why this stage.** 10.203 found two serial chains at ~38-40 ms each. Stage ei cuts both without the
+road. On the build chain it uses the fused receipts; on the root chain it moves the root's lookups
+before the gate (`N42_ROOT_LOOKUPS_EARLY=1`). LEa/LEb run X19; LE1/LE1b add both. LE2 (the same plus the
+road) was skipped when the stage yielded to a foreign request.
+
+| leg | config | drain M/s | seal -> seal mean | lookups (us) | root compute | rename -> root start | seal_to_fields | parent_fields | sealed_ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| LEa | X19 | 4.752 | 41.8 | 5,110 inline | 25.5 | 8.5 | 63.1 | 2.5 | 5.2 |
+| LE1 | fused + lookups early | 4.858 | 41.2 | 10,769 early | 21.9 | 14.1 | 68.6 | 5.6 | 8.3 |
+| LEb | X19 | 4.843 | 41.3 | - | - | - | - | - | - |
+| LE1b | fused + lookups early | **4.954** | 40.3 | 11,327 early | 22.7 | 14.0 | 71.7 | 6.9 | 9.6 |
+
+(Times in ms unless marked, build-line means. All four d2gates pass; there were no handovers.)
+
+- **Not adopted.** LE1b clears both controls by 2.3% and 4.2%, but LE1 clears LEb by only 0.3%.
+  Across ee-ei, the fused-receipt legs without the road (FU1, FU1b, LE1, LE1b) average 4.879 M/s. That
+  is +1.3% over their stages' four controls (4.816). It is suggestive, but under the bar.
+- **Early lookups cost twice as much.** Moved before the gate, they take 10.8-11.3 ms against 5.1 ms
+  inline. The root's compute falls by only 3 ms. Its gated start moves 5.5 ms later (rename -> start
+  8.5 to 14 ms), and the fields come out 5.5-8.6 ms later. The road gave the same doubling (10.203).
+- **The cause is the overlap with a build's execution.** Inline, the lookups run ~35-40 ms after the
+  seal: between the child's execution (~7-28 ms) and the grandchild's (~42 ms on). Both the early
+  lookups and the road's earlier child start them inside an execution's window.
+  - The layout keeps them on separate L3s. The host is one EPYC 9B45 socket: 16 CCDs of 8 cores, one
+    NUMA node. The build pool's 64 cores are CCDs 0-7 and the 16 critical cores CCDs 8-9.
+  - So the shared resource is DRAM, through the fabric. The execution's 64 memory-bound threads raise
+    the loaded latency of every latency-bound reader beside them.
+- **The floor, restated.** Each block needs ~21 ms of execution that saturates memory, plus ~5 ms of
+  latency-bound root lookups that must fall outside it to stay at 5 ms. The two chains are coupled
+  through memory as well as through their waits.
+- **Next: stage ej.** It tests whether fewer execution threads keep par_exec while easing the loaded
+  latency. 10.165 found par_exec latency-bound, and stage cn found it flat above 16 cores. LFa/LFb run X19
+  (64 threads); LF1/LF1b run fused receipts with 48 threads; LF2 runs fused receipts with 32.

@@ -4429,3 +4429,49 @@ async journal filter.
   sealed_ms. As forecast in 10.201, the depth-2 fields chain is the next floor.
 - **Next: stage eg, a repeat.** GWa/GWb run X19; GW1/GW1b/GW1c run fused receipts + build pool + road.
   This tells whether FV1's degradation recurs with the road, and whether FV1b's level holds.
+
+## 10.203 -- the road's repeat is flat; two serial chains at ~38-40 ms are the floor (stages eg + eh, 2026-10-22)
+
+**Why these stages.** In 10.202, fused receipts + frame road gave one record-level leg (FV1b 4.970) and
+one degraded leg (FV1 4.270). Stage eg repeated the comparison, but yielded to a foreign request after
+three legs. Stage eh ran it again, and its fifth leg (GX2) splits the road from the consensus move to
+nvme0.
+
+| leg | config | drain M/s | parent_fields | sealed_ms | root lookups (us) | root majflt | seal_to_fields (us) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| GWa | X19 | 4.667 | 2.5 | 5.2 | - | - | - |
+| GW1 | fused + road | 4.764 | 9.5 | 11.7 | 10,634 | 265 | 75,892 |
+| GWb | X19 | 4.694 | 3.7 | 6.2 | - | - | - |
+| GXa | X19 | 4.858 | 3.8 | 6.2 | 5,449 | 0.1 | 68,979 |
+| GX1 | fused + road | 4.902 | 9.4 | 11.6 | 12,452 | 176 | 75,886 |
+| GXb | X19 | 4.861 | 2.6 | - | 5,230 | 0.0 | 65,027 |
+| GX1b | fused + road | 4.822 | 9.3 | - | 11,213 | 269 | - |
+| GX2 | fused + road, consensus not moved | 4.853 | 8.5 | 10.8 | 10,561 | 65 | 73,583 |
+
+(Times in ms unless marked, build-line means. All d2gates pass. GX1 had two handovers; no other eg/eh
+leg had any.)
+
+- **Fused receipts + road: not adopted.** Over six legs in ef-eh it read 4.270, 4.970, 4.902, 4.764,
+  4.902 and 4.822, against controls of 4.667-4.875. Only GW1 and GX1 clear their own stage's controls,
+  and those stage-eh controls only by 0.9%.
+- **The road itself doubles the QMDB root's lookups, not the consensus move.** GX2 keeps the consensus
+  log in place and still reads 10.6 ms against 5.2-5.4 ms on the controls, with major faults appearing
+  (65-269 per block against ~0). With the road, the child starts ~4.5 ms earlier (par_start 4.7 to
+  0.1-0.2 ms). The likely cause is that the child's execution then overlaps the root's latency-bound
+  lookups. This is not yet measured.
+- **The model: two serial chains, each at ~38-40 ms.**
+  - **The build chain.** seal -> seal = 1.8 + sealed_at. sealed_at ~38.5 ms = par_start + state_wait +
+    par_exec ~21 + fold + sealed_ms.
+  - **The root chain.** At depth 2, block N's root job renames under the parent's fields, so it waits
+    for block N-1's fields (the rename). From there to N's own fields takes ~37-38 ms: the gated start
+    5.5-8.5 ms, the compute 26-28 ms (apply 21-23: lookups 5.4, writes 7.1, index 6.3, retire 3.3,
+    delta 2.5; hash ~4.4), and the publication ~2.5 ms.
+  - **Where they meet.** The fixed point rename = seal_to_fields - gap means the root chain sustains a
+    gap of ~37-38 ms at best. The child's seal at depth 2 needs its grandparent's fields
+    (`parent_fields_ms`, at the seal). Whenever the build chain is cut (road, fused receipts), the
+    child's seal reaches the root chain's floor, and sealed_ms rises by the same amount.
+- **So 5M needs both chains under ~38 ms at once.** A cut to only one of them moves the wait to the
+  other. This is what every stage from ea to eh showed.
+- **Next: stage ei.** It cuts the root chain without the road. `N42_ROOT_LOOKUPS_EARLY=1` (cg: -4.7 ms on
+  the root, exact) moves the lookups before the gate, and `N42_RECEIPTS_FUSED=1` shortens the build chain.
+  The legs: LEa/LEb run X19; LE1/LE1b run fused receipts + build pool + lookups early; LE2 adds the road.

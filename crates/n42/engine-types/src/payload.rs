@@ -1061,6 +1061,30 @@ fn cumulative_gas(
     (cumulative, tx_gas)
 }
 
+/// Whether a block's receipts are built on the build pool, whose threads
+/// are idle once the execution has ended (`N42_RECEIPTS_ON_BUILD_POOL=1`,
+/// off by default). The pool behind the seal (`N42_FREEZE_POOL=own`) runs
+/// them beside the freeze on the background cores, and they were the whole
+/// of `par_fold_ms` (8.5 ms a 200,000-transaction block, 10.199), on the
+/// leader's serial seal chain.
+fn receipts_on_build_pool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_RECEIPTS_ON_BUILD_POOL").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The pool a block's receipts are built on: the build pool
+/// ([`receipts_on_build_pool`]), the pool behind the seal
+/// (`N42_FREEZE_POOL=own`), or `None` for the global pool.
+fn receipts_pool() -> Option<&'static rayon::ThreadPool> {
+    if receipts_on_build_pool() {
+        Some(crate::parallel_transfer::build_pool())
+    } else if crate::parallel_transfer::freeze_pool_own() {
+        Some(crate::parallel_transfer::behind_pool())
+    } else {
+        None
+    }
+}
+
 /// The receipts of a block the parallel step left in its slots, in block
 /// order, with `cumulative[i]` the block's gas through transaction `i`.
 fn receipts_from_slots<P: PoolTransaction<Consensus = TransactionSigned>>(
@@ -3056,10 +3080,9 @@ where
                             };
                             let refs: Vec<_> = slots.iter().filter_map(std::sync::OnceLock::get).collect();
                             let (cumulative, tx_gas) = cumulative_gas(&refs);
-                            let receipts = if crate::parallel_transfer::freeze_pool_own() {
-                                crate::parallel_transfer::behind_pool().install(|| receipts_from_slots(&refs, &cumulative, &pulled))
-                            } else {
-                                receipts_from_slots(&refs, &cumulative, &pulled)
+                            let receipts = match receipts_pool() {
+                                Some(pool) => pool.install(|| receipts_from_slots(&refs, &cumulative, &pulled)),
+                                None => receipts_from_slots(&refs, &cumulative, &pulled),
                             };
                             drop(refs);
                             // The slots' 77 MB are freed on the pool, off this thread.
@@ -3096,12 +3119,10 @@ where
                             scope.spawn(move || {
                                 let refs: Vec<_> = slots.iter().filter_map(std::sync::OnceLock::get).collect();
                                 let (cumulative, tx_gas) = cumulative_gas(&refs);
-                                // `N42_FREEZE_POOL=own`: the receipts on the
-                                // pool behind the seal; the global pool else.
-                                let receipts = if crate::parallel_transfer::freeze_pool_own() {
-                                    crate::parallel_transfer::behind_pool().install(|| receipts_from_slots(&refs, &cumulative, pulled))
-                                } else {
-                                    receipts_from_slots(&refs, &cumulative, pulled)
+                                // The pool `receipts_pool` names; the global pool else.
+                                let receipts = match receipts_pool() {
+                                    Some(pool) => pool.install(|| receipts_from_slots(&refs, &cumulative, pulled)),
+                                    None => receipts_from_slots(&refs, &cumulative, pulled),
                                 };
                                 (receipts, tx_gas)
                             })

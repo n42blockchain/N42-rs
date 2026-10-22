@@ -4579,3 +4579,33 @@ road; LG2 runs fused receipts + 40 threads + road.
   4.764-4.979. The fix belongs in the frame road's take path in `tx-queue` (`frames.rs`
   `sweep_at_take`, the bound that refuses rather than evicts). The admitted transactions have to stay
   reachable without a per-build sweep, or the bound must not count frames the builder cannot use.
+
+## 10.207 -- first leg at 5.0M/s: fused receipts + 32 threads + road + the flush reseed (stage el, 2026-10-22)
+
+**Why this stage.** In 10.206 the road's degraded mode was traced to its seeding. A flush clears the
+road's sender map, and seeding is lazy: at the sender's next frame, from its lane's tail. By then a build
+has taken that lane empty, and a sender with an empty lane cannot be seeded. So every frame was refused
+as `unknown` for the rest of the leg: on FV1 and LG1, after one flush, `seeded` read 0 and
+`refused_unknown` ~40,000 per 5 s. `N42_ROAD_RESEED_AT_FLUSH=1` (d5822d8c3, off by default) seeds every
+sender whose frames the flush put back in the lanes at once, under the lanes' lock. Its unit test
+reproduces both the refusal and the fix, and the gate passed 2,542 tests.
+
+Stage el: LHa/LHb run X19; LH1/LH1b run fused receipts + 32 threads + road + reseed; LH2 the same on 64
+threads. The stage yielded to a foreign request after three legs, so LH1b and LH2 did not run.
+
+| leg | config | drain M/s | seal -> seal mean | sealed_at | par_start | par_exec | par_fold | sealed_ms | parent_fields | seal_to_fields |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| LHa | X19 | 4.871 | 41.0 | 39.2 | 5.2 | 21.0 | 8.8 | 6.1 | 3.5 | 68.1 |
+| LH1 | fused, 32 thr, road, reseed | **5.004** | **39.9** | 38.0 | 0.2 | 30.2 | 2.2 | 4.3 | 2.2 | 62.6 |
+| LHb | X19 | 4.784 | 41.6 | 39.5 | 5.4 | 21.1 | 8.6 | 5.8 | 2.8 | 64.7 |
+
+(Times in ms, build-line means. All three d2gates pass; there were no handovers. The road ran the whole
+leg on LH1: 925,285 frames admitted, 0 refused, 0 flushes, 18,750 senders seeded. The reseed was
+therefore not exercised on this leg.)
+
+- **The first drain at 5.0M/s, at a mean gap of 40.0 ms.** LH1 beats both controls by 2.7% and 4.6%. It
+  is one leg, so it is not concluded.
+- **Both chains are under their floors at once.** The build chain starts at 0.2 ms and folds in 2.2 ms,
+  despite the 32-thread execution's 30 ms. The root chain has slack: seal_to_fields 62.6 ms, and
+  parent_fields only 2.2 ms.
+- **Next: stage em.** It repeats LH1 three times (LI1, LI1b, LI1c) against two X19 controls (LIa, LIb).

@@ -5415,3 +5415,26 @@ therefore not exercised on this leg.)
   despite the 32-thread execution's 30 ms. The root chain has slack: seal_to_fields 62.6 ms, and
   parent_fields only 2.2 ms.
 - **Next: stage em.** It repeats LH1 three times (LI1, LI1b, LI1c) against two X19 controls (LIa, LIb).
+
+## 10.208 -- a second leg over 5.0M/s; one knob leg at the controls (stage em, 2026-10-22)
+
+**Why this stage.** Stage em repeats LH1 (10.207) against X19. LIa/LIb run X19; LI1/LI1b/LI1c run fused
+receipts + 32 threads + road + reseed. LI1c was skipped when the stage yielded to a foreign request.
+
+| leg | config | drain M/s | seal -> seal mean | sealed_at | par_start | par_exec | parent_fields | seal_to_fields | windows (M/s) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| LIa | X19 | 4.900 | 40.7 | 39.0 | 4.7 | 21.2 | 3.0 | 66.4 | - |
+| LI1 | knob | 4.905 | 40.7 | 38.9 | 0.1 | 29.1 | 3.1 | 64.7 | 4.91 / 4.90 / 4.85 |
+| LIb | X19 | 4.885 | 40.9 | 39.1 | 4.3 | 20.8 | 3.7 | 69.0 | - |
+| LI1b | knob | **5.022** | **39.8** | 37.9 | 0.2 | 29.2 | 3.0 | 67.0 | **5.17** / 5.06 / 4.79 |
+
+(Times in ms, build-line means. All four d2gates pass; there were no handovers. The road ran whole on
+both knob legs, with 0 flushes and 0 `unknown` refusals.)
+
+- **Not yet adopted.** LI1b clears both controls by 2.5% and 2.8%, but LI1 clears them by only 0.1-0.4%.
+- **Across el and em, the knob config has three legs.** They read 5.004, 4.905 and 5.022 (mean 4.977)
+  against four X19 controls of 4.784-4.900 (mean 4.860), a gain of +2.4%. No leg fell into the road's
+  degraded mode.
+- **Both chains sit at the same place.** On the knob legs, sealed_at reads ~38-39 ms, made of the 32-thread
+  execution (29 ms) plus the fold and the seal; the root chain has ~5 ms of slack (parent_fields ~3 ms).
+- **Next: stage en**, a third repeat (LJa/LJb against LJ1/LJ1b/LJ1c).

@@ -4324,3 +4324,35 @@ waited 2.0-3.4 ms for the lanes lock (`queue_lock_us`). Stage ec pairs X19 again
 - **Next: stage ed.** `N42_RECEIPTS_ON_BUILD_POOL=1` (5d23dcc4a) runs the receipts on the 64-thread
   build pool, which is idle once the execution ends. The stage pairs it with X19, plus RB2: receipts +
   road + async filter, with all three floors cut at once.
+
+## 10.200 -- the build pool barely shortens the receipts; the job is not bound by its parallel map (stage ed, 2026-10-22)
+
+**Why this stage.** 10.199 found the fold (8.5 ms) to be the receipts job, run on the 16-thread pool
+behind the seal. Stage ed pairs X19 against `N42_RECEIPTS_ON_BUILD_POOL=1` (5d23dcc4a: the same job on
+the 64-thread build pool, idle once the execution ends), plus RB2: receipts + frame road + async filter.
+
+| leg | config | drain M/s | seal -> seal mean | sealed_at | par_start | state_wait | par_exec | par_fold | receipts wait (us) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| RBa | X19 | 4.854 | 41.2 | 39.4 | 5.0 | 4.7 | 21.7 | 8.7 | 8,708 |
+| RB1 | + receipts on build pool | 4.892 | 40.8 | 39.1 | 1.7 | 6.0 | 22.0 | 8.0 | 8,046 |
+| RBb | X19 | 4.845 | 41.3 | 39.5 | 4.7 | 5.7 | 21.4 | 8.7 | - |
+| RB1b | + receipts on build pool | 4.897 | 40.7 | 39.0 | 4.4 | 4.6 | 22.2 | 7.9 | 8,001 |
+| RB2 | + receipts + road + async filter | 4.882 | 40.9 | 39.2 | 0.1 | 9.8 | 19.1 | 9.6 | 9,758 |
+
+(Times in ms unless marked, build-line means; the receipts wait is `scope_receipts_wait_us`.)
+
+- **Not adopted.** Both knob legs beat both controls, but only by 0.8-1.1%, under the 1.5% bar. All five
+  d2gates pass.
+- **The pool barely matters.** Four times the threads cut the receipts wait by only 0.7 ms (8.7 to
+  8.0 ms). At ~600 ns of work per receipt, a parallel map of 200,000 receipts on 64 threads should take
+  about 2 ms. So most of the job is not in the parallel map.
+- **The suspects are the two serial walks before the map.** The job first collects the slots' references
+  (200,000 `OnceLock`s, one cache line each), then walks them again for the cumulative gas. Both walks run
+  on one thread, before any parallel work starts.
+- **RB2 repeats the road's pattern.** par_start goes to 0.1 ms, but state_wait rises to 9.8 ms and the fold
+  to 9.6 ms, so the drain stays flat.
+- **Next: stage ee.** `N42_RECEIPTS_FUSED=1` (eff7fd5e5) builds the receipts straight from the slots in
+  two parallel passes: per-chunk count and gas, a prefix over ~100 chunks, then each chunk writes its own
+  range. Every leg now logs the job's split (`scope_receipts_refs_us`, `_cum_us`, `_build_us`). FUa/FUb
+  run X19; FU1/FU1b run fused receipts on the build pool; FU2 runs fused receipts on the pool behind the
+  seal.

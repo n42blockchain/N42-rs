@@ -1071,6 +1071,92 @@ fn receipts_from_slots<P: PoolTransaction<Consensus = TransactionSigned>>(
         .collect()
 }
 
+/// Whether a block's receipts are built straight from the slots in two
+/// passes on the receipts pool (`N42_RECEIPTS_FUSED=1`, off by default):
+/// the per-chunk gas, then the receipts with their cumulative gas, instead
+/// of the serial walks for the references and the cumulative gas before the
+/// parallel map. Moving the receipts to the 64-thread build pool cut them
+/// only 8.7 -> 8.0 ms (10.200): the serial walks are the suspect.
+fn receipts_fused() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_RECEIPTS_FUSED").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Where a receipts job's time went, us: the slots' references, the
+/// cumulative gas and the receipts themselves (with
+/// [`receipts_fused`], the chunk pass, the prefix and the receipts).
+#[derive(Debug, Default, Clone, Copy)]
+struct ReceiptsTimes {
+    refs_us: u64,
+    cum_us: u64,
+    build_us: u64,
+}
+
+/// The slots in a chunk of the fused receipts' passes.
+const RECEIPTS_CHUNK: usize = 2048;
+
+/// [`receipts_from_slots`] in two parallel passes over the slots
+/// ([`receipts_fused`]): each chunk's filled count and gas, a prefix over
+/// the ~100 chunks, then each chunk writes its receipts, cumulative gas
+/// included, into its own range of the output. Returns the block's gas too.
+fn receipts_fused_from_slots<P: PoolTransaction<Consensus = TransactionSigned>>(
+    slots: &[std::sync::OnceLock<crate::parallel_transfer::BuiltTransfer<()>>],
+    pulled: &Pulled<P>,
+    times: &mut ReceiptsTimes,
+) -> (Vec<n42_tx_types::Receipt>, u64) {
+    use rayon::prelude::*;
+    let at = std::time::Instant::now();
+    let sums: Vec<(usize, u64)> = slots
+        .par_chunks(RECEIPTS_CHUNK)
+        .map(|chunk| {
+            chunk.iter().filter_map(std::sync::OnceLock::get).fold((0usize, 0u64), |(n, gas), built| {
+                (n + 1, gas + built.result.gas().tx_gas_used())
+            })
+        })
+        .collect();
+    times.refs_us = at.elapsed().as_micros() as u64;
+    let at = std::time::Instant::now();
+    let mut bases = Vec::with_capacity(sums.len());
+    let (mut filled, mut tx_gas) = (0usize, 0u64);
+    for (n, gas) in &sums {
+        bases.push(tx_gas);
+        filled += n;
+        tx_gas += gas;
+    }
+    times.cum_us = at.elapsed().as_micros() as u64;
+    let at = std::time::Instant::now();
+    let Some(first) = slots.iter().find_map(std::sync::OnceLock::get) else {
+        times.build_us = at.elapsed().as_micros() as u64;
+        return (Vec::new(), tx_gas);
+    };
+    let receipt_of = |built: &crate::parallel_transfer::BuiltTransfer<()>, cumulative_gas_used: u64| n42_tx_types::Receipt {
+        tx_type: <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(pooled_consensus(&pulled[built.index])),
+        success: built.result.is_success(),
+        cumulative_gas_used,
+        logs: built.result.logs().to_vec(),
+    };
+    // Placeholders written in parallel, then overwritten chunk by chunk.
+    let template = receipt_of(first, 0);
+    let mut receipts: Vec<n42_tx_types::Receipt> = Vec::new();
+    (0..filled).into_par_iter().map(|_| template.clone()).collect_into_vec(&mut receipts);
+    let mut outs = Vec::with_capacity(sums.len());
+    let mut rest: &mut [n42_tx_types::Receipt] = &mut receipts;
+    for (n, _) in &sums {
+        let (out, tail) = rest.split_at_mut(*n);
+        outs.push(out);
+        rest = tail;
+    }
+    slots.par_chunks(RECEIPTS_CHUNK).zip(outs).zip(bases).for_each(|((chunk, out), base)| {
+        let mut cumulative = base;
+        for (built, slot) in chunk.iter().filter_map(std::sync::OnceLock::get).zip(out.iter_mut()) {
+            cumulative += built.result.gas().tx_gas_used();
+            *slot = receipt_of(built, cumulative);
+        }
+    });
+    times.build_us = at.elapsed().as_micros() as u64;
+    (receipts, tx_gas)
+}
+
 /// Where the thread merging a block's revert set (`N42_ANSWER_BEFORE_REVERTS`)
 /// is sent the promise to fill, once the execution it belongs to exists.
 type LateRevertsTx = std::sync::mpsc::SyncSender<n42_deferred_reverts::LateReverts>;
@@ -2005,6 +2091,8 @@ where
     let mut gap_after_exec_ms = 0u64;
     let mut gap_before_seal_ms = 0u64;
     let mut index_ms = 0u64;
+    // Where the receipts job in the scope spent its time (`ReceiptsTimes`).
+    let mut scope_receipts_times = ReceiptsTimes::default();
     // `N42_FREEZE_AFTER_SEAL=1`: whether the freeze ran beside the seal, when
     // it ended, and how long its join waited for it (us).
     let mut freeze_late_used = false;
@@ -3063,14 +3151,28 @@ where
                             let slots: &[_] = &run.slots;
                             let pulled: &[_] = &cands;
                             scope.spawn(move || {
+                                let mut times = ReceiptsTimes::default();
+                                if receipts_fused() {
+                                    let (receipts, tx_gas) = match receipts_pool() {
+                                        Some(pool) => pool.install(|| receipts_fused_from_slots(slots, pulled, &mut times)),
+                                        None => receipts_fused_from_slots(slots, pulled, &mut times),
+                                    };
+                                    return (receipts, tx_gas, times);
+                                }
+                                let at = std::time::Instant::now();
                                 let refs: Vec<_> = slots.iter().filter_map(std::sync::OnceLock::get).collect();
+                                times.refs_us = at.elapsed().as_micros() as u64;
+                                let at = std::time::Instant::now();
                                 let (cumulative, tx_gas) = cumulative_gas(&refs);
+                                times.cum_us = at.elapsed().as_micros() as u64;
+                                let at = std::time::Instant::now();
                                 // The pool `receipts_pool` names; the global pool else.
                                 let receipts = match receipts_pool() {
                                     Some(pool) => pool.install(|| receipts_from_slots(&refs, &cumulative, pulled)),
                                     None => receipts_from_slots(&refs, &cumulative, pulled),
                                 };
-                                (receipts, tx_gas)
+                                times.build_us = at.elapsed().as_micros() as u64;
+                                (receipts, tx_gas, times)
                             })
                         });
                         let root = (sealing_early && sealed_ahead.is_none() && frame_plan.is_none()).then(|| match direct_body.as_ref() {
@@ -3166,13 +3268,14 @@ where
                     par_graft_ms = graft_ms;
                     early_transactions_root = early_root;
                     if let Some(receipts) = receipts {
-                        let (receipts, tx_gas) = receipts.map_err(|_| {
+                        let (receipts, tx_gas, times) = receipts.map_err(|_| {
                             failed_after_seal(
                                 sealed_ahead_id,
                                 PayloadBuilderError::other(std::io::Error::other("the receipts job behind the seal panicked")),
                             )
                         })?;
                         direct_receipts = Some((receipts, tx_gas));
+                        scope_receipts_times = times;
                         // The slots' 77 MB are freed on the pool, off this thread.
                         let slots = std::mem::take(&mut run.slots);
                         crate::parallel_transfer::behind_pool().spawn(move || drop(slots));
@@ -4784,6 +4887,12 @@ where
                     freeze_pool_own = crate::parallel_transfer::freeze_pool_own(),
                     seal_to_frozen_us = crate::fields_at_seal::us_between(sealed_instant, freeze_ended_at),
                     freeze_join_wait_us,
+                    // Where the receipts job spent its time (us) and
+                    // whether it ran fused (`N42_RECEIPTS_FUSED`).
+                    scope_receipts_refs_us = scope_receipts_times.refs_us,
+                    scope_receipts_cum_us = scope_receipts_times.cum_us,
+                    scope_receipts_build_us = scope_receipts_times.build_us,
+                    receipts_fused = receipts_fused(),
                     // `N42_STATE_AFTER_PULL=1` (plan v6 G3): the parent's state
                     // opened after the pull, prep and partition, and the time
                     // inside that open (0 with the flag off: the open is then

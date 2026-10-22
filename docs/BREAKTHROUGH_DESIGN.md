@@ -4356,3 +4356,47 @@ the 64-thread build pool, idle once the execution ends), plus RB2: receipts + fr
   range. Every leg now logs the job's split (`scope_receipts_refs_us`, `_cum_us`, `_build_us`). FUa/FUb
   run X19; FU1/FU1b run fused receipts on the build pool; FU2 runs fused receipts on the pool behind the
   seal.
+
+## 10.201 -- the fused receipts take the fold from 8.8 to 2.2 ms; the next build's start absorbs it (stage ee, 2026-10-22)
+
+**Why this stage.** In 10.200, the build pool cut the receipts job only from 8.7 to 8.0 ms. Stage ee
+logs the job's split on every leg, and tests `N42_RECEIPTS_FUSED=1` (eff7fd5e5): the receipts built
+straight from the slots in two parallel passes. The pairs are FUa/FUb = X19 and FU1/FU1b = fused on the
+build pool; FU2 = fused on the pool behind the seal.
+
+| leg | config | drain M/s | seal -> seal mean | sealed_at | par_start | state_wait | parent_fields | par_fold | sealed_ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FUa | X19 | 4.921 | 40.6 | 38.8 | 5.5 | 4.9 | 2.9 | 8.8 | 5.8 |
+| FU1 | fused, build pool | 4.873 | 40.7 | 37.7 | 6.5 | 1.0 | 4.0 | 2.2 | 6.6 |
+| FUb | X19 | 4.747 | 42.1 | 40.2 | 6.2 | 4.3 | - | 8.4 | 6.0 |
+| FU1b | fused, build pool | 4.832 | 41.2 | 38.5 | 4.7 | 1.7 | 5.8 | 2.2 | 8.5 |
+| FU2 | fused, behind pool | 4.788 | 41.8 | 39.9 | 6.5 | 1.4 | - | 3.6 | 7.6 |
+
+(Times in ms, build-line means. FU1b's seven TC lines were the view-1 start-up, which is not gated.
+All d2gates pass.)
+
+**The receipts job, split** (control FUa vs FU1, us means):
+
+| part | X19 (serial walks) | fused |
+| --- | --- | --- |
+| refs (the slots' references / chunk pass) | 2,934 | 691 |
+| cumulative gas (serial walk / prefix) | 3,847 | 1 |
+| receipts (parallel map) | 2,167 | 1,658 |
+| wait in the graft scope | 8,903 | 2,207 |
+
+- **Not adopted.** The fused legs fall between the controls (4.873 and 4.832 against 4.921 and 4.747).
+- **The diagnosis was right.** The two serial walks were 6.8 of the 8.9 ms. Fused, the fold falls from
+  8.8 to 2.2 ms. The time behind the seal falls from 9.3 to 2.7 ms (`par_behind_seal_us`), and the
+  child's state_wait from ~4.5 to ~1 ms. par_ms falls from 42 to 33-36 ms.
+- **The chain absorbed the cut.** The receipts had been mostly behind the seal: what they delayed was
+  the next build's view of its parent's state. With that gone, the next build's start waits on the next
+  two items:
+  - the queue hand-off (start_handoff ~3 ms, so par_start 5-6.5 ms);
+  - the parent's fields at depth 2 (parent_fields 2.9 rising to 4.0-5.8 ms, p90 14-17).
+
+  sealed_at falls by only 0.3-1.1 ms, and sealed_ms rises 0.8-2.7 ms.
+- **Next: stage ef.** The frame road removes the hand-off wait. Before, it moved that wait onto the
+  parent's state, which was the receipts (10.199). With the fused receipts that wait is gone, so the road
+  is tried on top. FVa/FVb run X19; FV1/FV1b run fused receipts + build pool + road; FV2 adds the async
+  journal filter. If the parent's fields then bind, the depth-2 fields chain (seal_to_fields 65-70 ms) is
+  next.

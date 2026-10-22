@@ -4663,3 +4663,40 @@ road + reseed) against X19.
   is empty: everything below it is in a build's take or mined. New test:
   `a_flush_keeps_the_next_of_a_sender_whose_frames_were_taken`.
 - **Next: stage eo.** It runs this config with the full-map reseed, after its unit tests pass.
+
+## 10.210 -- the knob config passes the two-pair rule; X20 adopted (stage eo, 2026-10-22)
+
+**Why this stage.** Stage eo repeats the 10.207 configuration against X19, now with the full-map reseed
+(a21aca778), so that a flush keeps every sender the road knew.
+
+| leg | config | drain M/s | seal -> seal mean | windows (M/s) | road flushes | refused unknown | queued p50 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| LKa | X19 | 4.809 | 41.6 | 4.81 / 4.87 / 4.75 | - | - | 2,346,000 |
+| LK1 | knob | **5.001** | **40.0** | 5.11 / 4.94 / 4.87 | 0 | 0 | 2,299,000 |
+| LKb | X19 | 4.835 | 41.4 | 4.92 / 4.86 / 4.69 | - | - | 2,352,500 |
+| LK1b | knob | 4.915 | 40.7 | 4.98 / 4.89 / 4.82 | 0 | 0 | 2,283,500 |
+| LK1c | knob | **5.001** | **40.0** | 4.99 / 5.01 / 4.96 | 0 | 0 | 2,304,000 |
+
+(All five d2gates and bodygates pass: invalid 0, fields mismatches 0, ParentUnknown 0, verify pass. The
+only TC lines are seven view-1 start-up lines on LKa, which are not gated. There were no handovers.)
+
+- **The two-pair rule passes.** The bar is 4.835 x 1.015 = 4.908, and all three knob legs clear it:
+  LK1 by +4.0% and +3.4%, LK1b by +2.2% and +1.7%, LK1c by +4.0% and +3.4%.
+- **The knob config over four stages (el-eo).** Nine legs: 5.004, 4.905, 5.022, 5.065, 4.717, 5.041,
+  5.001, 4.915 and 5.001 (mean 4.963). Six of the nine are at or over 5.0M/s. The eight X19 controls
+  read 4.784-4.939 (mean 4.854), so the gain is +2.2%.
+- **The full-map reseed was not exercised.** No leg flushed the road, so eo shows no regression from
+  a21aca778, but it does not test the flush path. That path's only evidence is its unit tests:
+  `a_flush_keeps_the_next_of_a_sender_whose_frames_were_taken` and
+  `a_flush_reseeds_its_senders_before_a_build_empties_their_lanes`.
+  The degraded mode of 10.206 (LG1) and 10.209 (LJ1b) came after a flush. So a flush leg on the new
+  code is still owed.
+- **X20 = X19 + `N42_RECEIPTS_ON_BUILD_POOL=1 N42_RECEIPTS_FUSED=1 N42_PARALLEL_BUILD_THREADS=32
+  N42_FRAME_ROAD=1 N42_LOCK_SITES=1 N42_ROAD_RESEED_AT_FLUSH=1`**, with
+  `F7_CONSENSUS_ROOT=/home/n42/.cache/n42-consensus`. It reaches the 5M/s target on the mean of good
+  legs. The mean gap is 40.0 ms on the 5.0 legs. It is not yet there on every leg: the spread is
+  4.72-5.07.
+- **Next.**
+  - Port the frame road, the fused receipts and the reseed to main. Main has none of them.
+  - Collect X20 legs until a flush occurs, to see whether the road recovers.
+  - Widen the margin. The two 40 ms chains (seal -> seal, and rename -> fields) both still bind.

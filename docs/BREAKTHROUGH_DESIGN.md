@@ -5098,3 +5098,35 @@ request had waited 20 minutes, so the runner yielded at the leg boundary.
 - **Next: the queue hand-off.** The work is to make the parent's hand-off and frame sweep finish before the
   child's selector arrives (handoff_hold 0.65-1.1 ms, start_handoff 2.6-4.7 ms), or to let the selector
   take frames without waiting for the sweep. With that floor lowered, the filter's 3 ms becomes reachable.
+
+## 10.199 -- the frame road moves the wait to the parent's state again; the fold is the receipts (stage ec, 2026-10-21)
+
+**Why this stage.** On eb, the queue hand-off took the O(1) whole-take path on every full block, but it
+waited 2.0-3.4 ms for the lanes lock (`queue_lock_us`). Stage ec pairs X19 against X19 + the frame road
+(`N42_FRAME_ROAD=1`, consensus on nvme0, lock sites), plus one leg of road + async journal filter (FR2).
+
+| leg | config | drain M/s | seal -> seal mean | sealed_at | par_start | state_wait | par_exec | par_fold |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FRa | X19 | 4.842 | 41.0 | 39.2 | 4.8 | 4.7 | 21.0 | 8.4 |
+| FR1 | + road | 4.846 | 41.3 | 39.6 | 0.1 | 10.1 | 20.9 | 9.9 |
+| FRb | X19 | 4.893 | 40.8 | 39.1 | 4.5 | 4.7 | 20.3 | 8.5 |
+| FR1b | + road | 4.676 | 42.5 | 40.6 | 0.9 | 10.4 | 21.4 | 10.1 |
+| FR2 | + road + async filter | 4.770 | 41.9 | 40.2 | 0.1 | 11.0 | 19.0 | 10.3 |
+
+(Times in ms, build-line means.)
+
+- **The road is not adopted.** All five d2gates pass.
+- **The road behaves as it did in 10.187.** par_start falls to 0.1-0.9 ms, and state_wait rises by the same
+  amount, to 10-11 ms. The build now starts at once and waits for its parent's state instead.
+- **What the parent's state waits for is the fold, and the fold is the receipts.** On FRa, par_fold
+  (8.4 ms) is entirely `scope_receipts_wait_us` (mean 8,479, p50 7,831, p90 12,163). The receipts are
+  built in parallel, but on the pool behind the seal (`N42_FREEZE_POOL=own`, 16 threads, which X11's
+  layout puts on the background cores) beside the freeze. That is about 600 ns of pool time per receipt.
+- XA2 (10.194) shows the other side of the same piece. With `N42_SHARDS_BEFORE_RECEIPTS=1` the state is
+  early (state_wait 2.4, seal_to_view 2.1 ms), but the seal waits for the receipts instead
+  (`receipts_late_wait_us` 8,591, sealed_ms 18).
+- **So the 8.5 ms receipts job sits on the leader's serial chain whichever way it is arranged.** The queue,
+  the parent's state and the fold are one floor: the receipts behind each block.
+- **Next: stage ed.** `N42_RECEIPTS_ON_BUILD_POOL=1` (5d23dcc4a) runs the receipts on the 64-thread
+  build pool, which is idle once the execution ends. The stage pairs it with X19, plus RB2: receipts +
+  road + async filter, with all three floors cut at once.

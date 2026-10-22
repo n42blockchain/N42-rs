@@ -185,8 +185,9 @@ pub(crate) struct RoadSender {
 }
 
 /// `N42_ROAD_RESEED_AT_FLUSH=1` (off by default): a flush seeds again, at
-/// once, every sender whose frames it put back in the lanes, from those
-/// lanes. Seeding is otherwise lazy, at the sender's next frame. By then a
+/// once, every sender the road knew: from its lane's tail where the lane
+/// holds anything (the flushed frames among it), else at the `next` it had
+/// (everything below it is in a build's take or mined). Seeding is otherwise lazy, at the sender's next frame. By then a
 /// build has usually taken the lane empty, and a sender with an empty
 /// lane cannot be seeded. At 5M/s every sender is then refused for the
 /// rest of the leg, and the road stays shut (10.206: `seeded` 0 and
@@ -679,15 +680,25 @@ impl<T: PoolTransaction> Road<T> {
     /// lowers the count with [`Self::sub_len`] once the lanes count them).
     /// Counted as a flush.
     pub(crate) fn invalidate(&self) -> Vec<RoadFrame<T>> {
+        self.invalidate_keeping(false).0
+    }
+
+    /// [`Self::invalidate`], and with `keep` the senders the map knew, each
+    /// with the `next` it had (for [`reseed_at_flush`] to seed them again).
+    pub(crate) fn invalidate_keeping(&self, keep: bool) -> (Vec<RoadFrame<T>>, Vec<(Address, u64)>) {
         let mut shards = self.lock_shards(u64::MAX);
+        let mut known = Vec::new();
         for slot in shards.guards.iter_mut().flatten() {
+            if keep {
+                known.extend(slot.iter().map(|(sender, entry)| (*sender, entry.next)));
+            }
             slot.clear();
         }
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.counters.flushes.fetch_add(1, Ordering::Relaxed);
         let frames: Vec<RoadFrame<T>> = std::mem::take(&mut *self.fifo.lock()).into();
         drop(shards);
-        frames
+        (frames, known)
     }
 
     /// The FIFO's frames' ids in order (tests).

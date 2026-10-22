@@ -5451,53 +5451,58 @@ impl<T: PoolTransaction> Inner<T> {
     /// that very lane entry -- would never take them.
     fn road_flush(&mut self) {
         let road = Arc::clone(&self.road);
-        let frames = road.invalidate();
+        let (frames, known) = road.invalidate_keeping(road.reseed());
         if self.road_epoch != 0 {
             self.road_epoch = road.epoch();
         }
         self.road_debt.clear();
-        if frames.is_empty() {
-            return;
+        if !frames.is_empty() {
+            self.lanes_gen = self.lanes_gen.wrapping_add(1);
         }
-        self.lanes_gen = self.lanes_gen.wrapping_add(1);
-        let mut senders: Vec<Address> = Vec::new();
         for frame in frames {
             for (valid, (sender, nonce)) in frame.txs.iter().zip(frame.members.iter()) {
                 self.insert_keyed(*sender, *nonce, Arc::clone(valid));
             }
-            if road.reseed() {
-                senders.extend(frame.members.iter().map(|(sender, _)| *sender));
-            }
             self.road_unaccounted += frame.len();
             self.frames.insert(frame.new_frame(), Some(Arc::clone(&frame.txs)));
         }
-        if !senders.is_empty() {
-            senders.sort_unstable();
-            senders.dedup();
-            self.road_reseed(&road, &senders);
+        if !known.is_empty() {
+            self.road_reseed(&road, &known);
         }
     }
 
-    /// `N42_ROAD_RESEED_AT_FLUSH=1`: `senders` (those a flush just put back
-    /// in the lanes) seeded again from their lanes, as [`TxQueue::road_seed`]
-    /// seeds them: `next` is the lane's highest nonce + 1, and the lane is
-    /// road debt in this epoch. The lanes' lock is held, so no build takes
-    /// from these lanes in between.
-    fn road_reseed(&mut self, road: &road::Road<T>, senders: &[Address]) {
+    /// `N42_ROAD_RESEED_AT_FLUSH=1`: the senders the road knew before a
+    /// flush, each with the `next` it had, seeded again at once. A sender
+    /// whose lane holds anything (the flushed frames among it) seeds as
+    /// [`TxQueue::road_seed`] seeds it: `next` past the lane's highest nonce,
+    /// and the lane is road debt in this epoch. A sender with an empty lane
+    /// keeps its `next`: everything below it is in a build's take or mined.
+    /// The lanes' lock is held, so no build takes from these lanes in
+    /// between.
+    fn road_reseed(&mut self, road: &road::Road<T>, known: &[(Address, u64)]) {
         use std::sync::atomic::Ordering;
         let epoch = self.road_epoch;
-        let mut shards = road.lock_senders(senders.iter());
-        for sender in senders {
+        let mut shards = road.lock_senders(known.iter().map(|(sender, _)| sender));
+        for (sender, had) in known {
             if shards.get(sender).is_some() {
                 continue;
             }
-            let Some(lane) = self.lanes.get_mut(sender) else { continue };
-            let Some((last, _)) = lane.by_nonce.last_key_value() else { continue };
-            let next = last.saturating_add(1);
-            if epoch != 0 {
-                lane.road = epoch;
-                self.road_debt.insert(*sender);
-            }
+            let tail = self.lanes.get_mut(sender).and_then(|lane| {
+                let last = *lane.by_nonce.last_key_value()?.0;
+                if epoch != 0 {
+                    lane.road = epoch;
+                }
+                Some(last)
+            });
+            let next = match tail {
+                Some(last) => {
+                    if epoch != 0 {
+                        self.road_debt.insert(*sender);
+                    }
+                    last.saturating_add(1).max(*had)
+                }
+                None => *had,
+            };
             shards.insert(*sender, road::RoadSender { next, ..road::RoadSender::default() });
             road.counters.seeded.fetch_add(1, Ordering::Relaxed);
         }

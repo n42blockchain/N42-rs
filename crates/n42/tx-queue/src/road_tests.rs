@@ -189,6 +189,32 @@ fn a_flush_reseeds_its_senders_before_a_build_empties_their_lanes() {
     }
 }
 
+/// `N42_ROAD_RESEED_AT_FLUSH`: a sender whose road frames a build already
+/// took (nothing of it on the road or in the lanes at the flush) keeps its
+/// `next` through the flush, so its next frame is admitted, not refused
+/// as `unknown`.
+#[test]
+fn a_flush_keeps_the_next_of_a_sender_whose_frames_were_taken() {
+    for reseed in [false, true] {
+        let q = road_queue();
+        q.road.set_reseed(reseed);
+        push_members(&q, &[(sender(2), 0), (sender(2), 1)], 1);
+        let taken: usize = chain_of(&q, 1, 100 * TX_GAS).iter().map(Vec::len).sum();
+        assert_eq!(taken, 2);
+        push_members(&q, &[(sender(9), 0)], 2);
+        push_members(&q, &[(sender(9), 5)], 3);
+        assert_eq!(q.road_stats().flushes, 1);
+        push_members(&q, &[(sender(2), 2)], 4);
+        let stats = q.road_stats();
+        if reseed {
+            assert_eq!(stats.refused_unknown, 0, "{stats:?}");
+            assert_eq!(q.road.sender(&sender(2)).map(|s| s.next), Some(3));
+        } else {
+            assert_eq!(stats.refused_unknown, 1, "{stats:?}");
+        }
+    }
+}
+
 /// Transactions of an on-road sender that arrive without a frame flush
 /// the road; those of a sender not on it only move its `next`.
 #[test]

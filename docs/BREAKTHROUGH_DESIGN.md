@@ -4511,3 +4511,34 @@ road) was skipped when the stage yielded to a foreign request.
 - **Next: stage ej.** It tests whether fewer execution threads keep par_exec while easing the loaded
   latency. 10.165 found par_exec latency-bound, and stage cn found it flat above 16 cores. LFa/LFb run X19
   (64 threads); LF1/LF1b run fused receipts with 48 threads; LF2 runs fused receipts with 32.
+
+## 10.205 -- fewer build threads give the root chain slack, and the build chain pays it (stage ej, 2026-10-22)
+
+**Why this stage.** 10.204 traced the root's slow lookups to the build's 64 memory-bound threads. Stage ej
+tests whether fewer threads keep par_exec flat while easing that pressure. LFa/LFb run X19 (64 threads);
+LF1/LF1b run fused receipts on 48 threads; LF2 runs fused receipts on 32.
+
+| leg | config | drain M/s | seal -> seal mean | sealed_at | par_start | par_exec | sealed_ms | parent_fields | seal_to_fields | root lookups (us) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| LFa | X19, 64 threads | 4.663 | 42.8 | 38.6 | 4.2 | 21.1 | 6.7 | 4.1 | 66.8 | 5,380 |
+| LF1 | fused, 48 threads | 4.778 | 41.6 | 39.7 | 5.4 | 23.5 | 6.2 | 3.6 | 64.1 | 7,496 |
+| LFb | X19, 64 threads | 4.874 | 41.0 | 39.1 | 5.5 | 21.3 | 5.6 | 2.9 | 66.7 | 5,379 |
+| LF1b | fused, 48 threads | 4.812 | 41.4 | 37.4 | 6.5 | 22.9 | 4.7 | 2.4 | 59.0 | 6,837 |
+| LF2 | fused, 32 threads | 4.840 | 41.3 | 37.3 | 4.1 | 26.6 | 4.1 | 1.8 | **54.5** | 5,804 |
+
+(Times in ms unless marked, build-line means. All five d2gates pass; there were no handovers.)
+
+- **Not adopted.** Every knob leg falls between the controls.
+- **par_exec is not flat below 64 threads.** It reads 21.1-21.3 ms on 64 threads, 22.9-23.5 on 48 and
+  26.6 on 32. So the execution is partly throughput-bound, not purely latency-bound.
+- **Fewer threads give the root chain slack.** seal_to_fields falls from 66.8 ms to 59-64 ms on 48
+  threads and to 54.5 ms on 32. parent_fields falls to 1.8 ms and sealed_ms to 4.1 ms. The two chains are
+  coupled through memory: a lighter execution shortens the root's own work.
+  - The root's mean lookup time is not where the 32-thread gain shows (5.8 ms), so the cut is elsewhere
+    in the root job.
+- **The sum is flat.** On 32 threads, the build chain's +5.5 ms of execution offsets the fused receipts'
+  cut, and the root chain's new slack goes unused, because nothing on the build chain then waits for it.
+- **Next: stage ek.** The road removes the build chain's start wait (par_start 4-6 ms). Before, the road
+  failed because it pushed the root chain past its floor (10.203); with 32 threads the root chain has
+  ~12 ms of slack to absorb that. LGa/LGb run X19; LG1/LG1b run fused receipts + 32 threads + road; LG2
+  runs fused receipts + 40 threads + road.

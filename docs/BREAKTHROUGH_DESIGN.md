@@ -4400,3 +4400,32 @@ All d2gates pass.)
   is tried on top. FVa/FVb run X19; FV1/FV1b run fused receipts + build pool + road; FV2 adds the async
   journal filter. If the parent's fields then bind, the depth-2 fields chain (seal_to_fields 65-70 ms) is
   next.
+
+## 10.202 -- fused receipts + frame road: two legs at record level, one degraded (stage ef, 2026-10-22)
+
+**Why this stage.** In 10.201 the fused receipts removed the parent-state wait. The next build's start
+then waited on the queue hand-off instead. The frame road removes that wait, so stage ef tries both
+together. FVa/FVb run X19. FV1/FV1b run fused receipts on the build pool plus the road. FV2 adds the
+async journal filter.
+
+| leg | config | drain M/s | seal -> seal mean | sealed_at | par_start | start_handoff | parent_fields | state_wait | par_fold | sealed_ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FVa | X19 | 4.730 | 42.1 | 38.2 | 4.7 | 2.7 | 4.1 | 3.8 | 8.5 | 6.6 |
+| FV1 | fused + road | 4.270 | 43.1 | 41.1 | 7.9 | 0.1 | 5.4 | 1.5 | 2.2 | 8.2 |
+| FVb | X19 | 4.875 | 41.0 | 38.8 | 4.2 | 2.3 | 4.2 | 4.7 | 8.7 | 6.7 |
+| FV1b | fused + road | **4.970** | 40.2 | 38.5 | 0.4 | 0.1 | 9.7 | 2.4 | 2.8 | 11.6 |
+| FV2 | + async filter | 4.902 | 40.7 | 38.9 | 0.4 | 0.1 | 11.0 | 2.7 | 2.7 | 13.2 |
+
+(Times in ms, build-line means. All five d2gates pass.)
+
+- **Not adopted, and not concluded.** FV1b (4.970, mean gap 40.2 ms) and FV2 beat both controls.
+  FV1 is a degraded leg: window 1 read 4.94M at 99.8% full, but window 2 fell to 4.16M (96.6% full) and
+  window 3 to 3.73M (94.9% full), with four tenure handovers. No other leg in ea-ef had a handover. The
+  long-gap blocks on FV1 had a usable queue of ~0.48M against ~1.97M on the short ones, so supply ran
+  thin. The trigger is not identified. The held-block bound warning is not it: the controls show it too
+  (FVb 568, FV1 755, FV1b 1,645).
+- **Where the road works, the wait moves to the parent's fields.** With the road, start_handoff falls to
+  0.1 ms and par_start to 0.4 ms. parent_fields (the depth-2 fields chain) rises to 9.7-11 ms, and so does
+  sealed_ms. As forecast in 10.201, the depth-2 fields chain is the next floor.
+- **Next: stage eg, a repeat.** GWa/GWb run X19; GW1/GW1b/GW1c run fused receipts + build pool + road.
+  This tells whether FV1's degradation recurs with the road, and whether FV1b's level holds.

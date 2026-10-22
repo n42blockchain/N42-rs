@@ -4542,3 +4542,40 @@ LF1/LF1b run fused receipts on 48 threads; LF2 runs fused receipts on 32.
   failed because it pushed the root chain past its floor (10.203); with 32 threads the root chain has
   ~12 ms of slack to absorb that. LGa/LGb run X19; LG1/LG1b run fused receipts + 32 threads + road; LG2
   runs fused receipts + 40 threads + road.
+
+## 10.206 -- on 32 threads the road reaches 4.979, and its degraded mode recurs (stage ek, 2026-10-22)
+
+**Why this stage.** 10.205 left the root chain ~12 ms of slack on 32 build threads. Stage ek adds the road,
+which removes the build chain's start wait. LGa/LGb run X19; LG1/LG1b run fused receipts + 32 threads +
+road; LG2 runs fused receipts + 40 threads + road.
+
+| leg | config | drain M/s | seal -> seal mean | sealed_at | par_start | par_exec | parent_fields | seal_to_fields | root lookups (us) | queued p50 | ingest rate |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| LGa | X19 | 4.799 | 41.6 | 39.8 | 4.7 | 21.4 | 4.2 | 70.6 | 5,650 | 2,320,500 | 4.79M |
+| LG1 | fused, 32 thr, road | 4.037 | 48.5 | 46.7 | **17.1** | 21.2 | 0.3 | 33.9 | 3,437 | **4,000** | 3.99M |
+| LGb | X19 | 4.778 | 41.5 | 39.8 | 6.5 | 21.0 | 3.4 | 67.3 | 5,575 | - | - |
+| LG1b | fused, 32 thr, road | **4.979** | 40.1 | 38.3 | 0.1 | 29.1 | 3.7 | 67.8 | 8,284 | 2,298,000 | 5.00M |
+| LG2 | fused, 40 thr, road | 4.859 | 41.1 | 38.0 | 0.2 | 25.8 | 4.2 | 65.8 | 8,025 | 2,296,000 | 4.93M |
+
+(Times in ms unless marked, build-line means. All five d2gates pass; there were no handovers.)
+
+- **Not adopted.** LG1b is the best leg of this session (4.979, mean gap 40.1 ms) and LG2 clears both
+  controls by 1.2-1.7%, but LG1 is degraded.
+- **The road's degraded mode is the same in both cases.** It hit FV1 in 10.202 and LG1 here: 2 of the 9
+  road legs in ef-ek. In both, from window 1 on:
+  - the queue is nearly empty (queued p50 2,000-4,000 against ~2.3M) and the flood is held at ~3.8-4.0M/s;
+  - the flood still reports its deepest pool at 2.5M (its backpressure bound) and waits on it;
+  - the build's start waits 17 ms in the selector (`start_best_other_ms` 16.6), sweeping ~367 frames at
+    the take (`start_frames_swept_at_take`, 0 on the good legs) with `pull_bulk_us` 811 against 21.
+
+  So the transactions are admitted but not usable. They count against the pool bound that paces the
+  flood, but the builder reaches them only through the slow frame sweep. Once in this state the leg
+  stays there: a supply-bistable floor, like 10.169. The held-block bound is not the cause: LG1 shows
+  7 such warnings against LG1b's 2,009.
+- **On the good road legs, the root chain does absorb the road.** seal_to_fields stays at ~66-68 ms,
+  despite lookups of ~8 ms and the slower execution. But sealed_at only reaches ~38 ms, because the
+  32-thread execution (29 ms) eats the road's start cut.
+- **Next.** The road's supply-bistable mode is now the blocker: without it, the six good road legs read
+  4.764-4.979. The fix belongs in the frame road's take path in `tx-queue` (`frames.rs`
+  `sweep_at_take`, the bound that refuses rather than evicts). The admitted transactions have to stay
+  reachable without a per-build sweep, or the bound must not count frames the builder cannot use.

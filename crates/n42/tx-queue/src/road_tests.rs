@@ -158,6 +158,37 @@ fn a_sender_with_an_empty_known_lane_is_refused_as_unknown() {
     assert_eq!(q.road.sender(&sender(1)).map(|s| s.next), Some(4));
 }
 
+/// `N42_ROAD_RESEED_AT_FLUSH`: a flush seeds its senders again from the
+/// lanes it put their frames back in, so a sender whose lane a build then
+/// takes empty is not refused as `unknown` at its next frame. Without it,
+/// that sender stays unknown.
+#[test]
+fn a_flush_reseeds_its_senders_before_a_build_empties_their_lanes() {
+    for reseed in [false, true] {
+        let q = road_queue();
+        q.road.set_reseed(reseed);
+        push_members(&q, &[(sender(1), 0), (sender(1), 1)], 1);
+        push_members(&q, &[(sender(1), 2), (sender(1), 3)], 2);
+        assert_eq!(q.road_stats().frames, 2);
+        // Another on-road sender's gap flushes the whole road into the
+        // lanes, sender(1)'s frames with it.
+        push_members(&q, &[(sender(9), 0)], 3);
+        push_members(&q, &[(sender(9), 5)], 4);
+        assert_eq!(q.road_stats().flushes, 1);
+        // Builds take sender(1)'s lane empty.
+        let taken: Vec<Tx> = chain_of(&q, 2, 100 * TX_GAS).into_iter().flatten().collect();
+        assert_eq!(taken.iter().filter(|t| t.sender() == sender(1)).count(), 4);
+        push_members(&q, &[(sender(1), 4)], 5);
+        let stats = q.road_stats();
+        if reseed {
+            assert_eq!(stats.refused_unknown, 0, "{stats:?}");
+            assert_eq!(q.road.sender(&sender(1)).map(|s| s.next), Some(5), "seeded at the flush, then admitted");
+        } else {
+            assert_eq!(stats.refused_unknown, 1, "{stats:?}");
+        }
+    }
+}
+
 /// Transactions of an on-road sender that arrive without a frame flush
 /// the road; those of a sender not on it only move its `next`.
 #[test]

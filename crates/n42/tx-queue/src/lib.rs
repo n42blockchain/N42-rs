@@ -5460,12 +5460,46 @@ impl<T: PoolTransaction> Inner<T> {
             return;
         }
         self.lanes_gen = self.lanes_gen.wrapping_add(1);
+        let mut senders: Vec<Address> = Vec::new();
         for frame in frames {
             for (valid, (sender, nonce)) in frame.txs.iter().zip(frame.members.iter()) {
                 self.insert_keyed(*sender, *nonce, Arc::clone(valid));
             }
+            if road.reseed() {
+                senders.extend(frame.members.iter().map(|(sender, _)| *sender));
+            }
             self.road_unaccounted += frame.len();
             self.frames.insert(frame.new_frame(), Some(Arc::clone(&frame.txs)));
+        }
+        if !senders.is_empty() {
+            senders.sort_unstable();
+            senders.dedup();
+            self.road_reseed(&road, &senders);
+        }
+    }
+
+    /// `N42_ROAD_RESEED_AT_FLUSH=1`: `senders` (those a flush just put back
+    /// in the lanes) seeded again from their lanes, as [`TxQueue::road_seed`]
+    /// seeds them: `next` is the lane's highest nonce + 1, and the lane is
+    /// road debt in this epoch. The lanes' lock is held, so no build takes
+    /// from these lanes in between.
+    fn road_reseed(&mut self, road: &road::Road<T>, senders: &[Address]) {
+        use std::sync::atomic::Ordering;
+        let epoch = self.road_epoch;
+        let mut shards = road.lock_senders(senders.iter());
+        for sender in senders {
+            if shards.get(sender).is_some() {
+                continue;
+            }
+            let Some(lane) = self.lanes.get_mut(sender) else { continue };
+            let Some((last, _)) = lane.by_nonce.last_key_value() else { continue };
+            let next = last.saturating_add(1);
+            if epoch != 0 {
+                lane.road = epoch;
+                self.road_debt.insert(*sender);
+            }
+            shards.insert(*sender, road::RoadSender { next, ..road::RoadSender::default() });
+            road.counters.seeded.fetch_add(1, Ordering::Relaxed);
         }
     }
 

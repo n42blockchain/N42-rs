@@ -98,13 +98,15 @@ fn ok_with(result: Value) -> Arc<Handler> {
     })
 }
 
-fn dead_url() -> Url {
-    // Bind and drop to get a port nothing listens on.
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
-    Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap()
+/// A URL whose port is bound but never listened on, so a connection is
+/// refused. The socket is returned and must be kept alive: a port bound and
+/// dropped could be taken by another test's server in the same binary, and
+/// the call would then reach it.
+fn dead_url() -> (Url, tokio::net::TcpSocket) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    (Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap(), socket)
 }
 
 #[tokio::test]
@@ -212,7 +214,8 @@ async fn a_second_failure_is_returned_not_retried_again() {
 
 #[tokio::test]
 async fn a_refused_connection_is_a_transport_error() {
-    let t = transport(dead_url(), Duration::from_secs(5));
+    let (url, _held) = dead_url();
+    let t = transport(url, Duration::from_secs(5));
     assert!(matches!(t.call("m", vec![]).await, Err(TransportError::Transport(_))));
 }
 
@@ -279,6 +282,7 @@ async fn call_many_counts_a_malformed_answer_as_none_accepted() {
 
 #[tokio::test]
 async fn call_many_to_a_dead_endpoint_counts_zero() {
-    let t = transport(dead_url(), Duration::from_secs(2));
+    let (url, _held) = dead_url();
+    let t = transport(url, Duration::from_secs(2));
     assert_eq!(t.call_many("m", vec![vec![json!(1)]]).await, 0);
 }

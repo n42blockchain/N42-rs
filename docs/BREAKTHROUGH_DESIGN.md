@@ -5584,3 +5584,56 @@ leaked scratch files and whose swap was full. Gov5 cleaned its files before this
 - **Where 5M stands.** X20's mean gap over thirteen legs is 40.3 ms. The legs that faulted lose 2-5% of their
   third window; the legs that did not read 5.00-5.07. Removing the fault bursts is the remaining lever
   within X20.
+
+## 10.213 -- the slow third window is the page cache at capacity: kswapd steals 29-38M pages a leg (stage er, 2026-10-23)
+
+**Why this stage.** 10.212 left the third window's major faults unexplained: the box had 82 GiB available,
+no cgroup limit and one NUMA node. Stage er runs three X20 legs with a hook that samples `/proc/vmstat`
+every 2 s for 120 s from the first full block and records `perf record -e major-faults -d` over the leader's
+threads at +55 s. No code change; all gates clean, no handovers.
+
+| leg | drain M/s | seal -> seal mean | windows (M/s) | major faults by third (build / root) | kswapd steals, 120 s | file refaults |
+| --- | --- | --- | --- | --- | --- | --- |
+| LNa | 4.851 | 41.2 | 4.93 / 4.89 / 4.85 | 6/56, 63k/137k, 10k/120k | 38.0M pages | 966k |
+| LNb | 4.925 | 40.6 | 4.95 / 4.93 / 4.85 | 21/63, 90k/96k, 42k/99k | 33.6M | 737k |
+| LNc | 4.988 | 40.1 | 5.27 / 4.87 / 4.77 | 3/30, 6/34, 89k/154k | 28.7M | 629k |
+
+- **The perf record failed** ("No such process"): one of the ~490 tids listed a moment earlier had exited
+  before the open. Stage es lists the tids twice, 1 s apart, and records on the intersection.
+- **The vmstat sampler is the finding.** Over the 120 s from the first full block, `pgsteal_kswapd` rose by
+  29-38M pages (110-145 GB) and `workingset_refault_file` by 0.6-1.0M, with 0.2-0.3M direct steals,
+  350-870 compaction stalls and 15-39k THP fault fallbacks. LNc's timeline, in 10 s steps:
+
+  | t (s) | kswapd steals | major faults | file refaults | file pages, net |
+  | --- | --- | --- | --- | --- |
+  | 10-20 | 0 | 2-3 | 9-24 | +4.1M, +4.2M |
+  | 30-50 | 0.8M, 0.8M, 1.2M | 30, 2, 1 | 91, 1040, 54 | +3.1M, +2.6M, +2.7M |
+  | 60-70 | 8.3M, 9.0M | 44, 58 | 214, 3839 | -4.6M, -5.3M |
+  | 80-90 | 5.3M, 3.1M | **89,852, 171,183** | **114,853, 439,940** | -1.3M, +1.0M |
+  | 100-110 | 57k, 0 | 71, 5 | 69k, 10 | +0.7M, 0 |
+
+  The page cache grows by 16 GB every 10 s (1.6 GB/s) for the leg's first half, kswapd starts stealing at
+  30 s and runs at 35 GB per 10 s from 60 s, and the refaults -- the major faults on the root and build
+  threads -- arrive at 80-90 s, when the reclaim has reached the QMDB pages a block's execution still
+  reads. `MemAvailable` counts the whole cache as available, which is why the gates read 80+ GiB free
+  throughout. The leg whose cache filled latest (LNc, faults only in its third) read 4.988; the leg whose
+  cache filled first (LNa, faults from its second third) read 4.851.
+- **Not the flood.** `tx_flood` reads the replay set through `POSIX_FADV_DONTNEED` on every consumed range
+  (its `AdviseFile`), so the 1.6 GB/s is the fleet's own files: seven nodes' `entries.log` appends, the
+  QMDB log compactions (214 a leg a node, 35-55 MB each, every ~0.4 s, with the folded snapshot and
+  sealed log hard-linked into `recovery-archive` until the durable-head pruner lets them go), MDBX and the
+  static files. Which of them, and how much each retains, is what stage es measures (du of every node's
+  QMDB files at +30/+60/+85 s, `/proc/meminfo` beside the vmstat counters).
+- **Why X20 is hit and X19 was not.** X20's execution layer holds ~20 GB more anonymous memory (the frame
+  road); the cache has that much less room, so it reaches capacity inside the 93 s drain where X19's did
+  not. The same mechanism was the "stall near block 200-222" of round 43 (page cache reclaimed for the
+  thp:always heaps) at a smaller scale.
+- **A side finding on the own-block hold.** `an own block was still held when the bound was reached` fires
+  on 94% of X20 blocks (2,170 of 2,330 on LMb) and 39% of X19 blocks: the pruner wakes every ~4 s and
+  prunes ~95 blocks at once (`mined=19,000,000` a wake), so a held block (bound 16, 0.64 s) is evicted long
+  before its `settle_own_block`. The eviction's hand-over to the freeing thread is 1.5 ms a block, after the
+  hand-off's signal (`N42_HANDOFF_DONE_FIRST`), so it is off the seal path; noted, not acted on.
+- **Where 5M stands.** Three more X20 legs at 4.851 / 4.925 / 4.988 (sixteen legs since el: mean 4.955).
+  Every leg's first half runs at 5.0-5.27M/s; the remedy for the second half is to keep the fleet's cold
+  file pages out of the way of its hot ones (drop the cache of files no one reads again, or pin the QMDB
+  pages a block reads), which is the next stage after es says which files fill the cache.

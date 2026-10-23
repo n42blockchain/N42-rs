@@ -1002,6 +1002,14 @@ fn spawn_stats_reporter() {
                         seed_holds = d(road.seed_holds, last_road.seed_holds),
                         road_len = road.len_txs,
                         lane_debt = road.lane_debt,
+                        // The taken frames over the interval, and those the
+                        // road still remembers (taken, not yet handed back,
+                        // mined or forgotten at the bound): what it holds.
+                        road_taken = d(road.taken, last_road.taken),
+                        road_handed_back = d(road.handed_back, last_road.handed_back),
+                        road_retired = d(road.retired, last_road.retired),
+                        road_evicted = d(road.evicted, last_road.evicted),
+                        road_taken_live = road.taken.saturating_sub(road.handed_back + road.retired + road.evicted),
                         "frame road"
                     );
                     last_road = road;

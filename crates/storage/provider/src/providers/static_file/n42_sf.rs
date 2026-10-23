@@ -70,28 +70,23 @@ pub(crate) fn drop_cache() -> bool {
     })
 }
 
-/// Releases the page-cache pages of a segment's data file at `data_path`, its offsets file
-/// (`.off`, nippy-jar's `offsets_path()`) and its changeset offsets sidecar (`.csoff`, when it
-/// exists), under `N42_SF_DROP_CACHE=1`. Call it only after the files were synced: clean pages
-/// are dropped, dirty ones are left by the kernel. Best effort, every error is ignored; a no-op
-/// when the switch is off and off Linux.
+/// Releases the page-cache pages of a segment's data file at `data_path`, under
+/// `N42_SF_DROP_CACHE=1` (off by default). Only the data file: its offsets file (`.off`) and
+/// changeset offsets sidecar (`.csoff`) are what readers index the data by, and dropping them
+/// made every read fault them back in (1,200 index faults in 30 s on loop351 leg LP2), while the
+/// data file is written and rarely read. Call it only after the file was synced: clean pages are
+/// dropped, dirty ones are left by the kernel. Best effort, every error is ignored; a no-op when
+/// the switch is off and off Linux.
 pub(super) fn drop_cache_after_commit(data_path: &Path) {
     if !drop_cache() {
         return;
     }
     #[cfg(target_os = "linux")]
-    for path in [
-        data_path.to_path_buf(),
-        data_path.with_extension("off"),
-        data_path.with_extension("csoff"),
-    ] {
-        if let Ok(file) = std::fs::File::open(&path) {
-            use std::os::fd::AsRawFd;
-            // SAFETY: the descriptor is open for the duration of the call, and the advice only
-            // drops clean cached pages of this file; its contents are unaffected.
-            let _ =
-                unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
-        }
+    if let Ok(file) = std::fs::File::open(data_path) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor is open for the duration of the call, and the advice only
+        // drops clean cached pages of this file; its contents are unaffected.
+        let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
     }
     #[cfg(not(target_os = "linux"))]
     let _ = data_path;

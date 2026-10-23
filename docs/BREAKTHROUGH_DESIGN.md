@@ -5715,3 +5715,63 @@ All gates clean, no handovers.
   next lever is the entry file itself: the view's cold reads are the refaults, and the recent region of
   the file could be served from the store's own anonymous buffers instead of file pages.
 - **Where 5M stands.** Twenty-two X20 legs since el, mean 4.957; every leg's first window is 4.94-5.27.
+
+## 10.216 -- dropping the static files' cache does not pay; the in-node knob exposes a frame-road flush loop that is the low legs' cause (stage eu, 2026-10-23)
+
+**Why this stage.** 10.215 left two forms of the static-files cache drop: the bench-side hook every 5 s
+(one leg so far, between its controls) and the in-node form, `N42_SF_DROP_CACHE=1` (the static-file
+writer runs `posix_fadvise(DONTNEED)` over a segment's data, `.off` and `.csoff` files right after each
+commit's fsync). Stage eu ran the build and test gate first (the crates changed; 2,544 tests passed,
+unclaimed), then WARM and four legs: control, hook, knob, control, all with the memory sampler, the `du`
+samples, the maps copy and the 30 s major-fault record. All gates clean, no handovers.
+
+| leg | config | drain M/s | seal -> seal mean | windows (M/s) | occupancy | Cached | Free | kswapd steals, 120 s | file refaults | perf, 30 s at +55 s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| LPc | X20 | 5.006 | 39.9 | 4.99 / 4.99 / 4.96 | 100 / 100 / 100% | 21-39 GB | 22-52 GB | 35.7M | 0.73M | 197,862, 99.7% `entries.log` |
+| LP1b | X20 + drop static_files every 5 s | 4.804 | 41.8 | 5.12 / 4.79 / 4.42 | 100 / 96 / 96% | 21-33 GB | 27-51 GB | 6.9M | 0.55M | (not recorded) |
+| LP2 | X20 + `N42_SF_DROP_CACHE=1` | 3.758 | 54.0 | 4.85 / 3.59 / 2.88 | 100 / 79 / 62% | 17-26 GB | 74-77 GB | **0** | **0** | 2,532: 60% static-file `.off` files, 21% senders/changeset data |
+| LPd | X20 | 5.036 | 39.7 | 5.07 / 5.03 / 4.96 | 100 / 100 / 100% | 26-59 GB | 14-40 GB | 29.0M | 0.76M | 88,608, 99.6% `entries.log` |
+
+- **Both controls over 5.0M/s** (5.006 and 5.036; the third window 4.96 on both, -1% from the first).
+  Twelve X20 controls since el now read 4.851-5.043, mean 4.966; the four over 5.0 are LMb, LOc, LPc, LPd.
+- **The bench-side hook is rejected by the two-pair rule**: LP1 4.930 between its controls 4.864 / 4.990
+  (10.215), LP1b 4.804 under both of its (5.006 / 5.036). Keeping `Cached` at 20-30 GB and the kswapd
+  steals at a fifth of the controls' did not buy a block.
+- **The in-node knob did exactly what it was built for and the leg collapsed anyway.** With the writer
+  releasing every segment's pages after each commit the page cache never grew (17-26 GB, 75 GB free the
+  whole leg), kswapd stole nothing, `thp_fault_fallback` stayed at 0, the entry-file refaults vanished
+  (major faults per block 164 / 71 / 2 by third against the controls' 8 / 40 / 99 and 0 / 0 / 49) --
+  and the first window read 4.85 against the controls' 4.99 / 5.07, then 3.59 and 2.88 with blocks at
+  79% and 62% occupancy. **A leg with no reclaim at all is not a faster leg**: the page-cache line of
+  10.213-10.215 is not where the remaining 1% is.
+- **The knob's own fault.** Dropping the `.off` / `.csoff` offsets files per commit sent every static-file
+  lookup to disk (the build pool's threads took 1,200 faults on `receipts.off` and `transaction-senders.off`
+  in 30 s, plus 527 on the senders and account-changeset data files); the pruner's canonical path ran 35
+  times per 10 s against the controls' 2. The knob is to drop only the data file's pages (commit in this
+  tree), and it stays off: the lever is dead regardless.
+- **The collapse itself is a frame-road flush loop, and it is the low legs' cause.** LP2's log from +45 s:
+  one build refused on a stale parent (`below the canonical head 2047 (persisted 2041)`) gave its take
+  back, which flushed the road (`docs/FRAME_ROAD_DESIGN.md` 2: every road frame into the lanes and the
+  index, every sender reseeded, the lanes road debt, the gate shut). The index then drained at ~240
+  frames a build (blocks of 120k) while the same 12,500 senders' new frames were admitted to the road
+  again (28k frames per 5 s); after 8 builds `road_note_stuck` saw the debt not lower and flushed again,
+  dumping those frames into the lanes too -- `flushes=6` per 5 s for the rest of the leg, `lane_debt`
+  0.5M -> 1.9M, `road_taken` 0, `frame plan empty while frames are arriving; the build does not walk the
+  lanes` 405 times (`candidates=0` with 2.5M usable in the queue). The design's "Left for stage 2" names
+  this exact case: "a flush loop when untakeable debt keeps coming back". There is no log line on a flush,
+  which is why 10.206-10.211 saw only its counters.
+- **The same loop, milder, is on every low leg since el.** Builds refused for `arriving` / flushes per leg:
+  LM1 and LM1b (4.820) 6 / 1, LOb (4.940) 27 / 4, LPa (4.864) 40 / 5, LP1b (4.804) 54 / 4, LP2 (3.758)
+  405 / 6; LNc (4.988) 16 / 3 recovered fast. Every leg at 0 / 0 reads 4.925-5.043 except LNa (4.851,
+  the cold-box leg of 10.213). LPa's episode shows the race: two flushes, debt 1.5M, paid off in 5 s, the
+  road back. Whether a leg recovers is whether the index drains the flushed frames before the 8-build
+  stuck timer fires again; at 5M/s the road holds 2.5M transactions = 12 builds' worth, so the timer is
+  shorter than the drain the flush itself creates.
+- **Fix (in progress, `crates/n42/tx-queue`)**: the stuck flush requires stagnation (no indexed frame taken
+  over the 8 builds, not merely the debt not lower), a cool-down after a flush sized to the frames it moved
+  (F / 400 + 8 builds), a log line on every flush with its reason and size, a `flushes_stuck` counter on
+  the 5 s road line, `N42_ROAD_STUCK_LEGACY=1` for the old rule, and unit tests for both the loop and the
+  genuinely untakeable debt. Stage ev runs it against legacy controls; the test is not a mean but a tail:
+  no leg with the loop.
+- **Where 5M stands.** Clean X20 legs are 4.93-5.04 and the low tail is this loop. The fix is the lever
+  for "5M on every leg"; the memory line (entry-file refaults, kswapd) is parked.

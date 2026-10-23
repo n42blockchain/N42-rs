@@ -197,6 +197,33 @@ fn reseed_at_flush() -> bool {
     *ON.get_or_init(|| std::env::var("N42_ROAD_RESEED_AT_FLUSH").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `N42_ROAD_STUCK_LEGACY=1` (off by default): the stuck flush fires on the
+/// first rule -- the gate shut with the debt not lower over
+/// `ROAD_STUCK_BUILDS` builds -- with no progress test and no cool-down.
+/// That rule flushed every ~8 builds at full load while the debt of the
+/// previous flush was being taken (loop351 stage eu, leg LP2MEMF: six
+/// flushes per 5 s, every one putting the frames admitted meanwhile back
+/// in the lanes, so the gate never reopened).
+pub(crate) fn road_stuck_legacy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_ROAD_STUCK_LEGACY").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Why the road was invalidated (the flush's log line).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlushReason {
+    /// A frame was refused with a member already on the road.
+    Refused,
+    /// An on-road sender's transactions arrived without a frame.
+    Frameless,
+    /// A give-back brought an on-road sender's transactions to the lanes.
+    GiveBack,
+    /// A build walks the lanes, which never takes the road's frames.
+    Walk,
+    /// The gate stayed shut on debt no build was taking.
+    Stuck,
+}
+
 /// Why a frame was not admitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
@@ -232,6 +259,7 @@ pub(crate) struct RoadCounters {
     pub(crate) txs: AtomicU64,
     pub(crate) refused: [AtomicU64; 4],
     pub(crate) flushes: AtomicU64,
+    pub(crate) flushes_stuck: AtomicU64,
     pub(crate) seeded: AtomicU64,
     pub(crate) seed_holds: AtomicU64,
     pub(crate) len_txs: AtomicU64,
@@ -260,6 +288,8 @@ pub struct RoadStats {
     /// Times the road was invalidated: its map cleared (and its queued
     /// frames moved to the lanes' path).
     pub flushes: u64,
+    /// Of those, the flushes of a gate stuck on debt no build was taking.
+    pub flushes_stuck: u64,
     /// Senders that joined the road.
     pub seeded: u64,
     /// Holds of the lanes' lock the seeding took.
@@ -288,6 +318,7 @@ impl RoadCounters {
             refused_no_frame: get(&self.refused[Refusal::NoFrame as usize]),
             refused_dup_sender: get(&self.refused[Refusal::DupSender as usize]),
             flushes: get(&self.flushes),
+            flushes_stuck: get(&self.flushes_stuck),
             seeded: get(&self.seeded),
             seed_holds: get(&self.seed_holds),
             len_txs: get(&self.len_txs),

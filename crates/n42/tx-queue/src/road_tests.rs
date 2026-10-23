@@ -525,3 +525,97 @@ fn a_large_road_take_lists_the_body_in_order() {
     assert_depth(&q, 0);
     assert_eq!(q.road.taken_len(), 0);
 }
+
+/// A flush at full load puts thousands of frames in the lanes as the new
+/// epoch's debt, and frames for the same senders keep reaching the road
+/// while builds take that debt a bounded number of frames at a time: the
+/// road is not flushed again while the takes make progress, and the gate
+/// reopens once the flushed frames are taken (loop351 stage eu).
+#[test]
+fn a_flush_whose_debt_is_being_taken_does_not_flush_again() {
+    let q = road_queue();
+    q.road.set_reseed(true);
+    flood(&q, 100, 0, 20, 50);
+    assert_eq!(q.road.queued_ids().len(), 40);
+    q.road_flush(road::FlushReason::GiveBack);
+    assert_eq!(q.road_stats().flushes, 1);
+    assert_depth(&q, 2_000);
+    let mut parent = block_hash(0);
+    let mut reopened = None;
+    for n in 1..=30u64 {
+        // One new frame per build for senders whose lanes are still debt:
+        // admitted to the road (seeded past the lane tail at the flush).
+        flood(&q, 50, 19 + n, 1, 50);
+        let (txs, _) = build(&q, parent, 100);
+        assert!(!txs.is_empty(), "build {n} took nothing");
+        parent = commit(&q, parent, n, &txs);
+        let stats = q.road_stats();
+        assert_eq!((stats.flushes, stats.flushes_stuck), (1, 0), "build {n}: {stats:?}");
+        if reopened.is_none() && stats.taken > 0 {
+            assert_eq!(stats.lane_debt, 0, "{stats:?}");
+            reopened = Some(n);
+        }
+    }
+    let at = reopened.expect("the gate reopened");
+    assert!(at as u64 > ROAD_STUCK_BUILDS, "reopened at build {at}");
+}
+
+/// The stuck rule itself: flat debt with frames taken every build waits
+/// until the backstop; after a flush (and its cool-down) flat debt with
+/// nothing taken flushes after [`ROAD_STUCK_BUILDS`] builds.
+#[test]
+fn the_stuck_flush_waits_for_the_takes_to_stall() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let q = road_queue();
+    let mut inner = q.lock_inner_quiet();
+    inner.road.counters.lane_debt.store(5_000, Relaxed);
+    for _ in 0..ROAD_STUCK_BACKSTOP_BUILDS {
+        inner.builds += 1;
+        inner.frames_planned += 240;
+        inner.road_note_stuck();
+    }
+    assert_eq!(inner.road.counters.read().flushes, 0, "progress keeps the road");
+    inner.builds += 1;
+    inner.frames_planned += 240;
+    inner.road_note_stuck();
+    assert_eq!((inner.road.counters.read().flushes, inner.road.counters.read().flushes_stuck), (1, 1), "the backstop");
+    inner.road.counters.lane_debt.store(5_000, Relaxed);
+    let mark = inner.builds + 1;
+    let mut fired = None;
+    for _ in 0..2 * ROAD_STUCK_BUILDS {
+        inner.builds += 1;
+        inner.road_note_stuck();
+        if fired.is_none() && inner.road.counters.read().flushes == 2 {
+            fired = Some(inner.builds);
+        }
+    }
+    assert_eq!(fired, Some(mark + ROAD_STUCK_BUILDS), "no takes: the first rule's window");
+}
+
+/// Debt no frame plan can take, with nothing indexed to take instead,
+/// still flushes the road after [`ROAD_STUCK_BUILDS`] builds (the stuck
+/// flush's first purpose), counted as a stuck flush.
+#[test]
+fn untakeable_debt_with_nothing_indexed_still_flushes() {
+    let q = road_queue();
+    for s in 0..10 {
+        q.push([tx_hashed(sender(s), 0)]);
+    }
+    flood(&q, 10, 1, 2, 10);
+    assert_eq!(q.road.queued_ids().len(), 2);
+    let mut parent = block_hash(0);
+    let mut flushed_at = None;
+    for n in 1..=16u64 {
+        let (txs, _) = build(&q, parent, 1_000);
+        if q.road_stats().flushes > 0 && flushed_at.is_none() {
+            flushed_at = Some(n);
+        }
+        if !txs.is_empty() {
+            parent = commit(&q, parent, n, &txs);
+        }
+    }
+    let at = flushed_at.expect("the road was invalidated");
+    assert!(at > ROAD_STUCK_BUILDS && at <= ROAD_STUCK_BUILDS + 2, "flushed at build {at}");
+    let stats = q.road_stats();
+    assert_eq!((stats.flushes, stats.flushes_stuck, stats.len_txs), (1, 1, 0), "{stats:?}");
+}

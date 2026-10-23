@@ -5674,3 +5674,44 @@ counters every 2 s, and runs `du` over the QMDB files, `db` and `static_files` o
 - **Where 5M stands.** LOc is the record drain-rate leg, 5.043M/s at a 39.7 ms mean gap; nineteen X20 legs
   since el average 4.959. Every leg's first half runs at 4.94-5.22; the second half loses 1-5% to the
   reclaim, which is now attributed to a file class nobody reads.
+
+## 10.215 -- the faults are the entry file through the view mapping; dropping the static files' cache from outside is not enough (stage et, 2026-10-23)
+
+**Why this stage.** 10.214 named the static files as the page-cache filler. Stage et runs two X20 controls
+against two X20 legs with a bench-side hook that runs `scripts/dropcache.py` over the execution layer's
+`static_files` every 5 s (`posix_fadvise(DONTNEED)`, no node change). The runner yielded the fourth leg to
+a Gov5 request that had waited 20 minutes (the protocol's leg-boundary yield), so one knob leg ran.
+All gates clean, no handovers.
+
+| leg | config | drain M/s | seal -> seal mean | windows (M/s) | major faults by third (build / root) | Cached peak | kswapd steals, 120 s |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| LPa | X20 | 4.864 | 41.2 | 5.16 / 4.81 / 4.54 | 2/3, 4/51, 45.0k/103.5k | 61 GB | 25.3M |
+| LP1 | X20 + drop static_files every 5 s | 4.930 | 40.6 | 5.08 / 4.97 / 4.93 | 1.8k/1.1k, 45.8k/125.4k, 193.2k/341.8k | 27 GB | 14.7M |
+| LPb | X20 | 4.990 | 40.1 | 5.13 / 4.96 / 4.83 | 0/4, 3.8k/23.8k, 131.0k/118.6k | 62 GB | 33.2M |
+
+- **The perf record worked** (`-m 4`): 148,009 major faults on the leader's threads in LPa's 30 s window,
+  **98.5% of them on `qmdb/entries.log` through the 1 TiB `EntryFileView` mapping** (101,084 on the
+  unnamed `n42` threads -- the root and view-index work -- and ~1,700 per build thread); 229 on a
+  transactions static file, 133 on `mdbx.dat`, 242 on the binary. The faults are refaults of the QMDB
+  entry pages a block's state reads need.
+- **Dropping the static files' cache from outside kept `Cached` at 17-27 GB (controls: 58-62 GB) but
+  did not stop the reclaim.** LP1's kswapd still stole 2-3M pages every 10 s from +52 s with 20-35 GB
+  free, and its refaults were higher than the controls' (900k against 230-330k), spread from the second
+  third. Its anonymous memory was an outlier (the execution layer's RSS 47 GB at +10 s, 105 GB at +84 s,
+  against 31-33 and 66-84 GB on the controls), and `Mapped` stayed at 6-9 GB against 12-15: fewer
+  entry pages stayed resident. The leg read 4.930, between the controls, with the flattest window
+  profile (-3% from the first window to the third against -12% and -6%).
+- **Why kswapd runs with 20 GB free.** `watermark_boost_factor` is 0 and the Normal zone's low watermark
+  is 200 MB, so the steals are not the plain watermark: they are the THP path. The heaps run
+  `thp:always` under `defrag=defer`, and a huge-page fault that finds no order-9 block wakes kswapd and
+  kcompactd to make one (`thp_fault_fallback` +15-39k a leg); kswapd then takes inactive file pages --
+  the cold entry pages first. The page cache's growth fragments the order-9 pool that `hugeprep.py` built
+  before the leg; the same mechanism as round 43's reclaim storm, at a slower rate. `mlock` is not
+  available (MEMLOCK 8 MB).
+- **What follows (stage eu).** The in-node form of the drop, `N42_SF_DROP_CACHE=1` (the static-file
+  writer releases a segment's data and offsets pages right after each commit's fsync, so the static files
+  never hold more than a block's worth of cache), beside the bench-side hook again and two controls; the
+  memory sampler and the perf record on every leg. If the reclaim persists without the static files, the
+  next lever is the entry file itself: the view's cold reads are the refaults, and the recent region of
+  the file could be served from the store's own anonymous buffers instead of file pages.
+- **Where 5M stands.** Twenty-two X20 legs since el, mean 4.957; every leg's first window is 4.94-5.27.

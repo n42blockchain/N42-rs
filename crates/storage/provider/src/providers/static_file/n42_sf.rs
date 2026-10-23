@@ -22,13 +22,21 @@
 //!   batch's `sync_all` waits only for the last block's tail instead of the
 //!   whole batch. The `sync_all` itself is unchanged: what is durable when is
 //!   what it was.
+//! * `N42_SF_DROP_CACHE=1`: after a segment's commit (or `sync_all`) has synced
+//!   its files, the data file's, the offsets file's (`.off`) and the changeset
+//!   offsets sidecar's (`.csoff`) page-cache pages are released
+//!   (`posix_fadvise(POSIX_FADV_DONTNEED)`). The segments are appended at
+//!   ~1.4 GB/s and nothing reads them back during a run, so their clean pages
+//!   otherwise fill the page cache and push out the QMDB entry-file pages a
+//!   block does read. Durability and the files' bytes are unchanged; a later
+//!   read just comes from the device.
 
 use super::StaticFileProviderRWRefMut;
 use alloy_primitives::TxNumber;
 use reth_codecs::Compact;
 use reth_primitives_traits::NodePrimitives;
 use reth_storage_errors::provider::ProviderResult;
-use std::sync::OnceLock;
+use std::{path::Path, sync::OnceLock};
 
 /// Rows encoded per parallel task: 4,096 transfer rows are ~760 KB.
 pub(crate) const ENCODE_CHUNK: usize = 4096;
@@ -50,6 +58,43 @@ pub(crate) fn parallel_encode() -> bool {
 pub(crate) fn early_writeback() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| flag("N42_SF_EARLY_WRITEBACK"))
+}
+
+/// `N42_SF_DROP_CACHE=1`, read once.
+pub(crate) fn drop_cache() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = flag("N42_SF_DROP_CACHE");
+        tracing::info!(target: "providers::static_file", drop_cache = on, "N42_SF_DROP_CACHE");
+        on
+    })
+}
+
+/// Releases the page-cache pages of a segment's data file at `data_path`, its offsets file
+/// (`.off`, nippy-jar's `offsets_path()`) and its changeset offsets sidecar (`.csoff`, when it
+/// exists), under `N42_SF_DROP_CACHE=1`. Call it only after the files were synced: clean pages
+/// are dropped, dirty ones are left by the kernel. Best effort, every error is ignored; a no-op
+/// when the switch is off and off Linux.
+pub(super) fn drop_cache_after_commit(data_path: &Path) {
+    if !drop_cache() {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    for path in [
+        data_path.to_path_buf(),
+        data_path.with_extension("off"),
+        data_path.with_extension("csoff"),
+    ] {
+        if let Ok(file) = std::fs::File::open(&path) {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the descriptor is open for the duration of the call, and the advice only
+            // drops clean cached pages of this file; its contents are unaffected.
+            let _ =
+                unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = data_path;
 }
 
 /// `N42_SF_BULK_APPEND=1`, read once: an encoded chunk is appended to the data file in one

@@ -5506,3 +5506,34 @@ only TC lines are seven view-1 start-up lines on LKa, which are not gated. There
   - Port the frame road, the fused receipts and the reseed to main. Main has none of them.
   - Collect X20 legs until a flush occurs, to see whether the road recovers.
   - Widen the margin. The two 40 ms chains (seal -> seal, and rename -> fields) both still bind.
+
+## 10.211 -- the road now survives a flush; X20 holds (stage ep, 2026-10-23)
+
+**Why this stage.** Stage ep has two X20 legs and one X20 leg on 40 build threads, against two X19
+controls. It looks for a road flush on the full-map reseed (a21aca778), which stage eo did not see.
+
+| leg | config | drain M/s | seal -> seal mean | windows (M/s) | road flushes | seeded at the flush | refused unknown |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| LLa | X19 | 4.813 | 41.5 | 4.76 / 4.82 / 4.83 | - | - | - |
+| LL1 | X20 | **4.957** | 40.4 | 4.97 / 5.01 / 4.81 | 4 | 75,000 | 0 |
+| LLb | X19 | 4.825 | 41.5 | 4.80 / 4.73 / 4.90 | - | - | - |
+| LL1b | X20 | 4.859 | 41.1 | 4.82 / 4.94 / 4.77 | 0 | - | 0 |
+| LL2 | X20, 40 threads | 4.933 | 40.5 | 5.06 / 5.00 / 4.68 | 0 | - | 0 |
+
+(All five d2gates pass: invalid 0, fields mismatches 0, verify pass. The TC lines on LLb and LL2 are the
+view-1 start-up lines, which are not gated. There were no handovers.)
+
+- **The flush case is fixed.** LL1 flushed the road four times in one 5 s interval (01:06:02). The reseed
+  put 75,000 senders back, every sender the map knew, and no `unknown` refusal followed. The next
+  interval took 52,633 road frames again, the steady rate.
+  In 10.206 (LG1) and 10.209 (LJ1b) the same event shut the road for the rest of the leg (4.04 and
+  4.72M/s). Here the leg read 4.957.
+- **X20 against X19 in this stage.** The bar is 4.825 x 1.015 = 4.897. LL1 clears it (+3.0% / +2.7%);
+  LL1b does not (+1.0% / +0.7%).
+- **X20 over five stages (el-ep).** Eleven legs, mean 4.953, range 4.717-5.065; six of them are at or
+  over 5.0M/s. Ten X19 controls: mean 4.847, range 4.784-4.939. The gain is +2.2%, and every X20 leg since
+  the full-map reseed (five legs) is at or above 4.859.
+- **40 build threads.** A single leg read 4.933 (gap 40.5) against 4.957 / 4.859 on 32 threads. That is
+  inside the X20 spread: neither better nor worse.
+- **Where 5M stands.** X20's mean is 40.4 ms per block against the 40.0 ms that 5M needs. The remaining
+  ~1% sits in the slow third windows (4.68-4.83 on three of the five legs this stage).

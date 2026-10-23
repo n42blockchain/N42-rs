@@ -33,6 +33,8 @@ T=$S/tests-loop351.log; : > $T
 BUILD_FROM=$(date -u +%s)
 # the 40G scope needs the user systemd manager; when its bus is gone (it was, after claim a on 2026-10-08) run the test plain: the tests fit the box
 tst() { echo "== $*" >> $T; if systemd-run --user --scope -q true >/dev/null 2>&1; then nice -n 19 systemd-run --user --scope -q -p MemoryMax=40G -p MemorySwapMax=0 "$@" >> $T 2>&1; else nice -n 19 "$@" >> $T 2>&1; fi; }
+# no cargo while a foreign request or claim exists (box protocol): wait for none before the test gate
+if [ "${LOOP351_DRY:-0}" != 1 ]; then w=0; while ls -d /data/blockchain/.box-request-* /data/blockchain/wr-logs/.box-request-* /data/blockchain/.box-claim-* /data/blockchain/wr-logs/.box-claim-* 2>/dev/null | grep -qv -- "-rust$"; do [ $w = 0 ] && echo "test gate waits: a foreign request or claim exists ($(date +%H:%M))"; w=1; sleep 60; done; fi
 echo "tests from $(date +%H:%M) (no claim)"
 SKIPGATE=""; if [ -n "${LOOP351_GATE_TREES:-}" ] && [ "$LOOP351_GATE_TREES" = "$(git rev-parse HEAD:crates)-$(git rev-parse HEAD:bin)" ]; then SKIPGATE=1; echo "test and build gate skipped: git diff --stat f2794a821 HEAD -- crates bin is empty (crates/ and bin/ unchanged since claim a build; LOOP351_GATE_TREES)"; fi
 if [ -z "$SKIPGATE" ]; then

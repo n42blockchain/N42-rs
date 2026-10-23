@@ -11,7 +11,9 @@ BUILT_TREES=$(cat $MARK 2>/dev/null || echo "$(git rev-parse $BUILT:crates)-$(gi
 CUR_TREES="$(git rev-parse HEAD:crates)-$(git rev-parse HEAD:bin)"
 if [ -n "$(git status --porcelain crates bin | grep -v pycache)" ]; then echo "uncommitted changes in crates/ or bin/; nothing run"; echo ALLDONE; exit 1; fi
 n=0
-while [ -n "$(find /data/blockchain/.box-claim-* -mmin -90 2>/dev/null)" ] || [ "$(pgrep -fc 'n42-[a-z0-9]+ --chai[n]')" != 0 ]; do sleep 60; n=$((n+1)); [ $n -gt 240 ] && { echo "gave up waiting after 4 h"; exit 1; }; done
+foreign_req() { ls -d /data/blockchain/.box-request-* /data/blockchain/wr-logs/.box-request-* 2>/dev/null | grep -v -- "-rust$"; }
+# a foreign request (not only a claim) also holds the build here and the runner's test gate: no cargo while one exists (gaps included)
+while [ -n "$(foreign_req)" ] || [ -n "$(find /data/blockchain/.box-claim-* -mmin -90 2>/dev/null)" ] || [ "$(pgrep -fc 'n42-[a-z0-9]+ --chai[n]')" != 0 ]; do sleep 60; n=$((n+1)); [ $n -gt 240 ] && { echo "gave up waiting after 4 h"; exit 1; }; done
 grep -rq N42_LEADER_LAYERS crates/n42/engine-types/src || { echo "N42_LEADER_LAYERS is not in the tree; nothing run"; echo ALLDONE; exit 1; }
 grep -rq N42_PARALLEL_BUILD_THREADS crates bin || { echo "N42_PARALLEL_BUILD_THREADS is not in the tree; nothing run"; echo ALLDONE; exit 1; }
 grep -rq N42_IMPORT_ONCE bin/n42/src crates/n42 || { echo "N42_IMPORT_ONCE is not in the tree; nothing run"; echo ALLDONE; exit 1; }

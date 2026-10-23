@@ -168,6 +168,16 @@ impl<T: PoolTransaction> RoadTaken<T> {
 /// path with an invalidation, which is correct, only slower.
 const ROAD_TAKEN_MAX: usize = 131_072;
 
+/// `N42_ROAD_TAKEN_MAX=<frames>`: the bound above, for the stage that
+/// measures what the remembered frames cost in memory (at the default, a
+/// map at its bound holds ~65M transactions).
+fn road_taken_max() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("N42_ROAD_TAKEN_MAX").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(ROAD_TAKEN_MAX)
+    })
+}
+
 /// One sender as the road knows it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RoadSender {
@@ -267,6 +277,7 @@ pub(crate) struct RoadCounters {
     pub(crate) taken: AtomicU64,
     pub(crate) handed_back: AtomicU64,
     pub(crate) retired: AtomicU64,
+    pub(crate) evicted: AtomicU64,
 }
 
 /// The road's counters as read ([`road_stats`], [`crate::TxQueue::road_stats`]):
@@ -305,6 +316,9 @@ pub struct RoadStats {
     pub handed_back: u64,
     /// Taken frames the chain mined.
     pub retired: u64,
+    /// Taken frames forgotten at the bound (`ROAD_TAKEN_MAX`) before the
+    /// chain mined them.
+    pub evicted: u64,
 }
 
 impl RoadCounters {
@@ -326,6 +340,7 @@ impl RoadCounters {
             taken: get(&self.taken),
             handed_back: get(&self.handed_back),
             retired: get(&self.retired),
+            evicted: get(&self.evicted),
         }
     }
 }
@@ -482,7 +497,7 @@ impl<T: PoolTransaction> Road<T> {
                 taken.order.push_back(frame.id);
                 taken.by_id.insert(frame.id, frame.clone());
             }
-            while taken.by_id.len() > ROAD_TAKEN_MAX {
+            while taken.by_id.len() > road_taken_max() {
                 let Some(id) = taken.order.pop_front() else { break };
                 if let Some(frame) = taken.remove(&id) {
                     evicted.push(frame);
@@ -493,6 +508,7 @@ impl<T: PoolTransaction> Road<T> {
                 order.retain(|id| by_id.contains_key(id));
             }
         }
+        self.counters.evicted.fetch_add(evicted.len() as u64, Ordering::Relaxed);
         drop(evicted);
         out
     }

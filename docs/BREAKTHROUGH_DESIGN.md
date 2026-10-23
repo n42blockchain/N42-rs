@@ -5537,3 +5537,50 @@ view-1 start-up lines, which are not gated. There were no handovers.)
   inside the X20 spread: neither better nor worse.
 - **Where 5M stands.** X20's mean is 40.4 ms per block against the 40.0 ms that 5M needs. The remaining
   ~1% sits in the slow third windows (4.68-4.83 on three of the five legs this stage).
+
+## 10.212 -- the taken-frame bound is not the slow third window; X20 reads 5.03 on a box with memory to spare (stage eq, 2026-10-23)
+
+**Why this stage.** The offline pass after 10.211 found X20's slow third windows (gap 41.3-42.6 against
+39.4-40.0 earlier in the leg) alongside major page faults in the build batches (40-305 a block, ~0 on X19)
+and a peak RSS ~20 GB above X19's. One suspect was the road's taken-frame map at its 131,072-frame bound
+(`ROAD_TAKEN_MAX`); the other was the box itself, whose `/tmp` tmpfs held 37 GiB of another client's
+leaked scratch files and whose swap was full. Gov5 cleaned its files before this stage (MemAvailable 85 ->
+118 GiB). Stage eq runs two X20 controls against two X20 legs with `N42_ROAD_TAKEN_MAX=16384`
+(894891b61 adds the knob and the counters `road_taken`, `road_handed_back`, `road_retired`,
+`road_evicted`, `road_taken_live` to the frame-road line). All gates clean, no handovers, no flush.
+
+| leg | config | drain M/s | seal -> seal mean | windows (M/s) | taken live (frames) | evicted / 5 s | peak RSS GB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| LMa | X20 | 4.959 | 40.4 | 4.87 / 4.95 / 5.01 | 30-44k | 0 | 41.5 |
+| LM1 | X20 + TAKEN_MAX 16384 | 4.694 | 42.6 | 4.75 / 4.62 / 4.67 | 16.4-16.8k (at the bound) | 3-30k | 99.5 |
+| LMb | X20 | **5.030** | **39.8** | 5.13 / 5.05 / 4.87 | 23-35k | 0 | 63.2 |
+| LM1b | X20 + TAKEN_MAX 16384 | 4.820 | 41.5 | 4.90 / 4.72 / 4.81 | 14-16.8k (at the bound) | 27-40k | 79.7 |
+
+- **The bound hypothesis is wrong, and the knob loses.** On X20 the taken map holds 23,000-44,000 live frames,
+  a quarter of its 131,072 bound; nothing is ever evicted. Forcing the bound to 16,384 evicts 3,000-40,000
+  frames every 5 s, and an evicted frame is never retired: `road_retired` falls from 28-52k to 8-23k per
+  interval, the frames' memory stays (RSS 99.5 and 79.7 GB against 41.5 and 63.2), and the legs read
+  -5.4% and -4.2% against the controls. Not adopted; the default stays. The eviction path is a latent leak
+  if the bound is ever reached: an evicted entry should retire its frame, not drop it (open item).
+- **LMb is the record drain-rate leg: 5.030M/s, mean gap 39.8 ms**, the first leg whose mean gap is under
+  the 40.0 ms that 5M needs. LMa reads 4.959. X20 over six stages (el-eq): thirteen legs, mean 4.959,
+  range 4.717-5.065, eight at or over 4.95.
+- **The slow third window is not box memory pressure.** LMb still faulted in its third: 61,274 major faults
+  in the build batches and 139,361 on the root threads (both ~0 in the first two thirds), with
+  `batch_view_index_wait` 5.5 -> 14.8 ms and the window at 4.87 against 5.13 -- while the box had 82.8 GiB
+  available, no cgroup limit (user slice `memory.max` = max), one NUMA node, and the Normal zone's low
+  watermark at 200 MB, so no kswapd reclaim ran. LMa, same config, took 14 faults in the whole leg and its
+  third window was its fastest (gap 39.8). The faults come in bursts of 3,000-15,000 (build) and
+  4,000-47,000 (root) per 40 blocks, four or five bursts in the third.
+  A major fault without reclaim is a page-cache miss on a file mapping, which Linux counts as major even
+  when no disk read follows: a hole in a sparse file, or a page another thread is instantiating. The QMDB
+  entry store maps its file (`entry_store.rs`, chunks mapped with populate; `entry_view.rs`, a 1 TiB
+  shared mapping advised random) and `set_len`s it ahead. Which mapping takes the faults is the next
+  measurement, not a guess: **stage er** runs three X20 legs with a hook that, 55 s after the first full
+  block, copies node0's `/proc/<pid>/maps` and records `perf record -e major-faults -c 1 -d --per-thread`
+  over every thread of the execution layer for 30 s, beside a 2 s `/proc/vmstat` sampler (major faults,
+  swap-ins, kswapd and direct steals, file refaults, compaction stalls); `scripts/fleet7-runs/majfmap.py`
+  charges the samples to mappings.
+- **Where 5M stands.** X20's mean gap over thirteen legs is 40.3 ms. The legs that faulted lose 2-5% of their
+  third window; the legs that did not read 5.00-5.07. Removing the fault bursts is the remaining lever
+  within X20.

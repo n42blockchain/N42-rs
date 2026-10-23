@@ -4831,3 +4831,40 @@ threads at +55 s. No code change; all gates clean, no handovers.
   Every leg's first half runs at 5.0-5.27M/s; the remedy for the second half is to keep the fleet's cold
   file pages out of the way of its hot ones (drop the cache of files no one reads again, or pin the QMDB
   pages a block reads), which is the next stage after es says which files fill the cache.
+
+## 10.214 -- the filler is the static files: 122 GB by 85 s into a leg; record leg 5.043M/s (stage es, 2026-10-23)
+
+**Why this stage.** 10.213 showed the page cache at capacity but not which files fill it. Stage es runs
+three X20 legs with a hook that samples `/proc/meminfo` and the execution layer's RSS beside the vmstat
+counters every 2 s, and runs `du` over the QMDB files, `db` and `static_files` of the execution layer at
++30, +60 and +85 s after the first full block. No code change; all gates clean, no handovers.
+
+| leg | drain M/s | seal -> seal mean | windows (M/s) | major faults by third (build / root) | kswapd steals, 120 s |
+| --- | --- | --- | --- | --- | --- |
+| LOa | 4.963 | 40.3 | 4.94 / 4.97 / 4.99 | 0/5, 10.8k/35.0k, 25.7k/22.1k | 27.4M pages |
+| LOb | 4.940 | 40.5 | 4.99 / 5.06 / 4.80 | 2/13, 20/59, 33.2k/64.7k | 27.0M |
+| LOc | **5.043** | **39.7** | 5.22 / 4.95 / 4.90 | 3/5, 35/86, 35.2k/81.4k | 25.3M |
+
+- **What the execution layer writes.** The bench runs one execution layer for the seven validators
+  (`F7_EL_MAP=0,0`), and its `static_files` grow by 46-48 GB at +30 s, 93-95 GB at +60 s and 119-122 GB
+  at +85 s: **1.4 GB/s of transactions, receipts and headers that nothing reads again during the leg**.
+  `entries.log` (the QMDB entry file, read by the view and the sealed chunks) is 8-9 GB at +30 s and
+  16-17 GB at +85 s (~190 MB/s). `forest.ckpt` is 49 MB, rewritten every ~0.4 s through a temp file and a
+  rename (the old inode and its pages go); the sealed log is removed after each compaction; `db` (MDBX)
+  stays at 2 MB. In entry-file mode the compaction keeps no `recovery-archive`.
+- **The timeline (LOc), 10 s steps.** `Cached` climbs 31 -> 47 -> 64 -> 66 GB while `MemFree` falls
+  73 -> 44 -> 13 GB by +31 s; kswapd starts at +40 s (3.5M pages), peaks at +63 s (11.6M pages, 44 GB in
+  10 s) while `Cached` is cut to 25 GB; the refaults land at +74 s (168k file refaults, 112.6k major
+  faults in that 10 s) -- the reclaim had reached the QMDB pages a block reads. The execution layer's RSS
+  is 29 GB at the start and 72-81 GB from +50 s (`AnonPages` 27 -> 60 GB, `Mapped` 2.5 -> 15 GB).
+  LOb's cache filled at +42 s and its refaults came at +63-73 s; LOa's at +31 s and +63-74 s.
+- **The remedy to test (stage et).** Bench-side first, without touching the node: a hook that runs
+  `scripts/dropcache.py` over the execution layer's `static_files` every 5 s (`posix_fadvise(DONTNEED)`
+  over every file; dirty and mapped pages stay), on two of four X20 legs against two controls. If the
+  cache stays below capacity and the third window keeps its 5.0+, the permanent form is the same advice
+  from the static file writer after each commit, behind an env knob.
+- **The perf record failed again**, this time on the mmap buffers: ~475 per-thread buffers exceed
+  `perf_event_mlock_kb`. Stage et's controls record with `-m 4`.
+- **Where 5M stands.** LOc is the record drain-rate leg, 5.043M/s at a 39.7 ms mean gap; nineteen X20 legs
+  since el average 4.959. Every leg's first half runs at 4.94-5.22; the second half loses 1-5% to the
+  reclaim, which is now attributed to a file class nobody reads.

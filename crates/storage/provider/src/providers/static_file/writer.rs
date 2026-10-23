@@ -561,6 +561,8 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             self.writer.sync_all().map_err(ProviderError::other)?;
         }
         self.synced = true;
+        // N42: the files are synced, release their clean pages (`N42_SF_DROP_CACHE=1`).
+        super::n42_sf::drop_cache_after_commit(&self.data_path);
         Ok(())
     }
 
@@ -667,6 +669,9 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
 
             self.update_index()?;
         }
+
+        // N42: the files are synced, release their clean pages (`N42_SF_DROP_CACHE=1`).
+        super::n42_sf::drop_cache_after_commit(&self.data_path);
 
         Ok(())
     }

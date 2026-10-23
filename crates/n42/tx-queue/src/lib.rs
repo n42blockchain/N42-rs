@@ -1279,7 +1279,26 @@ struct Inner<T: PoolTransaction> {
     road_unaccounted: usize,
     /// Since which build the road's gate has been shut with the debt not
     /// shrinking, and the debt then ([`Inner::road_note_stuck`]).
-    road_stuck: Option<(u64, u64)>,
+    road_stuck: Option<RoadStuck>,
+    /// Frames frame plans took from the index and the lanes (not the
+    /// road's), a running total: the progress a stuck gate is judged by.
+    frames_planned: u64,
+    /// The build before which no stuck flush fires: the cool-down after a
+    /// flush, long enough to take the frames it moved into the lanes.
+    road_stuck_armed: u64,
+    /// The build of the last flush (the flush's log line).
+    road_last_flush: u64,
+}
+
+/// A shut gate's mark ([`Inner::road_note_stuck`]): since which build the
+/// debt has not shrunk and what it was then, and the last build that saw
+/// a frame plan take from the index or the lanes.
+#[derive(Clone, Copy, Debug)]
+struct RoadStuck {
+    since: u64,
+    owed: u64,
+    planned: u64,
+    planned_at: u64,
 }
 
 /// Road transactions a plan takes at which their taken-list entries are
@@ -1289,6 +1308,16 @@ const ROAD_PARALLEL_CLONE: usize = 16_384;
 /// Builds the road's gate may stay shut with its debt not shrinking before
 /// the road is invalidated ([`Inner::road_note_stuck`]).
 const ROAD_STUCK_BUILDS: u64 = 8;
+
+/// Builds the debt may stay flat while frame plans keep taking from the
+/// index before the road is invalidated anyway: debt no plan can take
+/// beside takeable frames of other senders must not shut the road for good.
+const ROAD_STUCK_BACKSTOP_BUILDS: u64 = 64;
+
+/// Frames a build takes off the index, about, for a flush's cool-down
+/// ([`Inner::road_flush`]): the cool-down is one stuck window plus the
+/// builds the flushed frames need.
+const ROAD_FLUSH_FRAMES_PER_BUILD: u64 = 400;
 
 /// A whole take handed off to an own block: the build counter of the build
 /// that took it, and the block's sealed hash once
@@ -2310,6 +2339,9 @@ impl<T: PoolTransaction> TxQueue<T> {
                 road_planned: 0,
                 road_unaccounted: 0,
                 road_stuck: None,
+                frames_planned: 0,
+                road_stuck_armed: 0,
+                road_last_flush: 0,
             })),
             inbox: Arc::new(Mutex::new(Vec::new())),
             staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2659,7 +2691,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             road::Admit::Admitted => true,
             road::Admit::Refused { flush, .. } => {
                 if flush {
-                    self.road_flush();
+                    self.road_flush(road::FlushReason::Refused);
                 }
                 false
             }
@@ -2677,7 +2709,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         }
         let arrivals: Vec<(Address, u64)> = staged.iter().map(|t| (t.sender(), t.nonce())).collect();
         if self.road.note_lanes_arrivals(&arrivals) {
-            self.road_flush();
+            self.road_flush(road::FlushReason::Frameless);
         }
     }
 
@@ -2755,9 +2787,9 @@ impl<T: PoolTransaction> TxQueue<T> {
 
     /// Invalidates the road ([`Inner::road_flush`]): its queued frames go
     /// to the lanes, and every sender seeds again from them.
-    fn road_flush(&self) {
+    fn road_flush(&self, reason: road::FlushReason) {
         let mut inner = self.lock_inner_quiet();
-        inner.road_flush();
+        inner.road_flush(reason);
     }
 
     /// Whether frames are on their way into the index: noted in the frame
@@ -4478,7 +4510,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             // first, so a node building without frames is not starved by a
             // road only a frame plan would take from.
             if inner.road_epoch != 0 && self.road.len_txs() != 0 {
-                inner.road_flush();
+                inner.road_flush(road::FlushReason::Walk);
             }
             // A build that walks the lanes cannot use a frame plan: it goes
             // back before the walk, so the walk sees its transactions.
@@ -5373,6 +5405,20 @@ impl<T: PoolTransaction> Inner<T> {
         times: &mut FrameSelectTimes,
         mode: SelectMode,
     ) -> (Vec<(FrameTxs<T>, usize)>, FramePlan, u64) {
+        let out = self.plan_frames_counted(gas_limit, times, mode);
+        // The index's and the lanes' frames of this plan: a stuck gate's
+        // progress ([`Self::road_note_stuck`]).
+        self.frames_planned += out.1.frames.len().saturating_sub(self.road_planned) as u64;
+        out
+    }
+
+    /// [`Self::plan_frames`] without the progress count.
+    fn plan_frames_counted(
+        &mut self,
+        gas_limit: u64,
+        times: &mut FrameSelectTimes,
+        mode: SelectMode,
+    ) -> (Vec<(FrameTxs<T>, usize)>, FramePlan, u64) {
         let mut segments: Vec<(FrameTxs<T>, usize)> = Vec::new();
         let mut plan = FramePlan::default();
         let mut gas_left = gas_limit;
@@ -5487,21 +5533,47 @@ impl<T: PoolTransaction> Inner<T> {
     }
 
     /// The gate found shut with road frames waiting: if the debt has not
-    /// shrunk over [`ROAD_STUCK_BUILDS`] builds, the road is invalidated.
-    /// A road sender's lane entry the frame planner can never take -- one
-    /// that reached the lane without a frame, or a frame's tail -- would
-    /// otherwise keep the gate shut for good, and with frames on the road
-    /// no build walks the lanes ([`TxQueue::frames_arriving`]).
+    /// shrunk over [`ROAD_STUCK_BUILDS`] builds and no frame plan took a
+    /// frame from the index or the lanes over as many, the road is
+    /// invalidated. A road sender's lane entry the frame planner can never
+    /// take -- one that reached the lane without a frame, or a frame's tail
+    /// -- would otherwise keep the gate shut for good, and with frames on
+    /// the road no build walks the lanes ([`TxQueue::frames_arriving`]).
+    ///
+    /// The progress test and the cool-down after a flush keep a flush's own
+    /// debt (thousands of frames, taken a few hundred a build, its level
+    /// bounced by give-backs) from flushing again before it is taken: each
+    /// such flush put every frame admitted meanwhile back in the lanes, and
+    /// the gate never reopened (loop351 stage eu). Debt flat for
+    /// [`ROAD_STUCK_BACKSTOP_BUILDS`] flushes even with progress.
+    /// `N42_ROAD_STUCK_LEGACY=1` keeps the first rule (debt alone).
     fn road_note_stuck(&mut self) {
         let owed = self.road.counters.lane_debt.load(std::sync::atomic::Ordering::Relaxed);
+        let builds = self.builds;
+        let planned = self.frames_planned;
+        let legacy = road::road_stuck_legacy();
         match self.road_stuck {
-            Some((since, last)) if owed >= last => {
-                if self.builds.saturating_sub(since) >= ROAD_STUCK_BUILDS {
+            Some(mut mark) if owed >= mark.owed => {
+                if mark.planned != planned {
+                    mark.planned = planned;
+                    mark.planned_at = builds;
+                }
+                let waited = builds.saturating_sub(mark.since);
+                let fire = if legacy {
+                    waited >= ROAD_STUCK_BUILDS
+                } else {
+                    let stalled = builds.saturating_sub(mark.planned_at) >= ROAD_STUCK_BUILDS;
+                    builds >= self.road_stuck_armed
+                        && ((stalled && waited >= ROAD_STUCK_BUILDS) || waited >= ROAD_STUCK_BACKSTOP_BUILDS)
+                };
+                if fire {
                     self.road_stuck = None;
-                    self.road_flush();
+                    self.road_flush(road::FlushReason::Stuck);
+                } else {
+                    self.road_stuck = Some(mark);
                 }
             }
-            _ => self.road_stuck = Some((self.builds, owed)),
+            _ => self.road_stuck = Some(RoadStuck { since: builds, owed, planned, planned_at: builds }),
         }
     }
 
@@ -5526,11 +5598,35 @@ impl<T: PoolTransaction> Inner<T> {
     /// as the account's next nonce, so a later nonce in the lanes would be
     /// planned ahead of the road frames below it, and the gate -- shut by
     /// that very lane entry -- would never take them.
-    fn road_flush(&mut self) {
+    fn road_flush(&mut self, reason: road::FlushReason) {
         let road = Arc::clone(&self.road);
+        let debt_before = road.counters.lane_debt.load(std::sync::atomic::Ordering::Relaxed);
         let (frames, known) = road.invalidate_keeping(road.reseed());
         if self.road_epoch != 0 {
             self.road_epoch = road.epoch();
+        }
+        let flushed_frames = frames.len() as u64;
+        let flushed_txs: usize = frames.iter().map(road::RoadFrame::len).sum();
+        if reason == road::FlushReason::Stuck {
+            road.counters.flushes_stuck.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        tracing::info!(
+            target: "n42.tx_queue",
+            ?reason,
+            frames = flushed_frames,
+            txs = flushed_txs,
+            lane_debt_before = debt_before,
+            epoch = road.epoch(),
+            builds_since_last = self.builds.saturating_sub(self.road_last_flush),
+            "frame road flushed"
+        );
+        self.road_last_flush = self.builds;
+        if !road::road_stuck_legacy() {
+            // The flushed frames are the new epoch's debt: no stuck flush
+            // before the builds that take them have had their turn.
+            self.road_stuck = None;
+            self.road_stuck_armed =
+                self.builds + flushed_frames / ROAD_FLUSH_FRAMES_PER_BUILD + ROAD_STUCK_BUILDS;
         }
         self.road_debt.clear();
         if !frames.is_empty() {
@@ -6333,7 +6429,7 @@ impl<T: PoolTransaction> Inner<T> {
         }
         road.hand_back(back);
         if flush {
-            self.road_flush();
+            self.road_flush(road::FlushReason::GiveBack);
         }
         gave
     }

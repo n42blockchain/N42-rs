@@ -998,6 +998,7 @@ fn spawn_stats_reporter() {
                         refused_no_frame = d(road.refused_no_frame, last_road.refused_no_frame),
                         refused_dup_sender = d(road.refused_dup_sender, last_road.refused_dup_sender),
                         flushes = d(road.flushes, last_road.flushes),
+                        flushes_stuck = d(road.flushes_stuck, last_road.flushes_stuck),
                         seeded = d(road.seeded, last_road.seeded),
                         seed_holds = d(road.seed_holds, last_road.seed_holds),
                         road_len = road.len_txs,

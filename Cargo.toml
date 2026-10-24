@@ -9,7 +9,7 @@ exclude = [".github/"]
 
 [workspace]
 members = [
-    "vendor/dependency-repairs/reth-nippy-jar-2.7.0",
+    "vendor/dependency-repairs/reth-nippy-jar-2.8.1",
     "crates/n42/dependency-compat-tests",
     "bin/n42/",
     "crates/n42/primitives/",
@@ -657,8 +657,8 @@ tree_hash_derive = "0.12"
 # upstream after that tag. N42 capability lives in this repo now; see
 # docs/RETH_FORK_REDUCTION.md.
 [patch.'https://github.com/paradigmxyz/reth.git']
-reth-nippy-jar = { path = "vendor/dependency-repairs/reth-nippy-jar-2.7.0" }
-reth-transaction-pool = { path = "vendor/dependency-repairs/reth-transaction-pool-2.7.0" }
+reth-nippy-jar = { path = "vendor/dependency-repairs/reth-nippy-jar-2.8.1" }
+reth-transaction-pool = { path = "vendor/dependency-repairs/reth-transaction-pool-2.8.1" }
 reth = { path = "bin/reth" }
 reth-revm = { path = "crates/revm" }
 # reth-evm-ethereum is NOT forked any more: the vendored copy was byte-identical

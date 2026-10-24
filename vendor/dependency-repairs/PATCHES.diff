@@ -368,8 +368,8 @@
  ]
 +
 +[workspace]
---- reth-nippy-jar-2.7.0/upstream/Cargo.toml
-+++ reth-nippy-jar-2.7.0/patched/Cargo.toml
+--- reth-nippy-jar-2.8.1/upstream/Cargo.toml
++++ reth-nippy-jar-2.8.1/patched/Cargo.toml
 @@ -1,39 +1,38 @@
  [package]
  name = "reth-nippy-jar"
@@ -379,7 +379,7 @@
 -license.workspace = true
 -homepage.workspace = true
 -repository.workspace = true
-+version = "2.7.0"
++version = "2.8.1"
 +edition = "2024"
 +rust-version = "1.95"
 +license = "MIT OR Apache-2.0"
@@ -397,7 +397,7 @@
  [dependencies]
  # reth
 -reth-fs-util.workspace = true
-+reth-fs-util = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
++reth-fs-util = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.8.1" }
  
  # compression
 -zstd = { workspace = true, features = ["experimental", "zdict_builder"] }
@@ -430,8 +430,8 @@
  
  [features]
  default = []
---- reth-transaction-pool-2.7.0/upstream/Cargo.toml
-+++ reth-transaction-pool-2.7.0/patched/Cargo.toml
+--- reth-transaction-pool-2.8.1/upstream/Cargo.toml
++++ reth-transaction-pool-2.8.1/patched/Cargo.toml
 @@ -1,82 +1,78 @@
  [package]
  name = "reth-transaction-pool"
@@ -441,7 +441,7 @@
 -license.workspace = true
 -homepage.workspace = true
 -repository.workspace = true
-+version = "2.7.0"
++version = "2.8.1"
 +edition = "2024"
 +rust-version = "1.95"
 +license = "MIT OR Apache-2.0"
@@ -467,17 +467,17 @@
 -reth-storage-api.workspace = true
 -reth-tasks.workspace = true
 -revm.workspace = true
-+reth-chain-state = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
-+reth-ethereum-primitives = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
-+reth-chainspec = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
-+reth-eth-wire-types = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
-+reth-evm = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
-+reth-evm-ethereum = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
-+reth-primitives-traits = { "version" = "0.8.1", "default-features" = false }
-+reth-execution-types = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
-+reth-fs-util = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
-+reth-storage-api = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
-+reth-tasks = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
++reth-chain-state = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.8.1" }
++reth-ethereum-primitives = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.8.1" }
++reth-chainspec = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.8.1" }
++reth-eth-wire-types = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.8.1" }
++reth-evm = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.8.1" }
++reth-evm-ethereum = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.8.1" }
++reth-primitives-traits = { "version" = "0.8.2", "default-features" = false }
++reth-execution-types = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.8.1" }
++reth-fs-util = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.8.1" }
++reth-storage-api = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.8.1" }
++reth-tasks = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.8.1" }
 +revm = { "version" = "43.0.3", "default-features" = false }
  
  # ethereum
@@ -505,7 +505,7 @@
  # metrics
 -reth-metrics.workspace = true
 -metrics.workspace = true
-+reth-metrics = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0" }
++reth-metrics = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.8.1" }
 +metrics = { "version" = "0.24.0" }
  
  # misc
@@ -557,7 +557,7 @@
 -criterion.workspace = true
 -reth-transaction-pool = { workspace = true, features = ["test-utils"] }
 -
-+reth-provider = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0", "features" = ["test-utils"] }
++reth-provider = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.8.1", "features" = ["test-utils"] }
 +reth-tracing = { "version" = "0.1.0", "default-features" = false, "features" = ["attributes"] }
 +alloy-primitives = { "version" = "1.6.1", "default-features" = false, "features" = ["map-foldhash", "rand"] }
 +paste = { package = "pastey", version = "0.2.3" }
@@ -569,7 +569,7 @@
 +tokio = { "version" = "1.52.3", "default-features" = false, "features" = ["rt-multi-thread"] }
 +futures = { "version" = "0.3" }
 +criterion = { "package" = "codspeed-criterion-compat", "version" = "4.3" }
-+reth-transaction-pool = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.7.0", "features" = ["test-utils"] }
++reth-transaction-pool = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.8.1", "features" = ["test-utils"] }
  [features]
  serde = [
      "reth-execution-types/serde",

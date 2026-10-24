@@ -119,20 +119,20 @@
   },
   {
     "package": "reth-nippy-jar",
-    "version": "2.7.0",
-    "source": "git+https://github.com/paradigmxyz/reth.git?tag=v2.7.0#3d592ece6de8c4559987416a544fc215fd6d6921",
+    "version": "2.8.1",
+    "source": "git+https://github.com/paradigmxyz/reth.git?tag=v2.8.1#d763342fa185e4e90ee79dc65f6a5706168b0bcb",
     "upstream_manifest_sha256": "f83d6dd5db47c4e6b88d26e331e7e049abda5010ddbbcd37768b32adeb451623",
-    "path": "vendor/dependency-repairs/reth-nippy-jar-2.7.0",
+    "path": "vendor/dependency-repairs/reth-nippy-jar-2.8.1",
     "modified_files": [
       "Cargo.toml"
     ]
   },
   {
     "package": "reth-transaction-pool",
-    "version": "2.7.0",
-    "source": "git+https://github.com/paradigmxyz/reth.git?tag=v2.7.0#3d592ece6de8c4559987416a544fc215fd6d6921",
+    "version": "2.8.1",
+    "source": "git+https://github.com/paradigmxyz/reth.git?tag=v2.8.1#d763342fa185e4e90ee79dc65f6a5706168b0bcb",
     "upstream_manifest_sha256": "f94c267bd73d1e9047b51c08438dbcfdbdd679549fc0d2616413bbc821007d2a",
-    "path": "vendor/dependency-repairs/reth-transaction-pool-2.7.0",
+    "path": "vendor/dependency-repairs/reth-transaction-pool-2.8.1",
     "modified_files": [
       "Cargo.toml"
     ]

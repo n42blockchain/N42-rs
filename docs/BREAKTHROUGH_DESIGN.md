@@ -5223,3 +5223,67 @@ the 64 MB leg does not take the steals to zero, the next lever is to pin
 the entry file's hot tail (`mlock` or `MADV_WILLNEED` on the last N GB of
 the view mapping), which converts the remaining faults to zero at a known
 memory cost.
+
+## 10.220 -- X21 = X20 + the ranged static-file cache drop; the filler behind the remaining reclaim is the execution layer's own heap (stage ey, 2026-10-24)
+
+Stage ey ran three of its five legs (WARM + control / knob / control) and
+yielded the last two at a leg boundary to a QS request, as agreed.
+
+| leg | knob | drain M/s | win1 / win2 / win3 | gap by thirds (ms) | kswapd steals | `root_majflt` by thirds |
+| --- | --- | --- | --- | --- | --- | --- |
+| LUa | off | 4.824 | 5.04 / 4.75 / 4.68 | 39.6 / 42.2 / 42.5 | 38.2M | 0 / 422 / 371 |
+| LU1 | on | **5.022** | 5.11 / 4.91 / 4.97 | 38.8 / 41.0 / 39.6 | 9.4M | 0 / 127 / 113 |
+| LUb | off | 4.927 | 5.11 / 5.07 / 4.55 | 38.8 / 39.5 / 43.6 | 33.8M | 0 / 0 / 517 |
+
+Gates clean; no refusal, flush or sweep. The knob beat both neighbours
+again. Over ex and ey the knob legs read 5.104 / 4.985 / 5.022 (mean
+5.037) against controls 4.954 / 5.035 / 4.824 / 4.927 (mean 4.935): two
+pairs won, one tied inside the control band, the storm 4-6x smaller in
+every knob leg. **Adopted: X21 = X20 + `N42_SF_DROP_CACHE=1`** (data pages
+only, released in ranges lagged by 256 MB a file). From stage ez the
+controls carry it.
+
+### Where the remaining pressure comes from
+
+The knob legs still reach `MemFree` 15-20 GB and fault 110-130 times a
+build in their later thirds. The vm sampler says what fills the box, and
+it is not the page cache. At the free-memory minimum of LU1 (+91 s):
+`AnonPages` **91 GB**, Cached 22 GB, the execution layer's RSS 107 GB. The
+anonymous memory through the legs (GB at +0 / 20 / 40 / 60 / 80 / 90 s):
+
+| leg | anon | peak |
+| --- | --- | --- |
+| LTa | 18 / 37 / 36 / 40 / 60 / 65 | 65 |
+| LT1 | 17 / 44 / 60 / 66 / 73 / 79 | 83 |
+| LTb | 13 / 35 / 63 / 72 / 80 / 77 | 83 |
+| LT1b | 13 / 57 / 62 / 72 / 80 / 83 | 83 |
+| LUa | 16 / 49 / 56 / 45 / 50 / 50 | 58 |
+| LU1 | 19 / 39 / 48 / 74 / 76 / 91 | 91 |
+| LUb | 20 / 30 / 36 / 47 / 38 / 38 | 50 |
+| LPc (10.216) | 20 / 52 / 56 / 68 / 78 / 91 | 91 |
+| LP2 (10.216, 3.76M/s) | 19 / 27 / 23 / 20 / 21 / 21 | 32 |
+
+Two things stand out. The heap grows by 0.7-0.9 GB/s through a leg and
+reaches 80-91 GB of a 136 GB box; with the page cache needing ~20 GB for
+the entry file and the indexes, the box is at its watermark from ~60 s,
+which is when every leg's faults begin. And it is not monotonic: LUa fell
+from 56 to 45 GB between +40 and +60 s, LUb from 47 to 38 between +60 and
++80, so a large part of it is **not live state**. The state index itself
+grows linearly with the accounts created (~150,000 a block; 345M by the
+end of a leg), but the drops say that tens of GB are allocation churn
+retained by jemalloc (`dirty_decay_ms:2000`, `thp:always`: purging is at
+2 MB granularity, a half-used huge page stays) or transient per-block
+structures (receipts, bundle states, hashed post-states, QMDB leaves for
+200,000-transaction blocks at 25 a second) whose lifetime varies with the
+pipeline's depth.
+
+jemalloc keeps its own account (`stats.allocated`, `active`, `resident`,
+`mapped`, `retained`), and the node already exports them on its metrics
+endpoint (`reth-node-metrics/jemalloc`); `memsample.py` now records them
+every 2 s beside the RSS. `allocated` ≈ anon means live data (then the
+lever is the bytes per account of the QMDB index and the in-memory tree);
+`resident` ≫ `allocated` means retention (then the lever is the decay and
+the huge-page policy of the heap, or returning the transient structures to
+the OS). Stage ez: three X21 controls and one leg with
+`N42_SF_DROP_CACHE_KEEP_MB=64`, the sampler on every leg; the jemalloc
+columns decide the next design step.

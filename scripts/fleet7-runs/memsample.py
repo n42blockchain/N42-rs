@@ -26,6 +26,9 @@ NAMES = {'reth_blockchain_tree_in_mem_state_num_blocks': 'num', 'reth_blockchain
          'reth_storage_providers_database_save_blocks_plain_reverts_sum': 'pr_sum', 'reth_storage_providers_database_save_blocks_commit_sf_sum': 'csf_sum',
          'reth_storage_providers_database_save_blocks_commit_mdbx_sum': 'cmd_sum', 'reth_storage_providers_database_save_blocks_commit_rocksdb_sum': 'crk_sum',
          # loop351 stage ez: jemalloc's own account of the heap (bytes), to tell live data from retention
+         # (the node exports them as reth_jemalloc_*; the bare names are kept for an older build)
+         'reth_jemalloc_allocated': 'j_alloc', 'reth_jemalloc_active': 'j_active', 'reth_jemalloc_resident': 'j_resident',
+         'reth_jemalloc_mapped': 'j_mapped', 'reth_jemalloc_retained': 'j_retained', 'reth_jemalloc_metadata': 'j_meta',
          'jemalloc_allocated': 'j_alloc', 'jemalloc_active': 'j_active', 'jemalloc_resident': 'j_resident', 'jemalloc_mapped': 'j_mapped',
          'jemalloc_retained': 'j_retained', 'jemalloc_metadata': 'j_meta'}
 MAP = [int(x) for x in os.environ['F7_EL_MAP'].split(',')] if os.environ.get('F7_EL_MAP') else None

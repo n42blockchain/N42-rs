@@ -5971,3 +5971,61 @@ Standing: every control leg's clean thirds read 39.0-41.8 ms; the
 storm-free, loop-free X20 leg is at 5.0 (LRb 5.000, LPc 5.006, LPd 5.036,
 LOc 5.043). The two defects above are what stands between a leg and 5M on
 *every* leg.
+
+## 10.219 -- four clean legs 4.95-5.10; the ranged cache drop cuts the reclaim 4-6x and reads a record 5.104 on one pair of two (stage ex, 2026-10-24)
+
+Stage ex ran the two fixes of 10.218 for the first time, after a native build
+and 2,556 unit tests (six new): the debt sweep (a0b8d022f, default on) and
+the ranged, lagged static-file cache drop (27fba2781, behind the knob).
+WARM + four X20 legs on the 600M set, the vm sampler on every leg.
+
+| leg | knob | drain M/s | win1 / win2 / win3 | gap by thirds (ms) | kswapd steals | refaults | `root_majflt` by thirds | sweeps / flushes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| LTa | off | 4.954 | 5.04 / 4.87 / 4.95 | 39.7 / 40.7 / 40.6 | 35.0M | 657k | 0 / 146 / 82 | 0 / 0 |
+| LT1 | on | **5.104** | 5.18 / 5.11 / 4.97 | **38.2** / 39.8 / 39.5 | 8.9M | 565k | 0 / 67 / 85 | 0 / 0 |
+| LTb | off | 5.035 | 5.10 / 5.01 / 4.93 | 39.0 / 40.0 / 40.2 | 33.8M | 318k | 0 / 28 / 102 | 0 / 0 |
+| LT1b | on | 4.985 | 4.94 / 5.08 / 4.90 | 40.3 / 39.2 / 40.8 | 6.0M | 391k | 0 / 0 / 198 | 0 / 0 |
+
+Gates clean on all four, no timeout certificate (the 7 in each of ew's knob
+legs were the view-1 start-up ones the d2gate ignores; the knob never caused
+a TC). Neither a stale-parent refusal nor a flush nor a sweep occurred in
+any leg: the periodic refusal of 10.216 is intermittent (eu 3 of 5 legs, ev
+0 of 4, ew 1 of 4, ex 0 of 4), so the debt sweep is still unexercised on the
+fleet; its unit tests cover the 10.218 state (debt-only lanes with frames on
+the road: the sweep takes exactly the debt, the FIFO is untouched, 30
+rebuilds cost zero flushes).
+
+Four facts:
+
+1. **The first stage in which every leg read 4.95 or more** (mean 5.020).
+   Nothing broke with both fixes in the tree.
+2. **Record leg 5.104M/s** (LT1: windows 5.18 / 5.11 / 4.97; first-third
+   gap 38.2 ms, the lowest measured). Previous record 5.043 (LOc).
+3. **The ranged drop does what 10.218 predicted for the writer cost**: the
+   knob legs' static-file writes are no longer slower (the per-block sums
+   are within the controls' spread), the follower never lagged, and kswapd
+   stole 6-9M pages a leg against 34-35M. It did not take the reclaim to
+   zero: `MemFree` still dips to 15-26 GB in the knob legs (controls 12-25),
+   so a watermark is still reached, and the knob legs still fault 67-198
+   times a build on the root path in their second and third thirds (the
+   controls 28-146). On a 136 GB box the static files (10.214: 115 GB
+   written in a leg) are the filler; with them released the remaining
+   pressure is the heaps (`AnonPages` 17 GB), the QMDB entry file (15 GB,
+   mapped) and the kept tails (256 MB × segments × 7 nodes ≈ 7 GB), plus
+   12 GB of tmpfs (`/tmp`, Go test caches and build caches of the other
+   client; our own 920 scratch dirs were small and are gone).
+4. **One pair of two**: LT1 beat both controls (5.104 against 4.954 and
+   5.035), LT1b sat between them (4.985). Not adopted yet; stage ey runs
+   the second pair plus one knob leg with `N42_SF_DROP_CACHE_KEEP_MB=64`
+   (the kept tail at a quarter) to see whether the remaining steals follow
+   the tail.
+
+Where the faults remain: 96.6-99.9% of the perf-recorded major faults in
+all four legs are `qmdb/entries.log` through the view mapping (10.215),
+the rest the account-change-sets static file (the builder's changeset
+fallback for cold accounts) and, in LTb only, 700 on the transactions file.
+The entry file is what has to stay resident; everything else may go. If
+the 64 MB leg does not take the steals to zero, the next lever is to pin
+the entry file's hot tail (`mlock` or `MADV_WILLNEED` on the last N GB of
+the view mapping), which converts the remaining faults to zero at a known
+memory cost.

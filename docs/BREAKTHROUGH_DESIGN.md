@@ -5563,3 +5563,67 @@ rate: `N42_FOLLOWER_FREE_ASYNC=0` (frees inline), `N42_ROAD_TAKEN_MAX=16384`
 4.69/4.82 before X21, when the page-cache storm dominated) and
 `N42_FOLLOWER_COPY_ASIDE=0` (the follower imports the described block
 without the owned copy made beside it).
+
+## 10.225 -- the holder: the queue pruner falls behind the chain and everything it releases waits with it (stages fd and fe, 2026-10-24)
+
+Stage fd ran one X21 control and three single-knob legs; stage fe reran
+the road knob that fd lost to the flood's funding failure (the second
+"funding did not mine within 120s" of the day, both on legs that had
+nothing else in common).
+
+| leg | knob | drain M/s | gap ms | heap `allocated` +30 / +60 / +90 s | peak GB | `road_taken_live` max | `road_evicted` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| LZa | X21 | 5.018 | 39.9 | 43 / 49 / 61 | 66 | 51k | 0 |
+| LZ1 | `N42_FOLLOWER_FREE_ASYNC=0` | 5.039 | 39.7 | 36 / 57 / 84 | 87 | 94k | 0 |
+| LZ3 | `N42_FOLLOWER_COPY_ASIDE=0` | 5.065 | 39.5 | 30 / 70 / 83 | 90 | 72k | 0 |
+| LZc | X21 | 4.961 | 40.3 | 65 / 77 / 75 | 85 | 73k | 0 |
+| LZ2b | `N42_ROAD_TAKEN_MAX=16384` | 4.818 | 41.5 | 26 / 29 / 27 | **30** | 16k (bound) | 41k |
+| LZ4 | `N42_ROAD_TAKEN_MAX=32768` | 4.911 | 40.7 | 39 / 42 / 41 | **45** | 33k (bound) | 39k |
+
+Two knobs are cleared (the follower's async free and the copy aside change
+nothing). The road's bound on remembered taken frames sets the heap
+directly -- 85 GB unbounded, 45 GB at 32,768 frames, 30 GB at 16,384 --
+but it costs 1-3% of the drain rate (as 10.212 found before X21): the
+road evicts 40k frames a leg under the taken lock the builder shares, and
+an evicted frame's transactions are forgotten rather than retired.
+
+### Why the frames are remembered so long
+
+A taken frame is retired only inside a pruner wake (`road.retire` at
+`tx-queue/src/lib.rs:3291` and `:3466`), so it lives at least until the
+canonical pruner reaches its block. The same wake is what releases the
+pooled transactions from the by-hash index and the own-block hold, and
+what drops the notification whose `Arc<Chain>` is the last reference to
+the block's body once the engine tree has let go (8-17 blocks). That is
+why the two profiled sites of 10.223 -- pooled transactions and the
+built bodies -- grow in lockstep: both wait for the pruner.
+
+And the pruner does fall behind. From the prune line against the canonical
+head (`mem.log`), the lag grows through every full-block leg: LZc +170
+blocks over 80 s, LYb +230, LZ2b (small road) +70 and then flat; the
+"an own block was still held when the bound was reached" warning fires
+~2,200 times a leg, i.e. the pruner is more than 16 blocks behind nearly
+every block. Each wake takes all the notifications queued (`prune_ms`
+0.1 s and 2 blocks at the start, **8.3 s and 193 blocks** by +80 s in LZc)
+while the timed steps inside it (`settle/remove/forget/fold/lock/free_us`)
+sum to 0.03-0.8 s: the other ~90% of a wake is spent outside them --
+collecting the (sender, nonce) pairs and hashes of 5-40M transactions out
+of the notifications, and dropping their bodies (the freeing channel holds
+four wakes and then the pruner frees inline). At ≥40 ms a block that is
+the block interval itself, so the lag never recovers until the blocks
+turn thin, when it drains in seconds -- the shape every leg shows.
+
+### The fix
+
+Feed the pruner lean block summaries (number, hash, the (sender, nonce)
+pairs, the transaction hashes: ~12 MB a block) built in the forwarding
+task, and drop the notification there, so the body dies with the engine
+tree and the wake neither walks 200k transactions a block nor frees
+them; `N42_PRUNE_FEED_LEAN=0` restores the whole-notification feed; the
+prune line gains `feed_depth` and `lag_blocks`. Being implemented in the
+bench tree; stage ff measures it against `N42_PRUNE_FEED_LEAN=0` controls
+in two pairs. If the lag then stays within a few blocks, the road's
+remembered frames, the by-hash index and the hold shrink with it and
+the heap should settle near the 13 GB baseline plus a few GB; the second
+step, if needed, is `N42_QUEUE_FREE_THREADS=2` and retiring the road's
+frames by the block they were taken for.

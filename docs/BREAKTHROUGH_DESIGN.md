@@ -6093,3 +6093,116 @@ the huge-page policy of the heap, or returning the transient structures to
 the OS). Stage ez: three X21 controls and one leg with
 `N42_SF_DROP_CACHE_KEEP_MB=64`, the sampler on every leg; the jemalloc
 columns decide the next design step.
+
+## 10.221 -- the heap is live data, ~50 MB a full block, held for ~1,000 blocks; the debt sweep is exercised in the field (stage ez, 2026-10-24)
+
+Stage ez ran WARM + four legs on X21: three controls and one with
+`N42_SF_DROP_CACHE_KEEP_MB=64` (release the static-file pages 64 MB behind
+the write instead of 256 MB). The jemalloc gauges the node already exports
+(`reth_jemalloc_*`) are in `mem.log` from LVb on: the sampler had looked
+them up under the bare names in LVa and LV1 (fixed 881a24091), and a side
+sampler of the metrics endpoint covered LVb at 2 s.
+
+| leg | knob | drain M/s | win1 / win2 / win3 | gap by thirds (ms) | kswapd steals | refaults | notes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| LVa | X21 | **5.030** | 5.13 / 5.03 / 4.87 | 38.8 / 39.8 / 40.7 | 4.3M | 0.45M | clean |
+| LV1 | keep 64 MB | 5.004 | 5.03 / 4.76 / 5.17 | 39.5 / 41.8 / 38.7 | 3.4M | 0.16M | one stale-parent refusal, one GiveBack flush, **one debt sweep** |
+| LVb | X21 | 5.018 | 5.06 / 4.76 / 5.17 | 39.4 / 41.8 / 38.5 | 0.09M | 0.12M | refusals at 1021/1022 and 2045, 3 GiveBack flushes, **two debt sweeps** |
+| LV2 | X21 | 4.965 | 5.15 / 4.73 / 4.95 | 38.6 / 42.1 / 40.2 | 10.1M | 0.60M | `root_majflt` 0 / 221 / 116 a build, `batch_majflt` 62 / 81 |
+
+Gates clean (LVb's `tc=7` are the view-1 start-up lines, not gated). The
+keep-64 leg sits inside the control band (controls 4.965-5.030 here,
+4.95-5.10 over ex-ez): **not adopted**, X21 stays at 256 MB. Seven X21
+legs now read 4.965-5.104.
+
+### The debt sweep works where the flush loop used to start
+
+LVb hit the periodic stale-parent refusal twice (blocks 1021 and 2045) and
+LV1 once. In 10.218 the same refusal started the flush loop that took a leg
+to 3.096; here each refusal cost one or two GiveBack flushes and a debt
+sweep (`debt_sweeps=1` in the road line, `lane debt swept` in the log), the
+legs read 5.018 and 5.004, and the blocks stayed full. a0b8d022f holds in
+the field.
+
+### The heap is live data
+
+jemalloc's own account of node0's heap (the one shared execution layer; the
+seven validators hold 0.8 GB together), GB, against the box's anonymous
+memory:
+
+| leg | +s | allocated | active | resident | mapped | retained (virtual) | EL RSS | box anon |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| LVb | 10 | 16.8 | 17.1 | 21.4 | 22.3 | 16.4 | 26.1 | 24.9 |
+| LVb | 40 | **45.5** | 46.0 | 49.1 | 50.0 | 27.0 | 63.5 | 50.0 |
+| LVb | 50 | 25.0 | 25.3 | 33.2 | 34.3 | 55.1 | 51.0 | 33.1 |
+| LVb | 90 | 34.4 | 34.9 | 38.8 | 39.8 | 53.5 | 71.1 | 41.1 |
+| LV2 | 30 | 50.2 | 50.6 | 54.6 | 55.6 | 22.2 | 66.2 | 56.9 |
+| LV2 | 50 | 68.1 | 68.8 | 72.2 | 73.1 | 31.5 | 89.7 | 71.7 |
+| LV2 | 80 | **72.2** | 72.8 | 79.9 | 80.9 | 41.8 | 89.9 | 79.3 |
+| LV2 | 90 | 73.8 | 74.6 | 79.4 | 80.4 | 42.9 | 93.3 | 79.3 |
+
+`resident / allocated` is **1.08-1.11** at every point, and `allocated`
+itself moves with the anonymous memory: the 10.220 question is answered,
+the heap is what the program asked for, not pages jemalloc kept. The
+retained column is address space, not memory. RSS minus resident (10-28
+GB) is the file-backed part: the entry file's view mapping and the
+static files, which is also where every major fault lands.
+
+The side sampler puts a clock on it. In LVb `allocated` was 2.6 GB at the
+first full block (08:04:17), 27.5 GB at +29 s, 51.7 GB at +44 s (1.1 GB/s
+rising to 1.6 GB/s), then **50.8 -> 31.1 -> 24.2 GB between 08:05:03 and
+08:05:08**, the four seconds around the block-2045 refusal; afterwards it
+hovered 25-35 GB. In LV2, with no refusal, it climbed to 72 GB by +50 s
+and stayed there to the end. At ~25 full blocks a second the growth is
+**45-65 MB a block, about 250-300 B a transaction**: a block's worth of
+transaction objects (or an equally sized per-block output), kept for
+roughly 1,000-1,300 blocks before it is let go, all at once or at a
+ceiling. The ~10 GB mid-leg falls of 10.220 (LUa, LUb) had no refusal, so
+the release has at least one other trigger.
+
+Ruled out by the logs, without a build:
+
+- the QMDB forest: `freed the QMDB records ... records=4` at every sample,
+  reader lag 7 blocks, `keep_cap=1024` never approached; read-view
+  journals are capped at 64 (`JOURNAL_DEPTH`); compaction runs every
+  block on 0.1-0.5 MB segments;
+- the state index and `TwigTree` entries: `N42_QMDB_ENTRY_FILE=1` keeps the
+  entries in `entries.log` (file-backed, the page-cache side of RSS);
+- the queue and the frame road: `queued` holds at 2.2-2.5M transactions
+  (~1 GB) through every leg; the road's 5 s line reports frames per window
+  (a 5.3M tx/s flow), not holdings; `frames_indexed/aside/pending` 0;
+- the engine tree's sidechains: `finalized` advances every block (6,667
+  distinct hashes in LVb), and exactly one executed block is handed in per
+  height (7,349 heights, one with two);
+- the validators: 0.8 GB for all seven.
+
+What is left are the per-block holders this log does not count: the
+executed blocks the engine tree keeps (`blocks_by_hash`, pruned by
+`remove_until` from the last persisted hash; bounded by the persistence
+threshold 8 only if that walk reaches them), the built executions and the
+hand-off path, and the canonical-notification subscribers. reth exports
+the first as `reth_consensus_engine_beacon_executed_blocks`.
+
+### What it costs
+
+LV2 is the slow leg of the stage and the one whose heap plateaued at 72-80
+GB: with 80 GB anonymous on a 136 GB box the page cache fell to 14-17 GB
+in the second and third thirds, `root_majflt` rose to 221 a build, kswapd
+stole 10M pages, and the second third's gap was 42.1 ms. LVb, whose heap
+was let go at +46 s, kept the cache at 30-44 GB and read 38.5 ms in its
+last third. The heap is therefore the lever left for "5M on every leg": a
+leg that holds its heap under ~40 GB keeps the entry file and the static
+files resident and does not fault.
+
+### Next
+
+Stage fa: two X21 controls with the whole `/metrics` page dumped every 5 s
+(`metrics-<tag>.log`) and `tree_blocks` in `mem.log`. If the executed-block
+gauge tracks the heap (~1,000 blocks held), the tree is the holder and the
+fix is in the persistence hand-off that should prune it; if it stays at the
+threshold, the N42 gauges in the same dump narrow it to the queue, the
+built executions or the subscribers. The fallback, if no gauge moves with
+the heap, is a `jemalloc-prof` build of the bench tree
+(`cargo build --profile profiling --features jemalloc-prof`) and one leg
+with `prof:true,lg_prof_interval:30`, read through
+`scripts/fleet7-profile.sh --alloc`.

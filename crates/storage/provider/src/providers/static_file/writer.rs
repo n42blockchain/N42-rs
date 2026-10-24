@@ -253,6 +253,9 @@ pub struct StaticFileProviderRW<N> {
     changeset_offsets: Option<ChangesetOffsetWriter>,
     /// Current block's changeset offset being written.
     current_changeset_offset: Option<ChangesetOffset>,
+    /// N42: bytes of the data file whose cached pages were already released
+    /// (`N42_SF_DROP_CACHE=1`); 0 again whenever another file is opened.
+    n42_dropped_upto: u64,
 }
 
 impl<N: NodePrimitives> StaticFileProviderRW<N> {
@@ -279,6 +282,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             synced: false,
             changeset_offsets: None,
             current_changeset_offset: None,
+            n42_dropped_upto: 0,
         };
 
         // Run NippyJar healing BEFORE setting up changeset sidecar
@@ -562,7 +566,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         }
         self.synced = true;
         // N42: the files are synced, release their clean pages (`N42_SF_DROP_CACHE=1`).
-        super::n42_sf::drop_cache_after_commit(&self.data_path);
+        super::n42_sf::drop_cache_after_commit(&self.data_path, &mut self.n42_dropped_upto);
         Ok(())
     }
 
@@ -671,7 +675,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         }
 
         // N42: the files are synced, release their clean pages (`N42_SF_DROP_CACHE=1`).
-        super::n42_sf::drop_cache_after_commit(&self.data_path);
+        super::n42_sf::drop_cache_after_commit(&self.data_path, &mut self.n42_dropped_upto);
 
         Ok(())
     }
@@ -825,6 +829,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                     Self::open(segment, last_block + 1, self.reader.clone(), self.metrics.clone())?;
                 self.writer = writer;
                 self.data_path = data_path.clone();
+                self.n42_dropped_upto = 0;
 
                 // Update changeset offsets writer for the new file (starts empty)
                 if segment.is_change_based() {
@@ -1094,6 +1099,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         self.writer = previous_writer;
         self.writer.set_dirty();
         self.data_path = data_path.clone();
+        self.n42_dropped_upto = 0;
 
         // Delete the sidecar file for changeset segments before deleting the main jar
         if segment.is_change_based() {

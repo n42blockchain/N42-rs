@@ -941,6 +941,6 @@ impl<T: PoolTransaction> TxQueue<T> {
             }
         }
         garbage.free();
-        self.finish_frame_build(segments, plan, times, mark, prepared_body, gas_limit, mode, ahead)
+        self.finish_frame_build(segments, plan, Vec::new(), times, mark, prepared_body, gas_limit, mode, ahead)
     }
 }

@@ -233,8 +233,11 @@ const TX_GAS: u64 = 21_000;
 
 fn build(queue: &TxQueue<EthPooledTransaction>, parent: B256, txs: u64) -> (Vec<Tx>, FramePlan) {
     let (best, plan, _) = queue.frames_for_build_ahead(parent, txs * TX_GAS, SelectMode::Parallel, false);
+    let sweep = best.is_debt_sweep();
     let taken: Vec<Tx> = best.collect();
-    assert_eq!(plan.tx_count(), taken.len());
+    if !sweep {
+        assert_eq!(plan.tx_count(), taken.len());
+    }
     (taken, plan)
 }
 
@@ -402,6 +405,7 @@ fn a_block_mixes_road_and_lane_frames_in_nonce_order() {
 #[test]
 fn a_gate_stuck_on_untakeable_debt_flushes_the_road() {
     let q = road_queue();
+    q.road.set_debt_sweep(false);
     for s in 0..10 {
         q.push([tx_hashed(sender(s), 0)]);
     }
@@ -598,6 +602,7 @@ fn the_stuck_flush_waits_for_the_takes_to_stall() {
 #[test]
 fn untakeable_debt_with_nothing_indexed_still_flushes() {
     let q = road_queue();
+    q.road.set_debt_sweep(false);
     for s in 0..10 {
         q.push([tx_hashed(sender(s), 0)]);
     }
@@ -618,4 +623,79 @@ fn untakeable_debt_with_nothing_indexed_still_flushes() {
     assert!(at > ROAD_STUCK_BUILDS && at <= ROAD_STUCK_BUILDS + 2, "flushed at build {at}");
     let stats = q.road_stats();
     assert_eq!((stats.flushes, stats.flushes_stuck, stats.len_txs), (1, 1, 0), "{stats:?}");
+}
+
+/// Ten road senders whose nonce 0 reached the lanes without a frame (lane
+/// debt no frame plan takes) and whose frames of nonces 1-2 wait on the
+/// road; nothing indexed.
+fn debt_only_queue() -> TxQueue<EthPooledTransaction> {
+    let q = road_queue();
+    q.road.set_debt_sweep(true);
+    for s in 0..10 {
+        q.push([tx_hashed(sender(s), 0)]);
+    }
+    flood(&q, 10, 1, 2, 10);
+    assert_eq!(q.road.queued_ids().len(), 2);
+    assert_eq!(q.frames_indexed(), 0);
+    assert_depth(&q, 30);
+    q
+}
+
+/// A debt-only lane state with frames on the road: the build's empty frame
+/// plan is answered with a sweep of exactly the debt transactions, the road
+/// is not touched, the gate is open afterwards, and the child takes the
+/// road's frames (`N42_ROAD_DEBT_SWEEP`).
+#[test]
+fn a_debt_sweep_takes_only_the_debt_and_opens_the_gate() {
+    let q = debt_only_queue();
+    let queued = q.road.queued_ids();
+    let (best, plan, _) = q.frames_for_build_ahead(block_hash(0), 1_000 * TX_GAS, SelectMode::Parallel, false);
+    assert!(best.is_debt_sweep());
+    assert!(plan.frames.is_empty());
+    let swept: Vec<Tx> = best.collect();
+    let mut got = pairs(&swept);
+    got.sort_unstable();
+    let mut want: Vec<(Address, u64)> = (0..10).map(|s| (sender(s), 0)).collect();
+    want.sort_unstable();
+    assert_eq!(got, want, "exactly the debt");
+    assert_eq!(q.road.queued_ids(), queued, "the road's FIFO is untouched");
+    let stats = q.road_stats();
+    assert_eq!((stats.flushes, stats.flushes_stuck, stats.debt_sweeps, stats.lane_debt), (0, 0, 1, 0), "{stats:?}");
+    assert!(q.lock_inner().road_gate_open(), "the gate is open after the sweep");
+    assert_depth(&q, 20);
+    let parent = commit(&q, block_hash(0), 1, &swept);
+    let (road, plan) = build(&q, parent, 1_000);
+    assert_eq!((road.len(), plan.frames.len()), (20, 2));
+    assert!(road.iter().all(|t| t.nonce() >= 1));
+    assert_chain_valid(&[swept, road]);
+    assert_depth(&q, 0);
+    assert_eq!(q.road_stats().flushes, 0);
+}
+
+/// Debt that keeps coming back (each build on the same parent gives the
+/// previous sweep back to the lanes) is swept again every build: no stuck
+/// flush and no give-back flush across 30 builds.
+#[test]
+fn recurring_debt_is_swept_without_a_stuck_flush() {
+    let q = debt_only_queue();
+    let queued = q.road.queued_ids();
+    for n in 1..=30u64 {
+        let (txs, plan) = build(&q, block_hash(0), 1_000);
+        assert!(plan.frames.is_empty(), "build {n}");
+        assert_eq!(txs.len(), 10, "build {n}: the debt");
+        let stats = q.road_stats();
+        assert_eq!((stats.flushes, stats.flushes_stuck, stats.debt_sweeps), (0, 0, n), "build {n}: {stats:?}");
+    }
+    assert_eq!(q.road.queued_ids(), queued);
+}
+
+/// The switch off keeps the old behaviour: no sweep, the build takes
+/// nothing while the debt holds the gate shut.
+#[test]
+fn the_debt_sweep_switch_off_takes_nothing() {
+    let q = debt_only_queue();
+    q.road.set_debt_sweep(false);
+    let (txs, plan) = build(&q, block_hash(0), 1_000);
+    assert!(txs.is_empty() && plan.frames.is_empty());
+    assert_eq!(q.road_stats().debt_sweeps, 0);
 }

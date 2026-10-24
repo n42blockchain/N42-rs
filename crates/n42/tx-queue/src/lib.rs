@@ -1288,6 +1288,12 @@ struct Inner<T: PoolTransaction> {
     road_stuck_armed: u64,
     /// The build of the last flush (the flush's log line).
     road_last_flush: u64,
+    /// The transactions of the last debt sweep ([`Self::sweep_road_debt`]),
+    /// by sender and nonce: one of them given back is a lane entry below its
+    /// sender's road frames again (debt for the next sweep), not a road
+    /// frame given back in part, so it does not invalidate the road.
+    /// Cleared by a flush.
+    road_swept: std::collections::HashSet<(Address, u64)>,
 }
 
 /// A shut gate's mark ([`Inner::road_note_stuck`]): since which build the
@@ -2342,6 +2348,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 frames_planned: 0,
                 road_stuck_armed: 0,
                 road_last_flush: 0,
+                road_swept: std::collections::HashSet::new(),
             })),
             inbox: Arc::new(Mutex::new(Vec::new())),
             staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -4533,6 +4540,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             prepared_body: None,
             drain,
             walk_cut_short: false,
+            debt_sweep: false,
         }
     }
 
@@ -4596,7 +4604,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         let mut garbage = PruneGarbage::default();
         let at = std::time::Instant::now();
         let mut prepared_body: Option<Arc<Mutex<BodySlot>>> = None;
-        let ((segments, plan), mark) = {
+        let ((segments, plan, swept), mark) = {
             let mut inner = self.lock_inner();
             times.lock_us = at.elapsed().as_micros() as u64;
             inner.note_index(&mut times);
@@ -4642,7 +4650,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                         }
                         plan.skipped += more_plan.skipped;
                     }
-                    (segments, plan)
+                    (segments, plan, Vec::new())
                 }
                 (verdict, prepared) => {
                     if let Some(prepared) = prepared {
@@ -4660,9 +4668,23 @@ impl<T: PoolTransaction> TxQueue<T> {
                     self.begin_build(&mut inner, parent);
                     times.begin_us = begin_at.elapsed().as_micros() as u64;
                     let plan_at = std::time::Instant::now();
-                    let (segments, plan, _) = inner.plan_frames(gas_limit, &mut times, mode);
+                    let (segments, plan, gas_left) = inner.plan_frames(gas_limit, &mut times, mode);
                     times.plan_us = plan_at.elapsed().as_micros() as u64;
-                    (segments, plan)
+                    // Nothing planned, nothing indexed or arriving into the
+                    // index, and the road held up by lane debt only: the
+                    // debt is taken as plain transactions
+                    // ([`Inner::sweep_road_debt`]).
+                    let swept = if plan.frames.is_empty()
+                        && segments.is_empty()
+                        && self.frames_in_hand.load(std::sync::atomic::Ordering::Acquire) == 0
+                        && self.frames_staged.load(std::sync::atomic::Ordering::Acquire) == 0
+                        && inner.road_debt_sweepable()
+                    {
+                        inner.sweep_road_debt(gas_left)
+                    } else {
+                        Vec::new()
+                    };
+                    (segments, plan, swept)
                 }
             };
             // With `N42_QUEUE_OFFLOCK` the noted takes are grouped off the
@@ -4677,7 +4699,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             (out, mark)
         };
         let _ = garbage.free();
-        self.finish_frame_build(segments, plan, times, mark, prepared_body, gas_limit, mode, ahead)
+        self.finish_frame_build(segments, plan, swept, times, mark, prepared_body, gas_limit, mode, ahead)
     }
 
     /// The end of a frame build's selection, after its last hold: the noted
@@ -4688,6 +4710,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         &self,
         segments: Vec<(FrameTxs<T>, usize)>,
         plan: FramePlan,
+        swept: Vec<Arc<ValidPoolTransaction<T>>>,
         times: FrameSelectTimes,
         mark: Option<SettleMark>,
         prepared_body: Option<Arc<Mutex<BodySlot>>>,
@@ -4734,6 +4757,26 @@ impl<T: PoolTransaction> TxQueue<T> {
                 }
             }
         }
+        if !swept.is_empty() {
+            // A debt sweep: its transactions, already taken, handed out as
+            // a walk's buffer is (a refusal skips the sender and gives its
+            // rest back), and nothing after them -- the lanes are not
+            // walked. The seal treats the body as a walked one.
+            let best = QueueBest {
+                queue: self.clone(),
+                skipped: AddressHashSet::default(),
+                buffer: swept.into(),
+                batch: 1,
+                frame_mode: false,
+                frames_ended: false,
+                segments: VecDeque::new(),
+                prepared_body: None,
+                drain: false,
+                walk_cut_short: true,
+                debt_sweep: true,
+            };
+            return (best, plan, times);
+        }
         let best = QueueBest {
             queue: self.clone(),
             skipped: AddressHashSet::default(),
@@ -4745,6 +4788,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             prepared_body,
             drain: true,
             walk_cut_short: false,
+            debt_sweep: false,
         };
         (best, plan, times)
     }
@@ -5562,7 +5606,11 @@ impl<T: PoolTransaction> Inner<T> {
                 let fire = if legacy {
                     waited >= ROAD_STUCK_BUILDS
                 } else {
-                    let stalled = builds.saturating_sub(mark.planned_at) >= ROAD_STUCK_BUILDS;
+                    // Debt a sweep can take is not stuck: this build sweeps
+                    // it ([`Self::sweep_road_debt`]); only the backstop
+                    // still fires (debt that keeps coming back).
+                    let stalled = builds.saturating_sub(mark.planned_at) >= ROAD_STUCK_BUILDS
+                        && !self.road_debt_sweepable();
                     builds >= self.road_stuck_armed
                         && ((stalled && waited >= ROAD_STUCK_BUILDS) || waited >= ROAD_STUCK_BACKSTOP_BUILDS)
                 };
@@ -5584,6 +5632,96 @@ impl<T: PoolTransaction> Inner<T> {
         self.road_debt
             .iter()
             .all(|sender| self.lanes.get(sender).is_none_or(|lane| lane.road != epoch || lane.by_nonce.is_empty()))
+    }
+
+    /// Whether a frame build whose plan came back empty takes the lane debt
+    /// as plain transactions ([`Self::sweep_road_debt`]): the switch is on
+    /// (`N42_ROAD_DEBT_SWEEP`), frames wait on the road, the frame index
+    /// and its chunked-drain remainder are empty (no frame plan will take
+    /// the debt), and a debt sender's lane is takeable (not parked). Read
+    /// after [`Self::road_gate_open`] pruned the debt set.
+    fn road_debt_sweepable(&self) -> bool {
+        if self.road_epoch == 0
+            || !self.road.debt_sweep()
+            || self.road.len_txs() == 0
+            || self.road_debt.is_empty()
+            || self.frames.len() != 0
+            || !self.pending_frames.is_empty()
+        {
+            return false;
+        }
+        let epoch = self.road_epoch;
+        self.road_debt.iter().any(|sender| {
+            self.lanes
+                .get(sender)
+                .is_some_and(|lane| lane.road == epoch && lane.parked.is_none() && !lane.by_nonce.is_empty())
+        })
+    }
+
+    /// The lane debt taken as plain transactions (`N42_ROAD_DEBT_SWEEP`):
+    /// each debt sender's lane (unparked, of this epoch) from its head in
+    /// nonce order while the transactions' gas fits `gas_limit`, into the
+    /// build's taken list as the walk takes them. No other lane is touched
+    /// and the road is not invalidated: the debt is the transactions below
+    /// the road senders' frames, so with it in this build the gate opens
+    /// for the child. Returns the transactions in body order.
+    fn sweep_road_debt(&mut self, gas_limit: u64) -> Vec<Arc<ValidPoolTransaction<T>>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let epoch = self.road_epoch;
+        let debt_before = self.road.counters.lane_debt.load(Relaxed);
+        let mut senders: Vec<Address> = self.road_debt.iter().copied().collect();
+        senders.sort_unstable();
+        let mut gas_left = gas_limit;
+        let mut out: Vec<Arc<ValidPoolTransaction<T>>> = Vec::new();
+        let mut swept_senders = 0usize;
+        for sender in senders {
+            if gas_left < MIN_FRAME_TX_GAS {
+                break;
+            }
+            let Some(lane) = self.lanes.get_mut(&sender) else { continue };
+            if lane.road != epoch || lane.parked.is_some() {
+                continue;
+            }
+            let from = out.len();
+            while let Some(entry) = lane.by_nonce.first_entry() {
+                let gas = entry.get().gas_limit();
+                if gas > gas_left {
+                    break;
+                }
+                gas_left -= gas;
+                out.push(entry.remove());
+            }
+            let took = out.len() - from;
+            if took > 0 {
+                swept_senders += 1;
+                self.len -= took;
+                if lane.by_nonce.is_empty() {
+                    lane.queued = false;
+                }
+            }
+        }
+        if out.is_empty() {
+            return out;
+        }
+        self.lanes_gen = self.lanes_gen.wrapping_add(1);
+        if let Some((_, taken)) = self.last_build.as_mut() {
+            taken.extend(out.iter().cloned());
+        }
+        self.road_swept = out.iter().map(|t| (t.sender(), t.nonce())).collect();
+        // The debt set pruned of the lanes the sweep emptied, and the gauge
+        // recounted.
+        let _ = self.road_gate_open();
+        let sweeps = self.road.counters.debt_sweeps.fetch_add(1, Relaxed) + 1;
+        tracing::info!(
+            target: "n42.tx_queue",
+            txs = out.len(),
+            senders = swept_senders,
+            lane_debt_before = debt_before,
+            lane_debt_after = self.road.counters.lane_debt.load(Relaxed),
+            sweeps,
+            "frame road lane debt swept as plain transactions"
+        );
+        out
     }
 
     /// Invalidates the road (`docs/FRAME_ROAD_DESIGN.md` 2, "Failure"): its
@@ -5629,6 +5767,7 @@ impl<T: PoolTransaction> Inner<T> {
                 self.builds + flushed_frames / ROAD_FLUSH_FRAMES_PER_BUILD + ROAD_STUCK_BUILDS;
         }
         self.road_debt.clear();
+        self.road_swept.clear();
         if !frames.is_empty() {
             self.lanes_gen = self.lanes_gen.wrapping_add(1);
         }
@@ -6414,7 +6553,15 @@ impl<T: PoolTransaction> Inner<T> {
                 revive.push(frame);
             }
         }
-        let senders: Vec<Address> = rest.iter().map(|t| t.sender()).collect();
+        // A debt sweep's transaction given back is a lane entry below its
+        // sender's road frames again: debt for the next sweep, not a reason
+        // to invalidate the road ([`Self::sweep_road_debt`]).
+        let swept = &self.road_swept;
+        let senders: Vec<Address> = rest
+            .iter()
+            .filter(|t| swept.is_empty() || !swept.contains(&(t.sender(), t.nonce())))
+            .map(|t| t.sender())
+            .collect();
         let flush = road.any_on_road(&senders);
         for frame in &revive {
             rest.extend(frame.txs.iter().cloned());
@@ -7106,6 +7253,10 @@ pub struct QueueBest<T: PoolTransaction> {
     drain: bool,
     /// A non-draining walk that ended because frames began arriving.
     walk_cut_short: bool,
+    /// A frame build that swept the road's lane debt
+    /// ([`TxQueue::frames_for_build`], `N42_ROAD_DEBT_SWEEP`): `buffer`
+    /// holds the swept transactions and nothing else is offered.
+    debt_sweep: bool,
 }
 
 /// Where a frame build's selection ([`TxQueue::frames_for_build_timed`])
@@ -7250,6 +7401,13 @@ impl<T: PoolTransaction> Inner<T> {
 }
 
 impl<T: PoolTransaction> QueueBest<T> {
+    /// Whether this is a frame build that swept the road's lane debt as
+    /// plain transactions (`N42_ROAD_DEBT_SWEEP`): its frame plan is empty,
+    /// and the build takes what it offers instead of walking the lanes.
+    pub const fn is_debt_sweep(&self) -> bool {
+        self.debt_sweep
+    }
+
     /// Whether this non-draining walk ended early because frames began
     /// arriving ([`TxQueue::best_for_walk`]).
     pub const fn walk_cut_short(&self) -> bool {

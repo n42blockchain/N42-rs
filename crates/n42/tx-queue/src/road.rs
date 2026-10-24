@@ -219,6 +219,21 @@ pub(crate) fn road_stuck_legacy() -> bool {
     *ON.get_or_init(|| std::env::var("N42_ROAD_STUCK_LEGACY").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `N42_ROAD_DEBT_SWEEP=0` turns it off (on by default; off under
+/// `N42_ROAD_STUCK_LEGACY=1`): a frame build whose plan came back empty,
+/// with frames on the road, nothing in the frame index and the gate shut by
+/// lane debt no frame plan can take (a road sender's frameless lane entry, a
+/// frame's tail), takes that debt as plain transactions -- only the debt
+/// senders' lanes, in nonce order, up to the block's gas -- instead of
+/// taking nothing until a stuck flush invalidates the road. Each such flush
+/// brought the same untakeable debt back with the whole road behind it, a
+/// flush loop at the cool-down's period (loop351 leg LR1b: 97 stuck
+/// flushes, ~147k-transaction blocks).
+fn road_debt_sweep_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_ROAD_DEBT_SWEEP").map_or(true, |v| v.trim() != "0"))
+}
+
 /// Why the road was invalidated (the flush's log line).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FlushReason {
@@ -270,6 +285,7 @@ pub(crate) struct RoadCounters {
     pub(crate) refused: [AtomicU64; 4],
     pub(crate) flushes: AtomicU64,
     pub(crate) flushes_stuck: AtomicU64,
+    pub(crate) debt_sweeps: AtomicU64,
     pub(crate) seeded: AtomicU64,
     pub(crate) seed_holds: AtomicU64,
     pub(crate) len_txs: AtomicU64,
@@ -301,6 +317,9 @@ pub struct RoadStats {
     pub flushes: u64,
     /// Of those, the flushes of a gate stuck on debt no build was taking.
     pub flushes_stuck: u64,
+    /// Builds that swept the road senders' lane debt as plain transactions
+    /// (`N42_ROAD_DEBT_SWEEP`), instead of a stuck flush.
+    pub debt_sweeps: u64,
     /// Senders that joined the road.
     pub seeded: u64,
     /// Holds of the lanes' lock the seeding took.
@@ -333,6 +352,7 @@ impl RoadCounters {
             refused_dup_sender: get(&self.refused[Refusal::DupSender as usize]),
             flushes: get(&self.flushes),
             flushes_stuck: get(&self.flushes_stuck),
+            debt_sweeps: get(&self.debt_sweeps),
             seeded: get(&self.seeded),
             seed_holds: get(&self.seed_holds),
             len_txs: get(&self.len_txs),
@@ -390,6 +410,8 @@ pub(crate) struct Road<T: PoolTransaction> {
     pub(crate) counters: Arc<RoadCounters>,
     /// [`reseed_at_flush`], read at construction (tests set it).
     reseed: std::sync::atomic::AtomicBool,
+    /// [`road_debt_sweep_env`], read at construction (tests set it).
+    debt_sweep: std::sync::atomic::AtomicBool,
 }
 
 /// Guards of the shards a frame touches, locked in ascending order (so two
@@ -426,7 +448,19 @@ impl<T: PoolTransaction> Road<T> {
             taken: Mutex::new(RoadTaken::default()),
             counters: Arc::new(RoadCounters::default()),
             reseed: std::sync::atomic::AtomicBool::new(reseed_at_flush()),
+            debt_sweep: std::sync::atomic::AtomicBool::new(road_debt_sweep_env() && !road_stuck_legacy()),
         }
+    }
+
+    /// Whether a frame build may sweep the lane debt ([`road_debt_sweep_env`]).
+    pub(crate) fn debt_sweep(&self) -> bool {
+        self.debt_sweep.load(Ordering::Relaxed)
+    }
+
+    /// Sets [`Self::debt_sweep`] (tests).
+    #[cfg(test)]
+    pub(crate) fn set_debt_sweep(&self, on: bool) {
+        self.debt_sweep.store(on, Ordering::Relaxed);
     }
 
     /// Whether a flush seeds its senders again at once ([`reseed_at_flush`]).

@@ -5729,3 +5729,39 @@ is the obvious headroom and stage fi measures 2 against 3.
 the pruner thread, lean feed off) + `N42_QUEUE_FREE_THREADS=2`, adopted
 2026-10-24.** Stage fi confirms it with two more pairs (2 vs 3 freeing
 threads) before the port to main.
+
+## 10.228 -- X22 confirmed: six legs 5.095-5.207, every one past 5M; a third freeing thread adds nothing (stage fi, 2026-10-24)
+
+Stage fi ran X22 in two pairs, `N42_QUEUE_FREE_THREADS=2` against `=3`,
+600M replay set:
+
+| leg | freeing threads | drain M tx/s | gap ms | heap peak GB | lag_blocks max | prune wakes | pruner CPU s | freeing CPU s |
+|---|---|---|---|---|---|---|---|---|
+| LDa | 2 | 5.151 | 38.8 | 24 | 6 | 466 | 40 | 90 + 14 |
+| LD1 | 3 | 5.095 | 39.3 | 24 | 8 | 436 | 45 | 33 + 34 + 34 |
+| LDb | 2 | **5.207** | **38.4** | 24 | 6 | 478 | 40 | 91 + 20 |
+| LD1b | 3 | 5.152 | 38.8 | 22 | 7 | 479 | 40 | 27 + 28 + 30 |
+
+Three freeing threads spread the garbage evenly but read 1.1% and 1.0%
+under their pairs' two-thread legs -- within the band, no gain; two
+threads stay. With fh, **X22 has six legs: 5.168, 5.168, 5.151, 5.095,
+5.207, 5.152 M tx/s (mean 5.157, gaps 38.4-39.3 ms), every one past the
+5M target that needs a 40.0 ms mean gap; the round record is 5.207
+(LDb)**. Every leg's heap sits flat at 22-24 GB, the pruner's lag stays
+within 8 blocks, and no own-hold warning, stale-parent refusal or road
+flush appears except in LD1b (one stale-parent refusal and two flushes,
+the periodic 1024-block refusal of 10.219, still open and now cheap).
+
+What the ten rounds since 10.219 found, in one line: the heap's 60-80 GB
+was never a cache, a leak or the engine tree; it was the canonical
+pruner's wake queue, held back by the frees it did on its own thread,
+and every copy of a block (body, pooled transactions, road frames) waited
+for that one thread. The release of 50 GB of live data cut the page-cache
+pressure that cost the slow legs 1-3% (10.213, 10.221) and the own-hold
+storms that cost the rest.
+
+Next: the port of X22 to main (reth 2.8.1) with the fixes since X21
+(cf04ae9c2 .. a45c84ab2), then a main-tree fleet comparison before any
+mixed-tree results; the periodic stale-parent refusal; and the pruner's
+remaining cost (the pair collection, `collect_us` 17 s a leg) if a later
+block shape needs it.

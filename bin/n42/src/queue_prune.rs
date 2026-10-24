@@ -70,7 +70,7 @@ pub fn lean_blocks(notification: &CanonStateNotification<N42Primitives>) -> Vec<
 pub enum PruneFeed {
     /// The committed blocks' summaries of an ordinary commit.
     Lean(Vec<LeanBlock>),
-    /// A whole notification (a reorg, or `N42_PRUNE_FEED_LEAN=0`).
+    /// A whole notification (a reorg, or `N42_PRUNE_FEED_LEAN` off).
     Whole(CanonStateNotification<N42Primitives>),
 }
 
@@ -86,16 +86,33 @@ impl PruneFeed {
     }
 }
 
-/// `N42_PRUNE_FEED_LEAN=0` carries whole canonical notifications to the
-/// pruning thread as before; default on: lean block summaries, read and
+/// `N42_PRUNE_FEED_LEAN=1` carries lean block summaries to the pruning
+/// thread instead of whole canonical notifications; default off, read and
 /// logged once. Loop351: with the pruner a wake (~1 s, ~25 blocks) behind,
 /// the notifications in its channel were the last holders of the
-/// committed blocks' bodies, 60-90 GB of the execution layer's heap.
+/// committed blocks' bodies, 60-90 GB of the execution layer's heap. Round
+/// 10.226 measured the lean feed losing 2-3.6% (LA1/LA1b 4.915 against
+/// 5.100/5.019 M tx/s): the pair collection moved onto the notification
+/// receiver's thread.
 pub fn feed_lean() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("N42_PRUNE_FEED_LEAN").map_or(true, |v| v != "0");
+        let on = std::env::var("N42_PRUNE_FEED_LEAN").is_ok_and(|v| v == "1");
         info!(target: "n42.tx_queue", prune_feed_lean = on, "N42_PRUNE_FEED_LEAN");
+        on
+    })
+}
+
+/// Whether the pruning thread drops a wake's feed items itself
+/// (`N42_PRUNE_FREE_INLINE=1`, default off: they go to the queue's freeing
+/// thread through [`n42_tx_queue::free_later`] once the wake is pruned and
+/// logged), read and logged once. A whole notification is the last holder
+/// of its blocks' bodies once the pruner is behind the engine.
+pub fn free_inline() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("N42_PRUNE_FREE_INLINE").is_ok_and(|v| v == "1");
+        info!(target: "n42.tx_queue", prune_free_inline_items = on, "N42_PRUNE_FREE_INLINE");
         on
     })
 }
@@ -215,7 +232,11 @@ fn prune_one(
     // the queue's freeing thread.
     let mut sum = n42_tx_queue::PruneTimes::default();
     let mut highest = 0u64;
-    for block in item.blocks() {
+    // The pairs and hashes collected from a whole notification's blocks.
+    let at = std::time::Instant::now();
+    let blocks = item.blocks();
+    let collect_us = at.elapsed().as_micros() as u64;
+    for block in blocks {
         // What the builder reads to tell a build for a height the chain has
         // already decided from a build that is starving.
         n42_engine_types::canonical_head::saw(block.number);
@@ -240,6 +261,8 @@ fn prune_one(
         sum.forget_us += times.forget_us;
         sum.free_us += times.free_us;
         sum.frames_swept += times.frames_swept;
+        sum.retire_us += times.retire_us;
+        sum.retired += times.retired;
     }
     if mined > 10_000 {
         // `usable` beside `queued`: what a build could take of the depth.
@@ -269,6 +292,9 @@ fn prune_one(
             lock_us = sum.lock_us,
             free_us = sum.free_us,
             frames_swept = sum.frames_swept,
+            retire_us = sum.retire_us,
+            retired = sum.retired,
+            collect_us,
             coalesced,
             prune_wait_ms = waited.as_millis() as u64,
             feed_depth,
@@ -318,6 +344,8 @@ fn prune_lean_items(queue: &TxQueue<N42PooledTransaction>, items: &[FeedRef<'_>]
     let mut sum = n42_tx_queue::PruneTimes::default();
     let mut mined = 0usize;
     let mut highest = 0u64;
+    // Microseconds collecting the pairs and hashes of whole notifications.
+    let mut collect_us = 0u64;
     // Every block's pairs and hashes of the run, in order.
     let mut run: Vec<std::borrow::Cow<'_, LeanBlock>> = Vec::new();
     let flush = |run: &mut Vec<std::borrow::Cow<'_, LeanBlock>>, sum: &mut n42_tx_queue::PruneTimes| {
@@ -339,6 +367,8 @@ fn prune_lean_items(queue: &TxQueue<N42PooledTransaction>, items: &[FeedRef<'_>]
         sum.forget_us += times.forget_us;
         sum.free_us += times.free_us;
         sum.frames_swept += times.frames_swept;
+        sum.retire_us += times.retire_us;
+        sum.retired += times.retired;
         sum.removals += times.removals;
         sum.folded += times.folded;
         sum.drained += times.drained;
@@ -355,7 +385,10 @@ fn prune_lean_items(queue: &TxQueue<N42PooledTransaction>, items: &[FeedRef<'_>]
             queue.push_reverted(back);
             warn!(target: "n42.tx_queue", reverted_blocks, offered, new_blocks = new.blocks_iter().count(), "reorg: the reverted blocks' transactions are offered again");
         }
-        for block in item.blocks() {
+        let at = std::time::Instant::now();
+        let blocks = item.blocks();
+        collect_us += at.elapsed().as_micros() as u64;
+        for block in blocks {
             n42_engine_types::canonical_head::saw(block.number);
             queue.note_pruned(block.number);
             highest = highest.max(block.number);
@@ -388,6 +421,9 @@ fn prune_lean_items(queue: &TxQueue<N42PooledTransaction>, items: &[FeedRef<'_>]
             lock_us = sum.lock_us,
             free_us = sum.free_us,
             frames_swept = sum.frames_swept,
+            retire_us = sum.retire_us,
+            retired = sum.retired,
+            collect_us,
             coalesced,
             prune_wait_ms = waited.as_millis() as u64,
             feed_depth,
@@ -523,11 +559,22 @@ pub fn spawn_thread(queue: TxQueue<N42PooledTransaction>) -> Option<PruneSender>
                 // engine holds the last reference to the wake's blocks, and
                 // their free was ~13 ms a block on this thread after the
                 // logged prune (loop351 by, lean legs, 25-block wakes).
-                n42_tx_queue::free_later(batch);
+                if free_inline() {
+                    drop(batch);
+                } else {
+                    n42_tx_queue::free_later(batch);
+                }
                 continue;
             }
-            for (feed, arrived) in batch {
-                prune_one(&queue, FeedRef::from(&feed), coalesced, arrived.elapsed(), feed_depth);
+            for (feed, arrived) in &batch {
+                prune_one(&queue, FeedRef::from(feed), coalesced, arrived.elapsed(), feed_depth);
+            }
+            // As on the lean path: the wake's notifications go to the
+            // freeing thread once every one is pruned and logged.
+            if free_inline() {
+                drop(batch);
+            } else {
+                n42_tx_queue::free_later(batch);
             }
         }
     });

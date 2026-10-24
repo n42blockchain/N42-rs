@@ -729,12 +729,15 @@ fn main() {
                                         for block in notification.committed().blocks_iter() {
                                             n42_engine_types::canonical_head::saw(block.number());
                                         }
-                                        // `N42_PRUNE_FEED_LEAN` (default on): an
+                                        // `N42_PRUNE_FEED_LEAN=1` (default off): an
                                         // ordinary commit goes as lean block
                                         // summaries and the notification -- the
                                         // last holder of the blocks' bodies once
                                         // the engine lets go -- is dropped here,
-                                        // not when the pruner gets to it.
+                                        // not when the pruner gets to it. Round
+                                        // 10.226: it loses 2-3.6% (LA1/LA1b
+                                        // 4.915 against 5.100/5.019 M tx/s), the
+                                        // pair collection being on this thread.
                                         let feed = n42::queue_prune::PruneFeed::of(notification, prune_feed_lean);
                                         if pruner.send(feed).is_err() {
                                             error!(target: "n42.tx_queue", "the queue's pruning thread is gone; the queue is no longer pruned");

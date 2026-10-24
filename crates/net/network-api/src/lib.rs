@@ -62,7 +62,6 @@ pub trait FullNetwork:
     + PeersHandleProvider
     + Clone
     + Unpin
-    + 'static
 {
 }
 
@@ -76,7 +75,6 @@ impl<T> FullNetwork for T where
         + PeersHandleProvider
         + Clone
         + Unpin
-        + 'static
 {
 }
 

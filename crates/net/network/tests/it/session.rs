@@ -6,123 +6,175 @@
 use futures::StreamExt;
 use reth_eth_wire::EthVersion;
 use reth_network::{
-    test_utils::{NetworkEventStream, PeerConfig, Testnet},
-    NetworkEvent, NetworkEventListenerProvider,
+    test_utils::{PeerConfig, PeerHandle, Testnet},
+    NetworkEvent,
 };
-use reth_network_api::{
-    events::{PeerEvent, SessionInfo},
-    NetworkInfo, Peers,
-};
-use reth_storage_api::noop::NoopProvider;
+use reth_network_api::events::PeerEvent;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_session_established_with_highest_version() {
-    reth_tracing::init_test_tracing();
-
-    let net = Testnet::create(2).await;
-    net.for_each(|peer| assert_eq!(0, peer.num_peers()));
-
-    let mut handles = net.handles();
-    let handle0 = handles.next().unwrap();
-    let handle1 = handles.next().unwrap();
-    drop(handles);
-
-    let handle = net.spawn();
-
-    let mut events = handle0.event_listener().take(2);
-    handle0.add_peer(*handle1.peer_id(), handle1.local_addr());
-
-    while let Some(event) = events.next().await {
-        match event {
-            NetworkEvent::Peer(PeerEvent::PeerAdded(peer_id)) => {
-                assert_eq!(handle1.peer_id(), &peer_id);
-            }
-            NetworkEvent::ActivePeerSession { info, .. } => {
-                let SessionInfo { peer_id, status, .. } = info;
-                assert_eq!(handle1.peer_id(), &peer_id);
-                assert_eq!(status.version, EthVersion::Eth68);
-            }
-            ev => {
-                panic!("unexpected event {ev:?}")
-            }
-        }
-    }
-    handle.terminate().await;
+    let version = negotiated_version(PeerConfig::default(), PeerConfig::default()).await;
+    assert_eq!(version, Some(EthVersion::LATEST));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_session_established_with_different_capability() {
-    reth_tracing::init_test_tracing();
-
-    let mut net = Testnet::create(1).await;
-
-    let p1 = PeerConfig::with_protocols(NoopProvider::default(), Some(EthVersion::Eth66.into()));
-    net.add_peer_with_config(p1).await.unwrap();
-
-    net.for_each(|peer| assert_eq!(0, peer.num_peers()));
-
-    let mut handles = net.handles();
-    let handle0 = handles.next().unwrap();
-    let handle1 = handles.next().unwrap();
-    drop(handles);
-
-    let handle = net.spawn();
-
-    let mut events = handle0.event_listener().take(2);
-    handle0.add_peer(*handle1.peer_id(), handle1.local_addr());
-
-    while let Some(event) = events.next().await {
-        match event {
-            NetworkEvent::Peer(PeerEvent::PeerAdded(peer_id)) => {
-                assert_eq!(handle1.peer_id(), &peer_id);
-            }
-            NetworkEvent::ActivePeerSession { info, .. } => {
-                let SessionInfo { peer_id, status, .. } = info;
-                assert_eq!(handle1.peer_id(), &peer_id);
-                assert_eq!(status.version, EthVersion::Eth66);
-            }
-            ev => {
-                panic!("unexpected event: {ev:?}")
-            }
-        }
-    }
-
-    handle.terminate().await;
+    let version = negotiated_version(
+        PeerConfig::default(),
+        PeerConfig::default().with_protocols([EthVersion::Eth66]),
+    )
+    .await;
+    assert_eq!(version, Some(EthVersion::Eth66));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_capability_version_mismatch() {
+    let version = negotiated_version(
+        PeerConfig::default().with_protocols([EthVersion::Eth66]),
+        PeerConfig::default().with_protocols([EthVersion::Eth67]),
+    )
+    .await;
+    // peer with mismatched capability version should fail to connect and be removed.
+    assert_eq!(version, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_eth69_peers_can_connect() {
+    let version = negotiated_version(
+        PeerConfig::default().with_protocols([EthVersion::Eth69]),
+        PeerConfig::default().with_protocols([EthVersion::Eth69]),
+    )
+    .await;
+    assert_eq!(version, Some(EthVersion::Eth69));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_peers_negotiate_highest_version_eth69() {
+    let version = negotiated_version(
+        PeerConfig::default().with_protocols([
+            EthVersion::Eth69,
+            EthVersion::Eth68,
+            EthVersion::Eth67,
+            EthVersion::Eth66,
+        ]),
+        PeerConfig::default().with_protocols([
+            EthVersion::Eth69,
+            EthVersion::Eth68,
+            EthVersion::Eth67,
+        ]),
+    )
+    .await;
+    assert_eq!(version, Some(EthVersion::Eth69));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_eth69_vs_eth68_incompatible() {
+    let version = negotiated_version(
+        PeerConfig::default().with_protocols([EthVersion::Eth69]),
+        PeerConfig::default().with_protocols([EthVersion::Eth68]),
+    )
+    .await;
+    // Peers with no shared ETH version should fail to connect and be removed.
+    assert_eq!(version, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_eth69_mixed_version_negotiation() {
+    let version = negotiated_version(
+        PeerConfig::default().with_protocols([EthVersion::Eth69, EthVersion::Eth68]),
+        PeerConfig::default().with_protocols([EthVersion::Eth68]),
+    )
+    .await;
+    assert_eq!(version, Some(EthVersion::Eth68));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_multiple_peers_different_eth_versions() {
     reth_tracing::init_test_tracing();
 
-    let mut net = Testnet::create(0).await;
+    let net = Testnet::from_configs([
+        // supports all versions
+        PeerConfig::default().with_protocols([
+            EthVersion::Eth69,
+            EthVersion::Eth68,
+            EthVersion::Eth67,
+            EthVersion::Eth66,
+        ]),
+        // only supports newer versions
+        PeerConfig::default().with_protocols([EthVersion::Eth69, EthVersion::Eth68]),
+        // only supports older versions
+        PeerConfig::default().with_protocols([EthVersion::Eth67, EthVersion::Eth66]),
+    ])
+    .await
+    .spawn();
+    let [all, newer, older] = net.peers_array();
 
-    let p0 = PeerConfig::with_protocols(NoopProvider::default(), Some(EthVersion::Eth66.into()));
-    net.add_peer_with_config(p0).await.unwrap();
+    assert_eq!(connect(all, newer).await, Some(EthVersion::Eth69));
+    assert_eq!(connect(all, older).await, Some(EthVersion::Eth67));
+}
 
-    let p1 = PeerConfig::with_protocols(NoopProvider::default(), Some(EthVersion::Eth67.into()));
-    net.add_peer_with_config(p1).await.unwrap();
+#[tokio::test(flavor = "multi_thread")]
+async fn test_eth69_capability_negotiation_fallback() {
+    let version = negotiated_version(
+        PeerConfig::default().with_protocols([EthVersion::Eth69, EthVersion::Eth67]),
+        PeerConfig::default().with_protocols([EthVersion::Eth67, EthVersion::Eth66]),
+    )
+    .await;
+    // Should fallback to ETH67 (skipping ETH68 which neither supports)
+    assert_eq!(version, Some(EthVersion::Eth67));
+}
 
-    net.for_each(|peer| assert_eq!(0, peer.num_peers()));
+#[tokio::test(flavor = "multi_thread")]
+async fn test_overlapping_version_sets_negotiation() {
+    let version = negotiated_version(
+        PeerConfig::default().with_protocols([
+            EthVersion::Eth69,
+            EthVersion::Eth67,
+            EthVersion::Eth66,
+        ]),
+        PeerConfig::default().with_protocols([
+            EthVersion::Eth68,
+            EthVersion::Eth67,
+            EthVersion::Eth66,
+        ]),
+    )
+    .await;
+    // Should negotiate to ETH67 (highest common version between ETH69,67,66 and ETH68,67,66)
+    assert_eq!(version, Some(EthVersion::Eth67));
+}
 
-    let mut handles = net.handles();
-    let handle0 = handles.next().unwrap();
-    let handle1 = handles.next().unwrap();
-    drop(handles);
+/// Launches a peer from each config, connects the first to the second and returns the negotiated
+/// eth version.
+async fn negotiated_version(a: PeerConfig, b: PeerConfig) -> Option<EthVersion> {
+    reth_tracing::init_test_tracing();
 
-    let handle = net.spawn();
+    let net = Testnet::from_configs([a, b]).await.spawn();
+    let [a, b] = net.peers_array();
+    connect(a, b).await
+}
 
-    let events = handle0.event_listener();
+/// Connects `peer` to `other` and returns the negotiated eth version, or `None` if `other` was
+/// removed because no session could be established.
+async fn connect<Pool>(peer: &PeerHandle<Pool>, other: &PeerHandle<Pool>) -> Option<EthVersion> {
+    let mut events = peer.event_listener();
+    peer.add_peer(other);
 
-    let mut event_stream = NetworkEventStream::new(events);
+    match events.next().await {
+        Some(NetworkEvent::Peer(PeerEvent::PeerAdded(peer_id))) => {
+            assert_eq!(peer_id, *other.peer_id())
+        }
+        event => panic!("unexpected event {event:?}"),
+    }
 
-    handle0.add_peer(*handle1.peer_id(), handle1.local_addr());
-
-    let added_peer_id = event_stream.peer_added().await.unwrap();
-    assert_eq!(added_peer_id, *handle1.peer_id());
-
-    // peer with mismatched capability version should fail to connect and be removed.
-    let removed_peer_id = event_stream.peer_removed().await.unwrap();
-    assert_eq!(removed_peer_id, *handle1.peer_id());
-
-    handle.terminate().await;
+    match events.next().await {
+        Some(NetworkEvent::ActivePeerSession { info, .. }) if info.peer_id == *other.peer_id() => {
+            Some(info.status.version)
+        }
+        Some(NetworkEvent::Peer(PeerEvent::PeerRemoved(peer_id)))
+            if peer_id == *other.peer_id() =>
+        {
+            None
+        }
+        event => panic!("unexpected event {event:?}"),
+    }
 }

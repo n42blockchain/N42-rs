@@ -5775,3 +5775,113 @@ samples, the maps copy and the 30 s major-fault record. All gates clean, no hand
   no leg with the loop.
 - **Where 5M stands.** Clean X20 legs are 4.93-5.04 and the low tail is this loop. The fix is the lever
   for "5M on every leg"; the memory line (entry-file refaults, kswapd) is parked.
+
+## 10.217 -- no flush in any leg, but a page-cache refault storm takes a fix leg to 4.16; every leg's first third is at 39 ms (stage ev, 2026-10-24)
+
+Stage ev was the tail test of the stuck-flush fix (cf04ae9c2: the frame road
+is flushed as stuck only when the planner has taken nothing from the index
+and lanes for eight builds, with a cool-down after every flush and a
+64-build backstop; every flush now logs its reason). Four X20 legs on the
+600M replay set after a native build and 2,550 unit tests (three new in
+`road_tests.rs`): two controls with `N42_ROAD_STUCK_LEGACY=1` (the old
+rule) and two with the new rule, no hooks.
+
+| leg | rule | drain M/s | win1 / win2 / win3 M/s | gap by thirds (ms) | stale-parent refusals | flushes |
+| --- | --- | --- | --- | --- | --- | --- |
+| LQa | legacy | 4.959 | 5.07 / 4.79 / 5.01 | 39.2 / 41.3 / 40.2 | 0 | 0 |
+| LQ1 | new | **4.161** | 5.09 / 4.39 / 3.11 | 39.1 / 46.4 / 64.3 | 0 | 0 |
+| LQb | legacy | 4.932 | 5.09 / 4.84 / 4.80 | 39.1 / 41.1 / 41.4 | 0 | 0 |
+| LQ1b | new | 4.860 | 5.04 / 4.82 / 4.67 | 39.8 / 41.2 / 42.8 | 0 | 0 |
+
+All gates clean (no invalid block, no field mismatch, no TC). Every road
+line in every leg reads `flushes=0 flushes_stuck=0 lane_debt=0`, no
+`frame road flushed` line was written, no build was refused on a stale
+parent and `frame plan empty` never appeared: the periodic refusal of
+10.216 (blocks 1021 / 2046 / 3070 in eu) did not occur in these four legs,
+so the stuck rule, old or new, was never exercised. The fix is unverified
+by this stage, not refuted; it stays in the tree as the default and the
+log line will say when it fires.
+
+### LQ1 is a different low leg: full blocks, a slow cycle
+
+LQ1 collapsed with occupancy 100% (blocks 200,000 transactions, 467 of them
+in window 3): the leader's cycle went from 39 ms to 64 ms, which is the
+10.213 shape, not the 10.216 shape (thin blocks, `candidates=0`). The
+thirds of its build phases (`winthirds.py`) against the first third:
+
+| metric (per build) | first third | second | third |
+| --- | --- | --- | --- |
+| `root_majflt` | 0.05 | 443 | **1,642** |
+| `batch_majflt` | 0.01 | 153 | 574 |
+| `root_compute_us` | 29,702 | 30,316 | 42,047 |
+| `roots_ms` | 37.3 | 40.4 | 54.4 |
+| `par_ms` | 39.5 | 44.9 | 64.5 |
+| `parent_fields_ms` | 2.6 | 6.3 | 18.9 |
+| `batch_view_index_wait_us` | 5,515 | 6,740 | 19,198 |
+| `root_twigs` | 36,802 | 104,917 | 158,841 |
+
+The root computation and the parallel execution both fault their pages
+back in (`root_majflt` 1,642 a build at 64 ms a build is ~25,000 major
+faults a second on the critical path), exactly the entry-file refaults of
+10.215, and the cycle follows the faults. The QMDB head follower (the task
+in `main.rs` that advances the QMDB head on every canonical notification)
+logged `canonical subscriber lag: qmdb head follower behind=255` 890 times
+from +30 s and dropped notifications 75 times; it touches the same file,
+and its lag is why `parent_fields_ms` and the view-index wait grew. It is a
+symptom, not the cause: the same warning appeared 141 times in LQ1b's last
+minute, 150 times in LG2 (4.859), 82 in LJ1 (5.065) and 124 in LNa (4.851),
+and never in a leg that stayed under 100 faults a build.
+
+The other three legs show the same storm at a smaller scale: `root_majflt`
+80-443 a build in their second thirds, 79-171 in their third thirds, and
+their gaps 41-43 ms there. Every leg's first third is 39.1-39.8 ms, i.e.
+5.0-5.1M/s: **the shortfall against 5M is entirely the second and third
+thirds, and in the second and third thirds the only thing that changes is
+the page cache** (`root_twigs` grows 4.8x in every leg alike as the touched
+accounts spread over the tree, and the leg with the flat 27-30 ms root
+compute, LQb, grew the same way; the twigs are not the cost, the faults
+are).
+
+### What this says about the two low-leg mechanisms
+
+Since stage el the low X20 legs split into two kinds:
+
+1. **The frame-road flush loop** (10.216): thin blocks, `frame plan empty`,
+   `lane_debt` in the millions, triggered by a stale-parent refusal that
+   recurs every ~1024 blocks in some legs and not at all in others (eu: 3
+   legs of 5; ev: 0 of 4). Fix in the tree, waiting for a leg that
+   triggers it.
+2. **The page-cache refault storm** (10.213-10.215): full blocks, a slow
+   cycle, major faults on the QMDB entry file and the builder's state
+   reads, the fleet's own static files filling the cache (10.214: 1.4 GB/s
+   written and never read). The static-files cache drop was rejected
+   twice in 10.215-10.216, but the in-node knob's leg (LP2, 3.758) was
+   measured with the knob dropping the `.off` and `.csoff` index files
+   too (60% of its 2,532 faults were those files) and inside a flush
+   loop; it is the leg that had zero reclaim and Cached at 17-26 GB. The
+   knob was repaired in 67e4bc8b4 (data pages only) and has not been
+   measured since.
+
+Stage ev shifts the weight: mechanism 2 cost 0.8M/s on LQ1 and 0.05-0.2 on
+the other three, mechanism 1 cost nothing. The memory line is unparked.
+
+### Next: stage ew
+
+WARM + four X20 legs, all with the stuck fix as default, the vm sampler
+(`MEMF`: `/proc/meminfo` and `/proc/vmstat` every 2 s, `du` of the
+datadir, the execution layer's maps, a `perf record -e major-faults` of
+the build and root threads) on every leg: LRa control, LR1
+`N42_SF_DROP_CACHE=1` (data pages only), LRb control, LR1b knob. The test
+is the thirds: a knob leg has to hold its first third's gap through the
+third third (`root_majflt` under 100 a build, kswapd steals near zero in
+`vm-<tag>.log`) on both legs, and its drain rate has to beat both
+controls. If the readers of the data files (the follower's body fetch,
+`receipts_by_block`) show up in the perf map instead, the next step is a
+narrower drop (only the segments behind the persisted block, or
+`fadvise` with a lag of one segment).
+
+Also pending from this stage, not the goal: the QMDB head follower's
+broadcast channel (`subscribe_to_canonical_state`, capacity 256) drops
+notifications under the storm; the follower only needs the tip, so a
+watch-style latest-only hand-off would remove the warning and 255 queued
+`on_canonical` calls, but it would not remove the faults.

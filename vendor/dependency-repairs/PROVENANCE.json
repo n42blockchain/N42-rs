@@ -68,26 +68,6 @@
     ]
   },
   {
-    "package": "boa_engine",
-    "version": "0.21.1",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "upstream_manifest_sha256": "d225c873e524ec715c467c585c5a4b87e7909a475f06523060709b59fc816e9d",
-    "path": "vendor/dependency-repairs/boa_engine-0.21.1",
-    "modified_files": [
-      "Cargo.toml"
-    ]
-  },
-  {
-    "package": "boa_string",
-    "version": "0.21.1",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "upstream_manifest_sha256": "038c4c3be33816848eaa2428eadabd77d84707321b0cbc00032b7b047ac2914b",
-    "path": "vendor/dependency-repairs/boa_string-0.21.1",
-    "modified_files": [
-      "Cargo.toml"
-    ]
-  },
-  {
     "package": "netlink-packet-core",
     "version": "0.8.2",
     "source": "registry+https://github.com/rust-lang/crates.io-index",

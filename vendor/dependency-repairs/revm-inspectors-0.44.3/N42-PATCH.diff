@@ -1,0 +1,41 @@
+--- upstream-0.44.3/src/tracing/debug.rs
++++ n42/src/tracing/debug.rs
+@@ -7,7 +7,7 @@
+ use alloy_rpc_types_trace::geth::{
+     erc7562::Erc7562Config, mux::MuxConfig, CallConfig, FourByteFrame, GethDebugBuiltInTracerType,
+     GethDebugTracerType, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace, NoopFrame,
+-    PreStateConfig,
++    AccountState, PreStateConfig, PreStateFrame,
+ };
+ use revm::{
+     context_interface::{
+@@ -245,11 +245,25 @@
+             }
+             Self::PreStateTracer(inspector, config) => {
+                 inspector.set_transaction_gas_limit(tx_env.gas_limit());
+-                inspector
++                let mut frame = inspector
+                     .geth_builder()
+-                    .geth_prestate_traces(res, config, db)
+-                    .map_err(DebugInspectorError::Database)?
+-                    .into()
++                    .geth_prestate_traces(res, config, &mut *db)
++                    .map_err(DebugInspectorError::Database)?;
++                // Geth looks up the block beneficiary even when traceCall
++                // disables fee charging and revm only marks coinbase warm.
++                if let PreStateFrame::Default(prestate) = &mut frame {
++                    let beneficiary = block_env.beneficiary();
++                    if !prestate.0.contains_key(&beneficiary) {
++                        let account = db.basic_ref(beneficiary)
++                            .map_err(DebugInspectorError::Database)?.unwrap_or_default();
++                        let code = config.code_enabled()
++                            .then(|| crate::tracing::utils::load_account_code(&*db, &account))
++                            .flatten();
++                        prestate.0.insert(beneficiary,
++                            AccountState::from_account_info(account.nonce, account.balance, code));
++                    }
++                }
++                frame.into()
+             }
+             Self::Noop(_) => NoopFrame::default().into(),
+             Self::StateGasTracer(_) => alloy_rpc_types_trace::geth::StateGasTrace {

@@ -282,42 +282,6 @@
  ]
 +
 +[workspace]
---- boa_engine-0.21.1/upstream/Cargo.toml
-+++ boa_engine-0.21.1/patched/Cargo.toml
-@@ -337,7 +337,8 @@
- version = "0.7.4"
- 
- [dependencies.paste]
--version = "1.0"
-+package = "pastey"
-+version = "0.2.3"
- 
- [dependencies.portable-atomic]
- version = "1.11.0"
-@@ -548,3 +549,5 @@
- missing_crate_level_docs = "warn"
- private_doc_tests = "warn"
- private_intra_doc_links = "warn"
-+
-+[workspace]
---- boa_string-0.21.1/upstream/Cargo.toml
-+++ boa_string-0.21.1/patched/Cargo.toml
-@@ -50,7 +50,8 @@
- version = "1.0.15"
- 
- [dependencies.paste]
--version = "1.0"
-+package = "pastey"
-+version = "0.2.3"
- 
- [dependencies.rustc-hash]
- version = "2.1.1"
-@@ -153,3 +154,5 @@
- missing_crate_level_docs = "warn"
- private_doc_tests = "warn"
- private_intra_doc_links = "warn"
-+
-+[workspace]
 --- netlink-packet-core-0.8.2/upstream/Cargo.toml
 +++ netlink-packet-core-0.8.2/patched/Cargo.toml
 @@ -43,7 +43,10 @@

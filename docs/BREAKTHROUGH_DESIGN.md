@@ -5795,3 +5795,35 @@ been ported to main; the X22 port assumed it. It is being ported now
 (stage fk repeats this comparison with main rebuilt), and the fact that
 main still read 5.11-5.20 with a lagging pruner says the X22 pruner fix
 and the 2.8.1 upgrade should stack to the mid-5.2s.
+
+## 10.230 -- main (reth 2.8.1) with X22 complete: 5.189 / 5.208, both pairs over the bench tree (stage fk, 2026-10-24)
+
+Stage fk repeated 10.229's comparison with main rebuilt at 47b8180ab (the
+freeing-threads commit 0eea07d86 ported on top of the nine X22 fixes),
+two pairs, X22 configuration, the bench tree's scripts and genesis:
+
+| leg | tree | drain M tx/s | gap ms | heap peak GB | lag_blocks max | own-hold warnings | prune wakes | pruner CPU s | freeing CPU s | collect_us s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| MBa | bench 2.7.0 | 5.157 | 38.8 | 26 | 6 | 0 | 492 | 40 | 90 + 13 | 18.9 |
+| MB1 | main 2.8.1 | 5.189 | 38.6 | 27 | 8 | 5 | 459 | 54 | 47 + 61 | 30.5 |
+| MBb | bench 2.7.0 | 5.106 | 39.2 | 43 | 7 | 0 | 483 | 36 | 0 + 77 | 16.5 |
+| MB1b | main 2.8.1 | **5.208** | **38.4** | 24 | 7 | 0 | 495 | 52 | 88 + 11 | 28.8 |
+
+Main wins both pairs (+0.6%, +2.0%), **5.208 on MB1b is the round
+record** (5.207 on the bench tree, 10.228), every gate is clean
+(invalid blocks, gas and fields mismatches all 0, no stale-parent
+refusal, no road flush), and main's pruner now behaves as the bench
+tree's: two freeing threads, no inline free, lag within 8 blocks, heap
+flat at 24-27 GB. The one cost main carries that the bench tree does
+not is the pair collection, `collect_us` 29-30 s a leg against 17-19 (reth
+2.8.1's transaction envelope walks slower), which puts the pruner at
+52-54 s of CPU a leg -- 37% of one core, not binding.
+
+**Where the 5M goal stands, end of 2026-10-24:** X22 is on main (ed0d7bd52
++ 47b8180ab; tag `fleet7-x22-5.2M-20261024`) and reads 5.189 / 5.208 M tx/s
+on this box with the fleet bench at 30 ms pacing and 200k-tx blocks, mean
+seal-to-seal gaps 38.4-38.6 ms against the 40.0 the target needs; the bench
+tree's six X22 legs read 5.095-5.207. Ten X22 legs across both trees, none
+under 5.09. The open items are the periodic 1024-block stale-parent
+refusal (seen once in fi, cheap since X22) and the pruner's pair
+collection if a later block shape needs the headroom.

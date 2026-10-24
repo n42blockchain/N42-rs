@@ -434,6 +434,12 @@ pub struct PruneTimes {
     pub drain_holds: usize,
     /// Their sum, lock waits included.
     pub drain_us: u64,
+    /// The road's retire of the mined frames, microseconds; their frees go
+    /// to the freeing thread with the rest of the prune's garbage unless
+    /// `N42_ROAD_RETIRE_INLINE=1`.
+    pub retire_us: u64,
+    /// Road frames that retire gave back.
+    pub retired: usize,
 }
 
 /// [`TxQueue::frame_census`].
@@ -617,6 +623,21 @@ impl<T: PoolTransaction> Default for PruneGarbage<T> {
     fn default() -> Self {
         Self { lanes: Vec::new(), taken: Vec::new(), frames: Vec::new(), index: Vec::new() }
     }
+}
+
+/// Whether the road frames a prune retires are dropped where the prune
+/// runs (`N42_ROAD_RETIRE_INLINE=1`, default off: their transactions go to
+/// the freeing thread with the rest of the prune's garbage), read and
+/// logged once. Stage fg: the retired frames held the last references of
+/// their pooled transactions, and their frees were most of the canonical
+/// pruner thread's cycles.
+fn road_retire_inline() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("N42_ROAD_RETIRE_INLINE").is_ok_and(|v| v == "1");
+        tracing::info!(target: "n42.tx_queue", road_retire_inline = on, "N42_ROAD_RETIRE_INLINE");
+        on
+    })
 }
 
 /// Garbage on its way to the freeing thread, type-erased: one thread serves
@@ -3285,11 +3306,10 @@ impl<T: PoolTransaction> TxQueue<T> {
         let highest = fold_highest(mined.iter().copied());
         times.senders = highest.len();
         times.fold_us = at.elapsed().as_micros() as u64;
-        // The road's taken frames this block carries are retired: off the
-        // lanes' lock, and dropped here (their transactions live on in the
-        // own block's hold).
-        drop(self.road.retire(&highest));
+        // The road's taken frames this block carries are retired, off the
+        // lanes' lock (their transactions live on in the own block's hold).
         let mut garbage = PruneGarbage::default();
+        self.retire_road(&highest, &mut garbage, &mut times);
         let at = std::time::Instant::now();
         if self.offlock() {
             let (swept, lock_us, remove_us) = self.remove_mined_offlock(highest, &mut garbage);
@@ -3454,6 +3474,22 @@ impl<T: PoolTransaction> TxQueue<T> {
         inner.held.iter().any(|(held_number, held_hash, _)| *held_number == number && *held_hash != hash)
     }
 
+    /// The road's frames `highest` mined retired, timed into `times`; the
+    /// frames' transactions are moved into `garbage` (freed with the rest
+    /// of the prune's garbage, off this thread), or dropped here under
+    /// `N42_ROAD_RETIRE_INLINE=1`.
+    fn retire_road(&self, highest: &AddressHashMap<u64>, garbage: &mut PruneGarbage<T>, times: &mut PruneTimes) {
+        let at = std::time::Instant::now();
+        let retired = self.road.retire(highest);
+        times.retire_us += at.elapsed().as_micros() as u64;
+        times.retired += retired.len();
+        if road_retire_inline() {
+            drop(retired);
+        } else {
+            garbage.frames.extend(retired.into_iter().map(|frame| frame.txs));
+        }
+    }
+
     /// One folded removal of `run`'s blocks ([`Self::prune_blocks`]).
     fn remove_folded(&self, run: &[PruneInput<'_>], times: &mut PruneTimes)
     where
@@ -3463,8 +3499,8 @@ impl<T: PoolTransaction> TxQueue<T> {
         let highest = fold_highest(run.iter().flat_map(|block| block.mined.iter().copied()));
         times.senders += highest.len();
         times.fold_us += at.elapsed().as_micros() as u64;
-        drop(self.road.retire(&highest));
         let mut garbage = PruneGarbage::default();
+        self.retire_road(&highest, &mut garbage, times);
         let at = std::time::Instant::now();
         if self.offlock() {
             let (swept, lock_us, remove_us) = self.remove_mined_offlock_with(highest, &mut garbage, false);

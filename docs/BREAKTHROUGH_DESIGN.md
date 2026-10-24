@@ -5516,3 +5516,50 @@ remaining receiver), one X21 leg, and then the fix on the receiver it
 names -- most likely taking what that receiver needs from the
 notification and dropping the rest at once, or moving its work off the
 stream so the slot is released within a block.
+
+## 10.224 -- the canonical-notification broadcast is not the holder either; two record-band controls on the diagnostics tree (stage fc, 2026-10-24)
+
+Stage fc ran WARM + two X21 controls on the tree with the diagnostics of
+020296860: the broadcast sender's `len()` logged every 5 s and exported as
+`n42_canon_notification_backlog`, and a named lag watch
+(`canonical subscriber lag`, `canonical subscriber lag summary`) on every
+canonical-state receiver that had none (payload service, the two RPC cache
+feeders, BAL prewarm, head tracker, leader layers). The runner's build and
+test gate passed first (2,556 tests).
+
+| leg | drain M/s | gap ms | backlog slots (every sample) | receivers' `max_behind` | heap `allocated` at +12 / +24 / +48 / +84 s |
+| --- | --- | --- | --- | --- | --- |
+| LYa | **5.071** | 39.4 | 0, 2, 0 | 0 for every name | 29 / 44 / 62 / 67 GB (peak 67) |
+| LYb | 5.041 | 39.7 | 0, 1, 1 | 0 for every name | 40 / 59 / 60 / 91 GB (peak 91) |
+
+Both controls sit in the record band (the diagnostics cost nothing
+measurable) and the hypothesis of 10.223 is refuted cleanly: the broadcast
+held 0-2 values at every sample while the heap climbed to 60-91 GB, and no
+receiver was ever more than 0 behind at the moment it received. Whatever
+keeps the bodies, it is not a lagging subscriber of the canonical state.
+
+What else the logs and code say:
+
+- the frame road's remembered taken frames (`road_taken_live`, the map
+  bounded by `ROAD_TAKEN_MAX` = 131,072 frames ≈ 65M transactions) swing
+  between 22k and 80k frames through a leg (11-40M transactions of pooled
+  objects) and correlate with the heap only at +0.6-0.7: a contributor of
+  tens of GB, not the whole;
+- the queue pruner's unbounded feed holds ~25 blocks (`prune_wait_ms`
+  0.7-1.0 s); its own-block hold is 16 blocks; the follower import's
+  stores (`PARENT_OUTPUTS_KEPT` 4, `FOLLOWER_SHARDS_KEPT` 2,
+  `HELD_EXECUTIONS` receivers only) and the payload serve's listed
+  transactions (2) are bounded; `N42_FOLLOWER_FREE_ASYNC=1` drops the
+  follower's transactions, groups and bundles on the global rayon pool
+  (31% busy, so not starved);
+- the two profiled sites grow in lockstep (+25 GB each between +10 and
+  +88 s), so one holder most likely references both the pooled
+  transactions and the keyed consensus copies of the same blocks.
+
+Reading has stopped converging; stage fd bisects by knob instead, one X21
+control and three single-knob legs, read by the heap plateau and the drain
+rate: `N42_FOLLOWER_FREE_ASYNC=0` (frees inline), `N42_ROAD_TAKEN_MAX=16384`
+(the road remembers 8M transactions instead of 65M; 10.212 measured it at
+4.69/4.82 before X21, when the page-cache storm dominated) and
+`N42_FOLLOWER_COPY_ASIDE=0` (the follower imports the described block
+without the owned copy made beside it).

@@ -177,7 +177,13 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
         // frameless, so only a thin one (funding, RPC) is walked
         // (`docs/LANE_WALK_COLLAPSE.md` 5). The `indexed` refusal only under
         // `N42_FRAME_WALK_REFUSE_INDEXED=1` ([`frame_walk_refuse_indexed`]).
-        let refuse_walk = if !plan.frames.is_empty() {
+        // A debt sweep (`N42_ROAD_DEBT_SWEEP`): the plan is empty because
+        // the road's gate is shut by lane debt no frame plan can take, with
+        // nothing in the index; the queue took that debt as plain
+        // transactions, and frames on the road are not frames arriving into
+        // the index -- the build takes the sweep, neither refused nor walked.
+        let debt_sweep = plan.frames.is_empty() && best.is_debt_sweep();
+        let refuse_walk = if !plan.frames.is_empty() || debt_sweep {
             None
         } else if queue.frames_arriving() {
             Some("arriving")
@@ -202,6 +208,11 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
             );
             // No plan is left for the seal: an empty body takes the MPT
             // root, as a walked one that came out empty did.
+            best
+        } else if debt_sweep {
+            // No plan is left for the seal: the body is sealed as a walked
+            // one.
+            FRAME_BUILDS_DEBT_SWEPT.fetch_add(1, Ordering::Relaxed);
             best
         } else if plan.frames.is_empty() {
             // No frame a build could take whole (the funding block, a thin
@@ -545,6 +556,9 @@ pub static FRAME_BUILDS_WALKED: AtomicU64 = AtomicU64::new(0);
 /// Builds under the flag that found no usable frame while frames were
 /// arriving, and took nothing instead of walking the queue.
 pub static FRAME_BUILDS_WALK_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// Builds under the flag whose empty plan the queue answered with a sweep
+/// of the road's lane debt (`N42_ROAD_DEBT_SWEEP`).
+pub static FRAME_BUILDS_DEBT_SWEPT: AtomicU64 = AtomicU64::new(0);
 /// Non-empty blocks this node sealed with the frame-tree root.
 pub static SEALED_ALIGNED: AtomicU64 = AtomicU64::new(0);
 /// Non-empty blocks this node sealed under the flag with the MPT root (a

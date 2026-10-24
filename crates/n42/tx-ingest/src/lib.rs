@@ -999,6 +999,7 @@ fn spawn_stats_reporter() {
                         refused_dup_sender = d(road.refused_dup_sender, last_road.refused_dup_sender),
                         flushes = d(road.flushes, last_road.flushes),
                         flushes_stuck = d(road.flushes_stuck, last_road.flushes_stuck),
+                        debt_sweeps = d(road.debt_sweeps, last_road.debt_sweeps),
                         seeded = d(road.seeded, last_road.seeded),
                         seed_holds = d(road.seed_holds, last_road.seed_holds),
                         road_len = road.len_txs,

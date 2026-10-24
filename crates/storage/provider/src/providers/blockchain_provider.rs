@@ -204,7 +204,7 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
     /// masked blocks' state only in memory) -- and the caller takes upstream's path.
     fn n42_layered_state_provider(
         &self,
-        state: &BlockState<N::Primitives>,
+        state: &Arc<BlockState<N::Primitives>>,
     ) -> ProviderResult<Option<StateProviderBox>> {
         let anchor = state.anchor();
         let provider = DatabaseProviderFactory::database_provider_ro(&self.database)?;
@@ -221,7 +221,17 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
         let in_memory: Vec<ExecutedBlock<N::Primitives>> =
             state.chain().map(|state| state.block()).collect();
         let historical = self.state_provider_from_database(provider, anchor.hash);
-        Ok(Some(Box::new(MemoryOverlayStateProvider::new(historical, in_memory))))
+        // Proofs over the in-memory blocks need the tip's trie overlay, which only upstream's
+        // path builds; it is opened when a proof is asked for, never for plain reads.
+        let fallback = {
+            let this = self.clone();
+            let state = Arc::clone(state);
+            move || this.state_provider_for_state_with(Arc::clone(&state), true)
+        };
+        Ok(Some(Box::new(
+            MemoryOverlayStateProvider::new(historical, in_memory)
+                .with_proof_fallback(Arc::new(fallback)),
+        )))
     }
 
     /// Returns a historical state provider using an existing database snapshot.
@@ -1409,6 +1419,17 @@ mod tests {
             for number in 0..=hashes.len() as u64 + 1 {
                 assert_eq!(layered.block_hash(number)?, upstream.block_hash(number)?);
             }
+            // v2.8: proofs no longer take the in-memory trie input; the layered provider
+            // answers them through upstream's path, so both agree.
+            let targets = || reth_trie::MultiProofTargetsV2 {
+                account_targets: (0..20).map(|n| keccak256(n42_address(n)).into()).collect(),
+                ..Default::default()
+            };
+            assert_eq!(
+                layered.multiproof_v2(targets(), false)?,
+                upstream.multiproof_v2(targets(), false)?,
+                "proof at {hash}"
+            );
         }
         Ok(())
     }

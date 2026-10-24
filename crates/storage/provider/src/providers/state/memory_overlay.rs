@@ -39,7 +39,10 @@ use reth_trie::{
     MultiProofTargets, StorageMultiProof, TrieInput, DecodedMultiProofV2, MultiProofTargetsV2,
 };
 use revm::database::BundleState;
-use std::{borrow::Cow, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    sync::{Arc, OnceLock},
+};
 
 use super::overlay_filter::{self, FilterCell, FilterKey};
 use n42_sharded_output::Shards;
@@ -80,6 +83,10 @@ fn block_account<'b, N: NodePrimitives>(
 /// A state provider that stores references to in-memory blocks along with their state as well as a
 /// reference of the historical state provider for fallback lookups.
 #[allow(missing_debug_implementations)]
+/// N42: opens a provider for the same tip that answers proofs itself (upstream's overlay path);
+/// used by `multiproof_v2`, which no longer takes the in-memory blocks' trie input.
+pub type ProofFallback = dyn Fn() -> ProviderResult<StateProviderBox> + Send + Sync;
+
 pub struct MemoryOverlayStateProviderRef<
     'a,
     N: NodePrimitives,
@@ -94,6 +101,8 @@ pub struct MemoryOverlayStateProviderRef<
     filters: Cow<'a, [Option<FilterCell>]>,
     /// N42: the blocks' shard sets, in `in_memory`'s order (empty when no block is elided).
     sharded: Cow<'a, [Option<Shards>]>,
+    /// N42: where proofs over in-memory blocks are answered (see [`ProofFallback`]).
+    proof_fallback: Option<&'a ProofFallback>,
 }
 
 impl<'a, N: NodePrimitives> MemoryOverlayStateProviderRef<'a, N> {
@@ -113,6 +122,7 @@ impl<'a, N: NodePrimitives> MemoryOverlayStateProviderRef<'a, N> {
             trie_input: OnceLock::new(),
             filters,
             sharded,
+            proof_fallback: None,
         }
     }
 
@@ -331,11 +341,15 @@ impl<N: NodePrimitives> StateProofProvider for MemoryOverlayStateProviderRef<'_,
         requires_masks: bool,
     ) -> ProviderResult<DecodedMultiProofV2> {
         // v2.8 proves against the provider's own state and no longer takes a trie input, so the
-        // in-memory blocks cannot be layered over the historical provider here.
-        if !self.in_memory.is_empty() {
-            return Err(ProviderError::UnsupportedProvider)
+        // in-memory blocks cannot be layered over the historical provider here: a proof over
+        // them is answered by a provider that holds the tip's trie overlay itself.
+        if self.in_memory.is_empty() {
+            return self.historical.multiproof_v2(targets, requires_masks)
         }
-        self.historical.multiproof_v2(targets, requires_masks)
+        let Some(fallback) = self.proof_fallback else {
+            return Err(ProviderError::UnsupportedProvider)
+        };
+        fallback()?.multiproof_v2(targets, requires_masks)
     }
 
     fn witness(
@@ -430,6 +444,8 @@ pub struct MemoryOverlayStateProvider<N: NodePrimitives> {
     filters: Vec<Option<FilterCell>>,
     /// N42: the blocks' shard sets, in `in_memory`'s order (empty when no block is elided).
     sharded: Vec<Option<Shards>>,
+    /// N42: where proofs over in-memory blocks are answered (see [`ProofFallback`]).
+    proof_fallback: Option<Arc<ProofFallback>>,
 }
 
 impl<N: NodePrimitives> MemoryOverlayStateProvider<N> {
@@ -443,7 +459,20 @@ impl<N: NodePrimitives> MemoryOverlayStateProvider<N> {
     pub fn new(historical: StateProviderBox, in_memory: Vec<ExecutedBlock<N>>) -> Self {
         let filters = filters_of(&in_memory);
         let sharded = sharded_of(&in_memory);
-        Self { historical, in_memory, trie_input: OnceLock::new(), filters, sharded }
+        Self {
+            historical,
+            in_memory,
+            trie_input: OnceLock::new(),
+            filters,
+            sharded,
+            proof_fallback: None,
+        }
+    }
+
+    /// N42: answer `multiproof_v2` over in-memory blocks with the provider `fallback` opens.
+    pub fn with_proof_fallback(mut self, fallback: Arc<ProofFallback>) -> Self {
+        self.proof_fallback = Some(fallback);
+        self
     }
 
     /// N42: this provider with its address filters dropped, so every read probes every
@@ -462,6 +491,7 @@ impl<N: NodePrimitives> MemoryOverlayStateProvider<N> {
             trie_input: self.trie_input.clone(),
             filters: Cow::Borrowed(&self.filters),
             sharded: Cow::Borrowed(&self.sharded),
+            proof_fallback: self.proof_fallback.as_deref(),
         }
     }
 
@@ -492,7 +522,7 @@ mod elided_tests {
     use crate::test_utils::{ExtendedAccount, MockEthProvider};
     use alloy_consensus::Header;
     use alloy_primitives::map::AddressHashMap;
-    use reth_trie::ComputedTrieData;
+    use reth_trie::SortedTrieData;
     use reth_ethereum_primitives::EthPrimitives;
     use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
     use reth_primitives_traits::SealedBlock;
@@ -548,7 +578,7 @@ mod elided_tests {
             },
             state,
         });
-        ExecutedBlock::new(Arc::new(sealed.try_recover().expect("recovers")), output, ComputedTrieData::default())
+        ExecutedBlock::new(Arc::new(sealed.try_recover().expect("recovers")), output, SortedTrieData::default())
     }
 
     /// `N42_MERGE_ELIDE`: a block handed out with a thin bundle is read through its shards --

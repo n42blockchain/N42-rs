@@ -5627,3 +5627,60 @@ remembered frames, the by-hash index and the hold shrink with it and
 the heap should settle near the 13 GB baseline plus a few GB; the second
 step, if needed, is `N42_QUEUE_FREE_THREADS=2` and retiring the road's
 frames by the block they were taken for.
+
+## 10.226 -- the lean feed loses; the pruner's missing 90% is the freeing it does itself (stages ff and fg, 2026-10-24)
+
+Stage ff ran the lean feed of 10.225 (bench commit 884196072) against
+whole-notification controls in two pairs, X21 otherwise, 600M replay set:
+
+| leg | feed | drain M tx/s | gap ms | heap peak GB | lag_blocks max |
+|---|---|---|---|---|---|
+| LAa | whole (`N42_PRUNE_FEED_LEAN=0`) | 5.100 | 39.2 | 74 | 126 |
+| LA1 | lean | 4.915 | 40.7 | 83 | 321 |
+| LAb | whole | 5.019 | 39.9 | 85 | 137 |
+| LA1b | lean | 4.915 | 40.7 | 63 | 180 |
+
+The lean feed **loses both pairs** (−2.1% and −3.6%), the heap peak does
+not fall, and the lag runs away exactly as before (a 338-block wake of
+12.8 s in LA1). The pruner thread is the same in both modes: 65-68% of the
+leg's wall on one core (93-98 s of CPU, `prune_ms` summing to 96-100 s),
+and its timed steps (`settle/fold/lock/remove/forget/free_us`) sum to
+7.9-8.9 s of it -- the fix had moved the pair collection to the
+notification receiver's thread (where it costs the critical set) without
+touching what the pruner spends its other 90 s on. The freeing thread
+tells the same story: 47 s of CPU in the whole-feed leg, 12 s in the lean
+one -- the frees moved, they did not go away.
+
+Stage fg profiled the thread (perf, dwarf call graph, 25 s from window 2
+on the profiling build, `pprof-*LBPPRMEMF.self.txt`; leg 4.862 on the
+profiling binary, not a scoring leg). The pruner's cycles, whole-feed mode:
+
+| share | where |
+|---|---|
+| 17.3% | the `(sender, nonce)` pair collection: the zip over the block's senders and its 200k `N42TxEnvelope`s (one cache line per transaction) |
+| 11.6% | `drop_glue::<N42TxEnvelope>` -- the block bodies dying with the notification at the end of the wake |
+| 8.8% | `Arc<ValidPoolTransaction>::drop_slow` -- the pooled copies' last references |
+| 5.6% | `Arc<[Arc<ValidPoolTransaction>]>::drop_slow`, called from `TxQueue::remove_folded` -- the retired road frames, dropped inline (`drop(self.road.retire(&highest))`, untimed) |
+| 5.8% + 5.8% + ~10% | `bytes::owned_drop`, `sdallocx`, jemalloc tcache flushes -- the same frees' allocator side |
+| 2.4% | `HashIndex::remove_all` (timed, `forget_us`) |
+
+So about half of the pruner's CPU is **freeing on the pruner thread** --
+the notification bodies and the retired road frames, both the last
+references -- and a sixth is walking the bodies for the pairs. The
+freeing thread exists for exactly this (`PruneGarbage`, `free_later`,
+`N42_QUEUE_FREE_THREADS`), but the two biggest producers never used it.
+
+### The fix (stage fh)
+
+Hand both to the freeing thread: the retired frames' `txs` join the wake's
+`PruneGarbage` (`N42_ROAD_RETIRE_INLINE=1` restores the inline drop), and
+the whole-feed items are passed to `free_later` after the prune line
+instead of dropping in scope (`N42_PRUNE_FREE_INLINE=1` restores); the
+prune line gains `retire_us`, `retired` and `collect_us`; the lean feed
+defaults off. With `N42_QUEUE_FREE_THREADS=2` so the freeing keeps up,
+the pruner's per-block cost should fall from ~45 ms to ~20-25 ms, under the
+30 ms interval, so the lag stops growing; the heap (bodies, pooled copies,
+road frames) then falls with the lag, and with it the page-cache pressure
+that cost the slow legs 1-3% (10.221). Stage fh: two pairs, controls with
+both `_INLINE=1` knobs (= X21's path) against the offload with two freeing
+threads.

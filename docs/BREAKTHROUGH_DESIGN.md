@@ -5765,3 +5765,33 @@ Next: the port of X22 to main (reth 2.8.1) with the fixes since X21
 mixed-tree results; the periodic stale-parent refusal; and the pruner's
 remaining cost (the pair collection, `collect_us` 17 s a leg) if a later
 block shape needs it.
+
+## 10.229 -- the main tree (reth 2.8.1) against the bench tree: faster, but its pruner lags again -- one commit was never ported (stage fj, 2026-10-24)
+
+Stage fj ran the main tree's binaries (main ed0d7bd52 = X22's nine fixes
+ported onto reth 2.8.1, built release in a port worktree, `F7_BIN` with
+`F7_SKIP_STALE_CHECK=1`) against the bench tree (reth 2.7.0) in two pairs,
+X22 configuration and the bench tree's scripts and genesis on both:
+
+| leg | tree | drain M tx/s | gap ms | heap peak GB | lag_blocks max | own-hold warnings | prune wakes | pruner CPU s | freeing CPU s | free_us inline s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| MAa | bench 2.7.0 | 5.019 | 39.9 | 27 | 7 | 0 | 446 | 38 | 18 + 91 | 0.003 |
+| MA1 | main 2.8.1 | 5.111 | 39.2 | 59 | 116 | 1,662 | 142 | 83 | 77 | 37.7 |
+| MAb | bench 2.7.0 | 5.049 | 39.6 | 25 | 7 | 0 | 473 | | | |
+| MA1b | main 2.8.1 | **5.200** | 38.5 | 40 | 57 | 1,355 | 181 | | | |
+
+Two findings. First, **the main tree is faster**: +1.8% and +3.0% over its
+pairs, 5.200 on MA1b, with the same genesis, flood and configuration --
+reth 2.8.1's execution path (revm 43, alloy-evm 0.39) is the only
+difference the fleet sees, so the upgrade itself is worth 2-3% at this
+block shape. Second, **main's pruner lags again**: `N42_QUEUE_FREE_THREADS`
+prints no knob line on main, one freeing thread runs, its four-deep
+channel fills and the pruner frees inline (`free_us` 37.7 s of its 83 s a
+leg), so the wakes fold 15-20 blocks, the lag reaches 57-116 blocks, the
+own-hold warning fires 1,300-1,700 times and the heap climbs to 40-59 GB
+-- the 10.225 shape, milder. The bench commit that added the freeing
+threads and the inline-free count (0eea07d86, round 10.173) had never
+been ported to main; the X22 port assumed it. It is being ported now
+(stage fk repeats this comparison with main rebuilt), and the fact that
+main still read 5.11-5.20 with a lagging pruner says the X22 pruner fix
+and the 2.8.1 upgrade should stack to the mid-5.2s.

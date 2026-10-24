@@ -5079,3 +5079,89 @@ broadcast channel (`subscribe_to_canonical_state`, capacity 256) drops
 notifications under the storm; the follower only needs the tip, so a
 watch-style latest-only hand-off would remove the warning and 255 queued
 `on_canonical` calls, but it would not remove the faults.
+
+## 10.218 -- the cache drop removes the reclaim and still loses; the stuck fix is itself the flush loop's clock (stage ew, 2026-10-24)
+
+Stage ew: WARM + four X20 legs on the 600M set, the stuck-flush fix of
+cf04ae9c2 as default on every leg, the vm sampler (`MEMF`) on every leg,
+the repaired `N42_SF_DROP_CACHE=1` (data pages only, 67e4bc8b4) on two.
+
+| leg | knob | drain M/s | gap by thirds (ms) | kswapd steals | refaults | `root_majflt` by thirds | road flushes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| LRa | off | 4.879 | 41.4 / 39.8 / 41.8 | 34.8M | 649k | 75 / 0 / 17 | 0 |
+| LR1 | on | 4.648 | 41.2 / 42.2 / 45.9 | **0.97M** | **8k** | 67 / 33 / 11 | 0 |
+| LRb | off | 5.000 | 39.0 / 39.8 / 41.4 | 31.1M | 741k | 0 / 0 / 102 | 0 |
+| LR1b | on | **3.096** | 61.4 / 70.2 / 68.9 | 0 | 0 | 31 / 1 / 1 | **101** (2 GiveBack, 99 Stuck) |
+
+Gates clean on all four. Two findings, one per knob leg.
+
+### LR1: the reclaim is gone and the leg is still slower than both controls
+
+The knob does what 10.213-10.215 asked for: kswapd stole 0.97M pages
+instead of 31-35M, the working set refaulted 8k pages instead of 650-740k,
+Cached stayed at 10-35 GB with 78 GB free, and the critical path's major
+faults fell through the leg (the perf record holds 556 faults against the
+controls' 19,521 and 33,500). The leg still read 4.648 against 4.879 and
+5.000, and its last third's gap was 45.9 ms.
+
+What grew in that third is not faults: `prev_seal_to_request_us` 1,092 →
+9,910 (+807%), `next_start_gap_ms` 1.2 → 9.8, `batch_open_sum_us` 17k →
+63k (+269%), `rename_record_waits` +355%, and the QMDB head follower
+lagged 255 notifications 406 times in the last minute. The persistence
+metrics name the cost: per block, the transactions static-file write took
+24.1 ms against 21.5 / 20.8 on the controls, senders 11.9 against 9.8 /
+10.2, receipts 6.6 against 5.4, changesets 16.4 against 13.8 / 14.0 --
+every static-file write 12-20% slower. `drop_cache_after_commit` calls
+`posix_fadvise(fd, 0, 0, DONTNEED)` over the *whole* data file after
+*every* commit: the transactions file is 49 GB (12M pages) by the end of a
+leg, there are ~25 commits a second across the segments, and each call
+walks the file's page tree. The cost grows with the file, which is why the
+third third pays. And the readers of recent data (the queue pruner's
+canonical path, the follower's body fetch; LR1b's perf has 215 of its 264
+faults on `static_file_transactions`) find their pages gone.
+
+The repair is mechanical: release only the bytes written since the last
+release, lagged by a kept tail (256 MB a file by default,
+`N42_SF_DROP_CACHE_KEEP_MB`), so each call touches ~25 MB of new pages and
+the last ~10 s of every segment stays cached. Then the knob can be measured
+on its merit, which stage ew established: the reclaim and the refaults do
+go away.
+
+### LR1b: the stuck fix's cool-down became the flush loop's period
+
+The log line added in cf04ae9c2 made the loop legible. At block 1021 (the
+periodic stale-parent refusal of 10.216 again, 1024k−3) a GiveBack flush
+put 5,062 frames (2.53M txs) into the lanes with `lane_debt_before=0`; 2 s
+later a second GiveBack (4,773 frames); then 97 flushes `reason=Stuck`,
+each at `builds_since_last=20` and `lane_debt_before=1500`. Twenty builds
+is exactly the cool-down (`frames/400 + 8`), and 1,500 txs of debt is what
+the frame planner can never take as a frame (`FRAME_ROAD_DESIGN.md`, "Gate
+stuck": a road sender's frameless lane entry, a frame's tail). The cycle:
+
+1. a flush fills the index; the index drains at ~240 frames a build and
+   is empty after ~20 builds; 1,500 txs of untakeable debt remain in the
+   lanes;
+2. `lane_debt > 0` keeps the road gate shut (`road_taken=0`), frames on
+   the road make `frames_arriving()` true, and the planner refuses the
+   lanes walk (`frame plan empty while frames are arriving` ×693), so no
+   build takes the debt;
+3. the stuck rule sees no progress, the cool-down expires, it flushes the
+   road again, and the 2.5M txs it dumps hide the same 1,500 txs for
+   another 20 builds.
+
+Blocks were ~147k txs (the index's drain) at 61-70 ms gaps (the flush and
+reseed cost) for the whole leg. The old rule (ROAD_STUCK_BUILDS=8) ran the
+same loop at a faster clock (10.216, LP2, `flushes=6` per 5 s); the new
+rule only slowed it. Flushing is the wrong remedy for this state: the debt
+is small and plannable as plain transactions, it is only not a frame. The
+fix is a **debt sweep**: when the frame plan is empty, the index is empty
+and `lane_debt > 0`, the build plans the debt lanes' transactions as
+ordinary candidates (those senders only, nonce order, no road
+invalidation, no full walk); the debt set empties, the gate opens on the
+next build, the road flows. The stuck flush stays only as the 64-build
+backstop. Both fixes are being written for stage ex.
+
+Standing: every control leg's clean thirds read 39.0-41.8 ms; the
+storm-free, loop-free X20 leg is at 5.0 (LRb 5.000, LPc 5.006, LPd 5.036,
+LOc 5.043). The two defects above are what stands between a leg and 5M on
+*every* leg.

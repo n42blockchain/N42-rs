@@ -6206,3 +6206,65 @@ the heap, is a `jemalloc-prof` build of the bench tree
 (`cargo build --profile profiling --features jemalloc-prof`) and one leg
 with `prof:true,lg_prof_interval:30`, read through
 `scripts/fleet7-profile.sh --alloc`.
+
+## 10.222 -- the engine tree is not the holder, and no gauge counts it: a heap profile is the next instrument (stage fa, 2026-10-24)
+
+Stage fa ran WARM + two X21 controls with the whole `/metrics` page dumped
+every 5 s and `reth_consensus_engine_beacon_executed_blocks` sampled as
+`tree_blocks` in `mem.log`. LWa is VOID: the flood's funding transaction
+did not mine within 120 s (a flood-side start failure seen before), so its
+blocks were thin and its heap stayed at 2.6 GB. LWb read **4.995M/s**
+(gap 40.1), clean gates, no refusal.
+
+| +s (LWb) | allocated GB | `tree_blocks` | in-memory canonical blocks |
+| --- | --- | --- | --- |
+| 0 | 2.6 | 9 | 8 |
+| 16 | 30.7 | 10 | 8 |
+| 32 | 45.7 | 15 | 14 |
+| 48 | 54.0 | 12 | 10 |
+| 64 | 54.0 | 12 | 10 |
+| 72 | 68.5 | 11 | 11 |
+| 80 | **80.1** | 11 | 9 |
+| 96 | 58.4 | 8 | 7 |
+
+The engine tree held 8-17 executed blocks throughout while the heap climbed
+to 80 GB: **the tree is not the holder**, and with it goes the
+`remove_until` / persisted-hash walk I had suspected. Of the 691 metrics
+that moved during the leg, the only ones that rise and fall with the heap
+are jemalloc's own and the process RSS (correlation 0.96-1.00); the next
+are histogram quantiles that merely drift with time. Nothing the node
+exports counts the holder.
+
+Also cleared this round, from the logs and the code:
+
+- non-committed builds ("previous build on the same parent was not
+  committed"): 1 in the whole full-block minute of LV2 and of LWb; the
+  thousands per minute come after the flood, with thin blocks and a 2.6 GB
+  heap;
+- the built-executions store: a `VecDeque` bounded by `N42_BUILT_KEEP`
+  (3-4) with `make_room` eviction, frees handed to `n42-built-free`
+  through a 2-slot channel that falls back to an inline drop;
+- the queue's and the shards' off-path frees: bounded channels (4) or
+  `pool.spawn(drop)` on the build/behind pools, and `tidcpu` says those
+  pools were 36% and 5% busy in the full-block window -- nothing starved;
+- the sharded-output registry of merge elision: `sharded_outputs=17-20` on
+  the ingest line;
+- the output-shards "1024" is a parallelism threshold, not retention.
+
+What is known about the holder: it allocates 45-65 MB per full block
+(~250-300 B a transaction), holds it for ~1,000-1,300 blocks, frees it in
+bulk at a stale-parent refusal (LVb) and at other moments without one
+(LUa, LUb, LWb at +88 s), drains to 13 GB within a 5 s sample when the
+blocks turn thin, and is invisible to every counter. Guessing further is
+not a good use of legs. The instrument is jemalloc's heap profile: the
+`jemalloc-prof` feature of `bin/n42` (reth's `tikv-jemallocator/profiling`)
+in the `profiling` profile, which keeps symbols. The profiling build in
+`target/profiling-build` (last used by stage x, 2026-10-19) is being
+rebuilt incrementally with the feature (8 cores, nice 19, paused while
+any foreign request, claim or Go test exists); stage fb runs one X21 leg
+on it with `prof:true,prof_active:true,lg_prof_interval:35` (a dump of
+the live heap every 32 GiB allocated) and
+`scripts/fleet7-profile.sh --alloc` names the allocation sites of the
+dump nearest the heap's peak. The validators and the flood come from the
+same build directory; `F7_SKIP_STALE_CHECK=1` because the freshness check
+compares the validator binary with the source tree, not with this build.

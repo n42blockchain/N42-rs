@@ -33,6 +33,8 @@ revm = { workspace = true, optional = true }
 # async
 tokio = { workspace = true, default-features = false, features = ["sync", "macros"] }
 tokio-stream = { workspace = true, features = ["sync"] }
+# N42: `watched_notifications` (canonical receivers whose lag is visible).
+futures-util = { workspace = true, features = ["std"] }
 
 # tracing
 tracing.workspace = true

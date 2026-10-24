@@ -28,6 +28,7 @@ pub mod n42_evm;
 pub mod pool;
 pub mod rpc;
 pub mod built_executions;
+pub mod canon_lag;
 pub mod canonical_head;
 pub mod chain_alias;
 pub mod fields_at_seal;

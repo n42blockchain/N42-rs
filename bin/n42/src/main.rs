@@ -432,6 +432,28 @@ fn main() {
                 ));
             }
 
+            // The canonical notification channel's backlog: the notifications
+            // tokio still holds because some receiver has not read them (each
+            // keeps a whole block alive). Sampled every 5 s; logged when non-zero,
+            // otherwise once a minute.
+            {
+                let in_memory = node.provider.canonical_in_memory_state();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                    let mut last_log: Option<std::time::Instant> = None;
+                    loop {
+                        tick.tick().await;
+                        let slots = in_memory.canon_notification_backlog();
+                        metrics::gauge!("n42_canon_notification_backlog").set(slots as f64);
+                        let quiet_for = last_log.map(|at| at.elapsed());
+                        if slots > 0 || quiet_for.is_none_or(|d| d >= std::time::Duration::from_secs(60)) {
+                            last_log = Some(std::time::Instant::now());
+                            info!(target: "n42.canon", slots, "canonical notification backlog");
+                        }
+                    }
+                });
+            }
+
             // A chained build that waits for an ancestor to reach the engine is
             // woken by the canonical chain's changes instead of polling, and the
             // own-block layers the engine's tip has passed are released
@@ -444,6 +466,10 @@ fn main() {
                     loop {
                         match canonical.recv().await {
                             Ok(notification) => {
+                                let behind = canonical.len();
+                                if behind > 8 {
+                                    warn!(target: "n42.canon", behind, "canonical subscriber lag: leader layers");
+                                }
                                 n42_engine_types::direct_build::engine_landed::notify();
                                 n42_engine_types::direct_build::leader_layers::on_canonical(notification.tip().number, depth);
                             }
@@ -788,12 +814,14 @@ fn main() {
                             use futures::StreamExt as _;
                             use reth_provider::CanonStateSubscriptions as _;
                             let head = head.clone();
-                            let mut canonical = node.provider.canonical_state_stream();
+                            let mut canonical = n42_engine_types::canon_lag::watched(
+                                "head_tracker",
+                                node.provider.subscribe_to_canonical_state(),
+                            );
                             tokio::spawn(async move {
                                 while let Some(notification) = canonical.next().await {
                                     head.store(notification.tip().number, std::sync::atomic::Ordering::Relaxed);
                                 }
-                                // (a stream over the broadcast; its lag is not readable here)
                             });
                         }
                         // The chain id a frame attestation is signed over

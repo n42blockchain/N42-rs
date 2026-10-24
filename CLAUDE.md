@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this repo is
 
 N42 is a **partial fork of [reth](https://github.com/paradigmxyz/reth)**. Most of reth is consumed as a
-git dependency pinned to a tag (`reth = { git = "...", tag = "v2.7.0" }` — grep `Cargo.toml` for the tag
+git dependency pinned to a tag (`reth = { git = "...", tag = "v2.8.1" }` — grep `Cargo.toml` for the tag
 to confirm the current version); a subset of reth crates is vendored under `crates/` and substituted into
 the whole dependency graph via `[patch.'https://github.com/paradigmxyz/reth.git']` in the root `Cargo.toml`.
 N42-specific code lives under `crates/n42/` and `bin/n42/`.
@@ -291,7 +291,7 @@ Three N42 clients live side by side on this host, and code moves between them:
   1.97) with HotStuff-2 and QMDB. Depends on reth by local path (`../reth`).
 - `../reth` — a checkout of the n42blockchain/reth fork with upstream tags
   fetched; `scripts/reth-sync.py` reads upstream revisions from it. This repo
-  itself pins upstream paradigmxyz/reth by tag (`v2.7.0` as of 2026-10-02).
+  itself pins upstream paradigmxyz/reth by tag (`v2.8.1` as of 2026-10-23).
 
 The `n42-{bmt-core,twig-core,h2-primitives,h2-wire,h2-consensus,mobile-verify,h2-net,h2-execution}`
 crates came from `../N42-26` (`h2-net` is new, modelled on its `n42-network`;
@@ -327,15 +327,19 @@ recorder and replayer must share one revm version.
 
 ## Upgrading reth
 
-The repo is on reth **v2.7.0** (upstream tag, since 2026-10-02; revm 43, alloy 2.5,
-alloy-evm 0.39, reth-core crates 0.8, edition 2024).
+The repo is on reth **v2.8.1** (upstream tag, since 2026-10-23; revm 43, alloy 2.5,
+alloy-evm 0.39, reth-core crates 0.8.2, edition 2024).
 `docs/RETH_2_4_1_UPGRADE.md` records the 1.11.0 → 2.4.1 move (22 of 121 reth
 crates deleted or relocated; `reth-primitives-traits` now comes from crates.io);
 `docs/RETH_2_7_0_UPGRADE.md` the 2.5.1 → 2.7.0 one (13 conflicts; reth-storage-overlay
 newly vendored; `MemoryOverlayStateProvider` kept in `engine-types/src/memory_overlay.rs`;
-the alloy forks re-merged to 2.5.0). `scripts/reth-sync.py` also syncs the commented-out
-patch entries and resolves `../reth` from the repository root -- discard what it brings
-back for reverted forks, and point it at the real checkout when running from a worktree.
+the alloy forks re-merged to 2.5.0); `docs/RETH_2_8_1_UPGRADE.md` the 2.7.0 → 2.8.1 one (14
+conflicts; `multiproof_v2` lost its `TrieInput`, so the memory overlay answers proofs over
+in-memory blocks through upstream's overlay). `scripts/reth-sync.py` resolves `../reth` from
+the repository root (`N42_RETH_SOURCE` overrides it; point it at the real checkout when running
+from a worktree). It does not see `vendor/dependency-repairs/reth-{nippy-jar,transaction-pool}-*`
+(their paths do not exist upstream): merge those by hand and rename them to the new version,
+and recheck the `revm-inspectors` repair whenever reth moves its version.
 
 Bumping to a newer reth: `scripts/reth-sync.py <old-rev> <new-rev>` three-way
 merges every vendored crate in the patch table from the upstream checkout at

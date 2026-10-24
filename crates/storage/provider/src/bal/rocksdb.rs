@@ -1,7 +1,7 @@
 use crate::providers::RocksDBProvider;
 use alloy_eip7928::BAL_RETENTION_PERIOD_SLOTS;
 use alloy_eips::NumHash;
-use alloy_primitives::{BlockHash, BlockNumber, Bytes};
+use alloy_primitives::{map::B256Map, BlockHash, BlockNumber, Bytes};
 use parking_lot::RwLock;
 use reth_db_api::{
     models::{StoredBlockAccessList, StoredBlockAccessListKey},
@@ -12,7 +12,7 @@ use reth_prune_types::PruneMode;
 use reth_storage_api::{BalStore, GetBlockAccessListLimit, RawBal};
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
 
@@ -212,7 +212,7 @@ impl BalStore for RocksDBBalStore {
 #[derive(Debug, Default)]
 struct RocksDBBalStoreBuffer {
     /// Hash index for serving recent hash-only lookups.
-    entries: HashMap<BlockHash, RocksDBBalEntry>,
+    entries: B256Map<RocksDBBalEntry>,
     /// Block-number index for pruning buffered entries.
     hashes_by_number: BTreeMap<BlockNumber, Vec<BlockHash>>,
     /// Validated BALs waiting to be confirmed canonical and flushed.
@@ -366,31 +366,6 @@ mod tests {
     }
 
     #[test]
-    fn inserts_and_reads_by_hash() {
-        let (_dir, store) = test_store();
-        let hash = B256::random();
-        let missing = NumHash::new(1, B256::random());
-        let bal = Bytes::from_static(&[0xc1, 0x01]);
-
-        store.insert(NumHash::new(1, hash), RawBal::from(bal.clone())).unwrap();
-
-        assert_eq!(read_many(&store, &[NumHash::new(1, hash), missing]), vec![Some(bal), None]);
-    }
-
-    #[test]
-    fn hash_lookup_reads_persisted_bal_through_store() {
-        let (_dir, store) = test_store();
-        let block = NumHash::new(1, B256::random());
-        let bal = Bytes::from_static(&[0xc1, 0x01]);
-
-        store.insert(block, RawBal::from(bal.clone())).unwrap();
-        store.flush(&[block]).unwrap();
-
-        let store_with_empty_buffer = RocksDBBalStore::new(store.rocksdb_provider().clone());
-        assert_eq!(store_with_empty_buffer.get_by_hash(block.hash).unwrap(), Some(bal));
-    }
-
-    #[test]
     fn flush_prunes_buffer_retention() {
         let (_dir, store) = test_store();
         let old = NumHash::new(1, B256::with_last_byte(1));
@@ -478,25 +453,6 @@ mod tests {
                 .unwrap(),
             vec![Some(bal_1), None, None]
         );
-    }
-
-    #[test]
-    fn sparse_numbers_are_valid() {
-        let (_dir, store) = test_store();
-        let hash_a = B256::with_last_byte(1);
-        let hash_b = B256::with_last_byte(2);
-        let bal_a = Bytes::from_static(&[0xc1, 0x01]);
-        let bal_b = Bytes::from_static(&[0xc1, 0x02]);
-
-        let block_a = NumHash::new(2, hash_a);
-        let block_b = NumHash::new(200, hash_b);
-
-        store.insert(block_a, RawBal::from(bal_a.clone())).unwrap();
-        store.flush(&[block_a]).unwrap();
-        store.insert(block_b, RawBal::from(bal_b.clone())).unwrap();
-        store.flush(&[block_b]).unwrap();
-
-        assert_eq!(read_many(&store, &[block_a, block_b]), vec![Some(bal_a), Some(bal_b)]);
     }
 
     #[test]

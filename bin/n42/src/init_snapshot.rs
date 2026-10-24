@@ -32,7 +32,7 @@ use reth_cli_commands::{
 };
 use alloy_primitives::{keccak256, map::B256Set, U256};
 use reth_db_api::{
-    cursor::{DbCursorRW, DbDupCursorRW},
+    cursor::DbCursorRW,
     models::{
         storage_sharded_key::StorageShardedKey, AccountBeforeTx, IntegerList, ShardedKey,
         StorageBeforeTx,

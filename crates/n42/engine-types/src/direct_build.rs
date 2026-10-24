@@ -34,7 +34,7 @@ use reth_storage_api::{
     StorageRootProvider,
 };
 use reth_trie::{
-    updates::TrieUpdates, AccountProof, ComputedTrieData, ExecutionWitnessMode, HashedPostState, HashedStorage,
+    updates::TrieUpdates, AccountProof, SortedTrieData, ExecutionWitnessMode, HashedPostState, HashedStorage,
     LazyTrieData, MultiProof, MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
 use revm::database::BundleState;
@@ -142,7 +142,7 @@ pub fn executed_under_seal(parent: &SealedHeader, execution: &BuiltExecution) ->
         // Only reth's trie methods read this, and nothing on a QMDB chain's
         // build path calls them; computed if anything ever does.
         trie_data: LazyTrieData::deferred(move || {
-            ComputedTrieData::new(Arc::new((*hashed).clone().into_sorted()), Arc::new((*updates).clone().into_sorted()))
+            SortedTrieData::new(Arc::new((*hashed).clone().into_sorted()), Arc::new((*updates).clone().into_sorted()))
         }),
         bal: None,
     }
@@ -181,7 +181,7 @@ pub fn executed_from_output(
     ExecutedBlock {
         recovered_block: Arc::new(RecoveredBlock::new_sealed(sealed, Vec::new())),
         execution_output: output,
-        trie_data: LazyTrieData::ready(ComputedTrieData::new(
+        trie_data: LazyTrieData::ready(SortedTrieData::new(
             Arc::new(reth_trie::HashedPostState::default().into_sorted()),
             Arc::new(reth_trie::updates::TrieUpdates::default().into_sorted()),
         )),
@@ -376,7 +376,7 @@ pub mod read_depth {
         StateProofProvider {
             fn proof(&self, input: TrieInput, address: Address, slots: &[B256]) -> ProviderResult<AccountProof>;
             fn multiproof(&self, input: TrieInput, targets: MultiProofTargets) -> ProviderResult<MultiProof>;
-            fn multiproof_v2(&self, input: TrieInput, targets: reth_trie::MultiProofTargetsV2) -> ProviderResult<reth_trie::DecodedMultiProofV2>;
+            fn multiproof_v2(&self, targets: reth_trie::MultiProofTargetsV2, requires_masks: bool) -> ProviderResult<reth_trie::DecodedMultiProofV2>;
             fn witness(&self, input: TrieInput, target: HashedPostState, mode: ExecutionWitnessMode) -> ProviderResult<Vec<Bytes>>;
         }
         HashedPostStateProvider {

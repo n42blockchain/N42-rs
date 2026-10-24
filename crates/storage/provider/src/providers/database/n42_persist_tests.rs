@@ -74,7 +74,7 @@ fn factory_with_genesis() -> TestFactory {
     let genesis: ExecutedBlock = ExecutedBlock::new(
         Arc::new(genesis.try_recover().expect("genesis recovers")),
         empty_output(Default::default()),
-        ComputedTrieData::default(),
+        SortedTrieData::default(),
     );
     let provider_rw = factory.provider_rw().expect("provider_rw");
     provider_rw
@@ -122,9 +122,7 @@ fn chain(n: u64) -> Vec<ExecutedBlock> {
         blocks.push(ExecutedBlock::new(
             Arc::new(block.try_recover().expect("block recovers")),
             empty_output(bundle),
-            ComputedTrieData {
-                sorted: SortedTrieData::new(Arc::new(hashed_state), Default::default()),
-            },
+            SortedTrieData::new(Arc::new(hashed_state), Default::default()),
         ));
     }
     blocks

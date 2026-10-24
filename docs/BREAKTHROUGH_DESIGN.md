@@ -5079,3 +5079,147 @@ broadcast channel (`subscribe_to_canonical_state`, capacity 256) drops
 notifications under the storm; the follower only needs the tip, so a
 watch-style latest-only hand-off would remove the warning and 255 queued
 `on_canonical` calls, but it would not remove the faults.
+
+## 10.218 -- the cache drop removes the reclaim and still loses; the stuck fix is itself the flush loop's clock (stage ew, 2026-10-24)
+
+Stage ew: WARM + four X20 legs on the 600M set, the stuck-flush fix of
+cf04ae9c2 as default on every leg, the vm sampler (`MEMF`) on every leg,
+the repaired `N42_SF_DROP_CACHE=1` (data pages only, 67e4bc8b4) on two.
+
+| leg | knob | drain M/s | gap by thirds (ms) | kswapd steals | refaults | `root_majflt` by thirds | road flushes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| LRa | off | 4.879 | 41.4 / 39.8 / 41.8 | 34.8M | 649k | 75 / 0 / 17 | 0 |
+| LR1 | on | 4.648 | 41.2 / 42.2 / 45.9 | **0.97M** | **8k** | 67 / 33 / 11 | 0 |
+| LRb | off | 5.000 | 39.0 / 39.8 / 41.4 | 31.1M | 741k | 0 / 0 / 102 | 0 |
+| LR1b | on | **3.096** | 61.4 / 70.2 / 68.9 | 0 | 0 | 31 / 1 / 1 | **101** (2 GiveBack, 99 Stuck) |
+
+Gates clean on all four. Two findings, one per knob leg.
+
+### LR1: the reclaim is gone and the leg is still slower than both controls
+
+The knob does what 10.213-10.215 asked for: kswapd stole 0.97M pages
+instead of 31-35M, the working set refaulted 8k pages instead of 650-740k,
+Cached stayed at 10-35 GB with 78 GB free, and the critical path's major
+faults fell through the leg (the perf record holds 556 faults against the
+controls' 19,521 and 33,500). The leg still read 4.648 against 4.879 and
+5.000, and its last third's gap was 45.9 ms.
+
+What grew in that third is not faults: `prev_seal_to_request_us` 1,092 →
+9,910 (+807%), `next_start_gap_ms` 1.2 → 9.8, `batch_open_sum_us` 17k →
+63k (+269%), `rename_record_waits` +355%, and the QMDB head follower
+lagged 255 notifications 406 times in the last minute. The persistence
+metrics name the cost: per block, the transactions static-file write took
+24.1 ms against 21.5 / 20.8 on the controls, senders 11.9 against 9.8 /
+10.2, receipts 6.6 against 5.4, changesets 16.4 against 13.8 / 14.0 --
+every static-file write 12-20% slower. `drop_cache_after_commit` calls
+`posix_fadvise(fd, 0, 0, DONTNEED)` over the *whole* data file after
+*every* commit: the transactions file is 49 GB (12M pages) by the end of a
+leg, there are ~25 commits a second across the segments, and each call
+walks the file's page tree. The cost grows with the file, which is why the
+third third pays. And the readers of recent data (the queue pruner's
+canonical path, the follower's body fetch; LR1b's perf has 215 of its 264
+faults on `static_file_transactions`) find their pages gone.
+
+The repair is mechanical: release only the bytes written since the last
+release, lagged by a kept tail (256 MB a file by default,
+`N42_SF_DROP_CACHE_KEEP_MB`), so each call touches ~25 MB of new pages and
+the last ~10 s of every segment stays cached. Then the knob can be measured
+on its merit, which stage ew established: the reclaim and the refaults do
+go away.
+
+### LR1b: the stuck fix's cool-down became the flush loop's period
+
+The log line added in cf04ae9c2 made the loop legible. At block 1021 (the
+periodic stale-parent refusal of 10.216 again, 1024k−3) a GiveBack flush
+put 5,062 frames (2.53M txs) into the lanes with `lane_debt_before=0`; 2 s
+later a second GiveBack (4,773 frames); then 97 flushes `reason=Stuck`,
+each at `builds_since_last=20` and `lane_debt_before=1500`. Twenty builds
+is exactly the cool-down (`frames/400 + 8`), and 1,500 txs of debt is what
+the frame planner can never take as a frame (`FRAME_ROAD_DESIGN.md`, "Gate
+stuck": a road sender's frameless lane entry, a frame's tail). The cycle:
+
+1. a flush fills the index; the index drains at ~240 frames a build and
+   is empty after ~20 builds; 1,500 txs of untakeable debt remain in the
+   lanes;
+2. `lane_debt > 0` keeps the road gate shut (`road_taken=0`), frames on
+   the road make `frames_arriving()` true, and the planner refuses the
+   lanes walk (`frame plan empty while frames are arriving` ×693), so no
+   build takes the debt;
+3. the stuck rule sees no progress, the cool-down expires, it flushes the
+   road again, and the 2.5M txs it dumps hide the same 1,500 txs for
+   another 20 builds.
+
+Blocks were ~147k txs (the index's drain) at 61-70 ms gaps (the flush and
+reseed cost) for the whole leg. The old rule (ROAD_STUCK_BUILDS=8) ran the
+same loop at a faster clock (10.216, LP2, `flushes=6` per 5 s); the new
+rule only slowed it. Flushing is the wrong remedy for this state: the debt
+is small and plannable as plain transactions, it is only not a frame. The
+fix is a **debt sweep**: when the frame plan is empty, the index is empty
+and `lane_debt > 0`, the build plans the debt lanes' transactions as
+ordinary candidates (those senders only, nonce order, no road
+invalidation, no full walk); the debt set empties, the gate opens on the
+next build, the road flows. The stuck flush stays only as the 64-build
+backstop. Both fixes are being written for stage ex.
+
+Standing: every control leg's clean thirds read 39.0-41.8 ms; the
+storm-free, loop-free X20 leg is at 5.0 (LRb 5.000, LPc 5.006, LPd 5.036,
+LOc 5.043). The two defects above are what stands between a leg and 5M on
+*every* leg.
+
+## 10.219 -- four clean legs 4.95-5.10; the ranged cache drop cuts the reclaim 4-6x and reads a record 5.104 on one pair of two (stage ex, 2026-10-24)
+
+Stage ex ran the two fixes of 10.218 for the first time, after a native build
+and 2,556 unit tests (six new): the debt sweep (a0b8d022f, default on) and
+the ranged, lagged static-file cache drop (27fba2781, behind the knob).
+WARM + four X20 legs on the 600M set, the vm sampler on every leg.
+
+| leg | knob | drain M/s | win1 / win2 / win3 | gap by thirds (ms) | kswapd steals | refaults | `root_majflt` by thirds | sweeps / flushes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| LTa | off | 4.954 | 5.04 / 4.87 / 4.95 | 39.7 / 40.7 / 40.6 | 35.0M | 657k | 0 / 146 / 82 | 0 / 0 |
+| LT1 | on | **5.104** | 5.18 / 5.11 / 4.97 | **38.2** / 39.8 / 39.5 | 8.9M | 565k | 0 / 67 / 85 | 0 / 0 |
+| LTb | off | 5.035 | 5.10 / 5.01 / 4.93 | 39.0 / 40.0 / 40.2 | 33.8M | 318k | 0 / 28 / 102 | 0 / 0 |
+| LT1b | on | 4.985 | 4.94 / 5.08 / 4.90 | 40.3 / 39.2 / 40.8 | 6.0M | 391k | 0 / 0 / 198 | 0 / 0 |
+
+Gates clean on all four, no timeout certificate (the 7 in each of ew's knob
+legs were the view-1 start-up ones the d2gate ignores; the knob never caused
+a TC). Neither a stale-parent refusal nor a flush nor a sweep occurred in
+any leg: the periodic refusal of 10.216 is intermittent (eu 3 of 5 legs, ev
+0 of 4, ew 1 of 4, ex 0 of 4), so the debt sweep is still unexercised on the
+fleet; its unit tests cover the 10.218 state (debt-only lanes with frames on
+the road: the sweep takes exactly the debt, the FIFO is untouched, 30
+rebuilds cost zero flushes).
+
+Four facts:
+
+1. **The first stage in which every leg read 4.95 or more** (mean 5.020).
+   Nothing broke with both fixes in the tree.
+2. **Record leg 5.104M/s** (LT1: windows 5.18 / 5.11 / 4.97; first-third
+   gap 38.2 ms, the lowest measured). Previous record 5.043 (LOc).
+3. **The ranged drop does what 10.218 predicted for the writer cost**: the
+   knob legs' static-file writes are no longer slower (the per-block sums
+   are within the controls' spread), the follower never lagged, and kswapd
+   stole 6-9M pages a leg against 34-35M. It did not take the reclaim to
+   zero: `MemFree` still dips to 15-26 GB in the knob legs (controls 12-25),
+   so a watermark is still reached, and the knob legs still fault 67-198
+   times a build on the root path in their second and third thirds (the
+   controls 28-146). On a 136 GB box the static files (10.214: 115 GB
+   written in a leg) are the filler; with them released the remaining
+   pressure is the heaps (`AnonPages` 17 GB), the QMDB entry file (15 GB,
+   mapped) and the kept tails (256 MB × segments × 7 nodes ≈ 7 GB), plus
+   12 GB of tmpfs (`/tmp`, Go test caches and build caches of the other
+   client; our own 920 scratch dirs were small and are gone).
+4. **One pair of two**: LT1 beat both controls (5.104 against 4.954 and
+   5.035), LT1b sat between them (4.985). Not adopted yet; stage ey runs
+   the second pair plus one knob leg with `N42_SF_DROP_CACHE_KEEP_MB=64`
+   (the kept tail at a quarter) to see whether the remaining steals follow
+   the tail.
+
+Where the faults remain: 96.6-99.9% of the perf-recorded major faults in
+all four legs are `qmdb/entries.log` through the view mapping (10.215),
+the rest the account-change-sets static file (the builder's changeset
+fallback for cold accounts) and, in LTb only, 700 on the transactions file.
+The entry file is what has to stay resident; everything else may go. If
+the 64 MB leg does not take the steals to zero, the next lever is to pin
+the entry file's hot tail (`mlock` or `MADV_WILLNEED` on the last N GB of
+the view mapping), which converts the remaining faults to zero at a known
+memory cost.

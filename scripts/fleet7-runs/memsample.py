@@ -24,7 +24,10 @@ NAMES = {'reth_blockchain_tree_in_mem_state_num_blocks': 'num', 'reth_blockchain
          'reth_storage_providers_database_save_blocks_sf_senders_sum': 'sfs_sum', 'reth_storage_providers_database_save_blocks_scope_sum': 'scope_sum',
          'reth_storage_providers_database_save_blocks_post_scope_sum': 'post_sum', 'reth_storage_providers_database_save_blocks_pre_scope_sum': 'pre_sum',
          'reth_storage_providers_database_save_blocks_plain_reverts_sum': 'pr_sum', 'reth_storage_providers_database_save_blocks_commit_sf_sum': 'csf_sum',
-         'reth_storage_providers_database_save_blocks_commit_mdbx_sum': 'cmd_sum', 'reth_storage_providers_database_save_blocks_commit_rocksdb_sum': 'crk_sum'}
+         'reth_storage_providers_database_save_blocks_commit_mdbx_sum': 'cmd_sum', 'reth_storage_providers_database_save_blocks_commit_rocksdb_sum': 'crk_sum',
+         # loop351 stage ez: jemalloc's own account of the heap (bytes), to tell live data from retention
+         'jemalloc_allocated': 'j_alloc', 'jemalloc_active': 'j_active', 'jemalloc_resident': 'j_resident', 'jemalloc_mapped': 'j_mapped',
+         'jemalloc_retained': 'j_retained', 'jemalloc_metadata': 'j_meta'}
 MAP = [int(x) for x in os.environ['F7_EL_MAP'].split(',')] if os.environ.get('F7_EL_MAP') else None
 def first_of(i):
     return MAP.index(i) if MAP else i
@@ -45,7 +48,7 @@ def sample(i):
             n, _, v = l.partition(' ')
             if n in NAMES: d[NAMES[n]] = v
     except Exception: pass
-    return f'node{i} pid={pid or "-"} rss_g={rss} num={d["num"]} latest={d["latest"]} earliest={d["earliest"]} bp={d["bp"]} stall_n={d["stall_n"]} stall_s={d["stall_s"]} sb_sum={d["sb_sum"]} sb_n={d["sb_n"]} bs_sum={d["bs_sum"]} sft_sum={d["sft_sum"]} qp_sum={d["qp_sum"]} canon={d["canon"]} sfr_sum={d["sfr_sum"]} sfa_sum={d["sfa_sum"]} sfs_sum={d["sfs_sum"]} scope_sum={d["scope_sum"]} post_sum={d["post_sum"]} pre_sum={d["pre_sum"]} pr_sum={d["pr_sum"]} csf_sum={d["csf_sum"]} cmd_sum={d["cmd_sum"]} crk_sum={d["crk_sum"]}'
+    return f'node{i} pid={pid or "-"} rss_g={rss} num={d["num"]} latest={d["latest"]} earliest={d["earliest"]} bp={d["bp"]} stall_n={d["stall_n"]} stall_s={d["stall_s"]} sb_sum={d["sb_sum"]} sb_n={d["sb_n"]} bs_sum={d["bs_sum"]} sft_sum={d["sft_sum"]} qp_sum={d["qp_sum"]} canon={d["canon"]} sfr_sum={d["sfr_sum"]} sfa_sum={d["sfa_sum"]} sfs_sum={d["sfs_sum"]} scope_sum={d["scope_sum"]} post_sum={d["post_sum"]} pre_sum={d["pre_sum"]} pr_sum={d["pr_sum"]} csf_sum={d["csf_sum"]} cmd_sum={d["cmd_sum"]} crk_sum={d["crk_sum"]} j_alloc={d["j_alloc"]} j_active={d["j_active"]} j_resident={d["j_resident"]} j_mapped={d["j_mapped"]} j_retained={d["j_retained"]} j_meta={d["j_meta"]}'
 ex = ThreadPoolExecutor(nodes)
 with open(out, 'a', buffering=1) as f:
     while True:

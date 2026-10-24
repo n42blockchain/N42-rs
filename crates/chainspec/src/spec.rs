@@ -1492,7 +1492,7 @@ mod tests {
     use alloy_primitives::{b256, hex};
     use alloy_trie::{TrieAccount, EMPTY_ROOT_HASH};
     use core::ops::Deref;
-    use reth_ethereum_forks::ethereum::sepolia;
+    use reth_ethereum_forks::ethereum::{hoodi, sepolia};
     use reth_ethereum_forks::{ForkCondition, ForkHash, ForkId, Head};
     use std::{
         collections::{BTreeMap, HashMap},

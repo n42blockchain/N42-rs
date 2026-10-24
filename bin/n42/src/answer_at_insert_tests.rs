@@ -68,7 +68,7 @@ fn the_switch_is_on_only_for_one() {
 async fn a_dispatched_new_payload_is_on_the_channel_before_any_await() {
     let (handle, mut rx) = engine();
     let reply = dispatch(&handle, data(5));
-    let Ok(BeaconEngineMessage::NewPayload { payload, tx }) = rx.try_recv() else {
+    let Ok(BeaconEngineMessage::NewPayload { payload, tx, .. }) = rx.try_recv() else {
         panic!("the newPayload is not on the channel after dispatch");
     };
     assert_eq!(payload.payload.block_number(), 5);

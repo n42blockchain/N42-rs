@@ -742,7 +742,7 @@ async fn own_block_answered_at_insert() {
     });
     loop {
         match engine_rx.recv().await.expect("message") {
-            BeaconEngineMessage::NewPayload { payload, tx } if payload.payload.block_number() == 522 => {
+            BeaconEngineMessage::NewPayload { payload, tx, .. } if payload.payload.block_number() == 522 => {
                 assert!(!call.is_finished(), "answered before the engine without the switch");
                 let _ = tx.send(Ok(PayloadStatus::from_status(PayloadStatusEnum::Valid)));
                 break;

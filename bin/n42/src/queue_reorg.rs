@@ -40,20 +40,20 @@ pub fn reverted_transactions(old: &Chain<N42Primitives>, new: &Chain<N42Primitiv
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alloy_consensus::{Header, Signed, TxEip1559};
     use alloy_primitives::{Address, Bytes, Signature, TxKind, B256, U256};
     use reth_primitives_traits::{RecoveredBlock, SealedBlock};
     use alloy_consensus::Transaction as _;
 
-    fn addr(i: u64) -> Address {
+    pub(crate) fn addr(i: u64) -> Address {
         let mut a = [0u8; 20];
         a[12..].copy_from_slice(&i.to_be_bytes());
         Address::from(a)
     }
 
-    fn transfer(nonce: u64, seed: u8) -> n42_tx_types::N42TxEnvelope {
+    pub(crate) fn transfer(nonce: u64, seed: u8) -> n42_tx_types::N42TxEnvelope {
         let inner = TxEip1559 {
             chain_id: 1,
             nonce,
@@ -69,7 +69,7 @@ mod tests {
         n42_tx_types::N42TxEnvelope::from(reth_ethereum_primitives::TransactionSigned::from(Signed::new_unchecked(inner, Signature::test_signature(), hash)))
     }
 
-    fn block(number: u64, txs: Vec<(Address, n42_tx_types::N42TxEnvelope)>) -> RecoveredBlock<n42_tx_types::Block> {
+    pub(crate) fn block(number: u64, txs: Vec<(Address, n42_tx_types::N42TxEnvelope)>) -> RecoveredBlock<n42_tx_types::Block> {
         let (senders, transactions): (Vec<_>, Vec<_>) = txs.into_iter().unzip();
         let header = Header { number, ..Default::default() };
         let body = n42_tx_types::BlockBody { transactions, ommers: Vec::new(), withdrawals: None };

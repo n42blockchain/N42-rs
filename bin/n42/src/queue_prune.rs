@@ -22,6 +22,109 @@ use reth_primitives_traits::AlloyBlockHeader as _;
 use reth_provider::CanonStateNotification;
 use tracing::{info, warn};
 
+use alloy_primitives::{Address, B256};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// What the pruner takes from one committed block: its height, hash, the
+/// `(sender, nonce)` pairs the lanes are pruned by and the transaction
+/// hashes the by-hash index is pruned by (~12 MB a 200,000-transaction
+/// block, against ~120 MB for the block itself).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeanBlock {
+    /// The block's height.
+    pub number: u64,
+    /// The block's hash.
+    pub hash: B256,
+    /// The block's `(sender, nonce)` pairs, in block order.
+    pub pairs: Vec<(Address, u64)>,
+    /// The block's transaction hashes, in block order.
+    pub hashes: Vec<B256>,
+}
+
+impl LeanBlock {
+    /// One walk of the block for both the pairs and the hashes.
+    pub fn from_block(block: &reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>) -> Self {
+        let mut hashes: Vec<B256> = Vec::with_capacity(block.senders().len());
+        let pairs: Vec<(Address, u64)> = block
+            .transactions_with_sender()
+            .map(|(sender, tx)| {
+                hashes.push(*alloy_consensus::transaction::TxHashRef::tx_hash(tx));
+                (*sender, alloy_consensus::Transaction::nonce(tx))
+            })
+            .collect();
+        Self { number: block.number(), hash: block.hash(), pairs, hashes }
+    }
+}
+
+/// The committed blocks of a notification as lean summaries, in order.
+pub fn lean_blocks(notification: &CanonStateNotification<N42Primitives>) -> Vec<LeanBlock> {
+    notification.committed().blocks_iter().map(|b| LeanBlock::from_block(b)).collect()
+}
+
+/// What is carried to the pruning thread. An ordinary commit goes as
+/// [`PruneFeed::Lean`], so the notification (an `Arc<Chain>` with every
+/// block's body) is dropped at the forwarder instead of being kept alive
+/// for as long as the pruner is behind; a reorg goes whole, since its
+/// reverted chain's transactions are offered again.
+#[derive(Debug)]
+pub enum PruneFeed {
+    /// The committed blocks' summaries of an ordinary commit.
+    Lean(Vec<LeanBlock>),
+    /// A whole notification (a reorg, or `N42_PRUNE_FEED_LEAN=0`).
+    Whole(CanonStateNotification<N42Primitives>),
+}
+
+impl PruneFeed {
+    /// The feed for one notification: lean for a commit without reverted
+    /// blocks when `lean` (`N42_PRUNE_FEED_LEAN`), whole otherwise.
+    pub fn of(notification: CanonStateNotification<N42Primitives>, lean: bool) -> Self {
+        if lean && notification.reverted().is_none() {
+            Self::Lean(lean_blocks(&notification))
+        } else {
+            Self::Whole(notification)
+        }
+    }
+}
+
+/// `N42_PRUNE_FEED_LEAN=0` carries whole canonical notifications to the
+/// pruning thread as before; default on: lean block summaries, read and
+/// logged once. Loop351: with the pruner a wake (~1 s, ~25 blocks) behind,
+/// the notifications in its channel were the last holders of the
+/// committed blocks' bodies, 60-90 GB of the execution layer's heap.
+pub fn feed_lean() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("N42_PRUNE_FEED_LEAN").map_or(true, |v| v != "0");
+        info!(target: "n42.tx_queue", prune_feed_lean = on, "N42_PRUNE_FEED_LEAN");
+        on
+    })
+}
+
+/// Items sent to the pruning thread and not yet received by it.
+static FEED_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// The pruning thread's inbox: counts what it sends, so a wake can say how
+/// deep the channel was (`feed_depth`).
+#[derive(Debug, Clone)]
+pub struct PruneSender(std::sync::mpsc::Sender<Queued>);
+
+impl PruneSender {
+    /// Sends one feed item with its arrival time; `Err` if the thread is gone.
+    pub fn send(&self, feed: PruneFeed) -> Result<(), PruneFeed> {
+        FEED_DEPTH.fetch_add(1, Ordering::Relaxed);
+        self.0.send((feed, std::time::Instant::now())).map_err(|err| {
+            FEED_DEPTH.fetch_sub(1, Ordering::Relaxed);
+            err.0 .0
+        })
+    }
+}
+
+/// How many committed blocks the canonical head is ahead of `pruned`, the
+/// highest block a wake pruned.
+fn lag_blocks(pruned: u64) -> u64 {
+    n42_engine_types::canonical_head::number().saturating_sub(pruned)
+}
+
 /// Whether the pruner runs on its own thread (`N42_QUEUE_PRUNE_THREAD=1`,
 /// off by default).
 pub fn on_own_thread() -> bool {
@@ -38,6 +141,55 @@ pub fn prune_notification(
     coalesced: usize,
     waited: std::time::Duration,
 ) {
+    prune_one(queue, FeedRef::Whole(notification), coalesced, waited, 0);
+}
+
+/// One feed item, borrowed: what the prune functions walk.
+#[derive(Debug, Clone, Copy)]
+enum FeedRef<'a> {
+    Lean(&'a [LeanBlock]),
+    Whole(&'a CanonStateNotification<N42Primitives>),
+}
+
+impl<'a> From<&'a PruneFeed> for FeedRef<'a> {
+    fn from(feed: &'a PruneFeed) -> Self {
+        match feed {
+            PruneFeed::Lean(blocks) => Self::Lean(blocks),
+            PruneFeed::Whole(notification) => Self::Whole(notification),
+        }
+    }
+}
+
+impl<'a> FeedRef<'a> {
+    /// The reorg's chains, if this item is a reorg.
+    fn reorg(self) -> Option<(&'a reth_execution_types::Chain<N42Primitives>, &'a reth_execution_types::Chain<N42Primitives>)> {
+        match self {
+            Self::Whole(CanonStateNotification::Reorg { old, new }) => Some((old, new)),
+            _ => None,
+        }
+    }
+
+    /// The committed blocks' summaries: borrowed when the feed is lean,
+    /// built from the blocks when it is whole.
+    fn blocks(self) -> Vec<std::borrow::Cow<'a, LeanBlock>> {
+        match self {
+            Self::Lean(blocks) => blocks.iter().map(std::borrow::Cow::Borrowed).collect(),
+            Self::Whole(notification) => {
+                notification.committed().blocks_iter().map(|b| std::borrow::Cow::Owned(LeanBlock::from_block(b))).collect()
+            }
+        }
+    }
+}
+
+/// [`prune_notification`] for one feed item; `feed_depth` is the pruning
+/// thread's channel depth at the wake's start (0 on the runtime).
+fn prune_one(
+    queue: &TxQueue<N42PooledTransaction>,
+    item: FeedRef<'_>,
+    coalesced: usize,
+    waited: std::time::Duration,
+    feed_depth: usize,
+) {
     let started = std::time::Instant::now();
     // A reorg: the reverted blocks' transactions are nowhere else -- with
     // the direct ingest the queue is their only holder -- so those the new
@@ -46,7 +198,7 @@ pub fn prune_notification(
     // Without this the affected senders' lanes started at a nonce ahead of
     // the chain and every leader refused them: half-empty blocks for the
     // rest of the leg (round 43).
-    if let CanonStateNotification::Reorg { old, new } = notification {
+    if let Some((old, new)) = item.reorg() {
         let reverted_blocks = old.blocks_iter().count();
         let back = crate::queue_reorg::reverted_transactions(old, new);
         let offered = back.len();
@@ -62,30 +214,24 @@ pub fn prune_notification(
     // pairs, the wait for the lock and the hand-off of what was removed to
     // the queue's freeing thread.
     let mut sum = n42_tx_queue::PruneTimes::default();
-    for block in notification.committed().blocks_iter() {
+    let mut highest = 0u64;
+    for block in item.blocks() {
         // What the builder reads to tell a build for a height the chain has
         // already decided from a build that is starving.
-        n42_engine_types::canonical_head::saw(block.number());
+        n42_engine_types::canonical_head::saw(block.number);
         // What the builder compares its parent against: a build below this
         // is behind its own queue.
-        queue.note_pruned(block.number());
-        // One walk for both: the (sender, nonce) pairs the lanes are pruned
-        // by, and the hashes the by-hash index is pruned by.
-        let mut hashes: Vec<alloy_primitives::B256> = Vec::new();
-        let pairs: Vec<(alloy_primitives::Address, u64)> = block
-            .transactions_with_sender()
-            .map(|(sender, tx)| {
-                hashes.push(*alloy_consensus::transaction::TxHashRef::tx_hash(tx));
-                (*sender, alloy_consensus::Transaction::nonce(tx))
-            })
-            .collect();
-        mined += pairs.len();
+        queue.note_pruned(block.number);
+        highest = highest.max(block.number);
+        // The (sender, nonce) pairs the lanes are pruned by, and the hashes
+        // the by-hash index is pruned by.
+        mined += block.pairs.len();
         // An own block held at this height: the same hash is settled,
         // another hash gives back what this block does not carry (then
         // pruned where this block mined a higher nonce).
-        let (back, times) = queue.prune_block(block.number(), block.hash(), &pairs, &hashes);
+        let (back, times) = queue.prune_block(block.number, block.hash, &block.pairs, &block.hashes);
         if back > 0 {
-            note_settled_back(Some(block.number()), 1, back);
+            note_settled_back(Some(block.number), 1, back);
         }
         sum.settle_us += times.settle_us;
         sum.fold_us += times.fold_us;
@@ -125,6 +271,8 @@ pub fn prune_notification(
             frames_swept = sum.frames_swept,
             coalesced,
             prune_wait_ms = waited.as_millis() as u64,
+            feed_depth,
+            lag_blocks = lag_blocks(highest),
             "canonical blocks pruned from the queue"
         );
         // What the queue let go of since the last block, by reason, with
@@ -154,21 +302,31 @@ pub fn prune_notifications_lean(
     notifications: &[&CanonStateNotification<N42Primitives>],
     waited: std::time::Duration,
 ) {
+    let items: Vec<FeedRef<'_>> = notifications.iter().map(|n| FeedRef::Whole(n)).collect();
+    prune_lean_items(queue, &items, waited, 0);
+}
+
+/// [`prune_notifications_lean`] for the pruning thread's feed items.
+pub fn prune_feed_lean(queue: &TxQueue<N42PooledTransaction>, feed: &[&PruneFeed], waited: std::time::Duration, feed_depth: usize) {
+    let items: Vec<FeedRef<'_>> = feed.iter().map(|f| FeedRef::from(*f)).collect();
+    prune_lean_items(queue, &items, waited, feed_depth);
+}
+
+fn prune_lean_items(queue: &TxQueue<N42PooledTransaction>, items: &[FeedRef<'_>], waited: std::time::Duration, feed_depth: usize) {
     let started = std::time::Instant::now();
-    let coalesced = notifications.len();
+    let coalesced = items.len();
     let mut sum = n42_tx_queue::PruneTimes::default();
     let mut mined = 0usize;
+    let mut highest = 0u64;
     // Every block's pairs and hashes of the run, in order.
-    let mut run: Vec<(u64, alloy_primitives::B256, Vec<(alloy_primitives::Address, u64)>, Vec<alloy_primitives::B256>)> =
-        Vec::new();
-    let flush = |run: &mut Vec<(u64, alloy_primitives::B256, Vec<(alloy_primitives::Address, u64)>, Vec<alloy_primitives::B256>)>,
-                 sum: &mut n42_tx_queue::PruneTimes| {
+    let mut run: Vec<std::borrow::Cow<'_, LeanBlock>> = Vec::new();
+    let flush = |run: &mut Vec<std::borrow::Cow<'_, LeanBlock>>, sum: &mut n42_tx_queue::PruneTimes| {
         if run.is_empty() {
             return;
         }
         let inputs: Vec<n42_tx_queue::PruneInput<'_>> = run
             .iter()
-            .map(|(number, hash, pairs, hashes)| n42_tx_queue::PruneInput { number: *number, hash: *hash, mined: pairs, hashes })
+            .map(|b| n42_tx_queue::PruneInput { number: b.number, hash: b.hash, mined: &b.pairs, hashes: &b.hashes })
             .collect();
         let (back, times) = queue.prune_blocks(&inputs);
         if back > 0 {
@@ -188,8 +346,8 @@ pub fn prune_notifications_lean(
         sum.drain_us += times.drain_us;
         run.clear();
     };
-    for notification in notifications {
-        if let CanonStateNotification::Reorg { old, new } = notification {
+    for item in items {
+        if let Some((old, new)) = item.reorg() {
             flush(&mut run, &mut sum);
             let reverted_blocks = old.blocks_iter().count();
             let back = crate::queue_reorg::reverted_transactions(old, new);
@@ -197,19 +355,12 @@ pub fn prune_notifications_lean(
             queue.push_reverted(back);
             warn!(target: "n42.tx_queue", reverted_blocks, offered, new_blocks = new.blocks_iter().count(), "reorg: the reverted blocks' transactions are offered again");
         }
-        for block in notification.committed().blocks_iter() {
-            n42_engine_types::canonical_head::saw(block.number());
-            queue.note_pruned(block.number());
-            let mut hashes: Vec<alloy_primitives::B256> = Vec::new();
-            let pairs: Vec<(alloy_primitives::Address, u64)> = block
-                .transactions_with_sender()
-                .map(|(sender, tx)| {
-                    hashes.push(*alloy_consensus::transaction::TxHashRef::tx_hash(tx));
-                    (*sender, alloy_consensus::Transaction::nonce(tx))
-                })
-                .collect();
-            mined += pairs.len();
-            run.push((block.number(), block.hash(), pairs, hashes));
+        for block in item.blocks() {
+            n42_engine_types::canonical_head::saw(block.number);
+            queue.note_pruned(block.number);
+            highest = highest.max(block.number);
+            mined += block.pairs.len();
+            run.push(block);
         }
     }
     flush(&mut run, &mut sum);
@@ -239,6 +390,8 @@ pub fn prune_notifications_lean(
             frames_swept = sum.frames_swept,
             coalesced,
             prune_wait_ms = waited.as_millis() as u64,
+            feed_depth,
+            lag_blocks = lag_blocks(highest),
             // `N42_PRUNE_LEAN`: the lock holds' sum is `remove_us`; these
             // say how many removals the wake made and how many blocks were
             // folded into them.
@@ -301,12 +454,12 @@ pub fn max_fold() -> usize {
     })
 }
 
-/// A notification on its way to the pruning thread, with when it arrived.
-type Queued = (CanonStateNotification<N42Primitives>, std::time::Instant);
+/// A feed item on its way to the pruning thread, with when it arrived.
+type Queued = (PruneFeed, std::time::Instant);
 
 /// Starts the pruning thread; `None` (and a warning) if it could not be
 /// started, and the caller prunes on the runtime as before.
-pub fn spawn_thread(queue: TxQueue<N42PooledTransaction>) -> Option<std::sync::mpsc::Sender<Queued>> {
+pub fn spawn_thread(queue: TxQueue<N42PooledTransaction>) -> Option<PruneSender> {
     let (tx, rx) = std::sync::mpsc::channel::<Queued>();
     let spawned = std::thread::Builder::new().name("n42-queue-prune".to_owned()).spawn(move || {
         let (min_fold, max_wait) = min_fold();
@@ -316,7 +469,9 @@ pub fn spawn_thread(queue: TxQueue<N42PooledTransaction>) -> Option<std::sync::m
         let mut carry: Vec<Queued> = Vec::new();
         loop {
             // Everything already waiting is taken in this wake, in order.
-            let mut batch = if carry.is_empty() {
+            // Whether the wake's first item comes from the channel (not the carry).
+            let first_from_rx = carry.is_empty();
+            let mut batch = if first_from_rx {
                 match rx.recv() {
                     Ok(first) => vec![first],
                     Err(_) => break,
@@ -324,8 +479,13 @@ pub fn spawn_thread(queue: TxQueue<N42PooledTransaction>) -> Option<std::sync::m
             } else {
                 std::mem::take(&mut carry)
             };
+            // The channel's depth at the wake's start, the item just
+            // received included (`feed_depth` on the prune line).
+            let feed_depth = FEED_DEPTH.load(Ordering::Relaxed);
+            let mut received = usize::from(first_from_rx);
             while let Ok(next) = rx.try_recv() {
                 batch.push(next);
+                received += 1;
             }
             // `N42_PRUNE_MIN_FOLD`: wait for more, up to `max_wait` after
             // the first arrived, so the wake folds at least `min_fold`.
@@ -339,23 +499,26 @@ pub fn spawn_thread(queue: TxQueue<N42PooledTransaction>) -> Option<std::sync::m
                     match rx.recv_timeout(deadline - now) {
                         Ok(next) => {
                             batch.push(next);
+                            received += 1;
                             while let Ok(more) = rx.try_recv() {
                                 batch.push(more);
+                                received += 1;
                             }
                         }
                         Err(_) => break,
                     }
                 }
             }
+            FEED_DEPTH.fetch_sub(received, Ordering::Relaxed);
             if max_fold > 0 && batch.len() > max_fold {
                 carry = batch.split_off(max_fold);
             }
             let coalesced = batch.len();
             if n42_tx_queue::prune_lean() {
                 let waited = batch[0].1.elapsed();
-                let notifications: Vec<&CanonStateNotification<N42Primitives>> = batch.iter().map(|(n, _)| n).collect();
-                prune_notifications_lean(&queue, &notifications, waited);
-                drop(notifications);
+                let feed: Vec<&PruneFeed> = batch.iter().map(|(f, _)| f).collect();
+                prune_feed_lean(&queue, &feed, waited, feed_depth);
+                drop(feed);
                 // Freed on the queue's freeing thread: a pruner behind the
                 // engine holds the last reference to the wake's blocks, and
                 // their free was ~13 ms a block on this thread after the
@@ -363,15 +526,15 @@ pub fn spawn_thread(queue: TxQueue<N42PooledTransaction>) -> Option<std::sync::m
                 n42_tx_queue::free_later(batch);
                 continue;
             }
-            for (notification, arrived) in batch {
-                prune_notification(&queue, &notification, coalesced, arrived.elapsed());
+            for (feed, arrived) in batch {
+                prune_one(&queue, FeedRef::from(&feed), coalesced, arrived.elapsed(), feed_depth);
             }
         }
     });
     match spawned {
         Ok(_) => {
             info!(target: "n42.tx_queue", "canonical queue pruner on its own thread");
-            Some(tx)
+            Some(PruneSender(tx))
         }
         Err(err) => {
             warn!(target: "n42.tx_queue", %err, "N42_QUEUE_PRUNE_THREAD=1 but its thread could not be started; pruning on the runtime");
@@ -400,5 +563,64 @@ fn note_settled_back(number: Option<u64>, blocks: usize, back: usize) {
         warn!(target: "n42.tx_queue", number, back, "an own block at this height was not the one committed; its transactions are offered again");
     } else {
         warn!(target: "n42.tx_queue", blocks, back, "an own block at a pruned height was not the one committed; its transactions are offered again");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::queue_reorg::tests::{addr, block, transfer};
+    use alloy_consensus::transaction::TxHashRef as _;
+    use reth_execution_types::Chain;
+    use reth_transaction_pool::PoolTransaction as _;
+    use std::sync::Arc;
+
+    fn commit() -> CanonStateNotification<N42Primitives> {
+        let (a, b) = (addr(1), addr(2));
+        let chain = Chain::new(
+            vec![block(10, vec![(a, transfer(0, 1)), (b, transfer(0, 2))]), block(11, vec![(a, transfer(1, 3))])],
+            Default::default(),
+            Default::default(),
+        );
+        CanonStateNotification::Commit { new: Arc::new(chain) }
+    }
+
+    #[test]
+    fn a_lean_feed_carries_what_the_whole_notification_gives_the_prune() {
+        let notification = commit();
+        // What the prune reads from the whole notification, block by block.
+        let whole: Vec<LeanBlock> = FeedRef::Whole(&notification).blocks().into_iter().map(|b| b.into_owned()).collect();
+        let PruneFeed::Lean(lean) = PruneFeed::of(notification.clone(), true) else { panic!("a commit goes lean") };
+        assert_eq!(lean, whole);
+        assert_eq!(lean.iter().map(|b| b.number).collect::<Vec<_>>(), vec![10, 11]);
+        assert_eq!(lean[0].pairs, vec![(addr(1), 0), (addr(2), 0)]);
+        let first = notification.committed().blocks_iter().next().map(|b| (b.hash(), *b.body().transactions[1].tx_hash()));
+        assert_eq!(first, Some((lean[0].hash, lean[0].hashes[1])));
+        assert!(matches!(PruneFeed::of(notification, false), PruneFeed::Whole(_)), "the knob off goes whole");
+    }
+
+    #[test]
+    fn a_lean_feed_prunes_the_queue_as_the_whole_notification_does() {
+        let notification = commit();
+        let fill = || {
+            let queue: TxQueue<N42PooledTransaction> = TxQueue::new();
+            let txs: Vec<N42PooledTransaction> = notification
+                .committed()
+                .blocks_iter()
+                .flat_map(|b| b.transactions_with_sender().map(|(s, tx)| (*s, tx.clone())).collect::<Vec<_>>())
+                .chain(std::iter::once((addr(1), transfer(2, 9))))
+                .filter_map(|(s, tx)| {
+                    N42PooledTransaction::try_from_consensus(reth_primitives_traits::Recovered::new_unchecked(tx, s)).ok()
+                })
+                .collect();
+            queue.push_reverted(txs);
+            queue
+        };
+        let (by_whole, by_lean) = (fill(), fill());
+        prune_notifications_lean(&by_whole, &[&notification], std::time::Duration::ZERO);
+        let feed = PruneFeed::of(notification.clone(), true);
+        prune_feed_lean(&by_lean, &[&feed], std::time::Duration::ZERO, 1);
+        assert_eq!(by_lean.len(), by_whole.len());
+        assert_eq!(by_lean.usable(), by_whole.usable());
     }
 }

@@ -28,7 +28,7 @@ use alloy_consensus::BlockHeader;
 use alloy_primitives::{
     keccak256, Address, BlockNumber, Bytes, StorageKey, StorageValue, B256, U256,
 };
-use reth_storage_api::errors::ProviderResult;
+use reth_storage_api::errors::{ProviderError, ProviderResult};
 use reth_primitives_traits::{Account, Bytecode, NodePrimitives};
 use reth_storage_api::{
     AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider, StateProofProvider,
@@ -134,8 +134,8 @@ impl<'a, N: NodePrimitives> MemoryOverlayStateProviderRef<'a, N> {
             // Iterate from oldest to newest
             for block in self.in_memory.iter().rev() {
                 let data = block.trie_data();
-                input.nodes.extend_from_sorted(&data.sorted.trie_updates);
-                input.state.extend_from_sorted(&data.sorted.hashed_state);
+                input.nodes.extend_from_sorted(&data.trie_updates);
+                input.state.extend_from_sorted(&data.hashed_state);
             }
             input
         })
@@ -327,11 +327,15 @@ impl<N: NodePrimitives> StateProofProvider for MemoryOverlayStateProviderRef<'_,
 
     fn multiproof_v2(
         &self,
-        mut input: TrieInput,
         targets: MultiProofTargetsV2,
+        requires_masks: bool,
     ) -> ProviderResult<DecodedMultiProofV2> {
-        input.prepend_self(self.trie_input().clone());
-        self.historical.multiproof_v2(input, targets)
+        // v2.8 proves against the provider's own state and no longer takes a trie input, so the
+        // in-memory blocks cannot be layered over the historical provider here.
+        if !self.in_memory.is_empty() {
+            return Err(ProviderError::UnsupportedProvider)
+        }
+        self.historical.multiproof_v2(targets, requires_masks)
     }
 
     fn witness(

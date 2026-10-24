@@ -1717,8 +1717,8 @@ impl RocksDBProvider {
             // changesets written, ensuring history indices match changeset entries.
             for storage_block_reverts in &reverts.storage {
                 for revert in storage_block_reverts {
-                    for (slot, _) in revert.storage_revert {
-                        let plain_key = B256::from(slot);
+                    for (slot, _) in &revert.storage_revert {
+                        let plain_key = B256::from(*slot);
                         storage_history
                             .entry((revert.address, plain_key))
                             .or_default()

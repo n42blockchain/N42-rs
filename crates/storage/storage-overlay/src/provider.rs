@@ -521,7 +521,11 @@ where
     }
 }
 
-impl<Provider, N: NodePrimitives> OverlayStateProvider<Provider, N> {
+impl<Provider, N: NodePrimitives> OverlayStateProvider<Provider, N>
+where
+    Provider: Deref,
+    Provider::Target: DBProvider,
+{
     /// The hint of [`AccountReader::n42_prefetch_account`] with the reader given. The
     /// execution overlay is only probed when already built: a hint never builds it.
     fn n42_prefetch_account_into(

@@ -607,7 +607,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     revert.storage_revert.iter().map(move |(key, revert_to_slot)| {
                         StorageBeforeTx {
                             address: revert.address,
-                            key: key.into(),
+                            key: B256::from(*key),
                             value: revert_to_slot.to_previous_value(),
                         }
                     })

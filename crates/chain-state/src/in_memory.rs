@@ -515,6 +515,13 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
         self.inner.canon_state_notification_sender.subscribe()
     }
 
+    /// N42: the number of canonical notifications the broadcast channel still
+    /// holds because at least one receiver has not read them (tokio keeps a value
+    /// until its slowest receiver has seen it).
+    pub fn canon_notification_backlog(&self) -> usize {
+        self.inner.canon_state_notification_sender.len()
+    }
+
     /// Subscribe to new safe block events.
     pub fn subscribe_safe_block(&self) -> watch::Receiver<Option<SealedHeader<N::BlockHeader>>> {
         self.inner.chain_info_tracker.subscribe_safe_block()

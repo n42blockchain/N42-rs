@@ -20,6 +20,10 @@ pub use preserved_sparse_trie::*;
 mod chain_info;
 pub use chain_info::ChainInfoTracker;
 
+// N42: canonical notification receivers whose lag is visible.
+mod canon_lag;
+pub use canon_lag::watched_notifications;
+
 mod notifications;
 pub use notifications::{
     CanonStateNotification, CanonStateNotificationSender, CanonStateNotificationStream,

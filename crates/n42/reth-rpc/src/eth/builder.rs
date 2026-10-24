@@ -488,7 +488,11 @@ where
         });
         let fee_history_cache =
             FeeHistoryCache::<HeaderTy<N::Primitives>>::new(fee_history_cache_config);
-        let new_canonical_blocks = provider.canonical_state_stream();
+        // N42: the same stream, with its receiver's lag reported.
+        let new_canonical_blocks = reth_chain_state::watched_notifications(
+            "eth_cache_n42",
+            provider.subscribe_to_canonical_state(),
+        );
         let fhc = fee_history_cache.clone();
         let cache = eth_cache.clone();
         task_spawner.spawn_critical(

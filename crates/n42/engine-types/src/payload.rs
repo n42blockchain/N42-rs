@@ -5757,7 +5757,14 @@ where
             payload_builder,
         );
         let (payload_service, payload_service_handle) =
-            PayloadBuilderService::new(payload_generator, ctx.provider().canonical_state_stream());
+            PayloadBuilderService::new(
+                payload_generator,
+                // N42: the same stream, with its receiver's lag reported.
+                crate::canon_lag::watched_notifications(
+                    "payload_service",
+                    ctx.provider().subscribe_to_canonical_state(),
+                ),
+            );
 
         ctx.task_executor()
             .spawn_critical_task("payload builder service", Box::pin(payload_service));

@@ -6490,3 +6490,48 @@ road frames) then falls with the lag, and with it the page-cache pressure
 that cost the slow legs 1-3% (10.221). Stage fh: two pairs, controls with
 both `_INLINE=1` knobs (= X21's path) against the offload with two freeing
 threads.
+
+## 10.227 -- 5.168M tx/s twice: the pruner's frees off its thread (stage fh, 2026-10-24) -- X22 adopted
+
+Stage fh measured bench commit a45c84ab2 (the retired road frames' `txs`
+into the wake's `PruneGarbage`, the whole-feed items to `free_later`
+after the prune line, the lean feed off) in two pairs on the 600M replay
+set, X21 otherwise. The controls force both drops inline
+(`N42_ROAD_RETIRE_INLINE=1 N42_PRUNE_FREE_INLINE=1`); the candidates run
+the offload with `N42_QUEUE_FREE_THREADS=2`:
+
+| leg | config | drain M tx/s | gap ms | heap peak GB | lag_blocks max | own-hold warnings | prune wakes | pruner CPU s | freeing CPU s |
+|---|---|---|---|---|---|---|---|---|---|
+| LCa | inline | 4.669 | 42.8 | 77 | 128 | 1,997 | 41 | 96.3 | 11.3 |
+| LC1 | offload, 2 freeing threads | **5.168** | **38.7** | **24** | 4 | 0 | 486 | 39.0 | 90.3 + 14.9 |
+| LCb | inline | 4.556 | 43.9 | 88 | 161 | 1,967 | 36 | 97.3 | 10.1 |
+| LC1b | offload, 2 freeing threads | **5.168** | **38.7** | **24** | 4 | 0 | 453 | 39.3 | 21.0 + 92.6 |
+
+Both pairs won by 10.7-13.4%, and both candidate legs read **5.168M tx/s
+with a mean seal-to-seal gap of 38.7 ms -- the first legs past the 5M
+target** (the X21 band was 4.95-5.10 over 17 legs, record 5.104). What
+changed inside: the pruner wakes once every ~4 blocks instead of once
+every 60-170, its lag stays at 0-4 blocks for the whole leg, the "own
+block was still held when the bound was reached" warning never fires,
+the heap sits flat at 20-24 GB from +30 s to the end (the bodies, the
+pooled copies and the road frames now die within a few blocks), and the
+pruner thread's CPU falls from 96 to 39 s a leg while the freeing threads
+take 105-114 s between them -- the frees were the pruner's missing 90%.
+The inline controls read below the X21 band (4.56-4.67) because X21's
+`free_later` already offloaded the whole items when its four-deep
+channel had room; forcing them inline is the pure worst case, so the
+gain over X21 proper is the +1.2-4.4% from the record band, not the 11-13%
+over these controls.
+
+The remaining pruner CPU is the pair collection (`collect_us` 17-18 s a
+leg, the zip over 200k envelopes a block) and the by-hash forget
+(`forget_us` 7 s); at 39 s a leg (~27% of one core) it is no longer near
+saturation. One freeing thread carries most of the garbage (the channels
+are offered in turn and the next tried when one is full): 90 s of CPU
+over the 90 s of windows, i.e. that thread runs flat out; a third thread
+is the obvious headroom and stage fi measures 2 against 3.
+
+**X22 = X21 + a45c84ab2 defaults (retired frames and whole items freed off
+the pruner thread, lean feed off) + `N42_QUEUE_FREE_THREADS=2`, adopted
+2026-10-24.** Stage fi confirms it with two more pairs (2 vs 3 freeing
+threads) before the port to main.

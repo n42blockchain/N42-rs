@@ -23,13 +23,18 @@
 //!   whole batch. The `sync_all` itself is unchanged: what is durable when is
 //!   what it was.
 //! * `N42_SF_DROP_CACHE=1`: after a segment's commit (or `sync_all`) has synced
-//!   its files, the data file's, the offsets file's (`.off`) and the changeset
-//!   offsets sidecar's (`.csoff`) page-cache pages are released
-//!   (`posix_fadvise(POSIX_FADV_DONTNEED)`). The segments are appended at
-//!   ~1.4 GB/s and nothing reads them back during a run, so their clean pages
-//!   otherwise fill the page cache and push out the QMDB entry-file pages a
-//!   block does read. Durability and the files' bytes are unchanged; a later
-//!   read just comes from the device.
+//!   its files, the data file's page-cache pages written since the last release
+//!   are released (`posix_fadvise(POSIX_FADV_DONTNEED)`), all but its last
+//!   `N42_SF_DROP_CACHE_KEEP_MB` (default 256) MB, which the readers of recent
+//!   rows (the queue pruner's canonical path, a follower's body fetch) still
+//!   find cached. Only the data file: the offsets file (`.off`) and the
+//!   changeset offsets sidecar (`.csoff`) are kept. The segments are appended
+//!   at ~1.4 GB/s and nothing reads the older rows back during a run, so their
+//!   clean pages otherwise fill the page cache and push out the QMDB
+//!   entry-file pages a block does read. Each commit releases only the range
+//!   it added (a whole-file advice walks the file's page tree, 12M pages on a
+//!   49 GB transactions file, at every commit). Durability and the files'
+//!   bytes are unchanged; a later read just comes from the device.
 
 use super::StaticFileProviderRWRefMut;
 use alloy_primitives::TxNumber;
@@ -70,26 +75,87 @@ pub(crate) fn drop_cache() -> bool {
     })
 }
 
-/// Releases the page-cache pages of a segment's data file at `data_path`, under
-/// `N42_SF_DROP_CACHE=1` (off by default). Only the data file: its offsets file (`.off`) and
-/// changeset offsets sidecar (`.csoff`) are what readers index the data by, and dropping them
-/// made every read fault them back in (1,200 index faults in 30 s on loop351 leg LP2), while the
-/// data file is written and rarely read. Call it only after the file was synced: clean pages are
-/// dropped, dirty ones are left by the kernel. Best effort, every error is ignored; a no-op when
-/// the switch is off and off Linux.
-pub(super) fn drop_cache_after_commit(data_path: &Path) {
+/// `N42_SF_DROP_CACHE_KEEP_MB` (default 256), read once: the tail of a data file, in bytes,
+/// whose pages [`drop_cache_after_commit`] leaves cached.
+fn drop_cache_keep() -> u64 {
+    static KEEP: OnceLock<u64> = OnceLock::new();
+    *KEEP.get_or_init(|| {
+        let mb = std::env::var("N42_SF_DROP_CACHE_KEEP_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(256);
+        mb.saturating_mul(1 << 20)
+    })
+}
+
+/// The byte range of a data file of `len` bytes that a release covers, given the bytes already
+/// released (`dropped_upto`, lowered first to `len` if the file was truncated below it) and the
+/// tail left cached (`keep`): `[dropped_upto, len - keep)`, `None` when empty. Updates
+/// `dropped_upto` to the range's end.
+fn drop_range(len: u64, keep: u64, dropped_upto: &mut u64) -> Option<(u64, u64)> {
+    if *dropped_upto > len {
+        *dropped_upto = len;
+    }
+    let end = len.saturating_sub(keep);
+    if end <= *dropped_upto {
+        return None;
+    }
+    let start = *dropped_upto;
+    *dropped_upto = end;
+    Some((start, end - start))
+}
+
+/// Releases the page-cache pages of a segment's data file at `data_path` written since the last
+/// release, under `N42_SF_DROP_CACHE=1` (off by default): the range `[dropped_upto, len - keep)`
+/// with `len` the file's length now and `keep` [`drop_cache_keep`], after which `dropped_upto` is
+/// that range's end. The caller keeps `dropped_upto` per file and resets it to 0 when it opens
+/// another file. Only the data file: its offsets file (`.off`) and changeset offsets sidecar
+/// (`.csoff`) are what readers index the data by, and dropping them made every read fault them
+/// back in (1,200 index faults in 30 s on loop351 leg LP2), while the data file is written and
+/// rarely read. Call it only after the file was synced: clean pages are dropped, dirty ones are
+/// left by the kernel. Best effort, every error is ignored; a no-op when the switch is off and
+/// off Linux.
+pub(super) fn drop_cache_after_commit(data_path: &Path, dropped_upto: &mut u64) {
     if !drop_cache() {
         return;
     }
     #[cfg(target_os = "linux")]
-    if let Ok(file) = std::fs::File::open(data_path) {
+    if let Ok(file) = std::fs::File::open(data_path)
+        && let Ok(meta) = file.metadata()
+        && let Some((offset, len)) = drop_range(meta.len(), drop_cache_keep(), dropped_upto)
+    {
         use std::os::fd::AsRawFd;
+        let (Ok(offset), Ok(len)) = (libc::off_t::try_from(offset), libc::off_t::try_from(len))
+        else {
+            return;
+        };
         // SAFETY: the descriptor is open for the duration of the call, and the advice only
         // drops clean cached pages of this file; its contents are unaffected.
-        let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        let _ = unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_DONTNEED)
+        };
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = data_path;
+    let _ = (data_path, dropped_upto);
+}
+
+#[cfg(test)]
+mod drop_range_tests {
+    use super::drop_range;
+
+    #[test]
+    fn a_release_covers_only_what_was_added_past_the_kept_tail() {
+        let mut upto = 0;
+        assert_eq!(drop_range(100, 256, &mut upto), None, "the kept tail");
+        assert_eq!(drop_range(1_000, 256, &mut upto), Some((0, 744)));
+        assert_eq!(upto, 744);
+        assert_eq!(drop_range(1_000, 256, &mut upto), None, "nothing added");
+        assert_eq!(drop_range(1_500, 256, &mut upto), Some((744, 500)));
+        // Truncated below what was released, then grown again.
+        assert_eq!(drop_range(600, 256, &mut upto), None);
+        assert_eq!(upto, 600);
+        assert_eq!(drop_range(2_000, 256, &mut upto), Some((600, 1_144)));
+    }
 }
 
 /// `N42_SF_BULK_APPEND=1`, read once: an encoded chunk is appended to the data file in one

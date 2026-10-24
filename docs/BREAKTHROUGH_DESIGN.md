@@ -6268,3 +6268,57 @@ the live heap every 32 GiB allocated) and
 dump nearest the heap's peak. The validators and the flood come from the
 same build directory; `F7_SKIP_STALE_CHECK=1` because the freshness check
 compares the validator binary with the source tree, not with this build.
+
+## 10.223 -- the heap profile: the live bytes are whole block bodies, two copies of every transaction; the holder is a canonical-notification receiver (stage fb, 2026-10-24)
+
+Stage fb ran WARM + one X21 leg (LXp) on the `profiling` build of the
+same tree with `--features n42/jemalloc-prof` (built incrementally in
+`target/profiling-build` in 17 min, paused for nobody) and
+`MALLOC_CONF=…,prof:true,prof_active:true,lg_prof_interval:35`. The leg
+read 4.884M/s (gap 41.0; the profiling build and the sampling cost it
+~2%), the heap reproduced (allocated 84-87 GB at +80-90 s), and jemalloc
+wrote a dump every ~1 s: the node allocates ~32 GiB a second.
+
+`jeprof --text --lines` on the dump at the heap's peak (87.8 GB live):
+
+| live GB at peak | growth since +10 s | allocation site |
+| --- | --- | --- |
+| 31.4 | +25 | `make_keyed_on` closure, `parallel_transfer.rs:1800`: the build's `(key, (tx, (sender, (tip, hash))))` vectors, one per block |
+| 29.6 | +25 | `tx_ingest::admit_decoded` (`tx-ingest/src/lib.rs:1699`) → `tx_queue::push_frame` (`tx-queue/src/lib.rs:2633`) → `valid_for` (1822): the decoded pooled transactions; of it 9.4 GB `decode_frame` → `alt_sig::typed_decode` and 7.0 GB `shared_key_and_signature` |
+| 4.5 | | `execute_for_build_opts` closures (`parallel_transfer.rs`): the batch state |
+| 3.7 | | `BatchState::with_capacity` (`batch_state.rs:140`) |
+| 3.5 | | `twig_core::prefault` (`prefault.rs:231/315`): the QMDB prefault pool, constant |
+| 2.7 | | `push_frame` / `road_admit` (`tx-queue/src/lib.rs:2641/2682`) |
+
+So the ~60 GB that grows is **transactions, twice**: the pooled objects
+the ingest decoded and the keyed consensus copies the build made from
+them, i.e. the bodies of full blocks, at ~250 MB a block (two copies of
+200,000 transactions at ~600 B each). At the +88 s peak that is ~250
+blocks' worth. Allocation sites say who made the bytes, not who keeps
+them; what keeps whole block bodies for hundreds of blocks and lets them
+go at once is the pattern of a `tokio::sync::broadcast` receiver that
+lags: the canonical-state notifications
+(`CANON_STATE_NOTIFICATION_CHANNEL_SIZE` = 256) carry the committed
+blocks with their bodies, tokio keeps a value until the slowest receiver
+has read it, and a receiver that lags up to 255 blocks is silent (only a
+lag past the capacity returns `Lagged`). The cap explains the 72-80 GB
+plateau of LV2 and LWb (256 blocks × ~250 MB plus the baseline), the
+bulk frees explain a receiver catching up, and the drain to 13 GB within
+seconds of the flood ending is every receiver catching up on thin blocks.
+
+Two receivers are already instrumented with a `rx.len() > 8` warning
+("queue pruner" at main.rs:703, "txpool maintenance" at node.rs:415) and
+never fired in any leg; the QMDB follower has its own. The receivers that
+are not: the payload service's stream (`payload.rs:5935`), the RPC cache
+feeders (`node/builder/src/rpc.rs:1161` and `reth-rpc/src/eth/builder.rs:491`),
+the BAL prewarm, the head tracker (main.rs:791) and the leader-layers loop
+(main.rs:440). The queue pruner's own thread is fed by an unbounded
+`std::sync::mpsc` of whole notifications (`queue_prune.rs:314`), but its
+`prune_wait_ms` of 0.7-1.0 s bounds that backlog at ~25 blocks (~6 GB).
+
+Next: an additive diagnostic (the sender's `len()` logged every 5 s and
+exported as `n42_canon_notification_backlog`; a named lag warning on every
+remaining receiver), one X21 leg, and then the fix on the receiver it
+names -- most likely taking what that receiver needs from the
+notification and dropping the rest at once, or moving its work off the
+stream so the slot is released within a block.

@@ -1594,8 +1594,14 @@ impl QmdbForest {
     /// common ancestor, re-applies down.
     fn move_to(&mut self, target: B256) -> Result<(), StateError> {
         self.refuse_leased()?;
-        if let Some((_, undo)) = self.pending.take() {
-            self.tree.apply_undo(&undo).map_err(|e| StateError::Undo(e.to_string()))?;
+        if let Some((parent, undo)) = self.pending.take() {
+            if let Err(err) = self.tree.apply_undo(&undo) {
+                // A refused undo left the pending block applied: it stays
+                // pending (a failure part way poisons the forest).
+                let err = self.undo_failed(&format!("reverting the pending block on {parent}"), err);
+                self.pending = Some((parent, undo));
+                return Err(err);
+            }
             self.note_move(&undo);
         }
         if self.tip == target {
@@ -1619,6 +1625,8 @@ impl QmdbForest {
             })?;
 
         // Revert, newest first, until the tree stands at the common ancestor.
+        // `tip` follows every step, so a failure leaves it naming the block
+        // the tree stands at.
         for hash in up_from_tip.iter().take_while(|hash| **hash != common) {
             let record = self
                 .records
@@ -1628,11 +1636,22 @@ impl QmdbForest {
                 .undo
                 .take()
                 .ok_or(StateError::NotApplied(*hash))?;
-            record.offsets = None;
-            self.tree
-                .apply_undo(&undo)
-                .map_err(|e| StateError::Undo(e.to_string()))?;
+            let offsets = record.offsets.take();
+            let parent = record.parent;
+            if let Err(err) = self.tree.apply_undo(&undo) {
+                // A refused undo left the block applied: it keeps its undo
+                // (and its offsets), and the tree stands at it. A failure
+                // part way poisons the forest.
+                let err = self.undo_failed(&format!("reverting block {hash}"), err);
+                if let Some(record) = self.records.get_mut(hash) {
+                    record.undo = Some(undo);
+                    record.offsets = offsets;
+                }
+                self.tip = *hash;
+                return Err(err);
+            }
             self.note_move(&undo);
+            self.tip = parent;
         }
         self.tip = common;
 
@@ -1650,10 +1669,23 @@ impl QmdbForest {
                 .get(hash)
                 .ok_or(StateError::UnknownBlock(*hash))?;
             let expected = record.root;
-            let (root, undo) = self.tree.apply_ops_recorded(&record.ops)?;
+            let ops = Arc::clone(&record.ops);
+            let (root, undo) = match self.tree.apply_ops_recorded(&ops) {
+                Ok(applied) => applied,
+                Err(err) => return Err(self.poison_if_mutated(&format!("re-applying block {hash}"), err.into())),
+            };
             self.note_move(&undo);
             let root = B256::from(root);
             if root != expected {
+                // The mismatched block is taken off again, so the tree stands
+                // at `tip` as the forest says; if that fails, nothing the
+                // tree computes can be trusted.
+                match self.tree.apply_undo(&undo) {
+                    Ok(()) => self.note_move(&undo),
+                    Err(err) => self.poison(format!(
+                        "re-applying block {hash} gave root {root}, expected {expected}, and its undo failed: {err}"
+                    )),
+                }
                 return Err(StateError::Replay {
                     block: *hash,
                     expected,
@@ -2527,5 +2559,26 @@ mod tests {
         fresh.apply(GENESIS, h(1), 1, &accounts(1, 8)).unwrap();
         assert_eq!(fresh.compute_operations(h(1), accounts(2, 8).ops()).unwrap().root, root);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A replay that lands on another root than the block had is taken off
+    /// again: the tree stands at the forest's tip, and the next root on it is
+    /// the one a fresh tree computes.
+    #[test]
+    fn a_replay_mismatch_leaves_the_tree_at_the_tip() {
+        let mut forest = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap();
+        forest.apply(GENESIS, h(1), 1, &accounts(1, 8)).unwrap();
+        forest.apply(h(1), h(2), 2, &accounts(2, 8)).unwrap();
+        // A sibling of block 2 moves the tree off it.
+        forest.apply(h(1), h(9), 2, &accounts(9, 8)).unwrap();
+        forest.records.get_mut(&h(2)).unwrap().root = B256::repeat_byte(0xEE);
+        let moved = forest.compute_operations(h(2), accounts(3, 4).ops());
+        assert!(matches!(moved, Err(StateError::Replay { .. })), "{moved:?}");
+        assert_eq!(forest.tip(), h(1));
+        assert!(forest.poisoned().is_none());
+        let root = forest.compute_operations(h(1), accounts(4, 4).ops()).unwrap().root;
+        let mut fresh = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap();
+        fresh.apply(GENESIS, h(1), 1, &accounts(1, 8)).unwrap();
+        assert_eq!(fresh.compute_operations(h(1), accounts(4, 4).ops()).unwrap().root, root);
     }
 }

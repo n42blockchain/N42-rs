@@ -1478,33 +1478,40 @@ impl ConsensusEngine {
         // For Decide we know the exact changes_hash from the message; for others
         // we fall back to ZERO since the proposal is not yet cached on this
         // far-behind node (acceptable: the next regular proposal will retry).
+        // Every arm resolves the set authorized for the QC's exact view and
+        // refuses the jump when it is unknown, never a guessed set.
         let verify_result = if already_verified {
             Ok(())
         } else {
             match msg {
-                ConsensusMessage::Decide(decide) => super::quorum::verify_commit_qc_with_profile(
-                    qc,
-                    self.validator_set_for_view(qc.view),
-                    &decide.validator_changes_hash,
-                    self.signing_profile,
-                ),
-                ConsensusMessage::PrepareQC(_) => super::quorum::verify_qc_with_profile(
-                    qc,
-                    self.validator_set_for_view(qc.view),
-                    self.signing_profile,
-                ),
+                ConsensusMessage::Decide(decide) => {
+                    self.resolve_qc_validator_set(qc).and_then(|set| {
+                        super::quorum::verify_commit_qc_with_profile(
+                            qc,
+                            set,
+                            &decide.validator_changes_hash,
+                            self.signing_profile,
+                        )
+                    })
+                }
+                ConsensusMessage::PrepareQC(_) => {
+                    self.resolve_qc_validator_set(qc).and_then(|set| {
+                        super::quorum::verify_qc_with_profile(qc, set, self.signing_profile)
+                    })
+                }
                 ConsensusMessage::Proposal(_)
                 | ConsensusMessage::Timeout(_)
                 | ConsensusMessage::NewView(_) => self.verify_qc_any_domain_or_known(qc),
                 ConsensusMessage::Vote(_) | ConsensusMessage::CommitVote(_) => return Ok(false),
             }
         };
-        if verify_result.is_err() {
+        if let Err(error) = verify_result {
             tracing::debug!(target: "n42::cl::engine",
                 current_view,
                 msg_view,
                 qc_view = qc.view,
-                "QC view jump failed: invalid QC signature"
+                %error,
+                "QC view jump failed: QC does not verify against its view's validator set"
             );
             return Ok(false);
         }
@@ -5623,6 +5630,52 @@ mod tests {
         assert_eq!(new_view.timeout_cert.view, timeout_view);
         crate::protocol::quorum::verify_tc(&new_view.timeout_cert, engine.validator_set())
             .expect("future recovery must produce a cryptographically valid TC");
+    }
+
+    #[test]
+    fn test_view_jump_and_new_view_tc_refuse_an_unknown_epoch_set() {
+        use crate::protocol::quorum::TimeoutCollector;
+        use n42_h2_primitives::consensus::{NewView, PrepareQC};
+
+        // Epoch 1 begins at view 3 and no next set is staged. The current
+        // set would verify these certificates by coincidence; the strict
+        // resolver refuses them.
+        let (mut engine, sks, vs, _rx) = make_engine(4, 0);
+        engine.epoch_manager = EpochManager::with_epoch_length(vs.clone(), 2);
+
+        let block_hash = B256::repeat_byte(0x3C);
+        let qc = build_test_prepare_qc(3, block_hash, &sks, &vs, &[0, 1, 2]);
+        let _ = engine.process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(
+            PrepareQC { view: 3, block_hash, qc },
+        )));
+        assert_eq!(engine.current_view(), 1, "no view jump on a QC of an unknown epoch");
+
+        let profile = engine.signing_profile;
+        let mut collector = TimeoutCollector::new(3, vs.len());
+        for sender in [0u32, 1, 2] {
+            collector
+                .add_timeout(
+                    sender,
+                    profile.sign(&sks[sender as usize], &profile.timeout_message(3)),
+                    QuorumCertificate::genesis(),
+                )
+                .expect("distinct senders");
+        }
+        let timeout_cert = collector.build_tc_with_profile(&vs, profile).expect("a valid TC");
+        let leader = engine.leader_index_for_view(4);
+        let new_view = NewView {
+            view: 4,
+            timeout_cert,
+            leader,
+            signature: profile.sign(&sks[leader as usize], &profile.new_view_message(4)),
+        };
+        let result =
+            engine.process_event(ConsensusEvent::Message(ConsensusMessage::NewView(new_view)));
+        assert!(
+            matches!(result, Err(ConsensusError::InvalidTC { view: 3, .. })),
+            "{result:?}"
+        );
+        assert_eq!(engine.current_view(), 1, "no advance on a TC of an unknown epoch");
     }
 
     #[test]

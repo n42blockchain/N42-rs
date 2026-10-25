@@ -440,11 +440,19 @@ impl ConsensusEngine {
                 ),
             });
         }
-        super::quorum::verify_tc_with_profile(
-            &nv.timeout_cert,
-            self.validator_set_for_view(nv.timeout_cert.view),
-            self.signing_profile,
-        )?;
+        // The TC is checked against the set authorized for its exact view,
+        // never a guessed one: at an unstaged epoch boundary the current set
+        // would accept or refuse it only by coincidence.
+        let Some(tc_set) = self
+            .epoch_manager
+            .known_validator_set_for_view(nv.timeout_cert.view)
+        else {
+            return Err(ConsensusError::InvalidTC {
+                view: nv.timeout_cert.view,
+                reason: "validator set unavailable for certificate view".into(),
+            });
+        };
+        super::quorum::verify_tc_with_profile(&nv.timeout_cert, tc_set, self.signing_profile)?;
 
         // Verify TC's high_qc signature to prevent injection of forged QCs.
         self.verify_embedded_qc(&nv.timeout_cert.high_qc)?;

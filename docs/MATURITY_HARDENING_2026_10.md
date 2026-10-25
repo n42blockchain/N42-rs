@@ -63,7 +63,10 @@ Decisions behind the fixes:
   change for later.
 - **0x50 sender.** For an Ed25519 transaction the sender is `keccak(alg‖pubkey)`, one hash;
   it is now always derived, in every ingest mode, and a wire claim that disagrees drops the
-  transaction. Cache readers re-check the hit against the derived sender.
+  transaction. The earlier read-side re-checks in the follower and the engine validator were
+  removed as dead code: the guard is the derivation at insert plus the loopback-only bind of
+  the trusting modes, and the 0x50 *signature* is still unchecked in `shard`/`leader` mode,
+  which is why those modes now need `N42_BENCH_UNSAFE=1` at start-up.
 - **Loopback by default.** The raw payload channel and the ingest refuse a non-loopback
   bind unless `*_ALLOW_REMOTE=1`; with `N42_TX_INGEST_DIRECT`, `N42_INGEST_VERIFY=shard|leader`
   or attested frames they refuse it outright. The fleet (seven nodes on one box, all

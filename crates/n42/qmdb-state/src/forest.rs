@@ -2310,7 +2310,8 @@ mod tests {
             assert_eq!(*key, op.key);
             match (offset, &op.value) {
                 (Some(offset), Some(value)) => {
-                    let (k, v) = view.record(*offset);
+                    // SAFETY: a flushed record of this forest's file, not cut.
+                    let (k, v) = unsafe { view.record(*offset) };
                     assert_eq!((k, v), (op.key, value.as_slice()));
                 }
                 (None, None) => {}
@@ -2322,7 +2323,8 @@ mod tests {
         let live = forest.live_entry_offsets().unwrap();
         assert!(!live.is_empty());
         for (key, offset) in live {
-            assert_eq!(view.key(offset), key);
+            // SAFETY: a flushed record of this forest's file, not cut.
+            assert_eq!(unsafe { view.key(offset) }, key);
         }
     }
 
@@ -2356,7 +2358,10 @@ mod tests {
             for ((key, offset), op) in listed.iter().zip(&ops) {
                 assert_eq!(*key, op.key);
                 match (offset, &op.value) {
-                    (Some(offset), Some(value)) => assert_eq!(view.record(*offset), (op.key, value.as_slice())),
+                    // SAFETY: a flushed record of this forest's file, not cut.
+                    (Some(offset), Some(value)) => {
+                        assert_eq!(unsafe { view.record(*offset) }, (op.key, value.as_slice()))
+                    }
                     other => panic!("mismatched change {other:?}"),
                 }
             }

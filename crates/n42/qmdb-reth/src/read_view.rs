@@ -397,7 +397,13 @@ impl QmdbReadView {
         };
         let changes: Vec<(Hash, Option<u64>)> = live.into_iter().map(|(key, offset)| (key, Some(offset))).collect();
         let index = SharedOffsetIndex::default();
-        index.apply_sorted(&changes, |offset| file.key(offset)).map_err(|e| std::io::Error::other(e.to_string()))?;
+        // SAFETY: every offset here is a live record of the tree at `head`,
+        // flushed before the call (the caller's contract), and the tree tells
+        // this view before it cuts the file; the index only reads the keys of
+        // offsets it was given.
+        index
+            .apply_sorted(&changes, |offset| unsafe { file.key(offset) })
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         let versions =
             Versions { valid: true, head, head_floor: floor, journals: VecDeque::new(), pending: None, held_from: None };
         let frozen = versions.frozen();
@@ -491,9 +497,13 @@ impl QmdbReadView {
         };
         let offset = match undone {
             Some(offset) => offset,
-            None => self.index.get(key, |offset| self.file.key(offset)),
+            // SAFETY: the index holds offsets of records written at or below
+            // the view's head, and the tree tells the view (`before_truncate`)
+            // before it cuts any of them.
+            None => self.index.get(key, |offset| unsafe { self.file.key(offset) }),
         };
-        Some(offset.map(|offset| decode(self.file.record(offset).1)))
+        // SAFETY: an offset from the index or a journal, as above.
+        Some(offset.map(|offset| decode(unsafe { self.file.record(offset) }.1)))
     }
 
     /// An account as of block `at` (see [`Self::read_at`]). A record that does
@@ -591,7 +601,9 @@ impl QmdbReadView {
                 return;
             }
         }
-        let key_at = |offset: u64| self.file.key(offset);
+        // SAFETY: the index holds offsets of written records the tree has not
+        // cut: a cut tells the view first and waits on `advancing`, held here.
+        let key_at = |offset: u64| unsafe { self.file.key(offset) };
         let journal: Vec<(Hash, Option<u64>)> =
             changes.par_iter().with_min_len(1024).map(|(key, _)| (*key, self.index.get(key, key_at))).collect();
         let journal = Arc::new(JournalData::new(journal, self.filter_journals.load(Ordering::Relaxed)));
@@ -674,7 +686,9 @@ impl QmdbReadView {
         if depth > versions.journals.len() {
             return false;
         }
-        let key_at = |offset: u64| self.file.key(offset);
+        // SAFETY: the index and the journals hold offsets of records written at
+        // or below the head being stepped back from, not yet cut.
+        let key_at = |offset: u64| unsafe { self.file.key(offset) };
         let from = versions.head.0;
         for _ in 0..depth {
             let step = versions.journals.pop_back().expect("depth checked against the journals");
@@ -1134,7 +1148,10 @@ mod tests {
                 let read = |a: &Address| matches!(view.account(a, at), Some(Some(_)));
                 let raw = |a: &Address| {
                     let key = gov5_account_key(&a.0 .0);
-                    view.index.get(&key, |o| view.file.key(o)).is_some_and(|o| decode_account(view.file.record(o).1).is_some())
+                    // SAFETY: offsets of the built view's own flushed records.
+                    view.index
+                        .get(&key, |o| unsafe { view.file.key(o) })
+                        .is_some_and(|o| decode_account(unsafe { view.file.record(o) }.1).is_some())
                 };
                 let cold = time(threads, &read, first);
                 let warm = time(threads, &read, second);

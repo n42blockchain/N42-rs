@@ -803,6 +803,17 @@ async fn wait_at_gate(
     }
 }
 
+/// Whether the peer behind `stream` has closed: waits until the stream has
+/// bytes (`false`, nothing consumed) or reaches end-of-stream (`true`).
+/// Cancel-safe: `fill_buf` keeps what it read in the buffer.
+async fn peer_closed<R>(stream: &mut tokio::io::BufReader<R>) -> std::io::Result<bool>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt as _;
+    Ok(stream.fill_buf().await?.is_empty())
+}
+
 /// How long this waiter may sleep before it must look again: the time left
 /// to the next deadline, or `None` when there is none and the watcher's
 /// notification is the only thing to wait for.
@@ -1505,13 +1516,36 @@ where
         // blocks would otherwise hold every connection for the rest of the
         // round.
         let frame_read = std::time::Instant::now();
-        let (GateExit::Open(at_gate) | GateExit::ForBlock(at_gate) | GateExit::Forced(at_gate)) =
-            wait_at_gate(
-                || gate_view(&pool, setup.queue.as_ref(), &head, gate, allowance),
-                block_pending_now,
-                gate_max_wait(),
-            )
-            .await;
+        let gated = wait_at_gate(
+            || gate_view(&pool, setup.queue.as_ref(), &head, gate, allowance),
+            block_pending_now,
+            gate_max_wait(),
+        );
+        tokio::pin!(gated);
+        // While the frame waits at a shut gate, a peer that closes ends the
+        // connection here and frees its slot of MAX_CONNECTIONS: a generator
+        // that times out and reconnects leaves its old socket behind, and
+        // with `N42_TX_INGEST_GATE_MAX_WAIT_MS=0` a few stall cycles of those
+        // filled every slot (R4). `biased`: an open gate answers on its first
+        // poll and the socket is never looked at, so the open path is as
+        // before. Not in the unbuffered mode, where a zero-capacity
+        // `fill_buf` reads as end-of-stream.
+        let (GateExit::Open(at_gate) | GateExit::ForBlock(at_gate) | GateExit::Forced(at_gate)) = if capacity == 0 {
+            gated.await
+        } else {
+            tokio::select! {
+                biased;
+                exit = &mut gated => exit,
+                closed = peer_closed(&mut stream) => {
+                    if closed? {
+                        debug!(target: "n42.tx_ingest", "peer closed while its frame waited at the gate");
+                        return Ok(());
+                    }
+                    // The next frame is already here; only the gate is left.
+                    gated.await
+                }
+            }
+        };
         STATS.gate_ns.fetch_add(at_gate.as_nanos() as u64, Ordering::Relaxed);
         if asynchronous {
             let pending = u32::try_from(queue_depth(&pool, setup.queue.as_ref())).unwrap_or(u32::MAX);
@@ -2670,6 +2704,20 @@ mod tests {
                 .is_some_and(|refusal| refusal.contains("N42_PAYLOAD_SERVE_ALLOW_REMOTE=1")));
             assert_eq!(remote_bind_refusal("N42_PAYLOAD_SERVE", &remote, true), None);
         }
+    }
+
+    /// R4: a peer that closes while its frame is gated is seen without
+    /// consuming anything, and one with bytes waiting is not taken for closed.
+    #[tokio::test]
+    async fn a_closed_peer_is_seen_without_consuming_its_bytes() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(reader);
+        writer.write_all(&[7]).await.expect("writes");
+        assert!(!peer_closed(&mut reader).await.expect("reads"), "bytes waiting");
+        assert_eq!(reader.read_u8().await.expect("kept"), 7, "nothing consumed");
+        drop(writer);
+        assert!(peer_closed(&mut reader).await.expect("reads"), "closed");
     }
 
     /// A gate reading a test drives: `depth` against a fixed limit, exactly

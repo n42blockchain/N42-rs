@@ -307,6 +307,16 @@ pub fn raw_channel_timeout() -> std::time::Duration {
     })
 }
 
+static OWN_BLOCK_BY_HEADER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Whether the leader's own block goes to its execution layer as a sealed
+/// header (`N42_OWN_BLOCK_BY_HEADER`, on unless set to `0`; `0` sends the
+/// payload as before). Read once: it is consulted on every own-block import.
+fn own_block_by_header() -> bool {
+    *OWN_BLOCK_BY_HEADER
+        .get_or_init(|| std::env::var("N42_OWN_BLOCK_BY_HEADER").map_or(true, |v| v != "0"))
+}
+
 /// Runs one raw-channel exchange under [`raw_channel_timeout`]. An
 /// execution layer that stops answering mid-frame used to hold the
 /// channel's lock forever; on the deadline the exchange (and the stream it
@@ -1479,7 +1489,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         &self,
         header: &alloy_consensus::Header,
     ) -> Option<PayloadStatus> {
-        let by_header = std::env::var("N42_OWN_BLOCK_BY_HEADER").map_or(true, |v| v != "0");
+        let by_header = own_block_by_header();
         if !by_header {
             return None;
         }
@@ -1492,7 +1502,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         payload: ExecutionData,
     ) -> Result<PayloadStatus, ElError> {
         // `N42_OWN_BLOCK_BY_HEADER=0` sends the payload as before (the A-B).
-        let by_header = std::env::var("N42_OWN_BLOCK_BY_HEADER").map_or(true, |v| v != "0");
+        let by_header = own_block_by_header();
         if let (Some(header), true) = (header, by_header) {
             if let Some(status) = self.own_block_over_channel(header).await {
                 return Ok(status);

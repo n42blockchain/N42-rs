@@ -2542,6 +2542,11 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// for the *next* output rather than stopping when the channel runs dry.
     async fn drain_outputs(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
         let drain_at = std::time::Instant::now();
+        // A commit whose forkchoice failed is sent again once its backoff
+        // has passed (`ExecutionDriver::retry_failed_commit`).
+        for action in self.driver.retry_failed_commit().await {
+            self.apply_driver_action(action, events)?;
+        }
         self.consider_catch_up(events).await;
         self.import_ranges(events).await;
         for (peer, hash, channel) in std::mem::take(&mut self.pending_block_requests) {

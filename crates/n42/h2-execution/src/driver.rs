@@ -23,7 +23,7 @@ use alloy_rpc_types_engine::{
     ExecutionData, ForkchoiceState, PayloadAttributes, PayloadStatusEnum,
 };
 use n42_h2_consensus::{ConsensusEvent, EngineOutput};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     el::{BuiltBlock, ElError, ExecutionLayer, ForeignBody, ResolveKind},
@@ -793,6 +793,12 @@ pub struct ExecutionDriver<E> {
     /// The commit whose forkchoice is on the wire, if any. One at a time, so
     /// the engine never sees two out of order.
     commit_in_flight: Option<B256>,
+    /// The newest commit whose forkchoice failed (an error, not a verdict),
+    /// to be sent again: how many times it failed and when it is next due.
+    /// A later commit that lands makes it moot (it finalises its ancestors).
+    commit_retry: Option<CommitRetry>,
+    /// Commit forkchoices refused as Invalid since start (see `apply_commit`).
+    commits_refused: u64,
     /// The commit that goes next (see [`PendingCommit`]).
     commit_pending: Option<PendingCommit>,
     /// The order the driver first heard each block's commit in, so a commit
@@ -1021,6 +1027,8 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             payload_order: Vec::new(),
             commit_async: commit_fcu_async(),
             commit_in_flight: None,
+            commit_retry: None,
+            commits_refused: 0,
             commit_pending: None,
             commit_orders: HashMap::new(),
             commit_order_seen: std::collections::VecDeque::new(),
@@ -2846,7 +2854,9 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             self.pending_commits.insert(block_hash);
             return DriverAction::Ignored;
         }
-        self.finalized = block_hash;
+        // `finalized` moves only on the engine's Valid answer (`apply_commit`):
+        // a forkchoice that failed or was refused did not make the block
+        // canonical, and later forkchoices must not name it as finalised.
         if !self.imported.contains(&block_hash) {
             // The block has not reached this node: whatever the engine says
             // to this forkchoice, it runs again when the import lands.
@@ -3033,8 +3043,19 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 PayloadStatusEnum::Invalid { validation_error } => {
                     // A forkchoice the engine refused is not an execution
                     // verdict on the block (`Rejected` withdraws a block's
-                    // import evidence): logged, and the next commit moves on.
-                    warn!(target: "n42.h2.el", block = ?block_hash, %validation_error, "forkchoice to a committed block refused");
+                    // import evidence), but it is a quorum-certified block
+                    // the execution layer will not follow: consensus and the
+                    // execution layer have diverged. Said at error level and
+                    // counted; what the node does about it (stop voting) is
+                    // a policy decision not taken here.
+                    self.commits_refused = self.commits_refused.saturating_add(1);
+                    error!(
+                        target: "n42.h2.el",
+                        block = ?block_hash,
+                        %validation_error,
+                        refused = self.commits_refused,
+                        "forkchoice to a committed block refused: the execution layer diverges from consensus"
+                    );
                     Vec::new()
                 }
                 PayloadStatusEnum::Syncing => {
@@ -3050,7 +3071,13 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     self.pending_commits.insert(block_hash);
                     Vec::new()
                 }
-                _ => {
+                status => {
+                    if matches!(status, PayloadStatusEnum::Valid) {
+                        self.finalized = block_hash;
+                    }
+                    // A commit that landed finalises its ancestors, so a
+                    // failed one waiting to be sent again is moot.
+                    self.commit_retry = None;
                     let mut actions = Vec::with_capacity(skipped.len() + 1);
                     // The ancestors this forkchoice finalised on its way: no
                     // head of their own (the descendant is the head), but the
@@ -3067,10 +3094,58 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 }
             },
             Err(error) => {
-                warn!(target: "n42.h2.el", block = ?block_hash, %error, "forkchoice to a committed block failed");
+                // Not a verdict: the call failed. The commit stays pending
+                // and is sent again after a backoff (`retry_failed_commit`).
+                let attempts = match &self.commit_retry {
+                    Some(retry) if retry.block_hash == block_hash => retry.attempts.saturating_add(1),
+                    _ => 1,
+                };
+                let delay = commit_retry_delay(attempts);
+                if attempts >= COMMIT_RETRY_LOUD_AFTER {
+                    error!(target: "n42.h2.el", block = ?block_hash, %error, attempts, retry_in_ms = delay.as_millis() as u64, "forkchoice to a committed block keeps failing");
+                } else {
+                    warn!(target: "n42.h2.el", block = ?block_hash, %error, attempts, retry_in_ms = delay.as_millis() as u64, "forkchoice to a committed block failed; it is sent again");
+                }
+                self.commit_retry = Some(CommitRetry {
+                    block_hash,
+                    attempts,
+                    due: std::time::Instant::now() + delay,
+                });
                 Vec::new()
             }
         }
+    }
+
+    /// Sends again the commit whose forkchoice failed, once its backoff has
+    /// passed. Cheap when there is none or it is not due; the loop calls it
+    /// on every drain.
+    pub async fn retry_failed_commit(&mut self) -> Vec<DriverAction> {
+        let Some(retry) = &self.commit_retry else {
+            return Vec::new();
+        };
+        if std::time::Instant::now() < retry.due || self.commit_in_flight.is_some() {
+            return Vec::new();
+        }
+        let block_hash = retry.block_hash;
+        // Due: it is no longer waiting, whatever happens next (a new failure
+        // records it again with one more attempt).
+        let attempts = retry.attempts;
+        self.commit_retry = None;
+        debug!(target: "n42.h2.el", block = ?block_hash, attempts, "sending a failed commit forkchoice again");
+        match self.commit(block_hash).await {
+            DriverAction::Ignored => Vec::new(),
+            action => vec![action],
+        }
+    }
+
+    /// The failed commit waiting to be sent again, if any.
+    pub fn commit_retry_pending(&self) -> Option<B256> {
+        self.commit_retry.as_ref().map(|retry| retry.block_hash)
+    }
+
+    /// Commit forkchoices the execution layer refused (Invalid) since start.
+    pub const fn commits_refused(&self) -> u64 {
+        self.commits_refused
     }
 
     /// Drops what a committed block no longer needs: it will never be
@@ -3080,6 +3155,24 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.bodies.remove(&block_hash);
         self.payload_order.retain(|h| h != &block_hash);
     }
+}
+
+/// A commit whose forkchoice failed, waiting to be sent again.
+#[derive(Debug, Clone, Copy)]
+struct CommitRetry {
+    block_hash: B256,
+    attempts: u32,
+    due: std::time::Instant,
+}
+
+/// Failures after which a commit that keeps failing is logged at error.
+const COMMIT_RETRY_LOUD_AFTER: u32 = 5;
+
+/// The wait before sending a failed commit forkchoice again: 200 ms,
+/// doubling per attempt, at most 5 s.
+fn commit_retry_delay(attempts: u32) -> std::time::Duration {
+    let shift = attempts.saturating_sub(1).min(5);
+    std::time::Duration::from_millis((200u64 << shift).min(5_000))
 }
 
 /// A commit's forkchoice that is slow or not Valid is what leaves an

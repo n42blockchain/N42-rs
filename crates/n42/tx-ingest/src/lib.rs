@@ -1283,7 +1283,13 @@ where
     let mut failed_accepts = 0u64;
     loop {
         // A slot first: past MAX_CONNECTIONS the next connection waits in
-        // the listen backlog instead of being served.
+        // the listen backlog instead of being served. Known edge: a slot is
+        // held for the whole connection, also while its frame waits at the
+        // gate, and a client that gives up and reconnects meanwhile is not
+        // noticed until the gate lets the frame through. With the default
+        // gate wait that is a few generations of the flood's connections,
+        // far below the cap; with N42_TX_INGEST_GATE_MAX_WAIT_MS=0 repeated
+        // stalls could fill it until the gate reopens.
         let Ok(slot) = std::sync::Arc::clone(&slots).acquire_owned().await else {
             return Err(std::io::Error::other("the ingest's connection slots closed"));
         };
@@ -2369,9 +2375,11 @@ mod shard_tests {
         assert_eq!(frame_of(6, hashes, None, &recovered[..5]), None);
     }
 
-    /// A claiming frame in shard mode: exactly the transactions whose hash
-    /// is in this node's shard are verified; every other one is queued under
-    /// its claim, unverified, and the claim is what the sender cache records.
+    /// A claiming frame in shard mode with honest 0x50 claims: exactly the
+    /// transactions whose hash is in this node's shard are verified, every
+    /// other one is queued under its claim unverified, and the sender cache
+    /// records the sender either way. (A wrong 0x50 claim is dropped, and a
+    /// wrong Eth claim is taken as it stands: the two tests below.)
     #[test]
     fn a_frame_in_shard_mode_verifies_exactly_its_shard() {
         let _lock = crate::coverage_tests::counter_lock();
@@ -2429,6 +2437,35 @@ mod shard_tests {
             recover_frame::<NoopTransactionPool<N42PooledTransaction>>(4, doubled, Vec::new(), &[], None);
         assert!(frame.is_none(), "[a, b, c, c] is refused as a frame");
         assert_eq!(STATS.frames_duplicate.load(Ordering::Relaxed) - before, 1);
+    }
+
+    /// An Eth transaction under a wrong claim in shard mode: outside this
+    /// node's shard it is queued under the claim as it stands (the probe's
+    /// design: nothing can derive an Eth sender without the signature);
+    /// inside it, it is verified and comes out under its real sender.
+    #[test]
+    fn a_shard_mode_eth_claim_is_taken_outside_the_shard_and_verified_inside() {
+        let _lock = crate::coverage_tests::counter_lock();
+        let shard = (0u64, 2u64);
+        let bogus = Address::repeat_byte(0xdd);
+        let real = crate::coverage_tests::secp_address(5);
+        let pooled: Vec<N42PooledTxEnvelope> = (0..24u64).map(|n| crate::coverage_tests::eth_tx(5, 4_000 + n)).collect();
+        let mine: std::collections::HashMap<B256, bool> =
+            pooled.iter().map(|tx| (*tx.hash(), in_my_shard(tx.hash(), shard))).collect();
+        let owned = mine.values().filter(|m| **m).count();
+        assert!(owned > 0 && owned < 24, "a spread across shards: {owned}");
+        let out = recover_decoded_in::<NoopTransactionPool<N42PooledTransaction>>(
+            pooled,
+            vec![bogus; 24],
+            None,
+            Some(shard),
+            false,
+        );
+        assert_eq!(out.len(), 24);
+        for tx in &out {
+            let expected = if mine[tx.hash()] { real } else { bogus };
+            assert_eq!(tx.sender(), expected, "transaction {:?}", tx.hash());
+        }
     }
 
     /// A shard-mode frame whose 0x50 claims name someone other than the

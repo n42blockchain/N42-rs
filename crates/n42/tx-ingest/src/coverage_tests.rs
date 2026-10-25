@@ -73,13 +73,13 @@ fn secp_key(index: u8) -> secp256k1::SecretKey {
     secp256k1::SecretKey::from_slice(&[index; 32]).expect("a valid key")
 }
 
-fn secp_address(index: u8) -> Address {
+pub(crate) fn secp_address(index: u8) -> Address {
     let public = secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, &secp_key(index));
     Address::from_slice(&keccak256(&public.serialize_uncompressed()[1..])[12..])
 }
 
 /// A signed EIP-1559 transfer from the sender of `key_index`.
-fn eth_tx(key_index: u8, nonce: u64) -> N42PooledTxEnvelope {
+pub(crate) fn eth_tx(key_index: u8, nonce: u64) -> N42PooledTxEnvelope {
     let tx = TxEip1559 {
         chain_id: 94,
         nonce,

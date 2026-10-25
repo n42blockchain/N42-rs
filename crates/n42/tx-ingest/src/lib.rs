@@ -98,11 +98,21 @@
 //!
 //! # What it is not
 //!
-//! Not a peer protocol and not authenticated. It hands transactions to the pool
-//! exactly as `eth_sendRawTransaction` does — the pool validates every one, and
-//! recovering the sender is the bulk of that — so it can admit nothing the RPC
-//! could not. It is off unless `N42_TX_INGEST=<addr>` is set, and it should be
-//! bound to loopback.
+//! Not a peer protocol and not authenticated. In its default form it hands
+//! transactions to the pool exactly as `eth_sendRawTransaction` does — the pool
+//! validates every one, and recovering the sender is the bulk of that. The
+//! benchmark modes trust far more than that RPC does: `N42_TX_INGEST_DIRECT`
+//! skips the pool's validation, `N42_INGEST_VERIFY=leader|shard` queues
+//! transactions under a sender the frame claims without checking a signature,
+//! and attested frames (`N42_FRAME_GATEWAYS`) are admitted on a gateway's word.
+//! Whoever can reach the port can then feed the node unverified transactions.
+//!
+//! It is off unless `N42_TX_INGEST=<addr>` is set, and it binds loopback only:
+//! a non-loopback address is refused at start-up unless
+//! `N42_TX_INGEST_ALLOW_REMOTE=1`, and refused outright under any of the
+//! trusting modes above ([`ingest_bind_refusal`]). At most
+//! [`MAX_CONNECTIONS`] connections are served at once, and a frame whose body
+//! has not arrived [`FRAME_READ_TIMEOUT`] after its header ends its connection.
 
 pub mod runtime;
 
@@ -117,6 +127,58 @@ use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool}
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
+
+/// Connections served at once; the accept loop waits for a free slot
+/// beyond it (the flood opens one per worker, 64 a node on the bench).
+pub const MAX_CONNECTIONS: usize = 256;
+
+/// How long a frame's body may take to arrive once its header has: a
+/// half-sent frame would otherwise hold its buffer (up to
+/// `MAX_FRAME_BYTES`) for as long as the connection stays open. The wait
+/// between frames is not bounded; an idle generator is not a fault.
+pub const FRAME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether `addr` is a loopback address, an IPv4-mapped IPv6 one included.
+pub fn is_loopback(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_loopback(),
+        std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(ip.is_loopback(), |v4| v4.is_loopback()),
+    }
+}
+
+/// Why an unauthenticated listener named by `knob` must not bind `addr`,
+/// or `None` when it may: loopback always may; any other address only with
+/// `allow_remote` (`<knob>_ALLOW_REMOTE=1`).
+pub fn remote_bind_refusal(knob: &str, addr: &SocketAddr, allow_remote: bool) -> Option<String> {
+    if is_loopback(addr) || allow_remote {
+        return None;
+    }
+    Some(format!(
+        "{knob}={addr} is not a loopback address and the channel is unauthenticated; \
+         bind 127.0.0.1, or set {knob}_ALLOW_REMOTE=1 to bind it anyway"
+    ))
+}
+
+/// Why the ingest must not bind `addr`, or `None` when it may.
+/// [`remote_bind_refusal`], except that a node in a mode that trusts what a
+/// frame says (`trusting`: `N42_TX_INGEST_DIRECT`, claimed senders under
+/// `N42_INGEST_VERIFY=leader|shard`, gateway attestations) never binds a
+/// non-loopback address: there the port admits unverified transactions.
+pub fn ingest_bind_refusal(addr: &SocketAddr, allow_remote: bool, trusting: &[&str]) -> Option<String> {
+    if !is_loopback(addr) && !trusting.is_empty() {
+        return Some(format!(
+            "N42_TX_INGEST={addr} is not a loopback address, and this node trusts its frames ({}): \
+             such an ingest is never bound off loopback, N42_TX_INGEST_ALLOW_REMOTE or not",
+            trusting.join(", ")
+        ));
+    }
+    remote_bind_refusal("N42_TX_INGEST", addr, allow_remote)
+}
+
+/// `<knob>=1`, read when asked (start-up only).
+pub fn allow_remote(knob: &str) -> bool {
+    std::env::var(knob).is_ok_and(|value| value.trim() == "1")
+}
 
 /// Largest frame this will read, in transactions.
 ///
@@ -612,6 +674,17 @@ fn gate_clock_ms() -> u64 {
 /// second across every door, because a systematic drop is a drop per
 /// transaction at half a million a second. The counts on the `ingest` line
 /// are the complete record; these lines are the first few, named.
+/// The pause after a failed `accept()`.
+const ACCEPT_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// At most one "accept failed" warning a second.
+fn accept_warn_allowed() -> bool {
+    static NEXT_MS: AtomicU64 = AtomicU64::new(0);
+    let now = gate_clock_ms();
+    let next = NEXT_MS.load(Ordering::Acquire);
+    now >= next && NEXT_MS.compare_exchange(next, now + 1_000, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
 fn drop_warn_allowed() -> bool {
     static NEXT_MS: AtomicU64 = AtomicU64::new(0);
     let now = gate_clock_ms();
@@ -1155,6 +1228,23 @@ where
 {
     init_frame_attest(chain_id);
     let setup = Setup::<P::Transaction>::from_env(blocking_slots);
+    let mut trusting = Vec::new();
+    if setup.direct {
+        trusting.push("N42_TX_INGEST_DIRECT");
+    }
+    if n42_tx_types::senders_claimed_at_ingest() || n42_tx_types::ingest_shard().is_some() {
+        trusting.push("N42_INGEST_VERIFY=leader|shard");
+    }
+    if frame_attest().is_some() {
+        trusting.push("N42_FRAME_GATEWAYS");
+    }
+    if let Some(refusal) = ingest_bind_refusal(&addr, allow_remote("N42_TX_INGEST_ALLOW_REMOTE"), &trusting) {
+        tracing::error!(target: "n42.tx_ingest", %addr, "{refusal}");
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, refusal));
+    }
+    if !is_loopback(&addr) {
+        warn!(target: "n42.tx_ingest", %addr, "the unauthenticated ingest is bound off loopback (N42_TX_INGEST_ALLOW_REMOTE=1)");
+    }
     spawn_stats_reporter();
     spawn_gate_watcher(pool.clone(), setup.queue.clone(), std::sync::Arc::clone(&head), setup.gate, setup.allowance);
     let listener = TcpListener::bind(addr).await?;
@@ -1184,11 +1274,25 @@ where
     P: TransactionPool + Clone + 'static,
     P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
 {
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let mut failed_accepts = 0u64;
     loop {
+        // A slot first: past MAX_CONNECTIONS the next connection waits in
+        // the listen backlog instead of being served.
+        let Ok(slot) = std::sync::Arc::clone(&slots).acquire_owned().await else {
+            return Err(std::io::Error::other("the ingest's connection slots closed"));
+        };
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(err) => {
-                warn!(target: "n42.tx_ingest", %err, "accept failed");
+                // EMFILE/ENFILE fail at once and for as long as they last:
+                // without the pause this loop spins a worker and the log.
+                failed_accepts += 1;
+                if accept_warn_allowed() {
+                    warn!(target: "n42.tx_ingest", %err, failed_accepts, "accept failed");
+                }
+                drop(slot);
+                tokio::time::sleep(ACCEPT_RETRY).await;
                 continue;
             }
         };
@@ -1197,6 +1301,7 @@ where
         let head = std::sync::Arc::clone(&head);
         let setup = setup.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             if let Err(err) = serve_connection(stream, pool, cache, head, setup).await {
                 debug!(target: "n42.tx_ingest", %peer, %err, "ingest connection ended");
             }
@@ -1290,61 +1395,75 @@ where
                 format!("frame of {count} transactions"),
             ));
         }
-        // The frame's transactions share one buffer: each is a slice of it
-        // rather than its own allocation (500 a frame, ~350,000 a second a
-        // node at the bench tier).
-        let mut raws = Vec::with_capacity(count as usize);
-        let keep_claims = claiming && claimed_senders;
-        let mut claims: Vec<Address> = if keep_claims { Vec::with_capacity(count as usize) } else { Vec::new() };
-        let mut frame_buf = bytes::BytesMut::with_capacity(count as usize * 160);
-        let mut frame_bytes = 0usize;
-        for _ in 0..count {
-            let len = stream.read_u32_le().await? as usize;
-            if len == 0 || len > MAX_TX_BYTES as usize {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("transaction of {len} bytes"),
-                ));
+        // The body under a deadline: a frame whose header arrived and whose
+        // body stalls would hold its buffer as long as the connection lived.
+        let read_body = async {
+            // The frame's transactions share one buffer: each is a slice of it
+            // rather than its own allocation (500 a frame, ~350,000 a second a
+            // node at the bench tier).
+            let mut raws = Vec::with_capacity(count as usize);
+            let keep_claims = claiming && claimed_senders;
+            let mut claims: Vec<Address> = if keep_claims { Vec::with_capacity(count as usize) } else { Vec::new() };
+            let mut frame_buf = bytes::BytesMut::with_capacity(count as usize * 160);
+            let mut frame_bytes = 0usize;
+            for _ in 0..count {
+                let len = stream.read_u32_le().await? as usize;
+                if len == 0 || len > MAX_TX_BYTES as usize {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("transaction of {len} bytes"),
+                    ));
+                }
+                frame_bytes += len;
+                if frame_bytes > MAX_FRAME_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("frame exceeds {MAX_FRAME_BYTES} transaction bytes"),
+                    ));
+                }
+                if claiming {
+                    let mut claim = [0u8; 20];
+                    stream.read_exact(&mut claim).await?;
+                    if keep_claims {
+                        claims.push(Address::from(claim));
+                    }
+                }
+                frame_buf.resize(len, 0);
+                stream.read_exact(&mut frame_buf[..]).await?;
+                raws.push(Bytes::from(frame_buf.split_to(len).freeze()));
             }
-            frame_bytes += len;
-            if frame_bytes > MAX_FRAME_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("frame exceeds {MAX_FRAME_BYTES} transaction bytes"),
-                ));
-            }
-            if claiming {
-                let mut claim = [0u8; 20];
-                stream.read_exact(&mut claim).await?;
-                if keep_claims {
-                    claims.push(Address::from(claim));
+            // The attestation section, read either way and kept only where this
+            // node trusts gateways; a node without them verifies the frame as if
+            // it carried none.
+            let mut attestations: Vec<n42_tx_types::FrameAttestation> = Vec::new();
+            if attested {
+                let n = stream.read_u8().await? as usize;
+                if n == 0 || n > n42_tx_types::MAX_FRAME_ATTESTATIONS {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("frame of {n} attestations"),
+                    ));
+                }
+                let keep = frame_attest().is_some();
+                for _ in 0..n {
+                    let mut raw = [0u8; n42_tx_types::FRAME_ATTESTATION_LEN];
+                    stream.read_exact(&mut raw).await?;
+                    if keep {
+                        attestations.push(n42_tx_types::FrameAttestation::from_bytes(&raw));
+                    }
                 }
             }
-            frame_buf.resize(len, 0);
-            stream.read_exact(&mut frame_buf[..]).await?;
-            raws.push(Bytes::from(frame_buf.split_to(len).freeze()));
-        }
-        // The attestation section, read either way and kept only where this
-        // node trusts gateways; a node without them verifies the frame as if
-        // it carried none.
-        let mut attestations: Vec<n42_tx_types::FrameAttestation> = Vec::new();
-        if attested {
-            let n = stream.read_u8().await? as usize;
-            if n == 0 || n > n42_tx_types::MAX_FRAME_ATTESTATIONS {
+            Ok::<_, std::io::Error>((raws, claims, attestations))
+        };
+        let (raws, claims, attestations) = match tokio::time::timeout(FRAME_READ_TIMEOUT, read_body).await {
+            Ok(read) => read?,
+            Err(_) => {
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("frame of {n} attestations"),
+                    std::io::ErrorKind::TimedOut,
+                    format!("a frame of {count} transactions did not arrive within {FRAME_READ_TIMEOUT:?}"),
                 ));
             }
-            let keep = frame_attest().is_some();
-            for _ in 0..n {
-                let mut raw = [0u8; n42_tx_types::FRAME_ATTESTATION_LEN];
-                stream.read_exact(&mut raw).await?;
-                if keep {
-                    attestations.push(n42_tx_types::FrameAttestation::from_bytes(&raw));
-                }
-            }
-        }
+        };
         // The gate. Not a refusal and not a drop: the frame is held until the
         // chain has taken a block out of the pool, and the client hears nothing
         // until then, which is the whole difference between backpressure and a
@@ -2481,6 +2600,33 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// Loopback binds silently; anything else needs the escape hatch, and
+    /// a trusting mode refuses it even then.
+    #[test]
+    fn a_non_loopback_bind_is_refused_unless_allowed_and_never_when_trusting() {
+        let addr = |s: &str| s.parse::<SocketAddr>().expect("an address");
+        for local in ["127.0.0.1:9000", "127.1.2.3:9000", "[::1]:9000", "[::ffff:127.0.0.1]:9000"] {
+            let local = addr(local);
+            assert!(is_loopback(&local), "{local}");
+            assert_eq!(ingest_bind_refusal(&local, false, &[]), None);
+            assert_eq!(ingest_bind_refusal(&local, false, &["N42_TX_INGEST_DIRECT"]), None);
+            assert_eq!(remote_bind_refusal("N42_PAYLOAD_SERVE", &local, false), None);
+        }
+        for remote in ["0.0.0.0:9000", "10.0.0.5:9000", "[::]:9000", "[::ffff:10.0.0.5]:9000"] {
+            let remote = addr(remote);
+            assert!(!is_loopback(&remote), "{remote}");
+            assert!(ingest_bind_refusal(&remote, false, &[]).is_some());
+            assert_eq!(ingest_bind_refusal(&remote, true, &[]), None);
+            for trusting in ["N42_TX_INGEST_DIRECT", "N42_INGEST_VERIFY=leader|shard", "N42_FRAME_GATEWAYS"] {
+                let refusal = ingest_bind_refusal(&remote, true, &[trusting]).expect("refused outright");
+                assert!(refusal.contains(trusting), "{refusal}");
+            }
+            assert!(remote_bind_refusal("N42_PAYLOAD_SERVE", &remote, false)
+                .is_some_and(|refusal| refusal.contains("N42_PAYLOAD_SERVE_ALLOW_REMOTE=1")));
+            assert_eq!(remote_bind_refusal("N42_PAYLOAD_SERVE", &remote, true), None);
+        }
+    }
 
     /// A gate reading a test drives: `depth` against a fixed limit, exactly
     /// the shape [`gate_view`] returns from the queue.

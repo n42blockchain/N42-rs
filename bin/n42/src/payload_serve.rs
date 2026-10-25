@@ -2899,6 +2899,19 @@ pub async fn serve<T>(
 where
     T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
+    // Unauthenticated, with Engine-API power (imports, held executions):
+    // loopback only unless `N42_PAYLOAD_SERVE_ALLOW_REMOTE=1`.
+    if let Some(refusal) = n42_tx_ingest::remote_bind_refusal(
+        "N42_PAYLOAD_SERVE",
+        &addr,
+        n42_tx_ingest::allow_remote("N42_PAYLOAD_SERVE_ALLOW_REMOTE"),
+    ) {
+        tracing::error!(target: "n42.payload_serve", %addr, "{refusal}");
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, refusal));
+    }
+    if !n42_tx_ingest::is_loopback(&addr) {
+        tracing::warn!(target: "n42.payload_serve", %addr, "the unauthenticated payload channel is bound off loopback (N42_PAYLOAD_SERVE_ALLOW_REMOTE=1)");
+    }
     // `N42_ROAD_RUNTIME=1`: the accept loop and every connection it serves on
     // the road's own runtime, so their tasks, `spawn_blocking` calls and
     // `block_in_place` hand-offs use that runtime's workers and blocking pool

@@ -478,8 +478,9 @@ fn main() {
                 None
             };
 
-            // The raw payload channel for the validator, loopback only. See
-            // `payload_serve`.
+            // The raw payload channel for the validator, loopback only (a
+            // non-loopback address is refused unless
+            // `N42_PAYLOAD_SERVE_ALLOW_REMOTE=1`). See `payload_serve`.
             if let Ok(addr) = std::env::var("N42_PAYLOAD_SERVE") {
                 // Several keys on this execution layer share each import
                 // (`N42_IMPORT_ONCE`); a held execution cannot be shared.
@@ -796,9 +797,11 @@ fn main() {
             }
 
             // A binary path into the pool, for load generators. Off unless
-            // asked for, and meant for loopback: it admits nothing
-            // `eth_sendRawTransaction` would not, but it is unauthenticated,
-            // so binding it anywhere reachable would be a mistake.
+            // asked for, and unauthenticated: it binds loopback only unless
+            // `N42_TX_INGEST_ALLOW_REMOTE=1`, and never off loopback under
+            // the modes that trust a frame (direct, claimed senders, gateway
+            // attestations), which admit what `eth_sendRawTransaction` would
+            // not (`n42_tx_ingest::ingest_bind_refusal`).
             if let Ok(addr) = std::env::var("N42_TX_INGEST") {
                 match addr.parse::<std::net::SocketAddr>() {
                     Ok(addr) => {

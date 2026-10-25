@@ -206,6 +206,21 @@ const MAX_BODY_BYTES: u32 = 256 << 20;
 /// Frames a peer may have queued before the leader stops offering it more.
 const PER_PEER_QUEUE: usize = 4;
 
+/// How long one frame's bytes may take to arrive once its length is read.
+/// The wait for the next length is not bounded: a member pushes only while
+/// it leads, so a connection is idle between tenures.
+const FRAME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Connections the listener serves at once; one per fleet member is the
+/// normal load. Further ones are closed on accept.
+const MAX_CONNECTIONS: usize = 64;
+
+/// What a body's buffer is reserved to before any of it has arrived. The
+/// rest grows with the bytes received, so a declared length alone cannot
+/// make this node allocate; a pooled buffer that is already larger is used
+/// as it is.
+const INITIAL_BODY_RESERVE: usize = 4 << 20;
+
 /// Listens on `addr` and hands every body received to `sink`.
 ///
 /// Returns once bound; the accept loop runs on its own task. A body is
@@ -214,7 +229,17 @@ const PER_PEER_QUEUE: usize = 4;
 pub async fn listen(addr: SocketAddr, sink: mpsc::Sender<BodyBuf>) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(target: "n42.h2.node", %addr, "body channel listening");
+    if !addr.ip().is_loopback() {
+        // The channel has no authentication: it is meant for one host or a
+        // trusted LAN. Say so where an operator will see it.
+        warn!(
+            target: "n42.h2.node",
+            %addr,
+            "body channel bound to a non-loopback address; it is unauthenticated, keep it off untrusted networks"
+        );
+    }
     let pool = Arc::new(BufPool::default());
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     tokio::spawn(async move {
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -224,12 +249,18 @@ pub async fn listen(addr: SocketAddr, sink: mpsc::Sender<BodyBuf>) -> std::io::R
                     continue;
                 }
             };
+            let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+                debug!(target: "n42.h2.node", %peer, max = MAX_CONNECTIONS, "body channel full; connection closed");
+                drop(stream);
+                continue;
+            };
             let sink = sink.clone();
             let pool = Arc::clone(&pool);
             tokio::spawn(async move {
                 if let Err(err) = receive(stream, sink, pool).await {
                     debug!(target: "n42.h2.node", %peer, %err, "body channel connection ended");
                 }
+                drop(slot);
             });
         }
     });
@@ -264,7 +295,7 @@ async fn receive(mut stream: TcpStream, sink: mpsc::Sender<BodyBuf>, pool: Arc<B
                 ));
             }
             let mut id = vec![0u8; len as usize];
-            stream.read_exact(&mut id).await?;
+            within_frame_deadline(FRAME_READ_TIMEOUT, stream.read_exact(&mut id)).await?;
             match String::from_utf8(id) {
                 Ok(id) => {
                     debug!(target: "n42.h2.node", %id, "a body-channel sender named itself");
@@ -280,13 +311,16 @@ async fn receive(mut stream: TcpStream, sink: mpsc::Sender<BodyBuf>, pool: Arc<B
             continue;
         }
         let compact = len == COMPACT_MARKER;
-        let len = if compact { stream.read_u32_le().await? } else { len };
+        let len = if compact {
+            within_frame_deadline(FRAME_READ_TIMEOUT, stream.read_u32_le()).await?
+        } else {
+            len
+        };
         if len == 0 || len > MAX_BODY_BYTES {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("body of {len} bytes")));
         }
         let mut body = pool.take();
-        body.resize(len as usize, 0);
-        stream.read_exact(&mut body).await?;
+        read_body(&mut stream, &mut body, len as usize, FRAME_READ_TIMEOUT).await?;
         let body = BodyBuf {
             buf: body,
             pool: Some(Arc::clone(&pool)),
@@ -298,6 +332,49 @@ async fn receive(mut stream: TcpStream, sink: mpsc::Sender<BodyBuf>, pool: Arc<B
             return Ok(());
         }
     }
+}
+
+/// Runs one read of a frame under `deadline`.
+async fn within_frame_deadline<T>(
+    deadline: std::time::Duration,
+    read: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    tokio::time::timeout(deadline, read).await.unwrap_or_else(|_| {
+        Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "body channel: frame not received in time"))
+    })
+}
+
+/// Reads exactly `len` bytes of a body into `body` (cleared first) within
+/// `deadline`. The buffer grows with the bytes that arrive rather than
+/// being sized to the declared length up front, so a length prefix with
+/// nothing behind it costs at most [`INITIAL_BODY_RESERVE`].
+async fn read_body<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+    body: &mut Vec<u8>,
+    len: usize,
+    deadline: std::time::Duration,
+) -> std::io::Result<()> {
+    body.clear();
+    if body.capacity() < len {
+        body.reserve(len.min(INITIAL_BODY_RESERVE));
+    }
+    let read = async {
+        let mut limited = (&mut *stream).take(len as u64);
+        while body.len() < len {
+            if body.len() == body.capacity() {
+                // Grow by what is still to come, at most doubling.
+                body.reserve((len - body.len()).min(body.capacity().max(4096)));
+            }
+            if limited.read_buf(body).await? == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("body ended after {} of {len} bytes", body.len()),
+                ));
+            }
+        }
+        Ok(())
+    };
+    within_frame_deadline(deadline, read).await
 }
 
 /// The leader's side: one queue per peer, drained to that peer's socket by
@@ -487,6 +564,42 @@ mod tests {
         );
         assert_eq!(address_for("/ip4/127.0.0.1/tcp/19003", 0), Some("127.0.0.1:19003".parse().unwrap()));
         assert_eq!(address_for("/dns4/x/tcp/1", 1), None);
+    }
+
+    /// A length prefix with nothing behind it neither allocates the declared
+    /// length nor waits forever.
+    #[tokio::test]
+    async fn a_declared_body_that_never_arrives_times_out_without_its_allocation() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        writer.write_all(&[1, 2, 3]).await.unwrap();
+        let mut body = Vec::new();
+        let err = read_body(&mut reader, &mut body, 200 << 20, std::time::Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(body.capacity() <= 2 * INITIAL_BODY_RESERVE, "capacity {}", body.capacity());
+        drop(writer);
+    }
+
+    /// A body bigger than the initial reservation arrives whole, and one
+    /// cut short is an error rather than a short body.
+    #[tokio::test]
+    async fn a_body_grows_with_the_bytes_received() {
+        let len = INITIAL_BODY_RESERVE * 2 + 17;
+        let sent: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let (mut writer, mut reader) = tokio::io::duplex(64 << 10);
+        let to_send = sent.clone();
+        let writer_task = tokio::spawn(async move { writer.write_all(&to_send).await });
+        let mut body = Vec::new();
+        read_body(&mut reader, &mut body, len, std::time::Duration::from_secs(10)).await.unwrap();
+        assert_eq!(body, sent);
+        writer_task.await.unwrap().unwrap();
+
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        writer.write_all(&[9u8; 10]).await.unwrap();
+        drop(writer);
+        let err = read_body(&mut reader, &mut body, 20, std::time::Duration::from_secs(1)).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     /// A body offered to the pushers arrives at the listener, whole and once.

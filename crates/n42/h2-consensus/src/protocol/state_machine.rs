@@ -4216,6 +4216,132 @@ mod tests {
     }
 
     #[test]
+    fn test_decide_stages_local_pending_changes_only_when_they_are_the_certified_set() {
+        let local = ValidatorInfo {
+            address: Address::with_last_byte(0x50),
+            bls_public_key: test_key(0x60).public_key(),
+            p2p_peer_id: None,
+        };
+        let local_changes = vec![ValidatorChange::Add {
+            address: local.address,
+            bls_public_key: local.bls_public_key.clone(),
+            p2p_peer_id: None,
+        }];
+        let other_changes = vec![ValidatorChange::Add {
+            address: Address::with_last_byte(0x51),
+            bls_public_key: test_key(0x61).public_key(),
+            p2p_peer_id: None,
+        }];
+
+        for (certified, expect_staged) in [(other_changes, false), (local_changes, true)] {
+            let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+            engine.epoch_manager = EpochManager::with_epoch_length(vs.clone(), 10);
+            // A change queued locally (an RPC add) that the follower never
+            // saw in a proposal.
+            engine.propose_add_validator(local.clone()).expect("queued");
+
+            let view = 2u64;
+            let block_hash = B256::repeat_byte(0xDA);
+            let changes_hash = EpochManager::hash_changes(&certified);
+            let decide = Decide {
+                view,
+                block_hash,
+                commit_qc: build_test_commit_qc_with_changes(
+                    view,
+                    block_hash,
+                    &sks,
+                    &vs,
+                    &[0, 1, 2],
+                    &changes_hash,
+                ),
+                validator_changes_hash: changes_hash,
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(decide)))
+                .expect("the decide commits");
+
+            assert_eq!(engine.epoch_manager().has_staged_next(), expect_staged);
+            let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let committed = outputs.iter().find_map(|output| match output {
+                EngineOutput::BlockCommitted { view: 2, validator_changes, .. } => {
+                    Some(validator_changes.clone())
+                }
+                _ => None,
+            });
+            let committed = committed.expect("the block is committed");
+            assert_eq!(committed.is_some(), expect_staged);
+            let resync = outputs.iter().any(|output| {
+                matches!(output, EngineOutput::SyncRequired { local_view: 1, target_view: 2 })
+            });
+            assert_eq!(resync, !expect_staged, "a mismatch is treated as missed changes");
+        }
+    }
+
+    #[test]
+    fn test_leader_decide_carries_the_certified_changes_hash_not_later_pending_changes() {
+        use crate::protocol::quorum::{commit_signing_message, signing_message};
+
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 1);
+        engine.epoch_manager = EpochManager::with_epoch_length(vs, 10);
+        let block_hash = B256::repeat_byte(0xF7);
+        let view = 1u64;
+
+        // The proposal carries no changes, so the CommitQC signs ZERO.
+        engine
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
+            .expect("block ready");
+        for i in [0u32, 2] {
+            let vote = Vote {
+                view,
+                block_hash,
+                voter: i,
+                signature: sks[i as usize].sign(&signing_message(view, &block_hash)),
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+                .expect("vote");
+        }
+        // A change queued between the proposal and the commit.
+        engine
+            .propose_add_validator(ValidatorInfo {
+                address: Address::with_last_byte(0x52),
+                bls_public_key: test_key(0x62).public_key(),
+                p2p_peer_id: None,
+            })
+            .expect("queued");
+        while rx.try_recv().is_ok() {}
+        for i in [0u32, 2] {
+            let cv = CommitVote {
+                view,
+                block_hash,
+                voter: i,
+                signature: sks[i as usize]
+                    .sign(&commit_signing_message(view, &block_hash, &B256::ZERO)),
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(cv)))
+                .expect("commit vote");
+        }
+        assert_eq!(engine.current_view(), 2);
+
+        let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let decide = outputs
+            .iter()
+            .find_map(|output| match output {
+                EngineOutput::BroadcastMessage(ConsensusMessage::Decide(decide)) => Some(decide),
+                _ => None,
+            })
+            .expect("the leader broadcasts a Decide");
+        assert_eq!(decide.validator_changes_hash, B256::ZERO, "the hash the CommitQC signed");
+        assert!(outputs.iter().any(|output| matches!(
+            output,
+            EngineOutput::BlockCommitted { view: 1, validator_changes: None, .. }
+        )));
+        assert!(!engine.epoch_manager().has_staged_next(), "unvoted changes are not staged");
+        assert!(engine.epoch_manager().has_pending_changes(), "they wait for the next proposal");
+    }
+
+    #[test]
     fn test_late_committed_proposal_recovers_validator_changes_before_boundary() {
         use crate::protocol::quorum::proposal_signing_message;
         use crate::validator::LeaderSelector;

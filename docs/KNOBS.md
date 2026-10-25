@@ -1,6 +1,6 @@
 # Runtime knob reference (N42_* environment variables)
 
-1. Generated from an audit of the tree at commit 393cc1e70 (audit/maturity-2026-10): 273 knobs read by code under bin/n42, crates/n42, crates/chain-state and crates/storage; none is read from a config file or CLI flag.
+1. Generated from an audit of the tree at commit 393cc1e70 (audit/maturity-2026-10): 273 knobs, plus the four the hardening branches added (`N42_TX_INGEST_ALLOW_REMOTE`, `N42_PAYLOAD_SERVE_ALLOW_REMOTE`, `N42_BENCH_UNSAFE`, `N42_RAW_CHANNEL_TIMEOUT_MS`) read by code under bin/n42, crates/n42, crates/chain-state and crates/storage; none is read from a config file or CLI flag.
 2. Almost every knob is read once, behind a `OnceLock`/`static`, at first use. Set it in the environment before the process starts; changing it afterwards has no effect. A few are read at service construction without a cache ("startup"), still once per process.
 3. The one HOT (per-call, uncached) read is `N42_OWN_BLOCK_BY_HEADER`, read twice in `crates/n42/h2-el-rpc/src/engine.rs` (lines ~1439 and ~1452) on the engine path.
 4. Truthiness is not uniform. Most switches test exactly `== "1"`; default-on switches test `!= "0"` (so `0` disables, anything else keeps them on); the `SF_*` knobs accept `1`/`on`/`true`; `N42_ACCOUNT_HISTORY` wants `off`; `N42_QMDB_READS` enables on any non-empty value other than `off`.
@@ -48,6 +48,7 @@ Status caveat: `adopted` follows the stage sets named above; `experimental` mean
 | `N42_PARALLEL_STATE_COMMIT` | on (0 disables) | on unless `0` | QMDB leaves and hashed post-state built on the worker pool; 0 = serial. | `bin/n42:follower_import.rs:3768; engine-types:assembler.rs:549` | default |
 | `N42_PARENT_OUTPUTS_KEPT` | 4 (valid 2..=16) | integer | How many published outputs are kept, by N42_PARENT_OUTPUTS_KEPT (2..=16, default PARENT_OUTPUTS_KEPT). The check and the execution stack the unla... | `bin/n42:follower_import.rs:310` | default |
 | `N42_PAYLOAD_SERVE` | unset: raw payload channel off (value: SocketAddr) | see Default | Address of the loopback raw payload channel beside the Engine API. | `bin/n42:main.rs:327,483` | unknown |
+| `N42_PAYLOAD_SERVE_ALLOW_REMOTE` | off (1 enables) | `1` | Allow the raw payload channel to bind off loopback; refused otherwise (audit/ingest-hardening). | `bin/n42:payload_serve.rs` | default |
 | `N42_PAYLOAD_SERVE_FRESH_BUFFERS` | off (any value enables) | presence only (`=0` still counts) | Payload serve uses fresh buffers per answer. | `bin/n42:payload_serve.rs:1911` | undocumented-before |
 | `N42_PRUNE_ASYNC` | on (0 disables) | on unless `0` | (default; N42_PRUNE_ASYNC=0 makes the answer wait for it, the behaviour before round 43's loop98). | `bin/n42:payload_serve.rs:4086` | default |
 | `N42_PRUNE_FEED_LEAN` | off | `1` (or the knob's own value; see code) | N42_PRUNE_FEED_LEAN=1 carries lean block summaries to the pruning thread instead of whole canonical notifications; default off, read and logged o... | `bin/n42:queue_prune.rs:100` | experimental |
@@ -67,6 +68,8 @@ Status caveat: `adopted` follows the stage sets named above; `experimental` mean
 | `N42_TENURE_FIRST_ON_OUTPUT` | off | `1` (or the knob's own value; see code) | N42_TENURE_FIRST_ON_OUTPUT=1 (defect 18b, docs/FLEET7_PLAN_V4.md 7.13): a build request on a sealed parent this node did not build is served on... | `bin/n42:payload_serve.rs:1399; h2-node:service.rs:1022` | experimental |
 | `N42_THP_DISABLE` | off (1) | `1` | prctl PR_SET_THP_DISABLE for this process. | `bin/n42:main.rs:50` | bench-only |
 | `N42_TX_INGEST` | unset: ingest server off (value: SocketAddr) | see Default | Address of the transaction ingest server (unauthenticated; loopback). | `bin/n42:main.rs:802` | unknown |
+| `N42_TX_INGEST_ALLOW_REMOTE` | off (1 enables) | `1` | Allow the ingest server to bind off loopback; refused outright with `N42_TX_INGEST_DIRECT`, `N42_INGEST_VERIFY=shard|leader` or attested frames (audit/ingest-hardening). | `bin/n42:main.rs` | default |
+| `N42_BENCH_UNSAFE` | off (1 enables) | `1` | Start-up acknowledgement required before `N42_INGEST_VERIFY=shard|leader` is accepted (audit/ingest-hardening). | `bin/n42:main.rs` | bench-only |
 | `N42_TX_QUEUE` | off (any value enables) | presence only (`=0` still counts) | Enable the builder's tx queue (fed by ingest, pruned per canonical block). | `bin/n42:main.rs:607` | experimental |
 | `N42_TX_QUEUE_DRAINER` | off (any value enables) | presence only (`=0` still counts) | Drain the queue inbox off the builder thread. | `bin/n42:main.rs:609,620` | experimental |
 | `N42_VOTE_BEFORE_SLOT` | off (1) | `1` | Vote before the slot (held execution); incompatible with IMPORT_ONCE. | `bin/n42:import_once.rs:62; h2-execution:driver.rs:172` | experimental |
@@ -256,6 +259,7 @@ Status caveat: `adopted` follows the stage sets named above; `experimental` mean
 
 | Knob | Default | Values | Meaning | Where read | Status |
 |---|---|---|---|---|---|
+| `N42_RAW_CHANNEL_TIMEOUT_MS` | 8000 | integer ms | Deadline for one exchange on the raw payload channel; the client falls back to the Engine API on expiry (audit/h2-hardening). | `h2-el-rpc:engine.rs` | default |
 | `N42_ANSWER_LAYOUT_ONLY` | off | `1` (or the knob's own value; see code) | N42_ANSWER_LAYOUT_ONLY, read once: the proposer tells its execution layer that a compact build-on-own answer may leave the transaction hash list ... | `h2-execution:driver.rs:909` | experimental |
 | `N42_BLOCK_BY_DESCRIPTION` | off | `1` (or the knob's own value; see code) | Follower checks a compact body by description; implies COMPACT_BODY. | `h2-execution:driver.rs:846; tx-queue:lib.rs:1708` | experimental |
 | `N42_BLOCK_TOPIC_ALWAYS` | off (any value enables) | presence only (`=0` still counts) | Always publish the block body on the gossip topic (gov5 members need it). | `h2-node:service.rs:1183` | undocumented-before |

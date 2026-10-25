@@ -67,6 +67,21 @@ impl EntryFileView {
         let value_at = len_at + LEN_LEN;
         (key, &self.map[value_at..value_at + len])
     }
+
+    /// Where the record at `offset` ends, if it lies wholly inside the
+    /// mapping ([`VIEW_MAP_BYTES`]); `None` past it, where the view cannot
+    /// read it (an entry file past 1 TiB: the caller invalidates the view
+    /// and reads go elsewhere). Nothing past the mapping is touched.
+    pub fn record_end(&self, offset: u64) -> Option<u64> {
+        let header_end = offset.checked_add((KEY_LEN + LEN_LEN) as u64)?;
+        if header_end > VIEW_MAP_BYTES {
+            return None;
+        }
+        let len_at = offset as usize + KEY_LEN;
+        let len = u32::from_le_bytes([self.map[len_at], self.map[len_at + 1], self.map[len_at + 2], self.map[len_at + 3]]);
+        let end = header_end + u64::from(len);
+        (end <= VIEW_MAP_BYTES).then_some(end)
+    }
 }
 
 #[cfg(test)]
@@ -134,5 +149,23 @@ mod tests {
         assert_eq!(calls[0].0, expected, "told the length the file is cut to");
         assert!(calls[0].1 > expected, "before the cut");
         assert_eq!(std::fs::metadata(&path).unwrap().len(), expected);
+    }
+
+    /// A record past the 1 TiB mapping is reported, not read: the bound is
+    /// checked before any byte of it is touched.
+    #[test]
+    fn a_record_past_the_mapping_has_no_end() {
+        let path = scratch("bounds");
+        let mut tree = QmdbCompatTree::new();
+        tree.set_entry_file(&path).unwrap();
+        tree.apply_sorted_ops(block(0..10, 1)).unwrap();
+        tree.sync_entries().unwrap();
+        let view = EntryFileView::open(&path).unwrap();
+        let (_, value) = view.record(0);
+        assert_eq!(view.record_end(0), Some((KEY_LEN + LEN_LEN + value.len()) as u64));
+        assert_eq!(view.record_end(VIEW_MAP_BYTES), None);
+        assert_eq!(view.record_end(VIEW_MAP_BYTES - (KEY_LEN + LEN_LEN) as u64 + 1), None);
+        assert_eq!(view.record_end(u64::MAX), None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

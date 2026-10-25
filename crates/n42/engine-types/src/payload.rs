@@ -3975,9 +3975,14 @@ where
                 let roots = receipts.join().map_err(|_| "the receipts root job panicked");
                 (hashed, prepared, roots)
             });
-            let (prepared, root_started, root_ended, kept_ops) =
-                prepared.map_err(|err| PayloadBuilderError::other(std::io::Error::other(err)))?;
-            let roots = roots.map_err(|err| PayloadBuilderError::other(std::io::Error::other(err)))?;
+            // After `state_ready`: a panicked job fails the build in the
+            // store too, so a child build waiting on it is told at once.
+            let panicked = |err: &str| {
+                crate::built_executions::fail(block_hash);
+                PayloadBuilderError::other(std::io::Error::other(err.to_owned()))
+            };
+            let (prepared, root_started, root_ended, kept_ops) = prepared.map_err(panicked)?;
+            let roots = roots.map_err(panicked)?;
             let hashed_state = hashed_state.map_err(PayloadBuilderError::other)?;
             root_started_at = Some(root_started);
             root_ended_at = Some(root_ended);

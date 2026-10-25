@@ -710,7 +710,7 @@ fn main() {
                 let mut canonical = node.provider.subscribe_to_canonical_state();
                 // `N42_QUEUE_PRUNE_THREAD=1`: the prune runs on a thread of its
                 // own and this task only forwards (see `n42::queue_prune`).
-                let pruner = n42::queue_prune::on_own_thread()
+                let mut pruner = n42::queue_prune::on_own_thread()
                     .then(|| n42::queue_prune::spawn_thread(queue.clone()))
                     .flatten();
                 let prune_feed_lean = pruner.is_some() && n42::queue_prune::feed_lean();
@@ -722,8 +722,8 @@ fn main() {
                                 if behind > 8 {
                                     warn!(target: "reth::cli", behind, "canonical subscriber lag: queue pruner");
                                 }
-                                match pruner.as_ref() {
-                                    Some(pruner) => {
+                                match pruner {
+                                    Some(_) => {
                                         // Read by the builder: said here as
                                         // well, so the thread's queue does
                                         // not delay it.
@@ -740,10 +740,12 @@ fn main() {
                                         // 4.915 against 5.100/5.019 M tx/s), the
                                         // pair collection being on this thread.
                                         let feed = n42::queue_prune::PruneFeed::of(notification, prune_feed_lean);
-                                        if pruner.send(feed).is_err() {
-                                            error!(target: "n42.tx_queue", "the queue's pruning thread is gone; the queue is no longer pruned");
-                                            break;
-                                        }
+                                        // A pruning thread that died (logged
+                                        // once) leaves `pruner` empty: this item
+                                        // and every later one are pruned here.
+                                        n42::queue_prune::forward(&mut pruner, feed, |feed| {
+                                            n42::queue_prune::prune_feed_inline(&queue, &feed)
+                                        });
                                     }
                                     None if n42_tx_queue::prune_lean() => {
                                         // `N42_PRUNE_LEAN`: every notification

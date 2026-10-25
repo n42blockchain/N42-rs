@@ -125,14 +125,63 @@ static FEED_DEPTH: AtomicUsize = AtomicUsize::new(0);
 #[derive(Debug, Clone)]
 pub struct PruneSender(std::sync::mpsc::Sender<Queued>);
 
+/// The inbox depth past which a send warns (at most once every ten
+/// seconds): the channel is unbounded on purpose (a bound would put the
+/// forwarder on the pruner's pace), so a pruner falling behind is said.
+const FEED_DEPTH_WARN: usize = 64;
+
 impl PruneSender {
     /// Sends one feed item with its arrival time; `Err` if the thread is gone.
     pub fn send(&self, feed: PruneFeed) -> Result<(), PruneFeed> {
-        FEED_DEPTH.fetch_add(1, Ordering::Relaxed);
+        let depth = FEED_DEPTH.fetch_add(1, Ordering::Relaxed) + 1;
+        metrics::gauge!("n42_queue_prune_feed_depth").set(depth as f64);
+        if depth > FEED_DEPTH_WARN && feed_depth_warn_allowed() {
+            warn!(target: "n42.tx_queue", feed_depth = depth, "the queue's pruning thread is behind: its inbox holds every waiting block");
+        }
         self.0.send((feed, std::time::Instant::now())).map_err(|err| {
             FEED_DEPTH.fetch_sub(1, Ordering::Relaxed);
             err.0 .0
         })
+    }
+}
+
+/// At most one feed-depth warning every ten seconds.
+fn feed_depth_warn_allowed() -> bool {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = std::time::Instant::now();
+    if last.is_some_and(|at| now.duration_since(at) < std::time::Duration::from_secs(10)) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+/// Forwards one feed item to the pruning thread; if the thread is gone (it
+/// panicked, see [`spawn_thread`]), says so once at error level, forgets
+/// the sender -- so every later notification takes the runtime's inline
+/// path -- and prunes this item inline, so no block goes unpruned from here
+/// on. What the dead thread had not yet taken from its inbox is lost with
+/// it; later blocks settle the same senders past those nonces.
+pub fn forward(pruner: &mut Option<PruneSender>, feed: PruneFeed, inline: impl FnOnce(PruneFeed)) {
+    let Some(sender) = pruner.as_ref() else {
+        inline(feed);
+        return;
+    };
+    if let Err(feed) = sender.send(feed) {
+        tracing::error!(target: "n42.tx_queue", "the queue's pruning thread is gone; pruning on the runtime from here on");
+        *pruner = None;
+        inline(feed);
+    }
+}
+
+/// One feed item pruned on the calling thread, as the pruning thread would
+/// (the fallback of [`forward`]).
+pub fn prune_feed_inline(queue: &TxQueue<N42PooledTransaction>, feed: &PruneFeed) {
+    if n42_tx_queue::prune_lean() {
+        prune_feed_lean(queue, &[feed], std::time::Duration::ZERO, 0);
+    } else {
+        prune_one(queue, FeedRef::from(feed), 1, std::time::Duration::ZERO, 0);
     }
 }
 
@@ -500,96 +549,125 @@ type Queued = (PruneFeed, std::time::Instant);
 /// Starts the pruning thread; `None` (and a warning) if it could not be
 /// started, and the caller prunes on the runtime as before.
 pub fn spawn_thread(queue: TxQueue<N42PooledTransaction>) -> Option<PruneSender> {
+    spawn_with(move |rx| run_pruner(&queue, rx)).map(|(sender, _)| sender)
+}
+
+/// Starts the pruning thread on `body`, which owns the inbox. A panic in
+/// the body is caught and logged at error level with its message; the
+/// thread then ends, its inbox closes, and [`forward`] falls back to
+/// pruning on the runtime.
+fn spawn_with(
+    body: impl FnOnce(std::sync::mpsc::Receiver<Queued>) + Send + 'static,
+) -> Option<(PruneSender, std::thread::JoinHandle<()>)> {
     let (tx, rx) = std::sync::mpsc::channel::<Queued>();
     let spawned = std::thread::Builder::new().name("n42-queue-prune".to_owned()).spawn(move || {
-        let (min_fold, max_wait) = min_fold();
-        let max_fold = max_fold();
-        // What a capped wake left over (`N42_PRUNE_MAX_FOLD`); the next
-        // wake starts from it without blocking.
-        let mut carry: Vec<Queued> = Vec::new();
-        loop {
-            // Everything already waiting is taken in this wake, in order.
-            // Whether the wake's first item comes from the channel (not the carry).
-            let first_from_rx = carry.is_empty();
-            let mut batch = if first_from_rx {
-                match rx.recv() {
-                    Ok(first) => vec![first],
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(rx))) {
+            let message = panic
+                .downcast_ref::<&str>()
+                .map(|m| (*m).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a non-string panic".to_owned());
+            tracing::error!(
+                target: "n42.tx_queue",
+                panic = %message,
+                canonical_head = n42_engine_types::canonical_head::number(),
+                feed_depth = FEED_DEPTH.load(Ordering::Relaxed),
+                "the queue's pruning thread panicked; the runtime prunes from the next notification"
+            );
+        }
+    });
+    match spawned {
+        Ok(handle) => {
+            info!(target: "n42.tx_queue", "canonical queue pruner on its own thread");
+            Some((PruneSender(tx), handle))
+        }
+        Err(err) => {
+            warn!(target: "n42.tx_queue", %err, "N42_QUEUE_PRUNE_THREAD=1 but its thread could not be started; pruning on the runtime");
+            None
+        }
+    }
+}
+
+/// The pruning thread's loop: wakes on its inbox, folds what is waiting
+/// and prunes it, until the inbox closes.
+fn run_pruner(queue: &TxQueue<N42PooledTransaction>, rx: std::sync::mpsc::Receiver<Queued>) {
+    let (min_fold, max_wait) = min_fold();
+    let max_fold = max_fold();
+    // What a capped wake left over (`N42_PRUNE_MAX_FOLD`); the next
+    // wake starts from it without blocking.
+    let mut carry: Vec<Queued> = Vec::new();
+    loop {
+        // Everything already waiting is taken in this wake, in order.
+        // Whether the wake's first item comes from the channel (not the carry).
+        let first_from_rx = carry.is_empty();
+        let mut batch = if first_from_rx {
+            match rx.recv() {
+                Ok(first) => vec![first],
+                Err(_) => break,
+            }
+        } else {
+            std::mem::take(&mut carry)
+        };
+        // The channel's depth at the wake's start, the item just
+        // received included (`feed_depth` on the prune line).
+        let feed_depth = FEED_DEPTH.load(Ordering::Relaxed);
+        let mut received = usize::from(first_from_rx);
+        while let Ok(next) = rx.try_recv() {
+            batch.push(next);
+            received += 1;
+        }
+        // `N42_PRUNE_MIN_FOLD`: wait for more, up to `max_wait` after
+        // the first arrived, so the wake folds at least `min_fold`.
+        if min_fold > 1 {
+            let deadline = batch[0].1 + max_wait;
+            while batch.len() < min_fold {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                match rx.recv_timeout(deadline - now) {
+                    Ok(next) => {
+                        batch.push(next);
+                        received += 1;
+                        while let Ok(more) = rx.try_recv() {
+                            batch.push(more);
+                            received += 1;
+                        }
+                    }
                     Err(_) => break,
                 }
-            } else {
-                std::mem::take(&mut carry)
-            };
-            // The channel's depth at the wake's start, the item just
-            // received included (`feed_depth` on the prune line).
-            let feed_depth = FEED_DEPTH.load(Ordering::Relaxed);
-            let mut received = usize::from(first_from_rx);
-            while let Ok(next) = rx.try_recv() {
-                batch.push(next);
-                received += 1;
             }
-            // `N42_PRUNE_MIN_FOLD`: wait for more, up to `max_wait` after
-            // the first arrived, so the wake folds at least `min_fold`.
-            if min_fold > 1 {
-                let deadline = batch[0].1 + max_wait;
-                while batch.len() < min_fold {
-                    let now = std::time::Instant::now();
-                    if now >= deadline {
-                        break;
-                    }
-                    match rx.recv_timeout(deadline - now) {
-                        Ok(next) => {
-                            batch.push(next);
-                            received += 1;
-                            while let Ok(more) = rx.try_recv() {
-                                batch.push(more);
-                                received += 1;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-            FEED_DEPTH.fetch_sub(received, Ordering::Relaxed);
-            if max_fold > 0 && batch.len() > max_fold {
-                carry = batch.split_off(max_fold);
-            }
-            let coalesced = batch.len();
-            if n42_tx_queue::prune_lean() {
-                let waited = batch[0].1.elapsed();
-                let feed: Vec<&PruneFeed> = batch.iter().map(|(f, _)| f).collect();
-                prune_feed_lean(&queue, &feed, waited, feed_depth);
-                drop(feed);
-                // Freed on the queue's freeing thread: a pruner behind the
-                // engine holds the last reference to the wake's blocks, and
-                // their free was ~13 ms a block on this thread after the
-                // logged prune (loop351 by, lean legs, 25-block wakes).
-                if free_inline() {
-                    drop(batch);
-                } else {
-                    n42_tx_queue::free_later(batch);
-                }
-                continue;
-            }
-            for (feed, arrived) in &batch {
-                prune_one(&queue, FeedRef::from(feed), coalesced, arrived.elapsed(), feed_depth);
-            }
-            // As on the lean path: the wake's notifications go to the
-            // freeing thread once every one is pruned and logged.
+        }
+        FEED_DEPTH.fetch_sub(received, Ordering::Relaxed);
+        if max_fold > 0 && batch.len() > max_fold {
+            carry = batch.split_off(max_fold);
+        }
+        let coalesced = batch.len();
+        if n42_tx_queue::prune_lean() {
+            let waited = batch[0].1.elapsed();
+            let feed: Vec<&PruneFeed> = batch.iter().map(|(f, _)| f).collect();
+            prune_feed_lean(queue, &feed, waited, feed_depth);
+            drop(feed);
+            // Freed on the queue's freeing thread: a pruner behind the
+            // engine holds the last reference to the wake's blocks, and
+            // their free was ~13 ms a block on this thread after the
+            // logged prune (loop351 by, lean legs, 25-block wakes).
             if free_inline() {
                 drop(batch);
             } else {
                 n42_tx_queue::free_later(batch);
             }
+            continue;
         }
-    });
-    match spawned {
-        Ok(_) => {
-            info!(target: "n42.tx_queue", "canonical queue pruner on its own thread");
-            Some(PruneSender(tx))
+        for (feed, arrived) in &batch {
+            prune_one(queue, FeedRef::from(feed), coalesced, arrived.elapsed(), feed_depth);
         }
-        Err(err) => {
-            warn!(target: "n42.tx_queue", %err, "N42_QUEUE_PRUNE_THREAD=1 but its thread could not be started; pruning on the runtime");
-            None
+        // As on the lean path: the wake's notifications go to the
+        // freeing thread once every one is pruned and logged.
+        if free_inline() {
+            drop(batch);
+        } else {
+            n42_tx_queue::free_later(batch);
         }
     }
 }
@@ -648,6 +726,47 @@ mod tests {
         let first = notification.committed().blocks_iter().next().map(|b| (b.hash(), *b.body().transactions[1].tx_hash()));
         assert_eq!(first, Some((lean[0].hash, lean[0].hashes[1])));
         assert!(matches!(PruneFeed::of(notification, false), PruneFeed::Whole(_)), "the knob off goes whole");
+    }
+
+    fn filled(notification: &CanonStateNotification<N42Primitives>) -> TxQueue<N42PooledTransaction> {
+        let queue: TxQueue<N42PooledTransaction> = TxQueue::new();
+        let txs: Vec<N42PooledTransaction> = notification
+            .committed()
+            .blocks_iter()
+            .flat_map(|b| b.transactions_with_sender().map(|(s, tx)| (*s, tx.clone())).collect::<Vec<_>>())
+            .chain(std::iter::once((addr(1), transfer(2, 9))))
+            .filter_map(|(s, tx)| {
+                N42PooledTransaction::try_from_consensus(reth_primitives_traits::Recovered::new_unchecked(tx, s)).ok()
+            })
+            .collect();
+        queue.push_reverted(txs);
+        queue
+    }
+
+    /// A pruning thread whose body panics: the panic is caught, the inbox
+    /// closes, and the next forward prunes inline and forgets the thread.
+    #[test]
+    fn a_dead_pruning_thread_is_followed_by_inline_pruning() {
+        let notification = commit();
+        let queue = filled(&notification);
+        let expected = filled(&notification);
+        prune_feed_inline(&expected, &PruneFeed::of(notification.clone(), false));
+        assert!(expected.len() < queue.len(), "the commit prunes something");
+        let (sender, handle) = spawn_with(|_rx| panic!("a pruner bug")).expect("a thread");
+        handle.join().expect("the panic is caught inside the thread");
+        let mut pruner = Some(sender);
+        let mut inline_runs = 0;
+        forward(&mut pruner, PruneFeed::of(notification.clone(), false), |feed| {
+            inline_runs += 1;
+            prune_feed_inline(&queue, &feed);
+        });
+        assert!(pruner.is_none(), "the dead thread is forgotten");
+        assert_eq!(inline_runs, 1);
+        assert_eq!(queue.len(), expected.len());
+        assert_eq!(queue.usable(), expected.usable());
+        // Later items go inline without trying the thread.
+        forward(&mut pruner, PruneFeed::of(notification, false), |_| inline_runs += 1);
+        assert_eq!(inline_runs, 2);
     }
 
     #[test]

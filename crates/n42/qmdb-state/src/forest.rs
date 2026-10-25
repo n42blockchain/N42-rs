@@ -737,7 +737,8 @@ impl QmdbForest {
             head_number = self.head.0,
             head = %self.head.1,
             pending_parent = ?self.pending.as_ref().map(|(parent, _)| *parent),
-            "QMDB forest poisoned: no further state roots will be computed; restart the node to rebuild the tree"
+            "QMDB forest poisoned: no further state roots will be computed and every block's root is refused; \
+             operator action: restart the node (a restart rebuilds the tree from the checkpoint and the log)"
         );
         self.poisoned = Some(reason);
     }

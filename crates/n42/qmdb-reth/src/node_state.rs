@@ -476,8 +476,15 @@ pub enum NodeStateError {
     State(StateError),
     /// The forest is unusable ([`QmdbForest::poison`]): a failed or panicked
     /// mutation left the tree where the forest does not believe it stands,
-    /// so no state root is computed again. Fail-stop: restart the node,
-    /// which rebuilds the tree from the checkpoint and the log.
+    /// so no state root is computed again. Any panic under the forest's lock
+    /// poisons it, a read-only one (a proof, a listing) included. A restart
+    /// rebuilds the tree from the checkpoint and the log.
+    ///
+    /// Today this is a stall, not an exit: the process stays up, every root
+    /// and persistence call fails with this error, and the poisoning is
+    /// logged once at error level ([`QmdbNodeState::poisoned`] reports it to
+    /// a health check). Whether the node should exit on the first one is an
+    /// open policy item.
     #[error("QMDB forest is poisoned and computes no roots: {0}")]
     Poisoned(String),
     /// The snapshot file could not be read or written.
@@ -1557,6 +1564,20 @@ impl QmdbNodeState {
     /// Where the log segment under compaction lives, while one is.
     pub fn sealed_log_path(&self) -> PathBuf {
         self.inner.dir.join(SEALED_LOG_FILE)
+    }
+
+    /// Why the forest is poisoned, if it is ([`NodeStateError::Poisoned`]):
+    /// for a health check or an `n42_qmdb_forest_poisoned` gauge where the
+    /// node keeps its metrics (this crate has no registry). Also reports a
+    /// poisoned forest lock.
+    pub fn poisoned(&self) -> Option<String> {
+        let guard = match self.inner.forest.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned_forest_guard(poisoned, "poisoned"),
+            // Held: the holder is working, and a poisoning is logged anyway.
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        guard.as_ref().and_then(|forest| forest.poisoned().map(str::to_owned))
     }
 
     /// Where the persisted heads' roots are recorded ([`HeadRoots`]).

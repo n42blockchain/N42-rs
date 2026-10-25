@@ -241,12 +241,18 @@ fn shards_merge_mode() -> MergeMode {
 static MERGE_VERIFIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static MERGE_MISMATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn note_merge_verified(same: bool) {
+/// Counts one compare under `N42_SHARDS_MERGE_OFF_PATH=verify`; `Err` when
+/// the two merges differ, so the import stops there instead of carrying a
+/// merge that may be wrong into the state root (the block then goes to the
+/// engine's own path, as any failed direct import does).
+fn note_merge_verified(same: bool) -> Result<(), String> {
     MERGE_VERIFIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if !same {
-        MERGE_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        tracing::warn!(target: "n42.follower_import", "the concurrent shards merge differs from the on-path merge");
+    if same {
+        return Ok(());
     }
+    MERGE_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::warn!(target: "n42.follower_import", "the concurrent shards merge differs from the on-path merge");
+    Err("N42_SHARDS_MERGE_OFF_PATH=verify: the concurrent shards merge differs from the on-path merge".to_string())
 }
 
 /// Executions held for their validator's release
@@ -3172,9 +3178,9 @@ where
                             // The on-path merge beside it, compared and dropped:
                             // one more bundle for the length of the compare.
                             let on_path = shards.merged(&residual.state);
-                            note_merge_verified(on_path == merged);
+                            note_merge_verified(on_path == merged)?;
                         }
-                        (merged, merge_ms, split)
+                        Ok::<_, String>((merged, merge_ms, split))
                     })
                     .map_err(|err| format!("a thread for the shards' merge: {err}"))?
             };
@@ -3199,7 +3205,7 @@ where
                 }
             }
             let wait_at = std::time::Instant::now();
-            let (merged, merge_ms, split) = merger.join().map_err(|_| "the shards' merge thread panicked".to_string())?;
+            let (merged, merge_ms, split) = merger.join().map_err(|_| "the shards' merge thread panicked".to_string())??;
             merge_times = Some((merge_ms, wait_at.elapsed().as_millis() as u64, split));
             tracing::debug!(
                 target: "n42.follower_import",
@@ -3998,8 +4004,8 @@ mod merge_mode_tests {
             MERGE_VERIFIED.load(std::sync::atomic::Ordering::Relaxed),
             MERGE_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed),
         );
-        note_merge_verified(true);
-        note_merge_verified(false);
+        assert_eq!(note_merge_verified(true), Ok(()));
+        assert!(note_merge_verified(false).is_err(), "a mismatch stops the import");
         assert!(MERGE_VERIFIED.load(std::sync::atomic::Ordering::Relaxed) >= verified + 2);
         assert!(MERGE_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed) > mismatched);
     }

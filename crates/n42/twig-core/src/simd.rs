@@ -104,9 +104,22 @@ pub fn kernel_name() -> &'static str {
 /// both `Twig::recompute` (whole levels) and `Twig::fold_batch` (level-by-level)
 /// satisfy this by construction.
 pub(crate) fn hash_parents(nodes: &mut [Hash], parents: &[usize]) {
+    // The SIMD kernels read `nodes[2p..2p + 2]` and write `nodes[p]` through
+    // raw pointers with no bounds check. Checked once per call in debug
+    // builds only: this runs on the commit path, and every caller passes the
+    // parents of one heap level of its own `nodes`.
+    debug_assert!(
+        parents.iter().all(|&p| p.checked_mul(2).is_some_and(|child| child + 1 < nodes.len())),
+        "hash_parents: a parent whose children lie past the {} nodes",
+        nodes.len()
+    );
     match kernel() {
+        // SAFETY: the kernel was chosen by `kernel()` for a CPU that has the
+        // feature, and every parent's children lie inside `nodes` (the
+        // callers' contract above, asserted in debug builds).
         #[cfg(target_arch = "x86_64")]
         Kernel::Avx512 => unsafe { x86::hash_parents_avx512(nodes, parents) },
+        // SAFETY: as above.
         #[cfg(target_arch = "x86_64")]
         Kernel::Avx2 => unsafe { x86::hash_parents_avx2(nodes, parents) },
         Kernel::Scalar => hash_parents_scalar(nodes, parents),
@@ -167,6 +180,12 @@ mod x86 {
 
     /// Gather one lane's 64-byte block (two adjacent child hashes) into the
     /// word-major transposed message buffer: `msg_t[w * LANES + lane]`.
+    ///
+    /// # Safety
+    ///
+    /// `2 * parent + 1 < nodes.len()`: the 64 bytes read are
+    /// `nodes[2 * parent]` and `nodes[2 * parent + 1]`, unchecked
+    /// ([`super::hash_parents`] asserts it in debug builds).
     #[inline(always)]
     unsafe fn fill_lane<const LANES: usize>(
         msg_t: &mut [u32],
@@ -183,6 +202,11 @@ mod x86 {
     }
 
     /// Scatter one lane's 32-byte output hash back to `nodes[parent]`.
+    ///
+    /// # Safety
+    ///
+    /// `parent < nodes.len()`, unchecked (implied by [`fill_lane`]'s bound,
+    /// which [`super::hash_parents`] asserts in debug builds).
     #[inline(always)]
     unsafe fn store_lane<const LANES: usize>(
         out_t: &[u32],
@@ -320,6 +344,9 @@ mod x86 {
             ];
             let len64 = _mm512_set1_epi32(64);
             while i + 16 <= parents.len() {
+                // SAFETY: `parents[i + l]` is in bounds (`i + 16 <=
+                // parents.len()`), and every parent's children lie inside
+                // `nodes` (`hash_parents`' contract).
                 for l in 0..16 {
                     fill_lane::<16>(&mut msg_t, nodes, l, parents[i + l]);
                 }
@@ -328,6 +355,7 @@ mod x86 {
                 for (w, ov) in o.iter().enumerate() {
                     _mm512_storeu_si512(out_t.as_mut_ptr().add(w * 16) as *mut _, *ov);
                 }
+                // SAFETY: the same parents, each inside `nodes`.
                 for l in 0..16 {
                     store_lane::<16>(&out_t, nodes, l, parents[i + l]);
                 }
@@ -601,6 +629,9 @@ mod x86 {
             ];
             let len64 = _mm256_set1_epi32(64);
             while i + 8 <= parents.len() {
+                // SAFETY: `parents[i + l]` is in bounds (`i + 8 <=
+                // parents.len()`), and every parent's children lie inside
+                // `nodes` (`hash_parents`' contract).
                 for l in 0..8 {
                     fill_lane::<8>(&mut msg_t, nodes, l, parents[i + l]);
                 }
@@ -609,6 +640,7 @@ mod x86 {
                 for (w, ov) in o.iter().enumerate() {
                     _mm256_storeu_si256(out_t.as_mut_ptr().add(w * 8) as *mut _, *ov);
                 }
+                // SAFETY: the same parents, each inside `nodes`.
                 for l in 0..8 {
                     store_lane::<8>(&out_t, nodes, l, parents[i + l]);
                 }
@@ -694,6 +726,17 @@ mod x86 {
 mod tests {
     use super::*;
     use rand::RngCore;
+
+    /// A parent whose children lie past `nodes` is caught before any kernel
+    /// reads through a raw pointer (debug builds).
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "hash_parents: a parent whose children lie past")]
+    fn a_parent_past_the_nodes_is_refused_in_debug_builds() {
+        let mut nodes = vec![[0u8; 32]; 32];
+        let parents: Vec<usize> = (1..16).chain([16]).collect();
+        hash_parents(&mut nodes, &parents);
+    }
 
     fn random_nodes(n: usize) -> Vec<Hash> {
         let mut rng = rand::rng();

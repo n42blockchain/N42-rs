@@ -1614,20 +1614,35 @@ impl Default for QmdbCompatTree {
 }
 
 impl Clone for QmdbCompatTree {
-    /// A file-backed tree clones as a second handle on the same file; see
-    /// `FileEntries::duplicate` for what a clone may and may not do.
+    /// [`QmdbCompatTree::try_clone`], panicking only when a file-backed
+    /// tree's entry file cannot be reopened (no descriptor left). A heap
+    /// tree's clone is a full, writable copy; a file-backed tree's clone is
+    /// read-only (see `try_clone`).
     fn clone(&self) -> Self {
-        Self {
-            entries: self.entries.try_clone().expect("the entry file could not be reopened for a clone"),
+        self.try_clone().expect("the entry file could not be reopened for a clone")
+    }
+}
+
+impl QmdbCompatTree {
+    /// A copy of this tree. A heap tree's copy is independent and writable.
+    /// A file-backed tree's copy is a second, read-only handle on the same
+    /// entry file: it answers roots, proofs and reads as the original stood,
+    /// but every operation that would append to or cut the file (`set`,
+    /// `apply_sorted_ops*`, `apply_undo` past the cursor, a flush of the
+    /// original's unwritten tail) returns an error instead. It carries no
+    /// truncation guard: the guard belongs to the original's read view.
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            entries: self.entries.try_clone()?,
             index: self.index.clone(),
             twigs: self.twigs.clone(),
             next_slot: self.next_slot,
             recording: self.recording.clone(),
             upper: std::sync::Mutex::new(self.upper.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()),
             evicted_below: self.evicted_below,
-            truncation_guard: self.truncation_guard.clone(),
+            truncation_guard: None,
             spare_twig_nodes: Vec::new(),
-        }
+        })
     }
 }
 
@@ -3739,6 +3754,49 @@ mod tests {
         crate::entry_store::failpoints::fail_next_append(&path, 0);
         let err = tree.set(key(2), b"two".to_vec()).unwrap_err();
         assert!(matches!(err, QmdbOperationError::Store(_)), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A clone of a file-backed tree reads as the original stood but refuses
+    /// every append and cut, and carries no truncation guard; the original
+    /// goes on unaffected.
+    #[test]
+    fn a_clone_of_a_file_backed_tree_is_read_only() {
+        let dir = std::env::temp_dir().join(format!("n42-twig-clone-read-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("entries.log");
+        let mut tree = QmdbCompatTree::new();
+        tree.set(key(1), b"one".to_vec()).unwrap();
+        tree.set_entry_file(&path).unwrap();
+        let (_, undo) = tree
+            .apply_sorted_ops_recorded(vec![QmdbOperation { key: key(2), value: Some(b"two".to_vec()) }])
+            .unwrap();
+        tree.flush_entries_for_sync().unwrap();
+        struct Never;
+        impl TruncationGuard for Never {
+            fn before_truncate(&self, _new_len: u64) {
+                panic!("a clone must not tell the original's guard");
+            }
+        }
+        tree.set_truncation_guard(Some(std::sync::Arc::new(Never)));
+        let file_len = std::fs::metadata(&path).unwrap().len();
+
+        let mut clone = tree.try_clone().unwrap();
+        assert_eq!(clone.root(), tree.root());
+        assert!(clone.truncation_guard.is_none());
+        assert!(matches!(clone.set(key(3), b"three".to_vec()), Err(QmdbOperationError::Store(_))));
+        let mut copy = tree.clone();
+        assert!(copy.apply_sorted_ops(vec![QmdbOperation { key: key(4), value: Some(vec![4]) }]).is_err());
+        let mut undone = tree.clone();
+        assert!(undone.apply_undo(&undo).is_err(), "a clone does not cut the file");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), file_len);
+        drop((clone, copy, undone));
+
+        tree.set_truncation_guard(None);
+        tree.set(key(5), b"five".to_vec()).unwrap();
+        tree.flush_entries_for_sync().unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > file_len, "the original still appends");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

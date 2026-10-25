@@ -161,8 +161,15 @@ impl ViewTiming {
 pub const FUTURE_VIEW_WINDOW: u64 = 50;
 
 /// Maximum number of buffered future-view messages.
-/// When exceeded, the oldest (lowest view) messages are evicted.
+/// When exceeded, the highest-view message is evicted: the lowest views are
+/// the ones the node is about to enter and needs most.
 const MAX_FUTURE_MESSAGES: usize = 256;
+
+/// Maximum number of buffered future-view messages attributed to one sender.
+const MAX_FUTURE_MESSAGES_PER_SENDER: usize = 8;
+
+/// Maximum number of buffered future-view messages for one view.
+const MAX_FUTURE_MESSAGES_PER_VIEW: usize = 64;
 
 /// Events fed into the consensus engine.
 #[derive(Debug)]
@@ -1128,33 +1135,19 @@ impl ConsensusEngine {
                         if view == new_current {
                             return self.dispatch_message(msg, authenticated_proof);
                         }
-                        if view > new_current
-                            && view <= new_current + FUTURE_VIEW_WINDOW
-                            && self.future_msg_buffer.len() < MAX_FUTURE_MESSAGES
-                        {
-                            self.future_msg_buffer.push((view, msg));
+                        if view > new_current && view <= new_current + FUTURE_VIEW_WINDOW {
+                            self.buffer_future_message(view, msg, authenticated_proof.is_some());
                         }
                         return Ok(());
                     }
-                    if self.future_msg_buffer.len() >= MAX_FUTURE_MESSAGES {
-                        // Evict the oldest (lowest view) entry.
-                        if let Some(min_idx) = self
-                            .future_msg_buffer
-                            .iter()
-                            .enumerate()
-                            .min_by_key(|(_, (v, _))| *v)
-                            .map(|(i, _)| i)
-                        {
-                            self.future_msg_buffer.swap_remove(min_idx);
-                        }
+                    if self.buffer_future_message(view, msg, authenticated_proof.is_some()) {
+                        tracing::debug!(target: "n42::cl::engine",
+                            current_view,
+                            msg_view = view,
+                            buffered = self.future_msg_buffer.len(),
+                            "buffering future-view message"
+                        );
                     }
-                    tracing::debug!(target: "n42::cl::engine",
-                        current_view,
-                        msg_view = view,
-                        buffered = self.future_msg_buffer.len(),
-                        "buffering future-view message"
-                    );
-                    self.future_msg_buffer.push((view, msg));
                     return Ok(());
                 }
 
@@ -1163,11 +1156,8 @@ impl ConsensusEngine {
                     let new_current = self.round_state.current_view();
                     if view == new_current {
                         return self.dispatch_message(msg, authenticated_proof);
-                    } else if view > new_current
-                        && view <= new_current + FUTURE_VIEW_WINDOW
-                        && self.future_msg_buffer.len() < MAX_FUTURE_MESSAGES
-                    {
-                        self.future_msg_buffer.push((view, msg));
+                    } else if view > new_current && view <= new_current + FUTURE_VIEW_WINDOW {
+                        self.buffer_future_message(view, msg, authenticated_proof.is_some());
                     }
                 }
                 return Ok(());
@@ -1238,6 +1228,127 @@ impl ConsensusEngine {
             ConsensusMessage::Timeout(t) => self.process_timeout(t),
             ConsensusMessage::NewView(nv) => self.process_new_view(nv),
             ConsensusMessage::Decide(d) => self.process_decide(d),
+        }
+    }
+
+    /// The sender a buffered future message is attributed to, and the hash
+    /// that tells two messages of one kind, view and sender apart.
+    fn future_message_key(msg: &ConsensusMessage) -> (u8, Option<u32>, B256) {
+        match msg {
+            ConsensusMessage::Proposal(p) => (0, Some(p.proposer), p.block_hash),
+            ConsensusMessage::Vote(v) => (1, Some(v.voter), v.block_hash),
+            ConsensusMessage::CommitVote(cv) => (2, Some(cv.voter), cv.block_hash),
+            ConsensusMessage::PrepareQC(pqc) => (3, None, pqc.block_hash),
+            ConsensusMessage::Timeout(t) => (4, Some(t.sender), B256::ZERO),
+            ConsensusMessage::NewView(nv) => (5, Some(nv.leader), B256::ZERO),
+            ConsensusMessage::Decide(d) => (6, None, d.block_hash),
+        }
+    }
+
+    /// Buffers a message for a future view inside the window, bounded and
+    /// deduplicated. Returns whether the message was buffered.
+    ///
+    /// - A copy with the same (kind, view, sender, hash) as a buffered one is
+    ///   dropped (gossip multi-path delivery).
+    /// - A single-signer Vote, CommitVote or Proposal is signature-checked
+    ///   first when the view's validator set is known exactly and no
+    ///   transport proof came with it, so junk cannot take a slot. A
+    ///   CommitVote is checked under the cached changes hash (zero when the
+    ///   proposal is not cached, which is every block without validator
+    ///   changes).
+    /// - At most [`MAX_FUTURE_MESSAGES_PER_SENDER`] per sender and
+    ///   [`MAX_FUTURE_MESSAGES_PER_VIEW`] per view. When a cap or the total
+    ///   [`MAX_FUTURE_MESSAGES`] is reached the highest view goes: a lower
+    ///   view replaces it, a message at or above it is dropped.
+    pub(super) fn buffer_future_message(
+        &mut self,
+        view: ViewNumber,
+        msg: ConsensusMessage,
+        authenticated: bool,
+    ) -> bool {
+        let (kind, sender, hash) = Self::future_message_key(&msg);
+        if self.future_msg_buffer.iter().any(|(buffered_view, buffered)| {
+            *buffered_view == view && Self::future_message_key(buffered) == (kind, sender, hash)
+        }) {
+            return false;
+        }
+
+        let single_signer = matches!(
+            msg,
+            ConsensusMessage::Vote(_)
+                | ConsensusMessage::CommitVote(_)
+                | ConsensusMessage::Proposal(_)
+        );
+        if single_signer
+            && !authenticated
+            && self.epoch_manager.known_validator_set_for_view(view).is_some()
+            && self.authenticated_signer(&msg) != sender
+        {
+            tracing::debug!(target: "n42::cl::engine",
+                msg_view = view,
+                ?sender,
+                "dropping future-view message: signature does not verify"
+            );
+            return false;
+        }
+
+        // Per-view cap: the messages of one view are equals, so a full view
+        // takes no more.
+        let in_view = self
+            .future_msg_buffer
+            .iter()
+            .filter(|(buffered_view, _)| *buffered_view == view)
+            .count();
+        if in_view >= MAX_FUTURE_MESSAGES_PER_VIEW {
+            return false;
+        }
+
+        // Per-sender cap, then the total cap: evict the highest view of the
+        // bucket if the new message is for a lower one.
+        if let Some(sender) = sender {
+            let from_sender = self
+                .future_msg_buffer
+                .iter()
+                .filter(|(_, buffered)| Self::future_message_key(buffered).1 == Some(sender))
+                .count();
+            if from_sender >= MAX_FUTURE_MESSAGES_PER_SENDER
+                && !self.evict_highest_future_message(view, |buffered| {
+                    Self::future_message_key(buffered).1 == Some(sender)
+                })
+            {
+                return false;
+            }
+        }
+        if self.future_msg_buffer.len() >= MAX_FUTURE_MESSAGES
+            && !self.evict_highest_future_message(view, |_| true)
+        {
+            return false;
+        }
+
+        self.future_msg_buffer.push((view, msg));
+        true
+    }
+
+    /// Removes the highest-view buffered message matching `filter` if its
+    /// view is above `view`. Returns whether one was removed.
+    fn evict_highest_future_message(
+        &mut self,
+        view: ViewNumber,
+        filter: impl Fn(&ConsensusMessage) -> bool,
+    ) -> bool {
+        let highest = self
+            .future_msg_buffer
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, buffered))| filter(buffered))
+            .max_by_key(|(_, (buffered_view, _))| *buffered_view)
+            .map(|(index, (buffered_view, _))| (index, *buffered_view));
+        match highest {
+            Some((index, highest_view)) if highest_view > view => {
+                self.future_msg_buffer.swap_remove(index);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -5479,53 +5590,90 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_eviction_removes_lowest_view() {
+    fn test_future_buffer_keeps_next_view_proposal_when_full_of_far_views() {
         use crate::protocol::quorum::signing_message;
 
         let (mut engine, sks, _, _rx) = make_engine(4, 0);
         assert_eq!(engine.current_view(), 1);
 
-        // Directly fill the buffer beyond MAX_FUTURE_MESSAGES to test eviction logic.
-        // Using process_event is limited by FUTURE_VIEW_WINDOW, so populate directly.
-        for v in 2u64..=(MAX_FUTURE_MESSAGES as u64 + 5) {
-            let block_hash = B256::repeat_byte((v % 256) as u8);
-            let msg = signing_message(v, &block_hash);
-            let vote = Vote {
-                view: v,
-                block_hash,
-                voter: 1,
-                signature: sks[1].sign(&msg),
-            };
-
-            // Simulate the eviction logic from process_message
-            if engine.future_msg_buffer.len() >= MAX_FUTURE_MESSAGES {
-                if let Some(min_idx) = engine
-                    .future_msg_buffer
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, (view, _))| *view)
-                    .map(|(i, _)| i)
-                {
-                    engine.future_msg_buffer.swap_remove(min_idx);
-                }
+        // Every validator fills its per-sender quota with distinct votes for
+        // the far edge of the window (view + 50).
+        let far_view = 1 + FUTURE_VIEW_WINDOW;
+        for voter in 0u32..4 {
+            for n in 0u8..(MAX_FUTURE_MESSAGES_PER_SENDER as u8 + 2) {
+                let block_hash = B256::repeat_byte(n.wrapping_add(1));
+                let vote = Vote {
+                    view: far_view,
+                    block_hash,
+                    voter,
+                    signature: sks[voter as usize].sign(&signing_message(far_view, &block_hash)),
+                };
+                engine
+                    .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+                    .expect("far future vote should be buffered or dropped");
             }
-            engine
-                .future_msg_buffer
-                .push((v, ConsensusMessage::Vote(vote)));
         }
-
-        assert_eq!(engine.future_msg_buffer.len(), MAX_FUTURE_MESSAGES);
-
-        let min_view = engine
-            .future_msg_buffer
-            .iter()
-            .map(|(v, _)| *v)
-            .min()
-            .unwrap_or(0);
-        assert!(
-            min_view >= 3,
-            "lowest view in buffer should be >= 3 after eviction, got {min_view}"
+        assert_eq!(
+            engine.future_msg_buffer.len(),
+            4 * MAX_FUTURE_MESSAGES_PER_SENDER,
+            "each sender is capped"
         );
+
+        // A proposal for the next view still finds room: the sender's
+        // highest-view entry is evicted for it.
+        let block_hash = B256::repeat_byte(0xC2);
+        let message = engine.signing_profile.proposal_message(2, block_hash, &None);
+        let proposal = Proposal {
+            view: 2,
+            block_hash,
+            justify_qc: QuorumCertificate::genesis(),
+            proposer: 2,
+            signature: engine.signing_profile.sign(&sks[2], &message),
+            prepare_qc: None,
+            tx_root_hash: None,
+            validator_changes: None,
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .expect("next-view proposal should be buffered");
+        assert!(
+            engine.future_msg_buffer.iter().any(|(view, msg)| {
+                *view == 2 && matches!(msg, ConsensusMessage::Proposal(p) if p.block_hash == block_hash)
+            }),
+            "the next view's proposal must be buffered"
+        );
+        assert_eq!(engine.future_msg_buffer.len(), 4 * MAX_FUTURE_MESSAGES_PER_SENDER);
+    }
+
+    #[test]
+    fn test_future_buffer_drops_duplicates_and_bad_signatures() {
+        use crate::protocol::quorum::signing_message;
+
+        let (mut engine, sks, _, _rx) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0x5A);
+        let vote = Vote {
+            view: 3,
+            block_hash,
+            voter: 1,
+            signature: sks[1].sign(&signing_message(3, &block_hash)),
+        };
+        for _ in 0..3 {
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote.clone())))
+                .expect("future vote");
+        }
+        assert_eq!(engine.future_msg_buffer.len(), 1, "copies are deduplicated");
+
+        let forged = Vote {
+            view: 3,
+            block_hash: B256::repeat_byte(0x5B),
+            voter: 1,
+            signature: sks[2].sign(&signing_message(3, &B256::repeat_byte(0x5B))),
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(forged)))
+            .expect("forged future vote is dropped, not an error");
+        assert_eq!(engine.future_msg_buffer.len(), 1, "a bad signature takes no slot");
     }
 
     #[test]

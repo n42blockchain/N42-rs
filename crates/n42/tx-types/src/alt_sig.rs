@@ -839,12 +839,13 @@ mod merged_batch_tests {
 
     /// Per-signature cost of ed25519-dalek's batch verification and the merged equation, for a
     /// batch from one sender and a batch from up to 128 senders, at the batch size
-    /// `N42_ED25519_BATCH` names (default 128). A measurement, not a check:
+    /// `N42_ED25519_BATCH` names, read as production reads it
+    /// ([`crate::ed25519_batch_size`]: default 64, at most 256). A measurement, not a check:
     /// `N42_ED25519_BATCH=256 cargo test --release -p n42-tx-types --lib merged_batch_timing -- --ignored --nocapture`.
     #[test]
     #[ignore = "timing; run by hand"]
     fn merged_batch_timing() {
-        let size: usize = std::env::var("N42_ED25519_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+        let size: usize = crate::ed25519_batch_size();
         let shapes: [(&str, Vec<AltSigTx>); 2] = [
             ("one sender", (0..size as u64).map(|nonce| signed(9, nonce)).collect()),
             ("distinct senders", (0..size as u64).map(|nonce| signed((nonce % 128) as u8 + 100, nonce)).collect()),

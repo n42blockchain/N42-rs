@@ -1135,8 +1135,8 @@ mod tests {
         assert!(!copy.is_active(17));
         // The copy is read-only: it neither appends to nor cuts the file.
         let bytes = std::fs::metadata(&file.path).unwrap().len();
-        assert_eq!(copy.push(&key(9001), &[1u8; 2]).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(copy.truncate(10).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(copy.push(&key(9001), &[1u8; 2]).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(copy.truncate(10).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(copy.len(), 801);
         file.sync().unwrap();
         assert!(std::fs::metadata(&file.path).unwrap().len() >= bytes);

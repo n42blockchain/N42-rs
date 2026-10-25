@@ -171,6 +171,10 @@ pub fn forward(pruner: &mut Option<PruneSender>, feed: PruneFeed, inline: impl F
     if let Err(feed) = sender.send(feed) {
         tracing::error!(target: "n42.tx_queue", "the queue's pruning thread is gone; pruning on the runtime from here on");
         *pruner = None;
+        // What the dead thread never took stays counted otherwise, and the
+        // depth would read as a pruner behind for the rest of the process.
+        FEED_DEPTH.store(0, Ordering::Relaxed);
+        metrics::gauge!("n42_queue_prune_feed_depth").set(0.0);
         inline(feed);
     }
 }
@@ -761,6 +765,7 @@ mod tests {
             prune_feed_inline(&queue, &feed);
         });
         assert!(pruner.is_none(), "the dead thread is forgotten");
+        assert_eq!(FEED_DEPTH.load(Ordering::Relaxed), 0, "the dead inbox is not counted");
         assert_eq!(inline_runs, 1);
         assert_eq!(queue.len(), expected.len());
         assert_eq!(queue.usable(), expected.usable());

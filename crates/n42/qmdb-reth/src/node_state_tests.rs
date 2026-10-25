@@ -1025,3 +1025,61 @@ fn a_branch_switch_during_a_lease_waits_and_takes_the_owed_trim_first() {
     assert_eq!(view.head(), (21, hash_of(21)));
     assert!(view.is_valid());
 }
+
+// ---------------------------------------------------------------------------
+// The restart's root check
+// ---------------------------------------------------------------------------
+
+/// A restart compares the rebuilt tree's root with the one recorded when its
+/// head was persisted: a clean restart passes, one over a corrupt entry file
+/// fails by name, and a datadir with no record restarts unchecked.
+#[test]
+fn a_restart_over_a_corrupt_entry_file_fails_on_its_root() {
+    let (state, chain, dir, head, root) = node_at("restart-root", true, 3);
+    let entries = state.entry_file_path();
+    let roots = state.head_roots_path();
+    drop(state);
+    assert!(roots.exists(), "the persisted heads' roots are recorded");
+
+    let clean = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+    clean.initialize((3, head)).expect("a clean restart");
+    assert_eq!(clean.state_root(), root);
+    drop(clean);
+
+    let good = std::fs::read(&entries).expect("the entry file");
+    let mut bytes = good.clone();
+    *bytes.last_mut().expect("a record") ^= 0xff;
+    std::fs::write(&entries, &bytes).expect("corrupt one record");
+    let corrupt = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+    let err = corrupt.initialize((3, head)).expect_err("a corrupt entry file is refused");
+    assert!(matches!(err, NodeStateError::RestoredRootMismatch { number: 3, recorded, .. } if recorded == root), "{err}");
+    drop(corrupt);
+
+    std::fs::write(&entries, &good).expect("restore the record");
+    std::fs::remove_file(&roots).expect("drop the record");
+    let unchecked = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    unchecked.initialize((3, head)).expect("no record: the check is skipped");
+    assert_eq!(unchecked.state_root(), root);
+    drop(unchecked);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same check in heap mode, over a corrupt snapshot's restored tree.
+#[test]
+fn a_heap_restart_checks_its_root_too() {
+    let (state, chain, dir, head, root) = node_at("restart-root-heap", false, 3);
+    drop(state);
+    let clean = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, false);
+    clean.initialize((3, head)).expect("a clean restart");
+    assert_eq!(clean.state_root(), root);
+    let roots = clean.head_roots_path();
+    drop(clean);
+    // A record naming another root for this head stands in for a corrupt
+    // snapshot or log.
+    HeadRoots::write(&roots, &[(3, head, B256::repeat_byte(0x5a))]).expect("rewrite the record");
+    let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, false);
+    let err = restarted.initialize((3, head)).expect_err("the wrong root is refused");
+    assert!(matches!(err, NodeStateError::RestoredRootMismatch { number: 3, restored, .. } if restored == root), "{err}");
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(&dir);
+}

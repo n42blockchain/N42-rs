@@ -82,6 +82,10 @@ const SNAPSHOT_FILE: &str = "forest.bin";
 const DELTA_LOG_FILE: &str = "forest.log";
 /// The log segment a background compaction is folding into the checkpoint.
 const SEALED_LOG_FILE: &str = "forest.log.sealed";
+/// The state roots of recently persisted heads, checked against the tree a
+/// restart rebuilds ([`HeadRoots`]). A sidecar, so the checkpoint, snapshot
+/// and delta-log layouts are unchanged.
+const HEAD_ROOTS_FILE: &str = "forest.roots";
 
 /// Below this the log is left to grow even if it has passed the checkpoint.
 /// Without a floor, a chain whose state is a few kilobytes would rewrite its
@@ -495,6 +499,88 @@ pub enum NodeStateError {
     /// The execution frontier required by a deferred checkpoint is unavailable or corrupt.
     #[error("QMDB deferred recovery: {0}")]
     RecoveryFrontier(String),
+    /// The tree a restart rebuilt from the checkpoint, the log and the entry
+    /// file does not have the root recorded when that head was persisted: a
+    /// corrupt or mismatched entry file, checkpoint or log. Refused rather
+    /// than proposed or attested to.
+    #[error(
+        "the QMDB tree restored at block {number} ({hash}) has root {restored}, but the root recorded \
+         when that head was persisted is {recorded}; the entry file, checkpoint or log is corrupt"
+    )]
+    RestoredRootMismatch {
+        /// The restored head's number.
+        number: u64,
+        /// Its hash.
+        hash: B256,
+        /// The root recorded when it was persisted.
+        recorded: B256,
+        /// The root of the rebuilt tree.
+        restored: B256,
+    },
+}
+
+/// The state roots of the last [`HeadRoots::SLOTS`] persisted heads, in a
+/// fixed ring of checksummed records (`[number][hash][root][digest]`, the
+/// record of block `n` at slot `n % SLOTS`), rewritten in place as heads are
+/// persisted and never fsynced: it is a check, not state. A restart compares
+/// the rebuilt tree's root with the record of its head, when there is a
+/// whole one for that very head (a crash can lose recent records, and an
+/// older datadir has none: the check is then skipped with a warning).
+struct HeadRoots;
+
+impl HeadRoots {
+    const SLOTS: u64 = 1024;
+    const RECORD: usize = 8 + 32 + 32 + 4;
+
+    fn encode(number: u64, hash: B256, root: B256) -> [u8; Self::RECORD] {
+        let mut record = [0u8; Self::RECORD];
+        record[..8].copy_from_slice(&number.to_le_bytes());
+        record[8..40].copy_from_slice(hash.as_slice());
+        record[40..72].copy_from_slice(root.as_slice());
+        let digest = alloy_primitives::keccak256(&record[..72]);
+        record[72..].copy_from_slice(&digest[..4]);
+        record
+    }
+
+    /// Records `heads` (number, hash, root).
+    fn write(path: &Path, heads: &[(u64, B256, B256)]) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        if heads.is_empty() {
+            return Ok(());
+        }
+        let mut file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
+        for (number, hash, root) in heads {
+            file.seek(SeekFrom::Start((number % Self::SLOTS) * Self::RECORD as u64))?;
+            file.write_all(&Self::encode(*number, *hash, *root))?;
+        }
+        Ok(())
+    }
+
+    /// The root recorded for `(number, hash)`, if a whole record of that
+    /// very head is there.
+    fn read(path: &Path, number: u64, hash: B256) -> std::io::Result<Option<B256>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let at = (number % Self::SLOTS) * Self::RECORD as u64;
+        if file.metadata()?.len() < at + Self::RECORD as u64 {
+            return Ok(None);
+        }
+        let mut record = [0u8; Self::RECORD];
+        file.seek(SeekFrom::Start(at))?;
+        file.read_exact(&mut record)?;
+        let digest = alloy_primitives::keccak256(&record[..72]);
+        if record[72..] != digest[..4]
+            || record[..8] != number.to_le_bytes()
+            || record[8..40] != hash.as_slice()[..]
+        {
+            return Ok(None);
+        }
+        Ok(Some(B256::from_slice(&record[40..72])))
+    }
 }
 
 impl From<StateError> for NodeStateError {
@@ -1473,6 +1559,41 @@ impl QmdbNodeState {
         self.inner.dir.join(SEALED_LOG_FILE)
     }
 
+    /// Where the persisted heads' roots are recorded ([`HeadRoots`]).
+    pub fn head_roots_path(&self) -> PathBuf {
+        self.inner.dir.join(HEAD_ROOTS_FILE)
+    }
+
+    /// Records the roots of heads just persisted. A failure is logged: the
+    /// record only lets a restart check its tree.
+    fn record_head_roots(&self, heads: &[(u64, B256, B256)]) {
+        if let Err(error) = HeadRoots::write(&self.head_roots_path(), heads) {
+            warn!(target: "n42.qmdb", %error, "could not record the persisted QMDB heads' roots; a restart cannot check its tree");
+        }
+    }
+
+    /// Compares the root of the tree a restart rebuilt at `head` with the
+    /// one recorded when that head was persisted: a mismatch fails the
+    /// initialisation, no record skips the check with a warning.
+    fn check_restored_root(&self, head: (u64, B256), restored: B256) -> Result<(), NodeStateError> {
+        let path = self.head_roots_path();
+        let recorded = HeadRoots::read(&path, head.0, head.1).map_err(|source| NodeStateError::Io { path, source })?;
+        match recorded {
+            Some(recorded) if recorded == restored => {
+                debug!(target: "n42.qmdb", block = head.0, %restored, "the restored QMDB root matches the recorded one");
+                Ok(())
+            }
+            Some(recorded) => {
+                tracing::error!(target: "n42.qmdb", block = head.0, hash = %head.1, %recorded, %restored, "the restored QMDB tree has the wrong root");
+                Err(NodeStateError::RestoredRootMismatch { number: head.0, hash: head.1, recorded, restored })
+            }
+            None => {
+                warn!(target: "n42.qmdb", block = head.0, hash = %head.1, %restored, "no recorded root for the restored QMDB head; its tree is not checked");
+                Ok(())
+            }
+        }
+    }
+
     fn cursor(&self) -> MutexGuard<'_, PersistCursor> {
         self.inner
             .persist
@@ -2072,6 +2193,7 @@ impl QmdbNodeState {
                     "restored the QMDB forest",
                 );
                 let forest = QmdbForest::from_snapshot(&snapshot)?;
+                self.check_restored_root((snapshot.head_number, snapshot.head_hash), forest.root())?;
                 // The interrupted compaction resumes: the segment is folded
                 // into the checkpoint as it would have been.
                 if let Some(sealed_head) = sealed_head {
@@ -2144,6 +2266,7 @@ impl QmdbNodeState {
             }
             let started = std::time::Instant::now();
             let forest = QmdbForest::from_entry_file(&ckpt, &entry_path)?;
+            self.check_restored_root((ckpt.head_number, ckpt.head_hash), forest.root())?;
             *cursor = PersistCursor {
                 head: ckpt.head_hash,
                 next_slot: ckpt.next_slot,
@@ -2176,7 +2299,9 @@ impl QmdbNodeState {
                     });
                 }
                 info!(target: "n42.qmdb", block = head_number, %head_hash, "migrating a version-1 QMDB checkpoint to the entry file");
-                QmdbForest::from_snapshot(&snapshot)?
+                let forest = QmdbForest::from_snapshot(&snapshot)?;
+                self.check_restored_root((snapshot.head_number, snapshot.head_hash), forest.root())?;
+                forest
             }
             None if head_number == 0 => {
                 let chain = &self.inner.chain;
@@ -2654,7 +2779,14 @@ impl QmdbNodeState {
         let (block_hash, number, ready, released) = self.with_forest("on_canonical", |forest| {
             let block_hash = target.unwrap_or_else(|| forest.head().1);
             let released = forest.set_canonical_releasing(block_hash)?;
-            Ok((block_hash, forest.head().0, forest.take_block_deltas(cursor.head, cursor.next_slot, block_hash), released))
+            let ready = forest.take_block_deltas(cursor.head, cursor.next_slot, block_hash).map(|deltas| {
+                let roots: Vec<(u64, B256, B256)> = deltas
+                    .iter()
+                    .filter_map(|delta| forest.root_of(&delta.head_hash).map(|root| (delta.head_number, delta.head_hash, root)))
+                    .collect();
+                (deltas, roots)
+            });
+            Ok((block_hash, forest.head().0, ready, released))
         })?;
         release_off_lock(number, released);
         // The catch-up's head may be behind one recorded since; that one
@@ -2663,7 +2795,7 @@ impl QmdbNodeState {
             self.inner.canonical_number.store(number, std::sync::atomic::Ordering::Relaxed);
             self.note_reader_lag();
         }
-        if let Some(deltas) = ready {
+        if let Some((deltas, roots)) = ready {
             self.sync_entries_if_file()?;
             for delta in &deltas {
                 let written = append_delta(&self.delta_log_path(), cursor.log_len, delta)?;
@@ -2677,6 +2809,7 @@ impl QmdbNodeState {
                 );
             }
             cursor.head = block_hash;
+            self.record_head_roots(&roots);
             // The tree's move bookkeeping describes changes since the last
             // measured delta; what these deltas carried is measured now, and
             // any move that follows records itself afresh.
@@ -2689,9 +2822,9 @@ impl QmdbNodeState {
             }
             return Ok(());
         }
-        let (delta, released) = self.with_forest("on_canonical#3", |forest| {
+        let (delta, root, released) = self.with_forest("on_canonical#3", |forest| {
             let released = forest.set_canonical_releasing(target.unwrap_or_else(|| forest.head().1))?;
-            Ok((forest.delta_since(cursor.next_slot)?, released))
+            Ok((forest.delta_since(cursor.next_slot)?, forest.root(), released))
         })?;
         release_off_lock(number, released);
         // Rewriting the checkpoint costs the whole state, so it is worth doing
@@ -2708,6 +2841,7 @@ impl QmdbNodeState {
         cursor.head = block_hash;
         cursor.next_slot = delta.next_slot;
         cursor.log_len = written;
+        self.record_head_roots(&[(delta.head_number, block_hash, root)]);
         debug!(
             target: "n42.qmdb",
             block = delta.head_number, %block_hash,
@@ -2979,12 +3113,14 @@ impl QmdbNodeState {
                 forest.sync_entries()?;
                 let ckpt = forest.checkpoint()?;
                 forest.forget_changes();
-                Ok(ckpt)
+                Ok((ckpt, forest.root()))
             })?;
+            let (ckpt, root) = ckpt;
             let mut phases = CompactPhases::default();
             let block_hash = ckpt.head_hash;
             self.save_checkpoint_frontier((ckpt.head_number, block_hash))?;
             let len = write_ckpt(&self.ckpt_path(), &ckpt, &mut phases)?;
+            self.record_head_roots(&[(ckpt.head_number, block_hash, root)]);
             let _ = std::fs::remove_file(self.delta_log_path());
             *cursor = PersistCursor {
                 head: block_hash,
@@ -3010,13 +3146,15 @@ impl QmdbNodeState {
             // The changes are in the snapshot now, so the next delta must be
             // measured from it rather than carrying them a second time.
             forest.forget_changes();
-            Ok(snapshot)
+            Ok((snapshot, forest.root()))
         })?;
+        let (snapshot, root) = snapshot;
         let block_hash = snapshot.head_hash;
         let path = self.snapshot_path();
         let mut phases = CompactPhases::default();
         self.save_checkpoint_frontier((snapshot.head_number, block_hash))?;
         let len = write_snapshot(&path, &snapshot, &mut phases)?;
+        self.record_head_roots(&[(snapshot.head_number, block_hash, root)]);
         // Order matters: the log is emptied only once the checkpoint that
         // supersedes it is on disk, so a crash between the two leaves a log
         // that is merely redundant rather than a state with neither.

@@ -636,6 +636,43 @@ async fn a_range_is_served_off_the_loop_and_its_slots_free_before_the_answer_goe
 }
 
 #[tokio::test]
+async fn a_fifth_range_request_from_one_peer_is_refused_with_the_server_error_code() {
+    let (mut a, mut b) = pair(0).await;
+    let mut parent = B256::ZERO;
+    for number in 1..=3 {
+        let built = MockExecutionLayer::built_block_on(number, parent);
+        parent = built.hash;
+        use n42_h2_execution::ExecutionLayer;
+        within(b.el.new_payload(built.execution_data)).await.expect("accepted");
+    }
+    let target = peer_of(&b);
+    // `a` pulls from `b`, so a refusal reaches its import queue (as an empty
+    // reply) rather than only a log line.
+    a.svc.catch_up =
+        Some(CatchUp { peer: target, next: 2, target: 2, started_at: 1, probing: false, probe_height: 0 });
+
+    // Four of `a`'s requests are in flight at `b` (held here, so the timing
+    // of the mock execution layer cannot free them): `a`'s share is full.
+    let held: Vec<_> = (0..MAX_SERVES_PER_PEER)
+        .map(|_| ServeSlot::take(&b.svc.serve_slots, peer_of(&a)).expect("within the share"))
+        .collect();
+
+    // The fifth is refused with the server-error code: no block, although
+    // `b` has block 2.
+    a.svc.transport.request_range(target, RangeRequest { start: 2, count: 1, step: 1 });
+    let mut a_events = Vec::new();
+    pump(&mut a, &mut b, (false, true), &mut a_events, |a, _, _| !a.svc.pending_imports.is_empty()).await;
+    assert!(a.svc.pending_imports[0].2.is_empty(), "the request past the share is refused");
+
+    // With the share free again the same request is served.
+    drop(held);
+    a.svc.pending_imports.clear();
+    a.svc.transport.request_range(target, RangeRequest { start: 2, count: 1, step: 1 });
+    pump(&mut a, &mut b, (false, true), &mut a_events, |a, _, _| !a.svc.pending_imports.is_empty()).await;
+    assert_eq!(a.svc.pending_imports[0].2.len(), 1, "block 2");
+}
+
+#[tokio::test]
 async fn a_member_behind_its_peer_pulls_the_gap_and_finishes_level() {
     let (b_height, blocks) = (3u64, chain(3));
     let mut b = node(1, 0, None).await;

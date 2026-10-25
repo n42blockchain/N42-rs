@@ -3124,6 +3124,11 @@ mod frozen_tests {
             });
             assert_eq!(walked.len(), merged.state.len(), "{label}: each address once");
             assert!(walked.iter().all(|(address, account)| merged.state.get(address) == Some(account)), "{label}: walk");
+            // What the state root is computed from: the hashed post-state of
+            // the thin bundle read through its shards is the whole map's.
+            let walked_refs: Vec<(&Address, &BundleAccount)> = walked.iter().map(|(address, account)| (address, account)).collect();
+            let merged_refs: Vec<(&Address, &BundleAccount)> = merged.state.iter().collect();
+            assert_eq!(hashed_post_state_of(&walked_refs), hashed_post_state_of(&merged_refs), "{label}: hashed post-state");
             let mut whole = thin.clone();
             n42_sharded_output::materialize(registered, &mut whole);
             assert_eq!(whole, merged, "{label}: materialized");

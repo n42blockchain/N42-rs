@@ -113,6 +113,19 @@ fn main() {
             for knob in &trusting_knobs {
                 warn!(target: "reth::cli", knob = *knob, "trusting ingest mode accepted: this node admits transactions on a frame's word (benchmark only)");
             }
+            // The own-build and follower stores are process-global queues
+            // keyed by hash with fixed caps; a cap below the leader's layers
+            // plus the build in flight and the one ahead means entries are
+            // evicted while a later build may still look for them (the
+            // fallback is a re-execution, not a fault, so this warns).
+            {
+                let depth = n42_engine_types::direct_build::leader_layers::depth();
+                let mut caps = n42_engine_types::built_executions::store_caps();
+                caps.extend(n42::follower_import::store_caps());
+                for line in n42_engine_types::built_executions::undersized_stores(depth, &caps) {
+                    warn!(target: "reth::cli", depth, "{line}");
+                }
+            }
 
             // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md): a
             // malformed value or a depth this node does not run is refused here,

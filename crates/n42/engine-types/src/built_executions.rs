@@ -74,6 +74,27 @@ fn keep() -> usize {
     *KEEP.get_or_init(|| built_keep_from(std::env::var("N42_BUILT_KEEP").ok().as_deref()))
 }
 
+/// The process-global stores of own builds and their caps, by name, for the
+/// start-up check against the leader's layer depth ([`undersized_stores`]).
+pub fn store_caps() -> Vec<(&'static str, usize)> {
+    vec![
+        ("built_executions (N42_BUILT_KEEP)", keep()),
+        ("built_executions.handed (N42_BUILT_KEEP)", keep()),
+        ("built_executions.sealed (N42_BUILT_KEEP)", keep()),
+    ]
+}
+
+/// The stores in `caps` that hold fewer than `depth + 2` entries -- the
+/// leader's layers plus the build in flight and the one ahead -- each as a
+/// line naming the store, its cap and what it needs.
+pub fn undersized_stores(depth: usize, caps: &[(&'static str, usize)]) -> Vec<String> {
+    let needed = depth.saturating_add(2);
+    caps.iter()
+        .filter(|(_, cap)| *cap < needed)
+        .map(|(name, cap)| format!("{name} keeps {cap}, below N42_LEADER_LAYERS {depth} + 2 = {needed}"))
+        .collect()
+}
+
 /// How far a build that was sealed before it finished has come
 /// (docs/PHASE_D_DEFERRED_EXECUTION.md section 13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -299,7 +320,20 @@ fn make_room_into(store: &mut VecDeque<(B256, Entry)>, evicted: &mut Vec<Entry>)
         let removed = if let Some(at) = store.iter().position(|(_, entry)| !entry.pinned && entry.stage == Stage::Complete) {
             store.remove(at)
         } else if unpinned(store) >= keep_finishing() {
-            store.iter().position(|(_, entry)| !entry.pinned).and_then(|at| store.remove(at))
+            let removed = store.iter().position(|(_, entry)| !entry.pinned).and_then(|at| store.remove(at));
+            // Past the hard bound with nothing complete: a build still
+            // finishing goes, and a child waiting on it will not find it.
+            if let Some((hash, entry)) = &removed {
+                tracing::warn!(
+                    target: "n42.built_executions",
+                    number = entry.block.header().number,
+                    built_hash = %hash,
+                    stage = ?entry.stage,
+                    keep = keep(),
+                    "an own build still finishing was evicted at the store's hard bound"
+                );
+            }
+            removed
         } else {
             break;
         };
@@ -1136,6 +1170,16 @@ pub(crate) static STORE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_store_below_the_layer_depth_is_named() {
+        let caps = [("a", 3), ("b", 4), ("c", 8)];
+        assert!(super::undersized_stores(2, &caps).iter().any(|line| line.starts_with("a keeps 3")));
+        assert_eq!(super::undersized_stores(2, &caps).len(), 1);
+        assert_eq!(super::undersized_stores(1, &caps), Vec::<String>::new());
+        assert_eq!(super::undersized_stores(6, &caps).len(), 2);
+        assert_eq!(super::store_caps().len(), 3);
+    }
+
     #[test]
     fn a_held_sealed_block_outlives_the_bound() {
         let _guard = super::STORE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());

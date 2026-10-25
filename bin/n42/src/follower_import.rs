@@ -355,6 +355,13 @@ fn parent_outputs_kept() -> usize {
     *KEPT.get_or_init(|| kept_from_env("N42_PARENT_OUTPUTS_KEPT", PARENT_OUTPUTS_KEPT, 2..=16))
 }
 
+/// The follower's process-global hash-keyed stores and their caps, for the
+/// start-up check against the leader's layer depth
+/// (`n42_engine_types::built_executions::undersized_stores`).
+pub fn store_caps() -> Vec<(&'static str, usize)> {
+    vec![("follower_import.parent_outputs (N42_PARENT_OUTPUTS_KEPT)", parent_outputs_kept())]
+}
+
 /// A capacity knob: `name` parsed as a count within `range`, else `default`
 /// (with a warning for a value that does not parse or lies outside).
 fn kept_from_env(name: &str, default: usize, range: std::ops::RangeInclusive<usize>) -> usize {

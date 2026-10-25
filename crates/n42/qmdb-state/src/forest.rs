@@ -974,6 +974,10 @@ impl QmdbForest {
     /// the entries are not in a file. The caller flushes the entries before
     /// reading the records (`flush_entries_for_sync`).
     pub fn block_changes(&self, block_hash: &B256) -> Option<Vec<([u8; 32], Option<u64>)>> {
+        // A poisoned tree's slots may not be the block's: list nothing.
+        if self.poisoned.is_some() {
+            return None;
+        }
         self.tree.entry_file()?;
         let record = self.records.get(block_hash)?;
         let undo = record.undo.as_ref()?;

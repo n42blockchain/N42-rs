@@ -78,6 +78,13 @@ fn shard_seed() -> u64 {
 
 /// The key's shard: the top byte of a seeded mix (murmur3's finalizer) of
 /// `key[0..8]`. Without the seed a sender cannot aim keys at one shard.
+///
+/// Open perf question: with `key[0]` shards a block's sorted-key lookups
+/// (`held_slots` / `get_into`) stayed inside one or two shards per chunk;
+/// seeded shards spread every chunk over all 256, and batches pay a
+/// grouping pass. Adoption on the bench tree is gated on a bookended fleet7
+/// pair (`apply_us` / `leaves_us` / `index_us`, win1); if it costs, group the
+/// lookups by shard with [`group_by_shard`].
 #[inline]
 fn shard_of(key: &Hash) -> usize {
     let mut x = u64::from_le_bytes([key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]]) ^ shard_seed();
@@ -668,6 +675,8 @@ mod tests {
 
     /// Keys a sender ground to share `key[0]` spread over the shards: past the
     /// point where one shard would have been full they all insert.
+    /// Probabilistic under the per-process seed: 400 keys over 256 shards
+    /// of 12, so a shard overflows with probability about 3e-6.
     #[test]
     fn keys_sharing_their_first_byte_do_not_fill_one_shard() {
         // 16 buckets a shard: 12 keys at the 3/4 load.

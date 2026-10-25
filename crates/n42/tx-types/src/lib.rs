@@ -34,16 +34,18 @@ pub use alt_sig::{
     ED25519_PUBKEY_LEN, ED25519_SIGNATURE_LEN,
 };
 pub use frame::{
-    binary_merkle_root, frame_attest_message, frame_blocks_requested, frame_root, frame_tree_root,
-    frame_tree_root_of, AttestVerdict, FrameAttestation, FrameGateways, FRAME_ATTESTATION_LEN,
+    binary_merkle_root, duplicate_given_sorted_prefixes, frame_attest_message, frame_blocks_requested,
+    frame_root, frame_tree_root, frame_tree_root_of, has_duplicate_hash, hash_prefix, AttestVerdict,
+    FrameAttestation, FrameGateways, FRAME_ATTESTATION_LEN,
     MAX_FRAME_ATTESTATIONS,
 };
 pub use envelope::{N42PooledTxEnvelope, N42PooledTxType, N42TxEnvelope, N42TxType};
 pub use primitives::{Block, BlockBody, N42Primitives, Receipt};
 pub use rpc::{AltSigRpcReceipt, N42RpcReceipt};
 pub use sender_cache::{
-    alt_sig_enabled, ed25519_batch_size, ingest_shard, ingest_verify_mode, parse_ingest_verify,
-    senders_claimed_at_ingest, set_alt_sig_enabled, shard_owner, AltSigSenderCache, IngestVerify,
+    alt_sig_enabled, bench_unsafe_acknowledged, ed25519_batch_size, ingest_shard, ingest_verify_mode,
+    parse_ingest_verify, senders_claimed_at_ingest, set_alt_sig_enabled, shard_owner,
+    trusting_ingest_knobs, trusting_mode_refusal, AltSigSenderCache, IngestVerify,
 };
 
 #[cfg(test)]

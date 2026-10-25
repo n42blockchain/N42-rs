@@ -74,6 +74,27 @@ fn keep() -> usize {
     *KEEP.get_or_init(|| built_keep_from(std::env::var("N42_BUILT_KEEP").ok().as_deref()))
 }
 
+/// The process-global stores of own builds and their caps, by name, for the
+/// start-up check against the leader's layer depth ([`undersized_stores`]).
+pub fn store_caps() -> Vec<(&'static str, usize)> {
+    vec![
+        ("built_executions (N42_BUILT_KEEP)", keep()),
+        ("built_executions.handed (N42_BUILT_KEEP)", keep()),
+        ("built_executions.sealed (N42_BUILT_KEEP)", keep()),
+    ]
+}
+
+/// The stores in `caps` that hold fewer than `depth + 2` entries -- the
+/// leader's layers plus the build in flight and the one ahead -- each as a
+/// line naming the store, its cap and what it needs.
+pub fn undersized_stores(depth: usize, caps: &[(&'static str, usize)]) -> Vec<String> {
+    let needed = depth.saturating_add(2);
+    caps.iter()
+        .filter(|(_, cap)| *cap < needed)
+        .map(|(name, cap)| format!("{name} keeps {cap}, below N42_LEADER_LAYERS {depth} + 2 = {needed}"))
+        .collect()
+}
+
 /// How far a build that was sealed before it finished has come
 /// (docs/PHASE_D_DEFERRED_EXECUTION.md section 13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -143,6 +164,27 @@ pub enum ParentState {
 /// a budget.
 const WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// The guard of a poisoned lock on a store that holds consensus data (an
+/// execution output, a graft's shards, a parent's published output),
+/// recovered as before with `into_inner`, but said once per store at error
+/// level: a thread panicked while holding it, so what the store holds may be
+/// half-updated and the next build or import reads it as valid. Visibility
+/// only; whether such a store should fail the node instead is open.
+pub fn recover_poisoned<G>(store: &'static str, poisoned: std::sync::PoisonError<G>) -> G {
+    static LOGGED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut logged = LOGGED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !logged.contains(&store) {
+        logged.push(store);
+        tracing::error!(
+            target: "n42::poison",
+            store,
+            "a lock on consensus data was poisoned by a panicking thread; its contents are used as they were left"
+        );
+    }
+    drop(logged);
+    poisoned.into_inner()
+}
+
 fn store() -> &'static (Mutex<VecDeque<(B256, Entry)>>, Condvar) {
     static STORE: OnceLock<(Mutex<VecDeque<(B256, Entry)>>, Condvar)> = OnceLock::new();
     STORE.get_or_init(|| (Mutex::new(VecDeque::with_capacity(keep())), Condvar::new()))
@@ -156,7 +198,7 @@ fn keep_finishing() -> usize {
 
 fn put(built_hash: B256, entry: Entry) {
     let (store, advanced) = store();
-    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut store = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
     let evicted = put_into(&mut store, built_hash, entry);
     drop(store);
     advanced.notify_all();
@@ -278,7 +320,20 @@ fn make_room_into(store: &mut VecDeque<(B256, Entry)>, evicted: &mut Vec<Entry>)
         let removed = if let Some(at) = store.iter().position(|(_, entry)| !entry.pinned && entry.stage == Stage::Complete) {
             store.remove(at)
         } else if unpinned(store) >= keep_finishing() {
-            store.iter().position(|(_, entry)| !entry.pinned).and_then(|at| store.remove(at))
+            let removed = store.iter().position(|(_, entry)| !entry.pinned).and_then(|at| store.remove(at));
+            // Past the hard bound with nothing complete: a build still
+            // finishing goes, and a child waiting on it will not find it.
+            if let Some((hash, entry)) = &removed {
+                tracing::warn!(
+                    target: "n42.built_executions",
+                    number = entry.block.header().number,
+                    built_hash = %hash,
+                    stage = ?entry.stage,
+                    keep = keep(),
+                    "an own build still finishing was evicted at the store's hard bound"
+                );
+            }
+            removed
         } else {
             break;
         };
@@ -312,7 +367,7 @@ fn release_passed_pins(store: &mut VecDeque<(B256, Entry)>, canonical: u64) {
 /// canonical head the store reads by itself).
 pub fn release_pins_through(canonical: u64) {
     let (store, _) = store();
-    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut store = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
     release_passed_pins(&mut store, canonical);
 }
 
@@ -327,7 +382,7 @@ pub fn release_pins_through(canonical: u64) {
 /// pin placed then would never be released.
 pub fn pin_sealed(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> bool {
     let (store, _) = store();
-    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut store = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
     if number <= crate::canonical_head::number() {
         return false;
     }
@@ -349,7 +404,7 @@ pub fn pin_sealed(parent: B256, number: u64, state_root: B256, receipts_root: B2
 /// [`pin_sealed`] for the same build is a no-op.
 pub fn handed_off(built_hash: B256) {
     let (store, _) = store();
-    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut store = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
     if let Some((_, entry)) = store.iter_mut().find(|(hash, _)| *hash == built_hash) {
         entry.pinned = false;
         entry.handed_off = true;
@@ -383,7 +438,7 @@ pub fn state_ready(built_hash: B256, execution: BuiltExecution) {
 /// [`wait_for_state`] before the one bundle `StateReady` carries is built.
 pub fn shards_ready(built_hash: B256, parent: ShardedParent) {
     let (store, advanced) = store();
-    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut store = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
     if let Some((_, entry)) = store.iter_mut().find(|(hash, _)| *hash == built_hash)
         && entry.stage < Stage::StateReady
     {
@@ -416,7 +471,7 @@ pub fn answerable(built_hash: B256) {
     // A waiter checks the table under the store's lock: taking it here
     // before the notify means none can miss this wake-up.
     let (store, advanced) = store();
-    drop(store.lock().unwrap_or_else(|p| p.into_inner()));
+    drop(store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p)));
     advanced.notify_all();
 }
 
@@ -461,7 +516,7 @@ pub fn find_answerable(
 ) -> Option<(B256, Arc<RecoveredBlock<Block>>)> {
     let (store, advanced) = store();
     let deadline = std::time::Instant::now() + WAIT;
-    let mut guard = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut guard = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
     loop {
         let found = guard
             .iter()
@@ -475,7 +530,7 @@ pub fn find_answerable(
             Some(_) => {}
             None => {
                 drop(guard);
-                let handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+                let handed = handed().lock().unwrap_or_else(|p| recover_poisoned("built_executions.handed", p));
                 return handed
                     .iter()
                     .rev()
@@ -487,7 +542,7 @@ pub fn find_answerable(
         if now >= deadline {
             return None;
         }
-        let (g, _) = advanced.wait_timeout(guard, deadline - now).unwrap_or_else(|p| p.into_inner());
+        let (g, _) = advanced.wait_timeout(guard, deadline - now).unwrap_or_else(|p| recover_poisoned("built_executions", p));
         guard = g;
     }
 }
@@ -499,7 +554,7 @@ pub fn complete(built_hash: B256, execution: BuiltExecution) {
 
 fn advance(built_hash: B256, stage: Stage, execution: BuiltExecution) {
     let (store, advanced) = store();
-    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut store = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
     match store.iter_mut().find(|(hash, _)| *hash == built_hash) {
         Some((_, entry)) => {
             entry.stage = stage;
@@ -520,7 +575,7 @@ fn advance(built_hash: B256, stage: Stage, execution: BuiltExecution) {
     drop(store);
     // A copy on the handed list (taken before it was complete) is refreshed.
     if stage == Stage::Complete {
-        let mut handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+        let mut handed = handed().lock().unwrap_or_else(|p| recover_poisoned("built_executions.handed", p));
         if let Some((_, kept)) = handed.iter_mut().find(|(hash, _)| *hash == built_hash) {
             *kept = execution_of(&store_get(built_hash)).unwrap_or_else(|| kept.clone());
         }
@@ -530,7 +585,7 @@ fn advance(built_hash: B256, stage: Stage, execution: BuiltExecution) {
 
 fn store_get(built_hash: B256) -> Option<Entry> {
     let (store, _) = store();
-    let store = store.lock().unwrap_or_else(|p| p.into_inner());
+    let store = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
     store.iter().find(|(hash, _)| *hash == built_hash).map(|(_, entry)| entry.clone())
 }
 
@@ -542,7 +597,7 @@ fn execution_of(entry: &Option<Entry>) -> Option<BuiltExecution> {
 /// store, so its waiters return at once rather than at their deadline.
 pub fn fail(built_hash: B256) {
     let (store, advanced) = store();
-    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut store = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
     store.retain(|(hash, _)| *hash != built_hash);
     drop(store);
     advanced.notify_all();
@@ -559,14 +614,14 @@ pub fn stage_of(built_hash: B256) -> Option<Stage> {
 pub fn wait_for(built_hash: B256, stage: Stage) -> Option<BuiltExecution> {
     let (store, advanced) = store();
     let deadline = std::time::Instant::now() + WAIT;
-    let mut guard = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut guard = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
     loop {
         match guard.iter().find(|(hash, _)| *hash == built_hash) {
             Some((_, entry)) if entry.stage >= stage => return entry.execution.clone(),
             Some(_) => {}
             None => {
                 drop(guard);
-                let handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+                let handed = handed().lock().unwrap_or_else(|p| recover_poisoned("built_executions.handed", p));
                 return handed.iter().rev().find(|(hash, _)| *hash == built_hash).map(|(_, built)| built.clone());
             }
         }
@@ -574,7 +629,7 @@ pub fn wait_for(built_hash: B256, stage: Stage) -> Option<BuiltExecution> {
         if now >= deadline {
             return None;
         }
-        let (g, _) = advanced.wait_timeout(guard, deadline - now).unwrap_or_else(|p| p.into_inner());
+        let (g, _) = advanced.wait_timeout(guard, deadline - now).unwrap_or_else(|p| recover_poisoned("built_executions", p));
         guard = g;
     }
 }
@@ -586,7 +641,7 @@ pub fn wait_for(built_hash: B256, stage: Stage) -> Option<BuiltExecution> {
 pub fn wait_for_state(built_hash: B256) -> Option<ParentState> {
     let (store, advanced) = store();
     let deadline = std::time::Instant::now() + WAIT;
-    let mut guard = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut guard = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
     loop {
         match guard.iter().find(|(hash, _)| *hash == built_hash) {
             Some((_, entry)) if entry.stage >= Stage::StateReady => {
@@ -599,7 +654,7 @@ pub fn wait_for_state(built_hash: B256) -> Option<ParentState> {
             Some(_) => {}
             None => {
                 drop(guard);
-                let handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+                let handed = handed().lock().unwrap_or_else(|p| recover_poisoned("built_executions.handed", p));
                 return handed
                     .iter()
                     .rev()
@@ -611,7 +666,7 @@ pub fn wait_for_state(built_hash: B256) -> Option<ParentState> {
         if now >= deadline {
             return None;
         }
-        let (g, _) = advanced.wait_timeout(guard, deadline - now).unwrap_or_else(|p| p.into_inner());
+        let (g, _) = advanced.wait_timeout(guard, deadline - now).unwrap_or_else(|p| recover_poisoned("built_executions", p));
         guard = g;
     }
 }
@@ -629,7 +684,7 @@ pub fn find(parent: B256, number: u64, state_root: B256, receipts_root: B256, ga
 pub fn find_at(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>, stage: Stage) -> Option<(B256, BuiltExecution)> {
     let (store, advanced) = store();
     let deadline = std::time::Instant::now() + WAIT;
-    let mut guard = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut guard = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
     loop {
         let found = guard
             .iter()
@@ -645,7 +700,7 @@ pub fn find_at(parent: B256, number: u64, state_root: B256, receipts_root: B256,
         if now >= deadline {
             return None;
         }
-        let (g, _) = advanced.wait_timeout(guard, deadline - now).unwrap_or_else(|p| p.into_inner());
+        let (g, _) = advanced.wait_timeout(guard, deadline - now).unwrap_or_else(|p| recover_poisoned("built_executions", p));
         guard = g;
     }
 }
@@ -657,7 +712,7 @@ pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, ga
         // Complete first (waiting for a finish behind the seal), then out.
         let (hash, built) = find(parent, number, state_root, receipts_root, gas_used, transactions_root)?;
         let (store, _) = store();
-        let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+        let mut store = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
         if let Some(at) = store.iter().rposition(|(h, _)| *h == hash) {
             store.remove(at);
         }
@@ -669,7 +724,7 @@ pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, ga
     // often than not (loop110 S1: 49 of 52 on-seal builds refused, silently).
     // The execution is four `Arc`s, so the copy costs nothing; the budget is
     // the store's.
-    let mut handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+    let mut handed = handed().lock().unwrap_or_else(|p| recover_poisoned("built_executions.handed", p));
     let mut evicted = Vec::new();
     while let Some(at) = handed.iter().position(|(hash, _)| *hash == taken.0) {
         evicted.extend(handed.remove(at));
@@ -741,13 +796,13 @@ fn find_kept_sealed_with<R>(
     found: impl FnOnce(B256, &Arc<RecoveredBlock<Block>>, Option<&BuiltExecution>) -> R,
 ) -> Option<R> {
     {
-        let handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+        let handed = handed().lock().unwrap_or_else(|p| recover_poisoned("built_executions.handed", p));
         if let Some((hash, built)) = handed.iter().rev().find(|(_, built)| matches_build(built, parent, number, state_root, receipts_root, gas_used, transactions_root)) {
             return Some(found(*hash, &built.block, Some(built)));
         }
     }
     let (store, _) = store();
-    let store = store.lock().unwrap_or_else(|p| p.into_inner());
+    let store = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
     store
         .iter()
         .rev()
@@ -768,7 +823,7 @@ pub fn find_kept_at(parent: B256, number: u64, state_root: B256, receipts_root: 
     // The handed list first: a build the engine already took is complete,
     // and looking there costs nothing where a wait on the store would.
     {
-        let handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+        let handed = handed().lock().unwrap_or_else(|p| recover_poisoned("built_executions.handed", p));
         if let Some(found) = handed.iter().rev().find(|(_, built)| matches_build(built, parent, number, state_root, receipts_root, gas_used, transactions_root)) {
             return Some(found.clone());
         }
@@ -913,9 +968,9 @@ pub fn reseal_moving(
     // Lock order store -> handed -> sealed store; no other function holds
     // two of these at once.
     let (store, advanced) = store();
-    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
-    let mut handed = handed().lock().unwrap_or_else(|p| p.into_inner());
-    let mut sealed_kept = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
+    let mut store = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
+    let mut handed = handed().lock().unwrap_or_else(|p| recover_poisoned("built_executions.handed", p));
+    let mut sealed_kept = sealed_store().lock().unwrap_or_else(|p| recover_poisoned("built_executions.sealed", p));
     let mut slots: Vec<&mut Arc<RecoveredBlock<Block>>> = Vec::new();
     for (hash, entry) in store.iter_mut() {
         if *hash != built_hash {
@@ -976,7 +1031,7 @@ pub fn kept_block(built_hash: B256) -> Option<Arc<RecoveredBlock<Block>>> {
     if let Some(entry) = store_get(built_hash) {
         return Some(entry.block);
     }
-    let handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+    let handed = handed().lock().unwrap_or_else(|p| recover_poisoned("built_executions.handed", p));
     handed.iter().rev().find(|(hash, _)| *hash == built_hash).map(|(_, built)| Arc::clone(&built.block))
 }
 
@@ -1024,7 +1079,7 @@ fn keep_sealed(sealed_hash: B256, transactions: usize, block: SealedKept) {
         }
         hints.push_back((sealed_hash, transactions));
     }
-    let mut store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
+    let mut store = sealed_store().lock().unwrap_or_else(|p| recover_poisoned("built_executions.sealed", p));
     let mut evicted = Vec::new();
     while let Some(at) = store.iter().position(|(hash, _)| *hash == sealed_hash) {
         evicted.extend(store.remove(at));
@@ -1068,7 +1123,7 @@ pub fn sealed_here_with_transactions(hash: B256) -> bool {
 /// The sealed block under this hash, if one was kept; taken out, so a
 /// payload converted twice decodes the second time.
 pub fn take_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
-    let mut store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
+    let mut store = sealed_store().lock().unwrap_or_else(|p| recover_poisoned("built_executions.sealed", p));
     let at = store.iter().position(|(hash, _)| *hash == sealed_hash)?;
     store.remove(at).map(|(_, block)| block.into_block())
 }
@@ -1079,7 +1134,7 @@ pub fn take_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
 /// transaction list the payload carries: loop147-150), and every conversion
 /// must find the body. The store's bound (`keep()`) retires it.
 pub fn find_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
-    let store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
+    let store = sealed_store().lock().unwrap_or_else(|p| recover_poisoned("built_executions.sealed", p));
     store.iter().find(|(hash, _)| *hash == sealed_hash).map(|(_, block)| block.block().clone())
 }
 
@@ -1094,7 +1149,7 @@ pub fn find_or_take_sealed(sealed_hash: B256, transactions: usize) -> Option<Sea
     if !take_sealed_enabled() || transactions == 0 {
         return find_sealed(sealed_hash);
     }
-    let mut store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
+    let mut store = sealed_store().lock().unwrap_or_else(|p| recover_poisoned("built_executions.sealed", p));
     let at = store.iter().position(|(hash, _)| *hash == sealed_hash)?;
     if store[at].1.block().body().transactions.len() != transactions {
         return Some(store[at].1.block().clone());
@@ -1115,6 +1170,16 @@ pub(crate) static STORE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_store_below_the_layer_depth_is_named() {
+        let caps = [("a", 3), ("b", 4), ("c", 8)];
+        assert!(super::undersized_stores(2, &caps).iter().any(|line| line.starts_with("a keeps 3")));
+        assert_eq!(super::undersized_stores(2, &caps).len(), 1);
+        assert_eq!(super::undersized_stores(1, &caps), Vec::<String>::new());
+        assert_eq!(super::undersized_stores(6, &caps).len(), 2);
+        assert_eq!(super::store_caps().len(), 3);
+    }
+
     #[test]
     fn a_held_sealed_block_outlives_the_bound() {
         let _guard = super::STORE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());

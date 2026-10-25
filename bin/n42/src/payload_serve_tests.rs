@@ -265,7 +265,7 @@ fn a_served_block_is_written_with_its_requests_and_access_list() {
     let _guard = lock_listed();
     let payload = built(301, 3, 0x31, Some(vec![Bytes::from_static(&[1, 2]), Bytes::from_static(&[3])]), Some(Bytes::from_static(&[7, 8, 9])));
     let mut out = Vec::new();
-    let (block_len, _) = push_built_payload(&mut out, &payload);
+    let (block_len, _) = push_built_payload(&mut out, &payload).expect("fits a frame");
     let rlp = encode_block_parallel(payload.block());
     assert_eq!(block_len, rlp.len());
     assert_eq!(out[0], 1);
@@ -293,7 +293,7 @@ fn a_served_block_without_requests_or_access_list_ends_in_two_zero_flags() {
     let _guard = lock_listed();
     let payload = built(302, 1, 0x32, None, None);
     let mut out = Vec::new();
-    push_built_payload(&mut out, &payload);
+    push_built_payload(&mut out, &payload).expect("fits a frame");
     assert_eq!(&out[out.len() - 2..], [0, 0]);
 }
 
@@ -303,9 +303,9 @@ fn the_hash_tail_lists_every_transaction_hash_in_block_order() {
     let _guard = lock_listed();
     let payload = built(303, 4, 0x33, None, None);
     let mut plain = Vec::new();
-    push_built_payload_hashed(&mut plain, &payload, false);
+    push_built_payload_hashed(&mut plain, &payload, false).expect("fits a frame");
     let mut hashed = Vec::new();
-    push_built_payload_hashed(&mut hashed, &payload, true);
+    push_built_payload_hashed(&mut hashed, &payload, true).expect("fits a frame");
     assert_eq!(&hashed[..plain.len()], plain.as_slice(), "the hashed form extends the plain one");
     let tail = &hashed[plain.len()..];
     assert_eq!(tail[0], 1, "marker 1: hashes only, no frame layout");
@@ -444,7 +444,7 @@ fn get_payload_serves_the_built_block_and_hashed_adds_the_hash_tail() {
         let payload = built(310, 2, 0x41, None, None);
         let mut client = loopback(Script::Serves(payload.clone()), None).await;
         let mut expected = Vec::new();
-        push_built_payload(&mut expected, &payload);
+        push_built_payload(&mut expected, &payload).expect("fits a frame");
 
         send_get(&mut client, request::GET_PAYLOAD, 7).await;
         let mut got = vec![0u8; expected.len()];
@@ -577,4 +577,35 @@ fn the_experiment_switches_default_to_the_shipped_behaviour() {
     if unset("N42_COMPACT_BODY_WAIT") {
         assert_eq!(miss_wait(), std::time::Duration::from_millis(20));
     }
+}
+
+/// A length past the validator's read limit is a protocol error at the
+/// writer, never a truncated `as u32`; counts are bounded by what the limit
+/// holds of their entries.
+#[test]
+fn a_frame_length_past_the_channel_limit_is_refused() {
+    assert_eq!(frame_len(0).expect("empty"), [0, 0, 0, 0]);
+    assert_eq!(frame_len(0x0102).expect("small"), 0x0102u32.to_le_bytes());
+    assert_eq!(
+        frame_len(raw_engine::MAX_FRAME).expect("at the limit"),
+        (raw_engine::MAX_FRAME as u32).to_le_bytes()
+    );
+    for len in [raw_engine::MAX_FRAME + 1, u32::MAX as usize + 1, usize::MAX] {
+        let err = frame_len(len).expect_err("past the limit");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{len}");
+    }
+    assert!(frame_count(raw_engine::MAX_FRAME / 32, 32).is_ok());
+    assert!(frame_count(raw_engine::MAX_FRAME / 32 + 1, 32).is_err());
+    assert!(frame_count(raw_engine::MAX_FRAME / 36 + 1, 36).is_err());
+}
+
+/// A request whose body stalls after its kind byte ends its connection; one
+/// that arrives in time reads as ever.
+#[tokio::test]
+async fn a_stalled_request_body_times_out() {
+    let deadline = std::time::Duration::from_millis(10);
+    let stalled = within_deadline(deadline, std::future::pending::<std::io::Result<()>>()).await;
+    assert_eq!(stalled.expect_err("stalled").kind(), std::io::ErrorKind::TimedOut);
+    let read = within_frame_deadline(async { Ok::<_, std::io::Error>(7u32) }).await;
+    assert_eq!(read.expect("in time"), 7);
 }

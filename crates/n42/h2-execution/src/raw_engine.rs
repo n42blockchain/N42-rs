@@ -27,6 +27,13 @@ use n42_h2_consensus::header_profile::N42HeaderProfile;
 
 const VERSION: u8 = 1;
 
+/// The largest length either end of the channel writes or reads for one
+/// length-prefixed field (a block, a payload, a body, a status): 256 MiB.
+/// The execution layer checks it before every write, the validator refuses
+/// anything longer on read, so a block that outgrows it is a protocol error
+/// at the writer rather than a dropped connection at the reader.
+pub const MAX_FRAME: usize = 256 << 20;
+
 /// Request kinds on the channel.
 pub mod request {
     /// `u64` payload id follows; the answer is the built block.

@@ -626,13 +626,12 @@ where
             }
         }
         let counts: Vec<usize> = frames.iter().map(|(_, count)| *count).collect();
-        let tree = {
+        let hash_at = |index: usize| {
             use alloy_consensus::transaction::TxHashRef as _;
-            crate::frame_blocks::frame_tree_root_known(&counts, &known, transactions.len(), |index| {
-                *transactions[index].transaction().tx_hash()
-            })
-        }
-        .ok_or_else(|| other("the frame layout does not cover the assembled body".to_owned()))?;
+            *transactions[index].transaction().tx_hash()
+        };
+        let (tree, leaves) = crate::frame_blocks::frame_tree_leaves_known(&counts, &known, transactions.len(), hash_at)
+            .ok_or_else(|| other("the frame layout does not cover the assembled body".to_owned()))?;
         let transactions_root = tree.root;
         let root_us = root_at.elapsed().as_micros() as u64;
         if transactions_root != body.header.transactions_root {
@@ -641,6 +640,16 @@ where
                     .into(),
             ));
         }
+        // The frame tree pairs an odd node with itself, so a body with a
+        // repeated tail (a frame or a transaction named twice) carries the
+        // root of the body without it: such a body is not this header's.
+        // Checked over the leaves and the hashed frames only, never the whole
+        // body ([`crate::frame_blocks::frame_body_ambiguous`]); kept out of
+        // `root_us`.
+        if crate::frame_blocks::frame_body_ambiguous(&counts, &known, &leaves, hash_at) {
+            return Err(other("the described body repeats a frame or a transaction".to_owned()));
+        }
+        crate::frame_blocks::note_distinct_body(transactions_root, transactions.len());
         // Verified from the layout and the body's own hashes, whatever this
         // node's frame index holds (a supplied frame's transactions included):
         // kept so a later whole-body check of the block verifies it the same way.

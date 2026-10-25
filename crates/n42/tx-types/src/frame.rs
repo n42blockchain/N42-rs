@@ -45,6 +45,44 @@ pub fn binary_merkle_root(leaves: &[B256]) -> B256 {
     }
 }
 
+/// The first eight bytes of `hash`, the key [`has_duplicate_hash`] sorts
+/// by (a transaction hash is uniformly distributed, so two different ones
+/// share it with probability 2^-64).
+pub fn hash_prefix(hash: &B256) -> u64 {
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&hash.as_slice()[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+/// Whether `hashes` holds the same hash twice.
+///
+/// The binary Merkle construction pairs an odd last node with itself, so
+/// `frame_root([a, b, c]) == frame_root([a, b, c, c])`: a list with a
+/// duplicate can carry the root of a list without it (the CVE-2012-2459
+/// shape). A body or frame that holds a duplicate transaction hash is never
+/// valid anyway (the second copy repeats a nonce), so refusing one before
+/// trusting its root removes the ambiguity without changing the root.
+pub fn has_duplicate_hash(hashes: &[B256]) -> bool {
+    if hashes.len() < 2 {
+        return false;
+    }
+    let mut prefixes: Vec<u64> = hashes.iter().map(hash_prefix).collect();
+    prefixes.sort_unstable();
+    duplicate_given_sorted_prefixes(hashes, &prefixes)
+}
+
+/// [`has_duplicate_hash`] with `sorted` the [`hash_prefix`] of every one of
+/// `hashes`, sorted (by a caller that sorts them in parallel). Only when two
+/// prefixes are equal are the full hashes compared.
+pub fn duplicate_given_sorted_prefixes(hashes: &[B256], sorted: &[u64]) -> bool {
+    if !sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+        return false;
+    }
+    let mut full = hashes.to_vec();
+    full.sort_unstable();
+    full.windows(2).any(|pair| pair[0] == pair[1])
+}
+
 /// A frame's root, and so its id: the binary Merkle root over its
 /// transactions' hashes in frame order.
 ///
@@ -292,6 +330,28 @@ mod tests {
         pair[..32].copy_from_slice(left.as_slice());
         pair[32..].copy_from_slice(right.as_slice());
         keccak256(pair)
+    }
+
+    /// The odd-node rule makes `[a, b, c]` and `[a, b, c, c]` share a root;
+    /// the duplicate check is what tells them apart.
+    #[test]
+    fn a_duplicated_last_leaf_keeps_the_root_and_is_detected() {
+        let three = [leaf(1), leaf(2), leaf(3)];
+        let four = [leaf(1), leaf(2), leaf(3), leaf(3)];
+        assert_eq!(frame_root(&three), frame_root(&four));
+        assert!(!has_duplicate_hash(&three));
+        assert!(has_duplicate_hash(&four));
+        assert!(!has_duplicate_hash(&[]));
+        assert!(!has_duplicate_hash(&[leaf(9)]));
+        // A duplicate anywhere, not only at the end.
+        assert!(has_duplicate_hash(&[leaf(5), leaf(1), leaf(2), leaf(5)]));
+        // Equal prefixes, different hashes: not a duplicate.
+        let x = leaf(7);
+        let mut y = x;
+        y.0[31] ^= 1;
+        assert_eq!(hash_prefix(&x), hash_prefix(&y));
+        assert!(!has_duplicate_hash(&[x, y]));
+        assert!(has_duplicate_hash(&[x, y, x]));
     }
 
     #[test]

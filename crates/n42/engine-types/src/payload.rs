@@ -1172,12 +1172,40 @@ fn spawn_late_reverts(
     graft: Vec<(alloy_primitives::Address, revm::database::AccountRevert)>,
     pool: Option<&'static rayon::ThreadPool>,
 ) -> (Vec<(alloy_primitives::Address, revm::database::AccountRevert)>, Option<LateRevertsTx>) {
+    spawn_late_reverts_with(shards, residual, graft, pool, OsThread)
+}
+
+/// How a helper thread is started: a named OS thread in production
+/// ([`OsThread`]); a test passes one that fails, to reach the fallback.
+trait SpawnThread {
+    /// Starts `work` on a thread named `name`, detached.
+    fn spawn<F: FnOnce() + Send + 'static>(self, name: &str, work: F) -> std::io::Result<()>;
+}
+
+/// [`SpawnThread`] by `std::thread::Builder`.
+#[derive(Debug, Clone, Copy)]
+struct OsThread;
+
+impl SpawnThread for OsThread {
+    fn spawn<F: FnOnce() + Send + 'static>(self, name: &str, work: F) -> std::io::Result<()> {
+        std::thread::Builder::new().name(name.into()).spawn(work).map(drop)
+    }
+}
+
+/// [`spawn_late_reverts`] with the thread started by `spawner`.
+fn spawn_late_reverts_with(
+    shards: &Arc<crate::output_shards::FrozenShards>,
+    residual: &revm::database::BundleState,
+    graft: Vec<(alloy_primitives::Address, revm::database::AccountRevert)>,
+    pool: Option<&'static rayon::ThreadPool>,
+    spawner: impl SpawnThread,
+) -> (Vec<(alloy_primitives::Address, revm::database::AccountRevert)>, Option<LateRevertsTx>) {
     let (tx, rx) = std::sync::mpsc::sync_channel::<n42_deferred_reverts::LateReverts>(1);
     let shards = Arc::clone(shards);
     let block_reverts = residual.reverts.clone();
     let cell = Arc::new(std::sync::Mutex::new(Some(graft)));
     let taken = Arc::clone(&cell);
-    let spawned = std::thread::Builder::new().name("n42-merge-late-reverts".into()).spawn(move || {
+    let spawned = spawner.spawn("n42-merge-late-reverts", move || {
         n42_core_layout::background_thread();
         let graft = taken.lock().ok().and_then(|mut cell| cell.take()).unwrap_or_default();
         let at = std::time::Instant::now();
@@ -3258,7 +3286,7 @@ where
                         // Kept at 0 when nothing was grafted.
                         graft_ms = if sharded_out.is_some() || early_out.is_some() { 0 } else { at.elapsed().as_millis() as u64 };
                         let root_wait_at = std::time::Instant::now();
-                        let root_done = root.map(|job| job.join().expect("the transactions root job does not panic"));
+                        let root_done = root.map(|job| job.join());
                         par_root_wait_ms = root_wait_at.elapsed().as_millis() as u64;
                         let receipts_wait_at = std::time::Instant::now();
                         let receipts_done = receipts_job.map(|job| job.join());
@@ -3266,7 +3294,14 @@ where
                         (graft, root_done, receipts_done)
                     });
                     par_graft_ms = graft_ms;
-                    early_transactions_root = early_root;
+                    early_transactions_root = early_root
+                        .transpose()
+                        .map_err(|_| {
+                            failed_after_seal(
+                                sealed_ahead_id,
+                                PayloadBuilderError::other(std::io::Error::other("the transactions root job panicked")),
+                            )
+                        })?;
                     if let Some(receipts) = receipts {
                         let (receipts, tx_gas, times) = receipts.map_err(|_| {
                             failed_after_seal(
@@ -3944,7 +3979,7 @@ where
             // post-state stays on this thread while the root and the
             // receipts run beside it.
             let parent_root_early = verify_fields.then(|| qmdb_state.root_of(&parent_sealed)).flatten();
-            let (hashed_state, (prepared, root_started, root_ended, kept_ops), roots) = std::thread::scope(|scope| {
+            let (hashed_state, prepared, roots) = std::thread::scope(|scope| {
                 let receipts = &execution_result.receipts;
                 let qmdb_job = &qmdb_state;
                 let root = scope.spawn(move || {
@@ -3964,10 +3999,18 @@ where
                 } else {
                     parent_state_ref().and_then(|state_provider| state_provider.hashed_post_state(bundle_ref))
                 };
-                let prepared = root.join().expect("the QMDB root job does not panic");
-                let roots = receipts.join().expect("the receipts root job does not panic");
+                let prepared = root.join().map_err(|_| "the QMDB root job panicked");
+                let roots = receipts.join().map_err(|_| "the receipts root job panicked");
                 (hashed, prepared, roots)
             });
+            // After `state_ready`: a panicked job fails the build in the
+            // store too, so a child build waiting on it is told at once.
+            let panicked = |err: &str| {
+                crate::built_executions::fail(block_hash);
+                PayloadBuilderError::other(std::io::Error::other(err.to_owned()))
+            };
+            let (prepared, root_started, root_ended, kept_ops) = prepared.map_err(panicked)?;
+            let roots = roots.map_err(panicked)?;
             let hashed_state = hashed_state.map_err(PayloadBuilderError::other)?;
             root_started_at = Some(root_started);
             root_ended_at = Some(root_ended);
@@ -5943,6 +5986,37 @@ fn ticks() -> u64 {
     {
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+    }
+}
+
+#[cfg(test)]
+mod late_reverts_tests {
+    use super::{spawn_late_reverts_with, SpawnThread};
+    use alloy_primitives::Address;
+    use std::sync::Arc;
+
+    /// A spawner that never gets a thread (EAGAIN under pressure).
+    struct NoThread;
+
+    impl SpawnThread for NoThread {
+        fn spawn<F: FnOnce() + Send + 'static>(self, _name: &str, _work: F) -> std::io::Result<()> {
+            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "no thread"))
+        }
+    }
+
+    /// A late revert set that gets no thread hands the graft back whole, so
+    /// the caller's merge runs it in place, and promises nothing.
+    #[test]
+    fn a_late_revert_set_without_a_thread_hands_the_graft_back() {
+        let shards = Arc::new(crate::output_shards::OutputShards::with_index_live(Address::ZERO, 8, 1, false, false).freeze());
+        let residual = revm::database::BundleState::default();
+        let graft: Vec<_> = (1u8..=3)
+            .map(|i| (Address::repeat_byte(i), revm::database::AccountRevert::default()))
+            .collect();
+        let (back, late) = spawn_late_reverts_with(&shards, &residual, graft, None, NoThread);
+        assert!(late.is_none(), "no thread, no promise");
+        let addresses: Vec<Address> = back.iter().map(|(address, _)| *address).collect();
+        assert_eq!(addresses, vec![Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(3)]);
     }
 }
 

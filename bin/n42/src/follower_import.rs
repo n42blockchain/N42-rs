@@ -241,12 +241,18 @@ fn shards_merge_mode() -> MergeMode {
 static MERGE_VERIFIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static MERGE_MISMATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn note_merge_verified(same: bool) {
+/// Counts one compare under `N42_SHARDS_MERGE_OFF_PATH=verify`; `Err` when
+/// the two merges differ, so the import stops there instead of carrying a
+/// merge that may be wrong into the state root (the block then goes to the
+/// engine's own path, as any failed direct import does).
+fn note_merge_verified(same: bool) -> Result<(), String> {
     MERGE_VERIFIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if !same {
-        MERGE_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        tracing::warn!(target: "n42.follower_import", "the concurrent shards merge differs from the on-path merge");
+    if same {
+        return Ok(());
     }
+    MERGE_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::warn!(target: "n42.follower_import", "the concurrent shards merge differs from the on-path merge");
+    Err("N42_SHARDS_MERGE_OFF_PATH=verify: the concurrent shards merge differs from the on-path merge".to_string())
 }
 
 /// Executions held for their validator's release
@@ -276,14 +282,53 @@ pub fn forget_hold(block_hash: B256) {
     }
 }
 
+/// Forgets `block_hash`'s hold when dropped ([`forget_hold`]).
+///
+/// Moved into the import that may reach the hold, so the entry goes when
+/// that import ends -- by success, error, panic or never being run -- and
+/// never while it could still wait on it. An import that failed before its
+/// execution left the entry in [`HELD_EXECUTIONS`] for good otherwise.
+#[derive(Debug)]
+pub struct HoldGuard(B256);
+
+impl HoldGuard {
+    /// A guard for `block_hash`'s hold.
+    pub const fn new(block_hash: B256) -> Self {
+        Self(block_hash)
+    }
+}
+
+impl Drop for HoldGuard {
+    fn drop(&mut self) {
+        forget_hold(self.0);
+    }
+}
+
+/// How long a held execution waits for its validator's release before it is
+/// dropped. A validator that keeps the connection open and never answers
+/// would otherwise pin the importing thread for good. Five times the
+/// genesis view timeout the fleet runs (6 s); a dropped execution leaves the
+/// block to the engine's own path, as any failed direct import does.
+pub const HELD_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Waits for `block_hash`'s release when its execution is held; at once
-/// otherwise. `Err` when it was dropped.
+/// otherwise. `Err` when it was dropped, or no release came within
+/// [`HELD_RELEASE_TIMEOUT`].
 fn wait_for_release(block_hash: B256) -> Result<(), String> {
+    wait_for_release_within(block_hash, HELD_RELEASE_TIMEOUT)
+}
+
+/// [`wait_for_release`] with the wait bounded by `timeout`.
+fn wait_for_release_within(block_hash: B256, timeout: std::time::Duration) -> Result<(), String> {
     let held = HELD_EXECUTIONS.lock().unwrap_or_else(|p| p.into_inner()).as_mut().and_then(|held| held.remove(&block_hash));
     let Some(held) = held else { return Ok(()) };
-    match held.recv() {
+    match held.recv_timeout(timeout) {
         Ok(true) => Ok(()),
-        Ok(false) | Err(_) => Err(HELD_DROPPED.to_owned()),
+        Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(HELD_DROPPED.to_owned()),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(target: "n42.follower_import", %block_hash, ?timeout, "no release for a held execution; dropping it");
+            Err(HELD_DROPPED.to_owned())
+        }
     }
 }
 
@@ -308,6 +353,13 @@ const PARENT_OUTPUTS_KEPT: usize = 4;
 fn parent_outputs_kept() -> usize {
     static KEPT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *KEPT.get_or_init(|| kept_from_env("N42_PARENT_OUTPUTS_KEPT", PARENT_OUTPUTS_KEPT, 2..=16))
+}
+
+/// The follower's process-global hash-keyed stores and their caps, for the
+/// start-up check against the leader's layer depth
+/// (`n42_engine_types::built_executions::undersized_stores`).
+pub fn store_caps() -> Vec<(&'static str, usize)> {
+    vec![("follower_import.parent_outputs (N42_PARENT_OUTPUTS_KEPT)", parent_outputs_kept())]
 }
 
 /// A capacity knob: `name` parsed as a count within `range`, else `default`
@@ -390,7 +442,7 @@ fn publish_parent_outputs() -> bool {
 /// Publishes a block's execution output for its child's check.
 fn publish_parent_output(block_hash: B256, header: reth_primitives_traits::SealedHeader, output: ParentOutput) {
     {
-        let mut outputs = PARENT_OUTPUTS.lock().unwrap_or_else(|p| p.into_inner());
+        let mut outputs = PARENT_OUTPUTS.lock().unwrap_or_else(|p| n42_engine_types::built_executions::recover_poisoned("PARENT_OUTPUTS", p));
         outputs.retain(|(hash, _, _)| *hash != block_hash);
         while outputs.len() >= parent_outputs_kept() {
             outputs.pop_front();
@@ -444,7 +496,7 @@ fn keep_follower_shards(
     residual: ParentOutput,
 ) {
     {
-        let mut kept = FOLLOWER_SHARDS.lock().unwrap_or_else(|p| p.into_inner());
+        let mut kept = FOLLOWER_SHARDS.lock().unwrap_or_else(|p| n42_engine_types::built_executions::recover_poisoned("FOLLOWER_SHARDS", p));
         kept.retain(|(hash, _, _, _)| *hash != block_hash);
         while kept.len() >= follower_shards_kept() {
             kept.pop_front();
@@ -462,7 +514,7 @@ fn follower_shards_of(block_hash: B256) -> Option<(reth_primitives_traits::Seale
     }
     FOLLOWER_SHARDS
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(|p| n42_engine_types::built_executions::recover_poisoned("FOLLOWER_SHARDS", p))
         .iter()
         .find(|(hash, _, _, _)| *hash == block_hash)
         .map(|(_, header, shards, residual)| (header.clone(), ParentLayer::Shards(Arc::clone(shards), Arc::clone(residual))))
@@ -706,14 +758,29 @@ fn two_roads<T>(
     vote: impl FnOnce() -> Result<(), String> + Send,
     execute: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
+    // Held in a slot rather than moved into the thread, so a spawn that
+    // fails (EAGAIN under thread or memory pressure) can still run the vote
+    // inline, before the execution, instead of panicking the import.
+    let vote = std::sync::Mutex::new(Some(vote));
+    let run_vote = || match vote.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+        Some(vote) => vote().map(|()| roads_at.elapsed().as_millis() as u64),
+        None => Err("the vote road ran twice".to_string()),
+    };
     let (voted, executed, exec_ms) = std::thread::scope(|scope| {
-        let voted = std::thread::Builder::new()
-            .name("vote-road".into())
-            .spawn_scoped(scope, || vote().map(|()| roads_at.elapsed().as_millis() as u64))
-            .expect("a thread for the vote road");
-        let executed = execute();
-        let exec_ms = roads_at.elapsed().as_millis() as u64;
-        (voted.join().unwrap_or_else(|_| Err("the vote road thread panicked".to_string())), executed, exec_ms)
+        let run_vote = &run_vote;
+        match std::thread::Builder::new().name("vote-road".into()).spawn_scoped(scope, move || run_vote()) {
+            Ok(voted) => {
+                let executed = execute();
+                let exec_ms = roads_at.elapsed().as_millis() as u64;
+                (voted.join().unwrap_or_else(|_| Err("the vote road thread panicked".to_string())), executed, exec_ms)
+            }
+            Err(err) => {
+                tracing::warn!(target: "n42.follower_import", number, %err, "no thread for the vote road: voting inline, then executing");
+                let voted = run_vote();
+                let executed = execute();
+                (voted, executed, roads_at.elapsed().as_millis() as u64)
+            }
+        }
     });
     let vote_ms = voted?;
     let executed = executed?;
@@ -1357,7 +1424,7 @@ fn decline_on_output(number: u64, why: &'static str) {
 fn published_output(hash: B256) -> Option<(reth_primitives_traits::SealedHeader, ParentOutput)> {
     PARENT_OUTPUTS
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(|p| n42_engine_types::built_executions::recover_poisoned("PARENT_OUTPUTS", p))
         .iter()
         .find(|(kept, _, _)| *kept == hash)
         .map(|(_, header, output)| (header.clone(), Arc::clone(output)))
@@ -3118,9 +3185,9 @@ where
                             // The on-path merge beside it, compared and dropped:
                             // one more bundle for the length of the compare.
                             let on_path = shards.merged(&residual.state);
-                            note_merge_verified(on_path == merged);
+                            note_merge_verified(on_path == merged)?;
                         }
-                        (merged, merge_ms, split)
+                        Ok::<_, String>((merged, merge_ms, split))
                     })
                     .map_err(|err| format!("a thread for the shards' merge: {err}"))?
             };
@@ -3145,7 +3212,7 @@ where
                 }
             }
             let wait_at = std::time::Instant::now();
-            let (merged, merge_ms, split) = merger.join().map_err(|_| "the shards' merge thread panicked".to_string())?;
+            let (merged, merge_ms, split) = merger.join().map_err(|_| "the shards' merge thread panicked".to_string())??;
             merge_times = Some((merge_ms, wait_at.elapsed().as_millis() as u64, split));
             tracing::debug!(
                 target: "n42.follower_import",
@@ -3353,14 +3420,18 @@ where
         // thread asleep, and the chain stopped for the rest of the tenure. A
         // plain thread that waits on the pool blocks and steals nothing.
         let (root, hashed) = std::thread::scope(|scope| {
-            let root = std::thread::Builder::new()
-                .name("qmdb-root".into())
-                .spawn_scoped(scope, root_job)
-                .expect("a thread for the QMDB root");
-            let hashed = hashed_job();
-            (root.join().unwrap_or_else(|_| Err("the QMDB root thread panicked".to_string())), hashed)
+            match std::thread::Builder::new().name("qmdb-root".into()).spawn_scoped(scope, root_job) {
+                Ok(root) => {
+                    let hashed = hashed_job();
+                    (root.join().unwrap_or_else(|_| Err("the QMDB root thread panicked".to_string())), Some(hashed))
+                }
+                // The import fails cleanly (the engine's own path takes the
+                // block) rather than panicking on a resource hiccup.
+                Err(err) => (Err(format!("no thread for the QMDB root: {err}")), None),
+            }
         });
         root?;
+        let hashed = hashed.ok_or_else(|| "the hashed state was not computed".to_string())?;
         let both = root_at.elapsed().as_millis() as u64;
         (both, 0, hashed?)
     };
@@ -3940,8 +4011,8 @@ mod merge_mode_tests {
             MERGE_VERIFIED.load(std::sync::atomic::Ordering::Relaxed),
             MERGE_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed),
         );
-        note_merge_verified(true);
-        note_merge_verified(false);
+        assert_eq!(note_merge_verified(true), Ok(()));
+        assert!(note_merge_verified(false).is_err(), "a mismatch stops the import");
         assert!(MERGE_VERIFIED.load(std::sync::atomic::Ordering::Relaxed) >= verified + 2);
         assert!(MERGE_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed) > mismatched);
     }

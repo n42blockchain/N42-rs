@@ -98,11 +98,26 @@
 //!
 //! # What it is not
 //!
-//! Not a peer protocol and not authenticated. It hands transactions to the pool
-//! exactly as `eth_sendRawTransaction` does — the pool validates every one, and
-//! recovering the sender is the bulk of that — so it can admit nothing the RPC
-//! could not. It is off unless `N42_TX_INGEST=<addr>` is set, and it should be
-//! bound to loopback.
+//! Not a peer protocol and not authenticated. In its default form it hands
+//! transactions to the pool exactly as `eth_sendRawTransaction` does — the pool
+//! validates every one, and recovering the sender is the bulk of that. The
+//! benchmark modes trust far more than that RPC does: `N42_TX_INGEST_DIRECT`
+//! skips the pool's validation, `N42_INGEST_VERIFY=leader|shard` queues
+//! transactions under a sender the frame claims without checking a signature,
+//! and attested frames (`N42_FRAME_GATEWAYS`) are admitted on a gateway's word.
+//! Whoever can reach the port can then feed the node unverified transactions.
+//! In particular `leader`/`shard` trust the gateway's frames outright: a 0x50
+//! transaction with a valid public key and a garbage signature is accepted
+//! (its sender is derived from the key, its signature never checked), so any
+//! account whose key is known can be spent from. These modes are loopback-only
+//! benchmark probes, and the bind refusal below is the actual guard.
+//!
+//! It is off unless `N42_TX_INGEST=<addr>` is set, and it binds loopback only:
+//! a non-loopback address is refused at start-up unless
+//! `N42_TX_INGEST_ALLOW_REMOTE=1`, and refused outright under any of the
+//! trusting modes above ([`ingest_bind_refusal`]). At most
+//! [`MAX_CONNECTIONS`] connections are served at once, and a frame whose body
+//! has not arrived [`FRAME_READ_TIMEOUT`] after its header ends its connection.
 
 pub mod runtime;
 
@@ -117,6 +132,58 @@ use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool}
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
+
+/// Connections served at once; the accept loop waits for a free slot
+/// beyond it (the flood opens one per worker, 64 a node on the bench).
+pub const MAX_CONNECTIONS: usize = 256;
+
+/// How long a frame's body may take to arrive once its header has: a
+/// half-sent frame would otherwise hold its buffer (up to
+/// `MAX_FRAME_BYTES`) for as long as the connection stays open. The wait
+/// between frames is not bounded; an idle generator is not a fault.
+pub const FRAME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether `addr` is a loopback address, an IPv4-mapped IPv6 one included.
+pub fn is_loopback(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_loopback(),
+        std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(ip.is_loopback(), |v4| v4.is_loopback()),
+    }
+}
+
+/// Why an unauthenticated listener named by `knob` must not bind `addr`,
+/// or `None` when it may: loopback always may; any other address only with
+/// `allow_remote` (`<knob>_ALLOW_REMOTE=1`).
+pub fn remote_bind_refusal(knob: &str, addr: &SocketAddr, allow_remote: bool) -> Option<String> {
+    if is_loopback(addr) || allow_remote {
+        return None;
+    }
+    Some(format!(
+        "{knob}={addr} is not a loopback address and the channel is unauthenticated; \
+         bind 127.0.0.1, or set {knob}_ALLOW_REMOTE=1 to bind it anyway"
+    ))
+}
+
+/// Why the ingest must not bind `addr`, or `None` when it may.
+/// [`remote_bind_refusal`], except that a node in a mode that trusts what a
+/// frame says (`trusting`: `N42_TX_INGEST_DIRECT`, claimed senders under
+/// `N42_INGEST_VERIFY=leader|shard`, gateway attestations) never binds a
+/// non-loopback address: there the port admits unverified transactions.
+pub fn ingest_bind_refusal(addr: &SocketAddr, allow_remote: bool, trusting: &[&str]) -> Option<String> {
+    if !is_loopback(addr) && !trusting.is_empty() {
+        return Some(format!(
+            "N42_TX_INGEST={addr} is not a loopback address, and this node trusts its frames ({}): \
+             such an ingest is never bound off loopback, N42_TX_INGEST_ALLOW_REMOTE or not",
+            trusting.join(", ")
+        ));
+    }
+    remote_bind_refusal("N42_TX_INGEST", addr, allow_remote)
+}
+
+/// `<knob>=1`, read when asked (start-up only).
+pub fn allow_remote(knob: &str) -> bool {
+    std::env::var(knob).is_ok_and(|value| value.trim() == "1")
+}
 
 /// Largest frame this will read, in transactions.
 ///
@@ -612,6 +679,17 @@ fn gate_clock_ms() -> u64 {
 /// second across every door, because a systematic drop is a drop per
 /// transaction at half a million a second. The counts on the `ingest` line
 /// are the complete record; these lines are the first few, named.
+/// The pause after a failed `accept()`.
+const ACCEPT_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// At most one "accept failed" warning a second.
+fn accept_warn_allowed() -> bool {
+    static NEXT_MS: AtomicU64 = AtomicU64::new(0);
+    let now = gate_clock_ms();
+    let next = NEXT_MS.load(Ordering::Acquire);
+    now >= next && NEXT_MS.compare_exchange(next, now + 1_000, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
 fn drop_warn_allowed() -> bool {
     static NEXT_MS: AtomicU64 = AtomicU64::new(0);
     let now = gate_clock_ms();
@@ -723,6 +801,17 @@ async fn wait_at_gate(
         }
         GATE.waiting.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// Whether the peer behind `stream` has closed: waits until the stream has
+/// bytes (`false`, nothing consumed) or reaches end-of-stream (`true`).
+/// Cancel-safe: `fill_buf` keeps what it read in the buffer.
+async fn peer_closed<R>(stream: &mut tokio::io::BufReader<R>) -> std::io::Result<bool>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt as _;
+    Ok(stream.fill_buf().await?.is_empty())
 }
 
 /// How long this waiter may sleep before it must look again: the time left
@@ -903,10 +992,12 @@ fn spawn_stats_reporter() {
                     dropped_signature = STATS.dropped_signature.load(Ordering::Relaxed),
                     dropped_altsig = STATS.dropped_altsig.load(Ordering::Relaxed),
                     dropped_altsig_disabled = STATS.dropped_altsig_disabled.load(Ordering::Relaxed),
+                    dropped_altsig_claim = STATS.dropped_altsig_claim.load(Ordering::Relaxed),
                     // Cumulative: frames noted in the queue's frame index,
                     // and frames with a dropped transaction (never whole).
                     frames_admitted = STATS.frames_admitted.load(Ordering::Relaxed),
                     frames_unaligned = STATS.frames_unaligned.load(Ordering::Relaxed),
+                    frames_duplicate = STATS.frames_duplicate.load(Ordering::Relaxed),
                     // Cumulative, step 2: frames admitted on their gateways'
                     // attestations (and their transactions), frames with a
                     // bad attestation signature and frames that carried
@@ -1153,6 +1244,23 @@ where
 {
     init_frame_attest(chain_id);
     let setup = Setup::<P::Transaction>::from_env(blocking_slots);
+    let mut trusting = Vec::new();
+    if setup.direct {
+        trusting.push("N42_TX_INGEST_DIRECT");
+    }
+    if n42_tx_types::senders_claimed_at_ingest() || n42_tx_types::ingest_shard().is_some() {
+        trusting.push("N42_INGEST_VERIFY=leader|shard");
+    }
+    if frame_attest().is_some() {
+        trusting.push("N42_FRAME_GATEWAYS");
+    }
+    if let Some(refusal) = ingest_bind_refusal(&addr, allow_remote("N42_TX_INGEST_ALLOW_REMOTE"), &trusting) {
+        tracing::error!(target: "n42.tx_ingest", %addr, "{refusal}");
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, refusal));
+    }
+    if !is_loopback(&addr) {
+        warn!(target: "n42.tx_ingest", %addr, "the unauthenticated ingest is bound off loopback (N42_TX_INGEST_ALLOW_REMOTE=1)");
+    }
     spawn_stats_reporter();
     spawn_gate_watcher(pool.clone(), setup.queue.clone(), std::sync::Arc::clone(&head), setup.gate, setup.allowance);
     let listener = TcpListener::bind(addr).await?;
@@ -1182,11 +1290,31 @@ where
     P: TransactionPool + Clone + 'static,
     P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
 {
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let mut failed_accepts = 0u64;
     loop {
+        // A slot first: past MAX_CONNECTIONS the next connection waits in
+        // the listen backlog instead of being served. Known edge: a slot is
+        // held for the whole connection, also while its frame waits at the
+        // gate, and a client that gives up and reconnects meanwhile is not
+        // noticed until the gate lets the frame through. With the default
+        // gate wait that is a few generations of the flood's connections,
+        // far below the cap; with N42_TX_INGEST_GATE_MAX_WAIT_MS=0 repeated
+        // stalls could fill it until the gate reopens.
+        let Ok(slot) = std::sync::Arc::clone(&slots).acquire_owned().await else {
+            return Err(std::io::Error::other("the ingest's connection slots closed"));
+        };
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(err) => {
-                warn!(target: "n42.tx_ingest", %err, "accept failed");
+                // EMFILE/ENFILE fail at once and for as long as they last:
+                // without the pause this loop spins a worker and the log.
+                failed_accepts += 1;
+                if accept_warn_allowed() {
+                    warn!(target: "n42.tx_ingest", %err, failed_accepts, "accept failed");
+                }
+                drop(slot);
+                tokio::time::sleep(ACCEPT_RETRY).await;
                 continue;
             }
         };
@@ -1195,6 +1323,7 @@ where
         let head = std::sync::Arc::clone(&head);
         let setup = setup.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             if let Err(err) = serve_connection(stream, pool, cache, head, setup).await {
                 debug!(target: "n42.tx_ingest", %peer, %err, "ingest connection ended");
             }
@@ -1288,61 +1417,75 @@ where
                 format!("frame of {count} transactions"),
             ));
         }
-        // The frame's transactions share one buffer: each is a slice of it
-        // rather than its own allocation (500 a frame, ~350,000 a second a
-        // node at the bench tier).
-        let mut raws = Vec::with_capacity(count as usize);
-        let keep_claims = claiming && claimed_senders;
-        let mut claims: Vec<Address> = if keep_claims { Vec::with_capacity(count as usize) } else { Vec::new() };
-        let mut frame_buf = bytes::BytesMut::with_capacity(count as usize * 160);
-        let mut frame_bytes = 0usize;
-        for _ in 0..count {
-            let len = stream.read_u32_le().await? as usize;
-            if len == 0 || len > MAX_TX_BYTES as usize {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("transaction of {len} bytes"),
-                ));
+        // The body under a deadline: a frame whose header arrived and whose
+        // body stalls would hold its buffer as long as the connection lived.
+        let read_body = async {
+            // The frame's transactions share one buffer: each is a slice of it
+            // rather than its own allocation (500 a frame, ~350,000 a second a
+            // node at the bench tier).
+            let mut raws = Vec::with_capacity(count as usize);
+            let keep_claims = claiming && claimed_senders;
+            let mut claims: Vec<Address> = if keep_claims { Vec::with_capacity(count as usize) } else { Vec::new() };
+            let mut frame_buf = bytes::BytesMut::with_capacity(count as usize * 160);
+            let mut frame_bytes = 0usize;
+            for _ in 0..count {
+                let len = stream.read_u32_le().await? as usize;
+                if len == 0 || len > MAX_TX_BYTES as usize {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("transaction of {len} bytes"),
+                    ));
+                }
+                frame_bytes += len;
+                if frame_bytes > MAX_FRAME_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("frame exceeds {MAX_FRAME_BYTES} transaction bytes"),
+                    ));
+                }
+                if claiming {
+                    let mut claim = [0u8; 20];
+                    stream.read_exact(&mut claim).await?;
+                    if keep_claims {
+                        claims.push(Address::from(claim));
+                    }
+                }
+                frame_buf.resize(len, 0);
+                stream.read_exact(&mut frame_buf[..]).await?;
+                raws.push(Bytes::from(frame_buf.split_to(len).freeze()));
             }
-            frame_bytes += len;
-            if frame_bytes > MAX_FRAME_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("frame exceeds {MAX_FRAME_BYTES} transaction bytes"),
-                ));
-            }
-            if claiming {
-                let mut claim = [0u8; 20];
-                stream.read_exact(&mut claim).await?;
-                if keep_claims {
-                    claims.push(Address::from(claim));
+            // The attestation section, read either way and kept only where this
+            // node trusts gateways; a node without them verifies the frame as if
+            // it carried none.
+            let mut attestations: Vec<n42_tx_types::FrameAttestation> = Vec::new();
+            if attested {
+                let n = stream.read_u8().await? as usize;
+                if n == 0 || n > n42_tx_types::MAX_FRAME_ATTESTATIONS {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("frame of {n} attestations"),
+                    ));
+                }
+                let keep = frame_attest().is_some();
+                for _ in 0..n {
+                    let mut raw = [0u8; n42_tx_types::FRAME_ATTESTATION_LEN];
+                    stream.read_exact(&mut raw).await?;
+                    if keep {
+                        attestations.push(n42_tx_types::FrameAttestation::from_bytes(&raw));
+                    }
                 }
             }
-            frame_buf.resize(len, 0);
-            stream.read_exact(&mut frame_buf[..]).await?;
-            raws.push(Bytes::from(frame_buf.split_to(len).freeze()));
-        }
-        // The attestation section, read either way and kept only where this
-        // node trusts gateways; a node without them verifies the frame as if
-        // it carried none.
-        let mut attestations: Vec<n42_tx_types::FrameAttestation> = Vec::new();
-        if attested {
-            let n = stream.read_u8().await? as usize;
-            if n == 0 || n > n42_tx_types::MAX_FRAME_ATTESTATIONS {
+            Ok::<_, std::io::Error>((raws, claims, attestations))
+        };
+        let (raws, claims, attestations) = match tokio::time::timeout(FRAME_READ_TIMEOUT, read_body).await {
+            Ok(read) => read?,
+            Err(_) => {
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("frame of {n} attestations"),
+                    std::io::ErrorKind::TimedOut,
+                    format!("a frame of {count} transactions did not arrive within {FRAME_READ_TIMEOUT:?}"),
                 ));
             }
-            let keep = frame_attest().is_some();
-            for _ in 0..n {
-                let mut raw = [0u8; n42_tx_types::FRAME_ATTESTATION_LEN];
-                stream.read_exact(&mut raw).await?;
-                if keep {
-                    attestations.push(n42_tx_types::FrameAttestation::from_bytes(&raw));
-                }
-            }
-        }
+        };
         // The gate. Not a refusal and not a drop: the frame is held until the
         // chain has taken a block out of the pool, and the client hears nothing
         // until then, which is the whole difference between backpressure and a
@@ -1373,13 +1516,36 @@ where
         // blocks would otherwise hold every connection for the rest of the
         // round.
         let frame_read = std::time::Instant::now();
-        let (GateExit::Open(at_gate) | GateExit::ForBlock(at_gate) | GateExit::Forced(at_gate)) =
-            wait_at_gate(
-                || gate_view(&pool, setup.queue.as_ref(), &head, gate, allowance),
-                block_pending_now,
-                gate_max_wait(),
-            )
-            .await;
+        let gated = wait_at_gate(
+            || gate_view(&pool, setup.queue.as_ref(), &head, gate, allowance),
+            block_pending_now,
+            gate_max_wait(),
+        );
+        tokio::pin!(gated);
+        // While the frame waits at a shut gate, a peer that closes ends the
+        // connection here and frees its slot of MAX_CONNECTIONS: a generator
+        // that times out and reconnects leaves its old socket behind, and
+        // with `N42_TX_INGEST_GATE_MAX_WAIT_MS=0` a few stall cycles of those
+        // filled every slot (R4). `biased`: an open gate answers on its first
+        // poll and the socket is never looked at, so the open path is as
+        // before. Not in the unbuffered mode, where a zero-capacity
+        // `fill_buf` reads as end-of-stream.
+        let (GateExit::Open(at_gate) | GateExit::ForBlock(at_gate) | GateExit::Forced(at_gate)) = if capacity == 0 {
+            gated.await
+        } else {
+            tokio::select! {
+                biased;
+                exit = &mut gated => exit,
+                closed = peer_closed(&mut stream) => {
+                    if closed? {
+                        debug!(target: "n42.tx_ingest", "peer closed while its frame waited at the gate");
+                        return Ok(());
+                    }
+                    // The next frame is already here; only the gate is left.
+                    gated.await
+                }
+            }
+        };
         STATS.gate_ns.fetch_add(at_gate.as_nanos() as u64, Ordering::Relaxed);
         if asynchronous {
             let pending = u32::try_from(queue_depth(&pool, setup.queue.as_ref())).unwrap_or(u32::MAX);
@@ -1510,11 +1676,16 @@ struct IngestStats {
     dropped_signature: AtomicU64,
     dropped_altsig: AtomicU64,
     dropped_altsig_disabled: AtomicU64,
+    /// 0x50 transactions in a claiming frame whose claim was not the sender
+    /// their key derives.
+    dropped_altsig_claim: AtomicU64,
     /// Frames the ingest kept every transaction of, noted in the queue's
     /// frame index.
     frames_admitted: AtomicU64,
     /// Frames it dropped any transaction of: never referenceable whole.
     frames_unaligned: AtomicU64,
+    /// Frames that named one transaction hash twice, refused as frames.
+    frames_duplicate: AtomicU64,
     /// Frames admitted on their gateways' attestations, and the
     /// transactions they carried (no per-transaction verification here).
     frames_attested: AtomicU64,
@@ -1542,8 +1713,10 @@ static STATS: IngestStats = IngestStats {
     dropped_signature: AtomicU64::new(0),
     dropped_altsig: AtomicU64::new(0),
     dropped_altsig_disabled: AtomicU64::new(0),
+    dropped_altsig_claim: AtomicU64::new(0),
     frames_admitted: AtomicU64::new(0),
     frames_unaligned: AtomicU64::new(0),
+    frames_duplicate: AtomicU64::new(0),
     frames_attested: AtomicU64::new(0),
     attested_txs: AtomicU64::new(0),
     frames_attest_bad: AtomicU64::new(0),
@@ -1815,9 +1988,21 @@ where
     P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
 {
     let hashes: Vec<B256> = pooled.iter().map(|tx| *tx.hash()).collect();
+    // A frame naming a transaction twice is refused as a frame: the frame
+    // tree pairs an odd last node with itself, so `[a, b, c, c]` would carry
+    // the id (and the attestations) of `[a, b, c]`. Its transactions are
+    // still recovered one by one; it is never attested, never indexed.
+    let duplicate = n42_tx_types::has_duplicate_hash(&hashes);
+    if duplicate {
+        let refused = STATS.frames_duplicate.fetch_add(1, Ordering::Relaxed) + 1;
+        if drop_warn_allowed() {
+            warn!(target: "n42.tx_ingest", refused, txs = hashes.len(), "a frame with a duplicate transaction hash: not admitted as a frame");
+        }
+    }
+    let attestations = if duplicate { &[][..] } else { attestations };
     let (attested, root) = frame_attested(sent, &hashes, attestations, attest);
     let recovered = recover_decoded_in::<P>(pooled, claims, cache, shard, attested);
-    let frame = frame_of(sent, hashes, root, &recovered);
+    let frame = if duplicate { None } else { frame_of(sent, hashes, root, &recovered) };
     if frame.is_none() {
         STATS.frames_unaligned.fetch_add(1, Ordering::Relaxed);
     }
@@ -1933,9 +2118,13 @@ fn in_my_shard(hash: &alloy_primitives::B256, (index, count): (u64, u64)) -> boo
 /// `shard` is `Some` only under `N42_INGEST_VERIFY=shard`, and matters only
 /// for a claiming frame: a transaction in this node's shard goes through the
 /// verification exactly as under `all`; any other is queued under its claim
-/// and the claim is recorded as its sender (the 0x50 sender cache), so the
-/// vote road and the payload conversion read it as an answer. **Nothing
-/// verifies it anywhere afterwards** -- this is the unsafe benchmark probe of
+/// and recorded as its sender (the 0x50 sender cache), so the vote road and
+/// the payload conversion read it as an answer. A 0x50 claim must be the
+/// sender the transaction's key derives (one keccak) or the transaction is
+/// dropped -- but the signature still goes unchecked, and an Ed25519 key is
+/// public once its account has sent anything, so a transaction carrying a
+/// victim's key and a garbage signature is admitted under the victim's
+/// account. **Nothing verifies it anywhere afterwards** -- this is the unsafe benchmark probe of
 /// `docs/VERIFY_ONCE_DESIGN.md` form C, correct only while no node and no
 /// generator lies. With `shard` `None` this is `leader`/`all` unchanged.
 ///
@@ -2012,15 +2201,35 @@ where
                 }
                 continue;
             }
+            // A 0x50 sender is a hash of the transaction's own key, so a
+            // claim is never needed for one: the derived sender is used and
+            // a claim that names anyone else drops the transaction. Without
+            // this, a wire claim would become the sender the road and the
+            // payload conversion read from the cache in shard mode.
+            let sender = match &tx {
+                N42PooledTxEnvelope::AltSig(alt_tx) => {
+                    let derived = alt_tx.sender();
+                    if derived != claims[at] {
+                        let dropped = STATS.dropped_altsig_claim.fetch_add(1, Ordering::Relaxed) + 1;
+                        if drop_warn_allowed() {
+                            warn!(target: "n42.tx_ingest", dropped, "a 0x50 claim that is not the sender its key derives");
+                        }
+                        continue;
+                    }
+                    derived
+                }
+                N42PooledTxEnvelope::Eth(_) => claims[at],
+            };
             if shard.is_some() {
-                // Recorded as the sender, unverified, so the road and the
-                // payload conversion take it without a signature (probe only).
+                // Recorded as the sender, signature unverified, so the road
+                // and the payload conversion take it without a signature
+                // (probe only). For 0x50 it is the key's own sender.
                 if tx.is_alt_sig() {
-                    AltSigSenderCache::global().insert(*tx.hash(), claims[at]);
+                    AltSigSenderCache::global().insert(*tx.hash(), sender);
                 }
                 shard_claimed_here += 1;
             }
-            recovered.push(P::Transaction::from_pooled(Recovered::new_unchecked(tx, claims[at])));
+            recovered.push(P::Transaction::from_pooled(Recovered::new_unchecked(tx, sender)));
             claimed_here += 1;
             continue;
         }
@@ -2200,16 +2409,16 @@ mod shard_tests {
         assert_eq!(frame_of(6, hashes, None, &recovered[..5]), None);
     }
 
-    /// A claiming frame in shard mode: exactly the transactions whose hash
-    /// is in this node's shard are verified (and come out under their real
-    /// sender, whatever the claim said); every other one is queued under its
-    /// claim, unverified, and the claim is what the sender cache records.
+    /// A claiming frame in shard mode with honest 0x50 claims: exactly the
+    /// transactions whose hash is in this node's shard are verified, every
+    /// other one is queued under its claim unverified, and the sender cache
+    /// records the sender either way. (A wrong 0x50 claim is dropped, and a
+    /// wrong Eth claim is taken as it stands: the two tests below.)
     #[test]
     fn a_frame_in_shard_mode_verifies_exactly_its_shard() {
         let _lock = crate::coverage_tests::counter_lock();
         n42_tx_types::set_alt_sig_enabled(true);
         let shard = (1u64, 3u64);
-        let bogus = Address::repeat_byte(0xee);
         let txs: Vec<AltSigTx> = (0..48u64).map(|i| signed(1 + (i % 4) as u8, 1_000 + i)).collect();
         let real: Vec<Address> = txs
             .iter()
@@ -2218,11 +2427,8 @@ mod shard_tests {
         let mine: Vec<bool> = txs.iter().map(|tx| in_my_shard(tx.hash(), shard)).collect();
         // The recovery returns claimed transactions first and the verified
         // batch after them, so the output is matched by hash, not by index.
-        let expected_by_hash: std::collections::HashMap<alloy_primitives::B256, (Address, bool)> = txs
-            .iter()
-            .enumerate()
-            .map(|(at, tx)| (*tx.hash(), (if mine[at] { real[at] } else { bogus }, mine[at])))
-            .collect();
+        let expected_by_hash: std::collections::HashMap<alloy_primitives::B256, (Address, bool)> =
+            txs.iter().enumerate().map(|(at, tx)| (*tx.hash(), (real[at], mine[at]))).collect();
         let owned = mine.iter().filter(|m| **m).count() as u64;
         assert!(owned > 0 && owned < 48, "a spread across shards: {owned}");
         let pooled: Vec<N42PooledTxEnvelope> = txs.into_iter().map(N42PooledTxEnvelope::AltSig).collect();
@@ -2230,7 +2436,7 @@ mod shard_tests {
             (STATS.shard_verified.load(Ordering::Relaxed), STATS.shard_claimed.load(Ordering::Relaxed));
         let out = recover_decoded_in::<NoopTransactionPool<N42PooledTransaction>>(
             pooled,
-            vec![bogus; 48],
+            real.clone(),
             None,
             Some(shard),
             false,
@@ -2241,10 +2447,99 @@ mod shard_tests {
             assert_eq!(tx.sender(), expected, "transaction {:?}, in shard: {in_shard}", tx.hash());
             assert_eq!(AltSigSenderCache::global().get(tx.hash()), Some(expected));
         }
-        // Only this test runs the shard path, so the global counters move by
-        // exactly this frame.
+        // The shard tests hold the counter lock, so the global counters move
+        // by exactly this frame.
         assert_eq!(STATS.shard_verified.load(Ordering::Relaxed) - verified_before, owned);
         assert_eq!(STATS.shard_claimed.load(Ordering::Relaxed) - claimed_before, 48 - owned);
+    }
+
+    /// `[a, b, c]` is admitted as a frame; `[a, b, c, c]`, which shares its
+    /// root, is refused as one (counted, never indexed).
+    #[test]
+    fn a_frame_with_a_duplicate_transaction_is_refused() {
+        let _lock = crate::coverage_tests::counter_lock();
+        n42_tx_types::set_alt_sig_enabled(true);
+        let txs: Vec<N42PooledTxEnvelope> =
+            (0..3u64).map(|i| N42PooledTxEnvelope::AltSig(signed(21, 3_000 + i))).collect();
+        let (_, frame) =
+            recover_frame::<NoopTransactionPool<N42PooledTransaction>>(3, txs.clone(), Vec::new(), &[], None);
+        assert!(frame.is_some(), "[a, b, c] is a frame");
+        let mut doubled = txs;
+        doubled.push(doubled[2].clone());
+        let before = STATS.frames_duplicate.load(Ordering::Relaxed);
+        let (_, frame) =
+            recover_frame::<NoopTransactionPool<N42PooledTransaction>>(4, doubled, Vec::new(), &[], None);
+        assert!(frame.is_none(), "[a, b, c, c] is refused as a frame");
+        assert_eq!(STATS.frames_duplicate.load(Ordering::Relaxed) - before, 1);
+    }
+
+    /// An Eth transaction under a wrong claim in shard mode: outside this
+    /// node's shard it is queued under the claim as it stands (the probe's
+    /// design: nothing can derive an Eth sender without the signature);
+    /// inside it, it is verified and comes out under its real sender.
+    #[test]
+    fn a_shard_mode_eth_claim_is_taken_outside_the_shard_and_verified_inside() {
+        let _lock = crate::coverage_tests::counter_lock();
+        let shard = (0u64, 2u64);
+        let bogus = Address::repeat_byte(0xdd);
+        let real = crate::coverage_tests::secp_address(5);
+        let pooled: Vec<N42PooledTxEnvelope> = (0..24u64).map(|n| crate::coverage_tests::eth_tx(5, 4_000 + n)).collect();
+        let mine: std::collections::HashMap<B256, bool> =
+            pooled.iter().map(|tx| (*tx.hash(), in_my_shard(tx.hash(), shard))).collect();
+        let owned = mine.values().filter(|m| **m).count();
+        assert!(owned > 0 && owned < 24, "a spread across shards: {owned}");
+        let out = recover_decoded_in::<NoopTransactionPool<N42PooledTransaction>>(
+            pooled,
+            vec![bogus; 24],
+            None,
+            Some(shard),
+            false,
+        );
+        assert_eq!(out.len(), 24);
+        for tx in &out {
+            let expected = if mine[tx.hash()] { real } else { bogus };
+            assert_eq!(tx.sender(), expected, "transaction {:?}", tx.hash());
+        }
+    }
+
+    /// A shard-mode frame whose 0x50 claims name someone other than the
+    /// sender each key derives: the transactions outside this node's shard
+    /// are refused (a claim never becomes a sender), the ones inside it are
+    /// verified and come out under their real sender, and the sender cache
+    /// never records the claimed address.
+    #[test]
+    fn a_shard_mode_claim_that_is_not_the_derived_sender_is_refused() {
+        let _lock = crate::coverage_tests::counter_lock();
+        n42_tx_types::set_alt_sig_enabled(true);
+        let shard = (0u64, 2u64);
+        let bogus = Address::repeat_byte(0xee);
+        let txs: Vec<AltSigTx> = (0..32u64).map(|i| signed(11 + (i % 4) as u8, 2_000 + i)).collect();
+        let mine: Vec<bool> = txs.iter().map(|tx| in_my_shard(tx.hash(), shard)).collect();
+        let owned = mine.iter().filter(|m| **m).count();
+        assert!(owned > 0 && owned < 32, "a spread across shards: {owned}");
+        let hashes: Vec<B256> = txs.iter().map(|tx| *tx.hash()).collect();
+        let derived: Vec<Address> = txs.iter().map(|tx| tx.sender()).collect();
+        let pooled: Vec<N42PooledTxEnvelope> = txs.into_iter().map(N42PooledTxEnvelope::AltSig).collect();
+        let dropped_before = STATS.dropped_altsig_claim.load(Ordering::Relaxed);
+        let out = recover_decoded_in::<NoopTransactionPool<N42PooledTransaction>>(
+            pooled,
+            vec![bogus; 32],
+            None,
+            Some(shard),
+            false,
+        );
+        assert_eq!(out.len(), owned, "only this node's shard survives");
+        for tx in &out {
+            assert_ne!(tx.sender(), bogus);
+        }
+        for (at, hash) in hashes.iter().enumerate() {
+            let cached = AltSigSenderCache::global().get(hash);
+            assert_ne!(cached, Some(bogus), "the claim never reaches the cache");
+            if mine[at] {
+                assert_eq!(cached, Some(derived[at]));
+            }
+        }
+        assert_eq!(STATS.dropped_altsig_claim.load(Ordering::Relaxed) - dropped_before, (32 - owned) as u64);
     }
 
     const CHAIN: u64 = 94;
@@ -2383,6 +2678,47 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// Loopback binds silently; anything else needs the escape hatch, and
+    /// a trusting mode refuses it even then.
+    #[test]
+    fn a_non_loopback_bind_is_refused_unless_allowed_and_never_when_trusting() {
+        let addr = |s: &str| s.parse::<SocketAddr>().expect("an address");
+        for local in ["127.0.0.1:9000", "127.1.2.3:9000", "[::1]:9000", "[::ffff:127.0.0.1]:9000"] {
+            let local = addr(local);
+            assert!(is_loopback(&local), "{local}");
+            assert_eq!(ingest_bind_refusal(&local, false, &[]), None);
+            assert_eq!(ingest_bind_refusal(&local, false, &["N42_TX_INGEST_DIRECT"]), None);
+            assert_eq!(remote_bind_refusal("N42_PAYLOAD_SERVE", &local, false), None);
+        }
+        for remote in ["0.0.0.0:9000", "10.0.0.5:9000", "[::]:9000", "[::ffff:10.0.0.5]:9000"] {
+            let remote = addr(remote);
+            assert!(!is_loopback(&remote), "{remote}");
+            assert!(ingest_bind_refusal(&remote, false, &[]).is_some());
+            assert_eq!(ingest_bind_refusal(&remote, true, &[]), None);
+            for trusting in ["N42_TX_INGEST_DIRECT", "N42_INGEST_VERIFY=leader|shard", "N42_FRAME_GATEWAYS"] {
+                let refusal = ingest_bind_refusal(&remote, true, &[trusting]).expect("refused outright");
+                assert!(refusal.contains(trusting), "{refusal}");
+            }
+            assert!(remote_bind_refusal("N42_PAYLOAD_SERVE", &remote, false)
+                .is_some_and(|refusal| refusal.contains("N42_PAYLOAD_SERVE_ALLOW_REMOTE=1")));
+            assert_eq!(remote_bind_refusal("N42_PAYLOAD_SERVE", &remote, true), None);
+        }
+    }
+
+    /// R4: a peer that closes while its frame is gated is seen without
+    /// consuming anything, and one with bytes waiting is not taken for closed.
+    #[tokio::test]
+    async fn a_closed_peer_is_seen_without_consuming_its_bytes() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(reader);
+        writer.write_all(&[7]).await.expect("writes");
+        assert!(!peer_closed(&mut reader).await.expect("reads"), "bytes waiting");
+        assert_eq!(reader.read_u8().await.expect("kept"), 7, "nothing consumed");
+        drop(writer);
+        assert!(peer_closed(&mut reader).await.expect("reads"), "closed");
+    }
 
     /// A gate reading a test drives: `depth` against a fixed limit, exactly
     /// the shape [`gate_view`] returns from the queue.

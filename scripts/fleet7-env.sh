@@ -153,6 +153,14 @@ f7_quorum() { echo $(( F7_NODES - (F7_NODES - 1) / 3 )); }
 : "${F7_P2P_BASE:=19000}"    # consensus libp2p
 : "${F7_MOBILE_BASE:=21000}" # mobile_* endpoint, off unless F7_MOBILE=1
 
+# ------------------------------------------------------ trusting ingest ---
+# N42_INGEST_VERIFY=leader|shard takes a frame's word for a sender: the node
+# refuses to start on either unless N42_BENCH_UNSAFE=1 acknowledges it. A leg
+# that sets the mode is a benchmark by construction, so the ack goes with it.
+case "${N42_INGEST_VERIFY:-}" in
+  [Ll][Ee][Aa][Dd][Ee][Rr] | [Ss][Hh][Aa][Rr][Dd]) export N42_BENCH_UNSAFE=1 ;;
+esac
+
 # ------------------------------------------------------------------- load ---
 # Transactions per second the fleet is offered, 0 for none. A fleet measured on
 # empty blocks says nothing about the costs that scale with transactions, and on

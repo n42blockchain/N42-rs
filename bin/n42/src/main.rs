@@ -29,12 +29,39 @@ use tracing::{debug, error, info, warn};
 const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
 fn main() {
+    // Enable backtraces unless a RUST_BACKTRACE value has already been
+    // explicitly provided. First, before this process spawns any thread or
+    // moves the allocator's (`n42_core_layout::init` below).
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        // SAFETY: the first statement of `main`: no thread this program
+        // starts exists yet, and nothing else in the process reads or writes
+        // the environment concurrently (the allocator reads its
+        // configuration once, at its own initialisation, before `main`).
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+    }
     // `N42_INGEST_VERIFY=shard` without a well-formed `N42_INGEST_SHARD=<i>/<n>`
     // would silently verify everything (or nothing); refuse to start instead.
-    if let Err(err) = n42_tx_types::ingest_verify_mode() {
-        eprintln!("error: {err}");
+    let ingest_mode = match n42_tx_types::ingest_verify_mode() {
+        Ok(mode) => mode,
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(2);
+        }
+    };
+    // `leader` and `shard` take a frame's word for a sender: benchmark probes,
+    // refused unless the operator acknowledges them with N42_BENCH_UNSAFE=1.
+    if let Some(refusal) = n42_tx_types::trusting_mode_refusal(
+        ingest_mode,
+        std::env::var("N42_BENCH_UNSAFE").ok().as_deref(),
+    ) {
+        eprintln!("error: {refusal}");
         std::process::exit(2);
     }
+    let trusting_knobs = n42_tx_types::trusting_ingest_knobs(
+        ingest_mode,
+        std::env::var_os("N42_TX_INGEST_DIRECT").is_some(),
+        std::env::var_os("N42_FRAME_GATEWAYS").is_some(),
+    );
     // `N42_CORE_LAYOUT=isolate`: split the node's affinity mask into the
     // build, critical and background sets before any thread is spawned, and
     // move this thread (and any the allocator already has) to the background
@@ -55,11 +82,6 @@ fn main() {
         }
     }
     reth_cli_util::sigsegv_handler::install();
-
-    // Enable backtraces unless a RUST_BACKTRACE value has already been explicitly provided.
-    if std::env::var_os("RUST_BACKTRACE").is_none() {
-        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
-    }
 
     let (verification_tx, verification_rx) = mpsc::channel(100);
     let (broadcast_tx, _broadcast_rx) = broadcast::channel::<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>(100);
@@ -88,6 +110,22 @@ fn main() {
     if let Err(err) =
         Cli::<N42ChainSpecParser>::parse().run(async move |builder, _extra_args| {
             info!(target: "reth::cli", "Launching node");
+            for knob in &trusting_knobs {
+                warn!(target: "reth::cli", knob = *knob, "trusting ingest mode accepted: this node admits transactions on a frame's word (benchmark only)");
+            }
+            // The own-build and follower stores are process-global queues
+            // keyed by hash with fixed caps; a cap below the leader's layers
+            // plus the build in flight and the one ahead means entries are
+            // evicted while a later build may still look for them (the
+            // fallback is a re-execution, not a fault, so this warns).
+            {
+                let depth = n42_engine_types::direct_build::leader_layers::depth();
+                let mut caps = n42_engine_types::built_executions::store_caps();
+                caps.extend(n42::follower_import::store_caps());
+                for line in n42_engine_types::built_executions::undersized_stores(depth, &caps) {
+                    warn!(target: "reth::cli", depth, "{line}");
+                }
+            }
 
             // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md): a
             // malformed value or a depth this node does not run is refused here,
@@ -278,28 +316,35 @@ fn main() {
                         // Follow the canonical chain so the persisted head keeps up with
                         // the database's. Lagging is tolerable — only the tip matters,
                         // and every tree in between was filed at validation.
+                        // `on_canonical` is synchronous QMDB work, so the loop runs on
+                        // a thread of its own with a blocking receiver rather than on a
+                        // tokio worker; one receiver, so the order is kept.
                         let mut canonical = node.provider.subscribe_to_canonical_state();
                         let follower = qmdb.clone();
-                        tokio::spawn(async move {
-                            loop {
-                                match canonical.recv().await {
-                                    Ok(notification) => {
-                                        let behind = canonical.len();
-                                        if behind > 8 {
-                                            warn!(target: "reth::cli", behind, "canonical subscriber lag: qmdb head follower");
-                                        }
-                                        let tip = notification.tip().hash();
-                                        if let Err(error) = follower.on_canonical(tip) {
-                                            error!(target: "reth::cli", %error, "QMDB head could not follow the canonical chain");
-                                        }
+                        let follow = move || loop {
+                            match canonical.blocking_recv() {
+                                Ok(notification) => {
+                                    let behind = canonical.len();
+                                    if behind > 8 {
+                                        warn!(target: "reth::cli", behind, "canonical subscriber lag: qmdb head follower");
                                     }
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                        warn!(target: "reth::cli", skipped, "QMDB head follower fell behind canonical notifications");
+                                    let tip = notification.tip().hash();
+                                    if let Err(error) = follower.on_canonical(tip) {
+                                        error!(target: "reth::cli", %error, "QMDB head could not follow the canonical chain");
                                     }
-                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                 }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                    warn!(target: "reth::cli", skipped, "QMDB head follower fell behind canonical notifications");
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
-                        });
+                        };
+                        // A plain thread, not the runtime's blocking pool: a task
+                        // there that never ends would hold up the runtime's shutdown.
+                        std::thread::Builder::new()
+                            .name("n42-qmdb-follow".into())
+                            .spawn(follow)
+                            .map_err(|err| eyre::eyre!("no thread for the QMDB head follower: {err}"))?;
                     }
                     Ok(())
                 })
@@ -308,7 +353,7 @@ fn main() {
                     let provider = ctx.provider().clone();
 
                     // Store consensus reference for later use
-                    *consensus_holder_clone.lock().unwrap() =
+                    *consensus_holder_clone.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                         Some(std::sync::Arc::new(consensus.clone()));
 
                     let beacon_ext = ConsensusBeaconExt {
@@ -391,9 +436,9 @@ fn main() {
             // Get the stored consensus instance
             let consensus = consensus_holder
                 .lock()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
-                .expect("consensus should be set");
+                .ok_or_else(|| eyre::eyre!("the consensus instance was not set by the RPC hook"))?;
 
             let node_config_dev = node.config.clone().dev();
             // The forest can only be restored once the database is open and the
@@ -472,14 +517,18 @@ fn main() {
 
             let consensus_signer_private_key = node_config_dev.dev.consensus_signer_private_key;
             let signer_address = if let Some(signer_private_key) = &consensus_signer_private_key {
-                let eth_signer: PrivateKeySigner = signer_private_key.to_string().parse().unwrap();
+                let eth_signer: PrivateKeySigner = signer_private_key
+                    .to_string()
+                    .parse()
+                    .map_err(|err| eyre::eyre!("invalid --dev.consensus-signer-private-key: {err}"))?;
                 Some(eth_signer.address())
             } else {
                 None
             };
 
-            // The raw payload channel for the validator, loopback only. See
-            // `payload_serve`.
+            // The raw payload channel for the validator, loopback only (a
+            // non-loopback address is refused unless
+            // `N42_PAYLOAD_SERVE_ALLOW_REMOTE=1`). See `payload_serve`.
             if let Ok(addr) = std::env::var("N42_PAYLOAD_SERVE") {
                 // Several keys on this execution layer share each import
                 // (`N42_IMPORT_ONCE`); a held execution cannot be shared.
@@ -709,7 +758,7 @@ fn main() {
                 let mut canonical = node.provider.subscribe_to_canonical_state();
                 // `N42_QUEUE_PRUNE_THREAD=1`: the prune runs on a thread of its
                 // own and this task only forwards (see `n42::queue_prune`).
-                let pruner = n42::queue_prune::on_own_thread()
+                let mut pruner = n42::queue_prune::on_own_thread()
                     .then(|| n42::queue_prune::spawn_thread(queue.clone()))
                     .flatten();
                 let prune_feed_lean = pruner.is_some() && n42::queue_prune::feed_lean();
@@ -721,8 +770,8 @@ fn main() {
                                 if behind > 8 {
                                     warn!(target: "reth::cli", behind, "canonical subscriber lag: queue pruner");
                                 }
-                                match pruner.as_ref() {
-                                    Some(pruner) => {
+                                match pruner {
+                                    Some(_) => {
                                         // Read by the builder: said here as
                                         // well, so the thread's queue does
                                         // not delay it.
@@ -739,10 +788,12 @@ fn main() {
                                         // 4.915 against 5.100/5.019 M tx/s), the
                                         // pair collection being on this thread.
                                         let feed = n42::queue_prune::PruneFeed::of(notification, prune_feed_lean);
-                                        if pruner.send(feed).is_err() {
-                                            error!(target: "n42.tx_queue", "the queue's pruning thread is gone; the queue is no longer pruned");
-                                            break;
-                                        }
+                                        // A pruning thread that died (logged
+                                        // once) leaves `pruner` empty: this item
+                                        // and every later one are pruned here.
+                                        n42::queue_prune::forward(&mut pruner, feed, |feed| {
+                                            n42::queue_prune::prune_feed_inline(&queue, &feed)
+                                        });
                                     }
                                     None if n42_tx_queue::prune_lean() => {
                                         // `N42_PRUNE_LEAN`: every notification
@@ -796,9 +847,11 @@ fn main() {
             }
 
             // A binary path into the pool, for load generators. Off unless
-            // asked for, and meant for loopback: it admits nothing
-            // `eth_sendRawTransaction` would not, but it is unauthenticated,
-            // so binding it anywhere reachable would be a mistake.
+            // asked for, and unauthenticated: it binds loopback only unless
+            // `N42_TX_INGEST_ALLOW_REMOTE=1`, and never off loopback under
+            // the modes that trust a frame (direct, claimed senders, gateway
+            // attestations), which admit what `eth_sendRawTransaction` would
+            // not (`n42_tx_ingest::ingest_bind_refusal`).
             if let Ok(addr) = std::env::var("N42_TX_INGEST") {
                 match addr.parse::<std::net::SocketAddr>() {
                     Ok(addr) => {

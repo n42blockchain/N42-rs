@@ -186,6 +186,55 @@ pub fn parse_ingest_verify(verify: Option<&str>, shard: Option<&str>) -> Result<
     Ok(IngestVerify::Shard { index, count })
 }
 
+/// Whether `N42_BENCH_UNSAFE` holds the operator's acknowledgement that this
+/// node runs a trusting ingest mode for a benchmark: exactly `1`, nothing
+/// else (not `true`, not ` 1`).
+pub fn bench_unsafe_acknowledged(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Why a node must not start in ingest mode `mode`, or `None` when it may.
+///
+/// `leader` and `shard` queue transactions under the sender a frame claims
+/// without checking the signature at ingest (`shard` never checks it
+/// anywhere for the other shards), so they are benchmark probes: refused
+/// unless `bench_unsafe` (`N42_BENCH_UNSAFE`) acknowledges them
+/// ([`bench_unsafe_acknowledged`]). `all` always may.
+pub fn trusting_mode_refusal(mode: IngestVerify, bench_unsafe: Option<&str>) -> Option<String> {
+    let name = match mode {
+        IngestVerify::All => return None,
+        IngestVerify::Leader => "leader",
+        IngestVerify::Shard { .. } => "shard",
+    };
+    if bench_unsafe_acknowledged(bench_unsafe) {
+        return None;
+    }
+    Some(format!(
+        "N42_INGEST_VERIFY={name} admits transactions under the sender their frame claims, \
+         without verifying the signature at ingest; it is a benchmark probe and is unsafe on a \
+         real chain. Set N42_BENCH_UNSAFE=1 to run it anyway"
+    ))
+}
+
+/// The ingest knobs that make this node trust what a frame says, by name,
+/// for the start-up warning: `mode` other than `all`, `direct`
+/// (`N42_TX_INGEST_DIRECT` set) and `gateways` (`N42_FRAME_GATEWAYS` set).
+pub fn trusting_ingest_knobs(mode: IngestVerify, direct: bool, gateways: bool) -> Vec<&'static str> {
+    let mut knobs = Vec::new();
+    match mode {
+        IngestVerify::All => {}
+        IngestVerify::Leader => knobs.push("N42_INGEST_VERIFY=leader"),
+        IngestVerify::Shard { .. } => knobs.push("N42_INGEST_VERIFY=shard"),
+    }
+    if direct {
+        knobs.push("N42_TX_INGEST_DIRECT");
+    }
+    if gateways {
+        knobs.push("N42_FRAME_GATEWAYS");
+    }
+    knobs
+}
+
 /// The shard a transaction belongs to among `count`: the first eight bytes of
 /// its hash, little-endian, modulo `count`.
 pub fn shard_owner(hash: &B256, count: u64) -> u64 {
@@ -282,6 +331,29 @@ mod shard_tests {
             seen[shard_owner(&alloy_primitives::keccak256(i.to_le_bytes()), 3) as usize] += 1;
         }
         assert!(seen.iter().all(|&n| n > 60), "{seen:?}");
+    }
+
+    #[test]
+    fn a_trusting_mode_needs_the_bench_unsafe_ack() {
+        let shard = IngestVerify::Shard { index: 0, count: 3 };
+        for mode in [IngestVerify::Leader, shard] {
+            for ack in [None, Some(""), Some("0"), Some("true"), Some(" 1"), Some("1 "), Some("yes")] {
+                assert!(trusting_mode_refusal(mode, ack).is_some(), "{mode:?} {ack:?}");
+            }
+            assert_eq!(trusting_mode_refusal(mode, Some("1")), None, "{mode:?}");
+        }
+        assert_eq!(trusting_mode_refusal(IngestVerify::All, None), None);
+        assert!(trusting_mode_refusal(shard, None).is_some_and(|why| why.contains("N42_BENCH_UNSAFE=1")));
+    }
+
+    #[test]
+    fn the_trusting_knobs_are_named() {
+        assert!(trusting_ingest_knobs(IngestVerify::All, false, false).is_empty());
+        assert_eq!(
+            trusting_ingest_knobs(IngestVerify::Shard { index: 1, count: 2 }, true, true),
+            vec!["N42_INGEST_VERIFY=shard", "N42_TX_INGEST_DIRECT", "N42_FRAME_GATEWAYS"]
+        );
+        assert_eq!(trusting_ingest_knobs(IngestVerify::Leader, false, false), vec!["N42_INGEST_VERIFY=leader"]);
     }
 
     #[test]

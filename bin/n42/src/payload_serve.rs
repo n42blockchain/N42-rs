@@ -64,6 +64,68 @@ use tokio::net::{TcpListener, TcpStream};
 use n42_engine_types::engine_validator::CompactBodyError;
 use tracing::{debug, info, warn};
 
+/// A length-prefixed field's length as written on the channel: refused as a
+/// protocol error past [`raw_engine::MAX_FRAME`], which the validator would
+/// refuse on read and drop the connection for, or past `u32`.
+fn frame_len(len: usize) -> std::io::Result<[u8; 4]> {
+    if len > raw_engine::MAX_FRAME {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("a frame of {len} bytes exceeds the channel's {} byte limit", raw_engine::MAX_FRAME),
+        ));
+    }
+    u32::try_from(len).map(u32::to_le_bytes).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("a frame of {len} bytes does not fit a u32 length"))
+    })
+}
+
+/// A count of `item`-byte entries as written on the channel: refused past
+/// what [`raw_engine::MAX_FRAME`] holds of them, the validator's read limit.
+fn frame_count(count: usize, item: usize) -> std::io::Result<[u8; 4]> {
+    if count > raw_engine::MAX_FRAME / item.max(1) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{count} entries of {item} bytes exceed the channel's {} byte limit", raw_engine::MAX_FRAME),
+        ));
+    }
+    frame_len(count)
+}
+
+/// The largest header-sized request (a header, a build request).
+const MAX_SMALL_FRAME: usize = 1 << 20;
+
+/// How long the rest of a request may take to arrive once its kind byte has.
+/// The wait for the kind byte itself is not bounded: these connections are
+/// long-lived and idle between blocks. A frame is ~25 MB at the bench tier
+/// over loopback, far inside this.
+const FRAME_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `read`, a read of a request's body, under [`FRAME_BODY_TIMEOUT`].
+async fn within_frame_deadline<R>(read: impl std::future::Future<Output = std::io::Result<R>>) -> std::io::Result<R> {
+    within_deadline(FRAME_BODY_TIMEOUT, read).await
+}
+
+/// `read` under `deadline`: `TimedOut` when it has not finished by then.
+async fn within_deadline<R>(
+    deadline: std::time::Duration,
+    read: impl std::future::Future<Output = std::io::Result<R>>,
+) -> std::io::Result<R> {
+    match tokio::time::timeout(deadline, read).await {
+        Ok(read) => read,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("a request's body did not arrive within {deadline:?} of its kind byte"),
+        )),
+    }
+}
+
+/// Connections the channel serves at once; the accept loop waits for a free
+/// slot beyond it. A validator opens a handful per key.
+const MAX_CONNECTIONS: usize = 64;
+
+/// The pause after a failed `accept()` (EMFILE and the like fail at once).
+const ACCEPT_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// The block's RLP, `[header, transactions, ommers, withdrawals]`, with the
 /// transactions encoded on the worker pool.
 ///
@@ -1636,8 +1698,8 @@ fn push_built_payload_hashed(
     out: &mut Vec<u8>,
     payload: &N42BuiltPayload,
     with_hashes: bool,
-) -> (usize, std::time::Duration) {
-    let answer = push_built_payload(out, payload);
+) -> std::io::Result<(usize, std::time::Duration)> {
+    let answer = push_built_payload(out, payload)?;
     if with_hashes {
         use alloy_consensus::transaction::TxHashRef as _;
         let transactions = &payload.block().body().transactions;
@@ -1649,19 +1711,19 @@ fn push_built_payload_hashed(
             .flatten()
             .filter(|layout| !layout.is_empty());
         out.push(if layout.is_some() { 2 } else { 1 });
-        out.extend_from_slice(&(transactions.len() as u32).to_le_bytes());
+        out.extend_from_slice(&frame_count(transactions.len(), 32)?);
         for tx in transactions {
             out.extend_from_slice(tx.tx_hash().as_slice());
         }
         if let Some(layout) = layout {
-            out.extend_from_slice(&(layout.len() as u32).to_le_bytes());
+            out.extend_from_slice(&frame_count(layout.len(), 36)?);
             for (id, count) in &layout {
                 out.extend_from_slice(id.as_slice());
                 out.extend_from_slice(&count.to_le_bytes());
             }
         }
     }
-    answer
+    Ok(answer)
 }
 
 /// Whether the built block holds a blob transaction, which the compact
@@ -1686,7 +1748,7 @@ fn push_compact_answer(
     out: &mut Vec<u8>,
     payload: &N42BuiltPayload,
     layout_only: bool,
-) -> (usize, std::time::Duration, bool) {
+) -> std::io::Result<(usize, std::time::Duration, bool)> {
     use alloy_consensus::transaction::TxHashRef as _;
     let encode_at = std::time::Instant::now();
     let block = payload.block();
@@ -1711,9 +1773,9 @@ fn push_compact_answer(
     let encoded = raw_engine::encode_compact_answer(&answer);
     out.reserve(encoded.len() + 5);
     out.push(raw_engine::reply::COMPACT_BUILT);
-    out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    out.extend_from_slice(&frame_len(encoded.len())?);
     out.extend_from_slice(&encoded);
-    (encoded.len(), encode_at.elapsed(), covered)
+    Ok((encoded.len(), encode_at.elapsed(), covered))
 }
 
 /// The body of a block this node built, by its sealed header
@@ -1747,22 +1809,22 @@ async fn own_block_body(frame: &[u8]) -> Result<Vec<u8>, String> {
     .map_err(|err| format!("own body task: {err}"))?
 }
 
-fn push_built_payload(out: &mut Vec<u8>, payload: &N42BuiltPayload) -> (usize, std::time::Duration) {
+fn push_built_payload(out: &mut Vec<u8>, payload: &N42BuiltPayload) -> std::io::Result<(usize, std::time::Duration)> {
     let encode_at = std::time::Instant::now();
     let (block, listed) = encode_block_parallel_keeping_transactions(payload.block());
     remember_listed(payload.block().hash(), listed);
     let encoded = encode_at.elapsed();
     out.reserve(block.len() + 64);
     out.push(1);
-    out.extend_from_slice(&(block.len() as u32).to_le_bytes());
+    out.extend_from_slice(&frame_len(block.len())?);
     out.extend_from_slice(&block);
     match payload.requests() {
         Some(requests) => {
             let requests = requests.take();
             out.push(1);
-            out.extend_from_slice(&(requests.len() as u32).to_le_bytes());
+            out.extend_from_slice(&frame_len(requests.len())?);
             for request in &requests {
-                out.extend_from_slice(&(request.len() as u32).to_le_bytes());
+                out.extend_from_slice(&frame_len(request.len())?);
                 out.extend_from_slice(request);
             }
         }
@@ -1771,12 +1833,12 @@ fn push_built_payload(out: &mut Vec<u8>, payload: &N42BuiltPayload) -> (usize, s
     match payload.block_access_list() {
         Some(bal) => {
             out.push(1);
-            out.extend_from_slice(&(bal.len() as u32).to_le_bytes());
+            out.extend_from_slice(&frame_len(bal.len())?);
             out.extend_from_slice(bal);
         }
         None => out.push(0),
     }
-    (block.len(), encoded)
+    Ok((block.len(), encoded))
 }
 
 /// The sealed header a payload describes, given the build it came from: the
@@ -2059,6 +2121,9 @@ where
         // and an execution that reached its hold ends instead of waiting.
         let held_hash = data.payload.block_hash();
         let mut release = hold.then(|| crate::follower_import::hold_execution(held_hash));
+        // The hold is forgotten when the import ends, whichever way this
+        // function returns: an early `?` on the connection used to leave it.
+        let hold_guard = hold.then(|| crate::follower_import::HoldGuard::new(held_hash));
         let mut dropped = false;
         road.prepare_us = prepare_at.elapsed().as_micros() as u64;
         // The hand-off itself: what the blocking pool costs before the import
@@ -2066,6 +2131,7 @@ where
         // this side.
         let spawned = std::time::Instant::now();
         let handed = tokio::task::spawn_blocking(move || {
+            let _hold_guard = hold_guard;
             let mut road = road;
             road.dispatch_us = spawned.elapsed().as_micros() as u64;
             let convert_at = std::time::Instant::now();
@@ -2097,7 +2163,7 @@ where
                     if let Some(once) = once {
                         once.checked();
                     }
-                    let frame = checked_frame(data.payload.block_hash());
+                    let frame = checked_frame(data.payload.block_hash())?;
                     stream.write_all(&frame).await?;
                     info!(
                         target: "n42.payload_serve",
@@ -2153,7 +2219,7 @@ where
             debug!(target: "n42.payload_serve", number, "held import dropped by the validator before its execution");
             out.clear();
             out.push(raw_engine::reply::ERROR);
-            out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+            out.extend_from_slice(&frame_len(message.len())?);
             out.extend_from_slice(message.as_bytes());
             stream.write_all(&out[..]).await?;
             return Ok(());
@@ -2325,7 +2391,7 @@ where
             once.done(encoded.clone(), true);
         }
         out.push(1);
-        out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        out.extend_from_slice(&frame_len(encoded.len())?);
         out.extend_from_slice(&encoded);
         stream.write_all(&out).await?;
         let answered = started.elapsed().saturating_sub(decoded).as_millis() as u64;
@@ -2614,13 +2680,13 @@ where
                 once.done(encoded.clone(), settled_status(&status.status));
             }
             out.push(1);
-            out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            out.extend_from_slice(&frame_len(encoded.len())?);
             out.extend_from_slice(&encoded);
         }
         Err(err) => {
             let message = err.to_string();
             out.push(2);
-            out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+            out.extend_from_slice(&frame_len(message.len())?);
             out.extend_from_slice(message.as_bytes());
         }
     }
@@ -2630,15 +2696,15 @@ where
 
 /// The CHECKED frame for `hash`: a VALID status naming the block, ahead of
 /// the import's own answer.
-fn checked_frame(hash: B256) -> Vec<u8> {
+fn checked_frame(hash: B256) -> std::io::Result<Vec<u8>> {
     let status = alloy_rpc_types_engine::PayloadStatus::from_status(alloy_rpc_types_engine::PayloadStatusEnum::Valid)
         .with_latest_valid_hash(hash);
     let encoded = raw_engine::encode_payload_status(&status);
     let mut frame = Vec::with_capacity(encoded.len() + 5);
     frame.push(raw_engine::reply::CHECKED);
-    frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&frame_len(encoded.len())?);
     frame.extend_from_slice(&encoded);
-    frame
+    Ok(frame)
 }
 
 /// Whether a status is a verdict that can answer every later request for the
@@ -2697,14 +2763,14 @@ async fn gate(
         match waiter.next().await {
             crate::import_once::Event::Checked => {
                 if wants_checked {
-                    stream.write_all(&checked_frame(hash)).await?;
+                    stream.write_all(&checked_frame(hash)?).await?;
                     checked_us = Some(waited_at.elapsed().as_micros() as u64);
                 }
             }
             crate::import_once::Event::Done(status) => {
                 let mut frame = Vec::with_capacity(status.len() + 5);
                 frame.push(raw_engine::reply::VALUE);
-                frame.extend_from_slice(&(status.len() as u32).to_le_bytes());
+                frame.extend_from_slice(&frame_len(status.len())?);
                 frame.extend_from_slice(&status);
                 stream.write_all(&frame).await?;
                 debug!(
@@ -2762,7 +2828,7 @@ async fn refuse_held(stream: &mut TcpStream, out: &mut Vec<u8>) -> std::io::Resu
     warn!(target: "n42.payload_serve", "{message}");
     out.clear();
     out.push(raw_engine::reply::ERROR);
-    out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+    out.extend_from_slice(&frame_len(message.len())?);
     out.extend_from_slice(message.as_bytes());
     stream.write_all(out).await
 }
@@ -2840,7 +2906,7 @@ where
     }
     // The build's fields are this layer's own result: this key votes now, as
     // the other keys waiting on the block do once `own_block_by_header` says so.
-    stream.write_all(&checked_frame(header.hash_slow())).await?;
+    stream.write_all(&checked_frame(header.hash_slow())?).await?;
     let rlp = alloy_rlp::encode(header);
     match own_block_by_header::<T>(reuse, engine, &rlp, Some(once)).await {
         Ok((status, number, handoff_ms, payload_ms)) => {
@@ -2885,7 +2951,7 @@ async fn answer_own_build(
     owner.done(encoded.clone(), settled_status(&status.status));
     out.clear();
     out.push(raw_engine::reply::VALUE);
-    out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    out.extend_from_slice(&frame_len(encoded.len())?);
     out.extend_from_slice(&encoded);
     stream.write_all(out).await
 }
@@ -2899,6 +2965,19 @@ pub async fn serve<T>(
 where
     T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
+    // Unauthenticated, with Engine-API power (imports, held executions):
+    // loopback only unless `N42_PAYLOAD_SERVE_ALLOW_REMOTE=1`.
+    if let Some(refusal) = n42_tx_ingest::remote_bind_refusal(
+        "N42_PAYLOAD_SERVE",
+        &addr,
+        n42_tx_ingest::allow_remote("N42_PAYLOAD_SERVE_ALLOW_REMOTE"),
+    ) {
+        tracing::error!(target: "n42.payload_serve", %addr, "{refusal}");
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, refusal));
+    }
+    if !n42_tx_ingest::is_loopback(&addr) {
+        tracing::warn!(target: "n42.payload_serve", %addr, "the unauthenticated payload channel is bound off loopback (N42_PAYLOAD_SERVE_ALLOW_REMOTE=1)");
+    }
     // `N42_ROAD_RUNTIME=1`: the accept loop and every connection it serves on
     // the road's own runtime, so their tasks, `spawn_blocking` calls and
     // `block_in_place` hand-offs use that runtime's workers and blocking pool
@@ -2937,11 +3016,21 @@ where
         answer_at_insert = crate::answer_at_insert::enabled(),
         "raw payload channel listening"
     );
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
+        // A slot first: past MAX_CONNECTIONS the next connection waits in the
+        // listen backlog instead of being served.
+        let Ok(slot) = std::sync::Arc::clone(&slots).acquire_owned().await else {
+            return Err(std::io::Error::other("the payload channel's connection slots closed"));
+        };
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(err) => {
+                // EMFILE/ENFILE fail at once and for as long as they last:
+                // without the pause this loop spins a worker and the log.
                 warn!(target: "n42.payload_serve", %err, "accept failed");
+                drop(slot);
+                tokio::time::sleep(ACCEPT_RETRY).await;
                 continue;
             }
         };
@@ -2950,6 +3039,7 @@ where
         let reuse = reuse.clone();
         let once = once.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             if let Err(err) = serve_connection(stream, payloads, engine, reuse, once).await {
                 debug!(target: "n42.payload_serve", %peer, %err, "raw payload connection ended");
             }
@@ -3012,20 +3102,20 @@ where
         // request reads it.
         let hold = std::mem::take(&mut hold_next);
         if kind == request::CHECK_ONLY {
-            let len = stream.read_u32_le().await? as usize;
-            if len > 1 << 20 {
+            let len = within_frame_deadline(stream.read_u32_le()).await? as usize;
+            if len > MAX_SMALL_FRAME {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "header frame too large"));
             }
             let mut buf = vec![0u8; len];
-            stream.read_exact(&mut buf).await?;
+            within_frame_deadline(stream.read_exact(&mut buf)).await?;
             let answer = check_only_answer(&buf, reuse.is_some(), once.as_deref());
             crate::import_once::note_check_only(answer.is_ok());
             out.clear();
             match &answer {
-                Ok((hash, _)) => out.extend_from_slice(&checked_frame(*hash)),
+                Ok((hash, _)) => out.extend_from_slice(&checked_frame(*hash)?),
                 Err(message) => {
                     out.push(raw_engine::reply::ERROR);
-                    out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&frame_len(message.len())?);
                     out.extend_from_slice(message.as_bytes());
                 }
             }
@@ -3043,12 +3133,12 @@ where
             continue;
         }
         if kind == request::OWN_BLOCK {
-            let len = stream.read_u32_le().await? as usize;
-            if len > 1 << 20 {
+            let len = within_frame_deadline(stream.read_u32_le()).await? as usize;
+            if len > MAX_SMALL_FRAME {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "header frame too large"));
             }
             let mut buf = vec![0u8; len];
-            stream.read_exact(&mut buf).await?;
+            within_frame_deadline(stream.read_exact(&mut buf)).await?;
             out.clear();
             let started = std::time::Instant::now();
             // The block's road (`post_seal`): the first key's import request.
@@ -3093,13 +3183,13 @@ where
                         owner.done(encoded.clone(), settled_status(&status.status));
                     }
                     out.push(1);
-                    out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&frame_len(encoded.len())?);
                     out.extend_from_slice(&encoded);
                 }
                 Err(message) => {
                     debug!(target: "n42.payload_serve", %message, "own block by header refused");
                     out.push(2);
-                    out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&frame_len(message.len())?);
                     out.extend_from_slice(message.as_bytes());
                 }
             }
@@ -3107,12 +3197,12 @@ where
             continue;
         }
         if kind == request::BUILD_ON_OWN {
-            let len = stream.read_u32_le().await? as usize;
-            if len > 1 << 20 {
+            let len = within_frame_deadline(stream.read_u32_le()).await? as usize;
+            if len > MAX_SMALL_FRAME {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "build request frame too large"));
             }
             let mut buf = vec![0u8; len];
-            stream.read_exact(&mut buf).await?;
+            within_frame_deadline(stream.read_exact(&mut buf)).await?;
             out.clear();
             let frame_ms = started_at.elapsed().as_millis() as u64;
             let started = std::time::Instant::now();
@@ -3143,7 +3233,7 @@ where
                         let rlp = alloy_rlp::encode(payload.block().header());
                         let mut frame = Vec::with_capacity(rlp.len() + 5);
                         frame.push(raw_engine::reply::CHAIN_HEADER);
-                        frame.extend_from_slice(&(rlp.len() as u32).to_le_bytes());
+                        frame.extend_from_slice(&frame_len(rlp.len())?);
                         frame.extend_from_slice(&rlp);
                         stream.write_all(&frame).await?;
                         n42_engine_types::post_seal::note(
@@ -3159,9 +3249,9 @@ where
                     let elided = compact_answer && want_hashes && !has_blob_transactions(&payload);
                     let answer_encode_start_us = raw_engine::unix_micros();
                     let (bytes, encoded, answer_layout_only) = if elided {
-                        push_compact_answer(&mut out, &payload, layout_only_asked)
+                        push_compact_answer(&mut out, &payload, layout_only_asked)?
                     } else {
-                        let (bytes, encoded) = push_built_payload_hashed(&mut out, &payload, want_hashes);
+                        let (bytes, encoded) = push_built_payload_hashed(&mut out, &payload, want_hashes)?;
                         (bytes, encoded, false)
                     };
                     let answer_write_start_us = raw_engine::unix_micros();
@@ -3205,7 +3295,7 @@ where
                 Err(message) => {
                     info!(target: "n42.payload_serve", %message, "build on own block refused");
                     out.push(2);
-                    out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&frame_len(message.len())?);
                     out.extend_from_slice(message.as_bytes());
                 }
             }
@@ -3213,19 +3303,19 @@ where
             continue;
         }
         if kind == request::OWN_BODY {
-            let len = stream.read_u32_le().await? as usize;
-            if len > 1 << 20 {
+            let len = within_frame_deadline(stream.read_u32_le()).await? as usize;
+            if len > MAX_SMALL_FRAME {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "header frame too large"));
             }
             let mut buf = vec![0u8; len];
-            stream.read_exact(&mut buf).await?;
+            within_frame_deadline(stream.read_exact(&mut buf)).await?;
             out.clear();
             let started = std::time::Instant::now();
             match own_block_body(&buf).await {
                 Ok(block) => {
                     out.reserve(block.len() + 8);
                     out.push(1);
-                    out.extend_from_slice(&(block.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&frame_len(block.len())?);
                     out.extend_from_slice(&block);
                     // No requests, no access list: the proposer has both.
                     out.push(0);
@@ -3240,7 +3330,7 @@ where
                 Err(message) => {
                     debug!(target: "n42.payload_serve", %message, "own block's body refused");
                     out.push(2);
-                    out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&frame_len(message.len())?);
                     out.extend_from_slice(message.as_bytes());
                 }
             }
@@ -3248,13 +3338,13 @@ where
             continue;
         }
         if kind == request::COMPACT_BODY {
-            let len = stream.read_u32_le().await? as usize;
-            if len > 256 << 20 {
+            let len = within_frame_deadline(stream.read_u32_le()).await? as usize;
+            if len > raw_engine::MAX_FRAME {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "compact body frame too large"));
             }
             frame.clear();
             frame.resize(len, 0);
-            stream.read_exact(&mut frame[..]).await?;
+            within_frame_deadline(stream.read_exact(&mut frame[..])).await?;
             let recv = started_at.elapsed();
             let started = std::time::Instant::now();
             out.clear();
@@ -3424,7 +3514,7 @@ where
                         &indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
                     );
                     out.push(raw_engine::reply::NEED_TXNS);
-                    out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&frame_len(encoded.len())?);
                     out.extend_from_slice(&encoded);
                     stream.write_all(&out).await?;
                     continue;
@@ -3450,7 +3540,7 @@ where
                         .map_or(0, |(_, header)| header.number);
                     info!(target: "n42.payload_serve", number, %message, "compact body refused");
                     out.push(2);
-                    out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&frame_len(message.len())?);
                     out.extend_from_slice(message.as_bytes());
                     stream.write_all(&out).await?;
                     continue;
@@ -3545,13 +3635,13 @@ where
             continue;
         }
         if kind == request::FOREIGN_BODY {
-            let len = stream.read_u32_le().await? as usize;
-            if len > 256 << 20 {
+            let len = within_frame_deadline(stream.read_u32_le()).await? as usize;
+            if len > raw_engine::MAX_FRAME {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "body frame too large"));
             }
             frame.clear();
             frame.resize(len, 0);
-            stream.read_exact(&mut frame[..]).await?;
+            within_frame_deadline(stream.read_exact(&mut frame[..])).await?;
             let recv = started_at.elapsed();
             let started = std::time::Instant::now();
             out.clear();
@@ -3612,7 +3702,7 @@ where
                     // its peers for the block again.
                     debug!(target: "n42.payload_serve", %message, "foreign body refused");
                     out.push(2);
-                    out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&frame_len(message.len())?);
                     out.extend_from_slice(message.as_bytes());
                     stream.write_all(&out).await?;
                     continue;
@@ -3661,8 +3751,8 @@ where
             continue;
         }
         if kind == request::NEW_PAYLOAD {
-            let len = stream.read_u32_le().await? as usize;
-            if len > 256 << 20 {
+            let len = within_frame_deadline(stream.read_u32_le()).await? as usize;
+            if len > raw_engine::MAX_FRAME {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "payload frame too large"));
             }
             // N42_PAYLOAD_SERVE_FRESH_BUFFERS=1 restores a fresh allocation per
@@ -3673,7 +3763,7 @@ where
             }
             frame.clear();
             frame.resize(len, 0);
-            stream.read_exact(&mut frame[..]).await?;
+            within_frame_deadline(stream.read_exact(&mut frame[..])).await?;
             let recv = started_at.elapsed();
             let started = std::time::Instant::now();
             out.clear();
@@ -3701,7 +3791,7 @@ where
             match decoded_data {
                 Err(err) => {
                     out.push(2);
-                    out.extend_from_slice(&(err.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&frame_len(err.len())?);
                     out.extend_from_slice(err.as_bytes());
                 }
                 Ok(data) => {
@@ -3763,7 +3853,7 @@ where
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("request kind {kind}")));
         }
         let with_hashes = kind == request::GET_PAYLOAD_HASHED;
-        let id = stream.read_u64_le().await?;
+        let id = within_frame_deadline(stream.read_u64_le()).await?;
         let id = alloy_rpc_types_engine::PayloadId::new(id.to_le_bytes());
         let started = std::time::Instant::now();
         let resolved = payloads.resolve_kind(id, PayloadKind::WaitForPending).await;
@@ -3774,11 +3864,11 @@ where
             Some(Err(err)) => {
                 let message = err.to_string();
                 out.push(2);
-                out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+                out.extend_from_slice(&frame_len(message.len())?);
                 out.extend_from_slice(message.as_bytes());
             }
             Some(Ok(payload)) => {
-                let (bytes, encoded) = push_built_payload_hashed(&mut out, &payload, with_hashes);
+                let (bytes, encoded) = push_built_payload_hashed(&mut out, &payload, with_hashes)?;
                 if bytes > 1_000_000 {
                     info!(
                         target: "n42.payload_serve",

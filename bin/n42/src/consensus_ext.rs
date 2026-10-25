@@ -26,7 +26,7 @@ use reth_node_core::primitives::AlloyBlockHeader;
 use reth_provider::{BeaconProvider, BlockIdReader, BlockReader, HeaderProvider};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// trait interface for a custom rpc namespace: `consensus`
 ///
@@ -176,12 +176,17 @@ where
                         debug!(target: "reth::cli", ?subscription_id, "subscribe_to_verification_request client disconnected");
                         break;
                     }
-                    let message = SubscriptionMessage::new(
+                    let message = match SubscriptionMessage::new(
                         "subscribeToVerificationRequest",
                         subscription_id.clone(),
                         &data_to_be_verified,
-                    )
-                    .unwrap();
+                    ) {
+                        Ok(message) => message,
+                        Err(err) => {
+                            warn!(target: "reth::cli", ?subscription_id, %err, "subscribe_to_verification_request could not serialise a block; ending the subscription");
+                            break;
+                        }
+                    };
                     if let Err(e) = sink.send(message).await {
                         debug!(target: "reth::cli", ?subscription_id, ?e, "subscribe_to_verification_request Error sending to client");
                         break;
@@ -207,8 +212,27 @@ where
             attestation_data,
             block_hash,
         };
-        let _ = self.verification_tx.try_send(v);
-        Ok(())
+        // The miner waits for these: a signature dropped here stalls its
+        // finalisation, so the caller is told rather than answered Ok.
+        match self.verification_tx.try_send(v) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(v)) => {
+                warn!(target: "reth::cli", pubkey = %v.pubkey, block_hash = %v.block_hash, "verification channel full; refusing the signature");
+                Err(ErrorObjectOwned::owned(
+                    INTERNAL_ERROR_CODE,
+                    "verification queue full; retry",
+                    None::<()>,
+                ))
+            }
+            Err(mpsc::error::TrySendError::Closed(v)) => {
+                warn!(target: "reth::cli", pubkey = %v.pubkey, block_hash = %v.block_hash, "verification channel closed; refusing the signature");
+                Err(ErrorObjectOwned::owned(
+                    INTERNAL_ERROR_CODE,
+                    "verification queue closed: the miner is not running",
+                    None::<()>,
+                ))
+            }
+        }
     }
 
     fn get_beacon_block_hash_by_eth1_hash(&self, eth1_hash: B256) -> RpcResult<Option<B256>> {
@@ -450,6 +474,27 @@ mod tests {
         )
     }
 
+    /// A full or closed verification channel is an RPC error, never a
+    /// silent drop answered Ok; what was taken is delivered.
+    #[test]
+    fn submit_verification_with_a_full_or_closed_channel_is_an_error() {
+        let (ext, mut rx) = beacon_ext(provider());
+        let submit = || ext.submit_verification("pk".into(), "sig".into(), AttestationData::default(), B256::ZERO);
+        // The test channel holds two.
+        submit().expect("taken");
+        submit().expect("taken");
+        let full = submit().expect_err("full");
+        assert!(full.message().contains("full"), "{full:?}");
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, 2, "the channel's capacity is delivered");
+        drop(rx);
+        let closed = submit().expect_err("closed");
+        assert!(closed.message().contains("closed"), "{closed:?}");
+    }
+
     fn state_with_validator(pubkey: BLSPubkey, effective_balance: u64) -> BeaconState {
         let mut state = BeaconState::new();
         state
@@ -490,20 +535,6 @@ mod tests {
         assert_eq!(got.pubkey, "pk");
         assert_eq!(got.signature, "sig");
         assert_eq!(got.block_hash, hash);
-    }
-
-    #[test]
-    fn submit_verification_with_a_full_channel_still_answers_ok() {
-        let (ext, mut rx) = beacon_ext(provider());
-        for _ in 0..4 {
-            ext.submit_verification("pk".into(), "sig".into(), AttestationData::default(), B256::ZERO)
-                .expect("a full channel drops the result, not the call");
-        }
-        let mut n = 0;
-        while rx.try_recv().is_ok() {
-            n += 1;
-        }
-        assert_eq!(n, 2, "only the channel's capacity is delivered");
     }
 
     #[test]

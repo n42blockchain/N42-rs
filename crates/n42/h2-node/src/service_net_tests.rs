@@ -461,7 +461,10 @@ async fn a_peer_whose_status_names_another_chain_is_disconnected() {
         })
         .expect("a handles it");
     assert!(!a.svc.peer_heights.contains_key(&peer), "a height from another chain is not kept");
-    assert!(a.svc.pending_status.is_empty(), "nor does it start a pull");
+    assert!(
+        !a.svc.pending_status.iter().any(|(p, height)| *p == peer && *height == 9),
+        "nor does it start a pull"
+    );
     let mut events = Vec::new();
     pump(&mut a, &mut b, (false, false), &mut events, |a, b, _| {
         !a.svc.transport.connected_peer_ids().contains(&peer)

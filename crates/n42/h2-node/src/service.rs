@@ -69,13 +69,35 @@ use n42_h2_consensus::withdrawals_to_rewards;
 use n42_h2_primitives::consensus::{H2V4ChainIdentity, QuorumCertificate};
 use n42_h2_wire::{H2Message, H2V4Envelope};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Decides what a leader proposes for a view, given the view number and the
 /// current head. `None` declines the view — see
 /// [`H2Service::with_payload_attributes`].
 type PayloadAttributesBuilder =
     dyn Fn(ProposalContext) -> Option<PayloadAttributes> + Send + Sync;
+
+/// Engine errors that were this node's own fault (see
+/// [`n42_h2_consensus::ConsensusError::is_local`]) since start.
+static LOCAL_ENGINE_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many local engine errors this process has logged.
+pub fn local_engine_errors() -> u64 {
+    LOCAL_ENGINE_ERRORS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Logs an engine error by whose fault it is: a refused peer message stays
+/// at debug, a local fault (vote-log fsync, lost output, the key leaving the
+/// set) is logged at error and counted, because it means this node may have
+/// stopped voting or committing. Nothing is made fatal here.
+fn report_engine_error(err: &n42_h2_consensus::ConsensusError, what: &'static str) {
+    if err.is_local() {
+        let total = LOCAL_ENGINE_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        error!(target: "n42.h2.node", %err, what, local_errors = total, "local consensus engine fault");
+    } else {
+        debug!(target: "n42.h2.node", %err, what, "engine rejected a peer input");
+    }
+}
 
 /// How many views one step may propose for before going back to the network.
 ///
@@ -1780,7 +1802,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         if self.engine.vote_aggregate() {
             let at = std::time::Instant::now();
             if let Err(err) = self.engine.flush_votes() {
-                debug!(target: "n42.h2.node", %err, "engine rejected a vote batch");
+                report_engine_error(&err, "vote batch");
             }
             handle += at.elapsed();
         }
@@ -2351,7 +2373,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // when this process should stop.
                 if let Err(err) = self.engine.process_event(ConsensusEvent::Message(message))
                 {
-                    debug!(target: "n42.h2.node", %err, "engine rejected a message");
+                    report_engine_error(&err, "message");
                 }
             }
             Err(BridgeError::InvalidBitmap { .. }) => {
@@ -2545,7 +2567,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             && self.imported.contains(block_hash)
         {
             if let Err(err) = self.engine.process_event(ConsensusEvent::BlockImported(*block_hash)) {
-                debug!(target: "n42.h2.node", %err, ?block_hash, "engine rejected an import it had already been told of");
+                debug!(target: "n42.h2.node", ?block_hash, "engine refused an import it had already been told of");
+                report_engine_error(&err, "repeated import");
             }
             return Ok(());
         }
@@ -3414,7 +3437,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     }
                 }
                 if let Err(err) = self.engine.process_event(*event) {
-                    debug!(target: "n42.h2.node", %err, "engine rejected an execution event");
+                    report_engine_error(&err, "execution event");
                 }
             }
             DriverAction::TransactionsMissing { block_hash, indices } => {
@@ -3519,7 +3542,8 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // checked again if it is ever proposed again.
                 warn!(target: "n42.h2.node", ?block_hash, reason, "execution layer rejected a block");
                 if let Err(err) = self.engine.process_event(ConsensusEvent::BlockRejected(block_hash)) {
-                    debug!(target: "n42.h2.node", %err, ?block_hash, "engine rejected the withdrawal of import evidence");
+                    debug!(target: "n42.h2.node", ?block_hash, "engine refused the withdrawal of import evidence");
+                    report_engine_error(&err, "import withdrawal");
                 }
             }
             DriverAction::Finalized { .. } | DriverAction::Ignored => {}

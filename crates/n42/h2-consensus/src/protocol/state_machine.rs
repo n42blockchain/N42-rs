@@ -171,6 +171,14 @@ const MAX_FUTURE_MESSAGES_PER_SENDER: usize = 8;
 /// Maximum number of buffered future-view messages for one view.
 const MAX_FUTURE_MESSAGES_PER_VIEW: usize = 64;
 
+/// Minimum number of buffered future-view messages per view that were taken
+/// without a signature check (CommitVote, PrepareQC, Decide). These name a
+/// sender nobody has verified, so they do not count against that sender's
+/// cap; they share their own per-view class instead, FIFO within it. The
+/// class grows with the view's validator set so a genuine commit quorum
+/// still fits.
+const MIN_FUTURE_UNCHECKED_PER_VIEW: usize = 8;
+
 /// Events fed into the consensus engine.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)] // Message is the dominant hot-path variant; boxing adds unnecessary allocation
@@ -1256,7 +1264,11 @@ impl ConsensusEngine {
     ///   came with it, so junk cannot take a slot. A CommitVote is not (its
     ///   domain needs the proposal's changes hash); the caps bound it.
     /// - At most [`MAX_FUTURE_MESSAGES_PER_SENDER`] per sender and
-    ///   [`MAX_FUTURE_MESSAGES_PER_VIEW`] per view. When a cap or the total
+    ///   [`MAX_FUTURE_MESSAGES_PER_VIEW`] per view. Messages taken without a
+    ///   signature check (CommitVote, PrepareQC, Decide) do not count
+    ///   against the sender they name: they share a per-view class of at
+    ///   least [`MIN_FUTURE_UNCHECKED_PER_VIEW`], oldest out first. When a
+    ///   sender cap or the total
     ///   [`MAX_FUTURE_MESSAGES`] is reached the highest view goes: a lower
     ///   view replaces it, a message at or above it is dropped.
     pub(super) fn buffer_future_message(
@@ -1309,22 +1321,43 @@ impl ConsensusEngine {
             return false;
         }
 
-        // Per-sender cap, then the total cap: evict the highest view of the
-        // bucket if the new message is for a lower one.
-        if let Some(sender) = sender {
+        // A message taken without a signature check names a sender nobody
+        // verified: it must not use up that sender's share (eight forged
+        // CommitVotes naming a validator would otherwise keep its real
+        // messages out). It goes into the view's unchecked class instead,
+        // whose oldest entry makes room for a newer one.
+        if Self::future_message_unchecked(&msg) {
+            let class_cap = MIN_FUTURE_UNCHECKED_PER_VIEW
+                .max(self.validator_set_for_view(view).len() as usize + 2);
+            let in_class = |(buffered_view, buffered): &(ViewNumber, ConsensusMessage)| {
+                *buffered_view == view && Self::future_message_unchecked(buffered)
+            };
+            let unchecked_in_view = self.future_msg_buffer.iter().filter(|&e| in_class(e)).count();
+            if unchecked_in_view >= class_cap {
+                if let Some(index) = self.future_msg_buffer.iter().position(in_class) {
+                    // `remove`, not `swap_remove`: the buffer keeps arrival
+                    // order, which is what FIFO and the replay rely on.
+                    self.future_msg_buffer.remove(index);
+                }
+            }
+        } else if let Some(sender) = sender {
+            // Per-sender cap: evict the sender's highest view if the new
+            // message is for a lower one.
             let from_sender = self
                 .future_msg_buffer
                 .iter()
-                .filter(|(_, buffered)| Self::future_message_key(buffered).1 == Some(sender))
+                .filter(|(_, buffered)| Self::future_message_counts_for(buffered, sender))
                 .count();
             if from_sender >= MAX_FUTURE_MESSAGES_PER_SENDER
                 && !self.evict_highest_future_message(view, |buffered| {
-                    Self::future_message_key(buffered).1 == Some(sender)
+                    Self::future_message_counts_for(buffered, sender)
                 })
             {
                 return false;
             }
         }
+        // The total cap: evict the highest view if the new message is for a
+        // lower one.
         if self.future_msg_buffer.len() >= MAX_FUTURE_MESSAGES
             && !self.evict_highest_future_message(view, |_| true)
         {
@@ -1333,6 +1366,24 @@ impl ConsensusEngine {
 
         self.future_msg_buffer.push((view, msg));
         true
+    }
+
+    /// Whether a buffered future message was taken without a signature
+    /// check: a CommitVote (its domain needs the proposal's changes hash), a
+    /// PrepareQC or a Decide (aggregates, verified at replay).
+    const fn future_message_unchecked(msg: &ConsensusMessage) -> bool {
+        matches!(
+            msg,
+            ConsensusMessage::CommitVote(_)
+                | ConsensusMessage::PrepareQC(_)
+                | ConsensusMessage::Decide(_)
+        )
+    }
+
+    /// Whether a buffered future message counts against `sender`'s cap:
+    /// it names that sender and is not in the unchecked class.
+    fn future_message_counts_for(msg: &ConsensusMessage, sender: u32) -> bool {
+        !Self::future_message_unchecked(msg) && Self::future_message_key(msg).1 == Some(sender)
     }
 
     /// Removes the highest-view buffered message matching `filter` if its
@@ -1351,7 +1402,7 @@ impl ConsensusEngine {
             .map(|(index, (buffered_view, _))| (index, *buffered_view));
         match highest {
             Some((index, highest_view)) if highest_view > view => {
-                self.future_msg_buffer.swap_remove(index);
+                self.future_msg_buffer.remove(index);
                 true
             }
             _ => false,
@@ -5855,6 +5906,74 @@ mod tests {
             .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(forged)))
             .expect("forged future vote is dropped, not an error");
         assert_eq!(engine.future_msg_buffer.len(), 1, "a bad signature takes no slot");
+    }
+
+    #[test]
+    fn test_forged_future_commit_votes_do_not_use_up_the_named_senders_share() {
+        use crate::protocol::quorum::signing_message;
+
+        let (mut engine, sks, _, _rx) = make_engine(4, 0);
+        let victim = 1u32;
+        // Forged CommitVotes naming the victim: distinct blocks, signed by
+        // another key. They are buffered unchecked (as 25d51b385 intends).
+        let forged = |n: u8| {
+            let block_hash = B256::repeat_byte(0x80 | n);
+            ConsensusMessage::CommitVote(CommitVote {
+                view: 3,
+                block_hash,
+                voter: victim,
+                signature: sks[3].sign(&signing_message(3, &block_hash)),
+            })
+        };
+        for n in 0..(MAX_FUTURE_MESSAGES_PER_SENDER as u8 + 4) {
+            engine
+                .process_event(ConsensusEvent::Message(forged(n)))
+                .expect("a future commit vote is buffered or dropped");
+        }
+        let unchecked = |engine: &ConsensusEngine| {
+            engine
+                .future_msg_buffer
+                .iter()
+                .filter(|(view, msg)| *view == 3 && matches!(msg, ConsensusMessage::CommitVote(_)))
+                .count()
+        };
+        assert_eq!(
+            unchecked(&engine),
+            MIN_FUTURE_UNCHECKED_PER_VIEW,
+            "the unchecked class of a view is capped"
+        );
+        // The class is FIFO: the newest forgery is kept, the oldest is gone.
+        let newest = forged(MAX_FUTURE_MESSAGES_PER_SENDER as u8 + 3);
+        let oldest = forged(0);
+        let held = |engine: &ConsensusEngine, wanted: &ConsensusMessage| {
+            let ConsensusMessage::CommitVote(wanted) = wanted else {
+                return false;
+            };
+            engine.future_msg_buffer.iter().any(|(_, msg)| {
+                matches!(msg, ConsensusMessage::CommitVote(cv) if cv.block_hash == wanted.block_hash)
+            })
+        };
+        assert!(held(&engine, &newest));
+        assert!(!held(&engine, &oldest));
+
+        // The victim's real Vote for the same view still finds room.
+        let block_hash = B256::repeat_byte(0x33);
+        let vote = Vote {
+            view: 3,
+            block_hash,
+            voter: victim,
+            signature: sks[victim as usize].sign(&signing_message(3, &block_hash)),
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+            .expect("the real vote is buffered");
+        assert!(
+            engine.future_msg_buffer.iter().any(|(view, msg)| {
+                *view == 3
+                    && matches!(msg, ConsensusMessage::Vote(v) if v.voter == victim && v.block_hash == block_hash)
+            }),
+            "forged commit votes must not crowd out the named sender's real vote"
+        );
     }
 
     #[test]

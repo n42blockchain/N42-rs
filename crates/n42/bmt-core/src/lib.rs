@@ -550,6 +550,12 @@ impl BmtProof {
         expected_value_hash: Option<Hash>,
         base_depth: usize,
     ) -> bool {
+        // A key has 256 bits: a path deeper than that names bits it does not
+        // have (and would index past the key), so an untrusted proof that
+        // long is refused rather than read.
+        if base_depth.checked_add(self.siblings.len()).is_none_or(|depth| depth > 256) {
+            return false;
+        }
         if self.value_hash != expected_value_hash {
             return false;
         }
@@ -894,5 +900,17 @@ mod tests {
             assert_eq!(path.len(), 4, "depth-4 tree");
             assert_eq!(shard_tree_root_from_path(leaves[i], i, &path), root);
         }
+    }
+
+    /// A proof deeper than a key's 256 bits is refused, not a panic.
+    #[test]
+    fn a_proof_deeper_than_the_key_is_refused() {
+        let proof = BmtProof { key: [7u8; 32], value_hash: Some([1u8; 32]), siblings: vec![[0u8; 32]; 257], other_leaf: None };
+        assert!(!proof.verify(&[0u8; 32], Some([1u8; 32]), 0));
+        let at_base = BmtProof { siblings: vec![[0u8; 32]; 253], ..proof.clone() };
+        assert!(!at_base.verify(&[0u8; 32], Some([1u8; 32]), 4));
+        assert!(!at_base.verify(&[0u8; 32], Some([1u8; 32]), usize::MAX));
+        let exclusion = BmtProof { value_hash: None, other_leaf: Some(([8u8; 32], [2u8; 32])), ..proof };
+        assert!(!exclusion.verify(&[0u8; 32], None, 0));
     }
 }

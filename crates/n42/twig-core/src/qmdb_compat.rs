@@ -527,6 +527,12 @@ impl QmdbPortableSnapshot {
                 // A slot snapshot is built in the heap; the entry file is not
                 // involved, so this arm is unreachable in practice.
                 QmdbSnapshotError::EntryFile(_) => QmdbPortableError::RootMismatch,
+                // A full key-index shard while replaying the slot log: the
+                // snapshot cannot be loaded on this process, which is a
+                // resource failure rather than a content mismatch.
+                QmdbSnapshotError::Index(reason) => {
+                    QmdbPortableError::Io(format!("key index: {reason}"))
+                }
             })?;
         if tree.root() != self.root {
             return Err(QmdbPortableError::RootMismatch);

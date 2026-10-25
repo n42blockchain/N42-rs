@@ -863,6 +863,14 @@ pub fn partition_by_sender(keys: &[(Address, Address)], beneficiary: Address) ->
 /// threads down to one, with an error logged, rather than panicking the
 /// build; only a box that cannot spawn a single thread still panics here
 /// (every caller takes a `&'static` pool, so there is no `Err` to return).
+///
+/// There is no inline fallback for that last case: rayon has no pool of
+/// zero threads, and `ThreadPoolBuilder::use_current_thread` would make the
+/// first caller's thread the pool's only worker, so an `install` from any
+/// other thread (the follower's import, the behind pool's users) would wait
+/// on a worker that is not in the pool -- a hang in place of the panic.
+/// Running the callers' work inline instead means a non-`&'static` return
+/// type at every call site, on the leader's build path.
 pub fn build_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {

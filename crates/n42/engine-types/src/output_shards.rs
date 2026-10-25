@@ -866,7 +866,7 @@ impl OutputShards {
             }
             match live[shard].try_lock() {
                 Ok(mut part) => enter(&mut part, shard),
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => enter(&mut crate::built_executions::recover_poisoned("output_shards", poisoned), shard),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => enter(&mut *crate::built_executions::recover_poisoned("output_shards", poisoned), shard),
                 Err(std::sync::TryLockError::WouldBlock) => left.push(shard),
             }
         }
@@ -877,7 +877,7 @@ impl OutputShards {
                 // busy now is the freeze's.
                 match live[shard].try_lock() {
                     Ok(mut part) => enter(&mut part, shard),
-                    Err(std::sync::TryLockError::Poisoned(poisoned)) => enter(&mut crate::built_executions::recover_poisoned("output_shards", poisoned), shard),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => enter(&mut *crate::built_executions::recover_poisoned("output_shards", poisoned), shard),
                     Err(std::sync::TryLockError::WouldBlock) => deferred.push(shard as u16),
                 }
                 continue;

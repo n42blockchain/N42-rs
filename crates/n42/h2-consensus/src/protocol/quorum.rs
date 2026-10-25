@@ -427,6 +427,11 @@ impl TimeoutCollector {
         Ok(())
     }
 
+    /// Whether this validator's timeout is already collected.
+    pub fn has_timeout_from(&self, validator_index: u32) -> bool {
+        self.timeouts.contains_key(&validator_index)
+    }
+
     pub fn timeout_count(&self) -> usize {
         self.timeouts.len()
     }

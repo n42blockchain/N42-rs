@@ -24,6 +24,19 @@ impl ConsensusEngine {
             return Ok(false);
         }
 
+        // A sender's timeout for this view is already verified and counted:
+        // every further copy (gossip multi-path, direct stream) is handled
+        // here, before any pairing and without another relay. Relaying each
+        // duplicate would rebuild the relay storm the current-view path in
+        // `process_timeout` was fixed for.
+        if self
+            .future_timeout_collectors
+            .get(&timeout.view)
+            .is_some_and(|collector| collector.has_timeout_from(timeout.sender))
+        {
+            return Ok(true);
+        }
+
         let Some(view_set) = self
             .epoch_manager
             .known_validator_set_for_view(timeout.view)
@@ -74,12 +87,6 @@ impl ConsensusEngine {
         );
         let local_timeout_index = view_set.index_of_public_key(&self.local_public_key);
         let local_next_index = next_view_set.index_of_public_key(&self.local_public_key);
-        if local_timeout_index != Some(timeout.sender) && local_next_index != Some(next_leader) {
-            self.emit(EngineOutput::SendToValidator(
-                next_leader,
-                ConsensusMessage::Timeout(timeout.clone()),
-            ))?;
-        }
 
         let recovery_timeout = timeout.clone();
         let collector = self
@@ -88,9 +95,23 @@ impl ConsensusEngine {
             .or_insert_with(|| TimeoutCollector::new(timeout.view, view_set.len()));
         match collector.add_verified_timeout(timeout.sender, timeout.signature, timeout.high_qc) {
             Ok(()) => {}
-            Err(ConsensusError::DuplicateVote { .. }) => return Ok(false),
+            Err(ConsensusError::DuplicateVote { .. }) => return Ok(true),
             Err(error) => return Err(error),
         }
+
+        // Relay only the first verified copy from this sender, after it is
+        // counted, so a duplicate can never be fanned out again.
+        if local_timeout_index != Some(recovery_timeout.sender)
+            && local_next_index != Some(next_leader)
+        {
+            self.emit(EngineOutput::SendToValidator(
+                next_leader,
+                ConsensusMessage::Timeout(recovery_timeout.clone()),
+            ))?;
+        }
+        let Some(collector) = self.future_timeout_collectors.get(&recovery_timeout.view) else {
+            return Ok(true);
+        };
 
         let quorum_size = view_set.quorum_size();
         if !collector.has_quorum(quorum_size) {

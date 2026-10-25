@@ -4912,6 +4912,53 @@ mod tests {
     }
 
     #[test]
+    fn test_verified_repeat_future_timeout_is_relayed_to_next_leader_once() {
+        // The future-view twin of the test above: validator 1's timeout for
+        // view 2 (local view 1) is verified, counted and relayed to view 3's
+        // leader once. A second copy is handled as a duplicate: no relay and
+        // no second entry in the future buffer.
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        assert_eq!(engine.current_view(), 1);
+        while rx.try_recv().is_ok() {}
+
+        let timeout = TimeoutMessage {
+            view: 2,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 1,
+            signature: sks[1].sign(&timeout_signing_message(2)),
+        };
+
+        for expected_relays in [1, 0] {
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(
+                    timeout.clone(),
+                )))
+                .expect("verified future timeout should be accepted or deduplicated");
+
+            let relays = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|output| {
+                    matches!(
+                        output,
+                        EngineOutput::SendToValidator(
+                            _,
+                            ConsensusMessage::Timeout(relayed)
+                        ) if relayed.sender == 1 && relayed.view == 2
+                    )
+                })
+                .count();
+            assert_eq!(
+                relays, expected_relays,
+                "only the first verified future timeout copy may be relayed"
+            );
+        }
+        assert_eq!(engine.current_view(), 1);
+        assert!(
+            engine.future_msg_buffer.len() <= 1,
+            "a duplicate future timeout must not be buffered again"
+        );
+    }
+
+    #[test]
     fn test_single_timeout_at_window_boundary_is_buffered() {
         use crate::protocol::quorum::timeout_signing_message;
         use n42_h2_primitives::consensus::TimeoutMessage;

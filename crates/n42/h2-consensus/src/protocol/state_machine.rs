@@ -1259,12 +1259,10 @@ impl ConsensusEngine {
     ///
     /// - A copy with the same (kind, view, sender, hash) as a buffered one is
     ///   dropped (gossip multi-path delivery).
-    /// - A single-signer Vote, CommitVote or Proposal is signature-checked
-    ///   first when the view's validator set is known exactly and no
-    ///   transport proof came with it, so junk cannot take a slot. A
-    ///   CommitVote is checked under the cached changes hash (zero when the
-    ///   proposal is not cached, which is every block without validator
-    ///   changes).
+    /// - A single-signer Vote or Proposal is signature-checked first when
+    ///   the view's validator set is known exactly and no transport proof
+    ///   came with it, so junk cannot take a slot. A CommitVote is not (its
+    ///   domain needs the proposal's changes hash); the caps bound it.
     /// - At most [`MAX_FUTURE_MESSAGES_PER_SENDER`] per sender and
     ///   [`MAX_FUTURE_MESSAGES_PER_VIEW`] per view. When a cap or the total
     ///   [`MAX_FUTURE_MESSAGES`] is reached the highest view goes: a lower
@@ -1290,12 +1288,11 @@ impl ConsensusEngine {
             return false;
         }
 
-        let single_signer = matches!(
-            msg,
-            ConsensusMessage::Vote(_)
-                | ConsensusMessage::CommitVote(_)
-                | ConsensusMessage::Proposal(_)
-        );
+        // Not a CommitVote: its signing domain carries the block's changes
+        // hash, known only once the proposal is cached, which a future
+        // view's usually is not -- a valid vote for a block with validator
+        // changes would be refused here. It is verified at replay.
+        let single_signer = matches!(msg, ConsensusMessage::Vote(_) | ConsensusMessage::Proposal(_));
         if single_signer
             && !authenticated
             && self.epoch_manager.known_validator_set_for_view(view).is_some()

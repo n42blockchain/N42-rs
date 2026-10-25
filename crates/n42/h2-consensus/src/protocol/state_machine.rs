@@ -5202,6 +5202,56 @@ mod tests {
     }
 
     #[test]
+    fn test_a_counted_future_timeout_the_buffer_refused_is_buffered_by_a_later_copy() {
+        use crate::protocol::quorum::signing_message;
+
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        // Validator 1's per-sender share is full of lower-view votes, so its
+        // view-10 timeout is counted but refused by the buffer.
+        for n in 0..MAX_FUTURE_MESSAGES_PER_SENDER as u8 {
+            let block_hash = B256::repeat_byte(n.wrapping_add(0x40));
+            let vote = Vote {
+                view: 3,
+                block_hash,
+                voter: 1,
+                signature: sks[1].sign(&signing_message(3, &block_hash)),
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+                .expect("future vote");
+        }
+        let timeout = TimeoutMessage {
+            view: 10,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 1,
+            signature: sks[1].sign(&timeout_signing_message(10)),
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout.clone())))
+            .expect("counted, not buffered");
+        let buffered = |engine: &ConsensusEngine| {
+            engine
+                .future_msg_buffer
+                .iter()
+                .any(|(view, msg)| *view == 10 && matches!(msg, ConsensusMessage::Timeout(t) if t.sender == 1))
+        };
+        assert!(!buffered(&engine), "the full share refused it");
+
+        // Room again (the view-3 votes were replayed); a later copy of the
+        // counted timeout is buffered, and not relayed a second time.
+        engine.future_msg_buffer.retain(|(view, _)| *view != 3);
+        while rx.try_recv().is_ok() {}
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout)))
+            .expect("later copy");
+        assert!(buffered(&engine), "the counted timeout reaches the buffer");
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|output| matches!(
+            output,
+            EngineOutput::SendToValidator(_, ConsensusMessage::Timeout(_))
+        )));
+    }
+
+    #[test]
     fn test_single_timeout_at_window_boundary_is_buffered() {
         use crate::protocol::quorum::timeout_signing_message;
         use n42_h2_primitives::consensus::TimeoutMessage;

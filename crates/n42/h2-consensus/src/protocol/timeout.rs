@@ -24,16 +24,20 @@ impl ConsensusEngine {
             return Ok(false);
         }
 
-        // A sender's timeout for this view is already verified and counted:
-        // every further copy (gossip multi-path, direct stream) is handled
-        // here, before any pairing and without another relay. Relaying each
-        // duplicate would rebuild the relay storm the current-view path in
-        // `process_timeout` was fixed for.
-        if self
+        // A sender's timeout for this view that is already verified, counted
+        // and in the future buffer (which is what fills the view's own
+        // collector once the node enters it): every further copy (gossip
+        // multi-path, direct stream) is handled here, before any pairing and
+        // without another relay. Relaying each duplicate would rebuild the
+        // relay storm the current-view path in `process_timeout` was fixed
+        // for. A counted timeout the buffer refused or later evicted is not
+        // handled here: the copy goes on, is not relayed again (the relay
+        // follows a successful add) and is offered to the buffer.
+        let counted = self
             .future_timeout_collectors
             .get(&timeout.view)
-            .is_some_and(|collector| collector.has_timeout_from(timeout.sender))
-        {
+            .is_some_and(|collector| collector.has_timeout_from(timeout.sender));
+        if counted && self.future_timeout_buffered(timeout.view, timeout.sender) {
             return Ok(true);
         }
 
@@ -95,7 +99,9 @@ impl ConsensusEngine {
             .or_insert_with(|| TimeoutCollector::new(timeout.view, view_set.len()));
         match collector.add_verified_timeout(timeout.sender, timeout.signature, timeout.high_qc) {
             Ok(()) => {}
-            Err(ConsensusError::DuplicateVote { .. }) => return Ok(true),
+            // Counted already but missing from the buffer (see above): the
+            // caller buffers this verified copy.
+            Err(ConsensusError::DuplicateVote { .. }) => return Ok(false),
             Err(error) => return Err(error),
         }
 
@@ -148,6 +154,14 @@ impl ConsensusEngine {
         );
         self.advance_with_tc(tc, next_view)?;
         Ok(true)
+    }
+
+    /// Whether the future buffer holds a timeout from `sender` for `view`.
+    fn future_timeout_buffered(&self, view: u64, sender: u32) -> bool {
+        self.future_msg_buffer.iter().any(|(buffered_view, msg)| {
+            *buffered_view == view
+                && matches!(msg, ConsensusMessage::Timeout(t) if t.sender == sender)
+        })
     }
 
     /// Verifies a QC embedded in a timeout or NewView message.

@@ -165,9 +165,6 @@ pub const FUTURE_VIEW_WINDOW: u64 = 50;
 /// the ones the node is about to enter and needs most.
 const MAX_FUTURE_MESSAGES: usize = 256;
 
-/// Number of view-jump QC digests remembered as already verified.
-const VERIFIED_JUMP_QC_MEMO: usize = 64;
-
 /// Maximum number of buffered future-view messages attributed to one sender.
 const MAX_FUTURE_MESSAGES_PER_SENDER: usize = 8;
 
@@ -383,9 +380,6 @@ pub struct ConsensusEngine {
     pub(super) proposal_equivocation_tracker: HashMap<u32, (B256, B256)>,
     /// Buffer for messages arriving for future views (within FUTURE_VIEW_WINDOW).
     pub(super) future_msg_buffer: Vec<(ViewNumber, ConsensusMessage)>,
-    /// Digests of QCs a view jump already verified, so a replayed
-    /// certificate costs no second aggregate pairing.
-    pub(super) verified_jump_qcs: BoundedFifoMap<B256, ()>,
     /// Which validators' Round 1 votes this node, as leader, has verified,
     /// per recent view -- including votes that arrive after the view's QC
     /// formed and after the view advanced, which the protocol otherwise
@@ -511,7 +505,6 @@ impl ConsensusEngine {
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
             future_msg_buffer: Vec::new(),
-            verified_jump_qcs: BoundedFifoMap::new(VERIFIED_JUMP_QC_MEMO),
             voters_seen: HashMap::new(),
             withheld_votes: VecDeque::new(),
             progress_votes: false,
@@ -629,7 +622,6 @@ impl ConsensusEngine {
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
             future_msg_buffer: Vec::new(),
-            verified_jump_qcs: BoundedFifoMap::new(VERIFIED_JUMP_QC_MEMO),
             voters_seen: HashMap::new(),
             withheld_votes: VecDeque::new(),
             progress_votes: false,
@@ -1389,28 +1381,6 @@ impl ConsensusEngine {
         }
     }
 
-    /// Digest of a view-jump QC together with its verification domain
-    /// (message kind, and a Decide's changes hash). `None` when the QC does
-    /// not serialize, which only disables the memo.
-    fn jump_qc_digest(msg: &ConsensusMessage, qc: &QuorumCertificate) -> Option<B256> {
-        let encoded = bincode::serialize(qc).ok()?;
-        let mut hasher = blake3::Hasher::new();
-        match msg {
-            ConsensusMessage::Decide(decide) => {
-                hasher.update(&[0u8]);
-                hasher.update(decide.validator_changes_hash.as_slice());
-            }
-            ConsensusMessage::PrepareQC(_) => {
-                hasher.update(&[1u8]);
-            }
-            _ => {
-                hasher.update(&[2u8]);
-            }
-        }
-        hasher.update(&encoded);
-        Some(B256::from(*hasher.finalize().as_bytes()))
-    }
-
     /// Attempts a QC-based view jump when a far-future message arrives.
     ///
     /// Extracts and verifies the QC from the message. If valid, jumps to exactly
@@ -1446,15 +1416,11 @@ impl ConsensusEngine {
         // verified before it got there: it still justifies the jump (the
         // next leader proposes on exactly that lock, and its proposal may
         // arrive before the Decide that would move this follower), only the
-        // pairing is skipped. Otherwise, a digest over the QC and the domain
-        // it is checked under; a QC already verified under it skips the
-        // pairing too.
-        let held = qc == self.round_state.locked_qc() || qc == self.round_state.last_committed_qc();
-        let memo_key = if held { None } else { Self::jump_qc_digest(msg, qc) };
-        let already_verified = held
-            || memo_key
-                .as_ref()
-                .is_some_and(|key| self.verified_jump_qcs.get(key).is_some());
+        // pairing is skipped. (A memo of verified QCs would never hit: one
+        // that verifies always jumps, and the view early-out above refuses
+        // it after that.)
+        let already_verified =
+            qc == self.round_state.locked_qc() || qc == self.round_state.last_committed_qc();
 
         // Proposal/Timeout/NewView can carry either a prepare QC or a commit QC as
         // their justify/high QC, so the view-jump path must accept both domains.
@@ -1482,11 +1448,6 @@ impl ConsensusEngine {
                 ConsensusMessage::Vote(_) | ConsensusMessage::CommitVote(_) => return Ok(false),
             }
         };
-        if verify_result.is_ok() && !already_verified {
-            if let Some(key) = memo_key {
-                self.verified_jump_qcs.insert(key, ());
-            }
-        }
         if verify_result.is_err() {
             tracing::debug!(target: "n42::cl::engine",
                 current_view,
@@ -4604,7 +4565,6 @@ mod tests {
             .process_event(ConsensusEvent::Message(far_proposal(100, justify_qc.clone())))
             .expect("first jump");
         assert_eq!(engine.current_view(), 100);
-        assert_eq!(engine.verified_jump_qcs.len(), 1, "the verified QC is remembered");
         while rx.try_recv().is_ok() {}
 
         // The same certificate replayed under a fresh outer view cannot move
@@ -4613,7 +4573,6 @@ mod tests {
             .process_event(ConsensusEvent::Message(far_proposal(200, justify_qc)))
             .expect("replayed QC is ignored");
         assert_eq!(engine.current_view(), 100);
-        assert_eq!(engine.verified_jump_qcs.len(), 1);
         assert!(!std::iter::from_fn(|| rx.try_recv().ok())
             .any(|output| matches!(output, EngineOutput::SyncRequired { .. })));
     }

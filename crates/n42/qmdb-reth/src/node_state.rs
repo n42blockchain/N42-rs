@@ -2935,15 +2935,24 @@ impl QmdbNodeState {
             path: log_path.clone(),
             source,
         })?;
-        // The rename made durable, as `write_durably` does: after a crash the
-        // segment is found under the name the compaction looks for, and the
-        // fresh log the next delta creates beside it is not mistaken for it.
-        sync_parent_dir(&sealed_path).map_err(|source| NodeStateError::Io { path: sealed_path.clone(), source })?;
         // The log starts again from nothing; the cursor's head and slot are
         // unchanged, because checkpoint + sealed segment is the state they
-        // describe.
+        // describe. Reset before anything below can fail: the rename has
+        // happened, and a cursor still at the old length would make the next
+        // delta create a fresh log that starts with that many zeros.
         cursor.log_len = 0;
         self.spawn_compaction(cursor, head);
+        // The rename made durable, as `write_durably` does: after a crash the
+        // segment is found under the name the compaction looks for. Advisory
+        // here: a failure is logged, never returned, because the rotation
+        // itself is already done.
+        if let Err(error) = sync_parent_dir(&sealed_path) {
+            tracing::error!(
+                target: "n42.qmdb",
+                %error, path = %sealed_path.display(),
+                "could not fsync the directory after rotating the QMDB delta log; a crash now may lose the rename"
+            );
+        }
         Ok(())
     }
 

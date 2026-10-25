@@ -866,7 +866,7 @@ impl OutputShards {
             }
             match live[shard].try_lock() {
                 Ok(mut part) => enter(&mut part, shard),
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => enter(&mut poisoned.into_inner(), shard),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => enter(&mut crate::built_executions::recover_poisoned("output_shards", poisoned), shard),
                 Err(std::sync::TryLockError::WouldBlock) => left.push(shard),
             }
         }
@@ -877,13 +877,13 @@ impl OutputShards {
                 // busy now is the freeze's.
                 match live[shard].try_lock() {
                     Ok(mut part) => enter(&mut part, shard),
-                    Err(std::sync::TryLockError::Poisoned(poisoned)) => enter(&mut poisoned.into_inner(), shard),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => enter(&mut crate::built_executions::recover_poisoned("output_shards", poisoned), shard),
                     Err(std::sync::TryLockError::WouldBlock) => deferred.push(shard as u16),
                 }
                 continue;
             }
             let at = std::time::Instant::now();
-            let mut part = live[shard].lock().unwrap_or_else(PoisonError::into_inner);
+            let mut part = live[shard].lock().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p));
             waits += 1;
             wait_ns += at.elapsed().as_nanos() as u64;
             enter(&mut part, shard);
@@ -912,7 +912,7 @@ impl OutputShards {
         // One transition merge leaves one list: taken as it is.
         let reverts = if taken.len() == 1 { taken.pop().unwrap_or_default() } else { taken.into_iter().flatten().collect() };
         if !contracts.is_empty() {
-            self.contracts.lock().unwrap_or_else(PoisonError::into_inner).extend(contracts);
+            self.contracts.lock().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p)).extend(contracts);
         }
         let count = self.count;
         let each = |n: usize| n / count + n / (4 * count) + 1;
@@ -977,12 +977,12 @@ impl OutputShards {
             let id = live_id as u16;
             for address in addresses.iter().flatten() {
                 let part = &parts[shard_index(address, parts.len())];
-                part.lock().unwrap_or_else(PoisonError::into_inner).enter(*address, id);
+                part.lock().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p)).enter(*address, id);
             }
         }
         let accounts = Arc::new(accounts);
         let out = BatchOut { accounts, reverts, addresses, revert_at, size, beneficiary_delta, live_id, deferred };
-        self.batches.lock().unwrap_or_else(PoisonError::into_inner).push(out);
+        self.batches.lock().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p)).push(out);
         self.append_ns.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
@@ -1005,15 +1005,15 @@ impl OutputShards {
         let at = std::time::Instant::now();
         let beneficiary = self.beneficiary;
         let count = self.count;
-        let batches = self.batches.into_inner().unwrap_or_else(PoisonError::into_inner);
+        let batches = self.batches.into_inner().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p));
         if self.index && batches.len() < CONFLICT as usize {
-            let contracts = self.contracts.into_inner().unwrap_or_else(PoisonError::into_inner);
+            let contracts = self.contracts.into_inner().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p));
             let mut batches = batches;
             // Live: every batch numbered 0..n and entered, in number order.
             batches.sort_unstable_by_key(|batch| batch.live_id);
             let entered = batches.iter().enumerate().all(|(i, batch)| batch.live_id == i);
             if let (Some(live), true) = (self.live, entered) {
-                let parts = live.into_iter().map(|part| part.into_inner().unwrap_or_else(PoisonError::into_inner)).collect();
+                let parts = live.into_iter().map(|part| part.into_inner().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p))).collect();
                 let split = (self.freeze_split, self.freeze_split_all);
                 return freeze_live(pool, at, beneficiary, count, batches, contracts, self.append_ns.into_inner(), parts, split);
             }
@@ -1056,7 +1056,7 @@ impl OutputShards {
             beneficiary,
             shards,
             indexed: None,
-            contracts: self.contracts.into_inner().unwrap_or_else(PoisonError::into_inner),
+            contracts: self.contracts.into_inner().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p)),
             append_ns: self.append_ns.into_inner(),
             fold_ns,
             index_build_ns: 0,
@@ -1082,7 +1082,7 @@ impl OutputShards {
         let taken = std::sync::Arc::clone(&slot);
         let spawned = std::thread::Builder::new().name("n42-freeze".into()).spawn(move || {
             let at = std::time::Instant::now();
-            let shards = taken.lock().unwrap_or_else(PoisonError::into_inner).take();
+            let shards = taken.lock().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p)).take();
             // Always present: the slot is filled before the spawn and emptied
             // only here or, when the spawn failed, by the caller.
             let frozen = shards.map(Self::freeze).unwrap_or_default();
@@ -1090,7 +1090,7 @@ impl OutputShards {
         });
         match spawned {
             Ok(handle) => Ok(handle),
-            Err(_) => Err(slot.lock().unwrap_or_else(PoisonError::into_inner).take().map(Box::new)),
+            Err(_) => Err(slot.lock().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p)).take().map(Box::new)),
         }
     }
 }
@@ -1108,7 +1108,7 @@ impl OutputShards {
     /// the ordinary way, and so must the reader).
     pub fn early_view(&self) -> Option<EarlyOutput> {
         self.live.as_deref()?;
-        let batches = self.batches.lock().unwrap_or_else(PoisonError::into_inner);
+        let batches = self.batches.lock().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p));
         let count = batches.len();
         let mut maps: Vec<Option<Arc<AddressHashMap<BundleAccount>>>> = vec![None; count];
         let mut beneficiary_delta = U256::ZERO;
@@ -1129,12 +1129,12 @@ impl OutputShards {
             .as_deref()
             .filter(|_| !self.early_taken.swap(true, Ordering::AcqRel))
             .map(|parts| {
-                parts.iter().map(|part| std::mem::take(&mut *part.lock().unwrap_or_else(PoisonError::into_inner))).collect()
+                parts.iter().map(|part| std::mem::take(&mut *part.lock().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p)))).collect()
             });
         let mut parts: Vec<EarlyPart> = match filled {
             Some(parts) => parts,
             None => {
-                let mut parts = early_parts(maps.iter().map(|m| m.len()).sum()).into_iter().map(|p| p.into_inner().unwrap_or_else(PoisonError::into_inner)).collect::<Vec<_>>();
+                let mut parts = early_parts(maps.iter().map(|m| m.len()).sum()).into_iter().map(|p| p.into_inner().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p))).collect::<Vec<_>>();
                 let n = parts.len();
                 for batch in batches.iter() {
                     for address in batch.addresses.iter().flatten() {
@@ -1148,7 +1148,7 @@ impl OutputShards {
         for part in &mut parts {
             part.settle();
         }
-        let contracts = self.contracts.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let contracts = self.contracts.lock().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p)).clone();
         Some(EarlyOutput { batches: maps, parts, contracts, beneficiary_delta })
     }
 
@@ -1160,7 +1160,7 @@ impl OutputShards {
         let taken = std::sync::Arc::clone(&slot);
         let spawned = std::thread::Builder::new().name("n42-freeze".into()).spawn(move || {
             let at = std::time::Instant::now();
-            let shards = taken.lock().unwrap_or_else(PoisonError::into_inner).take();
+            let shards = taken.lock().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p)).take();
             let early = shards.as_ref().and_then(Self::early_view).map(Arc::new);
             let _ = send.send(early);
             let frozen = shards.map(Self::freeze).unwrap_or_default();
@@ -1168,7 +1168,7 @@ impl OutputShards {
         });
         match spawned {
             Ok(handle) => Ok((receive, handle)),
-            Err(_) => Err(slot.lock().unwrap_or_else(PoisonError::into_inner).take().map(Box::new)),
+            Err(_) => Err(slot.lock().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p)).take().map(Box::new)),
         }
     }
 }

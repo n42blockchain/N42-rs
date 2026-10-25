@@ -390,7 +390,7 @@ fn publish_parent_outputs() -> bool {
 /// Publishes a block's execution output for its child's check.
 fn publish_parent_output(block_hash: B256, header: reth_primitives_traits::SealedHeader, output: ParentOutput) {
     {
-        let mut outputs = PARENT_OUTPUTS.lock().unwrap_or_else(|p| p.into_inner());
+        let mut outputs = PARENT_OUTPUTS.lock().unwrap_or_else(|p| n42_engine_types::built_executions::recover_poisoned("PARENT_OUTPUTS", p));
         outputs.retain(|(hash, _, _)| *hash != block_hash);
         while outputs.len() >= parent_outputs_kept() {
             outputs.pop_front();
@@ -444,7 +444,7 @@ fn keep_follower_shards(
     residual: ParentOutput,
 ) {
     {
-        let mut kept = FOLLOWER_SHARDS.lock().unwrap_or_else(|p| p.into_inner());
+        let mut kept = FOLLOWER_SHARDS.lock().unwrap_or_else(|p| n42_engine_types::built_executions::recover_poisoned("FOLLOWER_SHARDS", p));
         kept.retain(|(hash, _, _, _)| *hash != block_hash);
         while kept.len() >= follower_shards_kept() {
             kept.pop_front();
@@ -462,7 +462,7 @@ fn follower_shards_of(block_hash: B256) -> Option<(reth_primitives_traits::Seale
     }
     FOLLOWER_SHARDS
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(|p| n42_engine_types::built_executions::recover_poisoned("FOLLOWER_SHARDS", p))
         .iter()
         .find(|(hash, _, _, _)| *hash == block_hash)
         .map(|(_, header, shards, residual)| (header.clone(), ParentLayer::Shards(Arc::clone(shards), Arc::clone(residual))))
@@ -1371,7 +1371,7 @@ fn decline_on_output(number: u64, why: &'static str) {
 fn published_output(hash: B256) -> Option<(reth_primitives_traits::SealedHeader, ParentOutput)> {
     PARENT_OUTPUTS
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(|p| n42_engine_types::built_executions::recover_poisoned("PARENT_OUTPUTS", p))
         .iter()
         .find(|(kept, _, _)| *kept == hash)
         .map(|(_, header, output)| (header.clone(), Arc::clone(output)))

@@ -903,6 +903,7 @@ fn spawn_stats_reporter() {
                     dropped_signature = STATS.dropped_signature.load(Ordering::Relaxed),
                     dropped_altsig = STATS.dropped_altsig.load(Ordering::Relaxed),
                     dropped_altsig_disabled = STATS.dropped_altsig_disabled.load(Ordering::Relaxed),
+                    dropped_altsig_claim = STATS.dropped_altsig_claim.load(Ordering::Relaxed),
                     // Cumulative: frames noted in the queue's frame index,
                     // and frames with a dropped transaction (never whole).
                     frames_admitted = STATS.frames_admitted.load(Ordering::Relaxed),
@@ -1510,6 +1511,9 @@ struct IngestStats {
     dropped_signature: AtomicU64,
     dropped_altsig: AtomicU64,
     dropped_altsig_disabled: AtomicU64,
+    /// 0x50 transactions in a claiming frame whose claim was not the sender
+    /// their key derives.
+    dropped_altsig_claim: AtomicU64,
     /// Frames the ingest kept every transaction of, noted in the queue's
     /// frame index.
     frames_admitted: AtomicU64,
@@ -1542,6 +1546,7 @@ static STATS: IngestStats = IngestStats {
     dropped_signature: AtomicU64::new(0),
     dropped_altsig: AtomicU64::new(0),
     dropped_altsig_disabled: AtomicU64::new(0),
+    dropped_altsig_claim: AtomicU64::new(0),
     frames_admitted: AtomicU64::new(0),
     frames_unaligned: AtomicU64::new(0),
     frames_attested: AtomicU64::new(0),
@@ -1933,9 +1938,11 @@ fn in_my_shard(hash: &alloy_primitives::B256, (index, count): (u64, u64)) -> boo
 /// `shard` is `Some` only under `N42_INGEST_VERIFY=shard`, and matters only
 /// for a claiming frame: a transaction in this node's shard goes through the
 /// verification exactly as under `all`; any other is queued under its claim
-/// and the claim is recorded as its sender (the 0x50 sender cache), so the
-/// vote road and the payload conversion read it as an answer. **Nothing
-/// verifies it anywhere afterwards** -- this is the unsafe benchmark probe of
+/// and recorded as its sender (the 0x50 sender cache), so the vote road and
+/// the payload conversion read it as an answer. A 0x50 claim must be the
+/// sender the transaction's key derives (one keccak) or the transaction is
+/// dropped, so a claim can never name another account; what goes unchecked
+/// is the signature. **Nothing verifies it anywhere afterwards** -- this is the unsafe benchmark probe of
 /// `docs/VERIFY_ONCE_DESIGN.md` form C, correct only while no node and no
 /// generator lies. With `shard` `None` this is `leader`/`all` unchanged.
 ///
@@ -2012,15 +2019,35 @@ where
                 }
                 continue;
             }
+            // A 0x50 sender is a hash of the transaction's own key, so a
+            // claim is never needed for one: the derived sender is used and
+            // a claim that names anyone else drops the transaction. Without
+            // this, a wire claim would become the sender the road and the
+            // payload conversion read from the cache in shard mode.
+            let sender = match &tx {
+                N42PooledTxEnvelope::AltSig(alt_tx) => {
+                    let derived = alt_tx.sender();
+                    if derived != claims[at] {
+                        let dropped = STATS.dropped_altsig_claim.fetch_add(1, Ordering::Relaxed) + 1;
+                        if drop_warn_allowed() {
+                            warn!(target: "n42.tx_ingest", dropped, "a 0x50 claim that is not the sender its key derives");
+                        }
+                        continue;
+                    }
+                    derived
+                }
+                N42PooledTxEnvelope::Eth(_) => claims[at],
+            };
             if shard.is_some() {
-                // Recorded as the sender, unverified, so the road and the
-                // payload conversion take it without a signature (probe only).
+                // Recorded as the sender, signature unverified, so the road
+                // and the payload conversion take it without a signature
+                // (probe only). For 0x50 it is the key's own sender.
                 if tx.is_alt_sig() {
-                    AltSigSenderCache::global().insert(*tx.hash(), claims[at]);
+                    AltSigSenderCache::global().insert(*tx.hash(), sender);
                 }
                 shard_claimed_here += 1;
             }
-            recovered.push(P::Transaction::from_pooled(Recovered::new_unchecked(tx, claims[at])));
+            recovered.push(P::Transaction::from_pooled(Recovered::new_unchecked(tx, sender)));
             claimed_here += 1;
             continue;
         }
@@ -2201,15 +2228,13 @@ mod shard_tests {
     }
 
     /// A claiming frame in shard mode: exactly the transactions whose hash
-    /// is in this node's shard are verified (and come out under their real
-    /// sender, whatever the claim said); every other one is queued under its
-    /// claim, unverified, and the claim is what the sender cache records.
+    /// is in this node's shard are verified; every other one is queued under
+    /// its claim, unverified, and the claim is what the sender cache records.
     #[test]
     fn a_frame_in_shard_mode_verifies_exactly_its_shard() {
         let _lock = crate::coverage_tests::counter_lock();
         n42_tx_types::set_alt_sig_enabled(true);
         let shard = (1u64, 3u64);
-        let bogus = Address::repeat_byte(0xee);
         let txs: Vec<AltSigTx> = (0..48u64).map(|i| signed(1 + (i % 4) as u8, 1_000 + i)).collect();
         let real: Vec<Address> = txs
             .iter()
@@ -2218,11 +2243,8 @@ mod shard_tests {
         let mine: Vec<bool> = txs.iter().map(|tx| in_my_shard(tx.hash(), shard)).collect();
         // The recovery returns claimed transactions first and the verified
         // batch after them, so the output is matched by hash, not by index.
-        let expected_by_hash: std::collections::HashMap<alloy_primitives::B256, (Address, bool)> = txs
-            .iter()
-            .enumerate()
-            .map(|(at, tx)| (*tx.hash(), (if mine[at] { real[at] } else { bogus }, mine[at])))
-            .collect();
+        let expected_by_hash: std::collections::HashMap<alloy_primitives::B256, (Address, bool)> =
+            txs.iter().enumerate().map(|(at, tx)| (*tx.hash(), (real[at], mine[at]))).collect();
         let owned = mine.iter().filter(|m| **m).count() as u64;
         assert!(owned > 0 && owned < 48, "a spread across shards: {owned}");
         let pooled: Vec<N42PooledTxEnvelope> = txs.into_iter().map(N42PooledTxEnvelope::AltSig).collect();
@@ -2230,7 +2252,7 @@ mod shard_tests {
             (STATS.shard_verified.load(Ordering::Relaxed), STATS.shard_claimed.load(Ordering::Relaxed));
         let out = recover_decoded_in::<NoopTransactionPool<N42PooledTransaction>>(
             pooled,
-            vec![bogus; 48],
+            real.clone(),
             None,
             Some(shard),
             false,
@@ -2241,10 +2263,50 @@ mod shard_tests {
             assert_eq!(tx.sender(), expected, "transaction {:?}, in shard: {in_shard}", tx.hash());
             assert_eq!(AltSigSenderCache::global().get(tx.hash()), Some(expected));
         }
-        // Only this test runs the shard path, so the global counters move by
-        // exactly this frame.
+        // The shard tests hold the counter lock, so the global counters move
+        // by exactly this frame.
         assert_eq!(STATS.shard_verified.load(Ordering::Relaxed) - verified_before, owned);
         assert_eq!(STATS.shard_claimed.load(Ordering::Relaxed) - claimed_before, 48 - owned);
+    }
+
+    /// A shard-mode frame whose 0x50 claims name someone other than the
+    /// sender each key derives: the transactions outside this node's shard
+    /// are refused (a claim never becomes a sender), the ones inside it are
+    /// verified and come out under their real sender, and the sender cache
+    /// never records the claimed address.
+    #[test]
+    fn a_shard_mode_claim_that_is_not_the_derived_sender_is_refused() {
+        let _lock = crate::coverage_tests::counter_lock();
+        n42_tx_types::set_alt_sig_enabled(true);
+        let shard = (0u64, 2u64);
+        let bogus = Address::repeat_byte(0xee);
+        let txs: Vec<AltSigTx> = (0..32u64).map(|i| signed(11 + (i % 4) as u8, 2_000 + i)).collect();
+        let mine: Vec<bool> = txs.iter().map(|tx| in_my_shard(tx.hash(), shard)).collect();
+        let owned = mine.iter().filter(|m| **m).count();
+        assert!(owned > 0 && owned < 32, "a spread across shards: {owned}");
+        let hashes: Vec<B256> = txs.iter().map(|tx| *tx.hash()).collect();
+        let derived: Vec<Address> = txs.iter().map(|tx| tx.sender()).collect();
+        let pooled: Vec<N42PooledTxEnvelope> = txs.into_iter().map(N42PooledTxEnvelope::AltSig).collect();
+        let dropped_before = STATS.dropped_altsig_claim.load(Ordering::Relaxed);
+        let out = recover_decoded_in::<NoopTransactionPool<N42PooledTransaction>>(
+            pooled,
+            vec![bogus; 32],
+            None,
+            Some(shard),
+            false,
+        );
+        assert_eq!(out.len(), owned, "only this node's shard survives");
+        for tx in &out {
+            assert_ne!(tx.sender(), bogus);
+        }
+        for (at, hash) in hashes.iter().enumerate() {
+            let cached = AltSigSenderCache::global().get(hash);
+            assert_ne!(cached, Some(bogus), "the claim never reaches the cache");
+            if mine[at] {
+                assert_eq!(cached, Some(derived[at]));
+            }
+        }
+        assert_eq!(STATS.dropped_altsig_claim.load(Ordering::Relaxed) - dropped_before, (32 - owned) as u64);
     }
 
     const CHAIN: u64 = 94;

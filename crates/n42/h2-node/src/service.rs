@@ -992,9 +992,15 @@ fn fill_reply_on_drain() -> bool {
     *ON.get_or_init(|| std::env::var("N42_FILL_REPLY_ON_DRAIN").is_ok_and(|v| v == "1"))
 }
 /// Where a worker puts one.
-type ServedTxnsTx = tokio::sync::mpsc::UnboundedSender<Served>;
+type ServedTxnsTx = tokio::sync::mpsc::Sender<Served>;
 /// Where the loop takes it.
-type ServedTxnsRx = tokio::sync::mpsc::UnboundedReceiver<Served>;
+type ServedTxnsRx = tokio::sync::mpsc::Receiver<Served>;
+
+/// Answers prepared off the loop that may wait for it at once. A serving
+/// task awaits room before it lets go of its slot, so a loop that is not
+/// draining holds the serving tasks back (and, through their slots, new
+/// requests) instead of collecting 128 MiB range replies without bound.
+const SERVED_REPLY_CAPACITY: usize = 8;
 
 /// One block's fill rounds; see `fill_rounds` on the service.
 #[derive(Debug, Default)]
@@ -1357,7 +1363,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             fill_rounds: std::collections::HashMap::new(),
             pending_txns_requests: Vec::new(),
             loop_spend: LoopSpend::default(),
-            served_txns: tokio::sync::mpsc::unbounded_channel(),
+            served_txns: tokio::sync::mpsc::channel(SERVED_REPLY_CAPACITY),
             body_wait: std::collections::HashMap::new(),
             body_grace: body_request_grace(),
             direct_push: false,
@@ -2191,9 +2197,6 @@ impl<E: ExecutionLayer> H2Service<E> {
                         let asked_at = std::time::Instant::now();
                         tokio::task::spawn_blocking(move || {
                             let reply = fill_from_body(&body, profile, &request);
-                            // The work is done: the slot goes back now, not
-                            // when the loop hands the answer over.
-                            drop(slot);
                             debug!(
                                 target: "n42.h2.node",
                                 %peer,
@@ -2203,8 +2206,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                                 "peer asked for named transactions; served from the stored body"
                             );
                             // The loop wakes on this (see the step's select):
-                            // a follower is waiting on it to vote.
-                            let _ = back.send(Served::Txns(ServedTxns {
+                            // a follower is waiting on it to vote. Waits for
+                            // room in the channel (this is a blocking-pool
+                            // thread); a closed one (shutdown) just ends it.
+                            // The slot goes back once the answer is handed
+                            // on, not when the loop hands it to the peer.
+                            let _ = back.blocking_send(Served::Txns(ServedTxns {
                                 peer,
                                 channel,
                                 reply,
@@ -2213,6 +2220,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                                 asked_at,
                                 ready_at: std::time::Instant::now(),
                             }));
+                            drop(slot);
                         });
                     }
                     // A member that took this block as a compact body holds
@@ -2245,16 +2253,20 @@ impl<E: ExecutionLayer> H2Service<E> {
                         let asked_at = std::time::Instant::now();
                         tokio::spawn(async move {
                             let reply = txns_from_execution_layer(&*el, &request).await;
+                            // Room first, then the slot back; a closed
+                            // channel (shutdown) just ends the task.
+                            let _ = back
+                                .send(Served::Txns(ServedTxns {
+                                    peer,
+                                    channel,
+                                    reply,
+                                    hash: request.hash,
+                                    wanted: request.indices.len(),
+                                    asked_at,
+                                    ready_at: std::time::Instant::now(),
+                                }))
+                                .await;
                             drop(slot);
-                            let _ = back.send(Served::Txns(ServedTxns {
-                                peer,
-                                channel,
-                                reply,
-                                hash: request.hash,
-                                wanted: request.indices.len(),
-                                asked_at,
-                                ready_at: std::time::Instant::now(),
-                            }));
                         });
                     }
                 }
@@ -2383,8 +2395,8 @@ impl<E: ExecutionLayer> H2Service<E> {
                         let back = self.served_txns.0.clone();
                         tokio::spawn(async move {
                             let body = block_from_execution_layer(&*el, hash).await;
+                            let _ = back.send(Served::Block { peer, hash, channel, body }).await;
                             drop(slot);
-                            let _ = back.send(Served::Block { peer, hash, channel, body });
                         });
                     }
                 }
@@ -2492,8 +2504,8 @@ impl<E: ExecutionLayer> H2Service<E> {
                     let back = self.served_txns.0.clone();
                     tokio::spawn(async move {
                         let rlps = serve_range(&*el, request).await;
+                        let _ = back.send(Served::Range { peer, request, channel, rlps }).await;
                         drop(slot);
-                        let _ = back.send(Served::Range { peer, request, channel, rlps });
                     });
                 } else {
                     debug!(target: "n42.h2.node", %peer, ?request, "too many requests in flight; range refused");

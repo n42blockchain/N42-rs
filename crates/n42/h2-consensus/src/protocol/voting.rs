@@ -382,16 +382,33 @@ impl ConsensusEngine {
 
         self.round_state.commit(commit_qc.clone());
 
-        // Capture changes BEFORE commit clears pending (needed for Decide + BlockCommitted).
-        let committed_changes = self.epoch_manager.pending_changes_for_proposal();
-        let changes_hash = match &committed_changes {
-            Some(c) => crate::EpochManager::hash_changes(c),
-            None => alloy_primitives::B256::ZERO,
+        // The Decide carries the changes hash the CommitQC signed (the one
+        // cached with the proposal), not a hash of whatever is pending now: a
+        // change queued between proposal and commit was never voted on, and
+        // a Decide naming it would verify nowhere.
+        //
+        // Capture changes BEFORE commit clears pending (needed for
+        // BlockCommitted), and stage them only when they are the certified
+        // set (Commit-then-Activate).
+        let committed_changes = if changes_hash == alloy_primitives::B256::ZERO {
+            None
+        } else {
+            self.epoch_manager
+                .pending_changes_for_proposal()
+                .filter(|pending| crate::EpochManager::hash_changes(pending) == changes_hash)
         };
-
-        // Commit-then-Activate: if validator changes were proposed, stage them now.
-        if self.epoch_manager.has_pending_changes() {
+        if committed_changes.is_some() {
             self.epoch_manager.commit_pending_changes()?;
+        } else if changes_hash != alloy_primitives::B256::ZERO {
+            tracing::error!(
+                target: "n42::cl::voting",
+                view,
+                %block_hash,
+                certified_hash = %changes_hash,
+                local_hash = %self.epoch_manager.pending_changes_hash(),
+                "committed block certified validator changes this leader no longer holds; \
+                 not staging local pending changes"
+            );
         }
 
         let decide = n42_h2_primitives::consensus::Decide {

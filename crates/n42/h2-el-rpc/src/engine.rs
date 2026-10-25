@@ -288,6 +288,59 @@ fn chain_start_decision(
 /// Chain connections kept for reuse.
 const CHAIN_SPARES: usize = 2;
 
+/// Default deadline for one raw-channel exchange, the same as the HTTP
+/// transport's request timeout.
+const RAW_CHANNEL_TIMEOUT_DEFAULT_MS: u64 = 8_000;
+
+static RAW_CHANNEL_TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+
+/// The deadline for one raw-channel exchange (connect, request, every reply
+/// frame): `N42_RAW_CHANNEL_TIMEOUT_MS`, read once, default 8 s.
+pub fn raw_channel_timeout() -> std::time::Duration {
+    *RAW_CHANNEL_TIMEOUT.get_or_init(|| {
+        std::time::Duration::from_millis(
+            std::env::var("N42_RAW_CHANNEL_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(RAW_CHANNEL_TIMEOUT_DEFAULT_MS),
+        )
+    })
+}
+
+static OWN_BLOCK_BY_HEADER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Whether the leader's own block goes to its execution layer as a sealed
+/// header (`N42_OWN_BLOCK_BY_HEADER`, on unless set to `0`; `0` sends the
+/// payload as before). Read once: it is consulted on every own-block import.
+fn own_block_by_header() -> bool {
+    *OWN_BLOCK_BY_HEADER
+        .get_or_init(|| std::env::var("N42_OWN_BLOCK_BY_HEADER").map_or(true, |v| v != "0"))
+}
+
+/// Runs one raw-channel exchange under [`raw_channel_timeout`]. An
+/// execution layer that stops answering mid-frame used to hold the
+/// channel's lock forever; on the deadline the exchange (and the stream it
+/// owns) is dropped and a `TimedOut` error returned, so the caller falls
+/// back to the JSON-RPC path as it does on any other failure.
+async fn within_raw_deadline<T>(
+    exchange: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    within_deadline(raw_channel_timeout(), exchange).await
+}
+
+async fn within_deadline<T>(
+    deadline: std::time::Duration,
+    exchange: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    match tokio::time::timeout(deadline, exchange).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("raw channel: no answer within {} ms", deadline.as_millis()),
+        )),
+    }
+}
+
 /// The sealer, kept in a `Debug` client.
 struct Sealer(ChainSealer);
 
@@ -708,7 +761,7 @@ async fn chain_request(
     use tokio::io::AsyncWriteExt;
     let (chain, addr, generation) = (std::sync::Arc::clone(&ctx.chain), ctx.addr, ctx.generation);
     let spare = chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner).spare.pop();
-    let attempt: std::io::Result<(ChainAnswer, tokio::net::TcpStream)> = async {
+    let attempt: std::io::Result<(ChainAnswer, tokio::net::TcpStream)> = within_raw_deadline(async {
         let mut conn = match spare {
             Some(conn) => conn,
             None => {
@@ -730,7 +783,7 @@ async fn chain_request(
             }
         };
         Ok((answer, conn))
-    }
+    })
     .await;
     match attempt {
         Ok(((built, refusal), conn)) => {
@@ -1436,7 +1489,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         &self,
         header: &alloy_consensus::Header,
     ) -> Option<PayloadStatus> {
-        let by_header = std::env::var("N42_OWN_BLOCK_BY_HEADER").map_or(true, |v| v != "0");
+        let by_header = own_block_by_header();
         if !by_header {
             return None;
         }
@@ -1449,7 +1502,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         payload: ExecutionData,
     ) -> Result<PayloadStatus, ElError> {
         // `N42_OWN_BLOCK_BY_HEADER=0` sends the payload as before (the A-B).
-        let by_header = std::env::var("N42_OWN_BLOCK_BY_HEADER").map_or(true, |v| v != "0");
+        let by_header = own_block_by_header();
         if let (Some(header), true) = (header, by_header) {
             if let Some(status) = self.own_block_over_channel(header).await {
                 return Ok(status);
@@ -1731,7 +1784,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         let started = std::time::Instant::now();
         let frame = alloy_rlp::encode(header);
         let taken = channel.stream.take();
-        let attempt: std::io::Result<(Option<PayloadStatus>, tokio::net::TcpStream)> = async {
+        let attempt: std::io::Result<(Option<PayloadStatus>, tokio::net::TcpStream)> = within_raw_deadline(async {
             let mut conn = match taken {
                 Some(stream) => stream,
                 None => {
@@ -1764,7 +1817,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                 other => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("status {other}"))),
             };
             Ok((status, conn))
-        }
+        })
         .await;
         match attempt {
             Ok((status, conn)) => {
@@ -1833,7 +1886,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         let generation =
             chain_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).generation;
         let taken = channel.stream.take();
-        let attempt: std::io::Result<(Option<Result<BuiltBlock, ElError>>, tokio::net::TcpStream)> = async {
+        let attempt: std::io::Result<(Option<Result<BuiltBlock, ElError>>, tokio::net::TcpStream)> = within_raw_deadline(async {
             let mut conn = match taken {
                 Some(stream) => stream,
                 None => {
@@ -1881,7 +1934,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                 }
             };
             Ok((answer, conn))
-        }
+        })
         .await;
         match attempt {
             Ok((answer, conn)) => {
@@ -1917,7 +1970,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         let started = std::time::Instant::now();
         let frame = n42_h2_execution::raw_engine::encode_execution_data(payload);
         let mut checked = Some(checked);
-        let attempt: std::io::Result<(PayloadStatus, tokio::net::TcpStream)> = async {
+        let attempt: std::io::Result<(PayloadStatus, tokio::net::TcpStream)> = within_raw_deadline(async {
             let mut conn = match taken {
                 Some(stream) => stream,
                 None => {
@@ -1959,7 +2012,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                     }
                 }
             }
-        }
+        })
         .await;
         match attempt {
             Ok((status, conn)) => {
@@ -2046,7 +2099,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         // of answering: not a failure, and not a reason to send the block
         // another way.
         let mut needs: Option<Vec<u32>> = None;
-        let attempt: std::io::Result<(PayloadStatus, tokio::net::TcpStream)> = async {
+        let attempt: std::io::Result<(PayloadStatus, tokio::net::TcpStream)> = within_raw_deadline(async {
             let mut conn = match taken {
                 Some(stream) => stream,
                 None => {
@@ -2127,7 +2180,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                     }
                 }
             }
-        }
+        })
         .await;
         match attempt {
             Ok((status, conn)) => {
@@ -2201,7 +2254,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         let started = std::time::Instant::now();
         // Taken out of the channel and put back only after the whole answer
         // was read, as every request on it does.
-        let attempt: std::io::Result<(u8, Vec<u8>, tokio::net::TcpStream)> = async {
+        let attempt: std::io::Result<(u8, Vec<u8>, tokio::net::TcpStream)> = within_raw_deadline(async {
             let mut conn = match taken {
                 Some(stream) => stream,
                 None => {
@@ -2222,7 +2275,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             let mut buf = vec![0u8; len];
             conn.read_exact(&mut buf).await?;
             Ok((kind, buf, conn))
-        }
+        })
         .await;
         let (kind, buf, conn) = match attempt {
             Ok(answer) => answer,
@@ -2265,7 +2318,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         // response in the stream for the next request to read as its own --
         // a block on the previous parent, delivered in 2 ms (round 38).
         let taken = channel.stream.take();
-        let attempt: std::io::Result<(PayloadStatus, tokio::net::TcpStream)> = async {
+        let attempt: std::io::Result<(PayloadStatus, tokio::net::TcpStream)> = within_raw_deadline(async {
             let mut conn = match taken {
                 Some(stream) => stream,
                 None => {
@@ -2295,7 +2348,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                 other => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("status {other}"))),
             };
             Ok((status, conn))
-        }
+        })
         .await;
         match attempt {
             Ok((status, conn)) => {
@@ -2337,7 +2390,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         // Taken out for the request, back only after the full response; see
         // new_payload_over_channel.
         let taken = channel.stream.take();
-        let attempt: std::io::Result<(Option<Result<BuiltBlock, ElError>>, tokio::net::TcpStream)> = async {
+        let attempt: std::io::Result<(Option<Result<BuiltBlock, ElError>>, tokio::net::TcpStream)> = within_raw_deadline(async {
             let mut conn = match taken {
                 Some(stream) => stream,
                 None => {
@@ -2412,7 +2465,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                 other => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("status {other}"))),
             };
             Ok((answer, conn))
-        }
+        })
         .await;
         match attempt {
             Ok((answer, conn)) => {
@@ -2655,7 +2708,17 @@ fn built_block_from_header(
 /// header goes out, the block comes back in `GET_PAYLOAD`'s shape and is
 /// returned under the sealed header. The inner `Err` is the execution
 /// layer's refusal; the outer one a failed connection or a malformed answer.
+///
+/// The whole round trip runs under the raw-channel deadline
+/// ([`raw_channel_timeout`]).
 pub async fn request_own_body(
+    addr: std::net::SocketAddr,
+    header: &alloy_consensus::Header,
+) -> std::io::Result<Result<ChainBlock, String>> {
+    within_raw_deadline(request_own_body_unbounded(addr, header)).await
+}
+
+async fn request_own_body_unbounded(
     addr: std::net::SocketAddr,
     header: &alloy_consensus::Header,
 ) -> std::io::Result<Result<ChainBlock, String>> {
@@ -2738,6 +2801,30 @@ mod raw_payload_tests {
     use alloy_consensus::{Block, BlockBody, Header, TxEip1559, TxEnvelope, TxLegacy};
     use alloy_eips::Encodable2718;
     use alloy_primitives::{Address, Signature, TxKind, U256};
+
+    #[tokio::test]
+    async fn a_raw_exchange_with_a_silent_server_times_out() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A server that accepts the request and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut sink = [0u8; 64];
+            while conn.read(&mut sink).await.map(|n| n > 0).unwrap_or(false) {}
+        });
+        let started = std::time::Instant::now();
+        let result = within_deadline(std::time::Duration::from_millis(200), async {
+            let mut conn = tokio::net::TcpStream::connect(addr).await?;
+            conn.write_u8(n42_h2_execution::raw_engine::request::OWN_BLOCK).await?;
+            conn.write_u32_le(0).await?;
+            conn.read_u8().await
+        })
+        .await;
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        server.abort();
+    }
 
     #[tokio::test]
     async fn oversized_raw_replies_are_refused_before_the_body_is_read() {

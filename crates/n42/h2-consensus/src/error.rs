@@ -157,6 +157,23 @@ pub enum ConsensusError {
     VoteLogFsync(String),
 }
 
+impl ConsensusError {
+    /// Whether the error is a fault of this node (its disk, its output
+    /// path, its configuration) rather than something a peer sent. A local
+    /// error says the node may have stopped doing its job; a peer error only
+    /// says one message was refused.
+    pub const fn is_local(&self) -> bool {
+        matches!(
+            self,
+            Self::OutputChannelClosed
+                | Self::VoteLogFsync(_)
+                | Self::LocalValidatorNotInSet { .. }
+                | Self::EpochScheduleEmpty
+                | Self::InvalidValidatorSetParams { .. }
+        )
+    }
+}
+
 /// Result type for consensus operations.
 pub type ConsensusResult<T> = Result<T, ConsensusError>;
 
@@ -164,6 +181,16 @@ pub type ConsensusResult<T> = Result<T, ConsensusError>;
 mod tests {
     use super::*;
     use alloy_primitives::B256;
+
+    #[test]
+    fn local_and_peer_errors_are_told_apart() {
+        assert!(ConsensusError::VoteLogFsync("disk".into()).is_local());
+        assert!(ConsensusError::OutputChannelClosed.is_local());
+        assert!(ConsensusError::LocalValidatorNotInSet { epoch: 1 }.is_local());
+        assert!(!ConsensusError::InvalidSignature { view: 1, validator_index: 0 }.is_local());
+        assert!(!ConsensusError::DuplicateVote { view: 1, validator_index: 0 }.is_local());
+        assert!(!ConsensusError::InvalidQC { view: 1, reason: String::new() }.is_local());
+    }
 
     #[test]
     fn test_error_display_formats() {

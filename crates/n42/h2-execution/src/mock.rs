@@ -53,6 +53,9 @@ pub struct MockBehaviour {
     /// Status returned by `forkchoiceUpdated` without attributes (a commit):
     /// `Syncing` is what an engine answers for a block it does not have.
     pub forkchoice_status: PayloadStatusEnum,
+    /// When set, an attribute-less forkchoice (a commit) fails outright with
+    /// this error after it is recorded: the call failed, no verdict given.
+    pub forkchoice_error: Option<String>,
     /// When set, a resolve waits for a permit before it reaches the mock (and
     /// is recorded): a test holds a build between its forkchoice and its
     /// resolve, where a task that is aborted never resolves its job.
@@ -92,6 +95,7 @@ impl Default for MockBehaviour {
             start_builds: true,
             new_payload_error: None,
             forkchoice_status: PayloadStatusEnum::Valid,
+            forkchoice_error: None,
             resolve_gate: None,
             take_bodies: false,
             body_needs_txns: None,
@@ -365,6 +369,10 @@ impl ExecutionLayer for MockExecutionLayer {
             permit.forget();
         }
         self.record(ElCall::ForkchoiceUpdated(state));
+        let failure = self.behaviour.lock().unwrap_or_else(|p| p.into_inner()).forkchoice_error.clone();
+        if let Some(message) = failure {
+            return Err(ElError::new(message));
+        }
         let status = self.behaviour.lock().unwrap_or_else(|p| p.into_inner()).forkchoice_status.clone();
         Ok(ForkchoiceUpdated {
             payload_status: PayloadStatus {

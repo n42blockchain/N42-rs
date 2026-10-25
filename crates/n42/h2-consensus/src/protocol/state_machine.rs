@@ -161,8 +161,23 @@ impl ViewTiming {
 pub const FUTURE_VIEW_WINDOW: u64 = 50;
 
 /// Maximum number of buffered future-view messages.
-/// When exceeded, the oldest (lowest view) messages are evicted.
+/// When exceeded, the highest-view message is evicted: the lowest views are
+/// the ones the node is about to enter and needs most.
 const MAX_FUTURE_MESSAGES: usize = 256;
+
+/// Maximum number of buffered future-view messages attributed to one sender.
+const MAX_FUTURE_MESSAGES_PER_SENDER: usize = 8;
+
+/// Maximum number of buffered future-view messages for one view.
+const MAX_FUTURE_MESSAGES_PER_VIEW: usize = 64;
+
+/// Minimum number of buffered future-view messages per view that were taken
+/// without a signature check (CommitVote, PrepareQC, Decide). These name a
+/// sender nobody has verified, so they do not count against that sender's
+/// cap; they share their own per-view class instead, FIFO within it. The
+/// class grows with the view's validator set so a genuine commit quorum
+/// still fits.
+const MIN_FUTURE_UNCHECKED_PER_VIEW: usize = 8;
 
 /// Events fed into the consensus engine.
 #[derive(Debug)]
@@ -333,10 +348,11 @@ pub struct ConsensusEngine {
     /// what deferred execution (`docs/PHASE_D_DEFERRED_EXECUTION.md`) would
     /// give the cycle before any header changes.
     pub(super) vote_before_import: bool,
-    /// Retry budget of `emit` against a full output channel: attempts and the
-    /// wait before each. Production keeps the defaults; tests widen them.
-    output_retries: u32,
-    output_retry_wait: std::time::Duration,
+    /// Outputs `emit` could not put in a full output channel, in order. The
+    /// channel's consumer is the task that runs this engine, so waiting for
+    /// it to drain cannot work; nothing is dropped instead, and the consumer
+    /// moves these on with [`Self::release_outputs`] as it drains.
+    output_overflow: std::sync::Mutex<VecDeque<EngineOutput>>,
     pub(super) round_state: RoundState,
     pub(super) pacemaker: Pacemaker,
     pub(super) vote_collector: Option<VoteCollector>,
@@ -479,8 +495,7 @@ impl ConsensusEngine {
             leader_tenure: 1,
             signing_profile: ConsensusSigningProfile::Native,
             vote_before_import: false,
-            output_retries: 3,
-            output_retry_wait: std::time::Duration::from_micros(500),
+            output_overflow: std::sync::Mutex::new(VecDeque::new()),
             round_state: RoundState::new(),
             pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
             vote_collector: None,
@@ -590,8 +605,7 @@ impl ConsensusEngine {
             leader_tenure: 1,
             signing_profile: ConsensusSigningProfile::Native,
             vote_before_import: false,
-            output_retries: 3,
-            output_retry_wait: std::time::Duration::from_micros(500),
+            output_overflow: std::sync::Mutex::new(VecDeque::new()),
             round_state: RoundState::from_snapshot(
                 recovered_view,
                 locked_qc,
@@ -994,12 +1008,6 @@ impl ConsensusEngine {
 
     /// **Bench only, unsafe**: vote on a verified proposal before executing
     /// it, under the H2-v4 profile too. See the field.
-    /// Sets the `emit` retry budget (attempts and wait per attempt).
-    pub fn set_output_retry_budget(&mut self, retries: u32, wait: std::time::Duration) {
-        self.output_retries = retries;
-        self.output_retry_wait = wait;
-    }
-
     pub fn set_vote_before_import(&mut self, on: bool) {
         self.vote_before_import = on;
     }
@@ -1128,33 +1136,19 @@ impl ConsensusEngine {
                         if view == new_current {
                             return self.dispatch_message(msg, authenticated_proof);
                         }
-                        if view > new_current
-                            && view <= new_current + FUTURE_VIEW_WINDOW
-                            && self.future_msg_buffer.len() < MAX_FUTURE_MESSAGES
-                        {
-                            self.future_msg_buffer.push((view, msg));
+                        if view > new_current && view <= new_current + FUTURE_VIEW_WINDOW {
+                            self.buffer_future_message(view, msg, authenticated_proof.is_some());
                         }
                         return Ok(());
                     }
-                    if self.future_msg_buffer.len() >= MAX_FUTURE_MESSAGES {
-                        // Evict the oldest (lowest view) entry.
-                        if let Some(min_idx) = self
-                            .future_msg_buffer
-                            .iter()
-                            .enumerate()
-                            .min_by_key(|(_, (v, _))| *v)
-                            .map(|(i, _)| i)
-                        {
-                            self.future_msg_buffer.swap_remove(min_idx);
-                        }
+                    if self.buffer_future_message(view, msg, authenticated_proof.is_some()) {
+                        tracing::debug!(target: "n42::cl::engine",
+                            current_view,
+                            msg_view = view,
+                            buffered = self.future_msg_buffer.len(),
+                            "buffering future-view message"
+                        );
                     }
-                    tracing::debug!(target: "n42::cl::engine",
-                        current_view,
-                        msg_view = view,
-                        buffered = self.future_msg_buffer.len(),
-                        "buffering future-view message"
-                    );
-                    self.future_msg_buffer.push((view, msg));
                     return Ok(());
                 }
 
@@ -1163,11 +1157,8 @@ impl ConsensusEngine {
                     let new_current = self.round_state.current_view();
                     if view == new_current {
                         return self.dispatch_message(msg, authenticated_proof);
-                    } else if view > new_current
-                        && view <= new_current + FUTURE_VIEW_WINDOW
-                        && self.future_msg_buffer.len() < MAX_FUTURE_MESSAGES
-                    {
-                        self.future_msg_buffer.push((view, msg));
+                    } else if view > new_current && view <= new_current + FUTURE_VIEW_WINDOW {
+                        self.buffer_future_message(view, msg, authenticated_proof.is_some());
                     }
                 }
                 return Ok(());
@@ -1241,6 +1232,183 @@ impl ConsensusEngine {
         }
     }
 
+    /// The sender a buffered future message is attributed to, and the hash
+    /// that tells two messages of one kind, view and sender apart.
+    fn future_message_key(msg: &ConsensusMessage) -> (u8, Option<u32>, B256) {
+        match msg {
+            ConsensusMessage::Proposal(p) => (0, Some(p.proposer), p.block_hash),
+            ConsensusMessage::Vote(v) => (1, Some(v.voter), v.block_hash),
+            ConsensusMessage::CommitVote(cv) => (2, Some(cv.voter), cv.block_hash),
+            ConsensusMessage::PrepareQC(pqc) => (3, None, pqc.block_hash),
+            ConsensusMessage::Timeout(t) => (4, Some(t.sender), B256::ZERO),
+            ConsensusMessage::NewView(nv) => (5, Some(nv.leader), B256::ZERO),
+            ConsensusMessage::Decide(d) => (6, None, d.block_hash),
+        }
+    }
+
+    /// A digest of the whole message as encoded; `None` only if it does not
+    /// encode, and such a message is never taken for a duplicate (the caps
+    /// still bound it).
+    fn future_message_digest(msg: &ConsensusMessage) -> Option<B256> {
+        let encoded = bincode::serialize(msg).ok()?;
+        Some(B256::from(*blake3::hash(&encoded).as_bytes()))
+    }
+
+    /// Buffers a message for a future view inside the window, bounded and
+    /// deduplicated. Returns whether the message was buffered.
+    ///
+    /// - A copy with the same (kind, view, sender, hash) as a buffered one is
+    ///   dropped (gossip multi-path delivery).
+    /// - A single-signer Vote or Proposal is signature-checked first when
+    ///   the view's validator set is known exactly and no transport proof
+    ///   came with it, so junk cannot take a slot. A CommitVote is not (its
+    ///   domain needs the proposal's changes hash); the caps bound it.
+    /// - At most [`MAX_FUTURE_MESSAGES_PER_SENDER`] per sender and
+    ///   [`MAX_FUTURE_MESSAGES_PER_VIEW`] per view. Messages taken without a
+    ///   signature check (CommitVote, PrepareQC, Decide) do not count
+    ///   against the sender they name: they share a per-view class of at
+    ///   least [`MIN_FUTURE_UNCHECKED_PER_VIEW`], oldest out first. When a
+    ///   sender cap or the total
+    ///   [`MAX_FUTURE_MESSAGES`] is reached the highest view goes: a lower
+    ///   view replaces it, a message at or above it is dropped.
+    pub(super) fn buffer_future_message(
+        &mut self,
+        view: ViewNumber,
+        msg: ConsensusMessage,
+        authenticated: bool,
+    ) -> bool {
+        let (kind, sender, hash) = Self::future_message_key(&msg);
+        // A copy is a duplicate only if it is the same message byte for
+        // byte: an unchecked fake that names the right (kind, view, sender,
+        // hash) must not take the genuine message's place. The digest is
+        // computed only for the few entries the cheap key already matches.
+        let digest = Self::future_message_digest(&msg);
+        if self.future_msg_buffer.iter().any(|(buffered_view, buffered)| {
+            *buffered_view == view
+                && Self::future_message_key(buffered) == (kind, sender, hash)
+                && digest.is_some()
+                && Self::future_message_digest(buffered) == digest
+        }) {
+            return false;
+        }
+
+        // Not a CommitVote: its signing domain carries the block's changes
+        // hash, known only once the proposal is cached, which a future
+        // view's usually is not -- a valid vote for a block with validator
+        // changes would be refused here. It is verified at replay.
+        let single_signer = matches!(msg, ConsensusMessage::Vote(_) | ConsensusMessage::Proposal(_));
+        if single_signer
+            && !authenticated
+            && self.epoch_manager.known_validator_set_for_view(view).is_some()
+            && self.authenticated_signer(&msg) != sender
+        {
+            tracing::debug!(target: "n42::cl::engine",
+                msg_view = view,
+                ?sender,
+                "dropping future-view message: signature does not verify"
+            );
+            return false;
+        }
+
+        // Per-view cap: the messages of one view are equals, so a full view
+        // takes no more.
+        let in_view = self
+            .future_msg_buffer
+            .iter()
+            .filter(|(buffered_view, _)| *buffered_view == view)
+            .count();
+        if in_view >= MAX_FUTURE_MESSAGES_PER_VIEW {
+            return false;
+        }
+
+        // A message taken without a signature check names a sender nobody
+        // verified: it must not use up that sender's share (eight forged
+        // CommitVotes naming a validator would otherwise keep its real
+        // messages out). It goes into the view's unchecked class instead,
+        // whose oldest entry makes room for a newer one.
+        if Self::future_message_unchecked(&msg) {
+            let class_cap = MIN_FUTURE_UNCHECKED_PER_VIEW
+                .max(self.validator_set_for_view(view).len() as usize + 2);
+            let in_class = |(buffered_view, buffered): &(ViewNumber, ConsensusMessage)| {
+                *buffered_view == view && Self::future_message_unchecked(buffered)
+            };
+            let unchecked_in_view = self.future_msg_buffer.iter().filter(|&e| in_class(e)).count();
+            if unchecked_in_view >= class_cap {
+                if let Some(index) = self.future_msg_buffer.iter().position(in_class) {
+                    // `remove`, not `swap_remove`: the buffer keeps arrival
+                    // order, which is what FIFO and the replay rely on.
+                    self.future_msg_buffer.remove(index);
+                }
+            }
+        } else if let Some(sender) = sender {
+            // Per-sender cap: evict the sender's highest view if the new
+            // message is for a lower one.
+            let from_sender = self
+                .future_msg_buffer
+                .iter()
+                .filter(|(_, buffered)| Self::future_message_counts_for(buffered, sender))
+                .count();
+            if from_sender >= MAX_FUTURE_MESSAGES_PER_SENDER
+                && !self.evict_highest_future_message(view, |buffered| {
+                    Self::future_message_counts_for(buffered, sender)
+                })
+            {
+                return false;
+            }
+        }
+        // The total cap: evict the highest view if the new message is for a
+        // lower one.
+        if self.future_msg_buffer.len() >= MAX_FUTURE_MESSAGES
+            && !self.evict_highest_future_message(view, |_| true)
+        {
+            return false;
+        }
+
+        self.future_msg_buffer.push((view, msg));
+        true
+    }
+
+    /// Whether a buffered future message was taken without a signature
+    /// check: a CommitVote (its domain needs the proposal's changes hash), a
+    /// PrepareQC or a Decide (aggregates, verified at replay).
+    const fn future_message_unchecked(msg: &ConsensusMessage) -> bool {
+        matches!(
+            msg,
+            ConsensusMessage::CommitVote(_)
+                | ConsensusMessage::PrepareQC(_)
+                | ConsensusMessage::Decide(_)
+        )
+    }
+
+    /// Whether a buffered future message counts against `sender`'s cap:
+    /// it names that sender and is not in the unchecked class.
+    fn future_message_counts_for(msg: &ConsensusMessage, sender: u32) -> bool {
+        !Self::future_message_unchecked(msg) && Self::future_message_key(msg).1 == Some(sender)
+    }
+
+    /// Removes the highest-view buffered message matching `filter` if its
+    /// view is above `view`. Returns whether one was removed.
+    fn evict_highest_future_message(
+        &mut self,
+        view: ViewNumber,
+        filter: impl Fn(&ConsensusMessage) -> bool,
+    ) -> bool {
+        let highest = self
+            .future_msg_buffer
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, buffered))| filter(buffered))
+            .max_by_key(|(_, (buffered_view, _))| *buffered_view)
+            .map(|(index, (buffered_view, _))| (index, *buffered_view));
+        match highest {
+            Some((index, highest_view)) if highest_view > view => {
+                self.future_msg_buffer.remove(index);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn message_view(msg: &ConsensusMessage) -> Option<ViewNumber> {
         match msg {
             ConsensusMessage::Proposal(p) => Some(p.view),
@@ -1285,34 +1453,65 @@ impl ConsensusEngine {
             _ => return Ok(false),
         };
 
+        // A QC proves a quorum reached qc.view, so the jump target is its
+        // successor (see below). A QC that cannot move the view is refused
+        // before any pairing.
+        if qc.view.saturating_add(1) <= current_view {
+            return Ok(false);
+        }
+        if matches!(msg, ConsensusMessage::Vote(_) | ConsensusMessage::CommitVote(_)) {
+            return Ok(false);
+        }
+
+        // A QC this node already holds as its lock or its last commit was
+        // verified before it got there: it still justifies the jump (the
+        // next leader proposes on exactly that lock, and its proposal may
+        // arrive before the Decide that would move this follower), only the
+        // pairing is skipped. (A memo of verified QCs would never hit: one
+        // that verifies always jumps, and the view early-out above refuses
+        // it after that.)
+        let already_verified =
+            qc == self.round_state.locked_qc() || qc == self.round_state.last_committed_qc();
+
         // Proposal/Timeout/NewView can carry either a prepare QC or a commit QC as
         // their justify/high QC, so the view-jump path must accept both domains.
         // For Decide we know the exact changes_hash from the message; for others
         // we fall back to ZERO since the proposal is not yet cached on this
         // far-behind node (acceptable: the next regular proposal will retry).
-        let verify_result = match msg {
-            ConsensusMessage::Decide(decide) => super::quorum::verify_commit_qc_with_profile(
-                qc,
-                self.validator_set_for_view(qc.view),
-                &decide.validator_changes_hash,
-                self.signing_profile,
-            ),
-            ConsensusMessage::PrepareQC(_) => super::quorum::verify_qc_with_profile(
-                qc,
-                self.validator_set_for_view(qc.view),
-                self.signing_profile,
-            ),
-            ConsensusMessage::Proposal(_)
-            | ConsensusMessage::Timeout(_)
-            | ConsensusMessage::NewView(_) => self.verify_qc_any_domain_or_known(qc),
-            ConsensusMessage::Vote(_) | ConsensusMessage::CommitVote(_) => return Ok(false),
+        // Every arm resolves the set authorized for the QC's exact view and
+        // refuses the jump when it is unknown, never a guessed set.
+        let verify_result = if already_verified {
+            Ok(())
+        } else {
+            match msg {
+                ConsensusMessage::Decide(decide) => {
+                    self.resolve_qc_validator_set(qc).and_then(|set| {
+                        super::quorum::verify_commit_qc_with_profile(
+                            qc,
+                            set,
+                            &decide.validator_changes_hash,
+                            self.signing_profile,
+                        )
+                    })
+                }
+                ConsensusMessage::PrepareQC(_) => {
+                    self.resolve_qc_validator_set(qc).and_then(|set| {
+                        super::quorum::verify_qc_with_profile(qc, set, self.signing_profile)
+                    })
+                }
+                ConsensusMessage::Proposal(_)
+                | ConsensusMessage::Timeout(_)
+                | ConsensusMessage::NewView(_) => self.verify_qc_any_domain_or_known(qc),
+                ConsensusMessage::Vote(_) | ConsensusMessage::CommitVote(_) => return Ok(false),
+            }
         };
-        if verify_result.is_err() {
+        if let Err(error) = verify_result {
             tracing::debug!(target: "n42::cl::engine",
                 current_view,
                 msg_view,
                 qc_view = qc.view,
-                "QC view jump failed: invalid QC signature"
+                %error,
+                "QC view jump failed: QC does not verify against its view's validator set"
             );
             return Ok(false);
         }
@@ -1592,12 +1791,88 @@ impl ConsensusEngine {
     }
 
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {
-        let max_retries = self.output_retries;
+        let mut overflow = self
+            .output_overflow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Order is kept: while anything waits in the overflow, a new output
+        // queues behind it.
+        if !overflow.is_empty() {
+            Self::move_overflow(&self.output_tx, &mut overflow)?;
+            if !overflow.is_empty() {
+                overflow.push_back(output);
+                return Ok(());
+            }
+        }
+        match self.output_tx.try_send(output) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(output)) => {
+                tracing::error!(
+                    target: "n42::cl::engine",
+                    output = Self::output_kind(&output),
+                    "consensus output channel closed"
+                );
+                Err(crate::error::ConsensusError::OutputChannelClosed)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(output)) => {
+                // The consumer is this engine's own task: it drains after
+                // the event that is running now returns. Hold the output for
+                // it rather than sleeping the worker or dropping a Decide or
+                // a BlockCommitted.
+                tracing::debug!(
+                    target: "n42::cl::engine",
+                    output = Self::output_kind(&output),
+                    "consensus output channel full; holding the output in order"
+                );
+                overflow.push_back(output);
+                Ok(())
+            }
+        }
+    }
 
-        // Treat bounded-channel backpressure as recoverable. Only a closed channel
-        // is immediately fatal to consensus.
-        let is_block_committed = matches!(output, EngineOutput::BlockCommitted { .. });
-        let output_kind = match &output {
+    /// Moves held outputs into the channel while it has room. Called by the
+    /// channel's consumer as it drains (it is the one that makes room);
+    /// returns how many are still held.
+    pub fn release_outputs(&self) -> usize {
+        let mut overflow = self
+            .output_overflow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A closed channel has no consumer left to tell.
+        let _ = Self::move_overflow(&self.output_tx, &mut overflow);
+        overflow.len()
+    }
+
+    /// Outputs held because the channel was full.
+    pub fn held_outputs(&self) -> usize {
+        self.output_overflow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    fn move_overflow(
+        tx: &mpsc::Sender<EngineOutput>,
+        overflow: &mut VecDeque<EngineOutput>,
+    ) -> ConsensusResult<()> {
+        while let Some(output) = overflow.pop_front() {
+            match tx.try_send(output) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(output)) => {
+                    overflow.push_front(output);
+                    return Ok(());
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(output)) => {
+                    overflow.push_front(output);
+                    return Err(crate::error::ConsensusError::OutputChannelClosed);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    const fn output_kind(output: &EngineOutput) -> &'static str {
+        match output {
             EngineOutput::BroadcastMessage(_) => "BroadcastMessage",
             EngineOutput::SendToValidator(_, _) => "SendToValidator",
             EngineOutput::ExecuteBlock(_) => "ExecuteBlock",
@@ -1609,79 +1884,6 @@ impl ConsensusEngine {
             EngineOutput::SyncRequired { .. } => "SyncRequired",
             EngineOutput::EquivocationDetected { .. } => "EquivocationDetected",
             EngineOutput::EpochTransition { .. } => "EpochTransition",
-        };
-
-        match self.output_tx.try_send(output) {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                tracing::error!(
-                    target: "n42::cl::engine",
-                    output = output_kind,
-                    "consensus output channel closed"
-                );
-                Err(crate::error::ConsensusError::OutputChannelClosed)
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(output)) => {
-                let mut pending = output;
-
-                for attempt in 1..=max_retries {
-                    // Brief sleep to give the channel consumer a chance to drain.
-                    // 500µs × 3 retries = 1.5ms max blocking per emit() call.
-                    // This is acceptable: channel backpressure is rare (capacity 64-1024),
-                    // and 1.5ms is negligible relative to the 8-second slot target.
-                    // std::thread::sleep is used deliberately here rather than tokio::time::sleep
-                    // because emit() is a sync fn; the short duration minimises worker stall.
-                    std::thread::sleep(self.output_retry_wait);
-                    match self.output_tx.try_send(pending) {
-                        Ok(()) => {
-                            if is_block_committed {
-                                tracing::warn!(
-                                    target: "n42::cl::engine",
-                                    attempt,
-                                    "BlockCommitted delivered after retry"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    target: "n42::cl::engine",
-                                    output = output_kind,
-                                    attempt,
-                                    "consensus output delivered after retry"
-                                );
-                            }
-                            return Ok(());
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            tracing::error!(
-                                target: "n42::cl::engine",
-                                output = output_kind,
-                                attempt,
-                                "consensus output channel closed during retry"
-                            );
-                            return Err(crate::error::ConsensusError::OutputChannelClosed);
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(output)) => {
-                            pending = output;
-                        }
-                    }
-                }
-
-                if is_block_committed {
-                    tracing::error!(
-                        target: "n42::cl::engine",
-                        "CRITICAL: BlockCommitted lost after {} retries",
-                        max_retries
-                    );
-                } else {
-                    tracing::error!(
-                        target: "n42::cl::engine",
-                        output = output_kind,
-                        retries = max_retries,
-                        "consensus output channel remained full after retries"
-                    );
-                }
-
-                Err(crate::error::ConsensusError::OutputChannelClosed)
-            }
         }
     }
 }
@@ -2375,64 +2577,65 @@ mod tests {
         assert!(debug_str.contains("my_index"));
     }
 
-    /// Queued outputs remain ordered after a full channel drains. Synchronize
-    /// the consumer rather than relying on OS scheduling within the retry
-    /// deadline; the separate bounded-retry test covers an undrained channel.
+    /// Outputs beyond a full channel are held in order, never dropped, and
+    /// emit does not block: the consumer releases them as it drains.
     #[test]
-    fn test_emit_preserves_order_after_a_full_channel_drains() {
-        let (mut engine, _, _, mut rx) = make_engine_with_output_capacity(1, 0, 1);
-        // A budget far above any scheduling delay: the drain always lands in it.
-        engine.set_output_retry_budget(200, std::time::Duration::from_millis(1));
+    fn test_emit_holds_outputs_beyond_a_full_channel_in_order() {
+        let (engine, _, _, mut rx) = make_engine_with_output_capacity(1, 0, 1);
+        let started = std::time::Instant::now();
+        for view in 0..5u64 {
+            engine
+                .emit(EngineOutput::ViewChanged { new_view: view })
+                .expect("a full channel holds the output, it is not an error");
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "emit must not sleep");
+        assert_eq!(engine.held_outputs(), 4);
 
-        engine
-            .emit(EngineOutput::ExecuteBlock(B256::repeat_byte(0xAB)))
-            .expect("first output should fill the channel");
-
-        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
-        let drain = std::thread::spawn(move || {
-            let first = rx.blocking_recv().expect("expected first output");
-            drained_tx.send(()).expect("notify first drain");
-            let second = rx.blocking_recv().expect("expected second output");
-            (first, second)
-        });
-
-        drained_rx.recv().expect("consumer drained the full channel");
-        engine
-            .emit(EngineOutput::ViewChanged { new_view: 2 })
-            .expect("second output should preserve ordering");
-
-        let (first, second) = drain.join().expect("drain thread should complete");
-        assert!(
-            matches!(first, EngineOutput::ExecuteBlock(hash) if hash == B256::repeat_byte(0xAB))
-        );
-        assert!(matches!(second, EngineOutput::ViewChanged { new_view: 2 }));
+        let mut got = Vec::new();
+        loop {
+            engine.release_outputs();
+            match rx.try_recv() {
+                Ok(EngineOutput::ViewChanged { new_view }) => got.push(new_view),
+                Ok(other) => panic!("unexpected output {other:?}"),
+                Err(_) => break,
+            }
+        }
+        assert_eq!(got, vec![0, 1, 2, 3, 4]);
+        assert_eq!(engine.held_outputs(), 0);
     }
 
-    /// The retry budget is bounded: a consumer that never drains must not stall
-    /// the engine forever. This is the deterministic half of the pair above —
-    /// nothing drains, so the outcome does not depend on scheduling at all.
+    /// One event that emits more than the channel holds loses nothing:
+    /// the same timeout on a one-slot channel and on a roomy one yields the
+    /// same outputs.
     #[test]
-    fn test_emit_gives_up_when_the_consumer_never_drains() {
-        let (engine, _, _, _rx) = make_engine_with_output_capacity(1, 0, 1);
+    fn test_one_event_emitting_past_the_channel_capacity_loses_nothing() {
+        let collect = |capacity: usize| {
+            let (mut engine, _, _, mut rx) = make_engine_with_output_capacity(4, 0, capacity);
+            engine.on_timeout().expect("local timeout");
+            let mut kinds = Vec::new();
+            loop {
+                engine.release_outputs();
+                match rx.try_recv() {
+                    Ok(output) => kinds.push(ConsensusEngine::output_kind(&output)),
+                    Err(_) => break,
+                }
+            }
+            kinds
+        };
+        let roomy = collect(1024);
+        assert!(roomy.len() > 1, "the timeout emits several outputs: {roomy:?}");
+        assert_eq!(collect(1), roomy);
+    }
 
-        engine
-            .emit(EngineOutput::ExecuteBlock(B256::repeat_byte(0xAB)))
-            .expect("first output should fill the channel");
-
-        let started = std::time::Instant::now();
-        let result = engine.emit(EngineOutput::ViewChanged { new_view: 2 });
-        let elapsed = started.elapsed();
-
-        assert!(
-            result.is_err(),
-            "emit must give up rather than block the engine indefinitely"
-        );
-        // 3 retries x 500us of sleep. Asserted only as an upper bound, and a
-        // generous one, so a loaded machine cannot fail it.
-        assert!(
-            elapsed < std::time::Duration::from_secs(1),
-            "emit blocked for {elapsed:?}, far beyond its retry budget"
-        );
+    /// A closed channel is still an error.
+    #[test]
+    fn test_emit_reports_a_closed_channel() {
+        let (engine, _, _, rx) = make_engine_with_output_capacity(1, 0, 1);
+        drop(rx);
+        assert!(matches!(
+            engine.emit(EngineOutput::ViewChanged { new_view: 1 }),
+            Err(crate::error::ConsensusError::OutputChannelClosed)
+        ));
     }
 
     #[test]
@@ -4020,6 +4223,132 @@ mod tests {
     }
 
     #[test]
+    fn test_decide_stages_local_pending_changes_only_when_they_are_the_certified_set() {
+        let local = ValidatorInfo {
+            address: Address::with_last_byte(0x50),
+            bls_public_key: test_key(0x60).public_key(),
+            p2p_peer_id: None,
+        };
+        let local_changes = vec![ValidatorChange::Add {
+            address: local.address,
+            bls_public_key: local.bls_public_key.clone(),
+            p2p_peer_id: None,
+        }];
+        let other_changes = vec![ValidatorChange::Add {
+            address: Address::with_last_byte(0x51),
+            bls_public_key: test_key(0x61).public_key(),
+            p2p_peer_id: None,
+        }];
+
+        for (certified, expect_staged) in [(other_changes, false), (local_changes, true)] {
+            let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+            engine.epoch_manager = EpochManager::with_epoch_length(vs.clone(), 10);
+            // A change queued locally (an RPC add) that the follower never
+            // saw in a proposal.
+            engine.propose_add_validator(local.clone()).expect("queued");
+
+            let view = 2u64;
+            let block_hash = B256::repeat_byte(0xDA);
+            let changes_hash = EpochManager::hash_changes(&certified);
+            let decide = Decide {
+                view,
+                block_hash,
+                commit_qc: build_test_commit_qc_with_changes(
+                    view,
+                    block_hash,
+                    &sks,
+                    &vs,
+                    &[0, 1, 2],
+                    &changes_hash,
+                ),
+                validator_changes_hash: changes_hash,
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(decide)))
+                .expect("the decide commits");
+
+            assert_eq!(engine.epoch_manager().has_staged_next(), expect_staged);
+            let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let committed = outputs.iter().find_map(|output| match output {
+                EngineOutput::BlockCommitted { view: 2, validator_changes, .. } => {
+                    Some(validator_changes.clone())
+                }
+                _ => None,
+            });
+            let committed = committed.expect("the block is committed");
+            assert_eq!(committed.is_some(), expect_staged);
+            let resync = outputs.iter().any(|output| {
+                matches!(output, EngineOutput::SyncRequired { local_view: 1, target_view: 2 })
+            });
+            assert_eq!(resync, !expect_staged, "a mismatch is treated as missed changes");
+        }
+    }
+
+    #[test]
+    fn test_leader_decide_carries_the_certified_changes_hash_not_later_pending_changes() {
+        use crate::protocol::quorum::{commit_signing_message, signing_message};
+
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 1);
+        engine.epoch_manager = EpochManager::with_epoch_length(vs, 10);
+        let block_hash = B256::repeat_byte(0xF7);
+        let view = 1u64;
+
+        // The proposal carries no changes, so the CommitQC signs ZERO.
+        engine
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
+            .expect("block ready");
+        for i in [0u32, 2] {
+            let vote = Vote {
+                view,
+                block_hash,
+                voter: i,
+                signature: sks[i as usize].sign(&signing_message(view, &block_hash)),
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+                .expect("vote");
+        }
+        // A change queued between the proposal and the commit.
+        engine
+            .propose_add_validator(ValidatorInfo {
+                address: Address::with_last_byte(0x52),
+                bls_public_key: test_key(0x62).public_key(),
+                p2p_peer_id: None,
+            })
+            .expect("queued");
+        while rx.try_recv().is_ok() {}
+        for i in [0u32, 2] {
+            let cv = CommitVote {
+                view,
+                block_hash,
+                voter: i,
+                signature: sks[i as usize]
+                    .sign(&commit_signing_message(view, &block_hash, &B256::ZERO)),
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(cv)))
+                .expect("commit vote");
+        }
+        assert_eq!(engine.current_view(), 2);
+
+        let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let decide = outputs
+            .iter()
+            .find_map(|output| match output {
+                EngineOutput::BroadcastMessage(ConsensusMessage::Decide(decide)) => Some(decide),
+                _ => None,
+            })
+            .expect("the leader broadcasts a Decide");
+        assert_eq!(decide.validator_changes_hash, B256::ZERO, "the hash the CommitQC signed");
+        assert!(outputs.iter().any(|output| matches!(
+            output,
+            EngineOutput::BlockCommitted { view: 1, validator_changes: None, .. }
+        )));
+        assert!(!engine.epoch_manager().has_staged_next(), "unvoted changes are not staged");
+        assert!(engine.epoch_manager().has_pending_changes(), "they wait for the next proposal");
+    }
+
+    #[test]
     fn test_late_committed_proposal_recovers_validator_changes_before_boundary() {
         use crate::protocol::quorum::proposal_signing_message;
         use crate::validator::LeaderSelector;
@@ -4394,6 +4723,76 @@ mod tests {
             outputs
                 .iter()
                 .any(|o| matches!(o, EngineOutput::ViewChanged { new_view: 100 }))
+        );
+    }
+
+    #[test]
+    fn test_view_jump_skips_qcs_that_cannot_move_the_view() {
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+        let justify_qc = build_test_prepare_qc(99, B256::repeat_byte(0xEF), &sks, &vs, &[0, 1, 2]);
+        let far_proposal = |view: u64, justify_qc: QuorumCertificate| {
+            let block_hash = B256::repeat_byte(view as u8);
+            let msg = crate::protocol::quorum::proposal_signing_message(view, &block_hash, &None);
+            ConsensusMessage::Proposal(Proposal {
+                view,
+                block_hash,
+                justify_qc,
+                proposer: 0,
+                signature: sks[0].sign(&msg),
+                prepare_qc: None,
+                tx_root_hash: None,
+                validator_changes: None,
+            })
+        };
+
+        engine
+            .process_event(ConsensusEvent::Message(far_proposal(100, justify_qc.clone())))
+            .expect("first jump");
+        assert_eq!(engine.current_view(), 100);
+        while rx.try_recv().is_ok() {}
+
+        // The same certificate replayed under a fresh outer view cannot move
+        // the view: it is refused before verification and nothing changes.
+        engine
+            .process_event(ConsensusEvent::Message(far_proposal(200, justify_qc)))
+            .expect("replayed QC is ignored");
+        assert_eq!(engine.current_view(), 100);
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|output| matches!(output, EngineOutput::SyncRequired { .. })));
+    }
+
+    #[test]
+    fn test_next_view_proposal_on_the_own_lock_jumps_before_the_decide() {
+        // A follower locked on view 1's prepare QC (it processed the
+        // PrepareQC) is still in view 1, waiting for Decide(1). The next
+        // leader's proposal for view 2 carries that very QC as its justify
+        // and arrives first: it must move the follower to view 2 and be
+        // dispatched, not wait in the buffer for the Decide.
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+        assert_eq!(engine.current_view(), 1);
+        let lock = build_test_prepare_qc(1, B256::repeat_byte(0x31), &sks, &vs, &[0, 1, 2]);
+        engine.round_state.update_locked_qc(&lock);
+        while rx.try_recv().is_ok() {}
+
+        let block_hash = B256::repeat_byte(0x32);
+        let message = engine.signing_profile.proposal_message(2, block_hash, &None);
+        let proposal = Proposal {
+            view: 2,
+            block_hash,
+            justify_qc: lock,
+            proposer: 2,
+            signature: engine.signing_profile.sign(&sks[2], &message),
+            prepare_qc: None,
+            tx_root_hash: None,
+            validator_changes: None,
+        };
+        // What the proposal itself leads to (an execute request, a vote) is
+        // not the point; the view is.
+        let _ = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)));
+        assert_eq!(engine.current_view(), 2, "the own lock justifies the jump");
+        assert!(
+            !engine.future_msg_buffer.iter().any(|(view, _)| *view == 2),
+            "the proposal was dispatched, not buffered"
         );
     }
 
@@ -4912,6 +5311,103 @@ mod tests {
     }
 
     #[test]
+    fn test_verified_repeat_future_timeout_is_relayed_to_next_leader_once() {
+        // The future-view twin of the test above: validator 1's timeout for
+        // view 2 (local view 1) is verified, counted and relayed to view 3's
+        // leader once. A second copy is handled as a duplicate: no relay and
+        // no second entry in the future buffer.
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        assert_eq!(engine.current_view(), 1);
+        while rx.try_recv().is_ok() {}
+
+        let timeout = TimeoutMessage {
+            view: 2,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 1,
+            signature: sks[1].sign(&timeout_signing_message(2)),
+        };
+
+        for expected_relays in [1, 0] {
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(
+                    timeout.clone(),
+                )))
+                .expect("verified future timeout should be accepted or deduplicated");
+
+            let relays = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|output| {
+                    matches!(
+                        output,
+                        EngineOutput::SendToValidator(
+                            _,
+                            ConsensusMessage::Timeout(relayed)
+                        ) if relayed.sender == 1 && relayed.view == 2
+                    )
+                })
+                .count();
+            assert_eq!(
+                relays, expected_relays,
+                "only the first verified future timeout copy may be relayed"
+            );
+        }
+        assert_eq!(engine.current_view(), 1);
+        assert!(
+            engine.future_msg_buffer.len() <= 1,
+            "a duplicate future timeout must not be buffered again"
+        );
+    }
+
+    #[test]
+    fn test_a_counted_future_timeout_the_buffer_refused_is_buffered_by_a_later_copy() {
+        use crate::protocol::quorum::signing_message;
+
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        // Validator 1's per-sender share is full of lower-view votes, so its
+        // view-10 timeout is counted but refused by the buffer.
+        for n in 0..MAX_FUTURE_MESSAGES_PER_SENDER as u8 {
+            let block_hash = B256::repeat_byte(n.wrapping_add(0x40));
+            let vote = Vote {
+                view: 3,
+                block_hash,
+                voter: 1,
+                signature: sks[1].sign(&signing_message(3, &block_hash)),
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+                .expect("future vote");
+        }
+        let timeout = TimeoutMessage {
+            view: 10,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 1,
+            signature: sks[1].sign(&timeout_signing_message(10)),
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout.clone())))
+            .expect("counted, not buffered");
+        let buffered = |engine: &ConsensusEngine| {
+            engine
+                .future_msg_buffer
+                .iter()
+                .any(|(view, msg)| *view == 10 && matches!(msg, ConsensusMessage::Timeout(t) if t.sender == 1))
+        };
+        assert!(!buffered(&engine), "the full share refused it");
+
+        // Room again (the view-3 votes were replayed); a later copy of the
+        // counted timeout is buffered, and not relayed a second time.
+        engine.future_msg_buffer.retain(|(view, _)| *view != 3);
+        while rx.try_recv().is_ok() {}
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout)))
+            .expect("later copy");
+        assert!(buffered(&engine), "the counted timeout reaches the buffer");
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|output| matches!(
+            output,
+            EngineOutput::SendToValidator(_, ConsensusMessage::Timeout(_))
+        )));
+    }
+
+    #[test]
     fn test_single_timeout_at_window_boundary_is_buffered() {
         use crate::protocol::quorum::timeout_signing_message;
         use n42_h2_primitives::consensus::TimeoutMessage;
@@ -5134,6 +5630,52 @@ mod tests {
         assert_eq!(new_view.timeout_cert.view, timeout_view);
         crate::protocol::quorum::verify_tc(&new_view.timeout_cert, engine.validator_set())
             .expect("future recovery must produce a cryptographically valid TC");
+    }
+
+    #[test]
+    fn test_view_jump_and_new_view_tc_refuse_an_unknown_epoch_set() {
+        use crate::protocol::quorum::TimeoutCollector;
+        use n42_h2_primitives::consensus::{NewView, PrepareQC};
+
+        // Epoch 1 begins at view 3 and no next set is staged. The current
+        // set would verify these certificates by coincidence; the strict
+        // resolver refuses them.
+        let (mut engine, sks, vs, _rx) = make_engine(4, 0);
+        engine.epoch_manager = EpochManager::with_epoch_length(vs.clone(), 2);
+
+        let block_hash = B256::repeat_byte(0x3C);
+        let qc = build_test_prepare_qc(3, block_hash, &sks, &vs, &[0, 1, 2]);
+        let _ = engine.process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(
+            PrepareQC { view: 3, block_hash, qc },
+        )));
+        assert_eq!(engine.current_view(), 1, "no view jump on a QC of an unknown epoch");
+
+        let profile = engine.signing_profile;
+        let mut collector = TimeoutCollector::new(3, vs.len());
+        for sender in [0u32, 1, 2] {
+            collector
+                .add_timeout(
+                    sender,
+                    profile.sign(&sks[sender as usize], &profile.timeout_message(3)),
+                    QuorumCertificate::genesis(),
+                )
+                .expect("distinct senders");
+        }
+        let timeout_cert = collector.build_tc_with_profile(&vs, profile).expect("a valid TC");
+        let leader = engine.leader_index_for_view(4);
+        let new_view = NewView {
+            view: 4,
+            timeout_cert,
+            leader,
+            signature: profile.sign(&sks[leader as usize], &profile.new_view_message(4)),
+        };
+        let result =
+            engine.process_event(ConsensusEvent::Message(ConsensusMessage::NewView(new_view)));
+        assert!(
+            matches!(result, Err(ConsensusError::InvalidTC { view: 3, .. })),
+            "{result:?}"
+        );
+        assert_eq!(engine.current_view(), 1, "no advance on a TC of an unknown epoch");
     }
 
     #[test]
@@ -5432,52 +5974,184 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_eviction_removes_lowest_view() {
+    fn test_future_buffer_keeps_next_view_proposal_when_full_of_far_views() {
         use crate::protocol::quorum::signing_message;
 
         let (mut engine, sks, _, _rx) = make_engine(4, 0);
         assert_eq!(engine.current_view(), 1);
 
-        // Directly fill the buffer beyond MAX_FUTURE_MESSAGES to test eviction logic.
-        // Using process_event is limited by FUTURE_VIEW_WINDOW, so populate directly.
-        for v in 2u64..=(MAX_FUTURE_MESSAGES as u64 + 5) {
-            let block_hash = B256::repeat_byte((v % 256) as u8);
-            let msg = signing_message(v, &block_hash);
-            let vote = Vote {
-                view: v,
-                block_hash,
-                voter: 1,
-                signature: sks[1].sign(&msg),
-            };
-
-            // Simulate the eviction logic from process_message
-            if engine.future_msg_buffer.len() >= MAX_FUTURE_MESSAGES {
-                if let Some(min_idx) = engine
-                    .future_msg_buffer
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, (view, _))| *view)
-                    .map(|(i, _)| i)
-                {
-                    engine.future_msg_buffer.swap_remove(min_idx);
-                }
+        // Every validator fills its per-sender quota with distinct votes for
+        // the far edge of the window (view + 50).
+        let far_view = 1 + FUTURE_VIEW_WINDOW;
+        for voter in 0u32..4 {
+            for n in 0u8..(MAX_FUTURE_MESSAGES_PER_SENDER as u8 + 2) {
+                let block_hash = B256::repeat_byte(n.wrapping_add(1));
+                let vote = Vote {
+                    view: far_view,
+                    block_hash,
+                    voter,
+                    signature: sks[voter as usize].sign(&signing_message(far_view, &block_hash)),
+                };
+                engine
+                    .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+                    .expect("far future vote should be buffered or dropped");
             }
+        }
+        assert_eq!(
+            engine.future_msg_buffer.len(),
+            4 * MAX_FUTURE_MESSAGES_PER_SENDER,
+            "each sender is capped"
+        );
+
+        // A proposal for the next view still finds room: the sender's
+        // highest-view entry is evicted for it.
+        let block_hash = B256::repeat_byte(0xC2);
+        let message = engine.signing_profile.proposal_message(2, block_hash, &None);
+        let proposal = Proposal {
+            view: 2,
+            block_hash,
+            justify_qc: QuorumCertificate::genesis(),
+            proposer: 2,
+            signature: engine.signing_profile.sign(&sks[2], &message),
+            prepare_qc: None,
+            tx_root_hash: None,
+            validator_changes: None,
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .expect("next-view proposal should be buffered");
+        assert!(
+            engine.future_msg_buffer.iter().any(|(view, msg)| {
+                *view == 2 && matches!(msg, ConsensusMessage::Proposal(p) if p.block_hash == block_hash)
+            }),
+            "the next view's proposal must be buffered"
+        );
+        assert_eq!(engine.future_msg_buffer.len(), 4 * MAX_FUTURE_MESSAGES_PER_SENDER);
+    }
+
+    #[test]
+    fn test_future_buffer_dedup_tells_apart_copies_that_differ_in_their_signatures() {
+        use n42_h2_primitives::consensus::PrepareQC;
+
+        let (mut engine, sks, vs, _rx) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0x61);
+        // Same kind, view and block hash; aggregate signatures over other
+        // blocks, so neither verifies and neither moves the view.
+        let forged = |over: u8| {
+            let other = build_test_prepare_qc(5, B256::repeat_byte(over), &sks, &vs, &[0, 1, 2]);
+            ConsensusMessage::PrepareQC(PrepareQC {
+                view: 5,
+                block_hash,
+                qc: QuorumCertificate { view: 5, block_hash, ..other },
+            })
+        };
+        for message in [forged(0xA1), forged(0xA2), forged(0xA1)] {
+            engine.process_event(ConsensusEvent::Message(message)).expect("buffered or dropped");
+        }
+        assert_eq!(engine.current_view(), 1);
+        assert_eq!(
+            engine.future_msg_buffer.len(),
+            2,
+            "a copy with other signature bytes is not the same message; an identical one is"
+        );
+    }
+
+    #[test]
+    fn test_future_buffer_drops_duplicates_and_bad_signatures() {
+        use crate::protocol::quorum::signing_message;
+
+        let (mut engine, sks, _, _rx) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0x5A);
+        let vote = Vote {
+            view: 3,
+            block_hash,
+            voter: 1,
+            signature: sks[1].sign(&signing_message(3, &block_hash)),
+        };
+        for _ in 0..3 {
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote.clone())))
+                .expect("future vote");
+        }
+        assert_eq!(engine.future_msg_buffer.len(), 1, "copies are deduplicated");
+
+        let forged = Vote {
+            view: 3,
+            block_hash: B256::repeat_byte(0x5B),
+            voter: 1,
+            signature: sks[2].sign(&signing_message(3, &B256::repeat_byte(0x5B))),
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(forged)))
+            .expect("forged future vote is dropped, not an error");
+        assert_eq!(engine.future_msg_buffer.len(), 1, "a bad signature takes no slot");
+    }
+
+    #[test]
+    fn test_forged_future_commit_votes_do_not_use_up_the_named_senders_share() {
+        use crate::protocol::quorum::signing_message;
+
+        let (mut engine, sks, _, _rx) = make_engine(4, 0);
+        let victim = 1u32;
+        // Forged CommitVotes naming the victim: distinct blocks, signed by
+        // another key. They are buffered unchecked (as 25d51b385 intends).
+        let forged = |n: u8| {
+            let block_hash = B256::repeat_byte(0x80 | n);
+            ConsensusMessage::CommitVote(CommitVote {
+                view: 3,
+                block_hash,
+                voter: victim,
+                signature: sks[3].sign(&signing_message(3, &block_hash)),
+            })
+        };
+        for n in 0..(MAX_FUTURE_MESSAGES_PER_SENDER as u8 + 4) {
+            engine
+                .process_event(ConsensusEvent::Message(forged(n)))
+                .expect("a future commit vote is buffered or dropped");
+        }
+        let unchecked = |engine: &ConsensusEngine| {
             engine
                 .future_msg_buffer
-                .push((v, ConsensusMessage::Vote(vote)));
-        }
+                .iter()
+                .filter(|(view, msg)| *view == 3 && matches!(msg, ConsensusMessage::CommitVote(_)))
+                .count()
+        };
+        assert_eq!(
+            unchecked(&engine),
+            MIN_FUTURE_UNCHECKED_PER_VIEW,
+            "the unchecked class of a view is capped"
+        );
+        // The class is FIFO: the newest forgery is kept, the oldest is gone.
+        let newest = forged(MAX_FUTURE_MESSAGES_PER_SENDER as u8 + 3);
+        let oldest = forged(0);
+        let held = |engine: &ConsensusEngine, wanted: &ConsensusMessage| {
+            let ConsensusMessage::CommitVote(wanted) = wanted else {
+                return false;
+            };
+            engine.future_msg_buffer.iter().any(|(_, msg)| {
+                matches!(msg, ConsensusMessage::CommitVote(cv) if cv.block_hash == wanted.block_hash)
+            })
+        };
+        assert!(held(&engine, &newest));
+        assert!(!held(&engine, &oldest));
 
-        assert_eq!(engine.future_msg_buffer.len(), MAX_FUTURE_MESSAGES);
-
-        let min_view = engine
-            .future_msg_buffer
-            .iter()
-            .map(|(v, _)| *v)
-            .min()
-            .unwrap_or(0);
+        // The victim's real Vote for the same view still finds room.
+        let block_hash = B256::repeat_byte(0x33);
+        let vote = Vote {
+            view: 3,
+            block_hash,
+            voter: victim,
+            signature: sks[victim as usize].sign(&signing_message(3, &block_hash)),
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+            .expect("the real vote is buffered");
         assert!(
-            min_view >= 3,
-            "lowest view in buffer should be >= 3 after eviction, got {min_view}"
+            engine.future_msg_buffer.iter().any(|(view, msg)| {
+                *view == 3
+                    && matches!(msg, ConsensusMessage::Vote(v) if v.voter == victim && v.block_hash == block_hash)
+            }),
+            "forged commit votes must not crowd out the named sender's real vote"
         );
     }
 

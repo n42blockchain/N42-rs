@@ -69,13 +69,35 @@ use n42_h2_consensus::withdrawals_to_rewards;
 use n42_h2_primitives::consensus::{H2V4ChainIdentity, QuorumCertificate};
 use n42_h2_wire::{H2Message, H2V4Envelope};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Decides what a leader proposes for a view, given the view number and the
 /// current head. `None` declines the view — see
 /// [`H2Service::with_payload_attributes`].
 type PayloadAttributesBuilder =
     dyn Fn(ProposalContext) -> Option<PayloadAttributes> + Send + Sync;
+
+/// Engine errors that were this node's own fault (see
+/// [`n42_h2_consensus::ConsensusError::is_local`]) since start.
+static LOCAL_ENGINE_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many local engine errors this process has logged.
+pub fn local_engine_errors() -> u64 {
+    LOCAL_ENGINE_ERRORS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Logs an engine error by whose fault it is: a refused peer message stays
+/// at debug, a local fault (vote-log fsync, lost output, the key leaving the
+/// set) is logged at error and counted, because it means this node may have
+/// stopped voting or committing. Nothing is made fatal here.
+fn report_engine_error(err: &n42_h2_consensus::ConsensusError, what: &'static str) {
+    if err.is_local() {
+        let total = LOCAL_ENGINE_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        error!(target: "n42.h2.node", %err, what, local_errors = total, "local consensus engine fault");
+    } else {
+        debug!(target: "n42.h2.node", %err, what, "engine rejected a peer input");
+    }
+}
 
 /// How many views one step may propose for before going back to the network.
 ///
@@ -310,6 +332,13 @@ pub struct H2Service<E> {
     /// for one of these re-runs the execution instead of waiting for the next
     /// proposal to mention the block again, which it may never do.
     awaiting_bodies: HashSet<B256>,
+    /// When each entry of `awaiting_bodies` was first awaited: the set is
+    /// capped at [`MAX_AWAITING_BODIES`] (oldest out) and an entry is aged
+    /// out after [`BODY_BOOKKEEPING_TTL`], so hashes that never arrive do not
+    /// stay forever.
+    awaiting_since: std::collections::HashMap<B256, std::time::Instant>,
+    /// When `awaiting_bodies` and `held_bodies` were last aged out.
+    last_body_age_out: Option<std::time::Instant>,
     /// Blocks this node took as a *compact* body (`N42_COMPACT_BODY`), with
     /// the frame they arrived in.
     ///
@@ -446,9 +475,11 @@ pub struct H2Service<E> {
     /// Block requests the store could not answer, for the execution layer
     /// on the next drain.
     pending_block_requests: Vec<(String, B256, n42_h2_net::BlockRequestChannel)>,
-    /// Range requests to answer from the execution layer on the next drain;
-    /// kept here because the transport handler cannot await.
-    pending_ranges: Vec<(String, n42_h2_net::RangeRequest, n42_h2_net::RangeRequestChannel)>,
+    /// Range requests being served off the loop; see [`ServeSlots`].
+    serve_slots: SharedServeSlots,
+    /// Fills and block-by-hash requests being served off the loop: their
+    /// own share, so range pulls never refuse a vote-path fill.
+    fill_slots: SharedServeSlots,
     /// Every body this node built or received, as gov5 block RLP, to answer
     /// `block_by_hash` — gov5's fetch-on-miss, and this node's own. Bounded;
     /// insertion order in `body_store_order`.
@@ -536,8 +567,14 @@ struct CatchUp {
     started_at: u64,
     /// The target from the peer's status is reached; the pull now probes
     /// past it, a window at a time, for what the fleet produced meanwhile.
-    /// The peer's first short reply is the end of its chain.
+    /// It ends on an empty reply, or on a short one that reaches
+    /// `probe_height`.
     probing: bool,
+    /// The height the peer was known at when the probe started: a short
+    /// reply that reaches it is the end of the probe, so a chain that grows
+    /// within one round trip cannot keep a probe going for ever. Zero until
+    /// probing.
+    probe_height: u64,
 }
 
 /// How many block requests may wait for the execution layer at once, and
@@ -545,7 +582,105 @@ struct CatchUp {
 /// than queued, so one peer cannot hold every other's answers behind a
 /// thousand lookups.
 const MAX_PENDING_SERVES: usize = 256;
-const MAX_PENDING_RANGES: usize = 8;
+
+/// Range requests one peer may have being served off the loop at once;
+/// past it the request is refused with the protocol's server-error code.
+const MAX_SERVES_PER_PEER: usize = 4;
+
+/// The same for all peers together.
+const MAX_SERVES_IN_FLIGHT: usize = 32;
+
+/// Fills and block-by-hash requests one peer may have being served at once.
+/// Their own share, larger than the ranges': a follower asks for them on
+/// its vote path (fills for pipelined blocks, their retry rounds, the
+/// whole-body fallback), and a rejoiner's range pulls must never make that
+/// answer "server busy".
+const MAX_FILL_SERVES_PER_PEER: usize = 16;
+
+/// The same for all peers together.
+const MAX_FILL_SERVES_IN_FLIGHT: usize = 64;
+
+/// The most blocks one range reply carries: gov5's 1,024, so a gov5 member
+/// catching up from this node on a small-block chain is not slowed. The
+/// reply is capped by bytes first ([`n42_h2_net::MAX_RANGE_REPLY_BYTES`]);
+/// the asker reads a shorter reply as a shorter window and asks again from
+/// where it got to.
+const MAX_SERVED_RANGE_BLOCKS: u64 = MAX_RANGE_BLOCKS;
+
+/// Requests being served off the loop, counted per peer and in total
+/// against a per-peer and a total cap. Shared with the serving tasks: a
+/// slot is held by a [`ServeSlot`] that the task drops when its work is
+/// done, so only work in flight counts, not answers waiting for the loop
+/// to hand them over.
+#[derive(Debug)]
+struct ServeSlots {
+    per_peer: std::collections::HashMap<PeerId, usize>,
+    total: usize,
+    per_peer_cap: usize,
+    total_cap: usize,
+}
+
+/// [`ServeSlots`] as the service and its tasks share them.
+type SharedServeSlots = Arc<std::sync::Mutex<ServeSlots>>;
+
+impl ServeSlots {
+    fn shared(per_peer_cap: usize, total_cap: usize) -> SharedServeSlots {
+        Arc::new(std::sync::Mutex::new(Self {
+            per_peer: std::collections::HashMap::new(),
+            total: 0,
+            per_peer_cap,
+            total_cap,
+        }))
+    }
+
+    /// Takes a slot for `peer`, or says it is over its share or the total.
+    fn try_take(&mut self, peer: PeerId) -> bool {
+        let mine = self.per_peer.get(&peer).copied().unwrap_or(0);
+        if self.total >= self.total_cap || mine >= self.per_peer_cap {
+            return false;
+        }
+        self.per_peer.insert(peer, mine + 1);
+        self.total += 1;
+        true
+    }
+
+    /// Returns a slot taken for `peer`.
+    fn give_back(&mut self, peer: &PeerId) {
+        if let Some(mine) = self.per_peer.get_mut(peer) {
+            *mine = mine.saturating_sub(1);
+            if *mine == 0 {
+                self.per_peer.remove(peer);
+            }
+            self.total = self.total.saturating_sub(1);
+        }
+    }
+}
+
+/// One slot taken from [`ServeSlots`]; dropping it gives it back.
+#[derive(Debug)]
+struct ServeSlot {
+    slots: SharedServeSlots,
+    peer: PeerId,
+}
+
+impl ServeSlot {
+    /// Takes a slot for `peer` from `slots`, if it is within its share.
+    fn take(slots: &SharedServeSlots, peer: PeerId) -> Option<Self> {
+        let taken = slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).try_take(peer);
+        taken.then(|| Self { slots: Arc::clone(slots), peer })
+    }
+}
+
+impl Drop for ServeSlot {
+    fn drop(&mut self) {
+        self.slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).give_back(&self.peer);
+    }
+}
+
+/// How many slots of `slots` are taken.
+fn slots_taken(slots: &SharedServeSlots) -> usize {
+    slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).total
+}
 /// A block this far past the execution layer's tip is not handed to it.
 ///
 /// It was 32 — reth's `MIN_BLOCKS_FOR_PIPELINE_RUN`, past which a payload with
@@ -566,6 +701,16 @@ const MAX_PENDING_RANGES: usize = 8;
 /// closed is worse than the stall; `imported_height` is `None` until the first
 /// import, so this is simply inert until it can be right.
 const FAR_AHEAD_BLOCKS: u64 = 1;
+
+/// How far past the tip, in multiples of the far-ahead limit, the first
+/// window of a catch-up may reach on an advertised height alone.
+const CATCH_UP_FIRST_WINDOW_FACTOR: u64 = 8;
+
+/// The target a catch-up starts with: the advertised height, but no
+/// further than `latest + far_ahead * CATCH_UP_FIRST_WINDOW_FACTOR`.
+fn capped_catch_up_target(advertised: u64, latest: u64, far_ahead: u64) -> u64 {
+    advertised.min(latest.saturating_add(far_ahead.saturating_mul(CATCH_UP_FIRST_WINDOW_FACTOR)))
+}
 
 /// Parses `N42_FAR_AHEAD_BLOCKS`: an integer in `1..=8`, else the default
 /// [`FAR_AHEAD_BLOCKS`] (an invalid value is logged).
@@ -627,6 +772,19 @@ const TX_FORWARD_QUEUE: usize = 4;
 const INBOUND_TX_CAP: usize = 8000;
 
 const MAX_HELD_BODIES: usize = 4096;
+
+/// Blocks awaited for a body at most; the oldest go first.
+const MAX_AWAITING_BODIES: usize = 4096;
+
+/// How long a block may stay awaited or held before it is forgotten. Far
+/// beyond any healthy wait ([`HELD_TOO_LONG`] already warns at 2 s): what is
+/// still there after this is a hash that never arrives or a far-ahead body
+/// that will never be executable here. A real block that comes back later
+/// is caught up by range like any other.
+const BODY_BOOKKEEPING_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// At most one age-out pass this often.
+const BODY_AGE_OUT_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// At most one held-block line this often, however many are held.
 const HELD_LOG_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
@@ -808,8 +966,31 @@ impl LoopSpend {
     }
 }
 
+/// A reply to a peer prepared off the loop, with the channel it goes back
+/// on. Only the swarm can answer, and only this loop drives the swarm.
+enum Served {
+    /// Named transactions of a block.
+    Txns(ServedTxns),
+    /// A block by hash, from the execution layer.
+    Block {
+        peer: PeerId,
+        hash: B256,
+        channel: n42_h2_net::BlockRequestChannel,
+        body: Option<alloy_primitives::Bytes>,
+    },
+    /// A range of blocks, from the execution layer.
+    Range {
+        peer: PeerId,
+        request: n42_h2_net::RangeRequest,
+        channel: n42_h2_net::RangeRequestChannel,
+        rlps: Vec<Vec<u8>>,
+    },
+}
+
 /// A fill prepared on a worker, with the channel it goes back on.
 struct ServedTxns {
+    /// Who asked; its serve slot is returned when the answer is handed over.
+    peer: PeerId,
     channel: n42_h2_net::BlockTxnsChannel,
     reply: n42_h2_net::BlockTxnsReply,
     hash: B256,
@@ -831,9 +1012,15 @@ fn fill_reply_on_drain() -> bool {
     *ON.get_or_init(|| std::env::var("N42_FILL_REPLY_ON_DRAIN").is_ok_and(|v| v == "1"))
 }
 /// Where a worker puts one.
-type ServedTxnsTx = tokio::sync::mpsc::UnboundedSender<ServedTxns>;
+type ServedTxnsTx = tokio::sync::mpsc::Sender<Served>;
 /// Where the loop takes it.
-type ServedTxnsRx = tokio::sync::mpsc::UnboundedReceiver<ServedTxns>;
+type ServedTxnsRx = tokio::sync::mpsc::Receiver<Served>;
+
+/// Answers prepared off the loop that may wait for it at once. A serving
+/// task awaits room before it lets go of its slot, so a loop that is not
+/// draining holds the serving tasks back (and, through their slots, new
+/// requests) instead of collecting 128 MiB range replies without bound.
+const SERVED_REPLY_CAPACITY: usize = 8;
 
 /// One block's fill rounds; see `fill_rounds` on the service.
 #[derive(Debug, Default)]
@@ -1188,6 +1375,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             header_profile: HeaderProfile::Ethereum,
             native_wire: false,
             awaiting_bodies: HashSet::new(),
+            awaiting_since: std::collections::HashMap::new(),
+            last_body_age_out: None,
             compact_bodies: std::collections::HashMap::new(),
             compact_order: std::collections::VecDeque::new(),
             body_from: std::collections::HashMap::new(),
@@ -1196,7 +1385,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             fill_rounds: std::collections::HashMap::new(),
             pending_txns_requests: Vec::new(),
             loop_spend: LoopSpend::default(),
-            served_txns: tokio::sync::mpsc::unbounded_channel(),
+            served_txns: tokio::sync::mpsc::channel(SERVED_REPLY_CAPACITY),
             body_wait: std::collections::HashMap::new(),
             body_grace: body_request_grace(),
             direct_push: false,
@@ -1228,7 +1417,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             catch_up: None,
             pending_imports: Vec::new(),
             pending_block_requests: Vec::new(),
-            pending_ranges: Vec::new(),
+            serve_slots: ServeSlots::shared(MAX_SERVES_PER_PEER, MAX_SERVES_IN_FLIGHT),
+            fill_slots: ServeSlots::shared(MAX_FILL_SERVES_PER_PEER, MAX_FILL_SERVES_IN_FLIGHT),
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
             elided_own: std::collections::HashMap::new(),
@@ -1620,13 +1810,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                     return Err(ServiceError::OutputChannelClosed);
                 };
                 self.handle_output(output, &mut events).await?;
+                // Room was made: outputs the engine held behind a full
+                // channel move on, in order.
+                self.engine.release_outputs();
             }
             // Defect 17b: a fill a worker has prepared for a peer goes out
             // now, not on the drain after whatever event comes next. The
             // sender half lives on `self`, so this never ends.
             served = self.served_txns.1.recv(), if !fill_reply_on_drain() => {
                 if let Some(served) = served {
-                    self.respond_served_txns(served);
+                    self.respond_served(served);
                 }
             }
             imported = async {
@@ -1780,7 +1973,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         if self.engine.vote_aggregate() {
             let at = std::time::Instant::now();
             if let Err(err) = self.engine.flush_votes() {
-                debug!(target: "n42.h2.node", %err, "engine rejected a vote batch");
+                report_engine_error(&err, "vote batch");
             }
             handle += at.elapsed();
         }
@@ -2005,6 +2198,15 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // took the block as a compact body has none and says so;
                 // the asker then has the whole-body road.
                 let held = self.body_store.get(&request.hash).map(|body| body.to_shared());
+                // Every road below but the elided one is work off the loop
+                // held to a per-peer and a total share.
+                let elided = held.is_none() && self.elided_own.contains_key(&request.hash);
+                let slot = if elided { None } else { ServeSlot::take(&self.fill_slots, peer) };
+                if !elided && slot.is_none() {
+                    debug!(target: "n42.h2.node", %peer, hash = ?request.hash, "too many requests in flight; fill refused");
+                    self.transport.respond_block_txns(channel, Err("server busy".to_owned()));
+                    return Ok(());
+                }
                 match held {
                     Some(body) => {
                         // The body is shared, not copied, and the walk that
@@ -2026,15 +2228,21 @@ impl<E: ExecutionLayer> H2Service<E> {
                                 "peer asked for named transactions; served from the stored body"
                             );
                             // The loop wakes on this (see the step's select):
-                            // a follower is waiting on it to vote.
-                            let _ = back.send(ServedTxns {
+                            // a follower is waiting on it to vote. Waits for
+                            // room in the channel (this is a blocking-pool
+                            // thread); a closed one (shutdown) just ends it.
+                            // The slot goes back once the answer is handed
+                            // on, not when the loop hands it to the peer.
+                            let _ = back.blocking_send(Served::Txns(ServedTxns {
+                                peer,
                                 channel,
                                 reply,
                                 hash: request.hash,
                                 wanted: request.indices.len(),
                                 asked_at,
                                 ready_at: std::time::Instant::now(),
-                            });
+                            }));
+                            drop(slot);
                         });
                     }
                     // A member that took this block as a compact body holds
@@ -2050,7 +2258,39 @@ impl<E: ExecutionLayer> H2Service<E> {
                     // block has the body in its store and is the one this
                     // node asks first, so this runs when that member is
                     // gone.
-                    None => self.pending_txns_requests.push((request, channel)),
+                    //
+                    // A block this node took elided is fetched by its header
+                    // on the next drain (it needs this loop's state); any
+                    // other is looked up off the loop.
+                    None if elided => {
+                        if self.pending_txns_requests.len() >= MAX_PENDING_SERVES {
+                            self.transport.respond_block_txns(channel, Err("server busy".to_owned()));
+                        } else {
+                            self.pending_txns_requests.push((request, channel));
+                        }
+                    }
+                    None => {
+                        let el = self.driver.execution_layer_arc();
+                        let back = self.served_txns.0.clone();
+                        let asked_at = std::time::Instant::now();
+                        tokio::spawn(async move {
+                            let reply = txns_from_execution_layer(&*el, &request).await;
+                            // Room first, then the slot back; a closed
+                            // channel (shutdown) just ends the task.
+                            let _ = back
+                                .send(Served::Txns(ServedTxns {
+                                    peer,
+                                    channel,
+                                    reply,
+                                    hash: request.hash,
+                                    wanted: request.indices.len(),
+                                    asked_at,
+                                    ready_at: std::time::Instant::now(),
+                                }))
+                                .await;
+                            drop(slot);
+                        });
+                    }
                 }
             }
             TransportEvent::BlockTxnsFetched { peer, request, reply } => {
@@ -2152,14 +2392,35 @@ impl<E: ExecutionLayer> H2Service<E> {
                         debug!(target: "n42.h2.node", %peer, ?hash, "peer asked for a block; served from the store");
                         self.transport.respond_block(channel, Some(body));
                     }
-                    None if self.pending_block_requests.len() >= MAX_PENDING_SERVES => {
-                        // A queue this deep is a peer asking faster than the
-                        // execution layer answers; better a prompt "not
-                        // found" than a stall for everyone behind it.
-                        debug!(target: "n42.h2.node", %peer, ?hash, "block request queue full; refused");
-                        self.transport.respond_block(channel, None);
+                    // A block this node took elided is fetched by its header
+                    // on the next drain (it needs this loop's state).
+                    None if self.elided_own.contains_key(&hash) => {
+                        if self.pending_block_requests.len() >= MAX_PENDING_SERVES {
+                            // A queue this deep is a peer asking faster than
+                            // the execution layer answers; better a prompt
+                            // refusal than a stall for everyone behind it.
+                            debug!(target: "n42.h2.node", %peer, ?hash, "block request queue full; refused");
+                            self.transport.respond_block(channel, None);
+                        } else {
+                            self.pending_block_requests.push((peer.to_string(), hash, channel));
+                        }
                     }
-                    None => self.pending_block_requests.push((peer.to_string(), hash, channel)),
+                    // Any other is looked up off the loop, within the
+                    // peer's share of requests in flight.
+                    None => {
+                        let Some(slot) = ServeSlot::take(&self.fill_slots, peer) else {
+                            debug!(target: "n42.h2.node", %peer, ?hash, "too many requests in flight; block request refused");
+                            self.transport.respond_block(channel, None);
+                            return Ok(());
+                        };
+                        let el = self.driver.execution_layer_arc();
+                        let back = self.served_txns.0.clone();
+                        tokio::spawn(async move {
+                            let body = block_from_execution_layer(&*el, hash).await;
+                            let _ = back.send(Served::Block { peer, hash, channel, body }).await;
+                            drop(slot);
+                        });
+                    }
                 }
             }
             TransportEvent::BlockFetched { peer, hash, reply } => match reply {
@@ -2257,11 +2518,20 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // has every block, rather than from the body store, which
                 // has the recent ones. As many as it has from the start, in
                 // order; gov5 reads until the stream closes.
-                if self.pending_ranges.len() >= MAX_PENDING_RANGES {
-                    debug!(target: "n42.h2.node", %peer, ?request, "range request queue full; refused");
-                    self.transport.respond_range(channel, Vec::new());
+                //
+                // Off the loop: up to 32 sequential lookups and the replies'
+                // bytes used to sit on this loop, which is the view's.
+                if let Some(slot) = ServeSlot::take(&self.serve_slots, peer) {
+                    let el = self.driver.execution_layer_arc();
+                    let back = self.served_txns.0.clone();
+                    tokio::spawn(async move {
+                        let rlps = serve_range(&*el, request).await;
+                        let _ = back.send(Served::Range { peer, request, channel, rlps }).await;
+                        drop(slot);
+                    });
                 } else {
-                    self.pending_ranges.push((peer.to_string(), request, channel));
+                    debug!(target: "n42.h2.node", %peer, ?request, "too many requests in flight; range refused");
+                    self.transport.respond_range_error(channel, "server busy".to_owned());
                 }
             }
             TransportEvent::RangeFetched { peer, request, reply } => match reply {
@@ -2288,9 +2558,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                     debug!(target: "n42.h2.node", %peer, height, "peer on our chain");
                     self.pending_status.push((peer, height));
                 } else {
-                    // gov5 sends goodbye on a fork mismatch, so this connection
-                    // is about to die and the operator needs to know why.
-                    warn!(target: "n42.h2.node", %peer, "peer is on a different chain; it will disconnect");
+                    // gov5 sends goodbye on a fork mismatch; a Rust peer on
+                    // another chain would stay connected and keep asking, so
+                    // this side hangs up too. The operator needs to know why.
+                    warn!(target: "n42.h2.node", %peer, "peer is on a different chain; disconnecting");
+                    self.peer_heights.remove(&peer);
+                    self.transport.disconnect(peer);
                 }
             }
             TransportEvent::PeerConnected(peer) => {
@@ -2299,6 +2572,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             TransportEvent::PeerDisconnected(peer) => {
                 self.direct_votes.forget_peer(&peer);
+                // A height is only worth what the peer can still serve.
+                self.peer_heights.remove(&peer);
             }
             TransportEvent::VoteHello { peer, index, signature } => {
                 let verified = n42_h2_primitives::BlsSignature::from_bytes(&signature).is_ok_and(|signature| {
@@ -2351,7 +2626,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // when this process should stop.
                 if let Err(err) = self.engine.process_event(ConsensusEvent::Message(message))
                 {
-                    debug!(target: "n42.h2.node", %err, "engine rejected a message");
+                    report_engine_error(&err, "message");
                 }
             }
             Err(BridgeError::InvalidBitmap { .. }) => {
@@ -2376,6 +2651,11 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// for the *next* output rather than stopping when the channel runs dry.
     async fn drain_outputs(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
         let drain_at = std::time::Instant::now();
+        // A commit whose forkchoice failed is sent again once its backoff
+        // has passed (`ExecutionDriver::retry_failed_commit`).
+        for action in self.driver.retry_failed_commit().await {
+            self.apply_driver_action(action, events)?;
+        }
         self.consider_catch_up(events).await;
         self.import_ranges(events).await;
         for (peer, hash, channel) in std::mem::take(&mut self.pending_block_requests) {
@@ -2401,7 +2681,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.transport.respond_block(channel, body);
         }
         while let Ok(served) = self.served_txns.1.try_recv() {
-            self.respond_served_txns(served);
+            self.respond_served(served);
         }
         for (request, channel) in std::mem::take(&mut self.pending_txns_requests) {
             if let Some(body) = self.elided_body(request.hash).await {
@@ -2440,14 +2720,6 @@ impl<E: ExecutionLayer> H2Service<E> {
             );
             self.transport.respond_block_txns(channel, reply);
         }
-        for (peer, request, channel) in std::mem::take(&mut self.pending_ranges) {
-            // Only the execution layer is held across the await: the
-            // transport is not `Sync`, and a future holding all of `self`
-            // could not be spawned.
-            let rlps = serve_range(self.driver.execution_layer(), request).await;
-            debug!(target: "n42.h2.node", peer, ?request, served = rlps.len(), "peer asked for a range");
-            self.transport.respond_range(channel, rlps);
-        }
         for block_hash in std::mem::take(&mut self.received_bodies) {
             events.push(ServiceEvent::BodyReceived { block_hash });
         }
@@ -2456,6 +2728,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         // request, so the resulting BlockImported reaches the engine the same
         // way.
         self.refresh_layer_for_held().await;
+        self.age_out_body_bookkeeping();
         for block_hash in std::mem::take(&mut self.held_bodies) {
             if self.holds_far_ahead(block_hash) {
                 self.held_bodies.push(block_hash);
@@ -2470,7 +2743,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.handle_output(EngineOutput::ExecuteBlock(block_hash), events)
                 .await?;
         }
-        while let Ok(output) = self.outputs.try_recv() {
+        while let Some(output) = self.next_output() {
             self.handle_output(output, events).await?;
         }
         self.loop_spend.note("driver_outputs", drain_at);
@@ -2545,7 +2818,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             && self.imported.contains(block_hash)
         {
             if let Err(err) = self.engine.process_event(ConsensusEvent::BlockImported(*block_hash)) {
-                debug!(target: "n42.h2.node", %err, ?block_hash, "engine rejected an import it had already been told of");
+                debug!(target: "n42.h2.node", ?block_hash, "engine refused an import it had already been told of");
+                report_engine_error(&err, "repeated import");
             }
             return Ok(());
         }
@@ -2848,11 +3122,19 @@ impl<E: ExecutionLayer> H2Service<E> {
         seen.checked_add(pacing)
     }
 
+    /// The engine's next output without waiting. Outputs the engine held
+    /// behind a full channel are moved into it first, so they come out in
+    /// the order they were made.
+    fn next_output(&mut self) -> Option<EngineOutput> {
+        self.engine.release_outputs();
+        self.outputs.try_recv().ok()
+    }
+
     /// Handles the engine's outputs in order up to and including this
     /// leader's proposal, so the proposal is published the moment the engine
     /// makes it. What follows it stays for the step's drain.
     async fn send_own_proposal(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
-        while let Ok(output) = self.outputs.try_recv() {
+        while let Some(output) = self.next_output() {
             let proposal = matches!(
                 &output,
                 EngineOutput::BroadcastMessage(n42_h2_primitives::consensus::ConsensusMessage::Proposal(_))
@@ -3045,7 +3327,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         };
         if head != self.driver.head() && head_header.is_none() {
             warn!(target: "n42.h2.node", view, certified = ?head, imported = ?self.driver.head(), "the block our highest QC certifies is not imported; asking for it before proposing");
-            if self.awaiting_bodies.insert(head) {
+            if self.await_body(head) {
                 for peer in self.transport.connected_peer_ids() {
                     self.transport.request_block(peer, head);
                 }
@@ -3414,7 +3696,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     }
                 }
                 if let Err(err) = self.engine.process_event(*event) {
-                    debug!(target: "n42.h2.node", %err, "engine rejected an execution event");
+                    report_engine_error(&err, "execution event");
                 }
             }
             DriverAction::TransactionsMissing { block_hash, indices } => {
@@ -3505,7 +3787,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     // has passed without the body arriving on its own.
                     self.body_wait.entry(block_hash).or_insert_with(std::time::Instant::now);
                 } else if self.body_request_due(block_hash) {
-                    self.awaiting_bodies.insert(block_hash);
+                    self.await_body(block_hash);
                     for peer in self.transport.connected_peer_ids() {
                         self.transport.request_block(peer, block_hash);
                     }
@@ -3519,7 +3801,8 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // checked again if it is ever proposed again.
                 warn!(target: "n42.h2.node", ?block_hash, reason, "execution layer rejected a block");
                 if let Err(err) = self.engine.process_event(ConsensusEvent::BlockRejected(block_hash)) {
-                    debug!(target: "n42.h2.node", %err, ?block_hash, "engine rejected the withdrawal of import evidence");
+                    debug!(target: "n42.h2.node", ?block_hash, "engine refused the withdrawal of import evidence");
+                    report_engine_error(&err, "import withdrawal");
                 }
             }
             DriverAction::Finalized { .. } | DriverAction::Ignored => {}
@@ -3744,13 +4027,22 @@ impl<E: ExecutionLayer> H2Service<E> {
         if height <= latest {
             return;
         }
-        info!(target: "n42.h2.node", %peer, from = latest, to = height, "behind a peer; pulling the gap by range");
+        // An advertised height is not certified: a status or a relayed
+        // header can name any number. The first window is capped near the
+        // tip; a peer that really is further ahead serves it full and the
+        // pull probes on window by window (see `import_ranges`), so the cap
+        // costs a real catch-up one short request and a false height one
+        // short pull.
+        let advertised = height;
+        let height = capped_catch_up_target(advertised, latest, far_ahead_limit());
+        info!(target: "n42.h2.node", %peer, from = latest, to = height, advertised, "behind a peer; pulling the gap by range");
         self.catch_up = Some(CatchUp {
             peer,
             next: latest + 1,
             target: height,
             started_at: latest,
             probing: false,
+            probe_height: 0,
         });
         self.request_next_range();
         events.push(ServiceEvent::Syncing {
@@ -3848,6 +4140,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     }
                 }
             }
+            let known_height = self.peer_heights.get(&peer).copied();
             let Some(catch_up) = self.catch_up.as_mut() else {
                 continue;
             };
@@ -3870,14 +4163,23 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // The status's target is reached, or a probe window came back
                 // full: the fleet kept producing while this pull ran, and a
                 // gap of a whole window is not one gossip's future queue
-                // closes. Probe on until the peer serves short.
-                catch_up.probing = true;
+                // closes. Probe on until the peer serves nothing, or serves
+                // short at the height it was known at when the probe began.
+                if !catch_up.probing {
+                    catch_up.probing = true;
+                    catch_up.probe_height = known_height.unwrap_or(0).max(catch_up.next - 1);
+                }
                 catch_up.target = catch_up.next + MAX_RANGE_BLOCKS - 1;
                 self.request_next_range();
-            } else if catch_up.probing {
-                // Short of a probe window: that was the peer's head.
+            } else if catch_up.probing && catch_up.next - 1 >= catch_up.probe_height {
+                // Short, and at the height the peer was known at when the
+                // probe began: the rest is what the fleet made since, which
+                // gossip carries.
                 self.finish_catch_up(events, true);
             } else {
+                // Short of the window. A server caps a reply by bytes (this
+                // node at 128 MB) and by blocks, so a short reply is not
+                // the peer's head by itself: ask on from where it got to.
                 self.request_next_range();
             }
         }
@@ -3893,6 +4195,12 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
         self.catch_up_retry_after = Some(std::time::Instant::now() + CATCH_UP_RETRY);
         self.failed_peer = (!complete).then_some(catch_up.peer);
+        // What the peer actually served replaces what it advertised, so a
+        // height it cannot back stops starting a pull every retry; blocks it
+        // gossips later raise it again.
+        if let Some(known) = self.peer_heights.get_mut(&catch_up.peer) {
+            *known = (*known).min(height.max(catch_up.started_at));
+        }
         info!(target: "n42.h2.node", from = catch_up.started_at, height, target = catch_up.target, complete, "catch-up finished");
         events.push(ServiceEvent::Synced { height, complete });
     }
@@ -4080,7 +4388,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             if self.body_request_due(block_hash) {
                 info!(target: "n42.h2.node", ?block_hash, grace_ms = grace.as_millis() as u64, "body did not arrive within the grace; asking peers");
-                self.awaiting_bodies.insert(block_hash);
+                self.await_body(block_hash);
                 for peer in self.transport.connected_peer_ids() {
                     self.transport.request_block(peer, block_hash);
                 }
@@ -4097,6 +4405,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             debug!(target: "n42.h2.node", ?block_hash, waited_ms = at.elapsed().as_millis() as u64, "eager import queued");
         }
         self.awaiting_bodies.remove(&block_hash);
+        self.awaiting_since.remove(&block_hash);
         self.body_wait.remove(&block_hash);
         if !self.imported.contains(&block_hash) && !self.ready_bodies.contains(&block_hash) {
             self.ready_bodies.push(block_hash);
@@ -4135,7 +4444,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
         let peers = self.transport.connected_peer_ids();
         if peers.is_empty() || !self.body_request_due(parent) { return };
-        self.awaiting_bodies.insert(parent);
+        self.await_body(parent);
         for peer in peers {
             self.transport.request_block(peer, parent);
         }
@@ -4155,7 +4464,92 @@ impl<E: ExecutionLayer> H2Service<E> {
             while self.body_store_order.len() > remembered_bodies() {
                 let oldest = self.body_store_order.remove(0);
                 self.body_store.remove(&oldest);
+                self.forget_evicted_body(oldest);
             }
+        }
+    }
+
+    /// Marks `block_hash` as awaiting its body; returns whether it was not
+    /// awaited already. Bounded: past [`MAX_AWAITING_BODIES`] the oldest
+    /// entry is forgotten.
+    fn await_body(&mut self, block_hash: B256) -> bool {
+        let added = self.awaiting_bodies.insert(block_hash);
+        self.awaiting_since.entry(block_hash).or_insert_with(std::time::Instant::now);
+        while self.awaiting_bodies.len() > MAX_AWAITING_BODIES {
+            let oldest = self
+                .awaiting_bodies
+                .iter()
+                .min_by_key(|hash| self.awaiting_since.get(*hash).copied())
+                .copied();
+            let Some(oldest) = oldest else { break };
+            self.awaiting_bodies.remove(&oldest);
+            self.awaiting_since.remove(&oldest);
+        }
+        added
+    }
+
+    /// Stops holding `block_hash` (the far-ahead hold) and its log state.
+    fn release_held(&mut self, block_hash: B256) {
+        self.held_bodies.retain(|hash| *hash != block_hash);
+        self.held_since.remove(&block_hash);
+        self.held_warned.remove(&block_hash);
+    }
+
+    /// A body evicted from `body_store`: a held entry whose body the driver
+    /// does not hold either can never execute from here, and an awaited
+    /// one is no longer worth waiting for.
+    fn forget_evicted_body(&mut self, block_hash: B256) {
+        if self.held_bodies.contains(&block_hash) && !self.driver.has_body(&block_hash) {
+            debug!(target: "n42.h2.node", ?block_hash, "held body evicted from the store; no longer held");
+            self.release_held(block_hash);
+        }
+        if self.awaiting_bodies.remove(&block_hash) {
+            self.awaiting_since.remove(&block_hash);
+        }
+    }
+
+    /// Ages out awaited and held blocks older than [`BODY_BOOKKEEPING_TTL`],
+    /// at most once per [`BODY_AGE_OUT_EVERY`]. Lineage is not touched.
+    fn age_out_body_bookkeeping(&mut self) {
+        let now = std::time::Instant::now();
+        if self.last_body_age_out.is_some_and(|at| now.duration_since(at) < BODY_AGE_OUT_EVERY) {
+            return;
+        }
+        self.last_body_age_out = Some(now);
+
+        // An entry without a time (put in directly) starts its clock now.
+        for hash in &self.awaiting_bodies {
+            self.awaiting_since.entry(*hash).or_insert(now);
+        }
+        let awaiting = &self.awaiting_bodies;
+        self.awaiting_since.retain(|hash, _| awaiting.contains(hash));
+        let stale: Vec<B256> = self
+            .awaiting_since
+            .iter()
+            .filter(|(_, since)| now.duration_since(**since) >= BODY_BOOKKEEPING_TTL)
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in &stale {
+            self.awaiting_bodies.remove(hash);
+            self.awaiting_since.remove(hash);
+        }
+
+        let held: Vec<B256> = self
+            .held_bodies
+            .iter()
+            .filter(|hash| {
+                self.held_since
+                    .get(*hash)
+                    .is_some_and(|since| now.duration_since(*since) >= BODY_BOOKKEEPING_TTL)
+            })
+            .copied()
+            .collect();
+        for hash in &held {
+            self.release_held(*hash);
+        }
+        if !stale.is_empty() || !held.is_empty() {
+            info!(target: "n42.h2.node", awaited = stale.len(), held = held.len(),
+                  ttl_s = BODY_BOOKKEEPING_TTL.as_secs(), "forgot blocks awaited or held past the limit");
         }
     }
 
@@ -4208,10 +4602,25 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Hands a fill prepared on a worker to the swarm, and says how long it
     /// took: `walk_ms` on the worker, `waited_ms` from ready to handed over
     /// (the wait defect 17b was, 5.5-5.9 s in loop247).
+    fn respond_served(&mut self, served: Served) {
+        match served {
+            Served::Txns(served) => self.respond_served_txns(served),
+            Served::Block { peer, hash, channel, body } => {
+                debug!(target: "n42.h2.node", %peer, ?hash, found = body.is_some(), "peer asked for a block; execution layer consulted");
+                self.transport.respond_block(channel, body);
+            }
+            Served::Range { peer, request, channel, rlps } => {
+                debug!(target: "n42.h2.node", %peer, ?request, served = rlps.len(), "peer asked for a range");
+                self.transport.respond_range(channel, rlps);
+            }
+        }
+    }
+
     fn respond_served_txns(&mut self, served: ServedTxns) {
-        let ServedTxns { channel, reply, hash, wanted, asked_at, ready_at } = served;
+        let ServedTxns { peer, channel, reply, hash, wanted, asked_at, ready_at } = served;
         info!(
             target: "n42.h2.node",
+            %peer,
             ?hash,
             wanted,
             served = reply.as_ref().map(Vec::len).unwrap_or(0),
@@ -4259,7 +4668,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.driver.forget_payload(block_hash);
         }
         if self.body_request_due(block_hash) {
-            self.awaiting_bodies.insert(block_hash);
+            self.await_body(block_hash);
             // One peer, not every peer: a whole body is 26 MB, and six of
             // them answering at once is 156 MB read off six consensus loops
             // for one block. The member that pushed the compact body is
@@ -4759,18 +5168,28 @@ impl<E: ExecutionLayer> H2Service<E> {
 
 /// The blocks of a range an execution layer can produce, from the start
 /// until the first it does not have.
+///
+/// At most [`MAX_SERVED_RANGE_BLOCKS`] blocks and
+/// [`n42_h2_net::MAX_RANGE_REPLY_BYTES`] of them (one block always), so one
+/// request costs a bounded number of lookups and bytes.
 async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeRequest) -> Vec<Vec<u8>> {
-    let count = request.count.min(MAX_RANGE_BLOCKS);
+    let count = request.count.min(MAX_RANGE_BLOCKS).min(MAX_SERVED_RANGE_BLOCKS);
     let mut rlps = Vec::new();
+    let mut bytes = 0usize;
     for number in request.start..request.start.saturating_add(count) {
         match el.block_by_number(number).await {
             Ok(Some(block)) => {
-                rlps.push(n42_h2_net::encode_block_rlp_raw(
+                let rlp = n42_h2_net::encode_block_rlp_raw(
                     &block.header,
                     &block.transactions,
                     &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
                     None,
-                ));
+                );
+                if !range_reply_takes(rlps.len(), bytes, rlp.len()) {
+                    break;
+                }
+                bytes = bytes.saturating_add(rlp.len());
+                rlps.push(rlp);
             }
             Ok(None) => break,
             Err(err) => {
@@ -4780,6 +5199,60 @@ async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeReques
         }
     }
     rlps
+}
+
+/// Whether a range reply holding `blocks` blocks of `bytes` takes one more
+/// of `next` bytes: always the first, then while the total stays within
+/// [`n42_h2_net::MAX_RANGE_REPLY_BYTES`].
+const fn range_reply_takes(blocks: usize, bytes: usize, next: usize) -> bool {
+    blocks == 0 || bytes.saturating_add(next) <= n42_h2_net::MAX_RANGE_REPLY_BYTES
+}
+
+/// A block by hash as gov5 block RLP, from the execution layer.
+async fn block_from_execution_layer<E: ExecutionLayer>(el: &E, hash: B256) -> Option<alloy_primitives::Bytes> {
+    match el.block_by_hash(hash).await {
+        Ok(Some(block)) => Some(alloy_primitives::Bytes::from(n42_h2_net::encode_block_rlp_raw(
+            &block.header,
+            &block.transactions,
+            &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
+            None,
+        ))),
+        Ok(None) => None,
+        Err(err) => {
+            debug!(target: "n42.h2.node", ?hash, %err, "execution layer could not serve a block");
+            None
+        }
+    }
+}
+
+/// Named transactions of a block, from the execution layer.
+async fn txns_from_execution_layer<E: ExecutionLayer>(
+    el: &E,
+    request: &n42_h2_net::BlockTxnsRequest,
+) -> n42_h2_net::BlockTxnsReply {
+    let reply = match el.block_by_hash(request.hash).await {
+        Ok(Some(block)) => request
+            .indices
+            .iter()
+            .map(|&i| {
+                block
+                    .transactions
+                    .get(i as usize)
+                    .cloned()
+                    .ok_or_else(|| format!("block {} has no index {i}", request.hash))
+            })
+            .collect::<Result<Vec<_>, String>>(),
+        Ok(None) => Err(format!("block {} is not here", request.hash)),
+        Err(err) => Err(err.to_string()),
+    };
+    debug!(
+        target: "n42.h2.node",
+        hash = ?request.hash,
+        wanted = request.indices.len(),
+        served = reply.as_ref().map(Vec::len).unwrap_or(0),
+        "peer asked for named transactions; execution layer consulted"
+    );
+    reply
 }
 
 /// `N42_H2_TRACE_MSGS=1`: one info line per consensus message sent or
@@ -4846,6 +5319,43 @@ mod tests {
         assert_eq!(stale_build_parent(1023, Some(1023)), None, "the committed block is the parent");
         assert_eq!(stale_build_parent(1024, Some(1023)), None, "an own block above it");
         assert_eq!(stale_build_parent(5, None), None, "nothing committed yet");
+    }
+
+    #[test]
+    fn serve_slots_hold_each_peer_and_the_total_to_their_share() {
+        use super::{slots_taken, ServeSlot, ServeSlots};
+        let slots = ServeSlots::shared(2, 3);
+        let one = super::PeerId::random();
+        let first = ServeSlot::take(&slots, one).expect("within the share");
+        let second = ServeSlot::take(&slots, one).expect("within the share");
+        assert!(ServeSlot::take(&slots, one).is_none(), "a peer past its share is refused");
+        drop(first);
+        let again = ServeSlot::take(&slots, one).expect("a slot given back is usable again");
+        let other = ServeSlot::take(&slots, super::PeerId::random()).expect("another peer");
+        assert!(ServeSlot::take(&slots, super::PeerId::random()).is_none(), "the total is capped");
+        assert_eq!(slots_taken(&slots), 3);
+        drop((second, again, other));
+        assert_eq!(slots_taken(&slots), 0);
+        assert!(slots.lock().unwrap().per_peer.is_empty());
+    }
+
+    #[test]
+    fn a_range_reply_is_capped_by_bytes_but_always_carries_a_block() {
+        use super::range_reply_takes as takes;
+        let cap = n42_h2_net::MAX_RANGE_REPLY_BYTES;
+        assert!(takes(0, 0, cap * 2), "the first block always goes");
+        assert!(takes(1, cap / 2, cap / 2));
+        assert!(!takes(1, cap / 2, cap / 2 + 1));
+        assert!(!takes(3, usize::MAX, 1));
+    }
+
+    #[test]
+    fn catch_up_target_is_capped_near_the_tip() {
+        use super::capped_catch_up_target as cap;
+        assert_eq!(cap(u64::MAX, 100, 1), 108);
+        assert_eq!(cap(1_000_000_000_000, 100, 2), 116);
+        assert_eq!(cap(103, 100, 1), 103);
+        assert_eq!(cap(u64::MAX, u64::MAX - 1, 8), u64::MAX);
     }
 
     #[test]

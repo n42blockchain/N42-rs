@@ -90,19 +90,31 @@ impl ConsensusEngine {
         // changes — which would cause epoch divergence with nodes that never had
         // those pending_adds.
         let committed_changes = if decide.validator_changes_hash != alloy_primitives::B256::ZERO {
-            // Capture changes before commit clears them.
-            let changes = self.epoch_manager.pending_changes_for_proposal();
-            if self.epoch_manager.has_pending_changes() {
+            // Capture changes before commit clears them. Only the change set
+            // the CommitQC certified may be staged: local pending changes that
+            // hash to anything else (an RPC-queued add, or a proposal this
+            // follower never saw) were not voted on, and staging them would
+            // diverge the next epoch's set.
+            let changes = self
+                .epoch_manager
+                .pending_changes_for_proposal()
+                .filter(|pending| {
+                    crate::EpochManager::hash_changes(pending) == decide.validator_changes_hash
+                });
+            if changes.is_some() {
                 self.epoch_manager.commit_pending_changes()?;
             } else {
                 // The committed Proposal carried validator changes but this follower
-                // missed it.  Log prominently so the operator notices; the node will
-                // need to resync (or receive the changes in a subsequent Proposal
-                // before the epoch boundary) to avoid validator-set divergence.
+                // missed it, or holds a different change set.  Log prominently so the
+                // operator notices; the node will need to resync (or receive the
+                // changes in a subsequent Proposal before the epoch boundary) to avoid
+                // validator-set divergence.
+                let local_hash = self.epoch_manager.pending_changes_hash();
                 tracing::error!(
                     target: "n42::cl::decision",
                     view = decide.view,
                     expected_hash = %decide.validator_changes_hash,
+                    %local_hash,
                     "MISSED validator changes from Proposal — epoch transition may diverge; \
                      requesting resync"
                 );

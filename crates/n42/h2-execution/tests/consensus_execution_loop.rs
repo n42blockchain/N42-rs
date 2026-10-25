@@ -12,7 +12,7 @@ use alloy_primitives::{B256, U256};
 use alloy_rpc_types_engine::{PayloadAttributes, PayloadStatusEnum};
 use n42_h2_consensus::EngineOutput;
 use n42_h2_execution::{
-    ElCall, ExecutionDriver, ExecutionLayer, ExecutionPath, MockBehaviour, MockExecutionLayer,
+    DriverAction, ElCall, ExecutionDriver, ExecutionLayer, ExecutionPath, MockBehaviour, MockExecutionLayer,
 };
 
 const GENESIS: B256 = B256::ZERO;
@@ -249,6 +249,91 @@ async fn commit_finalizes_head_safe_and_finalized_together() {
 
     // A committed block's payload is dropped: it will never be re-executed.
     assert!(!driver.has_payload(&hash));
+}
+
+#[tokio::test]
+async fn a_failed_commit_forkchoice_is_not_finalised_and_is_sent_again() {
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    driver.set_commit_fcu_async(false);
+    driver.set_settlement_tags(n42_h2_execution::SettlementTags::Legacy);
+    let hash = B256::repeat_byte(0x23);
+    driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
+    driver.handle_output(&execute(hash)).await;
+    el.set_behaviour(MockBehaviour { forkchoice_error: Some("connection reset".to_owned()), ..Default::default() });
+
+    let action = driver.handle_output(&committed(hash)).await;
+    assert_eq!(action.finalized_block(), None);
+    assert_eq!(driver.finalized(), GENESIS, "a failed forkchoice finalises nothing");
+    assert_eq!(driver.commit_retry_pending(), Some(hash), "the commit stays pending");
+
+    // Not due yet: nothing is sent.
+    let sent = |el: &MockExecutionLayer| {
+        el.calls().iter().filter(|c| matches!(c, ElCall::ForkchoiceUpdated(_))).count()
+    };
+    let before = sent(&el);
+    assert!(driver.retry_failed_commit().await.is_empty());
+    assert_eq!(sent(&el), before);
+
+    // The engine answers again; after the backoff the commit is sent again
+    // from a task, not awaited on the loop, and lands when its report is
+    // applied.
+    el.set_behaviour(MockBehaviour::default());
+    let mut reports = driver.take_commit_reports().expect("the commit report channel");
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(driver.retry_failed_commit().await.is_empty(), "the answer comes as a report");
+    assert!(driver.is_committing());
+    let report = reports.recv().await.expect("a commit report");
+    let actions = driver.finish_commit(report).await;
+    assert_eq!(actions.iter().filter_map(DriverAction::finalized_block).collect::<Vec<_>>(), vec![hash]);
+    assert_eq!(driver.finalized(), hash);
+    assert_eq!(driver.commit_retry_pending(), None);
+}
+
+#[tokio::test]
+async fn a_failed_commit_survives_an_older_commit_landing() {
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    driver.set_commit_fcu_async(false);
+    driver.set_settlement_tags(n42_h2_execution::SettlementTags::Legacy);
+    let (older, newer) = (B256::repeat_byte(0x25), B256::repeat_byte(0x26));
+    driver.cache_payload(older, MockExecutionLayer::payload_for(older, 1));
+    driver.handle_output(&execute(older)).await;
+    driver.cache_payload(newer, MockExecutionLayer::payload_for(newer, 2));
+    driver.handle_output(&execute(newer)).await;
+
+    // The older commit is heard first and fails; the newer one fails too.
+    el.set_behaviour(MockBehaviour { forkchoice_error: Some("timeout".to_owned()), ..Default::default() });
+    driver.handle_output(&committed(older)).await;
+    driver.handle_output(&committed(newer)).await;
+    assert_eq!(driver.commit_retry_pending(), Some(newer), "the newest failure is the one kept");
+
+    // The older one is asked for again and lands: the newer retry stays.
+    el.set_behaviour(MockBehaviour::default());
+    driver.handle_output(&committed(older)).await;
+    assert_eq!(driver.finalized(), older);
+    assert_eq!(driver.commit_retry_pending(), Some(newer), "an ancestor landing does not finalise it");
+}
+
+#[tokio::test]
+async fn a_refused_commit_forkchoice_is_not_finalised_and_is_counted() {
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    driver.set_commit_fcu_async(false);
+    driver.set_settlement_tags(n42_h2_execution::SettlementTags::Legacy);
+    let hash = B256::repeat_byte(0x24);
+    driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
+    driver.handle_output(&execute(hash)).await;
+    // The import itself is fine; only the commit's forkchoice is refused.
+    el.set_behaviour(MockBehaviour {
+        forkchoice_status: PayloadStatusEnum::Invalid { validation_error: "bad".to_owned() },
+        ..Default::default()
+    });
+    let action = driver.handle_output(&committed(hash)).await;
+    assert_eq!(action.finalized_block(), None);
+    assert_eq!(driver.finalized(), GENESIS);
+    assert_eq!(driver.commits_refused(), 1);
+    assert_eq!(driver.commit_retry_pending(), None, "a verdict is not retried");
 }
 
 #[tokio::test]
@@ -586,9 +671,9 @@ async fn an_async_commit_returns_before_its_forkchoice_and_finalises_on_the_repo
     assert_eq!(action.finalized_block(), None, "the loop is not told anything yet");
     assert_eq!(forkchoices_to(&el, hash), 0, "the forkchoice has not reached the engine");
     assert_eq!(driver.head(), GENESIS, "the head follows the answer, not the request");
-    // Everything that does not depend on the answer happened at send time,
-    // exactly as on the awaited path.
-    assert_eq!(driver.finalized(), hash);
+    // Finality follows the answer too: a forkchoice that fails or is
+    // refused must not leave the block named as finalised.
+    assert_eq!(driver.finalized(), GENESIS);
     assert!(driver.is_committing());
 
     gate.add_permits(1);

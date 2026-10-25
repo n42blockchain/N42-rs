@@ -29,7 +29,7 @@ fn chunks(blocks: &[(B256, Header, alloy_primitives::Bytes)]) -> Vec<BlockChunk>
 }
 
 fn catching_up(rig: &mut Rig, peer: PeerId, next: u64, target: u64) {
-    rig.svc.catch_up = Some(CatchUp { peer, next, target, started_at: next - 1, probing: false });
+    rig.svc.catch_up = Some(CatchUp { peer, next, target, started_at: next - 1, probing: false, probe_height: 0 });
 }
 
 async fn import(rig: &mut Rig) -> Vec<ServiceEvent> {
@@ -97,7 +97,9 @@ async fn the_peer_whose_pull_failed_last_is_passed_over_for_another() {
     let mut events = Vec::new();
     within(rig.svc.consider_catch_up(&mut events)).await;
     let catch_up = rig.svc.catch_up.as_ref().expect("a pull");
-    assert_eq!((catch_up.peer, catch_up.target), (short, 20));
+    // The first window stops near the tip (0 + 8 x the far-ahead limit of
+    // 1); a peer that has more serves it full and the pull probes on.
+    assert_eq!((catch_up.peer, catch_up.target), (short, 8));
 
     // With no other peer the failed one is tried again.
     let mut rig = node(1, 0, None).await;
@@ -255,10 +257,32 @@ async fn a_pull_stops_and_blames_the_peer_when_its_reply_is_unusable() {
 }
 
 #[tokio::test]
+async fn a_short_probe_reply_ends_the_pull_only_at_the_height_the_probe_began_at() {
+    for (probe_height, ends) in [(2u64, true), (5, false)] {
+        let mut rig = node(1, 0, None).await;
+        let peer = PeerId::random();
+        let blocks = chain(2);
+        rig.svc.catch_up =
+            Some(CatchUp { peer, next: 1, target: 1024, started_at: 0, probing: true, probe_height });
+        rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 1024, step: 1 }, chunks(&blocks)));
+        let events = import(&mut rig).await;
+        if ends {
+            assert_eq!(events, vec![ServiceEvent::Synced { height: 2, complete: true }]);
+            assert!(rig.svc.catch_up.is_none());
+        } else {
+            // Short of the window but below the probe's height: a server's
+            // byte cap, not the peer's head. The pull asks on.
+            assert!(events.is_empty());
+            assert_eq!(rig.svc.catch_up.as_ref().map(|c| c.next), Some(3));
+        }
+    }
+}
+
+#[tokio::test]
 async fn an_empty_probe_ends_a_pull_that_already_made_progress() {
     let mut rig = node(1, 0, None).await;
     let peer = PeerId::random();
-    rig.svc.catch_up = Some(CatchUp { peer, next: 11, target: 1034, started_at: 4, probing: true });
+    rig.svc.catch_up = Some(CatchUp { peer, next: 11, target: 1034, started_at: 4, probing: true, probe_height: 0 });
     rig.svc.pending_imports.push((peer, RangeRequest { start: 11, count: 1024, step: 1 }, Vec::new()));
     assert_eq!(import(&mut rig).await, vec![ServiceEvent::Synced { height: 10, complete: true }]);
 }
@@ -425,6 +449,31 @@ fn peer_of(rig: &Rig) -> PeerId {
 }
 
 #[tokio::test]
+async fn a_peer_whose_status_names_another_chain_is_disconnected() {
+    let (mut a, mut b) = pair(0).await;
+    let peer = peer_of(&b);
+    a.svc
+        .handle_transport_event(TransportEvent::StatusExchanged {
+            peer,
+            genesis_hash: B256::repeat_byte(0xEE),
+            height: 9,
+            fork_matches: false,
+        })
+        .expect("a handles it");
+    assert!(!a.svc.peer_heights.contains_key(&peer), "a height from another chain is not kept");
+    assert!(
+        !a.svc.pending_status.iter().any(|(p, height)| *p == peer && *height == 9),
+        "nor does it start a pull"
+    );
+    let mut events = Vec::new();
+    pump(&mut a, &mut b, (false, false), &mut events, |a, b, _| {
+        !a.svc.transport.connected_peer_ids().contains(&peer)
+            && b.svc.transport.connected_peer_ids().is_empty()
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_named_direct_body_pulls_a_parent_missed_before_the_peer_connected() {
     let (mut a, b) = pair(0).await;
     let blocks = chain(2);
@@ -575,7 +624,7 @@ async fn a_block_asked_for_by_hash_is_served_from_the_store_or_the_execution_lay
 }
 
 #[tokio::test]
-async fn a_range_is_served_from_the_execution_layer_and_an_overfull_queue_is_refused() {
+async fn a_range_is_served_off_the_loop_and_its_slots_free_before_the_answer_goes_out() {
     let (mut a, mut b) = pair(0).await;
     let mut parent = B256::ZERO;
     for number in 1..=3 {
@@ -593,18 +642,59 @@ async fn a_range_is_served_from_the_execution_layer_and_an_overfull_queue_is_ref
     assert_eq!((request.start, request.count), (2, 10));
     assert_eq!(served.len(), 2, "blocks 2 and 3");
 
-    // Nine requests at once to a node that is not draining: eight wait, the
-    // ninth is refused with an empty answer.
+    // Four requests (one peer's share) to a node that is not draining: the work runs
+    // off its loop, and each slot is back as soon as the work is done --
+    // before the loop has handed a single answer over.
     a.svc.pending_imports.clear();
-    for start in 100..109 {
+    let before = b.seen.len();
+    for start in 100..104 {
         a.svc.transport.request_range(target, RangeRequest { start, count: 1, step: 1 });
     }
-    pump(&mut a, &mut b, (false, false), &mut a_events, |a, b, _| {
-        b.svc.pending_ranges.len() == MAX_PENDING_RANGES && !a.svc.pending_imports.is_empty()
+    pump(&mut a, &mut b, (false, false), &mut a_events, |_, b, _| {
+        b.seen.len() >= before + 4 && slots_taken(&b.svc.serve_slots) == 0
     })
     .await;
-    assert_eq!(b.svc.pending_ranges.len(), MAX_PENDING_RANGES);
-    assert!(a.svc.pending_imports[0].2.is_empty(), "the refused request is answered empty");
+    assert!(a.svc.pending_imports.is_empty(), "nothing is answered until the loop hands it over");
+
+    // The loop hands the answers over; none was lost or refused.
+    pump(&mut a, &mut b, (false, true), &mut a_events, |a, _, _| a.svc.pending_imports.len() == 4).await;
+}
+
+#[tokio::test]
+async fn a_fifth_range_request_from_one_peer_is_refused_with_the_server_error_code() {
+    let (mut a, mut b) = pair(0).await;
+    let mut parent = B256::ZERO;
+    for number in 1..=3 {
+        let built = MockExecutionLayer::built_block_on(number, parent);
+        parent = built.hash;
+        use n42_h2_execution::ExecutionLayer;
+        within(b.el.new_payload(built.execution_data)).await.expect("accepted");
+    }
+    let target = peer_of(&b);
+    // `a` pulls from `b`, so a refusal reaches its import queue (as an empty
+    // reply) rather than only a log line.
+    a.svc.catch_up =
+        Some(CatchUp { peer: target, next: 2, target: 2, started_at: 1, probing: false, probe_height: 0 });
+
+    // Four of `a`'s requests are in flight at `b` (held here, so the timing
+    // of the mock execution layer cannot free them): `a`'s share is full.
+    let held: Vec<_> = (0..MAX_SERVES_PER_PEER)
+        .map(|_| ServeSlot::take(&b.svc.serve_slots, peer_of(&a)).expect("within the share"))
+        .collect();
+
+    // The fifth is refused with the server-error code: no block, although
+    // `b` has block 2.
+    a.svc.transport.request_range(target, RangeRequest { start: 2, count: 1, step: 1 });
+    let mut a_events = Vec::new();
+    pump(&mut a, &mut b, (false, true), &mut a_events, |a, _, _| !a.svc.pending_imports.is_empty()).await;
+    assert!(a.svc.pending_imports[0].2.is_empty(), "the request past the share is refused");
+
+    // With the share free again the same request is served.
+    drop(held);
+    a.svc.pending_imports.clear();
+    a.svc.transport.request_range(target, RangeRequest { start: 2, count: 1, step: 1 });
+    pump(&mut a, &mut b, (false, true), &mut a_events, |a, _, _| !a.svc.pending_imports.is_empty()).await;
+    assert_eq!(a.svc.pending_imports[0].2.len(), 1, "block 2");
 }
 
 #[tokio::test]

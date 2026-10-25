@@ -31,10 +31,27 @@ const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 fn main() {
     // `N42_INGEST_VERIFY=shard` without a well-formed `N42_INGEST_SHARD=<i>/<n>`
     // would silently verify everything (or nothing); refuse to start instead.
-    if let Err(err) = n42_tx_types::ingest_verify_mode() {
-        eprintln!("error: {err}");
+    let ingest_mode = match n42_tx_types::ingest_verify_mode() {
+        Ok(mode) => mode,
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(2);
+        }
+    };
+    // `leader` and `shard` take a frame's word for a sender: benchmark probes,
+    // refused unless the operator acknowledges them with N42_BENCH_UNSAFE=1.
+    if let Some(refusal) = n42_tx_types::trusting_mode_refusal(
+        ingest_mode,
+        std::env::var("N42_BENCH_UNSAFE").ok().as_deref(),
+    ) {
+        eprintln!("error: {refusal}");
         std::process::exit(2);
     }
+    let trusting_knobs = n42_tx_types::trusting_ingest_knobs(
+        ingest_mode,
+        std::env::var_os("N42_TX_INGEST_DIRECT").is_some(),
+        std::env::var_os("N42_FRAME_GATEWAYS").is_some(),
+    );
     // `N42_CORE_LAYOUT=isolate`: split the node's affinity mask into the
     // build, critical and background sets before any thread is spawned, and
     // move this thread (and any the allocator already has) to the background
@@ -88,6 +105,9 @@ fn main() {
     if let Err(err) =
         Cli::<N42ChainSpecParser>::parse().run(async move |builder, _extra_args| {
             info!(target: "reth::cli", "Launching node");
+            for knob in &trusting_knobs {
+                warn!(target: "reth::cli", knob = *knob, "trusting ingest mode accepted: this node admits transactions on a frame's word (benchmark only)");
+            }
 
             // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md): a
             // malformed value or a depth this node does not run is refused here,

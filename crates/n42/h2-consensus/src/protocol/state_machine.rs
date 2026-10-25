@@ -1420,25 +1420,28 @@ impl ConsensusEngine {
         };
 
         // A QC proves a quorum reached qc.view, so the jump target is its
-        // successor (see below). Decide what the jump could do before paying
-        // for any pairing: a QC that cannot move the view, or one this node
-        // already holds as its lock or commit, is ignored outright.
-        if qc.view.saturating_add(1) <= current_view
-            || qc == self.round_state.locked_qc()
-            || qc == self.round_state.last_committed_qc()
-        {
+        // successor (see below). A QC that cannot move the view is refused
+        // before any pairing.
+        if qc.view.saturating_add(1) <= current_view {
             return Ok(false);
         }
         if matches!(msg, ConsensusMessage::Vote(_) | ConsensusMessage::CommitVote(_)) {
             return Ok(false);
         }
 
-        // A digest over the QC and the domain it is checked under; a QC
-        // already verified under it skips the pairing.
-        let memo_key = Self::jump_qc_digest(msg, qc);
-        let already_verified = memo_key
-            .as_ref()
-            .is_some_and(|key| self.verified_jump_qcs.get(key).is_some());
+        // A QC this node already holds as its lock or its last commit was
+        // verified before it got there: it still justifies the jump (the
+        // next leader proposes on exactly that lock, and its proposal may
+        // arrive before the Decide that would move this follower), only the
+        // pairing is skipped. Otherwise, a digest over the QC and the domain
+        // it is checked under; a QC already verified under it skips the
+        // pairing too.
+        let held = qc == self.round_state.locked_qc() || qc == self.round_state.last_committed_qc();
+        let memo_key = if held { None } else { Self::jump_qc_digest(msg, qc) };
+        let already_verified = held
+            || memo_key
+                .as_ref()
+                .is_some_and(|key| self.verified_jump_qcs.get(key).is_some());
 
         // Proposal/Timeout/NewView can carry either a prepare QC or a commit QC as
         // their justify/high QC, so the view-jump path must accept both domains.
@@ -4600,6 +4603,41 @@ mod tests {
         assert_eq!(engine.verified_jump_qcs.len(), 1);
         assert!(!std::iter::from_fn(|| rx.try_recv().ok())
             .any(|output| matches!(output, EngineOutput::SyncRequired { .. })));
+    }
+
+    #[test]
+    fn test_next_view_proposal_on_the_own_lock_jumps_before_the_decide() {
+        // A follower locked on view 1's prepare QC (it processed the
+        // PrepareQC) is still in view 1, waiting for Decide(1). The next
+        // leader's proposal for view 2 carries that very QC as its justify
+        // and arrives first: it must move the follower to view 2 and be
+        // dispatched, not wait in the buffer for the Decide.
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+        assert_eq!(engine.current_view(), 1);
+        let lock = build_test_prepare_qc(1, B256::repeat_byte(0x31), &sks, &vs, &[0, 1, 2]);
+        engine.round_state.update_locked_qc(&lock);
+        while rx.try_recv().is_ok() {}
+
+        let block_hash = B256::repeat_byte(0x32);
+        let message = engine.signing_profile.proposal_message(2, block_hash, &None);
+        let proposal = Proposal {
+            view: 2,
+            block_hash,
+            justify_qc: lock,
+            proposer: 2,
+            signature: engine.signing_profile.sign(&sks[2], &message),
+            prepare_qc: None,
+            tx_root_hash: None,
+            validator_changes: None,
+        };
+        // What the proposal itself leads to (an execute request, a vote) is
+        // not the point; the view is.
+        let _ = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)));
+        assert_eq!(engine.current_view(), 2, "the own lock justifies the jump");
+        assert!(
+            !engine.future_msg_buffer.iter().any(|(view, _)| *view == 2),
+            "the proposal was dispatched, not buffered"
+        );
     }
 
     #[test]

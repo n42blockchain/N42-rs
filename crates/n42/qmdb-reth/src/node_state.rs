@@ -1566,8 +1566,14 @@ impl QmdbNodeState {
 
     /// Records the roots of heads just persisted. A failure is logged: the
     /// record only lets a restart check its tree.
-    fn record_head_roots(&self, heads: &[(u64, B256, B256)]) {
-        if let Err(error) = HeadRoots::write(&self.head_roots_path(), heads) {
+    fn record_head_roots(&self, heads: &[(u64, B256, Option<B256>)]) {
+        // A head whose root is not known is not recorded: a zero there would
+        // make the next restart refuse to start rather than skip the check.
+        let heads: Vec<(u64, B256, B256)> = heads
+            .iter()
+            .filter_map(|(number, hash, root)| root.filter(|root| !root.is_zero()).map(|root| (*number, *hash, root)))
+            .collect();
+        if let Err(error) = HeadRoots::write(&self.head_roots_path(), &heads) {
             warn!(target: "n42.qmdb", %error, "could not record the persisted QMDB heads' roots; a restart cannot check its tree");
         }
     }
@@ -1577,7 +1583,15 @@ impl QmdbNodeState {
     /// initialisation, no record skips the check with a warning.
     fn check_restored_root(&self, head: (u64, B256), restored: B256) -> Result<(), NodeStateError> {
         let path = self.head_roots_path();
-        let recorded = HeadRoots::read(&path, head.0, head.1).map_err(|source| NodeStateError::Io { path, source })?;
+        // The record is a check, not state: a file that cannot be read skips
+        // the comparison, as a missing record does.
+        let recorded = match HeadRoots::read(&path, head.0, head.1) {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                warn!(target: "n42.qmdb", %error, path = %path.display(), block = head.0, "could not read the recorded QMDB roots; the restored tree is not checked");
+                None
+            }
+        };
         match recorded {
             Some(recorded) if recorded == restored => {
                 debug!(target: "n42.qmdb", block = head.0, %restored, "the restored QMDB root matches the recorded one");
@@ -2780,10 +2794,8 @@ impl QmdbNodeState {
             let block_hash = target.unwrap_or_else(|| forest.head().1);
             let released = forest.set_canonical_releasing(block_hash)?;
             let ready = forest.take_block_deltas(cursor.head, cursor.next_slot, block_hash).map(|deltas| {
-                let roots: Vec<(u64, B256, B256)> = deltas
-                    .iter()
-                    .filter_map(|delta| forest.root_of(&delta.head_hash).map(|root| (delta.head_number, delta.head_hash, root)))
-                    .collect();
+                let roots: Vec<(u64, B256, Option<B256>)> =
+                    deltas.iter().map(|delta| (delta.head_number, delta.head_hash, forest.root_of(&delta.head_hash))).collect();
                 (deltas, roots)
             });
             Ok((block_hash, forest.head().0, ready, released))
@@ -2824,7 +2836,9 @@ impl QmdbNodeState {
         }
         let (delta, root, released) = self.with_forest("on_canonical#3", |forest| {
             let released = forest.set_canonical_releasing(target.unwrap_or_else(|| forest.head().1))?;
-            Ok((forest.delta_since(cursor.next_slot)?, forest.root(), released))
+            let delta = forest.delta_since(cursor.next_slot)?;
+            let root = forest.root_of(&delta.head_hash);
+            Ok((delta, root, released))
         })?;
         release_off_lock(number, released);
         // Rewriting the checkpoint costs the whole state, so it is worth doing
@@ -3122,7 +3136,8 @@ impl QmdbNodeState {
                 forest.sync_entries()?;
                 let ckpt = forest.checkpoint()?;
                 forest.forget_changes();
-                Ok((ckpt, forest.root()))
+                let root = forest.root_of(&ckpt.head_hash);
+                Ok((ckpt, root))
             })?;
             let (ckpt, root) = ckpt;
             let mut phases = CompactPhases::default();
@@ -3155,7 +3170,8 @@ impl QmdbNodeState {
             // The changes are in the snapshot now, so the next delta must be
             // measured from it rather than carrying them a second time.
             forest.forget_changes();
-            Ok((snapshot, forest.root()))
+            let root = forest.root_of(&snapshot.head_hash);
+            Ok((snapshot, root))
         })?;
         let (snapshot, root) = snapshot;
         let block_hash = snapshot.head_hash;

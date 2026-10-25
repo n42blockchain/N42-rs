@@ -1083,3 +1083,24 @@ fn a_heap_restart_checks_its_root_too() {
     drop(restarted);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A head whose root is absent or zero is not recorded (a zero would make
+/// the next restart refuse to start), and an unreadable record file skips
+/// the check instead of blocking startup.
+#[test]
+fn absent_roots_are_not_recorded_and_an_unreadable_record_is_skipped() {
+    let (state, chain, dir, head, root) = node_at("restart-root-absent", true, 2);
+    let roots = state.head_roots_path();
+    std::fs::remove_file(&roots).expect("drop the records");
+    state.record_head_roots(&[(5, B256::repeat_byte(5), None), (6, B256::repeat_byte(6), Some(B256::ZERO))]);
+    assert!(!roots.exists(), "nothing was recorded");
+    drop(state);
+    // A directory where the file should be: reading it fails, and the
+    // restart goes on unchecked.
+    std::fs::create_dir_all(&roots).expect("an unreadable record");
+    let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    restarted.initialize((2, head)).expect("an unreadable record does not block startup");
+    assert_eq!(restarted.state_root(), root);
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(&dir);
+}

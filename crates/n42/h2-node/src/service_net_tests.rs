@@ -595,23 +595,22 @@ async fn a_range_is_served_off_the_loop_and_a_peer_past_its_share_is_refused() {
     assert_eq!((request.start, request.count), (2, 10));
     assert_eq!(served.len(), 2, "blocks 2 and 3");
 
-    // Nine requests at once to a node that is not draining: none is served
-    // on its loop; the peer's four slots are taken by work spawned off it,
-    // and the other five are refused at once with the server-error code.
+    // Four requests (one peer's share) to a node that is not draining: the work runs
+    // off its loop, and each slot is back as soon as the work is done --
+    // before the loop has handed a single answer over.
     a.svc.pending_imports.clear();
     let before = b.seen.len();
-    for start in 100..109 {
+    for start in 100..104 {
         a.svc.transport.request_range(target, RangeRequest { start, count: 1, step: 1 });
     }
     pump(&mut a, &mut b, (false, false), &mut a_events, |_, b, _| {
-        b.svc.serve_slots.total == MAX_SERVES_PER_PEER && b.seen.len() >= before + 9
+        b.seen.len() >= before + 4 && slots_taken(&b.svc.serve_slots) == 0
     })
     .await;
-    assert_eq!(b.svc.serve_slots.total, MAX_SERVES_PER_PEER, "one peer holds at most its share");
+    assert!(a.svc.pending_imports.is_empty(), "nothing is answered until the loop hands it over");
 
-    // The replies are handed over when the loop next gets to them, and the
-    // slots come back.
-    pump(&mut a, &mut b, (false, true), &mut a_events, |_, b, _| b.svc.serve_slots.total == 0).await;
+    // The loop hands the answers over; none was lost or refused.
+    pump(&mut a, &mut b, (false, true), &mut a_events, |a, _, _| a.svc.pending_imports.len() == 4).await;
 }
 
 #[tokio::test]

@@ -468,8 +468,11 @@ pub struct H2Service<E> {
     /// Block requests the store could not answer, for the execution layer
     /// on the next drain.
     pending_block_requests: Vec<(String, B256, n42_h2_net::BlockRequestChannel)>,
-    /// Peer requests being served off the loop, by peer; see [`ServeSlots`].
-    serve_slots: ServeSlots,
+    /// Range requests being served off the loop; see [`ServeSlots`].
+    serve_slots: SharedServeSlots,
+    /// Fills and block-by-hash requests being served off the loop: their
+    /// own share, so range pulls never refuse a vote-path fill.
+    fill_slots: SharedServeSlots,
     /// Every body this node built or received, as gov5 block RLP, to answer
     /// `block_by_hash` — gov5's fetch-on-miss, and this node's own. Bounded;
     /// insertion order in `body_store_order`.
@@ -567,32 +570,58 @@ struct CatchUp {
 /// thousand lookups.
 const MAX_PENDING_SERVES: usize = 256;
 
-/// Peer requests (ranges, blocks and fills from the execution layer or a
-/// stored body) one peer may have in flight off the loop; past it the
-/// request is refused with the protocol's server-error code.
+/// Range requests one peer may have being served off the loop at once;
+/// past it the request is refused with the protocol's server-error code.
 const MAX_SERVES_PER_PEER: usize = 4;
 
-/// The same for all peers together. Every reply in flight comes back on
-/// `served_txns`, so this also bounds that channel.
+/// The same for all peers together.
 const MAX_SERVES_IN_FLIGHT: usize = 32;
+
+/// Fills and block-by-hash requests one peer may have being served at once.
+/// Their own share, larger than the ranges': a follower asks for them on
+/// its vote path (fills for pipelined blocks, their retry rounds, the
+/// whole-body fallback), and a rejoiner's range pulls must never make that
+/// answer "server busy".
+const MAX_FILL_SERVES_PER_PEER: usize = 16;
+
+/// The same for all peers together.
+const MAX_FILL_SERVES_IN_FLIGHT: usize = 64;
 
 /// The most blocks one range reply carries, whatever was asked (gov5 asks
 /// for up to 1,024). The asker reads a shorter reply as a shorter window
 /// and asks again from where it got to.
 const MAX_SERVED_RANGE_BLOCKS: u64 = 32;
 
-/// Requests served off the loop, counted per peer and in total.
-#[derive(Debug, Default)]
+/// Requests being served off the loop, counted per peer and in total
+/// against a per-peer and a total cap. Shared with the serving tasks: a
+/// slot is held by a [`ServeSlot`] that the task drops when its work is
+/// done, so only work in flight counts, not answers waiting for the loop
+/// to hand them over.
+#[derive(Debug)]
 struct ServeSlots {
     per_peer: std::collections::HashMap<PeerId, usize>,
     total: usize,
+    per_peer_cap: usize,
+    total_cap: usize,
 }
 
+/// [`ServeSlots`] as the service and its tasks share them.
+type SharedServeSlots = Arc<std::sync::Mutex<ServeSlots>>;
+
 impl ServeSlots {
+    fn shared(per_peer_cap: usize, total_cap: usize) -> SharedServeSlots {
+        Arc::new(std::sync::Mutex::new(Self {
+            per_peer: std::collections::HashMap::new(),
+            total: 0,
+            per_peer_cap,
+            total_cap,
+        }))
+    }
+
     /// Takes a slot for `peer`, or says it is over its share or the total.
     fn try_take(&mut self, peer: PeerId) -> bool {
         let mine = self.per_peer.get(&peer).copied().unwrap_or(0);
-        if self.total >= MAX_SERVES_IN_FLIGHT || mine >= MAX_SERVES_PER_PEER {
+        if self.total >= self.total_cap || mine >= self.per_peer_cap {
             return false;
         }
         self.per_peer.insert(peer, mine + 1);
@@ -610,6 +639,32 @@ impl ServeSlots {
             self.total = self.total.saturating_sub(1);
         }
     }
+}
+
+/// One slot taken from [`ServeSlots`]; dropping it gives it back.
+#[derive(Debug)]
+struct ServeSlot {
+    slots: SharedServeSlots,
+    peer: PeerId,
+}
+
+impl ServeSlot {
+    /// Takes a slot for `peer` from `slots`, if it is within its share.
+    fn take(slots: &SharedServeSlots, peer: PeerId) -> Option<Self> {
+        let taken = slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).try_take(peer);
+        taken.then(|| Self { slots: Arc::clone(slots), peer })
+    }
+}
+
+impl Drop for ServeSlot {
+    fn drop(&mut self) {
+        self.slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).give_back(&self.peer);
+    }
+}
+
+/// How many slots of `slots` are taken.
+fn slots_taken(slots: &SharedServeSlots) -> usize {
+    slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).total
 }
 /// A block this far past the execution layer's tip is not handed to it.
 ///
@@ -1326,7 +1381,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             catch_up: None,
             pending_imports: Vec::new(),
             pending_block_requests: Vec::new(),
-            serve_slots: ServeSlots::default(),
+            serve_slots: ServeSlots::shared(MAX_SERVES_PER_PEER, MAX_SERVES_IN_FLIGHT),
+            fill_slots: ServeSlots::shared(MAX_FILL_SERVES_PER_PEER, MAX_FILL_SERVES_IN_FLIGHT),
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
             elided_own: std::collections::HashMap::new(),
@@ -2109,7 +2165,8 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // Every road below but the elided one is work off the loop
                 // held to a per-peer and a total share.
                 let elided = held.is_none() && self.elided_own.contains_key(&request.hash);
-                if !elided && !self.serve_slots.try_take(peer) {
+                let slot = if elided { None } else { ServeSlot::take(&self.fill_slots, peer) };
+                if !elided && slot.is_none() {
                     debug!(target: "n42.h2.node", %peer, hash = ?request.hash, "too many requests in flight; fill refused");
                     self.transport.respond_block_txns(channel, Err("server busy".to_owned()));
                     return Ok(());
@@ -2126,6 +2183,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                         let asked_at = std::time::Instant::now();
                         tokio::task::spawn_blocking(move || {
                             let reply = fill_from_body(&body, profile, &request);
+                            // The work is done: the slot goes back now, not
+                            // when the loop hands the answer over.
+                            drop(slot);
                             debug!(
                                 target: "n42.h2.node",
                                 %peer,
@@ -2177,6 +2237,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         let asked_at = std::time::Instant::now();
                         tokio::spawn(async move {
                             let reply = txns_from_execution_layer(&*el, &request).await;
+                            drop(slot);
                             let _ = back.send(Served::Txns(ServedTxns {
                                 peer,
                                 channel,
@@ -2304,15 +2365,17 @@ impl<E: ExecutionLayer> H2Service<E> {
                     }
                     // Any other is looked up off the loop, within the
                     // peer's share of requests in flight.
-                    None if !self.serve_slots.try_take(peer) => {
-                        debug!(target: "n42.h2.node", %peer, ?hash, "too many requests in flight; block request refused");
-                        self.transport.respond_block(channel, None);
-                    }
                     None => {
+                        let Some(slot) = ServeSlot::take(&self.fill_slots, peer) else {
+                            debug!(target: "n42.h2.node", %peer, ?hash, "too many requests in flight; block request refused");
+                            self.transport.respond_block(channel, None);
+                            return Ok(());
+                        };
                         let el = self.driver.execution_layer_arc();
                         let back = self.served_txns.0.clone();
                         tokio::spawn(async move {
                             let body = block_from_execution_layer(&*el, hash).await;
+                            drop(slot);
                             let _ = back.send(Served::Block { peer, hash, channel, body });
                         });
                     }
@@ -2416,16 +2479,17 @@ impl<E: ExecutionLayer> H2Service<E> {
                 //
                 // Off the loop: up to 32 sequential lookups and the replies'
                 // bytes used to sit on this loop, which is the view's.
-                if !self.serve_slots.try_take(peer) {
-                    debug!(target: "n42.h2.node", %peer, ?request, "too many requests in flight; range refused");
-                    self.transport.respond_range_error(channel, "server busy".to_owned());
-                } else {
+                if let Some(slot) = ServeSlot::take(&self.serve_slots, peer) {
                     let el = self.driver.execution_layer_arc();
                     let back = self.served_txns.0.clone();
                     tokio::spawn(async move {
                         let rlps = serve_range(&*el, request).await;
+                        drop(slot);
                         let _ = back.send(Served::Range { peer, request, channel, rlps });
                     });
+                } else {
+                    debug!(target: "n42.h2.node", %peer, ?request, "too many requests in flight; range refused");
+                    self.transport.respond_range_error(channel, "server busy".to_owned());
                 }
             }
             TransportEvent::RangeFetched { peer, request, reply } => match reply {
@@ -4401,12 +4465,10 @@ impl<E: ExecutionLayer> H2Service<E> {
         match served {
             Served::Txns(served) => self.respond_served_txns(served),
             Served::Block { peer, hash, channel, body } => {
-                self.serve_slots.give_back(&peer);
                 debug!(target: "n42.h2.node", %peer, ?hash, found = body.is_some(), "peer asked for a block; execution layer consulted");
                 self.transport.respond_block(channel, body);
             }
             Served::Range { peer, request, channel, rlps } => {
-                self.serve_slots.give_back(&peer);
                 debug!(target: "n42.h2.node", %peer, ?request, served = rlps.len(), "peer asked for a range");
                 self.transport.respond_range(channel, rlps);
             }
@@ -4415,9 +4477,9 @@ impl<E: ExecutionLayer> H2Service<E> {
 
     fn respond_served_txns(&mut self, served: ServedTxns) {
         let ServedTxns { peer, channel, reply, hash, wanted, asked_at, ready_at } = served;
-        self.serve_slots.give_back(&peer);
         info!(
             target: "n42.h2.node",
+            %peer,
             ?hash,
             wanted,
             served = reply.as_ref().map(Vec::len).unwrap_or(0),
@@ -5120,30 +5182,20 @@ mod tests {
 
     #[test]
     fn serve_slots_hold_each_peer_and_the_total_to_their_share() {
-        use super::{ServeSlots, MAX_SERVES_IN_FLIGHT, MAX_SERVES_PER_PEER};
-        let mut slots = ServeSlots::default();
+        use super::{slots_taken, ServeSlot, ServeSlots};
+        let slots = ServeSlots::shared(2, 3);
         let one = super::PeerId::random();
-        for _ in 0..MAX_SERVES_PER_PEER {
-            assert!(slots.try_take(one));
-        }
-        assert!(!slots.try_take(one), "a peer past its share is refused");
-        slots.give_back(&one);
-        assert!(slots.try_take(one), "a returned slot is usable again");
-        let mut others = Vec::new();
-        while slots.total < MAX_SERVES_IN_FLIGHT {
-            let peer = super::PeerId::random();
-            assert!(slots.try_take(peer));
-            others.push(peer);
-        }
-        assert!(!slots.try_take(super::PeerId::random()), "the total is capped");
-        for peer in others.iter().chain(std::iter::repeat_n(&one, MAX_SERVES_PER_PEER)) {
-            slots.give_back(peer);
-        }
-        assert_eq!(slots.total, 0);
-        assert!(slots.per_peer.is_empty());
-        // A peer that holds nothing gives nothing back.
-        slots.give_back(&one);
-        assert_eq!(slots.total, 0);
+        let first = ServeSlot::take(&slots, one).expect("within the share");
+        let second = ServeSlot::take(&slots, one).expect("within the share");
+        assert!(ServeSlot::take(&slots, one).is_none(), "a peer past its share is refused");
+        drop(first);
+        let again = ServeSlot::take(&slots, one).expect("a slot given back is usable again");
+        let other = ServeSlot::take(&slots, super::PeerId::random()).expect("another peer");
+        assert!(ServeSlot::take(&slots, super::PeerId::random()).is_none(), "the total is capped");
+        assert_eq!(slots_taken(&slots), 3);
+        drop((second, again, other));
+        assert_eq!(slots_taken(&slots), 0);
+        assert!(slots.lock().unwrap().per_peer.is_empty());
     }
 
     #[test]

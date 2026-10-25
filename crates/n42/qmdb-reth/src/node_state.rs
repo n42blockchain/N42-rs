@@ -2801,6 +2801,10 @@ impl QmdbNodeState {
             path: log_path.clone(),
             source,
         })?;
+        // The rename made durable, as `write_durably` does: after a crash the
+        // segment is found under the name the compaction looks for, and the
+        // fresh log the next delta creates beside it is not mistaken for it.
+        sync_parent_dir(&sealed_path).map_err(|source| NodeStateError::Io { path: sealed_path.clone(), source })?;
         // The log starts again from nothing; the cursor's head and slot are
         // unchanged, because checkpoint + sealed segment is the state they
         // describe.
@@ -3272,7 +3276,22 @@ fn append_delta(path: &Path, from: u64, delta: &ForestDelta) -> Result<u64, Node
     // delta, and the restart would stand behind the database and refuse to
     // start.
     file.sync_data().map_err(io)?;
+    // A log appended from its start was just created (or rotated): its
+    // directory entry is made durable too, or an OS crash could keep the
+    // synced data blocks and lose the file that holds them.
+    if from == 0 {
+        sync_parent_dir(path).map_err(io)?;
+    }
     Ok(from + record.len() as u64)
+}
+
+/// Syncs the directory holding `path`, so a create or a rename in it is
+/// durable.
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => std::fs::File::open(dir)?.sync_all(),
+        _ => Ok(()),
+    }
 }
 
 /// Replays `path` onto `checkpoint`, stopping at `head_hash` if it is reached.
@@ -4419,6 +4438,32 @@ mod tests {
         assert!(view.is_valid(), "the cut took only the records of the block not advanced yet");
         view.advance(12, old_twelve, &changes, raised);
         assert!(!view.is_valid(), "a cut between the floor and the advance invalidates the view");
+    }
+
+    /// A delta log appended from its start (just created) and a rotated
+    /// segment have their directory synced; the sync itself works on a path
+    /// with no directory part too.
+    #[test]
+    fn a_fresh_delta_log_syncs_its_directory() {
+        let dir = scratch("dir-sync");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DELTA_LOG_FILE);
+        let delta = ForestDelta {
+            version: ForestDelta::VERSION,
+            head_number: 1,
+            head_hash: B256::repeat_byte(1),
+            base_next_slot: 0,
+            next_slot: 0,
+            appended: Vec::new(),
+            changed: Vec::new(),
+        };
+        let written = append_delta(&path, 0, &delta).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), written);
+        let again = append_delta(&path, written, &delta).unwrap();
+        assert!(again > written);
+        sync_parent_dir(&path).unwrap();
+        sync_parent_dir(Path::new("no-directory-part")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

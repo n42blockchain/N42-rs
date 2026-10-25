@@ -788,6 +788,8 @@ pub fn seal_root_carried(ahead: &RootAhead, plan: Option<&FramePlan>, body_hashe
             "frame build sealed"
         );
     }
+    // This node's own body: its import does not check it for duplicates again.
+    note_distinct_body(ahead.root, body_hashes.len());
     remember_layout(ahead.root, described);
     Some(SealRoot { root: ahead.root, layout_us: 0, root_us: 0, indexed: ahead.indexed, hashed: ahead.hashed })
 }
@@ -839,11 +841,22 @@ pub fn frame_tree_root_known(
     total: usize,
     hash_at: impl Fn(usize) -> B256 + Sync,
 ) -> Option<FrameTreeRoot> {
+    frame_tree_leaves_known(counts, known, total, hash_at).map(|(tree, _)| tree)
+}
+
+/// [`frame_tree_root_known`], with the tree's leaves (one per frame, in
+/// body order) for [`frame_body_ambiguous`].
+pub fn frame_tree_leaves_known(
+    counts: &[usize],
+    known: &[Option<B256>],
+    total: usize,
+    hash_at: impl Fn(usize) -> B256 + Sync,
+) -> Option<(FrameTreeRoot, Vec<B256>)> {
     use rayon::prelude::*;
     if total == 0 {
         return counts
             .is_empty()
-            .then_some(FrameTreeRoot { root: alloy_consensus::EMPTY_ROOT_HASH, indexed: 0, hashed: 0 });
+            .then_some((FrameTreeRoot { root: alloy_consensus::EMPTY_ROOT_HASH, indexed: 0, hashed: 0 }, Vec::new()));
     }
     if counts.len() != known.len() || counts.contains(&0) || counts.iter().sum::<usize>() != total {
         return None;
@@ -867,7 +880,79 @@ pub fn frame_tree_root_known(
     } else {
         (0..counts.len()).into_par_iter().map(leaf).collect()
     };
-    Some(FrameTreeRoot { root: n42_tx_types::frame_tree_root(&leaves), indexed, hashed })
+    Some((FrameTreeRoot { root: n42_tx_types::frame_tree_root(&leaves), indexed, hashed }, leaves))
+}
+
+/// Whether a frame-tree body could carry the root of a different body,
+/// checked in O(frames + hashed transactions) rather than over every
+/// transaction: the frame tree pairs an odd node with itself, so a list
+/// whose tail repeats (a leaf, a run of leaves, or a transaction inside a
+/// frame) shares its root with the list without the repeat.
+///
+/// - Two equal leaves: a frame (or a run of frames) named twice, or a hashed
+///   frame with the same transactions as another. Every repeat at the frame
+///   level shows up here.
+/// - A duplicate among the transactions of the frames without a known leaf
+///   (`known[k]` `None`: hashed here, the cut last frame or a supplied one).
+///   A known leaf is an indexed frame whose positions hold exactly its
+///   transactions, and the ingest never indexes a frame that names a
+///   transaction twice, so its inside needs no check.
+///
+/// Not detected: one transaction in two different frames with distinct
+/// leaves. That is no root ambiguity -- the root still binds that very
+/// body -- only an invalid block (a repeated nonce), which every node
+/// refuses alike at execution.
+pub fn frame_body_ambiguous(
+    counts: &[usize],
+    known: &[Option<B256>],
+    leaves: &[B256],
+    hash_at: impl Fn(usize) -> B256 + Sync,
+) -> bool {
+    let mut hashed = Vec::new();
+    let mut at = 0usize;
+    for (k, count) in counts.iter().enumerate() {
+        if known.get(k).copied().flatten().is_none() {
+            hashed.extend((at..at + count).map(&hash_at));
+        }
+        at += count;
+    }
+    let ambiguous = n42_tx_types::has_duplicate_hash(leaves) || n42_tx_types::has_duplicate_hash(&hashed);
+    if ambiguous {
+        let refused = REFUSED_DUPLICATE.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            target: "n42::frame_blocks",
+            frames = leaves.len(),
+            hashed = hashed.len(),
+            refused,
+            "a frame-tree body with a repeated frame or transaction: its root is not trusted"
+        );
+    }
+    ambiguous
+}
+
+/// Bodies already checked free of duplicates, by `(transactions root,
+/// length)`: a described body checked by [`frame_body_ambiguous`], or a
+/// body this node sealed. Two different lists under one frame-tree root
+/// differ in length (a repeat makes the list longer), so the pair names one
+/// body and its whole-body check later need not run again.
+static DISTINCT_BODIES: Mutex<VecDeque<(B256, usize)>> = Mutex::new(VecDeque::new());
+const DISTINCT_BODIES_KEPT: usize = 64;
+
+/// Records that the body of `len` transactions under `root` holds no
+/// duplicate.
+pub fn note_distinct_body(root: B256, len: usize) {
+    let mut kept = DISTINCT_BODIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if kept.contains(&(root, len)) {
+        return;
+    }
+    kept.push_back((root, len));
+    while kept.len() > DISTINCT_BODIES_KEPT {
+        kept.pop_front();
+    }
+}
+
+fn known_distinct_body(root: B256, len: usize) -> bool {
+    DISTINCT_BODIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&(root, len))
 }
 
 /// The known leaves of a layout the frame index found for a body
@@ -960,6 +1045,8 @@ pub fn seal_root_timed(plan: Option<&FramePlan>, body_hashes: &[B256], mpt: impl
             "frame build sealed"
         );
     }
+    // This node's own body: its import does not check it for duplicates again.
+    note_distinct_body(tree.root, body_hashes.len());
     remember_layout(tree.root, described);
     SealRoot { root: tree.root, layout_us, root_us, indexed: tree.indexed, hashed: tree.hashed }
 }
@@ -1009,9 +1096,14 @@ pub fn root_for_body_counted(claimed: Option<B256>, hashes: &[B256], mpt: impl F
     // A body with a duplicate hash can reproduce the frame-tree root of the
     // body without it, so it never matches a header by a frame tree; it is
     // checked against its MPT root, which has no such ambiguity. Checked
-    // only once a frame tree would be accepted.
+    // once, only once a frame tree would be accepted, and not at all for a
+    // body the description path or this node's seal already checked
+    // ([`note_distinct_body`]). Serial after the root: it runs only when
+    // the root matched, which a concurrent check could not know.
     let mut duplicate: Option<bool> = None;
-    let mut refuses = || *duplicate.get_or_insert_with(|| body_has_duplicate(hashes));
+    let mut refuses = |root: B256| {
+        *duplicate.get_or_insert_with(|| !known_distinct_body(root, hashes.len()) && body_has_duplicate(hashes))
+    };
     let queue = n42_tx_queue::global::<crate::N42PooledTransaction>();
     if let Some(claimed) = claimed
         && let Some(layout) = layout_by_root(&claimed)
@@ -1021,7 +1113,7 @@ pub fn root_for_body_counted(claimed: Option<B256>, hashes: &[B256], mpt: impl F
         let counts: Vec<usize> = layout.iter().map(|(_, count)| *count).collect();
         if let Some(tree) = frame_tree_root_known(&counts, &known, hashes.len(), |i| hashes[i])
             && tree.root == claimed
-            && !refuses()
+            && !refuses(claimed)
         {
             CHECKED_FRAME_ROOT.fetch_add(1, Ordering::Relaxed);
             return BodyRoot { root: claimed, frame: true, indexed: tree.indexed, hashed: tree.hashed };
@@ -1033,7 +1125,7 @@ pub fn root_for_body_counted(claimed: Option<B256>, hashes: &[B256], mpt: impl F
     });
     if let Some(tree) = indexed
         && claimed.is_none_or(|claimed| claimed == tree.root)
-        && !refuses()
+        && !refuses(tree.root)
     {
         CHECKED_FRAME_ROOT.fetch_add(1, Ordering::Relaxed);
         return BodyRoot { root: tree.root, frame: true, indexed: tree.indexed, hashed: tree.hashed };
@@ -1111,6 +1203,45 @@ mod duplicate_tests {
         assert!(!body_has_duplicate(&big));
         big.push(big[17]);
         assert!(body_has_duplicate(&big));
+    }
+
+    /// The description path's check: a repeated leaf or a duplicate inside a
+    /// hashed frame is caught; a known frame's inside is not read.
+    #[test]
+    fn a_repeated_frame_or_a_duplicate_in_a_hashed_frame_is_ambiguous() {
+        let h: Vec<B256> = (0..9u8).map(|i| B256::repeat_byte(0x60 + i)).collect();
+        let f = |r: std::ops::Range<usize>| n42_tx_types::frame_root(&h[r]);
+        // Honest: three frames of three, the last hashed.
+        let body = h.clone();
+        let counts = [3usize, 3, 3];
+        let known = [Some(f(0..3)), Some(f(3..6)), None];
+        let (tree, leaves) = frame_tree_leaves_known(&counts, &known, 9, |i| body[i]).expect("covers");
+        assert!(!frame_body_ambiguous(&counts, &known, &leaves, |i| body[i]));
+        // The third frame named twice: the same root, refused.
+        let forged: Vec<B256> = h.iter().chain(&h[6..9]).copied().collect();
+        let counts4 = [3usize, 3, 3, 3];
+        let known4 = [Some(f(0..3)), Some(f(3..6)), Some(f(6..9)), Some(f(6..9))];
+        let (tree4, leaves4) = frame_tree_leaves_known(&counts4, &known4, 12, |i| forged[i]).expect("covers");
+        assert_eq!(tree4.root, tree.root, "the collision");
+        assert!(frame_body_ambiguous(&counts4, &known4, &leaves4, |i| forged[i]));
+        // A hashed last frame with its last transaction repeated.
+        let tail: Vec<B256> = h.iter().copied().chain(std::iter::once(h[8])).collect();
+        let counts_t = [3usize, 3, 4];
+        let known_t = [Some(f(0..3)), Some(f(3..6)), None];
+        let (tree_t, leaves_t) = frame_tree_leaves_known(&counts_t, &known_t, 10, |i| tail[i]).expect("covers");
+        assert_eq!(tree_t.root, tree.root, "the collision inside a frame");
+        assert!(frame_body_ambiguous(&counts_t, &known_t, &leaves_t, |i| tail[i]));
+    }
+
+    /// A body checked once (by its root and length) is not checked again by
+    /// the whole-body path; a longer body under the same root still is.
+    #[test]
+    fn a_body_noted_distinct_is_not_checked_again_but_a_longer_one_is() {
+        let honest: Vec<B256> = (0..3u8).map(|i| B256::repeat_byte(0x71 + i)).collect();
+        let root = root_of_hashes(&honest, &[3]).expect("one frame");
+        note_distinct_body(root, 3);
+        assert!(known_distinct_body(root, 3));
+        assert!(!known_distinct_body(root, 4));
     }
 }
 

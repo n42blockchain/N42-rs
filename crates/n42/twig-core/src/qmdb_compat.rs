@@ -1408,6 +1408,10 @@ pub enum QmdbUndoError {
     /// The entry file could not be shortened.
     #[error("QMDB entry store: {0}")]
     Store(String),
+    /// An evicted boundary twig could not be brought back before the undo
+    /// began: nothing was changed, the tree is as it was.
+    #[error("QMDB undo could not hydrate a twig before reverting: {0}")]
+    Hydrate(String),
     /// A revived slot's entry disagrees with the record — the record does not
     /// belong to this tree's history.
     #[error("undo entry for slot {slot} does not match the tree's entry")]
@@ -2041,7 +2045,7 @@ impl QmdbCompatTree {
             ((prev - 1) as usize) / TWIG_SIZE + 1
         };
         if prev < self.next_slot && !(prev as usize).is_multiple_of(TWIG_SIZE) {
-            self.hydrate(prev as usize / TWIG_SIZE).map_err(QmdbUndoError::Store)?;
+            self.hydrate(prev as usize / TWIG_SIZE).map_err(QmdbUndoError::Hydrate)?;
         }
 
         // 1. Truncate the block's appends: drop their index mappings, and in

@@ -757,8 +757,9 @@ impl QmdbForest {
         err
     }
 
-    /// An undo that failed: a refusal (the record does not match the tree)
-    /// leaves the tree unchanged, but a failure once it began truncating
+    /// An undo that failed: a refusal (the record does not match the tree,
+    /// or a twig could not be hydrated before the undo began) leaves the
+    /// tree unchanged, but a failure once it began truncating (`Store`)
     /// leaves it half reverted, which poisons the forest.
     fn undo_failed(&mut self, what: &str, err: n42_twig_core::qmdb_compat::QmdbUndoError) -> StateError {
         if matches!(err, n42_twig_core::qmdb_compat::QmdbUndoError::Store(_)) {

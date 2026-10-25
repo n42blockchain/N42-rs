@@ -442,6 +442,11 @@ pub struct QmdbForest {
     /// The twig leaf trees a deferred trim evicted on [`Self::return_tree`],
     /// for the caller to free off its lock ([`Self::take_deferred_release`]).
     deferred_twigs: Vec<TwigNodes>,
+    /// Why the forest is unusable, once it is ([`Self::poison`]): a failed
+    /// mutation left the tree somewhere other than `tip`, so every call that
+    /// computes a root, files a block, moves the tree or persists it refuses
+    /// with [`StateError::Poisoned`] from then on.
+    poisoned: Option<String>,
 }
 
 /// The shared tree, taken out of the forest so a block's root is computed
@@ -700,9 +705,66 @@ impl QmdbForest {
         Ok(handle)
     }
 
-    /// Refuses a call that needs the tree while it is leased out.
-    const fn refuse_leased(&self) -> Result<(), StateError> {
+    /// Refuses a call that needs the tree while it is leased out, or at all
+    /// once the forest is poisoned ([`Self::poison`]).
+    fn refuse_leased(&self) -> Result<(), StateError> {
+        self.refuse_poisoned()?;
         if self.leased_at.is_some() { Err(StateError::TreeLeased) } else { Ok(()) }
+    }
+
+    /// Refuses every call once the forest is poisoned ([`Self::poison`]).
+    fn refuse_poisoned(&self) -> Result<(), StateError> {
+        match &self.poisoned {
+            Some(reason) => Err(StateError::Poisoned(reason.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Marks the forest unusable: the tree may no longer stand at `tip`, so
+    /// no root is computed on it again (fail-stop; a restart rebuilds the
+    /// tree from the checkpoint and the log). The first reason is kept and
+    /// logged at error level with the block the tree was believed to stand
+    /// at; later ones are ignored.
+    pub fn poison(&mut self, reason: impl Into<String>) {
+        if self.poisoned.is_some() {
+            return;
+        }
+        let reason = reason.into();
+        tracing::error!(
+            target: "n42.qmdb",
+            %reason,
+            tip = %self.tip,
+            head_number = self.head.0,
+            head = %self.head.1,
+            pending_parent = ?self.pending.as_ref().map(|(parent, _)| *parent),
+            "QMDB forest poisoned: no further state roots will be computed; restart the node to rebuild the tree"
+        );
+        self.poisoned = Some(reason);
+    }
+
+    /// Why the forest is poisoned, if it is ([`Self::poison`]).
+    pub fn poisoned(&self) -> Option<&str> {
+        self.poisoned.as_deref()
+    }
+
+    /// Poisons the forest when `err` may have left the tree half mutated
+    /// ([`StateError::may_have_mutated`]), naming `what` failed; returns
+    /// the error for the caller to propagate.
+    fn poison_if_mutated(&mut self, what: &str, err: StateError) -> StateError {
+        if err.may_have_mutated() && !matches!(err, StateError::Poisoned(_)) {
+            self.poison(format!("{what}: {err}"));
+        }
+        err
+    }
+
+    /// An undo that failed: a refusal (the record does not match the tree)
+    /// leaves the tree unchanged, but a failure once it began truncating
+    /// leaves it half reverted, which poisons the forest.
+    fn undo_failed(&mut self, what: &str, err: n42_twig_core::qmdb_compat::QmdbUndoError) -> StateError {
+        if matches!(err, n42_twig_core::qmdb_compat::QmdbUndoError::Store(_)) {
+            self.poison(format!("{what}: undo failed part way: {err}"));
+        }
+        StateError::Undo(err.to_string())
     }
 
     /// Whether the tree is leased out ([`Self::lease_tree`]).
@@ -743,10 +805,15 @@ impl QmdbForest {
         let computed = match computed {
             Ok(computed) => computed,
             Err(err) => {
+                // The apply ran on the leased tree and gave no undo: an error
+                // after it began writing leaves the tree part way into the
+                // block while `tip` still names the parent.
+                let err = self.poison_if_mutated(&format!("leased apply on parent {}", lease.parent), err);
                 self.apply_deferred_trim();
                 return Err(err);
             }
         };
+        self.refuse_poisoned()?;
         self.last_compute = (lease.move_us, computed.phases);
         let noted_at = std::time::Instant::now();
         self.note_move(&computed.undo);
@@ -834,6 +901,7 @@ impl QmdbForest {
             flushed_slots: 0,
             trim_due: false,
             deferred_twigs: Vec::new(),
+            poisoned: None,
         }
     }
 
@@ -1092,7 +1160,10 @@ impl QmdbForest {
         let mut ops = changes.ops();
         ops.sort();
         // Applied from the arena the record keeps: no clone of the block.
-        let (root, undo) = self.tree.apply_ops_recorded(&ops)?;
+        let (root, undo) = match self.tree.apply_ops_recorded(&ops) {
+            Ok(applied) => applied,
+            Err(err) => return Err(self.poison_if_mutated(&format!("apply on parent {parent}"), err.into())),
+        };
         self.note_move(&undo);
         let delta = self.delta_of_applied(&undo);
         self.pending = Some((parent, undo));
@@ -1123,7 +1194,10 @@ impl QmdbForest {
         }
         // Applied from the arena the record keeps: no clone of the block.
         let applied_at = std::time::Instant::now();
-        let (root, undo, phases) = self.tree.apply_ops_recorded_phased(&ops)?;
+        let (root, undo, phases) = match self.tree.apply_ops_recorded_phased(&ops) {
+            Ok(applied) => applied,
+            Err(err) => return Err(self.poison_if_mutated(&format!("apply on parent {parent}"), err.into())),
+        };
         let apply_us = applied_at.elapsed().as_micros() as u64;
         self.last_compute = (move_us, phases);
         let noted_at = std::time::Instant::now();
@@ -1164,6 +1238,11 @@ impl QmdbForest {
     /// difference by standing the tree at the head instead. Nothing is taken
     /// unless the whole chain qualifies.
     pub fn take_block_deltas(&mut self, persisted_head: B256, persisted_next_slot: u64, block: B256) -> Option<Vec<ForestDelta>> {
+        // A poisoned forest persists nothing; the fallback stands the tree
+        // at the head, which refuses.
+        if self.poisoned.is_some() {
+            return None;
+        }
         let mut chain = Vec::new();
         let mut current = block;
         while current != persisted_head {
@@ -1194,6 +1273,7 @@ impl QmdbForest {
     /// a producer twice — once when it builds it, once when its own execution
     /// layer validates it — and both arrive at the same root.
     pub fn insert(&mut self, block_hash: B256, number: u64, prepared: PreparedBlock) -> Result<(), StateError> {
+        self.refuse_poisoned()?;
         if self.records.contains_key(&block_hash) {
             return Ok(());
         }
@@ -1201,8 +1281,13 @@ impl QmdbForest {
         // applied rather than reverting and replaying it.
         let undo = match self.pending.take() {
             Some((parent, undo)) if parent == prepared.parent => Some(undo),
-            Some((_, undo)) => {
-                self.tree.apply_undo(&undo).map_err(|e| StateError::Undo(e.to_string()))?;
+            Some((parent, undo)) => {
+                if let Err(err) = self.tree.apply_undo(&undo) {
+                    let err = self.undo_failed(&format!("reverting the pending block on {parent}"), err);
+                    // A refused undo left the tree as it was: still pending.
+                    self.pending = Some((parent, undo));
+                    return Err(err);
+                }
                 self.note_move(&undo);
                 None
             }
@@ -1315,6 +1400,7 @@ impl QmdbForest {
     /// still held. Nothing moves the tree, so the entry file is never
     /// truncated and the read view's cut count is untouched.
     pub fn set_canonical_in_place(&mut self, block_hash: B256) -> Result<Option<Released>, StateError> {
+        self.refuse_poisoned()?;
         let number = self
             .records
             .get(&block_hash)
@@ -2368,5 +2454,78 @@ mod tests {
             }
             parent = hash;
         }
+    }
+
+    /// A block of `n` fresh accounts tagged `tag`.
+    fn accounts(tag: u8, n: u64) -> BlockChanges {
+        let mut c = BlockChanges::new();
+        for i in 0..n {
+            c.set_account(
+                Address::from_word(B256::from(U256::from(i + 1 + 1000 * tag as u64))),
+                AccountState { nonce: tag as u64, balance: U256::from(i), code_hash: B256::ZERO },
+            );
+        }
+        c
+    }
+
+    /// A forest at block 1 over an entry file in a fresh directory.
+    fn entry_file_forest(name: &str) -> (std::path::PathBuf, std::path::PathBuf, QmdbForest) {
+        let dir = std::env::temp_dir().join(format!("n42-forest-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("entries.log");
+        let mut forest = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap().with_entry_file(&path).unwrap();
+        forest.apply(GENESIS, h(1), 1, &accounts(1, 8)).unwrap();
+        (dir, path, forest)
+    }
+
+    /// An entry-file write that fails part way through a block's apply
+    /// leaves the tree part way into the block; the forest is poisoned, and
+    /// the next root on the same parent is refused rather than computed on
+    /// the half-applied tree.
+    #[test]
+    fn a_failed_write_part_way_through_an_apply_poisons_the_forest() {
+        let (dir, path, mut forest) = entry_file_forest("poison-apply");
+        n42_twig_core::entry_store::failpoints::fail_next_append(&path, 3);
+        let err = forest.compute_operations(h(1), accounts(2, 8).ops()).unwrap_err();
+        assert!(err.may_have_mutated(), "{err}");
+        assert!(forest.poisoned().is_some());
+        let again = forest.compute_operations(h(1), accounts(2, 8).ops());
+        assert!(matches!(again, Err(StateError::Poisoned(_))), "{again:?}");
+        assert!(matches!(forest.compute(h(1), &changes(5)), Err(StateError::Poisoned(_))));
+        assert!(matches!(forest.set_canonical(h(1)), Err(StateError::Poisoned(_))));
+        assert!(matches!(forest.checkpoint(), Err(StateError::Poisoned(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same on a leased tree: the failed computation is handed back with
+    /// the tree, and the forest refuses the next lease.
+    #[test]
+    fn a_failed_write_on_a_leased_tree_poisons_the_forest() {
+        let (dir, path, mut forest) = entry_file_forest("poison-lease");
+        let mut lease = forest.lease_tree(h(1)).unwrap();
+        n42_twig_core::entry_store::failpoints::fail_next_append(&path, 2);
+        let computed = lease.compute(accounts(2, 8).ops());
+        assert!(computed.is_err());
+        assert!(forest.return_tree(lease, computed).is_err());
+        assert!(forest.poisoned().is_some());
+        assert!(matches!(forest.lease_tree(h(1)), Err(StateError::Poisoned(_))));
+        assert!(matches!(forest.compute_operations(h(1), accounts(2, 8).ops()), Err(StateError::Poisoned(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refusal that mutates nothing (a computation that never ran) does
+    /// not poison: the forest computes the same root as before.
+    #[test]
+    fn a_refused_computation_does_not_poison_the_forest() {
+        let (dir, _path, mut forest) = entry_file_forest("poison-refused");
+        let lease = forest.lease_tree(h(1)).unwrap();
+        assert!(forest.return_tree(lease, Err(StateError::TreeLeased)).is_err());
+        assert!(forest.poisoned().is_none());
+        let root = forest.compute_operations(h(1), accounts(2, 8).ops()).unwrap().root;
+        let mut fresh = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap();
+        fresh.apply(GENESIS, h(1), 1, &accounts(1, 8)).unwrap();
+        assert_eq!(fresh.compute_operations(h(1), accounts(2, 8).ops()).unwrap().root, root);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

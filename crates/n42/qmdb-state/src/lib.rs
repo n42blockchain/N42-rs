@@ -300,6 +300,27 @@ pub enum StateError {
     /// A delta named a slot the tree does not have.
     #[error("QMDB delta names slot {0}, which the tree does not hold")]
     DeltaSlot(u64),
+    /// The forest is unusable: an apply or an undo failed after it may have
+    /// mutated the tree, or a panic interrupted one, so the tree no longer
+    /// stands where the forest believes it does. Every root it computed from
+    /// here on could be wrong, so it computes none; the node has to stop and
+    /// rebuild its state from the checkpoint and the log on restart.
+    #[error("QMDB forest is poisoned and computes no roots: {0}")]
+    Poisoned(String),
+}
+
+impl StateError {
+    /// Whether the failure may have left the tree part way through a
+    /// mutation: an entry-store or index write that failed after the apply
+    /// began writing, or an undo that failed after it began truncating. A
+    /// refusal (a duplicate key, an undo that does not match the tree) leaves
+    /// the tree as it was.
+    pub const fn may_have_mutated(&self) -> bool {
+        matches!(
+            self,
+            Self::Duplicate(QmdbOperationError::Store(_)) | Self::Poisoned(_)
+        )
+    }
 }
 
 /// A point the tree can be rolled back to.

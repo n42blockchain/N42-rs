@@ -20,6 +20,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
+# A failed entry-file write part way through a block's apply (the poisoning tests).
+n42-twig-core = { workspace = true, features = ["rayon", "failpoints"] }
 serde_json = { workspace = true, features = ["std"] }
 
 [lints]

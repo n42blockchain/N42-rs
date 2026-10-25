@@ -19,6 +19,36 @@ use std::{
 
 use crate::Hash;
 
+/// Fault injection for the entry file's appends (feature `failpoints`, for
+/// tests of callers that must survive a failed write): an armed path's next
+/// batch append copies its first `keep` records and then fails as a failed
+/// seal does, leaving the store part way into the batch.
+#[cfg(feature = "failpoints")]
+pub mod failpoints {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static ARMED: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+
+    /// Arms the entry file at `path`: its next batch append keeps `keep`
+    /// records and fails.
+    pub fn fail_next_append(path: &Path, keep: usize) {
+        ARMED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((path.to_path_buf(), keep));
+    }
+
+    /// Disarms and returns the failure armed for `path`, if any.
+    pub(crate) fn take(path: &Path) -> Option<usize> {
+        let mut armed = ARMED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = armed.iter().position(|(armed, _)| armed == path)?;
+        Some(armed.swap_remove(at).1)
+    }
+
+    /// The error an armed append fails with.
+    pub(crate) fn injected() -> std::io::Error {
+        std::io::Error::other("injected entry-file seal failure (failpoints)")
+    }
+}
+
 /// One entry, as the heap store keeps it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Entry {
@@ -859,7 +889,14 @@ impl Entries {
                 faults.entries += crate::prefault::thread_faults().saturating_sub(at);
                 Ok(())
             }
-            Self::File(file) => file.push_batch(records, faults),
+            Self::File(file) => {
+                #[cfg(feature = "failpoints")]
+                if let Some(keep) = failpoints::take(&file.path) {
+                    file.push_batch(records.take(keep), faults)?;
+                    return Err(failpoints::injected());
+                }
+                file.push_batch(records, faults)
+            }
         }
     }
 
@@ -881,7 +918,14 @@ impl Entries {
                 }));
                 Ok(())
             }
-            Self::File(file) => file.push_batch_parallel(count, record),
+            Self::File(file) => {
+                #[cfg(feature = "failpoints")]
+                if let Some(keep) = failpoints::take(&file.path) {
+                    file.push_batch_parallel(count.min(keep), record)?;
+                    return Err(failpoints::injected());
+                }
+                file.push_batch_parallel(count, record)
+            }
         }
     }
 

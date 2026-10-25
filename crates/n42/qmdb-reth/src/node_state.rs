@@ -469,7 +469,13 @@ pub enum NodeStateError {
     },
     /// The trees themselves refused an operation.
     #[error(transparent)]
-    State(#[from] StateError),
+    State(StateError),
+    /// The forest is unusable ([`QmdbForest::poison`]): a failed or panicked
+    /// mutation left the tree where the forest does not believe it stands,
+    /// so no state root is computed again. Fail-stop: restart the node,
+    /// which rebuilds the tree from the checkpoint and the log.
+    #[error("QMDB forest is poisoned and computes no roots: {0}")]
+    Poisoned(String),
     /// The snapshot file could not be read or written.
     #[error("QMDB snapshot at {path}: {source}")]
     Io {
@@ -489,6 +495,32 @@ pub enum NodeStateError {
     /// The execution frontier required by a deferred checkpoint is unavailable or corrupt.
     #[error("QMDB deferred recovery: {0}")]
     RecoveryFrontier(String),
+}
+
+impl From<StateError> for NodeStateError {
+    fn from(err: StateError) -> Self {
+        match err {
+            StateError::Poisoned(reason) => Self::Poisoned(reason),
+            err => Self::State(err),
+        }
+    }
+}
+
+/// Recovers the forest's guard from a poisoned lock and poisons the forest
+/// itself: a panic while the lock was held interrupted whatever held it --
+/// an apply, an undo, a move -- part way, so the tree no longer stands
+/// where the forest believes it does. Only the forest's lock is treated
+/// this way; the side locks (metrics, holder labels, rename queue) recover
+/// with `into_inner` as before.
+fn poisoned_forest_guard<'a>(
+    poisoned: std::sync::PoisonError<MutexGuard<'a, Option<QmdbForest>>>,
+    label: &'static str,
+) -> MutexGuard<'a, Option<QmdbForest>> {
+    let mut guard = poisoned.into_inner();
+    if let Some(forest) = guard.as_mut() {
+        forest.poison(format!("the forest lock was poisoned by a panic under it (found by {label})"));
+    }
+    guard
 }
 
 struct Inner {
@@ -1455,10 +1487,10 @@ impl QmdbNodeState {
         let asked = std::time::Instant::now();
         let (guard, held_by) = match self.inner.forest.try_lock() {
             Ok(guard) => (guard, ""),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => (poisoned.into_inner(), ""),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => (poisoned_forest_guard(poisoned, label), ""),
             Err(std::sync::TryLockError::WouldBlock) => {
                 let held_by = *self.inner.forest_holder.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                (self.inner.forest.lock().unwrap_or_else(std::sync::PoisonError::into_inner), held_by)
+                (self.inner.forest.lock().unwrap_or_else(|poisoned| poisoned_forest_guard(poisoned, label)), held_by)
             }
         };
         let (guard, held_by) = self.wait_for_tree(guard, label, held_by);
@@ -1480,7 +1512,7 @@ impl QmdbNodeState {
             return (guard, held_by);
         }
         self.inner.tree_waits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let guard = self.inner.tree_back.wait_while(guard, leased).unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = self.inner.tree_back.wait_while(guard, leased).unwrap_or_else(|poisoned| poisoned_forest_guard(poisoned, label));
         (guard, "tree_lease")
     }
 
@@ -1546,7 +1578,7 @@ impl QmdbNodeState {
         let asked = std::time::Instant::now();
         let guard = match self.inner.forest.try_lock() {
             Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned_forest_guard(poisoned, "rename"),
             Err(std::sync::TryLockError::WouldBlock) => {
                 let mut pending = self.inner.pending_renames.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 pending.push(PendingRename { from, alternate, to, queued_at: asked });
@@ -1672,6 +1704,10 @@ impl QmdbNodeState {
             Ok(computed) => computed,
             Err(panic) => {
                 let _ = forest.return_tree(lease, Err(StateError::TreeLeased));
+                // The apply panicked part way into the block on the leased
+                // tree, which is back with `tip` still naming the parent:
+                // nothing computed on it again could be trusted.
+                forest.poison(format!("a panic during the leased root computation on parent {parent} ({label})"));
                 self.inner.tree_back.notify_all();
                 let trimmed = forest.take_deferred_release();
                 drop(guard);

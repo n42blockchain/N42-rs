@@ -279,7 +279,7 @@ fn main() {
                         // the database's. Lagging is tolerable — only the tip matters,
                         // and every tree in between was filed at validation.
                         // `on_canonical` is synchronous QMDB work, so the loop runs on
-                        // the blocking pool with a blocking receiver rather than on a
+                        // a thread of its own with a blocking receiver rather than on a
                         // tokio worker; one receiver, so the order is kept.
                         let mut canonical = node.provider.subscribe_to_canonical_state();
                         let follower = qmdb.clone();
@@ -301,7 +301,12 @@ fn main() {
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
                         };
-                        tokio::task::spawn_blocking(follow);
+                        // A plain thread, not the runtime's blocking pool: a task
+                        // there that never ends would hold up the runtime's shutdown.
+                        std::thread::Builder::new()
+                            .name("n42-qmdb-follow".into())
+                            .spawn(follow)
+                            .map_err(|err| eyre::eyre!("no thread for the QMDB head follower: {err}"))?;
                     }
                     Ok(())
                 })

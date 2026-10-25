@@ -764,7 +764,7 @@ async fn a_range_reply_is_queued_and_a_refusal_is_handed_on_only_to_the_running_
     assert!(rig.svc.pending_imports.is_empty());
 
     // With this peer's catch-up running it becomes an empty reply for the import loop.
-    rig.svc.catch_up = Some(CatchUp { peer, next: 4, target: 20, started_at: 3, probing: false });
+    rig.svc.catch_up = Some(CatchUp { peer, next: 4, target: 20, started_at: 3, probing: false, probe_height: 0 });
     rig.svc
         .handle_transport_event(TransportEvent::RangeFetched { peer, request, reply: Err("nope".into()) })
         .expect("ok");

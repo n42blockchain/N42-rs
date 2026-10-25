@@ -560,8 +560,14 @@ struct CatchUp {
     started_at: u64,
     /// The target from the peer's status is reached; the pull now probes
     /// past it, a window at a time, for what the fleet produced meanwhile.
-    /// The peer's first short reply is the end of its chain.
+    /// It ends on an empty reply, or on a short one that reaches
+    /// `probe_height`.
     probing: bool,
+    /// The height the peer was known at when the probe started: a short
+    /// reply that reaches it is the end of the probe, so a chain that grows
+    /// within one round trip cannot keep a probe going for ever. Zero until
+    /// probing.
+    probe_height: u64,
 }
 
 /// How many block requests may wait for the execution layer at once, and
@@ -587,10 +593,12 @@ const MAX_FILL_SERVES_PER_PEER: usize = 16;
 /// The same for all peers together.
 const MAX_FILL_SERVES_IN_FLIGHT: usize = 64;
 
-/// The most blocks one range reply carries, whatever was asked (gov5 asks
-/// for up to 1,024). The asker reads a shorter reply as a shorter window
-/// and asks again from where it got to.
-const MAX_SERVED_RANGE_BLOCKS: u64 = 32;
+/// The most blocks one range reply carries: gov5's 1,024, so a gov5 member
+/// catching up from this node on a small-block chain is not slowed. The
+/// reply is capped by bytes first ([`n42_h2_net::MAX_RANGE_REPLY_BYTES`]);
+/// the asker reads a shorter reply as a shorter window and asks again from
+/// where it got to.
+const MAX_SERVED_RANGE_BLOCKS: u64 = MAX_RANGE_BLOCKS;
 
 /// Requests being served off the loop, counted per peer and in total
 /// against a per-peer and a total cap. Shared with the serving tasks: a
@@ -3996,6 +4004,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             target: height,
             started_at: latest,
             probing: false,
+            probe_height: 0,
         });
         self.request_next_range();
         events.push(ServiceEvent::Syncing {
@@ -4093,6 +4102,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     }
                 }
             }
+            let known_height = self.peer_heights.get(&peer).copied();
             let Some(catch_up) = self.catch_up.as_mut() else {
                 continue;
             };
@@ -4115,16 +4125,23 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // The status's target is reached, or a probe window came back
                 // full: the fleet kept producing while this pull ran, and a
                 // gap of a whole window is not one gossip's future queue
-                // closes. Probe on until the peer serves nothing.
-                catch_up.probing = true;
+                // closes. Probe on until the peer serves nothing, or serves
+                // short at the height it was known at when the probe began.
+                if !catch_up.probing {
+                    catch_up.probing = true;
+                    catch_up.probe_height = known_height.unwrap_or(0).max(catch_up.next - 1);
+                }
                 catch_up.target = catch_up.next + MAX_RANGE_BLOCKS - 1;
                 self.request_next_range();
+            } else if catch_up.probing && catch_up.next - 1 >= catch_up.probe_height {
+                // Short, and at the height the peer was known at when the
+                // probe began: the rest is what the fleet made since, which
+                // gossip carries.
+                self.finish_catch_up(events, true);
             } else {
-                // Short of the window. A server caps a reply by blocks and
-                // by bytes (this node at 32 blocks and 64 MB), so a short
-                // reply is not the peer's head: ask on from where it got
-                // to. The head is the reply that serves nothing, which ends
-                // a probe as complete (above).
+                // Short of the window. A server caps a reply by bytes (this
+                // node at 128 MB) and by blocks, so a short reply is not
+                // the peer's head by itself: ask on from where it got to.
                 self.request_next_range();
             }
         }

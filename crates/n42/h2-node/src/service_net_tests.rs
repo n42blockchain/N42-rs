@@ -29,7 +29,7 @@ fn chunks(blocks: &[(B256, Header, alloy_primitives::Bytes)]) -> Vec<BlockChunk>
 }
 
 fn catching_up(rig: &mut Rig, peer: PeerId, next: u64, target: u64) {
-    rig.svc.catch_up = Some(CatchUp { peer, next, target, started_at: next - 1, probing: false });
+    rig.svc.catch_up = Some(CatchUp { peer, next, target, started_at: next - 1, probing: false, probe_height: 0 });
 }
 
 async fn import(rig: &mut Rig) -> Vec<ServiceEvent> {
@@ -257,10 +257,32 @@ async fn a_pull_stops_and_blames_the_peer_when_its_reply_is_unusable() {
 }
 
 #[tokio::test]
+async fn a_short_probe_reply_ends_the_pull_only_at_the_height_the_probe_began_at() {
+    for (probe_height, ends) in [(2u64, true), (5, false)] {
+        let mut rig = node(1, 0, None).await;
+        let peer = PeerId::random();
+        let blocks = chain(2);
+        rig.svc.catch_up =
+            Some(CatchUp { peer, next: 1, target: 1024, started_at: 0, probing: true, probe_height });
+        rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 1024, step: 1 }, chunks(&blocks)));
+        let events = import(&mut rig).await;
+        if ends {
+            assert_eq!(events, vec![ServiceEvent::Synced { height: 2, complete: true }]);
+            assert!(rig.svc.catch_up.is_none());
+        } else {
+            // Short of the window but below the probe's height: a server's
+            // byte cap, not the peer's head. The pull asks on.
+            assert!(events.is_empty());
+            assert_eq!(rig.svc.catch_up.as_ref().map(|c| c.next), Some(3));
+        }
+    }
+}
+
+#[tokio::test]
 async fn an_empty_probe_ends_a_pull_that_already_made_progress() {
     let mut rig = node(1, 0, None).await;
     let peer = PeerId::random();
-    rig.svc.catch_up = Some(CatchUp { peer, next: 11, target: 1034, started_at: 4, probing: true });
+    rig.svc.catch_up = Some(CatchUp { peer, next: 11, target: 1034, started_at: 4, probing: true, probe_height: 0 });
     rig.svc.pending_imports.push((peer, RangeRequest { start: 11, count: 1024, step: 1 }, Vec::new()));
     assert_eq!(import(&mut rig).await, vec![ServiceEvent::Synced { height: 10, complete: true }]);
 }
@@ -577,7 +599,7 @@ async fn a_block_asked_for_by_hash_is_served_from_the_store_or_the_execution_lay
 }
 
 #[tokio::test]
-async fn a_range_is_served_off_the_loop_and_a_peer_past_its_share_is_refused() {
+async fn a_range_is_served_off_the_loop_and_its_slots_free_before_the_answer_goes_out() {
     let (mut a, mut b) = pair(0).await;
     let mut parent = B256::ZERO;
     for number in 1..=3 {

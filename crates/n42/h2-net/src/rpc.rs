@@ -877,8 +877,9 @@ pub const MAX_RANGE_BLOCKS: u64 = 1024;
 pub const MAX_RANGE_READ_BYTES: usize = 128 << 20;
 
 /// The most bytes of block RLP this node serves in one range reply (at
-/// least one block is always served).
-pub const MAX_RANGE_REPLY_BYTES: usize = 64 << 20;
+/// least one block is always served). No more than [`MAX_RANGE_READ_BYTES`],
+/// so a reply this node serves is read whole by another.
+pub const MAX_RANGE_REPLY_BYTES: usize = MAX_RANGE_READ_BYTES;
 
 /// A range of blocks by number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

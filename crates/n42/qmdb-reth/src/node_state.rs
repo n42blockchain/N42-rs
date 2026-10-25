@@ -282,6 +282,10 @@ pub struct OfflockCounters {
     /// their persistence left to the catch-up thread (and, during a lease,
     /// their trim to the lease's return).
     pub deferred_canonicals: u64,
+    /// Deferred renames (`N42_QMDB_RENAME_DEFER`) that failed when the next
+    /// holder of the forest applied them: the caller had already been told
+    /// [`RenameOutcome::Deferred`].
+    pub failed_renames: u64,
 }
 
 /// Why a persistence call stops following the database.
@@ -631,6 +635,16 @@ struct Inner {
     /// How many renames are queued, so a lock taker skips the queue's mutex
     /// when there are none.
     pending_rename_count: std::sync::atomic::AtomicUsize,
+    /// Deferred renames that failed while their sealed hash was not filed,
+    /// kept (at most [`RENAME_ALIASES_KEPT`]) as `from -> to` aliases and
+    /// tried again when the next renames are drained and when a root lookup
+    /// misses ([`QmdbNodeState::root_of`]), so a block filed under `from`
+    /// after its rename was queued still resolves under the sealed hash.
+    rename_aliases: Mutex<Vec<PendingRename>>,
+    /// How many aliases are kept, so a lookup skips their mutex when none are.
+    rename_alias_count: std::sync::atomic::AtomicUsize,
+    /// Deferred renames that failed when they were drained.
+    failed_renames: std::sync::atomic::AtomicU64,
     /// The last roots' splits, by key ([`QmdbNodeState::take_root_split`]).
     root_splits: Mutex<std::collections::VecDeque<(B256, RootSplit)>>,
     chain: Arc<ChainSpec>,
@@ -747,6 +761,10 @@ pub const FOREST_LOCK_WARN_MS: u64 = 20;
 
 /// How many roots' splits [`QmdbNodeState::take_root_split`] can still find.
 const ROOT_SPLITS_KEPT: usize = 32;
+
+/// How many failed deferred renames are kept as aliases; past this the
+/// oldest is dropped.
+const RENAME_ALIASES_KEPT: usize = 64;
 
 /// The forest's lock, taken for a label ([`QmdbNodeState::lock_as`]); a
 /// hold over [`FOREST_LOCK_WARN_MS`] is logged when it is dropped.
@@ -1035,6 +1053,9 @@ impl QmdbNodeState {
                 forest_holder: Mutex::new(""),
                 pending_renames: Mutex::new(Vec::new()),
                 pending_rename_count: std::sync::atomic::AtomicUsize::new(0),
+                rename_aliases: Mutex::new(Vec::new()),
+                rename_alias_count: std::sync::atomic::AtomicUsize::new(0),
+                failed_renames: std::sync::atomic::AtomicU64::new(0),
                 root_splits: Mutex::new(std::collections::VecDeque::new()),
                 chain,
                 dir: dir.into(),
@@ -1467,6 +1488,7 @@ impl QmdbNodeState {
                 holds: inner.persist_holds.load(Relaxed),
             },
             deferred_canonicals: inner.deferred_canonicals.load(Relaxed),
+            failed_renames: inner.failed_renames.load(Relaxed),
         }
     }
 
@@ -1734,8 +1756,13 @@ impl QmdbNodeState {
     }
 
     /// Applies the queued renames in the order they were queued. A failure is
-    /// logged: the caller that queued it has already gone on.
+    /// counted ([`OfflockCounters::failed_renames`]) and logged: the caller
+    /// that queued it has already gone on. One whose sealed hash is not filed
+    /// is kept as an alias and tried again later (`Inner::rename_aliases`).
     fn drain_renames(&self, forest: &mut QmdbForest) {
+        if self.inner.rename_alias_count.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            self.retry_rename_aliases(forest);
+        }
         let queued = {
             let mut pending = self.inner.pending_renames.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             self.inner.pending_rename_count.store(0, std::sync::atomic::Ordering::Release);
@@ -1745,13 +1772,53 @@ impl QmdbNodeState {
             let waited_ms = rename.queued_at.elapsed().as_millis() as u64;
             match apply_rename(forest, &rename) {
                 Ok(()) => debug!(target: "n42.qmdb", from = %rename.from, to = %rename.to, waited_ms, "deferred rename applied"),
-                Err(err) => warn!(
-                    target: "n42.qmdb",
-                    %err, from = %rename.from, alternate = ?rename.alternate, to = %rename.to, waited_ms,
-                    "deferred rename failed; the block is not filed under its sealed hash"
-                ),
+                Err(err) => {
+                    self.inner.failed_renames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // A sealed hash already filed (with another root) is not
+                    // aliased: the alias would name a block that is not it.
+                    let aliased = forest.root_of(&rename.to).is_none();
+                    warn!(
+                        target: "n42.qmdb",
+                        %err, from = %rename.from, alternate = ?rename.alternate, to = %rename.to, waited_ms, aliased,
+                        "deferred rename failed; the block is not filed under its sealed hash"
+                    );
+                    if aliased {
+                        self.keep_rename_alias(rename);
+                    }
+                }
             }
         }
+    }
+
+    /// Keeps a failed deferred rename as an alias, dropping the oldest past
+    /// [`RENAME_ALIASES_KEPT`].
+    fn keep_rename_alias(&self, rename: PendingRename) {
+        let mut aliases = self.inner.rename_aliases.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if aliases.len() >= RENAME_ALIASES_KEPT {
+            let dropped = aliases.remove(0);
+            debug!(target: "n42.qmdb", from = %dropped.from, to = %dropped.to, "dropped the oldest failed-rename alias");
+        }
+        aliases.push(rename);
+        self.inner.rename_alias_count.store(aliases.len(), std::sync::atomic::Ordering::Release);
+    }
+
+    /// Tries the kept aliases again: one whose sealed hash is now filed (by
+    /// this rename or by another caller) is dropped, the rest are kept.
+    fn retry_rename_aliases(&self, forest: &mut QmdbForest) {
+        let mut aliases = self.inner.rename_aliases.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        aliases.retain(|rename| {
+            if forest.root_of(&rename.to).is_some() {
+                return false;
+            }
+            match apply_rename(forest, rename) {
+                Ok(()) => {
+                    debug!(target: "n42.qmdb", from = %rename.from, to = %rename.to, "failed deferred rename applied on retry");
+                    false
+                }
+                Err(_) => true,
+            }
+        });
+        self.inner.rename_alias_count.store(aliases.len(), std::sync::atomic::Ordering::Release);
     }
 
     /// [`Self::rename`] that does not wait behind another holder of the
@@ -2731,9 +2798,20 @@ impl QmdbNodeState {
         self.with_forest("rename", |forest| forest.rename(from, to))
     }
 
-    /// The root of a block the forest holds, if it does.
+    /// The root of a block the forest holds, if it does. A miss tries the
+    /// failed deferred renames kept as aliases first (`drain_renames`), so a
+    /// sealed hash whose rename failed resolves once its block is filed.
     pub fn root_of(&self, block_hash: &B256) -> Option<B256> {
-        self.lock_as("root_of").as_ref()?.root_of(block_hash)
+        let mut guard = self.lock_as("root_of");
+        let forest = guard.as_mut()?;
+        if let Some(root) = forest.root_of(block_hash) {
+            return Some(root);
+        }
+        if self.inner.rename_alias_count.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return None;
+        }
+        self.retry_rename_aliases(forest);
+        forest.root_of(block_hash)
     }
 
     /// The canonical head the forest stands at.
@@ -3888,6 +3966,35 @@ mod tests {
         assert_eq!(state.root_of(&resealed), Some(root));
         // A rename of a block never filed fails when applied now.
         assert!(state.rename_or_defer(B256::repeat_byte(0x98), None, B256::repeat_byte(0x97)).is_err());
+    }
+
+    /// A deferred rename whose `from` is not filed when it is drained (gone,
+    /// as a trimmed record is) is counted and kept as an alias; once a block
+    /// is filed under `from`, the sealed hash resolves through it.
+    #[test]
+    fn a_failed_deferred_rename_is_counted_and_kept_as_an_alias() {
+        let chain = qmdb_chain();
+        let state = QmdbNodeState::new(chain.clone(), scratch("rename-alias"));
+        let genesis_hash = chain.genesis_hash();
+        state.initialize((0, genesis_hash)).unwrap();
+        let built = B256::repeat_byte(0x31);
+        let sealed = B256::repeat_byte(0x32);
+        {
+            let _held = state.lock_as("test holder");
+            assert_eq!(state.rename_or_defer(built, None, sealed).unwrap(), RenameOutcome::Deferred);
+        }
+        // The next taker drains the queue: `built` is not filed, so it fails.
+        assert_eq!(state.root_of(&sealed), None);
+        assert_eq!(state.offlock_counters().failed_renames, 1);
+        assert_eq!(state.inner.rename_alias_count.load(std::sync::atomic::Ordering::Acquire), 1);
+
+        // The block shows up under `from`: the sealed hash now resolves.
+        let root = state.compute(genesis_hash, &BlockChanges::new()).unwrap().root;
+        state.validate_block(genesis_hash, built, 1, &BlockChanges::new(), root).unwrap();
+        assert_eq!(state.root_of(&sealed), Some(root));
+        assert_eq!(state.root_of(&built), None, "moved, not copied");
+        assert_eq!(state.inner.rename_alias_count.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(state.offlock_counters().failed_renames, 1);
     }
 
     #[test]

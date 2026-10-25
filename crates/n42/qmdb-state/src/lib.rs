@@ -318,7 +318,7 @@ impl StateError {
     pub const fn may_have_mutated(&self) -> bool {
         matches!(
             self,
-            Self::Duplicate(QmdbOperationError::Store(_)) | Self::Poisoned(_)
+            Self::Duplicate(QmdbOperationError::Store(_) | QmdbOperationError::Index(_)) | Self::Poisoned(_)
         )
     }
 }

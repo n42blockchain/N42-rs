@@ -389,7 +389,7 @@ impl QmdbReadView {
         let floor = live.iter().map(|(_, offset)| *offset).max().map_or(0, |offset| record_end(&file, offset));
         let changes: Vec<(Hash, Option<u64>)> = live.into_iter().map(|(key, offset)| (key, Some(offset))).collect();
         let index = SharedOffsetIndex::default();
-        index.apply_sorted(&changes, |offset| file.key(offset));
+        index.apply_sorted(&changes, |offset| file.key(offset)).map_err(|e| std::io::Error::other(e.to_string()))?;
         let versions =
             Versions { valid: true, head, head_floor: floor, journals: VecDeque::new(), pending: None, held_from: None };
         let frozen = versions.frozen();
@@ -589,9 +589,17 @@ impl QmdbReadView {
             // Every slot holds the journal before the index changes.
             self.publish(&versions);
         }
-        self.index.apply_sorted(changes, key_at);
+        let applied = self.index.apply_sorted(changes, key_at);
         let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
         versions.pending = None;
+        if let Err(err) = applied {
+            // Part of the block is in the index: the view cannot answer for
+            // it, and reads go to the database from here on.
+            warn!(target: "n42.qmdb", %err, number, "the QMDB read view's key index refused a block's changes");
+            Self::invalidate_locked(&mut versions, "the key index refused a block's changes");
+            self.publish(&versions);
+            return;
+        }
         let floor_before = versions.head_floor;
         versions.journals.push_back(Step { number, hash, journal, floor_before });
         versions.head = (number, hash);
@@ -661,7 +669,11 @@ impl QmdbReadView {
             for (key, before) in step.journal.iter() {
                 match before {
                     Some(offset) => {
-                        self.index.insert(*key, *offset, key_at);
+                        // A refusal leaves the view part way back: the
+                        // caller invalidates it.
+                        if self.index.insert(*key, *offset, key_at).is_err() {
+                            return false;
+                        }
                     }
                     None => {
                         self.index.remove(key, key_at);

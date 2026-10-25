@@ -109,6 +109,10 @@ pub enum QmdbOperationError {
     /// The entry file could not be written.
     #[error("QMDB entry store: {0}")]
     Store(String),
+    /// The key index refused the block's keys (a shard full) after the
+    /// apply began writing.
+    #[error("QMDB key index: {0}")]
+    Index(String),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -154,6 +158,9 @@ pub enum QmdbSnapshotError {
     /// The entry file could not be opened or read.
     #[error("QMDB entry file: {0}")]
     EntryFile(String),
+    /// The key index refused a key (a shard full).
+    #[error("QMDB key index: {0}")]
+    Index(String),
 }
 
 /// Cross-client QMDB bootstrap metadata plus its complete positional slot log.
@@ -1769,7 +1776,11 @@ impl QmdbCompatTree {
         };
         for slot in 0..n {
             if tree.entries.is_active(slot)
-                && tree.index.insert(tree.entries.key(slot), slot as u64, |s| tree.entries.key(s as usize)).is_some()
+                && tree
+                    .index
+                    .insert(tree.entries.key(slot), slot as u64, |s| tree.entries.key(s as usize))
+                    .map_err(|e| QmdbSnapshotError::Index(e.to_string()))?
+                    .is_some()
             {
                 return Err(QmdbSnapshotError::DuplicateActiveKey(tree.entries.key(slot)));
             }
@@ -1884,7 +1895,9 @@ impl QmdbCompatTree {
         // the block path (`apply_sorted_ops`) reports it, this one-at-a-time
         // path is the genesis, the tests and the vectors.
         self.entries.push(key, value).expect("the QMDB entry file could not be written");
-        self.index.insert(key, slot, |slot| self.entries.key(slot as usize));
+        // Past the index's limits (3.2 billion keys) only on a path that is
+        // never given that many: the block path reports it as an error.
+        self.index.insert(key, slot, |slot| self.entries.key(slot as usize)).expect("the QMDB key index is full");
     }
 
     /// Deactivate a key without erasing its frozen leaf.
@@ -2067,7 +2080,9 @@ impl QmdbCompatTree {
         };
         for (slot, key) in revived {
             self.entries.set_active(slot as usize, true);
-            self.index.insert(key, slot, |slot| self.entries.key(slot as usize));
+            // After the truncation: a refusal here leaves the tree half
+            // reverted, reported as a store failure (which poisons the forest).
+            self.index.insert(key, slot, |slot| self.entries.key(slot as usize)).map_err(|e| QmdbUndoError::Store(e.to_string()))?;
             let twig_id = (slot as usize) / TWIG_SIZE;
             let local = (slot as usize) % TWIG_SIZE;
             self.twigs[twig_id].bits[local / 8] |= 1 << (local % 8);
@@ -2451,10 +2466,10 @@ impl QmdbCompatTree {
             #[cfg(feature = "rayon")]
             {
                 let (index, twigs, dirty) = (&mut self.index, &mut self.twigs, &dirty);
-                let (index_us, rehash_us) = rayon::join(
+                let ((indexed, index_us), rehash_us) = rayon::join(
                     || {
-                        index.insert_sorted(appended, |slot| entries.key(slot as usize));
-                        at.elapsed().as_micros() as u64
+                        let indexed = index.insert_sorted(appended, |slot| entries.key(slot as usize));
+                        (indexed, at.elapsed().as_micros() as u64)
                     },
                     || {
                         rehash_dirty(twigs, dirty);
@@ -2462,10 +2477,13 @@ impl QmdbCompatTree {
                     },
                 );
                 (phases.index_us, phases.rehash_us) = (index_us, rehash_us);
+                indexed.map_err(|e| QmdbOperationError::Index(e.to_string()))?;
             }
             phases.index_faults += crate::prefault::thread_faults().saturating_sub(faults_hash);
         } else {
-            self.index.insert_sorted(appended, |slot| entries.key(slot as usize));
+            self.index
+                .insert_sorted(appended, |slot| entries.key(slot as usize))
+                .map_err(|e| QmdbOperationError::Index(e.to_string()))?;
             phases.index_us = at.elapsed().as_micros() as u64;
             phases.index_faults += crate::prefault::thread_faults().saturating_sub(faults_hash);
             let at = std::time::Instant::now();
@@ -2822,7 +2840,12 @@ impl QmdbCompatTree {
             // goes in first: the index confirms keys against the store.
             tree.entries.push(entry.key, entry.value.clone()).expect("a heap push cannot fail");
             if entry.active {
-                if tree.index.insert(entry.key, slot as u64, |s| tree.entries.key(s as usize)).is_some() {
+                if tree
+                    .index
+                    .insert(entry.key, slot as u64, |s| tree.entries.key(s as usize))
+                    .map_err(|e| QmdbSnapshotError::Index(e.to_string()))?
+                    .is_some()
+                {
                     return Err(QmdbSnapshotError::DuplicateActiveKey(entry.key));
                 }
                 tree.twigs[twig_id].bits[local / 8] |= 1 << (local % 8);

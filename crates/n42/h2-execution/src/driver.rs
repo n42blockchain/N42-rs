@@ -2862,11 +2862,13 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             // to this forkchoice, it runs again when the import lands.
             self.remember_commit_ahead(block_hash);
         }
-        if self.commit_async {
+        if self.commit_async || self.commit_in_flight.is_some() || self.commit_pending.is_some() {
             // Off the loop from here: the forkchoice goes on a task and its
             // outcome is applied in `finish_commit`. Everything above happens
             // at send time either way, because none of it depends on the
-            // answer.
+            // answer. The awaited path takes this road too while a spawned
+            // forkchoice (a retry) is out, so the two can never cross on the
+            // wire.
             self.queue_commit(block_hash, Vec::new());
             return DriverAction::Ignored;
         }
@@ -3075,9 +3077,17 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     if matches!(status, PayloadStatusEnum::Valid) {
                         self.finalized = block_hash;
                     }
-                    // A commit that landed finalises its ancestors, so a
-                    // failed one waiting to be sent again is moot.
-                    self.commit_retry = None;
+                    // A commit that landed finalises its ancestors -- the
+                    // commits heard before it -- so a failed one waiting to
+                    // be sent again is moot only if it is one of those; a
+                    // failed descendant still waits.
+                    let order = self.commit_order_of(block_hash);
+                    self.commit_landed = self.commit_landed.max(order);
+                    if self.commit_retry.as_ref().is_some_and(|retry| {
+                        retry.order <= order || retry.block_hash == block_hash || skipped.contains(&retry.block_hash)
+                    }) {
+                        self.commit_retry = None;
+                    }
                     let mut actions = Vec::with_capacity(skipped.len() + 1);
                     // The ancestors this forkchoice finalised on its way: no
                     // head of their own (the descendant is the head), but the
@@ -3096,6 +3106,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             Err(error) => {
                 // Not a verdict: the call failed. The commit stays pending
                 // and is sent again after a backoff (`retry_failed_commit`).
+                let order = self.commit_order_of(block_hash);
+                // One retry is kept, the newest commit's: it finalises every
+                // older one when it lands.
+                if self.commit_retry.as_ref().is_some_and(|retry| retry.order > order) {
+                    return Vec::new();
+                }
                 let attempts = match &self.commit_retry {
                     Some(retry) if retry.block_hash == block_hash => retry.attempts.saturating_add(1),
                     _ => 1,
@@ -3108,8 +3124,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 }
                 self.commit_retry = Some(CommitRetry {
                     block_hash,
+                    order,
                     attempts,
                     due: std::time::Instant::now() + delay,
+                    sent: false,
                 });
                 Vec::new()
             }
@@ -3118,24 +3136,30 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
 
     /// Sends again the commit whose forkchoice failed, once its backoff has
     /// passed. Cheap when there is none or it is not due; the loop calls it
-    /// on every drain.
+    /// on every drain. The forkchoice always goes on a task (the commit
+    /// queue), on the awaited path too, so a failing execution layer never
+    /// holds the consensus loop; its outcome comes back through
+    /// `finish_commit`. Returns the actions to apply now (none so far: the
+    /// answer arrives as a commit report).
     pub async fn retry_failed_commit(&mut self) -> Vec<DriverAction> {
         let Some(retry) = &self.commit_retry else {
             return Vec::new();
         };
-        if std::time::Instant::now() < retry.due || self.commit_in_flight.is_some() {
+        if retry.sent || std::time::Instant::now() < retry.due {
             return Vec::new();
         }
-        let block_hash = retry.block_hash;
-        // Due: it is no longer waiting, whatever happens next (a new failure
-        // records it again with one more attempt).
-        let attempts = retry.attempts;
-        self.commit_retry = None;
-        debug!(target: "n42.h2.el", block = ?block_hash, attempts, "sending a failed commit forkchoice again");
-        match self.commit(block_hash).await {
-            DriverAction::Ignored => Vec::new(),
-            action => vec![action],
+        let (block_hash, order, attempts) = (retry.block_hash, retry.order, retry.attempts);
+        if order <= self.commit_landed {
+            // A later commit already landed and finalised it.
+            self.commit_retry = None;
+            return Vec::new();
         }
+        if let Some(retry) = self.commit_retry.as_mut() {
+            retry.sent = true;
+        }
+        debug!(target: "n42.h2.el", block = ?block_hash, attempts, "sending a failed commit forkchoice again");
+        self.queue_commit(block_hash, Vec::new());
+        Vec::new()
     }
 
     /// The failed commit waiting to be sent again, if any.
@@ -3161,8 +3185,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
 #[derive(Debug, Clone, Copy)]
 struct CommitRetry {
     block_hash: B256,
+    /// Its commit order (see `commit_order_of`).
+    order: u64,
     attempts: u32,
     due: std::time::Instant,
+    /// Handed to the commit queue; its answer is awaited.
+    sent: bool,
 }
 
 /// Failures after which a commit that keeps failing is logged at error.

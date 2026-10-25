@@ -275,13 +275,44 @@ async fn a_failed_commit_forkchoice_is_not_finalised_and_is_sent_again() {
     assert!(driver.retry_failed_commit().await.is_empty());
     assert_eq!(sent(&el), before);
 
-    // The engine answers again; after the backoff the commit lands.
+    // The engine answers again; after the backoff the commit is sent again
+    // from a task, not awaited on the loop, and lands when its report is
+    // applied.
     el.set_behaviour(MockBehaviour::default());
+    let mut reports = driver.take_commit_reports().expect("the commit report channel");
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    let actions = driver.retry_failed_commit().await;
+    assert!(driver.retry_failed_commit().await.is_empty(), "the answer comes as a report");
+    assert!(driver.is_committing());
+    let report = reports.recv().await.expect("a commit report");
+    let actions = driver.finish_commit(report).await;
     assert_eq!(actions.iter().filter_map(DriverAction::finalized_block).collect::<Vec<_>>(), vec![hash]);
     assert_eq!(driver.finalized(), hash);
     assert_eq!(driver.commit_retry_pending(), None);
+}
+
+#[tokio::test]
+async fn a_failed_commit_survives_an_older_commit_landing() {
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    driver.set_commit_fcu_async(false);
+    driver.set_settlement_tags(n42_h2_execution::SettlementTags::Legacy);
+    let (older, newer) = (B256::repeat_byte(0x25), B256::repeat_byte(0x26));
+    driver.cache_payload(older, MockExecutionLayer::payload_for(older, 1));
+    driver.handle_output(&execute(older)).await;
+    driver.cache_payload(newer, MockExecutionLayer::payload_for(newer, 2));
+    driver.handle_output(&execute(newer)).await;
+
+    // The older commit is heard first and fails; the newer one fails too.
+    el.set_behaviour(MockBehaviour { forkchoice_error: Some("timeout".to_owned()), ..Default::default() });
+    driver.handle_output(&committed(older)).await;
+    driver.handle_output(&committed(newer)).await;
+    assert_eq!(driver.commit_retry_pending(), Some(newer), "the newest failure is the one kept");
+
+    // The older one is asked for again and lands: the newer retry stays.
+    el.set_behaviour(MockBehaviour::default());
+    driver.handle_output(&committed(older)).await;
+    assert_eq!(driver.finalized(), older);
+    assert_eq!(driver.commit_retry_pending(), Some(newer), "an ancestor landing does not finalise it");
 }
 
 #[tokio::test]

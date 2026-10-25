@@ -49,8 +49,8 @@
 //! deadline on every iteration. Dropping that arm is what turns a node that
 //! looks connected into one that silently stops voting.
 
-use std::collections::HashSet;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use alloy_consensus::Header;
 use alloy_primitives::{keccak256, Bytes, B256};
@@ -231,8 +231,9 @@ pub struct H2Service<E> {
     native_wire: bool,
     /// Blocks consensus asked to execute before their bodies arrived. A body
     /// for one of these re-runs the execution instead of waiting for the next
-    /// proposal to mention the block again, which it may never do.
-    awaiting_bodies: HashSet<B256>,
+    /// proposal to mention the block again, which it may never do. Requests
+    /// that go unanswered are repeated; see [`BodyRequests`].
+    awaiting_bodies: BodyRequests,
     /// Bodies that arrived for awaited blocks, to execute on the next drain.
     /// Kept separate because the transport handler cannot await.
     ready_bodies: Vec<B256>,
@@ -292,6 +293,69 @@ pub struct H2Service<E> {
 /// view timeout, and every other view is lost to it. gov5 paces its own
 /// re-asks at `minProposeDelayMs`, 200ms on the devnet.
 const PROPOSE_RETRY: Duration = Duration::from_millis(200);
+
+/// How long an awaited block body may go unanswered before it is asked for
+/// again, and how many times. Together about ten seconds: long enough to
+/// outlast a body still being imported by its peers, short of the range pull
+/// that takes over for anything older.
+const BODY_RETRY: Duration = Duration::from_millis(250);
+const BODY_REQUEST_ATTEMPTS: u32 = 40;
+
+/// Outstanding requests for block bodies consensus is waiting on.
+#[derive(Debug, Default)]
+struct BodyRequests {
+    pending: HashMap<B256, BodyRequest>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BodyRequest {
+    last_asked: Instant,
+    attempts: u32,
+}
+
+impl BodyRequests {
+    /// Starts waiting for a body. True when it was not already awaited, so
+    /// the caller should ask for it now.
+    fn insert(&mut self, block_hash: B256, now: Instant) -> bool {
+        match self.pending.entry(block_hash) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(BodyRequest { last_asked: now, attempts: 1 });
+                true
+            }
+        }
+    }
+
+    /// Stops waiting for a body. True when it was awaited.
+    fn remove(&mut self, block_hash: &B256) -> bool {
+        self.pending.remove(block_hash).is_some()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// The bodies to ask for again now, marked as asked, and those given up
+    /// on after [`BODY_REQUEST_ATTEMPTS`] requests.
+    fn due(&mut self, now: Instant) -> (Vec<B256>, Vec<B256>) {
+        let mut due = Vec::new();
+        let mut abandoned = Vec::new();
+        self.pending.retain(|block_hash, request| {
+            if now.saturating_duration_since(request.last_asked) < BODY_RETRY {
+                return true;
+            }
+            if request.attempts >= BODY_REQUEST_ATTEMPTS {
+                abandoned.push(*block_hash);
+                return false;
+            }
+            request.attempts += 1;
+            request.last_asked = now;
+            due.push(*block_hash);
+            true
+        });
+        (due, abandoned)
+    }
+}
 
 /// A pull of the blocks this node is missing, from one peer, by range.
 ///
@@ -402,7 +466,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             proposal_deferred: false,
             header_profile: HeaderProfile::Ethereum,
             native_wire: false,
-            awaiting_bodies: HashSet::new(),
+            awaiting_bodies: BodyRequests::default(),
             ready_bodies: Vec::new(),
             received_bodies: Vec::new(),
             body_outbox: Vec::new(),
@@ -596,6 +660,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
                 () = std::future::ready(()) => {}
             }
+            self.retry_body_requests();
             self.drain_outputs(&mut events).await?;
             self.forward_inbound_transactions().await;
             self.flush_outbox(&mut events);
@@ -641,12 +706,39 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // Nothing happened; the builder is asked again at the top of
                 // the next step.
             }
+            () = tokio::time::sleep(BODY_RETRY), if !self.awaiting_bodies.is_empty() => {
+                // An awaited body is still missing; asked for again below.
+            }
         }
 
+        self.retry_body_requests();
         self.drain_outputs(&mut events).await?;
         self.forward_inbound_transactions().await;
         self.flush_outbox(&mut events);
         Ok(events)
+    }
+
+    /// Asks every connected peer for one block body.
+    fn request_body(&mut self, block_hash: B256) {
+        for peer in self.transport.connected_peer_ids() {
+            self.transport.request_block(peer, block_hash);
+        }
+    }
+
+    /// Asks again for awaited bodies whose last request went unanswered.
+    ///
+    /// A request is answered "not found" by a peer that has not imported the
+    /// block yet, and the gossip copy can be lost; without a retry the block
+    /// would stay unexecuted until some later range pull happened to cover it.
+    fn retry_body_requests(&mut self) {
+        let (due, abandoned) = self.awaiting_bodies.due(Instant::now());
+        for block_hash in due {
+            debug!(target: "n42.h2.node", ?block_hash, "block body still missing; asking peers again");
+            self.request_body(block_hash);
+        }
+        for block_hash in abandoned {
+            warn!(target: "n42.h2.node", ?block_hash, attempts = BODY_REQUEST_ATTEMPTS, "gave up asking for a block body");
+        }
     }
 
     /// Hands the transactions heard from the fleet to the execution layer's
@@ -1093,10 +1185,8 @@ impl<E: ExecutionLayer> H2Service<E> {
         };
         if head != self.driver.head() && head_header.is_none() {
             warn!(target: "n42.h2.node", view, certified = ?head, imported = ?self.driver.head(), "the block our highest QC certifies is not imported; asking for it before proposing");
-            if self.awaiting_bodies.insert(head) {
-                for peer in self.transport.connected_peer_ids() {
-                    self.transport.request_block(peer, head);
-                }
+            if self.awaiting_bodies.insert(head, Instant::now()) {
+                self.request_body(head);
             }
             self.proposal_deferred = true;
             return;
@@ -1171,10 +1261,8 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // for it too, as gov5 does, from everyone connected. An
                 // answer that arrives after the gossip copy is a duplicate
                 // the cache absorbs.
-                if self.awaiting_bodies.insert(block_hash) {
-                    for peer in self.transport.connected_peer_ids() {
-                        self.transport.request_block(peer, block_hash);
-                    }
+                if self.awaiting_bodies.insert(block_hash, Instant::now()) {
+                    self.request_body(block_hash);
                 }
                 events.push(ServiceEvent::PayloadMissing { block_hash });
             }
@@ -1965,5 +2053,54 @@ mod recovered_parent_time_tests {
         assert_eq!(head_stamp(Some(1030), Some(&header)), Some(1030));
         assert_eq!(head_stamp(None, Some(&header)), Some(1040));
         assert_eq!(head_stamp(None, None), None);
+    }
+}
+
+#[cfg(test)]
+mod body_request_tests {
+    use super::*;
+
+    #[test]
+    fn an_unanswered_body_request_is_repeated_until_the_body_arrives() {
+        let start = Instant::now();
+        let hash = B256::repeat_byte(0x86);
+        let mut requests = BodyRequests::default();
+        assert!(requests.insert(hash, start));
+        // Already awaited: the first request is not duplicated at once.
+        assert!(!requests.insert(hash, start));
+        assert_eq!(requests.due(start + BODY_RETRY / 2), (vec![], vec![]));
+
+        // The one-shot request used to be the only one; now it repeats.
+        assert_eq!(requests.due(start + BODY_RETRY), (vec![hash], vec![]));
+        assert_eq!(requests.due(start + BODY_RETRY + BODY_RETRY / 2), (vec![], vec![]));
+        assert_eq!(requests.due(start + BODY_RETRY * 2), (vec![hash], vec![]));
+
+        assert!(requests.remove(&hash));
+        assert!(requests.is_empty());
+        assert_eq!(requests.due(start + BODY_RETRY * 10), (vec![], vec![]));
+        assert!(!requests.remove(&hash));
+    }
+
+    #[test]
+    fn a_body_nobody_serves_is_abandoned_after_the_attempt_budget() {
+        let mut now = Instant::now();
+        let hash = B256::repeat_byte(0x87);
+        let mut requests = BodyRequests::default();
+        requests.insert(hash, now);
+        let mut asked = 1;
+        loop {
+            now += BODY_RETRY;
+            let (due, abandoned) = requests.due(now);
+            if !abandoned.is_empty() {
+                assert_eq!(abandoned, vec![hash]);
+                break;
+            }
+            assert_eq!(due, vec![hash]);
+            asked += 1;
+        }
+        assert_eq!(asked, BODY_REQUEST_ATTEMPTS);
+        assert!(requests.is_empty());
+        // A later miss for the same block starts a fresh budget.
+        assert!(requests.insert(hash, now));
     }
 }

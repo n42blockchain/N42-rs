@@ -908,6 +908,7 @@ fn spawn_stats_reporter() {
                     // and frames with a dropped transaction (never whole).
                     frames_admitted = STATS.frames_admitted.load(Ordering::Relaxed),
                     frames_unaligned = STATS.frames_unaligned.load(Ordering::Relaxed),
+                    frames_duplicate = STATS.frames_duplicate.load(Ordering::Relaxed),
                     // Cumulative, step 2: frames admitted on their gateways'
                     // attestations (and their transactions), frames with a
                     // bad attestation signature and frames that carried
@@ -1519,6 +1520,8 @@ struct IngestStats {
     frames_admitted: AtomicU64,
     /// Frames it dropped any transaction of: never referenceable whole.
     frames_unaligned: AtomicU64,
+    /// Frames that named one transaction hash twice, refused as frames.
+    frames_duplicate: AtomicU64,
     /// Frames admitted on their gateways' attestations, and the
     /// transactions they carried (no per-transaction verification here).
     frames_attested: AtomicU64,
@@ -1549,6 +1552,7 @@ static STATS: IngestStats = IngestStats {
     dropped_altsig_claim: AtomicU64::new(0),
     frames_admitted: AtomicU64::new(0),
     frames_unaligned: AtomicU64::new(0),
+    frames_duplicate: AtomicU64::new(0),
     frames_attested: AtomicU64::new(0),
     attested_txs: AtomicU64::new(0),
     frames_attest_bad: AtomicU64::new(0),
@@ -1820,9 +1824,21 @@ where
     P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
 {
     let hashes: Vec<B256> = pooled.iter().map(|tx| *tx.hash()).collect();
+    // A frame naming a transaction twice is refused as a frame: the frame
+    // tree pairs an odd last node with itself, so `[a, b, c, c]` would carry
+    // the id (and the attestations) of `[a, b, c]`. Its transactions are
+    // still recovered one by one; it is never attested, never indexed.
+    let duplicate = n42_tx_types::has_duplicate_hash(&hashes);
+    if duplicate {
+        let refused = STATS.frames_duplicate.fetch_add(1, Ordering::Relaxed) + 1;
+        if drop_warn_allowed() {
+            warn!(target: "n42.tx_ingest", refused, txs = hashes.len(), "a frame with a duplicate transaction hash: not admitted as a frame");
+        }
+    }
+    let attestations = if duplicate { &[][..] } else { attestations };
     let (attested, root) = frame_attested(sent, &hashes, attestations, attest);
     let recovered = recover_decoded_in::<P>(pooled, claims, cache, shard, attested);
-    let frame = frame_of(sent, hashes, root, &recovered);
+    let frame = if duplicate { None } else { frame_of(sent, hashes, root, &recovered) };
     if frame.is_none() {
         STATS.frames_unaligned.fetch_add(1, Ordering::Relaxed);
     }
@@ -2267,6 +2283,26 @@ mod shard_tests {
         // by exactly this frame.
         assert_eq!(STATS.shard_verified.load(Ordering::Relaxed) - verified_before, owned);
         assert_eq!(STATS.shard_claimed.load(Ordering::Relaxed) - claimed_before, 48 - owned);
+    }
+
+    /// `[a, b, c]` is admitted as a frame; `[a, b, c, c]`, which shares its
+    /// root, is refused as one (counted, never indexed).
+    #[test]
+    fn a_frame_with_a_duplicate_transaction_is_refused() {
+        let _lock = crate::coverage_tests::counter_lock();
+        n42_tx_types::set_alt_sig_enabled(true);
+        let txs: Vec<N42PooledTxEnvelope> =
+            (0..3u64).map(|i| N42PooledTxEnvelope::AltSig(signed(21, 3_000 + i))).collect();
+        let (_, frame) =
+            recover_frame::<NoopTransactionPool<N42PooledTransaction>>(3, txs.clone(), Vec::new(), &[], None);
+        assert!(frame.is_some(), "[a, b, c] is a frame");
+        let mut doubled = txs;
+        doubled.push(doubled[2].clone());
+        let before = STATS.frames_duplicate.load(Ordering::Relaxed);
+        let (_, frame) =
+            recover_frame::<NoopTransactionPool<N42PooledTransaction>>(4, doubled, Vec::new(), &[], None);
+        assert!(frame.is_none(), "[a, b, c, c] is refused as a frame");
+        assert_eq!(STATS.frames_duplicate.load(Ordering::Relaxed) - before, 1);
     }
 
     /// A shard-mode frame whose 0x50 claims name someone other than the

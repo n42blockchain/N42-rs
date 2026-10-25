@@ -568,6 +568,53 @@ pub static SEALED_MPT: AtomicU64 = AtomicU64::new(0);
 pub static CHECKED_FRAME_ROOT: AtomicU64 = AtomicU64::new(0);
 /// Whole bodies under the flag checked against the MPT root.
 pub static CHECKED_MPT_ROOT: AtomicU64 = AtomicU64::new(0);
+/// Bodies whose frame-tree root was refused because they hold a duplicate
+/// transaction hash ([`body_has_duplicate`]).
+pub static REFUSED_DUPLICATE: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a body's transaction hashes hold a duplicate, the check that
+/// must pass before a frame-tree root is trusted to bind it: the frame
+/// tree pairs an odd last node with itself, so `[a, b, c]` and
+/// `[a, b, c, c]` share a root ([`n42_tx_types::has_duplicate_hash`]).
+/// Sorted on the worker pool for a large body. Counts and warns on a hit.
+pub fn body_has_duplicate(hashes: &[B256]) -> bool {
+    hashes_have_duplicate(hashes.len(), |i| hashes[i])
+}
+
+/// [`body_has_duplicate`] over a body of `total` transactions whose `i`-th
+/// hash is `hash_at(i)`, so a caller holding transactions rather than a
+/// hash list does not collect one: only the eight-byte prefixes are
+/// gathered and sorted, and the full hashes only on a prefix collision.
+pub fn hashes_have_duplicate(total: usize, hash_at: impl Fn(usize) -> B256 + Sync) -> bool {
+    use rayon::prelude::*;
+    if total < 2 {
+        return false;
+    }
+    let mut prefixes: Vec<u64> = if total < 4096 {
+        (0..total).map(|i| n42_tx_types::hash_prefix(&hash_at(i))).collect()
+    } else {
+        (0..total).into_par_iter().map(|i| n42_tx_types::hash_prefix(&hash_at(i))).collect()
+    };
+    if total < 4096 {
+        prefixes.sort_unstable();
+    } else {
+        prefixes.par_sort_unstable();
+    }
+    let duplicate = prefixes.windows(2).any(|pair| pair[0] == pair[1]) && {
+        let hashes: Vec<B256> = (0..total).map(&hash_at).collect();
+        n42_tx_types::has_duplicate_hash(&hashes)
+    };
+    if duplicate {
+        let refused = REFUSED_DUPLICATE.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            target: "n42::frame_blocks",
+            txs = total,
+            refused,
+            "a body with a duplicate transaction hash: its frame-tree root is not trusted"
+        );
+    }
+    duplicate
+}
 
 /// The plan [`select`] left on this thread, taken.
 pub fn take_plan() -> Option<FramePlan> {
@@ -959,6 +1006,12 @@ pub fn root_for_body_counted(claimed: Option<B256>, hashes: &[B256], mpt: impl F
     if hashes.is_empty() {
         return BodyRoot { root: alloy_consensus::EMPTY_ROOT_HASH, frame: false, indexed: 0, hashed: 0 };
     }
+    // A body with a duplicate hash can reproduce the frame-tree root of the
+    // body without it, so it never matches a header by a frame tree; it is
+    // checked against its MPT root, which has no such ambiguity. Checked
+    // only once a frame tree would be accepted.
+    let mut duplicate: Option<bool> = None;
+    let mut refuses = || *duplicate.get_or_insert_with(|| body_has_duplicate(hashes));
     let queue = n42_tx_queue::global::<crate::N42PooledTransaction>();
     if let Some(claimed) = claimed
         && let Some(layout) = layout_by_root(&claimed)
@@ -968,6 +1021,7 @@ pub fn root_for_body_counted(claimed: Option<B256>, hashes: &[B256], mpt: impl F
         let counts: Vec<usize> = layout.iter().map(|(_, count)| *count).collect();
         if let Some(tree) = frame_tree_root_known(&counts, &known, hashes.len(), |i| hashes[i])
             && tree.root == claimed
+            && !refuses()
         {
             CHECKED_FRAME_ROOT.fetch_add(1, Ordering::Relaxed);
             return BodyRoot { root: claimed, frame: true, indexed: tree.indexed, hashed: tree.hashed };
@@ -979,6 +1033,7 @@ pub fn root_for_body_counted(claimed: Option<B256>, hashes: &[B256], mpt: impl F
     });
     if let Some(tree) = indexed
         && claimed.is_none_or(|claimed| claimed == tree.root)
+        && !refuses()
     {
         CHECKED_FRAME_ROOT.fetch_add(1, Ordering::Relaxed);
         return BodyRoot { root: tree.root, frame: true, indexed: tree.indexed, hashed: tree.hashed };
@@ -1024,6 +1079,38 @@ mod claimed_root_tests {
         let bare = B256::repeat_byte(0x79);
         remember_claimed(bare, root, &[]);
         assert_eq!(root_of_block(&bare), None);
+    }
+}
+
+#[cfg(test)]
+mod duplicate_tests {
+    use super::*;
+
+    /// `[a, b, c]` and `[a, b, c, c]` share a frame tree root; a body with
+    /// the duplicate is never accepted by it, even under a layout that
+    /// covers it, and is checked against its MPT root instead.
+    #[test]
+    fn a_body_with_a_duplicated_last_transaction_is_refused_the_frame_root() {
+        let a = B256::repeat_byte(0x51);
+        let b = B256::repeat_byte(0x52);
+        let c = B256::repeat_byte(0x53);
+        let honest = vec![a, b, c];
+        let forged = vec![a, b, c, c];
+        let root = root_of_hashes(&honest, &[3]).expect("one frame");
+        assert_eq!(root_of_hashes(&forged, &[4]), Some(root), "the collision the check guards against");
+        // A layout that covers the forged body, remembered under the root.
+        remember_claimed(B256::repeat_byte(0xd4), root, &[(B256::repeat_byte(0xd3), 4u32)]);
+        let mpt = B256::repeat_byte(0x12);
+        let before = REFUSED_DUPLICATE.load(Ordering::Relaxed);
+        assert_eq!(root_for_body(Some(root), &forged, || mpt), (mpt, false));
+        assert!(REFUSED_DUPLICATE.load(Ordering::Relaxed) > before);
+        assert!(body_has_duplicate(&forged));
+        assert!(!body_has_duplicate(&honest));
+        // The parallel path for a large body.
+        let mut big: Vec<B256> = (0..10_000u32).map(|i| alloy_primitives::keccak256(i.to_le_bytes())).collect();
+        assert!(!body_has_duplicate(&big));
+        big.push(big[17]);
+        assert!(body_has_duplicate(&big));
     }
 }
 

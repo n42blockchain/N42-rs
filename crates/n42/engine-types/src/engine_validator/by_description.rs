@@ -634,13 +634,24 @@ where
         }
         .ok_or_else(|| other("the frame layout does not cover the assembled body".to_owned()))?;
         let transactions_root = tree.root;
-        let root_us = root_at.elapsed().as_micros() as u64;
         if transactions_root != body.header.transactions_root {
             return Err(CompactBodyError::Invalid(
                 PayloadError::BlockHash { execution: transactions_root, consensus: body.header.transactions_root }
                     .into(),
             ));
         }
+        // The frame tree pairs an odd last node with itself, so a body with
+        // a duplicated tail (a frame or a transaction named twice) carries
+        // the root of the body without it: such a body is not this header's.
+        {
+            use alloy_consensus::transaction::TxHashRef as _;
+            if crate::frame_blocks::hashes_have_duplicate(transactions.len(), |index| {
+                *transactions[index].transaction().tx_hash()
+            }) {
+                return Err(other("the described body holds a duplicate transaction hash".to_owned()));
+            }
+        }
+        let root_us = root_at.elapsed().as_micros() as u64;
         // Verified from the layout and the body's own hashes, whatever this
         // node's frame index holds (a supplied frame's transactions included):
         // kept so a later whole-body check of the block verifies it the same way.

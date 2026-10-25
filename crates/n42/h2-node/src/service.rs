@@ -2536,9 +2536,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                     debug!(target: "n42.h2.node", %peer, height, "peer on our chain");
                     self.pending_status.push((peer, height));
                 } else {
-                    // gov5 sends goodbye on a fork mismatch, so this connection
-                    // is about to die and the operator needs to know why.
-                    warn!(target: "n42.h2.node", %peer, "peer is on a different chain; it will disconnect");
+                    // gov5 sends goodbye on a fork mismatch; a Rust peer on
+                    // another chain would stay connected and keep asking, so
+                    // this side hangs up too. The operator needs to know why.
+                    warn!(target: "n42.h2.node", %peer, "peer is on a different chain; disconnecting");
+                    self.peer_heights.remove(&peer);
+                    self.transport.disconnect(peer);
                 }
             }
             TransportEvent::PeerConnected(peer) => {

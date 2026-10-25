@@ -449,6 +449,28 @@ fn peer_of(rig: &Rig) -> PeerId {
 }
 
 #[tokio::test]
+async fn a_peer_whose_status_names_another_chain_is_disconnected() {
+    let (mut a, mut b) = pair(0).await;
+    let peer = peer_of(&b);
+    a.svc
+        .handle_transport_event(TransportEvent::StatusExchanged {
+            peer,
+            genesis_hash: B256::repeat_byte(0xEE),
+            height: 9,
+            fork_matches: false,
+        })
+        .expect("a handles it");
+    assert!(!a.svc.peer_heights.contains_key(&peer), "a height from another chain is not kept");
+    assert!(a.svc.pending_status.is_empty(), "nor does it start a pull");
+    let mut events = Vec::new();
+    pump(&mut a, &mut b, (false, false), &mut events, |a, b, _| {
+        !a.svc.transport.connected_peer_ids().contains(&peer)
+            && b.svc.transport.connected_peer_ids().is_empty()
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_named_direct_body_pulls_a_parent_missed_before_the_peer_connected() {
     let (mut a, b) = pair(0).await;
     let blocks = chain(2);

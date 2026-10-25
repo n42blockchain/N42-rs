@@ -84,6 +84,8 @@ pub(crate) enum Command {
     PushBlock(PeerId, alloy_primitives::Bytes),
     /// A direct vote (or hello) for one peer; see [`crate::rpc::VOTE_PROTOCOL`].
     SendVote(PeerId, crate::rpc::VoteRequest),
+    /// Close every connection to a peer.
+    Disconnect(PeerId),
 }
 
 /// What the loop reads of the task's state without asking it.
@@ -293,5 +295,6 @@ fn apply(core: &mut TransportCore, command: Command) {
         Command::RespondBlock(channel, rlp) => core.respond_block(channel, rlp),
         Command::PushBlock(peer, rlp) => core.push_block(peer, rlp),
         Command::SendVote(peer, request) => core.send_vote(peer, request),
+        Command::Disconnect(peer) => core.disconnect(peer),
     }
 }

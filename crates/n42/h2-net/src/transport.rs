@@ -637,6 +637,13 @@ impl TransportCore {
         self.swarm.connected_peers().copied().collect()
     }
 
+    /// Closes every connection to `peer` (a peer on another chain, for
+    /// one). gov5 says goodbye on a status mismatch itself; this is the same
+    /// end from our side. A peer that is not connected is ignored.
+    pub fn disconnect(&mut self, peer: PeerId) {
+        let _ = self.swarm.disconnect_peer_id(peer);
+    }
+
     /// Asks `peer` for a block by hash. The answer arrives as
     /// [`TransportEvent::BlockFetched`] or [`TransportEvent::BlockFetchFailed`].
     pub fn request_block(&mut self, peer: PeerId, hash: B256) {
@@ -1370,6 +1377,15 @@ impl H2V4Transport {
         match &mut self.inner {
             Inner::Inline(core) => core.respond_range_error(channel, message),
             Inner::OffLoop(off) => off.command(crate::pump::Command::RespondRangeError(channel, message)),
+        }
+    }
+
+    /// Closes every connection to `peer`; see [`TransportCore::disconnect`].
+    /// The [`TransportEvent::PeerDisconnected`] follows as for any close.
+    pub fn disconnect(&mut self, peer: PeerId) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.disconnect(peer),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::Disconnect(peer)),
         }
     }
 

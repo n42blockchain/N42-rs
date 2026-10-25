@@ -37,6 +37,24 @@ pub mod failpoints {
         ARMED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((path.to_path_buf(), keep));
     }
 
+    static ARMED_TRUNCATE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Arms the entry file at `path`: its next truncation (an undo that
+    /// takes appended slots off) fails before it cuts anything.
+    pub fn fail_next_truncate(path: &Path) {
+        ARMED_TRUNCATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(path.to_path_buf());
+    }
+
+    /// Disarms the truncation failure armed for `path`; whether there was one.
+    pub(crate) fn take_truncate(path: &Path) -> bool {
+        let mut armed = ARMED_TRUNCATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(at) = armed.iter().position(|armed| armed == path) else {
+            return false;
+        };
+        armed.swap_remove(at);
+        true
+    }
+
     /// Disarms and returns the failure armed for `path`, if any.
     pub(crate) fn take(path: &Path) -> Option<usize> {
         let mut armed = ARMED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -979,7 +997,13 @@ impl Entries {
                 entries.truncate(len);
                 Ok(())
             }
-            Self::File(file) => file.truncate(len),
+            Self::File(file) => {
+                #[cfg(feature = "failpoints")]
+                if failpoints::take_truncate(&file.path) {
+                    return Err(failpoints::injected());
+                }
+                file.truncate(len)
+            }
         }
     }
 

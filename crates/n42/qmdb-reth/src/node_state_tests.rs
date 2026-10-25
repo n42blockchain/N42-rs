@@ -1076,6 +1076,49 @@ fn a_restart_over_a_corrupt_entry_file_fails_on_its_root() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An entry file cut shorter than the checkpoint needs (a lost or torn
+/// first record) refuses the restart by name, rather than rebuilding a
+/// tree with slots missing.
+#[test]
+fn a_restart_over_an_entry_file_shorter_than_the_checkpoint_fails() {
+    let (state, chain, dir, head, _) = node_at("restart-short-entries", true, 3);
+    let entries = state.entry_file_path();
+    drop(state);
+    let file = std::fs::OpenOptions::new().write(true).open(&entries).expect("the entry file");
+    file.set_len(10).expect("cut the entry file inside its first record");
+    drop(file);
+    let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    let err = restarted.initialize((3, head)).expect_err("a short entry file is refused");
+    assert!(matches!(err, NodeStateError::State(StateError::EntryFile(_))), "{err}");
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A delta log that ends before the database's head (the database persisted
+/// a block the log never recorded) refuses the restart with the two
+/// positions named, and leaves the datadir as it was: a restart at the
+/// log's own head still works.
+#[test]
+fn a_delta_log_ending_before_the_database_head_is_refused() {
+    for entry_file in [true, false] {
+        let name = format!("restart-log-short-{entry_file}");
+        let (state, chain, dir, head, root) = node_at(&name, entry_file, 3);
+        drop(state);
+        let ahead = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        let err = ahead.initialize((4, hash_of(4))).expect_err("the database is past the log");
+        assert!(
+            matches!(err, NodeStateError::SnapshotMismatch { snapshot_number: 3, head_number: 4, .. }),
+            "{err}"
+        );
+        drop(ahead);
+        let back = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        back.initialize((3, head)).expect("the log's own head");
+        assert_eq!(back.state_root(), root);
+        drop(back);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The same check in heap mode, over a corrupt snapshot's restored tree.
 #[test]
 fn a_heap_restart_checks_its_root_too() {

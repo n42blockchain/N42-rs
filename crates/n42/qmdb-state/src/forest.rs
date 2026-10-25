@@ -2557,6 +2557,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An undo that fails part way through the revert loop (the entry file
+    /// refuses the truncation, after the undo began taking the block off)
+    /// poisons the forest: the next compute is refused rather than run on a
+    /// tree that stands between two blocks.
+    #[test]
+    fn a_failed_undo_in_the_revert_loop_poisons_the_forest() {
+        let (dir, path, mut forest) = entry_file_forest("poison-revert");
+        forest.apply(h(1), h(2), 2, &accounts(2, 8)).unwrap();
+        n42_twig_core::entry_store::failpoints::fail_next_truncate(&path);
+        // Computing on block 1 reverts block 2 first.
+        let err = forest.compute_operations(h(1), accounts(3, 8).ops()).unwrap_err();
+        assert!(matches!(err, StateError::Undo(_)), "{err}");
+        assert!(forest.poisoned().is_some_and(|why| why.contains("reverting block")));
+        assert!(matches!(forest.compute_operations(h(1), accounts(3, 8).ops()), Err(StateError::Poisoned(_))));
+        assert!(matches!(forest.compute_operations(h(2), accounts(3, 8).ops()), Err(StateError::Poisoned(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A refusal that mutates nothing (a computation that never ran) does
     /// not poison: the forest computes the same root as before.
     #[test]

@@ -1652,6 +1652,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                     return Err(ServiceError::OutputChannelClosed);
                 };
                 self.handle_output(output, &mut events).await?;
+                // Room was made: outputs the engine held behind a full
+                // channel move on, in order.
+                self.engine.release_outputs();
             }
             // Defect 17b: a fill a worker has prepared for a peer goes out
             // now, not on the drain after whatever event comes next. The
@@ -2504,7 +2507,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.handle_output(EngineOutput::ExecuteBlock(block_hash), events)
                 .await?;
         }
-        while let Ok(output) = self.outputs.try_recv() {
+        while let Some(output) = self.next_output() {
             self.handle_output(output, events).await?;
         }
         self.loop_spend.note("driver_outputs", drain_at);
@@ -2883,11 +2886,19 @@ impl<E: ExecutionLayer> H2Service<E> {
         seen.checked_add(pacing)
     }
 
+    /// The engine's next output without waiting. Outputs the engine held
+    /// behind a full channel are moved into it first, so they come out in
+    /// the order they were made.
+    fn next_output(&mut self) -> Option<EngineOutput> {
+        self.engine.release_outputs();
+        self.outputs.try_recv().ok()
+    }
+
     /// Handles the engine's outputs in order up to and including this
     /// leader's proposal, so the proposal is published the moment the engine
     /// makes it. What follows it stays for the step's drain.
     async fn send_own_proposal(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
-        while let Ok(output) = self.outputs.try_recv() {
+        while let Some(output) = self.next_output() {
             let proposal = matches!(
                 &output,
                 EngineOutput::BroadcastMessage(n42_h2_primitives::consensus::ConsensusMessage::Proposal(_))

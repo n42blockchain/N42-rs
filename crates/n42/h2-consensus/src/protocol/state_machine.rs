@@ -343,10 +343,11 @@ pub struct ConsensusEngine {
     /// what deferred execution (`docs/PHASE_D_DEFERRED_EXECUTION.md`) would
     /// give the cycle before any header changes.
     pub(super) vote_before_import: bool,
-    /// Retry budget of `emit` against a full output channel: attempts and the
-    /// wait before each. Production keeps the defaults; tests widen them.
-    output_retries: u32,
-    output_retry_wait: std::time::Duration,
+    /// Outputs `emit` could not put in a full output channel, in order. The
+    /// channel's consumer is the task that runs this engine, so waiting for
+    /// it to drain cannot work; nothing is dropped instead, and the consumer
+    /// moves these on with [`Self::release_outputs`] as it drains.
+    output_overflow: std::sync::Mutex<VecDeque<EngineOutput>>,
     pub(super) round_state: RoundState,
     pub(super) pacemaker: Pacemaker,
     pub(super) vote_collector: Option<VoteCollector>,
@@ -492,8 +493,7 @@ impl ConsensusEngine {
             leader_tenure: 1,
             signing_profile: ConsensusSigningProfile::Native,
             vote_before_import: false,
-            output_retries: 3,
-            output_retry_wait: std::time::Duration::from_micros(500),
+            output_overflow: std::sync::Mutex::new(VecDeque::new()),
             round_state: RoundState::new(),
             pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
             vote_collector: None,
@@ -604,8 +604,7 @@ impl ConsensusEngine {
             leader_tenure: 1,
             signing_profile: ConsensusSigningProfile::Native,
             vote_before_import: false,
-            output_retries: 3,
-            output_retry_wait: std::time::Duration::from_micros(500),
+            output_overflow: std::sync::Mutex::new(VecDeque::new()),
             round_state: RoundState::from_snapshot(
                 recovered_view,
                 locked_qc,
@@ -1009,12 +1008,6 @@ impl ConsensusEngine {
 
     /// **Bench only, unsafe**: vote on a verified proposal before executing
     /// it, under the H2-v4 profile too. See the field.
-    /// Sets the `emit` retry budget (attempts and wait per attempt).
-    pub fn set_output_retry_budget(&mut self, retries: u32, wait: std::time::Duration) {
-        self.output_retries = retries;
-        self.output_retry_wait = wait;
-    }
-
     pub fn set_vote_before_import(&mut self, on: bool) {
         self.vote_before_import = on;
     }
@@ -1763,12 +1756,88 @@ impl ConsensusEngine {
     }
 
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {
-        let max_retries = self.output_retries;
+        let mut overflow = self
+            .output_overflow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Order is kept: while anything waits in the overflow, a new output
+        // queues behind it.
+        if !overflow.is_empty() {
+            Self::move_overflow(&self.output_tx, &mut overflow)?;
+            if !overflow.is_empty() {
+                overflow.push_back(output);
+                return Ok(());
+            }
+        }
+        match self.output_tx.try_send(output) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(output)) => {
+                tracing::error!(
+                    target: "n42::cl::engine",
+                    output = Self::output_kind(&output),
+                    "consensus output channel closed"
+                );
+                Err(crate::error::ConsensusError::OutputChannelClosed)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(output)) => {
+                // The consumer is this engine's own task: it drains after
+                // the event that is running now returns. Hold the output for
+                // it rather than sleeping the worker or dropping a Decide or
+                // a BlockCommitted.
+                tracing::debug!(
+                    target: "n42::cl::engine",
+                    output = Self::output_kind(&output),
+                    "consensus output channel full; holding the output in order"
+                );
+                overflow.push_back(output);
+                Ok(())
+            }
+        }
+    }
 
-        // Treat bounded-channel backpressure as recoverable. Only a closed channel
-        // is immediately fatal to consensus.
-        let is_block_committed = matches!(output, EngineOutput::BlockCommitted { .. });
-        let output_kind = match &output {
+    /// Moves held outputs into the channel while it has room. Called by the
+    /// channel's consumer as it drains (it is the one that makes room);
+    /// returns how many are still held.
+    pub fn release_outputs(&self) -> usize {
+        let mut overflow = self
+            .output_overflow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A closed channel has no consumer left to tell.
+        let _ = Self::move_overflow(&self.output_tx, &mut overflow);
+        overflow.len()
+    }
+
+    /// Outputs held because the channel was full.
+    pub fn held_outputs(&self) -> usize {
+        self.output_overflow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    fn move_overflow(
+        tx: &mpsc::Sender<EngineOutput>,
+        overflow: &mut VecDeque<EngineOutput>,
+    ) -> ConsensusResult<()> {
+        while let Some(output) = overflow.pop_front() {
+            match tx.try_send(output) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(output)) => {
+                    overflow.push_front(output);
+                    return Ok(());
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(output)) => {
+                    overflow.push_front(output);
+                    return Err(crate::error::ConsensusError::OutputChannelClosed);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    const fn output_kind(output: &EngineOutput) -> &'static str {
+        match output {
             EngineOutput::BroadcastMessage(_) => "BroadcastMessage",
             EngineOutput::SendToValidator(_, _) => "SendToValidator",
             EngineOutput::ExecuteBlock(_) => "ExecuteBlock",
@@ -1780,79 +1849,6 @@ impl ConsensusEngine {
             EngineOutput::SyncRequired { .. } => "SyncRequired",
             EngineOutput::EquivocationDetected { .. } => "EquivocationDetected",
             EngineOutput::EpochTransition { .. } => "EpochTransition",
-        };
-
-        match self.output_tx.try_send(output) {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                tracing::error!(
-                    target: "n42::cl::engine",
-                    output = output_kind,
-                    "consensus output channel closed"
-                );
-                Err(crate::error::ConsensusError::OutputChannelClosed)
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(output)) => {
-                let mut pending = output;
-
-                for attempt in 1..=max_retries {
-                    // Brief sleep to give the channel consumer a chance to drain.
-                    // 500µs × 3 retries = 1.5ms max blocking per emit() call.
-                    // This is acceptable: channel backpressure is rare (capacity 64-1024),
-                    // and 1.5ms is negligible relative to the 8-second slot target.
-                    // std::thread::sleep is used deliberately here rather than tokio::time::sleep
-                    // because emit() is a sync fn; the short duration minimises worker stall.
-                    std::thread::sleep(self.output_retry_wait);
-                    match self.output_tx.try_send(pending) {
-                        Ok(()) => {
-                            if is_block_committed {
-                                tracing::warn!(
-                                    target: "n42::cl::engine",
-                                    attempt,
-                                    "BlockCommitted delivered after retry"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    target: "n42::cl::engine",
-                                    output = output_kind,
-                                    attempt,
-                                    "consensus output delivered after retry"
-                                );
-                            }
-                            return Ok(());
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            tracing::error!(
-                                target: "n42::cl::engine",
-                                output = output_kind,
-                                attempt,
-                                "consensus output channel closed during retry"
-                            );
-                            return Err(crate::error::ConsensusError::OutputChannelClosed);
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(output)) => {
-                            pending = output;
-                        }
-                    }
-                }
-
-                if is_block_committed {
-                    tracing::error!(
-                        target: "n42::cl::engine",
-                        "CRITICAL: BlockCommitted lost after {} retries",
-                        max_retries
-                    );
-                } else {
-                    tracing::error!(
-                        target: "n42::cl::engine",
-                        output = output_kind,
-                        retries = max_retries,
-                        "consensus output channel remained full after retries"
-                    );
-                }
-
-                Err(crate::error::ConsensusError::OutputChannelClosed)
-            }
         }
     }
 }
@@ -2546,64 +2542,65 @@ mod tests {
         assert!(debug_str.contains("my_index"));
     }
 
-    /// Queued outputs remain ordered after a full channel drains. Synchronize
-    /// the consumer rather than relying on OS scheduling within the retry
-    /// deadline; the separate bounded-retry test covers an undrained channel.
+    /// Outputs beyond a full channel are held in order, never dropped, and
+    /// emit does not block: the consumer releases them as it drains.
     #[test]
-    fn test_emit_preserves_order_after_a_full_channel_drains() {
-        let (mut engine, _, _, mut rx) = make_engine_with_output_capacity(1, 0, 1);
-        // A budget far above any scheduling delay: the drain always lands in it.
-        engine.set_output_retry_budget(200, std::time::Duration::from_millis(1));
+    fn test_emit_holds_outputs_beyond_a_full_channel_in_order() {
+        let (engine, _, _, mut rx) = make_engine_with_output_capacity(1, 0, 1);
+        let started = std::time::Instant::now();
+        for view in 0..5u64 {
+            engine
+                .emit(EngineOutput::ViewChanged { new_view: view })
+                .expect("a full channel holds the output, it is not an error");
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "emit must not sleep");
+        assert_eq!(engine.held_outputs(), 4);
 
-        engine
-            .emit(EngineOutput::ExecuteBlock(B256::repeat_byte(0xAB)))
-            .expect("first output should fill the channel");
-
-        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
-        let drain = std::thread::spawn(move || {
-            let first = rx.blocking_recv().expect("expected first output");
-            drained_tx.send(()).expect("notify first drain");
-            let second = rx.blocking_recv().expect("expected second output");
-            (first, second)
-        });
-
-        drained_rx.recv().expect("consumer drained the full channel");
-        engine
-            .emit(EngineOutput::ViewChanged { new_view: 2 })
-            .expect("second output should preserve ordering");
-
-        let (first, second) = drain.join().expect("drain thread should complete");
-        assert!(
-            matches!(first, EngineOutput::ExecuteBlock(hash) if hash == B256::repeat_byte(0xAB))
-        );
-        assert!(matches!(second, EngineOutput::ViewChanged { new_view: 2 }));
+        let mut got = Vec::new();
+        loop {
+            engine.release_outputs();
+            match rx.try_recv() {
+                Ok(EngineOutput::ViewChanged { new_view }) => got.push(new_view),
+                Ok(other) => panic!("unexpected output {other:?}"),
+                Err(_) => break,
+            }
+        }
+        assert_eq!(got, vec![0, 1, 2, 3, 4]);
+        assert_eq!(engine.held_outputs(), 0);
     }
 
-    /// The retry budget is bounded: a consumer that never drains must not stall
-    /// the engine forever. This is the deterministic half of the pair above —
-    /// nothing drains, so the outcome does not depend on scheduling at all.
+    /// One event that emits more than the channel holds loses nothing:
+    /// the same timeout on a one-slot channel and on a roomy one yields the
+    /// same outputs.
     #[test]
-    fn test_emit_gives_up_when_the_consumer_never_drains() {
-        let (engine, _, _, _rx) = make_engine_with_output_capacity(1, 0, 1);
+    fn test_one_event_emitting_past_the_channel_capacity_loses_nothing() {
+        let collect = |capacity: usize| {
+            let (mut engine, _, _, mut rx) = make_engine_with_output_capacity(4, 0, capacity);
+            engine.on_timeout().expect("local timeout");
+            let mut kinds = Vec::new();
+            loop {
+                engine.release_outputs();
+                match rx.try_recv() {
+                    Ok(output) => kinds.push(ConsensusEngine::output_kind(&output)),
+                    Err(_) => break,
+                }
+            }
+            kinds
+        };
+        let roomy = collect(1024);
+        assert!(roomy.len() > 1, "the timeout emits several outputs: {roomy:?}");
+        assert_eq!(collect(1), roomy);
+    }
 
-        engine
-            .emit(EngineOutput::ExecuteBlock(B256::repeat_byte(0xAB)))
-            .expect("first output should fill the channel");
-
-        let started = std::time::Instant::now();
-        let result = engine.emit(EngineOutput::ViewChanged { new_view: 2 });
-        let elapsed = started.elapsed();
-
-        assert!(
-            result.is_err(),
-            "emit must give up rather than block the engine indefinitely"
-        );
-        // 3 retries x 500us of sleep. Asserted only as an upper bound, and a
-        // generous one, so a loaded machine cannot fail it.
-        assert!(
-            elapsed < std::time::Duration::from_secs(1),
-            "emit blocked for {elapsed:?}, far beyond its retry budget"
-        );
+    /// A closed channel is still an error.
+    #[test]
+    fn test_emit_reports_a_closed_channel() {
+        let (engine, _, _, rx) = make_engine_with_output_capacity(1, 0, 1);
+        drop(rx);
+        assert!(matches!(
+            engine.emit(EngineOutput::ViewChanged { new_view: 1 }),
+            Err(crate::error::ConsensusError::OutputChannelClosed)
+        ));
     }
 
     #[test]

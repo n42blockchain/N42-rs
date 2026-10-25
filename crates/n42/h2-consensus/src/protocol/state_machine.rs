@@ -165,6 +165,9 @@ pub const FUTURE_VIEW_WINDOW: u64 = 50;
 /// the ones the node is about to enter and needs most.
 const MAX_FUTURE_MESSAGES: usize = 256;
 
+/// Number of view-jump QC digests remembered as already verified.
+const VERIFIED_JUMP_QC_MEMO: usize = 64;
+
 /// Maximum number of buffered future-view messages attributed to one sender.
 const MAX_FUTURE_MESSAGES_PER_SENDER: usize = 8;
 
@@ -379,6 +382,9 @@ pub struct ConsensusEngine {
     pub(super) proposal_equivocation_tracker: HashMap<u32, (B256, B256)>,
     /// Buffer for messages arriving for future views (within FUTURE_VIEW_WINDOW).
     pub(super) future_msg_buffer: Vec<(ViewNumber, ConsensusMessage)>,
+    /// Digests of QCs a view jump already verified, so a replayed
+    /// certificate costs no second aggregate pairing.
+    pub(super) verified_jump_qcs: BoundedFifoMap<B256, ()>,
     /// Which validators' Round 1 votes this node, as leader, has verified,
     /// per recent view -- including votes that arrive after the view's QC
     /// formed and after the view advanced, which the protocol otherwise
@@ -505,6 +511,7 @@ impl ConsensusEngine {
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
             future_msg_buffer: Vec::new(),
+            verified_jump_qcs: BoundedFifoMap::new(VERIFIED_JUMP_QC_MEMO),
             voters_seen: HashMap::new(),
             withheld_votes: VecDeque::new(),
             progress_votes: false,
@@ -623,6 +630,7 @@ impl ConsensusEngine {
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
             future_msg_buffer: Vec::new(),
+            verified_jump_qcs: BoundedFifoMap::new(VERIFIED_JUMP_QC_MEMO),
             voters_seen: HashMap::new(),
             withheld_votes: VecDeque::new(),
             progress_votes: false,
@@ -1375,6 +1383,28 @@ impl ConsensusEngine {
         }
     }
 
+    /// Digest of a view-jump QC together with its verification domain
+    /// (message kind, and a Decide's changes hash). `None` when the QC does
+    /// not serialize, which only disables the memo.
+    fn jump_qc_digest(msg: &ConsensusMessage, qc: &QuorumCertificate) -> Option<B256> {
+        let encoded = bincode::serialize(qc).ok()?;
+        let mut hasher = blake3::Hasher::new();
+        match msg {
+            ConsensusMessage::Decide(decide) => {
+                hasher.update(&[0u8]);
+                hasher.update(decide.validator_changes_hash.as_slice());
+            }
+            ConsensusMessage::PrepareQC(_) => {
+                hasher.update(&[1u8]);
+            }
+            _ => {
+                hasher.update(&[2u8]);
+            }
+        }
+        hasher.update(&encoded);
+        Some(B256::from(*hasher.finalize().as_bytes()))
+    }
+
     /// Attempts a QC-based view jump when a far-future message arrives.
     ///
     /// Extracts and verifies the QC from the message. If valid, jumps to exactly
@@ -1396,28 +1426,58 @@ impl ConsensusEngine {
             _ => return Ok(false),
         };
 
+        // A QC proves a quorum reached qc.view, so the jump target is its
+        // successor (see below). Decide what the jump could do before paying
+        // for any pairing: a QC that cannot move the view, or one this node
+        // already holds as its lock or commit, is ignored outright.
+        if qc.view.saturating_add(1) <= current_view
+            || qc == self.round_state.locked_qc()
+            || qc == self.round_state.last_committed_qc()
+        {
+            return Ok(false);
+        }
+        if matches!(msg, ConsensusMessage::Vote(_) | ConsensusMessage::CommitVote(_)) {
+            return Ok(false);
+        }
+
+        // A digest over the QC and the domain it is checked under; a QC
+        // already verified under it skips the pairing.
+        let memo_key = Self::jump_qc_digest(msg, qc);
+        let already_verified = memo_key
+            .as_ref()
+            .is_some_and(|key| self.verified_jump_qcs.get(key).is_some());
+
         // Proposal/Timeout/NewView can carry either a prepare QC or a commit QC as
         // their justify/high QC, so the view-jump path must accept both domains.
         // For Decide we know the exact changes_hash from the message; for others
         // we fall back to ZERO since the proposal is not yet cached on this
         // far-behind node (acceptable: the next regular proposal will retry).
-        let verify_result = match msg {
-            ConsensusMessage::Decide(decide) => super::quorum::verify_commit_qc_with_profile(
-                qc,
-                self.validator_set_for_view(qc.view),
-                &decide.validator_changes_hash,
-                self.signing_profile,
-            ),
-            ConsensusMessage::PrepareQC(_) => super::quorum::verify_qc_with_profile(
-                qc,
-                self.validator_set_for_view(qc.view),
-                self.signing_profile,
-            ),
-            ConsensusMessage::Proposal(_)
-            | ConsensusMessage::Timeout(_)
-            | ConsensusMessage::NewView(_) => self.verify_qc_any_domain_or_known(qc),
-            ConsensusMessage::Vote(_) | ConsensusMessage::CommitVote(_) => return Ok(false),
+        let verify_result = if already_verified {
+            Ok(())
+        } else {
+            match msg {
+                ConsensusMessage::Decide(decide) => super::quorum::verify_commit_qc_with_profile(
+                    qc,
+                    self.validator_set_for_view(qc.view),
+                    &decide.validator_changes_hash,
+                    self.signing_profile,
+                ),
+                ConsensusMessage::PrepareQC(_) => super::quorum::verify_qc_with_profile(
+                    qc,
+                    self.validator_set_for_view(qc.view),
+                    self.signing_profile,
+                ),
+                ConsensusMessage::Proposal(_)
+                | ConsensusMessage::Timeout(_)
+                | ConsensusMessage::NewView(_) => self.verify_qc_any_domain_or_known(qc),
+                ConsensusMessage::Vote(_) | ConsensusMessage::CommitVote(_) => return Ok(false),
+            }
         };
+        if verify_result.is_ok() && !already_verified {
+            if let Some(key) = memo_key {
+                self.verified_jump_qcs.insert(key, ());
+            }
+        }
         if verify_result.is_err() {
             tracing::debug!(target: "n42::cl::engine",
                 current_view,
@@ -4506,6 +4566,43 @@ mod tests {
                 .iter()
                 .any(|o| matches!(o, EngineOutput::ViewChanged { new_view: 100 }))
         );
+    }
+
+    #[test]
+    fn test_view_jump_skips_qcs_that_cannot_move_the_view() {
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+        let justify_qc = build_test_prepare_qc(99, B256::repeat_byte(0xEF), &sks, &vs, &[0, 1, 2]);
+        let far_proposal = |view: u64, justify_qc: QuorumCertificate| {
+            let block_hash = B256::repeat_byte(view as u8);
+            let msg = crate::protocol::quorum::proposal_signing_message(view, &block_hash, &None);
+            ConsensusMessage::Proposal(Proposal {
+                view,
+                block_hash,
+                justify_qc,
+                proposer: 0,
+                signature: sks[0].sign(&msg),
+                prepare_qc: None,
+                tx_root_hash: None,
+                validator_changes: None,
+            })
+        };
+
+        engine
+            .process_event(ConsensusEvent::Message(far_proposal(100, justify_qc.clone())))
+            .expect("first jump");
+        assert_eq!(engine.current_view(), 100);
+        assert_eq!(engine.verified_jump_qcs.len(), 1, "the verified QC is remembered");
+        while rx.try_recv().is_ok() {}
+
+        // The same certificate replayed under a fresh outer view cannot move
+        // the view: it is refused before verification and nothing changes.
+        engine
+            .process_event(ConsensusEvent::Message(far_proposal(200, justify_qc)))
+            .expect("replayed QC is ignored");
+        assert_eq!(engine.current_view(), 100);
+        assert_eq!(engine.verified_jump_qcs.len(), 1);
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|output| matches!(output, EngineOutput::SyncRequired { .. })));
     }
 
     #[test]

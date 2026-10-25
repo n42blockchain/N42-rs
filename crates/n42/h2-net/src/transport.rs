@@ -677,6 +677,12 @@ impl TransportCore {
         let _ = self.swarm.behaviour_mut().ranges.send_response(channel.0, Ok(chunks));
     }
 
+    /// Refuses a [`TransportEvent::RangeRequest`] with the protocol's
+    /// server-error code (a busy server, for one).
+    pub fn respond_range_error(&mut self, channel: RangeRequestChannel, message: String) {
+        let _ = self.swarm.behaviour_mut().ranges.send_response(channel.0, Err(message));
+    }
+
     /// Answers a [`TransportEvent::BlockRequest`]: the block's gov5 RLP, or
     /// gov5's "not found" when this node does not have it.
     /// Hands `chunk` straight to `peer`, unasked.
@@ -1355,6 +1361,15 @@ impl H2V4Transport {
         match &mut self.inner {
             Inner::Inline(core) => core.respond_range(channel, rlps),
             Inner::OffLoop(off) => off.command(crate::pump::Command::RespondRange(channel, rlps)),
+        }
+    }
+
+    /// Refuses a [`TransportEvent::RangeRequest`] with the protocol's
+    /// server-error code, so the asker tries elsewhere or later.
+    pub fn respond_range_error(&mut self, channel: RangeRequestChannel, message: String) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.respond_range_error(channel, message),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::RespondRangeError(channel, message)),
         }
     }
 

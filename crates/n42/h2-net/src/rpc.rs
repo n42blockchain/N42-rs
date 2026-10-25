@@ -869,6 +869,17 @@ pub fn bodies_by_range_protocol() -> StreamProtocol {
 /// gov5's `maxRequestBlocks`: the most blocks one range request may name.
 pub const MAX_RANGE_BLOCKS: u64 = 1024;
 
+/// The most bytes of block RLP this node buffers from one range reply.
+/// Reading stops there and the blocks so far are the reply: a range pull
+/// asks again from where it got to, so a reply cut short is a shorter
+/// window, not an error. A server holding to [`MAX_RANGE_REPLY_BYTES`]
+/// stays under it.
+pub const MAX_RANGE_READ_BYTES: usize = 128 << 20;
+
+/// The most bytes of block RLP this node serves in one range reply (at
+/// least one block is always served).
+pub const MAX_RANGE_REPLY_BYTES: usize = 64 << 20;
+
 /// A range of blocks by number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RangeRequest {
@@ -944,7 +955,12 @@ impl request_response::Codec for BodiesByRangeCodec {
         T: AsyncRead + Unpin + Send,
     {
         let mut chunks = Vec::new();
+        let mut buffered = 0usize;
         loop {
+            if buffered >= MAX_RANGE_READ_BYTES {
+                // Enough held for one reply; the rest is asked for again.
+                return Ok(Ok(chunks));
+            }
             let mut code = [0u8; 1];
             if io.read(&mut code).await? == 0 {
                 // The stream closing is how gov5 ends a range.
@@ -957,6 +973,7 @@ impl request_response::Codec for BodiesByRangeCodec {
             let mut fork_digest = [0u8; 4];
             io.read_exact(&mut fork_digest).await?;
             let rlp = read_framed_limit(io, MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK).await?;
+            buffered = buffered.saturating_add(rlp.len());
             chunks.push(BlockChunk { fork_digest, rlp: rlp.into() });
             if chunks.len() as u64 > MAX_RANGE_BLOCKS {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "peer served more blocks than a range allows"));

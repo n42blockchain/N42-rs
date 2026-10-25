@@ -1076,6 +1076,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         &self.el
     }
 
+    /// The execution layer as a shared handle, for work spawned off the
+    /// consensus loop (serving peers' block and range requests).
+    pub fn execution_layer_arc(&self) -> std::sync::Arc<E> {
+        std::sync::Arc::clone(&self.el)
+    }
+
     /// Current head.
     pub fn head(&self) -> B256 {
         self.head

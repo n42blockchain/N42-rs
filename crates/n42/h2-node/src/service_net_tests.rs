@@ -97,7 +97,9 @@ async fn the_peer_whose_pull_failed_last_is_passed_over_for_another() {
     let mut events = Vec::new();
     within(rig.svc.consider_catch_up(&mut events)).await;
     let catch_up = rig.svc.catch_up.as_ref().expect("a pull");
-    assert_eq!((catch_up.peer, catch_up.target), (short, 20));
+    // The first window stops near the tip (0 + 8 x the far-ahead limit of
+    // 1); a peer that has more serves it full and the pull probes on.
+    assert_eq!((catch_up.peer, catch_up.target), (short, 8));
 
     // With no other peer the failed one is tried again.
     let mut rig = node(1, 0, None).await;
@@ -575,7 +577,7 @@ async fn a_block_asked_for_by_hash_is_served_from_the_store_or_the_execution_lay
 }
 
 #[tokio::test]
-async fn a_range_is_served_from_the_execution_layer_and_an_overfull_queue_is_refused() {
+async fn a_range_is_served_off_the_loop_and_a_peer_past_its_share_is_refused() {
     let (mut a, mut b) = pair(0).await;
     let mut parent = B256::ZERO;
     for number in 1..=3 {
@@ -593,18 +595,23 @@ async fn a_range_is_served_from_the_execution_layer_and_an_overfull_queue_is_ref
     assert_eq!((request.start, request.count), (2, 10));
     assert_eq!(served.len(), 2, "blocks 2 and 3");
 
-    // Nine requests at once to a node that is not draining: eight wait, the
-    // ninth is refused with an empty answer.
+    // Nine requests at once to a node that is not draining: none is served
+    // on its loop; the peer's four slots are taken by work spawned off it,
+    // and the other five are refused at once with the server-error code.
     a.svc.pending_imports.clear();
+    let before = b.seen.len();
     for start in 100..109 {
         a.svc.transport.request_range(target, RangeRequest { start, count: 1, step: 1 });
     }
-    pump(&mut a, &mut b, (false, false), &mut a_events, |a, b, _| {
-        b.svc.pending_ranges.len() == MAX_PENDING_RANGES && !a.svc.pending_imports.is_empty()
+    pump(&mut a, &mut b, (false, false), &mut a_events, |_, b, _| {
+        b.svc.serve_slots.total == MAX_SERVES_PER_PEER && b.seen.len() >= before + 9
     })
     .await;
-    assert_eq!(b.svc.pending_ranges.len(), MAX_PENDING_RANGES);
-    assert!(a.svc.pending_imports[0].2.is_empty(), "the refused request is answered empty");
+    assert_eq!(b.svc.serve_slots.total, MAX_SERVES_PER_PEER, "one peer holds at most its share");
+
+    // The replies are handed over when the loop next gets to them, and the
+    // slots come back.
+    pump(&mut a, &mut b, (false, true), &mut a_events, |_, b, _| b.svc.serve_slots.total == 0).await;
 }
 
 #[tokio::test]

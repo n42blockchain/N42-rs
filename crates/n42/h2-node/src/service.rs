@@ -468,9 +468,8 @@ pub struct H2Service<E> {
     /// Block requests the store could not answer, for the execution layer
     /// on the next drain.
     pending_block_requests: Vec<(String, B256, n42_h2_net::BlockRequestChannel)>,
-    /// Range requests to answer from the execution layer on the next drain;
-    /// kept here because the transport handler cannot await.
-    pending_ranges: Vec<(String, n42_h2_net::RangeRequest, n42_h2_net::RangeRequestChannel)>,
+    /// Peer requests being served off the loop, by peer; see [`ServeSlots`].
+    serve_slots: ServeSlots,
     /// Every body this node built or received, as gov5 block RLP, to answer
     /// `block_by_hash` — gov5's fetch-on-miss, and this node's own. Bounded;
     /// insertion order in `body_store_order`.
@@ -567,7 +566,51 @@ struct CatchUp {
 /// than queued, so one peer cannot hold every other's answers behind a
 /// thousand lookups.
 const MAX_PENDING_SERVES: usize = 256;
-const MAX_PENDING_RANGES: usize = 8;
+
+/// Peer requests (ranges, blocks and fills from the execution layer or a
+/// stored body) one peer may have in flight off the loop; past it the
+/// request is refused with the protocol's server-error code.
+const MAX_SERVES_PER_PEER: usize = 4;
+
+/// The same for all peers together. Every reply in flight comes back on
+/// `served_txns`, so this also bounds that channel.
+const MAX_SERVES_IN_FLIGHT: usize = 32;
+
+/// The most blocks one range reply carries, whatever was asked (gov5 asks
+/// for up to 1,024). The asker reads a shorter reply as a shorter window
+/// and asks again from where it got to.
+const MAX_SERVED_RANGE_BLOCKS: u64 = 32;
+
+/// Requests served off the loop, counted per peer and in total.
+#[derive(Debug, Default)]
+struct ServeSlots {
+    per_peer: std::collections::HashMap<PeerId, usize>,
+    total: usize,
+}
+
+impl ServeSlots {
+    /// Takes a slot for `peer`, or says it is over its share or the total.
+    fn try_take(&mut self, peer: PeerId) -> bool {
+        let mine = self.per_peer.get(&peer).copied().unwrap_or(0);
+        if self.total >= MAX_SERVES_IN_FLIGHT || mine >= MAX_SERVES_PER_PEER {
+            return false;
+        }
+        self.per_peer.insert(peer, mine + 1);
+        self.total += 1;
+        true
+    }
+
+    /// Returns a slot taken for `peer`.
+    fn give_back(&mut self, peer: &PeerId) {
+        if let Some(mine) = self.per_peer.get_mut(peer) {
+            *mine = mine.saturating_sub(1);
+            if *mine == 0 {
+                self.per_peer.remove(peer);
+            }
+            self.total = self.total.saturating_sub(1);
+        }
+    }
+}
 /// A block this far past the execution layer's tip is not handed to it.
 ///
 /// It was 32 — reth's `MIN_BLOCKS_FOR_PIPELINE_RUN`, past which a payload with
@@ -840,8 +883,31 @@ impl LoopSpend {
     }
 }
 
+/// A reply to a peer prepared off the loop, with the channel it goes back
+/// on. Only the swarm can answer, and only this loop drives the swarm.
+enum Served {
+    /// Named transactions of a block.
+    Txns(ServedTxns),
+    /// A block by hash, from the execution layer.
+    Block {
+        peer: PeerId,
+        hash: B256,
+        channel: n42_h2_net::BlockRequestChannel,
+        body: Option<alloy_primitives::Bytes>,
+    },
+    /// A range of blocks, from the execution layer.
+    Range {
+        peer: PeerId,
+        request: n42_h2_net::RangeRequest,
+        channel: n42_h2_net::RangeRequestChannel,
+        rlps: Vec<Vec<u8>>,
+    },
+}
+
 /// A fill prepared on a worker, with the channel it goes back on.
 struct ServedTxns {
+    /// Who asked; its serve slot is returned when the answer is handed over.
+    peer: PeerId,
     channel: n42_h2_net::BlockTxnsChannel,
     reply: n42_h2_net::BlockTxnsReply,
     hash: B256,
@@ -863,9 +929,9 @@ fn fill_reply_on_drain() -> bool {
     *ON.get_or_init(|| std::env::var("N42_FILL_REPLY_ON_DRAIN").is_ok_and(|v| v == "1"))
 }
 /// Where a worker puts one.
-type ServedTxnsTx = tokio::sync::mpsc::UnboundedSender<ServedTxns>;
+type ServedTxnsTx = tokio::sync::mpsc::UnboundedSender<Served>;
 /// Where the loop takes it.
-type ServedTxnsRx = tokio::sync::mpsc::UnboundedReceiver<ServedTxns>;
+type ServedTxnsRx = tokio::sync::mpsc::UnboundedReceiver<Served>;
 
 /// One block's fill rounds; see `fill_rounds` on the service.
 #[derive(Debug, Default)]
@@ -1260,7 +1326,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             catch_up: None,
             pending_imports: Vec::new(),
             pending_block_requests: Vec::new(),
-            pending_ranges: Vec::new(),
+            serve_slots: ServeSlots::default(),
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
             elided_own: std::collections::HashMap::new(),
@@ -1661,7 +1727,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             // sender half lives on `self`, so this never ends.
             served = self.served_txns.1.recv(), if !fill_reply_on_drain() => {
                 if let Some(served) = served {
-                    self.respond_served_txns(served);
+                    self.respond_served(served);
                 }
             }
             imported = async {
@@ -2040,6 +2106,14 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // took the block as a compact body has none and says so;
                 // the asker then has the whole-body road.
                 let held = self.body_store.get(&request.hash).map(|body| body.to_shared());
+                // Every road below but the elided one is work off the loop
+                // held to a per-peer and a total share.
+                let elided = held.is_none() && self.elided_own.contains_key(&request.hash);
+                if !elided && !self.serve_slots.try_take(peer) {
+                    debug!(target: "n42.h2.node", %peer, hash = ?request.hash, "too many requests in flight; fill refused");
+                    self.transport.respond_block_txns(channel, Err("server busy".to_owned()));
+                    return Ok(());
+                }
                 match held {
                     Some(body) => {
                         // The body is shared, not copied, and the walk that
@@ -2062,14 +2136,15 @@ impl<E: ExecutionLayer> H2Service<E> {
                             );
                             // The loop wakes on this (see the step's select):
                             // a follower is waiting on it to vote.
-                            let _ = back.send(ServedTxns {
+                            let _ = back.send(Served::Txns(ServedTxns {
+                                peer,
                                 channel,
                                 reply,
                                 hash: request.hash,
                                 wanted: request.indices.len(),
                                 asked_at,
                                 ready_at: std::time::Instant::now(),
-                            });
+                            }));
                         });
                     }
                     // A member that took this block as a compact body holds
@@ -2085,7 +2160,34 @@ impl<E: ExecutionLayer> H2Service<E> {
                     // block has the body in its store and is the one this
                     // node asks first, so this runs when that member is
                     // gone.
-                    None => self.pending_txns_requests.push((request, channel)),
+                    //
+                    // A block this node took elided is fetched by its header
+                    // on the next drain (it needs this loop's state); any
+                    // other is looked up off the loop.
+                    None if elided => {
+                        if self.pending_txns_requests.len() >= MAX_PENDING_SERVES {
+                            self.transport.respond_block_txns(channel, Err("server busy".to_owned()));
+                        } else {
+                            self.pending_txns_requests.push((request, channel));
+                        }
+                    }
+                    None => {
+                        let el = self.driver.execution_layer_arc();
+                        let back = self.served_txns.0.clone();
+                        let asked_at = std::time::Instant::now();
+                        tokio::spawn(async move {
+                            let reply = txns_from_execution_layer(&*el, &request).await;
+                            let _ = back.send(Served::Txns(ServedTxns {
+                                peer,
+                                channel,
+                                reply,
+                                hash: request.hash,
+                                wanted: request.indices.len(),
+                                asked_at,
+                                ready_at: std::time::Instant::now(),
+                            }));
+                        });
+                    }
                 }
             }
             TransportEvent::BlockTxnsFetched { peer, request, reply } => {
@@ -2187,14 +2289,33 @@ impl<E: ExecutionLayer> H2Service<E> {
                         debug!(target: "n42.h2.node", %peer, ?hash, "peer asked for a block; served from the store");
                         self.transport.respond_block(channel, Some(body));
                     }
-                    None if self.pending_block_requests.len() >= MAX_PENDING_SERVES => {
-                        // A queue this deep is a peer asking faster than the
-                        // execution layer answers; better a prompt "not
-                        // found" than a stall for everyone behind it.
-                        debug!(target: "n42.h2.node", %peer, ?hash, "block request queue full; refused");
+                    // A block this node took elided is fetched by its header
+                    // on the next drain (it needs this loop's state).
+                    None if self.elided_own.contains_key(&hash) => {
+                        if self.pending_block_requests.len() >= MAX_PENDING_SERVES {
+                            // A queue this deep is a peer asking faster than
+                            // the execution layer answers; better a prompt
+                            // refusal than a stall for everyone behind it.
+                            debug!(target: "n42.h2.node", %peer, ?hash, "block request queue full; refused");
+                            self.transport.respond_block(channel, None);
+                        } else {
+                            self.pending_block_requests.push((peer.to_string(), hash, channel));
+                        }
+                    }
+                    // Any other is looked up off the loop, within the
+                    // peer's share of requests in flight.
+                    None if !self.serve_slots.try_take(peer) => {
+                        debug!(target: "n42.h2.node", %peer, ?hash, "too many requests in flight; block request refused");
                         self.transport.respond_block(channel, None);
                     }
-                    None => self.pending_block_requests.push((peer.to_string(), hash, channel)),
+                    None => {
+                        let el = self.driver.execution_layer_arc();
+                        let back = self.served_txns.0.clone();
+                        tokio::spawn(async move {
+                            let body = block_from_execution_layer(&*el, hash).await;
+                            let _ = back.send(Served::Block { peer, hash, channel, body });
+                        });
+                    }
                 }
             }
             TransportEvent::BlockFetched { peer, hash, reply } => match reply {
@@ -2292,11 +2413,19 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // has every block, rather than from the body store, which
                 // has the recent ones. As many as it has from the start, in
                 // order; gov5 reads until the stream closes.
-                if self.pending_ranges.len() >= MAX_PENDING_RANGES {
-                    debug!(target: "n42.h2.node", %peer, ?request, "range request queue full; refused");
-                    self.transport.respond_range(channel, Vec::new());
+                //
+                // Off the loop: up to 32 sequential lookups and the replies'
+                // bytes used to sit on this loop, which is the view's.
+                if !self.serve_slots.try_take(peer) {
+                    debug!(target: "n42.h2.node", %peer, ?request, "too many requests in flight; range refused");
+                    self.transport.respond_range_error(channel, "server busy".to_owned());
                 } else {
-                    self.pending_ranges.push((peer.to_string(), request, channel));
+                    let el = self.driver.execution_layer_arc();
+                    let back = self.served_txns.0.clone();
+                    tokio::spawn(async move {
+                        let rlps = serve_range(&*el, request).await;
+                        let _ = back.send(Served::Range { peer, request, channel, rlps });
+                    });
                 }
             }
             TransportEvent::RangeFetched { peer, request, reply } => match reply {
@@ -2438,7 +2567,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.transport.respond_block(channel, body);
         }
         while let Ok(served) = self.served_txns.1.try_recv() {
-            self.respond_served_txns(served);
+            self.respond_served(served);
         }
         for (request, channel) in std::mem::take(&mut self.pending_txns_requests) {
             if let Some(body) = self.elided_body(request.hash).await {
@@ -2476,14 +2605,6 @@ impl<E: ExecutionLayer> H2Service<E> {
                 "peer asked for named transactions; execution layer consulted"
             );
             self.transport.respond_block_txns(channel, reply);
-        }
-        for (peer, request, channel) in std::mem::take(&mut self.pending_ranges) {
-            // Only the execution layer is held across the await: the
-            // transport is not `Sync`, and a future holding all of `self`
-            // could not be spawned.
-            let rlps = serve_range(self.driver.execution_layer(), request).await;
-            debug!(target: "n42.h2.node", peer, ?request, served = rlps.len(), "peer asked for a range");
-            self.transport.respond_range(channel, rlps);
         }
         for block_hash in std::mem::take(&mut self.received_bodies) {
             events.push(ServiceEvent::BodyReceived { block_hash });
@@ -3797,8 +3918,9 @@ impl<E: ExecutionLayer> H2Service<E> {
         // pull probes on window by window (see `import_ranges`), so the cap
         // costs a real catch-up one short request and a false height one
         // short pull.
-        let height = capped_catch_up_target(height, latest, far_ahead_limit());
-        info!(target: "n42.h2.node", %peer, from = latest, to = height, "behind a peer; pulling the gap by range");
+        let advertised = height;
+        let height = capped_catch_up_target(advertised, latest, far_ahead_limit());
+        info!(target: "n42.h2.node", %peer, from = latest, to = height, advertised, "behind a peer; pulling the gap by range");
         self.catch_up = Some(CatchUp {
             peer,
             next: latest + 1,
@@ -3924,14 +4046,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // The status's target is reached, or a probe window came back
                 // full: the fleet kept producing while this pull ran, and a
                 // gap of a whole window is not one gossip's future queue
-                // closes. Probe on until the peer serves short.
+                // closes. Probe on until the peer serves nothing.
                 catch_up.probing = true;
                 catch_up.target = catch_up.next + MAX_RANGE_BLOCKS - 1;
                 self.request_next_range();
-            } else if catch_up.probing {
-                // Short of a probe window: that was the peer's head.
-                self.finish_catch_up(events, true);
             } else {
+                // Short of the window. A server caps a reply by blocks and
+                // by bytes (this node at 32 blocks and 64 MB), so a short
+                // reply is not the peer's head: ask on from where it got
+                // to. The head is the reply that serves nothing, which ends
+                // a probe as complete (above).
                 self.request_next_range();
             }
         }
@@ -4268,8 +4392,25 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Hands a fill prepared on a worker to the swarm, and says how long it
     /// took: `walk_ms` on the worker, `waited_ms` from ready to handed over
     /// (the wait defect 17b was, 5.5-5.9 s in loop247).
+    fn respond_served(&mut self, served: Served) {
+        match served {
+            Served::Txns(served) => self.respond_served_txns(served),
+            Served::Block { peer, hash, channel, body } => {
+                self.serve_slots.give_back(&peer);
+                debug!(target: "n42.h2.node", %peer, ?hash, found = body.is_some(), "peer asked for a block; execution layer consulted");
+                self.transport.respond_block(channel, body);
+            }
+            Served::Range { peer, request, channel, rlps } => {
+                self.serve_slots.give_back(&peer);
+                debug!(target: "n42.h2.node", %peer, ?request, served = rlps.len(), "peer asked for a range");
+                self.transport.respond_range(channel, rlps);
+            }
+        }
+    }
+
     fn respond_served_txns(&mut self, served: ServedTxns) {
-        let ServedTxns { channel, reply, hash, wanted, asked_at, ready_at } = served;
+        let ServedTxns { peer, channel, reply, hash, wanted, asked_at, ready_at } = served;
+        self.serve_slots.give_back(&peer);
         info!(
             target: "n42.h2.node",
             ?hash,
@@ -4819,18 +4960,28 @@ impl<E: ExecutionLayer> H2Service<E> {
 
 /// The blocks of a range an execution layer can produce, from the start
 /// until the first it does not have.
+///
+/// At most [`MAX_SERVED_RANGE_BLOCKS`] blocks and
+/// [`n42_h2_net::MAX_RANGE_REPLY_BYTES`] of them (one block always), so one
+/// request costs a bounded number of lookups and bytes.
 async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeRequest) -> Vec<Vec<u8>> {
-    let count = request.count.min(MAX_RANGE_BLOCKS);
+    let count = request.count.min(MAX_RANGE_BLOCKS).min(MAX_SERVED_RANGE_BLOCKS);
     let mut rlps = Vec::new();
+    let mut bytes = 0usize;
     for number in request.start..request.start.saturating_add(count) {
         match el.block_by_number(number).await {
             Ok(Some(block)) => {
-                rlps.push(n42_h2_net::encode_block_rlp_raw(
+                let rlp = n42_h2_net::encode_block_rlp_raw(
                     &block.header,
                     &block.transactions,
                     &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
                     None,
-                ));
+                );
+                if !range_reply_takes(rlps.len(), bytes, rlp.len()) {
+                    break;
+                }
+                bytes = bytes.saturating_add(rlp.len());
+                rlps.push(rlp);
             }
             Ok(None) => break,
             Err(err) => {
@@ -4840,6 +4991,60 @@ async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeReques
         }
     }
     rlps
+}
+
+/// Whether a range reply holding `blocks` blocks of `bytes` takes one more
+/// of `next` bytes: always the first, then while the total stays within
+/// [`n42_h2_net::MAX_RANGE_REPLY_BYTES`].
+const fn range_reply_takes(blocks: usize, bytes: usize, next: usize) -> bool {
+    blocks == 0 || bytes.saturating_add(next) <= n42_h2_net::MAX_RANGE_REPLY_BYTES
+}
+
+/// A block by hash as gov5 block RLP, from the execution layer.
+async fn block_from_execution_layer<E: ExecutionLayer>(el: &E, hash: B256) -> Option<alloy_primitives::Bytes> {
+    match el.block_by_hash(hash).await {
+        Ok(Some(block)) => Some(alloy_primitives::Bytes::from(n42_h2_net::encode_block_rlp_raw(
+            &block.header,
+            &block.transactions,
+            &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
+            None,
+        ))),
+        Ok(None) => None,
+        Err(err) => {
+            debug!(target: "n42.h2.node", ?hash, %err, "execution layer could not serve a block");
+            None
+        }
+    }
+}
+
+/// Named transactions of a block, from the execution layer.
+async fn txns_from_execution_layer<E: ExecutionLayer>(
+    el: &E,
+    request: &n42_h2_net::BlockTxnsRequest,
+) -> n42_h2_net::BlockTxnsReply {
+    let reply = match el.block_by_hash(request.hash).await {
+        Ok(Some(block)) => request
+            .indices
+            .iter()
+            .map(|&i| {
+                block
+                    .transactions
+                    .get(i as usize)
+                    .cloned()
+                    .ok_or_else(|| format!("block {} has no index {i}", request.hash))
+            })
+            .collect::<Result<Vec<_>, String>>(),
+        Ok(None) => Err(format!("block {} is not here", request.hash)),
+        Err(err) => Err(err.to_string()),
+    };
+    debug!(
+        target: "n42.h2.node",
+        hash = ?request.hash,
+        wanted = request.indices.len(),
+        served = reply.as_ref().map(Vec::len).unwrap_or(0),
+        "peer asked for named transactions; execution layer consulted"
+    );
+    reply
 }
 
 /// `N42_H2_TRACE_MSGS=1`: one info line per consensus message sent or
@@ -4906,6 +5111,44 @@ mod tests {
         assert_eq!(stale_build_parent(1023, Some(1023)), None, "the committed block is the parent");
         assert_eq!(stale_build_parent(1024, Some(1023)), None, "an own block above it");
         assert_eq!(stale_build_parent(5, None), None, "nothing committed yet");
+    }
+
+    #[test]
+    fn serve_slots_hold_each_peer_and_the_total_to_their_share() {
+        use super::{ServeSlots, MAX_SERVES_IN_FLIGHT, MAX_SERVES_PER_PEER};
+        let mut slots = ServeSlots::default();
+        let one = super::PeerId::random();
+        for _ in 0..MAX_SERVES_PER_PEER {
+            assert!(slots.try_take(one));
+        }
+        assert!(!slots.try_take(one), "a peer past its share is refused");
+        slots.give_back(&one);
+        assert!(slots.try_take(one), "a returned slot is usable again");
+        let mut others = Vec::new();
+        while slots.total < MAX_SERVES_IN_FLIGHT {
+            let peer = super::PeerId::random();
+            assert!(slots.try_take(peer));
+            others.push(peer);
+        }
+        assert!(!slots.try_take(super::PeerId::random()), "the total is capped");
+        for peer in others.iter().chain(std::iter::repeat_n(&one, MAX_SERVES_PER_PEER)) {
+            slots.give_back(peer);
+        }
+        assert_eq!(slots.total, 0);
+        assert!(slots.per_peer.is_empty());
+        // A peer that holds nothing gives nothing back.
+        slots.give_back(&one);
+        assert_eq!(slots.total, 0);
+    }
+
+    #[test]
+    fn a_range_reply_is_capped_by_bytes_but_always_carries_a_block() {
+        use super::range_reply_takes as takes;
+        let cap = n42_h2_net::MAX_RANGE_REPLY_BYTES;
+        assert!(takes(0, 0, cap * 2), "the first block always goes");
+        assert!(takes(1, cap / 2, cap / 2));
+        assert!(!takes(1, cap / 2, cap / 2 + 1));
+        assert!(!takes(3, usize::MAX, 1));
     }
 
     #[test]

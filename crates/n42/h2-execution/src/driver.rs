@@ -141,6 +141,11 @@ pub struct ExecutionDriver<E> {
     max_cached_payloads: usize,
     /// Insertion order, for evicting the oldest cached payload.
     payload_order: Vec<B256>,
+    /// A committed block the execution layer could not make canonical
+    /// because it had not seen the body yet (SYNCING/ACCEPTED). When the body
+    /// later executes, its forkchoice is sent again rather than waiting for
+    /// the next commit to carry the head past it.
+    unconfirmed_commit: Option<B256>,
 }
 
 impl<E: ExecutionLayer> ExecutionDriver<E> {
@@ -157,6 +162,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             finalized: genesis,
             max_cached_payloads: Self::DEFAULT_MAX_CACHED_PAYLOADS,
             payload_order: Vec::new(),
+            unconfirmed_commit: None,
         }
     }
 
@@ -404,6 +410,14 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             Ok(status) => match status.status {
                 PayloadStatusEnum::Valid => {
                     self.head = block_hash;
+                    // A late body for a block consensus already committed:
+                    // the earlier forkchoice found nothing to make canonical.
+                    if self.unconfirmed_commit == Some(block_hash) {
+                        let action = self.commit(block_hash).await;
+                        if action.rejection().is_some() {
+                            return action;
+                        }
+                    }
                     DriverAction::Consensus(Box::new(ConsensusEvent::BlockImported(block_hash)))
                 }
                 // SYNCING/ACCEPTED are not a verdict: the EL has not executed the
@@ -442,11 +456,21 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     block_hash,
                     reason: validation_error.to_string(),
                 },
-                _ => {
+                status => {
                     self.head = block_hash;
-                    // Committed blocks never need re-execution.
-                    self.payloads.remove(&block_hash);
-                    self.payload_order.retain(|h| h != &block_hash);
+                    if matches!(status, PayloadStatusEnum::Valid) {
+                        // Committed blocks never need re-execution.
+                        self.payloads.remove(&block_hash);
+                        self.payload_order.retain(|h| h != &block_hash);
+                        if self.unconfirmed_commit == Some(block_hash) {
+                            self.unconfirmed_commit = None;
+                        }
+                    } else {
+                        // The execution layer does not have this block yet;
+                        // keep any cached body and re-send the forkchoice once
+                        // it executes.
+                        self.unconfirmed_commit = Some(block_hash);
+                    }
                     DriverAction::Finalized { block_hash }
                 }
             },

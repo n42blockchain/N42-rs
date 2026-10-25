@@ -218,6 +218,53 @@ async fn commit_finalizes_head_safe_and_finalized_together() {
 }
 
 #[tokio::test]
+async fn a_body_arriving_after_its_commit_is_made_canonical_then() {
+    // The Decide reached this node before the block body: the commit's
+    // forkchoice found nothing to make canonical.
+    let el = MockExecutionLayer::with_behaviour(MockBehaviour {
+        fork_choice_status: PayloadStatusEnum::Syncing,
+        ..Default::default()
+    });
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    let hash = B256::repeat_byte(0x23);
+    assert_eq!(driver.handle_output(&execute(hash)).await.missing_block(), Some(hash));
+    assert_eq!(driver.handle_output(&committed(hash)).await.finalized_block(), Some(hash));
+
+    // The body arrives late, and the execution layer now has it.
+    el.set_behaviour(MockBehaviour::default());
+    driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
+    let action = driver.handle_output(&execute(hash)).await;
+    assert_eq!(action.imported_block(), Some(hash));
+
+    let tail: Vec<_> = el.calls().into_iter().rev().take(2).collect();
+    assert_eq!(tail[1], ElCall::NewPayload(hash));
+    match &tail[0] {
+        ElCall::ForkchoiceUpdated(state) => {
+            assert_eq!(state.head_block_hash, hash);
+            assert_eq!(state.finalized_block_hash, hash);
+        }
+        other => panic!("late body must re-send the commit's forkchoice, got {other:?}"),
+    }
+    assert!(!driver.has_payload(&hash));
+
+    // Once confirmed, executing the block again sends no further forkchoice.
+    driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
+    let before = el.calls().len();
+    driver.handle_output(&execute(hash)).await;
+    assert_eq!(el.calls()[before..], [ElCall::NewPayload(hash)]);
+}
+
+#[tokio::test]
+async fn an_ordinary_import_sends_no_extra_forkchoice() {
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    let hash = B256::repeat_byte(0x24);
+    driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
+    driver.handle_output(&execute(hash)).await;
+    assert_eq!(el.calls(), [ElCall::NewPayload(hash)]);
+}
+
+#[tokio::test]
 async fn a_build_that_never_starts_reports_the_status_not_a_bare_failure() {
     let el = MockExecutionLayer::with_behaviour(MockBehaviour {
         start_builds: false,

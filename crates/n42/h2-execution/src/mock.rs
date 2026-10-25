@@ -40,6 +40,8 @@ pub struct MockBehaviour {
     pub start_builds: bool,
     /// Whether `new_payload` errors outright.
     pub new_payload_error: Option<String>,
+    /// Status returned by `forkchoiceUpdated` without attributes.
+    pub fork_choice_status: PayloadStatusEnum,
 }
 
 impl Default for MockBehaviour {
@@ -48,6 +50,7 @@ impl Default for MockBehaviour {
             new_payload_status: PayloadStatusEnum::Valid,
             start_builds: true,
             new_payload_error: None,
+            fork_choice_status: PayloadStatusEnum::Valid,
         }
     }
 }
@@ -216,9 +219,10 @@ impl ExecutionLayer for MockExecutionLayer {
         state: ForkchoiceState,
     ) -> Result<ForkchoiceUpdated, ElError> {
         self.record(ElCall::ForkchoiceUpdated(state));
+        let status = self.behaviour.lock().expect("mock behaviour lock").fork_choice_status.clone();
         Ok(ForkchoiceUpdated {
             payload_status: PayloadStatus {
-                status: PayloadStatusEnum::Valid,
+                status,
                 latest_valid_hash: Some(state.head_block_hash),
             },
             payload_id: None,

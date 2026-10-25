@@ -1246,6 +1246,14 @@ impl ConsensusEngine {
         }
     }
 
+    /// A digest of the whole message as encoded; `None` only if it does not
+    /// encode, and such a message is never taken for a duplicate (the caps
+    /// still bound it).
+    fn future_message_digest(msg: &ConsensusMessage) -> Option<B256> {
+        let encoded = bincode::serialize(msg).ok()?;
+        Some(B256::from(*blake3::hash(&encoded).as_bytes()))
+    }
+
     /// Buffers a message for a future view inside the window, bounded and
     /// deduplicated. Returns whether the message was buffered.
     ///
@@ -1268,8 +1276,16 @@ impl ConsensusEngine {
         authenticated: bool,
     ) -> bool {
         let (kind, sender, hash) = Self::future_message_key(&msg);
+        // A copy is a duplicate only if it is the same message byte for
+        // byte: an unchecked fake that names the right (kind, view, sender,
+        // hash) must not take the genuine message's place. The digest is
+        // computed only for the few entries the cheap key already matches.
+        let digest = Self::future_message_digest(&msg);
         if self.future_msg_buffer.iter().any(|(buffered_view, buffered)| {
-            *buffered_view == view && Self::future_message_key(buffered) == (kind, sender, hash)
+            *buffered_view == view
+                && Self::future_message_key(buffered) == (kind, sender, hash)
+                && digest.is_some()
+                && Self::future_message_digest(buffered) == digest
         }) {
             return false;
         }
@@ -5825,6 +5841,33 @@ mod tests {
             "the next view's proposal must be buffered"
         );
         assert_eq!(engine.future_msg_buffer.len(), 4 * MAX_FUTURE_MESSAGES_PER_SENDER);
+    }
+
+    #[test]
+    fn test_future_buffer_dedup_tells_apart_copies_that_differ_in_their_signatures() {
+        use n42_h2_primitives::consensus::PrepareQC;
+
+        let (mut engine, sks, vs, _rx) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0x61);
+        // Same kind, view and block hash; aggregate signatures over other
+        // blocks, so neither verifies and neither moves the view.
+        let forged = |over: u8| {
+            let other = build_test_prepare_qc(5, B256::repeat_byte(over), &sks, &vs, &[0, 1, 2]);
+            ConsensusMessage::PrepareQC(PrepareQC {
+                view: 5,
+                block_hash,
+                qc: QuorumCertificate { view: 5, block_hash, ..other },
+            })
+        };
+        for message in [forged(0xA1), forged(0xA2), forged(0xA1)] {
+            engine.process_event(ConsensusEvent::Message(message)).expect("buffered or dropped");
+        }
+        assert_eq!(engine.current_view(), 1);
+        assert_eq!(
+            engine.future_msg_buffer.len(),
+            2,
+            "a copy with other signature bytes is not the same message; an identical one is"
+        );
     }
 
     #[test]

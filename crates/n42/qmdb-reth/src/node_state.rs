@@ -706,6 +706,9 @@ struct Inner {
     /// Who held the forest's lock and its tree, and who waited
     /// ([`crate::occupancy`]).
     occupancy: crate::occupancy::Occupancy,
+    /// Why this run's restored tree was not checked against a recorded
+    /// root, if it was not ([`QmdbNodeState::unchecked_restart`]).
+    unchecked_restart: std::sync::OnceLock<String>,
 }
 
 /// A rename queued by [`QmdbNodeState::rename_or_defer`].
@@ -1067,6 +1070,7 @@ impl QmdbNodeState {
                 persist_advance_us: Default::default(),
                 persist_holds: Default::default(),
                 occupancy: Default::default(),
+                unchecked_restart: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -1580,6 +1584,17 @@ impl QmdbNodeState {
         guard.as_ref().and_then(|forest| forest.poisoned().map(str::to_owned))
     }
 
+    /// Why this run restarted on a tree that was not checked against the
+    /// root recorded for its head, if it did: no `forest.roots` (a datadir
+    /// from before the check), no whole record of that head (a crash before
+    /// it was recorded, or a ring slot overwritten by a later head), or an
+    /// unreadable file. Set once at initialisation and kept for the run, for a
+    /// health check beside [`Self::poisoned`]. The heads persisted from then
+    /// on are recorded, so the next restart past one of them is checked.
+    pub fn unchecked_restart(&self) -> Option<&str> {
+        self.inner.unchecked_restart.get().map(String::as_str)
+    }
+
     /// Where the persisted heads' roots are recorded ([`HeadRoots`]).
     pub fn head_roots_path(&self) -> PathBuf {
         self.inner.dir.join(HEAD_ROOTS_FILE)
@@ -1607,9 +1622,20 @@ impl QmdbNodeState {
         // The record is a check, not state: a file that cannot be read skips
         // the comparison, as a missing record does.
         let recorded = match HeadRoots::read(&path, head.0, head.1) {
-            Ok(recorded) => recorded,
+            Ok(Some(recorded)) => Some(recorded),
+            Ok(None) if !path.exists() => {
+                self.note_unchecked_restart(head, "no forest.roots file (a datadir from before the root check)");
+                None
+            }
+            Ok(None) => {
+                self.note_unchecked_restart(
+                    head,
+                    "no whole record of this head in forest.roots (lost in a crash, or its slot overwritten)",
+                );
+                None
+            }
             Err(error) => {
-                warn!(target: "n42.qmdb", %error, path = %path.display(), block = head.0, "could not read the recorded QMDB roots; the restored tree is not checked");
+                self.note_unchecked_restart(head, &format!("forest.roots could not be read: {error}"));
                 None
             }
         };
@@ -1622,11 +1648,19 @@ impl QmdbNodeState {
                 tracing::error!(target: "n42.qmdb", block = head.0, hash = %head.1, %recorded, %restored, "the restored QMDB tree has the wrong root");
                 Err(NodeStateError::RestoredRootMismatch { number: head.0, hash: head.1, recorded, restored })
             }
-            None => {
-                warn!(target: "n42.qmdb", block = head.0, hash = %head.1, %restored, "no recorded root for the restored QMDB head; its tree is not checked");
-                Ok(())
-            }
+            None => Ok(()),
         }
+    }
+
+    /// Marks this run as restarted unchecked ([`Self::unchecked_restart`])
+    /// and says why.
+    fn note_unchecked_restart(&self, head: (u64, B256), reason: &str) {
+        warn!(
+            target: "n42.qmdb",
+            block = head.0, hash = %head.1, path = %self.head_roots_path().display(), reason,
+            "the restored QMDB tree is not checked against a recorded root; the heads persisted from now on are recorded",
+        );
+        let _ = self.inner.unchecked_restart.set(reason.to_owned());
     }
 
     fn cursor(&self) -> MutexGuard<'_, PersistCursor> {

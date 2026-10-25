@@ -1044,6 +1044,7 @@ fn a_restart_over_a_corrupt_entry_file_fails_on_its_root() {
     let clean = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
     clean.initialize((3, head)).expect("a clean restart");
     assert_eq!(clean.state_root(), root);
+    assert_eq!(clean.unchecked_restart(), None, "a checked restart is not flagged");
     drop(clean);
 
     let good = std::fs::read(&entries).expect("the entry file");
@@ -1057,10 +1058,21 @@ fn a_restart_over_a_corrupt_entry_file_fails_on_its_root() {
 
     std::fs::write(&entries, &good).expect("restore the record");
     std::fs::remove_file(&roots).expect("drop the record");
-    let unchecked = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    let unchecked = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
     unchecked.initialize((3, head)).expect("no record: the check is skipped");
     assert_eq!(unchecked.state_root(), root);
+    let reason = unchecked.unchecked_restart().expect("an unchecked restart is flagged");
+    assert!(reason.contains("no forest.roots"), "{reason}");
+    // The first head persisted after it is recorded, so the next restart is
+    // checked.
+    let (head4, root4) = advance(&unchecked, 4, head);
+    assert!(roots.exists(), "the persisted head's root is recorded");
     drop(unchecked);
+    let rechecked = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    rechecked.initialize((4, head4)).expect("the second restart");
+    assert_eq!(rechecked.state_root(), root4);
+    assert_eq!(rechecked.unchecked_restart(), None, "the second restart is checked");
+    drop(rechecked);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1101,6 +1113,8 @@ fn absent_roots_are_not_recorded_and_an_unreadable_record_is_skipped() {
     let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, true);
     restarted.initialize((2, head)).expect("an unreadable record does not block startup");
     assert_eq!(restarted.state_root(), root);
+    // (Which reason depends on how the file system sizes a directory.)
+    assert!(restarted.unchecked_restart().is_some(), "an unchecked restart is flagged");
     drop(restarted);
     let _ = std::fs::remove_dir_all(&dir);
 }

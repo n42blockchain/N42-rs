@@ -332,6 +332,13 @@ pub struct H2Service<E> {
     /// for one of these re-runs the execution instead of waiting for the next
     /// proposal to mention the block again, which it may never do.
     awaiting_bodies: HashSet<B256>,
+    /// When each entry of `awaiting_bodies` was first awaited: the set is
+    /// capped at [`MAX_AWAITING_BODIES`] (oldest out) and an entry is aged
+    /// out after [`BODY_BOOKKEEPING_TTL`], so hashes that never arrive do not
+    /// stay forever.
+    awaiting_since: std::collections::HashMap<B256, std::time::Instant>,
+    /// When `awaiting_bodies` and `held_bodies` were last aged out.
+    last_body_age_out: Option<std::time::Instant>,
     /// Blocks this node took as a *compact* body (`N42_COMPACT_BODY`), with
     /// the frame they arrived in.
     ///
@@ -765,6 +772,19 @@ const TX_FORWARD_QUEUE: usize = 4;
 const INBOUND_TX_CAP: usize = 8000;
 
 const MAX_HELD_BODIES: usize = 4096;
+
+/// Blocks awaited for a body at most; the oldest go first.
+const MAX_AWAITING_BODIES: usize = 4096;
+
+/// How long a block may stay awaited or held before it is forgotten. Far
+/// beyond any healthy wait ([`HELD_TOO_LONG`] already warns at 2 s): what is
+/// still there after this is a hash that never arrives or a far-ahead body
+/// that will never be executable here. A real block that comes back later
+/// is caught up by range like any other.
+const BODY_BOOKKEEPING_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// At most one age-out pass this often.
+const BODY_AGE_OUT_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// At most one held-block line this often, however many are held.
 const HELD_LOG_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
@@ -1355,6 +1375,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             header_profile: HeaderProfile::Ethereum,
             native_wire: false,
             awaiting_bodies: HashSet::new(),
+            awaiting_since: std::collections::HashMap::new(),
+            last_body_age_out: None,
             compact_bodies: std::collections::HashMap::new(),
             compact_order: std::collections::VecDeque::new(),
             body_from: std::collections::HashMap::new(),
@@ -2706,6 +2728,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         // request, so the resulting BlockImported reaches the engine the same
         // way.
         self.refresh_layer_for_held().await;
+        self.age_out_body_bookkeeping();
         for block_hash in std::mem::take(&mut self.held_bodies) {
             if self.holds_far_ahead(block_hash) {
                 self.held_bodies.push(block_hash);
@@ -3304,7 +3327,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         };
         if head != self.driver.head() && head_header.is_none() {
             warn!(target: "n42.h2.node", view, certified = ?head, imported = ?self.driver.head(), "the block our highest QC certifies is not imported; asking for it before proposing");
-            if self.awaiting_bodies.insert(head) {
+            if self.await_body(head) {
                 for peer in self.transport.connected_peer_ids() {
                     self.transport.request_block(peer, head);
                 }
@@ -3764,7 +3787,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     // has passed without the body arriving on its own.
                     self.body_wait.entry(block_hash).or_insert_with(std::time::Instant::now);
                 } else if self.body_request_due(block_hash) {
-                    self.awaiting_bodies.insert(block_hash);
+                    self.await_body(block_hash);
                     for peer in self.transport.connected_peer_ids() {
                         self.transport.request_block(peer, block_hash);
                     }
@@ -4365,7 +4388,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             if self.body_request_due(block_hash) {
                 info!(target: "n42.h2.node", ?block_hash, grace_ms = grace.as_millis() as u64, "body did not arrive within the grace; asking peers");
-                self.awaiting_bodies.insert(block_hash);
+                self.await_body(block_hash);
                 for peer in self.transport.connected_peer_ids() {
                     self.transport.request_block(peer, block_hash);
                 }
@@ -4382,6 +4405,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             debug!(target: "n42.h2.node", ?block_hash, waited_ms = at.elapsed().as_millis() as u64, "eager import queued");
         }
         self.awaiting_bodies.remove(&block_hash);
+        self.awaiting_since.remove(&block_hash);
         self.body_wait.remove(&block_hash);
         if !self.imported.contains(&block_hash) && !self.ready_bodies.contains(&block_hash) {
             self.ready_bodies.push(block_hash);
@@ -4420,7 +4444,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
         let peers = self.transport.connected_peer_ids();
         if peers.is_empty() || !self.body_request_due(parent) { return };
-        self.awaiting_bodies.insert(parent);
+        self.await_body(parent);
         for peer in peers {
             self.transport.request_block(peer, parent);
         }
@@ -4440,7 +4464,92 @@ impl<E: ExecutionLayer> H2Service<E> {
             while self.body_store_order.len() > remembered_bodies() {
                 let oldest = self.body_store_order.remove(0);
                 self.body_store.remove(&oldest);
+                self.forget_evicted_body(oldest);
             }
+        }
+    }
+
+    /// Marks `block_hash` as awaiting its body; returns whether it was not
+    /// awaited already. Bounded: past [`MAX_AWAITING_BODIES`] the oldest
+    /// entry is forgotten.
+    fn await_body(&mut self, block_hash: B256) -> bool {
+        let added = self.awaiting_bodies.insert(block_hash);
+        self.awaiting_since.entry(block_hash).or_insert_with(std::time::Instant::now);
+        while self.awaiting_bodies.len() > MAX_AWAITING_BODIES {
+            let oldest = self
+                .awaiting_bodies
+                .iter()
+                .min_by_key(|hash| self.awaiting_since.get(*hash).copied())
+                .copied();
+            let Some(oldest) = oldest else { break };
+            self.awaiting_bodies.remove(&oldest);
+            self.awaiting_since.remove(&oldest);
+        }
+        added
+    }
+
+    /// Stops holding `block_hash` (the far-ahead hold) and its log state.
+    fn release_held(&mut self, block_hash: B256) {
+        self.held_bodies.retain(|hash| *hash != block_hash);
+        self.held_since.remove(&block_hash);
+        self.held_warned.remove(&block_hash);
+    }
+
+    /// A body evicted from `body_store`: a held entry whose body the driver
+    /// does not hold either can never execute from here, and an awaited
+    /// one is no longer worth waiting for.
+    fn forget_evicted_body(&mut self, block_hash: B256) {
+        if self.held_bodies.contains(&block_hash) && !self.driver.has_body(&block_hash) {
+            debug!(target: "n42.h2.node", ?block_hash, "held body evicted from the store; no longer held");
+            self.release_held(block_hash);
+        }
+        if self.awaiting_bodies.remove(&block_hash) {
+            self.awaiting_since.remove(&block_hash);
+        }
+    }
+
+    /// Ages out awaited and held blocks older than [`BODY_BOOKKEEPING_TTL`],
+    /// at most once per [`BODY_AGE_OUT_EVERY`]. Lineage is not touched.
+    fn age_out_body_bookkeeping(&mut self) {
+        let now = std::time::Instant::now();
+        if self.last_body_age_out.is_some_and(|at| now.duration_since(at) < BODY_AGE_OUT_EVERY) {
+            return;
+        }
+        self.last_body_age_out = Some(now);
+
+        // An entry without a time (put in directly) starts its clock now.
+        for hash in &self.awaiting_bodies {
+            self.awaiting_since.entry(*hash).or_insert(now);
+        }
+        let awaiting = &self.awaiting_bodies;
+        self.awaiting_since.retain(|hash, _| awaiting.contains(hash));
+        let stale: Vec<B256> = self
+            .awaiting_since
+            .iter()
+            .filter(|(_, since)| now.duration_since(**since) >= BODY_BOOKKEEPING_TTL)
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in &stale {
+            self.awaiting_bodies.remove(hash);
+            self.awaiting_since.remove(hash);
+        }
+
+        let held: Vec<B256> = self
+            .held_bodies
+            .iter()
+            .filter(|hash| {
+                self.held_since
+                    .get(*hash)
+                    .is_some_and(|since| now.duration_since(*since) >= BODY_BOOKKEEPING_TTL)
+            })
+            .copied()
+            .collect();
+        for hash in &held {
+            self.release_held(*hash);
+        }
+        if !stale.is_empty() || !held.is_empty() {
+            info!(target: "n42.h2.node", awaited = stale.len(), held = held.len(),
+                  ttl_s = BODY_BOOKKEEPING_TTL.as_secs(), "forgot blocks awaited or held past the limit");
         }
     }
 
@@ -4559,7 +4668,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.driver.forget_payload(block_hash);
         }
         if self.body_request_due(block_hash) {
-            self.awaiting_bodies.insert(block_hash);
+            self.await_body(block_hash);
             // One peer, not every peer: a whole body is 26 MB, and six of
             // them answering at once is 156 MB read off six consensus loops
             // for one block. The member that pushed the compact body is

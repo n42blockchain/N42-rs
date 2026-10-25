@@ -1197,3 +1197,54 @@ async fn check_ahead_unheld_hands_a_far_ahead_block_to_the_driver_up_to_the_queu
         gate.add_permits(16);
     }
 }
+
+/// C17's bounded part: awaited and held blocks age out, the awaited set is
+/// capped oldest-first, and a held block whose body is evicted from the
+/// store (and is not in the driver) is no longer held.
+#[tokio::test]
+async fn awaited_and_held_blocks_are_bounded_aged_out_and_dropped_with_their_evicted_body() {
+    let mut rig = node(1, 0, None).await;
+    let Some(long_ago) = std::time::Instant::now().checked_sub(BODY_BOOKKEEPING_TTL + Duration::from_secs(1)) else {
+        return;
+    };
+    let numbered = |n: u64| B256::left_padding_from(&n.to_be_bytes());
+
+    // Aged out past the limit; a fresh entry stays.
+    let stale = B256::repeat_byte(0xA1);
+    let fresh = B256::repeat_byte(0xA2);
+    assert!(rig.svc.await_body(stale));
+    assert!(!rig.svc.await_body(stale), "already awaited");
+    assert!(rig.svc.await_body(fresh));
+    rig.svc.awaiting_since.insert(stale, long_ago);
+    let held_stale = B256::repeat_byte(0xB1);
+    let held_fresh = B256::repeat_byte(0xB2);
+    rig.svc.held_bodies.extend([held_stale, held_fresh]);
+    rig.svc.held_since.insert(held_stale, long_ago);
+    rig.svc.held_since.insert(held_fresh, std::time::Instant::now());
+    rig.svc.age_out_body_bookkeeping();
+    assert!(!rig.svc.awaiting_bodies.contains(&stale));
+    assert!(!rig.svc.awaiting_since.contains_key(&stale));
+    assert!(rig.svc.awaiting_bodies.contains(&fresh));
+    assert_eq!(rig.svc.held_bodies, vec![held_fresh]);
+    assert!(!rig.svc.held_since.contains_key(&held_stale));
+
+    // Capped: past the bound the oldest awaited block is forgotten.
+    rig.svc.awaiting_since.insert(fresh, long_ago);
+    for n in 1..=MAX_AWAITING_BODIES as u64 {
+        rig.svc.await_body(numbered(n));
+    }
+    assert_eq!(rig.svc.awaiting_bodies.len(), MAX_AWAITING_BODIES);
+    assert!(!rig.svc.awaiting_bodies.contains(&fresh), "the oldest goes first");
+    assert!(rig.svc.awaiting_bodies.contains(&numbered(MAX_AWAITING_BODIES as u64)));
+
+    // A held block whose body leaves the store, with no copy in the driver.
+    rig.svc.held_bodies.push(held_stale);
+    rig.svc.held_since.insert(held_stale, std::time::Instant::now());
+    rig.svc.remember_body(held_stale, Bytes::from_static(&[1]));
+    for n in 1..=remembered_bodies() as u64 {
+        rig.svc.remember_body(numbered(n), Bytes::from_static(&[2]));
+    }
+    assert!(!rig.svc.body_store.contains_key(&held_stale));
+    assert_eq!(rig.svc.held_bodies, vec![held_fresh], "the evicted body is no longer held");
+    assert!(!rig.svc.held_since.contains_key(&held_stale));
+}

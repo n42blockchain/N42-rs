@@ -101,7 +101,28 @@ impl<C, EvmF> N42EvmConfig<C, EvmF> {
         if hotstuff {
             return header.beneficiary;
         }
-        n42_clique_utils::recover_address(header).unwrap_or(header.beneficiary)
+        match n42_clique_utils::recover_address(header) {
+            Ok(signer) => signer,
+            Err(err) => {
+                // No seal at all is an Ethereum header (this config also runs
+                // the spec tests and non-N42 chains): its beneficiary is the
+                // fee recipient. A seal-sized extra data whose seal does not
+                // recover is an APoS header consensus should have refused;
+                // `evm_env` cannot fail (`Error = Infallible`), so the
+                // fallback stays, but it is no longer silent: the fees go to
+                // the header's beneficiary, not the signer the builder
+                // credited, and the state root will say so.
+                if header.extra_data.len() >= n42_clique_utils::SIGNATURE_LENGTH {
+                    tracing::warn!(
+                        target: "n42::evm",
+                        number = header.number,
+                        %err,
+                        "the APoS seal does not recover; crediting the header's beneficiary"
+                    );
+                }
+                header.beneficiary
+            }
+        }
     }
 
     /// Whether blocks are credited to their signer (an APoS chain).

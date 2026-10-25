@@ -106,6 +106,11 @@
 //! transactions under a sender the frame claims without checking a signature,
 //! and attested frames (`N42_FRAME_GATEWAYS`) are admitted on a gateway's word.
 //! Whoever can reach the port can then feed the node unverified transactions.
+//! In particular `leader`/`shard` trust the gateway's frames outright: a 0x50
+//! transaction with a valid public key and a garbage signature is accepted
+//! (its sender is derived from the key, its signature never checked), so any
+//! account whose key is known can be spent from. These modes are loopback-only
+//! benchmark probes, and the bind refusal below is the actual guard.
 //!
 //! It is off unless `N42_TX_INGEST=<addr>` is set, and it binds loopback only:
 //! a non-loopback address is refused at start-up unless
@@ -2076,8 +2081,10 @@ fn in_my_shard(hash: &alloy_primitives::B256, (index, count): (u64, u64)) -> boo
 /// and recorded as its sender (the 0x50 sender cache), so the vote road and
 /// the payload conversion read it as an answer. A 0x50 claim must be the
 /// sender the transaction's key derives (one keccak) or the transaction is
-/// dropped, so a claim can never name another account; what goes unchecked
-/// is the signature. **Nothing verifies it anywhere afterwards** -- this is the unsafe benchmark probe of
+/// dropped -- but the signature still goes unchecked, and an Ed25519 key is
+/// public once its account has sent anything, so a transaction carrying a
+/// victim's key and a garbage signature is admitted under the victim's
+/// account. **Nothing verifies it anywhere afterwards** -- this is the unsafe benchmark probe of
 /// `docs/VERIFY_ONCE_DESIGN.md` form C, correct only while no node and no
 /// generator lies. With `shard` `None` this is `leader`/`all` unchanged.
 ///

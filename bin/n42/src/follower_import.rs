@@ -2302,15 +2302,9 @@ where
                                     return Ok(Some(sender));
                                 }
                                 match tx {
-                                    // A hit counts only when it is the sender
-                                    // the key derives (one keccak); any other
-                                    // is a miss and goes to the verification.
-                                    TransactionSigned::AltSig(alt) => Ok(alt_cache
-                                        .get(alt.hash())
-                                        .filter(|sender| *sender == alt.sender())
-                                        .inspect(|_| {
-                                            cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        })),
+                                    TransactionSigned::AltSig(alt) => Ok(alt_cache.get(alt.hash()).inspect(|_| {
+                                        cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    })),
                                     TransactionSigned::Eth(_) => {
                                         if let Some(sender) = senders_cache.and_then(|cache| cache.get(tx.tx_hash())) {
                                             cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -260,11 +260,7 @@ fn sender_of(tx: &TransactionSigned) -> Result<alloy_primitives::Address, String
     match tx {
         TransactionSigned::AltSig(alt) => {
             let cache = n42_tx_types::AltSigSenderCache::global();
-            // A hit is taken only when it is the sender the key derives (one
-            // keccak): anything else in the cache is not an answer.
-            if let Some(sender) = cache.get(alt.hash())
-                && sender == alt.sender()
-            {
+            if let Some(sender) = cache.get(alt.hash()) {
                 return Ok(sender);
             }
             let sender = n42_tx_types::verify_batch(&[alt])

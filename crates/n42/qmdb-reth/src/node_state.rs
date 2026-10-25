@@ -755,6 +755,18 @@ fn apply_rename(forest: &mut QmdbForest, rename: &PendingRename) -> Result<(), S
     }
 }
 
+/// Removes a file that may not exist (an old log, a folded segment): a
+/// missing file is the expected case, any other failure is logged with the
+/// path, since the file then stays beside a checkpoint that supersedes it.
+fn remove_file_logged(path: impl AsRef<Path>) {
+    let path = path.as_ref();
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(target: "n42.qmdb", %error, path = %path.display(), "could not remove a superseded QMDB file"),
+    }
+}
+
 /// A forest-lock wait or hold longer than this is logged at WARN
 /// (`forest lock waited` / `forest lock held`, with the holder's label).
 pub const FOREST_LOCK_WARN_MS: u64 = 20;
@@ -2352,8 +2364,8 @@ impl QmdbNodeState {
                 // A genesis forest has no checkpoint on disk yet; the first
                 // head move writes one, and until then there is nothing for a
                 // delta to be measured against.
-                let _ = std::fs::remove_file(&log_path);
-                let _ = std::fs::remove_file(self.sealed_log_path());
+                remove_file_logged(&log_path);
+                remove_file_logged(self.sealed_log_path());
                 *cursor = PersistCursor {
                     head: forest.head().1,
                     next_slot: forest.next_slot(),
@@ -2455,7 +2467,7 @@ impl QmdbNodeState {
         // The version-1 checkpoint and whatever log there was are folded into
         // the entry file and the new checkpoint; a delta the file already
         // covers would be refused as standing on the wrong cursor.
-        let _ = std::fs::remove_file(&v1_path);
+        remove_file_logged(&v1_path);
         Ok(forest)
     }
 
@@ -2470,8 +2482,8 @@ impl QmdbNodeState {
         let ckpt = forest.checkpoint()?;
         forest.forget_changes();
         let checkpoint_len = write_ckpt(&self.ckpt_path(), &ckpt, &mut CompactPhases::default())?;
-        let _ = std::fs::remove_file(self.delta_log_path());
-        let _ = std::fs::remove_file(self.sealed_log_path());
+        remove_file_logged(self.delta_log_path());
+        remove_file_logged(self.sealed_log_path());
         *cursor = PersistCursor {
             head: ckpt.head_hash,
             next_slot: ckpt.next_slot,
@@ -2541,8 +2553,8 @@ impl QmdbNodeState {
         // Any log left in this datadir describes a different chain of states.
         // Its first delta would be refused for standing on the wrong cursor,
         // which is safe but reads as corruption; removing it is the truth.
-        let _ = std::fs::remove_file(self.delta_log_path());
-        let _ = std::fs::remove_file(self.sealed_log_path());
+        remove_file_logged(self.delta_log_path());
+        remove_file_logged(self.sealed_log_path());
         *cursor = PersistCursor {
             head: snapshot.head_hash,
             next_slot: snapshot.tree.next_slot,
@@ -3159,7 +3171,7 @@ impl QmdbNodeState {
                     });
                 }
                 let len = write_ckpt(&ckpt_path, &ckpt, &mut phases)?;
-                let _ = std::fs::remove_file(&sealed_path);
+                remove_file_logged(&sealed_path);
                 return Ok((len, read_ms));
             }
             let checkpoint = read_snapshot(&path)?.ok_or_else(|| NodeStateError::NoSnapshot {
@@ -3182,7 +3194,7 @@ impl QmdbNodeState {
             let len = write_snapshot(&path, &snapshot, &mut phases)?;
             // The segment goes only once the checkpoint that covers it is on
             // disk; a crash in between leaves a segment a restart skips.
-            let _ = std::fs::remove_file(&sealed_path);
+            remove_file_logged(&sealed_path);
             Ok((len, read_ms))
         })();
         let mut cursor = self.cursor();
@@ -3278,7 +3290,7 @@ impl QmdbNodeState {
             self.save_checkpoint_frontier((ckpt.head_number, block_hash))?;
             let len = write_ckpt(&self.ckpt_path(), &ckpt, &mut phases)?;
             self.record_head_roots(&[(ckpt.head_number, block_hash, root)]);
-            let _ = std::fs::remove_file(self.delta_log_path());
+            remove_file_logged(self.delta_log_path());
             *cursor = PersistCursor {
                 head: block_hash,
                 next_slot: ckpt.next_slot,
@@ -3316,7 +3328,7 @@ impl QmdbNodeState {
         // Order matters: the log is emptied only once the checkpoint that
         // supersedes it is on disk, so a crash between the two leaves a log
         // that is merely redundant rather than a state with neither.
-        let _ = std::fs::remove_file(self.delta_log_path());
+        remove_file_logged(self.delta_log_path());
         *cursor = PersistCursor {
             head: block_hash,
             next_slot: snapshot.tree.next_slot,
@@ -3995,6 +4007,25 @@ mod tests {
         assert_eq!(state.root_of(&built), None, "moved, not copied");
         assert_eq!(state.inner.rename_alias_count.load(std::sync::atomic::Ordering::Acquire), 0);
         assert_eq!(state.offlock_counters().failed_renames, 1);
+    }
+
+    /// A superseded file that is already gone is not an error, and one that
+    /// cannot be removed is logged rather than panicking or failing the caller.
+    #[test]
+    fn a_superseded_file_that_cannot_be_removed_is_only_logged() {
+        let dir = scratch("remove-logged");
+        std::fs::create_dir_all(&dir).unwrap();
+        remove_file_logged(dir.join("absent.log"));
+        let file = dir.join("present.log");
+        std::fs::write(&file, b"x").unwrap();
+        remove_file_logged(&file);
+        assert!(!file.exists());
+        // A directory where the file should be: `remove_file` refuses it.
+        let stuck = dir.join("stuck.log");
+        std::fs::create_dir_all(&stuck).unwrap();
+        remove_file_logged(&stuck);
+        assert!(stuck.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -276,14 +276,53 @@ pub fn forget_hold(block_hash: B256) {
     }
 }
 
+/// Forgets `block_hash`'s hold when dropped ([`forget_hold`]).
+///
+/// Moved into the import that may reach the hold, so the entry goes when
+/// that import ends -- by success, error, panic or never being run -- and
+/// never while it could still wait on it. An import that failed before its
+/// execution left the entry in [`HELD_EXECUTIONS`] for good otherwise.
+#[derive(Debug)]
+pub struct HoldGuard(B256);
+
+impl HoldGuard {
+    /// A guard for `block_hash`'s hold.
+    pub const fn new(block_hash: B256) -> Self {
+        Self(block_hash)
+    }
+}
+
+impl Drop for HoldGuard {
+    fn drop(&mut self) {
+        forget_hold(self.0);
+    }
+}
+
+/// How long a held execution waits for its validator's release before it is
+/// dropped. A validator that keeps the connection open and never answers
+/// would otherwise pin the importing thread for good. Five times the
+/// genesis view timeout the fleet runs (6 s); a dropped execution leaves the
+/// block to the engine's own path, as any failed direct import does.
+pub const HELD_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Waits for `block_hash`'s release when its execution is held; at once
-/// otherwise. `Err` when it was dropped.
+/// otherwise. `Err` when it was dropped, or no release came within
+/// [`HELD_RELEASE_TIMEOUT`].
 fn wait_for_release(block_hash: B256) -> Result<(), String> {
+    wait_for_release_within(block_hash, HELD_RELEASE_TIMEOUT)
+}
+
+/// [`wait_for_release`] with the wait bounded by `timeout`.
+fn wait_for_release_within(block_hash: B256, timeout: std::time::Duration) -> Result<(), String> {
     let held = HELD_EXECUTIONS.lock().unwrap_or_else(|p| p.into_inner()).as_mut().and_then(|held| held.remove(&block_hash));
     let Some(held) = held else { return Ok(()) };
-    match held.recv() {
+    match held.recv_timeout(timeout) {
         Ok(true) => Ok(()),
-        Ok(false) | Err(_) => Err(HELD_DROPPED.to_owned()),
+        Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(HELD_DROPPED.to_owned()),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(target: "n42.follower_import", %block_hash, ?timeout, "no release for a held execution; dropping it");
+            Err(HELD_DROPPED.to_owned())
+        }
     }
 }
 

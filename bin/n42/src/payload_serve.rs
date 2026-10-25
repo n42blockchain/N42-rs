@@ -2059,6 +2059,9 @@ where
         // and an execution that reached its hold ends instead of waiting.
         let held_hash = data.payload.block_hash();
         let mut release = hold.then(|| crate::follower_import::hold_execution(held_hash));
+        // The hold is forgotten when the import ends, whichever way this
+        // function returns: an early `?` on the connection used to leave it.
+        let hold_guard = hold.then(|| crate::follower_import::HoldGuard::new(held_hash));
         let mut dropped = false;
         road.prepare_us = prepare_at.elapsed().as_micros() as u64;
         // The hand-off itself: what the blocking pool costs before the import
@@ -2066,6 +2069,7 @@ where
         // this side.
         let spawned = std::time::Instant::now();
         let handed = tokio::task::spawn_blocking(move || {
+            let _hold_guard = hold_guard;
             let mut road = road;
             road.dispatch_us = spawned.elapsed().as_micros() as u64;
             let convert_at = std::time::Instant::now();

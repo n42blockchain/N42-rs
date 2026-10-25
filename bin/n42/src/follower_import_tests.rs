@@ -502,6 +502,30 @@ fn a_dropped_or_abandoned_hold_ends_the_execution() {
     assert_eq!(wait_for_release(forgotten), Ok(()));
 }
 
+#[test]
+fn a_hold_guard_forgets_the_hold_when_its_import_ends() {
+    // The import failed before its execution: without the guard the entry
+    // stayed, and a later import of the same hash would wait on it.
+    let hash = B256::repeat_byte(0xe5);
+    let _release = hold_execution(hash);
+    drop(HoldGuard::new(hash));
+    assert_eq!(wait_for_release(hash), Ok(()));
+}
+
+#[test]
+fn a_held_execution_with_no_release_is_dropped_after_the_timeout() {
+    // The validator keeps the connection (the sender lives) but never answers.
+    let hash = B256::repeat_byte(0xe6);
+    let release = hold_execution(hash);
+    let started = std::time::Instant::now();
+    assert_eq!(
+        wait_for_release_within(hash, std::time::Duration::from_millis(30)),
+        Err(HELD_DROPPED.to_owned())
+    );
+    assert!(started.elapsed() >= std::time::Duration::from_millis(30));
+    drop(release);
+}
+
 // --- deferred execution at depth 2 (docs/DEFERRED_DEPTH_2_DESIGN.md) ----------
 
 fn depth_two_genesis() -> alloy_genesis::Genesis {

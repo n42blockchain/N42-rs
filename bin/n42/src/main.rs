@@ -29,6 +29,16 @@ use tracing::{debug, error, info, warn};
 const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
 fn main() {
+    // Enable backtraces unless a RUST_BACKTRACE value has already been
+    // explicitly provided. First, before this process spawns any thread or
+    // moves the allocator's (`n42_core_layout::init` below).
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        // SAFETY: the first statement of `main`: no thread this program
+        // starts exists yet, and nothing else in the process reads or writes
+        // the environment concurrently (the allocator reads its
+        // configuration once, at its own initialisation, before `main`).
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+    }
     // `N42_INGEST_VERIFY=shard` without a well-formed `N42_INGEST_SHARD=<i>/<n>`
     // would silently verify everything (or nothing); refuse to start instead.
     let ingest_mode = match n42_tx_types::ingest_verify_mode() {
@@ -72,11 +82,6 @@ fn main() {
         }
     }
     reth_cli_util::sigsegv_handler::install();
-
-    // Enable backtraces unless a RUST_BACKTRACE value has already been explicitly provided.
-    if std::env::var_os("RUST_BACKTRACE").is_none() {
-        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
-    }
 
     let (verification_tx, verification_rx) = mpsc::channel(100);
     let (broadcast_tx, _broadcast_rx) = broadcast::channel::<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>(100);
@@ -335,7 +340,7 @@ fn main() {
                     let provider = ctx.provider().clone();
 
                     // Store consensus reference for later use
-                    *consensus_holder_clone.lock().unwrap() =
+                    *consensus_holder_clone.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                         Some(std::sync::Arc::new(consensus.clone()));
 
                     let beacon_ext = ConsensusBeaconExt {
@@ -418,9 +423,9 @@ fn main() {
             // Get the stored consensus instance
             let consensus = consensus_holder
                 .lock()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
-                .expect("consensus should be set");
+                .ok_or_else(|| eyre::eyre!("the consensus instance was not set by the RPC hook"))?;
 
             let node_config_dev = node.config.clone().dev();
             // The forest can only be restored once the database is open and the
@@ -499,7 +504,10 @@ fn main() {
 
             let consensus_signer_private_key = node_config_dev.dev.consensus_signer_private_key;
             let signer_address = if let Some(signer_private_key) = &consensus_signer_private_key {
-                let eth_signer: PrivateKeySigner = signer_private_key.to_string().parse().unwrap();
+                let eth_signer: PrivateKeySigner = signer_private_key
+                    .to_string()
+                    .parse()
+                    .map_err(|err| eyre::eyre!("invalid --dev.consensus-signer-private-key: {err}"))?;
                 Some(eth_signer.address())
             } else {
                 None

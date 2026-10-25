@@ -589,6 +589,16 @@ const MAX_PENDING_RANGES: usize = 8;
 /// import, so this is simply inert until it can be right.
 const FAR_AHEAD_BLOCKS: u64 = 1;
 
+/// How far past the tip, in multiples of the far-ahead limit, the first
+/// window of a catch-up may reach on an advertised height alone.
+const CATCH_UP_FIRST_WINDOW_FACTOR: u64 = 8;
+
+/// The target a catch-up starts with: the advertised height, but no
+/// further than `latest + far_ahead * CATCH_UP_FIRST_WINDOW_FACTOR`.
+fn capped_catch_up_target(advertised: u64, latest: u64, far_ahead: u64) -> u64 {
+    advertised.min(latest.saturating_add(far_ahead.saturating_mul(CATCH_UP_FIRST_WINDOW_FACTOR)))
+}
+
 /// Parses `N42_FAR_AHEAD_BLOCKS`: an integer in `1..=8`, else the default
 /// [`FAR_AHEAD_BLOCKS`] (an invalid value is logged).
 fn far_ahead_blocks_from(value: Option<&str>) -> u64 {
@@ -2321,6 +2331,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             TransportEvent::PeerDisconnected(peer) => {
                 self.direct_votes.forget_peer(&peer);
+                // A height is only worth what the peer can still serve.
+                self.peer_heights.remove(&peer);
             }
             TransportEvent::VoteHello { peer, index, signature } => {
                 let verified = n42_h2_primitives::BlsSignature::from_bytes(&signature).is_ok_and(|signature| {
@@ -3768,6 +3780,13 @@ impl<E: ExecutionLayer> H2Service<E> {
         if height <= latest {
             return;
         }
+        // An advertised height is not certified: a status or a relayed
+        // header can name any number. The first window is capped near the
+        // tip; a peer that really is further ahead serves it full and the
+        // pull probes on window by window (see `import_ranges`), so the cap
+        // costs a real catch-up one short request and a false height one
+        // short pull.
+        let height = capped_catch_up_target(height, latest, far_ahead_limit());
         info!(target: "n42.h2.node", %peer, from = latest, to = height, "behind a peer; pulling the gap by range");
         self.catch_up = Some(CatchUp {
             peer,
@@ -3917,6 +3936,12 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
         self.catch_up_retry_after = Some(std::time::Instant::now() + CATCH_UP_RETRY);
         self.failed_peer = (!complete).then_some(catch_up.peer);
+        // What the peer actually served replaces what it advertised, so a
+        // height it cannot back stops starting a pull every retry; blocks it
+        // gossips later raise it again.
+        if let Some(known) = self.peer_heights.get_mut(&catch_up.peer) {
+            *known = (*known).min(height.max(catch_up.started_at));
+        }
         info!(target: "n42.h2.node", from = catch_up.started_at, height, target = catch_up.target, complete, "catch-up finished");
         events.push(ServiceEvent::Synced { height, complete });
     }
@@ -4870,6 +4895,15 @@ mod tests {
         assert_eq!(stale_build_parent(1023, Some(1023)), None, "the committed block is the parent");
         assert_eq!(stale_build_parent(1024, Some(1023)), None, "an own block above it");
         assert_eq!(stale_build_parent(5, None), None, "nothing committed yet");
+    }
+
+    #[test]
+    fn catch_up_target_is_capped_near_the_tip() {
+        use super::capped_catch_up_target as cap;
+        assert_eq!(cap(u64::MAX, 100, 1), 108);
+        assert_eq!(cap(1_000_000_000_000, 100, 2), 116);
+        assert_eq!(cap(103, 100, 1), 103);
+        assert_eq!(cap(u64::MAX, u64::MAX - 1, 8), u64::MAX);
     }
 
     #[test]

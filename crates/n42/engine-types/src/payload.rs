@@ -1172,12 +1172,40 @@ fn spawn_late_reverts(
     graft: Vec<(alloy_primitives::Address, revm::database::AccountRevert)>,
     pool: Option<&'static rayon::ThreadPool>,
 ) -> (Vec<(alloy_primitives::Address, revm::database::AccountRevert)>, Option<LateRevertsTx>) {
+    spawn_late_reverts_with(shards, residual, graft, pool, OsThread)
+}
+
+/// How a helper thread is started: a named OS thread in production
+/// ([`OsThread`]); a test passes one that fails, to reach the fallback.
+trait SpawnThread {
+    /// Starts `work` on a thread named `name`, detached.
+    fn spawn<F: FnOnce() + Send + 'static>(self, name: &str, work: F) -> std::io::Result<()>;
+}
+
+/// [`SpawnThread`] by `std::thread::Builder`.
+#[derive(Debug, Clone, Copy)]
+struct OsThread;
+
+impl SpawnThread for OsThread {
+    fn spawn<F: FnOnce() + Send + 'static>(self, name: &str, work: F) -> std::io::Result<()> {
+        std::thread::Builder::new().name(name.into()).spawn(work).map(drop)
+    }
+}
+
+/// [`spawn_late_reverts`] with the thread started by `spawner`.
+fn spawn_late_reverts_with(
+    shards: &Arc<crate::output_shards::FrozenShards>,
+    residual: &revm::database::BundleState,
+    graft: Vec<(alloy_primitives::Address, revm::database::AccountRevert)>,
+    pool: Option<&'static rayon::ThreadPool>,
+    spawner: impl SpawnThread,
+) -> (Vec<(alloy_primitives::Address, revm::database::AccountRevert)>, Option<LateRevertsTx>) {
     let (tx, rx) = std::sync::mpsc::sync_channel::<n42_deferred_reverts::LateReverts>(1);
     let shards = Arc::clone(shards);
     let block_reverts = residual.reverts.clone();
     let cell = Arc::new(std::sync::Mutex::new(Some(graft)));
     let taken = Arc::clone(&cell);
-    let spawned = std::thread::Builder::new().name("n42-merge-late-reverts".into()).spawn(move || {
+    let spawned = spawner.spawn("n42-merge-late-reverts", move || {
         n42_core_layout::background_thread();
         let graft = taken.lock().ok().and_then(|mut cell| cell.take()).unwrap_or_default();
         let at = std::time::Instant::now();
@@ -5958,6 +5986,37 @@ fn ticks() -> u64 {
     {
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+    }
+}
+
+#[cfg(test)]
+mod late_reverts_tests {
+    use super::{spawn_late_reverts_with, SpawnThread};
+    use alloy_primitives::Address;
+    use std::sync::Arc;
+
+    /// A spawner that never gets a thread (EAGAIN under pressure).
+    struct NoThread;
+
+    impl SpawnThread for NoThread {
+        fn spawn<F: FnOnce() + Send + 'static>(self, _name: &str, _work: F) -> std::io::Result<()> {
+            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "no thread"))
+        }
+    }
+
+    /// A late revert set that gets no thread hands the graft back whole, so
+    /// the caller's merge runs it in place, and promises nothing.
+    #[test]
+    fn a_late_revert_set_without_a_thread_hands_the_graft_back() {
+        let shards = Arc::new(crate::output_shards::OutputShards::with_index_live(Address::ZERO, 8, 1, false, false).freeze());
+        let residual = revm::database::BundleState::default();
+        let graft: Vec<_> = (1u8..=3)
+            .map(|i| (Address::repeat_byte(i), revm::database::AccountRevert::default()))
+            .collect();
+        let (back, late) = spawn_late_reverts_with(&shards, &residual, graft, None, NoThread);
+        assert!(late.is_none(), "no thread, no promise");
+        let addresses: Vec<Address> = back.iter().map(|(address, _)| *address).collect();
+        assert_eq!(addresses, vec![Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(3)]);
     }
 }
 

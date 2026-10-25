@@ -601,51 +601,10 @@ fn run_pruner(queue: &TxQueue<N42PooledTransaction>, rx: std::sync::mpsc::Receiv
     // wake starts from it without blocking.
     let mut carry: Vec<Queued> = Vec::new();
     loop {
-        // Everything already waiting is taken in this wake, in order.
-        // Whether the wake's first item comes from the channel (not the carry).
-        let first_from_rx = carry.is_empty();
-        let mut batch = if first_from_rx {
-            match rx.recv() {
-                Ok(first) => vec![first],
-                Err(_) => break,
-            }
-        } else {
-            std::mem::take(&mut carry)
+        let Some((batch, received, feed_depth)) = next_wake(&rx, &mut carry, min_fold, max_wait, max_fold) else {
+            break;
         };
-        // The channel's depth at the wake's start, the item just
-        // received included (`feed_depth` on the prune line).
-        let feed_depth = FEED_DEPTH.load(Ordering::Relaxed);
-        let mut received = usize::from(first_from_rx);
-        while let Ok(next) = rx.try_recv() {
-            batch.push(next);
-            received += 1;
-        }
-        // `N42_PRUNE_MIN_FOLD`: wait for more, up to `max_wait` after
-        // the first arrived, so the wake folds at least `min_fold`.
-        if min_fold > 1 {
-            let deadline = batch[0].1 + max_wait;
-            while batch.len() < min_fold {
-                let now = std::time::Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                match rx.recv_timeout(deadline - now) {
-                    Ok(next) => {
-                        batch.push(next);
-                        received += 1;
-                        while let Ok(more) = rx.try_recv() {
-                            batch.push(more);
-                            received += 1;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
         FEED_DEPTH.fetch_sub(received, Ordering::Relaxed);
-        if max_fold > 0 && batch.len() > max_fold {
-            carry = batch.split_off(max_fold);
-        }
         let coalesced = batch.len();
         if n42_tx_queue::prune_lean() {
             let waited = batch[0].1.elapsed();
@@ -674,6 +633,67 @@ fn run_pruner(queue: &TxQueue<N42PooledTransaction>, rx: std::sync::mpsc::Receiv
             n42_tx_queue::free_later(batch);
         }
     }
+}
+
+/// One wake of the pruning thread: the items it folds, how many of them came
+/// off the channel (the rest are `carry`), and the channel's depth at its
+/// start (`feed_depth` on the prune line). `None` once the inbox is closed
+/// and nothing is carried.
+///
+/// Everything already waiting is taken, in order. With `min_fold > 1`
+/// (`N42_PRUNE_MIN_FOLD`) the wake waits for more, up to `max_wait` after
+/// its first item arrived; with `max_fold > 0` (`N42_PRUNE_MAX_FOLD`) what
+/// is over is left in `carry`, and the next wake starts from it without
+/// blocking.
+fn next_wake<T>(
+    rx: &std::sync::mpsc::Receiver<(T, std::time::Instant)>,
+    carry: &mut Vec<(T, std::time::Instant)>,
+    min_fold: usize,
+    max_wait: std::time::Duration,
+    max_fold: usize,
+) -> Option<(Vec<(T, std::time::Instant)>, usize, usize)> {
+    // Whether the wake's first item comes from the channel (not the carry).
+    let first_from_rx = carry.is_empty();
+    let mut batch = if first_from_rx {
+        match rx.recv() {
+            Ok(first) => vec![first],
+            Err(_) => return None,
+        }
+    } else {
+        std::mem::take(carry)
+    };
+    // The channel's depth at the wake's start, the item just received
+    // included.
+    let feed_depth = FEED_DEPTH.load(Ordering::Relaxed);
+    let mut received = usize::from(first_from_rx);
+    while let Ok(next) = rx.try_recv() {
+        batch.push(next);
+        received += 1;
+    }
+    if min_fold > 1 {
+        let deadline = batch[0].1 + max_wait;
+        while batch.len() < min_fold {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match rx.recv_timeout(deadline - now) {
+                Ok(next) => {
+                    batch.push(next);
+                    received += 1;
+                    while let Ok(more) = rx.try_recv() {
+                        batch.push(more);
+                        received += 1;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    if max_fold > 0 && batch.len() > max_fold {
+        *carry = batch.split_off(max_fold);
+    }
+    Some((batch, received, feed_depth))
 }
 
 /// The canonical prune gave back an own block held at a height the chain
@@ -772,6 +792,49 @@ mod tests {
         // Later items go inline without trying the thread.
         forward(&mut pruner, PruneFeed::of(notification, false), |_| inline_runs += 1);
         assert_eq!(inline_runs, 2);
+    }
+
+    /// `N42_PRUNE_MAX_FOLD`: a wake folds at most `max_fold` items and the
+    /// rest are carried, in order, into the next wakes, which take nothing
+    /// off the channel until the carry is gone.
+    #[test]
+    fn a_capped_wake_carries_the_rest_in_order() {
+        let (tx, rx) = std::sync::mpsc::channel::<(u32, std::time::Instant)>();
+        for i in 0..5 {
+            tx.send((i, std::time::Instant::now())).expect("open");
+        }
+        let mut carry = Vec::new();
+        let items = |batch: &[(u32, std::time::Instant)]| batch.iter().map(|(i, _)| *i).collect::<Vec<_>>();
+        let (batch, received, _) = next_wake(&rx, &mut carry, 1, std::time::Duration::ZERO, 2).expect("a wake");
+        assert_eq!((items(&batch), received), (vec![0, 1], 5));
+        let (batch, received, _) = next_wake(&rx, &mut carry, 1, std::time::Duration::ZERO, 2).expect("a wake");
+        assert_eq!((items(&batch), received), (vec![2, 3], 0), "from the carry");
+        let (batch, received, _) = next_wake(&rx, &mut carry, 1, std::time::Duration::ZERO, 2).expect("a wake");
+        assert_eq!((items(&batch), received), (vec![4], 0));
+        assert!(carry.is_empty());
+        drop(tx);
+        assert!(next_wake(&rx, &mut carry, 1, std::time::Duration::ZERO, 2).is_none(), "closed, nothing carried");
+    }
+
+    /// `N42_PRUNE_MIN_FOLD`: a wake with enough waiting folds at once; one
+    /// short of the minimum waits out `max_wait` from its first item and
+    /// then folds what it has.
+    #[test]
+    fn a_minimum_fold_waits_at_most_its_deadline() {
+        let (tx, rx) = std::sync::mpsc::channel::<(u32, std::time::Instant)>();
+        let mut carry = Vec::new();
+        for i in 0..3 {
+            tx.send((i, std::time::Instant::now())).expect("open");
+        }
+        let (batch, received, _) = next_wake(&rx, &mut carry, 3, std::time::Duration::from_secs(10), 0).expect("a wake");
+        assert_eq!((batch.len(), received), (3, 3), "enough waiting: no wait");
+        let max_wait = std::time::Duration::from_millis(30);
+        let started = std::time::Instant::now();
+        tx.send((9, started)).expect("open");
+        let (batch, received, _) = next_wake(&rx, &mut carry, 3, max_wait, 0).expect("a wake");
+        assert_eq!((batch.len(), received), (1, 1));
+        assert!(started.elapsed() >= max_wait, "waited for more until the deadline");
+        assert!(carry.is_empty());
     }
 
     #[test]

@@ -278,28 +278,30 @@ fn main() {
                         // Follow the canonical chain so the persisted head keeps up with
                         // the database's. Lagging is tolerable — only the tip matters,
                         // and every tree in between was filed at validation.
+                        // `on_canonical` is synchronous QMDB work, so the loop runs on
+                        // the blocking pool with a blocking receiver rather than on a
+                        // tokio worker; one receiver, so the order is kept.
                         let mut canonical = node.provider.subscribe_to_canonical_state();
                         let follower = qmdb.clone();
-                        tokio::spawn(async move {
-                            loop {
-                                match canonical.recv().await {
-                                    Ok(notification) => {
-                                        let behind = canonical.len();
-                                        if behind > 8 {
-                                            warn!(target: "reth::cli", behind, "canonical subscriber lag: qmdb head follower");
-                                        }
-                                        let tip = notification.tip().hash();
-                                        if let Err(error) = follower.on_canonical(tip) {
-                                            error!(target: "reth::cli", %error, "QMDB head could not follow the canonical chain");
-                                        }
+                        let follow = move || loop {
+                            match canonical.blocking_recv() {
+                                Ok(notification) => {
+                                    let behind = canonical.len();
+                                    if behind > 8 {
+                                        warn!(target: "reth::cli", behind, "canonical subscriber lag: qmdb head follower");
                                     }
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                        warn!(target: "reth::cli", skipped, "QMDB head follower fell behind canonical notifications");
+                                    let tip = notification.tip().hash();
+                                    if let Err(error) = follower.on_canonical(tip) {
+                                        error!(target: "reth::cli", %error, "QMDB head could not follow the canonical chain");
                                     }
-                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                 }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                    warn!(target: "reth::cli", skipped, "QMDB head follower fell behind canonical notifications");
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
-                        });
+                        };
+                        tokio::task::spawn_blocking(follow);
                     }
                     Ok(())
                 })

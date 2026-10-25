@@ -715,7 +715,8 @@ fn two_roads<T>(
         None => Err("the vote road ran twice".to_string()),
     };
     let (voted, executed, exec_ms) = std::thread::scope(|scope| {
-        match std::thread::Builder::new().name("vote-road".into()).spawn_scoped(scope, run_vote) {
+        let run_vote = &run_vote;
+        match std::thread::Builder::new().name("vote-road".into()).spawn_scoped(scope, move || run_vote()) {
             Ok(voted) => {
                 let executed = execute();
                 let exec_ms = roads_at.elapsed().as_millis() as u64;

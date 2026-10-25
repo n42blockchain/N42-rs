@@ -3258,7 +3258,7 @@ where
                         // Kept at 0 when nothing was grafted.
                         graft_ms = if sharded_out.is_some() || early_out.is_some() { 0 } else { at.elapsed().as_millis() as u64 };
                         let root_wait_at = std::time::Instant::now();
-                        let root_done = root.map(|job| job.join().expect("the transactions root job does not panic"));
+                        let root_done = root.map(|job| job.join());
                         par_root_wait_ms = root_wait_at.elapsed().as_millis() as u64;
                         let receipts_wait_at = std::time::Instant::now();
                         let receipts_done = receipts_job.map(|job| job.join());
@@ -3266,7 +3266,14 @@ where
                         (graft, root_done, receipts_done)
                     });
                     par_graft_ms = graft_ms;
-                    early_transactions_root = early_root;
+                    early_transactions_root = early_root
+                        .transpose()
+                        .map_err(|_| {
+                            failed_after_seal(
+                                sealed_ahead_id,
+                                PayloadBuilderError::other(std::io::Error::other("the transactions root job panicked")),
+                            )
+                        })?;
                     if let Some(receipts) = receipts {
                         let (receipts, tx_gas, times) = receipts.map_err(|_| {
                             failed_after_seal(
@@ -3944,7 +3951,7 @@ where
             // post-state stays on this thread while the root and the
             // receipts run beside it.
             let parent_root_early = verify_fields.then(|| qmdb_state.root_of(&parent_sealed)).flatten();
-            let (hashed_state, (prepared, root_started, root_ended, kept_ops), roots) = std::thread::scope(|scope| {
+            let (hashed_state, prepared, roots) = std::thread::scope(|scope| {
                 let receipts = &execution_result.receipts;
                 let qmdb_job = &qmdb_state;
                 let root = scope.spawn(move || {
@@ -3964,10 +3971,13 @@ where
                 } else {
                     parent_state_ref().and_then(|state_provider| state_provider.hashed_post_state(bundle_ref))
                 };
-                let prepared = root.join().expect("the QMDB root job does not panic");
-                let roots = receipts.join().expect("the receipts root job does not panic");
+                let prepared = root.join().map_err(|_| "the QMDB root job panicked");
+                let roots = receipts.join().map_err(|_| "the receipts root job panicked");
                 (hashed, prepared, roots)
             });
+            let (prepared, root_started, root_ended, kept_ops) =
+                prepared.map_err(|err| PayloadBuilderError::other(std::io::Error::other(err)))?;
+            let roots = roots.map_err(|err| PayloadBuilderError::other(std::io::Error::other(err)))?;
             let hashed_state = hashed_state.map_err(PayloadBuilderError::other)?;
             root_started_at = Some(root_started);
             root_ended_at = Some(root_ended);

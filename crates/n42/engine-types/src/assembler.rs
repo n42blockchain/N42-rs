@@ -314,9 +314,9 @@ where
         // plain thread that waits on the pool injects its work and blocks; it
         // steals nothing, so nothing it holds can be wanted by what it runs.
         let (transactions_root, (receipts_root, bloom)) = std::thread::scope(|scope| {
-            let qmdb = self.qmdb.as_ref().map(|job| {
+            let qmdb = self.qmdb.as_ref().and_then(|job| {
                 let qmdb_ms = &qmdb_ms;
-                std::thread::Builder::new()
+                let spawned = std::thread::Builder::new()
                     .name("qmdb-root".into())
                     .spawn_scoped(scope, move || {
                         let at = std::time::Instant::now();
@@ -329,8 +329,17 @@ where
                         };
                         *job.out.lock().unwrap_or_else(|p| p.into_inner()) = Some(prepared);
                         qmdb_ms.store(at.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
-                    })
-                    .expect("a thread for the QMDB root")
+                    });
+                match spawned {
+                    Ok(handle) => Some(handle),
+                    // No thread (EAGAIN under pressure): the builder reads
+                    // this error from `job.out` and fails this one build.
+                    Err(err) => {
+                        *job.out.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(Err(format!("no thread for the QMDB root: {err}")));
+                        None
+                    }
+                }
             });
             let roots = rayon::join(
                 || {

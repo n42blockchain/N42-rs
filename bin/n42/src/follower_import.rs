@@ -706,14 +706,28 @@ fn two_roads<T>(
     vote: impl FnOnce() -> Result<(), String> + Send,
     execute: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
+    // Held in a slot rather than moved into the thread, so a spawn that
+    // fails (EAGAIN under thread or memory pressure) can still run the vote
+    // inline, before the execution, instead of panicking the import.
+    let vote = std::sync::Mutex::new(Some(vote));
+    let run_vote = || match vote.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+        Some(vote) => vote().map(|()| roads_at.elapsed().as_millis() as u64),
+        None => Err("the vote road ran twice".to_string()),
+    };
     let (voted, executed, exec_ms) = std::thread::scope(|scope| {
-        let voted = std::thread::Builder::new()
-            .name("vote-road".into())
-            .spawn_scoped(scope, || vote().map(|()| roads_at.elapsed().as_millis() as u64))
-            .expect("a thread for the vote road");
-        let executed = execute();
-        let exec_ms = roads_at.elapsed().as_millis() as u64;
-        (voted.join().unwrap_or_else(|_| Err("the vote road thread panicked".to_string())), executed, exec_ms)
+        match std::thread::Builder::new().name("vote-road".into()).spawn_scoped(scope, run_vote) {
+            Ok(voted) => {
+                let executed = execute();
+                let exec_ms = roads_at.elapsed().as_millis() as u64;
+                (voted.join().unwrap_or_else(|_| Err("the vote road thread panicked".to_string())), executed, exec_ms)
+            }
+            Err(err) => {
+                tracing::warn!(target: "n42.follower_import", number, %err, "no thread for the vote road: voting inline, then executing");
+                let voted = run_vote();
+                let executed = execute();
+                (voted, executed, roads_at.elapsed().as_millis() as u64)
+            }
+        }
     });
     let vote_ms = voted?;
     let executed = executed?;
@@ -3359,14 +3373,18 @@ where
         // thread asleep, and the chain stopped for the rest of the tenure. A
         // plain thread that waits on the pool blocks and steals nothing.
         let (root, hashed) = std::thread::scope(|scope| {
-            let root = std::thread::Builder::new()
-                .name("qmdb-root".into())
-                .spawn_scoped(scope, root_job)
-                .expect("a thread for the QMDB root");
-            let hashed = hashed_job();
-            (root.join().unwrap_or_else(|_| Err("the QMDB root thread panicked".to_string())), hashed)
+            match std::thread::Builder::new().name("qmdb-root".into()).spawn_scoped(scope, root_job) {
+                Ok(root) => {
+                    let hashed = hashed_job();
+                    (root.join().unwrap_or_else(|_| Err("the QMDB root thread panicked".to_string())), Some(hashed))
+                }
+                // The import fails cleanly (the engine's own path takes the
+                // block) rather than panicking on a resource hiccup.
+                Err(err) => (Err(format!("no thread for the QMDB root: {err}")), None),
+            }
         });
         root?;
+        let hashed = hashed.ok_or_else(|| "the hashed state was not computed".to_string())?;
         let both = root_at.elapsed().as_millis() as u64;
         (both, 0, hashed?)
     };

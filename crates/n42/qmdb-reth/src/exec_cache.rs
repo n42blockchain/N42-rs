@@ -143,10 +143,37 @@ pub fn executed_block_without_cache<N: NodePrimitives>(
     let BuiltPayloadExecutedBlock { recovered_block, execution_output, hashed_state, trie_updates } =
         block;
     let (trie_data, producer) = LazyTrieData::pending(hashed_state, trie_updates);
-    let _ = runtime.spawn_blocking_named(DEFERRED_TRIE_WORKER_NAME, move || {
+    // A task the named worker never runs (its thread gone, the closure
+    // dropped unrun) would leave every reader of the trie data waiting on a
+    // producer that never publishes: the guard then sorts inline, on
+    // whichever thread drops it.
+    let fallback = PublishOnDrop(Some(move || {
         let _ = producer.compute_and_publish();
+    }));
+    let _ = runtime.spawn_blocking_named(DEFERRED_TRIE_WORKER_NAME, move || {
+        let mut fallback = fallback;
+        if let Some(publish) = fallback.0.take() {
+            publish();
+        }
     });
     ExecutedBlock::with_deferred_trie_data(recovered_block, execution_output, trie_data)
+}
+
+/// Runs the deferred trie data's publication when dropped without having
+/// run it ([`executed_block_without_cache`]).
+struct PublishOnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for PublishOnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(publish) = self.0.take() {
+            tracing::warn!(
+                target: "n42.qmdb",
+                worker = DEFERRED_TRIE_WORKER_NAME,
+                "the deferred trie worker did not run the sort; sorting inline"
+            );
+            publish();
+        }
+    }
 }
 
 impl<Types, N, V> EngineValidator<Types, N> for N42TreeValidator<V>
@@ -239,6 +266,28 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    /// A publication the worker never ran is run when its guard drops; one
+    /// the worker ran is not run again.
+    #[test]
+    fn an_unrun_publication_runs_when_its_guard_drops() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = runs.clone();
+        drop(PublishOnDrop(Some(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+        })));
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "dropped unrun: run inline");
+
+        let counted = runs.clone();
+        let mut ran = PublishOnDrop(Some(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+        }));
+        if let Some(publish) = ran.0.take() {
+            publish();
+        }
+        drop(ran);
+        assert_eq!(runs.load(Ordering::Relaxed), 2, "run once, not again on drop");
+    }
 
     /// Stands in for reth's validator: counts the executed inserts it is
     /// handed and answers with the block's trie data already sorted.

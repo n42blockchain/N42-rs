@@ -109,6 +109,10 @@ pub enum QmdbOperationError {
     /// The entry file could not be written.
     #[error("QMDB entry store: {0}")]
     Store(String),
+    /// The key index refused the block's keys (a shard full) after the
+    /// apply began writing.
+    #[error("QMDB key index: {0}")]
+    Index(String),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -154,6 +158,9 @@ pub enum QmdbSnapshotError {
     /// The entry file could not be opened or read.
     #[error("QMDB entry file: {0}")]
     EntryFile(String),
+    /// The key index refused a key (a shard full).
+    #[error("QMDB key index: {0}")]
+    Index(String),
 }
 
 /// Cross-client QMDB bootstrap metadata plus its complete positional slot log.
@@ -520,6 +527,12 @@ impl QmdbPortableSnapshot {
                 // A slot snapshot is built in the heap; the entry file is not
                 // involved, so this arm is unreachable in practice.
                 QmdbSnapshotError::EntryFile(_) => QmdbPortableError::RootMismatch,
+                // A full key-index shard while replaying the slot log: the
+                // snapshot cannot be loaded on this process, which is a
+                // resource failure rather than a content mismatch.
+                QmdbSnapshotError::Index(reason) => {
+                    QmdbPortableError::Io(format!("key index: {reason}"))
+                }
             })?;
         if tree.root() != self.root {
             return Err(QmdbPortableError::RootMismatch);
@@ -1395,6 +1408,10 @@ pub enum QmdbUndoError {
     /// The entry file could not be shortened.
     #[error("QMDB entry store: {0}")]
     Store(String),
+    /// An evicted boundary twig could not be brought back before the undo
+    /// began: nothing was changed, the tree is as it was.
+    #[error("QMDB undo could not hydrate a twig before reverting: {0}")]
+    Hydrate(String),
     /// A revived slot's entry disagrees with the record — the record does not
     /// belong to this tree's history.
     #[error("undo entry for slot {slot} does not match the tree's entry")]
@@ -1597,20 +1614,35 @@ impl Default for QmdbCompatTree {
 }
 
 impl Clone for QmdbCompatTree {
-    /// A file-backed tree clones as a second handle on the same file; see
-    /// `FileEntries::duplicate` for what a clone may and may not do.
+    /// [`QmdbCompatTree::try_clone`], panicking only when a file-backed
+    /// tree's entry file cannot be reopened (no descriptor left). A heap
+    /// tree's clone is a full, writable copy; a file-backed tree's clone is
+    /// read-only (see `try_clone`).
     fn clone(&self) -> Self {
-        Self {
-            entries: self.entries.try_clone().expect("the entry file could not be reopened for a clone"),
+        self.try_clone().expect("the entry file could not be reopened for a clone")
+    }
+}
+
+impl QmdbCompatTree {
+    /// A copy of this tree. A heap tree's copy is independent and writable.
+    /// A file-backed tree's copy is a second, read-only handle on the same
+    /// entry file: it answers roots, proofs and reads as the original stood,
+    /// but every operation that would append to or cut the file (`set`,
+    /// `apply_sorted_ops*`, `apply_undo` past the cursor, a flush of the
+    /// original's unwritten tail) returns an error instead. It carries no
+    /// truncation guard: the guard belongs to the original's read view.
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            entries: self.entries.try_clone()?,
             index: self.index.clone(),
             twigs: self.twigs.clone(),
             next_slot: self.next_slot,
             recording: self.recording.clone(),
             upper: std::sync::Mutex::new(self.upper.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()),
             evicted_below: self.evicted_below,
-            truncation_guard: self.truncation_guard.clone(),
+            truncation_guard: None,
             spare_twig_nodes: Vec::new(),
-        }
+        })
     }
 }
 
@@ -1769,7 +1801,11 @@ impl QmdbCompatTree {
         };
         for slot in 0..n {
             if tree.entries.is_active(slot)
-                && tree.index.insert(tree.entries.key(slot), slot as u64, |s| tree.entries.key(s as usize)).is_some()
+                && tree
+                    .index
+                    .insert(tree.entries.key(slot), slot as u64, |s| tree.entries.key(s as usize))
+                    .map_err(|e| QmdbSnapshotError::Index(e.to_string()))?
+                    .is_some()
             {
                 return Err(QmdbSnapshotError::DuplicateActiveKey(tree.entries.key(slot)));
             }
@@ -1864,7 +1900,13 @@ impl QmdbCompatTree {
     }
 
     /// Append a new frozen leaf, deactivating an earlier live slot for `key`.
-    pub fn set(&mut self, key: Hash, value: Vec<u8>) {
+    ///
+    /// The one-at-a-time path (genesis, tests, vectors). A refused write to the
+    /// entry file is [`QmdbOperationError::Store`] and a full key-index shard is
+    /// [`QmdbOperationError::Index`], the same errors the block path
+    /// (`apply_sorted_ops`) reports; after either the tree has lost its state
+    /// and must not be used for another root.
+    pub fn set(&mut self, key: Hash, value: Vec<u8>) -> Result<(), QmdbOperationError> {
         self.upper_stale();
         if let Some(old_slot) = self.index.get(&key, |slot| self.entries.key(slot as usize)) {
             self.record_deactivation(old_slot);
@@ -1880,11 +1922,13 @@ impl QmdbCompatTree {
         self.ensure_twig(twig_id);
         self.twigs[twig_id].set_leaf(local, hash_leaf(&key, &value));
         self.twigs[twig_id].set_active(local, true);
-        // A write the entry file refuses is a node that has lost its state;
-        // the block path (`apply_sorted_ops`) reports it, this one-at-a-time
-        // path is the genesis, the tests and the vectors.
-        self.entries.push(key, value).expect("the QMDB entry file could not be written");
-        self.index.insert(key, slot, |slot| self.entries.key(slot as usize));
+        // A write the entry file refuses is a node that has lost its state.
+        self.entries.push(key, value).map_err(|e| QmdbOperationError::Store(e.to_string()))?;
+        // A shard past its limit refuses the key rather than panicking.
+        self.index
+            .insert(key, slot, |slot| self.entries.key(slot as usize))
+            .map_err(|e| QmdbOperationError::Index(e.to_string()))?;
+        Ok(())
     }
 
     /// Deactivate a key without erasing its frozen leaf.
@@ -2022,7 +2066,7 @@ impl QmdbCompatTree {
             ((prev - 1) as usize) / TWIG_SIZE + 1
         };
         if prev < self.next_slot && !(prev as usize).is_multiple_of(TWIG_SIZE) {
-            self.hydrate(prev as usize / TWIG_SIZE).map_err(QmdbUndoError::Store)?;
+            self.hydrate(prev as usize / TWIG_SIZE).map_err(QmdbUndoError::Hydrate)?;
         }
 
         // 1. Truncate the block's appends: drop their index mappings, and in
@@ -2067,7 +2111,9 @@ impl QmdbCompatTree {
         };
         for (slot, key) in revived {
             self.entries.set_active(slot as usize, true);
-            self.index.insert(key, slot, |slot| self.entries.key(slot as usize));
+            // After the truncation: a refusal here leaves the tree half
+            // reverted, reported as a store failure (which poisons the forest).
+            self.index.insert(key, slot, |slot| self.entries.key(slot as usize)).map_err(|e| QmdbUndoError::Store(e.to_string()))?;
             let twig_id = (slot as usize) / TWIG_SIZE;
             let local = (slot as usize) % TWIG_SIZE;
             self.twigs[twig_id].bits[local / 8] |= 1 << (local % 8);
@@ -2451,10 +2497,10 @@ impl QmdbCompatTree {
             #[cfg(feature = "rayon")]
             {
                 let (index, twigs, dirty) = (&mut self.index, &mut self.twigs, &dirty);
-                let (index_us, rehash_us) = rayon::join(
+                let ((indexed, index_us), rehash_us) = rayon::join(
                     || {
-                        index.insert_sorted(appended, |slot| entries.key(slot as usize));
-                        at.elapsed().as_micros() as u64
+                        let indexed = index.insert_sorted(appended, |slot| entries.key(slot as usize));
+                        (indexed, at.elapsed().as_micros() as u64)
                     },
                     || {
                         rehash_dirty(twigs, dirty);
@@ -2462,10 +2508,13 @@ impl QmdbCompatTree {
                     },
                 );
                 (phases.index_us, phases.rehash_us) = (index_us, rehash_us);
+                indexed.map_err(|e| QmdbOperationError::Index(e.to_string()))?;
             }
             phases.index_faults += crate::prefault::thread_faults().saturating_sub(faults_hash);
         } else {
-            self.index.insert_sorted(appended, |slot| entries.key(slot as usize));
+            self.index
+                .insert_sorted(appended, |slot| entries.key(slot as usize))
+                .map_err(|e| QmdbOperationError::Index(e.to_string()))?;
             phases.index_us = at.elapsed().as_micros() as u64;
             phases.index_faults += crate::prefault::thread_faults().saturating_sub(faults_hash);
             let at = std::time::Instant::now();
@@ -2822,7 +2871,12 @@ impl QmdbCompatTree {
             // goes in first: the index confirms keys against the store.
             tree.entries.push(entry.key, entry.value.clone()).expect("a heap push cannot fail");
             if entry.active {
-                if tree.index.insert(entry.key, slot as u64, |s| tree.entries.key(s as usize)).is_some() {
+                if tree
+                    .index
+                    .insert(entry.key, slot as u64, |s| tree.entries.key(s as usize))
+                    .map_err(|e| QmdbSnapshotError::Index(e.to_string()))?
+                    .is_some()
+                {
                     return Err(QmdbSnapshotError::DuplicateActiveKey(entry.key));
                 }
                 tree.twigs[twig_id].bits[local / 8] |= 1 << (local % 8);
@@ -3080,7 +3134,7 @@ mod tests {
             one_by_one.start_undo_recording();
             for operation in ordered {
                 match operation.value {
-                    Some(value) => one_by_one.set(operation.key, value),
+                    Some(value) => one_by_one.set(operation.key, value).unwrap(),
                     None => {
                         one_by_one.delete(&operation.key);
                     }
@@ -3425,9 +3479,9 @@ mod tests {
         let mut sorted = QmdbCompatTree::new();
         let sorted_root = sorted.apply_sorted_ops(operations).unwrap();
         let mut expected = QmdbCompatTree::new();
-        expected.set(key(1), b"one".to_vec());
-        expected.set(key(2), b"two".to_vec());
-        expected.set(key(3), b"three".to_vec());
+        expected.set(key(1), b"one".to_vec()).unwrap();
+        expected.set(key(2), b"two".to_vec()).unwrap();
+        expected.set(key(3), b"three".to_vec()).unwrap();
         assert_eq!(sorted_root, expected.root());
 
         let before = sorted.snapshot();
@@ -3453,12 +3507,12 @@ mod tests {
 
         let mut tree = QmdbCompatTree::new();
         for value in 0..vector.workload.insert_count {
-            tree.set(interop_key(value), interop_value(value));
+            tree.set(interop_key(value), interop_value(value)).unwrap();
         }
         assert_eq!(hex::encode(tree.root()), vector.checkpoints.insert_root);
 
         for [key, value] in vector.workload.updates {
-            tree.set(interop_key(key), interop_value(value));
+            tree.set(interop_key(key), interop_value(value)).unwrap();
         }
         assert_eq!(hex::encode(tree.root()), vector.checkpoints.update_root);
 
@@ -3516,9 +3570,9 @@ mod tests {
     fn portable_snapshot_roundtrip_checks_identity_root_and_digest() {
         let mut tree = QmdbCompatTree::new();
         for value in 0..2050 {
-            tree.set(interop_key(value), interop_value(value));
+            tree.set(interop_key(value), interop_value(value)).unwrap();
         }
-        tree.set(interop_key(7), interop_value(1_000_007));
+        tree.set(interop_key(7), interop_value(1_000_007)).unwrap();
         assert!(tree.delete(&interop_key(9)));
         let snapshot = tree.snapshot();
         let genesis_hash = interop_key(0x11);
@@ -3583,7 +3637,7 @@ mod tests {
     fn build_sequential_portable(chain_id: u64, genesis: Hash, n: u64) -> QmdbPortableSnapshot {
         let mut tree = QmdbCompatTree::new();
         for value in 0..n {
-            tree.set(interop_key(value), interop_value(value));
+            tree.set(interop_key(value), interop_value(value)).unwrap();
         }
         let snapshot = tree.snapshot();
         QmdbPortableSnapshot {
@@ -3685,10 +3739,71 @@ mod tests {
         );
     }
 
+    /// A refused entry-file write on the one-at-a-time path is an error, not
+    /// a panic.
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn a_refused_write_in_set_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("n42-twig-set-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("entries.log");
+        let mut tree = QmdbCompatTree::new();
+        tree.set(key(1), b"one".to_vec()).unwrap();
+        tree.set_entry_file(&path).unwrap();
+        crate::entry_store::failpoints::fail_next_append(&path, 0);
+        let err = tree.set(key(2), b"two".to_vec()).unwrap_err();
+        assert!(matches!(err, QmdbOperationError::Store(_)), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A clone of a file-backed tree reads as the original stood but refuses
+    /// every append and cut, and carries no truncation guard; the original
+    /// goes on unaffected.
+    #[test]
+    fn a_clone_of_a_file_backed_tree_is_read_only() {
+        let dir = std::env::temp_dir().join(format!("n42-twig-clone-read-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("entries.log");
+        let mut tree = QmdbCompatTree::new();
+        tree.set(key(1), b"one".to_vec()).unwrap();
+        tree.set_entry_file(&path).unwrap();
+        let (_, undo) = tree
+            .apply_sorted_ops_recorded(vec![QmdbOperation { key: key(2), value: Some(b"two".to_vec()) }])
+            .unwrap();
+        tree.flush_entries_for_sync().unwrap();
+        struct Never;
+        impl TruncationGuard for Never {
+            fn before_truncate(&self, _new_len: u64) {
+                panic!("a clone must not tell the original's guard");
+            }
+        }
+        tree.set_truncation_guard(Some(std::sync::Arc::new(Never)));
+        let file_len = std::fs::metadata(&path).unwrap().len();
+
+        let mut clone = tree.try_clone().unwrap();
+        assert_eq!(clone.root(), tree.root());
+        assert!(clone.truncation_guard.is_none());
+        assert!(matches!(clone.set(key(3), b"three".to_vec()), Err(QmdbOperationError::Store(_))));
+        let mut copy = tree.clone();
+        assert!(copy.apply_sorted_ops(vec![QmdbOperation { key: key(4), value: Some(vec![4]) }]).is_err());
+        let mut undone = tree.clone();
+        assert!(undone.apply_undo(&undo).is_err(), "a clone does not cut the file");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), file_len);
+        drop((clone, copy, undone));
+
+        tree.set_truncation_guard(None);
+        tree.set(key(5), b"five".to_vec()).unwrap();
+        tree.flush_entries_for_sync().unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > file_len, "the original still appends");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn split_commitment_freezes_deleted_leaf() {
         let mut tree = QmdbCompatTree::new();
-        tree.set(key(1), b"first".to_vec());
+        tree.set(key(1), b"first".to_vec()).unwrap();
         let inserted_root = tree.root();
 
         let nulls = null_level();
@@ -3718,8 +3833,8 @@ mod tests {
     #[test]
     fn snapshot_preserves_dead_slots_and_root() {
         let mut tree = QmdbCompatTree::new();
-        tree.set(key(1), b"old".to_vec());
-        tree.set(key(1), b"new".to_vec());
+        tree.set(key(1), b"old".to_vec()).unwrap();
+        tree.set(key(1), b"new".to_vec()).unwrap();
         tree.delete(&key(1));
         let root = tree.root();
         let snapshot = tree.snapshot();
@@ -3734,8 +3849,8 @@ mod tests {
     #[test]
     fn slot_snapshot_preserves_positions_and_rejects_sparse_history() {
         let mut tree = QmdbCompatTree::new();
-        tree.set(key(1), b"old".to_vec());
-        tree.set(key(1), b"new".to_vec());
+        tree.set(key(1), b"old".to_vec()).unwrap();
+        tree.set(key(1), b"new".to_vec()).unwrap();
         let snapshot = tree.snapshot();
         let slot_snapshot = QmdbSlotSnapshot {
             next_slot: snapshot.next_slot,
@@ -3772,7 +3887,7 @@ mod tests {
     #[test]
     fn decodes_and_verifies_gov5_v2_proof_layout() {
         let mut tree = QmdbCompatTree::new();
-        tree.set(key(7), b"proof-value".to_vec());
+        tree.set(key(7), b"proof-value".to_vec()).unwrap();
         let root = tree.root();
 
         let nulls = null_level();
@@ -3820,7 +3935,7 @@ mod tests {
             out
         };
         for index in 0..(TWIG_SIZE + 3) {
-            tree.set(indexed_key(index as u64), index.to_le_bytes().to_vec());
+            tree.set(indexed_key(index as u64), index.to_le_bytes().to_vec()).unwrap();
         }
         let query = indexed_key((TWIG_SIZE + 1) as u64);
         let proof = tree.prove(&query).expect("active key has proof");
@@ -3956,7 +4071,7 @@ mod undo_tests {
         let before_root = tree.root();
         // apply_sorted_ops refuses duplicate keys, so do the two steps by hand.
         tree.start_undo_recording();
-        tree.set(key(99), vec![1]);
+        tree.set(key(99), vec![1]).unwrap();
         assert!(tree.delete(&key(99)));
         let undo = tree.stop_undo_recording().unwrap();
         assert_eq!(undo.entries.len(), 1, "the delete recorded a deactivation");
@@ -4096,8 +4211,8 @@ mod undo_tests {
                 // A one-off set, again with no root read before the next apply.
                 5 => {
                     let n = mix(&mut state) % next;
-                    on.set(key(n), vec![0x77, block as u8]);
-                    off.set(key(n), vec![0x77, block as u8]);
+                    on.set(key(n), vec![0x77, block as u8]).unwrap();
+                    off.set(key(n), vec![0x77, block as u8]).unwrap();
                 }
                 _ => {}
             }

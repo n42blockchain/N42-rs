@@ -1025,3 +1025,139 @@ fn a_branch_switch_during_a_lease_waits_and_takes_the_owed_trim_first() {
     assert_eq!(view.head(), (21, hash_of(21)));
     assert!(view.is_valid());
 }
+
+// ---------------------------------------------------------------------------
+// The restart's root check
+// ---------------------------------------------------------------------------
+
+/// A restart compares the rebuilt tree's root with the one recorded when its
+/// head was persisted: a clean restart passes, one over a corrupt entry file
+/// fails by name, and a datadir with no record restarts unchecked.
+#[test]
+fn a_restart_over_a_corrupt_entry_file_fails_on_its_root() {
+    let (state, chain, dir, head, root) = node_at("restart-root", true, 3);
+    let entries = state.entry_file_path();
+    let roots = state.head_roots_path();
+    drop(state);
+    assert!(roots.exists(), "the persisted heads' roots are recorded");
+
+    let clean = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+    clean.initialize((3, head)).expect("a clean restart");
+    assert_eq!(clean.state_root(), root);
+    assert_eq!(clean.unchecked_restart(), None, "a checked restart is not flagged");
+    drop(clean);
+
+    let good = std::fs::read(&entries).expect("the entry file");
+    let mut bytes = good.clone();
+    *bytes.last_mut().expect("a record") ^= 0xff;
+    std::fs::write(&entries, &bytes).expect("corrupt one record");
+    let corrupt = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+    let err = corrupt.initialize((3, head)).expect_err("a corrupt entry file is refused");
+    assert!(matches!(err, NodeStateError::RestoredRootMismatch { number: 3, recorded, .. } if recorded == root), "{err}");
+    drop(corrupt);
+
+    std::fs::write(&entries, &good).expect("restore the record");
+    std::fs::remove_file(&roots).expect("drop the record");
+    let unchecked = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+    unchecked.initialize((3, head)).expect("no record: the check is skipped");
+    assert_eq!(unchecked.state_root(), root);
+    let reason = unchecked.unchecked_restart().expect("an unchecked restart is flagged");
+    assert!(reason.contains("no forest.roots"), "{reason}");
+    // The first head persisted after it is recorded, so the next restart is
+    // checked.
+    let (head4, root4) = advance(&unchecked, 4, head);
+    assert!(roots.exists(), "the persisted head's root is recorded");
+    drop(unchecked);
+    let rechecked = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    rechecked.initialize((4, head4)).expect("the second restart");
+    assert_eq!(rechecked.state_root(), root4);
+    assert_eq!(rechecked.unchecked_restart(), None, "the second restart is checked");
+    drop(rechecked);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An entry file cut shorter than the checkpoint needs (a lost or torn
+/// first record) refuses the restart by name, rather than rebuilding a
+/// tree with slots missing.
+#[test]
+fn a_restart_over_an_entry_file_shorter_than_the_checkpoint_fails() {
+    let (state, chain, dir, head, _) = node_at("restart-short-entries", true, 3);
+    let entries = state.entry_file_path();
+    drop(state);
+    let file = std::fs::OpenOptions::new().write(true).open(&entries).expect("the entry file");
+    file.set_len(10).expect("cut the entry file inside its first record");
+    drop(file);
+    let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    let err = restarted.initialize((3, head)).expect_err("a short entry file is refused");
+    assert!(matches!(err, NodeStateError::State(StateError::EntryFile(_))), "{err}");
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A delta log that ends before the database's head (the database persisted
+/// a block the log never recorded) refuses the restart with the two
+/// positions named, and leaves the datadir as it was: a restart at the
+/// log's own head still works.
+#[test]
+fn a_delta_log_ending_before_the_database_head_is_refused() {
+    for entry_file in [true, false] {
+        let name = format!("restart-log-short-{entry_file}");
+        let (state, chain, dir, head, root) = node_at(&name, entry_file, 3);
+        drop(state);
+        let ahead = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        let err = ahead.initialize((4, hash_of(4))).expect_err("the database is past the log");
+        assert!(
+            matches!(err, NodeStateError::SnapshotMismatch { snapshot_number: 3, head_number: 4, .. }),
+            "{err}"
+        );
+        drop(ahead);
+        let back = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        back.initialize((3, head)).expect("the log's own head");
+        assert_eq!(back.state_root(), root);
+        drop(back);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The same check in heap mode, over a corrupt snapshot's restored tree.
+#[test]
+fn a_heap_restart_checks_its_root_too() {
+    let (state, chain, dir, head, root) = node_at("restart-root-heap", false, 3);
+    drop(state);
+    let clean = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, false);
+    clean.initialize((3, head)).expect("a clean restart");
+    assert_eq!(clean.state_root(), root);
+    let roots = clean.head_roots_path();
+    drop(clean);
+    // A record naming another root for this head stands in for a corrupt
+    // snapshot or log.
+    HeadRoots::write(&roots, &[(3, head, B256::repeat_byte(0x5a))]).expect("rewrite the record");
+    let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, false);
+    let err = restarted.initialize((3, head)).expect_err("the wrong root is refused");
+    assert!(matches!(err, NodeStateError::RestoredRootMismatch { number: 3, restored, .. } if restored == root), "{err}");
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A head whose root is absent or zero is not recorded (a zero would make
+/// the next restart refuse to start), and an unreadable record file skips
+/// the check instead of blocking startup.
+#[test]
+fn absent_roots_are_not_recorded_and_an_unreadable_record_is_skipped() {
+    let (state, chain, dir, head, root) = node_at("restart-root-absent", true, 2);
+    let roots = state.head_roots_path();
+    std::fs::remove_file(&roots).expect("drop the records");
+    state.record_head_roots(&[(5, B256::repeat_byte(5), None), (6, B256::repeat_byte(6), Some(B256::ZERO))]);
+    assert!(!roots.exists(), "nothing was recorded");
+    drop(state);
+    // A directory where the file should be: reading it fails, and the
+    // restart goes on unchecked.
+    std::fs::create_dir_all(&roots).expect("an unreadable record");
+    let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    restarted.initialize((2, head)).expect("an unreadable record does not block startup");
+    assert_eq!(restarted.state_root(), root);
+    // (Which reason depends on how the file system sizes a directory.)
+    assert!(restarted.unchecked_restart().is_some(), "an unchecked restart is flagged");
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(&dir);
+}

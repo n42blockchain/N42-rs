@@ -311,6 +311,9 @@ pub enum Position {
 pub struct Raised {
     floor: u64,
     cuts: u64,
+    /// A record the block names lies past the view's 1 TiB mapping: the
+    /// advance invalidates the view instead of reading it.
+    past_view: bool,
 }
 
 /// The read view: see the module documentation.
@@ -343,8 +346,9 @@ impl std::fmt::Debug for QmdbReadView {
     }
 }
 
-fn record_end(file: &EntryFileView, offset: u64) -> u64 {
-    offset + 36 + file.record(offset).1.len() as u64
+/// Where the record at `offset` ends; `None` past the view's 1 TiB mapping.
+fn record_end(file: &EntryFileView, offset: u64) -> Option<u64> {
+    file.record_end(offset)
 }
 
 /// gov5's `StateAccount.MarshalV2` leaf as reth's account: the presence bitmap
@@ -386,10 +390,20 @@ impl QmdbReadView {
     pub fn build(entry_file: &Path, head: (u64, B256), mut live: Vec<(Hash, u64)>) -> std::io::Result<Arc<Self>> {
         let file = EntryFileView::open(entry_file)?;
         live.par_sort_unstable_by_key(|(key, _)| *key);
-        let floor = live.iter().map(|(_, offset)| *offset).max().map_or(0, |offset| record_end(&file, offset));
+        let floor = match live.iter().map(|(_, offset)| *offset).max() {
+            None => 0,
+            Some(offset) => record_end(&file, offset)
+                .ok_or_else(|| std::io::Error::other("entry file past 1 TiB: the read view cannot map it"))?,
+        };
         let changes: Vec<(Hash, Option<u64>)> = live.into_iter().map(|(key, offset)| (key, Some(offset))).collect();
         let index = SharedOffsetIndex::default();
-        index.apply_sorted(&changes, |offset| file.key(offset));
+        // SAFETY: every offset here is a live record of the tree at `head`,
+        // flushed before the call (the caller's contract), and the tree tells
+        // this view before it cuts the file; the index only reads the keys of
+        // offsets it was given.
+        index
+            .apply_sorted(&changes, |offset| unsafe { file.key(offset) })
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         let versions =
             Versions { valid: true, head, head_floor: floor, journals: VecDeque::new(), pending: None, held_from: None };
         let frozen = versions.frozen();
@@ -483,9 +497,13 @@ impl QmdbReadView {
         };
         let offset = match undone {
             Some(offset) => offset,
-            None => self.index.get(key, |offset| self.file.key(offset)),
+            // SAFETY: the index holds offsets of records written at or below
+            // the view's head, and the tree tells the view (`before_truncate`)
+            // before it cuts any of them.
+            None => self.index.get(key, |offset| unsafe { self.file.key(offset) }),
         };
-        Some(offset.map(|offset| decode(self.file.record(offset).1)))
+        // SAFETY: an offset from the index or a journal, as above.
+        Some(offset.map(|offset| decode(unsafe { self.file.record(offset) }.1)))
     }
 
     /// An account as of block `at` (see [`Self::read_at`]). A record that does
@@ -551,9 +569,11 @@ impl QmdbReadView {
     /// (`QmdbForest::block_changes_parts`). The same rule: under the lock,
     /// before anything that could cut the records.
     pub fn raise_floor_to(&self, max_offset: Option<u64>) -> Raised {
-        let floor = max_offset.map_or(0, |offset| record_end(&self.file, offset));
+        let end = max_offset.map(|offset| record_end(&self.file, offset));
+        let past_view = matches!(end, Some(None));
+        let floor = end.flatten().unwrap_or(0);
         self.floor.fetch_max(floor, Ordering::SeqCst);
-        Raised { floor, cuts: self.cuts.load(Ordering::SeqCst) }
+        Raised { floor, cuts: self.cuts.load(Ordering::SeqCst), past_view }
     }
 
     /// Moves the view to its head's child `number`, whose `changes` (sorted by
@@ -566,7 +586,9 @@ impl QmdbReadView {
             if !versions.valid {
                 return;
             }
-            let why = if number != versions.head.0 + 1 {
+            let why = if raised.past_view {
+                Some("entry file past 1 TiB")
+            } else if number != versions.head.0 + 1 {
                 Some("advanced to a block that is not the head's child")
             } else if self.cuts.load(Ordering::SeqCst) != raised.cuts {
                 Some("the tree cut records between a block's floor and its advance")
@@ -579,7 +601,9 @@ impl QmdbReadView {
                 return;
             }
         }
-        let key_at = |offset: u64| self.file.key(offset);
+        // SAFETY: the index holds offsets of written records the tree has not
+        // cut: a cut tells the view first and waits on `advancing`, held here.
+        let key_at = |offset: u64| unsafe { self.file.key(offset) };
         let journal: Vec<(Hash, Option<u64>)> =
             changes.par_iter().with_min_len(1024).map(|(key, _)| (*key, self.index.get(key, key_at))).collect();
         let journal = Arc::new(JournalData::new(journal, self.filter_journals.load(Ordering::Relaxed)));
@@ -589,9 +613,17 @@ impl QmdbReadView {
             // Every slot holds the journal before the index changes.
             self.publish(&versions);
         }
-        self.index.apply_sorted(changes, key_at);
+        let applied = self.index.apply_sorted(changes, key_at);
         let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
         versions.pending = None;
+        if let Err(err) = applied {
+            // Part of the block is in the index: the view cannot answer for
+            // it, and reads go to the database from here on.
+            warn!(target: "n42.qmdb", %err, number, "the QMDB read view's key index refused a block's changes");
+            Self::invalidate_locked(&mut versions, "the key index refused a block's changes");
+            self.publish(&versions);
+            return;
+        }
         let floor_before = versions.head_floor;
         versions.journals.push_back(Step { number, hash, journal, floor_before });
         versions.head = (number, hash);
@@ -654,14 +686,20 @@ impl QmdbReadView {
         if depth > versions.journals.len() {
             return false;
         }
-        let key_at = |offset: u64| self.file.key(offset);
+        // SAFETY: the index and the journals hold offsets of records written at
+        // or below the head being stepped back from, not yet cut.
+        let key_at = |offset: u64| unsafe { self.file.key(offset) };
         let from = versions.head.0;
         for _ in 0..depth {
             let step = versions.journals.pop_back().expect("depth checked against the journals");
             for (key, before) in step.journal.iter() {
                 match before {
                     Some(offset) => {
-                        self.index.insert(*key, *offset, key_at);
+                        // A refusal leaves the view part way back: the
+                        // caller invalidates it.
+                        if self.index.insert(*key, *offset, key_at).is_err() {
+                            return false;
+                        }
                     }
                     None => {
                         self.index.remove(key, key_at);
@@ -737,6 +775,31 @@ mod tests {
         }
         assert_eq!(decode_account(&[]), None);
         assert_eq!(decode_account(&[2, 5, 1]), None, "a truncated balance");
+    }
+
+    /// A block whose records lie past the view's 1 TiB mapping invalidates
+    /// the view (reads fall back) instead of reading past the mapping.
+    #[test]
+    fn a_block_past_the_mapping_invalidates_the_view() {
+        use n42_twig_core::entry_view::VIEW_MAP_BYTES;
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("n42-view-past-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("entries.log");
+        let key = [3u8; 32];
+        {
+            let mut file = std::fs::File::create(&path).expect("the entry file");
+            file.write_all(&key).expect("write");
+            file.write_all(&1u32.to_le_bytes()).expect("write");
+            file.write_all(&[9]).expect("write");
+        }
+        let view = QmdbReadView::build(&path, (1, B256::ZERO), vec![(key, 0)]).expect("the view");
+        assert!(view.is_valid());
+        let changes = vec![([4u8; 32], Some(VIEW_MAP_BYTES))];
+        let raised = view.raise_floor(&changes);
+        view.advance(2, B256::repeat_byte(2), &changes, raised);
+        assert!(!view.is_valid());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1085,7 +1148,10 @@ mod tests {
                 let read = |a: &Address| matches!(view.account(a, at), Some(Some(_)));
                 let raw = |a: &Address| {
                     let key = gov5_account_key(&a.0 .0);
-                    view.index.get(&key, |o| view.file.key(o)).is_some_and(|o| decode_account(view.file.record(o).1).is_some())
+                    // SAFETY: offsets of the built view's own flushed records.
+                    view.index
+                        .get(&key, |o| unsafe { view.file.key(o) })
+                        .is_some_and(|o| decode_account(unsafe { view.file.record(o) }.1).is_some())
                 };
                 let cold = time(threads, &read, first);
                 let warm = time(threads, &read, second);

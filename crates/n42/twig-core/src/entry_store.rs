@@ -19,6 +19,55 @@ use std::{
 
 use crate::Hash;
 
+/// Fault injection for the entry file's appends (feature `failpoints`, for
+/// tests of callers that must survive a failed write): an armed path's next
+/// batch append copies its first `keep` records and then fails as a failed
+/// seal does, leaving the store part way into the batch. A single append
+/// (`QmdbCompatTree::set`) fails outright, whatever `keep` is.
+#[cfg(feature = "failpoints")]
+pub mod failpoints {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static ARMED: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+
+    /// Arms the entry file at `path`: its next batch append keeps `keep`
+    /// records and fails.
+    pub fn fail_next_append(path: &Path, keep: usize) {
+        ARMED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((path.to_path_buf(), keep));
+    }
+
+    static ARMED_TRUNCATE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Arms the entry file at `path`: its next truncation (an undo that
+    /// takes appended slots off) fails before it cuts anything.
+    pub fn fail_next_truncate(path: &Path) {
+        ARMED_TRUNCATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(path.to_path_buf());
+    }
+
+    /// Disarms the truncation failure armed for `path`; whether there was one.
+    pub(crate) fn take_truncate(path: &Path) -> bool {
+        let mut armed = ARMED_TRUNCATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(at) = armed.iter().position(|armed| armed == path) else {
+            return false;
+        };
+        armed.swap_remove(at);
+        true
+    }
+
+    /// Disarms and returns the failure armed for `path`, if any.
+    pub(crate) fn take(path: &Path) -> Option<usize> {
+        let mut armed = ARMED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = armed.iter().position(|(armed, _)| armed == path)?;
+        Some(armed.swap_remove(at).1)
+    }
+
+    /// The error an armed append fails with.
+    pub(crate) fn injected() -> std::io::Error {
+        std::io::Error::other("injected entry-file seal failure (failpoints)")
+    }
+}
+
 /// One entry, as the heap store keeps it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Entry {
@@ -211,6 +260,10 @@ pub(crate) struct FileEntries {
     offsets: Offsets,
     /// One bit per slot.
     active: Vec<u64>,
+    /// A second handle made for a cloned tree ([`Self::duplicate`]): it
+    /// refuses every append, truncation and write, so it can never cut or
+    /// extend the file under the handle it was cloned from.
+    read_only: bool,
 }
 
 impl std::fmt::Debug for FileEntries {
@@ -245,6 +298,7 @@ impl FileEntries {
             len_bytes: 0,
             offsets: Offsets::default(),
             active: Vec::new(),
+            read_only: false,
         })
     }
 
@@ -306,6 +360,7 @@ impl FileEntries {
             len_bytes,
             offsets: Offsets::from_vec(offsets),
             active: vec![0u64; (kept as usize).div_ceil(64)],
+            read_only: false,
         };
         for (word, bits) in store.active.iter_mut().zip(active) {
             *word = *bits;
@@ -404,6 +459,7 @@ impl FileEntries {
     /// Appends a live entry as the next slot: into the tail, which reaches
     /// the file at the next `flush` (a sync, a sealed chunk, a truncation).
     pub(crate) fn push(&mut self, key: &Hash, value: &[u8]) -> io::Result<()> {
+        self.writable()?;
         let slot = self.offsets.len();
         let record_len = KEY_LEN + LEN_LEN + value.len();
         // Sealed before the record that would not fit rather than after the
@@ -442,6 +498,7 @@ impl FileEntries {
         records: impl Iterator<Item = (&'a Hash, &'a [u8])> + Clone,
         faults: &mut AppendFaults,
     ) -> io::Result<()> {
+        self.writable()?;
         let first_slot = self.offsets.len();
         let first_byte = self.len_bytes;
         let at = crate::prefault::thread_faults();
@@ -499,6 +556,7 @@ impl FileEntries {
     #[cfg(feature = "rayon")]
     fn push_batch_parallel<'a>(&mut self, count: usize, record: &(impl Fn(usize) -> (&'a Hash, &'a [u8]) + Sync)) -> io::Result<()> {
         use rayon::prelude::*;
+        self.writable()?;
         let lens: Vec<usize> = (0..count).into_par_iter().with_min_len(4096).map(|k| KEY_LEN + LEN_LEN + record(k).1.len()).collect();
         let mut from = 0usize;
         while from < count {
@@ -635,6 +693,8 @@ impl FileEntries {
     /// Writes the tail's unwritten bytes to the file, in one call.
     fn flush(&mut self) -> io::Result<()> {
         if self.written < self.tail.len() {
+            // The handle it was cloned from writes these bytes.
+            self.writable()?;
             self.file.seek(io::SeekFrom::Start(self.sealed_len + self.written as u64))?;
             self.file.write_all(&self.tail[self.written..])?;
             self.written = self.tail.len();
@@ -701,6 +761,7 @@ impl FileEntries {
         if len >= self.offsets.len() {
             return Ok(());
         }
+        self.writable()?;
         let new_len_bytes = self.offsets[len];
         self.offsets.truncate(len);
         for slot in len..self.active.len() * 64 {
@@ -739,12 +800,25 @@ impl FileEntries {
         self.active.reserve(additional.div_ceil(64));
     }
 
-    /// A second handle on the same file with the same bookkeeping, for a
-    /// tree that is cloned. Two handles appending to one file would corrupt
-    /// it; a clone is only sensible when at most one of the two appends
-    /// afterwards (a checkpoint's read, a test's comparison).
+    /// Refuses a write on a read-only handle ([`Self::duplicate`]).
+    fn writable(&self) -> io::Result<()> {
+        if self.read_only {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{}: a cloned entry store is read-only", self.path.display()),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A second, read-only handle on the same file with the same
+    /// bookkeeping, for a tree that is cloned: it reads what the original
+    /// had (its unwritten tail included, from memory) and refuses every
+    /// append, truncation and write, since two handles writing one file
+    /// would corrupt it and a clone cutting it would pull the original's
+    /// sealed mappings out from under it (`SIGBUS`).
     pub(crate) fn duplicate(&self) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        let file = OpenOptions::new().read(true).open(&self.path)?;
         let mut chunks = Vec::with_capacity(self.chunks.len());
         for chunk in &self.chunks {
             // SAFETY: as in `seal_tail`; the same sealed bytes.
@@ -767,6 +841,7 @@ impl FileEntries {
             len_bytes: self.len_bytes,
             offsets: self.offsets.clone(),
             active: self.active.clone(),
+            read_only: true,
         })
     }
 
@@ -859,7 +934,14 @@ impl Entries {
                 faults.entries += crate::prefault::thread_faults().saturating_sub(at);
                 Ok(())
             }
-            Self::File(file) => file.push_batch(records, faults),
+            Self::File(file) => {
+                #[cfg(feature = "failpoints")]
+                if let Some(keep) = failpoints::take(&file.path) {
+                    file.push_batch(records.take(keep), faults)?;
+                    return Err(failpoints::injected());
+                }
+                file.push_batch(records, faults)
+            }
         }
     }
 
@@ -881,7 +963,14 @@ impl Entries {
                 }));
                 Ok(())
             }
-            Self::File(file) => file.push_batch_parallel(count, record),
+            Self::File(file) => {
+                #[cfg(feature = "failpoints")]
+                if let Some(keep) = failpoints::take(&file.path) {
+                    file.push_batch_parallel(count.min(keep), record)?;
+                    return Err(failpoints::injected());
+                }
+                file.push_batch_parallel(count, record)
+            }
         }
     }
 
@@ -892,7 +981,13 @@ impl Entries {
                 entries.push(Entry { key, value, active: true });
                 Ok(())
             }
-            Self::File(file) => file.push(&key, &value),
+            Self::File(file) => {
+                #[cfg(feature = "failpoints")]
+                if failpoints::take(&file.path).is_some() {
+                    return Err(failpoints::injected());
+                }
+                file.push(&key, &value)
+            }
         }
     }
 
@@ -902,7 +997,13 @@ impl Entries {
                 entries.truncate(len);
                 Ok(())
             }
-            Self::File(file) => file.truncate(len),
+            Self::File(file) => {
+                #[cfg(feature = "failpoints")]
+                if failpoints::take_truncate(&file.path) {
+                    return Err(failpoints::injected());
+                }
+                file.truncate(len)
+            }
         }
     }
 
@@ -1052,10 +1153,20 @@ mod tests {
         assert_eq!(file.value(800), &[9u8; 4]);
         assert_eq!(file.value(799), &vec![(799 % 256) as u8; 1 + 799 % 50][..]);
         assert!(file.is_active(800));
-        let copy = file.duplicate().unwrap();
+        let mut copy = file.duplicate().unwrap();
         assert_eq!(copy.len(), 801);
         assert_eq!(copy.value(800), &[9u8; 4]);
         assert!(!copy.is_active(17));
+        // The copy is read-only: it neither appends to nor cuts the file.
+        let bytes = std::fs::metadata(&file.path).unwrap().len();
+        assert_eq!(copy.push(&key(9001), &[1u8; 2]).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(copy.truncate(10).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(copy.len(), 801);
+        file.sync().unwrap();
+        assert!(std::fs::metadata(&file.path).unwrap().len() >= bytes);
+        // The original is untouched by the copy and still appends.
+        file.push(&key(9002), &[2u8; 2]).unwrap();
+        assert_eq!(file.len(), 802);
     }
 
     /// The file store must be the heap store to every caller: same roots

@@ -991,8 +991,13 @@ pub fn n42_canon_notify_lean() -> bool {
 /// handed out with a thin bundle (`N42_MERGE_ELIDE`, refused from here on: a
 /// notification that carries the outcome reads the whole map) gets its shards'
 /// accounts put in.
+///
+/// The failure is fail-stop, deliberately and explicitly: the notification has no error path
+/// (`to_chain_notification` is upstream's signature), and leaving the block out of it would give
+/// subscribers a gap. The panic names the block, so the operator knows which fill failed.
 fn n42_completed_outcome<R: Clone>(
     output: &reth_execution_types::BlockExecutionOutput<R>,
+    block: (BlockNumber, B256),
 ) -> reth_execution_types::BlockExecutionOutput<R> {
     let mut copy = output.clone();
     if let Some(whole) =
@@ -1000,14 +1005,21 @@ fn n42_completed_outcome<R: Clone>(
     {
         copy.state = whole;
     }
-    n42_deferred_reverts::complete_in_place(output, &mut copy.state)
-        .expect("a canonical notification requires the block's complete revert set");
+    if let Err(unfilled) = n42_deferred_reverts::complete_in_place(output, &mut copy.state) {
+        let (number, hash) = block;
+        panic!(
+            "N42: the canonical notification for block {number} ({hash}) needs the block's \
+             complete revert set, but its deferred revert set was never filled ({unfilled}); \
+             stopping rather than publishing a partial one"
+        );
+    }
     copy
 }
 
 #[cfg(test)]
 mod completed_outcome_tests {
     use super::n42_completed_outcome;
+    use alloy_primitives::B256;
     use reth_execution_types::BlockExecutionOutput;
     use std::sync::Arc;
 
@@ -1018,7 +1030,12 @@ mod completed_outcome_tests {
             result: Default::default(),
         });
         drop(n42_deferred_reverts::register(&output));
-        assert!(std::panic::catch_unwind(|| n42_completed_outcome(&*output)).is_err());
+        let panic = std::panic::catch_unwind(|| n42_completed_outcome(&*output, (7, B256::repeat_byte(7))))
+            .expect_err("an unfilled revert set stops the notification");
+        let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(message.contains("block 7"), "{message}");
+        assert!(message.contains(&B256::repeat_byte(7).to_string()), "{message}");
+        assert!(message.contains("never filled"), "{message}");
     }
 
     #[test]
@@ -1027,11 +1044,11 @@ mod completed_outcome_tests {
             state: Default::default(),
             result: Default::default(),
         });
-        assert_eq!(n42_completed_outcome(&*output).state, output.state);
+        assert_eq!(n42_completed_outcome(&*output, (1, B256::ZERO)).state, output.state);
         let mut reverts = n42_deferred_reverts::Reverts::default();
         reverts.push(Vec::new());
         n42_deferred_reverts::register(&output).fill(reverts.clone(), 7);
-        let completed = n42_completed_outcome(&*output);
+        let completed = n42_completed_outcome(&*output, (1, B256::ZERO));
         assert_eq!(completed.state.reverts, reverts);
         assert_eq!(completed.state.reverts_size, 7);
         assert!(output.state.reverts.is_empty());
@@ -1089,7 +1106,10 @@ impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
                 let mut chain = Chain::from_block(
                     Arc::clone(&first.recovered_block),
                     ExecutionOutcome::from((
-                        n42_completed_outcome(first.execution_outcome()),
+                        n42_completed_outcome(
+                            first.execution_outcome(),
+                            (first.block_number(), first.recovered_block.hash()),
+                        ),
                         first.block_number(),
                     )),
                     first.trie_data_handle(),
@@ -1098,7 +1118,10 @@ impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
                     chain.append_block(
                         Arc::clone(&exec.recovered_block),
                         ExecutionOutcome::from((
-                            n42_completed_outcome(exec.execution_outcome()),
+                            n42_completed_outcome(
+                                exec.execution_outcome(),
+                                (exec.block_number(), exec.recovered_block.hash()),
+                            ),
                             exec.block_number(),
                         )),
                         exec.trie_data_handle(),

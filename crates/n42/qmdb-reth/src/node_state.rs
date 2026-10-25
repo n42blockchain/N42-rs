@@ -82,6 +82,10 @@ const SNAPSHOT_FILE: &str = "forest.bin";
 const DELTA_LOG_FILE: &str = "forest.log";
 /// The log segment a background compaction is folding into the checkpoint.
 const SEALED_LOG_FILE: &str = "forest.log.sealed";
+/// The state roots of recently persisted heads, checked against the tree a
+/// restart rebuilds ([`HeadRoots`]). A sidecar, so the checkpoint, snapshot
+/// and delta-log layouts are unchanged.
+const HEAD_ROOTS_FILE: &str = "forest.roots";
 
 /// Below this the log is left to grow even if it has passed the checkpoint.
 /// Without a floor, a chain whose state is a few kilobytes would rewrite its
@@ -278,6 +282,10 @@ pub struct OfflockCounters {
     /// their persistence left to the catch-up thread (and, during a lease,
     /// their trim to the lease's return).
     pub deferred_canonicals: u64,
+    /// Deferred renames (`N42_QMDB_RENAME_DEFER`) that failed when the next
+    /// holder of the forest applied them: the caller had already been told
+    /// [`RenameOutcome::Deferred`].
+    pub failed_renames: u64,
 }
 
 /// Why a persistence call stops following the database.
@@ -469,7 +477,20 @@ pub enum NodeStateError {
     },
     /// The trees themselves refused an operation.
     #[error(transparent)]
-    State(#[from] StateError),
+    State(StateError),
+    /// The forest is unusable ([`QmdbForest::poison`]): a failed or panicked
+    /// mutation left the tree where the forest does not believe it stands,
+    /// so no state root is computed again. Any panic under the forest's lock
+    /// poisons it, a read-only one (a proof, a listing) included. A restart
+    /// rebuilds the tree from the checkpoint and the log.
+    ///
+    /// Today this is a stall, not an exit: the process stays up, every root
+    /// and persistence call fails with this error, and the poisoning is
+    /// logged once at error level ([`QmdbNodeState::poisoned`] reports it to
+    /// a health check). Whether the node should exit on the first one is an
+    /// open policy item.
+    #[error("QMDB forest is poisoned and computes no roots: {0}")]
+    Poisoned(String),
     /// The snapshot file could not be read or written.
     #[error("QMDB snapshot at {path}: {source}")]
     Io {
@@ -489,6 +510,114 @@ pub enum NodeStateError {
     /// The execution frontier required by a deferred checkpoint is unavailable or corrupt.
     #[error("QMDB deferred recovery: {0}")]
     RecoveryFrontier(String),
+    /// The tree a restart rebuilt from the checkpoint, the log and the entry
+    /// file does not have the root recorded when that head was persisted: a
+    /// corrupt or mismatched entry file, checkpoint or log. Refused rather
+    /// than proposed or attested to.
+    #[error(
+        "the QMDB tree restored at block {number} ({hash}) has root {restored}, but the root recorded \
+         when that head was persisted is {recorded}; the entry file, checkpoint or log is corrupt"
+    )]
+    RestoredRootMismatch {
+        /// The restored head's number.
+        number: u64,
+        /// Its hash.
+        hash: B256,
+        /// The root recorded when it was persisted.
+        recorded: B256,
+        /// The root of the rebuilt tree.
+        restored: B256,
+    },
+}
+
+/// The state roots of the last [`HeadRoots::SLOTS`] persisted heads, in a
+/// fixed ring of checksummed records (`[number][hash][root][digest]`, the
+/// record of block `n` at slot `n % SLOTS`), rewritten in place as heads are
+/// persisted and never fsynced: it is a check, not state. A restart compares
+/// the rebuilt tree's root with the record of its head, when there is a
+/// whole one for that very head (a crash can lose recent records, and an
+/// older datadir has none: the check is then skipped with a warning).
+struct HeadRoots;
+
+impl HeadRoots {
+    const SLOTS: u64 = 1024;
+    const RECORD: usize = 8 + 32 + 32 + 4;
+
+    fn encode(number: u64, hash: B256, root: B256) -> [u8; Self::RECORD] {
+        let mut record = [0u8; Self::RECORD];
+        record[..8].copy_from_slice(&number.to_le_bytes());
+        record[8..40].copy_from_slice(hash.as_slice());
+        record[40..72].copy_from_slice(root.as_slice());
+        let digest = alloy_primitives::keccak256(&record[..72]);
+        record[72..].copy_from_slice(&digest[..4]);
+        record
+    }
+
+    /// Records `heads` (number, hash, root).
+    fn write(path: &Path, heads: &[(u64, B256, B256)]) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        if heads.is_empty() {
+            return Ok(());
+        }
+        let mut file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
+        for (number, hash, root) in heads {
+            file.seek(SeekFrom::Start((number % Self::SLOTS) * Self::RECORD as u64))?;
+            file.write_all(&Self::encode(*number, *hash, *root))?;
+        }
+        Ok(())
+    }
+
+    /// The root recorded for `(number, hash)`, if a whole record of that
+    /// very head is there.
+    fn read(path: &Path, number: u64, hash: B256) -> std::io::Result<Option<B256>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let at = (number % Self::SLOTS) * Self::RECORD as u64;
+        if file.metadata()?.len() < at + Self::RECORD as u64 {
+            return Ok(None);
+        }
+        let mut record = [0u8; Self::RECORD];
+        file.seek(SeekFrom::Start(at))?;
+        file.read_exact(&mut record)?;
+        let digest = alloy_primitives::keccak256(&record[..72]);
+        if record[72..] != digest[..4]
+            || record[..8] != number.to_le_bytes()
+            || record[8..40] != hash.as_slice()[..]
+        {
+            return Ok(None);
+        }
+        Ok(Some(B256::from_slice(&record[40..72])))
+    }
+}
+
+impl From<StateError> for NodeStateError {
+    fn from(err: StateError) -> Self {
+        match err {
+            StateError::Poisoned(reason) => Self::Poisoned(reason),
+            err => Self::State(err),
+        }
+    }
+}
+
+/// Recovers the forest's guard from a poisoned lock and poisons the forest
+/// itself: a panic while the lock was held interrupted whatever held it --
+/// an apply, an undo, a move -- part way, so the tree no longer stands
+/// where the forest believes it does. Only the forest's lock is treated
+/// this way; the side locks (metrics, holder labels, rename queue) recover
+/// with `into_inner` as before.
+fn poisoned_forest_guard<'a>(
+    poisoned: std::sync::PoisonError<MutexGuard<'a, Option<QmdbForest>>>,
+    label: &'static str,
+) -> MutexGuard<'a, Option<QmdbForest>> {
+    let mut guard = poisoned.into_inner();
+    if let Some(forest) = guard.as_mut() {
+        forest.poison(format!("the forest lock was poisoned by a panic under it (found by {label})"));
+    }
+    guard
 }
 
 struct Inner {
@@ -506,6 +635,16 @@ struct Inner {
     /// How many renames are queued, so a lock taker skips the queue's mutex
     /// when there are none.
     pending_rename_count: std::sync::atomic::AtomicUsize,
+    /// Deferred renames that failed while their sealed hash was not filed,
+    /// kept (at most [`RENAME_ALIASES_KEPT`]) as `from -> to` aliases and
+    /// tried again when the next renames are drained and when a root lookup
+    /// misses ([`QmdbNodeState::root_of`]), so a block filed under `from`
+    /// after its rename was queued still resolves under the sealed hash.
+    rename_aliases: Mutex<Vec<PendingRename>>,
+    /// How many aliases are kept, so a lookup skips their mutex when none are.
+    rename_alias_count: std::sync::atomic::AtomicUsize,
+    /// Deferred renames that failed when they were drained.
+    failed_renames: std::sync::atomic::AtomicU64,
     /// The last roots' splits, by key ([`QmdbNodeState::take_root_split`]).
     root_splits: Mutex<std::collections::VecDeque<(B256, RootSplit)>>,
     chain: Arc<ChainSpec>,
@@ -581,6 +720,9 @@ struct Inner {
     /// Who held the forest's lock and its tree, and who waited
     /// ([`crate::occupancy`]).
     occupancy: crate::occupancy::Occupancy,
+    /// Why this run's restored tree was not checked against a recorded
+    /// root, if it was not ([`QmdbNodeState::unchecked_restart`]).
+    unchecked_restart: std::sync::OnceLock<String>,
 }
 
 /// A rename queued by [`QmdbNodeState::rename_or_defer`].
@@ -613,12 +755,28 @@ fn apply_rename(forest: &mut QmdbForest, rename: &PendingRename) -> Result<(), S
     }
 }
 
+/// Removes a file that may not exist (an old log, a folded segment): a
+/// missing file is the expected case, any other failure is logged with the
+/// path, since the file then stays beside a checkpoint that supersedes it.
+fn remove_file_logged(path: impl AsRef<Path>) {
+    let path = path.as_ref();
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(target: "n42.qmdb", %error, path = %path.display(), "could not remove a superseded QMDB file"),
+    }
+}
+
 /// A forest-lock wait or hold longer than this is logged at WARN
 /// (`forest lock waited` / `forest lock held`, with the holder's label).
 pub const FOREST_LOCK_WARN_MS: u64 = 20;
 
 /// How many roots' splits [`QmdbNodeState::take_root_split`] can still find.
 const ROOT_SPLITS_KEPT: usize = 32;
+
+/// How many failed deferred renames are kept as aliases; past this the
+/// oldest is dropped.
+const RENAME_ALIASES_KEPT: usize = 64;
 
 /// The forest's lock, taken for a label ([`QmdbNodeState::lock_as`]); a
 /// hold over [`FOREST_LOCK_WARN_MS`] is logged when it is dropped.
@@ -907,6 +1065,9 @@ impl QmdbNodeState {
                 forest_holder: Mutex::new(""),
                 pending_renames: Mutex::new(Vec::new()),
                 pending_rename_count: std::sync::atomic::AtomicUsize::new(0),
+                rename_aliases: Mutex::new(Vec::new()),
+                rename_alias_count: std::sync::atomic::AtomicUsize::new(0),
+                failed_renames: std::sync::atomic::AtomicU64::new(0),
                 root_splits: Mutex::new(std::collections::VecDeque::new()),
                 chain,
                 dir: dir.into(),
@@ -942,6 +1103,7 @@ impl QmdbNodeState {
                 persist_advance_us: Default::default(),
                 persist_holds: Default::default(),
                 occupancy: Default::default(),
+                unchecked_restart: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -1338,6 +1500,7 @@ impl QmdbNodeState {
                 holds: inner.persist_holds.load(Relaxed),
             },
             deferred_canonicals: inner.deferred_canonicals.load(Relaxed),
+            failed_renames: inner.failed_renames.load(Relaxed),
         }
     }
 
@@ -1441,6 +1604,99 @@ impl QmdbNodeState {
         self.inner.dir.join(SEALED_LOG_FILE)
     }
 
+    /// Why the forest is poisoned, if it is ([`NodeStateError::Poisoned`]):
+    /// for a health check or an `n42_qmdb_forest_poisoned` gauge where the
+    /// node keeps its metrics (this crate has no registry). Also reports a
+    /// poisoned forest lock.
+    pub fn poisoned(&self) -> Option<String> {
+        let guard = match self.inner.forest.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned_forest_guard(poisoned, "poisoned"),
+            // Held: the holder is working, and a poisoning is logged anyway.
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        guard.as_ref().and_then(|forest| forest.poisoned().map(str::to_owned))
+    }
+
+    /// Why this run restarted on a tree that was not checked against the
+    /// root recorded for its head, if it did: no `forest.roots` (a datadir
+    /// from before the check), no whole record of that head (a crash before
+    /// it was recorded, or a ring slot overwritten by a later head), or an
+    /// unreadable file. Set once at initialisation and kept for the run, for a
+    /// health check beside [`Self::poisoned`]. The heads persisted from then
+    /// on are recorded, so the next restart past one of them is checked.
+    pub fn unchecked_restart(&self) -> Option<&str> {
+        self.inner.unchecked_restart.get().map(String::as_str)
+    }
+
+    /// Where the persisted heads' roots are recorded ([`HeadRoots`]).
+    pub fn head_roots_path(&self) -> PathBuf {
+        self.inner.dir.join(HEAD_ROOTS_FILE)
+    }
+
+    /// Records the roots of heads just persisted. A failure is logged: the
+    /// record only lets a restart check its tree.
+    fn record_head_roots(&self, heads: &[(u64, B256, Option<B256>)]) {
+        // A head whose root is not known is not recorded: a zero there would
+        // make the next restart refuse to start rather than skip the check.
+        let heads: Vec<(u64, B256, B256)> = heads
+            .iter()
+            .filter_map(|(number, hash, root)| root.filter(|root| !root.is_zero()).map(|root| (*number, *hash, root)))
+            .collect();
+        if let Err(error) = HeadRoots::write(&self.head_roots_path(), &heads) {
+            warn!(target: "n42.qmdb", %error, "could not record the persisted QMDB heads' roots; a restart cannot check its tree");
+        }
+    }
+
+    /// Compares the root of the tree a restart rebuilt at `head` with the
+    /// one recorded when that head was persisted: a mismatch fails the
+    /// initialisation, no record skips the check with a warning.
+    fn check_restored_root(&self, head: (u64, B256), restored: B256) -> Result<(), NodeStateError> {
+        let path = self.head_roots_path();
+        // The record is a check, not state: a file that cannot be read skips
+        // the comparison, as a missing record does.
+        let recorded = match HeadRoots::read(&path, head.0, head.1) {
+            Ok(Some(recorded)) => Some(recorded),
+            Ok(None) if !path.exists() => {
+                self.note_unchecked_restart(head, "no forest.roots file (a datadir from before the root check)");
+                None
+            }
+            Ok(None) => {
+                self.note_unchecked_restart(
+                    head,
+                    "no whole record of this head in forest.roots (lost in a crash, or its slot overwritten)",
+                );
+                None
+            }
+            Err(error) => {
+                self.note_unchecked_restart(head, &format!("forest.roots could not be read: {error}"));
+                None
+            }
+        };
+        match recorded {
+            Some(recorded) if recorded == restored => {
+                debug!(target: "n42.qmdb", block = head.0, %restored, "the restored QMDB root matches the recorded one");
+                Ok(())
+            }
+            Some(recorded) => {
+                tracing::error!(target: "n42.qmdb", block = head.0, hash = %head.1, %recorded, %restored, "the restored QMDB tree has the wrong root");
+                Err(NodeStateError::RestoredRootMismatch { number: head.0, hash: head.1, recorded, restored })
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Marks this run as restarted unchecked ([`Self::unchecked_restart`])
+    /// and says why.
+    fn note_unchecked_restart(&self, head: (u64, B256), reason: &str) {
+        warn!(
+            target: "n42.qmdb",
+            block = head.0, hash = %head.1, path = %self.head_roots_path().display(), reason,
+            "the restored QMDB tree is not checked against a recorded root; the heads persisted from now on are recorded",
+        );
+        let _ = self.inner.unchecked_restart.set(reason.to_owned());
+    }
+
     fn cursor(&self) -> MutexGuard<'_, PersistCursor> {
         self.inner
             .persist
@@ -1455,10 +1711,10 @@ impl QmdbNodeState {
         let asked = std::time::Instant::now();
         let (guard, held_by) = match self.inner.forest.try_lock() {
             Ok(guard) => (guard, ""),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => (poisoned.into_inner(), ""),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => (poisoned_forest_guard(poisoned, label), ""),
             Err(std::sync::TryLockError::WouldBlock) => {
                 let held_by = *self.inner.forest_holder.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                (self.inner.forest.lock().unwrap_or_else(std::sync::PoisonError::into_inner), held_by)
+                (self.inner.forest.lock().unwrap_or_else(|poisoned| poisoned_forest_guard(poisoned, label)), held_by)
             }
         };
         let (guard, held_by) = self.wait_for_tree(guard, label, held_by);
@@ -1480,7 +1736,7 @@ impl QmdbNodeState {
             return (guard, held_by);
         }
         self.inner.tree_waits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let guard = self.inner.tree_back.wait_while(guard, leased).unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = self.inner.tree_back.wait_while(guard, leased).unwrap_or_else(|poisoned| poisoned_forest_guard(poisoned, label));
         (guard, "tree_lease")
     }
 
@@ -1512,8 +1768,13 @@ impl QmdbNodeState {
     }
 
     /// Applies the queued renames in the order they were queued. A failure is
-    /// logged: the caller that queued it has already gone on.
+    /// counted ([`OfflockCounters::failed_renames`]) and logged: the caller
+    /// that queued it has already gone on. One whose sealed hash is not filed
+    /// is kept as an alias and tried again later (`Inner::rename_aliases`).
     fn drain_renames(&self, forest: &mut QmdbForest) {
+        if self.inner.rename_alias_count.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            self.retry_rename_aliases(forest);
+        }
         let queued = {
             let mut pending = self.inner.pending_renames.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             self.inner.pending_rename_count.store(0, std::sync::atomic::Ordering::Release);
@@ -1523,13 +1784,53 @@ impl QmdbNodeState {
             let waited_ms = rename.queued_at.elapsed().as_millis() as u64;
             match apply_rename(forest, &rename) {
                 Ok(()) => debug!(target: "n42.qmdb", from = %rename.from, to = %rename.to, waited_ms, "deferred rename applied"),
-                Err(err) => warn!(
-                    target: "n42.qmdb",
-                    %err, from = %rename.from, alternate = ?rename.alternate, to = %rename.to, waited_ms,
-                    "deferred rename failed; the block is not filed under its sealed hash"
-                ),
+                Err(err) => {
+                    self.inner.failed_renames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // A sealed hash already filed (with another root) is not
+                    // aliased: the alias would name a block that is not it.
+                    let aliased = forest.root_of(&rename.to).is_none();
+                    warn!(
+                        target: "n42.qmdb",
+                        %err, from = %rename.from, alternate = ?rename.alternate, to = %rename.to, waited_ms, aliased,
+                        "deferred rename failed; the block is not filed under its sealed hash"
+                    );
+                    if aliased {
+                        self.keep_rename_alias(rename);
+                    }
+                }
             }
         }
+    }
+
+    /// Keeps a failed deferred rename as an alias, dropping the oldest past
+    /// [`RENAME_ALIASES_KEPT`].
+    fn keep_rename_alias(&self, rename: PendingRename) {
+        let mut aliases = self.inner.rename_aliases.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if aliases.len() >= RENAME_ALIASES_KEPT {
+            let dropped = aliases.remove(0);
+            debug!(target: "n42.qmdb", from = %dropped.from, to = %dropped.to, "dropped the oldest failed-rename alias");
+        }
+        aliases.push(rename);
+        self.inner.rename_alias_count.store(aliases.len(), std::sync::atomic::Ordering::Release);
+    }
+
+    /// Tries the kept aliases again: one whose sealed hash is now filed (by
+    /// this rename or by another caller) is dropped, the rest are kept.
+    fn retry_rename_aliases(&self, forest: &mut QmdbForest) {
+        let mut aliases = self.inner.rename_aliases.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        aliases.retain(|rename| {
+            if forest.root_of(&rename.to).is_some() {
+                return false;
+            }
+            match apply_rename(forest, rename) {
+                Ok(()) => {
+                    debug!(target: "n42.qmdb", from = %rename.from, to = %rename.to, "failed deferred rename applied on retry");
+                    false
+                }
+                Err(_) => true,
+            }
+        });
+        self.inner.rename_alias_count.store(aliases.len(), std::sync::atomic::Ordering::Release);
     }
 
     /// [`Self::rename`] that does not wait behind another holder of the
@@ -1546,7 +1847,7 @@ impl QmdbNodeState {
         let asked = std::time::Instant::now();
         let guard = match self.inner.forest.try_lock() {
             Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned_forest_guard(poisoned, "rename"),
             Err(std::sync::TryLockError::WouldBlock) => {
                 let mut pending = self.inner.pending_renames.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 pending.push(PendingRename { from, alternate, to, queued_at: asked });
@@ -1672,6 +1973,10 @@ impl QmdbNodeState {
             Ok(computed) => computed,
             Err(panic) => {
                 let _ = forest.return_tree(lease, Err(StateError::TreeLeased));
+                // The apply panicked part way into the block on the leased
+                // tree, which is back with `tip` still naming the parent:
+                // nothing computed on it again could be trusted.
+                forest.poison(format!("a panic during the leased root computation on parent {parent} ({label})"));
                 self.inner.tree_back.notify_all();
                 let trimmed = forest.take_deferred_release();
                 drop(guard);
@@ -2036,6 +2341,7 @@ impl QmdbNodeState {
                     "restored the QMDB forest",
                 );
                 let forest = QmdbForest::from_snapshot(&snapshot)?;
+                self.check_restored_root((snapshot.head_number, snapshot.head_hash), forest.root())?;
                 // The interrupted compaction resumes: the segment is folded
                 // into the checkpoint as it would have been.
                 if let Some(sealed_head) = sealed_head {
@@ -2058,8 +2364,8 @@ impl QmdbNodeState {
                 // A genesis forest has no checkpoint on disk yet; the first
                 // head move writes one, and until then there is nothing for a
                 // delta to be measured against.
-                let _ = std::fs::remove_file(&log_path);
-                let _ = std::fs::remove_file(self.sealed_log_path());
+                remove_file_logged(&log_path);
+                remove_file_logged(self.sealed_log_path());
                 *cursor = PersistCursor {
                     head: forest.head().1,
                     next_slot: forest.next_slot(),
@@ -2108,6 +2414,7 @@ impl QmdbNodeState {
             }
             let started = std::time::Instant::now();
             let forest = QmdbForest::from_entry_file(&ckpt, &entry_path)?;
+            self.check_restored_root((ckpt.head_number, ckpt.head_hash), forest.root())?;
             *cursor = PersistCursor {
                 head: ckpt.head_hash,
                 next_slot: ckpt.next_slot,
@@ -2140,7 +2447,9 @@ impl QmdbNodeState {
                     });
                 }
                 info!(target: "n42.qmdb", block = head_number, %head_hash, "migrating a version-1 QMDB checkpoint to the entry file");
-                QmdbForest::from_snapshot(&snapshot)?
+                let forest = QmdbForest::from_snapshot(&snapshot)?;
+                self.check_restored_root((snapshot.head_number, snapshot.head_hash), forest.root())?;
+                forest
             }
             None if head_number == 0 => {
                 let chain = &self.inner.chain;
@@ -2158,7 +2467,7 @@ impl QmdbNodeState {
         // The version-1 checkpoint and whatever log there was are folded into
         // the entry file and the new checkpoint; a delta the file already
         // covers would be refused as standing on the wrong cursor.
-        let _ = std::fs::remove_file(&v1_path);
+        remove_file_logged(&v1_path);
         Ok(forest)
     }
 
@@ -2173,8 +2482,8 @@ impl QmdbNodeState {
         let ckpt = forest.checkpoint()?;
         forest.forget_changes();
         let checkpoint_len = write_ckpt(&self.ckpt_path(), &ckpt, &mut CompactPhases::default())?;
-        let _ = std::fs::remove_file(self.delta_log_path());
-        let _ = std::fs::remove_file(self.sealed_log_path());
+        remove_file_logged(self.delta_log_path());
+        remove_file_logged(self.sealed_log_path());
         *cursor = PersistCursor {
             head: ckpt.head_hash,
             next_slot: ckpt.next_slot,
@@ -2244,8 +2553,8 @@ impl QmdbNodeState {
         // Any log left in this datadir describes a different chain of states.
         // Its first delta would be refused for standing on the wrong cursor,
         // which is safe but reads as corruption; removing it is the truth.
-        let _ = std::fs::remove_file(self.delta_log_path());
-        let _ = std::fs::remove_file(self.sealed_log_path());
+        remove_file_logged(self.delta_log_path());
+        remove_file_logged(self.sealed_log_path());
         *cursor = PersistCursor {
             head: snapshot.head_hash,
             next_slot: snapshot.tree.next_slot,
@@ -2501,9 +2810,20 @@ impl QmdbNodeState {
         self.with_forest("rename", |forest| forest.rename(from, to))
     }
 
-    /// The root of a block the forest holds, if it does.
+    /// The root of a block the forest holds, if it does. A miss tries the
+    /// failed deferred renames kept as aliases first (`drain_renames`), so a
+    /// sealed hash whose rename failed resolves once its block is filed.
     pub fn root_of(&self, block_hash: &B256) -> Option<B256> {
-        self.lock_as("root_of").as_ref()?.root_of(block_hash)
+        let mut guard = self.lock_as("root_of");
+        let forest = guard.as_mut()?;
+        if let Some(root) = forest.root_of(block_hash) {
+            return Some(root);
+        }
+        if self.inner.rename_alias_count.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return None;
+        }
+        self.retry_rename_aliases(forest);
+        forest.root_of(block_hash)
     }
 
     /// The canonical head the forest stands at.
@@ -2618,7 +2938,12 @@ impl QmdbNodeState {
         let (block_hash, number, ready, released) = self.with_forest("on_canonical", |forest| {
             let block_hash = target.unwrap_or_else(|| forest.head().1);
             let released = forest.set_canonical_releasing(block_hash)?;
-            Ok((block_hash, forest.head().0, forest.take_block_deltas(cursor.head, cursor.next_slot, block_hash), released))
+            let ready = forest.take_block_deltas(cursor.head, cursor.next_slot, block_hash).map(|deltas| {
+                let roots: Vec<(u64, B256, Option<B256>)> =
+                    deltas.iter().map(|delta| (delta.head_number, delta.head_hash, forest.root_of(&delta.head_hash))).collect();
+                (deltas, roots)
+            });
+            Ok((block_hash, forest.head().0, ready, released))
         })?;
         release_off_lock(number, released);
         // The catch-up's head may be behind one recorded since; that one
@@ -2627,7 +2952,7 @@ impl QmdbNodeState {
             self.inner.canonical_number.store(number, std::sync::atomic::Ordering::Relaxed);
             self.note_reader_lag();
         }
-        if let Some(deltas) = ready {
+        if let Some((deltas, roots)) = ready {
             self.sync_entries_if_file()?;
             for delta in &deltas {
                 let written = append_delta(&self.delta_log_path(), cursor.log_len, delta)?;
@@ -2641,6 +2966,7 @@ impl QmdbNodeState {
                 );
             }
             cursor.head = block_hash;
+            self.record_head_roots(&roots);
             // The tree's move bookkeeping describes changes since the last
             // measured delta; what these deltas carried is measured now, and
             // any move that follows records itself afresh.
@@ -2653,9 +2979,11 @@ impl QmdbNodeState {
             }
             return Ok(());
         }
-        let (delta, released) = self.with_forest("on_canonical#3", |forest| {
+        let (delta, root, released) = self.with_forest("on_canonical#3", |forest| {
             let released = forest.set_canonical_releasing(target.unwrap_or_else(|| forest.head().1))?;
-            Ok((forest.delta_since(cursor.next_slot)?, released))
+            let delta = forest.delta_since(cursor.next_slot)?;
+            let root = forest.root_of(&delta.head_hash);
+            Ok((delta, root, released))
         })?;
         release_off_lock(number, released);
         // Rewriting the checkpoint costs the whole state, so it is worth doing
@@ -2672,6 +3000,7 @@ impl QmdbNodeState {
         cursor.head = block_hash;
         cursor.next_slot = delta.next_slot;
         cursor.log_len = written;
+        self.record_head_roots(&[(delta.head_number, block_hash, root)]);
         debug!(
             target: "n42.qmdb",
             block = delta.head_number, %block_hash,
@@ -2767,9 +3096,22 @@ impl QmdbNodeState {
         })?;
         // The log starts again from nothing; the cursor's head and slot are
         // unchanged, because checkpoint + sealed segment is the state they
-        // describe.
+        // describe. Reset before anything below can fail: the rename has
+        // happened, and a cursor still at the old length would make the next
+        // delta create a fresh log that starts with that many zeros.
         cursor.log_len = 0;
         self.spawn_compaction(cursor, head);
+        // The rename made durable, as `write_durably` does: after a crash the
+        // segment is found under the name the compaction looks for. Advisory
+        // here: a failure is logged, never returned, because the rotation
+        // itself is already done.
+        if let Err(error) = sync_parent_dir(&sealed_path) {
+            tracing::error!(
+                target: "n42.qmdb",
+                %error, path = %sealed_path.display(),
+                "could not fsync the directory after rotating the QMDB delta log; a crash now may lose the rename"
+            );
+        }
         Ok(())
     }
 
@@ -2829,7 +3171,7 @@ impl QmdbNodeState {
                     });
                 }
                 let len = write_ckpt(&ckpt_path, &ckpt, &mut phases)?;
-                let _ = std::fs::remove_file(&sealed_path);
+                remove_file_logged(&sealed_path);
                 return Ok((len, read_ms));
             }
             let checkpoint = read_snapshot(&path)?.ok_or_else(|| NodeStateError::NoSnapshot {
@@ -2852,7 +3194,7 @@ impl QmdbNodeState {
             let len = write_snapshot(&path, &snapshot, &mut phases)?;
             // The segment goes only once the checkpoint that covers it is on
             // disk; a crash in between leaves a segment a restart skips.
-            let _ = std::fs::remove_file(&sealed_path);
+            remove_file_logged(&sealed_path);
             Ok((len, read_ms))
         })();
         let mut cursor = self.cursor();
@@ -2939,13 +3281,16 @@ impl QmdbNodeState {
                 forest.sync_entries()?;
                 let ckpt = forest.checkpoint()?;
                 forest.forget_changes();
-                Ok(ckpt)
+                let root = forest.root_of(&ckpt.head_hash);
+                Ok((ckpt, root))
             })?;
+            let (ckpt, root) = ckpt;
             let mut phases = CompactPhases::default();
             let block_hash = ckpt.head_hash;
             self.save_checkpoint_frontier((ckpt.head_number, block_hash))?;
             let len = write_ckpt(&self.ckpt_path(), &ckpt, &mut phases)?;
-            let _ = std::fs::remove_file(self.delta_log_path());
+            self.record_head_roots(&[(ckpt.head_number, block_hash, root)]);
+            remove_file_logged(self.delta_log_path());
             *cursor = PersistCursor {
                 head: block_hash,
                 next_slot: ckpt.next_slot,
@@ -2970,17 +3315,20 @@ impl QmdbNodeState {
             // The changes are in the snapshot now, so the next delta must be
             // measured from it rather than carrying them a second time.
             forest.forget_changes();
-            Ok(snapshot)
+            let root = forest.root_of(&snapshot.head_hash);
+            Ok((snapshot, root))
         })?;
+        let (snapshot, root) = snapshot;
         let block_hash = snapshot.head_hash;
         let path = self.snapshot_path();
         let mut phases = CompactPhases::default();
         self.save_checkpoint_frontier((snapshot.head_number, block_hash))?;
         let len = write_snapshot(&path, &snapshot, &mut phases)?;
+        self.record_head_roots(&[(snapshot.head_number, block_hash, root)]);
         // Order matters: the log is emptied only once the checkpoint that
         // supersedes it is on disk, so a crash between the two leaves a log
         // that is merely redundant rather than a state with neither.
-        let _ = std::fs::remove_file(self.delta_log_path());
+        remove_file_logged(self.delta_log_path());
         *cursor = PersistCursor {
             head: block_hash,
             next_slot: snapshot.tree.next_slot,
@@ -3236,7 +3584,22 @@ fn append_delta(path: &Path, from: u64, delta: &ForestDelta) -> Result<u64, Node
     // delta, and the restart would stand behind the database and refuse to
     // start.
     file.sync_data().map_err(io)?;
+    // A log appended from its start was just created (or rotated): its
+    // directory entry is made durable too, or an OS crash could keep the
+    // synced data blocks and lose the file that holds them.
+    if from == 0 {
+        sync_parent_dir(path).map_err(io)?;
+    }
     Ok(from + record.len() as u64)
+}
+
+/// Syncs the directory holding `path`, so a create or a rename in it is
+/// durable.
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => std::fs::File::open(dir)?.sync_all(),
+        _ => Ok(()),
+    }
 }
 
 /// Replays `path` onto `checkpoint`, stopping at `head_hash` if it is reached.
@@ -3615,6 +3978,54 @@ mod tests {
         assert_eq!(state.root_of(&resealed), Some(root));
         // A rename of a block never filed fails when applied now.
         assert!(state.rename_or_defer(B256::repeat_byte(0x98), None, B256::repeat_byte(0x97)).is_err());
+    }
+
+    /// A deferred rename whose `from` is not filed when it is drained (gone,
+    /// as a trimmed record is) is counted and kept as an alias; once a block
+    /// is filed under `from`, the sealed hash resolves through it.
+    #[test]
+    fn a_failed_deferred_rename_is_counted_and_kept_as_an_alias() {
+        let chain = qmdb_chain();
+        let state = QmdbNodeState::new(chain.clone(), scratch("rename-alias"));
+        let genesis_hash = chain.genesis_hash();
+        state.initialize((0, genesis_hash)).unwrap();
+        let built = B256::repeat_byte(0x31);
+        let sealed = B256::repeat_byte(0x32);
+        {
+            let _held = state.lock_as("test holder");
+            assert_eq!(state.rename_or_defer(built, None, sealed).unwrap(), RenameOutcome::Deferred);
+        }
+        // The next taker drains the queue: `built` is not filed, so it fails.
+        assert_eq!(state.root_of(&sealed), None);
+        assert_eq!(state.offlock_counters().failed_renames, 1);
+        assert_eq!(state.inner.rename_alias_count.load(std::sync::atomic::Ordering::Acquire), 1);
+
+        // The block shows up under `from`: the sealed hash now resolves.
+        let root = state.compute(genesis_hash, &BlockChanges::new()).unwrap().root;
+        state.validate_block(genesis_hash, built, 1, &BlockChanges::new(), root).unwrap();
+        assert_eq!(state.root_of(&sealed), Some(root));
+        assert_eq!(state.root_of(&built), None, "moved, not copied");
+        assert_eq!(state.inner.rename_alias_count.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(state.offlock_counters().failed_renames, 1);
+    }
+
+    /// A superseded file that is already gone is not an error, and one that
+    /// cannot be removed is logged rather than panicking or failing the caller.
+    #[test]
+    fn a_superseded_file_that_cannot_be_removed_is_only_logged() {
+        let dir = scratch("remove-logged");
+        std::fs::create_dir_all(&dir).unwrap();
+        remove_file_logged(dir.join("absent.log"));
+        let file = dir.join("present.log");
+        std::fs::write(&file, b"x").unwrap();
+        remove_file_logged(&file);
+        assert!(!file.exists());
+        // A directory where the file should be: `remove_file` refuses it.
+        let stuck = dir.join("stuck.log");
+        std::fs::create_dir_all(&stuck).unwrap();
+        remove_file_logged(&stuck);
+        assert!(stuck.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4383,6 +4794,32 @@ mod tests {
         assert!(view.is_valid(), "the cut took only the records of the block not advanced yet");
         view.advance(12, old_twelve, &changes, raised);
         assert!(!view.is_valid(), "a cut between the floor and the advance invalidates the view");
+    }
+
+    /// A delta log appended from its start (just created) and a rotated
+    /// segment have their directory synced; the sync itself works on a path
+    /// with no directory part too.
+    #[test]
+    fn a_fresh_delta_log_syncs_its_directory() {
+        let dir = scratch("dir-sync");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DELTA_LOG_FILE);
+        let delta = ForestDelta {
+            version: ForestDelta::VERSION,
+            head_number: 1,
+            head_hash: B256::repeat_byte(1),
+            base_next_slot: 0,
+            next_slot: 0,
+            appended: Vec::new(),
+            changed: Vec::new(),
+        };
+        let written = append_delta(&path, 0, &delta).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), written);
+        let again = append_delta(&path, written, &delta).unwrap();
+        assert!(again > written);
+        sync_parent_dir(&path).unwrap();
+        sync_parent_dir(Path::new("no-directory-part")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

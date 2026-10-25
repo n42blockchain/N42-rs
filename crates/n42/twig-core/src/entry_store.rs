@@ -22,7 +22,8 @@ use crate::Hash;
 /// Fault injection for the entry file's appends (feature `failpoints`, for
 /// tests of callers that must survive a failed write): an armed path's next
 /// batch append copies its first `keep` records and then fails as a failed
-/// seal does, leaving the store part way into the batch.
+/// seal does, leaving the store part way into the batch. A single append
+/// (`QmdbCompatTree::set`) fails outright, whatever `keep` is.
 #[cfg(feature = "failpoints")]
 pub mod failpoints {
     use std::path::{Path, PathBuf};
@@ -936,7 +937,13 @@ impl Entries {
                 entries.push(Entry { key, value, active: true });
                 Ok(())
             }
-            Self::File(file) => file.push(&key, &value),
+            Self::File(file) => {
+                #[cfg(feature = "failpoints")]
+                if failpoints::take(&file.path).is_some() {
+                    return Err(failpoints::injected());
+                }
+                file.push(&key, &value)
+            }
         }
     }
 

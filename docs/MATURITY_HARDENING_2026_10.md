@@ -214,9 +214,22 @@ ingest `6c24a6299`, qmdb `68677f00a`, h2 `971671bf8`.
   appear on a main leg too, so they are not the audit's. Peak during the stage: Tctl 59 C,
   CPU_VRM0 49 C, socket 364 W (temp-guard.sh, no trip).
 - The HotStuff-2 changes (`115e1d486` exact-view validator sets, `98aef5e28` staged changes,
-  `c74099d10` bounded body bookkeeping) need one `scripts/devnet-fleet.sh --gov5` run with
+  `c74099d10` bounded body bookkeeping) needed one `scripts/devnet-fleet.sh --gov5` run with
   `GOV5_DELAY`, `LATE_VALIDATOR` and `ABSENT_VALIDATOR` each, since a view jump across an epoch
-  boundary without the staged set is now refused.
+  boundary without the staged set is now refused. Run 2026-10-26 20:09-20:31 UTC on the merged
+  tree's release binaries (`c07716826`, same code as `0c76beddd`) with the gov5 member from
+  `../N42-gov5`; `epochLength` 20, so every run crosses several epoch boundaries:
+
+  | run | shape | reth height | gov5 errors | rejoin | head hash reth = gov5 |
+  | --- | --- | --- | --- | --- | --- |
+  | gov5late | `GOV5_DELAY=120`, 360 s | 160 | 0 | gov5 sealed 40 of the last 200 views | `0x8ad7790c…5fa14` equal |
+  | late | `LATE_VALIDATOR=2 LATE_DELAY=120`, 360 s | 121 | 0 | member 2 pulled 0 -> 8 by range, synced at height 19, 102 commits, same head as main | `0x82dd99cd…ebf2` equal |
+  | absent | `ABSENT_VALIDATOR=2 ABSENT_AT=120 ABSENT_FOR=120`, 480 s | 180 | 0 | absent at 52, back at 82: range pull 52 -> 60 then catch-up to 82 in 74 ms, first commit 23 s after return, 98 commits / 26 proposals after, same head as main | `0xfbeca38b…2741` equal |
+
+  Every execution layer reports `err=0`; the view timeouts on the two present validators are the
+  slots of the member that is away (the devnet's four-validator rotation keeps proposing them),
+  and they stop once it is back. The late and absent members' validators each rejoined across
+  epoch boundaries with the staged validator set, so the exact-view sets hold on the real path.
 
 ### 7.2 Commits by branch
 

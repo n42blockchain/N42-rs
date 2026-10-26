@@ -12,7 +12,14 @@ CUR_TREES="$(git rev-parse HEAD:crates)-$(git rev-parse HEAD:bin)"
 if [ -n "$(git status --porcelain crates bin | grep -v pycache)" ]; then echo "uncommitted changes in crates/ or bin/; nothing run"; echo ALLDONE; exit 1; fi
 n=0
 # box-gate rule 1: a request older than 3 h is ignored (the stale gov5 request of 2026-10-25 held this gate for a day)
-foreign_req() { local f; for f in /data/blockchain/.box-request-* /data/blockchain/wr-logs/.box-request-*; do [ -e "$f" ] || continue; case $f in *-rust) continue;; esac; [ -n "$(find "$f" -mmin -180 2>/dev/null)" ] && echo "$f"; done; }
+# box-gate rule 2 (FIFO): a foreign request NEWER than our own live request (.box-request-rust under 3 h, filed for this
+# chain) waits for us, so it does not hold this gate; an older one, or any one when we have no request, does.
+foreign_req() { local f v mine; mine=$(tr -dc '0-9' 2>/dev/null < /data/blockchain/wr-logs/.box-request-rust | cut -c1-10)
+  if [ -n "$mine" ] && [ $(( $(date -u +%s) - mine )) -gt 10800 ]; then mine=""; fi
+  for f in /data/blockchain/.box-request-* /data/blockchain/wr-logs/.box-request-*; do [ -e "$f" ] || continue; case $f in *-rust) continue;; esac
+    [ -n "$(find "$f" -mmin -180 2>/dev/null)" ] || continue
+    if [ -n "$mine" ]; then v=$(tr -dc '0-9' 2>/dev/null < "$f" | cut -c1-10); [ -n "$v" ] && [ "$v" -gt "$mine" ] && continue; fi
+    echo "$f"; done; }
 # a foreign request (not only a claim) also holds the build here and the runner's test gate: no cargo while one exists (gaps included)
 while [ -n "$(foreign_req)" ] || [ -n "$(find /data/blockchain/.box-claim-* -mmin -90 2>/dev/null)" ] || [ "$(pgrep -fc 'n42-[a-z0-9]+ --chai[n]')" != 0 ]; do sleep 60; n=$((n+1)); [ $n -gt 240 ] && { echo "gave up waiting after 4 h"; exit 1; }; done
 grep -rq N42_LEADER_LAYERS crates/n42/engine-types/src || { echo "N42_LEADER_LAYERS is not in the tree; nothing run"; echo ALLDONE; exit 1; }

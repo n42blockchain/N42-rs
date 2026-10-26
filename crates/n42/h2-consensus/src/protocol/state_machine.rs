@@ -2606,11 +2606,13 @@ mod tests {
 
     /// One event that emits more than the channel holds loses nothing:
     /// the same timeout on a one-slot channel and on a roomy one yields the
-    /// same outputs.
+    /// same outputs. A single validator forms the TC from its own timeout,
+    /// so one `on_timeout` broadcasts the timeout, changes the view and
+    /// proposes: several outputs from one event.
     #[test]
     fn test_one_event_emitting_past_the_channel_capacity_loses_nothing() {
         let collect = |capacity: usize| {
-            let (mut engine, _, _, mut rx) = make_engine_with_output_capacity(4, 0, capacity);
+            let (mut engine, _, _, mut rx) = make_engine_with_output_capacity(1, 0, capacity);
             engine.on_timeout().expect("local timeout");
             let mut kinds = Vec::new();
             loop {

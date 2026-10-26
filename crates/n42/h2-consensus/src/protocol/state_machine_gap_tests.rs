@@ -404,28 +404,40 @@ fn recovered_timeouts_are_capped_so_a_bad_snapshot_cannot_stall_the_node_for_eve
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_full_output_channel_is_retried_and_then_reported_not_silently_dropped() {
+fn a_full_output_channel_holds_outputs_in_order_and_never_drops_them() {
     let (engine, _, _, mut rx) = make_with_capacity(4, 0, 1);
     engine.emit(EngineOutput::ViewChanged { new_view: 2 }).expect("room for one");
     let started = Instant::now();
-    let err = engine.emit(EngineOutput::ViewChanged { new_view: 3 }).expect_err("nobody is draining");
-    assert!(matches!(err, ConsensusError::OutputChannelClosed), "{err:?}");
-    assert!(started.elapsed() >= Duration::from_micros(1_000), "the retries waited: {:?}", started.elapsed());
+    // The consumer is the engine's own task, so emit must neither sleep nor fail:
+    // the output is held behind the one in the channel.
+    engine.emit(EngineOutput::ViewChanged { new_view: 3 }).expect("held, not dropped");
+    assert!(started.elapsed() < Duration::from_millis(500), "emit must not sleep: {:?}", started.elapsed());
+    assert_eq!(engine.held_outputs(), 1);
 
-    // A commit that cannot be delivered is the worst case and fails the same way.
-    let err = engine
+    // A commit that cannot be delivered yet is the worst case and is held the same way.
+    engine
         .emit(EngineOutput::BlockCommitted {
             view: 1,
             block_hash: B256::ZERO,
             commit_qc: QuorumCertificate::genesis(),
             validator_changes: None,
         })
-        .expect_err("still full");
-    assert!(matches!(err, ConsensusError::OutputChannelClosed));
+        .expect("held behind the view change");
+    assert_eq!(engine.held_outputs(), 2);
 
-    // What was accepted is still there, in order, and draining makes room again.
+    // Draining releases what was held, in order, and then there is room again.
     assert!(matches!(rx.try_recv(), Ok(EngineOutput::ViewChanged { new_view: 2 })));
+    assert_eq!(engine.release_outputs(), 1);
+    assert!(matches!(rx.try_recv(), Ok(EngineOutput::ViewChanged { new_view: 3 })));
+    assert_eq!(engine.release_outputs(), 0);
+    assert!(matches!(rx.try_recv(), Ok(EngineOutput::BlockCommitted { view: 1, .. })));
     engine.emit(EngineOutput::ViewChanged { new_view: 4 }).expect("room again");
+    assert_eq!(engine.held_outputs(), 0);
+
+    // A closed channel is still reported: nobody is left to drain it.
+    drop(rx);
+    let err = engine.emit(EngineOutput::ViewChanged { new_view: 5 }).expect_err("closed");
+    assert!(matches!(err, ConsensusError::OutputChannelClosed), "{err:?}");
 }
 
 #[test]

@@ -187,13 +187,32 @@ ingest `6c24a6299`, qmdb `68677f00a`, h2 `971671bf8`.
   workspace already carried, see section 6.7).
 - `cargo test` of the thirteen touched crates (n42-tx-types, n42-tx-ingest, n42-tx-queue, n42,
   n42-qmdb-state, n42-twig-core, n42-bmt-core, n42-qmdb-reth, n42-h2-consensus, n42-h2-node,
-  n42-h2-execution, n42-h2-el-rpc, n42-h2-net): PENDING -- queued behind the box's bench rounds,
-  recorded here when it has run.
+  n42-h2-execution, n42-h2-el-rpc, n42-h2-net): all green on `0c76beddd` (2026-10-26 13:26 UTC,
+  `--no-fail-fast`, 55 test binaries). The merge surfaced three tests on main that asserted the
+  behaviour the fixes changed, rewritten to the new contracts: the h2-consensus output
+  back-pressure pair (`d83fd32fa` holds outputs in order past a full channel, test `dd73929c7`)
+  and the tx-ingest claiming-frame test (`7b1bac92b` derives the 0x50 sender, test `0c76beddd`,
+  which also covers the wrong-claim drop and its counter).
 - Hot-path changes that still need a fleet7 control pair before the branch lands on main (the
   reconciliation's open cost questions): `61689b62b` seeded shard choice in the QMDB key index,
-  `dfd8ebcbc` + `0ca8cd375` the duplicate-hash check on described bodies. Pair: X22
-  configuration, main binaries against the merged tree's, same leg count, compared on the round
-  total and window 1 only (CLAUDE.md: never one round).
+  `dfd8ebcbc` + `0ca8cd375` the duplicate-hash check on described bodies. Pair run 2026-10-26
+  15:03-15:28 UTC (loop351 stage fl: X22 configuration, 600M replay set, two alternating pairs,
+  main `47b8180ab` native binaries against the merged tree's at `0c76beddd`, after a warm leg):
+
+  | leg | tree | win1 M tx/s | win2 | win3 | round total | notes |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | AUa | audit | 4.967 | 5.073 | 4.960 | 145.9M | tc=7, one engine idle >5 s |
+  | AU1 | main | 5.087 | 5.233 | 5.167 | 151.1M | clean |
+  | AUb | audit | 5.073 | 5.087 | 4.973 | 147.5M | tc=7, one engine idle >5 s |
+  | AU1b | main | 5.080 | 5.133 | 5.173 | 149.8M | tc=7, one engine idle >5 s |
+
+  Audit against main: window 1 mean 5.020 vs 5.083 (-1.2%), round total 146.7M vs 150.5M
+  (-2.5%). Both inside the single-round spread (CLAUDE.md: a difference under about 10% between
+  single rounds is invisible), so no regression is measurable from the audit fixes and the
+  dependency refresh; both arms read ~2% under round 10.230's main (5.189 / 5.208), which is the
+  box's state after the day's QS rounds, not the tree. The seven timeout certificates per leg
+  appear on a main leg too, so they are not the audit's. Peak during the stage: Tctl 59 C,
+  CPU_VRM0 49 C, socket 364 W (temp-guard.sh, no trip).
 - The HotStuff-2 changes (`115e1d486` exact-view validator sets, `98aef5e28` staged changes,
   `c74099d10` bounded body bookkeeping) need one `scripts/devnet-fleet.sh --gov5` run with
   `GOV5_DELAY`, `LATE_VALIDATOR` and `ABSENT_VALIDATOR` each, since a view jump across an epoch

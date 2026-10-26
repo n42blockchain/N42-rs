@@ -158,6 +158,18 @@ CI runs `cargo clippy --workspace --lib --bins --examples` without `-D warnings`
 baseline per crate, then `-D warnings` on `crates/n42/*`, is the cheap next step once the
 hardening branches are in.
 
+Baseline on the merged tree (`c07716826`, 2026-10-26 23:29 UTC, the CI command): exit 0,
+0 errors, 1,497 warnings. The bulk is the pre-existing APoS/beacon code: `crates/n42/primitives`
+341, `ef-tests` 143, `consensus-client` 125, `bin/n42` 96, `fusaka` 50, `mobile-sdk` 39; by
+lint, `doc_markdown` 216, `missing_docs` 286 (fields, methods, structs, functions, variants),
+`missing_const_for_fn` 108, `collapsible_if` 91, `or_fun_call` 41. The crates this audit touched
+carry 126 of them (`engine-types` 44, `h2-node` 25, `qmdb-reth` 18, `tx-queue` 16,
+`h2-consensus` 9, `tx-ingest` 8, `h2-el-rpc` 4, `tx-types` 1, `qmdb-state` 1): mostly
+`collapsible_if` 28, `doc_markdown` 10, `type_complexity` 9, `missing_const_for_fn` 9, plus three
+uses of revm's deprecated `ExecutionResult::gas_used` (now `tx_gas_used`) that the v2.8.1 bump
+surfaced. No warning is an error class (no `unused_must_use`, no `rust_2018_idioms`). The log is
+`ci/clippy-c07716826.log` under the audit notes; the per-crate `-D warnings` step stays deferred.
+
 ### 6.8 QMDB health gauges
 
 Done in `22ac2990b`: `bin/n42` exports `n42_qmdb_forest_poisoned` and

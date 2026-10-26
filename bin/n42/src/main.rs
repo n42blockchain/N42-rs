@@ -487,6 +487,39 @@ fn main() {
                 });
             }
 
+            // QMDB health: `n42_qmdb_forest_poisoned` is 1 once the forest has
+            // refused further applies (the node stalls rather than diverge), and
+            // `n42_qmdb_unchecked_restart` is 1 when this run started on a tree
+            // that was not checked against the root recorded for its head. Both
+            // are sticky for the run; each is logged once, at error level, when
+            // it first turns 1. A chain without QMDB exports neither.
+            if let Some(qmdb) = qmdb_for_startup.clone() {
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+                    let mut poisoned_seen = false;
+                    let mut unchecked_seen = false;
+                    loop {
+                        tick.tick().await;
+                        // `poisoned()` answers None while the forest lock is held,
+                        // so a reason once seen is latched rather than re-read.
+                        if !poisoned_seen {
+                            if let Some(reason) = qmdb.poisoned() {
+                                poisoned_seen = true;
+                                error!(target: "reth::cli", %reason, "QMDB forest is poisoned; state applies are refused");
+                            }
+                        }
+                        if !unchecked_seen {
+                            if let Some(reason) = qmdb.unchecked_restart() {
+                                unchecked_seen = true;
+                                error!(target: "reth::cli", %reason, "QMDB restarted on a tree not checked against its recorded head root");
+                            }
+                        }
+                        metrics::gauge!("n42_qmdb_forest_poisoned").set(if poisoned_seen { 1.0 } else { 0.0 });
+                        metrics::gauge!("n42_qmdb_unchecked_restart").set(if unchecked_seen { 1.0 } else { 0.0 });
+                    }
+                });
+            }
+
             // A chained build that waits for an ancestor to reach the engine is
             // woken by the canonical chain's changes instead of polling, and the
             // own-block layers the engine's tip has passed are released

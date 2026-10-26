@@ -11,7 +11,8 @@ BUILT_TREES=$(cat $MARK 2>/dev/null || echo "$(git rev-parse $BUILT:crates)-$(gi
 CUR_TREES="$(git rev-parse HEAD:crates)-$(git rev-parse HEAD:bin)"
 if [ -n "$(git status --porcelain crates bin | grep -v pycache)" ]; then echo "uncommitted changes in crates/ or bin/; nothing run"; echo ALLDONE; exit 1; fi
 n=0
-foreign_req() { ls -d /data/blockchain/.box-request-* /data/blockchain/wr-logs/.box-request-* 2>/dev/null | grep -v -- "-rust$"; }
+# box-gate rule 1: a request older than 3 h is ignored (the stale gov5 request of 2026-10-25 held this gate for a day)
+foreign_req() { local f; for f in /data/blockchain/.box-request-* /data/blockchain/wr-logs/.box-request-*; do [ -e "$f" ] || continue; case $f in *-rust) continue;; esac; [ -n "$(find "$f" -mmin -180 2>/dev/null)" ] && echo "$f"; done; }
 # a foreign request (not only a claim) also holds the build here and the runner's test gate: no cargo while one exists (gaps included)
 while [ -n "$(foreign_req)" ] || [ -n "$(find /data/blockchain/.box-claim-* -mmin -90 2>/dev/null)" ] || [ "$(pgrep -fc 'n42-[a-z0-9]+ --chai[n]')" != 0 ]; do sleep 60; n=$((n+1)); [ $n -gt 240 ] && { echo "gave up waiting after 4 h"; exit 1; }; done
 grep -rq N42_LEADER_LAYERS crates/n42/engine-types/src || { echo "N42_LEADER_LAYERS is not in the tree; nothing run"; echo ALLDONE; exit 1; }

@@ -34,7 +34,15 @@ BUILD_FROM=$(date -u +%s)
 # the 40G scope needs the user systemd manager; when its bus is gone (it was, after claim a on 2026-10-08) run the test plain: the tests fit the box
 tst() { echo "== $*" >> $T; if systemd-run --user --scope -q true >/dev/null 2>&1; then nice -n 19 systemd-run --user --scope -q -p MemoryMax=40G -p MemorySwapMax=0 "$@" >> $T 2>&1; else nice -n 19 "$@" >> $T 2>&1; fi; }
 # no cargo while a foreign request or claim exists (box protocol): wait for none before the test gate
-if [ "${LOOP351_DRY:-0}" != 1 ]; then w=0; while ls -d /data/blockchain/.box-request-* /data/blockchain/wr-logs/.box-request-* /data/blockchain/.box-claim-* /data/blockchain/wr-logs/.box-claim-* 2>/dev/null | grep -qv -- "-rust$"; do [ $w = 0 ] && echo "test gate waits: a foreign request or claim exists ($(date +%H:%M))"; w=1; sleep 60; done; fi
+# The test gate (box-gate rules 1-3): a foreign claim younger than 90 min, or a foreign request under 3 h that is OLDER than
+# our own live request (.box-request-rust under 3 h; without one every fresh foreign request counts), holds this gate. A newer
+# request waits for us (FIFO, rule 2) and must not hold it: it held stage fl while our older request aged out (2026-10-26).
+gate_blockers() { local f v now mine; now=$(date -u +%s); mine=$(tr -dc '0-9' 2>/dev/null < /data/blockchain/wr-logs/.box-request-rust | cut -c1-10)
+  { [ -n "$mine" ] && [ $(( now - mine )) -le 10800 ]; } || mine=9999999999
+  for f in /data/blockchain/.box-claim-* /data/blockchain/wr-logs/.box-claim-*; do [ -e "$f" ] || continue; case $f in *-rust) continue;; esac; [ -n "$(find "$f" -mmin -90 2>/dev/null)" ] && echo "$f"; done
+  for f in /data/blockchain/.box-request-* /data/blockchain/wr-logs/.box-request-*; do [ -e "$f" ] || continue; case $f in *-rust) continue;; esac
+    v=$(tr -dc '0-9' 2>/dev/null < "$f" | cut -c1-10); [ -n "$v" ] || v=$(stat -c %Y "$f"); [ $(( now - v )) -gt 10800 ] && continue; [ "$v" -lt "$mine" ] && echo "$f"; done; }
+if [ "${LOOP351_DRY:-0}" != 1 ]; then w=0; while [ -n "$(gate_blockers)" ]; do [ $w = 0 ] && echo "test gate waits: a foreign claim, or a request older than ours, exists ($(date +%H:%M)): $(gate_blockers | tr '\n' ' ')"; w=1; sleep 60; done; fi
 echo "tests from $(date +%H:%M) (no claim)"
 SKIPGATE=""; if [ -n "${LOOP351_GATE_TREES:-}" ] && [ "$LOOP351_GATE_TREES" = "$(git rev-parse HEAD:crates)-$(git rev-parse HEAD:bin)" ]; then SKIPGATE=1; echo "test and build gate skipped: git diff --stat f2794a821 HEAD -- crates bin is empty (crates/ and bin/ unchanged since claim a build; LOOP351_GATE_TREES)"; fi
 if [ -z "$SKIPGATE" ]; then

@@ -158,6 +158,12 @@ CI runs `cargo clippy --workspace --lib --bins --examples` without `-D warnings`
 baseline per crate, then `-D warnings` on `crates/n42/*`, is the cheap next step once the
 hardening branches are in.
 
+### 6.8 QMDB health gauges
+
+Done in `22ac2990b`: `bin/n42` exports `n42_qmdb_forest_poisoned` and
+`n42_qmdb_unchecked_restart` (1/0, sampled every 10 s, latched for the run, each logged once
+at error level with its reason) on a QMDB chain.
+
 ## 7. Merge record
 
 Three fix branches, each reviewed against `docs/MATURITY_AUDIT_RECONCILIATION_2026_10.md`, were

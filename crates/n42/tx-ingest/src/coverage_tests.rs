@@ -231,9 +231,13 @@ fn a_claiming_frame_is_queued_under_the_claims_without_verification() {
     let _g = counter_lock();
     n42_tx_types::set_alt_sig_enabled(true);
     // The unrecoverable transaction would be dropped if anything verified it.
+    // A 0x50 claim has to be the sender its own key derives (7b1bac92b): it
+    // is taken without a signature check, but it can never name another
+    // account.
+    let alt_sender = alt_tx(61, 70_100).sender();
     let txs = vec![eth_tx(8, 0), unrecoverable_eth_tx(5), alt(61, 70_100)];
     let hashes: Vec<B256> = txs.iter().map(|tx| *tx.hash()).collect();
-    let claims = vec![Address::repeat_byte(0x11), Address::repeat_byte(0x22), Address::repeat_byte(0x33)];
+    let claims = vec![Address::repeat_byte(0x11), Address::repeat_byte(0x22), alt_sender];
     let (claimed_before, verified_before) = (load(&STATS.claimed), load(&STATS.verified_at_ingest));
     let (shard_claimed, shard_verified) = (load(&STATS.shard_claimed), load(&STATS.shard_verified));
 
@@ -242,12 +246,32 @@ fn a_claiming_frame_is_queued_under_the_claims_without_verification() {
     assert_eq!(out.len(), 3);
     assert_eq!(sender_of(&out, &hashes[0]), Address::repeat_byte(0x11));
     assert_eq!(sender_of(&out, &hashes[1]), Address::repeat_byte(0x22));
-    assert_eq!(sender_of(&out, &hashes[2]), Address::repeat_byte(0x33));
+    assert_eq!(sender_of(&out, &hashes[2]), alt_sender);
     assert_eq!(load(&STATS.claimed) - claimed_before, 3);
     assert_eq!(load(&STATS.verified_at_ingest) - verified_before, 0);
     // Not shard mode: the shard counters stay put.
     assert_eq!(load(&STATS.shard_claimed), shard_claimed);
     assert_eq!(load(&STATS.shard_verified), shard_verified);
+}
+
+/// A claiming frame whose 0x50 claim names anyone but the key's own sender
+/// loses that transaction, counted, while the Eth transactions beside it are
+/// still queued under their claims.
+#[test]
+fn a_0x50_claim_that_is_not_the_derived_sender_is_dropped_in_a_claiming_frame() {
+    let _g = counter_lock();
+    n42_tx_types::set_alt_sig_enabled(true);
+    let txs = vec![eth_tx(8, 1), alt(62, 1)];
+    let hashes: Vec<B256> = txs.iter().map(|tx| *tx.hash()).collect();
+    let claims = vec![Address::repeat_byte(0x11), Address::repeat_byte(0x33)];
+    let (claimed_before, dropped_before) = (load(&STATS.claimed), load(&STATS.dropped_altsig_claim));
+
+    let out = recover(txs, claims, None, false);
+
+    assert_eq!(out.len(), 1);
+    assert_eq!(sender_of(&out, &hashes[0]), Address::repeat_byte(0x11));
+    assert_eq!(load(&STATS.claimed) - claimed_before, 1);
+    assert_eq!(load(&STATS.dropped_altsig_claim) - dropped_before, 1);
 }
 
 #[test]

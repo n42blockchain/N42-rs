@@ -115,8 +115,16 @@ reads migrated to `flag` (16 presence-only, 4 "anything but 0", 25 default-on `!
 one-line numeric reads to `parse`; `N42_PROFILE=x22` (env only, no CLI flag) applied as the first
 statement of `bin/n42` and `h2_validator`, 41 knobs = the `adopted` rows of `docs/KNOBS.md`,
 held equal to them by a test. Not done: the per-mode root-equality integration tests, and the
-`== "1"` switches (still exact-match). The profile does not carry the X22 base set that KNOBS.md
-classes `experimental`/`default` (the loop351 `ALLA` line), so a launcher still passes those.
+`== "1"` switches (still exact-match). Completed 2026-10-27 (branch `design/knob-profile-x22`): the
+X22 base set (the loop351 `ALLA` line and its per-leg additions, 46 rows that were `experimental`) and
+13 tuned values whose compiled default differs (`N42_ED25519_BATCH` 256, `N42_ALTSIG_SENDER_CACHE`
+2^22, `N42_OUTPUT_SHARDS` 16, the build throttle 48/80, ...) are `adopted` and in the profile, which
+is now 99 knobs and reproduces the node-side environment of an X22 leg. What a leg passes beyond it
+is classed `bench-only` (bench gateway key and attestation minimum, `N42_IMPORT_ONCE`, the storage
+mode `N42_HASHED_TABLES=off` / `N42_QMDB_READS=on`, `N42_ACCOUNT_HISTORY=off`,
+`N42_SETTLEMENT_TAGS=legacy`, `N42_PERSIST_QMDB_IN_SCOPE`, `N42_STORAGE_OP_METRICS=0`, and
+`N42_LOCK_SITES`, moved out of the profile) or is a launcher variable (`MALLOC_CONF`,
+`TOKIO_WORKER_THREADS`, `RAYON_NUM_THREADS`).
 
 ### 6.2 QMDB entry-file compaction
 

@@ -46,6 +46,22 @@ fn main() {
         // configuration once, at its own initialisation, before `main`).
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
+    // The command line, chain spec included (clap runs the chain parser
+    // here), before any knob of the profile is read: the knobs a profile set
+    // that need a genesis feature this chain lacks (`frameBlocks`) are
+    // withdrawn again, so the profile never forces a chain feature. A
+    // command without a chain withdraws them too. An operator's own
+    // `N42_FRAME_BLOCKS=1` is left for `frame_blocks::init` to refuse.
+    let cli = Cli::<N42ChainSpecParser>::parse();
+    let features = n42_env::profile::ChainFeatures {
+        frame_blocks: cli
+            .command
+            .chain_spec()
+            .is_some_and(|spec| reth_chainspec::qmdb::frame_blocks_enabled(&spec.genesis)),
+    };
+    // SAFETY: still single-threaded: parsing the command line spawns no
+    // thread, and nothing else reads or writes the environment.
+    unsafe { n42_env::profile::reconcile_and_report("n42", features) };
     // `N42_INGEST_VERIFY=shard` without a well-formed `N42_INGEST_SHARD=<i>/<n>`
     // would silently verify everything (or nothing); refuse to start instead.
     let ingest_mode = match n42_tx_types::ingest_verify_mode() {
@@ -115,7 +131,7 @@ fn main() {
     let consensus_holder_clone = consensus_holder.clone();
 
     if let Err(err) =
-        Cli::<N42ChainSpecParser>::parse().run(async move |builder, _extra_args| {
+        cli.run(async move |builder, _extra_args| {
             info!(target: "reth::cli", "Launching node");
             for knob in &trusting_knobs {
                 warn!(target: "reth::cli", knob = *knob, "trusting ingest mode accepted: this node admits transactions on a frame's word (benchmark only)");

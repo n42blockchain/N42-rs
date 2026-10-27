@@ -13,6 +13,49 @@
 //! Only `N42_*` knobs are in a profile. `MALLOC_CONF` is read by the
 //! allocator before `main` and `TOKIO_WORKER_THREADS` / `RAYON_NUM_THREADS`
 //! size pools the launcher owns, so the fleet scripts keep setting those.
+//!
+//! Some knobs only make sense on a chain whose genesis enables a feature
+//! (`N42_FRAME_BLOCKS=1` on a chain without `frameBlocks` is refused at
+//! start-up). A profile is applied before the chain spec is parsed, so such
+//! a knob carries a [`Requires`], and the binary calls [`reconcile`] once the
+//! chain is known, before any of those knobs is read: every knob the profile
+//! set whose requirement the chain lacks is removed from the environment
+//! again. A knob the operator set is never touched, so the start-up check
+//! still stops an operator who asks for frame blocks on such a chain.
+
+use std::sync::Mutex;
+
+/// A genesis feature a profile knob needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Requires {
+    /// The genesis `config` sets `frameBlocks: true`.
+    FrameBlocks,
+}
+
+impl Requires {
+    /// The genesis key, as an operator would look for it.
+    pub const fn genesis_key(self) -> &'static str {
+        match self {
+            Self::FrameBlocks => "frameBlocks",
+        }
+    }
+}
+
+/// What a chain's genesis enables, for [`reconcile`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChainFeatures {
+    /// `frameBlocks: true` in the genesis `config`.
+    pub frame_blocks: bool,
+}
+
+impl ChainFeatures {
+    /// Whether the chain has `requirement`.
+    pub const fn has(&self, requirement: Requires) -> bool {
+        match requirement {
+            Requires::FrameBlocks => self.frame_blocks,
+        }
+    }
+}
 
 /// One knob of a profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,10 +64,19 @@ pub struct Knob {
     pub name: &'static str,
     /// The value the profile gives it.
     pub value: &'static str,
+    /// The genesis feature without which the profile must not set it.
+    pub requires: Option<Requires>,
 }
 
 const fn k(name: &'static str, value: &'static str) -> Knob {
-    Knob { name, value }
+    Knob { name, value, requires: None }
+}
+
+/// A knob that only means something with frame blocks (`frameBlocks` in the
+/// genesis): its read site is only reached, or its value only acts, on a
+/// frame build, a frame description or the frame road.
+const fn kf(name: &'static str, value: &'static str) -> Knob {
+    Knob { name, value, requires: Some(Requires::FrameBlocks) }
 }
 
 /// X22, the configuration adopted on 2026-10-24 (`docs/BREAKTHROUGH_DESIGN.md`
@@ -37,7 +89,8 @@ const fn k(name: &'static str, value: &'static str) -> Knob {
 /// default differs included. Not here: the `bench-only` knobs the leg also
 /// passes (bench gateway key, shared import, storage mode, history index,
 /// settlement tags, persistence ordering, instrumentation) and the
-/// launcher's non-`N42_*` variables.
+/// launcher's non-`N42_*` variables. Knobs listed with `kf` need frame
+/// blocks in the genesis ([`Requires::FrameBlocks`], [`reconcile`]).
 pub const X22: &[Knob] = &[
     // X3: the hand-off copies.
     k("N42_QMDB_RENAME_DEFER", "1"),
@@ -57,7 +110,7 @@ pub const X22: &[Knob] = &[
     k("N42_QMDB_PARALLEL_APPLY", "1"),
     k("N42_SF_BULK_APPEND", "1"),
     // X10.
-    k("N42_PLAN_AHEAD_WAIT_MS", "30"),
+    kf("N42_PLAN_AHEAD_WAIT_MS", "30"),
     // X11: the core layout (C16).
     k("N42_CORE_LAYOUT", "isolate"),
     k("N42_CORE_LAYOUT_BUILD_CORES", "64"),
@@ -92,8 +145,8 @@ pub const X22: &[Knob] = &[
     k("N42_RECEIPTS_ON_BUILD_POOL", "1"),
     k("N42_RECEIPTS_FUSED", "1"),
     k("N42_PARALLEL_BUILD_THREADS", "32"),
-    k("N42_FRAME_ROAD", "1"),
-    k("N42_ROAD_RESEED_AT_FLUSH", "1"),
+    kf("N42_FRAME_ROAD", "1"),
+    kf("N42_ROAD_RESEED_AT_FLUSH", "1"),
     // X21 (round 10.220).
     k("N42_SF_DROP_CACHE", "1"),
     // X22 (round 10.227).
@@ -101,17 +154,17 @@ pub const X22: &[Knob] = &[
     // X22 base (the loop351 `ALLA` line and its per-leg additions; every
     // leg since X11 carries them). Frame blocks and the pull by frames
     // (step 1 phase B; plan-ahead body: SHARED_EXECUTION_SCOPE.md 16.4 item 2).
-    k("N42_FRAME_BLOCKS", "1"),
-    k("N42_PLAN_AHEAD", "1"),
-    k("N42_PULL_BY_FRAMES", "1"),
-    k("N42_PLAN_AHEAD_BODY", "1"),
-    k("N42_PLAN_AHEAD_BODY_THREADS", "16"),
+    kf("N42_FRAME_BLOCKS", "1"),
+    kf("N42_PLAN_AHEAD", "1"),
+    kf("N42_PULL_BY_FRAMES", "1"),
+    kf("N42_PLAN_AHEAD_BODY", "1"),
+    kf("N42_PLAN_AHEAD_BODY_THREADS", "16"),
     // X22 base: the body sent once, compact and checked by description.
     k("N42_BODY_ONCE", "1"),
     k("N42_COMPACT_BODY", "1"),
     k("N42_BLOCK_BY_DESCRIPTION", "1"),
     k("N42_TAKE_COMPACT", "1"),
-    k("N42_ANSWER_LAYOUT_ONLY", "1"),
+    kf("N42_ANSWER_LAYOUT_ONLY", "1"),
     k("N42_COMMIT_FCU_ASYNC", "1"),
     // X22 base: the leader's build chain (plan v6 attempts J, G2, G3; defect
     // 18b for the tenure's first build).
@@ -149,15 +202,15 @@ pub const X22: &[Knob] = &[
     k("N42_FOLLOWER_FREE_ASYNC", "1"),
     k("N42_FOLLOWER_BUILD_PATH", "1"),
     k("N42_FOLLOWER_ROOT_ON_BUILD_POOL", "1"),
-    k("N42_FOLLOWER_FRAME_SCAN", "1"),
+    kf("N42_FOLLOWER_FRAME_SCAN", "1"),
     k("N42_FOLLOWER_COPY_ASIDE", "1"),
     k("N42_FOLLOWER_EXEC_EARLY", "1"),
     k("N42_FOLLOWER_FIELDS_EARLY", "1"),
     // X22 base: the raw payload channel on its own runtime.
     k("N42_ROAD_RUNTIME", "1"),
     // 6.4 road bounds (MATURITY_HARDENING_2026_10.md; stage fm pair 2026-10-27).
-    k("N42_ROAD_TAKEN_BOUND", "1"),
-    k("N42_ROAD_RETIRE_INDEX", "1"),
+    kf("N42_ROAD_TAKEN_BOUND", "1"),
+    kf("N42_ROAD_RETIRE_INDEX", "1"),
     // X22 base: QMDB (entry file: QMDB_ENTRY_LOG.md step 1) and static files.
     k("N42_QMDB_ENTRY_FILE", "1"),
     k("N42_QMDB_RETAIN_DEPTH", "16"),
@@ -246,14 +299,106 @@ pub fn plan(
 pub unsafe fn apply() -> Result<Option<Applied>, UnknownProfile> {
     let name = std::env::var_os(PROFILE_VAR).map(|raw| raw.to_string_lossy().into_owned());
     let applied = plan(name.as_deref(), |knob| std::env::var_os(knob).is_some())?;
+    let mut record = recorded();
+    *record = None;
     if let Some(applied) = &applied {
         for knob in &applied.set {
             // SAFETY: the caller's contract (no other thread touches the
             // environment while this runs).
             unsafe { std::env::set_var(knob.name, knob.value) };
         }
+        *record = Some(Record { profile: applied.profile.clone(), set: applied.set.clone() });
     }
     Ok(applied)
+}
+
+/// What [`apply`] set in this process: the profile's name and the knobs it
+/// wrote (not the ones the operator's environment kept).
+#[derive(Debug)]
+struct Record {
+    profile: String,
+    set: Vec<Knob>,
+}
+
+static RECORD: Mutex<Option<Record>> = Mutex::new(None);
+
+fn recorded() -> std::sync::MutexGuard<'static, Option<Record>> {
+    RECORD.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether the knob `name` is in the environment because the profile set it
+/// (and [`reconcile`] has not withdrawn it): `false` for a knob the operator
+/// set, one no profile has, or any knob when no profile was applied.
+pub fn set_by_profile(name: &str) -> bool {
+    recorded().as_ref().is_some_and(|record| record.set.iter().any(|knob| knob.name == name))
+}
+
+/// The knobs of `set` whose requirement `features` lacks: what
+/// [`reconcile`] withdraws.
+pub fn unmet(set: &[Knob], features: ChainFeatures) -> Vec<Knob> {
+    set.iter().filter(|knob| knob.requires.is_some_and(|req| !features.has(req))).copied().collect()
+}
+
+/// What [`reconcile`] withdrew.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Withdrawn {
+    /// The profile's name as given.
+    pub profile: String,
+    /// The knobs removed from the environment again.
+    pub knobs: Vec<Knob>,
+}
+
+/// Withdraws every knob the applied profile set whose genesis requirement the
+/// chain lacks: removes it from the environment and from what
+/// [`set_by_profile`] reports. Knobs the operator set are never touched.
+/// `None` when no profile was applied or nothing had to be withdrawn.
+///
+/// Must run once the chain spec is known and before any withdrawn knob is
+/// first read (they are cached in `OnceLock`s at first use).
+///
+/// # Safety
+///
+/// Calls [`std::env::remove_var`]: as for [`apply`], no other thread may
+/// read or write the environment while this runs.
+pub unsafe fn reconcile(features: ChainFeatures) -> Option<Withdrawn> {
+    let mut record = recorded();
+    let record = record.as_mut()?;
+    let knobs = unmet(&record.set, features);
+    if knobs.is_empty() {
+        return None;
+    }
+    for knob in &knobs {
+        // SAFETY: the caller's contract (no other thread touches the
+        // environment while this runs).
+        unsafe { std::env::remove_var(knob.name) };
+    }
+    record.set.retain(|knob| !knobs.contains(knob));
+    Some(Withdrawn { profile: record.profile.clone(), knobs })
+}
+
+/// [`reconcile`] for a binary's start-up: prints one stderr line per
+/// missing feature naming the knobs that were not applied.
+///
+/// # Safety
+///
+/// As for [`reconcile`].
+pub unsafe fn reconcile_and_report(binary: &str, features: ChainFeatures) -> Option<Withdrawn> {
+    // SAFETY: forwarded from this function's own contract.
+    let withdrawn = unsafe { reconcile(features) }?;
+    for requirement in [Requires::FrameBlocks] {
+        let names: Vec<&str> =
+            withdrawn.knobs.iter().filter(|knob| knob.requires == Some(requirement)).map(|knob| knob.name).collect();
+        if !names.is_empty() {
+            eprintln!(
+                "{binary}: {PROFILE_VAR}={}: {} knob(s) need {} in the genesis and were not applied: {}",
+                withdrawn.profile,
+                names.len(),
+                requirement.genesis_key(),
+                names.join(", ")
+            );
+        }
+    }
+    Some(withdrawn)
 }
 
 /// [`apply`] for a binary's `main`: an unknown profile prints the error and
@@ -375,6 +520,112 @@ mod tests {
             unset(knob.name);
         }
         unset(PROFILE_VAR);
+    }
+
+    /// Unsets the profile and every X22 knob, and clears the record.
+    fn clean() {
+        unset(PROFILE_VAR);
+        for knob in X22 {
+            unset(knob.name);
+        }
+        // SAFETY: the caller holds the environment lock.
+        assert_eq!(unsafe { apply() }, Ok(None));
+    }
+
+    const FRAME_GATED: [&str; 12] = [
+        "N42_PLAN_AHEAD_WAIT_MS",
+        "N42_FRAME_ROAD",
+        "N42_ROAD_RESEED_AT_FLUSH",
+        "N42_FRAME_BLOCKS",
+        "N42_PLAN_AHEAD",
+        "N42_PULL_BY_FRAMES",
+        "N42_PLAN_AHEAD_BODY",
+        "N42_PLAN_AHEAD_BODY_THREADS",
+        "N42_ANSWER_LAYOUT_ONLY",
+        "N42_FOLLOWER_FRAME_SCAN",
+        "N42_ROAD_TAKEN_BOUND",
+        "N42_ROAD_RETIRE_INDEX",
+    ];
+
+    #[test]
+    fn the_frame_gated_knobs_are_the_listed_ones() {
+        let gated: Vec<&str> =
+            X22.iter().filter(|knob| knob.requires == Some(Requires::FrameBlocks)).map(|knob| knob.name).collect();
+        assert_eq!(gated, FRAME_GATED);
+        let names: Vec<&str> = unmet(X22, ChainFeatures::default()).iter().map(|knob| knob.name).collect();
+        assert_eq!(names, FRAME_GATED);
+        assert!(unmet(X22, ChainFeatures { frame_blocks: true }).is_empty());
+    }
+
+    #[test]
+    fn gated_knobs_stay_on_a_frame_chain() {
+        let _guard = lock();
+        clean();
+        set(PROFILE_VAR, "x22");
+        // SAFETY: the test holds the environment lock.
+        unsafe { apply() }.unwrap().unwrap();
+        assert!(set_by_profile("N42_FRAME_BLOCKS"));
+        // SAFETY: as above.
+        assert_eq!(unsafe { reconcile(ChainFeatures { frame_blocks: true }) }, None);
+        assert_eq!(std::env::var("N42_FRAME_BLOCKS").as_deref(), Ok("1"));
+        assert_eq!(std::env::var("N42_PLAN_AHEAD_BODY_THREADS").as_deref(), Ok("16"));
+        assert!(set_by_profile("N42_FRAME_BLOCKS"));
+        clean();
+    }
+
+    #[test]
+    fn gated_knobs_are_withdrawn_without_frame_blocks() {
+        let _guard = lock();
+        clean();
+        set(PROFILE_VAR, "x22");
+        // SAFETY: the test holds the environment lock.
+        unsafe { apply() }.unwrap().unwrap();
+        // SAFETY: as above.
+        let withdrawn = unsafe { reconcile(ChainFeatures::default()) }.unwrap();
+        assert_eq!(withdrawn.profile, "x22");
+        let names: Vec<&str> = withdrawn.knobs.iter().map(|knob| knob.name).collect();
+        assert_eq!(names, FRAME_GATED);
+        for name in FRAME_GATED {
+            assert!(std::env::var_os(name).is_none(), "{name} withdrawn");
+            assert!(!set_by_profile(name), "{name} no longer reported as set");
+        }
+        assert_eq!(std::env::var("N42_MERGE_ELIDE").as_deref(), Ok("1"), "an ungated knob stays");
+        assert!(set_by_profile("N42_MERGE_ELIDE"));
+        // SAFETY: as above. A second call has nothing left to withdraw.
+        assert_eq!(unsafe { reconcile(ChainFeatures::default()) }, None);
+        clean();
+    }
+
+    #[test]
+    fn an_operator_value_survives_reconcile() {
+        let _guard = lock();
+        clean();
+        set(PROFILE_VAR, "x22");
+        set("N42_FRAME_BLOCKS", "1");
+        set("N42_FRAME_ROAD", "0");
+        // SAFETY: the test holds the environment lock.
+        let applied = unsafe { apply() }.unwrap().unwrap();
+        assert!(applied.kept.contains(&"N42_FRAME_BLOCKS"));
+        assert!(!set_by_profile("N42_FRAME_BLOCKS"), "the operator set it");
+        // SAFETY: as above.
+        let withdrawn = unsafe { reconcile(ChainFeatures::default()) }.unwrap();
+        assert!(withdrawn.knobs.iter().all(|knob| knob.name != "N42_FRAME_BLOCKS" && knob.name != "N42_FRAME_ROAD"));
+        assert_eq!(withdrawn.knobs.len(), FRAME_GATED.len() - 2);
+        assert_eq!(std::env::var("N42_FRAME_BLOCKS").as_deref(), Ok("1"), "left for the start-up check to refuse");
+        assert_eq!(std::env::var("N42_FRAME_ROAD").as_deref(), Ok("0"));
+        assert!(std::env::var_os("N42_PULL_BY_FRAMES").is_none());
+        clean();
+    }
+
+    #[test]
+    fn reconcile_without_a_profile_touches_nothing() {
+        let _guard = lock();
+        clean();
+        set("N42_FRAME_BLOCKS", "1");
+        // SAFETY: the test holds the environment lock.
+        assert_eq!(unsafe { reconcile(ChainFeatures::default()) }, None);
+        assert_eq!(std::env::var("N42_FRAME_BLOCKS").as_deref(), Ok("1"));
+        clean();
     }
 
     #[test]

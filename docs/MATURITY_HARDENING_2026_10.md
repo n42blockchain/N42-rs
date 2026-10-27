@@ -124,7 +124,11 @@ is classed `bench-only` (bench gateway key and attestation minimum, `N42_IMPORT_
 mode `N42_HASHED_TABLES=off` / `N42_QMDB_READS=on`, `N42_ACCOUNT_HISTORY=off`,
 `N42_SETTLEMENT_TAGS=legacy`, `N42_PERSIST_QMDB_IN_SCOPE`, `N42_STORAGE_OP_METRICS=0`, and
 `N42_LOCK_SITES`, moved out of the profile) or is a launcher variable (`MALLOC_CONF`,
-`TOKIO_WORKER_THREADS`, `RAYON_NUM_THREADS`).
+`TOKIO_WORKER_THREADS`, `RAYON_NUM_THREADS`). The 12 profile knobs that only act with frame blocks
+are chain-gated (branch `design/profile-chain-gate`): `n42_env::profile::reconcile` withdraws them
+right after the chain spec is parsed when the genesis lacks `frameBlocks`, so `N42_PROFILE=x22` runs on
+`n42_fleet7.json`, the devnet and the gov5 chains (on 2026-10-27 it stopped all seven execution layers
+of the production-shaped fleet), while an operator's own `N42_FRAME_BLOCKS=1` there is still refused.
 
 ### 6.2 QMDB entry-file compaction
 

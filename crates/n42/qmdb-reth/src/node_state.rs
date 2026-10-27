@@ -33,8 +33,11 @@
 //! `forest.ckpt` when the entries move into the file), so the delta log starts
 //! at genesis and the restart stops its replay there: the genesis root, checked
 //! against the header and the recorded root, with the blocks past it arriving
-//! again through the engine. A heap checkpoint rewritten past the database's
-//! head is restored from the archived pair under `recovery-archive/`.
+//! again through the engine. A checkpoint a fold rewrote past the database's
+//! head (in either storage mode) is restored from the archived pair under
+//! `recovery-archive/fold-<number>-<hash>-*`: the checkpoint the fold replaced
+//! and the segment it folded. An archive retires at a later fold once the
+//! database's durable head has passed its fold head.
 //!
 //! What is written per block is a *delta*, not the tree. Serialising the whole
 //! forest every time the head moved cost the size of the world state per block:
@@ -2176,6 +2179,15 @@ impl QmdbNodeState {
     // Heap checkpoints may follow canonical execution ahead of the EL's
     // database transaction. Keep the overwritten base and folded log together.
     fn archive_heap_pair(&self, label: &str, log: &Path) -> Result<(), NodeStateError> {
+        self.archive_pair(label, &self.snapshot_path(), log)
+    }
+
+    /// Hard-links `base` (the checkpoint about to be replaced: `forest.bin`
+    /// or `forest.ckpt`, under its own name) and `log` into a new directory
+    /// `recovery-archive/<label>-<pid>-<sequence>`, made durable before it
+    /// takes its name. Both storage modes archive through here, so a datadir
+    /// has one archive scheme.
+    fn archive_pair(&self, label: &str, base: &Path, log: &Path) -> Result<(), NodeStateError> {
         let root = self.inner.dir.join("recovery-archive");
         let io = |path: &Path, source| NodeStateError::Io { path: path.to_path_buf(), source };
         std::fs::create_dir_all(&root).map_err(|e| io(&root, e))?;
@@ -2188,7 +2200,8 @@ impl QmdbNodeState {
             if !target.exists() && !temporary.exists() { break (target, temporary); }
         };
         std::fs::create_dir(&temporary).map_err(|e| io(&temporary, e))?;
-        std::fs::hard_link(self.snapshot_path(), temporary.join("forest.bin")).map_err(|e| io(&temporary, e))?;
+        let base_name = base.file_name().ok_or_else(|| io(base, std::io::Error::other("checkpoint path has no file name")))?;
+        std::fs::hard_link(base, temporary.join(base_name)).map_err(|e| io(&temporary, e))?;
         if log.exists() {
             let archived_log = temporary.join("forest.log");
             if label.starts_with("rollback-") {
@@ -2235,6 +2248,94 @@ impl QmdbNodeState {
             }
         }
         Ok(None)
+    }
+
+    /// The file-mode twin of [`Self::archived_heap_snapshot`]: the newest
+    /// archived `forest.ckpt` at or below `target`, with its archived
+    /// segment replayed up to `target`. Heap archives (no `forest.ckpt`)
+    /// are skipped. The entries stay in the live entry file, which only
+    /// ever grows past the archived cursor.
+    fn archived_file_checkpoint(&self, target: (u64, B256)) -> Result<Option<ForestCheckpoint>, NodeStateError> {
+        let root = self.inner.dir.join("recovery-archive");
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(NodeStateError::Io { path: root, source }),
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| NodeStateError::Io { path: root.clone(), source })?;
+            if entry.file_name().to_string_lossy().starts_with('.') { continue; }
+            paths.push(entry.path());
+        }
+        paths.sort();
+        for path in paths.into_iter().rev() {
+            let Some(ckpt) = read_ckpt(&path.join("forest.ckpt"))? else { continue };
+            if ckpt.head_number > target.0 { continue; }
+            let (ckpt, _) = replay_delta_log(&path.join("forest.log"), ckpt, Some(target.1))?;
+            if (ckpt.head_number, ckpt.head_hash) == target {
+                return Ok(Some(ckpt));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A file-mode restart whose `forest.ckpt` a fold has moved past the
+    /// database's head: the state at `head` comes from the fold's archive
+    /// (the checkpoint it replaced plus the segment it folded), the entry
+    /// file is cut back to that cursor, and the live checkpoint is rewritten
+    /// at `head`. Without an archive that reaches `head` the restart is
+    /// refused as before.
+    fn restore_file_mode_from_archive(
+        &self,
+        head: (u64, B256),
+        live: &ForestCheckpoint,
+        cursor: &mut PersistCursor,
+    ) -> Result<QmdbForest, NodeStateError> {
+        let (head_number, head_hash) = head;
+        let Some(restored) = self.archived_file_checkpoint(head)? else {
+            return Err(NodeStateError::SnapshotMismatch {
+                snapshot_number: live.head_number,
+                snapshot_hash: live.head_hash,
+                head_number,
+                head_hash,
+            });
+        };
+        let started = std::time::Instant::now();
+        // Rebuilt and checked before any live file changes: a wrong root
+        // leaves the checkpoint and logs as they were. The rebuild cuts the
+        // entry file to the restored cursor, as every file-mode restart does.
+        let forest = QmdbForest::from_entry_file(&restored, &self.entry_file_path())?;
+        self.check_restored_root(head, forest.root())?;
+        // The live log and any sealed segment continue from the fold head,
+        // past the database's head; they stand on entries just cut away.
+        // They go before the checkpoint is replaced: a crash in between
+        // finds the live checkpoint still past the head and comes back here.
+        for future in [self.delta_log_path(), self.sealed_log_path()] {
+            match std::fs::remove_file(&future) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(NodeStateError::Io { path: future, source }),
+            }
+        }
+        std::fs::File::open(&self.inner.dir)
+            .and_then(|f| f.sync_all())
+            .map_err(|source| NodeStateError::Io { path: self.inner.dir.clone(), source })?;
+        let checkpoint_len = write_ckpt(&self.ckpt_path(), &restored, &mut CompactPhases::default())?;
+        *cursor = PersistCursor {
+            head: restored.head_hash,
+            next_slot: restored.next_slot,
+            log_len: 0,
+            checkpoint_len,
+            compacting: false,
+        };
+        info!(
+            target: "n42.qmdb",
+            block = head_number, %head_hash, checkpoint_block = live.head_number, slots = restored.next_slot,
+            rebuild_ms = started.elapsed().as_millis() as u64,
+            "restored the QMDB forest from a fold archive: the checkpoint was ahead of the database",
+        );
+        Ok(forest)
     }
 
     fn frontier_path(&self) -> PathBuf {
@@ -2471,6 +2572,11 @@ impl QmdbNodeState {
         let entry_path = self.entry_file_path();
         let log_path = self.delta_log_path();
         if let Some(ckpt) = read_ckpt(&ckpt_path)? {
+            if ckpt.head_number > head_number {
+                // A fold sealed the log at the forest's head, which runs
+                // ahead of the database's by the persistence lag.
+                return self.restore_file_mode_from_archive(head, &ckpt, cursor);
+            }
             let checkpoint_len = std::fs::metadata(&ckpt_path).map(|m| m.len()).unwrap_or(0);
             let sealed_path = self.sealed_log_path();
             let sealed = sealed_path.exists();
@@ -3324,6 +3430,11 @@ impl QmdbNodeState {
                         head_hash: sealed_head.1,
                     });
                 }
+                // The fold head is the forest's, ahead of the database's by
+                // the persistence lag. The replaced checkpoint and the folded
+                // segment are kept as a pair, so a crash before the database
+                // reaches the fold head restarts from them.
+                self.archive_pair(&format!("fold-{:020}-{:x}", sealed_head.0, sealed_head.1), &ckpt_path, &sealed_path)?;
                 let len = write_ckpt(&ckpt_path, &ckpt, &mut phases)?;
                 remove_file_logged(&sealed_path);
                 return Ok((len, read_ms));

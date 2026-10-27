@@ -443,6 +443,131 @@ fn a_compaction_folds_the_sealed_segment_into_a_new_checkpoint_in_both_storage_m
     }
 }
 
+/// A node that followed blocks 1..=12 with a fold at block 10 in between:
+/// the log is sealed at 10, blocks 11 and 12 go to the fresh log, and the
+/// compaction then writes the checkpoint at 10, as a background fold does
+/// while the forest runs on. Returns the dropped node's directory and the
+/// roots of blocks 0..=12.
+fn folded_at_ten(name: &str, entry_file: bool) -> (Arc<ChainSpec>, PathBuf, Vec<B256>) {
+    let (state, chain, dir, mut head, _) = node_at(name, entry_file, 10);
+    seal_the_log(&state);
+    for number in 11..=12 {
+        (head, _) = advance(&state, number, head);
+    }
+    state.compact((10, hash_of(10)));
+    assert!(!state.sealed_log_path().exists(), "entry_file={entry_file}: the fold completed");
+    let checkpoint_number = if entry_file {
+        read_ckpt(&state.ckpt_path()).expect("read").expect("a checkpoint").head_number
+    } else {
+        read_snapshot(&state.snapshot_path()).expect("read").expect("a checkpoint").head_number
+    };
+    assert_eq!(checkpoint_number, 10, "entry_file={entry_file}: the checkpoint is past blocks the database may lack");
+    let mut roots = vec![chain.genesis_header.state_root];
+    roots.extend((1..=12).map(|number| state.root_of(&hash_of(number)).expect("root")));
+    drop(state);
+    (chain, dir, roots)
+}
+
+/// The names of the fold archives under `dir`, sorted.
+fn fold_archives(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = match std::fs::read_dir(dir.join("recovery-archive")) {
+        Ok(entries) => entries.map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned()).collect(),
+        Err(_) => Vec::new(),
+    };
+    names.retain(|name| name.starts_with("fold-"));
+    names.sort();
+    names
+}
+
+/// A SIGKILL after a fold but before the database reached the fold head:
+/// the restart at the database's head comes from the fold's archive, and
+/// the node then follows the blocks again and restarts at the new head.
+#[test]
+fn a_restart_below_a_fold_head_restores_from_the_fold_archive_in_both_storage_modes() {
+    for entry_file in [false, true] {
+        let (chain, dir, roots) = folded_at_ten(&format!("fold-archive-below-{entry_file}"), entry_file);
+        let archives = fold_archives(&dir);
+        assert_eq!(archives.len(), 1, "entry_file={entry_file}: {archives:?}");
+        assert!(archives[0].starts_with(&format!("fold-{:020}-{:x}-", 10, hash_of(10))), "{archives:?}");
+        if entry_file {
+            let archive = dir.join("recovery-archive").join(&archives[0]);
+            assert!(archive.join("forest.ckpt").exists() && archive.join("forest.log").exists(), "the replaced checkpoint and the folded segment");
+        }
+
+        let restarted = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        restarted.initialize((7, hash_of(7))).expect("a database head below the fold head");
+        assert_eq!(restarted.head(), Some((7, hash_of(7))));
+        assert_eq!(restarted.state_root(), roots[7], "entry_file={entry_file}");
+        let mut head = hash_of(7);
+        for number in 8..=12 {
+            let (hash, root) = advance(&restarted, number, head);
+            assert_eq!(root, roots[number as usize], "entry_file={entry_file}: block {number} again");
+            head = hash;
+        }
+        drop(restarted);
+
+        let at_twelve = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        at_twelve.initialize((12, hash_of(12))).expect("the head reached again");
+        assert_eq!(at_twelve.state_root(), roots[12], "entry_file={entry_file}");
+        drop(at_twelve);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// At or past the fold head no archive is needed: the live checkpoint and
+/// log serve the restart.
+#[test]
+fn a_restart_at_or_past_a_fold_head_needs_no_archive_in_both_storage_modes() {
+    for entry_file in [false, true] {
+        let (chain, dir, roots) = folded_at_ten(&format!("fold-archive-at-{entry_file}"), entry_file);
+        let _ = std::fs::remove_dir_all(dir.join("recovery-archive"));
+        let at_twelve = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        at_twelve.initialize((12, hash_of(12))).expect("past the fold head");
+        assert_eq!(at_twelve.state_root(), roots[12], "entry_file={entry_file}");
+        drop(at_twelve);
+        let at_ten = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        at_ten.initialize((10, hash_of(10))).expect("at the fold head");
+        assert_eq!(at_ten.state_root(), roots[10], "entry_file={entry_file}");
+        drop(at_ten);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A fold archive retires at a later fold once the database's durable head
+/// has passed its fold head (and the fold head's child, which may still
+/// need the parent), never before; without it a restart below the fold
+/// head is refused as it was before archives existed.
+#[test]
+fn a_fold_archive_retires_once_the_durable_head_passes_its_fold_head() {
+    for entry_file in [false, true] {
+        let (state, chain, dir, mut head, _) = node_at(&format!("fold-archive-retire-{entry_file}"), entry_file, 10);
+        seal_the_log(&state);
+        for number in 11..=14 {
+            (head, _) = advance(&state, number, head);
+        }
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(11));
+        let boundary = durable.clone();
+        state.set_durable_head_reader(move || Some(boundary.load(std::sync::atomic::Ordering::Relaxed)));
+        state.compact((10, hash_of(10)));
+        assert_eq!(fold_archives(&dir).len(), 1, "entry_file={entry_file}: durable at 11 keeps the fold at 10");
+
+        seal_the_log(&state);
+        durable.store(12, std::sync::atomic::Ordering::Relaxed);
+        state.compact((14, head));
+        let archives = fold_archives(&dir);
+        assert_eq!(archives.len(), 1, "entry_file={entry_file}: {archives:?}");
+        assert!(archives[0].starts_with(&format!("fold-{:020}-", 14)), "the fold at 10 retired, the one at 14 kept: {archives:?}");
+        drop(state);
+
+        // The retired archive was the only way back to block 7.
+        let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        let err = restarted.initialize((7, hash_of(7))).expect_err("nothing reaches block 7 any more");
+        assert!(matches!(err, NodeStateError::SnapshotMismatch { snapshot_number: 14, head_number: 7, .. }), "entry_file={entry_file}: {err}");
+        drop(restarted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[test]
 fn a_due_checkpoint_rotates_the_log_and_the_compaction_runs_behind() {
     let (state, chain, dir, head, root) = node_at("rotate-steps", false, 4);

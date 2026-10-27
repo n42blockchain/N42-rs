@@ -182,6 +182,29 @@ Done in `22ac2990b`: `bin/n42` exports `n42_qmdb_forest_poisoned` and
 `n42_qmdb_unchecked_restart` (1/0, sampled every 10 s, latched for the run, each logged once
 at error level with its reason) on a QMDB chain.
 
+### 6.9 Embed the committed QC in Rust-built headers
+
+Found while landing 6.6. gov5's leader writes `N42H || view || QC || seal` with its last
+committed QC (`adapter.go` `buildHeaderExtra(view, committedQC)`), and its `VerifyHeader`
+decodes and checks that QC when it can resolve the validator set. This node's leader writes
+`HeaderExtra::for_view`: view, no QC, seal reserved (gov5's `buildHeaderExtra(view, nil)`
+shape). The 6.6 check therefore certifies ranges of gov5-built blocks but can only check the
+parent link on ranges of Rust-built blocks, which is every block of the all-Rust fleet; for
+those the protection is that a pulled block never becomes `safe`.
+
+Design: the Rust leader embeds its last committed QC the way gov5 does, through the h2-wire QC
+codec (gov5's byte-exact encoding, already fixture-tested), when it has one; the first blocks
+after genesis stay QC-less as gov5's do. Nothing in consensus changes: the extra is content the
+leader already signs, followers keep authenticating blocks through the proposal and commit
+certificates on the wire, and gov5 already accepts both shapes. What changes is that every
+header then carries evidence a cold node can verify, so 6.6's check and a future header-only
+light verification cover Rust-built chains too. Cost: ~300 bytes per header on the wire and in
+storage (one aggregate BLS signature plus the voter bitmap and view), nothing on the cycle.
+Verification: the h2-consensus header tests against gov5's fixtures (a Rust header with a QC
+must decode in gov5's `decodeHeaderExtra`), the three devnet shapes with a gov5 member (gov5
+must accept the Rust headers it now verifies), and a fleet7 pair to confirm the cycle is
+unchanged. Not started.
+
 ## 7. Merge record
 
 Three fix branches, each reviewed against `docs/MATURITY_AUDIT_RECONCILIATION_2026_10.md`, were

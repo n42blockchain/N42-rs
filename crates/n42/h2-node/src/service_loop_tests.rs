@@ -438,6 +438,70 @@ async fn a_single_validator_leads_commits_and_announces_each_block() {
     assert_ne!(svc.driver.head(), ID.genesis_hash);
 }
 
+/// Section 6.9 of `docs/MATURITY_HARDENING_2026_10.md`: a leader under
+/// gov5's profile embeds its last committed QC in every header it seals, as
+/// gov5's `buildHeaderExtra(view, committedQC)`; the first block, sealed
+/// before any commit, carries none. Each embedded QC decodes and passes the
+/// range-pull check a cold node runs on it.
+#[tokio::test]
+async fn a_leaders_headers_carry_its_last_committed_qc_once_it_has_one() {
+    let (keys, set) = keys(1);
+    let rig = node_in(&keys, &set, 0, None).await;
+    let mut svc =
+        rig.svc.with_gov5_h2_profile(keys[0].clone()).with_payload_attributes(|context| Some(attributes_for(&context)));
+    assert!(svc.header_qc.lock().unwrap().current.is_empty(), "nothing committed yet");
+    let events = step_until(&mut svc, |_, events| {
+        events.iter().filter(|e| matches!(e, ServiceEvent::Committed { .. })).count() >= 3
+    })
+    .await;
+    let commits: Vec<(u64, B256)> = events
+        .iter()
+        .filter_map(|e| match e {
+            ServiceEvent::Committed { view, block_hash, .. } => Some((*view, *block_hash)),
+            _ => None,
+        })
+        .collect();
+
+    let first = svc.block_headers.get(&commits[0].1).expect("the leader remembers its own header");
+    let extra = n42_h2_consensus::validate_gov5_h2_header(first).expect("a gov5 header");
+    assert!(extra.qc.is_empty(), "before the first commit a header carries no QC, gov5's shape");
+    assert_eq!(first.extra_data.len(), 12 + n42_h2_consensus::EXTRA_SEAL_LEN);
+
+    for pair in commits.windows(2) {
+        let (before, (_, hash)) = (pair[0], pair[1]);
+        let header = svc.block_headers.get(&hash).expect("own header").clone();
+        let extra = n42_h2_consensus::validate_gov5_h2_header(&header).expect("a gov5 header");
+        n42_h2_consensus::verify_seal(&header, &keys[0].public_key()).expect("the seal covers the QC");
+        let wire = n42_h2_wire::h2_wire::decode_h2_qc(&extra.qc).expect("the embedded QC decodes");
+        assert_eq!((wire.view, wire.block_hash), before, "the commit before this block");
+        assert!(wire.view < extra.view);
+        svc.check_pulled_block(&header).expect("a cold node's range-pull check accepts it");
+    }
+    let held = svc.header_qc.lock().unwrap();
+    assert_eq!(held.view, svc.engine().last_committed_qc().view);
+}
+
+/// A block sealed twice -- by the chain sealer, then by the normalizer --
+/// embeds the same QC even when a commit lands between the two seals.
+#[test]
+fn a_blocks_second_seal_embeds_the_qc_its_first_seal_did() {
+    let shared = std::sync::Mutex::new(HeaderQc { view: 3, current: vec![3], pinned: Default::default() });
+    assert_eq!(HeaderQc::for_block(&shared, 10, 11), vec![3]);
+    {
+        let mut held = shared.lock().unwrap();
+        held.view = 4;
+        held.current = vec![4];
+    }
+    assert_eq!(HeaderQc::for_block(&shared, 10, 11), vec![3], "pinned to the block's first seal");
+    assert_eq!(HeaderQc::for_block(&shared, 10, 12), vec![4], "another view seals afresh");
+    assert_eq!(HeaderQc::for_block(&shared, 11, 12), vec![4]);
+    for number in 0..HeaderQc::PINNED as u64 {
+        let _ = HeaderQc::for_block(&shared, 100 + number, 1);
+    }
+    assert_eq!(HeaderQc::for_block(&shared, 10, 11), vec![4], "old blocks are forgotten");
+    assert!(shared.lock().unwrap().pinned.len() <= HeaderQc::PINNED);
+}
+
 #[tokio::test]
 async fn a_followers_view_clock_runs_out_and_it_votes_to_leave_the_view() {
     let (keys, set) = keys(4);

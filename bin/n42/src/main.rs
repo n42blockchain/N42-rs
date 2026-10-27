@@ -278,7 +278,10 @@ fn main() {
                         if n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(node.provider.chain_spec().genesis()).is_ok() {
                             qmdb.set_refuse_stale_builds(true);
                         }
-                        // `N42_QMDB_READS=verify|on`: the read view answers or checks the
+                        // The QMDB state is registered as the state reader on every QMDB
+                        // node: its persistence hook makes the delta log durable through a
+                        // batch before the database commits it (`N42_QMDB_SETTLE_WAIT_MS`).
+                        // `N42_QMDB_READS=verify|on`: the read view also answers or checks the
                         // providers' latest-state reads (docs/QMDB_UPGRADE_PLAN.md, stage 6).
                         if n42_qmdb_reth::register_state_reader(qmdb) {
                             info!(target: "reth::cli", "QMDB read view registered as the state reader");
@@ -330,6 +333,19 @@ fn main() {
                                     }
                                     let tip = notification.tip().hash();
                                     if let Err(error) = follower.on_canonical(tip) {
+                                        // A notification the log cannot follow leaves it unable to
+                                        // track the chain: stop rather than run on a log that a
+                                        // restart would refuse (`N42_QMDB_CANONICAL_FATAL=0` keeps
+                                        // the old log-and-continue). I/O on the log is retried by
+                                        // the next head and stays a log line.
+                                        if n42_qmdb_reth::canonical_fatal() && follower.is_fatal_canonical_error(&error, tip) {
+                                            error!(
+                                                target: "reth::cli",
+                                                %error, block_hash = %tip,
+                                                "QMDB head cannot follow the canonical chain; exiting (N42_QMDB_CANONICAL_FATAL=0 continues)"
+                                            );
+                                            std::process::exit(1);
+                                        }
                                         error!(target: "reth::cli", %error, "QMDB head could not follow the canonical chain");
                                     }
                                 }

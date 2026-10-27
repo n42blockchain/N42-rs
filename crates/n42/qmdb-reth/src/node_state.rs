@@ -25,6 +25,20 @@
 //! starting. The exception is a database at genesis, which is seeded from the
 //! alloc exactly as gov5 does.
 //!
+//! A database at genesis is also the normal state after a crash before the
+//! first persistence: the forest settles canonical blocks before the database
+//! commits them, so a node killed early restarts with the database at block 0
+//! and the forest's files tens of blocks ahead. Seeding therefore writes the
+//! genesis checkpoint at once (in heap mode `forest.bin`; in entry-file mode
+//! `forest.ckpt` when the entries move into the file), so the delta log starts
+//! at genesis and the restart stops its replay there: the genesis root, checked
+//! against the header and the recorded root, with the blocks past it arriving
+//! again through the engine. A checkpoint a fold rewrote past the database's
+//! head (in either storage mode) is restored from the archived pair under
+//! `recovery-archive/fold-<number>-<hash>-*`: the checkpoint the fold replaced
+//! and the segment it folded. An archive retires at a later fold once the
+//! database's durable head has passed its fold head.
+//!
 //! What is written per block is a *delta*, not the tree. Serialising the whole
 //! forest every time the head moved cost the size of the world state per block:
 //! tolerable on a devnet whose state is twenty accounts, and impossible on a
@@ -175,7 +189,7 @@ fn retain_depth() -> Option<u64> {
 /// stage 3).
 fn trim_twigs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_QMDB_TRIM_TWIGS").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_QMDB_TRIM_TWIGS", true))
 }
 
 /// `N42_QMDB_COMPUTE_OFFLOCK=1` (default off): a block's QMDB root
@@ -213,6 +227,26 @@ fn compute_offlock_env() -> bool {
 fn canonical_defer_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_QMDB_CANONICAL_DEFER").is_ok_and(|v| v == "1"))
+}
+
+/// `N42_QMDB_SETTLE_WAIT_MS` (default 30000): how long the persistence hook
+/// ([`QmdbNodeState::settle_through`], called by the state reader before the
+/// database commits a batch) waits for the delta log to reach the batch's last
+/// block before it refuses the batch. Read once.
+pub fn settle_wait() -> std::time::Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(*MS.get_or_init(|| {
+        n42_env::parse("N42_QMDB_SETTLE_WAIT_MS", 30_000u64)
+    }))
+}
+
+/// `N42_QMDB_CANONICAL_FATAL` (default on; `0` turns it off): a canonical
+/// notification the QMDB log cannot follow
+/// ([`QmdbNodeState::is_fatal_canonical_error`]) ends the process instead of
+/// being logged. Off restores the old log-and-continue, for benches. Read once.
+pub fn canonical_fatal() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| n42_env::flag("N42_QMDB_CANONICAL_FATAL", true))
 }
 
 /// `N42_QMDB_PERSIST_BATCH=1` (default off): [`QmdbNodeState::on_persisted`]
@@ -510,6 +544,28 @@ pub enum NodeStateError {
     /// The execution frontier required by a deferred checkpoint is unavailable or corrupt.
     #[error("QMDB deferred recovery: {0}")]
     RecoveryFrontier(String),
+    /// The persistence hook ([`QmdbNodeState::settle_through`]) could not
+    /// make the delta log durable through a block the database was about to
+    /// commit: the canonical notification for it had not reached the forest,
+    /// or the log append kept failing, until the deadline. The batch is
+    /// refused, so the database never stands past the log (which a restart
+    /// would refuse as [`Self::SnapshotMismatch`]).
+    #[error(
+        "the QMDB delta log is not settled through block {number} ({hash}) after {waited_ms} ms \
+         (forest head {forest_head:?}): {reason}"
+    )]
+    PersistUnsettled {
+        /// The batch's last block.
+        number: u64,
+        /// Its hash.
+        hash: B256,
+        /// How long the hook waited.
+        waited_ms: u64,
+        /// Where the forest's canonical head stood at the deadline.
+        forest_head: Option<u64>,
+        /// The last settle error, or why the block was not covered.
+        reason: String,
+    },
     /// The tree a restart rebuilt from the checkpoint, the log and the entry
     /// file does not have the root recorded when that head was persisted: a
     /// corrupt or mismatched entry file, checkpoint or log. Refused rather
@@ -1618,6 +1674,19 @@ impl QmdbNodeState {
         guard.as_ref().and_then(|forest| forest.poisoned().map(str::to_owned))
     }
 
+    /// The entry store's size ([`n42_twig_core::entry_store::EntryStoreStats`],
+    /// `docs/QMDB_COMPACTION_DESIGN.md` 3.7), for the node's gauges. Never
+    /// waits: `None` while the forest lock is held or before the forest is
+    /// initialised, so a sampler skips that tick.
+    pub fn entry_stats(&self) -> Option<n42_twig_core::entry_store::EntryStoreStats> {
+        let guard = match self.inner.forest.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned_forest_guard(poisoned, "entry_stats"),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        guard.as_ref().map(QmdbForest::entry_stats)
+    }
+
     /// Why this run restarted on a tree that was not checked against the
     /// root recorded for its head, if it did: no `forest.roots` (a datadir
     /// from before the check), no whole record of that head (a crash before
@@ -2110,6 +2179,15 @@ impl QmdbNodeState {
     // Heap checkpoints may follow canonical execution ahead of the EL's
     // database transaction. Keep the overwritten base and folded log together.
     fn archive_heap_pair(&self, label: &str, log: &Path) -> Result<(), NodeStateError> {
+        self.archive_pair(label, &self.snapshot_path(), log)
+    }
+
+    /// Hard-links `base` (the checkpoint about to be replaced: `forest.bin`
+    /// or `forest.ckpt`, under its own name) and `log` into a new directory
+    /// `recovery-archive/<label>-<pid>-<sequence>`, made durable before it
+    /// takes its name. Both storage modes archive through here, so a datadir
+    /// has one archive scheme.
+    fn archive_pair(&self, label: &str, base: &Path, log: &Path) -> Result<(), NodeStateError> {
         let root = self.inner.dir.join("recovery-archive");
         let io = |path: &Path, source| NodeStateError::Io { path: path.to_path_buf(), source };
         std::fs::create_dir_all(&root).map_err(|e| io(&root, e))?;
@@ -2122,7 +2200,8 @@ impl QmdbNodeState {
             if !target.exists() && !temporary.exists() { break (target, temporary); }
         };
         std::fs::create_dir(&temporary).map_err(|e| io(&temporary, e))?;
-        std::fs::hard_link(self.snapshot_path(), temporary.join("forest.bin")).map_err(|e| io(&temporary, e))?;
+        let base_name = base.file_name().ok_or_else(|| io(base, std::io::Error::other("checkpoint path has no file name")))?;
+        std::fs::hard_link(base, temporary.join(base_name)).map_err(|e| io(&temporary, e))?;
         if log.exists() {
             let archived_log = temporary.join("forest.log");
             if label.starts_with("rollback-") {
@@ -2169,6 +2248,94 @@ impl QmdbNodeState {
             }
         }
         Ok(None)
+    }
+
+    /// The file-mode twin of [`Self::archived_heap_snapshot`]: the newest
+    /// archived `forest.ckpt` at or below `target`, with its archived
+    /// segment replayed up to `target`. Heap archives (no `forest.ckpt`)
+    /// are skipped. The entries stay in the live entry file, which only
+    /// ever grows past the archived cursor.
+    fn archived_file_checkpoint(&self, target: (u64, B256)) -> Result<Option<ForestCheckpoint>, NodeStateError> {
+        let root = self.inner.dir.join("recovery-archive");
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(NodeStateError::Io { path: root, source }),
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| NodeStateError::Io { path: root.clone(), source })?;
+            if entry.file_name().to_string_lossy().starts_with('.') { continue; }
+            paths.push(entry.path());
+        }
+        paths.sort();
+        for path in paths.into_iter().rev() {
+            let Some(ckpt) = read_ckpt(&path.join("forest.ckpt"))? else { continue };
+            if ckpt.head_number > target.0 { continue; }
+            let (ckpt, _) = replay_delta_log(&path.join("forest.log"), ckpt, Some(target.1))?;
+            if (ckpt.head_number, ckpt.head_hash) == target {
+                return Ok(Some(ckpt));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A file-mode restart whose `forest.ckpt` a fold has moved past the
+    /// database's head: the state at `head` comes from the fold's archive
+    /// (the checkpoint it replaced plus the segment it folded), the entry
+    /// file is cut back to that cursor, and the live checkpoint is rewritten
+    /// at `head`. Without an archive that reaches `head` the restart is
+    /// refused as before.
+    fn restore_file_mode_from_archive(
+        &self,
+        head: (u64, B256),
+        live: &ForestCheckpoint,
+        cursor: &mut PersistCursor,
+    ) -> Result<QmdbForest, NodeStateError> {
+        let (head_number, head_hash) = head;
+        let Some(restored) = self.archived_file_checkpoint(head)? else {
+            return Err(NodeStateError::SnapshotMismatch {
+                snapshot_number: live.head_number,
+                snapshot_hash: live.head_hash,
+                head_number,
+                head_hash,
+            });
+        };
+        let started = std::time::Instant::now();
+        // Rebuilt and checked before any live file changes: a wrong root
+        // leaves the checkpoint and logs as they were. The rebuild cuts the
+        // entry file to the restored cursor, as every file-mode restart does.
+        let forest = QmdbForest::from_entry_file(&restored, &self.entry_file_path())?;
+        self.check_restored_root(head, forest.root())?;
+        // The live log and any sealed segment continue from the fold head,
+        // past the database's head; they stand on entries just cut away.
+        // They go before the checkpoint is replaced: a crash in between
+        // finds the live checkpoint still past the head and comes back here.
+        for future in [self.delta_log_path(), self.sealed_log_path()] {
+            match std::fs::remove_file(&future) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(NodeStateError::Io { path: future, source }),
+            }
+        }
+        std::fs::File::open(&self.inner.dir)
+            .and_then(|f| f.sync_all())
+            .map_err(|source| NodeStateError::Io { path: self.inner.dir.clone(), source })?;
+        let checkpoint_len = write_ckpt(&self.ckpt_path(), &restored, &mut CompactPhases::default())?;
+        *cursor = PersistCursor {
+            head: restored.head_hash,
+            next_slot: restored.next_slot,
+            log_len: 0,
+            checkpoint_len,
+            compacting: false,
+        };
+        info!(
+            target: "n42.qmdb",
+            block = head_number, %head_hash, checkpoint_block = live.head_number, slots = restored.next_slot,
+            rebuild_ms = started.elapsed().as_millis() as u64,
+            "restored the QMDB forest from a fold archive: the checkpoint was ahead of the database",
+        );
+        Ok(forest)
     }
 
     fn frontier_path(&self) -> PathBuf {
@@ -2361,16 +2528,28 @@ impl QmdbNodeState {
                     });
                 }
                 info!(target: "n42.qmdb", root = %forest.root(), "seeded the QMDB forest from the genesis alloc");
-                // A genesis forest has no checkpoint on disk yet; the first
-                // head move writes one, and until then there is nothing for a
-                // delta to be measured against.
+                // The genesis forest is checkpointed at once, so the delta log
+                // starts at genesis. The forest settles canonical blocks before
+                // the database persists them, so a crash before the first
+                // persistence leaves the database at genesis and the log ahead
+                // of it; a restart then stops the replay at genesis. With the
+                // first checkpoint at block 1 instead, no replay could reach
+                // genesis and the node could not start again. The alloc is
+                // small, so this costs one small write.
+                // Any log or segment here belongs to no checkpoint: there is
+                // none. They go before the checkpoint is written.
                 remove_file_logged(&log_path);
                 remove_file_logged(self.sealed_log_path());
+                let mut forest = forest;
+                let snapshot = forest.snapshot()?;
+                forest.forget_changes();
+                let checkpoint_len = write_snapshot(&path, &snapshot, &mut CompactPhases::default())?;
+                self.record_head_roots(&[(0, snapshot.head_hash, Some(header_root))]);
                 *cursor = PersistCursor {
-                    head: forest.head().1,
-                    next_slot: forest.next_slot(),
+                    head: snapshot.head_hash,
+                    next_slot: snapshot.tree.next_slot,
                     log_len: 0,
-                    checkpoint_len: 0,
+                    checkpoint_len,
                     compacting: false,
                 };
                 forest
@@ -2393,6 +2572,11 @@ impl QmdbNodeState {
         let entry_path = self.entry_file_path();
         let log_path = self.delta_log_path();
         if let Some(ckpt) = read_ckpt(&ckpt_path)? {
+            if ckpt.head_number > head_number {
+                // A fold sealed the log at the forest's head, which runs
+                // ahead of the database's by the persistence lag.
+                return self.restore_file_mode_from_archive(head, &ckpt, cursor);
+            }
             let checkpoint_len = std::fs::metadata(&ckpt_path).map(|m| m.len()).unwrap_or(0);
             let sealed_path = self.sealed_log_path();
             let sealed = sealed_path.exists();
@@ -2482,6 +2666,10 @@ impl QmdbNodeState {
         let ckpt = forest.checkpoint()?;
         forest.forget_changes();
         let checkpoint_len = write_ckpt(&self.ckpt_path(), &ckpt, &mut CompactPhases::default())?;
+        // The head's root is known good here (checked against the genesis
+        // header, a restored record or a trusted header), so a restart at
+        // this checkpoint is checked too.
+        self.record_head_roots(&[(ckpt.head_number, ckpt.head_hash, Some(forest.root()))]);
         remove_file_logged(self.delta_log_path());
         remove_file_logged(self.sealed_log_path());
         *cursor = PersistCursor {
@@ -2882,6 +3070,77 @@ impl QmdbNodeState {
         self.persist_canonical(None, &mut cursor)
     }
 
+    /// Makes the delta log durable through block `(number, hash)` before the
+    /// database commits it: the persistence hook's ordering guarantee (the
+    /// log is never behind the database, so a crash anywhere leaves a
+    /// datadir that restarts). Once the forest's canonical head has reached
+    /// the block (its number is past it, or it is the block), the log is
+    /// settled to that head ([`Self::settle_canonical`]) and this returns.
+    /// Until then -- the canonical notification for the block has not been
+    /// followed yet -- or while settling fails, it polls (1 ms, growing to
+    /// 10 ms) until `wait` has passed, then refuses with
+    /// [`NodeStateError::PersistUnsettled`]. A zero `wait` tries once.
+    pub fn settle_through(&self, number: u64, hash: B256, wait: std::time::Duration) -> Result<(), NodeStateError> {
+        let started = std::time::Instant::now();
+        let mut pause = std::time::Duration::from_millis(1);
+        loop {
+            let head = self.head();
+            let reason = match head {
+                None => return Err(NodeStateError::Uninitialised),
+                Some((head_number, head_hash)) if head_number > number || (head_number == number && head_hash == hash) => {
+                    match self.settle_canonical() {
+                        Ok(()) => return Ok(()),
+                        Err(error @ (NodeStateError::Poisoned(_) | NodeStateError::Uninitialised)) => return Err(error),
+                        Err(error) => error.to_string(),
+                    }
+                }
+                Some((head_number, head_hash)) => format!(
+                    "the forest's canonical head is block {head_number} ({head_hash}); the canonical \
+                     notification for the block has not been followed"
+                ),
+            };
+            let waited = started.elapsed();
+            if waited >= wait {
+                return Err(NodeStateError::PersistUnsettled {
+                    number,
+                    hash,
+                    waited_ms: waited.as_millis() as u64,
+                    forest_head: head.map(|(n, _)| n),
+                    reason,
+                });
+            }
+            std::thread::sleep(pause.min(wait - waited));
+            pause = (pause * 2).min(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Whether an [`Self::on_canonical`] error for `block_hash` means the
+    /// log can no longer follow the chain (`N42_QMDB_CANONICAL_FATAL`), as
+    /// opposed to a condition the next canonical head already retries.
+    ///
+    /// Fatal: a poisoned forest (no root is computed again until a restart);
+    /// an uninitialised one (the follower runs only after initialisation);
+    /// a refusal by the trees (`State`: a head the forest does not hold, or
+    /// any refused move of the canonical head), except an entry-file I/O
+    /// error and an unknown block that a kept rename alias may still file
+    /// under that hash. Not fatal: I/O on the log, checkpoint or frontier
+    /// (`Io`, `Decode`, `RecoveryFrontier`), which leave the persistence
+    /// cursor where it was so the next head appends again, and whose
+    /// persistent form the persistence hook refuses
+    /// ([`Self::settle_through`]).
+    pub fn is_fatal_canonical_error(&self, error: &NodeStateError, block_hash: B256) -> bool {
+        match error {
+            NodeStateError::Poisoned(_) | NodeStateError::Uninitialised => true,
+            NodeStateError::State(StateError::EntryFile(_)) => false,
+            NodeStateError::State(StateError::UnknownBlock(unknown)) => {
+                let aliases = self.inner.rename_aliases.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                !aliases.iter().any(|alias| alias.to == *unknown || alias.to == block_hash)
+            }
+            NodeStateError::State(_) => true,
+            _ => false,
+        }
+    }
+
     /// Wakes the catch-up thread, starting it on first use. It holds the
     /// state weakly and ends with it.
     fn wake_catch_up(&self) {
@@ -2915,9 +3174,10 @@ impl QmdbNodeState {
     /// held: of `target`, or (`None`, the catch-up) of the head the forest
     /// stands at, read under each hold.
     fn persist_canonical(&self, target: Option<B256>, cursor: &mut PersistCursor) -> Result<(), NodeStateError> {
-        // No checkpoint yet (a forest seeded from the alloc, or one whose log
-        // has outgrown it): write the tree once, and the deltas that follow are
-        // measured against it.
+        // No checkpoint to measure a delta against: write the tree once, and
+        // the deltas that follow are measured against it. Initialisation
+        // always leaves one now (the genesis seed writes it), so this is the
+        // defensive path, not the first block's.
         if cursor.checkpoint_len == 0 {
             return self.checkpoint(target, cursor);
         }
@@ -3170,6 +3430,11 @@ impl QmdbNodeState {
                         head_hash: sealed_head.1,
                     });
                 }
+                // The fold head is the forest's, ahead of the database's by
+                // the persistence lag. The replaced checkpoint and the folded
+                // segment are kept as a pair, so a crash before the database
+                // reaches the fold head restarts from them.
+                self.archive_pair(&format!("fold-{:020}-{:x}", sealed_head.0, sealed_head.1), &ckpt_path, &sealed_path)?;
                 let len = write_ckpt(&ckpt_path, &ckpt, &mut phases)?;
                 remove_file_logged(&sealed_path);
                 return Ok((len, read_ms));
@@ -3916,7 +4181,12 @@ mod tests {
         }
         let snapshot = std::fs::read(state.snapshot_path()).unwrap();
         let log = std::fs::read(state.delta_log_path()).unwrap();
-        std::fs::remove_file(state.frontier_path()).unwrap();
+        // The checkpoint is at genesis, which needs no frontier record.
+        match std::fs::remove_file(state.frontier_path()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("{e}"),
+        }
         // A directory in place of the file forces an actual I/O failure even
         // when the tests run with permission to bypass mode bits.
         std::fs::create_dir(state.frontier_path()).unwrap();

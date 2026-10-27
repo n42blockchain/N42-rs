@@ -66,7 +66,27 @@ use n42_h2_primitives::bls::BlsSecretKey;
 use n42_h2_primitives::consensus::H2V4ChainIdentity;
 use n42_mobile_service::MobileService;
 
+/// Exit code of a validator stopped by a fatal local fault
+/// (`ServiceError::Fatal`), distinct from the 1 of any other error.
+const FATAL_EXIT_CODE: i32 = 3;
+
+/// Withdraws the profile's knobs that need a genesis feature the chain does
+/// not enable (`n42_env::profile::reconcile`); called once, as soon as the
+/// chain is known, before any of them is read.
+fn reconcile_profile(frame_blocks: bool) {
+    let features = n42_env::profile::ChainFeatures { frame_blocks };
+    // SAFETY: called from `main` before the validator starts its runtime or
+    // any thread of its own (the tracing subscriber spawns none), so nothing
+    // reads or writes the environment concurrently.
+    unsafe { n42_env::profile::reconcile_and_report("h2_validator", features) };
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `N42_PROFILE=x22`: the adopted knob set, for every knob the operator
+    // left unset, before any knob is read or any thread exists.
+    // SAFETY: the first statement of `main`: no thread this program starts
+    // exists yet, so nothing reads or writes the environment concurrently.
+    unsafe { n42_env::profile::apply_or_exit("h2_validator") };
     // `N42_THP_DISABLE=1`: no transparent huge pages for this process. With
     // the box's THP at `always`, a fleet allocating ~45 GB of anonymous
     // memory drove 5.8M direct-compaction stalls that tore the page cache
@@ -177,10 +197,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut deferred_execution_time: Option<u64> = None;
     // The chain's `deferredExecutionDepth` (1 when absent).
     let mut deferred_execution_depth: u64 = 1;
+    if chain_path.is_none() {
+        // No genesis to read a feature from: the chain-gated knobs a profile
+        // set are withdrawn.
+        reconcile_profile(false);
+    }
     let (identity, validators): (H2V4ChainIdentity, Vec<ValidatorInfo>) = match &chain_path {
         Some(path) => {
             use reth_cli::chainspec::ChainSpecParser as _;
             let spec = n42_qmdb_reth::N42ChainSpecParser::parse(path)?;
+            // The profile's knobs that need a genesis feature this chain
+            // lacks (`frameBlocks`) are withdrawn before any is read.
+            // `reth_chainspec::qmdb::FRAME_BLOCKS_KEY`, read as
+            // `frame_blocks_enabled` reads it: anything but `true` is off.
+            reconcile_profile(
+                spec.genesis
+                    .config
+                    .extra_fields
+                    .get_deserialized::<bool>("frameBlocks")
+                    .and_then(Result::ok)
+                    .unwrap_or(false),
+            );
             deferred_execution_time = n42_qmdb_reth::deferred_execution_time(&spec.genesis);
             // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md):
             // refused when malformed or not run by this build, never read as 1.
@@ -512,10 +549,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("transaction source: {rpc}");
         }
         if let Some(addr) = &el_ingest {
-            let lanes = std::env::var("N42_INGEST_FORWARD_LANES")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(4usize);
+            let lanes = n42_env::parse("N42_INGEST_FORWARD_LANES", 4usize);
             service = service.with_transaction_ingest(addr.clone(), lanes);
             println!("gossip -> pool : binary ingest at {addr}, {lanes} connections");
         }
@@ -590,7 +624,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // imports its own block. With round-robin it stays behind the
             // switch, because measured there it was a loss (see the service).
             service = service
-                .with_build_ahead(std::env::var("N42_BUILD_AHEAD").is_ok() || leader_tenure > 1);
+                .with_build_ahead(n42_env::flag("N42_BUILD_AHEAD", false) || leader_tenure > 1);
             service = service.with_payload_attributes(move |context| {
                 let parent_beacon_block_root = match (&committee, &context.head_header) {
                     (Some(pool), Some(parent)) => {
@@ -630,7 +664,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("running…\n");
         loop {
-            for event in service.step().await? {
+            let events = match service.step().await {
+                Ok(events) => events,
+                // A validator that cannot record its votes must not keep
+                // voting. Exit non-zero so the supervisor (systemd,
+                // `fleet7.sh roll`) restarts it; the vote log replays then.
+                Err(n42_h2_node::ServiceError::Fatal { reason, detail }) => {
+                    eprintln!("FATAL {reason}: {detail}; stopping (see docs/OPERATOR_FAULTS.md)");
+                    std::process::exit(FATAL_EXIT_CODE);
+                }
+                Err(err) => return Err(err.into()),
+            };
+            for event in events {
                 match event {
                     ServiceEvent::Committed {
                         view,

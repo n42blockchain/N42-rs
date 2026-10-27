@@ -38,6 +38,7 @@ members = [
     "crates/n42/deferred-reverts",
     "crates/n42/sharded-output",
     "crates/n42/core-layout",
+    "crates/n42/env",
     "crates/n42/tx-ingest",
     "crates/n42/tx-queue",
     "crates/n42/tx-types",
@@ -248,6 +249,7 @@ n42-qmdb-reth = { path = "crates/n42/qmdb-reth" }
 n42-deferred-reverts = { path = "crates/n42/deferred-reverts" }
 n42-sharded-output = { path = "crates/n42/sharded-output" }
 n42-core-layout = { path = "crates/n42/core-layout" }
+n42-env = { path = "crates/n42/env" }
 n42-tx-ingest = { path = "crates/n42/tx-ingest" }
 n42-tx-queue = { path = "crates/n42/tx-queue" }
 n42-h2-node = { path = "crates/n42/h2-node" }

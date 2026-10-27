@@ -858,8 +858,11 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 let qmdb_start = Instant::now();
                 let persisted: Vec<_> =
                     state_trie_blocks.iter().map(|block| block.recovered_block().num_hash()).collect();
-                reader.on_state_persisted(&persisted);
+                let checked = reader.on_state_persisted_checked(&persisted);
                 n42_timers.save_blocks_qmdb_persisted.record(qmdb_start.elapsed());
+                // A refusal fails the batch here, before the commit: the database must not
+                // stand past what the reader has made durable.
+                checked.map_err(ProviderError::other)?;
             }
         }
 

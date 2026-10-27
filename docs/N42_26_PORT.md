@@ -622,14 +622,41 @@ one joining a running chain — a fresh datadir, or a long absence — has
 no blocks and no way to get them from devp2p. When a peer's status shows
 it ahead of the execution layer (`eth_blockNumber`), the service pulls the
 gap by range from that peer, imports each block in order through
-`newPayload` and a forkchoice that finalizes it — the chain it came from is
-the fleet's committed one — and asks for the next range until the peer's
+`newPayload` and a forkchoice that makes it head (not safe, not finalized:
+those move on the next commit this node sees) and asks for the next range until the peer's
 height is reached; the consensus engine then finds the fleet's view from
 the messages it hears. Measured: a member started 45 s late with an empty
 execution layer pulled 1–12 from a peer in 160 ms, jumped from view 1 to
 the fleet's 17, and committed every view after — its execution layer at 36
 with the main chain's head hash when the run ended. The harness pins the
 pull with mock execution layers (`a_member_that_starts_behind_pulls_the_chain_from_its_peers`).
+
+**Certificates on pulled blocks (2026-10-26).** Before `newPayload` each
+pulled block must name the block pulled before it as its parent, and the
+committed QC a gov5 leader embeds in the header (`N42H ‖ view ‖ QC ‖ seal`)
+is verified through the engine's proposal-path check
+(`ConsensusEngine::verify_header_qc`: the set for the QC's exact view, a
+quorum, either signing domain), must be no later than the header's view and
+must name a block on the header's parent chain where this node holds those
+headers. The first block that fails ends the batch (the ones before it stay
+imported), and its peer is not asked for that gap again. gov5 imports a
+range (`internal/sync/rpc_catchup.go` `catchUpRange`, `bad_blocks.go`
+`insertCatchUpBlocks`) one block at a time through `InsertChain`, whose
+`VerifyHeader` (`hotstuff/adapter.go`) checks the same embedded QC
+(`verifyQCAnyDomainWithSet`, QC view ≤ header view) but skips the check when
+it cannot resolve a validator set for the QC's view, and never checks the
+seal or which block the QC names. So our check is stricter in three places
+only — a set this node cannot resolve, a QC naming a block off the parent
+chain, a parent link that skips — and each is a range only a Byzantine peer
+serves: an honest gov5 peer's blocks always pass (a static set, as both
+clients run v4, always resolves; the leader's committed block is an ancestor
+of the block it builds), and a bad batch is refused rather than executed.
+Neither client checks the seal (the live path does not either). This
+node's own leaders embed no QC (`HeaderExtra::for_view`), so a range served
+from Rust-produced blocks is checked only for its parent links; that is the
+case the second half of the rule covers: a pulled block is never safe or
+finalized in either settlement mode, so nothing a peer serves is settled
+before the live protocol commits it.
 
 **Fetch-on-miss.** gov5 recovers from anything it cannot place — the parent
 of a gossiped block, the block a proposal names, its own speculative sibling

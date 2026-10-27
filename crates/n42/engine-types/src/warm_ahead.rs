@@ -50,7 +50,7 @@ use crate::parallel_transfer::{FrozenWarm, WARM_SHARDS, WarmInfo, warm_shard};
 /// off. Read once.
 pub fn threads() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| std::env::var("N42_PLAN_AHEAD_WARM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(64))
+    *N.get_or_init(|| n42_env::parse::<usize>("N42_PLAN_AHEAD_WARM", 0).min(64))
 }
 
 /// The warm read's pool: [`threads`] threads (`n42-warm-*`), each placed on

@@ -29,7 +29,8 @@ fn chunks(blocks: &[(B256, Header, alloy_primitives::Bytes)]) -> Vec<BlockChunk>
 }
 
 fn catching_up(rig: &mut Rig, peer: PeerId, next: u64, target: u64) {
-    rig.svc.catch_up = Some(CatchUp { peer, next, target, started_at: next - 1, probing: false, probe_height: 0 });
+    rig.svc.catch_up =
+        Some(CatchUp { peer, next, target, started_at: next - 1, probing: false, probe_height: 0, prev_hash: None });
 }
 
 async fn import(rig: &mut Rig) -> Vec<ServiceEvent> {
@@ -256,6 +257,117 @@ async fn a_pull_stops_and_blames_the_peer_when_its_reply_is_unusable() {
     assert!(rig.svc.imported.is_empty());
 }
 
+/// The committed QC a gov5 leader embeds in a header: `signers` of `keys`
+/// sign `signed` under the rig engine's profile, and the certificate names
+/// `(view, named)`. A `signed` other than `named` is a forged certificate.
+fn header_qc(
+    svc: &H2Service<MockExecutionLayer>,
+    keys: &[BlsSecretKey],
+    signers: &[usize],
+    view: u64,
+    named: B256,
+    signed: B256,
+) -> Vec<u8> {
+    let profile = svc.engine.signing_profile();
+    let message = profile.vote_message(view, signed);
+    let signatures: Vec<_> = signers.iter().map(|&i| profile.sign(&keys[i], &message)).collect();
+    let refs: Vec<_> = signatures.iter().collect();
+    let aggregate = n42_h2_primitives::bls::AggregateSignature::aggregate(&refs).expect("aggregate");
+    let mut bitmap = (keys.len() as u16).to_le_bytes().to_vec();
+    bitmap.resize(2 + keys.len().div_ceil(8), 0);
+    for &i in signers {
+        bitmap[2 + i / 8] |= 1 << (i % 8);
+    }
+    // gov5's `HotStuffQC` SSZ: the view, then each field length-prefixed.
+    let mut out = view.to_le_bytes().to_vec();
+    for field in [named.as_slice(), &aggregate.to_bytes()[..], &bitmap[..]] {
+        out.extend_from_slice(&(field.len() as u32).to_le_bytes());
+        out.extend_from_slice(field);
+    }
+    let decoded = n42_h2_wire::h2_wire::decode_h2_qc(&out).expect("the codec reads it back");
+    assert_eq!((decoded.view, decoded.block_hash), (view, named));
+    out
+}
+
+/// A mock block whose header carries gov5's extra layout for `view` with
+/// `qc` embedded.
+fn block_with_extra(number: u64, parent: B256, view: u64, qc: Vec<u8>) -> (B256, Header, alloy_primitives::Bytes) {
+    let built = MockExecutionLayer::built_block_on(number, parent);
+    let mut header = built.execution_data.clone().into_block_raw().expect("raw block").header;
+    let extra = n42_h2_consensus::HeaderExtra { view, qc, seal: Some([0; n42_h2_consensus::EXTRA_SEAL_LEN]) };
+    header.extra_data = extra.encode();
+    let rlp = n42_h2_net::encode_block_rlp_raw(&header, &[], &[], None);
+    (header.hash_slow(), header, alloy_primitives::Bytes::from(rlp))
+}
+
+/// Section 6.6 of `docs/MATURITY_HARDENING_2026_10.md`: a pulled range
+/// whose third block carries a forged parent QC. The two blocks before it
+/// are imported; it and the one after are not; the peer is refused for the
+/// gap and not asked again even when it is the only peer, and another peer
+/// is asked instead.
+#[tokio::test]
+async fn a_pulled_block_with_a_forged_parent_qc_ends_the_batch_and_its_peer_is_not_asked_again() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    let peer = PeerId::random();
+    let quorum = [0, 1, 2];
+    let mut blocks: Vec<(B256, Header, alloy_primitives::Bytes)> = Vec::new();
+    let mut parent = B256::ZERO;
+    for number in 1..=4u64 {
+        let qc = match number {
+            1 => Vec::new(),
+            // Signed over another hash than the one it names.
+            3 => header_qc(&rig.svc, &keys, &quorum, number - 1, parent, B256::repeat_byte(0x77)),
+            _ => header_qc(&rig.svc, &keys, &quorum, number - 1, parent, parent),
+        };
+        let block = block_with_extra(number, parent, number, qc);
+        parent = block.0;
+        blocks.push(block);
+    }
+    catching_up(&mut rig, peer, 1, 4);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 4, step: 1 }, chunks(&blocks)));
+    let events = import(&mut rig).await;
+
+    assert_eq!(events, vec![ServiceEvent::Synced { height: 2, complete: false }]);
+    let imported: Vec<B256> =
+        rig.el.calls().iter().filter_map(|c| if let ElCall::NewPayload(h) = c { Some(*h) } else { None }).collect();
+    assert_eq!(imported, vec![blocks[0].0, blocks[1].0], "the blocks before the forged QC, and only those");
+    assert!(!rig.svc.imported.contains(&blocks[2].0) && !rig.svc.imported.contains(&blocks[3].0));
+    assert_eq!(rig.svc.refused_range_peers.get(&peer), Some(&3));
+    assert!(rig.svc.catch_up.is_none());
+
+    // The only peer known, still claiming more: not asked again.
+    rig.svc.catch_up_retry_after = None;
+    rig.svc.note_peer_height(peer, 10);
+    let mut events = Vec::new();
+    within(rig.svc.consider_catch_up(&mut events)).await;
+    assert!(rig.svc.catch_up.is_none(), "the refused peer is not re-asked for the gap");
+    assert!(rig.el.calls().iter().all(|c| !matches!(c, ElCall::NewPayload(h) if *h == blocks[2].0)));
+
+    // Another peer is.
+    let other = PeerId::random();
+    rig.svc.note_peer_height(other, 10);
+    within(rig.svc.consider_catch_up(&mut events)).await;
+    let catch_up = rig.svc.catch_up.as_ref().expect("a pull from the other peer");
+    assert_eq!((catch_up.peer, catch_up.next), (other, 3));
+}
+
+/// A block that does not extend the one pulled before it is refused before
+/// the execution layer sees it, whatever its certificate says.
+#[tokio::test]
+async fn a_pulled_block_that_does_not_extend_the_previous_one_is_refused() {
+    let mut rig = node(1, 0, None).await;
+    let peer = PeerId::random();
+    let first = block(1, B256::ZERO);
+    let stray = block(2, B256::repeat_byte(0x09));
+    catching_up(&mut rig, peer, 1, 2);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 2, step: 1 }, chunks(&[first.clone(), stray])));
+    assert_eq!(import(&mut rig).await, vec![ServiceEvent::Synced { height: 1, complete: false }]);
+    assert!(rig.svc.imported.contains(&first.0));
+    assert_eq!(rig.svc.imported.len(), 1);
+    assert_eq!(rig.svc.refused_range_peers.get(&peer), Some(&2));
+}
+
 #[tokio::test]
 async fn a_short_probe_reply_ends_the_pull_only_at_the_height_the_probe_began_at() {
     for (probe_height, ends) in [(2u64, true), (5, false)] {
@@ -263,7 +375,7 @@ async fn a_short_probe_reply_ends_the_pull_only_at_the_height_the_probe_began_at
         let peer = PeerId::random();
         let blocks = chain(2);
         rig.svc.catch_up =
-            Some(CatchUp { peer, next: 1, target: 1024, started_at: 0, probing: true, probe_height });
+            Some(CatchUp { peer, next: 1, target: 1024, started_at: 0, probing: true, probe_height, prev_hash: None });
         rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 1024, step: 1 }, chunks(&blocks)));
         let events = import(&mut rig).await;
         if ends {
@@ -282,7 +394,7 @@ async fn a_short_probe_reply_ends_the_pull_only_at_the_height_the_probe_began_at
 async fn an_empty_probe_ends_a_pull_that_already_made_progress() {
     let mut rig = node(1, 0, None).await;
     let peer = PeerId::random();
-    rig.svc.catch_up = Some(CatchUp { peer, next: 11, target: 1034, started_at: 4, probing: true, probe_height: 0 });
+    rig.svc.catch_up = Some(CatchUp { peer, next: 11, target: 1034, started_at: 4, probing: true, probe_height: 0, prev_hash: None });
     rig.svc.pending_imports.push((peer, RangeRequest { start: 11, count: 1024, step: 1 }, Vec::new()));
     assert_eq!(import(&mut rig).await, vec![ServiceEvent::Synced { height: 10, complete: true }]);
 }
@@ -674,7 +786,7 @@ async fn a_fifth_range_request_from_one_peer_is_refused_with_the_server_error_co
     // `a` pulls from `b`, so a refusal reaches its import queue (as an empty
     // reply) rather than only a log line.
     a.svc.catch_up =
-        Some(CatchUp { peer: target, next: 2, target: 2, started_at: 1, probing: false, probe_height: 0 });
+        Some(CatchUp { peer: target, next: 2, target: 2, started_at: 1, probing: false, probe_height: 0, prev_hash: None });
 
     // Four of `a`'s requests are in flight at `b` (held here, so the timing
     // of the mock execution layer cannot free them): `a`'s share is full.

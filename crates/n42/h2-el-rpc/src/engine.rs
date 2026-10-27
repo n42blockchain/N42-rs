@@ -299,10 +299,7 @@ static RAW_CHANNEL_TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync
 pub fn raw_channel_timeout() -> std::time::Duration {
     *RAW_CHANNEL_TIMEOUT.get_or_init(|| {
         std::time::Duration::from_millis(
-            std::env::var("N42_RAW_CHANNEL_TIMEOUT_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(RAW_CHANNEL_TIMEOUT_DEFAULT_MS),
+            n42_env::parse("N42_RAW_CHANNEL_TIMEOUT_MS", RAW_CHANNEL_TIMEOUT_DEFAULT_MS),
         )
     })
 }
@@ -314,7 +311,7 @@ static OWN_BLOCK_BY_HEADER: std::sync::OnceLock<bool> = std::sync::OnceLock::new
 /// payload as before). Read once: it is consulted on every own-block import.
 fn own_block_by_header() -> bool {
     *OWN_BLOCK_BY_HEADER
-        .get_or_init(|| std::env::var("N42_OWN_BLOCK_BY_HEADER").map_or(true, |v| v != "0"))
+        .get_or_init(|| n42_env::flag("N42_OWN_BLOCK_BY_HEADER", true))
 }
 
 /// Runs one raw-channel exchange under [`raw_channel_timeout`]. An

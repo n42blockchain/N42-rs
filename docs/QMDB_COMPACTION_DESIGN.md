@@ -130,11 +130,26 @@ the first landing.
 
 ### 3.7 Metrics (stage 0, land first)
 
-`n42_qmdb_entry_file_bytes`, `n42_qmdb_entry_relocated_bytes`, `n42_qmdb_entry_punched_bytes`,
-`n42_qmdb_entry_live_slots`, `n42_qmdb_entry_total_slots`, `n42_qmdb_offsets_bytes`, and the
-alarm `n42_qmdb_entry_bytes_per_live_slot` (file + relocated - punched, over live slots); a
-warning when it passes `N42_QMDB_ENTRY_BYTES_PER_LIVE_ALARM` (default 2,000). All are
-available today from `FileEntries` (slots, bytes), `index_bytes()`, and a popcount of `active`.
+Landed (stage 0) as gauges of the node's 10 s QMDB health sampler (`bin/n42/src/main.rs`), read
+from `QmdbNodeState::entry_stats()` -> `QmdbForest::entry_stats()` ->
+`QmdbCompatTree::entry_stats()` (`twig-core` `entry_store::EntryStoreStats`); the accessor
+`try_lock`s the forest and skips the tick while the lock is held:
+
+| gauge | source |
+| --- | --- |
+| `n42_qmdb_entry_file_bytes` | `FileEntries` bytes that belong to slots (heap mode: the entry `Vec`'s own bytes) |
+| `n42_qmdb_entry_total_slots` | slots appended and not cut by an undo |
+| `n42_qmdb_entry_live_slots` | the key index's length, both modes: O(1), where a popcount of `active` is linear in the slots (128 MB at 10^9 slots, under the forest lock every tick). It is an invariant, not an estimate: the index names every active slot once at rest (an open builds it from the active bits and refuses a duplicate active key; every apply, delete and undo changes a slot's bit and its index entry together); the unit tests check it against a count of the active slots |
+| `n42_qmdb_offsets_bytes` | `Offsets` segments x 8 MiB (0 in the heap) |
+| `n42_qmdb_index_bytes` | `index_bytes()` |
+| `n42_qmdb_entry_chunks` | sealed mappings of the file (0 in the heap) |
+| `n42_qmdb_entry_bytes_per_live_slot` | `file_bytes / max(live_slots, 1)` |
+
+A warning, once per process, when the last passes `N42_QMDB_ENTRY_BYTES_PER_LIVE_ALARM`
+(default 2,000, 0 disables). `n42_qmdb_entry_relocated_bytes` and `n42_qmdb_entry_punched_bytes`
+come with stages 2 and 3 (nothing produces them yet); the ratio then becomes
+(file + relocated - punched) over live slots. No per-100-block log line: the node has no periodic
+QMDB-counter log to put it in (the read view's lag line is about the view, not the tree).
 
 ## 4. What this does not do
 
@@ -147,7 +162,7 @@ available today from `FileEntries` (slots, bytes), `index_bytes()`, and a popcou
 
 | stage | change | verification |
 | --- | --- | --- |
-| 0 | metrics of 3.7 | unit tests; one fleet leg shows the growth rates in the table of section 1 |
+| 0 | metrics of 3.7 (done in 301f82916) | unit tests; one fleet leg shows the growth rates in the table of section 1 |
 | 1 | read view resolves slots through atomic `Offsets` (3.3), no relocation yet | existing read-view and proof tests; an X22 control pair (the hot read path changes: expect noise) |
 | 2 | `entries.relocated`, tagged records, `open_existing` from two files, `Offsets` top bit, checkpoint fields; compaction runs but never punches | tests: compact, restart, same root and same proofs; same portable snapshot bytes before and after; undo across a compacted boundary refused by construction (3.4a) and tested |
 | 3 | scheduler on the pruner thread, epoch-deferred punching, `punched` in the checkpoint | tests with a fake epoch; a fleet leg reads `entry_bytes_per_live_slot` falling to a plateau; `roll --kill` under load restarts on a punched file |

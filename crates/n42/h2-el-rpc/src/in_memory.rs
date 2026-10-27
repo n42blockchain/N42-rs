@@ -132,6 +132,98 @@ pub async fn poll_persisted_once<T: JsonRpcTransport>(transport: &T, gauge: &InM
     }
 }
 
+/// How long a reading must hold before the persistence watch speaks again,
+/// and how long the unpersisted count must stay over [`LAG_BLOCKS`] before it
+/// is called a lag.
+const WATCH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The unpersisted-block count past which the execution layer's persistence
+/// is said to lag (the engine persists past a threshold of 2-8 blocks).
+const LAG_BLOCKS: u64 = 16;
+
+/// What the persistence watch has to say about one reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchEvent {
+    /// The persisted block moved from `from` to `to`.
+    Advanced { from: u64, to: u64, unpersisted: Option<u64> },
+    /// More than [`LAG_BLOCKS`] blocks have stood unpersisted for `for_secs`.
+    Lagging { persisted: Option<u64>, unpersisted: u64, for_secs: u64 },
+}
+
+/// Turns the poller's readings into rate-limited operator lines: the
+/// persisted block advancing (at most one line per [`WATCH_INTERVAL`],
+/// naming the whole move since the last one) and the unpersisted count
+/// standing over [`LAG_BLOCKS`] for longer than [`WATCH_INTERVAL`] (repeated
+/// once per interval while it lasts). Without these a run shows only the
+/// first reading, and an execution layer that persists nothing for minutes
+/// looks exactly like a healthy one.
+#[derive(Debug, Default)]
+struct PersistenceWatch {
+    /// The persisted block the last advance line named (or the first seen).
+    logged: Option<u64>,
+    /// When the last advance line was written.
+    advanced_at: Option<std::time::Instant>,
+    /// When the unpersisted count went over the lag bound, if it is over.
+    lag_since: Option<std::time::Instant>,
+    /// When the last lag line was written.
+    lag_logged_at: Option<std::time::Instant>,
+}
+
+impl PersistenceWatch {
+    fn observe(&mut self, now: std::time::Instant, persisted: Option<u64>, unpersisted: Option<u64>) -> Vec<WatchEvent> {
+        let due = |at: Option<std::time::Instant>| at.is_none_or(|at| now.duration_since(at) >= WATCH_INTERVAL);
+        let mut events = Vec::new();
+        if let Some(number) = persisted {
+            match self.logged {
+                None => self.logged = Some(number),
+                Some(from) if number != from && due(self.advanced_at) => {
+                    events.push(WatchEvent::Advanced { from, to: number, unpersisted });
+                    self.logged = Some(number);
+                    self.advanced_at = Some(now);
+                }
+                Some(_) => {}
+            }
+        }
+        match unpersisted {
+            Some(count) if count > LAG_BLOCKS => {
+                let since = *self.lag_since.get_or_insert(now);
+                let held = now.duration_since(since);
+                if held >= WATCH_INTERVAL && due(self.lag_logged_at) {
+                    events.push(WatchEvent::Lagging { persisted, unpersisted: count, for_secs: held.as_secs() });
+                    self.lag_logged_at = Some(now);
+                }
+            }
+            // Unknown leaves the lag clock as it is; a count at or under the
+            // bound ends the lag.
+            None => {}
+            Some(_) => {
+                self.lag_since = None;
+                self.lag_logged_at = None;
+            }
+        }
+        events
+    }
+}
+
+fn log_watch_event(event: WatchEvent) {
+    match event {
+        WatchEvent::Advanced { from, to, unpersisted } => {
+            let head = unpersisted.map(|count| to.saturating_add(count));
+            info!(target: "n42.h2.el", from, persisted = to, ?unpersisted, ?head, "persisted block advanced");
+        }
+        WatchEvent::Lagging { persisted, unpersisted, for_secs } => {
+            let head = persisted.map(|number| number.saturating_add(unpersisted));
+            info!(
+                target: "n42.h2.el",
+                ?head, ?persisted, unpersisted, for_secs,
+                "persistence lagging: head={} persisted={} unpersisted={unpersisted}",
+                head.map_or_else(|| "?".to_owned(), |n| n.to_string()),
+                persisted.map_or_else(|| "?".to_owned(), |n| n.to_string()),
+            );
+        }
+    }
+}
+
 /// Starts a task polling `transport` every `every` and returns the gauge it
 /// fills: the unpersisted-block count and the persisted block number, each
 /// until the execution layer turns out not to have its method (that reading
@@ -146,6 +238,7 @@ pub fn spawn_poller<T: JsonRpcTransport>(transport: T, every: Duration) -> InMem
         let mut first = true;
         let mut first_persisted = true;
         let (mut count_on, mut persisted_on) = (true, true);
+        let mut watch = PersistenceWatch::default();
         while count_on || persisted_on {
             ticks.tick().await;
             if count_on {
@@ -177,6 +270,13 @@ pub fn spawn_poller<T: JsonRpcTransport>(transport: T, every: Duration) -> InMem
                         persisted_on = false;
                     }
                 }
+            }
+            let persisted = match filled.persisted() {
+                n42_h2_execution::PersistedHeight::Known(number) => Some(number),
+                _ => None,
+            };
+            for event in watch.observe(std::time::Instant::now(), persisted, filled.get()) {
+                log_watch_event(event);
             }
         }
     });
@@ -220,6 +320,42 @@ mod tests {
             state.1 += 1;
             state.0.pop().unwrap_or_else(|| Err(TransportError::Transport("no more answers".into())))
         }
+    }
+
+    #[test]
+    fn the_persistence_watch_names_advances_and_lags_at_most_once_an_interval() {
+        let start = std::time::Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut watch = PersistenceWatch::default();
+        assert!(watch.observe(at(0), Some(0), Some(3)).is_empty(), "the first reading is the baseline");
+        assert_eq!(
+            watch.observe(at(1), Some(4), Some(2)),
+            vec![WatchEvent::Advanced { from: 0, to: 4, unpersisted: Some(2) }]
+        );
+        assert!(watch.observe(at(5), Some(8), Some(2)).is_empty(), "rate-limited");
+        assert_eq!(
+            watch.observe(at(11), Some(9), Some(1)),
+            vec![WatchEvent::Advanced { from: 4, to: 9, unpersisted: Some(1) }],
+            "the line names the whole move since the last one"
+        );
+        // Over the bound: silent until it has held for the interval.
+        assert!(watch.observe(at(20), Some(9), Some(17)).is_empty());
+        assert!(watch.observe(at(29), Some(9), Some(25)).is_empty());
+        assert_eq!(
+            watch.observe(at(30), Some(9), Some(26)),
+            vec![WatchEvent::Lagging { persisted: Some(9), unpersisted: 26, for_secs: 10 }]
+        );
+        assert!(watch.observe(at(35), None, None).is_empty(), "an unknown reading keeps the clock");
+        assert_eq!(
+            watch.observe(at(40), Some(9), Some(36)),
+            vec![WatchEvent::Lagging { persisted: Some(9), unpersisted: 36, for_secs: 20 }]
+        );
+        // Back under the bound ends the lag; a new one starts its own clock.
+        let events = watch.observe(at(41), Some(40), Some(2));
+        assert_eq!(events, vec![WatchEvent::Advanced { from: 9, to: 40, unpersisted: Some(2) }]);
+        assert!(watch.observe(at(45), Some(40), Some(20)).is_empty());
+        assert!(watch.observe(at(54), Some(40), Some(20)).is_empty());
+        assert_eq!(watch.observe(at(55), Some(40), Some(20)).len(), 1);
     }
 
     #[tokio::test]

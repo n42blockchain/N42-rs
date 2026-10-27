@@ -94,7 +94,7 @@ Decisions behind the fixes:
 - The pruner feed stays an unbounded channel. Bounding it changes the hand-off that the 5M
   configuration depends on (round 10.227: frees moved off the pruner thread); it now warns
   when the depth passes 64. A bound needs a bench pair, not a code review.
-- `VoteLogFsync` is logged at `error` and counted but is not fatal yet (section 6.5).
+- `VoteLogFsync` is logged at `error` and counted; consecutive failures are fatal since section 6.5.
 
 ## 6. Open design items
 
@@ -107,8 +107,28 @@ behaviour change only for someone passing `=0` to enable, which nothing in `scri
 Then add `N42_PROFILE=x22` (or `--n42.profile`), applied at process start before any
 `OnceLock` read, that sets the adopted knob set when the knobs are unset. The binary then
 carries the measured configuration, and one integration test per adopted mode can compare
-its block and state root against the default path. Owner: a single branch after the three
-hardening branches merge (it touches the same files).
+its block and state root against the default path.
+
+Done in `3bd981d69`, `c6d049e53`, `d8cb61101`, `47e38c629` (branch `design/knob-profile`): crate
+`crates/n42/env` (`n42_env::flag` / `parse` / `var`, unit-tested branch by branch); 45 switch
+reads migrated to `flag` (16 presence-only, 4 "anything but 0", 25 default-on `!= "0"`) and 26
+one-line numeric reads to `parse`; `N42_PROFILE=x22` (env only, no CLI flag) applied as the first
+statement of `bin/n42` and `h2_validator`, 41 knobs = the `adopted` rows of `docs/KNOBS.md`,
+held equal to them by a test. Not done: the per-mode root-equality integration tests, and the
+`== "1"` switches (still exact-match). Completed 2026-10-27 (branch `design/knob-profile-x22`): the
+X22 base set (the loop351 `ALLA` line and its per-leg additions, 46 rows that were `experimental`) and
+13 tuned values whose compiled default differs (`N42_ED25519_BATCH` 256, `N42_ALTSIG_SENDER_CACHE`
+2^22, `N42_OUTPUT_SHARDS` 16, the build throttle 48/80, ...) are `adopted` and in the profile, which
+is now 99 knobs (101 with the 6.4 road knobs adopted below) and reproduces the node-side environment of an X22 leg. What a leg passes beyond it
+is classed `bench-only` (bench gateway key and attestation minimum, `N42_IMPORT_ONCE`, the storage
+mode `N42_HASHED_TABLES=off` / `N42_QMDB_READS=on`, `N42_ACCOUNT_HISTORY=off`,
+`N42_SETTLEMENT_TAGS=legacy`, `N42_PERSIST_QMDB_IN_SCOPE`, `N42_STORAGE_OP_METRICS=0`, and
+`N42_LOCK_SITES`, moved out of the profile) or is a launcher variable (`MALLOC_CONF`,
+`TOKIO_WORKER_THREADS`, `RAYON_NUM_THREADS`). The 12 profile knobs that only act with frame blocks
+are chain-gated (branch `design/profile-chain-gate`): `n42_env::profile::reconcile` withdraws them
+right after the chain spec is parsed when the genesis lacks `frameBlocks`, so `N42_PROFILE=x22` runs on
+`n42_fleet7.json`, the devnet and the gov5 chains (on 2026-10-27 it stopped all seven execution layers
+of the production-shaped fleet), while an operator's own `N42_FRAME_BLOCKS=1` there is still refused.
 
 ### 6.2 QMDB entry-file compaction
 
@@ -134,6 +154,13 @@ separate path, so a crash can leave MDBX ahead of the log and the node refuses t
 or forces `settle_canonical` up to `blocks.last()` and fails the batch if it cannot; an
 `on_canonical` error becomes fatal rather than logged. Verify with `roll --kill` under load.
 
+Done in `42cd67f4a`, `a4a33f0fc`, `97e23d124` (branch `design/qmdb-durability`); field check pending.
+The hook is the additive, error-returning `on_state_persisted_checked`: past
+`N42_QMDB_SETTLE_WAIT_MS` (default 30000) the batch fails before its commit (`PersistUnsettled`), so
+no `n42_qmdb_persist_unsettled` gauge was needed. A fatal `on_canonical` error (Poisoned,
+Uninitialised, State refusals; not log I/O, which the next head retries) exits the node unless
+`N42_QMDB_CANONICAL_FATAL=0`. `docs/PERSISTENCE_COST_STUDY.md` section 9 states the ordering.
+
 ### 6.4 Bounds on the road and the pruner feed
 
 The road's taken map keeps up to 131k frames alive and `retire` scans it every block; a frame
@@ -141,6 +168,17 @@ whose gas exceeds the block limit blocks the FIFO behind it. Design: bound the t
 the own-block hold window, index it by first-member sender so `retire` touches only the
 senders in the pruned block, and refuse oversize frames at `road_admit`. Each is a bench pair
 (X22 control vs change) before adoption.
+
+Implemented behind knobs in `ad111b05a` and `54362f7d1` (tests). Bench pairs run 2026-10-27 (loop351
+stage fm, section 8.2): no measurable cost, so both knobs are on by default since the adoption commit on
+`design/integration-2026-10-next` (`N42_ROAD_TAKEN_BOUND=0` / `N42_ROAD_RETIRE_INDEX=0` turn them off;
+`adopted` rows in `docs/KNOBS.md`, in the X22 profile).
+`N42_ROAD_TAKEN_BOUND=1` forgets a taken frame neither retired nor handed back once more than
+`N42_OWN_HOLD_BLOCKS` + 8 own blocks were held since its take (its block has left the hold
+window; a later give-back goes the lanes' path with a flush, as after `N42_ROAD_TAKEN_MAX`);
+`N42_ROAD_RETIRE_INDEX=1` retires through an index by first-member sender. The oversize refusal
+is unconditional, against the gas limit of the latest frame build (nothing is refused before the
+first build). Metrics: `n42_road_taken_frames`, `n42_road_oversize_frames_total`.
 
 ### 6.5 Local faults that should stop a validator
 
@@ -150,6 +188,14 @@ Likewise an `Invalid` answer to a commit forkchoice is a divergence between cons
 execution layer; proposal: stop voting and raise an error event. Both need an operator story
 (restart, resync) before they are switched on.
 
+Done in `14818bf86`, `2d147152a`, `26b095081` and the docs commit adding `docs/OPERATOR_FAULTS.md`:
+`N42_VOTE_LOG_FATAL_AFTER` consecutive vote-log failures (default 3, `0` off) halt the engine's
+voting and stop the validator (`ConsensusError::Fatal` -> `ServiceError::Fatal`, exit code 3,
+`n42_h2_fatal{reason="vote_log"}`, `n42_h2_vote_log_failures_total`); a commit forkchoice answered
+`Invalid` halts voting and proposing while the node keeps following
+(`n42_h2_voting_halted{reason="commit_invalid"}`, `N42_HALT_ON_COMMIT_INVALID=0` off). Operator
+story in `docs/OPERATOR_FAULTS.md`.
+
 ### 6.6 Certificates on range-pulled blocks
 
 Blocks pulled by `bodies_by_range` become head (and `safe` in legacy settlement) after
@@ -157,6 +203,12 @@ decodability and sequence checks only; the embedded QC and leader seal are not v
 Design: verify the parent QC in each header against the validator set before `new_payload`,
 never move `safe` on a pulled block, and compare behaviour with gov5's range import before
 changing the cross-client expectation.
+
+Done in `6c737e8e2`, `4dae5c17a`, `e833bd966`: each pulled block must extend the one before it, and the committed QC in
+its header is verified through the proposal-path check (`ConsensusEngine::verify_header_qc`)
+before `newPayload`; the first failure ends the batch and the peer is not asked again for the
+gap (`H2Service::check_pulled_block`). A pulled block is head only in both settlement modes.
+No knob. gov5 comparison in `docs/N42_26_PORT.md` "Certificates on pulled blocks".
 
 ### 6.7 Lint baseline
 
@@ -361,3 +413,114 @@ ingest `6c24a6299`, qmdb `68677f00a`, h2 `971671bf8`.
 - `3f241ae6f` fix(h2-node): disconnect a peer whose status names another chain
 - `c74099d10` fix(h2-node): bound and age out awaited and held body bookkeeping
 - `971671bf8` test(h2-node): tolerate the real status a paired peer queued before the mismatch
+
+## 8. Design-item integration record (2026-10-27)
+
+Branch `design/integration-2026-10` = main `7b730e65d` + the five item branches (6.1 `design/knob-profile`,
+6.5 `design/fatal-local-faults`, 6.6 `design/range-pull-qc`, 6.3 `design/qmdb-durability`,
+6.4 `perf/road-bounds`; the only merge conflict was `Cargo.lock`) + `4e43be3ac`, which reads the items'
+new knobs through `n42_env`. `design/integration-2026-10-next` adds the 6.1 completion
+(`design/knob-profile-x22`) and 6.2 stage 0 (`design/qmdb-entry-metrics`, section 6.2 and
+`docs/QMDB_COMPACTION_DESIGN.md` 3.7 / 5).
+
+### 8.1 Verification of `4e43be3ac`
+
+- `cargo check --workspace --tests`: clean. `cargo test --no-fail-fast` of the thirteen crates of
+  section 7.1 plus `n42-env` and `n42-testing` (58 test binaries) and
+  `cargo test -p reth-provider --lib n42_persist` (the 6.3 refusal test in both orders): all green
+  (2026-10-27 09:37-12:56 UTC).
+- Fleet7 control pair (loop351 stage fl, X22 configuration, 600M replay set, the integration tree's
+  native binaries against the X22 record binaries of main `47b8180ab`, alternating, after a warm leg):
+
+  | leg | binaries | window 1 | round (3 windows) |
+  |---|---|---|---|
+  | AUa | integration | 4,966,667 tx/s | 461.0M |
+  | AU1 | main | 5,086,667 tx/s | 463.0M |
+  | AUb | integration | 5,073,333 tx/s | 460.0M |
+  | AU1b | main | 5,080,000 tx/s | 459.8M |
+
+  Round totals within 0.3%, window 1 within the single-round spread (section 7.1's 10% rule): no
+  regression from the five items with their knobs at defaults (`N42_ROAD_TAKEN_BOUND` and
+  `N42_ROAD_RETIRE_INDEX` off; 6.3's settle wait and fatal canonical errors on; 6.5 and 6.6 on).
+  Gates on every leg: `invalid_blocks=0 gas_mismatch=0 fields_mismatches=0 own_not_committed=0`.
+- Devnet, the three shapes of section 7.1 on the integration binaries (14:02-14:24 UTC): gov5late
+  head 160 identical on reth and gov5; late member synced 0 -> 8 -> 16 -> 19 and holds the main head
+  at 121; absent member away at 52, range pull to 60, catch-up to 82, first commit at view 98, same
+  head as main at 185 (`main=back=reth=gov5`). Every execution layer `errors=0`.
+- `cargo clippy --workspace --lib --bins --examples`: 0 errors, 1,504 warnings against the 1,497 of
+  section 6.7. The seven new ones are style lints in the items' code (`collapsible_if` in
+  `h2-node/src/service.rs`, `qmdb-reth/src/node_state.rs` and `state_reader.rs`; one
+  `match_same_arms` and one `use_self` in `node_state.rs`; one `use_self` in `tx-queue/src/road.rs`;
+  one `doc_markdown` in `service.rs`), to be cleared with the per-crate `-D warnings` step.
+- Pending at the time of writing, run automatically after the above: the 6.3 field check (`fleet7.sh
+  up --fresh` on the integration binaries at 200 tx/s, `roll 1/2/3 --kill`, the forest's recovery
+  and fault lines) and the 6.4 bench pairs (loop351 stage fm: `N42_ROAD_TAKEN_BOUND=1
+  N42_ROAD_RETIRE_INDEX=1` against the X22 control, two alternating pairs). Results in 8.2.
+
+### 8.2 Field check and bench pairs (2026-10-27, after 8.1)
+
+- **6.3 field check, `roll --kill` on the integration binaries** (fleet7 lean profile, heap forest, 200 tx/s;
+  14:35-14:43 UTC): rolls 2 and 3 came back (forest restored at block 92, kills at heights 112 and 126, no
+  fault line). **Roll 1 failed**: node1 was killed at block 28 with MDBX still at genesis (every stage
+  checkpoint 0); the forest's checkpoint stood at block 1 with deltas through 28, and the restart refused
+  it: `QMDB snapshot is at block 1 (…) but the database head is block 0 (…); the forest cannot be rebuilt
+  from execution state`. Two defects: (a) the genesis-seeded forest writes no checkpoint, the first head
+  move checkpoints at block 1, so a replay can never stop at genesis (both storage modes); (b) MDBX
+  persisted nothing in 28 blocks / 85 s although reth's threshold persistence (2 blocks in the lean
+  profile) should have run, and the other kills show a persisted head 20-34 blocks behind (node4, stopped
+  gracefully, persisted its head 141). (b) is reth v2.8.1's new defaults: `DEFAULT_PERSISTENCE_THRESHOLD`
+  50 and `DEFAULT_MEMORY_BLOCK_BUFFER_TARGET` 5 (2 and 2 before), and only the bench profile of
+  `scripts/fleet7-env.sh` passes the flags (8 and 6). A probe (`audit-notes/scripts/persist-probe.sh`,
+  node1 sampled every 2 s at 200 tx/s) shows it: persisted 0 while the in-memory count grew to 46, then
+  one batch at height 51 persisted blocks 1-46, then the count grew again (32 at height 78). So a SIGKILL
+  inside the first 50 blocks lands MDBX on genesis, and every later kill costs up to 50 blocks of
+  re-execution. Fixes on `design/integration-2026-10-next`: the forest writes its genesis checkpoint when
+  it is seeded (a), and on a QMDB chain the node lowers the two defaults to 8 and 6 unless the operator
+  set them, next to the existing state-masking override (b). The check must be rerun on the fixed
+  binaries with a kill before the first persistence, and in the X22 configuration
+  (`N42_QMDB_ENTRY_FILE=1`), which is what production runs; the lean profile keeps the forest on the heap.
+  The second reth bump in a row to change a persistence default under the QMDB chain (2.7.0: state
+  masking blocks 30), so the bump checklist in `docs/RETH_2_8_1_UPGRADE.md` now names both constants.
+- **Rerun on the fixed binaries (07f1fbdf6, 17:00-17:12 UTC), entry-file mode (`N42_QMDB_ENTRY_FILE=1`,
+  what production runs), first kill 20 s after the start:** node1 killed at height 5 with MDBX still at
+  genesis came back from the genesis checkpoint and committed again (height 7); node2 killed at 27
+  restored its forest at 21 and node3 killed at 48 at 42 (the persisted head now trails by the buffer
+  target of 6, not by up to 50); after 360 s all seven members stood at height 116 with one head hash, no
+  fault line. The 6.3 field check passes. A first rerun with `N42_PROFILE=x22` was void: every execution
+  layer refused to start because the profile sets `N42_FRAME_BLOCKS=1` and the fleet7 genesis has no
+  `frameBlocks` (only the bench genesis files do) -- a 6.1 defect, fixed by gating profile knobs on the
+  genesis features they need (branch `design/profile-chain-gate`).
+- Remaining recovery hole found while fixing (a): in entry-file mode a compaction could move `forest.ckpt`
+  past the MDBX head with no archive, so a restart below it failed; the fold now keeps the pre-fold
+  checkpoint and segment as an archive the restart can replay (281a656c8, `docs/OPERATOR_FAULTS.md` 3).
+- **6.4 bench pairs** (loop351 stage fm, X22 configuration, 600M replay set, integration binaries, warm leg
+  then two alternating pairs; 14:51-15:17 UTC):
+
+  | leg | `N42_ROAD_TAKEN_BOUND` + `N42_ROAD_RETIRE_INDEX` | window 1 | round (3 windows) |
+  |---|---|---|---|
+  | RBa | on | 5,033,333 tx/s | 459.6M |
+  | RB0 | off | 5,071,067 tx/s | 454.1M |
+  | RBb | on | 5,085,083 tx/s | 457.4M |
+  | RB0b | off | 5,040,000 tx/s | 452.9M |
+
+  On: 5.03/5.09, 459.6/457.4M; off: 5.07/5.04, 454.1/452.9M. Within the single-round spread either way,
+  so the bound and the index cost nothing measurable, and they are adopted (on by default). Gates clean on
+  every leg. RBb reported `rename_fallbacks_total=2276` (the early rename of the fields-at-seal path fell
+  back to the parent's `Complete` on nearly every build); the counter is reported, not gated, and the same
+  per-leg mode appears in 11 of 417 loop351 legs since stage dy, independent of these knobs.
+
+### 8.3 Final verification of `a455702d8` (2026-10-27 17:36-18:14 UTC)
+
+The branch head that lands on main: `design/integration-2026-10-next` = the five items + 6.1 completion
+and chain gating + 6.2 stage 0 + 6.4 adopted + the three recovery fixes (genesis checkpoint, QMDB-chain
+persistence defaults 8/6, entry-file fold archive) + the validator's persistence-lag log.
+
+- `cargo test --no-fail-fast` of n42-env, n42-tx-queue, n42-qmdb-reth, n42-h2-el-rpc, reth-node-builder,
+  n42-twig-core, n42-qmdb-state: rc 0. `cargo check -p n42 -p n42-h2-node --tests --examples`: rc 0.
+  Native fleet binaries built.
+- `N42_PROFILE=x22` on the fleet7 genesis (no `frameBlocks`): the fleet produces blocks (height 25 at
+  90 s) and the twelve frame knobs are withdrawn with one stderr line; MDBX follows at the lowered
+  defaults (persisted 18 at height 25).
+- `roll --kill` in entry-file mode, first kill at height 6 before any MDBX persistence: node1 restored
+  from the genesis checkpoint and committed again (height 8); node2 killed at 28 restored at 21, node3
+  killed at 49 at 42; all seven members at height 117 with one head hash after 360 s, no fault line.

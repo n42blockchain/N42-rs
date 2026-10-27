@@ -350,7 +350,7 @@ fn apply_recovery_nice_linux() {
 #[cfg(target_os = "linux")]
 fn recovery_pin() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| std::env::var("N42_TX_INGEST_RECOVER_PIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    *MODE.get_or_init(|| n42_env::parse("N42_TX_INGEST_RECOVER_PIN", 0))
 }
 
 #[cfg(target_os = "linux")]
@@ -453,7 +453,7 @@ const GATE_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 /// `N42_TX_INGEST_DIRECT`, read once.
 fn direct_to_queue() -> bool {
     static DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DIRECT.get_or_init(|| std::env::var("N42_TX_INGEST_DIRECT").is_ok())
+    *DIRECT.get_or_init(|| n42_env::flag("N42_TX_INGEST_DIRECT", false))
 }
 
 /// What the gate sees at one instant: whether it is open, the depth it
@@ -543,10 +543,7 @@ const GATE_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 fn gate_max_wait() -> Option<std::time::Duration> {
     static MAX: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
-        let ms = std::env::var("N42_TX_INGEST_GATE_MAX_WAIT_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(15_000);
+        let ms = n42_env::parse::<u64>("N42_TX_INGEST_GATE_MAX_WAIT_MS", 15_000);
         (ms > 0).then(|| std::time::Duration::from_millis(ms))
     })
 }
@@ -860,7 +857,7 @@ fn spawn_gate_watcher<P>(
 /// `N42_TX_INGEST_UNBUFFERED`, read once.
 fn unbuffered_reads() -> bool {
     static UNBUFFERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *UNBUFFERED.get_or_init(|| std::env::var("N42_TX_INGEST_UNBUFFERED").is_ok())
+    *UNBUFFERED.get_or_init(|| n42_env::flag("N42_TX_INGEST_UNBUFFERED", false))
 }
 
 /// What the gate and the frame's answer report as the node's depth.
@@ -888,10 +885,7 @@ where
 }
 
 fn high_water() -> usize {
-    std::env::var("N42_TX_INGEST_HIGH_WATER")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(90_000)
+    n42_env::parse("N42_TX_INGEST_HIGH_WATER", 90_000)
 }
 
 /// Serves the ingest protocol on `addr` until the process ends.
@@ -1088,6 +1082,7 @@ fn spawn_stats_reporter() {
                         refused_gap = d(road.refused_gap, last_road.refused_gap),
                         refused_no_frame = d(road.refused_no_frame, last_road.refused_no_frame),
                         refused_dup_sender = d(road.refused_dup_sender, last_road.refused_dup_sender),
+                        refused_oversize = d(road.refused_oversize, last_road.refused_oversize),
                         flushes = d(road.flushes, last_road.flushes),
                         flushes_stuck = d(road.flushes_stuck, last_road.flushes_stuck),
                         debt_sweeps = d(road.debt_sweeps, last_road.debt_sweeps),
@@ -1102,7 +1097,8 @@ fn spawn_stats_reporter() {
                         road_handed_back = d(road.handed_back, last_road.handed_back),
                         road_retired = d(road.retired, last_road.retired),
                         road_evicted = d(road.evicted, last_road.evicted),
-                        road_taken_live = road.taken.saturating_sub(road.handed_back + road.retired + road.evicted),
+                        road_bounded = d(road.bounded, last_road.bounded),
+                        road_taken_live = road.taken_frames,
                         "frame road"
                     );
                     last_road = road;
@@ -1117,10 +1113,7 @@ fn spawn_stats_reporter() {
 /// `N42_TX_INGEST_BLOCK_TXS`; the allowance the gate grants per block the
 /// pool has yet to hear of. Zero (the default) is the old gate.
 fn block_txs_allowance() -> u64 {
-    std::env::var("N42_TX_INGEST_BLOCK_TXS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0)
+    n42_env::parse("N42_TX_INGEST_BLOCK_TXS", 0)
 }
 
 /// Where a frame's recovery takes its slot.
@@ -1177,7 +1170,7 @@ impl<T: PoolTransaction + 'static> Setup<T> {
         Self {
             queue: n42_tx_queue::global::<T>(),
             direct: direct_to_queue(),
-            asynchronous: std::env::var("N42_TX_INGEST_ASYNC").is_ok(),
+            asynchronous: n42_env::flag("N42_TX_INGEST_ASYNC", false),
             gate: high_water(),
             allowance: block_txs_allowance(),
             slots,

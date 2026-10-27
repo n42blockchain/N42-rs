@@ -29,6 +29,13 @@ use tracing::{debug, error, info, warn};
 const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
 fn main() {
+    // `N42_PROFILE=x22`: the adopted knob set, for every knob the operator
+    // left unset. First, before any knob is read (they are cached in
+    // `OnceLock`s at first use) and before any thread exists.
+    // SAFETY: the first statement of `main`: no thread this program starts
+    // exists yet, and nothing else reads or writes the environment
+    // concurrently (the allocator read its configuration before `main`).
+    unsafe { n42_env::profile::apply_or_exit("n42") };
     // Enable backtraces unless a RUST_BACKTRACE value has already been
     // explicitly provided. First, before this process spawns any thread or
     // moves the allocator's (`n42_core_layout::init` below).
@@ -39,6 +46,22 @@ fn main() {
         // configuration once, at its own initialisation, before `main`).
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
+    // The command line, chain spec included (clap runs the chain parser
+    // here), before any knob of the profile is read: the knobs a profile set
+    // that need a genesis feature this chain lacks (`frameBlocks`) are
+    // withdrawn again, so the profile never forces a chain feature. A
+    // command without a chain withdraws them too. An operator's own
+    // `N42_FRAME_BLOCKS=1` is left for `frame_blocks::init` to refuse.
+    let cli = Cli::<N42ChainSpecParser>::parse();
+    let features = n42_env::profile::ChainFeatures {
+        frame_blocks: cli
+            .command
+            .chain_spec()
+            .is_some_and(|spec| reth_chainspec::qmdb::frame_blocks_enabled(&spec.genesis)),
+    };
+    // SAFETY: still single-threaded: parsing the command line spawns no
+    // thread, and nothing else reads or writes the environment.
+    unsafe { n42_env::profile::reconcile_and_report("n42", features) };
     // `N42_INGEST_VERIFY=shard` without a well-formed `N42_INGEST_SHARD=<i>/<n>`
     // would silently verify everything (or nothing); refuse to start instead.
     let ingest_mode = match n42_tx_types::ingest_verify_mode() {
@@ -59,7 +82,7 @@ fn main() {
     }
     let trusting_knobs = n42_tx_types::trusting_ingest_knobs(
         ingest_mode,
-        std::env::var_os("N42_TX_INGEST_DIRECT").is_some(),
+        n42_env::flag("N42_TX_INGEST_DIRECT", false),
         std::env::var_os("N42_FRAME_GATEWAYS").is_some(),
     );
     // `N42_CORE_LAYOUT=isolate`: split the node's affinity mask into the
@@ -108,7 +131,7 @@ fn main() {
     let consensus_holder_clone = consensus_holder.clone();
 
     if let Err(err) =
-        Cli::<N42ChainSpecParser>::parse().run(async move |builder, _extra_args| {
+        cli.run(async move |builder, _extra_args| {
             info!(target: "reth::cli", "Launching node");
             for knob in &trusting_knobs {
                 warn!(target: "reth::cli", knob = *knob, "trusting ingest mode accepted: this node admits transactions on a frame's word (benchmark only)");
@@ -278,7 +301,10 @@ fn main() {
                         if n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(node.provider.chain_spec().genesis()).is_ok() {
                             qmdb.set_refuse_stale_builds(true);
                         }
-                        // `N42_QMDB_READS=verify|on`: the read view answers or checks the
+                        // The QMDB state is registered as the state reader on every QMDB
+                        // node: its persistence hook makes the delta log durable through a
+                        // batch before the database commits it (`N42_QMDB_SETTLE_WAIT_MS`).
+                        // `N42_QMDB_READS=verify|on`: the read view also answers or checks the
                         // providers' latest-state reads (docs/QMDB_UPGRADE_PLAN.md, stage 6).
                         if n42_qmdb_reth::register_state_reader(qmdb) {
                             info!(target: "reth::cli", "QMDB read view registered as the state reader");
@@ -330,6 +356,19 @@ fn main() {
                                     }
                                     let tip = notification.tip().hash();
                                     if let Err(error) = follower.on_canonical(tip) {
+                                        // A notification the log cannot follow leaves it unable to
+                                        // track the chain: stop rather than run on a log that a
+                                        // restart would refuse (`N42_QMDB_CANONICAL_FATAL=0` keeps
+                                        // the old log-and-continue). I/O on the log is retried by
+                                        // the next head and stays a log line.
+                                        if n42_qmdb_reth::canonical_fatal() && follower.is_fatal_canonical_error(&error, tip) {
+                                            error!(
+                                                target: "reth::cli",
+                                                %error, block_hash = %tip,
+                                                "QMDB head cannot follow the canonical chain; exiting (N42_QMDB_CANONICAL_FATAL=0 continues)"
+                                            );
+                                            std::process::exit(1);
+                                        }
                                         error!(target: "reth::cli", %error, "QMDB head could not follow the canonical chain");
                                     }
                                 }
@@ -493,11 +532,21 @@ fn main() {
             // that was not checked against the root recorded for its head. Both
             // are sticky for the run; each is logged once, at error level, when
             // it first turns 1. A chain without QMDB exports neither.
+            //
+            // The entry store's growth (`docs/QMDB_COMPACTION_DESIGN.md` 3.7):
+            // the entry file's bytes, its slots in all and still live, the
+            // offsets' and the key index's heap, the file's sealed chunks, and
+            // `n42_qmdb_entry_bytes_per_live_slot`, logged once at warn level
+            // when it passes `N42_QMDB_ENTRY_BYTES_PER_LIVE_ALARM` (default
+            // 2000, 0 disables). A tick that finds the forest lock held skips
+            // these gauges rather than wait.
             if let Some(qmdb) = qmdb_for_startup.clone() {
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
                     let mut poisoned_seen = false;
                     let mut unchecked_seen = false;
+                    let bytes_per_live_alarm: u64 = n42_env::parse("N42_QMDB_ENTRY_BYTES_PER_LIVE_ALARM", 2000);
+                    let mut bytes_per_live_warned = false;
                     loop {
                         tick.tick().await;
                         // `poisoned()` answers None while the forest lock is held,
@@ -516,9 +565,47 @@ fn main() {
                         }
                         metrics::gauge!("n42_qmdb_forest_poisoned").set(if poisoned_seen { 1.0 } else { 0.0 });
                         metrics::gauge!("n42_qmdb_unchecked_restart").set(if unchecked_seen { 1.0 } else { 0.0 });
+                        if let Some(stats) = qmdb.entry_stats() {
+                            let per_live = stats.bytes_per_live_slot();
+                            metrics::gauge!("n42_qmdb_entry_file_bytes").set(stats.file_bytes as f64);
+                            metrics::gauge!("n42_qmdb_entry_total_slots").set(stats.total_slots as f64);
+                            metrics::gauge!("n42_qmdb_entry_live_slots").set(stats.live_slots as f64);
+                            metrics::gauge!("n42_qmdb_offsets_bytes").set(stats.offsets_bytes as f64);
+                            metrics::gauge!("n42_qmdb_index_bytes").set(stats.index_bytes as f64);
+                            metrics::gauge!("n42_qmdb_entry_chunks").set(stats.chunks as f64);
+                            metrics::gauge!("n42_qmdb_entry_bytes_per_live_slot").set(per_live as f64);
+                            if bytes_per_live_alarm > 0 && per_live > bytes_per_live_alarm && !bytes_per_live_warned {
+                                bytes_per_live_warned = true;
+                                warn!(
+                                    target: "n42.qmdb",
+                                    per_live,
+                                    alarm = bytes_per_live_alarm,
+                                    file_bytes = stats.file_bytes,
+                                    live_slots = stats.live_slots,
+                                    total_slots = stats.total_slots,
+                                    "the QMDB entry store holds more bytes per live slot than N42_QMDB_ENTRY_BYTES_PER_LIVE_ALARM; it grows with the append history (docs/QMDB_COMPACTION_DESIGN.md)",
+                                );
+                            }
+                        }
                     }
                 });
             }
+
+            // The frame road's bounds (`docs/MATURITY_HARDENING_2026_10.md` 6.4):
+            // `n42_road_taken_frames` is how many taken frames the road still
+            // remembers (bounded by `N42_ROAD_TAKEN_BOUND=1`, else by
+            // `N42_ROAD_TAKEN_MAX`), `n42_road_oversize_frames_total` the frames
+            // refused for a gas above the block gas limit. Both read 0 while
+            // the road is off.
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    tick.tick().await;
+                    let road = n42_tx_queue::road_stats().unwrap_or_default();
+                    metrics::gauge!("n42_road_taken_frames").set(road.taken_frames as f64);
+                    metrics::counter!("n42_road_oversize_frames_total").absolute(road.refused_oversize);
+                }
+            });
 
             // A chained build that waits for an ancestor to reach the engine is
             // woken by the canonical chain's changes instead of polling, and the
@@ -572,7 +659,7 @@ fn main() {
                         let engine = node.add_ons_handle.beacon_engine_handle.clone();
                         // Our own sealed blocks go in with the build's execution
                         // rather than being executed again; see payload_serve.
-                        let reuse = (std::env::var("N42_NO_OWN_BLOCK_REUSE").is_err()).then(|| {
+                        let reuse = (!n42_env::flag("N42_NO_OWN_BLOCK_REUSE", false)).then(|| {
                             let chain_spec = node.chain_spec();
                             let profile = n42_engine_types::engine_validator::header_profile_for(&chain_spec);
                             n42::payload_serve::OwnBlockReuse {
@@ -591,7 +678,7 @@ fn main() {
                                 // same per-transaction removal the pool's own maintenance
                                 // pays later -- so doing it on the import path moves the
                                 // cost onto the critical path rather than removing it.
-                                import_foreign: (std::env::var("N42_FOLLOWER_DIRECT_IMPORT").is_ok()).then(|| {
+                                import_foreign: n42_env::flag("N42_FOLLOWER_DIRECT_IMPORT", false).then(|| {
                                     let provider = node.provider.clone();
                                     let evm_config = node.evm_config.clone();
                                     let senders_cache = node.evm_config.sender_recovery_cache.clone();
@@ -605,7 +692,7 @@ fn main() {
                                         )
                                     }) as std::sync::Arc<n42::payload_serve::ForeignImport>
                                 }),
-                                exec_probe: (std::env::var("N42_FOLLOWER_EXEC_PROBE").is_ok()).then(|| {
+                                exec_probe: n42_env::flag("N42_FOLLOWER_EXEC_PROBE", false).then(|| {
                                     let provider = node.provider.clone();
                                     let evm_config = node.evm_config.clone();
                                     std::sync::Arc::new(move |block: reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>| {
@@ -620,7 +707,7 @@ fn main() {
                                         Ok((started.elapsed().as_millis() as u64, out.gas_used, out.receipts.len()))
                                     }) as std::sync::Arc<dyn Fn(reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>) -> Result<(u64, u64, usize), String> + Send + Sync>
                                 }),
-                                prune_pool: (std::env::var("N42_PRUNE_POOL_ON_IMPORT").is_ok()).then(|| {
+                                prune_pool: n42_env::flag("N42_PRUNE_POOL_ON_IMPORT", false).then(|| {
                                     let pool = node.pool.clone();
                                     std::sync::Arc::new(move |hashes: Vec<alloy_primitives::B256>| {
                                         let _ = reth_transaction_pool::TransactionPool::remove_transactions(&pool, hashes);
@@ -686,9 +773,9 @@ fn main() {
             // The builder-side transaction queue, beside the pool. See
             // n42_tx_queue. Fed by the ingest, drained by the builder, pruned
             // here by every canonical block on every node.
-            if std::env::var("N42_TX_QUEUE").is_ok() {
+            if n42_env::flag("N42_TX_QUEUE", false) {
                 let queue: n42_tx_queue::TxQueue<n42_engine_types::N42PooledTransaction> = n42_tx_queue::TxQueue::new();
-                if std::env::var("N42_TX_QUEUE_DRAINER").is_ok() && queue.wants_drainer_thread() {
+                if n42_env::flag("N42_TX_QUEUE_DRAINER", false) && queue.wants_drainer_thread() {
                     // N42_QUEUE_OFFLOCK: a thread of its own, woken early by a
                     // deep inbox; while it runs the block path's holds drain
                     // only a bounded slice. See TxQueue::run_drainer.
@@ -699,7 +786,7 @@ fn main() {
                     {
                         tracing::warn!(target: "reth::cli", %err, "could not start the queue's drainer thread");
                     }
-                } else if std::env::var("N42_TX_QUEUE_DRAINER").is_ok() {
+                } else if n42_env::flag("N42_TX_QUEUE_DRAINER", false) {
                     // The inbox drained off the builder's thread; see TxQueue::drain_now.
                     let drained = queue.clone();
                     tokio::spawn(async move {

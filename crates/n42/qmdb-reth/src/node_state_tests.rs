@@ -37,7 +37,7 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// The snapshot a node wrote at its first canonical block.
+/// The checkpoint a node seeded at genesis wrote (one block applied after it).
 fn first_snapshot(name: &str) -> ForestSnapshot {
     let (state, _, _, _, _) = node_at(name, false, 1);
     read_snapshot(&state.snapshot_path()).expect("read").expect("the first checkpoint")
@@ -112,6 +112,36 @@ fn a_portable_snapshot_started_node_continues_to_the_same_roots_in_both_storage_
         let (_, source_root) = advance(&source, 4, head);
         let (_, target_root) = advance(&target, 4, head);
         assert_eq!(source_root, target_root, "entry_file={entry_file}");
+    }
+}
+
+#[test]
+fn the_node_state_exposes_the_entry_store_stats_without_waiting_for_the_lock() {
+    use n42_twig_core::entry_store::EntryStoreMode;
+    for entry_file in [false, true] {
+        let chain = qmdb_chain();
+        let unstarted = QmdbNodeState::new_with_entry_file(chain, scratch(&format!("stats-none-{entry_file}")), entry_file);
+        assert_eq!(unstarted.entry_stats(), None, "nothing before initialisation");
+
+        let (state, _, dir, head, _) = node_at(&format!("stats-{entry_file}"), entry_file, 3);
+        let stats = state.entry_stats().expect("the lock is free");
+        let forest_stats = {
+            let guard = state.lock_as("checkpoint");
+            // Held, here by this thread: the accessor answers at once.
+            assert_eq!(state.entry_stats(), None, "a held lock is skipped, not waited for");
+            let forest = guard.as_ref().expect("initialised");
+            forest.entry_stats()
+        };
+        assert_eq!(stats, forest_stats);
+        assert_eq!(stats.mode, if entry_file { EntryStoreMode::File } else { EntryStoreMode::Heap });
+        assert!(stats.live_slots > 0 && stats.live_slots <= stats.total_slots);
+        assert!(stats.index_bytes > 0 && stats.file_bytes > 0);
+        // Every block rewrites account 7: one more slot, no more live keys.
+        advance(&state, 4, head);
+        let after = state.entry_stats().expect("the lock is free");
+        assert!(after.total_slots > stats.total_slots);
+        assert!(after.file_bytes > stats.file_bytes || !entry_file);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -413,6 +443,131 @@ fn a_compaction_folds_the_sealed_segment_into_a_new_checkpoint_in_both_storage_m
     }
 }
 
+/// A node that followed blocks 1..=12 with a fold at block 10 in between:
+/// the log is sealed at 10, blocks 11 and 12 go to the fresh log, and the
+/// compaction then writes the checkpoint at 10, as a background fold does
+/// while the forest runs on. Returns the dropped node's directory and the
+/// roots of blocks 0..=12.
+fn folded_at_ten(name: &str, entry_file: bool) -> (Arc<ChainSpec>, PathBuf, Vec<B256>) {
+    let (state, chain, dir, mut head, _) = node_at(name, entry_file, 10);
+    seal_the_log(&state);
+    for number in 11..=12 {
+        (head, _) = advance(&state, number, head);
+    }
+    state.compact((10, hash_of(10)));
+    assert!(!state.sealed_log_path().exists(), "entry_file={entry_file}: the fold completed");
+    let checkpoint_number = if entry_file {
+        read_ckpt(&state.ckpt_path()).expect("read").expect("a checkpoint").head_number
+    } else {
+        read_snapshot(&state.snapshot_path()).expect("read").expect("a checkpoint").head_number
+    };
+    assert_eq!(checkpoint_number, 10, "entry_file={entry_file}: the checkpoint is past blocks the database may lack");
+    let mut roots = vec![chain.genesis_header.state_root];
+    roots.extend((1..=12).map(|number| state.root_of(&hash_of(number)).expect("root")));
+    drop(state);
+    (chain, dir, roots)
+}
+
+/// The names of the fold archives under `dir`, sorted.
+fn fold_archives(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = match std::fs::read_dir(dir.join("recovery-archive")) {
+        Ok(entries) => entries.map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned()).collect(),
+        Err(_) => Vec::new(),
+    };
+    names.retain(|name| name.starts_with("fold-"));
+    names.sort();
+    names
+}
+
+/// A SIGKILL after a fold but before the database reached the fold head:
+/// the restart at the database's head comes from the fold's archive, and
+/// the node then follows the blocks again and restarts at the new head.
+#[test]
+fn a_restart_below_a_fold_head_restores_from_the_fold_archive_in_both_storage_modes() {
+    for entry_file in [false, true] {
+        let (chain, dir, roots) = folded_at_ten(&format!("fold-archive-below-{entry_file}"), entry_file);
+        let archives = fold_archives(&dir);
+        assert_eq!(archives.len(), 1, "entry_file={entry_file}: {archives:?}");
+        assert!(archives[0].starts_with(&format!("fold-{:020}-{:x}-", 10, hash_of(10))), "{archives:?}");
+        if entry_file {
+            let archive = dir.join("recovery-archive").join(&archives[0]);
+            assert!(archive.join("forest.ckpt").exists() && archive.join("forest.log").exists(), "the replaced checkpoint and the folded segment");
+        }
+
+        let restarted = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        restarted.initialize((7, hash_of(7))).expect("a database head below the fold head");
+        assert_eq!(restarted.head(), Some((7, hash_of(7))));
+        assert_eq!(restarted.state_root(), roots[7], "entry_file={entry_file}");
+        let mut head = hash_of(7);
+        for number in 8..=12 {
+            let (hash, root) = advance(&restarted, number, head);
+            assert_eq!(root, roots[number as usize], "entry_file={entry_file}: block {number} again");
+            head = hash;
+        }
+        drop(restarted);
+
+        let at_twelve = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        at_twelve.initialize((12, hash_of(12))).expect("the head reached again");
+        assert_eq!(at_twelve.state_root(), roots[12], "entry_file={entry_file}");
+        drop(at_twelve);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// At or past the fold head no archive is needed: the live checkpoint and
+/// log serve the restart.
+#[test]
+fn a_restart_at_or_past_a_fold_head_needs_no_archive_in_both_storage_modes() {
+    for entry_file in [false, true] {
+        let (chain, dir, roots) = folded_at_ten(&format!("fold-archive-at-{entry_file}"), entry_file);
+        let _ = std::fs::remove_dir_all(dir.join("recovery-archive"));
+        let at_twelve = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        at_twelve.initialize((12, hash_of(12))).expect("past the fold head");
+        assert_eq!(at_twelve.state_root(), roots[12], "entry_file={entry_file}");
+        drop(at_twelve);
+        let at_ten = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        at_ten.initialize((10, hash_of(10))).expect("at the fold head");
+        assert_eq!(at_ten.state_root(), roots[10], "entry_file={entry_file}");
+        drop(at_ten);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A fold archive retires at a later fold once the database's durable head
+/// has passed its fold head (and the fold head's child, which may still
+/// need the parent), never before; without it a restart below the fold
+/// head is refused as it was before archives existed.
+#[test]
+fn a_fold_archive_retires_once_the_durable_head_passes_its_fold_head() {
+    for entry_file in [false, true] {
+        let (state, chain, dir, mut head, _) = node_at(&format!("fold-archive-retire-{entry_file}"), entry_file, 10);
+        seal_the_log(&state);
+        for number in 11..=14 {
+            (head, _) = advance(&state, number, head);
+        }
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(11));
+        let boundary = durable.clone();
+        state.set_durable_head_reader(move || Some(boundary.load(std::sync::atomic::Ordering::Relaxed)));
+        state.compact((10, hash_of(10)));
+        assert_eq!(fold_archives(&dir).len(), 1, "entry_file={entry_file}: durable at 11 keeps the fold at 10");
+
+        seal_the_log(&state);
+        durable.store(12, std::sync::atomic::Ordering::Relaxed);
+        state.compact((14, head));
+        let archives = fold_archives(&dir);
+        assert_eq!(archives.len(), 1, "entry_file={entry_file}: {archives:?}");
+        assert!(archives[0].starts_with(&format!("fold-{:020}-", 14)), "the fold at 10 retired, the one at 14 kept: {archives:?}");
+        drop(state);
+
+        // The retired archive was the only way back to block 7.
+        let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        let err = restarted.initialize((7, hash_of(7))).expect_err("nothing reaches block 7 any more");
+        assert!(matches!(err, NodeStateError::SnapshotMismatch { snapshot_number: 14, head_number: 7, .. }), "entry_file={entry_file}: {err}");
+        drop(restarted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[test]
 fn a_due_checkpoint_rotates_the_log_and_the_compaction_runs_behind() {
     let (state, chain, dir, head, root) = node_at("rotate-steps", false, 4);
@@ -467,7 +622,7 @@ fn a_due_checkpoint_rotates_the_log_and_the_compaction_runs_behind() {
 fn an_unreachable_checkpoint_directory_surfaces_as_an_io_error_not_a_panic() {
     let (state, _, dir, _, _) = node_at("io-fail", false, 2);
     let snapshot = read_snapshot(&state.snapshot_path()).expect("read").expect("the node persisted a snapshot");
-    assert_eq!(snapshot.head_hash, hash_of(1), "the checkpoint was written at the first canonical block");
+    assert_eq!(snapshot.head_number, 0, "the checkpoint was written when the genesis forest was seeded");
     // A file where the checkpoint's directory should be: it cannot be created.
     let blocker = dir.join("blocked");
     std::fs::write(&blocker, b"a file where a directory should be").expect("blocker");
@@ -1119,6 +1274,84 @@ fn a_delta_log_ending_before_the_database_head_is_refused() {
     }
 }
 
+/// A node killed before the database's first persistence restarts with the
+/// database at genesis and the forest's log ahead of it (the forest settles
+/// canonical blocks first). The genesis checkpoint written at seeding lets the
+/// replay stop at genesis; the node then follows block 1 again, and a restart
+/// at any logged head still works.
+#[test]
+fn a_restart_at_genesis_under_a_log_that_ran_ahead_succeeds_in_both_storage_modes() {
+    for entry_file in [false, true] {
+        let name = format!("restart-genesis-ahead-{entry_file}");
+        let (state, chain, dir, _head, _root) = node_at(&name, entry_file, 5);
+        let root_3 = state.root_of(&hash_of(3)).expect("root of block 3");
+        drop(state);
+        let genesis = (0, chain.genesis_hash());
+        let genesis_root = chain.genesis_header.state_root;
+
+        let restarted = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        restarted.initialize(genesis).expect("the database at genesis under a log ahead of it");
+        assert_eq!(restarted.state_root(), genesis_root, "entry_file={entry_file}");
+        assert_eq!(restarted.unchecked_restart(), None, "the genesis root is recorded");
+        // The blocks past genesis arrive again and land on the same roots.
+        let mut head = chain.genesis_hash();
+        let mut root = genesis_root;
+        for number in 1..=5 {
+            (head, root) = advance(&restarted, number, head);
+            if number == 3 {
+                assert_eq!(root, root_3, "entry_file={entry_file}");
+            }
+        }
+        drop(restarted);
+
+        // The log written after the genesis restart serves a restart at a
+        // logged head, as before. (The log's own head first: in entry-file
+        // mode a restart drops the entries past its head, so a later restart
+        // cannot go forward again without the blocks.)
+        let at_five = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        at_five.initialize((5, head)).expect("the log's own head");
+        assert_eq!(at_five.state_root(), root, "entry_file={entry_file}");
+        drop(at_five);
+        let at_three = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        at_three.initialize((3, hash_of(3))).expect("a logged head");
+        assert_eq!(at_three.state_root(), root_3, "entry_file={entry_file}");
+        drop(at_three);
+
+        // And at genesis once more, after a second run ahead.
+        let again = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        again.initialize(genesis).expect("genesis again");
+        assert_eq!(again.state_root(), genesis_root, "entry_file={entry_file}");
+        drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The genesis seed leaves a checkpoint at genesis on disk, so the first
+/// canonical block is a delta rather than a rewrite of the tree.
+#[test]
+fn the_genesis_seed_writes_a_checkpoint_at_genesis_in_both_storage_modes() {
+    for entry_file in [false, true] {
+        let chain = qmdb_chain();
+        let dir = scratch(&format!("genesis-ckpt-{entry_file}"));
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        state.initialize((0, chain.genesis_hash())).expect("initialize");
+        let len = state.cursor().checkpoint_len;
+        assert_ne!(len, 0, "entry_file={entry_file}");
+        if entry_file {
+            let ckpt = read_ckpt(&state.ckpt_path()).expect("read").expect("a checkpoint");
+            assert_eq!((ckpt.head_number, ckpt.head_hash), (0, chain.genesis_hash()));
+        } else {
+            let snapshot = read_snapshot(&state.snapshot_path()).expect("read").expect("a checkpoint");
+            assert_eq!((snapshot.head_number, snapshot.head_hash), (0, chain.genesis_hash()));
+        }
+        advance(&state, 1, chain.genesis_hash());
+        assert_eq!(state.cursor().checkpoint_len, len, "block 1 is a delta");
+        assert!(state.cursor().log_len > 0, "entry_file={entry_file}");
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The same check in heap mode, over a corrupt snapshot's restored tree.
 #[test]
 fn a_heap_restart_checks_its_root_too() {
@@ -1159,5 +1392,123 @@ fn absent_roots_are_not_recorded_and_an_unreadable_record_is_skipped() {
     // (Which reason depends on how the file system sizes a directory.)
     assert!(restarted.unchecked_restart().is_some(), "an unchecked restart is flagged");
     drop(restarted);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// The persistence hook orders the delta log before the database's commit
+// ---------------------------------------------------------------------------
+
+/// The state reader's persistence hook with a `wait` deadline.
+fn hook(state: &QmdbNodeState, wait: std::time::Duration) -> crate::state_reader::QmdbStateReader {
+    crate::state_reader::QmdbStateReader::new(state.clone(), wait)
+}
+
+fn persisted(number: u64, hash: B256) -> Vec<alloy_eips::BlockNumHash> {
+    vec![alloy_eips::BlockNumHash::new(number, hash)]
+}
+
+/// The forest's head moved to block 4 but the log was never told (the
+/// catch-up had not run): the hook settles the log through the batch's last
+/// block before it returns, so a restart at the database's head works.
+#[test]
+fn the_persist_hook_settles_a_lagging_log_before_it_returns() {
+    use reth_storage_api::n42_state::N42StateReader;
+    for entry_file in [true, false] {
+        let name = format!("hook-settles-{entry_file}");
+        let (state, chain, dir, h3, _) = node_at(&name, entry_file, 3);
+        let prepared = state.compute(h3, &changes_for(4)).expect("compute");
+        let root = prepared.root;
+        let h4 = hash_of(4);
+        state.insert(h4, 4, prepared).expect("insert");
+        state.with_forest("test", |forest| forest.set_canonical(h4)).expect("head moved, log not told");
+        assert_eq!(state.cursor().head, h3, "the log lags the forest");
+
+        hook(&state, std::time::Duration::from_secs(5)).on_state_persisted_checked(&persisted(4, h4)).expect("settled");
+        assert_eq!(state.cursor().head, h4, "the log reached the batch's last block before the hook returned");
+        drop(state);
+        let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        restarted.initialize((4, h4)).expect("a restart at the database's head");
+        assert_eq!(restarted.state_root(), root);
+        drop(restarted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The canonical notification for the persisted block arrives while the
+/// hook waits: it returns once the log has followed it.
+#[test]
+fn the_persist_hook_waits_for_a_late_canonical_notification() {
+    use reth_storage_api::n42_state::N42StateReader;
+    let (state, _chain, dir, h3, _) = node_at("hook-waits", true, 3);
+    let prepared = state.compute(h3, &changes_for(4)).expect("compute");
+    let h4 = hash_of(4);
+    state.insert(h4, 4, prepared).expect("insert");
+    let follower = state.clone();
+    let late = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        follower.on_canonical(h4).expect("canonical 4");
+    });
+    hook(&state, std::time::Duration::from_secs(20)).on_state_persisted_checked(&persisted(4, h4)).expect("settled");
+    assert_eq!(state.cursor().head, h4);
+    late.join().expect("follower thread");
+    drop(state);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// No canonical notification for the persisted block ever arrives: past the
+/// deadline the batch is refused (the database does not commit it), and a
+/// database that committed it anyway is still refused at start-up.
+#[test]
+fn the_persist_hook_refuses_the_batch_past_its_deadline() {
+    use reth_storage_api::n42_state::N42StateReader;
+    for entry_file in [true, false] {
+        let name = format!("hook-deadline-{entry_file}");
+        let (state, chain, dir, _, _) = node_at(&name, entry_file, 3);
+        let wait = std::time::Duration::from_millis(50);
+        let err = state.settle_through(4, hash_of(4), wait).expect_err("the log cannot reach block 4");
+        assert!(
+            matches!(&err, NodeStateError::PersistUnsettled { number: 4, forest_head: Some(3), waited_ms, .. } if *waited_ms >= 50),
+            "{err}"
+        );
+        let refused = hook(&state, wait).on_state_persisted_checked(&persisted(4, hash_of(4))).expect_err("refused");
+        assert!(refused.to_string().contains("not settled through block 4"), "{refused}");
+        // A block the log already holds is settled at once, even without a wait.
+        state.settle_through(3, hash_of(3), std::time::Duration::ZERO).expect("block 3 is logged");
+        drop(state);
+        let ahead = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        let err = ahead.initialize((4, hash_of(4))).expect_err("the database is past the log");
+        assert!(matches!(err, NodeStateError::SnapshotMismatch { snapshot_number: 3, head_number: 4, .. }), "{err}");
+        drop(ahead);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// What `N42_QMDB_CANONICAL_FATAL` stops the node for, and what the next
+/// head retries.
+#[test]
+fn canonical_errors_split_into_fatal_and_retried() {
+    let (state, _chain, dir, _, _) = node_at("canonical-fatal", true, 1);
+    let unknown = B256::repeat_byte(0x99);
+    let err = state.on_canonical(unknown).expect_err("a head the forest does not hold");
+    assert!(state.is_fatal_canonical_error(&err, unknown), "{err}");
+    assert!(state.is_fatal_canonical_error(&NodeStateError::Poisoned("test".into()), unknown));
+    assert!(state.is_fatal_canonical_error(&NodeStateError::Uninitialised, unknown));
+    let io = NodeStateError::Io { path: PathBuf::from("forest.log"), source: std::io::Error::other("disk full") };
+    assert!(!state.is_fatal_canonical_error(&io, unknown), "a log I/O error is retried by the next head");
+    let entry = NodeStateError::State(StateError::EntryFile("short write".into()));
+    assert!(!state.is_fatal_canonical_error(&entry, unknown));
+    // An unknown head that a kept rename alias may still file is not fatal.
+    let missing = NodeStateError::State(StateError::UnknownBlock(unknown));
+    assert!(state.is_fatal_canonical_error(&missing, unknown));
+    state.keep_rename_alias(PendingRename { from: B256::repeat_byte(0x11), alternate: None, to: unknown, queued_at: std::time::Instant::now() });
+    assert!(!state.is_fatal_canonical_error(&missing, unknown));
+    if std::env::var_os("N42_QMDB_CANONICAL_FATAL").is_none() {
+        assert!(crate::node_state::canonical_fatal(), "fatal by default");
+    }
+    if std::env::var_os("N42_QMDB_SETTLE_WAIT_MS").is_none() {
+        assert_eq!(crate::node_state::settle_wait(), std::time::Duration::from_secs(30));
+    }
+    drop(state);
     let _ = std::fs::remove_dir_all(&dir);
 }

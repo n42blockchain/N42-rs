@@ -522,8 +522,8 @@ fn prune_lean_items(queue: &TxQueue<N42PooledTransaction>, items: &[FeedRef<'_>]
 pub fn min_fold() -> (usize, std::time::Duration) {
     static KNOB: std::sync::OnceLock<(usize, std::time::Duration)> = std::sync::OnceLock::new();
     *KNOB.get_or_init(|| {
-        let n = std::env::var("N42_PRUNE_MIN_FOLD").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
-        let ms = std::env::var("N42_PRUNE_MIN_FOLD_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(200);
+        let n = n42_env::parse::<usize>("N42_PRUNE_MIN_FOLD", 1).max(1);
+        let ms = n42_env::parse::<u64>("N42_PRUNE_MIN_FOLD_MS", 200);
         info!(target: "n42.tx_queue", min_fold = n, max_wait_ms = ms, "N42_PRUNE_MIN_FOLD");
         (n, std::time::Duration::from_millis(ms))
     })
@@ -539,7 +539,7 @@ pub fn min_fold() -> (usize, std::time::Duration) {
 pub fn max_fold() -> usize {
     static KNOB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *KNOB.get_or_init(|| {
-        let n = std::env::var("N42_PRUNE_MAX_FOLD").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        let n = n42_env::parse::<usize>("N42_PRUNE_MAX_FOLD", 0);
         if n > 0 {
             info!(target: "n42.tx_queue", max_fold = n, "N42_PRUNE_MAX_FOLD");
         }

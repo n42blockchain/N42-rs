@@ -799,6 +799,8 @@ pub struct ExecutionDriver<E> {
     commit_retry: Option<CommitRetry>,
     /// Commit forkchoices refused as Invalid since start (see `apply_commit`).
     commits_refused: u64,
+    /// The first commit forkchoice refused as Invalid, if any.
+    first_commit_refusal: Option<CommitRefusal>,
     /// The commit that goes next (see [`PendingCommit`]).
     commit_pending: Option<PendingCommit>,
     /// The order the driver first heard each block's commit in, so a commit
@@ -1029,6 +1031,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             commit_in_flight: None,
             commit_retry: None,
             commits_refused: 0,
+            first_commit_refusal: None,
             commit_pending: None,
             commit_orders: HashMap::new(),
             commit_order_seen: std::collections::VecDeque::new(),
@@ -2701,12 +2704,15 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
 
     /// Imports a block pulled from a peer to catch up and makes it the head.
     ///
-    /// Head and safe, not finalized: the peer says this is the fleet's
-    /// chain, and execution says the block is valid, but neither is a
-    /// commit certificate. Finality follows the next Decide this node sees,
-    /// which finalizes the block it names and, with it, everything pulled
-    /// beneath; until then a peer that served a sibling chain costs a reorg
-    /// rather than a node stuck behind a wrong finalized block. Returns the
+    /// Head only, not safe and not finalized, in either settlement mode: the
+    /// peer says this is the fleet's chain, execution says the block is
+    /// valid, and the service checked the certificate its header carries
+    /// (which vouches for an ancestor, never for the block itself), but none
+    /// of that is a commit of this block. Safe and finalized follow the next
+    /// commit this node sees, which settles the block it names and, with it,
+    /// everything pulled beneath; until then a peer that served a sibling
+    /// chain costs a reorg rather than a node stuck behind a wrong safe or
+    /// finalized block. Returns the
     /// hash on success; any verdict but VALID is an error, because a
     /// catch-up that skips a block leaves every later one without a parent.
     pub async fn import_pulled(&mut self, payload: ExecutionData) -> Result<B256, ElError> {
@@ -2733,18 +2739,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 return Err(ElError::new(format!("execution layer did not accept block {block_hash}: {other:?}")));
             }
         }
-        // Split tags: a pulled block is neither committed nor certified here,
-        // so it moves neither tag; the forkchoice carries the ones the
-        // driver has, when they are on the pulled block's chain.
-        let state = if split {
-            self.forkchoice(block_hash)
-        } else {
-            ForkchoiceState {
-                head_block_hash: block_hash,
-                safe_block_hash: block_hash,
-                finalized_block_hash: self.finalized,
-            }
-        };
+        // A pulled block is neither committed nor certified here, so it
+        // moves neither tag in either mode: split carries the tags the
+        // driver has, when they are on the pulled block's chain; legacy
+        // carries the last commit as safe and finalized (head = safe =
+        // finalized stays the rule for commits, byte for byte).
+        let state = self.forkchoice(block_hash);
         let updated = self
             .el
             .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, state)
@@ -3048,9 +3048,17 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     // import evidence), but it is a quorum-certified block
                     // the execution layer will not follow: consensus and the
                     // execution layer have diverged. Said at error level and
-                    // counted; what the node does about it (stop voting) is
-                    // a policy decision not taken here.
+                    // counted, and the first one kept; what the node does
+                    // about it (stop voting, `N42_HALT_ON_COMMIT_INVALID`) is
+                    // the service's decision, not the driver's.
                     self.commits_refused = self.commits_refused.saturating_add(1);
+                    if self.first_commit_refusal.is_none() {
+                        self.first_commit_refusal = Some(CommitRefusal {
+                            block_hash,
+                            number: self.payloads.get(&block_hash).map(|p| p.payload.block_number()),
+                            validation_error: validation_error.to_string(),
+                        });
+                    }
                     error!(
                         target: "n42.h2.el",
                         block = ?block_hash,
@@ -3172,6 +3180,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.commits_refused
     }
 
+    /// The first commit forkchoice the execution layer refused (Invalid):
+    /// where this node's execution layer diverged from consensus.
+    pub const fn first_commit_refusal(&self) -> Option<&CommitRefusal> {
+        self.first_commit_refusal.as_ref()
+    }
+
     /// Drops what a committed block no longer needs: it will never be
     /// re-executed.
     fn forget_committed(&mut self, block_hash: B256) {
@@ -3179,6 +3193,18 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.bodies.remove(&block_hash);
         self.payload_order.retain(|h| h != &block_hash);
     }
+}
+
+/// A commit forkchoice the execution layer answered `Invalid`: a
+/// quorum-certified block it will not follow. `Syncing` is not one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRefusal {
+    /// The committed block.
+    pub block_hash: B256,
+    /// Its number, when the driver still holds its payload.
+    pub number: Option<u64>,
+    /// The execution layer's validation error.
+    pub validation_error: String,
 }
 
 /// A commit whose forkchoice failed, waiting to be sent again.

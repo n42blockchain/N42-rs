@@ -174,6 +174,12 @@ Design: verify the parent QC in each header against the validator set before `ne
 never move `safe` on a pulled block, and compare behaviour with gov5's range import before
 changing the cross-client expectation.
 
+Done in `6c737e8e2`, `4dae5c17a`, `e833bd966`: each pulled block must extend the one before it, and the committed QC in
+its header is verified through the proposal-path check (`ConsensusEngine::verify_header_qc`)
+before `newPayload`; the first failure ends the batch and the peer is not asked again for the
+gap (`H2Service::check_pulled_block`). A pulled block is head only in both settlement modes.
+No knob. gov5 comparison in `docs/N42_26_PORT.md` "Certificates on pulled blocks".
+
 ### 6.7 Lint baseline
 
 CI runs `cargo clippy --workspace --lib --bins --examples` without `-D warnings`. A warning

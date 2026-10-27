@@ -670,7 +670,9 @@ engine reads as "unchanged"; so a build or a pulled block below the tags, or a r
 ancestor, never sends a tag above its head (which reth refuses, -38002). A fresh chain floors both
 tags at genesis; a restarted node sends zero tags until its first commit, so the tags reth restored
 from disk are never moved back. `payload_serve`'s head move for a re-proposed sibling sends zero tags
-too. Range sync (`import_pulled`) moves neither tag.
+too. Range sync (`import_pulled`) moves neither tag, in either mode: since 2026-10-26 (hardening
+item 6.6) a pulled block under `legacy` is head only, with safe = finalized = the last commit, where
+it used to be head and safe; commits under `legacy` are unchanged.
 
 First fleet leg (loop326 SPLIT): the followers were clean (safe at tip-1, finalized 6-8 behind), but
 the leader's own blocks under the compact take answer (`N42_TAKE_COMPACT=1`) come back elided and

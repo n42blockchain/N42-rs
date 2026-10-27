@@ -489,6 +489,12 @@ pub struct H2Service<E> {
     catch_up_retry_after: Option<std::time::Instant>,
     /// The peer whose catch-up failed last; another is preferred.
     failed_peer: Option<PeerId>,
+    /// Peers that served a pulled block whose certificate or parent link did
+    /// not verify, with that block's height: never asked again for the gap,
+    /// not even when no other peer is known. An entry goes once this node's
+    /// execution layer is known past that height (someone else closed the
+    /// gap), so a peer is not shut out of every later catch-up.
+    refused_range_peers: std::collections::HashMap<PeerId, u64>,
     /// Blocks the execution layer has imported through this service — voted
     /// on, pulled or built. A commit for any other block is not handed to
     /// the execution layer: a forkchoice to a head reth does not have starts
@@ -608,8 +614,10 @@ const PROPOSE_RETRY_FLOOR: Duration = Duration::from_millis(10);
 /// Started when a peer's status shows it ahead of this node's execution
 /// layer — a member restarting after an absence, or joining a chain that
 /// has been running — and driven one range at a time: the reply is
-/// imported through `newPayload` in order, each block becoming the
-/// finalized head, and the next range asked for until the peer's height is
+/// checked (parent link, the certificate its header carries; see
+/// `check_pulled_block`) and imported through `newPayload` in order, each
+/// block becoming the head but never safe or finalized, and the next range
+/// asked for until the peer's height is
 /// reached. Only the execution layer catches up here; the consensus engine
 /// finds the current view from the messages it hears.
 #[derive(Debug)]
@@ -628,6 +636,10 @@ struct CatchUp {
     /// within one round trip cannot keep a probe going for ever. Zero until
     /// probing.
     probe_height: u64,
+    /// The hash of the last block this pull imported or skipped as already
+    /// imported: the next pulled block must name it as its parent. `None`
+    /// before the first, whose parent the execution layer checks.
+    prev_hash: Option<B256>,
 }
 
 /// How many block requests may wait for the execution layer at once, and
@@ -1462,6 +1474,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             peer_heights: std::collections::HashMap::new(),
             catch_up_retry_after: None,
             failed_peer: None,
+            refused_range_peers: std::collections::HashMap::new(),
             imported: HashSet::new(),
             imported_order: std::collections::VecDeque::new(),
             ready_bodies: Vec::new(),
@@ -4127,10 +4140,16 @@ impl<E: ExecutionLayer> H2Service<E> {
         // status at connect and from every block it gossips or serves since,
         // so a node that falls behind later finds a peer to pull from too.
         let failed = self.failed_peer;
+        // A peer that served a block whose certificate did not verify is not
+        // asked again until the gap it was asked for is closed.
+        if let Some(tip) = self.imported_height {
+            self.refused_range_peers.retain(|_, at| *at > tip);
+        }
+        let refused = &self.refused_range_peers;
         let best = |exclude: Option<PeerId>| {
             self.peer_heights
                 .iter()
-                .filter(|(peer, _)| Some(**peer) != exclude)
+                .filter(|(peer, _)| Some(**peer) != exclude && !refused.contains_key(*peer))
                 .max_by_key(|(_, height)| **height)
                 .map(|(peer, height)| (*peer, *height))
         };
@@ -4173,6 +4192,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             started_at: latest,
             probing: false,
             probe_height: 0,
+            prev_hash: None,
         });
         self.request_next_range();
         events.push(ServiceEvent::Syncing {
@@ -4250,8 +4270,19 @@ impl<E: ExecutionLayer> H2Service<E> {
                 if self.imported.contains(&hash) {
                     if let Some(c) = self.catch_up.as_mut() {
                         c.next += 1;
+                        c.prev_hash = Some(hash);
                     }
                     continue;
+                }
+                // The certificate the header carries, before the execution
+                // layer sees the block: the first block that fails ends the
+                // batch (what passed before it stays imported), and its peer
+                // is not asked for this gap again.
+                if let Err(reason) = self.check_pulled_block(&block.header) {
+                    warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block whose certificate does not verify; the rest of its range is dropped");
+                    self.refused_range_peers.insert(peer, number);
+                    self.finish_catch_up(events, false);
+                    return;
                 }
                 match self.driver.import_pulled(block.execution_data()).await {
                     Ok(_) => {
@@ -4261,6 +4292,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         self.remember_body(hash, chunk.rlp.clone());
                         if let Some(c) = self.catch_up.as_mut() {
                             c.next += 1;
+                            c.prev_hash = Some(hash);
                         }
                     }
                     Err(err) => {
@@ -4313,6 +4345,82 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.request_next_range();
             }
         }
+    }
+
+    /// What a range-pulled block has to show before it is imported.
+    ///
+    /// - It extends the block this pull imported last.
+    /// - The committed QC its leader embedded in the header, when there is
+    ///   one (gov5 leaders embed it; this node's leaders do not), verifies
+    ///   against the validator set for that QC's exact view through the
+    ///   engine's proposal-path check ([`ConsensusEngine::verify_header_qc`]),
+    ///   is no later than the header's own view (gov5's `VerifyHeader` rule),
+    ///   and names a block on this block's parent chain as far as this node
+    ///   holds the headers.
+    ///
+    /// The seal is not checked: the live path does not check it either (a
+    /// block is authenticated by the certificates on the wire, see
+    /// `HotStuffConsensus`). A header without the HotStuff extra layout is
+    /// refused on a gov5 chain and carries no certificate on another.
+    fn check_pulled_block(&self, header: &Header) -> Result<(), String> {
+        if let Some(prev) = self.catch_up.as_ref().and_then(|c| c.prev_hash) {
+            if header.parent_hash != prev {
+                return Err(format!("parent {} is not the block pulled before it, {prev}", header.parent_hash));
+            }
+        }
+        let extra = match n42_h2_consensus::HeaderExtra::decode(&header.extra_data) {
+            Ok(extra) => extra,
+            Err(err) if self.header_profile == HeaderProfile::Gov5H2 => return Err(err.to_string()),
+            Err(_) => return Ok(()),
+        };
+        if extra.qc.is_empty() {
+            return Ok(());
+        }
+        // gov5's `decodeHeaderExtra`: QC then seal, or (legacy) a QC alone.
+        let wire = n42_h2_wire::h2_wire::decode_h2_qc(&extra.qc)
+            .or_else(|err| {
+                n42_h2_wire::h2_wire::decode_h2_qc(&header.extra_data[n42_h2_consensus::header_profile::EXTRA_MIN_LEN..])
+                    .map_err(|_| err)
+            })
+            .map_err(|err| format!("header QC does not decode: {err}"))?;
+        if wire.view > extra.view {
+            return Err(format!("header QC view {} is past the header's view {}", wire.view, extra.view));
+        }
+        let qc = self.engine.verify_header_qc(&wire).map_err(|err| err.to_string())?;
+        if qc.view == 0 {
+            return Ok(());
+        }
+        self.certified_is_an_ancestor(header, qc.block_hash)
+    }
+
+    /// Whether `certified` lies on `header`'s parent chain, walking the
+    /// headers this node holds. A certified block this node holds no header
+    /// for, or a walk that leaves the held headers before reaching its
+    /// height, is not a contradiction and passes: the QC itself verified.
+    fn certified_is_an_ancestor(&self, header: &Header, certified: B256) -> Result<(), String> {
+        /// Steps the walk takes at most; a committed QC names a block one
+        /// to a few heights below the header.
+        const MAX_WALK: usize = 256;
+        let Some(target) = self.block_headers.get(&certified).map(|h| h.number) else {
+            return Ok(());
+        };
+        if target >= header.number {
+            return Err(format!("header QC certifies block {certified} at height {target}, not below {}", header.number));
+        }
+        let mut cursor = header.parent_hash;
+        for _ in 0..MAX_WALK {
+            if cursor == certified {
+                return Ok(());
+            }
+            let Some(parent) = self.block_headers.get(&cursor) else {
+                return Ok(());
+            };
+            if parent.number <= target {
+                return Err(format!("header QC certifies block {certified}, not on this block's parent chain"));
+            }
+            cursor = parent.parent_hash;
+        }
+        Ok(())
     }
 
     fn finish_catch_up(&mut self, events: &mut Vec<ServiceEvent>, complete: bool) {

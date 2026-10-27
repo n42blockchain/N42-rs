@@ -39,10 +39,7 @@ pub fn enabled() -> bool {
 /// Async workers of the road's runtime: `N42_ROAD_RUNTIME_WORKERS`, 4 by default,
 /// clamped to 1..=16.
 fn workers() -> usize {
-    std::env::var("N42_ROAD_RUNTIME_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(4)
+    n42_env::parse::<usize>("N42_ROAD_RUNTIME_WORKERS", 4)
         .clamp(1, 16)
 }
 

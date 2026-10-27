@@ -299,10 +299,7 @@ static RAW_CHANNEL_TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync
 pub fn raw_channel_timeout() -> std::time::Duration {
     *RAW_CHANNEL_TIMEOUT.get_or_init(|| {
         std::time::Duration::from_millis(
-            std::env::var("N42_RAW_CHANNEL_TIMEOUT_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(RAW_CHANNEL_TIMEOUT_DEFAULT_MS),
+            n42_env::parse("N42_RAW_CHANNEL_TIMEOUT_MS", RAW_CHANNEL_TIMEOUT_DEFAULT_MS),
         )
     })
 }

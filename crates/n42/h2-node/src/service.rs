@@ -1069,7 +1069,7 @@ impl FillRounds {
 fn fill_rounds_max() -> u32 {
     static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
-        std::env::var("N42_FILL_ROUNDS_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(3).max(1)
+        n42_env::parse::<u32>("N42_FILL_ROUNDS_MAX", 3).max(1)
     })
 }
 
@@ -5299,7 +5299,7 @@ fn transport_event_kind(event: &TransportEvent) -> &'static str {
 fn body_request_grace() -> Duration {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     Duration::from_millis(*MS.get_or_init(|| {
-        std::env::var("N42_BODY_REQUEST_GRACE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(120)
+        n42_env::parse("N42_BODY_REQUEST_GRACE_MS", 120)
     }))
 }
 

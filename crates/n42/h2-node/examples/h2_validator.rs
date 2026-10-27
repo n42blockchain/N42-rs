@@ -512,10 +512,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("transaction source: {rpc}");
         }
         if let Some(addr) = &el_ingest {
-            let lanes = std::env::var("N42_INGEST_FORWARD_LANES")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(4usize);
+            let lanes = n42_env::parse("N42_INGEST_FORWARD_LANES", 4usize);
             service = service.with_transaction_ingest(addr.clone(), lanes);
             println!("gossip -> pool : binary ingest at {addr}, {lanes} connections");
         }

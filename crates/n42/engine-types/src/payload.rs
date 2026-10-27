@@ -1294,7 +1294,7 @@ fn failed_after_seal(sealed: Option<(B256, u64)>, err: PayloadBuilderError) -> P
 fn seal_shortfall(block_gas_limit: u64) -> u64 {
     static DIV: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let div = *DIV.get_or_init(|| {
-        std::env::var("N42_SEAL_SHORTFALL_DIV").ok().and_then(|v| v.parse().ok()).unwrap_or(64)
+        n42_env::parse("N42_SEAL_SHORTFALL_DIV", 64)
     });
     block_gas_limit.checked_div(div).unwrap_or(0)
 }
@@ -5875,7 +5875,7 @@ const MIN_TRANSACTION_GAS: u64 = 21_000;
 /// own thread.
 fn builder_puller() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("N42_BUILDER_PULLER").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    *N.get_or_init(|| n42_env::parse("N42_BUILDER_PULLER", 0))
 }
 
 /// What the build tells the puller about a transaction it was handed.
@@ -5970,7 +5970,7 @@ impl<T: reth_transaction_pool::PoolTransaction> Drop for Puller<T> {
 
 fn builder_prefetch() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("N42_BUILDER_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    *N.get_or_init(|| n42_env::parse("N42_BUILDER_PREFETCH", 0))
 }
 
 /// The CPU's cycle counter: a register read, where a clock read is a vDSO

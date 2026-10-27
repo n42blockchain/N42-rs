@@ -350,7 +350,7 @@ fn apply_recovery_nice_linux() {
 #[cfg(target_os = "linux")]
 fn recovery_pin() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| std::env::var("N42_TX_INGEST_RECOVER_PIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    *MODE.get_or_init(|| n42_env::parse("N42_TX_INGEST_RECOVER_PIN", 0))
 }
 
 #[cfg(target_os = "linux")]
@@ -543,10 +543,7 @@ const GATE_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 fn gate_max_wait() -> Option<std::time::Duration> {
     static MAX: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
-        let ms = std::env::var("N42_TX_INGEST_GATE_MAX_WAIT_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(15_000);
+        let ms = n42_env::parse::<u64>("N42_TX_INGEST_GATE_MAX_WAIT_MS", 15_000);
         (ms > 0).then(|| std::time::Duration::from_millis(ms))
     })
 }
@@ -888,10 +885,7 @@ where
 }
 
 fn high_water() -> usize {
-    std::env::var("N42_TX_INGEST_HIGH_WATER")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(90_000)
+    n42_env::parse("N42_TX_INGEST_HIGH_WATER", 90_000)
 }
 
 /// Serves the ingest protocol on `addr` until the process ends.
@@ -1117,10 +1111,7 @@ fn spawn_stats_reporter() {
 /// `N42_TX_INGEST_BLOCK_TXS`; the allowance the gate grants per block the
 /// pool has yet to hear of. Zero (the default) is the old gate.
 fn block_txs_allowance() -> u64 {
-    std::env::var("N42_TX_INGEST_BLOCK_TXS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0)
+    n42_env::parse("N42_TX_INGEST_BLOCK_TXS", 0)
 }
 
 /// Where a frame's recovery takes its slot.

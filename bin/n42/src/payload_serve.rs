@@ -1962,7 +1962,7 @@ fn miss_wait() -> std::time::Duration {
     static WAIT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *WAIT.get_or_init(|| {
         std::time::Duration::from_millis(
-            std::env::var("N42_COMPACT_BODY_WAIT").ok().and_then(|v| v.parse().ok()).unwrap_or(20),
+            n42_env::parse("N42_COMPACT_BODY_WAIT", 20),
         )
     })
 }

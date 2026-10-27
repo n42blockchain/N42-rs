@@ -441,10 +441,19 @@ new knobs through `n42_env`. `design/integration-2026-10-next` adds the 6.1 comp
   move checkpoints at block 1, so a replay can never stop at genesis (both storage modes); (b) MDBX
   persisted nothing in 28 blocks / 85 s although reth's threshold persistence (2 blocks in the lean
   profile) should have run, and the other kills show a persisted head 20-34 blocks behind (node4, stopped
-  gracefully, persisted its head 141). Fix for (a) and instrumentation for (b) on
-  `design/integration-2026-10-next` (see the commits there); (b)'s cause is open and is reproduced on the
-  devnet next. The check must also be run in the X22 configuration (`N42_QMDB_ENTRY_FILE=1`), which is
-  what production runs; the lean profile keeps the forest on the heap.
+  gracefully, persisted its head 141). (b) is reth v2.8.1's new defaults: `DEFAULT_PERSISTENCE_THRESHOLD`
+  50 and `DEFAULT_MEMORY_BLOCK_BUFFER_TARGET` 5 (2 and 2 before), and only the bench profile of
+  `scripts/fleet7-env.sh` passes the flags (8 and 6). A probe (`audit-notes/scripts/persist-probe.sh`,
+  node1 sampled every 2 s at 200 tx/s) shows it: persisted 0 while the in-memory count grew to 46, then
+  one batch at height 51 persisted blocks 1-46, then the count grew again (32 at height 78). So a SIGKILL
+  inside the first 50 blocks lands MDBX on genesis, and every later kill costs up to 50 blocks of
+  re-execution. Fixes on `design/integration-2026-10-next`: the forest writes its genesis checkpoint when
+  it is seeded (a), and on a QMDB chain the node lowers the two defaults to 8 and 6 unless the operator
+  set them, next to the existing state-masking override (b). The check must be rerun on the fixed
+  binaries with a kill before the first persistence, and in the X22 configuration
+  (`N42_QMDB_ENTRY_FILE=1`), which is what production runs; the lean profile keeps the forest on the heap.
+  The second reth bump in a row to change a persistence default under the QMDB chain (2.7.0: state
+  masking blocks 30), so the bump checklist in `docs/RETH_2_8_1_UPGRADE.md` now names both constants.
 - **6.4 bench pairs** (loop351 stage fm, X22 configuration, 600M replay set, integration binaries, warm leg
   then two alternating pairs; 14:51-15:17 UTC):
 

@@ -258,19 +258,22 @@ impl<T: PoolTransaction> RoadTaken<T> {
     }
 }
 
-/// `N42_ROAD_TAKEN_BOUND=1` (off by default): a taken frame is forgotten
-/// once the own-block hold window has passed it ([`Road::note_hold`]).
+/// `N42_ROAD_TAKEN_BOUND` (on by default, `=0` turns it off): a taken frame
+/// is forgotten once the own-block hold window has passed it
+/// ([`Road::note_hold`]). Adopted after the stage fm pair of 2026-10-27
+/// (`docs/MATURITY_HARDENING_2026_10.md` 6.4).
 fn road_taken_bound_env() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| n42_env::flag("N42_ROAD_TAKEN_BOUND", false))
+    *ON.get_or_init(|| n42_env::flag("N42_ROAD_TAKEN_BOUND", true))
 }
 
-/// `N42_ROAD_RETIRE_INDEX=1` (off by default): [`Road::retire`] finds the
-/// mined frames through an index of the taken frames by first-member
-/// sender instead of scanning every taken frame.
+/// `N42_ROAD_RETIRE_INDEX` (on by default, `=0` turns it off):
+/// [`Road::retire`] finds the mined frames through an index of the taken
+/// frames by first-member sender instead of scanning every taken frame.
+/// Adopted with the bound above.
 fn road_retire_index_env() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| n42_env::flag("N42_ROAD_RETIRE_INDEX", false))
+    *ON.get_or_init(|| n42_env::flag("N42_ROAD_RETIRE_INDEX", true))
 }
 
 /// Own blocks the bound waits past the hold window: a frame is taken before

@@ -119,7 +119,7 @@ held equal to them by a test. Not done: the per-mode root-equality integration t
 X22 base set (the loop351 `ALLA` line and its per-leg additions, 46 rows that were `experimental`) and
 13 tuned values whose compiled default differs (`N42_ED25519_BATCH` 256, `N42_ALTSIG_SENDER_CACHE`
 2^22, `N42_OUTPUT_SHARDS` 16, the build throttle 48/80, ...) are `adopted` and in the profile, which
-is now 99 knobs and reproduces the node-side environment of an X22 leg. What a leg passes beyond it
+is now 99 knobs (101 with the 6.4 road knobs adopted below) and reproduces the node-side environment of an X22 leg. What a leg passes beyond it
 is classed `bench-only` (bench gateway key and attestation minimum, `N42_IMPORT_ONCE`, the storage
 mode `N42_HASHED_TABLES=off` / `N42_QMDB_READS=on`, `N42_ACCOUNT_HISTORY=off`,
 `N42_SETTLEMENT_TAGS=legacy`, `N42_PERSIST_QMDB_IN_SCOPE`, `N42_STORAGE_OP_METRICS=0`, and
@@ -165,7 +165,10 @@ the own-block hold window, index it by first-member sender so `retire` touches o
 senders in the pruned block, and refuse oversize frames at `road_admit`. Each is a bench pair
 (X22 control vs change) before adoption.
 
-Implemented behind knobs in `ad111b05a` and `54362f7d1` (tests); bench pairs pending.
+Implemented behind knobs in `ad111b05a` and `54362f7d1` (tests). Bench pairs run 2026-10-27 (loop351
+stage fm, section 8.2): no measurable cost, so both knobs are on by default since the adoption commit on
+`design/integration-2026-10-next` (`N42_ROAD_TAKEN_BOUND=0` / `N42_ROAD_RETIRE_INDEX=0` turn them off;
+`adopted` rows in `docs/KNOBS.md`, in the X22 profile).
 `N42_ROAD_TAKEN_BOUND=1` forgets a taken frame neither retired nor handed back once more than
 `N42_OWN_HOLD_BLOCKS` + 8 own blocks were held since its take (its block has left the hold
 window; a later give-back goes the lanes' path with a flush, as after `N42_ROAD_TAKEN_MAX`);
@@ -426,3 +429,34 @@ new knobs through `n42_env`. `design/integration-2026-10-next` adds the 6.1 comp
   up --fresh` on the integration binaries at 200 tx/s, `roll 1/2/3 --kill`, the forest's recovery
   and fault lines) and the 6.4 bench pairs (loop351 stage fm: `N42_ROAD_TAKEN_BOUND=1
   N42_ROAD_RETIRE_INDEX=1` against the X22 control, two alternating pairs). Results in 8.2.
+
+### 8.2 Field check and bench pairs (2026-10-27, after 8.1)
+
+- **6.3 field check, `roll --kill` on the integration binaries** (fleet7 lean profile, heap forest, 200 tx/s;
+  14:35-14:43 UTC): rolls 2 and 3 came back (forest restored at block 92, kills at heights 112 and 126, no
+  fault line). **Roll 1 failed**: node1 was killed at block 28 with MDBX still at genesis (every stage
+  checkpoint 0); the forest's checkpoint stood at block 1 with deltas through 28, and the restart refused
+  it: `QMDB snapshot is at block 1 (…) but the database head is block 0 (…); the forest cannot be rebuilt
+  from execution state`. Two defects: (a) the genesis-seeded forest writes no checkpoint, the first head
+  move checkpoints at block 1, so a replay can never stop at genesis (both storage modes); (b) MDBX
+  persisted nothing in 28 blocks / 85 s although reth's threshold persistence (2 blocks in the lean
+  profile) should have run, and the other kills show a persisted head 20-34 blocks behind (node4, stopped
+  gracefully, persisted its head 141). Fix for (a) and instrumentation for (b) on
+  `design/integration-2026-10-next` (see the commits there); (b)'s cause is open and is reproduced on the
+  devnet next. The check must also be run in the X22 configuration (`N42_QMDB_ENTRY_FILE=1`), which is
+  what production runs; the lean profile keeps the forest on the heap.
+- **6.4 bench pairs** (loop351 stage fm, X22 configuration, 600M replay set, integration binaries, warm leg
+  then two alternating pairs; 14:51-15:17 UTC):
+
+  | leg | `N42_ROAD_TAKEN_BOUND` + `N42_ROAD_RETIRE_INDEX` | window 1 | round (3 windows) |
+  |---|---|---|---|
+  | RBa | on | 5,033,333 tx/s | 459.6M |
+  | RB0 | off | 5,071,067 tx/s | 454.1M |
+  | RBb | on | 5,085,083 tx/s | 457.4M |
+  | RB0b | off | 5,040,000 tx/s | 452.9M |
+
+  On: 5.03/5.09, 459.6/457.4M; off: 5.07/5.04, 454.1/452.9M. Within the single-round spread either way,
+  so the bound and the index cost nothing measurable, and they are adopted (on by default). Gates clean on
+  every leg. RBb reported `rename_fallbacks_total=2276` (the early rename of the fields-at-seal path fell
+  back to the parent's `Complete` on nearly every build); the counter is reported, not gated, and the same
+  per-leg mode appears in 11 of 417 loop351 legs since stage dy, independent of these knobs.

@@ -1,5 +1,21 @@
 # Runtime knob reference (N42_* environment variables)
 
+**Profiles.** `N42_PROFILE=x22` on `n42` and `h2_validator` applies the adopted configuration: at the
+first statement of `main`, before any knob is read, every knob whose status below is `adopted` is set
+to its X22 value unless the environment already sets it (a set knob always wins, `=0` included); the
+binary prints one stderr line naming how many it set and which it kept. An unknown profile name exits
+with status 2; unset, blank or `none` applies nothing. The table and its values live in
+`crates/n42/env/src/profile.rs`, and a test there fails when its knobs and the `adopted` rows of this
+file differ, so changing a row's status means changing the profile in the same commit. A profile
+carries `N42_*` knobs only: `MALLOC_CONF`, `TOKIO_WORKER_THREADS`, `RAYON_NUM_THREADS` and the X22
+base set that this file classes `experimental`/`default` (the loop351 `ALLA` line) still come from
+the launcher.
+
+**Truthiness (since the knob-profile branch).** Every former presence-only and `!= "0"` switch is read
+by `n42_env::flag`: on = `1|true|on|yes`, off = `0|false|off|no|""` (case-insensitive, trimmed),
+anything else warns once and reads the default; so notes 4-5 below describe the tree before it.
+The `== "1"` switches are unchanged.
+
 1. Generated from an audit of the tree at commit 393cc1e70 (audit/maturity-2026-10): 273 knobs, plus the four the hardening branches added (`N42_TX_INGEST_ALLOW_REMOTE`, `N42_PAYLOAD_SERVE_ALLOW_REMOTE`, `N42_BENCH_UNSAFE`, `N42_RAW_CHANNEL_TIMEOUT_MS`) read by code under bin/n42, crates/n42, crates/chain-state and crates/storage; none is read from a config file or CLI flag.
 2. Almost every knob is read once, behind a `OnceLock`/`static`, at first use. Set it in the environment before the process starts; changing it afterwards has no effect. A few are read at service construction without a cache ("startup"), still once per process.
 3. No knob is read per call any more: the one HOT read the audit found, `N42_OWN_BLOCK_BY_HEADER` on the engine path in `crates/n42/h2-el-rpc/src/engine.rs`, is behind a `OnceLock` since audit/h2-hardening (`647f6709d`).

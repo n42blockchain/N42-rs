@@ -107,8 +107,16 @@ behaviour change only for someone passing `=0` to enable, which nothing in `scri
 Then add `N42_PROFILE=x22` (or `--n42.profile`), applied at process start before any
 `OnceLock` read, that sets the adopted knob set when the knobs are unset. The binary then
 carries the measured configuration, and one integration test per adopted mode can compare
-its block and state root against the default path. Owner: a single branch after the three
-hardening branches merge (it touches the same files).
+its block and state root against the default path.
+
+Done in `3bd981d69`, `c6d049e53`, `d8cb61101`, `47e38c629` (branch `design/knob-profile`): crate
+`crates/n42/env` (`n42_env::flag` / `parse` / `var`, unit-tested branch by branch); 45 switch
+reads migrated to `flag` (16 presence-only, 4 "anything but 0", 25 default-on `!= "0"`) and 26
+one-line numeric reads to `parse`; `N42_PROFILE=x22` (env only, no CLI flag) applied as the first
+statement of `bin/n42` and `h2_validator`, 41 knobs = the `adopted` rows of `docs/KNOBS.md`,
+held equal to them by a test. Not done: the per-mode root-equality integration tests, and the
+`== "1"` switches (still exact-match). The profile does not carry the X22 base set that KNOBS.md
+classes `experimental`/`default` (the loop351 `ALLA` line), so a launcher still passes those.
 
 ### 6.2 QMDB entry-file compaction
 

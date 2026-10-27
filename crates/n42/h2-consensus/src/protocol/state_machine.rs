@@ -1790,6 +1790,34 @@ impl ConsensusEngine {
         )
     }
 
+    /// Verifies a quorum certificate carried outside a consensus message: the
+    /// committed QC a gov5 leader embeds in a block header (`N42H ‖ view ‖ QC
+    /// ‖ seal`), read off a block pulled by range.
+    ///
+    /// The same check a proposal's `justify_qc` gets: the set authorized for
+    /// the certificate's exact view (none known is a refusal, never a guess),
+    /// the bitmap read against that set's size, a quorum of signers, and the
+    /// aggregate signature under either signing domain. A view-0 certificate
+    /// is the genesis sentinel and certifies nothing, so it is not checked,
+    /// as on the proposal path. Returns the certificate in the engine's form.
+    pub fn verify_header_qc(
+        &self,
+        wire: &n42_h2_wire::h2_wire::H2QuorumCertificate,
+    ) -> ConsensusResult<QuorumCertificate> {
+        let invalid = |reason: String| ConsensusError::InvalidQC { view: wire.view, reason };
+        if wire.view == 0 {
+            return crate::wire_bridge::qc_to_engine(wire, 0, "header QC")
+                .map_err(|err| invalid(err.to_string()));
+        }
+        let Some(set) = self.epoch_manager.known_validator_set_for_view(wire.view) else {
+            return Err(invalid("validator set unavailable for certificate view".into()));
+        };
+        let qc = crate::wire_bridge::qc_to_engine(wire, set.len() as usize, "header QC")
+            .map_err(|err| invalid(err.to_string()))?;
+        self.verify_qc_any_domain_or_known(&qc)?;
+        Ok(qc)
+    }
+
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {
         let mut overflow = self
             .output_overflow

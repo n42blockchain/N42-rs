@@ -94,7 +94,7 @@ Decisions behind the fixes:
 - The pruner feed stays an unbounded channel. Bounding it changes the hand-off that the 5M
   configuration depends on (round 10.227: frees moved off the pruner thread); it now warns
   when the depth passes 64. A bound needs a bench pair, not a code review.
-- `VoteLogFsync` is logged at `error` and counted but is not fatal yet (section 6.5).
+- `VoteLogFsync` is logged at `error` and counted; consecutive failures are fatal since section 6.5.
 
 ## 6. Open design items
 
@@ -143,6 +143,14 @@ after a restart. Proposal: fatal after N consecutive failures, with the counter 
 Likewise an `Invalid` answer to a commit forkchoice is a divergence between consensus and the
 execution layer; proposal: stop voting and raise an error event. Both need an operator story
 (restart, resync) before they are switched on.
+
+Done in `14818bf86`, `2d147152a`, `26b095081` and the docs commit adding `docs/OPERATOR_FAULTS.md`:
+`N42_VOTE_LOG_FATAL_AFTER` consecutive vote-log failures (default 3, `0` off) halt the engine's
+voting and stop the validator (`ConsensusError::Fatal` -> `ServiceError::Fatal`, exit code 3,
+`n42_h2_fatal{reason="vote_log"}`, `n42_h2_vote_log_failures_total`); a commit forkchoice answered
+`Invalid` halts voting and proposing while the node keeps following
+(`n42_h2_voting_halted{reason="commit_invalid"}`, `N42_HALT_ON_COMMIT_INVALID=0` off). Operator
+story in `docs/OPERATOR_FAULTS.md`.
 
 ### 6.6 Certificates on range-pulled blocks
 

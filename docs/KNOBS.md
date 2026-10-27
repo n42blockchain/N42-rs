@@ -282,6 +282,7 @@ Status caveat: `adopted` follows the stage sets named above; `experimental` mean
 | `N42_FILL_ROUNDS_MAX` | 3 | integer | N42_FILL_ROUNDS_MAX: how many times a follower asks peers for a block's missing transactions before it fetches the whole body instead (defect 18:... | `h2-node:service.rs:885` | default |
 | `N42_GOSSIP_HANDLER_QUEUE` | 5000 | integer | Gossipsub handler queue length. | `h2-net:config.rs:130` | default |
 | `N42_GOSSIP_MAX_IHAVE` | 5000 | integer | Gossipsub max IHAVE messages. | `h2-net:config.rs:131` | default |
+| `N42_HALT_ON_COMMIT_INVALID` | on (0 disables) | on unless `0` | Stop voting and proposing (keep following) when the execution layer answers `Invalid` to a commit forkchoice; see docs/OPERATOR_FAULTS.md. | `h2-node:service.rs` (startup) | default |
 | `N42_H2_REMEMBERED_BODIES` | REMEMBERED_BODIES | integer | How many bodies the store keeps: N42_H2_REMEMBERED_BODIES, else REMEMBERED_BODIES. An environment knob so a round can bookend the old 4,096 again... | `h2-node:service.rs:751` | default |
 | `N42_H2_TRACE_MSGS` | off | `1` (or the knob's own value; see code) | N42_H2_TRACE_MSGS=1: one info line per consensus message sent or received, with its kind and view, so a round's hops can be timed across the flee... | `h2-node:service.rs:4795` | bench-only |
 | `N42_MAX_GOSSIP_MB` | 1 MiB (1<<20 bytes) | integer | reads N42_MAX_GOSSIP_MB, and two clients on one chain that disagree about this do not merely differ in throughput — the one with the smaller cap ... | `h2-net:config.rs:57` | default |
@@ -290,6 +291,7 @@ Status caveat: `adopted` follows the stage sets named above; `experimental` mean
 | `N42_STRAGGLER_RULE` | all (quorum) | see Default | Straggler grace rule: quorum or all validators. | `h2-node:straggler.rs:61` | default |
 | `N42_TAKE_COMPACT` | off | `1` (or the knob's own value; see code) | N42_TAKE_COMPACT, read once: the proposer asks its execution layer for a build-on-own answer *without the transactions* -- the header, the small ... | `h2-execution:driver.rs:892` | experimental |
 | `N42_VOTE_AGGREGATE_VERIFY` | off | `1` (or the knob's own value; see code) | Batched vote verification on a leader. | `h2-node:service.rs:4790` | experimental |
+| `N42_VOTE_LOG_FATAL_AFTER` | 3 | integer (`0` disables) | Consecutive vote-log write/fsync failures after which the validator stops and exits non-zero (code 3); see docs/OPERATOR_FAULTS.md. | `h2-node:service.rs` (startup) | default |
 | `N42_VOTE_LOG_NOSYNC` | off | `1` (or the knob's own value; see code) | Skip the vote-log sync (bench knob; gives up crash safety). | `h2-node:persistence.rs:486` | unsafe-bench |
 | `N42_VOTE_TRANSPORT` | gossip (direct, both) | see Default | Vote transport: direct, both, or gossip. | `h2-node:direct_votes.rs:43` | default |
 | `N42_YAMUX_WINDOW_MB` | ignored (only logs a warning: unsupported by libp2p 0.57) | see Default | Yamux window; unsupported, only logs a warning. | `h2-net:config.rs:247` | bench-only |

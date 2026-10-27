@@ -120,6 +120,12 @@ oldest twigs, retarget their index slots, then release the file prefix with
 file bytes per live key. The read view's 40-bit byte offsets (1 TiB) become slot numbers
 resolved through `Offsets` in the same change (today the view invalidates itself at 1 TiB).
 
+Design written 2026-10-27: `docs/QMDB_COMPACTION_DESIGN.md`. Re-appending live entries at new
+slots would change the positional root (a consensus rule shared with gov5), so the design moves
+bytes and keeps slots: a second relocated file of slot-numbered records, atomic `Offsets`
+retargeting, a slot-resolving read view, epoch-deferred `PUNCH_HOLE`. Stage 0 (growth metrics)
+is the first landing; stages 1-4 each need a bench pair.
+
 ### 6.3 QMDB durability ordered against MDBX
 
 QMDB's delta log follows canonical notifications asynchronously while MDBX persistence is a

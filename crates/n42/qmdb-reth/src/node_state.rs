@@ -222,7 +222,7 @@ fn canonical_defer_env() -> bool {
 pub fn settle_wait() -> std::time::Duration {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     std::time::Duration::from_millis(*MS.get_or_init(|| {
-        std::env::var("N42_QMDB_SETTLE_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(30_000)
+        n42_env::parse("N42_QMDB_SETTLE_WAIT_MS", 30_000u64)
     }))
 }
 
@@ -232,7 +232,7 @@ pub fn settle_wait() -> std::time::Duration {
 /// being logged. Off restores the old log-and-continue, for benches. Read once.
 pub fn canonical_fatal() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_QMDB_CANONICAL_FATAL").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_QMDB_CANONICAL_FATAL", true))
 }
 
 /// `N42_QMDB_PERSIST_BATCH=1` (default off): [`QmdbNodeState::on_persisted`]

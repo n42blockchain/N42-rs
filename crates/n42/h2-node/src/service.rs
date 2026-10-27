@@ -110,7 +110,7 @@ fn parse_vote_log_fatal_after(value: Option<&str>) -> u32 {
 /// execution layer answers `Invalid` to a commit forkchoice (default on;
 /// `0` keeps voting, for benches).
 fn halt_on_commit_invalid_from_env() -> bool {
-    std::env::var("N42_HALT_ON_COMMIT_INVALID").map_or(true, |v| v.trim() != "0")
+    n42_env::flag("N42_HALT_ON_COMMIT_INVALID", true)
 }
 
 /// Logs an engine error by whose fault it is: a refused peer message stays

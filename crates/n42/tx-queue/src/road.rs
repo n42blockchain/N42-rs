@@ -262,7 +262,7 @@ impl<T: PoolTransaction> RoadTaken<T> {
 /// once the own-block hold window has passed it ([`Road::note_hold`]).
 fn road_taken_bound_env() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_ROAD_TAKEN_BOUND").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_ROAD_TAKEN_BOUND", false))
 }
 
 /// `N42_ROAD_RETIRE_INDEX=1` (off by default): [`Road::retire`] finds the
@@ -270,7 +270,7 @@ fn road_taken_bound_env() -> bool {
 /// sender instead of scanning every taken frame.
 fn road_retire_index_env() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_ROAD_RETIRE_INDEX").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_ROAD_RETIRE_INDEX", false))
 }
 
 /// Own blocks the bound waits past the hold window: a frame is taken before

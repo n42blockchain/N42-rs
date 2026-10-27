@@ -1,0 +1,15 @@
+[package]
+name = "n42-env"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "One reading of the N42_* environment knobs: switch truthiness, warned parse failures and the adopted-configuration profiles"
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing.workspace = true

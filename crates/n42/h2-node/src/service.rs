@@ -86,11 +86,48 @@ pub fn local_engine_errors() -> u64 {
     LOCAL_ENGINE_ERRORS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Counter: vote-log write/fsync failures since start.
+pub const METRIC_VOTE_LOG_FAILURES_TOTAL: &str = "n42_h2_vote_log_failures_total";
+/// Gauge, label `reason`: 1 once a fatal local fault stopped this validator.
+pub const METRIC_FATAL: &str = "n42_h2_fatal";
+/// Gauge, label `reason`: 1 once this node stopped voting and proposing
+/// (it keeps following).
+pub const METRIC_VOTING_HALTED: &str = "n42_h2_voting_halted";
+
+/// `N42_VOTE_LOG_FATAL_AFTER`: consecutive vote-log failures that stop the
+/// validator (default 3; `0` never does).
+fn vote_log_fatal_after_from_env() -> u32 {
+    parse_vote_log_fatal_after(std::env::var("N42_VOTE_LOG_FATAL_AFTER").ok().as_deref())
+}
+
+fn parse_vote_log_fatal_after(value: Option<&str>) -> u32 {
+    value
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(n42_h2_consensus::DEFAULT_VOTE_LOG_FATAL_AFTER)
+}
+
+/// `N42_HALT_ON_COMMIT_INVALID`: stop voting and proposing when the
+/// execution layer answers `Invalid` to a commit forkchoice (default on;
+/// `0` keeps voting, for benches).
+fn halt_on_commit_invalid_from_env() -> bool {
+    std::env::var("N42_HALT_ON_COMMIT_INVALID").map_or(true, |v| v.trim() != "0")
+}
+
 /// Logs an engine error by whose fault it is: a refused peer message stays
 /// at debug, a local fault (vote-log fsync, lost output, the key leaving the
 /// set) is logged at error and counted, because it means this node may have
-/// stopped voting or committing. Nothing is made fatal here.
-fn report_engine_error(err: &n42_h2_consensus::ConsensusError, what: &'static str) {
+/// stopped voting or committing. A fatal one ([`ConsensusError::Fatal`]) is
+/// kept in `fatal`; the step that saw it ends the loop.
+///
+/// [`ConsensusError::Fatal`]: n42_h2_consensus::ConsensusError::Fatal
+fn report_engine_error(
+    err: &n42_h2_consensus::ConsensusError,
+    what: &'static str,
+    fatal: &mut Option<(&'static str, String)>,
+) {
+    if let n42_h2_consensus::ConsensusError::Fatal { reason, detail } = err {
+        fatal.get_or_insert((*reason, detail.clone()));
+    }
     if err.is_local() {
         let total = LOCAL_ENGINE_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         error!(target: "n42.h2.node", %err, what, local_errors = total, "local consensus engine fault");
@@ -123,6 +160,15 @@ pub enum ServiceError {
     /// The consensus engine returned a fatal error.
     #[error("consensus engine: {0}")]
     Engine(#[from] n42_h2_consensus::ConsensusError),
+    /// A local fault after which this validator must not go on (see
+    /// `docs/OPERATOR_FAULTS.md`): the caller exits with a non-zero code.
+    #[error("fatal local fault ({reason}): {detail}")]
+    Fatal {
+        /// Stable label, also the `reason` of [`METRIC_FATAL`].
+        reason: &'static str,
+        /// What happened.
+        detail: String,
+    },
 }
 
 /// What the service is doing, for a caller that wants to watch without owning
@@ -523,6 +569,13 @@ pub struct H2Service<E> {
     /// When each block was first seen here, for [`ProposalContext::head_seen`].
     block_seen: std::collections::HashMap<B256, std::time::Instant>,
     timestamp_order: Vec<B256>,
+    /// A fatal engine fault seen this step, `(reason, detail)`.
+    fatal: Option<(&'static str, String)>,
+    /// Whether a commit forkchoice answered `Invalid` stops this node's
+    /// voting (`N42_HALT_ON_COMMIT_INVALID`).
+    halt_on_commit_invalid: bool,
+    /// Vote-log failures already added to [`METRIC_VOTE_LOG_FAILURES_TOTAL`].
+    vote_log_failures_exported: u64,
 }
 
 /// How long a leader whose builder declined waits before asking it again.
@@ -1317,6 +1370,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     ) -> Self {
         let identity = transport.identity();
         engine.set_vote_aggregate(vote_aggregate_from_env());
+        engine.set_vote_log_fatal_after(vote_log_fatal_after_from_env());
         // How a body this node kept as bytes becomes a payload, for the
         // fallback when the execution layer will not take the bytes. The
         // transactions are slices of the body rather than copies: the body
@@ -1431,7 +1485,75 @@ impl<E: ExecutionLayer> H2Service<E> {
             block_numbers: std::collections::HashMap::new(),
             block_seen: std::collections::HashMap::new(),
             timestamp_order: Vec::new(),
+            fatal: None,
+            halt_on_commit_invalid: halt_on_commit_invalid_from_env(),
+            vote_log_failures_exported: 0,
         }
+    }
+
+    /// Whether a commit forkchoice the execution layer answers `Invalid`
+    /// stops this node's voting and proposing (default from
+    /// `N42_HALT_ON_COMMIT_INVALID`, on).
+    #[must_use]
+    pub fn with_halt_on_commit_invalid(mut self, on: bool) -> Self {
+        self.halt_on_commit_invalid = on;
+        self
+    }
+
+    /// Why this node no longer votes, if it does not.
+    pub const fn voting_halted(&self) -> Option<&'static str> {
+        self.engine.voting_halted()
+    }
+
+    /// Stops voting when the execution layer has refused a commit
+    /// forkchoice as `Invalid`: consensus certified a block this node's
+    /// execution layer will not follow, so its votes would no longer say
+    /// anything about execution. It keeps importing and following, so an
+    /// operator can see where it diverged. `Syncing` answers never get here.
+    fn halt_on_commit_refusal(&mut self) {
+        if !self.halt_on_commit_invalid || self.engine.voting_halted().is_some() {
+            return;
+        }
+        let Some(refusal) = self.driver.first_commit_refusal().cloned() else {
+            return;
+        };
+        let number = refusal.number.or_else(|| self.block_numbers.get(&refusal.block_hash).copied());
+        error!(
+            target: "n42.h2.node",
+            block = ?refusal.block_hash,
+            number = ?number,
+            validation_error = %refusal.validation_error,
+            "the execution layer refused the forkchoice that commits a block: execution diverges from \
+             consensus. This node stops voting and proposing and keeps following. Operator: resync it \
+             with a fresh execution layer (docs/OPERATOR_FAULTS.md); N42_HALT_ON_COMMIT_INVALID=0 disables the halt"
+        );
+        self.engine.halt_voting("commit_invalid");
+        self.driver.discard_prepared();
+        metrics::gauge!(METRIC_VOTING_HALTED, "reason" => "commit_invalid").set(1.0);
+    }
+
+    /// Exports the vote-log failure count, applies the commit-refusal halt,
+    /// and ends the loop on a fatal engine fault.
+    fn check_local_faults(&mut self) -> Result<(), ServiceError> {
+        let failures = self.engine.vote_log_failures_total();
+        if failures > self.vote_log_failures_exported {
+            metrics::counter!(METRIC_VOTE_LOG_FAILURES_TOTAL).increment(failures - self.vote_log_failures_exported);
+            self.vote_log_failures_exported = failures;
+        }
+        self.halt_on_commit_refusal();
+        if let Some((reason, detail)) = self.fatal.take() {
+            metrics::gauge!(METRIC_FATAL, "reason" => reason).set(1.0);
+            error!(
+                target: "n42.h2.node",
+                reason,
+                %detail,
+                vote_log_failures = failures,
+                "fatal local fault: this validator stops. Operator: fix the cause (the consensus \
+                 datadir's disk) and restart it; the vote log replays on restart (docs/OPERATOR_FAULTS.md)"
+            );
+            return Err(ServiceError::Fatal { reason, detail });
+        }
+        Ok(())
     }
 
     /// Runs this node under gov5's `HotStuff` header profile.
@@ -1920,6 +2042,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             let (poll_ms, handle_ms, slowest_ms, slowest_kind) = self.last_drain;
             info!(target: "n42.h2.node", transport_ms, transport_events, poll_ms, handle_ms, slowest_ms, slowest_kind, outputs_ms, flush_ms, "slow step");
         }
+        self.check_local_faults()?;
         Ok(events)
     }
 
@@ -1973,7 +2096,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         if self.engine.vote_aggregate() {
             let at = std::time::Instant::now();
             if let Err(err) = self.engine.flush_votes() {
-                report_engine_error(&err, "vote batch");
+                report_engine_error(&err, "vote batch", &mut self.fatal);
             }
             handle += at.elapsed();
         }
@@ -2623,10 +2746,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // A message that fails the engine's own checks is a
                 // peer problem, not a local one: log it and keep the
                 // node running rather than taking the fleet's word for
-                // when this process should stop.
+                // when this process should stop. Only a fatal local fault
+                // (the vote log failing) ends the step: no peer input can
+                // make one.
                 if let Err(err) = self.engine.process_event(ConsensusEvent::Message(message))
                 {
-                    report_engine_error(&err, "message");
+                    report_engine_error(&err, "message", &mut self.fatal);
                 }
             }
             Err(BridgeError::InvalidBitmap { .. }) => {
@@ -2768,6 +2893,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             for action in self.driver.finish_commit(report).await {
                 self.apply_driver_action(action, events)?;
             }
+            self.halt_on_commit_refusal();
         }
     }
 
@@ -2819,7 +2945,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         {
             if let Err(err) = self.engine.process_event(ConsensusEvent::BlockImported(*block_hash)) {
                 debug!(target: "n42.h2.node", ?block_hash, "engine refused an import it had already been told of");
-                report_engine_error(&err, "repeated import");
+                report_engine_error(&err, "repeated import", &mut self.fatal);
             }
             return Ok(());
         }
@@ -2847,6 +2973,9 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
         let action = self.driver.handle_output(&output).await;
         self.apply_driver_action(action, events)?;
+        // A commit forkchoice refused as Invalid halts voting before the
+        // outputs below (or the next proposal) can carry another vote.
+        self.halt_on_commit_refusal();
 
         match output {
             // v4 has no direct-to-validator transport: a vote to the leader goes
@@ -3519,6 +3648,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     .process_event(ConsensusEvent::BlockReady(built.hash, None))
                 {
                     warn!(target: "n42.h2.node", %err, view, "engine refused our own block");
+                    report_engine_error(&err, "own block", &mut self.fatal);
                 }
                 // The proposal is in the engine's output channel now; it used
                 // to wait there for the step's drain, behind the next build's
@@ -3696,7 +3826,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     }
                 }
                 if let Err(err) = self.engine.process_event(*event) {
-                    report_engine_error(&err, "execution event");
+                    report_engine_error(&err, "execution event", &mut self.fatal);
                 }
             }
             DriverAction::TransactionsMissing { block_hash, indices } => {
@@ -3802,7 +3932,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 warn!(target: "n42.h2.node", ?block_hash, reason, "execution layer rejected a block");
                 if let Err(err) = self.engine.process_event(ConsensusEvent::BlockRejected(block_hash)) {
                     debug!(target: "n42.h2.node", ?block_hash, "engine refused the withdrawal of import evidence");
-                    report_engine_error(&err, "import withdrawal");
+                    report_engine_error(&err, "import withdrawal", &mut self.fatal);
                 }
             }
             DriverAction::Finalized { .. } | DriverAction::Ignored => {}

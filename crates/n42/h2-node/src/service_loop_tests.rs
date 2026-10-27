@@ -804,3 +804,219 @@ async fn the_chain_sealer_is_installed_once_and_only_where_the_sealing_rule_is_k
     assert!(svc.chain_sealer_installed);
     assert!(svc.install_chain_sealer());
 }
+
+// ---------------------------------------------------------------------------
+// Local faults: a failing vote log, a commit the execution layer refuses
+// ---------------------------------------------------------------------------
+
+/// Captures every counter and gauge as `name{label=value,...}` -> value.
+#[derive(Debug, Default)]
+struct Captured(Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>);
+
+#[derive(Debug)]
+struct CapturedSlot {
+    key: String,
+    values: Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>,
+}
+
+impl CapturedSlot {
+    fn update(&self, f: impl FnOnce(f64) -> f64) {
+        let mut values = self.values.lock().expect("captured metrics");
+        let value = values.entry(self.key.clone()).or_insert(0.0);
+        *value = f(*value);
+    }
+}
+
+impl metrics::CounterFn for CapturedSlot {
+    fn increment(&self, value: u64) {
+        self.update(|v| v + value as f64);
+    }
+    fn absolute(&self, value: u64) {
+        self.update(|_| value as f64);
+    }
+}
+
+impl metrics::GaugeFn for CapturedSlot {
+    fn increment(&self, value: f64) {
+        self.update(|v| v + value);
+    }
+    fn decrement(&self, value: f64) {
+        self.update(|v| v - value);
+    }
+    fn set(&self, value: f64) {
+        self.update(|_| value);
+    }
+}
+
+impl metrics::HistogramFn for CapturedSlot {
+    fn record(&self, _value: f64) {}
+}
+
+impl Captured {
+    fn slot(&self, key: &metrics::Key) -> Arc<CapturedSlot> {
+        let labels: Vec<String> = key.labels().map(|l| format!("{}={}", l.key(), l.value())).collect();
+        Arc::new(CapturedSlot { key: format!("{}{{{}}}", key.name(), labels.join(",")), values: Arc::clone(&self.0) })
+    }
+
+    fn value(&self, key: &str) -> Option<f64> {
+        self.0.lock().expect("captured metrics").get(key).copied()
+    }
+}
+
+impl metrics::Recorder for Captured {
+    fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+    fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+    fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        metrics::Counter::from_arc(self.slot(key))
+    }
+    fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::from_arc(self.slot(key))
+    }
+    fn register_histogram(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+        metrics::Histogram::from_arc(self.slot(key))
+    }
+}
+
+#[derive(Debug)]
+struct VoteLogDown;
+
+impl n42_h2_consensus::VoteLogWriter for VoteLogDown {
+    fn record_vote(&self, _view: u64, _lock: &QuorumCertificate) -> n42_h2_consensus::ConsensusResult<()> {
+        Err(n42_h2_consensus::ConsensusError::VoteLogFsync("injected: disk gone".into()))
+    }
+    fn record_commit_vote(&self, view: u64, lock: &QuorumCertificate) -> n42_h2_consensus::ConsensusResult<()> {
+        self.record_vote(view, lock)
+    }
+}
+
+/// Whether the engine has queued a proposal or a vote of this node's.
+fn drained_votes_or_proposals(svc: &mut H2Service<MockExecutionLayer>) -> usize {
+    let mut n = 0;
+    while let Ok(output) = svc.outputs.try_recv() {
+        match output {
+            EngineOutput::BroadcastMessage(Msg::Proposal(_))
+            | EngineOutput::SendToValidator(_, Msg::Vote(_) | Msg::CommitVote(_)) => n += 1,
+            _ => {}
+        }
+    }
+    n
+}
+
+#[test]
+fn the_fault_knobs_parse_with_their_defaults() {
+    assert_eq!(parse_vote_log_fatal_after(None), n42_h2_consensus::DEFAULT_VOTE_LOG_FATAL_AFTER);
+    assert_eq!(parse_vote_log_fatal_after(Some("0")), 0, "0 disables");
+    assert_eq!(parse_vote_log_fatal_after(Some(" 5 ")), 5);
+    assert_eq!(parse_vote_log_fatal_after(Some("x")), n42_h2_consensus::DEFAULT_VOTE_LOG_FATAL_AFTER);
+    assert_eq!(METRIC_VOTE_LOG_FAILURES_TOTAL, "n42_h2_vote_log_failures_total");
+    assert_eq!(METRIC_FATAL, "n42_h2_fatal");
+    assert_eq!(METRIC_VOTING_HALTED, "n42_h2_voting_halted");
+}
+
+#[tokio::test]
+async fn a_vote_log_that_keeps_failing_stops_the_validator_with_a_fatal_error() {
+    let recorder = Captured::default();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let rig = node_with_vote_log(1, 0, Arc::new(VoteLogDown)).await;
+    let mut svc = rig.svc;
+    // One validator leads every view and records its self-vote once per
+    // view, so the run of failures is made one long here; the engine's own
+    // tests count a run of three.
+    svc.engine.set_vote_log_fatal_after(1);
+    let mut events = Vec::new();
+    svc.apply_driver_action(
+        DriverAction::Consensus(Box::new(ConsensusEvent::BlockReady(B256::repeat_byte(0x61), None))),
+        &mut events,
+    )
+    .expect("an engine error does not end the action itself");
+    assert_eq!(drained_votes_or_proposals(&mut svc), 0, "nothing signed without a record");
+    let err = svc.check_local_faults().expect_err("the step ends on the fatal fault");
+    assert!(matches!(err, ServiceError::Fatal { reason: "vote_log", .. }), "{err:?}");
+    assert_eq!(svc.voting_halted(), Some("vote_log"));
+    assert_eq!(recorder.value("n42_h2_vote_log_failures_total{}"), Some(1.0));
+    assert_eq!(recorder.value("n42_h2_fatal{reason=vote_log}"), Some(1.0));
+    // Reported once: the fault was taken.
+    svc.check_local_faults().expect("nothing new");
+}
+
+#[tokio::test]
+async fn a_commit_forkchoice_refused_as_invalid_halts_voting_and_the_node_keeps_following() {
+    let recorder = Captured::default();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let mut rig = node(1, 0, None).await;
+    let mut events = Vec::new();
+    let first = MockExecutionLayer::built_block(1);
+    rig.svc.driver.cache_payload(first.hash, first.execution_data.clone());
+    within(rig.svc.handle_output(EngineOutput::ExecuteBlock(first.hash), &mut events)).await.expect("executed");
+    rig.svc.remember_imported(first.hash);
+    assert!(rig.svc.engine.is_current_leader(), "a single validator leads");
+
+    rig.el.set_behaviour(MockBehaviour {
+        forkchoice_status: PayloadStatusEnum::Invalid { validation_error: "state root mismatch".into() },
+        ..MockBehaviour::default()
+    });
+    within(rig.svc.handle_output(committed(1, first.hash), &mut events)).await.expect("a refused commit is not fatal");
+    assert_eq!(rig.svc.driver.commits_refused(), 1);
+    let refusal = rig.svc.driver.first_commit_refusal().expect("the divergence is kept").clone();
+    assert_eq!(refusal.block_hash, first.hash);
+    assert!(refusal.validation_error.contains("state root mismatch"), "{refusal:?}");
+    assert_eq!(rig.svc.voting_halted(), Some("commit_invalid"));
+    assert_eq!(recorder.value("n42_h2_voting_halted{reason=commit_invalid}"), Some(1.0));
+    rig.svc.check_local_faults().expect("a halt is not fatal: the node keeps running");
+
+    // It no longer proposes or votes ...
+    drained_votes_or_proposals(&mut rig.svc);
+    assert!(!rig.svc.engine.is_current_leader());
+    rig.svc.engine.process_event(ConsensusEvent::BlockReady(B256::repeat_byte(0x77), None)).expect("ignored");
+    assert_eq!(drained_votes_or_proposals(&mut rig.svc), 0, "no proposal or vote after the halt");
+
+    // ... but it still imports and follows the chain.
+    rig.el.set_behaviour(MockBehaviour::default());
+    let second = MockExecutionLayer::built_block_on(2, first.hash);
+    rig.svc.driver.cache_payload(second.hash, second.execution_data.clone());
+    within(rig.svc.handle_output(EngineOutput::ExecuteBlock(second.hash), &mut events)).await.expect("executed");
+    assert_eq!(rig.svc.driver.head(), second.hash, "the import landed after the halt");
+    rig.svc.remember_imported(second.hash);
+    within(rig.svc.handle_output(committed(2, second.hash), &mut events)).await.expect("committed");
+    let calls = rig.el.calls();
+    assert!(
+        calls.iter().any(|c| matches!(c, ElCall::ForkchoiceUpdated(s) if s.head_block_hash == second.hash)),
+        "the commit is still followed: {calls:?}"
+    );
+    assert_eq!(rig.svc.voting_halted(), Some("commit_invalid"), "the halt holds");
+}
+
+#[tokio::test]
+async fn with_the_commit_invalid_halt_off_a_refused_commit_only_counts() {
+    let rig = node(1, 0, None).await;
+    let mut svc = rig.svc.with_halt_on_commit_invalid(false);
+    let mut events = Vec::new();
+    let first = MockExecutionLayer::built_block(1);
+    svc.driver.cache_payload(first.hash, first.execution_data.clone());
+    within(svc.handle_output(EngineOutput::ExecuteBlock(first.hash), &mut events)).await.expect("executed");
+    svc.remember_imported(first.hash);
+    rig.el.set_behaviour(MockBehaviour {
+        forkchoice_status: PayloadStatusEnum::Invalid { validation_error: "bad".into() },
+        ..MockBehaviour::default()
+    });
+    within(svc.handle_output(committed(1, first.hash), &mut events)).await.expect("not fatal");
+    assert_eq!(svc.driver.commits_refused(), 1);
+    assert_eq!(svc.voting_halted(), None, "N42_HALT_ON_COMMIT_INVALID=0 keeps voting");
+    assert!(svc.engine.is_current_leader());
+}
+
+#[tokio::test]
+async fn a_commit_forkchoice_answered_syncing_is_not_a_fault() {
+    let mut rig = node(1, 0, None).await;
+    let mut events = Vec::new();
+    let first = MockExecutionLayer::built_block(1);
+    rig.svc.driver.cache_payload(first.hash, first.execution_data.clone());
+    within(rig.svc.handle_output(EngineOutput::ExecuteBlock(first.hash), &mut events)).await.expect("executed");
+    rig.svc.remember_imported(first.hash);
+    rig.el.set_behaviour(MockBehaviour { forkchoice_status: PayloadStatusEnum::Syncing, ..MockBehaviour::default() });
+    within(rig.svc.handle_output(committed(1, first.hash), &mut events)).await.expect("the commit waits");
+    assert_eq!(rig.svc.driver.commits_refused(), 0);
+    assert_eq!(rig.svc.voting_halted(), None, "Syncing does not halt");
+    rig.svc.check_local_faults().expect("not fatal");
+}

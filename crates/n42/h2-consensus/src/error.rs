@@ -155,6 +155,18 @@ pub enum ConsensusError {
     /// surface (notably its `kind()` is rarely useful past logging).
     #[error("vote log fsync failed: {0}")]
     VoteLogFsync(String),
+
+    /// A local fault after which this validator must stop: the engine has
+    /// already halted its own voting, and the caller is expected to stop the
+    /// validator and exit so an operator restarts it. `reason` is a short
+    /// stable label (a metric label), `detail` the human-readable account.
+    #[error("fatal local fault ({reason}): {detail}")]
+    Fatal {
+        /// Stable label, e.g. `vote_log`.
+        reason: &'static str,
+        /// What happened, for the log.
+        detail: String,
+    },
 }
 
 impl ConsensusError {
@@ -167,10 +179,19 @@ impl ConsensusError {
             self,
             Self::OutputChannelClosed
                 | Self::VoteLogFsync(_)
+                | Self::Fatal { .. }
                 | Self::LocalValidatorNotInSet { .. }
                 | Self::EpochScheduleEmpty
                 | Self::InvalidValidatorSetParams { .. }
         )
+    }
+
+    /// The stable label of a fatal fault, `None` for every other error.
+    pub const fn fatal_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Fatal { reason, .. } => Some(*reason),
+            _ => None,
+        }
     }
 }
 
@@ -186,6 +207,10 @@ mod tests {
     fn local_and_peer_errors_are_told_apart() {
         assert!(ConsensusError::VoteLogFsync("disk".into()).is_local());
         assert!(ConsensusError::OutputChannelClosed.is_local());
+        let fatal = ConsensusError::Fatal { reason: "vote_log", detail: "disk".into() };
+        assert!(fatal.is_local());
+        assert_eq!(fatal.fatal_reason(), Some("vote_log"));
+        assert_eq!(ConsensusError::VoteLogFsync("disk".into()).fatal_reason(), None);
         assert!(ConsensusError::LocalValidatorNotInSet { epoch: 1 }.is_local());
         assert!(!ConsensusError::InvalidSignature { view: 1, validator_index: 0 }.is_local());
         assert!(!ConsensusError::DuplicateVote { view: 1, validator_index: 0 }.is_local());

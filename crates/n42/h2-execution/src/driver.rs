@@ -799,6 +799,8 @@ pub struct ExecutionDriver<E> {
     commit_retry: Option<CommitRetry>,
     /// Commit forkchoices refused as Invalid since start (see `apply_commit`).
     commits_refused: u64,
+    /// The first commit forkchoice refused as Invalid, if any.
+    first_commit_refusal: Option<CommitRefusal>,
     /// The commit that goes next (see [`PendingCommit`]).
     commit_pending: Option<PendingCommit>,
     /// The order the driver first heard each block's commit in, so a commit
@@ -1029,6 +1031,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             commit_in_flight: None,
             commit_retry: None,
             commits_refused: 0,
+            first_commit_refusal: None,
             commit_pending: None,
             commit_orders: HashMap::new(),
             commit_order_seen: std::collections::VecDeque::new(),
@@ -3048,9 +3051,17 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     // import evidence), but it is a quorum-certified block
                     // the execution layer will not follow: consensus and the
                     // execution layer have diverged. Said at error level and
-                    // counted; what the node does about it (stop voting) is
-                    // a policy decision not taken here.
+                    // counted, and the first one kept; what the node does
+                    // about it (stop voting, `N42_HALT_ON_COMMIT_INVALID`) is
+                    // the service's decision, not the driver's.
                     self.commits_refused = self.commits_refused.saturating_add(1);
+                    if self.first_commit_refusal.is_none() {
+                        self.first_commit_refusal = Some(CommitRefusal {
+                            block_hash,
+                            number: self.payloads.get(&block_hash).map(|p| p.payload.block_number()),
+                            validation_error: validation_error.to_string(),
+                        });
+                    }
                     error!(
                         target: "n42.h2.el",
                         block = ?block_hash,
@@ -3172,6 +3183,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.commits_refused
     }
 
+    /// The first commit forkchoice the execution layer refused (Invalid):
+    /// where this node's execution layer diverged from consensus.
+    pub const fn first_commit_refusal(&self) -> Option<&CommitRefusal> {
+        self.first_commit_refusal.as_ref()
+    }
+
     /// Drops what a committed block no longer needs: it will never be
     /// re-executed.
     fn forget_committed(&mut self, block_hash: B256) {
@@ -3179,6 +3196,18 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.bodies.remove(&block_hash);
         self.payload_order.retain(|h| h != &block_hash);
     }
+}
+
+/// A commit forkchoice the execution layer answered `Invalid`: a
+/// quorum-certified block it will not follow. `Syncing` is not one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRefusal {
+    /// The committed block.
+    pub block_hash: B256,
+    /// Its number, when the driver still holds its payload.
+    pub number: Option<u64>,
+    /// The execution layer's validation error.
+    pub validation_error: String,
 }
 
 /// A commit whose forkchoice failed, waiting to be sent again.

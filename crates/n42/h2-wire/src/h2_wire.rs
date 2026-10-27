@@ -491,6 +491,15 @@ pub fn decode_h2_qc(data: &[u8]) -> Result<H2QuorumCertificate, H2WireError> {
     decode_qc(data)
 }
 
+/// Encodes a quorum certificate in gov5's canonical SSZ representation.
+///
+/// This is the inverse of [`decode_h2_qc`] and the exact bytes gov5's
+/// `encodeQC` writes, both inside messages and in a header's extra data
+/// (`buildHeaderExtra(view, committedQC)`).
+pub fn encode_h2_qc(value: &H2QuorumCertificate) -> Result<Vec<u8>, H2WireError> {
+    encode_qc(value)
+}
+
 fn encode_qc(value: &H2QuorumCertificate) -> Result<Vec<u8>, H2WireError> {
     validate_bitmap(&value.signers_bitmap)?;
     let mut out = Vec::new();
@@ -738,6 +747,36 @@ mod tests {
                 item.name
             );
         }
+    }
+
+    #[test]
+    fn standalone_qc_codec_matches_the_gov5_decide_fixture() {
+        let fixture = fixture();
+        let item = fixture.messages.iter().find(|m| m.name == "decide").expect("decide fixture");
+        let wire = hex::decode(&item.wire_hex).expect("fixture hex");
+        let H2Message::Decide(decide) = decode_message(&wire).expect("decode decide") else {
+            panic!("fixture is a decide");
+        };
+        let qc = encode_h2_qc(&decide.commit_qc).expect("encode qc");
+        // The commit QC is the decide's last field: a u32 length, then gov5's bytes.
+        let mut tail = (qc.len() as u32).to_le_bytes().to_vec();
+        tail.extend_from_slice(&qc);
+        assert!(wire.ends_with(&tail), "standalone QC bytes are gov5's");
+        assert_eq!(decode_h2_qc(&qc).unwrap(), decide.commit_qc);
+    }
+
+    #[test]
+    fn standalone_qc_round_trips_and_rejects_a_bad_bitmap() {
+        let qc = H2QuorumCertificate {
+            view: 42,
+            block_hash: B256::repeat_byte(0x11),
+            aggregate_signature: vec![0xab; 96],
+            signers_bitmap: vec![4, 0, 0b0000_0111],
+        };
+        let bytes = encode_h2_qc(&qc).unwrap();
+        assert_eq!(decode_h2_qc(&bytes).unwrap(), qc);
+        let bad = H2QuorumCertificate { signers_bitmap: vec![1, 0, 0x81], ..qc };
+        assert_eq!(encode_h2_qc(&bad), Err(H2WireError::InvalidBitmap));
     }
 
     #[test]

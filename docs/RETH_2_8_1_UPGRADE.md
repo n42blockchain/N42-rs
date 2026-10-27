@@ -77,6 +77,17 @@ multiproof at every tip. A `MemoryOverlayStateProvider` built without the fallba
 - **Engine defaults.** `TreeConfig` / `EngineArgs` defaults are unchanged apart from the new
   `prewarm_reuse` (off). `num_state_masking_blocks` stays 30, persistence threshold 50.
   `--engine.cpu-cores` is new.
+- **Persistence defaults (found 2026-10-27).** The threshold moved 2 → 7 in v2.5.1 and to 50 in
+  v2.7.0 (`DEFAULT_PERSISTENCE_THRESHOLD`, with `DEFAULT_MEMORY_BLOCK_BUFFER_TARGET` 5): reth now
+  persists once more than 50 canonical blocks are in memory, down to the head less 5. The fleet7
+  lean profile passes no `--engine.persistence-threshold`, so its MDBX lagged the head by up to 50
+  blocks (a probe saw blocks 1..46 persisted in one batch at height 51), and a SIGKILL in the first
+  50 blocks restarted at genesis under a QMDB forest already tens of blocks ahead, which the forest
+  could not then restore (fixed separately: the genesis forest is now checkpointed when seeded).
+  On a QMDB chain `effective_tree_config` (`crates/node/builder/src/builder/mod.rs`, beside the
+  masking override) now lowers a threshold and buffer target still at reth's defaults to 8 and 6,
+  the bench profile's values run at 5M TPS; a value the operator passes is kept (one equal to the
+  default reads as unset), and an INFO line names both.
 - **Snap sync.** `--snap.v2` (snap/2 sync, a pluggable engine backfill) is new and off by
   default; `reth-node-ethereum` gains a `snap` module. The new "refuse databases the selected
   sync cannot use" check only concerns snap-synced databases.

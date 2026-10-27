@@ -54,6 +54,27 @@ and pulls the chain by range); on the devnet the `LATE_VALIDATOR=<i>` path of
 layer. If the fresh layer refuses the same block, the block (or this client) is
 the problem, not the node's state: report it before restarting the fleet.
 
+## 3. A crash before the execution layer's first persistence (not a fault)
+
+The QMDB forest settles canonical blocks before reth's database commits them
+(item 6.3), and reth persists in batches: reth 2.8.1's defaults hold up to 50
+canonical blocks in memory (minus a 5-block buffer), which a QMDB chain now
+lowers to 8 and 6 unless `--engine.persistence-threshold` /
+`--engine.memory-block-buffer-target` are given. Either way a node killed in its
+first blocks has an MDBX database still at genesis while `el/qmdb/` already
+holds deltas past it. A restart in
+that state is normal: the genesis seed writes the forest's checkpoint at
+genesis (`forest.bin` in heap mode, `forest.ckpt` in entry-file mode), so the
+delta log starts there, the replay stops at genesis, the restored root is
+checked against the genesis header, and the blocks past it arrive again through
+the engine. Before this, the first checkpoint was written at block 1 and such a
+restart failed with `QMDB snapshot is at block 1 ... but the database head is
+block 0`; a datadir left in that state by an older binary has to be
+re-initialised (`roll <i> --fresh`). The validator's log says how far its
+execution layer has persisted: `persisted block advanced` at most every 10 s,
+and `persistence lagging: head=.. persisted=.. unpersisted=..` while more than
+16 blocks have stood unpersisted for over 10 s.
+
 ## Metrics
 
 | Metric | Type | Meaning |

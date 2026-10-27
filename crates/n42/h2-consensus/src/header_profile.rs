@@ -160,9 +160,17 @@ impl HeaderExtra {
     /// The extra data a leader writes before sealing: view, no QC, seal
     /// reserved. What gov5's `buildHeaderExtra(view, nil)` produces.
     pub const fn for_view(view: u64) -> Self {
+        Self::with_committed_qc(view, Vec::new())
+    }
+
+    /// The extra data a leader writes before sealing when it has a committed
+    /// QC: view, the QC in gov5's encoding (`encodeQC`), seal reserved. What
+    /// gov5's `buildHeaderExtra(view, committedQC)` produces; an empty `qc`
+    /// is [`Self::for_view`].
+    pub const fn with_committed_qc(view: u64, qc: Vec<u8>) -> Self {
         Self {
             view,
-            qc: Vec::new(),
+            qc,
             seal: Some([0; EXTRA_SEAL_LEN]),
         }
     }
@@ -686,15 +694,27 @@ pub fn normalize_to_gov5_h2(
 /// that header's hash, and a hash that differed by one field would be a
 /// block the leader could not propose.
 pub fn gov5_h2_header_for_view(
+    header: alloy_consensus::Header,
+    withdrawals: &[alloy_eips::eip4895::Withdrawal],
+    view: u64,
+    sealer: Option<&BlsSecretKey>,
+) -> Result<alloy_consensus::Header, HeaderProfileError> {
+    gov5_h2_header_for_view_with_qc(header, withdrawals, view, &[], sealer)
+}
+
+/// [`gov5_h2_header_for_view`] with the leader's last committed QC embedded
+/// (gov5's encoding; empty embeds none, gov5's shape before its first commit).
+pub fn gov5_h2_header_for_view_with_qc(
     mut header: alloy_consensus::Header,
     withdrawals: &[alloy_eips::eip4895::Withdrawal],
     view: u64,
+    committed_qc: &[u8],
     sealer: Option<&BlsSecretKey>,
 ) -> Result<alloy_consensus::Header, HeaderProfileError> {
     header.ommers_hash = B256::ZERO;
     header.difficulty = U256::ZERO;
     header.nonce = Default::default();
-    header.extra_data = HeaderExtra::for_view(view).encode();
+    header.extra_data = HeaderExtra::with_committed_qc(view, committed_qc.to_vec()).encode();
     if header.withdrawals_root.is_some() {
         header.withdrawals_root = Some(gov5_rewards_root(withdrawals_to_rewards(withdrawals)));
     }
@@ -722,8 +742,20 @@ pub fn normalize_to_gov5_h2_from_header(
     view: u64,
     sealer: Option<&BlsSecretKey>,
 ) -> Result<(ExecutionData, alloy_consensus::Header), HeaderProfileError> {
+    normalize_to_gov5_h2_from_header_with_qc(header, execution, view, &[], sealer)
+}
+
+/// [`normalize_to_gov5_h2_from_header`] with the leader's last committed QC
+/// embedded (gov5's encoding; empty embeds none).
+pub fn normalize_to_gov5_h2_from_header_with_qc(
+    header: alloy_consensus::Header,
+    execution: &ExecutionData,
+    view: u64,
+    committed_qc: &[u8],
+    sealer: Option<&BlsSecretKey>,
+) -> Result<(ExecutionData, alloy_consensus::Header), HeaderProfileError> {
     let withdrawals = execution.payload.as_v2().map_or(&[][..], |v2| v2.withdrawals.as_slice());
-    let header = gov5_h2_header_for_view(header, withdrawals, view, sealer)?;
+    let header = gov5_h2_header_for_view_with_qc(header, withdrawals, view, committed_qc, sealer)?;
     let hash = header.hash_slow();
     let mut data = execution.clone();
     let v1 = data.payload.as_v1_mut();
@@ -747,6 +779,17 @@ pub fn normalize_to_gov5_h2_with_header(
     view: u64,
     sealer: Option<&BlsSecretKey>,
 ) -> Result<(ExecutionData, alloy_consensus::Header), HeaderProfileError> {
+    normalize_to_gov5_h2_with_header_with_qc(execution, view, &[], sealer)
+}
+
+/// [`normalize_to_gov5_h2_with_header`] with the leader's last committed QC
+/// embedded (gov5's encoding; empty embeds none).
+pub fn normalize_to_gov5_h2_with_header_with_qc(
+    execution: &ExecutionData,
+    view: u64,
+    committed_qc: &[u8],
+    sealer: Option<&BlsSecretKey>,
+) -> Result<(ExecutionData, alloy_consensus::Header), HeaderProfileError> {
     // Raw: the transactions stay the bytes the payload carries, so a block
     // with a transaction type this crate does not model (N42's 0x50) seals
     // like any other, and 163,000 of them are not decoded to be re-encoded.
@@ -757,7 +800,7 @@ pub fn normalize_to_gov5_h2_with_header(
     block.header.ommers_hash = B256::ZERO;
     block.header.difficulty = U256::ZERO;
     block.header.nonce = Default::default();
-    block.header.extra_data = HeaderExtra::for_view(view).encode();
+    block.header.extra_data = HeaderExtra::with_committed_qc(view, committed_qc.to_vec()).encode();
     // gov5's two non-Ethereum roots. The withdrawals field carries the
     // rewards commitment; the block's withdrawals are its rewards (see
     // `rewards_to_withdrawals`), keccak of nothing when there are none.
@@ -1262,6 +1305,56 @@ mod tests {
         assert_eq!(reconstructed.header.withdrawals_root, Some(GOV5_NIL_HASH));
         assert_eq!(reconstructed.header.requests_hash, Some(GOV5_EMPTY_REQUESTS_HASH));
         assert!(proposed.sidecar.requests().is_some());
+    }
+
+    /// Section 6.9 of `docs/MATURITY_HARDENING_2026_10.md`: a header carrying
+    /// the leader's committed QC, as gov5's `buildHeaderExtra(view, qc)`.
+    #[test]
+    fn a_header_with_a_committed_qc_seals_validates_and_gives_the_qc_back() {
+        let qc = n42_h2_wire::h2_wire::H2QuorumCertificate {
+            view: 6,
+            block_hash: B256::repeat_byte(1),
+            aggregate_signature: vec![0x5a; 96],
+            signers_bitmap: vec![4, 0, 0b0000_0111],
+        };
+        let qc_bytes = n42_h2_wire::h2_wire::encode_h2_qc(&qc).unwrap();
+
+        let extra = HeaderExtra::with_committed_qc(7, qc_bytes.clone());
+        let encoded = extra.encode();
+        assert_eq!(encoded.len(), EXTRA_MIN_LEN + qc_bytes.len() + EXTRA_SEAL_LEN);
+        assert_eq!(HeaderExtra::decode(&encoded).unwrap(), extra);
+        assert_eq!(HeaderExtra::with_committed_qc(7, Vec::new()), HeaderExtra::for_view(7));
+
+        // The seal hash strips the seal and nothing else: the QC is signed.
+        let mut header = fixture_header();
+        header.extra_data = encoded.clone();
+        let mut unsealed = header.clone();
+        unsealed.extra_data = Bytes::copy_from_slice(&encoded[..encoded.len() - EXTRA_SEAL_LEN]);
+        assert_eq!(seal_hash(&header), unsealed.hash_slow());
+        assert_ne!(seal_hash(&header), seal_hash(&fixture_header()));
+
+        let key = BlsSecretKey::random().unwrap();
+        seal_header(&mut header, &key).unwrap();
+        verify_seal(&header, &key.public_key()).unwrap();
+        let decoded = validate_gov5_h2_header(&header).unwrap();
+        assert_eq!(decoded.view, 7);
+        assert_eq!(decoded.qc, qc_bytes);
+        assert_eq!(n42_h2_wire::h2_wire::decode_h2_qc(&decoded.qc).unwrap(), qc);
+
+        // The normalizers write the same extra, and an empty QC is the old shape.
+        let block = block_for_header(fixture_header(), vec![]);
+        let built = execution_data_for_block(block.header.hash_slow(), &block);
+        let (data, sealed) = normalize_to_gov5_h2_with_header_with_qc(&built, 7, &qc_bytes, Some(&key)).unwrap();
+        let (_, from_header) =
+            normalize_to_gov5_h2_from_header_with_qc(block.header.clone(), &built, 7, &qc_bytes, Some(&key)).unwrap();
+        assert_eq!(sealed.hash_slow(), data.block_hash());
+        assert_eq!(from_header.hash_slow(), sealed.hash_slow());
+        assert_eq!(HeaderExtra::decode(&sealed.extra_data).unwrap().qc, qc_bytes);
+        let reconstructed = reconstruct_gov5_h2_block::<TxEnvelope>(&data).unwrap();
+        assert_eq!(reconstructed.header.hash_slow(), data.block_hash());
+        let (_, plain) = normalize_to_gov5_h2_with_header_with_qc(&built, 7, &[], None).unwrap();
+        let (_, old) = normalize_to_gov5_h2_with_header(&built, 7, None).unwrap();
+        assert_eq!(plain, old);
     }
 
     #[test]

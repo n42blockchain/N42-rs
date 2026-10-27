@@ -1660,6 +1660,19 @@ impl QmdbNodeState {
         guard.as_ref().and_then(|forest| forest.poisoned().map(str::to_owned))
     }
 
+    /// The entry store's size ([`n42_twig_core::entry_store::EntryStoreStats`],
+    /// `docs/QMDB_COMPACTION_DESIGN.md` 3.7), for the node's gauges. Never
+    /// waits: `None` while the forest lock is held or before the forest is
+    /// initialised, so a sampler skips that tick.
+    pub fn entry_stats(&self) -> Option<n42_twig_core::entry_store::EntryStoreStats> {
+        let guard = match self.inner.forest.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned_forest_guard(poisoned, "entry_stats"),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        guard.as_ref().map(QmdbForest::entry_stats)
+    }
+
     /// Why this run restarted on a tree that was not checked against the
     /// root recorded for its head, if it did: no `forest.roots` (a datadir
     /// from before the check), no whole record of that head (a crash before

@@ -136,6 +136,14 @@ the own-block hold window, index it by first-member sender so `retire` touches o
 senders in the pruned block, and refuse oversize frames at `road_admit`. Each is a bench pair
 (X22 control vs change) before adoption.
 
+Implemented behind knobs in `ad111b05a` and `54362f7d1` (tests); bench pairs pending.
+`N42_ROAD_TAKEN_BOUND=1` forgets a taken frame neither retired nor handed back once more than
+`N42_OWN_HOLD_BLOCKS` + 8 own blocks were held since its take (its block has left the hold
+window; a later give-back goes the lanes' path with a flush, as after `N42_ROAD_TAKEN_MAX`);
+`N42_ROAD_RETIRE_INDEX=1` retires through an index by first-member sender. The oversize refusal
+is unconditional, against the gas limit of the latest frame build (nothing is refused before the
+first build). Metrics: `n42_road_taken_frames`, `n42_road_oversize_frames_total`.
+
 ### 6.5 Local faults that should stop a validator
 
 `VoteLogFsync` means the node cannot record what it voted for; continuing risks equivocation

@@ -237,9 +237,11 @@ impl ConsensusEngine {
         // send_vote(); a fsync failure aborts the proposal.
         // A failed log write must not leave the watermark advanced: the
         // retry after the disk recovers would otherwise be refused.
-        self.vote_log
+        let logged = self
+            .vote_log
             .record_vote(view, self.round_state.locked_qc())
-            .inspect_err(|_| self.round_state.rollback_vote(previous))?;
+            .inspect_err(|_| self.round_state.rollback_vote(previous));
+        self.note_vote_log(logged)?;
         // Reuse the vote_msg computed above (same view + block_hash).
         let leader_vote_sig = self.signing_profile.sign(&self.secret_key, &vote_msg);
         if let Some(ref mut collector) = self.vote_collector {
@@ -524,9 +526,11 @@ impl ConsensusEngine {
         let previous = self.round_state.record_commit_vote(view);
         // A failed log write must not leave the watermark advanced: the
         // retry after the disk recovers would otherwise be refused.
-        self.vote_log
+        let logged = self
+            .vote_log
             .record_commit_vote(view, self.round_state.locked_qc())
-            .inspect_err(|_| self.round_state.rollback_commit_vote(previous))?;
+            .inspect_err(|_| self.round_state.rollback_commit_vote(previous));
+        self.note_vote_log(logged)?;
 
         // Bind this R2 commit-vote signature to the same changes_hash the
         // leader's proposal carried.
@@ -581,9 +585,11 @@ impl ConsensusEngine {
         let previous = self.round_state.record_vote(view);
         // A failed log write must not leave the watermark advanced: the
         // retry after the disk recovers would otherwise be refused.
-        self.vote_log
+        let logged = self
+            .vote_log
             .record_vote(view, self.round_state.locked_qc())
-            .inspect_err(|_| self.round_state.rollback_vote(previous))?;
+            .inspect_err(|_| self.round_state.rollback_vote(previous));
+        self.note_vote_log(logged)?;
 
         let leader = self.leader_index_for_view(view);
         let vote_msg = self.signing_profile.vote_message(view, block_hash);

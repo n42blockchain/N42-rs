@@ -432,7 +432,21 @@ pub struct ConsensusEngine {
     /// for tests / single-validator dev mode; production builds inject a
     /// file-backed implementation from the orchestrator.
     pub(super) vote_log: Arc<dyn VoteLogWriter>,
+    /// Consecutive vote-log failures after which the engine returns
+    /// [`ConsensusError::Fatal`] and halts its voting; `0` never does. See
+    /// [`Self::set_vote_log_fatal_after`].
+    vote_log_fatal_after: u32,
+    /// Vote-log failures since the last write that succeeded.
+    vote_log_failures_in_a_row: u32,
+    /// Vote-log failures since start.
+    vote_log_failures_total: u64,
+    /// Why this node no longer votes, proposes or times out, if it does not
+    /// (see [`Self::halt_voting`]). It keeps following.
+    voting_halted: Option<&'static str>,
 }
+
+/// Consecutive vote-log failures that make the engine stop, by default.
+pub const DEFAULT_VOTE_LOG_FATAL_AFTER: u32 = 3;
 
 impl ConsensusEngine {
     /// Creates a new consensus engine.
@@ -524,6 +538,10 @@ impl ConsensusEngine {
             pending_tx_roots: BoundedFifoMap::new(64),
             pending_changes_hashes: BoundedFifoMap::new(64),
             vote_log,
+            vote_log_fatal_after: DEFAULT_VOTE_LOG_FATAL_AFTER,
+            vote_log_failures_in_a_row: 0,
+            vote_log_failures_total: 0,
+            voting_halted: None,
         }
     }
 
@@ -641,6 +659,10 @@ impl ConsensusEngine {
             pending_tx_roots: BoundedFifoMap::new(64),
             pending_changes_hashes: BoundedFifoMap::new(64),
             vote_log,
+            vote_log_fatal_after: DEFAULT_VOTE_LOG_FATAL_AFTER,
+            vote_log_failures_in_a_row: 0,
+            vote_log_failures_total: 0,
+            voting_halted: None,
         }
     }
 
@@ -987,6 +1009,65 @@ impl ConsensusEngine {
             let oldest = view.saturating_sub(VOTERS_SEEN_WINDOW as u64);
             self.voters_seen.retain(|v, _| *v > oldest);
         }
+    }
+
+    /// Sets how many consecutive vote-log failures make the engine stop
+    /// (`N42_VOTE_LOG_FATAL_AFTER` in the node; default
+    /// [`DEFAULT_VOTE_LOG_FATAL_AFTER`]). `0` never does: every failure only
+    /// aborts its vote, as before.
+    pub fn set_vote_log_fatal_after(&mut self, failures: u32) {
+        self.vote_log_fatal_after = failures;
+    }
+
+    /// Vote-log failures since start.
+    pub const fn vote_log_failures_total(&self) -> u64 {
+        self.vote_log_failures_total
+    }
+
+    /// Vote-log failures since the last write that succeeded.
+    pub const fn vote_log_failures_in_a_row(&self) -> u32 {
+        self.vote_log_failures_in_a_row
+    }
+
+    /// Stops this node voting, proposing and broadcasting timeouts for the
+    /// rest of the process, for `reason` (a stable label). It keeps
+    /// processing proposals, certificates and commits, so it follows the
+    /// chain as an observer. The first reason is kept.
+    pub fn halt_voting(&mut self, reason: &'static str) {
+        if self.voting_halted.is_none() {
+            tracing::error!(target: "n42::cl", reason, "voting halted; this node now only follows");
+            self.voting_halted = Some(reason);
+        }
+    }
+
+    /// Why voting is halted, if it is (see [`Self::halt_voting`]).
+    pub const fn voting_halted(&self) -> Option<&'static str> {
+        self.voting_halted
+    }
+
+    /// Counts one vote-log write's outcome. A success resets the run of
+    /// failures; the failure that makes the run `vote_log_fatal_after` long
+    /// halts voting and turns into [`ConsensusError::Fatal`]: a validator
+    /// that cannot record its votes must not keep voting, because after a
+    /// restart it would not know what it signed.
+    pub(super) fn note_vote_log(&mut self, logged: ConsensusResult<()>) -> ConsensusResult<()> {
+        let Err(err) = logged else {
+            self.vote_log_failures_in_a_row = 0;
+            return Ok(());
+        };
+        self.vote_log_failures_in_a_row = self.vote_log_failures_in_a_row.saturating_add(1);
+        self.vote_log_failures_total = self.vote_log_failures_total.saturating_add(1);
+        if self.vote_log_fatal_after != 0 && self.vote_log_failures_in_a_row >= self.vote_log_fatal_after {
+            self.halt_voting("vote_log");
+            return Err(ConsensusError::Fatal {
+                reason: "vote_log",
+                detail: format!(
+                    "the vote log failed {} times in a row (last: {err})",
+                    self.vote_log_failures_in_a_row
+                ),
+            });
+        }
+        Err(err)
     }
 
     pub fn is_current_leader(&self) -> bool {
@@ -1749,6 +1830,11 @@ impl ConsensusEngine {
     }
 
     pub(super) fn local_validator_index_for_view(&self, view: ViewNumber) -> Option<u32> {
+        // A halted node is an observer: no vote, no commit vote, no timeout,
+        // no proposal (every one of them is gated on this index).
+        if self.voting_halted.is_some() {
+            return None;
+        }
         self.validator_set_for_view(view)
             .index_of_public_key(&self.local_public_key)
     }

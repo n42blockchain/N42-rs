@@ -50,6 +50,22 @@ async fn node(count: usize, index: usize, dial: Option<libp2p::Multiaddr>) -> Ri
 }
 
 async fn node_in(keys: &[BlsSecretKey], set: &ValidatorSet, index: usize, dial: Option<libp2p::Multiaddr>) -> Rig {
+    node_in_with_vote_log(keys, set, index, dial, Arc::new(n42_h2_consensus::NoopVoteLog)).await
+}
+
+/// One member of `count` validators whose engine records votes in `vote_log`.
+async fn node_with_vote_log(count: usize, index: usize, vote_log: Arc<dyn n42_h2_consensus::VoteLogWriter>) -> Rig {
+    let (keys, set) = keys(count);
+    node_in_with_vote_log(&keys, &set, index, None, vote_log).await
+}
+
+async fn node_in_with_vote_log(
+    keys: &[BlsSecretKey],
+    set: &ValidatorSet,
+    index: usize,
+    dial: Option<libp2p::Multiaddr>,
+    vote_log: Arc<dyn n42_h2_consensus::VoteLogWriter>,
+) -> Rig {
     let mut config = TransportConfig::new(ID).with_listen_addr("/ip4/127.0.0.1/tcp/0".parse().expect("addr"));
     if let Some(addr) = dial {
         config = config.with_peer(addr);
@@ -68,8 +84,15 @@ async fn node_in(keys: &[BlsSecretKey], set: &ValidatorSet, index: usize, dial: 
     .expect("the transport starts listening");
     let addr = listen.with(libp2p::multiaddr::Protocol::P2p(*transport.local_peer_id()));
     let (tx, rx) = mpsc::channel::<EngineOutput>(256);
-    let mut engine =
-        ConsensusEngine::new(index as u32, keys[index].clone(), set.clone(), 1_000, 4_000, tx);
+    let mut engine = ConsensusEngine::with_epoch_manager_and_vote_log(
+        index as u32,
+        keys[index].clone(),
+        n42_h2_consensus::EpochManager::new(set.clone()),
+        1_000,
+        4_000,
+        tx,
+        vote_log,
+    );
     engine.enable_h2_v4_signing(ID);
     let el = MockExecutionLayer::new();
     let driver = ExecutionDriver::new(el.clone(), ID.genesis_hash);

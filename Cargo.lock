@@ -7623,6 +7623,7 @@ dependencies = [
  "hex",
  "libc",
  "libp2p",
+ "metrics",
  "n42-h2-consensus",
  "n42-h2-el-rpc",
  "n42-h2-execution",

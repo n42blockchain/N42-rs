@@ -66,6 +66,10 @@ use n42_h2_primitives::bls::BlsSecretKey;
 use n42_h2_primitives::consensus::H2V4ChainIdentity;
 use n42_mobile_service::MobileService;
 
+/// Exit code of a validator stopped by a fatal local fault
+/// (`ServiceError::Fatal`), distinct from the 1 of any other error.
+const FATAL_EXIT_CODE: i32 = 3;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `N42_THP_DISABLE=1`: no transparent huge pages for this process. With
     // the box's THP at `always`, a fleet allocating ~45 GB of anonymous
@@ -630,7 +634,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("running…\n");
         loop {
-            for event in service.step().await? {
+            let events = match service.step().await {
+                Ok(events) => events,
+                // A validator that cannot record its votes must not keep
+                // voting. Exit non-zero so the supervisor (systemd,
+                // `fleet7.sh roll`) restarts it; the vote log replays then.
+                Err(n42_h2_node::ServiceError::Fatal { reason, detail }) => {
+                    eprintln!("FATAL {reason}: {detail}; stopping (see docs/OPERATOR_FAULTS.md)");
+                    std::process::exit(FATAL_EXIT_CODE);
+                }
+                Err(err) => return Err(err.into()),
+            };
+            for event in events {
                 match event {
                     ServiceEvent::Committed {
                         view,

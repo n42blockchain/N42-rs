@@ -454,6 +454,18 @@ new knobs through `n42_env`. `design/integration-2026-10-next` adds the 6.1 comp
   (`N42_QMDB_ENTRY_FILE=1`), which is what production runs; the lean profile keeps the forest on the heap.
   The second reth bump in a row to change a persistence default under the QMDB chain (2.7.0: state
   masking blocks 30), so the bump checklist in `docs/RETH_2_8_1_UPGRADE.md` now names both constants.
+- **Rerun on the fixed binaries (07f1fbdf6, 17:00-17:12 UTC), entry-file mode (`N42_QMDB_ENTRY_FILE=1`,
+  what production runs), first kill 20 s after the start:** node1 killed at height 5 with MDBX still at
+  genesis came back from the genesis checkpoint and committed again (height 7); node2 killed at 27
+  restored its forest at 21 and node3 killed at 48 at 42 (the persisted head now trails by the buffer
+  target of 6, not by up to 50); after 360 s all seven members stood at height 116 with one head hash, no
+  fault line. The 6.3 field check passes. A first rerun with `N42_PROFILE=x22` was void: every execution
+  layer refused to start because the profile sets `N42_FRAME_BLOCKS=1` and the fleet7 genesis has no
+  `frameBlocks` (only the bench genesis files do) -- a 6.1 defect, fixed by gating profile knobs on the
+  genesis features they need (branch `design/profile-chain-gate`).
+- Remaining recovery hole found while fixing (a): in entry-file mode a compaction could move `forest.ckpt`
+  past the MDBX head with no archive, so a restart below it failed; the fold now keeps the pre-fold
+  checkpoint and segment as an archive the restart can replay (281a656c8, `docs/OPERATOR_FAULTS.md` 3).
 - **6.4 bench pairs** (loop351 stage fm, X22 configuration, 600M replay set, integration binaries, warm leg
   then two alternating pairs; 14:51-15:17 UTC):
 

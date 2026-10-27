@@ -272,8 +272,8 @@ async fn legacy_sends_exactly_the_forkchoices_it_always_sent() {
         ForkchoiceState { head_block_hash: tip, safe_block_hash: tip, finalized_block_hash: tip },
         // The build: head = its parent, safe = finalized = the last commit.
         ForkchoiceState { head_block_hash: tip, safe_block_hash: tip, finalized_block_hash: tip },
-        // The pulled block: head and safe, finalized = the last commit.
-        ForkchoiceState { head_block_hash: pulled[0].0, safe_block_hash: pulled[0].0, finalized_block_hash: tip },
+        // The pulled block: head only; safe = finalized = the last commit.
+        ForkchoiceState { head_block_hash: pulled[0].0, safe_block_hash: tip, finalized_block_hash: tip },
     ];
     assert_eq!(all_forkchoices(&el), expected);
 }
@@ -297,6 +297,53 @@ async fn a_pulled_block_moves_no_tag_under_split() {
     // The Decide for the pulled tip certifies its parent.
     driver.handle_output(&committed(pulled[1].0)).await;
     assert_eq!(driver.safe_tag(), Some(Tag { number: 4, hash: pulled[0].0 }));
+}
+
+/// A block pulled by range is head only, in either mode: neither safe nor
+/// finalized moves until a commit names it (or a descendant), and then they
+/// move as that commit says.
+#[tokio::test]
+async fn a_pulled_block_never_moves_safe_in_either_mode() {
+    for mode in [SettlementTags::Split, SettlementTags::Legacy] {
+        let el = MockExecutionLayer::new();
+        let persisted = Arc::new(AtomicU64::new(100));
+        let mut driver = split_driver(&el, &persisted);
+        driver.set_settlement_tags(mode);
+        let blocks = chain_on(GENESIS, 1, 3);
+        for (hash, payload) in &blocks {
+            driver.cache_payload(*hash, payload.clone());
+            driver.handle_output(&committed(*hash)).await;
+        }
+        // What each mode holds as safe and finalized after those commits:
+        // split, the certified block one behind the tip; legacy, the tip.
+        let held = match mode {
+            SettlementTags::Split => blocks[1].0,
+            SettlementTags::Legacy => blocks[2].0,
+        };
+        let tags_before = (driver.safe_tag(), driver.finalized_tag());
+        let pulled = chain_on(blocks[2].0, 4, 3);
+        for (hash, payload) in &pulled {
+            driver.import_pulled(payload.clone()).await.expect("pulled");
+            let sent = *all_forkchoices(&el).last().expect("a forkchoice");
+            assert_eq!(sent.head_block_hash, *hash, "{mode:?}: the pulled block is head");
+            assert_eq!(
+                (sent.safe_block_hash, sent.finalized_block_hash),
+                (held, held),
+                "{mode:?}: a pulled block moves neither safe nor finalized",
+            );
+            assert_eq!((driver.safe_tag(), driver.finalized_tag()), tags_before, "{mode:?}: no tag moved");
+        }
+        // A commit of the pulled tip settles it as that mode always did.
+        driver.handle_output(&committed(pulled[2].0)).await;
+        let sent = *all_forkchoices(&el).last().expect("a commit forkchoice");
+        match mode {
+            SettlementTags::Legacy => assert_eq!(
+                (sent.head_block_hash, sent.safe_block_hash, sent.finalized_block_hash),
+                (pulled[2].0, pulled[2].0, pulled[2].0),
+            ),
+            SettlementTags::Split => assert_eq!(driver.safe_tag(), Some(Tag { number: 5, hash: pulled[1].0 })),
+        }
+    }
 }
 
 /// A leader under the compact take answer (`N42_TAKE_COMPACT=1`): its builds

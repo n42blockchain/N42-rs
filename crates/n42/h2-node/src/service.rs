@@ -280,6 +280,10 @@ pub struct H2Service<E> {
     /// propose -- the chained block's parent hash -- before the proposal
     /// path gets there. `None` on any other profile, and then nothing chains.
     chain_seal_key: Option<n42_h2_primitives::bls::BlsSecretKey>,
+    /// The committed QC this node embeds in the headers it seals (section
+    /// 6.9 of `docs/MATURITY_HARDENING_2026_10.md`), shared with the payload
+    /// normalizer and the chain sealer, which run off this loop.
+    header_qc: Arc<std::sync::Mutex<HeaderQc>>,
     /// Whether the chain sealer has been handed to the execution layer. Once
     /// per process; it captures the attributes builder and the seal key,
     /// which are both set before the first build ahead.
@@ -861,6 +865,45 @@ const HELD_TOO_LONG: std::time::Duration = std::time::Duration::from_secs(2);
 const MAX_IMPORTED: usize = 8192;
 /// Between the end of one catch-up and the start of the next.
 const CATCH_UP_RETRY: Duration = Duration::from_secs(3);
+/// The committed QC this node embeds in the headers it seals, in gov5's
+/// encoding (empty: none yet).
+///
+/// One block is sealed twice on the build chain -- by the chain sealer in
+/// the execution layer's client, then by the payload normalizer -- and the
+/// two must produce the same header, or the chained build's parent is not
+/// the block proposed. A commit can land between the two, so the bytes a
+/// block's first seal used are pinned to its `(number, view)` and handed to
+/// the second. An older committed QC is still a committed QC.
+#[derive(Debug, Default)]
+struct HeaderQc {
+    /// The view of the certificate in `current`; 0 for none.
+    view: u64,
+    /// What a block sealed now embeds.
+    current: Vec<u8>,
+    /// The bytes recently sealed blocks embedded, by `(number, view)`.
+    pinned: std::collections::VecDeque<((u64, u64), Vec<u8>)>,
+}
+
+impl HeaderQc {
+    /// Blocks whose embedded QC is remembered; a block is sealed twice
+    /// within one build, so a few suffice.
+    const PINNED: usize = 16;
+
+    /// The bytes to embed in block `number` sealed for `view`.
+    fn for_block(shared: &std::sync::Mutex<Self>, number: u64, view: u64) -> Vec<u8> {
+        let mut held = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, bytes)) = held.pinned.iter().find(|(key, _)| *key == (number, view)) {
+            return bytes.clone();
+        }
+        let bytes = held.current.clone();
+        if held.pinned.len() >= Self::PINNED {
+            held.pinned.pop_front();
+        }
+        held.pinned.push_back(((number, view), bytes.clone()));
+        bytes
+    }
+}
+
 /// The body of a block this node built and sealed, in gov5's block RLP.
 ///
 /// A node that built this block does not have to take it apart to send it:
@@ -1412,6 +1455,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             outbox: Vec::new(),
             payload_attributes: None,
             chain_seal_key: None,
+            header_qc: Arc::default(),
             chain_sealer_installed: false,
             propose_retry: PROPOSE_RETRY,
             block_pacing: None,
@@ -1583,15 +1627,20 @@ impl<E: ExecutionLayer> H2Service<E> {
         // path does, and must produce the identical header; it is kept only
         // for the profile whose sealing rule is known here.
         self.chain_seal_key = Some(key.clone());
+        self.refresh_header_qc();
+        let header_qc = Arc::clone(&self.header_qc);
         self.driver.set_payload_normalizer(move |payload, header, view| {
+            let number = header.map_or(payload.payload.as_v1().block_number, |h| h.number);
+            let qc = HeaderQc::for_block(&header_qc, number, view);
             match header {
-                Some(header) => n42_h2_consensus::normalize_to_gov5_h2_from_header(
+                Some(header) => n42_h2_consensus::normalize_to_gov5_h2_from_header_with_qc(
                     header.clone(),
                     payload,
                     view,
+                    &qc,
                     Some(&key),
                 ),
-                None => n42_h2_consensus::normalize_to_gov5_h2_with_header(payload, view, Some(&key)),
+                None => n42_h2_consensus::normalize_to_gov5_h2_with_header_with_qc(payload, view, &qc, Some(&key)),
             }
             .map(|(data, header)| (data, Some(header)))
             .map_err(|e| e.to_string())
@@ -1602,6 +1651,43 @@ impl<E: ExecutionLayer> H2Service<E> {
             Some(alloy_primitives::Bytes::from(encode_own_body(execution, header)))
         });
         self
+    }
+
+    /// Re-reads the engine's last committed QC into the bytes this node
+    /// embeds in the headers it seals, when it has moved.
+    ///
+    /// The engine's `last_committed_qc` is only ever set from a commit-domain
+    /// certificate: the CommitQC this node formed from round-two commit votes
+    /// (`try_form_commit_qc`, signed over `commit_message`) or the one a
+    /// Decide carried and that verified under the commit domain
+    /// (`verify_commit_qc_with_profile`), or the same restored from the
+    /// checkpoint. gov5's `maybeCommitFromHeaderQC` requires exactly that
+    /// domain to canonicalize a catching-up node from a header. The view-0
+    /// genesis sentinel embeds nothing, as gov5's `buildHeaderExtra(view,
+    /// nil)`. A certificate that does not encode keeps the previous bytes.
+    fn refresh_header_qc(&mut self) {
+        let qc = self.engine.last_committed_qc();
+        let mut held = self.header_qc.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if held.view == qc.view && qc.view != 0 {
+            return;
+        }
+        if qc.view == 0 {
+            held.view = 0;
+            held.current = Vec::new();
+            return;
+        }
+        match wire_bridge::qc_to_wire(qc)
+            .map_err(|err| err.to_string())
+            .and_then(|wire| n42_h2_wire::h2_wire::encode_h2_qc(&wire).map_err(|err| err.to_string()))
+        {
+            Ok(bytes) => {
+                held.view = qc.view;
+                held.current = bytes;
+            }
+            Err(err) => {
+                warn!(target: "n42.h2.node", view = qc.view, %err, "the committed QC does not encode; headers keep the previous one");
+            }
+        }
     }
 
     /// Sets the header shape used on the block topic.
@@ -2915,6 +3001,11 @@ impl<E: ExecutionLayer> H2Service<E> {
         output: EngineOutput,
         events: &mut Vec<ServiceEvent>,
     ) -> Result<(), ServiceError> {
+        // The engine's committed QC has moved: the next header this node
+        // seals carries it, whatever happens to the commit below.
+        if matches!(output, EngineOutput::BlockCommitted { .. }) {
+            self.refresh_header_qc();
+        }
         // Durability first, and only for the output that announces finality.
         // See the module docs: the Engine API has no way to un-finalise a block.
         if let (EngineOutput::BlockCommitted { view, block_hash, .. }, Some(write)) =
@@ -3224,12 +3315,22 @@ impl<E: ExecutionLayer> H2Service<E> {
         if self.header_profile != HeaderProfile::Gov5H2 {
             return false;
         }
+        let header_qc = Arc::clone(&self.header_qc);
         let sealer: n42_h2_execution::ChainSealer = Arc::new(move |built, built_with, view| {
             // The withdrawals are the block's rewards and live in the
             // attributes it was built with; the header carries only their
             // root, so they cannot be recovered from it.
             let withdrawals = built_with.withdrawals.clone().unwrap_or_default();
-            let sealed = n42_h2_consensus::gov5_h2_header_for_view(built.clone(), &withdrawals, view, Some(&key))
+            // The QC the proposal path will embed for this block, so both
+            // produce the same header.
+            let qc = HeaderQc::for_block(&header_qc, built.number, view);
+            let sealed = n42_h2_consensus::gov5_h2_header_for_view_with_qc(
+                built.clone(),
+                &withdrawals,
+                view,
+                &qc,
+                Some(&key),
+            )
                 .map_err(|err| {
                     warn!(target: "n42.h2.node", %err, number = built.number, "the chain could not seal the built header");
                 })
@@ -4351,7 +4452,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     ///
     /// - It extends the block this pull imported last.
     /// - The committed QC its leader embedded in the header, when there is
-    ///   one (gov5 leaders embed it; this node's leaders do not), verifies
+    ///   one (gov5's leaders and, since 6.9, this node's embed it), verifies
     ///   against the validator set for that QC's exact view through the
     ///   engine's proposal-path check ([`ConsensusEngine::verify_header_qc`]),
     ///   is no later than the header's own view (gov5's `VerifyHeader` rule),

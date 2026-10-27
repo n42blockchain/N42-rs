@@ -37,7 +37,7 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// The snapshot a node wrote at its first canonical block.
+/// The checkpoint a node seeded at genesis wrote (one block applied after it).
 fn first_snapshot(name: &str) -> ForestSnapshot {
     let (state, _, _, _, _) = node_at(name, false, 1);
     read_snapshot(&state.snapshot_path()).expect("read").expect("the first checkpoint")
@@ -497,7 +497,7 @@ fn a_due_checkpoint_rotates_the_log_and_the_compaction_runs_behind() {
 fn an_unreachable_checkpoint_directory_surfaces_as_an_io_error_not_a_panic() {
     let (state, _, dir, _, _) = node_at("io-fail", false, 2);
     let snapshot = read_snapshot(&state.snapshot_path()).expect("read").expect("the node persisted a snapshot");
-    assert_eq!(snapshot.head_hash, hash_of(1), "the checkpoint was written at the first canonical block");
+    assert_eq!(snapshot.head_number, 0, "the checkpoint was written when the genesis forest was seeded");
     // A file where the checkpoint's directory should be: it cannot be created.
     let blocker = dir.join("blocked");
     std::fs::write(&blocker, b"a file where a directory should be").expect("blocker");
@@ -1145,6 +1145,84 @@ fn a_delta_log_ending_before_the_database_head_is_refused() {
         back.initialize((3, head)).expect("the log's own head");
         assert_eq!(back.state_root(), root);
         drop(back);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A node killed before the database's first persistence restarts with the
+/// database at genesis and the forest's log ahead of it (the forest settles
+/// canonical blocks first). The genesis checkpoint written at seeding lets the
+/// replay stop at genesis; the node then follows block 1 again, and a restart
+/// at any logged head still works.
+#[test]
+fn a_restart_at_genesis_under_a_log_that_ran_ahead_succeeds_in_both_storage_modes() {
+    for entry_file in [false, true] {
+        let name = format!("restart-genesis-ahead-{entry_file}");
+        let (state, chain, dir, _head, _root) = node_at(&name, entry_file, 5);
+        let root_3 = state.root_of(&hash_of(3)).expect("root of block 3");
+        drop(state);
+        let genesis = (0, chain.genesis_hash());
+        let genesis_root = chain.genesis_header.state_root;
+
+        let restarted = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        restarted.initialize(genesis).expect("the database at genesis under a log ahead of it");
+        assert_eq!(restarted.state_root(), genesis_root, "entry_file={entry_file}");
+        assert_eq!(restarted.unchecked_restart(), None, "the genesis root is recorded");
+        // The blocks past genesis arrive again and land on the same roots.
+        let mut head = chain.genesis_hash();
+        let mut root = genesis_root;
+        for number in 1..=5 {
+            (head, root) = advance(&restarted, number, head);
+            if number == 3 {
+                assert_eq!(root, root_3, "entry_file={entry_file}");
+            }
+        }
+        drop(restarted);
+
+        // The log written after the genesis restart serves a restart at a
+        // logged head, as before. (The log's own head first: in entry-file
+        // mode a restart drops the entries past its head, so a later restart
+        // cannot go forward again without the blocks.)
+        let at_five = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        at_five.initialize((5, head)).expect("the log's own head");
+        assert_eq!(at_five.state_root(), root, "entry_file={entry_file}");
+        drop(at_five);
+        let at_three = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        at_three.initialize((3, hash_of(3))).expect("a logged head");
+        assert_eq!(at_three.state_root(), root_3, "entry_file={entry_file}");
+        drop(at_three);
+
+        // And at genesis once more, after a second run ahead.
+        let again = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        again.initialize(genesis).expect("genesis again");
+        assert_eq!(again.state_root(), genesis_root, "entry_file={entry_file}");
+        drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The genesis seed leaves a checkpoint at genesis on disk, so the first
+/// canonical block is a delta rather than a rewrite of the tree.
+#[test]
+fn the_genesis_seed_writes_a_checkpoint_at_genesis_in_both_storage_modes() {
+    for entry_file in [false, true] {
+        let chain = qmdb_chain();
+        let dir = scratch(&format!("genesis-ckpt-{entry_file}"));
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        state.initialize((0, chain.genesis_hash())).expect("initialize");
+        let len = state.cursor().checkpoint_len;
+        assert_ne!(len, 0, "entry_file={entry_file}");
+        if entry_file {
+            let ckpt = read_ckpt(&state.ckpt_path()).expect("read").expect("a checkpoint");
+            assert_eq!((ckpt.head_number, ckpt.head_hash), (0, chain.genesis_hash()));
+        } else {
+            let snapshot = read_snapshot(&state.snapshot_path()).expect("read").expect("a checkpoint");
+            assert_eq!((snapshot.head_number, snapshot.head_hash), (0, chain.genesis_hash()));
+        }
+        advance(&state, 1, chain.genesis_hash());
+        assert_eq!(state.cursor().checkpoint_len, len, "block 1 is a delta");
+        assert!(state.cursor().log_len > 0, "entry_file={entry_file}");
+        drop(state);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

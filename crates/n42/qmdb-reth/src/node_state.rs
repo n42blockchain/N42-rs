@@ -25,6 +25,17 @@
 //! starting. The exception is a database at genesis, which is seeded from the
 //! alloc exactly as gov5 does.
 //!
+//! A database at genesis is also the normal state after a crash before the
+//! first persistence: the forest settles canonical blocks before the database
+//! commits them, so a node killed early restarts with the database at block 0
+//! and the forest's files tens of blocks ahead. Seeding therefore writes the
+//! genesis checkpoint at once (in heap mode `forest.bin`; in entry-file mode
+//! `forest.ckpt` when the entries move into the file), so the delta log starts
+//! at genesis and the restart stops its replay there: the genesis root, checked
+//! against the header and the recorded root, with the blocks past it arriving
+//! again through the engine. A heap checkpoint rewritten past the database's
+//! head is restored from the archived pair under `recovery-archive/`.
+//!
 //! What is written per block is a *delta*, not the tree. Serialising the whole
 //! forest every time the head moved cost the size of the world state per block:
 //! tolerable on a devnet whose state is twenty accounts, and impossible on a
@@ -2416,16 +2427,28 @@ impl QmdbNodeState {
                     });
                 }
                 info!(target: "n42.qmdb", root = %forest.root(), "seeded the QMDB forest from the genesis alloc");
-                // A genesis forest has no checkpoint on disk yet; the first
-                // head move writes one, and until then there is nothing for a
-                // delta to be measured against.
+                // The genesis forest is checkpointed at once, so the delta log
+                // starts at genesis. The forest settles canonical blocks before
+                // the database persists them, so a crash before the first
+                // persistence leaves the database at genesis and the log ahead
+                // of it; a restart then stops the replay at genesis. With the
+                // first checkpoint at block 1 instead, no replay could reach
+                // genesis and the node could not start again. The alloc is
+                // small, so this costs one small write.
+                // Any log or segment here belongs to no checkpoint: there is
+                // none. They go before the checkpoint is written.
                 remove_file_logged(&log_path);
                 remove_file_logged(self.sealed_log_path());
+                let mut forest = forest;
+                let snapshot = forest.snapshot()?;
+                forest.forget_changes();
+                let checkpoint_len = write_snapshot(&path, &snapshot, &mut CompactPhases::default())?;
+                self.record_head_roots(&[(0, snapshot.head_hash, Some(header_root))]);
                 *cursor = PersistCursor {
-                    head: forest.head().1,
-                    next_slot: forest.next_slot(),
+                    head: snapshot.head_hash,
+                    next_slot: snapshot.tree.next_slot,
                     log_len: 0,
-                    checkpoint_len: 0,
+                    checkpoint_len,
                     compacting: false,
                 };
                 forest
@@ -2537,6 +2560,10 @@ impl QmdbNodeState {
         let ckpt = forest.checkpoint()?;
         forest.forget_changes();
         let checkpoint_len = write_ckpt(&self.ckpt_path(), &ckpt, &mut CompactPhases::default())?;
+        // The head's root is known good here (checked against the genesis
+        // header, a restored record or a trusted header), so a restart at
+        // this checkpoint is checked too.
+        self.record_head_roots(&[(ckpt.head_number, ckpt.head_hash, Some(forest.root()))]);
         remove_file_logged(self.delta_log_path());
         remove_file_logged(self.sealed_log_path());
         *cursor = PersistCursor {
@@ -3041,9 +3068,10 @@ impl QmdbNodeState {
     /// held: of `target`, or (`None`, the catch-up) of the head the forest
     /// stands at, read under each hold.
     fn persist_canonical(&self, target: Option<B256>, cursor: &mut PersistCursor) -> Result<(), NodeStateError> {
-        // No checkpoint yet (a forest seeded from the alloc, or one whose log
-        // has outgrown it): write the tree once, and the deltas that follow are
-        // measured against it.
+        // No checkpoint to measure a delta against: write the tree once, and
+        // the deltas that follow are measured against it. Initialisation
+        // always leaves one now (the genesis seed writes it), so this is the
+        // defensive path, not the first block's.
         if cursor.checkpoint_len == 0 {
             return self.checkpoint(target, cursor);
         }
@@ -4042,7 +4070,12 @@ mod tests {
         }
         let snapshot = std::fs::read(state.snapshot_path()).unwrap();
         let log = std::fs::read(state.delta_log_path()).unwrap();
-        std::fs::remove_file(state.frontier_path()).unwrap();
+        // The checkpoint is at genesis, which needs no frontier record.
+        match std::fs::remove_file(state.frontier_path()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("{e}"),
+        }
         // A directory in place of the file forces an actual I/O failure even
         // when the tests run with permission to bypass mode bits.
         std::fs::create_dir(state.frontier_path()).unwrap();

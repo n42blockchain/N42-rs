@@ -60,6 +60,15 @@ pub trait N42StateReader: Send + Sync + 'static {
     /// The hashed state of `blocks` (ascending) was written, ahead of its commit.
     fn on_state_persisted(&self, blocks: &[BlockNumHash]);
 
+    /// [`Self::on_state_persisted`] that can refuse the batch: an error fails the persistence
+    /// batch before its commit, so the database never stands past what the reader has made
+    /// durable. This is what persistence calls. The default runs [`Self::on_state_persisted`] and
+    /// accepts.
+    fn on_state_persisted_checked(&self, blocks: &[BlockNumHash]) -> Result<(), PersistRefused> {
+        self.on_state_persisted(blocks);
+        Ok(())
+    }
+
     /// The hashed state above `block` is being unwound.
     fn on_state_unwound(&self, block: BlockNumber);
 }
@@ -71,6 +80,25 @@ pub fn hashed_tables_off() -> bool {
     static OFF: OnceLock<bool> = OnceLock::new();
     *OFF.get_or_init(|| std::env::var("N42_HASHED_TABLES").is_ok_and(|v| v == "off"))
 }
+
+/// Why a reader refused a persistence batch ([`N42StateReader::on_state_persisted_checked`]).
+#[derive(Debug, Clone)]
+pub struct PersistRefused(alloc::string::String);
+
+impl PersistRefused {
+    /// The refusal, described.
+    pub fn new(why: impl core::fmt::Display) -> Self {
+        Self(alloc::format!("{why}"))
+    }
+}
+
+impl core::fmt::Display for PersistRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "the QMDB reader refused the persistence batch: {}", self.0)
+    }
+}
+
+impl core::error::Error for PersistRefused {}
 
 /// A latest-state read the reader did not answer while the hashed tables are not written.
 #[derive(Debug, Clone)]

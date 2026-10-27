@@ -179,10 +179,13 @@ pub(crate) fn account_history_scan_too_long(
     )))
 }
 
-fn timed_on_state_persisted(reader: &dyn N42StateReader, blocks: &[BlockNumHash]) {
+/// The reader's [`N42StateReader::on_state_persisted_checked`] for the batch, timed; its refusal
+/// fails the batch before the commit.
+fn timed_on_state_persisted(reader: &dyn N42StateReader, blocks: &[BlockNumHash]) -> ProviderResult<()> {
     let start = std::time::Instant::now();
-    reader.on_state_persisted(blocks);
+    let checked = reader.on_state_persisted_checked(blocks);
     metrics().save_blocks_qmdb_persisted.record(start.elapsed());
+    checked.map_err(ProviderError::other)
 }
 
 /// Runs `scope` (the backend writes of a batch) and the QMDB read view's `on_state_persisted` for
@@ -197,6 +200,10 @@ fn timed_on_state_persisted(reader: &dyn N42StateReader, blocks: &[BlockNumHash]
 ///   worker). The difference: if `scope` fails, the view has already advanced, as it already does
 ///   today when a static-file or `RocksDB` task fails; a failed batch is fatal to persistence
 ///   either way. If the thread cannot be spawned, the sequential order is used.
+///
+/// Either way a refusal by the reader ([`N42StateReader::on_state_persisted_checked`], e.g. the
+/// QMDB delta log could not be settled through the batch's last block) fails the batch, so the
+/// caller never commits it.
 pub(crate) fn run_with_qmdb_persisted<R>(
     reader: Option<&dyn N42StateReader>,
     blocks: &[BlockNumHash],
@@ -206,7 +213,7 @@ pub(crate) fn run_with_qmdb_persisted<R>(
     let Some(reader) = reader.filter(|_| !blocks.is_empty()) else { return scope() };
     if !in_scope {
         let result = scope()?;
-        timed_on_state_persisted(reader, blocks);
+        timed_on_state_persisted(reader, blocks)?;
         return Ok(result)
     }
     std::thread::scope(|threads| {
@@ -222,12 +229,12 @@ pub(crate) fn run_with_qmdb_persisted<R>(
                     ProviderError::other(std::io::Error::other(
                         "QMDB on_state_persisted thread panicked",
                     ))
-                })?;
+                })??;
                 Ok(result)
             }
             Err(_) => {
                 let result = scope()?;
-                timed_on_state_persisted(reader, blocks);
+                timed_on_state_persisted(reader, blocks)?;
                 Ok(result)
             }
         }
@@ -299,6 +306,35 @@ mod tests {
         assert!(result.is_err());
         // The view advanced (documented): the thread was joined before the error returned.
         assert_eq!(recorder.calls.lock().expect("recorder lock").len(), 1);
+    }
+
+    /// Refuses every batch, as the QMDB reader does when its log cannot be settled.
+    struct Refuser;
+
+    impl N42StateReader for Refuser {
+        fn account(&self, _: &Address, _: BlockNumber) -> Option<Option<Account>> {
+            None
+        }
+        fn storage(&self, _: &Address, _: &B256, _: BlockNumber) -> Option<Option<U256>> {
+            None
+        }
+        fn on_state_persisted(&self, _: &[BlockNumHash]) {}
+        fn on_state_persisted_checked(
+            &self,
+            _: &[BlockNumHash],
+        ) -> Result<(), reth_storage_api::n42_state::PersistRefused> {
+            Err(reth_storage_api::n42_state::PersistRefused::new("log behind"))
+        }
+        fn on_state_unwound(&self, _: BlockNumber) {}
+    }
+
+    #[test]
+    fn a_refusal_fails_the_batch_in_both_orders() {
+        for in_scope in [false, true] {
+            let result = run_with_qmdb_persisted(Some(&Refuser), &blocks(), in_scope, || Ok(3u8));
+            let err = result.expect_err("a refused batch is not committed");
+            assert!(err.to_string().contains("log behind"), "{err} (in_scope={in_scope})");
+        }
     }
 
     #[test]

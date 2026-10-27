@@ -1161,3 +1161,121 @@ fn absent_roots_are_not_recorded_and_an_unreadable_record_is_skipped() {
     drop(restarted);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// The persistence hook orders the delta log before the database's commit
+// ---------------------------------------------------------------------------
+
+/// The state reader's persistence hook with a `wait` deadline.
+fn hook(state: &QmdbNodeState, wait: std::time::Duration) -> crate::state_reader::QmdbStateReader {
+    crate::state_reader::QmdbStateReader::new(state.clone(), wait)
+}
+
+fn persisted(number: u64, hash: B256) -> Vec<alloy_eips::BlockNumHash> {
+    vec![alloy_eips::BlockNumHash::new(number, hash)]
+}
+
+/// The forest's head moved to block 4 but the log was never told (the
+/// catch-up had not run): the hook settles the log through the batch's last
+/// block before it returns, so a restart at the database's head works.
+#[test]
+fn the_persist_hook_settles_a_lagging_log_before_it_returns() {
+    use reth_storage_api::n42_state::N42StateReader;
+    for entry_file in [true, false] {
+        let name = format!("hook-settles-{entry_file}");
+        let (state, chain, dir, h3, _) = node_at(&name, entry_file, 3);
+        let prepared = state.compute(h3, &changes_for(4)).expect("compute");
+        let root = prepared.root;
+        let h4 = hash_of(4);
+        state.insert(h4, 4, prepared).expect("insert");
+        state.with_forest("test", |forest| forest.set_canonical(h4)).expect("head moved, log not told");
+        assert_eq!(state.cursor().head, h3, "the log lags the forest");
+
+        hook(&state, std::time::Duration::from_secs(5)).on_state_persisted_checked(&persisted(4, h4)).expect("settled");
+        assert_eq!(state.cursor().head, h4, "the log reached the batch's last block before the hook returned");
+        drop(state);
+        let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        restarted.initialize((4, h4)).expect("a restart at the database's head");
+        assert_eq!(restarted.state_root(), root);
+        drop(restarted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The canonical notification for the persisted block arrives while the
+/// hook waits: it returns once the log has followed it.
+#[test]
+fn the_persist_hook_waits_for_a_late_canonical_notification() {
+    use reth_storage_api::n42_state::N42StateReader;
+    let (state, _chain, dir, h3, _) = node_at("hook-waits", true, 3);
+    let prepared = state.compute(h3, &changes_for(4)).expect("compute");
+    let h4 = hash_of(4);
+    state.insert(h4, 4, prepared).expect("insert");
+    let follower = state.clone();
+    let late = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        follower.on_canonical(h4).expect("canonical 4");
+    });
+    hook(&state, std::time::Duration::from_secs(20)).on_state_persisted_checked(&persisted(4, h4)).expect("settled");
+    assert_eq!(state.cursor().head, h4);
+    late.join().expect("follower thread");
+    drop(state);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// No canonical notification for the persisted block ever arrives: past the
+/// deadline the batch is refused (the database does not commit it), and a
+/// database that committed it anyway is still refused at start-up.
+#[test]
+fn the_persist_hook_refuses_the_batch_past_its_deadline() {
+    use reth_storage_api::n42_state::N42StateReader;
+    for entry_file in [true, false] {
+        let name = format!("hook-deadline-{entry_file}");
+        let (state, chain, dir, _, _) = node_at(&name, entry_file, 3);
+        let wait = std::time::Duration::from_millis(50);
+        let err = state.settle_through(4, hash_of(4), wait).expect_err("the log cannot reach block 4");
+        assert!(
+            matches!(&err, NodeStateError::PersistUnsettled { number: 4, forest_head: Some(3), waited_ms, .. } if *waited_ms >= 50),
+            "{err}"
+        );
+        let refused = hook(&state, wait).on_state_persisted_checked(&persisted(4, hash_of(4))).expect_err("refused");
+        assert!(refused.to_string().contains("not settled through block 4"), "{refused}");
+        // A block the log already holds is settled at once, even without a wait.
+        state.settle_through(3, hash_of(3), std::time::Duration::ZERO).expect("block 3 is logged");
+        drop(state);
+        let ahead = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        let err = ahead.initialize((4, hash_of(4))).expect_err("the database is past the log");
+        assert!(matches!(err, NodeStateError::SnapshotMismatch { snapshot_number: 3, head_number: 4, .. }), "{err}");
+        drop(ahead);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// What `N42_QMDB_CANONICAL_FATAL` stops the node for, and what the next
+/// head retries.
+#[test]
+fn canonical_errors_split_into_fatal_and_retried() {
+    let (state, _chain, dir, _, _) = node_at("canonical-fatal", true, 1);
+    let unknown = B256::repeat_byte(0x99);
+    let err = state.on_canonical(unknown).expect_err("a head the forest does not hold");
+    assert!(state.is_fatal_canonical_error(&err, unknown), "{err}");
+    assert!(state.is_fatal_canonical_error(&NodeStateError::Poisoned("test".into()), unknown));
+    assert!(state.is_fatal_canonical_error(&NodeStateError::Uninitialised, unknown));
+    let io = NodeStateError::Io { path: PathBuf::from("forest.log"), source: std::io::Error::other("disk full") };
+    assert!(!state.is_fatal_canonical_error(&io, unknown), "a log I/O error is retried by the next head");
+    let entry = NodeStateError::State(StateError::EntryFile("short write".into()));
+    assert!(!state.is_fatal_canonical_error(&entry, unknown));
+    // An unknown head that a kept rename alias may still file is not fatal.
+    let missing = NodeStateError::State(StateError::UnknownBlock(unknown));
+    assert!(state.is_fatal_canonical_error(&missing, unknown));
+    state.keep_rename_alias(PendingRename { from: B256::repeat_byte(0x11), alternate: None, to: unknown, queued_at: std::time::Instant::now() });
+    assert!(!state.is_fatal_canonical_error(&missing, unknown));
+    if std::env::var_os("N42_QMDB_CANONICAL_FATAL").is_none() {
+        assert!(crate::node_state::canonical_fatal(), "fatal by default");
+    }
+    if std::env::var_os("N42_QMDB_SETTLE_WAIT_MS").is_none() {
+        assert_eq!(crate::node_state::settle_wait(), std::time::Duration::from_secs(30));
+    }
+    drop(state);
+    let _ = std::fs::remove_dir_all(&dir);
+}

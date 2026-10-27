@@ -215,6 +215,26 @@ fn canonical_defer_env() -> bool {
     *ON.get_or_init(|| std::env::var("N42_QMDB_CANONICAL_DEFER").is_ok_and(|v| v == "1"))
 }
 
+/// `N42_QMDB_SETTLE_WAIT_MS` (default 30000): how long the persistence hook
+/// ([`QmdbNodeState::settle_through`], called by the state reader before the
+/// database commits a batch) waits for the delta log to reach the batch's last
+/// block before it refuses the batch. Read once.
+pub fn settle_wait() -> std::time::Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(*MS.get_or_init(|| {
+        std::env::var("N42_QMDB_SETTLE_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(30_000)
+    }))
+}
+
+/// `N42_QMDB_CANONICAL_FATAL` (default on; `0` turns it off): a canonical
+/// notification the QMDB log cannot follow
+/// ([`QmdbNodeState::is_fatal_canonical_error`]) ends the process instead of
+/// being logged. Off restores the old log-and-continue, for benches. Read once.
+pub fn canonical_fatal() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_QMDB_CANONICAL_FATAL").map_or(true, |v| v != "0"))
+}
+
 /// `N42_QMDB_PERSIST_BATCH=1` (default off): [`QmdbNodeState::on_persisted`]
 /// lists a whole persistence batch's changes (and raises the read view's
 /// floor for each) under one hold of the forest's lock, then advances the
@@ -510,6 +530,28 @@ pub enum NodeStateError {
     /// The execution frontier required by a deferred checkpoint is unavailable or corrupt.
     #[error("QMDB deferred recovery: {0}")]
     RecoveryFrontier(String),
+    /// The persistence hook ([`QmdbNodeState::settle_through`]) could not
+    /// make the delta log durable through a block the database was about to
+    /// commit: the canonical notification for it had not reached the forest,
+    /// or the log append kept failing, until the deadline. The batch is
+    /// refused, so the database never stands past the log (which a restart
+    /// would refuse as [`Self::SnapshotMismatch`]).
+    #[error(
+        "the QMDB delta log is not settled through block {number} ({hash}) after {waited_ms} ms \
+         (forest head {forest_head:?}): {reason}"
+    )]
+    PersistUnsettled {
+        /// The batch's last block.
+        number: u64,
+        /// Its hash.
+        hash: B256,
+        /// How long the hook waited.
+        waited_ms: u64,
+        /// Where the forest's canonical head stood at the deadline.
+        forest_head: Option<u64>,
+        /// The last settle error, or why the block was not covered.
+        reason: String,
+    },
     /// The tree a restart rebuilt from the checkpoint, the log and the entry
     /// file does not have the root recorded when that head was persisted: a
     /// corrupt or mismatched entry file, checkpoint or log. Refused rather
@@ -2880,6 +2922,77 @@ impl QmdbNodeState {
             return Ok(());
         }
         self.persist_canonical(None, &mut cursor)
+    }
+
+    /// Makes the delta log durable through block `(number, hash)` before the
+    /// database commits it: the persistence hook's ordering guarantee (the
+    /// log is never behind the database, so a crash anywhere leaves a
+    /// datadir that restarts). Once the forest's canonical head has reached
+    /// the block (its number is past it, or it is the block), the log is
+    /// settled to that head ([`Self::settle_canonical`]) and this returns.
+    /// Until then -- the canonical notification for the block has not been
+    /// followed yet -- or while settling fails, it polls (1 ms, growing to
+    /// 10 ms) until `wait` has passed, then refuses with
+    /// [`NodeStateError::PersistUnsettled`]. A zero `wait` tries once.
+    pub fn settle_through(&self, number: u64, hash: B256, wait: std::time::Duration) -> Result<(), NodeStateError> {
+        let started = std::time::Instant::now();
+        let mut pause = std::time::Duration::from_millis(1);
+        loop {
+            let head = self.head();
+            let reason = match head {
+                None => return Err(NodeStateError::Uninitialised),
+                Some((head_number, head_hash)) if head_number > number || (head_number == number && head_hash == hash) => {
+                    match self.settle_canonical() {
+                        Ok(()) => return Ok(()),
+                        Err(error @ (NodeStateError::Poisoned(_) | NodeStateError::Uninitialised)) => return Err(error),
+                        Err(error) => error.to_string(),
+                    }
+                }
+                Some((head_number, head_hash)) => format!(
+                    "the forest's canonical head is block {head_number} ({head_hash}); the canonical \
+                     notification for the block has not been followed"
+                ),
+            };
+            let waited = started.elapsed();
+            if waited >= wait {
+                return Err(NodeStateError::PersistUnsettled {
+                    number,
+                    hash,
+                    waited_ms: waited.as_millis() as u64,
+                    forest_head: head.map(|(n, _)| n),
+                    reason,
+                });
+            }
+            std::thread::sleep(pause.min(wait - waited));
+            pause = (pause * 2).min(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Whether an [`Self::on_canonical`] error for `block_hash` means the
+    /// log can no longer follow the chain (`N42_QMDB_CANONICAL_FATAL`), as
+    /// opposed to a condition the next canonical head already retries.
+    ///
+    /// Fatal: a poisoned forest (no root is computed again until a restart);
+    /// an uninitialised one (the follower runs only after initialisation);
+    /// a refusal by the trees (`State`: a head the forest does not hold, or
+    /// any refused move of the canonical head), except an entry-file I/O
+    /// error and an unknown block that a kept rename alias may still file
+    /// under that hash. Not fatal: I/O on the log, checkpoint or frontier
+    /// (`Io`, `Decode`, `RecoveryFrontier`), which leave the persistence
+    /// cursor where it was so the next head appends again, and whose
+    /// persistent form the persistence hook refuses
+    /// ([`Self::settle_through`]).
+    pub fn is_fatal_canonical_error(&self, error: &NodeStateError, block_hash: B256) -> bool {
+        match error {
+            NodeStateError::Poisoned(_) | NodeStateError::Uninitialised => true,
+            NodeStateError::State(StateError::EntryFile(_)) => false,
+            NodeStateError::State(StateError::UnknownBlock(unknown)) => {
+                let aliases = self.inner.rename_aliases.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                !aliases.iter().any(|alias| alias.to == *unknown || alias.to == block_hash)
+            }
+            NodeStateError::State(_) => true,
+            _ => false,
+        }
     }
 
     /// Wakes the catch-up thread, starting it on first use. It holds the

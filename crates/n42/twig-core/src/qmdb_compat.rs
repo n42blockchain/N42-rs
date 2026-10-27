@@ -1843,6 +1843,13 @@ impl QmdbCompatTree {
         self.index.memory_bytes()
     }
 
+    /// The entry store's size ([`crate::entry_store::EntryStoreStats`]): a
+    /// few counters, the index's length as the live slots (it names every
+    /// active slot once) and its table sizes -- nothing linear in the slots.
+    pub fn entry_stats(&self) -> crate::entry_store::EntryStoreStats {
+        crate::entry_store::EntryStoreStats { index_bytes: self.index_bytes() as u64, ..self.entries.stats(self.index.len()) }
+    }
+
     pub fn get(&self, key: &Hash) -> Option<&[u8]> {
         self.index
             .get(key, |slot| self.entries.key(slot as usize))

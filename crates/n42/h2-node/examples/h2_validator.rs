@@ -70,6 +70,17 @@ use n42_mobile_service::MobileService;
 /// (`ServiceError::Fatal`), distinct from the 1 of any other error.
 const FATAL_EXIT_CODE: i32 = 3;
 
+/// Withdraws the profile's knobs that need a genesis feature the chain does
+/// not enable (`n42_env::profile::reconcile`); called once, as soon as the
+/// chain is known, before any of them is read.
+fn reconcile_profile(frame_blocks: bool) {
+    let features = n42_env::profile::ChainFeatures { frame_blocks };
+    // SAFETY: called from `main` before the validator starts its runtime or
+    // any thread of its own (the tracing subscriber spawns none), so nothing
+    // reads or writes the environment concurrently.
+    unsafe { n42_env::profile::reconcile_and_report("h2_validator", features) };
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `N42_PROFILE=x22`: the adopted knob set, for every knob the operator
     // left unset, before any knob is read or any thread exists.
@@ -186,10 +197,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut deferred_execution_time: Option<u64> = None;
     // The chain's `deferredExecutionDepth` (1 when absent).
     let mut deferred_execution_depth: u64 = 1;
+    if chain_path.is_none() {
+        // No genesis to read a feature from: the chain-gated knobs a profile
+        // set are withdrawn.
+        reconcile_profile(false);
+    }
     let (identity, validators): (H2V4ChainIdentity, Vec<ValidatorInfo>) = match &chain_path {
         Some(path) => {
             use reth_cli::chainspec::ChainSpecParser as _;
             let spec = n42_qmdb_reth::N42ChainSpecParser::parse(path)?;
+            // The profile's knobs that need a genesis feature this chain
+            // lacks (`frameBlocks`) are withdrawn before any is read.
+            // `reth_chainspec::qmdb::FRAME_BLOCKS_KEY`, read as
+            // `frame_blocks_enabled` reads it: anything but `true` is off.
+            reconcile_profile(
+                spec.genesis
+                    .config
+                    .extra_fields
+                    .get_deserialized::<bool>("frameBlocks")
+                    .and_then(Result::ok)
+                    .unwrap_or(false),
+            );
             deferred_execution_time = n42_qmdb_reth::deferred_execution_time(&spec.genesis);
             // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md):
             // refused when malformed or not run by this build, never read as 1.

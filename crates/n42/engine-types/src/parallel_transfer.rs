@@ -1006,7 +1006,7 @@ pub fn build_mlp() -> usize {
     static ENV: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     match BUILD_MLP_SET.load(std::sync::atomic::Ordering::Relaxed) {
         usize::MAX => *ENV.get_or_init(|| {
-            std::env::var("N42_BUILD_MLP").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0).min(BUILD_MLP_MAX)
+            n42_env::parse::<usize>("N42_BUILD_MLP", 0).min(BUILD_MLP_MAX)
         }),
         k => k,
     }
@@ -1554,7 +1554,7 @@ pub fn build_one_wave() -> bool {
 /// opens its own view of the parent, so more batches cost more opens.
 pub fn build_batches() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("N42_BUILD_BATCHES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    *N.get_or_init(|| n42_env::parse("N42_BUILD_BATCHES", 0))
 }
 
 /// How a build's batches are made and handed to the pool.
@@ -4395,7 +4395,7 @@ pub fn graft_stream() -> bool {
 /// ([`graft_stream`]).
 pub fn follower_graft_stream() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_GRAFT_STREAM").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_GRAFT_STREAM", true))
 }
 
 /// Whether the graft takes the largest bundle as the block's bundle (default;
@@ -4403,7 +4403,7 @@ pub fn follower_graft_stream() -> bool {
 /// 43's loop98).
 fn graft_base_swap() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_GRAFT_BASE_SWAP").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_GRAFT_BASE_SWAP", true))
 }
 
 /// Whether `N42_FOLLOWER_FREE_ASYNC=1` is set: the executor's own working
@@ -4557,7 +4557,7 @@ where
 /// follower's own path), so the block's post-state is unchanged.
 pub fn follower_batch_state() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_BATCH_STATE").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_BATCH_STATE", true))
 }
 
 /// One follower batch on the leader's cuts ([`follower_batch_state`]): the

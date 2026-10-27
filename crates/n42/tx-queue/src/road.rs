@@ -231,7 +231,7 @@ pub(crate) fn road_stuck_legacy() -> bool {
 /// flushes, ~147k-transaction blocks).
 fn road_debt_sweep_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_ROAD_DEBT_SWEEP").map_or(true, |v| v.trim() != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_ROAD_DEBT_SWEEP", true))
 }
 
 /// Why the road was invalidated (the flush's log line).

@@ -555,5 +555,5 @@ pub fn parallel_state_commit() -> bool {
     // On by default since round 43's loop82 (223-228k against 189-201k on
     // window 1 at 147,000 accounts a block, the follower's import 488-562 ms
     // against 605-690); `N42_PARALLEL_STATE_COMMIT=0` is the serial path.
-    *ON.get_or_init(|| std::env::var("N42_PARALLEL_STATE_COMMIT").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_PARALLEL_STATE_COMMIT", true))
 }

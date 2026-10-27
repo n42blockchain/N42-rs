@@ -15,6 +15,7 @@ description = "QMDB-style twig engine (all-DRAM AlDBaran variant) — ported fro
 # verification, so mobile / FFI can verify twig proofs without the storage stack.
 
 [dependencies]
+n42-env.workspace = true
 blake3.workspace = true
 memmap2.workspace = true
 # "std" as well as "derive": the workspace pins serde with default-features

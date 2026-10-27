@@ -12,6 +12,7 @@ description = "N42 transaction types: reth's Ethereum envelope plus the 0x50 alt
 workspace = true
 
 [dependencies]
+n42-env.workspace = true
 alloy-consensus = { workspace = true, features = ["std", "serde", "secp256k1"] }
 alloy-eips = { workspace = true, features = ["std", "serde"] }
 alloy-primitives = { workspace = true, features = ["std", "serde", "rlp"] }

@@ -12,6 +12,7 @@ description = "A builder-side transaction queue fed by the binary ingest, beside
 workspace = true
 
 [dependencies]
+n42-env.workspace = true
 reth-transaction-pool.workspace = true
 reth-primitives-traits.workspace = true
 alloy-primitives.workspace = true

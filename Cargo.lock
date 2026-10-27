@@ -7160,6 +7160,7 @@ dependencies = [
  "n42-core-layout",
  "n42-engine-primitives",
  "n42-engine-types",
+ "n42-env",
  "n42-h2-consensus",
  "n42-h2-execution",
  "n42-primitives",
@@ -7445,6 +7446,7 @@ dependencies = [
  "n42-core-layout",
  "n42-deferred-reverts",
  "n42-engine-primitives",
+ "n42-env",
  "n42-h2-consensus",
  "n42-primitives",
  "n42-qmdb-reth",
@@ -7507,6 +7509,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-env"
+version = "2.1.5"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "n42-fusaka"
 version = "2.1.5"
 dependencies = [
@@ -7553,6 +7562,7 @@ dependencies = [
  "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
  "async-trait",
+ "n42-env",
  "n42-h2-consensus",
  "n42-h2-execution",
  "n42-tx-types",
@@ -7623,6 +7633,7 @@ dependencies = [
  "hex",
  "libc",
  "libp2p",
+ "n42-env",
  "n42-h2-consensus",
  "n42-h2-el-rpc",
  "n42-h2-execution",
@@ -7774,6 +7785,7 @@ dependencies = [
  "eyre",
  "libc",
  "n42-core-layout",
+ "n42-env",
  "n42-h2-consensus",
  "n42-h2-primitives",
  "n42-legacy-codec",
@@ -7920,6 +7932,7 @@ dependencies = [
  "libc",
  "memmap2",
  "n42-core-layout",
+ "n42-env",
  "n42-legacy-codec",
  "rand 0.9.5",
  "rayon",
@@ -7940,6 +7953,7 @@ dependencies = [
  "libc",
  "n42-core-layout",
  "n42-engine-types",
+ "n42-env",
  "n42-sharded-output",
  "n42-tx-queue",
  "n42-tx-types",
@@ -7959,6 +7973,7 @@ version = "2.1.5"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives 1.7.3",
+ "n42-env",
  "parking_lot 0.12.5",
  "rayon",
  "reth-ethereum-primitives",
@@ -7986,6 +8001,7 @@ dependencies = [
  "fixed-cache",
  "hex",
  "merlin",
+ "n42-env",
  "rand_core 0.6.4",
  "rayon",
  "reth-codecs 0.8.2",

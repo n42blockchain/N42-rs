@@ -10,6 +10,7 @@ repository.workspace = true
 description = "Engine API client implementing the HotStuff-2 execution-layer seam over JSON-RPC"
 
 [dependencies]
+n42-env.workspace = true
 n42-h2-execution.workspace = true
 n42-tx-types.workspace = true
 alloy-consensus.workspace = true

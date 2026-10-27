@@ -91,7 +91,7 @@ shape, seven independent members each with its own execution layer and validator
 mesh, no discovery and no devp2p. Its genesis is `crates/chainspec/res/genesis/n42_fleet7.json`
 (chain 94's consensus parameters: epoch 200, gov5's 200,000-slot committee pool with 512 signers,
 but every fork at block 0, because the block reward is paid as withdrawals). Every launch argument
-lives in `scripts/fleet7-env.sh` and nowhere else. `up --fresh` / `status` / `watch <secs>` /
+lives in `scripts/fleet7-env.sh` and nowhere else (`N42_PROFILE=x22` on `n42` / `h2_validator` fills in the 41 `adopted` knobs of `docs/KNOBS.md` that the environment leaves unset; `crates/n42/env`). `up --fresh` / `status` / `watch <secs>` /
 `roll <i>` / `down`; `F7_TXGEN_RATE=<tx/s>` offers it load (200 tx/s sustained,
 0 rejected, block interval held).
 

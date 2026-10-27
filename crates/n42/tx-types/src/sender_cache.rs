@@ -46,10 +46,7 @@ impl AltSigSenderCache {
     pub fn global() -> &'static Self {
         static GLOBAL: OnceLock<AltSigSenderCache> = OnceLock::new();
         GLOBAL.get_or_init(|| {
-            let entries = std::env::var("N42_ALTSIG_SENDER_CACHE")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(1 << 20);
+            let entries = n42_env::parse::<usize>("N42_ALTSIG_SENDER_CACHE", 1 << 20);
             Self::new(entries)
         })
     }

@@ -29,6 +29,13 @@ use tracing::{debug, error, info, warn};
 const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
 fn main() {
+    // `N42_PROFILE=x22`: the adopted knob set, for every knob the operator
+    // left unset. First, before any knob is read (they are cached in
+    // `OnceLock`s at first use) and before any thread exists.
+    // SAFETY: the first statement of `main`: no thread this program starts
+    // exists yet, and nothing else reads or writes the environment
+    // concurrently (the allocator read its configuration before `main`).
+    unsafe { n42_env::profile::apply_or_exit("n42") };
     // Enable backtraces unless a RUST_BACKTRACE value has already been
     // explicitly provided. First, before this process spawns any thread or
     // moves the allocator's (`n42_core_layout::init` below).
@@ -59,7 +66,7 @@ fn main() {
     }
     let trusting_knobs = n42_tx_types::trusting_ingest_knobs(
         ingest_mode,
-        std::env::var_os("N42_TX_INGEST_DIRECT").is_some(),
+        n42_env::flag("N42_TX_INGEST_DIRECT", false),
         std::env::var_os("N42_FRAME_GATEWAYS").is_some(),
     );
     // `N42_CORE_LAYOUT=isolate`: split the node's affinity mask into the
@@ -572,7 +579,7 @@ fn main() {
                         let engine = node.add_ons_handle.beacon_engine_handle.clone();
                         // Our own sealed blocks go in with the build's execution
                         // rather than being executed again; see payload_serve.
-                        let reuse = (std::env::var("N42_NO_OWN_BLOCK_REUSE").is_err()).then(|| {
+                        let reuse = (!n42_env::flag("N42_NO_OWN_BLOCK_REUSE", false)).then(|| {
                             let chain_spec = node.chain_spec();
                             let profile = n42_engine_types::engine_validator::header_profile_for(&chain_spec);
                             n42::payload_serve::OwnBlockReuse {
@@ -591,7 +598,7 @@ fn main() {
                                 // same per-transaction removal the pool's own maintenance
                                 // pays later -- so doing it on the import path moves the
                                 // cost onto the critical path rather than removing it.
-                                import_foreign: (std::env::var("N42_FOLLOWER_DIRECT_IMPORT").is_ok()).then(|| {
+                                import_foreign: n42_env::flag("N42_FOLLOWER_DIRECT_IMPORT", false).then(|| {
                                     let provider = node.provider.clone();
                                     let evm_config = node.evm_config.clone();
                                     let senders_cache = node.evm_config.sender_recovery_cache.clone();
@@ -605,7 +612,7 @@ fn main() {
                                         )
                                     }) as std::sync::Arc<n42::payload_serve::ForeignImport>
                                 }),
-                                exec_probe: (std::env::var("N42_FOLLOWER_EXEC_PROBE").is_ok()).then(|| {
+                                exec_probe: n42_env::flag("N42_FOLLOWER_EXEC_PROBE", false).then(|| {
                                     let provider = node.provider.clone();
                                     let evm_config = node.evm_config.clone();
                                     std::sync::Arc::new(move |block: reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>| {
@@ -620,7 +627,7 @@ fn main() {
                                         Ok((started.elapsed().as_millis() as u64, out.gas_used, out.receipts.len()))
                                     }) as std::sync::Arc<dyn Fn(reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>) -> Result<(u64, u64, usize), String> + Send + Sync>
                                 }),
-                                prune_pool: (std::env::var("N42_PRUNE_POOL_ON_IMPORT").is_ok()).then(|| {
+                                prune_pool: n42_env::flag("N42_PRUNE_POOL_ON_IMPORT", false).then(|| {
                                     let pool = node.pool.clone();
                                     std::sync::Arc::new(move |hashes: Vec<alloy_primitives::B256>| {
                                         let _ = reth_transaction_pool::TransactionPool::remove_transactions(&pool, hashes);
@@ -686,9 +693,9 @@ fn main() {
             // The builder-side transaction queue, beside the pool. See
             // n42_tx_queue. Fed by the ingest, drained by the builder, pruned
             // here by every canonical block on every node.
-            if std::env::var("N42_TX_QUEUE").is_ok() {
+            if n42_env::flag("N42_TX_QUEUE", false) {
                 let queue: n42_tx_queue::TxQueue<n42_engine_types::N42PooledTransaction> = n42_tx_queue::TxQueue::new();
-                if std::env::var("N42_TX_QUEUE_DRAINER").is_ok() && queue.wants_drainer_thread() {
+                if n42_env::flag("N42_TX_QUEUE_DRAINER", false) && queue.wants_drainer_thread() {
                     // N42_QUEUE_OFFLOCK: a thread of its own, woken early by a
                     // deep inbox; while it runs the block path's holds drain
                     // only a bounded slice. See TxQueue::run_drainer.
@@ -699,7 +706,7 @@ fn main() {
                     {
                         tracing::warn!(target: "reth::cli", %err, "could not start the queue's drainer thread");
                     }
-                } else if std::env::var("N42_TX_QUEUE_DRAINER").is_ok() {
+                } else if n42_env::flag("N42_TX_QUEUE_DRAINER", false) {
                     // The inbox drained off the builder's thread; see TxQueue::drain_now.
                     let drained = queue.clone();
                     tokio::spawn(async move {

@@ -67,6 +67,11 @@ use n42_h2_primitives::consensus::H2V4ChainIdentity;
 use n42_mobile_service::MobileService;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `N42_PROFILE=x22`: the adopted knob set, for every knob the operator
+    // left unset, before any knob is read or any thread exists.
+    // SAFETY: the first statement of `main`: no thread this program starts
+    // exists yet, so nothing reads or writes the environment concurrently.
+    unsafe { n42_env::profile::apply_or_exit("h2_validator") };
     // `N42_THP_DISABLE=1`: no transparent huge pages for this process. With
     // the box's THP at `always`, a fleet allocating ~45 GB of anonymous
     // memory drove 5.8M direct-compaction stalls that tore the page cache
@@ -512,10 +517,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("transaction source: {rpc}");
         }
         if let Some(addr) = &el_ingest {
-            let lanes = std::env::var("N42_INGEST_FORWARD_LANES")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(4usize);
+            let lanes = n42_env::parse("N42_INGEST_FORWARD_LANES", 4usize);
             service = service.with_transaction_ingest(addr.clone(), lanes);
             println!("gossip -> pool : binary ingest at {addr}, {lanes} connections");
         }
@@ -590,7 +592,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // imports its own block. With round-robin it stays behind the
             // switch, because measured there it was a loss (see the service).
             service = service
-                .with_build_ahead(std::env::var("N42_BUILD_AHEAD").is_ok() || leader_tenure > 1);
+                .with_build_ahead(n42_env::flag("N42_BUILD_AHEAD", false) || leader_tenure > 1);
             service = service.with_payload_attributes(move |context| {
                 let parent_beacon_block_root = match (&committee, &context.head_header) {
                     (Some(pool), Some(parent)) => {

@@ -175,7 +175,7 @@ const PARK_BUILDS: u64 = 8;
 fn park_lane_cap() -> usize {
     static LANES: OnceLock<usize> = OnceLock::new();
     *LANES.get_or_init(|| {
-        std::env::var("N42_TX_QUEUE_PARK_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        n42_env::parse("N42_TX_QUEUE_PARK_LANES", 0)
     })
 }
 
@@ -496,10 +496,7 @@ pub fn prune_lean() -> bool {
 pub fn lean_drain_budget() -> usize {
     static BUDGET: OnceLock<usize> = OnceLock::new();
     *BUDGET.get_or_init(|| {
-        let budget = std::env::var("N42_PRUNE_LEAN_DRAIN_TXS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(LEAN_DRAIN_PER_BLOCK);
+        let budget = n42_env::parse("N42_PRUNE_LEAN_DRAIN_TXS", LEAN_DRAIN_PER_BLOCK);
         tracing::info!(target: "n42.tx_queue", lean_drain_txs = budget, "N42_PRUNE_LEAN_DRAIN_TXS");
         budget
     })
@@ -665,7 +662,7 @@ fn freeing_threads() -> &'static [std::sync::mpsc::SyncSender<Freeable>] {
     static SENDERS: OnceLock<Vec<std::sync::mpsc::SyncSender<Freeable>>> = OnceLock::new();
     SENDERS.get_or_init(|| {
         let threads =
-            std::env::var("N42_QUEUE_FREE_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
+            n42_env::parse::<usize>("N42_QUEUE_FREE_THREADS", 1).max(1);
         if threads > 1 {
             tracing::info!(target: "n42.tx_queue", threads, "N42_QUEUE_FREE_THREADS");
         }
@@ -1592,7 +1589,7 @@ pub fn plan_ahead() -> bool {
 /// `docs/SHARED_EXECUTION_SCOPE.md` 16.4.1.
 pub fn plan_ahead_wait_ms() -> u64 {
     static MS: OnceLock<u64> = OnceLock::new();
-    *MS.get_or_init(|| std::env::var("N42_PLAN_AHEAD_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    *MS.get_or_init(|| n42_env::parse("N42_PLAN_AHEAD_WAIT_MS", 0))
 }
 
 /// The continuous preparer's poll ([`TxQueue::prepare_continuously`]):
@@ -1654,7 +1651,7 @@ pub fn take_offlock_stats() -> (u64, u64) {
 /// hold, as before.
 fn drain_chunk() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| std::env::var("N42_TX_QUEUE_DRAIN_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    *N.get_or_init(|| n42_env::parse("N42_TX_QUEUE_DRAIN_CHUNK", 0))
 }
 
 /// `N42_TX_QUEUE_DRAIN_RUNS=1`, read once: the drainer's chunked and sliced
@@ -1760,7 +1757,7 @@ fn hash_index_capacity() -> Option<usize> {
 /// ([`TxQueue::push_frame`]): `N42_FRAME_ARCS`, on unless `0`.
 fn frame_arcs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FRAME_ARCS").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_FRAME_ARCS", true))
 }
 
 /// `staged` put in the order of `hashes`, the frame's: as it is when the
@@ -7335,7 +7332,7 @@ enum SlowFrame<T: PoolTransaction> {
 /// is checked and taken in turn. The plan is the same either way.
 fn frame_select_parallel() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FRAME_SELECT_PARALLEL").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_FRAME_SELECT_PARALLEL", true))
 }
 
 /// `N42_TX_QUEUE_BATCH`, read once.

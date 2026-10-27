@@ -52,10 +52,7 @@ pub fn enabled() -> bool {
 /// Async workers of the ingest's runtime: `N42_INGEST_RUNTIME_WORKERS`, 8 by
 /// default, clamped to 1..=64.
 pub(crate) fn workers() -> usize {
-    std::env::var("N42_INGEST_RUNTIME_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(8)
+    n42_env::parse::<usize>("N42_INGEST_RUNTIME_WORKERS", 8)
         .clamp(1, 64)
 }
 

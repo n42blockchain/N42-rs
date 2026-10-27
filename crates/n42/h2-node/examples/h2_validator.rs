@@ -67,6 +67,11 @@ use n42_h2_primitives::consensus::H2V4ChainIdentity;
 use n42_mobile_service::MobileService;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `N42_PROFILE=x22`: the adopted knob set, for every knob the operator
+    // left unset, before any knob is read or any thread exists.
+    // SAFETY: the first statement of `main`: no thread this program starts
+    // exists yet, so nothing reads or writes the environment concurrently.
+    unsafe { n42_env::profile::apply_or_exit("h2_validator") };
     // `N42_THP_DISABLE=1`: no transparent huge pages for this process. With
     // the box's THP at `always`, a fleet allocating ~45 GB of anonymous
     // memory drove 5.8M direct-compaction stalls that tore the page cache

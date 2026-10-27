@@ -29,6 +29,13 @@ use tracing::{debug, error, info, warn};
 const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
 fn main() {
+    // `N42_PROFILE=x22`: the adopted knob set, for every knob the operator
+    // left unset. First, before any knob is read (they are cached in
+    // `OnceLock`s at first use) and before any thread exists.
+    // SAFETY: the first statement of `main`: no thread this program starts
+    // exists yet, and nothing else reads or writes the environment
+    // concurrently (the allocator read its configuration before `main`).
+    unsafe { n42_env::profile::apply_or_exit("n42") };
     // Enable backtraces unless a RUST_BACKTRACE value has already been
     // explicitly provided. First, before this process spawns any thread or
     // moves the allocator's (`n42_core_layout::init` below).

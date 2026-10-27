@@ -896,7 +896,7 @@ pub mod leader_layers {
     /// Whether chained builds read their grandparent from its kept layer.
     pub fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var("N42_GRANDPARENT_SHARDS").map_or(true, |v| v.trim() != "0"))
+        *ON.get_or_init(|| n42_env::flag("N42_GRANDPARENT_SHARDS", true))
     }
 
     fn hash_of(layer: &Layer) -> B256 {

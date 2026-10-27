@@ -1171,7 +1171,7 @@ type CheckpointWriter = dyn Fn(&ConsensusEngine) -> Result<(), String> + Send + 
 /// it was.
 fn build_chain() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_BUILD_CHAIN").is_ok_and(|value| value != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_BUILD_CHAIN", false))
 }
 
 /// The "proposal sent" line's build start: how long after this leader's
@@ -1367,7 +1367,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             body_arrived: std::collections::HashMap::new(),
             body_rx: None,
             body_pushers: None,
-            always_publish_topic: std::env::var("N42_BLOCK_TOPIC_ALWAYS").is_ok(),
+            always_publish_topic: n42_env::flag("N42_BLOCK_TOPIC_ALWAYS", false),
             prepare_on: None,
             committed_height: None,
             prepare_ahead: false,
@@ -1389,7 +1389,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             body_wait: std::collections::HashMap::new(),
             body_grace: body_request_grace(),
             direct_push: false,
-            build_on_seal: std::env::var("N42_BUILD_ON_SEAL").is_ok_and(|v| v != "0"),
+            build_on_seal: n42_env::flag("N42_BUILD_ON_SEAL", false),
             first_on_output_view: None,
             last_proposal_sent_at: None,
             build_start_counts: [0; 4],

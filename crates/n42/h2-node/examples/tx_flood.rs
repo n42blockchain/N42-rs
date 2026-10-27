@@ -1174,7 +1174,7 @@ fn default_args() -> Args {
         ingest_all: false,
         ingest_timeout: 10,
         recipients: 1,
-        claim_sender: std::env::var("N42_FLOOD_CLAIM_SENDER").is_ok_and(|v| v != "0"),
+        claim_sender: n42_env::flag("N42_FLOOD_CLAIM_SENDER", false),
         rate: 0.0,
         pregen_out: None,
         pregen_txs: 0,
@@ -1696,7 +1696,7 @@ fn open_replay_set(
                 args.offset
             )
         })?;
-        let dontneed = std::env::var("F7_FLOOD_REPLAY_DONTNEED").map(|v| v != "0").unwrap_or(true);
+        let dontneed = n42_env::flag("F7_FLOOD_REPLAY_DONTNEED", true);
         let file = AdviseFile::new(file, path.clone(), dontneed);
         let mut inner = std::io::BufReader::with_capacity(8 << 20, file);
         let mut raw = [0u8; PREGEN_HEADER_LEN];

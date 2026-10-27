@@ -1760,7 +1760,7 @@ fn hash_index_capacity() -> Option<usize> {
 /// ([`TxQueue::push_frame`]): `N42_FRAME_ARCS`, on unless `0`.
 fn frame_arcs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FRAME_ARCS").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_FRAME_ARCS", true))
 }
 
 /// `staged` put in the order of `hashes`, the frame's: as it is when the
@@ -7335,7 +7335,7 @@ enum SlowFrame<T: PoolTransaction> {
 /// is checked and taken in turn. The plan is the same either way.
 fn frame_select_parallel() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FRAME_SELECT_PARALLEL").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_FRAME_SELECT_PARALLEL", true))
 }
 
 /// `N42_TX_QUEUE_BATCH`, read once.

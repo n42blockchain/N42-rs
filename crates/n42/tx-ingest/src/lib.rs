@@ -453,7 +453,7 @@ const GATE_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 /// `N42_TX_INGEST_DIRECT`, read once.
 fn direct_to_queue() -> bool {
     static DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DIRECT.get_or_init(|| std::env::var("N42_TX_INGEST_DIRECT").is_ok())
+    *DIRECT.get_or_init(|| n42_env::flag("N42_TX_INGEST_DIRECT", false))
 }
 
 /// What the gate sees at one instant: whether it is open, the depth it
@@ -860,7 +860,7 @@ fn spawn_gate_watcher<P>(
 /// `N42_TX_INGEST_UNBUFFERED`, read once.
 fn unbuffered_reads() -> bool {
     static UNBUFFERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *UNBUFFERED.get_or_init(|| std::env::var("N42_TX_INGEST_UNBUFFERED").is_ok())
+    *UNBUFFERED.get_or_init(|| n42_env::flag("N42_TX_INGEST_UNBUFFERED", false))
 }
 
 /// What the gate and the frame's answer report as the node's depth.
@@ -1177,7 +1177,7 @@ impl<T: PoolTransaction + 'static> Setup<T> {
         Self {
             queue: n42_tx_queue::global::<T>(),
             direct: direct_to_queue(),
-            asynchronous: std::env::var("N42_TX_INGEST_ASYNC").is_ok(),
+            asynchronous: n42_env::flag("N42_TX_INGEST_ASYNC", false),
             gate: high_water(),
             allowance: block_txs_allowance(),
             slots,

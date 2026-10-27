@@ -4395,7 +4395,7 @@ pub fn graft_stream() -> bool {
 /// ([`graft_stream`]).
 pub fn follower_graft_stream() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_GRAFT_STREAM").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_GRAFT_STREAM", true))
 }
 
 /// Whether the graft takes the largest bundle as the block's bundle (default;
@@ -4403,7 +4403,7 @@ pub fn follower_graft_stream() -> bool {
 /// 43's loop98).
 fn graft_base_swap() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_GRAFT_BASE_SWAP").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_GRAFT_BASE_SWAP", true))
 }
 
 /// Whether `N42_FOLLOWER_FREE_ASYNC=1` is set: the executor's own working
@@ -4557,7 +4557,7 @@ where
 /// follower's own path), so the block's post-state is unchanged.
 pub fn follower_batch_state() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_BATCH_STATE").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_BATCH_STATE", true))
 }
 
 /// One follower batch on the leader's cuts ([`follower_batch_state`]): the

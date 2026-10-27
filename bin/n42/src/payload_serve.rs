@@ -1906,7 +1906,7 @@ fn sealed_header_from_fields(
 /// registry or must leave it for the `BUILD_ON_OWN` racing it.
 fn build_on_seal() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_BUILD_ON_SEAL").is_ok_and(|v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_BUILD_ON_SEAL", false))
 }
 
 /// `N42_RAW_SHARED_DECODE`, read once.
@@ -1970,7 +1970,7 @@ fn miss_wait() -> std::time::Duration {
 /// `N42_PAYLOAD_SERVE_FRESH_BUFFERS`, read once.
 fn fresh_buffers() -> bool {
     static FRESH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FRESH.get_or_init(|| std::env::var("N42_PAYLOAD_SERVE_FRESH_BUFFERS").is_ok())
+    *FRESH.get_or_init(|| n42_env::flag("N42_PAYLOAD_SERVE_FRESH_BUFFERS", false))
 }
 
 /// Puts the block by description's transaction list into its payload, once
@@ -4173,5 +4173,5 @@ fn direct_fast_answer() -> bool {
 /// before round 43's loop98).
 fn prune_async() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_PRUNE_ASYNC").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_PRUNE_ASYNC", true))
 }

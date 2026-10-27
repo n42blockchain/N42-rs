@@ -65,7 +65,7 @@ fn kernel() -> Kernel {
     let v = *K.get_or_init(|| {
         #[cfg(target_arch = "x86_64")]
         {
-            if std::env::var_os("TWIG_NO_SIMD").is_none() {
+            if !n42_env::flag("TWIG_NO_SIMD", false) {
                 if std::arch::is_x86_feature_detected!("avx512f") {
                     return 2;
                 }

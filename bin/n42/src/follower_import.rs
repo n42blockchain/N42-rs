@@ -403,7 +403,7 @@ fn kept_from_env(name: &str, default: usize, range: std::ops::RangeInclusive<usi
 /// collection 153 -> 106 ms where the pair is comparable.
 fn check_on_parent_output() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_CHECK_ON_PARENT_OUTPUT").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_CHECK_ON_PARENT_OUTPUT", true))
 }
 
 /// The block is *executed* on the parent's published output as well -- the
@@ -431,7 +431,7 @@ fn check_on_parent_output() -> bool {
 /// says what this path is worth instead of leaving it in the gap.
 fn exec_on_parent_output() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT", true))
 }
 
 /// Whether an import publishes its execution output for its child at all.
@@ -484,7 +484,7 @@ fn follower_shards_kept() -> usize {
 /// `N42_FOLLOWER_CHECK_ON_SHARDS=0` restores the wait for the merge.
 fn check_on_shards() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_CHECK_ON_SHARDS").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_CHECK_ON_SHARDS", true))
 }
 
 /// Keeps a block's shards and residual for its child's check and execution,
@@ -3675,7 +3675,7 @@ fn fill_carry(
 fn hashed_state_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("N42_HASHED_STATE").map_or(true, |v| v != "0") && !n42_qmdb_reth::n42_state::hashed_tables_off()
+        n42_env::flag("N42_HASHED_STATE", true) && !n42_qmdb_reth::n42_state::hashed_tables_off()
     })
 }
 
@@ -3704,7 +3704,7 @@ static EXEC_GATE: Mutex<()> = Mutex::new(());
 /// `gate_ms` on the `direct import` line and sees whether it ever waited.
 fn exec_gate() -> Option<std::sync::MutexGuard<'static, ()>> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on = *ON.get_or_init(|| std::env::var("N42_FOLLOWER_EXEC_GATE").map_or(true, |v| v != "0"));
+    let on = *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_EXEC_GATE", true));
     // A thread that panicked under the gate poisoned nothing but `()`.
     on.then(|| EXEC_GATE.lock().unwrap_or_else(|p| p.into_inner()))
 }
@@ -3725,7 +3725,7 @@ fn carry_async() -> bool {
 /// `root_ms` with `hashed_ms` zero.
 fn root_hashed_parallel() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_ROOT_HASHED_PARALLEL").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_ROOT_HASHED_PARALLEL", true))
 }
 
 /// `N42_FOLLOWER_EXEC_EARLY=1` (section 5 of `docs/BREAKTHROUGH_DESIGN.md`,
@@ -3836,7 +3836,7 @@ pub fn parallel_state_commit() -> bool {
     // On by default since round 43's loop82 (223-228k against 189-201k on
     // window 1 at 147,000 accounts a block, the follower's import 488-562 ms
     // against 605-690); `N42_PARALLEL_STATE_COMMIT=0` is the serial path.
-    *ON.get_or_init(|| std::env::var("N42_PARALLEL_STATE_COMMIT").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_PARALLEL_STATE_COMMIT", true))
 }
 
 

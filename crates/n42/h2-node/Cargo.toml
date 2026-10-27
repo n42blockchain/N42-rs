@@ -10,6 +10,7 @@ repository.workspace = true
 description = "Wires the HotStuff-2 engine to the gov5 gossip transport and an execution layer"
 
 [dependencies]
+n42-env.workspace = true
 n42-tx-types.workspace = true
 n42-h2-consensus.workspace = true
 n42-h2-execution.workspace = true

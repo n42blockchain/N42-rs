@@ -590,7 +590,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // imports its own block. With round-robin it stays behind the
             // switch, because measured there it was a loss (see the service).
             service = service
-                .with_build_ahead(std::env::var("N42_BUILD_AHEAD").is_ok() || leader_tenure > 1);
+                .with_build_ahead(n42_env::flag("N42_BUILD_AHEAD", false) || leader_tenure > 1);
             service = service.with_payload_attributes(move |context| {
                 let parent_beacon_block_root = match (&committee, &context.head_header) {
                     (Some(pool), Some(parent)) => {

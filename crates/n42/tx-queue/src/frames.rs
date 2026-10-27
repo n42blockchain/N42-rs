@@ -71,7 +71,7 @@ pub const MAX_FRAMES: usize = 16_384;
 /// `N42_FRAME_SWEEP_AT_TAKE`, read once: on unless `0`.
 pub(crate) fn frame_sweep_at_take() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FRAME_SWEEP_AT_TAKE").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_FRAME_SWEEP_AT_TAKE", true))
 }
 
 /// A frame's transactions as the queue holds them, in frame order, shared.

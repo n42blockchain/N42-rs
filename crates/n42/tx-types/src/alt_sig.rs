@@ -411,7 +411,7 @@ pub fn verify_batch(txs: &[&AltSigTx]) -> Vec<Result<Address, AltSigError>> {
 /// verification with `N42_ED25519_MERGE=0`.
 fn batch_holds(messages: &[&[u8]], signatures: &[EdSignature], keys: &[VerifyingKey]) -> bool {
     static MERGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *MERGE.get_or_init(|| std::env::var("N42_ED25519_MERGE").map_or(true, |v| v != "0")) {
+    if *MERGE.get_or_init(|| n42_env::flag("N42_ED25519_MERGE", true)) {
         batch_equation_holds(messages, signatures, keys)
     } else {
         ed25519_dalek::verify_batch(messages, signatures, keys).is_ok()

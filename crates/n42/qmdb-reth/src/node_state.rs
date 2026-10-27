@@ -175,7 +175,7 @@ fn retain_depth() -> Option<u64> {
 /// stage 3).
 fn trim_twigs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_QMDB_TRIM_TWIGS").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_QMDB_TRIM_TWIGS", true))
 }
 
 /// `N42_QMDB_COMPUTE_OFFLOCK=1` (default off): a block's QMDB root

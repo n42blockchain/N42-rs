@@ -680,7 +680,7 @@ impl std::fmt::Debug for EarlySeal {
 /// builds as before.
 pub fn seal_first() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_SEAL_FIRST").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_SEAL_FIRST", true))
 }
 
 /// `N42_SEAL_AT_EXEC=1` (plan v6 attempt G2, `FLEET7_PLAN_V4.md` 6.6): a
@@ -1318,7 +1318,7 @@ fn refuse_stale_parent() -> bool {
 /// serial loop always runs); on by default.
 fn decline_empty_step() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_BUILD_DECLINE_EMPTY_STEP").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_BUILD_DECLINE_EMPTY_STEP", true))
 }
 
 /// The fewest skipped candidates that make an empty parallel step a verdict
@@ -1446,7 +1446,7 @@ fn note_handoff_wait(waited: std::time::Duration) {
 /// 320, and the node built eighteen empty blocks over a queue of 400,000.
 fn skip_decided_builds() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_BUILD_SKIP_DECIDED").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_BUILD_SKIP_DECIDED", true))
 }
 
 /// At most one line a second per call site, so a defect that repeats every
@@ -5850,12 +5850,12 @@ fn build_graft_no_cache() -> bool {
 /// full block before, 11-33 after).
 fn direct_receipts_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_DIRECT_RECEIPTS").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| n42_env::flag("N42_DIRECT_RECEIPTS", true))
 }
 
 fn parallel_build() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_PARALLEL_BUILD").is_ok())
+    *ON.get_or_init(|| n42_env::flag("N42_PARALLEL_BUILD", false))
 }
 
 fn stale_check() -> bool {

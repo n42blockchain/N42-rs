@@ -29,10 +29,15 @@ const fn k(name: &'static str, value: &'static str) -> Knob {
 
 /// X22, the configuration adopted on 2026-10-24 (`docs/BREAKTHROUGH_DESIGN.md`
 /// 10.227, confirmed 10.228, on main 10.230): every row of `docs/KNOBS.md`
-/// whose status is `adopted`, with the value the X22 stage lines of
-/// `scripts/fleet7-runs/run-loop351.sh` (stages fh-fl) pass. Each comment
-/// names the stage set (and round, where the docs give one) that adopted it;
-/// X3-X11 are the cumulative sets of loop351, S1/S2 its section 19 items.
+/// whose status is `adopted`, with the value an X22 leg of
+/// `scripts/fleet7-runs/run-loop351.sh` (stages fh-fl) passes. That is the
+/// cumulative stage sets X3-X22 (each comment names the stage set and round
+/// where the docs give one; S1/S2 are loop351's section 19 items) and the
+/// X22 base set every leg since X11 carries, tuned values whose compiled
+/// default differs included. Not here: the `bench-only` knobs the leg also
+/// passes (bench gateway key, shared import, storage mode, history index,
+/// settlement tags, persistence ordering, instrumentation) and the
+/// launcher's non-`N42_*` variables.
 pub const X22: &[Knob] = &[
     // X3: the hand-off copies.
     k("N42_QMDB_RENAME_DEFER", "1"),
@@ -88,12 +93,86 @@ pub const X22: &[Knob] = &[
     k("N42_RECEIPTS_FUSED", "1"),
     k("N42_PARALLEL_BUILD_THREADS", "32"),
     k("N42_FRAME_ROAD", "1"),
-    k("N42_LOCK_SITES", "1"),
     k("N42_ROAD_RESEED_AT_FLUSH", "1"),
     // X21 (round 10.220).
     k("N42_SF_DROP_CACHE", "1"),
     // X22 (round 10.227).
     k("N42_QUEUE_FREE_THREADS", "2"),
+    // X22 base (the loop351 `ALLA` line and its per-leg additions; every
+    // leg since X11 carries them). Frame blocks and the pull by frames
+    // (step 1 phase B; plan-ahead body: SHARED_EXECUTION_SCOPE.md 16.4 item 2).
+    k("N42_FRAME_BLOCKS", "1"),
+    k("N42_PLAN_AHEAD", "1"),
+    k("N42_PULL_BY_FRAMES", "1"),
+    k("N42_PLAN_AHEAD_BODY", "1"),
+    k("N42_PLAN_AHEAD_BODY_THREADS", "16"),
+    // X22 base: the body sent once, compact and checked by description.
+    k("N42_BODY_ONCE", "1"),
+    k("N42_COMPACT_BODY", "1"),
+    k("N42_BLOCK_BY_DESCRIPTION", "1"),
+    k("N42_TAKE_COMPACT", "1"),
+    k("N42_ANSWER_LAYOUT_ONLY", "1"),
+    k("N42_COMMIT_FCU_ASYNC", "1"),
+    // X22 base: the leader's build chain (plan v6 attempts J, G2, G3; defect
+    // 18b for the tenure's first build).
+    k("N42_BUILD_CHAIN", "1"),
+    k("N42_BUILD_ON_SEAL", "1"),
+    k("N42_BUILD_ON_OUTPUT", "1"),
+    k("N42_BUILD_START_ASYNC", "1"),
+    k("N42_SEAL_AT_EXEC", "1"),
+    k("N42_STATE_AFTER_PULL", "1"),
+    k("N42_TENURE_FIRST_ON_OUTPUT", "1"),
+    k("N42_ENGINE_TAKE_SEALED", "1"),
+    k("N42_FIELDS_AT_SEAL", "1"),
+    // X22 base: the parallel build (build batches: SHARED_EXECUTION_SCOPE.md
+    // 16.4 item 4).
+    k("N42_PARALLEL_BUILD", "1"),
+    k("N42_BUILDER_PULLER", "1024"),
+    k("N42_BUILD_BATCHES", "128"),
+    k("N42_BUILD_COLLECT_IN_PLACE", "1"),
+    // X22 base: the output shards and what runs behind the seal
+    // (SHARED_EXECUTION_SCOPE.md 15, 16.2, 16.4 item 1).
+    k("N42_OUTPUT_SHARDS", "16"),
+    k("N42_OUTPUT_INDEX", "1"),
+    k("N42_OUTPUT_INDEX_LIVE", "1"),
+    k("N42_LIVE_INDEX_DEFER", "1"),
+    k("N42_FREEZE_AFTER_SEAL", "1"),
+    k("N42_ROOT_OPS_AHEAD", "1"),
+    k("N42_SEAL_ON_COUNTERS", "1"),
+    k("N42_FREEZE_POOL", "own"),
+    // X22 base: the follower's import (exec/fields early:
+    // BREAKTHROUGH_DESIGN.md section 5 step 5a).
+    k("N42_FOLLOWER_PARALLEL", "1"),
+    k("N42_FOLLOWER_GRAFT", "1"),
+    k("N42_FOLLOWER_PARTITION_HASH", "1"),
+    k("N42_FOLLOWER_PARTITION_AHEAD", "1"),
+    k("N42_FOLLOWER_FREE_ASYNC", "1"),
+    k("N42_FOLLOWER_BUILD_PATH", "1"),
+    k("N42_FOLLOWER_ROOT_ON_BUILD_POOL", "1"),
+    k("N42_FOLLOWER_FRAME_SCAN", "1"),
+    k("N42_FOLLOWER_COPY_ASIDE", "1"),
+    k("N42_FOLLOWER_EXEC_EARLY", "1"),
+    k("N42_FOLLOWER_FIELDS_EARLY", "1"),
+    // X22 base: the raw payload channel on its own runtime.
+    k("N42_ROAD_RUNTIME", "1"),
+    // X22 base: QMDB (entry file: QMDB_ENTRY_LOG.md step 1) and static files.
+    k("N42_QMDB_ENTRY_FILE", "1"),
+    k("N42_QMDB_RETAIN_DEPTH", "16"),
+    k("N42_SF_PARALLEL_ENCODE", "1"),
+    k("N42_SF_EARLY_WRITEBACK", "1"),
+    // X22 base: ingest, queue and the build throttle.
+    k("N42_TX_INGEST_RECOVER_PARALLEL", "24"),
+    k("N42_TX_QUEUE_DRAIN_CHUNK", "8192"),
+    k("N42_TX_QUEUE_RUN", "64"),
+    k("N42_ED25519_BATCH", "256"),
+    k("N42_ALTSIG_SENDER_CACHE", "4194304"),
+    k("N42_BUILD_THROTTLE_SOFT", "48"),
+    k("N42_BUILD_THROTTLE_HARD", "80"),
+    // X22 base: votes and the local GossipSub queue bounds.
+    k("N42_VOTE_TRANSPORT", "direct"),
+    k("N42_VOTE_AGGREGATE_VERIFY", "1"),
+    k("N42_GOSSIP_HANDLER_QUEUE", "64"),
+    k("N42_GOSSIP_MAX_IHAVE", "500"),
 ];
 
 /// The environment variable that names the profile.

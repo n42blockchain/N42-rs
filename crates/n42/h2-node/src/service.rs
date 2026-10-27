@@ -4457,7 +4457,11 @@ impl<E: ExecutionLayer> H2Service<E> {
     ///   engine's proposal-path check ([`ConsensusEngine::verify_header_qc`]),
     ///   is no later than the header's own view (gov5's `VerifyHeader` rule),
     ///   and names a block on this block's parent chain as far as this node
-    ///   holds the headers.
+    ///   holds the headers. When this node knows no validator set for the
+    ///   QC's view (a cold node, or one further behind than the epoch history
+    ///   it keeps) the QC is unchecked and only the parent link is, as gov5's
+    ///   `verifyHeaderWithBatch` does; a pulled block never becomes `safe`
+    ///   either way.
     ///
     /// The seal is not checked: the live path does not check it either (a
     /// block is authenticated by the certificates on the wire, see
@@ -4487,7 +4491,15 @@ impl<E: ExecutionLayer> H2Service<E> {
         if wire.view > extra.view {
             return Err(format!("header QC view {} is past the header's view {}", wire.view, extra.view));
         }
-        let qc = self.engine.verify_header_qc(&wire).map_err(|err| err.to_string())?;
+        let Some(qc) = self.engine.verify_header_qc(&wire).map_err(|err| err.to_string())? else {
+            debug!(
+                target: "n42.h2.node",
+                qc_view = wire.view,
+                number = header.number,
+                "validator set for the certificate's view is not known; only the parent link is checked"
+            );
+            return Ok(());
+        };
         if qc.view == 0 {
             return Ok(());
         }

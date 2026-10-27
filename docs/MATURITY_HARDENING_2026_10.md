@@ -209,6 +209,9 @@ its header is verified through the proposal-path check (`ConsensusEngine::verify
 before `newPayload`; the first failure ends the batch and the peer is not asked again for the
 gap (`H2Service::check_pulled_block`). A pulled block is head only in both settlement modes.
 No knob. gov5 comparison in `docs/N42_26_PORT.md` "Certificates on pulled blocks".
+A QC whose view falls in an epoch this node knows no validator set for (a cold node, or one
+further behind than the epoch history) is unchecked and only the parent link is, as gov5's
+`verifyHeaderWithBatch` skips it; refusing it would keep such a node from ever catching up.
 
 ### 6.7 Lint baseline
 

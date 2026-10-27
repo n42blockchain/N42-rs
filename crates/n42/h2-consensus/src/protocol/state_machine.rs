@@ -1886,22 +1886,29 @@ impl ConsensusEngine {
     /// aggregate signature under either signing domain. A view-0 certificate
     /// is the genesis sentinel and certifies nothing, so it is not checked,
     /// as on the proposal path. Returns the certificate in the engine's form.
+    ///
+    /// `Ok(None)` when no validator set is known for the certificate's view
+    /// (an epoch older than the history this engine keeps, or one it has not
+    /// reached): the certificate is unchecked, not refused, as gov5's
+    /// `verifyHeaderWithBatch` skips a QC whose set it cannot resolve. Every
+    /// other failure is an error.
     pub fn verify_header_qc(
         &self,
         wire: &n42_h2_wire::h2_wire::H2QuorumCertificate,
-    ) -> ConsensusResult<QuorumCertificate> {
+    ) -> ConsensusResult<Option<QuorumCertificate>> {
         let invalid = |reason: String| ConsensusError::InvalidQC { view: wire.view, reason };
         if wire.view == 0 {
             return crate::wire_bridge::qc_to_engine(wire, 0, "header QC")
+                .map(Some)
                 .map_err(|err| invalid(err.to_string()));
         }
         let Some(set) = self.epoch_manager.known_validator_set_for_view(wire.view) else {
-            return Err(invalid("validator set unavailable for certificate view".into()));
+            return Ok(None);
         };
         let qc = crate::wire_bridge::qc_to_engine(wire, set.len() as usize, "header QC")
             .map_err(|err| invalid(err.to_string()))?;
         self.verify_qc_any_domain_or_known(&qc)?;
-        Ok(qc)
+        Ok(Some(qc))
     }
 
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {
@@ -2273,6 +2280,28 @@ mod tests {
                 validator_count: 4,
             })
         ));
+    }
+
+    /// A header QC whose view falls in an epoch this engine knows no set for
+    /// is unchecked (`Ok(None)`), as gov5's `verifyHeaderWithBatch`; one in a
+    /// known epoch that does not verify is still refused.
+    #[test]
+    fn a_header_qc_for_an_unknown_epoch_is_unchecked_and_a_known_bad_one_refused() {
+        let (mut engine, sks, vs, _rx) = make_engine(4, 0);
+        engine.epoch_manager = EpochManager::with_epoch_length(vs.clone(), 10);
+        let hash = B256::repeat_byte(0x31);
+        let good = build_test_commit_qc(3, hash, &sks, &vs, &[0, 1, 2]);
+        let wire = crate::wire_bridge::qc_to_wire(&good).unwrap();
+        assert_eq!(engine.verify_header_qc(&wire).unwrap().map(|qc| qc.view), Some(3));
+
+        let forged = n42_h2_wire::h2_wire::H2QuorumCertificate { block_hash: B256::repeat_byte(0x32), ..wire.clone() };
+        assert!(engine.verify_header_qc(&forged).is_err(), "a known set and a bad signature");
+
+        let unknown = n42_h2_wire::h2_wire::H2QuorumCertificate { view: 25, ..forged };
+        assert!(engine.verify_header_qc(&unknown).unwrap().is_none(), "no set known for epoch 2");
+
+        let sentinel = crate::wire_bridge::qc_to_wire(&QuorumCertificate::genesis()).unwrap();
+        assert_eq!(engine.verify_header_qc(&sentinel).unwrap().map(|qc| qc.view), Some(0));
     }
 
     #[test]

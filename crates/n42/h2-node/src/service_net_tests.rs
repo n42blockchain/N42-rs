@@ -352,6 +352,44 @@ async fn a_pulled_block_with_a_forged_parent_qc_ends_the_batch_and_its_peer_is_n
     assert_eq!((catch_up.peer, catch_up.next), (other, 3));
 }
 
+/// Sections 6.6 and 6.9: a pulled block whose embedded QC names a view in an
+/// epoch this node knows no validator set for (a cold node, or one further
+/// behind than its epoch history) is checked by its parent link only, as
+/// gov5's `verifyHeaderWithBatch`; a QC for a known view that does not
+/// verify is still refused.
+#[tokio::test]
+async fn a_pulled_block_whose_qc_names_an_unknown_epoch_is_checked_by_its_parent_link_only() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    *rig.svc.engine.epoch_manager_mut() = n42_h2_consensus::EpochManager::with_epoch_length(set.clone(), 10);
+    let quorum = [0, 1, 2];
+    let parent = B256::ZERO;
+
+    // Epoch 2 (views 21..=30): neither the current epoch nor a staged one.
+    let unknown = header_qc(&rig.svc, &keys, &quorum, 25, parent, B256::repeat_byte(0x77));
+    let (_, header, _) = block_with_extra(1, parent, 30, unknown);
+    rig.svc.check_pulled_block(&header).expect("an unknown set leaves the QC unchecked");
+
+    // A known view whose certificate is forged: refused as before.
+    let forged = header_qc(&rig.svc, &keys, &quorum, 3, parent, B256::repeat_byte(0x77));
+    let (_, header, _) = block_with_extra(1, parent, 4, forged);
+    assert!(rig.svc.check_pulled_block(&header).is_err(), "a known set still verifies the QC");
+
+    // The parent link is checked either way.
+    let unknown = header_qc(&rig.svc, &keys, &quorum, 25, parent, parent);
+    let (_, header, _) = block_with_extra(2, B256::repeat_byte(0x09), 30, unknown);
+    rig.svc.catch_up = Some(CatchUp {
+        peer: PeerId::random(),
+        next: 2,
+        target: 4,
+        started_at: 0,
+        probing: false,
+        probe_height: 0,
+        prev_hash: Some(B256::repeat_byte(0x01)),
+    });
+    assert!(rig.svc.check_pulled_block(&header).is_err(), "a block that does not extend the last one");
+}
+
 /// A block that does not extend the one pulled before it is refused before
 /// the execution layer sees it, whatever its certificate says.
 #[tokio::test]

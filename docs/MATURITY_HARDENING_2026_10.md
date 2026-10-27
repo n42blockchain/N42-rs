@@ -485,3 +485,19 @@ new knobs through `n42_env`. `design/integration-2026-10-next` adds the 6.1 comp
   every leg. RBb reported `rename_fallbacks_total=2276` (the early rename of the fields-at-seal path fell
   back to the parent's `Complete` on nearly every build); the counter is reported, not gated, and the same
   per-leg mode appears in 11 of 417 loop351 legs since stage dy, independent of these knobs.
+
+### 8.3 Final verification of `a455702d8` (2026-10-27 17:36-18:14 UTC)
+
+The branch head that lands on main: `design/integration-2026-10-next` = the five items + 6.1 completion
+and chain gating + 6.2 stage 0 + 6.4 adopted + the three recovery fixes (genesis checkpoint, QMDB-chain
+persistence defaults 8/6, entry-file fold archive) + the validator's persistence-lag log.
+
+- `cargo test --no-fail-fast` of n42-env, n42-tx-queue, n42-qmdb-reth, n42-h2-el-rpc, reth-node-builder,
+  n42-twig-core, n42-qmdb-state: rc 0. `cargo check -p n42 -p n42-h2-node --tests --examples`: rc 0.
+  Native fleet binaries built.
+- `N42_PROFILE=x22` on the fleet7 genesis (no `frameBlocks`): the fleet produces blocks (height 25 at
+  90 s) and the twelve frame knobs are withdrawn with one stderr line; MDBX follows at the lowered
+  defaults (persisted 18 at height 25).
+- `roll --kill` in entry-file mode, first kill at height 6 before any MDBX persistence: node1 restored
+  from the genesis checkpoint and committed again (height 8); node2 killed at 28 restored at 21, node3
+  killed at 49 at 42; all seven members at height 117 with one head hash after 360 s, no fault line.

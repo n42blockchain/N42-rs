@@ -155,6 +155,9 @@ pub const X22: &[Knob] = &[
     k("N42_FOLLOWER_FIELDS_EARLY", "1"),
     // X22 base: the raw payload channel on its own runtime.
     k("N42_ROAD_RUNTIME", "1"),
+    // 6.4 road bounds (MATURITY_HARDENING_2026_10.md; stage fm pair 2026-10-27).
+    k("N42_ROAD_TAKEN_BOUND", "1"),
+    k("N42_ROAD_RETIRE_INDEX", "1"),
     // X22 base: QMDB (entry file: QMDB_ENTRY_LOG.md step 1) and static files.
     k("N42_QMDB_ENTRY_FILE", "1"),
     k("N42_QMDB_RETAIN_DEPTH", "16"),

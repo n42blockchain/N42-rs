@@ -75,6 +75,26 @@ execution layer has persisted: `persisted block advanced` at most every 10 s,
 and `persistence lagging: head=.. persisted=.. unpersisted=..` while more than
 16 blocks have stood unpersisted for over 10 s.
 
+The same lead applies to every later checkpoint: a fold (the background
+compaction that rotates `forest.log` into `forest.log.sealed` and folds it into
+a new checkpoint) writes the checkpoint at the forest's head, up to the
+persistence lag past MDBX's. Each fold therefore first keeps the checkpoint it
+replaces and the segment it folds as a pair under
+`el/qmdb/recovery-archive/fold-<block, 20 digits>-<hash>-<pid>-<n>/` (hard
+links, so no copy is made): `forest.bin` + `forest.log` in heap mode,
+`forest.ckpt` + `forest.log` in entry-file mode. A restart whose MDBX head lies
+below the live checkpoint replays the archive up to that head; in entry-file
+mode it also cuts `entries.log` back to that head's cursor, drops the live log
+and rewrites `forest.ckpt` at the head, logging `restored the QMDB forest from a
+fold archive`. An archive is removed at a later fold once MDBX's durable head
+(its `Finish` stage checkpoint) is past the fold head's child, so a running
+node normally holds the archives of the last few folds only. Without a
+readable durable head nothing is removed. Heap-mode restarts below a fold head
+also leave `rollback-<block>-<hash>-*` directories (the future log they
+discarded); those are not removed automatically. A `SnapshotMismatch` at
+startup with no fold archive covering the head is a datadir from before this
+change or one whose archives were deleted by hand: re-initialise it.
+
 ## Metrics
 
 | Metric | Type | Meaning |

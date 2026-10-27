@@ -383,3 +383,46 @@ ingest `6c24a6299`, qmdb `68677f00a`, h2 `971671bf8`.
 - `3f241ae6f` fix(h2-node): disconnect a peer whose status names another chain
 - `c74099d10` fix(h2-node): bound and age out awaited and held body bookkeeping
 - `971671bf8` test(h2-node): tolerate the real status a paired peer queued before the mismatch
+
+## 8. Design-item integration record (2026-10-27)
+
+Branch `design/integration-2026-10` = main `7b730e65d` + the five item branches (6.1 `design/knob-profile`,
+6.5 `design/fatal-local-faults`, 6.6 `design/range-pull-qc`, 6.3 `design/qmdb-durability`,
+6.4 `perf/road-bounds`; the only merge conflict was `Cargo.lock`) + `4e43be3ac`, which reads the items'
+new knobs through `n42_env`. `design/integration-2026-10-next` adds the 6.1 completion
+(`design/knob-profile-x22`) and 6.2 stage 0 (`design/qmdb-entry-metrics`, section 6.2 and
+`docs/QMDB_COMPACTION_DESIGN.md` 3.7 / 5).
+
+### 8.1 Verification of `4e43be3ac`
+
+- `cargo check --workspace --tests`: clean. `cargo test --no-fail-fast` of the thirteen crates of
+  section 7.1 plus `n42-env` and `n42-testing` (58 test binaries) and
+  `cargo test -p reth-provider --lib n42_persist` (the 6.3 refusal test in both orders): all green
+  (2026-10-27 09:37-12:56 UTC).
+- Fleet7 control pair (loop351 stage fl, X22 configuration, 600M replay set, the integration tree's
+  native binaries against the X22 record binaries of main `47b8180ab`, alternating, after a warm leg):
+
+  | leg | binaries | window 1 | round (3 windows) |
+  |---|---|---|---|
+  | AUa | integration | 4,966,667 tx/s | 461.0M |
+  | AU1 | main | 5,086,667 tx/s | 463.0M |
+  | AUb | integration | 5,073,333 tx/s | 460.0M |
+  | AU1b | main | 5,080,000 tx/s | 459.8M |
+
+  Round totals within 0.3%, window 1 within the single-round spread (section 7.1's 10% rule): no
+  regression from the five items with their knobs at defaults (`N42_ROAD_TAKEN_BOUND` and
+  `N42_ROAD_RETIRE_INDEX` off; 6.3's settle wait and fatal canonical errors on; 6.5 and 6.6 on).
+  Gates on every leg: `invalid_blocks=0 gas_mismatch=0 fields_mismatches=0 own_not_committed=0`.
+- Devnet, the three shapes of section 7.1 on the integration binaries (14:02-14:24 UTC): gov5late
+  head 160 identical on reth and gov5; late member synced 0 -> 8 -> 16 -> 19 and holds the main head
+  at 121; absent member away at 52, range pull to 60, catch-up to 82, first commit at view 98, same
+  head as main at 185 (`main=back=reth=gov5`). Every execution layer `errors=0`.
+- `cargo clippy --workspace --lib --bins --examples`: 0 errors, 1,504 warnings against the 1,497 of
+  section 6.7. The seven new ones are style lints in the items' code (`collapsible_if` in
+  `h2-node/src/service.rs`, `qmdb-reth/src/node_state.rs` and `state_reader.rs`; one
+  `match_same_arms` and one `use_self` in `node_state.rs`; one `use_self` in `tx-queue/src/road.rs`;
+  one `doc_markdown` in `service.rs`), to be cleared with the per-crate `-D warnings` step.
+- Pending at the time of writing, run automatically after the above: the 6.3 field check (`fleet7.sh
+  up --fresh` on the integration binaries at 200 tx/s, `roll 1/2/3 --kill`, the forest's recovery
+  and fault lines) and the 6.4 bench pairs (loop351 stage fm: `N42_ROAD_TAKEN_BOUND=1
+  N42_ROAD_RETIRE_INDEX=1` against the X22 control, two alternating pairs). Results in 8.2.

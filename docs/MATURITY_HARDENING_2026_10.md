@@ -128,6 +128,13 @@ separate path, so a crash can leave MDBX ahead of the log and the node refuses t
 or forces `settle_canonical` up to `blocks.last()` and fails the batch if it cannot; an
 `on_canonical` error becomes fatal rather than logged. Verify with `roll --kill` under load.
 
+Done in `42cd67f4a`, `a4a33f0fc`, `97e23d124` (branch `design/qmdb-durability`); field check pending.
+The hook is the additive, error-returning `on_state_persisted_checked`: past
+`N42_QMDB_SETTLE_WAIT_MS` (default 30000) the batch fails before its commit (`PersistUnsettled`), so
+no `n42_qmdb_persist_unsettled` gauge was needed. A fatal `on_canonical` error (Poisoned,
+Uninitialised, State refusals; not log I/O, which the next head retries) exits the node unless
+`N42_QMDB_CANONICAL_FATAL=0`. `docs/PERSISTENCE_COST_STUDY.md` section 9 states the ordering.
+
 ### 6.4 Bounds on the road and the pruner feed
 
 The road's taken map keeps up to 131k frames alive and `retire` scans it every block; a frame

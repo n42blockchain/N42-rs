@@ -331,6 +331,20 @@ untouched. Corrections to section 5:
   blocks (5,876 entries a leg); putting it under the mode needs a second marker plus the same fallback in
   `storage_history_info` and `heal_storages_history`, which is not trivial enough for this step.
 
+### QMDB durability ordered against MDBX (2026-10-26)
+
+`on_state_persisted` used to only move the read view, while the QMDB delta log followed canonical
+notifications on its own thread; a crash could leave MDBX committed past the log, and the restart
+refused it (`SnapshotMismatch`). The hook is now `on_state_persisted_checked` (an additive,
+error-returning method on `N42StateReader`), and the QMDB reader is registered on every QMDB node.
+Before the batch's commit it calls `settle_through` for the batch's last block: once the forest's
+canonical head has reached that block, the log is settled to that head (`settle_canonical`, fsynced);
+until then it polls for up to `N42_QMDB_SETTLE_WAIT_MS` (default 30 s) and then refuses the batch, so
+`save_blocks` fails before the commit. The guarantee: the delta log is durable through every block MDBX
+commits, so the log may run ahead of the database (which a restart accepts) but never behind it. The
+cost is a cheap check when the follower is current, and a wait while it lags. The field check
+(`scripts/fleet7.sh roll --kill` under load, then a clean restart) is pending.
+
 ### Design note: the deferred indexer (not built)
 
 A background job owns the gap: it reads `AccountChangeSets` for `g..=min(tip, g + N - 1)` from static files,

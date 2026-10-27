@@ -566,7 +566,10 @@ would have written — a payload carries neither `ommers_hash` nor
 `difficulty`, and its withdrawals list reconstructs to the trie root — and
 lets the block hash pick; nothing is guessed. The validator process finishes
 each block it builds (`normalize_to_gov5_h2`: view, seal, the two roots, new
-hash) before importing and proposing it.
+hash) before importing and proposing it. The `[QC]` it writes is its last
+committed QC in gov5's encoding (`n42_h2_wire::h2_wire::encode_h2_qc`), as
+gov5's `buildHeaderExtra(view, committedQC)`, and none before the first commit
+(maturity item 6.9, `docs/MATURITY_HARDENING_2026_10.md`).
 
 **The consensus channel is not the v4 topic.** gov5 publishes on
 `/n42/h2/4/ssz_snappy` only Decide proofs, for observers; its consensus runs

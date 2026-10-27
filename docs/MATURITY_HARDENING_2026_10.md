@@ -258,7 +258,27 @@ storage (one aggregate BLS signature plus the voter bitmap and view), nothing on
 Verification: the h2-consensus header tests against gov5's fixtures (a Rust header with a QC
 must decode in gov5's `decodeHeaderExtra`), the three devnet shapes with a gov5 member (gov5
 must accept the Rust headers it now verifies), and a fleet7 pair to confirm the cycle is
-unchanged. Not started.
+unchanged.
+
+**6.9 done (2026-10-27, branch `design/qc-embed`).** `n42-h2-wire` exposes gov5's QC
+encoder (`encode_h2_qc`, checked byte for byte against the commit QC inside gov5's Decide
+fixture); `HeaderExtra::with_committed_qc` and the `*_with_qc` variants of the three header
+normalizers write `N42H || view || QC || seal`, the existing functions delegating with no QC.
+The service keeps the engine's last committed QC in gov5's encoding (refreshed on every
+`BlockCommitted` output and at start, empty for the view-0 genesis sentinel) and hands it to
+both sealers -- the payload normalizer and the build chain's sealer -- pinned per
+`(number, view)` so a block sealed twice embeds the same QC and the chained build's parent
+hash still matches. The embedded QC is a commit-domain certificate: the engine's
+`last_committed_qc` is only set from the CommitQC formed from round-two commit votes
+(`commit_message`) or from a Decide's CommitQC verified under the commit domain, which is
+what gov5's `maybeCommitFromHeaderQC` requires; gov5 will therefore now canonicalize a
+catching-up node from Rust-built headers too, and 6.6's range-pull check verifies the
+certificate on Rust-built ranges; one whose view lies in an epoch the pulling node knows no
+set for is unchecked, as gov5 (see 6.6), so a cold node still catches up. Nothing on the Rust side bounds the extra to 108 bytes
+(the bound is `MAX_HEADER_EXTRA_LEN`, 4096; a 512-signer QC is ~220 bytes). Covered by the
+h2-wire, h2-consensus and h2-node tests
+(`a_leaders_headers_carry_its_last_committed_qc_once_it_has_one`). Still to run: the devnet
+shapes with a gov5 member and a fleet7 pair for the cycle.
 
 ## 7. Merge record
 

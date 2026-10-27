@@ -2669,7 +2669,10 @@ impl<T: PoolTransaction> TxQueue<T> {
         }
         match outcome {
             road::Admit::Admitted => true,
-            road::Admit::Refused { flush, .. } => {
+            road::Admit::Refused { reason, flush } => {
+                if reason == road::Refusal::Oversize {
+                    road.warn_oversize(frame);
+                }
                 if flush {
                     self.road_flush(road::FlushReason::Refused);
                 }
@@ -3733,7 +3736,15 @@ impl<T: PoolTransaction> TxQueue<T> {
         }
         inner.held.push_back((number, hash, transactions));
         drop(inner);
+        // The road's clock: with `N42_ROAD_TAKEN_BOUND=1` the taken frames
+        // the hold window has passed are forgotten here (`Road::note_hold`).
+        let bounded = self.road.note_hold(held_blocks);
         let freed = std::time::Instant::now();
+        if lean && !bounded.is_empty() {
+            free_off_path(Box::new(bounded));
+        } else {
+            drop(bounded);
+        }
         if lean && !evicted_all.is_empty() {
             free_off_path(Box::new(evicted_all));
         } else {
@@ -4582,6 +4593,8 @@ impl<T: PoolTransaction> TxQueue<T> {
         mode: SelectMode,
         ahead: bool,
     ) -> (QueueBest<T>, FramePlan, FrameSelectTimes) {
+        // The block gas limit, for the road's refusal of frames above it.
+        self.road.note_gas_limit(gas_limit);
         if mode == SelectMode::Parallel && self.plan_snapshot_on() {
             return self.frames_for_build_snapshot(parent, gas_limit, ahead);
         }
@@ -9635,3 +9648,6 @@ mod drain_runs_tests;
 
 #[cfg(test)]
 mod road_tests;
+
+#[cfg(test)]
+mod road_bounds_tests;

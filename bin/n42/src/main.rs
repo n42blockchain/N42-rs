@@ -543,6 +543,22 @@ fn main() {
                 });
             }
 
+            // The frame road's bounds (`docs/MATURITY_HARDENING_2026_10.md` 6.4):
+            // `n42_road_taken_frames` is how many taken frames the road still
+            // remembers (bounded by `N42_ROAD_TAKEN_BOUND=1`, else by
+            // `N42_ROAD_TAKEN_MAX`), `n42_road_oversize_frames_total` the frames
+            // refused for a gas above the block gas limit. Both read 0 while
+            // the road is off.
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    tick.tick().await;
+                    let road = n42_tx_queue::road_stats().unwrap_or_default();
+                    metrics::gauge!("n42_road_taken_frames").set(road.taken_frames as f64);
+                    metrics::counter!("n42_road_oversize_frames_total").absolute(road.refused_oversize);
+                }
+            });
+
             // A chained build that waits for an ancestor to reach the engine is
             // woken by the canonical chain's changes instead of polling, and the
             // own-block layers the engine's tip has passed are released

@@ -1082,6 +1082,7 @@ fn spawn_stats_reporter() {
                         refused_gap = d(road.refused_gap, last_road.refused_gap),
                         refused_no_frame = d(road.refused_no_frame, last_road.refused_no_frame),
                         refused_dup_sender = d(road.refused_dup_sender, last_road.refused_dup_sender),
+                        refused_oversize = d(road.refused_oversize, last_road.refused_oversize),
                         flushes = d(road.flushes, last_road.flushes),
                         flushes_stuck = d(road.flushes_stuck, last_road.flushes_stuck),
                         debt_sweeps = d(road.debt_sweeps, last_road.debt_sweeps),
@@ -1096,7 +1097,8 @@ fn spawn_stats_reporter() {
                         road_handed_back = d(road.handed_back, last_road.handed_back),
                         road_retired = d(road.retired, last_road.retired),
                         road_evicted = d(road.evicted, last_road.evicted),
-                        road_taken_live = road.taken.saturating_sub(road.handed_back + road.retired + road.evicted),
+                        road_bounded = d(road.bounded, last_road.bounded),
+                        road_taken_live = road.taken_frames,
                         "frame road"
                     );
                     last_road = road;

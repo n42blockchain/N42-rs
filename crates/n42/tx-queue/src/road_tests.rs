@@ -382,7 +382,9 @@ fn a_block_mixes_road_and_lane_frames_in_nonce_order() {
     let q = queue(RoadMode::Off);
     let x = sender(5_000);
     push_members(&q, &[(x, 0)], 1);
-    let (b1, _) = build(&q, block_hash(0), 10);
+    // The block gas limit of every build here: the road refuses a frame
+    // above the latest build's limit, and the flood's frames are 30 wide.
+    let (b1, _) = build(&q, block_hash(0), 1_000);
     assert_eq!(b1.len(), 1);
     let parent = commit(&q, block_hash(0), 1, &b1);
     let q = q.with_frame_road(RoadMode::On);

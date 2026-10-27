@@ -1489,6 +1489,12 @@ impl QmdbForest {
         (self.tree.trimmed_twigs(), self.tree.twig_count())
     }
 
+    /// The entry store's size (`docs/QMDB_COMPACTION_DESIGN.md` 3.7): a few
+    /// counters and the key index's length, no entry reads and no scan.
+    pub fn entry_stats(&self) -> n42_twig_core::entry_store::EntryStoreStats {
+        self.tree.entry_stats()
+    }
+
     /// A snapshot of the canonical head, enough to restore this forest.
     ///
     /// Only the head: every other block is either an ancestor a restarted node

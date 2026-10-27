@@ -117,6 +117,55 @@ pub fn seal_stats() -> (u64, u64) {
     (SEALS.load(Relaxed), SEAL_US.load(Relaxed))
 }
 
+/// Where a tree's entries live, as [`EntryStoreStats`] reports it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EntryStoreMode {
+    /// Every entry in the heap (`N42_QMDB_ENTRY_FILE` off).
+    #[default]
+    Heap,
+    /// Entries in the append-only entry file.
+    File,
+}
+
+/// The entry store's size, read from a few counters and the key index's length
+/// (`docs/QMDB_COMPACTION_DESIGN.md` 3.7): what grows with the append
+/// history (`total_slots`, `file_bytes`, `offsets_bytes`) against what grows
+/// with the live state (`live_slots`, `index_bytes`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EntryStoreStats {
+    /// Where the entries live.
+    pub mode: EntryStoreMode,
+    /// Slots ever appended and not cut by an undo.
+    pub total_slots: u64,
+    /// Slots still active: the key index's length, in both modes. The index
+    /// names every active slot exactly once at rest -- an open builds it from
+    /// the active bits and refuses a duplicate active key, and every apply,
+    /// delete and undo retires or revives a slot together with its index
+    /// entry under the same `&mut` -- so this is O(1), where a popcount of
+    /// the file's active bits is linear in `total_slots` (128 MB at a billion
+    /// slots, under the forest lock every sample). The tests check it
+    /// against a count of the active slots.
+    pub live_slots: u64,
+    /// In the file, the bytes of the file that belong to slots (its length,
+    /// less a torn tail); in the heap, the entry vector's own bytes, without
+    /// the values' allocations.
+    pub file_bytes: u64,
+    /// The offsets' segments, 8 MiB each; 0 in the heap.
+    pub offsets_bytes: u64,
+    /// The key index's tables ([`crate::qmdb_compat::QmdbCompatTree::index_bytes`]).
+    pub index_bytes: u64,
+    /// Sealed mappings of the file; 0 in the heap.
+    pub chunks: u64,
+}
+
+impl EntryStoreStats {
+    /// Entry bytes per live slot, `file_bytes / max(live_slots, 1)`: the
+    /// growth compaction would bound.
+    pub fn bytes_per_live_slot(&self) -> u64 {
+        self.file_bytes / self.live_slots.max(1)
+    }
+}
+
 /// One sealed mapping of `[start, start + len)` of the file. A chunk sealed
 /// at open is populated there; one sealed while the tree grows is populated
 /// on a thread of its own ([`populate_off_lock`]), which holds the mapping
@@ -397,6 +446,20 @@ impl FileEntries {
         }
         self.sealed_len = self.len_bytes;
         Ok(())
+    }
+
+    /// The store's size ([`EntryStoreStats`]) with `live` active slots (the
+    /// tree's index length); `index_bytes` is the tree's.
+    fn stats(&self, live: usize) -> EntryStoreStats {
+        EntryStoreStats {
+            mode: EntryStoreMode::File,
+            total_slots: self.offsets.len() as u64,
+            live_slots: live as u64,
+            file_bytes: self.len_bytes,
+            offsets_bytes: (self.offsets.segments.len() * crate::prefault::OFFSET_SEGMENT_SLOTS * 8) as u64,
+            index_bytes: 0,
+            chunks: self.chunks.len() as u64,
+        }
     }
 
     /// The active bits, one per slot, 64 to a word.
@@ -1085,6 +1148,22 @@ impl Entries {
         }
     }
 
+    /// The store's size ([`EntryStoreStats`]); `live_slots` is `live`, the
+    /// caller's count (a scan here would be linear in the slots), and
+    /// `index_bytes` is left to the tree.
+    pub(crate) fn stats(&self, live: usize) -> EntryStoreStats {
+        match self {
+            Self::Heap(entries) => EntryStoreStats {
+                mode: EntryStoreMode::Heap,
+                total_slots: entries.len() as u64,
+                live_slots: live as u64,
+                file_bytes: (entries.capacity() * std::mem::size_of::<Entry>()) as u64,
+                ..EntryStoreStats::default()
+            },
+            Self::File(file) => file.stats(live),
+        }
+    }
+
     /// Where the entries are, for a caller deciding whether to move them.
     pub(crate) fn file_path(&self) -> Option<&Path> {
         match self {
@@ -1244,6 +1323,84 @@ mod tests {
         assert_eq!(copy.root(), file.root());
         assert_eq!(copy.snapshot(), file.snapshot());
         assert_eq!(copy.prove(&key(800)), heap.prove(&key(800)));
+    }
+
+    /// `entry_stats` matches a count by hand over the snapshot after
+    /// appends, rewrites (retirements), deletions and an undo, in both modes.
+    #[test]
+    fn entry_stats_match_a_hand_count_in_both_modes() {
+        use crate::qmdb_compat::{QmdbCompatTree, QmdbOperation};
+        let key = |n: u64| {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&n.to_le_bytes());
+            k
+        };
+        // Keys `base..base+n`: set, or deleted when `tag` is 0.
+        let block = |base: u64, n: u64, tag: u8| -> Vec<QmdbOperation> {
+            let mut ops: Vec<QmdbOperation> = (base..base + n)
+                .map(|i| QmdbOperation { key: key(i), value: (tag != 0).then(|| vec![tag; 60 + (i % 13) as usize]) })
+                .collect();
+            ops.sort_unstable_by_key(|op| op.key);
+            ops
+        };
+        let check = |tree: &QmdbCompatTree, mode: EntryStoreMode| {
+            let stats = tree.entry_stats();
+            let snap = tree.snapshot();
+            let live = snap.entries.iter().filter(|e| e.active).count() as u64;
+            assert_eq!(stats.mode, mode);
+            assert_eq!(stats.total_slots, tree.next_slot());
+            assert_eq!(stats.total_slots, snap.entries.len() as u64);
+            assert_eq!(stats.live_slots, live);
+            assert_eq!(stats.live_slots, tree.len() as u64);
+            assert_eq!(stats.index_bytes, tree.index_bytes() as u64);
+            assert!(stats.index_bytes > 0);
+            assert_eq!(stats.bytes_per_live_slot(), stats.file_bytes / live.max(1));
+            match mode {
+                EntryStoreMode::File => {
+                    let records: u64 = snap.entries.iter().map(|e| (KEY_LEN + LEN_LEN + e.value.len()) as u64).sum();
+                    assert_eq!(stats.file_bytes, records);
+                    let segments = stats.total_slots.div_ceil(crate::prefault::OFFSET_SEGMENT_SLOTS as u64);
+                    assert_eq!(stats.offsets_bytes, segments * crate::prefault::OFFSET_SEGMENT_SLOTS as u64 * 8);
+                    // A chunk is sealed at the last record that fits it.
+                    assert!(stats.chunks * (CHUNK_BYTES as u64 / 2) <= records, "chunks of at least half a chunk's bytes");
+                }
+                EntryStoreMode::Heap => {
+                    assert_eq!(stats.offsets_bytes, 0);
+                    assert_eq!(stats.chunks, 0);
+                    assert!(stats.file_bytes >= stats.total_slots * std::mem::size_of::<Entry>() as u64);
+                }
+            }
+            stats
+        };
+        let mut heap = QmdbCompatTree::new();
+        let mut file = QmdbCompatTree::new();
+        file.set_entry_file(&scratch("stats")).unwrap();
+        assert_eq!(check(&file, EntryStoreMode::File).total_slots, 0);
+        let mut undo = None;
+        for (b, (base, n, tag)) in [(0, 6000, 1), (2000, 6000, 2), (1000, 1500, 0), (5000, 9000, 3)].into_iter().enumerate() {
+            for (tree, mode) in [(&mut heap, EntryStoreMode::Heap), (&mut file, EntryStoreMode::File)] {
+                let (_, record) = tree.apply_sorted_ops_recorded(block(base, n, tag)).unwrap();
+                check(tree, mode);
+                if mode == EntryStoreMode::File && b == 3 {
+                    undo = Some(record);
+                }
+            }
+        }
+        let (h, f) = (heap.entry_stats(), file.entry_stats());
+        assert_eq!((h.total_slots, h.live_slots), (f.total_slots, f.live_slots));
+        // 14,000 keys, 1,500 of them deleted; 21,000 records appended.
+        assert_eq!(f.live_slots, 12_500);
+        assert_eq!(f.total_slots, 21_000);
+        assert!(f.chunks >= 1, "the records cross a test chunk");
+        // An undo cuts the file and revives the retired slots.
+        file.apply_undo(&undo.unwrap()).unwrap();
+        let after = check(&file, EntryStoreMode::File);
+        assert_eq!(after.total_slots, 12_000);
+        assert_eq!(after.live_slots, 6_500);
+        drop(file);
+        if let Some(dir) = scratch("stats").parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// Trimming a twig keeps the world root and every proof of a live key,

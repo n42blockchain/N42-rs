@@ -116,6 +116,36 @@ fn a_portable_snapshot_started_node_continues_to_the_same_roots_in_both_storage_
 }
 
 #[test]
+fn the_node_state_exposes_the_entry_store_stats_without_waiting_for_the_lock() {
+    use n42_twig_core::entry_store::EntryStoreMode;
+    for entry_file in [false, true] {
+        let chain = qmdb_chain();
+        let unstarted = QmdbNodeState::new_with_entry_file(chain, scratch(&format!("stats-none-{entry_file}")), entry_file);
+        assert_eq!(unstarted.entry_stats(), None, "nothing before initialisation");
+
+        let (state, _, dir, head, _) = node_at(&format!("stats-{entry_file}"), entry_file, 3);
+        let stats = state.entry_stats().expect("the lock is free");
+        let forest_stats = {
+            let guard = state.lock_as("checkpoint");
+            // Held, here by this thread: the accessor answers at once.
+            assert_eq!(state.entry_stats(), None, "a held lock is skipped, not waited for");
+            let forest = guard.as_ref().expect("initialised");
+            forest.entry_stats()
+        };
+        assert_eq!(stats, forest_stats);
+        assert_eq!(stats.mode, if entry_file { EntryStoreMode::File } else { EntryStoreMode::Heap });
+        assert!(stats.live_slots > 0 && stats.live_slots <= stats.total_slots);
+        assert!(stats.index_bytes > 0 && stats.file_bytes > 0);
+        // Every block rewrites account 7: one more slot, no more live keys.
+        advance(&state, 4, head);
+        let after = state.entry_stats().expect("the lock is free");
+        assert!(after.total_slots > stats.total_slots);
+        assert!(after.file_bytes > stats.file_bytes || !entry_file);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
 fn a_portable_snapshot_that_does_not_match_its_header_is_refused_by_name() {
     let (source, chain, _, head, root) = node_at("portable-bad", false, 2);
     let bytes = source.portable_export(1143, chain.genesis_hash()).expect("export");

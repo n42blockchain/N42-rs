@@ -516,11 +516,21 @@ fn main() {
             // that was not checked against the root recorded for its head. Both
             // are sticky for the run; each is logged once, at error level, when
             // it first turns 1. A chain without QMDB exports neither.
+            //
+            // The entry store's growth (`docs/QMDB_COMPACTION_DESIGN.md` 3.7):
+            // the entry file's bytes, its slots in all and still live, the
+            // offsets' and the key index's heap, the file's sealed chunks, and
+            // `n42_qmdb_entry_bytes_per_live_slot`, logged once at warn level
+            // when it passes `N42_QMDB_ENTRY_BYTES_PER_LIVE_ALARM` (default
+            // 2000, 0 disables). A tick that finds the forest lock held skips
+            // these gauges rather than wait.
             if let Some(qmdb) = qmdb_for_startup.clone() {
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
                     let mut poisoned_seen = false;
                     let mut unchecked_seen = false;
+                    let bytes_per_live_alarm: u64 = n42_env::parse("N42_QMDB_ENTRY_BYTES_PER_LIVE_ALARM", 2000);
+                    let mut bytes_per_live_warned = false;
                     loop {
                         tick.tick().await;
                         // `poisoned()` answers None while the forest lock is held,
@@ -539,6 +549,28 @@ fn main() {
                         }
                         metrics::gauge!("n42_qmdb_forest_poisoned").set(if poisoned_seen { 1.0 } else { 0.0 });
                         metrics::gauge!("n42_qmdb_unchecked_restart").set(if unchecked_seen { 1.0 } else { 0.0 });
+                        if let Some(stats) = qmdb.entry_stats() {
+                            let per_live = stats.bytes_per_live_slot();
+                            metrics::gauge!("n42_qmdb_entry_file_bytes").set(stats.file_bytes as f64);
+                            metrics::gauge!("n42_qmdb_entry_total_slots").set(stats.total_slots as f64);
+                            metrics::gauge!("n42_qmdb_entry_live_slots").set(stats.live_slots as f64);
+                            metrics::gauge!("n42_qmdb_offsets_bytes").set(stats.offsets_bytes as f64);
+                            metrics::gauge!("n42_qmdb_index_bytes").set(stats.index_bytes as f64);
+                            metrics::gauge!("n42_qmdb_entry_chunks").set(stats.chunks as f64);
+                            metrics::gauge!("n42_qmdb_entry_bytes_per_live_slot").set(per_live as f64);
+                            if bytes_per_live_alarm > 0 && per_live > bytes_per_live_alarm && !bytes_per_live_warned {
+                                bytes_per_live_warned = true;
+                                warn!(
+                                    target: "n42.qmdb",
+                                    per_live,
+                                    alarm = bytes_per_live_alarm,
+                                    file_bytes = stats.file_bytes,
+                                    live_slots = stats.live_slots,
+                                    total_slots = stats.total_slots,
+                                    "the QMDB entry store holds more bytes per live slot than N42_QMDB_ENTRY_BYTES_PER_LIVE_ALARM; it grows with the append history (docs/QMDB_COMPACTION_DESIGN.md)",
+                                );
+                            }
+                        }
                     }
                 });
             }

@@ -48,7 +48,7 @@ pub use reth_chainspec::qmdb::{
 /// The tree a producer computed for a block it has not yet sealed.
 pub use n42_qmdb_state::forest::PreparedBlock;
 pub use node_state::{
-    sort_and_hash_leaves, NodeStateError, OfflockCounters, PersistSplit, QmdbNodeState, RenameOutcome, RootSplit,
+    canonical_fatal, settle_wait, sort_and_hash_leaves, NodeStateError, OfflockCounters, PersistSplit, QmdbNodeState, RenameOutcome, RootSplit,
 };
 pub use read_view::{QmdbReadView, ViewLockWaits};
 pub use state_reader::{check_hashed_tables_setting, register_state_reader, QmdbStateReader};

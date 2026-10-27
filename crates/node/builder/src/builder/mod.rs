@@ -1152,25 +1152,111 @@ mod tests {
 }
 
 /// The engine tree configuration for `config`, with the state masking suffix forced off on a
-/// QMDB chain.
-///
-/// The suffix keeps the hashed-state/trie frontier `num_state_masking_blocks` behind the
-/// database tip. A restart after SIGKILL would then have to unwind the database to that
-/// frontier through the Merkle stage, which verifies a Merkle-Patricia root that a QMDB
-/// chain's headers do not carry.
+/// QMDB chain and reth's persistence defaults lowered there ([`qmdb_tree_config`]).
 fn effective_tree_config<C: EthChainSpec>(
     config: &reth_node_core::node_config::NodeConfig<C>,
 ) -> reth_engine_primitives::TreeConfig {
     let tree_config = config.tree_config();
     let qmdb = reth_chainspec::qmdb::state_scheme(config.chain.genesis()) ==
         reth_chainspec::qmdb::StateScheme::Qmdb;
-    if qmdb && tree_config.num_state_masking_blocks() > 0 {
+    if qmdb { qmdb_tree_config(tree_config) } else { tree_config }
+}
+
+/// The persistence threshold a QMDB chain runs at unless the operator sets one: the fleet7 bench
+/// profile's value, run at 5M TPS (`scripts/fleet7-env.sh`).
+const QMDB_PERSISTENCE_THRESHOLD: u64 = 8;
+
+/// The in-memory block buffer target a QMDB chain runs at unless the operator sets one.
+const QMDB_MEMORY_BLOCK_BUFFER_TARGET: u64 = 6;
+
+/// A QMDB chain's engine tree configuration.
+///
+/// The state masking suffix is forced off. It keeps the hashed-state/trie frontier
+/// `num_state_masking_blocks` behind the database tip. A restart after SIGKILL would then have to
+/// unwind the database to that frontier through the Merkle stage, which verifies a
+/// Merkle-Patricia root that a QMDB chain's headers do not carry.
+///
+/// The persistence threshold and the memory block buffer target are lowered to 8 and 6 when they
+/// are still reth's defaults (50 and 5 since reth 2.7; 2 before 2.5), which is how "not set by the
+/// operator" reads here. At 50 the database lags the head by up to 50 blocks, the QMDB forest
+/// settles ahead of it, and a crash loses that many blocks to re-import (a crash in the first 50
+/// blocks of a chain restarts at genesis). The buffer target is lowered only where it stays
+/// below the threshold.
+fn qmdb_tree_config(
+    mut tree_config: reth_engine_primitives::TreeConfig,
+) -> reth_engine_primitives::TreeConfig {
+    use reth_engine_primitives::{DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD};
+    if tree_config.num_state_masking_blocks() > 0 {
         info!(
             target: "reth::cli",
             configured = tree_config.num_state_masking_blocks(),
             "State masking suffix is off on a QMDB chain: the trie frontier it leaves behind cannot be unwound through the Merkle stage"
         );
-        return tree_config.with_num_state_masking_blocks(0)
+        tree_config = tree_config.with_num_state_masking_blocks(0);
+    }
+    let (threshold, target) =
+        (tree_config.persistence_threshold(), tree_config.memory_block_buffer_target());
+    let new_threshold = if threshold == DEFAULT_PERSISTENCE_THRESHOLD &&
+        QMDB_PERSISTENCE_THRESHOLD < tree_config.persistence_backpressure_threshold()
+    {
+        QMDB_PERSISTENCE_THRESHOLD
+    } else {
+        threshold
+    };
+    let new_target = if target == DEFAULT_MEMORY_BLOCK_BUFFER_TARGET &&
+        QMDB_MEMORY_BLOCK_BUFFER_TARGET <= new_threshold
+    {
+        QMDB_MEMORY_BLOCK_BUFFER_TARGET
+    } else {
+        target
+    };
+    if (new_threshold, new_target) != (threshold, target) {
+        info!(
+            target: "reth::cli",
+            persistence_threshold = new_threshold,
+            memory_block_buffer_target = new_target,
+            default_persistence_threshold = threshold,
+            default_memory_block_buffer_target = target,
+            "QMDB chain: persistence defaults lowered (set --engine.persistence-threshold / --engine.memory-block-buffer-target to override)"
+        );
+        tree_config = tree_config
+            .with_persistence_threshold(new_threshold)
+            .with_memory_block_buffer_target(new_target);
     }
     tree_config
+}
+
+#[cfg(test)]
+mod qmdb_tree_config_tests {
+    use super::*;
+    use reth_engine_primitives::{
+        TreeConfig, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD,
+    };
+
+    #[test]
+    fn reth_defaults_are_lowered_and_operator_values_are_kept() {
+        let defaults = TreeConfig::default();
+        assert_eq!(defaults.persistence_threshold(), DEFAULT_PERSISTENCE_THRESHOLD);
+        assert_eq!(defaults.memory_block_buffer_target(), DEFAULT_MEMORY_BLOCK_BUFFER_TARGET);
+        let lowered = qmdb_tree_config(defaults);
+        assert_eq!(lowered.persistence_threshold(), QMDB_PERSISTENCE_THRESHOLD);
+        assert_eq!(lowered.memory_block_buffer_target(), QMDB_MEMORY_BLOCK_BUFFER_TARGET);
+        assert_eq!(lowered.num_state_masking_blocks(), 0);
+
+        // An operator's threshold stays, and so does the buffer target it implies.
+        let set = TreeConfig::default()
+            .with_num_state_masking_blocks(0)
+            .with_persistence_threshold(4)
+            .with_memory_block_buffer_target(4);
+        let kept = qmdb_tree_config(set);
+        assert_eq!((kept.persistence_threshold(), kept.memory_block_buffer_target()), (4, 4));
+
+        // A threshold set to the default buffer target: the target is not raised past it.
+        let tight = TreeConfig::default()
+            .with_num_state_masking_blocks(0)
+            .with_persistence_threshold(DEFAULT_MEMORY_BLOCK_BUFFER_TARGET);
+        let kept = qmdb_tree_config(tight);
+        assert_eq!(kept.persistence_threshold(), DEFAULT_MEMORY_BLOCK_BUFFER_TARGET);
+        assert_eq!(kept.memory_block_buffer_target(), DEFAULT_MEMORY_BLOCK_BUFFER_TARGET);
+    }
 }

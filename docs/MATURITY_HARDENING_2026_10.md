@@ -580,3 +580,9 @@ persistence defaults 8/6, entry-file fold archive) + the validator's persistence
   the warmed 30 s legs (5.1-5.2M on main `47b8180ab`), so the QC-bearing headers cost nothing visible at
   this resolution; the proper pair (stage fn) still waits for the power supply. Peak the guard saw: 342 W,
   Tctl 48 C.
+- **Leftovers merged (2026-10-28, `fix/leftovers-2026-10`):** rollback recovery archives now retire by the
+  same durable-head rule as fold archives (they accumulated forever); the synchronous checkpoint path
+  (`N42_QMDB_CHECKPOINT_SYNC=1`) archives the checkpoint and log it replaces, so a restart below the new
+  checkpoint replays from the archive in both storage modes; the profile report's withdrawal line states
+  how many knobs remain in force; the seven clippy nits named in 6.x are fixed. Unit tests on the merged
+  head: `n42-qmdb-reth` 104, `n42-env` 23, `n42-tx-queue` 133 passed.

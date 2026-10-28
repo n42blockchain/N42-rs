@@ -1,7 +1,7 @@
 # QMDB entry-file compaction: a root-neutral design
 
-Status: design, 2026-10-27. Item 6.2 of `docs/MATURITY_HARDENING_2026_10.md`. Nothing here is
-implemented; the stages at the end say what lands first and how each is verified.
+Status: design, 2026-10-27, amended 2026-10-28 (3.2 consequence, stage order). Item 6.2 of
+`docs/MATURITY_HARDENING_2026_10.md`. Stage 0 is implemented; the stages at the end say what lands first and how each is verified.
 
 ## 1. The problem, restated with the code's numbers
 
@@ -62,6 +62,17 @@ key, a length and a value that nothing will read again. `twig_leaf_nodes` learns
 and uses the stored hash. The slot number in each record is what lets `open_existing` rebuild
 `Offsets` for a file that is no longer slot-ordered; the trailer lets a torn group be cut on
 open exactly as a torn tail is today.
+
+**Consequence found 2026-10-28, before stage 2:** gov5's portable snapshot is the complete
+positional slot log, dead slots included, and its verifier (`verify_portable_stream`) hashes
+`hash_leaf(key, value)` for every slot, so a tree whose dead slots keep only their leaf hash can
+no longer export a verifiable v1 portable snapshot (the hash alone reproduces the root but not
+the stream). A compacting node is therefore a *pruned* node: `portable_export` refuses on a tree
+with hash-only slots and names the rule (export from a node that runs with compaction off, as
+an archive node), the heap `QmdbSnapshot` carries the leaf hash for such entries so checkpoints
+and `from_snapshot` still work, and a v2 portable format with hash-only tombstones is a separate
+cross-client item to agree with gov5 before compacting nodes can serve bootstraps. The section 1
+numbers stand: without dropping the dead payloads there is nothing to reclaim.
 
 ### 3.3 Reads: the view resolves slots, not bytes
 
@@ -171,3 +182,10 @@ QMDB-counter log to put it in (the read view's lag line is about the view, not t
 Each stage is a bench pair (X22 control against the change, `scripts/fleet7-runs` stage) before
 it is adopted; stage 0 needs none. Stages 0-2 are additive and can land behind
 `N42_QMDB_COMPACT=1` (default off until stage 3 has its field check).
+
+Order note (2026-10-28): stage 2 lands before stage 1. Stage 2 never punches, so the old bytes of
+a relocated twig stay where the read view's byte offsets point and the view needs no change;
+stage 1 (slot-resolving view) is what stage 3's punching requires, and its bench pair waits for
+the host's power supply (`docs/MATURITY_HARDENING_2026_10.md` 8.3). Stage 2 ships the mechanism
+(`compact_twigs` on the tree, the second file, the two-file open, the checkpoint field, the
+`relocated_bytes` gauge) with no production caller: stage 3 adds the scheduler.

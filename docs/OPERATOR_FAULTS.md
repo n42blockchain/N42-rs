@@ -82,7 +82,9 @@ persistence lag past MDBX's. Each fold therefore first keeps the checkpoint it
 replaces and the segment it folds as a pair under
 `el/qmdb/recovery-archive/fold-<block, 20 digits>-<hash>-<pid>-<n>/` (hard
 links, so no copy is made): `forest.bin` + `forest.log` in heap mode,
-`forest.ckpt` + `forest.log` in entry-file mode. A restart whose MDBX head lies
+`forest.ckpt` + `forest.log` in entry-file mode. The live-forest rewrite
+(`N42_QMDB_CHECKPOINT_SYNC=1`) keeps the same pair under the same name: the
+checkpoint it replaces and the log the new checkpoint supersedes. A restart whose MDBX head lies
 below the live checkpoint replays the archive up to that head; in entry-file
 mode it also cuts `entries.log` back to that head's cursor, drops the live log
 and rewrites `forest.ckpt` at the head, logging `restored the QMDB forest from a

@@ -3561,6 +3561,7 @@ impl QmdbNodeState {
             let mut phases = CompactPhases::default();
             let block_hash = ckpt.head_hash;
             self.save_checkpoint_frontier((ckpt.head_number, block_hash))?;
+            self.archive_before_rewrite(&self.ckpt_path(), (ckpt.head_number, block_hash))?;
             let len = write_ckpt(&self.ckpt_path(), &ckpt, &mut phases)?;
             self.record_head_roots(&[(ckpt.head_number, block_hash, root)]);
             remove_file_logged(self.delta_log_path());
@@ -3578,6 +3579,7 @@ impl QmdbNodeState {
                 block = ckpt.head_number, %block_hash, bytes = len, total_ms,
                 "checkpointed the QMDB head (entry file)",
             );
+            self.prune_after_rewrite();
             return Ok(());
         }
         let snapshot = self.with_forest("checkpoint#2", |forest| {
@@ -3596,6 +3598,7 @@ impl QmdbNodeState {
         let path = self.snapshot_path();
         let mut phases = CompactPhases::default();
         self.save_checkpoint_frontier((snapshot.head_number, block_hash))?;
+        self.archive_before_rewrite(&path, (snapshot.head_number, block_hash))?;
         let len = write_snapshot(&path, &snapshot, &mut phases)?;
         self.record_head_roots(&[(snapshot.head_number, block_hash, root)]);
         // Order matters: the log is emptied only once the checkpoint that
@@ -3616,7 +3619,28 @@ impl QmdbNodeState {
             block = snapshot.head_number, %block_hash, bytes = len, total_ms,
             "checkpointed the QMDB head",
         );
+        self.prune_after_rewrite();
         Ok(())
+    }
+
+    /// The live-forest rewrite's twin of a fold's archive: the checkpoint
+    /// `base` about to be replaced and the log the new checkpoint at `head`
+    /// supersedes are kept as a `fold-<head>` pair, so a restart below
+    /// `head` (the database behind the forest by the persistence lag) can
+    /// replay from them. Nothing to keep when there is no checkpoint yet.
+    fn archive_before_rewrite(&self, base: &Path, head: (u64, B256)) -> Result<(), NodeStateError> {
+        if !base.exists() {
+            return Ok(());
+        }
+        self.archive_pair(&format!("fold-{:020}-{:x}", head.0, head.1), base, &self.delta_log_path())
+    }
+
+    /// Retires covered recovery archives after a live-forest rewrite, as a
+    /// background fold does after its compaction.
+    fn prune_after_rewrite(&self) {
+        if let Err(err) = self.prune_heap_archives() {
+            warn!(target: "n42.qmdb", %err, "could not retire covered recovery archives");
+        }
     }
 }
 
@@ -4063,8 +4087,14 @@ mod tests {
             assert_eq!(restarted.persisted_state_root(2, hashes[1]).unwrap(), roots[1]);
             restarted.initialize((3, hashes[2])).unwrap();
             assert_eq!(restarted.state_root(), roots[2]);
-            // An arbitrary older block or corrupt frontier must not get the
-            // head root substituted for its missing historical root.
+            // A heap node reads an older block from the pair the rewrite
+            // archived, exactly; without that archive, an arbitrary older
+            // block or corrupt frontier must not get the head root
+            // substituted for its missing historical root.
+            if !entry_file {
+                assert_eq!(restarted.persisted_state_root(1, hashes[0]).unwrap(), roots[0]);
+            }
+            std::fs::remove_dir_all(dir.join("recovery-archive")).unwrap();
             assert!(restarted.persisted_state_root(1, hashes[0]).is_err());
             let mut corrupt = std::fs::read(restarted.frontier_path()).unwrap();
             corrupt[35] ^= 1;

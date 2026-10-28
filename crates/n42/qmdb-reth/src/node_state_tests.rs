@@ -514,6 +514,38 @@ fn a_restart_below_a_fold_head_restores_from_the_fold_archive_in_both_storage_mo
     }
 }
 
+/// The live-forest rewrite (`N42_QMDB_CHECKPOINT_SYNC=1`) archives the
+/// checkpoint it replaces and the log it supersedes, as a fold does: a
+/// restart below the new checkpoint replays from that pair.
+#[test]
+fn a_restart_below_a_sync_checkpoint_restores_from_its_archive_in_both_storage_modes() {
+    for entry_file in [false, true] {
+        let (state, chain, dir, mut head, _) = node_at(&format!("sync-archive-below-{entry_file}"), entry_file, 10);
+        state.checkpoint(Some(hash_of(10)), &mut state.cursor()).expect("rewrite at 10");
+        let archives = fold_archives(&dir);
+        assert_eq!(archives.len(), 1, "entry_file={entry_file}: {archives:?}");
+        assert!(archives[0].starts_with(&format!("fold-{:020}-{:x}-", 10, hash_of(10))), "{archives:?}");
+        for number in 11..=12 {
+            (head, _) = advance(&state, number, head);
+        }
+        let mut roots = vec![chain.genesis_header.state_root];
+        roots.extend((1..=12).map(|number| state.root_of(&hash_of(number)).expect("root")));
+        drop(state);
+
+        let restarted = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        restarted.initialize((7, hash_of(7))).expect("a database head below the rewritten checkpoint");
+        assert_eq!(restarted.state_root(), roots[7], "entry_file={entry_file}");
+        let mut head = hash_of(7);
+        for number in 8..=12 {
+            let (hash, root) = advance(&restarted, number, head);
+            assert_eq!(root, roots[number as usize], "entry_file={entry_file}: block {number} again");
+            head = hash;
+        }
+        drop(restarted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// At or past the fold head no archive is needed: the live checkpoint and
 /// log serve the restart.
 #[test]

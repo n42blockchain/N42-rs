@@ -1406,10 +1406,10 @@ impl QmdbNodeState {
             // moved the tree off the persisted blocks' path; stand it back on
             // them before listing, or the view is invalidated for good.
             let hashes: Vec<B256> = todo.iter().map(|&(_, hash)| hash).collect();
-            if let Some(&last_hash) = hashes.last() {
-                if forest.restore_path_to(&hashes, last_hash)? {
-                    info!(target: "n42.qmdb", block = last, "stood the QMDB tree back on the persisted blocks' path");
-                }
+            if let Some(&last_hash) = hashes.last()
+                && forest.restore_path_to(&hashes, last_hash)?
+            {
+                info!(target: "n42.qmdb", block = last, "stood the QMDB tree back on the persisted blocks' path");
             }
             forest.flush_entries_for_sync()?;
             let mut listed = Vec::with_capacity(todo.len());
@@ -1831,10 +1831,10 @@ impl QmdbNodeState {
             warn!(target: "n42.qmdb", label, ms = waited_ms, held_by, "forest lock waited");
         }
         *self.inner.forest_holder.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = label;
-        if self.inner.pending_rename_count.load(std::sync::atomic::Ordering::Acquire) > 0 {
-            if let Some(forest) = guard.as_mut() {
-                self.drain_renames(forest);
-            }
+        if self.inner.pending_rename_count.load(std::sync::atomic::Ordering::Acquire) > 0
+            && let Some(forest) = guard.as_mut()
+        {
+            self.drain_renames(forest);
         }
         ForestGuard { guard, inner: &self.inner, label, acquired, waited_ms, held_by }
     }
@@ -2371,12 +2371,11 @@ impl QmdbNodeState {
     }
 
     fn parent_root_from_frontier(&self, checkpoint: (u64, B256), parent: (u64, B256)) -> Result<B256, NodeStateError> {
-        if parent.0.checked_add(1) == Some(checkpoint.0) {
-            if let Some(frontier) = self.checkpoint_frontier(checkpoint)? {
-                if frontier.parent_hash == parent.1 {
-                    return Ok(frontier.parent_root);
-                }
-            }
+        if parent.0.checked_add(1) == Some(checkpoint.0)
+            && let Some(frontier) = self.checkpoint_frontier(checkpoint)?
+            && frontier.parent_hash == parent.1
+        {
+            return Ok(frontier.parent_root);
         }
         Err(NodeStateError::RecoveryFrontier(format!(
             "checkpoint {} ({}) has no matching parent result for {} ({})",
@@ -3138,13 +3137,12 @@ impl QmdbNodeState {
     /// ([`Self::settle_through`]).
     pub fn is_fatal_canonical_error(&self, error: &NodeStateError, block_hash: B256) -> bool {
         match error {
-            NodeStateError::Poisoned(_) | NodeStateError::Uninitialised => true,
             NodeStateError::State(StateError::EntryFile(_)) => false,
             NodeStateError::State(StateError::UnknownBlock(unknown)) => {
                 let aliases = self.inner.rename_aliases.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 !aliases.iter().any(|alias| alias.to == *unknown || alias.to == block_hash)
             }
-            NodeStateError::State(_) => true,
+            NodeStateError::Poisoned(_) | NodeStateError::Uninitialised | NodeStateError::State(_) => true,
             _ => false,
         }
     }
@@ -3158,7 +3156,7 @@ impl QmdbNodeState {
             let spawned = std::thread::Builder::new().name("n42-qmdb-canon".into()).spawn(move || {
                 while receiver.recv().is_ok() {
                     let Some(inner) = inner.upgrade() else { break };
-                    if let Err(error) = (QmdbNodeState { inner }).settle_canonical() {
+                    if let Err(error) = (Self { inner }).settle_canonical() {
                         warn!(target: "n42.qmdb", %error, "the QMDB head's deferred persistence failed; the next head retries it");
                     }
                 }

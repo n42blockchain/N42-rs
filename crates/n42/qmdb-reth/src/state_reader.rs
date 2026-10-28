@@ -57,15 +57,15 @@ impl N42StateReader for QmdbStateReader {
     /// database must never commit past it), then the read view advances.
     /// A log that cannot be settled refuses the batch, and the view stays.
     fn on_state_persisted_checked(&self, blocks: &[BlockNumHash]) -> Result<(), PersistRefused> {
-        if let Some(last) = blocks.last() {
-            if let Err(err) = self.state.settle_through(last.number, last.hash, self.settle_wait) {
-                error!(
-                    target: "n42.qmdb",
-                    block = last.number, block_hash = %last.hash, error = %err,
-                    "QMDB delta log not settled through a block the database was about to commit; refusing the batch"
-                );
-                return Err(PersistRefused::new(err));
-            }
+        if let Some(last) = blocks.last()
+            && let Err(err) = self.state.settle_through(last.number, last.hash, self.settle_wait)
+        {
+            error!(
+                target: "n42.qmdb",
+                block = last.number, block_hash = %last.hash, error = %err,
+                "QMDB delta log not settled through a block the database was about to commit; refusing the batch"
+            );
+            return Err(PersistRefused::new(err));
         }
         let blocks: Vec<(u64, B256)> = blocks.iter().map(|block| (block.number, block.hash)).collect();
         self.state.on_persisted(&blocks);

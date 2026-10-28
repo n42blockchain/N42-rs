@@ -218,7 +218,7 @@ impl<T: PoolTransaction> RoadTaken<T> {
         self.indexed = on;
         self.by_sender.clear();
         if on {
-            let RoadTaken { by_id, by_sender, .. } = self;
+            let Self { by_id, by_sender, .. } = self;
             for (id, frame) in by_id.iter() {
                 if let Some((sender, _)) = frame.members.first() {
                     by_sender.entry(*sender).or_default().push(*id);

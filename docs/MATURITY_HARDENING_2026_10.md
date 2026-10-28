@@ -209,6 +209,9 @@ its header is verified through the proposal-path check (`ConsensusEngine::verify
 before `newPayload`; the first failure ends the batch and the peer is not asked again for the
 gap (`H2Service::check_pulled_block`). A pulled block is head only in both settlement modes.
 No knob. gov5 comparison in `docs/N42_26_PORT.md` "Certificates on pulled blocks".
+A QC whose view falls in an epoch this node knows no validator set for (a cold node, or one
+further behind than the epoch history) is unchecked and only the parent link is, as gov5's
+`verifyHeaderWithBatch` skips it; refusing it would keep such a node from ever catching up.
 
 ### 6.7 Lint baseline
 
@@ -255,7 +258,29 @@ storage (one aggregate BLS signature plus the voter bitmap and view), nothing on
 Verification: the h2-consensus header tests against gov5's fixtures (a Rust header with a QC
 must decode in gov5's `decodeHeaderExtra`), the three devnet shapes with a gov5 member (gov5
 must accept the Rust headers it now verifies), and a fleet7 pair to confirm the cycle is
-unchanged. Not started.
+unchanged.
+
+**6.9 done (2026-10-27, branch `design/qc-embed`).** `n42-h2-wire` exposes gov5's QC
+encoder (`encode_h2_qc`, checked byte for byte against the commit QC inside gov5's Decide
+fixture); `HeaderExtra::with_committed_qc` and the `*_with_qc` variants of the three header
+normalizers write `N42H || view || QC || seal`, the existing functions delegating with no QC.
+The service keeps the engine's last committed QC in gov5's encoding (refreshed on every
+`BlockCommitted` output and at start, empty for the view-0 genesis sentinel) and hands it to
+both sealers -- the payload normalizer and the build chain's sealer -- pinned per
+`(number, view)` so a block sealed twice embeds the same QC and the chained build's parent
+hash still matches. The embedded QC is a commit-domain certificate: the engine's
+`last_committed_qc` is only set from the CommitQC formed from round-two commit votes
+(`commit_message`) or from a Decide's CommitQC verified under the commit domain, which is
+what gov5's `maybeCommitFromHeaderQC` requires; gov5 will therefore now canonicalize a
+catching-up node from Rust-built headers too, and 6.6's range-pull check verifies the
+certificate on Rust-built ranges; one whose view lies in an epoch the pulling node knows no
+set for is unchecked, as gov5 (see 6.6), so a cold node still catches up. Nothing on the Rust side bounds the extra to 108 bytes
+(the bound is `MAX_HEADER_EXTRA_LEN`, 4096; a 512-signer QC is ~220 bytes). Covered by the
+h2-wire, h2-consensus and h2-node tests
+(`a_leaders_headers_carry_its_last_committed_qc_once_it_has_one`). Devnet shapes with a gov5
+member on the QC-bearing binaries (2026-10-28, 8.3): all three pass. The fleet7 pair for the
+cycle (bench stage fn, QC natives against main natives) is still to run: the host lost power
+three times in one week at load steps (8.3), so the full-load stage waits for the power fault.
 
 ## 7. Merge record
 
@@ -524,3 +549,27 @@ persistence defaults 8/6, entry-file fold archive) + the validator's persistence
 - `roll --kill` in entry-file mode, first kill at height 6 before any MDBX persistence: node1 restored
   from the genesis checkpoint and committed again (height 8); node2 killed at 28 restored at 21, node3
   killed at 49 at 42; all seven members at height 117 with one head hash after 360 s, no fault line.
+
+### 8.3 6.9 integration (2026-10-28)
+
+`design/qc-embed` (six commits over `8ff447481`) verified on 2026-10-28 before the merge, with
+`cargo` at 16 jobs (`audit-notes/scripts/qc-verify.sh`, log `ci/qc-verify.log`):
+
+- tests of `n42-h2-wire`, `n42-h2-consensus`, `n42-h2-node`, `n42-h2-execution`: 34 suites, 0 failed;
+  `cargo check -p n42 -p n42-h2-node --tests --examples` clean; native binaries built into
+  `target/native-qc` (the main natives in `target/native` kept for the bench pair).
+- **Devnet shapes with a gov5 member** (`devnet-phase.sh`, 05:40-06:03 UTC), every Rust-built header now
+  carrying the leader's last committed QC: `gov5late` (gov5 joins at 120 s): 160 blocks, gov5 sealed 40
+  and committed 200 views with 0 errors, block 160 one hash on both clients; `late` (Rust member 2 starts
+  at 120 s with a fresh execution layer): pulls the range and rejoins, 121 blocks, one hash, gov5
+  0 errors; `absent` (member 2 killed at height 52, back at 82): pulls the gap by range, 185 blocks,
+  the returning member at the main height with 103 commits after its return. So gov5 accepts and
+  verifies Rust headers with an embedded commit QC in all three shapes, and the 6.6 range-pull check
+  accepts QC-bearing Rust ranges.
+- Not run: bench stage fn (the QC/main pair for the cycle). The host lost power at 10-25 15:20,
+  10-27 00:20 and 10-28 03:04 UTC, each time within seconds of a load step from idle (the last one 8 s
+  into a 32-job `cargo build` on an idle box at 87 W, Tctl 33 C; no thermal or fan event in the BMC log,
+  the same BIOS 1.7, microcode 0xb002161 and kernel on every boot), and the chassis restore policy is
+  always-off, so each cut cost hours. Until the power supply is sorted the verification builds run at
+  16 jobs and the seven-node load stays off; stage fn is scheduled behind that and its result goes
+  here when it has run.

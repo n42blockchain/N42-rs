@@ -435,7 +435,7 @@ pub struct H2Service<E> {
     /// `body_grace`, because the leader's direct push is normally 30-40 ms
     /// behind its proposal and a request sent at once made every follower
     /// fetch and decode five or six 19 MB copies a view (round 39: 100-180
-    /// ms of every step's transport phase, and the PrepareQC behind it).
+    /// ms of every step's transport phase, and the `PrepareQC` behind it).
     body_wait: std::collections::HashMap<B256, std::time::Instant>,
     body_grace: Duration,
     /// When each block's body was last asked of every peer, so a body that
@@ -800,8 +800,8 @@ fn far_ahead_blocks_from(value: Option<&str>) -> u64 {
 /// At depth-2 deferred execution (header N carries the execution of N-2) a
 /// voted block is legitimately two ahead of the tip once votes no longer wait
 /// for imports (`N42_CHECK_BEFORE_SLOT=1`), so the default of one holds it and
-/// defeats the check-ahead. See docs/SHARED_EXECUTION_SCOPE.md section 20 and
-/// docs/BREAKTHROUGH_DESIGN.md 10.98.
+/// defeats the check-ahead. See `docs/SHARED_EXECUTION_SCOPE.md` section 20 and
+/// `docs/BREAKTHROUGH_DESIGN.md` 10.98.
 static FAR_AHEAD_LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// The effective far-ahead limit.
@@ -1657,7 +1657,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// embeds in the headers it seals, when it has moved.
     ///
     /// The engine's `last_committed_qc` is only ever set from a commit-domain
-    /// certificate: the CommitQC this node formed from round-two commit votes
+    /// certificate: the `CommitQC` this node formed from round-two commit votes
     /// (`try_form_commit_qc`, signed over `commit_message`) or the one a
     /// Decide carried and that verified under the commit domain
     /// (`verify_commit_qc_with_profile`), or the same restored from the
@@ -3524,16 +3524,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                 let seen = self.engine.voters_seen(previous);
                 let all = self.engine.validator_count() as usize;
                 let decided_at = self.engine.last_committed_view_timing().and_then(|t| t.commit_qc_formed);
-                if seen > 0 && seen < all {
-                    if let Some(at) = decided_at {
-                        if at.elapsed() < grace {
-                            self.proposal_deferred = true;
-                            self.defer_reason = Some("waiting for the stragglers' votes");
-                            self.note_straggler_wait(view, at);
-                            return Ok(());
-                        }
-                        debug!(target: "n42.h2.node", view, seen, all, "stragglers' grace ran out; proposing without them");
+                if seen > 0 && seen < all
+                    && let Some(at) = decided_at
+                {
+                    if at.elapsed() < grace {
+                        self.proposal_deferred = true;
+                        self.defer_reason = Some("waiting for the stragglers' votes");
+                        self.note_straggler_wait(view, at);
+                        return Ok(());
                     }
+                    debug!(target: "n42.h2.node", view, seen, all, "stragglers' grace ran out; proposing without them");
                 }
             }
         }
@@ -3934,10 +3934,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // A checked block (deferred execution) is voted for on the
                 // same extends rule; it is not imported yet, so nothing else
                 // moves.
-                if let ConsensusEvent::BlockChecked(block_hash) = event.as_ref() {
-                    if let Some(header) = self.block_headers.get(block_hash) {
-                        self.engine.remember_parent(*block_hash, header.parent_hash);
-                    }
+                if let ConsensusEvent::BlockChecked(block_hash) = event.as_ref()
+                    && let Some(header) = self.block_headers.get(block_hash)
+                {
+                    self.engine.remember_parent(*block_hash, header.parent_hash);
                 }
                 if let Err(err) = self.engine.process_event(*event) {
                     report_engine_error(&err, "execution event", &mut self.fatal);
@@ -4465,13 +4465,13 @@ impl<E: ExecutionLayer> H2Service<E> {
     ///
     /// The seal is not checked: the live path does not check it either (a
     /// block is authenticated by the certificates on the wire, see
-    /// `HotStuffConsensus`). A header without the HotStuff extra layout is
+    /// `HotStuffConsensus`). A header without the `HotStuff` extra layout is
     /// refused on a gov5 chain and carries no certificate on another.
     fn check_pulled_block(&self, header: &Header) -> Result<(), String> {
-        if let Some(prev) = self.catch_up.as_ref().and_then(|c| c.prev_hash) {
-            if header.parent_hash != prev {
-                return Err(format!("parent {} is not the block pulled before it, {prev}", header.parent_hash));
-            }
+        if let Some(prev) = self.catch_up.as_ref().and_then(|c| c.prev_hash)
+            && header.parent_hash != prev
+        {
+            return Err(format!("parent {} is not the block pulled before it, {prev}", header.parent_hash));
         }
         let extra = match n42_h2_consensus::HeaderExtra::decode(&header.extra_data) {
             Ok(extra) => extra,

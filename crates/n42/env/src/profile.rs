@@ -346,6 +346,8 @@ pub struct Withdrawn {
     pub profile: String,
     /// The knobs removed from the environment again.
     pub knobs: Vec<Knob>,
+    /// How many knobs the profile set remain in force after the withdrawal.
+    pub remaining: usize,
 }
 
 /// Withdraws every knob the applied profile set whose genesis requirement the
@@ -373,11 +375,47 @@ pub unsafe fn reconcile(features: ChainFeatures) -> Option<Withdrawn> {
         unsafe { std::env::remove_var(knob.name) };
     }
     record.set.retain(|knob| !knobs.contains(knob));
-    Some(Withdrawn { profile: record.profile.clone(), knobs })
+    Some(Withdrawn { profile: record.profile.clone(), knobs, remaining: record.set.len() })
+}
+
+/// The stderr lines [`reconcile_and_report`] prints: one per missing
+/// feature, each ending with how many of the profile's knobs remain in force.
+fn withdrawal_lines(binary: &str, withdrawn: &Withdrawn) -> Vec<String> {
+    let mut lines = Vec::new();
+    for requirement in [Requires::FrameBlocks] {
+        let names: Vec<&str> =
+            withdrawn.knobs.iter().filter(|knob| knob.requires == Some(requirement)).map(|knob| knob.name).collect();
+        if !names.is_empty() {
+            lines.push(format!(
+                "{binary}: {PROFILE_VAR}={}: {} knob(s) need {} in the genesis and were not applied: {}; {} knob(s) remain in force",
+                withdrawn.profile,
+                names.len(),
+                requirement.genesis_key(),
+                names.join(", "),
+                withdrawn.remaining,
+            ));
+        }
+    }
+    lines
+}
+
+/// The stderr line [`apply_or_exit`] prints. Knobs with a genesis
+/// requirement are counted as pending: [`reconcile_and_report`] may still
+/// withdraw them once the chain spec is known.
+fn applied_line(binary: &str, applied: &Applied) -> String {
+    let pending = applied.set.iter().filter(|knob| knob.requires.is_some()).count();
+    let pending = if pending == 0 { String::new() } else { format!(" ({pending} pending the genesis check)") };
+    format!(
+        "{binary}: {PROFILE_VAR}={} set {} knob(s){pending}; kept from the environment: [{}]",
+        applied.profile,
+        applied.set.len(),
+        applied.kept.join(", ")
+    )
 }
 
 /// [`reconcile`] for a binary's start-up: prints one stderr line per
-/// missing feature naming the knobs that were not applied.
+/// missing feature naming the knobs that were not applied and how many of
+/// the profile's knobs remain in force.
 ///
 /// # Safety
 ///
@@ -385,18 +423,8 @@ pub unsafe fn reconcile(features: ChainFeatures) -> Option<Withdrawn> {
 pub unsafe fn reconcile_and_report(binary: &str, features: ChainFeatures) -> Option<Withdrawn> {
     // SAFETY: forwarded from this function's own contract.
     let withdrawn = unsafe { reconcile(features) }?;
-    for requirement in [Requires::FrameBlocks] {
-        let names: Vec<&str> =
-            withdrawn.knobs.iter().filter(|knob| knob.requires == Some(requirement)).map(|knob| knob.name).collect();
-        if !names.is_empty() {
-            eprintln!(
-                "{binary}: {PROFILE_VAR}={}: {} knob(s) need {} in the genesis and were not applied: {}",
-                withdrawn.profile,
-                names.len(),
-                requirement.genesis_key(),
-                names.join(", ")
-            );
-        }
+    for line in withdrawal_lines(binary, &withdrawn) {
+        eprintln!("{line}");
     }
     Some(withdrawn)
 }
@@ -412,12 +440,7 @@ pub unsafe fn apply_or_exit(binary: &str) -> Option<Applied> {
     // SAFETY: forwarded from this function's own contract.
     match unsafe { apply() } {
         Ok(Some(applied)) => {
-            eprintln!(
-                "{binary}: {PROFILE_VAR}={} set {} knob(s); kept from the environment: [{}]",
-                applied.profile,
-                applied.set.len(),
-                applied.kept.join(", ")
-            );
+            eprintln!("{}", applied_line(binary, &applied));
             Some(applied)
         }
         Ok(None) => None,
@@ -593,6 +616,34 @@ mod tests {
         assert!(set_by_profile("N42_MERGE_ELIDE"));
         // SAFETY: as above. A second call has nothing left to withdraw.
         assert_eq!(unsafe { reconcile(ChainFeatures::default()) }, None);
+        clean();
+    }
+
+    #[test]
+    fn the_report_counts_what_remains_after_the_withdrawal() {
+        let _guard = lock();
+        clean();
+        set(PROFILE_VAR, "x22");
+        // SAFETY: the test holds the environment lock.
+        let applied = unsafe { apply() }.unwrap().unwrap();
+        assert_eq!(applied.set.len(), X22.len());
+        assert_eq!(
+            applied_line("n42", &applied),
+            format!(
+                "n42: {PROFILE_VAR}=x22 set {} knob(s) ({} pending the genesis check); kept from the environment: []",
+                X22.len(),
+                FRAME_GATED.len()
+            )
+        );
+        // SAFETY: as above.
+        let withdrawn = unsafe { reconcile(ChainFeatures::default()) }.unwrap();
+        assert_eq!(withdrawn.remaining, X22.len() - FRAME_GATED.len());
+        let remaining = X22.iter().filter(|knob| set_by_profile(knob.name)).count();
+        assert_eq!(withdrawn.remaining, remaining);
+        let lines = withdrawal_lines("n42", &withdrawn);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with(&format!("n42: {PROFILE_VAR}=x22: {} knob(s) need ", FRAME_GATED.len())), "{}", lines[0]);
+        assert!(lines[0].ends_with(&format!("; {remaining} knob(s) remain in force")), "{}", lines[0]);
         clean();
     }
 

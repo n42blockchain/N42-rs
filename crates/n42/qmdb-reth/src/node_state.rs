@@ -37,7 +37,10 @@
 //! head (in either storage mode) is restored from the archived pair under
 //! `recovery-archive/fold-<number>-<hash>-*`: the checkpoint the fold replaced
 //! and the segment it folded. An archive retires at a later fold once the
-//! database's durable head has passed its fold head.
+//! database's durable head has passed its fold head. The
+//! `recovery-archive/rollback-<number>-<hash>-*` pair a restart below the
+//! checkpoint leaves (the future checkpoint and logs it set aside) retires by
+//! the same rule, against the database head it rolled back to.
 //!
 //! What is written per block is a *delta*, not the tree. Serialising the whole
 //! forest every time the head moved cost the size of the world state per block:
@@ -1403,10 +1406,10 @@ impl QmdbNodeState {
             // moved the tree off the persisted blocks' path; stand it back on
             // them before listing, or the view is invalidated for good.
             let hashes: Vec<B256> = todo.iter().map(|&(_, hash)| hash).collect();
-            if let Some(&last_hash) = hashes.last() {
-                if forest.restore_path_to(&hashes, last_hash)? {
-                    info!(target: "n42.qmdb", block = last, "stood the QMDB tree back on the persisted blocks' path");
-                }
+            if let Some(&last_hash) = hashes.last()
+                && forest.restore_path_to(&hashes, last_hash)?
+            {
+                info!(target: "n42.qmdb", block = last, "stood the QMDB tree back on the persisted blocks' path");
             }
             forest.flush_entries_for_sync()?;
             let mut listed = Vec::with_capacity(todo.len());
@@ -1828,10 +1831,10 @@ impl QmdbNodeState {
             warn!(target: "n42.qmdb", label, ms = waited_ms, held_by, "forest lock waited");
         }
         *self.inner.forest_holder.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = label;
-        if self.inner.pending_rename_count.load(std::sync::atomic::Ordering::Acquire) > 0 {
-            if let Some(forest) = guard.as_mut() {
-                self.drain_renames(forest);
-            }
+        if self.inner.pending_rename_count.load(std::sync::atomic::Ordering::Acquire) > 0
+            && let Some(forest) = guard.as_mut()
+        {
+            self.drain_renames(forest);
         }
         ForestGuard { guard, inner: &self.inner, label, acquired, waited_ms, held_by }
     }
@@ -2164,14 +2167,19 @@ impl QmdbNodeState {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(source) => return Err(NodeStateError::Io { path: root, source }),
         };
+        let mut retired = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|source| NodeStateError::Io { path: root.clone(), source })?;
             let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let Some(number) = name.strip_prefix("fold-").and_then(|suffix| suffix.split('-').next()).and_then(|number| number.parse::<u64>().ok()) else { continue };
+            let Some(number) = archive_label_number(&name.to_string_lossy()) else { continue };
             // Retain the database head's parent frontier as well as its head.
             if number.checked_add(1).is_none_or(|parent_boundary| parent_boundary >= durable) { continue; }
-            std::fs::remove_dir_all(entry.path()).map_err(|source| NodeStateError::Io { path: entry.path(), source })?;
+            retired.push((number, entry.path()));
+        }
+        // Oldest first, so an interrupted pass leaves the newest history.
+        retired.sort();
+        for (_, path) in retired {
+            std::fs::remove_dir_all(&path).map_err(|source| NodeStateError::Io { path, source })?;
         }
         std::fs::File::open(&root).and_then(|f| f.sync_all()).map_err(|source| NodeStateError::Io { path: root, source })
     }
@@ -2363,12 +2371,11 @@ impl QmdbNodeState {
     }
 
     fn parent_root_from_frontier(&self, checkpoint: (u64, B256), parent: (u64, B256)) -> Result<B256, NodeStateError> {
-        if parent.0.checked_add(1) == Some(checkpoint.0) {
-            if let Some(frontier) = self.checkpoint_frontier(checkpoint)? {
-                if frontier.parent_hash == parent.1 {
-                    return Ok(frontier.parent_root);
-                }
-            }
+        if parent.0.checked_add(1) == Some(checkpoint.0)
+            && let Some(frontier) = self.checkpoint_frontier(checkpoint)?
+            && frontier.parent_hash == parent.1
+        {
+            return Ok(frontier.parent_root);
         }
         Err(NodeStateError::RecoveryFrontier(format!(
             "checkpoint {} ({}) has no matching parent result for {} ({})",
@@ -3130,13 +3137,12 @@ impl QmdbNodeState {
     /// ([`Self::settle_through`]).
     pub fn is_fatal_canonical_error(&self, error: &NodeStateError, block_hash: B256) -> bool {
         match error {
-            NodeStateError::Poisoned(_) | NodeStateError::Uninitialised => true,
             NodeStateError::State(StateError::EntryFile(_)) => false,
             NodeStateError::State(StateError::UnknownBlock(unknown)) => {
                 let aliases = self.inner.rename_aliases.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 !aliases.iter().any(|alias| alias.to == *unknown || alias.to == block_hash)
             }
-            NodeStateError::State(_) => true,
+            NodeStateError::Poisoned(_) | NodeStateError::Uninitialised | NodeStateError::State(_) => true,
             _ => false,
         }
     }
@@ -3150,7 +3156,7 @@ impl QmdbNodeState {
             let spawned = std::thread::Builder::new().name("n42-qmdb-canon".into()).spawn(move || {
                 while receiver.recv().is_ok() {
                     let Some(inner) = inner.upgrade() else { break };
-                    if let Err(error) = (QmdbNodeState { inner }).settle_canonical() {
+                    if let Err(error) = (Self { inner }).settle_canonical() {
                         warn!(target: "n42.qmdb", %error, "the QMDB head's deferred persistence failed; the next head retries it");
                     }
                 }
@@ -3553,6 +3559,7 @@ impl QmdbNodeState {
             let mut phases = CompactPhases::default();
             let block_hash = ckpt.head_hash;
             self.save_checkpoint_frontier((ckpt.head_number, block_hash))?;
+            self.archive_before_rewrite(&self.ckpt_path(), (ckpt.head_number, block_hash))?;
             let len = write_ckpt(&self.ckpt_path(), &ckpt, &mut phases)?;
             self.record_head_roots(&[(ckpt.head_number, block_hash, root)]);
             remove_file_logged(self.delta_log_path());
@@ -3570,6 +3577,7 @@ impl QmdbNodeState {
                 block = ckpt.head_number, %block_hash, bytes = len, total_ms,
                 "checkpointed the QMDB head (entry file)",
             );
+            self.prune_after_rewrite();
             return Ok(());
         }
         let snapshot = self.with_forest("checkpoint#2", |forest| {
@@ -3588,6 +3596,7 @@ impl QmdbNodeState {
         let path = self.snapshot_path();
         let mut phases = CompactPhases::default();
         self.save_checkpoint_frontier((snapshot.head_number, block_hash))?;
+        self.archive_before_rewrite(&path, (snapshot.head_number, block_hash))?;
         let len = write_snapshot(&path, &snapshot, &mut phases)?;
         self.record_head_roots(&[(snapshot.head_number, block_hash, root)]);
         // Order matters: the log is emptied only once the checkpoint that
@@ -3608,8 +3617,38 @@ impl QmdbNodeState {
             block = snapshot.head_number, %block_hash, bytes = len, total_ms,
             "checkpointed the QMDB head",
         );
+        self.prune_after_rewrite();
         Ok(())
     }
+
+    /// The live-forest rewrite's twin of a fold's archive: the checkpoint
+    /// `base` about to be replaced and the log the new checkpoint at `head`
+    /// supersedes are kept as a `fold-<head>` pair, so a restart below
+    /// `head` (the database behind the forest by the persistence lag) can
+    /// replay from them. Nothing to keep when there is no checkpoint yet.
+    fn archive_before_rewrite(&self, base: &Path, head: (u64, B256)) -> Result<(), NodeStateError> {
+        if !base.exists() {
+            return Ok(());
+        }
+        self.archive_pair(&format!("fold-{:020}-{:x}", head.0, head.1), base, &self.delta_log_path())
+    }
+
+    /// Retires covered recovery archives after a live-forest rewrite, as a
+    /// background fold does after its compaction.
+    fn prune_after_rewrite(&self) {
+        if let Err(err) = self.prune_heap_archives() {
+            warn!(target: "n42.qmdb", %err, "could not retire covered recovery archives");
+        }
+    }
+}
+
+/// The block number a recovery archive is labelled with: the fold head of a
+/// `fold-<number>-<hash>-*` archive, the database head of a
+/// `rollback-<number>-<hash>-*` one. `None` for anything else (an archive
+/// still being written is `.pending-*`).
+fn archive_label_number(name: &str) -> Option<u64> {
+    let suffix = name.strip_prefix("fold-").or_else(|| name.strip_prefix("rollback-"))?;
+    suffix.split('-').next()?.parse().ok()
 }
 
 /// Whether the log has grown to the point where the checkpoint is rewritten.
@@ -4046,8 +4085,14 @@ mod tests {
             assert_eq!(restarted.persisted_state_root(2, hashes[1]).unwrap(), roots[1]);
             restarted.initialize((3, hashes[2])).unwrap();
             assert_eq!(restarted.state_root(), roots[2]);
-            // An arbitrary older block or corrupt frontier must not get the
-            // head root substituted for its missing historical root.
+            // A heap node reads an older block from the pair the rewrite
+            // archived, exactly; without that archive, an arbitrary older
+            // block or corrupt frontier must not get the head root
+            // substituted for its missing historical root.
+            if !entry_file {
+                assert_eq!(restarted.persisted_state_root(1, hashes[0]).unwrap(), roots[0]);
+            }
+            std::fs::remove_dir_all(dir.join("recovery-archive")).unwrap();
             assert!(restarted.persisted_state_root(1, hashes[0]).is_err());
             let mut corrupt = std::fs::read(restarted.frontier_path()).unwrap();
             corrupt[35] ^= 1;
@@ -4161,6 +4206,52 @@ mod tests {
         logs.sort();
         assert_eq!(logs, vec![b"first future log".to_vec(), b"second future log".to_vec()]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rollback_archives_retire_by_the_fold_rule_oldest_first() {
+        let chain = deferred_chain();
+        let dir = scratch("archive-rollback-prune");
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, false);
+        state.set_persist_batch(false);
+        state.set_canonical_defer(false);
+        state.initialize((0, chain.genesis_hash())).unwrap();
+        let log = state.delta_log_path();
+        for number in [1u64, 2, 3, 5] {
+            std::fs::write(&log, format!("future log {number}")).unwrap();
+            state.archive_heap_pair(&format!("rollback-{:020}-{:x}", number, B256::repeat_byte(number as u8)), &log).unwrap();
+        }
+        state.archive_heap_pair(&format!("fold-{:020}-{:x}", 1, B256::repeat_byte(0xf1)), &log).unwrap();
+        let archived = || {
+            let mut names: Vec<_> = std::fs::read_dir(dir.join("recovery-archive")).unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter_map(|name| archive_label_number(&name).map(|number| (name.split('-').next().unwrap().to_owned(), number)))
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(archived().len(), 5);
+        // No durable boundary: nothing is guessed away.
+        state.prune_heap_archives().unwrap();
+        assert_eq!(archived().len(), 5);
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(4));
+        let boundary = durable.clone();
+        state.set_durable_head_reader(move || Some(boundary.load(std::sync::atomic::Ordering::Relaxed)));
+        state.prune_heap_archives().unwrap();
+        // Block 3 is the durable head's parent and stays, as for a fold.
+        assert_eq!(archived(), vec![("rollback".to_owned(), 3), ("rollback".to_owned(), 5)]);
+        durable.store(7, std::sync::atomic::Ordering::Relaxed);
+        state.prune_heap_archives().unwrap();
+        assert!(archived().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn archive_labels_name_their_block() {
+        assert_eq!(archive_label_number("fold-00000000000000000012-ab-77-0"), Some(12));
+        assert_eq!(archive_label_number("rollback-00000000000000000034-cd-77-1"), Some(34));
+        assert_eq!(archive_label_number(".pending-77-2"), None);
+        assert_eq!(archive_label_number("other-00000000000000000001"), None);
     }
 
     #[test]

@@ -905,9 +905,21 @@ impl FileEntries {
         }
     }
 
+    /// Whether `slot` keeps only its leaf hash.
+    pub(crate) fn is_hash_only(&self, slot: usize) -> bool {
+        matches!(self.read(slot), SlotRef::HashOnly(_))
+    }
+
     /// Whether any slot keeps only its leaf hash.
     pub(crate) fn has_hash_only(&self) -> bool {
         self.twigs.values().any(|twig| twig.dead > 0)
+    }
+
+    /// `twig`'s dead slots: a popcount of its 32 words of active bits.
+    pub(crate) fn dead_in_twig(&self, twig: usize) -> u32 {
+        const WORDS: usize = TWIG_SIZE / 64;
+        let words = self.active.get(twig * WORDS..(twig + 1) * WORDS).unwrap_or(&[]);
+        TWIG_SIZE as u32 - words.iter().map(|word| word.count_ones()).sum::<u32>()
     }
 
     /// The dead slots `twig`'s latest group stored as hashes, if it has one.
@@ -1496,12 +1508,6 @@ impl Entries {
         }
     }
 
-    /// `slot`'s leaf hash: stored for a hash-only slot, hashed from the
-    /// payload for the rest.
-    pub(crate) fn leaf_hash(&self, slot: usize) -> Hash {
-        self.read(slot).leaf_hash()
-    }
-
     /// Whether `slot` keeps only its leaf hash.
     pub(crate) fn is_hash_only(&self, slot: usize) -> bool {
         matches!(self.read(slot), SlotRef::HashOnly(_))
@@ -2019,5 +2025,243 @@ mod tests {
         file.set_entry_file(&scratch("trim")).unwrap();
         assert_eq!(file.trim_dead_twigs(file.next_slot() + 1), 3);
         assert_eq!(file.root(), root);
+    }
+
+    fn key_n(n: u64) -> Hash {
+        let mut k = [0u8; 32];
+        k[..8].copy_from_slice(&n.to_le_bytes());
+        k
+    }
+
+    /// Keys `keys` set to a value tagged by `tag` (or deleted when `tag` is
+    /// 0), sorted as the block path requires.
+    fn ops_of(keys: impl Iterator<Item = u64>, tag: u8) -> Vec<crate::qmdb_compat::QmdbOperation> {
+        let mut ops: Vec<_> = keys
+            .map(|i| crate::qmdb_compat::QmdbOperation { key: key_n(i), value: (tag != 0).then(|| vec![tag; 30 + (i % 11) as usize]) })
+            .collect();
+        ops.sort_unstable_by_key(|op| op.key);
+        ops
+    }
+
+    fn remove_scratch(name: &str) {
+        if let Some(dir) = scratch(name).parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// A truncation into a relocated twig is refused by the store itself,
+    /// and one above it goes through.
+    #[test]
+    fn the_store_refuses_to_truncate_into_a_relocated_twig() {
+        let name = "truncate-relocated";
+        let mut file = FileEntries::create(&scratch(name)).unwrap();
+        for i in 0..3 * TWIG_SIZE as u64 {
+            file.push(&key_n(i), &[1u8; 9]).unwrap();
+        }
+        for slot in (0..TWIG_SIZE).step_by(2) {
+            file.set_active(slot, false);
+        }
+        let group = file.build_group(0, |_| None).unwrap();
+        assert_eq!(group.dead as usize, TWIG_SIZE / 2);
+        let done = file.append_group(group).unwrap();
+        assert_eq!(done.reclaimable, (TWIG_SIZE * (KEY_LEN + LEN_LEN + 9)) as u64);
+        assert!(file.is_hash_only(0) && !file.is_hash_only(1));
+        assert_eq!(file.key(1), Some(&key_n(1)));
+        assert_eq!(file.value(1), &[1u8; 9]);
+        // The read view's offsets stay in entries.log.
+        assert_eq!(file.offset(1), Some((KEY_LEN + LEN_LEN + 9) as u64));
+        let error = file.truncate(TWIG_SIZE - 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(file.len(), 3 * TWIG_SIZE);
+        file.truncate(TWIG_SIZE + 5).unwrap();
+        assert_eq!(file.len(), TWIG_SIZE + 5);
+        assert_eq!(file.value(TWIG_SIZE + 4), &[1u8; 9]);
+        // A recreated store drops the relocated file left beside it.
+        drop(file);
+        assert!(relocated_path(&scratch(name)).exists());
+        drop(FileEntries::create(&scratch(name)).unwrap());
+        assert!(!relocated_path(&scratch(name)).exists());
+        remove_scratch(name);
+    }
+
+    /// Compaction moves bytes and keeps slots: a compacted file tree has the
+    /// heap tree's root, twig roots and proofs through compactions, more
+    /// blocks, a second compaction of a relocated twig, snapshots, a reopen
+    /// from the two files, and a torn or corrupted last group.
+    #[test]
+    fn a_compacted_file_tree_matches_a_heap_tree_through_blocks_snapshots_and_reopens() {
+        use crate::qmdb_compat::{QmdbCompatTree, QmdbSnapshot};
+        let name = "compact-parity";
+        let n = 6 * TWIG_SIZE as u64;
+        let mut heap = QmdbCompatTree::new();
+        let mut file = QmdbCompatTree::new();
+        file.set_entry_file(&scratch(name)).unwrap();
+        let both = |heap: &mut QmdbCompatTree, file: &mut QmdbCompatTree, ops: Vec<crate::qmdb_compat::QmdbOperation>| {
+            let root = heap.apply_sorted_ops(ops.clone()).unwrap();
+            assert_eq!(file.apply_sorted_ops(ops).unwrap(), root);
+        };
+        both(&mut heap, &mut file, ops_of(0..n, 1));
+        // Two of three keys rewritten (their first slots die), every tenth
+        // deleted: the first six twigs are 70% dead, scattered.
+        both(&mut heap, &mut file, ops_of((0..n).filter(|i| i % 3 != 0), 2));
+        both(&mut heap, &mut file, ops_of((0..n).filter(|i| i % 10 == 0), 0));
+        let check = |heap: &QmdbCompatTree, file: &QmdbCompatTree| {
+            assert_eq!(heap.root(), file.root());
+            assert_eq!(heap.twig_roots(), file.twig_roots());
+            for i in (0..n).step_by(97) {
+                assert_eq!(heap.prove(&key_n(i)), file.prove(&key_n(i)), "proof of key {i}");
+            }
+            // A deleted key proves absent in both.
+            assert_eq!(file.prove(&key_n(10)), None);
+            assert_eq!(heap.prove(&key_n(10)), None);
+        };
+        // Evicted twigs rehash from the entries for proofs (`twig_leaf_nodes`).
+        file.evict_twig_nodes(file.next_slot());
+        let (root, twig_roots) = (file.root(), file.twig_roots());
+        let before = file.entry_stats();
+        assert_eq!(before.relocated_bytes, 0);
+        // A heap tree has nothing to compact.
+        assert_eq!(heap.compact_twigs(heap.next_slot(), 0.5, usize::MAX).unwrap(), Default::default());
+        // Nothing qualifies past the horizon, or above the threshold.
+        assert_eq!(file.compact_twigs(TWIG_SIZE as u64 - 1, 0.5, usize::MAX).unwrap().twigs, 0);
+        // No undo record is held: no horizon (`u64::MAX`).
+        assert_eq!(file.compact_twigs(u64::MAX, 0.95, usize::MAX).unwrap().twigs, 0);
+        let first = file.compact_twigs(u64::MAX, 0.5, usize::MAX).unwrap();
+        assert_eq!(first.twigs, 6, "the six twigs of the first block");
+        assert!(first.bytes_written < first.bytes_reclaimable, "{first:?}");
+        assert_eq!((file.root(), file.twig_roots()), (root, twig_roots));
+        check(&heap, &file);
+        let stats = file.entry_stats();
+        assert_eq!(stats.relocated_bytes, first.bytes_written);
+        assert_eq!((stats.file_bytes, stats.total_slots, stats.live_slots), (before.file_bytes, before.total_slots, before.live_slots));
+        assert_eq!(stats.bytes_per_live_slot(), (stats.file_bytes + stats.relocated_bytes) / stats.live_slots);
+        // Already relocated, nothing died since: not a candidate again,
+        // whatever the threshold.
+        assert_eq!(file.compact_twigs(6 * TWIG_SIZE as u64, 0.0, usize::MAX).unwrap().twigs, 0);
+
+        // The snapshot carries the dead slots' leaf hashes and rebuilds the
+        // same root, in the heap and moved into a fresh file; it has no
+        // serialized form.
+        let snap: QmdbSnapshot = file.snapshot();
+        let hash_only = snap.first_hash_only_slot().expect("a hash-only slot");
+        assert!(!snap.entries[hash_only as usize].active);
+        assert!(heap.snapshot().first_hash_only_slot().is_none());
+        assert!(bincode::serialize(&snap).is_err());
+        assert!(file.has_hash_only_slots() && !heap.has_hash_only_slots());
+        let mut rebuilt = QmdbCompatTree::from_snapshot(&snap).unwrap();
+        assert!(rebuilt.has_hash_only_slots());
+        check(&heap, &rebuilt);
+        rebuilt.set_entry_file(&scratch("compact-rebuilt")).unwrap();
+        assert!(rebuilt.has_hash_only_slots());
+        check(&heap, &rebuilt);
+        drop(rebuilt);
+        remove_scratch("compact-rebuilt");
+
+        // More blocks on top: live slots of relocated twigs retire, appends go on.
+        both(&mut heap, &mut file, ops_of((0..n).filter(|i| i % 3 == 0 && i % 10 != 0), 3));
+        check(&heap, &file);
+        // Twig 0's slots that died since are past the threshold now: the
+        // second group reads the first one's records.
+        let reloc_before = file.relocated_len();
+        let second = file.compact_twigs(u64::MAX, 0.2, 1).unwrap();
+        assert_eq!(second.twigs, 1);
+        assert_eq!(file.relocated_len(), reloc_before + second.bytes_written);
+        assert!(second.bytes_written < second.bytes_reclaimable, "{second:?}");
+        check(&heap, &file);
+        both(&mut heap, &mut file, ops_of(n..n + 3000, 4));
+        check(&heap, &file);
+
+        // Reopen from the two files.
+        file.sync_entries().unwrap();
+        let (next_slot, active, reloc_len) = (file.next_slot(), file.active_bits(), file.relocated_len());
+        let path = scratch(name);
+        let reopen = || QmdbCompatTree::from_entry_file(&path, next_slot, &active).unwrap();
+        let (reopened, kept) = reopen();
+        assert_eq!(kept, next_slot);
+        assert_eq!(reopened.relocated_len(), reloc_len);
+        check(&heap, &reopened);
+        drop(reopened);
+        // A torn trailing group is cut on open, and nothing is lost.
+        let relocated = relocated_path(&path);
+        let bytes = std::fs::read(&relocated).unwrap();
+        assert_eq!(bytes.len() as u64, reloc_len);
+        let mut torn = bytes.clone();
+        torn.extend_from_slice(&bytes[..700]);
+        std::fs::write(&relocated, &torn).unwrap();
+        let (reopened, _) = reopen();
+        assert_eq!(reopened.relocated_len(), reloc_len);
+        assert_eq!(std::fs::metadata(&relocated).unwrap().len(), reloc_len);
+        check(&heap, &reopened);
+        drop(reopened);
+        // A last group that fails its CRC is cut: twig 0 falls back to its
+        // first group, which holds the same leaves.
+        let mut corrupt = bytes.clone();
+        let at = corrupt.len() - TRAILER - 20;
+        corrupt[at] ^= 0xff;
+        std::fs::write(&relocated, &corrupt).unwrap();
+        let (reopened, _) = reopen();
+        assert_eq!(reopened.relocated_len(), reloc_len - second.bytes_written);
+        check(&heap, &reopened);
+        // A read-only reopen of the full file leaves it as it is.
+        drop(reopened);
+        std::fs::write(&relocated, &torn).unwrap();
+        let (readonly, _) = QmdbCompatTree::from_entry_file_readonly(&path, next_slot, &active).unwrap();
+        assert_eq!(readonly.relocated_len(), reloc_len);
+        assert_eq!(std::fs::metadata(&relocated).unwrap().len(), torn.len() as u64);
+        check(&heap, &readonly);
+        drop(readonly);
+        drop(file);
+        remove_scratch(name);
+    }
+
+    /// The undo horizon `compact_twigs` respects keeps every undo inside it
+    /// applicable; an undo past it -- a cut into a relocated twig, or the
+    /// revival of a hash-only slot -- is refused before anything changes.
+    #[test]
+    fn undo_across_a_compacted_boundary_is_refused_and_unreachable_within_the_horizon() {
+        use crate::qmdb_compat::{BlockUndo, QmdbCompatTree, QmdbUndoError};
+        let name = "compact-undo";
+        let n = 4 * TWIG_SIZE as u64;
+        let mut heap = QmdbCompatTree::new();
+        let mut file = QmdbCompatTree::new();
+        file.set_entry_file(&scratch(name)).unwrap();
+        for (keys, tag) in [((0..n).collect::<Vec<_>>(), 1u8), ((0..n).filter(|i| i % 4 != 0).collect(), 2)] {
+            let ops = ops_of(keys.into_iter(), tag);
+            assert_eq!(heap.apply_sorted_ops(ops.clone()).unwrap(), file.apply_sorted_ops(ops).unwrap());
+        }
+        // Three more blocks, each retiring slots in the first twigs, with
+        // their undo records held: the horizon is the oldest one's cursor.
+        let mut undos = Vec::new();
+        for b in 0..3u64 {
+            let ops = ops_of((b * 1000..b * 1000 + 1500).filter(|i| i % 4 != 0), 10 + b as u8);
+            let (root, undo_h) = heap.apply_sorted_ops_recorded(ops.clone()).unwrap();
+            let (root_f, undo_f) = file.apply_sorted_ops_recorded(ops).unwrap();
+            assert_eq!(root, root_f);
+            undos.push((undo_h, undo_f));
+        }
+        let horizon = undos[0].1.prev_next_slot;
+        let report = file.compact_twigs(horizon, 0.5, usize::MAX).unwrap();
+        assert!(report.twigs >= 1, "{report:?}");
+        assert_eq!(heap.root(), file.root());
+        // Every held record still applies, newest first, and the trees agree.
+        for (undo_h, undo_f) in undos.iter().rev() {
+            heap.apply_undo(undo_h).unwrap();
+            file.apply_undo(undo_f).unwrap();
+            assert_eq!(heap.root(), file.root());
+            assert_eq!(heap.next_slot(), file.next_slot());
+        }
+        // A record that would cut below the horizon, into a relocated twig.
+        let root = file.root();
+        let cut = BlockUndo { prev_next_slot: 0, slots_only: true, ..Default::default() };
+        assert!(matches!(file.apply_undo(&cut), Err(QmdbUndoError::RelocatedTwig { prev: 0, .. })));
+        // A record that would revive a hash-only slot: a dead slot of the
+        // compacted twig 0.
+        let dead = (0..TWIG_SIZE as u64).find(|slot| file.slot_active(*slot) == Some(false)).unwrap();
+        let revive = BlockUndo { prev_next_slot: file.next_slot(), slots_only: true, slots: vec![dead], ..Default::default() };
+        assert_eq!(file.apply_undo(&revive), Err(QmdbUndoError::HashOnlySlot { slot: dead }));
+        assert_eq!(file.root(), root);
+        assert_eq!(heap.root(), root);
+        drop(file);
+        remove_scratch(name);
     }
 }

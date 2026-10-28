@@ -1523,6 +1523,36 @@ pub enum QmdbUndoError {
 }
 
 
+/// What [`QmdbCompatTree::compact_twigs`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompactReport {
+    /// Twigs rewritten into `entries.relocated`.
+    pub twigs: usize,
+    /// Bytes appended to `entries.relocated`.
+    pub bytes_written: u64,
+    /// Bytes the compacted twigs held where they were before (their records
+    /// in `entries.log`, or their previous group): what punching will free
+    /// (stage 3). Nothing is freed yet.
+    pub bytes_reclaimable: u64,
+}
+
+/// Why [`QmdbCompatTree::compact_twigs`] stopped. Twigs compacted before the
+/// error stay compacted; the one it stopped at is unchanged.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum QmdbCompactError {
+    /// The relocated file could not be written or synced, or a twig could
+    /// not be laid out.
+    #[error("QMDB compaction: {0}")]
+    Store(String),
+    /// A group's leaves do not hash to the twig's leaf root: the entry store
+    /// disagrees with the tree. Nothing was written for the twig.
+    #[error("QMDB compaction: twig {twig}'s group does not hash to its leaf root")]
+    LeafRootMismatch {
+        /// The twig.
+        twig: usize,
+    },
+}
+
 /// The key -> slot index: fingerprints confirmed against the entry store
 /// (`crate::index`).
 type KeyIndex = crate::index::TagIndex;
@@ -3173,6 +3203,100 @@ impl QmdbCompatTree {
             trimmed += 1;
         }
         trimmed
+    }
+
+    /// Rewrites up to `max_twigs` mostly dead twigs into `entries.relocated`
+    /// (`docs/QMDB_COMPACTION_DESIGN.md` 3.4, stage 2): each as one group in
+    /// slot order -- a live slot's payload, a dead slot's leaf hash -- made
+    /// durable before its 2048 offsets are pointed at it. Slots, leaves,
+    /// twig roots, active bits, proofs and the root are unchanged; nothing
+    /// is punched, so the bytes in `entries.log` stay where the read view's
+    /// offsets point and the report's `bytes_reclaimable` is what stage 3
+    /// will free.
+    ///
+    /// A candidate is a full twig whose every slot lies below `below_slot`
+    /// and whose last retirement happened before it -- `below_slot` is the
+    /// oldest cursor any undo record still held can rewind to, so no undo
+    /// truncates into the twig or revives one of its slots -- with at least
+    /// `min_dead_fraction` of its slots dead (a popcount of its active
+    /// bits). A twig already relocated is a candidate again only if the
+    /// slots that died since its last group are that fraction, at least one
+    /// (the new group reads the old one's records). Candidates are taken
+    /// oldest first. Each group's leaves are hashed from its own bytes and
+    /// checked against the twig's leaf root before anything is written.
+    ///
+    /// A reopened tree does not know when its twigs last retired a slot (it
+    /// reads as never), so after a restart `below_slot` must also be at or
+    /// below the cursor of every undo record held across it.
+    ///
+    /// A heap tree has nothing to compact: the report is empty. No
+    /// production caller in this stage; stage 3 schedules it on the
+    /// pruner's thread with `below_slot` from the persisted head minus the
+    /// retain depth.
+    pub fn compact_twigs(
+        &mut self,
+        below_slot: u64,
+        min_dead_fraction: f64,
+        max_twigs: usize,
+    ) -> Result<CompactReport, QmdbCompactError> {
+        let mut report = CompactReport::default();
+        let Entries::File(file) = &mut self.entries else {
+            return Ok(report);
+        };
+        let full = (below_slot.min(self.next_slot) as usize / TWIG_SIZE).min(self.twigs.len());
+        let threshold = (min_dead_fraction.clamp(0.0, 1.0) * TWIG_SIZE as f64).ceil() as u32;
+        for twig_id in 0..full {
+            if report.twigs >= max_twigs {
+                break;
+            }
+            let twig = &self.twigs[twig_id];
+            if twig.last_retired_at >= below_slot {
+                continue;
+            }
+            let dead = file.dead_in_twig(twig_id);
+            let eligible = match file.relocated_dead(twig_id) {
+                None => dead >= threshold,
+                Some(before) => {
+                    let since = dead.saturating_sub(before);
+                    since > 0 && since >= threshold
+                }
+            };
+            if !eligible {
+                continue;
+            }
+            let expected = twig.nodes.as_ref().map_or(twig.leaf_root, |nodes| nodes[1]);
+            let group = file.build_group(twig_id, |_| None).map_err(|e| QmdbCompactError::Store(e.to_string()))?;
+            if twig_leaf_root(&group.leaves) != expected {
+                return Err(QmdbCompactError::LeafRootMismatch { twig: twig_id });
+            }
+            let done = file.append_group(group).map_err(|e| QmdbCompactError::Store(e.to_string()))?;
+            report.twigs += 1;
+            report.bytes_written += done.written;
+            report.bytes_reclaimable += done.reclaimable;
+        }
+        Ok(report)
+    }
+
+    /// Bytes of `entries.relocated` in complete groups (0 in the heap): what
+    /// a file-mode checkpoint records (`ForestCheckpoint::relocated_len`).
+    pub fn relocated_len(&self) -> u64 {
+        self.entries.relocated_len()
+    }
+
+    /// Whether any slot keeps only its leaf hash (a compacted twig's dead
+    /// slot): such a tree cannot be exported as a v1 portable snapshot. O(1)
+    /// in the file; a scan of the entries in the heap.
+    pub fn has_hash_only_slots(&self) -> bool {
+        match &self.entries {
+            Entries::File(file) => file.has_hash_only(),
+            Entries::Heap(_) => (0..self.entries.len()).any(|slot| self.entries.is_hash_only(slot)),
+        }
+    }
+
+    /// Every twig's root, in order (tests).
+    #[cfg(test)]
+    pub(crate) fn twig_roots(&self) -> Vec<Hash> {
+        self.twigs.iter().map(|twig| twig.root).collect()
     }
 
     /// How many twigs hold only their root.

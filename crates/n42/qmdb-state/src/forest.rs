@@ -86,7 +86,12 @@ impl PreparedBlock {
 /// Everything a restart needs when the entries live in the file: where the
 /// head stands, how many slots the file holds for it, and which are live.
 /// The tree itself is rebuilt from the file (`QmdbForest::from_entry_file`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Version 2 adds `relocated_len`; a version 1 checkpoint reads as
+/// `relocated_len = 0` and writes back as the version 1 bytes it was
+/// (the serde impls below: the layout is the derived one, field by field,
+/// with `relocated_len` after `active` from version 2 on).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForestCheckpoint {
     /// Layout version.
     pub version: u32,
@@ -98,11 +103,23 @@ pub struct ForestCheckpoint {
     pub next_slot: u64,
     /// One bit per slot, 64 to a word.
     pub active: Vec<u64>,
+    /// Bytes of `entries.relocated` in complete groups when the checkpoint
+    /// was taken (`docs/QMDB_COMPACTION_DESIGN.md` 3.6; 0 before version 2).
+    /// Recorded, not enforced, in stage 2: nothing is punched, so a shorter
+    /// relocated file loses nothing (every slot's record is still in
+    /// `entries.log`), and complete groups past it are applied on open
+    /// because a group is idempotent. Stage 3's punched ranges will need it.
+    pub relocated_len: u64,
 }
 
 impl ForestCheckpoint {
     /// The layout this crate writes.
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2;
+
+    /// Whether this crate reads a checkpoint of `version`.
+    pub const fn reads(version: u32) -> bool {
+        version == 1 || version == 2
+    }
 
     /// Moves this checkpoint forward by one delta: the cursor to the delta's
     /// (truncating first on a rewind), the appended entries' active flags, the changed
@@ -164,6 +181,78 @@ impl ForestCheckpoint {
         self.head_number = delta.head_number;
         self.head_hash = delta.head_hash;
         Ok(())
+    }
+}
+
+impl Serialize for ForestCheckpoint {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeStruct};
+        let v1 = self.version < 2;
+        if v1 && self.relocated_len != 0 {
+            return Err(S::Error::custom("a version 1 QMDB checkpoint has no relocated length"));
+        }
+        let mut state = serializer.serialize_struct("ForestCheckpoint", if v1 { 5 } else { 6 })?;
+        state.serialize_field("version", &self.version)?;
+        state.serialize_field("head_number", &self.head_number)?;
+        state.serialize_field("head_hash", &self.head_hash)?;
+        state.serialize_field("next_slot", &self.next_slot)?;
+        state.serialize_field("active", &self.active)?;
+        if !v1 {
+            state.serialize_field("relocated_len", &self.relocated_len)?;
+        }
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ForestCheckpoint {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const FIELDS: &[&str] = &["version", "head_number", "head_hash", "next_slot", "active", "relocated_len"];
+        /// The self-describing formats' shape.
+        #[derive(Deserialize)]
+        struct Fields {
+            version: u32,
+            head_number: u64,
+            head_hash: B256,
+            next_slot: u64,
+            active: Vec<u64>,
+            #[serde(default)]
+            relocated_len: u64,
+        }
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = ForestCheckpoint;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a QMDB forest checkpoint")
+            }
+
+            // The fixed-width formats: the fields in order, `relocated_len`
+            // only from version 2 on.
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                use serde::de::Error;
+                let field = |at: usize| A::Error::invalid_length(at, &self);
+                let version: u32 = seq.next_element()?.ok_or_else(|| field(0))?;
+                let head_number = seq.next_element()?.ok_or_else(|| field(1))?;
+                let head_hash = seq.next_element()?.ok_or_else(|| field(2))?;
+                let next_slot = seq.next_element()?.ok_or_else(|| field(3))?;
+                let active = seq.next_element()?.ok_or_else(|| field(4))?;
+                let relocated_len = if version >= 2 { seq.next_element()?.ok_or_else(|| field(5))? } else { 0 };
+                Ok(ForestCheckpoint { version, head_number, head_hash, next_slot, active, relocated_len })
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                let f = Fields::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(ForestCheckpoint {
+                    version: f.version,
+                    head_number: f.head_number,
+                    head_hash: f.head_hash,
+                    next_slot: f.next_slot,
+                    active: f.active,
+                    relocated_len: f.relocated_len,
+                })
+            }
+        }
+        deserializer.deserialize_struct("ForestCheckpoint", FIELDS, Visitor)
     }
 }
 
@@ -667,7 +756,7 @@ impl QmdbForest {
     /// `checkpoint`: the tree is rebuilt from the file's records. An error if
     /// the file holds fewer slots than the checkpoint names.
     pub fn from_entry_file(checkpoint: &ForestCheckpoint, path: &std::path::Path) -> Result<Self, StateError> {
-        if checkpoint.version != ForestCheckpoint::VERSION {
+        if !ForestCheckpoint::reads(checkpoint.version) {
             return Err(StateError::SnapshotVersion { found: checkpoint.version, expected: ForestCheckpoint::VERSION });
         }
         let (tree, kept) = QmdbCompatTree::from_entry_file(path, checkpoint.next_slot, &checkpoint.active)
@@ -864,6 +953,7 @@ impl QmdbForest {
             head_hash: head,
             next_slot: self.tree.next_slot(),
             active: self.tree.active_bits(),
+            relocated_len: self.tree.relocated_len(),
         })
     }
 
@@ -1489,6 +1579,28 @@ impl QmdbForest {
         (self.tree.trimmed_twigs(), self.tree.twig_count())
     }
 
+    /// [`QmdbCompatTree::compact_twigs`] on the forest's tree
+    /// (`docs/QMDB_COMPACTION_DESIGN.md` stage 2): mostly dead twigs below
+    /// `below_slot` rewritten into `entries.relocated`, root and proofs
+    /// unchanged. `below_slot` is clamped to the oldest cursor an undo
+    /// record the forest holds can rewind to, so no move between the blocks
+    /// it holds cuts into or revives a slot of a compacted twig. Refused
+    /// while the tree is leased. Nothing to do without an entry file. No
+    /// production caller in this stage: stage 3 schedules it.
+    pub fn compact_twigs(
+        &mut self,
+        below_slot: u64,
+        min_dead_fraction: f64,
+        max_twigs: usize,
+    ) -> Result<n42_twig_core::qmdb_compat::CompactReport, StateError> {
+        self.refuse_leased()?;
+        let held = self.records.values().filter_map(|record| record.undo.as_ref()).map(|undo| undo.prev_next_slot).min();
+        let below_slot = below_slot.min(held.unwrap_or(u64::MAX));
+        self.tree
+            .compact_twigs(below_slot, min_dead_fraction, max_twigs)
+            .map_err(|e| StateError::EntryFile(e.to_string()))
+    }
+
     /// The entry store's size (`docs/QMDB_COMPACTION_DESIGN.md` 3.7): a few
     /// counters and the key index's length, no entry reads and no scan.
     pub fn entry_stats(&self) -> n42_twig_core::entry_store::EntryStoreStats {
@@ -1820,6 +1932,7 @@ mod tests {
             head_hash: snapshot.head_hash,
             next_slot: snapshot.tree.next_slot,
             active,
+            relocated_len: 0,
         }
     }
 
@@ -2615,5 +2728,76 @@ mod tests {
         let mut fresh = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap();
         fresh.apply(GENESIS, h(1), 1, &accounts(1, 8)).unwrap();
         assert_eq!(fresh.compute_operations(h(1), accounts(4, 4).ops()).unwrap().root, root);
+    }
+
+    /// A compacted forest keeps its root and proofs, records the relocated
+    /// length in a version 2 checkpoint, and restarts from it; a version 1
+    /// checkpoint reads as `relocated_len = 0` in a self-describing format.
+    #[test]
+    fn a_compacted_forest_keeps_its_root_and_restarts_from_a_version_2_checkpoint() {
+        let dir = std::env::temp_dir().join(format!("n42-forest-compact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("entries.log");
+        let mut forest =
+            QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap().with_retain_depth(2).with_entry_file(&path).unwrap();
+        let mut heap = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap().with_retain_depth(2);
+        // Every block rewrites the same 6,000 accounts: each block's slots
+        // die in the next one.
+        let all = |tag: u8| {
+            let mut c = BlockChanges::new();
+            for i in 1..=6000u64 {
+                c.set_account(
+                    Address::from_word(B256::from(U256::from(i))),
+                    AccountState { nonce: tag as u64, balance: U256::from(i), code_hash: B256::ZERO },
+                );
+            }
+            c
+        };
+        let probe = Address::from_word(B256::from(U256::from(77u64)));
+        let mut parent = GENESIS;
+        for n in 1..=6u8 {
+            for f in [&mut forest, &mut heap] {
+                f.apply(parent, h(n), n as u64, &all(n)).unwrap();
+                f.set_canonical(h(n)).unwrap();
+            }
+            parent = h(n);
+        }
+        let root = forest.root();
+        let proof = forest.prove_account(probe).unwrap();
+        let report = forest.compact_twigs(u64::MAX, 0.5, usize::MAX).unwrap();
+        assert!(report.twigs >= 2, "{report:?}");
+        assert_eq!(forest.root(), root);
+        assert_eq!(forest.prove_account(probe), Some(proof.clone()));
+        assert_eq!(forest.entry_stats().relocated_bytes, report.bytes_written);
+        // Nothing died since: a second pass finds nothing.
+        assert_eq!(forest.compact_twigs(u64::MAX, 0.5, usize::MAX).unwrap().twigs, 0);
+        // The undo records the forest holds bound the horizon, whatever the
+        // caller passed: a sibling of the head still reverts the head's
+        // block (reviving slots of block 5) and lands where the heap does.
+        for f in [&mut forest, &mut heap] {
+            f.apply(h(5), h(9), 6, &all(9)).unwrap();
+        }
+        assert_eq!(forest.root_of(&h(9)), heap.root_of(&h(9)));
+        assert_eq!(forest.root(), root, "the head is still block 6");
+        // The checkpoint moves the tree back to the head, then the appends
+        // that move made are synced.
+        let ckpt = forest.checkpoint().unwrap();
+        forest.sync_entries().unwrap();
+        assert_eq!((ckpt.version, ckpt.relocated_len), (2, report.bytes_written));
+        let json = serde_json::to_string(&ckpt).unwrap();
+        assert_eq!(serde_json::from_str::<ForestCheckpoint>(&json).unwrap(), ckpt);
+        let mut restored = QmdbForest::from_entry_file(&ckpt, &path).unwrap();
+        assert_eq!(restored.root(), root);
+        assert_eq!(restored.prove_account(probe), Some(proof));
+        assert_eq!(restored.entry_stats().relocated_bytes, report.bytes_written);
+        // Version 1: no relocated length, in either direction.
+        let v1 = ForestCheckpoint { version: 1, relocated_len: 0, ..ckpt.clone() };
+        let json = serde_json::to_string(&v1).unwrap();
+        assert!(!json.contains("relocated_len"), "{json}");
+        assert_eq!(serde_json::from_str::<ForestCheckpoint>(&json).unwrap(), v1);
+        assert!(serde_json::to_string(&ForestCheckpoint { relocated_len: 1, ..v1 }).is_err());
+        drop((forest, restored));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -905,8 +905,9 @@ impl FileEntries {
         }
     }
 
-    /// Whether `slot` keeps only its leaf hash.
-    pub(crate) fn is_hash_only(&self, slot: usize) -> bool {
+    /// Tests: whether `slot` keeps only its leaf hash.
+    #[cfg(test)]
+    fn is_hash_only(&self, slot: usize) -> bool {
         matches!(self.read(slot), SlotRef::HashOnly(_))
     }
 

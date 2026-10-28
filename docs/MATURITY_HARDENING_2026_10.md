@@ -573,3 +573,10 @@ persistence defaults 8/6, entry-file fold archive) + the validator's persistence
   always-off, so each cut cost hours. Until the power supply is sorted the verification builds run at
   16 jobs and the seven-node load stays off; stage fn is scheduled behind that and its result goes
   here when it has run.
+- **Quick capacity check after the merge** (bench stage `fq`, 2026-10-28 06:17 UTC, one leg on the merged
+  binaries in the X22 configuration, one 10 s window, no warm-up leg, so the seven-node load lasted under a
+  minute): **4,911,850 TPS** over 246 blocks at a 41 ms cycle, occupancy 99.0%, 243 of 246 blocks full,
+  `bodygate`/`d2gate` clean (0 invalid blocks, 0 field mismatches). A cold single window reads 4-6% under
+  the warmed 30 s legs (5.1-5.2M on main `47b8180ab`), so the QC-bearing headers cost nothing visible at
+  this resolution; the proper pair (stage fn) still waits for the power supply. Peak the guard saw: 342 W,
+  Tctl 48 C.

@@ -7929,6 +7929,7 @@ name = "n42-twig-core"
 version = "2.1.5"
 dependencies = [
  "blake3",
+ "crc32fast",
  "hex",
  "libc",
  "memmap2",

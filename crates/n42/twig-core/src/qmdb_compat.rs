@@ -8,7 +8,7 @@
 
 use std::io::Read;
 
-use crate::entry_store::Entries;
+use crate::entry_store::{Entries, SlotContent, SlotRef};
 use crate::qmdb_ops::LeafOps;
 pub use crate::qmdb_ops::QmdbOps;
 use crate::{Hash, NULL_HASH, TWIG_HEIGHT, TWIG_SIZE, hash_leaf, hash_node, null_level};
@@ -115,11 +115,48 @@ pub enum QmdbOperationError {
     Index(String),
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+/// One slot of a [`QmdbSnapshot`].
+///
+/// A dead slot of a compacted twig (`docs/QMDB_COMPACTION_DESIGN.md` 3.2)
+/// has no payload: `leaf_hash` carries its leaf hash, `key` is the null hash
+/// and `value` is empty, which is enough for [`QmdbCompatTree::from_snapshot`]
+/// to rebuild the same root. Such an entry has no place in the serialized
+/// layout (key, value, active -- the one heap checkpoints and deltas have
+/// always used): serializing it is an error rather than a silent loss of the
+/// hash, and the field is never read back.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
 pub struct QmdbEntrySnapshot {
     pub key: Hash,
     pub value: Vec<u8>,
     pub active: bool,
+    /// The leaf hash of a hash-only slot; `None` for a slot with its payload.
+    #[serde(skip_deserializing)]
+    pub leaf_hash: Option<Hash>,
+}
+
+impl QmdbEntrySnapshot {
+    /// A slot with its payload.
+    pub const fn new(key: Hash, value: Vec<u8>, active: bool) -> Self {
+        Self { key, value, active, leaf_hash: None }
+    }
+}
+
+impl serde::Serialize for QmdbEntrySnapshot {
+    /// The derived layout of `{ key, value, active }`, byte for byte; a
+    /// hash-only slot is refused.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeStruct};
+        if self.leaf_hash.is_some() {
+            return Err(S::Error::custom(
+                "a hash-only QMDB slot (a compacted twig's dead slot) has no serialized form",
+            ));
+        }
+        let mut state = serializer.serialize_struct("QmdbEntrySnapshot", 3)?;
+        state.serialize_field("key", &self.key)?;
+        state.serialize_field("value", &self.value)?;
+        state.serialize_field("active", &self.active)?;
+        state.end()
+    }
 }
 
 /// Portable, positional QMDB state. Every slot below `next_slot` must be
@@ -128,6 +165,16 @@ pub struct QmdbEntrySnapshot {
 pub struct QmdbSnapshot {
     pub next_slot: u64,
     pub entries: Vec<QmdbEntrySnapshot>,
+}
+
+impl QmdbSnapshot {
+    /// The first slot that keeps only its leaf hash, if any. A tree with
+    /// one cannot be exported as a v1 portable snapshot, whose verifier
+    /// hashes every slot's key and value (`docs/QMDB_COMPACTION_DESIGN.md`
+    /// 3.2, the 2026-10-28 consequence).
+    pub fn first_hash_only_slot(&self) -> Option<u64> {
+        self.entries.iter().position(|entry| entry.leaf_hash.is_some()).map(|slot| slot as u64)
+    }
 }
 
 /// The position-tagged form of gov5's `qmdb.SlotEntry`. This is the direct
@@ -155,6 +202,10 @@ pub enum QmdbSnapshotError {
     DuplicateActiveKey(Hash),
     #[error("QMDB slot log is not contiguous: expected slot {expected}, got {got}")]
     NonContiguousSlotLog { expected: u64, got: u64 },
+    /// A slot that keeps only its leaf hash is marked live: only a dead
+    /// slot of a compacted twig drops its payload.
+    #[error("QMDB slot {slot} is live but keeps only its leaf hash")]
+    ActiveHashOnly { slot: u64 },
     /// The entry file could not be opened or read.
     #[error("QMDB entry file: {0}")]
     EntryFile(String),
@@ -524,6 +575,8 @@ impl QmdbPortableSnapshot {
                     QmdbPortableError::NonContiguousSlotLog { expected, got }
                 }
                 QmdbSnapshotError::DuplicateActiveKey(_) => QmdbPortableError::RootMismatch,
+                // A slot snapshot carries every payload; unreachable in practice.
+                QmdbSnapshotError::ActiveHashOnly { .. } => QmdbPortableError::RootMismatch,
                 // A slot snapshot is built in the heap; the entry file is not
                 // involved, so this arm is unreachable in practice.
                 QmdbSnapshotError::EntryFile(_) => QmdbPortableError::RootMismatch,
@@ -1164,11 +1217,13 @@ fn retire_twigs(slots: usize, twigs: &mut [Twig], dirty: &mut Vec<u8>, held: &[O
     }
 }
 
-/// The undo entries for the slots `held` names: what each holds now.
+/// The undo entries for the slots `held` names: what each holds now. The
+/// index names live slots only, which always have their payload.
 fn undo_entries(entries: &Entries, held: &[Option<u64>]) -> Vec<UndoEntry> {
-    let entry = |slot: &u64| {
-        let e = entries.entry(*slot as usize);
-        UndoEntry { slot: *slot, key: e.key, value: e.value }
+    let entry = |slot: &u64| UndoEntry {
+        slot: *slot,
+        key: entries.key(*slot as usize),
+        value: entries.value(*slot as usize).to_vec(),
     };
     #[cfg(feature = "rayon")]
     {
@@ -1296,19 +1351,47 @@ fn rehash_dirty(twigs: &mut [Twig], dirty: &[u8]) {
 
 /// A twig's leaf tree hashed from its entries: the first `filled` slots'
 /// leaves (the rest null), every level above them. What an evicted twig held.
+/// A slot that keeps only its leaf hash (a compacted twig's dead slot)
+/// contributes the stored hash; every other slot is hashed from its payload.
 fn twig_leaf_nodes(entries: &Entries, twig_id: usize, filled: usize) -> Box<[Hash; 2 * TWIG_SIZE]> {
     let mut nodes = Box::new([NULL_HASH; 2 * TWIG_SIZE]);
     let base = twig_id * TWIG_SIZE;
-    let keys: Vec<Hash> = (base..base + filled).map(|slot| entries.key(slot)).collect();
-    let jobs: Vec<(&Hash, &[u8])> = keys.iter().zip(base..).map(|(key, slot)| (key, entries.value(slot))).collect();
+    let mut stored: Vec<(usize, Hash)> = Vec::new();
+    let mut jobs: Vec<(&Hash, &[u8])> = Vec::with_capacity(filled);
+    for slot in base..base + filled {
+        match entries.read(slot) {
+            SlotRef::Payload(key, value) => jobs.push((key, value)),
+            SlotRef::HashOnly(hash) => {
+                stored.push((slot - base, *hash));
+                // Hashed with the rest, then overwritten: the batch stays whole.
+                jobs.push((&NULL_HASH, &[]));
+            }
+        }
+    }
     crate::simd::hash_leaves(&jobs, &mut nodes[TWIG_SIZE..TWIG_SIZE + filled]);
+    for (local, hash) in stored {
+        nodes[TWIG_SIZE + local] = hash;
+    }
+    hash_twig_parents(&mut nodes);
+    nodes
+}
+
+/// Fills every level of a twig's leaf tree above its leaves.
+fn hash_twig_parents(nodes: &mut [Hash; 2 * TWIG_SIZE]) {
     let parents = twig_node_indices();
     let mut width = TWIG_SIZE / 2;
     while width >= 1 {
         crate::simd::hash_parents(&mut nodes[..], &parents[width..2 * width]);
         width /= 2;
     }
-    nodes
+}
+
+/// The leaf root of a full twig whose leaves are `leaves`.
+fn twig_leaf_root(leaves: &[Hash]) -> Hash {
+    let mut nodes = Box::new([NULL_HASH; 2 * TWIG_SIZE]);
+    nodes[TWIG_SIZE..TWIG_SIZE + leaves.len()].copy_from_slice(leaves);
+    hash_twig_parents(&mut nodes);
+    nodes[1]
 }
 
 /// Recomputes every twig, a twig to a task on the worker pool.
@@ -1416,6 +1499,24 @@ pub enum QmdbUndoError {
     /// belong to this tree's history.
     #[error("undo entry for slot {slot} does not match the tree's entry")]
     EntryMismatch {
+        /// The slot in question.
+        slot: u64,
+    },
+    /// The undo would truncate into a compacted twig: `entries.relocated` is
+    /// never cut. Compaction takes only twigs below the undo horizon, so a
+    /// record inside the retention window never gets here. Nothing changed.
+    #[error("undo to slot {prev} would cut into relocated twig {twig}")]
+    RelocatedTwig {
+        /// The record's cursor.
+        prev: u64,
+        /// The highest relocated twig.
+        twig: usize,
+    },
+    /// The undo would revive a slot that keeps only its leaf hash (a
+    /// compacted twig's dead slot, retired before the undo horizon). Nothing
+    /// changed.
+    #[error("undo would revive slot {slot}, which keeps only its leaf hash")]
+    HashOnlySlot {
         /// The slot in question.
         slot: u64,
     },
@@ -1665,16 +1766,38 @@ impl QmdbCompatTree {
     /// truncated), and appends there from now on. `docs/QMDB_ENTRY_LOG.md`.
     /// The whole entry set is written once; a tree restored from a
     /// checkpoint pays that at startup.
+    ///
+    /// A slot that keeps only its leaf hash (a tree rebuilt from a compacted
+    /// tree's snapshot) is written to `entries.log` as an empty placeholder
+    /// record, and its twig as a relocated group that holds the hash, so the
+    /// file tree reads the same leaves.
     pub fn set_entry_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         let mut file = crate::entry_store::FileEntries::create(path)?;
         file.reserve(self.entries.len());
+        let mut hash_only_twigs = std::collections::BTreeSet::new();
         for slot in 0..self.entries.len() {
-            file.push(&self.entries.key(slot), self.entries.value(slot))?;
+            match self.entries.read(slot) {
+                SlotRef::Payload(key, value) => file.push(key, value)?,
+                SlotRef::HashOnly(_) => {
+                    file.push(&NULL_HASH, &[])?;
+                    hash_only_twigs.insert(slot / TWIG_SIZE);
+                }
+            }
             if !self.entries.is_active(slot) {
                 file.set_active(slot, false);
             }
         }
         file.sync()?;
+        for twig in hash_only_twigs {
+            let group = file.build_group(twig, |slot| match self.entries.read(slot) {
+                SlotRef::HashOnly(hash) => Some(*hash),
+                SlotRef::Payload(..) => None,
+            })?;
+            if twig_leaf_root(&group.leaves) != self.twigs[twig].leaf_root {
+                return Err(std::io::Error::other(format!("twig {twig}'s relocated group does not hash to its leaf root")));
+            }
+            file.append_group(group)?;
+        }
         self.entries = Entries::File(file);
         Ok(())
     }
@@ -1800,6 +1923,9 @@ impl QmdbCompatTree {
             spare_twig_nodes: Vec::new(),
         };
         for slot in 0..n {
+            if tree.entries.is_active(slot) && tree.entries.is_hash_only(slot) {
+                return Err(QmdbSnapshotError::ActiveHashOnly { slot: slot as u64 });
+            }
             if tree.entries.is_active(slot)
                 && tree
                     .index
@@ -2038,6 +2164,18 @@ impl QmdbCompatTree {
                 next: self.next_slot,
             });
         }
+        // A cut into a compacted twig, or a revival of a slot that kept only
+        // its leaf hash, is refused before anything changes: neither can
+        // happen to a record inside the undo horizon compaction respects.
+        if let Entries::File(file) = &self.entries
+            && prev < self.next_slot
+            && let Some(twig) = file.last_relocated_twig().filter(|twig| ((twig + 1) * TWIG_SIZE) as u64 > prev)
+        {
+            return Err(QmdbUndoError::RelocatedTwig { prev, twig });
+        }
+        if let Some(slot) = undo.retired_slots().find(|slot| *slot < prev && self.entries.is_hash_only(*slot as usize)) {
+            return Err(QmdbUndoError::HashOnlySlot { slot });
+        }
         // Revivals below the cursor must name what the slot actually holds:
         // a record from another history would otherwise revive the wrong key.
         if undo.slots_only {
@@ -2053,7 +2191,7 @@ impl QmdbCompatTree {
         } else {
             for entry in undo.entries.iter().filter(|entry| entry.slot < prev) {
                 let slot = entry.slot as usize;
-                if self.entries.key(slot) != entry.key || self.entries.value(slot) != entry.value.as_slice() {
+                if self.entries.payload(slot) != Some((&entry.key, entry.value.as_slice())) {
                     return Err(QmdbUndoError::EntryMismatch { slot: entry.slot });
                 }
             }
@@ -2148,8 +2286,9 @@ impl QmdbCompatTree {
             }
             return;
         }
-        let e = self.entries.entry(slot as usize);
-        let entry = UndoEntry { slot, key: e.key, value: e.value };
+        // A slot being retired is live, so it has its payload.
+        let entry =
+            UndoEntry { slot, key: self.entries.key(slot as usize), value: self.entries.value(slot as usize).to_vec() };
         if let Some(record) = self.recording.as_mut() {
             record.entries.push(entry);
         }
@@ -2835,28 +2974,23 @@ impl QmdbCompatTree {
         if slot >= self.entries.len() {
             return None;
         }
+        Some(self.entry_snapshot(slot))
+    }
+
+    /// `slot` as a snapshot entry: its payload, or (a compacted twig's dead
+    /// slot) its leaf hash with a null key and an empty value.
+    fn entry_snapshot(&self, slot: usize) -> QmdbEntrySnapshot {
         let entry = self.entries.entry(slot);
-        Some(QmdbEntrySnapshot {
-            key: entry.key,
-            value: entry.value,
-            active: entry.active,
-        })
+        match entry.content {
+            SlotContent::Payload { key, value } => QmdbEntrySnapshot::new(key, value, entry.active),
+            SlotContent::HashOnly { leaf_hash } => {
+                QmdbEntrySnapshot { key: NULL_HASH, value: Vec::new(), active: entry.active, leaf_hash: Some(leaf_hash) }
+            }
+        }
     }
 
     pub fn snapshot(&self) -> QmdbSnapshot {
-        QmdbSnapshot {
-            next_slot: self.next_slot,
-            entries: (0..self.entries.len())
-                .map(|slot| {
-                    let entry = self.entries.entry(slot);
-                    QmdbEntrySnapshot {
-                        key: entry.key,
-                        value: entry.value,
-                        active: entry.active,
-                    }
-                })
-                .collect(),
-        }
+        QmdbSnapshot { next_slot: self.next_slot, entries: (0..self.entries.len()).map(|slot| self.entry_snapshot(slot)).collect() }
     }
 
     pub fn from_snapshot(snapshot: &QmdbSnapshot) -> Result<Self, QmdbSnapshotError> {
@@ -2872,6 +3006,15 @@ impl QmdbCompatTree {
             let twig_id = slot / TWIG_SIZE;
             let local = slot % TWIG_SIZE;
             tree.ensure_twig(twig_id);
+            // A compacted twig's dead slot: the stored leaf hash, no payload.
+            if let Some(leaf_hash) = entry.leaf_hash {
+                if entry.active {
+                    return Err(QmdbSnapshotError::ActiveHashOnly { slot: slot as u64 });
+                }
+                tree.twigs[twig_id].set_leaf_unchecked(local, leaf_hash);
+                tree.entries.push_hash_only(leaf_hash).expect("a heap push cannot fail");
+                continue;
+            }
             tree.twigs[twig_id].set_leaf_unchecked(local, hash_leaf(&entry.key, &entry.value));
             // A fresh tree keeps its entries in the heap, where a push
             // cannot fail; `set_entry_file` moves them afterwards. The entry
@@ -2909,11 +3052,7 @@ impl QmdbCompatTree {
                     got: entry.slot,
                 });
             }
-            entries.push(QmdbEntrySnapshot {
-                key: entry.key,
-                value: entry.value.clone(),
-                active: entry.active,
-            });
+            entries.push(QmdbEntrySnapshot::new(entry.key, entry.value.clone(), entry.active));
         }
         Self::from_snapshot(&QmdbSnapshot {
             next_slot: snapshot.next_slot,

@@ -10,14 +10,36 @@
 //! entry is ~160 B (the struct and a heap `Vec<u8>` for the value); in the
 //! file it is 8 B of offset and a bit, and the page cache -- evictable, which
 //! the heap is not -- holds whatever is read often.
+//!
+//! # The relocated file
+//!
+//! `docs/QMDB_COMPACTION_DESIGN.md` (stage 2) adds a second append-only file
+//! beside `entries.log`, `entries.relocated` (the main file's name with the
+//! extension `relocated`), which receives compacted twigs: a twig's 2048
+//! slots rewritten as one group, in slot order, keeping slot numbers -- so
+//! no leaf, twig root, proof or root changes. A group is
+//!
+//! ```text
+//! [0x01][slot u64][key 32][len u32][value]   a live slot, the main file's payload
+//! [0x02][slot u64][leaf_hash 32]             a dead slot: its leaf hash only
+//! [0x03][twig u64][crc32 u32]                the trailer
+//! ```
+//!
+//! with every integer little endian and the CRC-32 (IEEE, `crc32fast`) taken
+//! over every byte of the group before the CRC itself, the trailer's tag and
+//! twig included. A slot's offset has bit 63 set when it points into the
+//! relocated file. `entries.log` keeps every slot's original record (nothing
+//! is punched in this stage), so the read view's byte offsets into it stay
+//! valid and a lost group loses nothing.
 
 use std::{
+    collections::BTreeMap,
     fs::{File, OpenOptions},
     io::{self, Seek, Write},
     path::{Path, PathBuf},
 };
 
-use crate::Hash;
+use crate::{Hash, NULL_HASH, TWIG_SIZE, hash_leaf};
 
 /// Fault injection for the entry file's appends (feature `failpoints`, for
 /// tests of callers that must survive a failed write): an armed path's next
@@ -71,20 +93,95 @@ pub mod failpoints {
 /// One entry, as the heap store keeps it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Entry {
+    /// The key; for a hash-only slot, its leaf hash.
     pub(crate) key: Hash,
     pub(crate) value: Vec<u8>,
     pub(crate) active: bool,
+    /// A dead slot whose payload was dropped by a compaction: `key` holds
+    /// its leaf hash and `value` is empty. Only a heap tree rebuilt from the
+    /// snapshot of a compacted file tree has one.
+    pub(crate) hash_only: bool,
+}
+
+/// What a slot holds, read out of either store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlotContent {
+    /// The entry's key and value bytes: every live slot, and every dead
+    /// slot outside a compacted twig.
+    Payload {
+        /// The entry's key.
+        key: Hash,
+        /// Its value bytes.
+        value: Vec<u8>,
+    },
+    /// A dead slot of a compacted twig: only its leaf hash is kept
+    /// (`docs/QMDB_COMPACTION_DESIGN.md` 3.2).
+    HashOnly {
+        /// `hash_leaf(key, value)` of the entry the slot held.
+        leaf_hash: Hash,
+    },
 }
 
 /// A slot's content, read out of either store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotEntry {
-    /// The entry's key.
-    pub key: Hash,
-    /// Its value bytes.
-    pub value: Vec<u8>,
-    /// Whether the slot is live.
+    /// The payload, or only the leaf hash.
+    pub content: SlotContent,
+    /// Whether the slot is live (never for a hash-only slot).
     pub active: bool,
+}
+
+impl SlotEntry {
+    /// The slot's leaf hash, computed from the payload or stored.
+    pub fn leaf_hash(&self) -> Hash {
+        match &self.content {
+            SlotContent::Payload { key, value } => hash_leaf(key, value),
+            SlotContent::HashOnly { leaf_hash } => *leaf_hash,
+        }
+    }
+}
+
+/// A slot's content borrowed from either store.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SlotRef<'a> {
+    /// The key and the value.
+    Payload(&'a Hash, &'a [u8]),
+    /// A dead slot of a compacted twig: its leaf hash.
+    HashOnly(&'a Hash),
+}
+
+impl SlotRef<'_> {
+    /// The slot's leaf hash.
+    pub(crate) fn leaf_hash(self) -> Hash {
+        match self {
+            Self::Payload(key, value) => hash_leaf(key, value),
+            Self::HashOnly(hash) => *hash,
+        }
+    }
+}
+
+/// Bit 63 of an offset: the record is in `entries.relocated`.
+const RELOCATED_BIT: u64 = 1 << 63;
+/// The tags of a relocated group's records (module doc).
+const TAG_LIVE: u8 = 0x01;
+const TAG_DEAD: u8 = 0x02;
+const TAG_END: u8 = 0x03;
+/// A relocated record's tag and slot, before the payload or the hash.
+const RELOCATED_HEAD: usize = 1 + 8;
+/// A dead record: tag, slot, leaf hash.
+const DEAD_RECORD: usize = RELOCATED_HEAD + 32;
+/// A group's trailer: tag, twig, CRC.
+const TRAILER: usize = 1 + 8 + 4;
+
+/// The relocated file beside the main file at `main`: `entries.relocated`
+/// for `entries.log`.
+pub(crate) fn relocated_path(main: &Path) -> PathBuf {
+    main.with_extension("relocated")
+}
+
+/// Why an operation on the relocated twigs was refused.
+fn refused(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
 /// The record layout in the file: the key, the value's length, the value.
@@ -156,13 +253,17 @@ pub struct EntryStoreStats {
     pub index_bytes: u64,
     /// Sealed mappings of the file; 0 in the heap.
     pub chunks: u64,
+    /// Bytes of `entries.relocated` that belong to complete groups (the
+    /// compacted twigs, `docs/QMDB_COMPACTION_DESIGN.md` 3.7); 0 in the heap.
+    pub relocated_bytes: u64,
 }
 
 impl EntryStoreStats {
-    /// Entry bytes per live slot, `file_bytes / max(live_slots, 1)`: the
-    /// growth compaction would bound.
+    /// Entry bytes per live slot, `(file_bytes + relocated_bytes) /
+    /// max(live_slots, 1)`: the growth compaction would bound. Nothing is
+    /// punched yet (stage 3), so a compaction raises it until then.
     pub fn bytes_per_live_slot(&self) -> u64 {
-        self.file_bytes / self.live_slots.max(1)
+        (self.file_bytes + self.relocated_bytes) / self.live_slots.max(1)
     }
 }
 
@@ -232,6 +333,12 @@ impl Offsets {
 
     fn get(&self, slot: usize) -> Option<u64> {
         (slot < self.len).then(|| self.segments[slot >> Self::BITS][slot & Self::MASK])
+    }
+
+    /// Replaces `slot`'s offset (a compaction retargeting the slot).
+    fn set(&mut self, slot: usize, offset: u64) {
+        assert!(slot < self.len, "offset {slot} past {} slots", self.len);
+        self.segments[slot >> Self::BITS][slot & Self::MASK] = offset;
     }
 
     fn push(&mut self, offset: u64) {
@@ -374,19 +481,30 @@ impl LogFile {
         Ok(())
     }
 
-    /// The bytes `[start, end)`, which lie within one chunk or the tail.
-    fn bytes(&self, start: u64, end: u64) -> &[u8] {
+    /// The bytes from `start` to the end of the chunk, or of the tail, it
+    /// lies in: a record that starts there ends within them.
+    fn bytes_from(&self, start: u64) -> &[u8] {
         if start >= self.sealed_len {
-            let s = (start - self.sealed_len) as usize;
-            let e = (end - self.sealed_len) as usize;
-            &self.tail[s..e]
+            &self.tail[(start - self.sealed_len) as usize..]
         } else {
-            // A record never straddles two chunks: a chunk is sealed at a
-            // record boundary.
             let i = self.chunks.partition_point(|chunk| chunk.start <= start) - 1;
             let chunk = &self.chunks[i];
-            &chunk.map[(start - chunk.start) as usize..(end - chunk.start) as usize]
+            &chunk.map[(start - chunk.start) as usize..]
         }
+    }
+
+    /// Appends `bytes` as one unit that no chunk boundary splits: the tail is
+    /// sealed first if they would not fit in it. Returns where they start.
+    /// No populate: this is the relocated file's append, off the hot path.
+    fn append_unit(&mut self, bytes: &[u8]) -> io::Result<u64> {
+        self.writable()?;
+        if !self.tail.is_empty() && self.tail.len() + bytes.len() > CHUNK_BYTES {
+            self.seal_tail()?;
+        }
+        let start = self.len_bytes;
+        self.tail.extend_from_slice(bytes);
+        self.len_bytes += bytes.len() as u64;
+        Ok(start)
     }
 
     /// Asks the append populate thread to populate the tail buffer's pages
@@ -554,11 +672,55 @@ impl LogFile {
     }
 }
 
+/// A twig whose records were rewritten into `entries.relocated`.
+#[derive(Clone, Debug)]
+struct RelocatedTwig {
+    /// Where `entries.log` holds the twig's slots, for [`FileEntries::offset`]:
+    /// the read view resolves byte offsets into `entries.log`, which keeps
+    /// every record in this stage. 16 KiB a compacted twig; stage 1 (a view
+    /// that resolves slots) and stage 3 (punching) retire it.
+    main: Box<[u64]>,
+    /// The length of the twig's latest group in `entries.relocated`,
+    /// trailer included.
+    group_len: u64,
+    /// The dead slots the latest group stored as hashes.
+    dead: u32,
+}
+
+/// What [`FileEntries::append_group`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Relocation {
+    /// The group's bytes, trailer included.
+    pub(crate) written: u64,
+    /// The bytes the twig's previous location held: its records in
+    /// `entries.log`, or its previous group. Nothing is punched yet.
+    pub(crate) reclaimable: u64,
+}
+
+/// A twig's records laid out as a relocated group
+/// ([`FileEntries::build_group`]), not yet written.
+#[derive(Debug)]
+pub(crate) struct Group {
+    twig: usize,
+    bytes: Vec<u8>,
+    /// Each slot's record start within `bytes`.
+    starts: Box<[u32]>,
+    /// The slots stored as hashes.
+    dead: u32,
+    /// Each slot's leaf hash, hashed from the group's own bytes.
+    pub(crate) leaves: Box<[Hash]>,
+}
+
 /// The append-only entry file, mapped for reads.
 pub(crate) struct FileEntries {
     /// `entries.log`: one record per slot, in slot order.
     main: LogFile,
-    /// Where each slot's record starts.
+    /// `entries.relocated`, once a twig has been compacted (or found on
+    /// open): the compacted twigs' groups.
+    relocated: Option<LogFile>,
+    /// The twigs whose offsets point into `relocated`, by twig id.
+    twigs: BTreeMap<usize, RelocatedTwig>,
+    /// Where each slot's record starts; bit 63 set: in `relocated`.
     offsets: Offsets,
     /// One bit per slot.
     active: Vec<u64>,
@@ -576,9 +738,16 @@ impl std::fmt::Debug for FileEntries {
 }
 
 impl FileEntries {
-    /// Creates (truncating) the file at `path`.
+    /// Creates (truncating) the file at `path`. A relocated file left
+    /// beside it is removed: its groups name slots of the file just emptied.
     pub(crate) fn create(path: &Path) -> io::Result<Self> {
-        Ok(Self { main: LogFile::create(path, true)?, offsets: Offsets::default(), active: Vec::new() })
+        let main = LogFile::create(path, true)?;
+        match std::fs::remove_file(relocated_path(path)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        Ok(Self { main, relocated: None, twigs: BTreeMap::new(), offsets: Offsets::default(), active: Vec::new() })
     }
 
     /// Opens the file at `path` as it was left, keeping at most `slots`
@@ -628,8 +797,15 @@ impl FileEntries {
         let mut main = LogFile::new(path.to_path_buf(), file, len_bytes, true);
         // Everything on disk is sealed into chunks; the tail starts empty.
         main.seal_existing(&offsets)?;
-        let mut store =
-            Self { main, offsets: Offsets::from_vec(offsets), active: vec![0u64; (kept as usize).div_ceil(64)] };
+        let mut twigs = BTreeMap::new();
+        let relocated = open_relocated(&relocated_path(path), &mut offsets, &mut twigs, truncate)?;
+        let mut store = Self {
+            main,
+            relocated,
+            twigs,
+            offsets: Offsets::from_vec(offsets),
+            active: vec![0u64; (kept as usize).div_ceil(64)],
+        };
         for (word, bits) in store.active.iter_mut().zip(active) {
             *word = *bits;
         }
@@ -651,7 +827,13 @@ impl FileEntries {
             offsets_bytes: (self.offsets.segments.len() * crate::prefault::OFFSET_SEGMENT_SLOTS * 8) as u64,
             index_bytes: 0,
             chunks: self.main.chunks.len() as u64,
+            relocated_bytes: self.relocated_len(),
         }
+    }
+
+    /// Bytes of `entries.relocated` that belong to complete groups.
+    pub(crate) fn relocated_len(&self) -> u64 {
+        self.relocated.as_ref().map_or(0, |file| file.len_bytes)
     }
 
     /// The active bits, one per slot, 64 to a word.
@@ -664,29 +846,78 @@ impl FileEntries {
         &self.main.path
     }
 
-    fn record(&self, slot: usize) -> &[u8] {
-        let start = self.offsets[slot];
-        let end = self.offsets.get(slot + 1).unwrap_or(self.main.len_bytes);
-        self.main.bytes(start, end)
+    /// `slot`'s content, wherever its record is. A record's end comes from
+    /// its own length field, not from the next slot's offset, which may
+    /// point into the other file.
+    pub(crate) fn read(&self, slot: usize) -> SlotRef<'_> {
+        let raw = self.offsets[slot];
+        if raw & RELOCATED_BIT == 0 {
+            return payload_at(self.main.bytes_from(raw));
+        }
+        let Some(file) = self.relocated.as_ref() else {
+            unreachable!("slot {slot} names a relocated record without a relocated file");
+        };
+        let bytes = file.bytes_from(raw & !RELOCATED_BIT);
+        match bytes[0] {
+            TAG_DEAD => SlotRef::HashOnly(as_hash(&bytes[RELOCATED_HEAD..DEAD_RECORD])),
+            tag => {
+                debug_assert_eq!(tag, TAG_LIVE, "slot {slot}'s relocated record");
+                payload_at(&bytes[RELOCATED_HEAD..])
+            }
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
         self.offsets.len()
     }
 
-    /// Where `slot`'s record starts in the file.
+    /// Where `slot`'s record starts in `entries.log`: the main file keeps
+    /// every slot's record in this stage, a compacted one included, so the
+    /// read view's byte offsets stay valid.
     pub(crate) fn offset(&self, slot: usize) -> Option<u64> {
-        self.offsets.get(slot)
+        let raw = self.offsets.get(slot)?;
+        if raw & RELOCATED_BIT == 0 {
+            return Some(raw);
+        }
+        self.twigs.get(&(slot / TWIG_SIZE)).map(|twig| twig.main[slot % TWIG_SIZE])
     }
 
-    pub(crate) fn key(&self, slot: usize) -> Hash {
-        let mut key = [0u8; KEY_LEN];
-        key.copy_from_slice(&self.record(slot)[..KEY_LEN]);
-        key
+    /// `slot`'s key, `None` for a hash-only slot: the key index's
+    /// confirmation read, so a record in the main file -- every slot but a
+    /// compacted one -- is read without its length.
+    fn key(&self, slot: usize) -> Option<&Hash> {
+        let raw = self.offsets[slot];
+        if raw & RELOCATED_BIT == 0 {
+            return Some(as_hash(&self.main.bytes_from(raw)[..KEY_LEN]));
+        }
+        match self.read(slot) {
+            SlotRef::Payload(key, _) => Some(key),
+            SlotRef::HashOnly(_) => None,
+        }
     }
 
-    pub(crate) fn value(&self, slot: usize) -> &[u8] {
-        &self.record(slot)[KEY_LEN + LEN_LEN..]
+    /// Tests: a slot's value, which must have its payload.
+    #[cfg(test)]
+    fn value(&self, slot: usize) -> &[u8] {
+        match self.read(slot) {
+            SlotRef::Payload(_, value) => value,
+            SlotRef::HashOnly(_) => panic!("slot {slot} is hash-only"),
+        }
+    }
+
+    /// Whether any slot keeps only its leaf hash.
+    pub(crate) fn has_hash_only(&self) -> bool {
+        self.twigs.values().any(|twig| twig.dead > 0)
+    }
+
+    /// The dead slots `twig`'s latest group stored as hashes, if it has one.
+    pub(crate) fn relocated_dead(&self, twig: usize) -> Option<u32> {
+        self.twigs.get(&twig).map(|twig| twig.dead)
+    }
+
+    /// The highest relocated twig's id.
+    pub(crate) fn last_relocated_twig(&self) -> Option<usize> {
+        self.twigs.keys().next_back().copied()
     }
 
     pub(crate) fn is_active(&self, slot: usize) -> bool {
@@ -914,11 +1145,21 @@ impl FileEntries {
     }
 
     /// Drops every slot from `len` on, and shortens the file to match.
+    /// Refused (`InvalidInput`) if a slot from `len` on is relocated:
+    /// `entries.relocated` is never cut, so its group would rename the slots
+    /// appended in their place on the next open. Compaction takes only twigs
+    /// below the undo horizon, so an undo never gets here.
     pub(crate) fn truncate(&mut self, len: usize) -> io::Result<()> {
         if len >= self.offsets.len() {
             return Ok(());
         }
         self.main.writable()?;
+        if let Some(twig) = self.last_relocated_twig().filter(|twig| (twig + 1) * TWIG_SIZE > len) {
+            return Err(refused(format!(
+                "{}: a truncation to slot {len} would cut into relocated twig {twig}",
+                self.main.path.display()
+            )));
+        }
         let new_len_bytes = self.offsets[len];
         self.offsets.truncate(len);
         for slot in len..self.active.len() * 64 {
@@ -941,7 +1182,99 @@ impl FileEntries {
     /// would corrupt it and a clone cutting it would pull the original's
     /// sealed mappings out from under it (`SIGBUS`).
     pub(crate) fn duplicate(&self) -> io::Result<Self> {
-        Ok(Self { main: self.main.duplicate()?, offsets: self.offsets.clone(), active: self.active.clone() })
+        Ok(Self {
+            main: self.main.duplicate()?,
+            relocated: self.relocated.as_ref().map(LogFile::duplicate).transpose()?,
+            twigs: self.twigs.clone(),
+            offsets: self.offsets.clone(),
+            active: self.active.clone(),
+        })
+    }
+
+    /// Lays `twig`'s 2048 slots out as a relocated group (module doc): a
+    /// live slot's payload as it is, a dead slot's leaf hash -- `leaf(slot)`
+    /// if it names one, else the slot's own (stored, or hashed from its
+    /// payload). The leaf hashes are hashed from the group's own bytes, for
+    /// the caller to check against the twig before anything is written.
+    pub(crate) fn build_group(&self, twig: usize, leaf: impl Fn(usize) -> Option<Hash>) -> io::Result<Group> {
+        let base = twig * TWIG_SIZE;
+        if base + TWIG_SIZE > self.len() {
+            return Err(refused(format!("twig {twig} is not full ({} slots)", self.len())));
+        }
+        let mut bytes = Vec::new();
+        let mut starts = Vec::with_capacity(TWIG_SIZE);
+        let mut leaves = Vec::with_capacity(TWIG_SIZE);
+        let mut dead = 0u32;
+        for slot in base..base + TWIG_SIZE {
+            let start = bytes.len();
+            starts.push(u32::try_from(start).map_err(|_| refused(format!("twig {twig}'s group passes 4 GiB")))?);
+            if self.is_active(slot) {
+                let SlotRef::Payload(key, value) = self.read(slot) else {
+                    return Err(refused(format!("live slot {slot} has no payload")));
+                };
+                let len = u32::try_from(value.len()).map_err(|_| refused(format!("slot {slot}'s value passes 4 GiB")))?;
+                bytes.push(TAG_LIVE);
+                bytes.extend_from_slice(&(slot as u64).to_le_bytes());
+                bytes.extend_from_slice(key);
+                bytes.extend_from_slice(&len.to_le_bytes());
+                bytes.extend_from_slice(value);
+                let payload = &bytes[start + RELOCATED_HEAD..];
+                leaves.push(hash_leaf(as_hash(&payload[..KEY_LEN]), &payload[KEY_LEN + LEN_LEN..]));
+            } else {
+                let hash = leaf(slot).unwrap_or_else(|| self.read(slot).leaf_hash());
+                bytes.push(TAG_DEAD);
+                bytes.extend_from_slice(&(slot as u64).to_le_bytes());
+                bytes.extend_from_slice(&hash);
+                leaves.push(*as_hash(&bytes[start + RELOCATED_HEAD..start + DEAD_RECORD]));
+                dead += 1;
+            }
+        }
+        bytes.push(TAG_END);
+        bytes.extend_from_slice(&(twig as u64).to_le_bytes());
+        let crc = crc32fast::hash(&bytes);
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        Ok(Group { twig, bytes, starts: starts.into_boxed_slice(), dead, leaves: leaves.into_boxed_slice() })
+    }
+
+    /// Appends `group` to `entries.relocated` (created on the first one),
+    /// makes it durable, then points its twig's 2048 offsets at it. A
+    /// failure before the retarget leaves every slot where it was; a group
+    /// left complete in the file by one is applied by the next open, which
+    /// is harmless, since it holds what the slots hold.
+    pub(crate) fn append_group(&mut self, group: Group) -> io::Result<Relocation> {
+        self.main.writable()?;
+        let twig = group.twig;
+        let base = twig * TWIG_SIZE;
+        // What the twig's records take where they are now.
+        let reclaimable = match self.twigs.get(&twig) {
+            Some(relocated) => relocated.group_len,
+            None => {
+                let first = self.offsets[base];
+                let last = self.offsets[base + TWIG_SIZE - 1];
+                debug_assert_eq!((first | last) & RELOCATED_BIT, 0);
+                let SlotRef::Payload(_, value) = payload_at(self.main.bytes_from(last)) else { unreachable!() };
+                last + (KEY_LEN + LEN_LEN + value.len()) as u64 - first
+            }
+        };
+        if self.relocated.is_none() {
+            let path = relocated_path(&self.main.path);
+            let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path)?;
+            self.relocated = Some(LogFile::new(path, file, 0, false));
+        }
+        let Some(file) = self.relocated.as_mut() else { unreachable!("created above") };
+        let start = file.append_unit(&group.bytes)?;
+        // Durable before any slot points at it.
+        file.sync()?;
+        let main: Box<[u64]> = match self.twigs.remove(&twig) {
+            Some(relocated) => relocated.main,
+            None => (base..base + TWIG_SIZE).map(|slot| self.offsets[slot]).collect(),
+        };
+        for (local, at) in group.starts.iter().enumerate() {
+            self.offsets.set(base + local, (start + u64::from(*at)) | RELOCATED_BIT);
+        }
+        let written = group.bytes.len() as u64;
+        self.twigs.insert(twig, RelocatedTwig { main, group_len: written, dead: group.dead });
+        Ok(Relocation { written, reclaimable })
     }
 
     /// Seals the tail now (tests: exercise the chunked reads without
@@ -950,6 +1283,140 @@ impl FileEntries {
     fn seal_now(&mut self) -> io::Result<()> {
         self.main.seal_tail()
     }
+}
+
+/// A `[key 32][len u32][value]` record at the start of `bytes`.
+fn payload_at(bytes: &[u8]) -> SlotRef<'_> {
+    let len = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]) as usize;
+    SlotRef::Payload(as_hash(&bytes[..KEY_LEN]), &bytes[KEY_LEN + LEN_LEN..KEY_LEN + LEN_LEN + len])
+}
+
+fn as_hash(bytes: &[u8]) -> &Hash {
+    bytes.try_into().expect("a 32-byte range")
+}
+
+/// Opens `entries.relocated` at `path`, if there is one, and retargets
+/// `offsets` (the main file's, one per kept slot) to every complete group in
+/// it, in file order, so the latest group of a twig wins; `twigs` records
+/// each relocated twig with its `entries.log` offsets.
+///
+/// The walk stops at the first group that is torn, fails its CRC, is not
+/// exactly one twig's 2048 slots in order, or names a twig not wholly within
+/// the kept slots (an open that keeps a shorter prefix, or a main file cut
+/// short); with `truncate` the file is cut there, as a torn tail of the main
+/// file is. Losing a group loses nothing in this stage: `entries.log` still
+/// holds every slot's record, and nothing is punched.
+///
+/// Groups past what the checkpoint recorded (`relocated_len`) are applied
+/// like the rest when complete: a group only says where a slot's unchanged
+/// content is, so applying one written after the checkpoint is idempotent.
+fn open_relocated(
+    path: &Path,
+    offsets: &mut [u64],
+    twigs: &mut BTreeMap<usize, RelocatedTwig>,
+    truncate: bool,
+) -> io::Result<Option<LogFile>> {
+    use std::io::Read;
+    let mut file = match OpenOptions::new().read(true).write(truncate).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let len = file.metadata()?.len();
+    let mut good = 0u64;
+    let mut group_starts = Vec::new();
+    {
+        file.seek(io::SeekFrom::Start(0))?;
+        let mut reader = std::io::BufReader::with_capacity(8 << 20, &mut file);
+        let mut starts = vec![0u64; TWIG_SIZE];
+        let mut value = Vec::new();
+        'groups: loop {
+            let group_start = good;
+            let mut at = good;
+            let mut crc = crc32fast::Hasher::new();
+            let mut dead_hash_count = 0u32;
+            let mut twig = None;
+            for local in 0..TWIG_SIZE {
+                let mut head = [0u8; RELOCATED_HEAD];
+                if at + RELOCATED_HEAD as u64 > len || reader.read_exact(&mut head).is_err() {
+                    break 'groups;
+                }
+                let slot = u64::from_le_bytes(head[1..9].try_into().expect("8 bytes")) as usize;
+                let expected = *twig.get_or_insert(slot / TWIG_SIZE) * TWIG_SIZE + local;
+                if slot != expected {
+                    break 'groups;
+                }
+                crc.update(&head);
+                starts[local] = at;
+                match head[0] {
+                    TAG_LIVE => {
+                        let mut header = [0u8; KEY_LEN + LEN_LEN];
+                        if at + (RELOCATED_HEAD + KEY_LEN + LEN_LEN) as u64 > len || reader.read_exact(&mut header).is_err() {
+                            break 'groups;
+                        }
+                        let value_len = u32::from_le_bytes([header[32], header[33], header[34], header[35]]) as u64;
+                        let end = at + (RELOCATED_HEAD + KEY_LEN + LEN_LEN) as u64 + value_len;
+                        if end > len {
+                            break 'groups;
+                        }
+                        value.resize(value_len as usize, 0);
+                        if reader.read_exact(&mut value).is_err() {
+                            break 'groups;
+                        }
+                        crc.update(&header);
+                        crc.update(&value);
+                        at = end;
+                    }
+                    TAG_DEAD => {
+                        let mut hash = [0u8; 32];
+                        if at + DEAD_RECORD as u64 > len || reader.read_exact(&mut hash).is_err() {
+                            break 'groups;
+                        }
+                        crc.update(&hash);
+                        dead_hash_count += 1;
+                        at += DEAD_RECORD as u64;
+                    }
+                    _ => break 'groups,
+                }
+            }
+            let Some(twig) = twig else { break };
+            let mut trailer = [0u8; TRAILER];
+            if at + TRAILER as u64 > len || reader.read_exact(&mut trailer).is_err() {
+                break;
+            }
+            crc.update(&trailer[..9]);
+            if trailer[0] != TAG_END
+                || u64::from_le_bytes(trailer[1..9].try_into().expect("8 bytes")) != twig as u64
+                || u32::from_le_bytes(trailer[9..13].try_into().expect("4 bytes")) != crc.finalize()
+            {
+                break;
+            }
+            let base = twig * TWIG_SIZE;
+            if base + TWIG_SIZE > offsets.len() {
+                break;
+            }
+            at += TRAILER as u64;
+            let main = &mut offsets[base..base + TWIG_SIZE];
+            let entry = twigs.entry(twig).or_insert_with(|| RelocatedTwig {
+                main: main.iter().copied().collect(),
+                group_len: 0,
+                dead: 0,
+            });
+            entry.group_len = at - group_start;
+            entry.dead = dead_hash_count;
+            for (offset, start) in main.iter_mut().zip(&starts) {
+                *offset = start | RELOCATED_BIT;
+            }
+            group_starts.push(group_start);
+            good = at;
+        }
+    }
+    if truncate && good < len {
+        file.set_len(good)?;
+    }
+    let mut log = LogFile::new(path.to_path_buf(), file, good, false);
+    log.seal_existing(&group_starts)?;
+    Ok(Some(log))
 }
 
 /// The applying thread's page faults in a batch append, per structure.
@@ -980,18 +1447,64 @@ impl Entries {
         }
     }
 
-    pub(crate) fn key(&self, slot: usize) -> Hash {
+    /// `slot`'s content: its payload, or only its leaf hash.
+    pub(crate) fn read(&self, slot: usize) -> SlotRef<'_> {
         match self {
-            Self::Heap(entries) => entries[slot].key,
-            Self::File(file) => file.key(slot),
+            Self::Heap(entries) => {
+                let entry = &entries[slot];
+                if entry.hash_only { SlotRef::HashOnly(&entry.key) } else { SlotRef::Payload(&entry.key, &entry.value) }
+            }
+            Self::File(file) => file.read(slot),
         }
     }
 
-    pub(crate) fn value(&self, slot: usize) -> &[u8] {
-        match self {
-            Self::Heap(entries) => &entries[slot].value,
-            Self::File(file) => file.value(slot),
+    /// The key of a slot that has its payload: every slot the key index
+    /// names (they are live), and every slot appended since the undo horizon.
+    /// A hash-only slot has none; it reads as the null hash, which no key
+    /// lookup matches, and a debug build stops there.
+    pub(crate) fn key(&self, slot: usize) -> Hash {
+        let key = match self {
+            Self::Heap(entries) => (!entries[slot].hash_only).then_some(&entries[slot].key),
+            Self::File(file) => file.key(slot),
+        };
+        match key {
+            Some(key) => *key,
+            None => {
+                debug_assert!(false, "the key of hash-only slot {slot} was read");
+                NULL_HASH
+            }
         }
+    }
+
+    /// The value of a slot that has its payload ([`Self::key`]); a
+    /// hash-only slot reads as empty, and a debug build stops there.
+    pub(crate) fn value(&self, slot: usize) -> &[u8] {
+        match self.read(slot) {
+            SlotRef::Payload(_, value) => value,
+            SlotRef::HashOnly(_) => {
+                debug_assert!(false, "the value of hash-only slot {slot} was read");
+                &[]
+            }
+        }
+    }
+
+    /// `slot`'s key and value, `None` for a hash-only slot.
+    pub(crate) fn payload(&self, slot: usize) -> Option<(&Hash, &[u8])> {
+        match self.read(slot) {
+            SlotRef::Payload(key, value) => Some((key, value)),
+            SlotRef::HashOnly(_) => None,
+        }
+    }
+
+    /// `slot`'s leaf hash: stored for a hash-only slot, hashed from the
+    /// payload for the rest.
+    pub(crate) fn leaf_hash(&self, slot: usize) -> Hash {
+        self.read(slot).leaf_hash()
+    }
+
+    /// Whether `slot` keeps only its leaf hash.
+    pub(crate) fn is_hash_only(&self, slot: usize) -> bool {
+        matches!(self.read(slot), SlotRef::HashOnly(_))
     }
 
     pub(crate) fn is_active(&self, slot: usize) -> bool {
@@ -1009,12 +1522,31 @@ impl Entries {
     }
 
     pub(crate) fn entry(&self, slot: usize) -> SlotEntry {
+        let content = match self.read(slot) {
+            SlotRef::Payload(key, value) => SlotContent::Payload { key: *key, value: value.to_vec() },
+            SlotRef::HashOnly(hash) => SlotContent::HashOnly { leaf_hash: *hash },
+        };
+        SlotEntry { content, active: self.is_active(slot) }
+    }
+
+    /// Appends a dead slot that keeps only its leaf hash (a heap tree
+    /// rebuilt from a compacted tree's snapshot); refused in the file, where
+    /// such a slot exists only in a relocated group.
+    pub(crate) fn push_hash_only(&mut self, leaf_hash: Hash) -> io::Result<()> {
         match self {
             Self::Heap(entries) => {
-                let entry = &entries[slot];
-                SlotEntry { key: entry.key, value: entry.value.clone(), active: entry.active }
+                entries.push(Entry { key: leaf_hash, value: Vec::new(), active: false, hash_only: true });
+                Ok(())
             }
-            Self::File(file) => SlotEntry { key: file.key(slot), value: file.value(slot).to_vec(), active: file.is_active(slot) },
+            Self::File(_) => Err(refused("a hash-only slot cannot be appended to the entry file".to_owned())),
+        }
+    }
+
+    /// Bytes of `entries.relocated` in complete groups; 0 in the heap.
+    pub(crate) fn relocated_len(&self) -> u64 {
+        match self {
+            Self::Heap(_) => 0,
+            Self::File(file) => file.relocated_len(),
         }
     }
 
@@ -1029,7 +1561,7 @@ impl Entries {
         match self {
             Self::Heap(entries) => {
                 let at = crate::prefault::thread_faults();
-                entries.extend(records.map(|(key, value)| Entry { key: *key, value: value.to_vec(), active: true }));
+                entries.extend(records.map(|(key, value)| Entry { key: *key, value: value.to_vec(), active: true, hash_only: false }));
                 faults.entries += crate::prefault::thread_faults().saturating_sub(at);
                 Ok(())
             }
@@ -1058,7 +1590,7 @@ impl Entries {
             Self::Heap(entries) => {
                 entries.par_extend((0..count).into_par_iter().with_min_len(1024).map(|k| {
                     let (key, value) = record(k);
-                    Entry { key: *key, value: value.to_vec(), active: true }
+                    Entry { key: *key, value: value.to_vec(), active: true, hash_only: false }
                 }));
                 Ok(())
             }
@@ -1077,7 +1609,7 @@ impl Entries {
     pub(crate) fn push(&mut self, key: Hash, value: Vec<u8>) -> io::Result<()> {
         match self {
             Self::Heap(entries) => {
-                entries.push(Entry { key, value, active: true });
+                entries.push(Entry { key, value, active: true, hash_only: false });
                 Ok(())
             }
             Self::File(file) => {
@@ -1224,7 +1756,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let (old, kept) = FileEntries::open_existing_readonly(&path, 2, &[3]).unwrap();
         assert_eq!(kept, 2);
-        assert_eq!(old.key(1), [1; 32]);
+        assert_eq!(old.key(1), Some(&[1; 32]));
         assert_eq!(old.value(1), &[1; 8]);
         drop(old);
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -1249,7 +1781,7 @@ mod tests {
         }
         assert_eq!(file.len(), 1000);
         assert_eq!(file.value(999), &vec![(999 % 256) as u8; 1 + 999 % 50][..]);
-        assert_eq!(file.key(17), key(17));
+        assert_eq!(file.key(17), Some(&key(17)));
         assert!(file.is_active(17));
         file.set_active(17, false);
         assert!(!file.is_active(17));

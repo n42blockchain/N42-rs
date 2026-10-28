@@ -2335,7 +2335,7 @@ case $STAGE in
   fq) # quick capacity check after the 6.9 merge (2026-10-28): one leg on the QC natives (= main f2a1ff86c), one 10 s window, no WARM leg --
       # the host lost power three times in a week at load steps, so the seven-node load is kept to seconds (docs/MATURITY_HARDENING_2026_10.md 8.3)
      AUD=${LOOP351_QC_BIN:-/data/n42-build/wt-integ/target/native-qc/release}; MAIN=${LOOP351_MAIN_BIN:-/data/n42-build/wt-integ/target/native/release}; [ -x $MAIN/n42 ] || { echo "main binaries missing at $MAIN; nothing run"; echo ALLDONE; exit 1; }; [ -x $AUD/n42 ] && [ -x $AUD/examples/h2_validator ] || { echo "qc binaries missing at $AUD; nothing run"; echo ALLDONE; exit 1; }; echo "stage fn: qc binaries $AUD, main $MAIN (n42 built $(date -r $AUD/n42 +%m-%d\ %H:%M))"
-     R6="F7_FLOOD_REPLAY=/data/n42-pregen/g900000-600m"; export F7_SENDERS_ARG=18750; echo "stage fn: replay set $R6 (senders $F7_SENDERS_ARG; the WARM leg above used the 400M set)"
+     R6="F7_FLOOD_REPLAY=/data/n42-pregen/g900000-600m"; export F7_SENDERS_ARG=18750; echo "stage fq: replay set $R6 (senders $F7_SENDERS_ARG; one 10 s window, no WARM leg)"
      D2="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d2.json"; PA="N42_QMDB_PARALLEL_APPLY=1"; BA="N42_SF_BULK_APPEND=1"
      D3="F7_GENESIS=$WT/crates/chainspec/res/genesis/n42_fleet7_bench_d3.json N42_DEFERRED_DEPTH3=1"
      X3="N42_QMDB_RENAME_DEFER=1 N42_HANDOFF_HEAD_MOVE=number N42_HANDOFF_NO_CLONE=1"; X4="$X3 N42_HANDOFF_MOVE_BODY=1"; X5="$X4 N42_CANON_NOTIFY_LEAN=1"; X6="$X5 N42_QUEUE_OFFLOCK=1"; X7="$X6 N42_QMDB_COMPUTE_OFFLOCK=1 N42_QMDB_PERSIST_BATCH=1"

@@ -1349,7 +1349,7 @@ fn open_relocated(
             let mut crc = crc32fast::Hasher::new();
             let mut dead_hash_count = 0u32;
             let mut twig = None;
-            for local in 0..TWIG_SIZE {
+            for (local, record_start) in starts.iter_mut().enumerate() {
                 let mut head = [0u8; RELOCATED_HEAD];
                 if at + RELOCATED_HEAD as u64 > len || reader.read_exact(&mut head).is_err() {
                     break 'groups;
@@ -1360,7 +1360,7 @@ fn open_relocated(
                     break 'groups;
                 }
                 crc.update(&head);
-                starts[local] = at;
+                *record_start = at;
                 match head[0] {
                     TAG_LIVE => {
                         let mut header = [0u8; KEY_LEN + LEN_LEN];
@@ -1444,7 +1444,12 @@ pub(crate) struct AppendFaults {
 }
 
 /// The tree's entries, wherever they live.
+///
+/// One per tree, read on every key lookup: the file variant (two
+/// [`LogFile`]s) is kept inline rather than boxed, a few hundred bytes once
+/// against a pointer chase on the hot path.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Entries {
     /// Every entry in the heap.
     Heap(Vec<Entry>),

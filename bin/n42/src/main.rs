@@ -535,8 +535,10 @@ fn main() {
             //
             // The entry store's growth (`docs/QMDB_COMPACTION_DESIGN.md` 3.7):
             // the entry file's bytes, its slots in all and still live, the
-            // offsets' and the key index's heap, the file's sealed chunks, and
-            // `n42_qmdb_entry_bytes_per_live_slot`, logged once at warn level
+            // offsets' and the key index's heap, the file's sealed chunks, the
+            // compacted twigs' bytes in `entries.relocated`, and
+            // `n42_qmdb_entry_bytes_per_live_slot` ((file + relocated) / live),
+            // logged once at warn level
             // when it passes `N42_QMDB_ENTRY_BYTES_PER_LIVE_ALARM` (default
             // 2000, 0 disables). A tick that finds the forest lock held skips
             // these gauges rather than wait.
@@ -573,6 +575,7 @@ fn main() {
                             metrics::gauge!("n42_qmdb_offsets_bytes").set(stats.offsets_bytes as f64);
                             metrics::gauge!("n42_qmdb_index_bytes").set(stats.index_bytes as f64);
                             metrics::gauge!("n42_qmdb_entry_chunks").set(stats.chunks as f64);
+                            metrics::gauge!("n42_qmdb_entry_relocated_bytes").set(stats.relocated_bytes as f64);
                             metrics::gauge!("n42_qmdb_entry_bytes_per_live_slot").set(per_live as f64);
                             if bytes_per_live_alarm > 0 && per_live > bytes_per_live_alarm && !bytes_per_live_warned {
                                 bytes_per_live_warned = true;
@@ -581,6 +584,7 @@ fn main() {
                                     per_live,
                                     alarm = bytes_per_live_alarm,
                                     file_bytes = stats.file_bytes,
+                                    relocated_bytes = stats.relocated_bytes,
                                     live_slots = stats.live_slots,
                                     total_slots = stats.total_slots,
                                     "the QMDB entry store holds more bytes per live slot than N42_QMDB_ENTRY_BYTES_PER_LIVE_ALARM; it grows with the append history (docs/QMDB_COMPACTION_DESIGN.md)",

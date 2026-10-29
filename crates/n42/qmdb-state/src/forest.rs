@@ -438,6 +438,15 @@ pub struct QmdbForest {
     /// lets go of the forest between taking deltas and forgetting the moves
     /// they carried compares it to tell whether others came in between.
     moves: u64,
+    /// How many times [`Self::move_to`] synced the entry file after a cut.
+    cut_syncs: u64,
+    /// The append cursor of the state the log holds (or is being appended to
+    /// hold): the last delta handed out ([`Self::take_block_deltas`],
+    /// [`Self::delta_since`]) or checkpoint taken. A move that cuts only above
+    /// it reverts blocks no restart replays, and syncs nothing (audit 2026-10
+    /// round 2, R2-Q4). Set when the deltas leave, before they are appended:
+    /// a failed append leaves it high, which costs a sync, never a missed one.
+    logged_slots: u64,
     /// A head move recorded while the tree was leased out
     /// ([`Self::set_canonical_in_place`]) still owes the twig trim it would
     /// have done; [`Self::return_tree`] (or the next
@@ -862,6 +871,7 @@ impl QmdbForest {
     pub fn checkpoint(&mut self) -> Result<ForestCheckpoint, StateError> {
         let head = self.head.1;
         self.move_to(head)?;
+        self.logged_slots = self.tree.next_slot();
         Ok(ForestCheckpoint {
             version: ForestCheckpoint::VERSION,
             head_number: self.head.0,
@@ -906,6 +916,8 @@ impl QmdbForest {
             leased_at: None,
             flushed_slots: 0,
             moves: 0,
+            cut_syncs: 0,
+            logged_slots: next_slot,
             trim_due: false,
             deferred_twigs: Vec::new(),
             poisoned: None,
@@ -945,6 +957,19 @@ impl QmdbForest {
     /// ([`Self::forget_changes`] does not reset it).
     pub const fn moves(&self) -> u64 {
         self.moves
+    }
+
+    /// How many times a move synced the entry file after cutting it below
+    /// what the log holds (audit 2026-10 D-4); each one is an fsync under the
+    /// caller's lock.
+    pub const fn cut_syncs(&self) -> u64 {
+        self.cut_syncs
+    }
+
+    /// How many slots the move bookkeeping names (with repeats) for the next
+    /// [`Self::delta_since`].
+    pub fn dirty_slot_count(&self) -> usize {
+        self.dirty_slots.len()
     }
 
     /// Sets how many blocks behind the head are kept.
@@ -1282,6 +1307,7 @@ impl QmdbForest {
         for hash in &chain {
             deltas.push(self.records.get_mut(hash)?.delta.take()?);
         }
+        self.logged_slots = cursor;
         Some(deltas)
     }
 
@@ -1573,6 +1599,7 @@ impl QmdbForest {
         self.dirty_slots.clear();
         self.dirty_slots_deduped = 0;
         self.min_cursor = next_slot;
+        self.logged_slots = next_slot;
         Ok(ForestDelta {
             version: ForestDelta::VERSION,
             head_number: self.head.0,
@@ -1633,7 +1660,9 @@ impl QmdbForest {
     /// common ancestor, re-applies down.
     fn move_to(&mut self, target: B256) -> Result<(), StateError> {
         self.refuse_leased()?;
-        let synced = self.flushed_slots;
+        // Below both what is synced and what the log holds: a cut above the
+        // logged cursor reverts only blocks no restart replays.
+        let synced = self.flushed_slots.min(self.logged_slots);
         if let Some((parent, undo)) = self.pending.take() {
             if let Err(err) = self.tree.apply_undo(&undo) {
                 // A refused undo left the pending block applied: it stays
@@ -1738,8 +1767,8 @@ impl QmdbForest {
                 .undo = Some(undo);
             self.tip = *hash;
         }
-        // The move cut the entry file below what was synced -- below the
-        // persisted head -- and rewrote those slots for this branch before
+        // The move cut the entry file below what was synced and logged --
+        // below the persisted head -- and rewrote those slots for this branch before
         // any delta says so (audit 2026-10 D-4). A crash from here until the
         // next delta is durable leaves a datadir the restart refuses (its
         // root check); syncing now settles which entries it finds. Rare: a
@@ -1747,6 +1776,7 @@ impl QmdbForest {
         if self.flushed_slots < synced && self.has_entry_file() {
             self.tree.sync_entries().map_err(|e| StateError::EntryFile(e.to_string()))?;
             self.flushed_slots = self.tree.next_slot();
+            self.cut_syncs += 1;
         }
         Ok(())
     }

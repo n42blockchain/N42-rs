@@ -1344,6 +1344,50 @@ fn a_failed_delta_append_loses_no_flip() {
     }
 }
 
+/// Audit 2026-10 round 2 (R2-R4): a block computed between the
+/// persistence's two holds (the next build) keeps its own move bookkeeping,
+/// and only its own: what the persisted deltas carried is not kept with it.
+#[test]
+fn a_build_between_the_persistence_holds_keeps_only_its_own_bookkeeping() {
+    let dirty = |state: &QmdbNodeState| state.lock_as("root_of").as_ref().expect("initialised").dirty_slot_count();
+    let (reference, _, _, _, _) = node_at("build-between-holds-reference", true, 4);
+    let prepared = reference.compute(hash_of(4), &changes_for(5)).expect("compute 5");
+    reference.insert(hash_of(5), 5, prepared).expect("insert 5");
+    let own = dirty(&reference);
+    assert!(own > 0, "block 5 retires a slot");
+
+    let (state, _, _, head3, _) = node_at("build-between-holds", true, 3);
+    let prepared = state.compute(head3, &changes_for(4)).expect("compute 4");
+    state.insert(hash_of(4), 4, prepared).expect("insert 4");
+    {
+        let state = state.clone();
+        set_between_persist_holds(Box::new(move || {
+            let prepared = state.compute(hash_of(4), &changes_for(5)).expect("compute 5");
+            state.insert(hash_of(5), 5, prepared).expect("insert 5");
+        }));
+    }
+    state.on_canonical(hash_of(4)).expect("canonical 4");
+    assert_eq!(dirty(&state), own, "block 4's bookkeeping went with its delta");
+}
+
+/// Audit 2026-10 round 2 (R2-Q4): reverting a block the log does not hold
+/// yet -- the next build, replaced by a sibling -- cuts nothing persisted,
+/// and does not fsync the entry file under the forest's lock; a cut below
+/// the persisted head still does (D-4).
+#[test]
+fn only_a_cut_below_the_logged_slots_syncs_the_entry_file() {
+    let syncs = |state: &QmdbNodeState| state.lock_as("root_of").as_ref().expect("initialised").cut_syncs();
+    let (state, _, _, head3, _) = node_at("cut-syncs", true, 3);
+    let prepared = state.compute(head3, &changes_for(4)).expect("compute 4");
+    state.insert(hash_of(4), 4, prepared).expect("insert 4");
+    state.with_forest("test", |forest| Ok(forest.flush_entries_for_sync()?.is_some())).expect("flush");
+    state.compute(head3, &wide_changes(44)).expect("a sibling of 4");
+    assert_eq!(syncs(&state), 0, "block 4 was never logged");
+
+    state.compute(hash_of(1), &wide_changes(45)).expect("a block on 1");
+    assert_eq!(syncs(&state), 1, "the cut went below the logged head 3");
+}
+
 /// Audit 2026-10 D-4: a move below the persisted head rewrites the entry
 /// file's slots before any delta says so. A process that dies there leaves
 /// the log on the old branch and the entries on the new one; the restart

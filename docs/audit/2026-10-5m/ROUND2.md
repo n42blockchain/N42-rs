@@ -55,3 +55,5 @@
 | R2-R1 | 已修:已导入块的 `ExecuteBlock` 快捷路径先 `remember_parent`(多一次哈希查找);测试 `a_proposed_block_the_pull_imported_has_its_parent_recorded` 修复前失败 |
 | R2-I4 | 已修(主体):自己块的导入无结论(错误/SYNCING/ACCEPTED)时按 0.2/0.5/1/2/4 s 退避重试,最终失败记 error;测试 `an_own_import_without_a_verdict_is_tried_again` 在无重试时失败。重试全部失败后仍留在 `imported`(追赶跳过它)未改,极端情况仍需重启 |
 | R2-I3 | 已修:`Rejected` 时丢掉该哈希的 body(store、compact、driver 缓存),下一份副本照常导入且不再转发伪造字节;EL 的 import-once 只保留 VALID 供后续请求复用(INVALID 是对所带字节的判决)。测试 `a_rejected_body_is_forgotten_so_the_next_copy_is_taken`、`only_a_valid_verdict_answers_later_requests` 修复前失败。未做:记录供应者、向其他 peer 重取 |
+| R2-I1 | 已修:未请求的 body 只在 `(tip, tip + far_ahead + 1]` 窗口内急切导入,低于全部记住高度的不算"首个";测试 `an_unsolicited_body_outside_the_tips_window_waits_for_a_proposal` 修复前失败。热路径代价:每个未请求 body 多一次 `imported_tip()`(几次哈希查找)。窗口外的 body 原本也会被 far-ahead 扣住,行为不变 |
+| R2-R2 | 未修:窗口内仍是先到先得,匿名 peer 抢占某高度会让诚实 leader 的块失去急切导入(只推迟到 proposal 到达时导入,不丢票)。根治要按 view leader 校验头部封印,另列 |

@@ -907,6 +907,41 @@ async fn a_second_unsolicited_body_at_a_height_waits_until_consensus_asks_for_it
     assert_eq!(rig.svc.received_bodies, vec![first, sibling, wanted]);
 }
 
+/// Audit 2026-10 round 2 (R2-I1): a body nobody asked for is imported at
+/// once only in the window just above the execution layer's tip. Below it the
+/// height is settled, and far above it the body would only be held; either
+/// way it waits for a proposal to name it. A height below every remembered one
+/// is not "first" either: it used to be inserted, read as first and evicted,
+/// so a stream of low heights took one import each.
+#[tokio::test]
+async fn an_unsolicited_body_outside_the_tips_window_waits_for_a_proposal() {
+    let mut rig = node(1, 0, None).await;
+    let gossip = |rig: &mut Rig, rlp: &alloy_primitives::Bytes| {
+        let data = compress_block_rlp(rlp).expect("snappy");
+        rig.svc.handle_transport_event(TransportEvent::Block { from: None, data }).expect("ok");
+    };
+    // No tip known yet: the remembered heights are full and a lower one comes.
+    for number in 1000..1256u64 {
+        rig.svc.unsolicited_heights.insert(number, B256::with_last_byte(1));
+    }
+    let (low, _, low_rlp) = block(5, B256::repeat_byte(3));
+    gossip(&mut rig, &low_rlp);
+    assert!(!rig.svc.ready_bodies.contains(&low), "below every remembered height");
+
+    rig.svc.unsolicited_heights.clear();
+    rig.svc.note_imported(10);
+    let (below, _, below_rlp) = block(8, B256::repeat_byte(4));
+    let (next, _, next_rlp) = block(11, B256::repeat_byte(5));
+    let (far, _, far_rlp) = block(40, B256::repeat_byte(6));
+    let (wanted, _, wanted_rlp) = block(7, B256::repeat_byte(7));
+    rig.svc.awaiting_bodies.insert(wanted);
+    for rlp in [&below_rlp, &next_rlp, &far_rlp, &wanted_rlp] {
+        gossip(&mut rig, rlp);
+    }
+    assert_eq!(rig.svc.ready_bodies, vec![next, wanted], "only the window, and what consensus waits for");
+    assert!(rig.svc.body_store.contains_key(&below) && rig.svc.body_store.contains_key(&far), "the rest is kept");
+}
+
 #[tokio::test]
 async fn a_gossiped_block_is_decoded_cached_and_raises_the_senders_height() {
     let mut rig = node(1, 0, None).await;

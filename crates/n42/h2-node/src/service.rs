@@ -4830,9 +4830,27 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// sends one body per height (two after a timeout), so a stream of
     /// self-consistent blocks nobody proposed takes at most one import slot
     /// per height instead of one per block (audit 2026-10 B-3).
+    ///
+    /// And only in the window just above the execution layer's tip: below it
+    /// the height is settled, far above it the body would only be held, and a
+    /// stream of self-consistent blocks at fresh low heights took one import
+    /// each, every one of them "first" (audit 2026-10 round 2, R2-I1). A
+    /// height below every remembered one is not first either: inserted, it
+    /// was read as first and then evicted.
     fn import_unsolicited(&mut self, block_hash: B256, number: u64) {
         /// Heights remembered; far more than the window a body is useful in.
         const REMEMBERED_HEIGHTS: usize = 256;
+        if !self.awaiting_bodies.contains(&block_hash) {
+            let in_window = self.imported_tip().is_none_or(|tip| {
+                number > tip && number <= tip.saturating_add(far_ahead_limit()).saturating_add(1)
+            });
+            let below_remembered = self.unsolicited_heights.len() >= REMEMBERED_HEIGHTS
+                && self.unsolicited_heights.first_key_value().is_some_and(|(lowest, _)| number < *lowest);
+            if !in_window || below_remembered {
+                debug!(target: "n42.h2.node", ?block_hash, number, tip = ?self.imported_tip(), "an unsolicited body outside the tip's window waits for a proposal to name it");
+                return;
+            }
+        }
         let first = *self.unsolicited_heights.entry(number).or_insert(block_hash);
         while self.unsolicited_heights.len() > REMEMBERED_HEIGHTS {
             self.unsolicited_heights.pop_first();

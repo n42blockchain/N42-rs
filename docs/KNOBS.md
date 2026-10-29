@@ -12,7 +12,7 @@ adopted stage sets X3..X22, the X22 base set (the loop351 `ALLA` line and its pe
 row noting "X22 base set: `value`"), and the tuned values whose compiled default differs. Two groups
 stay with the launcher: the `bench-only` rows the leg also passes (`N42_FRAME_GATEWAYS`,
 `N42_FRAME_ATTEST_MIN`, `N42_IMPORT_ONCE`, `N42_HASHED_TABLES=off`, `N42_QMDB_READS=on`,
-`N42_ACCOUNT_HISTORY=off`, `N42_SETTLEMENT_TAGS=legacy`, `N42_PERSIST_QMDB_IN_SCOPE=1`,
+`N42_ACCOUNT_HISTORY=off`, `N42_CANON_NOTIFY_LEAN=1`, `N42_SETTLEMENT_TAGS=legacy`, `N42_PERSIST_QMDB_IN_SCOPE=1`,
 `N42_STORAGE_OP_METRICS=0`, `N42_LOCK_SITES=1`), and the non-`N42_*` variables `MALLOC_CONF`,
 `TOKIO_WORKER_THREADS`, `RAYON_NUM_THREADS`. A knob whose Meaning says "Needs `frameBlocks` in the
 genesis" is chain-gated: once the chain spec is parsed, and before any such knob is read, the binary
@@ -333,7 +333,7 @@ Status caveat: `adopted` follows the stage sets named above plus the X22 base se
 | `N42_ACCOUNT_HISTORY` | unset: index written; off skips it | see Default | Whether the AccountsHistory index write is skipped (N42_ACCOUNT_HISTORY=off). Read once; on, any other value or no value writes it (reth's be... Bench-only: `off` drops the AccountsHistory index. | `storage/provider:providers/n42_persist.rs:118` | bench-only |
 | `N42_HASHED_TABLES` | unset: hashed state tables written (`off` stops them) | `off` | Whether the hashed state tables are no longer written (QMDB reader hooks). Read once. Bench-only: `off` is the bench's storage mode; a product node decides it separately. | `storage-api:n42_state.rs:81` | bench-only |
 | `N42_ACCOUNT_HISTORY_SCAN_MAX` | DEFAULT_ACCOUNT_HISTORY_SCAN_MAX | integer | (N42_ACCOUNT_HISTORY_SCAN_MAX overrides). A read that finds no change within that many blocks of a longer range returns an error that names the m... | `storage/provider:providers/n42_persist.rs:155` | default |
-| `N42_CANON_NOTIFY_LEAN` | off | `1` (or the knob's own value; see code) | Read once from N42_CANON_NOTIFY_LEAN (1 turns it on; default off). Measured in loop351 stage k (E=1, seven validator keys on one execution laye... | `chain-state:in_memory.rs:984` | adopted |
+| `N42_CANON_NOTIFY_LEAN` | off | `1` (or the knob's own value; see code) | Read once from N42_CANON_NOTIFY_LEAN (1 turns it on; default off). Measured in loop351 stage k (E=1, seven validator keys on one execution laye... Bench-only (audit 2026-10 E-1): notifications carry no execution outcome, so `logs`/receipt subscriptions, RPC caches and pool maintenance see nothing; was in X22 until 2026-10-28. | `chain-state:in_memory.rs:984` | bench-only |
 | `N42_OVERLAY_FILTER` | on (0 disables) | on unless `0` | Whether the filters are on (N42_OVERLAY_FILTER=0 turns them off; on by default). | `storage/provider:providers/state/overlay_filter.rs:61` | default |
 | `N42_OVERLAY_FILTER_CAP` | 1024 (floor 64) | integer | Max entries of the overlay filter side map. | `storage/provider:providers/state/overlay_filter.rs:55` | undocumented-before |
 | `N42_OVERLAY_READS` | local overlay (upstream selects reth overlay) | see Default | N42: N42_OVERLAY_READS=upstream reads state under in-memory blocks through upstream's flattened OverlayStateProvider instead of MemoryOverlaySt... | `storage/provider:providers/blockchain_provider.rs:63` | experimental |

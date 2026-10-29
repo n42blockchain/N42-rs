@@ -98,8 +98,9 @@ pub const X22: &[Knob] = &[
     k("N42_HANDOFF_NO_CLONE", "1"),
     // X4.
     k("N42_HANDOFF_MOVE_BODY", "1"),
-    // X5.
-    k("N42_CANON_NOTIFY_LEAN", "1"),
+    // X5's `N42_CANON_NOTIFY_LEAN` is bench-only (canonical notifications
+    // without execution outcomes starve logs, receipts and pool upkeep) and
+    // stays with the launcher.
     // X6.
     k("N42_QUEUE_OFFLOCK", "1"),
     // X7.

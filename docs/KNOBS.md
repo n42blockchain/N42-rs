@@ -10,7 +10,7 @@ file differ, so changing a row's status means changing the profile in the same c
 2026-10-27 the profile reproduces the node-side environment of an X22 leg (loop351 stage fl): the
 adopted stage sets X3..X22, the X22 base set (the loop351 `ALLA` line and its per-leg additions, each
 row noting "X22 base set: `value`"), and the tuned values whose compiled default differs. Two groups
-stay with the launcher: the `bench-only` rows the leg also passes (`N42_FRAME_GATEWAYS`,
+stay with the launcher: the `bench-only` rows the leg also passes (`N42_BENCH_UNSAFE`, which the gateway and the direct ingest need, `N42_FRAME_GATEWAYS`,
 `N42_FRAME_ATTEST_MIN`, `N42_IMPORT_ONCE`, `N42_HASHED_TABLES=off`, `N42_QMDB_READS=on`,
 `N42_ACCOUNT_HISTORY=off`, `N42_CANON_NOTIFY_LEAN=1`, `N42_SETTLEMENT_TAGS=legacy`, `N42_PERSIST_QMDB_IN_SCOPE=1`,
 `N42_STORAGE_OP_METRICS=0`, `N42_LOCK_SITES=1`), and the non-`N42_*` variables `MALLOC_CONF`,

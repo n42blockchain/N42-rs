@@ -59,8 +59,13 @@ fn main() {
             .chain_spec()
             .is_some_and(|spec| reth_chainspec::qmdb::frame_blocks_enabled(&spec.genesis)),
     };
-    // SAFETY: still single-threaded: parsing the command line spawns no
-    // thread, and nothing else reads or writes the environment.
+    // SAFETY: no thread of this program reads or writes the environment
+    // concurrently. Parsing the command line is not thread-free on a QMDB
+    // chain: the chain parser computes the genesis root, which can start
+    // rayon's global pool (`N42_QMDB_PARALLEL_APPLY`), but those workers run
+    // only the tree's hashing and are idle here; Rust's own environment
+    // accesses are serialised by std's lock, and no C library code on them
+    // calls `getenv` (audit 2026-10 E-9).
     unsafe { n42_env::profile::reconcile_and_report("n42", features) };
     // `N42_INGEST_VERIFY=shard` without a well-formed `N42_INGEST_SHARD=<i>/<n>`
     // would silently verify everything (or nothing); refuse to start instead.

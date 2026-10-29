@@ -1349,7 +1349,7 @@ fn build_start_fields(
 /// set on the execution layer, which serves the request. Off by default.
 fn tenure_first_on_output() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_TENURE_FIRST_ON_OUTPUT").is_ok_and(|value| value == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_TENURE_FIRST_ON_OUTPUT", false))
 }
 
 const fn head_stamp(remembered: Option<u64>, header: Option<&Header>) -> Option<u64> {
@@ -5771,7 +5771,7 @@ async fn txns_from_execution_layer<E: ExecutionLayer>(
 /// the fleet's logs (all on one clock when the fleet is on one box).
 /// `N42_VOTE_AGGREGATE_VERIFY=1`: batched vote verification on a leader.
 fn vote_aggregate_from_env() -> bool {
-    std::env::var("N42_VOTE_AGGREGATE_VERIFY").is_ok_and(|v| v == "1")
+    n42_env::flag("N42_VOTE_AGGREGATE_VERIFY", false)
 }
 
 fn trace_messages() -> bool {

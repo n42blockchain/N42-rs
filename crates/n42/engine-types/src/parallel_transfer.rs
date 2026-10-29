@@ -681,7 +681,7 @@ pub fn partition(txs: &[TxEnv], beneficiary: Address) -> Result<(Vec<Vec<usize>>
 /// back, which is exactly what a leg has to confirm.
 pub fn partition_hash() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_PARTITION_HASH").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_PARTITION_HASH", false))
 }
 
 /// A 64-bit hash of an address, for [`partition_shared`]'s duplicate search.
@@ -1899,7 +1899,7 @@ impl<T> BuildRun<T> {
 /// by default until a four-node leg measures it.
 pub fn build_collect_in_place() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_BUILD_COLLECT_IN_PLACE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_BUILD_COLLECT_IN_PLACE", false))
 }
 
 /// Folds bundles that were each computed against the parent's state into
@@ -4339,7 +4339,7 @@ where
 /// check and the wait for the parent, instead of inside the execution gate.
 pub fn follower_partition_ahead() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_PARTITION_AHEAD").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_PARTITION_AHEAD", false))
 }
 
 /// Whether `N42_FOLLOWER_MERGE_BEHIND=1` is set: with the streamed graft, the
@@ -4418,7 +4418,7 @@ fn graft_base_swap() -> bool {
 /// Nothing reads any of it again, so the only cost is a job on the pool.
 pub fn free_async() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_FREE_ASYNC").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_FREE_ASYNC", false))
 }
 
 /// Whether `N42_FOLLOWER_GRAFT=1` is set: the follower folds the groups'
@@ -4428,7 +4428,7 @@ pub fn free_async() -> bool {
 /// accounts).
 pub fn follower_graft() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_GRAFT").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_GRAFT", false))
 }
 
 /// A block's transfers planned ahead of their execution: the transactions'
@@ -4898,7 +4898,7 @@ where
 /// default.
 pub fn follower_build_path() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_BUILD_PATH").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_BUILD_PATH", false))
 }
 
 /// A block executed on the build path ([`execute_transfers_build_path`]):

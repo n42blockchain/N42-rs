@@ -180,7 +180,7 @@ impl std::fmt::Debug for DeferredChain {
 
 /// `N42_BUILD_AHEAD_AT_SEAL=1`: see [`ChainState::defer_refused`]. Default off.
 fn build_ahead_at_seal() -> bool {
-    std::env::var("N42_BUILD_AHEAD_AT_SEAL").is_ok_and(|value| value == "1")
+    n42_env::flag("N42_BUILD_AHEAD_AT_SEAL", false)
 }
 
 /// `N42_BUILD_AHEAD_GATE=seal|qc|send`: what lets the chain start block N

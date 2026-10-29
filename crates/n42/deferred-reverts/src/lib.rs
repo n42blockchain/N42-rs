@@ -38,7 +38,7 @@ const WAIT: Duration = Duration::from_secs(30);
 pub fn answer_before_reverts() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("N42_ANSWER_BEFORE_REVERTS").is_ok_and(|v| v == "1");
+        let on = n42_env::flag("N42_ANSWER_BEFORE_REVERTS", false);
         tracing::info!(target: "n42.deferred_reverts", answer_before_reverts = on, "N42_ANSWER_BEFORE_REVERTS");
         on
     })
@@ -53,7 +53,7 @@ pub fn answer_before_reverts() -> bool {
 pub fn register_free_offlock() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("N42_REGISTER_FREE_OFFLOCK").is_ok_and(|v| v == "1");
+        let on = n42_env::flag("N42_REGISTER_FREE_OFFLOCK", false);
         tracing::info!(target: "n42.deferred_reverts", register_free_offlock = on, "N42_REGISTER_FREE_OFFLOCK");
         on
     })

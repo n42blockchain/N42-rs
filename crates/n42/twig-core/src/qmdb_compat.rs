@@ -991,7 +991,7 @@ pub fn parallel_apply() -> bool {
 /// `N42_QMDB_PARALLEL_APPLY` as the environment sets it, read once.
 pub fn parallel_apply_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_QMDB_PARALLEL_APPLY").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_QMDB_PARALLEL_APPLY", false))
 }
 
 std::thread_local! {
@@ -1006,7 +1006,7 @@ std::thread_local! {
 pub fn root_upper_dirty() -> bool {
     ROOT_UPPER_DIRTY_HERE.try_with(std::cell::Cell::get).ok().flatten().unwrap_or_else(|| {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("N42_ROOT_UPPER_DIRTY").is_ok_and(|v| v.trim() == "1"))
+        *ON.get_or_init(|| n42_env::flag("N42_ROOT_UPPER_DIRTY", false))
     })
 }
 

@@ -198,7 +198,7 @@ fn lag_blocks(pruned: u64) -> u64 {
 /// Whether the pruner runs on its own thread (`N42_QUEUE_PRUNE_THREAD=1`,
 /// off by default).
 pub fn on_own_thread() -> bool {
-    std::env::var("N42_QUEUE_PRUNE_THREAD").is_ok_and(|v| v == "1")
+    n42_env::flag("N42_QUEUE_PRUNE_THREAD", false)
 }
 
 /// One canonical notification's prune: a reorg's reverted transactions

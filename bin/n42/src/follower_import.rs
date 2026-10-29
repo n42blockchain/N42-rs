@@ -1701,7 +1701,7 @@ impl ExecSplit {
 /// hand-off -- waits for it where it reads it ([`LateBlock`]).
 pub fn copy_aside() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_COPY_ASIDE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_COPY_ASIDE", false))
 }
 
 /// The owned block a [`DescribedAside`] is made into beside the import, and
@@ -3738,7 +3738,7 @@ fn root_hashed_parallel() -> bool {
 /// execution's batches, queued on the worker pool, do not hold the vote.
 fn exec_early() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_EXEC_EARLY").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_EXEC_EARLY", false))
 }
 
 /// A small pool of its own, sized by `var` (default `default`), or `None` if
@@ -3780,7 +3780,7 @@ fn on_check_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
 /// bundle, filed under the same hash; only where and when it runs moves.
 fn fields_early() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_FIELDS_EARLY").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_FIELDS_EARLY", false))
 }
 
 /// Runs the early QMDB root's hashing on its own pool
@@ -3814,7 +3814,7 @@ fn on_root_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
 /// `N42_FOLLOWER_ROOT_ON_BUILD_POOL=1` ([`on_root_pool`]), read once.
 fn root_on_build_pool() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_ROOT_ON_BUILD_POOL").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_ROOT_ON_BUILD_POOL", false))
 }
 
 /// Milliseconds from `from` to `to`, zero if `to` is earlier.
@@ -3825,7 +3825,7 @@ fn ms_between(from: std::time::Instant, to: std::time::Instant) -> u64 {
 /// `N42_FOLLOWER_PARALLEL`, read once.
 fn follower_parallel() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_PARALLEL").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_PARALLEL", false))
 }
 
 /// Whether the parallel state commit is on (default; `N42_PARALLEL_STATE_COMMIT=0` turns it off): the QMDB leaf operations are

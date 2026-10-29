@@ -1413,7 +1413,7 @@ async fn build_on_own_block(
 /// now says so directly). Off by default.
 fn build_start_async() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_BUILD_START_ASYNC").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_BUILD_START_ASYNC", false))
 }
 
 /// An own block's hand-off ends: the block's transactions held until the
@@ -1448,7 +1448,7 @@ fn hold_and_signal(
 /// seal instead of at its `StateReady` (plan v6 attempt J). Off by default.
 fn build_on_output() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_BUILD_ON_OUTPUT").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_BUILD_ON_OUTPUT", false))
 }
 
 /// `N42_TENURE_FIRST_ON_OUTPUT=1` (defect 18b, `docs/FLEET7_PLAN_V4.md`
@@ -1458,7 +1458,7 @@ fn build_on_output() -> bool {
 /// build of its tenure. Off by default.
 fn tenure_first_on_output() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_TENURE_FIRST_ON_OUTPUT").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_TENURE_FIRST_ON_OUTPUT", false))
 }
 
 /// How long the first build of a tenure waits for this node's follower

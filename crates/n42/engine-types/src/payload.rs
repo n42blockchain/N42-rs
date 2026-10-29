@@ -694,7 +694,7 @@ pub fn seal_first() -> bool {
 /// parent's. Off by default.
 pub fn seal_at_exec() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_SEAL_AT_EXEC").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_SEAL_AT_EXEC", false))
 }
 
 /// `N42_SHARDS_READY_FIRST=1` (docs/SEALED_AT_FLOOR.md candidate 1): on a
@@ -709,7 +709,7 @@ pub fn seal_at_exec() -> bool {
 pub fn shards_ready_first() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("N42_SHARDS_READY_FIRST").is_ok_and(|v| v == "1");
+        let on = n42_env::flag("N42_SHARDS_READY_FIRST", false);
         tracing::info!(target: "payload_builder", shards_ready_first = on, "N42_SHARDS_READY_FIRST");
         on
     })
@@ -729,7 +729,7 @@ pub fn seal_on_counters() -> bool {
     *ON.get_or_init(|| {
         ["N42_SEAL_ON_COUNTERS", "N42_SEAL_ON_COUNTS"]
             .iter()
-            .any(|name| std::env::var(name).is_ok_and(|v| v.trim() == "1"))
+            .any(|name| n42_env::flag(name, false))
     })
 }
 
@@ -744,7 +744,7 @@ pub fn seal_on_counters() -> bool {
 /// the same call on the same input either way. Off by default.
 pub fn freeze_after_seal() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FREEZE_AFTER_SEAL").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FREEZE_AFTER_SEAL", false))
 }
 
 /// `N42_ROOT_OPS_AHEAD=1` (`docs/SHARED_EXECUTION_SCOPE.md` 15): with the
@@ -758,7 +758,7 @@ pub fn freeze_after_seal() -> bool {
 /// Off by default.
 pub fn root_ops_ahead() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_ROOT_OPS_AHEAD").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_ROOT_OPS_AHEAD", false))
 }
 
 /// `N42_ROOT_OPS_BEFORE_GATE=1` (`docs/ROOT_FIELDS_RACE.md` option B): on
@@ -771,7 +771,7 @@ pub fn root_ops_ahead() -> bool {
 /// waits for the gate. The same operations and root either way. Off by default.
 pub fn root_ops_before_gate() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_ROOT_OPS_BEFORE_GATE").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_ROOT_OPS_BEFORE_GATE", false))
 }
 
 /// The shards' operations encoded ahead ([`root_ops_ahead`]), and when they
@@ -836,7 +836,7 @@ fn spawn_freeze(shards: crate::output_shards::OutputShards) -> Result<LateFreeze
 /// take the parallel step, the state is opened where it always was.
 pub fn state_after_pull() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_STATE_AFTER_PULL").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_STATE_AFTER_PULL", false))
 }
 
 /// The builder's database over the parent's state: the provider in `slot`,
@@ -1036,7 +1036,7 @@ fn cumulative_gas(
 /// leader's serial seal chain.
 fn receipts_on_build_pool() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_RECEIPTS_ON_BUILD_POOL").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_RECEIPTS_ON_BUILD_POOL", false))
 }
 
 /// The pool a block's receipts are built on: the build pool
@@ -1079,7 +1079,7 @@ fn receipts_from_slots<P: PoolTransaction<Consensus = TransactionSigned>>(
 /// only 8.7 -> 8.0 ms (10.200): the serial walks are the suspect.
 fn receipts_fused() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_RECEIPTS_FUSED").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_RECEIPTS_FUSED", false))
 }
 
 /// Where a receipts job's time went, us: the slots' references, the

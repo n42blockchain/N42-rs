@@ -23,7 +23,10 @@ removes it again when the profile set it on a chain whose genesis does not set `
 **Truthiness (since the knob-profile branch).** Every former presence-only and `!= "0"` switch is read
 by `n42_env::flag`: on = `1|true|on|yes`, off = `0|false|off|no|""` (case-insensitive, trimmed),
 anything else warns once and reads the default; so notes 4-5 below describe the tree before it.
-The `== "1"` switches are unchanged.
+Since audit 2026-10 E-10 every switch the x22 profile sets to `1` is read the same way (a test in
+`crates/n42/env/src/profile.rs` scans the sources for one compared with `== "1"`); other `== "1"`
+switches are unchanged. **An empty value is off**, also for a default-on switch: `NAME=` turns off
+`N42_PARALLEL_STATE_COMMIT` or `N42_FOLLOWER_EXEC_GATE`, where unsetting the variable keeps the default.
 
 1. Generated from an audit of the tree at commit 393cc1e70 (audit/maturity-2026-10): 273 knobs, plus the four the hardening branches added (`N42_TX_INGEST_ALLOW_REMOTE`, `N42_PAYLOAD_SERVE_ALLOW_REMOTE`, `N42_BENCH_UNSAFE`, `N42_RAW_CHANNEL_TIMEOUT_MS`) read by code under bin/n42, crates/n42, crates/chain-state and crates/storage; none is read from a config file or CLI flag.
 2. Almost every knob is read once, behind a `OnceLock`/`static`, at first use. Set it in the environment before the process starts; changing it afterwards has no effect. A few are read at service construction without a cache ("startup"), still once per process.

@@ -1160,7 +1160,7 @@ pub fn find_or_take_sealed(sealed_hash: B256, transactions: usize) -> Option<Sea
 /// Whether `N42_ENGINE_TAKE_SEALED=1` is set; see [`find_or_take_sealed`].
 pub fn take_sealed_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_ENGINE_TAKE_SEALED").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_ENGINE_TAKE_SEALED", false))
 }
 
 /// Serialises every test that files builds: the stores are process-global and

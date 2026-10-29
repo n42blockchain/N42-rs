@@ -170,7 +170,7 @@ fn store() -> &'static Mutex<Store> {
 /// check reads the sums.
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_FRAME_SCAN").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_FRAME_SCAN", false))
 }
 
 /// Files a frame's summary under its id.

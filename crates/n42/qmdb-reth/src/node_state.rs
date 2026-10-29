@@ -211,7 +211,7 @@ fn trim_twigs() -> bool {
 /// the tree waits for it ([`TREE_FREE_LABELS`]).
 fn compute_offlock_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_QMDB_COMPUTE_OFFLOCK").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_QMDB_COMPUTE_OFFLOCK", false))
 }
 
 /// `N42_QMDB_CANONICAL_DEFER=1` (default off): a canonical head that
@@ -263,7 +263,7 @@ pub fn canonical_fatal() -> bool {
 /// view block by block outside it, instead of one hold per block.
 fn persist_batch_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_QMDB_PERSIST_BATCH").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_QMDB_PERSIST_BATCH", false))
 }
 
 /// The lock labels that never read the tree, so they do not wait for one
@@ -459,7 +459,7 @@ fn try_queue_release<T: Send>(sender: &std::sync::mpsc::SyncSender<T>, value: T)
 
 fn entry_file_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_QMDB_ENTRY_FILE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_QMDB_ENTRY_FILE", false))
 }
 
 const ENTRY_FILE: &str = "entries.log";

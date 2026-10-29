@@ -264,7 +264,7 @@ pub fn frame_walk_refuse_indexed() -> bool {
 /// ([`note_whole_take`]). Off by default.
 pub fn plan_ahead_body() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_PLAN_AHEAD_BODY").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_PLAN_AHEAD_BODY", false))
 }
 
 /// Whether the build asks for the plan's prepared body: the switch and every
@@ -408,7 +408,7 @@ std::thread_local! {
 /// through the puller thread. Off by default.
 pub fn pull_by_frames() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_PULL_BY_FRAMES").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_PULL_BY_FRAMES", false))
 }
 
 /// Says whether the build about to select on this thread can take its

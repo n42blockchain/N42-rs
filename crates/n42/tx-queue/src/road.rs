@@ -328,7 +328,7 @@ pub(crate) struct RoadSender {
 /// `refused_unknown` ~40,000 per 5 s after the one flush).
 fn reseed_at_flush() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_ROAD_RESEED_AT_FLUSH").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_ROAD_RESEED_AT_FLUSH", false))
 }
 
 /// `N42_ROAD_STUCK_LEGACY=1` (off by default): the stuck flush fires on the

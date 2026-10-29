@@ -93,7 +93,7 @@ pub fn output_shards() -> usize {
 /// conflicts). `0`, unset or anything else: the v4 fold. Read once.
 pub fn output_index() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_OUTPUT_INDEX").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_OUTPUT_INDEX", false))
 }
 
 /// `N42_OUTPUT_INDEX_LIVE=1` (index mode only): each batch enters its
@@ -112,7 +112,7 @@ pub fn output_index() -> bool {
 /// 535-637 ms a block; an entry here is 22 bytes). Read once.
 pub fn output_index_live() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_OUTPUT_INDEX_LIVE").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_OUTPUT_INDEX_LIVE", false))
 }
 
 /// `N42_OUTPUT_INCREMENTAL=1` (live index only, with `N42_FREEZE_AFTER_SEAL=1`;
@@ -150,7 +150,7 @@ pub fn output_incremental() -> bool {
 /// at a shard is as arbitrary as before). Off by default. Read once.
 pub fn live_index_defer() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_LIVE_INDEX_DEFER").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_LIVE_INDEX_DEFER", false))
 }
 
 /// `N42_MERGE_AT_SHARDS_READY=1` (off by default,
@@ -192,7 +192,7 @@ pub fn merge_split() -> bool {
 pub fn merge_elide() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let asked = std::env::var("N42_MERGE_ELIDE").is_ok_and(|v| v.trim() == "1");
+        let asked = n42_env::flag("N42_MERGE_ELIDE", false);
         let refusal = asked.then(merge_elide_refusal).flatten();
         if let Some(refusal) = refusal {
             tracing::warn!(target: "payload_builder", refusal, "N42_MERGE_ELIDE refused: the leader merges its output as before");
@@ -444,7 +444,7 @@ fn add_delta(staged: &mut revm::state::AccountInfo, account: &BundleAccount) {
 /// sub-ranges -- reads the same switch. Read once.
 pub fn shard_mix() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_SHARD_MIX").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_SHARD_MIX", false))
 }
 
 /// A deterministic 64-bit mix of all twenty bytes of `address` (three words

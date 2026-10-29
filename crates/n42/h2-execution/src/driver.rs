@@ -197,7 +197,7 @@ pub fn vote_before_slot() -> bool {
 /// `N42_IMPORT_ONCE`, where several validator keys share one execution layer.
 pub fn check_before_slot() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_CHECK_BEFORE_SLOT").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_CHECK_BEFORE_SLOT", false))
 }
 
 /// Blocks a check-ahead may queue past the in-flight cap before the service's
@@ -852,7 +852,7 @@ pub struct ExecutionDriver<E> {
 /// takes the `NEW_PAYLOAD` path it always took.
 pub fn body_once() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_BODY_ONCE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_BODY_ONCE", false))
 }
 
 /// `N42_COMPACT_BODY`, read once: opt-in, and read on the leader's side,
@@ -869,8 +869,8 @@ pub fn body_once() -> bool {
 pub fn compact_body() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        (std::env::var("N42_COMPACT_BODY").is_ok_and(|v| v == "1")
-            || std::env::var("N42_BLOCK_BY_DESCRIPTION").is_ok_and(|v| v == "1"))
+        (n42_env::flag("N42_COMPACT_BODY", false)
+            || n42_env::flag("N42_BLOCK_BY_DESCRIPTION", false))
             && body_once()
     })
 }
@@ -916,7 +916,7 @@ pub async fn import_own<E: ExecutionLayer + ?Sized>(
 /// by the sealed header ([`crate::ExecutionLayer::own_block_body`]).
 pub fn take_compact() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_TAKE_COMPACT").is_ok_and(|v| v == "1") && compact_body())
+    *ON.get_or_init(|| n42_env::flag("N42_TAKE_COMPACT", false) && compact_body())
 }
 
 /// `N42_ANSWER_LAYOUT_ONLY`, read once: the proposer tells its execution
@@ -933,7 +933,7 @@ pub fn take_compact() -> bool {
 /// them too.
 pub fn answer_layout_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_ANSWER_LAYOUT_ONLY").is_ok_and(|v| v == "1") && take_compact())
+    *ON.get_or_init(|| n42_env::flag("N42_ANSWER_LAYOUT_ONLY", false) && take_compact())
 }
 
 /// `N42_COMMIT_FCU_ASYNC`, read once: opt-in, and only the *default* for a
@@ -942,7 +942,7 @@ pub fn answer_layout_only() -> bool {
 /// for them.
 pub fn commit_fcu_async() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_COMMIT_FCU_ASYNC").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_COMMIT_FCU_ASYNC", false))
 }
 
 /// Releases a deferred block's vote: the execution layer said the header

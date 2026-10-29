@@ -457,6 +457,49 @@ pub unsafe fn apply_or_exit(binary: &str) -> Option<Applied> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Audit 2026-10 E-10: a profile switch (value `1`) is read with
+    /// [`crate::flag`] everywhere, so `true` and `1` mean the same for every
+    /// knob of one profile. Scans the workspace's own sources for a read of
+    /// one compared with a string instead.
+    #[test]
+    fn every_profile_switch_is_read_as_a_flag() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let switches: Vec<&str> = X22.iter().filter(|knob| knob.value == "1").map(|knob| knob.name).collect();
+        let mut files = Vec::new();
+        let mut dirs = vec![root.join("crates/n42"), root.join("bin/n42")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    if !path.ends_with("target") {
+                        dirs.push(path);
+                    }
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        let mut offenders = Vec::new();
+        for path in files {
+            let text = std::fs::read_to_string(&path).unwrap();
+            for name in &switches {
+                let quoted = format!("\"{name}\"");
+                let mut from = 0;
+                while let Some(at) = text[from..].find(&quoted) {
+                    let start = from + at;
+                    let statement = &text[start..text[start..].find(';').map_or(text.len(), |end| start + end)];
+                    if statement.contains("== \"1\"") {
+                        offenders.push(format!("{}: {name}", path.display()));
+                    }
+                    from = start + quoted.len();
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "profile switches read with == \"1\":
+{}", offenders.join("
+"));
+    }
     use super::*;
     use crate::test_env::{lock, set, unset};
     use std::collections::{BTreeSet, HashSet};

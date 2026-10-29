@@ -33,7 +33,7 @@ use tracing::{info, warn};
 /// off by default).
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_ROAD_RUNTIME").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_ROAD_RUNTIME", false))
 }
 
 /// Async workers of the road's runtime: `N42_ROAD_RUNTIME_WORKERS`, 4 by default,

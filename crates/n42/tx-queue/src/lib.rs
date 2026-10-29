@@ -483,7 +483,7 @@ pub struct PruneInput<'a> {
 pub fn prune_lean() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("N42_PRUNE_LEAN").is_ok_and(|v| v == "1");
+        let on = n42_env::flag("N42_PRUNE_LEAN", false);
         tracing::info!(target: "n42.tx_queue", prune_lean = on, "N42_PRUNE_LEAN");
         on
     })
@@ -739,7 +739,7 @@ pub fn release_replaced_own_blocks() -> bool {
 pub fn handoff_done_first() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("N42_HANDOFF_DONE_FIRST").is_ok_and(|v| v == "1");
+        let on = n42_env::flag("N42_HANDOFF_DONE_FIRST", false);
         tracing::info!(target: "n42.tx_queue", handoff_done_first = on, "N42_HANDOFF_DONE_FIRST");
         on
     })
@@ -1576,7 +1576,7 @@ pub fn take_ahead_discards() -> Vec<(&'static str, u64)> {
 /// right after its own ([`Prepared`]). Off by default.
 pub fn plan_ahead() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_PLAN_AHEAD").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_PLAN_AHEAD", false))
 }
 
 /// `N42_PLAN_AHEAD_WAIT_MS=<ms>`, read once (unset or 0: off). With
@@ -1614,7 +1614,7 @@ const AHEAD_LOOP_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 /// the one-hold path's. A test sets it per queue ([`TxQueue::with_offlock`]).
 fn queue_offlock() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_QUEUE_OFFLOCK").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_QUEUE_OFFLOCK", false))
 }
 
 /// Senders whose lanes one hold of an off-lock prune splits
@@ -1663,7 +1663,7 @@ fn drain_chunk() -> usize {
 fn drain_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("N42_TX_QUEUE_DRAIN_RUNS").is_ok_and(|v| v == "1");
+        let on = n42_env::flag("N42_TX_QUEUE_DRAIN_RUNS", false);
         tracing::info!(target: "n42.tx_queue", drain_runs = on, "N42_TX_QUEUE_DRAIN_RUNS");
         on
     })
@@ -1691,7 +1691,7 @@ fn run_length() -> usize {
 /// road reads the same index, by reference instead of by copy.
 fn compact_body() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_COMPACT_BODY").is_ok_and(|v| v == "1") || block_by_description())
+    *ON.get_or_init(|| n42_env::flag("N42_COMPACT_BODY", false) || block_by_description())
 }
 
 /// `N42_BLOCK_BY_DESCRIPTION`, read once: a follower checks a compact body
@@ -1702,7 +1702,7 @@ fn compact_body() -> bool {
 /// the index it needs cannot disagree about whether the index is kept.
 pub fn block_by_description() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_BLOCK_BY_DESCRIPTION").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_BLOCK_BY_DESCRIPTION", false))
 }
 
 /// `N42_SENDERS_FROM_QUEUE`, read once: a follower takes the senders of a

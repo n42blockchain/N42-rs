@@ -225,8 +225,11 @@ pub const X22: &[Knob] = &[
     k("N42_ALTSIG_SENDER_CACHE", "4194304"),
     k("N42_BUILD_THROTTLE_SOFT", "48"),
     k("N42_BUILD_THROTTLE_HARD", "80"),
-    // X22 base: votes and the local GossipSub queue bounds.
-    k("N42_VOTE_TRANSPORT", "direct"),
+    // X22 base: votes and the local GossipSub queue bounds. Direct votes
+    // skip the mesh, which a mixed fleet with gov5 members runs on
+    // (`h2-node/src/direct_votes.rs`): only on a frame-block chain, which
+    // no gov5 member can follow (audit 2026-10 E-5).
+    kf("N42_VOTE_TRANSPORT", "direct"),
     k("N42_VOTE_AGGREGATE_VERIFY", "1"),
     k("N42_GOSSIP_HANDLER_QUEUE", "64"),
     k("N42_GOSSIP_MAX_IHAVE", "500"),
@@ -556,7 +559,8 @@ mod tests {
         assert_eq!(unsafe { apply() }, Ok(None));
     }
 
-    const FRAME_GATED: [&str; 12] = [
+    // Audit 2026-10 E-5: N42_VOTE_TRANSPORT=direct is gated too.
+    const FRAME_GATED: [&str; 13] = [
         "N42_PLAN_AHEAD_WAIT_MS",
         "N42_FRAME_ROAD",
         "N42_ROAD_RESEED_AT_FLUSH",
@@ -569,6 +573,7 @@ mod tests {
         "N42_FOLLOWER_FRAME_SCAN",
         "N42_ROAD_TAKEN_BOUND",
         "N42_ROAD_RETIRE_INDEX",
+        "N42_VOTE_TRANSPORT",
     ];
 
     #[test]

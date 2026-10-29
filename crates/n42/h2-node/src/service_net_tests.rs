@@ -349,7 +349,56 @@ async fn a_pulled_block_with_a_forged_parent_qc_ends_the_batch_and_its_peer_is_n
     rig.svc.note_peer_height(other, 10);
     within(rig.svc.consider_catch_up(&mut events)).await;
     let catch_up = rig.svc.catch_up.as_ref().expect("a pull from the other peer");
-    assert_eq!((catch_up.peer, catch_up.next), (other, 3));
+    // From block 2: its QC proves block 1, not block 2 itself (audit 2026-10
+    // A-7). Block 2 comes back as held and is skipped.
+    assert_eq!((catch_up.peer, catch_up.next), (other, 2));
+}
+
+/// Audit 2026-10 A-7: a header QC proves the block it names and the chain
+/// below it, not the block that carries it. A range server that copies one
+/// real QC into blocks it made up above the certified one gets them past the
+/// header check (gov5 accepts them too); they stay unproven for catch-up, and
+/// a pulled block is never committed, safe or finalized -- the one defence
+/// against such a chain is that only a commit settles a block.
+#[tokio::test]
+async fn a_header_qc_proves_the_chain_up_to_the_block_it_names_not_the_block_carrying_it() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    let peer = PeerId::random();
+    let quorum = [0, 1, 2];
+    let mut blocks: Vec<(B256, Header, alloy_primitives::Bytes)> = Vec::new();
+    let mut parent = B256::ZERO;
+    let mut real_qc = Vec::new();
+    for number in 1..=4u64 {
+        let qc = match number {
+            1 => Vec::new(),
+            2 => header_qc(&rig.svc, &keys, &quorum, 1, parent, parent),
+            3 => {
+                real_qc = header_qc(&rig.svc, &keys, &quorum, 2, parent, parent);
+                real_qc.clone()
+            }
+            // Made up above block 2: the same real QC, copied.
+            _ => real_qc.clone(),
+        };
+        let block = block_with_extra(number, parent, number, qc);
+        parent = block.0;
+        blocks.push(block);
+    }
+    catching_up(&mut rig, peer, 1, 4);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 4, step: 1 }, chunks(&blocks)));
+    import(&mut rig).await;
+
+    assert!(blocks.iter().all(|(hash, ..)| rig.svc.imported.contains(hash)), "every block passes the header check");
+    assert_eq!(rig.svc.unproven_from, Some(3), "only blocks 1 and 2 are certified");
+    assert_eq!(rig.svc.engine.last_committed_qc().view, 0, "a pulled block is not committed");
+    for call in rig.el.calls() {
+        if let ElCall::ForkchoiceUpdated(state) = call {
+            assert!(
+                blocks.iter().all(|(hash, ..)| *hash != state.safe_block_hash && *hash != state.finalized_block_hash),
+                "a pulled block is never safe or finalized: {state:?}"
+            );
+        }
+    }
 }
 
 /// Sections 6.6 and 6.9: a pulled block whose embedded QC names a view in an

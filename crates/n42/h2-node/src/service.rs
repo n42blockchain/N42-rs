@@ -475,9 +475,10 @@ pub struct H2Service<E> {
     /// Height of the last block the execution layer is known to have
     /// imported, once read; what "far ahead" is measured from.
     imported_height: Option<u64>,
-    /// The lowest height of range-pulled blocks imported on their parent
-    /// links alone (no header certificate this node could check) since the
-    /// last proof -- a verified header QC, or a commit at or above it. Until
+    /// The lowest height of range-pulled blocks no certificate has proven
+    /// since the last proof -- a verified header QC naming a block at or
+    /// above it (which proves the chain up to that block, not the block
+    /// carrying the QC: audit 2026-10 A-7), or a commit at or above it. Until
     /// then catch-up measures "behind" from the block below it, not from the
     /// execution layer's head: a range server feeding a node that is behind
     /// a chain it made up would otherwise leave every honest peer "not ahead"
@@ -4373,11 +4374,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                 };
                 match self.driver.import_pulled(block.execution_data()).await {
                     Ok(_) => {
-                        if proven {
-                            self.unproven_from = None;
-                        } else {
-                            self.unproven_from.get_or_insert(number);
-                        }
+                        // A verified header QC proves the chain up to the
+                        // block it names; this block, above it, is still
+                        // unproven (audit 2026-10 A-7).
+                        let from = match proven {
+                            Some(certified) => {
+                                self.unproven_from.filter(|from| *from > certified).unwrap_or(certified + 1)
+                            }
+                            None => self.unproven_from.unwrap_or(number),
+                        };
+                        self.unproven_from = Some(from.min(number));
                         self.remember_imported(hash);
                         self.note_imported(number);
                         self.remember_block(hash, &block.header);
@@ -4451,18 +4457,26 @@ impl<E: ExecutionLayer> H2Service<E> {
     ///   holds the headers. When this node knows no validator set for the
     ///   QC's view (a cold node, or one further behind than the epoch history
     ///   it keeps) the QC is unchecked and only the parent link is, as gov5's
-    ///   `verifyHeaderWithBatch` does; a pulled block never becomes `safe`
-    ///   either way.
+    ///   `verifyHeaderWithBatch` does.
+    ///
+    /// None of this authenticates the block itself: a header QC proves that a
+    /// quorum certified the block it names, and a range server can copy one
+    /// real QC into blocks it made up above that one (gov5 accepts them as
+    /// well). The defence is that a pulled block is head only -- never
+    /// committed, `safe` or `finalized` (the driver's `import_pulled`) --
+    /// until a commit-domain QC from live consensus names it or a
+    /// descendant, as gov5 canonicalizes only from a commit (audit 2026-10
+    /// A-7); and that catch-up keeps counting it as unproven.
     ///
     /// The seal is not checked: the live path does not check it either (a
     /// block is authenticated by the certificates on the wire, see
     /// `HotStuffConsensus`). A header without the `HotStuff` extra layout is
     /// refused on a gov5 chain and carries no certificate on another.
     ///
-    /// `Ok(true)` when a certificate verified (the chain below the block is
-    /// the one the validator set certified), `Ok(false)` when only the parent
-    /// link was checked.
-    fn check_pulled_block(&self, header: &Header) -> Result<bool, String> {
+    /// `Ok(Some(height))` when a certificate verified and names the block at
+    /// `height` on this block's parent chain (the chain up to it is the one
+    /// the validator set certified), `Ok(None)` when nothing was proven.
+    fn check_pulled_block(&self, header: &Header) -> Result<Option<u64>, String> {
         if let Some(prev) = self.catch_up.as_ref().and_then(|c| c.prev_hash)
             && header.parent_hash != prev
         {
@@ -4471,10 +4485,10 @@ impl<E: ExecutionLayer> H2Service<E> {
         let extra = match n42_h2_consensus::HeaderExtra::decode(&header.extra_data) {
             Ok(extra) => extra,
             Err(err) if self.header_profile == HeaderProfile::Gov5H2 => return Err(err.to_string()),
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(None),
         };
         if extra.qc.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         // gov5's `decodeHeaderExtra`: QC then seal, or (legacy) a QC alone.
         let wire = n42_h2_wire::h2_wire::decode_h2_qc(&extra.qc)
@@ -4493,12 +4507,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 number = header.number,
                 "validator set for the certificate's view is not known; only the parent link is checked"
             );
-            return Ok(false);
+            return Ok(None);
         };
         if qc.view == 0 {
-            return Ok(false);
+            return Ok(None);
         }
-        self.certified_is_an_ancestor(header, qc.block_hash).map(|()| true)
+        self.certified_is_an_ancestor(header, qc.block_hash)
     }
 
     /// After a restart: the height past which the execution layer holds
@@ -4520,15 +4534,16 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 
     /// Whether `certified` lies on `header`'s parent chain, walking the
-    /// headers this node holds. A certified block this node holds no header
-    /// for, or a walk that leaves the held headers before reaching its
-    /// height, is not a contradiction and passes: the QC itself verified.
-    fn certified_is_an_ancestor(&self, header: &Header, certified: B256) -> Result<(), String> {
+    /// headers this node holds: its height when the walk reaches it. A
+    /// certified block this node holds no header for, or a walk that leaves
+    /// the held headers before reaching its height, is not a contradiction
+    /// and passes, but proves nothing (`None`): the QC itself verified.
+    fn certified_is_an_ancestor(&self, header: &Header, certified: B256) -> Result<Option<u64>, String> {
         /// Steps the walk takes at most; a committed QC names a block one
         /// to a few heights below the header.
         const MAX_WALK: usize = 256;
         let Some(target) = self.block_headers.get(&certified).map(|h| h.number) else {
-            return Ok(());
+            return Ok(None);
         };
         if target >= header.number {
             return Err(format!("header QC certifies block {certified} at height {target}, not below {}", header.number));
@@ -4536,17 +4551,17 @@ impl<E: ExecutionLayer> H2Service<E> {
         let mut cursor = header.parent_hash;
         for _ in 0..MAX_WALK {
             if cursor == certified {
-                return Ok(());
+                return Ok(Some(target));
             }
             let Some(parent) = self.block_headers.get(&cursor) else {
-                return Ok(());
+                return Ok(None);
             };
             if parent.number <= target {
                 return Err(format!("header QC certifies block {certified}, not on this block's parent chain"));
             }
             cursor = parent.parent_hash;
         }
-        Ok(())
+        Ok(None)
     }
 
     fn finish_catch_up(&mut self, events: &mut Vec<ServiceEvent>, complete: bool) {

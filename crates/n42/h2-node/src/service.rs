@@ -2826,6 +2826,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.peer_heights.remove(&peer);
             }
             TransportEvent::VoteHello { peer, index, signature } => {
+                if !self.direct_votes.hello_worth_verifying(index, peer) {
+                    return Ok(());
+                }
                 let verified = n42_h2_primitives::BlsSignature::from_bytes(&signature).is_ok_and(|signature| {
                     self.engine
                         .verify_vote_hello(index, self.identity.genesis_hash, &peer.to_bytes(), &signature)

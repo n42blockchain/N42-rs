@@ -48,6 +48,10 @@ impl VoteTransport {
     }
 }
 
+/// Hello checks one peer gets per connection: one per validator it hosts,
+/// with room to spare.
+const MAX_HELLOS_PER_PEER: u32 = 4;
+
 /// Votes remembered for de-duplication.
 const DEDUPE_CAPACITY: usize = 8192;
 
@@ -58,6 +62,8 @@ type VoteKey = (bool, u64, u32, B256, [u8; 96]);
 pub struct DirectVotes {
     mode: VoteTransport,
     peers: HashMap<u32, PeerId>,
+    /// Hello checks each connected peer has had ([`Self::hello_worth_verifying`]).
+    hellos_tried: HashMap<PeerId, u32>,
     seen: HashSet<VoteKey>,
     order: VecDeque<VoteKey>,
     /// A direct vote has arrived: de-duplication is on from then.
@@ -97,9 +103,28 @@ impl DirectVotes {
         self.peers.insert(index, peer);
     }
 
+    /// Whether a hello from `peer` naming validator `index` is worth its BLS
+    /// check on the consensus loop.
+    /// Not on a node that sends no direct votes (the mapping is only read to
+    /// send them), not again for a mapping already learned, and at most
+    /// [`MAX_HELLOS_PER_PEER`] times a connection (audit 2026-10 round 2,
+    /// R2-I5).
+    pub fn hello_worth_verifying(&mut self, index: u32, peer: PeerId) -> bool {
+        if self.mode == VoteTransport::Gossip || self.peers.get(&index) == Some(&peer) {
+            return false;
+        }
+        let tried = self.hellos_tried.entry(peer).or_insert(0);
+        if *tried >= MAX_HELLOS_PER_PEER {
+            return false;
+        }
+        *tried += 1;
+        true
+    }
+
     /// Forgets every validator mapped to `peer` (it disconnected).
     pub fn forget_peer(&mut self, peer: &PeerId) {
         self.peers.retain(|_, p| p != peer);
+        self.hellos_tried.remove(peer);
     }
 
     /// Where validator `index`'s votes go directly, if known.
@@ -152,6 +177,30 @@ mod tests {
             voter,
             signature: key.sign(&view.to_be_bytes()),
         })
+    }
+
+    /// Audit 2026-10 round 2 (R2-I5): a hello costs a pairing on the consensus
+    /// loop, and any peer may send them at any rate. Checked only where it can
+    /// matter: never on a node that sends no direct votes, not again for a
+    /// mapping already learned, and a few times a connection at most.
+    #[test]
+    fn hellos_are_verified_only_where_they_can_matter() {
+        let peer = PeerId::random();
+        let mut gossip = DirectVotes::new(VoteTransport::Gossip);
+        assert!(!gossip.hello_worth_verifying(1, peer), "a gossip node never sends directly");
+
+        let mut direct = DirectVotes::new(VoteTransport::Direct);
+        assert!(direct.hello_worth_verifying(1, peer));
+        direct.learn(1, peer);
+        assert!(!direct.hello_worth_verifying(1, peer), "already learned");
+        let mut tried = 1;
+        while direct.hello_worth_verifying(2 + tried, peer) {
+            tried += 1;
+            assert!(tried <= MAX_HELLOS_PER_PEER, "bounded per connection");
+        }
+        assert_eq!(tried, MAX_HELLOS_PER_PEER);
+        direct.forget_peer(&peer);
+        assert!(direct.hello_worth_verifying(9, peer), "a new connection starts afresh");
     }
 
     #[test]

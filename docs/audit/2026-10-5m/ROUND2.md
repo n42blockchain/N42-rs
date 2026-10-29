@@ -62,3 +62,4 @@
 | R2-X3 | 已修:池路径只在每笔结果为 Ok/AlreadyImported 时记帧(每帧一次对结果的遍历,池路径非 5M 的 direct 路径);测试 `a_frame_the_pool_refused_is_not_indexed` 修复前失败 |
 | R2-X2 | 已修(上限):单笔 1 MiB → 256 KiB,单帧 64 MiB → 16 MiB,256 连接合计 ≤ 4 GiB;测试 `what_the_connections_can_hold_is_bounded` 修复前失败。未做:按字节的全局信号量、帧间空闲超时(端口默认只绑回环) |
 | R2-I7 | 已修:导入任务 panic/运行时丢失报 `NotYet`(重新请求)而非 `Invalid`;测试 `an_import_task_that_ends_without_a_verdict_reports_not_yet` 修复前失败,原测试改为新语义 |
+| R2-I5 | 已修:gossip 模式不验 hello、已学到的 (index, peer) 不再验、每连接每 peer 至多 4 次;测试 `hellos_are_verified_only_where_they_can_matter` 修复前失败 |

@@ -116,6 +116,14 @@ impl ForestCheckpoint {
     /// The layout this crate writes.
     pub const VERSION: u32 = 2;
 
+    /// The version a checkpoint is written at: 1 while nothing has been
+    /// relocated, so a binary without compaction can still restore it (a
+    /// rollback stays possible until the first compaction), 2 once
+    /// `relocated_len` has something to say.
+    pub const fn version_for(relocated_len: u64) -> u32 {
+        if relocated_len == 0 { 1 } else { Self::VERSION }
+    }
+
     /// Whether this crate reads a checkpoint of `version`.
     pub const fn reads(version: u32) -> bool {
         version == 1 || version == 2
@@ -947,13 +955,14 @@ impl QmdbForest {
     pub fn checkpoint(&mut self) -> Result<ForestCheckpoint, StateError> {
         let head = self.head.1;
         self.move_to(head)?;
+        let relocated_len = self.tree.relocated_len();
         Ok(ForestCheckpoint {
-            version: ForestCheckpoint::VERSION,
+            version: ForestCheckpoint::version_for(relocated_len),
             head_number: self.head.0,
             head_hash: head,
             next_slot: self.tree.next_slot(),
             active: self.tree.active_bits(),
-            relocated_len: self.tree.relocated_len(),
+            relocated_len,
         })
     }
 
@@ -2765,6 +2774,11 @@ mod tests {
         }
         let root = forest.root();
         let proof = forest.prove_account(probe).unwrap();
+        // Audit 2026-10 E-2: nothing relocated yet, so the checkpoint is one
+        // a binary without compaction reads (version 1), and rolling back to
+        // it stays possible until a compaction runs.
+        let before = forest.checkpoint().unwrap();
+        assert_eq!((before.version, before.relocated_len), (1, 0));
         let report = forest.compact_twigs(u64::MAX, 0.5, usize::MAX).unwrap();
         assert!(report.twigs >= 2, "{report:?}");
         assert_eq!(forest.root(), root);

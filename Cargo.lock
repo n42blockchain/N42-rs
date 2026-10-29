@@ -7339,6 +7339,7 @@ name = "n42-deferred-reverts"
 version = "2.1.5"
 dependencies = [
  "alloy-primitives 1.7.3",
+ "n42-env",
  "revm-database",
  "tracing",
 ]
@@ -7586,6 +7587,7 @@ dependencies = [
  "alloy-rpc-types-engine",
  "async-trait",
  "metrics",
+ "n42-env",
  "n42-h2-consensus",
  "n42-h2-primitives",
  "serde_json",

@@ -623,10 +623,36 @@ async fn an_own_import_is_tracked_while_it_runs_and_reported_when_the_block_is_v
     ] {
         let el = MockExecutionLayer::with_behaviour(behaviour);
         let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+        driver.set_own_import_backoff(vec![Duration::from_millis(1); 2]);
         let mut own = driver.take_own_imports().expect("channel");
         driver.spawn_import_own_block(&built);
         eventually("the import to end", || !driver.is_importing_own_block(&built.hash)).await;
         assert!(own.try_recv().is_err(), "nothing was reported");
+    }
+}
+
+/// Audit 2026-10 round 2 (R2-I4): an own import that ends without a verdict
+/// -- the layer was down or answered SYNCING for a moment -- is tried again.
+/// The service already counts the block as imported and the commit for it
+/// waits for exactly this report; without a retry the leader stayed wedged
+/// on its own block until a restart.
+#[tokio::test]
+async fn an_own_import_without_a_verdict_is_tried_again() {
+    let built = MockExecutionLayer::built_block(1);
+    for behaviour in [
+        MockBehaviour { new_payload_error: Some("down".into()), ..Default::default() },
+        MockBehaviour { new_payload_status: PayloadStatusEnum::Syncing, ..Default::default() },
+    ] {
+        let el = MockExecutionLayer::with_behaviour(behaviour);
+        let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+        driver.set_own_import_backoff(vec![Duration::from_millis(50); 20]);
+        let mut own = driver.take_own_imports().expect("channel");
+        driver.spawn_import_own_block(&built);
+        eventually("a first attempt", || el.calls().contains(&ElCall::NewPayload(built.hash))).await;
+        assert!(driver.is_importing_own_block(&built.hash), "still trying");
+        el.set_behaviour(MockBehaviour::default());
+        assert_eq!(tokio::time::timeout(Duration::from_secs(10), own.recv()).await.expect("in time"), Some(built.hash));
+        eventually("the marker to clear", || !driver.is_importing_own_block(&built.hash)).await;
     }
 }
 
@@ -642,7 +668,8 @@ async fn an_own_block_its_execution_layer_calls_invalid_is_counted() {
         (MockBehaviour { new_payload_error: Some("down".into()), ..Default::default() }, 0),
         (MockBehaviour::default(), 0),
     ] {
-        let driver = ExecutionDriver::new(MockExecutionLayer::with_behaviour(behaviour), GENESIS);
+        let mut driver = ExecutionDriver::new(MockExecutionLayer::with_behaviour(behaviour), GENESIS);
+        driver.set_own_import_backoff(vec![Duration::from_millis(1); 2]);
         driver.spawn_import_own_block(&built);
         eventually("the import to end", || !driver.is_importing_own_block(&built.hash)).await;
         assert_eq!(driver.own_blocks_refused(), refused);

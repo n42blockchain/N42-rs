@@ -53,3 +53,4 @@
 | R2-Q5 | 已修:`persisted_state_root` 重建的根与 `forest.roots` 记录比对,不符返回 `RestoredRootMismatch`;测试 `a_rebuilt_historical_root_is_checked_against_its_record` 修复前失败 |
 | R2-C1 | 部分已修:按 gov5 `handleFutureViewTimeout` 移植按发送者的最高未来超时 view,取第 f+1 高 view 跳入;测试 `scattered_future_timeouts_join_the_f_plus_first_highest_view` 修复前失败。入站 `high_tc` 的采纳(gov5 `processEmbeddedTC`)未做:每条消息多一次 TC 验证,需要缓存设计,另列 |
 | R2-R1 | 已修:已导入块的 `ExecuteBlock` 快捷路径先 `remember_parent`(多一次哈希查找);测试 `a_proposed_block_the_pull_imported_has_its_parent_recorded` 修复前失败 |
+| R2-I4 | 已修(主体):自己块的导入无结论(错误/SYNCING/ACCEPTED)时按 0.2/0.5/1/2/4 s 退避重试,最终失败记 error;测试 `an_own_import_without_a_verdict_is_tried_again` 在无重试时失败。重试全部失败后仍留在 `imported`(追赶跳过它)未改,极端情况仍需重启 |

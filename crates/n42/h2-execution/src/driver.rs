@@ -659,6 +659,18 @@ impl AheadBuild {
 
 /// Takes an own block off [`ExecutionDriver::is_importing_own_block`]'s set
 /// when its import task ends, however it ends.
+/// The pauses before each retry of an own import that ended without a verdict
+/// (an error, SYNCING or ACCEPTED): about eight seconds in all, past the raw
+/// channel's deadline during a page-cache stall or an execution layer's
+/// restart. See [`ExecutionDriver::spawn_import_own_block`].
+pub const OWN_IMPORT_BACKOFF: [std::time::Duration; 5] = [
+    std::time::Duration::from_millis(200),
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+];
+
 struct OwnImportDone {
     importing: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<B256>>>,
     hash: B256,
@@ -705,6 +717,9 @@ pub struct ExecutionDriver<E> {
     /// Own blocks the execution layer called invalid. See
     /// [`Self::own_blocks_refused`].
     own_refused: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The pauses before each retry of an own import that ended without a
+    /// verdict. See [`Self::set_own_import_backoff`].
+    own_import_backoff: std::sync::Arc<[std::time::Duration]>,
     /// **Bench only** (`N42_VOTE_BEFORE_IMPORT=1`): a follower's import runs
     /// on a task instead of being awaited by the loop, so the loop can vote
     /// on the next proposal while the block executes -- what deferred
@@ -1020,6 +1035,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             own_imports_rx: Some(own_imports_rx),
             own_importing: Default::default(),
             own_refused: Default::default(),
+            own_import_backoff: OWN_IMPORT_BACKOFF.into(),
             spawn_imports: false,
             deferred_execution_time: None,
             deferred_depth: 1,
@@ -1833,12 +1849,29 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let elided = built.elided.then_some(built.tx_count);
         let imported = self.own_imports.clone();
         let refused = std::sync::Arc::clone(&self.own_refused);
+        let backoff = std::sync::Arc::clone(&self.own_import_backoff);
         self.own_importing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(hash);
         let done = OwnImportDone { importing: std::sync::Arc::clone(&self.own_importing), hash };
         tokio::spawn(async move {
             let _done = done;
             let started = std::time::Instant::now();
-            match import_own(el.as_ref(), header.as_ref(), payload, elided).await {
+            // An outcome that is not a verdict -- the layer down or past its
+            // deadline, SYNCING, ACCEPTED -- is tried again: the service
+            // already counts the block as imported, and a commit answered
+            // SYNCING waits for this report (`own_block_imported`). Given up
+            // on, the leader stayed on its own block until a restart (audit
+            // 2026-10 round 2, R2-I4).
+            let mut outcome = import_own(el.as_ref(), header.as_ref(), payload.clone(), elided).await;
+            for (attempt, pause) in backoff.iter().enumerate() {
+                let verdict = matches!(&outcome, Ok(status) if status.status.is_valid() || status.status.is_invalid());
+                if verdict {
+                    break;
+                }
+                debug!(target: "n42.h2.el", block = ?hash, attempt = attempt + 1, ?pause, "own import ended without a verdict; trying again");
+                tokio::time::sleep(*pause).await;
+                outcome = import_own(el.as_ref(), header.as_ref(), payload.clone(), elided).await;
+            }
+            match outcome {
                 Ok(status) => {
                     info!(
                         target: "n42.h2.el",
@@ -1863,9 +1896,9 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                         );
                     }
                 }
-                Err(err) => warn!(
+                Err(err) => error!(
                     target: "n42.h2.el",
-                    block = ?hash, %err,
+                    block = ?hash, %err, attempts = backoff.len() + 1,
                     "our own execution layer would not take the block we built"
                 ),
             }
@@ -1935,6 +1968,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// calling invalid since start (also [`METRIC_OWN_BLOCK_REFUSED_TOTAL`]).
     pub fn own_blocks_refused(&self) -> u64 {
         self.own_refused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The pauses before each retry of an own import that ended without a
+    /// verdict (default [`OWN_IMPORT_BACKOFF`]); one retry per entry.
+    pub fn set_own_import_backoff(&mut self, pauses: Vec<std::time::Duration>) {
+        self.own_import_backoff = pauses.into();
     }
 
     /// The channel [`Self::spawn_import_own_block`] reports on, once.

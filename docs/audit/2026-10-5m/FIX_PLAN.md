@@ -72,4 +72,4 @@
 | 第 0 批 | 完成 |
 | 第 1 批 | 完成:D-1、D-2 为 2cba0a42f,B-1 为 5e6e8c677;复现测试修复前均失败、修复后通过;h2-node 与 qmdb-reth 全部测试通过(WSL2) |
 | 第 2 批 | 完成:B-7 为 892c549cc,B-2 为 624b4d1e3,C-1 为 d72c8a9d9(本分支);E-2 为 6a438c5f0(分支 `fix/qmdb-compact-stage2-audit`,基于 `origin/design/qmdb-compact-stage2`,E-3/E-6/E-7 也在那里修) |
-| 第 3 批 | 进行中:A-1 cc308e5cf,A-2 602e1d266,A-3 3a98d8495,A-4 2c8c7edcf,A-5 e8612e544,A-6 d5575f368,A-7 0b1fc50eb(头部 QC 只证明它所指的块及以下;B-1 的 `unproven_from` 改为被认证高度 + 1),A-8 a66cd6e18;B-3 f746f3523,B-4 b9aaf3bf8,B-5 1d59a6539(EL 交换失败返回 NotYet/PayloadMissing,不再判 Invalid),B-6 ee2d9c815;b76df48f8 把 11 个被误转成 CRLF 的文件恢复为 LF |
+| 第 3 批 | 进行中:A-1 cc308e5cf,A-2 602e1d266,A-3 3a98d8495,A-4 2c8c7edcf,A-5 e8612e544,A-6 d5575f368,A-7 0b1fc50eb(头部 QC 只证明它所指的块及以下;B-1 的 `unproven_from` 改为被认证高度 + 1),A-8 a66cd6e18;B-3 f746f3523,B-4 b9aaf3bf8,B-5 1d59a6539(EL 交换失败返回 NotYet/PayloadMissing,不再判 Invalid),B-6 ee2d9c815;C-2 a463d27a1,C-3 35e816b7d,C-4 b4aafea36(网关、直通 ingest、leader/shard 都需启动参数里显式的 `N42_BENCH_UNSAFE=1`);b76df48f8 把 11 个被误转成 CRLF 的文件恢复为 LF |

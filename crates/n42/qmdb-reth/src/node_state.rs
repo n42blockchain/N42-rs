@@ -1076,7 +1076,26 @@ struct PersistCursor {
     /// checkpoint; no second one starts, and the log is not rotated again,
     /// until it has finished.
     compacting: bool,
+    /// The segment the last compaction was started on, kept so a retry
+    /// after a failure folds it to its own head.
+    sealed: Option<SealedSegment>,
 }
+
+/// A sealed `forest.log.sealed` and when a fold of it was last started.
+#[derive(Debug, Clone, Copy)]
+struct SealedSegment {
+    /// The block the segment ends at: the head it was rotated at.
+    head: (u64, B256),
+    /// When a compaction of it was last started.
+    started_at: std::time::Instant,
+}
+
+/// How long a failed compaction waits before the next due block retries it:
+/// each retry reads the whole checkpoint and replays the segment.
+#[cfg(not(test))]
+const COMPACTION_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const COMPACTION_RETRY_PAUSE: std::time::Duration = std::time::Duration::ZERO;
 
 /// A handle to the node's QMDB state. Cheap to clone; all clones share it.
 #[derive(Clone)]
@@ -2106,7 +2125,17 @@ impl QmdbNodeState {
                 return Err(unavailable());
             }
             if checkpoint.head_number > number {
-                return self.parent_root_from_frontier((checkpoint.head_number, checkpoint.head_hash), (number, hash));
+                // A fold that ran ahead of the database archived the
+                // checkpoint it replaced with the segment it folded; the
+                // live entry file still holds that cursor's prefix, as the
+                // heap branch below reads its archived snapshot.
+                match self.archived_file_checkpoint((number, hash))? {
+                    Some(archived) => checkpoint = archived,
+                    None => {
+                        return self
+                            .parent_root_from_frontier((checkpoint.head_number, checkpoint.head_hash), (number, hash));
+                    }
+                }
             }
             if checkpoint.head_hash != hash {
                 checkpoint = replay_delta_log(&self.sealed_log_path(), checkpoint, Some(hash))?.0;
@@ -2336,6 +2365,7 @@ impl QmdbNodeState {
             log_len: 0,
             checkpoint_len,
             compacting: false,
+            sealed: None,
         };
         info!(
             target: "n42.qmdb",
@@ -2508,6 +2538,7 @@ impl QmdbNodeState {
                     log_len,
                     checkpoint_len,
                     compacting: false,
+                    sealed: None,
                 };
                 info!(
                     target: "n42.qmdb",
@@ -2558,6 +2589,7 @@ impl QmdbNodeState {
                     log_len: 0,
                     checkpoint_len,
                     compacting: false,
+                    sealed: None,
                 };
                 forest
             }
@@ -2612,6 +2644,7 @@ impl QmdbNodeState {
                 log_len,
                 checkpoint_len,
                 compacting: false,
+                sealed: None,
             };
             info!(
                 target: "n42.qmdb",
@@ -2685,6 +2718,7 @@ impl QmdbNodeState {
             log_len: 0,
             checkpoint_len,
             compacting: false,
+            sealed: None,
         };
         info!(
             target: "n42.qmdb",
@@ -2756,6 +2790,7 @@ impl QmdbNodeState {
             log_len: 0,
             checkpoint_len,
             compacting: false,
+            sealed: None,
         };
         info!(target: "n42.qmdb", block = expected_head.0, head = %expected_head.1, %root, "restored the QMDB forest from a portable snapshot");
         *self.lock_as("initialize_from_portable#2") = Some(self.configured(forest)?);
@@ -3339,17 +3374,38 @@ impl QmdbNodeState {
             // and the next head asks again.
             return Ok(());
         }
-        let head = self.with_forest("rewrite_checkpoint", |forest| Ok(forest.head()))?;
-        // Durable before rotating the log or replacing its checkpoint. Until
-        // replacement completes, the old checkpoint's frontier stays in the file.
-        self.save_checkpoint_frontier(head)?;
         let sealed_path = self.sealed_log_path();
         if sealed_path.exists() {
             // A compaction that failed left its segment behind (it is still
-            // needed: the checkpoint does not cover it). Fold that one first;
-            // the log is rotated once it is gone.
-            warn!(target: "n42.qmdb", path = %sealed_path.display(), "a sealed QMDB log segment is still waiting to be compacted; retrying it");
+            // needed: the checkpoint does not cover it). Fold that one first,
+            // to the block it ends at -- the forest's head has moved past it
+            // with the log since -- and the log is rotated once it is gone.
+            let head = match cursor.sealed {
+                Some(sealed) if sealed.started_at.elapsed() < COMPACTION_RETRY_PAUSE => return Ok(()),
+                Some(sealed) => sealed.head,
+                // No fold of it was started in this process: the forest's
+                // head, which is the segment's while the log is still empty
+                // (a wrong one is refused by the fold, not applied).
+                None => self.with_forest("rewrite_checkpoint", |forest| Ok(forest.head()))?,
+            };
+            warn!(target: "n42.qmdb", path = %sealed_path.display(), block = head.0, "a sealed QMDB log segment is still waiting to be compacted; retrying it");
             self.spawn_compaction(cursor, head);
+            return Ok(());
+        }
+        let head = self.with_forest("rewrite_checkpoint", |forest| Ok(forest.head()))?;
+        if head.1 != cursor.head {
+            // The forest's head is not the block the log ends at (a deferred
+            // canonical move); the segment would not end where its fold
+            // looks. The next due block rotates instead.
+            debug!(target: "n42.qmdb", forest = %head.1, log = %cursor.head, "QMDB log rotation waits for the forest's head to reach the log's");
+            return Ok(());
+        }
+        // Durable before rotating the log or replacing its checkpoint. Until
+        // replacement completes, the old checkpoint's frontier stays in the file.
+        // A rotation is never owed: the block that asked is already logged,
+        // so a frontier that cannot be written postpones it, not the block.
+        if let Err(err) = self.save_checkpoint_frontier(head) {
+            warn!(target: "n42.qmdb", %err, block = head.0, "could not write the QMDB checkpoint frontier; the log rotation waits");
             return Ok(());
         }
         let log_path = self.delta_log_path();
@@ -3386,6 +3442,7 @@ impl QmdbNodeState {
     /// and cleared by the thread.
     fn spawn_compaction(&self, cursor: &mut PersistCursor, sealed_head: (u64, B256)) {
         cursor.compacting = true;
+        cursor.sealed = Some(SealedSegment { head: sealed_head, started_at: std::time::Instant::now() });
         let state = self.clone();
         let spawned = std::thread::Builder::new()
             .name("qmdb-compact".into())
@@ -3569,6 +3626,7 @@ impl QmdbNodeState {
                 log_len: 0,
                 checkpoint_len: len,
                 compacting: cursor.compacting,
+                sealed: cursor.sealed,
             };
             let total_ms = started.elapsed().as_millis() as u64;
             self.note_compaction(len, total_ms, &phases, 0);
@@ -3609,6 +3667,7 @@ impl QmdbNodeState {
             log_len: 0,
             checkpoint_len: len,
             compacting: cursor.compacting,
+            sealed: cursor.sealed,
         };
         let total_ms = started.elapsed().as_millis() as u64;
         self.note_compaction(len, total_ms, &phases, 0);
@@ -4085,13 +4144,13 @@ mod tests {
             assert_eq!(restarted.persisted_state_root(2, hashes[1]).unwrap(), roots[1]);
             restarted.initialize((3, hashes[2])).unwrap();
             assert_eq!(restarted.state_root(), roots[2]);
-            // A heap node reads an older block from the pair the rewrite
-            // archived, exactly; without that archive, an arbitrary older
-            // block or corrupt frontier must not get the head root
-            // substituted for its missing historical root.
-            if !entry_file {
-                assert_eq!(restarted.persisted_state_root(1, hashes[0]).unwrap(), roots[0]);
-            }
+            // Either mode reads an older block from the pair the rewrite
+            // archived, exactly -- the launch asks for the deferred parent
+            // below a fold that ran ahead of the database (audit 2026-10
+            // D-1); without that archive, an arbitrary older block or
+            // corrupt frontier must not get the head root substituted for
+            // its missing historical root.
+            assert_eq!(restarted.persisted_state_root(1, hashes[0]).unwrap(), roots[0]);
             std::fs::remove_dir_all(dir.join("recovery-archive")).unwrap();
             assert!(restarted.persisted_state_root(1, hashes[0]).is_err());
             let mut corrupt = std::fs::read(restarted.frontier_path()).unwrap();
@@ -4507,6 +4566,70 @@ mod tests {
         restarted.initialize((20_000, parent)).unwrap();
         assert_eq!(restarted.head(), Some((20_000, parent)));
         assert_eq!(restarted.state_root(), root);
+    }
+
+    /// Audit 2026-10 D-2: a compaction that fails once (here: the archive
+    /// directory cannot be made) leaves its sealed segment behind, and a
+    /// later checkpoint retries it. The retry must fold the segment up to
+    /// the block it ends at -- not the forest's head, which the regrown log
+    /// has carried past it -- so once the fault is gone the segment is
+    /// folded, the log rotates again and the head still restores.
+    #[test]
+    fn a_failed_compaction_is_retried_to_the_segments_own_head() {
+        use n42_qmdb_state::AccountState;
+        use alloy_primitives::{Address, U256};
+
+        for entry_file in [false, true] {
+            let chain = qmdb_chain();
+            let dir = scratch(if entry_file { "retry-file" } else { "retry-heap" });
+            let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+            state.initialize((0, chain.genesis_hash())).unwrap();
+            // A file where the archive directory goes: every fold fails.
+            let blocker = dir.join("recovery-archive");
+            std::fs::write(&blocker, b"not a directory").unwrap();
+
+            let mut parent = chain.genesis_hash();
+            let mut root = B256::ZERO;
+            let mut number = 0u64;
+            let block = |state: &QmdbNodeState, parent: &mut B256, root: &mut B256, number: &mut u64| {
+                *number += 1;
+                let mut changes = BlockChanges::new();
+                changes.set_account(
+                    Address::from_word(B256::from(U256::from(*number))),
+                    AccountState { nonce: *number, balance: U256::from(*number), code_hash: B256::ZERO },
+                );
+                let hash = B256::from(U256::from(*number) << 64);
+                let prepared = state.compute(*parent, &changes).unwrap();
+                *root = prepared.root;
+                state.insert(hash, *number, prepared).unwrap();
+                state.on_canonical(hash).unwrap();
+                *parent = hash;
+            };
+            while !state.sealed_log_path().exists() {
+                assert!(number < 20_000, "the log never rotated");
+                block(&state, &mut parent, &mut root, &mut number);
+            }
+            state.wait_for_compaction();
+            assert!(state.sealed_log_path().exists(), "the first fold failed and kept its segment");
+
+            // The fault clears; the chain goes on until the retry has had
+            // more than one chance.
+            std::fs::remove_file(&blocker).unwrap();
+            let failed_at = number;
+            while state.sealed_log_path().exists() && number < failed_at + 40_000 {
+                block(&state, &mut parent, &mut root, &mut number);
+                state.wait_for_compaction();
+            }
+            assert!(
+                !state.sealed_log_path().exists(),
+                "the segment sealed at block {failed_at} was never folded ({entry_file})"
+            );
+
+            let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+            restarted.initialize((number, parent)).unwrap();
+            assert_eq!(restarted.state_root(), root);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// A node can stop while a compaction is in flight: the checkpoint is

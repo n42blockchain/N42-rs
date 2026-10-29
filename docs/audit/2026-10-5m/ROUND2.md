@@ -48,3 +48,4 @@
 | R2-X1 | 已修 afdd51d80:测试 `a_torsion_component_in_r_gets_one_verdict_in_every_batch` 修复前失败(nonce 1 单独验证被拒,nonce 0 通过) |
 | R2-Q1 | 已修:`QmdbForest::remeasure`,两条追加路径出错时把未落日志的 delta 还给簿记;测试 `a_failed_delta_append_loses_no_flip` 修复前重启报 duplicate active key。`checkpoint()` 失败后重试整树重写,不丢 |
 | R2-Q4, R2-R4 | 已修:`logged_slots` 水位(取走/量出 delta 时设置),`move_to` 只在切到已记日志的槽位以下时 fsync;取走 delta 的同一次持锁里清簿记,去掉第二次持锁与移动计数比较(热路径少一次加锁)。测试 `only_a_cut_below_the_logged_slots_syncs_the_entry_file`、`a_build_between_the_persistence_holds_keeps_only_its_own_bookkeeping` 修复前失败 |
+| R2-Q3 | 已修:`rewrite_checkpoint` 先查 `compacting` 再走同步路径;测试 `the_synchronous_checkpoint_waits_for_a_running_compaction` 修复前失败 |

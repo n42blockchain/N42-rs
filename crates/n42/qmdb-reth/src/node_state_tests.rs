@@ -1388,6 +1388,20 @@ fn only_a_cut_below_the_logged_slots_syncs_the_entry_file() {
     assert_eq!(syncs(&state), 1, "the cut went below the logged head 3");
 }
 
+/// Audit 2026-10 round 2 (R2-Q3): with `N42_QMDB_CHECKPOINT_SYNC=1` a
+/// compaction still runs when a restart finds a sealed segment; the
+/// synchronous rewrite must not write the checkpoint beside it.
+#[test]
+fn the_synchronous_checkpoint_waits_for_a_running_compaction() {
+    let (state, _, _, _, _) = node_at("sync-ckpt-compacting", true, 3);
+    let before = std::fs::read(state.ckpt_path()).expect("the checkpoint");
+    let mut cursor = *state.cursor();
+    cursor.compacting = true;
+    force_checkpoint_sync();
+    state.rewrite_checkpoint(None, &mut cursor).expect("the rewrite");
+    assert_eq!(std::fs::read(state.ckpt_path()).expect("the checkpoint"), before, "the checkpoint was rewritten mid-compaction");
+}
+
 /// Audit 2026-10 D-4: a move below the persisted head rewrites the entry
 /// file's slots before any delta says so. A process that dies there leaves
 /// the log on the old branch and the entries on the new one; the restart

@@ -118,6 +118,10 @@ const MIN_LOG_BEFORE_CHECKPOINT: u64 = 1 << 20;
 /// on the canonical follower, as before, instead of compacting the files on a
 /// background thread. The A/B's off arm; read once.
 fn checkpoint_sync() -> bool {
+    #[cfg(test)]
+    if FORCE_CHECKPOINT_SYNC.with(std::cell::Cell::get) {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_QMDB_CHECKPOINT_SYNC").is_ok_and(|v| v == "1"))
 }
@@ -1160,6 +1164,18 @@ thread_local! {
 #[cfg(test)]
 fn fail_delta_append(nth: u32) {
     FAIL_DELTA_APPEND.with(|fail| fail.set(nth));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`checkpoint_sync`] on for this thread.
+    static FORCE_CHECKPOINT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`FORCE_CHECKPOINT_SYNC`] for this thread.
+#[cfg(test)]
+fn force_checkpoint_sync() {
+    FORCE_CHECKPOINT_SYNC.with(|on| on.set(true));
 }
 
 /// Sets [`BETWEEN_PERSIST_HOLDS`] for this thread.
@@ -3503,13 +3519,16 @@ impl QmdbNodeState {
         block_hash: Option<B256>,
         cursor: &mut PersistCursor,
     ) -> Result<(), NodeStateError> {
-        if checkpoint_sync() {
-            return self.checkpoint(block_hash, cursor);
-        }
         if cursor.compacting {
             // The previous compaction is still running; the log keeps growing
-            // and the next head asks again.
+            // and the next head asks again. Checked before the synchronous
+            // path too: a restart resumes a sealed segment's compaction in
+            // either mode, and two writers of one checkpoint race (audit
+            // 2026-10 round 2, R2-Q3).
             return Ok(());
+        }
+        if checkpoint_sync() {
+            return self.checkpoint(block_hash, cursor);
         }
         let sealed_path = self.sealed_log_path();
         if sealed_path.exists() {

@@ -50,13 +50,30 @@ impl ValidatorSet {
         // subgroup check, saving ~10–20% of single-sig BLS verify cost on the
         // hot path. Aggregate verification (`fast_aggregate_verify`) already
         // assumes pre-validated keys per blst's contract.
+        //
+        // A key may appear once: listed twice, its holder signs for two
+        // indices and counts twice toward `n - f` (audit 2026-10 A-4). gov5
+        // does not check this, but every shipped genesis has distinct keys.
+        // Proof of possession is not checked: keys come only from the genesis
+        // file (the gov5 profiles refuse validator changes), and the genesis
+        // format carries no proof. A reconfiguration that admits keys from a
+        // proposal must require one before it ships, since QCs use
+        // same-message aggregate verification.
         let mut entries = Vec::with_capacity(validators.len());
+        let mut seen = std::collections::HashMap::with_capacity(validators.len());
         for (index, v) in validators.iter().enumerate() {
             v.bls_public_key
                 .validate()
                 .map_err(|_| ConsensusError::InvalidValidatorPubkey {
                     index: index as u32,
                 })?;
+            if let Some(&first) = seen.get(&v.bls_public_key.to_bytes()) {
+                return Err(ConsensusError::DuplicateValidatorPubkey {
+                    index: index as u32,
+                    first,
+                });
+            }
+            seen.insert(v.bls_public_key.to_bytes(), index as u32);
             entries.push(ValidatorEntry {
                 address: v.address,
                 public_key: v.bls_public_key.clone(),
@@ -305,6 +322,19 @@ mod tests {
         assert_eq!(pks[1].to_bytes(), items[2].1.bls_public_key.to_bytes());
 
         assert!(vs.public_keys_for_signers(&[0, 10]).is_err());
+    }
+
+    /// Audit 2026-10 A-4: a key listed twice (under two addresses) would let
+    /// its holder sign for two indices and count twice toward `n - f`.
+    #[test]
+    fn test_try_new_rejects_duplicate_public_key() {
+        let mut infos: Vec<_> = (0..4u8).map(|i| make_validator_info(i).1).collect();
+        infos[3].bls_public_key = infos[1].bls_public_key.clone();
+        let err = ValidatorSet::try_new(&infos, 1).unwrap_err();
+        assert!(matches!(
+            err,
+            ConsensusError::DuplicateValidatorPubkey { index: 3, first: 1 }
+        ));
     }
 
     #[test]

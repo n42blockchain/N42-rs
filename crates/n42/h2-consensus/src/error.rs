@@ -149,6 +149,12 @@ pub enum ConsensusError {
     #[error("validator at index {index} has an invalid BLS public key (failed subgroup check)")]
     InvalidValidatorPubkey { index: u32 },
 
+    /// Two validators in one set carry the same BLS public key. One key
+    /// holder would count twice toward the quorum, so the set is refused at
+    /// `ValidatorSet::try_new`.
+    #[error("validator at index {index} repeats the BLS public key of validator {first}")]
+    DuplicateValidatorPubkey { index: u32, first: u32 },
+
     /// Persistent vote-log fsync failed; the vote MUST be aborted to avoid
     /// double-voting after a crash. The IO error message is captured as a
     /// `String` so this enum stays free of the rest of `io::Error`'s API

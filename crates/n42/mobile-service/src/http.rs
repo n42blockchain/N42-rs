@@ -29,6 +29,33 @@ use crate::service::MobileService;
 /// an attempt to make the node allocate on demand.
 const MAX_BODY: usize = 64 * 1024;
 
+/// The request line and headers together; a header line had no limit
+/// before (audit 2026-10 round 3, R3-P7).
+const MAX_HEADER: usize = 16 * 1024;
+
+/// How long one request may take to arrive and its answer to leave. One
+/// connection is served at a time, so an idle or trickling client held the
+/// endpoint for everyone until it went away (audit 2026-10 round 3, R3-P7).
+const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A socket read within an absolute deadline: each read waits only for what
+/// is left of it, so a client sending a byte at a time cannot extend it.
+struct DeadlineReader {
+    stream: TcpStream,
+    deadline: std::time::Instant,
+}
+
+impl Read for DeadlineReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "request deadline passed"));
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buf)
+    }
+}
+
 /// Serves `mobile_*` over HTTP until the process ends.
 ///
 /// Single-threaded and blocking: one phone at a time, which is right for a
@@ -78,6 +105,7 @@ pub fn serve_on(
 }
 
 fn handle(stream: TcpStream, service: &Arc<Mutex<MobileService>>) -> std::io::Result<()> {
+    stream.set_write_timeout(Some(REQUEST_DEADLINE))?;
     let body = match read_request(&stream) {
         Ok(body) => body,
         Err(error) => {
@@ -128,9 +156,13 @@ fn handle(stream: TcpStream, service: &Arc<Mutex<MobileService>>) -> std::io::Re
 
 /// Reads one HTTP request and returns its body.
 fn read_request(stream: &TcpStream) -> Result<Vec<u8>, String> {
-    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+    let deadline = DeadlineReader {
+        stream: stream.try_clone().map_err(|e| e.to_string())?,
+        deadline: std::time::Instant::now() + REQUEST_DEADLINE,
+    };
+    let mut reader = BufReader::new(deadline.take((MAX_HEADER + MAX_BODY) as u64));
     let mut request_line = String::new();
-    reader
+    let mut header_bytes = reader
         .read_line(&mut request_line)
         .map_err(|e| e.to_string())?;
     if !request_line.starts_with("POST") {
@@ -141,6 +173,10 @@ fn read_request(stream: &TcpStream) -> Result<Vec<u8>, String> {
     loop {
         let mut line = String::new();
         let read = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        header_bytes += read;
+        if header_bytes > MAX_HEADER {
+            return Err(format!("headers exceed the {MAX_HEADER} byte limit"));
+        }
         if read == 0 || line.trim().is_empty() {
             break;
         }

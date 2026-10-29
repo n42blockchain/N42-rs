@@ -172,3 +172,37 @@ fn a_get_is_refused() {
     stream.read_to_string(&mut response).expect("read");
     assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
 }
+
+/// Audit 2026-10 round 3 (R3-P7): the endpoint serves one connection at a
+/// time with no deadline, so a client that connected and sent nothing held
+/// it for everyone. A request now has a deadline as a whole.
+#[test]
+fn an_idle_connection_does_not_hold_the_endpoint() {
+    let (port, _) = start();
+    let _idle = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(call(port, "mobile_finality", json!([])));
+    });
+    let answer = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("served after the idle one's deadline");
+    assert_eq!(answer["result"]["block_hash"], json!(BLOCK.to_string()));
+}
+
+/// Audit 2026-10 round 3 (R3-P7): a header line had no length limit; the
+/// body did. The header section has its own.
+#[test]
+fn a_header_section_past_its_limit_is_refused() {
+    let (port, _) = start();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "mobile_finality", "params": []}).to_string();
+    let padding = "a".repeat(100_000);
+    write!(
+        stream,
+        "POST / HTTP/1.1\r\nX-Padding: {padding}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("write");
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    assert!(response.starts_with("HTTP/1.1 400"), "{}", &response[..response.len().min(200)]);
+}

@@ -55,3 +55,4 @@ RPC/快照/tx-queue/mobile。每项修复前先按代码核实,先写复现测�
 | R3-C3 | 已修 | 记住本节点最后发出的 R1 投票,同一 view 重复超时时(非 leader)随超时一并重发给 leader,与 gov5 `timeout.go` 一致;测试 `test_a_repeated_timeout_resends_this_views_vote` |
 | R3-N5 | 已修(部分) | `/n42/vote/1` 只放行本节点会在其上发送的 Vote/CommitVote/Timeout(Timeout 由 gossip 去重时直发重传,必须保留),其余类型拒绝;测试 `the_vote_protocol_carries_only_votes_and_timeouts`。限速与 Timeout 先验签后查重未做 |
 | R3-N6 | 已修 | message id 改为增量 Keccak,不再为每份 gossip 拷贝整份 payload;gov5 字节级向量 `matches_gov5_message_id_vectors` 覆盖正确性(纯降成本) |
+| R3-P7 | 已修 | 每个请求 10 s 绝对期限(逐次读按剩余时间设超时,涓流无法延长)与写超时;请求行+头部 16 KiB 上限;测试 `an_idle_connection_does_not_hold_the_endpoint`、`a_header_section_past_its_limit_is_refused`。仍单线程,一个慢客户端最多占 10 s |

@@ -87,6 +87,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: the first statement of `main`: no thread this program starts
     // exists yet, so nothing reads or writes the environment concurrently.
     unsafe { n42_env::profile::apply_or_exit("h2_validator") };
+    // The vote knobs that give up a safety property start only when the
+    // operator says this is a benchmark (audit 2026-10 round 2, R2-C3).
+    if let Some(refusal) = n42_h2_node::persistence::unsafe_vote_knob_refusal(|name| std::env::var(name).ok()) {
+        eprintln!("h2_validator: {refusal}");
+        std::process::exit(2);
+    }
     // `N42_THP_DISABLE=1`: no transparent huge pages for this process. With
     // the box's THP at `always`, a fleet allocating ~45 GB of anonymous
     // memory drove 5.8M direct-compaction stalls that tore the page cache

@@ -326,7 +326,7 @@ Status caveat: `adopted` follows the stage sets named above plus the X22 base se
 | `N42_TAKE_COMPACT` | off | `1` (or the knob's own value; see code) | N42_TAKE_COMPACT, read once: the proposer asks its execution layer for a build-on-own answer *without the transactions* -- the header, the small ... X22 base set: `1`. | `h2-execution:driver.rs:892` | adopted |
 | `N42_VOTE_AGGREGATE_VERIFY` | off | `1` (or the knob's own value; see code) | Batched vote verification on a leader. X22 base set: `1`. | `h2-node:service.rs:4790` | adopted |
 | `N42_VOTE_LOG_FATAL_AFTER` | 3 | integer (`0` disables) | Consecutive vote-log write/fsync failures after which the validator stops and exits non-zero (code 3); see docs/OPERATOR_FAULTS.md. | `h2-node:service.rs` (startup) | default |
-| `N42_VOTE_LOG_NOSYNC` | off | `1` (or the knob's own value; see code) | Skip the vote-log sync (bench knob; gives up crash safety). | `h2-node:persistence.rs:486` | unsafe-bench |
+| `N42_VOTE_LOG_NOSYNC` | off | `1`, and only with `N42_BENCH_UNSAFE=1` (h2_validator refuses to start without it) | Skip the vote-log sync (bench knob; gives up crash safety). | `h2-node:persistence.rs:506` | unsafe-bench |
 | `N42_VOTE_TRANSPORT` | gossip (direct, both) | see Default | Vote transport: direct, both, or gossip. X22 base set: `direct` (compiled default differs). Needs `frameBlocks` in the genesis: a chain a gov5 member can join keeps the mesh (audit 2026-10 E-5). | `h2-node:direct_votes.rs:43` | adopted |
 | `N42_YAMUX_WINDOW_MB` | ignored (only logs a warning: unsupported by libp2p 0.57) | see Default | Yamux window; unsupported, only logs a warning. | `h2-net:config.rs:247` | bench-only |
 

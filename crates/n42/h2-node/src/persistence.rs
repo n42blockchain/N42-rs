@@ -480,10 +480,37 @@ impl VoteLogWriter for FileVoteLog {
     }
 }
 
+/// The validator's bench knobs that give up a voting safety property:
+/// `N42_VOTE_BEFORE_IMPORT` votes without the import-gated checks (the
+/// extends rule among them), `N42_VOTE_LOG_NOSYNC` lets a crash lose a vote
+/// watermark and so permit a double vote.
+pub const UNSAFE_VOTE_KNOBS: [&str; 2] = ["N42_VOTE_BEFORE_IMPORT", "N42_VOTE_LOG_NOSYNC"];
+
+/// Why a validator must not start with the knobs `lookup` reads, or `None`
+/// when it may: every [`UNSAFE_VOTE_KNOBS`] entry set to `1` needs the
+/// operator's `N42_BENCH_UNSAFE=1`, as the ingest's trusting modes do
+/// (audit 2026-10 round 2, R2-C3).
+pub fn unsafe_vote_knob_refusal(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let set: Vec<&str> = UNSAFE_VOTE_KNOBS.iter().copied().filter(|knob| lookup(knob).as_deref() == Some("1")).collect();
+    if set.is_empty() || lookup("N42_BENCH_UNSAFE").as_deref() == Some("1") {
+        return None;
+    }
+    Some(format!(
+        "{} give up a voting safety property; it is a benchmark setting and is unsafe on a real chain. Set N42_BENCH_UNSAFE=1 to run it anyway",
+        set.join(" and ")
+    ))
+}
+
+/// Whether the vote log skips its sync, by the variables `lookup` reads:
+/// `N42_VOTE_LOG_NOSYNC=1`, acknowledged by `N42_BENCH_UNSAFE=1`.
+fn vote_log_nosync_from(lookup: impl Fn(&str) -> Option<String>) -> bool {
+    lookup("N42_VOTE_LOG_NOSYNC").as_deref() == Some("1") && lookup("N42_BENCH_UNSAFE").as_deref() == Some("1")
+}
+
 /// `N42_VOTE_LOG_NOSYNC`, read once.
 fn vote_log_nosync() -> bool {
     static NOSYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *NOSYNC.get_or_init(|| std::env::var("N42_VOTE_LOG_NOSYNC").is_ok_and(|v| v == "1"))
+    *NOSYNC.get_or_init(|| vote_log_nosync_from(|name| std::env::var(name).ok()))
 }
 
 /// A CRC-32 (IEEE).
@@ -520,4 +547,27 @@ pub fn checkpoint_from(engine: &n42_h2_consensus::ConsensusEngine) -> ConsensusC
 /// Maps a store error onto the consensus error type.
 pub fn to_consensus_error(error: StoreError) -> ConsensusError {
     ConsensusError::VoteLogFsync(error.to_string())
+}
+
+/// Audit 2026-10 round 2 (R2-C3): the vote knobs that give up safety need the
+/// operator's acknowledgement, and the log syncs without it.
+#[cfg(test)]
+mod unsafe_knob_tests {
+    use super::*;
+
+    fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| pairs.iter().find(|(key, _)| *key == name).map(|(_, value)| (*value).to_owned())
+    }
+
+    #[test]
+    fn the_unsafe_vote_knobs_need_the_bench_acknowledgement() {
+        assert_eq!(unsafe_vote_knob_refusal(env(&[])), None);
+        let refusal = unsafe_vote_knob_refusal(env(&[("N42_VOTE_BEFORE_IMPORT", "1")])).expect("refused");
+        assert!(refusal.contains("N42_VOTE_BEFORE_IMPORT") && refusal.contains("N42_BENCH_UNSAFE=1"), "{refusal}");
+        assert!(unsafe_vote_knob_refusal(env(&[("N42_VOTE_LOG_NOSYNC", "1")])).is_some());
+        assert_eq!(unsafe_vote_knob_refusal(env(&[("N42_VOTE_LOG_NOSYNC", "1"), ("N42_BENCH_UNSAFE", "1")])), None);
+
+        assert!(!vote_log_nosync_from(env(&[("N42_VOTE_LOG_NOSYNC", "1")])), "no sync skipped unacknowledged");
+        assert!(vote_log_nosync_from(env(&[("N42_VOTE_LOG_NOSYNC", "1"), ("N42_BENCH_UNSAFE", "1")])));
+    }
 }

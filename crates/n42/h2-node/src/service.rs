@@ -603,6 +603,9 @@ pub struct H2Service<E> {
     /// Commits whose consensus checkpoint could not be written, so were not
     /// finalised (also [`METRIC_CHECKPOINT_FAILURES_TOTAL`]).
     checkpoint_failures: u64,
+    /// Whether the engine's voting halt has been reported (gauge, and the
+    /// fatal fault for a vote-log halt).
+    halt_reported: bool,
 }
 
 /// How long a leader whose builder declined waits before asking it again.
@@ -1565,6 +1568,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             halt_on_commit_invalid: halt_on_commit_invalid_from_env(),
             vote_log_failures_exported: 0,
             checkpoint_failures: 0,
+            halt_reported: false,
         }
     }
 
@@ -1618,6 +1622,19 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.vote_log_failures_exported = failures;
         }
         self.halt_on_commit_refusal();
+        // However the engine came to halt -- the batch vote paths drop its
+        // `Fatal` for a vote log that keeps failing, at debug -- the halt is
+        // reported here, once: the gauge, and for the vote log the same
+        // fatal stop the direct path gives (audit 2026-10 A-1).
+        if !self.halt_reported
+            && let Some(reason) = self.engine.voting_halted()
+        {
+            self.halt_reported = true;
+            metrics::gauge!(METRIC_VOTING_HALTED, "reason" => reason).set(1.0);
+            if reason == "vote_log" && self.fatal.is_none() {
+                self.fatal = Some((reason, "voting halted: the vote log kept failing".to_owned()));
+            }
+        }
         if let Some((reason, detail)) = self.fatal.take() {
             metrics::gauge!(METRIC_FATAL, "reason" => reason).set(1.0);
             error!(

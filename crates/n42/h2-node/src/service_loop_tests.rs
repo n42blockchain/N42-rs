@@ -1006,6 +1006,24 @@ async fn a_vote_log_that_keeps_failing_stops_the_validator_with_a_fatal_error() 
     svc.check_local_faults().expect("nothing new");
 }
 
+/// Audit 2026-10 A-1: the batch paths drop the engine's `Fatal` for a vote
+/// log that keeps failing (at debug), while the engine has halted voting.
+/// The halt itself is what the service sees: it ends with the same fatal
+/// fault as on the direct path, and the halted gauge is set, once.
+#[tokio::test]
+async fn a_vote_log_halt_reported_only_by_the_engine_still_stops_the_validator() {
+    let recorder = Captured::default();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let rig = node(1, 0, None).await;
+    let mut svc = rig.svc;
+    svc.engine.halt_voting("vote_log");
+    let err = svc.check_local_faults().expect_err("the halt ends the step");
+    assert!(matches!(err, ServiceError::Fatal { reason: "vote_log", .. }), "{err:?}");
+    assert_eq!(recorder.value("n42_h2_voting_halted{reason=vote_log}"), Some(1.0));
+    assert_eq!(recorder.value("n42_h2_fatal{reason=vote_log}"), Some(1.0));
+    svc.check_local_faults().expect("reported once");
+}
+
 #[tokio::test]
 async fn a_commit_forkchoice_refused_as_invalid_halts_voting_and_the_node_keeps_following() {
     let recorder = Captured::default();

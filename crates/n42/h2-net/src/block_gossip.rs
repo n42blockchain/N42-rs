@@ -102,7 +102,7 @@ impl From<n42_h2_consensus::BlockBodyError> for BlockGossipError {
     fn from(error: n42_h2_consensus::BlockBodyError) -> Self {
         use n42_h2_consensus::BlockBodyError as E;
         match error {
-            E::InvalidRlp | E::NotTheAnnouncedBlock(_) => Self::InvalidRlp,
+            E::InvalidRlp | E::NotTheAnnouncedBlock(_) | E::TooManyTransactions { .. } => Self::InvalidRlp,
             E::HeaderProfile(profile, reason) => Self::HeaderProfile(profile, reason),
             E::InvalidRewards(reason) => Self::InvalidRewards(reason),
             E::RewardsRootMismatch => Self::RewardsRootMismatch,
@@ -502,6 +502,24 @@ mod tests {
         );
     }
 
+    /// Audit 2026-10 round 3 (R3-N3): a body may hold 64 MiB, and the
+    /// decoder took one-byte transactions without number -- 64 million
+    /// slices, then as many owned copies, from a 3 MB snappy push. No
+    /// transaction costs less than 21,000 gas, so a block cannot hold more
+    /// than its gas limit over that, and one that claims to is refused
+    /// before its transactions are listed.
+    #[test]
+    fn a_body_with_more_transactions_than_its_gas_limit_allows_is_refused() {
+        let mut sealed = header(Bytes::new());
+        sealed.gas_limit = 2 * 21_000;
+        let txs: Vec<Bytes> = (0..3u8).map(|i| Bytes::from(vec![0x02, i])).collect();
+        let fits = crate::encode_block_rlp_raw(&sealed, &txs[..2], &[], None);
+        assert_eq!(decode_block_rlp_raw(&fits, HeaderProfile::Ethereum).unwrap().transactions.len(), 2);
+        let over = crate::encode_block_rlp_raw(&sealed, &txs, &[], None);
+        assert!(decode_block_rlp_raw(&over, HeaderProfile::Ethereum).is_err());
+        assert!(n42_h2_consensus::decode_raw_block_body_ref(&over, HeaderProfile::Ethereum).is_err());
+    }
+
     #[test]
     fn garbage_is_rejected_not_panicked_on() {
         for bytes in [&[][..], &[0xC0][..], &[0xFF; 8][..]] {
@@ -574,7 +592,7 @@ mod bal_roundtrip {
         ];
         let rewards = vec![(Address::repeat_byte(0x42), U256::from(5_000_000_000u64))];
         let header = Header {
-            number: 7, base_fee_per_gas: Some(7), blob_gas_used: Some(0), excess_blob_gas: Some(0),
+            number: 7, gas_limit: 30_000_000, base_fee_per_gas: Some(7), blob_gas_used: Some(0), excess_blob_gas: Some(0),
             parent_beacon_block_root: Some(B256::repeat_byte(9)),
             withdrawals_root: Some(n42_h2_consensus::gov5_rewards_root(rewards.iter().copied())),
             transactions_root: alloy_consensus::proofs::calculate_transaction_root(&txs),

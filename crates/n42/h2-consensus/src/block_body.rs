@@ -46,7 +46,16 @@ pub enum BlockBodyError {
     /// The header does not hash to the block hash it was announced under.
     #[error("block body is not block {0}")]
     NotTheAnnouncedBlock(B256),
+    /// More transactions than a gas limit of this size can pay for.
+    #[error("more transactions than a gas limit of {gas_limit} can hold")]
+    TooManyTransactions {
+        /// The header's gas limit.
+        gas_limit: u64,
+    },
 }
+
+/// The least gas any transaction costs (its intrinsic gas).
+const MIN_TX_GAS: u64 = 21_000;
 
 /// One reward on the wire: gov5's `Reward{Address, Amount}` under reflective
 /// RLP, `[address, amount]`.
@@ -278,11 +287,18 @@ pub fn decode_raw_block_body_ref(
     if !list.list || list.payload_length != cursor.len() {
         return Err(BlockBodyError::InvalidRlp);
     }
-    let mut transactions = Vec::with_capacity(cursor.len() / 100);
+    // No transaction costs less than 21,000 gas, so a block holds at most
+    // its gas limit over that; one-byte "transactions" without number made
+    // a 64 MiB body tens of millions of slices (audit 2026-10 round 3, R3-N3).
+    let most = header.gas_limit / MIN_TX_GAS;
+    let mut transactions = Vec::with_capacity((cursor.len() / 100).min(most as usize));
     while !cursor.is_empty() {
         let bytes = take_rlp_bytes(&mut cursor).ok_or(BlockBodyError::InvalidRlp)?;
         if bytes.is_empty() {
             return Err(BlockBodyError::InvalidRlp);
+        }
+        if transactions.len() as u64 >= most {
+            return Err(BlockBodyError::TooManyTransactions { gas_limit: header.gas_limit });
         }
         transactions.push(bytes);
     }

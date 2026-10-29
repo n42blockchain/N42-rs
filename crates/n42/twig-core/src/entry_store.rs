@@ -1308,12 +1308,23 @@ fn as_hash(bytes: &[u8]) -> &Hash {
     bytes.try_into().expect("a 32-byte range")
 }
 
+/// `read_exact`, with a short read (a torn tail) as `false` and any other
+/// error passed on: an I/O error is not a torn group (audit 2026-10 E-6).
+fn read_whole(reader: &mut impl std::io::Read, buf: &mut [u8]) -> io::Result<bool> {
+    match reader.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Opens `entries.relocated` at `path`, if there is one, and retargets
 /// `offsets` (the main file's, one per kept slot) to every complete group in
 /// it, in file order, so the latest group of a twig wins; `twigs` records
 /// each relocated twig with its `entries.log` offsets.
 ///
-/// The walk stops at the first group that is torn, fails its CRC, is not
+/// The walk stops at the first group that is torn (a short read; any other
+/// read error fails the open), fails its CRC, is not
 /// exactly one twig's 2048 slots in order, or names a twig not wholly within
 /// the kept slots (an open that keeps a shorter prefix, or a main file cut
 /// short); with `truncate` the file is cut there, as a torn tail of the main
@@ -1334,7 +1345,6 @@ fn open_relocated(
     twigs: &mut BTreeMap<usize, RelocatedTwig>,
     truncate: bool,
 ) -> io::Result<Option<LogFile>> {
-    use std::io::Read;
     let mut file = match OpenOptions::new().read(true).write(truncate).open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1358,7 +1368,7 @@ fn open_relocated(
             let mut twig = None;
             for (local, record_start) in starts.iter_mut().enumerate() {
                 let mut head = [0u8; RELOCATED_HEAD];
-                if at + RELOCATED_HEAD as u64 > len || reader.read_exact(&mut head).is_err() {
+                if at + RELOCATED_HEAD as u64 > len || !read_whole(&mut reader, &mut head)? {
                     break 'groups;
                 }
                 let slot = u64::from_le_bytes(head[1..9].try_into().expect("8 bytes")) as usize;
@@ -1371,7 +1381,7 @@ fn open_relocated(
                 match head[0] {
                     TAG_LIVE => {
                         let mut header = [0u8; KEY_LEN + LEN_LEN];
-                        if at + (RELOCATED_HEAD + KEY_LEN + LEN_LEN) as u64 > len || reader.read_exact(&mut header).is_err() {
+                        if at + (RELOCATED_HEAD + KEY_LEN + LEN_LEN) as u64 > len || !read_whole(&mut reader, &mut header)? {
                             break 'groups;
                         }
                         let value_len = u32::from_le_bytes([header[32], header[33], header[34], header[35]]) as u64;
@@ -1380,7 +1390,7 @@ fn open_relocated(
                             break 'groups;
                         }
                         value.resize(value_len as usize, 0);
-                        if reader.read_exact(&mut value).is_err() {
+                        if !read_whole(&mut reader, &mut value)? {
                             break 'groups;
                         }
                         crc.update(&header);
@@ -1389,7 +1399,7 @@ fn open_relocated(
                     }
                     TAG_DEAD => {
                         let mut hash = [0u8; 32];
-                        if at + DEAD_RECORD as u64 > len || reader.read_exact(&mut hash).is_err() {
+                        if at + DEAD_RECORD as u64 > len || !read_whole(&mut reader, &mut hash)? {
                             break 'groups;
                         }
                         crc.update(&hash);
@@ -1402,7 +1412,7 @@ fn open_relocated(
             }
             let Some(twig) = twig else { break };
             let mut trailer = [0u8; TRAILER];
-            if at + TRAILER as u64 > len || reader.read_exact(&mut trailer).is_err() {
+            if at + TRAILER as u64 > len || !read_whole(&mut reader, &mut trailer)? {
                 break;
             }
             crc.update(&trailer[..9]);
@@ -2230,6 +2240,28 @@ mod tests {
         check(&heap, &readonly);
         drop(readonly);
         drop(file);
+        remove_scratch(name);
+    }
+
+    /// Audit 2026-10 E-6: only a short read is a torn tail. Any other error
+    /// reading `entries.relocated` (EIO; here, the name being a directory)
+    /// fails the open instead of dropping every group from there on.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_relocated_read_error_other_than_a_short_read_fails_the_open() {
+        use crate::qmdb_compat::QmdbCompatTree;
+        let name = "relocated-read-error";
+        let mut file = QmdbCompatTree::new();
+        file.set_entry_file(&scratch(name)).unwrap();
+        file.apply_sorted_ops(ops_of(0..64, 1)).unwrap();
+        file.sync_entries().unwrap();
+        let (next_slot, active) = (file.next_slot(), file.active_bits());
+        drop(file);
+        let path = scratch(name);
+        std::fs::create_dir_all(relocated_path(&path).join("in-the-way")).unwrap();
+        let err = QmdbCompatTree::from_entry_file_readonly(&path, next_slot, &active).expect_err("the read error surfaces");
+        assert!(!err.to_string().is_empty());
+        let _ = std::fs::remove_dir_all(relocated_path(&path));
         remove_scratch(name);
     }
 

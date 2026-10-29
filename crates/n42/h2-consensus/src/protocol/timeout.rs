@@ -257,6 +257,14 @@ impl ConsensusEngine {
             self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(
                 timeout_msg,
             )))?;
+            // This view's vote again: a vote is sent once, and a leader that
+            // missed it forms no QC. Not to ourselves as the leader (gov5
+            // `timeout.go`; audit 2026-10 round 3, R3-C3).
+            let leader = self.leader_index_for_view(view);
+            if let Some(vote) = self.last_vote.as_ref().filter(|vote| vote.view == view && leader != self.my_index) {
+                let vote = vote.clone();
+                self.emit(EngineOutput::SendToValidator(leader, ConsensusMessage::Vote(vote)))?;
+            }
 
             // Check if quorum was reached while we were waiting (messages may have
             // arrived between repeats). A quorum can advance even without the next leader.

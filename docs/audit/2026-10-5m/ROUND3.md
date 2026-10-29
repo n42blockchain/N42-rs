@@ -52,3 +52,4 @@ RPC/快照/tx-queue/mobile。每项修复前先按代码核实,先写复现测�
 | R3-C1 | 已修:延迟执行激活时 `validate_header` 只查 gas limit 上限,`gas_used` 在 `validate_header_against_parent` 中对照父块 gas limit(深度 1,与 gov5 `verifyHeaderWithBatch` 一致;更深时由执行字段相等检查约束);测试 `under_deferred_execution_gas_used_is_bounded_by_the_parents_limit` 修复前失败(满块后 limit 下调的子头被拒)。每头一次分支,非热路径 |
 | R3-G1 | 已修 | 追加失败时把未入日志的 delta 交还各自记录(`forest.restore_deltas`),换到更高目标重试仍走逐块路径;测试 `a_failed_append_retried_at_a_later_block_loses_no_flip`(修前报 duplicate active key) |
 | R3-G5 | 已修 | 等待式导入的 Valid/Invalid 与重试改向 fleet 索取时清除 `import_retries`;测试 `an_awaited_import_that_ends_after_retries_forgets_their_count` |
+| R3-C3 | 已修 | 记住本节点最后发出的 R1 投票,同一 view 重复超时时(非 leader)随超时一并重发给 leader,与 gov5 `timeout.go` 一致;测试 `test_a_repeated_timeout_resends_this_views_vote` |

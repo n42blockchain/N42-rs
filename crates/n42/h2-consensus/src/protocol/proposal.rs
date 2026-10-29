@@ -646,6 +646,7 @@ impl ConsensusEngine {
 
         tracing::info!(target: "n42::cl::proposal", view, %block_hash, voter = self.my_index, target_leader = leader, "sending vote to leader");
         self.view_timing.vote_sent = Some(std::time::Instant::now());
+        self.last_vote = Some(vote.clone());
         self.emit(EngineOutput::SendToValidator(
             leader,
             ConsensusMessage::Vote(vote),

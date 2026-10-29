@@ -449,6 +449,9 @@ pub struct ConsensusEngine {
     pub(super) parked_votes: HashMap<ViewNumber, Vec<super::vote_batch::ParkedVote>>,
     /// Per-view timing for commit latency diagnosis.
     pub(super) view_timing: ViewTiming,
+    /// The Round 1 vote this node last sent, sent again with each repeated
+    /// timeout of its view (gov5 `timeout.go`; audit 2026-10 round 3, R3-C3).
+    pub(super) last_vote: Option<n42_h2_primitives::consensus::Vote>,
     /// Timing from the last committed view (preserved across advance_to_view).
     last_committed_timing: Option<ViewTiming>,
     /// Pending tx_root_hash values for Baby Raptr DA verification.
@@ -574,6 +577,7 @@ impl ConsensusEngine {
             vote_queue: Vec::new(),
             parked_votes: HashMap::new(),
             view_timing: ViewTiming::new(),
+            last_vote: None,
             last_committed_timing: None,
             pending_tx_roots: BoundedFifoMap::new(64),
             pending_changes_hashes: BoundedFifoMap::new(64),
@@ -702,6 +706,7 @@ impl ConsensusEngine {
             vote_queue: Vec::new(),
             parked_votes: HashMap::new(),
             view_timing: ViewTiming::new(),
+            last_vote: None,
             last_committed_timing: None,
             pending_tx_roots: BoundedFifoMap::new(64),
             pending_changes_hashes: BoundedFifoMap::new(64),
@@ -6019,6 +6024,30 @@ mod tests {
             .count();
         // Repeat timeout re-broadcasts to help late/slow validators collect our vote.
         assert_eq!(broadcast_count_2, 1);
+    }
+
+    /// Audit 2026-10 round 3 (R3-C3): a vote is sent once, so a leader that
+    /// missed it never formed the view's QC. gov5 sends it again with every
+    /// repeated timeout of the view (`timeout.go`), as a follower; a
+    /// duplicate is a no-op in the leader's collector.
+    #[test]
+    fn test_a_repeated_timeout_resends_this_views_vote() {
+        let (mut engine, _, _, mut rx) = make_engine(4, 3);
+        let view = engine.current_view();
+        let leader = engine.leader_index_for_view(view);
+        assert_ne!(leader, 3, "a follower in this view");
+        let hash = B256::repeat_byte(9);
+        engine.send_vote(view, hash).expect("vote");
+        engine.on_timeout().expect("first timeout");
+        while rx.try_recv().is_ok() {}
+        engine.on_timeout().expect("repeat timeout");
+        let mut resent = Vec::new();
+        while let Ok(output) = rx.try_recv() {
+            if let EngineOutput::SendToValidator(to, ConsensusMessage::Vote(vote)) = output {
+                resent.push((to, vote.view, vote.block_hash, vote.voter));
+            }
+        }
+        assert_eq!(resent, vec![(leader, view, hash, 3)]);
     }
 
     #[test]

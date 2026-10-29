@@ -1,0 +1,48 @@
+# Area A -- consensus core (raw review, at c4064f700)
+
+Scope: `crates/n42/h2-consensus`, `h2-wire`, `h2-primitives`, and their changes since 91a360b57.
+Plan: `docs/PLAN_5M_AUDIT.md`. The reviewer's list as returned; verdicts in "Verification".
+
+Context the reviewer established: production builds the engine only in
+`crates/n42/h2-node/examples/h2_validator.rs:403-456`, always with a gov5 profile (H2V4 or Gov5Legacy)
+and `EpochManager::new` (epochs off, static validator set). Gaps only in the Native profile, the epoch
+code or reconfiguration are latent today.
+
+## Findings
+
+| id | sev | file:line | title | trigger | impact | suggested fix | conf |
+|---|---|---|---|---|---|---|---|
+| A-1 | P1 | `protocol/vote_batch.rs:264,309,389`; `protocol/state_machine.rs:1779-1781` | Fatal vote-log errors are swallowed on engine-internal paths | `N42_VOTE_AGGREGATE_VERIFY=1` (adopted, X22). On a leader, `flush_votes` -> `process_verified_vote` -> `try_form_prepare_qc` -> the R2 self-vote calls `note_vote_log` (`voting.rs:227-231`); when that write is the Nth consecutive failure, `ConsensusError::Fatal` is returned and logged at `debug` ("batched vote refused"). Same for a replayed buffered proposal reaching `send_vote` inside the `advance_to_view` replay loop. | `halt_voting("vote_log")` fires (no equivocation), but the service's `fatal` is never set (`service.rs:123-130`, `1594-1613`): no exit code 3, no `n42_h2_fatal`; the validator silently becomes an observer. Non-fatal vote-log failures on these paths are also only at `debug`. | In `check_local_faults` treat `engine.voting_halted() == Some("vote_log")` as fatal (report once), or keep the Fatal in the engine and return it from `flush_votes` / `advance_to_view`. Error path only. | high |
+| A-2 | P2 | `protocol/proposal.rs:689-712` | The extends-justify rule passes when the parent is unknown | `imported_parents` has no entry for the hash: `BlockImported`/`BlockChecked` arrives for a block whose header is not in `service.block_headers` (`service.rs:3926-3941`). | This rule is what stops a Byzantine leader at view v+1 from proposing a sibling of a block committed at view v under justify = QC(v) (`is_safe_to_vote` compares views only). Normal operation always has the header; reachability looks low. | For gov5 profiles, when `justify_block != 0` and the parent is unknown, defer the vote (or ask the service for the header). Cold. | medium (not every import source in h2-node traced) |
+| A-3 | P2 | `protocol/proposal.rs:265-475` (esp. `:430`, `:341`) | A duplicate or late proposal for the current view is processed again from scratch | Gossip delivers the same proposal on several paths (two topics plus direct streams); each copy re-verifies the signature and justify QC (2-3 pairings on the loop) and re-emits `ExecuteBlock`; `enter_voting()` moves the phase back from PreCommit/TimedOut to Voting. | After a timeout the next pacemaker firing takes the "first timeout" branch again (`timeout.rs:254-291`): `consecutive_timeouts` incremented twice, backoff grows faster; wasted CPU per copy. | `enter_voting` only from `WaitingForProposal`; early return when an identical (commitment, justify) pair was already fully accepted, recorded after acceptance (`justify_qc` is not covered by the signature, so the tracker at `:341` cannot dedup). Cheap. | medium (h2-node dedup not checked) |
+| A-4 | P2 | `validator/set.rs:44-71`; `validator/epoch.rs:431-453,515-559,609-630` | Validator keys admitted without duplicate-key check or proof of possession | Two indices with the same public key: one key holder counts twice toward n-f; `index_of_public_key` returns the first index. No PoP check anywhere; QCs use same-message `fast_aggregate_verify`, which needs PoP against rogue keys. Native reconfiguration admits `ValidatorChange::Add` keys from a leader's proposal, deduplicated by address only. | Today: trust in the genesis file. If reconfiguration is enabled, a rogue-key Add lets one party forge QCs (safety break). | Reject duplicate keys in `try_new` (cold). Require PoP for genesis entries and for `Add` before reconfiguration ships. | high on code; latent |
+| A-5 | P2 | `proposal.rs:458-472`; `decision.rs:84 vs 105`; `voting.rs:385 vs 403`; `state_machine.rs:1740-1743`, `835`/`1287-1291` | Gaps only in the Native profile | (a) no extends check under optimistic voting (A-2's attack works outright); (b) `round_state.commit` before `commit_pending_changes()?`: a staging failure returns Err after the commit was recorded, before `BlockCommitted`/`advance_to_view`, view stuck; (c) `imported_parents` never cleared; (d) vote tokens authenticated against the fallback current set for a future-epoch view, then trusted without recheck if a new set activates first. | No production binary uses Native. | Gate Native to tests, or port the gov5 rules to it. | high on code |
+| A-6 | P2 | `wire_bridge.rs:199-207`; `proposal.rs:351`; `timeout.rs:183-188`; `h2_finality.rs:456-461` | A view-0 QC is not checked for the canonical genesis shape | A view-0 QC with a real bitmap/signature and arbitrary hash decodes as an ordinary QC; its verification is skipped (proposals) or accepted while the local lock is genesis (timeouts). At chain start a leader can name an arbitrary `justify_block`, and a TC can carry a fake `high_qc` that advanced peers reject. The shadow verifier accepts only a `[0,0]` bitmap the wire decoder never produces (`h2_wire.rs:569-571`). | Liveness at chain start only; the shadow mismatch is in unused code. | Require `qc == QuorumCertificate::genesis()` for view 0; accept the empty bitmap in `h2_finality`. Zero cost. | high |
+| A-7 | P2 | `state_machine.rs:1895-1912` (caller `service.rs:4470-4507`) | A header QC proves "some quorum certified an ancestor", not this block | The check accepts either signing domain and the pulled header's seal is not checked: a range server copies one real committed QC into fabricated child headers and `check_pulled_block` passes them. | Pulled blocks can become head (never `safe`); the existing 6.6 trust model. Overlaps B-1. | Require the commit domain (as gov5's `maybeCommitFromHeaderQC`); verify the seal against `leader_for_view(extra.view)` on pulled blocks (one pairing, cold). | medium |
+| A-8 | P2 | `state_machine.rs:1589-1598,1381-1392`; `voting.rs:32-52` | Forged messages cost pairings but return Ok | A forged QC in a future message, or a forged late vote (up to 2 pairings each), fails quietly. | The service cannot score or penalise the sender. | Return a typed "unauthenticated" error the service can count. | high |
+
+## Checked and sound (reviewer)
+
+- Quorum n-f with f <= (n-1)/3, intersection >= f+1 (`set.rs:28-41,93-97`); bitmap length = set size and signer count >= quorum before any pairing (`quorum.rs:582-611`); canonical wire->engine bitmap conversion (`wire_bridge.rs:118-163`).
+- QCs, the view-jump path and NewView TCs resolve the set for the certificate's exact view, no fallback (`state_machine.rs:1801-1822`, `timeout.rs:446-455`); duplicate signers impossible (bitmap positions).
+- Every signed message binds view and hash with a distinct domain in Native and H2V4 (`quorum.rs:784-857`, `h2_v4.rs`); NUL and POP ciphersuites cannot verify each other, batch fallback included (`verify.rs:24-44`); the header seal is over a 32-byte hash.
+- Gov5Legacy: identical vote/proposal preimages, no chain binding (gov5's contract); `on_block_ready` writes the vote log before emitting the proposal and drops it if already voted (`proposal.rs:226-258`).
+- BLS batches: random non-zero 64-bit scalars, G2 subgroup check per signature, at most 1+n checks after a failure, size cap (`verify.rs:247-358`); keys validated once at set construction.
+- Decide binds the commit QC's view/hash, verifies in the commit domain, includes the changes hash (`decision.rs:20-54`); PrepareQC binds the wrapper to its QC (`proposal.rs:481-503`).
+- R1/R2 watermarks written before signing, rolled back on failed write (`proposal.rs:585-596,526-541`, `voting.rs:224-236`).
+- Locks and view only move forward (`round.rs:160-204`); a view jump goes exactly to qc.view+1 and a useless QC is refused before pairing (`state_machine.rs:1524-1633`).
+- Section 4 fixes hold: future buffer dedup by digest, unchecked class, per-sender/per-view/total caps (`state_machine.rs:1355-1450`); future timeouts deduplicated before verification and relayed once (`timeout.rs:36-42,108-117`); engine output non-lossy (`state_machine.rs:1914-1952`).
+- Wire codecs: lengths capped before allocation, checked arithmetic, no reachable panic, envelopes must re-encode identically (`h2_wire.rs:634-662`, `h2_v4.rs:57-100`); compact body count caps (`compact_body.rs:217-251,512-519`); header extra bounded at 4096 bytes.
+- Since 91a360b57: `encode_h2_qc` and `*_with_qc` are delegation plus a fixture test; `last_committed_qc` set only through `RoundState::commit`.
+
+## Not covered (reviewer)
+
+h2-node orchestration (proposal dedup, peer scoring, sources of `BlockImported`/`BlockChecked`);
+`block_body.rs` RLP in depth, `rotor.rs`, `vote_hello.rs`, `header_profile.rs` reconstruct paths;
+persistence formats; gov5's own behaviour (PoP, genesis-QC spelling). Nothing built or run.
+
+## Verification
+
+| id | verdict | note |
+|---|---|---|
+| all | pending | |

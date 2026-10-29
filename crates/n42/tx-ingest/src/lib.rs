@@ -429,12 +429,17 @@ fn recovery_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     })
 }
 
-/// Largest single transaction, in bytes.
-const MAX_TX_BYTES: u32 = 1 << 20;
+/// Largest single transaction, in bytes: twice reth's pool limit (128 KiB of
+/// input), so nothing a pool could take is refused here, and nothing far
+/// larger is read into memory first.
+const MAX_TX_BYTES: u32 = 256 << 10;
 
 /// Bound the retained transaction bytes of one frame independently of its
 /// transaction count. The per-transaction cap alone allowed a 10 GiB frame.
-const MAX_FRAME_BYTES: usize = 64 << 20;
+/// A full frame of transfers is about 1.1 MB; across [`MAX_CONNECTIONS`]
+/// the frames being read hold at most 4 GiB (64 MiB a frame was 16 GiB:
+/// audit 2026-10 round 2, R2-X2).
+const MAX_FRAME_BYTES: usize = 16 << 20;
 
 /// How long to wait between checks when the pool is at its high water mark.
 const GATE_POLL: std::time::Duration = std::time::Duration::from_millis(2);

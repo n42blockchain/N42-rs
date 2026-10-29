@@ -924,6 +924,17 @@ mod wire {
         refused(handle, client, "transaction of 0 bytes").await;
     }
 
+    /// Audit 2026-10 round 2 (R2-X2): a frame is read whole before anything in
+    /// it is checked, so what the open connections can make the node hold is
+    /// bounded: no transaction larger than a pool would take, and every
+    /// connection's frame together within 4 GiB.
+    #[test]
+    fn what_the_connections_can_hold_is_bounded() {
+        assert!(MAX_TX_BYTES as usize <= 256 * 1024, "a transaction no pool takes is not read");
+        assert!(MAX_FRAME_BYTES * MAX_CONNECTIONS <= 4 << 30, "{} bytes across the connections", MAX_FRAME_BYTES * MAX_CONNECTIONS);
+        assert!(MAX_FRAME_BYTES >= MAX_FRAME_TXS as usize * 1024, "a full frame of ordinary transactions still fits");
+    }
+
     #[tokio::test]
     async fn an_oversized_transaction_closes_the_connection() {
         let (mut client, handle) = connect().await;

@@ -967,6 +967,21 @@ async fn blocks_the_execution_layer_already_has_are_answered_without_asking_it_a
     assert!(events.is_empty());
 }
 
+/// Audit 2026-10 round 2 (R2-R1): a block the pull already imported is
+/// proposed afterwards. The engine is told it is imported straight away, and
+/// it must also learn the block's parent first: without it the import-gated
+/// vote is withheld (A-2's unknown-parent rule).
+#[tokio::test]
+async fn a_proposed_block_the_pull_imported_has_its_parent_recorded() {
+    let mut rig = node(1, 0, None).await;
+    let (hash, header, _) = block(1, ID.genesis_hash);
+    rig.svc.block_headers.insert(hash, header);
+    rig.svc.remember_imported(hash);
+    let mut events = Vec::new();
+    within(rig.svc.handle_output(EngineOutput::ExecuteBlock(hash), &mut events)).await.expect("ok");
+    assert!(rig.svc.engine.knows_parent(&hash), "the parent of a block imported by the pull");
+}
+
 #[path = "service_loop_tests.rs"]
 mod loop_tests;
 

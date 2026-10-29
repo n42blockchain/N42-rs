@@ -3035,6 +3035,12 @@ impl<E: ExecutionLayer> H2Service<E> {
         if let EngineOutput::ExecuteBlock(block_hash) = &output
             && self.imported.contains(block_hash)
         {
+            // The parent first, as for every import: a block the pull brought
+            // in never told the engine, and an unknown parent withholds the
+            // vote (audit 2026-10 round 2, R2-R1).
+            if let Some(header) = self.block_headers.get(block_hash) {
+                self.engine.remember_parent(*block_hash, header.parent_hash);
+            }
             if let Err(err) = self.engine.process_event(ConsensusEvent::BlockImported(*block_hash)) {
                 debug!(target: "n42.h2.node", ?block_hash, "engine refused an import it had already been told of");
                 report_engine_error(&err, "repeated import", &mut self.fatal);

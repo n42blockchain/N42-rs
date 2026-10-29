@@ -1130,6 +1130,11 @@ impl ConsensusEngine {
         self.imported_parents.insert(block_hash, parent_hash);
     }
 
+    /// Whether [`Self::remember_parent`] recorded `block_hash`'s parent.
+    pub fn knows_parent(&self, block_hash: &B256) -> bool {
+        self.imported_parents.contains_key(block_hash)
+    }
+
     pub fn locked_qc(&self) -> &QuorumCertificate {
         self.round_state.locked_qc()
     }

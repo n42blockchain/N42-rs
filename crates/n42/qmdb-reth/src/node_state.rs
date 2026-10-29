@@ -2382,6 +2382,11 @@ impl QmdbNodeState {
         }
         paths.sort();
         for path in paths.into_iter().rev() {
+            // A rollback archive holds a checkpoint and logs set aside over
+            // entries since cut away: kept to inspect, never a way back.
+            if path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("rollback-")) {
+                continue;
+            }
             let Some(ckpt) = read_ckpt(&path.join("forest.ckpt"))? else { continue };
             if ckpt.head_number > target.0 { continue; }
             let (ckpt, _) = replay_delta_log(&path.join("forest.log"), ckpt, Some(target.1))?;
@@ -2421,8 +2426,11 @@ impl QmdbNodeState {
         self.check_restored_root(head, forest.root())?;
         // The live log and any sealed segment continue from the fold head,
         // past the database's head; they stand on entries just cut away.
-        // They go before the checkpoint is replaced: a crash in between
+        // They are set aside with the future checkpoint as a `rollback-*`
+        // archive, as heap mode does, for inspection (audit 2026-10 D-9),
+        // then go before the checkpoint is replaced: a crash in between
         // finds the live checkpoint still past the head and comes back here.
+        self.archive_pair(&format!("rollback-{:020}-{:x}", head_number, head_hash), &self.ckpt_path(), &self.delta_log_path())?;
         for future in [self.delta_log_path(), self.sealed_log_path()] {
             match std::fs::remove_file(&future) {
                 Ok(()) => {}

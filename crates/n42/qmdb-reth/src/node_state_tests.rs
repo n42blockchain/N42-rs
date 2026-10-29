@@ -479,6 +479,36 @@ fn fold_archives(dir: &Path) -> Vec<String> {
     names
 }
 
+/// Audit 2026-10 D-9: a file-mode restart below the checkpoint sets aside
+/// the future checkpoint and logs as a `rollback-*` archive, as heap mode
+/// does, rather than deleting them; and the archive search for a later
+/// restart does not take that archive for a way back.
+#[test]
+fn a_file_mode_restart_below_the_checkpoint_keeps_a_rollback_archive() {
+    let (chain, dir, roots) = folded_at_ten("file-rollback-archive", true);
+    let restarted = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+    restarted.initialize((7, hash_of(7))).expect("a database head below the fold head");
+    let rollbacks: Vec<String> = std::fs::read_dir(dir.join("recovery-archive"))
+        .expect("the archives")
+        .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("rollback-"))
+        .collect();
+    assert_eq!(rollbacks.len(), 1, "{rollbacks:?}");
+    assert!(rollbacks[0].starts_with(&format!("rollback-{:020}-{:x}-", 7, hash_of(7))), "{rollbacks:?}");
+    let archive = dir.join("recovery-archive").join(&rollbacks[0]);
+    assert!(archive.join("forest.ckpt").exists() && archive.join("forest.log").exists());
+    let mut head = hash_of(7);
+    for number in 8..=12 {
+        (head, _) = advance(&restarted, number, head);
+    }
+    drop(restarted);
+    let again = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    again.initialize((12, head)).expect("the head reached again");
+    assert_eq!(again.state_root(), roots[12]);
+    drop(again);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A SIGKILL after a fold but before the database reached the fold head:
 /// the restart at the database's head comes from the fold's archive, and
 /// the node then follows the blocks again and restarts at the new head.

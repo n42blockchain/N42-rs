@@ -3441,8 +3441,12 @@ impl QmdbNodeState {
                 Ok(())
             });
             if let Err(error) = appended {
+                // Back into the bookkeeping, for a retry on another branch,
+                // and back into their records, for one on this branch (R3-G1).
+                let unlogged: Vec<_> = deltas.into_iter().skip(logged).collect();
                 self.with_forest("on_canonical#remeasure", |forest| {
-                    forest.remeasure(&deltas[logged..]);
+                    forest.remeasure(&unlogged);
+                    forest.restore_deltas(unlogged);
                     Ok(())
                 })?;
                 return Err(error);

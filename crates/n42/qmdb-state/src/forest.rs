@@ -1645,6 +1645,23 @@ impl QmdbForest {
         }
     }
 
+    /// Returns deltas taken by [`Self::take_block_deltas`] that never
+    /// reached the log to the records they came from, so a retry -- at the
+    /// same block or a later one -- takes the per-block path again. Measured
+    /// from the bookkeeping instead, a later target lost the flips of every
+    /// block above the failed one: the failed persistence had cleared them
+    /// (audit 2026-10 round 3, R3-G1). A record that is gone, or holds a
+    /// delta again, is left as it is.
+    pub fn restore_deltas(&mut self, deltas: Vec<ForestDelta>) {
+        for delta in deltas {
+            if let Some(record) = self.records.get_mut(&delta.head_hash)
+                && record.delta.is_none()
+            {
+                record.delta = Some(delta);
+            }
+        }
+    }
+
     /// Forgets what has changed, without describing it.
     ///
     /// For a caller that has just written the whole tree: the changes are in

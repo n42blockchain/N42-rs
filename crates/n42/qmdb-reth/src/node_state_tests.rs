@@ -1344,6 +1344,34 @@ fn a_failed_delta_append_loses_no_flip() {
     }
 }
 
+/// Audit 2026-10 round 3 (R3-G1): the same failure, retried at a later
+/// block. The failed append's deltas stayed taken, so the retry could not
+/// take the per-block path and measured from the bookkeeping -- which the
+/// failed persistence had cleared of every block above its target, and
+/// which the give-back refilled only with the target's own flips.
+#[test]
+fn a_failed_append_retried_at_a_later_block_loses_no_flip() {
+    for (entry_file, nth) in [(true, 1), (false, 1)] {
+        let (state, chain, dir, head3, _) = node_at(&format!("failed-append-later-{entry_file}-{nth}"), entry_file, 3);
+        let prepared = state.compute(head3, &changes_for(4)).expect("compute 4");
+        state.insert(hash_of(4), 4, prepared).expect("insert 4");
+        let prepared = state.compute(hash_of(4), &changes_for(5)).expect("compute 5");
+        state.insert(hash_of(5), 5, prepared).expect("insert 5");
+        let prepared = state.compute(hash_of(5), &changes_for(6)).expect("compute 6");
+        state.insert(hash_of(6), 6, prepared).expect("insert 6");
+        state.on_canonical(hash_of(4)).expect("canonical 4");
+        fail_delta_append(nth);
+        state.on_canonical(hash_of(5)).expect_err("the append fails");
+        state.on_canonical(hash_of(6)).expect("the retry, one block further, persists");
+        let root = state.state_root();
+        drop(state);
+
+        let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        restarted.initialize((6, hash_of(6))).expect("the log replays onto block 6's tree");
+        assert_eq!(restarted.state_root(), root, "entry file {entry_file}");
+    }
+}
+
 /// Audit 2026-10 round 2 (R2-R4): a block computed between the
 /// persistence's two holds (the next build) keeps its own move bookkeeping,
 /// and only its own: what the persisted deltas carried is not kept with it.

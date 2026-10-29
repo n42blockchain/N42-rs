@@ -684,8 +684,12 @@ impl ConsensusEngine {
     /// refuses exactly this (`extendsJustify`); it wedges instead when a
     /// Rust quorum does not.
     ///
-    /// A genesis justify (no block) and an unknown parent pass, as they do in
-    /// gov5: the rule refuses what it can see, and never a vote it cannot judge.
+    /// A genesis justify (no block) passes. An unknown parent abstains: gov5's
+    /// rule passes it too, but gov5 only reaches the rule with the parent
+    /// known (`tryHeaderVote` needs its `importedParents` entry), so neither
+    /// client votes on a parent it cannot judge (audit 2026-10 A-2). The
+    /// service records the parent of every block it imports or checks with a
+    /// header, before the event that releases the vote.
     fn extends_justify(&self, block_hash: B256) -> bool {
         let Some(pending) = self.pending_proposal.as_ref() else {
             return true;
@@ -694,7 +698,11 @@ impl ConsensusEngine {
             return true;
         }
         let Some(parent) = self.imported_parents.get(&block_hash).copied() else {
-            return true;
+            tracing::debug!(target: "n42::interop::h2v4",
+                view = pending.view, %block_hash,
+                "import-gated vote withheld: the block's parent is not known here"
+            );
+            return false;
         };
         // A zero parent is no parent: gov5 reads it as unknown, and so do
         // the harness's mock blocks.

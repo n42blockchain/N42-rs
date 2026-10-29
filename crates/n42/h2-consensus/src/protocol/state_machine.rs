@@ -3208,7 +3208,7 @@ mod tests {
         // leader proposes from a head that never imported `certified`.
         let genesis = B256::repeat_byte(0x42);
         let certified = B256::repeat_byte(0xA1);
-        let vote_after = |block: B256, parent: B256| {
+        let vote_after = |block: B256, parent: Option<B256>| {
             let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
             enable_test_h2(&mut engine);
             let mut proposal = signed_h2_test_proposal(&engine, 2, block, 2, &sks[2]);
@@ -3230,7 +3230,9 @@ mod tests {
                 )))
                 .expect("the proposal itself is valid");
             assert_eq!(engine.current_view(), 2, "the justify QC carries the engine to view 2");
-            engine.remember_parent(block, parent);
+            if let Some(parent) = parent {
+                engine.remember_parent(block, parent);
+            }
             engine
                 .process_event(ConsensusEvent::BlockImported(block))
                 .expect("import is reported");
@@ -3242,12 +3244,19 @@ mod tests {
             })
         };
         assert!(
-            !vote_after(B256::repeat_byte(0xB2), genesis),
+            !vote_after(B256::repeat_byte(0xB2), Some(genesis)),
             "a sibling of the certified block must not get a vote"
         );
         assert!(
-            vote_after(B256::repeat_byte(0xC3), certified),
+            vote_after(B256::repeat_byte(0xC3), Some(certified)),
             "a child of the certified block gets one"
+        );
+        // Audit 2026-10 A-2: a block whose parent this node never learnt
+        // cannot be judged, so it gets no vote -- gov5 votes only on a known
+        // parent (`tryHeaderVote` needs its `importedParents` entry).
+        assert!(
+            !vote_after(B256::repeat_byte(0xD4), None),
+            "an unjudged parent is abstained on"
         );
     }
 

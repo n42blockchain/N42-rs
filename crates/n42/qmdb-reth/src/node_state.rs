@@ -1113,6 +1113,20 @@ const COMPACTION_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_se
 #[cfg(test)]
 const COMPACTION_RETRY_PAUSE: std::time::Duration = std::time::Duration::ZERO;
 
+#[cfg(test)]
+thread_local! {
+    /// Run once between [`QmdbNodeState::persist_canonical`]'s two holds of
+    /// the forest, on the persisting thread: a test's way to move the tree
+    /// there.
+    static BETWEEN_PERSIST_HOLDS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Sets [`BETWEEN_PERSIST_HOLDS`] for this thread.
+#[cfg(test)]
+fn set_between_persist_holds(hook: Box<dyn FnOnce()>) {
+    BETWEEN_PERSIST_HOLDS.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
 /// A handle to the node's QMDB state. Cheap to clone; all clones share it.
 #[derive(Clone)]
 pub struct QmdbNodeState {
@@ -3276,7 +3290,7 @@ impl QmdbNodeState {
         // off this thread (`release_off_lock`): after a persistence batch it
         // is the whole batch, and freed under the lock it held every build's
         // and import's QMDB root for up to a second (BREAKTHROUGH_DESIGN 10.38).
-        let (block_hash, number, ready, released) = self.with_forest("on_canonical", |forest| {
+        let (block_hash, number, ready, released, moves) = self.with_forest("on_canonical", |forest| {
             let block_hash = target.unwrap_or_else(|| forest.head().1);
             let released = forest.set_canonical_releasing(block_hash)?;
             let ready = forest.take_block_deltas(cursor.head, cursor.next_slot, block_hash).map(|deltas| {
@@ -3284,9 +3298,13 @@ impl QmdbNodeState {
                     deltas.iter().map(|delta| (delta.head_number, delta.head_hash, forest.root_of(&delta.head_hash))).collect();
                 (deltas, roots)
             });
-            Ok((block_hash, forest.head().0, ready, released))
+            Ok((block_hash, forest.head().0, ready, released, forest.moves()))
         })?;
         release_off_lock(number, released);
+        #[cfg(test)]
+        if let Some(hook) = BETWEEN_PERSIST_HOLDS.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
         // The catch-up's head may be behind one recorded since; that one
         // already set the number.
         if target.is_some() {
@@ -3310,9 +3328,16 @@ impl QmdbNodeState {
             self.record_head_roots(&roots);
             // The tree's move bookkeeping describes changes since the last
             // measured delta; what these deltas carried is measured now, and
-            // any move that follows records itself afresh.
+            // any move that follows records itself afresh. A move made since
+            // the first hold (a build on another parent) is not in these
+            // deltas and cannot be told apart from what is, so then the
+            // bookkeeping is kept whole: a later delta measured from it
+            // re-sends flags the log already holds, which is harmless, where
+            // a forgotten move would lose its flips (audit 2026-10 D-5).
             self.with_forest("on_canonical#2", |forest| {
-                forest.forget_changes();
+                if forest.moves() == moves {
+                    forest.forget_changes();
+                }
                 Ok(())
             })?;
             if checkpoint_due(cursor) {

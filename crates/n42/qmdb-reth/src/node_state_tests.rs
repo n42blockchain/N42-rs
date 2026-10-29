@@ -1217,6 +1217,42 @@ fn a_branch_switch_during_a_lease_waits_and_takes_the_owed_trim_first() {
 // The restart's root check
 // ---------------------------------------------------------------------------
 
+/// Audit 2026-10 D-5: a move made between the persistence's two holds of
+/// the forest -- a build on another parent -- is not wiped with the moves
+/// the block deltas already carried. A later branch switch measures its
+/// delta from that bookkeeping, and a restart must land on the same tree.
+#[test]
+fn a_move_between_the_persistence_holds_reaches_the_next_delta() {
+    let (state, chain, dir, head3, _) = node_at("move-between-holds", true, 3);
+    let prepared = state.compute(head3, &changes_for(4)).expect("compute 4");
+    state.insert(hash_of(4), 4, prepared).expect("insert 4");
+    // A sibling of 4 with an account of its own: it leaves account 7 where
+    // block 3 put it, a slot block 4 retired.
+    let mut sibling_changes = BlockChanges::new();
+    sibling_changes.set_account(
+        Address::repeat_byte(0x99),
+        AccountState { nonce: 1, balance: U256::from(9u64), code_hash: B256::ZERO },
+    );
+    let sibling = B256::repeat_byte(0x44);
+    let built = Arc::new(std::sync::Mutex::new(None));
+    {
+        let (state, built, changes) = (state.clone(), Arc::clone(&built), sibling_changes.clone());
+        set_between_persist_holds(Box::new(move || {
+            *built.lock().unwrap() = Some(state.compute(head3, &changes).expect("compute the sibling"));
+        }));
+    }
+    state.on_canonical(hash_of(4)).expect("canonical 4");
+    let prepared = built.lock().unwrap().take().expect("the hook ran between the holds");
+    state.insert(sibling, 4, prepared).expect("insert the sibling");
+    state.on_canonical(sibling).expect("switch to the sibling");
+    let root = state.state_root();
+    drop(state);
+
+    let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    restarted.initialize((4, sibling)).expect("the log replays onto the sibling's tree");
+    assert_eq!(restarted.state_root(), root);
+}
+
 /// Audit 2026-10 D-4: a move below the persisted head rewrites the entry
 /// file's slots before any delta says so. A process that dies there leaves
 /// the log on the old branch and the entries on the new one; the restart

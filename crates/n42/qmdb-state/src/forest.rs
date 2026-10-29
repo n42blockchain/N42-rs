@@ -434,6 +434,10 @@ pub struct QmdbForest {
     /// cursor, lowered by any move that rewound below it): what
     /// [`Self::block_changes_parts`] checks instead of flushing.
     flushed_slots: u64,
+    /// How many moves [`Self::note_move`] has recorded, ever: a caller that
+    /// lets go of the forest between taking deltas and forgetting the moves
+    /// they carried compares it to tell whether others came in between.
+    moves: u64,
     /// A head move recorded while the tree was leased out
     /// ([`Self::set_canonical_in_place`]) still owes the twig trim it would
     /// have done; [`Self::return_tree`] (or the next
@@ -901,6 +905,7 @@ impl QmdbForest {
             last_tail: (0, 0, 0),
             leased_at: None,
             flushed_slots: 0,
+            moves: 0,
             trim_due: false,
             deferred_twigs: Vec::new(),
             poisoned: None,
@@ -933,6 +938,13 @@ impl QmdbForest {
         }
         self.min_cursor = self.min_cursor.min(self.tree.next_slot());
         self.flushed_slots = self.flushed_slots.min(self.tree.next_slot());
+        self.moves += 1;
+    }
+
+    /// How many moves have been recorded since this forest was built
+    /// ([`Self::forget_changes`] does not reset it).
+    pub const fn moves(&self) -> u64 {
+        self.moves
     }
 
     /// Sets how many blocks behind the head are kept.

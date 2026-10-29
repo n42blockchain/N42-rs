@@ -1417,3 +1417,21 @@ fn fill_and_block_replies_draw_on_a_byte_budget_held_until_dropped() {
     let whole = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_FILL_SERVE_BYTES >> 10));
     assert!(reply_permit(&whole, usize::MAX).is_some(), "a reply larger than the budget takes all of it, once");
 }
+
+/// Audit 2026-10 round 2 (R2-R5): while pulled blocks wait for a proof
+/// (`unproven_from`), the height last read from the execution layer still
+/// answers "is any peer past what is held": no peer is past the unproven
+/// start, so the layer is not read again on every drain.
+#[tokio::test]
+async fn no_peer_past_the_unproven_start_reads_the_layer_once_not_every_drain() {
+    let mut rig = node(1, 0, None).await;
+    // A sentinel: the mock layer is empty, so a read would set it to 0.
+    rig.svc.imported_height = Some(10);
+    rig.svc.unproven_checked = true;
+    rig.svc.unproven_from = Some(8);
+    rig.svc.peer_heights.insert(PeerId::random(), 5);
+    let mut events = Vec::new();
+    within(rig.svc.consider_catch_up(&mut events)).await;
+    assert_eq!(rig.svc.imported_height, Some(10), "no peer past block 7: the layer is not read");
+    assert!(rig.svc.catch_up.is_none());
+}

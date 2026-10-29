@@ -4289,8 +4289,13 @@ impl<E: ExecutionLayer> H2Service<E> {
             return;
         };
         // The execution layer is asked only when a peer may be past what was
-        // last read from it.
-        if self.unproven_checked && self.unproven_from.is_none() && self.imported_height.is_some_and(|tip| height <= tip) {
+        // last read from it -- below the unproven start, when pulled blocks
+        // wait for a proof: that start stays put, and the layer was read on
+        // every drain while it did (audit 2026-10 round 2, R2-R5).
+        let held = self
+            .imported_height
+            .map(|tip| self.unproven_from.map_or(tip, |from| tip.min(from.saturating_sub(1))));
+        if self.unproven_checked && held.is_some_and(|held| height <= held) {
             return;
         }
         if !self.unproven_checked {

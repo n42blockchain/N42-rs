@@ -45,4 +45,13 @@ persistence formats; gov5's own behaviour (PoP, genesis-QC spelling). Nothing bu
 
 | id | verdict | note |
 |---|---|---|
-| all | pending | |
+| A-1 | confirmed; P2 (was P1) | `try_form_prepare_qc` propagates the vote-log error (`voting.rs:227-231`), but the batch paths drop it at debug (`vote_batch.rs:264-266, 309-311, 389-390`), as does replay (`state_machine.rs:1778-1781`); `flush_votes` always returns Ok (`vote_batch.rs:319`). The halt itself still happens (`state_machine.rs:1061, 1835`) and `vote_log_failures_total` is exported; `METRIC_VOTING_HALTED` is set only for `commit_invalid` (`service.rs:1589`). Surfacing gap, no safety impact. |
+| A-2 | partly confirmed; P2 | An unknown parent passes (`proposal.rs:696-698`), documented as matching gov5 (`:687-688`, not checked against gov5). Import paths record the parent whenever the header is held (`service.rs:3926-3941`); reaching it needs a header-cache miss. |
+| A-3 | confirmed; P2 | A repeat with the same commitment passes the equivocation tracker (`proposal.rs:316-343`); no proposal dedup in h2-node; `enter_voting` resets the phase (`round.rs:151-153`), so after a timeout a replay makes `consecutive_timeouts` grow twice (`timeout.rs:219, 254-255`). Any peer can replay. A replay after a timeout also re-arms `pending_proposal` (`proposal.rs:441`): check whether it can release a first vote in a view already timed out of. |
+| A-4 | confirmed, latent; P2 | `try_new` checks subgroup and infinity only (`set.rs:53-65`); gov5 profiles refuse validator changes (`proposal.rs:286-292`), so keys come only from genesis. |
+| A-5 | confirmed, latent; P2 | Commit before `commit_pending_changes()?` (`voting.rs:385` vs `403`); `imported_parents` not cleared on view advance (`state_machine.rs:1740-1743`). Native profile only, not used in production. |
+| A-6 | confirmed; P2 | Only a zero-hash, empty QC is genesis (`wire_bridge.rs:176-207`); other view-0 QCs are skipped on proposals (`proposal.rs:351`) and accepted on timeouts and headers (`timeout.rs:183-188`, `service.rs:4503-4505`). On proposals it hurts only the bad leader's view. |
+| A-7 | confirmed; P2 | Either domain accepted (`state_machine.rs:1910`); seal unchecked by design (`service.rs:4466-4468`). An empty QC (`:4481-4483`) or any view-0 QC (`:4503-4505`) also passes, so the header-QC check proves nothing against a malicious range server: the control is "pulled is never safe". State it in the code and test it. |
+| A-8 | confirmed; P2 | Verification failures return `Ok(false)` (`state_machine.rs:1589-1598`, `1381-1391`); the service does not score peers on engine errors either (`service.rs:2851-2853`). |
+
+Verifier: no gov5 source on this host (`../N42-gov5` absent), so gov5-compatibility claims are unchecked.

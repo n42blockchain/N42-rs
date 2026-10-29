@@ -58,4 +58,6 @@ skips; whether `N42_INGEST_VERIFY` is set on X22 legs. Nothing built or run.
 | id | verdict | note |
 |---|---|---|
 | C-1 | confirmed (mechanism) | `remember_claimed` (679-684) calls `remember_verified` -> `remember_layout`, which keeps the first filing for a root (630-639); `layout_by_root` serves the node's own descriptions from the same table. Exploitability (an honest leader rebuilding the same root) not shown. |
-| C-2 .. C-4 | pending | |
+| C-2 | confirmed; P2 | The only gate, `trusting_mode_refusal` (`main.rs:76-82`, `sender_cache.rs:200-214`), covers `leader`/`shard`; `N42_FRAME_GATEWAYS` only produces a warning (`main.rs:83-87, 136-138`). The attested branch caches `alt_tx.sender()` without `ed25519_key()` (`tx-ingest/src/lib.rs:2163-2179`, `alt_sig.rs:169-193`). A gate needs `fleet7-env.sh` to acknowledge gateway legs too. |
+| C-3 | confirmed; P2 | `setup.direct` sends the frame through `push_frame` and returns before `pool.add_transactions` (`lib.rs:1859-1874`); only a warning (`main.rs:85`); the hard gate is the off-loopback bind refusal (`lib.rs:1240-1253`). `KNOBS.md:233` says "presence only (`=0` still counts)", but the code reads it with `n42_env::flag` (`lib.rs:456`): the doc is stale. |
+| C-4 | confirmed; P2 | `fleet7-env.sh:160-162` exports `N42_BENCH_UNSAFE=1` whenever `N42_INGEST_VERIFY` is leader or shard. |

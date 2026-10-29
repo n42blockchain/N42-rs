@@ -44,3 +44,4 @@ RPC/快照/tx-queue/mobile。每项修复前先按代码核实,先写复现测�
 | id | 状态 |
 |---|---|
 | R3-P1 | 已修:`init` 先验证 portable 快照得到树(在链上、在头部块、root 等于头部),写入时逐行核对账户叶值与每个非零槽位,地址严格递增,最后按 gov5 `verifyExportCoverage` 核对覆盖(保留的 EIP-161 空账户除外);测试 `init_refuses_a_dump_the_snapshot_does_not_authenticate` 修复前失败(篡改余额的 dump 被接受)。仅 init,无热路径 |
+| R3-N1 | 已修:`read_framed_limit` 逐块累计(不再每块从头重扫),可跳过块(流标识/填充)至多 16 个;`unframe_payload_limit` 按实际解码增长输出(不再按声明长度 `vec![0; len]`)。测试 `a_frame_padded_with_skippable_chunks_is_refused` 修复前失败(10,000 个填充块被接受)。热路径:body 解码器,只减不增;线格式不变(gov5 只发一个流标识)。未做:每 peer 连接上限 |

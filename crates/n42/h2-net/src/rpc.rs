@@ -70,15 +70,18 @@ where
             return Err(io::Error::new(io::ErrorKind::InvalidData, "length varint too long"));
         }
     }
+    let (declared, _) = crate::status::decode_varint(&buf).map_err(to_io)?;
+    if declared > max_decoded {
+        return Err(to_io(crate::status::StatusError::TooLong { got: declared }));
+    }
     // Then whole snappy frames — a 4-byte header naming the body length —
-    // until the declared length is accounted for.
-    loop {
-        if let Some(end) = framed_len_limit(&buf, max_decoded).map_err(to_io)? {
-            if end != buf.len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "frame ended mid snappy chunk"));
-            }
-            return unframe_payload_limit(&buf, max_decoded).map_err(to_io);
-        }
+    // until the declared length is accounted for. Each chunk is counted once
+    // as it arrives; the frame used to be walked from its start after every
+    // chunk, and empty skippable chunks were taken without limit, so a peer
+    // could make one read quadratic (audit 2026-10 round 3, R3-N1).
+    let mut produced = 0u64;
+    let mut skippable = 0usize;
+    while produced < declared {
         let mut header = [0u8; 4];
         io.read_exact(&mut header).await?;
         let body_len = u32::from_le_bytes([header[1], header[2], header[3], 0]) as usize;
@@ -92,8 +95,43 @@ where
         let start = buf.len();
         buf.resize(start + body_len, 0);
         io.read_exact(&mut buf[start..]).await?;
+        let body = &buf[start..];
+        match header[0] {
+            0x00 | 0x01 if body_len < 4 => {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "data chunk shorter than its CRC"));
+            }
+            0x00 => {
+                produced += snap::raw::decompress_len(&body[4..])
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+                    as u64;
+            }
+            0x01 => produced += (body_len - 4) as u64,
+            0xff | 0x80..=0xfe => {
+                skippable += 1;
+                if skippable > MAX_SKIPPABLE_CHUNKS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("more than {MAX_SKIPPABLE_CHUNKS} skippable snappy chunks"),
+                    ));
+                }
+            }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("reserved chunk type {other:#x}"),
+                ));
+            }
+        }
+        if produced > declared {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "data exceeds declared length"));
+        }
     }
+    unframe_payload_limit(&buf, max_decoded).map_err(to_io)
 }
+
+/// Stream identifiers and padding a frame may carry: gov5's writer sends one
+/// identifier and no padding.
+const MAX_SKIPPABLE_CHUNKS: usize = 16;
 
 fn to_io(e: crate::status::StatusError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
@@ -190,6 +228,36 @@ mod tests {
                 .unwrap(),
             42,
         )
+    }
+
+    /// Audit 2026-10 round 3 (R3-N1): the reader walked every chunk header
+    /// from the start of the frame after each chunk it read, and took any
+    /// number of empty skippable chunks -- a peer streaming megabytes of
+    /// them made the walk quadratic and held a worker thread for minutes. A
+    /// frame carries a stream identifier and data; a few skippable chunks
+    /// are allowed, a run of them is refused.
+    #[tokio::test]
+    async fn a_frame_padded_with_skippable_chunks_is_refused() {
+        let payload = vec![7u8; 100];
+        let framed = crate::status::frame_payload(&payload).unwrap();
+        let varint = crate::status::decode_varint(&framed).unwrap().1;
+        let padded = |chunks: usize| {
+            // After the stream identifier (a 10-byte chunk), which must come first.
+            let mut wire = framed[..varint + 10].to_vec();
+            for _ in 0..chunks {
+                wire.extend_from_slice(&[0xfe, 0, 0, 0]);
+            }
+            wire.extend_from_slice(&framed[varint + 10..]);
+            wire
+        };
+        let wire = padded(2);
+        let read = read_framed_limit(&mut wire.as_slice(), MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK).await;
+        assert_eq!(read.expect("two padding chunks are fine"), payload);
+        let wire = padded(10_000);
+        let err = read_framed_limit(&mut wire.as_slice(), MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK)
+            .await
+            .expect_err("a run of padding");
+        assert!(err.to_string().contains("skippable"), "{err}");
     }
 
     #[tokio::test]

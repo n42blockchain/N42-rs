@@ -229,16 +229,21 @@ pub fn unframe_payload_limit(bytes: &[u8], max_decoded: u64) -> Result<Vec<u8>, 
     if len > max_decoded {
         return Err(StatusError::TooLong { got: len });
     }
-    let mut out = vec![0u8; len as usize];
-    let mut decoder = snap::read::FrameDecoder::new(&bytes[consumed..]);
+    // The output grows with what actually decodes: the declared length is
+    // the peer's word, and a few kilobytes of chunk headers could claim the
+    // whole bound (audit 2026-10 round 3, R3-N1). Snappy expands at most
+    // ~21x, so an honest frame is sized once.
+    let wire = bytes.len().saturating_sub(consumed);
+    let mut out = Vec::with_capacity((len as usize).min(wire.saturating_mul(24)));
+    let mut decoder = snap::read::FrameDecoder::new(&bytes[consumed..]).take(len + 1);
     decoder
-        .read_exact(&mut out)
+        .read_to_end(&mut out)
         .map_err(|e| StatusError::Snappy(e.to_string()))?;
-    let mut extra = [0u8; 1];
-    if decoder.read(&mut extra).map_err(|e| StatusError::Snappy(e.to_string()))? != 0 {
-        return Err(StatusError::Snappy("data exceeds declared length".into()));
+    match (out.len() as u64).cmp(&len) {
+        std::cmp::Ordering::Less => Err(StatusError::Snappy("data is shorter than its declared length".into())),
+        std::cmp::Ordering::Greater => Err(StatusError::Snappy("data exceeds declared length".into())),
+        std::cmp::Ordering::Equal => Ok(out),
     }
-    Ok(out)
 }
 
 /// Walks snappy frame headers to find where a framed payload ends.

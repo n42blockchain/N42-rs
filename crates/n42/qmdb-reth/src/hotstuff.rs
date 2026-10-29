@@ -85,6 +85,12 @@ pub struct HotStuffGenesisConfig {
     /// see `n42_h2_consensus::committee_pool`.
     #[serde(default)]
     pub committee_pool: Option<CommitteePoolGenesis>,
+    /// gov5's two-phase vote gate (`twoPhaseVoteGate`): Round 1 votes no
+    /// longer wait for the import, so the commit vote is the execution
+    /// attestation and waits for it instead. This node holds its commit vote
+    /// the same way; its Round 1 stays import-gated.
+    #[serde(default)]
+    pub two_phase_vote_gate: bool,
 }
 
 /// `hotstuff.committeePool` in the genesis.
@@ -273,6 +279,17 @@ mod tests {
         assert!(header.parent_beacon_block_root.is_some(), "Cancun at genesis");
         assert!(header.withdrawals_root.is_some(), "Shanghai at genesis");
         assert_eq!(header.difficulty, alloy_primitives::U256::ZERO, "a BFT chain is post-merge from block 0");
+    }
+
+    /// Audit 2026-10 R2-C9: gov5's production genesis turns the two-phase
+    /// gate on; it used to be dropped as an unknown field.
+    #[test]
+    fn the_two_phase_vote_gate_is_read() {
+        let on: HotStuffGenesisConfig = serde_json::from_str(r#"{"twoPhaseVoteGate":true}"#).unwrap();
+        assert!(on.two_phase_vote_gate);
+        let off: HotStuffGenesisConfig = serde_json::from_str("{}").unwrap();
+        assert!(!off.two_phase_vote_gate);
+        assert!(!HotStuffGenesisConfig::from_genesis(&N42_DEVNET.genesis).unwrap().two_phase_vote_gate);
     }
 
     #[test]

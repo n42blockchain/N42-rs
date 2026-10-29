@@ -461,6 +461,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("signing      : H2-v4");
         }
         engine.set_leader_tenure(leader_tenure);
+        if hotstuff_config.as_ref().is_some_and(|config| config.two_phase_vote_gate) {
+            engine.set_two_phase_vote_gate(true);
+            println!("vote gate    : two-phase (commit vote waits for the import)");
+        }
         // Bench only: a vote before the import bounds what deferred execution
         // (docs/PHASE_D_DEFERRED_EXECUTION.md) would give the cycle.
         if std::env::var("N42_VOTE_BEFORE_IMPORT").is_ok_and(|v| v == "1") {

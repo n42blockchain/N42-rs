@@ -1,7 +1,7 @@
 use alloy_primitives::B256;
 use n42_h2_primitives::{
     BlsSecretKey,
-    consensus::{ConsensusMessage, H2V4ChainIdentity, QuorumCertificate, ViewNumber},
+    consensus::{ConsensusMessage, H2V4ChainIdentity, PrepareQC, QuorumCertificate, ViewNumber},
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -357,6 +357,13 @@ pub struct ConsensusEngine {
     /// what deferred execution (`docs/PHASE_D_DEFERRED_EXECUTION.md`) would
     /// give the cycle before any header changes.
     pub(super) vote_before_import: bool,
+    /// gov5's `hotstuff.twoPhaseVoteGate`: a PrepareQC no longer proves its
+    /// voters executed the block, so this node's commit vote waits for the
+    /// block's import (audit 2026-10 R2-C9). Round 1 stays import-gated
+    /// here, which is stricter than gov5's two-phase Round 1.
+    pub(super) two_phase_vote_gate: bool,
+    /// The PrepareQC whose commit vote the two-phase gate holds.
+    pub(super) held_prepare_qc: Option<PrepareQC>,
     /// Outputs `emit` could not put in a full output channel, in order. The
     /// channel's consumer is the task that runs this engine, so waiting for
     /// it to drain cannot work; nothing is dropped instead, and the consumer
@@ -532,6 +539,8 @@ impl ConsensusEngine {
             leader_tenure: 1,
             signing_profile: ConsensusSigningProfile::Native,
             vote_before_import: false,
+            two_phase_vote_gate: false,
+            held_prepare_qc: None,
             output_overflow: std::sync::Mutex::new(VecDeque::new()),
             round_state: RoundState::new(),
             pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
@@ -650,6 +659,8 @@ impl ConsensusEngine {
             leader_tenure: 1,
             signing_profile: ConsensusSigningProfile::Native,
             vote_before_import: false,
+            two_phase_vote_gate: false,
+            held_prepare_qc: None,
             output_overflow: std::sync::Mutex::new(VecDeque::new()),
             round_state: RoundState::from_snapshot(
                 recovered_view,
@@ -1122,6 +1133,11 @@ impl ConsensusEngine {
     /// it, under the H2-v4 profile too. See the field.
     pub fn set_vote_before_import(&mut self, on: bool) {
         self.vote_before_import = on;
+    }
+
+    /// gov5's `hotstuff.twoPhaseVoteGate`; see the field.
+    pub fn set_two_phase_vote_gate(&mut self, on: bool) {
+        self.two_phase_vote_gate = on;
     }
 
     /// Consecutive views one validator leads; see [`Self::set_leader_tenure`].
@@ -1871,6 +1887,7 @@ impl ConsensusEngine {
         self.commit_equivocation_tracker.clear();
         self.proposal_equivocation_tracker.clear();
         self.processed_proposal = None;
+        self.held_prepare_qc = None;
 
         // Defense-in-depth: re-derive my_index from the current set on every view
         // advance. The epoch-boundary branch above only fires for live consensus
@@ -3482,6 +3499,48 @@ mod tests {
             "no resync for changes a gov5 chain cannot carry: {outputs:?}"
         );
         assert_eq!(engine.current_view(), view, "and nothing is committed on it");
+    }
+
+    /// Audit 2026-10 R2-C9: under gov5's `twoPhaseVoteGate` a PrepareQC no
+    /// longer proves that its voters executed the block (gov5 votes Round 1
+    /// before the import), so the commit vote is the execution attestation:
+    /// it is held until the block is imported here, as gov5 holds it.
+    #[test]
+    fn under_the_two_phase_gate_the_commit_vote_waits_for_the_import() {
+        use crate::protocol::quorum::VoteCollector;
+        let (probe, ..) = make_engine(4, 0);
+        let leader = probe.leader_index_for_view(1);
+        let (mut engine, sks, vs, mut rx) = make_engine(4, (leader + 1) % 4);
+        enable_test_h2(&mut engine);
+        engine.set_two_phase_vote_gate(true);
+        let view = engine.current_view();
+        let block_hash = B256::repeat_byte(0xC9);
+        let message = engine.signing_profile.vote_message(view, block_hash);
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+        for i in (0..4u32).filter(|&i| i != engine.my_index).take(3) {
+            collector
+                .add_vote(i, engine.signing_profile.sign(&sks[i as usize], &message))
+                .unwrap();
+        }
+        let qc = collector
+            .build_qc_with_profile_message(&vs, &message, engine.signing_profile)
+            .unwrap();
+        let commit_votes = |rx: &mut mpsc::Receiver<EngineOutput>| {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::CommitVote(_))))
+                .count()
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(
+                n42_h2_primitives::consensus::PrepareQC { view, block_hash, qc },
+            )))
+            .expect("a valid PrepareQC");
+        assert_eq!(commit_votes(&mut rx), 0, "no commit vote before the block is imported here");
+        engine
+            .process_event(ConsensusEvent::BlockImported(block_hash))
+            .expect("the import");
+        assert_eq!(commit_votes(&mut rx), 1, "the held commit vote goes out on the import");
+        assert_eq!(engine.last_commit_voted_view(), view);
     }
 
     #[test]

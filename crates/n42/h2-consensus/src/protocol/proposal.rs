@@ -556,6 +556,14 @@ impl ConsensusEngine {
                 "suppressed duplicate commit vote (already commit-voted in this view)");
             return Ok(());
         }
+        // gov5's two-phase gate: the commit vote is the execution
+        // attestation, held until the block is imported here (audit 2026-10
+        // R2-C9). `on_block_imported` re-enters with the held PrepareQC.
+        if self.two_phase_vote_gate && !self.imported_blocks.contains(&pqc.block_hash) {
+            tracing::info!(target: "n42::interop::h2v4", view, block_hash = %pqc.block_hash, "two-phase vote: holding the commit vote until the block imports");
+            self.held_prepare_qc = Some(pqc);
+            return Ok(());
+        }
         // Persist before signing for the same crash-safety reason as R1.
         let previous = self.round_state.record_commit_vote(view);
         // A failed log write must not leave the watermark advanced: the
@@ -663,6 +671,16 @@ impl ConsensusEngine {
                 self.evict_oldest_imported_block();
             }
             self.imported_block_fifo.push_back(block_hash);
+        }
+
+        // The commit vote the two-phase gate held for this block.
+        if self.held_prepare_qc.as_ref().is_some_and(|held| held.block_hash == block_hash) {
+            if let Some(held) = self.held_prepare_qc.take() {
+                if held.view == self.round_state.current_view() {
+                    tracing::info!(target: "n42::interop::h2v4", view = held.view, %block_hash, "two-phase vote: block imported, casting the held commit vote");
+                    self.process_prepare_qc(held)?;
+                }
+            }
         }
 
         // edition-2021: N42-26 writes this as a let-chain. Resolving the

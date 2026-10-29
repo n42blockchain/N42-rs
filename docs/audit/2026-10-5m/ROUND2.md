@@ -59,3 +59,4 @@
 | R2-R2 | 未修:窗口内仍是先到先得,匿名 peer 抢占某高度会让诚实 leader 的块失去急切导入(只推迟到 proposal 到达时导入,不丢票)。根治要按 view leader 校验头部封印,另列 |
 | R2-I2 | 已修(主体):已提交高度之上 64 块以外、无可验 QC 的拉取块结束拉取并拒该 peer(冷节点尚无提交时不限);测试 `a_pull_far_past_the_committed_height_stops_at_the_first_unproven_block` 修复前失败。未做:在线节点不因未认证 status 发起追赶(64 块以内的伪造仍可导入为 head,永不 safe/finalized,A-7) |
 | R2-C3 | 已修(门控):`N42_VOTE_BEFORE_IMPORT`、`N42_VOTE_LOG_NOSYNC` 需 `N42_BENCH_UNSAFE=1`,否则 h2_validator 拒绝启动,vote log 也不跳过 sync;测试 `the_unsafe_vote_knobs_need_the_bench_acknowledgement` 在加门控前失败。vote-before-import 路径不加 extends 检查(导入前父块未知,加了等于永不投票),由门控限定为 bench |
+| R2-X3 | 已修:池路径只在每笔结果为 Ok/AlreadyImported 时记帧(每帧一次对结果的遍历,池路径非 5M 的 direct 路径);测试 `a_frame_the_pool_refused_is_not_indexed` 修复前失败 |

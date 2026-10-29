@@ -1877,7 +1877,14 @@ where
     // transaction that did not come from this node: it is validated, priced and
     // gossiped exactly as one that arrived over RPC.
     let results = pool.add_transactions(TransactionOrigin::External, decoded).await;
-    if let Some(queue) = setup.queue.clone().or_else(n42_tx_queue::global::<P::Transaction>) {
+    // Whole only if the pool holds every transaction: a refused frame noted
+    // would take one of the index's bounded slots and evict an admitted one
+    // (audit 2026-10 round 2, R2-X3).
+    let whole = results.iter().all(|outcome| match outcome {
+        Ok(_) => true,
+        Err(err) => matches!(err.kind, reth_transaction_pool::error::PoolErrorKind::AlreadyImported),
+    });
+    if whole && let Some(queue) = setup.queue.clone().or_else(n42_tx_queue::global::<P::Transaction>) {
         note_frame(&queue, frame);
     }
     STATS.frames.fetch_add(1, Ordering::Relaxed);

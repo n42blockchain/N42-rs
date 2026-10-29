@@ -607,6 +607,26 @@ fn frame_of_refuses_a_recovered_set_that_is_not_the_frames() {
     assert_eq!(frame_of::<N42PooledTransaction>(0, Vec::new(), None, &[]), None);
 }
 
+/// Audit 2026-10 round 2 (R2-X3): the queue's frame index names frames
+/// admitted whole. A frame the pool refused (here every transaction: the
+/// no-op pool takes none) is not noted, or refused frames would fill the
+/// index's bounded slots and evict the frames that were admitted.
+#[tokio::test]
+async fn a_frame_the_pool_refused_is_not_indexed() {
+    let _g = counter_lock();
+    n42_tx_types::set_alt_sig_enabled(true);
+    let pooled = vec![alt(71, 71_000), alt(71, 71_001)];
+    let hashes: Vec<B256> = pooled.iter().map(|tx| *tx.hash()).collect();
+    let recovered = recover(pooled, Vec::new(), None, false);
+    let frame = frame_of(2, hashes, None, &recovered).expect("whole frame");
+    let queue: n42_tx_queue::TxQueue<N42PooledTransaction> = n42_tx_queue::TxQueue::new();
+    let mut setup = Setup::from_env(false);
+    setup.queue = Some(queue.clone());
+    setup.direct = false;
+    admit_decoded(&Pool::new(), &setup, recovered, Some(frame), std::time::Instant::now()).await;
+    assert_eq!(queue.frames_indexed(), 0, "a refused frame is not in the index");
+}
+
 #[test]
 fn a_frame_with_an_undecodable_member_comes_back_unaligned() {
     let _g = counter_lock();

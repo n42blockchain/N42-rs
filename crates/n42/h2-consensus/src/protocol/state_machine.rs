@@ -1260,6 +1260,11 @@ impl ConsensusEngine {
                         }
                         return Ok(());
                     }
+                    // The jump found the carried QC forged: the message
+                    // takes no buffer slot (audit 2026-10 R2-C2).
+                    if self.unauthenticated.is_some() {
+                        return Ok(());
+                    }
                     if self.buffer_future_message(view, msg, authenticated_proof.is_some()) {
                         tracing::debug!(target: "n42::cl::engine",
                             current_view,
@@ -1428,6 +1433,29 @@ impl ConsensusEngine {
             );
             self.unauthenticated = Some((view, "future-view message signature"));
             return false;
+        }
+
+        // A proposal's signature does not cover its justify QC: copies of
+        // the leader's genuine proposal carrying forged QCs would pass the
+        // check above and fill the leader's share, keeping the genuine one
+        // out (audit 2026-10 R2-C2). The QC gets the check the replay will
+        // give it; a set this node does not know is a gap in its history,
+        // not a forgery, and such a proposal is still buffered. Cost: one
+        // aggregate verification per buffered future proposal.
+        if let ConsensusMessage::Proposal(proposal) = &msg {
+            let qc = &proposal.justify_qc;
+            if qc.view > 0
+                && self.resolve_qc_validator_set(qc).is_ok()
+                && self.verify_qc_any_domain_or_known(qc).is_err()
+            {
+                tracing::debug!(target: "n42::cl::engine",
+                    msg_view = view,
+                    qc_view = qc.view,
+                    "dropping future-view proposal: its QC does not verify"
+                );
+                self.unauthenticated = Some((view, "future-view proposal QC"));
+                return false;
+            }
         }
 
         // Per-view cap: the messages of one view are equals, so a full view
@@ -1823,11 +1851,16 @@ impl ConsensusEngine {
             tracing::debug!(target: "n42::cl::engine", view = new_view, replaying = to_replay.len(), "replaying buffered future-view messages");
         }
 
+        // A forgery the replay drops was sent by whoever sent that buffered
+        // message, not by the sender of the message that moved the view
+        // (audit 2026-10 R2-C8): what the replay flags is not reported.
+        let triggering = self.unauthenticated.take();
         for msg in to_replay {
             if let Err(e) = self.dispatch_message(msg, None) {
                 tracing::debug!(target: "n42::cl::engine", view = new_view, error = %e, "buffered message replay failed");
             }
         }
+        self.unauthenticated = triggering;
 
         tracing::debug!(target: "n42::cl::engine", view = new_view, "advanced to new view");
         Ok(())
@@ -4350,6 +4383,101 @@ mod tests {
         assert_eq!(engine.current_view(), start, "and moves no view");
     }
 
+    /// Audit 2026-10 R2-C2: a proposal's signature does not cover its
+    /// justify QC, so copies of the leader's genuine future proposal with
+    /// forged QCs pass the signature check. They must not take the leader's
+    /// future-buffer share: the genuine proposal that follows is buffered.
+    /// Both a QC that would jump (view = current) and one below the jump
+    /// threshold are refused.
+    #[test]
+    fn forged_qc_copies_of_a_future_proposal_do_not_crowd_out_the_genuine_one() {
+        for qc_back in [0u64, 1] {
+            let (mut engine, sks, vs, _rx) = make_engine(4, 0);
+            for view in 1..=2u64 {
+                let block_hash = B256::repeat_byte(0xC0 + view as u8);
+                let commit_qc = build_test_commit_qc(view, block_hash, &sks, &vs, &[0, 1, 2]);
+                engine
+                    .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                        view,
+                        block_hash,
+                        commit_qc,
+                        validator_changes_hash: B256::ZERO,
+                    })))
+                    .expect("valid Decide");
+            }
+            let current = engine.current_view();
+            assert_eq!(current, 3);
+            let view = current + 1;
+            let leader = engine.leader_index_for_view(view);
+            let block_hash = B256::repeat_byte(0xC7);
+            let genuine = signed_test_proposal(view, block_hash, leader, &sks[leader as usize]);
+            for i in 0..MAX_FUTURE_MESSAGES_PER_SENDER as u8 + 2 {
+                let mut forged = genuine.clone();
+                let mut qc =
+                    build_test_prepare_qc(current - qc_back, B256::repeat_byte(0xA0), &sks, &vs, &[0, 1, 2]);
+                qc.block_hash = B256::repeat_byte(0x10 + i);
+                forged.justify_qc = qc;
+                let err = engine
+                    .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(forged)))
+                    .expect_err("a forged QC is reported");
+                assert!(matches!(err, crate::error::ConsensusError::Unauthenticated { .. }), "{err:?}");
+            }
+            assert!(engine.future_msg_buffer.is_empty(), "qc_back {qc_back}: no forged copy is buffered");
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(genuine)))
+                .expect("the genuine proposal is taken");
+            assert_eq!(engine.future_msg_buffer.len(), 1, "qc_back {qc_back}: the genuine one is buffered");
+        }
+    }
+
+    /// Audit 2026-10 R2-C8: a buffered message replayed when the view moves
+    /// is not the triggering message. A forged vote that the replay drops
+    /// must not be reported as the fault of the Decide that moved the view.
+    #[test]
+    fn a_forged_message_found_at_replay_is_not_blamed_on_the_trigger() {
+        use crate::protocol::quorum::signing_message;
+        let (probe, ..) = make_engine(4, 0);
+        let led = probe.current_view() + 1;
+        let me = probe.leader_index_for_view(led);
+        let (mut engine, sks, vs, _rx) = make_engine(4, me);
+        assert_eq!(engine.current_view() + 1, led);
+        // Buffered at `led`: a Decide that moves the view past it, then a
+        // vote for it with a forged signature, which the replay sees late.
+        let led_hash = B256::repeat_byte(0xE2);
+        let led_qc = build_test_commit_qc(led, led_hash, &sks, &vs, &[0, 1, 2]);
+        engine.future_msg_buffer.push((
+            led,
+            ConsensusMessage::Decide(Decide {
+                view: led,
+                block_hash: led_hash,
+                commit_qc: led_qc,
+                validator_changes_hash: B256::ZERO,
+            }),
+        ));
+        let voter = (me + 1) % 4;
+        engine.future_msg_buffer.push((
+            led,
+            ConsensusMessage::Vote(Vote {
+                view: led,
+                block_hash: led_hash,
+                voter,
+                signature: sks[((me + 2) % 4) as usize].sign(&signing_message(led, &led_hash)),
+            }),
+        ));
+        let view = engine.current_view();
+        let block_hash = B256::repeat_byte(0xE1);
+        let commit_qc = build_test_commit_qc(view, block_hash, &sks, &vs, &[0, 1, 2]);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                view,
+                block_hash,
+                commit_qc,
+                validator_changes_hash: B256::ZERO,
+            })))
+            .expect("the genuine Decide is not reported for a replayed forgery");
+        assert_eq!(engine.current_view(), led + 1, "the replay ran");
+    }
+
     /// Audit 2026-10 A-8: a late vote for a view this node led whose
     /// signature verifies under neither domain is reported, not just ignored.
     #[test]
@@ -6460,19 +6588,19 @@ mod tests {
         let (mut engine, sks, vs, _rx) = make_engine(4, 0);
         let block_hash = B256::repeat_byte(0x61);
         // Same kind, view and block hash; aggregate signatures over other
-        // blocks, so neither verifies and neither moves the view.
+        // blocks. The QC names view 0, so no view jump checks it and the
+        // message is buffered unchecked (one whose QC a jump found forged
+        // is not buffered at all, audit 2026-10 R2-C2).
         let forged = |over: u8| {
             let other = build_test_prepare_qc(5, B256::repeat_byte(over), &sks, &vs, &[0, 1, 2]);
             ConsensusMessage::PrepareQC(PrepareQC {
                 view: 5,
                 block_hash,
-                qc: QuorumCertificate { view: 5, block_hash, ..other },
+                qc: QuorumCertificate { view: 0, block_hash, ..other },
             })
         };
         for message in [forged(0xA1), forged(0xA2), forged(0xA1)] {
-            // Buffered or dropped as before, and reported (audit 2026-10 A-8).
-            let err = engine.process_event(ConsensusEvent::Message(message)).expect_err("reported");
-            assert!(matches!(err, crate::error::ConsensusError::Unauthenticated { .. }), "{err:?}");
+            engine.process_event(ConsensusEvent::Message(message)).expect("buffered or deduplicated");
         }
         assert_eq!(engine.current_view(), 1);
         assert_eq!(

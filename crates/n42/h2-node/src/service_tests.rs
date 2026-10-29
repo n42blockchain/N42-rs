@@ -1027,6 +1027,20 @@ async fn a_block_taken_elided_is_served_from_the_execution_layer_on_demand() {
     assert_eq!(fill_from_body(&body, HeaderProfile::Ethereum, &request).expect("served"), Vec::<alloy_primitives::Bytes>::new());
 }
 
+/// Audit 2026-10 B-2: a queued request for a block taken elided is answered
+/// from the body store when an earlier request already fetched it -- the
+/// first fetch moves the block out of `elided_own`, and the requests behind
+/// it in the same drain used to fall through to a whole-block lookup on the
+/// loop -- and a block held nowhere costs no further lookup.
+#[tokio::test]
+async fn a_queued_request_is_answered_from_the_store_before_the_execution_layer() {
+    let mut rig = node(1, 0, None).await;
+    let (hash, _, rlp) = block(4, B256::repeat_byte(2));
+    assert!(rig.svc.queued_body(hash).await.is_none(), "held nowhere");
+    rig.svc.remember_body(hash, rlp.clone());
+    assert_eq!(rig.svc.queued_body(hash).await, Some(rlp), "from the store, not the layer");
+}
+
 #[tokio::test]
 async fn a_block_taken_elided_that_the_execution_layer_lost_stays_unserved() {
     let mut rig = node(1, 0, None).await;

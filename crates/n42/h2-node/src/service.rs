@@ -425,7 +425,7 @@ pub struct H2Service<E> {
     /// Requests for named transactions this node holds only as an imported
     /// block: served from the execution layer on the next drain, the way a
     /// whole body is.
-    pending_txns_requests: Vec<(n42_h2_net::BlockTxnsRequest, n42_h2_net::BlockTxnsChannel)>,
+    pending_txns_requests: Vec<(PeerId, n42_h2_net::BlockTxnsRequest, n42_h2_net::BlockTxnsChannel)>,
     /// What this loop did between a commit and the next proposal. See
     /// [`LoopSpend`].
     loop_spend: LoopSpend,
@@ -2450,43 +2450,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     return Ok(());
                 }
                 match held {
-                    Some(body) => {
-                        // The body is shared, not copied, and the walk that
-                        // picks the named transactions out of its 26 MB
-                        // happens on a worker: this loop is the leader's
-                        // between committing one view and proposing the
-                        // next, and loop196 put 230-330 of these a leg on it.
-                        let profile = self.header_profile;
-                        let back = self.served_txns.0.clone();
-                        let asked_at = std::time::Instant::now();
-                        tokio::task::spawn_blocking(move || {
-                            let reply = fill_from_body(&body, profile, &request);
-                            debug!(
-                                target: "n42.h2.node",
-                                %peer,
-                                hash = ?request.hash,
-                                wanted = request.indices.len(),
-                                served = reply.as_ref().map(Vec::len).unwrap_or(0),
-                                "peer asked for named transactions; served from the stored body"
-                            );
-                            // The loop wakes on this (see the step's select):
-                            // a follower is waiting on it to vote. Waits for
-                            // room in the channel (this is a blocking-pool
-                            // thread); a closed one (shutdown) just ends it.
-                            // The slot goes back once the answer is handed
-                            // on, not when the loop hands it to the peer.
-                            let _ = back.blocking_send(Served::Txns(ServedTxns {
-                                peer,
-                                channel,
-                                reply,
-                                hash: request.hash,
-                                wanted: request.indices.len(),
-                                asked_at,
-                                ready_at: std::time::Instant::now(),
-                            }));
-                            drop(slot);
-                        });
-                    }
+                    Some(body) => self.spawn_fill_from_body(peer, request, channel, body, slot),
                     // A member that took this block as a compact body holds
                     // no whole body -- and on a fleet where every member
                     // does that, "not held here whole" was every answer
@@ -2508,7 +2472,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         if self.pending_txns_requests.len() >= MAX_PENDING_SERVES {
                             self.transport.respond_block_txns(channel, Err("server busy".to_owned()));
                         } else {
-                            self.pending_txns_requests.push((request, channel));
+                            self.pending_txns_requests.push((peer, request, channel));
                         }
                     }
                     None => {
@@ -2902,67 +2866,32 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
         self.consider_catch_up(events).await;
         self.import_ranges(events).await;
+        // Only blocks taken elided are queued. The first request for one
+        // fetches its body into the store, so the ones behind it are served
+        // from there; one the execution layer no longer holds is answered
+        // "not here" without a second, whole-block lookup on this loop.
         for (peer, hash, channel) in std::mem::take(&mut self.pending_block_requests) {
-            if let Some(body) = self.elided_body(hash).await {
-                debug!(target: "n42.h2.node", peer, ?hash, "peer asked for a block taken elided; body fetched from the execution layer");
-                self.transport.respond_block(channel, Some(body));
-                continue;
-            }
-            let body = match self.driver.execution_layer().block_by_hash(hash).await {
-                Ok(Some(block)) => Some(alloy_primitives::Bytes::from(n42_h2_net::encode_block_rlp_raw(
-                    &block.header,
-                    &block.transactions,
-                    &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
-                    None,
-                ))),
-                Ok(None) => None,
-                Err(err) => {
-                    debug!(target: "n42.h2.node", ?hash, %err, "execution layer could not serve a block");
-                    None
-                }
-            };
-            debug!(target: "n42.h2.node", peer, ?hash, found = body.is_some(), "peer asked for a block; execution layer consulted");
+            let body = self.queued_body(hash).await;
+            debug!(target: "n42.h2.node", peer, ?hash, found = body.is_some(), "peer asked for a block taken elided");
             self.transport.respond_block(channel, body);
         }
         while let Ok(served) = self.served_txns.1.try_recv() {
             self.respond_served(served);
         }
-        for (request, channel) in std::mem::take(&mut self.pending_txns_requests) {
-            if let Some(body) = self.elided_body(request.hash).await {
-                let reply = fill_from_body(&body, self.header_profile, &request);
-                debug!(
-                    target: "n42.h2.node",
-                    hash = ?request.hash,
-                    wanted = request.indices.len(),
-                    served = reply.as_ref().map(Vec::len).unwrap_or(0),
-                    "peer asked for named transactions of a block taken elided; body fetched from the execution layer"
-                );
-                self.transport.respond_block_txns(channel, reply);
+        // The same for named transactions; the walk through the body runs
+        // off the loop within the peer's share, as for a stored body.
+        for (peer, request, channel) in std::mem::take(&mut self.pending_txns_requests) {
+            let Some(body) = self.queued_body(request.hash).await else {
+                debug!(target: "n42.h2.node", %peer, hash = ?request.hash, "peer asked for named transactions of a block no longer held");
+                self.transport.respond_block_txns(channel, Err(format!("block {} is not here", request.hash)));
                 continue;
-            }
-            let reply = match self.driver.execution_layer().block_by_hash(request.hash).await {
-                Ok(Some(block)) => request
-                    .indices
-                    .iter()
-                    .map(|&i| {
-                        block
-                            .transactions
-                            .get(i as usize)
-                            .cloned()
-                            .ok_or_else(|| format!("block {} has no index {i}", request.hash))
-                    })
-                    .collect::<Result<Vec<_>, String>>(),
-                Ok(None) => Err(format!("block {} is not here", request.hash)),
-                Err(err) => Err(err.to_string()),
             };
-            debug!(
-                target: "n42.h2.node",
-                hash = ?request.hash,
-                wanted = request.indices.len(),
-                served = reply.as_ref().map(Vec::len).unwrap_or(0),
-                "peer asked for named transactions; execution layer consulted"
-            );
-            self.transport.respond_block_txns(channel, reply);
+            let Some(slot) = ServeSlot::take(&self.fill_slots, peer) else {
+                debug!(target: "n42.h2.node", %peer, hash = ?request.hash, "too many requests in flight; fill refused");
+                self.transport.respond_block_txns(channel, Err("server busy".to_owned()));
+                continue;
+            };
+            self.spawn_fill_from_body(peer, request, channel, body, Some(slot));
         }
         for block_hash in std::mem::take(&mut self.received_bodies) {
             events.push(ServiceEvent::BodyReceived { block_hash });
@@ -5239,6 +5168,61 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             }
         }
+    }
+
+    /// The body a queued request is served from: the store first (an
+    /// earlier request may have fetched it), then the execution layer for a
+    /// block taken elided. `None` when it is held nowhere.
+    async fn queued_body(&mut self, block_hash: B256) -> Option<alloy_primitives::Bytes> {
+        if let Some(body) = self.body_store.get(&block_hash) {
+            return Some(body.to_shared());
+        }
+        self.elided_body(block_hash).await
+    }
+
+    /// Answers a fill from a body this node holds. The body is shared, not
+    /// copied, and the walk that picks the named transactions out of its
+    /// 26 MB happens on a worker: this loop is the leader's between
+    /// committing one view and proposing the next, and loop196 put 230-330 of
+    /// these a leg on it. `slot`, when given, goes back once the answer is
+    /// handed on.
+    fn spawn_fill_from_body(
+        &self,
+        peer: PeerId,
+        request: n42_h2_net::BlockTxnsRequest,
+        channel: n42_h2_net::BlockTxnsChannel,
+        body: alloy_primitives::Bytes,
+        slot: Option<ServeSlot>,
+    ) {
+        let profile = self.header_profile;
+        let back = self.served_txns.0.clone();
+        let asked_at = std::time::Instant::now();
+        tokio::task::spawn_blocking(move || {
+            let reply = fill_from_body(&body, profile, &request);
+            debug!(
+                target: "n42.h2.node",
+                %peer,
+                hash = ?request.hash,
+                wanted = request.indices.len(),
+                served = reply.as_ref().map(Vec::len).unwrap_or(0),
+                "peer asked for named transactions; served from the stored body"
+            );
+            // The loop wakes on this (see the step's select): a follower is
+            // waiting on it to vote. Waits for room in the channel (this is a
+            // blocking-pool thread); a closed one (shutdown) just ends it.
+            // The slot goes back once the answer is handed on, not when the
+            // loop hands it to the peer.
+            let _ = back.blocking_send(Served::Txns(ServedTxns {
+                peer,
+                channel,
+                reply,
+                hash: request.hash,
+                wanted: request.indices.len(),
+                asked_at,
+                ready_at: std::time::Instant::now(),
+            }));
+            drop(slot);
+        });
     }
 
     /// The gov5 body of a block this node took elided, fetched from the

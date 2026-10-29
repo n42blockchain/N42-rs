@@ -285,7 +285,10 @@ impl MobileService {
         Ok(SubmitOutcome {
             accepted: added,
             valid_receipts: status.map_or(0, |s| s.valid_count),
-            attested: status.is_some_and(n42_mobile_verify::BlockVerificationStatus::is_attested),
+            // Without the block's receipts root every receipt counts as
+            // valid, whatever root it reports: not an attestation (audit
+            // 2026-10 round 3, R3-P5).
+            attested: status.is_some_and(|status| status.expected_receipts_root.is_some() && status.is_attested()),
         })
     }
 

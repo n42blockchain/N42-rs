@@ -42,6 +42,7 @@ use reth_consensus_common::validation::{
     validate_header_gas,
 };
 use reth_ethereum_consensus::EthBeaconConsensus;
+use reth_primitives_traits::constants::MAXIMUM_GAS_LIMIT_BLOCK;
 use n42_tx_types::{Block as EthBlock, BlockBody as EthBlockBody, N42Primitives as EthPrimitives, Receipt};
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{BlockBody as _, GotExpected, RecoveredBlock, SealedBlock, SealedHeader};
@@ -300,7 +301,17 @@ where
         }
         validate_gov5_h2_header(header).map_err(|err| ConsensusError::Other(Arc::new(err)))?;
 
-        validate_header_gas(header)?;
+        if reth_chainspec::qmdb::deferred_execution_active_at(self.chain_spec.genesis(), header.timestamp) {
+            // The header's gas used is an ancestor's execution, bounded by
+            // that ancestor's limit, not this header's: the limit may step
+            // between the two (gov5 `verifyHeaderWithBatch`; audit 2026-10
+            // round 3, R3-C1). Checked against the parent below.
+            if header.gas_limit > MAXIMUM_GAS_LIMIT_BLOCK {
+                return Err(ConsensusError::HeaderGasLimitExceedsMax { gas_limit: header.gas_limit });
+            }
+        } else {
+            validate_header_gas(header)?;
+        }
         validate_header_base_fee(header, &self.chain_spec)?;
 
         let timestamp = header.timestamp;
@@ -356,6 +367,15 @@ where
             // `deferredExecutionDepth`: the parent's result at depth 1, the
             // parent's parent's at depth 2 (docs/DEFERRED_DEPTH_2_DESIGN.md).
             let depth = reth_chainspec::qmdb::deferred_execution_depth_at(self.chain_spec.genesis(), header.timestamp);
+            // gov5's bound: the parent's limit (at depth 1 the parent is the
+            // block executed; deeper, the fields check below binds gas used
+            // to the ancestor's own execution).
+            if depth == 1 && header.gas_used > parent.gas_limit {
+                return Err(ConsensusError::HeaderGasUsedExceedsGasLimit {
+                    gas_used: header.gas_used,
+                    gas_limit: parent.gas_limit,
+                });
+            }
             let ancestor = ancestor_hash(parent, depth);
             let expected = ancestor_executed_fields(self.chain_spec.genesis(), parent, depth)
                 .ok_or_else(|| ConsensusError::Other(Arc::new(DeferredExecutionError::ParentUnknown(ancestor))))?;
@@ -1193,6 +1213,53 @@ mod tests {
         child.receipts_root = expected.receipts_root;
         child.gas_used = expected.gas_used;
         assert!(c.validate_header_against_parent(&sealed(child), &parent).is_ok());
+    }
+
+    /// Audit 2026-10 round 3 (R3-C1): under deferred execution a header's
+    /// gas used is its parent's execution, bounded by the parent's limit, not
+    /// its own -- gov5 checks it so (`adapter.go`, "the limit may step
+    /// between the two"). A full parent followed by a child whose limit
+    /// stepped down was refused here and accepted by gov5.
+    #[test]
+    fn under_deferred_execution_gas_used_is_bounded_by_the_parents_limit() {
+        let c = deferred_consensus();
+        let parent = sealed(good_header(600, TS_SHANGHAI));
+        let mut child = good_header(601, TS_SHANGHAI + 3);
+        child.parent_hash = parent.hash();
+        child.base_fee_per_gas = Some(875);
+        // The largest step down the ramp allows (strictly under 1/1024).
+        child.gas_limit = parent.gas_limit - (parent.gas_limit / 1024 - 1);
+        let full = crate::executed_fields::ExecutedFields { gas_used: parent.gas_limit, ..fields(0x60) };
+        crate::executed_fields::remember(parent.hash(), full);
+        child.state_root = full.state_root;
+        child.receipts_root = full.receipts_root;
+        child.gas_used = full.gas_used;
+        assert!(child.gas_used > child.gas_limit);
+        assert!(c.validate_header(&sealed(child.clone())).is_ok(), "the standalone rule leaves gas used to the parent");
+        assert!(c.validate_header_against_parent(&sealed(child.clone()), &parent).is_ok());
+
+        // Past the parent's own limit is still refused.
+        let mut over = parent.header().clone();
+        over.number = 602;
+        let over_parent = sealed(over);
+        let past = crate::executed_fields::ExecutedFields { gas_used: over_parent.gas_limit + 1, ..fields(0x61) };
+        crate::executed_fields::remember(over_parent.hash(), past);
+        child.parent_hash = over_parent.hash();
+        child.number = 603;
+        child.state_root = past.state_root;
+        child.receipts_root = past.receipts_root;
+        child.gas_used = past.gas_used;
+        assert!(matches!(
+            c.validate_header_against_parent(&sealed(child.clone()), &over_parent),
+            Err(ConsensusError::HeaderGasUsedExceedsGasLimit { .. })
+        ));
+        // Without deferred execution the header's own limit is the bound.
+        let mut plain = good_header(5, TS_SHANGHAI);
+        plain.gas_used = plain.gas_limit + 1;
+        assert!(matches!(
+            consensus().validate_header(&sealed(plain)),
+            Err(ConsensusError::HeaderGasUsedExceedsGasLimit { .. })
+        ));
     }
 
     #[test]

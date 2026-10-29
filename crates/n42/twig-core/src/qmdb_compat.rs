@@ -1840,6 +1840,13 @@ impl QmdbCompatTree {
         self.entries.file_offset(usize::try_from(slot).ok()?)
     }
 
+    /// A reader of every slot's offset that needs no lock on the tree
+    /// (`crate::offsets`); `None` in the heap. Bit 63 of an offset names
+    /// `entries.relocated`. The reader follows this tree, not a clone of it.
+    pub fn entry_offsets_reader(&self) -> Option<crate::offsets::OffsetsReader> {
+        self.entries.offsets_reader()
+    }
+
     /// Every live entry's key and record offset, in slot order; `None` in the
     /// heap. What a read view over the entry file is built from.
     pub fn live_entry_offsets(&self) -> Option<Vec<(Hash, u64)>> {

@@ -592,7 +592,10 @@ pub enum NodeStateError {
 /// The state roots of the last [`HeadRoots::SLOTS`] persisted heads, in a
 /// fixed ring of checksummed records (`[number][hash][root][digest]`, the
 /// record of block `n` at slot `n % SLOTS`), rewritten in place as heads are
-/// persisted and never fsynced: it is a check, not state. A restart compares
+/// persisted and fdatasynced once per persistence batch
+/// ([`QmdbNodeState::settle_through`]), off the block path: it is a check,
+/// not state, but one a power cut would otherwise take the last seconds of,
+/// which is exactly when a restart needs it. A restart compares
 /// the rebuilt tree's root with the record of its head, when there is a
 /// whole one for that very head (a crash can lose recent records, and an
 /// older datadir has none: the check is then skipped with a warning).
@@ -624,6 +627,15 @@ impl HeadRoots {
             file.write_all(&Self::encode(*number, *hash, *root))?;
         }
         Ok(())
+    }
+
+    /// Makes the records written so far durable; no file is nothing to sync.
+    fn sync(path: &Path) -> std::io::Result<()> {
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(file) => file.sync_data(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// The root recorded for `(number, hash)`, if a whole record of that
@@ -782,6 +794,10 @@ struct Inner {
     /// Why this run's restored tree was not checked against a recorded
     /// root, if it was not ([`QmdbNodeState::unchecked_restart`]).
     unchecked_restart: std::sync::OnceLock<String>,
+    /// The head header's own state root, when its chain's headers carry it
+    /// ([`QmdbNodeState::expect_head_root`]): the check a restart falls back
+    /// on when `forest.roots` has no record of that head.
+    head_header_root: std::sync::OnceLock<((u64, B256), B256)>,
 }
 
 /// A rename queued by [`QmdbNodeState::rename_or_defer`].
@@ -1182,6 +1198,7 @@ impl QmdbNodeState {
                 persist_holds: Default::default(),
                 occupancy: Default::default(),
                 unchecked_restart: std::sync::OnceLock::new(),
+                head_header_root: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -1720,6 +1737,17 @@ impl QmdbNodeState {
         self.inner.unchecked_restart.get().map(String::as_str)
     }
 
+    /// Gives the restart the state root `head`'s header carries, for a chain
+    /// whose headers carry their own root (not under deferred execution,
+    /// where a header carries its parent's). Called before
+    /// [`Self::initialize`]: a restart with no record of that very head in
+    /// `forest.roots` -- the file is not fsynced, so a power cut loses its
+    /// last records -- checks the rebuilt tree against this instead of
+    /// starting unchecked. The first call wins.
+    pub fn expect_head_root(&self, head: (u64, B256), state_root: B256) {
+        let _ = self.inner.head_header_root.set((head, state_root));
+    }
+
     /// Where the persisted heads' roots are recorded ([`HeadRoots`]).
     pub fn head_roots_path(&self) -> PathBuf {
         self.inner.dir.join(HEAD_ROOTS_FILE)
@@ -1746,8 +1774,12 @@ impl QmdbNodeState {
         let path = self.head_roots_path();
         // The record is a check, not state: a file that cannot be read skips
         // the comparison, as a missing record does.
+        let header_root =
+            self.inner.head_header_root.get().filter(|(at, _)| *at == head).map(|(_, root)| *root);
         let recorded = match HeadRoots::read(&path, head.0, head.1) {
             Ok(Some(recorded)) => Some(recorded),
+            // No record of this head, but its header carries its root.
+            Ok(None) | Err(_) if header_root.is_some() => header_root,
             Ok(None) if !path.exists() => {
                 self.note_unchecked_restart(head, "no forest.roots file (a datadir from before the root check)");
                 None
@@ -3131,7 +3163,15 @@ impl QmdbNodeState {
                 None => return Err(NodeStateError::Uninitialised),
                 Some((head_number, head_hash)) if head_number > number || (head_number == number && head_hash == hash) => {
                     match self.settle_canonical() {
-                        Ok(()) => return Ok(()),
+                        Ok(()) => {
+                            // Once per persistence batch, off the block path:
+                            // the roots this batch recorded survive a power
+                            // cut, so the restart after one is checked.
+                            if let Err(error) = HeadRoots::sync(&self.head_roots_path()) {
+                                warn!(target: "n42.qmdb", %error, "could not sync the persisted QMDB heads' roots; a restart after a power cut may go unchecked");
+                            }
+                            return Ok(());
+                        }
                         Err(error @ (NodeStateError::Poisoned(_) | NodeStateError::Uninitialised)) => return Err(error),
                         Err(error) => error.to_string(),
                     }

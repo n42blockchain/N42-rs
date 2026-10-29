@@ -268,6 +268,12 @@ fn main() {
                                 n42_engine_types::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used });
                             info!(target: "reth::cli", block = parent.number, hash = %parent.hash(), "restored deferred execution parent result");
                         }
+                        // Without deferred execution the head's header carries
+                        // its own root: the restart's check when forest.roots
+                        // lost the head's record (audit 2026-10 D-3).
+                        if !reth_chainspec::qmdb::deferred_execution_active_at(genesis, head.timestamp) {
+                            qmdb.expect_head_root((info.best_number, head_hash), head.state_root);
+                        }
                         qmdb.initialize((info.best_number, head_hash))?;
                         info!(target: "reth::cli", block = info.best_number, %head_hash, "QMDB state ready");
                         // A lagging CL may re-submit persisted blocks below this EL's

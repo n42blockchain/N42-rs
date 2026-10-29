@@ -1217,6 +1217,43 @@ fn a_branch_switch_during_a_lease_waits_and_takes_the_owed_trim_first() {
 // The restart's root check
 // ---------------------------------------------------------------------------
 
+/// Audit 2026-10 D-3: with no record of its head (lost in a power cut), a
+/// restart on a chain whose headers carry their own root checks the tree
+/// against the head header's root instead of starting unchecked.
+#[test]
+fn a_restart_without_a_record_checks_the_head_header_root() {
+    let (state, chain, dir, head, root) = node_at("restart-header-root", true, 3);
+    let entries = state.entry_file_path();
+    let roots = state.head_roots_path();
+    drop(state);
+    std::fs::remove_file(&roots).expect("drop the record");
+
+    let checked = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+    checked.expect_head_root((3, head), root);
+    checked.initialize((3, head)).expect("the header root matches");
+    assert_eq!(checked.unchecked_restart(), None, "checked against the header");
+    drop(checked);
+
+    let good = std::fs::read(&entries).expect("the entry file");
+    let mut bytes = good.clone();
+    *bytes.last_mut().expect("a record") ^= 0xff;
+    std::fs::write(&entries, &bytes).expect("corrupt one record");
+    std::fs::remove_file(&roots).ok();
+    let corrupt = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+    corrupt.expect_head_root((3, head), root);
+    let err = corrupt.initialize((3, head)).expect_err("a corrupt entry file is refused");
+    assert!(matches!(err, NodeStateError::RestoredRootMismatch { number: 3, recorded, .. } if recorded == root), "{err}");
+    drop(corrupt);
+
+    // A header root for another block is no check of this one.
+    std::fs::write(&entries, &good).expect("restore the record");
+    std::fs::remove_file(&roots).ok();
+    let other = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    other.expect_head_root((2, head), B256::repeat_byte(9));
+    other.initialize((3, head)).expect("not this head's root: unchecked");
+    assert!(other.unchecked_restart().is_some());
+}
+
 /// A restart compares the rebuilt tree's root with the one recorded when its
 /// head was persisted: a clean restart passes, one over a corrupt entry file
 /// fails by name, and a datadir with no record restarts unchecked.

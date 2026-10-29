@@ -1594,7 +1594,8 @@ impl QmdbForest {
     /// (`docs/QMDB_COMPACTION_DESIGN.md` stage 2): mostly dead twigs below
     /// `below_slot` rewritten into `entries.relocated`, root and proofs
     /// unchanged. `below_slot` is clamped to the oldest cursor an undo
-    /// record the forest holds can rewind to, so no move between the blocks
+    /// record the forest holds (a held block's or the pending one's) can
+    /// rewind to, so no move between the blocks
     /// it holds cuts into or revives a slot of a compacted twig. Refused
     /// while the tree is leased. Nothing to do without an entry file. No
     /// production caller in this stage: stage 3 schedules it.
@@ -1605,7 +1606,15 @@ impl QmdbForest {
         max_twigs: usize,
     ) -> Result<n42_twig_core::qmdb_compat::CompactReport, StateError> {
         self.refuse_leased()?;
-        let held = self.records.values().filter_map(|record| record.undo.as_ref()).map(|undo| undo.prev_next_slot).min();
+        // The pending block's undo too, as `trim_into` counts it: just after
+        // a restore it can be the only one held (audit 2026-10 E-7).
+        let held = self
+            .records
+            .values()
+            .filter_map(|record| record.undo.as_ref())
+            .chain(self.pending.as_ref().map(|(_, undo)| undo))
+            .map(|undo| undo.prev_next_slot)
+            .min();
         let below_slot = below_slot.min(held.unwrap_or(u64::MAX));
         self.tree
             .compact_twigs(below_slot, min_dead_fraction, max_twigs)
@@ -2813,7 +2822,17 @@ mod tests {
         assert!(!json.contains("relocated_len"), "{json}");
         assert_eq!(serde_json::from_str::<ForestCheckpoint>(&json).unwrap(), v1);
         assert!(serde_json::to_string(&ForestCheckpoint { relocated_len: 1, ..v1 }).is_err());
-        drop((forest, restored));
+
+        // Audit 2026-10 E-7: just restored, the forest holds no undo record,
+        // only a pending block's. Its kills (block 6's slots) are not
+        // compacted, so the next build on the same parent still reverts it.
+        drop(forest);
+        let pending = restored.compute_operations(h(6), all(7).ops()).unwrap();
+        drop(pending);
+        restored.compact_twigs(u64::MAX, 0.5, usize::MAX).unwrap();
+        let again = restored.compute_operations(h(6), all(8).ops()).expect("the pending block reverts");
+        assert_eq!(again.root, heap.compute_operations(h(6), all(8).ops()).unwrap().root);
+        drop(restored);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

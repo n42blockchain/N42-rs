@@ -81,7 +81,6 @@ impl ConsensusEngine {
         self.view_timing.commit_qc_formed = Some(std::time::Instant::now());
 
         self.round_state.update_locked_qc(&decide.commit_qc);
-        self.round_state.commit(decide.commit_qc.clone());
 
         // Commit-then-Activate: only commit/stage validator changes when the decided
         // block actually carried them (hash != ZERO).  Gating on the Decide hash
@@ -133,6 +132,10 @@ impl ConsensusEngine {
             // Proposal when this node becomes leader.
             None
         };
+        // Recorded only once the changes are staged: a staging failure returns
+        // before this, so the commit is not left recorded without its
+        // `BlockCommitted` and view advance (audit 2026-10 A-5).
+        self.round_state.commit(decide.commit_qc.clone());
 
         // Clean up pending tx_root_hash for the committed block.
         self.pending_tx_roots.remove(&decide.block_hash);

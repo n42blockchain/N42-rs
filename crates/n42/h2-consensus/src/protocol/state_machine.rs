@@ -1111,8 +1111,9 @@ impl ConsensusEngine {
 
     /// Records a block's parent ahead of its `BlockImported`, so the vote that
     /// import releases can check the proposal extends its justify QC's block.
-    /// Unknown parents are tolerated by that check, so this is advisory — but
-    /// without it the rule cannot refuse anything.
+    /// A block whose parent is unknown gets no vote from that check (audit
+    /// 2026-10 A-2), so the service records the parent before every
+    /// `BlockImported` / `BlockChecked`.
     pub fn remember_parent(&mut self, block_hash: B256, parent_hash: B256) {
         self.imported_parents.insert(block_hash, parent_hash);
     }
@@ -1745,6 +1746,9 @@ impl ConsensusEngine {
         if !self.signing_profile.is_gov5() {
             self.imported_blocks.clear();
             self.imported_block_fifo.clear();
+            // The parents are kept beside the evidence and bounded by its
+            // FIFO; with the evidence gone they would only accumulate.
+            self.imported_parents.clear();
         }
         self.equivocation_tracker.clear();
         self.commit_equivocation_tracker.clear();
@@ -4407,6 +4411,59 @@ mod tests {
                 target_view: 2,
             }
         )));
+    }
+
+    /// Audit 2026-10 A-5 (b): a Decide whose certified changes cannot be
+    /// staged must fail before the commit is recorded, not after it (which
+    /// left the block committed with no `BlockCommitted` and no view advance).
+    #[test]
+    fn test_decide_whose_changes_cannot_be_staged_records_no_commit() {
+        let (mut engine, sks, vs, _rx) = make_engine(4, 0);
+        assert!(!engine.signing_profile().is_gov5());
+        engine.epoch_manager = EpochManager::with_epoch_length(vs.clone(), 10);
+        // Removing one of four leaves fewer than MIN_VALIDATOR_COUNT.
+        let changes = vec![ValidatorChange::Remove {
+            address: *vs.get_address(0).expect("member"),
+        }];
+        engine.epoch_manager.replace_pending_from_proposal(&changes);
+
+        let view = 2u64;
+        let block_hash = B256::repeat_byte(0xDB);
+        let changes_hash = EpochManager::hash_changes(&changes);
+        let decide = Decide {
+            view,
+            block_hash,
+            commit_qc: build_test_commit_qc_with_changes(
+                view,
+                block_hash,
+                &sks,
+                &vs,
+                &[0, 1, 2],
+                &changes_hash,
+            ),
+            validator_changes_hash: changes_hash,
+        };
+        let committed_before = engine.last_committed_qc().view;
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(decide)))
+            .expect_err("the certified changes cannot be staged");
+        assert_eq!(
+            engine.last_committed_qc().view,
+            committed_before,
+            "a failed staging must leave the commit unrecorded"
+        );
+    }
+
+    /// Audit 2026-10 A-5 (c): the Native profile drops its import evidence on
+    /// every view advance; the parents recorded beside it go with it.
+    #[test]
+    fn test_native_view_advance_forgets_imported_parents() {
+        let (mut engine, _sks, _vs, _rx) = make_engine(4, 0);
+        assert!(!engine.signing_profile().is_gov5());
+        engine.remember_parent(B256::repeat_byte(0x01), B256::repeat_byte(0x02));
+        let next = engine.current_view() + 1;
+        engine.advance_to_view(next).expect("advance");
+        assert!(engine.imported_parents.is_empty());
     }
 
     #[test]

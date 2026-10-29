@@ -382,8 +382,6 @@ impl ConsensusEngine {
             consensus_timing = %self.view_timing.summary(),
             "block committed!");
 
-        self.round_state.commit(commit_qc.clone());
-
         // The Decide carries the changes hash the CommitQC signed (the one
         // cached with the proposal), not a hash of whatever is pending now: a
         // change queued between proposal and commit was never voted on, and
@@ -412,6 +410,10 @@ impl ConsensusEngine {
                  not staging local pending changes"
             );
         }
+        // Recorded only once the changes are staged: a staging failure returns
+        // before this, so the commit is not left recorded without its Decide,
+        // `BlockCommitted` and view advance (audit 2026-10 A-5).
+        self.round_state.commit(commit_qc.clone());
 
         let decide = n42_h2_primitives::consensus::Decide {
             view,

@@ -107,8 +107,10 @@ pub struct ForestCheckpoint {
     /// was taken (`docs/QMDB_COMPACTION_DESIGN.md` 3.6; 0 before version 2).
     /// Recorded, not enforced, in stage 2: nothing is punched, so a shorter
     /// relocated file loses nothing (every slot's record is still in
-    /// `entries.log`), and complete groups past it are applied on open
-    /// because a group is idempotent. Stage 3's punched ranges will need it.
+    /// `entries.log`). Complete groups past it are applied on open only when
+    /// their dead records agree with `active` (a group is not idempotent: it
+    /// records kills; the open skips one whose kills this checkpoint does not
+    /// hold). Stage 3's punched ranges will need it.
     pub relocated_len: u64,
 }
 

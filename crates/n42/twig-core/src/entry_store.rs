@@ -798,7 +798,7 @@ impl FileEntries {
         // Everything on disk is sealed into chunks; the tail starts empty.
         main.seal_existing(&offsets)?;
         let mut twigs = BTreeMap::new();
-        let relocated = open_relocated(&relocated_path(path), &mut offsets, &mut twigs, truncate)?;
+        let relocated = open_relocated(&relocated_path(path), &mut offsets, active, &mut twigs, truncate)?;
         let mut store = Self {
             main,
             relocated,
@@ -1320,12 +1320,17 @@ fn as_hash(bytes: &[u8]) -> &Hash {
 /// file is. Losing a group loses nothing in this stage: `entries.log` still
 /// holds every slot's record, and nothing is punched.
 ///
-/// Groups past what the checkpoint recorded (`relocated_len`) are applied
-/// like the rest when complete: a group only says where a slot's unchanged
-/// content is, so applying one written after the checkpoint is idempotent.
+/// A complete group is applied when it agrees with `active` (the
+/// checkpoint's bits): its live records only say where a slot's unchanged
+/// content is, but its dead records stand for kills, and a group written
+/// after kills no checkpoint holds yet (compaction running ahead of
+/// persistence, then a crash) names as dead a slot `active` has live. Such a
+/// group is skipped -- kept in the file, not applied -- and the twig's slots
+/// keep their records in `entries.log` (audit 2026-10 E-3).
 fn open_relocated(
     path: &Path,
     offsets: &mut [u64],
+    active: &[u64],
     twigs: &mut BTreeMap<usize, RelocatedTwig>,
     truncate: bool,
 ) -> io::Result<Option<LogFile>> {
@@ -1343,11 +1348,13 @@ fn open_relocated(
         let mut reader = std::io::BufReader::with_capacity(8 << 20, &mut file);
         let mut starts = vec![0u64; TWIG_SIZE];
         let mut value = Vec::new();
+        let is_active = |slot: usize| active.get(slot / 64).is_some_and(|word| word >> (slot % 64) & 1 == 1);
         'groups: loop {
             let group_start = good;
             let mut at = good;
             let mut crc = crc32fast::Hasher::new();
             let mut dead_hash_count = 0u32;
+            let mut kills_a_live_slot = false;
             let mut twig = None;
             for (local, record_start) in starts.iter_mut().enumerate() {
                 let mut head = [0u8; RELOCATED_HEAD];
@@ -1387,6 +1394,7 @@ fn open_relocated(
                         }
                         crc.update(&hash);
                         dead_hash_count += 1;
+                        kills_a_live_slot |= is_active(slot);
                         at += DEAD_RECORD as u64;
                     }
                     _ => break 'groups,
@@ -1409,6 +1417,11 @@ fn open_relocated(
                 break;
             }
             at += TRAILER as u64;
+            if kills_a_live_slot {
+                group_starts.push(group_start);
+                good = at;
+                continue;
+            }
             let main = &mut offsets[base..base + TWIG_SIZE];
             let entry = twigs.entry(twig).or_insert_with(|| RelocatedTwig {
                 main: main.iter().copied().collect(),
@@ -2217,6 +2230,48 @@ mod tests {
         check(&heap, &readonly);
         drop(readonly);
         drop(file);
+        remove_scratch(name);
+    }
+
+    /// Audit 2026-10 E-3: a group can be written for kills no checkpoint
+    /// holds yet. A restart from the checkpoint before them must not take
+    /// that group: a slot the checkpoint has live would point at a dead
+    /// record (hash only). The group is skipped and the slot's record in the
+    /// main file stands.
+    #[test]
+    fn a_group_whose_kills_the_checkpoint_does_not_hold_is_skipped_on_open() {
+        use crate::qmdb_compat::QmdbCompatTree;
+        let name = "compact-undurable-kill";
+        let n = 2 * TWIG_SIZE as u64;
+        let mut heap = QmdbCompatTree::new();
+        let mut file = QmdbCompatTree::new();
+        file.set_entry_file(&scratch(name)).unwrap();
+        let both = |heap: &mut QmdbCompatTree, file: &mut QmdbCompatTree, ops: Vec<crate::qmdb_compat::QmdbOperation>| {
+            let root = heap.apply_sorted_ops(ops.clone()).unwrap();
+            assert_eq!(file.apply_sorted_ops(ops).unwrap(), root);
+        };
+        both(&mut heap, &mut file, ops_of(0..n, 1));
+        // The durable checkpoint: every first-block slot live.
+        file.sync_entries().unwrap();
+        let (next_slot, active) = (file.next_slot(), file.active_bits());
+        // A block nothing makes durable kills most of the first twigs, and a
+        // compaction records those kills in a group.
+        both(&mut heap, &mut file, ops_of((0..n).filter(|i| i % 4 != 0), 2));
+        let report = file.compact_twigs(u64::MAX, 0.5, usize::MAX).unwrap();
+        assert!(report.twigs > 0, "{report:?}");
+        file.sync_entries().unwrap();
+        drop(file);
+
+        // The restart from the durable checkpoint: the slots it has live
+        // read their records, and the tree is the one before the kills.
+        let path = scratch(name);
+        let (reopened, kept) = QmdbCompatTree::from_entry_file(&path, next_slot, &active).expect("the open skips the group");
+        assert_eq!(kept, next_slot);
+        let mut before = QmdbCompatTree::new();
+        before.apply_sorted_ops(ops_of(0..n, 1)).unwrap();
+        assert_eq!(reopened.root(), before.root());
+        assert_eq!(reopened.prove(&key_n(1)), before.prove(&key_n(1)));
+        drop(reopened);
         remove_scratch(name);
     }
 

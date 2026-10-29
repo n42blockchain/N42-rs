@@ -54,10 +54,12 @@ pub enum ImportReport {
 pub enum ImportVerdict {
     /// The execution layer holds the block.
     Imported,
-    /// The execution layer has not executed it (SYNCING/ACCEPTED): not a
-    /// verdict -- the block is asked for again, as on the awaited path.
+    /// The execution layer has not executed it (SYNCING/ACCEPTED), or the
+    /// exchange failed (a timeout, a dropped connection): not a verdict --
+    /// the block is asked for again, as on the awaited path.
     NotYet,
-    /// The execution layer refused it, or the import could not run.
+    /// The execution layer called it INVALID, or this driver dropped it (a
+    /// held import whose parent lost its height).
     Invalid(String),
     /// A compact body the execution layer could not assemble: these
     /// positions of the block are transactions it does not hold, and it will
@@ -74,7 +76,17 @@ impl ImportVerdict {
                 PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => Self::NotYet,
                 PayloadStatusEnum::Invalid { validation_error } => Self::Invalid(validation_error.to_string()),
             },
-            Err(error) => Self::Invalid(error.to_string()),
+            Err(error) if error.0 == HELD_IMPORT_DROPPED => Self::Invalid(error.to_string()),
+            // A timeout (an import that outlasts the raw channel's 8 s in a
+            // page-cache stall), a dropped connection, an answer that could
+            // not be read: nothing about the block. Rejecting it withdrew a
+            // valid block's evidence and dropped its payload; gov5 marks a
+            // block bad only on a deterministic execution failure and
+            // retries every other error (audit 2026-10 B-5).
+            Err(error) => {
+                warn!(target: "n42.h2.el", %error, "the import failed without a verdict; asking for the block again");
+                Self::NotYet
+            }
         }
     }
 }
@@ -2521,9 +2533,13 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                                 outcome = &mut import => outcome,
                             }
                         }
+                        // The body itself cannot be made into a payload
+                        // here: a verdict on this copy, unlike an exchange
+                        // that failed (see `ImportVerdict::of`).
                         Err(err) => {
                             warn!(target: "n42.h2.el", block = ?block_hash, %err, "a held body could not be sent");
-                            Err(err)
+                            guard.done(ImportVerdict::Invalid(err.to_string()));
+                            return;
                         }
                     }
                 }
@@ -2854,10 +2870,11 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     reason: validation_error.to_string(),
                 },
             },
-            Err(error) => DriverAction::Rejected {
-                block_hash,
-                reason: error.to_string(),
-            },
+            // No verdict on the block: asked for again, as above.
+            Err(error) => {
+                warn!(target: "n42.h2.el", block = ?block_hash, %error, "the import failed without a verdict; asking for the block again");
+                DriverAction::PayloadMissing { block_hash }
+            }
         }
     }
 

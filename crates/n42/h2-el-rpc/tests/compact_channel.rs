@@ -32,6 +32,8 @@ fn env() {
         unsafe {
             std::env::set_var("N42_BODY_ONCE", "1");
             std::env::set_var("N42_COMPACT_BODY", "1");
+            // Short enough for a test to outlast, long for a local exchange.
+            std::env::set_var("N42_RAW_CHANNEL_TIMEOUT_MS", "1000");
         }
     });
 }
@@ -286,6 +288,33 @@ async fn a_held_body_votes_then_waits_for_its_release_byte() {
     assert_eq!(seen.prefix, request::HOLD_EXECUTION);
     assert_eq!(seen.kind, request::COMPACT_BODY);
     assert_eq!(seen.byte, Some(raw_engine::release::EXECUTE));
+}
+
+/// Audit 2026-10 B-5: the time a held body waits for its slot is this
+/// node's, not the execution layer's. It does not count toward the raw
+/// channel's deadline (1 s in this binary), so a slot that frees late does
+/// not turn a valid block into a failed import.
+#[tokio::test]
+async fn a_held_bodys_wait_for_its_slot_does_not_count_toward_the_deadline() {
+    env();
+    let (addr, seen) = serve_held().await;
+    let client = EngineApiClient::new(Endpoint(addr));
+    let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let body = body(true);
+    let call = client.new_payload_body_held(ExecutionPath::LIVE_SEQUENTIAL, &body, checked_tx, release_rx);
+    tokio::pin!(call);
+    tokio::select! {
+        checked = checked_rx => assert!(matches!(checked.expect("checked").status, PayloadStatusEnum::Valid)),
+        outcome = &mut call => panic!("answered before the release: {outcome:?}"),
+    }
+    let release = async {
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        release_tx.send(true).expect("the call waits for it");
+    };
+    let (outcome, ()) = tokio::join!(&mut call, release);
+    assert!(matches!(outcome, BodyOutcome::Answered(Ok(_))), "{outcome:?}");
+    assert_eq!(seen.lock().unwrap().byte, Some(raw_engine::release::EXECUTE));
 }
 
 #[tokio::test]

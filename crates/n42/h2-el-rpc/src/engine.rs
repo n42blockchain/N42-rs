@@ -325,6 +325,42 @@ async fn within_raw_deadline<T>(
     within_deadline(raw_channel_timeout(), exchange).await
 }
 
+/// [`within_raw_deadline`] for an exchange that may wait on this node: while
+/// `waiting` is set (a held body waiting for its slot) the deadline does not
+/// run, and the time spent so is added to it. A slot that frees late is this
+/// node's delay, not the execution layer's silence (audit 2026-10 B-5).
+async fn within_raw_deadline_excluding<T>(
+    waiting: &std::sync::atomic::AtomicBool,
+    waited_ms: &std::sync::atomic::AtomicU64,
+    exchange: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    use std::sync::atomic::Ordering;
+    let deadline = raw_channel_timeout();
+    let started = tokio::time::Instant::now();
+    let mut until = started + deadline;
+    tokio::pin!(exchange);
+    loop {
+        tokio::select! {
+            result = &mut exchange => return result,
+            () = tokio::time::sleep_until(until) => {
+                let now = tokio::time::Instant::now();
+                if waiting.load(Ordering::Acquire) {
+                    until = now + deadline;
+                    continue;
+                }
+                let due = started + deadline + std::time::Duration::from_millis(waited_ms.load(Ordering::Acquire));
+                if now >= due {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("raw channel: no answer within {} ms", deadline.as_millis()),
+                    ));
+                }
+                until = due;
+            }
+        }
+    }
+}
+
 async fn within_deadline<T>(
     deadline: std::time::Duration,
     exchange: impl std::future::Future<Output = std::io::Result<T>>,
@@ -2096,7 +2132,9 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         // of answering: not a failure, and not a reason to send the block
         // another way.
         let mut needs: Option<Vec<u32>> = None;
-        let attempt: std::io::Result<(PayloadStatus, tokio::net::TcpStream)> = within_raw_deadline(async {
+        let waiting = std::sync::atomic::AtomicBool::new(false);
+        let waited_ms = std::sync::atomic::AtomicU64::new(0);
+        let attempt: std::io::Result<(PayloadStatus, tokio::net::TcpStream)> = within_raw_deadline_excluding(&waiting, &waited_ms, async {
             let mut conn = match taken {
                 Some(stream) => stream,
                 None => {
@@ -2140,9 +2178,17 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                             );
                             let _ = sender.send(status);
                         }
-                        // The vote is out; the execution waits for its slot.
+                        // The vote is out; the execution waits for its slot,
+                        // on this node's time, not the deadline's.
                         if let Some(release) = release.take() {
+                            let wait_started = std::time::Instant::now();
+                            waiting.store(true, std::sync::atomic::Ordering::Release);
                             let execute = release.await.unwrap_or(false);
+                            waited_ms.fetch_add(
+                                u64::try_from(wait_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                std::sync::atomic::Ordering::Release,
+                            );
+                            waiting.store(false, std::sync::atomic::Ordering::Release);
                             dropped = !execute;
                             conn.write_u8(if execute {
                                 n42_h2_execution::raw_engine::release::EXECUTE

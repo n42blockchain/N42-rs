@@ -167,7 +167,7 @@ async fn a_syncing_execution_layer_defers_rather_than_voting_blind() {
 }
 
 #[tokio::test]
-async fn an_execution_layer_error_is_a_rejection_not_an_import() {
+async fn an_execution_layer_error_is_asked_again_not_a_rejection_or_an_import() {
     let el = MockExecutionLayer::with_behaviour(MockBehaviour {
         new_payload_error: Some("engine unavailable".into()),
         ..Default::default()
@@ -176,9 +176,13 @@ async fn an_execution_layer_error_is_a_rejection_not_an_import() {
     let hash = B256::repeat_byte(0x11);
     driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
 
+    // Only the execution layer's INVALID is a verdict on the block; an error
+    // reaching it is asked again, as gov5 retries every error but a
+    // deterministic execution failure (audit 2026-10 B-5).
     let action = driver.handle_output(&execute(hash)).await;
     assert!(action.imported_block().is_none());
-    assert!(action.rejection().unwrap().1.contains("engine unavailable"));
+    assert!(action.rejection().is_none());
+    assert_eq!(action.missing_block(), Some(hash));
 }
 
 #[tokio::test]

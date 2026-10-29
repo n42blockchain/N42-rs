@@ -139,7 +139,12 @@ async fn a_spawned_imports_verdict_becomes_the_action_an_awaited_import_would_re
                 assert_eq!(actions[0].rejection(), Some((built.hash, "bad state root")));
                 assert!(!driver.has_payload(&built.hash), "a rejected payload is dropped so a fresh copy runs again");
             }
-            _ => assert_eq!(actions[0].rejection(), Some((built.hash, "db closed"))),
+            // An error (a timeout, a dropped connection) says nothing about
+            // the block: asked for again, the payload kept (audit 2026-10 B-5).
+            _ => {
+                assert_eq!(actions[0].missing_block(), Some(built.hash), "not a verdict: asked for again");
+                assert!(driver.has_payload(&built.hash), "kept for the next attempt");
+            }
         }
     }
 }
@@ -372,7 +377,7 @@ async fn a_body_the_layer_refuses_falls_back_to_the_payload_or_to_the_whole_body
 }
 
 #[tokio::test]
-async fn a_body_the_layer_takes_and_then_fails_is_rejected_without_a_second_attempt() {
+async fn a_body_the_layer_takes_and_then_fails_is_asked_again_not_resent_as_a_payload() {
     let built = MockExecutionLayer::built_block(1);
     let el = MockExecutionLayer::with_behaviour(MockBehaviour {
         take_bodies: true,
@@ -383,8 +388,10 @@ async fn a_body_the_layer_takes_and_then_fails_is_rejected_without_a_second_atte
     driver.cache_body(body_for(built.hash, 1, false));
     driver.cache_payload(built.hash, built.execution_data.clone());
     driver.handle_output(&execute(built.hash)).await;
-    let ImportReport::Done(_, ImportVerdict::Invalid(reason)) = next_report(&mut rx).await else { panic!("expected invalid") };
-    assert_eq!(reason, "state db corrupt");
+    // A failure after the layer took the body (a timeout while it executed,
+    // a dropped connection) is no verdict on the block: asked for again
+    // (audit 2026-10 B-5), not sent again as a payload on this attempt.
+    let ImportReport::Done(_, ImportVerdict::NotYet) = next_report(&mut rx).await else { panic!("expected not yet") };
     assert_eq!(count(&el, |c| matches!(c, ElCall::NewPayload(_))), 0, "a failure after the body was taken is not retried as a payload");
 
     // INVALID after a VALID check: the check released the vote, the verdict withdraws it.

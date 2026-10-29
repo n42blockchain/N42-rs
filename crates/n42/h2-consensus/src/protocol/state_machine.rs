@@ -309,6 +309,15 @@ pub(super) struct PendingProposal {
     pub(super) justify_block: B256,
 }
 
+/// Leader work a failed vote-log write left undone (audit 2026-10 R2-C7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VoteLogRetry {
+    /// The proposal of this node's own block, aborted before anything went out.
+    OwnBlock { view: ViewNumber, block_hash: B256, tx_root_hash: Option<B256> },
+    /// The leader's own commit vote for the PrepareQC it formed.
+    LeaderCommitVote { view: ViewNumber, block_hash: B256 },
+}
+
 /// The HotStuff-2 consensus engine.
 ///
 /// An event-driven state machine that processes consensus messages and produces
@@ -397,6 +406,9 @@ pub struct ConsensusEngine {
     /// The signed-message commitment of the proposal this view has taken;
     /// a repeat of it (any peer can replay the leader's) is dropped.
     pub(super) processed_proposal: Option<B256>,
+    /// Leader work a failed vote-log write left undone, retried before the
+    /// next event (audit 2026-10 R2-C7).
+    pub(super) vote_log_retry: Option<VoteLogRetry>,
     /// Buffer for messages arriving for future views (within FUTURE_VIEW_WINDOW).
     pub(super) future_msg_buffer: Vec<(ViewNumber, ConsensusMessage)>,
     /// Which validators' Round 1 votes this node, as leader, has verified,
@@ -540,6 +552,7 @@ impl ConsensusEngine {
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
             processed_proposal: None,
+            vote_log_retry: None,
             future_msg_buffer: Vec::new(),
             voters_seen: HashMap::new(),
             withheld_votes: VecDeque::new(),
@@ -664,6 +677,7 @@ impl ConsensusEngine {
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
             processed_proposal: None,
+            vote_log_retry: None,
             future_msg_buffer: Vec::new(),
             voters_seen: HashMap::new(),
             withheld_votes: VecDeque::new(),
@@ -1157,8 +1171,42 @@ impl ConsensusEngine {
 
     // ── Event processing ──
 
+    /// Retries the leader work a failed vote-log write left undone, if it is
+    /// still this view's. Only a fatal error is returned: any other failure
+    /// is kept for the next event, and the event at hand is still handled.
+    fn retry_vote_log_work(&mut self) -> ConsensusResult<()> {
+        let Some(retry) = self.vote_log_retry.take() else {
+            return Ok(());
+        };
+        let current_view = self.round_state.current_view();
+        let retried = match retry {
+            VoteLogRetry::OwnBlock { view, block_hash, tx_root_hash } if view == current_view => {
+                self.on_block_ready(block_hash, tx_root_hash)
+            }
+            VoteLogRetry::LeaderCommitVote { view, block_hash }
+                if view == current_view
+                    && self.prepare_qc.as_ref().is_some_and(|qc| qc.block_hash == block_hash) =>
+            {
+                self.cast_leader_commit_vote(view, block_hash)
+                    .and_then(|_| self.try_form_commit_qc())
+            }
+            _ => Ok(()),
+        };
+        match retried {
+            Err(error) if error.fatal_reason().is_some() => Err(error),
+            Err(error) => {
+                tracing::warn!(target: "n42::cl::engine", view = current_view, %error, "vote-log retry failed; trying again on the next event");
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
+    }
+
     /// Processes a consensus event and generates outputs.
     pub fn process_event(&mut self, event: ConsensusEvent) -> ConsensusResult<()> {
+        if self.vote_log_retry.is_some() {
+            self.retry_vote_log_work()?;
+        }
         let kind = match &event {
             ConsensusEvent::Message(_) => "message",
             ConsensusEvent::BlockReady(..) => "block_ready",
@@ -1194,6 +1242,9 @@ impl ConsensusEngine {
         &mut self,
         authenticated: AuthenticatedConsensusMessage,
     ) -> ConsensusResult<()> {
+        if self.vote_log_retry.is_some() {
+            self.retry_vote_log_work()?;
+        }
         self.process_message_inner(authenticated.message, Some(authenticated.proof))
     }
 

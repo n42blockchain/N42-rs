@@ -214,14 +214,23 @@ impl ConsensusEngine {
             prepare_qc_msg,
         )))?;
 
-        // Leader self-vote for CommitVote (Round 2). Bind to the same
-        // changes_hash on_block_ready cached so this self-vote signs the
-        // same domain as every follower's commit vote.
+        if !self.cast_leader_commit_vote(view, block_hash)? {
+            return Ok(());
+        }
+        self.try_form_commit_qc()
+    }
+
+    /// The leader's own commit vote (Round 2) for the PrepareQC it formed;
+    /// false when it was cast before. Bound to the same changes_hash
+    /// on_block_ready cached, so it signs the same domain as every
+    /// follower's commit vote. A failed log write is retried on the next
+    /// event (audit 2026-10 R2-C7).
+    pub(super) fn cast_leader_commit_vote(&mut self, view: u64, block_hash: B256) -> ConsensusResult<bool> {
         if !self.round_state.may_commit_vote_in(view) {
             tracing::warn!(target: "n42::cl::voting", view,
                 last_commit_voted = self.round_state.last_commit_voted_view(),
                 "leader already cast a commit vote in this view; suppressing R2 self-vote");
-            return Ok(());
+            return Ok(false);
         }
         let previous = self.round_state.record_commit_vote(view);
         // A failed log write must not leave the watermark advanced: the
@@ -230,6 +239,10 @@ impl ConsensusEngine {
             .vote_log
             .record_commit_vote(view, self.round_state.locked_qc())
             .inspect_err(|_| self.round_state.rollback_commit_vote(previous));
+        if logged.is_err() {
+            self.vote_log_retry =
+                Some(super::state_machine::VoteLogRetry::LeaderCommitVote { view, block_hash });
+        }
         self.note_vote_log(logged)?;
         let changes_hash = self.cached_changes_hash(&block_hash);
         let commit_msg = self
@@ -239,8 +252,7 @@ impl ConsensusEngine {
         if let Some(ref mut collector) = self.commit_collector {
             collector.add_verified_vote(self.my_index, commit_sig)?;
         }
-
-        self.try_form_commit_qc()
+        Ok(true)
     }
 
     /// Processes a Round 2 (Commit) vote from a validator.

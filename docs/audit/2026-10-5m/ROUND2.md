@@ -68,3 +68,4 @@
 | R2-C4 | 已修:`on_block_ready` 记录本 view 的 `processed_proposal`,被回传的自身 proposal 在投票或超时后按重复丢弃;测试 `a_leader_given_back_its_own_proposal_after_a_timeout_drops_it` 修复前失败(重新发出 ExecuteBlock) |
 | R2-C5 | 已修:真 genesis QC(view 0、零哈希、无签名者)作为 timeout/NewView 的 high QC 一律接受,与 gov5 一致;锁只向更高 view 移动,不会回退;测试 `a_timeout_with_the_genesis_high_qc_counts_after_the_lock_moved` 修复前失败 |
 | R2-C6 | 已修:gov5 profile(H2V4/Gov5Legacy)下 Decide 的 `validator_changes_hash` 非零即拒(`H2V4ValidatorChangesUnsupported`),在验 QC 之前;测试 `a_gov5_decide_naming_validator_changes_is_refused` 修复前失败(伪造哈希触发 SyncRequired) |
+| R2-C7 | 已修:leader 提案的 vote-log 写入挪到任何状态改动之前(失败时视图仍在等提案);失败的自身提案与 R2 自投 commit 票记入 `vote_log_retry`,下一个事件(`process_event` / `process_authenticated_message`)先重试,仅 fatal 错误上抛。热路径代价:每个事件一次 `Option` 判空。测试 `a_leader_retries_after_a_failed_log_write_in_both_rounds` 修复前失败 |

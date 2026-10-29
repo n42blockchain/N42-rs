@@ -142,10 +142,6 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        let justify_qc = self.round_state.locked_qc().clone();
-        let piggybacked_qc = self.previous_prepare_qc.take();
-        let chained = piggybacked_qc.is_some();
-
         // Include any pending validator changes so all nodes apply the same
         // changes at CommitQC time (consensus-safe commit-then-activate).
         let validator_changes = self.epoch_manager.pending_changes_for_proposal();
@@ -155,6 +151,44 @@ impl ConsensusEngine {
         {
             return Err(ConsensusError::H2V4ValidatorChangesUnsupported);
         }
+
+        // Leader self-vote: GossipSub does not deliver messages back to the sender,
+        // so the leader must add its own vote directly to the collector. Record the
+        // vote in last_voted_view *before* signing — same crash-safety invariant as
+        // send_vote(): we err on the side of not voting rather than double-voting.
+        if !self.round_state.may_vote_in(view) {
+            tracing::warn!(
+                target: "n42::cl::proposal",
+                view,
+                last_voted = self.round_state.last_voted_view(),
+                "leader already voted in this view; aborting proposal"
+            );
+            return Ok(());
+        }
+        let previous = self.round_state.record_vote(view);
+        // Persist the leader self-vote with the same crash-safety contract as
+        // send_vote(); a fsync failure aborts the proposal.
+        // A failed log write must not leave the watermark advanced: the
+        // retry after the disk recovers would otherwise be refused. It comes
+        // before any other change, so the view is still waiting for this
+        // proposal, which the next event retries (audit 2026-10 R2-C7).
+        let logged = self
+            .vote_log
+            .record_vote(view, self.round_state.locked_qc())
+            .inspect_err(|_| self.round_state.rollback_vote(previous));
+        if logged.is_err() {
+            self.vote_log_retry = Some(super::state_machine::VoteLogRetry::OwnBlock {
+                view,
+                block_hash,
+                tx_root_hash,
+            });
+        }
+        self.note_vote_log(logged)?;
+
+        let justify_qc = self.round_state.locked_qc().clone();
+        let piggybacked_qc = self.previous_prepare_qc.take();
+        let chained = piggybacked_qc.is_some();
+
         let changes_hash = match validator_changes.as_ref() {
             Some(changes) => crate::EpochManager::hash_changes(changes),
             None => B256::ZERO,
@@ -223,29 +257,6 @@ impl ConsensusEngine {
         self.processed_proposal = Some(B256::from(*blake3::hash(&prop_msg).as_bytes()));
         self.round_state.enter_voting();
 
-        // Leader self-vote: GossipSub does not deliver messages back to the sender,
-        // so the leader must add its own vote directly to the collector. Record the
-        // vote in last_voted_view *before* signing — same crash-safety invariant as
-        // send_vote(): we err on the side of not voting rather than double-voting.
-        if !self.round_state.may_vote_in(view) {
-            tracing::warn!(
-                target: "n42::cl::proposal",
-                view,
-                last_voted = self.round_state.last_voted_view(),
-                "leader already voted in this view; aborting proposal"
-            );
-            return Ok(());
-        }
-        let previous = self.round_state.record_vote(view);
-        // Persist the leader self-vote with the same crash-safety contract as
-        // send_vote(); a fsync failure aborts the proposal.
-        // A failed log write must not leave the watermark advanced: the
-        // retry after the disk recovers would otherwise be refused.
-        let logged = self
-            .vote_log
-            .record_vote(view, self.round_state.locked_qc())
-            .inspect_err(|_| self.round_state.rollback_vote(previous));
-        self.note_vote_log(logged)?;
         // Reuse the vote_msg computed above (same view + block_hash).
         let leader_vote_sig = self.signing_profile.sign(&self.secret_key, &vote_msg);
         if let Some(ref mut collector) = self.vote_collector {

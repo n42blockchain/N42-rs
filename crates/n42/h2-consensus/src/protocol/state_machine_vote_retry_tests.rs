@@ -215,3 +215,92 @@ fn a_vote_log_fatal_threshold_of_zero_is_never_fatal() {
     engine.send_vote(1, hash).expect("still voting");
     assert_eq!(votes(&mut rx), (1, 0));
 }
+
+/// Audit 2026-10 R2-C7: a leader whose vote-log write fails retries the
+/// work on its next event, in both rounds. Before, the failed proposal left
+/// the view in voting with nothing sent (a second BlockReady was refused)
+/// and a failed R2 self-vote was never cast.
+#[test]
+fn a_leader_retries_after_a_failed_log_write_in_both_rounds() {
+    use crate::protocol::quorum::{commit_signing_message, signing_message};
+    use n42_h2_primitives::consensus::{CommitVote, Vote};
+    let sks: Vec<_> = (0..4u8)
+        .map(|i| n42_h2_primitives::BlsSecretKey::key_gen(&[0x50 + i; 32]).expect("key"))
+        .collect();
+    let infos: Vec<_> = sks
+        .iter()
+        .enumerate()
+        .map(|(i, sk)| ValidatorInfo { address: Address::with_last_byte(i as u8), bls_public_key: sk.public_key(), p2p_peer_id: None })
+        .collect();
+    let vs = ValidatorSet::new(&infos, 1);
+    let make = |me: u32, log: Arc<dyn crate::vote_log::VoteLogWriter>| {
+        let (tx, rx) = mpsc::channel(1024);
+        let engine = ConsensusEngine::with_recovered_state_and_vote_log(
+            me,
+            sks[me as usize].clone(),
+            EpochManager::new(vs.clone()),
+            60_000,
+            120_000,
+            tx,
+            1,
+            QuorumCertificate::genesis(),
+            QuorumCertificate::genesis(),
+            0,
+            0,
+            0,
+            log,
+        );
+        (engine, rx)
+    };
+    let me = make(0, Arc::new(crate::vote_log::NoopVoteLog)).0.leader_index_for_view(1);
+    let (mut engine, mut rx) = make(me, Arc::new(FailOnce::default()));
+    let others: Vec<u32> = (0..4).filter(|&i| i != me).collect();
+    let hash = B256::repeat_byte(0x83);
+    let drain = |rx: &mut mpsc::Receiver<EngineOutput>| -> Vec<EngineOutput> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    };
+    let vote = |i: u32| {
+        ConsensusEvent::Message(ConsensusMessage::Vote(Vote {
+            view: 1,
+            block_hash: hash,
+            voter: i,
+            signature: sks[i as usize].sign(&signing_message(1, &hash)),
+        }))
+    };
+    let commit_vote = |i: u32| {
+        ConsensusEvent::Message(ConsensusMessage::CommitVote(CommitVote {
+            view: 1,
+            block_hash: hash,
+            voter: i,
+            signature: sks[i as usize].sign(&commit_signing_message(1, &hash, &B256::ZERO)),
+        }))
+    };
+
+    // R1: the proposal's log write fails; nothing goes out.
+    assert!(engine.process_event(ConsensusEvent::BlockReady(hash, None)).is_err());
+    assert!(
+        !drain(&mut rx).iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(_)))),
+        "no proposal without its logged self-vote"
+    );
+    assert_eq!(engine.last_voted_view(), 0);
+    // The next event (here a follower's early vote) retries it first.
+    engine.process_event(vote(others[0])).expect("the retry and the vote");
+    assert!(
+        drain(&mut rx).iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(p)) if p.block_hash == hash)),
+        "the retry proposes"
+    );
+    assert_eq!(engine.last_voted_view(), 1);
+
+    // R2: the quorum forms the PrepareQC; the self commit vote's write fails.
+    assert!(engine.process_event(vote(others[1])).is_err());
+    assert!(drain(&mut rx).iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_)))));
+    assert_eq!(engine.last_commit_voted_view(), 0);
+    // Retried on the next event: with it two followers' commit votes are a quorum.
+    engine.process_event(commit_vote(others[0])).expect("the retry and the commit vote");
+    assert_eq!(engine.last_commit_voted_view(), 1);
+    engine.process_event(commit_vote(others[1])).expect("the commit quorum");
+    assert!(
+        drain(&mut rx).iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Decide(d)) if d.block_hash == hash)),
+        "the view commits"
+    );
+}

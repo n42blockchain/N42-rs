@@ -826,6 +826,8 @@ pub struct ExecutionDriver<E> {
     /// The forkchoice the engine answered then made nothing canonical; it
     /// runs again when the block's import lands.
     commits_ahead: std::collections::HashSet<B256>,
+    /// [`Self::commits_ahead`] in the order remembered, for its bound.
+    commits_ahead_order: std::collections::VecDeque<B256>,
     /// Bounds `payloads` so a peer cannot make us buffer without limit.
     max_cached_payloads: usize,
     /// Insertion order, for evicting the oldest cached payload.
@@ -1077,6 +1079,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             pending_commits: std::collections::HashSet::new(),
             imported: std::collections::VecDeque::new(),
             commits_ahead: std::collections::HashSet::new(),
+            commits_ahead_order: std::collections::VecDeque::new(),
             max_cached_payloads: Self::DEFAULT_MAX_CACHED_PAYLOADS,
             payload_order: Vec::new(),
             commit_async: commit_fcu_async(),
@@ -2440,13 +2443,20 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Remembers a commit to repeat when `block_hash`'s import lands. Bounded:
     /// a block imported by a path the driver does not see (a synced range)
     /// stays in the set until it is bounded away, harmlessly.
+    /// The oldest is the one bounded away: a set's own order is arbitrary
+    /// and could drop the newest commit (round 3, R3-C4).
     fn remember_commit_ahead(&mut self, block_hash: B256) {
-        self.commits_ahead.insert(block_hash);
-        if self.commits_ahead.len() > 64 {
-            let stale: Vec<B256> = self.commits_ahead.iter().copied().take(self.commits_ahead.len() - 64).collect();
-            for hash in stale {
-                self.commits_ahead.remove(&hash);
-            }
+        if self.commits_ahead.insert(block_hash) {
+            self.commits_ahead_order.push_back(block_hash);
+        }
+        while self.commits_ahead.len() > 64 {
+            let Some(oldest) = self.commits_ahead_order.pop_front() else { break };
+            self.commits_ahead.remove(&oldest);
+        }
+        // Entries taken out of the set elsewhere leave their place behind.
+        if self.commits_ahead_order.len() > 256 {
+            let kept = &self.commits_ahead;
+            self.commits_ahead_order.retain(|hash| kept.contains(hash));
         }
     }
 
@@ -2768,10 +2778,14 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             ImportVerdict::NeedTxns(indices) => DriverAction::TransactionsMissing { block_hash, indices },
             ImportVerdict::Invalid(reason) => {
                 self.import_retries.remove(&block_hash);
-                // A commit for it can never run; a payload for it is dropped
-                // so a fresh copy is executed again, not this outcome.
+                // The verdict is on the bytes that were sent (audit 2026-10
+                // R2-I3): a payload for it is dropped so a fresh copy is
+                // executed again, and a commit that waited runs when that
+                // copy imports. Dropped, the block a quorum committed was not
+                // made canonical here until a descendant was (round 3, R3-C4).
                 if self.pending_commits.remove(&block_hash) {
-                    warn!(target: "n42.h2.el", block = ?block_hash, %reason, "a commit waited for an import that failed; dropped");
+                    warn!(target: "n42.h2.el", block = ?block_hash, %reason, "a commit waited for an import that failed; it runs when another copy imports");
+                    self.remember_commit_ahead(block_hash);
                 }
                 self.forget_payload(block_hash);
                 DriverAction::Rejected { block_hash, reason }

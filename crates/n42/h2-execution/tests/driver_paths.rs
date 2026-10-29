@@ -153,7 +153,7 @@ async fn a_spawned_imports_verdict_becomes_the_action_an_awaited_import_would_re
 }
 
 #[tokio::test]
-async fn a_commit_that_waited_for_an_import_runs_when_it_succeeds_and_is_dropped_when_it_fails() {
+async fn a_commit_that_waited_for_an_import_runs_when_it_or_a_later_copy_succeeds() {
     let built = MockExecutionLayer::built_block(1);
 
     // Success: the commit heard mid-import is sent once the block is in.
@@ -170,7 +170,10 @@ async fn a_commit_that_waited_for_an_import_runs_when_it_succeeds_and_is_dropped
     assert_eq!(driver.finalized(), built.hash);
     assert_eq!(count(&el, |c| matches!(c, ElCall::ForkchoiceUpdated(s) if s.head_block_hash == built.hash)), 1);
 
-    // Failure: the commit can never run, and a later success does not resurrect it.
+    // Failure: an invalid verdict judges the bytes that were sent, not the
+    // block (audit 2026-10 R2-I3), so the commit waits for the next copy;
+    // dropped, the block a quorum committed never became canonical here
+    // until a descendant was committed (round 3, R3-C4).
     let el = MockExecutionLayer::with_behaviour(MockBehaviour { new_payload_status: invalid("bad"), ..Default::default() });
     let (mut driver, mut rx) = spawning(&el);
     driver.cache_payload(built.hash, built.execution_data.clone());
@@ -184,7 +187,12 @@ async fn a_commit_that_waited_for_an_import_runs_when_it_succeeds_and_is_dropped
     driver.handle_output(&execute(built.hash)).await;
     let report = next_report(&mut rx).await;
     driver.finish_execute(report).await;
-    assert_eq!(count(&el, |c| matches!(c, ElCall::ForkchoiceUpdated(_))), 0, "the dropped commit stayed dropped");
+    assert_eq!(
+        count(&el, |c| matches!(c, ElCall::ForkchoiceUpdated(s) if s.head_block_hash == built.hash)),
+        1,
+        "the commit runs when a good copy imports"
+    );
+    assert_eq!(driver.finalized(), built.hash);
 }
 
 #[tokio::test]

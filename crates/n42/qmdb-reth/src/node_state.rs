@@ -1149,6 +1149,19 @@ fn remove_live_log(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Makes the `n`th delta append from now fail on this thread (0: none),
+    /// as a full disk would.
+    static FAIL_DELTA_APPEND: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Sets [`FAIL_DELTA_APPEND`] for this thread.
+#[cfg(test)]
+fn fail_delta_append(nth: u32) {
+    FAIL_DELTA_APPEND.with(|fail| fail.set(nth));
+}
+
 /// Sets [`BETWEEN_PERSIST_HOLDS`] for this thread.
 #[cfg(test)]
 fn set_between_persist_holds(hook: Box<dyn FnOnce()>) {
@@ -3349,17 +3362,30 @@ impl QmdbNodeState {
             self.note_reader_lag();
         }
         if let Some((deltas, roots)) = ready {
-            self.sync_entries_if_file()?;
-            for delta in &deltas {
-                let written = append_delta(&self.delta_log_path(), cursor.log_len, delta)?;
-                cursor.next_slot = delta.next_slot;
-                cursor.log_len = written;
-                debug!(
-                    target: "n42.qmdb",
-                    block = delta.head_number, block_hash = %delta.head_hash,
-                    appended = delta.appended.len(), changed = delta.changed.len(),
-                    "persisted a QMDB block from its own delta",
-                );
+            // What fails to reach the log goes back into the bookkeeping: the
+            // retry finds the deltas gone and measures from it instead.
+            let mut logged = 0;
+            let appended = self.sync_entries_if_file().and_then(|()| {
+                for delta in &deltas {
+                    cursor.log_len = append_delta(&self.delta_log_path(), cursor.log_len, delta)?;
+                    cursor.next_slot = delta.next_slot;
+                    cursor.head = delta.head_hash;
+                    logged += 1;
+                    debug!(
+                        target: "n42.qmdb",
+                        block = delta.head_number, block_hash = %delta.head_hash,
+                        appended = delta.appended.len(), changed = delta.changed.len(),
+                        "persisted a QMDB block from its own delta",
+                    );
+                }
+                Ok(())
+            });
+            if let Err(error) = appended {
+                self.with_forest("on_canonical#remeasure", |forest| {
+                    forest.remeasure(&deltas[logged..]);
+                    Ok(())
+                })?;
+                return Err(error);
             }
             cursor.head = block_hash;
             self.record_head_roots(&roots);
@@ -3397,8 +3423,19 @@ impl QmdbNodeState {
         // The measured delta is appended first either way: the compaction
         // folds the log as it stands, and the synchronous checkpoint's
         // snapshot covers it too (the log is then emptied).
-        self.sync_entries_if_file()?;
-        let written = append_delta(&self.delta_log_path(), cursor.log_len, &delta)?;
+        let written = match self
+            .sync_entries_if_file()
+            .and_then(|()| append_delta(&self.delta_log_path(), cursor.log_len, &delta))
+        {
+            Ok(written) => written,
+            Err(error) => {
+                self.with_forest("on_canonical#remeasure", |forest| {
+                    forest.remeasure(core::slice::from_ref(&delta));
+                    Ok(())
+                })?;
+                return Err(error);
+            }
+        };
         let block_hash = delta.head_hash;
         cursor.head = block_hash;
         cursor.next_slot = delta.next_slot;
@@ -4064,6 +4101,16 @@ fn append_delta(path: &Path, from: u64, delta: &ForestDelta) -> Result<u64, Node
         std::fs::create_dir_all(dir).map_err(io)?;
     }
     let record = frame_delta(delta)?;
+    #[cfg(test)]
+    if FAIL_DELTA_APPEND.with(|fail| match fail.get() {
+        0 => false,
+        n => {
+            fail.set(n - 1);
+            n == 1
+        }
+    }) {
+        return Err(io(std::io::Error::from(std::io::ErrorKind::StorageFull)));
+    }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         // Not truncated on open: the length this record belongs after is

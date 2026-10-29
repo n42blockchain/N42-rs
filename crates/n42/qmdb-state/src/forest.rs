@@ -1590,6 +1590,21 @@ impl QmdbForest {
         self.tree.next_slot()
     }
 
+    /// Puts back what `deltas` carried, for deltas that were taken out of the
+    /// records ([`Self::take_block_deltas`]) or measured ([`Self::delta_since`])
+    /// but never reached the log: their flipped slots rejoin the move
+    /// bookkeeping and the low-water mark drops to their base, so the next
+    /// [`Self::delta_since`] measures them again. Without it a failed append
+    /// lost them -- the bookkeeping they would otherwise come from was cleared
+    /// by the measurement, or by the persistence before it (audit 2026-10
+    /// round 2, R2-Q1).
+    pub fn remeasure(&mut self, deltas: &[ForestDelta]) {
+        for delta in deltas {
+            self.dirty_slots.extend(delta.changed.iter().map(|(slot, _)| *slot));
+            self.min_cursor = self.min_cursor.min(delta.base_next_slot);
+        }
+    }
+
     /// Forgets what has changed, without describing it.
     ///
     /// For a caller that has just written the whole tree: the changes are in

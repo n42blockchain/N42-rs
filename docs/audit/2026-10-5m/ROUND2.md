@@ -45,4 +45,5 @@
 
 | id | 状态 |
 |---|---|
-| R2-X1 | 已修(见下) |
+| R2-X1 | 已修 afdd51d80:测试 `a_torsion_component_in_r_gets_one_verdict_in_every_batch` 修复前失败(nonce 1 单独验证被拒,nonce 0 通过) |
+| R2-Q1 | 已修:`QmdbForest::remeasure`,两条追加路径出错时把未落日志的 delta 还给簿记;测试 `a_failed_delta_append_loses_no_flip` 修复前重启报 duplicate active key。`checkpoint()` 失败后重试整树重写,不丢 |

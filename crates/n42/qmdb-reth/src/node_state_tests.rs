@@ -1314,6 +1314,36 @@ fn a_move_between_the_persistence_holds_reaches_the_next_delta() {
     assert_eq!(restarted.state_root(), root);
 }
 
+/// Audit 2026-10 round 2 (R2-Q1): a delta append that fails after the
+/// block deltas were taken out of the forest falls back to measuring the
+/// difference from the move bookkeeping. That bookkeeping must still name
+/// the flips of every block not yet in the log -- including a block computed
+/// before the previous persistence, whose bookkeeping that persistence
+/// cleared -- or the restart lands on another tree.
+#[test]
+fn a_failed_delta_append_loses_no_flip() {
+    for (entry_file, nth) in [(true, 1), (true, 2), (false, 1), (false, 2)] {
+        let (state, chain, dir, head3, _) = node_at(&format!("failed-append-{entry_file}-{nth}"), entry_file, 3);
+        let prepared = state.compute(head3, &changes_for(4)).expect("compute 4");
+        state.insert(hash_of(4), 4, prepared).expect("insert 4");
+        let prepared = state.compute(hash_of(4), &changes_for(5)).expect("compute 5");
+        state.insert(hash_of(5), 5, prepared).expect("insert 5");
+        let prepared = state.compute(hash_of(5), &changes_for(6)).expect("compute 6");
+        state.insert(hash_of(6), 6, prepared).expect("insert 6");
+        // 4 persists while 5 and 6 are already computed on it.
+        state.on_canonical(hash_of(4)).expect("canonical 4");
+        fail_delta_append(nth);
+        state.on_canonical(hash_of(6)).expect_err("the append fails");
+        state.on_canonical(hash_of(6)).expect("the retry persists");
+        let root = state.state_root();
+        drop(state);
+
+        let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        restarted.initialize((6, hash_of(6))).expect("the log replays onto block 6's tree");
+        assert_eq!(restarted.state_root(), root, "entry file {entry_file}, append {nth} failed");
+    }
+}
+
 /// Audit 2026-10 D-4: a move below the persisted head rewrites the entry
 /// file's slots before any delta says so. A process that dies there leaves
 /// the log on the old branch and the entries on the new one; the restart

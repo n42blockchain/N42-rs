@@ -3368,6 +3368,35 @@ mod tests {
         assert_eq!(engine.consecutive_timeouts(), timeouts, "the repeat timeout is not a new one");
     }
 
+    /// Audit 2026-10 R2-C4: A-3 for the leader's own proposal. A peer that
+    /// relays the leader's proposal back to it after the leader timed out of
+    /// the view must change nothing, as for any other repeat.
+    #[test]
+    fn a_leader_given_back_its_own_proposal_after_a_timeout_drops_it() {
+        let (probe, ..) = make_engine(4, 0);
+        let view = probe.current_view();
+        let me = probe.leader_index_for_view(view);
+        let (mut engine, _sks, _, mut rx) = make_engine(4, me);
+        engine
+            .process_event(ConsensusEvent::BlockReady(B256::repeat_byte(0xE8), None))
+            .expect("the leader proposes");
+        let proposal = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|output| match output {
+                EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(p)) => Some(p),
+                _ => None,
+            })
+            .expect("the proposal is broadcast");
+        engine.on_timeout().expect("timed out");
+        let timeouts = engine.consecutive_timeouts();
+        let _: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let _ = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)));
+        let again: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(again.is_empty(), "its own proposal given back produces nothing: {again:?}");
+        assert_eq!(engine.current_phase(), Phase::TimedOut, "and the view stays timed out");
+        engine.on_timeout().expect("still timed out");
+        assert_eq!(engine.consecutive_timeouts(), timeouts, "the repeat timeout is not a new one");
+    }
+
     #[test]
     fn test_h2_vote_waits_for_execution_import() {
         let (mut engine, sks, _, mut rx) = make_engine(4, 0);

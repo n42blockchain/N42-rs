@@ -65,3 +65,4 @@
 | R2-I5 | 已修:gossip 模式不验 hello、已学到的 (index, peer) 不再验、每连接每 peer 至多 4 次;测试 `hellos_are_verified_only_where_they_can_matter` 修复前失败 |
 | R2-C2 | 已修:跳转校验发现携带 QC 伪造的未来消息不再缓冲;缓冲未来 proposal 时校验其 justify QC(与回放同一校验,集合未知则仍缓冲),代价每个缓冲的未来 proposal 一次聚合验签;测试 `forged_qc_copies_of_a_future_proposal_do_not_crowd_out_the_genuine_one` 修复前失败。旧去重测试改用 view-0 QC 保持原意 |
 | R2-C8 | 已修(确认可达):回放中晚到的伪造投票被记到触发推进的 Decide 头上;`advance_to_view` 回放前取出、回放后恢复 `unauthenticated`;测试 `a_forged_message_found_at_replay_is_not_blamed_on_the_trigger` 修复前失败 |
+| R2-C4 | 已修:`on_block_ready` 记录本 view 的 `processed_proposal`,被回传的自身 proposal 在投票或超时后按重复丢弃;测试 `a_leader_given_back_its_own_proposal_after_a_timeout_drops_it` 修复前失败(重新发出 ExecuteBlock) |

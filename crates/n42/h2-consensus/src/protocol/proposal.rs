@@ -217,6 +217,10 @@ impl ConsensusEngine {
             block_hash,
             view_set_len,
         ));
+        // The proposal this view took is this one: a peer relaying it back
+        // is a repeat, dropped once the view is voted or timed out (audit
+        // 2026-10 R2-C4, A-3 for the leader).
+        self.processed_proposal = Some(B256::from(*blake3::hash(&prop_msg).as_bytes()));
         self.round_state.enter_voting();
 
         // Leader self-vote: GossipSub does not deliver messages back to the sender,

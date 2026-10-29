@@ -288,8 +288,9 @@ impl AltSigTx {
         let key = self.tx.ed25519_key()?;
         let sig = self.ed25519_signature()?;
         let hash = self.tx.signing_hash();
-        ed25519_dalek::verify_batch(&[hash.as_slice()], &[sig], &[key])
-            .map_err(|_| AltSigError::Invalid)?;
+        if !batch_equation_holds(&[hash.as_slice()], &[sig], &[key], false) {
+            return Err(AltSigError::Invalid);
+        }
         Ok(self.tx.sender())
     }
 
@@ -400,22 +401,18 @@ pub fn verify_batch(txs: &[&AltSigTx]) -> Vec<Result<Address, AltSigError>> {
         return out;
     }
     for (slot, &i) in index.iter().enumerate() {
-        if ed25519_dalek::verify_batch(&messages[slot..=slot], &sigs[slot..=slot], &keys[slot..=slot]).is_ok() {
+        if batch_equation_holds(&messages[slot..=slot], &sigs[slot..=slot], &keys[slot..=slot], false) {
             out[i] = Ok(txs[i].tx.sender());
         }
     }
     out
 }
 
-/// Whether a batch verifies: [`batch_equation_holds`], or ed25519-dalek's own batch
-/// verification with `N42_ED25519_MERGE=0`.
+/// Whether a batch verifies under [`batch_equation_holds`], with the terms of equal keys
+/// merged unless `N42_ED25519_MERGE=0` (the verdict is the same either way).
 fn batch_holds(messages: &[&[u8]], signatures: &[EdSignature], keys: &[VerifyingKey]) -> bool {
     static MERGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *MERGE.get_or_init(|| n42_env::flag("N42_ED25519_MERGE", true)) {
-        batch_equation_holds(messages, signatures, keys)
-    } else {
-        ed25519_dalek::verify_batch(messages, signatures, keys).is_ok()
-    }
+    batch_equation_holds(messages, signatures, keys, *MERGE.get_or_init(|| n42_env::flag("N42_ED25519_MERGE", true)))
 }
 
 /// ed25519-dalek's batch verification (`ed25519_dalek::verify_batch`, 3.0; the equation and
@@ -428,8 +425,17 @@ fn batch_holds(messages: &[&[u8]], signatures: &[EdSignature], keys: &[Verifying
 /// -- every ingest frame of a flood, a sender's run of nonces -- puts one key point into it
 /// instead of one per signature, 130 points for 128 signatures rather than 257. The
 /// multiplication was a quarter of a fleet node's samples (loop167's leader profile: Ed25519
-/// and SHA-512 39% of the process, keccak 9%).
-fn batch_equation_holds(messages: &[&[u8]], signatures: &[EdSignature], keys: &[VerifyingKey]) -> bool {
+/// and SHA-512 39% of the process, keccak 9%). `merge = false` keeps one term per signature.
+///
+/// Unlike ed25519-dalek, the sum is multiplied by the cofactor before the identity check.
+/// ed25519-dalek's batch equation is cofactorless: for an `R` or `A` with a torsion
+/// component the sum is `z_i T`, which is the identity exactly when the transcript's `z_i`
+/// cancels `T`'s order, so the verdict depends on the rest of the batch. Signatures are a
+/// consensus rule and every node cuts its own batches, so a verdict must not; with the
+/// cofactor every batch, including a batch of one ([`AltSigTx::verify`]), checks the
+/// cofactored equation of `docs/spec/N42_TX_0x50.md` for each signature (up to the
+/// `2^-128` soundness of the random coefficients). Three doublings a batch.
+fn batch_equation_holds(messages: &[&[u8]], signatures: &[EdSignature], keys: &[VerifyingKey], merge: bool) -> bool {
     if messages.len() != signatures.len() || keys.len() != signatures.len() {
         return false;
     }
@@ -477,6 +483,11 @@ fn batch_equation_holds(messages: &[&[u8]], signatures: &[EdSignature], keys: &[
     let mut key_coefficients: Vec<Scalar> = Vec::new();
     for ((key, hram), z) in keys.iter().zip(&hrams).zip(&zs) {
         let term = Scalar::from_bytes_mod_order_wide(hram) * z;
+        if !merge {
+            key_points.push(key.to_edwards());
+            key_coefficients.push(term);
+            continue;
+        }
         match key_indices.entry(*key.as_bytes()) {
             std::collections::hash_map::Entry::Occupied(entry) => key_coefficients[*entry.get()] += term,
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -490,7 +501,7 @@ fn batch_equation_holds(messages: &[&[u8]], signatures: &[EdSignature], keys: &[
     let points = core::iter::once(Some(ED25519_BASEPOINT_POINT))
         .chain(signatures.iter().map(|signature| CompressedEdwardsY(*signature.r_bytes()).decompress()))
         .chain(key_points.into_iter().map(Some));
-    EdwardsPoint::optional_multiscalar_mul(scalars, points).is_some_and(|sum| sum.is_identity())
+    EdwardsPoint::optional_multiscalar_mul(scalars, points).is_some_and(|sum| sum.mul_by_cofactor().is_identity())
 }
 
 /// The empty randomness ed25519-dalek finalizes its batch transcript with: the coefficients
@@ -710,10 +721,12 @@ mod merged_batch_tests {
         )
     }
 
-    /// The merged equation's verdict, asserted equal to ed25519-dalek's.
+    /// The merged equation's verdict, asserted equal to the unmerged one and to
+    /// ed25519-dalek's (the batches here carry no torsion, where only the cofactor differs).
     fn verdict(hashes: &[B256], signatures: &[EdSignature], keys: &[VerifyingKey]) -> bool {
         let messages: Vec<&[u8]> = hashes.iter().map(|hash| hash.as_slice()).collect();
-        let merged = batch_equation_holds(&messages, signatures, keys);
+        let merged = batch_equation_holds(&messages, signatures, keys, true);
+        assert_eq!(merged, batch_equation_holds(&messages, signatures, keys, false), "merged and unmerged");
         let dalek = ed25519_dalek::verify_batch(&messages, signatures, keys).is_ok();
         assert_eq!(merged, dalek, "merged {merged}, ed25519-dalek {dalek}");
         merged
@@ -866,7 +879,7 @@ mod merged_batch_tests {
                 runs[runs.len() / 2]
             };
             let dalek = per_signature(&|| ed25519_dalek::verify_batch(&messages, &signatures, &keys).is_ok());
-            let merged = per_signature(&|| batch_equation_holds(&messages, &signatures, &keys));
+            let merged = per_signature(&|| batch_equation_holds(&messages, &signatures, &keys, true));
             println!("{name}: ed25519-dalek {dalek:.1} us a signature, merged {merged:.1} us ({:.0}% less)", (1.0 - merged / dalek) * 100.0);
         }
     }
@@ -910,6 +923,51 @@ mod merged_batch_tests {
         for batch in [1, 64, 128, 200, 256] {
             let verdicts: Vec<Option<Address>> = chunked(&txs, batch).into_iter().map(Result::ok).collect();
             assert_eq!(verdicts, alone, "batch {batch}");
+        }
+    }
+
+    /// A transaction from the key `SHA-512(seed) mod L` whose signature's `R` carries the
+    /// order-2 torsion point: `R = rB + T`, `s = r + H(R || A || M) a`. The cofactored
+    /// equation accepts it; the cofactorless one rejects it; ed25519-dalek's batch
+    /// equation accepts it exactly when the transcript's coefficient for it is even, so
+    /// its verdict there depends on which transactions share the batch.
+    fn torsion_signed(seed: u8, nonce: u64) -> AltSigTx {
+        let a = Scalar::from_bytes_mod_order_wide(&Sha512::digest([seed; 32]).into());
+        let public = (a * ED25519_BASEPOINT_POINT).compress().to_bytes();
+        let mut fields = signed(seed, nonce).into_parts().0;
+        fields.pubkey = Bytes::copy_from_slice(&public);
+        let hash = fields.signing_hash();
+        let r = Scalar::from_bytes_mod_order_wide(
+            &Sha512::new().chain_update([seed]).chain_update(nonce.to_le_bytes()).finalize().into(),
+        );
+        let big_r = (r * ED25519_BASEPOINT_POINT + curve25519_dalek::constants::EIGHT_TORSION[4]).compress();
+        let h = Scalar::from_bytes_mod_order_wide(
+            &Sha512::new().chain_update(big_r.as_bytes()).chain_update(public).chain_update(hash).finalize().into(),
+        );
+        let mut signature = big_r.to_bytes().to_vec();
+        signature.extend_from_slice((r + h * a).as_bytes());
+        AltSigTx::new(fields, Bytes::from(signature))
+    }
+
+    /// Signatures are a consensus rule, so a signature's verdict cannot depend on the batch
+    /// it is checked in (the ingest, the leader's build and every follower cut different
+    /// batches). A torsion component in `R` must get the cofactored verdict -- valid --
+    /// alone and next to any other transaction.
+    #[test]
+    fn a_torsion_component_in_r_gets_one_verdict_in_every_batch() {
+        let honest: Vec<AltSigTx> = (0..16).map(|nonce| signed(4, nonce)).collect();
+        for nonce in 0..8 {
+            let tx = torsion_signed(3, nonce);
+            assert_eq!(tx.verify(), Ok(tx.tx.sender()), "nonce {nonce} alone");
+            for companion in &honest {
+                let verdicts = verify_batch(&[&tx, companion]);
+                assert!(verdicts.iter().all(Result::is_ok), "nonce {nonce} beside {:?}", companion.hash());
+                let verdicts = verify_batch(&[companion, &tx]);
+                assert!(verdicts.iter().all(Result::is_ok), "nonce {nonce} after {:?}", companion.hash());
+            }
+            let mut many: Vec<&AltSigTx> = honest.iter().collect();
+            many.insert(7, &tx);
+            assert!(verify_batch(&many).iter().all(Result::is_ok), "nonce {nonce} in sixteen");
         }
     }
 

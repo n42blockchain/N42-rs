@@ -45,6 +45,11 @@ use tracing::{debug, warn};
 
 /// How many recent blocks keep their attestation state.
 ///
+/// The verifiers a registry holds. Registration is open and the registry
+/// never forgets a key, so this is what one caller could otherwise grow it
+/// to (audit 2026-10 round 3, R3-P6).
+pub const MAX_VERIFIERS: usize = 100_000;
+
 /// A phone verifies near the head; a block nobody attested within this window is
 /// not going to be attested. Bounded because this is fed by untrusted input.
 const DEFAULT_TRACKED_BLOCKS: usize = 256;
@@ -189,6 +194,18 @@ impl MobileService {
     /// attestations. Registering twice returns the same index.
     pub fn register_verifier(&mut self, pubkey: [u8; 48]) -> u32 {
         self.registry.register(pubkey)
+    }
+
+    /// [`Self::register_verifier`] for a key from the network: none past
+    /// [`MAX_VERIFIERS`], though a known key still gets its index.
+    pub fn try_register_verifier(&mut self, pubkey: [u8; 48]) -> Option<u32> {
+        if let Some(index) = self.registry.index_of(&pubkey) {
+            return Some(index);
+        }
+        if self.registry.len() as usize >= MAX_VERIFIERS {
+            return None;
+        }
+        Some(self.registry.register(pubkey))
     }
 
     /// The registry, for verifying an attestation this service produced.

@@ -57,3 +57,4 @@ RPC/快照/tx-queue/mobile。每项修复前先按代码核实,先写复现测�
 | R3-N6 | 已修 | message id 改为增量 Keccak,不再为每份 gossip 拷贝整份 payload;gov5 字节级向量 `matches_gov5_message_id_vectors` 覆盖正确性(纯降成本) |
 | R3-P7 | 已修 | 每个请求 10 s 绝对期限(逐次读按剩余时间设超时,涓流无法延长)与写超时;请求行+头部 16 KiB 上限;测试 `an_idle_connection_does_not_hold_the_endpoint`、`a_header_section_past_its_limit_is_refused`。仍单线程,一个慢客户端最多占 10 s |
 | R3-P5 | 已修(部分) | 未知 receipts root 的块不再报 `attested`(之前任一已注册手机报任意 root 即达阈值 1);测试 `a_block_without_a_known_receipts_root_is_never_attested`。h2_validator 仍传 view 当块号、root 为 None:需从 EL 取块号与 receipts root 才能真正出证明,`--mobile` 默认关闭(F7_MOBILE) |
+| R3-P6 | 已修(部分) | 注册表上限 `MAX_VERIFIERS`=100,000,满后 RPC 拒绝新 key(`REGISTRY_FULL`),已知 key 仍返回索引;测试 `the_verifier_registry_is_bounded`。PoP 注册与收据独立 DST 是手机协议变更(需 mobile-sdk 同步),未做 |

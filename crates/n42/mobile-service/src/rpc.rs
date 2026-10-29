@@ -44,6 +44,8 @@ pub mod codes {
     pub const UNKNOWN_BLOCK: i64 = -32003;
     /// The commit could not be encoded for phones.
     pub const INTERNAL: i64 = -32603;
+    /// The verifier registry holds as many keys as it may.
+    pub const REGISTRY_FULL: i64 = -32004;
 }
 
 /// A JSON-RPC error: a code the caller can branch on and a message for a person.
@@ -104,7 +106,10 @@ pub fn dispatch(
             let pubkey: [u8; 48] = pubkey.try_into().map_err(|_| {
                 RpcError::new(codes::INVALID_PARAMS, "a BLS public key is 48 bytes")
             })?;
-            Ok(json!(service.register_verifier(pubkey)))
+            service
+                .try_register_verifier(pubkey)
+                .map(|index| json!(index))
+                .ok_or_else(|| RpcError::new(codes::REGISTRY_FULL, "the verifier registry is full"))
         }
 
         "mobile_submitReceipt" => {
@@ -197,6 +202,27 @@ mod tests {
             dispatch(&mut service, "mobile_finality", &json!([])).unwrap(),
             Value::Null
         );
+    }
+
+    /// Audit 2026-10 round 3 (R3-P6): the registry took every key anyone
+    /// sent and never let one go. Past its bound a new key is refused; a
+    /// known one still gets its index.
+    #[test]
+    fn the_verifier_registry_is_bounded() {
+        let mut service = service();
+        let key = |i: u64| {
+            let mut key = [0u8; 48];
+            key[..8].copy_from_slice(&i.to_le_bytes());
+            key
+        };
+        for i in 0..crate::service::MAX_VERIFIERS as u64 {
+            service.register_verifier(key(i));
+        }
+        let register = |service: &mut MobileService, key: [u8; 48]| {
+            dispatch(service, "mobile_registerVerifier", &json!([format!("0x{}", hex::encode(key))]))
+        };
+        register(&mut service, [0xff; 48]).expect_err("the registry is full");
+        assert_eq!(register(&mut service, key(5)).expect("a known key"), json!(5));
     }
 
     #[test]

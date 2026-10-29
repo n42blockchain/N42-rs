@@ -362,6 +362,10 @@ pub struct ConsensusEngine {
     /// These may produce a TC only when the validator set for that view is
     /// known without epoch fallback and this node is the next-view leader.
     pub(super) future_timeout_collectors: HashMap<ViewNumber, TimeoutCollector>,
+    /// Each sender's highest verified future-view timeout: the weak
+    /// synchronizer joins the (f+1)-th highest of these views (gov5's
+    /// `futureTimeouts`). Keyed by validator index, so bounded by the set.
+    pub(super) future_timeout_views: HashMap<u32, ViewNumber>,
     /// QC formed from Round 1 votes (used to broadcast PrepareQC).
     pub(super) prepare_qc: Option<QuorumCertificate>,
     /// Saved PrepareQC piggybacked into the next Proposal (chained mode).
@@ -523,6 +527,7 @@ impl ConsensusEngine {
             commit_collector: None,
             timeout_collector: None,
             future_timeout_collectors: HashMap::new(),
+            future_timeout_views: HashMap::new(),
             prepare_qc: None,
             previous_prepare_qc: None,
             output_tx,
@@ -646,6 +651,7 @@ impl ConsensusEngine {
             commit_collector: None,
             timeout_collector: None,
             future_timeout_collectors: HashMap::new(),
+            future_timeout_views: HashMap::new(),
             prepare_qc: None,
             previous_prepare_qc: None,
             output_tx,
@@ -5959,6 +5965,36 @@ mod tests {
             .expect("timeout beyond window should be silently dropped");
 
         assert_eq!(engine.current_view(), 1);
+    }
+
+    /// Audit 2026-10 round 2 (R2-C1): validators restarted at scattered
+    /// views. Seven validators (f = 2): this one at view 1, two at view 3, one
+    /// at view 4. No future view has f+1 timeouts of its own, but f+1 senders
+    /// report a view at or above 3, so one of them is honest and gov5's weak
+    /// synchronizer joins view 3 -- the (f+1)-th highest report. Waiting for
+    /// f+1 reports of one exact view left such a fleet stalled for good.
+    #[test]
+    fn scattered_future_timeouts_join_the_f_plus_first_highest_view() {
+        use crate::protocol::quorum::timeout_signing_message;
+
+        let (mut engine, sks, _, _rx) = make_engine(7, 0);
+        assert_eq!(engine.current_view(), 1);
+        let timeout = |sender: u32, view: u64| TimeoutMessage {
+            view,
+            high_qc: QuorumCertificate::genesis(),
+            sender,
+            signature: sks[sender as usize].sign(&timeout_signing_message(view)),
+        };
+        for (sender, view) in [(1, 3), (2, 4)] {
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout(sender, view))))
+                .expect("a future timeout");
+            assert_eq!(engine.current_view(), 1, "f reports move nothing");
+        }
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout(3, 3))))
+            .expect("a future timeout");
+        assert_eq!(engine.current_view(), 3, "f+1 reports at or above view 3");
     }
 
     #[test]

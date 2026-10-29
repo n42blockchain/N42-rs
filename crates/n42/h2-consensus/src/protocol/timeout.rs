@@ -93,6 +93,8 @@ impl ConsensusEngine {
         let local_next_index = next_view_set.index_of_public_key(&self.local_public_key);
 
         let recovery_timeout = timeout.clone();
+        let latest = self.future_timeout_views.entry(timeout.sender).or_insert(timeout.view);
+        *latest = (*latest).max(timeout.view);
         let collector = self
             .future_timeout_collectors
             .entry(timeout.view)
@@ -121,24 +123,33 @@ impl ConsensusEngine {
 
         let quorum_size = view_set.quorum_size();
         if !collector.has_quorum(quorum_size) {
-            // Match gov5's weak synchronizer: f+1 distinct verified reports
-            // include an honest validator. Join that bounded, known view;
-            // this does not install a QC or TC and does not commit a block.
+            // gov5's weak synchronizer (`handleFutureViewTimeout`): once f+1
+            // distinct validators reported future views, at least one is
+            // honest, and the (f+1)-th highest view has f+1 reports at or
+            // above it. Join that bounded view; this installs no QC or TC
+            // and commits nothing. Requiring f+1 reports of one exact view
+            // left validators restarted at scattered views stalled for good
+            // (audit 2026-10 round 2, R2-C1).
             let threshold = view_set.fault_tolerance() as usize + 1;
-            if !collector.has_quorum(threshold)
-                || local_timeout_index.is_none()
-            {
+            if local_timeout_index.is_none() {
                 return Ok(false);
             }
-            let recovery_view = recovery_timeout.view;
-            self.advance_to_view(recovery_view)?;
+            let Some(target) = self.weak_sync_target(current_view, threshold) else {
+                return Ok(false);
+            };
+            self.advance_to_view(target)?;
             // Buffered certificates may already have advanced beyond the
             // target. Do not time out that newer view on this older report.
-            if self.current_view() != recovery_view {
-                return Ok(true);
+            if self.current_view() != target {
+                return Ok(target == recovery_timeout.view);
+            }
+            if target != recovery_timeout.view {
+                // This report is for a later view: the caller buffers it.
+                self.on_timeout()?;
+                return Ok(false);
             }
             self.process_timeout(recovery_timeout)?;
-            if self.current_view() == recovery_view {
+            if self.current_view() == target {
                 self.on_timeout()?;
             }
             return Ok(true);
@@ -154,6 +165,18 @@ impl ConsensusEngine {
         );
         self.advance_with_tc(tc, next_view)?;
         Ok(true)
+    }
+
+    /// The (f+1)-th highest future view reported by distinct senders, if
+    /// `threshold` (f+1) senders reported one above `current_view`.
+    fn weak_sync_target(&mut self, current_view: u64, threshold: usize) -> Option<u64> {
+        self.future_timeout_views.retain(|_, view| *view > current_view);
+        if threshold == 0 || self.future_timeout_views.len() < threshold {
+            return None;
+        }
+        let mut views: Vec<u64> = self.future_timeout_views.values().copied().collect();
+        views.sort_unstable_by(|a, b| b.cmp(a));
+        Some(views[threshold - 1])
     }
 
     /// Whether the future buffer holds a timeout from `sender` for `view`.

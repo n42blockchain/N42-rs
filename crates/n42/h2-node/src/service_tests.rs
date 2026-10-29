@@ -861,6 +861,25 @@ async fn a_pushed_body_is_imported_once_whoever_sends_it() {
     assert_eq!(rig.svc.received_bodies, vec![hash], "the copy that follows is recognised");
 }
 
+/// Audit 2026-10 B-3: only the first body nobody asked for at a height is
+/// imported at once. A sibling is kept, not imported, until consensus asks
+/// for it; one consensus already waits for is imported whatever came first.
+#[tokio::test]
+async fn a_second_unsolicited_body_at_a_height_waits_until_consensus_asks_for_it() {
+    let mut rig = node(1, 0, None).await;
+    let (first, _, first_rlp) = block(11, B256::repeat_byte(4));
+    let (sibling, _, sibling_rlp) = block(11, B256::repeat_byte(5));
+    let (wanted, _, wanted_rlp) = block(11, B256::repeat_byte(6));
+    rig.svc.awaiting_bodies.insert(wanted);
+    for rlp in [&first_rlp, &sibling_rlp, &wanted_rlp] {
+        let data = compress_block_rlp(rlp).expect("snappy");
+        rig.svc.handle_transport_event(TransportEvent::Block { from: None, data }).expect("ok");
+    }
+    assert_eq!(rig.svc.ready_bodies, vec![first, wanted], "the sibling nobody asked for is not imported");
+    assert!(rig.svc.body_store.contains_key(&sibling) && rig.svc.driver.has_payload(&sibling), "but it is kept");
+    assert_eq!(rig.svc.received_bodies, vec![first, sibling, wanted]);
+}
+
 #[tokio::test]
 async fn a_gossiped_block_is_decoded_cached_and_raises_the_senders_height() {
     let mut rig = node(1, 0, None).await;

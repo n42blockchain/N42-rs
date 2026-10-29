@@ -402,6 +402,20 @@ pub(crate) struct H2Behaviour {
     /// [`crate::rpc::VOTE_PROTOCOL`]. Used only when a node sends on it
     /// (`N42_VOTE_TRANSPORT`); a peer without it fails the request.
     votes: crate::rpc::VoteBehaviour,
+    /// A cap on inbound connections ([`max_inbound_connections`]): peers are
+    /// free to make, and each one may hold serve slots and gossip bodies
+    /// (audit 2026-10 B-3).
+    limits: libp2p::connection_limits::Behaviour,
+}
+
+/// Inbound connections this node accepts at most: `N42_H2_MAX_INBOUND`,
+/// default 128 (a seven-member fleet holds six, gov5 caps its peers near 50).
+pub fn max_inbound_connections() -> u32 {
+    max_inbound_from(std::env::var("N42_H2_MAX_INBOUND").ok().as_deref())
+}
+
+fn max_inbound_from(value: Option<&str>) -> u32 {
+    value.and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0).unwrap_or(128)
 }
 
 /// The swarm and its bookkeeping: what [`H2V4Transport`] polls on the
@@ -428,6 +442,9 @@ pub(crate) struct TransportCore {
     txns_requests: HashMap<request_response::OutboundRequestId, BlockTxnsRequest>,
     /// The head height this node advertises in its own status messages.
     advertised_height: u64,
+    /// Peers that completed the status handshake for this chain; only they
+    /// are served ranges (audit 2026-10 B-3).
+    statused: HashSet<PeerId>,
 }
 
 impl TransportCore {
@@ -457,6 +474,10 @@ impl TransportCore {
                     .with_agent_version(format!("n42-rs/h2-net/{}", env!("CARGO_PKG_VERSION"))),
             ),
             votes: crate::rpc::vote_behaviour(),
+            limits: libp2p::connection_limits::Behaviour::new(
+                libp2p::connection_limits::ConnectionLimits::default()
+                    .with_max_established_incoming(Some(max_inbound_connections())),
+            ),
         };
 
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -550,6 +571,7 @@ impl TransportCore {
             range_requests: HashMap::new(),
             txns_requests: HashMap::new(),
             advertised_height: 0,
+            statused: HashSet::new(),
         })
     }
 
@@ -953,6 +975,16 @@ impl TransportCore {
                     request_response::Message::Request {
                         request, channel, ..
                     } => {
+                        // gov5 syncs only from peers in its status store; a
+                        // peer that never completed the handshake for this
+                        // chain is not served one either.
+                        if !self.statused.contains(&peer) {
+                            let _ = self.swarm.behaviour_mut().ranges.send_response(
+                                channel,
+                                Err("no status exchanged for this chain".to_owned()),
+                            );
+                            continue;
+                        }
                         return Some(TransportEvent::RangeRequest {
                             peer,
                             request,
@@ -1064,6 +1096,7 @@ impl TransportCore {
                     num_established: 0,
                     ..
                 } => {
+                    self.statused.remove(&peer_id);
                     if self.mesh_peers.remove(&peer_id) {
                         return Some(TransportEvent::PeerDisconnected(peer_id));
                     }
@@ -1119,11 +1152,17 @@ impl TransportCore {
         }
 
         let ours = self.our_status();
+        let fork_matches = their_status.fork_digest() == ours.fork_digest();
+        if fork_matches {
+            self.statused.insert(peer);
+        } else {
+            self.statused.remove(&peer);
+        }
         Some(TransportEvent::StatusExchanged {
             peer,
             genesis_hash: their_status.genesis_hash,
             height: their_status.height(),
-            fork_matches: their_status.fork_digest() == ours.fork_digest(),
+            fork_matches,
         })
     }
 
@@ -1488,5 +1527,16 @@ impl std::fmt::Debug for H2V4Transport {
             .field("off_loop", &self.is_off_loop())
             .field("connected_peers", &self.connected_peers())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_inbound_cap_defaults_to_128_and_takes_a_positive_override() {
+        assert_eq!(super::max_inbound_from(None), 128);
+        assert_eq!(super::max_inbound_from(Some("32")), 32);
+        assert_eq!(super::max_inbound_from(Some("0")), 128);
+        assert_eq!(super::max_inbound_from(Some("lots")), 128);
     }
 }

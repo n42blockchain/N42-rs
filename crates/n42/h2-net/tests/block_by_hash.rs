@@ -107,16 +107,20 @@ async fn round_trip_body(body: Vec<u8>) {
     assert!(missing.unwrap_err().contains("block not found"));
 }
 
-#[tokio::test]
-async fn a_range_is_served_in_order_and_ends_where_the_server_runs_out() {
+/// A client on `client_identity` asks a server on [`IDENTITY`] holding
+/// blocks 1..=3 for 2..=5, once their status exchange is done.
+async fn fetch_range(
+    client_identity: H2V4ChainIdentity,
+) -> (RangeRequest, Result<Vec<n42_h2_net::BlockChunk>, String>) {
     let loopback: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
     let mut server = H2V4Transport::new(TransportConfig::new(IDENTITY).with_listen_addr(loopback.clone())).unwrap();
     let server_addr = listening(&mut server).await;
-    let mut client =
-        H2V4Transport::new(TransportConfig::new(IDENTITY).with_listen_addr(loopback).with_peer(server_addr)).unwrap();
+    let mut client = H2V4Transport::new(
+        TransportConfig::new(client_identity).with_listen_addr(loopback).with_peer(server_addr),
+    )
+    .unwrap();
     let server_id = *server.local_peer_id();
 
-    // The server holds blocks 1..=3; a request for 2..=5 gets 2 and 3.
     let server_task = tokio::spawn(async move {
         loop {
             match server.next_event().await {
@@ -133,12 +137,13 @@ async fn a_range_is_served_in_order_and_ends_where_the_server_runs_out() {
         }
     });
 
+    // As a node does: a range is asked for from a peer whose status it has.
     let request = RangeRequest { start: 2, count: 4, step: 1 };
     let mut asked = false;
     let outcome = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             match client.next_event().await {
-                Some(TransportEvent::PeerConnected(peer)) if peer == server_id && !asked => {
+                Some(TransportEvent::StatusExchanged { peer, .. }) if peer == server_id && !asked => {
                     asked = true;
                     client.request_range(server_id, request);
                 }
@@ -151,10 +156,25 @@ async fn a_range_is_served_in_order_and_ends_where_the_server_runs_out() {
     .await
     .expect("a reply within the budget");
     server_task.abort();
+    outcome
+}
 
-    let (got, reply) = outcome;
-    assert_eq!(got, request);
+#[tokio::test]
+async fn a_range_is_served_in_order_and_ends_where_the_server_runs_out() {
+    let (got, reply) = fetch_range(IDENTITY).await;
+    assert_eq!(got, RangeRequest { start: 2, count: 4, step: 1 });
     let chunks = reply.expect("served");
     assert_eq!(chunks.iter().map(|c| c.rlp.clone()).collect::<Vec<_>>(), vec![vec![0xc1, 2], vec![0xc1, 3]]);
     assert!(chunks.iter().all(|c| c.fork_digest == IDENTITY.genesis_hash[..4]));
+}
+
+/// Audit 2026-10 B-3: ranges are served only to a peer that completed the
+/// status handshake for this chain. One on another chain never does, so it
+/// is refused rather than served a chain it cannot use.
+#[tokio::test]
+async fn a_range_is_not_served_to_a_peer_without_a_matching_status() {
+    let other_chain = H2V4ChainIdentity { chain_id: 1143, genesis_hash: B256::repeat_byte(0x43) };
+    let (_, reply) = fetch_range(other_chain).await;
+    let refused = reply.expect_err("refused");
+    assert!(refused.contains("status"), "{refused}");
 }

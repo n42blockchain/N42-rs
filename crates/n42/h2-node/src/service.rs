@@ -385,6 +385,9 @@ pub struct H2Service<E> {
     /// for one of these re-runs the execution instead of waiting for the next
     /// proposal to mention the block again, which it may never do.
     awaiting_bodies: HashSet<B256>,
+    /// The first body nobody asked for (gossip, a push) at each recent
+    /// height: the one imported at once (see [`Self::import_unsolicited`]).
+    unsolicited_heights: std::collections::BTreeMap<u64, B256>,
     /// When each entry of `awaiting_bodies` was first awaited: the set is
     /// capped at [`MAX_AWAITING_BODIES`] (oldest out) and an entry is aged
     /// out after [`BODY_BOOKKEEPING_TTL`], so hashes that never arrive do not
@@ -1506,6 +1509,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             header_profile: HeaderProfile::Ethereum,
             native_wire: false,
             awaiting_bodies: HashSet::new(),
+            unsolicited_heights: std::collections::BTreeMap::new(),
             awaiting_since: std::collections::HashMap::new(),
             last_body_age_out: None,
             compact_bodies: std::collections::HashMap::new(),
@@ -2411,7 +2415,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                                 self.note_peer_height(peer, header.number);
                             }
                             if fresh {
-                                self.import_eagerly(block_hash);
+                                self.import_unsolicited(block_hash, header.number);
                                 self.body_arrived.insert(block_hash, std::time::Instant::now());
                                 info!(target: "n42.h2.node", ?block_hash, "block body received (header only)");
                                 self.received_bodies.push(block_hash);
@@ -2439,7 +2443,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         let txs = block.transactions.len();
                         self.driver.cache_payload(block_hash, block.execution_data());
                         let convert_ms = convert_at.elapsed().as_millis() as u64;
-                        self.import_eagerly(block_hash);
+                        self.import_unsolicited(block_hash, block.header.number);
                         self.body_arrived.insert(block_hash, std::time::Instant::now());
                         info!(target: "n42.h2.node", ?block_hash, txs, convert_ms, "block body received");
                         self.received_bodies.push(block_hash);
@@ -2699,7 +2703,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 match self.accept_body_once(chunk.rlp) {
                     Ok((hash, header, true)) => {
                         self.note_peer_height(peer, header.number);
-                        self.import_eagerly(hash);
+                        self.import_unsolicited(hash, header.number);
                         self.received_bodies.push(hash);
                     }
                     Ok((hash, header, false)) => {
@@ -2725,7 +2729,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                             self.remember_block(hash, &block.header);
                             self.remember_body(hash, chunk.rlp.clone());
                             self.driver.cache_payload(hash, block.execution_data());
-                            self.import_eagerly(hash);
+                            self.import_unsolicited(hash, block.header.number);
                             self.received_bodies.push(hash);
                         }
                     }
@@ -4789,6 +4793,28 @@ impl<E: ExecutionLayer> H2Service<E> {
         if !self.imported.contains(&block_hash) && !self.ready_bodies.contains(&block_hash) {
             self.ready_bodies.push(block_hash);
         }
+    }
+
+    /// A body nobody asked for -- gossiped, or pushed by a peer -- is imported
+    /// at once only when it is the first such body at its height, or one
+    /// consensus already waits for. A sibling after it is kept (the body
+    /// store and the driver hold it) and imported when a proposal names it,
+    /// as any named body is. A peer is free to make, and an honest fleet
+    /// sends one body per height (two after a timeout), so a stream of
+    /// self-consistent blocks nobody proposed takes at most one import slot
+    /// per height instead of one per block (audit 2026-10 B-3).
+    fn import_unsolicited(&mut self, block_hash: B256, number: u64) {
+        /// Heights remembered; far more than the window a body is useful in.
+        const REMEMBERED_HEIGHTS: usize = 256;
+        let first = *self.unsolicited_heights.entry(number).or_insert(block_hash);
+        while self.unsolicited_heights.len() > REMEMBERED_HEIGHTS {
+            self.unsolicited_heights.pop_first();
+        }
+        if first != block_hash && !self.awaiting_bodies.contains(&block_hash) {
+            debug!(target: "n42.h2.node", ?block_hash, number, first = ?first, "an unsolicited sibling waits for a proposal to name it");
+            return;
+        }
+        self.import_eagerly(block_hash);
     }
 
     fn remember_imported(&mut self, block_hash: B256) {

@@ -282,13 +282,15 @@ fn a_certificate_inside_the_window_also_moves_the_node_and_one_that_is_forged_or
         .expect("handled");
     assert_eq!(engine.current_view(), 6);
 
-    // A forged certificate: no movement, no outputs, and not an error.
+    // A forged certificate: no movement, no outputs; reported as
+    // unauthenticated (audit 2026-10 A-8), not as a fault of this node.
     let (mut engine, sks, vs, mut rx) = make(4, 0);
     let mut forged = prepare_qc(60, hash, &sks, &vs, &[0, 1, 2]);
     forged.aggregate_signature = sks[0].sign(b"forged");
-    engine
+    let err = engine
         .process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(PrepareQC { view: 60, block_hash: hash, qc: forged })))
-        .expect("a bad message is not an engine error");
+        .expect_err("a forged certificate is reported");
+    assert!(matches!(err, crate::error::ConsensusError::Unauthenticated { .. }) && !err.is_local(), "{err:?}");
     assert_eq!(engine.current_view(), 1);
     assert!(drain(&mut rx).is_empty());
 

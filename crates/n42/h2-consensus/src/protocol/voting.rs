@@ -48,6 +48,8 @@ impl ConsensusEngine {
             .note_verify(started, if progress_ok { 1 } else { 2 }, false, false);
         if ok {
             self.note_voter(vote.view, vote.voter);
+        } else {
+            self.unauthenticated = Some((vote.view, "late vote signature"));
         }
     }
 

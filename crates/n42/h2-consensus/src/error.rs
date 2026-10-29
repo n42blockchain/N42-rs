@@ -149,6 +149,14 @@ pub enum ConsensusError {
     #[error("validator at index {index} has an invalid BLS public key (failed subgroup check)")]
     InvalidValidatorPubkey { index: u32 },
 
+    /// A peer's message carried a signature or certificate that does not
+    /// verify against a validator set this node knows. The message is
+    /// handled as before (dropped, or buffered for its view, where it fails
+    /// again); the error names it so the sender can be counted
+    /// (audit 2026-10 A-8).
+    #[error("unauthenticated {what} at view {view}")]
+    Unauthenticated { view: u64, what: &'static str },
+
     /// Two validators in one set carry the same BLS public key. One key
     /// holder would count twice toward the quorum, so the set is refused at
     /// `ValidatorSet::try_new`.

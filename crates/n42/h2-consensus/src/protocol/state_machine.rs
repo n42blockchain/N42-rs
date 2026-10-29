@@ -377,6 +377,10 @@ pub struct ConsensusEngine {
     /// Parent hash of every imported block still in `imported_blocks`, as the
     /// orchestrator reported it; what the extends rule reads.
     pub(super) imported_parents: HashMap<B256, B256>,
+    /// A signature or certificate in the message being processed that did
+    /// not verify where the message is dropped quietly; reported as
+    /// [`ConsensusError::Unauthenticated`] once the message is done.
+    pub(super) unauthenticated: Option<(ViewNumber, &'static str)>,
     /// Tracks which block hash each validator voted for (equivocation detection).
     /// Tracks R1 (Vote) per validator per view for equivocation detection.
     pub(super) equivocation_tracker: HashMap<u32, B256>,
@@ -526,6 +530,7 @@ impl ConsensusEngine {
             imported_blocks: HashSet::new(),
             imported_block_fifo: VecDeque::new(),
             imported_parents: HashMap::new(),
+            unauthenticated: None,
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
@@ -648,6 +653,7 @@ impl ConsensusEngine {
             imported_blocks: HashSet::new(),
             imported_block_fifo: VecDeque::new(),
             imported_parents: HashMap::new(),
+            unauthenticated: None,
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
@@ -1191,6 +1197,21 @@ impl ConsensusEngine {
         msg: ConsensusMessage,
         authenticated_proof: Option<AuthenticatedVoteProof>,
     ) -> ConsensusResult<()> {
+        // The paths that drop a forged message keep doing so; the caller is
+        // told afterwards, so it can count the sender (audit 2026-10 A-8).
+        self.unauthenticated = None;
+        self.process_message_checked(msg, authenticated_proof)?;
+        match self.unauthenticated.take() {
+            Some((view, what)) => Err(ConsensusError::Unauthenticated { view, what }),
+            None => Ok(()),
+        }
+    }
+
+    fn process_message_checked(
+        &mut self,
+        msg: ConsensusMessage,
+        authenticated_proof: Option<AuthenticatedVoteProof>,
+    ) -> ConsensusResult<()> {
         let msg_view = Self::message_view(&msg);
         let current_view = self.round_state.current_view();
 
@@ -1394,6 +1415,7 @@ impl ConsensusEngine {
                 ?sender,
                 "dropping future-view message: signature does not verify"
             );
+            self.unauthenticated = Some((view, "future-view message signature"));
             return false;
         }
 
@@ -1600,6 +1622,11 @@ impl ConsensusEngine {
                 %error,
                 "QC view jump failed: QC does not verify against its view's validator set"
             );
+            // Forged only when the set it names is known: an unknown set is
+            // a gap in this node's history, not the sender's fault.
+            if self.resolve_qc_validator_set(qc).is_ok() {
+                self.unauthenticated = Some((qc.view, "QC carried for a view jump"));
+            }
             return Ok(false);
         }
 
@@ -4270,6 +4297,72 @@ mod tests {
         assert!(matches!(err, crate::error::ConsensusError::InvalidQC { view: 0, .. }), "{err:?}");
     }
 
+    /// Audit 2026-10 A-8: a future-view vote whose signature does not verify
+    /// is dropped, and the caller is told it was forged.
+    #[test]
+    fn test_forged_future_view_vote_is_reported_unauthenticated() {
+        use crate::protocol::quorum::signing_message;
+        let (mut engine, sks, _vs, _rx) = make_engine(4, 0);
+        let view = engine.current_view() + 2;
+        let block_hash = B256::repeat_byte(0xF1);
+        let vote = Vote {
+            view,
+            block_hash,
+            voter: 1,
+            signature: sks[2].sign(&signing_message(view, &block_hash)),
+        };
+        let err = engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+            .expect_err("a forged vote is reported");
+        assert!(matches!(err, crate::error::ConsensusError::Unauthenticated { .. }), "{err:?}");
+        assert!(engine.future_msg_buffer.is_empty(), "and still not buffered");
+    }
+
+    /// Audit 2026-10 A-8: a far-future message whose QC does not verify
+    /// moves no view, and the caller is told the QC was forged.
+    #[test]
+    fn test_forged_view_jump_qc_is_reported_unauthenticated() {
+        let (mut engine, sks, vs, _rx) = make_engine(4, 0);
+        let start = engine.current_view();
+        let qc_view = start + FUTURE_VIEW_WINDOW + 10;
+        let mut justify_qc = build_test_prepare_qc(qc_view, B256::repeat_byte(0xA1), &sks, &vs, &[0, 1, 2]);
+        justify_qc.block_hash = B256::repeat_byte(0xA2);
+        let view = qc_view + 1;
+        let leader = engine.leader_index_for_view(view);
+        let mut proposal =
+            signed_test_proposal(view, B256::repeat_byte(0xA3), leader, &sks[leader as usize]);
+        proposal.justify_qc = justify_qc;
+        let err = engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .expect_err("a forged QC is reported");
+        assert!(matches!(err, crate::error::ConsensusError::Unauthenticated { .. }), "{err:?}");
+        assert_eq!(engine.current_view(), start, "and moves no view");
+    }
+
+    /// Audit 2026-10 A-8: a late vote for a view this node led whose
+    /// signature verifies under neither domain is reported, not just ignored.
+    #[test]
+    fn test_forged_late_vote_is_reported_unauthenticated() {
+        use crate::protocol::quorum::signing_message;
+        let (probe, ..) = make_engine(4, 0);
+        let led = probe.current_view();
+        let leader = probe.leader_index_for_view(led);
+        let (mut engine, sks, _vs, _rx) = make_engine(4, leader);
+        engine.advance_to_view(led + 2).expect("advance");
+        let voter = (leader + 1) % 4;
+        let block_hash = B256::repeat_byte(0xB1);
+        let vote = Vote {
+            view: led,
+            block_hash,
+            voter,
+            signature: sks[((voter + 1) % 4) as usize].sign(&signing_message(led, &block_hash)),
+        };
+        let err = engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+            .expect_err("a forged late vote is reported");
+        assert!(matches!(err, crate::error::ConsensusError::Unauthenticated { .. }), "{err:?}");
+    }
+
     #[test]
     fn test_process_timeout_rejects_invalid_signature() {
         use crate::protocol::quorum::timeout_signing_message;
@@ -5297,11 +5390,12 @@ mod tests {
             validator_changes: None,
         };
 
-        engine
+        let err = engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
                 proposal,
             )))
-            .expect("far-future proposal with invalid QC should be silently dropped");
+            .expect_err("far-future proposal with invalid QC is dropped and reported");
+        assert!(matches!(err, crate::error::ConsensusError::Unauthenticated { .. }), "{err:?}");
 
         assert_eq!(engine.current_view(), 1);
     }
@@ -6335,7 +6429,9 @@ mod tests {
             })
         };
         for message in [forged(0xA1), forged(0xA2), forged(0xA1)] {
-            engine.process_event(ConsensusEvent::Message(message)).expect("buffered or dropped");
+            // Buffered or dropped as before, and reported (audit 2026-10 A-8).
+            let err = engine.process_event(ConsensusEvent::Message(message)).expect_err("reported");
+            assert!(matches!(err, crate::error::ConsensusError::Unauthenticated { .. }), "{err:?}");
         }
         assert_eq!(engine.current_view(), 1);
         assert_eq!(
@@ -6370,9 +6466,10 @@ mod tests {
             voter: 1,
             signature: sks[2].sign(&signing_message(3, &B256::repeat_byte(0x5B))),
         };
-        engine
+        let err = engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(forged)))
-            .expect("forged future vote is dropped, not an error");
+            .expect_err("forged future vote is dropped and reported");
+        assert!(matches!(err, crate::error::ConsensusError::Unauthenticated { .. }), "{err:?}");
         assert_eq!(engine.future_msg_buffer.len(), 1, "a bad signature takes no slot");
     }
 

@@ -1121,6 +1121,29 @@ thread_local! {
     static BETWEEN_PERSIST_HOLDS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Makes the next removal of the live log after a rewrite fail on this
+    /// thread, as an unlink refused by the file system would.
+    static FAIL_LOG_REMOVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`FAIL_LOG_REMOVAL`] for this thread.
+#[cfg(test)]
+fn fail_next_log_removal() {
+    FAIL_LOG_REMOVAL.with(|fail| fail.set(true));
+}
+
+/// Removes the live delta log a rewritten checkpoint supersedes
+/// ([`std::fs::remove_file`], or the failure a test asked for).
+fn remove_live_log(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_LOG_REMOVAL.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    std::fs::remove_file(path)
+}
+
 /// Sets [`BETWEEN_PERSIST_HOLDS`] for this thread.
 #[cfg(test)]
 fn set_between_persist_holds(hook: Box<dyn FnOnce()>) {
@@ -2262,7 +2285,7 @@ impl QmdbNodeState {
     // Heap checkpoints may follow canonical execution ahead of the EL's
     // database transaction. Keep the overwritten base and folded log together.
     fn archive_heap_pair(&self, label: &str, log: &Path) -> Result<(), NodeStateError> {
-        self.archive_pair(label, &self.snapshot_path(), log)
+        self.archive_pair(label, &self.snapshot_path(), log).map(drop)
     }
 
     /// Hard-links `base` (the checkpoint about to be replaced: `forest.bin`
@@ -2270,7 +2293,7 @@ impl QmdbNodeState {
     /// `recovery-archive/<label>-<pid>-<sequence>`, made durable before it
     /// takes its name. Both storage modes archive through here, so a datadir
     /// has one archive scheme.
-    fn archive_pair(&self, label: &str, base: &Path, log: &Path) -> Result<(), NodeStateError> {
+    fn archive_pair(&self, label: &str, base: &Path, log: &Path) -> Result<PathBuf, NodeStateError> {
         let root = self.inner.dir.join("recovery-archive");
         let io = |path: &Path, source| NodeStateError::Io { path: path.to_path_buf(), source };
         std::fs::create_dir_all(&root).map_err(|e| io(&root, e))?;
@@ -2304,7 +2327,7 @@ impl QmdbNodeState {
         std::fs::File::open(&temporary).and_then(|f| f.sync_all()).map_err(|e| io(&temporary, e))?;
         std::fs::rename(&temporary, &target).map_err(|e| io(&target, e))?;
         std::fs::File::open(&root).and_then(|f| f.sync_all()).map_err(|e| io(&root, e))?;
-        Ok(())
+        Ok(target)
     }
 
     fn archived_heap_snapshot(&self, target: (u64, B256)) -> Result<Option<ForestSnapshot>, NodeStateError> {
@@ -3681,10 +3704,10 @@ impl QmdbNodeState {
             let mut phases = CompactPhases::default();
             let block_hash = ckpt.head_hash;
             self.save_checkpoint_frontier((ckpt.head_number, block_hash))?;
-            self.archive_before_rewrite(&self.ckpt_path(), (ckpt.head_number, block_hash))?;
+            let archive = self.archive_before_rewrite(&self.ckpt_path(), (ckpt.head_number, block_hash))?;
             let len = write_ckpt(&self.ckpt_path(), &ckpt, &mut phases)?;
             self.record_head_roots(&[(ckpt.head_number, block_hash, root)]);
-            remove_file_logged(self.delta_log_path());
+            self.retire_superseded_log(archive.as_deref())?;
             *cursor = PersistCursor {
                 head: block_hash,
                 next_slot: ckpt.next_slot,
@@ -3719,13 +3742,13 @@ impl QmdbNodeState {
         let path = self.snapshot_path();
         let mut phases = CompactPhases::default();
         self.save_checkpoint_frontier((snapshot.head_number, block_hash))?;
-        self.archive_before_rewrite(&path, (snapshot.head_number, block_hash))?;
+        let archive = self.archive_before_rewrite(&path, (snapshot.head_number, block_hash))?;
         let len = write_snapshot(&path, &snapshot, &mut phases)?;
         self.record_head_roots(&[(snapshot.head_number, block_hash, root)]);
         // Order matters: the log is emptied only once the checkpoint that
         // supersedes it is on disk, so a crash between the two leaves a log
         // that is merely redundant rather than a state with neither.
-        remove_file_logged(self.delta_log_path());
+        self.retire_superseded_log(archive.as_deref())?;
         *cursor = PersistCursor {
             head: block_hash,
             next_slot: snapshot.tree.next_slot,
@@ -3750,11 +3773,39 @@ impl QmdbNodeState {
     /// supersedes are kept as a `fold-<head>` pair, so a restart below
     /// `head` (the database behind the forest by the persistence lag) can
     /// replay from them. Nothing to keep when there is no checkpoint yet.
-    fn archive_before_rewrite(&self, base: &Path, head: (u64, B256)) -> Result<(), NodeStateError> {
+    /// Returns the archive's directory, if one was made.
+    fn archive_before_rewrite(&self, base: &Path, head: (u64, B256)) -> Result<Option<PathBuf>, NodeStateError> {
         if !base.exists() {
-            return Ok(());
+            return Ok(None);
         }
-        self.archive_pair(&format!("fold-{:020}-{:x}", head.0, head.1), base, &self.delta_log_path())
+        self.archive_pair(&format!("fold-{:020}-{:x}", head.0, head.1), base, &self.delta_log_path()).map(Some)
+    }
+
+    /// Removes the live log a rewritten checkpoint supersedes; `archive` is
+    /// the directory [`Self::archive_before_rewrite`] hard-linked it into.
+    ///
+    /// When the name cannot be removed, the archive and the live log still
+    /// share one inode, and the next head's append (from offset 0, the
+    /// cursor having moved to the new checkpoint) would empty the archive's
+    /// log through it. The archive gets its own copy then, as a rollback
+    /// archive always does; if even that fails the rewrite is refused before
+    /// the cursor moves (audit 2026-10 D-6).
+    fn retire_superseded_log(&self, archive: Option<&Path>) -> Result<(), NodeStateError> {
+        let path = self.delta_log_path();
+        let error = match remove_live_log(&path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => error,
+        };
+        warn!(target: "n42.qmdb", %error, path = %path.display(), "could not remove a superseded QMDB log; its archive gets a copy of its own");
+        let Some(archive) = archive else { return Ok(()) };
+        let archived = archive.join("forest.log");
+        let copy = archive.join(".forest.log.copy");
+        let io = |path: &Path, source| NodeStateError::Io { path: path.to_path_buf(), source };
+        std::fs::copy(&archived, &copy).map_err(|e| io(&copy, e))?;
+        std::fs::File::open(&copy).and_then(|f| f.sync_all()).map_err(|e| io(&copy, e))?;
+        std::fs::rename(&copy, &archived).map_err(|e| io(&archived, e))?;
+        std::fs::File::open(archive).and_then(|f| f.sync_all()).map_err(|e| io(archive, e))
     }
 
     /// Retires covered recovery archives after a live-forest rewrite, as a

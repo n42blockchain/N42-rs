@@ -514,6 +514,36 @@ fn a_restart_below_a_fold_head_restores_from_the_fold_archive_in_both_storage_mo
     }
 }
 
+/// Audit 2026-10 D-6: the live-forest rewrite hard-links the log into its
+/// archive and then removes the live name. When that removal fails, the
+/// next head's append must not empty the archive's log through the shared
+/// inode: a restart below the checkpoint still replays from the archive.
+#[test]
+fn a_failed_log_removal_after_a_sync_checkpoint_leaves_the_archive_whole() {
+    for entry_file in [false, true] {
+        let (state, chain, dir, mut head, _) = node_at(&format!("sync-archive-unlink-{entry_file}"), entry_file, 10);
+        fail_next_log_removal();
+        state.checkpoint(Some(hash_of(10)), &mut state.cursor()).expect("rewrite at 10");
+        let archives = fold_archives(&dir);
+        assert_eq!(archives.len(), 1, "entry_file={entry_file}: {archives:?}");
+        let archived_log = dir.join("recovery-archive").join(&archives[0]).join("forest.log");
+        let archived_len = std::fs::metadata(&archived_log).expect("the archived log").len();
+        assert!(archived_len > 0);
+        for number in 11..=12 {
+            (head, _) = advance(&state, number, head);
+        }
+        assert_eq!(std::fs::metadata(&archived_log).expect("the archived log").len(), archived_len, "entry_file={entry_file}");
+        let root7 = state.root_of(&hash_of(7)).expect("root");
+        drop(state);
+
+        let restarted = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        restarted.initialize((7, hash_of(7))).expect("a database head below the rewritten checkpoint");
+        assert_eq!(restarted.state_root(), root7, "entry_file={entry_file}");
+        drop(restarted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The live-forest rewrite (`N42_QMDB_CHECKPOINT_SYNC=1`) archives the
 /// checkpoint it replaces and the log it supersedes, as a fold does: a
 /// restart below the new checkpoint replays from that pair.

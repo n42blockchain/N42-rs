@@ -551,6 +551,9 @@ pub struct H2Service<E> {
     pending_block_requests: Vec<(String, B256, n42_h2_net::BlockRequestChannel)>,
     /// Range requests being served off the loop; see [`ServeSlots`].
     serve_slots: SharedServeSlots,
+    /// The bytes range replies may hold at once, in KiB, for every peer
+    /// together ([`MAX_SERVE_BYTES`]).
+    serve_bytes: Arc<tokio::sync::Semaphore>,
     /// Fills and block-by-hash requests being served off the loop: their
     /// own share, so range pulls never refuse a vote-path fill.
     fill_slots: SharedServeSlots,
@@ -682,6 +685,12 @@ const MAX_SERVES_PER_PEER: usize = 4;
 
 /// The same for all peers together.
 const MAX_SERVES_IN_FLIGHT: usize = 32;
+
+/// The bytes all range replies may hold at once, from the first block read
+/// until libp2p has sent the reply. The slots alone bound requests, not
+/// bytes: 32 replies of up to 128 MB each, and a slow reader kept a reply's
+/// bytes queued after its slot was given back (audit 2026-10 B-4).
+const MAX_SERVE_BYTES: usize = 512 << 20;
 
 /// Fills and block-by-hash requests one peer may have being served at once.
 /// Their own share, larger than the ranges': a follower asks for them on
@@ -1110,12 +1119,14 @@ enum Served {
         channel: n42_h2_net::BlockRequestChannel,
         body: Option<alloy_primitives::Bytes>,
     },
-    /// A range of blocks, from the execution layer.
+    /// A range of blocks, from the execution layer, with what it holds (its
+    /// serve slot, its bytes) until the transport has sent it.
     Range {
         peer: PeerId,
         request: n42_h2_net::RangeRequest,
         channel: n42_h2_net::RangeRequestChannel,
-        rlps: Vec<Vec<u8>>,
+        range: ServedRange,
+        slot: ServeSlot,
     },
 }
 
@@ -1556,6 +1567,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             pending_imports: Vec::new(),
             pending_block_requests: Vec::new(),
             serve_slots: ServeSlots::shared(MAX_SERVES_PER_PEER, MAX_SERVES_IN_FLIGHT),
+            serve_bytes: Arc::new(tokio::sync::Semaphore::new(MAX_SERVE_BYTES >> 10)),
             fill_slots: ServeSlots::shared(MAX_FILL_SERVES_PER_PEER, MAX_FILL_SERVES_IN_FLIGHT),
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
@@ -2752,10 +2764,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                 if let Some(slot) = ServeSlot::take(&self.serve_slots, peer) {
                     let el = self.driver.execution_layer_arc();
                     let back = self.served_txns.0.clone();
+                    let budget = self.serve_bytes.clone();
                     tokio::spawn(async move {
-                        let rlps = serve_range(&*el, request).await;
-                        let _ = back.send(Served::Range { peer, request, channel, rlps }).await;
-                        drop(slot);
+                        let range = serve_range(&*el, request, &budget).await;
+                        let _ = back.send(Served::Range { peer, request, channel, range, slot }).await;
                     });
                 } else {
                     debug!(target: "n42.h2.node", %peer, ?request, "too many requests in flight; range refused");
@@ -5014,9 +5026,14 @@ impl<E: ExecutionLayer> H2Service<E> {
                 debug!(target: "n42.h2.node", %peer, ?hash, found = body.is_some(), "peer asked for a block; execution layer consulted");
                 self.transport.respond_block(channel, body);
             }
-            Served::Range { peer, request, channel, rlps } => {
-                debug!(target: "n42.h2.node", %peer, ?request, served = rlps.len(), "peer asked for a range");
-                self.transport.respond_range(channel, rlps);
+            Served::Range { peer, request, channel, mut range, slot } => {
+                debug!(target: "n42.h2.node", %peer, ?request, served = range.rlps.len(), short_of_budget = range.short_of_budget, "peer asked for a range");
+                if range.rlps.is_empty() && range.short_of_budget {
+                    self.transport.respond_range_error(channel, "server busy".to_owned());
+                    return;
+                }
+                let rlps = std::mem::take(&mut range.rlps);
+                self.transport.respond_range_holding(channel, rlps, n42_h2_net::ServeGuard::new((range, slot)));
             }
         }
     }
@@ -5632,9 +5649,15 @@ impl<E: ExecutionLayer> H2Service<E> {
 /// At most [`MAX_SERVED_RANGE_BLOCKS`] blocks and
 /// [`n42_h2_net::MAX_RANGE_REPLY_BYTES`] of them (one block always), so one
 /// request costs a bounded number of lookups and bytes.
-async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeRequest) -> Vec<Vec<u8>> {
+async fn serve_range<E: ExecutionLayer>(
+    el: &E,
+    request: n42_h2_net::RangeRequest,
+    budget: &Arc<tokio::sync::Semaphore>,
+) -> ServedRange {
     let count = request.count.min(MAX_RANGE_BLOCKS).min(MAX_SERVED_RANGE_BLOCKS);
     let mut rlps = Vec::new();
+    let mut held: Option<tokio::sync::OwnedSemaphorePermit> = None;
+    let mut short_of_budget = false;
     let mut bytes = 0usize;
     for number in request.start..request.start.saturating_add(count) {
         match el.block_by_number(number).await {
@@ -5648,6 +5671,19 @@ async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeReques
                 if !range_reply_takes(rlps.len(), bytes, rlp.len()) {
                     break;
                 }
+                // The shared byte budget, in KiB: a reply it cannot cover in
+                // full is cut short, which the asker reads as a short window.
+                let kib = u32::try_from(rlp.len().div_ceil(1024).max(1)).unwrap_or(u32::MAX);
+                match budget.clone().try_acquire_many_owned(kib) {
+                    Ok(permit) => match held.as_mut() {
+                        Some(held) => held.merge(permit),
+                        None => held = Some(permit),
+                    },
+                    Err(_) => {
+                        short_of_budget = true;
+                        break;
+                    }
+                }
                 bytes = bytes.saturating_add(rlp.len());
                 rlps.push(rlp);
             }
@@ -5658,7 +5694,19 @@ async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeReques
             }
         }
     }
-    rlps
+    ServedRange { rlps, held, short_of_budget }
+}
+
+/// A range reply and the share of [`MAX_SERVE_BYTES`] it holds until it is
+/// dropped.
+#[derive(Debug)]
+struct ServedRange {
+    rlps: Vec<Vec<u8>>,
+    /// Never read: given back to the budget when the reply is dropped.
+    #[allow(dead_code)]
+    held: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// The budget ran out before the reply was complete.
+    short_of_budget: bool,
 }
 
 /// Whether a range reply holding `blocks` blocks of `bytes` takes one more

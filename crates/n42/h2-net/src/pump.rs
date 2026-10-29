@@ -78,6 +78,8 @@ pub(crate) enum Command {
     RequestTxns(PeerId, BlockTxnsRequest),
     RespondTxns(BlockTxnsChannel, BlockTxnsReply),
     RespondRange(RangeRequestChannel, Vec<Vec<u8>>),
+    /// A range reply whose guard is held until it is sent.
+    RespondRangeHolding(RangeRequestChannel, Vec<Vec<u8>>, crate::transport::ServeGuard),
     /// A range refused with the protocol's server-error code.
     RespondRangeError(RangeRequestChannel, String),
     RespondBlock(BlockRequestChannel, Option<alloy_primitives::Bytes>),
@@ -291,6 +293,7 @@ fn apply(core: &mut TransportCore, command: Command) {
         Command::RequestTxns(peer, request) => core.request_block_txns(peer, request),
         Command::RespondTxns(channel, reply) => core.respond_block_txns(channel, reply),
         Command::RespondRange(channel, rlps) => core.respond_range(channel, rlps),
+        Command::RespondRangeHolding(channel, rlps, guard) => core.respond_range_holding(channel, rlps, guard),
         Command::RespondRangeError(channel, message) => core.respond_range_error(channel, message),
         Command::RespondBlock(channel, rlp) => core.respond_block(channel, rlp),
         Command::PushBlock(peer, rlp) => core.push_block(peer, rlp),

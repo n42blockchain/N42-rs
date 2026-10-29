@@ -189,16 +189,43 @@ async fn a_range_is_served_from_the_start_until_the_first_missing_block() {
         use n42_h2_execution::ExecutionLayer;
         within(el.new_payload(built.execution_data)).await.expect("accepted");
     }
-    let served = within(serve_range(&el, n42_h2_net::RangeRequest { start: 2, count: 10, step: 1 })).await;
+    let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1 << 20));
+    let served = within(serve_range(&el, n42_h2_net::RangeRequest { start: 2, count: 10, step: 1 }, &budget)).await.rlps;
     assert_eq!(served.len(), 2, "blocks 2 and 3, then block 4 is missing");
     for (rlp, number) in served.iter().zip([2u64, 3]) {
         let (_, header) = n42_h2_consensus::decode_block_body_header(rlp, HeaderProfile::Ethereum).expect("a body");
         assert_eq!(header.number, number);
     }
-    let none = within(serve_range(&el, n42_h2_net::RangeRequest { start: 50, count: 5, step: 1 })).await;
-    assert!(none.is_empty(), "nothing past the head");
-    let capped = within(serve_range(&el, n42_h2_net::RangeRequest { start: 1, count: 1, step: 1 })).await;
-    assert_eq!(capped.len(), 1, "count bounds the answer");
+    let none = within(serve_range(&el, n42_h2_net::RangeRequest { start: 50, count: 5, step: 1 }, &budget)).await;
+    assert!(none.rlps.is_empty() && !none.short_of_budget, "nothing past the head");
+    let capped = within(serve_range(&el, n42_h2_net::RangeRequest { start: 1, count: 1, step: 1 }, &budget)).await;
+    assert_eq!(capped.rlps.len(), 1, "count bounds the answer");
+}
+
+/// Audit 2026-10 B-4: range replies draw on one byte budget for every peer,
+/// held until the reply is dropped (by the transport, once sent). A reply
+/// the budget cannot cover in full is cut short; one it cannot start is
+/// empty and says so, for the caller to answer "server busy".
+#[tokio::test]
+async fn range_replies_draw_on_one_byte_budget_held_until_dropped() {
+    use n42_h2_execution::ExecutionLayer;
+    let el = MockExecutionLayer::new();
+    let mut parent = B256::ZERO;
+    for number in 1..=3 {
+        let built = MockExecutionLayer::built_block_on(number, parent);
+        parent = built.hash;
+        within(el.new_payload(built.execution_data)).await.expect("accepted");
+    }
+    // One KiB: one small block's worth.
+    let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let request = n42_h2_net::RangeRequest { start: 1, count: 3, step: 1 };
+    let first = within(serve_range(&el, request, &budget)).await;
+    assert_eq!((first.rlps.len(), first.short_of_budget), (1, true), "cut short where the budget ends");
+    assert_eq!(budget.available_permits(), 0, "held while the reply is");
+    let second = within(serve_range(&el, request, &budget)).await;
+    assert!(second.rlps.is_empty() && second.short_of_budget, "nothing left to start another");
+    drop(first);
+    assert_eq!(budget.available_permits(), 1, "given back with the reply");
 }
 
 #[test]

@@ -853,7 +853,7 @@ async fn a_block_asked_for_by_hash_is_served_from_the_store_or_the_execution_lay
 }
 
 #[tokio::test]
-async fn a_range_is_served_off_the_loop_and_its_slots_free_before_the_answer_goes_out() {
+async fn a_range_is_served_off_the_loop_and_its_slots_are_held_until_the_answer_is_sent() {
     let (mut a, mut b) = pair(0).await;
     let mut parent = B256::ZERO;
     for number in 1..=3 {
@@ -871,22 +871,25 @@ async fn a_range_is_served_off_the_loop_and_its_slots_free_before_the_answer_goe
     assert_eq!((request.start, request.count), (2, 10));
     assert_eq!(served.len(), 2, "blocks 2 and 3");
 
-    // Four requests (one peer's share) to a node that is not draining: the work runs
-    // off its loop, and each slot is back as soon as the work is done --
-    // before the loop has handed a single answer over.
+    // Four requests (one peer's share) to a node that is not draining: the
+    // work runs off its loop, and each slot -- with its reply's bytes -- is
+    // held until libp2p has sent the answer, not only until the work is done
+    // (audit 2026-10 B-4).
     a.svc.pending_imports.clear();
     let before = b.seen.len();
     for start in 100..104 {
         a.svc.transport.request_range(target, RangeRequest { start, count: 1, step: 1 });
     }
-    pump(&mut a, &mut b, (false, false), &mut a_events, |_, b, _| {
-        b.seen.len() >= before + 4 && slots_taken(&b.svc.serve_slots) == 0
+    pump(&mut a, &mut b, (false, false), &mut a_events, |_, b, _| b.seen.len() >= before + 4).await;
+    assert!(a.svc.pending_imports.is_empty(), "nothing is answered until the loop hands it over");
+    assert_eq!(slots_taken(&b.svc.serve_slots), 4, "held while the answers wait");
+
+    // The loop hands the answers over; none was lost or refused, and the
+    // slots come back once they are sent.
+    pump(&mut a, &mut b, (false, true), &mut a_events, |a, b, _| {
+        a.svc.pending_imports.len() == 4 && slots_taken(&b.svc.serve_slots) == 0
     })
     .await;
-    assert!(a.svc.pending_imports.is_empty(), "nothing is answered until the loop hands it over");
-
-    // The loop hands the answers over; none was lost or refused.
-    pump(&mut a, &mut b, (false, true), &mut a_events, |a, _, _| a.svc.pending_imports.len() == 4).await;
 }
 
 #[tokio::test]

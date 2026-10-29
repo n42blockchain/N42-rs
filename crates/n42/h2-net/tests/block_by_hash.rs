@@ -178,3 +178,74 @@ async fn a_range_is_not_served_to_a_peer_without_a_matching_status() {
     let refused = reply.expect_err("refused");
     assert!(refused.contains("status"), "{refused}");
 }
+
+/// Audit 2026-10 B-4: what a server holds for a range reply (its serve slot,
+/// its byte budget) is held until libp2p has sent the reply, not only until
+/// the reply is handed to the swarm -- a slow reader otherwise keeps the
+/// bytes queued without anything counting them.
+#[tokio::test]
+async fn a_range_replys_guard_is_held_until_the_reply_is_sent() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Flag(Arc<AtomicBool>);
+    impl Drop for Flag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let loopback: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let mut server = H2V4Transport::new(TransportConfig::new(IDENTITY).with_listen_addr(loopback.clone())).unwrap();
+    let server_addr = listening(&mut server).await;
+    let mut client =
+        H2V4Transport::new(TransportConfig::new(IDENTITY).with_listen_addr(loopback).with_peer(server_addr)).unwrap();
+    let server_id = *server.local_peer_id();
+
+    let released = Arc::new(AtomicBool::new(false));
+    let held_after_respond = Arc::new(AtomicBool::new(false));
+    let (server_released, server_held) = (released.clone(), held_after_respond.clone());
+    let server_task = tokio::spawn(async move {
+        loop {
+            match server.next_event().await {
+                Some(TransportEvent::RangeRequest { channel, .. }) => {
+                    let guard = n42_h2_net::ServeGuard::new(Flag(server_released.clone()));
+                    server.respond_range_holding(channel, vec![vec![0xc1, 1]], guard);
+                    // Nothing has been sent yet: the swarm has not been polled.
+                    server_held.store(!server_released.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+                Some(_) => {}
+                None => return,
+            }
+        }
+    });
+
+    let mut asked = false;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match client.next_event().await {
+                Some(TransportEvent::StatusExchanged { peer, .. }) if peer == server_id && !asked => {
+                    asked = true;
+                    client.request_range(server_id, RangeRequest { start: 1, count: 1, step: 1 });
+                }
+                Some(TransportEvent::RangeFetched { reply, .. }) => {
+                    reply.expect("served");
+                    return;
+                }
+                Some(_) => {}
+                None => panic!("client transport ended"),
+            }
+        }
+    })
+    .await
+    .expect("a reply within the budget");
+    assert!(held_after_respond.load(Ordering::SeqCst), "the guard is held while the reply waits to be sent");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !released.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the guard is released once the reply is sent");
+    server_task.abort();
+}

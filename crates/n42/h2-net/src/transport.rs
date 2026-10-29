@@ -172,7 +172,28 @@ pub struct BlockRequestChannel(request_response::ResponseChannel<BlockReply>);
 
 /// Where the answer to a [`TransportEvent::RangeRequest`] goes.
 #[derive(Debug)]
-pub struct RangeRequestChannel(request_response::ResponseChannel<RangeReply>);
+pub struct RangeRequestChannel(
+    request_response::ResponseChannel<RangeReply>,
+    request_response::InboundRequestId,
+);
+
+/// Whatever a server holds for a reply (a serve slot, a byte budget),
+/// kept by the transport until libp2p has sent the reply or given up on
+/// it, then dropped. See [`H2V4Transport::respond_range_holding`].
+pub struct ServeGuard(#[allow(dead_code)] Box<dyn std::any::Any + Send>);
+
+impl ServeGuard {
+    /// Wraps what is to be held.
+    pub fn new<T: Send + 'static>(held: T) -> Self {
+        Self(Box::new(held))
+    }
+}
+
+impl std::fmt::Debug for ServeGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ServeGuard")
+    }
+}
 
 /// Where an answer to a named-transactions request goes.
 #[derive(Debug)]
@@ -445,6 +466,9 @@ pub(crate) struct TransportCore {
     /// Peers that completed the status handshake for this chain; only they
     /// are served ranges (audit 2026-10 B-3).
     statused: HashSet<PeerId>,
+    /// What each range reply handed to libp2p holds until it is sent
+    /// (audit 2026-10 B-4).
+    range_guards: HashMap<request_response::InboundRequestId, ServeGuard>,
 }
 
 impl TransportCore {
@@ -572,6 +596,7 @@ impl TransportCore {
             txns_requests: HashMap::new(),
             advertised_height: 0,
             statused: HashSet::new(),
+            range_guards: HashMap::new(),
         })
     }
 
@@ -704,6 +729,22 @@ impl TransportCore {
             .map(|rlp| BlockChunk { fork_digest, rlp: rlp.into() })
             .collect();
         let _ = self.swarm.behaviour_mut().ranges.send_response(channel.0, Ok(chunks));
+    }
+
+    /// [`Self::respond_range`], holding `guard` until libp2p has sent the
+    /// reply (or failed to): what a reply's bytes cost the server is counted
+    /// until they leave it, not only until they are queued.
+    pub fn respond_range_holding(&mut self, channel: RangeRequestChannel, rlps: Vec<Vec<u8>>, guard: ServeGuard) {
+        let id = channel.1;
+        let fork_digest = self.our_status().fork_digest();
+        let chunks = rlps
+            .into_iter()
+            .map(|rlp| BlockChunk { fork_digest, rlp: rlp.into() })
+            .collect();
+        // A connection already gone takes the reply back: nothing to hold.
+        if self.swarm.behaviour_mut().ranges.send_response(channel.0, Ok(chunks)).is_ok() {
+            self.range_guards.insert(id, guard);
+        }
     }
 
     /// Refuses a [`TransportEvent::RangeRequest`] with the protocol's
@@ -973,7 +1014,7 @@ impl TransportCore {
                     request_response::Event::Message { peer, message, .. },
                 )) => match message {
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id, request, channel,
                     } => {
                         // gov5 syncs only from peers in its status store; a
                         // peer that never completed the handshake for this
@@ -988,7 +1029,7 @@ impl TransportCore {
                         return Some(TransportEvent::RangeRequest {
                             peer,
                             request,
-                            channel: RangeRequestChannel(channel),
+                            channel: RangeRequestChannel(channel, request_id),
                         });
                     }
                     request_response::Message::Response {
@@ -1019,6 +1060,12 @@ impl TransportCore {
                             reply: Err(error.to_string()),
                         });
                     }
+                }
+                SwarmEvent::Behaviour(H2BehaviourEvent::Ranges(
+                    request_response::Event::ResponseSent { request_id, .. }
+                    | request_response::Event::InboundFailure { request_id, .. },
+                )) => {
+                    self.range_guards.remove(&request_id);
                 }
                 SwarmEvent::Behaviour(H2BehaviourEvent::Ranges(_)) => {}
                 SwarmEvent::Behaviour(H2BehaviourEvent::BlockTxns(
@@ -1407,6 +1454,15 @@ impl H2V4Transport {
         match &mut self.inner {
             Inner::Inline(core) => core.respond_range(channel, rlps),
             Inner::OffLoop(off) => off.command(crate::pump::Command::RespondRange(channel, rlps)),
+        }
+    }
+
+    /// [`Self::respond_range`], holding `guard` until libp2p has sent the
+    /// reply or given up on it (audit 2026-10 B-4).
+    pub fn respond_range_holding(&mut self, channel: RangeRequestChannel, rlps: Vec<Vec<u8>>, guard: ServeGuard) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.respond_range_holding(channel, rlps, guard),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::RespondRangeHolding(channel, rlps, guard)),
         }
     }
 

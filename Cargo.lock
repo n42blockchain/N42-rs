@@ -7165,6 +7165,7 @@ dependencies = [
  "n42-h2-execution",
  "n42-primitives",
  "n42-qmdb-reth",
+ "n42-twig-core",
  "n42-tx-ingest",
  "n42-tx-queue",
  "n42-tx-types",

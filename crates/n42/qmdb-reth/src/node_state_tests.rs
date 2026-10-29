@@ -1217,6 +1217,31 @@ fn a_branch_switch_during_a_lease_waits_and_takes_the_owed_trim_first() {
 // The restart's root check
 // ---------------------------------------------------------------------------
 
+/// Audit 2026-10 D-4: a move below the persisted head rewrites the entry
+/// file's slots before any delta says so. A process that dies there leaves
+/// the log on the old branch and the entries on the new one; the restart
+/// refuses that datadir rather than build a tree on it.
+#[test]
+fn a_crash_after_a_cut_below_the_persisted_head_is_refused_at_restart() {
+    let (state, chain, dir, head, root) = node_at("cut-below-persisted", true, 3);
+    let entries = state.entry_file_path();
+    let persisted_len = std::fs::metadata(&entries).expect("the entry file").len();
+    // A block on block 1: the tree goes back below the persisted head 3.
+    let prepared = state.compute(hash_of(1), &wide_changes(77)).expect("compute");
+    state.insert(B256::repeat_byte(0x77), 2, prepared).expect("insert the side block");
+    let cut_len = std::fs::metadata(&entries).expect("the entry file").len();
+    assert_ne!(cut_len, persisted_len, "the side block rewrote the entry file");
+    drop(state);
+
+    let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    restarted.expect_head_root((3, head), root);
+    let err = restarted.initialize((3, head)).expect_err("the cut datadir is refused");
+    assert!(
+        matches!(err, NodeStateError::RestoredRootMismatch { .. } | NodeStateError::State(StateError::EntryFile(_))),
+        "{err}"
+    );
+}
+
 /// Audit 2026-10 D-3: with no record of its head (lost in a power cut), a
 /// restart on a chain whose headers carry their own root checks the tree
 /// against the head header's root instead of starting unchecked.

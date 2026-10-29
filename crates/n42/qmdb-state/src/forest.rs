@@ -1606,6 +1606,7 @@ impl QmdbForest {
     /// common ancestor, re-applies down.
     fn move_to(&mut self, target: B256) -> Result<(), StateError> {
         self.refuse_leased()?;
+        let synced = self.flushed_slots;
         if let Some((parent, undo)) = self.pending.take() {
             if let Err(err) = self.tree.apply_undo(&undo) {
                 // A refused undo left the pending block applied: it stays
@@ -1709,6 +1710,16 @@ impl QmdbForest {
                 .ok_or(StateError::UnknownBlock(*hash))?
                 .undo = Some(undo);
             self.tip = *hash;
+        }
+        // The move cut the entry file below what was synced -- below the
+        // persisted head -- and rewrote those slots for this branch before
+        // any delta says so (audit 2026-10 D-4). A crash from here until the
+        // next delta is durable leaves a datadir the restart refuses (its
+        // root check); syncing now settles which entries it finds. Rare: a
+        // branch below the persisted head, never a HotStuff commit chain.
+        if self.flushed_slots < synced && self.has_entry_file() {
+            self.tree.sync_entries().map_err(|e| StateError::EntryFile(e.to_string()))?;
+            self.flushed_slots = self.tree.next_slot();
         }
         Ok(())
     }

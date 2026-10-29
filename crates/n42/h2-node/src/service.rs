@@ -1241,17 +1241,34 @@ fn fill_from_body(
 ) -> n42_h2_net::BlockTxnsReply {
     let decoded = n42_h2_consensus::decode_raw_block_body_ref(body, profile)
         .map_err(|err| err.to_string())?;
-    request
-        .indices
-        .iter()
-        .map(|&i| {
-            decoded
-                .transactions
-                .get(i as usize)
-                .map(|tx| alloy_primitives::Bytes::copy_from_slice(tx))
-                .ok_or_else(|| format!("block {} has no index {i}", request.hash))
-        })
-        .collect()
+    named_txns(&decoded.transactions, request)
+}
+
+/// The transactions at `request`'s positions of a block's `txs`. The
+/// positions must be in block order with none repeated, as this node asks
+/// for them, and the reply is refused before anything is copied once it
+/// would pass [`n42_h2_net::MAX_BLOCK_TXNS_BYTES`], the reader's own limit:
+/// a peer that named one large transaction a million times was answered
+/// with all of it (audit 2026-10 round 3, R3-N2).
+fn named_txns<T: AsRef<[u8]>>(txs: &[T], request: &n42_h2_net::BlockTxnsRequest) -> n42_h2_net::BlockTxnsReply {
+    let mut previous = None;
+    let mut bytes = 0u64;
+    for &i in &request.indices {
+        if previous.is_some_and(|previous| previous >= i) {
+            return Err(format!("positions asked of block {} are not strictly ascending", request.hash));
+        }
+        previous = Some(i);
+        let tx = txs.get(i as usize).ok_or_else(|| format!("block {} has no index {i}", request.hash))?;
+        bytes += 4 + tx.as_ref().len() as u64;
+        if bytes > n42_h2_net::MAX_BLOCK_TXNS_BYTES {
+            return Err(format!(
+                "the transactions asked of block {} exceed {} bytes",
+                request.hash,
+                n42_h2_net::MAX_BLOCK_TXNS_BYTES
+            ));
+        }
+    }
+    Ok(request.indices.iter().map(|&i| alloy_primitives::Bytes::copy_from_slice(txs[i as usize].as_ref())).collect())
 }
 
 /// How many compact frames are kept. Fewer than the other per-block maps,
@@ -5871,17 +5888,7 @@ async fn txns_from_execution_layer<E: ExecutionLayer>(
     request: &n42_h2_net::BlockTxnsRequest,
 ) -> n42_h2_net::BlockTxnsReply {
     let reply = match el.block_by_hash(request.hash).await {
-        Ok(Some(block)) => request
-            .indices
-            .iter()
-            .map(|&i| {
-                block
-                    .transactions
-                    .get(i as usize)
-                    .cloned()
-                    .ok_or_else(|| format!("block {} has no index {i}", request.hash))
-            })
-            .collect::<Result<Vec<_>, String>>(),
+        Ok(Some(block)) => named_txns(&block.transactions, request),
         Ok(None) => Err(format!("block {} is not here", request.hash)),
         Err(err) => Err(err.to_string()),
     };

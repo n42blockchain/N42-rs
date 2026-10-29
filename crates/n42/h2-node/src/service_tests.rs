@@ -166,9 +166,9 @@ fn a_fill_is_the_named_transactions_of_a_body_and_names_a_missing_index() {
     let body = n42_h2_net::encode_block_rlp_raw(&header, &txs, &[], None);
     let hash = header.hash_slow();
 
-    let request = n42_h2_net::BlockTxnsRequest { hash, indices: vec![2, 0] };
+    let request = n42_h2_net::BlockTxnsRequest { hash, indices: vec![0, 2] };
     let fill = fill_from_body(&body, HeaderProfile::Ethereum, &request).expect("both positions exist");
-    assert_eq!(fill, vec![txs[2].clone(), txs[0].clone()], "answered in the order asked");
+    assert_eq!(fill, vec![txs[0].clone(), txs[2].clone()], "answered in the order asked");
 
     let request = n42_h2_net::BlockTxnsRequest { hash, indices: vec![1, 3] };
     let err = fill_from_body(&body, HeaderProfile::Ethereum, &request).expect_err("index 3 is past the end");
@@ -1434,4 +1434,31 @@ async fn no_peer_past_the_unproven_start_reads_the_layer_once_not_every_drain() 
     within(rig.svc.consider_catch_up(&mut events)).await;
     assert_eq!(rig.svc.imported_height, Some(10), "no peer past block 7: the layer is not read");
     assert!(rig.svc.catch_up.is_none());
+}
+
+/// Audit 2026-10 round 3 (R3-N2): a peer could name one large transaction a
+/// million times; the reply was copied out in full before any byte limit
+/// applied (a 24 KB transaction asked 2^20 times is 24 GiB). The positions
+/// must be in block order with none repeated -- as this node asks for them
+/// -- and the reply is refused before copying once it would pass the
+/// reader's own limit.
+#[test]
+fn a_fill_request_cannot_name_more_than_a_reply_may_carry() {
+    let (_, header, _) = block(1, B256::ZERO);
+    let big = alloy_primitives::Bytes::from(vec![0x02; 1 << 20]);
+    let txs: Vec<_> = (0..40).map(|_| big.clone()).collect();
+    let body = n42_h2_net::encode_block_rlp_raw(&header, &txs, &[], None);
+    let hash = header.hash_slow();
+    // Lengths only: a failure must not print megabytes of reply.
+    let ask = |indices: Vec<u32>| {
+        fill_from_body(&body, HeaderProfile::Ethereum, &n42_h2_net::BlockTxnsRequest { hash, indices }).map(|txs| txs.len())
+    };
+
+    let err = ask(vec![1; 10_000]).expect_err("a repeated position");
+    assert!(err.contains("ascending"), "{err}");
+    let err = ask(vec![2, 1]).expect_err("out of block order");
+    assert!(err.contains("ascending"), "{err}");
+    let err = ask((0..40).collect()).expect_err("40 MiB is past the reply limit");
+    assert!(err.contains("exceed"), "{err}");
+    assert_eq!(ask((0..20).collect()).expect("20 MiB fits"), 20);
 }

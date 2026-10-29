@@ -354,6 +354,29 @@ async fn a_pulled_block_with_a_forged_parent_qc_ends_the_batch_and_its_peer_is_n
     assert_eq!((catch_up.peer, catch_up.next), (other, 2));
 }
 
+/// Audit 2026-10 B-6: a step that returns early -- a range reply part
+/// imported, the rest left for the next step -- still checks for local
+/// faults: a vote-log halt ends it as it ends a step on the slow path.
+#[tokio::test]
+async fn a_step_on_the_fast_path_still_stops_on_a_local_fault() {
+    let mut rig = node(1, 0, None).await;
+    let peer = PeerId::random();
+    let mut blocks: Vec<(B256, Header, alloy_primitives::Bytes)> = Vec::new();
+    let mut parent = B256::ZERO;
+    for number in 1..=(PULLED_BLOCKS_PER_STEP as u64 * 6) {
+        let block = block_with_extra(number, parent, number, Vec::new());
+        parent = block.0;
+        blocks.push(block);
+    }
+    let count = blocks.len() as u64;
+    catching_up(&mut rig, peer, 1, count);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count, step: 1 }, chunks(&blocks)));
+    rig.svc.engine.halt_voting("vote_log");
+    let err = within(rig.svc.step()).await.expect_err("the fault ends the step");
+    assert!(matches!(err, ServiceError::Fatal { reason: "vote_log", .. }), "{err:?}");
+    assert!(!rig.svc.pending_imports.is_empty(), "the step took the fast path");
+}
+
 /// Audit 2026-10 A-7: a header QC proves the block it names and the chain
 /// below it, not the block that carries it. A range server that copies one
 /// real QC into blocks it made up above the certified one gets them past the

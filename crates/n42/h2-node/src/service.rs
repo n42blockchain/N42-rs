@@ -1990,6 +1990,9 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.drain_outputs(&mut events).await?;
             self.forward_inbound_transactions();
             self.flush_outbox(&mut events);
+            // A fault the engine raised in this step ends it here too: the
+            // fast path is the one a node under load takes every step.
+            self.check_local_faults()?;
             return Ok(events);
         }
 

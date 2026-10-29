@@ -416,6 +416,9 @@ pub struct ConsensusEngine {
     /// Leader work a failed vote-log write left undone, retried before the
     /// next event (audit 2026-10 R2-C7).
     pub(super) vote_log_retry: Option<VoteLogRetry>,
+    /// Set while [`Self::retry_vote_log_work`] runs: its failures do not
+    /// lengthen the run that halts voting.
+    pub(super) vote_log_retrying: bool,
     /// Buffer for messages arriving for future views (within FUTURE_VIEW_WINDOW).
     pub(super) future_msg_buffer: Vec<(ViewNumber, ConsensusMessage)>,
     /// Which validators' Round 1 votes this node, as leader, has verified,
@@ -562,6 +565,7 @@ impl ConsensusEngine {
             proposal_equivocation_tracker: HashMap::new(),
             processed_proposal: None,
             vote_log_retry: None,
+            vote_log_retrying: false,
             future_msg_buffer: Vec::new(),
             voters_seen: HashMap::new(),
             withheld_votes: VecDeque::new(),
@@ -689,6 +693,7 @@ impl ConsensusEngine {
             proposal_equivocation_tracker: HashMap::new(),
             processed_proposal: None,
             vote_log_retry: None,
+            vote_log_retrying: false,
             future_msg_buffer: Vec::new(),
             voters_seen: HashMap::new(),
             withheld_votes: VecDeque::new(),
@@ -1097,8 +1102,14 @@ impl ConsensusEngine {
             self.vote_log_failures_in_a_row = 0;
             return Ok(());
         };
-        self.vote_log_failures_in_a_row = self.vote_log_failures_in_a_row.saturating_add(1);
         self.vote_log_failures_total = self.vote_log_failures_total.saturating_add(1);
+        if self.vote_log_retrying {
+            // A retry runs before every event; counted, a few milliseconds
+            // of disk trouble and two late votes halted voting (audit
+            // 2026-10 round 3, R3-G3). The run grows by first attempts.
+            return Err(err);
+        }
+        self.vote_log_failures_in_a_row = self.vote_log_failures_in_a_row.saturating_add(1);
         if self.vote_log_fatal_after != 0 && self.vote_log_failures_in_a_row >= self.vote_log_fatal_after {
             self.halt_voting("vote_log");
             return Err(ConsensusError::Fatal {
@@ -1195,6 +1206,7 @@ impl ConsensusEngine {
             return Ok(());
         };
         let current_view = self.round_state.current_view();
+        self.vote_log_retrying = true;
         let retried = match retry {
             VoteLogRetry::OwnBlock { view, block_hash, tx_root_hash } if view == current_view => {
                 self.on_block_ready(block_hash, tx_root_hash)
@@ -1208,6 +1220,7 @@ impl ConsensusEngine {
             }
             _ => Ok(()),
         };
+        self.vote_log_retrying = false;
         match retried {
             Err(error) if error.fatal_reason().is_some() => Err(error),
             Err(error) => {

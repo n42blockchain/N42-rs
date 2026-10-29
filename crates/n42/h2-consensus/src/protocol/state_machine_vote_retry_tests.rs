@@ -304,3 +304,69 @@ fn a_leader_retries_after_a_failed_log_write_in_both_rounds() {
         "the view commits"
     );
 }
+
+/// Audit 2026-10 round 3 (R3-G3): the retry runs before every event, and
+/// each one counted toward the run of failures that halts voting -- a disk
+/// error a few milliseconds long, two late votes after it, and the leader
+/// stopped voting until restart. A retry does not lengthen the run.
+#[test]
+fn retries_of_a_failed_leader_write_do_not_count_toward_the_fatal_run() {
+    use crate::protocol::quorum::signing_message;
+    use n42_h2_primitives::consensus::Vote;
+    let sks: Vec<_> = (0..4u8)
+        .map(|i| n42_h2_primitives::BlsSecretKey::key_gen(&[0x60 + i; 32]).expect("key"))
+        .collect();
+    let infos: Vec<_> = sks
+        .iter()
+        .enumerate()
+        .map(|(i, sk)| ValidatorInfo { address: Address::with_last_byte(i as u8), bls_public_key: sk.public_key(), p2p_peer_id: None })
+        .collect();
+    let vs = ValidatorSet::new(&infos, 1);
+    let log = Arc::new(Switchable::default());
+    let make = |me: u32, log: Arc<dyn crate::vote_log::VoteLogWriter>| {
+        let (tx, rx) = mpsc::channel(1024);
+        let engine = ConsensusEngine::with_recovered_state_and_vote_log(
+            me,
+            sks[me as usize].clone(),
+            EpochManager::new(vs.clone()),
+            60_000,
+            120_000,
+            tx,
+            1,
+            QuorumCertificate::genesis(),
+            QuorumCertificate::genesis(),
+            0,
+            0,
+            0,
+            log,
+        );
+        (engine, rx)
+    };
+    let me = make(0, Arc::new(crate::vote_log::NoopVoteLog)).0.leader_index_for_view(1);
+    let (mut engine, mut rx) = make(me, Arc::clone(&log) as Arc<dyn crate::vote_log::VoteLogWriter>);
+    let other = (0..4).find(|&i| i != me).expect("a follower");
+    let hash = B256::repeat_byte(0x84);
+    let vote = || {
+        ConsensusEvent::Message(ConsensusMessage::Vote(Vote {
+            view: 1,
+            block_hash: hash,
+            voter: other,
+            signature: sks[other as usize].sign(&signing_message(1, &hash)),
+        }))
+    };
+
+    log.fail.store(true, Ordering::SeqCst);
+    assert!(engine.process_event(ConsensusEvent::BlockReady(hash, None)).is_err());
+    assert_eq!(engine.vote_log_failures_in_a_row(), 1);
+    for _ in 0..5 {
+        engine.process_event(vote()).expect("a failed retry is not the event's error");
+    }
+    assert_eq!(engine.voting_halted(), None, "retries alone do not halt voting");
+    assert_eq!(engine.vote_log_failures_in_a_row(), 1);
+
+    log.fail.store(false, Ordering::SeqCst);
+    engine.process_event(vote()).expect("the retry succeeds");
+    assert_eq!(engine.last_voted_view(), 1, "and the leader proposed");
+    assert_eq!(engine.vote_log_failures_in_a_row(), 0);
+    drop(rx.try_recv());
+}

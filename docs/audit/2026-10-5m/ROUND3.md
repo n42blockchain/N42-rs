@@ -51,3 +51,4 @@ RPC/快照/tx-queue/mobile。每项修复前先按代码核实,先写复现测�
 | R3-N2 | 已修:`named_txns`(by-hash 存档 body 与 EL 两条路径共用)要求索引严格递增(本节点请求本就按块序),拷贝前累计字节,超过 `MAX_BLOCK_TXNS_BYTES`(32 MiB,读取端自身上限)即拒;测试 `a_fill_request_cannot_name_more_than_a_reply_may_carry` 修复前把测试进程撑到 40 GB。旧测试 `[2, 0]` 乱序请求改为块序。热路径:fill 回复多一次 O(n) 遍历。`reply_permit` 的截断未改:回复已被 32 MiB 限住 |
 | R3-C1 | 已修:延迟执行激活时 `validate_header` 只查 gas limit 上限,`gas_used` 在 `validate_header_against_parent` 中对照父块 gas limit(深度 1,与 gov5 `verifyHeaderWithBatch` 一致;更深时由执行字段相等检查约束);测试 `under_deferred_execution_gas_used_is_bounded_by_the_parents_limit` 修复前失败(满块后 limit 下调的子头被拒)。每头一次分支,非热路径 |
 | R3-G1 | 已修 | 追加失败时把未入日志的 delta 交还各自记录(`forest.restore_deltas`),换到更高目标重试仍走逐块路径;测试 `a_failed_append_retried_at_a_later_block_loses_no_flip`(修前报 duplicate active key) |
+| R3-G5 | 已修 | 等待式导入的 Valid/Invalid 与重试改向 fleet 索取时清除 `import_retries`;测试 `an_awaited_import_that_ends_after_retries_forgets_their_count` |

@@ -826,6 +826,37 @@ fn action_accessors_answer_only_for_their_own_variant() {
 /// so a copy that arrived was a duplicate), and a compact body was dropped
 /// for a whole one asked of every peer.
 #[tokio::test]
+async fn an_awaited_import_that_ends_after_retries_forgets_their_count() {
+    // Audit 2026-10 round 3 (R3-G5): the awaited path ended a retried
+    // import without dropping its retry count, so every block that once had
+    // no verdict left an entry behind for good.
+    let built = MockExecutionLayer::built_block(1);
+    let el = MockExecutionLayer::with_behaviour(MockBehaviour {
+        new_payload_status: PayloadStatusEnum::Syncing,
+        ..Default::default()
+    });
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    driver.set_import_retry_backoff(vec![Duration::ZERO, Duration::ZERO]);
+    driver.cache_payload(built.hash, built.execution_data.clone());
+    assert!(matches!(driver.handle_output(&execute(built.hash)).await, DriverAction::Ignored));
+    assert_eq!(driver.import_retries_held(), 1);
+    el.set_behaviour(MockBehaviour::default());
+    let retried = driver.retry_failed_imports().await;
+    assert_eq!(retried[0].imported_block(), Some(built.hash));
+    assert_eq!(driver.import_retries_held(), 0, "the count goes with the verdict");
+
+    // A retry that finds the payload gone is asked of the fleet, and its count goes too.
+    let other = MockExecutionLayer::built_block(2);
+    el.set_behaviour(MockBehaviour { new_payload_status: PayloadStatusEnum::Syncing, ..Default::default() });
+    driver.cache_payload(other.hash, other.execution_data.clone());
+    driver.handle_output(&execute(other.hash)).await;
+    driver.forget_payload(other.hash);
+    let retried = driver.retry_failed_imports().await;
+    assert_eq!(retried[0].missing_block(), Some(other.hash));
+    assert_eq!(driver.import_retries_held(), 0);
+}
+
+#[tokio::test]
 async fn an_import_without_a_verdict_is_executed_again_from_what_is_held() {
     let built = MockExecutionLayer::built_block(1);
     let el = MockExecutionLayer::with_behaviour(MockBehaviour {

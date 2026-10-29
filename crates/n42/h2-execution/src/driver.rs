@@ -2040,9 +2040,20 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 self.import_retries.remove(&block_hash);
                 continue;
             }
-            actions.push(self.execute(block_hash).await);
+            let action = self.execute(block_hash).await;
+            // The payload is gone and the fleet is asked: no retry follows
+            // (audit 2026-10 round 3, R3-G5, as the verdicts above).
+            if action.missing_block() == Some(block_hash) {
+                self.import_retries.remove(&block_hash);
+            }
+            actions.push(action);
         }
         actions
+    }
+
+    /// Blocks with a retry count held, for diagnostics.
+    pub fn import_retries_held(&self) -> usize {
+        self.import_retries.len()
     }
 
     /// The channel [`Self::spawn_import_own_block`] reports on, once.
@@ -2970,6 +2981,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         match outcome {
             Ok(status) => match status.status {
                 PayloadStatusEnum::Valid => {
+                    self.import_retries.remove(&block_hash);
                     self.head = block_hash;
                     self.note_imported(block_hash);
                     if self.pending_commits.remove(&block_hash) || self.commits_ahead.remove(&block_hash) {
@@ -2985,10 +2997,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 // block yet, so voting now would be voting blind. Treat it the
                 // same as a missing payload — the caller retries.
                 PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => self.schedule_import_retry(block_hash),
-                PayloadStatusEnum::Invalid { validation_error } => DriverAction::Rejected {
-                    block_hash,
-                    reason: validation_error.to_string(),
-                },
+                PayloadStatusEnum::Invalid { validation_error } => {
+                    self.import_retries.remove(&block_hash);
+                    DriverAction::Rejected { block_hash, reason: validation_error.to_string() }
+                }
             },
             // No verdict on the block: executed again, as above.
             Err(error) => {

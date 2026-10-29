@@ -4348,6 +4348,49 @@ mod tests {
         assert!(matches!(err, crate::error::ConsensusError::InvalidQC { view: 0, .. }), "{err:?}");
     }
 
+    /// Audit 2026-10 R2-C5: a validator whose highest QC is still genesis (a
+    /// fresh or restarted member) times out with the genesis QC as its high
+    /// QC. gov5 counts that timeout; refusing it once this node's lock moved
+    /// kept such members out of every TC. The lock only moves up, so the
+    /// genesis QC cannot lower it.
+    #[test]
+    fn a_timeout_with_the_genesis_high_qc_counts_after_the_lock_moved() {
+        use crate::protocol::quorum::timeout_signing_message;
+        use n42_h2_primitives::consensus::TimeoutMessage;
+
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+        for view in 1..=2u64 {
+            let block_hash = B256::repeat_byte(0xB0 + view as u8);
+            let commit_qc = build_test_commit_qc(view, block_hash, &sks, &vs, &[0, 1, 2]);
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                    view,
+                    block_hash,
+                    commit_qc,
+                    validator_changes_hash: B256::ZERO,
+                })))
+                .expect("valid Decide");
+        }
+        let lock = engine.round_state.locked_qc().clone();
+        assert!(lock.view > 0, "the lock moved past genesis");
+        let view = engine.current_view();
+        engine.on_timeout().expect("timed out");
+        while rx.try_recv().is_ok() {}
+        for sender in [1u32, 2] {
+            let timeout = TimeoutMessage {
+                view,
+                high_qc: QuorumCertificate::genesis(),
+                sender,
+                signature: sks[sender as usize].sign(&timeout_signing_message(view)),
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout)))
+                .expect("a genesis high QC is a valid high QC");
+        }
+        assert_eq!(engine.current_view(), view + 1, "the three timeouts formed a TC");
+        assert_eq!(engine.round_state.locked_qc(), &lock, "and the lock did not move back");
+    }
+
     #[test]
     fn test_timeout_carrying_a_non_genesis_view_zero_qc_is_refused() {
         use crate::protocol::quorum::timeout_signing_message;

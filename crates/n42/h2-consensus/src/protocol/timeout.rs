@@ -188,12 +188,9 @@ impl ConsensusEngine {
     }
 
     /// Verifies a QC embedded in a timeout or NewView message.
-    /// Genesis QC (view 0) is exempt only when our own locked_qc is also genesis —
-    /// i.e., the chain has just started and no real QC exists yet.
-    ///
-    /// Allowing any network message to carry a view=0 QC unconditionally would let
-    /// an attacker forge a genesis QC and use it to regress our locked_qc back to
-    /// view 0, violating HotStuff-2's safety monotonicity invariant.
+    /// The genesis QC (view 0, zero block hash, no signers) carries no
+    /// signatures and is accepted as is; any other view-0 QC is refused. It
+    /// never lowers the lock: `update_locked_qc` only moves to a higher view.
     ///
     /// The R2 commit-domain fallback in `verify_qc_any_domain` reads the
     /// cached `changes_hash` for this QC's block; on cache miss it falls back
@@ -210,15 +207,11 @@ impl ConsensusEngine {
                     reason: "a view-0 QC that is not the genesis QC".to_string(),
                 });
             }
-            // Only accept a genesis QC if our own locked_qc is still at genesis.
-            // Once we have advanced past genesis, any incoming view=0 QC is suspicious.
-            if self.round_state.locked_qc().view == 0 {
-                return Ok(());
-            }
-            return Err(crate::error::ConsensusError::InvalidQC {
-                view: 0,
-                reason: "genesis QC rejected: local locked_qc has already advanced".to_string(),
-            });
+            // The genesis QC is the high QC of a member that has seen no
+            // other (fresh or restarted); gov5 counts its timeout. The lock
+            // only moves to a higher view (`update_locked_qc`), so it cannot
+            // move back to genesis (audit 2026-10 R2-C5).
+            return Ok(());
         }
         self.verify_qc_any_domain_or_known(qc)
     }

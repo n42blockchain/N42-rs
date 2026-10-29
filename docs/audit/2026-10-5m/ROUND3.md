@@ -54,3 +54,4 @@ RPC/快照/tx-queue/mobile。每项修复前先按代码核实,先写复现测�
 | R3-G5 | 已修 | 等待式导入的 Valid/Invalid 与重试改向 fleet 索取时清除 `import_retries`;测试 `an_awaited_import_that_ends_after_retries_forgets_their_count` |
 | R3-C3 | 已修 | 记住本节点最后发出的 R1 投票,同一 view 重复超时时(非 leader)随超时一并重发给 leader,与 gov5 `timeout.go` 一致;测试 `test_a_repeated_timeout_resends_this_views_vote` |
 | R3-N5 | 已修(部分) | `/n42/vote/1` 只放行本节点会在其上发送的 Vote/CommitVote/Timeout(Timeout 由 gossip 去重时直发重传,必须保留),其余类型拒绝;测试 `the_vote_protocol_carries_only_votes_and_timeouts`。限速与 Timeout 先验签后查重未做 |
+| R3-N6 | 已修 | message id 改为增量 Keccak,不再为每份 gossip 拷贝整份 payload;gov5 字节级向量 `matches_gov5_message_id_vectors` 覆盖正确性(纯降成本) |

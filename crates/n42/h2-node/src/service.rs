@@ -88,6 +88,9 @@ pub fn local_engine_errors() -> u64 {
 
 /// Counter: vote-log write/fsync failures since start.
 pub const METRIC_VOTE_LOG_FAILURES_TOTAL: &str = "n42_h2_vote_log_failures_total";
+/// Counter: commits whose consensus checkpoint could not be written; the
+/// execution layer is not told of them, while voting goes on.
+pub const METRIC_CHECKPOINT_FAILURES_TOTAL: &str = "n42_h2_checkpoint_failures_total";
 /// Gauge, label `reason`: 1 once a fatal local fault stopped this validator.
 pub const METRIC_FATAL: &str = "n42_h2_fatal";
 /// Gauge, label `reason`: 1 once this node stopped voting and proposing
@@ -597,6 +600,9 @@ pub struct H2Service<E> {
     halt_on_commit_invalid: bool,
     /// Vote-log failures already added to [`METRIC_VOTE_LOG_FAILURES_TOTAL`].
     vote_log_failures_exported: u64,
+    /// Commits whose consensus checkpoint could not be written, so were not
+    /// finalised (also [`METRIC_CHECKPOINT_FAILURES_TOTAL`]).
+    checkpoint_failures: u64,
 }
 
 /// How long a leader whose builder declined waits before asking it again.
@@ -1558,6 +1564,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             fatal: None,
             halt_on_commit_invalid: halt_on_commit_invalid_from_env(),
             vote_log_failures_exported: 0,
+            checkpoint_failures: 0,
         }
     }
 
@@ -3025,9 +3032,11 @@ impl<E: ExecutionLayer> H2Service<E> {
             (&output, self.checkpoint.as_ref())
             && let Err(error) = write(&self.engine)
         {
-            warn!(
+            self.checkpoint_failures += 1;
+            metrics::counter!(METRIC_CHECKPOINT_FAILURES_TOTAL).increment(1);
+            error!(
                 target: "n42.h2.node",
-                %error, view, ?block_hash,
+                %error, view, ?block_hash, failures = self.checkpoint_failures,
                 "could not persist consensus state; the commit is not being finalised",
             );
             return Ok(());

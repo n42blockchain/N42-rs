@@ -270,6 +270,10 @@ impl SlotNote {
 
 /// What the execution layer is told when a held import is dropped, and what
 /// its answer then carries.
+/// Counter: blocks this node built that its own execution layer called
+/// invalid (a builder/executor divergence on the leader).
+pub const METRIC_OWN_BLOCK_REFUSED_TOTAL: &str = "n42_h2_own_block_refused_total";
+
 pub const HELD_IMPORT_DROPPED: &str = "the held import was dropped before its execution";
 
 /// A commit whose forkchoice has not been sent yet
@@ -686,6 +690,9 @@ pub struct ExecutionDriver<E> {
     /// This node's own blocks whose import task has not ended. See
     /// [`Self::is_importing_own_block`].
     own_importing: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<B256>>>,
+    /// Own blocks the execution layer called invalid. See
+    /// [`Self::own_blocks_refused`].
+    own_refused: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// **Bench only** (`N42_VOTE_BEFORE_IMPORT=1`): a follower's import runs
     /// on a task instead of being awaited by the loop, so the loop can vote
     /// on the next proposal while the block executes -- what deferred
@@ -1000,6 +1007,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             own_imports: own_imports_tx,
             own_imports_rx: Some(own_imports_rx),
             own_importing: Default::default(),
+            own_refused: Default::default(),
             spawn_imports: false,
             deferred_execution_time: None,
             deferred_depth: 1,
@@ -1812,6 +1820,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let hash = built.hash;
         let elided = built.elided.then_some(built.tx_count);
         let imported = self.own_imports.clone();
+        let refused = std::sync::Arc::clone(&self.own_refused);
         self.own_importing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(hash);
         let done = OwnImportDone { importing: std::sync::Arc::clone(&self.own_importing), hash };
         tokio::spawn(async move {
@@ -1828,6 +1837,18 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     );
                     if status.status.is_valid() {
                         let _ = imported.send(hash);
+                    } else if let PayloadStatusEnum::Invalid { validation_error } = &status.status {
+                        // The builder and the executor of one node disagree:
+                        // the block this node proposed is one it would not
+                        // vote for. The follower path decides the vote; this
+                        // is the alarm.
+                        refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        metrics::counter!(METRIC_OWN_BLOCK_REFUSED_TOTAL).increment(1);
+                        error!(
+                            target: "n42.h2.el",
+                            block = ?hash, %validation_error,
+                            "our own execution layer calls the block we built invalid"
+                        );
                     }
                 }
                 Err(err) => warn!(
@@ -1896,6 +1917,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// which an own import never sends.
     pub fn is_importing_own_block(&self, block_hash: &B256) -> bool {
         self.own_importing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(block_hash)
+    }
+
+    /// Own blocks [`Self::spawn_import_own_block`] found the execution layer
+    /// calling invalid since start (also [`METRIC_OWN_BLOCK_REFUSED_TOTAL`]).
+    pub fn own_blocks_refused(&self) -> u64 {
+        self.own_refused.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The channel [`Self::spawn_import_own_block`] reports on, once.

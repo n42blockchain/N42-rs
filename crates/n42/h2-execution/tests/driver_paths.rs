@@ -623,6 +623,25 @@ async fn an_own_import_is_tracked_while_it_runs_and_reported_when_the_block_is_v
     }
 }
 
+/// Audit 2026-10 B-7: a block this node built that its own execution layer
+/// calls invalid is a builder/executor divergence on the leader. It is
+/// counted (and logged at error), unlike a layer that is syncing or down.
+#[tokio::test]
+async fn an_own_block_its_execution_layer_calls_invalid_is_counted() {
+    let built = MockExecutionLayer::built_block(1);
+    for (behaviour, refused) in [
+        (MockBehaviour { new_payload_status: invalid("bad"), ..Default::default() }, 1),
+        (MockBehaviour { new_payload_status: PayloadStatusEnum::Syncing, ..Default::default() }, 0),
+        (MockBehaviour { new_payload_error: Some("down".into()), ..Default::default() }, 0),
+        (MockBehaviour::default(), 0),
+    ] {
+        let driver = ExecutionDriver::new(MockExecutionLayer::with_behaviour(behaviour), GENESIS);
+        driver.spawn_import_own_block(&built);
+        eventually("the import to end", || !driver.is_importing_own_block(&built.hash)).await;
+        assert_eq!(driver.own_blocks_refused(), refused);
+    }
+}
+
 #[tokio::test]
 async fn the_commit_that_was_answered_syncing_runs_again_when_the_own_block_lands() {
     let built = MockExecutionLayer::built_block(1);

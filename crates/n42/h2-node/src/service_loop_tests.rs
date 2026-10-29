@@ -47,6 +47,8 @@ async fn a_commit_whose_checkpoint_cannot_be_written_is_not_finalised() {
     let mut events = Vec::new();
     within(svc.handle_output(committed(3, hash), &mut events)).await.expect("a refused commit is not fatal");
     assert_eq!(writes.load(Ordering::SeqCst), 1, "the checkpoint was attempted");
+    // Audit 2026-10 B-7: voting goes on, so the refusal is counted.
+    assert_eq!(svc.checkpoint_failures, 1, "the failure is counted");
     assert!(events.is_empty(), "no Committed event for an undurable commit");
     assert!(rig.el.calls().is_empty(), "finality is never announced to the execution layer");
     assert_eq!(svc.driver.finalized(), ID.genesis_hash, "nothing was finalised");

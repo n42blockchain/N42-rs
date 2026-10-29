@@ -22,17 +22,22 @@
 //! tree may truncate while it reads: the read view's guards (`TruncationGuard`, its floor)
 //! already keep it below both.
 
-use std::sync::{
-    atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
-    Arc,
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use crate::prefault::{OFFSET_SEGMENT_BITS, OFFSET_SEGMENT_SLOTS};
 
-/// Slots the directory can name: as many as the key index's 40-bit field.
-const MAX_SLOTS: usize = 1 << 40;
-/// Directory entries, one per segment.
-const DIRECTORY_LEN: usize = MAX_SLOTS >> OFFSET_SEGMENT_BITS;
+/// Slots the directory can name: as many as the key index's 40-bit field,
+/// which refuses a slot past it anyway (`index::MAX_SLOT`). A `u64`, so the
+/// crate still builds for 32-bit targets.
+const MAX_SLOTS: u64 = 1 << 40;
+/// Directory entries, one per segment (2^20, which fits any `usize`).
+const DIRECTORY_LEN: usize = (MAX_SLOTS >> OFFSET_SEGMENT_BITS) as usize;
 const MASK: usize = OFFSET_SEGMENT_SLOTS - 1;
 
 /// The shared part: the directory, the segments it points at, and the length.
@@ -87,8 +92,10 @@ impl Drop for Inner {
     }
 }
 
-/// A prefaulted `u64` segment as atomics.
+/// A `u64` segment as atomics; it must hold exactly `OFFSET_SEGMENT_SLOTS`,
+/// the length every pointer into it is rebuilt with.
 fn atomic_segment(segment: Box<[u64]>) -> Box<[AtomicU64]> {
+    assert_eq!(segment.len(), OFFSET_SEGMENT_SLOTS, "an offsets segment of the wrong length");
     const _: () = assert!(std::mem::size_of::<u64>() == std::mem::size_of::<AtomicU64>());
     const _: () = assert!(std::mem::align_of::<u64>() == std::mem::align_of::<AtomicU64>());
     // SAFETY: `AtomicU64` has the size and alignment of `u64` (asserted above)
@@ -115,7 +122,9 @@ impl Clone for Offsets {
         let mut slot = 0;
         while slot < len {
             let run = (OFFSET_SEGMENT_SLOTS - (slot & MASK)).min(len - slot);
-            out.grow_to(slot + run);
+            // Fresh segments, not the prefault pool's: those are kept for the
+            // apply path, and a clone is not on it.
+            out.grow_to(slot + run, false).expect("a clone needs no more slots than its original holds");
             let from = &self.inner.segment(slot)[slot & MASK..][..run];
             let to = &out.inner.segment(slot)[slot & MASK..][..run];
             for (to, from) in to.iter().zip(from) {
@@ -135,10 +144,10 @@ impl std::fmt::Debug for Offsets {
 }
 
 impl Offsets {
-    pub(crate) fn from_vec(offsets: Vec<u64>) -> Self {
+    pub(crate) fn from_vec(offsets: Vec<u64>) -> io::Result<Self> {
         let mut out = Self::default();
-        out.extend_from_slice(&offsets);
-        out
+        out.extend_from_slice(&offsets)?;
+        Ok(out)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -177,31 +186,48 @@ impl Offsets {
     }
 
     /// Makes sure segments cover slots below `end`, publishing each before
-    /// any length that reaches it.
-    fn grow_to(&mut self, end: usize) {
-        assert!(end <= MAX_SLOTS, "{end} slots past the directory's {MAX_SLOTS}");
+    /// any length that reaches it; `pooled` takes them from the prefault
+    /// pool. Past [`MAX_SLOTS`] it refuses and changes nothing: the caller's
+    /// append fails, and the forest stops on it as on any store error.
+    fn grow_to(&mut self, end: usize, pooled: bool) -> io::Result<()> {
+        if end as u64 > MAX_SLOTS {
+            return Err(io::Error::other(format!("{end} QMDB slots past the offsets' {MAX_SLOTS}")));
+        }
         let mut segments = self.allocated_segments();
         while segments << OFFSET_SEGMENT_BITS < end {
-            let segment = atomic_segment(crate::prefault::take_offset_segment());
+            let raw = if pooled {
+                crate::prefault::take_offset_segment()
+            } else {
+                vec![0u64; OFFSET_SEGMENT_SLOTS].into_boxed_slice()
+            };
+            let segment = atomic_segment(raw);
             let ptr = Box::into_raw(segment) as *mut AtomicU64;
             self.inner.directory[segments].store(ptr, Ordering::Release);
             segments += 1;
             self.inner.segments.store(segments, Ordering::Release);
         }
+        Ok(())
     }
 
-    pub(crate) fn push(&mut self, offset: u64) {
+    /// Makes room for slots below `end` without changing the length, so an
+    /// append that touches other structures first can fail before it does.
+    pub(crate) fn reserve(&mut self, end: usize) -> io::Result<()> {
+        self.grow_to(end, true)
+    }
+
+    pub(crate) fn push(&mut self, offset: u64) -> io::Result<()> {
         let slot = self.len();
-        self.grow_to(slot + 1);
+        self.grow_to(slot + 1, true)?;
         self.inner.segment(slot)[slot & MASK].store(offset, Ordering::Relaxed);
         self.inner.len.store(slot + 1, Ordering::Release);
+        Ok(())
     }
 
     /// Appends `offsets` in order: what one [`Self::push`] each leaves, with
     /// the length published once.
-    pub(crate) fn extend_from_slice(&mut self, offsets: &[u64]) {
+    pub(crate) fn extend_from_slice(&mut self, offsets: &[u64]) -> io::Result<()> {
         let first = self.len();
-        self.grow_to(first + offsets.len());
+        self.grow_to(first + offsets.len(), true)?;
         let mut slot = first;
         let mut rest = offsets;
         while !rest.is_empty() {
@@ -214,6 +240,7 @@ impl Offsets {
             rest = &rest[run..];
         }
         self.inner.len.store(slot, Ordering::Release);
+        Ok(())
     }
 
     /// Drops every slot from `len` on. The segments stay allocated: a reader
@@ -268,9 +295,9 @@ mod tests {
         assert_eq!(reader.get(0), None);
         // Across a segment boundary, both ways of appending.
         let first: Vec<u64> = (0..OFFSET_SEGMENT_SLOTS as u64 - 3).map(|n| n * 40).collect();
-        offsets.extend_from_slice(&first);
+        offsets.extend_from_slice(&first).expect("room");
         for n in 0..10u64 {
-            offsets.push((first.len() as u64 + n) * 40);
+            offsets.push((first.len() as u64 + n) * 40).expect("room");
         }
         let len = first.len() + 10;
         assert_eq!(offsets.len(), len);
@@ -292,21 +319,21 @@ mod tests {
         assert_eq!(reader.len(), OFFSET_SEGMENT_SLOTS as u64 - 2);
         assert_eq!(reader.get(OFFSET_SEGMENT_SLOTS as u64), None);
         assert_eq!(offsets.allocated_segments(), 2);
-        offsets.extend_from_slice(&[1, 2, 3]);
+        offsets.extend_from_slice(&[1, 2, 3]).expect("room");
         assert_eq!(reader.get(OFFSET_SEGMENT_SLOTS as u64), Some(3));
         assert_eq!(offsets.allocated_segments(), 2);
     }
 
     #[test]
     fn a_clone_moves_apart_from_the_original() {
-        let mut offsets = Offsets::from_vec((0..100).collect());
+        let mut offsets = Offsets::from_vec((0..100).collect()).expect("room");
         let reader = offsets.reader();
         let mut copy = offsets.clone();
         assert_eq!(copy.len(), 100);
         assert_eq!(copy.at(99), 99);
         copy.set(3, 1000);
         copy.truncate(10);
-        offsets.push(100);
+        offsets.push(100).expect("room");
         assert_eq!(reader.get(3), Some(3));
         assert_eq!(reader.len(), 101);
         assert_eq!(copy.reader().len(), 10);
@@ -342,15 +369,26 @@ mod tests {
         while (next as usize) < total {
             if next.is_multiple_of(3) {
                 let run: Vec<u64> = (next..next + 4097).map(|slot| slot * 8 + 1).collect();
-                offsets.extend_from_slice(&run);
+                offsets.extend_from_slice(&run).expect("room");
                 next += run.len() as u64;
             } else {
-                offsets.push(next * 8 + 1);
+                offsets.push(next * 8 + 1).expect("room");
                 next += 1;
             }
         }
         done.store(true, Ordering::Release);
         assert!(watcher.join().expect("the reader thread") > 0);
         assert_eq!(reader.len(), next);
+    }
+
+    #[test]
+    fn growth_past_the_directory_is_refused_and_changes_nothing() {
+        let mut offsets = Offsets::default();
+        offsets.push(1).expect("room");
+        assert!(offsets.reserve(MAX_SLOTS as usize + 1).is_err());
+        assert_eq!(offsets.len(), 1);
+        assert_eq!(offsets.allocated_segments(), 1);
+        offsets.push(2).expect("room");
+        assert_eq!(offsets.at(1), 2);
     }
 }

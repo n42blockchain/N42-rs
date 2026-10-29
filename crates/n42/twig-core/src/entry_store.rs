@@ -724,7 +724,7 @@ impl FileEntries {
             main,
             relocated,
             twigs,
-            offsets: Offsets::from_vec(offsets),
+            offsets: Offsets::from_vec(offsets)?,
             active: vec![0u64; (kept as usize).div_ceil(64)],
         };
         for (word, bits) in store.active.iter_mut().zip(active) {
@@ -876,6 +876,9 @@ impl FileEntries {
     pub(crate) fn push(&mut self, key: &Hash, value: &[u8]) -> io::Result<()> {
         self.main.writable()?;
         let slot = self.offsets.len();
+        // Room for the offset before the record, so a refusal leaves both as
+        // they were.
+        self.offsets.reserve(slot + 1)?;
         let record_len = KEY_LEN + LEN_LEN + value.len();
         // Sealed before the record that would not fit rather than after the
         // one that overflowed: the tail never outgrows `CHUNK_BYTES`, so its
@@ -894,7 +897,7 @@ impl FileEntries {
         main.tail.extend_from_slice(key);
         main.tail.extend_from_slice(&(value.len() as u32).to_le_bytes());
         main.tail.extend_from_slice(value);
-        self.offsets.push(main.len_bytes);
+        self.offsets.push(main.len_bytes)?;
         main.len_bytes += record_len as u64;
         if self.active.len() * 64 <= slot {
             self.active.push(0);
@@ -923,6 +926,12 @@ impl FileEntries {
         let main = &mut self.main;
         for (key, value) in records.clone() {
             let record_len = KEY_LEN + LEN_LEN + value.len();
+            // The offset's room first: a refusal stops here like a failed
+            // seal, keeping the records copied before it.
+            if let Err(error) = self.offsets.reserve(first_slot + copied + 1) {
+                sealed = Err(error);
+                break;
+            }
             if !main.tail.is_empty()
                 && main.tail.len() + record_len > CHUNK_BYTES
                 && let Err(error) = main.seal_tail()
@@ -946,7 +955,8 @@ impl FileEntries {
         faults.entries += entries_done.saturating_sub(at);
         let mut offset = first_byte;
         for (_, value) in records.take(copied) {
-            self.offsets.push(offset);
+            // Reserved in the copy loop; cannot refuse.
+            self.offsets.push(offset)?;
             offset += (KEY_LEN + LEN_LEN + value.len()) as u64;
         }
         let offsets_done = crate::prefault::thread_faults();
@@ -989,6 +999,7 @@ impl FileEntries {
                 main.seal_tail()?;
                 continue;
             }
+            self.offsets.reserve(self.offsets.len() + (to - from))?;
             if main.tail.capacity() < CHUNK_BYTES {
                 main.tail.reserve_exact(CHUNK_BYTES.max(main.tail.len() + bytes) - main.tail.len());
             }
@@ -1044,7 +1055,7 @@ impl FileEntries {
                 *start += first_byte;
             }
             main.len_bytes += bytes as u64;
-            self.offsets.extend_from_slice(&starts);
+            self.offsets.extend_from_slice(&starts)?;
             self.set_active_run(first_slot, first_slot + (to - from));
             from = to;
         }

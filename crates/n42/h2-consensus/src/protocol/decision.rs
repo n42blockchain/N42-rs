@@ -17,6 +17,14 @@ impl ConsensusEngine {
             return Ok(());
         }
 
+        // gov5's commit signatures do not cover the changes hash, so on a
+        // gov5 chain the envelope's value is unauthenticated, and such a
+        // chain carries no validator changes: anything but zero is a relay's
+        // edit (audit 2026-10 R2-C6).
+        if self.signing_profile.is_gov5() && decide.validator_changes_hash != alloy_primitives::B256::ZERO {
+            return Err(ConsensusError::H2V4ValidatorChangesUnsupported);
+        }
+
         let commit_set = self.resolve_qc_validator_set(&decide.commit_qc)?;
         let quorum_size = commit_set.quorum_size();
         if decide.commit_qc.signer_count() < quorum_size {

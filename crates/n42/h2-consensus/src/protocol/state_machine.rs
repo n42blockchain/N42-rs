@@ -3397,6 +3397,42 @@ mod tests {
         assert_eq!(engine.consecutive_timeouts(), timeouts, "the repeat timeout is not a new one");
     }
 
+    /// Audit 2026-10 R2-C6: gov5's commit signatures do not cover the
+    /// changes hash, so a relay can put any value in a Decide's envelope and
+    /// its QC still verifies. gov5 chains carry no validator changes: a
+    /// nonzero hash is refused instead of sending this node into a resync
+    /// for changes that never existed.
+    #[test]
+    fn a_gov5_decide_naming_validator_changes_is_refused() {
+        use crate::protocol::quorum::VoteCollector;
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+        enable_test_h2(&mut engine);
+        let view = engine.current_view();
+        let block_hash = B256::repeat_byte(0xD6);
+        let message = engine.signing_profile.commit_message(view, block_hash, B256::ZERO);
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+        for i in 0..3u32 {
+            collector
+                .add_vote(i, engine.signing_profile.sign(&sks[i as usize], &message))
+                .unwrap();
+        }
+        let commit_qc = collector
+            .build_qc_with_profile_message(&vs, &message, engine.signing_profile)
+            .unwrap();
+        let _ = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+            view,
+            block_hash,
+            commit_qc,
+            validator_changes_hash: B256::repeat_byte(0x77),
+        })));
+        let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !outputs.iter().any(|o| matches!(o, EngineOutput::SyncRequired { .. })),
+            "no resync for changes a gov5 chain cannot carry: {outputs:?}"
+        );
+        assert_eq!(engine.current_view(), view, "and nothing is committed on it");
+    }
+
     #[test]
     fn test_h2_vote_waits_for_execution_import() {
         let (mut engine, sks, _, mut rx) = make_engine(4, 0);

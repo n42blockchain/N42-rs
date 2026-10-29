@@ -67,3 +67,4 @@
 | R2-C8 | 已修(确认可达):回放中晚到的伪造投票被记到触发推进的 Decide 头上;`advance_to_view` 回放前取出、回放后恢复 `unauthenticated`;测试 `a_forged_message_found_at_replay_is_not_blamed_on_the_trigger` 修复前失败 |
 | R2-C4 | 已修:`on_block_ready` 记录本 view 的 `processed_proposal`,被回传的自身 proposal 在投票或超时后按重复丢弃;测试 `a_leader_given_back_its_own_proposal_after_a_timeout_drops_it` 修复前失败(重新发出 ExecuteBlock) |
 | R2-C5 | 已修:真 genesis QC(view 0、零哈希、无签名者)作为 timeout/NewView 的 high QC 一律接受,与 gov5 一致;锁只向更高 view 移动,不会回退;测试 `a_timeout_with_the_genesis_high_qc_counts_after_the_lock_moved` 修复前失败 |
+| R2-C6 | 已修:gov5 profile(H2V4/Gov5Legacy)下 Decide 的 `validator_changes_hash` 非零即拒(`H2V4ValidatorChangesUnsupported`),在验 QC 之前;测试 `a_gov5_decide_naming_validator_changes_is_refused` 修复前失败(伪造哈希触发 SyncRequired) |

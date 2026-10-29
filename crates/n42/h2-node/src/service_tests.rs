@@ -982,6 +982,25 @@ async fn a_proposed_block_the_pull_imported_has_its_parent_recorded() {
     assert!(rig.svc.engine.knows_parent(&hash), "the parent of a block imported by the pull");
 }
 
+/// Audit 2026-10 round 2 (R2-I3): a body filed under a block's hash is not
+/// proven by it -- the hash covers the header, not the transactions. A body
+/// the execution layer rejected is forgotten, so the honest copy that comes
+/// next is taken and imported rather than dropped as a duplicate.
+#[tokio::test]
+async fn a_rejected_body_is_forgotten_so_the_next_copy_is_taken() {
+    let mut rig = node(1, 0, None).await;
+    let (hash, _, rlp) = block(4, B256::repeat_byte(2));
+    let (_, _, fresh) = rig.svc.accept_body_once(rlp.clone()).expect("a readable body");
+    assert!(fresh);
+    let mut events = Vec::new();
+    rig.svc
+        .apply_driver_action(DriverAction::Rejected { block_hash: hash, reason: "transactions root mismatch".into() }, &mut events)
+        .expect("applied");
+    assert!(!rig.svc.body_store.contains_key(&hash), "the rejected bytes are not served or kept");
+    let (_, _, fresh) = rig.svc.accept_body_once(rlp).expect("the next copy");
+    assert!(fresh, "the next copy is imported");
+}
+
 #[path = "service_loop_tests.rs"]
 mod loop_tests;
 

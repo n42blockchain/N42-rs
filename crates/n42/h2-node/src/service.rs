@@ -4043,6 +4043,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // withdraws the block's import evidence, so the hash is
                 // checked again if it is ever proposed again.
                 warn!(target: "n42.h2.node", ?block_hash, reason, "execution layer rejected a block");
+                // The hash names the header, not the transactions: the
+                // rejected bytes may be a forgery under an honest block's
+                // hash. Forgotten, so the next copy is taken and imported
+                // rather than dropped as a duplicate, and the forgery is not
+                // served on (audit 2026-10 round 2, R2-I3).
+                self.forget_rejected_body(block_hash);
                 if let Err(err) = self.engine.process_event(ConsensusEvent::BlockRejected(block_hash)) {
                     debug!(target: "n42.h2.node", ?block_hash, "engine refused the withdrawal of import evidence");
                     report_engine_error(&err, "import withdrawal", &mut self.fatal);
@@ -4882,6 +4888,17 @@ impl<E: ExecutionLayer> H2Service<E> {
     fn note_peer_height(&mut self, peer: PeerId, height: u64) {
         let known = self.peer_heights.entry(peer).or_insert(height);
         *known = (*known).max(height);
+    }
+
+    /// Drops every copy of a body the execution layer rejected.
+    fn forget_rejected_body(&mut self, block_hash: B256) {
+        if self.body_store.remove(&block_hash).is_some() {
+            self.body_store_order.retain(|hash| hash != &block_hash);
+        }
+        if self.compact_bodies.remove(&block_hash).is_some() {
+            self.compact_order.retain(|hash| hash != &block_hash);
+        }
+        self.driver.forget_payload(block_hash);
     }
 
     fn remember_body(&mut self, block_hash: B256, rlp: impl Into<crate::body_channel::BodyBuf>) {

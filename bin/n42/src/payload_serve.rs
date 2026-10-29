@@ -2708,12 +2708,14 @@ fn checked_frame(hash: B256) -> std::io::Result<Vec<u8>> {
 }
 
 /// Whether a status is a verdict that can answer every later request for the
-/// block (VALID, INVALID) rather than one that may change (SYNCING, ACCEPTED).
+/// block: VALID only. SYNCING and ACCEPTED may change, and INVALID is a
+/// verdict on the bytes this request carried, not on the block its hash
+/// names -- a body with the honest header and other transactions is INVALID
+/// under the honest block's hash, and kept, it answered the honest body too
+/// (audit 2026-10 round 2, R2-I3). Requests waiting on the same import still
+/// get its answer.
 const fn settled_status(status: &alloy_rpc_types_engine::PayloadStatusEnum) -> bool {
-    matches!(
-        status,
-        alloy_rpc_types_engine::PayloadStatusEnum::Valid | alloy_rpc_types_engine::PayloadStatusEnum::Invalid { .. }
-    )
+    matches!(status, alloy_rpc_types_engine::PayloadStatusEnum::Valid)
 }
 
 /// The block hash in an encoded `NEW_PAYLOAD` frame
@@ -3899,6 +3901,20 @@ mod tests {
     use alloy_consensus::{Block, BlockBody, Header, Signed, TxEip1559, TxLegacy};
     use alloy_primitives::{Address, Signature, TxKind, U256};
     use reth_ethereum_primitives::TransactionSigned;
+
+    /// Audit 2026-10 round 2 (R2-I3): an INVALID answer is not kept for the
+    /// block's later requests. The registry keys on the hash the payload
+    /// names, and a body with the right header and other transactions is
+    /// INVALID under the honest block's hash: kept, it would answer the honest
+    /// body too.
+    #[test]
+    fn only_a_valid_verdict_answers_later_requests() {
+        use alloy_rpc_types_engine::PayloadStatusEnum;
+        assert!(settled_status(&PayloadStatusEnum::Valid));
+        assert!(!settled_status(&PayloadStatusEnum::Invalid { validation_error: "transactions root mismatch".into() }));
+        assert!(!settled_status(&PayloadStatusEnum::Syncing));
+        assert!(!settled_status(&PayloadStatusEnum::Accepted));
+    }
 
     /// A taken build with one transaction, filed and handed out of the store
     /// as `take` hands it to the own-block import, and its sealed header.

@@ -398,6 +398,40 @@ fn an_attested_frame_admits_0x50_on_its_key_and_counts_them() {
     assert_eq!(load(&STATS.altsig_txs), before.1, "no signature work");
 }
 
+/// Audit 2026-10 C-2: an attestation vouches for a frame's signatures, not
+/// for its keys' shape. A 0x50 whose algorithm, key length or key is one the
+/// verified path would refuse is dropped, not cached under the sender its
+/// bytes hash to.
+#[test]
+fn an_attested_frame_still_drops_a_0x50_with_a_misshapen_key() {
+    let _g = counter_lock();
+    n42_tx_types::set_alt_sig_enabled(true);
+    let reshaped = |nonce: u64, alg_type: u8, pubkey: Vec<u8>| {
+        let (mut tx, signature, _) = alt_tx(69, nonce).into_parts();
+        tx.alg_type = alg_type;
+        tx.pubkey = Bytes::from(pubkey);
+        AltSigTx::new(tx, signature)
+    };
+    let mut identity = vec![0u8; 32];
+    identity[0] = 1;
+    let bad = vec![
+        reshaped(70_700, ALG_ED25519 + 1, alt_tx(69, 0).tx().pubkey.to_vec()),
+        reshaped(70_701, ALG_ED25519, vec![7u8; 31]),
+        reshaped(70_702, ALG_ED25519, identity),
+    ];
+    let hashes: Vec<B256> = bad.iter().map(|tx| *tx.hash()).collect();
+    let before = (load(&STATS.attested_txs), load(&STATS.dropped_altsig));
+
+    let out = recover(bad.into_iter().map(N42PooledTxEnvelope::AltSig).collect(), Vec::new(), None, true);
+
+    assert!(out.is_empty(), "{} admitted", out.len());
+    for hash in &hashes {
+        assert_eq!(AltSigSenderCache::global().get(hash), None);
+    }
+    assert_eq!(load(&STATS.attested_txs), before.0);
+    assert_eq!(load(&STATS.dropped_altsig) - before.1, 3);
+}
+
 #[test]
 fn shard_mode_ignores_the_shard_without_claims() {
     let _g = counter_lock();

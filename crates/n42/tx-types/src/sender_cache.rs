@@ -213,6 +213,23 @@ pub fn trusting_mode_refusal(mode: IngestVerify, bench_unsafe: Option<&str>) -> 
     ))
 }
 
+/// Why a node must not start with frame gateways (`gateways`: whether
+/// `N42_FRAME_GATEWAYS` is set), or `None` when it may.
+///
+/// An attested frame's 0x50 transactions are admitted under the senders their
+/// keys derive without a signature check, on the word of the gateways'
+/// attestations -- and the bench gateway's secret derives from a public seed.
+/// That trusts more than `leader`, so the same acknowledgement gates it.
+pub fn frame_gateways_refusal(gateways: bool, bench_unsafe: Option<&str>) -> Option<String> {
+    if !gateways || bench_unsafe_acknowledged(bench_unsafe) {
+        return None;
+    }
+    Some(
+        "N42_FRAME_GATEWAYS admits 0x50 transactions on a gateway's attestation, without          verifying their signatures; it is a benchmark setting and is unsafe on a real chain.          Set N42_BENCH_UNSAFE=1 to run it anyway"
+            .to_owned(),
+    )
+}
+
 /// The ingest knobs that make this node trust what a frame says, by name,
 /// for the start-up warning: `mode` other than `all`, `direct`
 /// (`N42_TX_INGEST_DIRECT` set) and `gateways` (`N42_FRAME_GATEWAYS` set).
@@ -341,6 +358,20 @@ mod shard_tests {
         }
         assert_eq!(trusting_mode_refusal(IngestVerify::All, None), None);
         assert!(trusting_mode_refusal(shard, None).is_some_and(|why| why.contains("N42_BENCH_UNSAFE=1")));
+    }
+
+    /// Audit 2026-10 C-2: gateways admit 0x50 senders on an attestation,
+    /// which trusts more than `leader`; the same acknowledgement gates them.
+    #[test]
+    fn frame_gateways_need_the_bench_unsafe_ack() {
+        assert_eq!(frame_gateways_refusal(false, None), None);
+        for ack in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
+            assert!(
+                frame_gateways_refusal(true, ack).is_some_and(|why| why.contains("N42_BENCH_UNSAFE=1")),
+                "{ack:?}"
+            );
+        }
+        assert_eq!(frame_gateways_refusal(true, Some("1")), None);
     }
 
     #[test]

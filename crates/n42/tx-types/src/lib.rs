@@ -45,7 +45,7 @@ pub use rpc::{AltSigRpcReceipt, N42RpcReceipt};
 pub use sender_cache::{
     alt_sig_enabled, bench_unsafe_acknowledged, ed25519_batch_size, ingest_shard, ingest_verify_mode,
     parse_ingest_verify, senders_claimed_at_ingest, set_alt_sig_enabled, shard_owner,
-    trusting_ingest_knobs, trusting_mode_refusal, AltSigSenderCache, IngestVerify,
+    frame_gateways_refusal, trusting_ingest_knobs, trusting_mode_refusal, AltSigSenderCache, IngestVerify,
 };
 
 #[cfg(test)]

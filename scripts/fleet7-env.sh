@@ -160,6 +160,13 @@ f7_quorum() { echo $(( F7_NODES - (F7_NODES - 1) / 3 )); }
 case "${N42_INGEST_VERIFY:-}" in
   [Ll][Ee][Aa][Dd][Ee][Rr] | [Ss][Hh][Aa][Rr][Dd]) export N42_BENCH_UNSAFE=1 ;;
 esac
+# Frame gateways (N42_FRAME_GATEWAYS) admit 0x50 transactions on the bench
+# gateway's attestation, whose secret derives from a public seed: the node
+# refuses them without the ack too, and a gateway leg passes it on its own line.
+if [[ -n ${N42_FRAME_GATEWAYS+set} && ${N42_BENCH_UNSAFE:-} != 1 ]]; then
+  echo "fleet7-env: N42_FRAME_GATEWAYS is set; a gateway leg must also set N42_BENCH_UNSAFE=1." >&2
+  return 1 2>/dev/null || exit 1
+fi
 
 # ------------------------------------------------------------------- load ---
 # Transactions per second the fleet is offered, 0 for none. A fleet measured on

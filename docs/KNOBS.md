@@ -94,7 +94,7 @@ Status caveat: `adopted` follows the stage sets named above plus the X22 base se
 | `N42_THP_DISABLE` | off (1) | `1` | prctl PR_SET_THP_DISABLE for this process. | `bin/n42:main.rs:50` | bench-only |
 | `N42_TX_INGEST` | unset: ingest server off (value: SocketAddr) | see Default | Address of the transaction ingest server (unauthenticated; loopback). | `bin/n42:main.rs:802` | unknown |
 | `N42_TX_INGEST_ALLOW_REMOTE` | off (1 enables) | `1` | Allow the ingest server to bind off loopback; refused outright with `N42_TX_INGEST_DIRECT`, `N42_INGEST_VERIFY=shard|leader` or attested frames (audit/ingest-hardening). | `bin/n42:main.rs` | default |
-| `N42_BENCH_UNSAFE` | off (1 enables) | `1` | Start-up acknowledgement required before `N42_INGEST_VERIFY=shard|leader` is accepted (audit/ingest-hardening). | `bin/n42:main.rs` | bench-only |
+| `N42_BENCH_UNSAFE` | off (1 enables) | `1` | Start-up acknowledgement required before `N42_INGEST_VERIFY=shard|leader` or `N42_FRAME_GATEWAYS` is accepted (audit/ingest-hardening; gateways since audit 2026-10 C-2). | `bin/n42:main.rs` | bench-only |
 | `N42_TX_QUEUE` | off (any value enables) | presence only (`=0` still counts) | Enable the builder's tx queue (fed by ingest, pruned per canonical block). | `bin/n42:main.rs:607` | experimental |
 | `N42_TX_QUEUE_DRAINER` | off (any value enables) | presence only (`=0` still counts) | Drain the queue inbox off the builder thread. | `bin/n42:main.rs:609,620` | experimental |
 | `N42_VOTE_BEFORE_SLOT` | off (1) | `1` | Vote before the slot (held execution); incompatible with IMPORT_ONCE. | `bin/n42:import_once.rs:62; h2-execution:driver.rs:172` | experimental |
@@ -250,7 +250,7 @@ Status caveat: `adopted` follows the stage sets named above plus the X22 base se
 | `N42_ED25519_MERGE` | on (0 disables) | on unless `0` | Merged (single-equation) Ed25519 batch verification; 0 falls back to dalek verify_batch. | `tx-types:alt_sig.rs:414` | default |
 | `N42_FRAME_ATTEST_MIN` | 1 (only read when FRAME_GATEWAYS is set) | integer | Distinct gateways a frame needs (with FRAME_GATEWAYS). Bench-only: only meaningful with the bench gateway key of `N42_FRAME_GATEWAYS`. | `tx-types:frame.rs:231` | bench-only |
 | `N42_FRAME_BLOCKS` | off | `1` (or the knob's own value; see code) | N42_FRAME_BLOCKS=1, read once: this node builds, describes and checks frame-aligned blocks (phase B of step 1). Meaningful only on a chain whose ... X22 base set: `1`. Needs `frameBlocks` in the genesis. | `tx-types:frame.rs:88` | adopted |
-| `N42_FRAME_GATEWAYS` | unset: no gateway attestation | see Default | List of frame gateways whose attestation a frame needs. Bench-only: a trusted bench gateway key, not a product trust root. | `tx-types:frame.rs:230` | bench-only |
+| `N42_FRAME_GATEWAYS` | unset: no gateway attestation | see Default | List of frame gateways whose attestation a frame needs. Bench-only: a trusted bench gateway key, not a product trust root; the node refuses it without `N42_BENCH_UNSAFE=1`. | `tx-types:frame.rs:230` | bench-only |
 | `N42_INGEST_SHARD` | unset (required as i/n when INGEST_VERIFY=shard) | see Default | This node's i/n shard of ingest signature work (INGEST_VERIFY=shard). | `tx-types:sender_cache.rs:163` | unsafe-bench |
 | `N42_INGEST_VERIFY` | all (leader, shard) | see Default | N42_INGEST_VERIFY=leader, against the default all. The supply is a ceiling every member pays alike: each one ingests every transaction and veri... | `tx-types:sender_cache.rs:109,162` | unsafe-bench |
 

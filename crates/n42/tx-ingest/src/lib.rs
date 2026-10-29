@@ -2170,6 +2170,16 @@ where
                 }
                 continue;
             }
+            // The attestation vouches for the signature, not for the key:
+            // one the verified path would refuse (algorithm, length, a weak
+            // point) is dropped here too. A key-cache lookup, no signature.
+            if let Err(err) = alt_tx.tx().ed25519_key() {
+                STATS.dropped_altsig.fetch_add(1, Ordering::Relaxed);
+                if drop_warn_allowed() {
+                    warn!(target: "n42.tx_ingest", hash = %alt_tx.hash(), %err, "an attested 0x50 transaction with a key the type refuses");
+                }
+                continue;
+            }
             // The sender the key controls; cheap, no signature check.
             // Trusted on the gateways' attestation (see above).
             let sender = alt_tx.sender();

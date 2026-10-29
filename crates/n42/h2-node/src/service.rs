@@ -557,6 +557,9 @@ pub struct H2Service<E> {
     /// Fills and block-by-hash requests being served off the loop: their
     /// own share, so range pulls never refuse a vote-path fill.
     fill_slots: SharedServeSlots,
+    /// The bytes fill and block-by-hash replies may hold at once, in KiB
+    /// ([`MAX_FILL_SERVE_BYTES`]); their own budget, as `fill_slots` are.
+    fill_bytes: Arc<tokio::sync::Semaphore>,
     /// Every body this node built or received, as gov5 block RLP, to answer
     /// `block_by_hash` — gov5's fetch-on-miss, and this node's own. Bounded;
     /// insertion order in `body_store_order`.
@@ -701,6 +704,13 @@ const MAX_FILL_SERVES_PER_PEER: usize = 16;
 
 /// The same for all peers together.
 const MAX_FILL_SERVES_IN_FLIGHT: usize = 64;
+
+/// The bytes fill and block-by-hash replies may hold at once, from the reply
+/// until libp2p has sent it. A store hit took no slot and counted no bytes,
+/// so a peer asking for a 26 MB body over and over queued copies nothing
+/// bounded (audit 2026-10 R2-I6). Their own budget, so range pulls never
+/// spend what the vote path needs.
+const MAX_FILL_SERVE_BYTES: usize = 512 << 20;
 
 /// The most blocks one range reply carries: gov5's 1,024, so a gov5 member
 /// catching up from this node on a small-block chain is not slowed. The
@@ -1576,6 +1586,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             serve_slots: ServeSlots::shared(MAX_SERVES_PER_PEER, MAX_SERVES_IN_FLIGHT),
             serve_bytes: Arc::new(tokio::sync::Semaphore::new(MAX_SERVE_BYTES >> 10)),
             fill_slots: ServeSlots::shared(MAX_FILL_SERVES_PER_PEER, MAX_FILL_SERVES_IN_FLIGHT),
+            fill_bytes: Arc::new(tokio::sync::Semaphore::new(MAX_FILL_SERVE_BYTES >> 10)),
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
             elided_own: std::collections::HashMap::new(),
@@ -2640,7 +2651,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 match self.body_store.get(&hash).map(|body| body.to_shared()) {
                     Some(body) => {
                         debug!(target: "n42.h2.node", %peer, ?hash, "peer asked for a block; served from the store");
-                        self.transport.respond_block(channel, Some(body));
+                        self.respond_block_within_budget(channel, Some(body));
                     }
                     // A block this node took elided is fetched by its header
                     // on the next drain (it needs this loop's state).
@@ -2920,7 +2931,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         for (peer, hash, channel) in std::mem::take(&mut self.pending_block_requests) {
             let body = self.queued_body(hash).await;
             debug!(target: "n42.h2.node", peer, ?hash, found = body.is_some(), "peer asked for a block taken elided");
-            self.transport.respond_block(channel, body);
+            self.respond_block_within_budget(channel, body);
         }
         while let Ok(served) = self.served_txns.1.try_recv() {
             self.respond_served(served);
@@ -5090,7 +5101,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             Served::Txns(served) => self.respond_served_txns(served),
             Served::Block { peer, hash, channel, body } => {
                 debug!(target: "n42.h2.node", %peer, ?hash, found = body.is_some(), "peer asked for a block; execution layer consulted");
-                self.transport.respond_block(channel, body);
+                self.respond_block_within_budget(channel, body);
             }
             Served::Range { peer, request, channel, mut range, slot } => {
                 debug!(target: "n42.h2.node", %peer, ?request, served = range.rlps.len(), short_of_budget = range.short_of_budget, "peer asked for a range");
@@ -5116,7 +5127,44 @@ impl<E: ExecutionLayer> H2Service<E> {
             waited_ms = ready_at.elapsed().as_millis() as u64,
             "served a peer the transactions it was missing"
         );
-        self.transport.respond_block_txns(channel, reply);
+        let Ok(txns) = reply else {
+            self.transport.respond_block_txns(channel, reply);
+            return;
+        };
+        let bytes = txns.iter().map(|tx| tx.len()).sum();
+        match reply_permit(&self.fill_bytes, bytes) {
+            Some(permit) => {
+                self.transport.respond_block_txns_holding(channel, Ok(txns), n42_h2_net::ServeGuard::new(permit));
+            }
+            None => {
+                debug!(target: "n42.h2.node", %peer, ?hash, bytes, "fill byte budget spent; fill refused");
+                self.transport.respond_block_txns(channel, Err("server busy".to_owned()));
+            }
+        }
+    }
+
+    /// Answers a block request within [`MAX_FILL_SERVE_BYTES`]: the reply
+    /// holds its share until libp2p has sent it, and one the budget cannot
+    /// cover now is answered "not found", which sends the asker to another
+    /// peer (audit 2026-10 R2-I6).
+    fn respond_block_within_budget(
+        &mut self,
+        channel: n42_h2_net::BlockRequestChannel,
+        body: Option<alloy_primitives::Bytes>,
+    ) {
+        let Some(body) = body else {
+            self.transport.respond_block(channel, None);
+            return;
+        };
+        match reply_permit(&self.fill_bytes, body.len()) {
+            Some(permit) => {
+                self.transport.respond_block_holding(channel, Some(body), n42_h2_net::ServeGuard::new(permit));
+            }
+            None => {
+                debug!(target: "n42.h2.node", bytes = body.len(), "fill byte budget spent; block request refused");
+                self.transport.respond_block(channel, None);
+            }
+        }
     }
 
     /// Asks the next peer for a fill this one could not answer, and only
@@ -5773,6 +5821,14 @@ struct ServedRange {
     held: Option<tokio::sync::OwnedSemaphorePermit>,
     /// The budget ran out before the reply was complete.
     short_of_budget: bool,
+}
+
+/// A share of `budget` (KiB permits) for a reply of `bytes`, or none while
+/// the budget cannot cover it. A reply larger than the whole budget asks
+/// for all of it rather than never being served.
+fn reply_permit(budget: &Arc<tokio::sync::Semaphore>, bytes: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let kib = bytes.div_ceil(1024).clamp(1, MAX_FILL_SERVE_BYTES >> 10);
+    Arc::clone(budget).try_acquire_many_owned(u32::try_from(kib).unwrap_or(u32::MAX)).ok()
 }
 
 /// Whether a range reply holding `blocks` blocks of `bytes` takes one more

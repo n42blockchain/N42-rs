@@ -83,6 +83,10 @@ pub(crate) enum Command {
     /// A range refused with the protocol's server-error code.
     RespondRangeError(RangeRequestChannel, String),
     RespondBlock(BlockRequestChannel, Option<alloy_primitives::Bytes>),
+    /// A block reply whose guard is held until it is sent.
+    RespondBlockHolding(BlockRequestChannel, Option<alloy_primitives::Bytes>, crate::transport::ServeGuard),
+    /// A named-transactions reply whose guard is held until it is sent.
+    RespondTxnsHolding(BlockTxnsChannel, BlockTxnsReply, crate::transport::ServeGuard),
     PushBlock(PeerId, alloy_primitives::Bytes),
     /// A direct vote (or hello) for one peer; see [`crate::rpc::VOTE_PROTOCOL`].
     SendVote(PeerId, crate::rpc::VoteRequest),
@@ -296,6 +300,8 @@ fn apply(core: &mut TransportCore, command: Command) {
         Command::RespondRangeHolding(channel, rlps, guard) => core.respond_range_holding(channel, rlps, guard),
         Command::RespondRangeError(channel, message) => core.respond_range_error(channel, message),
         Command::RespondBlock(channel, rlp) => core.respond_block(channel, rlp),
+        Command::RespondBlockHolding(channel, rlp, guard) => core.respond_block_holding(channel, rlp, guard),
+        Command::RespondTxnsHolding(channel, reply, guard) => core.respond_block_txns_holding(channel, reply, guard),
         Command::PushBlock(peer, rlp) => core.push_block(peer, rlp),
         Command::SendVote(peer, request) => core.send_vote(peer, request),
         Command::Disconnect(peer) => core.disconnect(peer),

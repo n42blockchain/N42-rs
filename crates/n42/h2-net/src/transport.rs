@@ -168,7 +168,7 @@ impl TransportConfig {
 
 /// Where the answer to a [`TransportEvent::BlockRequest`] goes.
 #[derive(Debug)]
-pub struct BlockRequestChannel(request_response::ResponseChannel<BlockReply>);
+pub struct BlockRequestChannel(request_response::ResponseChannel<BlockReply>, request_response::InboundRequestId);
 
 /// Where the answer to a [`TransportEvent::RangeRequest`] goes.
 #[derive(Debug)]
@@ -197,7 +197,7 @@ impl std::fmt::Debug for ServeGuard {
 
 /// Where an answer to a named-transactions request goes.
 #[derive(Debug)]
-pub struct BlockTxnsChannel(request_response::ResponseChannel<BlockTxnsReply>);
+pub struct BlockTxnsChannel(request_response::ResponseChannel<BlockTxnsReply>, request_response::InboundRequestId);
 
 /// What the transport saw.
 #[derive(Debug)]
@@ -469,6 +469,10 @@ pub(crate) struct TransportCore {
     /// What each range reply handed to libp2p holds until it is sent
     /// (audit 2026-10 B-4).
     range_guards: HashMap<request_response::InboundRequestId, ServeGuard>,
+    /// The same for block-by-hash replies (audit 2026-10 R2-I6).
+    block_guards: HashMap<request_response::InboundRequestId, ServeGuard>,
+    /// The same for named-transactions replies (audit 2026-10 R2-I6).
+    txns_guards: HashMap<request_response::InboundRequestId, ServeGuard>,
 }
 
 impl TransportCore {
@@ -597,6 +601,8 @@ impl TransportCore {
             advertised_height: 0,
             statused: HashSet::new(),
             range_guards: HashMap::new(),
+            block_guards: HashMap::new(),
+            txns_guards: HashMap::new(),
         })
     }
 
@@ -719,6 +725,15 @@ impl TransportCore {
         let _ = self.swarm.behaviour_mut().block_txns.send_response(channel.0, reply);
     }
 
+    /// [`Self::respond_block_txns`], holding `guard` until libp2p has sent
+    /// the reply (audit 2026-10 R2-I6).
+    pub fn respond_block_txns_holding(&mut self, channel: BlockTxnsChannel, reply: BlockTxnsReply, guard: ServeGuard) {
+        let id = channel.1;
+        if self.swarm.behaviour_mut().block_txns.send_response(channel.0, reply).is_ok() {
+            self.txns_guards.insert(id, guard);
+        }
+    }
+
     /// Answers a [`TransportEvent::RangeRequest`] with the blocks this node
     /// has, in order — as many as it could find from the start, which is
     /// how gov5 serves a range it only partly holds.
@@ -803,6 +818,24 @@ impl TransportCore {
         };
         // A closed channel means the peer went away; nothing to do about it.
         let _ = self.swarm.behaviour_mut().blocks.send_response(channel.0, reply);
+    }
+
+    /// [`Self::respond_block`], holding `guard` until libp2p has sent the
+    /// reply (audit 2026-10 R2-I6).
+    pub fn respond_block_holding(
+        &mut self,
+        channel: BlockRequestChannel,
+        rlp: Option<alloy_primitives::Bytes>,
+        guard: ServeGuard,
+    ) {
+        let id = channel.1;
+        let reply = match rlp {
+            Some(rlp) => Ok(BlockChunk { fork_digest: self.our_status().fork_digest(), rlp }),
+            None => Err("block not found".to_owned()),
+        };
+        if self.swarm.behaviour_mut().blocks.send_response(channel.0, reply).is_ok() {
+            self.block_guards.insert(id, guard);
+        }
     }
 
     /// Publishes a compressed transaction batch on the chain's transaction
@@ -949,12 +982,12 @@ impl TransportCore {
                     request_response::Event::Message { peer, message, .. },
                 )) => match message {
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id, request, channel,
                     } => {
                         return Some(TransportEvent::BlockRequest {
                             peer,
                             hash: request,
-                            channel: BlockRequestChannel(channel),
+                            channel: BlockRequestChannel(channel, request_id),
                         });
                     }
                     request_response::Message::Response {
@@ -985,6 +1018,12 @@ impl TransportCore {
                             reason: error.to_string(),
                         });
                     }
+                }
+                SwarmEvent::Behaviour(H2BehaviourEvent::Blocks(
+                    request_response::Event::ResponseSent { request_id, .. }
+                    | request_response::Event::InboundFailure { request_id, .. },
+                )) => {
+                    self.block_guards.remove(&request_id);
                 }
                 SwarmEvent::Behaviour(H2BehaviourEvent::Blocks(_)) => {}
                 SwarmEvent::Behaviour(H2BehaviourEvent::Pushes(
@@ -1071,11 +1110,11 @@ impl TransportCore {
                 SwarmEvent::Behaviour(H2BehaviourEvent::BlockTxns(
                     request_response::Event::Message { peer, message, .. },
                 )) => match message {
-                    request_response::Message::Request { request, channel, .. } => {
+                    request_response::Message::Request { request_id, request, channel } => {
                         return Some(TransportEvent::BlockTxnsRequested {
                             peer,
                             request,
-                            channel: BlockTxnsChannel(channel),
+                            channel: BlockTxnsChannel(channel, request_id),
                         });
                     }
                     request_response::Message::Response { request_id, response } => {
@@ -1094,6 +1133,12 @@ impl TransportCore {
                             reply: Err(error.to_string()),
                         });
                     }
+                }
+                SwarmEvent::Behaviour(H2BehaviourEvent::BlockTxns(
+                    request_response::Event::ResponseSent { request_id, .. }
+                    | request_response::Event::InboundFailure { request_id, .. },
+                )) => {
+                    self.txns_guards.remove(&request_id);
                 }
                 SwarmEvent::Behaviour(H2BehaviourEvent::BlockTxns(_)) => {}
                 SwarmEvent::Behaviour(H2BehaviourEvent::Votes(
@@ -1447,6 +1492,15 @@ impl H2V4Transport {
         }
     }
 
+    /// Answers a named-transactions request, holding `guard` until the reply
+    /// is sent.
+    pub fn respond_block_txns_holding(&mut self, channel: BlockTxnsChannel, reply: BlockTxnsReply, guard: ServeGuard) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.respond_block_txns_holding(channel, reply, guard),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::RespondTxnsHolding(channel, reply, guard)),
+        }
+    }
+
     /// Answers a [`TransportEvent::RangeRequest`] with the blocks this node
     /// has, in order — as many as it could find from the start, which is
     /// how gov5 serves a range it only partly holds.
@@ -1524,6 +1578,19 @@ impl H2V4Transport {
         match &mut self.inner {
             Inner::Inline(core) => core.respond_block(channel, rlp),
             Inner::OffLoop(off) => off.command(crate::pump::Command::RespondBlock(channel, rlp)),
+        }
+    }
+
+    /// Answers a block request, holding `guard` until the reply is sent.
+    pub fn respond_block_holding(
+        &mut self,
+        channel: BlockRequestChannel,
+        rlp: Option<alloy_primitives::Bytes>,
+        guard: ServeGuard,
+    ) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.respond_block_holding(channel, rlp, guard),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::RespondBlockHolding(channel, rlp, guard)),
         }
     }
 

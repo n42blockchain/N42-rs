@@ -249,3 +249,87 @@ async fn a_range_replys_guard_is_held_until_the_reply_is_sent() {
     .expect("the guard is released once the reply is sent");
     server_task.abort();
 }
+
+/// Audit 2026-10 R2-I6: a block-by-hash reply and a named-transactions
+/// reply hold their guard (the server's byte budget) until libp2p has sent
+/// them, as a range reply does (B-4). A whole body is tens of megabytes: a
+/// slow reader asking for it again and again otherwise queued copies
+/// nothing counted.
+#[tokio::test]
+async fn block_and_fill_replies_hold_their_guard_until_sent() {
+    for fill in [false, true] {
+        guard_held_until_sent(fill).await;
+    }
+}
+
+async fn guard_held_until_sent(fill: bool) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Flag(Arc<AtomicBool>);
+    impl Drop for Flag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let loopback: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let mut server = H2V4Transport::new(TransportConfig::new(IDENTITY).with_listen_addr(loopback.clone())).unwrap();
+    let server_addr = listening(&mut server).await;
+    let mut client =
+        H2V4Transport::new(TransportConfig::new(IDENTITY).with_listen_addr(loopback).with_peer(server_addr)).unwrap();
+    let server_id = *server.local_peer_id();
+
+    let released = Arc::new(AtomicBool::new(false));
+    let held_after_respond = Arc::new(AtomicBool::new(false));
+    let (server_released, server_held) = (released.clone(), held_after_respond.clone());
+    let server_task = tokio::spawn(async move {
+        loop {
+            match server.next_event().await {
+                Some(TransportEvent::BlockRequest { channel, .. }) => {
+                    let guard = n42_h2_net::ServeGuard::new(Flag(server_released.clone()));
+                    server.respond_block_holding(channel, Some(vec![0xc1, 1].into()), guard);
+                    server_held.store(!server_released.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+                Some(TransportEvent::BlockTxnsRequested { channel, .. }) => {
+                    let guard = n42_h2_net::ServeGuard::new(Flag(server_released.clone()));
+                    server.respond_block_txns_holding(channel, Ok(vec![vec![0x01].into()]), guard);
+                    server_held.store(!server_released.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+                Some(_) => {}
+                None => return,
+            }
+        }
+    });
+
+    let mut asked = false;
+    let hash = B256::repeat_byte(0x16);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match client.next_event().await {
+                Some(TransportEvent::StatusExchanged { peer, .. }) if peer == server_id && !asked => {
+                    asked = true;
+                    if fill {
+                        client.request_block_txns(server_id, n42_h2_net::BlockTxnsRequest { hash, indices: vec![0] });
+                    } else {
+                        client.request_block(server_id, hash);
+                    }
+                }
+                Some(TransportEvent::BlockFetched { .. } | TransportEvent::BlockTxnsFetched { .. }) => return,
+                Some(_) => {}
+                None => panic!("client transport ended"),
+            }
+        }
+    })
+    .await
+    .expect("a reply within the budget");
+    assert!(held_after_respond.load(Ordering::SeqCst), "fill {fill}: the guard is held while the reply waits to be sent");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !released.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the guard is released once the reply is sent");
+    server_task.abort();
+}

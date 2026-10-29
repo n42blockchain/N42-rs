@@ -1400,3 +1400,20 @@ async fn awaited_and_held_blocks_are_bounded_aged_out_and_dropped_with_their_evi
     assert_eq!(rig.svc.held_bodies, vec![held_fresh], "the evicted body is no longer held");
     assert!(!rig.svc.held_since.contains_key(&held_stale));
 }
+
+/// Audit 2026-10 R2-I6: fill and block-by-hash replies draw on their own
+/// byte budget, held until the reply is dropped (by the transport, once
+/// sent); a reply the budget cannot cover now is refused, not queued.
+#[test]
+fn fill_and_block_replies_draw_on_a_byte_budget_held_until_dropped() {
+    let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(30 << 10));
+    let body = reply_permit(&budget, 26 << 20).expect("one 26 MB body fits");
+    assert_eq!(budget.available_permits(), 4 << 10, "held while the reply is");
+    assert!(reply_permit(&budget, 26 << 20).is_none(), "a second does not, while the first is held");
+    let small = reply_permit(&budget, 100).expect("a small fill still fits");
+    drop(body);
+    assert_eq!(budget.available_permits(), (30 << 10) - 1, "given back with the reply");
+    drop(small);
+    let whole = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_FILL_SERVE_BYTES >> 10));
+    assert!(reply_permit(&whole, usize::MAX).is_some(), "a reply larger than the budget takes all of it, once");
+}

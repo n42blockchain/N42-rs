@@ -1402,6 +1402,23 @@ fn the_synchronous_checkpoint_waits_for_a_running_compaction() {
     assert_eq!(std::fs::read(state.ckpt_path()).expect("the checkpoint"), before, "the checkpoint was rewritten mid-compaction");
 }
 
+/// Audit 2026-10 round 2 (R2-Q5): the historical root a restart rebuilds
+/// for the deferred parent (it goes into the next header) is checked against
+/// the root recorded when that block was persisted, as the head's is.
+#[test]
+fn a_rebuilt_historical_root_is_checked_against_its_record() {
+    for entry_file in [true, false] {
+        let (state, _, _, _, _) = node_at(&format!("historical-root-record-{entry_file}"), entry_file, 3);
+        let root = state.persisted_state_root(2, hash_of(2)).expect("block 2's root");
+        HeadRoots::write(&state.head_roots_path(), &[(2, hash_of(2), B256::repeat_byte(0xee))]).expect("a wrong record");
+        let err = state.persisted_state_root(2, hash_of(2)).expect_err("the record disagrees");
+        assert!(
+            matches!(err, NodeStateError::RestoredRootMismatch { number: 2, restored, .. } if restored == root),
+            "entry file {entry_file}: {err}"
+        );
+    }
+}
+
 /// Audit 2026-10 D-4: a move below the persisted head rewrites the entry
 /// file's slots before any delta says so. A process that dies there leaves
 /// the log on the old branch and the entries on the new one; the restart

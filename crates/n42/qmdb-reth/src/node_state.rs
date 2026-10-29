@@ -2221,7 +2221,28 @@ impl QmdbNodeState {
     /// Call at startup, before persistence and compaction tasks are running.
     /// Entry-file reconstruction must be read-only: opening an older prefix for
     /// normal recovery would truncate entries belonging to the database head.
+    ///
+    /// The rebuilt root is compared with the one recorded when the block was
+    /// persisted (`forest.roots`), as a restart's head root is: it goes into
+    /// the next header under deferred execution (audit 2026-10 round 2,
+    /// R2-Q5). No record, or an unreadable one, skips the comparison.
     pub fn persisted_state_root(&self, number: u64, hash: B256) -> Result<B256, NodeStateError> {
+        let restored = self.rebuild_persisted_state_root(number, hash)?;
+        match HeadRoots::read(&self.head_roots_path(), number, hash) {
+            Ok(Some(recorded)) if recorded != restored => {
+                tracing::error!(target: "n42.qmdb", block = number, %hash, %recorded, %restored, "the rebuilt historical QMDB root disagrees with its record");
+                Err(NodeStateError::RestoredRootMismatch { number, hash, recorded, restored })
+            }
+            Ok(_) => Ok(restored),
+            Err(error) => {
+                warn!(target: "n42.qmdb", %error, block = number, "forest.roots could not be read; the historical root goes unchecked");
+                Ok(restored)
+            }
+        }
+    }
+
+    /// [`Self::persisted_state_root`] without the record check.
+    fn rebuild_persisted_state_root(&self, number: u64, hash: B256) -> Result<B256, NodeStateError> {
         let unavailable = || NodeStateError::RecoveryFrontier(format!("no persisted root for block {number} ({hash})"));
         if let Some(mut checkpoint) = read_ckpt(&self.ckpt_path())? {
             if checkpoint.version != ForestCheckpoint::VERSION {

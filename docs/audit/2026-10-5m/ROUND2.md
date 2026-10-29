@@ -50,3 +50,4 @@
 | R2-Q4, R2-R4 | 已修:`logged_slots` 水位(取走/量出 delta 时设置),`move_to` 只在切到已记日志的槽位以下时 fsync;取走 delta 的同一次持锁里清簿记,去掉第二次持锁与移动计数比较(热路径少一次加锁)。测试 `only_a_cut_below_the_logged_slots_syncs_the_entry_file`、`a_build_between_the_persistence_holds_keeps_only_its_own_bookkeeping` 修复前失败 |
 | R2-Q3 | 已修:`rewrite_checkpoint` 先查 `compacting` 再走同步路径;测试 `the_synchronous_checkpoint_waits_for_a_running_compaction` 修复前失败 |
 | R2-Q2 | 已修:`QmdbForest::canonical_at`,头高于持久块时核对该块在规范链上(记录不够远时仍按高度);测试 `the_persist_hook_refuses_a_block_off_the_canonical_chain` 修复前失败 |
+| R2-Q5 | 已修:`persisted_state_root` 重建的根与 `forest.roots` 记录比对,不符返回 `RestoredRootMismatch`;测试 `a_rebuilt_historical_root_is_checked_against_its_record` 修复前失败 |

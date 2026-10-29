@@ -147,6 +147,31 @@ async fn a_range_reply_is_imported_in_order_then_the_pull_probes_past_the_target
     assert_eq!(rig.svc.failed_peer, None, "a complete pull clears the blame");
 }
 
+/// Audit 2026-10 round 2 (R2-I2): a peer's status height is not certified,
+/// and a peer that serves full windows of blocks it made up keeps a probe
+/// going for ever, moving the execution layer's head onto its chain. Past
+/// [`MAX_UNPROVEN_PAST_COMMITTED`] blocks above what consensus committed, a
+/// pulled block nothing proves ends the pull and the peer is refused for the
+/// gap; below it (or with nothing committed yet) the pull runs as before.
+#[tokio::test]
+async fn a_pull_far_past_the_committed_height_stops_at_the_first_unproven_block() {
+    let mut rig = node(1, 0, None).await;
+    let peer = PeerId::random();
+    let total = MAX_UNPROVEN_PAST_COMMITTED + 6;
+    let blocks = chain(total);
+    rig.svc.committed_height = Some(0);
+    catching_up(&mut rig, peer, 1, total);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: total, step: 1 }, chunks(&blocks)));
+    let mut events = Vec::new();
+    for _ in 0..total.div_ceil(PULLED_BLOCKS_PER_STEP as u64) {
+        events.extend(import(&mut rig).await);
+    }
+    assert_eq!(rig.svc.imported.len() as u64, MAX_UNPROVEN_PAST_COMMITTED, "up to the bound");
+    assert!(rig.svc.catch_up.is_none(), "the pull ended");
+    assert!(rig.svc.refused_range_peers.contains_key(&peer), "and the peer is not asked for the gap again");
+    assert!(events.contains(&ServiceEvent::Synced { height: MAX_UNPROVEN_PAST_COMMITTED, complete: false }), "{events:?}");
+}
+
 #[tokio::test]
 async fn a_short_reply_before_the_target_asks_for_the_rest() {
     let mut rig = node(1, 0, None).await;

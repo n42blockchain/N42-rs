@@ -1032,6 +1032,13 @@ const MAX_TRANSPORT_DRAIN: usize = 256;
 /// guards on far-ahead blocks and unimported commits make safe.
 const PULLED_BLOCKS_PER_STEP: usize = 32;
 
+/// How far past the committed height a pull may import blocks nothing proves
+/// (no header QC this node can verify): past it the pull ends at the first
+/// such block and its peer is refused for the gap (audit 2026-10 round 2,
+/// R2-I2). Honest blocks that far up carry a verifiable QC; a cold node with
+/// nothing committed yet is not bounded.
+const MAX_UNPROVEN_PAST_COMMITTED: u64 = 64;
+
 /// How many block bodies to keep for peers that ask. gov5 asks for the
 /// parent of a block it cannot place and for the block a proposal names —
 /// recent blocks, both — but a member restarting after a long absence walks
@@ -4403,6 +4410,18 @@ impl<E: ExecutionLayer> H2Service<E> {
                         return;
                     }
                 };
+                if proven.is_none()
+                    && self.committed_height.is_some_and(|committed| number > committed.saturating_add(MAX_UNPROVEN_PAST_COMMITTED))
+                {
+                    warn!(
+                        target: "n42.h2.node",
+                        %peer, number, committed = ?self.committed_height,
+                        "peer served a block far past the committed height that nothing proves; the pull stops and the peer is not asked for this gap again"
+                    );
+                    self.refused_range_peers.insert(peer, number);
+                    self.finish_catch_up(events, false);
+                    return;
+                }
                 match self.driver.import_pulled(block.execution_data()).await {
                     Ok(_) => {
                         // A verified header QC proves the chain up to the

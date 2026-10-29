@@ -453,11 +453,9 @@ fn verify_qc(
     }
 }
 
+/// Both spellings of the genesis QC: the wire's empty bitmap and `[0, 0]`.
 fn is_canonical_genesis_qc(qc: &H2QuorumCertificate) -> bool {
-    qc.view == 0
-        && qc.block_hash == B256::ZERO
-        && qc.aggregate_signature.is_empty()
-        && qc.signers_bitmap == [0, 0]
+    crate::wire_bridge::is_genesis_qc(qc)
 }
 
 fn signer_indices(
@@ -496,6 +494,19 @@ fn canonical_signer_indices(qc: &H2QuorumCertificate, expected_count: usize) -> 
 
 #[cfg(test)]
 mod tests {
+    /// Audit 2026-10 A-6: the wire codec carries the genesis QC with an
+    /// empty bitmap, so that spelling is the genesis QC here too.
+    #[test]
+    fn the_genesis_qc_is_recognised_in_its_wire_spelling() {
+        let wire = n42_h2_wire::h2_wire::H2QuorumCertificate {
+            view: 0,
+            block_hash: alloy_primitives::B256::ZERO,
+            aggregate_signature: Vec::new(),
+            signers_bitmap: Vec::new(),
+        };
+        assert!(super::is_canonical_genesis_qc(&wire));
+    }
+
     use super::*;
     use alloy_primitives::{Address, B256};
     use crate::ValidatorInfo;

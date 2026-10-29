@@ -4225,6 +4225,51 @@ mod tests {
         }
     }
 
+    /// A view-0 QC naming an arbitrary block: the shape audit 2026-10 A-6
+    /// says must never pass for the genesis QC.
+    fn forged_view_zero_qc() -> QuorumCertificate {
+        QuorumCertificate {
+            block_hash: B256::repeat_byte(0xAB),
+            ..QuorumCertificate::genesis()
+        }
+    }
+
+    #[test]
+    fn test_proposal_justified_by_a_non_genesis_view_zero_qc_is_refused() {
+        let (probe, ..) = make_engine(4, 0);
+        let leader = probe.leader_index_for_view(1);
+        let (mut engine, sks, _vs, _rx) = make_engine(4, (leader + 1) % 4);
+        let mut proposal =
+            signed_test_proposal(1, B256::repeat_byte(0xC1), leader, &sks[leader as usize]);
+        proposal.justify_qc = forged_view_zero_qc();
+        let err = engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .expect_err("a view-0 QC that is not genesis justifies nothing");
+        assert!(matches!(err, crate::error::ConsensusError::InvalidQC { view: 0, .. }), "{err:?}");
+    }
+
+    #[test]
+    fn test_timeout_carrying_a_non_genesis_view_zero_qc_is_refused() {
+        use crate::protocol::quorum::timeout_signing_message;
+        use n42_h2_primitives::consensus::TimeoutMessage;
+
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        let view = 1u64;
+        engine.on_timeout().expect("timeout should succeed");
+        while rx.try_recv().is_ok() {}
+
+        let timeout = TimeoutMessage {
+            view,
+            high_qc: forged_view_zero_qc(),
+            sender: 2,
+            signature: sks[2].sign(&timeout_signing_message(view)),
+        };
+        let err = engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout)))
+            .expect_err("a view-0 QC that is not genesis is no high QC");
+        assert!(matches!(err, crate::error::ConsensusError::InvalidQC { view: 0, .. }), "{err:?}");
+    }
+
     #[test]
     fn test_process_timeout_rejects_invalid_signature() {
         use crate::protocol::quorum::timeout_signing_message;

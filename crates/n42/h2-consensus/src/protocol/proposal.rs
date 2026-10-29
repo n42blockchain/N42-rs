@@ -356,7 +356,8 @@ impl ConsensusEngine {
 
         // Verify the justify_qc's aggregate BLS signature to prevent a Byzantine leader
         // from injecting a forged QC that manipulates honest nodes' locked_qc.
-        // Genesis QC (view 0) is exempt — it has no real aggregate signatures.
+        // The genesis QC (view 0) is exempt — it has no real aggregate
+        // signature — and is the only QC allowed to name view 0.
         // Uses verify_qc_any_domain_or_known because justify_qc may be either a
         // prepare QC or commit QC. Exact locally persisted QCs remain usable after
         // restart even when their validator-changes signing-domain cache is empty.
@@ -369,6 +370,11 @@ impl ConsensusEngine {
                     );
                     e
                 })?;
+        } else if !crate::wire_bridge::is_engine_genesis_qc(&proposal.justify_qc) {
+            return Err(ConsensusError::InvalidQC {
+                view: 0,
+                reason: "a view-0 justify QC that is not the genesis QC".to_string(),
+            });
         }
 
         if !self.round_state.is_safe_to_vote(&proposal.justify_qc) {

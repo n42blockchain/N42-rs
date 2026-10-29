@@ -181,6 +181,12 @@ impl ConsensusEngine {
         qc: &n42_h2_primitives::consensus::QuorumCertificate,
     ) -> ConsensusResult<()> {
         if qc.view == 0 {
+            if !crate::wire_bridge::is_engine_genesis_qc(qc) {
+                return Err(crate::error::ConsensusError::InvalidQC {
+                    view: 0,
+                    reason: "a view-0 QC that is not the genesis QC".to_string(),
+                });
+            }
             // Only accept a genesis QC if our own locked_qc is still at genesis.
             // Once we have advanced past genesis, any incoming view=0 QC is suspicious.
             if self.round_state.locked_qc().view == 0 {

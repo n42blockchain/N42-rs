@@ -37,7 +37,12 @@
 //! head (in either storage mode) is restored from the archived pair under
 //! `recovery-archive/fold-<number>-<hash>-*`: the checkpoint the fold replaced
 //! and the segment it folded. An archive retires at a later fold once the
-//! database's durable head has passed its fold head. The
+//! database's durable head has passed its fold head by
+//! [`ARCHIVE_RETIRE_MARGIN`] blocks: the durable head is read from MDBX's
+//! `Finish` checkpoint, which an unwind moves back and which, under
+//! `--db.sync-mode safe-no-sync`, a power cut can move back too (the default
+//! sync mode is durable); an unwind deeper than the margin past a retired
+//! archive's head leaves a restart that is refused. The
 //! `recovery-archive/rollback-<number>-<hash>-*` pair a restart below the
 //! checkpoint leaves (the future checkpoint and logs it set aside) retires by
 //! the same rule, against the database head it rolled back to.
@@ -2270,8 +2275,9 @@ impl QmdbNodeState {
             let entry = entry.map_err(|source| NodeStateError::Io { path: root.clone(), source })?;
             let name = entry.file_name();
             let Some(number) = archive_label_number(&name.to_string_lossy()) else { continue };
-            // Retain the database head's parent frontier as well as its head.
-            if number.checked_add(1).is_none_or(|parent_boundary| parent_boundary >= durable) { continue; }
+            // Retain the database head's parent frontier as well as its head,
+            // and the margin an unwind could take it back by.
+            if number.checked_add(1 + ARCHIVE_RETIRE_MARGIN).is_none_or(|boundary| boundary >= durable) { continue; }
             retired.push((number, entry.path()));
         }
         // Oldest first, so an interrupted pass leaves the newest history.
@@ -3826,6 +3832,11 @@ fn archive_label_number(name: &str) -> Option<u64> {
     suffix.split('-').next()?.parse().ok()
 }
 
+/// How many blocks past an archive's head the durable head must be before the
+/// archive retires: the depth an unwind (or a `safe-no-sync` power cut) can
+/// take the database back and still find the archive it restarts from.
+const ARCHIVE_RETIRE_MARGIN: u64 = 64;
+
 /// Whether the log has grown to the point where the checkpoint is rewritten.
 fn checkpoint_due(cursor: &PersistCursor) -> bool {
     cursor.log_len >= cursor.checkpoint_len.saturating_mul(checkpoint_ratio())
@@ -4354,6 +4365,9 @@ mod tests {
         assert!(reader.archived_heap_snapshot((1, hashes[0])).unwrap().is_some(), "database parent may still need the folded segment");
         durable.store(6, std::sync::atomic::Ordering::Relaxed);
         reader.prune_heap_archives().unwrap();
+        assert!(reader.archived_heap_snapshot((1, hashes[0])).unwrap().is_some(), "within the unwind margin");
+        durable.store(6 + ARCHIVE_RETIRE_MARGIN, std::sync::atomic::Ordering::Relaxed);
+        reader.prune_heap_archives().unwrap();
         assert!(reader.archived_heap_snapshot((1, hashes[0])).unwrap().is_none(), "covered compaction history can retire");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -4409,15 +4423,42 @@ mod tests {
         // No durable boundary: nothing is guessed away.
         state.prune_heap_archives().unwrap();
         assert_eq!(archived().len(), 5);
-        let durable = Arc::new(std::sync::atomic::AtomicU64::new(4));
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(4 + ARCHIVE_RETIRE_MARGIN));
         let boundary = durable.clone();
         state.set_durable_head_reader(move || Some(boundary.load(std::sync::atomic::Ordering::Relaxed)));
         state.prune_heap_archives().unwrap();
-        // Block 3 is the durable head's parent and stays, as for a fold.
+        // Block 3 is the durable head's parent (less the margin) and stays, as for a fold.
         assert_eq!(archived(), vec![("rollback".to_owned(), 3), ("rollback".to_owned(), 5)]);
-        durable.store(7, std::sync::atomic::Ordering::Relaxed);
+        durable.store(7 + ARCHIVE_RETIRE_MARGIN, std::sync::atomic::Ordering::Relaxed);
         state.prune_heap_archives().unwrap();
         assert!(archived().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Audit 2026-10 D-7: the durable head can move back (an unwind, or
+    /// MDBX's `safe-no-sync` after a power cut), so an archive is retired
+    /// only once the durable head is a margin past it.
+    #[test]
+    fn an_archive_outlives_the_durable_head_by_a_margin() {
+        let chain = deferred_chain();
+        let dir = scratch("archive-margin");
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, false);
+        state.initialize((0, chain.genesis_hash())).unwrap();
+        let log = state.delta_log_path();
+        std::fs::write(&log, "a log").unwrap();
+        state.archive_heap_pair(&format!("fold-{:020}-{:x}", 10, B256::repeat_byte(0xa)), &log).unwrap();
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(12));
+        let boundary = durable.clone();
+        state.set_durable_head_reader(move || Some(boundary.load(std::sync::atomic::Ordering::Relaxed)));
+        let kept = || std::fs::read_dir(dir.join("recovery-archive")).unwrap().count();
+        state.prune_heap_archives().unwrap();
+        assert_eq!(kept(), 1, "two blocks past it is within the margin");
+        durable.store(11 + ARCHIVE_RETIRE_MARGIN, std::sync::atomic::Ordering::Relaxed);
+        state.prune_heap_archives().unwrap();
+        assert_eq!(kept(), 1, "the margin's last block");
+        durable.store(12 + ARCHIVE_RETIRE_MARGIN, std::sync::atomic::Ordering::Relaxed);
+        state.prune_heap_archives().unwrap();
+        assert_eq!(kept(), 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 

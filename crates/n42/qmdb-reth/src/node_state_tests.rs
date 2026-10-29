@@ -614,7 +614,8 @@ fn a_fold_archive_retires_once_the_durable_head_passes_its_fold_head() {
         assert_eq!(fold_archives(&dir).len(), 1, "entry_file={entry_file}: durable at 11 keeps the fold at 10");
 
         seal_the_log(&state);
-        durable.store(12, std::sync::atomic::Ordering::Relaxed);
+        // Past the fold head by the unwind margin (audit 2026-10 D-7).
+        durable.store(12 + ARCHIVE_RETIRE_MARGIN, std::sync::atomic::Ordering::Relaxed);
         state.compact((14, head));
         let archives = fold_archives(&dir);
         assert_eq!(archives.len(), 1, "entry_file={entry_file}: {archives:?}");

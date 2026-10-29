@@ -311,6 +311,18 @@ impl ConsensusEngine {
         // sets for the same block are also equivocation. Record only after BLS
         // verification so a forged first message cannot poison the tracker.
         let proposal_commitment = B256::from(*blake3::hash(&prop_msg).as_bytes());
+        // A repeat of the proposal this view already took, once this node
+        // has voted in the view or timed out of it, changes nothing:
+        // processing it again put a timed-out view back into voting (the
+        // next timeout then counted as a first one) and re-armed the pending
+        // vote (audit 2026-10 A-3). Before that it is still taken: it is how
+        // a vote whose log write failed is retried.
+        if self.processed_proposal == Some(proposal_commitment)
+            && (self.round_state.phase() == Phase::TimedOut || !self.round_state.may_vote_in(view))
+        {
+            tracing::debug!(target: "n42::cl::proposal", view, block_hash = %proposal.block_hash, "a repeat of the proposal already taken; dropped");
+            return Ok(());
+        }
         // edition-2021: N42-26 writes this as a let-chain; filtering the
         // Option keeps the guard and the body identical.
         if let Some((previous_commitment, previous_block_hash)) = self
@@ -427,6 +439,7 @@ impl ConsensusEngine {
             self.pending_tx_roots.insert(proposal.block_hash, tx_root);
         }
 
+        self.processed_proposal = Some(proposal_commitment);
         self.round_state.enter_voting();
         self.view_timing.proposal_received = Some(std::time::Instant::now());
 

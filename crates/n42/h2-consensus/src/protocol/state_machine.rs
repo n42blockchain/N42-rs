@@ -386,6 +386,9 @@ pub struct ConsensusEngine {
     /// current view. The commitment includes validator changes, so reusing a
     /// block hash with a different reconfiguration payload is still detected.
     pub(super) proposal_equivocation_tracker: HashMap<u32, (B256, B256)>,
+    /// The signed-message commitment of the proposal this view has taken;
+    /// a repeat of it (any peer can replay the leader's) is dropped.
+    pub(super) processed_proposal: Option<B256>,
     /// Buffer for messages arriving for future views (within FUTURE_VIEW_WINDOW).
     pub(super) future_msg_buffer: Vec<(ViewNumber, ConsensusMessage)>,
     /// Which validators' Round 1 votes this node, as leader, has verified,
@@ -526,6 +529,7 @@ impl ConsensusEngine {
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
+            processed_proposal: None,
             future_msg_buffer: Vec::new(),
             voters_seen: HashMap::new(),
             withheld_votes: VecDeque::new(),
@@ -647,6 +651,7 @@ impl ConsensusEngine {
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
+            processed_proposal: None,
             future_msg_buffer: Vec::new(),
             voters_seen: HashMap::new(),
             withheld_votes: VecDeque::new(),
@@ -1744,6 +1749,7 @@ impl ConsensusEngine {
         self.equivocation_tracker.clear();
         self.commit_equivocation_tracker.clear();
         self.proposal_equivocation_tracker.clear();
+        self.processed_proposal = None;
 
         // Defense-in-depth: re-derive my_index from the current set on every view
         // advance. The epoch-boundary branch above only fires for live consensus
@@ -3258,6 +3264,33 @@ mod tests {
             !vote_after(B256::repeat_byte(0xD4), None),
             "an unjudged parent is abstained on"
         );
+    }
+
+    /// Audit 2026-10 A-3: a repeat of the proposal this view took, arriving
+    /// after this node timed out of the view -- any peer can replay the
+    /// leader's signed one -- changes nothing: it used to put the view back
+    /// into voting, so the next timeout counted as a first one again, and to
+    /// re-arm the pending vote. (A repeat before a vote went out is still
+    /// taken: that is how a vote whose log write failed is retried.)
+    #[test]
+    fn test_a_repeated_proposal_after_a_timeout_is_dropped() {
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        enable_test_h2(&mut engine);
+        let block_hash = B256::repeat_byte(0xE7);
+        let proposal = signed_h2_test_proposal(&engine, 1, block_hash, 1, &sks[1]);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal.clone())))
+            .expect("the proposal is accepted");
+        engine.on_timeout().expect("timed out");
+        let timeouts = engine.consecutive_timeouts();
+        let _: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .expect("a repeat is not an error");
+        let again: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(again.is_empty(), "a repeat produces nothing: {again:?}");
+        engine.on_timeout().expect("still timed out");
+        assert_eq!(engine.consecutive_timeouts(), timeouts, "the repeat timeout is not a new one");
     }
 
     #[test]

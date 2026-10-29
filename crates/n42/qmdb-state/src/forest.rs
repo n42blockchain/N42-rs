@@ -1617,6 +1617,19 @@ impl QmdbForest {
         self.tree.next_slot()
     }
 
+    /// Whether `hash` is the canonical chain's block at `number`; `None` when
+    /// the records no longer reach back that far.
+    pub fn canonical_at(&self, number: u64, hash: B256) -> Option<bool> {
+        let mut current = self.head.1;
+        loop {
+            let record = self.records.get(&current)?;
+            if record.number <= number {
+                return Some(record.number == number && current == hash);
+            }
+            current = record.parent;
+        }
+    }
+
     /// Puts back what `deltas` carried, for deltas that were taken out of the
     /// records ([`Self::take_block_deltas`]) or measured ([`Self::delta_since`])
     /// but never reached the log: their flipped slots rejoin the move

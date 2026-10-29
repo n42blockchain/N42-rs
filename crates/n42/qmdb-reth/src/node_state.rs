@@ -3242,18 +3242,29 @@ impl QmdbNodeState {
             let reason = match head {
                 None => return Err(NodeStateError::Uninitialised),
                 Some((head_number, head_hash)) if head_number > number || (head_number == number && head_hash == hash) => {
-                    match self.settle_canonical() {
-                        Ok(()) => {
-                            // Once per persistence batch, off the block path:
-                            // the roots this batch recorded survive a power
-                            // cut, so the restart after one is checked.
-                            if let Err(error) = HeadRoots::sync(&self.head_roots_path()) {
-                                warn!(target: "n42.qmdb", %error, "could not sync the persisted QMDB heads' roots; a restart after a power cut may go unchecked");
+                    // A head past the block settles it only if the block is
+                    // on its chain: a sibling is not in the log (audit
+                    // 2026-10 round 2, R2-Q2). Records that no longer reach
+                    // back that far cannot say; then the height decides, as
+                    // before.
+                    let off_chain = head_number > number
+                        && self.with_forest("settle_through", |forest| Ok(forest.canonical_at(number, hash)))? == Some(false);
+                    if off_chain {
+                        format!("block {number} ({hash}) is not on the forest's canonical chain, at block {head_number} ({head_hash})")
+                    } else {
+                        match self.settle_canonical() {
+                            Ok(()) => {
+                                // Once per persistence batch, off the block path:
+                                // the roots this batch recorded survive a power
+                                // cut, so the restart after one is checked.
+                                if let Err(error) = HeadRoots::sync(&self.head_roots_path()) {
+                                    warn!(target: "n42.qmdb", %error, "could not sync the persisted QMDB heads' roots; a restart after a power cut may go unchecked");
+                                }
+                                return Ok(());
                             }
-                            return Ok(());
+                            Err(error @ (NodeStateError::Poisoned(_) | NodeStateError::Uninitialised)) => return Err(error),
+                            Err(error) => error.to_string(),
                         }
-                        Err(error @ (NodeStateError::Poisoned(_) | NodeStateError::Uninitialised)) => return Err(error),
-                        Err(error) => error.to_string(),
                     }
                 }
                 Some((head_number, head_hash)) => format!(

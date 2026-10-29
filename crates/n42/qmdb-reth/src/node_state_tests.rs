@@ -1735,6 +1735,22 @@ fn the_persist_hook_waits_for_a_late_canonical_notification() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Audit 2026-10 round 2 (R2-Q2): a persisted block below the forest's
+/// head settles only if it is the canonical chain's block at its height. A
+/// sibling the database is about to commit is not in the log, and the
+/// batch is refused rather than committed beside it.
+#[test]
+fn the_persist_hook_refuses_a_block_off_the_canonical_chain() {
+    let (state, _, _, _, _) = node_at("hook-off-chain", true, 4);
+    let sibling = B256::repeat_byte(0x33);
+    let prepared = state.compute(hash_of(2), &wide_changes(33)).expect("a sibling of 3");
+    state.insert(sibling, 3, prepared).expect("insert the sibling");
+    let wait = std::time::Duration::from_millis(20);
+    let err = state.settle_through(3, sibling, wait).expect_err("the sibling is not logged");
+    assert!(matches!(&err, NodeStateError::PersistUnsettled { number: 3, forest_head: Some(4), .. }), "{err}");
+    state.settle_through(3, hash_of(3), std::time::Duration::ZERO).expect("block 3 is logged");
+}
+
 /// No canonical notification for the persisted block ever arrives: past the
 /// deadline the batch is refused (the database does not commit it), and a
 /// database that committed it anyway is still refused at start-up.

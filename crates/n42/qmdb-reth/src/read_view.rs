@@ -502,8 +502,13 @@ impl QmdbReadView {
             // before it cuts any of them.
             None => self.index.get(key, |offset| unsafe { self.file.key(offset) }),
         };
-        // SAFETY: an offset from the index or a journal, as above.
-        Some(offset.map(|offset| decode(unsafe { self.file.record(offset) }.1)))
+        // SAFETY: an offset from the index or a journal, as above. A record
+        // that does not have the shape of one (a broken offset invariant) is
+        // declined, not a panic on this RPC or EVM thread (audit 2026-10 D-8).
+        match offset {
+            None => Some(None),
+            Some(offset) => Some(Some(decode(unsafe { self.file.try_record(offset) }?.1))),
+        }
     }
 
     /// An account as of block `at` (see [`Self::read_at`]). A record that does
@@ -1151,7 +1156,7 @@ mod tests {
                     // SAFETY: offsets of the built view's own flushed records.
                     view.index
                         .get(&key, |o| unsafe { view.file.key(o) })
-                        .is_some_and(|o| decode_account(unsafe { view.file.record(o) }.1).is_some())
+                        .is_some_and(|o| unsafe { view.file.try_record(o) }.is_some_and(|(_, value)| decode_account(value).is_some()))
                 };
                 let cold = time(threads, &read, first);
                 let warm = time(threads, &read, second);

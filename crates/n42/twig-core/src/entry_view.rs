@@ -93,6 +93,25 @@ impl EntryFileView {
         (key, &self.map[value_at..value_at + len])
     }
 
+    /// [`Self::record`], declining (`None`) instead of panicking when the
+    /// length field is over [`MAX_RECORD_VALUE`] or the record runs past the
+    /// mapping. Same cost as `record` (no `fstat`): for a reader that trusts
+    /// its offset but must not take its thread down if that trust is wrong.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::record`].
+    #[inline]
+    pub unsafe fn try_record(&self, offset: u64) -> Option<(Hash, &[u8])> {
+        let end = self.record_end(offset)?;
+        let len = end - offset - (KEY_LEN + LEN_LEN) as u64;
+        if len as usize > MAX_RECORD_VALUE {
+            return None;
+        }
+        // SAFETY: the caller's contract, and the length was checked above.
+        Some(unsafe { self.record(offset) })
+    }
+
     /// [`Self::record`] checked against the file as it is now: `None` when
     /// the record's header or value would lie past the file's end or the
     /// mapping, or its length field is over [`MAX_RECORD_VALUE`]. Costs an
@@ -246,5 +265,32 @@ mod tests {
         assert!(view.checked_record(0).unwrap().is_none());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         let _ = std::fs::remove_dir_all(torn.parent().unwrap());
+    }
+
+    /// Audit 2026-10 D-8: a read that trusts its offset (the read view's)
+    /// declines a record whose length field is over the bound instead of
+    /// panicking on the reader's thread.
+    #[test]
+    fn the_unchecked_read_declines_an_oversized_record() {
+        let torn = scratch("try-torn");
+        let mut bytes = vec![0u8; KEY_LEN];
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&torn, &bytes).unwrap();
+        let view = EntryFileView::open(&torn).unwrap();
+        // SAFETY: offset 0 starts the one record written.
+        assert!(unsafe { view.try_record(0) }.is_none());
+        let _ = std::fs::remove_dir_all(torn.parent().unwrap());
+
+        let path = scratch("try-good");
+        let mut tree = QmdbCompatTree::new();
+        tree.set_entry_file(&path).unwrap();
+        tree.apply_sorted_ops(block(0..4, 1)).unwrap();
+        tree.sync_entries().unwrap();
+        let view = EntryFileView::open(&path).unwrap();
+        // SAFETY: offset 0 starts the first record, synced above.
+        let (key, value) = unsafe { view.try_record(0) }.expect("the first record");
+        assert_eq!(key, tree.entry_at(0).unwrap().key);
+        assert_eq!(value, tree.entry_at(0).unwrap().value.as_slice());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

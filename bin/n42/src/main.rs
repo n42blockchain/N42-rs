@@ -71,22 +71,20 @@ fn main() {
             std::process::exit(2);
         }
     };
-    // `leader`, `shard` and frame gateways take a frame's word for a sender:
-    // benchmark probes, refused unless the operator acknowledges them with
-    // N42_BENCH_UNSAFE=1.
+    // `leader`, `shard` and frame gateways take a frame's word for a sender,
+    // and the direct ingest skips the pool's checks: benchmark probes, refused
+    // unless the operator acknowledges them with N42_BENCH_UNSAFE=1.
     let bench_unsafe = std::env::var("N42_BENCH_UNSAFE").ok();
     let gateways = std::env::var_os("N42_FRAME_GATEWAYS").is_some();
+    let direct = n42_env::flag("N42_TX_INGEST_DIRECT", false);
     if let Some(refusal) = n42_tx_types::trusting_mode_refusal(ingest_mode, bench_unsafe.as_deref())
         .or_else(|| n42_tx_types::frame_gateways_refusal(gateways, bench_unsafe.as_deref()))
+        .or_else(|| n42_tx_types::ingest_direct_refusal(direct, bench_unsafe.as_deref()))
     {
         eprintln!("error: {refusal}");
         std::process::exit(2);
     }
-    let trusting_knobs = n42_tx_types::trusting_ingest_knobs(
-        ingest_mode,
-        n42_env::flag("N42_TX_INGEST_DIRECT", false),
-        gateways,
-    );
+    let trusting_knobs = n42_tx_types::trusting_ingest_knobs(ingest_mode, direct, gateways);
     // `N42_CORE_LAYOUT=isolate`: split the node's affinity mask into the
     // build, critical and background sets before any thread is spawned, and
     // move this thread (and any the allocator already has) to the background

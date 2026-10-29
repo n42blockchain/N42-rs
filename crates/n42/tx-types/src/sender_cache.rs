@@ -221,13 +221,34 @@ pub fn trusting_mode_refusal(mode: IngestVerify, bench_unsafe: Option<&str>) -> 
 /// attestations -- and the bench gateway's secret derives from a public seed.
 /// That trusts more than `leader`, so the same acknowledgement gates it.
 pub fn frame_gateways_refusal(gateways: bool, bench_unsafe: Option<&str>) -> Option<String> {
-    if !gateways || bench_unsafe_acknowledged(bench_unsafe) {
+    bench_setting_refusal(
+        gateways,
+        bench_unsafe,
+        "N42_FRAME_GATEWAYS admits 0x50 transactions on a gateway's attestation, without          verifying their signatures",
+    )
+}
+
+/// Why a node must not start with the direct ingest (`direct`:
+/// `N42_TX_INGEST_DIRECT` on), or `None` when it may.
+///
+/// Signatures are still verified, but a frame goes into the builder's queue
+/// past the pool's checks (chain id, fee, balance, size): anything that can
+/// reach the ingest port can fill the queue with what the pool would refuse.
+pub fn ingest_direct_refusal(direct: bool, bench_unsafe: Option<&str>) -> Option<String> {
+    bench_setting_refusal(
+        direct,
+        bench_unsafe,
+        "N42_TX_INGEST_DIRECT queues transactions for the builder without the pool's checks          (chain id, fee, balance, size)",
+    )
+}
+
+fn bench_setting_refusal(set: bool, bench_unsafe: Option<&str>, what: &str) -> Option<String> {
+    if !set || bench_unsafe_acknowledged(bench_unsafe) {
         return None;
     }
-    Some(
-        "N42_FRAME_GATEWAYS admits 0x50 transactions on a gateway's attestation, without          verifying their signatures; it is a benchmark setting and is unsafe on a real chain.          Set N42_BENCH_UNSAFE=1 to run it anyway"
-            .to_owned(),
-    )
+    Some(format!(
+        "{what}; it is a benchmark setting and is unsafe on a real chain.          Set N42_BENCH_UNSAFE=1 to run it anyway"
+    ))
 }
 
 /// The ingest knobs that make this node trust what a frame says, by name,
@@ -372,6 +393,20 @@ mod shard_tests {
             );
         }
         assert_eq!(frame_gateways_refusal(true, Some("1")), None);
+    }
+
+    /// Audit 2026-10 C-3: the direct ingest puts frames in the builder's
+    /// queue past the pool's checks; the same acknowledgement gates it.
+    #[test]
+    fn the_direct_ingest_needs_the_bench_unsafe_ack() {
+        assert_eq!(ingest_direct_refusal(false, None), None);
+        for ack in [None, Some(""), Some("0"), Some("yes")] {
+            assert!(
+                ingest_direct_refusal(true, ack).is_some_and(|why| why.contains("N42_BENCH_UNSAFE=1")),
+                "{ack:?}"
+            );
+        }
+        assert_eq!(ingest_direct_refusal(true, Some("1")), None);
     }
 
     #[test]

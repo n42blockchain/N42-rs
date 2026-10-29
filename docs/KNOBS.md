@@ -94,7 +94,7 @@ Status caveat: `adopted` follows the stage sets named above plus the X22 base se
 | `N42_THP_DISABLE` | off (1) | `1` | prctl PR_SET_THP_DISABLE for this process. | `bin/n42:main.rs:50` | bench-only |
 | `N42_TX_INGEST` | unset: ingest server off (value: SocketAddr) | see Default | Address of the transaction ingest server (unauthenticated; loopback). | `bin/n42:main.rs:802` | unknown |
 | `N42_TX_INGEST_ALLOW_REMOTE` | off (1 enables) | `1` | Allow the ingest server to bind off loopback; refused outright with `N42_TX_INGEST_DIRECT`, `N42_INGEST_VERIFY=shard|leader` or attested frames (audit/ingest-hardening). | `bin/n42:main.rs` | default |
-| `N42_BENCH_UNSAFE` | off (1 enables) | `1` | Start-up acknowledgement required before `N42_INGEST_VERIFY=shard|leader` or `N42_FRAME_GATEWAYS` is accepted (audit/ingest-hardening; gateways since audit 2026-10 C-2). | `bin/n42:main.rs` | bench-only |
+| `N42_BENCH_UNSAFE` | off (1 enables) | `1` | Start-up acknowledgement required before `N42_INGEST_VERIFY=shard|leader`, `N42_FRAME_GATEWAYS` or `N42_TX_INGEST_DIRECT` is accepted (audit/ingest-hardening; gateways and direct since audit 2026-10 C-2/C-3). | `bin/n42:main.rs` | bench-only |
 | `N42_TX_QUEUE` | off (any value enables) | presence only (`=0` still counts) | Enable the builder's tx queue (fed by ingest, pruned per canonical block). | `bin/n42:main.rs:607` | experimental |
 | `N42_TX_QUEUE_DRAINER` | off (any value enables) | presence only (`=0` still counts) | Drain the queue inbox off the builder thread. | `bin/n42:main.rs:609,620` | experimental |
 | `N42_VOTE_BEFORE_SLOT` | off (1) | `1` | Vote before the slot (held execution); incompatible with IMPORT_ONCE. | `bin/n42:import_once.rs:62; h2-execution:driver.rs:172` | experimental |
@@ -230,7 +230,7 @@ Status caveat: `adopted` follows the stage sets named above plus the X22 base se
 | `N42_TX_INGEST_ASYNC` | off (any value enables) | presence only (`=0` still counts) | Ingest answers frames asynchronously. | `tx-ingest:lib.rs:1089` | experimental |
 | `N42_TX_INGEST_ASYNC_FRAMES` | ASYNC_FRAMES_IN_FLIGHT | integer | N42_TX_INGEST_ASYNC_FRAMES: frames a connection may have recovering or awaiting admission before its next answer waits; the default above. | `tx-ingest:lib.rs:208` | default |
 | `N42_TX_INGEST_BLOCK_TXS` | 0 | integer | Per-block allowance the ingest gate grants (0 = old gate). | `tx-ingest:lib.rs:1029` | undocumented-before |
-| `N42_TX_INGEST_DIRECT` | off (any value enables) | presence only (`=0` still counts) | Ingest feeds the tx queue directly (queue is a tx's only holder). | `tx-ingest:lib.rs:389` | unsafe-bench |
+| `N42_TX_INGEST_DIRECT` | off | `n42_env::flag`: 1/true/on/yes enable, 0/false/off/no disable | Ingest feeds the tx queue directly (queue is a tx's only holder), past the pool's checks; the node refuses it without `N42_BENCH_UNSAFE=1`. | `tx-ingest:lib.rs:456` | unsafe-bench |
 | `N42_TX_INGEST_GATE_FOR_BLOCK` | off | `1` (or the knob's own value; see code) | Opt-in opening of the ingest gate while a block is pending. | `tx-ingest:lib.rs:562` | unknown |
 | `N42_TX_INGEST_GATE_MAX_WAIT_MS` | 15_000 | integer | N42_TX_INGEST_GATE_MAX_WAIT_MS, 15 seconds by default, 0 to wait for ever (the behaviour before this). The gate is backpressure, not a rule: wait... | `tx-ingest:lib.rs:479` | default |
 | `N42_TX_INGEST_GATE_STRICT` | off | `1` (or the knob's own value; see code) | that is. N42_TX_INGEST_GATE_STRICT=1 is the same as leaving the opt-in unset and is read for the older runners. | `tx-ingest:lib.rs:563` | undocumented-before |

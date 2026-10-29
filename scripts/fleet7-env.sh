@@ -161,12 +161,21 @@ case "${N42_INGEST_VERIFY:-}" in
   [Ll][Ee][Aa][Dd][Ee][Rr] | [Ss][Hh][Aa][Rr][Dd]) export N42_BENCH_UNSAFE=1 ;;
 esac
 # Frame gateways (N42_FRAME_GATEWAYS) admit 0x50 transactions on the bench
-# gateway's attestation, whose secret derives from a public seed: the node
-# refuses them without the ack too, and a gateway leg passes it on its own line.
+# gateway's attestation, whose secret derives from a public seed, and the
+# direct ingest (N42_TX_INGEST_DIRECT) queues frames past the pool's checks:
+# the node refuses either without the ack too, and such a leg passes it on its
+# own line.
 if [[ -n ${N42_FRAME_GATEWAYS+set} && ${N42_BENCH_UNSAFE:-} != 1 ]]; then
   echo "fleet7-env: N42_FRAME_GATEWAYS is set; a gateway leg must also set N42_BENCH_UNSAFE=1." >&2
   return 1 2>/dev/null || exit 1
 fi
+case "${N42_TX_INGEST_DIRECT:-}" in
+  [Tt][Rr][Uu][Ee] | [Oo][Nn] | [Yy][Ee][Ss] | 1)
+    if [[ ${N42_BENCH_UNSAFE:-} != 1 ]]; then
+      echo "fleet7-env: N42_TX_INGEST_DIRECT is on; such a leg must also set N42_BENCH_UNSAFE=1." >&2
+      return 1 2>/dev/null || exit 1
+    fi ;;
+esac
 
 # ------------------------------------------------------------------- load ---
 # Transactions per second the fleet is offered, 0 for none. A fleet measured on

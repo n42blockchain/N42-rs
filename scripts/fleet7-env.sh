@@ -155,10 +155,15 @@ f7_quorum() { echo $(( F7_NODES - (F7_NODES - 1) / 3 )); }
 
 # ------------------------------------------------------ trusting ingest ---
 # N42_INGEST_VERIFY=leader|shard takes a frame's word for a sender: the node
-# refuses to start on either unless N42_BENCH_UNSAFE=1 acknowledges it. A leg
-# that sets the mode is a benchmark by construction, so the ack goes with it.
+# refuses to start on either unless N42_BENCH_UNSAFE=1 acknowledges it. The
+# launcher does not supply the ack: the leg line that picks the mode gives it
+# too, so no run turns a trusting mode on without saying so.
 case "${N42_INGEST_VERIFY:-}" in
-  [Ll][Ee][Aa][Dd][Ee][Rr] | [Ss][Hh][Aa][Rr][Dd]) export N42_BENCH_UNSAFE=1 ;;
+  [Ll][Ee][Aa][Dd][Ee][Rr] | [Ss][Hh][Aa][Rr][Dd])
+    if [[ ${N42_BENCH_UNSAFE:-} != 1 ]]; then
+      echo "fleet7-env: N42_INGEST_VERIFY=$N42_INGEST_VERIFY; such a leg must also set N42_BENCH_UNSAFE=1." >&2
+      return 1 2>/dev/null || exit 1
+    fi ;;
 esac
 # Frame gateways (N42_FRAME_GATEWAYS) admit 0x50 transactions on the bench
 # gateway's attestation, whose secret derives from a public seed, and the

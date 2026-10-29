@@ -867,26 +867,7 @@ impl TransportCore {
 
     /// What a request on the vote protocol is, as a transport event.
     fn direct_vote_event(&self, peer: PeerId, request: crate::rpc::VoteRequest) -> TransportEvent {
-        let inner = match request {
-            crate::rpc::VoteRequest::Hello { index, signature } => {
-                return TransportEvent::VoteHello { peer, index, signature };
-            }
-            crate::rpc::VoteRequest::Native(bytes) => match decode_gov5_gossip_message(&bytes) {
-                Ok(decoded) => TransportEvent::Native {
-                    from: Some(peer),
-                    message: Box::new(decoded),
-                },
-                Err(err) => TransportEvent::Rejected {
-                    from: Some(peer),
-                    reason: format!("direct vote: {err}"),
-                },
-            },
-            crate::rpc::VoteRequest::Envelope(bytes) => decode_payload_for(self.identity, Some(peer), &bytes),
-        };
-        TransportEvent::DirectVote {
-            peer,
-            inner: Box::new(inner),
-        }
+        direct_vote_event(self.identity, peer, request)
     }
 
     /// Publishes already-encoded bytes on one of the four topics.
@@ -1268,6 +1249,49 @@ impl TransportCore {
 }
 
 /// Decodes one v4 gossip payload for the chain `identity`.
+/// What a request on the vote protocol is, as a transport event. Only what
+/// this node sends there reaches the engine -- votes, commit votes and
+/// retransmitted timeouts; any other message is refused, as it is not
+/// de-duplicated the way gossip is (audit 2026-10 round 3, R3-N5).
+pub(crate) fn direct_vote_event(identity: H2V4ChainIdentity, peer: PeerId, request: crate::rpc::VoteRequest) -> TransportEvent {
+    let inner = match request {
+        crate::rpc::VoteRequest::Hello { index, signature } => {
+            return TransportEvent::VoteHello { peer, index, signature };
+        }
+        crate::rpc::VoteRequest::Native(bytes) => match decode_gov5_gossip_message(&bytes) {
+            Ok(decoded) => TransportEvent::Native {
+                from: Some(peer),
+                message: Box::new(decoded),
+            },
+            Err(err) => TransportEvent::Rejected {
+                from: Some(peer),
+                reason: format!("direct vote: {err}"),
+            },
+        },
+        crate::rpc::VoteRequest::Envelope(bytes) => decode_payload_for(identity, Some(peer), &bytes),
+    };
+    let kind = match &inner {
+        TransportEvent::Native { message, .. } => Some(message.kind()),
+        TransportEvent::Envelope { envelope, .. } => Some(envelope.message.kind()),
+        _ => None,
+    };
+    if let Some(kind) = kind.filter(|kind| {
+        !matches!(
+            kind,
+            n42_h2_wire::h2_wire::H2MessageKind::Vote | n42_h2_wire::h2_wire::H2MessageKind::CommitVote | n42_h2_wire::h2_wire::H2MessageKind::Timeout
+        )
+    }) {
+        return TransportEvent::Rejected {
+            from: Some(peer),
+            reason: format!("direct vote: a {kind:?} is not carried on the vote protocol"),
+        };
+    }
+    TransportEvent::DirectVote {
+        peer,
+        inner: Box::new(inner),
+    }
+}
+
 pub(crate) fn decode_payload_for(
     identity: H2V4ChainIdentity,
     from: Option<PeerId>,
@@ -1655,6 +1679,65 @@ impl std::fmt::Debug for H2V4Transport {
 
 #[cfg(test)]
 mod tests {
+    /// Audit 2026-10 round 3 (R3-N5): any peer could send any consensus
+    /// message on the vote protocol, past gossip's de-duplication -- a
+    /// proposal or a decide as often as it liked, each verified again. The
+    /// protocol carries what this node sends on it: votes, commit votes and
+    /// retransmitted timeouts.
+    #[test]
+    fn the_vote_protocol_carries_only_votes_and_timeouts() {
+        use n42_h2_wire::h2_wire::{H2Decide, H2QuorumCertificate, H2Timeout, H2Vote};
+        let identity = super::H2V4ChainIdentity { chain_id: 1, genesis_hash: super::B256::ZERO };
+        let signature = n42_h2_primitives::BlsSecretKey::random().expect("a key").sign(b"m");
+        let qc = H2QuorumCertificate {
+            view: 1,
+            block_hash: super::B256::ZERO,
+            aggregate_signature: signature.to_bytes().to_vec(),
+            signers_bitmap: vec![1, 0, 1],
+        };
+        let vote = super::H2Message::Vote(H2Vote {
+            view: 2,
+            block_hash: super::B256::ZERO,
+            voter: 0,
+            signature: signature.clone(),
+            high_tc: None,
+        });
+        let commit_vote = super::H2Message::CommitVote(H2Vote {
+            view: 2,
+            block_hash: super::B256::ZERO,
+            voter: 0,
+            signature: signature.clone(),
+            high_tc: None,
+        });
+        let timeout = super::H2Message::Timeout(H2Timeout {
+            view: 2,
+            high_qc: qc.clone(),
+            sender: 0,
+            signature,
+            high_tc: None,
+        });
+        let decide = super::H2Message::Decide(H2Decide { view: 2, block_hash: super::B256::ZERO, commit_qc: qc });
+        let peer = super::PeerId::random();
+        let reaches_the_node = |request| {
+            matches!(
+                super::direct_vote_event(identity, peer, request),
+                super::TransportEvent::DirectVote { inner, .. }
+                    if matches!(*inner, super::TransportEvent::Native { .. } | super::TransportEvent::Envelope { .. })
+            )
+        };
+        for (message, allowed) in [(vote, true), (commit_vote, true), (timeout, true), (decide, false)] {
+            let native = super::encode_gov5_gossip_message(&message).expect("encodes");
+            assert_eq!(reaches_the_node(crate::rpc::VoteRequest::Native(native)), allowed, "{:?}", message.kind());
+            let envelope = super::encode_gossip(&super::H2V4Envelope {
+                identity,
+                changes_hash: super::B256::ZERO,
+                message: message.clone(),
+            })
+            .expect("encodes");
+            assert_eq!(reaches_the_node(crate::rpc::VoteRequest::Envelope(envelope)), allowed, "{:?}", message.kind());
+        }
+    }
+
     #[test]
     fn the_inbound_cap_defaults_to_128_and_takes_a_positive_override() {
         assert_eq!(super::max_inbound_from(None), 128);

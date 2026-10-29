@@ -390,6 +390,36 @@ async fn a_pulled_block_whose_qc_names_an_unknown_epoch_is_checked_by_its_parent
     assert!(rig.svc.check_pulled_block(&header).is_err(), "a block that does not extend the last one");
 }
 
+/// Audit 2026-10 B-1: a range server that answers a node behind it with a
+/// chain whose headers carry no certificate it can check (here none at all)
+/// gets that chain imported on its parent links alone, and the execution
+/// layer's head moves to it. That head must not then stand for "caught up":
+/// an honest peer at the same height still has to be pulled from, or the
+/// node never leaves the forged chain -- a restart reads the same head.
+#[tokio::test]
+async fn an_uncertified_pulled_chain_does_not_stop_a_pull_from_an_honest_peer() {
+    let mut rig = node(1, 0, None).await;
+    let forger = PeerId::random();
+    let forged = chain(4);
+    catching_up(&mut rig, forger, 1, 4);
+    rig.svc.pending_imports.push((forger, RangeRequest { start: 1, count: 4, step: 1 }, chunks(&forged)));
+    import(&mut rig).await;
+    assert!(
+        rig.el.calls().iter().any(|c| matches!(c, ElCall::NewPayload(h) if *h == forged[3].0)),
+        "the uncertified chain reached the execution layer"
+    );
+
+    let honest = PeerId::random();
+    rig.svc.catch_up = None;
+    rig.svc.catch_up_retry_after = None;
+    rig.svc.peer_heights.remove(&forger);
+    rig.svc.note_peer_height(honest, 4);
+    let mut events = Vec::new();
+    within(rig.svc.consider_catch_up(&mut events)).await;
+    let catch_up = rig.svc.catch_up.as_ref().expect("the honest peer is pulled from");
+    assert_eq!(catch_up.peer, honest);
+}
+
 /// A block that does not extend the one pulled before it is refused before
 /// the execution layer sees it, whatever its certificate says.
 #[tokio::test]

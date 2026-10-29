@@ -472,6 +472,17 @@ pub struct H2Service<E> {
     /// Height of the last block the execution layer is known to have
     /// imported, once read; what "far ahead" is measured from.
     imported_height: Option<u64>,
+    /// The lowest height of range-pulled blocks imported on their parent
+    /// links alone (no header certificate this node could check) since the
+    /// last proof -- a verified header QC, or a commit at or above it. Until
+    /// then catch-up measures "behind" from the block below it, not from the
+    /// execution layer's head: a range server feeding a node that is behind
+    /// a chain it made up would otherwise leave every honest peer "not ahead"
+    /// (audit 2026-10 B-1; gov5 measures from its committed height).
+    unproven_from: Option<u64>,
+    /// Whether the restart check of [`Self::unproven_from`] ran: an execution
+    /// layer ahead of the restored commit is unproven past it.
+    unproven_checked: bool,
     /// When the layer's height was last read for a held block; one forced
     /// read every [`HELD_TOO_LONG`] at most.
     last_forced_layer_read: Option<std::time::Instant>,
@@ -1506,6 +1517,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             body_requested_at: std::collections::HashMap::new(),
             body_requested_order: std::collections::VecDeque::new(),
             imported_height: None,
+            unproven_from: None,
+            unproven_checked: false,
             last_forced_layer_read: None,
             silent_keys: SilentKeys::default(),
             silent_checked_view: None,
@@ -3104,6 +3117,11 @@ impl<E: ExecutionLayer> H2Service<E> {
                 if let Some(number) = self.block_numbers.get(&block_hash).copied() {
                     self.transport.set_advertised_height(number);
                     self.committed_height = Some(self.committed_height.map_or(number, |height| height.max(number)));
+                    // A commit at or past the unproven run puts the head on
+                    // the chain consensus decided.
+                    if self.unproven_from.is_some_and(|from| number >= from) {
+                        self.unproven_from = None;
+                    }
                 }
                 self.loop_spend.open(view);
                 events.push(ServiceEvent::Committed {
@@ -4259,8 +4277,14 @@ impl<E: ExecutionLayer> H2Service<E> {
         };
         // The execution layer is asked only when a peer may be past what was
         // last read from it.
-        if self.imported_height.is_some_and(|tip| height <= tip) {
+        if self.unproven_checked && self.unproven_from.is_none() && self.imported_height.is_some_and(|tip| height <= tip) {
             return;
+        }
+        if !self.unproven_checked {
+            self.unproven_checked = true;
+            if let Some(from) = self.unproven_after_restart().await {
+                self.unproven_from = Some(self.unproven_from.map_or(from, |known| known.min(from)));
+            }
         }
         let latest = match self.driver.execution_layer().latest_block_number().await {
             Ok(Some(latest)) => latest,
@@ -4272,6 +4296,10 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
         };
         self.imported_height = Some(latest);
+        // Pulled blocks nothing has proven do not count as held: the pull
+        // starts below them, and an honest peer's chain replaces them
+        // through the forkchoice that follows its blocks.
+        let latest = self.unproven_from.map_or(latest, |from| latest.min(from - 1));
         // Statuses arrive on connect, and a block the fleet gossiped before
         // this node connected never comes by itself — however small the gap.
         if height <= latest {
@@ -4379,14 +4407,22 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // layer sees the block: the first block that fails ends the
                 // batch (what passed before it stays imported), and its peer
                 // is not asked for this gap again.
-                if let Err(reason) = self.check_pulled_block(&block.header) {
-                    warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block whose certificate does not verify; the rest of its range is dropped");
-                    self.refused_range_peers.insert(peer, number);
-                    self.finish_catch_up(events, false);
-                    return;
-                }
+                let proven = match self.check_pulled_block(&block.header) {
+                    Ok(proven) => proven,
+                    Err(reason) => {
+                        warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block whose certificate does not verify; the rest of its range is dropped");
+                        self.refused_range_peers.insert(peer, number);
+                        self.finish_catch_up(events, false);
+                        return;
+                    }
+                };
                 match self.driver.import_pulled(block.execution_data()).await {
                     Ok(_) => {
+                        if proven {
+                            self.unproven_from = None;
+                        } else {
+                            self.unproven_from.get_or_insert(number);
+                        }
                         self.remember_imported(hash);
                         self.note_imported(number);
                         self.remember_block(hash, &block.header);
@@ -4467,7 +4503,11 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// block is authenticated by the certificates on the wire, see
     /// `HotStuffConsensus`). A header without the `HotStuff` extra layout is
     /// refused on a gov5 chain and carries no certificate on another.
-    fn check_pulled_block(&self, header: &Header) -> Result<(), String> {
+    ///
+    /// `Ok(true)` when a certificate verified (the chain below the block is
+    /// the one the validator set certified), `Ok(false)` when only the parent
+    /// link was checked.
+    fn check_pulled_block(&self, header: &Header) -> Result<bool, String> {
         if let Some(prev) = self.catch_up.as_ref().and_then(|c| c.prev_hash)
             && header.parent_hash != prev
         {
@@ -4476,10 +4516,10 @@ impl<E: ExecutionLayer> H2Service<E> {
         let extra = match n42_h2_consensus::HeaderExtra::decode(&header.extra_data) {
             Ok(extra) => extra,
             Err(err) if self.header_profile == HeaderProfile::Gov5H2 => return Err(err.to_string()),
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(false),
         };
         if extra.qc.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         // gov5's `decodeHeaderExtra`: QC then seal, or (legacy) a QC alone.
         let wire = n42_h2_wire::h2_wire::decode_h2_qc(&extra.qc)
@@ -4498,12 +4538,30 @@ impl<E: ExecutionLayer> H2Service<E> {
                 number = header.number,
                 "validator set for the certificate's view is not known; only the parent link is checked"
             );
-            return Ok(());
+            return Ok(false);
         };
         if qc.view == 0 {
-            return Ok(());
+            return Ok(false);
         }
-        self.certified_is_an_ancestor(header, qc.block_hash)
+        self.certified_is_an_ancestor(header, qc.block_hash).map(|()| true)
+    }
+
+    /// After a restart: the height past which the execution layer holds
+    /// blocks consensus has not committed here, when the restored commit is
+    /// a real one the layer holds. Blocks above it may be a chain a range
+    /// server made up before the restart, so a pull from an honest peer
+    /// starts above the commit. `None` on a fresh consensus state (a node
+    /// started on a snapshot has nothing to measure from) or when the layer
+    /// is not ahead.
+    async fn unproven_after_restart(&mut self) -> Option<u64> {
+        let qc = self.engine.last_committed_qc();
+        if qc.view == 0 {
+            return None;
+        }
+        let el = self.driver.execution_layer();
+        let committed = el.block_by_hash(qc.block_hash).await.ok().flatten()?.header.number;
+        let latest = el.latest_block_number().await.ok().flatten()?;
+        (latest > committed).then_some(committed + 1)
     }
 
     /// Whether `certified` lies on `header`'s parent chain, walking the

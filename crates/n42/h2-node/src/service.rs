@@ -2922,6 +2922,11 @@ impl<E: ExecutionLayer> H2Service<E> {
         for action in self.driver.retry_failed_commit().await {
             self.apply_driver_action(action, events)?;
         }
+        // An import that ended without a verdict is executed again once its
+        // pause has passed, from what is held (audit 2026-10 round 2, R2-R3).
+        for action in self.driver.retry_failed_imports().await {
+            self.apply_driver_action(action, events)?;
+        }
         self.consider_catch_up(events).await;
         self.import_ranges(events).await;
         // Only blocks taken elided are queued. The first request for one

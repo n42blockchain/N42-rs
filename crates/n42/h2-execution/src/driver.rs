@@ -54,10 +54,15 @@ pub enum ImportReport {
 pub enum ImportVerdict {
     /// The execution layer holds the block.
     Imported,
-    /// The execution layer has not executed it (SYNCING/ACCEPTED), or the
-    /// exchange failed (a timeout, a dropped connection): not a verdict --
-    /// the block is asked for again, as on the awaited path.
+    /// The block cannot be executed from what this node holds (a compact
+    /// body it could not assemble, a held body the layer would not take):
+    /// the block is asked for again.
     NotYet,
+    /// The execution layer has not executed it (SYNCING/ACCEPTED), or the
+    /// exchange failed (a timeout, a dropped connection, a task that died):
+    /// no verdict on the block, which is executed again after a pause from
+    /// what the driver holds (audit 2026-10 round 2, R2-R3).
+    NoVerdict,
     /// The execution layer called it INVALID, or this driver dropped it (a
     /// held import whose parent lost its height).
     Invalid(String),
@@ -73,7 +78,7 @@ impl ImportVerdict {
         match outcome {
             Ok(status) => match status.status {
                 PayloadStatusEnum::Valid => Self::Imported,
-                PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => Self::NotYet,
+                PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => Self::NoVerdict,
                 PayloadStatusEnum::Invalid { validation_error } => Self::Invalid(validation_error.to_string()),
             },
             Err(error) if error.0 == HELD_IMPORT_DROPPED => Self::Invalid(error.to_string()),
@@ -84,8 +89,8 @@ impl ImportVerdict {
             // block bad only on a deterministic execution failure and
             // retries every other error (audit 2026-10 B-5).
             Err(error) => {
-                warn!(target: "n42.h2.el", %error, "the import failed without a verdict; asking for the block again");
-                Self::NotYet
+                warn!(target: "n42.h2.el", %error, "the import failed without a verdict; executing it again");
+                Self::NoVerdict
             }
         }
     }
@@ -112,8 +117,8 @@ impl Drop for ReportGuard {
         // about the block, and INVALID withdrew the evidence for a block
         // that may be valid (audit 2026-10 round 2, R2-I7).
         if let Some(report) = self.report.take() {
-            warn!(target: "n42.h2.el", block = ?self.block_hash, "an import task ended without a verdict; the block is asked for again");
-            let _ = report.send(ImportReport::Done(self.block_hash, ImportVerdict::NotYet));
+            warn!(target: "n42.h2.el", block = ?self.block_hash, "an import task ended without a verdict; executing it again");
+            let _ = report.send(ImportReport::Done(self.block_hash, ImportVerdict::NoVerdict));
         }
     }
 }
@@ -721,6 +726,13 @@ pub struct ExecutionDriver<E> {
     /// The pauses before each retry of an own import that ended without a
     /// verdict. See [`Self::set_own_import_backoff`].
     own_import_backoff: std::sync::Arc<[std::time::Duration]>,
+    /// The pauses before each new execution of a follower import that ended
+    /// without a verdict. See [`Self::set_import_retry_backoff`].
+    import_retry_backoff: Vec<std::time::Duration>,
+    /// Retries taken so far, by block.
+    import_retries: HashMap<B256, usize>,
+    /// Imports to run again, and when.
+    import_retry_due: Vec<(std::time::Instant, B256)>,
     /// **Bench only** (`N42_VOTE_BEFORE_IMPORT=1`): a follower's import runs
     /// on a task instead of being awaited by the loop, so the loop can vote
     /// on the next proposal while the block executes -- what deferred
@@ -1037,6 +1049,9 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             own_importing: Default::default(),
             own_refused: Default::default(),
             own_import_backoff: OWN_IMPORT_BACKOFF.into(),
+            import_retry_backoff: OWN_IMPORT_BACKOFF.into(),
+            import_retries: HashMap::new(),
+            import_retry_due: Vec::new(),
             spawn_imports: false,
             deferred_execution_time: None,
             deferred_depth: 1,
@@ -1977,6 +1992,56 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.own_import_backoff = pauses.into();
     }
 
+    /// The pauses before each new execution of a follower import that ended
+    /// without a verdict (default [`OWN_IMPORT_BACKOFF`]); one per entry,
+    /// then the block is asked for again.
+    pub fn set_import_retry_backoff(&mut self, pauses: Vec<std::time::Duration>) {
+        self.import_retry_backoff = pauses;
+    }
+
+    /// An import that ended without a verdict: executed again after the
+    /// next pause, from the payload or body still held -- the body is here,
+    /// so asking the fleet for it would only bring a duplicate nothing
+    /// executes, and a compact body would be given up for a whole one
+    /// (audit 2026-10 round 2, R2-R3). Asked for again once the pauses run
+    /// out.
+    fn schedule_import_retry(&mut self, block_hash: B256) -> DriverAction {
+        let attempt = self.import_retries.entry(block_hash).or_insert(0);
+        match self.import_retry_backoff.get(*attempt) {
+            Some(pause) => {
+                *attempt += 1;
+                debug!(target: "n42.h2.el", block = ?block_hash, attempt = *attempt, ?pause, "import ended without a verdict; executing it again after a pause");
+                self.import_retry_due.push((std::time::Instant::now() + *pause, block_hash));
+                DriverAction::Ignored
+            }
+            None => {
+                self.import_retries.remove(&block_hash);
+                DriverAction::PayloadMissing { block_hash }
+            }
+        }
+    }
+
+    /// Runs the imports whose pause has passed (see
+    /// [`Self::schedule_import_retry`]); the loop applies what they return.
+    pub async fn retry_failed_imports(&mut self) -> Vec<DriverAction> {
+        if self.import_retry_due.is_empty() {
+            return Vec::new();
+        }
+        let now = std::time::Instant::now();
+        let (due, later): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.import_retry_due).into_iter().partition(|(at, _)| *at <= now);
+        self.import_retry_due = later;
+        let mut actions = Vec::with_capacity(due.len());
+        for (_, block_hash) in due {
+            if self.imported.contains(&block_hash) {
+                self.import_retries.remove(&block_hash);
+                continue;
+            }
+            actions.push(self.execute(block_hash).await);
+        }
+        actions
+    }
+
     /// The channel [`Self::spawn_import_own_block`] reports on, once.
     pub fn take_own_imports(&mut self) -> Option<tokio::sync::mpsc::UnboundedReceiver<B256>> {
         self.own_imports_rx.take()
@@ -2681,6 +2746,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let mut actions = Vec::with_capacity(2);
         actions.push(match verdict {
             ImportVerdict::Imported => {
+                self.import_retries.remove(&block_hash);
                 self.head = block_hash;
                 self.note_imported(block_hash);
                 if self.pending_commits.remove(&block_hash) || self.commits_ahead.remove(&block_hash) {
@@ -2698,8 +2764,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             // Not executed: asked for again, as the awaited path does. A
             // commit that waited keeps waiting for the import that follows.
             ImportVerdict::NotYet => DriverAction::PayloadMissing { block_hash },
+            ImportVerdict::NoVerdict => self.schedule_import_retry(block_hash),
             ImportVerdict::NeedTxns(indices) => DriverAction::TransactionsMissing { block_hash, indices },
             ImportVerdict::Invalid(reason) => {
+                self.import_retries.remove(&block_hash);
                 // A commit for it can never run; a payload for it is dropped
                 // so a fresh copy is executed again, not this outcome.
                 if self.pending_commits.remove(&block_hash) {
@@ -2902,18 +2970,16 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 // SYNCING/ACCEPTED are not a verdict: the EL has not executed the
                 // block yet, so voting now would be voting blind. Treat it the
                 // same as a missing payload — the caller retries.
-                PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => {
-                    DriverAction::PayloadMissing { block_hash }
-                }
+                PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => self.schedule_import_retry(block_hash),
                 PayloadStatusEnum::Invalid { validation_error } => DriverAction::Rejected {
                     block_hash,
                     reason: validation_error.to_string(),
                 },
             },
-            // No verdict on the block: asked for again, as above.
+            // No verdict on the block: executed again, as above.
             Err(error) => {
-                warn!(target: "n42.h2.el", block = ?block_hash, %error, "the import failed without a verdict; asking for the block again");
-                DriverAction::PayloadMissing { block_hash }
+                warn!(target: "n42.h2.el", block = ?block_hash, %error, "the import failed without a verdict; executing it again");
+                self.schedule_import_retry(block_hash)
             }
         }
     }
@@ -3343,11 +3409,11 @@ mod report_guard_tests {
     use super::*;
 
     #[test]
-    fn an_import_task_that_ends_without_a_verdict_reports_not_yet() {
+    fn an_import_task_that_ends_without_a_verdict_reports_no_verdict() {
         let (report, mut reports) = tokio::sync::mpsc::unbounded_channel();
         drop(ReportGuard { block_hash: B256::repeat_byte(7), report: Some(report) });
         let Ok(ImportReport::Done(hash, verdict)) = reports.try_recv() else { panic!("a report") };
         assert_eq!(hash, B256::repeat_byte(7));
-        assert!(matches!(verdict, ImportVerdict::NotYet), "{verdict:?}");
+        assert!(matches!(verdict, ImportVerdict::NoVerdict), "{verdict:?}");
     }
 }

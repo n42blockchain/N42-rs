@@ -159,10 +159,15 @@ async fn a_syncing_execution_layer_defers_rather_than_voting_blind() {
     driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
 
     // SYNCING is not a verdict: the EL has not executed the block, so voting
-    // would be voting blind. The driver must ask the caller to retry.
+    // would be voting blind. The driver executes it again after a pause
+    // (audit 2026-10 round 2, R2-R3), and asks for it once the pauses run out.
+    driver.set_import_retry_backoff(vec![std::time::Duration::ZERO]);
     let action = driver.handle_output(&execute(hash)).await;
-    assert_eq!(action.missing_block(), Some(hash));
-    assert!(action.imported_block().is_none());
+    assert!(action.missing_block().is_none() && action.imported_block().is_none(), "{action:?}");
+    assert_eq!(driver.head(), GENESIS);
+    let retried = driver.retry_failed_imports().await;
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].missing_block(), Some(hash), "out of retries");
     assert_eq!(driver.head(), GENESIS);
 }
 
@@ -178,11 +183,15 @@ async fn an_execution_layer_error_is_asked_again_not_a_rejection_or_an_import() 
 
     // Only the execution layer's INVALID is a verdict on the block; an error
     // reaching it is asked again, as gov5 retries every error but a
-    // deterministic execution failure (audit 2026-10 B-5).
+    // deterministic execution failure (audit 2026-10 B-5), executed again
+    // from the payload held (R2-R3).
+    driver.set_import_retry_backoff(vec![std::time::Duration::ZERO]);
     let action = driver.handle_output(&execute(hash)).await;
     assert!(action.imported_block().is_none());
     assert!(action.rejection().is_none());
-    assert_eq!(action.missing_block(), Some(hash));
+    assert!(action.missing_block().is_none(), "retried first: {action:?}");
+    let retried = driver.retry_failed_imports().await;
+    assert_eq!(retried[0].missing_block(), Some(hash), "then asked for again");
 }
 
 #[tokio::test]

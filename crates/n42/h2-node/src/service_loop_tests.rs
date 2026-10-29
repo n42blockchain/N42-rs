@@ -138,8 +138,10 @@ async fn an_execution_that_is_not_a_verdict_asks_for_the_body_and_an_invalid_one
     assert_eq!(events.len(), before, "nothing asked for a body already held");
     assert!(rig.svc.body_wait.is_empty());
 
-    // SYNCING is not a verdict either.
+    // SYNCING is not a verdict either: the block is executed again from the
+    // payload held, not asked of the fleet (audit 2026-10 round 2, R2-R3)...
     rig.svc.driver.cache_payload(built.hash, built.execution_data.clone());
+    rig.svc.driver.set_import_retry_backoff(vec![Duration::ZERO]);
     rig.el.set_behaviour(MockBehaviour { new_payload_status: PayloadStatusEnum::Syncing, ..Default::default() });
     rig.svc.body_grace = Duration::ZERO;
     rig.svc.awaiting_bodies.clear();
@@ -147,6 +149,11 @@ async fn an_execution_that_is_not_a_verdict_asks_for_the_body_and_an_invalid_one
     events.clear();
     within(rig.svc.handle_output(EngineOutput::ExecuteBlock(built.hash), &mut events)).await.expect("ok");
     assert!(!rig.svc.imported.contains(&built.hash), "never counted as imported");
+    assert!(events.is_empty() && rig.svc.awaiting_bodies.is_empty(), "executed again, not asked for: {events:?}");
+    // ...and once the pauses run out, asked for at once with no grace.
+    for action in within(rig.svc.driver.retry_failed_imports()).await {
+        rig.svc.apply_driver_action(action, &mut events).expect("ok");
+    }
     assert!(rig.svc.awaiting_bodies.contains(&built.hash), "with no grace the ask is immediate");
     assert_eq!(events, vec![ServiceEvent::PayloadMissing { block_hash: built.hash }]);
     // Asked again at once: rate limited, no second event.

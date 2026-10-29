@@ -108,11 +108,12 @@ impl ReportGuard {
 
 impl Drop for ReportGuard {
     fn drop(&mut self) {
+        // Not executed, rather than INVALID: a local failure says nothing
+        // about the block, and INVALID withdrew the evidence for a block
+        // that may be valid (audit 2026-10 round 2, R2-I7).
         if let Some(report) = self.report.take() {
-            let _ = report.send(ImportReport::Done(
-                self.block_hash,
-                ImportVerdict::Invalid("the import task ended without a verdict".to_string()),
-            ));
+            warn!(target: "n42.h2.el", block = ?self.block_hash, "an import task ended without a verdict; the block is asked for again");
+            let _ = report.send(ImportReport::Done(self.block_hash, ImportVerdict::NotYet));
         }
     }
 }
@@ -3330,5 +3331,23 @@ fn say_slow_commit(
             Err(error) => format!("error: {error}"),
         };
         info!(target: "n42.h2.el", block = ?block_hash, elapsed_ms, ahead_of_import, %outcome, "commit forkchoice");
+    }
+}
+
+/// Audit 2026-10 round 2 (R2-I7): an import task that ends without a verdict
+/// -- a panic, a dropped runtime -- is a local failure, not a verdict on the
+/// block. Reported INVALID, it withdrew the evidence for a block that may be
+/// valid; it is reported as not executed, and the block is asked for again.
+#[cfg(test)]
+mod report_guard_tests {
+    use super::*;
+
+    #[test]
+    fn an_import_task_that_ends_without_a_verdict_reports_not_yet() {
+        let (report, mut reports) = tokio::sync::mpsc::unbounded_channel();
+        drop(ReportGuard { block_hash: B256::repeat_byte(7), report: Some(report) });
+        let Ok(ImportReport::Done(hash, verdict)) = reports.try_recv() else { panic!("a report") };
+        assert_eq!(hash, B256::repeat_byte(7));
+        assert!(matches!(verdict, ImportVerdict::NotYet), "{verdict:?}");
     }
 }

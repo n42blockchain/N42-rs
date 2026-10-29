@@ -213,9 +213,10 @@ async fn imports_queue_behind_the_one_in_flight_and_a_queued_block_with_no_paylo
 }
 
 #[tokio::test]
-async fn an_import_task_that_dies_reports_an_invalid_verdict_instead_of_hanging() {
+async fn an_import_task_that_dies_reports_not_yet_instead_of_hanging() {
     // An execution layer that panics inside newPayload: the task ends with no
-    // verdict, and the guard says so.
+    // verdict, and the guard says so -- as not executed, not as INVALID: a
+    // local failure is no verdict on the block (audit 2026-10 round 2, R2-I7).
     struct Panics(MockExecutionLayer);
     #[async_trait::async_trait]
     impl ExecutionLayer for Panics {
@@ -252,13 +253,12 @@ async fn an_import_task_that_dies_reports_an_invalid_verdict_instead_of_hanging(
     let mut rx = driver.take_foreign_imports().expect("channel");
     driver.cache_payload(built.hash, built.execution_data.clone());
     driver.handle_output(&execute(built.hash)).await;
-    let ImportReport::Done(hash, ImportVerdict::Invalid(reason)) = next_report(&mut rx).await else {
-        panic!("expected an invalid verdict from the guard");
+    let ImportReport::Done(hash, ImportVerdict::NotYet) = next_report(&mut rx).await else {
+        panic!("expected a not-yet report from the guard");
     };
     assert_eq!(hash, built.hash);
-    assert_eq!(reason, "the import task ended without a verdict");
-    let actions = driver.finish_execute(ImportReport::Done(hash, ImportVerdict::Invalid(reason))).await;
-    assert!(actions[0].rejection().is_some());
+    let actions = driver.finish_execute(ImportReport::Done(hash, ImportVerdict::NotYet)).await;
+    assert!(actions.iter().all(|action| action.rejection().is_none()), "no rejection: {actions:?}");
     assert!(!driver.is_importing(&built.hash), "the slot is not held for good");
 }
 

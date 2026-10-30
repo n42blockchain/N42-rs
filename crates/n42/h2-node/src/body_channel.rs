@@ -412,12 +412,12 @@ impl BodyPushers {
     }
 
     /// How many peers this pushes to.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.peers.len()
     }
 
     /// Whether there are no peers.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.peers.is_empty()
     }
 

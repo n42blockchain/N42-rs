@@ -1,5 +1,5 @@
+//! Mobile validator SDK: key generation, deposit and exit transactions, and the verification client.
 use blst::min_pk::SecretKey;
-use futures_util::StreamExt;
 use hex::FromHex;
 use jsonrpsee::core::client::Subscription;
 use jsonrpsee::core::client::{ClientT, SubscriptionClientT};
@@ -11,7 +11,6 @@ use reth_chainspec::{ChainSpec, ChainSpecBuilder, EthereumHardfork, ForkConditio
 use n42_tx_types::{Block, Receipt};
 use reth_evm::execute::Executor;
 use reth_evm::ConfigureEvm;
-use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{AlloyBlockHeader, RecoveredBlock, SealedBlock};
 use reth_provider::test_utils::MockEthProvider;
 use reth_revm::{database::StateProviderDatabase, db::State};
@@ -19,20 +18,24 @@ use revm_primitives::B256;
 use std::{sync::Arc, time::Duration};
 use tokio::time::timeout;
 
+/// Unsigned deposit and exit transaction builders.
 pub mod deposit_exit;
 
 /// cbindgen:ignore
 pub mod jni;
 
+/// C foreign function interface of the SDK.
 pub mod c_ffi;
 
+/// BLS12-381 helpers built on blst.
 pub mod blst_utils;
 
+/// Connects to a node over WebSocket and answers its block verification requests with BLS signatures.
 pub async fn run_client(ws_url: &str, validator_private_key: &str) -> eyre::Result<()> {
     let validator_private_key = validator_private_key
         .strip_prefix("0x")
         .unwrap_or(validator_private_key);
-    let validator_private_key_vec = Vec::from_hex(&validator_private_key)?;
+    let validator_private_key_vec = Vec::from_hex(validator_private_key)?;
     let sk = SecretKey::from_bytes(&validator_private_key_vec)
         .map_err(|e| eyre::eyre!("SecretKey error: {e:?}"))?;
     let pk = sk.sk_to_pk();
@@ -127,6 +130,7 @@ pub async fn run_client(ws_url: &str, validator_private_key: &str) -> eyre::Resu
     }
 }
 
+#[allow(unused_assignments)] // initial value documents the loop state
 fn verify(mut unverifiedblock: UnverifiedBlock) -> eyre::Result<B256> {
     println!("verify, {unverifiedblock:?}");
     let provider_1 = MockEthProvider::default();
@@ -165,15 +169,14 @@ fn verify(mut unverifiedblock: UnverifiedBlock) -> eyre::Result<B256> {
     println!("computed {receipts_root:?}");
 
     // for test
-    if sealed_block_receipts_root != B256::ZERO {
-        if receipts_root != sealed_block_receipts_root {
+    if sealed_block_receipts_root != B256::ZERO
+        && receipts_root != sealed_block_receipts_root {
             return Err(eyre::eyre!(
                 "receipts_root={:?}, expected={:?}",
                 receipts_root,
                 sealed_block_receipts_root
             ));
         }
-    }
 
     Ok(receipts_root)
 }

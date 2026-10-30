@@ -3,10 +3,9 @@
 use alloy_consensus::TxReceipt;
 use alloy_eips::eip7685::Requests;
 use alloy_eips::{BlockHashOrNumber, BlockNumHash};
-use alloy_primitives::FixedBytes;
-use alloy_primitives::{keccak256, Address, BlockHash, TxHash, B256, U128, U256};
-use alloy_primitives::{BlockNumber, Bytes, Sealable};
-use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
+use alloy_primitives::{Address, BlockHash, TxHash, B256, U128, U256};
+use alloy_primitives::{BlockNumber, Sealable};
+use alloy_rpc_types_engine::{CancunPayloadFields, ForkchoiceState};
 use blst::min_pk::PublicKey;
 use blst::min_pk::{AggregateSignature, Signature};
 use eyre::OptionExt;
@@ -15,10 +14,9 @@ use n42_clique::{BlockVerifyResult, UnverifiedBlock};
 use n42_engine_primitives::PayloadAttributesBuilderExt;
 use reth_chainspec::EthChainSpec;
 use reth_chainspec::EthereumHardforks;
-use reth_consensus::{ConsensusError, FullConsensus};
+use reth_consensus::FullConsensus;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_eth_wire_types::{NetworkPrimitives, NewBlock};
-use n42_tx_types::N42Primitives as EthPrimitives;
 use reth_network_api::{
     BlockAnnounceProvider, BlockDownloaderProvider, FullNetwork, NetworkEventListenerProvider,
 };
@@ -26,8 +24,7 @@ use reth_network_p2p::{
     bodies::client::BodiesClient, headers::client::HeadersClient, priority::Priority, BlockClient,
 };
 use reth_payload_builder::PayloadBuilderHandle;
-use reth_payload_primitives::EngineApiMessageVersion;
-use reth_payload_primitives::{BuiltPayload, PayloadAttributesBuilder, PayloadKind, PayloadTypes};
+use reth_payload_primitives::{BuiltPayload, PayloadKind, PayloadTypes};
 use n42_tx_types::{Block, N42TxEnvelope as TransactionSigned};
 use reth_primitives_traits::Header;
 // reth-primitives (deleted in reth 2.4.1) supplied this default type argument.
@@ -39,10 +36,8 @@ use reth_provider::{
     BeaconProvider, BeaconProviderWriter, BlockIdReader, BlockReader, ChainSpecProvider,
     ChainStateBlockReader, DatabaseProviderFactory,
 };
-use reth_storage_errors::provider::ProviderResult;
 use reth_transaction_pool::TransactionPool;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::{
     future::Future,
@@ -56,11 +51,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::beacon::Beacon;
-use crate::network::{broadcast_beacon_block, fetch_beacon_block};
 use n42_primitives::{
     agg_sig_to_fixed, fixed_to_agg_sig, parse_deposit_log, Attestation, AttestationData, BLSPubkey,
-    BeaconBlock, BeaconState, BlockVerifyResultAggregate, CommitteeIndex, Deposit, RelativeEpoch,
-    VoluntaryExitWithSig, SLOTS_PER_EPOCH,
+    BeaconBlock, BeaconState, CommitteeIndex, Deposit, RelativeEpoch, SLOTS_PER_EPOCH,
 };
 
 /// A mining mode for the local dev engine.
@@ -163,8 +156,10 @@ struct PendingBlockData {
     attestations: HashMap<CommitteeIndex, Attestation>,
 }
 
+#[allow(dead_code)] // tuning constant kept with the deposit scan; not used today
 const DEPOSIT_GAP: u64 = 6;
 const INMEMORY_BLOCKS: u32 = 256;
+#[allow(dead_code)] // tuning constant kept next to INMEMORY_BLOCKS; not used today
 const INMEMORY_BEACON_BLOCKS: u32 = 256;
 const NUM_NUM_TO_TD: u32 = 256;
 const WAIT_FOR_PEERS_INTERVAL_SECS: u64 = 5;
@@ -176,8 +171,7 @@ const MIN_NO_BLOCK_TIMESTAMP_GAP: u64 = 300;
 impl<T, Provider, B, Network> N42Miner<T, Provider, B, Network>
 where
     T: PayloadTypes,
-    <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives,
-    <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives<Block = Block>,
+    <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives + NodePrimitives<Block = Block>,
     Provider: BlockReader
         + BlockIdReader
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
@@ -186,16 +180,16 @@ where
         + BeaconProviderWriter
         + 'static + Clone,
     B: PayloadAttributesBuilderExt<<T as PayloadTypes>::PayloadAttributes>,
-    Network: FullNetwork,
     // Block is already Block<TransactionSigned>;
     // reth-primitives' alias was generic over the transaction type, this one is not.
-    Network: BlockAnnounceProvider<Block = Block>,
+    Network: FullNetwork + BlockAnnounceProvider<Block = Block>,
     <<Network as BlockDownloaderProvider>::Client as BlockClient>::Block: reth_primitives_traits::Block<Header = reth_primitives_traits::Header>,
     <<<Network as BlockDownloaderProvider>::Client as BlockClient>::Block as reth_primitives_traits::Block>::Body: BlockBody< Transaction = TransactionSigned>,
     <<Network as NetworkEventListenerProvider>::Primitives as NetworkPrimitives>::Block: reth_primitives_traits::Block<Header = reth_primitives_traits::Header>,
     <<Network as NetworkEventListenerProvider>::Primitives as NetworkPrimitives>::BlockBody: reth_primitives_traits::BlockBody<OmmerHeader = reth_primitives_traits::Header>,
 {
     /// Spawns a new [`N42Miner`] with the given parameters.
+    #[allow(clippy::too_many_arguments)] // public constructor; the argument list is kept
     pub fn spawn_new(
         provider: Provider,
         payload_attributes_builder: B,
@@ -215,7 +209,7 @@ where
                 unimplemented!("Add a separate flow if needed");
             }
             MiningMode::Interval(ref v) => v,
-            _ => return (),
+            _ => return ,
         };
         let block_time = mode_interval.period().as_secs();
 
@@ -290,10 +284,9 @@ where
                 }
                 new_block_event = &mut new_block_event_stream.next() => {
                     debug!(target: "consensus-client", "new_block_event={:?}", new_block_event);
-                    if let Some(new_block) = new_block_event {
-                    if let Err(e) = self.handle_new_block(new_block).await {
+                    if let Some(new_block) = new_block_event
+                    && let Err(e) = self.handle_new_block(new_block).await {
                         error!(target: "consensus-client", "Error handling the new block: {:?}", e);
-                    }
                     }
                 }
                 network_event = &mut network_event_stream.next() => {
@@ -375,7 +368,7 @@ where
         let best_block_number = self.provider.best_block_number()?;
         let latest_header = self.provider
             .sealed_header(best_block_number)?
-.ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
+.ok_or_else(|| eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)?;
         if now.as_secs() > self.start_timestamp + MIN_NO_BLOCK_TIMESTAMP_GAP &&
@@ -463,13 +456,12 @@ where
         let mut larger_td = max_td < U256::from(new_block.td);
         debug!(target: "consensus-client", is_fork, ?max_td, new_block_td=?U256::from(new_block.td));
 
-        if let Some(&mut v) = self.recent_num_to_td.get(&new_block.block.number) {
-            if v >= U256::from(new_block.td) {
+        if let Some(&mut v) = self.recent_num_to_td.get(&new_block.block.number)
+            && v >= U256::from(new_block.td) {
                 debug!(target: "consensus-client", number=new_block.block.number, td=?U256::from(new_block.td), old_td=?v, "skip new block");
                 self.num_skipped_new_block += 1;
                 larger_td = false;
             }
-        }
         if is_fork && larger_td {
             let mut new_payload_ok = true;
             for parent in parents.iter().rev() {
@@ -531,7 +523,7 @@ where
         let header = self
             .provider
             .sealed_header(best_block_number)?
-            .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
+            .ok_or_else(|| eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
         let snapshot = self
             .consensus
             .snapshot(header.number(), header.hash_slow(), None)?;
@@ -545,25 +537,25 @@ where
         Ok(num_signers)
     }
 
+    #[allow(clippy::needless_pass_by_ref_mut)] // signature kept; callers hold the miner mutably
     fn get_safe_block_num_hash_from_provider(&mut self) -> eyre::Result<BlockNumHash> {
         let mut safe_block_number = self
             .provider
             .safe_block_number()
             .unwrap_or(Some(0))
             .unwrap_or(0);
-        if safe_block_number == 0 {
-            if let Ok(db_provider) = self.provider.database_provider_ro() {
+        if safe_block_number == 0
+            && let Ok(db_provider) = self.provider.database_provider_ro() {
                 safe_block_number = db_provider
                     .last_safe_block_number()
                     .unwrap_or(Some(0))
                     .unwrap_or(0);
             }
-        }
 
         let safe_block_header = self
             .provider
             .sealed_header(safe_block_number)?
-            .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", safe_block_number))?;
+            .ok_or_else(|| eyre::eyre!("sealed_header not found, block_number={:?}", safe_block_number))?;
         let safe_block_hash = safe_block_header.hash_slow();
 
         Ok(BlockNumHash {
@@ -583,7 +575,7 @@ where
         let header = self
             .provider
             .sealed_header(best_block_number)?
-            .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
+            .ok_or_else(|| eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
 
         const NUM_SAMPLE_ROUNDS: u64 = 2;
         const NUM_CONFIRM_ROUNDS: u64 = 1;
@@ -591,10 +583,10 @@ where
         let num_signers = self.get_best_block_num_signers()?;
         let best_block_number = self.provider.best_block_number()?;
         let mut active_signers: Vec<Address> = Vec::new();
-        for i in (best_block_number.saturating_sub(NUM_SAMPLE_ROUNDS * num_signers) ..best_block_number) {
-            if (i > 0) {
+        for i in best_block_number.saturating_sub(NUM_SAMPLE_ROUNDS * num_signers) ..best_block_number {
+            if i > 0 {
                 let sealed_header = self.provider.sealed_header(i)?
-                    .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", i))?;
+                    .ok_or_else(|| eyre::eyre!("sealed_header not found, block_number={:?}", i))?;
                 let signer = recover_address_generic(sealed_header.header())
                     .map_err(|e| eyre::eyre!("{e:?}"))?;
                 active_signers.push(signer);
@@ -608,9 +600,9 @@ where
         if num_active_signers == num_signers {
             // if in NUM_CONFIRM_ROUNDS rounds, all active signers have signed a 2-difficulty block, then it is considered finalized
             let mut num_recent_signers_in_order: u64 = 0;
-            for i in (best_block_number.saturating_sub(NUM_CONFIRM_ROUNDS * num_signers)..best_block_number) {
+            for i in best_block_number.saturating_sub(NUM_CONFIRM_ROUNDS * num_signers)..best_block_number {
                 let sealed_header = self.provider.sealed_header(i)?
-                    .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", i))?;
+                    .ok_or_else(|| eyre::eyre!("sealed_header not found, block_number={:?}", i))?;
                 if sealed_header
                         .header()
                         .difficulty()
@@ -635,7 +627,7 @@ where
         let safe_block_header = self
             .provider
             .sealed_header(safe_block_number)?
-            .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", safe_block_number))?;
+            .ok_or_else(|| eyre::eyre!("sealed_header not found, block_number={:?}", safe_block_number))?;
         let safe_block_hash = safe_block_header.hash_slow();
 
         Ok(BlockNumHash {
@@ -689,15 +681,15 @@ where
             return Err(eyre::eyre!("verification result block hash mismatch: block_hash={block_hash:?}, pending block hash={:?}", block.hash()));
         }
 
-        let mut attestation = pending_block_data.attestations.get_mut(&attestation_data.committee_index)
-.ok_or(eyre::eyre!("attestation not found, block_hash={block_hash:?}, committee index={:?}", attestation_data.committee_index))?;
+        let attestation = pending_block_data.attestations.get_mut(&attestation_data.committee_index)
+.ok_or_else(|| eyre::eyre!("attestation not found, block_hash={block_hash:?}, committee index={:?}", attestation_data.committee_index))?;
 
         let signature = Signature::from_bytes(&hex::decode(signature)?).map_err(|e| eyre::eyre!("{e:?}"))?;
 
         let pubkey_str = pubkey.clone();
         let pubkey = PublicKey::from_bytes(&hex::decode(pubkey)?).map_err(|e| eyre::eyre!("{e:?}"))?;
 
-        let validator_index = self.beacon.get_validator_index_from_beacon_state(block.parent_hash(), pubkey)?.ok_or(eyre::eyre!("validator not found, block_hash={block_hash:?}, pubkey={pubkey_str:?}"))?;
+        let validator_index = self.beacon.get_validator_index_from_beacon_state(block.parent_hash(), pubkey)?.ok_or_else(|| eyre::eyre!("validator not found, block_hash={block_hash:?}, pubkey={pubkey_str:?}"))?;
         if attestation.validator_indexes.contains(&validator_index) {
             return Err(eyre::eyre!("duplicate attestations for validator, pubkey={pubkey_str:?}"));
         }
@@ -728,11 +720,10 @@ where
         }
         attestation.validator_indexes.insert(validator_index);
         let updated_attestation = attestation.clone();
-        if let Some(ref mut pending_data) = self.pending_block_data {
-            if let Some(stored_attestation) = pending_data.attestations.get_mut(&attestation_data.committee_index) {
+        if let Some(ref mut pending_data) = self.pending_block_data
+            && let Some(stored_attestation) = pending_data.attestations.get_mut(&attestation_data.committee_index) {
                 *stored_attestation = updated_attestation;
             }
-        }
 
         Ok(())
     }
@@ -785,15 +776,15 @@ where
         } else {
             //fetch_beacon_block(block.header().parent_hash).unwrap().hash_slow()
             self.provider.get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash)?
-            .ok_or(eyre::eyre!("get_beacon_block_hash_by_eth1_hash failed, hash={:?}", block.header().parent_hash))?
+            .ok_or_else(|| eyre::eyre!("get_beacon_block_hash_by_eth1_hash failed, hash={:?}", block.header().parent_hash))?
         };
         let beacon_block = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &attestations.values().cloned().collect(), &execution_requests, &block)?;
         let beacon_block_hash = beacon_block.hash_slow();
         self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
         self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
 
-        let new_beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?
-            .ok_or(eyre::eyre!("get_beacon_state_by_hash failed, hash={:?}", beacon_block_hash))?;
+        let _new_beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?
+            .ok_or_else(|| eyre::eyre!("get_beacon_state_by_hash failed, hash={:?}", beacon_block_hash))?;
 
         self.recent_blocks.insert(block.hash_slow(), block.clone());
 
@@ -852,7 +843,7 @@ where
         let header = self
             .provider
             .sealed_header(best_block_number)?
-            .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
+            .ok_or_else(|| eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
         debug!(target: "consensus-client", block_time, "prepare_block");
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)?;
@@ -906,7 +897,7 @@ where
             for (i, v) in beacon_state_after_withdrawal.validators_store.iter().take(5).enumerate() {
                 info!(target: "consensus-client",
                     validator_index=i,
-                    pubkey=hex::encode(&v.pubkey),
+                    pubkey=hex::encode(v.pubkey),
                     activation_eligibility_epoch=v.activation_eligibility_epoch,
                     activation_epoch=v.activation_epoch,
                     exit_epoch=v.exit_epoch,
@@ -956,7 +947,7 @@ where
         let pending_block_data = PendingBlockData {
             block: payload.block().clone(),
             beacon_state_after_withdrawal: beacon_state_after_withdrawal.clone(),
-            execution_requests: execution_requests.clone(),
+            execution_requests,
             attestations: Default::default(),
         };
         self.pending_block_data.replace(pending_block_data);
@@ -1005,7 +996,7 @@ where
                 },
                 ..Default::default()
             };
-            self.pending_block_data.as_mut().ok_or(eyre::eyre!("pending_block_data not found, block_number={:?}", block.number))?.attestations.insert(beacon_committee.index, attestation);
+            self.pending_block_data.as_mut().ok_or_else(|| eyre::eyre!("pending_block_data not found, block_number={:?}", block.number))?.attestations.insert(beacon_committee.index, attestation);
             let mut target_committee_pubkeys = Vec::new();
             for validator_index in beacon_committee.committee {
                 target_committee_pubkeys.push(beacon_state_after_withdrawal.get_validator(*validator_index)?.pubkey);
@@ -1014,7 +1005,7 @@ where
                 block_number=block.number, 
                 committee_index=beacon_committee.index, 
                 num_validators=target_committee_pubkeys.len(),
-                pubkeys=?target_committee_pubkeys.iter().map(|p| hex::encode(p)).collect::<Vec<_>>(),
+                pubkeys=?target_committee_pubkeys.iter().map(hex::encode).collect::<Vec<_>>(),
                 "prepare_block: broadcasting to committee"
             );
             unverified_block.committee_index = beacon_committee.index;
@@ -1040,10 +1031,11 @@ where
         })
     }
 
+    #[allow(clippy::needless_pass_by_ref_mut)] // signature kept; callers hold the miner mutably
     async fn new_payload(&mut self, block: &SealedBlock<<<T::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block>) -> eyre::Result<()> {
         debug!(target: "consensus-client", "new_block hash {:?}", block.header().hash_slow());
 
-        let cancun_fields = self
+        let _cancun_fields = self
             .provider
             .chain_spec()
             .is_cancun_active_at_timestamp(block.timestamp())
@@ -1087,6 +1079,7 @@ where
         Ok(())
     }
 
+    #[allow(clippy::needless_pass_by_ref_mut)] // signature kept; callers hold the miner mutably
     async fn fcu_hash_finalized(
         &mut self,
         finalized_hash: BlockHash,
@@ -1139,7 +1132,7 @@ where
 
         for number in (start_block_number..=best_block_number).skip(1) {
             let block = self.provider.block_by_number(number)?
-                .ok_or(eyre::eyre!("block_by_number failed, block_number={:?}", number))?;
+                .ok_or_else(|| eyre::eyre!("block_by_number failed, block_number={:?}", number))?;
 
             let hash = block.header().hash_slow();
             debug!(target: "consensus-client", number, "initial_sync_to_hash, fetching header");
@@ -1201,7 +1194,7 @@ where
         let header = self
             .provider
             .sealed_header(best_block_number)?
-            .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
+            .ok_or_else(|| eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
 
         if header.hash() == block_hash {
             Ok(())
@@ -1258,7 +1251,7 @@ where
         let header = self
             .provider
             .sealed_header(best_block_number)?
-            .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
+            .ok_or_else(|| eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
         let td = self.consensus.total_difficulty(header.hash_slow());
         let average_td = td.to::<u64>() as f64 / header.number() as f64;
         info!(hash=?header.hash(), ?td, header_number=header.number(), header_timestamp=header.timestamp(), average_td, "max_td_and_hash");
@@ -1273,6 +1266,7 @@ where
         }
     }
 
+    #[allow(dead_code)] // deposit scan kept for the beacon deposit path; not called today
     fn get_deposits(&self, block_number: BlockNumber) -> eyre::Result<Vec<Deposit>> {
         let mut deposits = Vec::new();
         debug!(target: "consensus-client", ?block_number, "get_deposits");
@@ -1280,7 +1274,7 @@ where
             for receipt in &receipts {
                 for log in receipt.logs() {
                     debug!(target: "consensus-client", ?log);
-                    if let Some(deposit_event) = parse_deposit_log(&log) {
+                    if let Some(deposit_event) = parse_deposit_log(log) {
                         debug!(target: "consensus-client", ?deposit_event);
                         let mut deposit: Deposit = Default::default();
                         deposit.data.amount = u64::from_le_bytes(deposit_event.amount.as_ref().try_into()?);

@@ -1,7 +1,7 @@
 //! State test model for EF tests
 
 use super::{
-    deserialize_b256, deserialize_bytes, deserialize_u256, deserialize_u256_opt, deserialize_u64,
+    deserialize_b256, deserialize_bytes, deserialize_u256_opt, deserialize_u64,
     Account, Transaction,
 };
 use alloy_primitives::{Address, Bytes, B256, U256};
@@ -10,7 +10,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::str::FromStr;
 
 /// A complete state test fixture file contains multiple test cases
-pub type StateTestFile = HashMap<String, StateTest>;
+#[allow(dead_code)] // file-level alias kept for callers of the fixture format; not used today
+pub(super) type StateTestFile = HashMap<String, StateTest>;
 
 /// A single state test case
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,7 +58,7 @@ pub struct Environment {
     #[serde(deserialize_with = "deserialize_u64")]
     pub current_timestamp: u64,
 
-    /// Block difficulty (PoW) or prev_randao (PoS)
+    /// Block difficulty (`PoW`) or `prev_randao` (`PoS`)
     #[serde(
         default,
         deserialize_with = "deserialize_u256_opt",
@@ -65,7 +66,7 @@ pub struct Environment {
     )]
     pub current_difficulty: Option<U256>,
 
-    /// Block random/prev_randao (PoS)
+    /// Block `random/prev_randao` (`PoS`)
     #[serde(
         default,
         deserialize_with = "deserialize_b256_opt",
@@ -139,7 +140,7 @@ pub struct StateTestIndexes {
     /// Index into transaction.data array
     pub data: usize,
 
-    /// Index into transaction.gas_limit array
+    /// Index into `transaction.gas_limit` array
     pub gas: usize,
 
     /// Index into transaction.value array
@@ -301,7 +302,7 @@ impl Environment {
             .unwrap_or(0)
     }
 
-    /// Get prev_randao/random value
+    /// Get `prev_randao/random` value
     pub fn prev_randao(&self) -> B256 {
         self.current_random.unwrap_or_default()
     }

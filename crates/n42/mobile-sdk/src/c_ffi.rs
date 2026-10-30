@@ -97,7 +97,7 @@ pub unsafe extern "C" fn run_client_c(
     validator_private_key: *const c_char,
     out_error: *mut *mut c_char,
 ) -> i32 {
-    let mut set_error = |msg: String| {
+    let set_error = |msg: String| {
         if !out_error.is_null() {
             unsafe {
                 *out_error = make_c_string(msg);
@@ -148,7 +148,7 @@ pub unsafe extern "C" fn run_client_c(
 /// from this library and not been freed before.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn generate_bls12_381_keypair_c(out_error: *mut *mut c_char) -> *mut c_char {
-    let mut set_error = |msg: String| {
+    let set_error = |msg: String| {
         if !out_error.is_null() {
             unsafe {
                 *out_error = make_c_string(msg);
@@ -197,7 +197,7 @@ pub unsafe extern "C" fn create_deposit_unsigned_tx_c(
     deposit_value_in_wei: *const c_char,
     out_error: *mut *mut c_char,
 ) -> *mut c_char {
-    let mut set_error = |msg: String| {
+    let set_error = |msg: String| {
         if !out_error.is_null() {
             unsafe {
                 *out_error = make_c_string(msg);
@@ -270,7 +270,7 @@ pub unsafe extern "C" fn create_deposit_unsigned_tx_c(
 /// from this library and not been freed before.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_get_exit_fee_unsigned_tx_c(out_error: *mut *mut c_char) -> *mut c_char {
-    let mut set_error = |msg: String| {
+    let set_error = |msg: String| {
         if !out_error.is_null() {
             unsafe {
                 *out_error = make_c_string(msg);
@@ -317,7 +317,7 @@ pub unsafe extern "C" fn create_exit_unsigned_tx_c(
     fee_in_wei_or_empty: *const c_char,
     out_error: *mut *mut c_char,
 ) -> *mut c_char {
-    let mut set_error = |msg: String| {
+    let set_error = |msg: String| {
         if !out_error.is_null() {
             unsafe {
                 *out_error = make_c_string(msg);

@@ -91,6 +91,14 @@ pub struct N42EngineExt<T: PayloadTypes> {
     pub persisted_block: Option<PersistedBlock>,
 }
 
+impl<T: PayloadTypes> std::fmt::Debug for N42EngineExt<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("N42EngineExt")
+            .field("raw_endpoint", &self.raw_endpoint)
+            .finish_non_exhaustive()
+    }
+}
+
 #[jsonrpsee::core::async_trait]
 impl<T> N42EngineApiServer for N42EngineExt<T>
 where

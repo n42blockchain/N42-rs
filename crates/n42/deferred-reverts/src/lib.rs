@@ -179,6 +179,7 @@ pub struct RegisterTiming {
 }
 
 /// [`register`], timed.
+#[allow(clippy::useless_let_if_seq)] // hot-path function kept as written
 pub fn register_timed<T: Send + Sync + 'static>(output: &Arc<T>) -> (LateReverts, RegisterTiming) {
     let slot = Arc::new(Slot::default());
     let keep: Arc<dyn Any + Send + Sync> = output.clone();

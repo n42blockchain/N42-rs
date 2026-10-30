@@ -1,12 +1,12 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! N42 APoS consensus error types
+//! N42 `APoS` consensus error types
 
 use alloy_primitives::{Address, B256};
 use thiserror::Error;
 
-/// APoS consensus errors
+/// `APoS` consensus errors
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum AposError {
     /// Unknown block hash
@@ -54,7 +54,7 @@ pub enum AposError {
     #[error("unauthorized signer: {0}")]
     UnauthorizedSigner(Address),
 
-    /// Signer has signed recently (within SIGNER_LIMIT)
+    /// Signer has signed recently (within `SIGNER_LIMIT`)
     #[error("signer {0} recently signed at block {1}")]
     RecentlySigned(Address, u64),
 
@@ -86,7 +86,7 @@ pub enum AposError {
     #[error("parent block not found: {0}")]
     ParentNotFound(B256),
 
-    /// Generic APoS error with details
+    /// Generic `APoS` error with details
     #[error("apos error: {0}")]
     Other(String),
 }
@@ -98,7 +98,7 @@ impl AposError {
     }
 
     /// Check if this is a recoverable error
-    pub fn is_recoverable(&self) -> bool {
+    pub const fn is_recoverable(&self) -> bool {
         matches!(
             self,
             Self::UnknownBlock(_)
@@ -109,7 +109,7 @@ impl AposError {
     }
 
     /// Check if this is a validation error
-    pub fn is_validation_error(&self) -> bool {
+    pub const fn is_validation_error(&self) -> bool {
         matches!(
             self,
             Self::InvalidCheckpointBeneficiary(_)
@@ -125,7 +125,7 @@ impl AposError {
     }
 }
 
-/// Result type for APoS operations
+/// Result type for `APoS` operations
 pub type AposResult<T> = Result<T, AposError>;
 
 #[cfg(test)]

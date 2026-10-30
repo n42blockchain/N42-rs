@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use ssz::{four_byte_option_impl, Decode, DecodeError, Encode};
 use ssz_derive::{Decode, Encode};
 use std::ops::Range;
-use std::sync::Arc;
 use tracing::debug;
 
 // Define "legacy" implementations of `Option<Epoch>`, `Option<NonZeroUsize>` which use four bytes
@@ -70,11 +69,12 @@ impl CommitteeCache {
     ///
     /// Spec v0.12.1
     /// PERF: Uses cached shuffle results when available
+    #[allow(clippy::useless_let_if_seq)] // kept as written
     pub fn initialized(
         state: &BeaconState,
         epoch: Epoch,
         spec: &ChainSpec,
-    ) -> eyre::Result<CommitteeCache> {
+    ) -> eyre::Result<Self> {
         // Check that the cache is being built for an in-range epoch.
         if epoch > state.current_epoch() + 1 {
             return Err(eyre::eyre!("Error::EpochOutOfBounds"));
@@ -120,12 +120,11 @@ impl CommitteeCache {
         let shuffling = {
             // Try cache read
             let mut cached_result = None;
-            if let Ok(cache) = SHUFFLE_CACHE.read() {
-                if let Some(shuffling) = cache.peek(&cache_key) {
+            if let Ok(cache) = SHUFFLE_CACHE.read()
+                && let Some(shuffling) = cache.peek(&cache_key) {
                     debug!(target: "committee_cache", epoch, "Shuffle cache hit");
                     cached_result = Some(shuffling.clone());
                 }
-            }
 
             if let Some(result) = cached_result {
                 result
@@ -138,7 +137,7 @@ impl CommitteeCache {
                     &seed[..],
                     false,
                 )
-                .ok_or(eyre::eyre!("Error::UnableToShuffle"))?;
+                .ok_or_else(|| eyre::eyre!("Error::UnableToShuffle"))?;
 
                 // Cache the result
                 if let Ok(mut cache) = SHUFFLE_CACHE.write() {
@@ -153,11 +152,11 @@ impl CommitteeCache {
         for (i, &v) in shuffling.iter().enumerate() {
             *shuffling_positions
                 .get_mut(v)
-                .ok_or(eyre::eyre!("Error::ShuffleIndexOutOfBounds, v={v}"))? =
+                .ok_or_else(|| eyre::eyre!("Error::ShuffleIndexOutOfBounds, v={v}"))? =
                 NonZeroUsize::new(i + 1).into();
         }
 
-        Ok(CommitteeCache {
+        Ok(Self {
             initialized_epoch: Some(epoch),
             shuffling,
             shuffling_positions,
@@ -226,7 +225,7 @@ impl CommitteeCache {
 
     /// Get all the Beacon committees at a given `slot`.
     ///
-    /// Committees are sorted by ascending index order 0..committees_per_slot
+    /// Committees are sorted by ascending index order `0..committees_per_slot`
     pub fn get_beacon_committees_at_slot(
         &self,
         slot: Slot,
@@ -237,7 +236,7 @@ impl CommitteeCache {
 
         (0..self.committees_per_slot())
             .map(|index| {
-                self.get_beacon_committee(slot, index).ok_or(eyre::eyre!(
+                self.get_beacon_committee(slot, index).ok_or_else(|| eyre::eyre!(
                     "Error::NoCommittee, slot={slot}, index={index}"
                 ))
             })
@@ -248,7 +247,7 @@ impl CommitteeCache {
     pub fn get_all_beacon_committees(&self) -> eyre::Result<Vec<BeaconCommittee<'_>>> {
         let initialized_epoch = self
             .initialized_epoch
-            .ok_or(eyre::eyre!("Error::CommitteeCacheUninitialized(None)"))?;
+            .ok_or_else(|| eyre::eyre!("Error::CommitteeCacheUninitialized(None)"))?;
 
         ((initialized_epoch * self.slots_per_epoch)..)
             .take(self.slots_per_epoch as usize)
@@ -311,7 +310,7 @@ impl CommitteeCache {
     /// Always returns `usize::default()` for a non-initialized epoch.
     ///
     /// Spec v0.12.1
-    pub fn active_validator_count(&self) -> usize {
+    pub const fn active_validator_count(&self) -> usize {
         self.shuffling.len()
     }
 
@@ -320,7 +319,7 @@ impl CommitteeCache {
     /// Always returns `usize::default()` for a non-initialized epoch.
     ///
     /// Spec v0.12.1
-    pub fn epoch_committee_count(&self) -> usize {
+    pub const fn epoch_committee_count(&self) -> usize {
         epoch_committee_count(
             self.committees_per_slot as usize,
             self.slots_per_epoch as usize,
@@ -328,7 +327,7 @@ impl CommitteeCache {
     }
 
     /// Returns the number of committees per slot for this cache's epoch.
-    pub fn committees_per_slot(&self) -> u64 {
+    pub const fn committees_per_slot(&self) -> u64 {
         self.committees_per_slot
     }
 
@@ -346,7 +345,7 @@ impl CommitteeCache {
     /// Will also return `None` if the index is out of bounds.
     ///
     /// Spec v0.12.1
-    fn compute_committee_range(&self, index: usize) -> Option<Range<usize>> {
+    const fn compute_committee_range(&self, index: usize) -> Option<Range<usize>> {
         compute_committee_range_in_epoch(self.epoch_committee_count(), index, self.shuffling.len())
     }
 
@@ -366,7 +365,7 @@ impl CommitteeCache {
 ///
 /// The return result may be used to provide input to the `compute_committee_range_in_epoch`
 /// function.
-pub fn compute_committee_index_in_epoch(
+pub(crate) const fn compute_committee_index_in_epoch(
     slot: Slot,
     slots_per_epoch: usize,
     committees_per_slot: usize,
@@ -379,7 +378,7 @@ pub fn compute_committee_index_in_epoch(
 ///
 /// The `index_in_epoch` parameter can be computed computed using
 /// `compute_committee_index_in_epoch`.
-pub fn compute_committee_range_in_epoch(
+pub(crate) const fn compute_committee_range_in_epoch(
     epoch_committee_count: usize,
     index_in_epoch: usize,
     shuffling_len: usize,
@@ -395,7 +394,7 @@ pub fn compute_committee_range_in_epoch(
 }
 
 /// Returns the total number of committees in an epoch.
-pub fn epoch_committee_count(committees_per_slot: usize, slots_per_epoch: usize) -> usize {
+pub(crate) const fn epoch_committee_count(committees_per_slot: usize, slots_per_epoch: usize) -> usize {
     committees_per_slot * slots_per_epoch
 }
 
@@ -403,7 +402,8 @@ pub fn epoch_committee_count(committees_per_slot: usize, slots_per_epoch: usize)
 /// `epoch`.
 ///
 /// Spec v0.12.1
-pub fn get_active_validator_indices<'a, V, I>(validators: V, epoch: Epoch) -> Vec<usize>
+#[allow(dead_code)] // spec helper kept for reference; not used today
+pub(crate) fn get_active_validator_indices<'a, V, I>(validators: V, epoch: Epoch) -> Vec<usize>
 where
     V: IntoIterator<Item = &'a Validator, IntoIter = I>,
     I: ExactSizeIterator + Iterator<Item = &'a Validator>,

@@ -1069,7 +1069,7 @@ impl QmdbForest {
 
     /// How many slots the move bookkeeping names (with repeats) for the next
     /// [`Self::delta_since`].
-    pub fn dirty_slot_count(&self) -> usize {
+    pub const fn dirty_slot_count(&self) -> usize {
         self.dirty_slots.len()
     }
 
@@ -1258,11 +1258,10 @@ impl QmdbForest {
         if self.head.1 == from {
             self.head.1 = to;
         }
-        if let Some((parent, _)) = self.pending.as_mut() {
-            if *parent == from {
+        if let Some((parent, _)) = self.pending.as_mut()
+            && *parent == from {
                 *parent = to;
             }
-        }
         for child in self.records.values_mut() {
             if child.parent == from {
                 child.parent = to;

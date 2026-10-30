@@ -9,9 +9,8 @@ use crate::suite::TestDiscovery;
 use crate::utils::TestFilter;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 
 /// Trait for test suites
 pub trait Suite {
@@ -68,13 +67,13 @@ impl StateTestSuite {
     }
 
     /// Set whether to run tests in parallel
-    pub fn with_parallel(mut self, parallel: bool) -> Self {
+    pub const fn with_parallel(mut self, parallel: bool) -> Self {
         self.parallel = parallel;
         self
     }
 
     /// Set the chain ID
-    pub fn with_chain_id(mut self, chain_id: u64) -> Self {
+    pub const fn with_chain_id(mut self, chain_id: u64) -> Self {
         self.chain_id = chain_id;
         self
     }
@@ -90,11 +89,10 @@ impl StateTestSuite {
 
         for (test_name, test) in &tests {
             // Check filter
-            if let Some(f) = filter {
-                if !f.matches(test_name) {
+            if let Some(f) = filter
+                && !f.matches(test_name) {
                     continue;
                 }
-            }
 
             // Run test for each fork
             let test_forks: Vec<_> = if self.forks.is_empty() {
@@ -115,11 +113,10 @@ impl StateTestSuite {
                 }
 
                 // Check fork filter
-                if let Some(f) = filter {
-                    if !f.matches_fork(&fork) {
+                if let Some(f) = filter
+                    && !f.matches_fork(&fork) {
                         continue;
                     }
-                }
 
                 // Get the post-state results for this fork
                 if let Some(post_results) = test.post_for_fork(&fork) {
@@ -282,13 +279,13 @@ impl BlockchainTestSuite {
     }
 
     /// Set whether to run tests in parallel
-    pub fn with_parallel(mut self, parallel: bool) -> Self {
+    pub const fn with_parallel(mut self, parallel: bool) -> Self {
         self.parallel = parallel;
         self
     }
 
     /// Set the chain ID
-    pub fn with_chain_id(mut self, chain_id: u64) -> Self {
+    pub const fn with_chain_id(mut self, chain_id: u64) -> Self {
         self.chain_id = chain_id;
         self
     }
@@ -306,11 +303,10 @@ impl BlockchainTestSuite {
 
         for (test_name, test) in &tests {
             // Check filter
-            if let Some(f) = filter {
-                if !f.matches(test_name) {
+            if let Some(f) = filter
+                && !f.matches(test_name) {
                     continue;
                 }
-            }
 
             let fork = test.fork();
 
@@ -325,11 +321,10 @@ impl BlockchainTestSuite {
             }
 
             // Check fork filter
-            if let Some(f) = filter {
-                if !f.matches_fork(fork) {
+            if let Some(f) = filter
+                && !f.matches_fork(fork) {
                     continue;
                 }
-            }
 
             // Run the blockchain test
             let result = self.run_blockchain_test(test, test_name);
@@ -486,7 +481,7 @@ impl TransactionTestSuite {
     }
 
     /// Set whether to run tests in parallel
-    pub fn with_parallel(mut self, parallel: bool) -> Self {
+    pub const fn with_parallel(mut self, parallel: bool) -> Self {
         self.parallel = parallel;
         self
     }
@@ -502,11 +497,10 @@ impl TransactionTestSuite {
 
         for (test_name, test) in &tests {
             // Check filter
-            if let Some(f) = filter {
-                if !f.matches(test_name) {
+            if let Some(f) = filter
+                && !f.matches(test_name) {
                     continue;
                 }
-            }
 
             // Run test for each fork it covers
             for fork in test.forks() {
@@ -520,11 +514,10 @@ impl TransactionTestSuite {
                 }
 
                 // Check fork filter
-                if let Some(f) = filter {
-                    if !f.matches_fork(fork) {
+                if let Some(f) = filter
+                    && !f.matches_fork(fork) {
                         continue;
                     }
-                }
 
                 // Check suite fork filter
                 if !self.forks.is_empty() && !self.forks.iter().any(|f| f.eq_ignore_ascii_case(fork)) {

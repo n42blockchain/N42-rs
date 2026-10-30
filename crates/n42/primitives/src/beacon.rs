@@ -28,8 +28,6 @@ use crate::{activation_queue::ActivationQueue, CommitteeIndex, Hash256, Slot, Va
 use educe::Educe;
 use ethereum_hashing::hash;
 use merkle_db_rs::tree::VecTree;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 use typenum::U100000;
 
 // ========== Performance Optimization: Public Key Cache ==========
@@ -42,11 +40,10 @@ static PUBKEY_CACHE: Lazy<RwLock<LruMap<FixedBytes<48>, PublicKey>>> =
 /// Get or parse a public key with caching
 fn get_cached_pubkey(pubkey_bytes: &FixedBytes<48>) -> eyre::Result<PublicKey> {
     // Try cache read first
-    if let Ok(cache) = PUBKEY_CACHE.read() {
-        if let Some(pk) = cache.peek(pubkey_bytes) {
-            return Ok(pk.clone());
+    if let Ok(cache) = PUBKEY_CACHE.read()
+        && let Some(pk) = cache.peek(pubkey_bytes) {
+            return Ok(*pk);
         }
-    }
 
     // Parse public key
     let pk = PublicKey::from_bytes(pubkey_bytes.as_slice())
@@ -54,7 +51,7 @@ fn get_cached_pubkey(pubkey_bytes: &FixedBytes<48>) -> eyre::Result<PublicKey> {
 
     // Cache it
     if let Ok(mut cache) = PUBKEY_CACHE.write() {
-        cache.insert(*pubkey_bytes, pk.clone());
+        cache.insert(*pubkey_bytes, pk);
     }
 
     Ok(pk)
@@ -67,62 +64,106 @@ fn get_cached_pubkey(pubkey_bytes: &FixedBytes<48>) -> eyre::Result<PublicKey> {
 const SHUFFLE_CACHE_SIZE: u32 = 8;
 /// Shuffle cache key: (epoch, seed, active validator count, keccak256 of the active indices).
 pub type ShuffleCacheKey = (u64, B256, usize, B256);
+/// Cache of committee shuffles, keyed by [`ShuffleCacheKey`].
 pub static SHUFFLE_CACHE: Lazy<RwLock<LruMap<ShuffleCacheKey, Vec<usize>>>> =
     Lazy::new(|| RwLock::new(LruMap::new(schnellru::ByLength::new(SHUFFLE_CACHE_SIZE))));
 
+/// Number of slots in an epoch.
 pub const SLOTS_PER_EPOCH: u64 = 32;
 
+/// Domain constant mixed into the committee seed for attester selection.
 pub const DOMAIN_CONSTANT_BEACON_ATTESTER: u32 = 1;
 
 // EthSpec
+#[allow(non_upper_case_globals)] // public name kept for API compatibility
+/// Maximum number of withdrawals in one execution payload.
 pub const max_withdrawals_per_payload: usize = 16;
+#[allow(non_upper_case_globals)] // public name kept for API compatibility
+/// Maximum number of pending partial withdrawals.
 pub const pending_partial_withdrawals_limit: usize = 16; // ?
+#[allow(non_upper_case_globals)] // public name kept for API compatibility
+/// Maximum number of deposits per block.
 pub const MaxDeposits: u64 = 16;
+#[allow(non_upper_case_globals)] // public name kept for API compatibility
+/// The genesis epoch.
 pub const genesis_epoch: u64 = 0;
 
 #[derive(Debug, Default)]
+/// Chain-wide beacon parameters (churn limits, balances, rewards, penalties).
 pub struct ChainSpec {
+    /// Maximum number of pending partial withdrawals handled per sweep.
     pub max_pending_partials_per_withdrawals_sweep: u64,
+    /// Minimum balance, in Gwei, a validator needs to be activated.
     pub min_activation_balance: u64,
+    /// Balance, in Gwei, at or below which a validator is ejected.
     pub ejection_balance: u64,
+    /// Sentinel epoch meaning "never".
     pub far_future_epoch: u64,
+    /// Maximum number of validators examined per withdrawal sweep.
     pub max_validators_per_withdrawals_sweep: u64,
+    /// Maximum effective balance of a validator, in Gwei.
     pub max_effective_balance: u64,
+    /// Withdrawal request amount that denotes a full exit.
     pub full_exit_request_amount: u64,
+    /// Epochs a validator must be active before it may exit.
     pub shard_committee_period: u64, //?
+    /// Withdrawal-credential prefix byte of compounding credentials.
     pub compounding_withdrawal_prefix_byte: u8,
+    /// Withdrawal-credential prefix byte of execution-address credentials.
     pub eth1_address_withdrawal_prefix_byte: u8,
+    /// Maximum number of epochs a seed is derived ahead of its use.
     pub max_seed_lookahead: u64,
+    /// Upper bound of the activation and exit balance churn per epoch, in Gwei.
     pub max_per_epoch_activation_exit_churn_limit: u64,
+    /// Lower bound of the per-epoch balance churn limit, in Gwei.
     pub min_per_epoch_churn_limit_electra: u64,
+    /// Divisor that derives the churn limit from the active validator count.
     pub churn_limit_quotient: u64,
+    /// Granularity of effective balances, in Gwei.
     pub effective_balance_increment: u64,
+    /// Number of base rewards a validator can earn per epoch.
     pub base_rewards_per_epoch: u64,
+    /// Scaling factor of the base reward.
     pub base_reward_factor: u64,
+    /// Epochs without finality before the inactivity penalty applies.
     pub min_epochs_to_inactivity_penalty: u64,
+    /// Divisor of the inactivity penalty.
     pub inactivity_penalty_quotient: u64, //?
+    /// Divisor that turns an attester reward into the proposer reward.
     pub proposer_reward_quotient: u64,
+    /// Lower bound of the per-epoch validator churn limit.
     pub min_per_epoch_churn_limit: u64,
+    /// Maximum number of committees per slot.
     pub max_committees_per_slot: usize,
+    /// Target number of validators per attestation committee.
     pub target_committee_size: usize,
+    /// Minimum number of epochs between a seed's epoch and the epoch that uses it.
     pub min_seed_lookahead: u64,
+    /// Number of rounds of the committee shuffle.
     pub shuffle_round_count: u8,
 
+    /// Amount an inactivity score grows per epoch of inactivity.
     pub inactivity_score_bias: u64,
+    /// Amount an inactivity score drops per epoch when the validator is not punished.
     pub inactivity_score_recovery_rate: u64,
+    /// Upper bound of a validator's inactivity score.
     pub max_inactivity_score: u64,
+    /// Inactivity score above which the validator is punished.
     pub trigger_punish_inactivity_score: u64,
+    /// Multiple of the base reward charged as inactivity penalty.
     pub multiple_reward_for_inactivity_penalty: u64,
 
+    /// Epochs between a validator's exit and the time it can withdraw.
     pub min_validator_withdrawability_delay: u64,
 }
 
-pub fn beacon_chain_spec() -> ChainSpec {
+/// Returns the beacon chain parameters used by this network.
+pub const fn beacon_chain_spec() -> ChainSpec {
     ChainSpec {
         max_pending_partials_per_withdrawals_sweep: 16,
         min_activation_balance: 32000000000,
         ejection_balance: 16000000000,
-        far_future_epoch: u64::max_value(),
+        far_future_epoch: u64::MAX,
         max_validators_per_withdrawals_sweep: 16384,
         max_effective_balance: 32000000000,
         full_exit_request_amount: 0,
@@ -165,6 +206,7 @@ pub const multiple_reward_for_inactivity_penalty: u64 = 3;
 pub const min_validator_withdrawability_delay: u64 = 1;
 */
 
+/// Number of epochs of committee caches kept.
 pub const CACHED_EPOCHS: usize = 3;
 
 // lighthouse: consensus/types/src/chain_spec.rs, get_deposit_domain()
@@ -192,86 +234,122 @@ sol! {
     );
 }
 
+/// Epoch number.
 pub type Epoch = u64;
 
-pub fn epoch_to_block_number(epoch: Epoch) -> u64 {
+/// Returns the first block number of `epoch`, saturating at `u64::MAX`.
+pub const fn epoch_to_block_number(epoch: Epoch) -> u64 {
     epoch.saturating_mul(SLOTS_PER_EPOCH)
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+/// An exit a validator announces for itself.
 pub struct VoluntaryExit {
+    /// Epoch the record applies to.
     pub epoch: Epoch,
+    /// Index of the validator in the registry.
     pub validator_index: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+/// A voluntary exit together with the validator's signature.
 pub struct VoluntaryExitWithSig {
+    /// The exit message being signed.
     pub voluntary_exit: VoluntaryExit,
+    /// Signature over the enclosing message.
     pub signature: Bytes,
 }
 
+/// Beacon states to be written to the database in one batch.
+#[derive(Debug)]
 pub struct BeaconStateChangeset {
+    /// Beacon states to persist, keyed by block hash.
     pub beaconstates: Vec<(BlockHash, BeaconState)>,
 }
 
+/// Beacon blocks to be written to the database in one batch.
+#[derive(Debug)]
 pub struct BeaconBlockChangeset {
+    /// Beacon blocks to persist, keyed by block hash.
     pub beaconblocks: Vec<(BlockHash, BeaconBlock)>,
 }
 
 #[derive(Educe, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 #[educe(Debug)]
+/// The beacon state: validator registry, balances, scores and withdrawal bookkeeping.
 pub struct BeaconState {
+    /// Slot (block height) this record refers to.
     pub slot: u64,
+    /// Index of the next deposit to process.
     pub eth1_deposit_index: u64,
     //pub validators: Vec<Validator>,
+    /// Merkle root of the validator registry.
     pub validators: Hash256,
+    /// Number of validators in the registry.
     pub validators_len: u64,
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
     #[educe(Debug(ignore))]
+    /// In-memory validator registry; skipped by serde and SSZ, rebuilt from the stored leaves.
     pub validators_store: VecTree<Validator, U100000>,
 
     //pub balances: Vec<Gwei>,
+    /// Merkle root of the validator balance list.
     pub balances: Hash256,
+    /// Number of balances in the registry.
     pub balances_len: u64,
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
     #[educe(Debug(ignore))]
+    /// In-memory balance list; skipped by serde and SSZ, rebuilt from the stored leaves.
     pub balances_store: VecTree<Gwei, U100000>,
 
     //pub inactivity_scores: Vec<u64>,
+    /// Merkle root of the inactivity score list.
     pub inactivity_scores: Hash256,
+    /// Number of entries in the inactivity score list.
     pub inactivity_scores_len: u64,
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
     #[educe(Debug(ignore))]
+    /// In-memory inactivity score list; skipped by serde and SSZ, rebuilt from the stored leaves.
     pub inactivity_scores_store: VecTree<u64, U100000>,
 
+    /// Current RANDAO mix used as the shuffling seed.
     pub randao_mix: B256,
 
+    /// Index assigned to the next withdrawal.
     pub next_withdrawal_index: u64,
+    /// Validator index at which the next withdrawal sweep starts.
     pub next_withdrawal_validator_index: u64,
+    /// Queue of partial withdrawals waiting for their withdrawable epoch.
     pub pending_partial_withdrawals: Vec<PendingPartialWithdrawal>,
+    /// Earliest epoch in which a new exit can be scheduled.
     pub earliest_exit_epoch: Epoch,
+    /// Exit balance still available in the earliest exit epoch, in Gwei.
     pub exit_balance_to_consume: u64,
 
     //pub total_active_balance: Option<TotalActiveBalance>,
 
     //pub committee_caches: Vec<CommitteeCache>,
+    /// Merkle root of the epoch's attester index list.
     pub epoch_attester_indexes: Hash256,
+    /// Number of recorded attester indexes in the epoch.
     pub epoch_attester_indexes_len: u64,
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
     #[educe(Debug(ignore))]
+    /// In-memory attester index list of the epoch; skipped by serde and SSZ.
     pub epoch_attester_indexes_store: VecTree<u64, U100000>,
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
     #[educe(Debug(ignore))]
+    /// Set form of the epoch's attester indexes; skipped by serde and SSZ.
     pub epoch_attester_indexes_set: BTreeSet<u64>,
 }
 
@@ -287,18 +365,27 @@ impl Sealable for BeaconState {
     }
 }
 
+/// Amount in Gwei (1e-9 ETH).
 pub type Gwei = u64;
 
 // mock
+/// BLS public key (48 bytes).
 pub type BLSPubkey = FixedBytes<48>;
+/// BLS signature (96 bytes).
 pub type BLSSignature = FixedBytes<96>;
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+/// A beacon block header plus its body.
 pub struct BeaconBlock {
+    /// Slot (block height) this record refers to.
     pub slot: Slot,
+    /// Hash of the execution block this beacon block commits to.
     pub eth1_block_hash: BlockHash,
+    /// Hash of the parent block.
     pub parent_hash: BlockHash,
+    /// Root of the beacon state after this block.
     pub state_root: B256,
+    /// Body of the block.
     pub body: BeaconBlockBody,
 }
 
@@ -309,16 +396,21 @@ impl Sealable for BeaconBlock {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+/// Aggregated verification result for a block: who verified it and their combined signature.
 pub struct BlockVerifyResultAggregate {
+    /// Registry indexes of the validators that took part.
     pub validator_indexes: BTreeSet<u64>,
+    /// Aggregate BLS signature of the verifiers over the block, if any signed.
     pub block_aggregate_signature: Option<FixedBytes<96>>,
 }
 
+/// Packs an aggregate BLS signature into its 96-byte form.
 pub fn agg_sig_to_fixed(sig: &AggregateSignature) -> FixedBytes<96> {
     FixedBytes::from(sig.to_signature().to_bytes())
 }
 
+/// Parses an aggregate BLS signature from its 96-byte form.
 pub fn fixed_to_agg_sig(bytes: &FixedBytes<96>) -> eyre::Result<AggregateSignature> {
     Ok(AggregateSignature::from_signature(
         &Signature::from_bytes(bytes.as_ref())
@@ -326,27 +418,42 @@ pub fn fixed_to_agg_sig(bytes: &FixedBytes<96>) -> eyre::Result<AggregateSignatu
     ))
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+/// Body of a beacon block: attestations, deposits, exits and execution requests.
 pub struct BeaconBlockBody {
+    /// Attestations included in the block.
     pub attestations: Vec<Attestation>,
+    /// Deposits carried by this container.
     pub deposits: Vec<Deposit>,
+    /// Signed voluntary exits included in the block.
     pub voluntary_exits: Vec<VoluntaryExitWithSig>,
+    /// Requests that the execution layer produced for the beacon layer.
     pub execution_requests: ExecutionRequestsV4,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+/// Requests the execution layer hands to the beacon layer.
 pub struct ExecutionRequests {
+    /// Deposits carried by this container.
     pub deposits: Vec<DepositRequest>,
+    /// Withdrawal requests carried by this container.
     pub withdrawals: Vec<WithdrawalRequest>,
+    /// Consolidation requests carried by this container.
     pub consolidations: Vec<ConsolidationRequest>,
 }
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Hash, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+/// A deposit request produced by the execution layer.
 pub struct DepositRequest {
+    /// BLS public key of the validator.
     pub pubkey: Bytes,
+    /// Withdrawal credentials: a prefix byte followed by the withdrawal target.
     pub withdrawal_credentials: B256,
+    /// Amount in Gwei.
     pub amount: u64,
+    /// Signature over the enclosing message.
     pub signature: Bytes,
+    /// Index of the deposit in the deposit tree.
     pub index: u64,
 }
 
@@ -359,45 +466,65 @@ pub struct WithdrawalRequest {
 }
 */
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+/// A request to consolidate one validator into another.
 pub struct ConsolidationRequest {
+    /// Execution address that requested the consolidation.
     pub source_address: Address,
+    /// BLS public key of the consolidation source validator.
     pub source_pubkey: Bytes,
+    /// BLS public key of the consolidation target validator.
     pub target_pubkey: Bytes,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+/// An aggregated attestation over a block.
 pub struct Attestation {
+    /// Registry indexes of the validators that took part.
     pub validator_indexes: BTreeSet<u64>,
+    /// Payload data of this container.
     pub data: AttestationData,
+    /// Aggregate BLS signature of the verifiers over the block, if any signed.
     pub block_aggregate_signature: Option<FixedBytes<96>>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+/// What an attestation vouches for.
 pub struct AttestationData {
+    /// Slot (block height) this record refers to.
     pub slot: Slot,
+    /// Index of the committee within the slot.
     pub committee_index: CommitteeIndex,
+    /// Receipts root of the attested execution block.
     pub receipts_root: B256,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+/// A deposit together with its Merkle proof.
 pub struct Deposit {
+    /// Merkle proof of the deposit against the deposit root.
     pub proof: Vec<B256>,
+    /// Payload data of this container.
     pub data: DepositData,
 }
 
 /// Used by deposit data signing and verifying, do not modify field data types
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct DepositData {
+    /// BLS public key of the validator.
     pub pubkey: FixedBytes<48>,
     #[serde(rename = "withdrawal_credentials")]
+    /// Withdrawal credentials: a prefix byte followed by the withdrawal target.
     pub withdrawal_credentials: B256,
+    /// Amount in Gwei.
     pub amount: u64,
+    /// Signature over the enclosing message.
     pub signature: FixedBytes<96>,
 }
 
 impl DepositData {
-    pub fn as_deposit_message(&self) -> DepositMessage {
+    /// Returns the deposit message (the part of the deposit that is signed).
+    pub const fn as_deposit_message(&self) -> DepositMessage {
         DepositMessage {
             pubkey: self.pubkey,
             withdrawal_credentials: self.withdrawal_credentials,
@@ -405,7 +532,7 @@ impl DepositData {
         }
     }
 
-    /// Generate the signature for a given DepositData details.
+    /// Generate the signature for a given `DepositData` details.
     pub fn create_signature(
         &self,
         secret_key: &SecretKey,
@@ -431,6 +558,7 @@ impl DepositData {
         )
     }
 
+    /// Returns true if the deposit signature verifies against the deposit pubkey.
     pub fn verify_signature(&self) -> bool {
         let signature = match Signature::from_bytes(self.signature.as_ref()) {
             Ok(v) => v,
@@ -457,24 +585,33 @@ impl DepositData {
     }
 }
 
-#[derive(TreeHash, Serialize, Deserialize)]
+#[derive(Debug, TreeHash, Serialize, Deserialize)]
+/// The part of a deposit that is signed.
 pub struct DepositMessage {
+    /// BLS public key of the validator.
     pub pubkey: FixedBytes<48>,
+    /// Withdrawal credentials: a prefix byte followed by the withdrawal target.
     pub withdrawal_credentials: B256,
     #[serde(with = "serde_utils::quoted_u64")]
+    /// Amount in Gwei.
     pub amount: u64,
 }
 
 impl SignedRoot for DepositMessage {}
 
 //arbitrary::Arbitrary,
-#[derive(Debug, PartialEq, Clone, Serialize, Deserialize, Encode, Decode, TreeHash)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Encode, Decode, TreeHash)]
+/// The object root and domain that a signature is actually made over.
 pub struct SigningData {
+    /// Tree-hash root of the object being signed.
     pub object_root: B256,
+    /// Signature domain the root is signed under.
     pub domain: B256,
 }
 
+/// An SSZ object whose signing root can be computed under a domain.
 pub trait SignedRoot: tree_hash::TreeHash {
+    /// Returns the signing root of `self` under `domain`.
     fn signing_root(&self, domain: Hash256) -> Hash256 {
         SigningData {
             object_root: self.tree_hash_root(),
@@ -484,13 +621,14 @@ pub trait SignedRoot: tree_hash::TreeHash {
     }
 }
 
+/// Decodes a deposit contract log into a `DepositEvent`, or `None` if it is another event.
 pub fn parse_deposit_log(log: &Log) -> Option<DepositEvent> {
     let deposit_event_sig = b"DepositEvent(bytes,bytes,bytes,bytes,bytes)";
-    let deposit_topic: B256 = keccak256(deposit_event_sig).into();
+    let deposit_topic: B256 = keccak256(deposit_event_sig);
     debug!(target: "consensus-client", ?deposit_topic, "parse_deposit_log");
-    if let Some(&topic) = log.topics().get(0) {
+    if let Some(&topic) = log.topics().first() {
         if topic == deposit_topic {
-            match DepositEvent::decode_log(&log) {
+            match DepositEvent::decode_log(log) {
                 Ok(v) => Some(v.data),
                 Err(err) => {
                     error!(target: "consensus-client", ?err, "parse_deposit_log failed");
@@ -506,6 +644,7 @@ pub fn parse_deposit_log(log: &Log) -> Option<DepositEvent> {
 }
 
 impl BeaconState {
+    /// Creates an empty beacon state.
     pub fn new() -> Self {
         let validators_len = 0;
         let validators_store = VecTree::try_new(validators_len).unwrap();
@@ -533,22 +672,24 @@ impl BeaconState {
         }
     }
 
+    /// Applies `beacon_block` to `old_beacon_state` and returns the resulting state.
     pub fn state_transition(
-        old_beacon_state: &BeaconState,
+        old_beacon_state: &Self,
         beacon_block: &BeaconBlock,
     ) -> eyre::Result<Self> {
         debug!(target: "consensus-client", ?old_beacon_state, ?beacon_block, "state_transition");
         let spec = beacon_chain_spec();
         let mut new_beacon_state = old_beacon_state.clone();
         new_beacon_state.slot += 1;
-        if (new_beacon_state.slot) % SLOTS_PER_EPOCH == 0 {
+        if (new_beacon_state.slot).is_multiple_of(SLOTS_PER_EPOCH) {
             new_beacon_state.process_epoch(&spec)?;
         }
-        new_beacon_state.process_block(&beacon_block, &spec)?;
+        new_beacon_state.process_block(beacon_block, &spec)?;
 
         Ok(new_beacon_state)
     }
 
+    /// Runs the epoch transition: effective balances, inactivity scores and registry updates.
     pub fn process_epoch(&mut self, spec: &ChainSpec) -> eyre::Result<()> {
         // PERF: Batch collect updates to minimize tree operations
         // Phase 1: Collect effective balance updates
@@ -560,14 +701,14 @@ impl BeaconState {
             let balance = self
                 .balances_store
                 .get(index)?
-                .ok_or(eyre::eyre!("BalanceNotfound"))?
+                .ok_or_else(|| eyre::eyre!("BalanceNotfound"))?
                 .min(&spec.max_effective_balance);
             let new_effective_balance =
                 round_to_nearest(*balance, spec.effective_balance_increment);
             let validator = self
                 .validators_store
                 .get(index)?
-                .ok_or(eyre::eyre!("ValidatorNotfound"))?;
+                .ok_or_else(|| eyre::eyre!("ValidatorNotfound"))?;
 
             if new_effective_balance != validator.effective_balance {
                 let mut updated_validator = validator.clone();
@@ -594,7 +735,7 @@ impl BeaconState {
             let current_score = self
                 .inactivity_scores_store
                 .get(validator_index)?
-                .ok_or(eyre::eyre!("InactivityScoreNotfound"))?;
+                .ok_or_else(|| eyre::eyre!("InactivityScoreNotfound"))?;
 
             let new_score = if is_active {
                 current_score.saturating_sub(spec.inactivity_score_recovery_rate)
@@ -625,6 +766,7 @@ impl BeaconState {
         Ok(())
     }
 
+    /// Runs the registry updates: activation eligibility, activation queue and ejections.
     pub fn process_registry_updates(&mut self, spec: &ChainSpec) -> eyre::Result<()> {
         // Process activation eligibility and ejections.
         // Collect eligible and exiting validators (we need to avoid mutating the state while iterating).
@@ -659,7 +801,7 @@ impl BeaconState {
             let mut validator = self
                 .validators_store
                 .get(index)?
-                .ok_or(eyre::eyre!("ValidatorNotfound"))?
+                .ok_or_else(|| eyre::eyre!("ValidatorNotfound"))?
                 .clone();
             if validator.is_eligible_for_activation_queue(spec) {
                 validator.activation_eligibility_epoch = current_epoch.safe_add(1)?;
@@ -694,7 +836,7 @@ impl BeaconState {
             let mut validator = self
                 .validators_store
                 .get(index)?
-                .ok_or(eyre::eyre!("ValidatorNotfound"))?
+                .ok_or_else(|| eyre::eyre!("ValidatorNotfound"))?
                 .clone();
             validator.activation_epoch = delayed_activation_epoch;
             self.validators_store.set(index, validator)?;
@@ -703,6 +845,7 @@ impl BeaconState {
         Ok(())
     }
 
+    /// Applies a block to the state: randao update followed by its operations.
     pub fn process_block(
         &mut self,
         beacon_block: &BeaconBlock,
@@ -713,6 +856,7 @@ impl BeaconState {
         Ok(())
     }
 
+    /// Verifies the block's attestations and mixes them into the randao.
     pub fn process_randao(
         &mut self,
         beacon_block_body: &BeaconBlockBody,
@@ -725,7 +869,7 @@ impl BeaconState {
         let mut mix = self.randao_mix;
         for attestation in &beacon_block_body.attestations {
             if let Some(sig) = attestation.block_aggregate_signature {
-                mix = mix ^ keccak256(sig);
+                mix ^= keccak256(sig);
             }
         }
 
@@ -734,6 +878,7 @@ impl BeaconState {
         Ok(())
     }
 
+    /// Processes the block's attestations, deposits, withdrawals and exits.
     pub fn process_operations(
         &mut self,
         beacon_block_body: &BeaconBlockBody,
@@ -765,6 +910,7 @@ impl BeaconState {
         Ok(())
     }
 
+    /// Processes execution-layer withdrawal requests (full exits and partial withdrawals).
     pub fn process_withdrawal_requests(
         &mut self,
         requests: &[WithdrawalRequest],
@@ -865,18 +1011,20 @@ impl BeaconState {
         Ok(())
     }
 
+    /// Processes a list of attestations one by one.
     pub fn process_attestation(&mut self, attestations: &Vec<Attestation>) -> eyre::Result<()> {
         for attestation in attestations {
-            let _ = self.process_one_attestation(attestation)?;
+            self.process_one_attestation(attestation)?;
         }
 
         Ok(())
     }
 
+    /// Verifies one attestation and records its validator indexes for the epoch.
     pub fn process_one_attestation(&mut self, attestation: &Attestation) -> eyre::Result<()> {
-        self.verify_aggregate_signature(&attestation)?;
+        self.verify_aggregate_signature(attestation)?;
         //self.epoch_attester_indexes.extend(attestation.validator_indexes.iter());
-        for validator_index in attestation.validator_indexes.iter() {
+        for validator_index in &attestation.validator_indexes {
             self.epoch_attester_indexes_store.push(*validator_index)?;
         }
 
@@ -911,7 +1059,7 @@ impl BeaconState {
             true,
             bytes_slice,
             alloy_rpc_types_beacon::constants::BLS_DST_SIG,
-            &pubkeys_refs.as_slice(),
+            pubkeys_refs.as_slice(),
         );
         debug!(target: "consensus-client", slot=?attestation.data.slot, pubkeys_len=?pubkeys.len(), ?aggregate_sig_verify_result);
 
@@ -980,7 +1128,7 @@ impl BeaconState {
                 true,
                 msg.as_slice(),
                 alloy_rpc_types_beacon::constants::BLS_DST_SIG,
-                &pubkeys_refs.as_slice(),
+                pubkeys_refs.as_slice(),
             );
 
             if result != blst::BLST_ERROR::BLST_SUCCESS {
@@ -996,6 +1144,7 @@ impl BeaconState {
         Ok(())
     }
 
+    /// Returns the withdrawals due in the next payload and the number of partial withdrawals they consume.
     pub fn get_expected_withdrawals(
         &self,
         spec: &ChainSpec,
@@ -1008,7 +1157,7 @@ impl BeaconState {
 
         let mut processed_partial_withdrawals_count = 0;
 
-        for withdrawal in self.pending_partial_withdrawals.iter() {
+        for withdrawal in &self.pending_partial_withdrawals {
             if withdrawal.withdrawable_epoch > epoch
                 || withdrawals.len() == spec.max_pending_partials_per_withdrawals_sweep as usize
             {
@@ -1043,7 +1192,7 @@ impl BeaconState {
                     validator_index: withdrawal.validator_index,
                     address: validator
                         .get_execution_withdrawal_address()
-                        .ok_or(eyre::eyre!("NonExecutionAddressWithdrawalCredential"))?,
+                        .ok_or_else(|| eyre::eyre!("NonExecutionAddressWithdrawalCredential"))?,
                     amount: withdrawable_balance,
                 });
                 withdrawal_index.safe_add_assign(1)?;
@@ -1074,7 +1223,7 @@ impl BeaconState {
                     address: validator
                         .get_execution_withdrawal_address()
                         //.ok_or(BlockProcessingError::WithdrawalCredentialsInvalid)?,
-                        .ok_or(eyre::eyre!("WithdrawalCredentialsInvalid"))?,
+                        .ok_or_else(|| eyre::eyre!("WithdrawalCredentialsInvalid"))?,
                     amount: balance,
                 });
                 withdrawal_index.safe_add_assign(1)?;
@@ -1085,7 +1234,7 @@ impl BeaconState {
                     address: validator
                         .get_execution_withdrawal_address()
                         //.ok_or(BlockProcessingError::WithdrawalCredentialsInvalid)?,
-                        .ok_or(eyre::eyre!("WithdrawalCredentialsInvalid"))?,
+                        .ok_or_else(|| eyre::eyre!("WithdrawalCredentialsInvalid"))?,
                     //amount: balance.safe_sub(validator.get_max_effective_balance(spec, fork_name))?,
                     amount: balance.safe_sub(spec.max_effective_balance)?,
                 });
@@ -1103,6 +1252,7 @@ impl BeaconState {
         Ok((withdrawals, Some(processed_partial_withdrawals_count)))
     }
 
+    /// Applies the expected withdrawals to the balances and advances the sweep cursors.
     pub fn process_withdrawals(&mut self) -> eyre::Result<(Vec<Withdrawal>, Option<usize>)> {
         let spec = beacon_chain_spec();
         let (expected_withdrawals, processed_partial_withdrawals_count) =
@@ -1110,13 +1260,13 @@ impl BeaconState {
 
         // TODO: check expected_withdrawals hash root against execution payload withdrawals root
 
-        for withdrawal in expected_withdrawals.iter() {
+        for withdrawal in &expected_withdrawals {
             decrease_balance(self, withdrawal.validator_index as usize, withdrawal.amount)?;
         }
 
         // Update pending partial withdrawals [New in Electra:EIP7251]
         if let Some(processed_partial_withdrawals_count) =
-            processed_partial_withdrawals_count.clone()
+            processed_partial_withdrawals_count
         {
             self
                 //.pending_partial_withdrawals_mut()?
@@ -1155,17 +1305,19 @@ impl BeaconState {
         Ok((expected_withdrawals, processed_partial_withdrawals_count))
     }
 
-    pub fn current_epoch(&self) -> Epoch {
+    /// Returns the epoch of the state's current slot.
+    pub const fn current_epoch(&self) -> Epoch {
         self.slot / SLOTS_PER_EPOCH
     }
 
+    /// Returns the epoch after the current one.
     pub fn next_epoch(&self) -> eyre::Result<Epoch> {
         Ok(self.current_epoch().safe_add(1)?)
     }
 
     /// The epoch prior to `self.current_epoch()`.
     ///
-    /// If the current epoch is the genesis epoch, the genesis_epoch is returned.
+    /// If the current epoch is the genesis epoch, the `genesis_epoch` is returned.
     pub fn previous_epoch(&self) -> Epoch {
         let current_epoch = self.current_epoch();
         if let Ok(prev_epoch) = current_epoch.safe_sub(1) {
@@ -1179,7 +1331,7 @@ impl BeaconState {
     pub fn get_validator(&self, validator_index: usize) -> eyre::Result<&Validator> {
         self.validators_store
             .get(validator_index)?
-            .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
+            .ok_or_else(|| eyre::eyre!("UnknownValidator, {validator_index}"))
     }
 
     /*
@@ -1187,15 +1339,16 @@ impl BeaconState {
     pub fn get_validator_mut(&mut self, validator_index: usize) -> eyre::Result<&mut Validator> {
         self.validators
             .get_mut(validator_index)
-            .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
+            .ok_or_else(|| eyre::eyre!("UnknownValidator, {validator_index}"))
     }
     */
 
+    /// Returns the balance of a validator, in Gwei.
     pub fn get_balance(&self, validator_index: usize) -> eyre::Result<u64> {
         self.balances_store
             .get(validator_index)?
             .copied()
-            .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
+            .ok_or_else(|| eyre::eyre!("UnknownValidator, {validator_index}"))
     }
 
     /*
@@ -1203,15 +1356,16 @@ impl BeaconState {
     pub fn get_balance_mut(&mut self, validator_index: usize) -> eyre::Result<&mut u64> {
         self.balances
             .get_mut(validator_index)
-            .ok_or(eyre::eyre!("BalancesOutOfBounds, {validator_index}"))
+            .ok_or_else(|| eyre::eyre!("BalancesOutOfBounds, {validator_index}"))
     }
     */
 
+    /// Returns the inactivity score of a validator.
     pub fn get_inactivity_score(&self, validator_index: usize) -> eyre::Result<u64> {
         self.inactivity_scores_store
             .get(validator_index)?
             .copied()
-            .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
+            .ok_or_else(|| eyre::eyre!("UnknownValidator, {validator_index}"))
     }
 
     /*
@@ -1219,10 +1373,11 @@ impl BeaconState {
     pub fn get_inactivity_score_mut(&mut self, validator_index: usize) -> eyre::Result<&mut u64> {
         self.inactivity_scores
             .get_mut(validator_index)
-            .ok_or(eyre::eyre!("InactivityScoreOutOfBounds, {validator_index}"))
+            .ok_or_else(|| eyre::eyre!("InactivityScoreOutOfBounds, {validator_index}"))
     }
     */
 
+    /// Returns the sum of a validator's queued partial withdrawals, in Gwei.
     pub fn get_pending_balance_to_withdraw(&self, validator_index: usize) -> eyre::Result<u64> {
         let mut pending_balance = 0;
         for withdrawal in self
@@ -1235,6 +1390,7 @@ impl BeaconState {
         Ok(pending_balance)
     }
 
+    /// Returns the epoch in which an activation or exit started at `epoch` takes effect.
     pub fn compute_activation_exit_epoch(
         &self,
         epoch: Epoch,
@@ -1243,6 +1399,7 @@ impl BeaconState {
         Ok(epoch.safe_add(1)?.safe_add(spec.max_seed_lookahead)?)
     }
 
+    /// Computes the epoch an exit of `exit_balance` is scheduled for and updates the exit churn.
     pub fn compute_exit_epoch_and_update_churn(
         &mut self,
         exit_balance: u64,
@@ -1278,6 +1435,7 @@ impl BeaconState {
         Ok(self.earliest_exit_epoch)
     }
 
+    /// Returns the registry index of the validator with `pubkey`, if present.
     pub fn get_validator_index_from_pubkey(&self, pubkey: &BLSPubkey) -> Option<usize> {
         self.validators_store
             .iter()
@@ -1315,7 +1473,7 @@ impl BeaconState {
         let mut validator = self
             .validators_store
             .get(index)?
-            .ok_or(eyre::eyre!("ValidatorNotfound"))?
+            .ok_or_else(|| eyre::eyre!("ValidatorNotfound"))?
             .clone();
         validator.exit_epoch = exit_queue_epoch;
         validator.withdrawable_epoch =
@@ -1362,12 +1520,12 @@ impl BeaconState {
     }
 
     /// Get the cached total active balance while checking that it is for the correct `epoch`.
-    pub fn get_total_active_balance_at_epoch(&self, epoch: Epoch) -> eyre::Result<u64> {
+    pub fn get_total_active_balance_at_epoch(&self, _epoch: Epoch) -> eyre::Result<u64> {
         todo!()
         /*
         let TotalActiveBalance(initialized_epoch, balance) = self
             .total_active_balance.clone()
-            .ok_or(eyre::eyre!("TotalActiveBalanceCacheUninitialized"))?;
+            .ok_or_else(|| eyre::eyre!("TotalActiveBalanceCacheUninitialized"))?;
 
         if initialized_epoch == epoch {
             Ok(balance)
@@ -1382,7 +1540,7 @@ impl BeaconState {
     /// Returns `Ok(())` if the validation and state updates completed successfully, otherwise returns
     /// an `Err` describing the invalid object or cause of failure.
     pub fn process_exits(
-        self: &mut Self,
+        &mut self,
         voluntary_exits: &[VoluntaryExitWithSig],
         spec: &ChainSpec,
     ) -> eyre::Result<()> {
@@ -1404,13 +1562,13 @@ impl BeaconState {
     ///
     /// Spec v0.12.1
     pub fn verify_exit(
-        self: &mut Self,
+        &mut self,
         current_epoch: Option<Epoch>,
         signed_exit: &VoluntaryExitWithSig,
         //verify_signatures: VerifySignatures,
         spec: &ChainSpec,
     ) -> eyre::Result<()> {
-        let current_epoch = current_epoch.unwrap_or(self.current_epoch());
+        let current_epoch = current_epoch.unwrap_or_else(|| self.current_epoch());
         let exit = &signed_exit.voluntary_exit;
 
         let validator = self
@@ -1499,7 +1657,7 @@ impl BeaconState {
     /// Returns `Ok(())` if the validation and state updates completed successfully, otherwise returns
     /// an `Err` describing the invalid object or cause of failure.
     pub fn process_deposits(
-        self: &mut Self,
+        &mut self,
         deposits: &[Deposit],
         spec: &ChainSpec,
     ) -> eyre::Result<()> {
@@ -1531,14 +1689,14 @@ impl BeaconState {
 
     /// Process a single deposit, verifying its merkle proof if provided.
     pub fn apply_deposit(
-        self: &mut Self,
+        &mut self,
         deposit_data: DepositData,
         //proof: Option<FixedVector<Hash256, U33>>,
-        proof: Option<u8>, // for compile
+        _proof: Option<u8>, // for compile
         increment_eth1_deposit_index: bool,
         spec: &ChainSpec,
     ) -> eyre::Result<()> {
-        let deposit_index = self.eth1_deposit_index as usize;
+        let _deposit_index = self.eth1_deposit_index as usize;
         /*
         if let Some(proof) = proof {
             let deposit = Deposit {
@@ -1576,7 +1734,7 @@ impl BeaconState {
                 increase_balance(state, index as usize, amount)?;
             }
             */
-            increase_balance(self, index as usize, amount)?;
+            increase_balance(self, index, amount)?;
         }
         // New validator
         else {
@@ -1673,7 +1831,7 @@ impl BeaconState {
 
     /// Apply attester and proposer rewards.
     pub fn process_rewards_and_penalties(
-        self: &mut Self,
+        &mut self,
         validator_statuses: &ValidatorStatuses,
         spec: &ChainSpec,
     ) -> eyre::Result<()> {
@@ -1709,7 +1867,7 @@ impl BeaconState {
 
     /// Apply rewards for participation in attestations during the previous epoch.
     pub fn get_attestation_deltas_all(
-        self: &Self,
+        &self,
         validator_statuses: &ValidatorStatuses,
         proposer_reward: ProposerRewardCalculation,
         spec: &ChainSpec,
@@ -1723,9 +1881,9 @@ impl BeaconState {
     ///
     /// Returns a vec of validator indices to `AttestationDelta`.
     fn get_attestation_deltas(
-        self: &Self,
+        &self,
         validator_statuses: &ValidatorStatuses,
-        proposer_reward: ProposerRewardCalculation,
+        _proposer_reward: ProposerRewardCalculation,
         // maybe_validators_subset: Option<&Vec<usize>>,
         spec: &ChainSpec,
     ) -> eyre::Result<Vec<AttestationDelta>> {
@@ -1784,7 +1942,7 @@ impl BeaconState {
             let delta = deltas
                 .get_mut(index)
                 //.ok_or(Error::DeltaOutOfBounds(index))?;
-                .ok_or(eyre::eyre!("DeltaOutOfBounds, {index}"))?;
+                .ok_or_else(|| eyre::eyre!("DeltaOutOfBounds, {index}"))?;
             delta.all_delta.combine(all_delta)?;
             // delta.target_delta.combine(target_delta)?;
             // delta.head_delta.combine(head_delta)?;
@@ -1816,7 +1974,7 @@ impl BeaconState {
     /// Return the churn limit for the current epoch (number of validators who can leave per epoch).
     ///
     /// Uses the current epoch committee cache, and will error if it isn't initialized.
-    pub fn get_validator_churn_limit(&self, spec: &ChainSpec) -> eyre::Result<u64> {
+    pub const fn get_validator_churn_limit(&self, spec: &ChainSpec) -> eyre::Result<u64> {
         /*
         Ok(std::cmp::max(
             spec.min_per_epoch_churn_limit,
@@ -1829,7 +1987,8 @@ impl BeaconState {
         Ok(spec.min_per_epoch_churn_limit)
     }
 
-    pub fn get_activation_churn_limit(&self, spec: &ChainSpec) -> eyre::Result<u64> {
+    /// Returns the per-epoch churn limit for validator activations.
+    pub const fn get_activation_churn_limit(&self, spec: &ChainSpec) -> eyre::Result<u64> {
         self.get_validator_churn_limit(spec)
     }
 
@@ -1865,6 +2024,7 @@ impl BeaconState {
         ))
     }
 
+    /// Returns the shuffling seed for `epoch` under `domain_constant`.
     pub fn get_seed(&self, epoch: Epoch, domain_constant: u32) -> eyre::Result<Hash256> {
         let mix = self.randao_mix;
 
@@ -1922,7 +2082,7 @@ impl BeaconState {
         fn committee_cache_at_index(&self, index: usize) -> eyre::Result<&CommitteeCache> {
             self.committee_caches
                 .get(index)
-                .ok_or(eyre::eyre!("Error::CommitteeCachesOutOfBounds, {index}"))
+                .ok_or_else(|| eyre::eyre!("Error::CommitteeCachesOutOfBounds, {index}"))
         }
 
         /// Get a mutable reference to the committee cache at a given index.
@@ -1932,7 +2092,7 @@ impl BeaconState {
         ) -> eyre::Result<&mut CommitteeCache> {
             self.committee_caches
                 .get_mut(index)
-                .ok_or(eyre::eyre!("Error::CommitteeCachesOutOfBounds, {index}"))
+                .ok_or_else(|| eyre::eyre!("Error::CommitteeCachesOutOfBounds, {index}"))
         }
 
         pub(crate) fn committee_cache_index(relative_epoch: RelativeEpoch) -> usize {
@@ -1969,6 +2129,7 @@ impl BeaconState {
         }
     */
 
+    /// Returns true if the state has at least one active validator in the given relative epoch.
     pub fn has_active_validators(&self, relative_epoch: RelativeEpoch) -> bool {
         let epoch = relative_epoch.into_epoch(self.current_epoch());
         let active_validator_indices = self.get_active_validator_indices(epoch);
@@ -1976,6 +2137,7 @@ impl BeaconState {
         !active_validator_indices.is_empty()
     }
 
+    /// Returns the indices of the validators active in `epoch`.
     pub fn get_active_validator_indices(&self, epoch: Epoch) -> Vec<usize> {
         let mut active = Vec::with_capacity(self.validators_store.len());
         for (index, validator) in self.validators_store.iter().enumerate() {
@@ -2023,6 +2185,7 @@ impl BeaconState {
             }
         }
     */
+    /// Builds the committee cache for the given relative epoch.
     pub fn gen_committee_cache(
         &self,
         relative_epoch: RelativeEpoch,
@@ -2033,10 +2196,14 @@ impl BeaconState {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+/// A withdrawal that is queued until its withdrawable epoch.
 pub struct PendingPartialWithdrawal {
+    /// Index of the validator in the registry.
     pub validator_index: u64,
+    /// Amount in Gwei.
     pub amount: u64,
+    /// Epoch from which the withdrawal can be paid out.
     pub withdrawable_epoch: Epoch,
 }
 
@@ -2046,7 +2213,7 @@ pub fn increase_balance(state: &mut BeaconState, index: usize, delta: u64) -> ey
     let balance = state
         .balances_store
         .get(index)?
-        .ok_or(eyre::eyre!("BalanceNotfound"))?;
+        .ok_or_else(|| eyre::eyre!("BalanceNotfound"))?;
     Ok(state
         .balances_store
         .set(index, balance.saturating_add(delta))?)
@@ -2060,12 +2227,13 @@ pub fn increase_balance_directly(balance: &mut u64, delta: u64) -> eyre::Result<
 }
 */
 
+/// Lowers a validator's balance by `delta`, saturating at zero.
 pub fn decrease_balance(state: &mut BeaconState, index: usize, delta: u64) -> eyre::Result<()> {
     //decrease_balance_directly(state.get_balance_mut(index)?, delta)
     let balance = state
         .balances_store
         .get(index)?
-        .ok_or(eyre::eyre!("BalanceNotfound"))?;
+        .ok_or_else(|| eyre::eyre!("BalanceNotfound"))?;
     Ok(state
         .balances_store
         .set(index, balance.saturating_sub(delta))?)
@@ -2078,6 +2246,7 @@ pub fn decrease_balance_directly(balance: &mut u64, delta: u64) -> eyre::Result<
 }
 */
 
+/// Returns true if the withdrawal credentials carry the compounding prefix.
 pub fn is_compounding_withdrawal_credential(
     withdrawal_credentials: B256,
     spec: &ChainSpec,
@@ -2089,7 +2258,8 @@ pub fn is_compounding_withdrawal_credential(
         .unwrap_or(false)
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
+/// Reasons a voluntary exit is invalid.
 pub enum ExitInvalid {
     /// The specified validator is not active.
     NotActive(u64),
@@ -2100,10 +2270,17 @@ pub enum ExitInvalid {
     /// The specified validator has already initiated exit.
     AlreadyInitiatedExit(u64),
     /// The exit is for a future epoch.
-    FutureEpoch { state: Epoch, exit: Epoch },
+    FutureEpoch {
+        /// Epoch of the state the exit was checked against.
+        state: Epoch,
+        /// Epoch the exit is scheduled for.
+        exit: Epoch,
+    },
     /// The validator has not been active for long enough.
     TooYoungToExit {
+        /// Epoch at the time of the exit request.
         current_epoch: Epoch,
+        /// Earliest epoch in which a new exit can be scheduled.
         earliest_exit_epoch: Epoch,
     },
     /// The exit signature was not signed by the validator.
@@ -2114,14 +2291,19 @@ pub enum ExitInvalid {
     PendingWithdrawalInQueue(u64),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+/// Execution-layer deposit tree summary.
 pub struct Eth1Data {
+    /// Root of the deposit tree.
     pub deposit_root: B256,
+    /// Number of deposits in the deposit tree.
     pub deposit_count: u64,
+    /// Hash of the execution block.
     pub block_hash: B256,
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// Per-validator statuses and balance totals used for rewards and penalties.
 pub struct ValidatorStatuses {
     /// Information about each individual validator from the state's validator registry.
     pub statuses: Vec<ValidatorStatus>,
@@ -2187,8 +2369,11 @@ impl ValidatorStatuses {
 }
 
 #[derive(Debug)]
+/// Whether a proposer reward is part of a reward calculation.
 pub enum ProposerRewardCalculation {
+    /// The proposer reward is included.
     Include,
+    /// The proposer reward is left out.
     Exclude,
 }
 
@@ -2201,14 +2386,16 @@ pub struct AttestationDelta {
     // pub target_delta: Delta,
     // pub head_delta: Delta,
     // pub inclusion_delay_delta: Delta,
+    /// Combined reward and penalty of all attestation components.
     pub all_delta: Delta,
+    /// Delta caused by the inactivity penalty.
     pub inactivity_penalty_delta: Delta,
 }
 
 impl AttestationDelta {
     /// Flatten into a single delta.
     pub fn flatten(self) -> eyre::Result<Delta> {
-        let AttestationDelta {
+        let Self {
             // source_delta,
             // target_delta,
             // head_delta,
@@ -2234,7 +2421,9 @@ impl AttestationDelta {
 /// Used to track the changes to a validator's balance.
 #[derive(Default, Clone, Debug)]
 pub struct Delta {
+    /// Accumulated reward in Gwei.
     pub rewards: u64,
+    /// Accumulated penalty in Gwei.
     pub penalties: u64,
 }
 
@@ -2252,21 +2441,24 @@ impl Delta {
     }
 
     /// Combine two deltas.
-    pub fn combine(&mut self, other: Delta) -> eyre::Result<()> {
+    pub fn combine(&mut self, other: Self) -> eyre::Result<()> {
         self.reward(other.rewards)?;
         self.penalize(other.penalties)
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
+/// Integer square root of the total active balance.
 pub struct SqrtTotalActiveBalance(u64);
 
 impl SqrtTotalActiveBalance {
+    /// Creates the value from the total active balance.
     pub fn new(total_active_balance: u64) -> Self {
         Self(total_active_balance.integer_sqrt())
     }
 
-    pub fn as_u64(&self) -> u64 {
+    /// Returns the integer square root as a `u64`.
+    pub const fn as_u64(&self) -> u64 {
         self.0
     }
 }
@@ -2286,13 +2478,14 @@ pub fn get_base_reward(
 fn get_all_delta(
     validator: &ValidatorStatus,
     base_reward: u64,
-    total_balances: &TotalBalances,
-    finality_delay: u64,
+    _total_balances: &TotalBalances,
+    _finality_delay: u64,
     spec: &ChainSpec,
 ) -> eyre::Result<Delta> {
     get_attestation_component_delta_n42(base_reward, validator.is_punishable, spec)
 }
 
+/// Returns the reward/penalty delta of one attestation component under the N42 rule.
 pub fn get_attestation_component_delta_n42(
     base_reward: u64,
     is_punishable: bool,
@@ -2308,6 +2501,7 @@ pub fn get_attestation_component_delta_n42(
     Ok(delta)
 }
 
+/// Returns the inactivity penalty delta of a validator after `finality_delay` epochs.
 pub fn get_inactivity_penalty_delta(
     validator: &ValidatorStatus,
     base_reward: u64,
@@ -2352,7 +2546,8 @@ macro_rules! set_self_if_other_is_true {
     };
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// The facts about one validator that the reward calculation needs.
 pub struct ValidatorStatus {
     /// True if the validator has been slashed, ever.
     pub is_slashed: bool,
@@ -2387,6 +2582,7 @@ pub struct ValidatorStatus {
     /// True if the validator can withdraw in the current epoch.
     pub is_withdrawable_in_current_epoch: bool,
 
+    /// True if the validator is subject to the inactivity punishment.
     pub is_punishable: bool,
 }
 
@@ -2397,7 +2593,7 @@ impl ValidatorStatus {
     /// contains a `true` field.
     ///
     /// Note: does not update the winning root info, this is done manually.
-    pub fn update(&mut self, other: &Self) {
+    pub const fn update(&mut self, other: &Self) {
         // Update all the bool fields, only updating `self` if `other` is true (never setting
         // `self` to false).
         set_self_if_other_is_true!(self, other, is_slashed);
@@ -2421,7 +2617,8 @@ impl ValidatorStatus {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// Summed effective balances of validator sets, used by the reward calculation.
 pub struct TotalBalances {
     /// The effective balance increment from the spec.
     effective_balance_increment: u64,
@@ -2447,6 +2644,7 @@ pub struct TotalBalances {
 // Generate a safe accessor for a balance in `TotalBalances`, as per spec `get_total_balance`.
 macro_rules! balance_accessor {
     ($field_name:ident) => {
+        /// Returns the total balance of this set, never below the effective balance increment.
         pub fn $field_name(&self) -> u64 {
             std::cmp::max(self.effective_balance_increment, self.$field_name)
         }
@@ -2454,7 +2652,8 @@ macro_rules! balance_accessor {
 }
 
 impl TotalBalances {
-    pub fn new(spec: &ChainSpec) -> Self {
+    /// Creates empty totals for the given spec.
+    pub const fn new(spec: &ChainSpec) -> Self {
         Self {
             effective_balance_increment: spec.effective_balance_increment,
             current_epoch: 0,
@@ -2487,7 +2686,7 @@ fn get_proposer_reward(base_reward: u64, spec: &ChainSpec) -> eyre::Result<u64> 
 /// to and following some epoch.
 ///
 /// Spec v0.12.1
-#[derive(Debug, PartialEq, Clone, Copy, arbitrary::Arbitrary)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, arbitrary::Arbitrary)]
 pub enum RelativeEpoch {
     /// The prior epoch.
     Previous,
@@ -2501,21 +2700,22 @@ impl RelativeEpoch {
     /// Returns the `epoch` that `self` refers to, with respect to the `base` epoch.
     ///
     /// Spec v0.12.1
-    pub fn into_epoch(self, base: Epoch) -> Epoch {
+    pub const fn into_epoch(self, base: Epoch) -> Epoch {
         match self {
             // Due to saturating nature of epoch, check for current first.
-            RelativeEpoch::Current => base,
-            RelativeEpoch::Previous => base.saturating_sub(1u64),
-            RelativeEpoch::Next => base.saturating_add(1u64),
+            Self::Current => base,
+            Self::Previous => base.saturating_sub(1u64),
+            Self::Next => base.saturating_add(1u64),
         }
     }
 }
 
-pub fn round_down(n: u64, step: u64) -> u64 {
+/// Rounds `n` down to a multiple of `step`.
+pub const fn round_down(n: u64, step: u64) -> u64 {
     n - (n % step)
 }
 
-fn round_to_nearest(n: u64, step: u64) -> u64 {
+const fn round_to_nearest(n: u64, step: u64) -> u64 {
     ((n + step / 2) / step) * step
 }
 

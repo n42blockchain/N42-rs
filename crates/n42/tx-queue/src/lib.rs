@@ -555,7 +555,7 @@ pub struct PruneInput<'a> {
 /// removal ([`TxQueue::prune_blocks`]). The pruner's first hold drained the
 /// ingest's backlog and was the lanes lock's longest holder (33-45 ms per
 /// 5 s), and a prune per block at ~22 blocks/s kept the pruner at a
-/// utilisation of ~1 (docs/DEGRADED_ONSET_ANALYSIS.md).
+/// utilisation of ~1 (`docs/DEGRADED_ONSET_ANALYSIS.md`).
 pub fn prune_lean() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -811,7 +811,7 @@ pub fn release_replaced_own_blocks() -> bool {
 /// accounting into one add and frees the evicted transactions on the
 /// queue's freeing thread: after the degraded onset every hold evicts a
 /// 200,000-transaction block, and the next build's selector waited on that
-/// eviction (`start_handoff_ms` 2 -> 10-12, docs/DEGRADED_ONSET_ANALYSIS.md).
+/// eviction (`start_handoff_ms` 2 -> 10-12, `docs/DEGRADED_ONSET_ANALYSIS.md`).
 pub fn handoff_done_first() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -1042,6 +1042,7 @@ fn note_lock_site(at: &'static std::panic::Location<'static>, hold_ns: u64, wait
 
 /// The lanes' lock by caller since the last call, which resets it, the
 /// largest duty first; empty unless `N42_LOCK_SITES=1`.
+#[allow(clippy::unnecessary_sort_by)] // diagnostic dump; sort call kept as written
 pub fn take_lock_sites() -> Vec<LockSite> {
     let mut sites = std::mem::take(&mut *HOLD_SITES.lock());
     sites.sort_unstable_by(|a, b| b.hold_ns.cmp(&a.hold_ns));
@@ -1260,6 +1261,7 @@ struct Inner<T: PoolTransaction> {
     /// nonce refusals a block after a stall). Settled by the canonical
     /// pruner: the same hash drops them, another hash at the height gives
     /// back the ones it does not carry. Bounded to the last few blocks.
+    #[allow(clippy::type_complexity)] // hot-path queue field; its type is kept inline
     held: VecDeque<(u64, B256, Vec<Arc<ValidPoolTransaction<T>>>)>,
     /// Lanes stepped over behind a hole ([`Parked`]), roughly in the order
     /// their parks expire -- a park always ends `PARK_BUILDS` builds after
@@ -3725,15 +3727,14 @@ impl<T: PoolTransaction> TxQueue<T> {
                 removed.extend(gone.into_values());
             }
         }
-        if let Some((_, taken)) = inner.last_build.as_mut() {
-            if !taken.is_empty() {
+        if let Some((_, taken)) = inner.last_build.as_mut()
+            && !taken.is_empty() {
                 let (mined, kept): (Vec<_>, Vec<_>) = std::mem::take(taken)
                     .into_iter()
                     .partition(|t| highest.get(&t.sender()).is_some_and(|m| t.nonce() <= *m));
                 *taken = kept;
                 removed.extend(mined);
             }
-        }
         removed
     }
 
@@ -3757,7 +3758,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         Self::mark_handed_in(&mut inner, hash);
     }
 
-    fn mark_handed_in(inner: &mut Inner<T>, hash: B256) {
+    const fn mark_handed_in(inner: &mut Inner<T>, hash: B256) {
         let build = inner.builds;
         if let Some(handed) = inner.handed.as_mut()
             && handed.build == build
@@ -4803,6 +4804,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// takes handed to the settling thread (which, with `ahead`, then
     /// prepares the next build's plan), and the build's [`QueueBest`].
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)] // hot-path local; its type is kept inline
     fn finish_frame_build(
         &self,
         segments: Vec<(FrameTxs<T>, usize)>,
@@ -5159,11 +5161,10 @@ impl<T: PoolTransaction> TxQueue<T> {
     }
 
     fn prepare_next_in(&self, gas_limit: u64, mode: SelectMode) -> bool {
-        if mode == SelectMode::Parallel && self.plan_snapshot_on() {
-            if let Some(made) = self.prepare_next_snapshot(gas_limit) {
+        if mode == SelectMode::Parallel && self.plan_snapshot_on()
+            && let Some(made) = self.prepare_next_snapshot(gas_limit) {
                 return made;
             }
-        }
         if self.offlock() && mode == SelectMode::Parallel {
             for attempt in 0..2 {
                 if let Some(made) = self.prepare_next_offlock(gas_limit) {
@@ -6032,7 +6033,7 @@ impl<T: PoolTransaction> Inner<T> {
 
     /// Whether a frame build's takes are noted and not all out of their
     /// lanes ([`Self::pending`] or a batched settle's [`Self::settling`]).
-    pub(crate) fn takes_unsettled(&self) -> bool {
+    pub(crate) const fn takes_unsettled(&self) -> bool {
         !self.pending.is_empty() || !self.settling.is_empty()
     }
 
@@ -7104,9 +7105,9 @@ impl<T: PoolTransaction> Inner<T> {
     fn next_ready(&mut self, skipped: &AddressHashSet) -> Option<Arc<ValidPoolTransaction<T>>> {
         // Continue the current sender's run first.
         if let Some((sender, left)) = self.current.take() {
-            if left > 0 && !skipped.contains(&sender) {
-                if let Some(lane) = self.lanes.get_mut(&sender) {
-                    if let Some((_, valid)) = lane.by_nonce.pop_first() {
+            if left > 0 && !skipped.contains(&sender)
+                && let Some(lane) = self.lanes.get_mut(&sender)
+                    && let Some((_, valid)) = lane.by_nonce.pop_first() {
                         self.len -= 1;
                         if lane.by_nonce.is_empty() {
                             lane.queued = false;
@@ -7120,8 +7121,6 @@ impl<T: PoolTransaction> Inner<T> {
                         }
                         return Some(valid);
                     }
-                }
-            }
             // The run ended, was refused, or the lane emptied: the sender
             // rejoins the rotation if it still has anything.
             if let Some(lane) = self.lanes.get_mut(&sender) {
@@ -7585,11 +7584,10 @@ impl<T: PoolTransaction> QueueBest<T> {
     /// that the build took it. The taken list ends with the buffered ones,
     /// so the search from the back is short.
     fn untake(inner: &mut Inner<T>, transaction: Arc<ValidPoolTransaction<T>>) {
-        if let Some((_, taken)) = inner.last_build.as_mut() {
-            if let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, &transaction)) {
+        if let Some((_, taken)) = inner.last_build.as_mut()
+            && let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, &transaction)) {
                 taken.remove(at);
             }
-        }
         inner.give_back(vec![transaction]);
     }
 }
@@ -7777,15 +7775,13 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
             tx,
             state,
         }) = &kind
-        {
-            if tx > state {
+            && tx > state {
                 inner.gaps.push((sender, *state, *tx));
                 // Nothing in this lane can execute until the hole is
                 // filled, and its head is what every build is offered
                 // first: stepped over until then ([`Parked`]).
                 inner.park(sender, *state);
             }
-        }
         inner.give_back(vec![Arc::clone(transaction)]);
     }
 

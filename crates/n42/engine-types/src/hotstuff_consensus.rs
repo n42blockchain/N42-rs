@@ -48,7 +48,7 @@ use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{BlockBody as _, GotExpected, RecoveredBlock, SealedBlock, SealedHeader};
 use std::sync::{Arc, RwLock};
 
-/// gov5's HotStuff-2 block rules, for reth.
+// gov5's HotStuff-2 block rules, for reth.
 thread_local! {
     /// A transactions root already computed and checked for the block being
     /// validated on this thread, so the body check does not compute it again

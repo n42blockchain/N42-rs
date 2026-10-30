@@ -1,3 +1,4 @@
+//! Loads one engine blockchain test fixture and prints a summary of the tests in it.
 use std::collections::HashMap;
 use n42_ef_tests::models::BlockchainTest;
 

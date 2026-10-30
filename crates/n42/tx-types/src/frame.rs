@@ -105,7 +105,7 @@ pub fn frame_tree_root(frame_roots: &[B256]) -> B256 {
 /// body exactly or names an empty frame, i.e. the body is not frame-aligned
 /// by that layout.
 pub fn frame_tree_root_of(tx_hashes: &[B256], layout: &[usize]) -> Option<B256> {
-    if layout.iter().any(|len| *len == 0) || layout.iter().sum::<usize>() != tx_hashes.len() {
+    if layout.contains(&0) || layout.iter().sum::<usize>() != tx_hashes.len() {
         return None;
     }
     let mut at = 0usize;

@@ -99,6 +99,7 @@ fn summary(label: &str, threads: usize, mut lat: Vec<Duration>, wall: Duration, 
 
 /// The checkpoint moved to the end of the delta log (the node's own framing: u64 length, 4 bytes of the
 /// payload's keccak, bincode `ForestDelta`).
+#[allow(clippy::suspicious_operation_groupings)] // the comparison is intentional
 fn checkpoint(dir: &Path) -> ForestCheckpoint {
     let mut ckpt: ForestCheckpoint = bincode::deserialize(&std::fs::read(dir.join("forest.ckpt")).expect("ckpt")).expect("ckpt decodes");
     let bytes = std::fs::read(dir.join("forest.log")).unwrap_or_default();
@@ -120,6 +121,7 @@ fn checkpoint(dir: &Path) -> ForestCheckpoint {
     ckpt
 }
 
+#[allow(clippy::type_complexity)] // benchmark result tuple kept inline
 fn main() -> eyre::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mdbx_dir = PathBuf::from(&args[1]);
@@ -127,7 +129,7 @@ fn main() -> eyre::Result<()> {
     let recipients: u32 = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(2_000_000);
     let n: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
     let thread_list: Vec<usize> =
-        args.get(5).map_or(vec![1, 16], |v| v.split(',').filter_map(|t| t.parse().ok()).collect());
+        args.get(5).map_or_else(|| vec![1, 16], |v| v.split(',').filter_map(|t| t.parse().ok()).collect());
     let addresses = samples(recipients, n);
 
     // MDBX, cold then warm.

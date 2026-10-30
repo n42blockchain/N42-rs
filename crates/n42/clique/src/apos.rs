@@ -1,4 +1,3 @@
-use alloy_primitives::Sealable;
 use alloy_primitives::{hex, Address, BlockHash, Bytes, FixedBytes, B256, B64, U256};
 use bytes::BytesMut;
 use n42_primitives::{APosConfig, Snapshot};
@@ -152,6 +151,7 @@ where
 {
     config: APosConfig, // Consensus engine configuration parameters
     /// Chain spec
+    #[allow(dead_code)] // kept for the consensus engine's configuration; not read today
     chain_spec: Arc<ChainSpec>,
     recents: RwLock<schnellru::LruMap<B256, Snapshot>>, // Snapshots for recent block to speed up reorgs
     proposals: Arc<RwLock<HashMap<Address, bool>>>,     // Current list of proposals we are pushing
@@ -459,16 +459,15 @@ where
             // at a checkpoint block without a parent (light client CHT), or we have piled
             // up more headers than allowed to be reorged (chain reinit from a freezer),
             // consider the checkpoint trusted and snapshot it.
-            if number == 0
-                || (number % self.config.epoch == 0
+            if (number == 0
+                || (number.is_multiple_of(self.config.epoch)
                     && (headers.len() > FULL_IMMUTABILITY_THRESHOLD
                         || self
                             .provider
                             .header_by_number(number - 1)
                             .map_err(|_| ConsensusError::UnknownBlock)?
-                            .is_none()))
-            {
-                if let Ok(Some(checkpoint)) = self.provider.header_by_number(number) {
+                            .is_none())))
+                && let Ok(Some(checkpoint)) = self.provider.header_by_number(number) {
                     debug!(target: "consensus::apos", "checkpoint={:?}", checkpoint);
                     let hash = checkpoint.hash_slow();
                     //info!(target: "consensus::apos", "snapshot() : number={}, hash_slow hash={:?}", number, hash);
@@ -501,7 +500,6 @@ where
                     );
                     break;
                 }
-            }
 
             // No snapshot for this header, gather the header and move backward
             let from_parent = parents
@@ -659,7 +657,7 @@ where
         }
 
         //todo
-        if checkpoint && signers_bytes % 20 != 0 {
+        if checkpoint && !signers_bytes.is_multiple_of(20) {
             return Err(ConsensusError::InvalidCheckpointSigners);
         }
 
@@ -730,7 +728,7 @@ where
     /// Note: this expects that the headers are in natural order (ascending block number)
     fn validate_header_range(
         &self,
-        headers: &[SealedHeader],
+        _headers: &[SealedHeader],
     ) -> Result<(), HeaderConsensusError<reth_primitives_traits::Header>> {
         Ok(())
     }
@@ -746,12 +744,12 @@ where
         + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
     N: NodePrimitives,
-    APos<Provider, ChainSpec>: HeaderValidator<<N as NodePrimitives>::BlockHeader>,
+    Self: HeaderValidator<<N as NodePrimitives>::BlockHeader>,
 {
     fn validate_block_post_execution(
         &self,
-        block: &RecoveredBlock<N::Block>,
-        result: &BlockExecutionResult<N::Receipt>,
+        _block: &RecoveredBlock<N::Block>,
+        _result: &BlockExecutionResult<N::Receipt>,
         _receipt_root_bloom: Option<reth_consensus::ReceiptRootBloom>,
         // EIP-7928 block access list hash, added upstream. APoS does not produce
         // one, so post-execution validation ignores it.
@@ -771,12 +769,12 @@ where
         + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
     B: BlockTrait,
-    APos<Provider, ChainSpec>: HeaderValidator<<B as reth_primitives_traits::Block>::Header>,
+    Self: HeaderValidator<<B as reth_primitives_traits::Block>::Header>,
 {
     fn validate_body_against_header(
         &self,
-        body: &B::Body,
-        header: &SealedHeader<B::Header>,
+        _body: &B::Body,
+        _header: &SealedHeader<B::Header>,
     ) -> Result<(), ConsensusError> {
         Ok(())
     }
@@ -787,6 +785,7 @@ where
 
     /// Prepare implements consensus.Engine, preparing all the consensus fields of the
     /// header for running the transactions on top.
+    #[allow(clippy::field_reassign_with_default)] // header is built step by step
     fn prepare(&self, parent_header: &SealedHeader) -> Result<Header, ConsensusError> {
         let mut header = Header::default();
         //If the block is not a checkpoint, vote randomly
@@ -807,15 +806,12 @@ where
                     detail: format!("lock poisoned: {}", e),
                 }
             })?;
-            let addresses: Vec<Address> = proposals_lock
-                .iter()
-                //.filter(|(&address, &authorize)| snap.valid_vote(address, authorize))
-                .map(|(address, _)| *address)
+            let addresses: Vec<Address> = proposals_lock.keys().copied()
                 .collect();
 
             //If there are proposals to be voted on, proceed with the vote
-            if !addresses.is_empty() {
-                if let Some(&addr) = addresses.choose(&mut rand::rng()) {
+            if !addresses.is_empty()
+                && let Some(&addr) = addresses.choose(&mut rand::rng()) {
                     header.beneficiary = addr;
                     if let Some(&authorize) = proposals_lock.get(&header.beneficiary) {
                         if authorize {
@@ -825,7 +821,6 @@ where
                         }
                     }
                 }
-            }
         }
 
         debug!(target: "consensus::apos", ?snap, "snap");

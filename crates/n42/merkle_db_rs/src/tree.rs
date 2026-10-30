@@ -196,11 +196,10 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
         F: FnMut(&Hash256, &Tree<T>) -> Result<(), E>,
     {
         for (hash, node) in &self.kv {
-            if let Tree::Zero(h) = node {
-                if *hash == zero_tree_root(*h) {
+            if let Tree::Zero(h) = node
+                && *hash == zero_tree_root(*h) {
                     continue;
                 }
-            }
             db_put(hash, node)?;
         }
         Ok(())
@@ -236,11 +235,10 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
             }
 
             if let Some(node) = self.kv.get(&hash) {
-                if let Tree::Zero(h) = node {
-                    if hash == zero_tree_root(*h) {
+                if let Tree::Zero(h) = node
+                    && hash == zero_tree_root(*h) {
                         continue;
                     }
-                }
 
                 db_put(&hash, node)?;
 
@@ -253,11 +251,11 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
         Ok(())
     }
 
-    pub fn root(self: &Self) -> Hash256 {
+    pub fn root(&self) -> Hash256 {
         self.root
     }
 
-    pub fn ssz_root(self: &Self) -> Hash256 {
+    pub fn ssz_root(&self) -> Hash256 {
         let left_bytes: &[u8; 32] = self.root.as_ref();
 
         let mut chunk = [0u8; 32];
@@ -266,7 +264,7 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
 
         let mut hasher = Sha256::new();
         hasher.update(left_bytes);
-        hasher.update(&right_bytes);
+        hasher.update(right_bytes);
 
         Hash256::from_slice(&hasher.finalize())
     }

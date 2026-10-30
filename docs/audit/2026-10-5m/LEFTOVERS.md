@@ -70,7 +70,7 @@ Rust 现状:
 
 | 项 | 来源 | 卡在哪里 |
 |---|---|---|
-| R3-P5 余项 | ROUND3 | h2_validator 需从 EL 取真实块号与 receipts root;`--mobile` 默认关。**Windows(10-30 认领)** |
+| R3-P5 余项 | ROUND3 | h2_validator 需从 EL 取真实块号与 receipts root;`--mobile` 默认关。**Windows 已修(见 `git log --grep R3-P5`;延迟执行下仍无 root)** |
 | R3-P6 余项 | ROUND3 | 注册 PoP 与收据独立 DST 是手机协议变更,需 mobile-sdk 同步。**Windows(10-30 认领)** |
 | R3-P7 余项 | ROUND3 | mobile HTTP 仍单线程(每连接最多占 10 s)。**Windows(10-30 认领)** |
 | R2-C1 余项 | ROUND2 | 入站 `high_tc` 采纳:**Windows 已修(见 `git log --grep R2-C1`)**;只在 TC 能让本节点前进时验证,无需缓存。待 Linux devnet gov5 三形态(含 absent/late)覆盖 |

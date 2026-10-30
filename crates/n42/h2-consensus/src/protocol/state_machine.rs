@@ -1176,6 +1176,25 @@ impl ConsensusEngine {
         self.imported_parents.insert(block_hash, parent_hash);
     }
 
+    /// A block's header is known here (its parent recorded as by
+    /// [`Self::remember_parent`]): under gov5's `twoPhaseVoteGate` this is
+    /// what releases Round 1 for the pending proposal (gov5's
+    /// `tryHeaderVote`, audit 2026-10 R2-C9); the commit vote still waits
+    /// for the import. The caller has checked whatever the header must pass
+    /// before this node votes for it.
+    pub fn header_known(&mut self, block_hash: B256, parent_hash: B256) -> ConsensusResult<()> {
+        self.remember_parent(block_hash, parent_hash);
+        if self.pending_proposal.as_ref().is_some_and(|pending| pending.block_hash == block_hash) {
+            self.try_header_vote()?;
+        }
+        Ok(())
+    }
+
+    /// Whether gov5's `twoPhaseVoteGate` is on; see the field.
+    pub const fn two_phase_vote_gate(&self) -> bool {
+        self.two_phase_vote_gate
+    }
+
     /// Whether [`Self::remember_parent`] recorded `block_hash`'s parent.
     pub fn knows_parent(&self, block_hash: &B256) -> bool {
         self.imported_parents.contains_key(block_hash)
@@ -3573,6 +3592,52 @@ mod tests {
             .expect("the import");
         assert_eq!(commit_votes(&mut rx), 1, "the held commit vote goes out on the import");
         assert_eq!(engine.last_commit_voted_view(), view);
+    }
+
+    /// Audit 2026-10 R2-C9 (the remainder): under gov5's `twoPhaseVoteGate`
+    /// gov5 casts Round 1 once the proposal's header is known and extends its
+    /// justify QC's block (`tryHeaderVote`), the commit vote being the
+    /// execution attestation; this node still waited for the import, a
+    /// block's execution later than every gov5 member. The header now
+    /// releases the vote under the gate (a zero parent is no parent), with
+    /// the header first or the proposal first; without the gate the vote
+    /// still waits for the import.
+    #[test]
+    fn under_the_two_phase_gate_the_vote_goes_out_on_the_header() {
+        let votes = |rx: &mut mpsc::Receiver<EngineOutput>, block_hash: B256| {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(v)) if v.block_hash == block_hash))
+                .count()
+        };
+        let parent = B256::repeat_byte(0x11);
+        for gate in [false, true] {
+            let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+            enable_test_h2(&mut engine);
+            engine.set_two_phase_vote_gate(gate);
+            let block_hash = B256::repeat_byte(0xE2);
+            let proposal = signed_h2_test_proposal(&engine, 1, block_hash, 1, &sks[1]);
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+                .expect("the proposal");
+            assert_eq!(votes(&mut rx, block_hash), 0, "gate {gate}: nothing known yet");
+            engine.header_known(block_hash, B256::ZERO).expect("a header");
+            assert_eq!(votes(&mut rx, block_hash), 0, "gate {gate}: a zero parent is no parent");
+            engine.header_known(block_hash, parent).expect("a header");
+            assert_eq!(votes(&mut rx, block_hash), usize::from(gate), "gate {gate}: the header");
+            engine.process_event(ConsensusEvent::BlockImported(block_hash)).expect("the import");
+            assert_eq!(votes(&mut rx, block_hash), usize::from(!gate), "gate {gate}: the import");
+        }
+        // The header before the proposal: the vote goes out with it.
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        enable_test_h2(&mut engine);
+        engine.set_two_phase_vote_gate(true);
+        let block_hash = B256::repeat_byte(0xE3);
+        engine.header_known(block_hash, parent).expect("a header");
+        let proposal = signed_h2_test_proposal(&engine, 1, block_hash, 1, &sks[1]);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .expect("the proposal");
+        assert_eq!(votes(&mut rx, block_hash), 1, "voted on the proposal");
     }
 
     #[test]

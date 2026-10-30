@@ -59,7 +59,7 @@ Rust 现状:
 
 | 项 | 来源 | 内容 | 负责 | 状态 |
 |---|---|---|---|---|
-| R3-E1 | ROUND3 | builder 与 follower 的可纳入性规则对齐(先与 gov5 对齐规则) | Linux(10-30 认领) | 实现中:builder 串行循环在延迟执行下改按 Σgas_limit 预算 + 每 sender 最坏花费账本(与 follower `check_senders` 同一规则,严格化只在 builder 侧,跨客户端安全);R3-E3 一并;合入前 X22 配对 |
+| R3-E1 | ROUND3 | builder 与 follower 的可纳入性规则对齐(先与 gov5 对齐规则) | Linux(10-30 认领) | 已修(分支 fix/r3-e1-builder-includability 527e009fb), 待 X22 配对与合入。串行循环 Σgas_limit 预算 + 每 sender 最坏花费账本;并行步每 sender run 同一账本(并行步原也不一致:同一 sender 第二笔起只对照扣实际花费后的余额);R3-E3 一并 |
 | R3-P2/P3/P4 | ROUND3 | tx-queue 有界 lane、加价替换、`Lagged` 补齐,与帧索引一起设计 | Linux | 待做 |
 | R3-N4 | ROUND3 | gossip `validate_messages()` + 回报 Accept/Reject/Ignore | Linux | 待做 |
 | R3-G4 | ROUND3 | leader 首次导入的多余 payload 克隆 | Linux | 低优先 |

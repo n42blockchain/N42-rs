@@ -594,5 +594,7 @@ persistence defaults 8/6, entry-file fold archive) + the validator's persistence
   through the whole chain at 32 jobs -- 71 test suites, `cargo check --workspace`, clippy 1500 against the
   1504 baseline, the x22 probe, the three devnet shapes with a gov5 member (same block hashes on both
   clients), the `roll --kill` field check in file mode -- with the guard never above the pre-fault
-  readings; the X22 bench pair (stage `fv`, audited main against `native-qc`) follows and its result
-  goes to the handoff document.
+  readings. The X22 bench pair (stage `fv`, 01:22-01:51 UTC: audited main against `native-qc`, two
+  alternating pairs, 600M replay set) read win1 5.047 / 5.040M against 5.060 / 5.040M and round totals
+  451.1M against 454.6M (-0.8%), every leg with clean gates, so the audit's hot-path changes cost nothing
+  visible at the 5M shape; peak under the new supply 349 W, Tctl 54 C. Details in the handoff document.

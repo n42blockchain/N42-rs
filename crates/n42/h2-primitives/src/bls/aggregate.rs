@@ -38,6 +38,23 @@ impl AggregateSignature {
         Ok(())
     }
 
+    /// [`Self::verify_aggregate`] under a caller-chosen domain separation tag.
+    /// Same-message aggregation is sound only over keys whose holders proved
+    /// possession of them.
+    pub fn verify_aggregate_with_dst(
+        message: &[u8],
+        signature: &BlsSignature,
+        public_keys: &[&BlsPublicKey],
+        dst: &[u8],
+    ) -> Result<(), BlsError> {
+        let pks: Vec<&blst::min_pk::PublicKey> = public_keys.iter().map(|pk| pk.inner()).collect();
+        let result = signature.inner().fast_aggregate_verify(true, message, dst, &pks);
+        if result != BLST_ERROR::BLST_SUCCESS {
+            return Err(BlsError::VerificationFailed(result));
+        }
+        Ok(())
+    }
+
     /// Verifies a gov5-compatible H2-v4 aggregate signature. This explicit
     /// entry point prevents the POP ciphersuite from leaking into native Rust
     /// consensus signatures, which remain on [`super::DST`].

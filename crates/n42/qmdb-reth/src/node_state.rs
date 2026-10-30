@@ -716,6 +716,7 @@ struct Inner {
     forest: Mutex<Option<QmdbForest>>,
     /// Serialises the bounded checkpoint-parent sidecar's atomic replacements.
     frontier_write: Mutex<()>,
+    #[allow(clippy::type_complexity)] // hot-path callback field; its type is kept inline
     durable_head_reader: Mutex<Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>>,
     /// The label the forest's lock was last taken for ([`QmdbNodeState::lock_as`]),
     /// read by a caller that has to wait to say whom it waited for.
@@ -923,7 +924,7 @@ pub fn sort_and_hash_leaves(ops: &mut QmdbOps) -> Option<n42_twig_core::qmdb_com
 }
 
 /// Fills a computed root's split from the forest's last computation.
-fn fill_split(forest: &QmdbForest, split: &mut RootSplit, publish_us: u64) {
+const fn fill_split(forest: &QmdbForest, split: &mut RootSplit, publish_us: u64) {
     let (move_us, phases) = forest.last_compute();
     split.computed = true;
     split.move_ms = move_us / 1000;
@@ -1587,7 +1588,7 @@ impl QmdbNodeState {
         let hold = inner.persist_hold_us.fetch_add(split.lock_hold_us, Relaxed) + split.lock_hold_us;
         let advance = inner.persist_advance_us.fetch_add(split.advance_us, Relaxed) + split.advance_us;
         let holds = inner.persist_holds.fetch_add(split.holds, Relaxed) + split.holds;
-        if persists % PERSIST_SPLIT_LOG_EVERY == 0 {
+        if persists.is_multiple_of(PERSIST_SPLIT_LOG_EVERY) {
             info!(
                 target: "n42.qmdb",
                 persists,
@@ -1612,7 +1613,7 @@ impl QmdbNodeState {
     /// (`QmdbForest::check_build_parent`). Only for a chain with finality,
     /// where the canonical head follows the committed block and a parent
     /// below it is a stale request (the HotStuff-2 node sets it); on a chain
-    /// without finality (APoS, the deferred-execution fork tests) a build on
+    /// without finality (`APoS`, the deferred-execution fork tests) a build on
     /// an older block is a legitimate fork. Off by default.
     pub fn set_refuse_stale_builds(&self, on: bool) {
         self.inner.refuse_stale_builds.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -2121,6 +2122,7 @@ impl QmdbNodeState {
     /// the tree. A rename of the parent while it was out is followed (the
     /// block is filed on the new hash) and counted. A panic in the
     /// computation puts the tree back before it unwinds.
+    #[allow(clippy::too_many_arguments)] // hot-path helper; the argument list is kept
     fn with_leased_root<T>(
         &self,
         label: &'static str,

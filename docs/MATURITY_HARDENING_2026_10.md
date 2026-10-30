@@ -245,7 +245,9 @@ uses of revm's deprecated `ExecutionResult::gas_used` (now `tx_gas_used`) that t
 surfaced. No warning is an error class (no `unused_must_use`, no `rust_2018_idioms`). The log is
 `ci/clippy-c07716826.log` under the audit notes.
 
-The per-crate `-D warnings` step is done (branch `chore/clippy-n42-crates`, 2026-10-30). The N42-owned
+The per-crate `-D warnings` step is done (branch `chore/clippy-n42-crates`, merged into main as
+d07ec6584 on 2026-10-30 after a level X22 pair, stage fx VL: win1 4.993/4.849M against main's
+5.027/5.007M, rounds 450.8/446.1M against 445.0/449.8M, gates clean). The N42-owned
 crates went from 1,040 distinct warnings (the same crates in the 1,504-warning baseline of
 `ci/clippy-4e43be3ac.log`; the rest of that baseline is the vendored reth forks, the alloy forks and
 `vendor/dependency-repairs`, which track upstream and are out of scope) to 0. `scripts/clippy-n42.sh`

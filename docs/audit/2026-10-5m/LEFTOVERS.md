@@ -73,7 +73,7 @@ Rust 现状:
 | R3-P5 余项 | ROUND3 | h2_validator 需从 EL 取真实块号与 receipts root;`--mobile` 默认关 |
 | R3-P6 余项 | ROUND3 | 注册 PoP 与收据独立 DST 是手机协议变更,需 mobile-sdk 同步 |
 | R3-P7 余项 | ROUND3 | mobile HTTP 仍单线程(每连接最多占 10 s) |
-| R2-C1 余项 | ROUND2 | 入站 `high_tc` 采纳需 TC 验证缓存设计 |
+| R2-C1 余项 | ROUND2 | 入站 `high_tc` 采纳需 TC 验证缓存设计。**Windows 10-30 认领,实现中** |
 | R2-R2 | ROUND2 | 按 view leader 校验头部封印 |
 | R2-C9 余项 | ROUND2 | gov5 header vote / deferred vote 未移植 |
 | R2-X4 余项 | ROUND2 | 声明不按声明者分键(EL 不知道 peer) |

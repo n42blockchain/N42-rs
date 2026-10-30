@@ -71,3 +71,4 @@ RPC/快照/tx-queue/mobile。每项修复前先按代码核实,先写复现测�
 | R2-C1(high_tc) | 未修:复核结论为无永久停滞,只有延迟(TC 由任一节点形成并推进);最小移植方案已记录,留待 C2 一并做跨客户端一致性 |
 | R3-G2 | 已修:fill/by-hash 回复预算按 peer 分份(`FillBudget`,每 peer 至多总量 1/8 = 64 MiB,超过一份的回复取整份),断开时 `forget` 释放,peer 表至多 1,024 项、满时丢弃空闲项;测试 `one_peer_cannot_hold_the_whole_fill_budget` 修复前编译失败(无按 peer 预算)。热路径:每个 fill/by-hash 回复多一次 HashMap 查找与一个 semaphore permit,需同机 A/B |
 | R3-G6 | 已修:单笔上限按类型:type 3(带 sidecar 的 blob 交易)至多 1 MiB,其余仍 256 KiB;长度过 1 MiB 仍只凭长度拒绝,过 256 KiB 的非 blob 交易在读入后按类型拒绝。测试 `a_blob_transaction_with_its_sidecar_is_not_refused_for_size` 修复前编译失败;`an_oversized_transaction_closes_the_connection` 按新语义补发 body。帧总量上限不变 |
+| R3-P8 | 已修(部分):APoS 公开订阅任务同时监听 `sink.closed()`,客户端离开即结束,并向 router 发 `Disconnect` 释放其条目(之前对无人发布的 key 永远挂起,任务与条目泄漏);测试 `a_closed_subscription_leaves_the_router_without_an_event` 修复前失败(订阅丢弃后 router 收不到任何消息)。验证队列入队前校验成员与块哈希未做 |

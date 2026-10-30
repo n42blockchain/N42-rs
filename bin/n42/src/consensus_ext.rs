@@ -159,7 +159,7 @@ where
         let router_tx_clone = self.router_tx.clone();
 
         tokio::spawn(async move {
-            let (_id, mut rx) = match subscribe(router_tx_clone, hex::encode(&pubkey)).await {
+            let (id, mut rx) = match subscribe(router_tx_clone.clone(), hex::encode(pubkey)).await {
                 Ok(v) => v,
                 Err(err) => {
                     debug!(target: "reth::cli", ?pubkey, ?err, "subscribe_to_verification_request failed");
@@ -169,7 +169,20 @@ where
             debug!(target: "reth::cli", ?pubkey, "subscribe_to_verification_request New client subscribed");
             if let Ok(sink) = pending.accept().await {
                 let subscription_id = sink.subscription_id();
-                while let Some(event) = rx.recv().await {
+                // A client that goes away is noticed without an event: a key
+                // nothing is published for would otherwise hold this task and
+                // its router entry for good (audit 2026-10 round 3, R3-P8).
+                loop {
+                    let event = tokio::select! {
+                        _ = sink.closed() => {
+                            debug!(target: "reth::cli", ?subscription_id, "subscribe_to_verification_request client disconnected");
+                            break;
+                        }
+                        event = rx.recv() => match event {
+                            Some(event) => event,
+                            None => break,
+                        },
+                    };
                     let data_to_be_verified = event.payload;
                     debug!(target: "reth::cli", ?pubkey, "start broadcasting, block number {:?}", data_to_be_verified.blockbody.header().number());
                     if sink.is_closed() {
@@ -194,6 +207,7 @@ where
                     debug!(target: "reth::cli", ?pubkey, "finish broadcasting, block number {:?}", data_to_be_verified.blockbody.header().number());
                 }
             }
+            let _ = router_tx_clone.send(RouterMsg::Disconnect { id }).await;
         });
         Ok(())
     }
@@ -472,6 +486,42 @@ mod tests {
             ConsensusBeaconExt { consensus: NoopConsensus::default(), provider, verification_tx, router_tx },
             verification_rx,
         )
+    }
+
+    /// Audit 2026-10 round 3 (R3-P8): a subscription to a key nothing is
+    /// published for waited on the router forever, so a client that went
+    /// away left its task and its router entry behind. Its end is noticed
+    /// without an event, and the router is told.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_subscription_leaves_the_router_without_an_event() {
+        let (verification_tx, _verification_rx) = mpsc::channel(2);
+        let (router_tx, mut router_rx) = mpsc::channel(8);
+        let ext = ConsensusBeaconExt { consensus: NoopConsensus::default(), provider: provider(), verification_tx, router_tx };
+        let module = ext.into_rpc();
+        // The subscription is accepted only once the router answers, so it
+        // is opened beside the router's side of the exchange.
+        let subscribing = tokio::spawn(async move {
+            module
+                .subscribe_unbounded("consensusBeaconExt_subscribeToVerificationRequest", [BLSPubkey::repeat_byte(1)])
+                .await
+                .expect("subscribed")
+        });
+        async fn within(rx: &mut mpsc::Receiver<RouterMsg<UnverifiedBlock>>) -> RouterMsg<UnverifiedBlock> {
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.expect("in time").expect("a message")
+        }
+        match within(&mut router_rx).await {
+            RouterMsg::Subscribe { reply, .. } => reply.send(7).await.expect("reply"),
+            _ => panic!("the subscription is registered first"),
+        }
+        let sub = tokio::time::timeout(std::time::Duration::from_secs(5), subscribing)
+            .await
+            .expect("accepted in time")
+            .expect("the subscribing task");
+        drop(sub);
+        match within(&mut router_rx).await {
+            RouterMsg::Disconnect { id } => assert_eq!(id, 7),
+            _ => panic!("then dropped from the router"),
+        }
     }
 
     /// A full or closed verification channel is an RPC error, never a

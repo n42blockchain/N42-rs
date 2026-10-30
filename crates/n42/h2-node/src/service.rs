@@ -61,8 +61,7 @@ use n42_h2_execution::{DriverAction, ExecutionDriver, ExecutionLayer};
 use alloy_rpc_types_engine::PayloadAttributes;
 use n42_h2_net::{
     compress_block_rlp, decode_block_rlp_raw, decode_tx_batch, decompress_block_gossip,
-    encode_block_rlp, encode_tx_batch,
-    encode_block_rlp_parts, BlockChunk, H2V4Transport, HeaderProfile, PeerId, RangeRequest,
+    encode_block_rlp, encode_tx_batch, BlockChunk, H2V4Transport, HeaderProfile, PeerId, RangeRequest,
     TransportEvent, MAX_RANGE_BLOCKS,
 };
 use n42_h2_consensus::withdrawals_to_rewards;
@@ -793,6 +792,7 @@ impl Drop for ServeSlot {
 }
 
 /// How many slots of `slots` are taken.
+#[allow(dead_code)] // helper kept for serve-slot accounting; not used today
 fn slots_taken(slots: &SharedServeSlots) -> usize {
     slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).total
 }
@@ -1115,6 +1115,7 @@ impl LoopSpend {
     /// The proposal for `view` is being made: closes the window the commit
     /// for `view - 1` opened and hands back what it cost, when that is worth
     /// a line.
+    #[allow(clippy::type_complexity)] // hot-path return type kept as is
     fn close(&mut self, view: u64) -> Option<(u64, Vec<(&'static str, u32, u64)>)> {
         let (opened, at) = self.since.take()?;
         if opened + 1 != view {
@@ -1632,7 +1633,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// stops this node's voting and proposing (default from
     /// `N42_HALT_ON_COMMIT_INVALID`, on).
     #[must_use]
-    pub fn with_halt_on_commit_invalid(mut self, on: bool) -> Self {
+    pub const fn with_halt_on_commit_invalid(mut self, on: bool) -> Self {
         self.halt_on_commit_invalid = on;
         self
     }
@@ -1758,6 +1759,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// domain to canonicalize a catching-up node from a header. The view-0
     /// genesis sentinel embeds nothing, as gov5's `buildHeaderExtra(view,
     /// nil)`. A certificate that does not encode keeps the previous bytes.
+    #[allow(clippy::needless_pass_by_ref_mut)] // hot-path method; the receiver is kept
     fn refresh_header_qc(&mut self) {
         let qc = self.engine.last_committed_qc();
         let mut held = self.header_qc.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2246,6 +2248,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Bounded because the transport can always have more: an unbounded drain
     /// under sustained gossip would never return to the engine, which is the
     /// same starvation this fixes, pointed the other way.
+    #[allow(clippy::needless_pass_by_ref_mut)] // hot-path method; the receiver is kept
     async fn drain_transport(&mut self, events: &mut Vec<ServiceEvent>) -> Result<usize, ServiceError> {
         let mut drained = 0;
         // The phase's time, split: polling the swarm (which runs libp2p's
@@ -3249,6 +3252,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         self
     }
 
+    /// Enables or disables building the next payload before this node is the leader (off by default).
     pub const fn with_build_ahead(mut self, enabled: bool) -> Self {
         self.prepare_ahead = enabled;
         self
@@ -4554,7 +4558,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
                 catch_up.target = catch_up.next + MAX_RANGE_BLOCKS - 1;
                 self.request_next_range();
-            } else if catch_up.probing && catch_up.next - 1 >= catch_up.probe_height {
+            } else if catch_up.probing && catch_up.next > catch_up.probe_height {
                 // Short, and at the height the peer was known at when the
                 // probe began: the rest is what the fleet made since, which
                 // gossip carries.
@@ -4686,6 +4690,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// starts above the commit. `None` on a fresh consensus state (a node
     /// started on a snapshot has nothing to measure from) or when the layer
     /// is not ahead.
+    #[allow(clippy::needless_pass_by_ref_mut)] // hot-path method; the receiver is kept
     async fn unproven_after_restart(&mut self) -> Option<u64> {
         let qc = self.engine.last_committed_qc();
         if qc.view == 0 {
@@ -5579,6 +5584,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 
     /// Publishes a block body, queueing it if the mesh is not ready.
+    #[allow(unused_assignments)] // initial value documents the loop state
     fn publish_body(
         &mut self,
         execution: &alloy_rpc_types_engine::ExecutionData,
@@ -5707,6 +5713,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.send_body(data, block_hash);
     }
 
+    #[allow(clippy::needless_pass_by_ref_mut)] // hot-path method; the receiver is kept
     fn remember_topic_skipped(&mut self, block_hash: B256) {
         debug!(target: "n42.h2.node", ?block_hash, "body pushed to every member; topic not used");
     }
@@ -6112,7 +6119,7 @@ fn trace_messages() -> bool {
     *ON.get_or_init(|| std::env::var("N42_H2_TRACE_MSGS").is_ok_and(|v| v == "1"))
 }
 
-fn message_kind(message: &n42_h2_primitives::consensus::ConsensusMessage) -> &'static str {
+const fn message_kind(message: &n42_h2_primitives::consensus::ConsensusMessage) -> &'static str {
     use n42_h2_primitives::consensus::ConsensusMessage as M;
     match message {
         M::Proposal(_) => "proposal",
@@ -6125,7 +6132,7 @@ fn message_kind(message: &n42_h2_primitives::consensus::ConsensusMessage) -> &'s
     }
 }
 
-fn transport_event_kind(event: &TransportEvent) -> &'static str {
+const fn transport_event_kind(event: &TransportEvent) -> &'static str {
     match event {
         TransportEvent::Envelope { .. } => "envelope",
         TransportEvent::Native { .. } => "native",

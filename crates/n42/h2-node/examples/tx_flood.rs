@@ -511,7 +511,7 @@ impl RateLimiter {
                 let mut state = self.state.lock().expect("rate limiter lock");
                 let now = Instant::now();
                 let elapsed = now.duration_since(state.last).as_secs_f64();
-                state.tokens = (state.tokens + elapsed * self.rate).min(capacity);
+                state.tokens = elapsed.mul_add(self.rate, state.tokens).min(capacity);
                 state.last = now;
                 if state.tokens >= n {
                     state.tokens -= n;
@@ -535,7 +535,7 @@ enum Signer {
 }
 
 impl Signer {
-    fn address(&self) -> Address {
+    const fn address(&self) -> Address {
         match self {
             Self::Secp(key) => key.address(),
             Self::Ed { address, .. } => *address,
@@ -589,6 +589,7 @@ static DEEPEST: AtomicU64 = AtomicU64::new(0);
 /// node's ability to answer. A sender whose frame is still unanswered is
 /// skipped rather than waited on, which is what keeps every other sender
 /// moving while one is being validated.
+#[allow(clippy::too_many_arguments)] // example helper; the argument list is kept
 fn flood_over_ingest(
     conn: &mut Ingest,
     part: &[Signer],
@@ -600,12 +601,12 @@ fn flood_over_ingest(
     rejected: &AtomicU64,
     limiter: &RateLimiter,
 ) {
-    /// Frames a worker may have unanswered at once.
-    ///
-    /// Deep enough that the connection is never idle waiting for an answer,
-    /// shallow enough that a worker cannot bury the node under work it has
-    /// already refused: at 100 transactions a frame this is 3,200 in flight
-    /// per worker.
+    // Frames a worker may have unanswered at once.
+    //
+    // Deep enough that the connection is never idle waiting for an answer,
+    // shallow enough that a worker cannot bury the node under work it has
+    // already refused: at 100 transactions a frame this is 3,200 in flight
+    // per worker.
     let window = args.window.max(1);
 
     let mut inflight = vec![false; part.len()];

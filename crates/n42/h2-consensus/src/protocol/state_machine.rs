@@ -2059,6 +2059,12 @@ impl ConsensusEngine {
     /// reached): the certificate is unchecked, not refused, as gov5's
     /// `verifyHeaderWithBatch` skips a QC whose set it cannot resolve. Every
     /// other failure is an error.
+    /// Whether an import (or, under deferred execution, a check) of
+    /// `block_hash` has reached this engine: what its vote waits for.
+    pub fn has_imported_block(&self, block_hash: &B256) -> bool {
+        self.imported_blocks.contains(block_hash)
+    }
+
     pub fn verify_header_qc(
         &self,
         wire: &n42_h2_wire::h2_wire::H2QuorumCertificate,

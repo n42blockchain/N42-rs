@@ -598,3 +598,18 @@ persistence defaults 8/6, entry-file fold archive) + the validator's persistence
   alternating pairs, 600M replay set) read win1 5.047 / 5.040M against 5.060 / 5.040M and round totals
   451.1M against 454.6M (-0.8%), every leg with clean gates, so the audit's hot-path changes cost nothing
   visible at the 5M shape; peak under the new supply 349 W, Tctl 54 C. Details in the handoff document.
+- **Second Linux pass and the 10-30 A/B (2026-10-30, 03:05-05:50 UTC).** The same chain ran green again on
+  main `a2407baf8` (72 suites, both checks, natives, the x22 probe byte for byte, the three devnet shapes with
+  the same hashes and no header-QC refusal in any validator log, `roll --kill`, clippy 1500). The Windows
+  session then pushed main `5a0d895c3` (tx-queue R3-P2/P3/P4, R3-N4's decode-before-forward, the R2-C9
+  two-phase header vote, R2-C1, R3-G4 and the mobile remainders); the Linux side merged its R3-E1/E3 branch
+  onto it (`6f0913d92`: the builder admits by the sum of gas limits and a per-sender worst-case ledger, the
+  follower's rule), ran 50 suites of the ten touched crates, and paired the natives against `b91411e27` in
+  bench stage `fw`: win1 4.960 / 4.945M against 4.960 / 5.033M (-0.9%), round totals 449.0M against 452.1M
+  (-0.7%), clean gates, R3-P2's bounds never hit (`refused=0`, `frames_refused=0`, no `Lagged` read-back).
+  The same binaries then ran five devnet shapes with a gov5 member -- the three rejoin shapes and two on a
+  genesis copy with `twoPhaseVoteGate: true` (gov5 late, 160 blocks; gov5 present from the start, 133 blocks)
+  -- every one with the same block hash on both clients and no gov5 error, the Rust validators reporting
+  `vote gate : two-phase` and the gov5 member's stored chainspec carrying the flag. The branch merged into
+  main as `134b9c215`; `docs/audit/2026-10-5m/LEFTOVERS.md` section C is closed except R3-E2. Peak under load
+  433 W at the 32-job test build, Tctl 58 C, VRM 62 C; no cut.

@@ -5637,7 +5637,7 @@ mod tests {
     #[test]
     fn the_build_path_by_reference_matches_the_owned_block() {
         let (block, db) = fixture(8, 6);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let (owned, _) = execute_transfers_build_path(&evm_config, &block, db.clone(), &|| Some(db.clone()))
             .expect("no execution error")
             .expect("the block qualifies on the build path");
@@ -5680,7 +5680,7 @@ mod tests {
     #[test]
     fn the_build_path_matches_the_follower_path_and_the_serial_executor() {
         let (block, db) = fixture(8, 6);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let serial = evm_config.executor(db.clone()).execute(&block).expect("serial execution");
         let (follower, _) = execute_transfers_with(&evm_config, &block, db.clone(), &|| Some(db.clone()), true, false)
             .expect("no execution error")
@@ -5719,7 +5719,7 @@ mod tests {
     fn the_build_path_refuses_a_block_it_would_skip_a_transfer_of() {
         let (block, mut db) = fixture(4, 3);
         db.insert_account_info(addr(101), AccountInfo { balance: U256::from(1u64), nonce: 3, ..Default::default() });
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let refused = execute_transfers_build_path(&evm_config, &block, db.clone(), &|| Some(db.clone())).expect("no execution error");
         assert!(refused.is_err(), "an unfunded transfer sends the block elsewhere");
     }
@@ -5730,7 +5730,7 @@ mod tests {
 
     fn parallel_matches_serial_planned(graft: bool, sender_groups: bool, ahead: bool, merge_behind: bool) {
         let (block, db) = fixture(8, 6);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let serial = evm_config.executor(db.clone()).execute(&block).expect("serial execution");
         // A plan made the way the follower makes it ahead; used only when its
         // grouping is the one asked for.
@@ -6346,7 +6346,7 @@ mod tests {
     fn build_run_matches_serial() {
         use alloy_consensus::Transaction as _;
         let (block, db) = fixture(8, 6);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let serial = evm_config.executor(db.clone()).execute(&block).expect("serial execution");
         let evm_env = evm_config.evm_env(block.header()).expect("env");
         let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
@@ -6424,7 +6424,7 @@ mod tests {
     #[test]
     fn the_read_set_run_equals_the_plain_run() {
         let (block, db) = random_fixture(40, 12, 300, 3, 5);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(block.header()).expect("env");
         let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
         let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
@@ -6480,7 +6480,7 @@ mod tests {
                 db.insert_account_info(addr(100 + s), AccountInfo { balance: five, nonce: 0, ..Default::default() });
             }
             let evm_config =
-                crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+                crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
             let evm_env = evm_config.evm_env(block.header()).expect("env");
             let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
             let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
@@ -6545,7 +6545,7 @@ mod tests {
         for (senders, per, space, run) in [(400u64, 50u64, 0u64, 50usize), (300, 30, 0, 1), (200, 40, 2_000, 7)] {
             let (block, db) = random_fixture(senders, per, space, run, 5);
             let evm_config =
-                crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+                crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
             let evm_env = evm_config.evm_env(block.header()).expect("env");
             let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
             let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
@@ -6716,7 +6716,7 @@ mod tests {
                 }
             }
             let evm_config =
-                crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+                crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
             let evm_env = evm_config.evm_env(block.header()).expect("env");
             let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
             let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
@@ -6895,7 +6895,7 @@ mod tests {
     #[test]
     fn a_staged_graft_lands_where_the_graft_does() {
         let (block, db) = fixture(8, 6);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(block.header()).expect("env");
         let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
         let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
@@ -6936,7 +6936,7 @@ mod tests {
     #[test]
     fn a_later_touch_of_a_grafted_account_keeps_the_grafts_revert() {
         let (block, db) = fixture(3, 2);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(block.header()).expect("env");
         let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
         let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
@@ -7147,7 +7147,7 @@ mod tests {
         let (senders, per, space, run) =
             (env("BENCH_SENDERS", 380), env("BENCH_PER", 429), env("BENCH_SPACE", 0), env("BENCH_RUN", 64));
         let (block, mut db) = random_fixture(senders, per, space, run as usize, env("BENCH_SPREAD", 8));
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let mut distinct: std::collections::HashSet<Address> = Default::default();
         for (sender, tx) in block.transactions_with_sender() {
             distinct.insert(*sender);
@@ -7407,7 +7407,7 @@ mod tests {
             })
             .collect();
         let header = n42_header::N42Header::from(alloy_consensus::Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() });
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(&header).expect("env");
         let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap_or_default())).collect();
         let convert = |i: usize| (Recovered::new_unchecked(signed[i].clone(), envs[i].caller), envs[i].clone());
@@ -7775,7 +7775,7 @@ mod tests {
     #[test]
     fn the_hash_partition_is_the_serial_one_on_a_full_block() {
         let (block, _) = random_fixture(64, 200, 0, 64, 8);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(block.header()).expect("an environment");
         let txs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
         let beneficiary = evm_env.block_env.beneficiary;
@@ -7798,7 +7798,7 @@ mod tests {
         let senders = block.senders().to_vec();
         block = RecoveredBlock::new_unhashed(raw, senders);
         let _ = hash;
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let out = execute_transfers(&evm_config, &block, db.clone(), &|| Some(db.clone())).expect("no execution error");
         assert!(matches!(out, Err(NotParallel::TouchesBeneficiary(0))), "{out:?}");
     }
@@ -7833,7 +7833,7 @@ mod tests {
         for (senders, per, space, run) in [(400u64, 50u64, 0u64, 50usize), (300, 30, 0, 1), (200, 40, 2_000, 7)] {
             let (block, db) = random_fixture(senders, per, space, run, 5);
             let evm_config =
-                crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+                crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
             let evm_env = evm_config.evm_env(block.header()).expect("env");
             let beneficiary = evm_env.block_env.beneficiary;
             let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
@@ -7919,7 +7919,7 @@ mod tests {
         for r in (0..2_000u64).step_by(3) {
             db.insert_account_info(addr(1_000_000 + r), AccountInfo { balance: U256::from(5 + r), nonce: r % 4, ..Default::default() });
         }
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(block.header()).expect("env");
         let beneficiary = evm_env.block_env.beneficiary;
         let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
@@ -8127,7 +8127,7 @@ mod tests {
             }
         }
         let header = n42_header::N42Header::from(alloy_consensus::Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() });
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(&header).expect("env");
         let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap_or_default())).collect();
         let convert = |i: usize| ((), envs[i].clone());
@@ -8319,7 +8319,7 @@ mod tests {
             }
         }
         let header = n42_header::N42Header::from(alloy_consensus::Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() });
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(&header).expect("env");
         let keys: Vec<(Address, Address)> =
             cands.iter().map(|tx| (tx.sender(), alloy_consensus::Transaction::to(&tx.transaction).unwrap_or_default())).collect();
@@ -8550,7 +8550,7 @@ mod tests {
             timestamp: 1_800_000_000,
             ..Default::default()
         });
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         (evm_config.evm_env(&header).expect("env"), envs, db)
     }
 

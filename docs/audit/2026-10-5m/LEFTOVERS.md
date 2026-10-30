@@ -81,6 +81,7 @@ Rust 现状:
 
 ## E. 需要用户操作
 
-(已完成 10-30:`design/qmdb-compact-stage1` `7e379dc62` 与 `design/qmdb-compact-stage2` `62265d47c` 已推送。Linux 把两者合到
-main `5a0d895c3` 上为 `integ/qmdb-compact-stage12`(`7ce44bdb4`,forest.rs 一处平凡冲突),测试后 no-ff 合入 main;
+(已完成 10-30:`design/qmdb-compact-stage1` `7e379dc62` 与 `design/qmdb-compact-stage2` `62265d47c` 已推送;Linux 把两者合到
+main `5a0d895c3` 上为 `integ/qmdb-compact-stage12`(`7ce44bdb4`,forest.rs 一处平凡冲突),五个 QMDB crate 19 套件 571 测试、
+`bin/n42` + `h2-node` check、entry-file 模式 `roll --kill` 现场检查通过后 no-ff 合入 main `c992a5ee4`;
 见 `docs/MATURITY_HARDENING_2026_10.md` §6.2 / §8。)

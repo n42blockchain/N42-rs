@@ -80,11 +80,7 @@
 
 ## 未推送的分支
 
-推送曾被拒,未重试。需要时由用户执行:
-
-```
-git push origin design/qmdb-compact-stage1 fix/qmdb-compact-stage2-audit:design/qmdb-compact-stage2
-```
+(已解决 10-30:两条 stage 分支已推送并经 `integ/qmdb-compact-stage12` 合入 main `c992a5ee4`,见 LEFTOVERS.md E。)
 
 ## Linux 会话接手(bench 主机或任意 Linux)
 

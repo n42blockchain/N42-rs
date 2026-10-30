@@ -60,4 +60,4 @@ mobile/APoS 旧路径。
 |---|---|
 | 1.1-1.2 五个领域审查 | 进行中(2026-10-28 起) |
 | 1.2 复核与入库 | 待审查完成 |
-| 1.2 第 4 步 Linux 验证 | 等主机 |
+| 1.2 第 4 步 Linux 验证 | 完成(2026-10-30,main `b91411e27`,电源更换后):17 个触及 crate + bin 的测试 71 套件全过;`cargo check -p n42 -p n42-h2-node --tests --examples` 与 `cargo check --workspace` 通过;clippy CI 集 1500 条警告(基线 1504);x22 探针出块与审计前逐字相同;devnet 三形态(gov5 成员)全过且块哈希两客户端相同;fleet7 `roll --kill`(文件模式,首杀在首次 MDBX 持久化前)三成员均恢复并再提交。X22 同机配对见 `audit/2026-10-5m/HANDOFF.md` "Linux 会话结果" |

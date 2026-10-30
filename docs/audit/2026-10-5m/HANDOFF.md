@@ -147,3 +147,23 @@ Linux 会话接手:
 3. R3-E1:与 gov5 对齐可纳入性规则后,builder 与 follower 同改。
 4. tx-queue 组(P2/P3/P4)一起设计。
 5. R3-N4 与 R3-P5/P6 余项(PoP、独立 DST 需 mobile-sdk 同步)。
+
+## Linux 会话结果(2026-10-30,bench 主机电源更换后)
+
+主机 10-28 17:54 UTC 第四次在负载台阶上掉电(一次 `cargo test` 的多线程测试二进制,87 W → 337 W),
+用户 10-29 更换电源;以下是更换后的第一轮验证,main `b91411e27`(链脚本
+`/data/n42-build/audit-notes/scripts/main-verify.sh`,日志 `ci/main-verify.log`):
+
+| 步骤 | 结果 |
+|---|---|
+| 测试(交接表全部 crate:deferred-reverts、engine-types、env、h2-consensus、h2-el-rpc、h2-execution、h2-net、h2-node、mobile-service、mobile-verify、qmdb-reth、qmdb-state、twig-core、tx-ingest、tx-queue、tx-types、h2-wire、n42 lib+bins) | 71 套件 ok,0 失败。第一遍在 `93f3ea2cf` 上只挂 `a_described_block_of_many_chunks_with_fills_is_the_decoded_block`(R3-N3 的上限 vs 30M 夹具),与 Windows 的 `67449f7ba` 同一修法 |
+| `cargo check -p n42 -p n42-h2-node --tests --examples`;`cargo check --workspace` | 通过 |
+| `cargo clippy --workspace --lib --bins --examples` | 1500 条警告,基线(`4e43be3ac`)1504 |
+| native 构建(`target-cpu=native`,n42 + h2_validator/tx_flood/h2_keygen/send_tx) | 通过 |
+| x22 探针(七节点,`N42_PROFILE=x22`,200 tx/s,90 s) | 高度 28 / 持久化 21 / 内存 7,与审计前探针逐字相同;`N42_BENCH_UNSAFE` 由 main 的 `fleet7-env.sh` 自给 |
+| devnet 三形态(gov5 成员) | gov5late:160 块,gov5 封 40 / 提交 200,块 160 两客户端同哈希;late:121 块,补拉成员同哈希;absent:185 块,归来成员再提交 103。gov5 日志 2 条 error 是晚加入后 36 s 内两次 "committed block not executed locally"(number 0,EL 未追上的瞬态),之后正常 |
+| fleet7 `roll --kill`(`N42_QMDB_ENTRY_FILE=1`,首杀 20 s) | node1 高度 8 从块 0 检查点 + entry 文件恢复,node2 从块 21,node3 从块 42;三者都重新加入并再提交 |
+| X22 同机配对 | bench 树 stage `fv`(`bench/main-x11t16` `c00ebb297`):main `b91411e27` natives 对 `native-qc`(= 审计前 main `f2a1ff86c`),WARM + 四腿交替,600M 回放集;stage 导出 `N42_BENCH_UNSAFE=1`(审计后的二进制拒绝 runner 的直通 ingest),X11 本就显式带 `N42_CANON_NOTIFY_LEAN=1`。结果见下 |
+
+X22 配对结果:**(运行中,2026-10-30 01:22 UTC 起)**
+

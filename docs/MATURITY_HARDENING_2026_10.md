@@ -586,3 +586,13 @@ persistence defaults 8/6, entry-file fold archive) + the validator's persistence
   checkpoint replays from the archive in both storage modes; the profile report's withdrawal line states
   how many knobs remain in force; the seven clippy nits named in 6.x are fixed. Unit tests on the merged
   head: `n42-qmdb-reth` 104, `n42-env` 23, `n42-tx-queue` 133 passed.
+- **Power fault closed (2026-10-29).** A fourth silent cut at 10-28 17:54 UTC, again at a load step
+  (a `cargo test` run's multi-threaded test binaries, 87 W to 337 W within a minute, no BMC event),
+  settled the diagnosis: the motherboard's standby LEDs stayed lit through every cut, so the wall supply
+  never dropped and the PSU's main rails tripped. The user replaced the PSU on 2026-10-29. The first
+  verification after it ran main `b91411e27` (the 5M audit merge, `docs/audit/2026-10-5m/HANDOFF.md`)
+  through the whole chain at 32 jobs -- 71 test suites, `cargo check --workspace`, clippy 1500 against the
+  1504 baseline, the x22 probe, the three devnet shapes with a gov5 member (same block hashes on both
+  clients), the `roll --kill` field check in file mode -- with the guard never above the pre-fault
+  readings; the X22 bench pair (stage `fv`, audited main against `native-qc`) follows and its result
+  goes to the handoff document.

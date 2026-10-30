@@ -1,0 +1,210 @@
+From e9d3ed3696e69dc98d45bd8a2617a3e431cbdab3 Mon Sep 17 00:00:00 2001
+From: MiraWells <1020080523@qq.com>
+Date: Fri, 30 Oct 2026 02:55:16 -0400
+Subject: [PATCH 2/3] test(block): pin the Glamsterdam header layout and write
+ cross-client fixtures
+
+A slot number binds the hash; a header with a slot and a registry root has
+24 elements (slot at 23, root at 24) and round-trips through RLP, the
+trailer and the compact codec with and without a BAL hash at 22.
+TestWriteHeaderParityFixtures writes those shapes, and Ethereum's Amsterdam
+shape, as raw RLP with their hashes when N42_HEADER_PARITY_FIXTURE_DIR is
+set; the Rust client decodes them byte for byte.
+---
+ common/block/header_parity_fixtures_test.go | 81 ++++++++++++++++++
+ common/block/header_slot_number_test.go     | 94 +++++++++++++++++++++
+ 2 files changed, 175 insertions(+)
+ create mode 100644 common/block/header_parity_fixtures_test.go
+
+diff --git a/common/block/header_parity_fixtures_test.go b/common/block/header_parity_fixtures_test.go
+new file mode 100644
+index 00000000..1464dd8e
+--- /dev/null
++++ b/common/block/header_parity_fixtures_test.go
+@@ -0,0 +1,81 @@
++// Copyright 2022-2026 The N42 Authors
++// This file is part of the N42 library.
++
++package block
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/n42blockchain/N42/common/types"
++	"github.com/n42blockchain/N42/lib/rlp"
++)
++
++// headerParityFixtures are the header shapes the Rust client's
++// header-field-parity tests decode byte for byte (n42-rs
++// crates/n42/h2-consensus/testdata/header_field_parity/): the trailing fields
++// from Glamsterdam on, with the slot (the block number, as the native chain
++// stamps it) at element 23 and MobileRegistryRoot at 24.
++func headerParityFixtures() map[string]*Header {
++	slot := uint64(1001) // balSampleHeader's number
++	root := types.HexToHash("0x4242424242424242424242424242424242424242424242424242424242424242")
++	bal := types.HexToHash("0x99aabbccddeeff00112233445566778899aabbccddeeff0011223344556677ff")
++
++	// The native chain as configured today: balTime unset, so element 22 is
++	// gov5's empty placeholder.
++	slotRoot := balSampleHeader()
++	slotRoot.SlotNumber = &slot
++	slotRoot.MobileRegistryRoot = &root
++
++	balSlotRoot := balSampleHeader()
++	balSlotRoot.BlockAccessListHash = &bal
++	balSlotRoot.SlotNumber = &slot
++	balSlotRoot.MobileRegistryRoot = &root
++
++	// Ethereum's Amsterdam shape: no root.
++	amsterdam := balSampleHeader()
++	amsterdam.BlockAccessListHash = &bal
++	amsterdam.SlotNumber = &slot
++
++	return map[string]*Header{
++		"gov5_header_slot23_root24":       slotRoot,
++		"gov5_header_bal22_slot23_root24": balSlotRoot,
++		"gov5_header_bal22_slot23":        amsterdam,
++	}
++}
++
++// TestWriteHeaderParityFixtures writes the fixtures (raw RLP, one file each,
++// plus their gov5 hashes) when N42_HEADER_PARITY_FIXTURE_DIR names a
++// directory; otherwise it only checks that every fixture round-trips.
++func TestWriteHeaderParityFixtures(t *testing.T) {
++	dir := os.Getenv("N42_HEADER_PARITY_FIXTURE_DIR")
++	hashes := map[string]string{}
++	for name, h := range headerParityFixtures() {
++		enc, err := rlp.EncodeToBytes(h)
++		if err != nil {
++			t.Fatal(err)
++		}
++		var back Header
++		if err := rlp.DecodeBytes(enc, &back); err != nil || back.Hash() != h.Hash() {
++			t.Fatalf("%s: round trip err=%v hash %s want %s", name, err, back.Hash().Hex(), h.Hash().Hex())
++		}
++		hashes[name] = h.Hash().Hex()
++		if dir != "" {
++			if err := os.WriteFile(filepath.Join(dir, name+".rlp"), enc, 0o644); err != nil {
++				t.Fatal(err)
++			}
++		}
++	}
++	if dir == "" {
++		return
++	}
++	out, err := json.MarshalIndent(hashes, "", "  ")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(dir, "gov5_header_hashes.json"), append(out, '\n'), 0o644); err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/common/block/header_slot_number_test.go b/common/block/header_slot_number_test.go
+index 15c4ce7f..a2fa2071 100644
+--- a/common/block/header_slot_number_test.go
++++ b/common/block/header_slot_number_test.go
+@@ -77,3 +77,97 @@ func TestHeaderSlotNumberTrailerRoundTrip(t *testing.T) {
+ 		t.Fatalf("trailer round trip: slot=%v hash=%s want %s", back.SlotNumber, back.Hash().Hex(), h.Hash().Hex())
+ 	}
+ }
++
++// Binding a slot number changes the hash, with and without a registry root,
++// and a header with both has 24 elements: the slot at 23, the root at 24.
++func TestHeaderSlotNumberParticipatesInHash(t *testing.T) {
++	slot := uint64(1001)
++	root := types.HexToHash("0xabc0000000000000000000000000000000000000000000000000000000000abc")
++
++	plain := balSampleHeader()
++	withSlot := balSampleHeader()
++	withSlot.SlotNumber = &slot
++	if withSlot.Hash() == plain.Hash() {
++		t.Fatal("binding SlotNumber did not change the header hash")
++	}
++	both := balSampleHeader()
++	both.SlotNumber = &slot
++	both.MobileRegistryRoot = &root
++	if both.Hash() == withSlot.Hash() {
++		t.Fatal("MobileRegistryRoot behind the slot does not bind the hash")
++	}
++	if n := headerElementCount(t, withSlot); n != 23 {
++		t.Fatalf("slot without root encodes %d elements, want 23", n)
++	}
++	if n := headerElementCount(t, both); n != 24 {
++		t.Fatalf("slot with root encodes %d elements, want 24", n)
++	}
++}
++
++// A slot plus a registry root round-trips through RLP and both storage
++// codecs with its hash, with and without a BAL hash at 22.
++func TestHeaderSlotNumberAndMobileRegistryRootRoundTrip(t *testing.T) {
++	slot := uint64(2_000_000)
++	root := types.HexToHash("0x4242424242424242424242424242424242424242424242424242424242424242")
++	bal := types.HexToHash("0x99aabbccddeeff00112233445566778899aabbccddeeff0011223344556677ff")
++	for _, withBAL := range []bool{false, true} {
++		h := balSampleHeader()
++		h.SlotNumber = &slot
++		h.MobileRegistryRoot = &root
++		if withBAL {
++			h.BlockAccessListHash = &bal
++		}
++		want := h.Hash()
++
++		enc, err := rlp.EncodeToBytes(h)
++		if err != nil {
++			t.Fatal(err)
++		}
++		var back Header
++		if err := rlp.DecodeBytes(enc, &back); err != nil {
++			t.Fatalf("decode (bal %v): %v", withBAL, err)
++		}
++		if back.SlotNumber == nil || *back.SlotNumber != slot || back.MobileRegistryRoot == nil || *back.MobileRegistryRoot != root {
++			t.Fatalf("RLP round trip (bal %v): slot=%v root=%v", withBAL, back.SlotNumber, back.MobileRegistryRoot)
++		}
++		if (back.BlockAccessListHash != nil) != withBAL || back.Hash() != want {
++			t.Fatalf("RLP round trip (bal %v): bal=%v hash %s, want %s", withBAL, back.BlockAccessListHash, back.Hash().Hex(), want.Hex())
++		}
++
++		m, err := h.Marshal()
++		if err != nil {
++			t.Fatal(err)
++		}
++		var fromTrailer Header
++		if err := fromTrailer.Unmarshal(m); err != nil {
++			t.Fatal(err)
++		}
++		if fromTrailer.Hash() != want {
++			t.Fatalf("trailer round trip (bal %v) hash %s, want %s", withBAL, fromTrailer.Hash().Hex(), want.Hex())
++		}
++		var fromCompact Header
++		if err := fromCompact.Unmarshal(h.MarshalCompact()); err != nil {
++			t.Fatal(err)
++		}
++		if fromCompact.Hash() != want {
++			t.Fatalf("compact round trip (bal %v) hash %s, want %s", withBAL, fromCompact.Hash().Hex(), want.Hex())
++		}
++	}
++}
++
++func headerElementCount(t *testing.T, h *Header) int {
++	t.Helper()
++	enc, err := rlp.EncodeToBytes(h)
++	if err != nil {
++		t.Fatal(err)
++	}
++	content, _, err := rlp.SplitList(enc)
++	if err != nil {
++		t.Fatal(err)
++	}
++	n, err := rlp.CountValues(content)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return n
++}
+-- 
+2.53.0
+

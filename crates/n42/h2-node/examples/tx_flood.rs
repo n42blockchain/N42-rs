@@ -1033,7 +1033,7 @@ fn submit(
 /// How many times a refused funding transaction is sent again, and the pause
 /// before each try. Funding is one nonce sequence from the faucet: a single
 /// refusal leaves a nonce hole, nothing after it is mined, and the round dies
-/// in "funding did not mine" (loop351 SMPABAb, LWa, LZ2, VXa: one valid-looking
+/// in "funding did not mine" (loop351 `SMPABAb`, `LWa`, `LZ2`, `VXa`: one valid-looking
 /// transfer refused as "expected a valid hex string").
 const FUNDING_RETRIES: usize = 3;
 const FUNDING_RETRY_PAUSE: Duration = Duration::from_millis(200);
@@ -1101,10 +1101,10 @@ fn submit_funding(
             let nonce = first_nonce + *id as u64;
             let verdict = funding_refusal(error);
             eprintln!("funding      : nonce {nonce} refused (attempt {attempt}, {verdict:?}): {error}");
-            if verdict == FundingRefusal::Retry {
-                if let Some(raw) = batch.get(*id) {
-                    again.push((*id, raw));
-                }
+            if verdict == FundingRefusal::Retry
+                && let Some(raw) = batch.get(*id)
+            {
+                again.push((*id, raw));
             }
         }
         sent.fetch_add((pending.len() - again.len()) as u64, Ordering::Relaxed);

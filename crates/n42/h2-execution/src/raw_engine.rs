@@ -658,6 +658,7 @@ pub fn decode_foreign_body(buf: &[u8]) -> Result<(B256, N42HeaderProfile, &[u8])
 
 /// [`decode_foreign_body`], with the sender's [`ClaimSource`] when the frame
 /// carries one ([`encode_foreign_body_from`]).
+#[allow(clippy::type_complexity)] // hot-path decoder; the return tuple is kept inline
 pub fn decode_foreign_body_from(buf: &[u8]) -> Result<(B256, N42HeaderProfile, &[u8], Option<ClaimSource>), String> {
     let mut r = Reader { rest: buf, shared: None };
     if r.u8()? != VERSION {

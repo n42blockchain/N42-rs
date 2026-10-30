@@ -475,6 +475,7 @@ where
     /// [`PayloadList::copy_out`] encodes it from the same transactions beside
     /// the import, for the engine's own pass, its only reader. What this road
     /// does per transaction is the list in block order and the senders.
+    #[allow(clippy::too_many_arguments)] // hot-path helper; the argument list is kept
     fn describe_frames(
         &self,
         body: n42_h2_consensus::CompactBlockBody<'_>,

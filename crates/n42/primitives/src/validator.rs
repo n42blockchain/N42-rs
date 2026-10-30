@@ -5,11 +5,10 @@
 use crate::{is_compounding_withdrawal_credential, BLSPubkey, ChainSpec, Epoch, Gwei};
 use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
-use ssz::Encode;
 use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 
-#[derive(Serialize, Debug, Deserialize, PartialEq)]
+#[derive(Serialize, Debug, Deserialize, PartialEq, Eq)]
 pub struct ValidatorBeforeTx {
     pub address: Address,
     pub info: Option<Validator>,
@@ -31,7 +30,7 @@ pub struct ValidatorRevert {
     pub validators: Vec<Vec<(Address, Option<Validator>)>>,
 }
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Hash, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub struct ValidatorInfo {
     pub activation_timestamp: u64,
     pub exit_timestamp: u64,
@@ -41,7 +40,7 @@ pub struct ValidatorInfo {
 }
 
 #[derive(
-    Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode, TreeHash,
+    Debug, Clone, Hash, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash,
 )]
 pub struct Validator {
     pub pubkey: BLSPubkey,
@@ -57,11 +56,11 @@ pub struct Validator {
 }
 
 impl Validator {
-    pub fn is_partially_withdrawable_validator(&self, balance: u64, spec: &ChainSpec) -> bool {
+    pub const fn is_partially_withdrawable_validator(&self, balance: u64, spec: &ChainSpec) -> bool {
         self.effective_balance == spec.max_effective_balance && balance > spec.max_effective_balance
     }
 
-    pub fn is_fully_withdrawable_validator(&self, balance: u64, epoch: Epoch) -> bool {
+    pub const fn is_fully_withdrawable_validator(&self, balance: u64, epoch: Epoch) -> bool {
         self.withdrawable_epoch <= epoch && balance > 0
     }
 
@@ -92,7 +91,7 @@ impl Validator {
     }
 
     /// Returns `true` if the validator is considered active at some epoch.
-    pub fn is_active_at(&self, epoch: Epoch) -> bool {
+    pub const fn is_active_at(&self, epoch: Epoch) -> bool {
         self.activation_epoch <= epoch && epoch < self.exit_epoch
     }
 
@@ -104,7 +103,7 @@ impl Validator {
         //fork_name: ForkName,
         spec: &ChainSpec,
     ) -> Self {
-        let mut validator = Validator {
+        let mut validator = Self {
             pubkey,
             withdrawal_credentials,
             activation_eligibility_epoch: spec.far_future_epoch,
@@ -130,7 +129,7 @@ impl Validator {
     /// Eligibility depends on finalization, so we assume best-possible finalization. This function
     /// returning true is a necessary but *not sufficient* condition for a validator to activate in
     /// the epoch transition at the end of `epoch`.
-    pub fn could_be_eligible_for_activation_at(&self, epoch: Epoch, spec: &ChainSpec) -> bool {
+    pub const fn could_be_eligible_for_activation_at(&self, epoch: Epoch, spec: &ChainSpec) -> bool {
         // Has not yet been activated
         self.activation_epoch == spec.far_future_epoch
         // Placement in queue could be finalized.
@@ -144,29 +143,29 @@ impl Validator {
     /// Returns `true` if the validator is eligible to join the activation queue.
     ///
     /// Calls the correct function depending on the provided `fork_name`.
-    pub fn is_eligible_for_activation_queue(&self, spec: &ChainSpec) -> bool {
+    pub const fn is_eligible_for_activation_queue(&self, spec: &ChainSpec) -> bool {
         self.is_eligible_for_activation_queue_base(spec)
     }
 
     /// Returns `true` if the validator is eligible to join the activation queue.
     ///
     /// Spec v0.12.1
-    fn is_eligible_for_activation_queue_base(&self, spec: &ChainSpec) -> bool {
+    const fn is_eligible_for_activation_queue_base(&self, spec: &ChainSpec) -> bool {
         self.activation_eligibility_epoch == spec.far_future_epoch
             && self.effective_balance == spec.max_effective_balance
     }
 
     /// Returns `true` if the validator is able to withdraw at some epoch.
-    pub fn is_withdrawable_at(&self, epoch: Epoch) -> bool {
+    pub const fn is_withdrawable_at(&self, epoch: Epoch) -> bool {
         epoch >= self.withdrawable_epoch
     }
 
     /// Returns `true` if the validator is considered exited at some epoch.
-    pub fn is_exited_at(&self, epoch: Epoch) -> bool {
+    pub const fn is_exited_at(&self, epoch: Epoch) -> bool {
         self.exit_epoch <= epoch
     }
 
-    pub fn js_exited_set(&self, spec: &ChainSpec) -> bool {
+    pub const fn js_exited_set(&self, spec: &ChainSpec) -> bool {
         self.exit_epoch != spec.far_future_epoch
     }
 }

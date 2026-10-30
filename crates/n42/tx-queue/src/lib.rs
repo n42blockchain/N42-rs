@@ -300,11 +300,14 @@ pub enum Dropped {
     /// pool's price bump (audit 2026-10 round 3, R3-P3). Harmless: the
     /// sender replaced it.
     Outbid,
+    /// A transaction builds refused [`REFUSALS_BEFORE_DROP`] times for
+    /// something other than its nonce or a full block (R3-P2).
+    Refused,
 }
 
 impl Dropped {
     /// Every reason, in report order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Duplicate,
         Self::Mined,
         Self::StaleArrival,
@@ -315,6 +318,7 @@ impl Dropped {
         Self::HeldEvicted,
         Self::HeldBehind,
         Self::Outbid,
+        Self::Refused,
     ];
 
     /// The name this reason is reported under.
@@ -330,6 +334,7 @@ impl Dropped {
             Self::HeldEvicted => "held_evicted",
             Self::HeldBehind => "held_behind",
             Self::Outbid => "outbid",
+            Self::Refused => "refused",
         }
     }
 
@@ -345,6 +350,7 @@ impl Dropped {
             Self::HeldEvicted => 7,
             Self::HeldBehind => 8,
             Self::Outbid => 9,
+            Self::Refused => 10,
         }
     }
 
@@ -354,6 +360,25 @@ impl Dropped {
         matches!(self, Self::Duplicate | Self::Mined | Self::Outbid)
     }
 }
+
+/// How many refusals by builds a transaction takes before the queue drops
+/// it, counting those for anything but its nonce or a full block (audit
+/// 2026-10 round 3, R3-P2). The builder reports every EVM refusal that is
+/// not a nonce's as an unsupported type, so a refusal cannot say whether it
+/// is for good (no funds) or for now (a base fee above its cap): it is
+/// counted, and given back until the count is reached.
+/// `N42_TX_QUEUE_REFUSALS` overrides it; 0 never drops (the old behaviour).
+const REFUSALS_BEFORE_DROP: u8 = 4;
+
+fn refusals_before_drop() -> u8 {
+    static AT: OnceLock<u8> = OnceLock::new();
+    *AT.get_or_init(|| {
+        std::env::var("N42_TX_QUEUE_REFUSALS").ok().and_then(|v| v.parse().ok()).unwrap_or(REFUSALS_BEFORE_DROP)
+    })
+}
+
+/// The most (sender, nonce) refusal counts kept; past it they start over.
+const REFUSAL_COUNTS_MAX: usize = 1 << 16;
 
 /// The pool's price bump for a replacement, in percent (reth's
 /// `PriceBumpConfig` default).
@@ -845,7 +870,7 @@ fn fold_highest(mined: impl IntoIterator<Item = (Address, u64)>) -> AddressHashM
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DropReport {
     /// Counts in [`Dropped::ALL`] order.
-    pub counts: [u64; 10],
+    pub counts: [u64; 11],
     /// The first few, as (reason, sender, nonce): enough to take one sender
     /// to the generator's own log and see which nonce went missing.
     pub samples: Vec<(Dropped, Address, u64)>,
@@ -1198,6 +1223,10 @@ struct Inner<T: PoolTransaction> {
     /// Holes a build ran into: (sender, the account's next nonce, the lowest
     /// queued nonce above it). The feed fills them from the pool.
     gaps: Vec<(Address, u64, u64)>,
+    /// Builds' refusals of a (sender, nonce) for anything but its nonce or
+    /// a full block ([`REFUSALS_BEFORE_DROP`]). Kept at the count once
+    /// reached, so a copy the gap fill brings back goes at its next refusal.
+    refusals: alloy_primitives::map::HashMap<(Address, u64), u8>,
     /// Transactions this node's own built blocks took out of the queue before
     /// the chain committed them: (block number, block hash, the
     /// transactions). A block that consensus never commits -- its view timed
@@ -2318,6 +2347,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 pending: Vec::new(),
                 settling: Vec::new(),
                 gaps: Vec::new(),
+                refusals: Default::default(),
                 held: VecDeque::new(),
                 parked_order: VecDeque::new(),
                 parked_len: 0,
@@ -6707,6 +6737,21 @@ impl<T: PoolTransaction> Inner<T> {
         self.drops.samples.extend(items.take(room).map(|(sender, nonce)| (reason, sender, nonce)));
     }
 
+    /// Counts a build's refusal of (sender, nonce); whether it has reached
+    /// [`REFUSALS_BEFORE_DROP`].
+    fn refused_enough(&mut self, sender: Address, nonce: u64) -> bool {
+        let at = refusals_before_drop();
+        if at == 0 {
+            return false;
+        }
+        if self.refusals.len() >= REFUSAL_COUNTS_MAX && !self.refusals.contains_key(&(sender, nonce)) {
+            self.refusals.clear();
+        }
+        let count = self.refusals.entry((sender, nonce)).or_insert(0);
+        *count = count.saturating_add(1).min(at);
+        *count >= at
+    }
+
     /// Records that a transaction left the queue, or never entered it.
     fn dropped(&mut self, reason: Dropped, sender: Address, nonce: u64) {
         self.drops.counts[reason.index()] += 1;
@@ -7670,6 +7715,15 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
                 taken.remove(at);
             }
         }
+        // Refused for what it is rather than where it stands (R3-P2).
+        if let InvalidPoolTransactionError::Consensus(err) = &kind
+            && !matches!(err, InvalidTransactionError::NonceNotConsistent { .. })
+            && inner.refused_enough(sender, transaction.nonce())
+        {
+            let nonce = transaction.nonce();
+            inner.dropped(Dropped::Refused, sender, nonce);
+            return;
+        }
         if let InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent {
             tx,
             state,
@@ -8240,6 +8294,48 @@ mod tests {
         drop(best);
         assert_eq!(offered.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec![0, 1, 2]);
         assert_eq!(offered[1].1, bumped);
+    }
+
+    /// Audit 2026-10 round 3 (R3-P2): a build's refusal for anything but a
+    /// nonce gave the transaction back every time, so one that can never
+    /// execute (no funds, a fee cap under the base fee: the builder reports
+    /// every such EVM refusal as an unsupported type) was taken and refused
+    /// by every build for the rest of the leg. After `REFUSALS_BEFORE_DROP`
+    /// refusals it is dropped, and a later copy of it goes at the first; a
+    /// block that is full (`ExceedsGasLimit`) never counts.
+    #[test]
+    fn a_transaction_every_build_refuses_is_dropped() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(64);
+        let refuse = |seed: u8, kind: fn() -> InvalidPoolTransactionError| {
+            let mut best = queue.best_for_build(B256::repeat_byte(seed));
+            let head = std::iter::from_fn(|| best.next())
+                .find(|t| t.sender() == Address::repeat_byte(4))
+                .expect("offered");
+            best.mark_invalid(&head, kind());
+            drop(best);
+            queue.drain_now();
+        };
+        let unsupported = || InvalidPoolTransactionError::Consensus(InvalidTransactionError::TxTypeNotSupported);
+        let full = || InvalidPoolTransactionError::ExceedsGasLimit(21_000, 0);
+        queue.push(vec![tx(4, 0)]);
+        queue.drain_now();
+        for round in 0..10u8 {
+            refuse(round, full);
+        }
+        assert_eq!(queue.len(), 1, "a full block says nothing against it");
+        for round in 1..REFUSALS_BEFORE_DROP {
+            refuse(20 + round, unsupported);
+            assert_eq!(queue.len(), 1, "refusal {round} gives it back");
+        }
+        refuse(40, unsupported);
+        assert_eq!(queue.len(), 0, "dropped at the last refusal");
+        let named: alloy_primitives::map::HashMap<&str, u64> = queue.take_drops().named().into_iter().collect();
+        assert_eq!(named.get("refused"), Some(&1), "{named:?}");
+        // Brought back (the pool's gap fill): dropped at its next refusal.
+        queue.push(vec![tx(4, 0)]);
+        queue.drain_now();
+        refuse(41, unsupported);
+        assert_eq!(queue.len(), 0);
     }
 
     /// Whatever the queue lets go of is counted and the first few are

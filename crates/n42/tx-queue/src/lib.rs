@@ -303,11 +303,14 @@ pub enum Dropped {
     /// A transaction builds refused [`REFUSALS_BEFORE_DROP`] times for
     /// something other than its nonce or a full block (R3-P2).
     Refused,
+    /// An arrival past the queue's bound or its lane's
+    /// ([`TxQueue::with_bounds`], R3-P2).
+    Full,
 }
 
 impl Dropped {
     /// Every reason, in report order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Duplicate,
         Self::Mined,
         Self::StaleArrival,
@@ -319,6 +322,7 @@ impl Dropped {
         Self::HeldBehind,
         Self::Outbid,
         Self::Refused,
+        Self::Full,
     ];
 
     /// The name this reason is reported under.
@@ -335,6 +339,7 @@ impl Dropped {
             Self::HeldBehind => "held_behind",
             Self::Outbid => "outbid",
             Self::Refused => "refused",
+            Self::Full => "full",
         }
     }
 
@@ -351,6 +356,7 @@ impl Dropped {
             Self::HeldBehind => 8,
             Self::Outbid => 9,
             Self::Refused => 10,
+            Self::Full => 11,
         }
     }
 
@@ -375,6 +381,20 @@ fn refusals_before_drop() -> u8 {
     *AT.get_or_init(|| {
         std::env::var("N42_TX_QUEUE_REFUSALS").ok().and_then(|v| v.parse().ok()).unwrap_or(REFUSALS_BEFORE_DROP)
     })
+}
+
+/// The most transactions the queue holds from arrivals (R3-P2):
+/// `N42_TX_QUEUE_MAX`. A 480M bench block is ~163,000 transactions and the
+/// deepest queue measured ~360,000.
+const QUEUE_MAX: usize = 4_000_000;
+
+/// The most one sender's lane holds from arrivals: `N42_TX_QUEUE_LANE_MAX`.
+/// Generous: the flood keeps deep lanes, and the queue's own bound is what
+/// caps memory.
+const LANE_MAX: usize = 1 << 20;
+
+fn env_bound(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).filter(|v| *v > 0).unwrap_or(default)
 }
 
 /// The most (sender, nonce) refusal counts kept; past it they start over.
@@ -870,7 +890,7 @@ fn fold_highest(mined: impl IntoIterator<Item = (Address, u64)>) -> AddressHashM
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DropReport {
     /// Counts in [`Dropped::ALL`] order.
-    pub counts: [u64; 11],
+    pub counts: [u64; 12],
     /// The first few, as (reason, sender, nonce): enough to take one sender
     /// to the generator's own log and see which nonce went missing.
     pub samples: Vec<(Dropped, Address, u64)>,
@@ -1227,6 +1247,10 @@ struct Inner<T: PoolTransaction> {
     /// a full block ([`REFUSALS_BEFORE_DROP`]). Kept at the count once
     /// reached, so a copy the gap fill brings back goes at its next refusal.
     refusals: alloy_primitives::map::HashMap<(Address, u64), u8>,
+    /// The most transactions arrivals fill the queue to ([`QUEUE_MAX`]).
+    max_len: usize,
+    /// The most one lane holds from arrivals ([`LANE_MAX`]).
+    lane_max: usize,
     /// Transactions this node's own built blocks took out of the queue before
     /// the chain committed them: (block number, block hash, the
     /// transactions). A block that consensus never commits -- its view timed
@@ -2348,6 +2372,8 @@ impl<T: PoolTransaction> TxQueue<T> {
                 settling: Vec::new(),
                 gaps: Vec::new(),
                 refusals: Default::default(),
+                max_len: env_bound("N42_TX_QUEUE_MAX", QUEUE_MAX),
+                lane_max: env_bound("N42_TX_QUEUE_LANE_MAX", LANE_MAX),
                 held: VecDeque::new(),
                 parked_order: VecDeque::new(),
                 parked_len: 0,
@@ -2449,6 +2475,18 @@ impl<T: PoolTransaction> TxQueue<T> {
     #[must_use]
     pub fn with_drain_chunk(self, chunk: usize) -> Self {
         self.drain_chunk.store(chunk, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// The queue's bound and each lane's on arrivals, whatever the
+    /// environment says (`N42_TX_QUEUE_MAX`, `N42_TX_QUEUE_LANE_MAX`).
+    #[must_use]
+    pub fn with_bounds(self, total: usize, lane: usize) -> Self {
+        {
+            let mut inner = self.inner.lock();
+            inner.max_len = total;
+            inner.lane_max = lane;
+        }
         self
     }
 
@@ -6450,6 +6488,7 @@ impl<T: PoolTransaction> Inner<T> {
             return moved;
         }
         let sampling = self.drops.samples.len() < DROP_SAMPLES;
+        let (max_len, lane_max, len) = (self.max_len, self.lane_max, self.len);
         let mut samples: Vec<(u32, Dropped, Address, u64)> = Vec::new();
         let mut pushes: Vec<(u32, Address)> = Vec::new();
         let mut in_order = true;
@@ -6471,6 +6510,7 @@ impl<T: PoolTransaction> Inner<T> {
             for &pos in &meta.pos[start..end] {
                 let Some(Keyed { nonce, valid, .. }) = self.pending_drain.pop_front() else { break };
                 moved += 1;
+                let full = len + inserted >= max_len || lane.by_nonce.len() >= lane_max;
                 match lane.by_nonce.entry(nonce) {
                     std::collections::btree_map::Entry::Occupied(mut held) => {
                         // Outbid by the pool's bump: the new one takes the
@@ -6493,6 +6533,11 @@ impl<T: PoolTransaction> Inner<T> {
                             self.drops.counts[reason.index()] += 1;
                             if sampling && reason != Dropped::Mined {
                                 samples.push((pos, reason, sender, nonce));
+                            }
+                        } else if full {
+                            self.drops.counts[Dropped::Full.index()] += 1;
+                            if sampling {
+                                samples.push((pos, Dropped::Full, sender, nonce));
                             }
                         } else {
                             slot.insert(valid);
@@ -6551,6 +6596,10 @@ impl<T: PoolTransaction> Inner<T> {
         if lane.is_stale(nonce) {
             let reason = lane.why_stale(nonce, false);
             self.dropped(reason, sender, nonce);
+            return;
+        }
+        if self.len >= self.max_len || lane.by_nonce.len() >= self.lane_max {
+            self.dropped(Dropped::Full, sender, nonce);
             return;
         }
         // The hole a build parked this lane behind, filled: the ingest saw
@@ -8336,6 +8385,37 @@ mod tests {
         queue.drain_now();
         refuse(41, unsupported);
         assert_eq!(queue.len(), 0);
+    }
+
+    /// Audit 2026-10 round 3 (R3-P2, the bound): the queue had no limit, so
+    /// with the ingest going straight to it a sender (or many) could fill
+    /// the execution layer's memory. Arrivals past the queue's bound, or past
+    /// a lane's, are refused; what a build gives back is not an arrival and
+    /// always goes back. Through either drain.
+    #[test]
+    fn arrivals_past_the_queues_bounds_are_refused() {
+        for runs in [false, true] {
+            let queue: TxQueue<EthPooledTransaction> =
+                TxQueue::with_run_length(64).with_drain_runs(runs).with_bounds(5, 3);
+            queue.push((0..4).map(|n| tx_hashed(Address::repeat_byte(1), n)));
+            queue.drain_now();
+            assert_eq!(queue.len(), 3, "runs {runs}: a lane holds at most 3");
+            queue.push((0..4).map(|n| tx_hashed(Address::repeat_byte(2), n)));
+            queue.drain_now();
+            assert_eq!(queue.len(), 5, "runs {runs}: the queue holds at most 5");
+            let named: alloy_primitives::map::HashMap<&str, u64> = queue.take_drops().named().into_iter().collect();
+            assert_eq!(named.get("full"), Some(&3), "runs {runs}: {named:?}");
+            // A build's take comes back whole although the queue is full.
+            let mut best = queue.best_for_build(B256::repeat_byte(1));
+            let taken: Vec<_> = std::iter::from_fn(|| best.next()).collect();
+            assert_eq!(taken.len(), 5);
+            drop(best);
+            queue.push(vec![tx_hashed(Address::repeat_byte(3), 0)]);
+            queue.drain_now();
+            assert_eq!(queue.len(), 1, "runs {runs}: room again while the build holds them");
+            queue.untake(taken);
+            assert_eq!(queue.len(), 6, "runs {runs}: a give-back is not refused");
+        }
     }
 
     /// Whatever the queue lets go of is counted and the first few are

@@ -476,6 +476,18 @@ pub enum NodeStateError {
     /// A portable snapshot could not be used.
     #[error("portable QMDB snapshot: {0}")]
     Portable(String),
+    /// The persisted tree has compacted twigs, whose dead slots keep only
+    /// their leaf hash, and a v1 portable snapshot is the complete slot log
+    /// that its verifier hashes slot by slot (`docs/QMDB_COMPACTION_DESIGN.md`
+    /// 3.2, the 2026-10-28 consequence): a compacting node is a pruned node.
+    #[error(
+        "QMDB slot {slot} keeps only its leaf hash (a compacted twig): a v1 portable snapshot needs every slot's key \
+         and value, so export from a node that runs with compaction off (an archive node)"
+    )]
+    PortableCompacted {
+        /// The first hash-only slot.
+        slot: u64,
+    },
     /// Nothing has restored the trees yet. See the module docs.
     #[error("QMDB state is not initialised; the node cannot compute state roots yet")]
     Uninitialised,
@@ -2245,7 +2257,7 @@ impl QmdbNodeState {
     fn rebuild_persisted_state_root(&self, number: u64, hash: B256) -> Result<B256, NodeStateError> {
         let unavailable = || NodeStateError::RecoveryFrontier(format!("no persisted root for block {number} ({hash})"));
         if let Some(mut checkpoint) = read_ckpt(&self.ckpt_path())? {
-            if checkpoint.version != ForestCheckpoint::VERSION {
+            if !ForestCheckpoint::reads(checkpoint.version) {
                 return Err(unavailable());
             }
             if checkpoint.head_number > number {
@@ -2953,6 +2965,9 @@ impl QmdbNodeState {
             let (snapshot, _) = replay_delta_log(&self.delta_log_path(), checkpoint, None)?;
             snapshot
         };
+        if let Some(slot) = snapshot.tree.first_hash_only_slot() {
+            return Err(NodeStateError::PortableCompacted { slot });
+        }
         let tree = QmdbForest::from_snapshot(&snapshot)?;
         let entries = snapshot
             .tree
@@ -5108,6 +5123,64 @@ mod tests {
         assert!(!portable.is_empty());
     }
 
+    /// A file-mode node whose tree was compacted restarts on the two entry
+    /// files at the same root, and refuses a v1 portable export, naming the
+    /// rule; the entry stats report the relocated bytes.
+    #[test]
+    fn a_compacted_node_restarts_and_refuses_a_portable_export() {
+        use alloy_primitives::{Address, U256};
+        use n42_qmdb_state::AccountState;
+        let chain = qmdb_chain();
+        let dir = scratch("compacted-export");
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        state.initialize((0, chain.genesis_hash())).unwrap();
+        // 2,100 accounts, then all of them rewritten: the first twig dies.
+        let mut parent = chain.genesis_hash();
+        for number in 1..=2u64 {
+            let mut changes = BlockChanges::new();
+            for i in 100..2200u64 {
+                changes.set_account(
+                    Address::from_word(B256::from(U256::from(i))),
+                    AccountState { nonce: number, balance: U256::from(i), code_hash: B256::ZERO },
+                );
+            }
+            let hash = B256::from(U256::from(number) << 64);
+            let prepared = state.compute(parent, &changes).unwrap();
+            state.insert(hash, number, prepared).unwrap();
+            state.on_canonical(hash).unwrap();
+            parent = hash;
+        }
+        // Enough small blocks that the forest lets the first two go.
+        let mut root = B256::ZERO;
+        for number in 3..=80 {
+            let (hash, r) = advance(&state, number, parent);
+            parent = hash;
+            root = r;
+        }
+        state.wait_for_compaction();
+        let report = state
+            .lock_as("a_compacted_node_restarts_and_refuses_a_portable_export")
+            .as_mut()
+            .unwrap()
+            .compact_twigs(u64::MAX, 0.5, 4)
+            .unwrap();
+        assert!(report.twigs >= 1, "{report:?}");
+        assert_eq!(state.state_root(), root);
+        assert_eq!(state.entry_stats().unwrap().relocated_bytes, report.bytes_written);
+        drop(state);
+
+        let restarted = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        restarted.initialize((80, parent)).unwrap();
+        assert_eq!(restarted.state_root(), root);
+        assert_eq!(restarted.entry_stats().unwrap().relocated_bytes, report.bytes_written);
+        drop(restarted);
+        let refused = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true).portable_export(1143, chain.genesis_hash());
+        let error = refused.unwrap_err();
+        assert!(matches!(error, NodeStateError::PortableCompacted { .. }), "{error}");
+        assert!(error.to_string().contains("compaction off"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Both digests say the same thing about an intact record, and a torn
     /// one matches neither.
     #[test]
@@ -5125,7 +5198,7 @@ mod tests {
     #[test]
     fn replay_applies_branch_rewinds_instead_of_treating_them_as_checkpoint_coverage() {
         use n42_twig_core::qmdb_compat::{QmdbEntrySnapshot, QmdbSnapshot};
-        let entry = |key, value| QmdbEntrySnapshot { key: [key; 32], value: vec![value], active: true };
+        let entry = |key, value| QmdbEntrySnapshot::new([key; 32], vec![value], true);
         let checkpoint = ForestSnapshot {
             version: ForestSnapshot::VERSION, head_number: 1, head_hash: B256::repeat_byte(1),
             tree: QmdbSnapshot { next_slot: 2, entries: vec![entry(1, 1), entry(2, 1)] },
@@ -5173,6 +5246,7 @@ mod tests {
             head_hash: B256::repeat_byte(1),
             next_slot: 128,
             active: vec![u64::MAX, u64::MAX],
+            relocated_len: 0,
         };
         let delta = ForestDelta {
             version: ForestDelta::VERSION,

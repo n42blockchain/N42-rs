@@ -3830,7 +3830,7 @@ where
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, Dispatch::from_env(), None, None)
+    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, Dispatch::from_env(), None, None, false)
 }
 
 /// [`execute_for_build_in_place`] with the dispatch chosen by the caller
@@ -3851,7 +3851,7 @@ where
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), None, None)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), None, None, false)
 }
 
 fn execute_for_build_run<T, G>(
@@ -3868,7 +3868,7 @@ where
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), None, None)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), None, None, false)
 }
 
 /// [`execute_for_build_in_place_after`] (with `before_batches` optional) with
@@ -3888,13 +3888,14 @@ pub fn execute_for_build_counted<T, G>(
     before_batches: Option<&mut dyn FnMut() -> bool>,
     tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
     prepared: Option<PreparedExec<T>>,
+    includable: bool,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), tip_of, prepared)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), tip_of, prepared, includable)
 }
 
 /// [`execute_for_build_counted`] with the dispatch chosen by the caller: for
@@ -3916,7 +3917,7 @@ where
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, None, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), tip_of, prepared)
+    execute_for_build_opts(evm_env, keys, convert, open, None, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), tip_of, prepared, false)
 }
 
 /// [`execute_for_build_in_place`] with the [`Dispatch`] chosen by the caller:
@@ -3935,7 +3936,7 @@ where
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, true, None, read_set(), dispatch, None, None)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, true, None, read_set(), dispatch, None, None, false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3951,6 +3952,7 @@ fn execute_for_build_opts<T, G>(
     dispatch: Dispatch,
     tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
     prepared: Option<PreparedExec<T>>,
+    includable: bool,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
@@ -4033,6 +4035,9 @@ where
     // `N42_BUILD_MLP=<k>`: the lookahead distance, 0 when off.
     let mlp_k = build_mlp();
     phases.mlp_k = mlp_k;
+    // Audit R3-E3: the block's gas, against which each transfer's gas limit
+    // is checked by its index ([`crate::includability::fits_block_gas`]).
+    let block_gas_limit = evm_env.block_env.gas_limit;
     let run_batch = |members: &Vec<&Vec<usize>>| -> Result<BatchResult, NotParallel> {
         let start_us = batches_at.elapsed().as_micros() as u64;
         let cpu_start = ThreadMark::now();
@@ -4072,8 +4077,15 @@ where
             let mut ahead: std::collections::VecDeque<(usize, T, TxEnv)> =
                 std::collections::VecDeque::with_capacity(if mlp_k > 0 { mlp_k + 1 } else { 0 });
             let (mut pos, mut filled) = (0usize, 0usize);
+            // Audit R3-E1 (`includable`, deferred execution): each sender's
+            // summed worst-case cost against its balance before its first
+            // transfer, as the follower checks it. A group is one sender's
+            // transfers (`partition_by_sender`), so the run opens at each
+            // group's first transfer.
+            let mut ledger = crate::includability::RunLedger::new();
             for group in members {
                 let mut rest = group.iter();
+                let mut first = true;
                 for &i in rest.by_ref() {
                     // `N42_PHASE_TIMERS=1`: one transaction in
                     // `LOOP_SAMPLE_STRIDE` timed by section.
@@ -4124,8 +4136,24 @@ where
                         }
                     };
                     let t1 = mark();
+                    // Audit R3-E3: the gas limit within the block's gas left
+                    // (refused like a transfer the path does not take).
+                    if !crate::includability::fits_block_gas(i, env.gas_limit, crate::fast_transfer::TRANSFER_GAS, block_gas_limit) {
+                        skipped.push(i);
+                        break;
+                    }
                     match evm.transfer_plain(&env) {
                         Ok(Some((plain, result))) => {
+                            // Checked before the commit: a transfer refused
+                            // here leaves the batch's state as it was.
+                            if includable {
+                                let worst = revm::context_interface::Transaction::max_balance_spending(&env).unwrap_or(U256::MAX);
+                                if !ledger.admit(plain.caller, first, plain.sender.balance, worst) {
+                                    skipped.push(i);
+                                    break;
+                                }
+                            }
+                            first = false;
                             let t2 = mark();
                             let gas_used = result.gas_used();
                             let t3 = mark();
@@ -4560,6 +4588,13 @@ pub fn follower_batch_state() -> bool {
     *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_BATCH_STATE", true))
 }
 
+/// Whether block transaction `i` fits the block's gas left after `i`
+/// transfers on the path (audit R3-E3, [`crate::includability::fits_block_gas`]).
+#[inline(always)]
+fn fits_block_gas_at(i: usize, tx: &TxEnv, evm_env: &reth_evm::EvmEnv) -> bool {
+    crate::includability::fits_block_gas(i, tx.gas_limit, crate::fast_transfer::TRANSFER_GAS, evm_env.block_env.gas_limit)
+}
+
 /// One follower batch on the leader's cuts ([`follower_batch_state`]): the
 /// batch's groups in order, each transfer straight into a
 /// [`crate::batch_state::BatchState`] over `db`, and the batch's bundle with
@@ -4583,6 +4618,13 @@ where
     {
         let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
         for &i in members.iter().flat_map(|group| group.iter()) {
+            // Audit R3-E3: every transaction before this one in the block is
+            // a transfer on this path (or the block is not parallel), so
+            // `i * 21,000` gas is used before it, as the serial executor
+            // counts it; one that does not fit goes to that executor.
+            if !fits_block_gas_at(i, &txs[i], evm_env) {
+                return Err(NotParallel::Failed(i, "gas limit over the block's gas left".to_string()));
+            }
             match evm.transfer_plain(&txs[i]) {
                 Ok(Some((plain, result))) => {
                     gas.push((i, result.gas_used()));
@@ -4693,6 +4735,10 @@ where
                         let mut evm =
                             N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
                         for &i in members.iter().flat_map(|g| g.iter()) {
+                            // Audit R3-E3, as in `follower_batch`.
+                            if !fits_block_gas_at(i, &txs[i], &evm_env) {
+                                return Err(NotParallel::Failed(i, "gas limit over the block's gas left".to_string()));
+                            }
                             match evm.transfer(&txs[i]) {
                                 Ok(Some(out)) => {
                                     gas.push((i, out.result.gas_used()));
@@ -8463,5 +8509,98 @@ mod tests {
             drop(run);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plain transfers of 21,000 gas at a 10 gwei fee cap and a 1 gwei tip
+    /// (2 gwei effective at the 1 gwei base fee), value 1, `(sender, nonce)`
+    /// each, on a block of `gas_limit`; the senders hold `balances`.
+    fn includability_case(
+        gas_limit: u64,
+        balances: &[(u64, U256)],
+        txs: &[(u64, u64)],
+    ) -> (reth_evm::EvmEnv, Vec<TxEnv>, CacheDB<EmptyDB>) {
+        let mut db = CacheDB::new(EmptyDB::default());
+        let beneficiary = addr(1);
+        db.insert_account_info(beneficiary, AccountInfo { balance: U256::from(7), ..Default::default() });
+        for (s, balance) in balances {
+            db.insert_account_info(addr(*s), AccountInfo { balance: *balance, ..Default::default() });
+        }
+        let envs = txs
+            .iter()
+            .map(|(s, nonce)| {
+                let mut env = TxEnv::default();
+                env.caller = addr(*s);
+                env.kind = TxKind::Call(addr(1_000_000 + s * 1_000 + nonce));
+                env.value = U256::from(1);
+                env.gas_limit = 21_000;
+                env.gas_price = 10_000_000_000;
+                env.gas_priority_fee = Some(1_000_000_000);
+                env.nonce = *nonce;
+                env.tx_type = 2;
+                env.chain_id = Some(1);
+                env
+            })
+            .collect();
+        let header = Header {
+            number: 20_000_000,
+            beneficiary,
+            gas_limit,
+            base_fee_per_gas: Some(1_000_000_000),
+            timestamp: 1_800_000_000,
+            ..Default::default()
+        };
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        (evm_config.evm_env(&header).expect("env"), envs, db)
+    }
+
+    fn run_includable(
+        evm_env: &reth_evm::EvmEnv,
+        envs: &[TxEnv],
+        db: &CacheDB<EmptyDB>,
+        includable: bool,
+    ) -> BuildRun<()> {
+        let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap_or_default())).collect();
+        let shared = SharedDb(std::sync::Arc::new(db.clone()));
+        execute_for_build_counted(evm_env, &keys, &|i| ((), envs[i].clone()), &|| Some(shared.clone()), None, false, None, None, None, includable)
+            .expect("a block of transfers")
+    }
+
+    /// Audit R3-E1, the parallel step: a sender whose balance covers each of
+    /// its two transfers at the fee cap alone (and both at the effective
+    /// price) but not both at the fee cap gets one in; the follower's rule
+    /// sums the worst case against the parent's balance. Without the ledger
+    /// (reth's rule) both execute.
+    #[test]
+    fn the_build_run_keeps_a_senders_worst_case_within_its_balance() {
+        let worst = U256::from(21_000u64 * 10_000_000_000 + 1);
+        let (evm_env, envs, db) = includability_case(
+            1_000_000,
+            &[(100, worst * U256::from(2) - U256::from(1)), (101, U256::from(10u128.pow(21)))],
+            &[(100, 0), (100, 1), (101, 0), (101, 1)],
+        );
+        let run = run_includable(&evm_env, &envs, &db, true);
+        assert_eq!(run.skipped, vec![1], "sender 100's second transfer is skipped");
+        assert_eq!(run.executed.len(), 3);
+        let reth = run_includable(&evm_env, &envs, &db, false);
+        assert!(reth.skipped.is_empty(), "reth's rule takes both: {:?}", reth.skipped);
+    }
+
+    /// Audit R3-E3: a transfer whose gas limit no longer fits the block's
+    /// remaining gas (three 21,000 transfers already fill 63,000) is not
+    /// taken, ledger or not.
+    #[test]
+    fn the_build_run_keeps_the_block_gas() {
+        let rich = U256::from(10u128.pow(21));
+        let (evm_env, envs, db) = includability_case(
+            63_000,
+            &[(100, rich), (101, rich), (102, rich), (103, rich)],
+            &[(100, 0), (101, 0), (102, 0), (103, 0)],
+        );
+        for includable in [false, true] {
+            let run = run_includable(&evm_env, &envs, &db, includable);
+            assert_eq!(run.skipped, vec![3], "the fourth transfer does not fit");
+            let gas: u64 = run.executed.iter().map(|built| built.gas_used).sum();
+            assert!(gas <= 63_000);
+        }
     }
 }

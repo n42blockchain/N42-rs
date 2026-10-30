@@ -46,7 +46,7 @@ use revm::{
 };
 
 /// The gas of a call with no calldata: the whole cost of a qualifying transfer.
-const TRANSFER_GAS: u64 = 21_000;
+pub(crate) const TRANSFER_GAS: u64 = 21_000;
 
 /// How many transfers have taken this path in this process.
 static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

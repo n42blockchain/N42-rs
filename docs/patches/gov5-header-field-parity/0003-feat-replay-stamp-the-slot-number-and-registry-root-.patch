@@ -1,0 +1,162 @@
+From 081804f686b78f9ca211e8d5ef7c5c47fef310cd Mon Sep 17 00:00:00 2001
+From: MiraWells <1020080523@qq.com>
+Date: Fri, 30 Oct 2026 02:56:14 -0400
+Subject: [PATCH 3/3] feat(replay): stamp the slot number and registry root the
+ target config schedules
+
+replay-v2 builds every target header itself and wrote nothing after
+RequestsHash, so a target config with Glamsterdam in the replayed range
+produced headers the live verifier refuses (missing SlotNumber, missing
+MobileRegistryRoot). It now stamps them as live production does: SlotNumber
+= the target block number from Glamsterdam, and MobileRegistryRoot from
+MobileAnchor plus Glamsterdam, copied from the source block, or the last
+source root seen for a gap block. A target that needs a root before the
+source has one is refused with the fork to move.
+---
+ internal/replay/engine_v2.go               | 46 +++++++++++++++++
+ internal/replay/fork_header_fields_test.go | 58 ++++++++++++++++++++++
+ 2 files changed, 104 insertions(+)
+ create mode 100644 internal/replay/fork_header_fields_test.go
+
+diff --git a/internal/replay/engine_v2.go b/internal/replay/engine_v2.go
+index 8cda291d..5cc3e3e0 100644
+--- a/internal/replay/engine_v2.go
++++ b/internal/replay/engine_v2.go
+@@ -86,6 +86,11 @@ type EngineV2 struct {
+ 	leafJournal   *LeafJournal                 // per-block leaf changes for tree building
+ 	resealer      *BLSResealer                 // BLS mobile-voter re-seal (nil = disabled)
+ 
++	// lastRegistryRoot is the most recent source MobileRegistryRoot seen, the
++	// value a target header carries when the target config puts the root in
++	// the header and the source block (or a synthetic gap block) has none.
++	lastRegistryRoot *types.Hash
++
+ 	// topups accumulates the exact deficit credited per sender under AutoTopup
+ 	// (diagnostic minimum-genesis-balance computation).
+ 	topups map[types.Address]*uint256.Int
+@@ -828,6 +833,9 @@ func (e *EngineV2) processBatchV2(ctx context.Context, from, to uint64) error {
+ 							ParentBeaconRoot: copyHash(gapParentCEHash),
+ 							RequestsHash:     copyHash(emptyRequestsHash),
+ 						}
++						if err := e.stampForkHeaderFields(gapHeader, nil); err != nil {
++							return err
++						}
+ 						gapBlk := block.NewBlock(gapHeader, nil)
+ 						gapCE.BlockHash = gapBlk.Hash()
+ 						if e.resealer != nil {
+@@ -1083,6 +1091,10 @@ func (e *EngineV2) processBatchV2(ctx context.Context, from, to uint64) error {
+ 					RequestsHash:     copyHash(emptyRequestsHash),
+ 				}
+ 
++				if err := e.stampForkHeaderFields(newHeader, srcHeader); err != nil {
++					return err
++				}
++
+ 				var newBlk *block.Block
+ 				if len(replayedTxs) > 0 {
+ 					newBlk = block.NewBlock(newHeader, replayedTxs).(*block.Block)
+@@ -1697,3 +1709,37 @@ func (e *EngineV2) writeNewBlock(dstTx kv.RwTx, blk *block.Block, num uint64) er
+ 	}
+ 	return nil
+ }
++
++// stampForkHeaderFields writes the header fields the TARGET chain config
++// schedules after Prague, the way live production does
++// (hotstuff.FinalizeAndAssemble and the miner), so a replayed chain verifies
++// under the same rules a live node applies:
++//
++//   - SlotNumber (EIP-7843, element 23) = the target block number, from
++//     Glamsterdam;
++//   - MobileRegistryRoot (element 24) from MobileAnchor and Glamsterdam, copied
++//     from the source block (the root is a leader-provided commitment that
++//     followers store verbatim), or the last source root seen when the
++//     source block or a synthetic gap block has none.
++//
++// A target that schedules the root before any source root exists is refused:
++// there is no value to stamp.
++func (e *EngineV2) stampForkHeaderFields(h *block.Header, src *block.Header) error {
++	if src != nil && src.MobileRegistryRoot != nil {
++		root := *src.MobileRegistryRoot
++		e.lastRegistryRoot = &root
++	}
++	cc := e.cfg.ChainConfig
++	if cc.IsGlamsterdam(h.Time) {
++		slot := h.Number.Uint64()
++		h.SlotNumber = &slot
++	}
++	if cc.IsMobileRegistryRootInHeader(h.Time) {
++		if e.lastRegistryRoot == nil {
++			return fmt.Errorf("replay-v2: target block %s (time %d) needs a MobileRegistryRoot and the source has none yet; move mobileAnchorTime in the target config", h.Number, h.Time)
++		}
++		root := *e.lastRegistryRoot
++		h.MobileRegistryRoot = &root
++	}
++	return nil
++}
+diff --git a/internal/replay/fork_header_fields_test.go b/internal/replay/fork_header_fields_test.go
+new file mode 100644
+index 00000000..824c2d96
+--- /dev/null
++++ b/internal/replay/fork_header_fields_test.go
+@@ -0,0 +1,58 @@
++// Copyright 2022-2026 The N42 Authors
++// This file is part of the N42 library.
++
++package replay
++
++import (
++	"math/big"
++	"testing"
++
++	"github.com/holiman/uint256"
++
++	"github.com/n42blockchain/N42/common/block"
++	"github.com/n42blockchain/N42/common/types"
++	"github.com/n42blockchain/N42/params"
++)
++
++// Replay stamps the post-Prague fields the target config schedules: the slot
++// (the target number) from Glamsterdam, and the source's registry root (or
++// the last one seen) once MobileAnchor and Glamsterdam are both active.
++func TestStampForkHeaderFields(t *testing.T) {
++	e := &EngineV2{cfg: ConfigV2{ChainConfig: &params.ChainConfig{
++		MobileAnchorTime: big.NewInt(10),
++		GlamsterdamTime:  big.NewInt(100),
++	}}}
++	root := types.Hash{0x42}
++
++	// Before Glamsterdam: nothing, even with a source root (chain 94's history).
++	h := &block.Header{Number: uint256.NewInt(5), Time: 50}
++	if err := e.stampForkHeaderFields(h, &block.Header{MobileRegistryRoot: &root}); err != nil {
++		t.Fatal(err)
++	}
++	if h.SlotNumber != nil || h.MobileRegistryRoot != nil {
++		t.Fatalf("pre-Glamsterdam: slot=%v root=%v", h.SlotNumber, h.MobileRegistryRoot)
++	}
++
++	// From Glamsterdam: slot = number; a gap block (no source) carries the
++	// last source root.
++	h = &block.Header{Number: uint256.NewInt(6), Time: 100}
++	if err := e.stampForkHeaderFields(h, nil); err != nil {
++		t.Fatal(err)
++	}
++	if h.SlotNumber == nil || *h.SlotNumber != 6 || h.MobileRegistryRoot == nil || *h.MobileRegistryRoot != root {
++		t.Fatalf("post-fork gap block: slot=%v root=%v", h.SlotNumber, h.MobileRegistryRoot)
++	}
++
++	// A target that needs a root before the source ever had one is refused.
++	fresh := &EngineV2{cfg: e.cfg}
++	if err := fresh.stampForkHeaderFields(&block.Header{Number: uint256.NewInt(1), Time: 100}, &block.Header{}); err == nil {
++		t.Fatal("stamped a root the source never had")
++	}
++
++	// No Glamsterdam in the target: the header ends at Prague.
++	none := &EngineV2{cfg: ConfigV2{ChainConfig: &params.ChainConfig{MobileAnchorTime: big.NewInt(0)}}}
++	h = &block.Header{Number: uint256.NewInt(7), Time: 1 << 40}
++	if err := none.stampForkHeaderFields(h, &block.Header{MobileRegistryRoot: &root}); err != nil || h.SlotNumber != nil || h.MobileRegistryRoot != nil {
++		t.Fatalf("no Glamsterdam: err=%v slot=%v root=%v", err, h.SlotNumber, h.MobileRegistryRoot)
++	}
++}
+-- 
+2.53.0
+

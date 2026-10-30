@@ -1,6 +1,6 @@
 # 2026-10 5M 审计:遗留问题清单与分工
 
-更新日期:2026-10-30。**10-30:除 R3-E1/E3/E2(Linux,同一组文件)外的全部遗留由 Windows 认领,按 G4 → R2-R2 → P5 → P7 → R2-X4 → P2/P3/P4 → N4 → R2-C9 → P6 的顺序推进;Linux 若要接手某项,改负责列并推送即可。**两个会话不在同一会话列表里,通过本文件协调:**认领一项时把"负责"改成自己并推送,
+更新日期:2026-10-30(Linux 05:50 UTC:10-30 全部待 A/B 项闭合,见 A 与 HANDOFF.md "第二轮 Linux 结果")。**10-30:除 R3-E1/E3/E2(Linux,同一组文件)外的全部遗留由 Windows 认领,按 G4 → R2-R2 → P5 → P7 → R2-X4 → P2/P3/P4 → N4 → R2-C9 → P6 的顺序推进;Linux 若要接手某项,改负责列并推送即可。**两个会话不在同一会话列表里,通过本文件协调:**认领一项时把"负责"改成自己并推送,
 完成后在"状态"写提交号**,同时照常在 `ROUND2.md` / `ROUND3.md` 状态表追加一行。每项仍先写失败测试再修。
 
 - **Windows 会话**:Windows 主机上的 Claude Code(WSL2 编译,无 bench)。
@@ -14,6 +14,7 @@ Windows 合入的改动由 Linux 在下一次整体验证时一并覆盖。
 | 项 | 负责 | 状态 |
 |---|---|---|
 | X22 同机配对(main `b91411e27` 对 `native-qc`),结果写入 `HANDOFF.md` "Linux 会话结果" | Linux | 完成(5ab8fffea):win1 -0.1%、轮总量 -0.8%,无可见代价;第一至三轮热路径 A/B 闭合 |
+| 第二次配对 stage `fw`(main `5a0d895c3` + R3-E1 = `6f0913d92` 对 `b91411e27`)+ devnet 五形态(三个重连形态 + 两个 `twoPhaseVoteGate` gov5 混跑) | Linux | 完成(10-30 05:50 UTC):win1 -0.9%、轮总量 -0.7%,四腿门净;devnet 全部同哈希、gov5 error 0。10-30 的全部热路径合入(P2/P3/P4、N4、C2、N5 余项、P9、G4、R2-R2、R2-C1、R2-C9 余项)与 E1/E3 一并闭合 |
 
 ## B. 非热路径,可本地闭环(Windows)
 
@@ -23,10 +24,10 @@ Windows 合入的改动由 Linux 在下一次整体验证时一并覆盖。
 | R3-N3 余项 | ROUND3 | by-hash 回复先核头哈希再解 body | Windows | 不修(无放大,见 ROUND3) |
 | R3-P9 | ROUND3 | EL 响应体按字节上限读取(`h2-el-rpc` transport) | Windows | 已修(见 `git log --grep R3-P9`) |
 | R3-P8 余项 | ROUND3 | APoS 验证队列入队前校验成员与块哈希 | Windows | 暂缓(APoS 旧路径,见 ROUND3) |
-| R3-E3 | ROUND3 | 并行执行器单笔 gas_limit ≤ 剩余 gas 的加固检查(当前不可达) | Linux(随 E1,同在装块热路径) | 待做 |
+| R3-E3 | ROUND3 | 并行执行器单笔 gas_limit ≤ 剩余 gas 的加固检查(当前不可达) | Linux(随 E1) | 已修(随 R3-E1 同一提交,合入 main) |
 | R3-N1 余项 | ROUND3 | 每 peer 入站 RPC 连接上限 | Windows | 已修(见 `git log --grep R3-N1`) |
 | R2-X2 余项 | ROUND2 | tx-ingest 帧间空闲超时(端口默认只绑回环) | Windows | 不修(帧体已有期限,见 ROUND3) |
-| R3-C2 | ROUND3 | 头部 QC 共用检查(实时路径投票闸门),方案见下 | Windows 写(10-30 认领),Linux 验 A/B 与 devnet gov5 | 已实现(见 `git log --grep R3-C2`),**待 Linux:X22 A/B + devnet gov5 三形态**,通过后改为已修 |
+| R3-C2 | ROUND3 | 头部 QC 共用检查(实时路径投票闸门),方案见下 | Windows 写(10-30 认领),Linux 验 A/B 与 devnet gov5 | 已修(d5fe4495d;Linux 10-30:devnet gov5 三形态两轮同哈希、无 header-QC 拒绝,X22 stage fw 无可见代价) |
 
 ### R3-C2 实现方案(Windows 会话 10-30 读码结论)
 
@@ -59,12 +60,12 @@ Rust 现状:
 
 | 项 | 来源 | 内容 | 负责 | 状态 |
 |---|---|---|---|---|
-| R3-E1 | ROUND3 | builder 与 follower 的可纳入性规则对齐(先与 gov5 对齐规则) | Linux(10-30 认领) | 已修(分支 fix/r3-e1-builder-includability 527e009fb), 待 X22 配对与合入。串行循环 Σgas_limit 预算 + 每 sender 最坏花费账本;并行步每 sender run 同一账本(并行步原也不一致:同一 sender 第二笔起只对照扣实际花费后的余额);R3-E3 一并 |
-| R3-P2/P3/P4 | ROUND3 | tx-queue 有界 lane、加价替换、`Lagged` 补齐 | Windows 已修(4f6256c4d P4 / c1814476f P3 / ad3ece18d、c402f298a P2);**待 Linux A/B**:P2/P3 改了 drain 路径(occupied 分支多一次 hash 比较、到达多两次比较、拒绝计数表) | 已修，待 A/B |
-| R3-N4 | ROUND3 | gossip `validate_messages()` + 回报 Accept/Reject/Ignore | Windows 已修(eb9146203);**待 Linux A/B + gov5 混跑**:共识消息改为解码后转发 | 已修，待 A/B |
-| R3-G4 | ROUND3 | leader 首次导入的多余 payload 克隆 | Windows(10-30 认领),热路径项合入前由 Linux A/B | 已修(见 `git log --grep R3-G4`) |
+| R3-E1 | ROUND3 | builder 与 follower 的可纳入性规则对齐(先与 gov5 对齐规则) | Linux(10-30 认领) | 已修并合入 main(分支 fix/r3-e1-builder-includability 527e009fb,X22 stage fw 持平后 no-ff 合入):串行循环 Σgas_limit 预算 + 每 sender 最坏花费账本;并行步每 sender run 同一账本;R3-E3 一并 |
+| R3-P2/P3/P4 | ROUND3 | tx-queue 有界 lane、加价替换、`Lagged` 补齐 | Windows 已修(4f6256c4d P4 / c1814476f P3 / ad3ece18d、c402f298a P2);Linux A/B 10-30 stage fw | 已修,A/B 闭合:win1/轮总量 -0.9%/-0.7%(噪声内);5M 负载下 `refused=0`、`refused_at_cap=0`、`frames_refused=0`,无 `Lagged` 读回 |
+| R3-N4 | ROUND3 | gossip `validate_messages()` + 回报 Accept/Reject/Ignore | Windows 已修(eb9146203);Linux A/B + gov5 混跑 10-30 | 已修,A/B 闭合(stage fw);gov5 混跑五形态(gov5late/late/absent + gov5late2p/gov5now2p)全部同哈希、gov5 error 0,网格评分无异常(gov5 全程封块/提交) |
+| R3-G4 | ROUND3 | leader 首次导入的多余 payload 克隆 | Windows(10-30 认领),Linux A/B | 已修(见 `git log --grep R3-G4`),A/B 闭合(stage fw) |
 | R3-E2 | ROUND3 | 零手续费块 beneficiary 触碰:先用 gov5 夹具确认根 | Linux(与 R3-E1 同改 `payload.rs` / `parallel_transfer.rs`,Windows 不动) | 待做 |
-| 热路径 A/B | ROUND2/3 | R2-X1、R2-I1、R2-R4/Q4、R2-C7、R2-I6、R2-R3、R3-N2、R3-N3、R3-G2、R3-C3 | Linux | 已由 X22 配对整体闭合(5ab8fffea);此后的热路径改动(R3-N5 余项、R3-P9、R3-C2)待下一次配对,建议一次 X22 覆盖三者 |
+| 热路径 A/B | ROUND2/3 | R2-X1、R2-I1、R2-R4/Q4、R2-C7、R2-I6、R2-R3、R3-N2、R3-N3、R3-G2、R3-C3 | Linux | 已由 X22 配对整体闭合(5ab8fffea);10-30 之后的热路径改动(R3-N5 余项、R3-P9、R3-C2、P2/P3/P4、N4、G4、R2-C9 余项、E1/E3)由 stage `fw` 一次闭合(HANDOFF.md "第二轮 Linux 结果") |
 
 ## D. 需协议/跨仓库决定(先记录,不动手)
 
@@ -73,16 +74,13 @@ Rust 现状:
 | R3-P5 余项 | ROUND3 | h2_validator 需从 EL 取真实块号与 receipts root;`--mobile` 默认关。**Windows 已修(见 `git log --grep R3-P5`;延迟执行下仍无 root)** |
 | R3-P6 余项 | ROUND3 | ~~注册 PoP 与收据独立 DST~~ **已修**(Windows,39b3657ae / dd68fba75 / 886468e86;手机客户端需按 `RECEIPT_DST` 签名并在注册时带 PoP,仓库内无此客户端) |
 | R3-P7 余项 | ROUND3 | mobile HTTP 仍单线程(每连接最多占 10 s)。**Windows 已修(见 `git log --grep R3-P7`)** |
-| R2-C1 余项 | ROUND2 | 入站 `high_tc` 采纳:**Windows 已修(见 `git log --grep R2-C1`)**;只在 TC 能让本节点前进时验证,无需缓存。待 Linux devnet gov5 三形态(含 absent/late)覆盖 |
+| R2-C1 余项 | ROUND2 | 入站 `high_tc` 采纳:**Windows 已修(见 `git log --grep R2-C1`)**;只在 TC 能让本节点前进时验证,无需缓存。Linux devnet gov5 五形态(含 absent/late)10-30 覆盖,通过 |
 | R2-R2 | ROUND2 | 按 view leader 校验头部封印。**Windows 已修(见 `git log --grep R2-R2`)** |
-| R2-C9 余项 | ROUND2 | ~~gov5 header vote / deferred vote 未移植~~ **已修**(Windows,aab6c13b1 / 47afc33ee;deferred vote 已由 `BlockChecked` 覆盖;待 Linux 与 gov5 两阶段 fleet 混跑) |
+| R2-C9 余项 | ROUND2 | ~~gov5 header vote / deferred vote 未移植~~ **已修**(Windows,aab6c13b1 / 47afc33ee;deferred vote 已由 `BlockChecked` 覆盖)。Linux 10-30 与 gov5 两阶段 fleet 混跑通过:devnet 基因副本 `twoPhaseVoteGate: true`(Rust 验证者打印 `vote gate : two-phase`,gov5 链库 chainspec 同值),gov5late2p 160 块 / gov5now2p 133 块两客户端同哈希、gov5 error 0、Rust 超时数与普通形态相同 |
 | R2-X4 余项 | ROUND2 | 声明不按声明者分键(EL 不知道 peer)。**Windows 评估后暂缓:需 h2-node 与 EL 两端协议改动,见 ROUND3 状态行** |
 
 ## E. 需要用户操作
 
-`design/qmdb-compact-stage1`(本地 `7e379dc62`)与 `fix/qmdb-compact-stage2-audit`(4 个提交:E-2/E-3/E-6/E-7)
-未推送,推送曾被权限拒绝:
-
-```
-git push origin design/qmdb-compact-stage1 fix/qmdb-compact-stage2-audit:design/qmdb-compact-stage2
-```
+(已完成 10-30:`design/qmdb-compact-stage1` `7e379dc62` 与 `design/qmdb-compact-stage2` `62265d47c` 已推送。Linux 把两者合到
+main `5a0d895c3` 上为 `integ/qmdb-compact-stage12`(`7ce44bdb4`,forest.rs 一处平凡冲突),测试后 no-ff 合入 main;
+见 `docs/MATURITY_HARDENING_2026_10.md` §6.2 / §8。)

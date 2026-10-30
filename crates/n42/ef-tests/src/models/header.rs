@@ -61,11 +61,11 @@ pub struct Header {
     #[serde(deserialize_with = "deserialize_bytes")]
     pub extra_data: Bytes,
 
-    /// Mix hash (PoW) / prev_randao (PoS)
+    /// Mix hash (`PoW`) / `prev_randao` (`PoS`)
     #[serde(deserialize_with = "deserialize_b256")]
     pub mix_hash: B256,
 
-    /// Nonce (PoW)
+    /// Nonce (`PoW`)
     #[serde(deserialize_with = "deserialize_b64")]
     pub nonce: B64,
 
@@ -133,24 +133,24 @@ impl Header {
             .unwrap_or(0)
     }
 
-    /// Check if this is a post-merge (PoS) block
+    /// Check if this is a post-merge (`PoS`) block
     pub fn is_pos(&self) -> bool {
         // Post-merge blocks have difficulty = 0
         self.difficulty.is_zero()
     }
 
     /// Check if this block has EIP-1559 (London+)
-    pub fn has_eip1559(&self) -> bool {
+    pub const fn has_eip1559(&self) -> bool {
         self.base_fee_per_gas.is_some()
     }
 
     /// Check if this block has withdrawals (Shanghai+)
-    pub fn has_withdrawals(&self) -> bool {
+    pub const fn has_withdrawals(&self) -> bool {
         self.withdrawals_root.is_some()
     }
 
     /// Check if this block has blob transactions (Cancun+)
-    pub fn has_blobs(&self) -> bool {
+    pub const fn has_blobs(&self) -> bool {
         self.blob_gas_used.is_some()
     }
 }

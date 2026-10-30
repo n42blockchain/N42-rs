@@ -9,7 +9,8 @@ use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
 
 /// A complete transaction test fixture file
-pub type TransactionTestFile = HashMap<String, TransactionTest>;
+#[allow(dead_code)] // file-level alias kept for callers of the fixture format; not used today
+pub(super) type TransactionTestFile = HashMap<String, TransactionTest>;
 
 /// A single transaction test case
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,12 +120,12 @@ impl TransactionTest {
 
 impl TransactionTestResult {
     /// Check if this result expects an error
-    pub fn expects_error(&self) -> bool {
+    pub const fn expects_error(&self) -> bool {
         self.exception.is_some()
     }
 
     /// Check if the transaction is expected to be valid
-    pub fn is_valid(&self) -> bool {
+    pub const fn is_valid(&self) -> bool {
         self.exception.is_none()
     }
 }

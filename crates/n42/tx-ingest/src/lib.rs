@@ -434,6 +434,21 @@ fn recovery_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
 /// larger is read into memory first.
 const MAX_TX_BYTES: u32 = 256 << 10;
 
+/// Largest blob transaction in its network form, sidecar included: six
+/// blobs of 128 KiB and their proofs, with room to spare (audit 2026-10
+/// round 3, R3-G6). Only type 3 may pass [`MAX_TX_BYTES`].
+const MAX_BLOB_TX_BYTES: usize = 1 << 20;
+
+/// Whether a transaction length announced in a frame may be read at all.
+const fn tx_len_readable(len: usize) -> bool {
+    len != 0 && len <= MAX_BLOB_TX_BYTES
+}
+
+/// Whether a transaction read in full is within its type's cap.
+fn tx_size_allowed(raw: &[u8]) -> bool {
+    raw.len() <= MAX_TX_BYTES as usize || raw.first() == Some(&0x03)
+}
+
 /// Bound the retained transaction bytes of one frame independently of its
 /// transaction count. The per-transaction cap alone allowed a 10 GiB frame.
 /// A full frame of transfers is about 1.1 MB; across [`MAX_CONNECTIONS`]
@@ -1428,7 +1443,7 @@ where
             let mut frame_bytes = 0usize;
             for _ in 0..count {
                 let len = stream.read_u32_le().await? as usize;
-                if len == 0 || len > MAX_TX_BYTES as usize {
+                if !tx_len_readable(len) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("transaction of {len} bytes"),
@@ -1450,6 +1465,12 @@ where
                 }
                 frame_buf.resize(len, 0);
                 stream.read_exact(&mut frame_buf[..]).await?;
+                if !tx_size_allowed(&frame_buf) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("transaction of {len} bytes"),
+                    ));
+                }
                 raws.push(Bytes::from(frame_buf.split_to(len).freeze()));
             }
             // The attestation section, read either way and kept only where this
@@ -2693,6 +2714,24 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// Audit 2026-10 round 3 (R3-G6): the 256 KiB cap refused a blob
+    /// transaction carrying its sidecar (six blobs are 768 KiB) and dropped
+    /// the connection. Type 3 has its own cap; every other type keeps 256 KiB.
+    #[test]
+    fn a_blob_transaction_with_its_sidecar_is_not_refused_for_size() {
+        let six_blobs = 6 * 131_072 + 40_000;
+        assert!(tx_len_readable(six_blobs));
+        let mut blob = vec![0u8; six_blobs];
+        blob[0] = 0x03;
+        assert!(tx_size_allowed(&blob), "a type-3 transaction with six blobs");
+        let mut other = vec![0u8; six_blobs];
+        other[0] = 0x02;
+        assert!(!tx_size_allowed(&other), "any other type past 256 KiB");
+        assert!(tx_size_allowed(&other[..MAX_TX_BYTES as usize]));
+        assert!(!tx_len_readable(0));
+        assert!(!tx_len_readable(MAX_BLOB_TX_BYTES + 1));
+    }
 
     /// Loopback binds silently; anything else needs the escape hatch, and
     /// a trusting mode refuses it even then.

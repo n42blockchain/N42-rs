@@ -937,9 +937,20 @@ mod wire {
 
     #[tokio::test]
     async fn an_oversized_transaction_closes_the_connection() {
+        // Past the blob cap, refused from the length alone.
+        let (mut client, handle) = connect().await;
+        client.write_all(&1u32.to_le_bytes()).await.unwrap();
+        let past_blobs = MAX_BLOB_TX_BYTES as u32 + 1;
+        client.write_all(&past_blobs.to_le_bytes()).await.unwrap();
+        refused(handle, client, &format!("transaction of {past_blobs} bytes")).await;
+        // Past 256 KiB and not a blob transaction: refused once its type is
+        // read (audit 2026-10 round 3, R3-G6).
         let (mut client, handle) = connect().await;
         client.write_all(&1u32.to_le_bytes()).await.unwrap();
         client.write_all(&(MAX_TX_BYTES + 1).to_le_bytes()).await.unwrap();
+        let mut body = vec![0u8; MAX_TX_BYTES as usize + 1];
+        body[0] = 0x02;
+        client.write_all(&body).await.unwrap();
         refused(handle, client, &format!("transaction of {} bytes", MAX_TX_BYTES + 1)).await;
     }
 

@@ -212,6 +212,56 @@ adds to 3.3:
   writer holding each slot's write lock has waited out every read that loaded a location before
   it); the `punch_after` queue is a TODO in `read_view.rs`'s module documentation.
 
+Stage 1 cost (measured 2026-10-30; stage 1 stays unmerged):
+
+- **Fleet pairs (X22, win1 M/s).** Stage fx VS (wt-integ 20d3df758 against main): branch
+  4.920 / 4.947 against 4.947. The branch also held the tree lease longer (11.3 / 12.1 ms a block
+  against 10.0-10.9 on every other leg): dropping the per-slot offsets list had also dropped the
+  `rayon::join` that kept `delta_of_applied` on the pool, and the leasing thread (`qmdb-root`, the
+  builder's scoped root thread) is outside it. Fixed in 5713db709. VS2 (5713db709 against main):
+  lease 10.34 / 11.19 against 10.69 / 10.78 ms, but win1 4.800 / 4.847 against 5.033 / 5.000 and
+  rounds 437.2 / 438.6M against 452.8 / 453.0M. All four branch legs (4.800-4.947) lie below all
+  five controls (4.947-5.033): a real 2-4% cost.
+- **Where it goes.** Per view read, main takes two dependent random misses: the index bucket
+  (key -> byte offset) and the record. The branch takes three: the bucket (key -> slot), the
+  slot's 8-byte cell in `Offsets` (8 B for every slot ever written, far past the last-level cache,
+  and a likely TLB miss), then the record. The directory pointer stays cached; the second resolve
+  of the same slot hits the cache.
+- **Micro-benchmark.** `read_view::bench_concurrent_reads` at 50M keys
+  (`N42_BENCH_VIEW_KEYS=50000000`), 160k distinct reads, release, pinned to cores 112-127, two
+  runs of each tree, us a read of pool time (cold / warm):
+
+  | threads | at | main 9cd355183 | stage 1 | delta |
+  | --- | --- | --- | --- | --- |
+  | 1 | head | 0.451-0.465 / 0.452-0.454 | 0.623-0.639 / 0.630-0.660 | +0.17-0.19 |
+  | 4 | head | 0.538-0.549 / 0.514-0.520 | 0.728-0.735 / 0.663-0.681 | +0.15-0.19 |
+  | 16 | head | 0.548-0.591 / 0.553-0.627 | 0.849-0.864 / 0.693-0.731 | +0.07-0.30 |
+  | 1 | 16 behind | 2.049-2.069 / 2.101-2.110 | 2.258-2.283 / 2.259-2.297 | +0.15-0.21 |
+  | 16 | 16 behind | 2.437-2.475 / 2.404 (4.090 outlier) | 2.653-2.654 / 2.456-2.603 | +0.05-0.22 |
+
+  The index-and-record read alone (`raw warm`, 1 thread) goes from 0.434-0.445 to 0.590-0.605 us.
+  So every read pays about 0.16-0.19 us more, about one DRAM miss and a page walk: 35-40% on a read
+  at the head. The hardware counters (`perf stat` of LLC and dTLB misses per read) were not taken:
+  `perf_event_paranoid` was 4 on the host and needs 1.
+- **Fix options, ranked.**
+  1. Keep main's hot path. The index stores locations again (key -> byte offset), and a compaction
+     rewrites the view's entries for a relocated twig: about 2,048 re-inserts of its live keys, done
+     on the view's advance path under every reader slot's write lock, which is also stage 3's reader
+     epoch. Journals keep their old offsets, which stay readable until the journals let go, which
+     `punch_after` has to wait for anyway. The cost: one of the index value's 40 bits must say "this
+     is in `entries.relocated`", which leaves 39 bits of byte offset, so each file is limited to
+     2^39 B = 512 GiB. Past 512 GiB the view invalidates itself as it did past 1 TiB before stage 1
+     (about 45 minutes of the fleet's ~200 MB/s): the limit comes back, halved, until stage 3's
+     punching keeps the live span of `entries.log` bounded, or offsets become relative to a moving
+     base.
+  2. A variant: relocated entries hold their slot (flagged), and only those reads, which are old
+     and cold keys, pay the `Offsets` cell. The same 39-bit limit for the main file.
+  3. Mitigations that keep the slot index: transparent huge pages on the `Offsets` segments (cuts
+     the page walk, not the miss), and prefetching the cell after the bucket in the batched build
+     prefetch. Neither removes the dependent miss.
+  4. Not useful: caching (slot, offset) in the index (a bucket is one `u64`, already full), or a
+     per-view snapshot of `Offsets` (still one cell load per read).
+
 Stage 2 as landed, where it differs from or adds to the text above:
 
 - **Candidates (3.4).** Besides (a) a last slot below `below_slot`, the twig's last retirement

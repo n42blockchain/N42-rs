@@ -1319,8 +1319,15 @@ mod tests {
     #[ignore = "timing"]
     fn bench_concurrent_reads() {
         use alloy_primitives::keccak256;
-        let keys = 2_000_000u64;
-        let reads = 160_000usize;
+        // `N42_BENCH_VIEW_KEYS` / `_READS` / `_THREADS` scale it (an offsets
+        // array past the last-level cache needs 50M keys or more).
+        let env = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+        let keys = env("N42_BENCH_VIEW_KEYS", 2_000_000);
+        let reads = env("N42_BENCH_VIEW_READS", 160_000) as usize;
+        let thread_counts: Vec<usize> = std::env::var("N42_BENCH_VIEW_THREADS")
+            .ok()
+            .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![1, 4, 16]);
         let behind = 16u64;
         let per_block = 10_000u64;
         let address_of = |i: u64| Address::from_slice(&keccak256(i.to_be_bytes())[12..]);
@@ -1372,7 +1379,7 @@ mod tests {
         };
         println!("us a read of pool time (wall x threads / reads), {reads} distinct keys of {keys}");
         println!("{:>7} {:>6} {:>9} {:>9} {:>9}", "threads", "at", "cold", "warm", "raw warm");
-        for threads in [1usize, 4, 16] {
+        for threads in thread_counts.iter().copied() {
             for at in [1 + behind, 1] {
                 let view = build();
                 let read = |a: &Address| matches!(view.account(a, at), Some(Some(_)));

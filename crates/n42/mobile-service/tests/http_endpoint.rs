@@ -95,7 +95,10 @@ fn a_phone_can_complete_the_round_trip_over_http() {
     let registered = call(
         port,
         "mobile_registerVerifier",
-        json!([format!("0x{}", hex::encode(key.public_key().to_bytes()))]),
+        json!([
+            format!("0x{}", hex::encode(key.public_key().to_bytes())),
+            format!("0x{}", hex::encode(n42_mobile_verify::proof_of_possession(&key).to_bytes())),
+        ]),
     );
     assert_eq!(registered["result"], json!(0));
 

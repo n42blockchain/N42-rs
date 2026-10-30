@@ -19,7 +19,7 @@
 //! | method | params | returns |
 //! | --- | --- | --- |
 //! | `mobile_finality` | — | [`FinalityReport`], or `null` before the first commit |
-//! | `mobile_registerVerifier` | `[pubkey_hex]` | the verifier's registry index |
+//! | `mobile_registerVerifier` | `[pubkey_hex, pop_hex]` | the verifier's registry index (a known key needs no `pop_hex`) |
 //! | `mobile_submitReceipt` | `[receipt_hex]` | [`SubmitOutcome`] |
 //! | `mobile_attestation` | `[block_hash]` | the aggregate, or `null` |
 //! | `mobile_getProof` | `[address]` or `[address, slot]` | [`crate::StateProofReport`], or `null` |
@@ -106,6 +106,24 @@ pub fn dispatch(
             let pubkey: [u8; 48] = pubkey.try_into().map_err(|_| {
                 RpcError::new(codes::INVALID_PARAMS, "a BLS public key is 48 bytes")
             })?;
+            // A known key keeps its index (public: it is the key's bit in
+            // every attestation). A new one proves its holder signed it
+            // (R3-P6), checked only once the registry has room for it.
+            if let Some(index) = service.registry().index_of(&pubkey) {
+                return Ok(json!(index));
+            }
+            if service.registry().len() as usize >= crate::service::MAX_VERIFIERS {
+                return Err(RpcError::new(codes::REGISTRY_FULL, "the verifier registry is full"));
+            }
+            let pop = hex_param(params, 1, "proof of possession")?;
+            let pop: [u8; 96] = pop.try_into().map_err(|_| {
+                RpcError::new(codes::INVALID_PARAMS, "a proof of possession is a 96-byte BLS signature")
+            })?;
+            let pop = n42_h2_primitives::BlsSignature::from_bytes(&pop)
+                .map_err(|_| RpcError::new(codes::INVALID_SIGNATURE, "the proof of possession is not a signature"))?;
+            if !n42_mobile_verify::verify_proof_of_possession(&pubkey, &pop) {
+                return Err(RpcError::new(codes::INVALID_SIGNATURE, "the proof of possession does not verify"));
+            }
             service
                 .try_register_verifier(pubkey)
                 .map(|index| json!(index))
@@ -225,6 +243,27 @@ mod tests {
         assert_eq!(register(&mut service, key(5)).expect("a known key"), json!(5));
     }
 
+    /// Audit 2026-10 round 3 (R3-P6): a key was registered on its bytes
+    /// alone, so a party could register a key derived from others' (a rogue
+    /// key) and, with the attestation aggregating one message, forge a
+    /// participant's signature. A new key comes with a proof that its holder
+    /// signed it; a known key still gets its index.
+    #[test]
+    fn a_new_verifier_proves_it_holds_its_key() {
+        let mut service = service();
+        let key = BlsSecretKey::random().unwrap();
+        let pubkey = format!("0x{}", hex::encode(key.public_key().to_bytes()));
+        let err = dispatch(&mut service, "mobile_registerVerifier", &json!([pubkey])).unwrap_err();
+        assert_eq!(err.code, codes::INVALID_PARAMS, "no proof");
+        let other = BlsSecretKey::random().unwrap();
+        let wrong = format!("0x{}", hex::encode(n42_mobile_verify::proof_of_possession(&other).to_bytes()));
+        let err = dispatch(&mut service, "mobile_registerVerifier", &json!([pubkey, wrong])).unwrap_err();
+        assert_eq!(err.code, codes::INVALID_SIGNATURE, "another key's proof");
+        let pop = format!("0x{}", hex::encode(n42_mobile_verify::proof_of_possession(&key).to_bytes()));
+        assert_eq!(dispatch(&mut service, "mobile_registerVerifier", &json!([pubkey, pop])).unwrap(), json!(0));
+        assert_eq!(dispatch(&mut service, "mobile_registerVerifier", &json!([pubkey])).unwrap(), json!(0), "known");
+    }
+
     #[test]
     fn a_receipt_makes_the_round_trip_in_the_encoding_the_phone_signed() {
         let block_hash = B256::repeat_byte(0x11);
@@ -238,7 +277,10 @@ mod tests {
         let index = dispatch(
             &mut service,
             "mobile_registerVerifier",
-            &json!([format!("0x{}", hex::encode(key.public_key().to_bytes()))]),
+            &json!([
+                format!("0x{}", hex::encode(key.public_key().to_bytes())),
+                format!("0x{}", hex::encode(n42_mobile_verify::proof_of_possession(&key).to_bytes())),
+            ]),
         )
         .unwrap();
         assert_eq!(index, json!(0));
@@ -283,7 +325,10 @@ mod tests {
         dispatch(
             &mut service,
             "mobile_registerVerifier",
-            &json!([format!("0x{}", hex::encode(key.public_key().to_bytes()))]),
+            &json!([
+                format!("0x{}", hex::encode(key.public_key().to_bytes())),
+                format!("0x{}", hex::encode(n42_mobile_verify::proof_of_possession(&key).to_bytes())),
+            ]),
         )
         .unwrap();
         let stranger = sign_receipt(B256::repeat_byte(0x99), 1, B256::ZERO, 0, &key);

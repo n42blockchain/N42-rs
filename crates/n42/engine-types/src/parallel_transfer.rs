@@ -24,11 +24,11 @@ use alloy_primitives::{Address, U256};
 use n42_tx_types::{Block, N42Primitives as EthPrimitives, Receipt};
 use alloy_consensus::TransactionEnvelope as _;
 use reth_evm::{
-    execute::{BlockExecutionError, BlockExecutor as _, BlockExecutorFactory},
+    execute::{BlockExecutionError, BlockExecutor as _},
     ConfigureEvm, Evm as _, EvmFactory as _,
 };
 use reth_execution_types::BlockExecutionOutput;
-use reth_primitives_traits::{RecoveredBlock, SignedTransaction};
+use reth_primitives_traits::{RecoveredBlock};
 use reth_revm::db::State;
 use revm::{
     context::TxEnv,
@@ -3940,6 +3940,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(deprecated)] // gas_used keeps the pre-EIP-8037 meaning the hot path was measured with
 fn execute_for_build_opts<T, G>(
     evm_env: &reth_evm::EvmEnv,
     keys: &[(Address, Address)],
@@ -4601,6 +4602,7 @@ fn fits_block_gas_at(i: usize, tx: &TxEnv, evm_env: &reth_evm::EvmEnv) -> bool {
 /// the gas each transaction used. A transaction the transfer path does not
 /// take, or a change the batch state does not model, sends the block to the
 /// serial executor as before.
+#[allow(deprecated)] // gas_used keeps the pre-EIP-8037 meaning the hot path was measured with
 fn follower_batch<G>(
     members: &[&Vec<usize>],
     txs: &[TxEnv],
@@ -4642,6 +4644,7 @@ where
 /// the grafted reverts' sort beside the rest of the merge
 /// ([`follower_merge_behind`]).
 #[allow(clippy::too_many_arguments)]
+#[allow(deprecated)] // gas_used keeps the pre-EIP-8037 meaning the hot path was measured with
 pub fn execute_transfers_with_plan<EvmConfig, DB, G>(
     evm_config: &EvmConfig,
     block: &RecoveredBlock<Block>,

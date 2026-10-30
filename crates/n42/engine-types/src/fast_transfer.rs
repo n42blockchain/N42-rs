@@ -40,7 +40,7 @@ use revm::{
     },
     database_interface::DBErrorMarker,
     inspector::NoOpInspector,
-    primitives::{hardfork::SpecId, HashMap, TxKind},
+    primitives::{hardfork::SpecId, TxKind},
     state::{Account, AccountInfo, EvmState, TransactionId},
     Inspector,
 };
@@ -698,12 +698,11 @@ where
         if self.fast && self.inspecting {
             REJECTED[11].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        if self.fast && !self.inspecting {
-            if let Some(done) = self.transfer(&tx).map_err(EVMError::Database)? {
+        if self.fast && !self.inspecting
+            && let Some(done) = self.transfer(&tx).map_err(EVMError::Database)? {
                 HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(done);
             }
-        }
         self.inner.transact_raw(tx)
     }
 

@@ -147,7 +147,7 @@ pub const FRAME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 pub fn is_loopback(addr: &SocketAddr) -> bool {
     match addr.ip() {
         std::net::IpAddr::V4(ip) => ip.is_loopback(),
-        std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(ip.is_loopback(), |v4| v4.is_loopback()),
+        std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(|| ip.is_loopback(), |v4| v4.is_loopback()),
     }
 }
 
@@ -269,6 +269,7 @@ const ASYNC_FRAMES_IN_FLIGHT: usize = 8;
 
 /// `N42_TX_INGEST_ASYNC_FRAMES`: frames a connection may have recovering
 /// or awaiting admission before its next answer waits; the default above.
+#[allow(dead_code)] // metric accessor kept for the async frame path; not used today
 fn async_frames_in_flight() -> usize {
     static FRAMES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *FRAMES.get_or_init(|| {
@@ -360,7 +361,7 @@ fn physical_cores() -> &'static [usize] {
         let all_logical = recovery_pin() == 2;
         let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
         // SAFETY: sched_getaffinity fills a cpu_set_t of the given size.
-        let ok = unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) } == 0;
+        let ok = unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw mut set) } == 0;
         let mut cpus: Vec<usize> = Vec::new();
         if ok {
             for cpu in 0..(8 * std::mem::size_of::<libc::cpu_set_t>()) {
@@ -409,7 +410,7 @@ fn apply_recovery_affinity_linux() {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_SET(core, &mut set);
         let tid = libc::syscall(libc::SYS_gettid) as libc::pid_t;
-        libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &raw const set);
     }
 }
 
@@ -914,6 +915,7 @@ fn high_water() -> usize {
 /// gets its parallelism by opening several rather than by this doing anything
 /// clever with one.
 /// Prints the ingest's rate and time split every five seconds, once.
+#[allow(clippy::manual_checked_ops)] // stats line kept as written
 fn spawn_stats_reporter() {
     tokio::spawn(async move {
         let slots = recovery_slot_count();
@@ -1345,7 +1347,7 @@ where
 }
 
 async fn serve_connection<P>(
-    mut stream: TcpStream,
+    stream: TcpStream,
     pool: P,
     cache: Option<reth_evm::SenderRecoveryCache>,
     head: std::sync::Arc<AtomicU64>,
@@ -1353,8 +1355,7 @@ async fn serve_connection<P>(
 ) -> std::io::Result<()>
 where
     P: TransactionPool + Clone + 'static,
-    P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
-    P::Transaction: 'static,
+    P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope> + 'static,
 {
     let gate = setup.gate;
     let allowance = setup.allowance;
@@ -1883,8 +1884,8 @@ where
     // right for a generator that funds every sender, and the reason this is
     // opt-in.
     let installed = if setup.direct && setup.queue.is_none() { n42_tx_queue::global::<P::Transaction>() } else { None };
-    if setup.direct {
-        if let Some(queue) = setup.queue.as_ref().or(installed.as_ref()) {
+    if setup.direct
+        && let Some(queue) = setup.queue.as_ref().or(installed.as_ref()) {
             // The frame's transactions stay in its index entry, so the vote
             // road takes the frame by reference (`TxQueue::push_frame`).
             let noted = frame.is_some();
@@ -1898,7 +1899,6 @@ where
             STATS.pool_ns.fetch_add((started.elapsed() - recovered_at).as_nanos() as u64, Ordering::Relaxed);
             return u32::try_from(count).unwrap_or(u32::MAX);
         }
-    }
     // `External`, the same origin `eth_sendRawTransaction` uses for a
     // transaction that did not come from this node: it is validated, priced and
     // gossiped exactly as one that arrived over RPC.

@@ -26,7 +26,34 @@ Windows 合入的改动由 Linux 在下一次整体验证时一并覆盖。
 | R3-E3 | ROUND3 | 并行执行器单笔 gas_limit ≤ 剩余 gas 的加固检查(当前不可达) | Linux(随 E1,同在装块热路径) | 待做 |
 | R3-N1 余项 | ROUND3 | 每 peer 入站 RPC 连接上限 | Windows | 已修(见 `git log --grep R3-N1`) |
 | R2-X2 余项 | ROUND2 | tx-ingest 帧间空闲超时(端口默认只绑回环) | Windows | 不修(帧体已有期限,见 ROUND3) |
-| R3-C2 | ROUND3 | 头部 QC 共用检查:按 gov5 `decodeHeaderExtra` / `verifyHeaderWithBatch`,用 gov5 夹具对齐;实时路径与拉取路径共用。跨客户端,合入前需 Linux 跑 devnet gov5 三形态 | Windows 写,Linux 验 | 待做 |
+| R3-C2 | ROUND3 | 头部 QC 共用检查(实时路径投票闸门),方案见下 | 待认领(落在投票热路径,需 A/B 与 devnet gov5) | 方案已出 |
+
+### R3-C2 实现方案(Windows 会话 10-30 读码结论)
+
+gov5 `verifyHeaderWithBatch`(`internal/consensus/hotstuff/adapter.go:389`)对头部 QC 的规则:
+`decodeHeaderExtra` 失败即拒(先按 QC+seal 解,失败再按旧布局整段解);`qc.View > headerView` 即拒;
+`ResolveQCValidatorSet` 解出非空集合时 `verifyQCAnyDomainWithSet` 必须通过,解不出则跳过。
+gov5 `unpackBoolBitmap` 宽松:计数越界、数据不足时返回 nil 签名者(不报错),之后由验签失败拒绝。
+
+Rust 现状:
+- 拉取路径 `check_pulled_block`(`h2-node/src/service.rs`,约 4570 行)已实现上面三条,外加祖先链检查;
+  比 gov5 严的只有 h2-wire `decode_h2_qc` 对位图的严格解码(集合未知时 gov5 接受、Rust 拒绝;
+  诚实 gov5 不产生这种位图)。
+- 实时路径(gossip / push / by-hash / compact 各条 body 入口)不看头部 QC;跟随者照常导入并投票,
+  gov5 会拒绝同一块,即拜占庭 leader 可造出 Rust 认证、gov5 拒绝的块。
+
+方案:
+1. 从 `check_pulled_block` 抽出 `check_header_qc(&self, header) -> Result<Option<QuorumCertificate>, String>`
+   (extra 解码、QC 解码含旧布局回退、view 比较、`engine.verify_header_qc`),拉取路径改为调用它再做祖先检查。
+2. 投票闸门放在 engine 收到 `BlockImported` / `BlockChecked` 之前:`apply_driver_action` 的
+   `DriverAction::Consensus` 分支与 `ExecuteBlock` 已导入分支(约 3089 行)。`block_headers` 里没有头部时放行
+   (不比现在弱)。本节点自己的块跳过。
+3. 代价:`verify_qc_any_domain_or_known` 只对 locked/last_committed 免验;头部嵌的是建块时的 committed QC,
+   跟随者投票时常已前进,未命中即一次 BLS 聚合验签(毫秒级,X22 周期 40 ms)。需加一个按 QC 字节哈希
+   键控的已验证小缓存(engine 在 proposal/commit 路径验过的 QC 也写入),否则热路径代价不可接受。
+4. 测试:service_net_tests 里仿 `a_pulled_block_with_a_forged_parent_qc_*` 构造头部 QC view 大于头部 view、
+   以及签名伪造的块,投递 `BlockImported` 后断言 engine 不投票;gov5 夹具补一个带 QC 的头部。
+5. 合入前:Linux 同机 A/B(X22)与 devnet gov5 三形态。
 
 ## C. 热路径或需设计 + A/B(Linux)
 

@@ -417,6 +417,7 @@ fn answer_layout_only() -> bool {
 /// `u8 2 | u32 n | n * 32 hashes | u32 frames | frames * (32 id | u32 count)`
 /// -- the same hashes and the block's frame layout after them.
 /// The third element is how many bytes the tail took on the wire.
+#[allow(clippy::useless_let_if_seq)] // frame decoding loop kept as written
 async fn read_hash_tail(
     stream: &mut tokio::net::TcpStream,
     asked: bool,
@@ -441,7 +442,7 @@ async fn read_hash_tail(
         stream.read_exact(&mut raw).await?;
         bytes += 4 + raw.len();
         frames = raw
-            .chunks_exact(36)
+            .as_chunks::<36>().0.iter()
             .map(|entry| {
                 let mut count = [0u8; 4];
                 count.copy_from_slice(&entry[32..]);
@@ -1536,11 +1537,10 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
     ) -> Result<PayloadStatus, ElError> {
         // `N42_OWN_BLOCK_BY_HEADER=0` sends the payload as before (the A-B).
         let by_header = own_block_by_header();
-        if let (Some(header), true) = (header, by_header) {
-            if let Some(status) = self.own_block_over_channel(header).await {
+        if let (Some(header), true) = (header, by_header)
+            && let Some(status) = self.own_block_over_channel(header).await {
                 return Ok(status);
             }
-        }
         self.new_payload(payload).await
     }
 
@@ -1769,7 +1769,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             debug!(target: "n42.h2.el", ?found, "raw payload endpoint");
             channel.endpoint = Some(found);
         }
-        (*channel.endpoint.as_ref()?)
+        *channel.endpoint.as_ref()?
     }
 
     /// The body of a block this node built, by its sealed header, over the

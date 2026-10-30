@@ -4977,10 +4977,34 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.unsolicited_heights.pop_first();
         }
         if first != block_hash && !self.awaiting_bodies.contains(&block_hash) {
+            // The view's leader sealed it: the block an anonymous peer's
+            // made-up one took the height from (audit 2026-10 round 2,
+            // R2-R2). A seal costs one verification, and only a sibling
+            // that would otherwise wait pays it.
+            if self.sealed_by_its_leader(&block_hash) {
+                debug!(target: "n42.h2.node", ?block_hash, number, first = ?first, "an unsolicited sibling sealed by its view's leader is imported at once");
+                self.unsolicited_heights.insert(number, block_hash);
+                self.import_eagerly(block_hash);
+                return;
+            }
             debug!(target: "n42.h2.node", ?block_hash, number, first = ?first, "an unsolicited sibling waits for a proposal to name it");
             return;
         }
         self.import_eagerly(block_hash);
+    }
+
+    /// Whether the header held for `block_hash` carries a seal by the leader
+    /// of the view it names, under the set known for that exact view.
+    fn sealed_by_its_leader(&self, block_hash: &B256) -> bool {
+        let Some(header) = self.block_headers.get(block_hash) else {
+            return false;
+        };
+        let Ok(view) = n42_h2_consensus::header_view(header) else {
+            return false;
+        };
+        self.engine
+            .leader_public_key_for_view(view)
+            .is_some_and(|leader| n42_h2_consensus::verify_seal(header, &leader).is_ok())
     }
 
     fn remember_imported(&mut self, block_hash: B256) {

@@ -486,6 +486,40 @@ async fn a_tc_piggybacked_on_a_vote_moves_a_lagging_node_to_the_view_after_it() 
     assert_eq!(rig.svc.engine.current_view(), 6);
 }
 
+/// Audit 2026-10 round 2 (R2-R2): only the first body nobody asked for at a
+/// height was imported at once (B-3), so an anonymous peer that sent a made-up
+/// block first took the slot and the honest leader's block waited for its
+/// proposal. A body sealed by the leader of the view its header names is
+/// imported at once whatever came first; an unsealed or wrongly sealed
+/// sibling still waits.
+#[tokio::test]
+async fn a_body_sealed_by_its_views_leader_is_imported_after_a_peers_made_up_one() {
+    let (keys, set) = keys(1);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    let gossip = |rig: &mut Rig, rlp: &alloy_primitives::Bytes| {
+        let data = compress_block_rlp(rlp).expect("snappy");
+        rig.svc.handle_transport_event(TransportEvent::Block { from: None, data }).expect("ok");
+    };
+    let sealed = |parent: B256, view: u64, key: &BlsSecretKey| {
+        let (_, mut header, _) = block_with_extra(1, parent, view, Vec::new());
+        n42_h2_consensus::seal_header(&mut header, key).expect("seal");
+        let rlp = n42_h2_net::encode_block_rlp_raw(&header, &[], &[], None);
+        (header.hash_slow(), alloy_primitives::Bytes::from(rlp))
+    };
+    let (made_up, _, made_up_rlp) = block_with_extra(1, B256::repeat_byte(1), 3, Vec::new());
+    gossip(&mut rig, &made_up_rlp);
+    assert_eq!(rig.svc.ready_bodies, vec![made_up], "the first takes the height");
+
+    let stranger = BlsSecretKey::random().expect("bls keygen");
+    let (forged, forged_rlp) = sealed(B256::repeat_byte(2), 3, &stranger);
+    gossip(&mut rig, &forged_rlp);
+    assert!(!rig.svc.ready_bodies.contains(&forged), "a seal by anyone else does not count");
+
+    let (leaders, leaders_rlp) = sealed(B256::repeat_byte(3), 3, &keys[0]);
+    gossip(&mut rig, &leaders_rlp);
+    assert!(rig.svc.ready_bodies.contains(&leaders), "the leader's block is imported at once");
+}
+
 /// Audit 2026-10 B-6: a step that returns early -- a range reply part
 /// imported, the rest left for the next step -- still checks for local
 /// faults: a vote-log halt ends it as it ends a step on the slow path.

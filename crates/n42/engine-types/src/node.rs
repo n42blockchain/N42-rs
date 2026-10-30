@@ -386,10 +386,13 @@ where
         // genesis enables it; elsewhere the pool refuses the type.
         let alt_sig = reth_chainspec::qmdb::alt_sig_tx_enabled(ctx.chain_spec().genesis());
         n42_tx_types::set_alt_sig_enabled(alt_sig);
+        let pq = reth_chainspec::qmdb::pq_tx_enabled(ctx.chain_spec().genesis());
+        n42_tx_types::set_pq_tx_enabled(pq);
         let mut validator = TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config);
         if alt_sig {
             validator = validator.with_custom_tx_type(n42_tx_types::ALT_SIG_TX_TYPE_ID);
         }
+        if pq { validator = validator.with_custom_tx_type(n42_tx_types::FALCON_TX_TYPE_ID); }
         let validator = validator
             .kzg_settings(ctx.kzg_settings()?)
             .with_local_transactions_config(pool_config.local_transactions_config.clone())

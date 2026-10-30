@@ -238,6 +238,7 @@ where
                 },
                 // ecrecover is the verification: a signature that names an
                 // address at all names the one that signed.
+                N42TxEnvelope::Falcon(tx) => tx.verify().map_or(Verdict::Unsigned, Verdict::Signed),
                 N42TxEnvelope::Eth(tx) => {
                     tx.recover_signer().map_or(Verdict::Unsigned, Verdict::Signed)
                 }
@@ -259,7 +260,7 @@ where
                     .iter()
                     .filter_map(|&at| match envelope_of(&taken[at]) {
                         N42TxEnvelope::AltSig(alt) => Some(alt),
-                        N42TxEnvelope::Eth(_) => None,
+                        N42TxEnvelope::Eth(_) | N42TxEnvelope::Falcon(_) => None,
                     })
                     .collect();
                 // One verdict per transaction or none is used: `refs`

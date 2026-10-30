@@ -2294,6 +2294,16 @@ where
     let late = match owned {
         None => LateBlock::waiting(made.ok_or("no block to import")?),
         Some(sealed) => {
+            // Falcon never inherits trust from compact-body sender claims or
+            // queue indexes. Verify its key and signature on every import road.
+            for tx in sealed.body().transactions() {
+                if let TransactionSigned::Falcon(falcon) = tx {
+                    if !n42_tx_types::pq_tx_enabled() {
+                        return Err("Falcon transactions disabled by genesis".to_string());
+                    }
+                    falcon.verify().map_err(|err| format!("Falcon sender: {err}"))?;
+                }
+            }
             let recovered = match given_senders {
                 Some(senders) if senders.len() != tx_count => {
                     return Err(format!("given {} senders for {tx_count} transactions", senders.len()));
@@ -2357,6 +2367,11 @@ where
                                     TransactionSigned::AltSig(alt) => Ok(alt_cache.get(alt.hash()).inspect(|_| {
                                         cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     })),
+                                    TransactionSigned::Falcon(_) => {
+                                        verified_here.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        tx.recover_signer().map(Some)
+                                            .map_err(|err| format!("sender of {}: {err}", tx.tx_hash()))
+                                    }
                                     TransactionSigned::Eth(_) => {
                                         if let Some(sender) = senders_cache.and_then(|cache| cache.get(tx.tx_hash())) {
                                             cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

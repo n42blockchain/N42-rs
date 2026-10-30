@@ -325,6 +325,7 @@ where
                         None => tx.try_recover().inspect(|sender| cache.insert(*alt.hash(), *sender)),
                     }
                 }
+                N42TxEnvelope::Falcon(_) => tx.try_recover(),
                 N42TxEnvelope::Eth(_) => {
                     if let Some(cache) = &sender_recovery_cache { cache.recover(&tx) } else { tx.try_recover() }
                 }

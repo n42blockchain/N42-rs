@@ -5,6 +5,7 @@
 //! transaction beside it, in consensus and pooled form.
 
 use crate::alt_sig::AltSigTx;
+use crate::falcon::FalconTx;
 use alloy_consensus::{
     crypto::RecoveryError,
     error::ValueError,
@@ -26,6 +27,9 @@ pub enum N42TxEnvelope {
     /// The 0x50 alternative-signature transaction.
     #[envelope(ty = 0x50)]
     AltSig(AltSigTx),
+    /// Full-key Falcon-512 transaction.
+    #[envelope(ty = 0x05)]
+    Falcon(FalconTx),
 }
 
 /// A transaction as it travels between pools: an Ethereum pooled transaction
@@ -39,6 +43,9 @@ pub enum N42PooledTxEnvelope {
     /// The 0x50 alternative-signature transaction.
     #[envelope(ty = 0x50)]
     AltSig(AltSigTx),
+    /// Full-key Falcon-512 transaction.
+    #[envelope(ty = 0x05)]
+    Falcon(FalconTx),
 }
 
 impl N42TxEnvelope {
@@ -47,6 +54,7 @@ impl N42TxEnvelope {
         match self {
             Self::Eth(tx) => Some(tx),
             Self::AltSig(_) => None,
+            Self::Falcon(_) => None,
         }
     }
 
@@ -55,6 +63,7 @@ impl N42TxEnvelope {
         match self {
             Self::Eth(_) => None,
             Self::AltSig(tx) => Some(tx),
+            Self::Falcon(_) => None,
         }
     }
 
@@ -68,6 +77,7 @@ impl N42TxEnvelope {
         match self {
             Self::Eth(tx) => tx.hash(),
             Self::AltSig(tx) => tx.hash(),
+            Self::Falcon(tx) => tx.hash(),
         }
     }
 
@@ -80,6 +90,7 @@ impl N42TxEnvelope {
                 .map(N42PooledTxEnvelope::Eth)
                 .map_err(|err| err.map(Self::Eth)),
             Self::AltSig(tx) => Ok(N42PooledTxEnvelope::AltSig(tx)),
+            Self::Falcon(tx) => Ok(N42PooledTxEnvelope::Falcon(tx)),
         }
     }
 
@@ -95,6 +106,7 @@ impl N42TxEnvelope {
                 .map(N42PooledTxEnvelope::Eth)
                 .map_err(|err| err.map(Self::Eth)),
             this @ Self::AltSig(_) => Err(ValueError::new_static(this, "Expected 4844 transaction")),
+            this @ Self::Falcon(_) => Err(ValueError::new_static(this, "Expected 4844 transaction")),
         }
     }
 }
@@ -105,6 +117,7 @@ impl N42PooledTxEnvelope {
         match self {
             Self::Eth(_) => None,
             Self::AltSig(tx) => Some(tx),
+            Self::Falcon(_) => None,
         }
     }
 
@@ -118,6 +131,7 @@ impl N42PooledTxEnvelope {
         match self {
             Self::Eth(tx) => tx.hash(),
             Self::AltSig(tx) => tx.hash(),
+            Self::Falcon(tx) => tx.hash(),
         }
     }
 }
@@ -134,6 +148,12 @@ impl From<AltSigTx> for N42TxEnvelope {
     }
 }
 
+impl From<FalconTx> for N42TxEnvelope {
+    fn from(tx: FalconTx) -> Self {
+        Self::Falcon(tx)
+    }
+}
+
 impl From<PooledTransactionVariant> for N42PooledTxEnvelope {
     fn from(tx: PooledTransactionVariant) -> Self {
         Self::Eth(tx)
@@ -146,11 +166,18 @@ impl From<AltSigTx> for N42PooledTxEnvelope {
     }
 }
 
+impl From<FalconTx> for N42PooledTxEnvelope {
+    fn from(tx: FalconTx) -> Self {
+        Self::Falcon(tx)
+    }
+}
+
 impl From<N42PooledTxEnvelope> for N42TxEnvelope {
     fn from(tx: N42PooledTxEnvelope) -> Self {
         match tx {
             N42PooledTxEnvelope::Eth(tx) => Self::Eth(tx.into()),
             N42PooledTxEnvelope::AltSig(tx) => Self::AltSig(tx),
+            N42PooledTxEnvelope::Falcon(tx) => Self::Falcon(tx),
         }
     }
 }
@@ -168,6 +195,7 @@ impl SignerRecoverable for N42TxEnvelope {
         match self {
             Self::Eth(tx) => tx.recover_signer(),
             Self::AltSig(tx) => tx.recover_signer(),
+            Self::Falcon(tx) => tx.recover_signer(),
         }
     }
 
@@ -175,6 +203,7 @@ impl SignerRecoverable for N42TxEnvelope {
         match self {
             Self::Eth(tx) => tx.recover_signer_unchecked(),
             Self::AltSig(tx) => tx.recover_signer_unchecked(),
+            Self::Falcon(tx) => tx.recover_signer_unchecked(),
         }
     }
 
@@ -182,6 +211,7 @@ impl SignerRecoverable for N42TxEnvelope {
         match self {
             Self::Eth(tx) => tx.recover_unchecked_with_buf(buf),
             Self::AltSig(tx) => tx.recover_signer_unchecked(),
+            Self::Falcon(tx) => tx.recover_signer_unchecked(),
         }
     }
 }
@@ -191,6 +221,7 @@ impl SignerRecoverable for N42PooledTxEnvelope {
         match self {
             Self::Eth(tx) => tx.recover_signer(),
             Self::AltSig(tx) => tx.recover_signer(),
+            Self::Falcon(tx) => tx.recover_signer(),
         }
     }
 
@@ -198,6 +229,7 @@ impl SignerRecoverable for N42PooledTxEnvelope {
         match self {
             Self::Eth(tx) => tx.recover_signer_unchecked(),
             Self::AltSig(tx) => tx.recover_signer_unchecked(),
+            Self::Falcon(tx) => tx.recover_signer_unchecked(),
         }
     }
 
@@ -205,6 +237,7 @@ impl SignerRecoverable for N42PooledTxEnvelope {
         match self {
             Self::Eth(tx) => tx.recover_unchecked_with_buf(buf),
             Self::AltSig(tx) => tx.recover_signer_unchecked(),
+            Self::Falcon(tx) => tx.recover_signer_unchecked(),
         }
     }
 }
@@ -226,6 +259,7 @@ impl InMemorySize for N42TxEnvelope {
         match self {
             Self::Eth(tx) => tx.size(),
             Self::AltSig(tx) => tx.size(),
+            Self::Falcon(tx) => tx.size(),
         }
     }
 }
@@ -235,6 +269,7 @@ impl InMemorySize for N42PooledTxEnvelope {
         match self {
             Self::Eth(tx) => tx.size(),
             Self::AltSig(tx) => tx.size(),
+            Self::Falcon(tx) => tx.size(),
         }
     }
 }

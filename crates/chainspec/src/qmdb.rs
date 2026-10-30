@@ -273,3 +273,10 @@ mod frame_blocks_tests {
         }
     }
 }
+
+/// Whether genesis explicitly enables N42's full-key Falcon-512 type 0x05.
+/// Defaults to disabled. Every validator must use the same chain configuration.
+pub fn pq_tx_enabled(genesis: &Genesis) -> bool {
+    genesis.config.extra_fields.get_deserialized::<bool>("pqTx")
+        .and_then(Result::ok).unwrap_or(false)
+}

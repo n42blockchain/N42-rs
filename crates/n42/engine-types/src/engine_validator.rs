@@ -271,6 +271,7 @@ fn sender_of(tx: &TransactionSigned) -> Result<alloy_primitives::Address, String
             cache.insert(*alt.hash(), sender);
             Ok(sender)
         }
+        TransactionSigned::Falcon(falcon) => falcon.verify().map_err(|err| err.to_string()),
         TransactionSigned::Eth(_) => tx.recover_signer().map_err(|err| err.to_string()),
     }
 }

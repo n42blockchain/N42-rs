@@ -21,6 +21,8 @@
 extern crate alloc;
 
 pub mod alt_sig;
+pub mod falcon;
+pub use falcon::{pq_tx_enabled, set_pq_tx_enabled, FalconTx, TxFalcon, FalconError, FALCON_TX_TYPE_ID, ALG_FALCON512};
 mod compact;
 pub mod envelope;
 pub mod evm;

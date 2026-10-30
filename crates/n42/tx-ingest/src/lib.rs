@@ -2193,6 +2193,18 @@ where
     let mut verified_here = 0u64;
     let mut attested_here = 0u64;
     for (at, tx) in pooled.into_iter().enumerate() {
+        // Falcon is always cryptographically verified locally. Sender claims,
+        // Ed25519 batches and frame attestations do not bypass this verifier.
+        if let N42PooledTxEnvelope::Falcon(falcon) = &tx {
+            if n42_tx_types::pq_tx_enabled() {
+                if let Ok(sender) = falcon.verify() {
+                    recovered.push(P::Transaction::from_pooled(Recovered::new_unchecked(tx, sender)));
+                    verified_here += 1;
+                }
+            }
+            continue;
+        }
+
         if attested && let N42PooledTxEnvelope::AltSig(alt_tx) = &tx {
             // The 0x50 gate stays where it is: attested or not, a chain that
             // does not admit the type must not hold one.
@@ -2255,6 +2267,7 @@ where
                     derived
                 }
                 N42PooledTxEnvelope::Eth(_) => claims[at],
+                N42PooledTxEnvelope::Falcon(_) => unreachable!("Falcon verified before claim handling"),
             };
             if shard.is_some() {
                 // Recorded as the sender, signature unverified, so the road
@@ -2327,7 +2340,7 @@ where
             .iter()
             .filter_map(|tx| match tx {
                 N42PooledTxEnvelope::AltSig(tx) => Some(tx),
-                N42PooledTxEnvelope::Eth(_) => None,
+                N42PooledTxEnvelope::Eth(_) | N42PooledTxEnvelope::Falcon(_) => None,
             })
             .collect();
         verdicts.extend(n42_tx_types::verify_batch(&refs));

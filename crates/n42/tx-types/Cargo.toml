@@ -43,6 +43,9 @@ reth-rpc-traits = "0.8.1"
 # The same fixed-size cache reth's sender-recovery cache is built on.
 fixed-cache = "0.1.8"
 
+pqcrypto-falcon = "0.4.1"
+pqcrypto-traits = "0.3.5"
+
 [dev-dependencies]
 serde_json.workspace = true
 hex.workspace = true

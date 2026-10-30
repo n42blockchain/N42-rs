@@ -2511,3 +2511,147 @@ async fn test_altsig_transfer__is_mined_and_typed_0x50() -> eyre::Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
+
+/// A 0x05 (Falcon-512) transfer on a chain whose genesis enables the type: the
+/// pool admits it, the builder mines it, the stored block and receipt carry
+/// the type. This is the path the fleet smoke test exercises, in one process.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_falcon_transfer__is_mined_and_typed_0x05() -> eyre::Result<()> {
+    use n42_qmdb_reth::{with_declared_state_scheme, QmdbNodeState};
+    use pqcrypto_traits::sign::PublicKey as _;
+    use n42_tx_types::ALG_FALCON512;
+    use reth_provider::{BlockReader, ReceiptProvider};
+
+    reth_tracing::init_test_tracing();
+    let runtime = Runtime::test();
+    let mut accounts = TesterAccountPool::new();
+    let base = CliqueTest {
+        signers: vec!["A".to_string()],
+        ..Default::default()
+    };
+    let mut chainspec = base.gen_chainspec(&mut accounts);
+
+    let (public, secret) = pqcrypto_falcon::falconpadded512::keypair();
+    let pubkey = alloy_primitives::Bytes::copy_from_slice(public.as_bytes());
+    let ed_sender = Address::from_slice(&alloy_primitives::keccak256(&pubkey)[12..]);
+    chainspec.genesis.alloc.insert(
+        ed_sender,
+        alloy_genesis::GenesisAccount {
+            balance: U256::from(10u128.pow(18)),
+            ..Default::default()
+        },
+    );
+    chainspec
+        .genesis
+        .config
+        .extra_fields
+        .insert_value("stateScheme".to_string(), "qmdb")?;
+    chainspec
+        .genesis
+        .config
+        .extra_fields
+        .insert_value("pqTx".to_string(), true)?;
+    let chainspec = with_declared_state_scheme(chainspec)?;
+    assert!(reth_chainspec::qmdb::pq_tx_enabled(&chainspec.genesis), "the flag is read back");
+    let chainspec = Arc::new(chainspec);
+
+    let dir = std::env::temp_dir().join(format!("n42-falcon-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let qmdb = QmdbNodeState::new(chainspec.clone(), &dir);
+
+    let mut node_config = NodeConfig::new(chainspec.clone())
+        .with_network(NetworkArgs {
+            discovery: DiscoveryArgs {
+                disable_discovery: true,
+                ..DiscoveryArgs::default()
+            },
+            ..NetworkArgs::default()
+        })
+        .with_unused_ports()
+        .with_rpc(RpcServerArgs::default().with_unused_ports().with_http())
+        .with_dev(DevArgs {
+            dev: false,
+            consensus_signer_private_key: Some(B256::random().to_string()),
+            ..Default::default()
+        });
+    node_config.engine.cross_block_cache_size = TEST_CROSS_BLOCK_CACHE_MB;
+
+    let capturing_consensus = CapturingConsensusBuilder::default();
+    let types = N42Node::with_qmdb(Some(qmdb.clone()));
+    // Held from before this test's own launch (which writes `true`) through
+    // its own block-1 import (which reads the flag while validating the 0x05
+    // transfer): the one window in the suite where the value actually has to
+    // stay `true`. Every other node-launching test only takes this lock
+    // briefly around its own `launch()` (see `ALT_SIG_FLAG_LOCK`), so this
+    // does not serialize the suite -- just excludes other launches from this
+    // test's critical section.
+    let _alt_sig_guard = ALT_SIG_FLAG_LOCK.lock().await;
+    let NodeHandle { node, .. } = NodeBuilder::new(node_config)
+        .testing_node(runtime.clone())
+        .with_types::<N42Node>()
+        .with_components(
+            types
+                .components_builder()
+                .consensus(capturing_consensus.clone())
+                .payload(
+                    n42_engine_types::N42PayloadServiceBuilder::new(capturing_consensus.clone())
+                        .with_qmdb(Some(qmdb.clone())),
+                ),
+        )
+        .with_add_ons(types.add_ons())
+        .launch()
+        .await?;
+    let genesis_hash = node.provider.block_hash(0)?.expect("genesis is stored");
+    qmdb.initialize((0, genesis_hash))?;
+    assert!(n42_tx_types::pq_tx_enabled(), "the node read the genesis flag");
+
+    let tx = n42_tx_types::TxFalcon {
+        chain_id: chainspec.chain().id(),
+        nonce: 0,
+        max_priority_fee_per_gas: 1_000_000_000,
+        max_fee_per_gas: 10_000_000_000,
+        gas_limit: 21_000,
+        to: Address::with_last_byte(0x77),
+        value: U256::from(1_000u64),
+        input: Default::default(),
+        access_list: Default::default(),
+        alg_type: ALG_FALCON512,
+        pubkey_mode: 0,
+        pubkey,
+    }
+    .sign_falcon(&secret);
+    let tx_hash = *tx.hash();
+    let raw = alloy_eips::eip2718::Encodable2718::encoded_2718(&tx);
+    let signed = <n42_tx_types::N42TxEnvelope as alloy_eips::eip2718::Decodable2718>::decode_2718_exact(&raw)?;
+    assert_eq!(reth_primitives_traits::SignerRecoverable::recover_signer(&signed)?, ed_sender);
+    let encoded_len = alloy_eips::eip2718::Encodable2718::encode_2718_len(&signed);
+    let recovered = reth_primitives_traits::Recovered::new_unchecked(signed, ed_sender);
+    let pooled = n42_engine_types::N42PooledTransaction::new(recovered, encoded_len);
+    let outcome = reth_transaction_pool::TransactionPool::add_transaction(
+        &node.pool,
+        reth_transaction_pool::TransactionOrigin::Local,
+        pooled,
+    )
+    .await;
+    assert!(outcome.is_ok(), "the pool admits a 0x05 transaction on this chain: {outcome:?}");
+    let status = reth_transaction_pool::TransactionPool::pool_size(&node.pool);
+    assert_eq!(status.pending, 1, "the transaction is pending, not queued: {status:?}");
+
+    let key = hex::encode(accounts.secret_key("A").secret_bytes());
+    new_block(&node, key, None, &capturing_consensus).await?;
+    let header = node.provider.latest_header()?.expect("a head");
+    assert_eq!(header.number, 1);
+    assert_eq!(header.gas_used, 21_000, "block 1 must have included the 0x05 transfer");
+    let block = node.provider.block(1u64.into())?.expect("block 1 is stored");
+    assert_eq!(block.body.transactions.len(), 1);
+    assert!(matches!(block.body.transactions[0], n42_tx_types::N42TxEnvelope::Falcon(_)));
+    assert_eq!(*block.body.transactions[0].hash(), tx_hash);
+    let receipts = node.provider.receipts_by_block(1u64.into())?.expect("receipts of block 1");
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].tx_type, n42_tx_types::N42TxType::Falcon);
+    assert!(receipts[0].success);
+    qmdb.on_canonical(header.hash())?;
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}

@@ -69,6 +69,10 @@ impl N42RpcReceipt {
                 tx_type: crate::ALT_SIG_TX_TYPE_ID,
                 inner: receipt.into_with_bloom(),
             }),
+            N42TxType::Falcon => Self::AltSig(AltSigRpcReceipt {
+                tx_type: crate::FALCON_TX_TYPE_ID,
+                inner: receipt.into_with_bloom(),
+            }),
         }
     }
 }

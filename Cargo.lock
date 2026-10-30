@@ -7891,6 +7891,8 @@ dependencies = [
  "n42-qmdb-reth",
  "n42-qmdb-state",
  "n42-tx-types",
+ "pqcrypto-falcon",
+ "pqcrypto-traits",
  "rand 0.9.5",
  "reth",
  "reth-basic-payload-builder",
@@ -8007,6 +8009,8 @@ dependencies = [
  "hex",
  "merlin",
  "n42-env",
+ "pqcrypto-falcon",
+ "pqcrypto-traits",
  "rand_core 0.6.4",
  "rayon",
  "reth-codecs 0.8.2",
@@ -9098,6 +9102,37 @@ checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy 0.8.63",
 ]
+
+[[package]]
+name = "pqcrypto-falcon"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01a0e72acca23e8bc9886f26396adbc1a2c71fc0b841723415ee245cdc5b395c"
+dependencies = [
+ "cc",
+ "glob",
+ "libc",
+ "pqcrypto-internals",
+ "pqcrypto-traits",
+]
+
+[[package]]
+name = "pqcrypto-internals"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4a326caf27cbf2ac291ca7fd56300497ba9e76a8cc6a7d95b7a18b57f22b61d"
+dependencies = [
+ "cc",
+ "dunce",
+ "getrandom 0.3.4",
+ "libc",
+]
+
+[[package]]
+name = "pqcrypto-traits"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94e851c7654eed9e68d7d27164c454961a616cf8c203d500607ef22c737b51bb"
 
 [[package]]
 name = "prefix-trie"

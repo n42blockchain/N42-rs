@@ -40,6 +40,31 @@ fn alt_sig_tx_env(tx: &AltSigTx, caller: Address) -> TxEnv {
     }
 }
 
+fn falcon_tx_env(tx: &crate::FalconTx, caller: Address) -> TxEnv {
+    let inner = tx.tx();
+    TxEnv {
+        tx_type: EXECUTES_AS,
+        caller,
+        gas_limit: inner.gas_limit,
+        gas_price: inner.max_fee_per_gas,
+        kind: TxKind::Call(inner.to),
+        value: inner.value,
+        data: inner.input.clone(),
+        nonce: inner.nonce,
+        chain_id: Some(inner.chain_id),
+        access_list: inner.access_list.clone(),
+        gas_priority_fee: Some(inner.max_priority_fee_per_gas),
+        // Every field spelled out: `TxEnv::default()` is
+        // `TxEnvBuilder::new().build()`, a whole second `TxEnv` built and
+        // type-derived per transaction only for these three empty fields
+        // (4.5% of the build pool in the loop314 profile). The values are
+        // the default's.
+        blob_hashes: Vec::new(),
+        max_fee_per_blob_gas: 0,
+        authorization_list: Vec::new(),
+    }
+}
+
 impl FromRecoveredTx<AltSigTx> for TxEnv {
     fn from_recovered_tx(tx: &AltSigTx, caller: Address) -> Self {
         alt_sig_tx_env(tx, caller)
@@ -57,6 +82,7 @@ impl FromRecoveredTx<N42TxEnvelope> for TxEnv {
         match tx {
             N42TxEnvelope::Eth(tx) => Self::from_recovered_tx(tx, caller),
             N42TxEnvelope::AltSig(tx) => alt_sig_tx_env(tx, caller),
+            N42TxEnvelope::Falcon(tx) => falcon_tx_env(tx, caller),
         }
     }
 }
@@ -66,6 +92,7 @@ impl FromTxWithEncoded<N42TxEnvelope> for TxEnv {
         match tx {
             N42TxEnvelope::Eth(tx) => Self::from_encoded_tx(tx, caller, encoded),
             N42TxEnvelope::AltSig(tx) => alt_sig_tx_env(tx, caller),
+            N42TxEnvelope::Falcon(tx) => falcon_tx_env(tx, caller),
         }
     }
 }

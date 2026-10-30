@@ -21,6 +21,7 @@ use reth_ethereum_primitives::TransactionSigned;
 
 const TAG_ETH: u8 = 0;
 const TAG_ALT_SIG: u8 = 1;
+const TAG_FALCON: u8 = 2;
 
 impl Compact for N42TxType {
     fn to_compact<B>(&self, buf: &mut B) -> usize
@@ -33,6 +34,10 @@ impl Compact for N42TxType {
                 buf.put_u8(ALT_SIG_TX_TYPE_ID);
                 COMPACT_EXTENDED_IDENTIFIER_FLAG
             }
+            Self::Falcon => {
+                buf.put_u8(crate::FALCON_TX_TYPE_ID);
+                COMPACT_EXTENDED_IDENTIFIER_FLAG
+            }
         }
     }
 
@@ -40,6 +45,7 @@ impl Compact for N42TxType {
         if identifier == COMPACT_EXTENDED_IDENTIFIER_FLAG && buf.first() == Some(&ALT_SIG_TX_TYPE_ID) {
             return (Self::AltSig, &buf[1..]);
         }
+        if identifier == COMPACT_EXTENDED_IDENTIFIER_FLAG && buf.first() == Some(&crate::FALCON_TX_TYPE_ID) { return (Self::Falcon, &buf[1..]); }
         let (ty, rest) = TxType::from_compact(buf, identifier);
         (Self::Eth(ty), rest)
     }
@@ -57,6 +63,14 @@ impl Compact for N42TxEnvelope {
             }
             Self::AltSig(tx) => {
                 buf.put_u8(TAG_ALT_SIG);
+                buf.put_slice(tx.hash().as_slice());
+                let len = tx.encode_2718_len();
+                buf.put_u32(len as u32);
+                tx.encode_2718(buf);
+                1 + 32 + 4 + len
+            }
+            Self::Falcon(tx) => {
+                buf.put_u8(TAG_FALCON);
                 buf.put_slice(tx.hash().as_slice());
                 let len = tx.encode_2718_len();
                 buf.put_u32(len as u32);
@@ -83,6 +97,17 @@ impl Compact for N42TxEnvelope {
                 debug_assert_eq!(tx.hash(), &hash);
                 let (tx, sig, _) = tx.into_parts();
                 (Self::AltSig(AltSigTx::new_unchecked(tx, sig, hash)), rest)
+            }
+            TAG_FALCON => {
+                let hash = B256::from_slice(&buf[..32]);
+                buf.advance(32);
+                let len = buf.get_u32() as usize;
+                let (bytes, rest) = buf.split_at(len);
+                let tx = crate::FalconTx::decode_2718_exact(bytes)
+                    .expect("a 0x05 transaction this node stored decodes");
+                debug_assert_eq!(tx.hash(), &hash);
+                let (tx, sig, _) = tx.into_parts();
+                (Self::Falcon(crate::FalconTx::new_unchecked(tx, sig, hash)), rest)
             }
             other => panic!("unknown N42 transaction storage tag {other}"),
         }

@@ -77,6 +77,8 @@ alloy-contract.workspace = true
 alloy-rpc-types-beacon.workspace = true
 
 [dev-dependencies]
+pqcrypto-falcon = "0.4.1"
+pqcrypto-traits = "0.3.5"
 ed25519-dalek = { version = "3.0", default-features = false, features = ["fast"] }
 reth.workspace = true
 reth-chainspec.workspace = true

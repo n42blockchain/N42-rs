@@ -456,6 +456,19 @@ fn main() {
                     ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
                     ctx.auth_module.merge_auth_methods(engine_ext.into_rpc())?;
                     ctx.modules.merge_configured(beacon_ext.into_rpc())?;
+                    use reth_provider::ChainSpecProvider;
+                    let pq_chain_id = reth_chainspec::EthChainSpec::chain_id(&*ctx.provider().chain_spec());
+                    let mut pq_rpc = jsonrpsee::RpcModule::new(());
+                    pq_rpc.register_method("n42_getPQCapabilities", move |_, _, _| {
+                        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+                            "protocol": "n42-pq-v1", "transactionType": "0x05",
+                            "algorithm": "Falcon-512", "signatureEncoding": "padded-666",
+                            "publicKeyMode": 0, "chainId": format!("0x{pq_chain_id:x}"),
+                            "enabled": n42_tx_types::pq_tx_enabled(),
+                        }))
+                    })?;
+                    ctx.modules.merge_configured(pq_rpc)?;
+
 
                     info!(target: "reth::cli", "consensus rpc extension enabled");
 

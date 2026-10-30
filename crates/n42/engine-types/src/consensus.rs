@@ -211,6 +211,9 @@ where
 /// A block carrying a 0x50 transaction is valid only on a chain whose genesis
 /// enables the type (`altSigTx: true`).
 fn alt_sig_allowed(block: &SealedBlock<EthBlock>) -> Result<(), ConsensusError> {
+    if !n42_tx_types::pq_tx_enabled() && block.body().transactions().any(|tx| matches!(tx, n42_tx_types::N42TxEnvelope::Falcon(_))) {
+        return Err(ConsensusError::Other(Arc::new(std::io::Error::other("0x05 transactions are not enabled on this chain"))));
+    }
     if !n42_tx_types::alt_sig_enabled() && block.body().transactions().any(|tx| tx.is_alt_sig()) {
         return Err(ConsensusError::Other(Arc::new(std::io::Error::other(
             "0x50 alternative-signature transactions are not enabled on this chain",
@@ -262,6 +265,7 @@ where
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
         let chain_spec = ctx.chain_spec();
         n42_tx_types::set_alt_sig_enabled(reth_chainspec::qmdb::alt_sig_tx_enabled(chain_spec.genesis()));
+        n42_tx_types::set_pq_tx_enabled(reth_chainspec::qmdb::pq_tx_enabled(chain_spec.genesis()));
         let consensus = if is_hotstuff_chain(&chain_spec) {
             let consensus = HotStuffConsensus::new(chain_spec);
             if let Some(key) = ctx.config().dev.consensus_signer_private_key.clone() {

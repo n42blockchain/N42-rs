@@ -13,7 +13,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use alloy_consensus::{BlockBody, Header, TxEnvelope};
+use alloy_consensus::{BlockBody, TxEnvelope};
+use n42_header::N42Header as Header;
 use alloy_eips::eip4895::Withdrawals;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{
@@ -173,7 +174,7 @@ fn cancun_data(number: u64) -> ExecutionData {
 
 /// A Cancun-shaped header: the optional fields are positional in RLP.
 fn cancun_header(number: u64, beacon_root: B256) -> Header {
-    Header {
+    Header::from(alloy_consensus::Header {
         number,
         timestamp: 1_700_000_000,
         gas_limit: 30_000_000,
@@ -183,11 +184,11 @@ fn cancun_header(number: u64, beacon_root: B256) -> Header {
         excess_blob_gas: Some(0),
         parent_beacon_block_root: Some(beacon_root),
         ..Default::default()
-    }
+    })
 }
 
 fn block_rlp(header: Header) -> Vec<u8> {
-    let block = alloy_consensus::Block::<TxEnvelope> {
+    let block = alloy_consensus::Block::<TxEnvelope, Header> {
         header,
         body: BlockBody { transactions: Vec::new(), ommers: Vec::new(), withdrawals: Some(Withdrawals::new(Vec::new())) },
     };
@@ -726,7 +727,7 @@ async fn a_whole_answer_is_stamped_and_not_elided() {
 /// The sealed header of a block whose built header is `built`: what the
 /// proposer stamps changes the extra data, not the roots.
 fn sealed_of(built: &Header) -> Header {
-    Header { extra_data: alloy_primitives::Bytes::from_static(&[0x42; 8]), ..built.clone() }
+    Header::from(alloy_consensus::Header { extra_data: alloy_primitives::Bytes::from_static(&[0x42; 8]), ..built.inner.clone() })
 }
 
 #[tokio::test]
@@ -773,7 +774,7 @@ async fn a_refused_own_body_falls_back_to_the_lookup_by_hash() {
 async fn a_body_for_another_block_is_refused() {
     // The execution layer answering a block whose roots are not the sealed
     // header's is a malformed answer, not a body.
-    let other = Header { number: 6, transactions_root: B256::repeat_byte(0xee), ..cancun_header(6, B256::ZERO) };
+    let other = Header::from(alloy_consensus::Header { number: 6, transactions_root: B256::repeat_byte(0xee), ..cancun_header(6, B256::ZERO).inner });
     let answer = built_answer(other);
     let (addr, _) = serve(Arc::new(move |_, _| Some(answer.clone()))).await;
     let got = n42_h2_el_rpc::request_own_body(addr, &cancun_header(6, B256::ZERO)).await;

@@ -318,7 +318,7 @@ fn header_qc(
 /// `qc` embedded.
 fn block_with_extra(number: u64, parent: B256, view: u64, qc: Vec<u8>) -> (B256, Header, alloy_primitives::Bytes) {
     let built = MockExecutionLayer::built_block_on(number, parent);
-    let mut header = built.execution_data.clone().into_block_raw().expect("raw block").header;
+    let mut header = n42_h2_consensus::N42Header::from(built.execution_data.clone().into_block_raw().expect("raw block").header);
     let extra = n42_h2_consensus::HeaderExtra { view, qc, seal: Some([0; n42_h2_consensus::EXTRA_SEAL_LEN]) };
     header.extra_data = extra.encode();
     let rlp = n42_h2_net::encode_block_rlp_raw(&header, &[], &[], None);

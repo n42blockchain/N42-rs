@@ -465,8 +465,8 @@ impl DriverAction {
 /// commits to it (gov5's HotStuff profile) the header has to be finished —
 /// view stamped, seal signed, hash re-formed — before anyone else sees it.
 /// The result is what gets cached, imported, and proposed.
-pub type PayloadNormalizer = dyn Fn(&ExecutionData, Option<&alloy_consensus::Header>, u64)
-        -> Result<(ExecutionData, Option<alloy_consensus::Header>), String>
+pub type PayloadNormalizer = dyn Fn(&ExecutionData, Option<&n42_h2_consensus::N42Header>, u64)
+        -> Result<(ExecutionData, Option<n42_h2_consensus::N42Header>), String>
     + Send
     + Sync;
 
@@ -506,7 +506,7 @@ struct Normalizer(std::sync::Arc<PayloadNormalizer>);
 /// owns the wire format; run in a build ahead's task so the body is ready
 /// when the proposal wants it.
 pub type OwnBodyEncoder =
-    dyn Fn(&ExecutionData, &alloy_consensus::Header) -> Option<alloy_primitives::Bytes> + Send + Sync;
+    dyn Fn(&ExecutionData, &n42_h2_consensus::N42Header) -> Option<alloy_primitives::Bytes> + Send + Sync;
 
 /// A build ahead finished for the view it was expected to be proposed in:
 /// the header sealed, the payload's cache copy made and the body encoded in
@@ -520,7 +520,7 @@ struct Presealed {
     /// The hash of the block as built, before the seal.
     raw_hash: B256,
     execution: ExecutionData,
-    header: Option<alloy_consensus::Header>,
+    header: Option<n42_h2_consensus::N42Header>,
     /// A second copy of `execution`, for the payload cache.
     cached: ExecutionData,
     body: Option<alloy_primitives::Bytes>,
@@ -913,7 +913,7 @@ pub fn compact_body() -> bool {
 /// ([`ExecutionLayer::own_block_body`]) and the payload made whole from it.
 pub async fn import_own<E: ExecutionLayer + ?Sized>(
     el: &E,
-    header: Option<&alloy_consensus::Header>,
+    header: Option<&n42_h2_consensus::N42Header>,
     payload: &ExecutionData,
     elided: Option<usize>,
 ) -> Result<alloy_rpc_types_engine::PayloadStatus, ElError> {
@@ -1105,7 +1105,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Installs a [`PayloadNormalizer`] applied to every block this node builds.
     pub fn set_payload_normalizer(
         &mut self,
-        normalizer: impl Fn(&ExecutionData, Option<&alloy_consensus::Header>, u64) -> Result<(ExecutionData, Option<alloy_consensus::Header>), String>
+        normalizer: impl Fn(&ExecutionData, Option<&n42_h2_consensus::N42Header>, u64) -> Result<(ExecutionData, Option<n42_h2_consensus::N42Header>), String>
             + Send
             + Sync
             + 'static,
@@ -1117,7 +1117,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// its block early.
     pub fn set_own_body_encoder(
         &mut self,
-        encoder: impl Fn(&ExecutionData, &alloy_consensus::Header) -> Option<alloy_primitives::Bytes>
+        encoder: impl Fn(&ExecutionData, &n42_h2_consensus::N42Header) -> Option<alloy_primitives::Bytes>
             + Send
             + Sync
             + 'static,
@@ -1443,7 +1443,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     pub async fn prepare_build_on_sealed(
         &mut self,
         parent: B256,
-        header: alloy_consensus::Header,
+        header: n42_h2_consensus::N42Header,
         attrs: PayloadAttributes,
         chain: Option<crate::el::ChainAhead>,
     ) -> Result<(), ElError> {
@@ -1458,7 +1458,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     pub async fn prepare_build_on_sealed_for_view(
         &mut self,
         parent: B256,
-        header: alloy_consensus::Header,
+        header: n42_h2_consensus::N42Header,
         attrs: PayloadAttributes,
         chain: Option<crate::el::ChainAhead>,
         view: Option<u64>,
@@ -1470,7 +1470,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     async fn prepare_on_sealed(
         &mut self,
         parent: B256,
-        header: alloy_consensus::Header,
+        header: n42_h2_consensus::N42Header,
         attrs: PayloadAttributes,
         chain: Option<crate::el::ChainAhead>,
         view: Option<u64>,
@@ -1555,7 +1555,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     pub async fn prepare_first_build_on_output(
         &mut self,
         parent: B256,
-        header: alloy_consensus::Header,
+        header: n42_h2_consensus::N42Header,
         attrs: PayloadAttributes,
         chain: Option<crate::el::ChainAhead>,
     ) -> Result<&'static str, ElError> {

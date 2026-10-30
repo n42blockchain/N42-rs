@@ -27,6 +27,7 @@ reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
 n42-tx-queue.workspace = true
 n42-tx-types.workspace = true
+n42-header = { workspace = true, features = ["chainspec", "engine"] }
 n42-core-layout.workspace = true
 alloy-evm.workspace = true
 reth-rpc-convert.workspace = true

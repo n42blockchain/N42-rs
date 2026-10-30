@@ -42,6 +42,8 @@ pub use compact_body::{
     is_compact_body, is_compact_frame_body,
     merge_fill, rebuild_gov5_body, with_fill, write_compact, CompactBlockBody,
 };
+/// The engine-API carriers of the header's registry root.
+pub use n42_header::engine as header_engine;
 pub use committee_pool::{CommitteePoolConfig, CommitteePoolError, ConsensusEvidence, SimulatedCommitteePool};
 pub use error::{ConsensusError, ConsensusResult};
 pub use header_profile::{
@@ -53,8 +55,8 @@ pub use header_profile::{
     execution_data_for_block_with_bal, execution_data_from_raw_parts,
     reconstruct_gov5_h2_block, reconstruct_gov5_h2_block_from, reconstruct_gov5_h2_block_from_or_tx_root, rewards_to_withdrawals, seal_hash, seal_header,
     withdrawals_to_rewards,
-    validate_gov5_h2_header, verify_seal, HeaderExtra, HeaderProfileError, N42HeaderProfile,
-    ReceiptView,
+    validate_gov5_h2_header, validate_gov5_header_tail, verify_seal, HeaderTailRules, HeaderExtra, HeaderProfileError, N42HeaderProfile,
+    ReceiptView, N42Header,
     EXTRA_SEAL_LEN, GOV5_EMPTY_REQUESTS_HASH, GOV5_HEADER_EXTRA_MAGIC, GOV5_NIL_HASH,
     MAX_HEADER_EXTRA_LEN,
 };

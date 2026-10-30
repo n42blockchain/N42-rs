@@ -19,6 +19,7 @@
 //! the worker pool is for. The trie itself stays sequential.
 
 use alloy_consensus::{proofs::calculate_receipt_root, Block, TxReceipt};
+use n42_header::N42Header;
 use alloy_eips::Encodable2718;
 use alloy_primitives::B256;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
@@ -282,6 +283,96 @@ fn parallel_ordered_trie_root_inner<T: AsRef<[u8]> + Sync>(items: &[T]) -> B256 
     hb.root()
 }
 
+/// Assembles an [`N42Header`] block with reth's Ethereum assembler.
+///
+/// reth's assembler is written for alloy's header: its input names the
+/// parent as one and its block carries one. The parent is handed over as its
+/// Ethereum view (the excess blob gas is all it reads) and the block comes
+/// back without a registry root, which is right for every header this node
+/// builds today. A chain whose schedule puts `mobileRegistryRoot` in the
+/// header at this block's time is refused instead: the builder has no
+/// registry to compute the root from (`docs/HEADER_FIELD_PARITY.md` section
+/// 6), and a header without it would be one the chain's other members refuse.
+pub fn assemble_n42_block<F, ChainSpec>(
+    inner: &EthBlockAssembler<ChainSpec>,
+    input: BlockAssemblerInput<'_, '_, F, N42Header>,
+    transactions_root: Option<B256>,
+    receipts_root: Option<B256>,
+    logs_bloom: Option<alloy_primitives::Bloom>,
+) -> Result<Block<F::Transaction, N42Header>, BlockExecutionError>
+where
+    F: for<'a> BlockExecutorFactory<
+        ExecutionCtx<'a> = EthBlockExecutionCtx<'a>,
+        Transaction: SignedTransaction,
+        Receipt: Receipt,
+    >,
+    ChainSpec: EthChainSpec + EthereumHardforks,
+{
+    let timestamp: u64 = revm::context::Block::timestamp(&input.evm_env.block_env).saturating_to();
+    if reth_chainspec::qmdb::mobile_registry_root_in_header_at(inner.chain_spec.genesis(), timestamp) {
+        return Err(BlockExecutionError::msg(format!(
+            "a header at {timestamp} carries mobileRegistryRoot, which this builder cannot compute"
+        )));
+    }
+    let BlockAssemblerInput {
+        evm_env,
+        execution_ctx,
+        parent,
+        transactions,
+        output,
+        bundle_state,
+        state_provider,
+        state_root,
+        block_access_list_hash,
+        ..
+    } = input;
+    let parent = n42_header::seal_to_alloy(parent);
+    let input = BlockAssemblerInput::<F, alloy_consensus::Header>::new(
+        evm_env,
+        execution_ctx,
+        &parent,
+        transactions,
+        output,
+        bundle_state,
+        state_provider,
+        state_root,
+        block_access_list_hash,
+    );
+    let block = inner.assemble_block(input, transactions_root, receipts_root, logs_bloom)?;
+    Ok(block.map_header(N42Header::from))
+}
+
+/// reth's [`EthBlockAssembler`] producing [`N42Header`] blocks
+/// ([`assemble_n42_block`]): the node's EVM configuration's assembler.
+#[derive(Debug, Clone)]
+pub struct N42HeaderAssembler<ChainSpec>(pub EthBlockAssembler<ChainSpec>);
+
+impl<ChainSpec> N42HeaderAssembler<ChainSpec> {
+    /// The assembler for `chain_spec`.
+    pub const fn new(chain_spec: Arc<ChainSpec>) -> Self {
+        Self(EthBlockAssembler::new(chain_spec))
+    }
+}
+
+impl<F, ChainSpec> BlockAssembler<F> for N42HeaderAssembler<ChainSpec>
+where
+    F: for<'a> BlockExecutorFactory<
+        ExecutionCtx<'a> = EthBlockExecutionCtx<'a>,
+        Transaction: SignedTransaction,
+        Receipt: Receipt,
+    >,
+    ChainSpec: EthChainSpec + EthereumHardforks,
+{
+    type Block = Block<F::Transaction, N42Header>;
+
+    fn assemble_block(
+        &self,
+        input: BlockAssemblerInput<'_, '_, F, N42Header>,
+    ) -> Result<Self::Block, BlockExecutionError> {
+        assemble_n42_block(&self.0, input, None, None, None)
+    }
+}
+
 impl<F, ChainSpec> BlockAssembler<F> for N42BlockAssembler<ChainSpec>
 where
     F: for<'a> BlockExecutorFactory<
@@ -291,11 +382,11 @@ where
     >,
     ChainSpec: EthChainSpec + EthereumHardforks,
 {
-    type Block = Block<F::Transaction>;
+    type Block = Block<F::Transaction, N42Header>;
 
     fn assemble_block(
         &self,
-        input: BlockAssemblerInput<'_, '_, F>,
+        input: BlockAssemblerInput<'_, '_, F, N42Header>,
     ) -> Result<Self::Block, BlockExecutionError> {
         let receipts = &input.output.receipts;
         let hotstuff = self.hotstuff;
@@ -373,7 +464,7 @@ where
         });
         let roots_ms = assembling.elapsed().as_millis() as u64;
         let tx_count = input.transactions.len();
-        let block = self.inner.assemble_block(input, Some(transactions_root), Some(receipts_root), Some(bloom));
+        let block = assemble_n42_block(&self.inner, input, Some(transactions_root), Some(receipts_root), Some(bloom));
         if tx_count > 10_000 {
             tracing::info!(
                 target: "n42.assembler",

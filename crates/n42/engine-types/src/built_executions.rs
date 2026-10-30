@@ -778,7 +778,7 @@ pub fn find_kept_sealed_header(
     receipts_root: B256,
     gas_used: u64,
     transactions_root: Option<B256>,
-) -> Option<(B256, alloy_consensus::Header, Option<Vec<alloy_eips::eip4895::Withdrawal>>)> {
+) -> Option<(B256, n42_header::N42Header, Option<Vec<alloy_eips::eip4895::Withdrawal>>)> {
     find_kept_sealed_with(parent, number, state_root, receipts_root, gas_used, transactions_root, |hash, block, _| {
         (hash, block.header().clone(), block.body().withdrawals.as_ref().map(|w| w.to_vec()))
     })
@@ -960,7 +960,7 @@ pub fn handoff_move_body_enabled() -> bool {
 pub fn reseal_moving(
     built_hash: B256,
     block: Arc<RecoveredBlock<Block>>,
-    sealed: reth_primitives_traits::SealedHeader,
+    sealed: reth_primitives_traits::SealedHeader<n42_header::N42Header>,
 ) -> Result<Arc<RecoveredBlock<Block>>, Arc<RecoveredBlock<Block>>> {
     if block.hash() == sealed.hash() {
         return Ok(block);
@@ -1250,8 +1250,8 @@ mod tests {
         }
     }
 
-    fn sealed_of(built: &Header) -> reth_primitives_traits::SealedHeader {
-        reth_primitives_traits::SealedHeader::seal_slow(Header { extra_data: b"sealed".as_slice().into(), ..built.clone() })
+    fn sealed_of(built: &Header) -> reth_primitives_traits::SealedHeader<n42_header::N42Header> {
+        reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { extra_data: b"sealed".as_slice().into(), ..built.inner.clone() }))
     }
 
     /// A handed build whose block is moved under the sealed header: the
@@ -1343,7 +1343,7 @@ mod tests {
     #[test]
     fn a_shared_sealed_block_is_found_and_taken() {
         let _guard = lock();
-        let header = Header { number: 777, ..Default::default() };
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 777, ..Default::default() });
         let sealed = SealedBlock::<Block>::seal_slow(alloy_consensus::Block::new(header, BlockBody::default()));
         let hash = sealed.hash();
         let shared = Arc::new(RecoveredBlock::new_sealed(sealed, Vec::new()));
@@ -1361,13 +1361,13 @@ mod tests {
     fn an_evicted_sealed_block_is_freed_off_the_path() {
         let _guard = lock();
         let first = Arc::new(RecoveredBlock::new_sealed(
-            SealedBlock::<Block>::seal_slow(alloy_consensus::Block::new(Header { number: 880, ..Default::default() }, BlockBody::default())),
+            SealedBlock::<Block>::seal_slow(alloy_consensus::Block::new(n42_header::N42Header::from(alloy_consensus::Header { number: 880, ..Default::default() }), BlockBody::default())),
             Vec::new(),
         ));
         let gone = Arc::downgrade(&first);
         remember_sealed_shared(first.hash(), first);
         for number in 881..881 + keep() as u64 {
-            let next = SealedBlock::<Block>::seal_slow(alloy_consensus::Block::new(Header { number, ..Default::default() }, BlockBody::default()));
+            let next = SealedBlock::<Block>::seal_slow(alloy_consensus::Block::new(n42_header::N42Header::from(alloy_consensus::Header { number, ..Default::default() }), BlockBody::default()));
             let hash = next.hash();
             remember_sealed_shared(hash, Arc::new(RecoveredBlock::new_sealed(next, Vec::new())));
         }
@@ -1379,7 +1379,7 @@ mod tests {
     }
 
     use super::*;
-    use alloy_consensus::Header;
+    use n42_header::N42Header as Header;
     use n42_tx_types::{BlockBody, N42TxEnvelope};
     use reth_execution_types::BlockExecutionOutput;
     use std::time::{Duration, Instant};
@@ -1394,7 +1394,7 @@ mod tests {
     }
 
     fn header(tag: u8, number: u64) -> Header {
-        Header {
+        n42_header::N42Header::from(alloy_consensus::Header {
             number,
             parent_hash: B256::repeat_byte(tag),
             state_root: B256::repeat_byte(tag.wrapping_add(1)),
@@ -1402,7 +1402,7 @@ mod tests {
             gas_used: 1_000 + u64::from(tag),
             transactions_root: B256::repeat_byte(tag.wrapping_add(3)),
             ..Default::default()
-        }
+        })
     }
 
     fn built(header: &Header) -> BuiltExecution {
@@ -1448,7 +1448,7 @@ mod tests {
     fn the_transactions_root_tells_siblings_with_the_same_parent_results_apart() {
         let _guard = lock();
         let a = header(0x12, 502);
-        let b = Header { transactions_root: B256::repeat_byte(0x99), ..a.clone() };
+        let b = n42_header::N42Header::from(alloy_consensus::Header { transactions_root: B256::repeat_byte(0x99), ..a.inner.clone() });
         let (ea, eb) = (built(&a), built(&b));
         let (ha, hb) = (ea.block.hash(), eb.block.hash());
         assert_ne!(ha, hb);
@@ -1470,7 +1470,7 @@ mod tests {
     fn at_depth_two_cousins_with_the_same_fields_are_kept_apart() {
         let _guard = lock();
         let a = header(0x13, 503);
-        let b = Header { parent_hash: B256::repeat_byte(0x9a), ..a.clone() };
+        let b = n42_header::N42Header::from(alloy_consensus::Header { parent_hash: B256::repeat_byte(0x9a), ..a.inner.clone() });
         assert_eq!((a.state_root, a.receipts_root, a.gas_used), (b.state_root, b.receipts_root, b.gas_used));
         let (ea, eb) = (built(&a), built(&b));
         let (ha, hb) = (ea.block.hash(), eb.block.hash());
@@ -1757,18 +1757,18 @@ mod tests {
         let orphan_hash = built(&orphan).block.hash();
         remember(orphan_hash, built(&orphan));
         assert!(pin_sealed(orphan.parent_hash, orphan.number, orphan.state_root, orphan.receipts_root, orphan.gas_used, Some(orphan.transactions_root)));
-        let child = Header { parent_hash: orphan_hash, ..header(0x54, 5_000_011) };
+        let child = n42_header::N42Header::from(alloy_consensus::Header { parent_hash: orphan_hash, ..header(0x54, 5_000_011).inner });
         let child_hash = built(&child).block.hash();
         remember(child_hash, built(&child));
         assert!(pin_sealed(child.parent_hash, child.number, child.state_root, child.receipts_root, child.gas_used, Some(child.transactions_root)));
         // The replacement: the same parent and height, other transactions.
-        let replacement = Header { parent_hash: orphan.parent_hash, ..header(0x58, 5_000_010) };
+        let replacement = n42_header::N42Header::from(alloy_consensus::Header { parent_hash: orphan.parent_hash, ..header(0x58, 5_000_010).inner });
         let replacement_hash = built(&replacement).block.hash();
         remember(replacement_hash, built(&replacement));
         assert_eq!(find_by(&replacement).map(|(h, _)| h), Some(replacement_hash));
         assert_eq!(find_by(&orphan).map(|(h, _)| h), Some(orphan_hash), "kept apart, not confused");
         // A build on the replacement with the orphan child's fields finds nothing.
-        let on_replacement = Header { parent_hash: replacement_hash, ..child.clone() };
+        let on_replacement = n42_header::N42Header::from(alloy_consensus::Header { parent_hash: replacement_hash, ..child.inner.clone() });
         assert!(find_by(&on_replacement).is_none());
         handed_off(replacement_hash);
         // The chain commits the replacement and its own child: both pins go.
@@ -1941,7 +1941,7 @@ mod tests {
             })
             .collect();
         let block = Block {
-            header: Header { number: u64::from(tag), extra_data: vec![tag].into(), ..Default::default() },
+            header: n42_header::N42Header::from(alloy_consensus::Header { number: u64::from(tag), extra_data: vec![tag].into(), ..Default::default() }),
             body: BlockBody { transactions: txs, ommers: Vec::new(), withdrawals: None },
         };
         SealedBlock::seal_slow(block)

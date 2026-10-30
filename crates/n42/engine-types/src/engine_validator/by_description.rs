@@ -118,7 +118,7 @@ pub struct DescribedBlock {
     /// The hash consensus voted on, the keccak of the header as it arrived.
     pub hash: B256,
     /// The header.
-    pub header: alloy_consensus::Header,
+    pub header: n42_header::N42Header,
     /// The transactions, in block order.
     pub transactions: Arc<Vec<DescribedTx>>,
     /// Their senders, in the same order.
@@ -874,7 +874,7 @@ impl PayloadList {
 #[derive(Debug)]
 pub struct BlockMaker {
     hash: B256,
-    header: alloy_consensus::Header,
+    header: n42_header::N42Header,
     withdrawals: Vec<Withdrawal>,
     transactions: Arc<Vec<DescribedTx>>,
     sidecar: alloy_rpc_types_engine::ExecutionPayloadSidecar,

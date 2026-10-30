@@ -11,7 +11,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
-use alloy_consensus::{BlockBody, Header, TxEnvelope};
+use alloy_consensus::{BlockBody, TxEnvelope};
+use n42_header::N42Header as Header;
 use alloy_eips::eip4895::Withdrawals;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{PayloadAttributes, PayloadId, PayloadStatus, PayloadStatusEnum};
@@ -339,7 +340,7 @@ async fn a_dropped_held_body_sends_the_drop_byte_and_answers_the_drop() {
 // ---- hashed build answers --------------------------------------------------
 
 fn header(number: u64) -> Header {
-    Header {
+    Header::from(alloy_consensus::Header {
         number,
         timestamp: 1_700_000_000,
         gas_limit: 30_000_000,
@@ -349,11 +350,11 @@ fn header(number: u64) -> Header {
         excess_blob_gas: Some(0),
         parent_beacon_block_root: Some(B256::ZERO),
         ..Default::default()
-    }
+    })
 }
 
 fn block_rlp(header: Header) -> Vec<u8> {
-    let block = alloy_consensus::Block::<TxEnvelope> {
+    let block = alloy_consensus::Block::<TxEnvelope, Header> {
         header,
         body: BlockBody { transactions: Vec::new(), ommers: Vec::new(), withdrawals: Some(Withdrawals::new(Vec::new())) },
     };
@@ -478,7 +479,7 @@ async fn a_check_only_answer_vouches_only_for_the_block_asked_about() {
     env();
     let block = B256::repeat_byte(0x11);
     let other = B256::repeat_byte(0x22);
-    let header_rlp = alloy_rlp::encode(Header { number: 7, ..Default::default() });
+    let header_rlp = alloy_rlp::encode(Header::from(alloy_consensus::Header { number: 7, ..Default::default() }));
     // The answer is chosen by the header's number byte: 1 the block, 2 another
     // build, 3 an ERROR, 4 a SYNCING status.
     let answer = Arc::new(Mutex::new(1u8));

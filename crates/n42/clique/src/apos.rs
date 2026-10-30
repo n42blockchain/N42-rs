@@ -142,7 +142,7 @@ impl Error for AposError {}
 /// Ethereum testnet following the Ropsten attacks.
 pub struct APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header>
+    Provider: HeaderProvider<Header: Into<reth_primitives_traits::Header>>
         + BlockIdReader
         + BlockReaderIdExt
         + Clone
@@ -159,7 +159,7 @@ where
     eth_signer: RwLock<Option<LocalSigner<SigningKey>>>,
     //  Provider,
     provider: Provider,
-    recent_headers: RwLock<schnellru::LruMap<B256, Provider::Header>>, // Recent headers for snapshot
+    recent_headers: RwLock<schnellru::LruMap<B256, reth_primitives_traits::Header>>, // Recent headers for snapshot
     recent_tds: RwLock<schnellru::LruMap<B256, U256>>,
     recent_tds_inited: AtomicBool,
     recent_cached_reads: RwLock<schnellru::LruMap<B256, CachedReads>>,
@@ -169,7 +169,7 @@ where
 // signers set to the ones provided by the user.
 impl<Provider, ChainSpec> APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header>
+    Provider: HeaderProvider<Header: Into<reth_primitives_traits::Header>>
         + BlockIdReader
         + BlockReaderIdExt
         + Clone
@@ -350,7 +350,7 @@ where
         };
         for block_number in start_block_number..=best_block_number {
             debug!(target: "consensus::apos", ?block_number, "init_recent_tds");
-            let header = match self.provider.header_by_number(block_number) {
+            let header = match self.provider.header_by_number(block_number).map(|h| h.map(Into::<reth_primitives_traits::Header>::into)) {
                 Ok(Some(h)) => h,
                 Ok(None) => {
                     warn!(target: "consensus::apos", ?block_number, "header not found during init_recent_tds");
@@ -419,9 +419,9 @@ where
         &self,
         number: u64,
         hash: B256,
-        parents: Option<Vec<Provider::Header>>,
+        parents: Option<Vec<reth_primitives_traits::Header>>,
     ) -> Result<Snapshot, ConsensusError> {
-        let mut headers: Vec<Provider::Header> = Vec::new();
+        let mut headers: Vec<reth_primitives_traits::Header> = Vec::new();
         let mut snap: Option<Snapshot> = None;
         let mut hash = hash;
         let mut number = number;
@@ -468,7 +468,7 @@ where
                             .map_err(|_| ConsensusError::UnknownBlock)?
                             .is_none()))
             {
-                if let Ok(Some(checkpoint)) = self.provider.header_by_number(number) {
+                if let Ok(Some(checkpoint)) = self.provider.header_by_number(number).map(|h| h.map(Into::<reth_primitives_traits::Header>::into)) {
                     debug!(target: "consensus::apos", "checkpoint={:?}", checkpoint);
                     let hash = checkpoint.hash_slow();
                     //info!(target: "consensus::apos", "snapshot() : number={}, hash_slow hash={:?}", number, hash);
@@ -520,7 +520,7 @@ where
                 .header_by_hash_or_number(hash.into())
                 .map_err(|_| ConsensusError::UnknownBlock)?
             {
-                header
+                header.into()
             } else {
                 error!(target: "consensus::apos", "hash not found: {:?}", hash);
                 return Err(ConsensusError::UnknownBlock);
@@ -542,7 +542,7 @@ where
             .ok_or(ConsensusError::AposErrorDetail {
                 detail: "snapshot not found".to_string(),
             })?
-            .apply::<_, Provider::Header>(headers, |header| {
+            .apply::<_, reth_primitives_traits::Header>(headers, |header| {
                 let signer = recover_address_generic(&header)?;
                 Ok(signer)
             })
@@ -578,7 +578,7 @@ where
     ChainSpec: EthChainSpec + EthereumHardforks,
     Provider: 'static
         + Clone
-        + HeaderProvider<Header = reth_primitives_traits::Header>
+        + HeaderProvider<Header: Into<reth_primitives_traits::Header>>
         + BlockIdReader
         + BlockReaderIdExt
         + Unpin,
@@ -596,7 +596,7 @@ where
     ChainSpec: EthChainSpec + EthereumHardforks,
     Provider: 'static
         + Clone
-        + HeaderProvider<Header = reth_primitives_traits::Header>
+        + HeaderProvider<Header: Into<reth_primitives_traits::Header>>
         + BlockIdReader
         + BlockReaderIdExt
         + Unpin,
@@ -736,9 +736,51 @@ where
     }
 }
 
+/// The node's header type: an APoS header never carries gov5's registry
+/// root, so its Ethereum view (same fields, same hash) is validated.
+impl<Provider, ChainSpec> HeaderValidator<n42_header::N42Header> for APos<Provider, ChainSpec>
+where
+    ChainSpec: EthChainSpec + EthereumHardforks,
+    Provider: 'static
+        + Clone
+        + HeaderProvider<Header: Into<reth_primitives_traits::Header>>
+        + BlockIdReader
+        + BlockReaderIdExt
+        + Unpin,
+{
+    fn validate_header(&self, header: &SealedHeader<n42_header::N42Header>) -> Result<(), ConsensusError> {
+        if header.mobile_registry_root.is_some() {
+            return Err(ConsensusError::AposErrorDetail {
+                detail: "an APoS header carries no mobileRegistryRoot".to_string(),
+            });
+        }
+        HeaderValidator::<Header>::validate_header(self, &n42_header::seal_to_alloy(header))
+    }
+
+    fn validate_header_against_parent(
+        &self,
+        header: &SealedHeader<n42_header::N42Header>,
+        parent: &SealedHeader<n42_header::N42Header>,
+    ) -> Result<(), ConsensusError> {
+        HeaderValidator::<Header>::validate_header_against_parent(
+            self,
+            &n42_header::seal_to_alloy(header),
+            &n42_header::seal_to_alloy(parent),
+        )
+    }
+
+    /// As the Ethereum header's: APoS checks headers one at a time.
+    fn validate_header_range(
+        &self,
+        _headers: &[SealedHeader<n42_header::N42Header>],
+    ) -> Result<(), HeaderConsensusError<n42_header::N42Header>> {
+        Ok(())
+    }
+}
+
 impl<Provider, ChainSpec, N> FullConsensus<N> for APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header>
+    Provider: HeaderProvider<Header: Into<reth_primitives_traits::Header>>
         + BlockIdReader
         + BlockReaderIdExt
         + Clone
@@ -763,7 +805,7 @@ where
 
 impl<Provider, ChainSpec, B> Consensus<B> for APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header>
+    Provider: HeaderProvider<Header: Into<reth_primitives_traits::Header>>
         + BlockIdReader
         + BlockReaderIdExt
         + Clone
@@ -1042,7 +1084,7 @@ where
 
         // TD is no longer stored in the database (removed in reth v1.11.0 for PoS).
         // Try to calculate from parent TD in the in-memory cache.
-        if let Ok(Some(header)) = self.provider.header(hash) {
+        if let Ok(Some(header)) = self.provider.header(hash).map(|h| h.map(Into::<reth_primitives_traits::Header>::into)) {
             let parent_hash = header.parent_hash();
             let parent_td = match self.recent_tds.write() {
                 Ok(mut recent_tds) => recent_tds.get(&parent_hash).copied(),
@@ -1117,7 +1159,7 @@ where
 
 impl<Provider, ChainSpec> SignerManager for APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header>
+    Provider: HeaderProvider<Header: Into<reth_primitives_traits::Header>>
         + BlockIdReader
         + BlockReaderIdExt
         + Clone

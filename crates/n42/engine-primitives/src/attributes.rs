@@ -39,13 +39,14 @@ impl<ChainSpec> N42PayloadAttributesBuilder<ChainSpec> {
     }
 }
 
-impl<ChainSpec> PayloadAttributesBuilder<EthPayloadAttributes>
+impl<ChainSpec, H> PayloadAttributesBuilder<EthPayloadAttributes, H>
     for N42PayloadAttributesBuilder<ChainSpec>
 where
     ChainSpec: Send + Sync + EthereumHardforks + 'static,
+    H: reth_primitives_traits::BlockHeader,
 {
-    fn build(&self, parent: &reth_primitives_traits::SealedHeader) -> EthPayloadAttributes {
-        let timestamp = parent.timestamp;
+    fn build(&self, parent: &reth_primitives_traits::SealedHeader<H>) -> EthPayloadAttributes {
+        let timestamp = alloy_consensus::BlockHeader::timestamp(parent.header());
         EthPayloadAttributes {
             timestamp,
             prev_randao: B256::ZERO,
@@ -96,7 +97,8 @@ where
         header.timestamp = timestamp;
         let sealed_header = SealedHeader::new(header, Default::default());
 
-        let mut payload_attributes = self.build(&sealed_header);
+        let mut payload_attributes =
+            <Self as PayloadAttributesBuilder<EthPayloadAttributes>>::build(self, &sealed_header);
         payload_attributes.withdrawals = withdrawals;
         payload_attributes.prev_randao = prev_randao;
 

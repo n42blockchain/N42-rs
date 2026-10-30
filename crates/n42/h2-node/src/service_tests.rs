@@ -103,7 +103,7 @@ async fn node_in_with_vote_log(
 /// A block of the mock's shape and the gov5 RLP it travels as.
 fn block(number: u64, parent: B256) -> (B256, Header, alloy_primitives::Bytes) {
     let built = MockExecutionLayer::built_block_on(number, parent);
-    let header = built.execution_data.clone().into_block_raw().expect("raw block").header;
+    let header = n42_h2_consensus::N42Header::from(built.execution_data.clone().into_block_raw().expect("raw block").header);
     let rlp = n42_h2_net::encode_block_rlp_raw(&header, &[], &[], None);
     (header.hash_slow(), header, alloy_primitives::Bytes::from(rlp))
 }
@@ -391,7 +391,7 @@ async fn remembered_blocks_are_bounded_and_carry_their_number_and_stamp() {
     assert_eq!(rig.svc.block_seen[&hash], first_seen, "and keeps its first arrival");
 
     for i in 0..REMEMBERED_TIMESTAMPS as u64 {
-        let h = Header { number: 100 + i, ..Default::default() };
+        let h = Header::from(alloy_consensus::Header { number: 100 + i, ..Default::default() });
         rig.svc.remember_block(B256::left_padding_from(&(i + 1000).to_be_bytes()), &h);
     }
     assert_eq!(rig.svc.timestamp_order.len(), REMEMBERED_TIMESTAMPS);
@@ -492,7 +492,7 @@ async fn rig_at_genesis_with_a_layer_at_five() -> Rig {
         within(rig.el.new_payload(built.execution_data)).await.expect("accepted");
     }
     // The genesis header is always known to a real node.
-    let genesis = Header { number: 0, ..Default::default() };
+    let genesis = Header::from(alloy_consensus::Header { number: 0, ..Default::default() });
     rig.svc.block_headers.insert(ID.genesis_hash, genesis);
     rig
 }
@@ -545,7 +545,7 @@ async fn a_block_held_too_long_reads_the_layer_and_is_released() {
 #[tokio::test]
 async fn a_lagging_layer_still_holds_a_far_ahead_block_after_the_forced_read() {
     let mut rig = node(1, 0, None).await;
-    let genesis = Header { number: 0, ..Default::default() };
+    let genesis = Header::from(alloy_consensus::Header { number: 0, ..Default::default() });
     rig.svc.block_headers.insert(ID.genesis_hash, genesis);
     let (hash, _, rlp) = block(4, B256::repeat_byte(9));
     rig.svc.handle_direct_body(rlp.into());
@@ -567,7 +567,7 @@ async fn the_held_list_is_bounded_and_drops_the_oldest() {
     rig.svc.note_imported(parent.number);
     let mut hashes = Vec::new();
     for i in 0..(MAX_HELD_BODIES as u64 + 2) {
-        let header = Header { number: 500 + i, parent_hash: B256::repeat_byte(1), ..Default::default() };
+        let header = Header::from(alloy_consensus::Header { number: 500 + i, parent_hash: B256::repeat_byte(1), ..Default::default() });
         let hash = B256::left_padding_from(&(i + 1).to_be_bytes());
         rig.svc.remember_block(hash, &header);
         hashes.push(hash);
@@ -578,7 +578,7 @@ async fn the_held_list_is_bounded_and_drops_the_oldest() {
     }
     // The bound on remembered headers dropped the early ones; give them back.
     for (i, hash) in hashes.iter().enumerate() {
-        let header = Header { number: 500 + i as u64, parent_hash: B256::repeat_byte(1), ..Default::default() };
+        let header = Header::from(alloy_consensus::Header { number: 500 + i as u64, parent_hash: B256::repeat_byte(1), ..Default::default() });
         rig.svc.block_headers.insert(*hash, header);
     }
     let mut events = Vec::new();
@@ -1070,14 +1070,14 @@ mod mesh_tests;
 /// payload a whole answer gives and the one an elided answer gives.
 fn whole_and_elided() -> (alloy_rpc_types_engine::ExecutionData, alloy_rpc_types_engine::ExecutionData, Header, Vec<B256>) {
     let withdrawals = vec![alloy_eips::eip4895::Withdrawal { index: 0, validator_index: 0, address: Address::repeat_byte(3), amount: 1_000_000_000 }];
-    let header = Header {
+    let header = Header::from(alloy_consensus::Header {
         number: 9,
         base_fee_per_gas: Some(7),
         gas_limit: 30_000_000,
         withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
         ..Default::default()
-    };
-    let block = alloy_consensus::Block::<alloy_consensus::TxEnvelope> {
+    });
+    let block = alloy_consensus::Block::<alloy_consensus::TxEnvelope, Header> {
         header: header.clone(),
         body: alloy_consensus::BlockBody {
             transactions: Vec::new(),
@@ -1144,7 +1144,7 @@ async fn a_block_taken_elided_is_served_from_the_execution_layer_on_demand() {
         .await
         .expect("a job")
         .expect("built");
-    let header = built.execution_data.clone().into_block_raw().expect("raw block").header;
+    let header = n42_h2_consensus::N42Header::from(built.execution_data.clone().into_block_raw().expect("raw block").header);
     let hash = header.hash_slow();
     assert!(rig.svc.elided_body(hash).await.is_none(), "a block not taken elided is not fetched this way");
 
@@ -1318,7 +1318,7 @@ async fn check_ahead_unheld_hands_a_far_ahead_block_to_the_driver_up_to_the_queu
         let mut hashes = Vec::new();
         for number in 1..=4 {
             let built = MockExecutionLayer::built_block_on(number, parent);
-            let header = built.execution_data.clone().into_block_raw().expect("raw block").header;
+            let header = n42_h2_consensus::N42Header::from(built.execution_data.clone().into_block_raw().expect("raw block").header);
             let rlp = n42_h2_net::encode_block_rlp_raw(&header, &[], &[], None);
             rig.svc.remember_block(built.hash, &header);
             rig.svc.driver.cache_payload(built.hash, built.execution_data.clone());

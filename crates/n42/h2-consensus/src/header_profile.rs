@@ -42,6 +42,8 @@ use alloy_rpc_types_engine::{
     PraguePayloadFields,
 };
 use n42_h2_primitives::bls::{BlsPublicKey, BlsSecretKey, BlsSignature};
+pub use n42_header::N42Header;
+use n42_header::engine::{block_with_payload_root, put_header_tail};
 
 /// Which header shape a chain's blocks have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -252,6 +254,63 @@ pub enum HeaderProfileError {
     /// A payload could not be turned back into a block.
     #[error("execution payload cannot reconstruct a block: {0}")]
     Reconstruction(String),
+    /// A Glamsterdam header without EIP-7843's slot number.
+    #[error("block {0}: the slot number is missing from Glamsterdam")]
+    SlotNumberMissing(u64),
+    /// A slot number before Glamsterdam.
+    #[error("block {0}: a slot number before Glamsterdam")]
+    SlotNumberUnexpected(u64),
+    /// A slot number other than the block number.
+    #[error("block {number}: slot number {slot} is not the block number")]
+    SlotNumberMismatch {
+        /// The header's block number.
+        number: u64,
+        /// The slot number it carries.
+        slot: u64,
+    },
+    /// A header past MobileAnchor and Glamsterdam without `mobileRegistryRoot`.
+    #[error("block {0}: mobileRegistryRoot is missing")]
+    MobileRegistryRootMissing(u64),
+    /// A `mobileRegistryRoot` where the schedule puts none.
+    #[error("block {0}: mobileRegistryRoot before MobileAnchor and Glamsterdam")]
+    MobileRegistryRootUnexpected(u64),
+}
+
+/// Which of the header's trailing fields the chain's schedule asks for at the
+/// header's time (`docs/HEADER_FIELD_PARITY.md` section 4). Read from the
+/// genesis by the caller: `reth_chainspec::qmdb::glamsterdam_active_at` and
+/// `mobile_registry_root_in_header_at`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HeaderTailRules {
+    /// gov5's `IsGlamsterdam`: the slot number (element 23) is required and
+    /// equals the block number; before it, it is forbidden.
+    pub slot_number: bool,
+    /// gov5's `IsMobileRegistryRootInHeader` (MobileAnchor and Glamsterdam):
+    /// `mobileRegistryRoot` (element 24) is required; otherwise forbidden.
+    pub mobile_registry_root: bool,
+}
+
+/// gov5's presence rules for the slot number and `mobileRegistryRoot`.
+///
+/// Presence only: the root's *value* is not checked. gov5 derives it from
+/// its mobile registry state, which this node does not keep; a follower here
+/// accepts the root the leader committed to, and the header hash (which
+/// covers it) is what consensus agreed on (`docs/HEADER_FIELD_PARITY.md`
+/// section 6).
+pub fn validate_gov5_header_tail(header: &N42Header, rules: HeaderTailRules) -> Result<(), HeaderProfileError> {
+    match (rules.slot_number, header.slot_number) {
+        (true, None) => return Err(HeaderProfileError::SlotNumberMissing(header.number)),
+        (false, Some(_)) => return Err(HeaderProfileError::SlotNumberUnexpected(header.number)),
+        (true, Some(slot)) if slot != header.number => {
+            return Err(HeaderProfileError::SlotNumberMismatch { number: header.number, slot })
+        }
+        _ => {}
+    }
+    match (rules.mobile_registry_root, header.mobile_registry_root) {
+        (true, None) => Err(HeaderProfileError::MobileRegistryRootMissing(header.number)),
+        (false, Some(_)) => Err(HeaderProfileError::MobileRegistryRootUnexpected(header.number)),
+        _ => Ok(()),
+    }
 }
 
 /// The view a header was proposed in.
@@ -280,7 +339,10 @@ pub fn validate_gov5_h2_header(header: &Header) -> Result<HeaderExtra, HeaderPro
 /// The hash the leader signs: the header with the trailing seal removed
 /// (gov5 `sealHash`, which strips 96 bytes only when there is more than a
 /// seal's worth of extra data).
-pub fn seal_hash(header: &Header) -> B256 {
+///
+/// Over the whole N42 header: gov5's `sealHash` hashes every element,
+/// `mobileRegistryRoot` included.
+pub fn seal_hash(header: &N42Header) -> B256 {
     let mut unsealed = header.clone();
     if unsealed.extra_data.len() > EXTRA_SEAL_LEN {
         let keep = unsealed.extra_data.len() - EXTRA_SEAL_LEN;
@@ -291,7 +353,7 @@ pub fn seal_hash(header: &Header) -> B256 {
 
 /// Signs the seal into the header's reserved trailing bytes, as gov5's `Seal`
 /// does. The header's hash changes; re-hash after.
-pub fn seal_header(header: &mut Header, key: &BlsSecretKey) -> Result<(), HeaderProfileError> {
+pub fn seal_header(header: &mut N42Header, key: &BlsSecretKey) -> Result<(), HeaderProfileError> {
     let extra = HeaderExtra::decode(&header.extra_data)?;
     if extra.seal.is_none() {
         return Err(HeaderProfileError::NoSeal);
@@ -307,7 +369,7 @@ pub fn seal_header(header: &mut Header, key: &BlsSecretKey) -> Result<(), Header
 }
 
 /// Checks the seal against a leader's public key.
-pub fn verify_seal(header: &Header, leader: &BlsPublicKey) -> Result<(), HeaderProfileError> {
+pub fn verify_seal(header: &N42Header, leader: &BlsPublicKey) -> Result<(), HeaderProfileError> {
     let extra = HeaderExtra::decode(&header.extra_data)?;
     let seal = extra.seal.ok_or(HeaderProfileError::NoSeal)?;
     let signature =
@@ -375,7 +437,7 @@ pub fn gov5_receipts_root<'a>(receipts: impl IntoIterator<Item = ReceiptView<'a>
 /// hash gets the empty list, which every `newPayload` version accepts; one
 /// with real requests is handed over by hash, which an execution layer
 /// accepts only where its API allows it.
-pub fn execution_data_for_block(block_hash: B256, block: &Block<TxEnvelope>) -> ExecutionData {
+pub fn execution_data_for_block(block_hash: B256, block: &Block<TxEnvelope, N42Header>) -> ExecutionData {
     execution_data_for_block_with_bal(block_hash, block, None)
 }
 
@@ -391,7 +453,7 @@ pub fn execution_data_for_block(block_hash: B256, block: &Block<TxEnvelope>) -> 
 /// test says so.
 pub fn execution_data_from_raw_parts(
     block_hash: B256,
-    header: &alloy_consensus::Header,
+    header: &N42Header,
     transactions: Vec<alloy_primitives::Bytes>,
     withdrawals: Vec<alloy_eips::eip4895::Withdrawal>,
     bal: Option<alloy_primitives::Bytes>,
@@ -439,6 +501,7 @@ pub fn execution_data_from_raw_parts(
                     payload_inner: v3,
                     block_access_list,
                     slot_number: header.number,
+                    mobile_registry_root: None,
                 }),
                 None => ExecutionPayload::V3(v3),
             }
@@ -458,7 +521,21 @@ pub fn execution_data_from_raw_parts(
             }
         }
     };
-    ExecutionData::new(payload, sidecar)
+    ExecutionData::new(with_header_tail(payload, header), sidecar)
+}
+
+/// The header's slot number and registry root on its payload
+/// ([`n42_header::engine::put_header_tail`]). A root on a header with no
+/// Cancun fields has no payload form: it is reported, and the payload then
+/// cannot reproduce the block's hash, so the execution layer refuses it.
+fn with_header_tail(payload: ExecutionPayload, header: &N42Header) -> ExecutionPayload {
+    match put_header_tail(payload.clone(), header) {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::error!(target: "n42::h2", %err, "the registry root has no payload form; the block will not reproduce");
+            payload
+        }
+    }
 }
 
 /// [`execution_data_for_block`], carrying an EIP-7928 access list.
@@ -469,7 +546,7 @@ pub fn execution_data_from_raw_parts(
 /// carry its list or it cannot be imported.
 pub fn execution_data_for_block_with_bal(
     block_hash: B256,
-    block: &Block<TxEnvelope>,
+    block: &Block<TxEnvelope, N42Header>,
     bal: Option<alloy_primitives::Bytes>,
 ) -> ExecutionData {
     let payload = ExecutionPayload::from_block_unchecked(block_hash, block).0;
@@ -513,6 +590,7 @@ pub fn execution_data_for_block_with_bal(
                     payload_inner: v3,
                     block_access_list,
                     slot_number: block.header.number,
+                    mobile_registry_root: None,
                 },
             ),
             // alloy's `from_block_unchecked` already produces a V4 payload for a
@@ -531,7 +609,7 @@ pub fn execution_data_for_block_with_bal(
         },
         None => payload,
     };
-    ExecutionData::new(payload, sidecar)
+    ExecutionData::new(with_header_tail(payload, &block.header), sidecar)
 }
 
 /// The block a payload describes, with the header fields a payload cannot
@@ -543,12 +621,12 @@ pub fn execution_data_for_block_with_bal(
 /// wire is not the block that was hashed.
 pub fn reconstruct_gov5_h2_block<T: alloy_eips::Decodable2718>(
     execution: &ExecutionData,
-) -> Result<Block<T>, HeaderProfileError> {
+) -> Result<Block<T, N42Header>, HeaderProfileError> {
     let block = execution
         .clone()
         .try_into_block::<T>()
         .map_err(|e| HeaderProfileError::Reconstruction(e.to_string()))?;
-    reconstruct_gov5_h2_block_from(block, execution)
+    reconstruct_gov5_h2_block_from(block_with_payload_root(block, &execution.payload), execution)
 }
 
 /// [`reconstruct_gov5_h2_block`] for a caller that has already decoded the
@@ -560,10 +638,13 @@ pub fn reconstruct_gov5_h2_block<T: alloy_eips::Decodable2718>(
 /// hash, and once inside reth's own well-formedness check. Everything this
 /// function does on top is header arithmetic: a handful of candidate headers,
 /// each hashed once.
+///
+/// `block` is the payload's block with the payload's registry root
+/// ([`n42_header::engine::block_with_payload_root`]).
 pub fn reconstruct_gov5_h2_block_from<T>(
-    block: Block<T>,
+    block: Block<T, N42Header>,
     execution: &ExecutionData,
-) -> Result<Block<T>, HeaderProfileError> {
+) -> Result<Block<T, N42Header>, HeaderProfileError> {
     reconstruct_gov5_h2_block_from_or_tx_root(block, execution, || None)
 }
 
@@ -574,10 +655,10 @@ pub fn reconstruct_gov5_h2_block_from<T>(
 /// guessed the frame tree for a block its sealer rooted by MPT (their frame
 /// indexes differ) confirms the other root by the hash.
 pub fn reconstruct_gov5_h2_block_from_or_tx_root<T>(
-    mut block: Block<T>,
+    mut block: Block<T, N42Header>,
     execution: &ExecutionData,
     alternate: impl FnOnce() -> Option<B256>,
-) -> Result<Block<T>, HeaderProfileError> {
+) -> Result<Block<T, N42Header>, HeaderProfileError> {
     let expected = execution.block_hash();
     validate_gov5_h2_header(&block.header)?;
     // Two more fields a payload cannot carry as gov5 wrote them: the
@@ -694,23 +775,23 @@ pub fn normalize_to_gov5_h2(
 /// that header's hash, and a hash that differed by one field would be a
 /// block the leader could not propose.
 pub fn gov5_h2_header_for_view(
-    header: alloy_consensus::Header,
+    header: N42Header,
     withdrawals: &[alloy_eips::eip4895::Withdrawal],
     view: u64,
     sealer: Option<&BlsSecretKey>,
-) -> Result<alloy_consensus::Header, HeaderProfileError> {
+) -> Result<N42Header, HeaderProfileError> {
     gov5_h2_header_for_view_with_qc(header, withdrawals, view, &[], sealer)
 }
 
 /// [`gov5_h2_header_for_view`] with the leader's last committed QC embedded
 /// (gov5's encoding; empty embeds none, gov5's shape before its first commit).
 pub fn gov5_h2_header_for_view_with_qc(
-    mut header: alloy_consensus::Header,
+    mut header: N42Header,
     withdrawals: &[alloy_eips::eip4895::Withdrawal],
     view: u64,
     committed_qc: &[u8],
     sealer: Option<&BlsSecretKey>,
-) -> Result<alloy_consensus::Header, HeaderProfileError> {
+) -> Result<N42Header, HeaderProfileError> {
     header.ommers_hash = B256::ZERO;
     header.difficulty = U256::ZERO;
     header.nonce = Default::default();
@@ -737,23 +818,23 @@ pub fn gov5_h2_header_for_view_with_qc(
 /// touched: the general path decodes 163,000 of them to construct this same
 /// header and encodes them back, 130 ms at that tier, for two fields.
 pub fn normalize_to_gov5_h2_from_header(
-    header: alloy_consensus::Header,
+    header: N42Header,
     execution: &ExecutionData,
     view: u64,
     sealer: Option<&BlsSecretKey>,
-) -> Result<(ExecutionData, alloy_consensus::Header), HeaderProfileError> {
+) -> Result<(ExecutionData, N42Header), HeaderProfileError> {
     normalize_to_gov5_h2_from_header_with_qc(header, execution, view, &[], sealer)
 }
 
 /// [`normalize_to_gov5_h2_from_header`] with the leader's last committed QC
 /// embedded (gov5's encoding; empty embeds none).
 pub fn normalize_to_gov5_h2_from_header_with_qc(
-    header: alloy_consensus::Header,
+    header: N42Header,
     execution: &ExecutionData,
     view: u64,
     committed_qc: &[u8],
     sealer: Option<&BlsSecretKey>,
-) -> Result<(ExecutionData, alloy_consensus::Header), HeaderProfileError> {
+) -> Result<(ExecutionData, N42Header), HeaderProfileError> {
     let withdrawals = execution.payload.as_v2().map_or(&[][..], |v2| v2.withdrawals.as_slice());
     let header = gov5_h2_header_for_view_with_qc(header, withdrawals, view, committed_qc, sealer)?;
     let hash = header.hash_slow();
@@ -763,6 +844,8 @@ pub fn normalize_to_gov5_h2_from_header_with_qc(
     v1.block_hash = hash;
     v1.difficulty = header.difficulty;
     v1.nonce = header.nonce;
+    // The root is the header's: the sealed payload must name what was hashed.
+    data.payload = with_header_tail(data.payload, &header);
     Ok((data, header))
 }
 
@@ -778,7 +861,7 @@ pub fn normalize_to_gov5_h2_with_header(
     execution: &ExecutionData,
     view: u64,
     sealer: Option<&BlsSecretKey>,
-) -> Result<(ExecutionData, alloy_consensus::Header), HeaderProfileError> {
+) -> Result<(ExecutionData, N42Header), HeaderProfileError> {
     normalize_to_gov5_h2_with_header_with_qc(execution, view, &[], sealer)
 }
 
@@ -789,14 +872,15 @@ pub fn normalize_to_gov5_h2_with_header_with_qc(
     view: u64,
     committed_qc: &[u8],
     sealer: Option<&BlsSecretKey>,
-) -> Result<(ExecutionData, alloy_consensus::Header), HeaderProfileError> {
+) -> Result<(ExecutionData, N42Header), HeaderProfileError> {
     // Raw: the transactions stay the bytes the payload carries, so a block
     // with a transaction type this crate does not model (N42's 0x50) seals
     // like any other, and 163,000 of them are not decoded to be re-encoded.
-    let mut block = execution
+    let block = execution
         .clone()
         .into_block_raw()
         .map_err(|e| HeaderProfileError::Reconstruction(e.to_string()))?;
+    let mut block = block_with_payload_root(block, &execution.payload);
     block.header.ommers_hash = B256::ZERO;
     block.header.difficulty = U256::ZERO;
     block.header.nonce = Default::default();
@@ -839,10 +923,10 @@ pub fn normalize_to_gov5_h2_with_header_with_qc(
 /// block's rewards as its withdrawals; a header without a withdrawals root
 /// gets no withdrawals list, and its rewards must be none.
 pub fn block_for_header_with_rewards(
-    header: Header,
+    header: N42Header,
     transactions: Vec<TxEnvelope>,
     rewards: &[(Address, U256)],
-) -> Result<Block<TxEnvelope>, HeaderProfileError> {
+) -> Result<Block<TxEnvelope, N42Header>, HeaderProfileError> {
     let withdrawals = match header.withdrawals_root {
         Some(_) => Some(Withdrawals(rewards_to_withdrawals(rewards)?)),
         None if rewards.is_empty() => None,
@@ -860,7 +944,7 @@ pub fn block_for_header_with_rewards(
 
 /// A block body with these transactions and, on a post-Shanghai header, the
 /// empty withdrawals list that its empty withdrawals root implies.
-pub fn block_for_header(header: Header, transactions: Vec<TxEnvelope>) -> Block<TxEnvelope> {
+pub fn block_for_header(header: N42Header, transactions: Vec<TxEnvelope>) -> Block<TxEnvelope, N42Header> {
     let withdrawals = header
         .withdrawals_root
         .map(|_| alloy_eips::eip4895::Withdrawals::default());
@@ -953,7 +1037,7 @@ mod tests {
         // which wrapped in a V4 variant is an object no execution layer would
         // ever produce. The first version of this test did exactly that and
         // spent two rounds looking like a reconstruction bug.
-        let header = Header {
+        let header = N42Header::from(Header {
             number: 3,
             withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
             block_access_list_hash: Some(bal_hash),
@@ -963,7 +1047,7 @@ mod tests {
             ommers_hash: B256::ZERO,
             difficulty: U256::ZERO,
             ..Default::default()
-        };
+        });
         let block = Block {
             header: header.clone(),
             body: alloy_consensus::BlockBody {
@@ -1048,14 +1132,14 @@ mod tests {
             (Some(B256::repeat_byte(5)), None),
             (Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH), Some(alloy_primitives::Bytes::from_static(&[0xc0]))),
         ] {
-            let header = Header {
+            let header = N42Header::from(Header {
                 number: 7, gas_limit: 30_000_000, gas_used: 42_000, timestamp: 1_700_000_000, base_fee_per_gas: Some(7),
                 withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH), blob_gas_used: Some(0), excess_blob_gas: Some(0),
                 parent_beacon_block_root: Some(B256::repeat_byte(9)), requests_hash,
                 block_access_list_hash: bal.as_ref().map(|_| B256::repeat_byte(6)),
                 transactions_root: alloy_consensus::proofs::calculate_transaction_root(&txs),
                 ..Default::default()
-            };
+            });
             let block = Block { header: header.clone(), body: alloy_consensus::BlockBody { transactions: txs.clone(), ommers: Vec::new(), withdrawals: Some(Withdrawals(withdrawals.clone())) } };
             let hash = header.hash_slow();
             let typed = execution_data_for_block_with_bal(hash, &block, bal.clone());
@@ -1069,7 +1153,7 @@ mod tests {
     /// body its own execution layer rebuilds under a different hash.
     #[test]
     fn sealing_from_the_header_matches_sealing_from_the_payload() {
-        let header = Header {
+        let header = N42Header::from(Header {
             number: 7,
             gas_limit: 30_000_000,
             gas_used: 21_000,
@@ -1083,7 +1167,7 @@ mod tests {
             difficulty: U256::from(1),
             ommers_hash: alloy_consensus::EMPTY_OMMER_ROOT_HASH,
             ..Default::default()
-        };
+        });
         let block = Block {
             header: header.clone(),
             body: alloy_consensus::BlockBody {
@@ -1119,7 +1203,7 @@ mod tests {
             address: alloy_primitives::Address::repeat_byte(0x42),
             amount: 5,
         }];
-        let header = Header {
+        let header = N42Header::from(Header {
             number: 41,
             parent_hash: B256::repeat_byte(1),
             gas_limit: 30_000_000,
@@ -1136,7 +1220,7 @@ mod tests {
             difficulty: U256::from(1),
             ommers_hash: alloy_consensus::EMPTY_OMMER_ROOT_HASH,
             ..Default::default()
-        };
+        });
         let block = Block {
             header: header.clone(),
             body: alloy_consensus::BlockBody {
@@ -1198,8 +1282,8 @@ mod tests {
         assert_eq!(root, GOV5_RECEIPTS_TWO);
     }
 
-    fn fixture_header() -> Header {
-        Header {
+    fn fixture_header() -> N42Header {
+        N42Header::from(Header {
             parent_hash: B256::repeat_byte(1),
             ommers_hash: B256::ZERO,
             beneficiary: address!("f39fd6e51aad88f6f4ce6ab8827279cfffb92266"),
@@ -1218,7 +1302,7 @@ mod tests {
             parent_beacon_block_root: Some(B256::ZERO),
             requests_hash: Some(EMPTY_REQUESTS_HASH),
             ..Default::default()
-        }
+        })
     }
 
     #[test]
@@ -1375,4 +1459,58 @@ mod tests {
     }
 
     include!("header_profile_fixture.rs");
+
+    /// gov5's presence rules for the slot number and the registry root, both
+    /// directions of each (`validate_gov5_header_tail`).
+    #[test]
+    fn the_header_tail_is_present_exactly_when_the_schedule_says() {
+        let tail = |slot: Option<u64>, root: Option<B256>| {
+            let mut header = N42Header::from(Header { number: 77, ..Default::default() });
+            header.slot_number = slot;
+            header.mobile_registry_root = root;
+            header
+        };
+        let before = HeaderTailRules::default();
+        let glamsterdam = HeaderTailRules { slot_number: true, mobile_registry_root: false };
+        let anchored = HeaderTailRules { slot_number: true, mobile_registry_root: true };
+        let root = Some(B256::repeat_byte(0x24));
+
+        // Before Glamsterdam: neither field.
+        assert!(validate_gov5_header_tail(&tail(None, None), before).is_ok());
+        assert!(matches!(
+            validate_gov5_header_tail(&tail(Some(77), None), before),
+            Err(HeaderProfileError::SlotNumberUnexpected(77))
+        ));
+        assert!(matches!(
+            validate_gov5_header_tail(&tail(None, root), before),
+            Err(HeaderProfileError::MobileRegistryRootUnexpected(77))
+        ));
+
+        // Glamsterdam: the slot, equal to the number; no root yet.
+        assert!(validate_gov5_header_tail(&tail(Some(77), None), glamsterdam).is_ok());
+        assert!(matches!(
+            validate_gov5_header_tail(&tail(None, None), glamsterdam),
+            Err(HeaderProfileError::SlotNumberMissing(77))
+        ));
+        assert!(matches!(
+            validate_gov5_header_tail(&tail(Some(78), None), glamsterdam),
+            Err(HeaderProfileError::SlotNumberMismatch { number: 77, slot: 78 })
+        ));
+        assert!(matches!(
+            validate_gov5_header_tail(&tail(Some(77), root), glamsterdam),
+            Err(HeaderProfileError::MobileRegistryRootUnexpected(77))
+        ));
+
+        // MobileAnchor and Glamsterdam: both; any root value is accepted.
+        assert!(validate_gov5_header_tail(&tail(Some(77), root), anchored).is_ok());
+        assert!(validate_gov5_header_tail(&tail(Some(77), Some(B256::ZERO)), anchored).is_ok());
+        assert!(matches!(
+            validate_gov5_header_tail(&tail(Some(77), None), anchored),
+            Err(HeaderProfileError::MobileRegistryRootMissing(77))
+        ));
+        assert!(matches!(
+            validate_gov5_header_tail(&tail(None, root), anchored),
+            Err(HeaderProfileError::SlotNumberMissing(77))
+        ));
+    }
 }

@@ -41,7 +41,7 @@ use crate::fast_transfer::N42EvmFactory;
 
 /// The block executor factory of a node with the transfer path: what
 /// [`execute_transfers`] requires of its EVM configuration.
-pub type FastExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<reth_chainspec::ChainSpec>;
+pub type FastExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<n42_header::N42ChainSpec>;
 
 /// The executor's phase timings, in milliseconds: partitioning, the groups'
 /// execution (wall), the merge into the block's state, the finish.
@@ -5103,11 +5103,12 @@ impl BuildPathTx for n42_tx_types::N42TxEnvelope {
 #[derive(Debug, Clone, Copy)]
 pub struct BuildPathBlock<'a, T> {
     /// The header.
-    pub header: &'a alloy_consensus::Header,
+    pub header: &'a n42_header::N42Header,
     /// The owned block, when there is one: its executor context is the
     /// configuration's own (`context_for_block`).
     pub sealed: Option<&'a reth_primitives_traits::SealedBlock<Block>>,
-    /// The ommers (a described block has none).
+    /// The ommers (a described block has none; no N42 chain has any, and
+    /// the executor's ommer rewards read Ethereum headers).
     pub ommers: &'a [alloy_consensus::Header],
     /// The withdrawals, as the block's body lists them.
     pub withdrawals: Option<&'a [alloy_eips::eip4895::Withdrawal]>,
@@ -5123,7 +5124,7 @@ impl<'a> BuildPathBlock<'a, n42_tx_types::N42TxEnvelope> {
         Self {
             header: block.header(),
             sealed: Some(block.sealed_block()),
-            ommers: &block.body().ommers,
+            ommers: &[],
             withdrawals: block.body().withdrawals.as_ref().map(|w| w.as_slice()),
             txs: &block.body().transactions,
             senders: block.senders(),
@@ -5359,7 +5360,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::{Header, Signed, TxEip1559};
+    use alloy_consensus::{Signed, TxEip1559};
+    use n42_header::N42Header as Header;
     use alloy_primitives::{Bytes, Signature, TxKind, B256};
     use reth_chainspec::MAINNET;
     use reth_ethereum_primitives::TransactionSigned;
@@ -5447,7 +5449,7 @@ mod tests {
         }
         // Past the merge on mainnet, so the serial executor pays no
         // block reward: the builder path credits only the fees.
-        let header = Header {
+        let header = n42_header::N42Header::from(alloy_consensus::Header {
             number: 20_000_000,
             beneficiary,
             gas_limit: 1_000_000_000,
@@ -5459,7 +5461,7 @@ mod tests {
             excess_blob_gas: Some(0),
             requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
             ..Default::default()
-        };
+        });
         let body = n42_tx_types::BlockBody {
             transactions: txs,
             ommers: Vec::new(),
@@ -7088,7 +7090,7 @@ mod tests {
             }
             k += run;
         }
-        let header = Header {
+        let header = n42_header::N42Header::from(alloy_consensus::Header {
             number: 20_000_000,
             beneficiary,
             gas_limit: 10_000_000_000,
@@ -7100,7 +7102,7 @@ mod tests {
             excess_blob_gas: Some(0),
             requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
             ..Default::default()
-        };
+        });
         let body = n42_tx_types::BlockBody { transactions: txs, ommers: Vec::new(), withdrawals: Some(Vec::new().into()) };
         let block = SealedBlock::seal_slow(Block { header, body });
         (RecoveredBlock::new_sealed(block, recovered), db)
@@ -7404,7 +7406,7 @@ mod tests {
                 n42_tx_types::N42TxEnvelope::from(TransactionSigned::from(signed))
             })
             .collect();
-        let header = Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() };
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() });
         let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(&header).expect("env");
         let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap_or_default())).collect();
@@ -8124,7 +8126,7 @@ mod tests {
                 envs.push(env);
             }
         }
-        let header = Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() };
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() });
         let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(&header).expect("env");
         let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap_or_default())).collect();
@@ -8316,7 +8318,7 @@ mod tests {
                 }));
             }
         }
-        let header = Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() };
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() });
         let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(&header).expect("env");
         let keys: Vec<(Address, Address)> =
@@ -8540,14 +8542,14 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let header = Header {
+        let header = n42_header::N42Header::from(alloy_consensus::Header {
             number: 20_000_000,
             beneficiary,
             gas_limit,
             base_fee_per_gas: Some(1_000_000_000),
             timestamp: 1_800_000_000,
             ..Default::default()
-        };
+        });
         let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
         (evm_config.evm_env(&header).expect("env"), envs, db)
     }

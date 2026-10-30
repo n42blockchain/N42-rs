@@ -219,6 +219,9 @@ fn main() {
                 node,
                 node_exit_future,
             } = builder
+                // The node's header is `N42Header`; its chain spec wraps the
+                // parsed one (same genesis hash) over that header.
+                .map_chainspec(n42_header::N42ChainSpec::from)
                 .node(N42Node::with_qmdb(qmdb))
                 // Restore state and deferred results before engine/RPC launch.
                 // A cold checkpoint can take seconds to read; an early payload
@@ -300,7 +303,7 @@ fn main() {
                             if !(1..=2).contains(&depth) { return None; }
                             let mut descendants = Vec::with_capacity(usize::from(depth));
                             for step in 1..=depth {
-                                descendants.push(database.header_by_number(ancestor.number.checked_add(u64::from(step))?).ok()??);
+                                descendants.push(database.header_by_number(ancestor.number.checked_add(u64::from(step))?).ok()??.into_inner());
                             }
                             let carrying = descendants.last()?;
                             if reth_chainspec::qmdb::deferred_execution_depth_at(&historical_genesis, carrying.timestamp) != u64::from(depth) { return None; }

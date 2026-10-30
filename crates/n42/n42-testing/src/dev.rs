@@ -166,7 +166,7 @@ impl std::fmt::Debug for CapturingConsensusBuilder {
 #[cfg(test)]
 impl<Node> reth_node_builder::components::ConsensusBuilder<Node> for CapturingConsensusBuilder
 where
-    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = n42_tx_types::N42Primitives>>,
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = n42_header::N42ChainSpec, Primitives = n42_tx_types::N42Primitives>>,
 {
     type Consensus = Arc<n42_engine_types::N42Consensus<<Node as FullNodeTypes>::Provider>>;
 
@@ -388,6 +388,7 @@ impl CliqueTest {
         let NodeHandle { node, .. } = {
             let _alt_sig_guard = ALT_SIG_FLAG_LOCK.lock().await;
             NodeBuilder::new(node_config.clone())
+                .map_chainspec(n42_header::N42ChainSpec::from)
                 .testing_node(runtime.clone())
                 .with_types::<N42Node>()
                 .with_components(
@@ -1431,6 +1432,7 @@ async fn test_qmdb_chain__read_view_verifies_against_the_hashed_tables() -> eyre
     let NodeHandle { node, .. } = {
         let _alt_sig_guard = ALT_SIG_FLAG_LOCK.lock().await;
         NodeBuilder::new(node_config)
+            .map_chainspec(n42_header::N42ChainSpec::from)
             .testing_node(runtime.clone())
             .with_types::<N42Node>()
             .with_components(
@@ -1603,6 +1605,7 @@ async fn test_qmdb_chain__headers_carry_the_forest_root_and_validate() -> eyre::
     let NodeHandle { node, .. } = {
         let _alt_sig_guard = ALT_SIG_FLAG_LOCK.lock().await;
         NodeBuilder::new(node_config)
+            .map_chainspec(n42_header::N42ChainSpec::from)
             .testing_node(runtime.clone())
             .with_types::<N42Node>()
             .with_components(
@@ -1786,6 +1789,7 @@ async fn test_deferred_execution__headers_carry_the_parents_execution_across_the
     let NodeHandle { node, .. } = {
         let _alt_sig_guard = ALT_SIG_FLAG_LOCK.lock().await;
         NodeBuilder::new(node_config)
+            .map_chainspec(n42_header::N42ChainSpec::from)
             .testing_node(runtime.clone())
             .with_types::<N42Node>()
             .with_components(
@@ -2087,6 +2091,7 @@ async fn deferred_chain(run: DeferredChainRun) -> eyre::Result<serde_json::Value
     let NodeHandle { node, .. } = {
         let _alt_sig_guard = ALT_SIG_FLAG_LOCK.lock().await;
         NodeBuilder::new(node_config)
+            .map_chainspec(n42_header::N42ChainSpec::from)
             .testing_node(runtime.clone())
             .with_types::<N42Node>()
             .with_components(
@@ -2136,11 +2141,11 @@ async fn deferred_chain(run: DeferredChainRun) -> eyre::Result<serde_json::Value
     let genesis_sealed = chainspec.genesis_header.clone();
     // Every block's own result and sealed header, by hash, genesis included.
     let mut own: std::collections::HashMap<B256, ExecutedFields> = std::collections::HashMap::new();
-    let mut sealed_by_hash: std::collections::HashMap<B256, reth_primitives_traits::SealedHeader> =
+    let mut sealed_by_hash: std::collections::HashMap<B256, reth_primitives_traits::SealedHeader<n42_header::N42Header>> =
         std::collections::HashMap::new();
     own.insert(genesis_hash, fields_of(&genesis_sealed));
-    sealed_by_hash.insert(genesis_hash, SealedHeader::new(genesis_sealed.header().clone(), genesis_hash));
-    let block_json = |header: &reth_primitives_traits::SealedHeader,
+    sealed_by_hash.insert(genesis_hash, SealedHeader::new(n42_header::N42Header::from(genesis_sealed.header().clone()), genesis_hash));
+    let block_json = |header: &reth_primitives_traits::SealedHeader<n42_header::N42Header>,
                       deferred: bool,
                       own: &ExecutedFields,
                       transactions: Vec<alloy_primitives::Bytes>| {
@@ -2159,8 +2164,8 @@ async fn deferred_chain(run: DeferredChainRun) -> eyre::Result<serde_json::Value
         })
     };
     // The rule, as consensus and the vote road apply it, at `at_depth`.
-    let expected_at = |known: &std::collections::HashMap<B256, reth_primitives_traits::SealedHeader>,
-                       header: &reth_primitives_traits::SealedHeader,
+    let expected_at = |known: &std::collections::HashMap<B256, reth_primitives_traits::SealedHeader<n42_header::N42Header>>,
+                       header: &reth_primitives_traits::SealedHeader<n42_header::N42Header>,
                        at_depth: u64| {
         let parent = &known[&header.parent_hash];
         n42_engine_types::hotstuff_consensus::ancestor_executed_fields(&chainspec.genesis, parent, at_depth)
@@ -2168,7 +2173,7 @@ async fn deferred_chain(run: DeferredChainRun) -> eyre::Result<serde_json::Value
 
     let mut nonce = 0u64;
     let mut blocks = Vec::new();
-    let mut canonical: Vec<reth_primitives_traits::SealedHeader> = vec![sealed_by_hash[&genesis_hash].clone()];
+    let mut canonical: Vec<reth_primitives_traits::SealedHeader<n42_header::N42Header>> = vec![sealed_by_hash[&genesis_hash].clone()];
     for number in 1..=run.last {
         if run.carries.contains(&number) {
             let pooled = send(&sender, nonce)?;
@@ -2446,6 +2451,7 @@ async fn test_altsig_transfer__is_mined_and_typed_0x50() -> eyre::Result<()> {
     // test's critical section.
     let _alt_sig_guard = ALT_SIG_FLAG_LOCK.lock().await;
     let NodeHandle { node, .. } = NodeBuilder::new(node_config)
+        .map_chainspec(n42_header::N42ChainSpec::from)
         .testing_node(runtime.clone())
         .with_types::<N42Node>()
         .with_components(

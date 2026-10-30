@@ -338,6 +338,7 @@ impl ExecutionLayer for MockExecutionLayer {
         if matches!(behaviour.new_payload_status, PayloadStatusEnum::Valid)
             && let Ok(block) = payload.clone().into_block_raw()
         {
+            let block = n42_h2_consensus::header_engine::block_with_payload_root(block, &payload.payload);
             let number = block.header.number;
             self.state
                 .lock()
@@ -442,6 +443,7 @@ impl ExecutionLayer for MockExecutionLayer {
         let mut built = Self::built_block_on(number, parent);
         built.elided = self.behaviour.lock().expect("mock behaviour lock").elide_builds;
         if let Ok(block) = built.execution_data.clone().into_block_raw() {
+            let block = n42_h2_consensus::header_engine::block_with_payload_root(block, &built.execution_data.payload);
             self.state
                 .lock()
                 .expect("mock state lock")

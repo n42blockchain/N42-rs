@@ -49,7 +49,7 @@ pub type ParentStateOpener = Arc<dyn Fn() -> ProviderResult<StateProviderBox> + 
 #[derive(Debug)]
 pub struct BuildOnOwnRequest {
     /// The parent, under the hash consensus sealed it with.
-    pub parent: SealedHeader,
+    pub parent: SealedHeader<n42_header::N42Header>,
     /// The parent's execution, as the builder kept it (its block is under
     /// the builder's own hash) -- or, on a build started at the parent's
     /// seal (`N42_BUILD_ON_OUTPUT`), only the name it will be kept under.
@@ -131,7 +131,7 @@ pub fn get() -> Option<Arc<dyn DirectBuilder>> {
 /// The parent as an executed block under its sealed header, so the overlay
 /// answers `BLOCKHASH` with the hash the chain knows rather than the
 /// builder's. One copy of the body (163,000 transactions, ~10 ms) per build.
-pub fn executed_under_seal(parent: &SealedHeader, execution: &BuiltExecution) -> ExecutedBlock<N42Primitives> {
+pub fn executed_under_seal(parent: &SealedHeader<n42_header::N42Header>, execution: &BuiltExecution) -> ExecutedBlock<N42Primitives> {
     let sealed = SealedBlock::from_sealed_parts(parent.clone(), execution.block.body().clone());
     let recovered = RecoveredBlock::new_sealed(sealed, execution.block.senders().to_vec());
     let hashed = execution.hashed_state.clone();
@@ -174,7 +174,7 @@ pub type ExecutedParent = ExecutedBlock<N42Primitives>;
 /// (`N42_HASHED_TABLES=off`), since a follower's published output carries no
 /// hashed post-state to put here.
 pub fn executed_from_output(
-    parent: &SealedHeader,
+    parent: &SealedHeader<n42_header::N42Header>,
     output: Arc<reth_execution_types::BlockExecutionOutput<n42_tx_types::Receipt>>,
 ) -> ExecutedParent {
     let sealed = SealedBlock::from_sealed_parts(parent.clone(), n42_tx_types::BlockBody::default());
@@ -791,7 +791,7 @@ where
 /// only, so the body copy [`executed_under_seal`] makes (163,000
 /// transactions, ~10 ms) is saved. The first open files the parent; every
 /// later open (one per execution batch) reuses it.
-pub fn opener_on_sealed_parent<C>(client: C, parent: SealedHeader, built_hash: B256) -> ParentStateOpener
+pub fn opener_on_sealed_parent<C>(client: C, parent: SealedHeader<n42_header::N42Header>, built_hash: B256) -> ParentStateOpener
 where
     C: StateProviderFactory + Send + Sync + 'static,
 {
@@ -1036,7 +1036,7 @@ pub mod leader_layers {
 /// before `N42_GRANDPARENT_SHARDS`; see [`leader_layers::depth`]).
 fn opener_on_sealed_parent_with<C>(
     client: C,
-    parent: SealedHeader,
+    parent: SealedHeader<n42_header::N42Header>,
     built_hash: B256,
     depth: usize,
 ) -> ParentStateOpener
@@ -1121,7 +1121,7 @@ mod tests {
     //! hash instead of the one consensus sealed. A round lost to either would
     //! be the first on-seal block refusing 163,000 transactions.
     use super::*;
-    use alloy_consensus::Header;
+    use n42_header::N42Header as Header;
     use alloy_primitives::{Address, U256};
     use n42_tx_types::{Block, BlockBody};
     use reth_execution_types::BlockExecutionOutput;
@@ -1165,13 +1165,13 @@ mod tests {
             .state_present_account_info(sender, AccountInfo { nonce: 5, balance: U256::from(50), ..Default::default() })
             .state_present_account_info(created, AccountInfo { nonce: 0, balance: U256::from(7), ..Default::default() })
             .build();
-        let header = Header { number: 11, parent_hash: grandparent, gas_used: 21_000, ..Default::default() };
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 11, parent_hash: grandparent, gas_used: 21_000, ..Default::default() });
         let execution = execution_of(&header, bundle);
         let built_hash = execution.block.hash();
 
         // Consensus seals the header (the view and the signature go into
         // `extra_data`), so the hash the chain knows is not the builder's.
-        let sealed = SealedHeader::seal_slow(Header { extra_data: b"view 7".as_slice().into(), ..header.clone() });
+        let sealed = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { extra_data: b"view 7".as_slice().into(), ..header.inner.clone() }));
         assert_ne!(sealed.hash(), built_hash);
 
         // The registry finds the build by what a seal cannot change.
@@ -1224,12 +1224,12 @@ mod tests {
             .state_present_account_info(sender, AccountInfo { nonce: 5, balance: U256::from(60), ..Default::default() })
             .state_present_account_info(created, AccountInfo { nonce: 0, balance: U256::from(7), ..Default::default() })
             .build();
-        let parent = SealedHeader::seal_slow(Header {
+        let parent = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header {
             number: 12,
             parent_hash: grandparent,
             extra_data: b"view 9".as_slice().into(),
             ..Default::default()
-        });
+        }));
         let output = Arc::new(BlockExecutionOutput { result: Default::default(), state: bundle });
 
         let executed = executed_from_output(&parent, output);
@@ -1332,18 +1332,18 @@ mod tests {
             Vec::new(),
         );
 
-        let older = SealedHeader::seal_slow(Header {
+        let older = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header {
             number: 11,
             parent_hash: anchor_hash,
             extra_data: b"view 11".as_slice().into(),
             ..Default::default()
-        });
-        let newer = SealedHeader::seal_slow(Header {
+        }));
+        let newer = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header {
             number: 12,
             parent_hash: older.hash(),
             extra_data: b"view 12".as_slice().into(),
             ..Default::default()
-        });
+        }));
         let executed_older =
             executed_from_output(&older, Arc::new(BlockExecutionOutput { result: Default::default(), state: older_bundle }));
         let executed_newer =
@@ -1435,11 +1435,11 @@ mod tests {
         }
         let anchor = B256::with_last_byte(0x0a);
         let header = |number: u64, parent: B256| {
-            SealedHeader::seal_slow(Header { number, parent_hash: parent, ..Default::default() })
+            SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { number, parent_hash: parent, ..Default::default() }))
         };
         let older = header(11, anchor);
         let newer = header(12, older.hash());
-        let executed = |head: &SealedHeader, bundle: BundleState| {
+        let executed = |head: &SealedHeader<n42_header::N42Header>, bundle: BundleState| {
             executed_from_output(head, Arc::new(BlockExecutionOutput { result: Default::default(), state: bundle }))
         };
 
@@ -1508,7 +1508,7 @@ mod tests {
         let stack_of = |depth: usize| -> Vec<ExecutedParent> {
             (0..depth)
                 .map(|d| {
-                    let header = SealedHeader::seal_slow(Header { number: (d + 1) as u64, ..Default::default() });
+                    let header = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { number: (d + 1) as u64, ..Default::default() }));
                     let bundle = BundleState::new(
                         (0..10u64).map(|i| (address(10_000_000 + d as u64 * 10 + i), None, Some(info()), Default::default())),
                         Vec::<Vec<(Address, Option<Option<AccountInfo>>, Vec<(U256, U256)>)>>::new(),
@@ -1573,10 +1573,10 @@ mod tests {
             .state_present_account_info(sender, AccountInfo { nonce: 5, balance: U256::from(50), ..Default::default() })
             .state_present_account_info(created, AccountInfo { nonce: 0, balance: U256::from(7), ..Default::default() })
             .build();
-        let header = Header { number: 41, parent_hash: grandparent, gas_used: 41_000, ..Default::default() };
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 41, parent_hash: grandparent, gas_used: 41_000, ..Default::default() });
         let execution = execution_of(&header, bundle);
         let built_hash = execution.block.hash();
-        let sealed = SealedHeader::seal_slow(Header { extra_data: b"view 41".as_slice().into(), ..header.clone() });
+        let sealed = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { extra_data: b"view 41".as_slice().into(), ..header.inner.clone() }));
 
         // Sealed, its output not yet filed: found at once, without an execution.
         crate::built_executions::remember_pending(built_hash, execution.block.clone());
@@ -1644,10 +1644,10 @@ mod tests {
             .state_original_account_info(sender, AccountInfo { nonce: 5, balance: U256::from(50), ..Default::default() })
             .state_present_account_info(sender, AccountInfo { nonce: 5, balance: U256::from(55), ..Default::default() })
             .build();
-        let header = Header { number: 42, parent_hash: grandparent, gas_used: 42_000, ..Default::default() };
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 42, parent_hash: grandparent, gas_used: 42_000, ..Default::default() });
         let execution = execution_of(&header, residual);
         let built_hash = execution.block.hash();
-        let sealed = SealedHeader::seal_slow(Header { extra_data: b"view 42".as_slice().into(), ..header.clone() });
+        let sealed = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { extra_data: b"view 42".as_slice().into(), ..header.inner.clone() }));
         crate::built_executions::remember_pending(built_hash, execution.block.clone());
         crate::built_executions::shards_ready(
             built_hash,
@@ -1707,10 +1707,10 @@ mod tests {
         };
         // One own block: sealed, its shards and residual filed.
         let file = |number: u64, parent_hash: B256, batch: BundleState, residual: BundleState| {
-            let header = Header { number, parent_hash, gas_used: number * 1_000, ..Default::default() };
+            let header = n42_header::N42Header::from(alloy_consensus::Header { number, parent_hash, gas_used: number * 1_000, ..Default::default() });
             let execution = execution_of(&header, residual);
             let built_hash = execution.block.hash();
-            let sealed = SealedHeader::seal_slow(Header { extra_data: format!("view {number}").into_bytes().into(), ..header });
+            let sealed = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { extra_data: format!("view {number}").into_bytes().into(), ..header.inner }));
             crate::built_executions::remember_pending(built_hash, execution.block.clone());
             crate::built_executions::shards_ready(
                 built_hash,
@@ -1988,9 +1988,9 @@ mod tests {
         let mut client = Scripted::new(mock);
         client.flaky_first = AtomicUsize::new(1);
         let bundle = BundleState::builder(61..=61).state_present_account_info(sender, info(2, 5)).build();
-        let header = Header { number: 61, parent_hash: grandparent, ..Default::default() };
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 61, parent_hash: grandparent, ..Default::default() });
         let execution = execution_of(&header, bundle);
-        let sealed = SealedHeader::seal_slow(Header { extra_data: b"view 61".as_slice().into(), ..header });
+        let sealed = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { extra_data: b"view 61".as_slice().into(), ..header.inner }));
         let opener = opener_on_built_parent(client, grandparent, executed_under_seal(&sealed, &execution));
         let state = opener().expect("opens after one miss");
         assert_eq!(nonce_of(&state, sender), Some(2), "the parent's value");
@@ -2015,7 +2015,7 @@ mod tests {
             Arc::new(BlockExecutionOutput { result: Default::default(), state: builder.build() })
         };
         let seal = |number: u64| {
-            SealedHeader::seal_slow(Header { number, parent_hash: B256::with_last_byte(number as u8), ..Default::default() })
+            SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { number, parent_hash: B256::with_last_byte(number as u8), ..Default::default() }))
         };
         let newest = executed_from_output(&seal(72), output(72, &[(acct, 7)]));
         let older = executed_from_output(&seal(71), output(71, &[(acct, 5), (only_old, 4)]));
@@ -2030,7 +2030,7 @@ mod tests {
 
     #[test]
     fn executed_from_output_keeps_the_sealed_header_and_shares_the_output() {
-        let parent = SealedHeader::seal_slow(Header { number: 8, extra_data: b"view 8".as_slice().into(), ..Default::default() });
+        let parent = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { number: 8, extra_data: b"view 8".as_slice().into(), ..Default::default() }));
         let output = Arc::new(BlockExecutionOutput { result: Default::default(), state: BundleState::default() });
         let executed = executed_from_output(&parent, output.clone());
         assert_eq!(executed.recovered_block.hash(), parent.hash());
@@ -2043,7 +2043,7 @@ mod tests {
     #[test]
     fn executed_under_seal_carries_the_body_and_the_senders() {
         let sender = Address::with_last_byte(0x81);
-        let header = Header { number: 9, ..Default::default() };
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 9, ..Default::default() });
         let mut execution = execution_of(&header, BundleState::default());
         let tx = n42_tx_types::N42TxEnvelope::Eth(reth_ethereum_primitives::TransactionSigned::new_unhashed(
             reth_ethereum_primitives::Transaction::Legacy(alloy_consensus::TxLegacy { nonce: 3, ..Default::default() }),
@@ -2054,7 +2054,7 @@ mod tests {
             body: BlockBody { transactions: vec![tx], ommers: Vec::new(), withdrawals: Some(Vec::new().into()) },
         };
         execution.block = Arc::new(RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), vec![sender]));
-        let sealed = SealedHeader::seal_slow(Header { extra_data: b"view 9".as_slice().into(), ..header });
+        let sealed = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { extra_data: b"view 9".as_slice().into(), ..header.inner }));
         let executed = executed_under_seal(&sealed, &execution);
         assert_eq!(executed.recovered_block.hash(), sealed.hash());
         assert_eq!(executed.recovered_block.body().transactions.len(), 1);
@@ -2064,7 +2064,7 @@ mod tests {
 
     #[test]
     fn a_parents_builder_hash_is_named_by_each_kind_of_execution() {
-        let header = Header { number: 10, ..Default::default() };
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 10, ..Default::default() });
         let execution = execution_of(&header, BundleState::default());
         let built = execution.block.hash();
         assert_eq!(ParentExecution::Ready(execution).built_hash(), built);
@@ -2096,7 +2096,7 @@ mod tests {
     #[test]
     fn a_missing_parent_output_refuses_the_open_at_once() {
         let _guard = store_lock();
-        let parent = SealedHeader::seal_slow(Header { number: 91, extra_data: b"view 91".as_slice().into(), ..Default::default() });
+        let parent = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { number: 91, extra_data: b"view 91".as_slice().into(), ..Default::default() }));
         let opener = opener_on_sealed_parent_with(Scripted::new(MockEthProvider::default()), parent.clone(), B256::with_last_byte(0x9f), 1);
         let at = std::time::Instant::now();
         match opener() {
@@ -2108,11 +2108,11 @@ mod tests {
     }
 
     /// Files a build as `StateReady` (its bundle is its state) and returns it with its seal.
-    fn file_ready(number: u64, parent_hash: B256, bundle: BundleState) -> (SealedHeader, B256) {
-        let header = Header { number, parent_hash, gas_used: number * 1_000, ..Default::default() };
+    fn file_ready(number: u64, parent_hash: B256, bundle: BundleState) -> (SealedHeader<n42_header::N42Header>, B256) {
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number, parent_hash, gas_used: number * 1_000, ..Default::default() });
         let execution = execution_of(&header, bundle);
         let built_hash = execution.block.hash();
-        let sealed = SealedHeader::seal_slow(Header { extra_data: format!("view {number}").into_bytes().into(), ..header });
+        let sealed = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { extra_data: format!("view {number}").into_bytes().into(), ..header.inner }));
         crate::built_executions::remember_pending(built_hash, execution.block.clone());
         crate::built_executions::state_ready(built_hash, execution);
         (sealed, built_hash)
@@ -2153,7 +2153,7 @@ mod tests {
         let _guard = store_lock();
         let _ = open_wait::take();
         let grandparent = B256::with_last_byte(0xa3);
-        let header = Header { number: 103, parent_hash: grandparent, ..Default::default() };
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 103, parent_hash: grandparent, ..Default::default() });
         let execution = execution_of(&header, BundleState::default());
         let built = execution.block.hash();
         // Sealed, finishing; its QMDB root is already published, so the root wait returns at once.
@@ -2186,7 +2186,7 @@ mod tests {
         let _guard = store_lock();
         let _ = open_wait::take();
         let grandparent = B256::with_last_byte(0xa4);
-        let header = Header { number: 104, parent_hash: grandparent, ..Default::default() };
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 104, parent_hash: grandparent, ..Default::default() });
         let execution = execution_of(&header, BundleState::default());
         let built = execution.block.hash();
         crate::built_executions::remember_pending(built, execution.block.clone());
@@ -2216,8 +2216,8 @@ mod tests {
 
     // ---- leader_layers ----
 
-    fn layer_of(number: u64, parent_hash: B256, bundle: BundleState) -> (leader_layers::Layer, SealedHeader) {
-        let sealed = SealedHeader::seal_slow(Header { number, parent_hash, extra_data: format!("layer {number}").into_bytes().into(), ..Default::default() });
+    fn layer_of(number: u64, parent_hash: B256, bundle: BundleState) -> (leader_layers::Layer, SealedHeader<n42_header::N42Header>) {
+        let sealed = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { number, parent_hash, extra_data: format!("layer {number}").into_bytes().into(), ..Default::default() }));
         let output = Arc::new(BlockExecutionOutput { result: Default::default(), state: bundle });
         ((executed_from_output(&sealed, output), None), sealed)
     }
@@ -2270,7 +2270,7 @@ mod tests {
     }
 
     /// Files and opens a grandparent and its child's parent, so the layers are kept.
-    fn chain_of_two(great_grandparent: B256) -> ((SealedHeader, B256), (SealedHeader, B256)) {
+    fn chain_of_two(great_grandparent: B256) -> ((SealedHeader<n42_header::N42Header>, B256), (SealedHeader<n42_header::N42Header>, B256)) {
         let gp = file_ready(401, great_grandparent, BundleState::builder(401..=401).state_present_account_info(Address::with_last_byte(0xd1), info(2, 1)).build());
         let parent = file_ready(402, gp.0.hash(), BundleState::builder(402..=402).state_present_account_info(Address::with_last_byte(0xd2), info(4, 1)).build());
         (gp, parent)
@@ -2353,11 +2353,11 @@ mod tests {
 
     /// Files a build as its shard set and residual (before `StateReady`, as
     /// `N42_OUTPUT_SHARDS` does) and returns it with its seal.
-    fn file_sharded(number: u64, parent_hash: B256, batch: BundleState, residual: BundleState) -> (SealedHeader, B256) {
-        let header = Header { number, parent_hash, gas_used: number * 1_000, ..Default::default() };
+    fn file_sharded(number: u64, parent_hash: B256, batch: BundleState, residual: BundleState) -> (SealedHeader<n42_header::N42Header>, B256) {
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number, parent_hash, gas_used: number * 1_000, ..Default::default() });
         let execution = execution_of(&header, residual);
         let built_hash = execution.block.hash();
-        let sealed = SealedHeader::seal_slow(Header { extra_data: format!("view {number}").into_bytes().into(), ..header });
+        let sealed = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { extra_data: format!("view {number}").into_bytes().into(), ..header.inner }));
         let shards = crate::output_shards::OutputShards::with_index_live(Address::with_last_byte(0x01), 4, 16, true, true);
         shards.add(batch);
         crate::built_executions::remember_pending(built_hash, execution.block.clone());
@@ -2394,7 +2394,7 @@ mod tests {
             m
         };
         let open = |number: u64, receipts: Vec<n42_tx_types::Receipt>, gas_used: u64| {
-            let header = Header { number, parent_hash: B256::with_last_byte(0x60), gas_used: 42_000, ..Default::default() };
+            let header = n42_header::N42Header::from(alloy_consensus::Header { number, parent_hash: B256::with_last_byte(0x60), gas_used: 42_000, ..Default::default() });
             let residual = BundleState::builder(number..=number).state_present_account_info(coinbase, info(0, 9)).build();
             let mut execution = execution_of(&header, residual);
             let mut output = (*execution.execution_output).clone();
@@ -2402,7 +2402,7 @@ mod tests {
             output.result.gas_used = gas_used;
             execution.execution_output = Arc::new(output);
             let built_hash = execution.block.hash();
-            let sealed = SealedHeader::seal_slow(Header { extra_data: format!("view {number}").into_bytes().into(), ..header });
+            let sealed = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { extra_data: format!("view {number}").into_bytes().into(), ..header.inner }));
             let shards = crate::output_shards::OutputShards::with_index_live(Address::with_last_byte(0x01), 4, 16, true, true);
             shards.add(
                 BundleState::builder(number..=number)
@@ -2476,11 +2476,11 @@ mod tests {
             ]
         };
         let open = |number: u64, early: bool, depth: usize| {
-            let header = Header { number, parent_hash: B256::with_last_byte(0x70), gas_used: 42_000, ..Default::default() };
+            let header = n42_header::N42Header::from(alloy_consensus::Header { number, parent_hash: B256::with_last_byte(0x70), gas_used: 42_000, ..Default::default() });
             let residual = BundleState::builder(number..=number).state_present_account_info(coinbase, info(0, 9)).build();
             let execution = execution_of(&header, residual);
             let built_hash = execution.block.hash();
-            let sealed = SealedHeader::seal_slow(Header { extra_data: format!("view {number}").into_bytes().into(), ..header });
+            let sealed = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { extra_data: format!("view {number}").into_bytes().into(), ..header.inner }));
             let mut shards = crate::output_shards::OutputShards::with_index_live(Address::with_last_byte(0x01), 8, 16, true, true);
             // Every other shard of every batch left to the freeze.
             shards.set_live_defer(true, true);
@@ -2804,12 +2804,12 @@ mod tests {
         assert!(leader_layers::find(a_seal.hash()).is_none());
         assert_eq!(leader_layers::ancestors(d_seal.hash(), 3).len(), 3);
         // An abandoned build: d never committed, the next build is on its sibling d'.
-        let d2_seal = SealedHeader::seal_slow(Header {
+        let d2_seal = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header {
             number: 194,
             parent_hash: c_seal.hash(),
             extra_data: b"layer 194b".as_slice().into(),
             ..Default::default()
-        });
+        }));
         let d2: leader_layers::Layer = (
             executed_from_output(&d2_seal, Arc::new(BlockExecutionOutput { result: Default::default(), state: BundleState::default() })),
             None,
@@ -2847,11 +2847,11 @@ mod tests {
         let abandoned = file_ready(202, gp.0.hash(), BundleState::builder(202..=202).state_present_account_info(only_abandoned, info(9, 9)).build());
         opener_on_sealed_parent_with(Scripted::new(MockEthProvider::default()), abandoned.0.clone(), abandoned.1, 3)().expect("open");
         assert!(leader_layers::find(abandoned.0.hash()).is_some());
-        let mut sibling_header = Header { number: 202, parent_hash: gp.0.hash(), gas_used: 1, ..Default::default() };
+        let mut sibling_header = n42_header::N42Header::from(alloy_consensus::Header { number: 202, parent_hash: gp.0.hash(), gas_used: 1, ..Default::default() });
         sibling_header.extra_data = b"view 202b".as_slice().into();
         let execution = execution_of(&sibling_header, BundleState::default());
         let sibling_built = execution.block.hash();
-        let sibling = SealedHeader::seal_slow(Header { extra_data: b"sealed 202b".as_slice().into(), ..sibling_header });
+        let sibling = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { extra_data: b"sealed 202b".as_slice().into(), ..sibling_header.inner }));
         crate::built_executions::remember_pending(sibling_built, execution.block.clone());
         crate::built_executions::state_ready(sibling_built, execution);
         let _ = open_wait::take();
@@ -2961,7 +2961,7 @@ mod tests {
                         builder = builder.state_present_account_info(*address, info(depth as u64 + 1, 1));
                     }
                 }
-                let sealed = SealedHeader::seal_slow(Header { number: 500 - depth as u64, ..Default::default() });
+                let sealed = SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { number: 500 - depth as u64, ..Default::default() }));
                 executed_from_output(&sealed, Arc::new(BlockExecutionOutput { result: Default::default(), state: builder.build() }))
             })
             .collect();

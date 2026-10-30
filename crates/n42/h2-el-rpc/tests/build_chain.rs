@@ -19,7 +19,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use alloy_consensus::{BlockBody, Header, TxEnvelope};
+use alloy_consensus::{BlockBody, TxEnvelope};
+use n42_header::N42Header as Header;
 use alloy_eips::eip4895::{Withdrawal, Withdrawals};
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_engine::PayloadAttributes;
@@ -68,7 +69,7 @@ impl FakeEl {
     /// everything the attributes decide, so two requests that differ in any
     /// attribute produce two different hashes.
     fn build(parent: &Header, attrs: &PayloadAttributes) -> Header {
-        Header {
+        Header::from(alloy_consensus::Header {
             parent_hash: parent.hash_slow(),
             number: parent.number + 1,
             timestamp: attrs.timestamp,
@@ -85,7 +86,7 @@ impl FakeEl {
             blob_gas_used: Some(0),
             excess_blob_gas: Some(0),
             ..Default::default()
-        }
+        })
     }
 
     async fn serve(self: Arc<Self>, listener: tokio::net::TcpListener) {
@@ -138,7 +139,7 @@ impl FakeEl {
                         // The block, behind the seal.
                         tokio::time::sleep(FINISH).await;
                     }
-                    let block = alloy_consensus::Block::<TxEnvelope> {
+                    let block = alloy_consensus::Block::<TxEnvelope, Header> {
                         header: built,
                         body: BlockBody {
                             transactions: Vec::new(),
@@ -216,7 +217,7 @@ fn attrs(timestamp: u64) -> PayloadAttributes {
 }
 
 fn parent() -> Header {
-    Header { number: 40, gas_limit: 30_000_000, ..Default::default() }
+    Header::from(alloy_consensus::Header { number: 40, gas_limit: 30_000_000, ..Default::default() })
 }
 
 /// Waits for the execution layer to have been asked `n` times, or gives up.

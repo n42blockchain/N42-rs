@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 n42-env.workspace = true
+n42-header.workspace = true
 alloy-consensus = { workspace = true, features = ["std", "serde", "secp256k1"] }
 alloy-eips = { workspace = true, features = ["std", "serde"] }
 alloy-primitives = { workspace = true, features = ["std", "serde", "rlp"] }

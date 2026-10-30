@@ -190,10 +190,10 @@ where
     // Block is already Block<TransactionSigned>;
     // reth-primitives' alias was generic over the transaction type, this one is not.
     Network: BlockAnnounceProvider<Block = Block>,
-    <<Network as BlockDownloaderProvider>::Client as BlockClient>::Block: reth_primitives_traits::Block<Header = reth_primitives_traits::Header>,
+    <<Network as BlockDownloaderProvider>::Client as BlockClient>::Block: reth_primitives_traits::Block<Header = n42_header::N42Header>,
     <<<Network as BlockDownloaderProvider>::Client as BlockClient>::Block as reth_primitives_traits::Block>::Body: BlockBody< Transaction = TransactionSigned>,
-    <<Network as NetworkEventListenerProvider>::Primitives as NetworkPrimitives>::Block: reth_primitives_traits::Block<Header = reth_primitives_traits::Header>,
-    <<Network as NetworkEventListenerProvider>::Primitives as NetworkPrimitives>::BlockBody: reth_primitives_traits::BlockBody<OmmerHeader = reth_primitives_traits::Header>,
+    <<Network as NetworkEventListenerProvider>::Primitives as NetworkPrimitives>::Block: reth_primitives_traits::Block<Header = n42_header::N42Header>,
+    <<Network as NetworkEventListenerProvider>::Primitives as NetworkPrimitives>::BlockBody: reth_primitives_traits::BlockBody<OmmerHeader = n42_header::N42Header>,
 {
     /// Spawns a new [`N42Miner`] with the given parameters.
     pub fn spawn_new(
@@ -1226,7 +1226,8 @@ where
             .into_data()
             .ok_or_else(|| eyre::eyre!("Header not found for: {:?}", start))?;
 
-        Ok(header)
+        // An APoS header carries no registry root.
+        Ok(header.into_inner())
     }
 
     async fn fetch_block(&mut self, start: BlockHashOrNumber) -> eyre::Result<<<T::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block> {

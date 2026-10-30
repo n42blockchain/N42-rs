@@ -7,7 +7,7 @@ use super::*;
 
 mod node_tests {
     use super::*;
-    use reth_chainspec::ChainSpec;
+    use n42_header::N42ChainSpec as ChainSpec;
     use reth_node_api::NodeTypes;
 
     #[test]
@@ -19,7 +19,7 @@ mod node_tests {
 
     #[test]
     fn test_n42_node_chain_spec() {
-        // Verify N42Node uses ChainSpec
+        // Verify N42Node uses the N42Header chain spec
         fn check_chain_spec<T: NodeTypes<ChainSpec = ChainSpec>>() {}
         check_chain_spec::<N42Node>();
     }

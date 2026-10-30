@@ -162,7 +162,7 @@ struct DeferredChain {
     addr: std::net::SocketAddr,
     /// The header the execution layer sealed for N-1 and the attributes it
     /// was built with.
-    built: alloy_consensus::Header,
+    built: n42_header::N42Header,
     built_with: PayloadAttributes,
     /// The view N-1 is to be proposed in.
     view: u64,
@@ -392,7 +392,7 @@ enum BuildFrame {
     Refused(String),
     /// The *built* header of the block being built, sent the moment the
     /// builder sealed it early. Only ever sent to a request that hinted.
-    ChainHeader(Box<alloy_consensus::Header>),
+    ChainHeader(Box<n42_header::N42Header>),
     /// The block.
     Built(Box<Result<BuiltBlock, ElError>>),
 }
@@ -486,7 +486,7 @@ async fn read_build_frame(
             let len = read_bounded_u32(stream, n42_h2_execution::raw_engine::MAX_FRAME).await?;
             let mut rlp = vec![0u8; len];
             stream.read_exact(&mut rlp).await?;
-            let header = alloy_consensus::Header::decode(&mut &rlp[..])
+            let header = n42_header::N42Header::decode(&mut &rlp[..])
                 .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("chain header: {err}")))?;
             Ok(BuildFrame::ChainHeader(Box::new(header)))
         }
@@ -662,7 +662,7 @@ struct ChainCtx {
 
 fn start_chain(
     ctx: &ChainCtx,
-    built: &alloy_consensus::Header,
+    built: &n42_header::N42Header,
     built_with: &PayloadAttributes,
     view: u64,
 ) {
@@ -677,7 +677,7 @@ fn start_chain(
 fn start_chain_locked(
     state: &mut ChainState,
     ctx: &ChainCtx,
-    built: &alloy_consensus::Header,
+    built: &n42_header::N42Header,
     built_with: &PayloadAttributes,
     view: u64,
     trigger: n42_h2_execution::BuildTrigger,
@@ -953,7 +953,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
     /// have produced. Nothing is patched up to make a near-miss fit.
     async fn take_chained(
         &self,
-        header: &alloy_consensus::Header,
+        header: &n42_header::N42Header,
         attrs: &PayloadAttributes,
     ) -> Option<Result<BuiltBlock, ElError>> {
         let (chained, generation, deferred, promoted) = {
@@ -1312,6 +1312,9 @@ struct PayloadMaybeWithBal {
     payload: ExecutionPayloadV3,
     #[serde(default)]
     block_access_list: Option<alloy_primitives::Bytes>,
+    /// gov5's registry root (header element 24), a V4 field like the list.
+    #[serde(default, rename = "mobileRegistryRoot")]
+    mobile_registry_root: Option<B256>,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -1367,6 +1370,12 @@ pub fn built_block_from_envelope(
     // V4 when the build came back with an access list, V3 otherwise. The
     // variant is what carries the list to `newPayload`, and `newPayload` is
     // where reth decides between rayon workers and a `while` loop.
+    let mobile_registry_root = envelope.execution_payload.mobile_registry_root;
+    if mobile_registry_root.is_some() && envelope.execution_payload.block_access_list.is_none() {
+        // A V4 field on a payload without the other V4 fields: refused rather
+        // than dropped, since without it the block does not reproduce.
+        return Err(ElError::new("getPayload: a mobileRegistryRoot without a V4 payload"));
+    }
     let payload = match envelope.execution_payload.block_access_list {
         Some(block_access_list) => ExecutionPayload::V4(ExecutionPayloadV4 {
             payload_inner: envelope.execution_payload.payload,
@@ -1378,6 +1387,7 @@ pub fn built_block_from_envelope(
             // back with the block, so leader and followers derive it the same
             // way from the same block.
             slot_number: number,
+            mobile_registry_root,
         }),
         None => ExecutionPayload::V3(envelope.execution_payload.payload),
     };
@@ -1480,7 +1490,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
 
     async fn build_on_own_block(
         &self,
-        header: &alloy_consensus::Header,
+        header: &n42_header::N42Header,
         attrs: PayloadAttributes,
     ) -> Option<Result<BuiltBlock, ElError>> {
         self.build_on_own_over_channel(header, attrs, None).await
@@ -1488,7 +1498,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
 
     async fn build_on_own_block_chaining(
         &self,
-        header: &alloy_consensus::Header,
+        header: &n42_header::N42Header,
         attrs: PayloadAttributes,
         chain: Option<ChainAhead>,
     ) -> Option<Result<BuiltBlock, ElError>> {
@@ -1508,7 +1518,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
 
     async fn own_block_body(
         &self,
-        header: &alloy_consensus::Header,
+        header: &n42_header::N42Header,
     ) -> Result<Option<ChainBlock>, ElError> {
         // The build registry first: it holds the block from its seal on,
         // before the own import has put it where a lookup by hash finds it.
@@ -1520,7 +1530,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
 
     async fn import_own_block_by_header(
         &self,
-        header: &alloy_consensus::Header,
+        header: &n42_header::N42Header,
     ) -> Option<PayloadStatus> {
         let by_header = own_block_by_header();
         if !by_header {
@@ -1531,7 +1541,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
 
     async fn import_own_block(
         &self,
-        header: Option<&alloy_consensus::Header>,
+        header: Option<&n42_header::N42Header>,
         payload: ExecutionData,
     ) -> Result<PayloadStatus, ElError> {
         // `N42_OWN_BLOCK_BY_HEADER=0` sends the payload as before (the A-B).
@@ -1776,7 +1786,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
     /// raw channel (`request::OWN_BODY`). `None` when there is no channel,
     /// the execution layer no longer keeps the build, or the request failed:
     /// the caller asks for the block by hash.
-    async fn own_body_over_channel(&self, header: &alloy_consensus::Header) -> Option<ChainBlock> {
+    async fn own_body_over_channel(&self, header: &n42_header::N42Header) -> Option<ChainBlock> {
         let addr = {
             let mut channel = self.raw_body.lock().await;
             self.raw_endpoint(&mut channel).await?
@@ -1810,7 +1820,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
     /// The own-block import by sealed header (`request::OWN_BLOCK`). `None`
     /// when there is no raw channel, the execution layer no longer keeps the
     /// build, or the request failed: the caller sends the payload instead.
-    async fn own_block_over_channel(&self, header: &alloy_consensus::Header) -> Option<PayloadStatus> {
+    async fn own_block_over_channel(&self, header: &n42_header::N42Header) -> Option<PayloadStatus> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut channel = self.raw_import.lock().await;
         let addr = self.raw_endpoint(&mut channel).await?;
@@ -1880,7 +1890,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
     /// way.
     async fn build_on_own_over_channel(
         &self,
-        header: &alloy_consensus::Header,
+        header: &n42_header::N42Header,
         attrs: PayloadAttributes,
         chain: Option<ChainAhead>,
     ) -> Option<Result<BuiltBlock, ElError>> {
@@ -2545,7 +2555,7 @@ struct RawBuiltPayload {
 /// JSON it replaces was 150-200.
 pub fn split_block_rlp(
     rlp: &[u8],
-) -> Result<(alloy_consensus::Header, Vec<alloy_primitives::Bytes>, Vec<alloy_eips::eip4895::Withdrawal>), ElError> {
+) -> Result<(n42_header::N42Header, Vec<alloy_primitives::Bytes>, Vec<alloy_eips::eip4895::Withdrawal>), ElError> {
     use alloy_rlp::Decodable;
     let bad = |what: &str| ElError::new(format!("raw payload: {what}"));
     let mut buf = rlp;
@@ -2554,7 +2564,7 @@ pub fn split_block_rlp(
         return Err(bad("not a block list"));
     }
     let mut payload = &buf[..outer.payload_length];
-    let header = alloy_consensus::Header::decode(&mut payload).map_err(|e| bad(&format!("header: {e}")))?;
+    let header = n42_header::N42Header::decode(&mut payload).map_err(|e| bad(&format!("header: {e}")))?;
     let txs_header = alloy_rlp::Header::decode(&mut payload).map_err(|e| bad(&e.to_string()))?;
     if !txs_header.list || payload.len() < txs_header.payload_length {
         return Err(bad("transactions are not a list"));
@@ -2655,7 +2665,7 @@ pub fn built_block_from_compact(
 /// The payload of a built block from its header and parts; `tx_count` is the
 /// block's, which `transactions` lists unless the answer was elided.
 fn built_block_from_header(
-    mut header: alloy_consensus::Header,
+    mut header: n42_header::N42Header,
     transactions: Vec<alloy_primitives::Bytes>,
     tx_count: usize,
     withdrawals: Vec<alloy_eips::eip4895::Withdrawal>,
@@ -2711,11 +2721,16 @@ fn built_block_from_header(
                     payload_inner: v3,
                     block_access_list,
                     slot_number,
+                    mobile_registry_root: None,
                 }),
                 None => ExecutionPayload::V3(v3),
             }
         }
     };
+    // The header's registry root (and a slot number without an access list,
+    // gov5's gap) on the payload, or a refusal: never dropped.
+    let payload = n42_header::engine::put_header_tail(payload, &header)
+        .map_err(|e| ElError::new(e.to_string()))?;
     let sidecar = match header.parent_beacon_block_root {
         None => ExecutionPayloadSidecar::none(),
         Some(_) => {
@@ -2756,14 +2771,14 @@ fn built_block_from_header(
 /// ([`raw_channel_timeout`]).
 pub async fn request_own_body(
     addr: std::net::SocketAddr,
-    header: &alloy_consensus::Header,
+    header: &n42_header::N42Header,
 ) -> std::io::Result<Result<ChainBlock, String>> {
     within_raw_deadline(request_own_body_unbounded(addr, header)).await
 }
 
 async fn request_own_body_unbounded(
     addr: std::net::SocketAddr,
-    header: &alloy_consensus::Header,
+    header: &n42_header::N42Header,
 ) -> std::io::Result<Result<ChainBlock, String>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let invalid = |what: String| std::io::Error::new(std::io::ErrorKind::InvalidData, what);
@@ -2821,7 +2836,11 @@ async fn request_own_body_unbounded(
 
 /// A block as the node's RPC returns it: its transactions are the node's
 /// envelope, which includes the 0x50 type alloy's does not know.
-pub type RpcBlock = alloy_rpc_types_eth::Block<alloy_rpc_types_eth::Transaction<n42_tx_types::N42TxEnvelope>>;
+/// Its header is the node's, so a registry root in the answer is kept.
+pub type RpcBlock = alloy_rpc_types_eth::Block<
+    alloy_rpc_types_eth::Transaction<n42_tx_types::N42TxEnvelope>,
+    alloy_rpc_types_eth::Header<n42_header::N42Header>,
+>;
 
 /// The consensus header and transactions inside an `eth_getBlockByNumber`
 /// answer, which is what gov5's block form is built from.
@@ -2841,7 +2860,8 @@ pub fn block_parts(block: RpcBlock) -> ChainBlock {
 #[cfg(test)]
 mod raw_payload_tests {
     use super::*;
-    use alloy_consensus::{Block, BlockBody, Header, TxEip1559, TxEnvelope, TxLegacy};
+    use alloy_consensus::{Block, BlockBody, TxEip1559, TxEnvelope, TxLegacy};
+    use n42_header::N42Header as Header;
     use alloy_eips::Encodable2718;
     use alloy_primitives::{Address, Signature, TxKind, U256};
 
@@ -2903,7 +2923,7 @@ mod raw_payload_tests {
         let bal = alloy_primitives::Bytes::from(alloy_rlp::encode(&alloy_eip7928::BlockAccessList::default()));
         let decoded = <alloy_eip7928::BlockAccessList as alloy_rlp::Decodable>::decode(&mut bal.as_ref()).unwrap();
         let txs = vec![typed(), legacy()];
-        let header = Header {
+        let header = Header::from(alloy_consensus::Header {
             number: 3,
             base_fee_per_gas: Some(7),
             // As an execution layer would hand it over: the real root, not a
@@ -2918,7 +2938,7 @@ mod raw_payload_tests {
             block_access_list_hash: Some(alloy_eip7928::compute_block_access_list_hash(decoded.as_slice())),
             slot_number: None,
             ..Default::default()
-        };
+        });
         let block = Block { header, body: BlockBody { transactions: txs, ommers: Vec::new(), withdrawals: Some(alloy_eips::eip4895::Withdrawals(Vec::new())) } };
         let rlp = alloy_rlp::encode(&block);
         let built = built_block_from_parts(rlp.into(), Some(Vec::new()), Some(bal), B256::repeat_byte(7)).expect("builds");
@@ -2940,7 +2960,7 @@ mod raw_payload_tests {
         // A well-formed post-Shanghai header: the trailing optional fields
         // encode positionally, so a withdrawals root without a base fee is an
         // encoding no real block has and alloy's own decoder rejects it.
-        let header = Header { number: 5, base_fee_per_gas: Some(7), withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH), ..Default::default() };
+        let header = Header::from(alloy_consensus::Header { number: 5, base_fee_per_gas: Some(7), withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH), ..Default::default() });
         let withdrawals = vec![alloy_eips::eip4895::Withdrawal { index: 1, validator_index: 2, address: Address::repeat_byte(7), amount: 3 }];
         let block = Block { header: header.clone(), body: BlockBody { transactions: vec![typed(), legacy(), typed()], ommers: Vec::new(), withdrawals: Some(alloy_eips::eip4895::Withdrawals(withdrawals.clone())) } };
         let rlp = alloy_rlp::encode(&block);
@@ -2959,7 +2979,7 @@ mod raw_payload_tests {
     fn an_elided_answer_is_the_whole_answer_without_the_transactions() {
         let txs = vec![typed(), legacy(), typed()];
         let withdrawals = vec![alloy_eips::eip4895::Withdrawal { index: 1, validator_index: 2, address: Address::repeat_byte(7), amount: 3 }];
-        let header = Header {
+        let header = Header::from(alloy_consensus::Header {
             number: 8,
             base_fee_per_gas: Some(7),
             transactions_root: alloy_consensus::proofs::calculate_transaction_root(&txs),
@@ -2969,7 +2989,7 @@ mod raw_payload_tests {
             parent_beacon_block_root: Some(B256::repeat_byte(7)),
             requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
             ..Default::default()
-        };
+        });
         let block = Block { header: header.clone(), body: BlockBody { transactions: txs.clone(), ommers: Vec::new(), withdrawals: Some(alloy_eips::eip4895::Withdrawals(withdrawals.clone())) } };
         let whole = built_block_from_parts(alloy_rlp::encode(&block).into(), Some(Vec::new()), None, B256::repeat_byte(7)).expect("builds");
         let hashes: Vec<B256> = txs.iter().map(|tx| *tx.tx_hash()).collect();
@@ -3127,10 +3147,10 @@ mod ahead_gate_tests {
         }));
         let (slot, _a) = chained(0, 5, 4);
         let (next, _b) = chained(0, 6, 5);
-        let sealer: ChainSealer = std::sync::Arc::new(|_: &alloy_consensus::Header, _: &PayloadAttributes, _: u64| None);
+        let sealer: ChainSealer = std::sync::Arc::new(|_: &n42_h2_consensus::N42Header, _: &PayloadAttributes, _: u64| None);
         // The build behind (6, on 5) sealed while 5 was untaken: its
         // successor was deferred, owned by it.
-        let built = alloy_consensus::Header { number: 6, parent_hash: B256::repeat_byte(5), ..Default::default() };
+        let built = n42_header::N42Header::from(alloy_consensus::Header { number: 6, parent_hash: B256::repeat_byte(5), ..Default::default() });
         {
             let mut state = chain.lock().unwrap();
             state.slot = Some(slot);

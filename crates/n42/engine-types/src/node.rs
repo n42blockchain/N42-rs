@@ -7,7 +7,8 @@
 //use crate::{EthEngineTypes, EthEvmConfig};
 //use n42_engine_primitives::{N42PayloadAttributes, N42PayloadBuilderAttributes};
 use alloy_eips::{eip7840::BlobParams, merge::EPOCH_SLOTS};
-use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
+use reth_chainspec::{EthChainSpec, EthereumHardforks};
+use n42_header::{N42ChainSpec, N42Header};
 pub use reth_node_ethereum::EthereumEngineValidator;
 use n42_qmdb_reth::{QmdbEngineValidatorBuilder, QmdbNodeState};
 //use reth_ethereum_consensus::EthBeaconConsensus;
@@ -79,7 +80,7 @@ impl N42Node {
         N42ConsensusBuilder,
     >
     where
-        Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = N42Primitives>>,
+        Node: FullNodeTypes<Types: NodeTypes<ChainSpec = N42ChainSpec, Primitives = N42Primitives>>,
         <Node::Types as NodeTypes>::Payload: PayloadTypes<
             BuiltPayload = N42BuiltPayload,
             PayloadAttributes = EthPayloadAttributes,
@@ -98,7 +99,7 @@ impl N42Node {
         N42ConsensusBuilder,
     >
     where
-        Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = N42Primitives>>,
+        Node: FullNodeTypes<Types: NodeTypes<ChainSpec = N42ChainSpec, Primitives = N42Primitives>>,
         <Node::Types as NodeTypes>::Payload: PayloadTypes<
             BuiltPayload = N42BuiltPayload,
             PayloadAttributes = EthPayloadAttributes,
@@ -153,8 +154,8 @@ impl N42Node {
 
 impl NodeTypes for N42Node {
     type Primitives = N42Primitives;
-    type ChainSpec = ChainSpec;
-    type Storage = EthStorage<N42TxEnvelope>;
+    type ChainSpec = N42ChainSpec;
+    type Storage = EthStorage<N42TxEnvelope, N42Header>;
     type Payload = N42EngineTypes;
 }
 
@@ -287,10 +288,21 @@ where
 }
 
 impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for N42Node {
-    type RpcBlock = alloy_rpc_types_eth::Block<alloy_rpc_types_eth::Transaction<N42TxEnvelope>>;
+    type RpcBlock = alloy_rpc_types_eth::Block<
+        alloy_rpc_types_eth::Transaction<N42TxEnvelope>,
+        alloy_rpc_types_eth::Header<N42Header>,
+    >;
 
     fn rpc_to_primitive_block(rpc_block: Self::RpcBlock) -> n42_tx_types::Block {
-        rpc_block.into_consensus().map_transactions(|tx| tx.inner.into_inner())
+        let alloy_rpc_types_eth::Block { header, transactions, withdrawals, .. } = rpc_block;
+        alloy_consensus::Block {
+            header: header.inner,
+            body: alloy_consensus::BlockBody {
+                transactions: transactions.into_transactions_vec().into_iter().map(|tx| tx.inner.into_inner()).collect(),
+                ommers: Vec::new(),
+                withdrawals,
+            },
+        }
     }
 
     fn local_payload_attributes_builder(
@@ -310,10 +322,10 @@ pub struct EthereumExecutorBuilder;
 
 impl<Types, Node> ExecutorBuilder<Node> for EthereumExecutorBuilder
 where
-    Types: NodeTypes<ChainSpec = ChainSpec, Primitives = N42Primitives>,
+    Types: NodeTypes<ChainSpec = N42ChainSpec, Primitives = N42Primitives>,
     Node: FullNodeTypes<Types = Types>,
 {
-    type EVM = N42EvmConfig<ChainSpec, crate::fast_transfer::N42EvmFactory>;
+    type EVM = N42EvmConfig<N42ChainSpec, crate::fast_transfer::N42EvmFactory>;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
         // The sender-recovery cache, as upstream's Ethereum node attaches it.

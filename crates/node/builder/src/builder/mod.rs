@@ -188,6 +188,19 @@ impl<DB, ChainSpec> NodeBuilder<DB, ChainSpec> {
         &mut self.database
     }
 
+    /// Replaces the chain spec, and with it the chain spec type, using `f`
+    /// (N42: the node runs on a chain spec over its own header type).
+    pub fn map_chainspec<F, C>(self, f: F) -> NodeBuilder<DB, C>
+    where
+        F: FnOnce(Arc<ChainSpec>) -> C,
+    {
+        NodeBuilder {
+            config: self.config.map_chainspec(f),
+            database: self.database,
+            rocksdb_provider: self.rocksdb_provider,
+        }
+    }
+
     /// Applies a fallible function to the builder.
     pub fn try_apply<F, R>(self, f: F) -> Result<Self, R>
     where
@@ -376,6 +389,15 @@ impl<DB, ChainSpec> WithLaunchContext<NodeBuilder<DB, ChainSpec>> {
     /// Returns a mutable reference to the node builder's config.
     pub const fn config_mut(&mut self) -> &mut NodeConfig<ChainSpec> {
         self.builder.config_mut()
+    }
+
+    /// Replaces the chain spec, and with it the chain spec type, using `f`
+    /// (see [`NodeBuilder::map_chainspec`]).
+    pub fn map_chainspec<F, C>(self, f: F) -> WithLaunchContext<NodeBuilder<DB, C>>
+    where
+        F: FnOnce(Arc<ChainSpec>) -> C,
+    {
+        WithLaunchContext { builder: self.builder.map_chainspec(f), task_executor: self.task_executor }
     }
 }
 

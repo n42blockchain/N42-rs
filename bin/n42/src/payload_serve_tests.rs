@@ -55,7 +55,7 @@ fn transactions(n: u64, salt: u8) -> Vec<n42_tx_types::N42TxEnvelope> {
 /// block hash distinct between tests that share the process-wide store.
 fn built(number: u64, n: u64, salt: u8, requests: Option<Vec<Bytes>>, bal: Option<Bytes>) -> N42BuiltPayload {
     let block = n42_tx_types::Block {
-        header: Header { number, extra_data: vec![salt].into(), ..Default::default() },
+        header: n42_header::N42Header::from(Header { number, extra_data: vec![salt].into(), ..Default::default() }),
         body: n42_tx_types::BlockBody { transactions: transactions(n, salt), ommers: Vec::new(), withdrawals: None },
     };
     let recovered = reth_primitives_traits::RecoveredBlock::new_sealed(
@@ -171,8 +171,8 @@ fn payload_data(header: &Header, hash: B256) -> ExecutionData {
     ExecutionData::new(ExecutionPayload::V1(v1), ExecutionPayloadSidecar::none())
 }
 
-fn built_header() -> Header {
-    Header {
+fn built_header() -> n42_header::N42Header {
+    n42_header::N42Header::from(Header {
         number: 90,
         parent_hash: B256::repeat_byte(9),
         beneficiary: Address::repeat_byte(4),
@@ -180,7 +180,7 @@ fn built_header() -> Header {
         gas_limit: 30_000_000,
         base_fee_per_gas: Some(7),
         ..Default::default()
-    }
+    })
 }
 
 #[test]
@@ -318,7 +318,7 @@ fn the_hash_tail_lists_every_transaction_hash_in_block_order() {
 #[test]
 fn an_assembled_block_becomes_a_road_block_with_its_senders_and_timings() {
     let sealed = SealedBlock::seal_slow(n42_tx_types::Block {
-        header: Header { number: 44, ..Default::default() },
+        header: n42_header::N42Header::from(Header { number: 44, ..Default::default() }),
         body: n42_tx_types::BlockBody { transactions: Vec::new(), ommers: Vec::new(), withdrawals: None },
     });
     let payload = payload_data(&sealed.header().clone(), sealed.hash());

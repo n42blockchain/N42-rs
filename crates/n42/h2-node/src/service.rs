@@ -53,7 +53,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_consensus::Header;
+use n42_h2_consensus::N42Header as Header;
 use alloy_primitives::{keccak256, Bytes, B256};
 use n42_h2_consensus::wire_bridge::{self, BridgeError};
 use n42_h2_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput};
@@ -957,7 +957,7 @@ impl HeaderQc {
 /// encoding wants, and the header came out of sealing.
 fn encode_own_body(
     execution: &alloy_rpc_types_engine::ExecutionData,
-    header: &alloy_consensus::Header,
+    header: &Header,
 ) -> Vec<u8> {
     let rewards = n42_h2_consensus::withdrawals_to_rewards(
         execution.payload.as_v2().map_or(&[][..], |v2| v2.withdrawals.as_slice()),
@@ -979,7 +979,7 @@ fn encode_own_body(
 /// this is byte for byte what `publish_body` makes of the whole block.
 fn elided_compact_body(
     execution: &alloy_rpc_types_engine::ExecutionData,
-    header: &alloy_consensus::Header,
+    header: &Header,
     tx_count: usize,
     tx_hashes: &[B256],
     frame_layout: &[(B256, u32)],
@@ -1004,7 +1004,7 @@ fn elided_compact_body(
 fn elided_compact_body_with(
     frame_blocks: bool,
     execution: &alloy_rpc_types_engine::ExecutionData,
-    header: &alloy_consensus::Header,
+    header: &Header,
     tx_count: usize,
     tx_hashes: &[B256],
     frame_layout: &[(B256, u32)],
@@ -1392,7 +1392,7 @@ fn tenure_first_on_output() -> bool {
 const fn head_stamp(remembered: Option<u64>, header: Option<&Header>) -> Option<u64> {
     match (remembered, header) {
         (Some(stamp), _) => Some(stamp),
-        (None, Some(header)) => Some(header.timestamp),
+        (None, Some(header)) => Some(header.inner.timestamp),
         (None, None) => None,
     }
 }
@@ -3801,7 +3801,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                     self.remember_block(built.hash, &header);
                 } else {
                     match built.execution_data.clone().into_block_raw() {
-                        Ok(block) => self.remember_block(built.hash, &block.header),
+                        Ok(block) => self.remember_block(
+                            built.hash,
+                            &n42_h2_consensus::header_engine::block_with_payload_root(block, &built.execution_data.payload).header,
+                        ),
                         Err(err) => debug!(target: "n42.h2.node", %err, "built payload has no header to remember"),
                     }
                 }
@@ -5582,7 +5585,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     fn publish_body(
         &mut self,
         execution: &alloy_rpc_types_engine::ExecutionData,
-        sealed: Option<&alloy_consensus::Header>,
+        sealed: Option<&Header>,
         tx_hashes: &[B256],
         frame_layout: &[(B256, u32)],
         encoded: Option<alloy_primitives::Bytes>,
@@ -6300,7 +6303,7 @@ mod tests {
 
     #[test]
     fn the_heads_stamp_falls_back_to_its_header() {
-        let header = Header { timestamp: 1_700_000_042, ..Default::default() };
+        let header: Header = alloy_consensus::Header { timestamp: 1_700_000_042, ..Default::default() }.into();
         assert_eq!(head_stamp(Some(1_700_000_000), Some(&header)), Some(1_700_000_000), "what the node saw wins");
         assert_eq!(head_stamp(None, Some(&header)), Some(1_700_000_042), "a restart reads the header");
         assert_eq!(head_stamp(None, None), None, "genesis, which has no parent at all");

@@ -168,6 +168,10 @@ fn view(dir: &std::path::Path) -> Arc<n42_qmdb_reth::QmdbReadView> {
     let path = dir.join("entries.log");
     let mut live = Vec::with_capacity((TOTAL_SENDERS + RECIPIENTS + 1) as usize);
     let mut out = std::io::BufWriter::new(std::fs::File::create(&path).expect("the entry file"));
+    // The slot offsets a tree would hold for the file: the view names
+    // records by slot.
+    let mut offsets = n42_twig_core::offsets::StandaloneOffsets::default();
+    let reader = offsets.reader();
     let mut offset = 0u64;
     let mut put = |address: Address, nonce: u64, balance: U256| {
         let key = gov5_account_key(&address.0 .0);
@@ -175,7 +179,8 @@ fn view(dir: &std::path::Path) -> Arc<n42_qmdb_reth::QmdbReadView> {
         out.write_all(&key).expect("write");
         out.write_all(&(value.len() as u32).to_le_bytes()).expect("write");
         out.write_all(&value).expect("write");
-        live.push((key, offset));
+        live.push((key, offsets.len()));
+        offsets.push(offset).expect("room");
         offset += 36 + value.len() as u64;
     };
     put(beneficiary(), 0, U256::from(7));
@@ -189,7 +194,7 @@ fn view(dir: &std::path::Path) -> Arc<n42_qmdb_reth::QmdbReadView> {
     drop(out);
     let mut sorted = live.clone();
     sorted.sort_unstable_by_key(|(key, _)| *key);
-    let view = n42_qmdb_reth::QmdbReadView::build(&path, (1, B256::ZERO), live).expect("the read view");
+    let view = n42_qmdb_reth::QmdbReadView::build(&path, reader, (1, B256::ZERO), live).expect("the read view");
     // `E1_JOURNALS` (default 0): the view advanced that many blocks past the
     // version the batches read at (1), each block a journal of ~190,000
     // keys, as when the database's readers stand behind the view during a

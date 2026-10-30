@@ -75,6 +75,21 @@ impl Inner {
     fn get(&self, slot: usize) -> Option<u64> {
         (slot < self.len.load(Ordering::Acquire)).then(|| self.segment(slot)[slot & MASK].load(Ordering::Acquire))
     }
+
+    /// `slot`'s cell without the length check: `None` only when no segment
+    /// covers it. One load of the (rarely written) directory and one acquire
+    /// load of the cell; the length, stored at every append, is not touched.
+    #[inline]
+    fn location(&self, slot: usize) -> Option<u64> {
+        let ptr = self.directory.get(slot >> OFFSET_SEGMENT_BITS)?.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null entry points at a live segment of
+        // `OFFSET_SEGMENT_SLOTS` atomics, freed only with `Inner`, and the
+        // index is masked below that length.
+        Some(unsafe { &*ptr.add(slot & MASK) }.load(Ordering::Acquire))
+    }
 }
 
 impl Drop for Inner {
@@ -272,6 +287,19 @@ impl OffsetsReader {
         usize::try_from(slot).ok().and_then(|slot| self.inner.get(slot))
     }
 
+    /// `slot`'s offset for a slot the caller knows the tree holds (below a
+    /// length it saw, and not truncated since): the read view's hot path,
+    /// which keeps to slots its guards cover and so skips the length, a
+    /// cache line the tree writes at every append. A retarget (compaction)
+    /// is seen with acquire: the offset is the old record or the new one,
+    /// both readable until the old range is punched (stage 3). For a slot
+    /// the tree does not hold the value is stale or zero, never out of
+    /// bounds; `None` only past every allocated segment.
+    #[inline]
+    pub fn location(&self, slot: u64) -> Option<u64> {
+        usize::try_from(slot).ok().and_then(|slot| self.inner.location(slot))
+    }
+
     /// Slots that hold an offset, as of now.
     pub fn len(&self) -> u64 {
         self.inner.len.load(Ordering::Acquire) as u64
@@ -280,6 +308,41 @@ impl OffsetsReader {
     /// Whether no slot holds an offset.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// Offsets of an entry file no tree owns: for tests and benches that write
+/// an entry file by hand and read it through a read view, which resolves
+/// slots through an [`OffsetsReader`]. The same structure as the tree's.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct StandaloneOffsets(Offsets);
+
+impl StandaloneOffsets {
+    /// Appends the next slot's offset.
+    pub fn push(&mut self, offset: u64) -> io::Result<()> {
+        self.0.push(offset)
+    }
+
+    /// Retargets `slot` (bit 63: `entries.relocated`); panics past the length.
+    #[track_caller]
+    pub fn set(&mut self, slot: u64, offset: u64) {
+        self.0.set(usize::try_from(slot).expect("a slot that fits"), offset);
+    }
+
+    /// Slots held.
+    pub fn len(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    /// Whether no slot is held.
+    pub fn is_empty(&self) -> bool {
+        self.0.len() == 0
+    }
+
+    /// A reader of these offsets.
+    pub fn reader(&self) -> OffsetsReader {
+        self.0.reader()
     }
 }
 
@@ -379,6 +442,62 @@ mod tests {
         done.store(true, Ordering::Release);
         assert!(watcher.join().expect("the reader thread") > 0);
         assert_eq!(reader.len(), next);
+    }
+
+    /// `location` answers what `get` answers below the length, needs no
+    /// length, and is `None` only past the allocated segments.
+    #[test]
+    fn location_matches_get_without_the_length() {
+        let mut offsets = StandaloneOffsets::default();
+        for n in 0..10u64 {
+            offsets.push(n * 3).expect("room");
+        }
+        let reader = offsets.reader();
+        for slot in 0..10 {
+            assert_eq!(reader.location(slot), reader.get(slot));
+        }
+        assert_eq!(reader.get(10), None);
+        assert_eq!(reader.location(10), Some(0), "an unwritten cell of an allocated segment");
+        assert_eq!(reader.location(OFFSET_SEGMENT_SLOTS as u64), None, "no segment");
+        assert_eq!(reader.location(u64::MAX), None);
+    }
+
+    /// Readers resolving slots while the writer retargets them see the old
+    /// location or the new one, never anything else.
+    #[test]
+    fn a_retarget_is_seen_whole() {
+        let mut offsets = Offsets::from_vec((0..4096u64).map(|slot| slot * 40).collect()).expect("room");
+        let reader = offsets.reader();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchers: Vec<_> = (0..3)
+            .map(|t| {
+                let (reader, done) = (reader.clone(), Arc::clone(&done));
+                std::thread::spawn(move || {
+                    let mut seen = 0u64;
+                    let mut slot = t * 101;
+                    while !done.load(Ordering::Acquire) {
+                        let location = reader.location(slot % 4096).expect("a segment");
+                        let old = (slot % 4096) * 40;
+                        assert!(location == old || location == (old + 7) | (1 << 63), "slot {slot}: {location:#x}");
+                        seen += u64::from(location != old);
+                        slot += 13;
+                    }
+                    seen
+                })
+            })
+            .collect();
+        for round in 0..64u64 {
+            for slot in (0..4096u64).filter(|slot| slot % 64 == round) {
+                offsets.set(slot as usize, (slot * 40 + 7) | (1 << 63));
+            }
+        }
+        done.store(true, Ordering::Release);
+        for watcher in watchers {
+            watcher.join().expect("a reader");
+        }
+        for slot in 0..4096u64 {
+            assert_eq!(reader.location(slot), Some((slot * 40 + 7) | (1 << 63)));
+        }
     }
 
     #[test]

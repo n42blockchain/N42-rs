@@ -1294,9 +1294,13 @@ impl QmdbNodeState {
         let built = forest
             .flush_entries_for_sync()
             .map_err(|e| e.to_string())
-            .and_then(|_| forest.live_entry_offsets().ok_or_else(|| "no entry file".to_owned()))
-            .and_then(|live| {
-                crate::read_view::QmdbReadView::build(&self.entry_file_path(), head, live).map_err(|e| e.to_string())
+            .and_then(|_| {
+                let live = forest.live_entry_slots().ok_or_else(|| "no entry file".to_owned())?;
+                let offsets = forest.entry_offsets_reader().ok_or_else(|| "no entry offsets (a leased tree?)".to_owned())?;
+                Ok((live, offsets))
+            })
+            .and_then(|(live, offsets)| {
+                crate::read_view::QmdbReadView::build(&self.entry_file_path(), offsets, head, live).map_err(|e| e.to_string())
             });
         match built {
             Ok(view) => {
@@ -1498,7 +1502,7 @@ impl QmdbNodeState {
                     let Some(block) = forest.block_changes_parts(hash) else { return Ok(None) };
                     parts.push(block);
                 }
-                let raised: Vec<_> = parts.iter().map(|block| view.raise_floor_to(block.max_offset())).collect();
+                let raised: Vec<_> = parts.iter().map(|block| view.raise_floor_to(block.max_slot())).collect();
                 forest.set_keep_from(Some(last + 1));
                 Ok(Some((parts, raised)))
             });

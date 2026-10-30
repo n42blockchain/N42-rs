@@ -65,10 +65,10 @@ pub struct PreparedBlock {
     /// The block's delta from its parent (see `BlockRecord::delta`); its head
     /// fields are filled in when the block is filed under its hash.
     delta: Option<ForestDelta>,
-    /// The entry-file offsets of the slots the block appended, in slot order,
-    /// captured by a root computed on a leased tree ([`TreeLease`]); see
-    /// `BlockRecord::offsets`.
-    offsets: Option<Arc<[u64]>>,
+    /// How many slots the block appended to the entry file, captured by a
+    /// root computed on a leased tree ([`TreeLease`]); see
+    /// `BlockRecord::appended`.
+    appended: Option<u64>,
 }
 
 impl PreparedBlock {
@@ -407,12 +407,12 @@ struct BlockRecord {
     /// the first persistence that uses it; `None` for a restored head and for
     /// a block persisted already.
     delta: Option<ForestDelta>,
-    /// The entry-file offsets of the slots the block appended (in slot order,
-    /// which is the order of its non-deleting operations), captured when its
-    /// root was computed on a leased tree. Present only while the block stays
-    /// applied as it was computed: a revert clears it, since a re-applied
-    /// block's records are written again.
-    offsets: Option<Arc<[u64]>>,
+    /// How many slots the block appended to the entry file (from its undo's
+    /// `prev_next_slot`, in the order of its non-deleting operations),
+    /// captured when its root was computed on a leased tree. Present only
+    /// while the block stays applied as it was computed: a revert clears it,
+    /// since a re-applied block's records are written again.
+    appended: Option<u64>,
 }
 
 /// What [`QmdbForest::set_canonical_releasing`] took out of the forest: the
@@ -581,7 +581,7 @@ pub struct LeasedRoot {
     ops: QmdbOps,
     undo: BlockUndo,
     delta: ForestDelta,
-    offsets: Option<Arc<[u64]>>,
+    appended: Option<u64>,
     phases: n42_twig_core::qmdb_compat::ApplyPhases,
     apply_us: u64,
     delta_us: u64,
@@ -601,7 +601,7 @@ impl TreeLease {
     }
 
     /// [`QmdbForest::compute_operations`]'s apply, on the leased tree: the
-    /// root, the undo, the delta and the appended slots' entry-file offsets.
+    /// root, the undo, the delta and how many slots it appended to the entry file.
     /// Nothing outside the tree is touched; [`QmdbForest::return_tree`] files
     /// the result as pending work.
     pub fn compute(&mut self, ops: impl Into<QmdbOps>) -> Result<LeasedRoot, StateError> {
@@ -622,41 +622,49 @@ impl TreeLease {
         let apply_us = applied_at.elapsed().as_micros() as u64;
         let delta_at = std::time::Instant::now();
         let tree = &self.tree;
-        let offsets = || {
-            tree.entry_file().is_some().then(|| appended_offsets(tree, undo.prev_next_slot)).flatten()
-        };
-        let (delta, offsets) = if n42_twig_core::qmdb_compat::parallel_apply() {
-            rayon::join(|| delta_of_applied(tree, &undo), offsets)
-        } else {
-            (delta_of_applied(tree, &undo), offsets())
-        };
+        // The read view names records by slot (`docs/QMDB_COMPACTION_DESIGN.md`
+        // 3.3): the appended slots follow from the cursor, nothing per slot
+        // is collected.
+        let appended = tree.entry_file().is_some().then(|| tree.next_slot().saturating_sub(undo.prev_next_slot));
+        let delta = delta_of_applied(tree, &undo);
         let delta_us = delta_at.elapsed().as_micros() as u64;
-        Ok(LeasedRoot { root: B256::from(root), ops, undo, delta, offsets, phases, apply_us, delta_us })
+        Ok(LeasedRoot { root: B256::from(root), ops, undo, delta, appended, phases, apply_us, delta_us })
     }
 }
 
 /// A filed block's changes as shared parts ([`QmdbForest::block_changes_parts`]):
-/// its operations and the offsets of the records it appended, listed outside
-/// the forest's lock with [`Self::changes`].
+/// its operations and the slots it appended, listed outside the forest's
+/// lock with [`Self::changes`].
 #[derive(Debug, Clone)]
 pub struct BlockChangesParts {
     ops: Arc<QmdbOps>,
-    offsets: Arc<[u64]>,
+    /// The block's first appended slot.
+    first_slot: u64,
+    /// How many slots it appended.
+    appended: u64,
 }
 
 impl BlockChangesParts {
-    /// The highest record offset the block appended, if it appended any.
-    pub fn max_offset(&self) -> Option<u64> {
-        self.offsets.last().copied()
+    /// The highest slot the block appended, if it appended any.
+    pub fn max_slot(&self) -> Option<u64> {
+        self.appended.checked_sub(1).map(|last| self.first_slot + last)
     }
 
     /// The same list as [`QmdbForest::block_changes`]: each operation's key in
-    /// key order with its record's offset, `None` for a deletion.
+    /// key order with the slot of its record, `None` for a deletion.
     pub fn changes(&self) -> Vec<([u8; 32], Option<u64>)> {
-        let mut appended = self.offsets.iter();
+        let mut next = self.first_slot;
         self.ops
             .iter()
-            .map(|(key, value)| (*key, if value.is_some() { appended.next().copied() } else { None }))
+            .map(|(key, value)| {
+                (
+                    *key,
+                    value.is_some().then(|| {
+                        next += 1;
+                        next - 1
+                    }),
+                )
+            })
             .collect()
     }
 }
@@ -673,20 +681,6 @@ fn log_switches_once() {
             "QMDB block apply (N42_QMDB_PARALLEL_APPLY)",
         );
     });
-}
-
-/// The entry-file offsets of the slots appended since `from`, in slot order
-/// (`None` when one is missing): on the worker pool with
-/// `N42_QMDB_PARALLEL_APPLY`, the same list either way.
-fn appended_offsets(tree: &QmdbCompatTree, from: u64) -> Option<Arc<[u64]>> {
-    use rayon::prelude::*;
-    let count = usize::try_from(tree.next_slot().saturating_sub(from)).ok()?;
-    let offsets = if n42_twig_core::qmdb_compat::parallel_apply() {
-        (0..count).into_par_iter().with_min_len(8192).map(|k| tree.entry_offset(from + k as u64)).collect::<Option<Vec<u64>>>()
-    } else {
-        (0..count).map(|k| tree.entry_offset(from + k as u64)).collect::<Option<Vec<u64>>>()
-    };
-    offsets.map(Arc::from)
 }
 
 /// The delta from the parent to the block just applied on `tree`; see
@@ -946,23 +940,23 @@ impl QmdbForest {
                 parent,
                 ops: computed.ops,
                 delta: Some(computed.delta),
-                offsets: computed.offsets,
+                appended: computed.appended,
             },
             renamed,
         ))
     }
 
     /// [`Self::block_changes`] without the tree: the block's shared
-    /// operations and the offsets captured when its root was computed on a
+    /// operations and the appended slots captured when its root was computed on a
     /// leased tree, for a block still applied as it was computed and whose
     /// records are all written to the file. `None` otherwise (the caller
     /// falls back to [`Self::block_changes`], which needs the tree).
     pub fn block_changes_parts(&self, block_hash: &B256) -> Option<BlockChangesParts> {
         let record = self.records.get(block_hash)?;
         let undo = record.undo.as_ref()?;
-        let offsets = record.offsets.clone()?;
-        let end = undo.prev_next_slot + offsets.len() as u64;
-        (end <= self.flushed_slots).then(|| BlockChangesParts { ops: Arc::clone(&record.ops), offsets })
+        let appended = record.appended?;
+        let end = undo.prev_next_slot + appended;
+        (end <= self.flushed_slots).then(|| BlockChangesParts { ops: Arc::clone(&record.ops), first_slot: undo.prev_next_slot, appended })
     }
 
     /// The canonical head as a file-mode checkpoint: the cursor and the
@@ -996,7 +990,7 @@ impl QmdbForest {
                 root,
                 undo: None,
                 delta: None,
-                offsets: None,
+                appended: None,
             },
         );
         Self {
@@ -1105,7 +1099,7 @@ impl QmdbForest {
     }
 
     /// What a filed block changed, as the entry file holds it: for each of its
-    /// operations in key order, the byte offset of the record it appended, or
+    /// operations in key order, the slot of the record it appended, or
     /// `None` for a deletion. `None` when the block is not applied on the
     /// tree's current path (its appended slots may hold another block's
     /// records), when its operations were not kept (a restored head), or when
@@ -1123,7 +1117,10 @@ impl QmdbForest {
         let mut changes = Vec::with_capacity(record.ops.len());
         for (key, value) in record.ops.iter() {
             if value.is_some() {
-                changes.push((*key, Some(self.tree.entry_offset(slot)?)));
+                if slot >= self.tree.next_slot() {
+                    return None;
+                }
+                changes.push((*key, Some(slot)));
                 slot += 1;
             } else {
                 changes.push((*key, None));
@@ -1180,10 +1177,18 @@ impl QmdbForest {
         })
     }
 
-    /// Every live entry's key and record offset at the tree's current block;
-    /// `None` without an entry file.
-    pub fn live_entry_offsets(&self) -> Option<Vec<([u8; 32], u64)>> {
-        self.tree.live_entry_offsets()
+    /// Every live entry's key and slot at the tree's current block; `None`
+    /// without an entry file.
+    pub fn live_entry_slots(&self) -> Option<Vec<([u8; 32], u64)>> {
+        self.tree.live_entry_slots()
+    }
+
+    /// A lock-free reader of the tree's slot offsets, which a read view
+    /// resolves its slots through; `None` without an entry file, or while
+    /// the tree is leased (the forest then holds a placeholder). Once taken
+    /// it follows the tree through leases: a lease moves the same tree.
+    pub fn entry_offsets_reader(&self) -> Option<n42_twig_core::offsets::OffsetsReader> {
+        self.tree.entry_offsets_reader()
     }
 
     /// Installs (or removes) the guard told before the entry file is cut.
@@ -1316,7 +1321,7 @@ impl QmdbForest {
             parent,
             ops,
             delta: Some(delta),
-            offsets: None,
+            appended: None,
         })
     }
 
@@ -1356,7 +1361,7 @@ impl QmdbForest {
             parent,
             ops,
             delta: Some(delta),
-            offsets: None,
+            appended: None,
         })
     }
 
@@ -1453,7 +1458,7 @@ impl QmdbForest {
                 root: prepared.root,
                 undo,
                 delta,
-                offsets: if applied { prepared.offsets } else { None },
+                appended: if applied { prepared.appended } else { None },
             },
         );
         if applied {
@@ -1867,16 +1872,16 @@ impl QmdbForest {
                 .undo
                 .take()
                 .ok_or(StateError::NotApplied(*hash))?;
-            let offsets = record.offsets.take();
+            let appended = record.appended.take();
             let parent = record.parent;
             if let Err(err) = self.tree.apply_undo(&undo) {
                 // A refused undo left the block applied: it keeps its undo
-                // (and its offsets), and the tree stands at it. A failure
+                // (and its appended count), and the tree stands at it. A failure
                 // part way poisons the forest.
                 let err = self.undo_failed(&format!("reverting block {hash}"), err);
                 if let Some(record) = self.records.get_mut(hash) {
                     record.undo = Some(undo);
-                    record.offsets = offsets;
+                    record.appended = appended;
                 }
                 self.tip = *hash;
                 return Err(err);
@@ -2539,7 +2544,7 @@ mod tests {
         // A sibling of block 2 computed and filed moves the tree off block 2.
         forest.apply(h(1), h(9), 2, &changes(9)).unwrap();
         forest.flush_entries_for_sync().unwrap();
-        let view = n42_twig_core::entry_view::EntryFileView::open(&path).unwrap();
+        let view = n42_twig_core::entry_view::SlotFileView::open(&path, forest.entry_offsets_reader().unwrap()).unwrap();
         let listed = forest.block_changes(&h(9)).expect("block 9 is on the tree's path");
         let ops = { let mut ops = changes(9).operations(); ops.sort_unstable_by_key(|op| op.key); ops };
         assert_eq!(listed.len(), ops.len());
@@ -2548,7 +2553,7 @@ mod tests {
             match (offset, &op.value) {
                 (Some(offset), Some(value)) => {
                     // SAFETY: a flushed record of this forest's file, not cut.
-                    let (k, v) = unsafe { view.record(*offset) };
+                    let (k, v) = unsafe { view.record(*offset) }.expect("the slot's record");
                     assert_eq!((k, v), (op.key, value.as_slice()));
                 }
                 (None, None) => {}
@@ -2557,16 +2562,16 @@ mod tests {
         }
         assert!(forest.block_changes(&h(2)).is_none(), "block 2 was reverted by the move to its sibling");
         assert!(forest.block_changes(&h(1)).is_some());
-        let live = forest.live_entry_offsets().unwrap();
+        let live = forest.live_entry_slots().unwrap();
         assert!(!live.is_empty());
         for (key, offset) in live {
             // SAFETY: a flushed record of this forest's file, not cut.
-            assert_eq!(unsafe { view.key(offset) }, key);
+            assert_eq!(unsafe { view.key(offset) }, Some(key));
         }
     }
 
     /// A canonical block whose undo a sibling's computation took is listed
-    /// again once the tree is stood back on its path, with the offsets of the
+    /// again once the tree is stood back on its path, with the slots of the
     /// records it re-appended.
     #[test]
     fn a_block_moved_off_the_path_by_a_sibling_is_listed_after_restoring_it() {
@@ -2587,7 +2592,7 @@ mod tests {
         assert!(forest.restore_path_to(&[h(2), h(3)], h(3)).unwrap());
         assert!(!forest.restore_path_to(&[h(2), h(3)], h(3)).unwrap(), "already on the path");
         forest.flush_entries_for_sync().unwrap();
-        let view = n42_twig_core::entry_view::EntryFileView::open(&path).unwrap();
+        let view = n42_twig_core::entry_view::SlotFileView::open(&path, forest.entry_offsets_reader().unwrap()).unwrap();
         for n in 2..=3u8 {
             let listed = forest.block_changes(&h(n)).expect("back on the tree's path");
             let ops = { let mut ops = changes(n).operations(); ops.sort_unstable_by_key(|op| op.key); ops };
@@ -2597,7 +2602,7 @@ mod tests {
                 match (offset, &op.value) {
                     // SAFETY: a flushed record of this forest's file, not cut.
                     (Some(offset), Some(value)) => {
-                        assert_eq!(unsafe { view.record(*offset) }, (op.key, value.as_slice()))
+                        assert_eq!(unsafe { view.record(*offset) }, Some((op.key, value.as_slice())))
                     }
                     other => panic!("mismatched change {other:?}"),
                 }

@@ -1674,13 +1674,14 @@ impl UpperTree {
     }
 }
 
-/// Told before a tree cuts its entry file, so a reader that addresses the file
-/// by byte offset outside the tree's lock (`crate::entry_view::EntryFileView`)
-/// can stop reading the bytes that are about to go: reading a mapped page past
-/// the file's end is a `SIGBUS`, not an error.
+/// Told before a tree cuts its entry file, so a reader that reads the file by
+/// slot outside the tree's lock (`crate::entry_view::SlotFileView`) can stop
+/// reading the records that are about to go: reading a mapped page past the
+/// file's end is a `SIGBUS`, not an error, and a cut slot's offset is reused
+/// by the next append.
 pub trait TruncationGuard: Send + Sync {
-    /// The file is about to be cut to `new_len` bytes. Returns once no reader
-    /// can still reach a record at or past `new_len`.
+    /// The tree is about to cut every slot from `new_len` on (a slot count,
+    /// not bytes). Returns once no reader can still reach one of them.
     fn before_truncate(&self, new_len: u64);
 }
 
@@ -1833,9 +1834,11 @@ impl QmdbCompatTree {
     }
 
     /// Byte offset of `slot`'s record in the entry file (`[key 32][len u32 LE]
-    /// [value]`); `None` in the heap or past the last slot. A record's bytes
-    /// never change once appended; only a truncation (`apply_undo`) removes
-    /// them, after telling the [`TruncationGuard`].
+    /// [value]`); `None` in the heap, past the last slot, or for a slot of a
+    /// compacted twig, whose record is in `entries.relocated` (resolve it
+    /// through [`Self::entry_offsets_reader`]). A record's bytes never change
+    /// once appended; only a truncation (`apply_undo`) removes them, after
+    /// telling the [`TruncationGuard`].
     pub fn entry_offset(&self, slot: u64) -> Option<u64> {
         self.entries.file_offset(usize::try_from(slot).ok()?)
     }
@@ -1847,14 +1850,15 @@ impl QmdbCompatTree {
         self.entries.offsets_reader()
     }
 
-    /// Every live entry's key and record offset, in slot order; `None` in the
-    /// heap. What a read view over the entry file is built from.
-    pub fn live_entry_offsets(&self) -> Option<Vec<(Hash, u64)>> {
+    /// Every live entry's key and slot, in slot order; `None` in the heap.
+    /// What a read view over the entry files is built from (it resolves the
+    /// slots through [`Self::entry_offsets_reader`]).
+    pub fn live_entry_slots(&self) -> Option<Vec<(Hash, u64)>> {
         self.entries.file_path()?;
         let mut out = Vec::with_capacity(self.index.len());
         for slot in 0..self.entries.len() {
             if self.entries.is_active(slot) {
-                out.push((self.entries.key(slot), self.entries.file_offset(slot)?));
+                out.push((self.entries.key(slot), slot as u64));
             }
         }
         Some(out)
@@ -2271,10 +2275,8 @@ impl QmdbCompatTree {
             twig.bits[local / 8] &= !(1 << (local % 8));
             touched_twigs.insert(twig_id);
         }
-        if let (true, Some(guard), Some(new_len)) =
-            (prev < self.next_slot, &self.truncation_guard, self.entries.file_offset(prev as usize))
-        {
-            guard.before_truncate(new_len);
+        if let (true, Some(guard)) = (prev < self.next_slot, &self.truncation_guard) {
+            guard.before_truncate(prev);
         }
         self.entries.truncate(prev as usize).map_err(|e| QmdbUndoError::Store(e.to_string()))?;
         self.next_slot = prev;

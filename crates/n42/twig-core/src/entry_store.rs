@@ -593,14 +593,11 @@ impl LogFile {
     }
 }
 
-/// A twig whose records were rewritten into `entries.relocated`.
+/// A twig whose records were rewritten into `entries.relocated`. The read
+/// view resolves slots through the shared offsets (stage 1), so no copy of
+/// the twig's old `entries.log` offsets is kept.
 #[derive(Clone, Debug)]
 struct RelocatedTwig {
-    /// Where `entries.log` holds the twig's slots, for [`FileEntries::offset`]:
-    /// the read view resolves byte offsets into `entries.log`, which keeps
-    /// every record in this stage. 16 KiB a compacted twig; stage 1 (a view
-    /// that resolves slots) and stage 3 (punching) retire it.
-    main: Box<[u64]>,
     /// The length of the twig's latest group in `entries.relocated`,
     /// trailer included.
     group_len: u64,
@@ -797,15 +794,11 @@ impl FileEntries {
         self.offsets.reader()
     }
 
-    /// Where `slot`'s record starts in `entries.log`: the main file keeps
-    /// every slot's record in this stage, a compacted one included, so the
-    /// read view's byte offsets stay valid.
+    /// Where `slot`'s record starts in `entries.log`; `None` for a slot of a
+    /// compacted twig, whose record is in `entries.relocated` (a reader
+    /// resolves it through [`Self::offsets_reader`]).
     pub(crate) fn offset(&self, slot: usize) -> Option<u64> {
-        let raw = self.offsets.get(slot)?;
-        if raw & RELOCATED_BIT == 0 {
-            return Some(raw);
-        }
-        self.twigs.get(&(slot / TWIG_SIZE)).map(|twig| twig.main[slot % TWIG_SIZE])
+        self.offsets.get(slot).filter(|raw| raw & RELOCATED_BIT == 0)
     }
 
     /// `slot`'s key, `None` for a hash-only slot: the key index's
@@ -1215,15 +1208,14 @@ impl FileEntries {
         let start = file.append_unit(&group.bytes)?;
         // Durable before any slot points at it.
         file.sync()?;
-        let main: Box<[u64]> = match self.twigs.remove(&twig) {
-            Some(relocated) => relocated.main,
-            None => (base..base + TWIG_SIZE).map(|slot| self.offsets.at(slot)).collect(),
-        };
+        // Each slot is retargeted with a release store: a reader that loaded
+        // the old location keeps reading the old record, which stays where it
+        // is (nothing is punched before stage 3's reader epoch).
         for (local, at) in group.starts.iter().enumerate() {
             self.offsets.set(base + local, (start + u64::from(*at)) | RELOCATED_BIT);
         }
         let written = group.bytes.len() as u64;
-        self.twigs.insert(twig, RelocatedTwig { main, group_len: written, dead: group.dead });
+        self.twigs.insert(twig, RelocatedTwig { group_len: written, dead: group.dead });
         Ok(Relocation { written, reclaimable })
     }
 
@@ -1369,15 +1361,10 @@ fn open_relocated(
                 good = at;
                 continue;
             }
-            let main = &mut offsets[base..base + TWIG_SIZE];
-            let entry = twigs.entry(twig).or_insert_with(|| RelocatedTwig {
-                main: main.iter().copied().collect(),
-                group_len: 0,
-                dead: 0,
-            });
+            let entry = twigs.entry(twig).or_insert_with(|| RelocatedTwig { group_len: 0, dead: 0 });
             entry.group_len = at - group_start;
             entry.dead = dead_hash_count;
-            for (offset, start) in main.iter_mut().zip(&starts) {
+            for (offset, start) in offsets[base..base + TWIG_SIZE].iter_mut().zip(&starts) {
                 *offset = start | RELOCATED_BIT;
             }
             group_starts.push(group_start);
@@ -2042,8 +2029,11 @@ mod tests {
         assert!(file.is_hash_only(0) && !file.is_hash_only(1));
         assert_eq!(file.key(1), Some(&key_n(1)));
         assert_eq!(file.value(1), &[1u8; 9]);
-        // The read view's offsets stay in entries.log.
-        assert_eq!(file.offset(1), Some((KEY_LEN + LEN_LEN + 9) as u64));
+        // A relocated slot has no entries.log offset: readers resolve it
+        // through the shared offsets, bit 63 naming entries.relocated.
+        assert_eq!(file.offset(1), None);
+        assert_ne!(file.offsets_reader().get(1).unwrap() & RELOCATED_BIT, 0);
+        assert_eq!(file.offset(TWIG_SIZE), Some((TWIG_SIZE * (KEY_LEN + LEN_LEN + 9)) as u64));
         let error = file.truncate(TWIG_SIZE - 1).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(file.len(), 3 * TWIG_SIZE);

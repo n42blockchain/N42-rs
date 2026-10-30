@@ -8031,6 +8031,10 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         let path = dir.join("entries.log");
         let mut live = Vec::with_capacity((senders + recipients) as usize);
+        // The slot offsets a tree would hold for the file: the view names
+        // records by slot.
+        let mut offsets = n42_twig_core::offsets::StandaloneOffsets::default();
+        let reader = offsets.reader();
         {
             let mut out = std::io::BufWriter::new(std::fs::File::create(&path).expect("the entry file"));
             let mut offset = 0u64;
@@ -8040,7 +8044,8 @@ mod tests {
                 out.write_all(&key).expect("write");
                 out.write_all(&(value.len() as u32).to_le_bytes()).expect("write");
                 out.write_all(&value).expect("write");
-                live.push((key, offset));
+                live.push((key, offsets.len()));
+                offsets.push(offset).expect("room");
                 offset += 36 + value.len() as u64;
             };
             // The beneficiary exists, as on the chain (the fast path leaves
@@ -8054,7 +8059,7 @@ mod tests {
             }
             out.flush().expect("flush");
         }
-        let view = n42_qmdb_reth::QmdbReadView::build(&path, (1, B256::ZERO), live).expect("the read view");
+        let view = n42_qmdb_reth::QmdbReadView::build(&path, reader, (1, B256::ZERO), live).expect("the read view");
         // The parent block's changes: 150,000 accounts it touched.
         let mut overlay = alloy_primitives::map::AddressHashMap::default();
         for i in 0..150_000u64 {

@@ -18,7 +18,22 @@ alloy-rlp.workspace = true
 reth-primitives-traits = { workspace = true, features = ["std", "serde", "reth-codec"] }
 reth-codecs = { workspace = true, features = ["std", "alloy"] }
 derive_more.workspace = true
+bytes.workspace = true
 serde = { workspace = true, features = ["derive", "std"] }
+# `N42ChainSpec` (feature `chainspec`): the node's chain spec over this header.
+reth-chainspec = { workspace = true, optional = true }
+reth-network-peers = { workspace = true, optional = true }
+alloy-eips = { workspace = true, optional = true }
+alloy-genesis = { workspace = true, optional = true }
+alloy-evm = { workspace = true, optional = true }
+# The registry root on the Engine API (feature `engine`).
+alloy-rpc-types-engine = { workspace = true, optional = true, features = ["serde"] }
+thiserror = { workspace = true, optional = true }
+
+[features]
+default = []
+chainspec = ["dep:reth-chainspec", "dep:reth-network-peers", "dep:alloy-eips", "dep:alloy-genesis", "dep:alloy-evm"]
+engine = ["dep:alloy-rpc-types-engine", "dep:alloy-eips", "dep:thiserror"]
 
 [dev-dependencies]
 serde_json = { workspace = true, features = ["std"] }

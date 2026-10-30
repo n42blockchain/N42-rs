@@ -15,12 +15,20 @@
 //! a hash position as `None`. Both re-encode to the same `0x80`; the bytes,
 //! and therefore the hash, round-trip.
 
+extern crate alloc;
+
 use alloy_consensus::Header;
-use alloy_primitives::{keccak256, Address, BlockNumber, Bloom, Bytes, Sealable, B256, B64, U256};
+use alloy_primitives::{keccak256, Address, BlockHash, BlockNumber, Bloom, Bytes, Sealable, B256, B64, U256};
 use alloy_rlp::{BufMut, Decodable, Encodable, EMPTY_STRING_CODE};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "chainspec")]
+mod chainspec;
 mod compact;
+#[cfg(feature = "engine")]
+pub mod engine;
+#[cfg(feature = "chainspec")]
+pub use chainspec::N42ChainSpec;
 pub use compact::N42_HEADER_COMPACT_MARKER;
 
 /// Optional elements: 16 `base_fee_per_gas` .. 24 `mobile_registry_root`.
@@ -61,6 +69,38 @@ impl From<Header> for N42Header {
     fn from(inner: Header) -> Self {
         Self { inner, mobile_registry_root: None }
     }
+}
+
+impl From<N42Header> for Header {
+    fn from(header: N42Header) -> Self {
+        header.inner
+    }
+}
+
+impl N42Header {
+    /// A header with `root` as its `mobile_registry_root`.
+    pub const fn new(inner: Header, mobile_registry_root: Option<B256>) -> Self {
+        Self { inner, mobile_registry_root }
+    }
+
+    /// Ethereum's part of the header, without the registry root.
+    pub fn into_inner(self) -> Header {
+        self.inner
+    }
+}
+
+/// Re-seals an Ethereum header as an [`N42Header`] without a registry root.
+/// Its hash is unchanged: a header without the root encodes as alloy's.
+pub fn seal_from_alloy(sealed: reth_primitives_traits::SealedHeader<Header>) -> reth_primitives_traits::SealedHeader<N42Header> {
+    let (header, hash) = sealed.split();
+    reth_primitives_traits::SealedHeader::new(N42Header::from(header), hash)
+}
+
+/// The Ethereum view of a sealed [`N42Header`], for code that only reads
+/// Ethereum's fields. The hash is the N42 header's (the registry root, when
+/// set, is part of it).
+pub fn seal_to_alloy(sealed: &reth_primitives_traits::SealedHeader<N42Header>) -> reth_primitives_traits::SealedHeader<Header> {
+    reth_primitives_traits::SealedHeader::new(sealed.header().inner.clone(), sealed.hash())
 }
 
 impl AsRef<Self> for N42Header {
@@ -340,6 +380,35 @@ impl reth_primitives_traits::InMemorySize for N42Header {
 }
 
 impl reth_primitives_traits::BlockHeader for N42Header {}
+
+reth_codecs::impl_compression_for_compact!(N42Header);
+
+impl reth_primitives_traits::header::HeaderMut for N42Header {
+    fn set_parent_hash(&mut self, hash: BlockHash) {
+        self.inner.parent_hash = hash;
+    }
+    fn set_block_number(&mut self, number: BlockNumber) {
+        self.inner.number = number;
+    }
+    fn set_timestamp(&mut self, timestamp: u64) {
+        self.inner.timestamp = timestamp;
+    }
+    fn set_state_root(&mut self, state_root: B256) {
+        self.inner.state_root = state_root;
+    }
+    fn set_difficulty(&mut self, difficulty: U256) {
+        self.inner.difficulty = difficulty;
+    }
+    fn set_mix_hash(&mut self, mix_hash: B256) {
+        self.inner.mix_hash = mix_hash;
+    }
+    fn set_extra_data(&mut self, extra_data: Bytes) {
+        self.inner.extra_data = extra_data;
+    }
+    fn set_parent_beacon_block_root(&mut self, parent_beacon_block_root: Option<B256>) {
+        self.inner.parent_beacon_block_root = parent_beacon_block_root;
+    }
+}
 
 #[cfg(test)]
 mod tests {

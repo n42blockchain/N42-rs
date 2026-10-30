@@ -7693,6 +7693,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-header"
+version = "2.1.5"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives 1.7.3",
+ "alloy-rlp",
+ "derive_more 2.1.1",
+ "hex",
+ "reth-primitives-traits 0.8.2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "n42-legacy-codec"
 version = "0.1.0"
 dependencies = [

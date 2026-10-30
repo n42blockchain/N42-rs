@@ -2649,6 +2649,7 @@ where
                         Some(&mut before_batches),
                         counted_tips,
                         prepared_exec,
+                        deferred_now,
                     )
                 } else {
                     crate::parallel_transfer::execute_for_build_counted(
@@ -2661,6 +2662,7 @@ where
                         None,
                         counted_tips,
                         prepared_exec,
+                        deferred_now,
                     )
                 };
                 let exec_done = std::time::Instant::now();
@@ -5098,6 +5100,30 @@ where
         return Ok(BuildOutcome::Aborted { fees: U256::ZERO, cached_reads });
     }
 
+    // Audit R3-E1: under deferred execution a follower votes for the block
+    // before executing it and checks that it is includable instead
+    // (`bin/n42/src/follower_import.rs` `check_includable_laid_out`; gov5
+    // the same, docs/PHASE_D_DEFERRED_EXECUTION.md 2.4): the transactions'
+    // gas limits within the block's, and each sender's summed worst-case
+    // cost (`frame_scan::tx_cost`) within its balance in the parent's
+    // post-state. The loop admits by that rule there, by reth's (the gas
+    // used, what executes) otherwise. Everything executed before the loop is
+    // the parallel step's: plain transfers whose gas limit is
+    // MIN_TRANSACTION_GAS, the gas each used (`transfer_key`), so their gas
+    // limits are `cumulative_gas_used`.
+    //
+    // The rest of the follower's rule holds by execution: the executor takes
+    // a transaction only at its sender's in-block nonce (so a sender's
+    // transactions run on from the parent's nonce, the pool yielding each
+    // sender's in nonce order), and only with its fee cap at or over the
+    // base fee and its tip at or under the cap (revm's checks, none disabled
+    // here).
+    let mut gas_budget = crate::includability::GasBudget::new(block_gas_limit, deferred_now);
+    gas_budget.admit(cumulative_gas_used);
+    let mut sender_ledger = deferred_now.then(crate::includability::SenderLedger::new);
+    // Whether the parallel step put transactions in the block: a sender of
+    // theirs met again here has a worst case the ledger has not counted.
+    let built_before_loop = tx_count > 0;
     loop {
         // Once the block cannot fit even the smallest transaction there is
         // nothing left to take: every further candidate would only be
@@ -5106,7 +5132,7 @@ where
         // nothing is taken from the queue and left neither built nor returned.
         // Closed as well after a parallel step that skipped a block's worth
         // (`AfterParallelStep::Finish`): what was taken goes back below.
-        if serial_closed || block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS {
+        if serial_closed || gas_budget.left(cumulative_gas_used) < MIN_TRANSACTION_GAS {
             break;
         }
         // The pool/execution split is timed with the cycle counter, not the
@@ -5196,7 +5222,7 @@ where
         if tx_count == 0 { build_stage.at(3); }
         debug!(target: "payload_builder", tx_count, tx_hash=?pool_tx.hash(), gas_limit=pool_tx.gas_limit(), "processing transaction from pool");
         // ensure we still have capacity for this transaction
-        if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
+        if !gas_budget.fits(pool_tx.gas_limit(), cumulative_gas_used) {
             // we can't fit this transaction into the block, so we need to mark it as invalid
             // which also removes all dependent transaction from the iterator before we can
             // continue
@@ -5261,6 +5287,52 @@ where
                 continue;
             }
         }
+
+        // Audit R3-E1: the sender's worst case within its parent balance
+        // (deferred execution only). The account is read below the block's
+        // state, from the parent's post-state the build executes on, once per
+        // sender; the admission is committed only once the transaction is in.
+        let admitted = match sender_ledger.as_mut() {
+            None => None,
+            Some(ledger) => {
+                use crate::includability::{Admission, Opening};
+                let sender = pool_tx.sender();
+                let nonce = pool_tx.nonce();
+                let verdict = ledger.admit(sender, crate::frame_scan::tx_cost(tx.inner()), || {
+                    let db = builder.evm_mut().db_mut();
+                    let read = |err: &dyn std::fmt::Display| std::io::Error::other(format!("account {sender}: {err}"));
+                    let parent = db.database.basic(sender).map_err(|err| read(&err))?.unwrap_or_default();
+                    // A nonce past the parent's after the parallel step: the
+                    // sender's transfers are in the block when its in-block
+                    // nonce moved (a gap otherwise, which execution refuses).
+                    let unseen_earlier = built_before_loop
+                        && nonce > parent.nonce
+                        && db.basic(sender).map_err(|err| read(&err))?.map_or(0, |now| now.nonce) != parent.nonce;
+                    Ok::<_, std::io::Error>(Opening { balance: parent.balance, unseen_earlier })
+                });
+                match verdict {
+                    Ok(Admission::Admit(admitted)) => Some(admitted),
+                    Ok(Admission::OverBalance { balance, cost }) => {
+                        trace!(target: "payload_builder", tx = ?tx.hash(), %balance, %cost, "skipping a transaction whose sender's worst case exceeds its balance");
+                        refuse!(
+                            &pool_tx,
+                            InvalidPoolTransactionError::Consensus(InvalidTransactionError::InsufficientFunds(
+                                reth_primitives_traits::GotExpected { got: balance, expected: cost }.into(),
+                            ))
+                        );
+                        continue;
+                    }
+                    Ok(Admission::Unseen) => {
+                        refuse!(
+                            &pool_tx,
+                            InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit)
+                        );
+                        continue;
+                    }
+                    Err(err) => return Err(PayloadBuilderError::other(err)),
+                }
+            }
+        };
 
         // What the bookkeeping after execution needs, taken before the
         // transaction is moved into the executor (it used to be cloned).
@@ -5341,6 +5413,10 @@ where
         let tx_gas_used = gas_used.tx_gas_used();
         total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
         cumulative_gas_used += tx_gas_used;
+        gas_budget.admit(pool_tx.gas_limit());
+        if let Some(admitted) = admitted {
+            admitted.commit();
+        }
     }
 
     debug!(target: "payload_builder", tx_count, ?cumulative_gas_used, ?total_fees, "payload builder finished processing transactions");
@@ -6423,5 +6499,255 @@ mod hand_out_early_tests {
         assert_eq!(kept.fees(), U256::from(3));
         // The hand-off's move then succeeds: the last holder unwraps it.
         assert!(Arc::try_unwrap(recovered).is_ok());
+    }
+}
+
+/// Audit R3-E1: under deferred execution the builder admits only what the
+/// follower's includability check (`bin/n42/src/follower_import.rs`,
+/// `check_includable_laid_out`) accepts; before the fork, reth's rule.
+#[cfg(test)]
+mod includability_tests {
+    use super::*;
+    use alloy_consensus::{Header, Signed, TxEip1559};
+    use alloy_primitives::{Address, Bytes, Signature, TxKind};
+    use reth_basic_payload_builder::PayloadConfig;
+    use reth_chainspec::ChainSpecBuilder;
+    use reth_primitives_traits::{Recovered, RecoveredBlock, SealedHeader};
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+    use reth_transaction_pool::{
+        error::InvalidPoolTransactionError,
+        identifier::{SenderId, TransactionId},
+        noop::NoopTransactionPool,
+        TransactionOrigin,
+    };
+    use std::collections::{HashMap, VecDeque};
+
+    type Pooled = crate::N42PooledTransaction;
+    type Candidate = Arc<ValidPoolTransaction<Pooled>>;
+
+    const GAS_LIMIT: u64 = 1_000_000;
+    const BASE_FEE: u64 = 1_000_000_000;
+    const TIMESTAMP: u64 = 1_800_000_000;
+
+    /// The pool's best transactions, in the order given: a refusal drops the
+    /// sender's later transactions, as reth's iterator does.
+    struct Listed {
+        txs: VecDeque<Candidate>,
+        refused: Vec<Address>,
+    }
+
+    impl Iterator for Listed {
+        type Item = Candidate;
+        fn next(&mut self) -> Option<Candidate> {
+            loop {
+                let tx = self.txs.pop_front()?;
+                if !self.refused.contains(&tx.sender()) {
+                    return Some(tx);
+                }
+            }
+        }
+    }
+
+    impl BestTransactions for Listed {
+        fn mark_invalid(&mut self, transaction: &Candidate, _kind: InvalidPoolTransactionError) {
+            self.refused.push(transaction.sender());
+        }
+        fn no_updates(&mut self) {}
+        fn skip_blobs(&mut self) {}
+        fn set_skip_blobs(&mut self, _skip_blobs: bool) {}
+    }
+
+    fn address(i: u64) -> Address {
+        let mut a = [0u8; 20];
+        a[12..].copy_from_slice(&i.to_be_bytes());
+        Address::from(a)
+    }
+
+    /// A transfer of `sender` at `nonce`: `gas_limit`, fee cap 10 gwei, tip
+    /// 1 gwei (2 gwei effective at the 1 gwei base fee), value 1.
+    fn transfer(sender: u64, nonce: u64, gas_limit: u64) -> Candidate {
+        let inner = TxEip1559 {
+            chain_id: 1,
+            nonce,
+            gas_limit,
+            max_fee_per_gas: 10_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(address(1_000_000 + sender * 1_000 + nonce)),
+            value: U256::from(1),
+            input: Bytes::new(),
+            ..Default::default()
+        };
+        let signed = Signed::new_unchecked(inner, Signature::test_signature(), B256::random());
+        let envelope = TransactionSigned::from(reth_ethereum_primitives::TransactionSigned::from(signed));
+        let encoded = alloy_eips::eip2718::Encodable2718::encode_2718_len(&envelope);
+        Arc::new(ValidPoolTransaction {
+            transaction: Pooled::new(Recovered::new_unchecked(envelope, address(sender)), encoded),
+            transaction_id: TransactionId::new(SenderId::from(sender), nonce),
+            propagate: false,
+            timestamp: std::time::Instant::now(),
+            origin: TransactionOrigin::External,
+            authority_ids: None,
+        })
+    }
+
+    fn chain(deferred: bool) -> Arc<ChainSpec> {
+        let mut genesis = alloy_genesis::Genesis::default();
+        if deferred {
+            genesis
+                .config
+                .extra_fields
+                .insert(reth_chainspec::qmdb::DEFERRED_EXECUTION_TIME_KEY.to_owned(), serde_json::json!(TIMESTAMP));
+        }
+        Arc::new(ChainSpecBuilder::mainnet().genesis(genesis).prague_activated().build())
+    }
+
+    /// The block built over `accounts` from `txs`, the first past the fork
+    /// (deferred execution from `TIMESTAMP`) when `deferred`.
+    fn build(deferred: bool, accounts: &[(Address, u64, U256)], txs: Vec<Candidate>) -> RecoveredBlock<n42_tx_types::Block> {
+        let spec = chain(deferred);
+        let client = MockEthProvider::default().with_chain_spec((*spec).clone());
+        for (address, nonce, balance) in accounts {
+            client.add_account(*address, ExtendedAccount::new(*nonce, *balance));
+        }
+        // Far above any height another test marks decided (the process-wide
+        // `canonical_head`, which would decline the build), and before the
+        // fork, so the header carries the parent's own fields.
+        let parent = Header {
+            number: 1_000_000_000,
+            gas_limit: GAS_LIMIT,
+            gas_used: GAS_LIMIT / 2,
+            base_fee_per_gas: Some(BASE_FEE),
+            timestamp: TIMESTAMP - 4,
+            withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
+            parent_beacon_block_root: Some(B256::ZERO),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
+            ..Default::default()
+        };
+        let attributes = EthPayloadAttributes {
+            timestamp: TIMESTAMP,
+            prev_randao: B256::ZERO,
+            suggested_fee_recipient: address(7),
+            withdrawals: Some(Vec::new()),
+            parent_beacon_block_root: Some(B256::ZERO),
+            slot_number: None,
+            target_gas_limit: None,
+        };
+        let config = PayloadConfig {
+            parent_header: Arc::new(SealedHeader::seal_slow(parent)),
+            parent_block_info: None,
+            attributes,
+            payload_id: Default::default(),
+        };
+        let args = BuildArguments::new(Default::default(), None, None, config, Default::default(), None);
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(
+            spec.clone(),
+            crate::fast_transfer::N42EvmFactory::with_fast_transfers(false),
+        );
+        let listed = Listed { txs: txs.into(), refused: Vec::new() };
+        let outcome = default_n42_payload(
+            evm_config,
+            client,
+            NoopTransactionPool::<Pooled>::new(),
+            EthereumBuilderConfig::new().with_gas_limit(GAS_LIMIT),
+            args,
+            move |_| Box::new(listed) as BestTransactionsIter<NoopTransactionPool<Pooled>>,
+            Arc::new(crate::hotstuff_consensus::HotStuffConsensus::new(spec)),
+            None,
+            None,
+            None,
+        )
+        .expect("the build");
+        let payload = outcome.into_payload().expect("a payload");
+        payload.recovered_block().clone()
+    }
+
+    /// The follower's verdict, recomputed over a built block (the follower's
+    /// own functions live in `bin/n42`): the gas limits' sum within the
+    /// header's, and per sender in block order nonces on from the parent's,
+    /// fee cap over the base fee, tip under the cap, and the summed
+    /// worst-case cost within the parent's balance.
+    fn follower_verdict(block: &RecoveredBlock<n42_tx_types::Block>, accounts: &[(Address, u64, U256)]) -> Result<(), String> {
+        let header = block.header();
+        let base_fee = u128::from(header.base_fee_per_gas.unwrap_or(0));
+        let gas: u64 = block.body().transactions.iter().map(|tx| tx.gas_limit()).sum();
+        if gas > header.gas_limit {
+            return Err(format!("gas limits sum to {gas}, over the block's {}", header.gas_limit));
+        }
+        let mut ledger: HashMap<Address, (u64, U256)> = HashMap::new();
+        for (tx, sender) in block.body().transactions.iter().zip(block.senders()) {
+            let (nonce, balance) = accounts.iter().find(|(a, _, _)| a == sender).map_or((0, U256::ZERO), |(_, n, b)| (*n, *b));
+            let entry = ledger.entry(*sender).or_insert((nonce, U256::ZERO));
+            if tx.nonce() != entry.0 {
+                return Err(format!("{sender}: nonce {}, expected {}", tx.nonce(), entry.0));
+            }
+            if tx.max_fee_per_gas() < base_fee || tx.max_priority_fee_per_gas().is_some_and(|tip| tip > tx.max_fee_per_gas()) {
+                return Err(format!("{sender}: fees"));
+            }
+            entry.0 += 1;
+            entry.1 += crate::frame_scan::tx_cost(tx);
+            if entry.1 > balance {
+                return Err(format!("{sender}: cost {} over a balance of {balance}", entry.1));
+            }
+        }
+        Ok(())
+    }
+
+    const RICH: U256 = U256::from_limbs([0, 1, 0, 0]);
+
+    /// Thirty transfers of 60,000 gas limit that use 21,000 each: the gas
+    /// used fits a 1,000,000 block, the gas limits do not.
+    fn headroom_case() -> (Vec<(Address, u64, U256)>, Vec<Candidate>) {
+        let accounts: Vec<_> = (1..=30).map(|s| (address(s), 0, RICH)).collect();
+        let txs = (1..=30).map(|s| transfer(s, 0, 60_000)).collect();
+        (accounts, txs)
+    }
+
+    #[test]
+    fn a_deferred_build_keeps_the_gas_limits_within_the_block() {
+        let (accounts, txs) = headroom_case();
+        let block = build(true, &accounts, txs);
+        let gas: u64 = block.body().transactions.iter().map(|tx| tx.gas_limit()).sum();
+        assert!(gas <= block.header().gas_limit, "gas limits {gas} over {}", block.header().gas_limit);
+        assert_eq!(block.body().transactions.len(), (GAS_LIMIT / 60_000) as usize, "as many as the limits allow");
+        follower_verdict(&block, &accounts).expect("the follower accepts the block");
+    }
+
+    #[test]
+    fn a_build_before_the_fork_budgets_by_gas_used() {
+        let (accounts, txs) = headroom_case();
+        let block = build(false, &accounts, txs);
+        assert_eq!(block.body().transactions.len(), 30, "reth's rule: every transaction executes within the gas");
+    }
+
+    /// The worst-case cost of one transfer: 21,000 x 10 gwei + 1.
+    fn worst() -> U256 {
+        U256::from(21_000u64 * 10_000_000_000 + 1)
+    }
+
+    /// Sender 1 can pay two transfers at the effective price, and each at
+    /// its fee cap on its own, but not both at the fee cap; sender 2 is rich.
+    fn balance_case() -> (Vec<(Address, u64, U256)>, Vec<Candidate>) {
+        let accounts = vec![(address(1), 0, worst() * U256::from(2) - U256::from(1)), (address(2), 0, RICH)];
+        let txs = vec![transfer(1, 0, 21_000), transfer(1, 1, 21_000), transfer(2, 0, 21_000), transfer(2, 1, 21_000)];
+        (accounts, txs)
+    }
+
+    #[test]
+    fn a_deferred_build_keeps_each_senders_worst_case_within_its_balance() {
+        let (accounts, txs) = balance_case();
+        let block = build(true, &accounts, txs);
+        let of = |s: u64| block.senders().iter().filter(|a| **a == address(s)).count();
+        assert_eq!(of(1), 1, "the second transfer could cost more than sender 1 has");
+        assert_eq!(of(2), 2, "the other sender's transfers are still in");
+        follower_verdict(&block, &accounts).expect("the follower accepts the block");
+    }
+
+    #[test]
+    fn a_build_before_the_fork_admits_what_executes() {
+        let (accounts, txs) = balance_case();
+        let block = build(false, &accounts, txs);
+        assert_eq!(block.body().transactions.len(), 4, "reth's rule: both of sender 1's transfers execute");
     }
 }

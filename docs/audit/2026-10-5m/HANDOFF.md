@@ -192,3 +192,32 @@ R3-N1/N2/N3/N6/C3/G2 的 A/B 一并闭合。一处差别可记:两条审计后�
 启动 TC(leader 已提案、票未到,6 s 后进 view 2),两条审计前的腿没有;但 10-28 的 `fq` 腿(与审计前
 同一二进制)也有 7 条,属启动时序,窗口内无影响。新电源下守护峰值 349 W / Tctl 54 C。
 
+### 第二轮 Linux 结果:main `a2407baf8` 与 10-30 的 Windows 合入(2026-10-30 03:05-05:10 UTC)
+
+同一条链在 main `a2407baf8`(= `addaa480a` + 一个测试修复)上再跑一遍:72 套件 ok、check、check --workspace、
+natives、x22 探针逐字相同(28 / 21 / 7)、devnet 三形态同哈希(gov5late 160 块、late 121、absent 185;各节点
+日志无 header-QC 拒绝,gov5 无 error —— R3-C2 的 devnet 验收)、`roll --kill` 三节点恢复、clippy 1500。
+
+随后 Windows 推送 main `5a0d895c3`(tx-queue R3-P2/P3/P4、R3-N4、R2-C9 余项、R2-C1、R3-P5/P6/P7、R2-R2、R3-G4)。
+Linux 把 `fix/r3-e1-builder-includability` 合上它(`6f0913d92`,R3-E1/E3 + 全部 10-30 合入),十个 crate 50 套件 ok,
+`cargo check -p n42 -p n42-h2-node --tests --examples` 通过,natives 构建后做"上表待 A/B 项"要求的一次腿对照 ——
+bench stage `fw`(`bench/main-x11t16` `08ab10dd0`,`LOOP351_QC_BIN` 指向该树):
+
+| 腿 | 二进制 | win1 | win2 | win3 | 轮总量 | cycle | 满块 |
+|---|---|---|---|---|---|---|---|
+| VNa | `6f0913d92`(main `5a0d895c3` + R3-E1) | 4,960,000 | 4,986,667 | 5,013,333 | 448.8M | 40 ms | 743/744 |
+| VN0 | main `b91411e27`(审计后基线) | 4,960,000 | 5,020,000 | 5,000,000 | 449.4M | 40 ms | 742/744 |
+| VNb | `6f0913d92` | 4,944,767 | 5,073,333 | 4,953,333 | 449.1M | 40 ms | 739/743 |
+| VN0b | `b91411e27` | 5,033,333 | 5,100,000 | 5,026,667 | 454.8M | 40 ms | 754/755 |
+
+win1 新树 4.960 / 4.945M 对基线 4.960 / 5.033M(-0.9%),轮总量均值 449.0M 对 452.1M(-0.7%);四腿门全净
+(invalid 0、字段不匹配 0、运行中 TC 0,每腿同样的 7 条 view-1 启动 TC)。R3-P2 的上限在 5M 负载下没有咬到:
+两条新树腿的 el.log 里 `refused=0`、`refused_at_cap=0`、`frames_refused=0`,无 `Lagged` 读回(R3-P4)。
+结论:R3-C2、R3-N5 余项、R3-P9、R3-G4、R2-R2、R2-C1、R3-P2/P3/P4、R3-N4、R2-C9 余项与 R3-E1/E3 在 5M 配置下
+**无可见代价**,A/B 闭合;E1 分支据此合入 main。
+
+同一批二进制(`6f0913d92`)随后跑 devnet 五形态(`audit-notes/scripts/devnet-phase5.sh`,05:11-05:50 UTC):gov5late 160 块、
+late 121、absent 185(与前两轮逐字一致,同哈希、gov5 error 0),再加两个 `twoPhaseVoteGate: true` 基因副本的 gov5 混跑 ——
+gov5late2p 160 块、gov5now2p(gov5 从头在场)133 块,两客户端同哈希、gov5 error 0;Rust 验证者启动行 `vote gate : two-phase`,
+gov5 链库里的 chainspec `"twoPhaseVoteGate":true`。R2-C9 余项与 R3-N4 要求的 gov5 混跑由此闭合。
+

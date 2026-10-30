@@ -429,6 +429,12 @@ pub(crate) struct H2Behaviour {
     limits: libp2p::connection_limits::Behaviour,
 }
 
+/// Connections one peer may hold at once, both directions together: two
+/// for a simultaneous dial, and room for a redial while an old connection
+/// winds down. Without it one identity dialling again and again held every
+/// inbound slot (audit 2026-10 round 3, R3-N1).
+pub const MAX_CONNECTIONS_PER_PEER: u32 = 4;
+
 /// Inbound connections this node accepts at most: `N42_H2_MAX_INBOUND`,
 /// default 128 (a seven-member fleet holds six, gov5 caps its peers near 50).
 pub fn max_inbound_connections() -> u32 {
@@ -504,7 +510,8 @@ impl TransportCore {
             votes: crate::rpc::vote_behaviour(),
             limits: libp2p::connection_limits::Behaviour::new(
                 libp2p::connection_limits::ConnectionLimits::default()
-                    .with_max_established_incoming(Some(max_inbound_connections())),
+                    .with_max_established_incoming(Some(max_inbound_connections()))
+                    .with_max_established_per_peer(Some(MAX_CONNECTIONS_PER_PEER)),
             ),
         };
 

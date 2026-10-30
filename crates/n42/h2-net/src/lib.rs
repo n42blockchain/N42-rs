@@ -48,7 +48,7 @@ pub use status::{Status, StatusError, STATUS_PROTOCOL};
 pub use topic::{h2_v4_topic, H2_V4_TOPIC, H2_V4_TOPIC_BASE};
 pub use transport::{
     BlockRequestChannel, BlockTxnsChannel, H2V4Transport, RangeRequestChannel, PublishError, ServeGuard, TransportConfig,
-    TransportError, TransportEvent,
+    TransportError, TransportEvent, MAX_CONNECTIONS_PER_PEER,
 };
 pub use pump::{INBOUND_CAPACITY, PUBLISH_CAPACITY, RETRY_CAPACITY};
 pub use tx_gossip::{decode_tx_batch, encode_tx_batch, TxGossipError, TX_BATCH_MAX_BYTES, TX_BATCH_MAX_TXS};

@@ -13,19 +13,19 @@ Windows 合入的改动由 Linux 在下一次整体验证时一并覆盖。
 
 | 项 | 负责 | 状态 |
 |---|---|---|
-| X22 同机配对(main `b91411e27` 对 `native-qc`),结果写入 `HANDOFF.md` "Linux 会话结果" | Linux | 运行中(10-30 01:22 UTC 起) |
+| X22 同机配对(main `b91411e27` 对 `native-qc`),结果写入 `HANDOFF.md` "Linux 会话结果" | Linux | 完成(5ab8fffea):win1 -0.1%、轮总量 -0.8%,无可见代价;第一至三轮热路径 A/B 闭合 |
 
 ## B. 非热路径,可本地闭环(Windows)
 
 | 项 | 来源 | 内容 | 负责 | 状态 |
 |---|---|---|---|---|
 | R3-N5 余项 | ROUND3 | Timeout 先查重再验签(当前先验签,重复的 Timeout 每条都付一次 BLS 验证) | Windows | 已修(见 `git log --grep R3-N5`) |
-| R3-N3 余项 | ROUND3 | by-hash 回复先核头哈希再解 body | Windows | 待做 |
+| R3-N3 余项 | ROUND3 | by-hash 回复先核头哈希再解 body | Windows | 不修(无放大,见 ROUND3) |
 | R3-P9 | ROUND3 | EL 响应体按字节上限读取(`h2-el-rpc` transport) | Windows | 已修(见 `git log --grep R3-P9`) |
-| R3-P8 余项 | ROUND3 | APoS 验证队列入队前校验成员与块哈希 | Windows | 待做 |
-| R3-E3 | ROUND3 | 并行执行器单笔 gas_limit ≤ 剩余 gas 的加固检查(当前不可达) | Windows | 待做 |
-| R3-N1 余项 | ROUND3 | 每 peer 入站 RPC 连接上限 | Windows | 待做 |
-| R2-X2 余项 | ROUND2 | tx-ingest 帧间空闲超时(端口默认只绑回环) | Windows | 待做 |
+| R3-P8 余项 | ROUND3 | APoS 验证队列入队前校验成员与块哈希 | Windows | 暂缓(APoS 旧路径,见 ROUND3) |
+| R3-E3 | ROUND3 | 并行执行器单笔 gas_limit ≤ 剩余 gas 的加固检查(当前不可达) | Linux(随 E1,同在装块热路径) | 待做 |
+| R3-N1 余项 | ROUND3 | 每 peer 入站 RPC 连接上限 | Windows | 已修(见 `git log --grep R3-N1`) |
+| R2-X2 余项 | ROUND2 | tx-ingest 帧间空闲超时(端口默认只绑回环) | Windows | 不修(帧体已有期限,见 ROUND3) |
 | R3-C2 | ROUND3 | 头部 QC 共用检查:按 gov5 `decodeHeaderExtra` / `verifyHeaderWithBatch`,用 gov5 夹具对齐;实时路径与拉取路径共用。跨客户端,合入前需 Linux 跑 devnet gov5 三形态 | Windows 写,Linux 验 | 待做 |
 
 ## C. 热路径或需设计 + A/B(Linux)
@@ -37,7 +37,7 @@ Windows 合入的改动由 Linux 在下一次整体验证时一并覆盖。
 | R3-N4 | ROUND3 | gossip `validate_messages()` + 回报 Accept/Reject/Ignore | Linux | 待做 |
 | R3-G4 | ROUND3 | leader 首次导入的多余 payload 克隆 | Linux | 低优先 |
 | R3-E2 | ROUND3 | 零手续费块 beneficiary 触碰:先用 gov5 夹具确认根 | Linux | 待做 |
-| 热路径 A/B | ROUND2/3 | R2-X1、R2-I1、R2-R4/Q4、R2-C7、R2-I6、R2-R3、R3-N2、R3-N3、R3-G2、R3-C3 | Linux | X22 配对覆盖整体;单项回退再拆 |
+| 热路径 A/B | ROUND2/3 | R2-X1、R2-I1、R2-R4/Q4、R2-C7、R2-I6、R2-R3、R3-N2、R3-N3、R3-G2、R3-C3 | Linux | 已由 X22 配对整体闭合(5ab8fffea);此后的热路径改动(R3-N5 余项、R3-P9)待下一次配对 |
 
 ## D. 需协议/跨仓库决定(先记录,不动手)
 

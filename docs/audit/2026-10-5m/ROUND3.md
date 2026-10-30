@@ -74,3 +74,7 @@ RPC/快照/tx-queue/mobile。每项修复前先按代码核实,先写复现测�
 | R3-P8 | 已修(部分):APoS 公开订阅任务同时监听 `sink.closed()`,客户端离开即结束,并向 router 发 `Disconnect` 释放其条目(之前对无人发布的 key 永远挂起,任务与条目泄漏);测试 `a_closed_subscription_leaves_the_router_without_an_event` 修复前失败(订阅丢弃后 router 收不到任何消息)。验证队列入队前校验成员与块哈希未做 |
 | R3-N5 余项 | 已修:当前 view 的 Timeout 先问 collector 发送者是否已计入,已计入的副本(两个 gossip topic、直连流、转发)不再做 BLS 验证即丢弃,与未来 view 路径一致;测试 `test_a_counted_senders_timeout_copy_is_not_verified_again` 修复前失败(重复副本被验签并报 InvalidSignature)。热路径:每个 Timeout 多一次 Option/HashMap 查询,省掉重复副本的 BLS 验证。`/n42/vote/1` 限速仍未做 |
 | R3-P9 | 已修:EL 响应按字节上限读取(`MAX_RESPONSE_BYTES` 1 GiB = 256 MiB 原始 payload 上限的十六进制两倍再留余量),声明长度超限即拒,未声明时逐块累计超限即拒;Engine API 与 `--el-rpc` 两条路径(`call` 与 `call_many`)共用。测试 `a_response_past_its_cap_is_refused`(声明/未声明两种)修复前编译失败(无上限)。热路径:读取方式由 `json()` 改为逐块读入后 `from_slice`,同样一次缓冲,每块一次比较 |
+| R3-N1 余项 | 已修:每 peer 连接上限 `MAX_CONNECTIONS_PER_PEER`=4(双向合计,容许同时互拨与重拨),之前一个身份反复拨号可占满全部 128 个入站名额;测试 `tests/per_peer_connections.rs` 修复前失败(同一 peer 保持 8 条连接)。非热路径 |
+| R3-N3 余项 | 不修:by-hash 回复只对本节点发出的请求生效,每个请求至多一次解码,无放大;先核头哈希只省掉一次错误回复的 body 解码 |
+| R3-P8 余项 | 暂缓:矿工已逐条核块哈希、成员、重复与签名;剩下的是公开调用灌满队列使诚实签名得到 "retry"。在 RPC 层过滤需矿工导出当前待定块并提供成员查询;这是 APoS 旧路径(HotStuff 链不启动矿工),价值低 |
+| R2-X2 余项 | 不修:帧体读取已有期限(`FRAME_READ_TIMEOUT`);剩下的帧间空闲只占一个连接名额(256 个,每个 1 MiB 读缓冲,合计有界),空闲超时会断开长期空闲的合法客户端(本节点 relay、flood 工具) |

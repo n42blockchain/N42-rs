@@ -74,7 +74,7 @@ Rust 现状:
 | R3-P6 余项 | ROUND3 | 注册 PoP 与收据独立 DST 是手机协议变更,需 mobile-sdk 同步。**Windows(10-30 认领)** |
 | R3-P7 余项 | ROUND3 | mobile HTTP 仍单线程(每连接最多占 10 s)。**Windows(10-30 认领)** |
 | R2-C1 余项 | ROUND2 | 入站 `high_tc` 采纳:**Windows 已修(见 `git log --grep R2-C1`)**;只在 TC 能让本节点前进时验证,无需缓存。待 Linux devnet gov5 三形态(含 absent/late)覆盖 |
-| R2-R2 | ROUND2 | 按 view leader 校验头部封印。**Windows(10-30 认领)** |
+| R2-R2 | ROUND2 | 按 view leader 校验头部封印。**Windows 已修(见 `git log --grep R2-R2`)** |
 | R2-C9 余项 | ROUND2 | gov5 header vote / deferred vote 未移植。**Windows(10-30 认领)** |
 | R2-X4 余项 | ROUND2 | 声明不按声明者分键(EL 不知道 peer)。**Windows(10-30 认领)** |
 

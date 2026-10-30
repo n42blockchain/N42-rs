@@ -1,0 +1,37 @@
+diff --git a/benchmarks/test/Compare.t.sol b/benchmarks/test/Compare.t.sol
+index e2cd043..d5c5e91 100644
+--- a/benchmarks/test/Compare.t.sol
++++ b/benchmarks/test/Compare.t.sol
+@@ -68,7 +68,7 @@ contract Compare is Test {
+     bytes[] mpProofsCompressed;
+     bytes[] mpProofsUncompressed;
+ 
+-    uint256[16] internal SWEEP = [uint256(1), 2, 3, 4, 5, 10, 25, 50, 100, 150, 200, 300, 400, 500, 700, 1000];
++    uint256[100] internal SWEEP = [uint256(1), 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100];
+ 
+     function setUp() public {
+         loopVerifier = new LoopVerifier();
+@@ -249,4 +249,23 @@ contract Compare is Test {
+             out[i] = arr[i];
+         }
+     }
++
++    function test_calldata_lengths() public {
++        string memory csv = "n,shared_bytes,general_bytes,single_blob_bytes\n";
++        for (uint256 n = 1; n <= 100; ++n) {
++            uint256 shared = abi.encodeCall(BatchedVerifier.verifyBatchedMultiBlob,
++                (_sliceBytes32(mbBlobHashes,n), mbZ, _sliceBytes32(mbY,n),
++                 _sliceBytes(mbCommitmentsUncompressed,n), _sliceBytes(mbProofsUncompressed,n))).length;
++            bytes32[] memory zs = new bytes32[](n);
++            for (uint256 j; j<n; ++j) zs[j] = mbZ;
++            uint256 general = abi.encodeCall(BatchedVerifier.verifyBatchedGeneral,
++                (_sliceBytes32(mbBlobHashes,n), zs, _sliceBytes32(mbY,n),
++                 _sliceBytes(mbCommitmentsUncompressed,n), _sliceBytes(mbProofsUncompressed,n))).length;
++            uint256 single = abi.encodeCall(BatchedVerifier.verifyBatchedMultiPoint,
++                (mpBlobHash, _sliceBytes32(mpZ,n), _sliceBytes32(mpY,n),
++                 mpCommitmentUncompressed, _sliceBytes(mpProofsUncompressed,n))).length;
++            csv = string.concat(csv, vm.toString(n), ",", vm.toString(shared), ",", vm.toString(general), ",", vm.toString(single), "\n");
++        }
++        vm.writeFile("benchmarks/data/calldata_lengths.csv", csv);
++    }
+ }

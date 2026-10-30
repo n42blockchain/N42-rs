@@ -1,0 +1,70 @@
+{
+  "kind": "logical-node-cost-model",
+  "transactions": 100000,
+  "nodes": 32,
+  "seed": 42,
+  "injected": {
+    "nonce_conflict_injected": 10000,
+    "expired_transactions_injected": 20000,
+    "expired_wrappers_injected": 200,
+    "malicious_injected": 5000
+  },
+  "circuit_benchmark": null,
+  "assumptions": {
+    "dependency_cost_ms": 0.2,
+    "hop_ms": 20,
+    "proof_bytes": 4096,
+    "tx_bytes": 160,
+    "wrapper_size": 100
+  },
+  "strategies": {
+    "independent": {
+      "accepted": 69494,
+      "rejected": {
+        "invalid_dependency": 5000,
+        "nonce_conflict": 6511,
+        "expired": 18995
+      },
+      "proof_jobs": 25600,
+      "dependency_proving_work": 2223808,
+      "modeled_propagation_bytes": 14280673280,
+      "modeled_p95_admission_ms": 13319.6,
+      "python_cpu_seconds": 2.040879,
+      "peer_false_penalties": 0,
+      "peer_scoring": "disabled_without_attribution",
+      "cache_entries": 320000
+    },
+    "hash_partition": {
+      "accepted": 69494,
+      "rejected": {
+        "invalid_dependency": 5000,
+        "nonce_conflict": 6511,
+        "expired": 18995
+      },
+      "proof_jobs": 23986,
+      "dependency_proving_work": 69494,
+      "modeled_propagation_bytes": 3390336576,
+      "modeled_p95_admission_ms": 513.0,
+      "python_cpu_seconds": 1.524478,
+      "peer_false_penalties": 0,
+      "peer_scoring": "disabled_without_attribution",
+      "cache_entries": 63025
+    },
+    "proof_reuse": {
+      "accepted": 69494,
+      "rejected": {
+        "invalid_dependency": 5000,
+        "nonce_conflict": 6511,
+        "expired": 18995
+      },
+      "proof_jobs": 23451,
+      "dependency_proving_work": 63025,
+      "modeled_propagation_bytes": 3319279616,
+      "modeled_p95_admission_ms": 476.40000000000003,
+      "python_cpu_seconds": 1.551635,
+      "peer_false_penalties": 0,
+      "peer_scoring": "disabled_without_attribution",
+      "cache_entries": 63025
+    }
+  }
+}

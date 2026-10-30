@@ -1,0 +1,10 @@
+{
+  "upstream": "https://github.com/markolazic01/blober",
+  "commit": "a8a647d83366f1bb7d2ea683236c01fc7b53b374",
+  "environment": "Foundry reference EVM, not N42 execution",
+  "forge_version": "forge Version: 1.5.1-stable\nCommit SHA: b0a9dd9ceda36f63e2326ce530c10e6916f4b8a2\nBuild Timestamp: 2025-12-22T11:41:09.812070000Z (1766403669)\nBuild Profile: maxperf\n",
+  "wall_seconds_including_compilation": 19.505701250003767,
+  "n42_cpu_benchmark": null,
+  "n42_setup_equivalence": null,
+  "error_batch_localization_cost": null
+}

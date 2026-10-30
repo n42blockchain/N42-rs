@@ -1,0 +1,67 @@
+{
+  "schema": 1,
+  "baseline": "d2e05062b0",
+  "production_migration_complete": false,
+  "items": [
+    {
+      "plane": "consensus",
+      "algorithm": "BLS12-381/blst",
+      "evidence": "crates/n42/h2-primitives/src/bls/keys.rs",
+      "key_location": "validator signer key; deployment custody not verified",
+      "signature_lifetime": "validator lifetime",
+      "upgrade_interface": "consensus protocol fork and key registry",
+      "hybrid_mode": "none",
+      "revocation": "governed removal/rotation; recovery authority undecided"
+    },
+    {
+      "plane": "accounts",
+      "algorithm": "Ethereum secp256k1; experimental signature research separate",
+      "evidence": "docs/ROADMAP_ED25519_TX.md",
+      "key_location": "user wallet",
+      "signature_lifetime": "until account migration",
+      "upgrade_interface": "transaction envelope/validation version",
+      "hybrid_mode": "none",
+      "revocation": "move assets or contract-specific recovery"
+    },
+    {
+      "plane": "network",
+      "algorithm": "libp2p secp256k1 identity + Noise",
+      "evidence": "crates/n42/h2-net/Cargo.toml",
+      "key_location": "node identity file; production path unknown",
+      "signature_lifetime": "node key lifetime",
+      "upgrade_interface": "transport and identity upgrade",
+      "hybrid_mode": "not verified",
+      "revocation": "peer identity replacement"
+    },
+    {
+      "plane": "rpc_tls_ssh",
+      "algorithm": "deployment-selected algorithms; live configuration unknown",
+      "evidence": "CLAUDE.md",
+      "key_location": "operator infrastructure",
+      "signature_lifetime": "certificate/key lifetime",
+      "upgrade_interface": "operator TLS/SSH configuration",
+      "hybrid_mode": "not verified",
+      "revocation": "CA/key rotation by operator"
+    },
+    {
+      "plane": "release",
+      "algorithm": "binary/package signing not verified",
+      "evidence": "Cargo.toml",
+      "key_location": "CI/operator signing identities",
+      "signature_lifetime": "release certificate lifetime",
+      "upgrade_interface": "release pipeline",
+      "hybrid_mode": "not verified",
+      "revocation": "distribution revocation/rotation"
+    },
+    {
+      "plane": "pqc_research",
+      "algorithm": "ML-DSA/FIPS204; SLH-DSA/FIPS205; Falcon experimental",
+      "evidence": "docs/sigbench/src/main.rs",
+      "key_location": "synthetic benchmark keys only",
+      "signature_lifetime": "ephemeral test lifetime",
+      "upgrade_interface": "algorithm-specific research adapters",
+      "hybrid_mode": "not production",
+      "revocation": "discard test keys"
+    }
+  ]
+}

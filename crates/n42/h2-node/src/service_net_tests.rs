@@ -422,6 +422,30 @@ async fn a_live_block_whose_header_qc_gov5_refuses_is_not_voted_for() {
     assert!(rig.svc.engine.has_imported_block(&hash), "a header without a QC passes");
 }
 
+/// Audit 2026-10 R2-C9 (the remainder): under gov5's two-phase gate a held
+/// header is what releases Round 1 (gov5's `tryHeaderVote`), once its QC
+/// passes the check every vote of this node passes (R3-C2). Without the gate
+/// a header tells the engine nothing.
+#[tokio::test]
+async fn under_the_two_phase_gate_a_header_reaches_the_engine_once_its_qc_passes() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    let quorum = [0, 1, 2];
+    let parent = B256::ZERO;
+    let good = header_qc(&rig.svc, &keys, &quorum, 3, parent, parent);
+    let (hash, header, _) = block_with_extra(1, parent, 4, good.clone());
+    rig.svc.remember_block(hash, &header);
+    assert!(!rig.svc.engine.knows_parent(&hash), "no gate: the header waits for the import");
+    rig.svc.engine.set_two_phase_vote_gate(true);
+    let (hash, header, _) = block_with_extra(2, parent, 4, good);
+    rig.svc.remember_block(hash, &header);
+    assert!(rig.svc.engine.knows_parent(&hash), "the gate: the header reaches the engine");
+    let forged = header_qc(&rig.svc, &keys, &quorum, 3, parent, B256::repeat_byte(0x77));
+    let (hash, header, _) = block_with_extra(3, parent, 4, forged);
+    rig.svc.remember_block(hash, &header);
+    assert!(!rig.svc.engine.knows_parent(&hash), "a header QC refused: no header vote");
+}
+
 /// A TC for `view`, signed by `signers`, over the genesis high QC.
 fn timeout_cert(
     svc: &H2Service<MockExecutionLayer>,

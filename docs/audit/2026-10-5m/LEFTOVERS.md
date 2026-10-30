@@ -60,8 +60,8 @@ Rust 现状:
 | 项 | 来源 | 内容 | 负责 | 状态 |
 |---|---|---|---|---|
 | R3-E1 | ROUND3 | builder 与 follower 的可纳入性规则对齐(先与 gov5 对齐规则) | Linux(10-30 认领) | 已修(分支 fix/r3-e1-builder-includability 527e009fb), 待 X22 配对与合入。串行循环 Σgas_limit 预算 + 每 sender 最坏花费账本;并行步每 sender run 同一账本(并行步原也不一致:同一 sender 第二笔起只对照扣实际花费后的余额);R3-E3 一并 |
-| R3-P2/P3/P4 | ROUND3 | tx-queue 有界 lane、加价替换、`Lagged` 补齐,与帧索引一起设计 | Windows(10-30 认领),热路径项合入前由 Linux A/B | 待做 |
-| R3-N4 | ROUND3 | gossip `validate_messages()` + 回报 Accept/Reject/Ignore | Windows(10-30 认领),热路径项合入前由 Linux A/B | 待做 |
+| R3-P2/P3/P4 | ROUND3 | tx-queue 有界 lane、加价替换、`Lagged` 补齐 | Windows 已修(4f6256c4d P4 / c1814476f P3 / ad3ece18d、c402f298a P2);**待 Linux A/B**:P2/P3 改了 drain 路径(occupied 分支多一次 hash 比较、到达多两次比较、拒绝计数表) | 已修，待 A/B |
+| R3-N4 | ROUND3 | gossip `validate_messages()` + 回报 Accept/Reject/Ignore | Windows 已修(eb9146203);**待 Linux A/B + gov5 混跑**:共识消息改为解码后转发 | 已修，待 A/B |
 | R3-G4 | ROUND3 | leader 首次导入的多余 payload 克隆 | Windows(10-30 认领),热路径项合入前由 Linux A/B | 已修(见 `git log --grep R3-G4`) |
 | R3-E2 | ROUND3 | 零手续费块 beneficiary 触碰:先用 gov5 夹具确认根 | Linux(与 R3-E1 同改 `payload.rs` / `parallel_transfer.rs`,Windows 不动) | 待做 |
 | 热路径 A/B | ROUND2/3 | R2-X1、R2-I1、R2-R4/Q4、R2-C7、R2-I6、R2-R3、R3-N2、R3-N3、R3-G2、R3-C3 | Linux | 已由 X22 配对整体闭合(5ab8fffea);此后的热路径改动(R3-N5 余项、R3-P9、R3-C2)待下一次配对,建议一次 X22 覆盖三者 |
@@ -75,7 +75,7 @@ Rust 现状:
 | R3-P7 余项 | ROUND3 | mobile HTTP 仍单线程(每连接最多占 10 s)。**Windows 已修(见 `git log --grep R3-P7`)** |
 | R2-C1 余项 | ROUND2 | 入站 `high_tc` 采纳:**Windows 已修(见 `git log --grep R2-C1`)**;只在 TC 能让本节点前进时验证,无需缓存。待 Linux devnet gov5 三形态(含 absent/late)覆盖 |
 | R2-R2 | ROUND2 | 按 view leader 校验头部封印。**Windows 已修(见 `git log --grep R2-R2`)** |
-| R2-C9 余项 | ROUND2 | gov5 header vote / deferred vote 未移植。**Windows(10-30 认领)** |
+| R2-C9 余项 | ROUND2 | ~~gov5 header vote / deferred vote 未移植~~ **已修**(Windows,aab6c13b1 / 47afc33ee;deferred vote 已由 `BlockChecked` 覆盖;待 Linux 与 gov5 两阶段 fleet 混跑) |
 | R2-X4 余项 | ROUND2 | 声明不按声明者分键(EL 不知道 peer)。**Windows 评估后暂缓:需 h2-node 与 EL 两端协议改动,见 ROUND3 状态行** |
 
 ## E. 需要用户操作

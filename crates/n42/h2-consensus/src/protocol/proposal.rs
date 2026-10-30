@@ -483,7 +483,7 @@ impl ConsensusEngine {
                 }
                 tracing::info!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, "import-gated vote: block already execution-validated");
                 self.send_vote(view, proposal.block_hash)?;
-            } else {
+            } else if !self.try_header_vote()? {
                 tracing::info!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, "import-gated vote: waiting for execution validation");
             }
             return Ok(());
@@ -506,6 +506,35 @@ impl ConsensusEngine {
         self.send_vote(view, proposal.block_hash)?;
 
         Ok(())
+    }
+
+    /// gov5's header vote (`tryHeaderVote`), under the two-phase gate only:
+    /// Round 1 for the pending proposal once its header is known -- a real,
+    /// non-zero parent recorded -- and extends its justify QC's block. The
+    /// commit vote stays the execution attestation (held until the import,
+    /// [`Self::process_prepare_qc`]). Returns whether it voted.
+    pub(super) fn try_header_vote(&mut self) -> ConsensusResult<bool> {
+        if !self.two_phase_vote_gate || !self.signing_profile.is_gov5() || self.vote_before_import {
+            return Ok(false);
+        }
+        let current = self.round_state.current_view();
+        let Some((view, block_hash)) = self
+            .pending_proposal
+            .as_ref()
+            .filter(|pending| pending.view == current && self.round_state.may_vote_in(pending.view))
+            .map(|pending| (pending.view, pending.block_hash))
+        else {
+            return Ok(false);
+        };
+        if !self.imported_parents.get(&block_hash).is_some_and(|parent| *parent != B256::ZERO) {
+            return Ok(false);
+        }
+        if !self.extends_justify(block_hash) {
+            return Ok(false);
+        }
+        tracing::info!(target: "n42::interop::h2v4", view, %block_hash, "header vote: block header known and extends its justify QC's block, voting");
+        self.send_vote(view, block_hash)?;
+        Ok(true)
     }
 
     /// Processes a PrepareQC from the leader: validates the QC and sends a CommitVote.

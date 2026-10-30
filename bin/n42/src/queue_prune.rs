@@ -56,6 +56,55 @@ impl LeanBlock {
     }
 }
 
+/// Follows the committed heights handed to the pruner, so a stretch its
+/// receiver skipped (`Lagged`) shows at the next notification. A lost
+/// notification left the queue holding its blocks' transactions and an own
+/// block at its height unsettled (audit 2026-10 round 3, R3-P4).
+#[derive(Debug, Default)]
+pub struct GapWatch {
+    last: Option<u64>,
+}
+
+impl GapWatch {
+    /// The heights skipped before `notification`; remembers its tip. A
+    /// reorg's new chain starting at or below the last tip is no gap.
+    pub fn before(&mut self, notification: &CanonStateNotification<N42Primitives>) -> Option<std::ops::RangeInclusive<u64>> {
+        let first = notification.committed().first().number();
+        let gap = self.last.filter(|last| first > last.saturating_add(1)).map(|last| last + 1..=first - 1);
+        self.last = Some(notification.tip().number());
+        gap
+    }
+}
+
+/// The most blocks one gap reads back: the newest of a longer stretch,
+/// whose older blocks' transactions the senders' watermarks already
+/// refuse at a build.
+pub const MAX_BACKFILL: u64 = 64;
+
+/// The skipped blocks of `gap` as lean summaries, read with `read` (the
+/// provider's `recovered_block_range`), at most [`MAX_BACKFILL`] of the
+/// newest. A read that fails is logged and gives nothing.
+pub fn backfill<E: std::fmt::Display>(
+    gap: std::ops::RangeInclusive<u64>,
+    read: impl FnOnce(std::ops::RangeInclusive<u64>) -> Result<Vec<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>>, E>,
+) -> Vec<LeanBlock> {
+    let (start, end) = (*gap.start(), *gap.end());
+    let from = start.max(end.saturating_sub(MAX_BACKFILL - 1));
+    if from > start {
+        warn!(target: "n42.tx_queue", skipped = end - start + 1, read = end - from + 1, "queue pruning skipped more blocks than it reads back");
+    }
+    match read(from..=end) {
+        Ok(blocks) => {
+            warn!(target: "n42.tx_queue", from, end, read = blocks.len(), "blocks the queue pruner skipped are read back and pruned");
+            blocks.iter().map(LeanBlock::from_block).collect()
+        }
+        Err(error) => {
+            warn!(target: "n42.tx_queue", from, end, %error, "blocks the queue pruner skipped could not be read back");
+            Vec::new()
+        }
+    }
+}
+
 /// The committed blocks of a notification as lean summaries, in order.
 pub fn lean_blocks(notification: &CanonStateNotification<N42Primitives>) -> Vec<LeanBlock> {
     notification.committed().blocks_iter().map(|b| LeanBlock::from_block(b)).collect()
@@ -835,6 +884,45 @@ mod tests {
         assert_eq!((batch.len(), received), (1, 1));
         assert!(started.elapsed() >= max_wait, "waited for more until the deadline");
         assert!(carry.is_empty());
+    }
+
+    /// Audit 2026-10 round 3 (R3-P4): a pruner whose receiver lagged only
+    /// warned, so the skipped blocks' transactions stayed in the queue and an
+    /// own block at a skipped height was never settled. The next
+    /// notification's first height shows the stretch, which is read back and
+    /// pruned as the lost notifications would have been.
+    #[test]
+    fn blocks_a_lagging_pruner_skipped_are_read_back_and_pruned() {
+        let notification = commit();
+        let queue = filled(&notification);
+        let expected = filled(&notification);
+        prune_feed_inline(&expected, &PruneFeed::of(notification.clone(), false));
+
+        let at = |number: u64| {
+            CanonStateNotification::Commit {
+                new: Arc::new(Chain::new(vec![block(number, Vec::new())], Default::default(), Default::default())),
+            }
+        };
+        let mut watch = GapWatch::default();
+        assert_eq!(watch.before(&at(9)), None, "the first notification has nothing before it");
+        // Blocks 10 and 11 (the commit's) were lost to a lagged receiver.
+        let later = at(12);
+        let gap = watch.before(&later).expect("a stretch was skipped");
+        assert_eq!(gap, 10..=11);
+        let blocks: Vec<_> = notification.committed().blocks_iter().cloned().collect();
+        let read = backfill(gap, |range| {
+            Ok::<_, std::convert::Infallible>(blocks.iter().filter(|b| range.contains(&b.number())).map(|b| (**b).clone()).collect())
+        });
+        prune_feed_inline(&queue, &PruneFeed::Lean(read));
+        assert_eq!(queue.len(), expected.len());
+        assert_eq!(queue.usable(), expected.usable());
+        assert_eq!(watch.before(&at(13)), None, "consecutive");
+        assert_eq!(watch.before(&at(12)), None, "a reorg back is no gap");
+        assert_eq!(backfill(1..=10_000, |range| {
+            assert_eq!(range.clone().count() as u64, MAX_BACKFILL, "the newest blocks, at most");
+            assert_eq!(*range.end(), 10_000);
+            Ok::<_, std::convert::Infallible>(Vec::new())
+        }), Vec::new());
     }
 
     #[test]

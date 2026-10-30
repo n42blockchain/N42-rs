@@ -33,6 +33,32 @@ pub(crate) fn tx_hashed(sender: Address, nonce: u64) -> EthPooledTransaction {
     EthPooledTransaction::new(recovered, 120)
 }
 
+/// [`tx_hashed`] at a fee of its own, with a hash of its own.
+pub(crate) fn tx_priced(sender: Address, nonce: u64, max_fee: u128, tip: u128) -> EthPooledTransaction {
+    use alloy_consensus::{Signed, TxEip1559};
+    let inner = TxEip1559 {
+        chain_id: 1,
+        nonce,
+        gas_limit: 21_000,
+        max_fee_per_gas: max_fee,
+        max_priority_fee_per_gas: tip,
+        to: TxKind::Call(Address::repeat_byte(9)),
+        value: U256::from(1),
+        ..Default::default()
+    };
+    let mut seed = [0u8; 60];
+    seed[..20].copy_from_slice(sender.as_slice());
+    seed[20..28].copy_from_slice(&nonce.to_be_bytes());
+    seed[28..44].copy_from_slice(&max_fee.to_be_bytes());
+    seed[44..].copy_from_slice(&tip.to_be_bytes());
+    let signed = Signed::new_unchecked(inner, Signature::test_signature(), alloy_primitives::keccak256(seed));
+    let recovered = reth_primitives_traits::Recovered::new_unchecked(
+        reth_ethereum_primitives::TransactionSigned::from(signed),
+        sender,
+    );
+    EthPooledTransaction::new(recovered, 120)
+}
+
 pub(crate) fn sender(index: u64) -> Address {
     let mut a = [0u8; 20];
     a[..8].copy_from_slice(&(index.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1).to_be_bytes());

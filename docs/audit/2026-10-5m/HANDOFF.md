@@ -67,6 +67,17 @@
 | R3-C3 | 每次投票一次克隆 |
 | R3-N1、R3-N6 | 只减成本 |
 
+上表已由下文"Linux 会话结果"闭合。**10-30 之后 Windows 合入、仍待同机 A/B 的改动**(一次腿对照即可，审计前取 `b91411e27`):
+
+| 编号 | 提交 | 代价 / 要看什么 |
+|---|---|---|
+| R3-C2、R2-C1、R3-N5、R3-P9、R3-G4、R2-R2 | d5fe4495d … 96e2fb217 | 投票前 header QC 校验(缓存 64)、TC 随票推进、超时去重先于验签、EL 响应上限、`import_own` 借用 |
+| R3-P3 | c1814476f | drain 的 occupied 分支多一次 hash 比较 |
+| R3-P2 | ad3ece18d、c402f298a | 到达多两次比较;非 nonce 拒绝计数表(`N42_TX_QUEUE_REFUSALS=0` 关);上限 `N42_TX_QUEUE_MAX`=4M / `N42_TX_QUEUE_LANE_MAX`=2^20,看 drop 报告里是否出现 `full` / `refused` |
+| R3-P4 | 4f6256c4d | 每条规范通知一次高度比较;只在 `Lagged` 后读回 |
+| R3-N4 | eb9146203 | 共识消息改为解码后转发(多一次解码延迟);另需与 gov5 混跑确认网格评分 |
+| R2-C9 余项 | aab6c13b1、47afc33ee | gate 默认关，原生 fleet 不受影响;需与 gov5 两阶段(`twoPhaseVoteGate`)fleet 混跑 |
+
 ## 未推送的分支
 
 推送曾被拒,未重试。需要时由用户执行:

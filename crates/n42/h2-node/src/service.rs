@@ -5400,6 +5400,16 @@ impl<E: ExecutionLayer> H2Service<E> {
         if self.block_timestamps.insert(block_hash, header.timestamp).is_none() {
             self.block_numbers.insert(block_hash, header.number);
             self.block_headers.insert(block_hash, header.clone());
+            // gov5's header vote under its two-phase gate (audit 2026-10
+            // R2-C9): the header releases Round 1, once its QC passes the
+            // check every vote of this node passes (R3-C2).
+            if self.engine.two_phase_vote_gate() {
+                if let Some(reason) = self.header_qc_refusal(&block_hash) {
+                    warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header QC refused; no header vote");
+                } else if let Err(err) = self.engine.header_known(block_hash, header.parent_hash) {
+                    report_engine_error(&err, "header vote", &mut self.fatal);
+                }
+            }
             self.block_seen.insert(block_hash, std::time::Instant::now());
             self.timestamp_order.push(block_hash);
             while self.timestamp_order.len() > REMEMBERED_TIMESTAMPS {

@@ -321,6 +321,59 @@ gov5: `verifyHeaderWithBatch` and `FinalizeAndAssemble` (`internal/consensus/hot
    the field. A Rust leader on a MobileAnchor chain needs a root provider, the
    equivalent of gov5's `mobileAnchorRoot()` (`worker.go:377-381`).
 
+### 7.1 Rust status (branch `feat/n42-header-field-24`)
+
+Gaps 1-5 are closed on the Rust side; gap 6 is closed for followers only.
+
+- **The node runs on `N42Header`.** `N42Primitives::BlockHeader` is
+  `n42_header::N42Header`. reth's `ChainSpec` is not generic over its header,
+  so the node's chain spec is `n42_header::N42ChainSpec`, a wrapper over the
+  parsed spec whose genesis header is the inner one without a root (same
+  hash). `bin/n42` converts at launch with the additive
+  `NodeBuilder::map_chainspec`. The CLI's `init` and `db` commands still run
+  on `ChainSpec`; root-less headers store byte-identically (8.3).
+- **Presence rules (gap 3).** `HotStuffConsensus::validate_header` calls
+  `n42_h2_consensus::validate_gov5_header_tail` with
+  `HotStuffConsensus`'s `header_tail_rules(genesis, timestamp)`:
+  - The slot number is required from Glamsterdam and must equal the block
+    number. It is refused before Glamsterdam.
+  - `mobileRegistryRoot` is required when MobileAnchor and Glamsterdam are
+    both active, and refused otherwise.
+
+  Only presence is checked. The root's **value** is not: gov5 derives it from
+  mobile registry state that this node does not keep, and the block hash that
+  consensus agreed on covers it. The gate is read from the genesis only.
+- **Fork names (gaps 4-5).** Both fork times are read from the genesis by
+  `reth_chainspec::qmdb`:
+  - `glamsterdam_time` is gov5's `glamsterdamTime` or reth's `amsterdamTime`,
+    whichever is earlier.
+  - `mobile_anchor_time` is `mobileAnchorTime`.
+
+  The native devnet sets neither. The Rust copy of chain 94 sets both, so the
+  question in gap 4 (which copy is stale) is still open.
+- **Engine API.** `ExecutionPayloadV4` (alloy fork) gains
+  `mobileRegistryRoot`. An empty `blockAccessList` means a header without a
+  BAL hash (gov5's gap). `n42_header::engine` carries the root and the slot
+  number in both directions. The raw channel encodes a root-carrying V4 as
+  kind 5, and headers on it travel as RLP. The SSZ payload form does not carry
+  the root, because the N42 engine path does not use it.
+- **Gossip.** `block_body.rs` and `compact_body.rs` decode and re-encode
+  24-element headers.
+- **Leader (gap 6, open).** The Rust builder has no registry root provider.
+  It refuses to assemble a block whose timestamp falls under the root gate
+  (`assemble_n42_block`), so it never builds a header that other members
+  would refuse.
+- **Not covered yet.** `n42-init-snapshot` decodes the snapshot head as
+  Ethereum's header, so it cannot start a node at a head that carries a
+  root. The APoS miner and reth's own `init` / `db` commands stay on
+  Ethereum's header (an APoS header never carries a root).
+- **Verified (2026-10-30).** The check
+  `cargo check -p n42 -p n42-h2-node -p n42-testing --tests --examples` passes.
+  So do the tests of `n42-header` (features `chainspec,engine`),
+  `reth-chainspec`, `n42-h2-consensus`, `n42-h2-el-rpc`, `n42-h2-execution`,
+  `n42-h2-net`, `n42-clique`, `n42-engine-types`, `n42-h2-node` and
+  `n42-testing`.
+
 ## 8. Rust implementation spec: `N42Header` with field 24
 
 Today `N42Primitives::BlockHeader = alloy_consensus::Header`

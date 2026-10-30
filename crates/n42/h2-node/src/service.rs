@@ -2890,6 +2890,20 @@ impl<E: ExecutionLayer> H2Service<E> {
 
     /// Feeds a decoded consensus message to the engine.
     fn accept_envelope(&mut self, envelope: &H2V4Envelope) {
+        // gov5's SyncInfo TC, before the message itself as gov5 orders it;
+        // translated only when it is ahead of this node (R2-C1).
+        if let Some(tc) = wire_bridge::embedded_tc(envelope)
+            && tc.view >= self.engine.current_view()
+        {
+            match wire_bridge::tc_to_engine(tc, self.validator_count) {
+                Ok(tc) => {
+                    if let Err(err) = self.engine.adopt_embedded_tc(&tc) {
+                        report_engine_error(&err, "piggybacked TC", &mut self.fatal);
+                    }
+                }
+                Err(err) => debug!(target: "n42.h2.node", %err, "undecodable piggybacked TC; ignored"),
+            }
+        }
         match wire_bridge::to_engine(envelope, self.validator_count) {
             Ok(message) => {
                 if trace_messages() {

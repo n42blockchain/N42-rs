@@ -422,6 +422,70 @@ async fn a_live_block_whose_header_qc_gov5_refuses_is_not_voted_for() {
     assert!(rig.svc.engine.has_imported_block(&hash), "a header without a QC passes");
 }
 
+/// A TC for `view`, signed by `signers`, over the genesis high QC.
+fn timeout_cert(
+    svc: &H2Service<MockExecutionLayer>,
+    keys: &[BlsSecretKey],
+    set: &ValidatorSet,
+    signers: &[u32],
+    view: u64,
+) -> n42_h2_primitives::consensus::TimeoutCertificate {
+    let profile = svc.engine.signing_profile();
+    let mut collector = n42_h2_consensus::TimeoutCollector::new(view, set.len());
+    for &sender in signers {
+        collector
+            .add_timeout(sender, profile.sign(&keys[sender as usize], &profile.timeout_message(view)), QuorumCertificate::genesis())
+            .expect("distinct senders");
+    }
+    collector.build_tc_with_profile(set, profile).expect("a TC")
+}
+
+/// A vote from validator 1 for a view far ahead, carrying `tc` as gov5's
+/// `SyncInfo` `high_tc`.
+fn vote_carrying(svc: &H2Service<MockExecutionLayer>, keys: &[BlsSecretKey], view: u64, tc: Option<&n42_h2_primitives::consensus::TimeoutCertificate>) -> H2V4Envelope {
+    let profile = svc.engine.signing_profile();
+    let block_hash = B256::repeat_byte(0x42);
+    n42_h2_wire::h2_v4::H2V4Envelope {
+        identity: svc.identity,
+        changes_hash: B256::ZERO,
+        message: n42_h2_wire::h2_wire::H2Message::Vote(n42_h2_wire::h2_wire::H2Vote {
+            view,
+            block_hash,
+            voter: 1,
+            signature: profile.sign(&keys[1], &profile.vote_message(view, block_hash)),
+            high_tc: tc.map(|tc| wire_bridge::tc_to_wire(tc).expect("wire TC")),
+        }),
+    }
+}
+
+/// Audit 2026-10 round 2 (R2-C1, the inbound half): gov5 piggybacks its
+/// highest TC on votes, commit votes and timeouts (`SyncInfo`) and a lagging
+/// member adopts it at once (`processEmbeddedTC`): it locks on the TC's high
+/// QC and moves to the view after it. This node dropped the field, so a
+/// member that missed the NewView waited out its own timeouts instead. A TC
+/// that does not verify, or would not move the node, changes nothing.
+#[tokio::test]
+async fn a_tc_piggybacked_on_a_vote_moves_a_lagging_node_to_the_view_after_it() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    assert_eq!(rig.svc.engine.current_view(), 1);
+
+    // Signed over another view: does not verify, no move.
+    let mut forged = timeout_cert(&rig.svc, &keys, &set, &[1, 2, 3], 5);
+    forged.aggregate_signature = timeout_cert(&rig.svc, &keys, &set, &[1, 2, 3], 4).aggregate_signature;
+    rig.svc.accept_envelope(&vote_carrying(&rig.svc, &keys, 7, Some(&forged)));
+    assert_eq!(rig.svc.engine.current_view(), 1, "a TC that does not verify is ignored");
+
+    let tc = timeout_cert(&rig.svc, &keys, &set, &[1, 2, 3], 5);
+    rig.svc.accept_envelope(&vote_carrying(&rig.svc, &keys, 7, Some(&tc)));
+    assert_eq!(rig.svc.engine.current_view(), 6, "the view after the TC's");
+
+    // An older TC does not move it back.
+    let old = timeout_cert(&rig.svc, &keys, &set, &[1, 2, 3], 3);
+    rig.svc.accept_envelope(&vote_carrying(&rig.svc, &keys, 8, Some(&old)));
+    assert_eq!(rig.svc.engine.current_view(), 6);
+}
+
 /// Audit 2026-10 B-6: a step that returns early -- a range reply part
 /// imported, the rest left for the next step -- still checks for local
 /// faults: a vote-log halt ends it as it ends a step on the slow path.

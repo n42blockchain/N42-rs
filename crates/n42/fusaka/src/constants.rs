@@ -9,7 +9,7 @@ use alloy_primitives::Address;
 /// 2099-01-01 00:00:00 UTC (delayed for devnet testing)
 /// Original: 2025-07-01 00:00:00 UTC (1751328000)
 ///
-/// Note: Osaka introduces MAX_TX_GAS_LIMIT_OSAKA (16M gas) which restricts
+/// Note: Osaka introduces `MAX_TX_GAS_LIMIT_OSAKA` (16M gas) which restricts
 /// large contract deployments. Delayed to allow devnet testing.
 pub const N42_OSAKA_TIMESTAMP: u64 = 4070908800;
 
@@ -21,47 +21,47 @@ pub const N42_PRAGUE_TIMESTAMP: u64 = 1748930400;
 // BLS12-381 Precompile Addresses (EIP-2537)
 // ============================================================================
 
-/// BLS12_G1ADD precompile address
+/// `BLS12_G1ADD` precompile address
 pub const BLS12_G1ADD: Address = Address::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b,
 ]);
 
-/// BLS12_G1MUL precompile address
+/// `BLS12_G1MUL` precompile address
 pub const BLS12_G1MUL: Address = Address::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0c,
 ]);
 
-/// BLS12_G1MULTIEXP precompile address
+/// `BLS12_G1MULTIEXP` precompile address
 pub const BLS12_G1MULTIEXP: Address = Address::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0d,
 ]);
 
-/// BLS12_G2ADD precompile address
+/// `BLS12_G2ADD` precompile address
 pub const BLS12_G2ADD: Address = Address::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0e,
 ]);
 
-/// BLS12_G2MUL precompile address
+/// `BLS12_G2MUL` precompile address
 pub const BLS12_G2MUL: Address = Address::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0f,
 ]);
 
-/// BLS12_G2MULTIEXP precompile address
+/// `BLS12_G2MULTIEXP` precompile address
 pub const BLS12_G2MULTIEXP: Address = Address::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
 ]);
 
-/// BLS12_PAIRING precompile address
+/// `BLS12_PAIRING` precompile address
 pub const BLS12_PAIRING: Address = Address::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11,
 ]);
 
-/// BLS12_MAP_FP_TO_G1 precompile address
+/// `BLS12_MAP_FP_TO_G1` precompile address
 pub const BLS12_MAP_FP_TO_G1: Address = Address::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x12,
 ]);
 
-/// BLS12_MAP_FP2_TO_G2 precompile address
+/// `BLS12_MAP_FP2_TO_G2` precompile address
 pub const BLS12_MAP_FP2_TO_G2: Address = Address::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x13,
 ]);
@@ -102,34 +102,34 @@ pub const OSAKA_MAX_BLOBS_PER_TX: u64 = 6;
 // Gas Costs (EIP-2537)
 // ============================================================================
 
-/// Gas cost for BLS12_G1ADD
+/// Gas cost for `BLS12_G1ADD`
 pub const BLS12_G1ADD_GAS: u64 = 500;
 
-/// Gas cost for BLS12_G1MUL
+/// Gas cost for `BLS12_G1MUL`
 pub const BLS12_G1MUL_GAS: u64 = 12000;
 
-/// Base gas cost for BLS12_G1MULTIEXP
+/// Base gas cost for `BLS12_G1MULTIEXP`
 pub const BLS12_G1MULTIEXP_BASE_GAS: u64 = 12000;
 
-/// Gas cost for BLS12_G2ADD
+/// Gas cost for `BLS12_G2ADD`
 pub const BLS12_G2ADD_GAS: u64 = 800;
 
-/// Gas cost for BLS12_G2MUL
+/// Gas cost for `BLS12_G2MUL`
 pub const BLS12_G2MUL_GAS: u64 = 45000;
 
-/// Base gas cost for BLS12_G2MULTIEXP
+/// Base gas cost for `BLS12_G2MULTIEXP`
 pub const BLS12_G2MULTIEXP_BASE_GAS: u64 = 45000;
 
-/// Base gas cost for BLS12_PAIRING
+/// Base gas cost for `BLS12_PAIRING`
 pub const BLS12_PAIRING_BASE_GAS: u64 = 65000;
 
-/// Per-pair gas cost for BLS12_PAIRING
+/// Per-pair gas cost for `BLS12_PAIRING`
 pub const BLS12_PAIRING_PAIR_GAS: u64 = 43000;
 
-/// Gas cost for BLS12_MAP_FP_TO_G1
+/// Gas cost for `BLS12_MAP_FP_TO_G1`
 pub const BLS12_MAP_FP_TO_G1_GAS: u64 = 5500;
 
-/// Gas cost for BLS12_MAP_FP2_TO_G2
+/// Gas cost for `BLS12_MAP_FP2_TO_G2`
 pub const BLS12_MAP_FP2_TO_G2_GAS: u64 = 75000;
 
 // ============================================================================

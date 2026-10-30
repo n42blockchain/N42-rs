@@ -146,6 +146,20 @@ bytes and keeps slots: a second relocated file of slot-numbered records, atomic 
 retargeting, a slot-resolving read view, epoch-deferred `PUNCH_HOLE`. Stage 0 (growth metrics)
 is the first landing; stages 1-4 each need a bench pair.
 
+Stage 0 landed 2026-10-27 (`design/qmdb-entry-metrics`). Stages 2 and 1 were built 2026-10-28/29
+(`design/qmdb-compact-stage2` 62265d47c: `compact_twigs`, `entries.relocated`, `Offsets` bit 63,
+checkpoint version 2 with `relocated_len`; `design/qmdb-compact-stage1` 7e379dc62: fallible offsets
+growth) and audited in the 5M audit's round E (E-2 version-1 checkpoints until something is relocated,
+E-3 a relocated group whose kills the checkpoint does not hold is skipped on open, E-6 a read error
+that is not a torn tail fails the open, E-7 the clamp counts the pending block's undo). Both branches
+reached the remote on 2026-10-30 and were merged into main through `integ/qmdb-compact-stage12`
+(7ce44bdb4, one trivial `forest.rs` conflict with the D-3/D-4 persistence fixes) after 19 suites /
+571 tests of the five QMDB crates, a check of `bin/n42` and `h2-node`, and a `roll --kill` field check
+in entry-file mode on that tree (kills at heights 7, 28, 50; every node restored from its checkpoint
+and entry files and committed again, no fault line). No bench pair was run for these two stages: no
+production caller schedules a compaction yet, and the block path only gains one `relocated_len()`
+read per checkpoint; the pair comes with stage 3, which schedules it and punches the prefix.
+
 ### 6.3 QMDB durability ordered against MDBX
 
 QMDB's delta log follows canonical notifications asynchronously while MDBX persistence is a

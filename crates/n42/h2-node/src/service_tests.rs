@@ -888,6 +888,23 @@ async fn a_pushed_body_is_imported_once_whoever_sends_it() {
     assert_eq!(rig.svc.received_bodies, vec![hash], "the copy that follows is recognised");
 }
 
+/// Audit 2026-10 round 3 (R3-P5): the validator told the mobile service a
+/// committed block's view as its number and no receipts root, so a phone's
+/// receipt could never be attested. The held header gives both; under
+/// deferred execution a header carries its parent's execution, so no root
+/// is offered for it rather than the wrong one.
+#[tokio::test]
+async fn a_committed_block_gives_phones_its_number_and_receipts_root() {
+    let mut rig = node(1, 0, None).await;
+    let (hash, header, _) = block(12, B256::repeat_byte(4));
+    assert_eq!(rig.svc.mobile_commit_facts(&hash), None, "a block this node holds no header for");
+    rig.svc.remember_block(hash, &header);
+    assert_eq!(rig.svc.mobile_commit_facts(&hash), Some((12, Some(header.receipts_root))));
+
+    rig.svc.driver.set_deferred_execution_time(Some(header.timestamp));
+    assert_eq!(rig.svc.mobile_commit_facts(&hash), Some((12, None)), "its own receipts are in its child's header");
+}
+
 /// Audit 2026-10 B-3: only the first body nobody asked for at a height is
 /// imported at once. A sibling is kept, not imported, until consensus asks
 /// for it; one consensus already waits for is imported whatever came first.

@@ -4658,6 +4658,18 @@ impl<E: ExecutionLayer> H2Service<E> {
         Ok(Some(qc))
     }
 
+    /// What the mobile service needs of a committed block: its number and,
+    /// when its own header carries it, its receipts root (audit 2026-10
+    /// round 3, R3-P5). Under deferred execution a header's execution fields
+    /// are its parent's, so no root is given: an attestation then waits
+    /// rather than certifying the wrong one. `None` for a block whose header
+    /// this node does not hold.
+    pub fn mobile_commit_facts(&self, block_hash: &B256) -> Option<(u64, Option<B256>)> {
+        let header = self.block_headers.get(block_hash)?;
+        let root = (!self.driver.is_deferred_at(header.timestamp)).then_some(header.receipts_root);
+        Some((header.number, root))
+    }
+
     /// Why a block's import must not reach the engine, when its header --
     /// held since its body arrived -- carries a QC gov5 refuses (audit
     /// 2026-10 round 3, R3-C2). A block whose header this node does not hold

@@ -697,10 +697,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let mut guard = mobile
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            // Block number is not carried on the consensus event;
-                            // the view is what a phone indexes finality by here.
+                            // The number and receipts root come from the header
+                            // this node holds (R3-P5); a block it holds none for
+                            // is indexed by its view, and no receipt attests it.
+                            let (number, receipts_root) =
+                                service.mobile_commit_facts(&block_hash).unwrap_or((view, None));
                             if let Err(error) =
-                                guard.record_commit(view, block_hash, view, *commit_qc, None)
+                                guard.record_commit(view, block_hash, number, *commit_qc, receipts_root)
                             {
                                 eprintln!("could not publish the commit to phones: {error}");
                             }
